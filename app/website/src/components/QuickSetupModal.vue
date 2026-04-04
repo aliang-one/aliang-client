@@ -272,7 +272,7 @@
                     class="px-4 py-2 text-sm font-bold text-slate-500 hover:text-slate-700 transition-colors"
                     @click="collapseEditor"
                   >
-                    取消编辑
+                    收起
                   </button>
                   <button
                     type="button"

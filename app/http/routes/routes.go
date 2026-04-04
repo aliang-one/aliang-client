@@ -33,6 +33,7 @@ type Handlers struct {
 	Chat          *handlers.ChatHandler
 	UserCenter    *handlers.UserCenterHandler
 	Dashboard     *handlers.DashboardHandler
+	ConfigCenter  *handlers.ConfigCenterHandler
 
 	statsCollector     *statistic.StatsCollector
 	httpStatsCollector *statistic.HTTPStatsCollector
@@ -80,6 +81,7 @@ func newHandlers(runService *services.RunService) *Handlers {
 		Chat:               handlers.NewChatHandler(),
 		UserCenter:         handlers.NewUserCenterHandler(),
 		Dashboard:          handlers.NewDashboardHandler(),
+		ConfigCenter:       handlers.NewConfigCenterHandler(),
 		statsCollector:     statsCollector,
 		httpStatsCollector: httpStatsCollector,
 	}
@@ -209,6 +211,9 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	register("/api/dashboard/models", h.Dashboard.HandleGetModels, http.MethodGet)
 	register("/api/dashboard/usage", h.Dashboard.HandleGetUsageRecords, http.MethodGet)
 	register("/api/health", h.Dashboard.HandleGetHealth, http.MethodGet)
+
+	// Config Center API — rendered config by tag
+	register("/api/configs/rendered", h.ConfigCenter.HandleGetRenderedConfig, http.MethodGet)
 
 	registerDocsRoutes(mux, catalog)
 }
