@@ -174,12 +174,10 @@ $wxsContent = @"
 $iconDefXml
         <!-- Directory Structure -->
         <Directory Id="TARGETDIR" Name="SourceDir">
-            <Directory Id="WindowsFolder">
-                <Directory Id="SystemFolder">
-                    <Component Id="WintunDriverComponent" Guid="*" Win64="yes" Permanent="yes" NeverOverwrite="yes">
-                        <File Id="WintunDll" Source="$payloadDir\$WINTUN_DLL_NAME" KeyPath="yes"/>
-                    </Component>
-                </Directory>
+            <Directory Id="System64Folder">
+                <Component Id="WintunDriverComponent" Guid="*" Win64="yes" Permanent="yes" NeverOverwrite="yes">
+                    <File Id="WintunDll" Source="$payloadDir\$WINTUN_DLL_NAME" KeyPath="yes"/>
+                </Component>
             </Directory>
             <Directory Id="ProgramFiles64Folder">
                 <Directory Id="INSTALLFOLDER" Name="Aliang">
