@@ -317,20 +317,12 @@ func describeConnDiagnostics(conn net.Conn) string {
 		return "nil"
 	}
 
+	if diagnosticConn, ok := conn.(interface{ ConnectionDiagnosticString() string }); ok {
+		return diagnosticConn.ConnectionDiagnosticString()
+	}
+
 	_, canCloseRead := conn.(interface{ CloseRead() error })
 	_, canCloseWrite := conn.(interface{ CloseWrite() error })
-
-	if wrapped, ok := conn.(*WrappedConn); ok {
-		return fmt.Sprintf(
-			"type=%T wrapped=true underlying=%T buf=%d read_offset=%d can_close_read=%t can_close_write=%t",
-			conn,
-			wrapped.Conn,
-			len(wrapped.Buf),
-			wrapped.readOffset,
-			canCloseRead,
-			canCloseWrite,
-		)
-	}
 
 	return fmt.Sprintf(
 		"type=%T wrapped=false can_close_read=%t can_close_write=%t",

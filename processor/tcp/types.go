@@ -117,6 +117,25 @@ func (w *WrappedConn) CloseWrite() error {
 	return errors.New("CloseWrite is not implemented")
 }
 
+func (w *WrappedConn) ConnectionDiagnosticString() string {
+	if w == nil {
+		return "type=*tcp.WrappedConn nil"
+	}
+
+	_, canCloseRead := any(w).(interface{ CloseRead() error })
+	_, canCloseWrite := any(w).(interface{ CloseWrite() error })
+
+	return fmt.Sprintf(
+		"type=%T wrapped=true underlying=%T buf=%d read_offset=%d can_close_read=%t can_close_write=%t",
+		w,
+		w.Conn,
+		len(w.Buf),
+		w.readOffset,
+		canCloseRead,
+		canCloseWrite,
+	)
+}
+
 // String representation for logging
 func (w *WrappedConn) String() string {
 	return w.Conn.RemoteAddr().String()

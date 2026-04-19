@@ -333,6 +333,7 @@ func (h *TCPConnectionHandler) Handle(ctx context.Context, originConn net.Conn, 
 
 	if metadata != nil && metadata.Route == "RouteToALiang" && metadata.AppProto == AppProtoHTTP1 {
 		http1RelayStats, relayErr := watcher.RelayHTTP1(sessionCtx, newOriginConn, trackedRemote)
+		statistic.GetDefaultAIActivityTracker().CompleteMetadata(metadata, http1RelayStats.CompletedAt)
 		if relayErr == nil {
 			statistic.GetDefaultHTTPStatsCollector().RecordConnection(
 				metadata,
@@ -363,6 +364,7 @@ func (h *TCPConnectionHandler) Handle(ctx context.Context, originConn net.Conn, 
 
 	// Relay data bidirectionally
 	relayStats, err := h.relayManager.Relay(sessionCtx, newOriginConn, trackedRemote, metadata)
+	statistic.GetDefaultAIActivityTracker().CompleteMetadata(metadata, relayStats.CompletedAt)
 	if err == nil {
 		// Log successful relay completion at INFO level
 		logger.Info(fmt.Sprintf("[TCP] Relay completed: %s -> %s:%d (sent=%dKB, recv=%dKB)",

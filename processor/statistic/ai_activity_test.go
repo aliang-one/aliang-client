@@ -12,7 +12,14 @@ func TestAIActivityTracker_RecordMetadataAndTTL(t *testing.T) {
 	tracker := NewAIActivityTracker(15 * time.Second)
 	seenAt := time.Date(2026, 4, 19, 12, 0, 0, 0, time.UTC)
 
-	tracker.RecordDetection(trackedAIProvider{Key: "openai", Label: "OpenAI"}, "openai.com", "api.openai.com", string(M.BindingSourceSNI), "RouteToALiang", seenAt)
+	tracker.RecordMetadataAt(&M.Metadata{
+		ConnID:   "tcp-1",
+		HostName: "api.openai.com",
+		Route:    "RouteToALiang",
+		DNSInfo: &M.DNSInfo{
+			BindingSource: M.BindingSourceSNI,
+		},
+	}, seenAt)
 
 	summary := tracker.SummaryAt(seenAt.Add(5 * time.Second))
 	if !summary.Active {
@@ -30,8 +37,11 @@ func TestAIActivityTracker_RecordMetadataAndTTL(t *testing.T) {
 	if !summary.ActiveDetections[0].DetectedBySNI {
 		t.Fatal("expected detection source to be SNI")
 	}
-	if got := summary.ActiveDetections[0].RemainingTTL; got != 10 {
-		t.Fatalf("summary.ActiveDetections[0].RemainingTTL = %d, want 10", got)
+	if got := summary.ActiveDetections[0].RemainingTTL; got != 15 {
+		t.Fatalf("summary.ActiveDetections[0].RemainingTTL = %d, want 15", got)
+	}
+	if got := summary.ActiveDetections[0].ActiveConnectionCount; got != 1 {
+		t.Fatalf("summary.ActiveDetections[0].ActiveConnectionCount = %d, want 1", got)
 	}
 	if len(summary.RecentProviderTraffic) != 1 {
 		t.Fatalf("len(summary.RecentProviderTraffic) = %d, want 1", len(summary.RecentProviderTraffic))
@@ -40,9 +50,22 @@ func TestAIActivityTracker_RecordMetadataAndTTL(t *testing.T) {
 		t.Fatal("expected recent provider traffic to remain active inside TTL")
 	}
 
-	summary = tracker.SummaryAt(seenAt.Add(16 * time.Second))
+	tracker.CompleteMetadata(&M.Metadata{ConnID: "tcp-1", HostName: "api.openai.com"}, seenAt.Add(30*time.Second))
+
+	summary = tracker.SummaryAt(seenAt.Add(40 * time.Second))
+	if !summary.Active {
+		t.Fatal("expected summary to stay active within close buffer")
+	}
+	if got := summary.ActiveDetections[0].ActiveConnectionCount; got != 0 {
+		t.Fatalf("summary.ActiveDetections[0].ActiveConnectionCount = %d, want 0", got)
+	}
+	if got := summary.ActiveDetections[0].LastConnectionDurationSeconds; got != 30 {
+		t.Fatalf("summary.ActiveDetections[0].LastConnectionDurationSeconds = %d, want 30", got)
+	}
+
+	summary = tracker.SummaryAt(seenAt.Add(46 * time.Second))
 	if summary.Active {
-		t.Fatal("expected summary to expire after TTL")
+		t.Fatal("expected summary to expire after close buffer")
 	}
 	if summary.ActiveCount != 0 {
 		t.Fatalf("summary.ActiveCount = %d, want 0", summary.ActiveCount)
@@ -63,7 +86,7 @@ func TestAIActivityTracker_RecordMetadataAndTTL(t *testing.T) {
 		t.Fatalf("summary.LastHost = %q, want api.openai.com", got)
 	}
 
-	summary = tracker.SummaryAt(seenAt.Add(10*time.Minute + time.Second))
+	summary = tracker.SummaryAt(seenAt.Add(10*time.Minute + 31*time.Second))
 	if len(summary.RecentProviderTraffic) != 0 {
 		t.Fatalf("len(summary.RecentProviderTraffic) = %d, want 0", len(summary.RecentProviderTraffic))
 	}

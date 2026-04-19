@@ -8,15 +8,17 @@ import (
 )
 
 type publicAIActivityDetection struct {
-	ProviderKey   string `json:"providerKey"`
-	ProviderLabel string `json:"providerLabel"`
-	LastSeenAt    int64  `json:"lastSeenAt"`
-	LastSeenUnix  int64  `json:"lastSeenUnix"`
-	HitCount      int64  `json:"hitCount"`
-	Active        bool   `json:"active"`
-	RemainingTTL  int64  `json:"remainingTtlSeconds"`
-	TTLSeconds    int64  `json:"ttlSeconds"`
-	DetectedBySNI bool   `json:"detectedBySNI"`
+	ProviderKey                   string `json:"providerKey"`
+	ProviderLabel                 string `json:"providerLabel"`
+	LastSeenAt                    int64  `json:"lastSeenAt"`
+	LastSeenUnix                  int64  `json:"lastSeenUnix"`
+	HitCount                      int64  `json:"hitCount"`
+	Active                        bool   `json:"active"`
+	ActiveConnectionCount         int    `json:"activeConnectionCount"`
+	LastConnectionDurationSeconds int64  `json:"lastConnectionDurationSeconds"`
+	RemainingTTL                  int64  `json:"remainingTtlSeconds"`
+	TTLSeconds                    int64  `json:"ttlSeconds"`
+	DetectedBySNI                 bool   `json:"detectedBySNI"`
 }
 
 type publicAIActivitySummary struct {
@@ -114,15 +116,17 @@ func sanitizeAIActivityDetections(detections []*statistic.AIActivityDetection) [
 		}
 
 		publicDetections = append(publicDetections, publicAIActivityDetection{
-			ProviderKey:   detection.ProviderKey,
-			ProviderLabel: detection.ProviderLabel,
-			LastSeenAt:    detection.LastSeenAt.Unix(),
-			LastSeenUnix:  detection.LastSeenUnix,
-			HitCount:      detection.HitCount,
-			Active:        detection.Active,
-			RemainingTTL:  detection.RemainingTTL,
-			TTLSeconds:    detection.TTLSeconds,
-			DetectedBySNI: detection.DetectedBySNI,
+			ProviderKey:                   detection.ProviderKey,
+			ProviderLabel:                 detection.ProviderLabel,
+			LastSeenAt:                    detection.LastSeenAt.Unix(),
+			LastSeenUnix:                  detection.LastSeenUnix,
+			HitCount:                      detection.HitCount,
+			Active:                        detection.Active,
+			ActiveConnectionCount:         detection.ActiveConnectionCount,
+			LastConnectionDurationSeconds: detection.LastConnectionDurationSeconds,
+			RemainingTTL:                  detection.RemainingTTL,
+			TTLSeconds:                    detection.TTLSeconds,
+			DetectedBySNI:                 detection.DetectedBySNI,
 		})
 	}
 

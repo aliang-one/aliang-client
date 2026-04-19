@@ -1,6 +1,9 @@
 package tcp
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestWrappedConn_ForwardsHalfClose(t *testing.T) {
 	conn := newRecordingRelayConn(nil)
@@ -17,5 +20,26 @@ func TestWrappedConn_ForwardsHalfClose(t *testing.T) {
 	}
 	if conn.closeWriteCount != 1 {
 		t.Fatalf("underlying CloseWrite count = %d, want 1", conn.closeWriteCount)
+	}
+}
+
+func TestWrappedConnConnectionDiagnosticString(t *testing.T) {
+	conn := newRecordingRelayConn(nil)
+	wrapped := &WrappedConn{Conn: conn, Buf: []byte("hello")}
+	wrapped.readOffset = 2
+
+	got := wrapped.ConnectionDiagnosticString()
+	checks := []string{
+		"type=*tcp.WrappedConn",
+		"wrapped=true",
+		"buf=5",
+		"read_offset=2",
+		"can_close_read=true",
+		"can_close_write=true",
+	}
+	for _, check := range checks {
+		if !strings.Contains(got, check) {
+			t.Fatalf("diagnostic %q missing %q", got, check)
+		}
 	}
 }

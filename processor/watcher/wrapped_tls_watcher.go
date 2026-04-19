@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"sort"
 	"strings"
 	"sync"
 
@@ -72,6 +73,140 @@ func NewWatcherWrapConn(conn net.Conn) *WatcherWrapConn {
 	}
 }
 
+func (w *WatcherWrapConn) ConnectionDiagnosticString() string {
+	if w == nil {
+		return "type=*tls.WatcherWrapConn nil"
+	}
+
+	pendingLen := 0
+	if w.pendingBuffer != nil {
+		pendingLen = w.pendingBuffer.Len()
+	}
+
+	streamCount, activeStreams, latestSummary := w.http2DiagnosticSnapshot()
+	settingsCount := w.http2SettingsCount()
+
+	return fmt.Sprintf(
+		"type=%T proto=%s prefetched=%t http2_preface_sent=%t passthrough=%t sniffed_http1=%t req_buf=%d resp_buf=%d pending=%d streams=%d active=%s latest=%s settings=%d underlying={%s}",
+		w,
+		w.protocolLabel(),
+		w.prefetched,
+		w.http2PrefaceSent,
+		w.passthrough,
+		w.isHttp1,
+		w.reqBuf.Len(),
+		w.respBuf.Len(),
+		pendingLen,
+		streamCount,
+		activeStreams,
+		latestSummary,
+		settingsCount,
+		connectionDiagnosticString(w.Conn),
+	)
+}
+
+func (w *WatcherWrapConn) protocolLabel() string {
+	switch {
+	case w.prefetched && w.passthrough:
+		return "http2-passthrough"
+	case w.prefetched:
+		return "http2"
+	case w.isHttp1 && w.passthrough:
+		return "http1-passthrough"
+	case w.isHttp1:
+		return "http1"
+	case w.passthrough:
+		return "passthrough"
+	case w.reqBuf.Len() > 0:
+		return "sniffing"
+	default:
+		return "unknown"
+	}
+}
+
+func (w *WatcherWrapConn) http2DiagnosticSnapshot() (int, string, string) {
+	w.streamsMu.Lock()
+	defer w.streamsMu.Unlock()
+
+	streamCount := len(w.streams)
+	if streamCount == 0 {
+		latestSummary := "none"
+		for i := len(w.recentRequestOrder) - 1; i >= 0; i-- {
+			streamID := w.recentRequestOrder[i]
+			if summary, ok := w.recentRequestSummaries[streamID]; ok && strings.TrimSpace(summary) != "" {
+				latestSummary = fmt.Sprintf("%d:%s", streamID, summary)
+				break
+			}
+		}
+		return 0, "[]", latestSummary
+	}
+
+	streamIDs := make([]int, 0, len(w.streams))
+	for streamID := range w.streams {
+		streamIDs = append(streamIDs, int(streamID))
+	}
+	sort.Ints(streamIDs)
+
+	active := make([]string, 0, minInt(len(streamIDs), 3))
+	for i, streamID := range streamIDs {
+		if i >= 3 {
+			break
+		}
+		stream := w.streams[uint32(streamID)]
+		summary := summarizeHTTP2RequestMap(nil)
+		if stream != nil {
+			if strings.TrimSpace(stream.ReqSummary) != "" {
+				summary = stream.ReqSummary
+			} else {
+				summary = summarizeHTTP2RequestMap(stream.ReqHeaders)
+			}
+		}
+		active = append(active, fmt.Sprintf("%d:%s", streamID, summary))
+	}
+
+	latestSummary := "none"
+	for i := len(w.recentRequestOrder) - 1; i >= 0; i-- {
+		streamID := w.recentRequestOrder[i]
+		if summary, ok := w.recentRequestSummaries[streamID]; ok && strings.TrimSpace(summary) != "" {
+			latestSummary = fmt.Sprintf("%d:%s", streamID, summary)
+			break
+		}
+	}
+
+	return streamCount, "[" + strings.Join(active, "; ") + "]", latestSummary
+}
+
+func (w *WatcherWrapConn) http2SettingsCount() int {
+	w.settingsMu.Lock()
+	defer w.settingsMu.Unlock()
+	return len(w.serverHTTP2Settings)
+}
+
+func connectionDiagnosticString(conn net.Conn) string {
+	if conn == nil {
+		return "nil"
+	}
+	if diagnosticConn, ok := conn.(interface{ ConnectionDiagnosticString() string }); ok {
+		return diagnosticConn.ConnectionDiagnosticString()
+	}
+
+	_, canCloseRead := conn.(interface{ CloseRead() error })
+	_, canCloseWrite := conn.(interface{ CloseWrite() error })
+	return fmt.Sprintf(
+		"type=%T can_close_read=%t can_close_write=%t",
+		conn,
+		canCloseRead,
+		canCloseWrite,
+	)
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 func (w *WatcherWrapConn) getOrCreateStream(id uint32) *http2Stream {
 	w.streamsMu.Lock()
 	defer w.streamsMu.Unlock()
@@ -125,7 +260,7 @@ func (w *WatcherWrapConn) Read(p []byte) (int, error) {
 			if n > 0 {
 				continue
 			}
-			logger.Warn(fmt.Sprintf("WatcherWrapConn.Read: underlying read failed: %v", err))
+			logger.Warn(fmt.Sprintf("WatcherWrapConn.Read: underlying read failed: %v state=%s", err, w.ConnectionDiagnosticString()))
 			return 0, err
 		}
 	}
@@ -275,7 +410,7 @@ func (w *WatcherWrapConn) Write(p []byte) (n int, err error) {
 	}
 	n, err = w.Conn.Write(p)
 	if err != nil {
-		logger.Warn(fmt.Sprintf("WatcherWrapConn.Write: underlying write failed: %v", err))
+		logger.Warn(fmt.Sprintf("WatcherWrapConn.Write: underlying write failed: %v state=%s", err, w.ConnectionDiagnosticString()))
 	}
 	return n, err
 }

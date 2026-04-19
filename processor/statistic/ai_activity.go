@@ -24,6 +24,7 @@ type AIActivityTracker struct {
 	ttl              time.Duration
 	visibilityWindow time.Duration
 	detections       map[string]*AIActivityDetection
+	connections      map[string]*trackedAIConnection
 	totalHits        int64
 	latestSeenAt     time.Time
 	latestProvider   string
@@ -35,21 +36,29 @@ type AIActivityTracker struct {
 	latestMatchedVia string
 }
 
+type trackedAIConnection struct {
+	ConnID      string
+	ProviderKey string
+	StartedAt   time.Time
+}
+
 type AIActivityDetection struct {
-	ProviderKey   string    `json:"providerKey"`
-	ProviderLabel string    `json:"providerLabel"`
-	Domain        string    `json:"domain"`
-	RecentHost    string    `json:"recentHost"`
-	Source        string    `json:"source"`
-	Route         string    `json:"route"`
-	MatchedVia    string    `json:"matchedVia"`
-	LastSeenAt    time.Time `json:"lastSeenAt"`
-	LastSeenUnix  int64     `json:"lastSeenUnix"`
-	HitCount      int64     `json:"hitCount"`
-	Active        bool      `json:"active"`
-	RemainingTTL  int64     `json:"remainingTtlSeconds"`
-	TTLSeconds    int64     `json:"ttlSeconds"`
-	DetectedBySNI bool      `json:"detectedBySNI"`
+	ProviderKey                   string    `json:"providerKey"`
+	ProviderLabel                 string    `json:"providerLabel"`
+	Domain                        string    `json:"domain"`
+	RecentHost                    string    `json:"recentHost"`
+	Source                        string    `json:"source"`
+	Route                         string    `json:"route"`
+	MatchedVia                    string    `json:"matchedVia"`
+	LastSeenAt                    time.Time `json:"lastSeenAt"`
+	LastSeenUnix                  int64     `json:"lastSeenUnix"`
+	HitCount                      int64     `json:"hitCount"`
+	Active                        bool      `json:"active"`
+	ActiveConnectionCount         int       `json:"activeConnectionCount"`
+	LastConnectionDurationSeconds int64     `json:"lastConnectionDurationSeconds"`
+	RemainingTTL                  int64     `json:"remainingTtlSeconds"`
+	TTLSeconds                    int64     `json:"ttlSeconds"`
+	DetectedBySNI                 bool      `json:"detectedBySNI"`
 }
 
 type AIActivitySummary struct {
@@ -88,10 +97,15 @@ func NewAIActivityTracker(ttl time.Duration) *AIActivityTracker {
 		ttl:              ttl,
 		visibilityWindow: maxDuration(DefaultAIActivityVisibilityWindow, ttl),
 		detections:       make(map[string]*AIActivityDetection),
+		connections:      make(map[string]*trackedAIConnection),
 	}
 }
 
 func (t *AIActivityTracker) RecordMetadata(metadata *M.Metadata) {
+	t.RecordMetadataAt(metadata, time.Now())
+}
+
+func (t *AIActivityTracker) RecordMetadataAt(metadata *M.Metadata, seenAt time.Time) {
 	if metadata == nil || metadata.HostName == "" {
 		return
 	}
@@ -109,10 +123,14 @@ func (t *AIActivityTracker) RecordMetadata(metadata *M.Metadata) {
 		source = string(metadata.DNSInfo.BindingSource)
 	}
 
-	t.RecordDetection(provider, matchedDomain, metadata.HostName, source, metadata.Route, time.Now())
+	t.RecordConnectionOpened(provider, matchedDomain, metadata.HostName, source, metadata.Route, metadata.ConnID, seenAt)
 }
 
 func (t *AIActivityTracker) RecordDetection(provider trackedAIProvider, matchedDomain, host, source, route string, seenAt time.Time) {
+	t.RecordConnectionOpened(provider, matchedDomain, host, source, route, "", seenAt)
+}
+
+func (t *AIActivityTracker) RecordConnectionOpened(provider trackedAIProvider, matchedDomain, host, source, route, connID string, seenAt time.Time) {
 	providerKey := strings.TrimSpace(provider.Key)
 	providerLabel := strings.TrimSpace(provider.Label)
 	normalizedDomain := normalizeAIDomainPattern(matchedDomain)
@@ -135,6 +153,26 @@ func (t *AIActivityTracker) RecordDetection(provider trackedAIProvider, matchedD
 		t.detections[providerKey] = detection
 	}
 
+	countHit := true
+	if strings.TrimSpace(connID) != "" {
+		if existing, ok := t.connections[connID]; ok {
+			countHit = false
+			if existing.ProviderKey != providerKey {
+				if previous := t.detections[existing.ProviderKey]; previous != nil && previous.ActiveConnectionCount > 0 {
+					previous.ActiveConnectionCount--
+				}
+				detection.ActiveConnectionCount++
+			}
+		} else {
+			detection.ActiveConnectionCount++
+		}
+		t.connections[connID] = &trackedAIConnection{
+			ConnID:      connID,
+			ProviderKey: providerKey,
+			StartedAt:   seenAt,
+		}
+	}
+
 	detection.ProviderKey = providerKey
 	detection.ProviderLabel = providerLabel
 	detection.Domain = normalizedDomain
@@ -144,11 +182,13 @@ func (t *AIActivityTracker) RecordDetection(provider trackedAIProvider, matchedD
 	detection.MatchedVia = normalizedDomain
 	detection.LastSeenAt = seenAt
 	detection.LastSeenUnix = seenAt.Unix()
-	detection.HitCount++
+	if countHit {
+		detection.HitCount++
+		t.totalHits++
+	}
 	detection.TTLSeconds = int64(t.ttl / time.Second)
 	detection.DetectedBySNI = source == string(M.BindingSourceSNI)
 
-	t.totalHits++
 	t.latestSeenAt = seenAt
 	t.latestProvider = providerKey
 	t.latestLabel = providerLabel
@@ -157,6 +197,77 @@ func (t *AIActivityTracker) RecordDetection(provider trackedAIProvider, matchedD
 	t.latestSource = source
 	t.latestRoute = route
 	t.latestMatchedVia = normalizedDomain
+}
+
+func (t *AIActivityTracker) CompleteMetadata(metadata *M.Metadata, endedAt time.Time) {
+	if metadata == nil {
+		return
+	}
+	if endedAt.IsZero() {
+		endedAt = time.Now()
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.pruneExpiredLocked(endedAt)
+
+	connID := strings.TrimSpace(metadata.ConnID)
+	if connID == "" {
+		provider, matchedDomain, ok := matchTrackedAIProvider(metadata.HostName)
+		if !ok {
+			return
+		}
+		detection := t.detections[strings.TrimSpace(provider.Key)]
+		if detection == nil {
+			return
+		}
+		t.updateClosedDetectionLocked(detection, normalizeAIDomainPattern(matchedDomain), normalizeAIDomainHost(metadata.HostName), endedAt, time.Time{})
+		return
+	}
+
+	trackedConnection, ok := t.connections[connID]
+	if !ok {
+		return
+	}
+	delete(t.connections, connID)
+
+	detection := t.detections[trackedConnection.ProviderKey]
+	if detection == nil {
+		return
+	}
+	if detection.ActiveConnectionCount > 0 {
+		detection.ActiveConnectionCount--
+	}
+	t.updateClosedDetectionLocked(detection, detection.Domain, detection.RecentHost, endedAt, trackedConnection.StartedAt)
+}
+
+func (t *AIActivityTracker) updateClosedDetectionLocked(detection *AIActivityDetection, domain, host string, endedAt, startedAt time.Time) {
+	if detection == nil {
+		return
+	}
+
+	detection.LastSeenAt = endedAt
+	detection.LastSeenUnix = endedAt.Unix()
+	if domain != "" {
+		detection.Domain = domain
+		detection.MatchedVia = domain
+	}
+	if host != "" {
+		detection.RecentHost = host
+	}
+	if !startedAt.IsZero() && endedAt.After(startedAt) {
+		detection.LastConnectionDurationSeconds = int64(endedAt.Sub(startedAt) / time.Second)
+	}
+
+	t.latestSeenAt = endedAt
+	t.latestProvider = detection.ProviderKey
+	t.latestLabel = detection.ProviderLabel
+	t.latestDomain = detection.Domain
+	t.latestHost = detection.RecentHost
+	t.latestSource = detection.Source
+	t.latestRoute = detection.Route
+	t.latestMatchedVia = detection.MatchedVia
 }
 
 func (t *AIActivityTracker) Summary() *AIActivitySummary {
@@ -174,12 +285,16 @@ func (t *AIActivityTracker) SummaryAt(now time.Time) *AIActivitySummary {
 		copy := *detection
 		remaining := detection.LastSeenAt.Add(t.ttl).Sub(now)
 		visibleRemaining := detection.LastSeenAt.Add(t.visibilityWindow).Sub(now)
-		if visibleRemaining <= 0 {
+		if detection.ActiveConnectionCount <= 0 && visibleRemaining <= 0 {
 			continue
 		}
 
-		copy.Active = remaining > 0
-		copy.RemainingTTL = ttlSecondsCeil(remaining)
+		copy.Active = detection.ActiveConnectionCount > 0 || remaining > 0
+		if detection.ActiveConnectionCount > 0 {
+			copy.RemainingTTL = int64(t.ttl / time.Second)
+		} else {
+			copy.RemainingTTL = ttlSecondsCeil(remaining)
+		}
 		copy.TTLSeconds = int64(t.ttl / time.Second)
 		recent = append(recent, &copy)
 	}
@@ -224,6 +339,7 @@ func (t *AIActivityTracker) Reset() {
 	defer t.mu.Unlock()
 
 	t.detections = make(map[string]*AIActivityDetection)
+	t.connections = make(map[string]*trackedAIConnection)
 	t.totalHits = 0
 	t.latestSeenAt = time.Time{}
 	t.latestProvider = ""
@@ -238,7 +354,7 @@ func (t *AIActivityTracker) Reset() {
 func (t *AIActivityTracker) pruneExpiredLocked(now time.Time) {
 	cutoff := now.Add(-t.visibilityWindow)
 	for key, detection := range t.detections {
-		if detection.LastSeenAt.Before(cutoff) {
+		if detection.ActiveConnectionCount <= 0 && detection.LastSeenAt.Before(cutoff) {
 			delete(t.detections, key)
 		}
 	}

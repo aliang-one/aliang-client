@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"io"
 	"net"
+	"strings"
 	"testing"
 
 	"golang.org/x/net/http2"
@@ -463,5 +464,44 @@ func TestRebuildReqHeadersWithInjectedField_EmptyInjectKeyDoesNotAddAuthorizatio
 
 	if _, ok := getHTTP2HeaderFieldValue(rewrittenFields, "authorization-inner"); ok {
 		t.Fatal("authorization-inner unexpectedly added to trailer headers")
+	}
+}
+
+type diagnosticTestConn struct {
+	net.Conn
+	diagnostic string
+}
+
+func (c *diagnosticTestConn) ConnectionDiagnosticString() string {
+	return c.diagnostic
+}
+
+func TestWatcherWrapConnConnectionDiagnosticString_ReportsHTTP2State(t *testing.T) {
+	w := NewWatcherWrapConn(&diagnosticTestConn{diagnostic: "underlying=test"})
+	w.prefetched = true
+	w.http2PrefaceSent = true
+	w.serverHTTP2Settings[SETTINGS_MAX_FRAME_SIZE] = 32768
+	w.pendingBuffer = bytes.NewBufferString("abc")
+	w.reqBuf.WriteString("req")
+	w.respBuf.WriteString("resp")
+
+	stream := w.getOrCreateStream(3)
+	stream.ReqSummary = `method="GET" authority="example.com" path="/v1/chat"`
+	w.rememberRecentHTTP2RequestSummary(3, stream.ReqSummary)
+
+	diagnostic := w.ConnectionDiagnosticString()
+	checks := []string{
+		"proto=http2",
+		"http2_preface_sent=true",
+		"streams=1",
+		"active=[3:method=\"GET\" authority=\"example.com\" path=\"/v1/chat\"]",
+		"latest=3:method=\"GET\" authority=\"example.com\" path=\"/v1/chat\"",
+		"settings=1",
+		"underlying={underlying=test}",
+	}
+	for _, check := range checks {
+		if !strings.Contains(diagnostic, check) {
+			t.Fatalf("diagnostic %q missing %q", diagnostic, check)
+		}
 	}
 }

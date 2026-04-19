@@ -310,6 +310,7 @@ const visibleProviders = computed(() => {
 const totalTrafficBytes = computed(() => Number(httpStats.value?.totalTrafficBytes || 0));
 const statusTTLSeconds = computed(() => Number(aiSummary.value?.ttlSeconds || 15));
 const statusVisibleWindowSeconds = computed(() => Number(aiSummary.value?.visibleWindowSeconds || 600));
+const totalActiveConnections = computed(() => activeProviders.value.reduce((total, provider) => total + Number(provider?.activeConnectionCount || 0), 0));
 const hasRecentAIActivity = computed(() => Boolean(aiSummary.value?.active));
 const aiStatusDotClass = computed(() => hasRecentAIActivity.value ? 'bg-emerald-400 shadow-[0_0_16px_rgba(52,211,153,0.85)]' : 'bg-slate-400');
 const aiStatusBadgeClass = computed(() => hasRecentAIActivity.value
@@ -324,6 +325,12 @@ const activeSummaryTitle = computed(() => {
 const activeSummaryText = computed(() => {
   if (hasRecentAIActivity.value) {
     const latestLabel = aiSummary.value?.lastLabel || aiSummary.value?.lastProvider || '';
+    if (latestLabel && totalActiveConnections.value > 0) {
+      return t('status_activeConnectionDescriptionProvider', {
+        provider: latestLabel,
+        count: totalActiveConnections.value
+      });
+    }
     return latestLabel
       ? t('status_activeDescriptionProvider', {
           provider: latestLabel,
@@ -403,21 +410,32 @@ const providerCards = computed(() => {
     const lastSeenAt = Number(provider.lastSeenAt || 0);
     const label = provider.providerLabel || provider.providerKey || t('status_unknownProvider');
     const active = Boolean(provider.active);
+    const activeConnectionCount = Number(provider.activeConnectionCount || 0);
+    const lastConnectionDurationSeconds = Number(provider.lastConnectionDurationSeconds || 0);
     return {
       key: provider.providerKey || label,
       label,
       active,
       badge: active ? t('status_providerActiveBadge') : t('status_providerInactiveBadge'),
       caption: active
-        ? t('status_providerActiveCaption', { seconds: statusTTLSeconds.value })
+        ? (activeConnectionCount > 0
+          ? t('status_providerConnectionActiveCaption', { count: activeConnectionCount })
+          : t('status_providerActiveCaption', { seconds: statusTTLSeconds.value }))
         : t('status_providerInactiveCaption', {
             seconds: statusTTLSeconds.value,
             minutes: hiddenAfterMinutes
           }),
       lastSeenText: t('status_providerLastSeen', { value: formatRelativeFromSeconds(lastSeenAt) }),
       detail: active
-        ? (latestSeenAt === lastSeenAt ? t('status_providerLatest') : t('status_providerRecent'))
-        : t('status_providerInactiveDetail', { minutes: hiddenAfterMinutes })
+        ? (activeConnectionCount > 0
+          ? t('status_providerConnectionActiveDetail', { count: activeConnectionCount })
+          : (latestSeenAt === lastSeenAt ? t('status_providerLatest') : t('status_providerRecent')))
+        : (lastConnectionDurationSeconds > 0
+          ? t('status_providerInactiveDetailWithDuration', {
+              duration: formatDurationSeconds(lastConnectionDurationSeconds),
+              minutes: hiddenAfterMinutes
+            })
+          : t('status_providerInactiveDetail', { minutes: hiddenAfterMinutes }))
     };
   });
 });
@@ -498,6 +516,22 @@ function formatRelativeFromMilliseconds(timestamp) {
   }
   const diffHours = Math.round(diffMinutes / 60);
   return t('status_relativeHours', { count: diffHours });
+}
+
+function formatDurationSeconds(seconds) {
+  const value = Number(seconds || 0);
+  if (!Number.isFinite(value) || value <= 0) {
+    return '--';
+  }
+  if (value < 60) {
+    return t('status_durationSeconds', { count: Math.round(value) });
+  }
+  const diffMinutes = Math.round(value / 60);
+  if (diffMinutes < 60) {
+    return t('status_durationMinutes', { count: diffMinutes });
+  }
+  const diffHours = Math.round(diffMinutes / 60);
+  return t('status_durationHours', { count: diffHours });
 }
 
 async function loadStatus() {
