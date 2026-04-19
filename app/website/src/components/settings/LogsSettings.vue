@@ -25,7 +25,10 @@
                   {{ t('status_lastUpdatedCompact') }} {{ summaryUpdatedAgoText }}
                 </span>
                 <span class="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 dark:border-slate-800 dark:bg-slate-900/80">
-                  {{ t('status_trackingWindow', { seconds: statusTTLSeconds }) }}
+                  {{ t('status_trackingWindow', {
+                    seconds: statusTTLSeconds,
+                    minutes: Math.max(1, Math.round(statusVisibleWindowSeconds / 60))
+                  }) }}
                 </span>
               </div>
             </div>
@@ -298,8 +301,15 @@ const aiSummary = computed(() => statusSummary.value?.ai || {});
 const trafficStats = computed(() => statusSummary.value?.traffic || {});
 const httpStats = computed(() => statusSummary.value?.http || {});
 const activeProviders = computed(() => Array.isArray(aiSummary.value?.activeDetections) ? aiSummary.value.activeDetections : []);
+const visibleProviders = computed(() => {
+  if (Array.isArray(aiSummary.value?.recentProviderTraffic)) {
+    return aiSummary.value.recentProviderTraffic;
+  }
+  return activeProviders.value;
+});
 const totalTrafficBytes = computed(() => Number(httpStats.value?.totalTrafficBytes || 0));
 const statusTTLSeconds = computed(() => Number(aiSummary.value?.ttlSeconds || 15));
+const statusVisibleWindowSeconds = computed(() => Number(aiSummary.value?.visibleWindowSeconds || 600));
 const hasRecentAIActivity = computed(() => Boolean(aiSummary.value?.active));
 const aiStatusDotClass = computed(() => hasRecentAIActivity.value ? 'bg-emerald-400 shadow-[0_0_16px_rgba(52,211,153,0.85)]' : 'bg-slate-400');
 const aiStatusBadgeClass = computed(() => hasRecentAIActivity.value
@@ -321,7 +331,10 @@ const activeSummaryText = computed(() => {
         })
       : t('status_activeDescription', { ago: formatRelativeFromSeconds(aiSummary.value?.lastSeenAt) });
   }
-  return t('status_idleDescription', { seconds: statusTTLSeconds.value });
+  return t('status_idleDescription', {
+    seconds: statusTTLSeconds.value,
+    minutes: Math.max(1, Math.round(statusVisibleWindowSeconds.value / 60))
+  });
 });
 const summaryUpdatedAgoText = computed(() => {
   if (!lastUpdatedAt.value) {
@@ -385,17 +398,26 @@ const trafficCards = computed(() => [
 ]);
 const providerCards = computed(() => {
   const latestSeenAt = Number(aiSummary.value.lastSeenAt || 0);
-  return activeProviders.value.slice(0, 6).map((provider) => {
+  const hiddenAfterMinutes = Math.max(1, Math.round(statusVisibleWindowSeconds.value / 60));
+  return visibleProviders.value.slice(0, 6).map((provider) => {
     const lastSeenAt = Number(provider.lastSeenAt || 0);
     const label = provider.providerLabel || provider.providerKey || t('status_unknownProvider');
+    const active = Boolean(provider.active);
     return {
       key: provider.providerKey || label,
       label,
-      active: true,
-      badge: t('status_providerActiveBadge'),
-      caption: t('status_providerActiveCaption'),
+      active,
+      badge: active ? t('status_providerActiveBadge') : t('status_providerInactiveBadge'),
+      caption: active
+        ? t('status_providerActiveCaption', { seconds: statusTTLSeconds.value })
+        : t('status_providerInactiveCaption', {
+            seconds: statusTTLSeconds.value,
+            minutes: hiddenAfterMinutes
+          }),
       lastSeenText: t('status_providerLastSeen', { value: formatRelativeFromSeconds(lastSeenAt) }),
-      detail: latestSeenAt === lastSeenAt ? t('status_providerLatest') : t('status_providerRecent')
+      detail: active
+        ? (latestSeenAt === lastSeenAt ? t('status_providerLatest') : t('status_providerRecent'))
+        : t('status_providerInactiveDetail', { minutes: hiddenAfterMinutes })
     };
   });
 });

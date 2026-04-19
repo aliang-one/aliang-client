@@ -9,7 +9,10 @@ import (
 	M "aliang.one/nursorgate/inbound/tun/metadata"
 )
 
-const DefaultAIActivityTTL = 15 * time.Second
+const (
+	DefaultAIActivityTTL              = 15 * time.Second
+	DefaultAIActivityVisibilityWindow = 10 * time.Minute
+)
 
 var (
 	defaultAIActivityTracker     *AIActivityTracker
@@ -19,6 +22,7 @@ var (
 type AIActivityTracker struct {
 	mu               sync.RWMutex
 	ttl              time.Duration
+	visibilityWindow time.Duration
 	detections       map[string]*AIActivityDetection
 	totalHits        int64
 	latestSeenAt     time.Time
@@ -49,21 +53,23 @@ type AIActivityDetection struct {
 }
 
 type AIActivitySummary struct {
-	Active           bool                   `json:"active"`
-	ActiveCount      int                    `json:"activeCount"`
-	TTLSeconds       int64                  `json:"ttlSeconds"`
-	TotalHits        int64                  `json:"totalHits"`
-	LastSeenAt       int64                  `json:"lastSeenAt"`
-	LastProvider     string                 `json:"lastProvider,omitempty"`
-	LastLabel        string                 `json:"lastLabel,omitempty"`
-	LastDomain       string                 `json:"lastDomain,omitempty"`
-	LastHost         string                 `json:"lastHost,omitempty"`
-	LastSource       string                 `json:"lastSource,omitempty"`
-	LastRoute        string                 `json:"lastRoute,omitempty"`
-	LastMatchedVia   string                 `json:"lastMatchedVia,omitempty"`
-	DetectedBySNI    bool                   `json:"detectedBySNI"`
-	ActiveDetections []*AIActivityDetection `json:"activeDetections"`
-	TrackedPatterns  []string               `json:"trackedPatterns"`
+	Active                bool                   `json:"active"`
+	ActiveCount           int                    `json:"activeCount"`
+	TTLSeconds            int64                  `json:"ttlSeconds"`
+	VisibleWindowSeconds  int64                  `json:"visibleWindowSeconds"`
+	TotalHits             int64                  `json:"totalHits"`
+	LastSeenAt            int64                  `json:"lastSeenAt"`
+	LastProvider          string                 `json:"lastProvider,omitempty"`
+	LastLabel             string                 `json:"lastLabel,omitempty"`
+	LastDomain            string                 `json:"lastDomain,omitempty"`
+	LastHost              string                 `json:"lastHost,omitempty"`
+	LastSource            string                 `json:"lastSource,omitempty"`
+	LastRoute             string                 `json:"lastRoute,omitempty"`
+	LastMatchedVia        string                 `json:"lastMatchedVia,omitempty"`
+	DetectedBySNI         bool                   `json:"detectedBySNI"`
+	ActiveDetections      []*AIActivityDetection `json:"activeDetections"`
+	RecentProviderTraffic []*AIActivityDetection `json:"recentProviderTraffic"`
+	TrackedPatterns       []string               `json:"trackedPatterns"`
 }
 
 func GetDefaultAIActivityTracker() *AIActivityTracker {
@@ -79,8 +85,9 @@ func NewAIActivityTracker(ttl time.Duration) *AIActivityTracker {
 	}
 
 	return &AIActivityTracker{
-		ttl:        ttl,
-		detections: make(map[string]*AIActivityDetection),
+		ttl:              ttl,
+		visibilityWindow: maxDuration(DefaultAIActivityVisibilityWindow, ttl),
+		detections:       make(map[string]*AIActivityDetection),
 	}
 }
 
@@ -162,43 +169,53 @@ func (t *AIActivityTracker) SummaryAt(now time.Time) *AIActivitySummary {
 
 	t.pruneExpiredLocked(now)
 
-	active := make([]*AIActivityDetection, 0, len(t.detections))
+	recent := make([]*AIActivityDetection, 0, len(t.detections))
 	for _, detection := range t.detections {
 		copy := *detection
 		remaining := detection.LastSeenAt.Add(t.ttl).Sub(now)
-		if remaining <= 0 {
+		visibleRemaining := detection.LastSeenAt.Add(t.visibilityWindow).Sub(now)
+		if visibleRemaining <= 0 {
 			continue
 		}
 
-		copy.Active = true
+		copy.Active = remaining > 0
 		copy.RemainingTTL = ttlSecondsCeil(remaining)
 		copy.TTLSeconds = int64(t.ttl / time.Second)
-		active = append(active, &copy)
+		recent = append(recent, &copy)
 	}
 
-	sort.Slice(active, func(i, j int) bool {
-		if active[i].LastSeenAt.Equal(active[j].LastSeenAt) {
-			return active[i].ProviderLabel < active[j].ProviderLabel
+	sort.Slice(recent, func(i, j int) bool {
+		if recent[i].LastSeenAt.Equal(recent[j].LastSeenAt) {
+			return recent[i].ProviderLabel < recent[j].ProviderLabel
 		}
-		return active[i].LastSeenAt.After(active[j].LastSeenAt)
+		return recent[i].LastSeenAt.After(recent[j].LastSeenAt)
 	})
 
+	active := make([]*AIActivityDetection, 0, len(recent))
+	for _, detection := range recent {
+		if detection.Active {
+			active = append(active, detection)
+		}
+	}
+
 	return &AIActivitySummary{
-		Active:           len(active) > 0,
-		ActiveCount:      len(active),
-		TTLSeconds:       int64(t.ttl / time.Second),
-		TotalHits:        t.totalHits,
-		LastSeenAt:       t.latestSeenAt.Unix(),
-		LastProvider:     t.latestProvider,
-		LastLabel:        t.latestLabel,
-		LastDomain:       t.latestDomain,
-		LastHost:         t.latestHost,
-		LastSource:       t.latestSource,
-		LastRoute:        t.latestRoute,
-		LastMatchedVia:   t.latestMatchedVia,
-		DetectedBySNI:    t.latestSource == string(M.BindingSourceSNI),
-		ActiveDetections: active,
-		TrackedPatterns:  currentTrackedAIDomains(),
+		Active:                len(active) > 0,
+		ActiveCount:           len(active),
+		TTLSeconds:            int64(t.ttl / time.Second),
+		VisibleWindowSeconds:  int64(t.visibilityWindow / time.Second),
+		TotalHits:             t.totalHits,
+		LastSeenAt:            t.latestSeenAt.Unix(),
+		LastProvider:          t.latestProvider,
+		LastLabel:             t.latestLabel,
+		LastDomain:            t.latestDomain,
+		LastHost:              t.latestHost,
+		LastSource:            t.latestSource,
+		LastRoute:             t.latestRoute,
+		LastMatchedVia:        t.latestMatchedVia,
+		DetectedBySNI:         t.latestSource == string(M.BindingSourceSNI),
+		ActiveDetections:      active,
+		RecentProviderTraffic: recent,
+		TrackedPatterns:       currentTrackedAIDomains(),
 	}
 }
 
@@ -219,12 +236,19 @@ func (t *AIActivityTracker) Reset() {
 }
 
 func (t *AIActivityTracker) pruneExpiredLocked(now time.Time) {
-	cutoff := now.Add(-4 * t.ttl)
+	cutoff := now.Add(-t.visibilityWindow)
 	for key, detection := range t.detections {
 		if detection.LastSeenAt.Before(cutoff) {
 			delete(t.detections, key)
 		}
 	}
+}
+
+func maxDuration(left, right time.Duration) time.Duration {
+	if left > right {
+		return left
+	}
+	return right
 }
 
 func ttlSecondsCeil(remaining time.Duration) int64 {
