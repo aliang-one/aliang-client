@@ -242,6 +242,7 @@ jobs:
         shell: pwsh
         env:
           VERSION: ${{ github.ref_name }}
+          GOARCH: ${{ matrix.goarch }}
         run: |
           # Strip 'v' prefix from version for WiX compatibility
           $msiVersion = $env:VERSION -replace '^v', ''
@@ -274,9 +275,6 @@ jobs:
           Write-Host "WiX candle: $wixCandleExe"
           Write-Host "WiX light: $wixLightExe"
           Write-Host "WiX path: $wixPath"
-
-          # Copy binary to scripts dir
-          Copy-Item "dist\$env:BINARY_NAME.exe" scripts\
 
           # Run MSI build script with WiX paths
           $releaseDir = Join-Path $PWD "release"

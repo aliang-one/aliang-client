@@ -574,7 +574,7 @@ export default {
   status_heroWaiting: '等待中',
   status_heroLastSeenHint: '有新流量后会自动刷新。',
   status_providerSectionTitle: '访问概览',
-  status_providerSectionDescription: '只显示产品级状态，不直接展示命中的具体域名。优先按连接是否仍在存活判断高亮，连接关闭 15 秒后置灰，10 分钟无新流量后隐藏。',
+  status_providerSectionDescription: '展示各 AI 产品的访问状态。正在使用时高亮显示，停止使用后短暂保留，一段时间无访问则自动隐藏。',
   status_domainTraffic: '累计流量 {bytes}',
   status_domainActive: '活跃',
   status_domainIdle: '静默',
