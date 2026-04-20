@@ -210,19 +210,19 @@ $iconDefXml
                     </Component>
                 </Directory>
             </Directory>
-            <Directory Id="CommonProgramsFolder">
+            <Directory Id="ProgramMenuFolder">
                 <Directory Id="ApplicationProgramsFolder" Name="Aliang">
                     <Component Id="StartMenuShortcut" Guid="*" Win64="yes">
                         <Shortcut Id="ApplicationStartMenuShortcut" Name="Aliang" Description="Aliang Gateway Proxy Client" Target="[INSTALLFOLDER]$BINARY_NAME" Arguments="companion" WorkingDirectory="INSTALLFOLDER" $shortcutIconAttr/>
                         <RemoveFolder Id="CleanUpShortCut" On="uninstall"/>
-                        <RegistryValue Root="HKLM" Key="Software\Aliang" Name="StartMenuInstalled" Type="integer" Value="1" KeyPath="yes"/>
+                        <RegistryValue Root="HKCU" Key="Software\Aliang" Name="StartMenuInstalled" Type="integer" Value="1" KeyPath="yes"/>
                     </Component>
                 </Directory>
             </Directory>
-            <Directory Id="CommonDesktopFolder">
+            <Directory Id="DesktopFolder" Name="Desktop">
                 <Component Id="DesktopShortcut" Guid="*" Win64="yes">
                     <Shortcut Id="ApplicationDesktopShortcut" Name="Aliang" Description="Aliang Gateway Proxy Client" Target="[INSTALLFOLDER]$BINARY_NAME" Arguments="companion" WorkingDirectory="INSTALLFOLDER" $shortcutIconAttr/>
-                    <RegistryValue Root="HKLM" Key="Software\Aliang" Name="DesktopShortcutInstalled" Type="integer" Value="1" KeyPath="yes"/>
+                    <RegistryValue Root="HKCU" Key="Software\Aliang" Name="DesktopShortcutInstalled" Type="integer" Value="1" KeyPath="yes"/>
                 </Component>
             </Directory>
         </Directory>
