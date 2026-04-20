@@ -1849,18 +1849,22 @@ async function toggleProxyPower() {
   runSyncError.value = '';
   try {
     await syncStartupStatus();
-    if (!runIsRunning.value && !canStartProxy.value) {
+    await syncRunStatus();
+
+    const wasRunning = runIsRunning.value;
+    const currentMode = runMode.value;
+
+    if (!wasRunning && !canStartProxy.value) {
       throw new Error(proxyStatusSubtitle.value);
     }
-    if (runMode.value === 'unknown') {
-      await syncRunStatus();
-    }
-    const startingTun = !runIsRunning.value && runMode.value === 'tun';
+
+    const startingTun = !wasRunning && currentMode === 'tun';
     if (startingTun) {
       openTunStartModal();
     }
-    const endpoint = runIsRunning.value ? '/api/run/stop' : '/api/run/start';
-    const actionText = runIsRunning.value ? 'stop' : 'start';
+
+    const endpoint = wasRunning ? '/api/run/stop' : '/api/run/start';
+    const actionText = wasRunning ? 'stop' : 'start';
     const response = await fetch(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' }
@@ -1882,7 +1886,7 @@ async function toggleProxyPower() {
       throw new Error(data?.msg || `Failed to ${actionText} proxy`);
     }
 
-    runActionMessage.value = runIsRunning.value ? t('dash_proxyStoppedSuccessfully') : t('dash_proxyStartSent');
+    runActionMessage.value = wasRunning ? t('dash_proxyStoppedSuccessfully') : t('dash_proxyStartSent');
     await syncStartupStatus();
     await syncRunStatus();
   } catch (error) {
