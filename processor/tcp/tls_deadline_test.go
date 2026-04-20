@@ -52,3 +52,20 @@ func TestApplyContextReadDeadline_NoDeadlineIsNoop(t *testing.T) {
 		t.Fatalf("SetReadDeadline count = %d, want 0", len(conn.setReadDeadlines))
 	}
 }
+
+func TestApplyContextReadDeadline_WrappedConnWithoutUnderlyingIsNoop(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	clearDeadline := applyContextReadDeadline(ctx, &WrappedConn{})
+	clearDeadline()
+}
+
+func TestIsUsableConn_TypedNilWrappedConnIsFalse(t *testing.T) {
+	var wrapped *WrappedConn
+	var conn net.Conn = wrapped
+
+	if isUsableConn(conn) {
+		t.Fatal("isUsableConn() = true, want false for typed nil wrapped conn")
+	}
+}

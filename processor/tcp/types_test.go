@@ -1,8 +1,10 @@
 package tcp
 
 import (
+	"net"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestWrappedConn_ForwardsHalfClose(t *testing.T) {
@@ -41,5 +43,28 @@ func TestWrappedConnConnectionDiagnosticString(t *testing.T) {
 		if !strings.Contains(got, check) {
 			t.Fatalf("diagnostic %q missing %q", got, check)
 		}
+	}
+}
+
+func TestWrappedConnWithoutUnderlyingDoesNotPanic(t *testing.T) {
+	wrapped := &WrappedConn{}
+
+	if _, err := wrapped.Read(make([]byte, 1)); err != net.ErrClosed {
+		t.Fatalf("Read() error = %v, want %v", err, net.ErrClosed)
+	}
+	if _, err := wrapped.Write([]byte("x")); err != net.ErrClosed {
+		t.Fatalf("Write() error = %v, want %v", err, net.ErrClosed)
+	}
+	if err := wrapped.SetReadDeadline(time.Now()); err != net.ErrClosed {
+		t.Fatalf("SetReadDeadline() error = %v, want %v", err, net.ErrClosed)
+	}
+	if err := wrapped.SetWriteDeadline(time.Now()); err != net.ErrClosed {
+		t.Fatalf("SetWriteDeadline() error = %v, want %v", err, net.ErrClosed)
+	}
+	if err := wrapped.SetDeadline(time.Now()); err != net.ErrClosed {
+		t.Fatalf("SetDeadline() error = %v, want %v", err, net.ErrClosed)
+	}
+	if got := wrapped.String(); got != "" {
+		t.Fatalf("String() = %q, want empty string", got)
 	}
 }

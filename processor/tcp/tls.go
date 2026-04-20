@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"reflect"
 	"strings"
 	"syscall"
 	"time"
@@ -29,7 +30,7 @@ type DefaultTLSHandler struct {
 }
 
 func applyContextReadDeadline(ctx context.Context, conn net.Conn) func() {
-	if ctx == nil || conn == nil {
+	if ctx == nil || !isUsableConn(conn) {
 		return func() {}
 	}
 
@@ -47,6 +48,28 @@ func applyContextReadDeadline(ctx context.Context, conn net.Conn) func() {
 		if err := conn.SetReadDeadline(time.Time{}); err != nil && !isExpectedClientDisconnect(err) {
 			logger.Debug(fmt.Sprintf("failed to clear read deadline from context: %v", err))
 		}
+	}
+}
+
+func isUsableConn(conn net.Conn) bool {
+	if conn == nil {
+		return false
+	}
+
+	value := reflect.ValueOf(conn)
+	if value.Kind() == reflect.Pointer && value.IsNil() {
+		return false
+	}
+
+	switch typed := conn.(type) {
+	case *WrappedConn:
+		return typed != nil && isUsableConn(typed.Conn)
+	case *closeOnceConn:
+		return typed != nil && isUsableConn(typed.Conn)
+	case *WrappedConnWithTLS:
+		return typed != nil && isUsableConn(typed.Conn)
+	default:
+		return true
 	}
 }
 

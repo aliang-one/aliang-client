@@ -659,7 +659,8 @@ func (h *TCPConnectionHandler) resolveTLSRoute(
 	if route == RouteToALiang {
 		metadata.Route = "RouteToALiang"
 		mitmConn := wrapped
-		if mitmConn == nil {
+		// 在某些情况下会跳过sni，导致wrapped为nil，此时直接使用originConn进行MITM，避免因wrapped为nil而导致的MITM失败
+		if !isUsableConn(mitmConn) {
 			mitmConn = originConn
 		}
 

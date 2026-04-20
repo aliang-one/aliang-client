@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"time"
 
 	"aliang.one/nursorgate/common/logger"
 )
@@ -76,6 +77,10 @@ type WrappedConn struct {
 // If there's buffered data from initial read, return that first.
 // Once buffered data is exhausted, read from underlying connection.
 func (w *WrappedConn) Read(p []byte) (int, error) {
+	if w == nil || w.Conn == nil {
+		return 0, net.ErrClosed
+	}
+
 	// If we have buffered data, serve that first
 	if len(w.Buf) > w.readOffset {
 		n := copy(p, w.Buf[w.readOffset:])
@@ -97,6 +102,20 @@ func (w *WrappedConn) Read(p []byte) (int, error) {
 	return w.Conn.Read(p)
 }
 
+func (w *WrappedConn) Write(p []byte) (int, error) {
+	if w == nil || w.Conn == nil {
+		return 0, net.ErrClosed
+	}
+	return w.Conn.Write(p)
+}
+
+func (w *WrappedConn) Close() error {
+	if w == nil || w.Conn == nil {
+		return nil
+	}
+	return w.Conn.Close()
+}
+
 func (w *WrappedConn) CloseRead() error {
 	if w == nil || w.Conn == nil {
 		return nil
@@ -115,6 +134,41 @@ func (w *WrappedConn) CloseWrite() error {
 		return cw.CloseWrite()
 	}
 	return errors.New("CloseWrite is not implemented")
+}
+
+func (w *WrappedConn) LocalAddr() net.Addr {
+	if w == nil || w.Conn == nil {
+		return nil
+	}
+	return w.Conn.LocalAddr()
+}
+
+func (w *WrappedConn) RemoteAddr() net.Addr {
+	if w == nil || w.Conn == nil {
+		return nil
+	}
+	return w.Conn.RemoteAddr()
+}
+
+func (w *WrappedConn) SetDeadline(t time.Time) error {
+	if w == nil || w.Conn == nil {
+		return net.ErrClosed
+	}
+	return w.Conn.SetDeadline(t)
+}
+
+func (w *WrappedConn) SetReadDeadline(t time.Time) error {
+	if w == nil || w.Conn == nil {
+		return net.ErrClosed
+	}
+	return w.Conn.SetReadDeadline(t)
+}
+
+func (w *WrappedConn) SetWriteDeadline(t time.Time) error {
+	if w == nil || w.Conn == nil {
+		return net.ErrClosed
+	}
+	return w.Conn.SetWriteDeadline(t)
 }
 
 func (w *WrappedConn) ConnectionDiagnosticString() string {
@@ -138,6 +192,9 @@ func (w *WrappedConn) ConnectionDiagnosticString() string {
 
 // String representation for logging
 func (w *WrappedConn) String() string {
+	if w == nil || w.Conn == nil || w.Conn.RemoteAddr() == nil {
+		return ""
+	}
 	return w.Conn.RemoteAddr().String()
 }
 
