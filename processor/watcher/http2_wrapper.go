@@ -130,6 +130,13 @@ type http2Stream struct {
 	RespEndStream bool
 }
 
+type http2HeaderRewriteMeta struct {
+	endStream   bool
+	hasPriority bool
+	priority    http2.PriorityParam
+	padLength   uint8
+}
+
 const maxRecentHTTP2RequestSummaries = 128
 
 func getHTTP2HeaderFieldValue(fields []hpack.HeaderField, target string) (string, bool) {
@@ -307,6 +314,18 @@ func (w *WatcherWrapConn) processHttp2RequestFrame(preBuff *bytes.Buffer) error 
 				logger.Warn(fmt.Sprintf("[HTTP/2 REQ] Header decode failed for stream %d: %v", streamID, err))
 				return err
 			}
+			//
+			// Preserve wire-level HEADERS metadata before we rebuild the block.
+			// HPACK decoding gives us the logical header fields, but flags like
+			// PRIORITY/PADDED and the original pad length live on the frame itself.
+			// If we rewrite headers without carrying those bits forward, some HTTP/2
+			// clients or intermediaries may reject the rewritten stream with
+			// PROTOCOL_ERROR.
+			rewriteMeta, err := parseHTTP2HeaderRewriteMeta(rawHeaders, metaFrame)
+			if err != nil {
+				logger.Warn(fmt.Sprintf("[HTTP/2 REQ] Header metadata parse failed for stream %d: %v", streamID, err))
+				return err
+			}
 
 			injectKey := ""
 			injectValue := ""
@@ -318,8 +337,7 @@ func (w *WatcherWrapConn) processHttp2RequestFrame(preBuff *bytes.Buffer) error 
 			rewritten, rewrittenFields, err := w.rebuildReqHeadersWithInjectedField(
 				metaFrame.Fields,
 				streamID,
-				metaFrame.StreamEnded(),
-				metaFrame.HeadersFrame.Priority,
+				rewriteMeta,
 				injectKey,
 				injectValue,
 			)
@@ -593,11 +611,72 @@ func http2FrameTotalLen(data []byte) (int, bool) {
 	return totalLen, true
 }
 
+func parseHTTP2HeaderRewriteMeta(rawHeaders []byte, metaFrame *http2.MetaHeadersFrame) (http2HeaderRewriteMeta, error) {
+	params := http2HeaderRewriteMeta{}
+	if metaFrame != nil {
+		params.endStream = metaFrame.StreamEnded()
+		params.priority = metaFrame.HeadersFrame.Priority
+	}
+
+	if len(rawHeaders) < frameHeaderLen {
+		return params, fmt.Errorf("short HTTP/2 header sequence: len=%d", len(rawHeaders))
+	}
+
+	firstFrameLen, ok := http2FrameTotalLen(rawHeaders)
+	if !ok {
+		return params, fmt.Errorf("incomplete first HTTP/2 HEADERS frame")
+	}
+
+	flags := rawHeaders[4]
+	params.hasPriority = flags&flagPriority != 0
+	if flags&flagPadded != 0 {
+		firstPayload := rawHeaders[frameHeaderLen:firstFrameLen]
+		if len(firstPayload) < 1 {
+			return params, fmt.Errorf("padded HEADERS missing pad length")
+		}
+		params.padLength = firstPayload[0]
+	}
+
+	return params, nil
+}
+
+func computeHTTP2FirstHeaderChunkBudget(maxFrameSize int, rewriteMeta http2HeaderRewriteMeta) int {
+	chunkBudget := maxFrameSize
+
+	// chunkBudget/headerBlock 的单位都是 byte，这里计算的是：
+	// “首个 HEADERS 帧里，还能留给 HPACK header block fragment 多少字节空间”。
+	// 注意 maxFrameSize 限制的是整个 frame payload，而不是仅限制 fragment。
+	// 因此像 padding/priority 这种帧级元信息，也必须先从预算里扣掉。
+	if rewriteMeta.padLength != 0 {
+		// PADDED HEADERS 的 payload 结构是:
+		//   Pad Length(1 byte) + Header Block Fragment(N bytes) + Padding(padLength bytes)
+		// 所以真正可用于 fragment 的空间，要减去 1 + padLength。
+		chunkBudget -= 1 + int(rewriteMeta.padLength)
+	}
+	if rewriteMeta.hasPriority {
+		// PRIORITY 信息在线上的 HEADERS payload 中固定占 5 byte:
+		//   Stream Dependency(4 bytes) + Weight(1 byte)
+		// 这里扣的是 HTTP/2 线协议编码长度，不是 Go 里 PriorityParam 结构体的内存大小。
+		chunkBudget -= 5
+	}
+	if chunkBudget < 0 {
+		// 这里先钳成 0，而不是立刻报错，是为了避免我们重写时继续生成
+		// “首个 HEADERS payload 超过 maxFrameSize”的更坏结果。
+		// 设成 0 后，首帧只保留必要的帧级元信息，不放 fragment；
+		// 剩余 header block 会继续写进后续 CONTINUATION 帧。
+		//
+		// 这不是在说“输入一定合法”，而是在异常或极端组合下尽量做保守输出，
+		// 避免本地重写逻辑额外制造新的协议错误。
+		chunkBudget = 0
+	}
+
+	return chunkBudget
+}
+
 func (w *WatcherWrapConn) rebuildReqHeadersWithInjectedField(
 	headerFields []hpack.HeaderField,
 	streamID uint32,
-	endStream bool,
-	priority http2.PriorityParam,
+	rewriteMeta http2HeaderRewriteMeta,
 	keyToInject string,
 	valueToInject string,
 ) ([]byte, []hpack.HeaderField, error) {
@@ -657,23 +736,28 @@ func (w *WatcherWrapConn) rebuildReqHeadersWithInjectedField(
 	var out bytes.Buffer
 	writer := http2.NewFramer(&out, nil)
 	for first := true; len(headerBlock) > 0 || first; first = false {
-		chunkSize := len(headerBlock)
-		if chunkSize > maxFrameSize {
-			chunkSize = maxFrameSize
+		chunkBudget := maxFrameSize
+		if first {
+			chunkBudget = computeHTTP2FirstHeaderChunkBudget(maxFrameSize, rewriteMeta)
 		}
 
+		chunkSize := len(headerBlock)
+		if chunkSize > chunkBudget {
+			chunkSize = chunkBudget
+		}
 		chunk := headerBlock[:chunkSize]
 		headerBlock = headerBlock[chunkSize:]
 		endHeaders := len(headerBlock) == 0
 
 		if first {
-			if err := writer.WriteHeaders(http2.HeadersFrameParam{
+			if err := writeHTTP2HeadersFrame(&out, http2.HeadersFrameParam{
 				StreamID:      streamID,
 				BlockFragment: chunk,
-				EndStream:     endStream,
+				EndStream:     rewriteMeta.endStream,
 				EndHeaders:    endHeaders,
-				Priority:      priority,
-			}); err != nil {
+				PadLength:     rewriteMeta.padLength,
+				Priority:      rewriteMeta.priority,
+			}, rewriteMeta.hasPriority); err != nil {
 				return nil, nil, fmt.Errorf("write headers frame: %w", err)
 			}
 			continue
@@ -685,6 +769,72 @@ func (w *WatcherWrapConn) rebuildReqHeadersWithInjectedField(
 	}
 
 	return out.Bytes(), rewrittenFields, nil
+}
+
+func writeHTTP2HeadersFrame(out *bytes.Buffer, p http2.HeadersFrameParam, forcePriority bool) error {
+	if !forcePriority {
+		writer := http2.NewFramer(out, nil)
+		return writer.WriteHeaders(p)
+	}
+
+	var flags byte
+	if p.EndStream {
+		flags |= flagEndStream
+	}
+	if p.EndHeaders {
+		flags |= flagEndHeaders
+	}
+	if p.PadLength != 0 {
+		flags |= flagPadded
+	}
+	flags |= flagPriority
+
+	payloadLen := len(p.BlockFragment) + 5 + int(p.PadLength)
+	if p.PadLength != 0 {
+		payloadLen++
+	}
+	if payloadLen > 0xFFFFFF {
+		return fmt.Errorf("headers payload too large: %d", payloadLen)
+	}
+
+	var header [frameHeaderLen]byte
+	header[0] = byte(payloadLen >> 16)
+	header[1] = byte(payloadLen >> 8)
+	header[2] = byte(payloadLen)
+	header[3] = frameTypeHeaders
+	header[4] = flags
+	binary.BigEndian.PutUint32(header[5:9], p.StreamID&0x7FFFFFFF)
+	if _, err := out.Write(header[:]); err != nil {
+		return err
+	}
+
+	if p.PadLength != 0 {
+		if err := out.WriteByte(p.PadLength); err != nil {
+			return err
+		}
+	}
+
+	dependency := p.Priority.StreamDep & 0x7FFFFFFF
+	if p.Priority.Exclusive {
+		dependency |= 1 << 31
+	}
+	var dep [4]byte
+	binary.BigEndian.PutUint32(dep[:], dependency)
+	if _, err := out.Write(dep[:]); err != nil {
+		return err
+	}
+	if err := out.WriteByte(p.Priority.Weight); err != nil {
+		return err
+	}
+	if _, err := out.Write(p.BlockFragment); err != nil {
+		return err
+	}
+	for i := uint8(0); i < p.PadLength; i++ {
+		if err := out.WriteByte(0); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (w *WatcherWrapConn) decodeHeaderBlock(block []byte, isRequest bool) (map[string]string, error) {

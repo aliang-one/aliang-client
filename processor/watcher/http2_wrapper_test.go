@@ -46,6 +46,16 @@ func buildHeadersFrame(t *testing.T, p http2.HeadersFrameParam) []byte {
 	return buf.Bytes()
 }
 
+func buildHeadersFramePreservingPriorityFlag(t *testing.T, p http2.HeadersFrameParam, forcePriority bool) []byte {
+	t.Helper()
+
+	var buf bytes.Buffer
+	if err := writeHTTP2HeadersFrame(&buf, p, forcePriority); err != nil {
+		t.Fatalf("writeHTTP2HeadersFrame() error = %v", err)
+	}
+	return buf.Bytes()
+}
+
 func buildDataFrame(t *testing.T, streamID uint32, endStream bool, payload []byte) []byte {
 	t.Helper()
 
@@ -208,8 +218,7 @@ func TestRebuildReqHeadersWithInjectedField_SequentialStreamsRemainConnectionDec
 			{Name: "user-agent", Value: "agent-a"},
 		},
 		1,
-		false,
-		http2.PriorityParam{},
+		http2HeaderRewriteMeta{endStream: false},
 		"",
 		"",
 	)
@@ -225,8 +234,7 @@ func TestRebuildReqHeadersWithInjectedField_SequentialStreamsRemainConnectionDec
 			{Name: "user-agent", Value: "agent-a"},
 		},
 		3,
-		true,
-		http2.PriorityParam{},
+		http2HeaderRewriteMeta{endStream: true},
 		"",
 		"",
 	)
@@ -292,8 +300,7 @@ func TestRebuildReqHeadersWithInjectedField_UsesLatestServerMaxFrameSize(t *test
 			{Name: "x-large", Value: largeValue.String()},
 		},
 		1,
-		false,
-		http2.PriorityParam{},
+		http2HeaderRewriteMeta{endStream: false},
 		"",
 		"",
 	)
@@ -345,8 +352,7 @@ func TestRebuildReqHeadersWithInjectedField_PreservesEndStreamOnSplitHeaders(t *
 			{Name: "x-large", Value: largeValue.String()},
 		},
 		1,
-		true,
-		http2.PriorityParam{},
+		http2HeaderRewriteMeta{endStream: true},
 		"",
 		"",
 	)
@@ -453,8 +459,7 @@ func TestRebuildReqHeadersWithInjectedField_EmptyInjectKeyDoesNotAddAuthorizatio
 			{Name: "x-trailer", Value: "done"},
 		},
 		1,
-		true,
-		http2.PriorityParam{},
+		http2HeaderRewriteMeta{endStream: true},
 		"",
 		"",
 	)
@@ -464,6 +469,139 @@ func TestRebuildReqHeadersWithInjectedField_EmptyInjectKeyDoesNotAddAuthorizatio
 
 	if _, ok := getHTTP2HeaderFieldValue(rewrittenFields, "authorization-inner"); ok {
 		t.Fatal("authorization-inner unexpectedly added to trailer headers")
+	}
+}
+
+func TestParseHTTP2HeaderRewriteMeta_PreservesPriorityFlagAndPadding(t *testing.T) {
+	w := NewWatcherWrapConn(nil)
+
+	rawHeaders := buildHeadersFramePreservingPriorityFlag(t, http2.HeadersFrameParam{
+		StreamID: 1,
+		BlockFragment: extractHeaderBlockFragments(t, buildHeadersFrame(t, http2.HeadersFrameParam{
+			StreamID:      1,
+			BlockFragment: buildHeaderBlockWithDynamicTableSize(t, 4096, hpack.HeaderField{Name: ":method", Value: "GET"}),
+			EndHeaders:    true,
+		})),
+		EndHeaders: true,
+		PadLength:  3,
+		Priority:   http2.PriorityParam{},
+	}, true)
+
+	metaFrame, err := w.decodeMetaHeaders(rawHeaders)
+	if err != nil {
+		t.Fatalf("decodeMetaHeaders() error = %v", err)
+	}
+
+	rewriteMeta, err := parseHTTP2HeaderRewriteMeta(rawHeaders, metaFrame)
+	if err != nil {
+		t.Fatalf("parseHTTP2HeaderRewriteMeta() error = %v", err)
+	}
+	if !rewriteMeta.hasPriority {
+		t.Fatal("rewriteMeta.hasPriority = false, want true")
+	}
+	if rewriteMeta.padLength != 3 {
+		t.Fatalf("rewriteMeta.padLength = %d, want 3", rewriteMeta.padLength)
+	}
+	if !rewriteMeta.priority.IsZero() {
+		t.Fatalf("rewriteMeta.priority = %+v, want zero priority fields", rewriteMeta.priority)
+	}
+}
+
+func TestRebuildReqHeadersWithInjectedField_PreservesPriorityFlagAndPadding(t *testing.T) {
+	w := NewWatcherWrapConn(nil)
+
+	frames, _, err := w.rebuildReqHeadersWithInjectedField(
+		[]hpack.HeaderField{
+			{Name: ":method", Value: "GET"},
+			{Name: ":scheme", Value: "https"},
+			{Name: ":authority", Value: "example.com"},
+			{Name: ":path", Value: "/priority"},
+		},
+		1,
+		http2HeaderRewriteMeta{
+			endStream:   true,
+			hasPriority: true,
+			priority:    http2.PriorityParam{},
+			padLength:   2,
+		},
+		"",
+		"",
+	)
+	if err != nil {
+		t.Fatalf("rebuildReqHeadersWithInjectedField() error = %v", err)
+	}
+
+	reader := bytes.NewReader(frames)
+	framer := http2.NewFramer(nil, reader)
+	frame, err := framer.ReadFrame()
+	if err != nil {
+		t.Fatalf("ReadFrame() error = %v", err)
+	}
+
+	headersFrame, ok := frame.(*http2.HeadersFrame)
+	if !ok {
+		t.Fatalf("frame type = %T, want *http2.HeadersFrame", frame)
+	}
+	if !headersFrame.HasPriority() {
+		t.Fatal("headersFrame.HasPriority() = false, want true")
+	}
+	if !headersFrame.StreamEnded() {
+		t.Fatal("headersFrame.StreamEnded() = false, want true")
+	}
+	if got := headersFrame.FrameHeader.Flags.Has(http2.FlagHeadersPadded); !got {
+		t.Fatal("HEADERS padded flag missing after rebuild")
+	}
+}
+
+func TestRebuildReqHeadersWithInjectedField_FirstFrameRespectsMaxFrameSizeWithPriorityAndPadding(t *testing.T) {
+	w := NewWatcherWrapConn(nil)
+	w.ParseSettingsFrame([]byte{
+		0x00, 0x05,
+		0x00, 0x00, 0x00, 0x20,
+	}, http2SettingsSourceServer)
+
+	var largeValue bytes.Buffer
+	for i := 0; i < 80; i++ {
+		largeValue.WriteByte('c')
+	}
+
+	frames, _, err := w.rebuildReqHeadersWithInjectedField(
+		[]hpack.HeaderField{
+			{Name: ":method", Value: "GET"},
+			{Name: ":scheme", Value: "https"},
+			{Name: ":authority", Value: "example.com"},
+			{Name: ":path", Value: "/budget"},
+			{Name: "x-large", Value: largeValue.String()},
+		},
+		1,
+		http2HeaderRewriteMeta{
+			hasPriority: true,
+			priority: http2.PriorityParam{
+				StreamDep: 1,
+				Weight:    15,
+			},
+			padLength: 2,
+		},
+		"",
+		"",
+	)
+	if err != nil {
+		t.Fatalf("rebuildReqHeadersWithInjectedField() error = %v", err)
+	}
+
+	reader := bytes.NewReader(frames)
+	framer := http2.NewFramer(nil, reader)
+	for {
+		frame, err := framer.ReadFrame()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("ReadFrame() error = %v", err)
+		}
+		if frame.Header().Length > 32 {
+			t.Fatalf("frame length = %d, want <= 32", frame.Header().Length)
+		}
 	}
 }
 
