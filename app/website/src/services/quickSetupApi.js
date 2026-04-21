@@ -1,3 +1,5 @@
+import { syncUnauthenticatedAuthState } from '../stores/auth';
+
 function extractOuterEnvelope(json) {
   const payload = json && typeof json === 'object' ? json : {};
   return {
@@ -22,6 +24,11 @@ async function rawRequest(path, options = {}) {
 
   if (!response.ok || envelope.code !== 0) {
     throw new Error(envelope.msg || `Request failed with HTTP ${response.status}`);
+  }
+
+  const wrapper = envelope.data && typeof envelope.data === 'object' ? envelope.data : {};
+  if (wrapper.status === 'unauthenticated' || wrapper.error === 'session_expired') {
+    syncUnauthenticatedAuthState(wrapper.msg || envelope.msg);
   }
 
   return envelope.data;

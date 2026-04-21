@@ -55,6 +55,11 @@ function applyUnauthenticatedState(message = '', options = {}) {
   state.lastActionMessage = message;
 }
 
+export function syncUnauthenticatedAuthState(message = '', options = {}) {
+  const { t } = useI18n();
+  applyUnauthenticatedState(message || t('auth_pleaseLogin'), options);
+}
+
 export function mergeAuthUser(partialUser, message = '') {
   if (!state.user || !partialUser || typeof partialUser !== 'object') {
     return;
