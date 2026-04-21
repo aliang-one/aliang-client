@@ -24,8 +24,6 @@ func GetCertPath(certType string) (string, error) {
 	switch certType {
 	case CertTypeMitmCA:
 		return filepath.Join(certDir, "mitm-ca.pem"), nil
-	case CertTypeRootCA:
-		return filepath.Join(certDir, "root-ca.pem"), nil
 	case CertTypeMtlsClient:
 		return filepath.Join(certDir, "mtls-client.pem"), nil
 	default:

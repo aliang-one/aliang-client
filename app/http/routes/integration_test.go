@@ -39,7 +39,7 @@ func TestRunStopAndCertHTTPIntegration(t *testing.T) {
 		t.Fatalf("expected run stop error=not_running, got %#v", stopData["error"])
 	}
 
-	exportReq := httptest.NewRequest(http.MethodPost, "/api/cert/export", bytes.NewReader([]byte(`{"cert_type":"root-ca"}`)))
+	exportReq := httptest.NewRequest(http.MethodPost, "/api/cert/export", bytes.NewReader([]byte(`{"cert_type":"mitm-ca"}`)))
 	exportReq.Header.Set("Content-Type", "application/json")
 	exportRec := httptest.NewRecorder()
 	mux.ServeHTTP(exportRec, exportReq)
@@ -48,7 +48,7 @@ func TestRunStopAndCertHTTPIntegration(t *testing.T) {
 		t.Fatalf("cert export http status=%d body=%s", exportRec.Code, exportRec.Body.String())
 	}
 
-	statusReq := httptest.NewRequest(http.MethodGet, "/api/cert/status?cert_type=root-ca", nil)
+	statusReq := httptest.NewRequest(http.MethodGet, "/api/cert/status?cert_type=mitm-ca", nil)
 	statusRec := httptest.NewRecorder()
 	mux.ServeHTTP(statusRec, statusReq)
 
@@ -62,11 +62,11 @@ func TestRunStopAndCertHTTPIntegration(t *testing.T) {
 	}
 
 	statusData, _ := statusResp["data"].(map[string]interface{})
-	if statusData["cert_type"] != "root-ca" {
-		t.Fatalf("expected cert_type=root-ca, got %#v", statusData["cert_type"])
+	if statusData["cert_type"] != "mitm-ca" {
+		t.Fatalf("expected cert_type=mitm-ca, got %#v", statusData["cert_type"])
 	}
 
-	downloadReq := httptest.NewRequest(http.MethodGet, "/api/cert/download?cert_type=root-ca", nil)
+	downloadReq := httptest.NewRequest(http.MethodGet, "/api/cert/download?cert_type=mitm-ca", nil)
 	downloadRec := httptest.NewRecorder()
 	mux.ServeHTTP(downloadRec, downloadReq)
 
@@ -74,7 +74,7 @@ func TestRunStopAndCertHTTPIntegration(t *testing.T) {
 		t.Fatalf("cert download http status=%d body=%s", downloadRec.Code, downloadRec.Body.String())
 	}
 
-	if contentDisposition := downloadRec.Header().Get("Content-Disposition"); !strings.Contains(contentDisposition, "root-ca.pem") {
+	if contentDisposition := downloadRec.Header().Get("Content-Disposition"); !strings.Contains(contentDisposition, "mitm-ca.pem") {
 		t.Fatalf("unexpected Content-Disposition: %s", contentDisposition)
 	}
 }

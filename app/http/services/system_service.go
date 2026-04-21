@@ -378,8 +378,6 @@ func ensureManagedCertificateAssets(sourceDir string, targetDir string) error {
 	for _, name := range []string{
 		"mitm-ca.pem",
 		"mitm-ca.pem.key",
-		"root-ca.pem",
-		"root-ca.pem.key",
 		"mtls-client.pem",
 		"mtls-client.pem.key",
 	} {

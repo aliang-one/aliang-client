@@ -16,7 +16,6 @@ type CertConfig struct {
 // Certificate type constants
 const (
 	CertTypeMitmCA     = "mitm-ca"
-	CertTypeRootCA     = "root-ca"
 	CertTypeMtlsClient = "mtls-cert"
 )
 
@@ -31,19 +30,6 @@ var MitmCAConfig = CertConfig{
 	KeySize:          2048,
 	FileName:         "mitm-ca",
 	CertType:         CertTypeMitmCA,
-}
-
-// RootCAConfig is the configuration for Root CA certificate
-var RootCAConfig = CertConfig{
-	CN:               "aliang",
-	Issuer:           "aliang.com",
-	Country:          "US",
-	Organization:     "Subtraffic Inc",
-	OrganizationUnit: "Security",
-	ValidityYears:    10,
-	KeySize:          2048,
-	FileName:         "root-ca",
-	CertType:         CertTypeRootCA,
 }
 
 // MtlsClientConfig is the configuration for mTLS Client certificate
@@ -64,8 +50,6 @@ func GetCertConfig(certType string) *CertConfig {
 	switch certType {
 	case CertTypeMitmCA:
 		return &MitmCAConfig
-	case CertTypeRootCA:
-		return &RootCAConfig
 	case CertTypeMtlsClient:
 		return &MtlsClientConfig
 	default:
@@ -77,7 +61,6 @@ func GetCertConfig(certType string) *CertConfig {
 func AllCertTypes() []string {
 	return []string{
 		CertTypeMitmCA,
-		CertTypeRootCA,
 		CertTypeMtlsClient,
 	}
 }

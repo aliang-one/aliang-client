@@ -17,7 +17,7 @@ import (
 
 // CertStatusResult holds the status of a certificate
 type CertStatusResult struct {
-	CertType       string `json:"cert_type"`       // "mitm-ca", "root-ca", "mtls-cert"
+	CertType       string `json:"cert_type"`       // "mitm-ca", "mtls-cert"
 	IsExported     bool   `json:"is_exported"`     // Whether exported to file
 	IsInstalled    bool   `json:"is_installed"`    // Whether installed to system (file exists)
 	IsTrusted      bool   `json:"is_trusted"`      // Whether marked as globally trusted (NEW)
@@ -240,8 +240,6 @@ func (cs *CertService) getCertBytes(certType string) ([]byte, error) {
 	switch certType {
 	case "mitm-ca":
 		return cs.getMitmCACert()
-	case "root-ca":
-		return cs.getRootCACert()
 	case "mtls-cert":
 		return cs.getMTLSCert()
 	default:
@@ -264,22 +262,6 @@ func (cs *CertService) getMitmCACert() ([]byte, error) {
 			return nil, fmt.Errorf("failed to load MITM CA certificate: %w", err)
 		}
 		return certBytes.Certificate[0], nil
-	}
-
-	return os.ReadFile(certPath)
-}
-
-// getRootCACert returns the Root CA certificate bytes from filesystem
-func (cs *CertService) getRootCACert() ([]byte, error) {
-	certPath, err := cert_config.GetCertPath(cert_config.CertTypeRootCA)
-	if err != nil {
-		return nil, err
-	}
-
-	// Check if file exists
-	if _, err := os.Stat(certPath); os.IsNotExist(err) {
-		// Try to generate it through client_cert
-		return client_cert.LoadRootCACertificate()
 	}
 
 	return os.ReadFile(certPath)
@@ -311,8 +293,6 @@ func (cs *CertService) getExportPath(certType string) string {
 	switch certType {
 	case "mitm-ca":
 		return filepath.Join(certDir, "mitm-ca.pem")
-	case "root-ca":
-		return filepath.Join(certDir, "root-ca.pem")
 	case "mtls-cert":
 		return filepath.Join(certDir, "mtls-client.pem")
 	default:
