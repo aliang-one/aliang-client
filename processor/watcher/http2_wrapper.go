@@ -124,6 +124,8 @@ type http2Stream struct {
 	ReqEndStream bool
 	ReqSummary   string
 	AuthInjected bool
+	ReqSawHeader bool
+	LastReqFrame string
 
 	RespHeaders   map[string]string
 	RespBody      bytes.Buffer
@@ -169,6 +171,37 @@ func summarizeHTTP2RequestMap(headers map[string]string) string {
 	}
 	path := headers[":path"]
 	return fmt.Sprintf("method=%q authority=%q path=%q", method, authority, path)
+}
+
+func http2FrameTypeName(frameType byte) string {
+	switch frameType {
+	case frameTypeData:
+		return "DATA"
+	case frameTypeHeaders:
+		return "HEADERS"
+	case frameTypePriority:
+		return "PRIORITY"
+	case frameTypeRstStream:
+		return "RST_STREAM"
+	case frameTypeSettings:
+		return "SETTINGS"
+	case frameTypePushPromise:
+		return "PUSH_PROMISE"
+	case frameTypePing:
+		return "PING"
+	case frameTypeGoaway:
+		return "GOAWAY"
+	case frameTypeWindowUpdate:
+		return "WINDOW_UPDATE"
+	case frameTypeContinuation:
+		return "CONTINUATION"
+	default:
+		return fmt.Sprintf("UNKNOWN_%d", frameType)
+	}
+}
+
+func summarizeHTTP2Frame(frameType byte, flags byte, payloadLen int) string {
+	return fmt.Sprintf("type=%s(%d) flags=0x%02x len=%d", http2FrameTypeName(frameType), frameType, flags, payloadLen)
 }
 
 func isHTTP2InitialRequestHeaders(fields []hpack.HeaderField) bool {
@@ -261,6 +294,23 @@ func (w *WatcherWrapConn) summarizeHTTP2RequestByStreamID(streamID uint32) strin
 	return summarizeHTTP2RequestMap(nil)
 }
 
+func (w *WatcherWrapConn) latestHTTP2RequestFrameByStreamID(streamID uint32) string {
+	w.streamsMu.Lock()
+	defer w.streamsMu.Unlock()
+
+	if stream, ok := w.streams[streamID]; ok && stream != nil {
+		if strings.TrimSpace(stream.LastReqFrame) != "" {
+			return stream.LastReqFrame
+		}
+		if stream.ReqSawHeader {
+			return "headers_seen=true last_frame=unknown"
+		}
+		return "headers_seen=false last_frame=unknown"
+	}
+
+	return "headers_seen=false last_frame=unknown"
+}
+
 func (w *WatcherWrapConn) activeHTTP2RequestSummaries() []string {
 	w.streamsMu.Lock()
 	defer w.streamsMu.Unlock()
@@ -295,7 +345,12 @@ func (w *WatcherWrapConn) processHttp2RequestFrame(preBuff *bytes.Buffer) error 
 		logger.Debug(fmt.Sprintf("[HTTP/2 REQ] Frame type=%d flags=0x%02x stream=%d len=%d", ftype, flags, streamID, len(payload)))
 
 		if streamID != 0 {
-			w.getOrCreateStream(streamID)
+			stream := w.getOrCreateStream(streamID)
+			w.streamsMu.Lock()
+			if stream != nil {
+				stream.LastReqFrame = summarizeHTTP2Frame(ftype, flags, len(payload))
+			}
+			w.streamsMu.Unlock()
 		}
 
 		switch ftype {
@@ -353,6 +408,15 @@ func (w *WatcherWrapConn) processHttp2RequestFrame(preBuff *bytes.Buffer) error 
 				stream.ReqHeaders = headerFieldsToMap(rewrittenFields)
 				stream.ReqSummary = summary
 				stream.AuthInjected = injectKey == "authorization-inner" && strings.TrimSpace(injectValue) != ""
+				stream.ReqSawHeader = true
+				stream.LastReqFrame = fmt.Sprintf(
+					"%s rewritten={end_stream=%t has_priority=%t pad_length=%d auth_inner=%t}",
+					summarizeHTTP2Frame(ftype, flags, len(payload)),
+					rewriteMeta.endStream,
+					rewriteMeta.hasPriority,
+					rewriteMeta.padLength,
+					stream.AuthInjected,
+				)
 				w.rememberRecentHTTP2RequestSummary(streamID, summary)
 				if isHTTP2InitialRequestHeaders(rewrittenFields) {
 					logger.Info(fmt.Sprintf(
@@ -393,12 +457,14 @@ func (w *WatcherWrapConn) processHttp2RequestFrame(preBuff *bytes.Buffer) error 
 			if len(payload) >= 4 {
 				errorCode := binary.BigEndian.Uint32(payload[0:4])
 				requestSummary := w.summarizeHTTP2RequestByStreamID(streamID)
+				lastFrameSummary := w.latestHTTP2RequestFrameByStreamID(streamID)
 				logger.Warn(fmt.Sprintf(
-					"[HTTP/2 REQ] Stream %d reset by client, error code=%d(%s) %s",
+					"[HTTP/2 REQ] Stream %d reset by client, error code=%d(%s) %s last_req_frame={%s}",
 					streamID,
 					errorCode,
 					http2ErrorCodeName(errorCode),
 					requestSummary,
+					lastFrameSummary,
 				))
 				w.streamsMu.Lock()
 				delete(w.streams, streamID)
