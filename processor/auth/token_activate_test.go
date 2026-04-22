@@ -135,3 +135,113 @@ func TestRefreshSession_SerializesTokenRotation(t *testing.T) {
 		t.Fatalf("saved refresh token = %q, want refresh-2", saved.RefreshToken)
 	}
 }
+
+func TestRefreshSession_PersistsRotatedTokenWhenProfileSyncFails(t *testing.T) {
+	baseDir, err := os.MkdirTemp("", "aliang-refresh-profile-failure-*")
+	if err != nil {
+		t.Fatalf("MkdirTemp() error = %v", err)
+	}
+	t.Setenv("HOME", filepath.Join(baseDir, "home"))
+	t.Setenv("ALIANG_CACHE_DIR", filepath.Join(baseDir, "cache"))
+	defer os.RemoveAll(baseDir)
+
+	defer StopTokenRefresh()
+	defer ResetAuthPersistenceForTest()
+	defer config.ResetGlobalConfigForTest()
+
+	ResetAuthPersistenceForTest()
+	StopTokenRefresh()
+	config.ResetGlobalConfigForTest()
+
+	var refreshCalls int32
+	var profileCalls int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/auth/refresh":
+			var payload struct {
+				RefreshToken string `json:"refresh_token"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Fatalf("decode refresh payload failed: %v", err)
+			}
+
+			switch atomic.AddInt32(&refreshCalls, 1) {
+			case 1:
+				if payload.RefreshToken != "refresh-1" {
+					t.Fatalf("first refresh token = %q, want refresh-1", payload.RefreshToken)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"data":{"access_token":"access-2","refresh_token":"refresh-2","expires_in":3600,"token_type":"Bearer"}}`))
+			case 2:
+				if payload.RefreshToken != "refresh-2" {
+					t.Fatalf("second refresh token = %q, want refresh-2", payload.RefreshToken)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"data":{"access_token":"access-3","refresh_token":"refresh-3","expires_in":3600,"token_type":"Bearer"}}`))
+			default:
+				t.Fatalf("unexpected refresh call #%d with token %q", refreshCalls, payload.RefreshToken)
+			}
+			return
+
+		case "/api/v1/user/profile":
+			call := atomic.AddInt32(&profileCalls, 1)
+			if call == 1 {
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte(`{"message":"temporary failure"}`))
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":{"id":1,"email":"user@example.com","username":"user","role":"member","balance":12.5,"concurrency":2,"status":"active","allowed_groups":[1,2],"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-04-09T00:00:00Z"}}`))
+			return
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	config.SetGlobalConfig(&config.Config{Core: &config.CoreConfig{APIServer: server.URL}})
+
+	if err := SaveUserInfo(&UserInfo{
+		AccessToken:  "access-1",
+		RefreshToken: "refresh-1",
+		TokenType:    "Bearer",
+		Username:     "cached-user",
+		Email:        "cached@example.com",
+		UpdatedAt:    time.Now().Add(-30 * time.Minute),
+		ExpiresIn:    3600,
+	}); err != nil {
+		t.Fatalf("SaveUserInfo() error = %v", err)
+	}
+
+	refreshed, err := RefreshSession("refresh-1")
+	if err != nil {
+		t.Fatalf("first RefreshSession() error = %v", err)
+	}
+	if refreshed.RefreshToken != "refresh-2" {
+		t.Fatalf("first RefreshSession() refresh token = %q, want refresh-2", refreshed.RefreshToken)
+	}
+	if refreshed.Username != "cached-user" {
+		t.Fatalf("first RefreshSession() username = %q, want cached-user fallback", refreshed.Username)
+	}
+
+	savedAfterFirstRefresh, err := LoadUserInfo()
+	if err != nil {
+		t.Fatalf("LoadUserInfo() after first refresh error = %v", err)
+	}
+	if savedAfterFirstRefresh.RefreshToken != "refresh-2" {
+		t.Fatalf("saved refresh token after first refresh = %q, want refresh-2", savedAfterFirstRefresh.RefreshToken)
+	}
+
+	refreshedAgain, err := RefreshSession("")
+	if err != nil {
+		t.Fatalf("second RefreshSession() error = %v", err)
+	}
+	if refreshedAgain.RefreshToken != "refresh-3" {
+		t.Fatalf("second RefreshSession() refresh token = %q, want refresh-3", refreshedAgain.RefreshToken)
+	}
+	if refreshedAgain.Username != "user" {
+		t.Fatalf("second RefreshSession() username = %q, want user", refreshedAgain.Username)
+	}
+}

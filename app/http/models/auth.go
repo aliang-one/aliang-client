@@ -26,5 +26,7 @@ type UserInfoResponse struct {
 	AllowedGroups  []int64 `json:"allowed_groups,omitempty"`
 	CreatedAt      string  `json:"created_at,omitempty"`
 	ProfileUpdated string  `json:"profile_updated_at,omitempty"`
+	ExpiresIn      int     `json:"expires_in,omitempty"`
+	ExpiresAt      string  `json:"expires_at,omitempty"`
 	UpdatedAt      string  `json:"updated_at"`
 }

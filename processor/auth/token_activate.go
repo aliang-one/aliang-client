@@ -269,17 +269,14 @@ func RefreshSession(refreshToken string) (*UserInfo, error) {
 		response.Data.RefreshToken = token
 	}
 
+	userInfo := mergeRefreshedSessionWithCurrentUser(current, response.Data.AccessToken, response.Data.RefreshToken, response.Data.TokenType, response.Data.ExpiresIn)
+
 	profile, err := GetUserProfileWithToken(response.Data.AccessToken)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch user profile after refresh: %w", err)
+		logger.Warn(fmt.Sprintf("Profile sync after refresh failed, keeping last known user profile: %v", err))
+	} else {
+		applyUserProfileToUserInfo(userInfo, profile)
 	}
-
-	userInfo := buildUserInfoFromProfile(profile)
-	userInfo.AccessToken = response.Data.AccessToken
-	userInfo.RefreshToken = response.Data.RefreshToken
-	userInfo.TokenType = response.Data.TokenType
-	userInfo.ExpiresIn = response.Data.ExpiresIn
-	userInfo.UpdatedAt = time.Now()
 
 	if err := SaveUserInfo(userInfo); err != nil {
 		return nil, fmt.Errorf("failed to save refreshed user info: %w", err)
@@ -289,6 +286,21 @@ func RefreshSession(refreshToken string) (*UserInfo, error) {
 	config.SetHasLocalUserInfo(true)
 
 	return userInfo, nil
+}
+
+func mergeRefreshedSessionWithCurrentUser(current *UserInfo, accessToken, refreshToken, tokenType string, expiresIn int) *UserInfo {
+	info := &UserInfo{}
+	if current != nil {
+		*info = *current
+	}
+
+	info.AccessToken = accessToken
+	info.RefreshToken = refreshToken
+	info.TokenType = tokenType
+	info.ExpiresIn = expiresIn
+	info.UpdatedAt = time.Now()
+
+	return info
 }
 
 func LogoutSession(refreshToken string) error {

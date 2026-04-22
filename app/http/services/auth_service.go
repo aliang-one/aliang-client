@@ -21,6 +21,11 @@ func NewAuthService() *AuthService {
 }
 
 func mapUserInfo(userInfo *auth.UserInfo) models.UserInfoResponse {
+	expiresAt := ""
+	if !userInfo.UpdatedAt.IsZero() && userInfo.ExpiresIn > 0 {
+		expiresAt = userInfo.UpdatedAt.Add(time.Duration(userInfo.ExpiresIn) * time.Second).Format(time.RFC3339)
+	}
+
 	return models.UserInfoResponse{
 		ID:             userInfo.ID,
 		Username:       userInfo.Username,
@@ -32,6 +37,8 @@ func mapUserInfo(userInfo *auth.UserInfo) models.UserInfoResponse {
 		AllowedGroups:  append([]int64(nil), userInfo.AllowedGroups...),
 		CreatedAt:      userInfo.CreatedAt,
 		ProfileUpdated: userInfo.ProfileUpdated,
+		ExpiresIn:      userInfo.ExpiresIn,
+		ExpiresAt:      expiresAt,
 		UpdatedAt:      userInfo.UpdatedAt.Format(time.RFC3339),
 	}
 }

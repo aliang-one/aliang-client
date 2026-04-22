@@ -1,6 +1,10 @@
 import { computed, reactive, readonly, toRefs } from 'vue';
-import { login as loginRequest, logout as logoutRequest, restoreSession as restoreSessionRequest } from '../services/authApi';
+import { getCurrentUser as getCurrentUserRequest, login as loginRequest, logout as logoutRequest, restoreSession as restoreSessionRequest } from '../services/authApi';
 import { useI18n } from '../i18n';
+
+const authSessionPollIntervalMs = 60 * 1000;
+const authRefreshLeadTimeMs = 10 * 60 * 1000;
+let authSessionPollTimer = null;
 
 const state = reactive({
   user: null,
@@ -33,6 +37,8 @@ function normalizeUser(user) {
       : [],
     createdAt: typeof user.created_at === 'string' ? user.created_at : '',
     profileUpdatedAt: typeof user.profile_updated_at === 'string' ? user.profile_updated_at : '',
+    expiresIn: Number(user.expires_in || 0),
+    expiresAt: typeof user.expires_at === 'string' ? user.expires_at : '',
     updatedAt: typeof user.updated_at === 'string' ? user.updated_at : ''
   };
 }
@@ -44,6 +50,18 @@ function applyAuthenticatedState(user, message = '') {
   state.loginError = '';
   state.restoreError = '';
   state.lastActionMessage = message;
+}
+
+function refreshAuthenticatedUser(user) {
+  const normalized = normalizeUser(user);
+  if (!normalized) {
+    return;
+  }
+
+  state.user = normalized;
+  state.isAuthenticated = true;
+  state.status = 'authenticated';
+  state.restoreError = '';
 }
 
 function applyUnauthenticatedState(message = '', options = {}) {
@@ -58,6 +76,7 @@ function applyUnauthenticatedState(message = '', options = {}) {
 export function syncUnauthenticatedAuthState(message = '', options = {}) {
   const { t } = useI18n();
   applyUnauthenticatedState(message || t('auth_pleaseLogin'), options);
+  stopAuthSessionMonitor();
 }
 
 export function mergeAuthUser(partialUser, message = '') {
@@ -92,13 +111,16 @@ export async function restoreAuthSession() {
     const result = await restoreSessionRequest();
     if (result.status === 'success' && result.data) {
       applyAuthenticatedState(result.data, result.message || t('auth_sessionRestored'));
+      startAuthSessionMonitor();
       return true;
     }
 
     applyUnauthenticatedState(result.message || t('auth_pleaseLogin'));
+    stopAuthSessionMonitor();
     return false;
   } catch (error) {
     applyUnauthenticatedState(error instanceof Error ? error.message : t('auth_pleaseLogin'));
+    stopAuthSessionMonitor();
     return false;
   } finally {
     state.restorePending = false;
@@ -120,6 +142,7 @@ export async function loginWithPassword(credentials) {
     }
 
     applyAuthenticatedState(result.data, result.message || t('auth_loginSuccess'));
+    startAuthSessionMonitor();
     state.isReady = true;
     return true;
   } catch (error) {
@@ -129,6 +152,7 @@ export async function loginWithPassword(credentials) {
     state.loginError = error instanceof Error ? error.message : t('auth_loginFailed');
     state.lastActionMessage = '';
     state.isReady = true;
+    stopAuthSessionMonitor();
     return false;
   } finally {
     state.loginPending = false;
@@ -150,9 +174,83 @@ export async function logoutUser() {
   } catch (error) {
     applyUnauthenticatedState(error instanceof Error ? error.message : t('auth_loggedOutLocally'));
   } finally {
+    stopAuthSessionMonitor();
     state.logoutPending = false;
     state.isReady = true;
   }
+}
+
+async function pollAuthSession() {
+  if (state.restorePending || state.loginPending || state.logoutPending) {
+    return;
+  }
+
+  const { t } = useI18n();
+  const localExpiry = getLocalSessionExpiry(state.user);
+  if (localExpiry !== null) {
+    const remainingMs = localExpiry - Date.now();
+    if (remainingMs <= 0) {
+      syncUnauthenticatedAuthState(t('user_sessionExpired'));
+      return;
+    }
+    if (remainingMs <= authRefreshLeadTimeMs) {
+      return;
+    }
+  }
+
+  try {
+    const result = await getCurrentUserRequest();
+    if (result.status === 'success' && result.data) {
+      refreshAuthenticatedUser(result.data);
+      return;
+    }
+
+    syncUnauthenticatedAuthState(result.message || t('auth_pleaseLogin'));
+  } catch (error) {
+    syncUnauthenticatedAuthState(error instanceof Error ? error.message : t('auth_pleaseLogin'));
+  }
+}
+
+function startAuthSessionMonitor() {
+  if (authSessionPollTimer !== null || !state.isAuthenticated) {
+    return;
+  }
+
+  authSessionPollTimer = window.setInterval(() => {
+    void pollAuthSession();
+  }, authSessionPollIntervalMs);
+}
+
+function stopAuthSessionMonitor() {
+  if (authSessionPollTimer === null) {
+    return;
+  }
+
+  window.clearInterval(authSessionPollTimer);
+  authSessionPollTimer = null;
+}
+
+function getLocalSessionExpiry(user) {
+  if (!user || typeof user !== 'object') {
+    return null;
+  }
+
+  const explicitExpiry = Date.parse(user.expiresAt || '');
+  if (Number.isFinite(explicitExpiry)) {
+    return explicitExpiry;
+  }
+
+  const updatedAt = Date.parse(user.updatedAt || '');
+  if (!Number.isFinite(updatedAt)) {
+    return null;
+  }
+
+  const expiresInMs = Number(user.expiresIn || 0) * 1000;
+  if (!Number.isFinite(expiresInMs) || expiresInMs <= 0) {
+    return null;
+  }
+
+  return updatedAt + expiresInMs;
 }
 
 export function useAuthStore() {

@@ -352,6 +352,9 @@ func TestAuthSessionAndUserCenterLifecycleIntegration(t *testing.T) {
 	if mePayload["username"] != "restored-user" {
 		t.Fatalf("expected auth me username=restored-user, got %#v", mePayload["username"])
 	}
+	if got := mePayload["expires_in"]; got != nil && got != float64(0) {
+		t.Fatalf("expected default expires_in to remain zero for restored session without expiry metadata, got %#v", got)
+	}
 
 	logoutReq := httptest.NewRequest(http.MethodPost, "/api/auth/logout", bytes.NewReader([]byte(`{}`)))
 	logoutReq.Header.Set("Content-Type", "application/json")

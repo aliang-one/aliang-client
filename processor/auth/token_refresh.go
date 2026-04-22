@@ -22,6 +22,8 @@ type TokenRefresher struct {
 const (
 	// 默认刷新间隔（1分钟）
 	defaultRefreshDuration = 1 * time.Minute
+	// access token 剩余 10 分钟时开始刷新
+	tokenRefreshLeadTime = 10 * time.Minute
 )
 
 // NewTokenRefresher 创建新的Token刷新器
@@ -135,19 +137,14 @@ func (tr *TokenRefresher) refreshUserInfo() error {
 		return fmt.Errorf("no user info to refresh")
 	}
 
-	// 检查 access token 是否即将过期（提前5分钟刷新）
-	if tr.isTokenExpired(currentInfo) {
-		logger.Info("Access token expired or expiring soon, refreshing session")
-		_, err := RefreshSession(currentInfo.RefreshToken)
-		if err != nil {
-			return fmt.Errorf("failed to refresh session: %w", err)
-		}
-	} else {
-		// Token 仍然有效，只更新用户信息
-		_, err := RefreshSession(currentInfo.RefreshToken)
-		if err != nil {
-			return fmt.Errorf("failed to refresh session: %w", err)
-		}
+	// 仅在 access token 临近过期时才使用 refresh token，避免无谓轮换 refresh token。
+	if !tr.isTokenExpired(currentInfo) {
+		return nil
+	}
+
+	logger.Info("Access token expired or expiring soon, refreshing session")
+	if _, err := RefreshSession(currentInfo.RefreshToken); err != nil {
+		return fmt.Errorf("failed to refresh session: %w", err)
 	}
 
 	return nil
@@ -159,10 +156,9 @@ func (tr *TokenRefresher) isTokenExpired(info *UserInfo) bool {
 		return true
 	}
 
-	// 计算过期时间：更新时间 + 过期秒数 - 5分钟缓冲
+	// 计算过期时间：更新时间 + 过期秒数 - 提前刷新缓冲
 	expireTime := info.UpdatedAt.Add(time.Duration(info.ExpiresIn) * time.Second)
-	bufferTime := 5 * time.Minute // 提前5分钟刷新
-	expireTime = expireTime.Add(-bufferTime)
+	expireTime = expireTime.Add(-tokenRefreshLeadTime)
 
 	return time.Now().After(expireTime)
 }
