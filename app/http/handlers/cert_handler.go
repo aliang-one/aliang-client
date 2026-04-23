@@ -167,7 +167,7 @@ func (ch *CertHandler) HandleInstall(w http.ResponseWriter, r *http.Request) {
 
 	common.Success(w, map[string]interface{}{
 		"cert_type": req.CertType,
-		"message":   "Certificate installed successfully",
+		"message":   "Certificate trust flow opened successfully",
 	})
 }
 

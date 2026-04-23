@@ -80,6 +80,7 @@ func (cs *CertService) GetCertStatus(certType string) (CertStatusResult, error) 
 	if err == nil {
 		result.Fingerprint = certInfo.Fingerprint
 		result.InstallPath = certInfo.InstallPath
+		result.InstalledCount = certInfo.InstalledCount
 	}
 
 	// Check if exported
@@ -195,7 +196,7 @@ func (cs *CertService) InstallCert(certType string) error {
 		return fmt.Errorf("failed to install certificate: %w", err)
 	}
 
-	logger.Info(fmt.Sprintf("Certificate %s installed successfully", certType))
+	logger.Info(fmt.Sprintf("Certificate %s install flow started successfully", certType))
 	return nil
 }
 

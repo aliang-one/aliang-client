@@ -157,10 +157,15 @@
                 v-if="tunConflictScan.interfaces.length > 0"
                 class="rounded-xl border border-slate-200 bg-slate-50/90 px-4 py-3 dark:border-slate-700 dark:bg-slate-800/60"
               >
-                <p class="text-[11px] font-bold uppercase tracking-[0.2em] text-slate-500 dark:text-slate-400">{{ t('sys_tunConflictListTitle') }}</p>
+                <div class="flex flex-wrap items-center justify-between gap-2">
+                  <p class="text-[11px] font-bold uppercase tracking-[0.2em] text-slate-500 dark:text-slate-400">{{ t('sys_tunConflictListTitle') }}</p>
+                  <span class="text-[11px] text-slate-500 dark:text-slate-400">
+                    {{ tunConflictPaginationSummary }}
+                  </span>
+                </div>
                 <div class="mt-3 space-y-2">
                   <div
-                    v-for="item in tunConflictScan.interfaces"
+                    v-for="item in paginatedTunConflictInterfaces"
                     :key="`${item.name}-${item.description}`"
                     class="rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 dark:border-slate-700 dark:bg-slate-900/60 dark:text-slate-200"
                   >
@@ -169,6 +174,32 @@
                     <div class="mt-1 text-[11px] text-slate-500 dark:text-slate-400">
                       {{ item.match_reason }}<span v-if="item.status"> · {{ item.status }}</span>
                     </div>
+                  </div>
+                </div>
+                <div
+                  v-if="tunConflictTotalPages > 1"
+                  class="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-slate-200 pt-3 dark:border-slate-700"
+                >
+                  <span class="text-[11px] text-slate-500 dark:text-slate-400">
+                    {{ currentTunConflictPage }}/{{ tunConflictTotalPages }}
+                  </span>
+                  <div class="flex items-center gap-2">
+                    <button
+                      type="button"
+                      class="inline-flex min-h-11 items-center justify-center rounded-lg border border-slate-200 px-3 text-sm font-semibold text-slate-700 transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-50 dark:border-slate-700 dark:text-slate-100 dark:hover:bg-slate-800"
+                      :disabled="currentTunConflictPage === 1"
+                      @click="goToTunConflictPage(currentTunConflictPage - 1)"
+                    >
+                      上一页
+                    </button>
+                    <button
+                      type="button"
+                      class="inline-flex min-h-11 items-center justify-center rounded-lg border border-slate-200 px-3 text-sm font-semibold text-slate-700 transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-50 dark:border-slate-700 dark:text-slate-100 dark:hover:bg-slate-800"
+                      :disabled="currentTunConflictPage === tunConflictTotalPages"
+                      @click="goToTunConflictPage(currentTunConflictPage + 1)"
+                    >
+                      下一页
+                    </button>
                   </div>
                 </div>
               </div>
@@ -495,11 +526,9 @@ export default {
       modeError: '',
       modeSuccess: '',
       loadingMode: false,
-      switchingMode: false,
-      showTunSwitchConfirm: false,
-      showSystemServiceConfirm: false,
-      systemServiceConfirmAction: '',
       pendingTunSwitchAfterInstall: false,
+      tunConflictPageSize: 5,
+      currentTunConflictPage: 1,
       tunConflictScan: {
         should_prompt: false,
         first_time_prompt: false,
@@ -571,6 +600,22 @@ export default {
       return this.tunConflictScan.first_time_prompt
         ? this.t('sys_tunFirstTimeWarning')
         : this.t('sys_tunPermissionWarning');
+    },
+    tunConflictTotalPages() {
+      return Math.max(1, Math.ceil(this.tunConflictScan.interfaces.length / this.tunConflictPageSize));
+    },
+    paginatedTunConflictInterfaces() {
+      const start = (this.currentTunConflictPage - 1) * this.tunConflictPageSize;
+      return this.tunConflictScan.interfaces.slice(start, start + this.tunConflictPageSize);
+    },
+    tunConflictPaginationSummary() {
+      const total = this.tunConflictScan.interfaces.length;
+      if (!total) {
+        return '';
+      }
+      const start = (this.currentTunConflictPage - 1) * this.tunConflictPageSize + 1;
+      const end = Math.min(total, start + this.paginatedTunConflictInterfaces.length - 1);
+      return `${start}-${end} / ${total}`;
     },
     wintunDependency() {
       const dependency = this.authoritativeWintunDependency;
@@ -721,12 +766,36 @@ export default {
       if (!this.switchingMode && !this.pendingTunSwitchAfterInstall && nextMode) {
         this.selectedMode = nextMode;
       }
+    },
+    'tunConflictScan.interfaces'(nextInterfaces) {
+      const totalPages = Math.max(1, Math.ceil((Array.isArray(nextInterfaces) ? nextInterfaces.length : 0) / this.tunConflictPageSize));
+      if (this.currentTunConflictPage > totalPages) {
+        this.currentTunConflictPage = totalPages;
+      }
+      if (this.currentTunConflictPage < 1) {
+        this.currentTunConflictPage = 1;
+      }
+    },
+    showTunSwitchConfirm(nextValue) {
+      if (nextValue) {
+        this.currentTunConflictPage = 1;
+      }
     }
   },
   methods: {
     clearMessages() {
       this.modeError = '';
       this.modeSuccess = '';
+    },
+    goToTunConflictPage(page) {
+      const normalizedPage = Number(page);
+      if (!Number.isFinite(normalizedPage)) {
+        return;
+      }
+      this.currentTunConflictPage = Math.min(
+        this.tunConflictTotalPages,
+        Math.max(1, Math.trunc(normalizedPage))
+      );
     },
     themeButtonClass(mode) {
       return this.themeMode === mode
@@ -784,6 +853,7 @@ export default {
             has_conflict: false,
             interfaces: []
           };
+      this.currentTunConflictPage = 1;
       return this.tunConflictScan;
     },
     async refreshSystemServiceStatus() {
@@ -853,6 +923,7 @@ export default {
     cancelTunSwitchConfirm() {
       this.showTunSwitchConfirm = false;
       this.selectedMode = this.backendMode;
+      this.currentTunConflictPage = 1;
       this.tunConflictScan = {
         should_prompt: false,
         first_time_prompt: false,
