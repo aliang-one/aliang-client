@@ -26,7 +26,7 @@ const (
 	// tcpMaxConcurrentConn limits the number of simultaneously relayed TCP
 	// sessions. Each accepted TCP flow gets its own goroutine, so this limiter
 	// protects memory/file descriptors while avoiding worker-pool starvation.
-	tcpMaxConcurrentConn = 4000
+	tcpMaxConcurrentConn = 2000
 	// udpWorkerCount is the number of UDP worker goroutines
 	udpWorkerCount = 50
 	// tcpStatsLogInterval controls periodic TCP concurrency diagnostics.
