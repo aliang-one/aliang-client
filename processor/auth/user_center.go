@@ -3,6 +3,7 @@ package user
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -108,6 +109,16 @@ type userAPIKeyListEnvelope struct {
 	} `json:"data"`
 }
 
+type authenticatedAPIError struct {
+	Endpoint   string
+	StatusCode int
+	Body       []byte
+}
+
+func (e *authenticatedAPIError) Error() string {
+	return fmt.Sprintf("api %s returned status %d: %s", e.Endpoint, e.StatusCode, string(e.Body))
+}
+
 func resolveAccessToken() (string, error) {
 	current := GetCurrentUserInfoOrLoad()
 	if current == nil {
@@ -152,7 +163,11 @@ func callAuthenticatedAPI(method, endpoint, accessToken string, body any) ([]byt
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("api %s returned status %d: %s", endpoint, resp.StatusCode, string(responseBody))
+		return nil, &authenticatedAPIError{
+			Endpoint:   endpoint,
+			StatusCode: resp.StatusCode,
+			Body:       responseBody,
+		}
 	}
 
 	return responseBody, nil
@@ -163,7 +178,14 @@ func callUserCenterAPI(method, endpoint string, body any) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return callAuthenticatedAPI(method, endpoint, authToken, body)
+	responseBody, err := callAuthenticatedAPI(method, endpoint, authToken, body)
+	if err != nil {
+		if verifiedErr := verifyCurrentSessionWithAuthMe(authToken, err); verifiedErr != nil {
+			return nil, verifiedErr
+		}
+		return nil, err
+	}
+	return responseBody, nil
 }
 
 func resolveAuthTokenForEndpoint(endpoint string) (string, error) {
@@ -182,6 +204,38 @@ func resolveAuthTokenForEndpoint(endpoint string) (string, error) {
 
 func applyEndpointSpecificHeaders(req *http.Request) {
 	// no-op: kept for forward compatibility
+}
+
+func verifyCurrentSessionWithAuthMe(accessToken string, originalErr error) error {
+	var apiErr *authenticatedAPIError
+	if !errors.As(originalErr, &apiErr) || apiErr.StatusCode != http.StatusUnauthorized {
+		return nil
+	}
+
+	urlBuilder, err := config.NewURLBuilder()
+	if err != nil {
+		return nil
+	}
+	authMeURL, err := urlBuilder.GetAuthMeURL()
+	if err != nil {
+		return nil
+	}
+
+	_, err = callAuthenticatedAPI(http.MethodGet, authMeURL, accessToken, nil)
+	if err == nil {
+		return nil
+	}
+
+	var authMeErr *authenticatedAPIError
+	if !errors.As(err, &authMeErr) {
+		return nil
+	}
+	if !errors.Is(classifyAccessTokenFailure(authMeErr.StatusCode, authMeErr.Body), ErrSessionExpired) {
+		return nil
+	}
+
+	clearLocalSessionAfterExpiredAccessToken()
+	return ErrSessionExpired
 }
 
 func GetUserProfileWithToken(accessToken string) (*UserProfile, error) {
@@ -216,7 +270,14 @@ func GetUserProfile() (*UserProfile, error) {
 	if err != nil {
 		return nil, err
 	}
-	return GetUserProfileWithToken(accessToken)
+	profile, err := GetUserProfileWithToken(accessToken)
+	if err != nil {
+		if verifiedErr := verifyCurrentSessionWithAuthMe(accessToken, err); verifiedErr != nil {
+			return nil, verifiedErr
+		}
+		return nil, err
+	}
+	return profile, nil
 }
 
 func UpdateUserProfile(username string) (*UserProfile, error) {

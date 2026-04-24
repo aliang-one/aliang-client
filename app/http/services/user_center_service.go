@@ -1,6 +1,7 @@
 package services
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -26,6 +27,13 @@ func NewUserCenterService() *UserCenterService {
 func (s *UserCenterService) GetProfile() map[string]interface{} {
 	profile, err := getUserProfileFn()
 	if err != nil {
+		if errors.Is(err, auth.ErrSessionExpired) {
+			return map[string]interface{}{
+				"status": "unauthenticated",
+				"error":  "session_expired",
+				"msg":    "Session expired. Please log in again.",
+			}
+		}
 		if isSessionMissingError(err) {
 			return map[string]interface{}{
 				"status": "unauthenticated",
@@ -68,6 +76,13 @@ func (s *UserCenterService) UpdateProfile(username string) map[string]interface{
 
 	profile, err := updateUserProfileFn(username)
 	if err != nil {
+		if errors.Is(err, auth.ErrSessionExpired) {
+			return map[string]interface{}{
+				"status": "unauthenticated",
+				"error":  "session_expired",
+				"msg":    "Session expired. Please log in again.",
+			}
+		}
 		if isSessionMissingError(err) {
 			return map[string]interface{}{
 				"status": "unauthenticated",
@@ -103,6 +118,13 @@ func (s *UserCenterService) UpdateProfile(username string) map[string]interface{
 func (s *UserCenterService) GetUsageSummary() map[string]interface{} {
 	summary, err := getUserUsageSummaryFn()
 	if err != nil {
+		if errors.Is(err, auth.ErrSessionExpired) {
+			return map[string]interface{}{
+				"status": "unauthenticated",
+				"error":  "session_expired",
+				"msg":    "Session expired. Please log in again.",
+			}
+		}
 		if isSessionMissingError(err) {
 			return map[string]interface{}{
 				"status": "unauthenticated",
@@ -130,6 +152,13 @@ func (s *UserCenterService) GetUsageSummary() map[string]interface{} {
 func (s *UserCenterService) GetUsageProgress() map[string]interface{} {
 	progress, err := getUserUsageProgressFn()
 	if err != nil {
+		if errors.Is(err, auth.ErrSessionExpired) {
+			return map[string]interface{}{
+				"status": "unauthenticated",
+				"error":  "session_expired",
+				"msg":    "Session expired. Please log in again.",
+			}
+		}
 		if isSessionMissingError(err) {
 			return map[string]interface{}{
 				"status": "unauthenticated",
@@ -153,6 +182,13 @@ func (s *UserCenterService) GetUsageProgress() map[string]interface{} {
 func (s *UserCenterService) GetAPIKeys() map[string]interface{} {
 	apiKeys, err := getUserAPIKeysFn()
 	if err != nil {
+		if errors.Is(err, auth.ErrSessionExpired) {
+			return map[string]interface{}{
+				"status": "unauthenticated",
+				"error":  "session_expired",
+				"msg":    "Session expired. Please log in again.",
+			}
+		}
 		if isSessionMissingError(err) {
 			return map[string]interface{}{
 				"status": "unauthenticated",
@@ -212,6 +248,13 @@ func (s *UserCenterService) RedeemCode(code string) map[string]interface{} {
 
 	result, err := redeemCodeFn(code)
 	if err != nil {
+		if errors.Is(err, auth.ErrSessionExpired) {
+			return map[string]interface{}{
+				"status": "unauthenticated",
+				"error":  "session_expired",
+				"msg":    "Session expired. Please log in again.",
+			}
+		}
 		if isSessionMissingError(err) {
 			return map[string]interface{}{
 				"status": "unauthenticated",

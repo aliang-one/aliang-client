@@ -33,6 +33,23 @@ func TestUserCenterService_GetProfile_Unauthenticated(t *testing.T) {
 	}
 }
 
+func TestUserCenterService_GetProfile_SessionExpired(t *testing.T) {
+	defer resetUserCenterServiceHooksForTest()
+	getUserProfileFn = func() (*auth.UserProfile, error) {
+		return nil, auth.ErrSessionExpired
+	}
+
+	svc := NewUserCenterService()
+	result := svc.GetProfile()
+
+	if got := result["status"]; got != "unauthenticated" {
+		t.Fatalf("status=%v", got)
+	}
+	if got := result["error"]; got != "session_expired" {
+		t.Fatalf("error=%v", got)
+	}
+}
+
 func TestUserCenterService_UpdateProfile_Validation(t *testing.T) {
 	svc := NewUserCenterService()
 	result := svc.UpdateProfile("  ")
