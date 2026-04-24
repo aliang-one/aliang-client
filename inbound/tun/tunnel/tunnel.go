@@ -2,6 +2,7 @@ package tunnel
 
 import (
 	"context"
+	"fmt"
 	"runtime/debug"
 	"sync"
 	"time"
@@ -22,18 +23,24 @@ const (
 	// udpSessionTimeout is the default timeout for UDP sessions.
 	udpSessionTimeout = 60 * time.Second
 
-	// tcpWorkerCount is the number of TCP worker goroutines
-	tcpWorkerCount = 100
+	// tcpMaxConcurrentConn limits the number of simultaneously relayed TCP
+	// sessions. Each accepted TCP flow gets its own goroutine, so this limiter
+	// protects memory/file descriptors while avoiding worker-pool starvation.
+	tcpMaxConcurrentConn = 4000
 	// udpWorkerCount is the number of UDP worker goroutines
 	udpWorkerCount = 50
+	// tcpStatsLogInterval controls periodic TCP concurrency diagnostics.
+	tcpStatsLogInterval = 30 * time.Second
 )
 
 var _ adapter.TransportHandler = (*Tunnel)(nil)
 
 type Tunnel struct {
-	// Unbuffered TCP/UDP queues.
-	tcpQueue chan adapter.TCPConn
+	// UDP queue remains worker-driven because UDP sessions are short-lived and
+	// packet-oriented. TCP uses dedicated goroutines plus a limiter instead.
 	udpQueue chan adapter.UDPConn
+	// tcpLimiter bounds the number of active TCP relay goroutines.
+	tcpLimiter chan struct{}
 
 	// UDP session timeout.
 	udpTimeout *atomic.Duration
@@ -47,22 +54,21 @@ type Tunnel struct {
 
 	procOnce   sync.Once
 	procCancel context.CancelFunc
+
+	activeTCPConn   atomic.Int64
+	rejectedTCPConn atomic.Int64
+	peakTCPConn     atomic.Int64
 }
 
 func New(dialer proxy.Dialer, manager *statistic.Manager) *Tunnel {
 	return &Tunnel{
-		tcpQueue:   make(chan adapter.TCPConn, 512),
 		udpQueue:   make(chan adapter.UDPConn, 128),
+		tcpLimiter: make(chan struct{}, tcpMaxConcurrentConn),
 		udpTimeout: atomic.NewDuration(udpSessionTimeout),
 		dialer:     dialer,
 		manager:    manager,
 		procCancel: func() { /* nop */ },
 	}
-}
-
-// TCPIn return fan-in TCP queue.
-func (t *Tunnel) TCPIn() chan<- adapter.TCPConn {
-	return t.tcpQueue
 }
 
 // UDPIn return fan-in UDP queue.
@@ -71,7 +77,33 @@ func (t *Tunnel) UDPIn() chan<- adapter.UDPConn {
 }
 
 func (t *Tunnel) HandleTCP(conn adapter.TCPConn) {
-	t.TCPIn() <- conn
+	select {
+	case t.tcpLimiter <- struct{}{}:
+		active := t.activeTCPConn.Inc()
+		t.updatePeakTCP(active)
+
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					logger.Error("Recovered from panic in Tunnel.HandleTCP goroutine: ", logger.SafeRecoveredValueString(r))
+					debug.PrintStack()
+				}
+				t.activeTCPConn.Dec()
+				<-t.tcpLimiter
+			}()
+
+			t.handleTCPConn(conn)
+		}()
+	default:
+		rejected := t.rejectedTCPConn.Inc()
+		logger.Warn(fmt.Sprintf(
+			"[TUN TCP] concurrency limit reached active=%d limit=%d rejected_total=%d; closing new connection",
+			t.activeTCPConn.Load(),
+			cap(t.tcpLimiter),
+			rejected,
+		))
+		_ = conn.Close()
+	}
 }
 
 func (t *Tunnel) HandleUDP(conn adapter.UDPConn) {
@@ -86,25 +118,7 @@ func (t *Tunnel) process(ctx context.Context) {
 		}
 	}()
 
-	// Start TCP worker pool
-	for i := 0; i < tcpWorkerCount; i++ {
-		go func(workerID int) {
-			defer func() {
-				if r := recover(); r != nil {
-					logger.Error("TCP worker ", workerID, " panic: ", logger.SafeRecoveredValueString(r))
-					debug.PrintStack()
-				}
-			}()
-			for {
-				select {
-				case conn := <-t.tcpQueue:
-					t.handleTCPConn(conn)
-				case <-ctx.Done():
-					return
-				}
-			}
-		}(i)
-	}
+	go t.logTCPStats(ctx)
 
 	// Start UDP worker pool
 	for i := 0; i < udpWorkerCount; i++ {
@@ -159,4 +173,36 @@ func (t *Tunnel) SetDialer(dialer proxy.Dialer) {
 
 func (t *Tunnel) SetUDPTimeout(timeout time.Duration) {
 	t.udpTimeout.Store(timeout)
+}
+
+func (t *Tunnel) updatePeakTCP(active int64) {
+	for {
+		peak := t.peakTCPConn.Load()
+		if active <= peak {
+			return
+		}
+		if t.peakTCPConn.CompareAndSwap(peak, active) {
+			return
+		}
+	}
+}
+
+func (t *Tunnel) logTCPStats(ctx context.Context) {
+	ticker := time.NewTicker(tcpStatsLogInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			logger.Debug(fmt.Sprintf(
+				"[TUN TCP] active=%d peak=%d limit=%d rejected_total=%d",
+				t.activeTCPConn.Load(),
+				t.peakTCPConn.Load(),
+				cap(t.tcpLimiter),
+				t.rejectedTCPConn.Load(),
+			))
+		}
+	}
 }
