@@ -46,8 +46,7 @@
               "editable": true,
               "include": [
                 "api.openai.com",
-                "cdn.openai.com",
-                "api.aliang.one"
+                "cdn.openai.com"
               ]
             },
             "vscode": {
