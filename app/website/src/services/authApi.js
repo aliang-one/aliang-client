@@ -47,12 +47,6 @@ export async function restoreSession() {
   });
 }
 
-export async function getCurrentUser() {
-  return request('/api/auth/me', {
-    method: 'GET'
-  });
-}
-
 export async function logout() {
   return request('/api/auth/logout', {
     method: 'POST',

@@ -53,7 +53,7 @@ type authTokenRecord struct {
 	RefreshToken string    `gorm:"type:text"`
 	TokenType    string    `gorm:"type:varchar(32)"`
 	ExpiresIn    int       `gorm:"not null;default:0"`
-	UpdatedAt    time.Time `gorm:"autoUpdateTime"`
+	UpdatedAt    time.Time `gorm:"not null"`
 }
 
 func (authTokenRecord) TableName() string {
@@ -72,7 +72,7 @@ type authProfileRecord struct {
 	AllowedGroupsJSON string    `gorm:"column:allowed_groups_json;type:text"`
 	RemoteCreatedAt   string    `gorm:"column:remote_created_at;type:varchar(64)"`
 	RemoteUpdatedAt   string    `gorm:"column:remote_updated_at;type:varchar(64)"`
-	UpdatedAt         time.Time `gorm:"autoUpdateTime"`
+	UpdatedAt         time.Time `gorm:"not null"`
 }
 
 func (authProfileRecord) TableName() string {
@@ -98,16 +98,19 @@ func SaveUserInfo(info *UserInfo) error {
 
 	info.UpdatedAt = time.Now()
 
-	if err := saveUserInfoToSQLite(info); err != nil {
-		return fmt.Errorf("failed to persist user info to sqlite: %w", err)
-	}
-
+	// 内存优先 — 运行时正确性依赖此顺序
 	userInfoMutex.Lock()
 	copyInfo := *info
 	currentUserInfo = &copyInfo
 	userInfoMutex.Unlock()
 
-	logger.Debug("User info saved successfully (sqlite)")
+	// SQLite 尽力写入，失败不影响内存
+	if err := saveUserInfoToSQLite(info); err != nil {
+		logger.Warn(fmt.Sprintf("Failed to persist user info to sqlite (memory is up-to-date): %v", err))
+		return nil
+	}
+
+	logger.Debug("User info saved successfully (memory + sqlite)")
 	return nil
 }
 
@@ -322,7 +325,12 @@ func GetCurrentUserInfo() *UserInfo {
 func SetCurrentUserInfo(info *UserInfo) {
 	userInfoMutex.Lock()
 	defer userInfoMutex.Unlock()
-	currentUserInfo = info
+	if info == nil {
+		currentUserInfo = nil
+		return
+	}
+	copyInfo := *info
+	currentUserInfo = &copyInfo
 }
 
 // ResetAuthPersistenceForTest resets auth persistence singletons for isolated tests.

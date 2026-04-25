@@ -120,8 +120,3 @@ func notifyAuthExpirationHandler() {
 		handler()
 	}
 }
-
-func stopProxyDueToAuthExpiration() {
-	logger.Info("Stopping proxy service due to authentication expiration")
-	logger.Warn("Proxy service should be stopped due to authentication expiration - checking HasLocalUserInfo() status")
-}

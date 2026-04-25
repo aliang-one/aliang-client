@@ -2,14 +2,8 @@ package user
 
 import (
 	"strings"
-	"sync"
 
 	"aliang.one/nursorgate/common/logger"
-)
-
-var (
-	mu          sync.Mutex
-	accessToken []string
 )
 
 func GetCurrentAuthorizationHeader() string {
@@ -39,21 +33,4 @@ func resolveUserInfoForAuthorizationHeader() *UserInfo {
 		}
 	}
 	return current
-}
-
-// SetAccessToken 设置accessToken，如果变更则触发POST（线程安全 + 单请求）
-func SetAccessToken(newToken string) {
-	mu.Lock()
-	isNewComming := true
-	for _, token := range accessToken {
-		if token == newToken {
-			isNewComming = false
-			break
-		}
-	}
-	mu.Unlock()
-
-	if isNewComming {
-		// triggerAuthPost(newToken)
-	}
 }

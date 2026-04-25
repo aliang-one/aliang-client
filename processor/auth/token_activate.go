@@ -279,7 +279,7 @@ func RefreshSession(refreshToken string) (*UserInfo, error) {
 	}
 
 	if err := SaveUserInfo(userInfo); err != nil {
-		return nil, fmt.Errorf("failed to save refreshed user info: %w", err)
+		logger.Warn(fmt.Sprintf("Failed to persist refreshed user info: %v", err))
 	}
 
 	startTokenRefresh()

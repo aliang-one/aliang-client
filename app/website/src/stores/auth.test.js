@@ -9,12 +9,10 @@ const currentDir = dirname(fileURLToPath(import.meta.url));
 test('critical unauthenticated auth display logic is present in frontend sources', () => {
   const authStoreSource = readFileSync(resolve(currentDir, './auth.js'), 'utf8');
   assert.match(authStoreSource, /state\.status\s*=\s*'unauthenticated'/);
-  assert.match(authStoreSource, /authSessionPollIntervalMs\s*=\s*60\s*\*\s*1000/);
-  assert.match(authStoreSource, /authRefreshLeadTimeMs\s*=\s*10\s*\*\s*60\s*\*\s*1000/);
-  assert.match(authStoreSource, /getCurrentUserRequest/);
-  assert.match(authStoreSource, /window\.setInterval/);
-  assert.match(authStoreSource, /remainingMs <= authRefreshLeadTimeMs/);
-  assert.match(authStoreSource, /syncUnauthenticatedAuthState\(t\('user_sessionExpired'\)\)/);
+  assert.match(authStoreSource, /syncAuthFromStartupStatus/);
+  assert.match(authStoreSource, /syncUnauthenticatedAuthState/);
+  assert.match(authStoreSource, /fetch_success/);
+  assert.match(authStoreSource, /data\.user/);
 
   const settingsPageSource = readFileSync(resolve(currentDir, '../components/SettingsPage.vue'), 'utf8');
   assert.match(settingsPageSource, /v-if="!isAuthenticated"/);

@@ -1,4 +1,5 @@
 import { ref } from 'vue';
+import { syncAuthFromStartupStatus } from '../stores/auth';
 
 const runMode = ref('unknown');
 const runIsRunning = ref(false);
@@ -97,6 +98,7 @@ export async function syncStartupStatus() {
 
     const data = payload?.data || {};
     startupStatus.value = typeof data?.status === 'string' ? data.status : 'UNKNOWN';
+    syncAuthFromStartupStatus(data);
     return data;
   } catch {
     startupStatus.value = 'UNKNOWN';
