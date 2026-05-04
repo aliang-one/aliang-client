@@ -51,6 +51,7 @@ func (cp *ConnectionPool) Get(key string) *PooledConn {
 
 	conn, exists := cp.conns[key]
 	if exists && conn != nil {
+		conn.LastUsed = time.Now()
 		cp.updateStats(false)
 		return conn
 	}
@@ -69,6 +70,7 @@ func (cp *ConnectionPool) Put(key string, conn *PooledConn) error {
 
 	// Check if we should store this connection
 	// For now, store it if there's space or replace
+	conn.LastUsed = time.Now()
 	cp.conns[key] = conn
 
 	return nil
@@ -156,14 +158,17 @@ func (cp *ConnectionPool) cleanupRoutine() {
 }
 
 // cleanup removes idle connections from the pool
-// Note: Idle time tracking requires LastUsed timestamp on PooledConn
-// Currently disabled as we focus on core mTLS responsibility
 func (cp *ConnectionPool) cleanup() {
-	// cp.mu.Lock()
-	// defer cp.mu.Unlock()
-
-	// Idle connection cleanup would require timestamp tracking
-	// This is deferred for future optimization
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	now := time.Now()
+	for key, conn := range cp.conns {
+		if conn != nil && now.Sub(conn.LastUsed) > cp.config.MaxIdleTime {
+			conn.Conn.Close()
+			delete(cp.conns, key)
+			cp.updateStats(true)
+		}
+	}
 }
 
 // updateStats updates connection pool statistics

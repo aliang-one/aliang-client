@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"strings"
+	"time"
 
 	"aliang.one/nursorgate/common/logger"
 	"aliang.one/nursorgate/common/version"
@@ -130,6 +131,8 @@ type http2Stream struct {
 	RespHeaders   map[string]string
 	RespBody      bytes.Buffer
 	RespEndStream bool
+
+	CreatedAt time.Time
 }
 
 type http2HeaderRewriteMeta struct {
@@ -334,6 +337,7 @@ func (w *WatcherWrapConn) processHttp2RequestFrame(preBuff *bytes.Buffer) error 
 	for {
 		frame, ok := w.tryExtractFrameFromBuf(&w.reqBuf, false)
 		if !ok {
+			w.cleanupStaleHTTP2Streams()
 			return nil
 		}
 
@@ -447,6 +451,7 @@ func (w *WatcherWrapConn) processHttp2RequestFrame(preBuff *bytes.Buffer) error 
 				stream.ReqBody.Write(payload)
 				if flags&flagEndStream != 0 {
 					stream.ReqEndStream = true
+					delete(w.streams, streamID)
 				}
 			}
 			w.streamsMu.Unlock()
@@ -919,4 +924,17 @@ func (w *WatcherWrapConn) decodeHeaderBlock(block []byte, isRequest bool) (map[s
 
 	_, err := decoder.Write(block)
 	return headers, err
+}
+
+const http2StreamTimeout = 5 * time.Minute
+
+func (w *WatcherWrapConn) cleanupStaleHTTP2Streams() {
+	now := time.Now()
+	w.streamsMu.Lock()
+	defer w.streamsMu.Unlock()
+	for id, stream := range w.streams {
+		if now.Sub(stream.CreatedAt) > http2StreamTimeout {
+			delete(w.streams, id)
+		}
+	}
 }

@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"aliang.one/nursorgate/common/logger"
 	"golang.org/x/net/http2"
@@ -213,7 +214,9 @@ func (w *WatcherWrapConn) getOrCreateStream(id uint32) *http2Stream {
 	if s, ok := w.streams[id]; ok {
 		return s
 	}
-	s := &http2Stream{}
+	s := &http2Stream{
+		CreatedAt: time.Now(),
+	}
 	w.streams[id] = s
 	return s
 }

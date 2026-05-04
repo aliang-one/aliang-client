@@ -2,11 +2,13 @@ package aliang
 
 import (
 	"net"
+	"time"
 )
 
 // PooledConn represents a pooled TLS connection
 type PooledConn struct {
-	Conn net.Conn
+	Conn     net.Conn
+	LastUsed time.Time
 }
 
 // ConnectionKey represents a connection pool key

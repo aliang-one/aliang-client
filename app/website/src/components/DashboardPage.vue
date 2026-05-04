@@ -850,6 +850,7 @@ const quickChatInput = ref('');
 const isQuickChatSending = ref(false);
 const quickChatMessages = ref([]);
 const runActionLoading = ref(false);
+const runActionIntent = ref('');   // 'start' | 'stop' | ''
 const runActionMessage = ref('');
 const accountBalance = ref(null);
 const tunStartModal = ref(createTunStartModalState());
@@ -1591,7 +1592,11 @@ const proxyStatusSubtitle = computed(() => {
   return runIsRunning.value ? t('dash_serviceRunning') : t('dash_serviceStopped');
 });
 
-const powerButtonBusyText = computed(() => (runIsRunning.value ? t('dash_stoppingProxy') : t('dash_startingProxy')));
+const powerButtonBusyText = computed(() => {
+  if (runActionIntent.value === 'stop') return t('dash_stoppingProxy');
+  if (runActionIntent.value === 'start') return t('dash_startingProxy');
+  return runIsRunning.value ? t('dash_stoppingProxy') : t('dash_startingProxy');
+});
 
 const canStartProxy = computed(() => {
   if (!isAuthenticated.value) {

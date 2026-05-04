@@ -11,6 +11,7 @@ var DefaultManager *Manager
 
 func init() {
 	DefaultManager = &Manager{
+		stopCh:        make(chan struct{}),
 		uploadTemp:    atomic.NewInt64(0),
 		downloadTemp:  atomic.NewInt64(0),
 		uploadBlip:    atomic.NewInt64(0),
@@ -23,6 +24,8 @@ func init() {
 
 type Manager struct {
 	connections   sync.Map
+	stopCh        chan struct{}
+	stopped       atomic.Bool
 	uploadTemp    *atomic.Int64
 	downloadTemp  *atomic.Int64
 	uploadBlip    *atomic.Int64
@@ -135,12 +138,22 @@ func (m *Manager) ResetStatistic() {
 
 func (m *Manager) handle() {
 	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
 
-	for range ticker.C {
-		m.uploadBlip.Store(m.uploadTemp.Load())
-		m.uploadTemp.Store(0)
-		m.downloadBlip.Store(m.downloadTemp.Load())
-		m.downloadTemp.Store(0)
+	for {
+		select {
+		case <-ticker.C:
+			m.uploadBlip.Store(m.uploadTemp.Swap(0))
+			m.downloadBlip.Store(m.downloadTemp.Swap(0))
+		case <-m.stopCh:
+			return
+		}
+	}
+}
+
+func (m *Manager) Stop() {
+	if m.stopped.CompareAndSwap(false, true) {
+		close(m.stopCh)
 	}
 }
 
