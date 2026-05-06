@@ -96,7 +96,7 @@ func (ls *LogService) UpdateLogLevelWithOverride(levelStr string, allowProdLowLe
 }
 
 // SubscribeLogStream subscribes to real-time log stream
-// Returns a channel that receives log entries
+// Returns a channel that receives log entries and a cleanup function
 func (ls *LogService) SubscribeLogStream() (<-chan *logger.LogEntry, func()) {
 	logChan := make(chan *logger.LogEntry, 100)
 
@@ -108,10 +108,11 @@ func (ls *LogService) SubscribeLogStream() (<-chan *logger.LogEntry, func()) {
 		}
 	}
 
-	logger.GetGlobalBuffer().Subscribe(observer)
+	unsubscribe := logger.GetGlobalBuffer().Subscribe(observer)
 
 	// Return channel and cleanup function
 	cleanup := func() {
+		unsubscribe()
 		close(logChan)
 	}
 

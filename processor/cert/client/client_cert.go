@@ -24,7 +24,25 @@ import (
 
 var defaultCertificate *tls.Certificate
 var certCache = sync.Map{}
+var certAccessTime sync.Map // host -> time.Time of last access
 var mu sync.RWMutex
+
+func init() {
+	go func() {
+		ticker := time.NewTicker(10 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			now := time.Now()
+			certAccessTime.Range(func(key, value any) bool {
+				if t, ok := value.(time.Time); ok && now.Sub(t) > time.Hour {
+					certCache.Delete(key)
+					certAccessTime.Delete(key)
+				}
+				return true
+			})
+		}
+	}()
+}
 
 func buildHostLeafTemplate(host string) x509.Certificate {
 	template := x509.Certificate{
@@ -104,6 +122,7 @@ func creatCertForHost(host string) (tls.Certificate, error) {
 	}
 
 	if cert, ok := certCache.Load(host); ok {
+		certAccessTime.Store(host, time.Now())
 		return cert.(tls.Certificate), nil
 	}
 
@@ -156,6 +175,7 @@ func creatCertForHost(host string) (tls.Certificate, error) {
 	}
 
 	certCache.Store(host, cert)
+	certAccessTime.Store(host, time.Now())
 	return cert, nil
 }
 

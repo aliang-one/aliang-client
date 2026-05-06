@@ -14,6 +14,12 @@ type LogEntry struct {
 	TraceID   string // Connection trace ID if applicable
 }
 
+// observerEntry pairs an observer function with a unique ID for unsubscribing.
+type observerEntry struct {
+	fn func(*LogEntry)
+	id uint64
+}
+
 // LogBuffer is a thread-safe circular buffer for log entries
 type LogBuffer struct {
 	entries   []*LogEntry
@@ -23,7 +29,8 @@ type LogBuffer struct {
 	isFull    bool
 	mu        sync.RWMutex
 	maxSize   int
-	observers []func(*LogEntry)
+	observers []observerEntry
+	nextObsID uint64
 }
 
 // NewLogBuffer creates a new log buffer with specified max size
@@ -58,9 +65,9 @@ func (b *LogBuffer) Append(entry *LogEntry) {
 		b.isFull = true
 	}
 
-	// Notify observers
-	for _, observer := range b.observers {
-		go observer(entry)
+	// Notify observers (synchronous — observers use non-blocking channel sends)
+	for _, obs := range b.observers {
+		obs.fn(entry)
 	}
 }
 
@@ -141,11 +148,23 @@ func (b *LogBuffer) Size() int {
 	return b.tail
 }
 
-// Subscribe registers an observer for new log entries
-func (b *LogBuffer) Subscribe(observer func(*LogEntry)) {
+// Subscribe registers an observer for new log entries and returns an unsubscribe function.
+func (b *LogBuffer) Subscribe(observer func(*LogEntry)) func() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.observers = append(b.observers, observer)
+	id := b.nextObsID
+	b.nextObsID++
+	b.observers = append(b.observers, observerEntry{fn: observer, id: id})
+	return func() {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		for i := range b.observers {
+			if b.observers[i].id == id {
+				b.observers = append(b.observers[:i], b.observers[i+1:]...)
+				return
+			}
+		}
+	}
 }
 
 // matchesFilter checks if entry matches filter criteria
