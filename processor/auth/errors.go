@@ -52,7 +52,8 @@ func classifyAccessTokenFailure(statusCode int, body []byte) error {
 
 	var envelope map[string]any
 	if err := json.Unmarshal(body, &envelope); err != nil {
-		return nil
+		// 无法解析的 401 也应视为 session expired
+		return ErrSessionExpired
 	}
 
 	code := strings.ToUpper(strings.TrimSpace(stringValue(envelope["code"])))
@@ -68,8 +69,12 @@ func classifyAccessTokenFailure(statusCode int, body []byte) error {
 	if code == "TOKEN_EXPIRED" || reason == "TOKEN_EXPIRED" || strings.Contains(message, "token expired") || strings.Contains(message, "expired token") {
 		return ErrSessionExpired
 	}
+	if strings.Contains(message, "invalid authentication") {
+		return ErrSessionExpired
+	}
 
-	return nil
+	// 兜底 — 任何来自 auth 端点的 401 都视为 session expired
+	return ErrSessionExpired
 }
 
 func clearLocalSessionAfterInvalidRefreshToken() {

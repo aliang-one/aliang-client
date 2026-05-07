@@ -180,8 +180,11 @@ func callUserCenterAPI(method, endpoint string, body any) ([]byte, error) {
 	}
 	responseBody, err := callAuthenticatedAPI(method, endpoint, authToken, body)
 	if err != nil {
-		if verifiedErr := verifyCurrentSessionWithAuthMe(authToken, err); verifiedErr != nil {
-			return nil, verifiedErr
+		// 401 直接视为 session expired
+		var apiErr *authenticatedAPIError
+		if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusUnauthorized {
+			clearLocalSessionAfterExpiredAccessToken()
+			return nil, ErrSessionExpired
 		}
 		return nil, err
 	}
@@ -190,6 +193,13 @@ func callUserCenterAPI(method, endpoint string, body any) ([]byte, error) {
 
 func resolveAuthTokenForEndpoint(endpoint string) (string, error) {
 	_ = endpoint
+
+	// 在拿 token 前先尝试刷新
+	refresher := GetTokenRefresher()
+	if refresher != nil && refresher.IsRunning() {
+		_ = refresher.RefreshNow() // 忽略错误，继续用现有 token 尝试
+	}
+
 	current := GetCurrentUserInfoOrLoad()
 	if current == nil {
 		return "", fmt.Errorf("no user session")
@@ -266,18 +276,30 @@ func GetUserProfileWithToken(accessToken string) (*UserProfile, error) {
 }
 
 func GetUserProfile() (*UserProfile, error) {
-	accessToken, err := resolveAccessToken()
+	if _, err := resolveAccessToken(); err != nil {
+		return nil, err
+	}
+
+	urlBuilder, err := config.NewURLBuilder()
 	if err != nil {
 		return nil, err
 	}
-	profile, err := GetUserProfileWithToken(accessToken)
+	profileURL, err := urlBuilder.GetUserProfileURL()
 	if err != nil {
-		if verifiedErr := verifyCurrentSessionWithAuthMe(accessToken, err); verifiedErr != nil {
-			return nil, verifiedErr
-		}
 		return nil, err
 	}
-	return profile, nil
+
+	body, err := callUserCenterAPI(http.MethodGet, profileURL, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var envelope userProfileEnvelope
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	return &envelope.Data, nil
 }
 
 func UpdateUserProfile(username string) (*UserProfile, error) {
