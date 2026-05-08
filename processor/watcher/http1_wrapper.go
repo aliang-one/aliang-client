@@ -319,6 +319,12 @@ func (w *WatcherWrapConn) processH1ReqHeaders() ([]byte, bool, error) {
 		w.reqBuf.Write(leftoverBody)
 	}
 
-	logger.Debug(fmt.Sprintf("new http1 content is : %s", rebuilt.String()))
+	logger.Debug(fmt.Sprintf("rewritten HTTP/1 request: method=%s host=%s uri=%s header_bytes=%d inline_body_bytes=%d",
+		req.Method,
+		req.Host,
+		req.RequestURI,
+		len(headBytes),
+		len(currentBody),
+	))
 	return rebuilt.Bytes(), true, nil
 }

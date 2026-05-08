@@ -85,12 +85,16 @@ func (ls *LogService) SubscribeLogStream() (<-chan *logger.LogEntry, func()) {
 	}
 
 	// Register observer
-	logger.GetGlobalBuffer().Subscribe(observer)
+	unsubscribe := logger.GetGlobalBuffer().Subscribe(observer)
 
 	// Return channel and cleanup function
 	cleanup := func() {
 		// Mark as closed atomically first
-		atomic.StoreInt32(&closed, 1)
+		if !atomic.CompareAndSwapInt32(&closed, 0, 1) {
+			return
+		}
+
+		unsubscribe()
 
 		// Drain any remaining messages to prevent blocking
 		go func() {

@@ -68,6 +68,7 @@ func TestIPDomainCache_Expiration(t *testing.T) {
 	// Should not be found after expiration
 	_, found = cache.Get("cloudflare.com")
 	assert.False(t, found)
+	assert.Empty(t, cache.GetByIP(ip))
 }
 
 func TestIPDomainCache_SetWithTTL(t *testing.T) {
@@ -271,6 +272,8 @@ func TestIPDomainCache_Update(t *testing.T) {
 	assert.True(t, found)
 	assert.Equal(t, RouteToSocks, retrieved.Route)
 	assert.Equal(t, ip2, retrieved.IP)
+	assert.Empty(t, cache.GetByIP(ip1))
+	assert.Len(t, cache.GetByIP(ip2), 1)
 }
 
 func TestCacheEntry_IsExpired(t *testing.T) {
@@ -323,4 +326,49 @@ func TestIPDomainCache_Cleanup(t *testing.T) {
 
 	// All entries should be removed
 	assert.Equal(t, 0, cache.Size())
+	stats := cache.Stats()
+	assert.Equal(t, 0, stats["uniqueIPs"])
+}
+
+func TestIPDomainCache_CleanupRemovesReverseIndexEntries(t *testing.T) {
+	cache := NewIPDomainCache(10, 50*time.Millisecond)
+
+	ip := netip.MustParseAddr("1.1.1.1")
+	entry := &CacheEntry{
+		Domain: "expired.example",
+		IP:     ip,
+		Route:  RouteDirect,
+	}
+	cache.Set("expired.example", entry)
+	assert.Len(t, cache.GetByIP(ip), 1)
+
+	time.Sleep(100 * time.Millisecond)
+	cache.cleanup()
+
+	assert.Equal(t, 0, cache.Size())
+	assert.Empty(t, cache.GetByIP(ip))
+	stats := cache.Stats()
+	assert.Equal(t, 0, stats["uniqueIPs"])
+}
+
+func TestIPDomainCache_LRUEvictionRemovesReverseIndexEntry(t *testing.T) {
+	cache := NewIPDomainCache(1, 5*time.Minute)
+
+	evictedIP := netip.MustParseAddr("1.1.1.1")
+	cache.Set("old.example", &CacheEntry{
+		Domain: "old.example",
+		IP:     evictedIP,
+		Route:  RouteDirect,
+	})
+	assert.Len(t, cache.GetByIP(evictedIP), 1)
+
+	cache.Set("new.example", &CacheEntry{
+		Domain: "new.example",
+		IP:     netip.MustParseAddr("8.8.8.8"),
+		Route:  RouteToSocks,
+	})
+
+	assert.Empty(t, cache.GetByIP(evictedIP))
+	stats := cache.Stats()
+	assert.Equal(t, 1, stats["uniqueIPs"])
 }

@@ -5,6 +5,8 @@ import (
 	"time"
 )
 
+const DefaultLogBufferSize = 1000
+
 // LogEntry represents a single log entry
 type LogEntry struct {
 	Level     LogLevelType
@@ -36,7 +38,7 @@ type LogBuffer struct {
 // NewLogBuffer creates a new log buffer with specified max size
 func NewLogBuffer(maxSize int) *LogBuffer {
 	if maxSize <= 0 {
-		maxSize = 10000 // Default
+		maxSize = DefaultLogBufferSize
 	}
 	return &LogBuffer{
 		entries: make([]*LogEntry, maxSize),
@@ -54,7 +56,6 @@ func (b *LogBuffer) Append(entry *LogEntry) {
 	}
 
 	b.mu.Lock()
-	defer b.mu.Unlock()
 
 	b.entries[b.tail] = entry
 	b.tail = (b.tail + 1) % b.maxSize
@@ -65,8 +66,11 @@ func (b *LogBuffer) Append(entry *LogEntry) {
 		b.isFull = true
 	}
 
-	// Notify observers (synchronous — observers use non-blocking channel sends)
-	for _, obs := range b.observers {
+	observers := append([]observerEntry(nil), b.observers...)
+	b.mu.Unlock()
+
+	// Notify observers outside the buffer lock.
+	for _, obs := range observers {
 		obs.fn(entry)
 	}
 }
@@ -181,7 +185,7 @@ func (b *LogBuffer) matchesFilter(entry *LogEntry, level LogLevelType, source st
 }
 
 // Global log buffer instance
-var globalBuffer = NewLogBuffer(10000)
+var globalBuffer = NewLogBuffer(DefaultLogBufferSize)
 
 // GetGlobalBuffer returns the global log buffer
 func GetGlobalBuffer() *LogBuffer {

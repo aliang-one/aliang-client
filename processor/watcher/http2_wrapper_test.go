@@ -432,6 +432,31 @@ func TestPrepareBufferedOutput_FallbackPreservesPreviouslyConsumedFrames(t *test
 	}
 }
 
+func TestProcessHTTP2RequestFrame_DoesNotRetainDataPayload(t *testing.T) {
+	w := NewWatcherWrapConn(nil)
+	streamID := uint32(1)
+	stream := w.getOrCreateStream(streamID)
+	stream.ReqSummary = `method="POST" authority="example.com" path="/v1/chat"`
+
+	payload := bytes.Repeat([]byte("x"), 128*1024)
+	dataFrame := buildDataFrame(t, streamID, false, payload)
+	w.reqBuf.Write(dataFrame)
+
+	var out bytes.Buffer
+	if err := w.processHttp2RequestFrame(&out); err != nil {
+		t.Fatalf("processHttp2RequestFrame() error = %v", err)
+	}
+	if !bytes.Equal(out.Bytes(), dataFrame) {
+		t.Fatalf("forwarded frame mismatch: got %d bytes want %d bytes", out.Len(), len(dataFrame))
+	}
+
+	w.streamsMu.Lock()
+	defer w.streamsMu.Unlock()
+	if _, ok := w.streams[streamID]; !ok {
+		t.Fatal("stream was removed before END_STREAM")
+	}
+}
+
 func TestIsHTTP2InitialRequestHeaders(t *testing.T) {
 	if !isHTTP2InitialRequestHeaders([]hpack.HeaderField{
 		{Name: ":method", Value: "POST"},

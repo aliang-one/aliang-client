@@ -72,8 +72,7 @@ func (c *IPDomainCache) Get(key string) (*CacheEntry, bool) {
 
 	// Check expiration
 	if item.entry.IsExpired() {
-		c.lru.Remove(elem)
-		delete(c.entries, key)
+		c.removeElementLocked(elem)
 		c.misses++
 		return nil, false
 	}
@@ -104,6 +103,8 @@ func (c *IPDomainCache) Set(key string, entry *CacheEntry) {
 	// If entry exists, update and move to front
 	if elem, exists := c.entries[key]; exists {
 		c.lru.MoveToFront(elem)
+		oldEntry := elem.Value.(*cacheItem).entry
+		c.removeFromIPIndex(oldEntry)
 		elem.Value.(*cacheItem).entry = entry
 		// Update reverse index
 		c.updateIPIndex(entry)
@@ -161,15 +162,8 @@ func (c *IPDomainCache) Delete(key string) bool {
 		return false
 	}
 
-	item := elem.Value.(*cacheItem)
-	entry := item.entry
-
 	// Remove from forward index
-	c.lru.Remove(elem)
-	delete(c.entries, key)
-
-	// Remove from reverse index
-	c.removeFromIPIndex(entry)
+	c.removeElementLocked(elem)
 
 	return true
 }
@@ -177,6 +171,10 @@ func (c *IPDomainCache) Delete(key string) bool {
 // removeFromIPIndex removes an entry from the reverse IP index
 // Must be called with lock held
 func (c *IPDomainCache) removeFromIPIndex(entry *CacheEntry) {
+	if entry == nil {
+		return
+	}
+
 	ipStr := entry.IP.String()
 	oldEntries := c.ipIndex[ipStr]
 	var newEntries []*CacheEntry
@@ -194,18 +192,25 @@ func (c *IPDomainCache) removeFromIPIndex(entry *CacheEntry) {
 	}
 }
 
+// removeElementLocked removes an LRU element from both forward and reverse indexes.
+// Must be called with lock held.
+func (c *IPDomainCache) removeElementLocked(elem *list.Element) {
+	if elem == nil {
+		return
+	}
+
+	item := elem.Value.(*cacheItem)
+	c.lru.Remove(elem)
+	delete(c.entries, item.key)
+	c.removeFromIPIndex(item.entry)
+}
+
 // evictOldest removes the least recently used entry
 // Must be called with lock held
 func (c *IPDomainCache) evictOldest() {
 	elem := c.lru.Back()
 	if elem != nil {
-		c.lru.Remove(elem)
-		item := elem.Value.(*cacheItem)
-		delete(c.entries, item.key)
-
-		// Remove from reverse index
-		c.removeFromIPIndex(item.entry)
-
+		c.removeElementLocked(elem)
 		c.evictions++
 	}
 }
@@ -239,8 +244,7 @@ func (c *IPDomainCache) cleanup() {
 	// Delete expired entries
 	for _, key := range toDelete {
 		elem := c.entries[key]
-		c.lru.Remove(elem)
-		delete(c.entries, key)
+		c.removeElementLocked(elem)
 	}
 }
 

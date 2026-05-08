@@ -121,7 +121,6 @@ func (w *WatcherWrapConn) GetAllServerHTTP2Settings() map[uint16]uint32 {
 
 type http2Stream struct {
 	ReqHeaders   map[string]string
-	ReqBody      bytes.Buffer
 	ReqEndStream bool
 	ReqSummary   string
 	AuthInjected bool
@@ -129,7 +128,6 @@ type http2Stream struct {
 	LastReqFrame string
 
 	RespHeaders   map[string]string
-	RespBody      bytes.Buffer
 	RespEndStream bool
 
 	CreatedAt time.Time
@@ -448,7 +446,6 @@ func (w *WatcherWrapConn) processHttp2RequestFrame(preBuff *bytes.Buffer) error 
 			w.streamsMu.Lock()
 			stream := w.streams[streamID]
 			if stream != nil {
-				stream.ReqBody.Write(payload)
 				if flags&flagEndStream != 0 {
 					stream.ReqEndStream = true
 					delete(w.streams, streamID)
