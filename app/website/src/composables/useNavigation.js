@@ -23,12 +23,17 @@ export function useNavigation() {
     showPage('dashboard');
   }
 
+  function showChat() {
+    showPage('chat');
+  }
+
   return {
     currentPage,
     showPage,
     showSettings,
     showUserCenter,
     showLogs,
-    showDashboard
+    showDashboard,
+    showChat
   };
 }

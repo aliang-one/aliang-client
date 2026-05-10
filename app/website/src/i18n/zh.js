@@ -155,6 +155,22 @@ export default {
   sys_refreshWintunFailed: '刷新 Wintun 安装状态失败。',
   sys_syncFailed: '同步失败：{error}',
 
+  // -- ChatPage --
+  chat_title: 'AI 对话',
+  chat_newConversation: '新建对话',
+  chat_emptyTitle: '新对话',
+  chat_placeholder: '输入消息...',
+  chat_send: '发送',
+  chat_sending: '发送中...',
+  chat_deleteConfirm: '确定删除此对话？',
+  chat_noConversations: '暂无对话',
+  chat_startNew: '点击左侧「新建对话」开始',
+  chat_today: '今天',
+  chat_yesterday: '昨天',
+  chat_older: '更早',
+  chat_serviceUnavailable: '暂时无法连接 AI 服务，请稍后重试。',
+  chat_loginRequired: '请先登录后再使用对话功能。',
+
   // -- App --
   app_restoringSession: '正在恢复会话...',
 

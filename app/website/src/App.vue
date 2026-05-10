@@ -21,6 +21,9 @@
       v-model="isCertModalOpen"
     />
     <QuickSetupModal :open="isQuickSetupOpen" @close="isQuickSetupOpen = false" />
+    <!-- Chat feature hidden temporarily
+    <ChatPage v-if="currentPage === 'chat'" />
+    -->
     </template>
   </div>
 </template>
@@ -30,10 +33,12 @@ import { ref, watch } from 'vue';
 import { useI18n } from './i18n';
 import DashboardPage from './components/DashboardPage.vue';
 import SettingsPage from './components/SettingsPage.vue';
+import ChatPage from './components/ChatPage.vue';
 import CertManagementModal from './components/CertManagementModal.vue';
 import QuickSetupModal from './components/QuickSetupModal.vue';
 import SoftwareUpdateNotice from './components/SoftwareUpdateNotice.vue';
 import { useAuthStore } from './stores/auth';
+import { useNavigation } from './composables/useNavigation';
 import { getUserCenterProfile } from './services/userCenterApi';
 import { clearChatIdentityProfileCache } from './utils/chatIdentityCache';
 
@@ -42,6 +47,7 @@ const isQuickSetupOpen = ref(false);
 const isCertModalOpen = ref(false);
 const certModalRef = ref(null);
 const { isReady, isAuthenticated } = useAuthStore();
+const { currentPage } = useNavigation();
 
 async function syncChatIdentityProfile() {
   if (!isReady.value) {

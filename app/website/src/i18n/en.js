@@ -155,6 +155,22 @@ export default {
   sys_refreshWintunFailed: 'Failed to refresh Wintun installation status.',
   sys_syncFailed: 'Sync failed: {error}',
 
+  // -- ChatPage --
+  chat_title: 'AI Chat',
+  chat_newConversation: 'New Chat',
+  chat_emptyTitle: 'New Chat',
+  chat_placeholder: 'Type a message...',
+  chat_send: 'Send',
+  chat_sending: 'Sending...',
+  chat_deleteConfirm: 'Delete this conversation?',
+  chat_noConversations: 'No conversations',
+  chat_startNew: 'Click "New Chat" to start',
+  chat_today: 'Today',
+  chat_yesterday: 'Yesterday',
+  chat_older: 'Older',
+  chat_serviceUnavailable: 'AI service is temporarily unavailable.',
+  chat_loginRequired: 'Please log in first.',
+
   // -- App --
   app_restoringSession: 'Restoring saved session...',
 
