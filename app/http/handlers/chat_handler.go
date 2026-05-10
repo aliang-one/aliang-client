@@ -6,12 +6,16 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
+	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"aliang.one/nursorgate/app/http/common"
 	"aliang.one/nursorgate/common/logger"
+	clientcert "aliang.one/nursorgate/processor/cert/client"
+	"aliang.one/nursorgate/processor/config"
+	user "aliang.one/nursorgate/processor/auth"
 )
 
 type ChatHandler struct{}
@@ -53,6 +57,55 @@ type openAIResponse struct {
 	} `json:"choices"`
 }
 
+// mTLS HTTP/2 client for gateway forwarding (lazily initialized).
+var (
+	chatMTLSClient     *http.Client
+	chatMTLSClientOnce sync.Once
+	chatMTLSClientErr  error
+)
+
+func getOrCreateChatMTLSClient() (*http.Client, error) {
+	chatMTLSClientOnce.Do(func() {
+		gatewayURL := getGatewayChatURL()
+		serverName := ""
+		if gatewayURL != "" {
+			if parsed, err := url.Parse(gatewayURL); err == nil {
+				serverName = parsed.Hostname()
+			}
+		}
+		if serverName == "" {
+			chatMTLSClientErr = fmt.Errorf("cannot determine serverName from gateway URL")
+			return
+		}
+		tlsConfig, err := clientcert.GetMTLSClientTLSConfig(true, serverName)
+		if err != nil {
+			chatMTLSClientErr = err
+			return
+		}
+		transport := &http.Transport{
+			TLSClientConfig: tlsConfig,
+		}
+		chatMTLSClient = &http.Client{
+			Transport: transport,
+			Timeout:   60 * time.Second,
+		}
+	})
+	return chatMTLSClient, chatMTLSClientErr
+}
+
+// getGatewayChatURL builds the chat completions endpoint from core.api_server.
+func getGatewayChatURL() string {
+	cfg := config.GetGlobalConfig()
+	if cfg == nil {
+		return ""
+	}
+	base := strings.TrimRight(cfg.APIBaseURL(), "/")
+	if base == "" {
+		return ""
+	}
+	return base + "/v1/chat/completions"
+}
+
 func (h *ChatHandler) HandleCompletions(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
@@ -73,14 +126,7 @@ func (h *ChatHandler) HandleCompletions(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	apiKey := strings.TrimSpace(os.Getenv("OPENAI_API_KEY"))
-	if apiKey == "" {
-		common.Success(w, map[string]interface{}{
-			"reply": "AI 服务暂未配置（缺少 OPENAI_API_KEY），请先配置后重试。",
-		})
-		return
-	}
-
+	// Build message list from history.
 	messages := make([]openAIMessageItem, 0, len(req.History)+1)
 	for _, item := range req.History {
 		role := strings.TrimSpace(strings.ToLower(item.Role))
@@ -113,24 +159,43 @@ func (h *ChatHandler) HandleCompletions(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	httpClient := &http.Client{Timeout: 45 * time.Second}
-	upstreamReq, err := http.NewRequest(http.MethodPost, "https://api.openai.com/v1/chat/completions", bytes.NewReader(bodyBytes))
+	client, clientErr := getOrCreateChatMTLSClient()
+	if clientErr != nil {
+		common.ErrorInternalServer(w, "AI service unavailable", nil)
+		return
+	}
+
+	gatewayURL := getGatewayChatURL()
+	if gatewayURL == "" {
+		common.ErrorInternalServer(w, "AI service not configured", nil)
+		return
+	}
+
+	upstreamReq, err := http.NewRequest(http.MethodPost, gatewayURL, bytes.NewReader(bodyBytes))
 	if err != nil {
-		logger.Error(fmt.Sprintf("[chat] build upstream request failed: %v", err))
-		common.ErrorInternalServer(w, "Failed to build upstream request", nil)
+		common.ErrorInternalServer(w, "Failed to build request", nil)
 		return
 	}
 	upstreamReq.Header.Set("Content-Type", "application/json")
-	upstreamReq.Header.Set("Authorization", "Bearer "+apiKey)
 
-	upstreamResp, err := httpClient.Do(upstreamReq)
+	// Inject Authorization-Inner.
+	if authHeader := strings.TrimSpace(user.GetCurrentAuthorizationHeader()); authHeader != "" {
+		upstreamReq.Header.Set("Authorization-Inner", authHeader)
+	}
+
+	resp, err := client.Do(upstreamReq)
 	if err != nil {
-		logger.Error(fmt.Sprintf("[chat] call AI service failed: %v", err))
-		common.ErrorInternalServer(w, "Failed to call AI service", nil)
+		logger.Error(fmt.Sprintf("[chat] mTLS forward failed: %v", err))
+		common.ErrorInternalServer(w, "AI service unavailable", nil)
 		return
 	}
-	defer upstreamResp.Body.Close()
+	defer resp.Body.Close()
 
+	h.writeAIResponse(w, resp)
+}
+
+// writeAIResponse reads the upstream response and writes the reply to the client.
+func (h *ChatHandler) writeAIResponse(w http.ResponseWriter, upstreamResp *http.Response) {
 	respBody, err := io.ReadAll(upstreamResp.Body)
 	if err != nil {
 		logger.Error(fmt.Sprintf("[chat] read AI response failed: %v", err))
@@ -142,6 +207,11 @@ func (h *ChatHandler) HandleCompletions(w http.ResponseWriter, r *http.Request) 
 		logger.Error(fmt.Sprintf("[chat] AI service returned status=%d body=%s", upstreamResp.StatusCode, string(respBody)))
 		common.ErrorInternalServer(w, "AI service returned error", nil)
 		return
+	}
+
+	// Check if the response uses TLS and log the protocol.
+	if upstreamResp.TLS != nil {
+		logger.Debug(fmt.Sprintf("[chat] upstream TLS negotiated protocol: %v", upstreamResp.TLS.NegotiatedProtocol))
 	}
 
 	var parsed openAIResponse
@@ -165,4 +235,12 @@ func (h *ChatHandler) HandleCompletions(w http.ResponseWriter, r *http.Request) 
 	common.Success(w, map[string]interface{}{
 		"reply": reply,
 	})
+}
+
+// ResetChatMTLSClient resets the singleton mTLS client so it can be re-initialized.
+// Useful for testing or when the config changes at runtime.
+func ResetChatMTLSClient() {
+	chatMTLSClientOnce = sync.Once{}
+	chatMTLSClient = nil
+	chatMTLSClientErr = nil
 }
