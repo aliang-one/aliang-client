@@ -183,6 +183,7 @@ jobs:
           CGO_ENABLED: ${{ matrix.cgo_enabled }}
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.goos == 'darwin' && '10.15' || '' }}
         run: |
           mkdir -p dist release
           VERSION="${GITHUB_REF_NAME}"
