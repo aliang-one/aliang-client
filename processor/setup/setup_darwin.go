@@ -30,7 +30,7 @@ func NewServiceManager(opts InstallOptions) ServiceManager {
 // getPlistPath 获取 plist 文件路径
 func getPlistPath(name string, systemWide bool) string {
 	if systemWide {
-		return "/Library/LaunchDaemons/one.aliang.core.plist"
+		return "/Library/LaunchDaemons/" + macOSCoreServiceLabel + ".plist"
 	}
 
 	homeDir, _ := os.UserHomeDir()
@@ -39,7 +39,7 @@ func getPlistPath(name string, systemWide bool) string {
 
 func getLaunchdLabel(name string, systemWide bool) string {
 	if systemWide {
-		return "one.aliang.core"
+		return macOSCoreServiceLabel
 	}
 	return fmt.Sprintf("org.nursor.%s", name)
 }
