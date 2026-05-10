@@ -43,15 +43,19 @@ mkdir -p "$APP_DIR/Contents/Resources"
 mkdir -p "$CORE_DIR"
 mkdir -p "$SCRIPTS_DIR"
 
-# Step 1: Build the binary
-echo "=== Building aliang binary ==="
-cd "$PROJECT_DIR"
-
-# On macOS, CGO is required for systray (Cocoa/Objective-C)
-if [ "$(uname)" = "Darwin" ]; then
-	go build -ldflags="-s -w -X aliang.one/nursorgate/common/version.BuildMode=prod" -o "$SCRIPT_DIR/aliang" ./cmd/aliang/main.go
+# Step 1: Build the binary (skip if pre-built binary already exists, e.g. from CI)
+if [ -x "$SCRIPT_DIR/aliang" ]; then
+	echo "=== Pre-built binary found, skipping compile ==="
 else
-	CGO_ENABLED=0 go build -ldflags="-s -w -X aliang.one/nursorgate/common/version.BuildMode=prod" -o "$SCRIPT_DIR/aliang" ./cmd/aliang/main.go
+	echo "=== Building aliang binary ==="
+	cd "$PROJECT_DIR"
+
+	# On macOS, CGO is required for systray (Cocoa/Objective-C)
+	if [ "$(uname)" = "Darwin" ]; then
+		go build -ldflags="-s -w -X aliang.one/nursorgate/common/version.BuildMode=prod" -o "$SCRIPT_DIR/aliang" ./cmd/aliang/main.go
+	else
+		CGO_ENABLED=0 go build -ldflags="-s -w -X aliang.one/nursorgate/common/version.BuildMode=prod" -o "$SCRIPT_DIR/aliang" ./cmd/aliang/main.go
+	fi
 fi
 
 # Step 2: Copy binary to app bundle (Shell entry point)

@@ -226,6 +226,7 @@ jobs:
         env:
           VERSION: ${{ github.ref_name }}
           ARCH: ${{ matrix.goarch }}
+          MACOSX_DEPLOYMENT_TARGET: '10.15'
         run: |
           cd scripts
           chmod +x build-pkg.sh
