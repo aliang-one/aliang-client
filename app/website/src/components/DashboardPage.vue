@@ -795,6 +795,14 @@ const loginPassword = ref('');
 const runActionLoading = ref(false);
 const runActionIntent = ref('');   // 'start' | 'stop' | ''
 const runActionMessage = ref('');
+
+// External state changes (e.g. tray quit, auto-exit) update runIsRunning via polling.
+// Clear stale action message so the subtitle reflects the real state immediately.
+watch(runIsRunning, () => {
+  if (!runActionLoading.value) {
+    runActionMessage.value = '';
+  }
+});
 const accountBalance = ref(null);
 const tunStartModal = ref(createTunStartModalState());
 const dashboardLoading = ref(false);
@@ -1777,6 +1785,7 @@ const tunStartupSteps = computed(() => {
 async function toggleProxyPower() {
   if (runActionLoading.value) return;
   runActionLoading.value = true;
+  runActionIntent.value = runIsRunning.value ? 'stop' : 'start';
   runActionMessage.value = '';
   runSyncError.value = '';
   try {
@@ -1829,6 +1838,7 @@ async function toggleProxyPower() {
     }
   } finally {
     runActionLoading.value = false;
+    runActionIntent.value = '';
     if (runActionMessage.value) {
       window.setTimeout(() => {
         runActionMessage.value = '';
