@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 
 	"aliang.one/nursorgate/common/logger"
@@ -329,14 +330,20 @@ func configureWindowsTunRoute() error {
 
 	logger.Info(fmt.Sprintf("找到默认网关: %s", defaultGateway))
 
+	tunIfIndex, err := getWindowsTunInterfaceIndexByAddress("10.0.0.1")
+	if err != nil {
+		return fmt.Errorf("获取 TUN 接口索引失败: %w", err)
+	}
+	logger.Info(fmt.Sprintf("使用 TUN 接口索引: %d", tunIfIndex))
+
 	if !setup.IsRoot() {
 		UpdateStartupProgress("starting", "requesting_permission", 88, "Requesting Windows administrator permission to configure TUN routes.", "", true)
 	}
 
 	// 删除现有默认路由
 	commands := [][]string{
-		{"route", "delete", "0.0.0.0", "mask", "128.0.0.0", "10.0.0.1"},
-		{"route", "delete", "128.0.0.0", "mask", "128.0.0.0", "10.0.0.1"},
+		{"route", "delete", "0.0.0.0", "mask", "128.0.0.0", "10.0.0.1", "if", strconv.Itoa(tunIfIndex)},
+		{"route", "delete", "128.0.0.0", "mask", "128.0.0.0", "10.0.0.1", "if", strconv.Itoa(tunIfIndex)},
 	}
 
 	for _, cmd := range commands {
@@ -347,8 +354,8 @@ func configureWindowsTunRoute() error {
 
 	// 添加新的路由
 	commands = [][]string{
-		{"route", "add", "0.0.0.0", "mask", "128.0.0.0", "10.0.0.1", "metric", "1"},
-		{"route", "add", "128.0.0.0", "mask", "128.0.0.0", "10.0.0.1", "metric", "1"},
+		{"route", "add", "0.0.0.0", "mask", "128.0.0.0", "10.0.0.1", "metric", "1", "if", strconv.Itoa(tunIfIndex)},
+		{"route", "add", "128.0.0.0", "mask", "128.0.0.0", "10.0.0.1", "metric", "1", "if", strconv.Itoa(tunIfIndex)},
 		// 添加回原默认网关的路由，但优先级较低
 	}
 
@@ -361,6 +368,27 @@ func configureWindowsTunRoute() error {
 	}
 
 	return nil
+}
+
+func getWindowsTunInterfaceIndexByAddress(address string) (int, error) {
+	cmd := utils2.GetRunCommand("powershell", "-NoProfile", "-Command",
+		`$idx = Get-NetIPAddress -IPAddress "`+address+`" -AddressFamily IPv4 -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty InterfaceIndex; if ($idx) { Write-Output $idx }`)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return 0, fmt.Errorf("failed to query interface index for %s: %w", address, err)
+	}
+
+	indexText := strings.TrimSpace(string(output))
+	if indexText == "" {
+		return 0, fmt.Errorf("no interface index found for %s", address)
+	}
+
+	index, err := strconv.Atoi(indexText)
+	if err != nil {
+		return 0, fmt.Errorf("invalid interface index %q for %s: %w", indexText, address, err)
+	}
+
+	return index, nil
 }
 
 func runWindowsPrivilegedCommand(name string, args ...string) error {
