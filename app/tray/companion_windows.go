@@ -24,7 +24,6 @@ const maxCompanionTraceSize = 128 * 1024
 
 type CompanionApp struct {
 	mProxyStatus   *systray.MenuItem
-	mModeStatus    *systray.MenuItem
 	mModeHTTP      *systray.MenuItem
 	mModeTUN       *systray.MenuItem
 	mStart         *systray.MenuItem
@@ -32,6 +31,9 @@ type CompanionApp struct {
 	mRestart       *systray.MenuItem
 	mOpenDashboard *systray.MenuItem
 	mQuit          *systray.MenuItem
+
+	mAIHeader    *systray.MenuItem
+	mAIProviders []*systray.MenuItem
 
 	ipcClient *ipc.Client
 	httpURL   string
@@ -59,8 +61,6 @@ func (a *CompanionApp) onReady() {
 	a.mProxyStatus = systray.AddMenuItem("Proxy: starting service...", "Current proxy listener status")
 	a.mProxyStatus.Disable()
 
-	a.mModeStatus = systray.AddMenuItem("Current Mode: syncing...", "Selected proxy mode for the next start")
-	a.mModeStatus.Disable()
 	a.mModeHTTP = systray.AddMenuItemCheckbox("Select Regular Mode", "Choose Regular Mode for the next explicit start", false)
 	a.mModeTUN = systray.AddMenuItemCheckbox("Select Deep Mode", "Choose Deep Mode for the next explicit start", false)
 
@@ -78,6 +78,19 @@ func (a *CompanionApp) onReady() {
 	mVersion.Disable()
 
 	systray.AddSeparator()
+
+	// AI Acceleration status section (hidden by default)
+	a.mAIHeader = systray.AddMenuItem("AI Acceleration", "AI acceleration status")
+	a.mAIHeader.Disable()
+	a.mAIHeader.Hide()
+
+	for i := 0; i < maxAIProviders; i++ {
+		item := systray.AddMenuItem("", "AI provider status")
+		item.Disable()
+		item.Hide()
+		a.mAIProviders = append(a.mAIProviders, item)
+	}
+
 	a.mQuit = systray.AddMenuItem("Quit Aliang", "Stop the background proxy and quit the companion")
 
 	go func() {
@@ -229,9 +242,6 @@ func (a *CompanionApp) restartProxy() {
 }
 
 func (a *CompanionApp) syncModeMenu(mode string) {
-	if a.mModeStatus != nil {
-		a.mModeStatus.SetTitle(trayCurrentModeTitle(mode))
-	}
 	if a.mModeHTTP != nil {
 		if mode == "http" {
 			a.mModeHTTP.Check()
@@ -283,16 +293,8 @@ func (a *CompanionApp) syncState() {
 	if mode == "" {
 		mode = "unknown"
 	}
-	modeLabel := trayModeDisplayName(mode)
 	running, _ := data["is_running"].(bool)
 	description := trayResultString(data, "status")
-	if description == "" {
-		if running {
-			description = fmt.Sprintf("%s proxy running", modeLabel)
-		} else {
-			description = fmt.Sprintf("%s proxy stopped", modeLabel)
-		}
-	}
 
 	a.isRunning = running
 	a.syncModeMenu(mode)
@@ -304,17 +306,20 @@ func (a *CompanionApp) syncState() {
 		systray.SetTooltip(trayProxyTooltip(mode, false))
 	}
 
-	a.mProxyStatus.SetTitle(fmt.Sprintf("Proxy: %s", description))
+	a.mProxyStatus.SetTitle(trayProxyStatusTitle(mode, running, description))
 	a.mModeHTTP.Enable()
 	a.mModeTUN.Enable()
 	if running {
 		a.mStart.Disable()
 		a.mStop.Enable()
 		a.mRestart.Enable()
+		aiStatus := BuildAIStatusFromIPCData(data)
+		a.updateAIStatusMenu(aiStatus)
 	} else {
 		a.mStart.Enable()
 		a.mStop.Disable()
 		a.mRestart.Disable()
+		a.hideAIStatus()
 	}
 }
 
@@ -339,6 +344,7 @@ func (a *CompanionApp) applyUnavailableState(reason string) {
 	if a.mRestart != nil {
 		a.mRestart.Disable()
 	}
+	a.hideAIStatus()
 }
 
 func (a *CompanionApp) openDashboard() {
@@ -397,6 +403,37 @@ func (a *CompanionApp) stopProxyForQuit() bool {
 
 	logger.Error("Background proxy stop returned an unexpected result during quit", "result", result.Data)
 	return false
+}
+
+func (a *CompanionApp) updateAIStatusMenu(providers []AIProviderStatus) {
+	if len(providers) == 0 {
+		a.hideAIStatus()
+		return
+	}
+	a.mAIHeader.SetTitle("AI Acceleration")
+	a.mAIHeader.Show()
+	for i, item := range a.mAIProviders {
+		if i < len(providers) {
+			title := FormatAIStatusTitle(providers[i])
+			if title != "" {
+				item.SetTitle(title)
+				item.Show()
+			} else {
+				item.Hide()
+			}
+		} else {
+			item.Hide()
+		}
+	}
+}
+
+func (a *CompanionApp) hideAIStatus() {
+	if a.mAIHeader != nil {
+		a.mAIHeader.Hide()
+	}
+	for _, item := range a.mAIProviders {
+		item.Hide()
+	}
 }
 
 func RunCompanion() {

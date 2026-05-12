@@ -19,6 +19,7 @@ import (
 	"aliang.one/nursorgate/processor/rules"
 	"aliang.one/nursorgate/processor/runtime"
 	"aliang.one/nursorgate/processor/setup"
+	"aliang.one/nursorgate/processor/statistic"
 	"github.com/spf13/cobra"
 
 	"aliang.one/nursorgate/internal/ipc"
@@ -247,7 +248,56 @@ func handleGetStatus(_ json.RawMessage) (interface{}, error) {
 	status["http_enabled"] = httpServer.IsServerRunning()
 	status["version"] = version.String()
 
+	aiStatus := buildAIStatusPayload()
+	if len(aiStatus) > 0 {
+		status["ai_status"] = aiStatus
+	}
+
 	return status, nil
+}
+
+func buildAIStatusPayload() []map[string]interface{} {
+	cfg := config.GetGlobalConfig()
+	if cfg == nil || cfg.Customer == nil || len(cfg.Customer.AIRules) == 0 {
+		return nil
+	}
+
+	aiSummary := statistic.GetDefaultAIActivityTracker().Summary()
+
+	trafficSet := make(map[string]*statistic.AIActivityDetection, len(aiSummary.RecentProviderTraffic))
+	for _, d := range aiSummary.RecentProviderTraffic {
+		trafficSet[config.NormalizeAIProviderKey(d.ProviderKey)] = d
+	}
+
+	var result []map[string]interface{}
+	for _, preset := range config.PresetAIRuleProviders {
+		providerKey := config.NormalizeAIProviderKey(preset.Key)
+		rule, exists := config.FindCustomerAIRule(cfg.Customer.AIRules, providerKey)
+		if !exists || rule == nil || rule.Enble == nil || !*rule.Enble {
+			continue
+		}
+
+		label := rule.Label
+		if label == "" {
+			label = preset.Label
+		}
+
+		detected := false
+		active := false
+		if d, ok := trafficSet[providerKey]; ok {
+			detected = true
+			active = d.Active
+		}
+
+		result = append(result, map[string]interface{}{
+			"key":      providerKey,
+			"label":    label,
+			"enabled":  true,
+			"detected": detected,
+			"active":   active,
+		})
+	}
+	return result
 }
 
 func handleStartProxy(_ json.RawMessage) (interface{}, error) {

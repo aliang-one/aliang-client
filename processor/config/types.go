@@ -675,6 +675,27 @@ func (c *Config) EffectiveAIAllowlist() []string {
 	return dedupeTrimmedDomains(allowlist)
 }
 
+func NormalizeAIProviderKey(key string) string {
+	return strings.ToLower(strings.TrimSpace(key))
+}
+
+func FindCustomerAIRule(rules map[string]*CustomerAIRuleSetting, key string) (*CustomerAIRuleSetting, bool) {
+	if len(rules) == 0 {
+		return nil, false
+	}
+	if rule, ok := rules[key]; ok {
+		return rule, true
+	}
+
+	normalizedKey := NormalizeAIProviderKey(key)
+	for existingKey, rule := range rules {
+		if NormalizeAIProviderKey(existingKey) == normalizedKey {
+			return rule, true
+		}
+	}
+	return nil, false
+}
+
 func (c *Config) EffectiveDNSPreResolution() *DNSPreResolutionConfig {
 	return GetDNSPreResolutionConfig()
 }

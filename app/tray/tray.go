@@ -18,7 +18,6 @@ import (
 // TrayApp manages the system tray application
 type TrayApp struct {
 	mProxyStatus   *systray.MenuItem
-	mModeStatus    *systray.MenuItem
 	mModeHTTP      *systray.MenuItem
 	mModeTUN       *systray.MenuItem
 	mStart         *systray.MenuItem
@@ -26,6 +25,9 @@ type TrayApp struct {
 	mRestart       *systray.MenuItem
 	mOpenDashboard *systray.MenuItem
 	mQuit          *systray.MenuItem
+
+	mAIHeader    *systray.MenuItem
+	mAIProviders []*systray.MenuItem
 
 	isRunning  bool
 	runService *services.RunService
@@ -66,8 +68,6 @@ func onReady() {
 	mProxyStatus := systray.AddMenuItem("Proxy: syncing status...", "Current proxy listener status")
 	mProxyStatus.Disable()
 
-	mModeStatus := systray.AddMenuItem("Current Mode: syncing...", "Selected proxy mode for the next start")
-	mModeStatus.Disable()
 	mModeHTTP := systray.AddMenuItemCheckbox("Select Regular Mode", "Choose Regular Mode for the next explicit start", false)
 	mModeTUN := systray.AddMenuItemCheckbox("Select Deep Mode", "Choose Deep Mode for the next explicit start", false)
 
@@ -88,11 +88,23 @@ func onReady() {
 
 	systray.AddSeparator()
 
+	// AI Acceleration status section (hidden by default)
+	mAIHeader := systray.AddMenuItem("AI Acceleration", "AI acceleration status")
+	mAIHeader.Disable()
+	mAIHeader.Hide()
+
+	var mAIProviders []*systray.MenuItem
+	for i := 0; i < maxAIProviders; i++ {
+		item := systray.AddMenuItem("", "AI provider status")
+		item.Disable()
+		item.Hide()
+		mAIProviders = append(mAIProviders, item)
+	}
+
 	mQuit := systray.AddMenuItem("Quit", "Quit the application")
 
 	app := NewTrayApp()
 	app.mProxyStatus = mProxyStatus
-	app.mModeStatus = mModeStatus
 	app.mModeHTTP = mModeHTTP
 	app.mModeTUN = mModeTUN
 	app.mStart = mStart
@@ -100,6 +112,8 @@ func onReady() {
 	app.mRestart = mRestart
 	app.mOpenDashboard = mOpenDashboard
 	app.mQuit = mQuit
+	app.mAIHeader = mAIHeader
+	app.mAIProviders = mAIProviders
 
 	// Set default callbacks
 	app.SetCallbacks(
@@ -226,9 +240,6 @@ func (t *TrayApp) selectMode(mode string) {
 }
 
 func (t *TrayApp) syncModeMenu(mode string) {
-	if t.mModeStatus != nil {
-		t.mModeStatus.SetTitle(trayCurrentModeTitle(mode))
-	}
 	if t.mModeHTTP != nil {
 		if mode == "http" {
 			t.mModeHTTP.Check()
@@ -367,15 +378,12 @@ func (t *TrayApp) syncProxyState() {
 	}
 	modeLabel := trayModeDisplayName(mode)
 	description := trayResultString(status, "status")
-	if description == "" {
-		description = fmt.Sprintf("%s proxy stopped", modeLabel)
-	}
 
 	t.isRunning = running
 	t.syncModeMenu(mode)
 
 	if t.mProxyStatus != nil {
-		t.mProxyStatus.SetTitle(fmt.Sprintf("Proxy: %s", description))
+		t.mProxyStatus.SetTitle(trayProxyStatusTitle(mode, running, description))
 	}
 
 	if t.mStart != nil {
@@ -403,10 +411,13 @@ func (t *TrayApp) syncProxyState() {
 	if running {
 		systray.SetIcon(GetIcon())
 		systray.SetTooltip(trayProxyTooltip(mode, true))
+		aiStatus := BuildAIStatusFromTracker()
+		t.updateAIStatusMenu(aiStatus)
 		return
 	}
 
 	systray.SetIcon(GetIconDisabled())
+	t.hideAIStatus()
 	startupStatus := startupRuntime.GetStartupState().GetStatus()
 	if startupStatus == startupRuntime.READY || startupStatus == startupRuntime.CONFIGURED {
 		systray.SetTooltip(trayProxyTooltip(mode, false))
@@ -443,6 +454,37 @@ func isAcceptableQuitProxyStopResult(result map[string]interface{}) bool {
 	}
 
 	return status == "failed" && trayResultString(result, "error") == "not_running"
+}
+
+func (t *TrayApp) updateAIStatusMenu(providers []AIProviderStatus) {
+	if len(providers) == 0 {
+		t.hideAIStatus()
+		return
+	}
+	t.mAIHeader.SetTitle("AI Acceleration")
+	t.mAIHeader.Show()
+	for i, item := range t.mAIProviders {
+		if i < len(providers) {
+			title := FormatAIStatusTitle(providers[i])
+			if title != "" {
+				item.SetTitle(title)
+				item.Show()
+			} else {
+				item.Hide()
+			}
+		} else {
+			item.Hide()
+		}
+	}
+}
+
+func (t *TrayApp) hideAIStatus() {
+	if t.mAIHeader != nil {
+		t.mAIHeader.Hide()
+	}
+	for _, item := range t.mAIProviders {
+		item.Hide()
+	}
 }
 
 // Run starts the system tray application
