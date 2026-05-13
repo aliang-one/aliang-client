@@ -93,6 +93,171 @@ See `config.new.json` for a full example. Key sections:
 - `customer.proxy`: Enable/disable outbound proxy, type, server
 - `customer.ai_rules`: Domain allowlists for AI services
 - `customer.proxy_rules`: Custom domain/IP routing rules
+- `customer.traffic_mirror`: TCP-level traffic mirroring (see below)
+
+### Traffic Mirror (TCP Stream Mirroring)
+
+在配置文件中启用后，对匹配指定域名的流量在 TCP 层面进行旁路镜像转发。仅对经过 MITM 解密（Aliang 路由）的明文连接生效，镜像失败不影响正常流量。
+
+**配置格式：**
+
+```json
+{
+    "customer": {
+        "traffic_mirror": {
+            "enabled": true,
+            "target": "http://127.0.0.1:9090/mirror",
+            "domains": ["api.openai.com", "api.anthropic.com", "*.cursor.sh"]
+        }
+    }
+}
+```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `enabled` | bool | 开关，`false` 时不产生任何开销 |
+| `target` | string | 接收 StreamChunk 的 HTTP POST 端点 |
+| `domains` | string[] | 匹配域名列表，支持精确匹配、`*.wildcard` 和后缀匹配 |
+
+**域名匹配规则：**
+
+| 模式 | 示例 | 匹配 |
+|------|------|------|
+| 精确匹配 | `api.openai.com` | `api.openai.com` |
+| 通配符 | `*.cursor.sh` | `api2.cursor.sh`，不匹配 `cursor.sh` 本身 |
+| 后缀匹配 | `openai.com` | `api.openai.com`、`cdn.openai.com` |
+
+**StreamChunk 数据格式（HTTP POST JSON body）：**
+
+```json
+{
+    "flow_id": "a1b2c3d4e5f6...",
+    "conn_id": "tcp-42",
+    "direction": "request",
+    "offset": 0,
+    "seq": 0,
+    "payload": "<base64 bytes>",
+    "timestamp": 1715673600123,
+    "src_addr": "192.168.1.5:54321",
+    "dst_addr": "104.18.6.192:443",
+    "client_addr": "192.168.1.5:54321",
+    "upstream_addr": "104.18.6.192:443",
+    "protocol_hint": "http1"
+}
+```
+
+| 字段 | 说明 |
+|------|------|
+| `flow_id` | 唯一标识一条完整的代理连接 |
+| `conn_id` | TCP handler 内部连接 ID |
+| `direction` | `request`（客户端→上游）或 `response`（上游→客户端） |
+| `offset` | 当前方向内的字节偏移，从 0 递增 |
+| `seq` | 当前方向内的 chunk 序号，从 0 递增 |
+| `payload` | 本次读到的明文字节片段 |
+| `timestamp` | 收集侧读到数据的时间（unix ms） |
+| `src_addr` | 当前 chunk 原始 src 地址 |
+| `dst_addr` | 当前 chunk 原始 dst 地址 |
+| `client_addr` | 客户端地址 |
+| `upstream_addr` | 上游地址 |
+| `protocol_hint` | 应用层协议提示（`http1` / `http2` / `unknown`） |
+
+**服务端如何重组字节流：**
+
+1. 按 `flow_id` 分组，得到一条连接的所有 chunk
+2. 按 `direction` 分为 `request` 和 `response` 两个独立的流
+3. 按 `offset` 排序（chunk 可能乱序到达）
+4. 按顺序拼接每个 chunk 的 `payload`，即还原出完整的明文请求/响应字节流
+5. 如果检测到 offset 不连续，说明有 chunk 丢失（channel 满时丢弃）
+
+### Flow Lifecycle Events（流量生命周期事件）
+
+除数据片段外，镜像还发送生命周期事件，让服务端知道每个 flow 的开始与结束。完整的事件序列：
+
+```
+flow_start  →  StreamChunk × N  →  flow_end
+```
+
+服务端通过 `event_type` 字段区分：无/空 = 数据片段，`flow_start` / `flow_end` = 生命周期事件。
+
+**flow_start 示例：**
+
+```json
+{
+    "event_type": "flow_start",
+    "flow_id": "a1b2c3d4e5f6...",
+    "conn_id": "tcp-42",
+    "timestamp": 1715612345678,
+    "client_addr": "192.168.1.100:54321",
+    "upstream_addr": "93.184.216.34:443",
+    "protocol_hint": "http1",
+    "host_name": "api.openai.com"
+}
+```
+
+**flow_end 示例（正常关闭）：**
+
+```json
+{
+    "event_type": "flow_end",
+    "flow_id": "a1b2c3d4e5f6...",
+    "conn_id": "tcp-42",
+    "timestamp": 1715612347890,
+    "client_addr": "192.168.1.100:54321",
+    "upstream_addr": "93.184.216.34:443",
+    "protocol_hint": "http1",
+    "host_name": "api.openai.com",
+    "client_to_server_bytes": 1024,
+    "server_to_client_bytes": 8192,
+    "duration_ms": 2212,
+    "error_class": "clean"
+}
+```
+
+**FlowEvent 字段说明：**
+
+| 字段 | 说明 |
+|------|------|
+| `event_type` | `flow_start` 或 `flow_end` |
+| `flow_id` | 唯一标识一条代理连接 |
+| `conn_id` | TCP handler 内部连接 ID |
+| `timestamp` | 事件时间（unix ms） |
+| `client_addr` | 客户端地址 |
+| `upstream_addr` | 上游地址 |
+| `protocol_hint` | 应用层协议提示（`http1` / `http2` / `unknown`） |
+| `host_name` | 目标域名 |
+| `client_to_server_bytes` | 客户端→上游总字节数（仅 flow_end） |
+| `server_to_client_bytes` | 上游→客户端总字节数（仅 flow_end） |
+| `duration_ms` | flow 持续时间（仅 flow_end） |
+| `error` | 错误描述（仅 flow_end 异常时） |
+| `error_class` | 错误分类（`clean` / `timeout` / `reset` / `tls_error` / `context_cancel` / `unknown`） |
+
+**服务端 Flow 状态机：**
+
+```
+[无状态] --flow_start--> ACTIVE
+ACTIVE --data chunk--> ACTIVE（按 offset 追加 payload）
+ACTIVE --flow_end--> COMPLETE（校验完整性，触发后处理）
+```
+
+```
+request  流: offset=0 payload="GET /v1/chat..." + offset=1425 payload="..."  → 完整 HTTP 请求
+response 流: offset=0 payload="HTTP/1.1 200..." + offset=876  payload="..."  → 完整 HTTP 响应
+```
+
+**架构位置：**
+
+```
+客户端 → proxy (MITM 解密)
+  → mirrorConn.Wrap(clientConn, DirectionRequest)    ← wrapper
+  → mirrorConn.Wrap(remoteConn, DirectionResponse)    ← wrapper
+  → relay(wrappedClient, wrappedRemote)
+      → wrappedClient.Read()  → 底层 Read + 捕获 StreamChunk → 异步 HTTP POST
+      → wrappedRemote.Read()  → 底层 Read + 捕获 StreamChunk → 异步 HTTP POST
+```
+
+- wrapper 位于 `statistic.TCPTracker` 之外（更外层），统计数据不受影响
+- 仅对 `RouteToALiang` 路由生效，直连流量不经过镜像
+- 未配置时，开销仅一次 `nil` 判断，不创建任何 goroutine 或 channel
 
 ## 🧩 Key Commands
 

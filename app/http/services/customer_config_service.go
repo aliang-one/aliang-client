@@ -15,6 +15,7 @@ import (
 	"aliang.one/nursorgate/app/http/models"
 	"aliang.one/nursorgate/app/http/storage"
 	"aliang.one/nursorgate/processor/config"
+	"aliang.one/nursorgate/processor/mirror"
 )
 
 const customerConfigFilePath = "~/.aliang/config.json"
@@ -157,6 +158,7 @@ func (s *CustomerConfigService) UpdateCommittedCustomerConfig(payload []byte) (*
 				return fmt.Errorf("decode snapshot content for memory commit: %w", err)
 			}
 			config.SetGlobalConfig(&committedCfg)
+			mirror.InitGlobalForwarder()
 			return nil
 		},
 	)
@@ -250,7 +252,7 @@ func normalizeCustomerPayload(payload []byte) (map[string]interface{}, error) {
 				forbidden = append(forbidden, key)
 			}
 			sort.Strings(forbidden)
-			return nil, fmt.Errorf("customer.%s is forbidden: editable customer fields are [proxy ai_rules proxy_rules]", forbidden[0])
+			return nil, fmt.Errorf("customer.%s is forbidden: editable customer fields are [proxy ai_rules proxy_rules traffic_mirror]", forbidden[0])
 		}
 		rawRoot = map[string]json.RawMessage{}
 		if err := json.Unmarshal(rawCustomer, &rawRoot); err != nil {
@@ -277,9 +279,9 @@ func normalizeCustomerPayload(payload []byte) (map[string]interface{}, error) {
 func validateEditableCustomerKeys(rawRoot map[string]json.RawMessage) error {
 	for key := range rawRoot {
 		switch key {
-		case "proxy", "ai_rules", "proxy_rules":
+		case "proxy", "ai_rules", "proxy_rules", "traffic_mirror":
 		default:
-			return fmt.Errorf("customer.%s is forbidden: editable customer fields are [proxy ai_rules proxy_rules]", key)
+			return fmt.Errorf("customer.%s is forbidden: editable customer fields are [proxy ai_rules proxy_rules traffic_mirror]", key)
 		}
 	}
 	return nil

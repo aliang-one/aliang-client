@@ -20,6 +20,7 @@ import (
 	outboundproxy "aliang.one/nursorgate/outbound/proxy"
 	cachepkg "aliang.one/nursorgate/processor/cache"
 	"aliang.one/nursorgate/processor/config"
+	"aliang.one/nursorgate/processor/mirror"
 	"aliang.one/nursorgate/processor/rules"
 	"aliang.one/nursorgate/processor/statistic"
 	watcher "aliang.one/nursorgate/processor/watcher"
@@ -331,6 +332,18 @@ func (h *TCPConnectionHandler) Handle(ctx context.Context, originConn net.Conn, 
 	trackedRemote := statistic.NewTCPTracker(wrapCloseOnceConn(remoteConn), metadata, h.statsManager)
 	defer trackedRemote.Close()
 
+	// Mirror wrapping (only for Aliang/MITM routes with plaintext data)
+	var mirrorFlow *mirror.Flow
+	if metadata != nil && metadata.Route == "RouteToALiang" {
+		mirrorFlow = mirror.NewMirrorFlow(metadata)
+	}
+	if mirrorFlow != nil {
+		newOriginConn = mirrorFlow.WrapConn(newOriginConn, mirror.DirectionRequest)
+		trackedRemote = mirrorFlow.WrapConn(trackedRemote, mirror.DirectionResponse)
+		mirrorFlow.EmitStart()
+		defer mirrorFlow.Close()
+	}
+
 	if metadata != nil && metadata.Route == "RouteToALiang" && metadata.AppProto == AppProtoHTTP1 {
 		http1RelayStats, relayErr := watcher.RelayHTTP1(sessionCtx, newOriginConn, trackedRemote)
 		statistic.GetDefaultAIActivityTracker().CompleteMetadata(metadata, http1RelayStats.CompletedAt)
@@ -358,6 +371,13 @@ func (h *TCPConnectionHandler) Handle(ctx context.Context, originConn net.Conn, 
 		} else {
 			logger.Debug(fmt.Sprintf("TCP: conn_id=%s http1 relay completed bytes_up=%d bytes_down=%d",
 				connID, http1RelayStats.ClientToServerByte, http1RelayStats.ServerToClientByte))
+		}
+		if mirrorFlow != nil {
+			mirrorFlow.EmitEnd(
+				http1RelayStats.ClientToServerByte,
+				http1RelayStats.ServerToClientByte,
+				relayErr,
+			)
 		}
 		return relayErr
 	}
@@ -392,6 +412,14 @@ func (h *TCPConnectionHandler) Handle(ctx context.Context, originConn net.Conn, 
 	} else {
 		logger.Debug(fmt.Sprintf("TCP: conn_id=%s relay completed bytes_up=%d bytes_down=%d first_response=%s",
 			connID, relayStats.ClientToServerByte, relayStats.ServerToClientByte, relayStats.FirstResponseAt.Format(time.RFC3339Nano)))
+	}
+
+	if mirrorFlow != nil {
+		mirrorFlow.EmitEnd(
+			relayStats.ClientToServerByte,
+			relayStats.ServerToClientByte,
+			err,
+		)
 	}
 
 	// Store DNS binding to cache after successful relay

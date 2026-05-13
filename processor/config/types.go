@@ -263,10 +263,32 @@ type CoreEngineConfig struct {
 	UDPTimeout               string `json:"udp-timeout"`
 }
 
+// TrafficMirrorConfig controls TCP-level traffic mirroring for matched domains.
+type TrafficMirrorConfig struct {
+	Enabled bool     `json:"enabled"`
+	Target  string   `json:"target"`  // HTTP endpoint to POST StreamChunk to
+	Domains []string `json:"domains"` // Domain patterns to mirror
+}
+
+// Validate validates traffic mirror configuration
+func (c *TrafficMirrorConfig) Validate() error {
+	if !c.Enabled {
+		return nil
+	}
+	if c.Target == "" {
+		return fmt.Errorf("traffic_mirror.target is required when enabled")
+	}
+	if len(c.Domains) == 0 {
+		return fmt.Errorf("traffic_mirror.domains must not be empty when enabled")
+	}
+	return nil
+}
+
 type CustomerConfig struct {
-	Proxy      *CustomerProxyConfig              `json:"proxy,omitempty"`
-	AIRules    map[string]*CustomerAIRuleSetting `json:"ai_rules,omitempty"`
-	ProxyRules []string                          `json:"proxy_rules,omitempty"`
+	Proxy         *CustomerProxyConfig              `json:"proxy,omitempty"`
+	AIRules       map[string]*CustomerAIRuleSetting `json:"ai_rules,omitempty"`
+	ProxyRules    []string                          `json:"proxy_rules,omitempty"`
+	TrafficMirror *TrafficMirrorConfig              `json:"traffic_mirror,omitempty"`
 }
 
 type AliangServerConfig struct {
@@ -466,6 +488,12 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	if mirror := c.EffectiveTrafficMirror(); mirror != nil {
+		if err := mirror.Validate(); err != nil {
+			return fmt.Errorf("invalid traffic_mirror configuration: %w", err)
+		}
+	}
+
 	return nil
 }
 
@@ -518,7 +546,7 @@ func (c *Config) customerUnknownKeyErrors() error {
 	if len(c.customerUnknownFields) > 0 {
 		sorted := append([]string(nil), c.customerUnknownFields...)
 		sort.Strings(sorted)
-		return fmt.Errorf("customer.%s is forbidden: editable customer fields are [proxy ai_rules proxy_rules]", sorted[0])
+		return fmt.Errorf("customer.%s is forbidden: editable customer fields are [proxy ai_rules proxy_rules traffic_mirror]", sorted[0])
 	}
 
 	providers := make([]string, 0, len(c.aiRuleUnknownFields))
@@ -555,7 +583,7 @@ func extractCustomerUnknownFields(root map[string]json.RawMessage) ([]string, ma
 
 	for key := range customerRoot {
 		switch key {
-		case "proxy", "ai_rules", "proxy_rules":
+		case "proxy", "ai_rules", "proxy_rules", "traffic_mirror":
 		default:
 			unknownCustomer = append(unknownCustomer, key)
 		}
@@ -698,6 +726,17 @@ func FindCustomerAIRule(rules map[string]*CustomerAIRuleSetting, key string) (*C
 
 func (c *Config) EffectiveDNSPreResolution() *DNSPreResolutionConfig {
 	return GetDNSPreResolutionConfig()
+}
+
+// EffectiveTrafficMirror returns the traffic mirror config if mirroring is enabled.
+func (c *Config) EffectiveTrafficMirror() *TrafficMirrorConfig {
+	if c == nil || c.Customer == nil || c.Customer.TrafficMirror == nil {
+		return nil
+	}
+	if !c.Customer.TrafficMirror.Enabled {
+		return nil
+	}
+	return c.Customer.TrafficMirror
 }
 
 func sortedMapKeys(values map[string]*CustomerAIRuleSetting) []string {

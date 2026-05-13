@@ -11,6 +11,7 @@ import (
 	"aliang.one/nursorgate/outbound"
 	"aliang.one/nursorgate/processor/config"
 	"aliang.one/nursorgate/processor/dns"
+	"aliang.one/nursorgate/processor/mirror"
 	"aliang.one/nursorgate/processor/setup"
 )
 
@@ -208,6 +209,9 @@ func ApplyConfig(cfg *Config) error {
 
 	// Store config globally for access by other modules
 	config.SetGlobalConfig(cfg)
+
+	// Initialize traffic mirror forwarder (no-op if mirror is disabled)
+	mirror.InitGlobalForwarder()
 
 	// Phase 1: Register built-in proxies (direct + aliang)
 	// These are mandatory and always available
