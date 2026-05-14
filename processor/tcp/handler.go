@@ -3,6 +3,7 @@ package tcp
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -57,6 +58,7 @@ const (
 )
 
 var tcpConnIDCounter uint64
+var establishMirrorUpstreamTLSConn = establishMirrorUpstreamTLS
 
 type tcpContextConnIDKey struct{}
 
@@ -724,9 +726,17 @@ func (h *TCPConnectionHandler) resolveTLSRoute(
 		return remote, h.wrapAliangHTTPConnByProto(bufferedMitmed, metadata.AppProto), nil
 	}
 
+	if shouldMITMForMirror(metadata, route) {
+		return h.resolveTLSMirrorRoute(connectCtx, originConn, metadata, route, wrapped, mitmedSNI)
+	}
+
 	remote, err := h.dialByRoute(connectCtx, metadata, route)
 	if err != nil {
 		return nil, nil, err
+	}
+	relayOrigin := net.Conn(wrapped)
+	if !isUsableConn(relayOrigin) {
+		relayOrigin = originConn
 	}
 	logger.Debug(fmt.Sprintf(
 		"[TLS DIAG] conn_id=%s resolve_tls route=%s host=%s mitm_sni=%q relay_origin_type=%T relay_origin_diag=%s remote_type=%T remote_diag=%s",
@@ -739,7 +749,137 @@ func (h *TCPConnectionHandler) resolveTLSRoute(
 		remote,
 		describeConnDiagnostics(remote),
 	))
-	return remote, wrapped, nil
+	return remote, relayOrigin, nil
+}
+
+func shouldMITMForMirror(metadata *M.Metadata, route ProxyRoute) bool {
+	if route == RouteToALiang {
+		return false
+	}
+	return mirror.ShouldMirror(metadata)
+}
+
+func (h *TCPConnectionHandler) resolveTLSMirrorRoute(
+	connectCtx context.Context,
+	originConn net.Conn,
+	metadata *M.Metadata,
+	route ProxyRoute,
+	wrapped net.Conn,
+	mitmedSNI string,
+) (net.Conn, net.Conn, error) {
+	if strings.TrimSpace(mitmedSNI) == "" {
+		mitmedSNI = strings.TrimSpace(metadata.HostName)
+	}
+	if strings.TrimSpace(mitmedSNI) == "" {
+		return nil, nil, fmt.Errorf("monitor MITM requires a server name")
+	}
+
+	mitmConn := wrapped
+	if !isUsableConn(mitmConn) {
+		mitmConn = originConn
+	}
+	if !isUsableConn(mitmConn) {
+		return nil, nil, fmt.Errorf("monitor MITM requires a usable client TLS stream")
+	}
+
+	mitmed, err := h.tlsHandler.PerformMITM(connectCtx, mitmConn, mitmedSNI)
+	if err != nil {
+		logger.Warn(fmt.Sprintf("[TLS MIRROR MITM] MITM failed for %s: %v", mitmedSNI, err))
+		return nil, nil, err
+	}
+
+	clientALPN := negotiatedTLSProtocol(mitmed)
+	prefetchedData, sniffErr := prefetchApplicationData(connectCtx, mitmed, applicationPrefetchMaxBytes)
+	if sniffErr != nil {
+		logger.Debug(fmt.Sprintf("mirror MITM protocol prefetch failed: %v", sniffErr))
+	}
+
+	metadata.AppProto = detectApplicationProtocol(prefetchedData)
+	if metadata.AppProto == AppProtoUnknown && clientALPN == http2.NextProtoTLS {
+		metadata.AppProto = AppProtoHTTP2
+	}
+	if metadata.AppProto == AppProtoUnknown && clientALPN == "http/1.1" {
+		metadata.AppProto = AppProtoHTTP1
+	}
+	bufferedMitmed := wrapBufferedConn(mitmed, prefetchedData)
+
+	remoteRaw, err := h.dialByRoute(connectCtx, metadata, route)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	remoteTLS, err := establishMirrorUpstreamTLSConn(connectCtx, remoteRaw, mitmedSNI, mirrorUpstreamNextProtos(clientALPN, metadata.AppProto), clientALPN, metadata.AppProto)
+	if err != nil {
+		_ = remoteRaw.Close()
+		return nil, nil, err
+	}
+
+	logger.Info(fmt.Sprintf("[TLS MIRROR MITM] MITM bridge established for %s via %s (proto=%s alpn=%s)",
+		mitmedSNI, metadata.Route, metadata.AppProto, clientALPN))
+	return remoteTLS, bufferedMitmed, nil
+}
+
+func negotiatedTLSProtocol(conn net.Conn) string {
+	tlsConn, ok := conn.(*tls.Conn)
+	if !ok || tlsConn == nil {
+		return ""
+	}
+	return tlsConn.ConnectionState().NegotiatedProtocol
+}
+
+func mirrorUpstreamNextProtos(clientALPN, appProto string) []string {
+	switch clientALPN {
+	case http2.NextProtoTLS:
+		return []string{http2.NextProtoTLS}
+	case "http/1.1":
+		return []string{"http/1.1"}
+	}
+
+	switch appProto {
+	case AppProtoHTTP2:
+		return []string{http2.NextProtoTLS}
+	case AppProtoHTTP1:
+		return []string{"http/1.1"}
+	default:
+		return []string{http2.NextProtoTLS, "http/1.1"}
+	}
+}
+
+func establishMirrorUpstreamTLS(ctx context.Context, raw net.Conn, serverName string, nextProtos []string, clientALPN string, appProto string) (net.Conn, error) {
+	if !isUsableConn(raw) {
+		return nil, net.ErrClosed
+	}
+
+	cfg := &tls.Config{
+		ServerName: strings.TrimSpace(serverName),
+		NextProtos: append([]string(nil), nextProtos...),
+		MinVersion: tls.VersionTLS12,
+	}
+	tlsConn := tls.Client(raw, cfg)
+
+	clearDeadline := applyContextReadDeadline(ctx, raw)
+	defer clearDeadline()
+
+	if err := tlsConn.Handshake(); err != nil {
+		return nil, err
+	}
+
+	upstreamALPN := tlsConn.ConnectionState().NegotiatedProtocol
+	if err := validateMirrorUpstreamALPN(clientALPN, appProto, upstreamALPN); err != nil {
+		_ = tlsConn.Close()
+		return nil, err
+	}
+	return tlsConn, nil
+}
+
+func validateMirrorUpstreamALPN(clientALPN, appProto, upstreamALPN string) error {
+	if clientALPN == http2.NextProtoTLS && upstreamALPN != http2.NextProtoTLS {
+		return fmt.Errorf("monitor MITM upstream ALPN mismatch: client=%s upstream=%s", clientALPN, upstreamALPN)
+	}
+	if appProto == AppProtoHTTP2 && upstreamALPN != http2.NextProtoTLS {
+		return fmt.Errorf("monitor MITM upstream does not support HTTP/2: upstream_alpn=%s", upstreamALPN)
+	}
+	return nil
 }
 
 func safeBindingSource(metadata *M.Metadata) string {

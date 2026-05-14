@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/netip"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strings"
 	"sync"
 	"testing"
@@ -21,6 +21,7 @@ import (
 	"aliang.one/nursorgate/processor/config"
 	"aliang.one/nursorgate/processor/mirror"
 	"aliang.one/nursorgate/processor/statistic"
+	"golang.org/x/net/http2"
 )
 
 type fakeConn struct {
@@ -65,6 +66,28 @@ func (p *fakeAliangProxy) Proto() proto.Proto {
 }
 
 var _ outboundproxy.Proxy = (*fakeAliangProxy)(nil)
+
+type fakeMITMTLSHandler struct {
+	mitmPayload []byte
+	mitmHost    string
+}
+
+func (h *fakeMITMTLSHandler) ExtractSNI(context.Context, net.Conn) (string, []byte, error) {
+	return "", nil, nil
+}
+
+func (h *fakeMITMTLSHandler) PerformMITM(_ context.Context, _ net.Conn, serverName string) (net.Conn, error) {
+	h.mitmHost = serverName
+	return newFakeConn(h.mitmPayload), nil
+}
+
+func (h *fakeMITMTLSHandler) DetermineRoute(string) ProxyRoute {
+	return RouteDirect
+}
+
+func (h *fakeMITMTLSHandler) DetermineRouteWithContext(*M.Metadata) (ProxyRoute, bool) {
+	return RouteDirect, false
+}
 
 type mirrorAwareRelayManager struct {
 	mu            sync.Mutex
@@ -146,10 +169,10 @@ func TestHandle_MirrorsConfiguredTrafficEvenWhenRouteIsDirect(t *testing.T) {
 	}()
 
 	var (
-		mu      sync.Mutex
-		bodies  [][]byte
-		recvCh  = make(chan []byte, 8)
-		server  = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu     sync.Mutex
+		bodies [][]byte
+		recvCh = make(chan []byte, 8)
+		server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			body, _ := io.ReadAll(r.Body)
 			_ = r.Body.Close()
 			copyBody := append([]byte(nil), body...)
@@ -245,5 +268,146 @@ func TestHandle_MirrorsConfiguredTrafficEvenWhenRouteIsDirect(t *testing.T) {
 		case <-deadline:
 			t.Fatalf("expected mirrored flow_start and request chunk to be forwarded, got bodies=%d", len(bodies))
 		}
+	}
+}
+
+func TestShouldMITMForMirror_OnlyMatchesNonAliangMirroredHost(t *testing.T) {
+	config.ResetGlobalConfigForTest()
+	defer config.ResetGlobalConfigForTest()
+
+	config.SetGlobalConfig(&config.Config{
+		Customer: &config.CustomerConfig{
+			TrafficMirror: &config.TrafficMirrorConfig{
+				Enabled: true,
+				Target:  "http://127.0.0.1:1/mirror",
+				Domains: []string{"*.cursor.sh"},
+			},
+		},
+	})
+
+	metadata := &M.Metadata{HostName: "api.cursor.sh"}
+	if !shouldMITMForMirror(metadata, RouteDirect) {
+		t.Fatal("expected direct mirrored host to use monitor MITM")
+	}
+	if !shouldMITMForMirror(metadata, RouteToLocalProxy) {
+		t.Fatal("expected local proxy mirrored host to use monitor MITM")
+	}
+	if shouldMITMForMirror(metadata, RouteToALiang) {
+		t.Fatal("expected toAliang route to keep existing MITM path")
+	}
+	if shouldMITMForMirror(&M.Metadata{HostName: "api.openai.com"}, RouteDirect) {
+		t.Fatal("expected unmatched host to skip monitor MITM")
+	}
+}
+
+func TestMirrorUpstreamNextProtos_PreservesClientProtocol(t *testing.T) {
+	if got := mirrorUpstreamNextProtos(http2.NextProtoTLS, AppProtoHTTP1); len(got) != 1 || got[0] != http2.NextProtoTLS {
+		t.Fatalf("h2 client next protos = %v, want [h2]", got)
+	}
+	if got := mirrorUpstreamNextProtos("http/1.1", AppProtoHTTP2); len(got) != 1 || got[0] != "http/1.1" {
+		t.Fatalf("http/1.1 client next protos = %v, want [http/1.1]", got)
+	}
+	if got := mirrorUpstreamNextProtos("", AppProtoHTTP2); len(got) != 1 || got[0] != http2.NextProtoTLS {
+		t.Fatalf("http2 app next protos = %v, want [h2]", got)
+	}
+	if got := mirrorUpstreamNextProtos("", AppProtoUnknown); len(got) != 2 || got[0] != http2.NextProtoTLS || got[1] != "http/1.1" {
+		t.Fatalf("unknown app next protos = %v, want [h2 http/1.1]", got)
+	}
+}
+
+func TestValidateMirrorUpstreamALPN_RejectsHTTP2Downgrade(t *testing.T) {
+	if err := validateMirrorUpstreamALPN(http2.NextProtoTLS, AppProtoHTTP2, ""); err == nil {
+		t.Fatal("expected h2 client without upstream h2 to fail")
+	}
+	if err := validateMirrorUpstreamALPN("", AppProtoHTTP2, "http/1.1"); err == nil {
+		t.Fatal("expected h2 app without upstream h2 to fail")
+	}
+	if err := validateMirrorUpstreamALPN("http/1.1", AppProtoHTTP1, ""); err != nil {
+		t.Fatalf("expected http/1.1 client with empty upstream ALPN to pass, got %v", err)
+	}
+	if err := validateMirrorUpstreamALPN(http2.NextProtoTLS, AppProtoHTTP2, http2.NextProtoTLS); err != nil {
+		t.Fatalf("expected matching h2 ALPN to pass, got %v", err)
+	}
+}
+
+func TestResolveTLSMirrorRoute_RewrapsDirectRouteAndPreservesPlaintextForMirror(t *testing.T) {
+	config.ResetGlobalConfigForTest()
+	defer config.ResetGlobalConfigForTest()
+
+	var (
+		gotServerName string
+		gotNextProtos []string
+	)
+	previousEstablish := establishMirrorUpstreamTLSConn
+	establishMirrorUpstreamTLSConn = func(_ context.Context, raw net.Conn, serverName string, nextProtos []string, _ string, _ string) (net.Conn, error) {
+		gotServerName = serverName
+		gotNextProtos = append([]string(nil), nextProtos...)
+		return raw, nil
+	}
+	defer func() {
+		establishMirrorUpstreamTLSConn = previousEstablish
+	}()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen failed: %v", err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		conn, acceptErr := ln.Accept()
+		if acceptErr == nil {
+			accepted <- conn
+		}
+	}()
+
+	tlsHandler := &fakeMITMTLSHandler{
+		mitmPayload: []byte("GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"),
+	}
+	handler := NewTCPConnectionHandler(NewDefaultProtocolDetector(), tlsHandler, nil, statistic.DefaultManager)
+	metadata := &M.Metadata{
+		Network:  M.TCP,
+		DstIP:    netip.MustParseAddr("127.0.0.1"),
+		DstPort:  uint16(ln.Addr().(*net.TCPAddr).Port),
+		HostName: "127.0.0.1",
+	}
+
+	remote, origin, err := handler.resolveTLSMirrorRoute(context.Background(), newFakeConn(nil), metadata, RouteDirect, nil, "")
+	if err != nil {
+		t.Fatalf("resolveTLSMirrorRoute failed: %v", err)
+	}
+	defer remote.Close()
+	defer origin.Close()
+
+	if tlsHandler.mitmHost != "127.0.0.1" {
+		t.Fatalf("MITM host = %q, want 127.0.0.1", tlsHandler.mitmHost)
+	}
+	if gotServerName != "127.0.0.1" {
+		t.Fatalf("upstream TLS server name = %q, want 127.0.0.1", gotServerName)
+	}
+	if len(gotNextProtos) != 1 || gotNextProtos[0] != "http/1.1" {
+		t.Fatalf("upstream next protos = %v, want [http/1.1]", gotNextProtos)
+	}
+	if metadata.AppProto != AppProtoHTTP1 {
+		t.Fatalf("metadata AppProto = %q, want %q", metadata.AppProto, AppProtoHTTP1)
+	}
+	if metadata.Route != "RouteDirect" {
+		t.Fatalf("metadata Route = %q, want RouteDirect", metadata.Route)
+	}
+
+	plaintext, err := io.ReadAll(origin)
+	if err != nil {
+		t.Fatalf("read mirrored plaintext failed: %v", err)
+	}
+	if !strings.HasPrefix(string(plaintext), "GET / HTTP/1.1") {
+		t.Fatalf("origin plaintext = %q, want HTTP/1.1 request", string(plaintext))
+	}
+
+	select {
+	case conn := <-accepted:
+		_ = conn.Close()
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected direct dial to reach local listener")
 	}
 }

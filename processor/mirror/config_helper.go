@@ -1,6 +1,9 @@
 package mirror
 
-import "aliang.one/nursorgate/processor/config"
+import (
+	M "aliang.one/nursorgate/inbound/tun/metadata"
+	"aliang.one/nursorgate/processor/config"
+)
 
 // loadMirrorConfig returns the effective traffic mirror configuration, or nil.
 func loadMirrorConfig() *config.TrafficMirrorConfig {
@@ -9,4 +12,16 @@ func loadMirrorConfig() *config.TrafficMirrorConfig {
 		return nil
 	}
 	return cfg.EffectiveTrafficMirror()
+}
+
+// ShouldMirror reports whether traffic mirroring is configured for metadata's host.
+func ShouldMirror(metadata *M.Metadata) bool {
+	if metadata == nil || metadata.HostName == "" {
+		return false
+	}
+	cfg := loadMirrorConfig()
+	if cfg == nil {
+		return false
+	}
+	return MatchesAnyDomain(metadata.HostName, cfg.Domains)
 }
