@@ -286,6 +286,7 @@ let statusPollTimer = null;
 
 const runtimeLevelOptions = computed(() => {
   return LOG_LEVEL_OPTIONS
+    .filter((option) => !isProdBuild || option.value === 'info' || option.value === 'warn' || option.value === 'error')
     .map((option) => ({
       value: option.value,
       label: t(option.labelKey)
