@@ -46,12 +46,15 @@ func (c *packetConnStub) ReadFrom(p []byte) (int, net.Addr, error) {
 	c.readData = c.readData[n:]
 	return n, &net.UDPAddr{}, nil
 }
-func (c *packetConnStub) WriteTo(p []byte, _ net.Addr) (int, error) { c.written += len(p); return len(p), nil }
-func (c *packetConnStub) Close() error                              { c.closeCount++; return nil }
-func (c *packetConnStub) LocalAddr() net.Addr                       { return &net.UDPAddr{} }
-func (c *packetConnStub) SetDeadline(time.Time) error               { return nil }
-func (c *packetConnStub) SetReadDeadline(time.Time) error           { return nil }
-func (c *packetConnStub) SetWriteDeadline(time.Time) error          { return nil }
+func (c *packetConnStub) WriteTo(p []byte, _ net.Addr) (int, error) {
+	c.written += len(p)
+	return len(p), nil
+}
+func (c *packetConnStub) Close() error                     { c.closeCount++; return nil }
+func (c *packetConnStub) LocalAddr() net.Addr              { return &net.UDPAddr{} }
+func (c *packetConnStub) SetDeadline(time.Time) error      { return nil }
+func (c *packetConnStub) SetReadDeadline(time.Time) error  { return nil }
+func (c *packetConnStub) SetWriteDeadline(time.Time) error { return nil }
 
 func newTestManager() *Manager {
 	return &Manager{
@@ -130,6 +133,46 @@ func TestTCPTracker_NonDirectRouteContributesStatistics(t *testing.T) {
 	}
 	if _, ok := snapshot.ByRoute["RouteToALiang"]; !ok {
 		t.Fatalf("expected RouteToALiang stats to exist")
+	}
+}
+
+func TestManager_CloseTrackedConnectionsByMetadata_ClosesMatchingConnections(t *testing.T) {
+	manager := newTestManager()
+	conn := &closeCountingConn{}
+	_ = NewTCPTracker(conn, &M.Metadata{
+		Route:    "RouteToALiang",
+		HostName: "api.cursor.sh",
+		ConnID:   "conn-1",
+	}, manager)
+
+	closed := manager.CloseTrackedConnectionsByMetadata(func(metadata *M.Metadata) bool {
+		return metadata != nil && metadata.Route == "RouteToALiang" && metadata.HostName == "api.cursor.sh"
+	})
+	if closed != 1 {
+		t.Fatalf("closed connections = %d, want 1", closed)
+	}
+	if conn.closeCount != 1 {
+		t.Fatalf("underlying close count = %d, want 1", conn.closeCount)
+	}
+}
+
+func TestManager_CloseTrackedConnectionsByMetadata_IgnoresNonMatchingConnections(t *testing.T) {
+	manager := newTestManager()
+	conn := &closeCountingConn{}
+	_ = NewTCPTracker(conn, &M.Metadata{
+		Route:    "RouteToALiang",
+		HostName: "api.openai.com",
+		ConnID:   "conn-2",
+	}, manager)
+
+	closed := manager.CloseTrackedConnectionsByMetadata(func(metadata *M.Metadata) bool {
+		return metadata != nil && metadata.HostName == "api.cursor.sh"
+	})
+	if closed != 0 {
+		t.Fatalf("closed connections = %d, want 0", closed)
+	}
+	if conn.closeCount != 0 {
+		t.Fatalf("underlying close count = %d, want 0", conn.closeCount)
 	}
 }
 

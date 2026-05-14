@@ -14,8 +14,12 @@ import (
 
 	"aliang.one/nursorgate/app/http/models"
 	"aliang.one/nursorgate/app/http/storage"
+	"aliang.one/nursorgate/common/logger"
+	M "aliang.one/nursorgate/inbound/tun/metadata"
 	"aliang.one/nursorgate/processor/config"
 	"aliang.one/nursorgate/processor/mirror"
+	"aliang.one/nursorgate/processor/rules"
+	"aliang.one/nursorgate/processor/statistic"
 )
 
 const customerConfigFilePath = "~/.aliang/config.json"
@@ -157,7 +161,9 @@ func (s *CustomerConfigService) UpdateCommittedCustomerConfig(payload []byte) (*
 			if err := json.Unmarshal([]byte(snapshot.Content), &committedCfg); err != nil {
 				return fmt.Errorf("decode snapshot content for memory commit: %w", err)
 			}
+			previousCfg := config.GetGlobalConfig()
 			config.SetGlobalConfig(&committedCfg)
+			closeDisabledAIAcceleratedConnections(previousCfg, &committedCfg)
 			mirror.InitGlobalForwarder()
 			return nil
 		},
@@ -230,6 +236,69 @@ func mergeCustomerPayload(baseCfg *config.Config, payload []byte) (string, *conf
 	}
 
 	return string(mergedRaw), &nextCfg, nil
+}
+
+func closeDisabledAIAcceleratedConnections(previousCfg, nextCfg *config.Config) {
+	disabledDomains := disabledAIAccelerationDomains(previousCfg, nextCfg)
+	if len(disabledDomains) == 0 {
+		return
+	}
+
+	if engine := rules.GetEngine(); engine != nil {
+		engine.ClearCache()
+	}
+
+	closed := statistic.DefaultManager.CloseTrackedConnectionsByMetadata(func(metadata *M.Metadata) bool {
+		if metadata == nil || metadata.Route != "RouteToALiang" || metadata.HostName == "" {
+			return false
+		}
+		return mirror.MatchesAnyDomain(metadata.HostName, disabledDomains)
+	})
+
+	if closed > 0 {
+		logger.Info(fmt.Sprintf("Closed %d accelerated connections after AI rule disable", closed))
+	}
+}
+
+func disabledAIAccelerationDomains(previousCfg, nextCfg *config.Config) []string {
+	if previousCfg == nil || previousCfg.Customer == nil || len(previousCfg.Customer.AIRules) == 0 {
+		return nil
+	}
+
+	var nextRules map[string]*config.CustomerAIRuleSetting
+	if nextCfg != nil && nextCfg.Customer != nil {
+		nextRules = nextCfg.Customer.AIRules
+	}
+
+	disabled := make(map[string]struct{})
+	for providerKey, previousRule := range previousCfg.Customer.AIRules {
+		if previousRule == nil || previousRule.Enble == nil || !*previousRule.Enble {
+			continue
+		}
+
+		nextRule, ok := config.FindCustomerAIRule(nextRules, providerKey)
+		if ok && nextRule != nil && nextRule.Enble != nil && *nextRule.Enble {
+			continue
+		}
+
+		for _, domain := range previousRule.Include {
+			normalized := strings.ToLower(strings.TrimSpace(domain))
+			if normalized == "" {
+				continue
+			}
+			disabled[normalized] = struct{}{}
+		}
+	}
+
+	if len(disabled) == 0 {
+		return nil
+	}
+
+	domains := make([]string, 0, len(disabled))
+	for domain := range disabled {
+		domains = append(domains, domain)
+	}
+	return domains
 }
 
 func normalizeCustomerPayload(payload []byte) (map[string]interface{}, error) {

@@ -329,7 +329,11 @@ func (h *TCPConnectionHandler) Handle(ctx context.Context, originConn net.Conn, 
 	statistic.GetDefaultAIActivityTracker().RecordMetadata(metadata)
 
 	// Track statistics
-	trackedRemote := statistic.NewTCPTracker(wrapCloseOnceConn(remoteConn), metadata, h.statsManager)
+	trackedConn := wrapCloseOnceConn(remoteConn)
+	if metadata != nil && metadata.Route == "RouteToALiang" {
+		trackedConn = wrapCloseWithPeer(trackedConn, newOriginConn)
+	}
+	trackedRemote := statistic.NewTCPTracker(trackedConn, metadata, h.statsManager)
 	defer trackedRemote.Close()
 
 	// Mirror wrapping is enabled whenever traffic mirror is configured,

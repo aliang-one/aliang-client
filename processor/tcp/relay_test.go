@@ -160,3 +160,53 @@ func TestWrapCloseOnceConn_ForwardsHalfClose(t *testing.T) {
 		t.Fatalf("underlying CloseWrite count = %d, want 1", conn.closeWriteCount)
 	}
 }
+
+func TestWrapCloseWithPeer_ClosesBothConnectionsOnce(t *testing.T) {
+	conn := newRecordingRelayConn(nil)
+	peer := newRecordingRelayConn(nil)
+	wrapped := wrapCloseWithPeer(wrapCloseOnceConn(conn), peer)
+
+	if err := wrapped.Close(); err != nil {
+		t.Fatalf("first Close() error = %v", err)
+	}
+	if err := wrapped.Close(); err != nil {
+		t.Fatalf("second Close() error = %v", err)
+	}
+	if conn.closeCount != 1 {
+		t.Fatalf("underlying close count = %d, want 1", conn.closeCount)
+	}
+	if peer.closeCount != 1 {
+		t.Fatalf("peer close count = %d, want 1", peer.closeCount)
+	}
+}
+
+func TestWrapCloseWithPeer_ForwardsHalfCloseWithoutClosingPeer(t *testing.T) {
+	conn := newRecordingRelayConn(nil)
+	peer := newRecordingRelayConn(nil)
+	wrapped := wrapCloseWithPeer(wrapCloseOnceConn(conn), peer)
+
+	cr, ok := wrapped.(interface{ CloseRead() error })
+	if !ok {
+		t.Fatal("wrapped conn does not implement CloseRead")
+	}
+	cw, ok := wrapped.(interface{ CloseWrite() error })
+	if !ok {
+		t.Fatal("wrapped conn does not implement CloseWrite")
+	}
+
+	if err := cr.CloseRead(); err != nil {
+		t.Fatalf("CloseRead() error = %v", err)
+	}
+	if err := cw.CloseWrite(); err != nil {
+		t.Fatalf("CloseWrite() error = %v", err)
+	}
+	if conn.closeReadCount != 1 {
+		t.Fatalf("underlying CloseRead count = %d, want 1", conn.closeReadCount)
+	}
+	if conn.closeWriteCount != 1 {
+		t.Fatalf("underlying CloseWrite count = %d, want 1", conn.closeWriteCount)
+	}
+	if peer.closeCount != 0 {
+		t.Fatalf("peer close count = %d, want 0", peer.closeCount)
+	}
+}

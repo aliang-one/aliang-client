@@ -4,6 +4,7 @@ import (
 	"sync"
 	"time"
 
+	M "aliang.one/nursorgate/inbound/tun/metadata"
 	"go.uber.org/atomic"
 )
 
@@ -40,6 +41,36 @@ func (m *Manager) Join(c tracker) {
 
 func (m *Manager) Leave(c tracker) {
 	m.connections.Delete(c.ID())
+}
+
+// CloseTrackedConnectionsByMetadata closes all tracked connections whose metadata
+// matches the provided predicate. It returns the number of close attempts.
+func (m *Manager) CloseTrackedConnectionsByMetadata(match func(*M.Metadata) bool) int {
+	if m == nil || match == nil {
+		return 0
+	}
+
+	targets := make([]tracker, 0)
+	m.connections.Range(func(_, value any) bool {
+		t, ok := value.(tracker)
+		if !ok {
+			return true
+		}
+		if metadata, ok := trackedConnectionMetadata(t); ok && match(metadata) {
+			targets = append(targets, t)
+		}
+		return true
+	})
+
+	closed := 0
+	for _, target := range targets {
+		if target == nil {
+			continue
+		}
+		_ = target.Close()
+		closed++
+	}
+	return closed
 }
 
 func (m *Manager) PushUploaded(size int64) {
@@ -155,6 +186,20 @@ func (m *Manager) Stop() {
 	if m.stopped.CompareAndSwap(false, true) {
 		close(m.stopCh)
 	}
+}
+
+func trackedConnectionMetadata(t tracker) (*M.Metadata, bool) {
+	switch conn := t.(type) {
+	case *tcpTracker:
+		if conn != nil && conn.Metadata != nil {
+			return conn.Metadata, true
+		}
+	case *udpTracker:
+		if conn != nil && conn.Metadata != nil {
+			return conn.Metadata, true
+		}
+	}
+	return nil, false
 }
 
 // RouteStats holds statistics for a specific route type

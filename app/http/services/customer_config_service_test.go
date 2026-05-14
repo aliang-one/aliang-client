@@ -1,13 +1,17 @@
 package services
 
 import (
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	M "aliang.one/nursorgate/inbound/tun/metadata"
 	"aliang.one/nursorgate/processor/config"
 	"aliang.one/nursorgate/processor/setup"
+	"aliang.one/nursorgate/processor/statistic"
 )
 
 func TestMergeCustomerPayload_PreservesOmittedFields(t *testing.T) {
@@ -127,6 +131,82 @@ func TestResolveCustomerConfigPersistPath_FallsBackToRuntimeDirWithoutHome(t *te
 	}
 }
 
+func TestDisabledAIAccelerationDomains_ReturnsDisabledProviderDomains(t *testing.T) {
+	previousCfg := &config.Config{
+		Customer: &config.CustomerConfig{
+			AIRules: map[string]*config.CustomerAIRuleSetting{
+				"cursor": {
+					Enble:   customerBoolPtr(true),
+					Include: []string{"*.cursor.sh", "api.cursor.com"},
+				},
+				"openai": {
+					Enble:   customerBoolPtr(true),
+					Include: []string{"api.openai.com"},
+				},
+			},
+		},
+	}
+	nextCfg := &config.Config{
+		Customer: &config.CustomerConfig{
+			AIRules: map[string]*config.CustomerAIRuleSetting{
+				"cursor": {
+					Enble:   customerBoolPtr(false),
+					Include: []string{"*.cursor.sh", "api.cursor.com"},
+				},
+				"openai": {
+					Enble:   customerBoolPtr(true),
+					Include: []string{"api.openai.com"},
+				},
+			},
+		},
+	}
+
+	domains := disabledAIAccelerationDomains(previousCfg, nextCfg)
+	got := strings.Join(domains, ",")
+	if !strings.Contains(got, "*.cursor.sh") || !strings.Contains(got, "api.cursor.com") {
+		t.Fatalf("disabled domains = %v, want cursor domains", domains)
+	}
+	if strings.Contains(got, "api.openai.com") {
+		t.Fatalf("disabled domains = %v, should not include still-enabled openai", domains)
+	}
+}
+
+func TestCloseDisabledAIAcceleratedConnections_ClosesMatchingTrackedConnection(t *testing.T) {
+	conn := &customerConfigCloseCountingConn{}
+	_ = statistic.NewTCPTracker(conn, &M.Metadata{
+		Route:    "RouteToALiang",
+		HostName: "api.cursor.sh",
+		ConnID:   "cursor-conn",
+	}, statistic.DefaultManager)
+
+	previousCfg := &config.Config{
+		Customer: &config.CustomerConfig{
+			AIRules: map[string]*config.CustomerAIRuleSetting{
+				"cursor": {
+					Enble:   customerBoolPtr(true),
+					Include: []string{"*.cursor.sh"},
+				},
+			},
+		},
+	}
+	nextCfg := &config.Config{
+		Customer: &config.CustomerConfig{
+			AIRules: map[string]*config.CustomerAIRuleSetting{
+				"cursor": {
+					Enble:   customerBoolPtr(false),
+					Include: []string{"*.cursor.sh"},
+				},
+			},
+		},
+	}
+
+	closeDisabledAIAcceleratedConnections(previousCfg, nextCfg)
+
+	if conn.closeCount != 1 {
+		t.Fatalf("tracked connection close count = %d, want 1", conn.closeCount)
+	}
+}
+
 func TestReadConfigFromPath_FallsBackToRuntimeDirWithoutHome(t *testing.T) {
 	runtimeDir := t.TempDir()
 	t.Setenv("HOME", "")
@@ -155,3 +235,16 @@ func TestReadConfigFromPath_FallsBackToRuntimeDirWithoutHome(t *testing.T) {
 func customerBoolPtr(v bool) *bool {
 	return &v
 }
+
+type customerConfigCloseCountingConn struct {
+	closeCount int
+}
+
+func (c *customerConfigCloseCountingConn) Read([]byte) (int, error)         { return 0, nil }
+func (c *customerConfigCloseCountingConn) Write(p []byte) (int, error)      { return len(p), nil }
+func (c *customerConfigCloseCountingConn) Close() error                     { c.closeCount++; return nil }
+func (c *customerConfigCloseCountingConn) LocalAddr() net.Addr              { return &net.TCPAddr{} }
+func (c *customerConfigCloseCountingConn) RemoteAddr() net.Addr             { return &net.TCPAddr{} }
+func (c *customerConfigCloseCountingConn) SetDeadline(time.Time) error      { return nil }
+func (c *customerConfigCloseCountingConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *customerConfigCloseCountingConn) SetWriteDeadline(time.Time) error { return nil }
