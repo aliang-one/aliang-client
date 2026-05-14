@@ -97,7 +97,7 @@ See `config.new.json` for a full example. Key sections:
 
 ### Traffic Mirror (TCP Stream Mirroring)
 
-在配置文件中启用后，对匹配指定域名的流量在 TCP 层面进行旁路镜像转发。仅对经过 MITM 解密（Aliang 路由）的明文连接生效，镜像失败不影响正常流量。
+在配置文件中启用后，对匹配指定域名的流量在 TCP 层面进行旁路镜像转发。无论最终走的是 Aliang、直连还是其他路由，只要该连接命中配置的域名，就会尝试镜像；镜像失败不影响正常流量。
 
 **配置格式：**
 

@@ -332,9 +332,10 @@ func (h *TCPConnectionHandler) Handle(ctx context.Context, originConn net.Conn, 
 	trackedRemote := statistic.NewTCPTracker(wrapCloseOnceConn(remoteConn), metadata, h.statsManager)
 	defer trackedRemote.Close()
 
-	// Mirror wrapping (only for Aliang/MITM routes with plaintext data)
+	// Mirror wrapping is enabled whenever traffic mirror is configured,
+	// regardless of the final route.
 	var mirrorFlow *mirror.Flow
-	if metadata != nil && metadata.Route == "RouteToALiang" {
+	if metadata != nil {
 		mirrorFlow = mirror.NewMirrorFlow(metadata)
 	}
 	if mirrorFlow != nil {
