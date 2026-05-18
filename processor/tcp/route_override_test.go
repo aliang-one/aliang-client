@@ -315,6 +315,21 @@ func TestMirrorUpstreamNextProtos_PreservesClientProtocol(t *testing.T) {
 	}
 }
 
+func TestDetectApplicationProtocolWithALPN_FallsBackWhenPrefetchIncomplete(t *testing.T) {
+	if got := detectApplicationProtocolWithALPN([]byte("PRI * HTTP/2.0\r\n"), http2.NextProtoTLS); got != AppProtoHTTP2 {
+		t.Fatalf("incomplete h2 preface with h2 ALPN = %q, want %q", got, AppProtoHTTP2)
+	}
+	if got := detectApplicationProtocolWithALPN(nil, "http/1.1"); got != AppProtoHTTP1 {
+		t.Fatalf("empty prefetch with http/1.1 ALPN = %q, want %q", got, AppProtoHTTP1)
+	}
+	if got := detectApplicationProtocolWithALPN([]byte("GET / HTTP/1.1\r\n"), http2.NextProtoTLS); got != AppProtoHTTP1 {
+		t.Fatalf("sniffed HTTP/1 should win over ALPN fallback, got %q", got)
+	}
+	if got := detectApplicationProtocolWithALPN(nil, ""); got != AppProtoUnknown {
+		t.Fatalf("empty prefetch without ALPN = %q, want %q", got, AppProtoUnknown)
+	}
+}
+
 func TestValidateMirrorUpstreamALPN_RejectsHTTP2Downgrade(t *testing.T) {
 	if err := validateMirrorUpstreamALPN(http2.NextProtoTLS, AppProtoHTTP2, ""); err == nil {
 		t.Fatal("expected h2 client without upstream h2 to fail")

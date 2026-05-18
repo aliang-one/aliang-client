@@ -209,6 +209,22 @@ func detectApplicationProtocol(prefetched []byte) string {
 	return AppProtoUnknown
 }
 
+func detectApplicationProtocolWithALPN(prefetched []byte, clientALPN string) string {
+	appProto := detectApplicationProtocol(prefetched)
+	if appProto != AppProtoUnknown {
+		return appProto
+	}
+
+	switch clientALPN {
+	case http2.NextProtoTLS:
+		return AppProtoHTTP2
+	case "http/1.1":
+		return AppProtoHTTP1
+	default:
+		return AppProtoUnknown
+	}
+}
+
 func ensureTCPConnID(metadata *M.Metadata) string {
 	if metadata == nil {
 		return "unknown"
@@ -706,14 +722,12 @@ func (h *TCPConnectionHandler) resolveTLSRoute(
 		}
 		logger.Info(fmt.Sprintf("[TLS MITM] MITM completed for %s", mitmedSNI))
 
+		clientALPN := negotiatedTLSProtocol(mitmed)
 		prefetchedData, sniffErr := prefetchApplicationData(connectCtx, mitmed, applicationPrefetchMaxBytes)
 		if sniffErr != nil {
 			logger.Debug(fmt.Sprintf("aliang protocol prefetch failed: %v", sniffErr))
 		}
-		metadata.AppProto = detectApplicationProtocol(prefetchedData)
-		if metadata.AppProto == "" {
-			metadata.AppProto = AppProtoUnknown
-		}
+		metadata.AppProto = detectApplicationProtocolWithALPN(prefetchedData, clientALPN)
 		bufferedMitmed := wrapBufferedConn(mitmed, prefetchedData)
 
 		remote, err := h.dialByRoute(connectCtx, metadata, route)
@@ -794,13 +808,7 @@ func (h *TCPConnectionHandler) resolveTLSMirrorRoute(
 		logger.Debug(fmt.Sprintf("mirror MITM protocol prefetch failed: %v", sniffErr))
 	}
 
-	metadata.AppProto = detectApplicationProtocol(prefetchedData)
-	if metadata.AppProto == AppProtoUnknown && clientALPN == http2.NextProtoTLS {
-		metadata.AppProto = AppProtoHTTP2
-	}
-	if metadata.AppProto == AppProtoUnknown && clientALPN == "http/1.1" {
-		metadata.AppProto = AppProtoHTTP1
-	}
+	metadata.AppProto = detectApplicationProtocolWithALPN(prefetchedData, clientALPN)
 	bufferedMitmed := wrapBufferedConn(mitmed, prefetchedData)
 
 	remoteRaw, err := h.dialByRoute(connectCtx, metadata, route)
