@@ -29,7 +29,7 @@ func trayProxyStatusTitle(mode string, running bool, description string) string 
 	if running {
 		state = "running"
 	}
-	return fmt.Sprintf("Proxy: %s-%s", trayModeShortName(mode), state)
+	return fmt.Sprintf("Status: %s-%s", trayModeShortName(mode), state)
 }
 
 func traySelectedNotRunningStatus(mode string) string {

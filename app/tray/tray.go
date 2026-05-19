@@ -65,7 +65,7 @@ func onReady() {
 	mOpenDashboard := systray.AddMenuItem("Open Dashboard", "Open web dashboard in browser")
 	systray.AddSeparator()
 
-	mProxyStatus := systray.AddMenuItem("Proxy: syncing status...", "Current proxy listener status")
+	mProxyStatus := systray.AddMenuItem("Status: syncing status...", "Current proxy listener status")
 	mProxyStatus.Disable()
 
 	mModeHTTP := systray.AddMenuItemCheckbox("Regular Mode", "Choose Regular Mode for the next explicit start", false)

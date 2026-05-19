@@ -61,7 +61,7 @@ func (a *CompanionApp) onReady() {
 	a.mOpenDashboard = systray.AddMenuItem("Open Dashboard", "Open the service dashboard in browser")
 	systray.AddSeparator()
 
-	a.mProxyStatus = systray.AddMenuItem("Proxy: starting core...", "Current proxy listener status")
+	a.mProxyStatus = systray.AddMenuItem("Status: starting core...", "Current proxy listener status")
 	a.mProxyStatus.Disable()
 
 	a.mModeHTTP = systray.AddMenuItemCheckbox("Regular Mode", "Choose Regular Mode for the next explicit start", false)
@@ -402,7 +402,7 @@ func (a *CompanionApp) handleCoreError(errMsg string) {
 func (a *CompanionApp) applyUnavailableState(reason string) {
 	a.isRunning = false
 	if a.mProxyStatus != nil {
-		a.mProxyStatus.SetTitle(fmt.Sprintf("Proxy: %s", reason))
+		a.mProxyStatus.SetTitle(fmt.Sprintf("Status: %s", reason))
 	}
 	if a.mStart != nil {
 		a.mStart.Disable()

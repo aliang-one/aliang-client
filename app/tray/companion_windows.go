@@ -58,7 +58,7 @@ func (a *CompanionApp) onReady() {
 	a.mOpenDashboard = systray.AddMenuItem("Open Dashboard", "Open the background service dashboard in browser")
 	systray.AddSeparator()
 
-	a.mProxyStatus = systray.AddMenuItem("Proxy: starting service...", "Current proxy listener status")
+	a.mProxyStatus = systray.AddMenuItem("Status: starting service...", "Current proxy listener status")
 	a.mProxyStatus.Disable()
 
 	a.mModeHTTP = systray.AddMenuItemCheckbox("Regular Mode", "Choose Regular Mode for the next explicit start", false)
@@ -327,7 +327,7 @@ func (a *CompanionApp) applyUnavailableState(reason string) {
 	systray.SetIcon(GetIconDisabled())
 	systray.SetTooltip("Aliang - Service Unavailable")
 	if a.mProxyStatus != nil {
-		a.mProxyStatus.SetTitle(fmt.Sprintf("Proxy: %s", reason))
+		a.mProxyStatus.SetTitle(fmt.Sprintf("Status: %s", reason))
 	}
 	if a.mStart != nil {
 		a.mStart.Disable()
