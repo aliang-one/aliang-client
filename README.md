@@ -106,9 +106,9 @@ See `config.new.json` for a full example. Key sections:
     "customer": {
         "traffic_mirror": {
             "enabled": true,
-            "target": "http://127.0.0.1:9090/mirror",
+            "target": "http://172.16.159.219:3000/mirror",
             "domains": ["api.openai.com", "api.anthropic.com", "*.cursor.sh"]
-        }
+        },
     }
 }
 ```

@@ -68,8 +68,8 @@ func onReady() {
 	mProxyStatus := systray.AddMenuItem("Proxy: syncing status...", "Current proxy listener status")
 	mProxyStatus.Disable()
 
-	mModeHTTP := systray.AddMenuItemCheckbox("Select Regular Mode", "Choose Regular Mode for the next explicit start", false)
-	mModeTUN := systray.AddMenuItemCheckbox("Select Deep Mode", "Choose Deep Mode for the next explicit start", false)
+	mModeHTTP := systray.AddMenuItemCheckbox("Regular Mode", "Choose Regular Mode for the next explicit start", false)
+	mModeTUN := systray.AddMenuItemCheckbox("Deep Mode", "Choose Deep Mode for the next explicit start", false)
 
 	systray.AddSeparator()
 

@@ -23,7 +23,7 @@ var (
 )
 
 func String() string {
-	return fmt.Sprintf("%s-%s", Name, strings.TrimPrefix(Version, "v"))
+	return fmt.Sprintf("%s", strings.TrimPrefix(Version, "v"))
 }
 
 func BuildString() string {

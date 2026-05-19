@@ -64,15 +64,15 @@ func (a *CompanionApp) onReady() {
 	a.mProxyStatus = systray.AddMenuItem("Proxy: starting core...", "Current proxy listener status")
 	a.mProxyStatus.Disable()
 
-	a.mModeHTTP = systray.AddMenuItemCheckbox("Select Regular Mode", "Choose Regular Mode for the next explicit start", false)
-	a.mModeTUN = systray.AddMenuItemCheckbox("Select Deep Mode", "Choose Deep Mode for the next explicit start", false)
+	a.mModeHTTP = systray.AddMenuItemCheckbox("Regular Mode", "Choose Regular Mode for the next explicit start", false)
+	a.mModeTUN = systray.AddMenuItemCheckbox("Deep Mode", "Choose Deep Mode for the next explicit start", false)
 
 	systray.AddSeparator()
 
-	a.mStart = systray.AddMenuItem("Start Proxy", "Start the active proxy listener in the background service")
-	a.mStop = systray.AddMenuItem("Stop Proxy", "Stop the active proxy listener in the background service")
+	a.mStart = systray.AddMenuItem("Start", "Start the active proxy listener in the background service")
+	a.mStop = systray.AddMenuItem("Stop", "Stop the active proxy listener in the background service")
 	a.mStop.Disable()
-	a.mRestart = systray.AddMenuItem("Restart Proxy", "Restart the active proxy listener in the background service")
+	a.mRestart = systray.AddMenuItem("Restart", "Restart the active proxy listener in the background service")
 	a.mRestart.Disable()
 
 	systray.AddSeparator()
