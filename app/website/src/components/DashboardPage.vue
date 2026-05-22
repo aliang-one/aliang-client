@@ -8,6 +8,7 @@
       class="w-80 lg:w-96 bg-white dark:bg-slate-900 border-r border-slate-200 dark:border-slate-800 flex flex-col h-full overflow-y-auto custom-scrollbar"
     >
       <div
+        data-guide="account"
         class="p-8 border-b border-slate-100 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-800/20 transition-colors"
         :class="!isAuthenticated ? 'cursor-pointer hover:bg-primary/5 dark:hover:bg-primary/10' : ''"
         :role="!isAuthenticated ? 'button' : undefined"
@@ -58,7 +59,7 @@
           </div>
         </div>
       </div>
-      <div class="p-8 flex flex-col items-center justify-center gap-6">
+      <div class="p-8 flex flex-col items-center justify-center gap-6" data-guide="power">
         <div class="relative">
           <div class="absolute -inset-4 rounded-full scale-110 transition-all" :class="powerButtonHaloClass"></div>
           <button
@@ -81,7 +82,10 @@
           <p class="text-xs text-slate-400 mt-1">{{ runActionLoading ? powerButtonBusyText : proxyStatusSubtitle }}</p>
         </div>
       </div>
-      <div class="mx-6 p-4 bg-slate-50 dark:bg-slate-800/50 rounded border border-slate-100 dark:border-slate-700">
+      <div
+        data-guide="cert"
+        class="mx-6 p-4 bg-slate-50 dark:bg-slate-800/50 rounded border border-slate-100 dark:border-slate-700"
+      >
         <div class="flex justify-between items-start mb-3">
           <p class="text-xs font-bold text-slate-500 uppercase">{{ t('dash_networkStatus') }}</p>
           <span
@@ -130,6 +134,7 @@
         <div class="group relative">
           <button
             type="button"
+            data-guide="quick-setup"
             :disabled="!isAuthenticated"
             @click="openQuickSetup"
             class="w-full flex items-center gap-3 px-4 py-2.5 bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded text-sm font-medium hover:border-primary transition-colors"
@@ -227,6 +232,15 @@
             </div>
           </div>
           <div class="h-8 w-px bg-slate-200 dark:bg-slate-800 mx-2"></div>
+          <button
+            type="button"
+            class="inline-flex size-10 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-primary dark:hover:bg-slate-800 dark:hover:text-primary"
+            :title="t('guide_openHelp')"
+            :aria-label="t('guide_openHelp')"
+            @click="openOnboardingGuide()"
+          >
+            <span class="material-symbols-outlined">help_outline</span>
+          </button>
           <button
             type="button"
             class="px-4 py-1.5 bg-primary/10 text-primary text-xs font-bold rounded-lg hover:bg-primary/20 transition-colors"
@@ -735,11 +749,19 @@
         </div>
       </div>
     </div>
+
+    <OnboardingGuide
+      @open-cert="openCertModal"
+      @open-login="openLoginModal"
+      @open-quick-setup="openQuickSetup"
+    />
   </div>
 </template>
 
 <script setup>
-import { computed, ref, onMounted, onUnmounted, watch } from 'vue';
+import { computed, ref, onMounted, onUnmounted, watch, nextTick } from 'vue';
+import OnboardingGuide from './OnboardingGuide.vue';
+import { isOnboardingCompleted, openOnboardingGuide } from '../composables/useOnboardingGuide';
 import { useI18n } from '../i18n';
 import { useCertStatus } from '../composables/useCertStatus';
 import { useNavigation } from '../composables/useNavigation';
@@ -1909,6 +1931,12 @@ onMounted(() => {
   window.addEventListener('aliang:tun-progress-update', handleExternalTunProgressUpdate);
   window.addEventListener('aliang:tun-progress-success', handleExternalTunProgressSuccess);
   window.addEventListener('aliang:tun-progress-error', handleExternalTunProgressError);
+
+  if (!isOnboardingCompleted()) {
+    void nextTick(() => {
+      openOnboardingGuide();
+    });
+  }
 });
 
 onUnmounted(() => {
