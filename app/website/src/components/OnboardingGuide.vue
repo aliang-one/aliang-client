@@ -10,7 +10,7 @@
       <div class="absolute inset-0 bg-slate-900/55" @click="handleSkip"></div>
 
       <div
-        v-if="spotlightStyle"
+        v-if="spotlightStyle && currentStep.target"
         class="pointer-events-none absolute rounded-xl border-2 border-primary/80 transition-all duration-200"
         :style="spotlightStyle"
       ></div>
@@ -35,7 +35,26 @@
           </button>
         </div>
 
-        <p class="mt-3 text-sm leading-6 text-slate-600 dark:text-slate-300">{{ currentStep.description }}</p>
+        <p v-if="currentStep.id !== 'profile'" class="mt-3 text-sm leading-6 text-slate-600 dark:text-slate-300">
+          {{ currentStep.description }}
+        </p>
+
+        <div v-if="currentStep.id === 'profile'" class="mt-4 grid gap-2">
+          <p class="text-sm leading-6 text-slate-600 dark:text-slate-300">{{ t('guide_stepProfileDesc') }}</p>
+          <button
+            v-for="option in profileOptions"
+            :key="option.id"
+            type="button"
+            class="rounded-xl border px-4 py-3 text-left transition"
+            :class="clientProfile === option.id
+              ? 'border-primary bg-primary/5 text-slate-900 dark:text-white'
+              : 'border-slate-200 hover:border-primary/50 dark:border-slate-700'"
+            @click="selectProfile(option.id)"
+          >
+            <p class="text-sm font-semibold">{{ option.title }}</p>
+            <p class="mt-1 text-xs leading-5 text-slate-500 dark:text-slate-400">{{ option.description }}</p>
+          </button>
+        </div>
 
         <div class="mt-4 flex flex-wrap gap-2">
           <span
@@ -73,7 +92,8 @@
             </button>
             <button
               type="button"
-              class="inline-flex h-9 items-center justify-center rounded-lg bg-primary px-3 text-xs font-semibold text-white transition hover:bg-primary/90"
+              class="inline-flex h-9 items-center justify-center rounded-lg bg-primary px-3 text-xs font-semibold text-white transition hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-60"
+              :disabled="!canAdvance"
               @click="goNext"
             >
               {{ isLastStep ? t('guide_finish') : t('guide_next') }}
@@ -82,8 +102,17 @@
         </div>
 
         <button
+          v-if="isLastStep"
           type="button"
-          class="mt-3 text-xs font-semibold text-slate-400 transition hover:text-slate-600 dark:hover:text-slate-200"
+          class="mt-3 text-xs font-semibold text-primary transition hover:text-primary/80"
+          @click="openDocs"
+        >
+          {{ t('guide_openDocs') }}
+        </button>
+
+        <button
+          type="button"
+          class="mt-3 block text-xs font-semibold text-slate-400 transition hover:text-slate-600 dark:hover:text-slate-200"
           @click="handleSkip"
         >
           {{ t('guide_skip') }}
@@ -100,18 +129,20 @@ import { useCertStatus } from '../composables/useCertStatus';
 import { useAuthStore } from '../stores/auth';
 import { useRunStatus } from '../composables/useRunStatus';
 import {
+  clientProfile,
   closeOnboardingGuide,
   currentStepIndex,
   isOpen,
-  markOnboardingCompleted
+  markOnboardingCompleted,
+  setClientProfile
 } from '../composables/useOnboardingGuide';
 
 const { t } = useI18n();
 const { certStatus } = useCertStatus();
 const { isAuthenticated } = useAuthStore();
-const { runIsRunning } = useRunStatus();
+const { runIsRunning, runMode } = useRunStatus();
 
-const emit = defineEmits(['open-cert', 'open-login', 'open-quick-setup']);
+const emit = defineEmits(['open-cert', 'open-login', 'open-quick-setup', 'open-settings', 'open-docs']);
 
 const panelRef = ref(null);
 const spotlightStyle = ref(null);
@@ -123,50 +154,117 @@ const panelStyle = ref({
 
 let layoutFrame = null;
 
-const steps = computed(() => [
+const profileOptions = computed(() => [
   {
-    id: 'cert',
-    target: '[data-guide="cert"]',
-    title: t('guide_stepCertTitle'),
-    shortLabel: t('guide_stepCertShort'),
-    description: t('guide_stepCertDesc'),
-    actionLabel: t('guide_stepCertAction')
+    id: 'cli',
+    title: t('guide_profileCliTitle'),
+    description: t('guide_profileCliDesc')
   },
   {
-    id: 'login',
-    target: '[data-guide="account"]',
-    title: t('guide_stepLoginTitle'),
-    shortLabel: t('guide_stepLoginShort'),
-    description: t('guide_stepLoginDesc'),
-    actionLabel: t('guide_stepLoginAction')
+    id: 'ide',
+    title: t('guide_profileIdeTitle'),
+    description: t('guide_profileIdeDesc')
   },
   {
-    id: 'quick-setup',
-    target: '[data-guide="quick-setup"]',
-    title: t('guide_stepQuickSetupTitle'),
-    shortLabel: t('guide_stepQuickSetupShort'),
-    description: t('guide_stepQuickSetupDesc'),
-    actionLabel: t('guide_stepQuickSetupAction')
-  },
-  {
+    id: 'both',
+    title: t('guide_profileBothTitle'),
+    description: t('guide_profileBothDesc')
+  }
+]);
+
+const steps = computed(() => {
+  const profile = clientProfile.value;
+  const sequence = [
+    {
+      id: 'profile',
+      target: null,
+      title: t('guide_stepProfileTitle'),
+      shortLabel: t('guide_stepProfileShort'),
+      description: t('guide_stepProfileDesc'),
+      actionLabel: null
+    },
+    {
+      id: 'cert',
+      target: '[data-guide="cert"]',
+      title: t('guide_stepCertTitle'),
+      shortLabel: t('guide_stepCertShort'),
+      description: t('guide_stepCertDesc'),
+      actionLabel: t('guide_stepCertAction')
+    },
+    {
+      id: 'login',
+      target: '[data-guide="account"]',
+      title: t('guide_stepLoginTitle'),
+      shortLabel: t('guide_stepLoginShort'),
+      description: t('guide_stepLoginDesc'),
+      actionLabel: t('guide_stepLoginAction')
+    }
+  ];
+
+  if (profile === 'cli' || profile === 'both') {
+    sequence.push({
+      id: 'quick-setup',
+      target: '[data-guide="quick-setup"]',
+      title: t('guide_stepQuickSetupTitle'),
+      shortLabel: t('guide_stepQuickSetupShort'),
+      description: t('guide_stepQuickSetupDesc'),
+      actionLabel: t('guide_stepQuickSetupAction')
+    });
+  }
+
+  if (profile) {
+    sequence.push({
+      id: 'run-mode',
+      target: '[data-guide="run-mode"]',
+      title: profile === 'ide' ? t('guide_stepRunModeIdeTitle') : t('guide_stepRunModeCliTitle'),
+      shortLabel: t('guide_stepRunModeShort'),
+      description: profile === 'ide'
+        ? t('guide_stepRunModeIdeDesc')
+        : profile === 'cli'
+          ? t('guide_stepRunModeCliDesc')
+          : t('guide_stepRunModeBothDesc'),
+      actionLabel: t('guide_stepRunModeAction')
+    });
+  }
+
+  sequence.push({
     id: 'proxy',
     target: '[data-guide="power"]',
     title: t('guide_stepProxyTitle'),
     shortLabel: t('guide_stepProxyShort'),
-    description: t('guide_stepProxyDesc'),
+    description: profile === 'ide'
+      ? t('guide_stepProxyIdeDesc')
+      : profile === 'cli'
+        ? t('guide_stepProxyCliDesc')
+        : t('guide_stepProxyDesc'),
     actionLabel: t('guide_stepProxyAction')
+  });
+
+  return sequence;
+});
+
+const expectedRunMode = computed(() => {
+  if (clientProfile.value === 'ide') {
+    return 'tun';
   }
-]);
+  if (clientProfile.value === 'cli') {
+    return 'http';
+  }
+  return null;
+});
 
 const stepCompletion = computed(() => ({
+  profile: Boolean(clientProfile.value),
   cert: Boolean(certStatus.value?.is_installed && certStatus.value?.is_trusted),
   login: isAuthenticated.value,
   'quick-setup': false,
+  'run-mode': expectedRunMode.value ? runMode.value === expectedRunMode.value : false,
   proxy: runIsRunning.value
 }));
 
 const currentStep = computed(() => steps.value[currentStepIndex.value] || steps.value[0]);
 const isLastStep = computed(() => currentStepIndex.value >= steps.value.length - 1);
+const canAdvance = computed(() => currentStep.value.id !== 'profile' || Boolean(clientProfile.value));
 
 function stepChipClass(index, step) {
   if (stepCompletion.value[step.id]) {
@@ -176,6 +274,10 @@ function stepChipClass(index, step) {
     return 'bg-primary/10 text-primary';
   }
   return 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400';
+}
+
+function selectProfile(profile) {
+  setClientProfile(profile);
 }
 
 function runCurrentAction() {
@@ -189,12 +291,19 @@ function runCurrentAction() {
     case 'quick-setup':
       emit('open-quick-setup');
       break;
+    case 'run-mode':
+      emit('open-settings');
+      break;
     case 'proxy':
       document.querySelector(currentStep.value.target)?.scrollIntoView({ block: 'center', behavior: 'smooth' });
       break;
     default:
       break;
   }
+}
+
+function openDocs() {
+  emit('open-docs', 'usage-guide');
 }
 
 function goPrevious() {
@@ -204,6 +313,9 @@ function goPrevious() {
 }
 
 function goNext() {
+  if (!canAdvance.value) {
+    return;
+  }
   if (isLastStep.value) {
     finishGuide();
     return;
@@ -232,6 +344,16 @@ function scheduleLayout() {
 
 function updateLayout() {
   if (!isOpen.value) {
+    spotlightStyle.value = null;
+    panelStyle.value = {
+      top: '50%',
+      left: '50%',
+      transform: 'translate(-50%, -50%)'
+    };
+    return;
+  }
+
+  if (!currentStep.value.target) {
     spotlightStyle.value = null;
     panelStyle.value = {
       top: '50%',
@@ -292,6 +414,12 @@ function onViewportChange() {
     scheduleLayout();
   }
 }
+
+watch(clientProfile, () => {
+  if (currentStepIndex.value >= steps.value.length) {
+    currentStepIndex.value = Math.max(0, steps.value.length - 1);
+  }
+});
 
 watch(isOpen, async (open) => {
   if (!open) {

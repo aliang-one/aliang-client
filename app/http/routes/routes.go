@@ -36,6 +36,7 @@ type Handlers struct {
 	UserCenter     *handlers.UserCenterHandler
 	Dashboard      *handlers.DashboardHandler
 	QuickSetup     *handlers.QuickSetupHandler
+	Tutorial       *handlers.TutorialHandler
 
 	statsCollector     *statistic.StatsCollector
 	httpStatsCollector *statistic.HTTPStatsCollector
@@ -88,6 +89,7 @@ func newHandlers(runService *services.RunService) *Handlers {
 		UserCenter:         handlers.NewUserCenterHandler(),
 		Dashboard:          handlers.NewDashboardHandler(),
 		QuickSetup:         handlers.NewQuickSetupHandler(),
+		Tutorial:           handlers.NewTutorialHandler(),
 		statsCollector:     statsCollector,
 		httpStatsCollector: httpStatsCollector,
 	}
@@ -226,6 +228,7 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	register("/api/quick-setup/catalog", h.QuickSetup.HandleCatalog, http.MethodGet)
 	register("/api/quick-setup/render", h.QuickSetup.HandleRender, http.MethodPost)
 	register("/api/quick-setup/apply", h.QuickSetup.HandleApply, http.MethodPost)
+	register("/api/docs/tutorials", h.Tutorial.HandleGetTutorial, http.MethodGet)
 
 	registerDocsRoutes(mux, catalog)
 }

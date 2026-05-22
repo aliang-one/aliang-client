@@ -7,7 +7,7 @@
       </h3>
 
       <div class="space-y-6">
-        <div class="flex items-center justify-between">
+        <div class="flex items-center justify-between" data-guide="run-mode">
           <div>
             <p class="text-sm font-semibold">{{ t('sys_runMode') }}</p>
             <p class="text-[10px] text-slate-500">{{ t('sys_runModeDesc') }}</p>

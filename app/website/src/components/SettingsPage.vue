@@ -164,7 +164,7 @@
         <div class="mx-auto flex max-w-7xl items-center justify-between px-4 text-[10px] font-medium text-slate-400 sm:px-6 lg:px-8">
           <div>{{ t('settings_copyright') }}</div>
           <div class="flex gap-4 uppercase tracking-tighter">
-            <a class="hover:text-primary" href="javascript:void(0)">{{ t('settings_docs') }}</a>
+            <a class="hover:text-primary" href="javascript:void(0)" @click.prevent="openTutorialDocs('usage-guide')">{{ t('settings_docs') }}</a>
             <a class="hover:text-primary" href="javascript:void(0)">{{ t('settings_privacy') }}</a>
             <a class="hover:text-primary" href="javascript:void(0)">{{ t('settings_github') }}</a>
           </div>
@@ -193,6 +193,7 @@ import UserInfoSettings from './settings/UserInfoSettings.vue';
 import LogsSettings from './settings/LogsSettings.vue';
 import SystemSettings from './settings/SystemSettings.vue';
 import { useNavigation } from '../composables/useNavigation';
+import { openTutorialDocs } from '../composables/useTutorialDocs';
 import { useAuthStore } from '../stores/auth';
 import { useI18n } from '../i18n';
 
@@ -316,6 +317,7 @@ export default {
       userDisplayName,
       planLabel,
       authNotice,
+      openTutorialDocs,
       t
     };
   },

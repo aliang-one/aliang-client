@@ -21,6 +21,11 @@
       v-model="isCertModalOpen"
     />
     <QuickSetupModal :open="isQuickSetupOpen" @close="isQuickSetupOpen = false" />
+    <TutorialDocsModal
+      :open="isTutorialDocsOpen"
+      :initial-doc="tutorialDocId"
+      @close="closeTutorialDocs"
+    />
     <!-- Chat feature hidden temporarily
     <ChatPage v-if="currentPage === 'chat'" />
     -->
@@ -37,8 +42,10 @@ import ChatPage from './components/ChatPage.vue';
 import CertManagementModal from './components/CertManagementModal.vue';
 import QuickSetupModal from './components/QuickSetupModal.vue';
 import SoftwareUpdateNotice from './components/SoftwareUpdateNotice.vue';
+import TutorialDocsModal from './components/TutorialDocsModal.vue';
 import { useAuthStore } from './stores/auth';
 import { useNavigation } from './composables/useNavigation';
+import { closeTutorialDocs, isTutorialDocsOpen, tutorialDocId } from './composables/useTutorialDocs';
 import { getUserCenterProfile } from './services/userCenterApi';
 import { clearChatIdentityProfileCache } from './utils/chatIdentityCache';
 

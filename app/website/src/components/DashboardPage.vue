@@ -754,6 +754,8 @@
       @open-cert="openCertModal"
       @open-login="openLoginModal"
       @open-quick-setup="openQuickSetup"
+      @open-settings="handleGuideOpenSettings"
+      @open-docs="openTutorialDocs"
     />
   </div>
 </template>
@@ -762,6 +764,7 @@
 import { computed, ref, onMounted, onUnmounted, watch, nextTick } from 'vue';
 import OnboardingGuide from './OnboardingGuide.vue';
 import { isOnboardingCompleted, openOnboardingGuide } from '../composables/useOnboardingGuide';
+import { openTutorialDocs } from '../composables/useTutorialDocs';
 import { useI18n } from '../i18n';
 import { useCertStatus } from '../composables/useCertStatus';
 import { useNavigation } from '../composables/useNavigation';
@@ -1446,6 +1449,13 @@ function openQuickSetup() {
     return;
   }
   emit('openQuickSetup');
+}
+
+function handleGuideOpenSettings() {
+  showSettings();
+  void nextTick(() => {
+    document.querySelector('[data-guide="run-mode"]')?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  });
 }
 
 function handleAccountCardClick() {
