@@ -204,13 +204,13 @@ export default {
   guide_stepLoginShort: 'Login',
   guide_stepLoginDesc: 'Click the account area at the top of the sidebar to sign in. Login unlocks proxy controls, Quick Setup, rules editing, and account features.',
   guide_stepLoginAction: 'Log in now',
-  guide_stepQuickSetupTitle: 'Step 3: Quick Setup for your client',
+  guide_stepQuickSetupTitle: 'Step 3: Configure CLI clients',
   guide_stepQuickSetupShort: 'Quick Setup',
-  guide_stepQuickSetupDesc: 'If you use Codex, Claude Code, OpenCode, or similar tools that need config files, open Quick Setup, pick the software and API key, then apply the generated files.',
+  guide_stepQuickSetupDesc: 'Quick Setup is for CLI tools like Codex, Claude Code, and OpenCode—to write API and proxy settings. VS Code and Cursor need no config files; enable them from the control panel.',
   guide_stepQuickSetupAction: 'Open Quick Setup',
   guide_stepProxyTitle: 'Step 4: Start the proxy',
   guide_stepProxyShort: 'Start',
-  guide_stepProxyDesc: 'After the first three steps, press the power button in the sidebar to start the proxy. When it shows Proxy Running, the gateway is active.',
+  guide_stepProxyDesc: 'Press the power button to start the proxy. CLI tools: choose Regular Mode and start—127.0.0.1:56432 is only available then (not on by default). VS Code / Cursor: choose Deep Mode and start—no manual proxy setup.',
   guide_stepProxyAction: 'Show power button',
 
   // -- DashboardPage --

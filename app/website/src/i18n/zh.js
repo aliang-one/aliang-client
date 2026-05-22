@@ -204,13 +204,13 @@ export default {
   guide_stepLoginShort: '登录',
   guide_stepLoginDesc: '点击顶部账户区域登录。登录后可解锁代理开关、快速配置、规则编辑和账户相关功能。',
   guide_stepLoginAction: '立即登录',
-  guide_stepQuickSetupTitle: '第三步：快速配置客户端',
+  guide_stepQuickSetupTitle: '第三步：配置 CLI 客户端',
   guide_stepQuickSetupShort: '快速配置',
-  guide_stepQuickSetupDesc: '若使用 Codex、Claude Code、OpenCode 等需要写入配置的客户端，点击「快速配置」，选择软件与 API 密钥后应用配置文件。',
+  guide_stepQuickSetupDesc: '快速配置面向 Codex、Claude Code、OpenCode 等 CLI 工具，用于写入 API 与代理配置。VS Code、Cursor 无需配置文件，在控制面板开启即可。',
   guide_stepQuickSetupAction: '打开快速配置',
   guide_stepProxyTitle: '第四步：启动代理',
   guide_stepProxyShort: '启动',
-  guide_stepProxyDesc: '完成前三步后，点击中间的电源按钮启动代理。看到「代理运行中」即表示网关已开始工作。',
+  guide_stepProxyDesc: '点击电源按钮启动代理。CLI 工具：选「常规模式」并启动，本地代理 127.0.0.1:56432 才会开启（非默认）。VS Code / Cursor：选「深度模式」并启动，无需手动配代理。',
   guide_stepProxyAction: '定位启动按钮',
 
   // -- DashboardPage --
