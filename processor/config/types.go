@@ -284,11 +284,47 @@ func (c *TrafficMirrorConfig) Validate() error {
 	return nil
 }
 
+const defaultHTTP1DropPathContains = "metric"
+
+// HTTP1DropConfig controls local dropping of matched HTTP/1 requests before
+// they are forwarded to the Aliang upstream.
+type HTTP1DropConfig struct {
+	Enabled      *bool    `json:"enabled,omitempty"`
+	PathContains []string `json:"path_contains,omitempty"`
+}
+
+func (c *HTTP1DropConfig) IsEnabled() bool {
+	if c == nil || c.Enabled == nil {
+		return true
+	}
+	return *c.Enabled
+}
+
+func (c *HTTP1DropConfig) EffectivePathContains() []string {
+	if c == nil || c.PathContains == nil {
+		return []string{defaultHTTP1DropPathContains}
+	}
+	return dedupeTrimmedStrings(c.PathContains)
+}
+
+func (c *HTTP1DropConfig) Validate() error {
+	if c == nil || !c.IsEnabled() {
+		return nil
+	}
+	for i, pattern := range c.PathContains {
+		if strings.TrimSpace(pattern) == "" {
+			return fmt.Errorf("http1_drop.path_contains[%d] cannot be empty", i)
+		}
+	}
+	return nil
+}
+
 type CustomerConfig struct {
 	Proxy         *CustomerProxyConfig              `json:"proxy,omitempty"`
 	AIRules       map[string]*CustomerAIRuleSetting `json:"ai_rules,omitempty"`
 	ProxyRules    []string                          `json:"proxy_rules,omitempty"`
 	TrafficMirror *TrafficMirrorConfig              `json:"traffic_mirror,omitempty"`
+	HTTP1Drop     *HTTP1DropConfig                  `json:"http1_drop,omitempty"`
 }
 
 type AliangServerConfig struct {
@@ -493,6 +529,11 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("invalid traffic_mirror configuration: %w", err)
 		}
 	}
+	if http1Drop := c.EffectiveHTTP1Drop(); http1Drop != nil {
+		if err := http1Drop.Validate(); err != nil {
+			return fmt.Errorf("invalid http1_drop configuration: %w", err)
+		}
+	}
 
 	return nil
 }
@@ -546,7 +587,7 @@ func (c *Config) customerUnknownKeyErrors() error {
 	if len(c.customerUnknownFields) > 0 {
 		sorted := append([]string(nil), c.customerUnknownFields...)
 		sort.Strings(sorted)
-		return fmt.Errorf("customer.%s is forbidden: editable customer fields are [proxy ai_rules proxy_rules traffic_mirror]", sorted[0])
+		return fmt.Errorf("customer.%s is forbidden: editable customer fields are [proxy ai_rules proxy_rules traffic_mirror http1_drop]", sorted[0])
 	}
 
 	providers := make([]string, 0, len(c.aiRuleUnknownFields))
@@ -583,7 +624,7 @@ func extractCustomerUnknownFields(root map[string]json.RawMessage) ([]string, ma
 
 	for key := range customerRoot {
 		switch key {
-		case "proxy", "ai_rules", "proxy_rules", "traffic_mirror":
+		case "proxy", "ai_rules", "proxy_rules", "traffic_mirror", "http1_drop":
 		default:
 			unknownCustomer = append(unknownCustomer, key)
 		}
@@ -739,6 +780,17 @@ func (c *Config) EffectiveTrafficMirror() *TrafficMirrorConfig {
 	return c.Customer.TrafficMirror
 }
 
+func (c *Config) EffectiveHTTP1Drop() *HTTP1DropConfig {
+	if c == nil || c.Customer == nil || c.Customer.HTTP1Drop == nil {
+		return &HTTP1DropConfig{
+			PathContains: []string{defaultHTTP1DropPathContains},
+		}
+	}
+
+	cfg := *c.Customer.HTTP1Drop
+	return &cfg
+}
+
 func sortedMapKeys(values map[string]*CustomerAIRuleSetting) []string {
 	keys := make([]string, 0, len(values))
 	for key := range values {
@@ -764,6 +816,27 @@ func dedupeTrimmedDomains(in []string) []string {
 		}
 		seen[normalized] = struct{}{}
 		out = append(out, normalized)
+	}
+	return out
+}
+
+func dedupeTrimmedStrings(in []string) []string {
+	if len(in) == 0 {
+		return []string{}
+	}
+	seen := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, value := range in {
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			continue
+		}
+		key := strings.ToLower(trimmed)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, trimmed)
 	}
 	return out
 }

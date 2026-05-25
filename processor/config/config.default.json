@@ -77,6 +77,12 @@
             "domains,spotify.com",
             "domains,discord.com",
             "domains,github.com"
-        ]
+        ],
+        "http1_drop": {
+            "enabled": true,
+            "path_contains": [
+                "metric"
+            ]
+        }
     }
 }

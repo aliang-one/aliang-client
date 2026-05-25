@@ -16,9 +16,14 @@ import (
 	"aliang.one/nursorgate/common/logger"
 	"aliang.one/nursorgate/common/version"
 	user "aliang.one/nursorgate/processor/auth"
+	"aliang.one/nursorgate/processor/config"
 )
 
-const httpRelayCaptureLimit = 128 * 1024
+const (
+	httpRelayCaptureLimit       = 128 * 1024
+	http1DropMaxDrainBodyBytes  = 1 << 20
+	http1UnknownRequestBodySize = -1
+)
 
 type HTTP1RelayStats struct {
 	StartedAt          time.Time
@@ -220,6 +225,31 @@ func RelayHTTP1(ctx context.Context, clientConn, remoteConn net.Conn) (*HTTP1Rel
 				goto done
 			}
 
+			if shouldDropHTTP1Request(reqRes.req) {
+				closeAfterDrop := shouldCloseAfterDroppedHTTP1Request(reqRes.req)
+				if !closeAfterDrop {
+					if err := drainAndCloseHTTP1RequestBody(reqRes.req); err != nil {
+						relayErr = err
+						goto done
+					}
+				} else if reqRes.req.Body != nil {
+					_ = reqRes.req.Body.Close()
+				}
+				if err := writeHTTP1DroppedResponse(responseWriter, reqRes.req, closeAfterDrop); err != nil {
+					relayErr = err
+					goto done
+				}
+				logger.Info(fmt.Sprintf(
+					"WatcherWrapConn: dropped HTTP/1 request locally request=%q host=%q",
+					http1RequestLine(reqRes.req),
+					reqRes.req.Host,
+				))
+				if closeAfterDrop {
+					goto done
+				}
+				continue
+			}
+
 			injectHTTP1AuthorizationHeader(reqRes.req)
 
 			if err := reqRes.req.Write(requestWriter); err != nil {
@@ -265,6 +295,92 @@ done:
 	return stats, normalizeIdleRemoteClose(relayErr)
 }
 
+func shouldDropHTTP1Request(req *http.Request) bool {
+	if req == nil || req.URL == nil {
+		return false
+	}
+
+	cfg := config.GetGlobalConfig().EffectiveHTTP1Drop()
+	if cfg == nil || !cfg.IsEnabled() {
+		return false
+	}
+
+	path := strings.ToLower(strings.TrimSpace(req.URL.Path))
+	if path == "" {
+		return false
+	}
+
+	for _, pattern := range cfg.EffectivePathContains() {
+		needle := strings.ToLower(strings.TrimSpace(pattern))
+		if needle != "" && strings.Contains(path, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func drainAndCloseHTTP1RequestBody(req *http.Request) error {
+	if req == nil || req.Body == nil {
+		return nil
+	}
+	_, copyErr := io.Copy(io.Discard, req.Body)
+	closeErr := req.Body.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	return closeErr
+}
+
+func shouldCloseAfterDroppedHTTP1Request(req *http.Request) bool {
+	if req == nil {
+		return true
+	}
+	if req.Close || strings.EqualFold(req.Header.Get("Connection"), "close") {
+		return true
+	}
+	if hasHTTP1ExpectContinue(req) {
+		return true
+	}
+	if req.ContentLength == http1UnknownRequestBodySize {
+		return true
+	}
+	return req.ContentLength > http1DropMaxDrainBodyBytes
+}
+
+func hasHTTP1ExpectContinue(req *http.Request) bool {
+	if req == nil {
+		return false
+	}
+	for _, value := range req.Header.Values("Expect") {
+		for _, part := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(part), "100-continue") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func writeHTTP1DroppedResponse(w io.Writer, req *http.Request, closeAfter bool) error {
+	resp := &http.Response{
+		Status:        "204 No Content",
+		StatusCode:    http.StatusNoContent,
+		Proto:         "HTTP/1.1",
+		ProtoMajor:    1,
+		ProtoMinor:    1,
+		Header:        make(http.Header),
+		Body:          http.NoBody,
+		ContentLength: 0,
+		Request:       req,
+		Close:         closeAfter,
+	}
+	resp.Header.Set("X-Aliang-Dropped", "http1-path")
+	if closeAfter {
+		resp.Header.Set("Connection", "close")
+	}
+	return resp.Write(w)
+}
+
 func normalizeIdleRemoteClose(err error) error {
 	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
 		return nil
@@ -283,7 +399,7 @@ func injectHTTP1AuthorizationHeader(req *http.Request) {
 		req.Header.Set("Authorization-Inner", authHeader)
 	}
 
-	requestLine := fmt.Sprintf("%s %s %s", req.Method, req.RequestURI, req.Proto)
+	requestLine := http1RequestLine(req)
 	if req.Header.Get("Authorization-Inner") == "" {
 		logger.Warn(fmt.Sprintf(
 			"WatcherWrapConn: missing authorization-inner after HTTP/1 relay request=%q host=%q",
@@ -297,6 +413,13 @@ func injectHTTP1AuthorizationHeader(req *http.Request) {
 			req.Host,
 		))
 	}
+}
+
+func http1RequestLine(req *http.Request) string {
+	if req == nil {
+		return ""
+	}
+	return fmt.Sprintf("%s %s %s", req.Method, req.RequestURI, req.Proto)
 }
 
 func shouldCloseHTTP1Relay(req *http.Request, resp *http.Response) bool {

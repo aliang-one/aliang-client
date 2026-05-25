@@ -521,3 +521,66 @@ func TestConfigValidate_AIRulesEditableAccepted(t *testing.T) {
 		t.Fatalf("rule.Editable = %+v, want false", rule)
 	}
 }
+
+func TestConfigEffectiveHTTP1Drop_DefaultsToMetric(t *testing.T) {
+	cfg := &Config{}
+	http1Drop := cfg.EffectiveHTTP1Drop()
+	if http1Drop == nil {
+		t.Fatal("EffectiveHTTP1Drop() = nil, want default config")
+	}
+	if !http1Drop.IsEnabled() {
+		t.Fatal("EffectiveHTTP1Drop().IsEnabled() = false, want true")
+	}
+	if got := http1Drop.EffectivePathContains(); len(got) != 1 || got[0] != "metric" {
+		t.Fatalf("EffectivePathContains() = %v, want [metric]", got)
+	}
+}
+
+func TestConfigValidate_HTTP1DropAcceptsCustomRules(t *testing.T) {
+	payload := []byte(`{
+		"core": {"api_server": "https://api.aliang.one"},
+		"customer": {
+			"http1_drop": {
+				"enabled": true,
+				"path_contains": ["metric", "telemetry"]
+			}
+		}
+	}`)
+
+	var cfg Config
+	if err := json.Unmarshal(payload, &cfg); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+
+	got := cfg.EffectiveHTTP1Drop().EffectivePathContains()
+	if len(got) != 2 || got[0] != "metric" || got[1] != "telemetry" {
+		t.Fatalf("EffectivePathContains() = %v, want [metric telemetry]", got)
+	}
+}
+
+func TestConfigValidate_HTTP1DropRejectsBlankRule(t *testing.T) {
+	payload := []byte(`{
+		"core": {"api_server": "https://api.aliang.one"},
+		"customer": {
+			"http1_drop": {
+				"enabled": true,
+				"path_contains": ["metric", " "]
+			}
+		}
+	}`)
+
+	var cfg Config
+	if err := json.Unmarshal(payload, &cfg); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate() error = nil, want blank http1_drop rule error")
+	}
+	if !strings.Contains(err.Error(), "http1_drop.path_contains[1] cannot be empty") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
