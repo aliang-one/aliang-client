@@ -20,7 +20,7 @@
             "type": "aliang",
             "core_server": "15.nat0.cn:16749"
         },
-        "api_server": "https://api.aliang.one"
+        "api_server": "https://backend.aliang.one"
     },
     "customer": {
         "proxy": {
@@ -81,7 +81,9 @@
         "http1_drop": {
             "enabled": true,
             "path_contains": [
-                "metric"
+                "metric",
+                "telemetry",
+                "analytics"
             ]
         }
     }

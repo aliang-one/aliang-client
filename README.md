@@ -1,4 +1,3 @@
-
 # Aliang-Core (Nursorgate) - Intelligent TUN/HTTP Proxy System
 
 English | [中文](./README.zh.md)
@@ -45,6 +44,7 @@ Aliang-Core (Nursorgate) is a next-generation proxy engine for Windows, macOS, a
 ```
 
 Key modules:
+
 - `cmd/`         - CLI, service, tray, start, config commands
 - `inbound/`     - TUN/HTTP traffic capture
 - `processor/`   - Rules, cache, DNS, geoip, config, statistics
@@ -113,19 +113,23 @@ See `config.new.json` for a full example. Key sections:
 }
 ```
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `enabled` | bool | 开关，`false` 时不产生任何开销 |
-| `target` | string | 接收 StreamChunk 的 HTTP POST 端点 |
+
+| 字段        | 类型       | 说明                               |
+| --------- | -------- | -------------------------------- |
+| `enabled` | bool     | 开关，`false` 时不产生任何开销              |
+| `target`  | string   | 接收 StreamChunk 的 HTTP POST 端点    |
 | `domains` | string[] | 匹配域名列表，支持精确匹配、`*.wildcard` 和后缀匹配 |
+
 
 **域名匹配规则：**
 
-| 模式 | 示例 | 匹配 |
-|------|------|------|
-| 精确匹配 | `api.openai.com` | `api.openai.com` |
-| 通配符 | `*.cursor.sh` | `api2.cursor.sh`，不匹配 `cursor.sh` 本身 |
-| 后缀匹配 | `openai.com` | `api.openai.com`、`cdn.openai.com` |
+
+| 模式   | 示例               | 匹配                                  |
+| ---- | ---------------- | ----------------------------------- |
+| 精确匹配 | `api.openai.com` | `api.openai.com`                    |
+| 通配符  | `*.cursor.sh`    | `api2.cursor.sh`，不匹配 `cursor.sh` 本身 |
+| 后缀匹配 | `openai.com`     | `api.openai.com`、`cdn.openai.com`   |
+
 
 **StreamChunk 数据格式（HTTP POST JSON body）：**
 
@@ -146,20 +150,22 @@ See `config.new.json` for a full example. Key sections:
 }
 ```
 
-| 字段 | 说明 |
-|------|------|
-| `flow_id` | 唯一标识一条完整的代理连接 |
-| `conn_id` | TCP handler 内部连接 ID |
-| `direction` | `request`（客户端→上游）或 `response`（上游→客户端） |
-| `offset` | 当前方向内的字节偏移，从 0 递增 |
-| `seq` | 当前方向内的 chunk 序号，从 0 递增 |
-| `payload` | 本次读到的明文字节片段 |
-| `timestamp` | 收集侧读到数据的时间（unix ms） |
-| `src_addr` | 当前 chunk 原始 src 地址 |
-| `dst_addr` | 当前 chunk 原始 dst 地址 |
-| `client_addr` | 客户端地址 |
-| `upstream_addr` | 上游地址 |
+
+| 字段              | 说明                                     |
+| --------------- | -------------------------------------- |
+| `flow_id`       | 唯一标识一条完整的代理连接                          |
+| `conn_id`       | TCP handler 内部连接 ID                    |
+| `direction`     | `request`（客户端→上游）或 `response`（上游→客户端）  |
+| `offset`        | 当前方向内的字节偏移，从 0 递增                      |
+| `seq`           | 当前方向内的 chunk 序号，从 0 递增                 |
+| `payload`       | 本次读到的明文字节片段                            |
+| `timestamp`     | 收集侧读到数据的时间（unix ms）                    |
+| `src_addr`      | 当前 chunk 原始 src 地址                     |
+| `dst_addr`      | 当前 chunk 原始 dst 地址                     |
+| `client_addr`   | 客户端地址                                  |
+| `upstream_addr` | 上游地址                                   |
 | `protocol_hint` | 应用层协议提示（`http1` / `http2` / `unknown`） |
+
 
 **服务端如何重组字节流：**
 
@@ -215,21 +221,23 @@ flow_start  →  StreamChunk × N  →  flow_end
 
 **FlowEvent 字段说明：**
 
-| 字段 | 说明 |
-|------|------|
-| `event_type` | `flow_start` 或 `flow_end` |
-| `flow_id` | 唯一标识一条代理连接 |
-| `conn_id` | TCP handler 内部连接 ID |
-| `timestamp` | 事件时间（unix ms） |
-| `client_addr` | 客户端地址 |
-| `upstream_addr` | 上游地址 |
-| `protocol_hint` | 应用层协议提示（`http1` / `http2` / `unknown`） |
-| `host_name` | 目标域名 |
-| `client_to_server_bytes` | 客户端→上游总字节数（仅 flow_end） |
-| `server_to_client_bytes` | 上游→客户端总字节数（仅 flow_end） |
-| `duration_ms` | flow 持续时间（仅 flow_end） |
-| `error` | 错误描述（仅 flow_end 异常时） |
-| `error_class` | 错误分类（`clean` / `timeout` / `reset` / `tls_error` / `context_cancel` / `unknown`） |
+
+| 字段                       | 说明                                                                               |
+| ------------------------ | -------------------------------------------------------------------------------- |
+| `event_type`             | `flow_start` 或 `flow_end`                                                        |
+| `flow_id`                | 唯一标识一条代理连接                                                                       |
+| `conn_id`                | TCP handler 内部连接 ID                                                              |
+| `timestamp`              | 事件时间（unix ms）                                                                    |
+| `client_addr`            | 客户端地址                                                                            |
+| `upstream_addr`          | 上游地址                                                                             |
+| `protocol_hint`          | 应用层协议提示（`http1` / `http2` / `unknown`）                                           |
+| `host_name`              | 目标域名                                                                             |
+| `client_to_server_bytes` | 客户端→上游总字节数（仅 flow_end）                                                           |
+| `server_to_client_bytes` | 上游→客户端总字节数（仅 flow_end）                                                           |
+| `duration_ms`            | flow 持续时间（仅 flow_end）                                                            |
+| `error`                  | 错误描述（仅 flow_end 异常时）                                                             |
+| `error_class`            | 错误分类（`clean` / `timeout` / `reset` / `tls_error` / `context_cancel` / `unknown`） |
+
 
 **服务端 Flow 状态机：**
 
@@ -288,6 +296,7 @@ See [docs/](docs/) for API, config, and development notes.
 **Maintainers:** aliang.one
 
 **Data Structure Enhancement:**
+
 ```go
 type DNSInfo struct {
     BindingSource BindingSource  // Source: SNI, HTTP, DNS, CONNECT
@@ -303,13 +312,16 @@ type DNSInfo struct {
 
 Fixed three critical dashboard display issues:
 
-| Issue | Root Cause | Fix |
-|-------|-----------|-----|
-| **Hit Count = 0** | Get() method wasn't updating individual entry HitCount | Added `entry.HitCount++` in Get() method |
-| **Hit Rate = 0** | Stats() calculated correctly but missing data from cache usage | Fixed data flow with StoreBinding() implementation |
+
+| Issue                   | Root Cause                                                                                           | Fix                                                             |
+| ----------------------- | ---------------------------------------------------------------------------------------------------- | --------------------------------------------------------------- |
+| **Hit Count = 0**       | Get() method wasn't updating individual entry HitCount                                               | Added `entry.HitCount++` in Get() method                        |
+| **Hit Rate = 0**        | Stats() calculated correctly but missing data from cache usage                                       | Fixed data flow with StoreBinding() implementation              |
 | **Wrong Unique Counts** | Stats() returned maxEntries (capacity) instead of uniqueDomains; JS mapped hits instead of uniqueIPs | Added uniqueDomains and uniqueIPs calculation; Fixed JS mapping |
 
+
 **Files Modified:**
+
 - `processor/cache/ipdomain.go:Get()` - Update HitCount on cache hit
 - `processor/cache/ipdomain.go:Stats()` - Calculate and return uniqueDomains and uniqueIPs
 - `app/website/assets/app.js` - Correct field mapping for dashboard display
@@ -418,6 +430,7 @@ go build -ldflags="-s -w" -o nursorgate ./cmd/nursor
 ### Cross-Platform Build Scripts
 
 **macOS (arm64 - Apple Silicon):**
+
 ```bash
 export CGO_ENABLED=1
 export GOOS=darwin
@@ -426,6 +439,7 @@ go build -ldflags="-s -w" -tags=with_utls -o nursorgate-darwin-arm64 ./cmd/nurso
 ```
 
 **macOS (amd64 - Intel):**
+
 ```bash
 export CGO_ENABLED=1
 export GOOS=darwin
@@ -434,6 +448,7 @@ go build -ldflags="-s -w" -o nursorgate-darwin-amd64 ./cmd/nursor
 ```
 
 **Linux (amd64):**
+
 ```bash
 export CGO_ENABLED=1
 export GOOS=linux
@@ -442,6 +457,7 @@ go build -ldflags="-s -w" -o nursorgate-linux-amd64 ./cmd/nursor
 ```
 
 **Linux (arm64):**
+
 ```bash
 export GOOS=linux
 export GOARCH=arm64
@@ -449,6 +465,7 @@ go build -ldflags="-s -w" -o nursorgate-linux-arm64 ./cmd/nursor
 ```
 
 **Windows (amd64):**
+
 ```bash
 set CGO_ENABLED=1
 set GOOS=windows
@@ -484,12 +501,14 @@ This creates a "hostname metadata vacuum" where domain resolution context availa
 4. **System DNS Interception** (Optional): Capture full DNS queries at network layer
 
 Each binding is automatically stored to cache with:
+
 - Domain name and destination IP
 - Binding source (SNI/HTTP/CONNECT/DNS)
 - Route decision used
 - Expiration time (TTL varies by source)
 
 **Cache Usage:**
+
 - First connection: Expensive SNI extraction or header parsing
 - Subsequent connections: Cache hit → skip extraction → faster routing
 
@@ -508,6 +527,7 @@ Proxy → Remote: Transparent TCP connection
 ```
 
 The proxy must:
+
 1. Return `HTTP/1.1 200 Connection Established` before routing
 2. Extract domain from CONNECT request for cache
 3. Switch to transparent TCP relay mode
@@ -528,6 +548,7 @@ When processing HTTP/2 traffic:
 ### Certificate Authority Setup
 
 For HTTPS interception:
+
 - Cannot use system CA certificates
 - Must explicitly trust `mitm-ca.pem` certificate
 - Certificate pinning in some applications may prevent interception
@@ -549,6 +570,7 @@ This enables country-based routing rules without application involvement.
 ### December 10, 2024
 
 **DNS Cache Storage Implementation**
+
 - ✅ Added Route field to Metadata struct
 - ✅ Implemented StoreBinding() in RuleEngine
 - ✅ Integrated storage into TCP handler
@@ -559,14 +581,13 @@ This enables country-based routing rules without application involvement.
 ### December 8-9, 2024
 
 **Dashboard Display Bug Fixes**
+
 - 🐛 Issue: Hit count always showing 0
   - Root Cause: Get() method not updating individual entry HitCount
   - Fix: Added `entry.HitCount++` in Get() method
-
 - 🐛 Issue: Hit rate always 0%
   - Root Cause: Cache wasn't being queried, so hits=0, misses=0
   - Context: Not a bug but reflection of cache usage pattern
-
 - 🐛 Issue: Wrong unique IP/domain display
   - Root Cause: Backend missing uniqueDomains and uniqueIPs calculation
   - Root Cause: Frontend incorrectly mapped stats.maxEntries and stats.hits
@@ -577,6 +598,7 @@ This enables country-based routing rules without application involvement.
 ### December 2-7, 2024
 
 **Real-Time DNS Cache Dashboard**
+
 - ✅ Created 7 REST API endpoints for DNS cache operations
 - ✅ Integrated DNS cache panel into main web dashboard
 - ✅ Implemented live statistics with 5-second refresh
@@ -588,6 +610,7 @@ This enables country-based routing rules without application involvement.
 ### August 4, 2024
 
 **HTTP/2 Frame Processing**
+
 1. Header frame priority field must be extracted from payload before header parsing
 2. After header modification, priority must be restored to payload
 3. Envoy may convert HTTP to H2, requiring robust priority handling
@@ -662,6 +685,7 @@ See LICENSE file for project licensing information.
 ## 🤝 Contributing
 
 Development focuses on:
+
 1. Cache performance optimization
 2. Protocol compatibility improvements
 3. Dashboard UX/UX enhancements

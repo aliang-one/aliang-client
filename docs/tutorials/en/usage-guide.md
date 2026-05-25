@@ -2,17 +2,17 @@
 
 ## Table of Contents
 
-0. [Prerequisites](#0-prerequisites)
-1. [Quick Start](#quick-start-four-steps)
-2. [First Launch - Installation & Login](#1-first-launch--installation--login)
-3. [Trust Certificate (Unlogged State)](#2-trust-certificate-unlogged-state)
-4. [Login Flow](#3-login-flow)
-5. [Quick Setup](#4-quick-setup)
-6. [Run Mode Selection](#5-run-mode-selection)
-7. [Customer Proxy Configuration](#6-customer-proxy-configuration)
-8. [AI Rules Configuration](#7-ai-rules-configuration)
-9. [Proxy Rules Configuration](#8-proxy-rules-configuration)
-10. [FAQ](#9-faq)
+1. [Prerequisites](#0-prerequisites)
+2. [Quick Start](#quick-start-four-steps)
+3. [First Launch - Installation & Login](#1-first-launch--installation--login)
+4. [Trust Certificate (Unlogged State)](#2-trust-certificate-unlogged-state)
+5. [Login Flow](#3-login-flow)
+6. [Quick Setup](#4-quick-setup)
+7. [Run Mode Selection](#5-run-mode-selection)
+8. [Customer Proxy Configuration](#6-customer-proxy-configuration)
+9. [AI Rules Configuration](#7-ai-rules-configuration)
+10. [Proxy Rules Configuration](#8-proxy-rules-configuration)
+11. [FAQ](#9-faq)
 
 ---
 
@@ -71,11 +71,13 @@ Return to the dashboard, click **Start Proxy**.
 After downloading and installing ALiang Gateway, the app opens in an **unlogged state**.
 
 **Available in unlogged state:**
+
 - Certificate management (install, export, regenerate)
 - Language and appearance settings
 - Help documentation
 
 **Unavailable in unlogged state:**
+
 - Start/stop proxy
 - Quick Setup
 - Customer configuration changes
@@ -92,6 +94,7 @@ After downloading and installing ALiang Gateway, the app opens in an **unlogged 
 ALiang Gateway needs to install a local certificate to identify and process AI traffic (such as OpenAI, Claude, Cursor, VS Code, etc.) to enable intelligent routing and acceleration.
 
 **Certificate Safety:**
+
 - Certificate is only used to identify and accelerate AI traffic
 - Does not record or transmit any of your data
 - Certificate is stored on your device and cannot be accessed by third parties
@@ -105,11 +108,13 @@ ALiang Gateway needs to install a local certificate to identify and process AI t
 
 ### Certificate Status Explained
 
-| Status | Meaning |
-|--------|---------|
-| Generated | Certificate created, but not installed to system |
-| Installed | Certificate installed to system |
-| Trusted | Certificate installed and system-trusted, AI traffic acceleration works |
+
+| Status    | Meaning                                                                 |
+| --------- | ----------------------------------------------------------------------- |
+| Generated | Certificate created, but not installed to system                        |
+| Installed | Certificate installed to system                                         |
+| Trusted   | Certificate installed and system-trusted, AI traffic acceleration works |
+
 
 ### Export Certificate (Optional)
 
@@ -163,6 +168,7 @@ Quick Setup helps you generate ready-to-use configuration files for popular AI s
 **Important: Use the full absolute path, do NOT use `~` to represent the home directory.**
 
 For example:
+
 - ✅ Correct: `/Users/yourusername/.config/xxx/config.json`
 - ❌ Wrong: `~/.config/xxx/config.json`
 
@@ -181,12 +187,14 @@ If your software is not in the presets:
 
 ### Mode Comparison
 
-| Scenario | Recommended Mode |
-|----------|-----------------|
-| Use the official native AI interface in Cursor or VS Code directly | Deep Mode |
+
+| Scenario                                                                  | Recommended Mode          |
+| ------------------------------------------------------------------------- | ------------------------- |
+| Use the official native AI interface in Cursor or VS Code directly        | Deep Mode                 |
 | Connect Codex, Claude Code, OpenCode, and other CLI/manual-config clients | Regular Mode or Deep Mode |
-| Route AI traffic for all software automatically without per-app setup | Deep Mode |
-| Command-line tools (curl, wget, etc.) | Regular Mode |
+| Route AI traffic for all software automatically without per-app setup     | Deep Mode                 |
+| Command-line tools (curl, wget, etc.)                                     | Regular Mode              |
+
 
 ### Deep Mode
 
@@ -201,17 +209,20 @@ Deep Mode works through a **TUN virtual network interface** and accelerates AI t
 Deep Mode allows these applications to directly use our AI services with faster response speeds and stable connections.
 
 **Important notes:**
+
 - Supports the **official native AI interface in VS Code**
 - Supports the **official native AI interface in Cursor**
 - Also works for CLI tools such as **Codex, Claude Code, and OpenCode**
 - In most cases, no per-app proxy configuration is needed
 
 **Advantages:**
+
 - No need to configure proxy for each application
 - Supports AI traffic acceleration for all software
 - Global effect, simple to use
 
 **Notes:**
+
 - Windows users: necessary drivers auto-install on first switch
 - May conflict with VPNs that also use deep mode type connections
 - Before switching, recommended to set other VPNs to non-deep mode
@@ -225,6 +236,7 @@ Regular Mode works through a local **HTTP proxy** and is suitable for:
 - **Scenarios requiring fine-grained proxy control**
 
 **Important notes:**
+
 - In Regular Mode, users must **manually configure the client** through proxy settings or config files
 - Regular Mode does **not** support the **official native AI interface in VS Code**
 - Regular Mode does **not** support the **official native AI interface in Cursor**
@@ -232,6 +244,7 @@ Regular Mode works through a local **HTTP proxy** and is suitable for:
 
 **Configuration:**
 In each app's proxy settings or configuration file:
+
 - Proxy type: HTTP Proxy or SOCKS5
 - Address: `127.0.0.1`
 - Port: `56432`
@@ -254,11 +267,11 @@ Use ALiang as an intermediate proxy, forwarding traffic to your own VPN (SOCKS o
 2. Find the **Customer Proxy** area
 3. Enable customer proxy
 4. Select proxy type:
-   - **SOCKS5** - if your VPN provides SOCKS5 protocol
-   - **HTTP** - if your VPN provides HTTP proxy
+  - **SOCKS5** - if your VPN provides SOCKS5 protocol
+  - **HTTP** - if your VPN provides HTTP proxy
 5. Fill in server address and port
-   - Format: `IP:Port` (e.g., `127.0.0.1:1080`)
-   - Port must be between 1-65535
+  - Format: `IP:Port` (e.g., `127.0.0.1:1080`)
+  - Port must be between 1-65535
 6. Click **Save Configuration**
 
 ### Use Case
@@ -268,6 +281,7 @@ Your Device → ALiang Gateway (56432) → Your VPN (SOCKS/HTTP) → Target Serv
 ```
 
 Suitable for:
+
 - Already have VPN lines, want to accelerate AI traffic through ALiang
 - Need intelligent routing for specific domains
 
@@ -310,6 +324,7 @@ claude.ai
 **Putting third-party APIs into AI Rules does NOT leak your privacy.**
 
 Why:
+
 - ALiang only determines if traffic is AI traffic based on the domain
 - Does not inspect or log your request content
 - ALiang acts as a transparent proxy, only handling routing and acceleration
@@ -323,6 +338,7 @@ Proxy Rules let you customize traffic routing for specific domains.
 ### Function
 
 You can specify that certain domains:
+
 - **Use proxy** - Traffic goes through your configured proxy server
 - **Direct connect** - Traffic connects directly without proxy
 
@@ -336,10 +352,10 @@ You can specify that certain domains:
 domain,example.com,proxy
 ```
 
-4. Rule explanation:
-   - Part 1: Fixed as `domain`
-   - Part 2: Domain to match
-   - Part 3: `proxy` (use proxy) or `direct` (direct connect)
+1. Rule explanation:
+  - Part 1: Fixed as `domain`
+  - Part 2: Domain to match
+  - Part 3: `proxy` (use proxy) or `direct` (direct connect)
 
 ### Examples
 
@@ -360,6 +376,7 @@ domain,google.com,direct
 ### Q: Nothing happens when I click Start Proxy?
 
 **A:**
+
 1. Confirm certificate status is "Trusted"
 2. Confirm you are logged in
 3. Check runtime logs for error messages
@@ -375,6 +392,7 @@ domain,google.com,direct
 ### Q: Certificate shows "Not Trusted" but it's installed?
 
 **A:**
+
 1. Try restarting the app
 2. If still not working, click "Reinstall" certificate
 3. macOS users may need to manually trust the certificate in System Settings → Privacy & Security
@@ -382,6 +400,7 @@ domain,google.com,direct
 ### Q: Configuration file write fails?
 
 **A:**
+
 1. Check if target path exists
 2. Ensure using **full absolute path**, do NOT use `~`
 3. Ensure write permission for that path
@@ -390,6 +409,7 @@ domain,google.com,direct
 ### Q: AI traffic not accelerated?
 
 **A:**
+
 1. Confirm the domain is added in AI Rules
 2. Confirm proxy is started
 3. Check upstream proxy (Customer Proxy) configuration is correct
@@ -407,16 +427,18 @@ domain,google.com,direct
 
 ## Quick Reference
 
-| Action | Location |
-|--------|----------|
-| Login/Logout | Dashboard → Account Access |
-| Install Certificate | Dashboard → Certificate CA → Install |
-| Switch Mode | Settings → System Settings → Run Mode |
+
+| Action                   | Location                                           |
+| ------------------------ | -------------------------------------------------- |
+| Login/Logout             | Dashboard → Account Access                         |
+| Install Certificate      | Dashboard → Certificate CA → Install               |
+| Switch Mode              | Settings → System Settings → Run Mode              |
 | Configure Customer Proxy | Settings → Customer Configuration → Customer Proxy |
-| Configure AI Rules | Settings → Customer Configuration → AI Rules |
-| Configure Proxy Rules | Settings → Customer Configuration → Proxy Rules |
-| Quick Setup | Dashboard → Quick Setup |
-| View Logs | Settings → Log Monitoring |
+| Configure AI Rules       | Settings → Customer Configuration → AI Rules       |
+| Configure Proxy Rules    | Settings → Customer Configuration → Proxy Rules    |
+| Quick Setup              | Dashboard → Quick Setup                            |
+| View Logs                | Settings → Log Monitoring                          |
+
 
 ---
 
