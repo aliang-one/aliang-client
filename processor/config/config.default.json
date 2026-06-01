@@ -36,7 +36,6 @@
               "enble": true,
               "editable": true,
               "include": [
-                "api.aliang.one",
                 "api.anthropic.com"
               ]
             },

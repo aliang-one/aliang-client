@@ -46,9 +46,6 @@ func TestSoftwareUpdateService_TracksDismissalsAndForceUpdates(t *testing.T) {
 		if got := r.URL.Query().Get("version"); got != "v1.0.0" {
 			t.Fatalf("unexpected version query: %s", got)
 		}
-		if got := r.URL.Query().Get("software"); got != "aliang-gateway" {
-			t.Fatalf("unexpected software query: %s", got)
-		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(responseBody))
 	}))
@@ -89,8 +86,8 @@ func TestSoftwareUpdateService_TracksDismissalsAndForceUpdates(t *testing.T) {
 	if !dismissedStatus.Dismissed || dismissedStatus.ShowModal {
 		t.Fatalf("expected dismissed update to stop auto modal, got %+v", dismissedStatus)
 	}
-	if !dismissedStatus.IndicatorVisible {
-		t.Fatalf("expected dismissed update to keep indicator visible, got %+v", dismissedStatus)
+	if dismissedStatus.IndicatorVisible {
+		t.Fatalf("expected dismissed update to hide indicator, got %+v", dismissedStatus)
 	}
 
 	currentTime = currentTime.Add(10 * time.Minute)
@@ -144,5 +141,29 @@ func TestSoftwareUpdateService_TracksDismissalsAndForceUpdates(t *testing.T) {
 	}
 	if _, err := service.DismissCurrentUpdate(); err == nil {
 		t.Fatal("expected force update dismissal to be rejected")
+	}
+
+	responseBody = `{
+	  "software_name": "aliang-gateway",
+	  "platform": "darwin",
+	  "current_version": "v1.0.0",
+	  "latest_version": "v1.2.0",
+	  "download_url": "https://example.com/app-v1.2.0.dmg",
+	  "file_type": "dmg",
+	  "force_update": true,
+	  "needs_update": true,
+	  "changelog": "Security patch"
+	}`
+	currentTime = currentTime.Add(10 * time.Minute)
+	if err := service.RefreshNow(context.Background()); err != nil {
+		t.Fatalf("refresh previously dismissed version as force update failed: %v", err)
+	}
+
+	dismissedForceStatus := service.GetFrontendStatus()
+	if dismissedForceStatus.Dismissed {
+		t.Fatalf("force update should ignore previous dismissal, got %+v", dismissedForceStatus)
+	}
+	if !dismissedForceStatus.ForceUpdate || !dismissedForceStatus.ShowModal || !dismissedForceStatus.IndicatorVisible {
+		t.Fatalf("expected previously dismissed force update to show modal and indicator, got %+v", dismissedForceStatus)
 	}
 }

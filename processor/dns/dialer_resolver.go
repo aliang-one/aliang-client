@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
+	"strconv"
 	"strings"
 	"time"
 
@@ -29,9 +31,9 @@ func NewDialerResolverUtil(dialer proxy.Dialer, config *DNSConfig) *DialerResolv
 }
 
 // ResolveThroughDialer 通过 dialer 执行 DNS 解析
-func (d *DialerResolverUtil) ResolveThroughDialer(ctx context.Context, domain string, preferIPv4 bool) ([]net.IP, error) {
+func (d *DialerResolverUtil) ResolveThroughDialer(ctx context.Context, domain string, preferIPv4 bool) ([]net.IP, time.Duration, error) {
 	if d.dialer == nil {
-		return nil, fmt.Errorf("dialer not configured")
+		return nil, 0, fmt.Errorf("dialer not configured")
 	}
 
 	// 确保 domain 没有尾部点
@@ -43,17 +45,9 @@ func (d *DialerResolverUtil) ResolveThroughDialer(ctx context.Context, domain st
 		dnsServer = "8.8.8.8:53"
 	}
 
-	// 分解 host 和 port
-	var host string
-	var port uint16 = 53
-	if strings.Contains(dnsServer, ":") {
-		parts := strings.Split(dnsServer, ":")
-		host = parts[0]
-		portNum := 53
-		fmt.Sscanf(parts[1], "%d", &portNum)
-		port = uint16(portNum)
-	} else {
-		host = dnsServer
+	host, port, err := parseDNSServerAddress(dnsServer)
+	if err != nil {
+		return nil, 0, err
 	}
 
 	// 解析 IP 地址
@@ -63,10 +57,10 @@ func (d *DialerResolverUtil) ResolveThroughDialer(ctx context.Context, domain st
 		addrs, err := net.LookupHost(host)
 		if err != nil {
 			logger.Error(fmt.Sprintf("Failed to resolve DNS server %s: %v", host, err))
-			return nil, fmt.Errorf("failed to resolve DNS server: %w", err)
+			return nil, 0, fmt.Errorf("failed to resolve DNS server: %w", err)
 		}
 		if len(addrs) == 0 {
-			return nil, fmt.Errorf("DNS server %s resolved to no addresses", host)
+			return nil, 0, fmt.Errorf("DNS server %s resolved to no addresses", host)
 		}
 		dnsIP = net.ParseIP(addrs[0])
 	}
@@ -91,7 +85,7 @@ func (d *DialerResolverUtil) ResolveThroughDialer(ctx context.Context, domain st
 	conn, err := d.dialer.DialContext(ctx, metadata)
 	if err != nil {
 		logger.Debug(fmt.Sprintf("Failed to connect to DNS server %s via dialer: %v", dnsServer, err))
-		return nil, fmt.Errorf("failed to connect to DNS server: %w", err)
+		return nil, 0, fmt.Errorf("failed to connect to DNS server: %w", err)
 	}
 	defer conn.Close()
 
@@ -100,38 +94,97 @@ func (d *DialerResolverUtil) ResolveThroughDialer(ctx context.Context, domain st
 
 	// 设置写超时
 	if err := conn.SetWriteDeadline(time.Now().Add(d.config.Timeout)); err != nil {
-		return nil, fmt.Errorf("failed to set write deadline: %w", err)
+		return nil, 0, fmt.Errorf("failed to set write deadline: %w", err)
 	}
 
-	// 发送 DNS 查询
-	if _, err := conn.Write(query); err != nil {
-		return nil, fmt.Errorf("failed to send DNS query: %w", err)
+	// DNS over TCP uses a 2-byte length prefix before the DNS message.
+	if len(query) > 65535 {
+		return nil, 0, fmt.Errorf("DNS query too large: %d bytes", len(query))
+	}
+	framedQuery := make([]byte, 2+len(query))
+	binary.BigEndian.PutUint16(framedQuery[:2], uint16(len(query)))
+	copy(framedQuery[2:], query)
+
+	if err := writeFull(conn, framedQuery); err != nil {
+		return nil, 0, fmt.Errorf("failed to send DNS query: %w", err)
 	}
 
 	// 设置读超时
 	if err := conn.SetReadDeadline(time.Now().Add(d.config.Timeout)); err != nil {
-		return nil, fmt.Errorf("failed to set read deadline: %w", err)
+		return nil, 0, fmt.Errorf("failed to set read deadline: %w", err)
 	}
 
-	// 读取 DNS 响应
-	response := make([]byte, 4096)
-	n, err := conn.Read(response)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read DNS response: %w", err)
+	var lengthBuf [2]byte
+	if _, err := io.ReadFull(conn, lengthBuf[:]); err != nil {
+		return nil, 0, fmt.Errorf("failed to read DNS response length: %w", err)
+	}
+
+	responseLen := int(binary.BigEndian.Uint16(lengthBuf[:]))
+	if responseLen == 0 {
+		return nil, 0, fmt.Errorf("empty DNS response")
+	}
+
+	response := make([]byte, responseLen)
+	if _, err := io.ReadFull(conn, response); err != nil {
+		return nil, 0, fmt.Errorf("failed to read DNS response: %w", err)
 	}
 
 	// 解析 DNS 响应
-	ips, err := d.parseDNSResponse(response[:n], preferIPv4)
+	ips, ttl, err := d.parseDNSResponse(response, preferIPv4)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse DNS response: %w", err)
+		return nil, 0, fmt.Errorf("failed to parse DNS response: %w", err)
 	}
 
 	if len(ips) == 0 {
-		return nil, fmt.Errorf("no IP addresses found for %s", domain)
+		return nil, 0, fmt.Errorf("no IP addresses found for %s", domain)
+	}
+	if ttl <= 0 {
+		ttl = d.config.MaxTTL
 	}
 
 	logger.Debug(fmt.Sprintf("DNS resolved %s to %v via dialer", domain, ips))
-	return ips, nil
+	return ips, ttl, nil
+}
+
+func parseDNSServerAddress(dnsServer string) (string, uint16, error) {
+	dnsServer = strings.TrimSpace(dnsServer)
+	if dnsServer == "" {
+		return "", 0, fmt.Errorf("DNS server cannot be empty")
+	}
+
+	host, portText, err := net.SplitHostPort(dnsServer)
+	if err == nil {
+		port, err := strconv.ParseUint(portText, 10, 16)
+		if err != nil {
+			return "", 0, fmt.Errorf("invalid DNS server port %q: %w", portText, err)
+		}
+		return strings.Trim(host, "[]"), uint16(port), nil
+	}
+
+	if strings.Count(dnsServer, ":") == 1 {
+		host, portText, _ := strings.Cut(dnsServer, ":")
+		port, err := strconv.ParseUint(portText, 10, 16)
+		if err != nil {
+			return "", 0, fmt.Errorf("invalid DNS server port %q: %w", portText, err)
+		}
+		return strings.TrimSpace(host), uint16(port), nil
+	}
+
+	return strings.Trim(dnsServer, "[]"), 53, nil
+}
+
+func writeFull(w io.Writer, b []byte) error {
+	for len(b) > 0 {
+		n, err := w.Write(b)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+		b = b[n:]
+	}
+	return nil
 }
 
 // buildDNSQuery 构建 DNS 查询包
@@ -205,9 +258,9 @@ func (d *DialerResolverUtil) buildDNSQuery(domain string, isA bool) []byte {
 }
 
 // parseDNSResponse 解析 DNS 响应包
-func (d *DialerResolverUtil) parseDNSResponse(response []byte, preferIPv4 bool) ([]net.IP, error) {
+func (d *DialerResolverUtil) parseDNSResponse(response []byte, preferIPv4 bool) ([]net.IP, time.Duration, error) {
 	if len(response) < 12 {
-		return nil, fmt.Errorf("DNS response too short: %d bytes", len(response))
+		return nil, 0, fmt.Errorf("DNS response too short: %d bytes", len(response))
 	}
 
 	// 检查响应代码 (RCODE in flags)
@@ -223,18 +276,18 @@ func (d *DialerResolverUtil) parseDNSResponse(response []byte, preferIPv4 bool) 
 	flags := binary.BigEndian.Uint16(response[2:4])
 	rcode := flags & 0x000F
 	if rcode != 0 {
-		return nil, fmt.Errorf("DNS query failed with rcode %d", rcode)
+		return nil, 0, fmt.Errorf("DNS query failed with rcode %d", rcode)
 	}
 
 	// 检查是否是响应
 	if flags&0x8000 == 0 {
-		return nil, fmt.Errorf("received DNS query instead of response")
+		return nil, 0, fmt.Errorf("received DNS query instead of response")
 	}
 
 	// 字节 6-7: Answer count
 	answerCount := binary.BigEndian.Uint16(response[6:8])
 	if answerCount == 0 {
-		return nil, fmt.Errorf("no answers in DNS response")
+		return nil, 0, fmt.Errorf("no answers in DNS response")
 	}
 
 	// 跳过 Question section
@@ -254,11 +307,13 @@ func (d *DialerResolverUtil) parseDNSResponse(response []byte, preferIPv4 bool) 
 	pos += 4 // QTYPE (2 bytes) + QCLASS (2 bytes)
 
 	if pos >= len(response) {
-		return nil, fmt.Errorf("malformed DNS response")
+		return nil, 0, fmt.Errorf("malformed DNS response")
 	}
 
 	// 解析 Answer section
 	var ips []net.IP
+	var ttlSeconds uint32
+	ttlSet := false
 	for i := 0; i < int(answerCount) && pos < len(response); i++ {
 		// 跳过 RR Name (可能是压缩指针)
 		if pos >= len(response) {
@@ -288,6 +343,7 @@ func (d *DialerResolverUtil) parseDNSResponse(response []byte, preferIPv4 bool) 
 		pos += 2
 
 		// TTL (4 bytes)
+		recordTTL := binary.BigEndian.Uint32(response[pos:])
 		pos += 4
 
 		// RDLENGTH (2 bytes)
@@ -305,6 +361,10 @@ func (d *DialerResolverUtil) parseDNSResponse(response []byte, preferIPv4 bool) 
 			if preferIPv4 || len(ips) == 0 {
 				ip := net.IPv4(response[pos], response[pos+1], response[pos+2], response[pos+3])
 				ips = append(ips, ip)
+				if !ttlSet || recordTTL < ttlSeconds {
+					ttlSeconds = recordTTL
+					ttlSet = true
+				}
 			}
 		} else if recordType == 28 && dataLen == 16 {
 			// AAAA record (IPv6)
@@ -312,6 +372,10 @@ func (d *DialerResolverUtil) parseDNSResponse(response []byte, preferIPv4 bool) 
 				ip := net.IP(make([]byte, 16))
 				copy(ip, response[pos:pos+16])
 				ips = append(ips, ip)
+				if !ttlSet || recordTTL < ttlSeconds {
+					ttlSeconds = recordTTL
+					ttlSet = true
+				}
 			}
 		}
 
@@ -319,8 +383,8 @@ func (d *DialerResolverUtil) parseDNSResponse(response []byte, preferIPv4 bool) 
 	}
 
 	if len(ips) == 0 {
-		return nil, fmt.Errorf("no A/AAAA records found in DNS response")
+		return nil, 0, fmt.Errorf("no A/AAAA records found in DNS response")
 	}
 
-	return ips, nil
+	return ips, time.Duration(ttlSeconds) * time.Second, nil
 }

@@ -220,11 +220,11 @@ func ApplyConfig(cfg *Config) error {
 	}
 	logger.Debug("Phase 1: Built-in proxies registered")
 
-	// Phase 2: Register optional SOCKS proxy (if configured)
-	if err := registerSocksProxy(cfg); err != nil {
-		return fmt.Errorf("phase 2 - socks proxy registration failed: %w", err)
+	// Phase 2: Register optional customer proxy (if configured)
+	if err := registerCustomerProxy(cfg); err != nil {
+		return fmt.Errorf("phase 2 - customer proxy registration failed: %w", err)
 	}
-	logger.Debug("Phase 2: Optional SOCKS proxy registered")
+	logger.Debug("Phase 2: Optional customer proxy registered")
 
 	// Phase 3: Set the active default proxy for routing decisions
 	// Determines which proxy is used when no specific routing rule applies
@@ -289,35 +289,56 @@ func registerBuiltinProxies(cfg *Config) error {
 	return nil
 }
 
-// registerSocksProxy registers optional SOCKS5 proxy
-func registerSocksProxy(cfg *config.Config) error {
-	socksCfg, err := cfg.EffectiveSocksProxy()
+// registerCustomerProxy registers the optional customer proxy.
+func registerCustomerProxy(cfg *config.Config) error {
+	customerProxy, err := cfg.EffectiveCustomerProxy()
 	if err != nil {
-		return fmt.Errorf("invalid customer socks5 proxy config: %w", err)
+		return fmt.Errorf("invalid customer proxy config: %w", err)
 	}
-	if socksCfg == nil {
-		logger.Debug("No socks proxy configured")
+	if customerProxy == nil {
+		logger.Debug("No customer proxy configured")
 		return nil
 	}
 
-	// Validate config (already validated in cfg.Validate, but keep safe)
-	if err := socksCfg.Validate(); err != nil {
-		return fmt.Errorf("invalid socks proxy config: %w", err)
-	}
-
-	addr := fmt.Sprintf("%s:%d", socksCfg.Server, socksCfg.ServerPort)
 	proxyInstance := outbound.GetRegistry()
 
-	socksProxy, err := outbound.CreateSocksProxy(addr, socksCfg.Username, socksCfg.Password)
-	if err != nil {
-		return fmt.Errorf("failed to create socks proxy: %w", err)
+	switch proxyCfg := customerProxy.(type) {
+	case *config.Socks5Config:
+		if err := proxyCfg.Validate(); err != nil {
+			return fmt.Errorf("invalid socks proxy config: %w", err)
+		}
+
+		addr := fmt.Sprintf("%s:%d", proxyCfg.Server, proxyCfg.ServerPort)
+		socksProxy, err := outbound.CreateSocksProxy(addr, proxyCfg.Username, proxyCfg.Password)
+		if err != nil {
+			return fmt.Errorf("failed to create socks proxy: %w", err)
+		}
+
+		if err := proxyInstance.Register("socks", socksProxy); err != nil {
+			return fmt.Errorf("failed to register socks proxy: %w", err)
+		}
+
+		logger.Debug(fmt.Sprintf("SOCKS proxy registered at %s", addr))
+	case *config.HTTPProxyConfig:
+		if err := proxyCfg.Validate(); err != nil {
+			return fmt.Errorf("invalid http proxy config: %w", err)
+		}
+
+		addr := fmt.Sprintf("%s:%d", proxyCfg.Server, proxyCfg.ServerPort)
+		httpProxy, err := outbound.CreateHTTPProxy(addr, proxyCfg.Username, proxyCfg.Password)
+		if err != nil {
+			return fmt.Errorf("failed to create http proxy: %w", err)
+		}
+
+		if err := proxyInstance.Register("http", httpProxy); err != nil {
+			return fmt.Errorf("failed to register http proxy: %w", err)
+		}
+
+		logger.Debug(fmt.Sprintf("HTTP proxy registered at %s", addr))
+	default:
+		return fmt.Errorf("unsupported customer proxy config type %T", customerProxy)
 	}
 
-	if err := proxyInstance.Register("socks", socksProxy); err != nil {
-		return fmt.Errorf("failed to register socks proxy: %w", err)
-	}
-
-	logger.Debug(fmt.Sprintf("SOCKS proxy registered at %s", addr))
 	return nil
 }
 

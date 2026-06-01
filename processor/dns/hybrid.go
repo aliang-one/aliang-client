@@ -245,7 +245,7 @@ func (p *PrimaryResolver) performLookup(ctx context.Context, domain string, pref
 	// 使用 dialer 执行 DNS 解析 (DNS-over-TCP via proxy)
 	startTime := time.Now()
 	util := NewDialerResolverUtil(p.dialer, p.config)
-	ips, err := util.ResolveThroughDialer(ctx, domain, preferIPv4)
+	ips, ttl, err := util.ResolveThroughDialer(ctx, domain, preferIPv4)
 	duration := time.Since(startTime)
 
 	if err != nil {
@@ -253,9 +253,12 @@ func (p *PrimaryResolver) performLookup(ctx context.Context, domain string, pref
 		// Fallback to system resolver
 		return p.BaseResolver.performLookup(ctx, domain, preferIPv4)
 	}
+	if ttl <= 0 {
+		ttl = p.config.MaxTTL
+	}
 
 	logger.Debug(fmt.Sprintf("[DNS] DNS resolved via dialer for %s: %d IPs (took %v)", domain, len(ips), duration))
-	return ips, duration, nil
+	return ips, ttl, nil
 }
 
 // SystemResolver 系统DNS解析器

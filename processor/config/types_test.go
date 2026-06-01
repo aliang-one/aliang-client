@@ -405,6 +405,62 @@ func TestConfigValidate_CustomerProxyTypeAcceptsSocks5(t *testing.T) {
 	}
 }
 
+func TestConfigValidate_CustomerProxyTypeAcceptsHTTP(t *testing.T) {
+	payload := []byte(`{
+		"core": {"api_server": "https://api.aliang.one"},
+		"customer": {
+			"proxy": {
+				"type": "http",
+				"server": "127.0.0.1:8080",
+				"username": "u",
+				"password": "p"
+			}
+		}
+	}`)
+
+	var cfg Config
+	if err := json.Unmarshal(payload, &cfg); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v, want nil for http", err)
+	}
+
+	httpCfg, err := cfg.EffectiveHTTPProxy()
+	if err != nil {
+		t.Fatalf("EffectiveHTTPProxy() error = %v", err)
+	}
+	if httpCfg == nil {
+		t.Fatal("EffectiveHTTPProxy() = nil, want derived http config")
+	}
+	if httpCfg.Server != "127.0.0.1" || httpCfg.ServerPort != 8080 {
+		t.Fatalf("EffectiveHTTPProxy() = %#v, want host 127.0.0.1 port 8080", httpCfg)
+	}
+}
+
+func TestConfigValidate_CustomerHTTPProxyRequiresServer(t *testing.T) {
+	payload := []byte(`{
+		"core": {"api_server": "https://api.aliang.one"},
+		"customer": {
+			"proxy": {
+				"type": "http"
+			}
+		}
+	}`)
+
+	var cfg Config
+	if err := json.Unmarshal(payload, &cfg); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate() error = nil, want missing server error")
+	}
+	if !strings.Contains(err.Error(), "customer.proxy.server") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestConfigValidate_ForbidUnknownCustomerField(t *testing.T) {
 	payload := []byte(`{
 		"core": {"api_server": "https://api.aliang.one"},

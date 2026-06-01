@@ -64,13 +64,15 @@ type softwareUpdateStatusProvider interface {
 }
 
 type SoftwareUpdateService struct {
-	store     softwareUpdateStore
-	client    *http.Client
-	now       func() time.Time
-	startOnce sync.Once
-	refreshMu sync.Mutex
-	triggerCh chan struct{}
-	stopCh    chan struct{}
+	store      softwareUpdateStore
+	client     *http.Client
+	now        func() time.Time
+	startOnce  sync.Once
+	refreshMu  sync.Mutex
+	triggerCh  chan struct{}
+	stopCh     chan struct{}
+	dismissals map[string]bool
+	dismissMu  sync.RWMutex
 }
 
 var (
@@ -83,11 +85,12 @@ var (
 
 func NewSoftwareUpdateService() *SoftwareUpdateService {
 	return &SoftwareUpdateService{
-		store:     softwareUpdateStoreFactory(),
-		client:    softwareUpdateHTTPClient,
-		now:       softwareUpdateNow,
-		triggerCh: make(chan struct{}, 1),
-		stopCh:    make(chan struct{}),
+		store:      softwareUpdateStoreFactory(),
+		client:     softwareUpdateHTTPClient,
+		now:        softwareUpdateNow,
+		triggerCh:  make(chan struct{}, 1),
+		stopCh:     make(chan struct{}),
+		dismissals: make(map[string]bool),
 	}
 }
 
@@ -96,11 +99,12 @@ func NewSoftwareUpdateServiceWithStore(store softwareUpdateStore) *SoftwareUpdat
 		store = softwareUpdateStoreFactory()
 	}
 	return &SoftwareUpdateService{
-		store:     store,
-		client:    softwareUpdateHTTPClient,
-		now:       softwareUpdateNow,
-		triggerCh: make(chan struct{}, 1),
-		stopCh:    make(chan struct{}),
+		store:      store,
+		client:     softwareUpdateHTTPClient,
+		now:        softwareUpdateNow,
+		triggerCh:  make(chan struct{}, 1),
+		stopCh:     make(chan struct{}),
+		dismissals: make(map[string]bool),
 	}
 }
 
@@ -270,20 +274,10 @@ func (s *SoftwareUpdateService) GetFrontendStatus() models.SoftwareVersionUpdate
 		}
 	}
 
-	dismissal, dismissalErr := s.store.GetDismissal(runtimeInfo.software, runtimeInfo.platform, snapshot.LatestVersion)
-	if dismissalErr != nil {
-		return models.SoftwareVersionUpdateFrontendStatus{
-			Software:         runtimeInfo.software,
-			Platform:         runtimeInfo.platform,
-			CurrentVersion:   snapshot.CurrentVersion,
-			LatestVersion:    snapshot.LatestVersion,
-			Status:           "error",
-			LastError:        dismissalErr.Error(),
-			IndicatorVisible: snapshot.NeedsUpdate,
-		}
+	dismissed := false
+	if !snapshot.ForceUpdate {
+		dismissed = s.isDismissed(runtimeInfo.software, runtimeInfo.platform, snapshot.LatestVersion)
 	}
-
-	dismissed := dismissal != nil
 	showModal := snapshot.NeedsUpdate && (snapshot.ForceUpdate || !dismissed)
 
 	status := models.SoftwareVersionUpdateFrontendStatus{
@@ -298,16 +292,13 @@ func (s *SoftwareUpdateService) GetFrontendStatus() models.SoftwareVersionUpdate
 		ForceUpdate:        snapshot.ForceUpdate,
 		Dismissed:          dismissed,
 		ShowModal:          showModal,
-		IndicatorVisible:   snapshot.NeedsUpdate,
+		IndicatorVisible:   snapshot.NeedsUpdate && (snapshot.ForceUpdate || !dismissed),
 		BlockingProxyStart: snapshot.NeedsUpdate && snapshot.ForceUpdate,
 		Status:             snapshot.Status,
 		LastError:          snapshot.LastError,
 		CheckedAtUnix:      snapshot.CheckedAt.Unix(),
 		FirstSeenAtUnix:    snapshot.FirstSeenAt.Unix(),
 		LastSeenAtUnix:     snapshot.LastSeenAt.Unix(),
-	}
-	if dismissal != nil {
-		status.DismissedAtUnix = dismissal.DismissedAt.Unix()
 	}
 	return status
 }
@@ -332,14 +323,7 @@ func (s *SoftwareUpdateService) DismissCurrentUpdate() (models.SoftwareVersionUp
 		return models.SoftwareVersionUpdateFrontendStatus{}, fmt.Errorf("latest version is empty")
 	}
 
-	if err := s.store.UpsertDismissal(models.SoftwareVersionUpdateDismissal{
-		Software:      runtimeInfo.software,
-		Platform:      runtimeInfo.platform,
-		LatestVersion: snapshot.LatestVersion,
-		DismissedAt:   s.now(),
-	}); err != nil {
-		return models.SoftwareVersionUpdateFrontendStatus{}, err
-	}
+	s.setDismissed(runtimeInfo.software, runtimeInfo.platform, snapshot.LatestVersion)
 
 	return s.GetFrontendStatus(), nil
 }
@@ -470,9 +454,10 @@ func buildSoftwareUpdateCheckURL(runtimeInfo softwareUpdateRuntimeInfo) (string,
 		return "", fmt.Errorf("global config is not initialized")
 	}
 
-	// baseURL := strings.TrimSpace(globalCfg.APIBaseURL())
-	// TODO: 目前先写死，后续再改为可配置
-	baseURL := "https://www.aliang.one"
+	baseURL := strings.TrimSpace(globalCfg.APIBaseURL())
+	if baseURL == "" {
+		baseURL = "https://www.aliang.one"
+	}
 	if baseURL == "" {
 		return "", fmt.Errorf("api base url is not configured")
 	}
@@ -494,7 +479,6 @@ func buildSoftwareUpdateCheckURL(runtimeInfo softwareUpdateRuntimeInfo) (string,
 
 	parsed.Path = strings.TrimRight(parsed.Path, "/") + "/api/public/downloads/check"
 	parsed.RawQuery = query.Encode()
-	print(parsed.String())
 	return parsed.String(), nil
 }
 
@@ -532,4 +516,20 @@ func coalesceString(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func dismissalKey(software, platform, latestVersion string) string {
+	return software + ":" + platform + ":" + latestVersion
+}
+
+func (s *SoftwareUpdateService) isDismissed(software, platform, latestVersion string) bool {
+	s.dismissMu.RLock()
+	defer s.dismissMu.RUnlock()
+	return s.dismissals[dismissalKey(software, platform, latestVersion)]
+}
+
+func (s *SoftwareUpdateService) setDismissed(software, platform, latestVersion string) {
+	s.dismissMu.Lock()
+	defer s.dismissMu.Unlock()
+	s.dismissals[dismissalKey(software, platform, latestVersion)] = true
 }

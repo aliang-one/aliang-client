@@ -288,7 +288,10 @@ func compileCanonicalRoutingFromRuntimeInputs(cfg *config.Config, switches model
 		Routing: config.CanonicalRoutingConfig{Rules: []config.CanonicalRoutingRule{}},
 	}
 
-	aiDomains := collectAIDomains(cfg)
+	var aiDomains []string
+	if switches.AliangEnabled {
+		aiDomains = collectAIDomains(cfg)
+	}
 	proxyRuleDomains := collectProxyRuleDomains(cfg)
 
 	upstreamType, hasToSocks := resolveToSocksUpstreamType(cfg)

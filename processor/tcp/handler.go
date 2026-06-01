@@ -547,15 +547,6 @@ func (h *TCPConnectionHandler) handleTLS(
 			// Set hostname with SNI binding source
 			setMetadataHostFromObservedSNI(metadata, sni)
 
-			// Check if this is a DoH (DNS over HTTPS) provider
-			// DoH traffic should be routed directly without proxy interception
-			if IsDoHProvider(sni) {
-				logger.Info(fmt.Sprintf("[DoH] Detected DoH provider: %s, routing directly", sni))
-				// Return nil to allow direct connection (bypass proxy)
-				// This means the connection will be handled directly without MITM or proxy routing
-				return nil, nil, nil
-			}
-
 			logger.Info(fmt.Sprintf("[TLS] Successfully extracted SNI: %s", sni))
 		}
 	}
@@ -580,6 +571,13 @@ func (h *TCPConnectionHandler) handleTLS(
 		safeBindingSource(metadata),
 		metadata.Route,
 	))
+
+	// DoH is normal HTTPS traffic from the browser's point of view. Bypass
+	// interception, but still establish and relay the direct upstream connection.
+	if metadata.HostName != "" && IsDoHProvider(metadata.HostName) {
+		logger.Info(fmt.Sprintf("[DoH] Detected DoH provider: %s, routing directly", metadata.HostName))
+		return h.resolveTLSRoute(sessionCtx, connectCtx, originConn, metadata, RouteDirect, wrapped, "")
+	}
 
 	// STEP 2: Without an explicit hostname or observed SNI, we only trust a
 	// unique cached IP->domain binding. Shared-IP cache entries still bypass MITM.

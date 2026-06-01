@@ -70,10 +70,12 @@ var _ outboundproxy.Proxy = (*fakeAliangProxy)(nil)
 type fakeMITMTLSHandler struct {
 	mitmPayload []byte
 	mitmHost    string
+	extractSNI  string
+	extractBuf  []byte
 }
 
 func (h *fakeMITMTLSHandler) ExtractSNI(context.Context, net.Conn) (string, []byte, error) {
-	return "", nil, nil
+	return h.extractSNI, append([]byte(nil), h.extractBuf...), nil
 }
 
 func (h *fakeMITMTLSHandler) PerformMITM(_ context.Context, _ net.Conn, serverName string) (net.Conn, error) {
@@ -424,5 +426,71 @@ func TestResolveTLSMirrorRoute_RewrapsDirectRouteAndPreservesPlaintextForMirror(
 		_ = conn.Close()
 	case <-time.After(2 * time.Second):
 		t.Fatal("expected direct dial to reach local listener")
+	}
+}
+
+func TestHandleTLS_DoHProviderRoutesDirectAndPreservesClientHello(t *testing.T) {
+	config.ResetGlobalConfigForTest()
+	defer config.ResetGlobalConfigForTest()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen failed: %v", err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		conn, acceptErr := ln.Accept()
+		if acceptErr == nil {
+			accepted <- conn
+		}
+	}()
+
+	clientHello := []byte("client-hello")
+	tlsHandler := &fakeMITMTLSHandler{
+		extractSNI: "dns.google",
+		extractBuf: clientHello,
+	}
+	handler := NewTCPConnectionHandler(NewDefaultProtocolDetector(), tlsHandler, nil, statistic.DefaultManager)
+	metadata := &M.Metadata{
+		Network: M.TCP,
+		DstIP:   netip.MustParseAddr("127.0.0.1"),
+		DstPort: uint16(ln.Addr().(*net.TCPAddr).Port),
+	}
+
+	remote, origin, err := handler.handleTLS(context.Background(), context.Background(), newFakeConn(nil), metadata)
+	if err != nil {
+		t.Fatalf("handleTLS failed: %v", err)
+	}
+	if remote == nil {
+		t.Fatal("remote connection is nil")
+	}
+	defer remote.Close()
+	if origin == nil {
+		t.Fatal("origin connection is nil")
+	}
+	defer origin.Close()
+
+	if metadata.HostName != "dns.google" {
+		t.Fatalf("metadata HostName = %q, want dns.google", metadata.HostName)
+	}
+	if metadata.Route != "RouteDirect" {
+		t.Fatalf("metadata Route = %q, want RouteDirect", metadata.Route)
+	}
+
+	buf := make([]byte, len(clientHello))
+	if _, err := io.ReadFull(origin, buf); err != nil {
+		t.Fatalf("failed to read preserved ClientHello: %v", err)
+	}
+	if !bytes.Equal(buf, clientHello) {
+		t.Fatalf("preserved ClientHello = %q, want %q", string(buf), string(clientHello))
+	}
+
+	select {
+	case conn := <-accepted:
+		_ = conn.Close()
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected DoH direct route to reach local listener")
 	}
 }

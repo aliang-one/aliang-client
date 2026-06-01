@@ -53,8 +53,30 @@ type Socks5Config struct {
 	Password   string `json:"password,omitempty"`
 }
 
+// HTTPProxyConfig represents HTTP CONNECT proxy configuration.
+type HTTPProxyConfig struct {
+	Server     string `json:"server_host"`
+	ServerPort uint16 `json:"server_port"`
+	Username   string `json:"username,omitempty"`
+	Password   string `json:"password,omitempty"`
+}
+
 // Validate validates SOCKS5 configuration
 func (c *Socks5Config) Validate() error {
+	if c.Server == "" {
+		return fmt.Errorf("server_host is required")
+	}
+	if c.ServerPort == 0 {
+		return fmt.Errorf("server_port is required")
+	}
+	if (c.Username == "") != (c.Password == "") {
+		return fmt.Errorf("username and password must be provided together")
+	}
+	return nil
+}
+
+// Validate validates HTTP proxy configuration.
+func (c *HTTPProxyConfig) Validate() error {
 	if c.Server == "" {
 		return fmt.Errorf("server_host is required")
 	}
@@ -516,11 +538,18 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	if socksCfg, err := c.EffectiveSocksProxy(); err != nil {
+	if customerProxy, err := c.EffectiveCustomerProxy(); err != nil {
 		return fmt.Errorf("invalid customer proxy configuration: %w", err)
-	} else if socksCfg != nil {
-		if err := socksCfg.Validate(); err != nil {
-			return fmt.Errorf("invalid socksProxy configuration: %w", err)
+	} else if customerProxy != nil {
+		switch typedProxy := customerProxy.(type) {
+		case *Socks5Config:
+			if err := typedProxy.Validate(); err != nil {
+				return fmt.Errorf("invalid socksProxy configuration: %w", err)
+			}
+		case *HTTPProxyConfig:
+			if err := typedProxy.Validate(); err != nil {
+				return fmt.Errorf("invalid httpProxy configuration: %w", err)
+			}
 		}
 	}
 
@@ -725,6 +754,48 @@ func (c *Config) EffectiveSocksProxy() (*Socks5Config, error) {
 		Username:   c.Customer.Proxy.Username,
 		Password:   c.Customer.Proxy.Password,
 	}, nil
+}
+
+func (c *Config) EffectiveHTTPProxy() (*HTTPProxyConfig, error) {
+	if c == nil || c.Customer == nil || c.Customer.Proxy == nil {
+		return nil, nil
+	}
+	if !c.Customer.Proxy.IsEnabled() {
+		return nil, nil
+	}
+	if strings.ToLower(strings.TrimSpace(c.Customer.Proxy.Type)) != "http" {
+		return nil, nil
+	}
+
+	serverHost, serverPort, err := parseHostPort(c.Customer.Proxy.Server)
+	if err != nil {
+		return nil, fmt.Errorf("customer.proxy.server: %w", err)
+	}
+
+	return &HTTPProxyConfig{
+		Server:     serverHost,
+		ServerPort: serverPort,
+		Username:   c.Customer.Proxy.Username,
+		Password:   c.Customer.Proxy.Password,
+	}, nil
+}
+
+func (c *Config) EffectiveCustomerProxy() (interface{}, error) {
+	if c == nil || c.Customer == nil || c.Customer.Proxy == nil {
+		return nil, nil
+	}
+	if !c.Customer.Proxy.IsEnabled() {
+		return nil, nil
+	}
+
+	switch strings.ToLower(strings.TrimSpace(c.Customer.Proxy.Type)) {
+	case "socks5":
+		return c.EffectiveSocksProxy()
+	case "http":
+		return c.EffectiveHTTPProxy()
+	default:
+		return nil, nil
+	}
 }
 
 func (c *Config) EffectiveAIAllowlist() []string {

@@ -8,6 +8,7 @@ import (
 	"aliang.one/nursorgate/outbound/proxy"
 	"aliang.one/nursorgate/outbound/proxy/aliang"
 	"aliang.one/nursorgate/outbound/proxy/direct"
+	httpproxy "aliang.one/nursorgate/outbound/proxy/http"
 	"aliang.one/nursorgate/outbound/proxy/socks5"
 	proxyConfig "aliang.one/nursorgate/processor/config"
 )
@@ -80,6 +81,14 @@ func CreateSocksProxy(addr, username, password string) (proxy.Proxy, error) {
 		return nil, fmt.Errorf("socks proxy addr cannot be empty")
 	}
 	return socks5.New(addr, username, password)
+}
+
+// CreateHTTPProxy creates an HTTP CONNECT proxy instance from address and optional auth.
+func CreateHTTPProxy(addr, username, password string) (proxy.Proxy, error) {
+	if addr == "" {
+		return nil, fmt.Errorf("http proxy addr cannot be empty")
+	}
+	return httpproxy.NewHTTP(addr, username, password)
 }
 
 // Register 注册一个代理实例

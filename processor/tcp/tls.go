@@ -199,7 +199,7 @@ func IsDoHProvider(domain string) bool {
 		return false
 	}
 
-	domain = strings.ToLower(domain)
+	domain = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(domain)), ".")
 
 	// List of known DoH providers
 	dohProviders := []string{
@@ -216,7 +216,8 @@ func IsDoHProvider(domain string) bool {
 	}
 
 	for _, provider := range dohProviders {
-		if strings.Contains(domain, provider) {
+		provider = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(provider)), ".")
+		if domain == provider || strings.HasSuffix(domain, "."+provider) {
 			return true
 		}
 	}
