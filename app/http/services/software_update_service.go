@@ -10,6 +10,7 @@ import (
 	"os"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -199,9 +200,14 @@ func (s *SoftwareUpdateService) RefreshNow(ctx context.Context) error {
 		return lookupErr
 	}
 
+	currentVersion := coalesceString(normalizeVersionString(payload.CurrentVersion), runtimeInfo.version)
+	latestVersion := coalesceString(normalizeVersionString(payload.LatestVersion), currentVersion, runtimeInfo.version)
+	needsUpdate := payload.NeedsUpdate && isSoftwareUpdateNewer(latestVersion, currentVersion)
+	forceUpdate := needsUpdate && payload.ForceUpdate
+
 	firstSeenAt := time.Time{}
 	lastSeenAt := time.Time{}
-	if payload.NeedsUpdate {
+	if needsUpdate {
 		firstSeenAt = now
 		if existing != nil && existing.NeedsUpdate && strings.EqualFold(existing.LatestVersion, payload.LatestVersion) && !existing.FirstSeenAt.IsZero() {
 			firstSeenAt = existing.FirstSeenAt
@@ -212,14 +218,14 @@ func (s *SoftwareUpdateService) RefreshNow(ctx context.Context) error {
 	snapshot := models.SoftwareVersionUpdateSnapshot{
 		Software:       runtimeInfo.software,
 		Platform:       runtimeInfo.platform,
-		CurrentVersion: normalizeVersionString(payload.CurrentVersion),
-		LatestVersion:  normalizeVersionString(payload.LatestVersion),
+		CurrentVersion: currentVersion,
+		LatestVersion:  latestVersion,
 		DownloadURL:    strings.TrimSpace(payload.DownloadURL),
 		FileType:       strings.TrimSpace(payload.FileType),
 		Changelog:      strings.TrimSpace(payload.Changelog),
-		NeedsUpdate:    payload.NeedsUpdate,
-		ForceUpdate:    payload.NeedsUpdate && payload.ForceUpdate,
-		Status:         softwareUpdateStatusLabel(payload.NeedsUpdate, payload.ForceUpdate, ""),
+		NeedsUpdate:    needsUpdate,
+		ForceUpdate:    forceUpdate,
+		Status:         softwareUpdateStatusLabel(needsUpdate, forceUpdate, ""),
 		LastError:      "",
 		CheckedAt:      now,
 		FirstSeenAt:    firstSeenAt,
@@ -274,26 +280,31 @@ func (s *SoftwareUpdateService) GetFrontendStatus() models.SoftwareVersionUpdate
 		}
 	}
 
+	currentVersion := coalesceString(normalizeVersionString(snapshot.CurrentVersion), runtimeInfo.version)
+	latestVersion := coalesceString(normalizeVersionString(snapshot.LatestVersion), currentVersion)
+	needsUpdate := snapshot.NeedsUpdate && isSoftwareUpdateNewer(latestVersion, currentVersion)
+	forceUpdate := needsUpdate && snapshot.ForceUpdate
+
 	dismissed := false
-	if !snapshot.ForceUpdate {
-		dismissed = s.isDismissed(runtimeInfo.software, runtimeInfo.platform, snapshot.LatestVersion)
+	if !forceUpdate {
+		dismissed = s.isDismissed(runtimeInfo.software, runtimeInfo.platform, latestVersion)
 	}
-	showModal := snapshot.NeedsUpdate && (snapshot.ForceUpdate || !dismissed)
+	showModal := needsUpdate && (forceUpdate || !dismissed)
 
 	status := models.SoftwareVersionUpdateFrontendStatus{
 		Software:           snapshot.Software,
 		Platform:           snapshot.Platform,
-		CurrentVersion:     coalesceString(snapshot.CurrentVersion, runtimeInfo.version),
-		LatestVersion:      snapshot.LatestVersion,
+		CurrentVersion:     currentVersion,
+		LatestVersion:      latestVersion,
 		DownloadURL:        snapshot.DownloadURL,
 		FileType:           snapshot.FileType,
 		Changelog:          snapshot.Changelog,
-		NeedsUpdate:        snapshot.NeedsUpdate,
-		ForceUpdate:        snapshot.ForceUpdate,
+		NeedsUpdate:        needsUpdate,
+		ForceUpdate:        forceUpdate,
 		Dismissed:          dismissed,
 		ShowModal:          showModal,
-		IndicatorVisible:   snapshot.NeedsUpdate && (snapshot.ForceUpdate || !dismissed),
-		BlockingProxyStart: snapshot.NeedsUpdate && snapshot.ForceUpdate,
+		IndicatorVisible:   needsUpdate && (forceUpdate || !dismissed),
+		BlockingProxyStart: needsUpdate && forceUpdate,
 		Status:             snapshot.Status,
 		LastError:          snapshot.LastError,
 		CheckedAtUnix:      snapshot.CheckedAt.Unix(),
@@ -358,6 +369,12 @@ func (s *SoftwareUpdateService) persistFailureState(runtimeInfo softwareUpdateRu
 		}
 	} else {
 		next.LatestVersion = runtimeInfo.version
+	}
+	if !isSoftwareUpdateNewer(next.LatestVersion, next.CurrentVersion) {
+		next.NeedsUpdate = false
+		next.ForceUpdate = false
+		next.FirstSeenAt = time.Time{}
+		next.LastSeenAt = time.Time{}
 	}
 
 	if err := s.store.UpsertSnapshot(next); err != nil {
@@ -494,6 +511,35 @@ func normalizeVersionString(value string) string {
 		return "v" + trimmed
 	}
 	return ""
+}
+
+func isSoftwareUpdateNewer(latestVersion string, currentVersion string) bool {
+	latest := normalizeVersionString(latestVersion)
+	current := normalizeVersionString(currentVersion)
+	if latest == "" || current == "" {
+		return false
+	}
+
+	latestParts := strings.Split(strings.TrimPrefix(latest, "v"), ".")
+	currentParts := strings.Split(strings.TrimPrefix(current, "v"), ".")
+	if len(latestParts) != 3 || len(currentParts) != 3 {
+		return false
+	}
+
+	for i := 0; i < 3; i++ {
+		latestValue, latestErr := strconv.Atoi(latestParts[i])
+		currentValue, currentErr := strconv.Atoi(currentParts[i])
+		if latestErr != nil || currentErr != nil {
+			return false
+		}
+		if latestValue > currentValue {
+			return true
+		}
+		if latestValue < currentValue {
+			return false
+		}
+	}
+	return false
 }
 
 func softwareUpdateStatusLabel(needsUpdate bool, forceUpdate bool, lastError string) string {

@@ -1,5 +1,5 @@
 <template>
-  <div v-if="indicatorVisible" class="pointer-events-none fixed right-5 top-5 z-[1050] flex flex-col items-end gap-3">
+  <div v-if="noticeVisible" class="pointer-events-none fixed right-5 top-5 z-[1050] flex flex-col items-end gap-3">
     <button
       type="button"
       class="pointer-events-auto inline-flex items-center gap-3 rounded-2xl border px-4 py-3 shadow-xl backdrop-blur-md transition hover:-translate-y-0.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-slate-950"
@@ -124,7 +124,7 @@
 </template>
 
 <script setup>
-import { computed, onMounted } from 'vue';
+import { computed, onBeforeUnmount, onMounted } from 'vue';
 import { useSoftwareUpdate } from '../composables/useSoftwareUpdate';
 import { useI18n } from '../i18n';
 
@@ -142,6 +142,7 @@ const {
 const { t } = useI18n();
 
 const indicatorVisible = computed(() => softwareUpdateStatus.value.indicator_visible);
+const noticeVisible = computed(() => indicatorVisible.value || softwareUpdateModalOpen.value);
 
 const indicatorClass = computed(() => (
   softwareUpdateStatus.value.force_update
@@ -252,9 +253,27 @@ function handleOverlayClose() {
   void handleDismiss();
 }
 
+let refreshRetryTimer = null;
+let refreshPollTimer = null;
+
+function refreshUpdateStatusSilently() {
+  refreshSoftwareUpdateStatus().catch(() => {});
+}
+
 onMounted(() => {
-  if (!softwareUpdateLoaded.value) {
-    refreshSoftwareUpdateStatus().catch(() => {});
+  refreshUpdateStatusSilently();
+  refreshRetryTimer = window.setTimeout(refreshUpdateStatusSilently, 3000);
+  refreshPollTimer = window.setInterval(refreshUpdateStatusSilently, 60000);
+});
+
+onBeforeUnmount(() => {
+  if (refreshRetryTimer !== null) {
+    window.clearTimeout(refreshRetryTimer);
+    refreshRetryTimer = null;
+  }
+  if (refreshPollTimer !== null) {
+    window.clearInterval(refreshPollTimer);
+    refreshPollTimer = null;
   }
 });
 </script>

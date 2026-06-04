@@ -167,3 +167,78 @@ func TestSoftwareUpdateService_TracksDismissalsAndForceUpdates(t *testing.T) {
 		t.Fatalf("expected previously dismissed force update to show modal and indicator, got %+v", dismissedForceStatus)
 	}
 }
+
+func TestSoftwareUpdateService_ClearsCachedUpdateWhenRuntimeVersionCaughtUp(t *testing.T) {
+	config.ResetGlobalConfigForTest()
+	t.Cleanup(config.ResetGlobalConfigForTest)
+
+	originalVersion := appVersion.Version
+	appVersion.Version = "v1.0.0"
+	t.Cleanup(func() {
+		appVersion.Version = originalVersion
+	})
+
+	t.Setenv("ALIANG_UPDATE_SOFTWARE", "aliang-gateway")
+
+	responseStatus := http.StatusOK
+	responseBody := `{
+	  "software_name": "aliang-gateway",
+	  "platform": "darwin",
+	  "current_version": "v1.0.0",
+	  "latest_version": "v1.1.0",
+	  "download_url": "https://example.com/app-v1.1.0.dmg",
+	  "file_type": "dmg",
+	  "force_update": false,
+	  "needs_update": true,
+	  "changelog": "Bug fixes"
+	}`
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(responseStatus)
+		_, _ = w.Write([]byte(responseBody))
+	}))
+	defer server.Close()
+
+	config.SetGlobalConfig(&config.Config{
+		Core: &config.CoreConfig{
+			APIServer: server.URL,
+		},
+	})
+
+	store, err := storage.NewSoftwareVersionUpdateStoreWithDBPath(t.TempDir() + "/updates.db")
+	if err != nil {
+		t.Fatalf("create version update store failed: %v", err)
+	}
+
+	currentTime := time.Now().UTC()
+	service := NewSoftwareUpdateServiceWithStore(store)
+	service.client = server.Client()
+	service.now = func() time.Time { return currentTime }
+
+	if err := service.RefreshNow(context.Background()); err != nil {
+		t.Fatalf("initial refresh failed: %v", err)
+	}
+	initialStatus := service.GetFrontendStatus()
+	if !initialStatus.NeedsUpdate || !initialStatus.ShowModal {
+		t.Fatalf("expected initial update notice, got %+v", initialStatus)
+	}
+
+	appVersion.Version = "v1.1.0"
+	responseStatus = http.StatusNotFound
+	responseBody = "404 page not found"
+	currentTime = currentTime.Add(10 * time.Minute)
+	if err := service.RefreshNow(context.Background()); err == nil {
+		t.Fatal("expected refresh failure after remote 404")
+	}
+
+	status := service.GetFrontendStatus()
+	if status.CurrentVersion != "v1.1.0" || status.LatestVersion != "v1.1.0" {
+		t.Fatalf("expected caught-up versions, got %+v", status)
+	}
+	if status.NeedsUpdate || status.ForceUpdate || status.ShowModal || status.IndicatorVisible || status.BlockingProxyStart {
+		t.Fatalf("expected cached update prompt to be cleared after version caught up, got %+v", status)
+	}
+	if status.Status != "error" || status.LastError == "" {
+		t.Fatalf("expected refresh error to remain visible for diagnostics, got %+v", status)
+	}
+}
