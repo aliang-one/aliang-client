@@ -16,6 +16,7 @@ import (
 	"aliang.one/nursorgate/app/http/storage"
 	"aliang.one/nursorgate/common/logger"
 	M "aliang.one/nursorgate/inbound/tun/metadata"
+	"aliang.one/nursorgate/outbound"
 	"aliang.one/nursorgate/processor/config"
 	"aliang.one/nursorgate/processor/mirror"
 	"aliang.one/nursorgate/processor/rules"
@@ -163,6 +164,9 @@ func (s *CustomerConfigService) UpdateCommittedCustomerConfig(payload []byte) (*
 			}
 			previousCfg := config.GetGlobalConfig()
 			config.SetGlobalConfig(&committedCfg)
+			if err := outbound.GetRegistry().RefreshCustomerProxy(&committedCfg); err != nil {
+				return fmt.Errorf("refresh customer proxy registry: %w", err)
+			}
 			closeDisabledAIAcceleratedConnections(previousCfg, &committedCfg)
 			mirror.InitGlobalForwarder()
 			return nil

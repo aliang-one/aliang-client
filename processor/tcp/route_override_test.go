@@ -20,6 +20,7 @@ import (
 	"aliang.one/nursorgate/outbound/proxy/proto"
 	"aliang.one/nursorgate/processor/config"
 	"aliang.one/nursorgate/processor/mirror"
+	"aliang.one/nursorgate/processor/routing"
 	"aliang.one/nursorgate/processor/statistic"
 	"golang.org/x/net/http2"
 )
@@ -66,6 +67,10 @@ func (p *fakeAliangProxy) Proto() proto.Proto {
 }
 
 var _ outboundproxy.Proxy = (*fakeAliangProxy)(nil)
+
+func boolPtr(value bool) *bool {
+	return &value
+}
 
 type fakeMITMTLSHandler struct {
 	mitmPayload []byte
@@ -160,6 +165,74 @@ func TestHandleNonTLS_DoesNotShortCircuitLocalHTTPProxyPortToDirect(t *testing.T
 	}
 	if got, want := metadata.Route, "RouteToALiang"; got != want {
 		t.Fatalf("unexpected metadata route: got %q want %q", got, want)
+	}
+}
+
+func TestGetToSocksProxyForExecution_UsesCurrentCustomerProxyTypeOverStaleCanonical(t *testing.T) {
+	config.ResetGlobalConfigForTest()
+	config.ResetRoutingApplyStoreForTest()
+	t.Cleanup(func() {
+		config.ResetGlobalConfigForTest()
+		config.ResetRoutingApplyStoreForTest()
+	})
+
+	registry := outbound.GetRegistry()
+	registry.Clear()
+	t.Cleanup(registry.Clear)
+
+	staleSocks, err := outbound.CreateSocksProxy("182.138.136.39:27751", "", "")
+	if err != nil {
+		t.Fatalf("CreateSocksProxy() error = %v", err)
+	}
+	if err := registry.Register("socks", staleSocks); err != nil {
+		t.Fatalf("register stale socks proxy failed: %v", err)
+	}
+	currentHTTP, err := outbound.CreateHTTPProxy("cd.liangsqrt.com:27750", "clash", "asd123456")
+	if err != nil {
+		t.Fatalf("CreateHTTPProxy() error = %v", err)
+	}
+	if err := registry.Register("http", currentHTTP); err != nil {
+		t.Fatalf("register current http proxy failed: %v", err)
+	}
+
+	config.SetGlobalConfig(&config.Config{
+		Customer: &config.CustomerConfig{
+			Proxy: &config.CustomerProxyConfig{
+				Enable:   boolPtr(true),
+				Type:     "http",
+				Server:   "cd.liangsqrt.com:27750",
+				Username: "clash",
+				Password: "asd123456",
+			},
+		},
+	})
+
+	rawCanonical := []byte(`{
+		"version": 1,
+		"ingress": {"mode": "tun"},
+		"egress": {
+			"direct": {"enabled": true},
+			"toAliang": {"enabled": true},
+			"toSocks": {"enabled": true, "upstream": {"type": "socks"}}
+		},
+		"routing": {"rules": [], "default_egress": "direct"}
+	}`)
+	if _, err := config.GetRoutingApplyStore().Apply(rawCanonical, func(cfg *config.CanonicalRoutingSchema) (any, error) {
+		return routing.CompileRuntimeSnapshot(cfg)
+	}); err != nil {
+		t.Fatalf("apply stale canonical routing schema failed: %v", err)
+	}
+
+	handler := &TCPConnectionHandler{}
+	selectedProxy, upstreamType, err := handler.getToSocksProxyForExecution()
+	if err != nil {
+		t.Fatalf("getToSocksProxyForExecution() error = %v", err)
+	}
+	if upstreamType != toSocksUpstreamTypeHTTP {
+		t.Fatalf("upstreamType = %q, want %q", upstreamType, toSocksUpstreamTypeHTTP)
+	}
+	if got := selectedProxy.Addr(); got != "cd.liangsqrt.com:27750" {
+		t.Fatalf("selected proxy addr = %q, want cd.liangsqrt.com:27750", got)
 	}
 }
 

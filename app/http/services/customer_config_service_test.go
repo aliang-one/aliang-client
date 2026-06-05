@@ -8,7 +8,9 @@ import (
 	"testing"
 	"time"
 
+	"aliang.one/nursorgate/app/http/storage"
 	M "aliang.one/nursorgate/inbound/tun/metadata"
+	"aliang.one/nursorgate/outbound"
 	"aliang.one/nursorgate/processor/config"
 	"aliang.one/nursorgate/processor/setup"
 	"aliang.one/nursorgate/processor/statistic"
@@ -229,6 +231,76 @@ func TestReadConfigFromPath_FallsBackToRuntimeDirWithoutHome(t *testing.T) {
 	}
 	if got := fileCfg.APIBaseURL(); got != "https://daemon.example.com" {
 		t.Fatalf("APIBaseURL = %q, want runtime config value", got)
+	}
+}
+
+func TestUpdateCommittedCustomerConfig_RefreshesOutboundProxyRegistry(t *testing.T) {
+	config.ResetGlobalConfigForTest()
+	config.ResetEffectiveConfigCommitCoordinatorForTest()
+	storage.ResetSoftwareConfigDBForTest()
+	registry := outbound.GetRegistry()
+	registry.Clear()
+	t.Cleanup(func() {
+		config.ResetGlobalConfigForTest()
+		config.ResetEffectiveConfigCommitCoordinatorForTest()
+		storage.ResetSoftwareConfigDBForTest()
+		registry.Clear()
+	})
+
+	tempHome := t.TempDir()
+	t.Setenv("HOME", tempHome)
+	t.Setenv("ALIANG_CACHE_DIR", filepath.Join(tempHome, ".aliang-cache"))
+
+	baseCfg := &config.Config{
+		Core: &config.CoreConfig{APIServer: "https://api.aliang.one"},
+		Customer: &config.CustomerConfig{
+			Proxy: &config.CustomerProxyConfig{
+				Enable:   customerBoolPtr(true),
+				Type:     "socks5",
+				Server:   "182.138.136.39:27751",
+				Username: "clash",
+				Password: "old-pass",
+			},
+			ProxyRules: []string{"domains,google.com"},
+		},
+	}
+	config.SetGlobalConfig(baseCfg)
+	if err := registry.RefreshCustomerProxy(baseCfg); err != nil {
+		t.Fatalf("RefreshCustomerProxy(base) error = %v", err)
+	}
+
+	oldProxy, err := registry.Get("socks")
+	if err != nil {
+		t.Fatalf("registry.Get(\"socks\") error = %v", err)
+	}
+	if got := oldProxy.Addr(); got != "182.138.136.39:27751" {
+		t.Fatalf("old proxy addr = %q, want 182.138.136.39:27751", got)
+	}
+
+	service := NewCustomerConfigService()
+	if _, err := service.UpdateCommittedCustomerConfig([]byte(`{
+		"customer": {
+			"proxy": {
+				"enable": true,
+				"type": "http",
+				"server": "cd.liangsqrt.com:27750",
+				"username": "clash",
+				"password": "asd123456"
+			}
+		}
+	}`)); err != nil {
+		t.Fatalf("UpdateCommittedCustomerConfig() error = %v", err)
+	}
+
+	if _, err := registry.Get("socks"); err == nil {
+		t.Fatal("registry.Get(\"socks\") error = nil, want stale socks proxy removed")
+	}
+	httpProxy, err := registry.Get("http")
+	if err != nil {
+		t.Fatalf("registry.Get(\"http\") error = %v", err)
+	}
+	if got := httpProxy.Addr(); got != "cd.liangsqrt.com:27750" {
+		t.Fatalf("http proxy addr = %q, want cd.liangsqrt.com:27750", got)
 	}
 }
 

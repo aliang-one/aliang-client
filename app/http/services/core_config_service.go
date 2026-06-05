@@ -10,6 +10,7 @@ import (
 
 	"aliang.one/nursorgate/app/http/models"
 	"aliang.one/nursorgate/app/http/storage"
+	"aliang.one/nursorgate/outbound"
 	"aliang.one/nursorgate/processor/config"
 )
 
@@ -148,6 +149,9 @@ func (s *CoreConfigService) UpdateCommittedCoreConfig(payload []byte) (*CoreConf
 				return fmt.Errorf("decode snapshot content for memory commit: %w", err)
 			}
 			config.SetGlobalConfig(&committedCfg)
+			if err := outbound.GetRegistry().RefreshAliang(committedCfg.EffectiveAliangCoreServer()); err != nil {
+				return fmt.Errorf("refresh aliang registry: %w", err)
+			}
 			return nil
 		},
 	)

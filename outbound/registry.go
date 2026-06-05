@@ -2,6 +2,7 @@ package outbound
 
 import (
 	"fmt"
+	"net"
 	"sync"
 
 	"aliang.one/nursorgate/common/logger"
@@ -52,13 +53,18 @@ func (r *Registry) RegisterDefault() error {
 
 // RegisterAliang 注册默认的 aliang 代理
 func (r *Registry) RegisterAliang(serverAddr string) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
+	r.mu.RLock()
 	if _, exists := r.proxies["aliang"]; exists {
+		r.mu.RUnlock()
 		return nil
 	}
+	r.mu.RUnlock()
 
+	return r.RefreshAliang(serverAddr)
+}
+
+// RefreshAliang rebuilds the Aliang outbound entry from the latest core config.
+func (r *Registry) RefreshAliang(serverAddr string) error {
 	if serverAddr == "" {
 		serverAddr = "ai-gateway.aliang.one:443"
 		logger.Debug("Using default aliang server address")
@@ -70,8 +76,13 @@ func (r *Registry) RegisterAliang(serverAddr string) error {
 		return fmt.Errorf("failed to create aliang proxy: %w", err)
 	}
 
+	r.mu.Lock()
+	oldProxy := r.proxies["aliang"]
 	r.proxies["aliang"] = aliangProxy
-	logger.Debug(fmt.Sprintf("Default aliang proxy registered (server: %s)", serverAddr))
+	r.mu.Unlock()
+
+	closeProxyIfSupported(oldProxy)
+	logger.Debug(fmt.Sprintf("Aliang proxy refreshed (server: %s)", serverAddr))
 	return nil
 }
 
@@ -89,6 +100,61 @@ func CreateHTTPProxy(addr, username, password string) (proxy.Proxy, error) {
 		return nil, fmt.Errorf("http proxy addr cannot be empty")
 	}
 	return httpproxy.NewHTTP(addr, username, password)
+}
+
+// RefreshCustomerProxy rebuilds the runtime customer proxy entries from config.
+// It removes stale SOCKS/HTTP entries first so type/address/auth changes take
+// effect immediately after a customer config commit.
+func (r *Registry) RefreshCustomerProxy(cfg *proxyConfig.Config) error {
+	customerProxy, err := cfg.EffectiveCustomerProxy()
+	if err != nil {
+		return fmt.Errorf("invalid customer proxy config: %w", err)
+	}
+
+	r.UnregisterCustomerProxies()
+	if customerProxy == nil {
+		logger.Debug("No customer proxy configured")
+		return nil
+	}
+
+	switch proxyCfg := customerProxy.(type) {
+	case *proxyConfig.Socks5Config:
+		if err := proxyCfg.Validate(); err != nil {
+			return fmt.Errorf("invalid socks proxy config: %w", err)
+		}
+
+		addr := net.JoinHostPort(proxyCfg.Server, fmt.Sprintf("%d", proxyCfg.ServerPort))
+		socksProxy, err := CreateSocksProxy(addr, proxyCfg.Username, proxyCfg.Password)
+		if err != nil {
+			return fmt.Errorf("failed to create socks proxy: %w", err)
+		}
+
+		if err := r.Register("socks", socksProxy); err != nil {
+			return fmt.Errorf("failed to register socks proxy: %w", err)
+		}
+
+		logger.Debug(fmt.Sprintf("SOCKS proxy registered at %s", addr))
+	case *proxyConfig.HTTPProxyConfig:
+		if err := proxyCfg.Validate(); err != nil {
+			return fmt.Errorf("invalid http proxy config: %w", err)
+		}
+
+		addr := net.JoinHostPort(proxyCfg.Server, fmt.Sprintf("%d", proxyCfg.ServerPort))
+		httpProxy, err := CreateHTTPProxy(addr, proxyCfg.Username, proxyCfg.Password)
+		if err != nil {
+			return fmt.Errorf("failed to create http proxy: %w", err)
+		}
+
+		if err := r.Register("http", httpProxy); err != nil {
+			return fmt.Errorf("failed to register http proxy: %w", err)
+		}
+
+		logger.Debug(fmt.Sprintf("HTTP proxy registered at %s", addr))
+	default:
+		return fmt.Errorf("unsupported customer proxy config type %T", customerProxy)
+	}
+
+	return nil
 }
 
 // Register 注册一个代理实例
@@ -125,6 +191,27 @@ func (r *Registry) Unregister(name string) error {
 	delete(r.proxies, name)
 	logger.Debug(fmt.Sprintf("Proxy '%s' unregistered", name))
 	return nil
+}
+
+// UnregisterCustomerProxies removes the dynamic customer proxy entries.
+func (r *Registry) UnregisterCustomerProxies() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	delete(r.proxies, "socks")
+	delete(r.proxies, "http")
+	logger.Debug("Customer proxy entries unregistered")
+}
+
+func closeProxyIfSupported(p proxy.Proxy) {
+	if p == nil {
+		return
+	}
+	if closeable, ok := p.(interface{ Close() error }); ok {
+		if err := closeable.Close(); err != nil {
+			logger.Warn(fmt.Sprintf("failed to close replaced proxy %s: %v", p.Addr(), err))
+		}
+	}
 }
 
 // Get 根据名称获取代理实例

@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
-	"net"
 	"os"
 
 	"aliang.one/nursorgate/app/http/storage"
@@ -283,7 +282,7 @@ func registerBuiltinProxies(cfg *Config) error {
 	// 2. 注册 aliang 代理
 	coreServer := cfg.EffectiveAliangCoreServer()
 
-	if err := registry.RegisterAliang(coreServer); err != nil {
+	if err := registry.RefreshAliang(coreServer); err != nil {
 		return fmt.Errorf("failed to register aliang proxy: %w", err)
 	}
 
@@ -292,55 +291,7 @@ func registerBuiltinProxies(cfg *Config) error {
 
 // registerCustomerProxy registers the optional customer proxy.
 func registerCustomerProxy(cfg *config.Config) error {
-	customerProxy, err := cfg.EffectiveCustomerProxy()
-	if err != nil {
-		return fmt.Errorf("invalid customer proxy config: %w", err)
-	}
-	if customerProxy == nil {
-		logger.Debug("No customer proxy configured")
-		return nil
-	}
-
-	proxyInstance := outbound.GetRegistry()
-
-	switch proxyCfg := customerProxy.(type) {
-	case *config.Socks5Config:
-		if err := proxyCfg.Validate(); err != nil {
-			return fmt.Errorf("invalid socks proxy config: %w", err)
-		}
-
-		addr := net.JoinHostPort(proxyCfg.Server, fmt.Sprintf("%d", proxyCfg.ServerPort))
-		socksProxy, err := outbound.CreateSocksProxy(addr, proxyCfg.Username, proxyCfg.Password)
-		if err != nil {
-			return fmt.Errorf("failed to create socks proxy: %w", err)
-		}
-
-		if err := proxyInstance.Register("socks", socksProxy); err != nil {
-			return fmt.Errorf("failed to register socks proxy: %w", err)
-		}
-
-		logger.Debug(fmt.Sprintf("SOCKS proxy registered at %s", addr))
-	case *config.HTTPProxyConfig:
-		if err := proxyCfg.Validate(); err != nil {
-			return fmt.Errorf("invalid http proxy config: %w", err)
-		}
-
-		addr := net.JoinHostPort(proxyCfg.Server, fmt.Sprintf("%d", proxyCfg.ServerPort))
-		httpProxy, err := outbound.CreateHTTPProxy(addr, proxyCfg.Username, proxyCfg.Password)
-		if err != nil {
-			return fmt.Errorf("failed to create http proxy: %w", err)
-		}
-
-		if err := proxyInstance.Register("http", httpProxy); err != nil {
-			return fmt.Errorf("failed to register http proxy: %w", err)
-		}
-
-		logger.Debug(fmt.Sprintf("HTTP proxy registered at %s", addr))
-	default:
-		return fmt.Errorf("unsupported customer proxy config type %T", customerProxy)
-	}
-
-	return nil
+	return outbound.GetRegistry().RefreshCustomerProxy(cfg)
 }
 
 // LoadAndApplyConfig 加载并应用配置文件

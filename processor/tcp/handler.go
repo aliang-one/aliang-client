@@ -1196,17 +1196,22 @@ func (h *TCPConnectionHandler) getAliangProxyForExecution() (outboundproxy.Proxy
 
 func (h *TCPConnectionHandler) getToSocksProxyForExecution() (outboundproxy.Proxy, string, error) {
 	canonical := config.GetRoutingApplyStore().ActiveCanonicalSchema()
-	upstreamType := toSocksUpstreamTypeSocks
+	upstreamType, upstreamConfigured := currentCustomerProxyUpstreamType()
 
 	if canonical != nil {
-		if !canonical.Egress.ToSocks.Enabled {
+		if !canonical.Egress.ToSocks.Enabled && !upstreamConfigured {
 			return nil, "", newBranchDenyError(toSocksBranchName, DenyReasonToSocksDisabled, nil)
 		}
 
-		upstreamType = canonical.Egress.ToSocks.Upstream.Type
+		if !upstreamConfigured {
+			upstreamType = canonical.Egress.ToSocks.Upstream.Type
+		}
 		if upstreamType == "" {
 			return nil, "", newBranchDenyError(toSocksBranchName, DenyReasonToSocksMisconfigured, nil)
 		}
+	}
+	if upstreamType == "" {
+		return nil, "", newBranchDenyError(toSocksBranchName, DenyReasonToSocksMisconfigured, nil)
 	}
 
 	proxyName := ""
@@ -1229,4 +1234,20 @@ func (h *TCPConnectionHandler) getToSocksProxyForExecution() (outboundproxy.Prox
 	}
 
 	return socksProxy, upstreamType, nil
+}
+
+func currentCustomerProxyUpstreamType() (string, bool) {
+	cfg := config.GetGlobalConfig()
+	if cfg == nil || cfg.Customer == nil || cfg.Customer.Proxy == nil || !cfg.Customer.Proxy.IsEnabled() {
+		return "", false
+	}
+
+	switch strings.ToLower(strings.TrimSpace(cfg.Customer.Proxy.Type)) {
+	case "http":
+		return toSocksUpstreamTypeHTTP, true
+	case "socks5":
+		return toSocksUpstreamTypeSocks, true
+	default:
+		return "", false
+	}
 }
