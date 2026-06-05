@@ -3,6 +3,7 @@ package routing
 import (
 	"fmt"
 	"net/netip"
+	"strings"
 
 	"aliang.one/nursorgate/common/logger"
 	"aliang.one/nursorgate/common/model"
@@ -206,6 +207,7 @@ func checkRule(rule *model.RoutingRule, ctx *MatchContext) bool {
 // T030: matchDomain checks if a domain matches a pattern (supports wildcards)
 // Examples:
 // - "example.com" matches "example.com"
+// - "example.com" matches "www.example.com", "mail.example.com", etc.
 // - "*.example.com" matches "www.example.com", "mail.example.com", etc.
 // - "*.example.com" does NOT match "example.com"
 func matchDomain(pattern, domain string) bool {
@@ -215,6 +217,12 @@ func matchDomain(pattern, domain string) bool {
 
 	// Exact match
 	if pattern == domain {
+		return true
+	}
+
+	// Plain domain rules are treated as suffix rules for customer-facing
+	// entries like "domains,google.com".
+	if strings.HasSuffix(domain, "."+pattern) {
 		return true
 	}
 

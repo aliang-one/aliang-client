@@ -112,3 +112,37 @@ func TestRuntimeSnapshot_CustomerProxyRulesMatchWhenAIRuleDisabled(t *testing.T)
 		t.Fatalf("decision = %s, want %s", decision, RouteToSocks)
 	}
 }
+
+func TestRuntimeSnapshot_CustomerProxyPlainDomainRuleMatchesSubdomains(t *testing.T) {
+	cfg := &config.Config{
+		Customer: &config.CustomerConfig{
+			Proxy: &config.CustomerProxyConfig{
+				Type:   "socks5",
+				Server: "182.138.136.39:27751",
+			},
+			ProxyRules: []string{"domains,google.com"},
+		},
+	}
+
+	snapshot, err := CompileRuntimeSnapshotFromRuntimeInputs(cfg, model.RulesSettings{
+		AliangEnabled: true,
+		SocksEnabled:  true,
+	})
+	if err != nil {
+		t.Fatalf("CompileRuntimeSnapshotFromRuntimeInputs() error = %v", err)
+	}
+
+	for _, domain := range []string{
+		"google.com",
+		"www.google.com",
+		"ogads-pa.clients6.google.com",
+	} {
+		decision, err := DecideRouteFromSnapshot(snapshot, &MatchContext{Domain: domain})
+		if err != nil {
+			t.Fatalf("DecideRouteFromSnapshot(%q) error = %v", domain, err)
+		}
+		if decision != RouteToSocks {
+			t.Fatalf("decision for %q = %s, want %s", domain, decision, RouteToSocks)
+		}
+	}
+}

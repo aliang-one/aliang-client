@@ -5,6 +5,7 @@ import "strings"
 // MatchDomain checks if a domain matches a pattern.
 // Supports:
 // - Exact match: example.com
+// - Plain suffix: example.com matches www.example.com
 // - Wildcard subdomain: *.example.com (matches a.b.example.com, not example.com)
 func MatchDomain(pattern, domain string) bool {
 	if pattern == "" || domain == "" {
@@ -15,6 +16,10 @@ func MatchDomain(pattern, domain string) bool {
 	domain = strings.ToLower(strings.TrimSpace(domain))
 
 	if pattern == domain {
+		return true
+	}
+
+	if strings.HasSuffix(domain, "."+pattern) {
 		return true
 	}
 

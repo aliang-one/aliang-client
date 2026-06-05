@@ -160,6 +160,19 @@ const (
 	RouteDirect
 )
 
+func (r ProxyRoute) String() string {
+	switch r {
+	case RouteToALiang:
+		return "RouteToALiang"
+	case RouteToLocalProxy:
+		return "RouteToLocalProxy"
+	case RouteDirect:
+		return "RouteDirect"
+	default:
+		return "RouteUnknown"
+	}
+}
+
 // Timeouts for TCP operations
 const (
 	DefaultTCPConnectTimeout = 30     // seconds
