@@ -84,6 +84,32 @@
               />
               <p v-if="serverError" class="text-xs text-red-500">{{ serverError }}</p>
             </label>
+
+            <label class="space-y-2 md:col-start-1">
+              <span class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('rules_proxyUsername') }}</span>
+              <input
+                v-model.trim="form.proxy.username"
+                :disabled="!form.proxy.enable"
+                autocomplete="username"
+                class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                :placeholder="t('rules_proxyUsernamePlaceholder')"
+                type="text"
+                @keydown.enter.prevent
+              />
+            </label>
+
+            <label class="space-y-2">
+              <span class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('rules_proxyPassword') }}</span>
+              <input
+                v-model="form.proxy.password"
+                :disabled="!form.proxy.enable"
+                autocomplete="current-password"
+                class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                :placeholder="t('rules_proxyPasswordPlaceholder')"
+                type="password"
+                @keydown.enter.prevent
+              />
+            </label>
           </div>
         </section>
 
@@ -271,7 +297,9 @@ function defaultConfig() {
     proxy: {
       enable: true,
       type: 'socks5',
-      server: ''
+      server: '',
+      username: '',
+      password: ''
     },
     ai_rules: {},
     proxy_rules: []
@@ -347,7 +375,9 @@ function normalizeConfig(config = {}) {
     proxy: {
       enable: valueOrDefaultBoolean(config?.proxy?.enable, true),
       type: config?.proxy?.type === 'http' ? 'http' : defaults.proxy.type,
-      server: typeof config?.proxy?.server === 'string' ? config.proxy.server : defaults.proxy.server
+      server: typeof config?.proxy?.server === 'string' ? config.proxy.server : defaults.proxy.server,
+      username: typeof config?.proxy?.username === 'string' ? config.proxy.username : defaults.proxy.username,
+      password: typeof config?.proxy?.password === 'string' ? config.proxy.password : defaults.proxy.password
     },
     ai_rules: normalizeAiRules(config?.ai_rules),
     proxy_rules: normalizeProxyRules(config?.proxy_rules)
@@ -371,18 +401,54 @@ function mergeProviderOrder(configuredKeys, presetProviders) {
   return ordered;
 }
 
-const SERVER_RE = /^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}|\[[\da-fA-F:]+\]):(\d{1,5})$/;
+const HOST_PORT_RE = /^(.+):(\d{1,5})$/;
+const DOMAIN_RE = /^(?=.{1,253}$)([a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)*[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$/;
 
 function isValidServer(value, t) {
   if (!value) return '';
-  const match = value.match(SERVER_RE);
-  if (!match) return t('rules_serverError');
-  const port = Number(match[2]);
+  const parsed = parseProxyServer(value);
+  if (!parsed) return t('rules_serverError');
+  const port = Number(parsed.port);
   if (port < 1 || port > 65535) return t('rules_serverPortRange');
-  const ip = match[1];
-  if (ip.startsWith('[')) return '';
-  if (ip.split('.').every((o) => Number(o) >= 0 && Number(o) <= 255)) return '';
-  return t('rules_serverIpInvalid');
+  if (isValidHost(parsed.host)) return '';
+  return t('rules_serverHostInvalid');
+}
+
+function parseProxyServer(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return null;
+
+  if (/^[a-zA-Z][a-zA-Z\d+\-.]*:\/\//.test(raw) || raw.startsWith('//') || raw.includes('@')) {
+    try {
+      const urlValue = raw.includes('@') && !raw.includes('://') && !raw.startsWith('//')
+        ? `proxy://${raw}`
+        : raw;
+      const parsed = new URL(urlValue);
+      if (!parsed.hostname || !parsed.port) return null;
+      return { host: parsed.hostname, port: parsed.port };
+    } catch {
+      return null;
+    }
+  }
+
+  if (raw.startsWith('[')) {
+    const end = raw.indexOf(']');
+    if (end <= 1 || raw[end + 1] !== ':') return null;
+    return { host: raw.slice(1, end), port: raw.slice(end + 2) };
+  }
+
+  const match = raw.match(HOST_PORT_RE);
+  if (!match) return null;
+  return { host: match[1], port: match[2] };
+}
+
+function isValidHost(host) {
+  if (!host) return false;
+  if (/^[\da-fA-F:]+$/.test(host) && host.includes(':')) return true;
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) {
+    return host.split('.').every((o) => Number(o) >= 0 && Number(o) <= 255);
+  }
+  return DOMAIN_RE.test(host);
 }
 
 function valueOrDefaultBoolean(value, defaultValue) {

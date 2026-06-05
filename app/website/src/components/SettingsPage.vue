@@ -202,7 +202,9 @@ function createDefaultCustomerConfig() {
     proxy: {
       enable: true,
       type: 'socks5',
-      server: ''
+      server: '',
+      username: '',
+      password: ''
     },
     ai_rules: {},
     proxy_rules: []
@@ -239,7 +241,9 @@ function normalizeCustomerConfig(payload = {}) {
     proxy: {
       enable: typeof payload?.proxy?.enable === 'boolean' ? payload.proxy.enable : defaults.proxy.enable,
       type: payload?.proxy?.type === 'http' ? 'http' : defaults.proxy.type,
-      server: typeof payload?.proxy?.server === 'string' ? payload.proxy.server : defaults.proxy.server
+      server: typeof payload?.proxy?.server === 'string' ? payload.proxy.server : defaults.proxy.server,
+      username: typeof payload?.proxy?.username === 'string' ? payload.proxy.username : defaults.proxy.username,
+      password: typeof payload?.proxy?.password === 'string' ? payload.proxy.password : defaults.proxy.password
     },
     ai_rules: normalizeAiRules(payload?.ai_rules),
     proxy_rules: normalizeProxyRules(payload?.proxy_rules)
@@ -262,7 +266,20 @@ function areArraysEqual(left = [], right = []) {
 }
 
 function buildCustomerConfigPatch(nextConfig, currentConfig) {
-  return buildConfigPatch(normalizeCustomerConfig(nextConfig), normalizeCustomerConfig(currentConfig));
+  const normalizedNext = normalizeCustomerConfig(nextConfig);
+  const normalizedCurrent = normalizeCustomerConfig(currentConfig);
+  const patch = buildConfigPatch(normalizedNext, normalizedCurrent) || {};
+
+  for (const key of ['username', 'password']) {
+    const nextValue = String(normalizedNext.proxy?.[key] ?? '');
+    const currentValue = String(normalizedCurrent.proxy?.[key] ?? '');
+    if (!nextValue && currentValue) {
+      patch.proxy = isPlainObject(patch.proxy) ? patch.proxy : {};
+      patch.proxy[key] = '';
+    }
+  }
+
+  return Object.keys(patch).length ? patch : undefined;
 }
 
 function buildConfigPatch(nextValue, currentValue) {

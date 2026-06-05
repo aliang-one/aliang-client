@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"net"
 	"os"
 
 	"aliang.one/nursorgate/app/http/storage"
@@ -308,7 +309,7 @@ func registerCustomerProxy(cfg *config.Config) error {
 			return fmt.Errorf("invalid socks proxy config: %w", err)
 		}
 
-		addr := fmt.Sprintf("%s:%d", proxyCfg.Server, proxyCfg.ServerPort)
+		addr := net.JoinHostPort(proxyCfg.Server, fmt.Sprintf("%d", proxyCfg.ServerPort))
 		socksProxy, err := outbound.CreateSocksProxy(addr, proxyCfg.Username, proxyCfg.Password)
 		if err != nil {
 			return fmt.Errorf("failed to create socks proxy: %w", err)
@@ -324,7 +325,7 @@ func registerCustomerProxy(cfg *config.Config) error {
 			return fmt.Errorf("invalid http proxy config: %w", err)
 		}
 
-		addr := fmt.Sprintf("%s:%d", proxyCfg.Server, proxyCfg.ServerPort)
+		addr := net.JoinHostPort(proxyCfg.Server, fmt.Sprintf("%d", proxyCfg.ServerPort))
 		httpProxy, err := outbound.CreateHTTPProxy(addr, proxyCfg.Username, proxyCfg.Password)
 		if err != nil {
 			return fmt.Errorf("failed to create http proxy: %w", err)

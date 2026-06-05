@@ -438,6 +438,125 @@ func TestConfigValidate_CustomerProxyTypeAcceptsHTTP(t *testing.T) {
 	}
 }
 
+func TestConfigValidate_CustomerProxyAcceptsDomainServer(t *testing.T) {
+	payload := []byte(`{
+		"core": {"api_server": "https://api.aliang.one"},
+		"customer": {
+			"proxy": {
+				"type": "socks5",
+				"server": "cd.liangsqrt.com:27750"
+			}
+		}
+	}`)
+
+	var cfg Config
+	if err := json.Unmarshal(payload, &cfg); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v, want nil for domain host", err)
+	}
+
+	socksCfg, err := cfg.EffectiveSocksProxy()
+	if err != nil {
+		t.Fatalf("EffectiveSocksProxy() error = %v", err)
+	}
+	if socksCfg == nil {
+		t.Fatal("EffectiveSocksProxy() = nil, want derived socks config")
+	}
+	if socksCfg.Server != "cd.liangsqrt.com" || socksCfg.ServerPort != 27750 {
+		t.Fatalf("EffectiveSocksProxy() = %#v, want cd.liangsqrt.com:27750", socksCfg)
+	}
+}
+
+func TestConfigValidate_CustomerProxyParsesAuthFromURLServer(t *testing.T) {
+	payload := []byte(`{
+		"core": {"api_server": "https://api.aliang.one"},
+		"customer": {
+			"proxy": {
+				"type": "http",
+				"server": "http://user:pass@cd.liangsqrt.com:27750"
+			}
+		}
+	}`)
+
+	var cfg Config
+	if err := json.Unmarshal(payload, &cfg); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v, want nil for URL proxy server", err)
+	}
+
+	httpCfg, err := cfg.EffectiveHTTPProxy()
+	if err != nil {
+		t.Fatalf("EffectiveHTTPProxy() error = %v", err)
+	}
+	if httpCfg == nil {
+		t.Fatal("EffectiveHTTPProxy() = nil, want derived http config")
+	}
+	if httpCfg.Server != "cd.liangsqrt.com" || httpCfg.ServerPort != 27750 {
+		t.Fatalf("EffectiveHTTPProxy() = %#v, want cd.liangsqrt.com:27750", httpCfg)
+	}
+	if httpCfg.Username != "user" || httpCfg.Password != "pass" {
+		t.Fatalf("EffectiveHTTPProxy() auth = %q/%q, want user/pass", httpCfg.Username, httpCfg.Password)
+	}
+}
+
+func TestConfigValidate_CustomerProxyExplicitAuthOverridesURLAuth(t *testing.T) {
+	payload := []byte(`{
+		"core": {"api_server": "https://api.aliang.one"},
+		"customer": {
+			"proxy": {
+				"type": "socks5",
+				"server": "socks5://url-user:url-pass@cd.liangsqrt.com:27750",
+				"username": "field-user",
+				"password": "field-pass"
+			}
+		}
+	}`)
+
+	var cfg Config
+	if err := json.Unmarshal(payload, &cfg); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+
+	socksCfg, err := cfg.EffectiveSocksProxy()
+	if err != nil {
+		t.Fatalf("EffectiveSocksProxy() error = %v", err)
+	}
+	if socksCfg.Username != "field-user" || socksCfg.Password != "field-pass" {
+		t.Fatalf("EffectiveSocksProxy() auth = %q/%q, want field-user/field-pass", socksCfg.Username, socksCfg.Password)
+	}
+}
+
+func TestConfigValidate_CustomerProxyRejectsMismatchedURLScheme(t *testing.T) {
+	payload := []byte(`{
+		"core": {"api_server": "https://api.aliang.one"},
+		"customer": {
+			"proxy": {
+				"type": "http",
+				"server": "socks5://user:pass@cd.liangsqrt.com:27750"
+			}
+		}
+	}`)
+
+	var cfg Config
+	if err := json.Unmarshal(payload, &cfg); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate() error = nil, want scheme mismatch error")
+	}
+	if !strings.Contains(err.Error(), "scheme") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestConfigValidate_CustomerHTTPProxyRequiresServer(t *testing.T) {
 	payload := []byte(`{
 		"core": {"api_server": "https://api.aliang.one"},

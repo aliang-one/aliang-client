@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -711,6 +712,78 @@ func parseHostPort(server string) (string, uint16, error) {
 	return host, uint16(port), nil
 }
 
+func parseCustomerProxyServer(proxyType, server, username, password string) (string, uint16, string, string, error) {
+	raw := strings.TrimSpace(server)
+	if raw == "" {
+		return "", 0, "", "", fmt.Errorf("server is required")
+	}
+
+	address := raw
+	urlUsername := ""
+	urlPassword := ""
+	urlLike := strings.Contains(raw, "://") || strings.HasPrefix(raw, "//") || strings.Contains(raw, "@")
+
+	if urlLike {
+		parseRaw := raw
+		if strings.Contains(raw, "@") && !strings.Contains(raw, "://") && !strings.HasPrefix(raw, "//") {
+			parseRaw = "proxy://" + raw
+		}
+		parsed, err := url.Parse(parseRaw)
+		if err != nil {
+			return "", 0, "", "", fmt.Errorf("invalid proxy URL %q: %w", server, err)
+		}
+		if parsed.Scheme != "" && parsed.Scheme != "proxy" {
+			if err := validateCustomerProxyScheme(proxyType, parsed.Scheme); err != nil {
+				return "", 0, "", "", err
+			}
+		}
+		if parsed.Host == "" {
+			return "", 0, "", "", fmt.Errorf("proxy URL must include host:port")
+		}
+		address = parsed.Host
+		if parsed.User != nil {
+			urlUsername = parsed.User.Username()
+			if pass, ok := parsed.User.Password(); ok {
+				urlPassword = pass
+			}
+		}
+	}
+
+	host, port, err := parseHostPort(address)
+	if err != nil {
+		return "", 0, "", "", err
+	}
+
+	effectiveUsername := strings.TrimSpace(urlUsername)
+	effectivePassword := urlPassword
+	if strings.TrimSpace(username) != "" {
+		effectiveUsername = strings.TrimSpace(username)
+	}
+	if password != "" {
+		effectivePassword = password
+	}
+
+	return host, port, effectiveUsername, effectivePassword, nil
+}
+
+func validateCustomerProxyScheme(proxyType, scheme string) error {
+	normalizedType := strings.ToLower(strings.TrimSpace(proxyType))
+	normalizedScheme := strings.ToLower(strings.TrimSpace(scheme))
+
+	switch normalizedType {
+	case "http":
+		if normalizedScheme != "http" {
+			return fmt.Errorf("customer.proxy.server scheme %q does not match proxy type %q", scheme, proxyType)
+		}
+	case "socks5":
+		if normalizedScheme != "socks5" && normalizedScheme != "socks" {
+			return fmt.Errorf("customer.proxy.server scheme %q does not match proxy type %q", scheme, proxyType)
+		}
+	}
+
+	return nil
+}
+
 func (c *Config) APIBaseURL() string {
 	if c == nil || c.Core == nil {
 		return ""
@@ -743,7 +816,12 @@ func (c *Config) EffectiveSocksProxy() (*Socks5Config, error) {
 		return nil, nil
 	}
 
-	serverHost, serverPort, err := parseHostPort(c.Customer.Proxy.Server)
+	serverHost, serverPort, username, password, err := parseCustomerProxyServer(
+		"socks5",
+		c.Customer.Proxy.Server,
+		c.Customer.Proxy.Username,
+		c.Customer.Proxy.Password,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("customer.proxy.server: %w", err)
 	}
@@ -751,8 +829,8 @@ func (c *Config) EffectiveSocksProxy() (*Socks5Config, error) {
 	return &Socks5Config{
 		Server:     serverHost,
 		ServerPort: serverPort,
-		Username:   c.Customer.Proxy.Username,
-		Password:   c.Customer.Proxy.Password,
+		Username:   username,
+		Password:   password,
 	}, nil
 }
 
@@ -767,7 +845,12 @@ func (c *Config) EffectiveHTTPProxy() (*HTTPProxyConfig, error) {
 		return nil, nil
 	}
 
-	serverHost, serverPort, err := parseHostPort(c.Customer.Proxy.Server)
+	serverHost, serverPort, username, password, err := parseCustomerProxyServer(
+		"http",
+		c.Customer.Proxy.Server,
+		c.Customer.Proxy.Username,
+		c.Customer.Proxy.Password,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("customer.proxy.server: %w", err)
 	}
@@ -775,8 +858,8 @@ func (c *Config) EffectiveHTTPProxy() (*HTTPProxyConfig, error) {
 	return &HTTPProxyConfig{
 		Server:     serverHost,
 		ServerPort: serverPort,
-		Username:   c.Customer.Proxy.Username,
-		Password:   c.Customer.Proxy.Password,
+		Username:   username,
+		Password:   password,
 	}, nil
 }
 
