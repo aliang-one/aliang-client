@@ -340,10 +340,12 @@ func configureWindowsTunRoute() error {
 		UpdateStartupProgress("starting", "requesting_permission", 88, "Requesting Windows administrator permission to configure TUN routes.", "", true)
 	}
 
-	// 删除现有默认路由
+	// 删除现有 TUN 半默认路由。兼容旧版本错误使用 10.0.0.1 作为下一跳的残留路由。
 	commands := [][]string{
 		{"route", "delete", "0.0.0.0", "mask", "128.0.0.0", "10.0.0.1", "if", strconv.Itoa(tunIfIndex)},
 		{"route", "delete", "128.0.0.0", "mask", "128.0.0.0", "10.0.0.1", "if", strconv.Itoa(tunIfIndex)},
+		{"route", "delete", "0.0.0.0", "mask", "128.0.0.0", "10.0.0.2", "if", strconv.Itoa(tunIfIndex)},
+		{"route", "delete", "128.0.0.0", "mask", "128.0.0.0", "10.0.0.2", "if", strconv.Itoa(tunIfIndex)},
 	}
 
 	for _, cmd := range commands {
@@ -354,9 +356,8 @@ func configureWindowsTunRoute() error {
 
 	// 添加新的路由
 	commands = [][]string{
-		{"route", "add", "0.0.0.0", "mask", "128.0.0.0", "10.0.0.1", "metric", "1", "if", strconv.Itoa(tunIfIndex)},
-		{"route", "add", "128.0.0.0", "mask", "128.0.0.0", "10.0.0.1", "metric", "1", "if", strconv.Itoa(tunIfIndex)},
-		// 添加回原默认网关的路由，但优先级较低
+		{"route", "add", "0.0.0.0", "mask", "128.0.0.0", "10.0.0.2", "metric", "1", "if", strconv.Itoa(tunIfIndex)},
+		{"route", "add", "128.0.0.0", "mask", "128.0.0.0", "10.0.0.2", "metric", "1", "if", strconv.Itoa(tunIfIndex)},
 	}
 
 	for _, cmd := range commands {

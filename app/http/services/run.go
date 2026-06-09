@@ -14,7 +14,6 @@ import (
 	"aliang.one/nursorgate/common/logger"
 	model "aliang.one/nursorgate/common/model"
 	httpServer "aliang.one/nursorgate/inbound/http"
-	tun "aliang.one/nursorgate/inbound/tun/engine"
 	runner2 "aliang.one/nursorgate/inbound/tun/runner"
 	"aliang.one/nursorgate/outbound"
 	"aliang.one/nursorgate/processor/config"
@@ -28,7 +27,7 @@ var (
 	tunStartRunner               = defaultStartTUN
 	httpStartRunner              = httpServer.StartMitmHttp
 	httpStopRunner               = httpServer.StopHttpProxy
-	tunStopRunner                = tun.Stop
+	tunStopRunner                = runner2.Stop
 	runModeStoreFactory          = func() runModeSnapshotStore { return storage.NewSoftwareConfigStore() }
 	aliangLinkStatusResolver     = resolveAliangLinkStatus
 	softwareUpdateStatusResolver = func() models.SoftwareVersionUpdateFrontendStatus {

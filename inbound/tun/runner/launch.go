@@ -10,6 +10,7 @@ import (
 
 	"aliang.one/nursorgate/common/logger"
 	httpServer "aliang.one/nursorgate/inbound/http"
+	"aliang.one/nursorgate/inbound/tun/engine"
 	utils2 "aliang.one/nursorgate/inbound/tun/runner/utils"
 	"aliang.one/nursorgate/processor/config"
 )
@@ -29,11 +30,15 @@ func stopTun() {
 		logger.Error("Failed to cleanup TUN route:", err)
 	}
 
-	// 3. 关闭 TUN 接口
+	// 3. 停止 TUN engine
+	logger.Info("Stopping TUN engine...")
+	engine.Stop()
+
+	// 4. 关闭 TUN 接口
 	if err := CleanupTunInterface(defaultConfig.Device); err != nil {
 		logger.Error("Failed to cleanup TUN interface:", err)
 	}
-	// 4. 恢复默认网关
+	// 5. 恢复默认网关
 	if err := SetDefaultGateway(defaultGateway); err != nil {
 		logger.Error("Failed to set default gateway:", err)
 	}
@@ -50,6 +55,8 @@ func CleanupTunRoute() error {
 		routes = [][]string{
 			{"route", "DELETE", "0.0.0.0", "MASK", "128.0.0.0", "10.0.0.1"},
 			{"route", "DELETE", "128.0.0.0", "MASK", "128.0.0.0", "10.0.0.1"},
+			{"route", "DELETE", "0.0.0.0", "MASK", "128.0.0.0", "10.0.0.2"},
+			{"route", "DELETE", "128.0.0.0", "MASK", "128.0.0.0", "10.0.0.2"},
 		}
 	case "linux":
 		routes = [][]string{
