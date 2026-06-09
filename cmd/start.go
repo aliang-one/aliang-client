@@ -7,6 +7,7 @@ import (
 	"strings"
 	"syscall"
 
+	"aliang.one/nursorgate/app/agentruntime"
 	httpServer "aliang.one/nursorgate/app/http"
 	"aliang.one/nursorgate/app/http/storage"
 	"aliang.one/nursorgate/common/logger"
@@ -118,6 +119,10 @@ func runStart(cmd *cobra.Command, args []string) error {
 	// HTTP server always starts, but API requests are gated by startup status middleware
 	if err := httpServer.StartHttpServer(); err != nil {
 		return fmt.Errorf("failed to start HTTP server: %w", err)
+	}
+
+	if err := agentruntime.EnsureStarted(); err != nil {
+		logger.Warn(fmt.Sprintf("Failed to start user agent runtime: %v", err))
 	}
 
 	// 等待信号并优雅关闭

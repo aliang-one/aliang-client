@@ -20,7 +20,8 @@
             "type": "aliang",
             "core_server": "15.nat0.cn:16749"
         },
-        "api_server": "https://backend.aliang.one"
+        "api_server": "https://backend.aliang.one",
+        "agent_server": "http://localhost:5174"
     },
     "customer": {
         "proxy": {

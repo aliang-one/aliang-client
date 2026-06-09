@@ -137,6 +137,7 @@
 
           <aside class="flex flex-col gap-6 lg:col-span-4">
             <SystemSettings v-if="isAuthenticated" />
+            <AgentSettings v-if="isAuthenticated" />
           </aside>
         </div>
 
@@ -192,6 +193,7 @@ import RulesSettings from './settings/RulesSettings.vue';
 import UserInfoSettings from './settings/UserInfoSettings.vue';
 import LogsSettings from './settings/LogsSettings.vue';
 import SystemSettings from './settings/SystemSettings.vue';
+import AgentSettings from './settings/AgentSettings.vue';
 import { useNavigation } from '../composables/useNavigation';
 import { openTutorialDocs } from '../composables/useTutorialDocs';
 import { useAuthStore } from '../stores/auth';
@@ -320,7 +322,8 @@ export default {
     RulesSettings,
     UserInfoSettings,
     LogsSettings,
-    SystemSettings
+    SystemSettings,
+    AgentSettings
   },
   setup() {
     const { currentPage, showPage, showDashboard } = useNavigation();

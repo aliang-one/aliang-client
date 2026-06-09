@@ -601,45 +601,28 @@ func applyIngressModeToSnapshot(mode models.RunMode) error {
 
 func bootstrapCanonicalRoutingSchema(mode models.RunMode) *config.CanonicalRoutingSchema {
 	globalCfg := config.GetGlobalConfig()
-	upstreamType := "socks"
-	toSocksEnabled := false
-	if globalCfg != nil && globalCfg.Customer != nil && globalCfg.Customer.Proxy != nil {
-		proxyType := strings.ToLower(strings.TrimSpace(globalCfg.Customer.Proxy.Type))
-		if proxyType == "http" || proxyType == "socks5" {
-			toSocksEnabled = strings.TrimSpace(globalCfg.Customer.Proxy.Server) != ""
-			if proxyType == "http" {
-				upstreamType = "http"
-			}
+	if globalCfg != nil {
+		canonical, err := routing.CompileCanonicalRoutingFromRuntimeInputs(globalCfg, model.RulesSettings{
+			AliangEnabled: true,
+			SocksEnabled:  true,
+		})
+		if err == nil && canonical != nil {
+			canonical.Ingress.Mode = string(mode)
+			return canonical
 		}
+		logger.Warn(fmt.Sprintf("Failed to bootstrap routing schema from runtime config, using minimal schema: %v", err))
 	}
 
-	canonical := &config.CanonicalRoutingSchema{
+	return &config.CanonicalRoutingSchema{
 		Version: config.CanonicalRoutingSchemaVersion,
 		Ingress: config.CanonicalIngressConfig{Mode: string(mode)},
 		Egress: config.CanonicalEgressConfig{
 			Direct:   config.CanonicalEgressBranch{Enabled: true},
 			ToAliang: config.CanonicalEgressBranch{Enabled: true},
-			ToSocks: config.CanonicalSocksEgressBranch{
-				Enabled:  toSocksEnabled,
-				Upstream: config.CanonicalSocksUpstream{Type: upstreamType},
-			},
+			ToSocks:  config.CanonicalSocksEgressBranch{Enabled: false},
 		},
 		Routing: config.CanonicalRoutingConfig{Rules: []config.CanonicalRoutingRule{}},
 	}
-
-	if globalCfg != nil {
-		if snapshot, err := routing.CompileRuntimeSnapshotFromRuntimeInputs(globalCfg, model.RulesSettings{
-			AliangEnabled: true,
-			SocksEnabled:  toSocksEnabled,
-		}); err == nil && snapshot != nil {
-			compiledMode := strings.ToLower(strings.TrimSpace(snapshot.IngressMode()))
-			if compiledMode == string(models.ModeHTTP) || compiledMode == string(models.ModeTUN) {
-				canonical.Ingress.Mode = string(mode)
-			}
-		}
-	}
-
-	return canonical
 }
 
 func defaultStartTUN() map[string]string {

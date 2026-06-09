@@ -268,6 +268,7 @@ type CoreConfig struct {
 	Engine       *CoreEngineConfig   `json:"engine,omitempty"`
 	AliangServer *AliangServerConfig `json:"aliangServer,omitempty"`
 	APIServer    string              `json:"api_server,omitempty"`
+	AgentServer  string              `json:"agent_server,omitempty"`
 }
 
 type CoreEngineConfig struct {
@@ -520,6 +521,36 @@ func (c *Config) GetInboundsURL() string {
 // GetRemoteConfigURL returns the complete remote configuration URL
 func (c *Config) GetRemoteConfigURL() string {
 	return fmt.Sprintf("%s/api/config", c.APIBaseURL())
+}
+
+func (c *Config) GetAgentDeviceRegisterURL() string {
+	return fmt.Sprintf("%s/api/v1/agent/devices/register", c.AgentBaseURL())
+}
+
+func (c *Config) GetAgentDeviceSyncURL(deviceID string) string {
+	return fmt.Sprintf("%s/api/v1/agent/devices/%s/sync", c.AgentBaseURL(), url.PathEscape(strings.TrimSpace(deviceID)))
+}
+
+func (c *Config) GetAgentBindStartURL() string {
+	return fmt.Sprintf("%s/api/v1/agent/bind/sessions", c.AgentBaseURL())
+}
+
+func (c *Config) GetAgentBindStatusURL(sessionID string) string {
+	return fmt.Sprintf("%s/api/v1/agent/bind/sessions/%s", c.AgentBaseURL(), url.PathEscape(strings.TrimSpace(sessionID)))
+}
+
+func (c *Config) GetAgentPairingTicketsURL() string {
+	return fmt.Sprintf("%s/api/pairing/tickets", c.AgentBaseURL())
+}
+
+func (c *Config) GetAgentPairingTicketResultURL(ticketID string, agentSecret string) string {
+	values := url.Values{}
+	values.Set("agent_secret", strings.TrimSpace(agentSecret))
+	return fmt.Sprintf("%s/api/pairing/tickets/%s/result?%s", c.AgentBaseURL(), url.PathEscape(strings.TrimSpace(ticketID)), values.Encode())
+}
+
+func (c *Config) GetAgentDevicesURL() string {
+	return fmt.Sprintf("%s/api/devices", c.AgentBaseURL())
 }
 
 // Validate validates the configuration
@@ -789,6 +820,16 @@ func (c *Config) APIBaseURL() string {
 		return ""
 	}
 	return strings.TrimSpace(c.Core.APIServer)
+}
+
+func (c *Config) AgentBaseURL() string {
+	if c == nil || c.Core == nil {
+		return ""
+	}
+	if server := strings.TrimSpace(c.Core.AgentServer); server != "" {
+		return strings.TrimRight(server, "/")
+	}
+	return DefaultAgentServerURL
 }
 
 func (c *Config) EffectiveAliangCoreServer() string {
