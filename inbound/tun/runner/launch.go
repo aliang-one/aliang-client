@@ -16,7 +16,12 @@ import (
 )
 
 var defaultConfig config.EngineConf
-var defaultGateway = "192.168.1.1"
+var defaultGateway string
+
+const (
+	tunInterfaceAddress = "10.0.0.1"
+	tunRouteGateway     = "10.0.0.2"
+)
 
 func stopTun() {
 	logger.Info("Stopping TUN service...")
@@ -53,26 +58,38 @@ func CleanupTunRoute() error {
 	switch runtime.GOOS {
 	case "windows":
 		routes = [][]string{
-			{"route", "DELETE", "0.0.0.0", "MASK", "128.0.0.0", "10.0.0.1"},
-			{"route", "DELETE", "128.0.0.0", "MASK", "128.0.0.0", "10.0.0.1"},
-			{"route", "DELETE", "0.0.0.0", "MASK", "128.0.0.0", "10.0.0.2"},
-			{"route", "DELETE", "128.0.0.0", "MASK", "128.0.0.0", "10.0.0.2"},
+			{"route", "DELETE", "0.0.0.0", "MASK", "128.0.0.0", tunRouteGateway},
+			{"route", "DELETE", "128.0.0.0", "MASK", "128.0.0.0", tunRouteGateway},
+			{"route", "DELETE", "0.0.0.0", "MASK", "128.0.0.0", tunInterfaceAddress},
+			{"route", "DELETE", "128.0.0.0", "MASK", "128.0.0.0", tunInterfaceAddress},
 		}
 	case "linux":
 		routes = [][]string{
-			{"ip", "route", "delete", "0.0.0.0/1", "via", "10.0.0.1"},
-			{"ip", "route", "delete", "128.0.0.0/1", "via", "10.0.0.1"},
+			{"ip", "route", "delete", "0.0.0.0/1", "via", tunRouteGateway},
+			{"ip", "route", "delete", "128.0.0.0/1", "via", tunRouteGateway},
+			{"ip", "route", "delete", "0.0.0.0/1", "via", tunInterfaceAddress},
+			{"ip", "route", "delete", "128.0.0.0/1", "via", tunInterfaceAddress},
 		}
 	case "darwin": // macOS
 		routes = [][]string{
-			{"route", "-n", "delete", "-net", "1.0.0.0/8", "10.0.0.1"},
-			{"route", "-n", "delete", "-net", "2.0.0.0/7", "10.0.0.1"},
-			{"route", "-n", "delete", "-net", "4.0.0.0/6", "10.0.0.1"},
-			{"route", "-n", "delete", "-net", "8.0.0.0/5", "10.0.0.1"},
-			{"route", "-n", "delete", "-net", "32.0.0.0/3", "10.0.0.1"},
-			{"route", "-n", "delete", "-net", "64.0.0.0/2", "10.0.0.1"},
-			{"route", "-n", "delete", "-net", "128.0.0.0/1", "10.0.0.1"},
-			{"route", "-n", "delete", "-net", "198.18.0.0/15", "10.0.0.1"},
+			{"route", "-n", "delete", "-net", "0.0.0.0/1", tunRouteGateway},
+			{"route", "-n", "delete", "-net", "1.0.0.0/8", tunRouteGateway},
+			{"route", "-n", "delete", "-net", "2.0.0.0/7", tunRouteGateway},
+			{"route", "-n", "delete", "-net", "4.0.0.0/6", tunRouteGateway},
+			{"route", "-n", "delete", "-net", "8.0.0.0/5", tunRouteGateway},
+			{"route", "-n", "delete", "-net", "32.0.0.0/3", tunRouteGateway},
+			{"route", "-n", "delete", "-net", "64.0.0.0/2", tunRouteGateway},
+			{"route", "-n", "delete", "-net", "128.0.0.0/1", tunRouteGateway},
+			{"route", "-n", "delete", "-net", "198.18.0.0/15", tunRouteGateway},
+			{"route", "-n", "delete", "-net", "0.0.0.0/1", tunInterfaceAddress},
+			{"route", "-n", "delete", "-net", "1.0.0.0/8", tunInterfaceAddress},
+			{"route", "-n", "delete", "-net", "2.0.0.0/7", tunInterfaceAddress},
+			{"route", "-n", "delete", "-net", "4.0.0.0/6", tunInterfaceAddress},
+			{"route", "-n", "delete", "-net", "8.0.0.0/5", tunInterfaceAddress},
+			{"route", "-n", "delete", "-net", "32.0.0.0/3", tunInterfaceAddress},
+			{"route", "-n", "delete", "-net", "64.0.0.0/2", tunInterfaceAddress},
+			{"route", "-n", "delete", "-net", "128.0.0.0/1", tunInterfaceAddress},
+			{"route", "-n", "delete", "-net", "198.18.0.0/15", tunInterfaceAddress},
 		}
 	default:
 		return fmt.Errorf("unsupported operating system: %s", runtime.GOOS)
@@ -153,12 +170,8 @@ func CleanupTunInterface(ifName string) error {
 			// macOS 不支持直接删除 TUN 接口，继续执行
 		}
 
-		// macOS 的 TUN 接口通常由用户态程序管理，无法通过 ifconfig destroy 删除
-		// 可选：尝试通过 route 命令清理关联路由
-		cmd = utils2.GetRunCommand("route", "-n", "flush")
-		if err := cmd.Run(); err != nil {
-			logger.Error(fmt.Sprintf("Failed to flush routes for interface: %v", err))
-		}
+		// macOS 的 TUN 接口由用户态程序管理。不要执行全局 route flush，
+		// 否则可能把系统 IPv4 default route 一并清掉。
 
 	case "windows":
 		// 禁用 TUN 接口
@@ -208,7 +221,15 @@ func GetDefaultGateway() (string, error) {
 }
 
 func SetDefaultGateway(gateway string) error {
+	gateway = strings.TrimSpace(gateway)
+	if gateway == "" || gateway == tunInterfaceAddress || gateway == tunRouteGateway {
+		logger.Info(fmt.Sprintf("Skip default gateway restore, gateway=%q", gateway))
+		return nil
+	}
 	if runtime.GOOS == "darwin" {
+		if err := utils2.GetRunCommand("route", "change", "default", gateway).Run(); err == nil {
+			return nil
+		}
 		cmd := utils2.GetRunCommand("route", "add", "default", gateway)
 		return cmd.Run()
 	}
@@ -329,7 +350,7 @@ func waitForTunDeviceReady(deviceName string, timeout time.Duration) error {
 		// 检查输出是否包含设备名称和状态
 		if strings.Contains(outputStr, deviceName) && strings.Contains(outputStr, checkString) {
 			// 进一步验证网卡可用性，通过 ping 测试
-			pingCmd := utils2.GetRunCommand("ping", "-n", "1", "10.0.0.1")
+			pingCmd := utils2.GetRunCommand("ping", "-n", "1", tunInterfaceAddress)
 
 			if err := pingCmd.Run(); err == nil {
 				logger.Info("TUN 设备已就绪 OS: ", runtime.GOOS)
@@ -370,10 +391,10 @@ func checkMacOSTunReady(deviceName string) error {
 		return fmt.Errorf("interface not RUNNING")
 	}
 
-	// Step 2: 验证接口 IP 地址配置是否正确（应该是 10.0.0.1 或 10.0.0.2）
-	hasCorrectIP := strings.Contains(outputStr, "10.0.0.1") || strings.Contains(outputStr, "10.0.0.2")
+	// Step 2: 验证接口 IP 地址配置是否正确
+	hasCorrectIP := strings.Contains(outputStr, tunInterfaceAddress) || strings.Contains(outputStr, tunRouteGateway)
 	if !hasCorrectIP {
-		return fmt.Errorf("interface IP not configured correctly (expected 10.0.0.1 or 10.0.0.2)")
+		return fmt.Errorf("interface IP not configured correctly (expected %s or %s)", tunInterfaceAddress, tunRouteGateway)
 	}
 
 	// Step 3: 实际连通性测试 - ping 到 TUN 网关（带超时）
@@ -381,9 +402,9 @@ func checkMacOSTunReady(deviceName string) error {
 	defer cancel()
 
 	// macOS 的 ping 命令参数：-c 1 (count), -t 1 (timeout in seconds)
-	pingCmd := exec.CommandContext(ctx, "ping", "-c", "1", "-t", "1", "10.0.0.2")
+	pingCmd := exec.CommandContext(ctx, "ping", "-c", "1", "-t", "1", tunRouteGateway)
 	if err := pingCmd.Run(); err != nil {
-		return fmt.Errorf("connectivity test failed (ping to 10.0.0.2): %w", err)
+		return fmt.Errorf("connectivity test failed (ping to %s): %w", tunRouteGateway, err)
 	}
 
 	// Step 4: 验证路由表中存在 TUN 路由
@@ -394,7 +415,7 @@ func checkMacOSTunReady(deviceName string) error {
 		logger.Warn(fmt.Sprintf("无法检查路由表: %v", err))
 	} else {
 		// 检查至少有一条路由指向 TUN 网关
-		if !strings.Contains(string(routeOutput), "10.0.0.1") {
+		if !strings.Contains(string(routeOutput), tunRouteGateway) {
 			logger.Warn("路由表中未找到 TUN 网关路由，但设备可能仍可用")
 		}
 	}

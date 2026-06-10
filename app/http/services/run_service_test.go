@@ -309,6 +309,33 @@ func TestRunServiceCharacterization_SwitchModeGuards(t *testing.T) {
 	})
 }
 
+func TestBootstrapCanonicalRoutingSchemaHonorsDisabledCustomerProxy(t *testing.T) {
+	config.ResetGlobalConfigForTest()
+	t.Cleanup(config.ResetGlobalConfigForTest)
+
+	config.SetGlobalConfig(&config.Config{
+		Customer: &config.CustomerConfig{
+			Proxy: &config.CustomerProxyConfig{
+				Enable: customerBoolPtr(false),
+				Type:   "socks5",
+				Server: "127.0.0.1:1080",
+			},
+			ProxyRules: []string{"domains,google.com"},
+		},
+	})
+
+	canonical := bootstrapCanonicalRoutingSchema(models.ModeTUN)
+	if canonical.Egress.ToSocks.Enabled {
+		t.Fatal("bootstrap toSocks.enabled = true, want false when customer.proxy.enable=false")
+	}
+	if len(canonical.Routing.Rules) != 1 {
+		t.Fatalf("bootstrap routing rules = %d, want 1", len(canonical.Routing.Rules))
+	}
+	if got := canonical.Routing.Rules[0].Target; got != string(routing.SnapshotActionDirect) {
+		t.Fatalf("bootstrap proxy rule target = %q, want direct", got)
+	}
+}
+
 func TestRunServiceSwitchModeStopsRunningServiceWithoutAutoStart(t *testing.T) {
 	defer resetRunServiceHooksForTest()
 	seedActiveIngressSnapshot(t, string(models.ModeHTTP))

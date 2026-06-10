@@ -604,7 +604,7 @@ func bootstrapCanonicalRoutingSchema(mode models.RunMode) *config.CanonicalRouti
 	toSocksEnabled := false
 	if globalCfg != nil && globalCfg.Customer != nil && globalCfg.Customer.Proxy != nil {
 		proxyType := strings.ToLower(strings.TrimSpace(globalCfg.Customer.Proxy.Type))
-		if proxyType == "http" || proxyType == "socks5" {
+		if globalCfg.Customer.Proxy.IsEnabled() && (proxyType == "http" || proxyType == "socks5") {
 			toSocksEnabled = strings.TrimSpace(globalCfg.Customer.Proxy.Server) != ""
 			if proxyType == "http" {
 				upstreamType = "http"
@@ -627,14 +627,14 @@ func bootstrapCanonicalRoutingSchema(mode models.RunMode) *config.CanonicalRouti
 	}
 
 	if globalCfg != nil {
-		if snapshot, err := routing.CompileRuntimeSnapshotFromRuntimeInputs(globalCfg, model.RulesSettings{
+		if compiled, err := routing.CompileCanonicalRoutingFromRuntimeInputs(globalCfg, model.RulesSettings{
 			AliangEnabled: true,
 			SocksEnabled:  toSocksEnabled,
-		}); err == nil && snapshot != nil {
-			compiledMode := strings.ToLower(strings.TrimSpace(snapshot.IngressMode()))
-			if compiledMode == string(models.ModeHTTP) || compiledMode == string(models.ModeTUN) {
-				canonical.Ingress.Mode = string(mode)
-			}
+		}); err == nil && compiled != nil {
+			compiled.Ingress.Mode = string(mode)
+			return compiled
+		} else if err != nil {
+			logger.Warn(fmt.Sprintf("Failed to bootstrap routing schema from runtime config, using minimal schema: %v", err))
 		}
 	}
 

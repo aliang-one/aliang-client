@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"aliang.one/nursorgate/app/agentruntime"
 	"aliang.one/nursorgate/common/logger"
 	"aliang.one/nursorgate/common/version"
 	"aliang.one/nursorgate/internal/ipc"
@@ -159,6 +160,10 @@ func (a *CompanionApp) connectAndStartHTTP() {
 
 	a.coreReady = true
 	logger.Debug(fmt.Sprintf("Core connected, HTTP dashboard available at %s", a.httpURL))
+
+	if err := agentruntime.EnsureStarted(); err != nil {
+		logger.Warn(fmt.Sprintf("Failed to start user agent runtime from tray companion: %v", err))
+	}
 }
 
 // waitForIPC waits for the IPC socket to become available.

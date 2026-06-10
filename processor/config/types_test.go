@@ -759,3 +759,15 @@ func TestConfigValidate_HTTP1DropRejectsBlankRule(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+func TestConfigAgentBaseURL(t *testing.T) {
+	cfg := &Config{Core: &CoreConfig{APIServer: "https://api.example.com/"}}
+	if got := cfg.AgentBaseURL(); got != DefaultAgentServerURL {
+		t.Fatalf("AgentBaseURL() fallback = %q, want %s", got, DefaultAgentServerURL)
+	}
+
+	cfg.Core.AgentServer = "https://agent.example.com/"
+	if got := cfg.AgentBaseURL(); got != "https://agent.example.com" {
+		t.Fatalf("AgentBaseURL() explicit = %q, want https://agent.example.com", got)
+	}
+}

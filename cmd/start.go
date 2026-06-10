@@ -7,6 +7,7 @@ import (
 	"strings"
 	"syscall"
 
+	"aliang.one/nursorgate/app/agentruntime"
 	httpServer "aliang.one/nursorgate/app/http"
 	"aliang.one/nursorgate/app/http/storage"
 	"aliang.one/nursorgate/common/logger"
@@ -87,6 +88,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 	if err := ApplyStartupConfigForMode(setup.RuntimeModeInteractive, configPath); err != nil {
 		return fmt.Errorf("failed to initialize startup configuration: %w", err)
 	}
+	logAgentStartupConfig("core_config_loaded")
 
 	// Determine initial startup status based on login state
 	// Status reflects whether the system is ready for proxy operations
@@ -118,6 +120,11 @@ func runStart(cmd *cobra.Command, args []string) error {
 	// HTTP server always starts, but API requests are gated by startup status middleware
 	if err := httpServer.StartHttpServer(); err != nil {
 		return fmt.Errorf("failed to start HTTP server: %w", err)
+	}
+
+	logAgentStartupConfig("core_ensure_agent")
+	if err := agentruntime.EnsureStarted(); err != nil {
+		logger.Warn(fmt.Sprintf("Failed to start user agent runtime: %v", err))
 	}
 
 	// 等待信号并优雅关闭

@@ -1,6 +1,7 @@
 package services
 
 import (
+	"encoding/json"
 	"net"
 	"os"
 	"path/filepath"
@@ -9,9 +10,11 @@ import (
 	"time"
 
 	"aliang.one/nursorgate/app/http/storage"
+	"aliang.one/nursorgate/common/model"
 	M "aliang.one/nursorgate/inbound/tun/metadata"
 	"aliang.one/nursorgate/outbound"
 	"aliang.one/nursorgate/processor/config"
+	"aliang.one/nursorgate/processor/routing"
 	"aliang.one/nursorgate/processor/setup"
 	"aliang.one/nursorgate/processor/statistic"
 )
@@ -301,6 +304,91 @@ func TestUpdateCommittedCustomerConfig_RefreshesOutboundProxyRegistry(t *testing
 	}
 	if got := httpProxy.Addr(); got != "cd.liangsqrt.com:27750" {
 		t.Fatalf("http proxy addr = %q, want cd.liangsqrt.com:27750", got)
+	}
+}
+
+func TestUpdateCommittedCustomerConfig_DisablingProxyRefreshesRoutingRuntime(t *testing.T) {
+	config.ResetGlobalConfigForTest()
+	config.ResetEffectiveConfigCommitCoordinatorForTest()
+	config.ResetRoutingApplyStoreForTest()
+	storage.ResetSoftwareConfigDBForTest()
+	registry := outbound.GetRegistry()
+	registry.Clear()
+	t.Cleanup(func() {
+		config.ResetGlobalConfigForTest()
+		config.ResetEffectiveConfigCommitCoordinatorForTest()
+		config.ResetRoutingApplyStoreForTest()
+		storage.ResetSoftwareConfigDBForTest()
+		registry.Clear()
+	})
+
+	tempHome := t.TempDir()
+	t.Setenv("HOME", tempHome)
+	t.Setenv("ALIANG_CACHE_DIR", filepath.Join(tempHome, ".aliang-cache"))
+
+	baseCfg := &config.Config{
+		Core: &config.CoreConfig{APIServer: "https://api.aliang.one"},
+		Customer: &config.CustomerConfig{
+			Proxy: &config.CustomerProxyConfig{
+				Enable: customerBoolPtr(true),
+				Type:   "socks5",
+				Server: "127.0.0.1:1080",
+			},
+			ProxyRules: []string{"domains,google.com"},
+		},
+	}
+	config.SetGlobalConfig(baseCfg)
+	if err := registry.RefreshCustomerProxy(baseCfg); err != nil {
+		t.Fatalf("RefreshCustomerProxy(base) error = %v", err)
+	}
+
+	seedCanonical, err := routing.CompileCanonicalRoutingFromRuntimeInputs(baseCfg, routingSwitches(true, true))
+	if err != nil {
+		t.Fatalf("CompileCanonicalRoutingFromRuntimeInputs(base) error = %v", err)
+	}
+	seedRaw, err := json.Marshal(seedCanonical)
+	if err != nil {
+		t.Fatalf("marshal seed canonical error = %v", err)
+	}
+	if _, err := config.GetRoutingApplyStore().Apply(seedRaw, func(canonical *config.CanonicalRoutingSchema) (any, error) {
+		return routing.CompileRuntimeSnapshot(canonical)
+	}); err != nil {
+		t.Fatalf("seed routing apply error = %v", err)
+	}
+
+	service := NewCustomerConfigService()
+	if _, err := service.UpdateCommittedCustomerConfig([]byte(`{
+		"customer": {
+			"proxy": {
+				"enable": false
+			}
+		}
+	}`)); err != nil {
+		t.Fatalf("UpdateCommittedCustomerConfig() error = %v", err)
+	}
+
+	if _, err := registry.Get("socks"); err == nil {
+		t.Fatal("registry.Get(\"socks\") error = nil, want disabled proxy removed")
+	}
+	activeCanonical := config.GetRoutingApplyStore().ActiveCanonicalSchema()
+	if activeCanonical == nil {
+		t.Fatal("active canonical routing schema is nil")
+	}
+	if activeCanonical.Egress.ToSocks.Enabled {
+		t.Fatalf("active toSocks.enabled = true, want false after customer.proxy.enable=false")
+	}
+	if len(activeCanonical.Routing.Rules) != 1 {
+		t.Fatalf("active routing rules = %d, want 1", len(activeCanonical.Routing.Rules))
+	}
+	if got := activeCanonical.Routing.Rules[0].Target; got != string(routing.SnapshotActionDirect) {
+		t.Fatalf("proxy rule target = %q, want direct when customer proxy is disabled", got)
+	}
+}
+
+func routingSwitches(aliangEnabled, socksEnabled bool) model.RulesSettings {
+	return model.RulesSettings{
+		AliangEnabled: aliangEnabled,
+		SocksEnabled:  socksEnabled,
 	}
 }
 
