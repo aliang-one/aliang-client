@@ -68,7 +68,7 @@ func configureWindowsTunInterface(ifname string) error {
 	// 使用 netsh 命令配置接口
 	commands := [][]string{
 		// 设置静态 IP
-		{"powershell", "-Command", `New-NetIPAddress -InterfaceAlias "` + ifname + `" -IPAddress ` + tunInterfaceAddress + ` -PrefixLength 24`},
+		{"powershell", "-Command", `New-NetIPAddress -InterfaceAlias "` + ifname + `" -IPAddress 10.0.0.1 -PrefixLength 24`},
 
 		// 设置 Metric
 		{"powershell", "-Command", `Set-NetIPInterface -InterfaceAlias "` + ifname + `" -InterfaceMetric 1`},
@@ -82,7 +82,7 @@ func configureWindowsTunInterface(ifname string) error {
 	if err != nil {
 		logger.Error(fmt.Sprintf("failed to get net adapter: %v", err))
 		commands = [][]string{
-			{"netsh", "interface", "ipv4", "set", "address", "name=" + ifname, "static", tunInterfaceAddress, "255.255.255.0"},
+			{"netsh", "interface", "ipv4", "set", "address", "name=" + ifname, "static", "10.0.0.1", "255.255.255.0"},
 			{"netsh", "interface", "ipv4", "set", "interface", "name=" + ifname, "metric=1"},
 			{"netsh", "interface", "ipv4", "set", "interface", "name=" + ifname, "admin=enabled"},
 		}
@@ -103,7 +103,7 @@ func configureWindowsTunInterface(ifname string) error {
 }
 
 func configureDarwinTunInterface(ifname string) error {
-	if err := utils2.RunCommand("ifconfig", ifname, tunInterfaceAddress, tunRouteGateway, "up"); err != nil {
+	if err := utils2.RunCommand("ifconfig", ifname, "10.0.0.1", "10.0.0.2", "up"); err != nil {
 		errStr := fmt.Sprintf("ifconfig failed: %v", err)
 		logger.Error(errStr)
 		return errors.New(errStr)
@@ -113,7 +113,7 @@ func configureDarwinTunInterface(ifname string) error {
 
 func configureLinuxTunInterface(ifname string) error {
 	commands := [][]string{
-		{"ip", "addr", "add", tunInterfaceAddress + "/24", "dev", ifname},
+		{"ip", "addr", "add", "10.0.0.1/24", "dev", ifname},
 		{"ip", "link", "set", "dev", ifname, "up"},
 		{"ip", "route", "add", "10.0.0.0/24", "dev", ifname},
 	}
@@ -330,7 +330,7 @@ func configureWindowsTunRoute() error {
 
 	logger.Info(fmt.Sprintf("找到默认网关: %s", defaultGateway))
 
-	tunIfIndex, err := getWindowsTunInterfaceIndexByAddress(tunInterfaceAddress)
+	tunIfIndex, err := getWindowsTunInterfaceIndexByAddress("10.0.0.1")
 	if err != nil {
 		return fmt.Errorf("获取 TUN 接口索引失败: %w", err)
 	}
@@ -342,10 +342,10 @@ func configureWindowsTunRoute() error {
 
 	// 删除现有 TUN 半默认路由。兼容旧版本错误使用 10.0.0.1 作为下一跳的残留路由。
 	commands := [][]string{
-		{"route", "delete", "0.0.0.0", "mask", "128.0.0.0", tunRouteGateway, "if", strconv.Itoa(tunIfIndex)},
-		{"route", "delete", "128.0.0.0", "mask", "128.0.0.0", tunRouteGateway, "if", strconv.Itoa(tunIfIndex)},
-		{"route", "delete", "0.0.0.0", "mask", "128.0.0.0", tunInterfaceAddress, "if", strconv.Itoa(tunIfIndex)},
-		{"route", "delete", "128.0.0.0", "mask", "128.0.0.0", tunInterfaceAddress, "if", strconv.Itoa(tunIfIndex)},
+		{"route", "delete", "0.0.0.0", "mask", "128.0.0.0", "10.0.0.1", "if", strconv.Itoa(tunIfIndex)},
+		{"route", "delete", "128.0.0.0", "mask", "128.0.0.0", "10.0.0.1", "if", strconv.Itoa(tunIfIndex)},
+		{"route", "delete", "0.0.0.0", "mask", "128.0.0.0", "10.0.0.2", "if", strconv.Itoa(tunIfIndex)},
+		{"route", "delete", "128.0.0.0", "mask", "128.0.0.0", "10.0.0.2", "if", strconv.Itoa(tunIfIndex)},
 	}
 
 	for _, cmd := range commands {
@@ -356,8 +356,8 @@ func configureWindowsTunRoute() error {
 
 	// 添加新的路由
 	commands = [][]string{
-		{"route", "add", "0.0.0.0", "mask", "128.0.0.0", tunRouteGateway, "metric", "1", "if", strconv.Itoa(tunIfIndex)},
-		{"route", "add", "128.0.0.0", "mask", "128.0.0.0", tunRouteGateway, "metric", "1", "if", strconv.Itoa(tunIfIndex)},
+		{"route", "add", "0.0.0.0", "mask", "128.0.0.0", "10.0.0.2", "metric", "1", "if", strconv.Itoa(tunIfIndex)},
+		{"route", "add", "128.0.0.0", "mask", "128.0.0.0", "10.0.0.2", "metric", "1", "if", strconv.Itoa(tunIfIndex)},
 	}
 
 	for _, cmd := range commands {
@@ -409,14 +409,14 @@ func configureDarwinTunRoute() error {
 	// 如果没有匹配到 fakeip，就 fallback 用默认劫持
 	if !hasFakeIP {
 		routes = [][]string{
-			{"route", "-n", "add", "-net", "1.0.0.0/8", tunRouteGateway},
-			{"route", "-n", "add", "-net", "2.0.0.0/7", tunRouteGateway},
-			{"route", "-n", "add", "-net", "4.0.0.0/6", tunRouteGateway},
-			{"route", "-n", "add", "-net", "8.0.0.0/5", tunRouteGateway},
-			{"route", "-n", "add", "-net", "32.0.0.0/3", tunRouteGateway},
-			{"route", "-n", "add", "-net", "64.0.0.0/2", tunRouteGateway},
-			{"route", "-n", "add", "-net", "128.0.0.0/1", tunRouteGateway},
-			{"route", "-n", "add", "-net", "198.18.0.0/15", tunRouteGateway},
+			{"route", "-n", "add", "-net", "1.0.0.0/8", "10.0.0.1"},
+			{"route", "-n", "add", "-net", "2.0.0.0/7", "10.0.0.1"},
+			{"route", "-n", "add", "-net", "4.0.0.0/6", "10.0.0.1"},
+			{"route", "-n", "add", "-net", "8.0.0.0/5", "10.0.0.1"},
+			{"route", "-n", "add", "-net", "32.0.0.0/3", "10.0.0.1"},
+			{"route", "-n", "add", "-net", "64.0.0.0/2", "10.0.0.1"},
+			{"route", "-n", "add", "-net", "128.0.0.0/1", "10.0.0.1"},
+			{"route", "-n", "add", "-net", "198.18.0.0/15", "10.0.0.1"},
 		}
 	}
 
@@ -465,10 +465,8 @@ func configureLinuxTunRoute() error {
 
 	// 删除现有默认路由
 	commands := [][]string{
-		{"ip", "route", "del", "0.0.0.0/1", "via", tunRouteGateway},
-		{"ip", "route", "del", "128.0.0.0/1", "via", tunRouteGateway},
-		{"ip", "route", "del", "0.0.0.0/1", "via", tunInterfaceAddress},
-		{"ip", "route", "del", "128.0.0.0/1", "via", tunInterfaceAddress},
+		{"ip", "route", "del", "0.0.0.0/1", "via", "10.0.0.1"},
+		{"ip", "route", "del", "128.0.0.0/1", "via", "10.0.0.1"},
 	}
 
 	for _, cmd := range commands {
@@ -480,8 +478,8 @@ func configureLinuxTunRoute() error {
 
 	// 添加新的路由
 	commands = [][]string{
-		{"ip", "route", "add", "0.0.0.0/1", "via", tunRouteGateway, "metric", "1"},
-		{"ip", "route", "add", "128.0.0.0/1", "via", tunRouteGateway, "metric", "1"},
+		{"ip", "route", "add", "0.0.0.0/1", "via", "10.0.0.1", "metric", "1"},
+		{"ip", "route", "add", "128.0.0.0/1", "via", "10.0.0.1", "metric", "1"},
 		// 添加回原默认网关的路由，但优先级较低
 	}
 

@@ -7,7 +7,6 @@ import (
 	"strings"
 	"time"
 
-	"aliang.one/nursorgate/app/agentruntime"
 	httpServer "aliang.one/nursorgate/app/http"
 	"aliang.one/nursorgate/app/http/services"
 	"aliang.one/nursorgate/common/logger"
@@ -126,9 +125,6 @@ func onReady() {
 	// Ensure the dashboard/API server is available for local control UI.
 	go func() {
 		time.Sleep(250 * time.Millisecond)
-		if err := agentruntime.EnsureStarted(); err != nil {
-			logger.Warn(fmt.Sprintf("Failed to start user agent runtime from tray: %v", err))
-		}
 		app.ensureDashboardServer()
 		app.syncProxyState()
 	}()

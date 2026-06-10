@@ -10,7 +10,6 @@ import (
 	"time"
 	"unsafe"
 
-	"aliang.one/nursorgate/app/agentruntime"
 	"aliang.one/nursorgate/common/logger"
 	"aliang.one/nursorgate/common/version"
 	"aliang.one/nursorgate/internal/ipc"
@@ -152,10 +151,6 @@ func (a *CompanionApp) connectAndStartHTTP() {
 		} else if portNum, ok := data["port"].(float64); ok {
 			a.httpURL = fmt.Sprintf("http://127.0.0.1:%d", int(portNum))
 		}
-	}
-
-	if err := agentruntime.EnsureStarted(); err != nil {
-		logger.Warn("Failed to start user agent runtime from Windows companion", "error", err)
 	}
 
 	a.syncState()

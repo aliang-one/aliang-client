@@ -37,7 +37,6 @@ type Handlers struct {
 	Dashboard      *handlers.DashboardHandler
 	QuickSetup     *handlers.QuickSetupHandler
 	Tutorial       *handlers.TutorialHandler
-	Agent          *handlers.AgentHandler
 
 	statsCollector     *statistic.StatsCollector
 	httpStatsCollector *statistic.HTTPStatsCollector
@@ -63,7 +62,6 @@ func newHandlers(runService *services.RunService) *Handlers {
 	softwareCfgService := services.NewSoftwareConfigService()
 	certService := services.NewCertService()
 	softwareUpdateService := services.GetSharedSoftwareUpdateService()
-	agentService := services.GetSharedAgentService()
 	proxyRepository := repositories.NewProxyRepository()
 	statsCollector := statistic.NewStatsCollector()
 	httpStatsCollector := statistic.GetDefaultHTTPStatsCollector()
@@ -92,7 +90,6 @@ func newHandlers(runService *services.RunService) *Handlers {
 		Dashboard:          handlers.NewDashboardHandler(),
 		QuickSetup:         handlers.NewQuickSetupHandler(),
 		Tutorial:           handlers.NewTutorialHandler(),
-		Agent:              handlers.NewAgentHandler(agentService),
 		statsCollector:     statsCollector,
 		httpStatsCollector: httpStatsCollector,
 	}
@@ -231,14 +228,6 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	register("/api/quick-setup/catalog", h.QuickSetup.HandleCatalog, http.MethodGet)
 	register("/api/quick-setup/render", h.QuickSetup.HandleRender, http.MethodPost)
 	register("/api/quick-setup/apply", h.QuickSetup.HandleApply, http.MethodPost)
-
-	// User agent routes (/api/agent/*)
-	register("/api/agent/status", h.Agent.HandleStatus, http.MethodGet)
-	register("/api/agent/bind/start", h.Agent.HandleBindStart, http.MethodPost)
-	register("/api/agent/bind/status", h.Agent.HandleBindStatus, http.MethodGet)
-	register("/api/agent/disable", h.Agent.HandleDisable, http.MethodPost)
-	register("/api/agent/tools", h.Agent.HandleTools, http.MethodGet)
-	register("/api/agent/tools/launch", h.Agent.HandleLaunch, http.MethodPost)
 	register("/api/docs/tutorials", h.Tutorial.HandleGetTutorial, http.MethodGet)
 
 	registerDocsRoutes(mux, catalog)

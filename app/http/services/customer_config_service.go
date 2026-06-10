@@ -15,12 +15,10 @@ import (
 	"aliang.one/nursorgate/app/http/models"
 	"aliang.one/nursorgate/app/http/storage"
 	"aliang.one/nursorgate/common/logger"
-	"aliang.one/nursorgate/common/model"
 	M "aliang.one/nursorgate/inbound/tun/metadata"
 	"aliang.one/nursorgate/outbound"
 	"aliang.one/nursorgate/processor/config"
 	"aliang.one/nursorgate/processor/mirror"
-	"aliang.one/nursorgate/processor/routing"
 	"aliang.one/nursorgate/processor/rules"
 	"aliang.one/nursorgate/processor/statistic"
 )
@@ -169,10 +167,6 @@ func (s *CustomerConfigService) UpdateCommittedCustomerConfig(payload []byte) (*
 			if err := outbound.GetRegistry().RefreshCustomerProxy(&committedCfg); err != nil {
 				return fmt.Errorf("refresh customer proxy registry: %w", err)
 			}
-			if err := refreshRoutingRuntimeAfterCustomerConfigCommit(&committedCfg); err != nil {
-				return fmt.Errorf("refresh routing runtime: %w", err)
-			}
-			clearRoutingDecisionCache()
 			closeDisabledAIAcceleratedConnections(previousCfg, &committedCfg)
 			mirror.InitGlobalForwarder()
 			return nil
@@ -191,47 +185,6 @@ func (s *CustomerConfigService) UpdateCommittedCustomerConfig(payload []byte) (*
 		Version:  commitResult.Version,
 		Customer: customer,
 	}, nil
-}
-
-func refreshRoutingRuntimeAfterCustomerConfigCommit(committedCfg *config.Config) error {
-	if committedCfg == nil {
-		return nil
-	}
-
-	activeCanonical := config.GetRoutingApplyStore().ActiveCanonicalSchema()
-	aliangEnabled := true
-	ingressMode := "tun"
-	if activeCanonical != nil {
-		aliangEnabled = activeCanonical.Egress.ToAliang.Enabled
-		if activeCanonical.Ingress.Mode == "http" || activeCanonical.Ingress.Mode == "tun" {
-			ingressMode = activeCanonical.Ingress.Mode
-		}
-	}
-
-	canonical, err := routing.CompileCanonicalRoutingFromRuntimeInputs(committedCfg, model.RulesSettings{
-		AliangEnabled: aliangEnabled,
-		SocksEnabled:  true,
-	})
-	if err != nil {
-		return err
-	}
-	canonical.Ingress.Mode = ingressMode
-
-	raw, err := json.Marshal(canonical)
-	if err != nil {
-		return fmt.Errorf("marshal runtime routing schema: %w", err)
-	}
-
-	_, err = config.GetRoutingApplyStore().Apply(raw, func(cfg *config.CanonicalRoutingSchema) (any, error) {
-		return routing.CompileRuntimeSnapshot(cfg)
-	})
-	return err
-}
-
-func clearRoutingDecisionCache() {
-	if engine := rules.GetEngine(); engine != nil {
-		engine.ClearCache()
-	}
 }
 
 func IsCustomerConfigValidationError(err error) bool {
@@ -295,7 +248,9 @@ func closeDisabledAIAcceleratedConnections(previousCfg, nextCfg *config.Config) 
 		return
 	}
 
-	clearRoutingDecisionCache()
+	if engine := rules.GetEngine(); engine != nil {
+		engine.ClearCache()
+	}
 
 	closed := statistic.DefaultManager.CloseTrackedConnectionsByMetadata(func(metadata *M.Metadata) bool {
 		if metadata == nil || metadata.Route != "RouteToALiang" || metadata.HostName == "" {

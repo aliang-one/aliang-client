@@ -276,10 +276,6 @@ func CompileRuntimeSnapshotFromRuntimeInputs(cfg *config.Config, switches model.
 	return CompileRuntimeSnapshot(canonical)
 }
 
-func CompileCanonicalRoutingFromRuntimeInputs(cfg *config.Config, switches model.RulesSettings) (*config.CanonicalRoutingSchema, error) {
-	return compileCanonicalRoutingFromRuntimeInputs(cfg, switches)
-}
-
 func compileCanonicalRoutingFromRuntimeInputs(cfg *config.Config, switches model.RulesSettings) (*config.CanonicalRoutingSchema, error) {
 	canonical := &config.CanonicalRoutingSchema{
 		Version: config.CanonicalRoutingSchemaVersion,
