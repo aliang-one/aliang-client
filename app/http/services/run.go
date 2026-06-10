@@ -14,7 +14,6 @@ import (
 	"aliang.one/nursorgate/common/logger"
 	model "aliang.one/nursorgate/common/model"
 	httpServer "aliang.one/nursorgate/inbound/http"
-	tun "aliang.one/nursorgate/inbound/tun/engine"
 	runner2 "aliang.one/nursorgate/inbound/tun/runner"
 	"aliang.one/nursorgate/outbound"
 	"aliang.one/nursorgate/processor/config"
@@ -28,7 +27,7 @@ var (
 	tunStartRunner               = defaultStartTUN
 	httpStartRunner              = httpServer.StartMitmHttp
 	httpStopRunner               = httpServer.StopHttpProxy
-	tunStopRunner                = tun.Stop
+	tunStopRunner                = runner2.Stop
 	runModeStoreFactory          = func() runModeSnapshotStore { return storage.NewSoftwareConfigStore() }
 	aliangLinkStatusResolver     = resolveAliangLinkStatus
 	softwareUpdateStatusResolver = func() models.SoftwareVersionUpdateFrontendStatus {
@@ -601,28 +600,45 @@ func applyIngressModeToSnapshot(mode models.RunMode) error {
 
 func bootstrapCanonicalRoutingSchema(mode models.RunMode) *config.CanonicalRoutingSchema {
 	globalCfg := config.GetGlobalConfig()
-	if globalCfg != nil {
-		canonical, err := routing.CompileCanonicalRoutingFromRuntimeInputs(globalCfg, model.RulesSettings{
-			AliangEnabled: true,
-			SocksEnabled:  true,
-		})
-		if err == nil && canonical != nil {
-			canonical.Ingress.Mode = string(mode)
-			return canonical
+	upstreamType := "socks"
+	toSocksEnabled := false
+	if globalCfg != nil && globalCfg.Customer != nil && globalCfg.Customer.Proxy != nil {
+		proxyType := strings.ToLower(strings.TrimSpace(globalCfg.Customer.Proxy.Type))
+		if globalCfg.Customer.Proxy.IsEnabled() && (proxyType == "http" || proxyType == "socks5") {
+			toSocksEnabled = strings.TrimSpace(globalCfg.Customer.Proxy.Server) != ""
+			if proxyType == "http" {
+				upstreamType = "http"
+			}
 		}
-		logger.Warn(fmt.Sprintf("Failed to bootstrap routing schema from runtime config, using minimal schema: %v", err))
 	}
 
-	return &config.CanonicalRoutingSchema{
+	canonical := &config.CanonicalRoutingSchema{
 		Version: config.CanonicalRoutingSchemaVersion,
 		Ingress: config.CanonicalIngressConfig{Mode: string(mode)},
 		Egress: config.CanonicalEgressConfig{
 			Direct:   config.CanonicalEgressBranch{Enabled: true},
 			ToAliang: config.CanonicalEgressBranch{Enabled: true},
-			ToSocks:  config.CanonicalSocksEgressBranch{Enabled: false},
+			ToSocks: config.CanonicalSocksEgressBranch{
+				Enabled:  toSocksEnabled,
+				Upstream: config.CanonicalSocksUpstream{Type: upstreamType},
+			},
 		},
 		Routing: config.CanonicalRoutingConfig{Rules: []config.CanonicalRoutingRule{}},
 	}
+
+	if globalCfg != nil {
+		if compiled, err := routing.CompileCanonicalRoutingFromRuntimeInputs(globalCfg, model.RulesSettings{
+			AliangEnabled: true,
+			SocksEnabled:  toSocksEnabled,
+		}); err == nil && compiled != nil {
+			compiled.Ingress.Mode = string(mode)
+			return compiled
+		} else if err != nil {
+			logger.Warn(fmt.Sprintf("Failed to bootstrap routing schema from runtime config, using minimal schema: %v", err))
+		}
+	}
+
+	return canonical
 }
 
 func defaultStartTUN() map[string]string {

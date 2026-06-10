@@ -817,6 +817,8 @@ export default {
   agent_capabilities: 'Capabilities',
   agent_featureTerminal: 'Remote terminal',
   agent_featureAI: 'AI control',
+  agent_featureTerminalOff: 'Remote terminal disabled',
+  agent_featureAIOff: 'AI control disabled',
   agent_toolsFound: 'Tools',
   agent_toolsSummary: '{available}/{total} available',
   agent_server: 'Agent server',
@@ -837,7 +839,10 @@ export default {
   agent_preBoundMissing: 'Bind this device by scanning the QR code.',
   agent_preToolOk: 'At least one supported tool is available in PATH.',
   agent_preToolMissing: 'Install Codex or Claude Code, or add it to PATH.',
-  agent_preTerminal: 'Commands open in the current user terminal session.',
+  agent_preTerminalOk: 'Remote terminal is enabled for local command execution.',
+  agent_preTerminalDisabled: 'Remote terminal has been disabled by the agent server.',
+  agent_preAIOk: 'AI control is enabled for Codex or Claude Code.',
+  agent_preAIDisabled: 'AI control has been disabled by the agent server.',
   agent_history: 'History sync',
   agent_historySummary: '{found}/{total} roots found',
   agent_historyFound: 'Found',
@@ -873,6 +878,7 @@ export default {
   agent_disableFailed: 'Failed to disable agent mode.',
   agent_launchSuccess: 'Command launched.',
   agent_launchFailed: 'Failed to launch command.',
+  agent_remoteTerminalDisabled: 'Remote terminal is disabled. Commands cannot run.',
 
   // -- ConfigSyncSettings --
   sync_title: 'Config Sync Center',

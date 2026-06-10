@@ -18,7 +18,9 @@ import (
 const healthPath = "/api/agent/health"
 
 func EnsureStarted() error {
+	logger.Info(fmt.Sprintf("[AGENT-BOOT] ensure_started begin local_agent_url=%s health_path=%s", services.UserAgentBaseURL(), healthPath))
 	if IsHealthy(700 * time.Millisecond) {
+		logger.Info(fmt.Sprintf("[AGENT-BOOT] ensure_started existing_runtime_healthy local_agent_url=%s", services.UserAgentBaseURL()))
 		return nil
 	}
 
@@ -30,9 +32,11 @@ func EnsureStarted() error {
 		defer logFile.Close()
 	}
 
+	logger.Info(fmt.Sprintf("[AGENT-BOOT] ensure_started launching_user_agent command=%q args=%v", cmd.Path, cmd.Args))
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("failed to start user agent process: %w", err)
 	}
+	logger.Info(fmt.Sprintf("[AGENT-BOOT] ensure_started user_agent_process_started pid=%d", cmd.Process.Pid))
 	go func() {
 		if err := cmd.Wait(); err != nil {
 			logger.Warn(fmt.Sprintf("User agent process exited: %v", err))
@@ -42,7 +46,7 @@ func EnsureStarted() error {
 	deadline := time.Now().Add(7 * time.Second)
 	for time.Now().Before(deadline) {
 		if IsHealthy(700 * time.Millisecond) {
-			logger.Info("User agent process is ready")
+			logger.Info(fmt.Sprintf("[AGENT-BOOT] ensure_started user_agent_ready local_agent_url=%s", services.UserAgentBaseURL()))
 			return nil
 		}
 		time.Sleep(250 * time.Millisecond)

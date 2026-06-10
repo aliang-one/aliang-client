@@ -88,6 +88,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 	if err := ApplyStartupConfigForMode(setup.RuntimeModeInteractive, configPath); err != nil {
 		return fmt.Errorf("failed to initialize startup configuration: %w", err)
 	}
+	logAgentStartupConfig("core_config_loaded")
 
 	// Determine initial startup status based on login state
 	// Status reflects whether the system is ready for proxy operations
@@ -121,6 +122,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to start HTTP server: %w", err)
 	}
 
+	logAgentStartupConfig("core_ensure_agent")
 	if err := agentruntime.EnsureStarted(); err != nil {
 		logger.Warn(fmt.Sprintf("Failed to start user agent runtime: %v", err))
 	}

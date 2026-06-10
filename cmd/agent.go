@@ -39,6 +39,7 @@ func runAgent(cmd *cobra.Command, args []string) error {
 	if err := ApplyStartupConfigForMode(setup.RuntimeModeInteractive, configPath); err != nil {
 		return fmt.Errorf("failed to initialize agent configuration: %w", err)
 	}
+	logAgentStartupConfig("agent_config_loaded")
 	if err := InitializeUser(""); err != nil {
 		logger.Warn(fmt.Sprintf("Failed to initialize user session for agent: %v", err))
 	}

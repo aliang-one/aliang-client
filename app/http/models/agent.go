@@ -36,8 +36,8 @@ type AgentDevice struct {
 	Status                string   `json:"status,omitempty"`
 	Capabilities          []string `json:"capabilities,omitempty"`
 	LastSeenAt            string   `json:"last_seen_at,omitempty"`
-	RemoteTerminalEnabled bool     `json:"remote_terminal_enabled,omitempty"`
-	AIControlEnabled      bool     `json:"ai_control_enabled,omitempty"`
+	RemoteTerminalEnabled bool     `json:"remote_terminal_enabled"`
+	AIControlEnabled      bool     `json:"ai_control_enabled"`
 	CreatedAt             string   `json:"created_at,omitempty"`
 	PairedAt              string   `json:"paired_at,omitempty"`
 	BoundAt               string   `json:"bound_at"`

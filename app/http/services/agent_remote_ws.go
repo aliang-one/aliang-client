@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"aliang.one/nursorgate/common/logger"
 	"aliang.one/nursorgate/common/version"
 	"aliang.one/nursorgate/processor/config"
 	"github.com/gorilla/websocket"
@@ -22,14 +23,17 @@ func (s *AgentService) EnsureRemoteConnection() error {
 	enabled := s.state.Enabled
 	s.mu.Unlock()
 	if token == "" {
+		logger.Info("[AGENT-BOOT] remote_connection skipped reason=no_device_token")
 		return errors.New("device token is not available; pair this device first")
 	}
 	if !enabled {
+		logger.Info("[AGENT-BOOT] remote_connection skipped reason=agent_disabled")
 		return errors.New("agent mode is disabled")
 	}
 
 	s.wsMu.Lock()
 	if s.wsConnected || s.wsConnecting {
+		logger.Info(fmt.Sprintf("[AGENT-BOOT] remote_connection already_active connected=%t connecting=%t", s.wsConnected, s.wsConnecting))
 		s.wsMu.Unlock()
 		return nil
 	}
@@ -50,19 +54,23 @@ func (s *AgentService) remoteConnectionLoop() {
 	for {
 		token, shouldRun := s.remoteConnectionSnapshot()
 		if !shouldRun {
+			logger.Info("[AGENT-BOOT] remote_connection loop_stop reason=disabled_or_missing_token")
 			s.setRemoteConnectionState(false, "offline", "")
 			return
 		}
 
 		wsURL, err := currentAgentWebSocketURL(token)
 		if err != nil {
+			logger.Warn(fmt.Sprintf("[AGENT-BOOT] remote_connection ws_url_failed error=%v", err))
 			s.setRemoteConnectionState(false, "connect_failed", err.Error())
 			time.Sleep(2 * time.Second)
 			continue
 		}
 
+		logger.Info(fmt.Sprintf("[AGENT-BOOT] remote_connection dialing endpoint=%s", sanitizeAgentEndpoint(wsURL)))
 		conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
 		if err != nil {
+			logger.Warn(fmt.Sprintf("[AGENT-BOOT] remote_connection dial_failed endpoint=%s error=%v", sanitizeAgentEndpoint(wsURL), err))
 			s.setRemoteConnectionState(false, "connect_failed", err.Error())
 			time.Sleep(2 * time.Second)
 			continue
@@ -72,10 +80,13 @@ func (s *AgentService) remoteConnectionLoop() {
 		s.wsConnected = true
 		s.wsMu.Unlock()
 		s.setRemoteConnectionState(true, "online", "")
+		logger.Info(fmt.Sprintf("[AGENT-BOOT] remote_connection connected endpoint=%s", sanitizeAgentEndpoint(wsURL)))
 
 		if err := s.runRemoteAgentSession(conn); err != nil {
+			logger.Warn(fmt.Sprintf("[AGENT-BOOT] remote_connection session_ended status=error error=%v", err))
 			s.setRemoteConnectionState(false, "disconnected", err.Error())
 		} else {
+			logger.Info("[AGENT-BOOT] remote_connection session_ended status=clean")
 			s.setRemoteConnectionState(false, "offline", "")
 		}
 
@@ -97,9 +108,15 @@ func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn) error {
 		return conn.WriteJSON(payload)
 	}
 
-	if err := writeJSON(s.agentHelloPayload()); err != nil {
+	hello := s.agentHelloPayload()
+	logger.Info(fmt.Sprintf("[AGENT-BOOT] remote_connection sending_hello device_id=%s platform=%s", hello["device_id"], hello["platform"]))
+	if err := writeJSON(hello); err != nil {
 		return err
 	}
+	logger.Info("[AGENT-BOOT] remote_connection hello_sent")
+
+	defer s.terminal.closeAll()
+	defer s.ai.closeAll()
 
 	done := make(chan struct{})
 	defer close(done)
@@ -125,15 +142,16 @@ func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn) error {
 		if err := conn.ReadJSON(&msg); err != nil {
 			return err
 		}
-		s.handleRemoteAgentMessage(msg)
+		s.handleRemoteAgentMessage(msg, writeJSON)
 	}
 }
 
-func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}) {
+func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writeJSON func(interface{}) error) {
 	msgType := strings.TrimSpace(fmt.Sprint(msg["type"]))
 	switch msgType {
 	case "agent.registered":
 		deviceID := strings.TrimSpace(fmt.Sprint(msg["device_id"]))
+		logger.Info(fmt.Sprintf("[AGENT-BOOT] remote_connection registered_ack device_id=%s", deviceID))
 		s.mu.Lock()
 		if deviceID != "" {
 			s.state.DeviceID = deviceID
@@ -148,6 +166,7 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}) {
 	case "agent.heartbeat.ack":
 		s.setRemoteConnectionState(true, "online", "")
 	case "device.unbound":
+		logger.Warn("[AGENT-BOOT] remote_connection device_unbound")
 		s.mu.Lock()
 		s.state.Enabled = false
 		s.state.Registered = false
@@ -158,8 +177,51 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}) {
 		s.state.LastSyncMessage = "Device was unbound by the agent server."
 		_ = s.saveStateLocked()
 		s.mu.Unlock()
-	case "terminal.create", "terminal.input", "terminal.resize", "terminal.close", "ai.session.create", "ai.message", "ai.stop":
-		s.setRemoteConnectionState(true, "online", "Remote command handling is not implemented in this desktop agent build yet.")
+	case "device.settings.updated":
+		logger.Info("[AGENT-BOOT] remote_connection settings_updated")
+		s.applyRemoteDeviceSettings(msg)
+	case "terminal.create":
+		s.setRemoteConnectionState(true, "online", "")
+		if !s.remoteTerminalEnabled() {
+			_ = writeJSON(agentTerminalErrorPayload(remoteString(msg, "session_id"), errors.New("remote terminal is disabled for this device")))
+			return
+		}
+		s.terminal.create(msg, writeJSON)
+	case "terminal.input":
+		s.setRemoteConnectionState(true, "online", "")
+		if !s.remoteTerminalEnabled() {
+			_ = writeJSON(agentTerminalErrorPayload(remoteString(msg, "session_id"), errors.New("remote terminal is disabled for this device")))
+			return
+		}
+		s.terminal.write(msg, writeJSON)
+	case "terminal.resize":
+		s.setRemoteConnectionState(true, "online", "")
+		if !s.remoteTerminalEnabled() {
+			_ = writeJSON(agentTerminalErrorPayload(remoteString(msg, "session_id"), errors.New("remote terminal is disabled for this device")))
+			return
+		}
+		s.terminal.resize(msg, writeJSON)
+	case "terminal.close":
+		s.setRemoteConnectionState(true, "online", "")
+		s.terminal.close(msg, writeJSON)
+	case "ai.session.create", "ai.message", "ai.stop":
+		s.setRemoteConnectionState(true, "online", "")
+		switch msgType {
+		case "ai.session.create":
+			if !s.aiControlEnabled() {
+				_ = writeJSON(agentAIErrorPayload(remoteString(msg, "session_id"), "", errors.New("AI control is disabled for this device")))
+				return
+			}
+			s.ai.create(msg, writeJSON)
+		case "ai.message":
+			if !s.aiControlEnabled() {
+				_ = writeJSON(agentAIErrorPayload(remoteString(msg, "session_id"), remoteString(msg, "message_id"), errors.New("AI control is disabled for this device")))
+				return
+			}
+			s.ai.message(msg, writeJSON)
+		case "ai.stop":
+			s.ai.stop(msg, writeJSON)
+		}
 	}
 }
 
@@ -195,14 +257,42 @@ func (s *AgentService) setRemoteConnectionStateLocked(connected bool, status str
 }
 
 func (s *AgentService) agentHelloPayload() map[string]interface{} {
+	s.mu.Lock()
+	s.ensureDeviceIdentityLocked()
+	deviceID := s.state.DeviceID
+	uniqueCode := s.state.UniqueCode
+	s.mu.Unlock()
+
 	return map[string]interface{}{
 		"type":          "agent.hello",
-		"device_id":     s.currentDeviceID(),
+		"device_id":     deviceID,
+		"unique_code":   uniqueCode,
 		"device_name":   defaultAgentDeviceName(),
 		"platform":      agentPlatform(),
 		"agent_version": version.String(),
 		"capabilities":  agentCapabilities(),
+		"tools":         detectAgentTools(),
+		"history":       collectAgentHistoryRoots(),
+		"started_at":    time.Now().UTC().Format(time.RFC3339),
 	}
+}
+
+func (s *AgentService) remoteTerminalEnabled() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state.Device == nil {
+		return true
+	}
+	return s.state.Device.RemoteTerminalEnabled
+}
+
+func (s *AgentService) aiControlEnabled() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state.Device == nil {
+		return true
+	}
+	return s.state.Device.AIControlEnabled
 }
 
 func (s *AgentService) currentDeviceID() string {

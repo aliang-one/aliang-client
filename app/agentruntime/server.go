@@ -23,10 +23,12 @@ var (
 )
 
 func RunForeground(ctx context.Context) error {
+	logger.Info("[AGENT-BOOT] foreground_runtime starting")
 	if err := StartLocalServer(); err != nil {
 		return err
 	}
 	<-ctx.Done()
+	logger.Info("[AGENT-BOOT] foreground_runtime stopping")
 	return StopLocalServer()
 }
 
@@ -35,6 +37,7 @@ func StartLocalServer() error {
 	defer serverMu.Unlock()
 
 	if running {
+		logger.Info(fmt.Sprintf("[AGENT-BOOT] local_server already_running addr=%s", config.DefaultUserAgentAddr))
 		return nil
 	}
 
@@ -68,12 +71,17 @@ func StartLocalServer() error {
 	}()
 
 	go func() {
+		logger.Info(fmt.Sprintf("[AGENT-BOOT] startup_sync begin agent_server=%s runtime=user_agent", services.UserAgentOfflineStatus(nil).AgentServer))
 		if err := services.GetSharedAgentService().SyncNow(); err != nil {
 			logger.Warn(fmt.Sprintf("User agent startup sync failed: %v", err))
+			logger.Warn(fmt.Sprintf("[AGENT-BOOT] startup_sync failed error=%v", err))
+			return
 		}
+		logger.Info("[AGENT-BOOT] startup_sync success")
 	}()
 
 	logger.Info(fmt.Sprintf("User agent runtime listening on http://%s", config.DefaultUserAgentAddr))
+	logger.Info(fmt.Sprintf("[AGENT-BOOT] local_server listening url=http://%s routes_registered=true", config.DefaultUserAgentAddr))
 	return nil
 }
 
@@ -95,6 +103,7 @@ func StopLocalServer() error {
 }
 
 func registerAgentRoutes(mux *http.ServeMux) {
+	logger.Info("[AGENT-BOOT] local_server registering_routes routes=/api/agent/health,/api/agent/status,/api/agent/bind/start,/api/agent/bind/status,/api/agent/disable,/api/agent/tools,/api/agent/tools/launch")
 	agentHandler := handlers.NewAgentHandler(services.GetSharedAgentService())
 	mux.HandleFunc("/api/agent/health", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {

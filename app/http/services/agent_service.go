@@ -21,6 +21,7 @@ import (
 
 	"aliang.one/nursorgate/app/http/models"
 	"aliang.one/nursorgate/common/cache"
+	"aliang.one/nursorgate/common/logger"
 	"aliang.one/nursorgate/common/version"
 	"aliang.one/nursorgate/internal/runtimepath"
 	auth "aliang.one/nursorgate/processor/auth"
@@ -82,6 +83,8 @@ type AgentService struct {
 	state    agentState
 	sessions map[string]*agentBindSessionState
 	client   *http.Client
+	terminal *agentTerminalManager
+	ai       *agentAIManager
 
 	wsMu         sync.Mutex
 	wsConnected  bool
@@ -101,8 +104,21 @@ func NewAgentService() *AgentService {
 	s := &AgentService{
 		sessions: make(map[string]*agentBindSessionState),
 		client:   &http.Client{Timeout: agentHTTPTimeout},
+		terminal: newAgentTerminalManager(),
+		ai:       newAgentAIManager(),
 	}
-	_ = s.loadState()
+	if err := s.loadState(); err != nil {
+		logger.Warn(fmt.Sprintf("[AGENT-BOOT] state_load failed error=%v", err))
+	} else {
+		logger.Info(fmt.Sprintf("[AGENT-BOOT] state_load complete enabled=%t registered=%t has_device=%t has_token=%t agent_server=%s runtime=user_agent:%t",
+			s.state.Enabled,
+			s.state.Registered,
+			s.state.Device != nil,
+			strings.TrimSpace(s.state.DeviceToken) != "",
+			currentAgentServerURL(),
+			IsUserAgentRuntime(),
+		))
+	}
 	return s
 }
 
@@ -278,13 +294,18 @@ func (s *AgentService) BindingStatus(sessionID string) (*models.AgentBindStatusR
 	// launcher flows can be developed before the production binding API exists.
 	if session.Status == bindStatusPending && now.Sub(session.CreatedAt) >= agentLocalMVPBindDelay {
 		device := &models.AgentDevice{
-			ID:         s.state.DeviceID,
-			DeviceID:   s.state.DeviceID,
-			UniqueCode: s.state.UniqueCode,
-			Name:       defaultAgentDeviceName(),
-			Platform:   agentPlatform(),
-			Status:     "online",
-			BoundAt:    now.UTC().Format(time.RFC3339),
+			ID:                    s.state.DeviceID,
+			DeviceID:              s.state.DeviceID,
+			UniqueCode:            s.state.UniqueCode,
+			Name:                  defaultAgentDeviceName(),
+			Platform:              agentPlatform(),
+			AgentVersion:          version.String(),
+			Status:                "online",
+			Capabilities:          agentCapabilities(),
+			RemoteTerminalEnabled: true,
+			AIControlEnabled:      true,
+			PairedAt:              now.UTC().Format(time.RFC3339),
+			BoundAt:               now.UTC().Format(time.RFC3339),
 		}
 		s.state.Enabled = true
 		s.state.Device = device
@@ -320,19 +341,37 @@ func (s *AgentService) Disable() models.AgentStatusResponse {
 func (s *AgentService) SyncNow() error {
 	s.mu.Lock()
 	s.ensureDeviceIdentityLocked()
+	logger.Info(fmt.Sprintf("[AGENT-BOOT] sync_now begin device_id=%s enabled=%t registered=%t has_token=%t agent_server=%s runtime=user_agent:%t",
+		s.state.DeviceID,
+		s.state.Enabled,
+		s.state.Registered,
+		strings.TrimSpace(s.state.DeviceToken) != "",
+		currentAgentServerURL(),
+		IsUserAgentRuntime(),
+	))
 	if err := s.registerAndSyncLocked(); err != nil {
 		s.state.LastSyncStatus = "server_unavailable"
 		s.state.LastSyncMessage = err.Error()
 		_ = s.saveStateLocked()
 		s.mu.Unlock()
+		logger.Warn(fmt.Sprintf("[AGENT-BOOT] sync_now failed error=%v", err))
 		return err
 	}
 	hasToken := strings.TrimSpace(s.state.DeviceToken) != ""
+	enabled := s.state.Enabled
+	registered := s.state.Registered
+	deviceID := s.state.DeviceID
 	s.mu.Unlock()
 	if !hasToken {
+		logger.Info(fmt.Sprintf("[AGENT-BOOT] sync_now complete remote_connection=skipped reason=no_device_token device_id=%s registered=%t enabled=%t", deviceID, registered, enabled))
 		return nil
 	}
-	return s.EnsureRemoteConnection()
+	if err := s.EnsureRemoteConnection(); err != nil {
+		logger.Warn(fmt.Sprintf("[AGENT-BOOT] sync_now remote_connection_start_failed device_id=%s error=%v", deviceID, err))
+		return err
+	}
+	logger.Info(fmt.Sprintf("[AGENT-BOOT] sync_now complete remote_connection=start_requested device_id=%s registered=%t enabled=%t", deviceID, registered, enabled))
+	return nil
 }
 
 func (s *AgentService) Tools() []models.AgentTool {
@@ -342,9 +381,13 @@ func (s *AgentService) Tools() []models.AgentTool {
 func (s *AgentService) Launch(req models.AgentLaunchRequest) (*models.AgentLaunchResponse, error) {
 	s.mu.Lock()
 	enabled := s.isEnabledLocked()
+	terminalEnabled := s.state.Device == nil || s.state.Device.RemoteTerminalEnabled
 	s.mu.Unlock()
 	if !enabled {
 		return nil, errors.New("agent mode is not enabled for this device")
+	}
+	if !terminalEnabled {
+		return nil, errors.New("remote terminal is disabled for this device")
 	}
 
 	spec, err := resolveAgentLaunchSpec(req)
@@ -425,13 +468,15 @@ func (s *AgentService) isEnabledLocked() bool {
 func (s *AgentService) syncRuntimeDeviceStatusLocked() {
 	if s.state.Device == nil && strings.TrimSpace(s.state.DeviceToken) != "" {
 		s.state.Device = &models.AgentDevice{
-			ID:         s.state.DeviceID,
-			DeviceID:   s.state.DeviceID,
-			UniqueCode: s.state.UniqueCode,
-			Name:       defaultAgentDeviceName(),
-			Platform:   agentPlatform(),
-			Status:     "offline",
-			BoundAt:    s.state.LastSyncAt,
+			ID:                    s.state.DeviceID,
+			DeviceID:              s.state.DeviceID,
+			UniqueCode:            s.state.UniqueCode,
+			Name:                  defaultAgentDeviceName(),
+			Platform:              agentPlatform(),
+			Status:                "offline",
+			RemoteTerminalEnabled: true,
+			AIControlEnabled:      true,
+			BoundAt:               s.state.LastSyncAt,
 		}
 	}
 	if s.state.Device == nil {
@@ -522,8 +567,27 @@ func (s *AgentService) loadState() error {
 	if err := json.Unmarshal(raw, &state); err != nil {
 		return err
 	}
+	applyAgentDeviceFeatureDefaults(raw, &state)
 	s.state = state
 	return nil
+}
+
+func applyAgentDeviceFeatureDefaults(raw []byte, state *agentState) {
+	if state == nil || state.Device == nil {
+		return
+	}
+	var persisted struct {
+		Device map[string]json.RawMessage `json:"device"`
+	}
+	if err := json.Unmarshal(raw, &persisted); err != nil || persisted.Device == nil {
+		return
+	}
+	if _, ok := persisted.Device["remote_terminal_enabled"]; !ok {
+		state.Device.RemoteTerminalEnabled = true
+	}
+	if _, ok := persisted.Device["ai_control_enabled"]; !ok {
+		state.Device.AIControlEnabled = true
+	}
 }
 
 func (s *AgentService) saveStateLocked() error {
@@ -675,6 +739,11 @@ func (s *AgentService) registerAndSyncLocked() error {
 		s.state.RemoteConnected = false
 		s.state.LastSyncStatus = "pairing_required"
 		s.state.LastSyncMessage = "Pair this device before syncing with the agent server."
+		logger.Info(fmt.Sprintf("[AGENT-BOOT] register_sync skipped reason=pairing_required device_id=%s agent_server=%s register_url=%s",
+			s.state.DeviceID,
+			currentAgentServerURL(),
+			agentRegisterURLForLog(),
+		))
 		return s.saveStateLocked()
 	}
 
@@ -684,23 +753,36 @@ func (s *AgentService) registerAndSyncLocked() error {
 	s.state.LastSyncAt = time.Now().UTC().Format(time.RFC3339)
 	s.state.LastSyncStatus = "connecting"
 	s.state.LastSyncMessage = ""
+	logger.Info(fmt.Sprintf("[AGENT-BOOT] register_sync local_state_registered device_id=%s agent_server=%s register_url=%s note=%q",
+		s.state.DeviceID,
+		currentAgentServerURL(),
+		agentRegisterURLForLog(),
+		"remote registration is completed by websocket agent.hello",
+	))
 	return s.saveStateLocked()
 }
 
 func (s *AgentService) startRemoteBindingLocked() (*agentRemoteBindSession, error) {
 	cfg := config.GetGlobalConfig()
 	if cfg == nil || strings.TrimSpace(cfg.AgentBaseURL()) == "" {
+		logger.Info("[AGENT-BOOT] remote_binding skipped reason=agent_server_not_configured")
 		return nil, errors.New("agent server is not configured")
 	}
 
 	payload := map[string]interface{}{
 		"device_id":     s.state.DeviceID,
+		"unique_code":   s.state.UniqueCode,
 		"device_name":   defaultAgentDeviceName(),
 		"platform":      agentPlatform(),
 		"agent_version": version.String(),
 		"capabilities":  agentCapabilities(),
+		"tools":         detectAgentTools(),
+		"history":       collectAgentHistoryRoots(),
+		"started_at":    time.Now().UTC().Format(time.RFC3339),
 	}
-	raw, err := s.callAgentServer(http.MethodPost, cfg.GetAgentPairingTicketsURL(), payload)
+	endpoint := cfg.GetAgentPairingTicketsURL()
+	logger.Info(fmt.Sprintf("[AGENT-BOOT] remote_binding start endpoint=%s device_id=%s", sanitizeAgentEndpoint(endpoint), s.state.DeviceID))
+	raw, err := s.callAgentServer(http.MethodPost, endpoint, payload)
 	if err != nil {
 		return nil, err
 	}
@@ -739,6 +821,7 @@ func (s *AgentService) startRemoteBindingLocked() (*agentRemoteBindSession, erro
 	if parsed, err := time.Parse(time.RFC3339, strings.TrimSpace(resp.ExpiresAt)); err == nil {
 		expiresAt = parsed.UTC()
 	}
+	logger.Info(fmt.Sprintf("[AGENT-BOOT] remote_binding created ticket_id=%s has_pairing_code=%t expires_at=%s", sessionID, strings.TrimSpace(resp.PairingCode) != "", expiresAt.Format(time.RFC3339)))
 	return &agentRemoteBindSession{
 		ID:          sessionID,
 		Payload:     payloadText,
@@ -751,12 +834,15 @@ func (s *AgentService) startRemoteBindingLocked() (*agentRemoteBindSession, erro
 func (s *AgentService) pollRemoteBindingLocked(session *agentBindSessionState) (*models.AgentBindStatusResponse, error) {
 	cfg := config.GetGlobalConfig()
 	if cfg == nil || strings.TrimSpace(cfg.AgentBaseURL()) == "" {
+		logger.Info("[AGENT-BOOT] remote_binding_poll skipped reason=agent_server_not_configured")
 		return nil, errors.New("agent server is not configured")
 	}
 	if strings.TrimSpace(session.AgentSecret) == "" {
 		return nil, errors.New("binding session is missing agent_secret")
 	}
-	raw, err := s.callAgentServer(http.MethodGet, cfg.GetAgentPairingTicketResultURL(session.ID, session.AgentSecret), nil)
+	endpoint := cfg.GetAgentPairingTicketResultURL(session.ID, session.AgentSecret)
+	logger.Info(fmt.Sprintf("[AGENT-BOOT] remote_binding_poll begin endpoint=%s ticket_id=%s", sanitizeAgentEndpoint(endpoint), session.ID))
+	raw, err := s.callAgentServer(http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -815,6 +901,7 @@ func (s *AgentService) pollRemoteBindingLocked(session *agentBindSessionState) (
 		_ = s.saveStateLocked()
 		status = bindStatusBound
 		if deviceToken != "" {
+			logger.Info(fmt.Sprintf("[AGENT-BOOT] remote_binding_poll approved device_id=%s has_device_token=true", deviceID))
 			go func() {
 				_ = s.EnsureRemoteConnection()
 			}()
@@ -860,8 +947,15 @@ func (s *AgentService) callAgentServer(method string, endpoint string, payload i
 	if strings.TrimSpace(s.state.DeviceToken) != "" {
 		req.Header.Set("X-Agent-Device-Token", strings.TrimSpace(s.state.DeviceToken))
 	}
+	logger.Info(fmt.Sprintf("[AGENT-BOOT] agent_server_call begin method=%s endpoint=%s has_auth=%t has_device_token=%t",
+		method,
+		sanitizeAgentEndpoint(endpoint),
+		strings.TrimSpace(req.Header.Get("Authorization")) != "",
+		strings.TrimSpace(s.state.DeviceToken) != "",
+	))
 	resp, err := s.client.Do(req)
 	if err != nil {
+		logger.Warn(fmt.Sprintf("[AGENT-BOOT] agent_server_call failed method=%s endpoint=%s error=%v", method, sanitizeAgentEndpoint(endpoint), err))
 		return nil, err
 	}
 	defer resp.Body.Close()
@@ -870,8 +964,10 @@ func (s *AgentService) callAgentServer(method string, endpoint string, payload i
 		return nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		logger.Warn(fmt.Sprintf("[AGENT-BOOT] agent_server_call non_2xx method=%s endpoint=%s status=%d", method, sanitizeAgentEndpoint(endpoint), resp.StatusCode))
 		return nil, fmt.Errorf("agent server returned %d: %s", resp.StatusCode, string(raw))
 	}
+	logger.Info(fmt.Sprintf("[AGENT-BOOT] agent_server_call success method=%s endpoint=%s status=%d", method, sanitizeAgentEndpoint(endpoint), resp.StatusCode))
 	return unwrapAgentServerData(raw)
 }
 
@@ -888,6 +984,96 @@ func unwrapAgentServerData(raw []byte) ([]byte, error) {
 		return envelope.Data, nil
 	}
 	return raw, nil
+}
+
+func (s *AgentService) applyRemoteDeviceSettings(msg map[string]interface{}) {
+	rawDevice, ok := msg["device"].(map[string]interface{})
+	if !ok {
+		return
+	}
+	s.mu.Lock()
+	s.ensureDeviceIdentityLocked()
+	if s.state.Device == nil {
+		s.syncRuntimeDeviceStatusLocked()
+	}
+	if s.state.Device == nil {
+		s.mu.Unlock()
+		return
+	}
+	terminalDisabled := false
+	aiDisabled := false
+	if name := remoteString(rawDevice, "name"); name != "" {
+		s.state.Device.Name = name
+	}
+	deviceID := remoteString(rawDevice, "device_id")
+	if deviceID == "" {
+		deviceID = remoteString(rawDevice, "id")
+	}
+	if deviceID != "" {
+		s.state.Device.ID = deviceID
+		s.state.Device.DeviceID = deviceID
+		s.state.DeviceID = deviceID
+	}
+	if platform := remoteString(rawDevice, "platform"); platform != "" {
+		s.state.Device.Platform = platform
+	}
+	if status := remoteString(rawDevice, "status"); status != "" {
+		s.state.Device.Status = status
+	}
+	if agentVersion := remoteString(rawDevice, "agent_version"); agentVersion != "" {
+		s.state.Device.AgentVersion = agentVersion
+	}
+	if lastSeenAt := remoteString(rawDevice, "last_seen_at"); lastSeenAt != "" {
+		s.state.Device.LastSeenAt = lastSeenAt
+	}
+	if pairedAt := remoteString(rawDevice, "paired_at"); pairedAt != "" {
+		s.state.Device.PairedAt = pairedAt
+	}
+	if boundAt := remoteString(rawDevice, "bound_at"); boundAt != "" {
+		s.state.Device.BoundAt = boundAt
+	}
+	if capabilities := remoteStringSlice(rawDevice, "capabilities"); capabilities != nil {
+		s.state.Device.Capabilities = capabilities
+	}
+	if value, ok := rawDevice["remote_terminal_enabled"].(bool); ok {
+		s.state.Device.RemoteTerminalEnabled = value
+		terminalDisabled = !value
+	}
+	if value, ok := rawDevice["ai_control_enabled"].(bool); ok {
+		s.state.Device.AIControlEnabled = value
+		aiDisabled = !value
+	}
+	s.state.LastSyncAt = time.Now().UTC().Format(time.RFC3339)
+	s.state.LastSyncStatus = "settings_updated"
+	s.state.LastSyncMessage = ""
+	_ = s.saveStateLocked()
+	s.mu.Unlock()
+
+	if terminalDisabled {
+		s.terminal.closeAll()
+	}
+	if aiDisabled {
+		s.ai.closeAll()
+	}
+}
+
+func remoteStringSlice(msg map[string]interface{}, key string) []string {
+	raw, ok := msg[key]
+	if !ok || raw == nil {
+		return nil
+	}
+	values, ok := raw.([]interface{})
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		text := strings.TrimSpace(fmt.Sprint(value))
+		if text != "" {
+			out = append(out, text)
+		}
+	}
+	return out
 }
 
 func buildAgentRegisterPayload(deviceID string, uniqueCode string) agentRegisterPayload {
@@ -985,6 +1171,29 @@ func currentAgentServerURL() string {
 		return ""
 	}
 	return cfg.AgentBaseURL()
+}
+
+func agentRegisterURLForLog() string {
+	cfg := config.GetGlobalConfig()
+	if cfg == nil {
+		return ""
+	}
+	return sanitizeAgentEndpoint(cfg.GetAgentDeviceRegisterURL())
+}
+
+func sanitizeAgentEndpoint(endpoint string) string {
+	parsed, err := url.Parse(strings.TrimSpace(endpoint))
+	if err != nil {
+		return strings.TrimSpace(endpoint)
+	}
+	values := parsed.Query()
+	for _, key := range []string{"token", "agent_secret", "device_token"} {
+		if values.Has(key) {
+			values.Set(key, "<redacted>")
+		}
+	}
+	parsed.RawQuery = values.Encode()
+	return parsed.String()
 }
 
 func currentAgentRuntimeStatus() *models.AgentRuntime {

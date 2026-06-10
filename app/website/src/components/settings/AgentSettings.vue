@@ -187,7 +187,7 @@
           type="button"
           class="flex min-h-10 items-center justify-between gap-3 rounded-lg border px-3 py-2 text-left transition disabled:cursor-not-allowed disabled:opacity-50"
           :class="tool.available ? 'border-slate-200 hover:border-primary/40 hover:bg-primary/5 dark:border-slate-700 dark:hover:bg-primary/10' : 'border-slate-200 bg-slate-50 dark:border-slate-800 dark:bg-slate-900/60'"
-          :disabled="!agentEnabled || !tool.available || launchLoading"
+          :disabled="!canLaunchCommands || !tool.available || launchLoading"
           @click="launchTool(tool.id)"
         >
           <span class="min-w-0">
@@ -209,7 +209,7 @@
           type="text"
           class="mt-2 h-10 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm text-slate-700 outline-none transition focus:border-primary dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
           :placeholder="t('agent_workdirPlaceholder')"
-          :disabled="!agentEnabled || launchLoading"
+          :disabled="!canLaunchCommands || launchLoading"
         />
 
         <label class="mt-3 block text-[11px] font-bold uppercase tracking-[0.18em] text-slate-500 dark:text-slate-400">
@@ -221,13 +221,13 @@
             type="text"
             class="h-10 min-w-0 flex-1 rounded-lg border border-slate-200 bg-white px-3 text-sm text-slate-700 outline-none transition focus:border-primary dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
             :placeholder="t('agent_commandPlaceholder')"
-            :disabled="!agentEnabled || launchLoading"
+            :disabled="!canLaunchCommands || launchLoading"
             @keydown.enter.prevent="launchCommand"
           />
           <button
             type="button"
             class="inline-flex h-10 items-center justify-center rounded-lg bg-slate-900 px-3 text-xs font-bold text-white transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60 dark:bg-primary"
-            :disabled="!agentEnabled || !commandLine || launchLoading"
+            :disabled="!canLaunchCommands || !commandLine || launchLoading"
             @click="launchCommand"
           >
             {{ t('agent_run') }}
@@ -424,11 +424,25 @@ export default {
       return capabilities.length ? capabilities.join(' / ') : '-';
     },
     deviceFeatureSummary() {
-      const device = this.status?.device || {};
+      const device = this.status?.device;
+      if (!device) return '-';
       const features = [];
-      if (device.remote_terminal_enabled) features.push(this.t('agent_featureTerminal'));
-      if (device.ai_control_enabled) features.push(this.t('agent_featureAI'));
+      features.push(this.remoteTerminalFeatureEnabled ? this.t('agent_featureTerminal') : this.t('agent_featureTerminalOff'));
+      features.push(this.aiControlFeatureEnabled ? this.t('agent_featureAI') : this.t('agent_featureAIOff'));
       return features.length ? features.join(' / ') : '-';
+    },
+    remoteTerminalFeatureEnabled() {
+      const device = this.status?.device;
+      if (!device) return true;
+      return device.remote_terminal_enabled !== false;
+    },
+    aiControlFeatureEnabled() {
+      const device = this.status?.device;
+      if (!device) return true;
+      return device.ai_control_enabled !== false;
+    },
+    canLaunchCommands() {
+      return this.agentEnabled && this.remoteTerminalFeatureEnabled;
     },
     primaryTools() {
       const tools = Array.isArray(this.status?.tools) ? this.status.tools : [];
@@ -480,8 +494,13 @@ export default {
         },
         {
           key: 'terminal',
-          ok: true,
-          label: this.t('agent_preTerminal'),
+          ok: this.remoteTerminalFeatureEnabled,
+          label: this.remoteTerminalFeatureEnabled ? this.t('agent_preTerminalOk') : this.t('agent_preTerminalDisabled'),
+        },
+        {
+          key: 'ai',
+          ok: this.aiControlFeatureEnabled,
+          label: this.aiControlFeatureEnabled ? this.t('agent_preAIOk') : this.t('agent_preAIDisabled'),
         },
       ];
     },
@@ -596,10 +615,18 @@ export default {
       }
     },
     async launchTool(tool) {
+      if (!this.canLaunchCommands) {
+        this.setFeedback(this.t('agent_remoteTerminalDisabled'), 'error');
+        return;
+      }
       await this.launch({ tool });
     },
     async launchCommand() {
       if (!this.commandLine) return;
+      if (!this.canLaunchCommands) {
+        this.setFeedback(this.t('agent_remoteTerminalDisabled'), 'error');
+        return;
+      }
       await this.launch({ tool: 'command', command_line: this.commandLine });
     },
     async launch(payload) {

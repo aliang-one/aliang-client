@@ -817,6 +817,8 @@ export default {
   agent_capabilities: '能力声明',
   agent_featureTerminal: '远程终端',
   agent_featureAI: 'AI 控制',
+  agent_featureTerminalOff: '远程终端已关闭',
+  agent_featureAIOff: 'AI 控制已关闭',
   agent_toolsFound: '工具',
   agent_toolsSummary: '{available}/{total} 可用',
   agent_server: 'Agent 服务端',
@@ -837,7 +839,10 @@ export default {
   agent_preBoundMissing: '请先扫码绑定当前设备。',
   agent_preToolOk: '至少有一个支持的工具存在于 PATH。',
   agent_preToolMissing: '请安装 Codex 或 Claude Code，或将其加入 PATH。',
-  agent_preTerminal: '命令会在当前用户的终端会话中打开。',
+  agent_preTerminalOk: '远程终端能力已开启，可执行本地命令。',
+  agent_preTerminalDisabled: '远程终端能力已被服务端关闭。',
+  agent_preAIOk: 'AI 控制能力已开启，可调用 Codex 或 Claude Code。',
+  agent_preAIDisabled: 'AI 控制能力已被服务端关闭。',
   agent_history: '历史同步',
   agent_historySummary: '发现 {found}/{total} 个目录',
   agent_historyFound: '已发现',
@@ -873,6 +878,7 @@ export default {
   agent_disableFailed: '关闭 Agent 模式失败。',
   agent_launchSuccess: '命令已启动。',
   agent_launchFailed: '启动命令失败。',
+  agent_remoteTerminalDisabled: '远程终端能力已关闭，无法执行命令。',
 
   // -- ConfigSyncSettings --
   sync_title: '配置同步中心',
