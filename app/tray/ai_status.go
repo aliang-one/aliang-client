@@ -2,6 +2,7 @@ package tray
 
 import (
 	"fmt"
+	"strings"
 
 	"aliang.one/nursorgate/processor/config"
 	"aliang.one/nursorgate/processor/statistic"
@@ -113,4 +114,19 @@ func BuildAIStatusFromIPCData(data map[string]interface{}) []AIProviderStatus {
 		})
 	}
 	return result
+}
+
+func trayIconProviderKey(key string) string {
+	switch strings.ToLower(strings.TrimSpace(key)) {
+	case "vscode", "copilot", "githubcopilot", "github-copilot":
+		return "vscode"
+	case "cursor":
+		return "cursor"
+	case "openai", "chatgpt":
+		return "openai"
+	case "anthropic", "claude":
+		return "anthropic"
+	default:
+		return ""
+	}
 }
