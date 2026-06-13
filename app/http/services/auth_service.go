@@ -58,6 +58,18 @@ func clearStartupStateAfterLogout() {
 	startupState.SetStatus(runtime.UNCONFIGURED)
 }
 
+func agentSyncResult(reason string) map[string]interface{} {
+	if err := RequestUserAgentSyncAfterAuth(reason); err != nil {
+		return map[string]interface{}{
+			"status": "failed",
+			"error":  err.Error(),
+		}
+	}
+	return map[string]interface{}{
+		"status": "success",
+	}
+}
+
 func (s *AuthService) Login(email, password, turnstileToken string) map[string]interface{} {
 	if strings.TrimSpace(email) == "" {
 		return map[string]interface{}{
@@ -85,11 +97,13 @@ func (s *AuthService) Login(email, password, turnstileToken string) map[string]i
 	}
 
 	syncStartupStateForAuthenticatedUser(userInfo)
+	agentSync := agentSyncResult("login")
 
 	return map[string]interface{}{
-		"status": "success",
-		"msg":    "Login successful",
-		"data":   mapUserInfo(userInfo),
+		"status":     "success",
+		"msg":        "Login successful",
+		"data":       mapUserInfo(userInfo),
+		"agent_sync": agentSync,
 	}
 }
 
@@ -111,11 +125,13 @@ func (s *AuthService) RestoreSession() map[string]interface{} {
 	}
 
 	syncStartupStateForAuthenticatedUser(userInfo)
+	agentSync := agentSyncResult("restore_session")
 
 	return map[string]interface{}{
-		"status": "success",
-		"msg":    "Session restored successfully",
-		"data":   mapUserInfo(userInfo),
+		"status":     "success",
+		"msg":        "Session restored successfully",
+		"data":       mapUserInfo(userInfo),
+		"agent_sync": agentSync,
 	}
 }
 
@@ -139,11 +155,13 @@ func (s *AuthService) RefreshSession(refreshToken string) map[string]interface{}
 	}
 
 	syncStartupStateForAuthenticatedUser(userInfo)
+	agentSync := agentSyncResult("refresh_session")
 
 	return map[string]interface{}{
-		"status": "success",
-		"msg":    "Session refreshed successfully",
-		"data":   mapUserInfo(userInfo),
+		"status":     "success",
+		"msg":        "Session refreshed successfully",
+		"data":       mapUserInfo(userInfo),
+		"agent_sync": agentSync,
 	}
 }
 
@@ -177,6 +195,7 @@ func (s *AuthService) LogoutUser(refreshToken string) map[string]interface{} {
 	}
 
 	clearStartupStateAfterLogout()
+	RequestUserAgentDisableAfterLogout("logout")
 
 	logger.Info("User logged out successfully")
 

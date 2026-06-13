@@ -1,18 +1,17 @@
 package services
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
-	"aliang.one/nursorgate/common/cache"
+	"aliang.one/nursorgate/app/http/models"
 )
 
 type agentAIManager struct {
@@ -21,11 +20,36 @@ type agentAIManager struct {
 }
 
 type agentAISession struct {
-	id          string
-	mode        string
-	projectPath string
-	cancel      context.CancelFunc
-	runSeq      int
+	id              string
+	mode            string
+	projectPath     string
+	provider        string
+	model           string
+	resumeSessionID string
+	initialContext  string
+	cancel          context.CancelFunc
+	runSeq          int
+	history         []agentAIMessage
+}
+
+type agentAIMessage struct {
+	Role      string
+	MessageID string
+	Content   string
+	CreatedAt time.Time
+}
+
+type agentAIRun struct {
+	sessionID       string
+	messageID       string
+	runSeq          int
+	mode            string
+	projectPath     string
+	provider        string
+	model           string
+	resumeSessionID string
+	prompt          string
+	cancel          context.CancelFunc
 }
 
 type agentAITool struct {
@@ -58,21 +82,62 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 	if mode == "" {
 		mode = "vibe"
 	}
+	provider := strings.TrimSpace(remoteString(msg, "provider"))
+	if provider == "" {
+		provider = strings.TrimSpace(remoteString(msg, "tool"))
+	}
+	provider, err = normalizeAgentAIProvider(provider)
+	if err != nil {
+		_ = writeJSON(agentAIErrorPayload(sessionID, "", err))
+		return
+	}
+	model := strings.TrimSpace(remoteString(msg, "model"))
+	resumeSessionID := firstNonEmpty(remoteString(msg, "resume_session_id"), remoteString(msg, "source_session_id"))
+	initialContext := strings.TrimSpace(remoteString(msg, "initial_context"))
+	history := remoteAgentAIHistory(msg)
+	if initialContext != "" {
+		history = append([]agentAIMessage{{
+			Role:      "system",
+			MessageID: "initial_context",
+			Content:   initialContext,
+			CreatedAt: time.Now().UTC(),
+		}}, history...)
+	}
 
 	m.mu.Lock()
-	m.sessions[sessionID] = &agentAISession{
-		id:          sessionID,
-		mode:        mode,
-		projectPath: projectPath,
+	if existing := m.sessions[sessionID]; existing != nil {
+		existing.mode = mode
+		existing.projectPath = projectPath
+		existing.provider = provider
+		existing.model = model
+		existing.resumeSessionID = resumeSessionID
+		existing.initialContext = initialContext
+		if len(history) > 0 {
+			existing.history = trimAgentAIHistory(history)
+		}
+		m.mu.Unlock()
+		_ = writeJSON(agentAISessionCreatedPayload(existing))
+		return
 	}
+	if len(m.sessions) >= agentMaxAISessions {
+		m.mu.Unlock()
+		_ = writeJSON(agentAIErrorPayload(sessionID, "", fmt.Errorf("ai session limit reached: %d", agentMaxAISessions)))
+		return
+	}
+	session := &agentAISession{
+		id:              sessionID,
+		mode:            mode,
+		projectPath:     projectPath,
+		provider:        provider,
+		model:           model,
+		resumeSessionID: resumeSessionID,
+		initialContext:  initialContext,
+		history:         trimAgentAIHistory(history),
+	}
+	m.sessions[sessionID] = session
 	m.mu.Unlock()
 
-	_ = writeJSON(map[string]interface{}{
-		"type":         "ai.session.created",
-		"session_id":   sessionID,
-		"mode":         mode,
-		"project_path": projectPath,
-	})
+	_ = writeJSON(agentAISessionCreatedPayload(session))
 }
 
 func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerminalWriter) {
@@ -93,26 +158,100 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 		_ = writeJSON(agentAIErrorPayload(sessionID, messageID, errors.New("ai.message content is empty")))
 		return
 	}
-
-	session := m.get(sessionID)
-	if session == nil {
-		_ = writeJSON(agentAIErrorPayload(sessionID, messageID, fmt.Errorf("ai session not found: %s", sessionID)))
+	if len(content) > agentAIMessageLimitBytes {
+		_ = writeJSON(agentAIErrorPayload(sessionID, messageID, fmt.Errorf("ai.message exceeds %d bytes", agentAIMessageLimitBytes)))
 		return
 	}
 
+	now := time.Now().UTC()
 	m.mu.Lock()
+	session := m.sessions[sessionID]
+	if session == nil {
+		m.mu.Unlock()
+		_ = writeJSON(agentAIErrorPayload(sessionID, messageID, fmt.Errorf("ai session not found: %s", sessionID)))
+		return
+	}
 	if session.cancel != nil {
 		m.mu.Unlock()
 		_ = writeJSON(agentAIErrorPayload(sessionID, messageID, fmt.Errorf("ai session is already running: %s", sessionID)))
 		return
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	provider, err := normalizeAgentAIProvider(firstNonEmpty(strings.TrimSpace(remoteString(msg, "provider")), strings.TrimSpace(remoteString(msg, "tool")), session.provider))
+	if err != nil {
+		m.mu.Unlock()
+		_ = writeJSON(agentAIErrorPayload(sessionID, messageID, err))
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), agentAIRunTimeout)
 	session.cancel = cancel
 	session.runSeq++
-	runSeq := session.runSeq
+	resumeSessionID := strings.TrimSpace(session.resumeSessionID)
+	session.history = append(session.history, agentAIMessage{
+		Role:      "user",
+		MessageID: messageID,
+		Content:   content,
+		CreatedAt: now,
+	})
+	prompt := buildAgentAIPrompt(session, content)
+	if resumeSessionID != "" {
+		prompt = content
+	}
+	run := agentAIRun{
+		sessionID:       session.id,
+		messageID:       messageID,
+		runSeq:          session.runSeq,
+		mode:            session.mode,
+		projectPath:     session.projectPath,
+		provider:        provider,
+		model:           session.model,
+		resumeSessionID: resumeSessionID,
+		prompt:          prompt,
+		cancel:          cancel,
+	}
 	m.mu.Unlock()
 
-	go m.runCLI(ctx, session, runSeq, messageID, content, writeJSON)
+	go m.runCLI(ctx, run, writeJSON)
+}
+
+func agentAISessionCreatedPayload(session *agentAISession) map[string]interface{} {
+	payload := map[string]interface{}{
+		"type":         models.AgentEventAISessionCreated,
+		"session_id":   session.id,
+		"mode":         session.mode,
+		"project_path": session.projectPath,
+		"provider":     session.provider,
+		"model":        session.model,
+		"state":        "idle",
+	}
+	if session.resumeSessionID != "" {
+		payload["resume_session_id"] = session.resumeSessionID
+	}
+	return payload
+}
+
+func remoteAgentAIHistory(msg map[string]interface{}) []agentAIMessage {
+	raw, ok := msg["transcript"].([]interface{})
+	if !ok || len(raw) == 0 {
+		return nil
+	}
+	history := make([]agentAIMessage, 0, len(raw))
+	for _, item := range raw {
+		row, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		content := strings.TrimSpace(remoteString(row, "content"))
+		if content == "" {
+			continue
+		}
+		history = append(history, agentAIMessage{
+			Role:      remoteString(row, "role"),
+			MessageID: remoteString(row, "id"),
+			Content:   content,
+			CreatedAt: time.Now().UTC(),
+		})
+	}
+	return history
 }
 
 func (m *agentAIManager) stop(msg map[string]interface{}, writeJSON agentTerminalWriter) {
@@ -125,49 +264,73 @@ func (m *agentAIManager) stop(msg map[string]interface{}, writeJSON agentTermina
 		return
 	}
 
-	session := m.get(sessionID)
+	m.mu.Lock()
+	session := m.sessions[sessionID]
 	if session == nil {
+		m.mu.Unlock()
 		_ = writeJSON(map[string]interface{}{
-			"type":       "ai.status",
+			"type":       models.AgentEventAIStatus,
 			"session_id": sessionID,
 			"status":     "stopped",
 		})
 		return
 	}
-
-	m.mu.Lock()
 	cancel := session.cancel
 	m.mu.Unlock()
 	if cancel != nil {
 		cancel()
 	}
 	_ = writeJSON(map[string]interface{}{
-		"type":       "ai.status",
+		"type":       models.AgentEventAIStatus,
 		"session_id": sessionID,
 		"status":     "stopping",
 	})
 }
 
+func (m *agentAIManager) close(msg map[string]interface{}, writeJSON agentTerminalWriter) {
+	if writeJSON == nil {
+		return
+	}
+	sessionID := remoteString(msg, "session_id")
+	if sessionID == "" {
+		_ = writeJSON(agentAIErrorPayload("", "", errors.New("ai.session.close missing session_id")))
+		return
+	}
+
+	m.mu.Lock()
+	session := m.sessions[sessionID]
+	if session != nil {
+		delete(m.sessions, sessionID)
+	}
+	var cancel context.CancelFunc
+	if session != nil {
+		cancel = session.cancel
+	}
+	m.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	_ = writeJSON(map[string]interface{}{
+		"type":       models.AgentEventAISessionClosed,
+		"session_id": sessionID,
+	})
+}
+
 func (m *agentAIManager) closeAll() {
 	m.mu.Lock()
-	sessions := make([]*agentAISession, 0, len(m.sessions))
+	cancels := make([]context.CancelFunc, 0, len(m.sessions))
 	for _, session := range m.sessions {
-		sessions = append(sessions, session)
+		if session.cancel != nil {
+			cancels = append(cancels, session.cancel)
+		}
 	}
 	m.sessions = make(map[string]*agentAISession)
 	m.mu.Unlock()
 
-	for _, session := range sessions {
-		if session.cancel != nil {
-			session.cancel()
-		}
+	for _, cancel := range cancels {
+		cancel()
 	}
-}
-
-func (m *agentAIManager) get(sessionID string) *agentAISession {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.sessions[sessionID]
 }
 
 func (m *agentAIManager) clearRunning(sessionID string, runSeq int) {
@@ -176,142 +339,354 @@ func (m *agentAIManager) clearRunning(sessionID string, runSeq int) {
 	session := m.sessions[sessionID]
 	if session != nil && session.runSeq == runSeq {
 		session.cancel = nil
+		session.history = trimAgentAIHistory(session.history)
 	}
 }
 
-func (m *agentAIManager) runCLI(ctx context.Context, session *agentAISession, runSeq int, messageID string, content string, writeJSON agentTerminalWriter) {
-	defer m.clearRunning(session.id, runSeq)
+func (m *agentAIManager) appendAssistantHistory(sessionID string, runSeq int, messageID string, output string) {
+	output = strings.TrimSpace(output)
+	if output == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	session := m.sessions[sessionID]
+	if session == nil || session.runSeq != runSeq {
+		return
+	}
+	session.history = append(session.history, agentAIMessage{
+		Role:      "assistant",
+		MessageID: agentAssistantMessageID(messageID),
+		Content:   output,
+		CreatedAt: time.Now().UTC(),
+	})
+	session.history = trimAgentAIHistory(session.history)
+}
 
-	tool, err := resolveAgentAITool(content)
+func (m *agentAIManager) runCLI(ctx context.Context, run agentAIRun, writeJSON agentTerminalWriter) {
+	defer m.clearRunning(run.sessionID, run.runSeq)
+	if run.cancel != nil {
+		defer run.cancel()
+	}
+
+	tool, err := resolveAgentAITool(run.prompt, run.provider, run.model, run.resumeSessionID)
 	if err != nil {
-		_ = writeJSON(agentAIErrorPayload(session.id, messageID, err))
+		_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, err))
 		return
 	}
 
 	cmd := exec.CommandContext(ctx, tool.path, tool.args...)
-	cmd.Dir = session.projectPath
+	cmd.Dir = run.projectPath
 	cmd.Env = os.Environ()
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		_ = writeJSON(agentAIErrorPayload(session.id, messageID, err))
+		_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, err))
 		return
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		_ = writeJSON(agentAIErrorPayload(session.id, messageID, err))
+		_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, err))
 		return
 	}
 	if err := cmd.Start(); err != nil {
-		_ = writeJSON(agentAIErrorPayload(session.id, messageID, err))
+		_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, err))
 		return
 	}
 
 	_ = writeJSON(map[string]interface{}{
-		"type":       "ai.delta",
-		"session_id": session.id,
-		"message_id": agentAssistantMessageID(messageID),
-		"delta":      fmt.Sprintf("Running %s in %s\n", tool.id, session.projectPath),
+		"type":         models.AgentEventAIRunStarted,
+		"session_id":   run.sessionID,
+		"message_id":   agentAssistantMessageID(run.messageID),
+		"provider":     tool.id,
+		"mode":         run.mode,
+		"project_path": run.projectPath,
+		"state":        "running",
 	})
 
 	var wg sync.WaitGroup
+	var outMu sync.Mutex
+	var output strings.Builder
+	limiter := &agentAIOutputLimiter{limit: agentAIOutputLimitBytes}
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		copyAIDelta(stdout, session.id, messageID, writeJSON)
+		streamAIDelta(stdout, run, "stdout", writeJSON, limiter, func(text string) {
+			outMu.Lock()
+			output.WriteString(text)
+			outMu.Unlock()
+		})
 	}()
 	go func() {
 		defer wg.Done()
-		copyAIDelta(stderr, session.id, messageID, writeJSON)
+		streamAIDelta(stderr, run, "stderr", writeJSON, limiter, func(text string) {
+			outMu.Lock()
+			output.WriteString(text)
+			outMu.Unlock()
+		})
 	}()
 	waitErr := cmd.Wait()
 	wg.Wait()
 
 	if ctx.Err() != nil {
+		status := "stopped"
+		if limiter.Exceeded() {
+			status = "output_limited"
+			_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, fmt.Errorf("AI output exceeded %d bytes", agentAIOutputLimitBytes)))
+		} else if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			status = "timeout"
+			_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, fmt.Errorf("AI run exceeded timeout %s", agentAIRunTimeout)))
+		}
 		_ = writeJSON(map[string]interface{}{
-			"type":       "ai.status",
-			"session_id": session.id,
-			"status":     "stopped",
+			"type":       models.AgentEventAIStatus,
+			"session_id": run.sessionID,
+			"status":     status,
 		})
 		return
 	}
 	if waitErr != nil {
-		_ = writeJSON(agentAIErrorPayload(session.id, messageID, waitErr))
+		_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, waitErr))
 		return
 	}
+	outMu.Lock()
+	assistantOutput := output.String()
+	outMu.Unlock()
+	m.appendAssistantHistory(run.sessionID, run.runSeq, run.messageID, assistantOutput)
 	_ = writeJSON(map[string]interface{}{
-		"type":       "ai.done",
-		"session_id": session.id,
-		"message_id": agentAssistantMessageID(messageID),
+		"type":       models.AgentEventAIDone,
+		"session_id": run.sessionID,
+		"message_id": agentAssistantMessageID(run.messageID),
 	})
 }
 
-func copyAIDelta(reader io.Reader, sessionID string, messageID string, writeJSON agentTerminalWriter) {
-	scanner := bufio.NewScanner(reader)
-	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 1024*1024)
-	for scanner.Scan() {
-		text := scanner.Text()
-		if text != "" {
-			text += "\n"
+type agentAIOutputLimiter struct {
+	mu       sync.Mutex
+	limit    int
+	used     int
+	exceeded bool
+}
+
+func (l *agentAIOutputLimiter) Reserve(n int) int {
+	if l == nil {
+		return n
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.exceeded || l.limit <= 0 {
+		l.exceeded = true
+		return 0
+	}
+	remaining := l.limit - l.used
+	if remaining <= 0 {
+		l.exceeded = true
+		return 0
+	}
+	if n > remaining {
+		l.used = l.limit
+		l.exceeded = true
+		return remaining
+	}
+	l.used += n
+	return n
+}
+
+func (l *agentAIOutputLimiter) Exceeded() bool {
+	if l == nil {
+		return false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.exceeded
+}
+
+func streamAIDelta(reader io.Reader, run agentAIRun, channel string, writeJSON agentTerminalWriter, limiter *agentAIOutputLimiter, capture func(string)) {
+	buf := make([]byte, 4096)
+	for {
+		n, err := reader.Read(buf)
+		if n > 0 {
+			allowed := limiter.Reserve(n)
+			if allowed <= 0 {
+				if run.cancel != nil {
+					run.cancel()
+				}
+				return
+			}
+			text := string(buf[:allowed])
+			if capture != nil {
+				capture(text)
+			}
+			_ = writeJSON(map[string]interface{}{
+				"type":       models.AgentEventAIDelta,
+				"session_id": run.sessionID,
+				"message_id": agentAssistantMessageID(run.messageID),
+				"channel":    channel,
+				"delta":      text,
+			})
+			if allowed < n {
+				if run.cancel != nil {
+					run.cancel()
+				}
+				return
+			}
 		}
-		_ = writeJSON(map[string]interface{}{
-			"type":       "ai.delta",
-			"session_id": sessionID,
-			"message_id": agentAssistantMessageID(messageID),
-			"delta":      text,
-		})
+		if err != nil {
+			return
+		}
 	}
 }
 
-func resolveAgentAITool(prompt string) (*agentAITool, error) {
-	if path, err := exec.LookPath("codex"); err == nil {
-		return &agentAITool{
-			id:   "codex",
-			path: path,
-			args: []string{"exec", "--skip-git-repo-check", "--color", "never", prompt},
-		}, nil
+func buildAgentAIPrompt(session *agentAISession, latestContent string) string {
+	history := trimAgentAIHistory(append([]agentAIMessage(nil), session.history...))
+	var builder strings.Builder
+	builder.WriteString("You are continuing an Aliang remote agent AI chat session.\n")
+	builder.WriteString("Use the existing conversation as context and answer the latest user message.\n")
+	builder.WriteString("Project path: ")
+	builder.WriteString(session.projectPath)
+	builder.WriteString("\nMode: ")
+	builder.WriteString(session.mode)
+	builder.WriteString("\n\nConversation:\n")
+	for _, item := range history {
+		builder.WriteString(agentAIRoleLabel(item.Role))
+		builder.WriteString(": ")
+		builder.WriteString(strings.TrimSpace(item.Content))
+		builder.WriteString("\n\n")
 	}
-	if path, err := exec.LookPath("claude"); err == nil {
-		return &agentAITool{
-			id:   "claude",
-			path: path,
-			args: []string{"--print", "--output-format", "text", prompt},
-		}, nil
+	if len(history) == 0 {
+		builder.WriteString("User: ")
+		builder.WriteString(strings.TrimSpace(latestContent))
+		builder.WriteString("\n\n")
 	}
-	if path, err := exec.LookPath("claudecode"); err == nil {
-		return &agentAITool{
-			id:   "claudecode",
-			path: path,
-			args: []string{"--print", "--output-format", "text", prompt},
-		}, nil
+	builder.WriteString("Assistant:")
+	return builder.String()
+}
+
+func agentAIRoleLabel(role string) string {
+	role = strings.ToLower(strings.TrimSpace(role))
+	switch role {
+	case "user":
+		return "User"
+	case "assistant":
+		return "Assistant"
+	case "system":
+		return "System"
+	case "":
+		return "Message"
+	default:
+		return strings.ToUpper(role[:1]) + role[1:]
+	}
+}
+
+func trimAgentAIHistory(history []agentAIMessage) []agentAIMessage {
+	const maxMessages = 16
+	const maxChars = 64000
+	if len(history) > maxMessages {
+		history = history[len(history)-maxMessages:]
+	}
+	total := 0
+	start := len(history)
+	for i := len(history) - 1; i >= 0; i-- {
+		total += len(history[i].Content)
+		if total > maxChars {
+			break
+		}
+		start = i
+	}
+	if start > 0 && start < len(history) {
+		history = history[start:]
+	}
+	return history
+}
+
+func resolveAgentAITool(prompt string, preferred string, model string, resumeSessionID string) (*agentAITool, error) {
+	preferred, err := normalizeAgentAIProvider(preferred)
+	if err != nil {
+		return nil, err
+	}
+	if preferred != "auto" {
+		return resolveNamedAgentAITool(preferred, prompt, model, resumeSessionID)
+	}
+	for _, candidate := range []string{"codex", "claude", "claudecode"} {
+		if tool, err := resolveNamedAgentAITool(candidate, prompt, model, resumeSessionID); err == nil {
+			return tool, nil
+		}
 	}
 	return nil, errors.New("no supported AI CLI found in PATH: codex, claude, or claudecode")
 }
 
-func resolveAgentAICWD(raw string) (string, error) {
-	cwd := strings.TrimSpace(raw)
-	if cwd == "" {
-		if home, err := os.UserHomeDir(); err == nil && home != "" {
-			return home, nil
+func resolveNamedAgentAITool(name string, prompt string, model string, resumeSessionID string) (*agentAITool, error) {
+	model = strings.TrimSpace(model)
+	resumeSessionID = strings.TrimSpace(resumeSessionID)
+	switch name {
+	case "codex":
+		if path, err := exec.LookPath("codex"); err == nil {
+			args := []string{"exec"}
+			if resumeSessionID != "" {
+				args = append(args, "resume")
+			}
+			args = append(args, "--skip-git-repo-check", "--color", "never")
+			if model != "" {
+				args = append(args, "--model", model)
+			}
+			if resumeSessionID != "" {
+				args = append(args, resumeSessionID)
+			}
+			args = append(args, prompt)
+			return &agentAITool{
+				id:   "codex",
+				path: path,
+				args: args,
+			}, nil
 		}
-		return os.Getwd()
+	case "claude":
+		if path, err := exec.LookPath("claude"); err == nil {
+			args := []string{"--print", "--output-format", "text"}
+			if resumeSessionID != "" {
+				args = append(args, "--resume", resumeSessionID)
+			}
+			if model != "" {
+				args = append(args, "--model", model)
+			}
+			args = append(args, prompt)
+			return &agentAITool{
+				id:   "claude",
+				path: path,
+				args: args,
+			}, nil
+		}
+	case "claudecode":
+		if path, err := exec.LookPath("claudecode"); err == nil {
+			args := []string{"--print", "--output-format", "text"}
+			if resumeSessionID != "" {
+				args = append(args, "--resume", resumeSessionID)
+			}
+			if model != "" {
+				args = append(args, "--model", model)
+			}
+			args = append(args, prompt)
+			return &agentAITool{
+				id:   "claudecode",
+				path: path,
+				args: args,
+			}, nil
+		}
+	default:
+		return nil, fmt.Errorf("unsupported AI provider: %s", name)
 	}
-	if expanded, err := cache.ExpandHomePath(cwd); err == nil {
-		cwd = expanded
+	return nil, fmt.Errorf("AI CLI %q was not found in PATH", name)
+}
+
+func agentAICapabilities() []string {
+	caps := []string{"ai_chat", "ai_chat_context", "ai_stream", "vibe_session"}
+	for _, candidate := range []string{"codex", "claude", "claudecode"} {
+		if _, err := exec.LookPath(candidate); err == nil {
+			caps = append(caps, "ai_provider_"+candidate)
+		}
 	}
-	abs, err := filepath.Abs(cwd)
-	if err != nil {
-		return "", err
-	}
-	stat, err := os.Stat(abs)
-	if err != nil {
-		return "", err
-	}
-	if !stat.IsDir() {
-		return "", fmt.Errorf("project path is not a directory: %s", abs)
-	}
-	return abs, nil
+	return caps
+}
+
+func resolveAgentAICWD(raw string) (string, error) {
+	return resolveAgentAuthorizedCWD(raw, "project path")
 }
 
 func agentAIErrorPayload(sessionID string, messageID string, err error) map[string]interface{} {
@@ -320,7 +695,7 @@ func agentAIErrorPayload(sessionID string, messageID string, err error) map[stri
 		message = err.Error()
 	}
 	payload := map[string]interface{}{
-		"type":       "ai.error",
+		"type":       models.AgentEventAIError,
 		"session_id": sessionID,
 		"error":      message,
 	}

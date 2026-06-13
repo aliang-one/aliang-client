@@ -10,8 +10,8 @@ import (
 	"sync"
 	"time"
 
+	"aliang.one/nursorgate/app/http/models"
 	"aliang.one/nursorgate/common/logger"
-	"aliang.one/nursorgate/common/version"
 	"aliang.one/nursorgate/processor/config"
 	"github.com/gorilla/websocket"
 )
@@ -24,7 +24,7 @@ func (s *AgentService) EnsureRemoteConnection() error {
 	s.mu.Unlock()
 	if token == "" {
 		logger.Info("[AGENT-BOOT] remote_connection skipped reason=no_device_token")
-		return errors.New("device token is not available; pair this device first")
+		return errors.New("device token is not available; register this device first")
 	}
 	if !enabled {
 		logger.Info("[AGENT-BOOT] remote_connection skipped reason=agent_disabled")
@@ -108,12 +108,9 @@ func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn) error {
 		return conn.WriteJSON(payload)
 	}
 
-	hello := s.agentHelloPayload()
-	logger.Info(fmt.Sprintf("[AGENT-BOOT] remote_connection sending_hello device_id=%s platform=%s", hello["device_id"], hello["platform"]))
-	if err := writeJSON(hello); err != nil {
+	if err := s.sendAgentHello(writeJSON, "connect"); err != nil {
 		return err
 	}
-	logger.Info("[AGENT-BOOT] remote_connection hello_sent")
 
 	defer s.terminal.closeAll()
 	defer s.ai.closeAll()
@@ -121,16 +118,23 @@ func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn) error {
 	done := make(chan struct{})
 	defer close(done)
 	go func() {
-		ticker := time.NewTicker(10 * time.Second)
-		defer ticker.Stop()
+		heartbeatTicker := time.NewTicker(10 * time.Second)
+		defer heartbeatTicker.Stop()
+		inventoryTicker := time.NewTicker(time.Minute)
+		defer inventoryTicker.Stop()
 		for {
 			select {
-			case <-ticker.C:
+			case <-heartbeatTicker.C:
 				_ = writeJSON(map[string]interface{}{
-					"type":      "agent.heartbeat",
+					"type":      models.AgentEventHeartbeat,
 					"device_id": s.currentDeviceID(),
 					"ts":        time.Now().UnixMilli(),
 				})
+			case <-inventoryTicker.C:
+				if err := s.sendAgentHello(writeJSON, "periodic"); err != nil {
+					logger.Warn(fmt.Sprintf("[AGENT-BOOT] remote_connection periodic_hello_failed error=%v", err))
+					return
+				}
 			case <-done:
 				return
 			}
@@ -146,10 +150,39 @@ func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn) error {
 	}
 }
 
+func (s *AgentService) sendAgentHello(writeJSON func(interface{}) error, reason string) error {
+	hello := s.agentHelloPayload()
+	projectCount := 0
+	if projects, ok := hello["projects"].([]models.AgentProject); ok {
+		projectCount = len(projects)
+	}
+	vibeSessionCount := 0
+	if sessions, ok := hello["vibe_sessions"].([]models.AgentVibeSession); ok {
+		vibeSessionCount = len(sessions)
+	}
+	dirCount := 0
+	if dirs, ok := hello["authorized_directories"].([]string); ok {
+		dirCount = len(dirs)
+	}
+	logger.Info(fmt.Sprintf("[AGENT-BOOT] remote_connection sending_hello reason=%s device_id=%s platform=%s projects=%d vibe_sessions=%d dirs=%d",
+		strings.TrimSpace(reason),
+		hello["device_id"],
+		hello["platform"],
+		projectCount,
+		vibeSessionCount,
+		dirCount,
+	))
+	if err := writeJSON(hello); err != nil {
+		return err
+	}
+	logger.Info(fmt.Sprintf("[AGENT-BOOT] remote_connection hello_sent reason=%s", strings.TrimSpace(reason)))
+	return nil
+}
+
 func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writeJSON func(interface{}) error) {
 	msgType := strings.TrimSpace(fmt.Sprint(msg["type"]))
 	switch msgType {
-	case "agent.registered":
+	case models.AgentEventRegistered:
 		deviceID := strings.TrimSpace(fmt.Sprint(msg["device_id"]))
 		logger.Info(fmt.Sprintf("[AGENT-BOOT] remote_connection registered_ack device_id=%s", deviceID))
 		s.mu.Lock()
@@ -163,9 +196,9 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 		s.setRemoteConnectionStateLocked(true, "online", "")
 		_ = s.saveStateLocked()
 		s.mu.Unlock()
-	case "agent.heartbeat.ack":
+	case models.AgentEventHeartbeatAck:
 		s.setRemoteConnectionState(true, "online", "")
-	case "device.unbound":
+	case models.AgentEventDeviceUnbound:
 		logger.Warn("[AGENT-BOOT] remote_connection device_unbound")
 		s.mu.Lock()
 		s.state.Enabled = false
@@ -177,51 +210,61 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 		s.state.LastSyncMessage = "Device was unbound by the agent server."
 		_ = s.saveStateLocked()
 		s.mu.Unlock()
-	case "device.settings.updated":
+	case models.AgentEventDeviceSettings:
 		logger.Info("[AGENT-BOOT] remote_connection settings_updated")
 		s.applyRemoteDeviceSettings(msg)
-	case "terminal.create":
+	case models.AgentEventProjectDetail, models.AgentEventAISessionDetail, models.AgentEventFileList, models.AgentEventFileRead:
+		s.setRemoteConnectionState(true, "online", "")
+		handleAgentDetailMessage(msg, writeJSON)
+	case models.AgentEventTerminalCreate:
 		s.setRemoteConnectionState(true, "online", "")
 		if !s.remoteTerminalEnabled() {
 			_ = writeJSON(agentTerminalErrorPayload(remoteString(msg, "session_id"), errors.New("remote terminal is disabled for this device")))
 			return
 		}
 		s.terminal.create(msg, writeJSON)
-	case "terminal.input":
+	case models.AgentEventTerminalInput:
 		s.setRemoteConnectionState(true, "online", "")
 		if !s.remoteTerminalEnabled() {
 			_ = writeJSON(agentTerminalErrorPayload(remoteString(msg, "session_id"), errors.New("remote terminal is disabled for this device")))
 			return
 		}
 		s.terminal.write(msg, writeJSON)
-	case "terminal.resize":
+	case models.AgentEventTerminalResize:
 		s.setRemoteConnectionState(true, "online", "")
 		if !s.remoteTerminalEnabled() {
 			_ = writeJSON(agentTerminalErrorPayload(remoteString(msg, "session_id"), errors.New("remote terminal is disabled for this device")))
 			return
 		}
 		s.terminal.resize(msg, writeJSON)
-	case "terminal.close":
+	case models.AgentEventTerminalClose:
 		s.setRemoteConnectionState(true, "online", "")
 		s.terminal.close(msg, writeJSON)
-	case "ai.session.create", "ai.message", "ai.stop":
+	case models.AgentEventAISessionCreate, models.AgentEventAIMessage, models.AgentEventAIStop, models.AgentEventAISessionClose:
 		s.setRemoteConnectionState(true, "online", "")
 		switch msgType {
-		case "ai.session.create":
+		case models.AgentEventAISessionCreate:
 			if !s.aiControlEnabled() {
 				_ = writeJSON(agentAIErrorPayload(remoteString(msg, "session_id"), "", errors.New("AI control is disabled for this device")))
 				return
 			}
 			s.ai.create(msg, writeJSON)
-		case "ai.message":
+		case models.AgentEventAIMessage:
 			if !s.aiControlEnabled() {
 				_ = writeJSON(agentAIErrorPayload(remoteString(msg, "session_id"), remoteString(msg, "message_id"), errors.New("AI control is disabled for this device")))
 				return
 			}
 			s.ai.message(msg, writeJSON)
-		case "ai.stop":
+		case models.AgentEventAIStop:
 			s.ai.stop(msg, writeJSON)
+		case models.AgentEventAISessionClose:
+			s.ai.close(msg, writeJSON)
 		}
+	default:
+		_ = writeJSON(map[string]interface{}{
+			"type":  models.AgentEventError,
+			"error": fmt.Sprintf("unsupported remote agent event type: %s", msgType),
+		})
 	}
 }
 
@@ -263,17 +306,24 @@ func (s *AgentService) agentHelloPayload() map[string]interface{} {
 	uniqueCode := s.state.UniqueCode
 	s.mu.Unlock()
 
+	snapshot := collectAgentSyncSnapshot()
 	return map[string]interface{}{
-		"type":          "agent.hello",
-		"device_id":     deviceID,
-		"unique_code":   uniqueCode,
-		"device_name":   defaultAgentDeviceName(),
-		"platform":      agentPlatform(),
-		"agent_version": version.String(),
-		"capabilities":  agentCapabilities(),
-		"tools":         detectAgentTools(),
-		"history":       collectAgentHistoryRoots(),
-		"started_at":    time.Now().UTC().Format(time.RFC3339),
+		"type":                   models.AgentEventHello,
+		"protocol_version":       models.AgentProtocolVersion,
+		"device_id":              deviceID,
+		"unique_code":            uniqueCode,
+		"device_name":            snapshot.DeviceName,
+		"platform":               snapshot.Platform,
+		"agent_version":          snapshot.AgentVersion,
+		"host":                   snapshot.Host,
+		"capabilities":           snapshot.Capabilities,
+		"tools":                  snapshot.Tools,
+		"history":                snapshot.History,
+		"projects":               snapshot.Projects,
+		"vibe_sessions":          snapshot.VibeSessions,
+		"authorized_directories": snapshot.AuthorizedDirectories,
+		"collected_at":           snapshot.CollectedAt,
+		"started_at":             time.Now().UTC().Format(time.RFC3339),
 	}
 }
 
@@ -323,7 +373,7 @@ func currentAgentWebSocketURL(token string) (string, error) {
 	if (parsed.Hostname() == "localhost" || parsed.Hostname() == "127.0.0.1") && parsed.Port() == "5174" {
 		parsed.Host = parsed.Hostname() + ":4000"
 	}
-	parsed.Path = "/ws/agent"
+	parsed.Path = models.AgentWSEndpoint
 	parsed.RawQuery = ""
 	values := parsed.Query()
 	values.Set("token", token)
@@ -336,7 +386,14 @@ func agentPlatform() string {
 }
 
 func agentCapabilities() []string {
-	return []string{"terminal", "ai_chat", "vibe_session", "file_read", "file_diff", "command_launch"}
+	caps := []string{"terminal", "terminal_stream", "file_read", "file_diff", "command_launch"}
+	if agentNativePTYSupported() {
+		caps = append(caps, "terminal_pty", "terminal_resize")
+	} else {
+		caps = append(caps, "terminal_pipe")
+	}
+	caps = append(caps, agentAICapabilities()...)
+	return caps
 }
 
 func agentMessageJSON(payload interface{}) string {

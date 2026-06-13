@@ -413,9 +413,9 @@ func (t *TrayApp) syncProxyState() {
 	}
 
 	if running {
+		aiStatus := BuildAIStatusFromTracker()
 		systray.SetIcon(GetIcon())
 		systray.SetTooltip(trayProxyTooltip(mode, true))
-		aiStatus := BuildAIStatusFromTracker()
 		t.updateAIStatusMenu(aiStatus)
 		return
 	}
@@ -461,24 +461,8 @@ func isAcceptableQuitProxyStopResult(result map[string]interface{}) bool {
 }
 
 func (t *TrayApp) updateAIStatusMenu(providers []AIProviderStatus) {
-	if len(providers) == 0 {
+	if !applyAIStatusMenu(t.mAIHeader, t.mAIProviders, providers) {
 		t.hideAIStatus()
-		return
-	}
-	t.mAIHeader.SetTitle("AI Acceleration")
-	t.mAIHeader.Show()
-	for i, item := range t.mAIProviders {
-		if i < len(providers) {
-			title := FormatAIStatusTitle(providers[i])
-			if title != "" {
-				item.SetTitle(title)
-				item.Show()
-			} else {
-				item.Hide()
-			}
-		} else {
-			item.Hide()
-		}
 	}
 }
 

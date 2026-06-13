@@ -39,26 +39,26 @@ func TestTrayProxyStatusTitleHidesSelectedNotRunningMode(t *testing.T) {
 			name:        "deep mode selected not running",
 			mode:        "tun",
 			description: "Deep Mode is selected, service not running",
-			want:        "Proxy: deep-stopped",
+			want:        "Status: deep-stopped",
 		},
 		{
 			name:        "regular mode selected not running",
 			mode:        "http",
 			description: "Regular Mode is selected, service not running",
-			want:        "Proxy: regular-stopped",
+			want:        "Status: regular-stopped",
 		},
 		{
 			name:    "empty running",
 			mode:    "tun",
 			running: true,
-			want:    "Proxy: deep-running",
+			want:    "Status: deep-running",
 		},
 		{
 			name:        "specific status preserved",
 			mode:        "tun",
 			running:     true,
 			description: "Deep Mode is running",
-			want:        "Proxy: deep-running",
+			want:        "Status: deep-running",
 		},
 	}
 
@@ -106,6 +106,42 @@ func TestBuildAIStatusFromTrackerMatchesProviderKeysCaseInsensitively(t *testing
 	}
 	if !statuses[0].Detected || !statuses[0].Active {
 		t.Fatalf("statuses[0] detection mismatch: detected=%v active=%v, want both true", statuses[0].Detected, statuses[0].Active)
+	}
+}
+
+func TestAIStatusMenuIconUsesProviderIcon(t *testing.T) {
+	testCases := []struct {
+		name     string
+		provider AIProviderStatus
+		want     []byte
+	}{
+		{
+			name:     "openai detected",
+			provider: AIProviderStatus{Key: "openai", Enabled: true, Detected: true},
+			want:     GetProviderIcon("openai", true),
+		},
+		{
+			name:     "anthropic alias",
+			provider: AIProviderStatus{Key: "Claude", Enabled: true, Detected: true},
+			want:     GetProviderIcon("anthropic", true),
+		},
+		{
+			name:     "vscode inactive",
+			provider: AIProviderStatus{Key: "vscode", Enabled: true},
+			want:     GetProviderIcon("vscode", false),
+		},
+		{
+			name:     "unknown",
+			provider: AIProviderStatus{Key: "unknown", Enabled: true, Detected: true},
+			want:     nil,
+		},
+	}
+
+	for _, tc := range testCases {
+		got := AIStatusMenuIcon(tc.provider)
+		if string(got) != string(tc.want) {
+			t.Fatalf("%s: AIStatusMenuIcon() returned unexpected icon bytes", tc.name)
+		}
 	}
 }
 

@@ -103,23 +103,14 @@ func StopLocalServer() error {
 }
 
 func registerAgentRoutes(mux *http.ServeMux) {
-	logger.Info("[AGENT-BOOT] local_server registering_routes routes=/api/agent/health,/api/agent/status,/api/agent/bind/start,/api/agent/bind/status,/api/agent/disable,/api/agent/tools,/api/agent/tools/launch")
+	logger.Info("[AGENT-BOOT] local_server registering_routes routes=/api/agent/status,/api/agent/sync,/api/agent/enable,/api/agent/disable,/api/agent/tools,/api/agent/protocol,/api/agent/tools/launch")
 	agentHandler := handlers.NewAgentHandler(services.GetSharedAgentService())
-	mux.HandleFunc("/api/agent/health", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
-			return
-		}
-		common.Success(w, map[string]interface{}{
-			"status": "ok",
-			"url":    "http://" + config.DefaultUserAgentAddr,
-		})
-	})
 	mux.HandleFunc("/api/agent/status", agentHandler.HandleStatus)
-	mux.HandleFunc("/api/agent/bind/start", agentHandler.HandleBindStart)
-	mux.HandleFunc("/api/agent/bind/status", agentHandler.HandleBindStatus)
+	mux.HandleFunc("/api/agent/sync", agentHandler.HandleSync)
+	mux.HandleFunc("/api/agent/enable", agentHandler.HandleEnable)
 	mux.HandleFunc("/api/agent/disable", agentHandler.HandleDisable)
 	mux.HandleFunc("/api/agent/tools", agentHandler.HandleTools)
+	mux.HandleFunc("/api/agent/protocol", agentHandler.HandleProtocol)
 	mux.HandleFunc("/api/agent/tools/launch", agentHandler.HandleLaunch)
 }
 

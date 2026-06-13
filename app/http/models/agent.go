@@ -7,10 +7,11 @@ type AgentStatusResponse struct {
 	Registered      bool               `json:"registered"`
 	BindingRequired bool               `json:"binding_required"`
 	Platform        string             `json:"platform"`
+	ProtocolVersion string             `json:"protocol_version,omitempty"`
 	AgentServer     string             `json:"agent_server,omitempty"`
 	Runtime         *AgentRuntime      `json:"runtime,omitempty"`
 	Device          *AgentDevice       `json:"device,omitempty"`
-	PendingBind     *AgentBindSession  `json:"pending_bind,omitempty"`
+	Capabilities    []string           `json:"capabilities,omitempty"`
 	Tools           []AgentTool        `json:"tools"`
 	History         []AgentHistoryRoot `json:"history"`
 	LastSyncAt      string             `json:"last_sync_at,omitempty"`
@@ -27,47 +28,29 @@ type AgentRuntime struct {
 }
 
 type AgentDevice struct {
-	ID                    string   `json:"id"`
-	DeviceID              string   `json:"device_id,omitempty"`
-	UniqueCode            string   `json:"unique_code,omitempty"`
-	Name                  string   `json:"name"`
-	Platform              string   `json:"platform"`
-	AgentVersion          string   `json:"agent_version,omitempty"`
-	Status                string   `json:"status,omitempty"`
-	Capabilities          []string `json:"capabilities,omitempty"`
-	LastSeenAt            string   `json:"last_seen_at,omitempty"`
-	RemoteTerminalEnabled bool     `json:"remote_terminal_enabled"`
-	AIControlEnabled      bool     `json:"ai_control_enabled"`
-	CreatedAt             string   `json:"created_at,omitempty"`
-	PairedAt              string   `json:"paired_at,omitempty"`
-	BoundAt               string   `json:"bound_at"`
+	ID                    string             `json:"id"`
+	DeviceID              string             `json:"device_id,omitempty"`
+	UserID                string             `json:"user_id,omitempty"`
+	User                  *AgentUserIdentity `json:"user,omitempty"`
+	UniqueCode            string             `json:"unique_code,omitempty"`
+	Name                  string             `json:"name"`
+	Platform              string             `json:"platform"`
+	AgentVersion          string             `json:"agent_version,omitempty"`
+	Status                string             `json:"status,omitempty"`
+	Capabilities          []string           `json:"capabilities,omitempty"`
+	LastSeenAt            string             `json:"last_seen_at,omitempty"`
+	RemoteTerminalEnabled bool               `json:"remote_terminal_enabled"`
+	AIControlEnabled      bool               `json:"ai_control_enabled"`
+	CreatedAt             string             `json:"created_at,omitempty"`
+	PairedAt              string             `json:"paired_at,omitempty"`
+	BoundAt               string             `json:"bound_at"`
 }
 
-type AgentBindStartResponse struct {
-	SessionID   string `json:"session_id"`
-	PairingCode string `json:"pairing_code,omitempty"`
-	QRPayload   string `json:"qr_payload"`
-	QRDataURL   string `json:"qr_data_url"`
-	ExpiresAt   string `json:"expires_at"`
-	Status      string `json:"status"`
-	Message     string `json:"message"`
-}
-
-type AgentBindStatusResponse struct {
-	SessionID   string       `json:"session_id"`
-	PairingCode string       `json:"pairing_code,omitempty"`
-	Status      string       `json:"status"`
-	Bound       bool         `json:"bound"`
-	Device      *AgentDevice `json:"device,omitempty"`
-	Message     string       `json:"message,omitempty"`
-	ExpiresAt   string       `json:"expires_at,omitempty"`
-}
-
-type AgentBindSession struct {
-	SessionID   string `json:"session_id"`
-	PairingCode string `json:"pairing_code,omitempty"`
-	ExpiresAt   string `json:"expires_at"`
-	Status      string `json:"status"`
+type AgentUserIdentity struct {
+	ID    string `json:"id"`
+	Email string `json:"email,omitempty"`
+	Name  string `json:"name,omitempty"`
+	Role  string `json:"role,omitempty"`
 }
 
 type AgentTool struct {
@@ -86,6 +69,50 @@ type AgentHistoryRoot struct {
 	FileCount int    `json:"file_count"`
 	TotalSize int64  `json:"total_size"`
 	UpdatedAt string `json:"updated_at,omitempty"`
+}
+
+type AgentProject struct {
+	ID              string   `json:"id,omitempty"`
+	Name            string   `json:"name"`
+	Path            string   `json:"path"`
+	Branch          string   `json:"branch,omitempty"`
+	Language        string   `json:"language,omitempty"`
+	Description     string   `json:"description,omitempty"`
+	Status          string   `json:"status,omitempty"`
+	PackageManager  string   `json:"package_manager,omitempty"`
+	IsGitRepo       bool     `json:"is_git_repo,omitempty"`
+	DetectedPorts   []int    `json:"detected_ports,omitempty"`
+	Files           []string `json:"files,omitempty"`
+	FileCount       int      `json:"file_count,omitempty"`
+	TotalSize       int64    `json:"total_size,omitempty"`
+	Readme          string   `json:"readme,omitempty"`
+	LastActiveAt    string   `json:"last_active_at,omitempty"`
+	SourceTools     []string `json:"source_tools,omitempty"`
+	DetailUpdatedAt string   `json:"detail_updated_at,omitempty"`
+}
+
+type AgentVibeSession struct {
+	ID           string             `json:"id"`
+	Provider     string             `json:"provider"`
+	Tool         string             `json:"tool,omitempty"`
+	ProjectPath  string             `json:"project_path,omitempty"`
+	Title        string             `json:"title,omitempty"`
+	Summary      string             `json:"summary,omitempty"`
+	Mode         string             `json:"mode,omitempty"`
+	Status       string             `json:"status,omitempty"`
+	MessageCount int                `json:"message_count,omitempty"`
+	Branch       string             `json:"branch,omitempty"`
+	Model        string             `json:"model,omitempty"`
+	Transcript   []AgentVibeMessage `json:"transcript,omitempty"`
+	CreatedAt    string             `json:"created_at,omitempty"`
+	UpdatedAt    string             `json:"updated_at,omitempty"`
+}
+
+type AgentVibeMessage struct {
+	ID        string `json:"id,omitempty"`
+	Role      string `json:"role"`
+	Content   string `json:"content"`
+	Timestamp string `json:"timestamp,omitempty"`
 }
 
 type AgentLaunchRequest struct {

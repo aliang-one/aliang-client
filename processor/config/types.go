@@ -352,8 +352,9 @@ type CustomerConfig struct {
 }
 
 type AliangServerConfig struct {
-	Type       string `json:"type"`
-	CoreServer string `json:"core_server,omitempty"`
+	Type        string `json:"type"`
+	CoreServer  string `json:"core_server,omitempty"`
+	AgentServer string `json:"agent_server,omitempty"`
 }
 
 type CustomerProxyConfig struct {
@@ -524,29 +525,11 @@ func (c *Config) GetRemoteConfigURL() string {
 }
 
 func (c *Config) GetAgentDeviceRegisterURL() string {
-	return fmt.Sprintf("%s/api/v1/agent/devices/register", c.AgentBaseURL())
+	return fmt.Sprintf("%s/api/devices/register", c.AgentBaseURL())
 }
 
 func (c *Config) GetAgentDeviceSyncURL(deviceID string) string {
 	return fmt.Sprintf("%s/api/v1/agent/devices/%s/sync", c.AgentBaseURL(), url.PathEscape(strings.TrimSpace(deviceID)))
-}
-
-func (c *Config) GetAgentBindStartURL() string {
-	return fmt.Sprintf("%s/api/v1/agent/bind/sessions", c.AgentBaseURL())
-}
-
-func (c *Config) GetAgentBindStatusURL(sessionID string) string {
-	return fmt.Sprintf("%s/api/v1/agent/bind/sessions/%s", c.AgentBaseURL(), url.PathEscape(strings.TrimSpace(sessionID)))
-}
-
-func (c *Config) GetAgentPairingTicketsURL() string {
-	return fmt.Sprintf("%s/api/pairing/tickets", c.AgentBaseURL())
-}
-
-func (c *Config) GetAgentPairingTicketResultURL(ticketID string, agentSecret string) string {
-	values := url.Values{}
-	values.Set("agent_secret", strings.TrimSpace(agentSecret))
-	return fmt.Sprintf("%s/api/pairing/tickets/%s/result?%s", c.AgentBaseURL(), url.PathEscape(strings.TrimSpace(ticketID)), values.Encode())
 }
 
 func (c *Config) GetAgentDevicesURL() string {
@@ -828,6 +811,11 @@ func (c *Config) AgentBaseURL() string {
 	}
 	if server := strings.TrimSpace(c.Core.AgentServer); server != "" {
 		return strings.TrimRight(server, "/")
+	}
+	if c.Core.AliangServer != nil {
+		if server := strings.TrimSpace(c.Core.AliangServer.AgentServer); server != "" {
+			return strings.TrimRight(server, "/")
+		}
 	}
 	return DefaultAgentServerURL
 }

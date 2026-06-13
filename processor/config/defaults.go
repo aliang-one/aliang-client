@@ -1,5 +1,10 @@
 package config
 
+import (
+	"os"
+	"strings"
+)
+
 const (
 	// DefaultManagementPort 管理面板 HTTP 端口
 	DefaultManagementPort = 56431
@@ -16,9 +21,16 @@ const (
 	// DefaultHTTPProxyAddr HTTP CONNECT 代理监听地址
 	DefaultHTTPProxyAddr = "127.0.0.1:56432"
 
-	// DefaultUserAgentAddr 用户态 Agent 本地监听地址
-	DefaultUserAgentAddr = "127.0.0.1:56433"
-
 	// DefaultAgentServerURL 用户态 Agent 独立服务端地址
-	DefaultAgentServerURL = "http://localhost:5174"
+	DefaultAgentServerURL = "http://localhost:4000"
 )
+
+// DefaultUserAgentAddr 用户态 Agent 本地监听地址
+var DefaultUserAgentAddr = resolveDefaultUserAgentAddr()
+
+func resolveDefaultUserAgentAddr() string {
+	if addr := strings.TrimSpace(os.Getenv("ALIANG_USER_AGENT_ADDR")); addr != "" {
+		return addr
+	}
+	return "127.0.0.1:56433"
+}

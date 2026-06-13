@@ -38,7 +38,7 @@ func (h *AgentHandler) HandleStatus(w http.ResponseWriter, r *http.Request) {
 	common.Success(w, h.service.Status())
 }
 
-func (h *AgentHandler) HandleBindStart(w http.ResponseWriter, r *http.Request) {
+func (h *AgentHandler) HandleEnable(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
 		return
@@ -46,30 +46,9 @@ func (h *AgentHandler) HandleBindStart(w http.ResponseWriter, r *http.Request) {
 	if h.proxyIfNeeded(w, r) {
 		return
 	}
-	resp, err := h.service.StartBinding()
+	resp, err := h.service.EnableWithUserContext(r.Header.Get(services.AgentForwardedAuthorizationHeader), r.Header.Get(services.AgentForwardedUserKeyHeader))
 	if err != nil {
-		writeAgentServiceError(w, "Failed to start agent binding", err)
-		return
-	}
-	common.Success(w, resp)
-}
-
-func (h *AgentHandler) HandleBindStatus(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
-		return
-	}
-	if h.proxyIfNeeded(w, r) {
-		return
-	}
-	sessionID := strings.TrimSpace(r.URL.Query().Get("session_id"))
-	if sessionID == "" {
-		common.ErrorBadRequest(w, "session_id is required", nil)
-		return
-	}
-	resp, err := h.service.BindingStatus(sessionID)
-	if err != nil {
-		common.ErrorBadRequest(w, err.Error(), nil)
+		writeAgentServiceError(w, "Failed to enable agent", err)
 		return
 	}
 	common.Success(w, resp)
@@ -86,6 +65,21 @@ func (h *AgentHandler) HandleDisable(w http.ResponseWriter, r *http.Request) {
 	common.Success(w, h.service.Disable())
 }
 
+func (h *AgentHandler) HandleSync(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
+		return
+	}
+	if h.proxyIfNeeded(w, r) {
+		return
+	}
+	if err := h.service.SyncNowWithUserContext(r.Header.Get(services.AgentForwardedAuthorizationHeader), r.Header.Get(services.AgentForwardedUserKeyHeader)); err != nil {
+		writeAgentServiceError(w, "Failed to sync agent device", err)
+		return
+	}
+	common.Success(w, h.service.Status())
+}
+
 func (h *AgentHandler) HandleTools(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
@@ -95,6 +89,14 @@ func (h *AgentHandler) HandleTools(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	common.Success(w, map[string]interface{}{"tools": h.service.Tools()})
+}
+
+func (h *AgentHandler) HandleProtocol(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
+		return
+	}
+	common.Success(w, models.DefaultAgentProtocolContract())
 }
 
 func (h *AgentHandler) HandleLaunch(w http.ResponseWriter, r *http.Request) {
@@ -145,6 +147,14 @@ func (h *AgentHandler) proxyToUserAgent(w http.ResponseWriter, r *http.Request) 
 	}
 	copyAgentProxyHeaders(req.Header, r.Header)
 	req.Header.Set("X-Aliang-Agent-Proxy", "dashboard")
+	req.Header.Del(services.AgentForwardedAuthorizationHeader)
+	req.Header.Del(services.AgentForwardedUserKeyHeader)
+	if authHeader := services.CurrentAgentRegisterAuthorizationHeader(); authHeader != "" {
+		req.Header.Set(services.AgentForwardedAuthorizationHeader, authHeader)
+	}
+	if userKey := services.CurrentAgentRegisterUserKey(); userKey != "" {
+		req.Header.Set(services.AgentForwardedUserKeyHeader, userKey)
+	}
 
 	resp, err := h.client.Do(req)
 	if err != nil {
@@ -175,12 +185,14 @@ func writeAgentServiceError(w http.ResponseWriter, message string, err error) {
 	details := map[string]interface{}{"error": err.Error()}
 	errText := strings.ToLower(err.Error())
 	switch {
-	case strings.Contains(errText, "returned 401") || strings.Contains(errText, "missing_bearer_token"):
+	case strings.Contains(errText, "returned 401") || strings.Contains(errText, "missing_bearer_token") || strings.Contains(errText, "log in before"):
 		common.Error(w, common.CodeUnauthorized, message, details)
 	case strings.Contains(errText, "returned 403"):
 		common.Error(w, common.CodeForbidden, message, details)
 	case strings.Contains(errText, "returned 404"):
 		common.Error(w, common.CodeNotFound, message, details)
+	case strings.Contains(errText, "returned 409") || strings.Contains(errText, "already_bound"):
+		common.Error(w, common.CodeConflict, message, details)
 	default:
 		common.ErrorInternalServer(w, message, details)
 	}

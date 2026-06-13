@@ -234,10 +234,11 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 
 	// User agent routes (/api/agent/*)
 	register("/api/agent/status", h.Agent.HandleStatus, http.MethodGet)
-	register("/api/agent/bind/start", h.Agent.HandleBindStart, http.MethodPost)
-	register("/api/agent/bind/status", h.Agent.HandleBindStatus, http.MethodGet)
+	register("/api/agent/sync", h.Agent.HandleSync, http.MethodPost)
+	register("/api/agent/enable", h.Agent.HandleEnable, http.MethodPost)
 	register("/api/agent/disable", h.Agent.HandleDisable, http.MethodPost)
 	register("/api/agent/tools", h.Agent.HandleTools, http.MethodGet)
+	register("/api/agent/protocol", h.Agent.HandleProtocol, http.MethodGet)
 	register("/api/agent/tools/launch", h.Agent.HandleLaunch, http.MethodPost)
 	register("/api/docs/tutorials", h.Tutorial.HandleGetTutorial, http.MethodGet)
 

@@ -31,13 +31,8 @@ export async function getAgentStatus() {
   return request('/api/agent/status', { method: 'GET' });
 }
 
-export async function startAgentBinding() {
-  return request('/api/agent/bind/start', { method: 'POST' });
-}
-
-export async function getAgentBindingStatus(sessionId) {
-  const query = new URLSearchParams({ session_id: sessionId });
-  return request(`/api/agent/bind/status?${query.toString()}`, { method: 'GET' });
+export async function enableAgent() {
+  return request('/api/agent/enable', { method: 'POST' });
 }
 
 export async function disableAgent() {

@@ -6,13 +6,14 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
-	"aliang.one/nursorgate/common/cache"
+	"aliang.one/nursorgate/app/http/models"
+	"github.com/creack/pty"
 )
 
 type agentTerminalWriter func(interface{}) error
@@ -27,7 +28,12 @@ type agentTerminalSession struct {
 	shell string
 	cwd   string
 	cmd   *exec.Cmd
-	stdin io.WriteCloser
+	input io.WriteCloser
+	pty   *os.File
+	isPTY bool
+
+	outputBytes  int
+	lastActiveAt time.Time
 }
 
 func newAgentTerminalManager() *agentTerminalManager {
@@ -46,9 +52,10 @@ func (m *agentTerminalManager) create(msg map[string]interface{}, writeJSON agen
 		return
 	}
 
-	shell := remoteString(msg, "shell")
-	if shell == "" {
-		shell = defaultAgentShell()
+	shell, err := resolveAgentShell(remoteString(msg, "shell"))
+	if err != nil {
+		_ = writeJSON(agentTerminalErrorPayload(sessionID, err))
+		return
 	}
 	cwd, err := resolveAgentTerminalCWD(remoteString(msg, "cwd"))
 	if err != nil {
@@ -56,60 +63,59 @@ func (m *agentTerminalManager) create(msg map[string]interface{}, writeJSON agen
 		return
 	}
 
-	cmd := exec.Command(shell)
-	cmd.Dir = cwd
-	cmd.Env = agentTerminalEnv(shell)
+	m.mu.Lock()
+	if existing := m.sessions[sessionID]; existing != nil {
+		m.mu.Unlock()
+		_ = writeJSON(agentTerminalErrorPayload(sessionID, fmt.Errorf("terminal session already exists: %s", sessionID)))
+		return
+	}
+	if len(m.sessions) >= agentMaxTerminalSessions {
+		m.mu.Unlock()
+		_ = writeJSON(agentTerminalErrorPayload(sessionID, fmt.Errorf("terminal session limit reached: %d", agentMaxTerminalSessions)))
+		return
+	}
+	m.mu.Unlock()
 
-	stdin, err := cmd.StdinPipe()
+	rows := normalizeTerminalDimension(remoteInt(msg, "rows", 24), 24)
+	cols := normalizeTerminalDimension(remoteInt(msg, "cols", 80), 80)
+	session, readers, err := startAgentTerminalProcess(sessionID, shell, cwd, rows, cols)
 	if err != nil {
 		_ = writeJSON(agentTerminalErrorPayload(sessionID, err))
 		return
-	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		_ = stdin.Close()
-		_ = writeJSON(agentTerminalErrorPayload(sessionID, err))
-		return
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		_ = stdin.Close()
-		_ = writeJSON(agentTerminalErrorPayload(sessionID, err))
-		return
-	}
-
-	if err := cmd.Start(); err != nil {
-		_ = stdin.Close()
-		_ = writeJSON(agentTerminalErrorPayload(sessionID, err))
-		return
-	}
-
-	session := &agentTerminalSession{
-		id:    sessionID,
-		shell: shell,
-		cwd:   cwd,
-		cmd:   cmd,
-		stdin: stdin,
 	}
 
 	m.mu.Lock()
 	if existing := m.sessions[sessionID]; existing != nil {
-		existing.kill()
+		m.mu.Unlock()
+		session.kill()
+		_ = writeJSON(agentTerminalErrorPayload(sessionID, fmt.Errorf("terminal session already exists: %s", sessionID)))
+		return
 	}
+	if len(m.sessions) >= agentMaxTerminalSessions {
+		m.mu.Unlock()
+		session.kill()
+		_ = writeJSON(agentTerminalErrorPayload(sessionID, fmt.Errorf("terminal session limit reached: %d", agentMaxTerminalSessions)))
+		return
+	}
+	session.lastActiveAt = time.Now()
 	m.sessions[sessionID] = session
 	m.mu.Unlock()
 
 	_ = writeJSON(map[string]interface{}{
-		"type":       "terminal.created",
+		"type":       models.AgentEventTerminalCreated,
 		"session_id": sessionID,
 		"shell":      shell,
 		"cwd":        cwd,
-		"pty":        false,
+		"pty":        session.isPTY,
+		"rows":       rows,
+		"cols":       cols,
 	})
 
-	go m.copyTerminalOutput(sessionID, stdout, writeJSON)
-	go m.copyTerminalOutput(sessionID, stderr, writeJSON)
-	go m.waitTerminal(sessionID, cmd, writeJSON)
+	for _, reader := range readers {
+		go m.copyTerminalOutput(sessionID, reader, writeJSON)
+	}
+	go m.waitTerminal(sessionID, session.cmd, writeJSON)
+	go m.watchTerminalIdle(sessionID, session.cmd, writeJSON)
 }
 
 func (m *agentTerminalManager) write(msg map[string]interface{}, writeJSON agentTerminalWriter) {
@@ -122,13 +128,18 @@ func (m *agentTerminalManager) write(msg map[string]interface{}, writeJSON agent
 		_ = writeJSON(agentTerminalErrorPayload("", errors.New("terminal.input missing session_id")))
 		return
 	}
+	if len(data) > agentTerminalInputLimitBytes {
+		_ = writeJSON(agentTerminalErrorPayload(sessionID, fmt.Errorf("terminal.input exceeds %d bytes", agentTerminalInputLimitBytes)))
+		return
+	}
 
 	session := m.get(sessionID)
 	if session == nil {
 		_ = writeJSON(agentTerminalErrorPayload(sessionID, fmt.Errorf("terminal session not found: %s", sessionID)))
 		return
 	}
-	if _, err := io.WriteString(session.stdin, data); err != nil {
+	m.touch(sessionID)
+	if _, err := io.WriteString(session.input, data); err != nil {
 		_ = writeJSON(agentTerminalErrorPayload(sessionID, err))
 	}
 }
@@ -142,16 +153,29 @@ func (m *agentTerminalManager) resize(msg map[string]interface{}, writeJSON agen
 		_ = writeJSON(agentTerminalErrorPayload("", errors.New("terminal.resize missing session_id")))
 		return
 	}
-	if m.get(sessionID) == nil {
+	session := m.get(sessionID)
+	if session == nil {
 		_ = writeJSON(agentTerminalErrorPayload(sessionID, fmt.Errorf("terminal session not found: %s", sessionID)))
 		return
 	}
+	m.touch(sessionID)
 
-	// The initial user-agent implementation uses shell pipes for broad OS
-	// compatibility. Resize becomes active when the shell backend is upgraded
-	// to a native PTY on each supported platform.
-	_ = remoteInt(msg, "cols", 80)
-	_ = remoteInt(msg, "rows", 24)
+	cols := normalizeTerminalDimension(remoteInt(msg, "cols", 80), 80)
+	rows := normalizeTerminalDimension(remoteInt(msg, "rows", 24), 24)
+	if session.isPTY && session.pty != nil {
+		if err := pty.Setsize(session.pty, &pty.Winsize{Rows: uint16(rows), Cols: uint16(cols)}); err != nil {
+			_ = writeJSON(agentTerminalErrorPayload(sessionID, err))
+			return
+		}
+	}
+
+	_ = writeJSON(map[string]interface{}{
+		"type":       models.AgentEventTerminalResized,
+		"session_id": sessionID,
+		"rows":       rows,
+		"cols":       cols,
+		"pty":        session.isPTY,
+	})
 }
 
 func (m *agentTerminalManager) close(msg map[string]interface{}, writeJSON agentTerminalWriter) {
@@ -167,7 +191,7 @@ func (m *agentTerminalManager) close(msg map[string]interface{}, writeJSON agent
 	session := m.get(sessionID)
 	if session == nil {
 		_ = writeJSON(map[string]interface{}{
-			"type":       "terminal.exit",
+			"type":       models.AgentEventTerminalExit,
 			"session_id": sessionID,
 			"exit_code":  0,
 		})
@@ -196,13 +220,43 @@ func (m *agentTerminalManager) get(sessionID string) *agentTerminalSession {
 	return m.sessions[sessionID]
 }
 
+func (m *agentTerminalManager) touch(sessionID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if session := m.sessions[sessionID]; session != nil {
+		session.lastActiveAt = time.Now()
+	}
+}
+
+func (m *agentTerminalManager) reserveTerminalOutput(sessionID string, n int) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	session := m.sessions[sessionID]
+	if session == nil {
+		return false
+	}
+	if session.outputBytes+n > agentTerminalOutputLimitBytes {
+		return false
+	}
+	session.outputBytes += n
+	session.lastActiveAt = time.Now()
+	return true
+}
+
 func (m *agentTerminalManager) copyTerminalOutput(sessionID string, reader io.Reader, writeJSON agentTerminalWriter) {
 	buf := make([]byte, 4096)
 	for {
 		n, err := reader.Read(buf)
 		if n > 0 {
+			if !m.reserveTerminalOutput(sessionID, n) {
+				_ = writeJSON(agentTerminalErrorPayload(sessionID, fmt.Errorf("terminal output exceeded %d bytes", agentTerminalOutputLimitBytes)))
+				if session := m.get(sessionID); session != nil {
+					session.kill()
+				}
+				return
+			}
 			_ = writeJSON(map[string]interface{}{
-				"type":       "terminal.output",
+				"type":       models.AgentEventTerminalOutput,
 				"session_id": sessionID,
 				"encoding":   "text",
 				"data":       string(buf[:n]),
@@ -211,6 +265,27 @@ func (m *agentTerminalManager) copyTerminalOutput(sessionID string, reader io.Re
 		if err != nil {
 			return
 		}
+	}
+}
+
+func (m *agentTerminalManager) watchTerminalIdle(sessionID string, cmd *exec.Cmd, writeJSON agentTerminalWriter) {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		m.mu.Lock()
+		session := m.sessions[sessionID]
+		if session == nil || session.cmd != cmd {
+			m.mu.Unlock()
+			return
+		}
+		expired := time.Since(session.lastActiveAt) >= agentTerminalIdleTimeout
+		m.mu.Unlock()
+		if !expired {
+			continue
+		}
+		_ = writeJSON(agentTerminalErrorPayload(sessionID, fmt.Errorf("terminal session idle timeout after %s", agentTerminalIdleTimeout)))
+		session.kill()
+		return
 	}
 }
 
@@ -227,10 +302,13 @@ func (m *agentTerminalManager) waitTerminal(sessionID string, cmd *exec.Cmd, wri
 	if !active {
 		return
 	}
+	if session.pty != nil {
+		_ = session.pty.Close()
+	}
 
 	if err == nil {
 		_ = writeJSON(map[string]interface{}{
-			"type":       "terminal.exit",
+			"type":       models.AgentEventTerminalExit,
 			"session_id": sessionID,
 			"exit_code":  0,
 		})
@@ -240,7 +318,7 @@ func (m *agentTerminalManager) waitTerminal(sessionID string, cmd *exec.Cmd, wri
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
 		_ = writeJSON(map[string]interface{}{
-			"type":       "terminal.exit",
+			"type":       models.AgentEventTerminalExit,
 			"session_id": sessionID,
 			"exit_code":  exitErr.ExitCode(),
 		})
@@ -254,12 +332,81 @@ func (s *agentTerminalSession) kill() {
 	if s == nil {
 		return
 	}
-	if s.stdin != nil {
-		_ = s.stdin.Close()
+	if s.input != nil {
+		_ = s.input.Close()
 	}
 	if s.cmd != nil && s.cmd.Process != nil {
 		_ = s.cmd.Process.Kill()
 	}
+}
+
+func startAgentTerminalProcess(sessionID string, shell string, cwd string, rows int, cols int) (*agentTerminalSession, []io.Reader, error) {
+	cmd := newAgentShellCommand(shell, cwd)
+	ptyFile, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: uint16(rows), Cols: uint16(cols)})
+	if err == nil {
+		return &agentTerminalSession{
+			id:           sessionID,
+			shell:        shell,
+			cwd:          cwd,
+			cmd:          cmd,
+			input:        ptyFile,
+			pty:          ptyFile,
+			isPTY:        true,
+			lastActiveAt: time.Now(),
+		}, []io.Reader{ptyFile}, nil
+	}
+	if !errors.Is(err, pty.ErrUnsupported) {
+		return nil, nil, err
+	}
+
+	cmd = newAgentShellCommand(shell, cwd)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, nil, err
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		_ = stdin.Close()
+		return nil, nil, err
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		_ = stdin.Close()
+		return nil, nil, err
+	}
+	if err := cmd.Start(); err != nil {
+		_ = stdin.Close()
+		return nil, nil, err
+	}
+	return &agentTerminalSession{
+		id:           sessionID,
+		shell:        shell,
+		cwd:          cwd,
+		cmd:          cmd,
+		input:        stdin,
+		isPTY:        false,
+		lastActiveAt: time.Now(),
+	}, []io.Reader{stdout, stderr}, nil
+}
+
+func newAgentShellCommand(shell string, cwd string) *exec.Cmd {
+	cmd := exec.Command(shell)
+	cmd.Dir = cwd
+	cmd.Env = agentTerminalEnv(shell)
+	return cmd
+}
+
+func normalizeTerminalDimension(value int, fallback int) int {
+	if value <= 0 {
+		value = fallback
+	}
+	if value < 2 {
+		return 2
+	}
+	if value > 500 {
+		return 500
+	}
+	return value
 }
 
 func agentTerminalErrorPayload(sessionID string, err error) map[string]interface{} {
@@ -268,35 +415,14 @@ func agentTerminalErrorPayload(sessionID string, err error) map[string]interface
 		message = err.Error()
 	}
 	return map[string]interface{}{
-		"type":       "terminal.error",
+		"type":       models.AgentEventTerminalError,
 		"session_id": sessionID,
 		"error":      message,
 	}
 }
 
 func resolveAgentTerminalCWD(raw string) (string, error) {
-	cwd := strings.TrimSpace(raw)
-	if cwd == "" {
-		if home, err := os.UserHomeDir(); err == nil && home != "" {
-			return home, nil
-		}
-		return os.Getwd()
-	}
-	if expanded, err := cache.ExpandHomePath(cwd); err == nil {
-		cwd = expanded
-	}
-	abs, err := filepath.Abs(cwd)
-	if err != nil {
-		return "", err
-	}
-	stat, err := os.Stat(abs)
-	if err != nil {
-		return "", err
-	}
-	if !stat.IsDir() {
-		return "", fmt.Errorf("working directory is not a directory: %s", abs)
-	}
-	return abs, nil
+	return resolveAgentAuthorizedCWD(raw, "working directory")
 }
 
 func defaultAgentShell() string {
@@ -327,9 +453,18 @@ func defaultAgentShell() string {
 	return "sh"
 }
 
+func agentNativePTYSupported() bool {
+	switch runtime.GOOS {
+	case "linux", "darwin", "freebsd", "dragonfly", "netbsd", "openbsd", "solaris", "zos":
+		return true
+	default:
+		return false
+	}
+}
+
 func agentTerminalEnv(shell string) []string {
 	env := os.Environ()
-	env = append(env, "TERM=dumb")
+	env = append(env, "TERM=xterm-256color")
 	if shell != "" {
 		env = append(env, "SHELL="+shell)
 	}

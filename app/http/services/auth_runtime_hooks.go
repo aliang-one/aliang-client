@@ -17,6 +17,7 @@ func handleAuthExpired() {
 	startupState := runtime.GetStartupState()
 	startupState.SetFetchSuccess(false)
 	startupState.SetStatus(runtime.UNCONFIGURED)
+	RequestUserAgentDisableAfterLogout("auth_expired")
 
 	runService := GetSharedRunService()
 	if runService.IsRunning() {

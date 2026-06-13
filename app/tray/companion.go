@@ -357,9 +357,9 @@ func (a *CompanionApp) syncState() {
 	}
 
 	if running {
+		aiStatus := BuildAIStatusFromIPCData(data)
 		systray.SetIcon(GetIcon())
 		systray.SetTooltip(trayProxyTooltip(mode, true))
-		aiStatus := BuildAIStatusFromIPCData(data)
 		a.updateAIStatusMenu(aiStatus)
 		return
 	}
@@ -482,24 +482,8 @@ func (a *CompanionApp) quit() {
 }
 
 func (a *CompanionApp) updateAIStatusMenu(providers []AIProviderStatus) {
-	if len(providers) == 0 {
+	if !applyAIStatusMenu(a.mAIHeader, a.mAIProviders, providers) {
 		a.hideAIStatus()
-		return
-	}
-	a.mAIHeader.SetTitle("AI Acceleration")
-	a.mAIHeader.Show()
-	for i, item := range a.mAIProviders {
-		if i < len(providers) {
-			title := FormatAIStatusTitle(providers[i])
-			if title != "" {
-				item.SetTitle(title)
-				item.Show()
-			} else {
-				item.Hide()
-			}
-		} else {
-			item.Hide()
-		}
 	}
 }
 

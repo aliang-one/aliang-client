@@ -770,4 +770,10 @@ func TestConfigAgentBaseURL(t *testing.T) {
 	if got := cfg.AgentBaseURL(); got != "https://agent.example.com" {
 		t.Fatalf("AgentBaseURL() explicit = %q, want https://agent.example.com", got)
 	}
+
+	cfg.Core.AgentServer = ""
+	cfg.Core.AliangServer = &AliangServerConfig{AgentServer: "http://localhost:4000/"}
+	if got := cfg.AgentBaseURL(); got != "http://localhost:4000" {
+		t.Fatalf("AgentBaseURL() aliangServer fallback = %q, want http://localhost:4000", got)
+	}
 }
