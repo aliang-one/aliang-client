@@ -2,6 +2,7 @@ package services
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1614,6 +1615,9 @@ func TestAgentRemoteDetailRequestsReturnProjectAndVibeSessionDetail(t *testing.T
 	if err := os.WriteFile(filepath.Join(projectPath, "go.mod"), []byte("module detail-project\n"), 0o600); err != nil {
 		t.Fatalf("write go.mod: %v", err)
 	}
+	if err := os.WriteFile(filepath.Join(projectPath, "main.go"), []byte("package main\n"), 0o600); err != nil {
+		t.Fatalf("write main.go: %v", err)
+	}
 	if err := os.WriteFile(filepath.Join(projectPath, "README.md"), []byte("# Detail Project\n\nREADME body"), 0o600); err != nil {
 		t.Fatalf("write readme: %v", err)
 	}
@@ -1630,6 +1634,8 @@ func TestAgentRemoteDetailRequestsReturnProjectAndVibeSessionDetail(t *testing.T
 		`{"timestamp":"2026-06-14T00:00:00Z","type":"session_meta","payload":{"id":"` + codexID + `","cwd":"` + projectPath + `","model":"gpt-5-codex","model_provider":"OpenAI","git":{"branch":"main"}}}`,
 		`{"timestamp":"2026-06-14T00:01:00Z","type":"message","payload":{"role":"user","content":[{"type":"input_text","text":"Detail user prompt"}]}}`,
 		`{"timestamp":"2026-06-14T00:02:00Z","type":"message","payload":{"role":"assistant","content":[{"type":"output_text","text":"Detail assistant reply"}]}}`,
+		`{"timestamp":"2026-06-14T00:03:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Desktop user prompt"}]}}`,
+		`{"timestamp":"2026-06-14T00:04:00Z","type":"event_msg","payload":{"type":"agent_message","message":"Desktop assistant reply","phase":"commentary"}}`,
 	}
 	if err := os.WriteFile(filepath.Join(codexDir, "detail-session.jsonl"), []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
 		t.Fatalf("write codex session: %v", err)
@@ -1686,6 +1692,21 @@ func TestAgentRemoteDetailRequestsReturnProjectAndVibeSessionDetail(t *testing.T
 	}
 
 	service.handleRemoteAgentMessage(map[string]interface{}{
+		"type":         "file.list",
+		"request_id":   "req_files",
+		"project_path": projectPath,
+		"path":         projectPath,
+		"max_entries":  2,
+	}, writeJSON)
+	fileListEvent := waitForAgentEvent(t, &mu, &events, "file.list.result", func(event map[string]interface{}) bool {
+		return event["request_id"] == "req_files"
+	})
+	entries, ok := fileListEvent["entries"].([]map[string]interface{})
+	if !ok || len(entries) != 2 || fileListEvent["truncated"] != true {
+		t.Fatalf("file list event = %#v entries=%+v ok=%t", fileListEvent, entries, ok)
+	}
+
+	service.handleRemoteAgentMessage(map[string]interface{}{
 		"type":              "ai.session.detail",
 		"request_id":        "req_session",
 		"source_session_id": codexID,
@@ -1695,11 +1716,68 @@ func TestAgentRemoteDetailRequestsReturnProjectAndVibeSessionDetail(t *testing.T
 		return event["request_id"] == "req_session"
 	})
 	session, ok := sessionEvent["session"].(models.AgentVibeSession)
-	if !ok || session.ID != codexID || len(session.Transcript) != 2 {
+	if !ok || session.ID != codexID || len(session.Transcript) != 4 {
 		t.Fatalf("session detail event = %#v", sessionEvent)
 	}
 	if session.Transcript[0].Role != "user" || session.Transcript[0].Content != "Detail user prompt" {
 		t.Fatalf("first session detail message = %#v", session.Transcript[0])
+	}
+	if session.Transcript[3].Role != "assistant" || session.Transcript[3].Content != "Desktop assistant reply" {
+		t.Fatalf("desktop session detail message = %#v", session.Transcript[3])
+	}
+}
+
+func TestReadCodexSessionMetaWithOptionsPaginatesTranscript(t *testing.T) {
+	dir := t.TempDir()
+	sessionPath := filepath.Join(dir, "codex-session.jsonl")
+	codexID := "codex-paged-session"
+	var lines []string
+	lines = append(lines, `{"timestamp":"2026-06-13T00:00:00Z","type":"session_meta","payload":{"id":"`+codexID+`","cwd":"`+strings.ReplaceAll(dir, `\`, `\\`)+`","model":"gpt-5-codex","model_provider":"codex","git":{}}}`)
+	for i := 0; i < 60; i++ {
+		role := "assistant"
+		prefix := "recent"
+		if i%2 == 0 {
+			role = "user"
+		}
+		if i < 20 {
+			prefix = "old"
+		}
+		lines = append(lines, `{"timestamp":"2026-06-13T01:`+fmt.Sprintf("%02d", i)+`:00Z","type":"message","payload":{"role":"`+role+`","content":[{"type":"text","text":"`+prefix+` message `+fmt.Sprint(i)+`"}]}}`)
+	}
+	if err := os.WriteFile(sessionPath, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatalf("write codex fixture: %v", err)
+	}
+
+	latest := readCodexSessionMetaWithOptions(sessionPath, agentVibeSessionReadOptions{Limit: 40, IncludePageMeta: true})
+	if latest.MessageCount != 60 {
+		t.Fatalf("latest MessageCount = %d, want 60", latest.MessageCount)
+	}
+	if got := len(latest.Transcript); got != 40 {
+		t.Fatalf("latest transcript length = %d, want 40", got)
+	}
+	if latest.TranscriptPage == nil || !latest.TranscriptPage.HasMore || latest.TranscriptPage.NextBeforeMessageID == "" {
+		t.Fatalf("latest page metadata = %#v, want has_more with cursor", latest.TranscriptPage)
+	}
+	if strings.Contains(latest.Transcript[0].Content, "old message") {
+		t.Fatalf("latest page unexpectedly included old message: %#v", latest.Transcript[0])
+	}
+	if latest.Transcript[0].Index != 20 || latest.Transcript[len(latest.Transcript)-1].Index != 59 {
+		t.Fatalf("latest indexes = %d..%d, want 20..59", latest.Transcript[0].Index, latest.Transcript[len(latest.Transcript)-1].Index)
+	}
+
+	older := readCodexSessionMetaWithOptions(sessionPath, agentVibeSessionReadOptions{
+		Limit:           40,
+		BeforeMessageID: latest.TranscriptPage.NextBeforeMessageID,
+		IncludePageMeta: true,
+	})
+	if got := len(older.Transcript); got != 20 {
+		t.Fatalf("older transcript length = %d, want 20", got)
+	}
+	if older.TranscriptPage == nil || older.TranscriptPage.HasMore {
+		t.Fatalf("older page metadata = %#v, want no more history", older.TranscriptPage)
+	}
+	if older.Transcript[0].Index != 0 || older.Transcript[len(older.Transcript)-1].Index != 19 {
+		t.Fatalf("older indexes = %d..%d, want 0..19", older.Transcript[0].Index, older.Transcript[len(older.Transcript)-1].Index)
 	}
 }
 

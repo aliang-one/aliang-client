@@ -2,9 +2,11 @@ package services
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/sha1"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -16,10 +18,39 @@ import (
 )
 
 const (
-	agentVibeTranscriptMaxMessages       = 24
-	agentVibeDetailTranscriptMaxMessages = 500
-	agentVibeTranscriptMaxContentRunes   = 4000
+	agentVibeTranscriptMaxMessages     = 24
+	agentVibeDetailDefaultPageLimit    = 40
+	agentVibeDetailMaxPageLimit        = 100
+	agentVibeTranscriptMaxContentRunes = 4000
+	agentVibeIndexMaxLines             = 240
+	agentVibeIndexMaxBytes             = 2 * 1024 * 1024
+	agentVibeSummaryMaxSessions        = 200
+	agentVibeSessionFileScanLimit      = 120
+	agentVibeIndexFileScanLimit        = 80
+	agentVibeDetailCandidateFileLimit  = 24
+	agentRecentFileWalkMaxEntries      = 6000
+	agentRecentFileWalkMaxDuration     = 500 * time.Millisecond
 )
+
+type agentRecentFileCandidate struct {
+	path    string
+	modTime time.Time
+}
+
+type agentVibeSessionReadOptions struct {
+	Limit           int
+	BeforeMessageID string
+	BeforeTimestamp string
+	IncludePageMeta bool
+}
+
+type agentVibeTranscriptWindow struct {
+	limit           int
+	beforeMessageID string
+	beforeTimestamp string
+	foundBefore     bool
+	messages        []models.AgentVibeMessage
+}
 
 type agentSyncSnapshot struct {
 	DeviceName            string                    `json:"device_name"`
@@ -39,6 +70,8 @@ func collectAgentSyncSnapshot() agentSyncSnapshot {
 	history := collectAgentHistoryRoots()
 	vibeSessions := collectAgentVibeSessions()
 	projects := collectAgentProjects(vibeSessions)
+	authorizedDirectories := agentProjectPaths(projects)
+	setAgentAuthorizedExecutionDirectoriesCache(authorizedDirectories)
 
 	return agentSyncSnapshot{
 		DeviceName:            defaultAgentDeviceName(),
@@ -50,7 +83,7 @@ func collectAgentSyncSnapshot() agentSyncSnapshot {
 		History:               history,
 		Projects:              projects,
 		VibeSessions:          summarizeAgentVibeSessions(vibeSessions),
-		AuthorizedDirectories: agentProjectPaths(projects),
+		AuthorizedDirectories: authorizedDirectories,
 		CollectedAt:           time.Now().UTC().Format(time.RFC3339),
 	}
 }
@@ -59,6 +92,7 @@ func summarizeAgentVibeSessions(sessions []models.AgentVibeSession) []models.Age
 	summaries := make([]models.AgentVibeSession, 0, len(sessions))
 	for _, session := range sessions {
 		session.Transcript = nil
+		session.TranscriptPage = nil
 		summaries = append(summaries, session)
 	}
 	return summaries
@@ -168,6 +202,9 @@ func collectAgentVibeSessions() []models.AgentVibeSession {
 	sort.Slice(sessions, func(i, j int) bool {
 		return sessions[i].UpdatedAt > sessions[j].UpdatedAt
 	})
+	if len(sessions) > agentVibeSummaryMaxSessions {
+		sessions = sessions[:agentVibeSummaryMaxSessions]
+	}
 	return sessions
 }
 
@@ -178,38 +215,33 @@ func collectCodexVibeSessions() []models.AgentVibeSession {
 	}
 	indexPath := filepath.Join(home, ".codex", "session_index.jsonl")
 	var sessions []models.AgentVibeSession
-	if file, err := os.Open(indexPath); err == nil {
-		defer file.Close()
-		scanner := bufio.NewScanner(file)
-		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-		for scanner.Scan() {
-			var row struct {
-				ID         string `json:"id"`
-				ThreadName string `json:"thread_name"`
-				UpdatedAt  string `json:"updated_at"`
-			}
-			if err := json.Unmarshal(scanner.Bytes(), &row); err != nil {
-				continue
-			}
-			if strings.TrimSpace(row.ID) == "" {
-				continue
-			}
-			session := models.AgentVibeSession{
-				ID:        "codex_" + row.ID,
-				Provider:  "codex",
-				Tool:      "codex",
-				Title:     truncateAgentText(row.ThreadName, 200),
-				Mode:      "vibe",
-				Status:    "closed",
-				UpdatedAt: normalizeAgentTime(row.UpdatedAt),
-			}
-			sessions = append(sessions, session)
+	for _, line := range readRecentAgentJSONLLines(indexPath, agentVibeIndexMaxLines, agentVibeIndexMaxBytes) {
+		var row struct {
+			ID         string `json:"id"`
+			ThreadName string `json:"thread_name"`
+			UpdatedAt  string `json:"updated_at"`
 		}
+		if err := json.Unmarshal(line, &row); err != nil {
+			continue
+		}
+		if strings.TrimSpace(row.ID) == "" {
+			continue
+		}
+		session := models.AgentVibeSession{
+			ID:        "codex_" + row.ID,
+			Provider:  "codex",
+			Tool:      "codex",
+			Title:     truncateAgentText(row.ThreadName, 200),
+			Mode:      "vibe",
+			Status:    "closed",
+			UpdatedAt: normalizeAgentTime(row.UpdatedAt),
+		}
+		sessions = append(sessions, session)
 	}
 
 	sessionFiles := append(
-		findRecentAgentFiles(filepath.Join(home, ".codex", "sessions"), "*.jsonl", 0),
-		findRecentAgentFiles(filepath.Join(home, ".codex", "archived_sessions"), "*.jsonl", 0)...,
+		findRecentAgentFiles(filepath.Join(home, ".codex", "sessions"), "*.jsonl", agentVibeSessionFileScanLimit),
+		findRecentAgentFiles(filepath.Join(home, ".codex", "archived_sessions"), "*.jsonl", agentVibeSessionFileScanLimit)...,
 	)
 	metaByID := make(map[string]models.AgentVibeSession)
 	for _, path := range sessionFiles {
@@ -252,22 +284,26 @@ func readCodexSessionMeta(path string) models.AgentVibeSession {
 }
 
 func readCodexSessionMetaWithLimit(path string, maxMessages int) models.AgentVibeSession {
+	return readCodexSessionMetaWithOptions(path, agentVibeSessionReadOptions{Limit: maxMessages})
+}
+
+func readCodexSessionMetaWithOptions(path string, options agentVibeSessionReadOptions) models.AgentVibeSession {
 	file, err := os.Open(path)
 	if err != nil {
 		return models.AgentVibeSession{}
 	}
 	defer file.Close()
 
+	options = normalizeAgentVibeSessionReadOptions(options)
+	window := newAgentVibeTranscriptWindow(options)
 	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	lines := 0
 	var session models.AgentVibeSession
 	session.Provider = "codex"
 	session.Tool = "codex"
 	session.Mode = "vibe"
 	session.Status = "closed"
 	for scanner.Scan() {
-		lines++
 		var row struct {
 			Timestamp string `json:"timestamp"`
 			Type      string `json:"type"`
@@ -295,20 +331,18 @@ func readCodexSessionMetaWithLimit(path string, maxMessages int) models.AgentVib
 			session.CreatedAt = firstNonEmpty(session.CreatedAt, normalizeAgentTime(row.Timestamp))
 			continue
 		}
-		if msg := parseCodexTranscriptMessage(line, len(session.Transcript)); msg.Content != "" {
-			session.Transcript = append(session.Transcript, msg)
+		if msg := parseCodexTranscriptMessage(line, session.MessageCount); msg.Content != "" {
 			session.MessageCount++
 			if session.Title == "" && msg.Role == "user" {
 				session.Title = truncateAgentText(msg.Content, 200)
 			}
-			if maxMessages > 0 && len(session.Transcript) > maxMessages {
-				session.Transcript = session.Transcript[len(session.Transcript)-maxMessages:]
-			}
+			window.add(msg)
 		}
 	}
 	if session.ID == "" {
 		return models.AgentVibeSession{}
 	}
+	session.Transcript, session.TranscriptPage = window.page(session.MessageCount, options.IncludePageMeta)
 	if !isSafeAgentProjectPath(session.ProjectPath) {
 		session.ProjectPath = ""
 	}
@@ -357,7 +391,10 @@ func parseCodexTranscriptMessage(line []byte, index int) models.AgentVibeMessage
 		}
 	case "response_item":
 		var payload struct {
-			Item struct {
+			Type    string      `json:"type"`
+			Role    string      `json:"role"`
+			Content interface{} `json:"content"`
+			Item    struct {
 				Type    string      `json:"type"`
 				Role    string      `json:"role"`
 				Content interface{} `json:"content"`
@@ -366,11 +403,35 @@ func parseCodexTranscriptMessage(line []byte, index int) models.AgentVibeMessage
 		if err := json.Unmarshal(row.Payload, &payload); err != nil {
 			return models.AgentVibeMessage{}
 		}
-		role = payload.Item.Role
-		if role == "" && payload.Item.Type == "message" {
+		role = payload.Role
+		content = agentContentText(payload.Content)
+		if role == "" {
+			role = payload.Item.Role
+		}
+		if content == "" {
+			content = agentContentText(payload.Item.Content)
+		}
+		if role == "" && (payload.Type == "message" || payload.Item.Type == "message") {
 			role = "assistant"
 		}
-		content = agentContentText(payload.Item.Content)
+	case "event_msg":
+		var payload struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		}
+		if err := json.Unmarshal(row.Payload, &payload); err != nil {
+			return models.AgentVibeMessage{}
+		}
+		switch payload.Type {
+		case "user_message":
+			role = "user"
+			content = payload.Message
+		case "agent_message":
+			role = "assistant"
+			content = payload.Message
+		default:
+			return models.AgentVibeMessage{}
+		}
 	default:
 		return models.AgentVibeMessage{}
 	}
@@ -384,6 +445,7 @@ func parseCodexTranscriptMessage(line []byte, index int) models.AgentVibeMessage
 		Role:      role,
 		Content:   content,
 		Timestamp: normalizeAgentTime(row.Timestamp),
+		Index:     index,
 	}
 }
 
@@ -407,7 +469,7 @@ func collectClaudeVibeSessions() []models.AgentVibeSession {
 		return nil
 	}
 	root := filepath.Join(home, ".claude", "projects")
-	indexFiles := findRecentAgentFiles(root, "sessions-index.json", 0)
+	indexFiles := findRecentAgentFiles(root, "sessions-index.json", agentVibeIndexFileScanLimit)
 	var sessions []models.AgentVibeSession
 	seen := make(map[string]bool)
 	for _, indexPath := range indexFiles {
@@ -458,7 +520,7 @@ func collectClaudeVibeSessions() []models.AgentVibeSession {
 			seen[session.ID] = true
 		}
 	}
-	for _, path := range findRecentAgentFiles(root, "*.jsonl", 0) {
+	for _, path := range findRecentAgentFiles(root, "*.jsonl", agentVibeSessionFileScanLimit) {
 		if strings.Contains(path, string(filepath.Separator)+"subagents"+string(filepath.Separator)) {
 			continue
 		}
@@ -477,12 +539,18 @@ func readClaudeSessionMeta(path string) models.AgentVibeSession {
 }
 
 func readClaudeSessionMetaWithLimit(path string, maxMessages int) models.AgentVibeSession {
+	return readClaudeSessionMetaWithOptions(path, agentVibeSessionReadOptions{Limit: maxMessages})
+}
+
+func readClaudeSessionMetaWithOptions(path string, options agentVibeSessionReadOptions) models.AgentVibeSession {
 	file, err := os.Open(path)
 	if err != nil {
 		return models.AgentVibeSession{}
 	}
 	defer file.Close()
 
+	options = normalizeAgentVibeSessionReadOptions(options)
+	window := newAgentVibeTranscriptWindow(options)
 	var session models.AgentVibeSession
 	session.Provider = "claude"
 	session.Tool = "claude"
@@ -519,17 +587,17 @@ func readClaudeSessionMetaWithLimit(path string, maxMessages int) models.AgentVi
 			session.CreatedAt = normalizeAgentTime(row.Timestamp)
 		}
 		if row.Type == "user" || row.Type == "assistant" {
-			session.MessageCount++
 			if text := truncateAgentText(claudeMessageText(row.Message), agentVibeTranscriptMaxContentRunes); text != "" {
-				session.Transcript = append(session.Transcript, models.AgentVibeMessage{
-					ID:        stableAgentID("msg", fmt.Sprintf("%s:%d:%s", row.Timestamp, len(session.Transcript), text)),
+				messageIndex := session.MessageCount
+				session.MessageCount++
+				msg := models.AgentVibeMessage{
+					ID:        stableAgentID("msg", fmt.Sprintf("%s:%d:%s", row.Timestamp, messageIndex, text)),
 					Role:      normalizeAgentVibeRole(row.Type),
 					Content:   text,
 					Timestamp: normalizeAgentTime(row.Timestamp),
-				})
-				if maxMessages > 0 && len(session.Transcript) > maxMessages {
-					session.Transcript = session.Transcript[len(session.Transcript)-maxMessages:]
+					Index:     messageIndex,
 				}
+				window.add(msg)
 			}
 		}
 		if session.Title == "" && row.Type == "user" {
@@ -542,8 +610,80 @@ func readClaudeSessionMetaWithLimit(path string, maxMessages int) models.AgentVi
 	if !isSafeAgentProjectPath(session.ProjectPath) {
 		return models.AgentVibeSession{}
 	}
+	session.Transcript, session.TranscriptPage = window.page(session.MessageCount, options.IncludePageMeta)
 	session.UpdatedAt = fileUpdatedAt(path)
 	return session
+}
+
+func normalizeAgentVibeSessionReadOptions(options agentVibeSessionReadOptions) agentVibeSessionReadOptions {
+	if options.Limit <= 0 {
+		options.Limit = agentVibeTranscriptMaxMessages
+	}
+	if options.Limit > agentVibeDetailMaxPageLimit {
+		options.Limit = agentVibeDetailMaxPageLimit
+	}
+	options.BeforeMessageID = strings.TrimSpace(options.BeforeMessageID)
+	options.BeforeTimestamp = normalizeAgentTime(options.BeforeTimestamp)
+	return options
+}
+
+func newAgentVibeTranscriptWindow(options agentVibeSessionReadOptions) *agentVibeTranscriptWindow {
+	return &agentVibeTranscriptWindow{
+		limit:           options.Limit,
+		beforeMessageID: options.BeforeMessageID,
+		beforeTimestamp: options.BeforeTimestamp,
+		messages:        make([]models.AgentVibeMessage, 0, options.Limit+1),
+	}
+}
+
+func (window *agentVibeTranscriptWindow) add(message models.AgentVibeMessage) {
+	if window == nil || window.limit <= 0 {
+		return
+	}
+	if window.beforeMessageID != "" || window.beforeTimestamp != "" {
+		if window.foundBefore {
+			return
+		}
+		if window.beforeMessageID != "" && message.ID == window.beforeMessageID {
+			window.foundBefore = true
+			return
+		}
+		if window.beforeTimestamp != "" && compareRFC3339(message.Timestamp, window.beforeTimestamp) >= 0 {
+			window.foundBefore = true
+			return
+		}
+	}
+	window.messages = append(window.messages, message)
+	maxBuffered := window.limit + 1
+	if len(window.messages) > maxBuffered {
+		window.messages = window.messages[len(window.messages)-maxBuffered:]
+	}
+}
+
+func (window *agentVibeTranscriptWindow) page(totalCount int, includeMeta bool) ([]models.AgentVibeMessage, *models.AgentVibeTranscriptPage) {
+	if window == nil {
+		return nil, nil
+	}
+	messages := window.messages
+	hasMore := len(messages) > window.limit
+	if hasMore {
+		messages = messages[len(messages)-window.limit:]
+	}
+	out := append([]models.AgentVibeMessage(nil), messages...)
+	if !includeMeta {
+		return out, nil
+	}
+	page := &models.AgentVibeTranscriptPage{
+		Limit:      window.limit,
+		Count:      len(out),
+		TotalCount: totalCount,
+		HasMore:    hasMore,
+		Order:      "asc",
+	}
+	if hasMore && len(out) > 0 {
+		page.NextBeforeMessageID = out[0].ID
+	}
+	return out, page
 }
 
 func claudeMessageText(value interface{}) string {
@@ -622,37 +762,140 @@ func isSafeAgentProjectPath(path string) bool {
 }
 
 func findRecentAgentFiles(root string, pattern string, limit int) []string {
-	type candidate struct {
-		path    string
-		modTime time.Time
+	if limit <= 0 {
+		limit = agentVibeSessionFileScanLimit
 	}
-	var candidates []candidate
-	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil || d == nil || d.IsDir() {
-			return nil
+	candidates := make([]agentRecentFileCandidate, 0, minInt(limit, 64))
+	stack := []string{root}
+	startedAt := time.Now()
+	visitedEntries := 0
+	for len(stack) > 0 {
+		if shouldStopAgentRecentFileWalk(startedAt, visitedEntries) {
+			break
 		}
-		ok, err := filepath.Match(pattern, filepath.Base(path))
-		if err != nil || !ok {
-			return nil
-		}
-		info, err := d.Info()
+		dir := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		entries, err := os.ReadDir(dir)
 		if err != nil {
-			return nil
+			continue
 		}
-		candidates = append(candidates, candidate{path: path, modTime: info.ModTime()})
-		return nil
-	})
+		sort.Slice(entries, func(i, j int) bool {
+			return entries[i].Name() < entries[j].Name()
+		})
+		for _, entry := range entries {
+			visitedEntries++
+			if shouldStopAgentRecentFileWalk(startedAt, visitedEntries) {
+				break
+			}
+			path := filepath.Join(dir, entry.Name())
+			if entry.IsDir() {
+				if shouldSkipAgentRecentFileDir(entry.Name()) {
+					continue
+				}
+				stack = append(stack, path)
+				continue
+			}
+			ok, err := filepath.Match(pattern, entry.Name())
+			if err != nil || !ok {
+				continue
+			}
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
+			addAgentRecentFileCandidate(&candidates, agentRecentFileCandidate{path: path, modTime: info.ModTime()}, limit)
+		}
+	}
 	sort.Slice(candidates, func(i, j int) bool {
 		return candidates[i].modTime.After(candidates[j].modTime)
 	})
-	if limit > 0 && len(candidates) > limit {
-		candidates = candidates[:limit]
-	}
 	out := make([]string, 0, len(candidates))
 	for _, candidate := range candidates {
 		out = append(out, candidate.path)
 	}
 	return out
+}
+
+func addAgentRecentFileCandidate(candidates *[]agentRecentFileCandidate, next agentRecentFileCandidate, limit int) {
+	if limit <= 0 || len(*candidates) < limit {
+		*candidates = append(*candidates, next)
+		return
+	}
+	oldest := 0
+	for i := 1; i < len(*candidates); i++ {
+		if (*candidates)[i].modTime.Before((*candidates)[oldest].modTime) {
+			oldest = i
+		}
+	}
+	if next.modTime.After((*candidates)[oldest].modTime) {
+		(*candidates)[oldest] = next
+	}
+}
+
+func shouldStopAgentRecentFileWalk(startedAt time.Time, visitedEntries int) bool {
+	if agentRecentFileWalkMaxEntries > 0 && visitedEntries >= agentRecentFileWalkMaxEntries {
+		return true
+	}
+	return agentRecentFileWalkMaxDuration > 0 && time.Since(startedAt) >= agentRecentFileWalkMaxDuration
+}
+
+func shouldSkipAgentRecentFileDir(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case ".git", "node_modules", ".next", "dist", "build", "target", ".cache", ".venv", "vendor",
+		"coverage", ".turbo", ".parcel-cache", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+		".gradle", ".idea", ".dart_tool", ".serverless", ".terraform", ".pnpm-store", ".yarn",
+		"deriveddata", "tmp", "temp":
+		return true
+	default:
+		return false
+	}
+}
+
+func readRecentAgentJSONLLines(path string, maxLines int, maxBytes int64) [][]byte {
+	if maxLines <= 0 {
+		return nil
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return nil
+	}
+	if maxBytes <= 0 {
+		maxBytes = agentVibeIndexMaxBytes
+	}
+	start := int64(0)
+	if info.Size() > maxBytes {
+		start = info.Size() - maxBytes
+	}
+	if _, err := file.Seek(start, io.SeekStart); err != nil {
+		return nil
+	}
+	raw, err := io.ReadAll(file)
+	if err != nil {
+		return nil
+	}
+	if start > 0 {
+		if newline := bytes.IndexByte(raw, '\n'); newline >= 0 {
+			raw = raw[newline+1:]
+		}
+	}
+	parts := bytes.Split(raw, []byte("\n"))
+	lines := make([][]byte, 0, minInt(maxLines, len(parts)))
+	for i := len(parts) - 1; i >= 0 && len(lines) < maxLines; i-- {
+		line := bytes.TrimSpace(parts[i])
+		if len(line) == 0 {
+			continue
+		}
+		lines = append(lines, line)
+	}
+	for i, j := 0, len(lines)-1; i < j; i, j = i+1, j-1 {
+		lines[i], lines[j] = lines[j], lines[i]
+	}
+	return lines
 }
 
 func cleanAgentProjectPath(path string) string {

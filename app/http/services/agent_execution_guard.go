@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"aliang.one/nursorgate/common/cache"
@@ -26,6 +27,11 @@ const (
 	agentAIRunTimeout        = 30 * time.Minute
 )
 
+var (
+	agentAuthorizedDirsMu    sync.Mutex
+	agentAuthorizedDirsCache []string
+)
+
 func resolveAgentAuthorizedCWD(raw string, label string) (string, error) {
 	authorized := agentAuthorizedExecutionDirectories()
 	cwd := strings.TrimSpace(raw)
@@ -41,6 +47,9 @@ func resolveAgentAuthorizedCWD(raw string, label string) (string, error) {
 		return "", err
 	}
 	if !agentPathInsideAnyDirectory(resolved, authorized) {
+		authorized = refreshAgentAuthorizedExecutionDirectories()
+	}
+	if !agentPathInsideAnyDirectory(resolved, authorized) {
 		if label == "" {
 			label = "working directory"
 		}
@@ -50,10 +59,25 @@ func resolveAgentAuthorizedCWD(raw string, label string) (string, error) {
 }
 
 func agentAuthorizedExecutionDirectories() []string {
+	agentAuthorizedDirsMu.Lock()
+	if len(agentAuthorizedDirsCache) > 0 {
+		dirs := append([]string(nil), agentAuthorizedDirsCache...)
+		agentAuthorizedDirsMu.Unlock()
+		return dirs
+	}
+	agentAuthorizedDirsMu.Unlock()
+	return refreshAgentAuthorizedExecutionDirectories()
+}
+
+func refreshAgentAuthorizedExecutionDirectories() []string {
 	snapshot := collectAgentSyncSnapshot()
-	seen := make(map[string]struct{}, len(snapshot.AuthorizedDirectories))
-	dirs := make([]string, 0, len(snapshot.AuthorizedDirectories))
-	for _, raw := range snapshot.AuthorizedDirectories {
+	return setAgentAuthorizedExecutionDirectoriesCache(snapshot.AuthorizedDirectories)
+}
+
+func setAgentAuthorizedExecutionDirectoriesCache(rawDirs []string) []string {
+	seen := make(map[string]struct{}, len(rawDirs))
+	dirs := make([]string, 0, len(rawDirs))
+	for _, raw := range rawDirs {
 		dir, err := cleanExistingAgentDirectory(raw)
 		if err != nil {
 			continue
@@ -64,7 +88,10 @@ func agentAuthorizedExecutionDirectories() []string {
 		seen[dir] = struct{}{}
 		dirs = append(dirs, dir)
 	}
-	return dirs
+	agentAuthorizedDirsMu.Lock()
+	agentAuthorizedDirsCache = append([]string(nil), dirs...)
+	agentAuthorizedDirsMu.Unlock()
+	return append([]string(nil), dirs...)
 }
 
 func cleanExistingAgentDirectory(raw string) (string, error) {

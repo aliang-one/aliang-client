@@ -92,20 +92,21 @@ type AgentProject struct {
 }
 
 type AgentVibeSession struct {
-	ID           string             `json:"id"`
-	Provider     string             `json:"provider"`
-	Tool         string             `json:"tool,omitempty"`
-	ProjectPath  string             `json:"project_path,omitempty"`
-	Title        string             `json:"title,omitempty"`
-	Summary      string             `json:"summary,omitempty"`
-	Mode         string             `json:"mode,omitempty"`
-	Status       string             `json:"status,omitempty"`
-	MessageCount int                `json:"message_count,omitempty"`
-	Branch       string             `json:"branch,omitempty"`
-	Model        string             `json:"model,omitempty"`
-	Transcript   []AgentVibeMessage `json:"transcript,omitempty"`
-	CreatedAt    string             `json:"created_at,omitempty"`
-	UpdatedAt    string             `json:"updated_at,omitempty"`
+	ID             string                   `json:"id"`
+	Provider       string                   `json:"provider"`
+	Tool           string                   `json:"tool,omitempty"`
+	ProjectPath    string                   `json:"project_path,omitempty"`
+	Title          string                   `json:"title,omitempty"`
+	Summary        string                   `json:"summary,omitempty"`
+	Mode           string                   `json:"mode,omitempty"`
+	Status         string                   `json:"status,omitempty"`
+	MessageCount   int                      `json:"message_count,omitempty"`
+	Branch         string                   `json:"branch,omitempty"`
+	Model          string                   `json:"model,omitempty"`
+	Transcript     []AgentVibeMessage       `json:"transcript,omitempty"`
+	TranscriptPage *AgentVibeTranscriptPage `json:"transcript_page,omitempty"`
+	CreatedAt      string                   `json:"created_at,omitempty"`
+	UpdatedAt      string                   `json:"updated_at,omitempty"`
 }
 
 type AgentVibeMessage struct {
@@ -113,6 +114,16 @@ type AgentVibeMessage struct {
 	Role      string `json:"role"`
 	Content   string `json:"content"`
 	Timestamp string `json:"timestamp,omitempty"`
+	Index     int    `json:"index,omitempty"`
+}
+
+type AgentVibeTranscriptPage struct {
+	Limit               int    `json:"limit"`
+	Count               int    `json:"count"`
+	TotalCount          int    `json:"total_count,omitempty"`
+	HasMore             bool   `json:"has_more"`
+	NextBeforeMessageID string `json:"next_before_message_id,omitempty"`
+	Order               string `json:"order,omitempty"`
 }
 
 type AgentLaunchRequest struct {

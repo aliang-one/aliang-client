@@ -18,10 +18,19 @@ import (
 )
 
 const (
-	agentProjectDetailMaxFiles  = 80
-	agentProjectReadmeMaxBytes  = 24 * 1024
-	agentProjectFileReadMaxByte = 512 * 1024
+	agentProjectDetailMaxFiles        = 80
+	agentProjectDetailMaxScanEntries  = 5000
+	agentProjectDetailMaxScanDuration = 750 * time.Millisecond
+	agentProjectReadmeMaxBytes        = 24 * 1024
+	agentProjectFileReadMaxByte       = 512 * 1024
 )
+
+var errAgentProjectDetailScanLimit = errors.New("agent project detail scan limit reached")
+
+type agentProjectFileCandidate struct {
+	path    string
+	modTime time.Time
+}
 
 func handleAgentDetailMessage(msg map[string]interface{}, writeJSON func(interface{}) error) {
 	switch remoteString(msg, "type") {
@@ -65,14 +74,16 @@ func enrichAgentProjectDetail(project *models.AgentProject) {
 }
 
 func summarizeAgentProjectFiles(root string, limit int) ([]string, int, int64) {
-	type candidate struct {
-		path    string
-		modTime time.Time
+	candidateCap := 0
+	if limit > 0 {
+		candidateCap = limit
 	}
-	var candidates []candidate
+	candidates := make([]agentProjectFileCandidate, 0, candidateCap)
 	fileCount := 0
 	var totalSize int64
-	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+	visitedEntries := 0
+	startedAt := time.Now()
+	walkErr := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil || d == nil {
 			return nil
 		}
@@ -80,7 +91,15 @@ func summarizeAgentProjectFiles(root string, limit int) ([]string, int, int64) {
 			return filepath.SkipDir
 		}
 		if d.IsDir() {
+			visitedEntries++
+			if shouldStopAgentProjectDetailScan(startedAt, visitedEntries) {
+				return errAgentProjectDetailScanLimit
+			}
 			return nil
+		}
+		visitedEntries++
+		if shouldStopAgentProjectDetailScan(startedAt, visitedEntries) {
+			return errAgentProjectDetailScanLimit
 		}
 		info, err := d.Info()
 		if err != nil {
@@ -92,15 +111,15 @@ func summarizeAgentProjectFiles(root string, limit int) ([]string, int, int64) {
 		if err != nil {
 			return nil
 		}
-		candidates = append(candidates, candidate{path: filepath.ToSlash(rel), modTime: info.ModTime()})
+		addAgentProjectFileCandidate(&candidates, agentProjectFileCandidate{path: filepath.ToSlash(rel), modTime: info.ModTime()}, limit)
 		return nil
 	})
+	if walkErr != nil && !errors.Is(walkErr, errAgentProjectDetailScanLimit) {
+		return nil, fileCount, totalSize
+	}
 	sort.Slice(candidates, func(i, j int) bool {
 		return candidates[i].modTime.After(candidates[j].modTime)
 	})
-	if limit > 0 && len(candidates) > limit {
-		candidates = candidates[:limit]
-	}
 	files := make([]string, 0, len(candidates))
 	for _, candidate := range candidates {
 		files = append(files, candidate.path)
@@ -109,9 +128,35 @@ func summarizeAgentProjectFiles(root string, limit int) ([]string, int, int64) {
 	return files, fileCount, totalSize
 }
 
+func addAgentProjectFileCandidate(candidates *[]agentProjectFileCandidate, next agentProjectFileCandidate, limit int) {
+	if limit <= 0 || len(*candidates) < limit {
+		*candidates = append(*candidates, next)
+		return
+	}
+	oldest := 0
+	for i := 1; i < len(*candidates); i++ {
+		if (*candidates)[i].modTime.Before((*candidates)[oldest].modTime) {
+			oldest = i
+		}
+	}
+	if next.modTime.After((*candidates)[oldest].modTime) {
+		(*candidates)[oldest] = next
+	}
+}
+
+func shouldStopAgentProjectDetailScan(startedAt time.Time, visitedEntries int) bool {
+	if agentProjectDetailMaxScanEntries > 0 && visitedEntries >= agentProjectDetailMaxScanEntries {
+		return true
+	}
+	return agentProjectDetailMaxScanDuration > 0 && time.Since(startedAt) >= agentProjectDetailMaxScanDuration
+}
+
 func shouldSkipAgentProjectDir(name string) bool {
 	switch strings.ToLower(strings.TrimSpace(name)) {
-	case ".git", "node_modules", ".next", "dist", "build", "target", ".cache", ".venv", "vendor":
+	case ".git", "node_modules", ".next", "dist", "build", "target", ".cache", ".venv", "vendor",
+		"coverage", ".turbo", ".parcel-cache", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+		".gradle", ".idea", ".dart_tool", ".serverless", ".terraform", ".pnpm-store", ".yarn",
+		"deriveddata":
 		return true
 	default:
 		return false
@@ -142,7 +187,13 @@ func agentVibeSessionDetailPayload(msg map[string]interface{}) map[string]interf
 	sessionID := remoteString(msg, "session_id")
 	sourceSessionID := remoteString(msg, "source_session_id")
 	projectPath := remoteString(msg, "project_path")
-	session := findAgentVibeSessionDetail(sessionID, sourceSessionID, projectPath)
+	options := agentVibeSessionReadOptions{
+		Limit:           normalizeAgentVibeDetailLimit(remoteInt(msg, "limit", agentVibeDetailDefaultPageLimit)),
+		BeforeMessageID: remoteString(msg, "before_message_id"),
+		BeforeTimestamp: remoteString(msg, "before_timestamp"),
+		IncludePageMeta: true,
+	}
+	session := findAgentVibeSessionDetail(sessionID, sourceSessionID, projectPath, options)
 	if session.ID == "" {
 		return agentFileErrorPayload(requestID, errors.New("vibe session not found"))
 	}
@@ -153,18 +204,28 @@ func agentVibeSessionDetailPayload(msg map[string]interface{}) map[string]interf
 	}
 }
 
-func findAgentVibeSessionDetail(sessionID string, sourceSessionID string, projectPath string) models.AgentVibeSession {
+func normalizeAgentVibeDetailLimit(limit int) int {
+	if limit <= 0 {
+		return agentVibeDetailDefaultPageLimit
+	}
+	if limit > agentVibeDetailMaxPageLimit {
+		return agentVibeDetailMaxPageLimit
+	}
+	return limit
+}
+
+func findAgentVibeSessionDetail(sessionID string, sourceSessionID string, projectPath string, options agentVibeSessionReadOptions) models.AgentVibeSession {
 	sourceSessionID = strings.TrimSpace(sourceSessionID)
 	sessionID = strings.TrimSpace(sessionID)
 	projectPath = cleanAgentProjectPath(projectPath)
 	for _, candidate := range candidateAgentVibeSessionFiles(sourceSessionID) {
-		session := readAgentVibeSessionDetailFile(candidate)
+		session := readAgentVibeSessionDetailFile(candidate, options)
 		if agentVibeSessionMatches(session, sessionID, sourceSessionID, projectPath) {
 			return session
 		}
 	}
 	for _, candidate := range allAgentVibeSessionDetailFiles() {
-		session := readAgentVibeSessionDetailFile(candidate)
+		session := readAgentVibeSessionDetailFile(candidate, options)
 		if agentVibeSessionMatches(session, sessionID, sourceSessionID, projectPath) {
 			return session
 		}
@@ -183,9 +244,9 @@ func candidateAgentVibeSessionFiles(sourceSessionID string) []string {
 	}
 	var out []string
 	for _, root := range []string{filepath.Join(home, ".codex", "sessions"), filepath.Join(home, ".codex", "archived_sessions")} {
-		out = append(out, findRecentAgentFiles(root, sourceSessionID+".jsonl", 0)...)
+		out = append(out, findRecentAgentFiles(root, sourceSessionID+".jsonl", agentVibeDetailCandidateFileLimit)...)
 	}
-	out = append(out, findRecentAgentFiles(filepath.Join(home, ".claude", "projects"), sourceSessionID+".jsonl", 0)...)
+	out = append(out, findRecentAgentFiles(filepath.Join(home, ".claude", "projects"), sourceSessionID+".jsonl", agentVibeDetailCandidateFileLimit)...)
 	return out
 }
 
@@ -202,12 +263,13 @@ func allAgentVibeSessionDetailFiles() []string {
 	return files
 }
 
-func readAgentVibeSessionDetailFile(path string) models.AgentVibeSession {
+func readAgentVibeSessionDetailFile(path string, options agentVibeSessionReadOptions) models.AgentVibeSession {
+	options.IncludePageMeta = true
 	if strings.Contains(path, string(filepath.Separator)+".codex"+string(filepath.Separator)) {
-		return readCodexSessionMetaWithLimit(path, agentVibeDetailTranscriptMaxMessages)
+		return readCodexSessionMetaWithOptions(path, options)
 	}
 	if strings.Contains(path, string(filepath.Separator)+".claude"+string(filepath.Separator)) {
-		return readClaudeSessionMetaWithLimit(path, agentVibeDetailTranscriptMaxMessages)
+		return readClaudeSessionMetaWithOptions(path, options)
 	}
 	return models.AgentVibeSession{}
 }
@@ -242,7 +304,7 @@ func agentFileListPayload(msg map[string]interface{}) map[string]interface{} {
 	if maxEntries > 1000 {
 		maxEntries = 1000
 	}
-	entries, err := os.ReadDir(targetPath)
+	entries, truncated, err := readAgentDirectoryEntries(targetPath, maxEntries)
 	if err != nil {
 		return agentFileErrorPayload(requestID, err)
 	}
@@ -275,9 +337,29 @@ func agentFileListPayload(msg map[string]interface{}) map[string]interface{} {
 		"request_id":   requestID,
 		"path":         targetPath,
 		"entries":      result,
-		"truncated":    len(entries) > len(result),
+		"truncated":    truncated,
 		"generated_at": time.Now().UTC().Format(time.RFC3339),
 	}
+}
+
+func readAgentDirectoryEntries(path string, maxEntries int) ([]os.DirEntry, bool, error) {
+	dir, err := os.Open(path)
+	if err != nil {
+		return nil, false, err
+	}
+	defer dir.Close()
+	entries, err := dir.ReadDir(maxEntries + 1)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, false, err
+	}
+	truncated := len(entries) > maxEntries
+	if truncated {
+		entries = entries[:maxEntries]
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].Name() < entries[j].Name()
+	})
+	return entries, truncated, nil
 }
 
 func agentFileReadPayload(msg map[string]interface{}) map[string]interface{} {
@@ -342,7 +424,11 @@ func resolveAgentProjectPath(raw string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if !agentPathInsideAnyDirectory(projectPath, agentAuthorizedExecutionDirectories()) {
+	authorized := agentAuthorizedExecutionDirectories()
+	if !agentPathInsideAnyDirectory(projectPath, authorized) {
+		authorized = refreshAgentAuthorizedExecutionDirectories()
+	}
+	if !agentPathInsideAnyDirectory(projectPath, authorized) {
 		return "", fmt.Errorf("project path is not authorized: %s", projectPath)
 	}
 	return projectPath, nil

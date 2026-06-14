@@ -57,15 +57,13 @@ func EnsureStarted() error {
 		}
 	}()
 
-	deadline := time.Now().Add(7 * time.Second)
-	for time.Now().Before(deadline) {
-		if SupportsCurrentAgentAPI(700 * time.Millisecond) {
-			logger.Info(fmt.Sprintf("[AGENT-BOOT] ensure_started user_agent_ready local_agent_url=%s", services.UserAgentBaseURL()))
-			return nil
-		}
-		time.Sleep(250 * time.Millisecond)
+	attempts, err := waitForCurrentAgentAPI(7*time.Second, 700*time.Millisecond)
+	if err == nil {
+		logger.Info(fmt.Sprintf("[AGENT-BOOT] ensure_started user_agent_ready local_agent_url=%s readiness_attempts=%d", services.UserAgentBaseURL(), attempts))
+		return nil
 	}
-	return fmt.Errorf("user agent process did not become ready")
+	logger.Warn(fmt.Sprintf("[AGENT-BOOT] ensure_started capability_check final_failed path=%s attempts=%d error=%v", protocolPath, attempts, err))
+	return err
 }
 
 func requestUserAgentStartupSync(reason string) error {
@@ -87,16 +85,56 @@ func shouldReplaceExistingRuntimeAfterSyncError(err error) bool {
 }
 
 func SupportsCurrentAgentAPI(timeout time.Duration) bool {
-	protocol, err := fetchLocalAgentProtocol(timeout)
-	if err != nil {
-		logger.Info(fmt.Sprintf("[AGENT-BOOT] ensure_started capability_check failed path=%s error=%v", protocolPath, err))
-		return false
-	}
-	if strings.TrimSpace(protocol.Version) != models.AgentProtocolVersion {
-		logger.Warn(fmt.Sprintf("[AGENT-BOOT] ensure_started capability_check stale_protocol got=%q want=%q", protocol.Version, models.AgentProtocolVersion))
+	if err := checkCurrentAgentAPI(timeout); err != nil {
+		logAgentCapabilityCheckFailure(err)
 		return false
 	}
 	return true
+}
+
+func waitForCurrentAgentAPI(maxWait time.Duration, probeTimeout time.Duration) (int, error) {
+	deadline := time.Now().Add(maxWait)
+	attempts := 0
+	var lastErr error
+	for {
+		attempts++
+		if err := checkCurrentAgentAPI(probeTimeout); err == nil {
+			return attempts, nil
+		} else {
+			lastErr = err
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		if remaining > 250*time.Millisecond {
+			remaining = 250 * time.Millisecond
+		}
+		time.Sleep(remaining)
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("readiness deadline exceeded")
+	}
+	return attempts, fmt.Errorf("user agent process did not become ready: %w", lastErr)
+}
+
+func checkCurrentAgentAPI(timeout time.Duration) error {
+	protocol, err := fetchLocalAgentProtocol(timeout)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(protocol.Version) != models.AgentProtocolVersion {
+		return fmt.Errorf("stale protocol got=%q want=%q", protocol.Version, models.AgentProtocolVersion)
+	}
+	return nil
+}
+
+func logAgentCapabilityCheckFailure(err error) {
+	if strings.Contains(strings.ToLower(err.Error()), "stale protocol") {
+		logger.Warn(fmt.Sprintf("[AGENT-BOOT] ensure_started capability_check %v", err))
+		return
+	}
+	logger.Info(fmt.Sprintf("[AGENT-BOOT] ensure_started capability_check failed path=%s error=%v", protocolPath, err))
 }
 
 func fetchLocalAgentProtocol(timeout time.Duration) (*models.AgentProtocolContract, error) {
