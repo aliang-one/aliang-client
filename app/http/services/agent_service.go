@@ -11,7 +11,6 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
-	osuser "os/user"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -503,21 +502,32 @@ func (s *AgentService) resolveDeviceIDLocked() string {
 }
 
 func (s *AgentService) ensureDeviceIdentityLocked() {
+	changed := false
 	if strings.TrimSpace(s.state.DeviceID) == "" {
 		s.state.DeviceID = "dev-" + uuid.NewString()
+		changed = true
 	}
 	if strings.TrimSpace(s.state.UniqueCode) == "" {
-		s.state.UniqueCode = computeAgentUniqueCode(s.state.DeviceID)
+		s.state.UniqueCode = newAgentUniqueDeviceCode()
+		changed = true
 	}
 	if s.state.Device != nil {
 		if strings.TrimSpace(s.state.Device.ID) == "" {
 			s.state.Device.ID = s.state.DeviceID
+			changed = true
 		}
 		if strings.TrimSpace(s.state.Device.DeviceID) == "" {
 			s.state.Device.DeviceID = s.state.Device.ID
+			changed = true
 		}
 		if strings.TrimSpace(s.state.Device.UniqueCode) == "" {
 			s.state.Device.UniqueCode = s.state.UniqueCode
+			changed = true
+		}
+	}
+	if changed {
+		if err := s.saveStateLocked(); err != nil {
+			logger.Warn(fmt.Sprintf("[AGENT-BOOT] persist_device_identity failed error=%v", err))
 		}
 	}
 }
@@ -714,6 +724,8 @@ func (s *AgentService) registerAndSyncLockedWithAuthorization(authHeader string)
 }
 
 func (s *AgentService) registerAndSyncLockedWithUserContext(authHeader string, userKey string) error {
+	s.ensureDeviceIdentityLocked()
+
 	cfg := config.GetGlobalConfig()
 	if cfg == nil || strings.TrimSpace(cfg.AgentBaseURL()) == "" {
 		s.state.Registered = false
@@ -831,7 +843,6 @@ func (s *AgentService) syncExistingRegisteredDeviceLocked() error {
 func (s *AgentService) rotateDeviceIdentityLocked() {
 	oldDeviceID := s.state.DeviceID
 	s.state.DeviceID = "dev-" + uuid.NewString()
-	s.state.UniqueCode = computeAgentUniqueCode(s.state.DeviceID)
 	s.state.Device = nil
 	s.state.DeviceToken = ""
 	s.state.RegisteredUser = ""
@@ -971,7 +982,8 @@ func (s *AgentService) syncAgentInventoryLocked(reason string) error {
 		fillAgentDeviceDefaults(&device, time.Now().UTC().Format(time.RFC3339))
 		s.state.Device = &device
 		s.state.DeviceID = firstNonEmpty(device.DeviceID, device.ID, s.state.DeviceID)
-		s.state.UniqueCode = firstNonEmpty(device.UniqueCode, s.state.UniqueCode)
+		s.state.UniqueCode = firstNonEmpty(s.state.UniqueCode, device.UniqueCode)
+		device.UniqueCode = s.state.UniqueCode
 	}
 	s.state.LastSyncAt = time.Now().UTC().Format(time.RFC3339)
 	logger.Info(fmt.Sprintf("[AGENT-BOOT] inventory_sync success reason=%s device_id=%s projects=%d vibe_sessions=%d server_projects=%d server_vibe_sessions=%d",
@@ -1280,9 +1292,7 @@ func normalizeRegisteredAgentDevice(resp agentRegisterResponse, fallbackDeviceID
 		if strings.TrimSpace(device.DeviceID) == "" {
 			device.DeviceID = firstNonEmpty(resp.DeviceID, device.ID, fallbackDeviceID)
 		}
-		if strings.TrimSpace(device.UniqueCode) == "" {
-			device.UniqueCode = firstNonEmpty(resp.UniqueCode, fallbackUniqueCode)
-		}
+		device.UniqueCode = firstNonEmpty(fallbackUniqueCode, device.UniqueCode, resp.UniqueCode)
 		if strings.TrimSpace(device.UserID) == "" {
 			device.UserID = firstNonEmpty(resp.UserID, userIDFromIdentity(resp.User))
 		}
@@ -1294,7 +1304,7 @@ func normalizeRegisteredAgentDevice(resp agentRegisterResponse, fallbackDeviceID
 	}
 
 	deviceID := firstNonEmpty(resp.DeviceID, fallbackDeviceID)
-	uniqueCode := firstNonEmpty(resp.UniqueCode, fallbackUniqueCode)
+	uniqueCode := firstNonEmpty(fallbackUniqueCode, resp.UniqueCode)
 	device := &models.AgentDevice{
 		ID:                    deviceID,
 		DeviceID:              deviceID,
@@ -1331,7 +1341,7 @@ func fillAgentDeviceDefaults(device *models.AgentDevice, now string) {
 		device.UserID = strings.TrimSpace(device.User.ID)
 	}
 	if strings.TrimSpace(device.UniqueCode) == "" {
-		device.UniqueCode = computeAgentUniqueCode(device.DeviceID)
+		device.UniqueCode = newAgentUniqueDeviceCode()
 	}
 	if strings.TrimSpace(device.Name) == "" {
 		device.Name = defaultAgentDeviceName()
@@ -1437,15 +1447,8 @@ func summarizeAgentHistoryRoot(tool string, rawPath string) models.AgentHistoryR
 	return summary
 }
 
-func computeAgentUniqueCode(deviceID string) string {
-	hostname, _ := os.Hostname()
-	username := ""
-	if current, err := osuser.Current(); err == nil && current != nil {
-		username = current.Username
-	}
-	raw := strings.Join([]string{deviceID, hostname, username, runtime.GOOS, runtime.GOARCH}, "|")
-	sum := sha256.Sum256([]byte(raw))
-	return fmt.Sprintf("%x", sum[:])[:24]
+func newAgentUniqueDeviceCode() string {
+	return "adc-" + uuid.NewString()
 }
 
 func currentAgentServerURL() string {

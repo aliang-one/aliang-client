@@ -623,7 +623,10 @@ func resolveNamedAgentAITool(name string, prompt string, model string, resumeSes
 			if resumeSessionID != "" {
 				args = append(args, "resume")
 			}
-			args = append(args, "--skip-git-repo-check", "--color", "never")
+			args = append(args, "--skip-git-repo-check")
+			if resumeSessionID == "" {
+				args = append(args, "--color", "never")
+			}
 			if model != "" {
 				args = append(args, "--model", model)
 			}

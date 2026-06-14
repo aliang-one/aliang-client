@@ -382,7 +382,7 @@ func parseCodexTranscriptMessage(line []byte, index int) models.AgentVibeMessage
 		if err := json.Unmarshal(row.Payload, &payload); err != nil {
 			return models.AgentVibeMessage{}
 		}
-		role = firstNonEmpty(payload.Role, payload.Message.Role)
+		role = codexTranscriptRole(payload.Role, payload.Message.Role, payload.Content, payload.Message.Content)
 		if payload.Content != nil {
 			content = agentContentText(payload.Content)
 		}
@@ -403,11 +403,8 @@ func parseCodexTranscriptMessage(line []byte, index int) models.AgentVibeMessage
 		if err := json.Unmarshal(row.Payload, &payload); err != nil {
 			return models.AgentVibeMessage{}
 		}
-		role = payload.Role
+		role = codexTranscriptRole(payload.Role, payload.Item.Role, payload.Content, payload.Item.Content)
 		content = agentContentText(payload.Content)
-		if role == "" {
-			role = payload.Item.Role
-		}
 		if content == "" {
 			content = agentContentText(payload.Item.Content)
 		}
@@ -461,6 +458,52 @@ func codexPayloadText(raw json.RawMessage) string {
 		return ""
 	}
 	return firstNonEmpty(payload.Text, agentContentText(payload.Content), agentContentText(payload.Message.Content))
+}
+
+func codexTranscriptRole(primaryRole string, nestedRole string, primaryContent interface{}, nestedContent interface{}) string {
+	explicitRole := normalizeAgentVibeRole(firstNonEmpty(primaryRole, nestedRole))
+	if explicitRole == "system" {
+		return explicitRole
+	}
+	if contentRole := firstNonEmpty(inferAgentVibeRoleFromContent(primaryContent), inferAgentVibeRoleFromContent(nestedContent)); contentRole != "" {
+		return contentRole
+	}
+	return explicitRole
+}
+
+func inferAgentVibeRoleFromContent(value interface{}) string {
+	switch typed := value.(type) {
+	case []interface{}:
+		seen := make(map[string]bool)
+		for _, item := range typed {
+			if role := inferAgentVibeRoleFromContent(item); role != "" {
+				seen[role] = true
+			}
+		}
+		switch {
+		case seen["assistant"]:
+			return "assistant"
+		case seen["user"]:
+			return "user"
+		case seen["system"]:
+			return "system"
+		default:
+			return ""
+		}
+	case map[string]interface{}:
+		switch strings.ToLower(strings.TrimSpace(fmt.Sprint(typed["type"]))) {
+		case "output_text", "output", "assistant_message":
+			return "assistant"
+		case "input_text", "input", "user_message":
+			return "user"
+		case "system_text", "developer_text", "tool_result", "tool_use", "server_tool_use":
+			return "system"
+		}
+		if nested, ok := typed["content"]; ok {
+			return inferAgentVibeRoleFromContent(nested)
+		}
+	}
+	return ""
 }
 
 func collectClaudeVibeSessions() []models.AgentVibeSession {
@@ -592,7 +635,7 @@ func readClaudeSessionMetaWithOptions(path string, options agentVibeSessionReadO
 				session.MessageCount++
 				msg := models.AgentVibeMessage{
 					ID:        stableAgentID("msg", fmt.Sprintf("%s:%d:%s", row.Timestamp, messageIndex, text)),
-					Role:      normalizeAgentVibeRole(row.Type),
+					Role:      firstNonEmpty(inferAgentVibeRoleFromClaudeMessage(row.Message), normalizeAgentVibeRole(row.Type)),
 					Content:   text,
 					Timestamp: normalizeAgentTime(row.Timestamp),
 					Index:     messageIndex,
@@ -697,6 +740,23 @@ func claudeMessageText(value interface{}) string {
 	return agentContentText(msg.Content)
 }
 
+func inferAgentVibeRoleFromClaudeMessage(value interface{}) string {
+	raw, _ := json.Marshal(value)
+	var msg struct {
+		Role    string      `json:"role"`
+		Content interface{} `json:"content"`
+	}
+	if err := json.Unmarshal(raw, &msg); err != nil {
+		return ""
+	}
+	explicitRole := normalizeAgentVibeRole(msg.Role)
+	contentRole := inferAgentVibeRoleFromContent(msg.Content)
+	if explicitRole == "assistant" && contentRole == "system" && agentContentHasPlainText(msg.Content) {
+		return "assistant"
+	}
+	return firstNonEmpty(contentRole, explicitRole)
+}
+
 func agentContentText(value interface{}) string {
 	switch typed := value.(type) {
 	case string:
@@ -725,13 +785,44 @@ func agentContentText(value interface{}) string {
 	return ""
 }
 
+func agentContentHasPlainText(value interface{}) bool {
+	switch typed := value.(type) {
+	case string:
+		return strings.TrimSpace(typed) != ""
+	case []interface{}:
+		for _, item := range typed {
+			if agentContentHasPlainText(item) {
+				return true
+			}
+		}
+	case map[string]interface{}:
+		itemType := strings.ToLower(strings.TrimSpace(fmt.Sprint(typed["type"])))
+		switch itemType {
+		case "text", "input_text", "output_text":
+			if text, ok := typed["text"].(string); ok && strings.TrimSpace(text) != "" {
+				return true
+			}
+			if content, ok := typed["content"]; ok {
+				return agentContentHasPlainText(content)
+			}
+		case "tool_result", "tool_use", "server_tool_use":
+			return false
+		default:
+			if content, ok := typed["content"]; ok {
+				return agentContentHasPlainText(content)
+			}
+		}
+	}
+	return false
+}
+
 func normalizeAgentVibeRole(value string) string {
 	switch strings.ToLower(strings.TrimSpace(value)) {
 	case "user", "human":
 		return "user"
 	case "assistant", "ai", "model":
 		return "assistant"
-	case "system":
+	case "system", "developer", "tool", "function":
 		return "system"
 	default:
 		return ""

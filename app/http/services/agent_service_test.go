@@ -454,7 +454,7 @@ func TestAgentServiceRegisterAndSyncReusesExistingDeviceToken(t *testing.T) {
 	service := NewAgentService()
 	service.mu.Lock()
 	service.state.DeviceID = "dev_existing"
-	service.state.UniqueCode = computeAgentUniqueCode("dev_existing")
+	service.state.UniqueCode = "adc-test-existing"
 	service.state.DeviceToken = "dt_existing"
 	err := service.registerAndSyncLocked()
 	deviceToken := service.state.DeviceToken
@@ -520,7 +520,7 @@ func TestAgentServiceRegisterAndSyncReregistersWhenUserChanges(t *testing.T) {
 	service := NewAgentService()
 	service.mu.Lock()
 	service.state.DeviceID = "dev_existing"
-	service.state.UniqueCode = computeAgentUniqueCode("dev_existing")
+	service.state.UniqueCode = "adc-test-existing"
 	service.state.DeviceToken = "dt_user_one"
 	service.state.RegisteredUser = "user:user_one"
 	err := service.registerAndSyncLockedWithUserContext("Bearer user_two", "user:user_two")
@@ -594,10 +594,11 @@ func TestAgentServiceRegisterAndSyncRetriesWithNewDeviceIDOnAlreadyBound(t *test
 	service := NewAgentService()
 	service.mu.Lock()
 	service.state.DeviceID = "dev_conflict"
-	service.state.UniqueCode = computeAgentUniqueCode("dev_conflict")
+	service.state.UniqueCode = "adc-test-conflict"
 	err := service.registerAndSyncLocked()
 	deviceID := service.state.DeviceID
 	deviceToken := service.state.DeviceToken
+	uniqueCode := service.state.UniqueCode
 	service.mu.Unlock()
 	if err != nil {
 		t.Fatalf("registerAndSyncLocked() error = %v", err)
@@ -608,11 +609,20 @@ func TestAgentServiceRegisterAndSyncRetriesWithNewDeviceIDOnAlreadyBound(t *test
 	if remoteString(registerPayloads[0], "device_id") != "dev_conflict" {
 		t.Fatalf("first register device_id = %q, want dev_conflict", remoteString(registerPayloads[0], "device_id"))
 	}
+	if remoteString(registerPayloads[0], "unique_code") != "adc-test-conflict" {
+		t.Fatalf("first register unique_code = %q, want adc-test-conflict", remoteString(registerPayloads[0], "unique_code"))
+	}
 	if got := remoteString(registerPayloads[1], "device_id"); got == "" || got == "dev_conflict" {
 		t.Fatalf("retry register device_id = %q, want a new device id", got)
 	}
+	if remoteString(registerPayloads[1], "unique_code") != "adc-test-conflict" {
+		t.Fatalf("retry register unique_code = %q, want stable adc-test-conflict", remoteString(registerPayloads[1], "unique_code"))
+	}
 	if deviceID == "dev_conflict" {
 		t.Fatalf("state device_id was not rotated")
+	}
+	if uniqueCode != "adc-test-conflict" {
+		t.Fatalf("state unique_code = %q, want stable adc-test-conflict", uniqueCode)
 	}
 	if deviceToken != "dt_conflict_retry" {
 		t.Fatalf("device token = %q, want dt_conflict_retry", deviceToken)
@@ -1424,6 +1434,9 @@ printf 'PWD:%s\n' "$PWD"
 	if !strings.Contains(got, "ARGS:exec resume") || !strings.Contains(got, "codex-session-raw") || !strings.Contains(got, "PWD:"+resolvedProjectPath) {
 		t.Fatalf("codex resume output = %q, want resume args and project cwd", got)
 	}
+	if strings.Contains(got, "--color") {
+		t.Fatalf("codex resume output = %q, want no unsupported color flag on resume", got)
+	}
 }
 
 func TestAgentAIManagerRejectsUnsafeRemoteExecution(t *testing.T) {
@@ -1635,7 +1648,8 @@ func TestAgentRemoteDetailRequestsReturnProjectAndVibeSessionDetail(t *testing.T
 		`{"timestamp":"2026-06-14T00:01:00Z","type":"message","payload":{"role":"user","content":[{"type":"input_text","text":"Detail user prompt"}]}}`,
 		`{"timestamp":"2026-06-14T00:02:00Z","type":"message","payload":{"role":"assistant","content":[{"type":"output_text","text":"Detail assistant reply"}]}}`,
 		`{"timestamp":"2026-06-14T00:03:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Desktop user prompt"}]}}`,
-		`{"timestamp":"2026-06-14T00:04:00Z","type":"event_msg","payload":{"type":"agent_message","message":"Desktop assistant reply","phase":"commentary"}}`,
+		`{"timestamp":"2026-06-14T00:04:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"output_text","text":"Desktop assistant reply"}]}}`,
+		`{"timestamp":"2026-06-14T00:05:00Z","type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"Developer context"}]}}`,
 	}
 	if err := os.WriteFile(filepath.Join(codexDir, "detail-session.jsonl"), []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
 		t.Fatalf("write codex session: %v", err)
@@ -1716,7 +1730,7 @@ func TestAgentRemoteDetailRequestsReturnProjectAndVibeSessionDetail(t *testing.T
 		return event["request_id"] == "req_session"
 	})
 	session, ok := sessionEvent["session"].(models.AgentVibeSession)
-	if !ok || session.ID != codexID || len(session.Transcript) != 4 {
+	if !ok || session.ID != codexID || len(session.Transcript) != 5 {
 		t.Fatalf("session detail event = %#v", sessionEvent)
 	}
 	if session.Transcript[0].Role != "user" || session.Transcript[0].Content != "Detail user prompt" {
@@ -1724,6 +1738,34 @@ func TestAgentRemoteDetailRequestsReturnProjectAndVibeSessionDetail(t *testing.T
 	}
 	if session.Transcript[3].Role != "assistant" || session.Transcript[3].Content != "Desktop assistant reply" {
 		t.Fatalf("desktop session detail message = %#v", session.Transcript[3])
+	}
+	if session.Transcript[4].Role != "system" || session.Transcript[4].Content != "Developer context" {
+		t.Fatalf("developer session detail message = %#v", session.Transcript[4])
+	}
+}
+
+func TestReadClaudeSessionMetaClassifiesToolResultsAsSystem(t *testing.T) {
+	dir := t.TempDir()
+	projectPath := filepath.Join(dir, "project")
+	if err := os.MkdirAll(projectPath, 0o700); err != nil {
+		t.Fatalf("mkdir project: %v", err)
+	}
+	sessionPath := filepath.Join(dir, "claude-session.jsonl")
+	lines := []string{
+		`{"timestamp":"2026-06-14T01:00:00Z","type":"user","cwd":"` + projectPath + `","sessionId":"claude-role-session","message":{"role":"user","content":[{"type":"text","text":"Claude user prompt"}]}}`,
+		`{"timestamp":"2026-06-14T01:01:00Z","type":"assistant","cwd":"` + projectPath + `","sessionId":"claude-role-session","message":{"role":"assistant","content":[{"type":"text","text":"Claude assistant reply"}]}}`,
+		`{"timestamp":"2026-06-14T01:02:00Z","type":"user","cwd":"` + projectPath + `","sessionId":"claude-role-session","message":{"role":"user","content":[{"type":"tool_result","content":"Tool output should not be user"}]}}`,
+	}
+	if err := os.WriteFile(sessionPath, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatalf("write claude fixture: %v", err)
+	}
+
+	session := readClaudeSessionMetaWithOptions(sessionPath, agentVibeSessionReadOptions{Limit: 10, IncludePageMeta: true})
+	if got := len(session.Transcript); got != 3 {
+		t.Fatalf("claude transcript length = %d, want 3", got)
+	}
+	if session.Transcript[0].Role != "user" || session.Transcript[1].Role != "assistant" || session.Transcript[2].Role != "system" {
+		t.Fatalf("claude transcript roles = %#v", session.Transcript)
 	}
 }
 
