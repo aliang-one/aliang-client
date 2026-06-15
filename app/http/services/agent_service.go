@@ -644,6 +644,17 @@ func detectAgentTools() []models.AgentTool {
 			defs[i].Available = true
 		}
 	}
+	for i := range defs {
+		if defs[i].ID != "claudecode" || defs[i].Available {
+			continue
+		}
+		if path, err := exec.LookPath("claude"); err == nil {
+			defs[i].Command = "claude"
+			defs[i].Path = path
+			defs[i].Available = true
+			defs[i].Description = "Claude Code CLI via claude"
+		}
+	}
 	return defs
 }
 

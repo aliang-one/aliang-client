@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -53,10 +54,19 @@ type agentAIRun struct {
 }
 
 type agentAITool struct {
-	id   string
-	path string
-	args []string
+	id           string
+	path         string
+	args         []string
+	outputFormat agentAIOutputFormat
 }
+
+type agentAIOutputFormat string
+
+const (
+	agentAIOutputText             agentAIOutputFormat = "text"
+	agentAIOutputCodexJSON        agentAIOutputFormat = "codex_json"
+	agentAIOutputClaudeStreamJSON agentAIOutputFormat = "claude_stream_json"
+)
 
 func newAgentAIManager() *agentAIManager {
 	return &agentAIManager{
@@ -411,7 +421,7 @@ func (m *agentAIManager) runCLI(ctx context.Context, run agentAIRun, writeJSON a
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		streamAIDelta(stdout, run, "stdout", writeJSON, limiter, func(text string) {
+		streamAgentAIStdout(stdout, tool.outputFormat, run, writeJSON, limiter, func(text string) {
 			outMu.Lock()
 			output.WriteString(text)
 			outMu.Unlock()
@@ -419,11 +429,7 @@ func (m *agentAIManager) runCLI(ctx context.Context, run agentAIRun, writeJSON a
 	}()
 	go func() {
 		defer wg.Done()
-		streamAIDelta(stderr, run, "stderr", writeJSON, limiter, func(text string) {
-			outMu.Lock()
-			output.WriteString(text)
-			outMu.Unlock()
-		})
+		drainAIReader(stderr, &agentAIOutputLimiter{limit: 64 * 1024}, run)
 	}()
 	waitErr := cmd.Wait()
 	wg.Wait()
@@ -499,12 +505,127 @@ func (l *agentAIOutputLimiter) Exceeded() bool {
 	return l.exceeded
 }
 
+func streamAgentAIStdout(reader io.Reader, format agentAIOutputFormat, run agentAIRun, writeJSON agentTerminalWriter, limiter *agentAIOutputLimiter, capture func(string)) {
+	switch format {
+	case agentAIOutputCodexJSON, agentAIOutputClaudeStreamJSON:
+		streamStructuredAIDelta(reader, format, run, writeJSON, limiter, capture)
+	default:
+		streamAIDelta(reader, run, "assistant", writeJSON, limiter, capture)
+	}
+}
+
+func streamStructuredAIDelta(reader io.Reader, format agentAIOutputFormat, run agentAIRun, writeJSON agentTerminalWriter, limiter *agentAIOutputLimiter, capture func(string)) {
+	decoder := json.NewDecoder(reader)
+	emitted := false
+	for {
+		var event map[string]interface{}
+		if err := decoder.Decode(&event); err != nil {
+			return
+		}
+		for _, text := range extractStructuredAITexts(format, event, !emitted) {
+			if strings.TrimSpace(text) == "" {
+				continue
+			}
+			if !emitAIDelta(text, run, "assistant", writeJSON, limiter, capture) {
+				return
+			}
+			emitted = true
+		}
+	}
+}
+
+func extractStructuredAITexts(format agentAIOutputFormat, event map[string]interface{}, allowFinal bool) []string {
+	switch format {
+	case agentAIOutputClaudeStreamJSON:
+		return extractClaudeStreamTexts(event, allowFinal)
+	case agentAIOutputCodexJSON:
+		return extractCodexJSONTexts(event, allowFinal)
+	default:
+		return nil
+	}
+}
+
+func extractClaudeStreamTexts(event map[string]interface{}, allowFinal bool) []string {
+	if remoteString(event, "type") == "stream_event" {
+		if streamEvent, ok := event["event"].(map[string]interface{}); ok && remoteString(streamEvent, "type") == "content_block_delta" {
+			if delta, ok := streamEvent["delta"].(map[string]interface{}); ok && remoteString(delta, "type") == "text_delta" {
+				if text := remoteString(delta, "text"); text != "" {
+					return []string{text}
+				}
+			}
+		}
+	}
+	if !allowFinal {
+		return nil
+	}
+	switch remoteString(event, "type") {
+	case "assistant":
+		if message, ok := event["message"].(map[string]interface{}); ok {
+			if text := claudeMessageContentText(message["content"]); text != "" {
+				return []string{text}
+			}
+		}
+	case "result":
+		if text := remoteString(event, "result"); text != "" {
+			return []string{text}
+		}
+	}
+	return nil
+}
+
+func claudeMessageContentText(raw interface{}) string {
+	items, ok := raw.([]interface{})
+	if !ok || len(items) == 0 {
+		return ""
+	}
+	var builder strings.Builder
+	for _, item := range items {
+		row, ok := item.(map[string]interface{})
+		if !ok || remoteString(row, "type") != "text" {
+			continue
+		}
+		builder.WriteString(remoteString(row, "text"))
+	}
+	return builder.String()
+}
+
+func extractCodexJSONTexts(event map[string]interface{}, allowFinal bool) []string {
+	eventType := remoteString(event, "type")
+	if strings.Contains(eventType, "delta") {
+		if text := firstNonEmpty(remoteString(event, "delta"), remoteString(event, "text")); text != "" {
+			return []string{text}
+		}
+		if item, ok := event["item"].(map[string]interface{}); ok && remoteString(item, "type") == "agent_message" {
+			if text := firstNonEmpty(remoteString(item, "delta"), remoteString(item, "text")); text != "" {
+				return []string{text}
+			}
+		}
+	}
+	if !allowFinal {
+		return nil
+	}
+	if item, ok := event["item"].(map[string]interface{}); ok && remoteString(item, "type") == "agent_message" {
+		if text := remoteString(item, "text"); text != "" {
+			return []string{text}
+		}
+	}
+	if eventType == "agent_message" {
+		if text := remoteString(event, "text"); text != "" {
+			return []string{text}
+		}
+	}
+	return nil
+}
+
 func streamAIDelta(reader io.Reader, run agentAIRun, channel string, writeJSON agentTerminalWriter, limiter *agentAIOutputLimiter, capture func(string)) {
 	buf := make([]byte, 4096)
 	for {
 		n, err := reader.Read(buf)
 		if n > 0 {
-			allowed := limiter.Reserve(n)
+			allowed := n
+			if limiter != nil {
+				allowed = limiter.Reserve(n)
+			}
 			if allowed <= 0 {
 				if run.cancel != nil {
 					run.cancel()
@@ -512,16 +633,7 @@ func streamAIDelta(reader io.Reader, run agentAIRun, channel string, writeJSON a
 				return
 			}
 			text := string(buf[:allowed])
-			if capture != nil {
-				capture(text)
-			}
-			_ = writeJSON(map[string]interface{}{
-				"type":       models.AgentEventAIDelta,
-				"session_id": run.sessionID,
-				"message_id": agentAssistantMessageID(run.messageID),
-				"channel":    channel,
-				"delta":      text,
-			})
+			emitAIDelta(text, run, channel, writeJSON, nil, capture)
 			if allowed < n {
 				if run.cancel != nil {
 					run.cancel()
@@ -533,6 +645,57 @@ func streamAIDelta(reader io.Reader, run agentAIRun, channel string, writeJSON a
 			return
 		}
 	}
+}
+
+func drainAIReader(reader io.Reader, limiter *agentAIOutputLimiter, run agentAIRun) {
+	buf := make([]byte, 4096)
+	for {
+		n, err := reader.Read(buf)
+		if n > 0 && limiter != nil {
+			if limiter.Reserve(n) <= 0 && run.cancel != nil {
+				run.cancel()
+				return
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+func emitAIDelta(text string, run agentAIRun, channel string, writeJSON agentTerminalWriter, limiter *agentAIOutputLimiter, capture func(string)) bool {
+	if text == "" {
+		return true
+	}
+	if limiter != nil {
+		allowed := limiter.Reserve(len(text))
+		if allowed <= 0 {
+			if run.cancel != nil {
+				run.cancel()
+			}
+			return false
+		}
+		if allowed < len(text) {
+			text = text[:allowed]
+			if run.cancel != nil {
+				run.cancel()
+			}
+		}
+	}
+	if capture != nil {
+		capture(text)
+	}
+	_ = writeJSON(map[string]interface{}{
+		"type":       models.AgentEventAIDelta,
+		"session_id": run.sessionID,
+		"message_id": agentAssistantMessageID(run.messageID),
+		"channel":    channel,
+		"delta":      text,
+	})
+	if limiter != nil && limiter.Exceeded() {
+		return false
+	}
+	return true
 }
 
 func buildAgentAIPrompt(session *agentAISession, latestContent string) string {
@@ -614,7 +777,7 @@ func resolveAgentAITool(prompt string, preferred string, model string, resumeSes
 }
 
 func resolveNamedAgentAITool(name string, prompt string, model string, resumeSessionID string) (*agentAITool, error) {
-	model = strings.TrimSpace(model)
+	model = normalizeAgentAIModel(model)
 	resumeSessionID = strings.TrimSpace(resumeSessionID)
 	switch name {
 	case "codex":
@@ -623,10 +786,7 @@ func resolveNamedAgentAITool(name string, prompt string, model string, resumeSes
 			if resumeSessionID != "" {
 				args = append(args, "resume")
 			}
-			args = append(args, "--skip-git-repo-check")
-			if resumeSessionID == "" {
-				args = append(args, "--color", "never")
-			}
+			args = append(args, "--json", "--skip-git-repo-check")
 			if model != "" {
 				args = append(args, "--model", model)
 			}
@@ -635,47 +795,54 @@ func resolveNamedAgentAITool(name string, prompt string, model string, resumeSes
 			}
 			args = append(args, prompt)
 			return &agentAITool{
-				id:   "codex",
-				path: path,
-				args: args,
+				id:           "codex",
+				path:         path,
+				args:         args,
+				outputFormat: agentAIOutputCodexJSON,
 			}, nil
 		}
 	case "claude":
 		if path, err := exec.LookPath("claude"); err == nil {
-			args := []string{"--print", "--output-format", "text"}
-			if resumeSessionID != "" {
-				args = append(args, "--resume", resumeSessionID)
-			}
-			if model != "" {
-				args = append(args, "--model", model)
-			}
-			args = append(args, prompt)
-			return &agentAITool{
-				id:   "claude",
-				path: path,
-				args: args,
-			}, nil
+			return newClaudeCodeAITool("claude", path, prompt, model, resumeSessionID), nil
 		}
 	case "claudecode":
 		if path, err := exec.LookPath("claudecode"); err == nil {
-			args := []string{"--print", "--output-format", "text"}
-			if resumeSessionID != "" {
-				args = append(args, "--resume", resumeSessionID)
-			}
-			if model != "" {
-				args = append(args, "--model", model)
-			}
-			args = append(args, prompt)
-			return &agentAITool{
-				id:   "claudecode",
-				path: path,
-				args: args,
-			}, nil
+			return newClaudeCodeAITool("claudecode", path, prompt, model, resumeSessionID), nil
+		}
+		if path, err := exec.LookPath("claude"); err == nil {
+			return newClaudeCodeAITool("claudecode", path, prompt, model, resumeSessionID), nil
 		}
 	default:
 		return nil, fmt.Errorf("unsupported AI provider: %s", name)
 	}
 	return nil, fmt.Errorf("AI CLI %q was not found in PATH", name)
+}
+
+func newClaudeCodeAITool(id string, path string, prompt string, model string, resumeSessionID string) *agentAITool {
+	args := []string{"--print", "--verbose", "--output-format", "stream-json", "--include-partial-messages"}
+	if resumeSessionID != "" {
+		args = append(args, "--resume", resumeSessionID)
+	}
+	if model != "" {
+		args = append(args, "--model", model)
+	}
+	args = append(args, prompt)
+	return &agentAITool{
+		id:           id,
+		path:         path,
+		args:         args,
+		outputFormat: agentAIOutputClaudeStreamJSON,
+	}
+}
+
+func normalizeAgentAIModel(model string) string {
+	model = strings.TrimSpace(model)
+	switch strings.ToLower(model) {
+	case "", "auto", "codex", "claude", "claudecode":
+		return ""
+	default:
+		return model
+	}
 }
 
 func agentAICapabilities() []string {
@@ -685,7 +852,19 @@ func agentAICapabilities() []string {
 			caps = append(caps, "ai_provider_"+candidate)
 		}
 	}
+	if _, err := exec.LookPath("claude"); err == nil && !agentAIStringSliceContains(caps, "ai_provider_claudecode") {
+		caps = append(caps, "ai_provider_claudecode")
+	}
 	return caps
+}
+
+func agentAIStringSliceContains(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }
 
 func resolveAgentAICWD(raw string) (string, error) {

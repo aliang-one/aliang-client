@@ -1240,10 +1240,10 @@ func TestAgentAIManagerRunsFakeCodex(t *testing.T) {
 	projectPath := setupAgentExecutionProjectForTest(t)
 	binDir := t.TempDir()
 	codexName := "codex"
-	script := "#!/bin/sh\nprintf 'ALIANG_FAKE_CODEX_OUTPUT\\n'\nprintf '%s\\n' \"$@\"\n"
+	script := "#!/bin/sh\nprintf '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"ALIANG_FAKE_CODEX_OUTPUT\"}}\\n'\n"
 	if runtime.GOOS == "windows" {
 		codexName = "codex.bat"
-		script = "@echo off\r\necho ALIANG_FAKE_CODEX_OUTPUT\r\necho %*\r\n"
+		script = "@echo off\r\necho {\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"ALIANG_FAKE_CODEX_OUTPUT\"}}\r\n"
 	}
 	codexPath := filepath.Join(binDir, codexName)
 	if err := os.WriteFile(codexPath, []byte(script), 0o700); err != nil {
@@ -1304,9 +1304,9 @@ for arg in "$@"; do
   last="$arg"
 done
 if printf '%s' "$last" | grep -q 'ALIANG_FIRST_ASSISTANT'; then
-  printf 'SECOND_CONTEXT_OK\n'
+  printf '{"type":"item.completed","item":{"type":"agent_message","text":"SECOND_CONTEXT_OK"}}\n'
 else
-  printf 'FIRST ANSWER ALIANG_FIRST_ASSISTANT\n'
+  printf '{"type":"item.completed","item":{"type":"agent_message","text":"FIRST ANSWER ALIANG_FIRST_ASSISTANT"}}\n'
 fi
 `
 	codexPath := filepath.Join(binDir, "codex")
@@ -1374,8 +1374,7 @@ func TestAgentAIManagerResumesImportedCodexSession(t *testing.T) {
 	}
 	binDir := t.TempDir()
 	script := `#!/bin/sh
-printf 'ARGS:%s\n' "$*"
-printf 'PWD:%s\n' "$PWD"
+printf '{"type":"item.completed","item":{"type":"agent_message","text":"ARGS:%s\\nPWD:%s\\n"}}\n' "$*" "$PWD"
 `
 	codexPath := filepath.Join(binDir, "codex")
 	if err := os.WriteFile(codexPath, []byte(script), 0o700); err != nil {
@@ -1436,6 +1435,135 @@ printf 'PWD:%s\n' "$PWD"
 	}
 	if strings.Contains(got, "--color") {
 		t.Fatalf("codex resume output = %q, want no unsupported color flag on resume", got)
+	}
+}
+
+func TestResolveNamedAgentAIToolIgnoresProviderPlaceholderModel(t *testing.T) {
+	binDir := t.TempDir()
+	claudeName := "claude"
+	script := "#!/bin/sh\n"
+	if runtime.GOOS == "windows" {
+		claudeName = "claude.bat"
+		script = "@echo off\r\n"
+	}
+	claudePath := filepath.Join(binDir, claudeName)
+	if err := os.WriteFile(claudePath, []byte(script), 0o700); err != nil {
+		t.Fatalf("write fake claude: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	tool, err := resolveNamedAgentAITool("claude", "你好", "claude", "claude-session-id")
+	if err != nil {
+		t.Fatalf("resolveNamedAgentAITool() error = %v", err)
+	}
+	got := strings.Join(tool.args, " ")
+	if strings.Contains(got, "--model claude") {
+		t.Fatalf("claude args = %q, want provider placeholder model omitted", got)
+	}
+	if !strings.Contains(got, "--resume claude-session-id") {
+		t.Fatalf("claude args = %q, want resume session id", got)
+	}
+}
+
+func TestAgentAIManagerStreamsClaudeCodeTextDelta(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fake claude in this test is POSIX-only")
+	}
+
+	projectPath := setupAgentExecutionProjectForTest(t)
+	binDir := t.TempDir()
+	script := `#!/bin/sh
+printf '{"type":"system","subtype":"init","cwd":"ignored"}\n'
+printf '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"SECRET_THINKING"}}}\n'
+printf '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"你"}}}\n'
+printf '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"好"}}}\n'
+printf '{"type":"assistant","message":{"content":[{"type":"text","text":"你好"}]}}\n'
+printf '{"type":"result","result":"你好"}\n'
+`
+	claudePath := filepath.Join(binDir, "claude")
+	if err := os.WriteFile(claudePath, []byte(script), 0o700); err != nil {
+		t.Fatalf("write fake claude: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	manager := newAgentAIManager()
+	defer manager.closeAll()
+
+	var mu sync.Mutex
+	events := make([]map[string]interface{}, 0)
+	writeJSON := func(payload interface{}) error {
+		event, ok := payload.(map[string]interface{})
+		if !ok {
+			t.Fatalf("payload type = %T, want map[string]interface{}", payload)
+		}
+		mu.Lock()
+		events = append(events, event)
+		mu.Unlock()
+		return nil
+	}
+
+	manager.create(map[string]interface{}{
+		"type":         "ai.session.create",
+		"session_id":   "ai_claude_stream",
+		"project_path": projectPath,
+		"provider":     "claudecode",
+	}, writeJSON)
+	waitForAgentEvent(t, &mu, &events, "ai.session.created", func(event map[string]interface{}) bool {
+		return event["session_id"] == "ai_claude_stream"
+	})
+
+	manager.message(map[string]interface{}{
+		"type":       "ai.message",
+		"session_id": "ai_claude_stream",
+		"message_id": "msg_hello",
+		"content":    "你好",
+	}, writeJSON)
+	waitForAgentEvent(t, &mu, &events, "ai.done", func(event map[string]interface{}) bool {
+		return event["session_id"] == "ai_claude_stream" && event["message_id"] == "assistant_msg_hello"
+	})
+
+	mu.Lock()
+	var output strings.Builder
+	for _, event := range events {
+		if event["session_id"] == "ai_claude_stream" && remoteString(event, "type") == "ai.delta" {
+			output.WriteString(remoteString(event, "delta"))
+			if remoteString(event, "channel") != "assistant" {
+				t.Fatalf("claude delta channel = %q, want assistant", remoteString(event, "channel"))
+			}
+		}
+	}
+	mu.Unlock()
+	got := output.String()
+	if got != "你好" {
+		t.Fatalf("claude streamed output = %q, want only visible assistant text", got)
+	}
+	if strings.Contains(got, "SECRET_THINKING") || strings.Contains(got, "system") {
+		t.Fatalf("claude streamed output leaked non-assistant event: %q", got)
+	}
+}
+
+func TestClaudeCodeToolFallsBackToClaudeBinary(t *testing.T) {
+	binDir := t.TempDir()
+	script := "#!/bin/sh\nprintf 'fallback-ok\\n'\n"
+	claudePath := filepath.Join(binDir, "claude")
+	if runtime.GOOS == "windows" {
+		claudePath = filepath.Join(binDir, "claude.bat")
+		script = "@echo off\r\necho fallback-ok\r\n"
+	}
+	if err := os.WriteFile(claudePath, []byte(script), 0o700); err != nil {
+		t.Fatalf("write fake claude: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	tool, err := resolveNamedAgentAITool("claudecode", "你好", "", "")
+	if err != nil {
+		t.Fatalf("resolveNamedAgentAITool() error = %v", err)
+	}
+	if tool.id != "claudecode" {
+		t.Fatalf("tool.id = %q, want claudecode", tool.id)
+	}
+	if !strings.Contains(strings.Join(tool.args, " "), "--output-format stream-json") {
+		t.Fatalf("claudecode args = %v, want stream-json output", tool.args)
 	}
 }
 
