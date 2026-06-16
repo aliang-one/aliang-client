@@ -129,6 +129,7 @@ func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn) error {
 					"type":      models.AgentEventHeartbeat,
 					"device_id": s.currentDeviceID(),
 					"ts":        time.Now().UnixMilli(),
+					"load":      collectAgentLoadSnapshot(),
 				})
 			case <-inventoryTicker.C:
 				if err := s.sendAgentHello(writeJSON, "periodic"); err != nil {
@@ -352,6 +353,7 @@ func (s *AgentService) agentHelloPayload() map[string]interface{} {
 		"authorized_directories": snapshot.AuthorizedDirectories,
 		"collected_at":           snapshot.CollectedAt,
 		"started_at":             time.Now().UTC().Format(time.RFC3339),
+		"load":                   collectAgentLoadSnapshot(),
 	}
 }
 
