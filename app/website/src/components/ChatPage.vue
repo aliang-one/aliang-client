@@ -83,6 +83,12 @@
         <h3 class="flex-1 truncate text-sm font-semibold text-slate-900 dark:text-white">
           {{ activeConversation?.title || t('chat_emptyTitle') }}
         </h3>
+        <span
+          v-if="activeId && activeRunning"
+          class="inline-flex items-center gap-1 rounded-full bg-primary/10 px-2 py-0.5 text-xs font-medium text-primary"
+        >
+          <span class="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-primary"></span>{{ t('chat_statusRunning') }}
+        </span>
         <button
           v-if="activeId"
           type="button"
@@ -110,13 +116,31 @@
             <p class="text-sm text-slate-400">{{ t('chat_startNew') }}</p>
           </div>
           <div v-for="(msg, idx) in activeMessages" :key="idx" class="mb-3">
-            <div class="mb-1 text-xs text-slate-400">{{ msg.role === 'user' ? t('dash_me') : t('dash_ai') }}</div>
+            <div class="mb-1 flex items-center gap-2 text-xs text-slate-400">
+              <span>{{ msg.role === 'user' ? t('dash_me') : t('dash_ai') }}</span>
+              <span v-if="msg.role === 'assistant' && msg.status === 'running'" class="inline-flex items-center gap-1 text-primary">
+                <span class="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-primary"></span>{{ t('chat_statusRunning') }}
+              </span>
+              <span v-else-if="msg.role === 'assistant' && msg.status === 'done'" class="text-emerald-500">{{ t('chat_statusDone') }}</span>
+              <span v-else-if="msg.role === 'assistant' && msg.status === 'error'" class="text-rose-500">!</span>
+            </div>
             <div
               class="inline-block max-w-[85%] whitespace-pre-wrap rounded-lg px-3 py-2 text-sm"
               :class="msg.role === 'user'
                 ? 'ml-auto block bg-primary text-white'
-                : 'bg-white text-slate-700 dark:bg-slate-700 dark:text-slate-100'"
-            >{{ msg.content }}</div>
+                : msg.status === 'error'
+                  ? 'bg-rose-50 text-rose-600 dark:bg-rose-900/30 dark:text-rose-300'
+                  : 'bg-white text-slate-700 dark:bg-slate-700 dark:text-slate-100'"
+            >
+              <span
+                v-if="msg.role === 'assistant' && msg.status === 'running' && !msg.content"
+                class="ai-thinking"
+              >
+                <span class="thinking-dot"></span><span class="thinking-dot"></span><span class="thinking-dot"></span>
+                <span class="ml-1 align-middle">{{ t('chat_aiThinking') }}</span>
+              </span>
+              <template v-else>{{ msg.content }}</template>
+            </div>
           </div>
         </template>
       </div>
@@ -148,7 +172,7 @@
 </template>
 
 <script setup>
-import { ref, computed, watch, nextTick, onMounted } from 'vue';
+import { ref, computed, nextTick, onMounted, onUnmounted } from 'vue';
 import { useI18n } from '../i18n';
 import { useNavigation } from '../composables/useNavigation';
 import { useAuthStore } from '../stores/auth';
@@ -167,6 +191,11 @@ const messagesContainer = ref(null);
 const inputRef = ref(null);
 const showMobileSidebar = ref(false);
 
+// Local agent AI WebSocket: streams the local Claude Code / Codex headless run
+// token-by-token and carries the running -> done status transitions.
+let aiSocket = null;
+let aiSocketPromise = null;
+
 const activeConversation = computed(() =>
   conversations.value.find(c => c.id === activeId.value) || null
 );
@@ -174,6 +203,15 @@ const activeConversation = computed(() =>
 const activeMessages = computed(() =>
   activeConversation.value?.messages || []
 );
+
+// True while the active conversation's latest assistant message is still streaming.
+const activeRunning = computed(() => {
+  const msgs = activeMessages.value;
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (msgs[i].role === 'assistant') return msgs[i].status === 'running';
+  }
+  return false;
+});
 
 function generateId() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
@@ -276,10 +314,166 @@ function scrollToBottom() {
   });
 }
 
+// --- Local agent AI streaming over WebSocket ---
+
+function aiSocketUrl() {
+  const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+  return `${proto}://${window.location.host}/api/agent/ai/stream`;
+}
+
+function ensureAISocket() {
+  if (aiSocket && aiSocket.readyState === WebSocket.OPEN) return Promise.resolve();
+  if (aiSocket && aiSocket.readyState === WebSocket.CONNECTING && aiSocketPromise) return aiSocketPromise;
+
+  aiSocketPromise = new Promise((resolve, reject) => {
+    let sock;
+    try {
+      sock = new WebSocket(aiSocketUrl());
+    } catch (e) {
+      aiSocketPromise = null;
+      reject(e);
+      return;
+    }
+    aiSocket = sock;
+    sock.onopen = () => {
+      console.log('[aliang-chat] ws open', aiSocketUrl());
+      aiSocketPromise = null;
+      resolve();
+    };
+    sock.onmessage = (ev) => {
+      let parsed = null;
+      try {
+        parsed = JSON.parse(ev.data);
+      } catch (_) {
+        // ignore malformed frames
+      }
+      if (parsed && parsed.type) {
+        console.log('[aliang-chat] frame', parsed.type, parsed.type === 'ai.delta' ? `len=${(parsed.delta || '').length}` : '');
+      }
+      handleAIEvent(parsed);
+    };
+    sock.onerror = (e) => {
+      console.warn('[aliang-chat] ws error', e);
+    };
+    sock.onclose = (e) => {
+      console.log('[aliang-chat] ws close code=', e.code, 'reason=', e.reason);
+      if (aiSocket === sock) aiSocket = null;
+      aiSocketPromise = null;
+    };
+  });
+  return aiSocketPromise;
+}
+
+function sendAI(payload) {
+  if (aiSocket && aiSocket.readyState === WebSocket.OPEN) {
+    aiSocket.send(JSON.stringify(payload));
+    return true;
+  }
+  return false;
+}
+
+function findRunningAssistant(conv) {
+  const msgs = conv.messages || [];
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (msgs[i].role === 'assistant' && msgs[i].status === 'running') return msgs[i];
+  }
+  return null;
+}
+
+// Returns the live assistant bubble for a streaming run, creating a fresh
+// placeholder if sendMessage's placeholder was lost (e.g. page reloaded mid-run
+// holding a stale session id, or a state desync). Never spawns a stray bubble
+// after the turn already finished (done/error) — late deltas are then ignored.
+function ensureAssistantBubble(conv) {
+  const asst = findRunningAssistant(conv);
+  if (asst) return asst;
+  const msgs = conv.messages || [];
+  const last = msgs[msgs.length - 1];
+  if (last && last.role === 'assistant' && (last.status === 'done' || last.status === 'error')) {
+    return null;
+  }
+  const fresh = { role: 'assistant', content: '', status: 'running', ts: now() };
+  conv.messages.push(fresh);
+  return fresh;
+}
+
+function finishRun(conv) {
+  conv.updatedAt = now();
+  if (activeId.value === conv.id) sending.value = false;
+  saveToStorage();
+}
+
+function handleAIEvent(e) {
+  if (!e || !e.type) return;
+
+  let conv = e.session_id ? conversations.value.find(c => c.aiSessionId === e.session_id) : null;
+  // Fallback: a run started from this page always targets the active
+  // conversation's live assistant bubble. If the session id didn't match
+  // (e.g. reloaded localStorage holding a stale id, or an id mismatch), route
+  // to the active conversation so the stream still renders instead of being
+  // silently dropped.
+  if (!conv && activeConversation.value) {
+    conv = activeConversation.value;
+  }
+  if (!conv) {
+    console.debug('[chat] ai event has no target conversation', e);
+    return;
+  }
+
+  // Lightweight trace so a streaming/render issue can be localized from the
+  // browser console (event type + session match). Delta text is intentionally
+  // omitted to keep the log readable.
+  console.log('[aliang-chat] ai event', e.type, 'session=', e.session_id, 'conv=', conv.id);
+
+  let persist = false;
+  switch (e.type) {
+    case 'ai.session.created':
+      conv.aiReady = true;
+      persist = true;
+      break;
+    case 'ai.run.started': {
+      ensureAssistantBubble(conv).status = 'running';
+      break;
+    }
+    case 'ai.delta': {
+      const asst = ensureAssistantBubble(conv);
+      if (!asst) break;
+      asst.content += e.delta || '';
+      console.log('[aliang-chat] rendered delta, contentLen=', asst.content.length, 'conv=', conv.id);
+      scrollToBottom();
+      break;
+    }
+    case 'ai.status': {
+      const asst = findRunningAssistant(conv);
+      if (asst && !asst.content && e.status) asst.content = e.status;
+      persist = true;
+      break;
+    }
+    case 'ai.done': {
+      const asst = findRunningAssistant(conv);
+      if (asst) asst.status = 'done';
+      finishRun(conv);
+      return;
+    }
+    case 'ai.error': {
+      const asst = findRunningAssistant(conv);
+      if (asst) {
+        asst.status = 'error';
+        if (!asst.content) asst.content = e.error || t('chat_aiError');
+      }
+      finishRun(conv);
+      return;
+    }
+    default:
+      return;
+  }
+  if (persist) saveToStorage();
+}
+
 async function sendMessage() {
   if (!isAuthenticated.value) {
     if (activeConversation.value) {
-      activeConversation.value.messages.push({ role: 'assistant', content: t('chat_loginRequired'), ts: now() });
+      activeConversation.value.messages.push({ role: 'assistant', content: t('chat_loginRequired'), status: 'done', ts: now() });
     }
     return;
   }
@@ -299,30 +493,43 @@ async function sendMessage() {
   saveToStorage();
   scrollToBottom();
 
+  // Live assistant placeholder: its content fills in token-by-token as
+  // ai.delta frames arrive, and its status drives the running -> done UI.
+  const assistantMsg = { role: 'assistant', content: '', status: 'running', ts: now() };
+  conv.messages.push(assistantMsg);
+  scrollToBottom();
+
   sending.value = true;
+  if (!conv.aiSessionId) conv.aiSessionId = 'local-' + conv.id;
+  const messageId = generateId();
+
   try {
-    const historyPayload = conv.messages.slice(-20).map(m => ({ role: m.role, content: m.content }));
-
-    const response = await fetch('/api/chat/completions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: text, history: historyPayload })
+    await ensureAISocket();
+    if (!conv.aiSessionCreated) {
+      sendAI({
+        type: 'ai.session.create',
+        session_id: conv.aiSessionId,
+        project_path: conv.projectPath || '',
+        provider: conv.provider || 'claudecode',
+        mode: 'vibe',
+      });
+      conv.aiSessionCreated = true;
+    }
+    const ok = sendAI({
+      type: 'ai.message',
+      session_id: conv.aiSessionId,
+      message_id: messageId,
+      content: text,
     });
-
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-
-    const data = await response.json();
-    const reply = data?.data?.reply;
-    if (!reply || !String(reply).trim()) throw new Error('Empty AI response');
-
-    conv.messages.push({ role: 'assistant', content: String(reply).trim(), ts: now() });
+    if (!ok) throw new Error('socket-closed');
   } catch (_) {
-    conv.messages.push({ role: 'assistant', content: t('chat_serviceUnavailable'), ts: now() });
-  } finally {
-    conv.updatedAt = now();
+    const asst = findRunningAssistant(conv);
+    if (asst) {
+      asst.status = 'error';
+      asst.content = t('chat_serviceUnavailable');
+    }
     sending.value = false;
     saveToStorage();
-    scrollToBottom();
   }
 }
 
@@ -337,12 +544,41 @@ function handleKeydown(e) {
 }
 
 onMounted(() => {
+  console.log('[aliang-chat] ChatPage mounted build=stream-v3 ws=' + aiSocketUrl());
   loadFromStorage();
   document.addEventListener('keydown', handleKeydown);
 });
 
-import { onUnmounted } from 'vue';
 onUnmounted(() => {
   document.removeEventListener('keydown', handleKeydown);
+  if (aiSocket) {
+    try { aiSocket.close(); } catch (_) {}
+    aiSocket = null;
+  }
 });
 </script>
+
+<style scoped>
+.ai-thinking {
+  display: inline-flex;
+  align-items: center;
+}
+
+.thinking-dot {
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  margin: 0 1px;
+  border-radius: 9999px;
+  background-color: rgb(148 163 184);
+  animation: thinking-bounce 1.2s infinite ease-in-out both;
+}
+
+.thinking-dot:nth-child(2) { animation-delay: 0.15s; }
+.thinking-dot:nth-child(3) { animation-delay: 0.3s; }
+
+@keyframes thinking-bounce {
+  0%, 80%, 100% { transform: scale(0.6); opacity: 0.4; }
+  40% { transform: scale(1); opacity: 1; }
+}
+</style>

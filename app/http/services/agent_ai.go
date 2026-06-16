@@ -373,16 +373,48 @@ func (m *agentAIManager) appendAssistantHistory(sessionID string, runSeq int, me
 	session.history = trimAgentAIHistory(session.history)
 }
 
+// agentAIRunOutcome reports how a single CLI pass finished.
+const (
+	agentAIRunDone agentAIRunOutcome = iota
+	// agentAIRunResumeMissing means the CLI could not find the requested
+	// --resume session locally (it is absent, or filed under a different
+	// project path than the run's cwd). The pass emitted no assistant output;
+	// the caller should retry the run fresh, without --resume.
+	agentAIRunResumeMissing
+)
+
+type agentAIRunOutcome int
+
 func (m *agentAIManager) runCLI(ctx context.Context, run agentAIRun, writeJSON agentTerminalWriter) {
 	defer m.clearRunning(run.sessionID, run.runSeq)
 	if run.cancel != nil {
 		defer run.cancel()
 	}
 
-	tool, err := resolveAgentAITool(run.prompt, run.provider, run.model, run.resumeSessionID)
+	// Try to resume the prior Claude/Codex session when one is referenced. If
+	// that session does not exist locally (an imported/foreign session, or one
+	// filed under a different project path than this run's cwd), the CLI exits
+	// with "No conversation found with session ID" before emitting any output.
+	// Retry the run fresh in that case so the conversation still streams,
+	// rather than surfacing a hard error to the user.
+	if strings.TrimSpace(run.resumeSessionID) != "" {
+		if m.runCLIPass(ctx, run, writeJSON, true) != agentAIRunResumeMissing {
+			return
+		}
+	}
+	_ = m.runCLIPass(ctx, run, writeJSON, false)
+}
+
+func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJSON agentTerminalWriter, allowResume bool) agentAIRunOutcome {
+	resumeID := run.resumeSessionID
+	if !allowResume {
+		resumeID = ""
+	}
+
+	tool, err := resolveAgentAITool(run.prompt, run.provider, run.model, resumeID)
 	if err != nil {
 		_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, err))
-		return
+		return agentAIRunDone
 	}
 
 	cmd := exec.CommandContext(ctx, tool.path, tool.args...)
@@ -392,16 +424,16 @@ func (m *agentAIManager) runCLI(ctx context.Context, run agentAIRun, writeJSON a
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, err))
-		return
+		return agentAIRunDone
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, err))
-		return
+		return agentAIRunDone
 	}
 	if err := cmd.Start(); err != nil {
 		_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, err))
-		return
+		return agentAIRunDone
 	}
 
 	_ = writeJSON(map[string]interface{}{
@@ -417,6 +449,7 @@ func (m *agentAIManager) runCLI(ctx context.Context, run agentAIRun, writeJSON a
 	var wg sync.WaitGroup
 	var outMu sync.Mutex
 	var output strings.Builder
+	var stderrBuf strings.Builder
 	limiter := &agentAIOutputLimiter{limit: agentAIOutputLimitBytes}
 	wg.Add(2)
 	go func() {
@@ -429,7 +462,10 @@ func (m *agentAIManager) runCLI(ctx context.Context, run agentAIRun, writeJSON a
 	}()
 	go func() {
 		defer wg.Done()
-		drainAIReader(stderr, &agentAIOutputLimiter{limit: 64 * 1024}, run)
+		// Capture the head of stderr (capped) so a stale/missing --resume
+		// session can be detected and the run retried fresh; the remainder is
+		// drained to keep memory bounded.
+		captureAgentAIStderr(stderr, &stderrBuf)
 	}()
 	waitErr := cmd.Wait()
 	wg.Wait()
@@ -448,11 +484,17 @@ func (m *agentAIManager) runCLI(ctx context.Context, run agentAIRun, writeJSON a
 			"session_id": run.sessionID,
 			"status":     status,
 		})
-		return
+		return agentAIRunDone
 	}
 	if waitErr != nil {
+		// The referenced --resume session is not resolvable in this cwd (e.g.
+		// an imported session, or one created under a different project path).
+		// Signal the caller to retry without --resume instead of erroring.
+		if allowResume && strings.Contains(stderrBuf.String(), "No conversation found with session ID") {
+			return agentAIRunResumeMissing
+		}
 		_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, waitErr))
-		return
+		return agentAIRunDone
 	}
 	outMu.Lock()
 	assistantOutput := output.String()
@@ -463,6 +505,28 @@ func (m *agentAIManager) runCLI(ctx context.Context, run agentAIRun, writeJSON a
 		"session_id": run.sessionID,
 		"message_id": agentAssistantMessageID(run.messageID),
 	})
+	return agentAIRunDone
+}
+
+// captureAgentAIStderr reads everything from reader, storing the first cap
+// bytes into buf and discarding the rest. It never blocks the run on stderr
+// volume and bounds memory usage.
+func captureAgentAIStderr(reader io.Reader, buf *strings.Builder) {
+	const cap = 8 * 1024
+	b := make([]byte, 4096)
+	for {
+		n, err := reader.Read(b)
+		if n > 0 && buf.Len() < cap {
+			room := cap - buf.Len()
+			if room > n {
+				room = n
+			}
+			buf.Write(b[:room])
+		}
+		if err != nil {
+			return
+		}
+	}
 }
 
 type agentAIOutputLimiter struct {
@@ -647,22 +711,9 @@ func streamAIDelta(reader io.Reader, run agentAIRun, channel string, writeJSON a
 	}
 }
 
-func drainAIReader(reader io.Reader, limiter *agentAIOutputLimiter, run agentAIRun) {
-	buf := make([]byte, 4096)
-	for {
-		n, err := reader.Read(buf)
-		if n > 0 && limiter != nil {
-			if limiter.Reserve(n) <= 0 && run.cancel != nil {
-				run.cancel()
-				return
-			}
-		}
-		if err != nil {
-			return
-		}
-	}
-}
-
+// captureAgentAIStderr (defined above runCLIPass) is used for AI runs so a
+// stale --resume session ("No conversation found with session ID") can be
+// detected and the run retried fresh.
 func emitAIDelta(text string, run agentAIRun, channel string, writeJSON agentTerminalWriter, limiter *agentAIOutputLimiter, capture func(string)) bool {
 	if text == "" {
 		return true

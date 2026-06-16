@@ -170,6 +170,10 @@ export default {
   chat_older: 'Older',
   chat_serviceUnavailable: 'AI service is temporarily unavailable.',
   chat_loginRequired: 'Please log in first.',
+  chat_statusRunning: 'In conversation',
+  chat_statusDone: 'Done',
+  chat_aiThinking: 'Thinking…',
+  chat_aiError: 'AI response failed, please retry.',
 
   // -- App --
   app_restoringSession: 'Restoring saved session...',
@@ -869,6 +873,20 @@ export default {
   agent_launchSuccess: 'Command launched.',
   agent_launchFailed: 'Failed to launch command.',
   agent_remoteTerminalDisabled: 'Remote terminal is disabled. Commands cannot run.',
+
+  // -- ModelMappingSettings --
+  modelMapping_title: 'Model Mapping',
+  modelMapping_description: 'Rewrite the "model" field in forwarded HTTP/1 AI requests before sending upstream.',
+  modelMapping_enable: 'Enable model mapping',
+  modelMapping_hint: 'Applies only to HTTP/1 AI traffic (e.g. OpenAI /v1/chat/completions, Anthropic /v1/messages). Models not listed below are forwarded unchanged.',
+  modelMapping_original: 'Original model',
+  modelMapping_replacement: 'Replacement model',
+  modelMapping_originalPlaceholder: 'e.g. gpt-4',
+  modelMapping_replacementPlaceholder: 'e.g. gpt-4o',
+  modelMapping_addRule: 'Add rule',
+  modelMapping_remove: 'Remove rule',
+  modelMapping_save: 'Save',
+  modelMapping_saving: 'Saving...',
 
   // -- ConfigSyncSettings --
   sync_title: 'Config Sync Center',

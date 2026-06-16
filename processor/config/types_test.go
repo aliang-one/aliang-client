@@ -760,6 +760,139 @@ func TestConfigValidate_HTTP1DropRejectsBlankRule(t *testing.T) {
 	}
 }
 
+func TestConfigEffectiveModelMapping_DisabledByDefault(t *testing.T) {
+	cfg := &Config{}
+	if got := cfg.EffectiveModelMapping(); got != nil {
+		t.Fatalf("EffectiveModelMapping() = %v, want nil by default", got)
+	}
+}
+
+func TestConfigValidate_ModelMappingAcceptsRules(t *testing.T) {
+	payload := []byte(`{
+		"core": {"api_server": "https://api.aliang.one"},
+		"customer": {
+			"model_mapping": {
+				"enable": true,
+				"rules": {"gpt-4": "gpt-4o", "  claude-3  ": "  claude-3-5  "}
+			}
+		}
+	}`)
+
+	var cfg Config
+	if err := json.Unmarshal(payload, &cfg); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+
+	effective := cfg.EffectiveModelMapping()
+	if effective == nil {
+		t.Fatal("EffectiveModelMapping() = nil, want enabled config")
+	}
+	rules := effective.EffectiveRules()
+	if rules["gpt-4"] != "gpt-4o" {
+		t.Fatalf("rules[gpt-4] = %q, want gpt-4o", rules["gpt-4"])
+	}
+	if rules["claude-3"] != "claude-3-5" {
+		t.Fatalf("trimmed rule = %q, want claude-3-5", rules["claude-3"])
+	}
+
+	roundTripRaw, err := json.Marshal(&cfg)
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	if !strings.Contains(string(roundTripRaw), `"enable":true`) {
+		t.Fatalf("marshaled config = %s, want model_mapping.enable true", roundTripRaw)
+	}
+	if strings.Contains(string(roundTripRaw), `"enabled"`) {
+		t.Fatalf("marshaled config = %s, want no legacy model_mapping.enabled key", roundTripRaw)
+	}
+
+	var roundTrip Config
+	if err := json.Unmarshal(roundTripRaw, &roundTrip); err != nil {
+		t.Fatalf("round-trip json.Unmarshal() error = %v", err)
+	}
+	if got := roundTrip.EffectiveModelMapping(); got == nil {
+		t.Fatal("round-trip EffectiveModelMapping() = nil, want enabled config")
+	}
+}
+
+func TestConfigValidate_ModelMappingAcceptsLegacyEnabledAlias(t *testing.T) {
+	payload := []byte(`{
+		"core": {"api_server": "https://api.aliang.one"},
+		"customer": {
+			"model_mapping": {
+				"enabled": true,
+				"rules": {"src": "dst"}
+			}
+		}
+	}`)
+
+	var cfg Config
+	if err := json.Unmarshal(payload, &cfg); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if got := cfg.EffectiveModelMapping(); got == nil {
+		t.Fatal("EffectiveModelMapping() = nil, want legacy enabled alias to enable config")
+	}
+
+	roundTripRaw, err := json.Marshal(&cfg)
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	if !strings.Contains(string(roundTripRaw), `"enable":true`) {
+		t.Fatalf("marshaled config = %s, want canonical model_mapping.enable true", roundTripRaw)
+	}
+	if strings.Contains(string(roundTripRaw), `"enabled"`) {
+		t.Fatalf("marshaled config = %s, want no legacy model_mapping.enabled key", roundTripRaw)
+	}
+}
+
+func TestConfigValidate_ModelMappingRejectsBlankRule(t *testing.T) {
+	payload := []byte(`{
+		"core": {"api_server": "https://api.aliang.one"},
+		"customer": {
+			"model_mapping": {
+				"enable": true,
+				"rules": {"gpt-4": "  "}
+			}
+		}
+	}`)
+
+	var cfg Config
+	if err := json.Unmarshal(payload, &cfg); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate() error = nil, want blank model_mapping rule error")
+	}
+	if !strings.Contains(err.Error(), "model_mapping") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestConfigValidate_ModelMappingDisabledSkipsValidation(t *testing.T) {
+	payload := []byte(`{
+		"core": {"api_server": "https://api.aliang.one"},
+		"customer": {
+			"model_mapping": {"enable": false, "rules": {"": ""}}
+		}
+	}`)
+
+	var cfg Config
+	if err := json.Unmarshal(payload, &cfg); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v, want nil when disabled", err)
+	}
+	if got := cfg.EffectiveModelMapping(); got != nil {
+		t.Fatalf("EffectiveModelMapping() = %v, want nil when disabled", got)
+	}
+}
+
 func TestConfigAgentBaseURL(t *testing.T) {
 	cfg := &Config{Core: &CoreConfig{APIServer: "https://api.example.com/"}}
 	if got := cfg.AgentBaseURL(); got != DefaultAgentServerURL {

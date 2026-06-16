@@ -122,17 +122,26 @@
                 </p>
               </div>
             </div>
-            <RulesSettings
-              v-else
-              :config="customerConfig"
-              :preset-providers="presetProviders"
-              :loading="isLoadingCustomerConfig"
-              :saving="isSavingCustomerConfig"
-              :error="customerConfigError"
-              :success-message="customerConfigSuccess"
-              :version="customerConfigVersion"
-              @save="saveCustomerConfig"
-            />
+            <template v-else>
+              <RulesSettings
+                :config="customerConfig"
+                :preset-providers="presetProviders"
+                :loading="isLoadingCustomerConfig"
+                :saving="isSavingCustomerConfig"
+                :error="customerConfigError"
+                :success-message="customerConfigSuccess"
+                :version="customerConfigVersion"
+                @save="saveCustomerConfig"
+              />
+              <ModelMappingSettings
+                :config="customerConfig"
+                :loading="isLoadingCustomerConfig"
+                :saving="isSavingCustomerConfig"
+                :error="customerConfigError"
+                :success-message="customerConfigSuccess"
+                @save="saveCustomerConfig"
+              />
+            </template>
           </section>
 
           <aside class="flex flex-col gap-6 lg:col-span-4">
@@ -194,6 +203,7 @@ import UserInfoSettings from './settings/UserInfoSettings.vue';
 import LogsSettings from './settings/LogsSettings.vue';
 import SystemSettings from './settings/SystemSettings.vue';
 import AgentSettings from './settings/AgentSettings.vue';
+import ModelMappingSettings from './settings/ModelMappingSettings.vue';
 import { useNavigation } from '../composables/useNavigation';
 import { openTutorialDocs } from '../composables/useTutorialDocs';
 import { useAuthStore } from '../stores/auth';
@@ -209,7 +219,11 @@ function createDefaultCustomerConfig() {
       password: ''
     },
     ai_rules: {},
-    proxy_rules: []
+    proxy_rules: [],
+    model_mapping: {
+      enable: false,
+      rules: {}
+    }
   };
 }
 
@@ -237,6 +251,23 @@ function normalizeProxyRules(raw) {
   return normalizeStringList(raw);
 }
 
+function normalizeModelMappingConfig(payload = {}) {
+  const source = payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : {};
+  const rawRules = source.rules && typeof source.rules === 'object' && !Array.isArray(source.rules) ? source.rules : {};
+  const rules = {};
+  for (const [from, to] of Object.entries(rawRules)) {
+    const key = String(from ?? '').trim();
+    const value = String(to ?? '').trim();
+    if (key && value) {
+      rules[key] = value;
+    }
+  }
+  return {
+    enable: typeof source.enable === 'boolean' ? source.enable : false,
+    rules
+  };
+}
+
 function normalizeCustomerConfig(payload = {}) {
   const defaults = createDefaultCustomerConfig();
   return {
@@ -248,7 +279,8 @@ function normalizeCustomerConfig(payload = {}) {
       password: typeof payload?.proxy?.password === 'string' ? payload.proxy.password : defaults.proxy.password
     },
     ai_rules: normalizeAiRules(payload?.ai_rules),
-    proxy_rules: normalizeProxyRules(payload?.proxy_rules)
+    proxy_rules: normalizeProxyRules(payload?.proxy_rules),
+    model_mapping: normalizeModelMappingConfig(payload?.model_mapping)
   };
 }
 
@@ -323,7 +355,8 @@ export default {
     UserInfoSettings,
     LogsSettings,
     SystemSettings,
-    AgentSettings
+    AgentSettings,
+    ModelMappingSettings
   },
   setup() {
     const { currentPage, showPage, showDashboard } = useNavigation();

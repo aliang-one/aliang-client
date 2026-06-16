@@ -170,6 +170,10 @@ export default {
   chat_older: '更早',
   chat_serviceUnavailable: '暂时无法连接 AI 服务，请稍后重试。',
   chat_loginRequired: '请先登录后再使用对话功能。',
+  chat_statusRunning: '对话中',
+  chat_statusDone: '已完成',
+  chat_aiThinking: '正在思考…',
+  chat_aiError: 'AI 回复出错，请重试。',
 
   // -- App --
   app_restoringSession: '正在恢复会话...',
@@ -869,6 +873,20 @@ export default {
   agent_launchSuccess: '命令已启动。',
   agent_launchFailed: '启动命令失败。',
   agent_remoteTerminalDisabled: '远程终端能力已关闭，无法执行命令。',
+
+  // -- ModelMappingSettings --
+  modelMapping_title: '模型映射',
+  modelMapping_description: '转发 HTTP/1 AI 请求前，将请求体里的 model 字段改写为映射后的值。',
+  modelMapping_enable: '启用模型映射',
+  modelMapping_hint: '仅对 HTTP/1 的 AI 流量生效（如 OpenAI /v1/chat/completions、Anthropic /v1/messages）。未在下方列出的 model 将原样透传。',
+  modelMapping_original: '原始 model',
+  modelMapping_replacement: '替换 model',
+  modelMapping_originalPlaceholder: '例如 gpt-4',
+  modelMapping_replacementPlaceholder: '例如 gpt-4o',
+  modelMapping_addRule: '新增规则',
+  modelMapping_remove: '删除规则',
+  modelMapping_save: '保存',
+  modelMapping_saving: '保存中…',
 
   // -- ConfigSyncSettings --
   sync_title: '配置同步中心',

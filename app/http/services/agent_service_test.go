@@ -1542,6 +1542,103 @@ printf '{"type":"result","result":"你好"}\n'
 	}
 }
 
+// TestAgentServiceDispatchLocalAIStreamsClaudeDeltas exercises the in-process
+// dispatch path used by the in-app chat WebSocket: DispatchLocalAI must route
+// ai.session.create / ai.message to the manager so the page receives the live
+// ai.run.started -> ai.delta -> ai.done stream, exactly as it would over the
+// remote agent link.
+func TestAgentServiceDispatchLocalAIStreamsClaudeDeltas(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fake claude in this test is POSIX-only")
+	}
+
+	projectPath := setupAgentExecutionProjectForTest(t)
+	// resolveAgentAICWD populates the package-level authorized-dirs cache; reset
+	// it on exit so this test cannot leak a stale entry that flips a later test's
+	// "unauthorized path" rejection.
+	defer func() {
+		agentAuthorizedDirsMu.Lock()
+		agentAuthorizedDirsCache = nil
+		agentAuthorizedDirsMu.Unlock()
+	}()
+	binDir := t.TempDir()
+	script := `#!/bin/sh
+printf '{"type":"system","subtype":"init","cwd":"ignored"}\n'
+printf '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"SECRET"}}}\n'
+printf '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"你"}}}\n'
+printf '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"好"}}}\n'
+printf '{"type":"result","result":"你好"}\n'
+`
+	claudePath := filepath.Join(binDir, "claude")
+	if err := os.WriteFile(claudePath, []byte(script), 0o700); err != nil {
+		t.Fatalf("write fake claude: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	svc := &AgentService{ai: newAgentAIManager()}
+	defer svc.ai.closeAll()
+
+	var mu sync.Mutex
+	events := make([]map[string]interface{}, 0)
+	writeJSON := func(payload interface{}) error {
+		event, ok := payload.(map[string]interface{})
+		if !ok {
+			t.Fatalf("payload type = %T, want map[string]interface{}", payload)
+		}
+		mu.Lock()
+		events = append(events, event)
+		mu.Unlock()
+		return nil
+	}
+
+	svc.DispatchLocalAI(map[string]interface{}{
+		"type":         "ai.session.create",
+		"session_id":   "dispatch_local",
+		"project_path": projectPath,
+		"provider":     "claudecode",
+		"mode":         "vibe",
+	}, writeJSON)
+	waitForAgentEvent(t, &mu, &events, "ai.session.created", func(event map[string]interface{}) bool {
+		return event["session_id"] == "dispatch_local"
+	})
+
+	svc.DispatchLocalAI(map[string]interface{}{
+		"type":       "ai.message",
+		"session_id": "dispatch_local",
+		"message_id": "msg_dispatch",
+		"content":    "你好",
+	}, writeJSON)
+	waitForAgentEvent(t, &mu, &events, "ai.run.started", func(event map[string]interface{}) bool {
+		return event["session_id"] == "dispatch_local"
+	})
+	waitForAgentEvent(t, &mu, &events, "ai.done", func(event map[string]interface{}) bool {
+		return event["session_id"] == "dispatch_local"
+	})
+
+	mu.Lock()
+	var output strings.Builder
+	sawStarted := false
+	for _, event := range events {
+		if event["session_id"] != "dispatch_local" {
+			continue
+		}
+		switch remoteString(event, "type") {
+		case "ai.run.started":
+			sawStarted = true
+		case "ai.delta":
+			output.WriteString(remoteString(event, "delta"))
+		}
+	}
+	mu.Unlock()
+
+	if !sawStarted {
+		t.Fatalf("expected ai.run.started before ai.done")
+	}
+	if got := output.String(); got != "你好" {
+		t.Fatalf("dispatched streamed output = %q, want 你好", got)
+	}
+}
+
 func TestClaudeCodeToolFallsBackToClaudeBinary(t *testing.T) {
 	binDir := t.TempDir()
 	script := "#!/bin/sh\nprintf 'fallback-ok\\n'\n"

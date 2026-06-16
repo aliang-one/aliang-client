@@ -5,11 +5,14 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"aliang.one/nursorgate/app/http/common"
 	"aliang.one/nursorgate/app/http/models"
 	"aliang.one/nursorgate/app/http/services"
+
+	"github.com/gorilla/websocket"
 )
 
 type AgentHandler struct {
@@ -24,6 +27,47 @@ func NewAgentHandler(service *services.AgentService) *AgentHandler {
 	return &AgentHandler{
 		service: service,
 		client:  &http.Client{Timeout: 12 * time.Second},
+	}
+}
+
+// aiStreamUpgrader upgrades the in-app chat WebSocket. Same localhost-only
+// origin policy as the log stream so the bundled web UI can connect directly
+// and drive the local Claude Code / Codex headless run.
+var aiStreamUpgrader = websocket.Upgrader{
+	ReadBufferSize:  4096,
+	WriteBufferSize: 4096,
+	CheckOrigin: func(r *http.Request) bool {
+		host := strings.Split(r.Host, ":")[0]
+		return host == "localhost" || host == "127.0.0.1"
+	},
+}
+
+// HandleAIStream is the local chat WebSocket endpoint (/api/agent/ai/stream).
+// It bridges the web UI to the agent AI manager: each inbound JSON message is
+// dispatched locally (ai.session.create / ai.message / ai.stop / ai.session.close)
+// and every event the manager emits (ai.run.started, ai.delta, ai.done, ai.error)
+// is written straight back over the same socket, giving the page a live,
+// token-by-token stream plus the running -> done status transitions.
+func (h *AgentHandler) HandleAIStream(w http.ResponseWriter, r *http.Request) {
+	conn, err := aiStreamUpgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+
+	var writeMu sync.Mutex
+	writeJSON := func(payload interface{}) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		return conn.WriteJSON(payload)
+	}
+
+	for {
+		var msg map[string]interface{}
+		if err := conn.ReadJSON(&msg); err != nil {
+			return
+		}
+		h.service.DispatchLocalAI(msg, writeJSON)
 	}
 }
 

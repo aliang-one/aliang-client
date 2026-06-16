@@ -82,6 +82,69 @@ func TestMergeCustomerPayload_PreservesOmittedFields(t *testing.T) {
 	}
 }
 
+func TestMergeCustomerPayload_ModelMappingEnableRoundTrip(t *testing.T) {
+	baseCfg := &config.Config{
+		Core:     &config.CoreConfig{APIServer: "https://api.aliang.one"},
+		Customer: &config.CustomerConfig{},
+	}
+
+	cases := []struct {
+		name    string
+		payload string
+	}{
+		{
+			name:    "wrapped customer payload",
+			payload: `{"customer":{"model_mapping":{"enable":true,"rules":{"src":"dst"}}}}`,
+		},
+		{
+			name:    "direct customer payload",
+			payload: `{"model_mapping":{"enable":true,"rules":{"src":"dst"}}}`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mergedRaw, nextCfg, err := mergeCustomerPayload(baseCfg, []byte(tc.payload))
+			if err != nil {
+				t.Fatalf("mergeCustomerPayload() error = %v", err)
+			}
+			if !strings.Contains(mergedRaw, `"enable":true`) {
+				t.Fatalf("merged payload = %s, want model_mapping.enable true", mergedRaw)
+			}
+			if err := nextCfg.Validate(); err != nil {
+				t.Fatalf("Validate() error = %v", err)
+			}
+
+			effective := nextCfg.EffectiveModelMapping()
+			if effective == nil {
+				t.Fatal("EffectiveModelMapping() = nil, want enabled config")
+			}
+			if got := effective.EffectiveRules()["src"]; got != "dst" {
+				t.Fatalf("EffectiveRules()[src] = %q, want dst", got)
+			}
+
+			committedRaw, err := json.Marshal(nextCfg)
+			if err != nil {
+				t.Fatalf("json.Marshal() error = %v", err)
+			}
+			if !strings.Contains(string(committedRaw), `"enable":true`) {
+				t.Fatalf("committed payload = %s, want model_mapping.enable true", committedRaw)
+			}
+			if strings.Contains(string(committedRaw), `"enabled"`) {
+				t.Fatalf("committed payload = %s, want no legacy model_mapping.enabled key", committedRaw)
+			}
+
+			var committedCfg config.Config
+			if err := json.Unmarshal(committedRaw, &committedCfg); err != nil {
+				t.Fatalf("decode committed payload: %v", err)
+			}
+			if got := committedCfg.EffectiveModelMapping(); got == nil {
+				t.Fatal("committed EffectiveModelMapping() = nil, want enabled config")
+			}
+		})
+	}
+}
+
 func TestResolveBaseConfigForCustomerUpdate_PrefersStartupLocalConfigOverHomeConfig(t *testing.T) {
 	config.ResetGlobalConfigForTest()
 	config.ResetEffectiveConfigCommitCoordinatorForTest()

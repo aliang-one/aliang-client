@@ -4,11 +4,13 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -23,6 +25,10 @@ const (
 	httpRelayCaptureLimit       = 128 * 1024
 	http1DropMaxDrainBodyBytes  = 1 << 20
 	http1UnknownRequestBodySize = -1
+	// http1ModelRewriteMaxBodyBytes bounds how much of an HTTP/1 AI request body
+	// we buffer in memory to rewrite the "model" field. Larger bodies are
+	// forwarded unchanged.
+	http1ModelRewriteMaxBodyBytes = 1 << 20
 )
 
 type HTTP1RelayStats struct {
@@ -251,6 +257,7 @@ func RelayHTTP1(ctx context.Context, clientConn, remoteConn net.Conn) (*HTTP1Rel
 			}
 
 			injectHTTP1AuthorizationHeader(reqRes.req)
+			applyHTTP1AIModelRewrite(reqRes.req)
 
 			if err := reqRes.req.Write(requestWriter); err != nil {
 				relayErr = err
@@ -413,6 +420,107 @@ func injectHTTP1AuthorizationHeader(req *http.Request) {
 			req.Host,
 		))
 	}
+}
+
+// applyHTTP1AIModelRewrite rewrites the top-level "model" field of an HTTP/1 AI
+// request body in place according to the configured ModelMapping rules. It is
+// best-effort: disabled/empty rules, non-JSON bodies, oversized or unparseable
+// bodies are all forwarded unchanged. Once any bytes are consumed from
+// req.Body the body is always restored (rewritten, original-buffered, or as a
+// reconstructed stream) so the downstream relay never loses data.
+func applyHTTP1AIModelRewrite(req *http.Request) {
+	if req == nil || req.Body == nil {
+		return
+	}
+	rules := config.GetGlobalConfig().EffectiveModelMapping().EffectiveRules()
+	if len(rules) == 0 {
+		return
+	}
+	if !isHTTP1JSONRequest(req) {
+		return
+	}
+
+	raw, err := io.ReadAll(io.LimitReader(req.Body, http1ModelRewriteMaxBodyBytes+1))
+	if err != nil || len(raw) > http1ModelRewriteMaxBodyBytes {
+		// Body too large to buffer safely or read error: forward the original
+		// stream untouched by re-prepending whatever we already consumed.
+		restoreHTTP1RequestBodyStream(req, raw)
+		return
+	}
+
+	if rewritten, ok := rewriteHTTP1AIModelField(raw, rules); ok {
+		setHTTP1RequestBody(req, rewritten)
+		if !version.IsProdBuild() {
+			logger.Debug(fmt.Sprintf(
+				"WatcherWrapConn: rewrote HTTP/1 AI model for request=%q",
+				http1RequestLine(req),
+			))
+		}
+		return
+	}
+
+	// Model absent / not in rules / JSON unparseable: forward original bytes.
+	setHTTP1RequestBody(req, raw)
+}
+
+// rewriteHTTP1AIModelField parses a JSON object and, if it has a top-level
+// string "model" field present in rules, returns the re-serialized body with
+// the mapped value substituted. ok is false when nothing should change.
+func rewriteHTTP1AIModelField(raw []byte, rules map[string]string) ([]byte, bool) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var obj map[string]any
+	if err := dec.Decode(&obj); err != nil {
+		return nil, false
+	}
+	if obj == nil || dec.More() {
+		return nil, false
+	}
+	current, ok := obj["model"].(string)
+	if !ok {
+		return nil, false
+	}
+	target, ok := rules[current]
+	if !ok {
+		return nil, false
+	}
+	obj["model"] = target
+	rewritten, err := json.Marshal(obj)
+	if err != nil {
+		return nil, false
+	}
+	return rewritten, true
+}
+
+func isHTTP1JSONRequest(req *http.Request) bool {
+	if req == nil {
+		return false
+	}
+	contentType := strings.ToLower(strings.TrimSpace(req.Header.Get("Content-Type")))
+	return strings.Contains(contentType, "application/json")
+}
+
+// setHTTP1RequestBody replaces req.Body with a fixed-length buffer of body and
+// normalizes framing to an explicit Content-Length (dropping Transfer-Encoding).
+func setHTTP1RequestBody(req *http.Request, body []byte) {
+	if req == nil {
+		return
+	}
+	req.Body = io.NopCloser(bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	req.TransferEncoding = nil
+	req.Header.Set("Content-Length", strconv.Itoa(len(body)))
+	req.Header.Del("Transfer-Encoding")
+}
+
+// restoreHTTP1RequestBodyStream reconstructs the original body stream after a
+// partial read by prepending the already-consumed bytes. Framing headers are
+// left untouched so the original Content-Length / chunked semantics still hold.
+func restoreHTTP1RequestBodyStream(req *http.Request, consumed []byte) {
+	if req == nil || req.Body == nil || len(consumed) == 0 {
+		return
+	}
+	req.Body = io.NopCloser(io.MultiReader(bytes.NewReader(consumed), req.Body))
 }
 
 func http1RequestLine(req *http.Request) string {

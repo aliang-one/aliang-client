@@ -343,12 +343,90 @@ func (c *HTTP1DropConfig) Validate() error {
 	return nil
 }
 
+// ModelMappingConfig rewrites the top-level "model" field of forwarded HTTP/1
+// AI request bodies (e.g. OpenAI /v1/chat/completions, Anthropic /v1/messages)
+// from the original value to the mapped value before sending to the upstream.
+// Models absent from Rules are forwarded unchanged. The feature is opt-in and
+// only applies to HTTP/1 AI-accelerated traffic.
+type ModelMappingConfig struct {
+	Enabled *bool             `json:"enable,omitempty"`
+	Rules   map[string]string `json:"rules,omitempty"` // 原始 model -> 替换 model
+}
+
+func (c *ModelMappingConfig) UnmarshalJSON(data []byte) error {
+	type alias struct {
+		Enabled       *bool             `json:"enable,omitempty"`
+		LegacyEnabled *bool             `json:"enabled,omitempty"`
+		Rules         map[string]string `json:"rules,omitempty"`
+	}
+
+	var decoded alias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+
+	c.Enabled = decoded.Enabled
+	if c.Enabled == nil {
+		c.Enabled = decoded.LegacyEnabled
+	}
+	c.Rules = decoded.Rules
+	return nil
+}
+
+// IsEnabled reports whether model rewriting is enabled. The feature is opt-in:
+// it defaults to disabled when Enabled is unset.
+func (c *ModelMappingConfig) IsEnabled() bool {
+	if c == nil || c.Enabled == nil {
+		return false
+	}
+	return *c.Enabled
+}
+
+// EffectiveRules returns the cleaned mapping (trimmed keys/values, empty
+// entries dropped). It returns nil when there are no usable rules.
+func (c *ModelMappingConfig) EffectiveRules() map[string]string {
+	if c == nil || len(c.Rules) == 0 {
+		return nil
+	}
+	rules := make(map[string]string, len(c.Rules))
+	for rawFrom, rawTo := range c.Rules {
+		from := strings.TrimSpace(rawFrom)
+		to := strings.TrimSpace(rawTo)
+		if from == "" || to == "" {
+			continue
+		}
+		rules[from] = to
+	}
+	if len(rules) == 0 {
+		return nil
+	}
+	return rules
+}
+
+func (c *ModelMappingConfig) Validate() error {
+	if c == nil || !c.IsEnabled() {
+		return nil
+	}
+	for rawFrom, rawTo := range c.Rules {
+		from := strings.TrimSpace(rawFrom)
+		to := strings.TrimSpace(rawTo)
+		if from == "" {
+			return fmt.Errorf("model_mapping.rules cannot have an empty source model")
+		}
+		if to == "" {
+			return fmt.Errorf("model_mapping.rules[%q] cannot map to an empty target model", from)
+		}
+	}
+	return nil
+}
+
 type CustomerConfig struct {
 	Proxy         *CustomerProxyConfig              `json:"proxy,omitempty"`
 	AIRules       map[string]*CustomerAIRuleSetting `json:"ai_rules,omitempty"`
 	ProxyRules    []string                          `json:"proxy_rules,omitempty"`
 	TrafficMirror *TrafficMirrorConfig              `json:"traffic_mirror,omitempty"`
 	HTTP1Drop     *HTTP1DropConfig                  `json:"http1_drop,omitempty"`
+	ModelMapping  *ModelMappingConfig               `json:"model_mapping,omitempty"`
 }
 
 type AliangServerConfig struct {
@@ -578,6 +656,11 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("invalid http1_drop configuration: %w", err)
 		}
 	}
+	if modelMapping := c.Customer.ModelMapping; modelMapping != nil {
+		if err := modelMapping.Validate(); err != nil {
+			return fmt.Errorf("invalid model_mapping configuration: %w", err)
+		}
+	}
 
 	return nil
 }
@@ -631,7 +714,7 @@ func (c *Config) customerUnknownKeyErrors() error {
 	if len(c.customerUnknownFields) > 0 {
 		sorted := append([]string(nil), c.customerUnknownFields...)
 		sort.Strings(sorted)
-		return fmt.Errorf("customer.%s is forbidden: editable customer fields are [proxy ai_rules proxy_rules traffic_mirror http1_drop]", sorted[0])
+		return fmt.Errorf("customer.%s is forbidden: editable customer fields are [proxy ai_rules proxy_rules traffic_mirror http1_drop model_mapping]", sorted[0])
 	}
 
 	providers := make([]string, 0, len(c.aiRuleUnknownFields))
@@ -668,7 +751,7 @@ func extractCustomerUnknownFields(root map[string]json.RawMessage) ([]string, ma
 
 	for key := range customerRoot {
 		switch key {
-		case "proxy", "ai_rules", "proxy_rules", "traffic_mirror", "http1_drop":
+		case "proxy", "ai_rules", "proxy_rules", "traffic_mirror", "http1_drop", "model_mapping":
 		default:
 			unknownCustomer = append(unknownCustomer, key)
 		}
@@ -971,6 +1054,20 @@ func (c *Config) EffectiveHTTP1Drop() *HTTP1DropConfig {
 	}
 
 	cfg := *c.Customer.HTTP1Drop
+	return &cfg
+}
+
+// EffectiveModelMapping returns the model mapping config when rewriting is
+// enabled, otherwise nil. Callers should also handle an empty EffectiveRules
+// result as a no-op.
+func (c *Config) EffectiveModelMapping() *ModelMappingConfig {
+	if c == nil || c.Customer == nil || c.Customer.ModelMapping == nil {
+		return nil
+	}
+	if !c.Customer.ModelMapping.IsEnabled() {
+		return nil
+	}
+	cfg := *c.Customer.ModelMapping
 	return &cfg
 }
 

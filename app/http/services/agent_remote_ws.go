@@ -268,6 +268,34 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 	}
 }
 
+// DispatchLocalAI routes a single in-process AI protocol event to the agent AI
+// manager. It is the local counterpart of the AI branch in
+// handleRemoteAgentMessage: the in-app chat WebSocket uses it so the web UI can
+// drive the local Claude Code / Codex headless run and receive streaming
+// ai.run.started / ai.delta / ai.done events without round-tripping through the
+// remote agent server. writeJSON receives every event the manager emits.
+func (s *AgentService) DispatchLocalAI(msg map[string]interface{}, writeJSON func(interface{}) error) {
+	if writeJSON == nil || msg == nil {
+		return
+	}
+	msgType := strings.TrimSpace(fmt.Sprint(msg["type"]))
+	switch msgType {
+	case models.AgentEventAISessionCreate:
+		s.ai.create(msg, writeJSON)
+	case models.AgentEventAIMessage:
+		s.ai.message(msg, writeJSON)
+	case models.AgentEventAIStop:
+		s.ai.stop(msg, writeJSON)
+	case models.AgentEventAISessionClose:
+		s.ai.close(msg, writeJSON)
+	default:
+		_ = writeJSON(map[string]interface{}{
+			"type":  models.AgentEventAIError,
+			"error": fmt.Sprintf("unsupported local AI event type: %s", msgType),
+		})
+	}
+}
+
 func (s *AgentService) remoteConnectionSnapshot() (string, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
