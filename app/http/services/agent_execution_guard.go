@@ -16,9 +16,18 @@ import (
 )
 
 const (
-	agentMaxTerminalSessions      = 4
-	agentTerminalInputLimitBytes  = 64 * 1024
-	agentTerminalOutputLimitBytes = 2 * 1024 * 1024
+	agentMaxTerminalSessions     = 4
+	agentTerminalInputLimitBytes = 64 * 1024
+	// Terminal output flood protection. A hard cumulative cap killed legitimately
+	// long-running continuous commands (watch / top / tail -f). We now stop a
+	// stream only when its sustained rate over a sliding window exceeds the flood
+	// threshold (runaway commands such as `yes` or `cat /dev/urandom` are stopped
+	// within seconds), with a high lifetime cap as a backstop for slow leaks.
+	// watch-paced output (~1-5 KB/s) never trips either limit, so it streams
+	// indefinitely up to the idle timeout.
+	agentTerminalOutputRateWindow = 5 * time.Second
+	agentTerminalOutputRateBytes  = 8 * 1024 * 1024
+	agentTerminalOutputCapBytes   = 256 * 1024 * 1024
 	agentTerminalIdleTimeout      = 30 * time.Minute
 
 	agentMaxAISessions       = 4

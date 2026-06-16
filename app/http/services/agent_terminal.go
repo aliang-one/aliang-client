@@ -11,10 +11,16 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"aliang.one/nursorgate/app/http/models"
-	"github.com/creack/pty"
 )
+
+// errPTYUnsupported is returned by startAgentPTY when the current platform cannot
+// allocate a real pseudo-terminal. The caller falls back to plain stdin/stdout
+// pipes so terminals still work, albeit without PTY semantics (no TUI, no
+// resize, no signal handling via the controlling terminal).
+var errPTYUnsupported = errors.New("pty not supported on this platform; falling back to pipes")
 
 type agentTerminalWriter func(interface{}) error
 
@@ -27,13 +33,29 @@ type agentTerminalSession struct {
 	id    string
 	shell string
 	cwd   string
-	cmd   *exec.Cmd
-	input io.WriteCloser
-	pty   *os.File
-	isPTY bool
 
-	outputBytes  int
+	input   io.WriteCloser
+	isPTY   bool
+	resizer func(rows, cols int) error
+	waiter  func() (int, error) // returns process exit code (and a non-exit error, if any)
+	killer  func() error
+	closer  func() error
+
+	meter        *terminalOutputMeter
+	token        *struct{}
 	lastActiveAt time.Time
+}
+
+// agentTerminalHandle is the platform-supplied wiring for a started shell. The
+// Unix backend fills it from creack/pty, the Windows backend from ConPTY, and
+// the shared pipe fallback fills it from os/exec pipes.
+type agentTerminalHandle struct {
+	input   io.WriteCloser
+	readers []io.Reader
+	resizer func(rows, cols int) error // nil when resize is unsupported (pipe fallback)
+	wait    func() (int, error)
+	kill    func() error
+	close   func() error
 }
 
 func newAgentTerminalManager() *agentTerminalManager {
@@ -97,7 +119,6 @@ func (m *agentTerminalManager) create(msg map[string]interface{}, writeJSON agen
 		_ = writeJSON(agentTerminalErrorPayload(sessionID, fmt.Errorf("terminal session limit reached: %d", agentMaxTerminalSessions)))
 		return
 	}
-	session.lastActiveAt = time.Now()
 	m.sessions[sessionID] = session
 	m.mu.Unlock()
 
@@ -114,8 +135,8 @@ func (m *agentTerminalManager) create(msg map[string]interface{}, writeJSON agen
 	for _, reader := range readers {
 		go m.copyTerminalOutput(sessionID, reader, writeJSON)
 	}
-	go m.waitTerminal(sessionID, session.cmd, writeJSON)
-	go m.watchTerminalIdle(sessionID, session.cmd, writeJSON)
+	go m.waitTerminal(sessionID, session.token, writeJSON)
+	go m.watchTerminalIdle(sessionID, session.token, writeJSON)
 }
 
 func (m *agentTerminalManager) write(msg map[string]interface{}, writeJSON agentTerminalWriter) {
@@ -162,8 +183,8 @@ func (m *agentTerminalManager) resize(msg map[string]interface{}, writeJSON agen
 
 	cols := normalizeTerminalDimension(remoteInt(msg, "cols", 80), 80)
 	rows := normalizeTerminalDimension(remoteInt(msg, "rows", 24), 24)
-	if session.isPTY && session.pty != nil {
-		if err := pty.Setsize(session.pty, &pty.Winsize{Rows: uint16(rows), Cols: uint16(cols)}); err != nil {
+	if session.resizer != nil {
+		if err := session.resizer(rows, cols); err != nil {
 			_ = writeJSON(agentTerminalErrorPayload(sessionID, err))
 			return
 		}
@@ -228,39 +249,47 @@ func (m *agentTerminalManager) touch(sessionID string) {
 	}
 }
 
-func (m *agentTerminalManager) reserveTerminalOutput(sessionID string, n int) bool {
+// acceptTerminalOutput records n bytes of output for the session, refreshing its
+// idle timer, and reports whether the stream has tripped the flood limiter (in
+// which case the caller should terminate the session). Continuous, human-paced
+// output such as `watch` never trips it; only runaway floods do.
+func (m *agentTerminalManager) acceptTerminalOutput(sessionID string, n int) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	session := m.sessions[sessionID]
 	if session == nil {
 		return false
 	}
-	if session.outputBytes+n > agentTerminalOutputLimitBytes {
+	session.lastActiveAt = time.Now()
+	if session.meter == nil {
 		return false
 	}
-	session.outputBytes += n
-	session.lastActiveAt = time.Now()
-	return true
+	return session.meter.add(n, time.Now())
 }
 
 func (m *agentTerminalManager) copyTerminalOutput(sessionID string, reader io.Reader, writeJSON agentTerminalWriter) {
+	enc := newTerminalOutputEncoder()
 	buf := make([]byte, 4096)
 	for {
 		n, err := reader.Read(buf)
 		if n > 0 {
-			if !m.reserveTerminalOutput(sessionID, n) {
-				_ = writeJSON(agentTerminalErrorPayload(sessionID, fmt.Errorf("terminal output exceeded %d bytes", agentTerminalOutputLimitBytes)))
+			if m.acceptTerminalOutput(sessionID, n) {
+				_ = writeJSON(agentTerminalErrorPayload(sessionID, fmt.Errorf(
+					"terminal output flood limit exceeded (max %d bytes per %s, lifetime cap %d bytes)",
+					agentTerminalOutputRateBytes, agentTerminalOutputRateWindow, agentTerminalOutputCapBytes)))
 				if session := m.get(sessionID); session != nil {
 					session.kill()
 				}
 				return
 			}
-			_ = writeJSON(map[string]interface{}{
-				"type":       models.AgentEventTerminalOutput,
-				"session_id": sessionID,
-				"encoding":   "text",
-				"data":       string(buf[:n]),
-			})
+			if chunk := enc.push(buf[:n]); len(chunk) > 0 {
+				_ = writeJSON(map[string]interface{}{
+					"type":       models.AgentEventTerminalOutput,
+					"session_id": sessionID,
+					"encoding":   "text",
+					"data":       string(chunk),
+				})
+			}
 		}
 		if err != nil {
 			return
@@ -268,13 +297,13 @@ func (m *agentTerminalManager) copyTerminalOutput(sessionID string, reader io.Re
 	}
 }
 
-func (m *agentTerminalManager) watchTerminalIdle(sessionID string, cmd *exec.Cmd, writeJSON agentTerminalWriter) {
+func (m *agentTerminalManager) watchTerminalIdle(sessionID string, token *struct{}, writeJSON agentTerminalWriter) {
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
 	for range ticker.C {
 		m.mu.Lock()
 		session := m.sessions[sessionID]
-		if session == nil || session.cmd != cmd {
+		if session == nil || session.token != token {
 			m.mu.Unlock()
 			return
 		}
@@ -289,12 +318,16 @@ func (m *agentTerminalManager) watchTerminalIdle(sessionID string, cmd *exec.Cmd
 	}
 }
 
-func (m *agentTerminalManager) waitTerminal(sessionID string, cmd *exec.Cmd, writeJSON agentTerminalWriter) {
-	err := cmd.Wait()
+func (m *agentTerminalManager) waitTerminal(sessionID string, token *struct{}, writeJSON agentTerminalWriter) {
+	session := m.get(sessionID)
+	if session == nil || session.waiter == nil {
+		return
+	}
+	exitCode, err := session.waiter()
 
 	m.mu.Lock()
-	session := m.sessions[sessionID]
-	active := session != nil && session.cmd == cmd
+	current := m.sessions[sessionID]
+	active := current != nil && current.token == token
 	if active {
 		delete(m.sessions, sessionID)
 	}
@@ -302,25 +335,15 @@ func (m *agentTerminalManager) waitTerminal(sessionID string, cmd *exec.Cmd, wri
 	if !active {
 		return
 	}
-	if session.pty != nil {
-		_ = session.pty.Close()
+	if session.closer != nil {
+		_ = session.closer()
 	}
 
 	if err == nil {
 		_ = writeJSON(map[string]interface{}{
 			"type":       models.AgentEventTerminalExit,
 			"session_id": sessionID,
-			"exit_code":  0,
-		})
-		return
-	}
-
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) {
-		_ = writeJSON(map[string]interface{}{
-			"type":       models.AgentEventTerminalExit,
-			"session_id": sessionID,
-			"exit_code":  exitErr.ExitCode(),
+			"exit_code":  exitCode,
 		})
 		return
 	}
@@ -332,61 +355,91 @@ func (s *agentTerminalSession) kill() {
 	if s == nil {
 		return
 	}
+	if s.killer != nil {
+		_ = s.killer()
+	}
 	if s.input != nil {
 		_ = s.input.Close()
 	}
-	if s.cmd != nil && s.cmd.Process != nil {
-		_ = s.cmd.Process.Kill()
+}
+
+// startAgentTerminalProcess starts a shell for a terminal session. It prefers a
+// real PTY (platform-specific startAgentPTY) and falls back to plain pipes when
+// the platform has no PTY support, so terminals work everywhere.
+func startAgentTerminalProcess(sessionID string, shell string, cwd string, rows int, cols int) (*agentTerminalSession, []io.Reader, error) {
+	if handle, err := startAgentPTY(shell, cwd, rows, cols); err == nil {
+		return newAgentTerminalSession(sessionID, shell, cwd, handle, true), handle.readers, nil
+	} else if !errors.Is(err, errPTYUnsupported) {
+		return nil, nil, err
+	}
+
+	handle, err := startAgentTerminalPipes(shell, cwd)
+	if err != nil {
+		return nil, nil, err
+	}
+	return newAgentTerminalSession(sessionID, shell, cwd, handle, false), handle.readers, nil
+}
+
+func newAgentTerminalSession(id string, shell string, cwd string, handle *agentTerminalHandle, isPTY bool) *agentTerminalSession {
+	return &agentTerminalSession{
+		id:           id,
+		shell:        shell,
+		cwd:          cwd,
+		input:        handle.input,
+		isPTY:        isPTY,
+		resizer:      handle.resizer,
+		waiter:       handle.wait,
+		killer:       handle.kill,
+		closer:       handle.close,
+		meter:        newTerminalOutputMeter(),
+		token:        new(struct{}),
+		lastActiveAt: time.Now(),
 	}
 }
 
-func startAgentTerminalProcess(sessionID string, shell string, cwd string, rows int, cols int) (*agentTerminalSession, []io.Reader, error) {
+// startAgentTerminalPipes is the shared, non-PTY fallback: it runs the shell
+// with piped stdin/stdout/stderr. Resize is unsupported (resizer stays nil).
+func startAgentTerminalPipes(shell string, cwd string) (*agentTerminalHandle, error) {
 	cmd := newAgentShellCommand(shell, cwd)
-	ptyFile, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: uint16(rows), Cols: uint16(cols)})
-	if err == nil {
-		return &agentTerminalSession{
-			id:           sessionID,
-			shell:        shell,
-			cwd:          cwd,
-			cmd:          cmd,
-			input:        ptyFile,
-			pty:          ptyFile,
-			isPTY:        true,
-			lastActiveAt: time.Now(),
-		}, []io.Reader{ptyFile}, nil
-	}
-	if !errors.Is(err, pty.ErrUnsupported) {
-		return nil, nil, err
-	}
-
-	cmd = newAgentShellCommand(shell, cwd)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		_ = stdin.Close()
-		return nil, nil, err
+		return nil, err
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		_ = stdin.Close()
-		return nil, nil, err
+		return nil, err
 	}
 	if err := cmd.Start(); err != nil {
 		_ = stdin.Close()
-		return nil, nil, err
+		return nil, err
 	}
-	return &agentTerminalSession{
-		id:           sessionID,
-		shell:        shell,
-		cwd:          cwd,
-		cmd:          cmd,
-		input:        stdin,
-		isPTY:        false,
-		lastActiveAt: time.Now(),
-	}, []io.Reader{stdout, stderr}, nil
+	return &agentTerminalHandle{
+		input:   stdin,
+		readers: []io.Reader{stdout, stderr},
+		wait: func() (int, error) {
+			if err := cmd.Wait(); err == nil {
+				return 0, nil
+			} else {
+				var exitErr *exec.ExitError
+				if errors.As(err, &exitErr) {
+					return exitErr.ExitCode(), nil
+				}
+				return -1, err
+			}
+		},
+		kill: func() error {
+			if cmd.Process != nil {
+				return cmd.Process.Kill()
+			}
+			return nil
+		},
+	}, nil
 }
 
 func newAgentShellCommand(shell string, cwd string) *exec.Cmd {
@@ -394,6 +447,120 @@ func newAgentShellCommand(shell string, cwd string) *exec.Cmd {
 	cmd.Dir = cwd
 	cmd.Env = agentTerminalEnv(shell)
 	return cmd
+}
+
+// terminalOutputMeter bounds terminal output volume with a sliding time window.
+// It stops runaway floods quickly (e.g. `yes`, `cat /dev/urandom`) while letting
+// continuous-but-slow commands such as `watch` stream indefinitely.
+type terminalOutputMeter struct {
+	window  time.Duration
+	rateMax int
+	capMax  int64
+
+	mu      sync.Mutex
+	samples []terminalOutputSample
+	total   int64
+}
+
+type terminalOutputSample struct {
+	at    time.Time
+	bytes int
+}
+
+func newTerminalOutputMeter() *terminalOutputMeter {
+	return &terminalOutputMeter{
+		window:  agentTerminalOutputRateWindow,
+		rateMax: agentTerminalOutputRateBytes,
+		capMax:  int64(agentTerminalOutputCapBytes),
+	}
+}
+
+// add records n bytes emitted at now and reports whether the session should be
+// killed because the sustained rate over the window or the lifetime cap was
+// exceeded.
+func (m *terminalOutputMeter) add(n int, now time.Time) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	cutoff := now.Add(-m.window)
+	drop := 0
+	for drop < len(m.samples) && m.samples[drop].at.Before(cutoff) {
+		drop++
+	}
+	if drop > 0 {
+		m.samples = m.samples[drop:]
+	}
+	m.samples = append(m.samples, terminalOutputSample{at: now, bytes: n})
+	m.total += int64(n)
+
+	if m.capMax > 0 && m.total > m.capMax {
+		return true
+	}
+	if m.rateMax > 0 {
+		recent := 0
+		for _, s := range m.samples {
+			recent += s.bytes
+		}
+		if recent > m.rateMax {
+			return true
+		}
+	}
+	return false
+}
+
+// terminalOutputEncoder buffers an incomplete trailing UTF-8 sequence so that
+// multi-byte runes split across PTY reads are not split across WebSocket frames
+// (json.Marshal would otherwise corrupt them into U+FFFD). Genuinely invalid
+// bytes are emitted as-is.
+type terminalOutputEncoder struct {
+	carry []byte
+}
+
+func newTerminalOutputEncoder() *terminalOutputEncoder {
+	return &terminalOutputEncoder{}
+}
+
+// push consumes incoming bytes and returns a chunk that ends on a complete UTF-8
+// rune boundary. Any incomplete trailing sequence is held until the next push.
+func (e *terminalOutputEncoder) push(in []byte) []byte {
+	var merged []byte
+	if len(e.carry) > 0 {
+		merged = make([]byte, 0, len(e.carry)+len(in))
+		merged = append(merged, e.carry...)
+		merged = append(merged, in...)
+		e.carry = nil
+	} else {
+		merged = in
+	}
+
+	safe := utf8SafePrefix(merged)
+	if safe < len(merged) {
+		tail := merged[safe:]
+		e.carry = make([]byte, len(tail))
+		copy(e.carry, tail)
+	}
+	if safe == 0 {
+		return nil
+	}
+	return merged[:safe]
+}
+
+// utf8SafePrefix returns the length of the longest prefix of b that does not end
+// inside an incomplete multi-byte UTF-8 sequence. Invalid bytes are kept (they
+// will become U+FFFD on marshal) and only a genuinely truncated tail is excluded.
+func utf8SafePrefix(b []byte) int {
+	i := 0
+	for i < len(b) {
+		if !utf8.FullRune(b[i:]) {
+			return i
+		}
+		if r, size := utf8.DecodeRune(b[i:]); r == utf8.RuneError {
+			i++ // invalid start byte: keep it, advance one
+		} else {
+			i += size
+		}
+	}
+	return i
 }
 
 func normalizeTerminalDimension(value int, fallback int) int {

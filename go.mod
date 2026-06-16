@@ -6,6 +6,7 @@ replace github.com/elazarl/goproxy v1.7.2 => ../goproxy
 
 require (
 	github.com/Microsoft/go-winio v0.6.2
+	github.com/UserExistsError/conpty v0.1.4
 	github.com/creack/pty v1.1.24
 	github.com/docker/go-units v0.5.0
 	github.com/gen2brain/beeep v0.11.2
