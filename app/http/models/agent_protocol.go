@@ -108,7 +108,16 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				Auth:           "Authorization: Bearer <device_token>",
 				RequestFields:  []string{"device_id", "status", "unique_code", "device_name", "platform", "agent_version", "capabilities", "tools", "history", "projects", "vibe_sessions", "authorized_directories", "started_at", "collected_at", "load"},
 				ResponseFields: []string{"status", "device", "settings", "project_count", "vibe_session_count"},
-				Notes:          "Sent immediately after device registration and on explicit sync so the cloud can list local projects and vibecoding sessions before websocket hello succeeds.",
+				Notes:          "Sent immediately after device registration and on explicit sync so the cloud can list local projects and vibecoding sessions before websocket hello succeeds. A 401 response means the device token is invalid; the local agent must clear the device token and close its websocket.",
+			},
+			{
+				Name:           "disable_local_agent",
+				Method:         "POST",
+				Path:           "/api/agent/disable",
+				Auth:           "local dashboard or local auth hook",
+				RequestFields:  []string{"reason?"},
+				ResponseFields: []string{"status", "enabled", "registered", "remote_connected", "sync_status", "sync_message"},
+				Notes:          "Local-only control endpoint. Supported reasons include manual, logout, auth_expired, device_token_invalid, and device_unbound; disabling actively closes the remote websocket and local terminal/AI sessions.",
 			},
 		},
 		WebSocket: AgentProtocolWebSocket{

@@ -817,6 +817,156 @@ func TestAgentServiceRegisterDoesNotTreatUserAccessTokenAsDeviceToken(t *testing
 	}
 }
 
+func TestAgentServiceDisableWithReasonClearsRemoteState(t *testing.T) {
+	t.Setenv("ALIANG_DATA_DIR", t.TempDir())
+	cache.ResetCacheDirForTest()
+	config.ResetGlobalConfigForTest()
+	t.Cleanup(config.ResetGlobalConfigForTest)
+
+	service := NewAgentService()
+	service.mu.Lock()
+	service.ensureDeviceIdentityLocked()
+	deviceID := service.state.DeviceID
+	service.state.Enabled = true
+	service.state.Registered = true
+	service.state.RemoteConnected = true
+	service.state.DeviceToken = "dt_test"
+	service.state.Device = &models.AgentDevice{
+		ID:                    deviceID,
+		DeviceID:              deviceID,
+		UniqueCode:            service.state.UniqueCode,
+		Name:                  "disable-reason-device",
+		Platform:              agentPlatform(),
+		Status:                "online",
+		RemoteTerminalEnabled: true,
+		AIControlEnabled:      true,
+		BoundAt:               time.Now().UTC().Format(time.RFC3339),
+	}
+	service.mu.Unlock()
+
+	status := service.DisableWithReason("auth_expired")
+	if status.Enabled || status.Registered || status.Bound || status.Device != nil || status.RemoteConnected {
+		t.Fatalf("DisableWithReason() status = %#v, want fully disconnected", status)
+	}
+	if status.SyncStatus != "auth_expired" {
+		t.Fatalf("SyncStatus = %q, want auth_expired", status.SyncStatus)
+	}
+	if !strings.Contains(status.SyncMessage, "session expired") {
+		t.Fatalf("SyncMessage = %q, want session expired", status.SyncMessage)
+	}
+}
+
+func TestAgentServiceRejectsRemoteCommandsAfterDisable(t *testing.T) {
+	t.Setenv("ALIANG_DATA_DIR", t.TempDir())
+	cache.ResetCacheDirForTest()
+	config.ResetGlobalConfigForTest()
+	t.Cleanup(config.ResetGlobalConfigForTest)
+
+	service := NewAgentService()
+	service.mu.Lock()
+	service.ensureDeviceIdentityLocked()
+	deviceID := service.state.DeviceID
+	service.state.Enabled = true
+	service.state.Registered = true
+	service.state.DeviceToken = "dt_test"
+	service.state.Device = &models.AgentDevice{
+		ID:                    deviceID,
+		DeviceID:              deviceID,
+		UniqueCode:            service.state.UniqueCode,
+		Name:                  "old-ws-device",
+		Platform:              agentPlatform(),
+		Status:                "online",
+		RemoteTerminalEnabled: true,
+		AIControlEnabled:      true,
+		BoundAt:               time.Now().UTC().Format(time.RFC3339),
+	}
+	service.mu.Unlock()
+	service.DisableWithReason("auth_expired")
+
+	var mu sync.Mutex
+	events := make([]map[string]interface{}, 0)
+	writeJSON := func(payload interface{}) error {
+		event, ok := payload.(map[string]interface{})
+		if !ok {
+			t.Fatalf("payload type = %T, want map[string]interface{}", payload)
+		}
+		mu.Lock()
+		events = append(events, event)
+		mu.Unlock()
+		return nil
+	}
+
+	service.handleRemoteAgentMessage(map[string]interface{}{
+		"type":       "terminal.create",
+		"session_id": "term_after_disable",
+		"cwd":        os.TempDir(),
+	}, writeJSON)
+	waitForAgentEvent(t, &mu, &events, "agent.error", func(event map[string]interface{}) bool {
+		return strings.Contains(remoteString(event, "error"), "disabled")
+	})
+}
+
+func TestAgentServiceDeviceTokenUnauthorizedDisablesAgent(t *testing.T) {
+	t.Setenv("ALIANG_DATA_DIR", t.TempDir())
+	cache.ResetCacheDirForTest()
+	auth.ResetAuthPersistenceForTest()
+	config.ResetGlobalConfigForTest()
+	t.Cleanup(func() {
+		auth.ResetAuthPersistenceForTest()
+		config.ResetGlobalConfigForTest()
+	})
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/api/agent/status" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"code":    http.StatusUnauthorized,
+				"message": "device token invalid",
+				"reason":  "DEVICE_TOKEN_INVALID",
+			})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+	config.SetGlobalConfig(&config.Config{Core: &config.CoreConfig{AgentServer: server.URL}})
+
+	service := NewAgentService()
+	service.mu.Lock()
+	service.ensureDeviceIdentityLocked()
+	deviceID := service.state.DeviceID
+	service.state.Enabled = true
+	service.state.Registered = true
+	service.state.DeviceToken = "dt_invalid"
+	service.state.Device = &models.AgentDevice{
+		ID:                    deviceID,
+		DeviceID:              deviceID,
+		UniqueCode:            service.state.UniqueCode,
+		Name:                  "invalid-token-device",
+		Platform:              agentPlatform(),
+		Status:                "online",
+		RemoteTerminalEnabled: true,
+		AIControlEnabled:      true,
+		BoundAt:               time.Now().UTC().Format(time.RFC3339),
+	}
+	err := service.syncAgentInventoryLocked("test_device_token_invalid")
+	service.mu.Unlock()
+	if err == nil || !strings.Contains(err.Error(), "401") {
+		t.Fatalf("syncAgentInventoryLocked() error = %v, want 401", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		status := service.Status()
+		if !status.Enabled && !status.Bound && status.SyncStatus == "device_token_invalid" {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("status after device token rejection = %#v, want disabled and unbound", service.Status())
+}
+
 func TestRequestUserAgentSyncAfterAuthRequestsLocalUserAgentWithUserAuthorization(t *testing.T) {
 	t.Setenv("ALIANG_DATA_DIR", t.TempDir())
 	cache.ResetCacheDirForTest()
@@ -2168,8 +2318,8 @@ func TestAgentProtocolContractDefinesRemoteFlow(t *testing.T) {
 	if contract.Version == "" {
 		t.Fatal("protocol version is empty")
 	}
-	if len(contract.HTTP) != 2 || contract.HTTP[0].Path != models.AgentHTTPRegisterEndpoint || contract.HTTP[1].Path != models.AgentHTTPStatusSyncEndpoint {
-		t.Fatalf("HTTP contract = %#v, want register and status sync endpoints", contract.HTTP)
+	if len(contract.HTTP) != 3 || contract.HTTP[0].Path != models.AgentHTTPRegisterEndpoint || contract.HTTP[1].Path != models.AgentHTTPStatusSyncEndpoint || contract.HTTP[2].Path != "/api/agent/disable" {
+		t.Fatalf("HTTP contract = %#v, want register, status sync, and local disable endpoints", contract.HTTP)
 	}
 	if got := strings.Join(contract.HTTP[0].RequestFields, ","); got != "device_id,unique_code" {
 		t.Fatalf("register request fields = %q, want device_id,unique_code", got)
@@ -2179,6 +2329,9 @@ func TestAgentProtocolContractDefinesRemoteFlow(t *testing.T) {
 	}
 	if !strings.Contains(contract.HTTP[1].Auth, "device_token") {
 		t.Fatalf("status sync auth = %q, want device token auth", contract.HTTP[1].Auth)
+	}
+	if !stringSliceContains(contract.HTTP[2].RequestFields, "reason?") {
+		t.Fatalf("disable request fields = %#v, want optional reason", contract.HTTP[2].RequestFields)
 	}
 	if !stringSliceContains(contract.HTTP[1].RequestFields, "projects") || !stringSliceContains(contract.HTTP[1].RequestFields, "vibe_sessions") {
 		t.Fatalf("status sync fields = %#v, want projects and vibe_sessions", contract.HTTP[1].RequestFields)

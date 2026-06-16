@@ -68,8 +68,17 @@ func (cp *ConnectionPool) Put(key string, conn *PooledConn) error {
 	cp.mu.Lock()
 	defer cp.mu.Unlock()
 
-	// Check if we should store this connection
-	// For now, store it if there's space or replace
+	// If a connection already exists under this key, close it before replacing.
+	// Otherwise the previous *PooledConn (and its underlying TLS connection, file
+	// descriptor and read/write buffers) is silently overwritten and never
+	// closed, leaking until the process exits.
+	if existing, ok := cp.conns[key]; ok && existing != nil && existing != conn {
+		if existing.Conn != nil {
+			_ = existing.Conn.Close()
+		}
+		cp.updateStats(true)
+	}
+
 	conn.LastUsed = time.Now()
 	cp.conns[key] = conn
 

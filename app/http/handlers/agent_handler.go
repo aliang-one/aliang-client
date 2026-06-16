@@ -130,7 +130,15 @@ func (h *AgentHandler) HandleDisable(w http.ResponseWriter, r *http.Request) {
 	if h.proxyIfNeeded(w, r) {
 		return
 	}
-	common.Success(w, h.service.Disable())
+	reason := strings.TrimSpace(r.URL.Query().Get("reason"))
+	if r.Body != nil {
+		defer r.Body.Close()
+		var req models.AgentDisableRequest
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err == nil && strings.TrimSpace(req.Reason) != "" {
+			reason = req.Reason
+		}
+	}
+	common.Success(w, h.service.DisableWithReason(reason))
 }
 
 func (h *AgentHandler) HandleSync(w http.ResponseWriter, r *http.Request) {

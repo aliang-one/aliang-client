@@ -35,8 +35,11 @@ export async function enableAgent() {
   return request('/api/agent/enable', { method: 'POST' });
 }
 
-export async function disableAgent() {
-  return request('/api/agent/disable', { method: 'POST' });
+export async function disableAgent(reason = 'manual') {
+  return request('/api/agent/disable', {
+    method: 'POST',
+    body: JSON.stringify({ reason }),
+  });
 }
 
 export async function launchAgentTool(payload) {

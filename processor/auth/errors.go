@@ -85,6 +85,14 @@ func clearLocalSessionAfterExpiredAccessToken() {
 	clearLocalSessionAfterExpiration("expired access token")
 }
 
+func ExpireLocalSession(reason string) {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "expired access token"
+	}
+	clearLocalSessionAfterExpiration(reason)
+}
+
 func clearLocalSessionAfterExpiration(reason string) {
 	StopTokenRefresh()
 

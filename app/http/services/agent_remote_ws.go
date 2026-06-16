@@ -54,6 +54,9 @@ func (s *AgentService) remoteConnectionLoop() {
 	for {
 		token, shouldRun := s.remoteConnectionSnapshot()
 		if !shouldRun {
+			if s.shouldPreserveDisabledStatus() {
+				return
+			}
 			logger.Info("[AGENT-BOOT] remote_connection loop_stop reason=disabled_or_missing_token")
 			s.setRemoteConnectionState(false, "offline", "")
 			return
@@ -76,27 +79,67 @@ func (s *AgentService) remoteConnectionLoop() {
 			continue
 		}
 
-		s.wsMu.Lock()
-		s.wsConnected = true
-		s.wsMu.Unlock()
+		s.setActiveRemoteConnection(conn)
 		s.setRemoteConnectionState(true, "online", "")
 		logger.Info(fmt.Sprintf("[AGENT-BOOT] remote_connection connected endpoint=%s", sanitizeAgentEndpoint(wsURL)))
 
 		if err := s.runRemoteAgentSession(conn); err != nil {
 			logger.Warn(fmt.Sprintf("[AGENT-BOOT] remote_connection session_ended status=error error=%v", err))
-			s.setRemoteConnectionState(false, "disconnected", err.Error())
+			if _, shouldRun := s.remoteConnectionSnapshot(); shouldRun {
+				s.setRemoteConnectionState(false, "disconnected", err.Error())
+			}
 		} else {
 			logger.Info("[AGENT-BOOT] remote_connection session_ended status=clean")
-			s.setRemoteConnectionState(false, "offline", "")
+			if _, shouldRun := s.remoteConnectionSnapshot(); shouldRun {
+				s.setRemoteConnectionState(false, "offline", "")
+			}
 		}
 
-		s.wsMu.Lock()
-		if s.wsConnected {
-			s.wsConnected = false
-		}
-		s.wsMu.Unlock()
+		s.clearActiveRemoteConnection(conn)
 		_ = conn.Close()
 		time.Sleep(2 * time.Second)
+	}
+}
+
+func (s *AgentService) setActiveRemoteConnection(conn *websocket.Conn) {
+	s.wsMu.Lock()
+	defer s.wsMu.Unlock()
+	s.wsConn = conn
+	s.wsConnected = true
+}
+
+func (s *AgentService) clearActiveRemoteConnection(conn *websocket.Conn) {
+	s.wsMu.Lock()
+	defer s.wsMu.Unlock()
+	if s.wsConn == conn {
+		s.wsConn = nil
+	}
+	s.wsConnected = false
+}
+
+func (s *AgentService) forceDisconnectRemote(reason string) {
+	s.wsMu.Lock()
+	conn := s.wsConn
+	s.wsConn = nil
+	s.wsConnected = false
+	s.wsMu.Unlock()
+
+	if conn != nil {
+		logger.Info(fmt.Sprintf("[AGENT-BOOT] remote_connection force_close reason=%s", normalizeAgentDisableReason(reason)))
+		_ = conn.Close()
+	}
+	s.terminal.closeAll()
+	s.ai.closeAll()
+}
+
+func (s *AgentService) shouldPreserveDisabledStatus() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	switch normalizeAgentDisableReason(s.state.LastSyncStatus) {
+	case "disabled", "logout", "auth_expired", "device_token_invalid", "device_unbound":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -182,6 +225,14 @@ func (s *AgentService) sendAgentHello(writeJSON func(interface{}) error, reason 
 
 func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writeJSON func(interface{}) error) {
 	msgType := strings.TrimSpace(fmt.Sprint(msg["type"]))
+	if remoteAgentMessageRequiresEnabledDevice(msgType) && !s.remoteControlAllowed() {
+		_ = writeJSON(map[string]interface{}{
+			"type":  models.AgentEventError,
+			"error": "agent mode is disabled or disconnected",
+		})
+		s.forceDisconnectRemote("disabled")
+		return
+	}
 	switch msgType {
 	case models.AgentEventRegistered:
 		deviceID := strings.TrimSpace(fmt.Sprint(msg["device_id"]))
@@ -201,16 +252,7 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 		s.setRemoteConnectionState(true, "online", "")
 	case models.AgentEventDeviceUnbound:
 		logger.Warn("[AGENT-BOOT] remote_connection device_unbound")
-		s.mu.Lock()
-		s.state.Enabled = false
-		s.state.Registered = false
-		s.state.RemoteConnected = false
-		s.state.Device = nil
-		s.state.DeviceToken = ""
-		s.state.LastSyncStatus = "unbound"
-		s.state.LastSyncMessage = "Device was unbound by the agent server."
-		_ = s.saveStateLocked()
-		s.mu.Unlock()
+		s.DisableWithReason("device_unbound")
 	case models.AgentEventDeviceSettings:
 		logger.Info("[AGENT-BOOT] remote_connection settings_updated")
 		s.applyRemoteDeviceSettings(msg)
@@ -273,6 +315,33 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 			"error": fmt.Sprintf("unsupported remote agent event type: %s", msgType),
 		})
 	}
+}
+
+func remoteAgentMessageRequiresEnabledDevice(msgType string) bool {
+	switch msgType {
+	case models.AgentEventProjectDetail,
+		models.AgentEventAISessionDetail,
+		models.AgentEventFileList,
+		models.AgentEventFileRead,
+		models.AgentEventTerminalCreate,
+		models.AgentEventTerminalInput,
+		models.AgentEventTerminalResize,
+		models.AgentEventTerminalClose,
+		models.AgentEventAISessionCreate,
+		models.AgentEventAIMessage,
+		models.AgentEventAIApprovalResponse,
+		models.AgentEventAIStop,
+		models.AgentEventAISessionClose:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *AgentService) remoteControlAllowed() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.state.Enabled && strings.TrimSpace(s.state.DeviceToken) != ""
 }
 
 // DispatchLocalAI routes a single in-process AI protocol event to the agent AI
@@ -368,6 +437,9 @@ func (s *AgentService) agentHelloPayload() map[string]interface{} {
 func (s *AgentService) remoteTerminalEnabled() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !s.state.Enabled || strings.TrimSpace(s.state.DeviceToken) == "" {
+		return false
+	}
 	if s.state.Device == nil {
 		return true
 	}
@@ -377,6 +449,9 @@ func (s *AgentService) remoteTerminalEnabled() bool {
 func (s *AgentService) aiControlEnabled() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !s.state.Enabled || strings.TrimSpace(s.state.DeviceToken) == "" {
+		return false
+	}
 	if s.state.Device == nil {
 		return true
 	}

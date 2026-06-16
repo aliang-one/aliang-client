@@ -12,6 +12,12 @@ import (
 const (
 	DefaultAIActivityTTL              = 15 * time.Second
 	DefaultAIActivityVisibilityWindow = 10 * time.Minute
+	// DefaultAIActivityConnectionSweepAge is the backstop age at which a tracked
+	// AI connection entry is reclaimed even if CompleteMetadata was never called
+	// (e.g. the relay panicked or an early-return skipped it). It is deliberately
+	// much larger than a single AI run (agentAIRunTimeout) and the visibility
+	// window, so it can never reap a connection that is still actively streaming.
+	DefaultAIActivityConnectionSweepAge = time.Hour
 )
 
 var (
@@ -23,6 +29,7 @@ type AIActivityTracker struct {
 	mu               sync.RWMutex
 	ttl              time.Duration
 	visibilityWindow time.Duration
+	connectionSweepAge time.Duration
 	detections       map[string]*AIActivityDetection
 	connections      map[string]*trackedAIConnection
 	totalHits        int64
@@ -94,10 +101,11 @@ func NewAIActivityTracker(ttl time.Duration) *AIActivityTracker {
 	}
 
 	return &AIActivityTracker{
-		ttl:              ttl,
-		visibilityWindow: maxDuration(DefaultAIActivityVisibilityWindow, ttl),
-		detections:       make(map[string]*AIActivityDetection),
-		connections:      make(map[string]*trackedAIConnection),
+		ttl:                ttl,
+		visibilityWindow:   maxDuration(DefaultAIActivityVisibilityWindow, ttl),
+		connectionSweepAge: maxDuration(DefaultAIActivityConnectionSweepAge, ttl),
+		detections:         make(map[string]*AIActivityDetection),
+		connections:        make(map[string]*trackedAIConnection),
 	}
 }
 
@@ -352,6 +360,25 @@ func (t *AIActivityTracker) Reset() {
 }
 
 func (t *AIActivityTracker) pruneExpiredLocked(now time.Time) {
+	// connections are normally removed in CompleteMetadata. As a backstop for
+	// connections whose close callback was missed (relay panic, early return),
+	// reclaim entries older than connectionSweepAge and decrement their
+	// detection's active count. This runs on every record/complete/summary, so a
+	// missed close can never pin the map forever. CompleteMetadata looks the
+	// entry up by connID first, so a backstop reap followed by a later
+	// CompleteMetadata is a safe no-op (not found -> return).
+	if t.connectionSweepAge > 0 {
+		connCutoff := now.Add(-t.connectionSweepAge)
+		for connID, conn := range t.connections {
+			if conn.StartedAt.Before(connCutoff) {
+				if detection := t.detections[conn.ProviderKey]; detection != nil && detection.ActiveConnectionCount > 0 {
+					detection.ActiveConnectionCount--
+				}
+				delete(t.connections, connID)
+			}
+		}
+	}
+
 	cutoff := now.Add(-t.visibilityWindow)
 	for key, detection := range t.detections {
 		if detection.ActiveConnectionCount <= 0 && detection.LastSeenAt.Before(cutoff) {

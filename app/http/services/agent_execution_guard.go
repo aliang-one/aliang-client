@@ -41,6 +41,13 @@ const (
 	agentAIOutputRateBytes  = 16 * 1024 * 1024
 	agentAIOutputCapBytes   = 256 * 1024 * 1024
 	agentAIRunTimeout       = 30 * time.Minute
+
+	// agentAIHistoryCaptureMaxBytes bounds the assistant output retained for
+	// session history/replay. Client streaming is governed separately by the
+	// output limiter (agentAIOutputCapBytes, which stops the run); this cap only
+	// limits the in-memory buffer kept after a run, so a long/bursty run cannot
+	// pin hundreds of MB in session history.
+	agentAIHistoryCaptureMaxBytes = 1 << 20 // 1 MiB
 )
 
 var (
@@ -251,4 +258,23 @@ func sortedAgentStrings(values []string) []string {
 	out := append([]string(nil), values...)
 	sort.Strings(out)
 	return out
+}
+
+// appendAgentAIHistoryCapture appends text to b for session-history replay, but
+// stops accumulating once b reaches agentAIHistoryCaptureMaxBytes so a long or
+// bursty run cannot pin unbounded memory in the session history. Streaming to
+// the client is unaffected (it happens before this capture and is governed by
+// the output limiter). The caller must hold b's protecting mutex.
+func appendAgentAIHistoryCapture(b *strings.Builder, text string) {
+	if b == nil {
+		return
+	}
+	if b.Len() >= agentAIHistoryCaptureMaxBytes {
+		return
+	}
+	remaining := agentAIHistoryCaptureMaxBytes - b.Len()
+	if len(text) > remaining {
+		text = text[:remaining]
+	}
+	b.WriteString(text)
 }

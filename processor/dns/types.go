@@ -73,6 +73,7 @@ type DNSConfig struct {
 	ConcurrentLimit  int             `json:"concurrent_limit"`   // 并发解析限制
 	RetryCount       int             `json:"retry_count"`        // 重试次数
 	RetryDelay       time.Duration   `json:"retry_delay"`        // 重试延迟
+	MaxCacheEntries  int             `json:"max_cache_entries"`  // 缓存最大条目数（0=用默认值）
 }
 
 // DefaultDNSConfig 返回默认DNS配置
@@ -89,6 +90,7 @@ func DefaultDNSConfig() *DNSConfig {
 		ConcurrentLimit:  10,
 		RetryCount:       2,
 		RetryDelay:       500 * time.Millisecond,
+		MaxCacheEntries:  defaultDNSCacheMaxEntries,
 	}
 }
 

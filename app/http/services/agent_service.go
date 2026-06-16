@@ -26,6 +26,7 @@ import (
 	"aliang.one/nursorgate/processor/config"
 	"github.com/google/shlex"
 	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
 )
 
 const (
@@ -77,6 +78,15 @@ type AgentService struct {
 	wsMu         sync.Mutex
 	wsConnected  bool
 	wsConnecting bool
+	wsConn       *websocket.Conn
+}
+
+type agentDeviceTokenRejectedError struct {
+	message string
+}
+
+func (e agentDeviceTokenRejectedError) Error() string {
+	return e.message
 }
 
 func GetSharedAgentService() *AgentService {
@@ -127,6 +137,7 @@ func UserAgentOfflineStatus(err error) models.AgentStatusResponse {
 		Enabled:         false,
 		Bound:           false,
 		Registered:      false,
+		RemoteConnected: false,
 		BindingRequired: false,
 		Platform:        runtime.GOOS,
 		ProtocolVersion: models.AgentProtocolVersion,
@@ -168,6 +179,7 @@ func (s *AgentService) Status() models.AgentStatusResponse {
 		Enabled:         s.isEnabledLocked(),
 		Bound:           s.isBoundLocked(),
 		Registered:      s.isRegisteredLocked(),
+		RemoteConnected: s.state.RemoteConnected,
 		BindingRequired: false,
 		Platform:        runtime.GOOS,
 		ProtocolVersion: models.AgentProtocolVersion,
@@ -233,8 +245,12 @@ func (s *AgentService) enableWithUserContext(authHeader string, userKey string) 
 }
 
 func (s *AgentService) Disable() models.AgentStatusResponse {
+	return s.DisableWithReason("manual")
+}
+
+func (s *AgentService) DisableWithReason(reason string) models.AgentStatusResponse {
+	reason = normalizeAgentDisableReason(reason)
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.ensureDeviceIdentityLocked()
 	s.state.Enabled = false
 	s.state.Device = nil
@@ -242,8 +258,48 @@ func (s *AgentService) Disable() models.AgentStatusResponse {
 	s.state.RegisteredUser = ""
 	s.state.Registered = false
 	s.state.RemoteConnected = false
+	s.state.LastSyncAt = time.Now().UTC().Format(time.RFC3339)
+	s.state.LastSyncStatus = reason
+	s.state.LastSyncMessage = agentDisableMessage(reason)
 	_ = s.saveStateLocked()
-	return s.statusLocked()
+	status := s.statusLocked()
+	s.mu.Unlock()
+
+	s.forceDisconnectRemote(reason)
+	return status
+}
+
+func normalizeAgentDisableReason(reason string) string {
+	reason = strings.TrimSpace(strings.ToLower(reason))
+	switch reason {
+	case "", "manual":
+		return "disabled"
+	case "logout":
+		return "logout"
+	case "auth_expired":
+		return "auth_expired"
+	case "device_token_invalid":
+		return "device_token_invalid"
+	case "device_unbound":
+		return "device_unbound"
+	default:
+		return reason
+	}
+}
+
+func agentDisableMessage(reason string) string {
+	switch normalizeAgentDisableReason(reason) {
+	case "logout":
+		return "Agent mode was disabled after logout."
+	case "auth_expired":
+		return "Agent mode was disabled because the session expired."
+	case "device_token_invalid":
+		return "Agent mode was disabled because the device token was rejected."
+	case "device_unbound":
+		return "Agent mode was disabled because the device was unbound."
+	default:
+		return "Agent mode is disabled."
+	}
 }
 
 func (s *AgentService) SyncNow() error {
@@ -266,9 +322,12 @@ func (s *AgentService) SyncNowWithUserContext(authHeader string, userKey string)
 		IsUserAgentRuntime(),
 	))
 	if err := s.registerAndSyncLockedWithUserContext(authHeader, userKey); err != nil {
-		s.state.LastSyncStatus = "server_unavailable"
-		s.state.LastSyncMessage = err.Error()
-		_ = s.saveStateLocked()
+		var deviceTokenErr agentDeviceTokenRejectedError
+		if !errors.As(err, &deviceTokenErr) {
+			s.state.LastSyncStatus = "server_unavailable"
+			s.state.LastSyncMessage = err.Error()
+			_ = s.saveStateLocked()
+		}
 		s.mu.Unlock()
 		logger.Warn(fmt.Sprintf("[AGENT-BOOT] sync_now failed error=%v", err))
 		return err
@@ -430,6 +489,7 @@ func (s *AgentService) statusLocked() models.AgentStatusResponse {
 		Enabled:         s.isEnabledLocked(),
 		Bound:           s.isBoundLocked(),
 		Registered:      s.isRegisteredLocked(),
+		RemoteConnected: s.state.RemoteConnected,
 		BindingRequired: false,
 		Platform:        runtime.GOOS,
 		ProtocolVersion: models.AgentProtocolVersion,
@@ -958,10 +1018,23 @@ func (s *AgentService) callAgentServerWithAuthorization(method string, endpoint 
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		logger.Warn(fmt.Sprintf("[AGENT-BOOT] agent_server_call non_2xx method=%s endpoint=%s status=%d", method, sanitizeAgentEndpoint(endpoint), resp.StatusCode))
+		if resp.StatusCode == http.StatusUnauthorized {
+			if hasDeviceToken {
+				s.handleAgentDeviceTokenRejected(string(raw))
+				return nil, agentDeviceTokenRejectedError{message: fmt.Sprintf("agent server returned %d: %s", resp.StatusCode, string(raw))}
+			} else if authHeader != "" {
+				auth.ExpireLocalSession("agent server rejected user authorization")
+			}
+		}
 		return nil, fmt.Errorf("agent server returned %d: %s", resp.StatusCode, string(raw))
 	}
 	logger.Info(fmt.Sprintf("[AGENT-BOOT] agent_server_call success method=%s endpoint=%s status=%d", method, sanitizeAgentEndpoint(endpoint), resp.StatusCode))
 	return unwrapAgentServerData(raw)
+}
+
+func (s *AgentService) handleAgentDeviceTokenRejected(body string) {
+	logger.Warn(fmt.Sprintf("[AGENT-BOOT] device_token rejected by agent server body=%s", strings.TrimSpace(body)))
+	go s.DisableWithReason("device_token_invalid")
 }
 
 func (s *AgentService) syncAgentInventoryLocked(reason string) error {

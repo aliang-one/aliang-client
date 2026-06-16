@@ -413,6 +413,19 @@ func (r *BaseResolver) startCacheCleanup() {
 	}
 }
 
+// defaultDNSCacheMaxEntries 是 DNS 缓存的默认容量上限。代理会见到海量不同
+// 域名，仅靠 TTL 在高 cardinality 场景下仍可能让缓存增长过大，因此叠加一个
+// 容量兜底：超过上限时按过期时间最早优先驱逐。
+const defaultDNSCacheMaxEntries = 10000
+
+// maxCacheEntries 返回生效的缓存容量上限，0/未配置时回退默认值。
+func (r *BaseResolver) maxCacheEntries() int {
+	if r.config != nil && r.config.MaxCacheEntries > 0 {
+		return r.config.MaxCacheEntries
+	}
+	return defaultDNSCacheMaxEntries
+}
+
 // cleanExpiredCache 清理过期缓存
 func (r *BaseResolver) cleanExpiredCache() {
 	r.cacheMu.Lock()
@@ -422,6 +435,25 @@ func (r *BaseResolver) cleanExpiredCache() {
 	for key, entry := range r.cache {
 		if now.After(entry.expiresAt) {
 			delete(r.cache, key)
+		}
+	}
+
+	// 容量兜底：删除过期项后若仍超上限，按过期时间最早优先驱逐，避免海量
+	// 不同域名在高 cardinality 下让缓存无界增长。每分钟一次，O(n) 可接受。
+	if max := r.maxCacheEntries(); max > 0 {
+		for len(r.cache) > max {
+			var oldestKey string
+			var oldestExpiry time.Time
+			for k, e := range r.cache {
+				if oldestKey == "" || e.expiresAt.Before(oldestExpiry) {
+					oldestKey = k
+					oldestExpiry = e.expiresAt
+				}
+			}
+			if oldestKey == "" {
+				break
+			}
+			delete(r.cache, oldestKey)
 		}
 	}
 }

@@ -5,6 +5,7 @@ type AgentStatusResponse struct {
 	Enabled         bool               `json:"enabled"`
 	Bound           bool               `json:"bound"`
 	Registered      bool               `json:"registered"`
+	RemoteConnected bool               `json:"remote_connected"`
 	BindingRequired bool               `json:"binding_required"`
 	Platform        string             `json:"platform"`
 	ProtocolVersion string             `json:"protocol_version,omitempty"`
@@ -18,6 +19,10 @@ type AgentStatusResponse struct {
 	SyncStatus      string             `json:"sync_status,omitempty"`
 	SyncMessage     string             `json:"sync_message,omitempty"`
 	Message         string             `json:"message,omitempty"`
+}
+
+type AgentDisableRequest struct {
+	Reason string `json:"reason,omitempty"`
 }
 
 type AgentRuntime struct {

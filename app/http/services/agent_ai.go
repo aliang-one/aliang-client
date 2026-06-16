@@ -883,7 +883,7 @@ func (m *agentAIManager) runCodexAppServer(ctx context.Context, run agentAIRun, 
 	var output strings.Builder
 	capture := func(text string) {
 		outMu.Lock()
-		output.WriteString(text)
+		appendAgentAIHistoryCapture(&output, text)
 		outMu.Unlock()
 	}
 	threadID := ""
@@ -1224,7 +1224,7 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 		defer wg.Done()
 		streamAgentAIStdout(stdout, tool.outputFormat, run, writeJSON, limiter, func(text string) {
 			outMu.Lock()
-			output.WriteString(text)
+			appendAgentAIHistoryCapture(&output, text)
 			outMu.Unlock()
 		})
 	}()
