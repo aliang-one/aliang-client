@@ -174,6 +174,16 @@ export default {
   chat_statusDone: 'Done',
   chat_aiThinking: 'Thinking…',
   chat_aiError: 'AI response failed, please retry.',
+  chat_approvalTitle: 'Approval required',
+  chat_approvalTool: 'Tool',
+  chat_approvalCwd: 'Directory',
+  chat_approvalPending: 'Waiting',
+  chat_approvalResponding: 'Sending',
+  chat_approvalAccept: 'Approve',
+  chat_approvalAcceptSession: 'Approve session',
+  chat_approvalDecline: 'Decline',
+  chat_approvalCancel: 'Cancel',
+  chat_approvalSendFailed: 'Failed to send approval response. Please retry.',
 
   // -- App --
   app_restoringSession: 'Restoring saved session...',

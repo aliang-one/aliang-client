@@ -10,7 +10,7 @@ func TestTerminalOutputMeter_WatchPacedStreamNeverTrips(t *testing.T) {
 	// A continuous, human-paced command such as `watch` emits a few KB every
 	// couple of seconds. It must stream indefinitely (within the idle timeout)
 	// without tripping the flood limiter.
-	meter := newTerminalOutputMeter()
+	meter := newOutputMeter(agentTerminalOutputRateWindow, agentTerminalOutputRateBytes, int64(agentTerminalOutputCapBytes))
 	base := time.Date(2026, 6, 16, 12, 0, 0, 0, time.UTC)
 	for i := 0; i < 600; i++ { // ~20 minutes of `watch -n 2` at 4 KB/refresh
 		now := base.Add(time.Duration(i*2) * time.Second)
@@ -23,7 +23,7 @@ func TestTerminalOutputMeter_WatchPacedStreamNeverTrips(t *testing.T) {
 func TestTerminalOutputMeter_BurstFloodTripsWithinWindow(t *testing.T) {
 	// A runaway command dumping ~1 MB chunks back-to-back must be stopped once
 	// the sustained rate exceeds the per-window threshold.
-	meter := newTerminalOutputMeter()
+	meter := newOutputMeter(agentTerminalOutputRateWindow, agentTerminalOutputRateBytes, int64(agentTerminalOutputCapBytes))
 	now := time.Date(2026, 6, 16, 12, 0, 0, 0, time.UTC)
 	for i := 0; i < 8; i++ { // 8 MiB exactly == limit, not yet over
 		if meter.add(1<<20, now) {
@@ -36,7 +36,7 @@ func TestTerminalOutputMeter_BurstFloodTripsWithinWindow(t *testing.T) {
 }
 
 func TestTerminalOutputMeter_RateWindowSlides(t *testing.T) {
-	meter := newTerminalOutputMeter()
+	meter := newOutputMeter(agentTerminalOutputRateWindow, agentTerminalOutputRateBytes, int64(agentTerminalOutputCapBytes))
 	base := time.Date(2026, 6, 16, 12, 0, 0, 0, time.UTC)
 
 	// 7 MiB at t=0 stays under the 8 MiB window limit.
@@ -56,7 +56,7 @@ func TestTerminalOutputMeter_RateWindowSlides(t *testing.T) {
 
 func TestTerminalOutputMeter_LifetimeCapBackstop(t *testing.T) {
 	// With a tiny lifetime cap and a huge rate, only the cap path can trip.
-	meter := &terminalOutputMeter{
+	meter := &outputMeter{
 		window:  5 * time.Second,
 		rateMax: 1 << 30,
 		capMax:  100,

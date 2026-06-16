@@ -241,6 +241,7 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	register("/api/agent/protocol", h.Agent.HandleProtocol, http.MethodGet)
 	register("/api/agent/tools/launch", h.Agent.HandleLaunch, http.MethodPost)
 	register("/api/agent/ai/stream", h.Agent.HandleAIStream, http.MethodGet)
+	register("/api/agent/ai/approval-hook", h.Agent.HandleAIApprovalHook, http.MethodPost)
 	register("/api/docs/tutorials", h.Tutorial.HandleGetTutorial, http.MethodGet)
 
 	registerDocsRoutes(mux, catalog)

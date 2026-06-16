@@ -174,6 +174,16 @@ export default {
   chat_statusDone: '已完成',
   chat_aiThinking: '正在思考…',
   chat_aiError: 'AI 回复出错，请重试。',
+  chat_approvalTitle: '需要授权',
+  chat_approvalTool: '工具',
+  chat_approvalCwd: '目录',
+  chat_approvalPending: '等待授权',
+  chat_approvalResponding: '正在发送',
+  chat_approvalAccept: '批准',
+  chat_approvalAcceptSession: '本会话批准',
+  chat_approvalDecline: '拒绝',
+  chat_approvalCancel: '取消',
+  chat_approvalSendFailed: '授权响应发送失败，请重试。',
 
   // -- App --
   app_restoringSession: '正在恢复会话...',

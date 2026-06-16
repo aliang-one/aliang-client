@@ -32,8 +32,15 @@ const (
 
 	agentMaxAISessions       = 4
 	agentAIMessageLimitBytes = 64 * 1024
-	agentAIOutputLimitBytes  = 2 * 1024 * 1024
-	agentAIRunTimeout        = 30 * time.Minute
+	// AI output flood protection, mirroring the terminal policy: a sliding
+	// window stops runaway bursts (an AI dumping megabytes per second) while
+	// letting long but paced sessions run, with a high lifetime cap as a
+	// backstop. This replaces the old hard 2 MiB cumulative cap that killed
+	// legitimately long coding sessions after they emitted 2 MiB total.
+	agentAIOutputRateWindow = 5 * time.Second
+	agentAIOutputRateBytes  = 16 * 1024 * 1024
+	agentAIOutputCapBytes   = 256 * 1024 * 1024
+	agentAIRunTimeout       = 30 * time.Minute
 )
 
 var (

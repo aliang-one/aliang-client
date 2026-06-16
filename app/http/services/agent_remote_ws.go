@@ -241,7 +241,7 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 	case models.AgentEventTerminalClose:
 		s.setRemoteConnectionState(true, "online", "")
 		s.terminal.close(msg, writeJSON)
-	case models.AgentEventAISessionCreate, models.AgentEventAIMessage, models.AgentEventAIStop, models.AgentEventAISessionClose:
+	case models.AgentEventAISessionCreate, models.AgentEventAIMessage, models.AgentEventAIApprovalResponse, models.AgentEventAIStop, models.AgentEventAISessionClose:
 		s.setRemoteConnectionState(true, "online", "")
 		switch msgType {
 		case models.AgentEventAISessionCreate:
@@ -256,6 +256,12 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 				return
 			}
 			s.ai.message(msg, writeJSON)
+		case models.AgentEventAIApprovalResponse:
+			if !s.aiControlEnabled() {
+				_ = writeJSON(agentAIErrorPayload(remoteString(msg, "session_id"), remoteString(msg, "message_id"), errors.New("AI control is disabled for this device")))
+				return
+			}
+			s.ai.approval(msg, writeJSON)
 		case models.AgentEventAIStop:
 			s.ai.stop(msg, writeJSON)
 		case models.AgentEventAISessionClose:
@@ -285,6 +291,8 @@ func (s *AgentService) DispatchLocalAI(msg map[string]interface{}, writeJSON fun
 		s.ai.create(msg, writeJSON)
 	case models.AgentEventAIMessage:
 		s.ai.message(msg, writeJSON)
+	case models.AgentEventAIApprovalResponse:
+		s.ai.approval(msg, writeJSON)
 	case models.AgentEventAIStop:
 		s.ai.stop(msg, writeJSON)
 	case models.AgentEventAISessionClose:

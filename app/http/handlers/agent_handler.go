@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -69,6 +70,29 @@ func (h *AgentHandler) HandleAIStream(w http.ResponseWriter, r *http.Request) {
 		}
 		h.service.DispatchLocalAI(msg, writeJSON)
 	}
+}
+
+func (h *AgentHandler) HandleAIApprovalHook(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
+		return
+	}
+	defer r.Body.Close()
+	var payload map[string]interface{}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&payload); err != nil {
+		common.Error(w, http.StatusBadRequest, "Invalid approval hook payload", nil)
+		return
+	}
+	response, _ := h.service.HandleAIApprovalHook(
+		r.Context(),
+		r.URL.Query().Get("session_id"),
+		r.URL.Query().Get("message_id"),
+		r.URL.Query().Get("token"),
+		payload,
+	)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(response)
 }
 
 func (h *AgentHandler) HandleStatus(w http.ResponseWriter, r *http.Request) {

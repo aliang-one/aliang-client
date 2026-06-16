@@ -34,6 +34,8 @@ const (
 	AgentEventAIStop                = "ai.stop"
 	AgentEventAIStatus              = "ai.status"
 	AgentEventAIError               = "ai.error"
+	AgentEventAIApprovalRequest     = "ai.approval.request"
+	AgentEventAIApprovalResponse    = "ai.approval.response"
 	AgentEventFileList              = "file.list"
 	AgentEventFileListResult        = "file.list.result"
 	AgentEventFileRead              = "file.read"
@@ -128,6 +130,7 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				{Type: AgentEventAIDone, Required: []string{"type", "session_id", "message_id"}},
 				{Type: AgentEventAIStatus, Required: []string{"type", "session_id", "status"}},
 				{Type: AgentEventAIError, Required: []string{"type", "session_id", "error"}},
+				{Type: AgentEventAIApprovalRequest, Required: []string{"type", "session_id", "message_id", "approval_id", "provider", "kind", "status"}, Optional: []string{"title", "reason", "command", "cwd", "tool_name", "tool_input", "file_changes", "available_decisions", "decision", "raw"}},
 				{Type: AgentEventAISessionClosed, Required: []string{"type", "session_id"}},
 				{Type: AgentEventFileListResult, Required: []string{"type", "request_id", "path", "entries"}},
 				{Type: AgentEventFileReadResult, Required: []string{"type", "request_id", "path", "encoding", "content"}},
@@ -146,7 +149,8 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				{Type: AgentEventTerminalResize, Required: []string{"type", "session_id", "rows", "cols"}, Emits: []string{AgentEventTerminalResized, AgentEventTerminalError}},
 				{Type: AgentEventTerminalClose, Required: []string{"type", "session_id"}, Emits: []string{AgentEventTerminalExit}},
 				{Type: AgentEventAISessionCreate, Required: []string{"type", "session_id"}, Optional: []string{"project_path", "mode", "provider", "tool", "model", "source_session_id", "resume_session_id", "initial_context", "transcript"}, Emits: []string{AgentEventAISessionCreated, AgentEventAIError}},
-				{Type: AgentEventAIMessage, Required: []string{"type", "session_id", "message_id", "content"}, Optional: []string{"attachments", "provider", "tool", "model", "project_path", "source_session_id", "resume_session_id"}, Emits: []string{AgentEventAIRunStarted, AgentEventAIDelta, AgentEventAIDone, AgentEventAIError}},
+				{Type: AgentEventAIMessage, Required: []string{"type", "session_id", "message_id", "content"}, Optional: []string{"attachments", "provider", "tool", "model", "project_path", "source_session_id", "resume_session_id"}, Emits: []string{AgentEventAIRunStarted, AgentEventAIDelta, AgentEventAIApprovalRequest, AgentEventAIDone, AgentEventAIError}},
+				{Type: AgentEventAIApprovalResponse, Required: []string{"type", "session_id", "approval_id", "decision"}, Optional: []string{"message_id", "scope", "raw"}, Emits: []string{AgentEventAIStatus, AgentEventAIError}},
 				{Type: AgentEventAIStop, Required: []string{"type", "session_id"}, Emits: []string{AgentEventAIStatus}},
 				{Type: AgentEventAISessionClose, Required: []string{"type", "session_id"}, Emits: []string{AgentEventAISessionClosed}},
 				{Type: AgentEventFileList, Required: []string{"type", "request_id", "project_path", "path"}, Optional: []string{"max_entries"}, Emits: []string{AgentEventFileListResult, AgentEventFileError}},
@@ -158,6 +162,7 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 		Streams: []AgentProtocolStream{
 			{Name: "terminal", Event: AgentEventTerminalOutput, Required: []string{"session_id", "encoding", "data"}, Description: "PTY bytes are forwarded as text chunks in arrival order."},
 			{Name: "ai_chat", Event: AgentEventAIDelta, Required: []string{"session_id", "message_id", "channel", "delta"}, Optional: []string{"provider"}, Description: "Headless AI CLI stdout/stderr is streamed as soon as bytes arrive."},
+			{Name: "ai_approval", Event: AgentEventAIApprovalRequest, Required: []string{"session_id", "message_id", "approval_id", "provider", "kind", "status"}, Optional: []string{"title", "reason", "command", "cwd", "tool_name", "tool_input", "file_changes", "available_decisions", "decision"}, Description: "Headless AI CLI permission requests are surfaced to the user and resumed only after an ai.approval.response decision."},
 		},
 	}
 }

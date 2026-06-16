@@ -142,6 +142,73 @@
               <template v-else>{{ msg.content }}</template>
             </div>
           </div>
+          <div
+            v-for="approval in activeApprovals"
+            :key="approval.key"
+            class="mb-3 max-w-[85%] rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-950 shadow-sm dark:border-amber-700/60 dark:bg-amber-950/40 dark:text-amber-100"
+          >
+            <div class="flex flex-wrap items-center gap-2">
+              <span class="material-symbols-outlined text-base">{{ approvalIcon(approval) }}</span>
+              <span class="font-semibold">{{ approval.title || t('chat_approvalTitle') }}</span>
+              <span class="rounded bg-white/70 px-1.5 py-0.5 text-xs font-medium text-amber-700 dark:bg-amber-900/60 dark:text-amber-200">
+                {{ approval.status === 'responding' ? t('chat_approvalResponding') : t('chat_approvalPending') }}
+              </span>
+            </div>
+            <p v-if="approval.reason" class="mt-1 whitespace-pre-wrap text-xs text-amber-800 dark:text-amber-200">
+              {{ approval.reason }}
+            </p>
+            <pre
+              v-if="approval.command"
+              class="mt-2 max-h-40 overflow-auto rounded border border-amber-200 bg-white px-2 py-1.5 text-xs text-slate-800 dark:border-amber-700/60 dark:bg-slate-950 dark:text-slate-100"
+            >{{ approval.command }}</pre>
+            <pre
+              v-else-if="approvalDetailText(approval)"
+              class="mt-2 max-h-40 overflow-auto rounded border border-amber-200 bg-white px-2 py-1.5 text-xs text-slate-800 dark:border-amber-700/60 dark:bg-slate-950 dark:text-slate-100"
+            >{{ approvalDetailText(approval) }}</pre>
+            <div v-if="approval.cwd || approval.toolName" class="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs text-amber-700 dark:text-amber-200">
+              <span v-if="approval.toolName">{{ t('chat_approvalTool') }}: {{ approval.toolName }}</span>
+              <span v-if="approval.cwd">{{ t('chat_approvalCwd') }}: {{ approval.cwd }}</span>
+            </div>
+            <div class="mt-2 flex flex-wrap gap-2">
+              <button
+                v-if="approvalAllows(approval, 'accept_for_session')"
+                type="button"
+                class="inline-flex items-center gap-1 rounded bg-emerald-600 px-2.5 py-1 text-xs font-semibold text-white transition hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-60"
+                :disabled="approval.status === 'responding'"
+                @click="respondApproval(activeConversation, approval, 'accept_for_session')"
+              >
+                <span class="material-symbols-outlined text-sm">verified_user</span>{{ t('chat_approvalAcceptSession') }}
+              </button>
+              <button
+                v-if="approvalAllows(approval, 'accept')"
+                type="button"
+                class="inline-flex items-center gap-1 rounded bg-emerald-600 px-2.5 py-1 text-xs font-semibold text-white transition hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-60"
+                :disabled="approval.status === 'responding'"
+                @click="respondApproval(activeConversation, approval, 'accept')"
+              >
+                <span class="material-symbols-outlined text-sm">check</span>{{ t('chat_approvalAccept') }}
+              </button>
+              <button
+                v-if="approvalAllows(approval, 'decline')"
+                type="button"
+                class="inline-flex items-center gap-1 rounded border border-amber-300 bg-white px-2.5 py-1 text-xs font-semibold text-amber-800 transition hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-60 dark:border-amber-700 dark:bg-slate-900 dark:text-amber-100 dark:hover:bg-amber-900/50"
+                :disabled="approval.status === 'responding'"
+                @click="respondApproval(activeConversation, approval, 'decline')"
+              >
+                <span class="material-symbols-outlined text-sm">block</span>{{ t('chat_approvalDecline') }}
+              </button>
+              <button
+                v-if="approvalAllows(approval, 'cancel')"
+                type="button"
+                class="inline-flex items-center gap-1 rounded border border-slate-300 bg-white px-2.5 py-1 text-xs font-semibold text-slate-600 transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-60 dark:border-slate-600 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"
+                :disabled="approval.status === 'responding'"
+                @click="respondApproval(activeConversation, approval, 'cancel')"
+              >
+                <span class="material-symbols-outlined text-sm">close</span>{{ t('chat_approvalCancel') }}
+              </button>
+            </div>
+            <p v-if="approval.error" class="mt-1 text-xs text-rose-600 dark:text-rose-300">{{ approval.error }}</p>
+          </div>
         </template>
       </div>
 
@@ -195,6 +262,7 @@ const showMobileSidebar = ref(false);
 // token-by-token and carries the running -> done status transitions.
 let aiSocket = null;
 let aiSocketPromise = null;
+const handledApprovalIds = new Set();
 
 const activeConversation = computed(() =>
   conversations.value.find(c => c.id === activeId.value) || null
@@ -202,6 +270,10 @@ const activeConversation = computed(() =>
 
 const activeMessages = computed(() =>
   activeConversation.value?.messages || []
+);
+
+const activeApprovals = computed(() =>
+  (activeConversation.value?.approvals || []).filter(a => a.status === 'pending' || a.status === 'responding')
 );
 
 // True while the active conversation's latest assistant message is still streaming.
@@ -253,7 +325,7 @@ function loadFromStorage() {
     if (!raw) return;
     const data = JSON.parse(raw);
     if (data && Array.isArray(data.conversations)) {
-      conversations.value = data.conversations;
+      conversations.value = data.conversations.map(normalizeConversation).filter(Boolean);
       activeId.value = data.activeConversationId || null;
     }
   } catch (_) {
@@ -264,7 +336,7 @@ function loadFromStorage() {
 function saveToStorage() {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({
-      conversations: conversations.value,
+      conversations: conversations.value.map(conversationForStorage),
       activeConversationId: activeId.value
     }));
   } catch (_) {
@@ -272,11 +344,18 @@ function saveToStorage() {
   }
 }
 
+function conversationForStorage(conv) {
+  const copy = { ...conv };
+  copy.approvals = [];
+  return copy;
+}
+
 function createConversation() {
   const conv = {
     id: generateId(),
     title: '',
     messages: [],
+    approvals: [],
     createdAt: now(),
     updatedAt: now()
   };
@@ -397,6 +476,181 @@ function ensureAssistantBubble(conv) {
   return fresh;
 }
 
+function normalizeConversation(conv) {
+  if (!conv || typeof conv !== 'object') return null;
+  if (!Array.isArray(conv.messages)) conv.messages = [];
+  conv.approvals = [];
+  return conv;
+}
+
+function approvalKeyFromValues(sessionId, approvalId) {
+  return `${sessionId || ''}:${approvalId || ''}`;
+}
+
+function approvalKey(approval) {
+  return approvalKeyFromValues(approval?.sessionId, approval?.id);
+}
+
+function ensureApprovalList(conv) {
+  if (!Array.isArray(conv.approvals)) conv.approvals = [];
+  return conv.approvals;
+}
+
+function normalizeApprovalDecision(value) {
+  const lower = String(value || '').replace(/[-\s]/g, '_').toLowerCase();
+  if (['accept', 'accepted', 'approve', 'approved', 'allow', 'allowed', 'yes'].includes(lower)) return 'accept';
+  if (['accept_for_session', 'acceptforsession', 'approved_for_session', 'approve_for_session', 'allow_for_session'].includes(lower)) return 'accept_for_session';
+  if (['decline', 'declined', 'deny', 'denied', 'reject', 'rejected', 'no'].includes(lower)) return 'decline';
+  if (['cancel', 'abort', 'timed_out', 'timeout'].includes(lower)) return 'cancel';
+  return '';
+}
+
+function normalizeApprovalDecisions(values) {
+  const input = Array.isArray(values) ? values : [];
+  const out = [];
+  for (const item of input) {
+    const normalized = normalizeApprovalDecision(item);
+    if (normalized && !out.includes(normalized)) out.push(normalized);
+  }
+  return out.length ? out : ['accept', 'decline', 'cancel'];
+}
+
+function removeApproval(conv, key) {
+  if (!conv || !key || !Array.isArray(conv.approvals)) return;
+  conv.approvals = conv.approvals.filter(item => item.key !== key);
+}
+
+function markApprovalHandled(conv, key) {
+  if (!key) return;
+  handledApprovalIds.add(key);
+  removeApproval(conv, key);
+}
+
+function clearApprovalsForSession(conv, sessionId) {
+  if (!conv || !Array.isArray(conv.approvals)) return;
+  const keep = [];
+  for (const item of conv.approvals) {
+    if (!sessionId || item.sessionId === sessionId) {
+      handledApprovalIds.add(item.key);
+    } else {
+      keep.push(item);
+    }
+  }
+  conv.approvals = keep;
+}
+
+function upsertApproval(conv, event) {
+  const id = event.approval_id || event.id;
+  const sessionId = event.session_id || conv.aiSessionId || '';
+  const key = approvalKeyFromValues(sessionId, id);
+  if (!id || handledApprovalIds.has(key)) return;
+  if (event.status && event.status !== 'pending') {
+    markApprovalHandled(conv, key);
+    return;
+  }
+
+  const approvals = ensureApprovalList(conv);
+  const existing = approvals.find(item => item.key === key);
+  const next = {
+    ...(existing || {}),
+    key,
+    id,
+    sessionId,
+    messageId: event.message_id || existing?.messageId || '',
+    provider: event.provider || existing?.provider || '',
+    kind: event.kind || existing?.kind || 'tool',
+    status: existing?.status === 'responding' ? 'responding' : 'pending',
+    title: event.title || existing?.title || '',
+    reason: event.reason || existing?.reason || '',
+    command: event.command || existing?.command || '',
+    cwd: event.cwd || existing?.cwd || '',
+    toolName: event.tool_name || event.toolName || existing?.toolName || '',
+    toolInput: event.tool_input ?? event.toolInput ?? existing?.toolInput ?? null,
+    fileChanges: event.file_changes ?? event.fileChanges ?? existing?.fileChanges ?? null,
+    availableDecisions: normalizeApprovalDecisions(event.available_decisions || event.availableDecisions || existing?.availableDecisions),
+    error: '',
+    updatedAt: now()
+  };
+  if (existing) {
+    Object.assign(existing, next);
+  } else {
+    approvals.push(next);
+  }
+  conv.updatedAt = now();
+  scrollToBottom();
+}
+
+function serializeApprovalValue(value) {
+  if (value === null || value === undefined || value === '') return '';
+  if (typeof value === 'string') return value;
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch (_) {
+    return String(value);
+  }
+}
+
+function approvalDetailText(approval) {
+  return serializeApprovalValue(approval?.toolInput) || serializeApprovalValue(approval?.fileChanges);
+}
+
+function approvalAllows(approval, decision) {
+  const normalized = normalizeApprovalDecision(decision);
+  return normalizeApprovalDecisions(approval?.availableDecisions).includes(normalized);
+}
+
+function approvalIcon(approval) {
+  switch (approval?.kind) {
+    case 'command':
+      return 'terminal';
+    case 'file_change':
+      return 'edit_document';
+    case 'permissions':
+      return 'lock';
+    default:
+      return 'rule';
+  }
+}
+
+async function respondApproval(conv, approval, decision) {
+  if (!conv || !approval || approval.status !== 'pending') return;
+  const normalized = normalizeApprovalDecision(decision);
+  if (!normalized) return;
+
+  const key = approvalKey(approval);
+  if (handledApprovalIds.has(key)) {
+    removeApproval(conv, key);
+    return;
+  }
+
+  approval.status = 'responding';
+  approval.error = '';
+  approval.updatedAt = now();
+  saveToStorage();
+
+  try {
+    await ensureAISocket();
+    const ok = sendAI({
+      type: 'ai.approval.response',
+      session_id: approval.sessionId || conv.aiSessionId,
+      message_id: approval.messageId || '',
+      approval_id: approval.id,
+      decision: normalized,
+      scope: normalized === 'accept_for_session' ? 'session' : 'turn'
+    });
+    if (!ok) throw new Error('socket-closed');
+    markApprovalHandled(conv, key);
+    saveToStorage();
+  } catch (_) {
+    if (!handledApprovalIds.has(key)) {
+      approval.status = 'pending';
+      approval.error = t('chat_approvalSendFailed');
+      approval.updatedAt = now();
+      saveToStorage();
+    }
+  }
+}
+
 function finishRun(conv) {
   conv.updatedAt = now();
   if (activeId.value === conv.id) sending.value = false;
@@ -432,7 +686,8 @@ function handleAIEvent(e) {
       persist = true;
       break;
     case 'ai.run.started': {
-      ensureAssistantBubble(conv).status = 'running';
+      const asst = ensureAssistantBubble(conv);
+      if (asst) asst.status = 'running';
       break;
     }
     case 'ai.delta': {
@@ -449,9 +704,15 @@ function handleAIEvent(e) {
       persist = true;
       break;
     }
+    case 'ai.approval.request': {
+      upsertApproval(conv, e);
+      persist = true;
+      break;
+    }
     case 'ai.done': {
       const asst = findRunningAssistant(conv);
       if (asst) asst.status = 'done';
+      clearApprovalsForSession(conv, e.session_id);
       finishRun(conv);
       return;
     }
@@ -461,6 +722,7 @@ function handleAIEvent(e) {
         asst.status = 'error';
         if (!asst.content) asst.content = e.error || t('chat_aiError');
       }
+      clearApprovalsForSession(conv, e.session_id);
       finishRun(conv);
       return;
     }

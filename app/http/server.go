@@ -83,6 +83,9 @@ func StartHttpServer() error {
 		_, portStr, _ := net.SplitHostPort(port)
 		actualPort = portStr
 	}
+	if actualPort != "" {
+		services.SetAgentAIApprovalHookBaseURL("http://127.0.0.1:" + actualPort)
+	}
 
 	// Create HTTP server
 	server = &http.Server{

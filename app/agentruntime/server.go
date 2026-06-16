@@ -48,6 +48,7 @@ func StartLocalServer() error {
 	if err != nil {
 		return fmt.Errorf("failed to listen on user agent address %s: %w", config.DefaultUserAgentAddr, err)
 	}
+	services.SetAgentAIApprovalHookBaseURL("http://" + config.DefaultUserAgentAddr)
 
 	srv := &http.Server{
 		Handler:           loopbackOnly(mux),
@@ -103,7 +104,7 @@ func StopLocalServer() error {
 }
 
 func registerAgentRoutes(mux *http.ServeMux) {
-	logger.Info("[AGENT-BOOT] local_server registering_routes routes=/api/agent/status,/api/agent/sync,/api/agent/enable,/api/agent/disable,/api/agent/tools,/api/agent/protocol,/api/agent/tools/launch")
+	logger.Info("[AGENT-BOOT] local_server registering_routes routes=/api/agent/status,/api/agent/sync,/api/agent/enable,/api/agent/disable,/api/agent/tools,/api/agent/protocol,/api/agent/tools/launch,/api/agent/ai/approval-hook")
 	agentHandler := handlers.NewAgentHandler(services.GetSharedAgentService())
 	mux.HandleFunc("/api/agent/status", agentHandler.HandleStatus)
 	mux.HandleFunc("/api/agent/sync", agentHandler.HandleSync)
@@ -112,6 +113,7 @@ func registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/agent/tools", agentHandler.HandleTools)
 	mux.HandleFunc("/api/agent/protocol", agentHandler.HandleProtocol)
 	mux.HandleFunc("/api/agent/tools/launch", agentHandler.HandleLaunch)
+	mux.HandleFunc("/api/agent/ai/approval-hook", agentHandler.HandleAIApprovalHook)
 }
 
 func loopbackOnly(next http.Handler) http.Handler {

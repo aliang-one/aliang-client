@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -1236,19 +1237,93 @@ func TestAgentTerminalManagerRejectsUnsafeRemoteExecution(t *testing.T) {
 	})
 }
 
-func TestAgentAIManagerRunsFakeCodex(t *testing.T) {
-	projectPath := setupAgentExecutionProjectForTest(t)
-	binDir := t.TempDir()
-	codexName := "codex"
-	script := "#!/bin/sh\nprintf '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"ALIANG_FAKE_CODEX_OUTPUT\"}}\\n'\n"
+func writeFakeCodexAppServerForTest(t *testing.T, binDir string) string {
+	t.Helper()
+	codexPath := filepath.Join(binDir, "codex")
 	if runtime.GOOS == "windows" {
-		codexName = "codex.bat"
-		script = "@echo off\r\necho {\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"ALIANG_FAKE_CODEX_OUTPUT\"}}\r\n"
+		t.Skip("fake codex app-server shell is POSIX-only")
 	}
-	codexPath := filepath.Join(binDir, codexName)
+	script := `#!/bin/sh
+if [ "$1" != "app-server" ]; then
+  echo "expected codex app-server, got: $*" >&2
+  exit 2
+fi
+
+mode="${ALIANG_FAKE_CODEX_MODE:-basic}"
+thread_method="start"
+thread_seen="0"
+
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"id":0,"result":{"userAgent":"fake-codex","codexHome":"/tmp","platformFamily":"unix","platformOs":"macos"}}\n'
+      ;;
+    *'"method":"thread/resume"'*)
+      thread_method="resume"
+      if printf '%s' "$line" | grep -q 'codex-session-raw'; then
+        thread_seen="1"
+      fi
+      printf '{"id":1,"result":{"thread":{"id":"thr_fake"},"model":"fake","modelProvider":"openai","serviceTier":null,"cwd":"%s","instructionSources":[],"approvalPolicy":"on-request","approvalsReviewer":"user","sandbox":{},"reasoningEffort":null}}\n' "$PWD"
+      ;;
+    *'"method":"thread/start"'*)
+      thread_method="start"
+      printf '{"id":1,"result":{"thread":{"id":"thr_fake"},"model":"fake","modelProvider":"openai","serviceTier":null,"cwd":"%s","instructionSources":[],"approvalPolicy":"on-request","approvalsReviewer":"user","sandbox":{},"reasoningEffort":null}}\n' "$PWD"
+      ;;
+    *'"method":"turn/start"'*)
+      printf '{"id":2,"result":{"turn":{"id":"turn_fake"}}}\n'
+      case "$mode" in
+        approval)
+          printf '{"method":"item/commandExecution/requestApproval","id":77,"params":{"threadId":"thr_fake","turnId":"turn_fake","itemId":"cmd_fake","startedAtMs":1,"reason":"needs shell","command":"printf ok","cwd":"%s","availableDecisions":["accept","acceptForSession","decline","cancel"]}}\n' "$PWD"
+          ;;
+        history)
+          if printf '%s' "$line" | grep -q 'ALIANG_FIRST_ASSISTANT'; then
+            text="SECOND_CONTEXT_OK"
+          else
+            text="FIRST ANSWER ALIANG_FIRST_ASSISTANT"
+          fi
+          printf '{"method":"item/agentMessage/delta","params":{"threadId":"thr_fake","turnId":"turn_fake","itemId":"msg_fake","delta":"%s"}}\n' "$text"
+          printf '{"method":"turn/completed","params":{"threadId":"thr_fake","turn":{"id":"turn_fake","status":"completed"}}}\n'
+          exit 0
+          ;;
+        resume)
+          prompt_seen="0"
+          if printf '%s' "$line" | grep -q 'continue this imported session'; then
+            prompt_seen="1"
+          fi
+          printf '{"method":"item/agentMessage/delta","params":{"threadId":"thr_fake","turnId":"turn_fake","itemId":"msg_fake","delta":"METHOD:%s THREAD:%s PROMPT:%s PWD:%s"}}\n' "$thread_method" "$thread_seen" "$prompt_seen" "$PWD"
+          printf '{"method":"turn/completed","params":{"threadId":"thr_fake","turn":{"id":"turn_fake","status":"completed"}}}\n'
+          exit 0
+          ;;
+        *)
+          printf '{"method":"item/agentMessage/delta","params":{"threadId":"thr_fake","turnId":"turn_fake","itemId":"msg_fake","delta":"ALIANG_FAKE_CODEX_OUTPUT"}}\n'
+          printf '{"method":"turn/completed","params":{"threadId":"thr_fake","turn":{"id":"turn_fake","status":"completed"}}}\n'
+          exit 0
+          ;;
+      esac
+      ;;
+    *'"id":77'*)
+      if printf '%s' "$line" | grep -q '"decision":"accept'; then
+        printf '{"method":"item/agentMessage/delta","params":{"threadId":"thr_fake","turnId":"turn_fake","itemId":"msg_fake","delta":"APPROVED_OK"}}\n'
+        printf '{"method":"turn/completed","params":{"threadId":"thr_fake","turn":{"id":"turn_fake","status":"completed"}}}\n'
+        exit 0
+      fi
+      printf '{"method":"turn/completed","params":{"threadId":"thr_fake","turn":{"id":"turn_fake","status":"failed"}}}\n'
+      exit 1
+      ;;
+  esac
+done
+`
 	if err := os.WriteFile(codexPath, []byte(script), 0o700); err != nil {
 		t.Fatalf("write fake codex: %v", err)
 	}
+	return codexPath
+}
+
+func TestAgentAIManagerRunsFakeCodex(t *testing.T) {
+	projectPath := setupAgentExecutionProjectForTest(t)
+	binDir := t.TempDir()
+	writeFakeCodexAppServerForTest(t, binDir)
+	t.Setenv("ALIANG_FAKE_CODEX_MODE", "basic")
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	manager := newAgentAIManager()
@@ -1298,21 +1373,8 @@ func TestAgentAIManagerKeepsSessionHistory(t *testing.T) {
 
 	projectPath := setupAgentExecutionProjectForTest(t)
 	binDir := t.TempDir()
-	script := `#!/bin/sh
-last=""
-for arg in "$@"; do
-  last="$arg"
-done
-if printf '%s' "$last" | grep -q 'ALIANG_FIRST_ASSISTANT'; then
-  printf '{"type":"item.completed","item":{"type":"agent_message","text":"SECOND_CONTEXT_OK"}}\n'
-else
-  printf '{"type":"item.completed","item":{"type":"agent_message","text":"FIRST ANSWER ALIANG_FIRST_ASSISTANT"}}\n'
-fi
-`
-	codexPath := filepath.Join(binDir, "codex")
-	if err := os.WriteFile(codexPath, []byte(script), 0o700); err != nil {
-		t.Fatalf("write fake codex: %v", err)
-	}
+	writeFakeCodexAppServerForTest(t, binDir)
+	t.Setenv("ALIANG_FAKE_CODEX_MODE", "history")
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	manager := newAgentAIManager()
@@ -1373,13 +1435,8 @@ func TestAgentAIManagerResumesImportedCodexSession(t *testing.T) {
 		resolvedProjectPath = resolved
 	}
 	binDir := t.TempDir()
-	script := `#!/bin/sh
-printf '{"type":"item.completed","item":{"type":"agent_message","text":"ARGS:%s\\nPWD:%s\\n"}}\n' "$*" "$PWD"
-`
-	codexPath := filepath.Join(binDir, "codex")
-	if err := os.WriteFile(codexPath, []byte(script), 0o700); err != nil {
-		t.Fatalf("write fake codex: %v", err)
-	}
+	writeFakeCodexAppServerForTest(t, binDir)
+	t.Setenv("ALIANG_FAKE_CODEX_MODE", "resume")
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	manager := newAgentAIManager()
@@ -1430,8 +1487,8 @@ printf '{"type":"item.completed","item":{"type":"agent_message","text":"ARGS:%s\
 	}
 	mu.Unlock()
 	got := output.String()
-	if !strings.Contains(got, "ARGS:exec resume") || !strings.Contains(got, "codex-session-raw") || !strings.Contains(got, "PWD:"+resolvedProjectPath) {
-		t.Fatalf("codex resume output = %q, want resume args and project cwd", got)
+	if !strings.Contains(got, "METHOD:resume") || !strings.Contains(got, "THREAD:1") || !strings.Contains(got, "PROMPT:1") || !strings.Contains(got, "PWD:"+resolvedProjectPath) {
+		t.Fatalf("codex resume output = %q, want thread/resume, latest prompt, and project cwd", got)
 	}
 	if strings.Contains(got, "--color") {
 		t.Fatalf("codex resume output = %q, want no unsupported color flag on resume", got)
@@ -1636,6 +1693,391 @@ printf '{"type":"result","result":"你好"}\n'
 	}
 	if got := output.String(); got != "你好" {
 		t.Fatalf("dispatched streamed output = %q, want 你好", got)
+	}
+}
+
+func TestAgentServiceDispatchLocalAIHandlesCodexAppServerApproval(t *testing.T) {
+	projectPath := setupAgentExecutionProjectForTest(t)
+	defer func() {
+		agentAuthorizedDirsMu.Lock()
+		agentAuthorizedDirsCache = nil
+		agentAuthorizedDirsMu.Unlock()
+	}()
+	binDir := t.TempDir()
+	writeFakeCodexAppServerForTest(t, binDir)
+	t.Setenv("ALIANG_FAKE_CODEX_MODE", "approval")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	svc := &AgentService{ai: newAgentAIManager()}
+	defer svc.ai.closeAll()
+
+	var mu sync.Mutex
+	events := make([]map[string]interface{}, 0)
+	writeJSON := func(payload interface{}) error {
+		event, ok := payload.(map[string]interface{})
+		if !ok {
+			t.Fatalf("payload type = %T, want map[string]interface{}", payload)
+		}
+		mu.Lock()
+		events = append(events, event)
+		mu.Unlock()
+		return nil
+	}
+
+	svc.DispatchLocalAI(map[string]interface{}{
+		"type":         "ai.session.create",
+		"session_id":   "codex_approval",
+		"project_path": projectPath,
+		"provider":     "codex",
+		"mode":         "vibe",
+	}, writeJSON)
+	waitForAgentEvent(t, &mu, &events, "ai.session.created", func(event map[string]interface{}) bool {
+		return event["session_id"] == "codex_approval"
+	})
+
+	svc.DispatchLocalAI(map[string]interface{}{
+		"type":       "ai.message",
+		"session_id": "codex_approval",
+		"message_id": "msg_approval",
+		"content":    "run a command",
+	}, writeJSON)
+	approval := waitForAgentEvent(t, &mu, &events, "ai.approval.request", func(event map[string]interface{}) bool {
+		return event["session_id"] == "codex_approval" &&
+			remoteString(event, "status") == "pending" &&
+			remoteString(event, "kind") == models.AgentAIApprovalKindCommand &&
+			remoteString(event, "command") == "printf ok"
+	})
+
+	svc.DispatchLocalAI(map[string]interface{}{
+		"type":        "ai.approval.response",
+		"session_id":  "codex_approval",
+		"message_id":  remoteString(approval, "message_id"),
+		"approval_id": remoteString(approval, "approval_id"),
+		"decision":    "accept",
+	}, writeJSON)
+	waitForAgentEvent(t, &mu, &events, "ai.approval.request", func(event map[string]interface{}) bool {
+		return event["session_id"] == "codex_approval" &&
+			remoteString(event, "approval_id") == remoteString(approval, "approval_id") &&
+			remoteString(event, "status") == "resolved" &&
+			remoteString(event, "decision") == models.AgentAIApprovalDecisionAccept
+	})
+	waitForAgentEvent(t, &mu, &events, "ai.done", func(event map[string]interface{}) bool {
+		return event["session_id"] == "codex_approval" && event["message_id"] == "assistant_msg_approval"
+	})
+
+	mu.Lock()
+	var output strings.Builder
+	for _, event := range events {
+		if event["session_id"] == "codex_approval" && remoteString(event, "type") == "ai.delta" {
+			output.WriteString(remoteString(event, "delta"))
+		}
+	}
+	mu.Unlock()
+	if got := output.String(); got != "APPROVED_OK" {
+		t.Fatalf("codex approval output = %q, want APPROVED_OK", got)
+	}
+}
+
+func TestAgentServiceRemoteAIApprovalResponseUnblocksCodexAppServer(t *testing.T) {
+	projectPath := setupAgentExecutionProjectForTest(t)
+	defer func() {
+		agentAuthorizedDirsMu.Lock()
+		agentAuthorizedDirsCache = nil
+		agentAuthorizedDirsMu.Unlock()
+	}()
+	binDir := t.TempDir()
+	writeFakeCodexAppServerForTest(t, binDir)
+	t.Setenv("ALIANG_FAKE_CODEX_MODE", "approval")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	svc := &AgentService{
+		terminal: newAgentTerminalManager(),
+		ai:       newAgentAIManager(),
+	}
+	defer svc.ai.closeAll()
+
+	var mu sync.Mutex
+	events := make([]map[string]interface{}, 0)
+	writeJSON := func(payload interface{}) error {
+		event, ok := payload.(map[string]interface{})
+		if !ok {
+			t.Fatalf("payload type = %T, want map[string]interface{}", payload)
+		}
+		mu.Lock()
+		events = append(events, event)
+		mu.Unlock()
+		return nil
+	}
+
+	svc.handleRemoteAgentMessage(map[string]interface{}{
+		"type":         "ai.session.create",
+		"session_id":   "remote_codex_approval",
+		"project_path": projectPath,
+		"provider":     "codex",
+		"mode":         "vibe",
+	}, writeJSON)
+	waitForAgentEvent(t, &mu, &events, "ai.session.created", func(event map[string]interface{}) bool {
+		return event["session_id"] == "remote_codex_approval"
+	})
+
+	svc.handleRemoteAgentMessage(map[string]interface{}{
+		"type":       "ai.message",
+		"session_id": "remote_codex_approval",
+		"message_id": "msg_remote_approval",
+		"content":    "run a command",
+	}, writeJSON)
+	approval := waitForAgentEvent(t, &mu, &events, "ai.approval.request", func(event map[string]interface{}) bool {
+		return event["session_id"] == "remote_codex_approval" &&
+			remoteString(event, "status") == "pending" &&
+			remoteString(event, "kind") == models.AgentAIApprovalKindCommand &&
+			remoteString(event, "command") == "printf ok"
+	})
+
+	svc.handleRemoteAgentMessage(map[string]interface{}{
+		"type":        "ai.approval.response",
+		"session_id":  "remote_codex_approval",
+		"message_id":  remoteString(approval, "message_id"),
+		"approval_id": remoteString(approval, "approval_id"),
+		"decision":    "accept",
+	}, writeJSON)
+	waitForAgentEvent(t, &mu, &events, "ai.approval.request", func(event map[string]interface{}) bool {
+		return event["session_id"] == "remote_codex_approval" &&
+			remoteString(event, "approval_id") == remoteString(approval, "approval_id") &&
+			remoteString(event, "status") == "resolved" &&
+			remoteString(event, "decision") == models.AgentAIApprovalDecisionAccept
+	})
+	waitForAgentEvent(t, &mu, &events, "ai.done", func(event map[string]interface{}) bool {
+		return event["session_id"] == "remote_codex_approval" && event["message_id"] == "assistant_msg_remote_approval"
+	})
+
+	mu.Lock()
+	var output strings.Builder
+	for _, event := range events {
+		if event["session_id"] == "remote_codex_approval" && remoteString(event, "type") == "ai.delta" {
+			output.WriteString(remoteString(event, "delta"))
+		}
+	}
+	mu.Unlock()
+	if got := output.String(); got != "APPROVED_OK" {
+		t.Fatalf("remote codex approval output = %q, want APPROVED_OK", got)
+	}
+
+	mu.Lock()
+	beforeDuplicate := len(events)
+	mu.Unlock()
+	svc.handleRemoteAgentMessage(map[string]interface{}{
+		"type":        "ai.approval.response",
+		"session_id":  "remote_codex_approval",
+		"message_id":  remoteString(approval, "message_id"),
+		"approval_id": remoteString(approval, "approval_id"),
+		"decision":    "decline",
+	}, writeJSON)
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, event := range events[beforeDuplicate:] {
+		if remoteString(event, "type") == models.AgentEventAIStatus && remoteString(event, "status") == "approval_not_found" {
+			t.Fatalf("duplicate approval response emitted approval_not_found: %#v", event)
+		}
+		if remoteString(event, "type") == models.AgentEventAIError {
+			t.Fatalf("duplicate approval response emitted error: %#v", event)
+		}
+	}
+}
+
+func TestAgentAIManagerRoutesDuplicateApprovalIDsBySession(t *testing.T) {
+	manager := newAgentAIManager()
+	defer manager.closeAll()
+
+	var mu sync.Mutex
+	events := make([]map[string]interface{}, 0)
+	writeJSON := func(payload interface{}) error {
+		event, ok := payload.(map[string]interface{})
+		if !ok {
+			t.Fatalf("payload type = %T, want map[string]interface{}", payload)
+		}
+		mu.Lock()
+		events = append(events, event)
+		mu.Unlock()
+		return nil
+	}
+
+	type approvalResult struct {
+		response agentAIApprovalResponse
+		err      error
+	}
+	ctxA, cancelA := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelA()
+	ctxB, cancelB := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelB()
+	resultA := make(chan approvalResult, 1)
+	resultB := make(chan approvalResult, 1)
+
+	go func() {
+		response, err := manager.requestApproval(ctxA, agentAIRun{
+			sessionID: "approval_session_a",
+			messageID: "msg_a",
+			runSeq:    1,
+			provider:  "codex",
+		}, writeJSON, agentAIApprovalRequest{
+			ID:   "same_approval_id",
+			Kind: models.AgentAIApprovalKindCommand,
+		})
+		resultA <- approvalResult{response: response, err: err}
+	}()
+	go func() {
+		response, err := manager.requestApproval(ctxB, agentAIRun{
+			sessionID: "approval_session_b",
+			messageID: "msg_b",
+			runSeq:    1,
+			provider:  "codex",
+		}, writeJSON, agentAIApprovalRequest{
+			ID:   "same_approval_id",
+			Kind: models.AgentAIApprovalKindCommand,
+		})
+		resultB <- approvalResult{response: response, err: err}
+	}()
+
+	waitForAgentEvent(t, &mu, &events, "ai.approval.request", func(event map[string]interface{}) bool {
+		return event["session_id"] == "approval_session_a" &&
+			remoteString(event, "approval_id") == "same_approval_id" &&
+			remoteString(event, "status") == "pending"
+	})
+	waitForAgentEvent(t, &mu, &events, "ai.approval.request", func(event map[string]interface{}) bool {
+		return event["session_id"] == "approval_session_b" &&
+			remoteString(event, "approval_id") == "same_approval_id" &&
+			remoteString(event, "status") == "pending"
+	})
+
+	manager.approval(map[string]interface{}{
+		"type":        "ai.approval.response",
+		"session_id":  "approval_session_b",
+		"approval_id": "same_approval_id",
+		"decision":    "decline",
+	}, writeJSON)
+	select {
+	case result := <-resultB:
+		if result.err != nil {
+			t.Fatalf("session B approval error = %v", result.err)
+		}
+		if result.response.Decision != models.AgentAIApprovalDecisionDecline {
+			t.Fatalf("session B decision = %q, want decline", result.response.Decision)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for session B approval result")
+	}
+	select {
+	case result := <-resultA:
+		t.Fatalf("session A was resolved by session B response: %#v", result)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	manager.approval(map[string]interface{}{
+		"type":        "ai.approval.response",
+		"session_id":  "approval_session_a",
+		"approval_id": "same_approval_id",
+		"decision":    "accept",
+	}, writeJSON)
+	select {
+	case result := <-resultA:
+		if result.err != nil {
+			t.Fatalf("session A approval error = %v", result.err)
+		}
+		if result.response.Decision != models.AgentAIApprovalDecisionAccept {
+			t.Fatalf("session A decision = %q, want accept", result.response.Decision)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for session A approval result")
+	}
+}
+
+func TestAgentServiceHandleAIApprovalHookRoundTrip(t *testing.T) {
+	projectPath := setupAgentExecutionProjectForTest(t)
+	svc := &AgentService{ai: newAgentAIManager()}
+	defer svc.ai.closeAll()
+
+	var mu sync.Mutex
+	events := make([]map[string]interface{}, 0)
+	writeJSON := func(payload interface{}) error {
+		event, ok := payload.(map[string]interface{})
+		if !ok {
+			t.Fatalf("payload type = %T, want map[string]interface{}", payload)
+		}
+		mu.Lock()
+		events = append(events, event)
+		mu.Unlock()
+		return nil
+	}
+
+	svc.ai.create(map[string]interface{}{
+		"type":         "ai.session.create",
+		"session_id":   "hook_session",
+		"project_path": projectPath,
+		"provider":     "claudecode",
+	}, writeJSON)
+	waitForAgentEvent(t, &mu, &events, "ai.session.created", func(event map[string]interface{}) bool {
+		return event["session_id"] == "hook_session"
+	})
+
+	_, runCancel := context.WithCancel(context.Background())
+	defer runCancel()
+	svc.ai.mu.Lock()
+	session := svc.ai.sessions["hook_session"]
+	if session == nil {
+		svc.ai.mu.Unlock()
+		t.Fatal("hook_session was not created")
+	}
+	session.cancel = runCancel
+	session.activeWriter = writeJSON
+	session.approvalToken = "token-hook"
+	session.runSeq = 1
+	svc.ai.mu.Unlock()
+
+	type hookResult struct {
+		response map[string]interface{}
+		err      error
+	}
+	hookCtx, cancelHook := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelHook()
+	resultCh := make(chan hookResult, 1)
+	go func() {
+		response, err := svc.HandleAIApprovalHook(hookCtx, "hook_session", "msg_hook", "token-hook", map[string]interface{}{
+			"tool_name":         "Bash",
+			"permission_prompt": "Needs shell access",
+			"tool_input": map[string]interface{}{
+				"command": "printf ok",
+			},
+		})
+		resultCh <- hookResult{response: response, err: err}
+	}()
+
+	approval := waitForAgentEvent(t, &mu, &events, "ai.approval.request", func(event map[string]interface{}) bool {
+		return event["session_id"] == "hook_session" &&
+			remoteString(event, "message_id") == "assistant_msg_hook" &&
+			remoteString(event, "kind") == models.AgentAIApprovalKindCommand &&
+			remoteString(event, "command") == "printf ok"
+	})
+	svc.DispatchLocalAI(map[string]interface{}{
+		"type":        "ai.approval.response",
+		"session_id":  "hook_session",
+		"approval_id": remoteString(approval, "approval_id"),
+		"decision":    "accept",
+	}, writeJSON)
+
+	select {
+	case result := <-resultCh:
+		if result.err != nil {
+			t.Fatalf("HandleAIApprovalHook() error = %v", result.err)
+		}
+		hookOutput, _ := result.response["hookSpecificOutput"].(map[string]interface{})
+		if remoteString(hookOutput, "hookEventName") != "PermissionRequest" {
+			t.Fatalf("hookEventName = %#v, want PermissionRequest", hookOutput["hookEventName"])
+		}
+		if remoteString(hookOutput, "permissionDecision") != "allow" {
+			t.Fatalf("permissionDecision = %#v, want allow", hookOutput["permissionDecision"])
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for approval hook response")
 	}
 }
 

@@ -38,13 +38,14 @@ func EnsureStarted() error {
 		stopStaleUserAgentIfNeeded(700 * time.Millisecond)
 	}
 
-	cmd, logFile, err := newAgentProcessCommand()
+	cmd, err := newAgentProcessCommand()
 	if err != nil {
 		return err
 	}
-	if logFile != nil {
-		defer logFile.Close()
-	}
+	// The rotating log writer backs the child's stdout/stderr via an os/exec
+	// pipe+copy goroutine that runs for the agent's lifetime, so it must NOT be
+	// closed here — closing it would cut the captured agent.log off the moment
+	// EnsureStarted returns. It is reclaimed once the child exits.
 
 	logger.Info(fmt.Sprintf("[AGENT-BOOT] ensure_started launching_user_agent command=%q args=%v", cmd.Path, cmd.Args))
 	if err := cmd.Start(); err != nil {
@@ -223,21 +224,23 @@ func getLocalAgentJSON(timeout time.Duration, path string, target interface{}) e
 	return nil
 }
 
-func newAgentProcessCommand() (*exec.Cmd, *os.File, error) {
+func newAgentProcessCommand() (*exec.Cmd, error) {
 	executable, err := os.Executable()
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	cmd := newBackgroundCommand(executable, "agent")
 	cmd.Env = userAgentEnv(os.Environ())
 
-	logFile := openAgentLogFile()
-	if logFile != nil {
-		cmd.Stdout = logFile
-		cmd.Stderr = logFile
+	if writer := openAgentLogWriter(); writer != nil {
+		// Pointing stdout and stderr at the same io.Writer makes os/exec merge
+		// both streams onto one pipe that it copies into our rotating writer,
+		// which bounds the captured agent.log (see rotatingLogWriter).
+		cmd.Stdout = writer
+		cmd.Stderr = writer
 	}
-	return cmd, logFile, nil
+	return cmd, nil
 }
 
 func userAgentEnv(env []string) []string {
@@ -263,7 +266,7 @@ func userAgentEnv(env []string) []string {
 	return next
 }
 
-func openAgentLogFile() *os.File {
+func openAgentLogWriter() *rotatingLogWriter {
 	stateDir, err := runtimepath.UserStateDir()
 	if err != nil {
 		return nil
@@ -272,9 +275,9 @@ func openAgentLogFile() *os.File {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil
 	}
-	file, err := os.OpenFile(filepath.Join(dir, "agent.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	writer, err := newRotatingLogWriter(dir, "agent.log", agentLogMaxSize, agentLogMaxBackups)
 	if err != nil {
 		return nil
 	}
-	return file
+	return writer
 }

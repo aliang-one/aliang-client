@@ -41,7 +41,7 @@ type agentTerminalSession struct {
 	killer  func() error
 	closer  func() error
 
-	meter        *terminalOutputMeter
+	meter        *outputMeter
 	token        *struct{}
 	lastActiveAt time.Time
 }
@@ -391,7 +391,7 @@ func newAgentTerminalSession(id string, shell string, cwd string, handle *agentT
 		waiter:       handle.wait,
 		killer:       handle.kill,
 		closer:       handle.close,
-		meter:        newTerminalOutputMeter(),
+		meter:        newOutputMeter(agentTerminalOutputRateWindow, agentTerminalOutputRateBytes, int64(agentTerminalOutputCapBytes)),
 		token:        new(struct{}),
 		lastActiveAt: time.Now(),
 	}
@@ -449,36 +449,38 @@ func newAgentShellCommand(shell string, cwd string) *exec.Cmd {
 	return cmd
 }
 
-// terminalOutputMeter bounds terminal output volume with a sliding time window.
-// It stops runaway floods quickly (e.g. `yes`, `cat /dev/urandom`) while letting
-// continuous-but-slow commands such as `watch` stream indefinitely.
-type terminalOutputMeter struct {
+// outputMeter bounds streamed output volume with a sliding time window. It is
+// shared by terminal sessions and AI runs so both apply the same flood policy:
+// stop runaway bursts quickly (e.g. `yes`, `cat /dev/urandom`, or an AI dumping
+// megabytes per second) while letting continuous-but-slow streams run
+// indefinitely up to a high lifetime cap.
+type outputMeter struct {
 	window  time.Duration
 	rateMax int
 	capMax  int64
 
 	mu      sync.Mutex
-	samples []terminalOutputSample
+	samples []outputSample
 	total   int64
 }
 
-type terminalOutputSample struct {
+type outputSample struct {
 	at    time.Time
 	bytes int
 }
 
-func newTerminalOutputMeter() *terminalOutputMeter {
-	return &terminalOutputMeter{
-		window:  agentTerminalOutputRateWindow,
-		rateMax: agentTerminalOutputRateBytes,
-		capMax:  int64(agentTerminalOutputCapBytes),
+func newOutputMeter(window time.Duration, rateMax int, capMax int64) *outputMeter {
+	return &outputMeter{
+		window:  window,
+		rateMax: rateMax,
+		capMax:  capMax,
 	}
 }
 
 // add records n bytes emitted at now and reports whether the session should be
 // killed because the sustained rate over the window or the lifetime cap was
 // exceeded.
-func (m *terminalOutputMeter) add(n int, now time.Time) bool {
+func (m *outputMeter) add(n int, now time.Time) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -490,7 +492,7 @@ func (m *terminalOutputMeter) add(n int, now time.Time) bool {
 	if drop > 0 {
 		m.samples = m.samples[drop:]
 	}
-	m.samples = append(m.samples, terminalOutputSample{at: now, bytes: n})
+	m.samples = append(m.samples, outputSample{at: now, bytes: n})
 	m.total += int64(n)
 
 	if m.capMax > 0 && m.total > m.capMax {
