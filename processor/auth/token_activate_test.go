@@ -245,3 +245,94 @@ func TestRefreshSession_PersistsRotatedTokenWhenProfileSyncFails(t *testing.T) {
 		t.Fatalf("second RefreshSession() username = %q, want user", refreshedAgain.Username)
 	}
 }
+
+func TestRefreshSession_RenewsAccessTokenAndRetainsRefreshTokenWhenOmitted(t *testing.T) {
+	baseDir, err := os.MkdirTemp("", "aliang-refresh-missing-token-*")
+	if err != nil {
+		t.Fatalf("MkdirTemp() error = %v", err)
+	}
+	t.Setenv("HOME", filepath.Join(baseDir, "home"))
+	t.Setenv("ALIANG_CACHE_DIR", filepath.Join(baseDir, "cache"))
+	defer os.RemoveAll(baseDir)
+
+	defer StopTokenRefresh()
+	defer ResetAuthPersistenceForTest()
+	defer config.ResetGlobalConfigForTest()
+
+	ResetAuthPersistenceForTest()
+	StopTokenRefresh()
+	config.ResetGlobalConfigForTest()
+
+	var profileCalls int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/auth/refresh":
+			// Server returns a fresh access_token but omits a rotated refresh_token.
+			// (Some refresh endpoints do not rotate refresh tokens on every call.)
+			// The client MUST still renew the access_token and retain the existing
+			// refresh_token as a fallback, otherwise the access_token is never
+			// renewed and the session expires (auth_expired) on a fixed cadence.
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":{"access_token":"access-2","expires_in":3600,"token_type":"Bearer"}}`))
+		case "/api/v1/user/profile":
+			atomic.AddInt32(&profileCalls, 1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":{"id":1,"email":"user@example.com","username":"user","role":"member","balance":12.5,"concurrency":2,"status":"active","allowed_groups":[1,2],"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-04-09T00:00:00Z"}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	config.SetGlobalConfig(&config.Config{Core: &config.CoreConfig{APIServer: server.URL}})
+
+	if err := SaveUserInfo(&UserInfo{
+		AccessToken:  "access-1",
+		RefreshToken: "refresh-1",
+		TokenType:    "Bearer",
+		Username:     "cached-user",
+		Email:        "cached@example.com",
+		UpdatedAt:    time.Now().Add(-30 * time.Minute),
+		ExpiresIn:    3600,
+	}); err != nil {
+		t.Fatalf("SaveUserInfo() error = %v", err)
+	}
+
+	refreshed, err := RefreshSession("refresh-1")
+	if err != nil {
+		t.Fatalf("RefreshSession() error = %v, want nil (access_token must be renewed even when no refresh_token is returned)", err)
+	}
+	if refreshed.AccessToken != "access-2" {
+		t.Fatalf("RefreshSession() access token = %q, want access-2 (renewed)", refreshed.AccessToken)
+	}
+	if refreshed.RefreshToken != "refresh-1" {
+		t.Fatalf("RefreshSession() refresh token = %q, want refresh-1 (retain existing when none returned)", refreshed.RefreshToken)
+	}
+	if got := atomic.LoadInt32(&profileCalls); got != 1 {
+		t.Fatalf("profile calls = %d, want 1 (renewed access_token should be used to sync profile)", got)
+	}
+
+	saved, err := LoadUserInfo()
+	if err != nil {
+		t.Fatalf("LoadUserInfo() error = %v", err)
+	}
+	if saved.AccessToken != "access-2" {
+		t.Fatalf("saved access token = %q, want access-2", saved.AccessToken)
+	}
+	if saved.RefreshToken != "refresh-1" {
+		t.Fatalf("saved refresh token = %q, want refresh-1 (existing token retained)", saved.RefreshToken)
+	}
+}
+
+func TestActivateWithTokensRejectsMissingRefreshToken(t *testing.T) {
+	userInfo, err := ActivateWithTokens("scan-access-token", " ")
+	if err == nil {
+		t.Fatal("ActivateWithTokens() error = nil, want refresh token error")
+	}
+	if err.Error() != "refresh token cannot be empty" {
+		t.Fatalf("ActivateWithTokens() error = %v, want refresh token cannot be empty", err)
+	}
+	if userInfo != nil {
+		t.Fatalf("ActivateWithTokens() user info = %#v, want nil", userInfo)
+	}
+}

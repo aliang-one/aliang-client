@@ -46,6 +46,10 @@ func (s *AgentService) EnsureRemoteConnection() error {
 
 func (s *AgentService) remoteConnectionLoop() {
 	defer func() {
+		// The remote connection is being torn down for good (disabled / no
+		// token): clean up AI sessions that were deliberately kept alive across
+		// transient reconnects inside runRemoteAgentSession.
+		s.ai.closeAll()
 		s.wsMu.Lock()
 		s.wsConnecting = false
 		s.wsMu.Unlock()
@@ -62,7 +66,7 @@ func (s *AgentService) remoteConnectionLoop() {
 			return
 		}
 
-		wsURL, err := currentAgentWebSocketURL(token)
+		wsURL, err := currentAgentWebSocketURL(token, s.currentAccessToken())
 		if err != nil {
 			logger.Warn(fmt.Sprintf("[AGENT-BOOT] remote_connection ws_url_failed error=%v", err))
 			s.setRemoteConnectionState(false, "connect_failed", err.Error())
@@ -117,6 +121,30 @@ func (s *AgentService) clearActiveRemoteConnection(conn *websocket.Conn) {
 	s.wsConnected = false
 }
 
+// setCurrentRemoteWriter publishes the live remote-connection writer so that
+// AI runs (which outlive a single socket) keep streaming after a reconnect.
+// Pass nil to detach (writes will fail until the next connection publishes one).
+func (s *AgentService) setCurrentRemoteWriter(w agentTerminalWriter) {
+	if w == nil {
+		s.remoteWriter.Store(nil)
+		return
+	}
+	s.remoteWriter.Store(&w)
+}
+
+func (s *AgentService) clearCurrentRemoteWriter() {
+	s.remoteWriter.Store(nil)
+}
+
+// currentRemoteWriter returns the live remote writer, or nil when disconnected.
+func (s *AgentService) currentRemoteWriter() agentTerminalWriter {
+	p := s.remoteWriter.Load()
+	if p == nil {
+		return nil
+	}
+	return *p
+}
+
 func (s *AgentService) forceDisconnectRemote(reason string) {
 	s.wsMu.Lock()
 	conn := s.wsConn
@@ -143,28 +171,101 @@ func (s *AgentService) shouldPreserveDisabledStatus() bool {
 	}
 }
 
+// Remote-WS liveness tuning. The connection rides over a NAT tunnel, so a
+// dead/half-open socket can persist undetected: without an enforced deadline
+// the agent believes itself online while PhoneServer sees no traffic (and vice
+// versa). These keep the connection honest. Package vars so tests can shrink
+// them to exercise the dead-peer path quickly.
+var (
+	agentRemoteHeartbeatInterval = 10 * time.Second
+	agentRemotePingInterval      = 30 * time.Second
+	agentRemoteReadWindow        = 90 * time.Second
+	agentRemoteWriteTimeout      = 10 * time.Second
+)
+
 func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn) error {
+	// Write deadline: a stuck write (peer stopped reading / NAT blackhole) must
+	// fail fast instead of blocking forever while holding writeMu.
 	var writeMu sync.Mutex
-	writeJSON := func(payload interface{}) error {
+	rawWriter := func(payload interface{}) error {
 		writeMu.Lock()
 		defer writeMu.Unlock()
+		_ = conn.SetWriteDeadline(time.Now().Add(agentRemoteWriteTimeout))
 		return conn.WriteJSON(payload)
 	}
+	// Publish this connection's writer so AI runs that outlive the socket keep
+	// streaming after a reconnect (they emit through currentRemoteWriter()).
+	s.setCurrentRemoteWriter(rawWriter)
+	defer s.clearCurrentRemoteWriter()
+	// writeJSON is an indirection: it always writes to the *current* live writer,
+	// not the closure captured here, so a reconnect reattaches in-flight runs.
+	writeJSON := func(payload interface{}) error {
+		w := s.currentRemoteWriter()
+		if w == nil {
+			return errors.New("remote agent writer unavailable (disconnected)")
+		}
+		return w(payload)
+	}
+
+	// Read liveness: enforce a read deadline that is refreshed by inbound pongs
+	// (and any application message). If the peer goes silent the deadline fires
+	// -> ReadJSON errors -> the session ends and remoteConnectionLoop reconnects,
+	// instead of hanging on a dead socket.
+	resetReadDeadline := func() {
+		_ = conn.SetReadDeadline(time.Now().Add(agentRemoteReadWindow))
+	}
+	resetReadDeadline()
+	conn.SetPongHandler(func(string) error {
+		resetReadDeadline()
+		return nil
+	})
 
 	if err := s.sendAgentHello(writeJSON, "connect"); err != nil {
 		return err
 	}
 
 	defer s.terminal.closeAll()
-	defer s.ai.closeAll()
+	// NOTE: AI sessions are intentionally NOT closed here. A transient WS
+	// disconnect (conn read error) must not kill locally-running AI CLIs; they
+	// survive and re-stream over the next connection via currentRemoteWriter().
+	// True shutdown paths (remoteConnectionLoop exit, forceDisconnectRemote)
+	// close AI sessions explicitly.
+
+	// Reconcile on (re)connect: re-surface approvals we are still waiting on so
+	// the server can re-deliver decided ones and confirm still-pending ones.
+	s.ai.emitApprovalSync(writeJSON)
 
 	done := make(chan struct{})
 	defer close(done)
+
+	// Ping goroutine, independent of the application ticker below: liveness
+	// probes must never be starved by (or starve) heartbeats/inventory writes.
+	// WriteControl is safe to call concurrently with WriteJSON and carries its
+	// own deadline, so it does not contend on writeMu.
 	go func() {
-		heartbeatTicker := time.NewTicker(10 * time.Second)
+		pingTicker := time.NewTicker(agentRemotePingInterval)
+		defer pingTicker.Stop()
+		for {
+			select {
+			case <-pingTicker.C:
+				if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(agentRemoteWriteTimeout)); err != nil {
+					return
+			}
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	go func() {
+		heartbeatTicker := time.NewTicker(agentRemoteHeartbeatInterval)
 		defer heartbeatTicker.Stop()
 		inventoryTicker := time.NewTicker(time.Minute)
 		defer inventoryTicker.Stop()
+		// Periodically re-surface still-pending approvals: a delivery retry nudge
+		// and a dialogue-liveness heartbeat for the server.
+		approvalSyncTicker := time.NewTicker(time.Minute)
+		defer approvalSyncTicker.Stop()
 		for {
 			select {
 			case <-heartbeatTicker.C:
@@ -175,10 +276,29 @@ func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn) error {
 					"load":      collectAgentLoadSnapshot(),
 				})
 			case <-inventoryTicker.C:
+				// Log-only on failure: a periodic hello failure must NOT tear down
+				// the heartbeat/liveness stream. Returning here (the old behavior)
+				// silently starved PhoneServer of heartbeats and tripped its own
+				// liveness timer, dropping an otherwise-healthy connection.
 				if err := s.sendAgentHello(writeJSON, "periodic"); err != nil {
 					logger.Warn(fmt.Sprintf("[AGENT-BOOT] remote_connection periodic_hello_failed error=%v", err))
-					return
 				}
+			case <-s.sessionRefreshSig:
+				// Token was refreshed (new exp). Push the current access_token so
+				// PhoneServer advances this device's userTokenExp without a reconnect.
+				accessToken := s.currentAccessToken()
+				if accessToken == "" {
+					continue
+				}
+				if err := writeJSON(map[string]interface{}{
+					"type":         "agent.session.refresh",
+					"access_token": accessToken,
+				}); err != nil {
+					// Log-only (see inventory): don't kill the heartbeat stream.
+					logger.Warn(fmt.Sprintf("[AGENT-BOOT] remote_connection session_refresh_send_failed error=%v", err))
+				}
+			case <-approvalSyncTicker.C:
+				s.ai.emitApprovalSync(writeJSON)
 			case <-done:
 				return
 			}
@@ -190,6 +310,9 @@ func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn) error {
 		if err := conn.ReadJSON(&msg); err != nil {
 			return err
 		}
+		// Any inbound traffic confirms the peer is alive; refresh the deadline so
+		// a chatty-but-pong-less peer isn't misclassified as dead.
+		resetReadDeadline()
 		s.handleRemoteAgentMessage(msg, writeJSON)
 	}
 }
@@ -256,7 +379,7 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 	case models.AgentEventDeviceSettings:
 		logger.Info("[AGENT-BOOT] remote_connection settings_updated")
 		s.applyRemoteDeviceSettings(msg)
-	case models.AgentEventProjectDetail, models.AgentEventAISessionDetail, models.AgentEventFileList, models.AgentEventFileRead:
+	case models.AgentEventProjectDetail, models.AgentEventAISessionDetail, models.AgentEventFileList, models.AgentEventFileRead, models.AgentEventSlashCommandsList:
 		s.setRemoteConnectionState(true, "online", "")
 		go handleAgentDetailMessage(msg, writeJSON)
 	case models.AgentEventTerminalCreate:
@@ -283,7 +406,7 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 	case models.AgentEventTerminalClose:
 		s.setRemoteConnectionState(true, "online", "")
 		s.terminal.close(msg, writeJSON)
-	case models.AgentEventAISessionCreate, models.AgentEventAIMessage, models.AgentEventAIApprovalResponse, models.AgentEventAIStop, models.AgentEventAISessionClose:
+	case models.AgentEventAISessionCreate, models.AgentEventAIMessage, models.AgentEventAIApprovalResponse, models.AgentEventAIOptionResponse, models.AgentEventAIStop, models.AgentEventAISessionClose:
 		s.setRemoteConnectionState(true, "online", "")
 		switch msgType {
 		case models.AgentEventAISessionCreate:
@@ -304,11 +427,31 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 				return
 			}
 			s.ai.approval(msg, writeJSON)
+		case models.AgentEventAIOptionResponse:
+			if !s.aiControlEnabled() {
+				_ = writeJSON(agentAIErrorPayload(remoteString(msg, "session_id"), remoteString(msg, "message_id"), errors.New("AI control is disabled for this device")))
+				return
+			}
+			s.ai.optionResponse(msg, writeJSON)
 		case models.AgentEventAIStop:
 			s.ai.stop(msg, writeJSON)
 		case models.AgentEventAISessionClose:
 			s.ai.close(msg, writeJSON)
 		}
+	case models.AgentEventAIApprovalState, models.AgentEventAIApprovalRequestAck:
+		// Server-side approval status / request-received ack: informational.
+		// Touch liveness; delivery/retry is driven by ai.approval.ack.
+		s.setRemoteConnectionState(true, "online", "")
+	case models.AgentEventAIApprovalCancelled:
+		// Server cancelled approvals (e.g. device was offline past grace): drop
+		// the matching local waiters so a still-running CLI is told to give up.
+		s.setRemoteConnectionState(true, "online", "")
+		s.ai.cancelApprovals(msg)
+	case models.AgentEventAIOptionCancelled:
+		// Server cancelled an option (e.g. device offline past grace): drop the
+		// local pendingOption so a later stray response is ignored.
+		s.setRemoteConnectionState(true, "online", "")
+		s.ai.cancelOptions(msg)
 	default:
 		_ = writeJSON(map[string]interface{}{
 			"type":  models.AgentEventError,
@@ -323,6 +466,7 @@ func remoteAgentMessageRequiresEnabledDevice(msgType string) bool {
 		models.AgentEventAISessionDetail,
 		models.AgentEventFileList,
 		models.AgentEventFileRead,
+		models.AgentEventSlashCommandsList,
 		models.AgentEventTerminalCreate,
 		models.AgentEventTerminalInput,
 		models.AgentEventTerminalResize,
@@ -330,6 +474,7 @@ func remoteAgentMessageRequiresEnabledDevice(msgType string) bool {
 		models.AgentEventAISessionCreate,
 		models.AgentEventAIMessage,
 		models.AgentEventAIApprovalResponse,
+		models.AgentEventAIOptionResponse,
 		models.AgentEventAIStop,
 		models.AgentEventAISessionClose:
 		return true
@@ -465,7 +610,7 @@ func (s *AgentService) currentDeviceID() string {
 	return s.state.DeviceID
 }
 
-func currentAgentWebSocketURL(token string) (string, error) {
+func currentAgentWebSocketURL(token, userToken string) (string, error) {
 	cfg := config.GetGlobalConfig()
 	if cfg == nil || strings.TrimSpace(cfg.AgentBaseURL()) == "" {
 		return "", errors.New("agent server is not configured")
@@ -490,6 +635,12 @@ func currentAgentWebSocketURL(token string) (string, error) {
 	parsed.RawQuery = ""
 	values := parsed.Query()
 	values.Set("token", token)
+	// Present the current user JWT so a reconnect after a stale-exp kick
+	// self-heals: PhoneServer refreshes the device's userTokenExp from a valid
+	// future-exp token before running the handshake gate.
+	if strings.TrimSpace(userToken) != "" {
+		values.Set("user_token", userToken)
+	}
 	parsed.RawQuery = values.Encode()
 	return parsed.String(), nil
 }

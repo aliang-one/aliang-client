@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"aliang.one/nursorgate/common/logger"
 	"aliang.one/nursorgate/processor/config"
 )
 
@@ -180,15 +181,47 @@ func callUserCenterAPI(method, endpoint string, body any) ([]byte, error) {
 	}
 	responseBody, err := callAuthenticatedAPI(method, endpoint, authToken, body)
 	if err != nil {
-		// 401 直接视为 session expired
 		var apiErr *authenticatedAPIError
 		if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusUnauthorized {
-			clearLocalSessionAfterExpiredAccessToken()
-			return nil, ErrSessionExpired
+			// A 401 can be transient (backend deploy, load-balancer hiccup, clock
+			// skew, or a momentary network failure surfacing as 401). Confirm the
+			// session is really dead before wiping — wiping forces a full re-login
+			// and is the reason a single hiccup took the agent offline.
+			if sessionConfirmedDeadAfter401() {
+				return nil, ErrSessionExpired
+			}
+			// Transient: retain the session (and the freshly refreshed token) so
+			// the caller retries next cycle instead of forcing a re-login.
+			return nil, err
 		}
 		return nil, err
 	}
 	return responseBody, nil
+}
+
+// sessionConfirmedDeadAfter401 decides whether a 401 from a user-center API
+// really means the local session is dead. It probes liveness by attempting a
+// token refresh:
+//   - refresh succeeds  -> the session is alive; the 401 was spurious.
+//   - refresh fails      -> if the refresh attempt itself invalidated the
+//                           session (refresh token rejected) the session is
+//                           genuinely dead; otherwise the refresh failure was
+//                           transient (e.g. network) and we keep the session so
+//                           the caller retries later.
+//
+// Returns true only when the session is confirmed dead. In that case the
+// session has already been wiped by the refresh path, so callers must NOT wipe
+// again (doing so would re-fire the auth-expired side effects).
+func sessionConfirmedDeadAfter401() bool {
+	if refreshed, refreshErr := RefreshSession(""); refreshErr == nil && refreshed != nil {
+		logger.Warn("user-center API returned 401 but token refresh succeeded; treating 401 as transient and retaining session")
+		return false
+	}
+	if GetCurrentUserInfoOrLoad() == nil {
+		return true
+	}
+	logger.Warn("user-center API returned 401 and refresh failed transiently; retaining session for retry")
+	return false
 }
 
 func resolveAuthTokenForEndpoint(endpoint string) (string, error) {

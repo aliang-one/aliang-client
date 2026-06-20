@@ -18,6 +18,12 @@ import (
 const (
 	// API调用超时
 	apiTimeout = 10 * time.Second
+
+	// scanAccessTokenTTLSeconds 是扫码登录落地的 st_(access_token) 在客户端侧登记的过期秒数。
+	// official-website 的本地会话(st_)服务端寿命为 24h，每次 /api/v1/auth/refresh 会顺带
+	// extendLocalSessionExpiry 续 +24h。此处取 1h 仅用于驱动 TokenRefresher 的「提前刷新」节奏，
+	// 使其与密码登录（sub2api access_token ~1h）一致；每次刷新都会续命服务端 st_，故 24h 内必被刷新。
+	scanAccessTokenTTLSeconds = 3600
 )
 
 func ActivateToken(token string) (*UserInfo, error) {
@@ -114,16 +120,23 @@ func LoginWithPassword(email, password, turnstileToken string) (*UserInfo, error
 		return nil, fmt.Errorf("login response missing refresh_token")
 	}
 
-	profile, err := GetUserProfileWithToken(response.Data.AccessToken)
+	return finalizeAuthenticatedSession(response.Data.AccessToken, response.Data.RefreshToken, response.Data.TokenType, response.Data.ExpiresIn)
+}
+
+// finalizeAuthenticatedSession 把已取得的 access/refresh token 落地为本地登录态：拉取个人资料、
+// 组装 UserInfo、持久化、启动刷新器、置位就绪标志。密码登录与扫码登录共用此收尾，
+// 确保两条登录路径产出的本地态逐字段等价（下游 /me、刷新器、Authorization-Inner 行为一致）。
+func finalizeAuthenticatedSession(accessToken, refreshToken, tokenType string, expiresIn int) (*UserInfo, error) {
+	profile, err := GetUserProfileWithToken(accessToken)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch user profile after login: %w", err)
 	}
 
 	userInfo := buildUserInfoFromProfile(profile)
-	userInfo.AccessToken = response.Data.AccessToken
-	userInfo.RefreshToken = response.Data.RefreshToken
-	userInfo.TokenType = response.Data.TokenType
-	userInfo.ExpiresIn = response.Data.ExpiresIn
+	userInfo.AccessToken = accessToken
+	userInfo.RefreshToken = refreshToken
+	userInfo.TokenType = tokenType
+	userInfo.ExpiresIn = expiresIn
 	userInfo.UpdatedAt = time.Now()
 
 	if err := SaveUserInfo(userInfo); err != nil {
@@ -135,6 +148,22 @@ func LoginWithPassword(email, password, turnstileToken string) (*UserInfo, error
 	config.SetHasLocalUserInfo(true)
 
 	return userInfo, nil
+}
+
+// ActivateWithTokens 用扫码登录拿到的令牌对完成登录收尾。
+// accessToken 为 official-website 下发的本地 st_（作 Bearer / Authorization-Inner），
+// refreshToken 为该用户的 sub2api refresh_token（驱动刷新器，每次刷新顺带续命服务端 st_）。
+// 与 LoginWithPassword 走同一条 finalizeAuthenticatedSession，故扫码后状态与密码登录等价。
+func ActivateWithTokens(accessToken, refreshToken string) (*UserInfo, error) {
+	accessToken = strings.TrimSpace(accessToken)
+	refreshToken = strings.TrimSpace(refreshToken)
+	if accessToken == "" {
+		return nil, fmt.Errorf("access token cannot be empty")
+	}
+	if refreshToken == "" {
+		return nil, fmt.Errorf("refresh token cannot be empty")
+	}
+	return finalizeAuthenticatedSession(accessToken, refreshToken, "Bearer", scanAccessTokenTTLSeconds)
 }
 
 func RestoreSession() (*UserInfo, error) {
@@ -265,11 +294,29 @@ func RefreshSession(refreshToken string) (*UserInfo, error) {
 	if strings.TrimSpace(response.Data.AccessToken) == "" {
 		return nil, fmt.Errorf("refresh response missing access_token")
 	}
-	if strings.TrimSpace(response.Data.RefreshToken) == "" {
-		response.Data.RefreshToken = token
+
+	nextRefreshToken := strings.TrimSpace(response.Data.RefreshToken)
+	if nextRefreshToken == "" {
+		// The server renewed the access_token but did not return a (rotated)
+		// refresh_token — some refresh endpoints keep the same refresh_token
+		// valid across calls. We MUST still persist the renewed access_token;
+		// otherwise it is never refreshed and the session expires (auth_expired)
+		// on a fixed cadence, taking the agent offline periodically. Retain the
+		// existing refresh_token as a fallback so the next refresh cycle retries.
+		// If the old token was genuinely consumed/invalidated, the next refresh
+		// returns REFRESH_TOKEN_INVALID and clears the session then — no worse
+		// than failing now, but with a renewed access_token in between.
+		retained := token
+		if current != nil {
+			if latest := strings.TrimSpace(current.RefreshToken); latest != "" {
+				retained = latest
+			}
+		}
+		logger.Warn("Refresh response missing refresh_token; retaining existing refresh_token and persisting renewed access_token")
+		nextRefreshToken = retained
 	}
 
-	userInfo := mergeRefreshedSessionWithCurrentUser(current, response.Data.AccessToken, response.Data.RefreshToken, response.Data.TokenType, response.Data.ExpiresIn)
+	userInfo := mergeRefreshedSessionWithCurrentUser(current, response.Data.AccessToken, nextRefreshToken, response.Data.TokenType, response.Data.ExpiresIn)
 
 	profile, err := GetUserProfileWithToken(response.Data.AccessToken)
 	if err != nil {
@@ -284,6 +331,11 @@ func RefreshSession(refreshToken string) (*UserInfo, error) {
 
 	startTokenRefresh()
 	config.SetHasLocalUserInfo(true)
+
+	// A fresh access_token was obtained (new exp). Notify the agent so it can
+	// push it to PhoneServer (agent.session.refresh) — keeping the server's
+	// recorded session expiry current without a reconnect.
+	notifyAuthSuccessHandler()
 
 	return userInfo, nil
 }
@@ -404,12 +456,16 @@ func maskToken(token string) string {
 }
 
 var (
+	tokenRefresherMu sync.RWMutex
 	tokenRefresher   *TokenRefresher
 	refreshSessionMu sync.Mutex
 )
 
 // startTokenRefresh 启动定时刷新
 func startTokenRefresh() {
+	tokenRefresherMu.Lock()
+	defer tokenRefresherMu.Unlock()
+
 	if tokenRefresher != nil && tokenRefresher.IsRunning() {
 		return // 已经在运行
 	}
@@ -422,6 +478,9 @@ func startTokenRefresh() {
 
 // StopTokenRefresh 停止定时刷新
 func StopTokenRefresh() {
+	tokenRefresherMu.Lock()
+	defer tokenRefresherMu.Unlock()
+
 	if tokenRefresher != nil {
 		if err := tokenRefresher.Stop(); err != nil {
 			logger.Warn(fmt.Sprintf("Failed to stop token refresher: %v", err))
@@ -431,5 +490,8 @@ func StopTokenRefresh() {
 
 // GetTokenRefresher 获取Token刷新器实例
 func GetTokenRefresher() *TokenRefresher {
+	tokenRefresherMu.RLock()
+	defer tokenRefresherMu.RUnlock()
+
 	return tokenRefresher
 }

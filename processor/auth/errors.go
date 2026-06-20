@@ -18,6 +18,9 @@ var ErrSessionExpired = errors.New("auth session expired")
 var (
 	authExpirationHandlerMu sync.RWMutex
 	authExpirationHandler   func()
+
+	authSuccessHandlerMu sync.RWMutex
+	authSuccessHandler   func()
 )
 
 type authAPIErrorEnvelope struct {
@@ -82,6 +85,22 @@ func clearLocalSessionAfterInvalidRefreshToken() {
 }
 
 func clearLocalSessionAfterExpiredAccessToken() {
+	// Self-heal before wiping: an access token typically only expires because
+	// the background refresher missed its lead-time window (e.g. a transient
+	// network failure during refresh). If the refresh token is still valid,
+	// refreshing renews the access token and the session survives — no
+	// auth_expired, no forced re-login, no agent going offline. Only when the
+	// refresh genuinely fails do we treat the session as expired.
+	if refreshed, err := RefreshSession(""); err == nil && refreshed != nil {
+		logger.Warn("access token expired but recovery refresh succeeded; retaining session (no auth_expired)")
+		return
+	}
+	// RefreshSession may have already wiped the session if the refresh token was
+	// invalid (its own invalid-token path clears the session). Avoid double
+	// wiping / double-firing the auth-expired side effects in that case.
+	if GetCurrentUserInfoOrLoad() == nil {
+		return
+	}
 	clearLocalSessionAfterExpiration("expired access token")
 }
 
@@ -128,6 +147,26 @@ func notifyAuthExpirationHandler() {
 	authExpirationHandlerMu.RLock()
 	handler := authExpirationHandler
 	authExpirationHandlerMu.RUnlock()
+
+	if handler != nil {
+		handler()
+	}
+}
+
+// SetAuthSuccessHandler registers a callback fired after a successful token
+// refresh/login. The agent uses it to push its freshly-rotated access_token to
+// PhoneServer over the live WS (agent.session.refresh) so the server's recorded
+// session expiry (userTokenExp) stays current without a reconnect.
+func SetAuthSuccessHandler(handler func()) {
+	authSuccessHandlerMu.Lock()
+	defer authSuccessHandlerMu.Unlock()
+	authSuccessHandler = handler
+}
+
+func notifyAuthSuccessHandler() {
+	authSuccessHandlerMu.RLock()
+	handler := authSuccessHandler
+	authSuccessHandlerMu.RUnlock()
 
 	if handler != nil {
 		handler()
