@@ -511,6 +511,11 @@ func (s *AgentService) DispatchLocalAI(msg map[string]interface{}, writeJSON fun
 		s.ai.stop(msg, writeJSON)
 	case models.AgentEventAISessionClose:
 		s.ai.close(msg, writeJSON)
+	case models.AgentEventSlashCommandsList:
+		// Slash-command discovery shares the local chat socket so the web UI can
+		// offer `/` completion. It routes through the same detail handler as the
+		// remote link and is provider-aware (claude vs codex).
+		handleAgentDetailMessage(msg, writeJSON)
 	default:
 		_ = writeJSON(map[string]interface{}{
 			"type":  models.AgentEventAIError,

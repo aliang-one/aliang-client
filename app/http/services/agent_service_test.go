@@ -1221,7 +1221,7 @@ func TestCurrentAgentWebSocketURLUsesDevServerPort(t *testing.T) {
 	t.Cleanup(config.ResetGlobalConfigForTest)
 	config.SetGlobalConfig(&config.Config{Core: &config.CoreConfig{AgentServer: "http://localhost:5174"}})
 
-	got, err := currentAgentWebSocketURL("dt_test")
+	got, err := currentAgentWebSocketURL("dt_test", "")
 	if err != nil {
 		t.Fatalf("currentAgentWebSocketURL() error = %v", err)
 	}
@@ -1659,7 +1659,7 @@ func TestResolveNamedAgentAIToolIgnoresProviderPlaceholderModel(t *testing.T) {
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	tool, err := resolveNamedAgentAITool("claude", "你好", "claude", "claude-session-id")
+	tool, err := resolveNamedAgentAITool("claude", "你好", "claude", "", "claude-session-id")
 	if err != nil {
 		t.Fatalf("resolveNamedAgentAITool() error = %v", err)
 	}
@@ -1928,6 +1928,93 @@ func TestAgentServiceDispatchLocalAIHandlesCodexAppServerApproval(t *testing.T) 
 	}
 }
 
+func TestAgentServiceDispatchLocalAIListsSlashCommandsByProvider(t *testing.T) {
+	projectPath := setupAgentExecutionProjectForTest(t)
+	defer func() {
+		agentAuthorizedDirsMu.Lock()
+		agentAuthorizedDirsCache = nil
+		agentAuthorizedDirsMu.Unlock()
+	}()
+
+	cmdDir := filepath.Join(projectPath, ".claude", "commands")
+	if err := os.MkdirAll(cmdDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cmdDir, "demo.md"), []byte("---\ndescription: Demo command\n---\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	svc := &AgentService{ai: newAgentAIManager()}
+	defer svc.ai.closeAll()
+
+	listSlash := func(provider string) map[string]interface{} {
+		var mu sync.Mutex
+		var got map[string]interface{}
+		writeJSON := func(payload interface{}) error {
+			if event, ok := payload.(map[string]interface{}); ok {
+				if remoteString(event, "type") == models.AgentEventSlashCommandsListResult {
+					mu.Lock()
+					got = event
+					mu.Unlock()
+				}
+			}
+			return nil
+		}
+		svc.DispatchLocalAI(map[string]interface{}{
+			"type":         models.AgentEventSlashCommandsList,
+			"request_id":   "req-" + provider,
+			"project_path": projectPath,
+			"provider":     provider,
+		}, writeJSON)
+		mu.Lock()
+		defer mu.Unlock()
+		return got
+	}
+
+	namesByProvider := func(result map[string]interface{}) map[string]string {
+		out := map[string]string{}
+		if result == nil {
+			return out
+		}
+		cmds, _ := result["commands"].([]map[string]interface{})
+		for _, c := range cmds {
+			out[remoteString(c, "name")] = remoteString(c, "provider")
+		}
+		return out
+	}
+
+	claude := listSlash("claude")
+	if claude == nil {
+		t.Fatal("claude: expected slash.commands.list.result over the local AI stream")
+	}
+	claudeNames := namesByProvider(claude)
+	if _, ok := claudeNames["demo"]; !ok {
+		t.Errorf("claude result missing project command 'demo': %v", claudeNames)
+	}
+	for name, prov := range claudeNames {
+		if prov != "claude" {
+			t.Errorf("claude result entry %q has provider=%q, want claude", name, prov)
+		}
+	}
+
+	codex := listSlash("codex")
+	if codex == nil {
+		t.Fatal("codex: expected slash.commands.list.result over the local AI stream")
+	}
+	codexNames := namesByProvider(codex)
+	if _, ok := codexNames["model"]; !ok {
+		t.Errorf("codex result missing builtin 'model': %v", codexNames)
+	}
+	if _, leaked := codexNames["demo"]; leaked {
+		t.Errorf("codex result must not include the claude project command 'demo': %v", codexNames)
+	}
+	for name, prov := range codexNames {
+		if prov != "codex" {
+			t.Errorf("codex result entry %q has provider=%q, want codex", name, prov)
+		}
+	}
+}
+
 func TestAgentServiceRemoteAIApprovalResponseUnblocksCodexAppServer(t *testing.T) {
 	projectPath := setupAgentExecutionProjectForTest(t)
 	defer func() {
@@ -1944,6 +2031,13 @@ func TestAgentServiceRemoteAIApprovalResponseUnblocksCodexAppServer(t *testing.T
 		terminal: newAgentTerminalManager(),
 		ai:       newAgentAIManager(),
 	}
+	// The remote link gates every AI event behind remoteControlAllowed()
+	// (Enabled + device token). The local dispatch path bypasses that gate, so
+	// only this remote test must opt into the enabled state to reach ai.create.
+	svc.mu.Lock()
+	svc.state.Enabled = true
+	svc.state.DeviceToken = "dt_test"
+	svc.mu.Unlock()
 	defer svc.ai.closeAll()
 
 	var mu sync.Mutex
@@ -2223,6 +2317,97 @@ func TestAgentServiceHandleAIApprovalHookRoundTrip(t *testing.T) {
 		if remoteString(hookOutput, "hookEventName") != "PermissionRequest" {
 			t.Fatalf("hookEventName = %#v, want PermissionRequest", hookOutput["hookEventName"])
 		}
+		decision, _ := hookOutput["decision"].(map[string]interface{})
+		if remoteString(decision, "behavior") != "allow" {
+			t.Fatalf("decision.behavior = %#v, want allow", decision["behavior"])
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for approval hook response")
+	}
+}
+
+func TestAgentServiceHandleAIPreToolUseApprovalHookRoundTrip(t *testing.T) {
+	projectPath := setupAgentExecutionProjectForTest(t)
+	svc := &AgentService{ai: newAgentAIManager()}
+	defer svc.ai.closeAll()
+
+	var mu sync.Mutex
+	events := make([]map[string]interface{}, 0)
+	writeJSON := func(payload interface{}) error {
+		event, ok := payload.(map[string]interface{})
+		if !ok {
+			t.Fatalf("payload type = %T, want map[string]interface{}", payload)
+		}
+		mu.Lock()
+		events = append(events, event)
+		mu.Unlock()
+		return nil
+	}
+
+	svc.ai.create(map[string]interface{}{
+		"type":         "ai.session.create",
+		"session_id":   "pretool_session",
+		"project_path": projectPath,
+		"provider":     "claudecode",
+	}, writeJSON)
+	waitForAgentEvent(t, &mu, &events, "ai.session.created", func(event map[string]interface{}) bool {
+		return event["session_id"] == "pretool_session"
+	})
+
+	_, runCancel := context.WithCancel(context.Background())
+	defer runCancel()
+	svc.ai.mu.Lock()
+	session := svc.ai.sessions["pretool_session"]
+	if session == nil {
+		svc.ai.mu.Unlock()
+		t.Fatal("pretool_session was not created")
+	}
+	session.cancel = runCancel
+	session.activeWriter = writeJSON
+	session.approvalToken = "token-pretool"
+	session.runSeq = 1
+	svc.ai.mu.Unlock()
+
+	type hookResult struct {
+		response map[string]interface{}
+		err      error
+	}
+	hookCtx, cancelHook := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelHook()
+	resultCh := make(chan hookResult, 1)
+	go func() {
+		response, err := svc.HandleAIApprovalHook(hookCtx, "pretool_session", "msg_pretool", "token-pretool", map[string]interface{}{
+			"hook_event_name": "PreToolUse",
+			"tool_name":       "Bash",
+			"tool_input": map[string]interface{}{
+				"command": "printf ok",
+			},
+		})
+		resultCh <- hookResult{response: response, err: err}
+	}()
+
+	approval := waitForAgentEvent(t, &mu, &events, "ai.approval.request", func(event map[string]interface{}) bool {
+		return event["session_id"] == "pretool_session" &&
+			remoteString(event, "message_id") == "assistant_msg_pretool" &&
+			remoteString(event, "kind") == models.AgentAIApprovalKindCommand &&
+			remoteString(event, "command") == "printf ok"
+	})
+	svc.DispatchLocalAI(map[string]interface{}{
+		"type":        "ai.approval.response",
+		"session_id":  "pretool_session",
+		"approval_id": remoteString(approval, "approval_id"),
+		"decision":    "accept",
+	}, writeJSON)
+
+	select {
+	case result := <-resultCh:
+		if result.err != nil {
+			t.Fatalf("HandleAIApprovalHook() error = %v", result.err)
+		}
+		hookOutput, _ := result.response["hookSpecificOutput"].(map[string]interface{})
+		if remoteString(hookOutput, "hookEventName") != "PreToolUse" {
+			t.Fatalf("hookEventName = %#v, want PreToolUse", hookOutput["hookEventName"])
+		}
 		if remoteString(hookOutput, "permissionDecision") != "allow" {
 			t.Fatalf("permissionDecision = %#v, want allow", hookOutput["permissionDecision"])
 		}
@@ -2244,7 +2429,7 @@ func TestClaudeCodeToolFallsBackToClaudeBinary(t *testing.T) {
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	tool, err := resolveNamedAgentAITool("claudecode", "你好", "", "")
+	tool, err := resolveNamedAgentAITool("claudecode", "你好", "", "", "")
 	if err != nil {
 		t.Fatalf("resolveNamedAgentAITool() error = %v", err)
 	}
@@ -2253,6 +2438,57 @@ func TestClaudeCodeToolFallsBackToClaudeBinary(t *testing.T) {
 	}
 	if !strings.Contains(strings.Join(tool.args, " "), "--output-format stream-json") {
 		t.Fatalf("claudecode args = %v, want stream-json output", tool.args)
+	}
+}
+
+// TestCodexEffortSuffixApplied locks in the codex reasoning-effort mechanism:
+// effort is conveyed to the codex CLI as a `<base>-<effort>` model-name suffix
+// (the downstream gateway derives reasoning_effort from it). The suffix is
+// applied AFTER normalization and never doubled.
+func TestCodexEffortSuffixApplied(t *testing.T) {
+	binDir := t.TempDir()
+	script := "#!/bin/sh\nprintf 'codex-ok\\n'\n"
+	codexPath := filepath.Join(binDir, "codex")
+	if runtime.GOOS == "windows" {
+		codexPath = filepath.Join(binDir, "codex.bat")
+		script = "@echo off\r\necho codex-ok\r\n"
+	}
+	if err := os.WriteFile(codexPath, []byte(script), 0o700); err != nil {
+		t.Fatalf("write fake codex: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	// 1) effort appended to base model.
+	tool, err := resolveNamedAgentAITool("codex", "你好", "gpt-5.4", "xhigh", "")
+	if err != nil {
+		t.Fatalf("resolveNamedAgentAITool() error = %v", err)
+	}
+	joined := strings.Join(tool.args, " ")
+	if !strings.Contains(joined, "--model gpt-5.4-xhigh") {
+		t.Fatalf("codex args = %v, want --model gpt-5.4-xhigh", tool.args)
+	}
+
+	// 2) double-suffix guard: a model already carrying a suffix is left alone.
+	tool2, err := resolveNamedAgentAITool("codex", "你好", "gpt-5.4-xhigh", "high", "")
+	if err != nil {
+		t.Fatalf("resolveNamedAgentAITool() error = %v", err)
+	}
+	joined2 := strings.Join(tool2.args, " ")
+	if strings.Contains(joined2, "gpt-5.4-xhigh-high") {
+		t.Fatalf("codex args = %v, suffix double-applied", tool2.args)
+	}
+	if !strings.Contains(joined2, "--model gpt-5.4-xhigh") {
+		t.Fatalf("codex args = %v, want --model gpt-5.4-xhigh (preserved)", tool2.args)
+	}
+
+	// 3) empty effort → no suffix (base model forwarded as-is).
+	tool3, err := resolveNamedAgentAITool("codex", "你好", "gpt-5.4", "", "")
+	if err != nil {
+		t.Fatalf("resolveNamedAgentAITool() error = %v", err)
+	}
+	joined3 := strings.Join(tool3.args, " ")
+	if !strings.Contains(joined3, "--model gpt-5.4") {
+		t.Fatalf("codex args = %v, want --model gpt-5.4", tool3.args)
 	}
 }
 

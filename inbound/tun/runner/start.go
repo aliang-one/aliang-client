@@ -80,7 +80,7 @@ func Start() {
 func startWithRollback(state *StartupState) error {
 	// Step 1: 添加设备状态监控
 	UpdateStartupProgress("starting", "monitoring_device", 10, "Starting TUN device monitoring.", "", false)
-	go monitorTunDevice(defaultConfig.Device)
+	startTunDeviceMonitor(defaultConfig.Device)
 	state.monitorStarted = true
 
 	// Step 2: 插入配置并启动 engine
@@ -179,7 +179,10 @@ func rollbackStartup(state *StartupState) {
 		logger.Debug("✓ Engine 停止成功")
 	}
 
-	// Note: 监控 goroutine 会在程序结束时自动终止，无需显式清理
+	if state.monitorStarted {
+		logger.Debug("回滚: 停止 TUN 设备监控")
+		stopTunDeviceMonitor()
+	}
 
 	logger.Debug("TUN 启动回滚完成")
 }

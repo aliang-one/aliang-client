@@ -11,6 +11,7 @@ import (
 
 func init() {
 	auth.SetAuthExpirationHandler(handleAuthExpired)
+	auth.SetAuthSuccessHandler(handleAuthRefreshed)
 }
 
 func handleAuthExpired() {
@@ -26,4 +27,13 @@ func handleAuthExpired() {
 		result := runService.StopService()
 		logger.Info(fmt.Sprintf("Proxy stop result after authentication expiration: %+v", result))
 	}
+}
+
+// handleAuthRefreshed fires after a successful token refresh (or login). The
+// access_token now carries a fresh exp; push it to PhoneServer over the live
+// agent WS so the server's recorded session expiry (userTokenExp) advances
+// without a reconnect. No-op when the agent isn't connected (the next connect
+// carries the current JWT via the user_token query param).
+func handleAuthRefreshed() {
+	GetSharedAgentService().PushSessionRefresh()
 }

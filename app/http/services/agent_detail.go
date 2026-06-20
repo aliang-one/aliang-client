@@ -42,6 +42,8 @@ func handleAgentDetailMessage(msg map[string]interface{}, writeJSON func(interfa
 		_ = writeJSON(agentFileListPayload(msg))
 	case models.AgentEventFileRead:
 		_ = writeJSON(agentFileReadPayload(msg))
+	case models.AgentEventSlashCommandsList:
+		_ = writeJSON(agentSlashCommandsListPayload(msg))
 	}
 }
 

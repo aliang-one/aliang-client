@@ -15,6 +15,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"aliang.one/nursorgate/app/http/models"
@@ -79,6 +80,18 @@ type AgentService struct {
 	wsConnected  bool
 	wsConnecting bool
 	wsConn       *websocket.Conn
+
+	// sessionRefreshSig is signalled (non-blocking) after a successful token
+	// refresh; the remote-agent session loop drains it and pushes the current
+	// access_token to PhoneServer as agent.session.refresh so the server's
+	// recorded userTokenExp stays current. All WS writes stay within the loop.
+	sessionRefreshSig chan struct{}
+
+	// remoteWriter holds the live remote-connection writer. AI (and terminal)
+	// events are emitted through currentRemoteWriter() rather than a closure
+	// captured at message-arrival time, so a reconnect reattaches in-flight AI
+	// runs to the new socket instead of streaming into a dead one.
+	remoteWriter atomic.Pointer[agentTerminalWriter]
 }
 
 type agentDeviceTokenRejectedError struct {
@@ -100,9 +113,10 @@ func GetSharedAgentService() *AgentService {
 
 func NewAgentService() *AgentService {
 	s := &AgentService{
-		client:   &http.Client{Timeout: agentHTTPTimeout},
-		terminal: newAgentTerminalManager(),
-		ai:       newAgentAIManager(),
+		client:            &http.Client{Timeout: agentHTTPTimeout},
+		terminal:          newAgentTerminalManager(),
+		ai:                newAgentAIManager(),
+		sessionRefreshSig: make(chan struct{}, 1),
 	}
 	if err := s.loadState(); err != nil {
 		logger.Warn(fmt.Sprintf("[AGENT-BOOT] state_load failed error=%v", err))
@@ -1129,6 +1143,28 @@ func effectiveAgentRegisterAuthHeader(authHeader string) string {
 		return trimmed
 	}
 	return strings.TrimSpace(auth.GetCurrentAuthorizationHeader())
+}
+
+// currentAccessToken returns the logged-in user's raw access_token (the HS256
+// JWT PhoneServer decodes for identity + exp), without the "Bearer " prefix.
+// Empty when no session is loaded.
+func (s *AgentService) currentAccessToken() string {
+	current := auth.GetCurrentUserInfoOrLoad()
+	if current == nil {
+		return ""
+	}
+	return strings.TrimSpace(current.AccessToken)
+}
+
+// PushSessionRefresh signals the remote-agent session loop to push the current
+// access_token to PhoneServer (agent.session.refresh). Non-blocking: if a push
+// is already pending or no loop is running, the signal is dropped. Invoked from
+// the auth-success handler after a token refresh.
+func (s *AgentService) PushSessionRefresh() {
+	select {
+	case s.sessionRefreshSig <- struct{}{}:
+	default:
+	}
 }
 
 func CanUseAdminConsoleAgentRegistration() bool {

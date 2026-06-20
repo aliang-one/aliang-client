@@ -74,3 +74,6 @@ release/*
 .gomodcache
 .gomodcache/*
 .gopath/*
+
+# CodeGraph 本地索引（生成物，不入库）
+.codegraph/

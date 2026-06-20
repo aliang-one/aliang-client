@@ -169,7 +169,7 @@ func quickSetupSoftwares() []models.QuickSetupSoftware {
 			Code:               "codex",
 			Name:               "Codex",
 			Description:        "Prepare Codex config.toml plus auth.json so the CLI can start with your chosen provider.",
-			SupportedProviders: []string{"openai"},
+			SupportedProviders: []string{"openai", "anthropic"},
 			Files: []models.QuickSetupSoftwareFile{
 				{
 					Code:        "config",

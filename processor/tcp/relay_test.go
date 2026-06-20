@@ -66,11 +66,11 @@ func TestShouldUseTrackedTeardownForGOOS(t *testing.T) {
 	}
 }
 
-func TestRelayStreamTrackedTeardownSkipsHalfCloseAndDeadline(t *testing.T) {
+func TestRelayStreamTrackedTeardownSkipsHalfCloseAndSetsDeadline(t *testing.T) {
 	manager := NewDefaultRelayManager()
 	dst := newRecordingRelayConn(nil)
 	src := newRecordingRelayConn([]byte("hello"))
-	tracker := newRelayCompletionTracker(dst, src)
+	tracker := newRelayCompletionTracker(src, dst)
 	metadata := &M.Metadata{ConnID: "tun-100"}
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -93,8 +93,39 @@ func TestRelayStreamTrackedTeardownSkipsHalfCloseAndDeadline(t *testing.T) {
 	if dst.closeWriteCount != 0 {
 		t.Fatalf("expected tracked teardown to skip CloseWrite, got %d", dst.closeWriteCount)
 	}
-	if dst.setReadDeadlineCount != 0 {
-		t.Fatalf("expected tracked teardown to skip SetReadDeadline, got %d", dst.setReadDeadlineCount)
+	if dst.setReadDeadlineCount != 1 {
+		t.Fatalf("expected tracked teardown to set opposite read deadline once, got %d", dst.setReadDeadlineCount)
+	}
+}
+
+func TestRelayStreamTUNDirectConservativeTeardownSetsDeadline(t *testing.T) {
+	manager := NewDefaultRelayManager()
+	dst := newRecordingRelayConn(nil)
+	src := newRecordingRelayConn([]byte("hello"))
+	metadata := &M.Metadata{ConnID: "tun-101", Route: "RouteDirect"}
+	var wg sync.WaitGroup
+	wg.Add(1)
+
+	done := make(chan struct{})
+	go func() {
+		manager.relayStream(dst, src, "client->server", &wg, nil, nil, nil, context.Background(), metadata, nil)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("relayStream did not complete")
+	}
+
+	if src.closeReadCount != 0 {
+		t.Fatalf("expected TUN direct teardown to skip CloseRead, got %d", src.closeReadCount)
+	}
+	if dst.closeWriteCount != 0 {
+		t.Fatalf("expected TUN direct teardown to skip CloseWrite, got %d", dst.closeWriteCount)
+	}
+	if dst.setReadDeadlineCount != 1 {
+		t.Fatalf("expected TUN direct teardown to set opposite read deadline once, got %d", dst.setReadDeadlineCount)
 	}
 }
 

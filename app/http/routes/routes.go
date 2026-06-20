@@ -139,6 +139,11 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	register("/api/auth/me", h.Auth.HandleMe, http.MethodGet)
 	register("/api/auth/logout", h.Auth.HandleLogout, http.MethodPost)
 
+	// Scan-to-login routes (扫码登录) — init/status/activate 全部登录前可用
+	register("/api/auth/scan/init", h.Auth.HandleScanInit, http.MethodPost)
+	register("/api/auth/scan/status", h.Auth.HandleScanStatus, http.MethodGet)
+	register("/api/auth/scan/activate", h.Auth.HandleScanActivate, http.MethodPost)
+
 	// Run mode routes (/api/run/*)
 	register("/api/run/start", h.Run.HandleRunStart, http.MethodPost)
 	register("/api/run/stop", h.Run.HandleRunStop, http.MethodPost)

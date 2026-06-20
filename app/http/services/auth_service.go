@@ -181,6 +181,88 @@ func (s *AuthService) GetUserInfo() map[string]interface{} {
 	}
 }
 
+// ScanInit 扫码登录初始化：向 official-website 申请 device_code + 二维码内容。
+func (s *AuthService) ScanInit() map[string]interface{} {
+	result, err := auth.ScanInit()
+	if err != nil {
+		logger.Error(fmt.Sprintf("Scan login init failed: %v", err))
+		return map[string]interface{}{
+			"status": "failed",
+			"error":  "scan_init_failed",
+			"msg":    fmt.Sprintf("Failed to init scan login: %v", err),
+		}
+	}
+	return map[string]interface{}{
+		"status": "success",
+		"data":   result,
+	}
+}
+
+// ScanStatus 按 device_code 轮询扫码状态。scan 阶段置于 data.status（pending/scanned/
+// authorized/denied/expired）；行不存在视为 expired（前端重生码）。
+func (s *AuthService) ScanStatus(deviceCode string) map[string]interface{} {
+	result, err := auth.ScanStatus(deviceCode)
+	if err != nil {
+		if errors.Is(err, auth.ErrScanCodeNotFound) {
+			return map[string]interface{}{
+				"status": "success",
+				"data":   map[string]interface{}{"status": "expired"},
+			}
+		}
+		logger.Warn(fmt.Sprintf("Scan login status failed: %v", err))
+		return map[string]interface{}{
+			"status": "failed",
+			"error":  "scan_status_failed",
+			"msg":    fmt.Sprintf("Failed to query scan status: %v", err),
+		}
+	}
+	return map[string]interface{}{
+		"status": "success",
+		"data":   result,
+	}
+}
+
+// ActivateScanLogin 用扫码拿到的 st_(session_token) + refresh_token 完成本地登录，
+// 返回结构与密码登录 Login 一致（data 为 UserInfoResponse、附带 agent_sync）。
+func (s *AuthService) ActivateScanLogin(sessionToken, refreshToken string) map[string]interface{} {
+	sessionToken = strings.TrimSpace(sessionToken)
+	refreshToken = strings.TrimSpace(refreshToken)
+	if sessionToken == "" {
+		return map[string]interface{}{
+			"status": "failed",
+			"error":  "session_token_required",
+			"msg":    "Session token cannot be empty",
+		}
+	}
+	if refreshToken == "" {
+		return map[string]interface{}{
+			"status": "failed",
+			"error":  "refresh_token_required",
+			"msg":    "Refresh token cannot be empty",
+		}
+	}
+
+	userInfo, err := auth.ActivateWithTokens(sessionToken, refreshToken)
+	if err != nil {
+		logger.Error(fmt.Sprintf("Scan login activation failed: %v", err))
+		return map[string]interface{}{
+			"status": "failed",
+			"error":  "scan_activate_failed",
+			"msg":    fmt.Sprintf("Failed to activate scan login: %v", err),
+		}
+	}
+
+	syncStartupStateForAuthenticatedUser(userInfo)
+	agentSync := agentSyncResult("scan_login")
+
+	return map[string]interface{}{
+		"status":     "success",
+		"msg":        "Scan login successful",
+		"data":       mapUserInfo(userInfo),
+		"agent_sync": agentSync,
+	}
+}
+
 // LogoutUser 登出用户
 func (s *AuthService) LogoutUser(refreshToken string) map[string]interface{} {
 	err := auth.LogoutSession(refreshToken)

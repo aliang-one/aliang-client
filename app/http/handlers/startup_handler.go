@@ -146,6 +146,7 @@ func getSuggestedActions(status runtime.StartupStatus) []string {
 	actions := map[runtime.StartupStatus][]string{
 		runtime.UNCONFIGURED: {
 			"POST /api/auth/login - Login with email/password",
+			"POST /api/auth/scan/init - Scan to sign in with the mobile app",
 			"GET /api/auth/session - Try local session restore",
 			"GET /api/startup/status - Check status again",
 		},

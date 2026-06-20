@@ -49,6 +49,16 @@ func (ub *URLBuilder) GetUserProfileURL() (string, error) {
 	return ub.getAndValidateURL(ub.cfg.GetUserProfileURL())
 }
 
+// GetAuthScanInitURL 扫码登录初始化（PC 换 device_code + 二维码 scan_code）。
+func (ub *URLBuilder) GetAuthScanInitURL() (string, error) {
+	return ub.getAndValidateURL(ub.cfg.GetAuthScanInitURL())
+}
+
+// GetAuthScanStatusURL 扫码登录状态轮询（按 device_code）。
+func (ub *URLBuilder) GetAuthScanStatusURL() (string, error) {
+	return ub.getAndValidateURL(ub.cfg.GetAuthScanStatusURL())
+}
+
 func (ub *URLBuilder) GetUserUpdateURL() (string, error) {
 	return ub.getAndValidateURL(ub.cfg.GetUserUpdateURL())
 }

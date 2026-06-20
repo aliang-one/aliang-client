@@ -188,6 +188,15 @@ func enrichAgentProject(project *models.AgentProject) {
 		if project.Branch == "" {
 			project.Branch = readGitHeadBranch(project.Path)
 		}
+		// Live dashboard metrics: report this run's project filesystem/git state on
+		// every snapshot (the inventoryTicker re-emits the project list ~1/min), so
+		// the mobile home card's Files/Changed reflect the real current project
+		// state without depending on an active vibe run. git ls-files = tracked file
+		// count (Files); git status --porcelain lines = uncommitted changes (Changed).
+		if tracked := countGitTrackedFiles(project.Path); tracked > 0 {
+			project.FileCount = tracked
+		}
+		project.GitChangedCount = countGitChanged(project.Path)
 	}
 	if project.Language == "" {
 		project.Language = detectAgentProjectLanguage(project.Path)

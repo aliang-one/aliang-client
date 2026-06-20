@@ -568,6 +568,17 @@ func (c *Config) GetUserProfileURL() string {
 	return fmt.Sprintf("%s/api/v1/user/profile", c.APIBaseURL())
 }
 
+// GetAuthScanInitURL 扫码登录：PC 端初始化（换取 device_code + 二维码 scan_code）。
+// 注意：官方后端的扫码路由挂在 /auth/scan/*（与 /api/v1/auth/* 同主机），不带 /api/v1 前缀。
+func (c *Config) GetAuthScanInitURL() string {
+	return fmt.Sprintf("%s/auth/scan/init", c.APIBaseURL())
+}
+
+// GetAuthScanStatusURL 扫码登录：PC 端按 device_code 轮询状态（authorized 时下发 st_ + refresh_token）。
+func (c *Config) GetAuthScanStatusURL() string {
+	return fmt.Sprintf("%s/auth/scan/status", c.APIBaseURL())
+}
+
 func (c *Config) GetUserUpdateURL() string {
 	return fmt.Sprintf("%s/api/v1/user", c.APIBaseURL())
 }

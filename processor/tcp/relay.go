@@ -41,12 +41,14 @@ type relayCompletionTracker struct {
 	clientToServerDone atomic.Bool
 	serverToClientDone atomic.Bool
 	closeOnce          sync.Once
+	waitTimeout        time.Duration
 }
 
 func newRelayCompletionTracker(originConn, remoteConn net.Conn) *relayCompletionTracker {
 	return &relayCompletionTracker{
-		originConn: originConn,
-		remoteConn: remoteConn,
+		originConn:  originConn,
+		remoteConn:  remoteConn,
+		waitTimeout: time.Duration(DefaultTCPWaitTimeout) * time.Second,
 	}
 }
 
@@ -65,6 +67,7 @@ func (t *relayCompletionTracker) markDone(direction, connID string) {
 	}
 
 	if !t.clientToServerDone.Load() || !t.serverToClientDone.Load() {
+		t.setOppositeReadDeadline(direction, connID)
 		logger.Debug(fmt.Sprintf(
 			"[RELAY] conn_id=%s tracked teardown dir=%s completed; waiting for opposite direction before closing both sides",
 			connID,
@@ -89,6 +92,23 @@ func (t *relayCompletionTracker) markDone(direction, connID string) {
 			}
 		}
 	})
+}
+
+func (t *relayCompletionTracker) setOppositeReadDeadline(direction, connID string) {
+	if t == nil {
+		return
+	}
+
+	var conn net.Conn
+	switch direction {
+	case "client->server":
+		conn = t.remoteConn
+	case "server->client":
+		conn = t.originConn
+	default:
+		return
+	}
+	setRelayReadDeadline(conn, t.waitTimeout, connID, "tracked teardown "+direction)
 }
 
 // NewDefaultRelayManager creates a new relay manager
@@ -236,6 +256,10 @@ func (r *DefaultRelayManager) relayStream(
 	}
 
 	if shouldUseConservativeTeardown(metadata) {
+		if shouldUseTUNDeadlineOnlyTeardown(metadata) {
+			setRelayReadDeadline(dst, time.Duration(DefaultTCPWaitTimeout)*time.Second, connID, "tun direct "+direction)
+			return
+		}
 		logger.Debug(fmt.Sprintf("[RELAY] conn_id=%s conservative teardown [%s]: skipping half-close/deadline for route=%s",
 			connID, direction, safeRoute(metadata)))
 		return
@@ -259,10 +283,7 @@ func (r *DefaultRelayManager) relayStream(
 	}
 
 	// Set a read deadline so we don't wait forever for the other side to close
-	logger.Debug(fmt.Sprintf("[RELAY] conn_id=%s set deadline dir=%s dst_type=%T timeout=%ds", connID, direction, dst, DefaultTCPWaitTimeout))
-	if err := dst.SetReadDeadline(time.Now().Add(time.Duration(DefaultTCPWaitTimeout) * time.Second)); err != nil && !isConnectionClosedByPeer(err) {
-		logger.Debug(fmt.Sprintf("[RELAY] conn_id=%s set deadline failed dir=%s err=%v", connID, direction, err))
-	}
+	setRelayReadDeadline(dst, time.Duration(DefaultTCPWaitTimeout)*time.Second, connID, direction)
 }
 
 func safeRoute(metadata *M.Metadata) string {
@@ -286,6 +307,10 @@ func shouldUseConservativeTeardown(metadata *M.Metadata) bool {
 	return metadata.Route == "RouteDirect"
 }
 
+func shouldUseTUNDeadlineOnlyTeardown(metadata *M.Metadata) bool {
+	return shouldUseConservativeTeardown(metadata) && isTUNConnection(metadata)
+}
+
 func shouldUseTrackedTeardown(metadata *M.Metadata) bool {
 	return shouldUseTrackedTeardownForGOOS(runtime.GOOS, metadata)
 }
@@ -294,7 +319,24 @@ func shouldUseTrackedTeardownForGOOS(goos string, metadata *M.Metadata) bool {
 	if goos != "windows" || metadata == nil {
 		return false
 	}
+	return isTUNConnection(metadata)
+}
+
+func isTUNConnection(metadata *M.Metadata) bool {
+	if metadata == nil {
+		return false
+	}
 	return strings.HasPrefix(strings.TrimSpace(metadata.ConnID), "tun-")
+}
+
+func setRelayReadDeadline(conn net.Conn, timeout time.Duration, connID, direction string) {
+	if conn == nil || timeout <= 0 {
+		return
+	}
+	logger.Debug(fmt.Sprintf("[RELAY] conn_id=%s set deadline dir=%s conn_type=%T timeout=%s", connID, direction, conn, timeout))
+	if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil && !isConnectionClosedByPeer(err) {
+		logger.Debug(fmt.Sprintf("[RELAY] conn_id=%s set deadline failed dir=%s err=%v", connID, direction, err))
+	}
 }
 
 func describeConn(conn net.Conn) string {

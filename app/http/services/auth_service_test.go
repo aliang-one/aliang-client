@@ -92,3 +92,14 @@ func TestAuthServiceRestoreSession_ReturnsSessionExpiredWhenRefreshTokenInvalid(
 		t.Fatal("expected shared run service to be marked stopped after session expiration")
 	}
 }
+
+func TestAuthServiceActivateScanLogin_RejectsMissingRefreshToken(t *testing.T) {
+	result := NewAuthService().ActivateScanLogin("scan-session-token", " ")
+
+	if got := result["status"]; got != "failed" {
+		t.Fatalf("status = %#v, want failed", got)
+	}
+	if got := result["error"]; got != "refresh_token_required" {
+		t.Fatalf("error = %#v, want refresh_token_required", got)
+	}
+}

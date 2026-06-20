@@ -89,6 +89,7 @@ type AgentProject struct {
 	DetectedPorts   []int    `json:"detected_ports,omitempty"`
 	Files           []string `json:"files,omitempty"`
 	FileCount       int      `json:"file_count,omitempty"`
+	GitChangedCount int      `json:"git_changed_count,omitempty"`
 	TotalSize       int64    `json:"total_size,omitempty"`
 	Readme          string   `json:"readme,omitempty"`
 	LastActiveAt    string   `json:"last_active_at,omitempty"`

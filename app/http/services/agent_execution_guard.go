@@ -40,7 +40,22 @@ const (
 	agentAIOutputRateWindow = 5 * time.Second
 	agentAIOutputRateBytes  = 16 * 1024 * 1024
 	agentAIOutputCapBytes   = 256 * 1024 * 1024
-	agentAIRunTimeout       = 30 * time.Minute
+
+	// AI run liveness. A run is kept alive while it produces output OR while it
+	// is awaiting a human approval decision. A run that goes silent (no stdout)
+	// for longer than agentAIIdleWindow AND is not awaiting approval is stopped
+	// as idle. agentAIHardCeiling is a runaway backstop that fires regardless of
+	// activity. Approvals themselves have no wall-clock limit: they are cancelled
+	// only when the enclosing dialogue/session terminates or the agent goes
+	// offline (see agent_ai.go startAIWatchdog / clearPendingApprovalsLocked).
+	agentAIIdleWindow        = 10 * time.Minute
+	agentAIHardCeiling       = 4 * time.Hour
+	agentAIIdleCheckInterval = 30 * time.Second
+
+	// agentAIRunProgressInterval is how often an active run emits ai.run.progress
+	// (files touched so far + git working-tree changes) so the mobile dashboard
+	// card updates live instead of only at ai.done.
+	agentAIRunProgressInterval = 10 * time.Second
 
 	// agentAIHistoryCaptureMaxBytes bounds the assistant output retained for
 	// session history/replay. Client streaming is governed separately by the

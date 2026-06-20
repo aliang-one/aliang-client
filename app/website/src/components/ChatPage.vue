@@ -215,15 +215,37 @@
       <!-- Input -->
       <div v-if="activeId" class="border-t border-slate-200 p-4 dark:border-slate-700">
         <div class="flex items-center gap-2">
-          <input
-            ref="inputRef"
-            v-model="inputText"
-            type="text"
-            :placeholder="t('chat_placeholder')"
-            :disabled="sending"
-            class="h-10 flex-1 rounded-lg border border-slate-200 bg-white px-3 text-sm text-slate-700 outline-none transition focus:border-primary dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100"
-            @keydown.enter.prevent="sendMessage"
-          />
+          <div class="relative flex-1">
+            <div
+              v-if="slashOpen && slashMatches.length"
+              class="absolute bottom-full left-0 z-20 mb-2 max-h-60 w-full overflow-auto rounded-lg border border-slate-200 bg-white shadow-lg dark:border-slate-600 dark:bg-slate-800"
+            >
+              <button
+                v-for="(c, i) in slashMatches"
+                :key="c.name"
+                type="button"
+                class="flex w-full items-baseline gap-2 px-3 py-2 text-left text-sm transition hover:bg-primary/10"
+                :class="i === slashIndex ? 'bg-primary/10' : ''"
+                @click="applySlash(c)"
+                @mouseenter="slashIndex = i"
+              >
+                <span class="font-mono font-medium text-primary">/{{ c.name }}</span>
+                <span v-if="c.arg_hint" class="font-mono text-xs text-slate-400">{{ c.arg_hint }}</span>
+                <span class="truncate text-xs text-slate-500 dark:text-slate-400">{{ c.description }}</span>
+              </button>
+            </div>
+            <input
+              ref="inputRef"
+              v-model="inputText"
+              type="text"
+              :placeholder="t('chat_placeholder')"
+              :disabled="sending"
+              class="h-10 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm text-slate-700 outline-none transition focus:border-primary dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100"
+              @input="onSlashInput"
+              @keydown="onInputKeydown"
+              @blur="closeSlashDeferred"
+            />
+          </div>
           <button
             type="button"
             class="h-10 rounded-lg bg-primary px-4 text-sm font-semibold text-white transition hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-60"
@@ -283,6 +305,41 @@ const activeRunning = computed(() => {
     if (msgs[i].role === 'assistant') return msgs[i].status === 'running';
   }
   return false;
+});
+
+// --- Slash command autocomplete (provider-aware) ---
+// The `/` popup is backed by slash.commands.list over the same AI stream socket
+// the chat already uses. Commands are cached per provider (claude vs codex) so a
+// claude conversation never surfaces codex's builtins and vice-versa.
+const slashCommandsByProvider = ref({});
+const slashOpen = ref(false);
+const slashIndex = ref(0);
+const slashPending = {};
+
+function slashProviderOf(conv) {
+  const p = String(conv?.provider || 'claudecode').toLowerCase();
+  return p === 'codex' ? 'codex' : 'claude';
+}
+
+const slashActiveProvider = computed(() => slashProviderOf(activeConversation.value));
+
+// The in-progress command token (text after the leading `/`, before any space),
+// or null when the input is not a slash invocation. An empty string means the
+// user typed exactly `/` — show the full list.
+function slashToken(text) {
+  if (!text.startsWith('/')) return null;
+  const rest = text.slice(1);
+  if (/\s/.test(rest)) return null; // args started -> stop suggesting
+  return rest.toLowerCase();
+}
+
+const slashMatches = computed(() => {
+  if (!slashOpen.value) return [];
+  const q = slashToken(inputText.value);
+  if (q === null) return [];
+  const list = slashCommandsByProvider.value[slashActiveProvider.value] || [];
+  const filtered = q === '' ? list : list.filter(c => String(c.name || '').toLowerCase().startsWith(q));
+  return filtered.slice(0, 20);
 });
 
 function generateId() {
@@ -449,6 +506,87 @@ function sendAI(payload) {
     return true;
   }
   return false;
+}
+
+// Ask the agent for the active provider's `/`-command surface. Cached per
+// provider so we only round-trip once; a second call while pending is a no-op.
+async function ensureSlashCommands() {
+  const provider = slashActiveProvider.value;
+  if (slashCommandsByProvider.value[provider] || slashPending[provider]) return;
+  slashPending[provider] = true;
+  try {
+    await ensureAISocket();
+    sendAI({
+      type: 'slash.commands.list',
+      request_id: 'slash-' + provider,
+      project_path: activeConversation.value?.projectPath || '',
+      provider,
+    });
+  } catch (_) {
+    // socket unavailable: leave uncached so a later retry can fill it in
+    slashPending[provider] = false;
+  }
+}
+
+function onSlashInput() {
+  const token = slashToken(inputText.value);
+  if (token === null) {
+    slashOpen.value = false;
+    return;
+  }
+  ensureSlashCommands();
+  slashOpen.value = true;
+  slashIndex.value = 0;
+}
+
+function applySlash(cmd) {
+  if (!cmd) return;
+  const name = String(cmd.name || '').trim();
+  if (!name) return;
+  // Insert `/name ` and let the user append arguments. (For Codex the app-server
+  // does not execute slash commands, so this is the most we can do — the token is
+  // forwarded as text. For Claude the CLI likewise receives it as a prompt.)
+  inputText.value = '/' + name + ' ';
+  slashOpen.value = false;
+  nextTick(() => inputRef.value?.focus());
+}
+
+// Close the popup shortly after the input loses focus so a click on a popup
+// item still registers (mousedown fires before blur).
+function closeSlashDeferred() {
+  setTimeout(() => { slashOpen.value = false; }, 150);
+}
+
+// Unified keydown so the popup can intercept arrows/enter/tab/escape before the
+// send-on-enter binding fires.
+function onInputKeydown(e) {
+  const matches = slashMatches.value;
+  if (slashOpen.value && matches.length) {
+    if (e.key === 'ArrowDown') {
+      slashIndex.value = (slashIndex.value + 1) % matches.length;
+      e.preventDefault();
+      return;
+    }
+    if (e.key === 'ArrowUp') {
+      slashIndex.value = (slashIndex.value - 1 + matches.length) % matches.length;
+      e.preventDefault();
+      return;
+    }
+    if (e.key === 'Enter' || e.key === 'Tab') {
+      applySlash(matches[slashIndex.value] || matches[0]);
+      e.preventDefault();
+      return;
+    }
+    if (e.key === 'Escape') {
+      slashOpen.value = false;
+      e.preventDefault();
+      return;
+    }
+  }
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    sendMessage();
+  }
 }
 
 function findRunningAssistant(conv) {
@@ -659,6 +797,24 @@ function finishRun(conv) {
 
 function handleAIEvent(e) {
   if (!e || !e.type) return;
+
+  // Slash-command discovery results are not tied to a conversation session; cache
+  // them by provider before the conversation-targeting logic below.
+  if (e.type === 'slash.commands.list.result') {
+    const provider = e.provider === 'codex' ? 'codex' : 'claude';
+    slashPending[provider] = false;
+    slashCommandsByProvider.value = {
+      ...slashCommandsByProvider.value,
+      [provider]: Array.isArray(e.commands) ? e.commands : [],
+    };
+    return;
+  }
+  if (e.type === 'slash.commands.list.error') {
+    const provider = e.provider === 'codex' ? 'codex' : 'claude';
+    slashPending[provider] = false;
+    slashCommandsByProvider.value = { ...slashCommandsByProvider.value, [provider]: [] };
+    return;
+  }
 
   let conv = e.session_id ? conversations.value.find(c => c.aiSessionId === e.session_id) : null;
   // Fallback: a run started from this page always targets the active

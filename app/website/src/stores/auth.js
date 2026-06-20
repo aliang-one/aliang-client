@@ -1,5 +1,10 @@
 import { computed, reactive, readonly, toRefs } from 'vue';
-import { login as loginRequest, logout as logoutRequest, restoreSession as restoreSessionRequest } from '../services/authApi';
+import {
+  login as loginRequest,
+  logout as logoutRequest,
+  restoreSession as restoreSessionRequest,
+  activateScanLogin as activateScanLoginRequest
+} from '../services/authApi';
 import { useI18n } from '../i18n';
 
 const state = reactive({
@@ -164,6 +169,35 @@ export async function loginWithPassword(credentials) {
   }
 }
 
+export async function completeScanLogin({ sessionToken, refreshToken }) {
+  const { t } = useI18n();
+
+  state.loginPending = true;
+  state.loginError = '';
+  state.lastActionMessage = '';
+
+  try {
+    const result = await activateScanLoginRequest({ sessionToken, refreshToken });
+    if (result.status !== 'success' || !result.data) {
+      throw new Error(result.message || t('auth_loginFailed'));
+    }
+
+    applyAuthenticatedState(result.data, result.message || t('auth_loginSuccess'));
+    state.isReady = true;
+    return true;
+  } catch (error) {
+    state.user = null;
+    state.isAuthenticated = false;
+    state.status = 'unauthenticated';
+    state.loginError = error instanceof Error ? error.message : t('auth_loginFailed');
+    state.lastActionMessage = '';
+    state.isReady = true;
+    return false;
+  } finally {
+    state.loginPending = false;
+  }
+}
+
 export async function logoutUser() {
   if (state.logoutPending) {
     return;
@@ -221,6 +255,7 @@ export function useAuthStore() {
     authNotice,
     restoreAuthSession,
     loginWithPassword,
+    completeScanLogin,
     logoutUser,
     mergeAuthUser
   };

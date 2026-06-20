@@ -14,6 +14,13 @@ type LogoutRequest struct {
 	RefreshToken string `json:"refresh_token,omitempty"`
 }
 
+// ScanActivateRequest 扫码登录激活请求：authorized 状态下 PC 从轮询结果中拿到
+// session_token(st_) + refresh_token(sub2api)，提交此接口完成与密码登录等价的本地登录。
+type ScanActivateRequest struct {
+	SessionToken string `json:"session_token,omitempty"`
+	RefreshToken string `json:"refresh_token,omitempty"`
+}
+
 // UserInfoResponse 用户信息响应
 type UserInfoResponse struct {
 	ID             int64   `json:"id"`

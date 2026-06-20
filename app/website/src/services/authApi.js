@@ -53,3 +53,30 @@ export async function logout() {
     body: JSON.stringify({})
   });
 }
+
+// 扫码登录：初始化，换取 device_code + 二维码内容(qr_payload)。
+export async function scanInit() {
+  return request('/api/auth/scan/init', {
+    method: 'POST',
+    body: JSON.stringify({})
+  });
+}
+
+// 扫码登录：按 device_code 轮询状态。authorized 时 data 含 session_token + refresh_token。
+export async function scanStatus(deviceCode) {
+  const query = new URLSearchParams({ device_code: deviceCode }).toString();
+  return request(`/api/auth/scan/status?${query}`, {
+    method: 'GET'
+  });
+}
+
+// 扫码登录：用 st_(session_token) + refresh_token 完成本地激活，返回与密码登录同构的用户信息。
+export async function activateScanLogin({ sessionToken, refreshToken }) {
+  return request('/api/auth/scan/activate', {
+    method: 'POST',
+    body: JSON.stringify({
+      session_token: sessionToken,
+      refresh_token: refreshToken
+    })
+  });
+}

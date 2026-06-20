@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"aliang.one/nursorgate/common/logger"
@@ -18,6 +19,11 @@ import (
 var defaultConfig config.EngineConf
 var defaultGateway string
 
+var (
+	tunMonitorMu     sync.Mutex
+	tunMonitorCancel context.CancelFunc
+)
+
 const (
 	tunInterfaceAddress = "10.0.0.1"
 	tunRouteGateway     = "10.0.0.2"
@@ -25,6 +31,8 @@ const (
 
 func stopTun() {
 	logger.Info("Stopping TUN service...")
+
+	stopTunDeviceMonitor()
 
 	// 1. 停止 HTTP 代理
 	logger.Info("Stopping HTTP proxy server...")
@@ -241,24 +249,53 @@ func SetDefaultGateway(gateway string) error {
 	return nil
 }
 
+func startTunDeviceMonitor(ifname string) {
+	tunMonitorMu.Lock()
+	if tunMonitorCancel != nil {
+		tunMonitorCancel()
+		tunMonitorCancel = nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	tunMonitorCancel = cancel
+	tunMonitorMu.Unlock()
+
+	go monitorTunDevice(ctx, ifname)
+}
+
+func stopTunDeviceMonitor() {
+	tunMonitorMu.Lock()
+	cancel := tunMonitorCancel
+	tunMonitorCancel = nil
+	tunMonitorMu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+}
+
 // monitorTunDevice 监控 TUN 设备状态
-func monitorTunDevice(ifname string) {
+func monitorTunDevice(ctx context.Context, ifname string) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
 	var memStats runtime.MemStats
-	for range ticker.C {
-		// 检查设备状态
-		if err := checkTunDeviceStatus(ifname); err != nil {
-			logger.Warn(fmt.Sprintf("TUN 设备状态异常: %v", err))
-		}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			// 检查设备状态
+			if err := checkTunDeviceStatus(ifname); err != nil {
+				logger.Warn(fmt.Sprintf("TUN 设备状态异常: %v", err))
+			}
 
-		// 获取内存统计
-		runtime.ReadMemStats(&memStats)
-		// 打印系统信息
-		logger.Debug(fmt.Sprintf("系统信息 - Goroutines: %d, 内存使用: %v MB",
-			runtime.NumGoroutine(),
-			memStats.Alloc/1024/1024))
+			// 获取内存统计
+			runtime.ReadMemStats(&memStats)
+			// 打印系统信息
+			logger.Debug(fmt.Sprintf("系统信息 - Goroutines: %d, 内存使用: %v MB",
+				runtime.NumGoroutine(),
+				memStats.Alloc/1024/1024))
+		}
 	}
 }
 

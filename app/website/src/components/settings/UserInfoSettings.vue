@@ -27,7 +27,27 @@
         {{ authNotice }}
       </div>
 
-      <form v-if="!isAuthenticated" class="mx-auto max-w-sm space-y-4 py-4" @submit.prevent="submitLogin">
+      <div v-if="!isAuthenticated" class="mx-auto max-w-sm py-4">
+        <div class="mb-4 grid grid-cols-2 gap-1 rounded-lg border border-slate-200 bg-slate-50/80 p-1 dark:border-slate-800 dark:bg-slate-900/50">
+          <button
+            type="button"
+            class="rounded-md px-3 py-1.5 text-xs font-semibold transition"
+            :class="loginMode === 'password' ? 'bg-primary text-white shadow-sm' : 'text-slate-600 hover:text-slate-900 dark:text-slate-300 dark:hover:text-white'"
+            @click="loginMode = 'password'"
+          >
+            {{ t('scan_tabPassword') }}
+          </button>
+          <button
+            type="button"
+            class="rounded-md px-3 py-1.5 text-xs font-semibold transition"
+            :class="loginMode === 'scan' ? 'bg-primary text-white shadow-sm' : 'text-slate-600 hover:text-slate-900 dark:text-slate-300 dark:hover:text-white'"
+            @click="loginMode = 'scan'"
+          >
+            {{ t('scan_tabScan') }}
+          </button>
+        </div>
+
+      <form v-if="loginMode === 'password'" class="space-y-4" @submit.prevent="submitLogin">
         <div class="rounded-xl border border-slate-200 bg-slate-50/80 p-5 dark:border-slate-800 dark:bg-slate-900/50">
           <div class="flex flex-col items-center gap-3 text-center">
             <div class="flex size-12 items-center justify-center rounded-full bg-primary/10">
@@ -95,6 +115,9 @@
           {{ t('user_loginHint') }}
         </p>
       </form>
+
+      <ScanLoginPanel v-else @success="handleScanSuccess" />
+      </div>
 
       <template v-else>
         <div v-if="loadError" class="mb-4 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700 dark:border-rose-900 dark:bg-rose-950/30 dark:text-rose-300">
@@ -511,6 +534,7 @@ import {
   redeemUserCenterCode,
   updateUserCenterProfile
 } from '../../services/userCenterApi';
+import ScanLoginPanel from './ScanLoginPanel.vue';
 
 const { t } = useI18n();
 const API_KEY_DOCS_PATH = '/docs/sub2api-apikey-api-reference.md';
@@ -518,6 +542,7 @@ const API_KEYS_PAGE_SIZE = 3;
 
 const email = ref('');
 const password = ref('');
+const loginMode = ref('password'); // 'password' | 'scan'
 const usernameDraft = ref('');
 const redeemCode = ref('');
 const isRefreshing = ref(false);
@@ -613,6 +638,11 @@ async function submitLogin() {
     password.value = '';
     await refreshAll();
   }
+}
+
+// 扫码登录成功：清掉密码框（安全），其余由 watch(isAuthenticated) 触发 refreshAll。
+function handleScanSuccess() {
+  password.value = '';
 }
 
 async function handleLogout() {

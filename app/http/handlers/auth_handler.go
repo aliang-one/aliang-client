@@ -73,6 +73,48 @@ func (h *AuthHandler) HandleMe(w http.ResponseWriter, r *http.Request) {
 	common.Success(w, result)
 }
 
+// HandleScanInit 扫码登录初始化
+// POST /api/auth/scan/init
+func (h *AuthHandler) HandleScanInit(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
+		return
+	}
+
+	result := h.authService.ScanInit()
+	common.Success(w, result)
+}
+
+// HandleScanStatus 扫码登录状态轮询
+// GET /api/auth/scan/status?device_code=<PC密钥>
+func (h *AuthHandler) HandleScanStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
+		return
+	}
+
+	result := h.authService.ScanStatus(r.URL.Query().Get("device_code"))
+	common.Success(w, result)
+}
+
+// HandleScanActivate 扫码登录激活（用 st_ + refresh_token 完成本地登录）
+// POST /api/auth/scan/activate
+func (h *AuthHandler) HandleScanActivate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
+		return
+	}
+
+	var req models.ScanActivateRequest
+	if err := common.DecodeRequest(r, &req); err != nil {
+		common.ErrorBadRequest(w, "Invalid request format", nil)
+		return
+	}
+
+	result := h.authService.ActivateScanLogin(req.SessionToken, req.RefreshToken)
+	common.Success(w, result)
+}
+
 // HandleLogout 处理登出请求
 // POST /api/auth/logout
 func (h *AuthHandler) HandleLogout(w http.ResponseWriter, r *http.Request) {

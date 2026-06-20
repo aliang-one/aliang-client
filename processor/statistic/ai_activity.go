@@ -15,8 +15,9 @@ const (
 	// DefaultAIActivityConnectionSweepAge is the backstop age at which a tracked
 	// AI connection entry is reclaimed even if CompleteMetadata was never called
 	// (e.g. the relay panicked or an early-return skipped it). It is deliberately
-	// much larger than a single AI run (agentAIRunTimeout) and the visibility
-	// window, so it can never reap a connection that is still actively streaming.
+	// much larger than the AI runaway backstop (agentAIHardCeiling) and the
+	// visibility window, so it can never reap a connection that is still actively
+	// streaming.
 	DefaultAIActivityConnectionSweepAge = time.Hour
 )
 
@@ -26,21 +27,21 @@ var (
 )
 
 type AIActivityTracker struct {
-	mu               sync.RWMutex
-	ttl              time.Duration
-	visibilityWindow time.Duration
+	mu                 sync.RWMutex
+	ttl                time.Duration
+	visibilityWindow   time.Duration
 	connectionSweepAge time.Duration
-	detections       map[string]*AIActivityDetection
-	connections      map[string]*trackedAIConnection
-	totalHits        int64
-	latestSeenAt     time.Time
-	latestProvider   string
-	latestLabel      string
-	latestDomain     string
-	latestHost       string
-	latestSource     string
-	latestRoute      string
-	latestMatchedVia string
+	detections         map[string]*AIActivityDetection
+	connections        map[string]*trackedAIConnection
+	totalHits          int64
+	latestSeenAt       time.Time
+	latestProvider     string
+	latestLabel        string
+	latestDomain       string
+	latestHost         string
+	latestSource       string
+	latestRoute        string
+	latestMatchedVia   string
 }
 
 type trackedAIConnection struct {
