@@ -35,6 +35,7 @@ const (
 	agentStatusEnabled  = "enabled"
 
 	agentStateFilename     = "agent_state.json"
+	agentIdentityFilename  = "device_identity.json"
 	agentDefaultLaunchMode = "external_terminal"
 	agentHTTPTimeout       = 8 * time.Second
 	agentStatusSyncPath    = "/api/agent/status"
@@ -43,9 +44,6 @@ const (
 	AgentForwardedAuthorizationHeader = "X-Aliang-User-Authorization"
 	AgentForwardedUserKeyHeader       = "X-Aliang-User-Key"
 	AgentUserKeyHeader                = "X-Aliang-User-Key"
-	AgentUserEmailHeader              = "X-Aliang-User-Email"
-	AgentUsernameHeader               = "X-Aliang-Username"
-	AgentUserRoleHeader               = "X-Aliang-User-Role"
 )
 
 var (
@@ -72,6 +70,7 @@ type agentState struct {
 type AgentService struct {
 	mu       sync.Mutex
 	state    agentState
+	identity *agentDeviceIdentity
 	client   *http.Client
 	terminal *agentTerminalManager
 	ai       *agentAIManager
@@ -576,15 +575,13 @@ func (s *AgentService) resolveDeviceIDLocked() string {
 }
 
 func (s *AgentService) ensureDeviceIdentityLocked() {
-	changed := false
-	if strings.TrimSpace(s.state.DeviceID) == "" {
-		s.state.DeviceID = "dev-" + uuid.NewString()
-		changed = true
-	}
-	if strings.TrimSpace(s.state.UniqueCode) == "" {
-		s.state.UniqueCode = newAgentUniqueDeviceCode()
-		changed = true
-	}
+	beforeID := s.state.DeviceID
+	beforeUC := s.state.UniqueCode
+	// The device identity is permanent and client-owned: resolve it from the
+	// dedicated identity file (creating it once if needed) and pin it into
+	// state, never generating or adopting a server-provided id here.
+	s.pinPermanentDeviceIDLocked()
+	changed := s.state.DeviceID != beforeID || s.state.UniqueCode != beforeUC
 	if s.state.Device != nil {
 		if strings.TrimSpace(s.state.Device.ID) == "" {
 			s.state.Device.ID = s.state.DeviceID
@@ -658,6 +655,109 @@ func (s *AgentService) saveStateLocked() error {
 		return err
 	}
 	return os.WriteFile(path, raw, 0o600)
+}
+
+// agentDeviceIdentity is the installation-permanent device identity: the
+// device_id and its pairing unique_code. It is generated ONCE, persisted to a
+// dedicated file (device_identity.json), and never mutated afterwards — not by
+// server responses, not by auth/user-session changes, not by registration
+// conflicts. It is the single source of truth for who this device is.
+type agentDeviceIdentity struct {
+	DeviceID   string `json:"device_id"`
+	UniqueCode string `json:"unique_code"`
+	CreatedAt  string `json:"created_at,omitempty"`
+}
+
+func agentIdentityPath() (string, error) {
+	statePath, err := agentStatePath()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(filepath.Dir(statePath), agentIdentityFilename), nil
+}
+
+func loadAgentDeviceIdentity() agentDeviceIdentity {
+	path, err := agentIdentityPath()
+	if err != nil {
+		return agentDeviceIdentity{}
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return agentDeviceIdentity{}
+	}
+	var id agentDeviceIdentity
+	if err := json.Unmarshal(raw, &id); err != nil {
+		return agentDeviceIdentity{}
+	}
+	return id
+}
+
+// saveAgentDeviceIdentity writes the identity atomically (temp file + rename)
+// so a torn write can never corrupt the permanent identity.
+func saveAgentDeviceIdentity(id agentDeviceIdentity) error {
+	path, err := agentIdentityPath()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	raw, err := json.MarshalIndent(id, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// permanentDeviceIdentityLocked resolves the installation's device identity
+// from its dedicated file, generating it once if absent. On first encounter
+// after an upgrade (file missing) it ADOPTS any device_id already present in
+// session state so the server-registered id is preserved rather than
+// regenerated. The result is cached for the process lifetime. Callers must
+// hold s.mu.
+func (s *AgentService) permanentDeviceIdentityLocked() agentDeviceIdentity {
+	if s.identity != nil {
+		return *s.identity
+	}
+	id := loadAgentDeviceIdentity()
+	if strings.TrimSpace(id.DeviceID) == "" {
+		if existing := strings.TrimSpace(s.state.DeviceID); existing != "" {
+			// Migration: promote the existing session device_id to the permanent
+			// identity instead of minting a new one.
+			id.DeviceID = existing
+			id.UniqueCode = firstNonEmpty(strings.TrimSpace(s.state.UniqueCode), newAgentUniqueDeviceCode())
+		} else {
+			id.DeviceID = "dev-" + uuid.NewString()
+			id.UniqueCode = newAgentUniqueDeviceCode()
+		}
+		if strings.TrimSpace(id.CreatedAt) == "" {
+			id.CreatedAt = time.Now().UTC().Format(time.RFC3339)
+		}
+		if err := saveAgentDeviceIdentity(id); err != nil {
+			logger.Warn(fmt.Sprintf("[AGENT-BOOT] persist_device_identity failed error=%v", err))
+		}
+	}
+	s.identity = &id
+	return id
+}
+
+// pinPermanentDeviceIDLocked re-asserts the permanent device identity over the
+// in-memory session state and (if present) the device record, discarding any
+// device_id a remote exchange may have written. The device_id is owned by the
+// client and must never be overridden by the server. Callers must hold s.mu.
+func (s *AgentService) pinPermanentDeviceIDLocked() {
+	id := s.permanentDeviceIdentityLocked()
+	s.state.DeviceID = id.DeviceID
+	s.state.UniqueCode = id.UniqueCode
+	if s.state.Device != nil {
+		s.state.Device.ID = id.DeviceID
+		s.state.Device.DeviceID = id.DeviceID
+		s.state.Device.UniqueCode = id.UniqueCode
+	}
 }
 
 type agentLaunchSpec struct {
@@ -854,14 +954,18 @@ func (s *AgentService) registerAndSyncLockedWithUserContext(authHeader string, u
 	raw, err := s.callAgentServer(http.MethodPost, endpoint, payload, authHeader)
 	if err != nil {
 		if isDeviceIDAlreadyBoundError(err) {
-			s.rotateDeviceIdentityLocked()
-			payload = buildAgentRegisterPayload(s.state.DeviceID, s.state.UniqueCode)
-			logger.Info(fmt.Sprintf("[AGENT-BOOT] register_sync retry endpoint=%s device_id=%s unique_code=%s reason=device_id_already_bound",
-				sanitizeAgentEndpoint(endpoint),
-				s.state.DeviceID,
-				s.state.UniqueCode,
-			))
-			raw, err = s.callAgentServer(http.MethodPost, endpoint, payload, authHeader)
+			// The device_id is permanent and client-owned: never rotate it. The
+			// server already holds a binding for this id; surface a conflict so
+			// the operator can resolve it (unbind / re-login) instead of
+			// fragmenting device history with a fresh id.
+			s.pinPermanentDeviceIDLocked()
+			s.state.Registered = false
+			s.state.RemoteConnected = false
+			s.state.LastSyncStatus = "device_id_conflict"
+			s.state.LastSyncMessage = "Device id is already bound on the agent server."
+			logger.Warn(fmt.Sprintf("[AGENT-BOOT] register_sync device_id_conflict keeping_device_id device_id=%s", s.state.DeviceID))
+			_ = s.saveStateLocked()
+			return err
 		}
 	}
 	if err != nil {
@@ -880,8 +984,12 @@ func (s *AgentService) registerAndSyncLockedWithUserContext(authHeader string, u
 	}
 
 	device := normalizeRegisteredAgentDevice(resp, s.state.DeviceID, s.state.UniqueCode)
-	s.state.DeviceID = device.DeviceID
-	s.state.UniqueCode = device.UniqueCode
+	// device_id / unique_code are client-owned and permanent: ignore whatever
+	// the server returned and re-pin to the installation identity.
+	s.pinPermanentDeviceIDLocked()
+	device.ID = s.state.DeviceID
+	device.DeviceID = s.state.DeviceID
+	device.UniqueCode = s.state.UniqueCode
 	s.state.DeviceToken = deviceToken
 	s.state.RegisteredUser = currentUserKey
 	s.state.Device = device
@@ -923,17 +1031,6 @@ func (s *AgentService) syncExistingRegisteredDeviceLocked() error {
 		logger.Warn(fmt.Sprintf("[AGENT-BOOT] inventory_sync failed reason=existing_device_token device_id=%s error=%v", s.state.DeviceID, err))
 	}
 	return nil
-}
-
-func (s *AgentService) rotateDeviceIdentityLocked() {
-	oldDeviceID := s.state.DeviceID
-	s.state.DeviceID = "dev-" + uuid.NewString()
-	s.state.Device = nil
-	s.state.DeviceToken = ""
-	s.state.RegisteredUser = ""
-	s.state.Registered = false
-	s.state.RemoteConnected = false
-	logger.Warn(fmt.Sprintf("[AGENT-BOOT] register_sync device_id_conflict rotating_device_id old_device_id=%s new_device_id=%s", oldDeviceID, s.state.DeviceID))
 }
 
 func (s *AgentService) resetRegisteredDeviceIfUserChangedLocked(currentUserKey string) {
@@ -1008,11 +1105,12 @@ func (s *AgentService) callAgentServerWithAuthorization(method string, endpoint 
 	if useAdminConsoleFallback {
 		req.Header.Set("X-Admin-Console", "1")
 	}
-	if !hasDeviceToken {
-		for key, value := range CurrentAgentRegisterIdentityHeaders(agentRegistrationUserKey("", authHeader)) {
-			req.Header.Set(key, value)
-		}
-	}
+	// Identity is carried solely by the standard `Authorization: <aliang JWT>`
+	// header above. The PhoneServer decodes it (shared HS256 secret) → canonical
+	// user_id, so the device binds to the real account and stays in sync with the
+	// phone. The legacy X-Aliang-User-* headers were intentionally dropped: they
+	// produced synthetic `agent_user_<sha1(key)>` accounts that drifted from the
+	// logged-in user whenever the key changed, hiding devices from the phone.
 	logger.Info(fmt.Sprintf("[AGENT-BOOT] agent_server_call begin method=%s endpoint=%s has_auth=%t has_device_token=%t admin_console_fallback=%t",
 		method,
 		sanitizeAgentEndpoint(endpoint),
@@ -1079,9 +1177,8 @@ func (s *AgentService) syncAgentInventoryLocked(reason string) error {
 		device := *resp.Device
 		fillAgentDeviceDefaults(&device, time.Now().UTC().Format(time.RFC3339))
 		s.state.Device = &device
-		s.state.DeviceID = firstNonEmpty(device.DeviceID, device.ID, s.state.DeviceID)
-		s.state.UniqueCode = firstNonEmpty(s.state.UniqueCode, device.UniqueCode)
-		device.UniqueCode = s.state.UniqueCode
+		// device_id is permanent and client-owned: never adopt the server's id.
+		s.pinPermanentDeviceIDLocked()
 	}
 	s.state.LastSyncAt = time.Now().UTC().Format(time.RFC3339)
 	logger.Info(fmt.Sprintf("[AGENT-BOOT] inventory_sync success reason=%s device_id=%s projects=%d vibe_sessions=%d server_projects=%d server_vibe_sessions=%d",
@@ -1116,26 +1213,6 @@ func CurrentAgentRegisterAuthorizationHeader() string {
 
 func CurrentAgentRegisterUserKey() string {
 	return agentRegistrationUserKey("", "")
-}
-
-func CurrentAgentRegisterIdentityHeaders(userKey string) map[string]string {
-	headers := make(map[string]string)
-	userKey = agentRegistrationUserKey(userKey, "")
-	if userKey != "" {
-		headers[AgentUserKeyHeader] = userKey
-	}
-	if current := auth.GetCurrentUserInfoOrLoad(); current != nil {
-		if email := strings.TrimSpace(current.Email); email != "" {
-			headers[AgentUserEmailHeader] = email
-		}
-		if username := strings.TrimSpace(current.Username); username != "" {
-			headers[AgentUsernameHeader] = username
-		}
-		if role := strings.TrimSpace(current.Role); role != "" {
-			headers[AgentUserRoleHeader] = role
-		}
-	}
-	return headers
 }
 
 func effectiveAgentRegisterAuthHeader(authHeader string) string {
@@ -1298,15 +1375,8 @@ func (s *AgentService) applyRemoteDeviceSettings(msg map[string]interface{}) {
 	if name := remoteString(rawDevice, "name"); name != "" {
 		s.state.Device.Name = name
 	}
-	deviceID := remoteString(rawDevice, "device_id")
-	if deviceID == "" {
-		deviceID = remoteString(rawDevice, "id")
-	}
-	if deviceID != "" {
-		s.state.Device.ID = deviceID
-		s.state.Device.DeviceID = deviceID
-		s.state.DeviceID = deviceID
-	}
+	// device_id is permanent and client-owned: never adopt the server's id.
+	// (ensureDeviceIdentityLocked at the top of this handler already pinned it.)
 	if platform := remoteString(rawDevice, "platform"); platform != "" {
 		s.state.Device.Platform = platform
 	}

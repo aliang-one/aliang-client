@@ -164,6 +164,35 @@ func TestClassifyRefreshSessionFailure_KnownPatterns(t *testing.T) {
 			body:       `not json`,
 			wantErr:    nil,
 		},
+		// The auth backend's scan/st_ refresh path returns a bare {"error": ...}
+		// with no code/reason/message fields. The classifier must still recognize
+		// it as a terminal refresh-token rejection — otherwise RestoreSession
+		// silently serves stale cached user info and the UI shows logged-in
+		// forever while every background refresh 401s.
+		{
+			name:       "error field: refresh token is no longer valid",
+			statusCode: http.StatusUnauthorized,
+			body:       `{"error":"refresh token is no longer valid"}`,
+			wantErr:    ErrRefreshTokenInvalid,
+		},
+		{
+			name:       "error field: refresh token expired",
+			statusCode: http.StatusUnauthorized,
+			body:       `{"error":"refresh token expired"}`,
+			wantErr:    ErrRefreshTokenInvalid,
+		},
+		{
+			name:       "error field: refresh token has been revoked",
+			statusCode: http.StatusUnauthorized,
+			body:       `{"error":"refresh token has been revoked"}`,
+			wantErr:    ErrRefreshTokenInvalid,
+		},
+		{
+			name:       "code string REFRESH_TOKEN_INVALID",
+			statusCode: http.StatusUnauthorized,
+			body:       `{"code":"REFRESH_TOKEN_INVALID","error":"bad"}`,
+			wantErr:    ErrRefreshTokenInvalid,
+		},
 	}
 
 	for _, tt := range tests {

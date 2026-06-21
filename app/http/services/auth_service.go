@@ -58,15 +58,26 @@ func clearStartupStateAfterLogout() {
 	startupState.SetStatus(runtime.UNCONFIGURED)
 }
 
+// agentSyncDispatch performs the PhoneServer sync after an auth-state change.
+// It is a package-level var so tests can swap in a recording/blocking stub.
+// Auth HTTP handlers fire it asynchronously (see agentSyncResult) so the
+// response is never blocked by this side-effect.
+var agentSyncDispatch = RequestUserAgentSyncAfterAuth
+
 func agentSyncResult(reason string) map[string]interface{} {
-	if err := RequestUserAgentSyncAfterAuth(reason); err != nil {
-		return map[string]interface{}{
-			"status": "failed",
-			"error":  err.Error(),
+	// Fire the PhoneServer sync off the request path. Pushing the auth token to
+	// PhoneServer is a side-effect of login/session-restore, not part of
+	// determining login state, so it must not gate the HTTP response — otherwise
+	// /api/auth/session hangs (and the page stays blank on first load) whenever
+	// PhoneServer is slow or unreachable. The frontend does not consume the
+	// agent_sync field from this response.
+	go func() {
+		if err := agentSyncDispatch(reason); err != nil {
+			logger.Warn(fmt.Sprintf("Async agent sync failed (reason=%s): %v", reason, err))
 		}
-	}
+	}()
 	return map[string]interface{}{
-		"status": "success",
+		"status": "async",
 	}
 }
 

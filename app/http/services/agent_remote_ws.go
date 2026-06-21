@@ -358,16 +358,11 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 	}
 	switch msgType {
 	case models.AgentEventRegistered:
-		deviceID := strings.TrimSpace(fmt.Sprint(msg["device_id"]))
-		logger.Info(fmt.Sprintf("[AGENT-BOOT] remote_connection registered_ack device_id=%s", deviceID))
+		logger.Info(fmt.Sprintf("[AGENT-BOOT] remote_connection registered_ack server_device_id=%s", strings.TrimSpace(fmt.Sprint(msg["device_id"]))))
 		s.mu.Lock()
-		if deviceID != "" {
-			s.state.DeviceID = deviceID
-			if s.state.Device != nil {
-				s.state.Device.ID = deviceID
-				s.state.Device.DeviceID = deviceID
-			}
-		}
+		// device_id is permanent and client-owned: ignore the id the server
+		// acknowledges and re-pin our own installation identity.
+		s.pinPermanentDeviceIDLocked()
 		s.setRemoteConnectionStateLocked(true, "online", "")
 		_ = s.saveStateLocked()
 		s.mu.Unlock()

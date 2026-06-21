@@ -93,6 +93,31 @@ func TestAuthServiceRestoreSession_ReturnsSessionExpiredWhenRefreshTokenInvalid(
 	}
 }
 
+func TestAgentSyncResult_DoesNotBlockOnSync(t *testing.T) {
+	// The /api/auth/session (and login/refresh/scan) HTTP response must NOT wait
+	// for the PhoneServer sync side-effect — otherwise the page hangs (blank on
+	// first load) whenever PhoneServer is slow or unreachable. agentSyncResult
+	// must dispatch the sync asynchronously and return immediately.
+	orig := agentSyncDispatch
+	t.Cleanup(func() { agentSyncDispatch = orig })
+
+	fired := make(chan struct{}, 1)
+	agentSyncDispatch = func(string) error { fired <- struct{}{}; return nil }
+
+	res := agentSyncResult("restore_session")
+
+	if got := res["status"]; got != "async" {
+		t.Fatalf("agentSyncResult status = %#v, want \"async\" (must not block the HTTP response on the PhoneServer sync)", got)
+	}
+
+	// The dispatch still happens, just off the request path.
+	select {
+	case <-fired:
+	case <-time.After(time.Second):
+		t.Fatal("agent sync dispatch never fired")
+	}
+}
+
 func TestAuthServiceActivateScanLogin_RejectsMissingRefreshToken(t *testing.T) {
 	result := NewAuthService().ActivateScanLogin("scan-session-token", " ")
 

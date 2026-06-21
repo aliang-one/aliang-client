@@ -21,7 +21,7 @@
             "core_server": "15.nat0.cn:16749"
         },
         "api_server": "https://backend.aliang.one",
-        "agent_server": "http://localhost:4000"
+        "agent_server": "https://ws-vb-phone.aliang.one"
     },
     "customer": {
         "proxy": {

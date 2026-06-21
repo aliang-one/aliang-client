@@ -11,15 +11,34 @@ function extractEnvelope(json) {
   };
 }
 
-async function request(path, options = {}) {
-  const response = await fetch(path, {
-    credentials: 'same-origin',
-    ...options,
-    headers: {
-      'Content-Type': 'application/json',
-      ...(options.headers || {})
+async function request(path, options = {}, timeoutMs) {
+  // Optional client-side timeout so a request can never hang forever when the
+  // backend is slow or unreachable. Aborts the fetch after timeoutMs and throws
+  // a clear error the caller can treat as a failure.
+  const controller = new AbortController();
+  const timer = timeoutMs ? setTimeout(() => controller.abort(), timeoutMs) : null;
+
+  let response;
+  try {
+    response = await fetch(path, {
+      credentials: 'same-origin',
+      ...options,
+      headers: {
+        'Content-Type': 'application/json',
+        ...(options.headers || {})
+      },
+      signal: controller.signal
+    });
+  } catch (error) {
+    if (error && error.name === 'AbortError') {
+      throw new Error(`Request to ${path} timed out after ${timeoutMs}ms`);
     }
-  });
+    throw error;
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
 
   const json = await response.json().catch(() => ({}));
   const envelope = extractEnvelope(json);
@@ -42,9 +61,10 @@ export async function login({ email, password }) {
 }
 
 export async function restoreSession() {
-  return request('/api/auth/session', {
-    method: 'GET'
-  });
+  // Bounded timeout: this runs on first paint, so a hung backend must not leave
+  // the UI stuck restoring. On timeout the auth store falls back to the
+  // unauthenticated view and /api/startup/status polling corrects it.
+  return request('/api/auth/session', { method: 'GET' }, 5000);
 }
 
 export async function logout() {

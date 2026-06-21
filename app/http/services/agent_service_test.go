@@ -64,8 +64,11 @@ func TestAgentServiceRegisterAndSyncUsesAdminConsoleFallbackForLoopbackWithoutLo
 			if got := r.Header.Get("X-Admin-Console"); got != "1" {
 				t.Errorf("X-Admin-Console = %q, want 1", got)
 			}
-			if got := r.Header.Get(AgentUserKeyHeader); !strings.HasPrefix(got, "admin-console:") {
-				t.Errorf("%s = %q, want admin-console prefix", AgentUserKeyHeader, got)
+			// X-Aliang-User-Key is intentionally no longer sent on registration:
+			// identity is carried by X-Admin-Console (loopback dev fallback) here,
+			// or by the standard Authorization: <aliang JWT> on a normal login.
+			if got := r.Header.Get(AgentUserKeyHeader); got != "" {
+				t.Errorf("%s = %q, want empty (header dropped)", AgentUserKeyHeader, got)
 			}
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{
 				"code": 0,
@@ -105,6 +108,7 @@ func TestAgentServiceRegisterAndSyncUsesAdminConsoleFallbackForLoopbackWithoutLo
 	service := NewAgentService()
 	service.mu.Lock()
 	err := service.registerAndSyncLockedWithUserContext("", "")
+	clientDeviceID := service.state.DeviceID
 	status := service.statusLocked()
 	service.mu.Unlock()
 	if err != nil {
@@ -119,8 +123,10 @@ func TestAgentServiceRegisterAndSyncUsesAdminConsoleFallbackForLoopbackWithoutLo
 	if !status.Enabled || !status.Registered || !status.Bound {
 		t.Fatalf("status did not reflect admin console fallback registration: %#v", status)
 	}
-	if status.Device == nil || status.Device.DeviceID != "dev_admin_console" {
-		t.Fatalf("device = %#v, want dev_admin_console", status.Device)
+	// device_id is client-owned and permanent: the server's dev_admin_console
+	// must be ignored in favour of the id the client generated and registered.
+	if status.Device == nil || status.Device.DeviceID != clientDeviceID || clientDeviceID == "" {
+		t.Fatalf("device = %#v, want client-owned permanent id %q", status.Device, clientDeviceID)
 	}
 	service.Disable()
 }
@@ -190,8 +196,11 @@ func TestAgentServiceEnableRegistersLoggedInDevice(t *testing.T) {
 	if !status.Enabled || !status.Registered || !status.Bound {
 		t.Fatalf("Enable() did not reflect registered device: %#v", status)
 	}
-	if status.Device == nil || status.Device.DeviceID != "dev_enable" {
-		t.Fatalf("Enable() device = %#v, want dev_enable", status.Device)
+	// device_id is client-owned: the registered id (sent in the payload) must
+	// be the one retained, not the server's dev_enable.
+	registeredID := remoteString(registerPayload, "device_id")
+	if status.Device == nil || status.Device.DeviceID != registeredID || registeredID == "" {
+		t.Fatalf("Enable() device = %#v, want client-owned permanent id %q", status.Device, registeredID)
 	}
 	service.Disable()
 }
@@ -280,8 +289,10 @@ func TestAgentServiceRegisterAndSyncUsesLoggedInSession(t *testing.T) {
 	if !status.Enabled || !status.Registered || !status.Bound {
 		t.Fatalf("Status() did not reflect registered agent: %#v", status)
 	}
-	if status.Device == nil || status.Device.DeviceID != "dev_backend" {
-		t.Fatalf("Status() device = %#v, want backend device", status.Device)
+	// device_id is client-owned and permanent: it must stay the original id,
+	// ignoring the server's dev_backend.
+	if status.Device == nil || status.Device.DeviceID != originalDeviceID {
+		t.Fatalf("Status() device = %#v, want permanent client id %q", status.Device, originalDeviceID)
 	}
 	if status.SyncStatus != "connecting" {
 		t.Fatalf("SyncStatus = %q, want connecting", status.SyncStatus)
@@ -381,8 +392,10 @@ func TestAgentServiceRegisterAndSyncUploadsInventoryWithDeviceToken(t *testing.T
 	if !statusCalled {
 		t.Fatal("status sync endpoint was not called after registration")
 	}
-	if remoteString(statusPayload, "device_id") != "dev_inventory" {
-		t.Fatalf("status payload device_id = %q, want dev_inventory", remoteString(statusPayload, "device_id"))
+	// The inventory sync must carry the client's permanent device_id (the same
+	// id it registered with), not the server's dev_inventory.
+	if remoteString(statusPayload, "device_id") != remoteString(registerPayload, "device_id") {
+		t.Fatalf("status payload device_id = %q, want client permanent id %q", remoteString(statusPayload, "device_id"), remoteString(registerPayload, "device_id"))
 	}
 	projects, ok := statusPayload["projects"].([]interface{})
 	if !ok || len(projects) == 0 {
@@ -545,91 +558,6 @@ func TestAgentServiceRegisterAndSyncReregistersWhenUserChanges(t *testing.T) {
 	}
 }
 
-func TestAgentServiceRegisterAndSyncRetriesWithNewDeviceIDOnAlreadyBound(t *testing.T) {
-	t.Setenv("ALIANG_DATA_DIR", t.TempDir())
-	cache.ResetCacheDirForTest()
-	auth.ResetAuthPersistenceForTest()
-	config.ResetGlobalConfigForTest()
-	t.Cleanup(func() {
-		auth.ResetAuthPersistenceForTest()
-		config.ResetGlobalConfigForTest()
-	})
-
-	if err := auth.SaveUserInfo(&auth.UserInfo{
-		AccessToken:  "access_conflict",
-		RefreshToken: "refresh_conflict",
-		TokenType:    "Bearer",
-	}); err != nil {
-		t.Fatalf("SaveUserInfo() error = %v", err)
-	}
-
-	registerPayloads := make([]map[string]interface{}, 0, 2)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		if r.Method != http.MethodPost || r.URL.Path != "/api/devices/register" {
-			http.NotFound(w, r)
-			return
-		}
-		var payload map[string]interface{}
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-			t.Errorf("decode register payload: %v", err)
-		}
-		registerPayloads = append(registerPayloads, payload)
-		if len(registerPayloads) == 1 {
-			w.WriteHeader(http.StatusConflict)
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{"error": "device_id_already_bound"})
-			return
-		}
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"code": 0,
-			"data": map[string]interface{}{
-				"device_token": "dt_conflict_retry",
-				"device_id":    remoteString(payload, "device_id"),
-				"unique_code":  remoteString(payload, "unique_code"),
-			},
-		})
-	}))
-	defer server.Close()
-	config.SetGlobalConfig(&config.Config{Core: &config.CoreConfig{AgentServer: server.URL}})
-
-	service := NewAgentService()
-	service.mu.Lock()
-	service.state.DeviceID = "dev_conflict"
-	service.state.UniqueCode = "adc-test-conflict"
-	err := service.registerAndSyncLocked()
-	deviceID := service.state.DeviceID
-	deviceToken := service.state.DeviceToken
-	uniqueCode := service.state.UniqueCode
-	service.mu.Unlock()
-	if err != nil {
-		t.Fatalf("registerAndSyncLocked() error = %v", err)
-	}
-	if len(registerPayloads) != 2 {
-		t.Fatalf("register call count = %d, want 2", len(registerPayloads))
-	}
-	if remoteString(registerPayloads[0], "device_id") != "dev_conflict" {
-		t.Fatalf("first register device_id = %q, want dev_conflict", remoteString(registerPayloads[0], "device_id"))
-	}
-	if remoteString(registerPayloads[0], "unique_code") != "adc-test-conflict" {
-		t.Fatalf("first register unique_code = %q, want adc-test-conflict", remoteString(registerPayloads[0], "unique_code"))
-	}
-	if got := remoteString(registerPayloads[1], "device_id"); got == "" || got == "dev_conflict" {
-		t.Fatalf("retry register device_id = %q, want a new device id", got)
-	}
-	if remoteString(registerPayloads[1], "unique_code") != "adc-test-conflict" {
-		t.Fatalf("retry register unique_code = %q, want stable adc-test-conflict", remoteString(registerPayloads[1], "unique_code"))
-	}
-	if deviceID == "dev_conflict" {
-		t.Fatalf("state device_id was not rotated")
-	}
-	if uniqueCode != "adc-test-conflict" {
-		t.Fatalf("state unique_code = %q, want stable adc-test-conflict", uniqueCode)
-	}
-	if deviceToken != "dt_conflict_retry" {
-		t.Fatalf("device token = %q, want dt_conflict_retry", deviceToken)
-	}
-}
-
 func TestAgentServiceRegisterAndSyncAcceptsAliangPhoneServerResponse(t *testing.T) {
 	t.Setenv("ALIANG_DATA_DIR", t.TempDir())
 	cache.ResetCacheDirForTest()
@@ -719,8 +647,10 @@ func TestAgentServiceRegisterAndSyncAcceptsAliangPhoneServerResponse(t *testing.
 	if status.Device == nil {
 		t.Fatal("Status() missing registered device")
 	}
-	if status.Device.DeviceID != "dev_phone_server" {
-		t.Fatalf("DeviceID = %q, want dev_phone_server", status.Device.DeviceID)
+	// device_id is client-owned: the id the client registered with is retained,
+	// not the server's dev_phone_server.
+	if status.Device.DeviceID != remoteString(registerPayload, "device_id") {
+		t.Fatalf("DeviceID = %q, want client permanent id %q", status.Device.DeviceID, remoteString(registerPayload, "device_id"))
 	}
 	if status.Device.UserID != "user_123" {
 		t.Fatalf("UserID = %q, want user_123", status.Device.UserID)
@@ -769,7 +699,12 @@ func TestAgentServiceRegisterUsesForwardedUserAuthorization(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EnableWithAuthorization() error = %v", err)
 	}
-	if !status.Enabled || status.Device == nil || status.Device.DeviceID != "dev_forwarded" {
+	service.mu.Lock()
+	forwardedDeviceID := service.state.DeviceID
+	service.mu.Unlock()
+	// device_id is client-owned: must be the client's permanent id, not the
+	// server's dev_forwarded.
+	if !status.Enabled || status.Device == nil || status.Device.DeviceID != forwardedDeviceID || forwardedDeviceID == "" {
 		t.Fatalf("status did not reflect forwarded auth registration: %#v", status)
 	}
 	service.Disable()
@@ -1067,8 +1002,10 @@ func TestAgentServiceAppliesRemoteDeviceSettings(t *testing.T) {
 	if status.Device == nil {
 		t.Fatal("Status() missing device after remote settings update")
 	}
-	if status.Device.DeviceID != "dev_remote" || status.Device.Name != "remote-name" {
-		t.Fatalf("device settings not applied: %#v", status.Device)
+	// Remote settings must update name/capabilities/toggles but NOT the
+	// device_id — that is client-owned and permanent (ignores dev_remote).
+	if status.Device.DeviceID != deviceID || status.Device.Name != "remote-name" {
+		t.Fatalf("device settings not applied (device_id must stay %q): %#v", deviceID, status.Device)
 	}
 	if status.Device.BoundAt != "2026-06-10T00:00:00Z" {
 		t.Fatalf("BoundAt = %q, want cloud bound_at", status.Device.BoundAt)

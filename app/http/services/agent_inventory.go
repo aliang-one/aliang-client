@@ -855,10 +855,39 @@ func isSafeAgentProjectPath(path string) bool {
 	if path == filepath.Clean(string(filepath.Separator)) {
 		return false
 	}
-	if home, err := os.UserHomeDir(); err == nil && home != "" && path == filepath.Clean(home) {
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		homeCleaned := filepath.Clean(home)
+		if path == homeCleaned {
+			return false
+		}
+		// ~/Library holds per-app data containers (design tools, IDEs, storage
+		// backends) rather than code. Apps like Open Design drive Claude Code with
+		// cwd pointing at their internal per-document folders under here, which would
+		// otherwise surface as bogus UUID-named projects.
+		libraryRoot := filepath.Join(homeCleaned, "Library")
+		if path == libraryRoot || strings.HasPrefix(path, libraryRoot+string(filepath.Separator)) {
+			return false
+		}
+	}
+	// Anything inside (or equal to) a macOS app bundle — a component whose name ends
+	// in ".app" — is the application's own resource tree, not a standalone project.
+	if isAgentPathInsideAppBundle(path) {
 		return false
 	}
 	return true
+}
+
+// isAgentPathInsideAppBundle reports whether any component of path is a macOS app
+// bundle (a directory whose name ends in ".app"). Such paths live inside the app's
+// bundled resource tree (e.g. /Applications/Foo.app/Contents/Resources/...), not a
+// user project, so they are excluded from reported projects.
+func isAgentPathInsideAppBundle(path string) bool {
+	for _, part := range strings.Split(filepath.ToSlash(path), "/") {
+		if part != "" && strings.HasSuffix(part, ".app") {
+			return true
+		}
+	}
+	return false
 }
 
 func findRecentAgentFiles(root string, pattern string, limit int) []string {

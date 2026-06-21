@@ -23,10 +23,34 @@ var (
 	authSuccessHandler   func()
 )
 
-type authAPIErrorEnvelope struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
-	Reason  string `json:"reason"`
+// refreshRejectionPhrases are lowercase substrings the auth backend emits (in
+// either the "message" or "error" field) to signal that a refresh token was
+// rejected. The backend is inconsistent across endpoints: password-login
+// refresh returns {"code":401,"reason":"REFRESH_TOKEN_INVALID","message":
+// "invalid refresh token"}, while the scan/st_ path returns a bare
+// {"error":"refresh token is no longer valid"} with no code/reason/message.
+var refreshRejectionPhrases = []string{
+	"invalid refresh token",
+	"refresh token is no longer valid",
+	"refresh token expired",
+	"refresh token has been revoked",
+}
+
+// messageFieldMatchesRefreshRejection reports whether either the "message" or
+// "error" JSON field carries a known refresh-token-rejection phrase.
+func messageFieldMatchesRefreshRejection(envelope map[string]any) bool {
+	for _, key := range []string{"message", "error"} {
+		msg := strings.ToLower(strings.TrimSpace(stringValue(envelope[key])))
+		if msg == "" {
+			continue
+		}
+		for _, phrase := range refreshRejectionPhrases {
+			if strings.Contains(msg, phrase) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func classifyRefreshSessionFailure(statusCode int, body []byte) error {
@@ -34,17 +58,26 @@ func classifyRefreshSessionFailure(statusCode int, body []byte) error {
 		return nil
 	}
 
-	var envelope authAPIErrorEnvelope
+	// Parse as a generic map: refresh-rejection bodies vary in shape and some
+	// only carry an "error" field, so a fixed struct would silently drop the
+	// very field we must match on.
+	var envelope map[string]any
 	if err := json.Unmarshal(body, &envelope); err != nil {
 		return nil
 	}
 
-	message := strings.ToLower(strings.TrimSpace(envelope.Message))
-	reason := strings.ToUpper(strings.TrimSpace(envelope.Reason))
-	if envelope.Code == http.StatusUnauthorized && (reason == "REFRESH_TOKEN_INVALID" || strings.Contains(message, "invalid refresh token")) {
+	reason := strings.ToUpper(strings.TrimSpace(stringValue(envelope["reason"])))
+	code := strings.ToUpper(strings.TrimSpace(stringValue(envelope["code"])))
+	if reason == "REFRESH_TOKEN_INVALID" || code == "REFRESH_TOKEN_INVALID" {
+		return ErrRefreshTokenInvalid
+	}
+	if messageFieldMatchesRefreshRejection(envelope) {
 		return ErrRefreshTokenInvalid
 	}
 
+	// Unrecognized 401 (e.g. a transient "reason":"OTHER") stays nil so
+	// RestoreSession keeps retrying instead of wiping a session whose refresh
+	// token may still be valid.
 	return nil
 }
 
