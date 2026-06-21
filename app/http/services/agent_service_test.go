@@ -1444,6 +1444,15 @@ while IFS= read -r line; do
           printf '{"method":"turn/completed","params":{"threadId":"thr_fake","turn":{"id":"turn_fake","status":"completed"}}}\n'
           exit 0
           ;;
+        structured)
+          printf '{"method":"item/started","params":{"threadId":"thr_fake","turnId":"turn_fake","item":{"type":"commandExecution","id":"cmd_struct","command":["echo","hello"],"cwd":"%s"}}}\n' "$PWD"
+          printf '{"method":"item/completed","params":{"threadId":"thr_fake","turnId":"turn_fake","item":{"type":"commandExecution","id":"cmd_struct","exitCode":0,"stdout":"hello world"}}}\n'
+          printf '{"method":"item/started","params":{"threadId":"thr_fake","turnId":"turn_fake","item":{"type":"fileChange","id":"fc_struct","changes":[{"path":"%s/out.txt","kind":"edit","diff":"@@ -1,1 +1,2 @@\\n-old\\n+new\\n+newer\\n"}]}}}\n' "$PWD"
+          printf '{"method":"item/completed","params":{"threadId":"thr_fake","turnId":"turn_fake","item":{"type":"fileChange","id":"fc_struct","changes":[{"path":"%s/out.txt","kind":"edit","diff":"@@ -1,1 +1,2 @@\\n-old\\n+new\\n+newer\\n"}]}}}\n' "$PWD"
+          printf '{"method":"item/agentMessage/delta","params":{"threadId":"thr_fake","turnId":"turn_fake","itemId":"msg_fake","delta":"STRUCTURED_DONE"}}\n'
+          printf '{"method":"turn/completed","params":{"threadId":"thr_fake","turn":{"id":"turn_fake","status":"completed"}}}\n'
+          exit 0
+          ;;
         *)
           printf '{"method":"item/agentMessage/delta","params":{"threadId":"thr_fake","turnId":"turn_fake","itemId":"msg_fake","delta":"ALIANG_FAKE_CODEX_OUTPUT"}}\n'
           printf '{"method":"turn/completed","params":{"threadId":"thr_fake","turn":{"id":"turn_fake","status":"completed"}}}\n'
@@ -1514,6 +1523,114 @@ func TestAgentAIManagerRunsFakeCodex(t *testing.T) {
 	waitForAgentEvent(t, &mu, &events, "ai.done", func(event map[string]interface{}) bool {
 		return event["session_id"] == "ai_test" && event["message_id"] == "assistant_msg_test"
 	})
+}
+
+func TestAgentAIManagerEmitsStructuredCodexEvents(t *testing.T) {
+	projectPath := setupAgentExecutionProjectForTest(t)
+	binDir := t.TempDir()
+	writeFakeCodexAppServerForTest(t, binDir)
+	t.Setenv("ALIANG_FAKE_CODEX_MODE", "structured")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	manager := newAgentAIManager()
+	defer manager.closeAll()
+
+	var mu sync.Mutex
+	events := make([]map[string]interface{}, 0)
+	writeJSON := func(payload interface{}) error {
+		if event, ok := payload.(map[string]interface{}); ok {
+			mu.Lock()
+			events = append(events, event)
+			mu.Unlock()
+		}
+		return nil
+	}
+
+	manager.create(map[string]interface{}{
+		"type": "ai.session.create", "session_id": "ai_struct",
+		"project_path": projectPath, "mode": "agent",
+	}, writeJSON)
+	waitForAgentEvent(t, &mu, &events, "ai.session.created", func(event map[string]interface{}) bool {
+		return event["session_id"] == "ai_struct"
+	})
+
+	manager.message(map[string]interface{}{
+		"type": "ai.message", "session_id": "ai_struct",
+		"message_id": "msg_struct", "content": "run it",
+	}, writeJSON)
+	waitForAgentEvent(t, &mu, &events, "ai.done", func(event map[string]interface{}) bool {
+		return event["session_id"] == "ai_struct"
+	})
+
+	commands := filterEvents(&mu, &events, "ai.command")
+	if len(commands) != 2 {
+		t.Fatalf("ai.command events = %d, want 2 (started+completed)", len(commands))
+	}
+	byStatus := map[string]map[string]interface{}{}
+	for _, ev := range commands {
+		byStatus[remoteString(ev, "status")] = ev
+	}
+	if started := byStatus["started"]; started == nil || remoteString(started, "command") != "echo hello" {
+		t.Fatalf("ai.command started = %#v, want command echo hello", started)
+	}
+	if completed := byStatus["completed"]; completed == nil {
+		t.Fatal("missing ai.command completed")
+	} else {
+		if remoteString(completed, "command") != "echo hello" {
+			t.Fatalf("completed command = %q, want echo hello", remoteString(completed, "command"))
+		}
+		if code, ok := eventInt(completed, "exit_code"); !ok || code != 0 {
+			t.Fatalf("completed exit_code = %v, want 0", completed["exit_code"])
+		}
+		if remoteString(completed, "output") != "hello world" {
+			t.Fatalf("completed output = %q, want hello world", remoteString(completed, "output"))
+		}
+	}
+
+	fileChanges := filterEvents(&mu, &events, "ai.file_change")
+	if len(fileChanges) != 1 {
+		t.Fatalf("ai.file_change events = %d, want 1", len(fileChanges))
+	}
+	fc := fileChanges[0]
+	if !strings.HasSuffix(remoteString(fc, "path"), "/out.txt") {
+		t.Fatalf("file_change path = %q, want .../out.txt", remoteString(fc, "path"))
+	}
+	if remoteString(fc, "kind") != "edit" {
+		t.Fatalf("file_change kind = %q, want edit", remoteString(fc, "kind"))
+	}
+	if added, ok := eventInt(fc, "added"); !ok || added != 2 {
+		t.Fatalf("file_change added = %v, want 2", fc["added"])
+	}
+	if removed, ok := eventInt(fc, "removed"); !ok || removed != 1 {
+		t.Fatalf("file_change removed = %v, want 1", fc["removed"])
+	}
+	if remoteString(fc, "diff") == "" {
+		t.Fatal("file_change diff should be forwarded to the cloud")
+	}
+}
+
+func filterEvents(mu *sync.Mutex, events *[]map[string]interface{}, eventType string) []map[string]interface{} {
+	mu.Lock()
+	defer mu.Unlock()
+	out := make([]map[string]interface{}, 0)
+	for _, ev := range *events {
+		if remoteString(ev, "type") == eventType {
+			out = append(out, ev)
+		}
+	}
+	return out
+}
+
+// eventInt reads a numeric event field whether it is stored as a Go int (in-process
+// writeJSON capture) or a float64 (after a JSON round-trip over the wire).
+func eventInt(event map[string]interface{}, key string) (int, bool) {
+	switch v := event[key].(type) {
+	case int:
+		return v, true
+	case float64:
+		return int(v), true
+	}
+	return 0, false
 }
 
 func TestAgentAIManagerKeepsSessionHistory(t *testing.T) {
@@ -1746,6 +1863,117 @@ printf '{"type":"result","result":"你好"}\n'
 	}
 	if strings.Contains(got, "SECRET_THINKING") || strings.Contains(got, "system") {
 		t.Fatalf("claude streamed output leaked non-assistant event: %q", got)
+	}
+}
+
+func TestAgentAIManagerStreamsClaudeStructuredEvents(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fake claude in this test is POSIX-only")
+	}
+	projectPath := setupAgentExecutionProjectForTest(t)
+	binDir := t.TempDir()
+	script := `#!/bin/sh
+printf '{"type":"system","subtype":"init","cwd":"ignored"}\n'
+printf '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"PLANNING_THOUGHT"}}}\n'
+printf '{"type":"assistant","message":{"content":[{"type":"text","text":"ok"},{"type":"tool_use","id":"call_b1","name":"Bash","input":{"command":"echo hi","cwd":"/repo"}},{"type":"tool_use","id":"call_w1","name":"Write","input":{"file_path":"/repo/x.txt","content":"alpha"}},{"type":"tool_use","id":"call_t1","name":"TodoWrite","input":{"todos":[{"content":"t1","status":"in_progress","activeForm":"doing t1"}]}}],"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":3}}}\n'
+printf '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"call_b1","content":"hi","is_error":false}]}}\n'
+printf '{"type":"result","result":"ok"}\n'
+`
+	claudePath := filepath.Join(binDir, "claude")
+	if err := os.WriteFile(claudePath, []byte(script), 0o700); err != nil {
+		t.Fatalf("write fake claude: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	manager := newAgentAIManager()
+	defer manager.closeAll()
+
+	var mu sync.Mutex
+	events := make([]map[string]interface{}, 0)
+	writeJSON := func(payload interface{}) error {
+		if event, ok := payload.(map[string]interface{}); ok {
+			mu.Lock()
+			events = append(events, event)
+			mu.Unlock()
+		}
+		return nil
+	}
+
+	manager.create(map[string]interface{}{
+		"type": "ai.session.create", "session_id": "ai_struct_claude",
+		"project_path": projectPath, "provider": "claudecode",
+	}, writeJSON)
+	waitForAgentEvent(t, &mu, &events, "ai.session.created", func(event map[string]interface{}) bool {
+		return event["session_id"] == "ai_struct_claude"
+	})
+	manager.message(map[string]interface{}{
+		"type": "ai.message", "session_id": "ai_struct_claude",
+		"message_id": "msg_sc", "content": "go",
+	}, writeJSON)
+	waitForAgentEvent(t, &mu, &events, "ai.done", func(event map[string]interface{}) bool {
+		return event["session_id"] == "ai_struct_claude"
+	})
+
+	thinking := filterEvents(&mu, &events, "ai.thinking")
+	if len(thinking) != 1 || remoteString(thinking[0], "delta") != "PLANNING_THOUGHT" {
+		t.Fatalf("ai.thinking events = %#v, want one PLANNING_THOUGHT", thinking)
+	}
+
+	commands := filterEvents(&mu, &events, "ai.command")
+	if len(commands) != 2 {
+		t.Fatalf("ai.command events = %d, want 2 (started+completed)", len(commands))
+	}
+	var started, completed map[string]interface{}
+	for _, ev := range commands {
+		if remoteString(ev, "status") == "started" {
+			started = ev
+		}
+		if remoteString(ev, "status") == "completed" {
+			completed = ev
+		}
+	}
+	if started == nil || remoteString(started, "command") != "echo hi" {
+		t.Fatalf("ai.command started = %#v, want echo hi", started)
+	}
+	if completed == nil {
+		t.Fatal("missing ai.command completed from tool_result")
+	}
+	if remoteString(completed, "command") != "echo hi" || remoteString(completed, "output") != "hi" {
+		t.Fatalf("ai.command completed = %#v, want echo hi / hi", completed)
+	}
+	if code, _ := eventInt(completed, "exit_code"); code != 0 {
+		t.Fatalf("completed exit_code = %v, want 0", completed["exit_code"])
+	}
+
+	fileChanges := filterEvents(&mu, &events, "ai.file_change")
+	if len(fileChanges) != 1 {
+		t.Fatalf("ai.file_change events = %d, want 1", len(fileChanges))
+	}
+	if got := remoteString(fileChanges[0], "path"); got != "/repo/x.txt" {
+		t.Fatalf("file_change path = %q, want /repo/x.txt", got)
+	}
+	if added, _ := eventInt(fileChanges[0], "added"); added != 1 {
+		t.Fatalf("file_change added = %v, want 1", fileChanges[0]["added"])
+	}
+
+	tasks := filterEvents(&mu, &events, "ai.task")
+	if len(tasks) != 1 {
+		t.Fatalf("ai.task events = %d, want 1", len(tasks))
+	}
+	taskList, ok := tasks[0]["tasks"].([]map[string]interface{})
+	if !ok || len(taskList) != 1 || remoteString(taskList[0], "subject") != "t1" {
+		t.Fatalf("ai.task tasks = %#v, want one subject t1", tasks[0]["tasks"])
+	}
+
+	usage := filterEvents(&mu, &events, "ai.usage")
+	if len(usage) != 1 {
+		t.Fatalf("ai.usage events = %d, want 1", len(usage))
+	}
+	if in, _ := eventInt(usage[0], "input_tokens"); in != 10 {
+		t.Fatalf("usage input_tokens = %v, want 10", usage[0]["input_tokens"])
+	}
+	if out, _ := eventInt(usage[0], "output_tokens"); out != 5 {
+		t.Fatalf("usage output_tokens = %v, want 5", usage[0]["output_tokens"])
 	}
 }
 

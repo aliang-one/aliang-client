@@ -48,6 +48,11 @@ const (
 	AgentEventAIOptionRequest         = "ai.option.request"       // agent→server: 请求用户在多个方案中选择
 	AgentEventAIOptionResponse        = "ai.option.response"      // server→agent: 用户的选择结果
 	AgentEventAIOptionCancelled       = "ai.option.cancelled"     // 双向: 选择对话失活，作废待选
+	AgentEventAICommand               = "ai.command"              // agent→cloud: structured command execution (Bash / codex commandExecution) for activity-feed rendering
+	AgentEventAIFileChange            = "ai.file_change"          // agent→cloud: structured file edit (Write/Edit/MultiEdit / codex fileChange) with ±lines + diff
+	AgentEventAIThinking              = "ai.thinking"             // agent→cloud: streamed model reasoning (claude thinking_delta / codex reasoning) kept off the prose channel
+	AgentEventAIUsage                 = "ai.usage"                // agent→cloud: per-turn token usage surfaced from the provider
+	AgentEventAITask                  = "ai.task"                 // agent→cloud: task/todo list snapshot (claude TodoWrite)
 	AgentEventFileList                = "file.list"
 	AgentEventFileListResult          = "file.list.result"
 	AgentEventFileRead                = "file.read"
@@ -154,6 +159,11 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				{Type: AgentEventAIDelta, Required: []string{"type", "session_id", "message_id", "channel", "delta"}},
 				{Type: AgentEventAIDone, Required: []string{"type", "session_id", "message_id"}},
 				{Type: AgentEventAIRunProgress, Required: []string{"type", "session_id"}, Optional: []string{"message_id", "files_touched_count", "git_changed_count"}},
+				{Type: AgentEventAICommand, Required: []string{"type", "session_id", "message_id", "item_id", "status"}, Optional: []string{"command", "cwd", "exit_code", "output"}},
+				{Type: AgentEventAIFileChange, Required: []string{"type", "session_id", "message_id", "item_id"}, Optional: []string{"path", "kind", "added", "removed", "diff", "changes"}},
+				{Type: AgentEventAIThinking, Required: []string{"type", "session_id", "message_id", "delta"}},
+				{Type: AgentEventAIUsage, Required: []string{"type", "session_id"}, Optional: []string{"message_id", "input_tokens", "output_tokens", "cache_read_tokens", "model"}},
+				{Type: AgentEventAITask, Required: []string{"type", "session_id", "message_id", "tasks"}},
 				{Type: AgentEventAIStatus, Required: []string{"type", "session_id", "status"}},
 				{Type: AgentEventAIError, Required: []string{"type", "session_id", "error"}},
 				{Type: AgentEventAIApprovalRequest, Required: []string{"type", "session_id", "message_id", "approval_id", "provider", "kind", "status"}, Optional: []string{"title", "reason", "command", "cwd", "tool_name", "tool_input", "file_changes", "available_decisions", "decision", "raw"}},
@@ -182,7 +192,7 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				{Type: AgentEventTerminalResize, Required: []string{"type", "session_id", "rows", "cols"}, Emits: []string{AgentEventTerminalResized, AgentEventTerminalError}},
 				{Type: AgentEventTerminalClose, Required: []string{"type", "session_id"}, Emits: []string{AgentEventTerminalExit}},
 				{Type: AgentEventAISessionCreate, Required: []string{"type", "session_id"}, Optional: []string{"project_path", "mode", "provider", "tool", "model", "source_session_id", "resume_session_id", "initial_context", "transcript"}, Emits: []string{AgentEventAISessionCreated, AgentEventAIError}},
-				{Type: AgentEventAIMessage, Required: []string{"type", "session_id", "message_id", "content"}, Optional: []string{"attachments", "provider", "tool", "model", "project_path", "source_session_id", "resume_session_id"}, Emits: []string{AgentEventAIMessageReceived, AgentEventAIRunStarted, AgentEventAIDelta, AgentEventAIApprovalRequest, AgentEventAIRunProgress, AgentEventAIDone, AgentEventAIError}},
+				{Type: AgentEventAIMessage, Required: []string{"type", "session_id", "message_id", "content"}, Optional: []string{"attachments", "provider", "tool", "model", "project_path", "source_session_id", "resume_session_id"}, Emits: []string{AgentEventAIMessageReceived, AgentEventAIRunStarted, AgentEventAIDelta, AgentEventAIThinking, AgentEventAICommand, AgentEventAIFileChange, AgentEventAIUsage, AgentEventAITask, AgentEventAIApprovalRequest, AgentEventAIRunProgress, AgentEventAIDone, AgentEventAIError}},
 				{Type: AgentEventAIMessageReceived, Required: []string{"type", "session_id", "message_id"}, Optional: []string{"received_at"}},
 				{Type: AgentEventAIApprovalResponse, Required: []string{"type", "session_id", "approval_id", "decision"}, Optional: []string{"message_id", "scope", "raw", "delivery_id", "attempt"}, Emits: []string{AgentEventAIApprovalAck, AgentEventAIStatus, AgentEventAIError}},
 				{Type: AgentEventAIApprovalState, Required: []string{"type", "approval_id", "status"}, Optional: []string{"session_id"}},

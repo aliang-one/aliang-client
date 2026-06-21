@@ -1366,6 +1366,231 @@ func extractCodexFileChangeItem(msg map[string]interface{}) (string, json.RawMes
 	return itemID, nil
 }
 
+// summarizeFileDiff counts added/removed lines in a unified diff for the
+// activity feed ("Update(file) +N -M"). File headers (+++/---), hunk headers
+// (@@) and the "\ No newline at end of file" marker are not counted.
+func summarizeFileDiff(diff string) (added, removed int) {
+	if diff == "" {
+		return 0, 0
+	}
+	for _, line := range strings.Split(diff, "\n") {
+		if line == "" {
+			continue
+		}
+		switch line[0] {
+		case '@', '\\', ' ':
+			continue
+		case '+':
+			if !strings.HasPrefix(line, "+++") {
+				added++
+			}
+		case '-':
+			if !strings.HasPrefix(line, "---") {
+				removed++
+			}
+		}
+	}
+	return added, removed
+}
+
+// extractCodexCommandItem pulls the lifecycle fields of a codex
+// commandExecution item (item/started carries command+cwd; item/completed
+// carries exitCode+stdout+stderr). ok is true only for commandExecution items;
+// exitCode is non-nil only when the completed item carried one.
+func extractCodexCommandItem(msg map[string]interface{}) (itemID, command, cwd string, exitCode *int, stdout, stderr string, ok bool) {
+	params, _ := msg["params"].(map[string]interface{})
+	item, _ := params["item"].(map[string]interface{})
+	if remoteString(item, "type") != "commandExecution" {
+		return "", "", "", nil, "", "", false
+	}
+	itemID = remoteString(item, "id")
+	command = codexJoinCommand(item["command"])
+	cwd = remoteString(item, "cwd")
+	exitCode = remoteIntPointer(item, "exitCode", "exit_code")
+	stdout = remoteString(item, "stdout")
+	stderr = remoteString(item, "stderr")
+	return itemID, command, cwd, exitCode, stdout, stderr, true
+}
+
+// codexJoinCommand renders a codex command value — either a shell string or an
+// argv array — as a single display string.
+func codexJoinCommand(raw interface{}) string {
+	switch v := raw.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case []interface{}:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			if part := strings.TrimSpace(fmt.Sprint(item)); part != "" {
+				out = append(out, part)
+			}
+		}
+		return strings.Join(out, " ")
+	}
+	return ""
+}
+
+// remoteIntPointer returns the first present integer-valued field among keys,
+// or nil when none of them hold a number. JSON numbers arrive as float64.
+func remoteIntPointer(fields map[string]interface{}, keys ...string) *int {
+	for _, key := range keys {
+		raw, present := fields[key]
+		if !present || raw == nil {
+			continue
+		}
+		if v, ok := toIntValue(raw); ok {
+			return &v
+		}
+	}
+	return nil
+}
+
+func toIntValue(raw interface{}) (int, bool) {
+	switch v := raw.(type) {
+	case float64:
+		return int(v), true
+	case int:
+		return v, true
+	case int64:
+		return int(v), true
+	}
+	return 0, false
+}
+
+// agentAICloudFieldCap bounds a single structured-event text field (command
+// output, diff) so one verbose command/edit cannot blow up a websocket frame.
+const agentAICloudFieldCap = 8 * 1024
+
+func truncateForCloud(value string) string {
+	if len(value) <= agentAICloudFieldCap {
+		return value
+	}
+	return value[:agentAICloudFieldCap] + "…<truncated>"
+}
+
+// emitCodexFileChangeEvents fans a codex fileChange item's changes out as one
+// ai.file_change event per changed path, each carrying ±line counts (from the
+// diff) and the raw diff for the cloud to render.
+func emitCodexFileChangeEvents(run agentAIRun, writeJSON agentTerminalWriter, itemID string, changes json.RawMessage) {
+	var parsed []map[string]interface{}
+	if err := json.Unmarshal(changes, &parsed); err != nil || len(parsed) == 0 {
+		return
+	}
+	for _, ch := range parsed {
+		diff := firstNonEmpty(remoteString(ch, "diff"), remoteString(ch, "change"))
+		added, removed := summarizeFileDiff(diff)
+		payload := map[string]interface{}{
+			"type":       models.AgentEventAIFileChange,
+			"session_id": run.sessionID,
+			"message_id": agentAssistantMessageID(run.messageID),
+			"item_id":    itemID,
+			"path":       remoteString(ch, "path"),
+			"kind":       remoteString(ch, "kind"),
+			"added":      added,
+			"removed":    removed,
+		}
+		if diff != "" {
+			payload["diff"] = truncateForCloud(diff)
+		}
+		_ = writeJSON(payload)
+	}
+}
+
+// emitCodexUsageIfPresent is a best-effort hook: codex surfaces per-turn token
+// usage on turn/completed, but the exact field shape varies across codex
+// versions. It probes the most likely locations and emits a single ai.usage
+// event when one is found; otherwise it is a no-op. Verify/adjust the shape
+// against a real codex transcript at runtime.
+func emitCodexUsageIfPresent(run agentAIRun, writeJSON agentTerminalWriter, params map[string]interface{}) {
+	if params == nil {
+		return
+	}
+	sources := []map[string]interface{}{
+		mapIf(params["usage"]),
+		mapIf(params["turn"]),
+		mapIf(params["tokenUsage"]),
+	}
+	for _, src := range sources {
+		if src == nil {
+			continue
+		}
+		usage := src
+		if nested := mapIf(src["usage"]); nested != nil {
+			usage = nested
+		}
+		payload := map[string]interface{}{
+			"type":       models.AgentEventAIUsage,
+			"session_id": run.sessionID,
+			"message_id": agentAssistantMessageID(run.messageID),
+		}
+		hit := false
+		for _, key := range []string{"input_tokens", "inputTokens"} {
+			if v := remoteIntValue(usage[key]); v >= 0 {
+				payload["input_tokens"] = v
+				hit = true
+				break
+			}
+		}
+		for _, key := range []string{"output_tokens", "outputTokens"} {
+			if v := remoteIntValue(usage[key]); v >= 0 {
+				payload["output_tokens"] = v
+				hit = true
+				break
+			}
+		}
+		for _, key := range []string{"cache_read_tokens", "cacheReadInputTokens"} {
+			if v := remoteIntValue(usage[key]); v >= 0 {
+				payload["cache_read_tokens"] = v
+				hit = true
+				break
+			}
+		}
+		if hit {
+			_ = writeJSON(payload)
+			return
+		}
+	}
+}
+
+func mapIf(raw interface{}) map[string]interface{} {
+	if m, ok := raw.(map[string]interface{}); ok {
+		return m
+	}
+	return nil
+}
+
+func remoteIntValue(raw interface{}) int {
+	if v, ok := toIntValue(raw); ok {
+		return v
+	}
+	return -1
+}
+
+// emitCodexThinkingIfPresent is a best-effort hook for codex reasoning: when an
+// item carries reasoning text (type reasoning/agentReasoning/reasoningSummary
+// with a text/summary field), it is streamed as ai.thinking. Codex's reasoning
+// event shape is version-dependent; verify against a real transcript.
+func emitCodexThinkingIfPresent(run agentAIRun, writeJSON agentTerminalWriter, item map[string]interface{}) {
+	if item == nil {
+		return
+	}
+	switch remoteString(item, "type") {
+	case "reasoning", "agentReasoning", "reasoningSummary":
+	default:
+		return
+	}
+	text := firstNonEmpty(remoteString(item, "text"), remoteString(item, "summary"), remoteString(item, "delta"))
+	if strings.TrimSpace(text) == "" {
+		return
+	}
+	_ = writeJSON(map[string]interface{}{
+		"type":       models.AgentEventAIThinking,
+		"session_id": run.sessionID,
+		"message_id": agentAssistantMessageID(run.messageID),
+		"delta":      text,
+	})
+}
+
 // codexAgentMessageDedup suppresses exact replays of the previous completed
 // agent message within a single codex turn. The upstream model/proxy has been
 // observed re-streaming an identical generation (same content, sometimes the
@@ -1544,6 +1769,7 @@ func (m *agentAIManager) runCodexAppServer(ctx context.Context, run agentAIRun, 
 	completed := false
 	turnStatus := ""
 	fileChangesByID := map[string]json.RawMessage{}
+	commandsByID := map[string]string{}
 	dedup := newCodexAgentMessageDedup()
 	for scanner.Scan() {
 		run.activity.bump()
@@ -1583,13 +1809,60 @@ func (m *agentAIManager) runCodexAppServer(ctx context.Context, run agentAIRun, 
 					}
 				}
 			case "item/started", "item/completed":
+				isCompleted := method == "item/completed"
+				// commandExecution lifecycle → ai.command (started: command+cwd;
+				// completed: exit_code + truncated output). The completed item
+				// often omits the command, so remember it from started by item id.
+				if cmdID, cmd, cmdCwd, exitCode, stdout, stderr, ok := extractCodexCommandItem(msg); ok && cmdID != "" {
+					if cmd != "" {
+						commandsByID[cmdID] = cmd
+					}
+					command := cmd
+					if command == "" {
+						command = commandsByID[cmdID]
+					}
+					payload := map[string]interface{}{
+						"type":       models.AgentEventAICommand,
+						"session_id": run.sessionID,
+						"message_id": agentAssistantMessageID(run.messageID),
+						"item_id":    cmdID,
+						"status":     "started",
+						"command":    command,
+					}
+					if cmdCwd != "" {
+						payload["cwd"] = cmdCwd
+					}
+					if isCompleted {
+						payload["status"] = "completed"
+						if exitCode != nil {
+							payload["exit_code"] = *exitCode
+						}
+						if output := firstNonEmpty(stdout, stderr); output != "" {
+							payload["output"] = truncateForCloud(output)
+						}
+					}
+					_ = writeJSON(payload)
+				}
+				// Best-effort reasoning streaming (codex reasoning items), kept off
+				// the prose channel.
+				if params, ok := msg["params"].(map[string]interface{}); ok {
+					if item, ok := params["item"].(map[string]interface{}); ok {
+						emitCodexThinkingIfPresent(run, writeJSON, item)
+					}
+				}
+				// fileChange: seed the approval map (started) and emit ai.file_change
+				// once the change is actually applied (completed).
 				if fcItemID, fcChanges := extractCodexFileChangeItem(msg); fcItemID != "" && fcChanges != nil {
 					fileChangesByID[fcItemID] = fcChanges
+					if isCompleted {
+						emitCodexFileChangeEvents(run, writeJSON, fcItemID, fcChanges)
+					}
 				}
 			case "turn/completed":
 				completedParams, _ := msg["params"].(map[string]interface{})
 				var turnErr string
 				turnStatus, turnErr = codexTurnResult(completedParams)
+				emitCodexUsageIfPresent(run, writeJSON, completedParams)
 				if turnStatus == "failed" {
 					// A failed turn (ContextWindowExceeded, upstream 5xx, etc.) must
 					// surface as an error, never as a successful ai.done. The error
@@ -2085,6 +2358,9 @@ func streamAgentAIStdout(reader io.Reader, format agentAIOutputFormat, run agent
 func streamStructuredAIDelta(reader io.Reader, format agentAIOutputFormat, run agentAIRun, writeJSON agentTerminalWriter, limiter *agentAIOutputLimiter, capture func(string), fileSink func(string)) {
 	decoder := json.NewDecoder(reader)
 	emitted := false
+	// pendingCommands tracks Bash tool_use_id → command so a later user-turn
+	// tool_result can close it as ai.command(completed) with output + exit code.
+	pendingCommands := map[string]string{}
 	for {
 		var event map[string]interface{}
 		if err := decoder.Decode(&event); err != nil {
@@ -2095,6 +2371,7 @@ func streamStructuredAIDelta(reader io.Reader, format agentAIOutputFormat, run a
 				fileSink(fp)
 			}
 		}
+		emitClaudeStructuredEvents(format, event, run, writeJSON, pendingCommands)
 		for _, text := range extractStructuredAITexts(format, event, !emitted) {
 			if strings.TrimSpace(text) == "" {
 				continue
@@ -2205,6 +2482,281 @@ func extractToolUseFilePaths(format agentAIOutputFormat, event map[string]interf
 		}
 	}
 	return nil
+}
+
+// countTextLines reports the number of lines in s for ±line accounting: empty
+// text is 0; otherwise newline count, bumped by one when there is no trailing
+// newline (so "a\nb" and "a\nb\n" are both 2).
+func countTextLines(s string) int {
+	if s == "" {
+		return 0
+	}
+	n := strings.Count(s, "\n")
+	if !strings.HasSuffix(s, "\n") {
+		n++
+	}
+	return n
+}
+
+// claudeEditLineDelta estimates added/removed lines for a file-mutating Claude
+// tool_use. Write contributes its content as additions; Edit/MultiEdit compare
+// new_string vs old_string. Exact removed counts would need the baseline file;
+// this is a faithful approximation for the activity feed, and the raw edit is
+// not what we forward (only the counts + path).
+func claudeEditLineDelta(toolName string, input map[string]interface{}) (added, removed int) {
+	switch toolName {
+	case "Write":
+		return countTextLines(remoteString(input, "content")), 0
+	case "Edit":
+		return countTextLines(remoteString(input, "new_string")), countTextLines(remoteString(input, "old_string"))
+	case "MultiEdit":
+		if edits, ok := input["edits"].([]interface{}); ok {
+			for _, raw := range edits {
+				edit, ok := raw.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				added += countTextLines(remoteString(edit, "new_string"))
+				removed += countTextLines(remoteString(edit, "old_string"))
+			}
+		}
+	}
+	return added, removed
+}
+
+// claudeToolUseEvents maps a finalized Claude assistant message's tool_use
+// blocks to structured activity events. Bash → ai.command(started) and its
+// tool_use_id→command mapping is recorded in pending so a later tool_result can
+// close it as completed. Write/Edit/MultiEdit → ai.file_change; TodoWrite →
+// ai.task. Read-only and other tools are ignored (write/exec surface only).
+func claudeToolUseEvents(content []interface{}, run agentAIRun, pending map[string]string) []map[string]interface{} {
+	items := content
+	msgID := agentAssistantMessageID(run.messageID)
+	var out []map[string]interface{}
+	for _, raw := range items {
+		row, ok := raw.(map[string]interface{})
+		if !ok || remoteString(row, "type") != "tool_use" {
+			continue
+		}
+		name := remoteString(row, "name")
+		id := remoteString(row, "id")
+		input, _ := row["input"].(map[string]interface{})
+		switch name {
+		case "Bash":
+			command := remoteString(input, "command")
+			if id != "" && command != "" && pending != nil {
+				pending[id] = command
+			}
+			payload := map[string]interface{}{
+				"type":       models.AgentEventAICommand,
+				"session_id": run.sessionID,
+				"message_id": msgID,
+				"item_id":    id,
+				"status":     "started",
+				"command":    command,
+			}
+			if cwd := remoteString(input, "cwd"); cwd != "" {
+				payload["cwd"] = cwd
+			}
+			out = append(out, payload)
+		case "Write", "Edit", "MultiEdit":
+			added, removed := claudeEditLineDelta(name, input)
+			kind := "edit"
+			if name == "Write" {
+				kind = "create"
+			}
+			out = append(out, map[string]interface{}{
+				"type":       models.AgentEventAIFileChange,
+				"session_id": run.sessionID,
+				"message_id": msgID,
+				"item_id":    id,
+				"path":       remoteString(input, "file_path"),
+				"kind":       kind,
+				"added":      added,
+				"removed":    removed,
+			})
+		case "TodoWrite":
+			out = append(out, map[string]interface{}{
+				"type":       models.AgentEventAITask,
+				"session_id": run.sessionID,
+				"message_id": msgID,
+				"item_id":    id,
+				"tasks":      claudeTodosToTasks(input["todos"]),
+			})
+		}
+	}
+	return out
+}
+
+// claudeTodosToTasks maps a TodoWrite todos array to the ai.task tasks payload:
+// content→subject, status passthrough, activeForm→active_form.
+func claudeTodosToTasks(raw interface{}) []map[string]interface{} {
+	items, ok := raw.([]interface{})
+	if !ok {
+		return nil
+	}
+	out := make([]map[string]interface{}, 0, len(items))
+	for _, item := range items {
+		todo, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		entry := map[string]interface{}{
+			"subject": remoteString(todo, "content"),
+			"status":  remoteString(todo, "status"),
+		}
+		if af := remoteString(todo, "activeForm"); af != "" {
+			entry["active_form"] = af
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+// claudeToolResultEvents closes Bash commands whose tool_result arrives in a
+// later "user" turn. A matching tool_use_id emits ai.command(completed) with the
+// result text (truncated) and exit_code 1 for is_error, else 0; the pending
+// entry is consumed. Unknown ids are ignored.
+func claudeToolResultEvents(content []interface{}, run agentAIRun, pending map[string]string) []map[string]interface{} {
+	items := content
+	if len(pending) == 0 {
+		return nil
+	}
+	msgID := agentAssistantMessageID(run.messageID)
+	var out []map[string]interface{}
+	for _, raw := range items {
+		row, ok := raw.(map[string]interface{})
+		if !ok || remoteString(row, "type") != "tool_result" {
+			continue
+		}
+		id := remoteString(row, "tool_use_id")
+		command, matched := pending[id]
+		if !matched {
+			continue
+		}
+		exitCode := 0
+		if isErr, ok := row["is_error"].(bool); ok && isErr {
+			exitCode = 1
+		}
+		output := truncateForCloud(claudeToolResultText(row["content"]))
+		payload := map[string]interface{}{
+			"type":       models.AgentEventAICommand,
+			"session_id": run.sessionID,
+			"message_id": msgID,
+			"item_id":    id,
+			"status":     "completed",
+			"command":    command,
+		}
+		if output != "" {
+			payload["output"] = output
+		}
+		payload["exit_code"] = exitCode
+		out = append(out, payload)
+		delete(pending, id)
+	}
+	return out
+}
+
+// claudeToolResultText flattens a tool_result content value — a plain string or
+// an array of {type:text,text:...} blocks — into a single display string.
+func claudeToolResultText(raw interface{}) string {
+	if s, ok := raw.(string); ok {
+		return s
+	}
+	items, ok := raw.([]interface{})
+	if !ok {
+		return ""
+	}
+	var b strings.Builder
+	for _, item := range items {
+		row, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if remoteString(row, "type") == "text" {
+			b.WriteString(remoteString(row, "text"))
+		}
+	}
+	return b.String()
+}
+
+// claudeUsageEvent builds an ai.usage payload from a finalized assistant
+// message's usage block, or returns nil when no token counts are present. The
+// caller stamps session_id/message_id (run context is not available here).
+func claudeUsageEvent(message map[string]interface{}) map[string]interface{} {
+	usage := mapIf(message["usage"])
+	if usage == nil {
+		return nil
+	}
+	payload := map[string]interface{}{"type": models.AgentEventAIUsage}
+	hit := false
+	for field, key := range map[string]string{
+		"input_tokens":      "input_tokens",
+		"output_tokens":     "output_tokens",
+		"cache_read_tokens": "cache_read_input_tokens",
+	} {
+		if v := remoteIntValue(usage[key]); v >= 0 {
+			payload[field] = v
+			hit = true
+		}
+	}
+	if !hit {
+		return nil
+	}
+	return payload
+}
+
+// emitClaudeStructuredEvents turns Claude stream-json events into structured
+// activity events: thinking_delta→ai.thinking (streamed), the finalized
+// assistant message's tool_use blocks→ai.command/ai.file_change/ai.task plus
+// ai.usage, and a later user-turn tool_result closes a pending Bash command as
+// ai.command(completed). Only write/exec tools surface; reads are ignored.
+func emitClaudeStructuredEvents(format agentAIOutputFormat, event map[string]interface{}, run agentAIRun, writeJSON agentTerminalWriter, pending map[string]string) {
+	if format != agentAIOutputClaudeStreamJSON {
+		return
+	}
+	msgID := agentAssistantMessageID(run.messageID)
+
+	if remoteString(event, "type") == "stream_event" {
+		if streamEvent := mapIf(event["event"]); streamEvent != nil && remoteString(streamEvent, "type") == "content_block_delta" {
+			if delta := mapIf(streamEvent["delta"]); delta != nil && remoteString(delta, "type") == "thinking_delta" {
+				if text := remoteString(delta, "thinking"); strings.TrimSpace(text) != "" {
+					_ = writeJSON(map[string]interface{}{
+						"type":       models.AgentEventAIThinking,
+						"session_id": run.sessionID,
+						"message_id": msgID,
+						"delta":      text,
+					})
+				}
+			}
+		}
+	}
+
+	switch remoteString(event, "type") {
+	case "assistant":
+		message := mapIf(event["message"])
+		if message == nil {
+			return
+		}
+		content, _ := message["content"].([]interface{})
+		for _, ev := range claudeToolUseEvents(content, run, pending) {
+			_ = writeJSON(ev)
+		}
+		if usage := claudeUsageEvent(message); usage != nil {
+			usage["session_id"] = run.sessionID
+			usage["message_id"] = msgID
+			_ = writeJSON(usage)
+		}
+	case "user":
+		message := mapIf(event["message"])
+		if message == nil {
+			return
+		}
+		content, _ := message["content"].([]interface{})
+		for _, ev := range claudeToolResultEvents(content, run, pending) {
+			_ = writeJSON(ev)
+		}
+	}
 }
 
 // countGitChanged returns the number of working-tree entries reported by
