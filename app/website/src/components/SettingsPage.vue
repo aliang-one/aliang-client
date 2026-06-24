@@ -149,20 +149,20 @@
                 :version="customerConfigVersion"
                 @save="saveCustomerConfig"
               />
-              <ModelMappingSettings
-                :config="customerConfig"
-                :loading="isLoadingCustomerConfig"
-                :saving="isSavingCustomerConfig"
-                :error="customerConfigError"
-                :success-message="customerConfigSuccess"
-                @save="saveCustomerConfig"
-              />
             </template>
           </section>
 
           <aside class="flex flex-col gap-6 lg:col-span-4">
             <SystemSettings v-if="isAuthenticated" />
-            <AgentSettings v-if="isAuthenticated" />
+            <ModelMappingSettings
+              v-if="isAuthenticated"
+              :config="customerConfig"
+              :loading="isLoadingCustomerConfig"
+              :saving="isSavingCustomerConfig"
+              :error="customerConfigError"
+              :success-message="customerConfigSuccess"
+              @save="saveCustomerConfig"
+            />
             <AgentScanDirectoriesSettings v-if="isAuthenticated" />
           </aside>
         </div>
@@ -183,6 +183,7 @@
               </p>
             </div>
           </div>
+          <AgentSettings v-if="isAuthenticated" />
           <AgentActivitySettings v-if="isAuthenticated" />
         </section>
 
