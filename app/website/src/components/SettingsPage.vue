@@ -163,7 +163,6 @@
               :success-message="customerConfigSuccess"
               @save="saveCustomerConfig"
             />
-            <AgentScanDirectoriesSettings v-if="isAuthenticated" />
           </aside>
         </div>
 
@@ -184,6 +183,7 @@
             </div>
           </div>
           <AgentSettings v-if="isAuthenticated" />
+          <AgentScanDirectoriesSettings v-if="isAuthenticated" />
           <AgentActivitySettings v-if="isAuthenticated" />
         </section>
 
