@@ -36,4 +36,17 @@ func handleAuthExpired() {
 // carries the current JWT via the user_token query param).
 func handleAuthRefreshed() {
 	GetSharedAgentService().PushSessionRefresh()
+	// Self-heal: a successful refresh means we hold a valid JWT again. If the
+	// agent was terminal-disabled by a prior auth_expired (typically a
+	// transient refresh failure to backend.aliang.one), re-enable and
+	// reconnect instead of staying offline until a manual re-login. No-op for
+	// every other disable reason (logout / device_unbound / device_token_invalid).
+	RequestUserAgentRecoverAfterAuthExpired()
+	// Bind the device to the real JWT user if it registered under a fallback
+	// identity (e.g. admin-console → platform_admin) or not at all before the
+	// JWT was loaded. Only meaningful in the user-agent runtime, where the
+	// agent state + WS connection live.
+	if IsUserAgentRuntime() {
+		GetSharedAgentService().ReRegisterIfUserIdentityChanged()
+	}
 }

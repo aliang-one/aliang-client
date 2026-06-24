@@ -42,6 +42,10 @@ type agentVibeSessionReadOptions struct {
 	BeforeMessageID string
 	BeforeTimestamp string
 	IncludePageMeta bool
+	// ScanDirs, when non-empty, filters sessions early: a session whose project
+	// path is not under any of these directories is dropped before its transcript
+	// is read. Empty/nil = no filtering (current behavior).
+	ScanDirs []string
 }
 
 type agentVibeTranscriptWindow struct {
@@ -66,9 +70,9 @@ type agentSyncSnapshot struct {
 	CollectedAt           string                    `json:"collected_at"`
 }
 
-func collectAgentSyncSnapshot() agentSyncSnapshot {
+func collectAgentSyncSnapshot(scanDirs []string) agentSyncSnapshot {
 	history := collectAgentHistoryRoots()
-	vibeSessions := collectAgentVibeSessions()
+	vibeSessions := collectAgentVibeSessions(scanDirs)
 	projects := collectAgentProjects(vibeSessions)
 	authorizedDirectories := agentProjectPaths(projects)
 	setAgentAuthorizedExecutionDirectoriesCache(authorizedDirectories)
@@ -206,8 +210,8 @@ func enrichAgentProject(project *models.AgentProject) {
 	}
 }
 
-func collectAgentVibeSessions() []models.AgentVibeSession {
-	sessions := append(collectCodexVibeSessions(), collectClaudeVibeSessions()...)
+func collectAgentVibeSessions(scanDirs []string) []models.AgentVibeSession {
+	sessions := append(collectCodexVibeSessions(scanDirs), collectClaudeVibeSessions(scanDirs)...)
 	sort.Slice(sessions, func(i, j int) bool {
 		return sessions[i].UpdatedAt > sessions[j].UpdatedAt
 	})
@@ -217,7 +221,7 @@ func collectAgentVibeSessions() []models.AgentVibeSession {
 	return sessions
 }
 
-func collectCodexVibeSessions() []models.AgentVibeSession {
+func collectCodexVibeSessions(scanDirs []string) []models.AgentVibeSession {
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
 		return nil
@@ -254,7 +258,7 @@ func collectCodexVibeSessions() []models.AgentVibeSession {
 	)
 	metaByID := make(map[string]models.AgentVibeSession)
 	for _, path := range sessionFiles {
-		meta := readCodexSessionMeta(path)
+		meta := readCodexSessionMetaWithOptions(path, agentVibeSessionReadOptions{Limit: agentVibeTranscriptMaxMessages, ScanDirs: scanDirs})
 		if meta.ID == "" {
 			continue
 		}
@@ -338,6 +342,10 @@ func readCodexSessionMetaWithOptions(path string, options agentVibeSessionReadOp
 			session.Branch = firstNonEmpty(session.Branch, row.Payload.Git.Branch)
 			session.Model = firstNonEmpty(session.Model, row.Payload.Model)
 			session.CreatedAt = firstNonEmpty(session.CreatedAt, normalizeAgentTime(row.Timestamp))
+			// 早过滤：扫描目录限制开启时，cwd 不在任一目录内则丢弃整个会话，不读 transcript
+			if len(options.ScanDirs) > 0 && session.ProjectPath != "" && !pathUnderAnyScanDir(session.ProjectPath, options.ScanDirs) {
+				return models.AgentVibeSession{}
+			}
 			continue
 		}
 		if msg := parseCodexTranscriptMessage(line, session.MessageCount); msg.Content != "" {
@@ -515,7 +523,7 @@ func inferAgentVibeRoleFromContent(value interface{}) string {
 	return ""
 }
 
-func collectClaudeVibeSessions() []models.AgentVibeSession {
+func collectClaudeVibeSessions(scanDirs []string) []models.AgentVibeSession {
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
 		return nil
@@ -554,6 +562,10 @@ func collectClaudeVibeSessions() []models.AgentVibeSession {
 			if !isSafeAgentProjectPath(projectPath) {
 				continue
 			}
+			// 早过滤：扫描目录限制开启时，projectPath 不在目录内则跳过（连 session 文件都不读）
+			if len(scanDirs) > 0 && !pathUnderAnyScanDir(cleanAgentProjectPath(projectPath), scanDirs) {
+				continue
+			}
 			session := models.AgentVibeSession{
 				ID:           "claude_" + entry.SessionID,
 				Provider:     "claude",
@@ -576,7 +588,7 @@ func collectClaudeVibeSessions() []models.AgentVibeSession {
 		if strings.Contains(path, string(filepath.Separator)+"subagents"+string(filepath.Separator)) {
 			continue
 		}
-		session := readClaudeSessionMeta(path)
+		session := readClaudeSessionMetaWithOptions(path, agentVibeSessionReadOptions{Limit: agentVibeTranscriptMaxMessages, ScanDirs: scanDirs})
 		if session.ID == "" || seen[session.ID] {
 			continue
 		}
@@ -631,6 +643,10 @@ func readClaudeSessionMetaWithOptions(path string, options agentVibeSessionReadO
 		}
 		if session.ProjectPath == "" {
 			session.ProjectPath = cleanAgentProjectPath(row.CWD)
+		}
+		// 早过滤：扫描目录限制开启时，cwd 不在任一目录内则丢弃整个会话，不读 transcript
+		if len(options.ScanDirs) > 0 && session.ProjectPath != "" && !pathUnderAnyScanDir(session.ProjectPath, options.ScanDirs) {
+			return models.AgentVibeSession{}
 		}
 		if session.Branch == "" {
 			session.Branch = row.GitBranch

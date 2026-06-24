@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -122,6 +123,27 @@ func (h *AgentHandler) HandleEnable(w http.ResponseWriter, r *http.Request) {
 	common.Success(w, resp)
 }
 
+// HandleAuthRecover re-enables an agent that was terminal-disabled by an
+// auth_expired session, but only if a fresh valid token is now available. It is
+// self-gating (RecoverIfAuthExpired is a no-op otherwise), so it is safe to
+// nudge after every successful token refresh. Proxied to the user-agent server
+// when this process isn't the runtime that owns agent state.
+func (h *AgentHandler) HandleAuthRecover(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
+		return
+	}
+	if h.proxyIfNeeded(w, r) {
+		return
+	}
+	resp, err := h.service.RecoverIfAuthExpired()
+	if err != nil {
+		writeAgentServiceError(w, "Failed to recover agent", err)
+		return
+	}
+	common.Success(w, resp)
+}
+
 func (h *AgentHandler) HandleDisable(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
@@ -194,6 +216,82 @@ func (h *AgentHandler) HandleLaunch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	common.Success(w, resp)
+}
+
+// HandleVibeSessions returns local AI coding sessions as summaries. When this
+// process is not the user-agent runtime and the runtime is unreachable, an
+// empty list is returned so the page can show an empty state instead of an error.
+func (h *AgentHandler) HandleVibeSessions(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
+		return
+	}
+	if services.IsUserAgentRuntime() {
+		common.Success(w, map[string]interface{}{"sessions": h.service.VibeSessions()})
+		return
+	}
+	if err := h.proxyToUserAgent(w, r); err != nil {
+		common.Success(w, map[string]interface{}{"sessions": []interface{}{}})
+		return
+	}
+}
+
+// HandleVibeSession returns one session's transcript page (?id=&limit=&before=).
+func (h *AgentHandler) HandleVibeSession(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
+		return
+	}
+	if h.proxyIfNeeded(w, r) {
+		return
+	}
+	id := strings.TrimSpace(r.URL.Query().Get("id"))
+	if id == "" {
+		common.ErrorBadRequest(w, "id is required", nil)
+		return
+	}
+	limit := 0
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			limit = n
+		}
+	}
+	session, err := h.service.VibeSessionDetail(id, limit, r.URL.Query().Get("before"))
+	if err != nil {
+		common.ErrorNotFound(w, err.Error())
+		return
+	}
+	common.Success(w, session)
+}
+
+// HandleScanDirectories GET 读取 / POST 设置扫描目录过滤（经 proxyIfNeeded 代理到 runtime，
+// runtime 直接读写本地 state 并持久化）。
+func (h *AgentHandler) HandleScanDirectories(w http.ResponseWriter, r *http.Request) {
+	if h.proxyIfNeeded(w, r) {
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		dirs, enabled := h.service.ScanDirectoriesConfig()
+		common.Success(w, map[string]interface{}{"enabled": enabled, "directories": dirs})
+	case http.MethodPost:
+		var req struct {
+			Enabled     bool     `json:"enabled"`
+			Directories []string `json:"directories"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+			common.ErrorBadRequest(w, "Invalid request body", nil)
+			return
+		}
+		dirs, enabled, err := h.service.SetScanDirectoriesConfig(req.Directories, req.Enabled)
+		if err != nil {
+			common.ErrorInternalServer(w, "Failed to save scan directories", map[string]interface{}{"error": err.Error()})
+			return
+		}
+		common.Success(w, map[string]interface{}{"enabled": enabled, "directories": dirs})
+	default:
+		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
+	}
 }
 
 func (h *AgentHandler) proxyIfNeeded(w http.ResponseWriter, r *http.Request) bool {

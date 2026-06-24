@@ -108,7 +108,7 @@ func agentAuthorizedExecutionDirectories() []string {
 }
 
 func refreshAgentAuthorizedExecutionDirectories() []string {
-	snapshot := collectAgentSyncSnapshot()
+	snapshot := collectAgentSyncSnapshot(nil)
 	return setAgentAuthorizedExecutionDirectoriesCache(snapshot.AuthorizedDirectories)
 }
 

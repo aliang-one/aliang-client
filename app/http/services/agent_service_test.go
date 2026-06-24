@@ -40,7 +40,7 @@ func TestAgentServiceEnableRequiresLogin(t *testing.T) {
 	}
 }
 
-func TestAgentServiceRegisterAndSyncUsesAdminConsoleFallbackForLoopbackWithoutLogin(t *testing.T) {
+func TestAgentServiceRegisterRefusedWithoutJwtNoFallback(t *testing.T) {
 	t.Setenv("ALIANG_DATA_DIR", t.TempDir())
 	cache.ResetCacheDirForTest()
 	auth.ResetAuthPersistenceForTest()
@@ -50,57 +50,16 @@ func TestAgentServiceRegisterAndSyncUsesAdminConsoleFallbackForLoopbackWithoutLo
 		config.ResetGlobalConfigForTest()
 	})
 
+	// No user info saved → no JWT available. Registration must be REFUSED
+	// (login_required), NEVER falling back to an admin-console / platform
+	// identity. This is the invariant: a device binds to an owner only via JWT.
 	registerCalled := false
-	statusCalled := false
-
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		switch {
-		case r.Method == http.MethodPost && r.URL.Path == "/api/devices/register":
+		if r.Method == http.MethodPost && r.URL.Path == "/api/devices/register" {
 			registerCalled = true
-			if got := r.Header.Get("Authorization"); got != "" {
-				t.Errorf("Authorization = %q, want empty for admin console fallback", got)
-			}
-			if got := r.Header.Get("X-Admin-Console"); got != "1" {
-				t.Errorf("X-Admin-Console = %q, want 1", got)
-			}
-			// X-Aliang-User-Key is intentionally no longer sent on registration:
-			// identity is carried by X-Admin-Console (loopback dev fallback) here,
-			// or by the standard Authorization: <aliang JWT> on a normal login.
-			if got := r.Header.Get(AgentUserKeyHeader); got != "" {
-				t.Errorf("%s = %q, want empty (header dropped)", AgentUserKeyHeader, got)
-			}
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{
-				"code": 0,
-				"data": map[string]interface{}{
-					"device_token": "dt_admin_console",
-					"device": map[string]interface{}{
-						"id":                      "dev_admin_console",
-						"device_id":               "dev_admin_console",
-						"name":                    "admin-console-device",
-						"platform":                agentPlatform(),
-						"status":                  "offline",
-						"remote_terminal_enabled": true,
-						"ai_control_enabled":      true,
-					},
-				},
-			})
-		case r.Method == http.MethodPost && r.URL.Path == "/api/agent/status":
-			statusCalled = true
-			if got := r.Header.Get("Authorization"); got != "Bearer dt_admin_console" {
-				t.Errorf("status Authorization = %q, want device token", got)
-			}
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{
-				"code": 0,
-				"data": map[string]interface{}{
-					"status":             "ok",
-					"project_count":      0,
-					"vibe_session_count": 0,
-				},
-			})
-		default:
-			http.NotFound(w, r)
 		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"code": 0, "data": map[string]interface{}{}})
 	}))
 	defer server.Close()
 	config.SetGlobalConfig(&config.Config{Core: &config.CoreConfig{AgentServer: server.URL}})
@@ -108,27 +67,20 @@ func TestAgentServiceRegisterAndSyncUsesAdminConsoleFallbackForLoopbackWithoutLo
 	service := NewAgentService()
 	service.mu.Lock()
 	err := service.registerAndSyncLockedWithUserContext("", "")
-	clientDeviceID := service.state.DeviceID
 	status := service.statusLocked()
 	service.mu.Unlock()
 	if err != nil {
 		t.Fatalf("registerAndSyncLockedWithUserContext() error = %v", err)
 	}
-	if !registerCalled {
-		t.Fatal("register endpoint was not called")
+	if registerCalled {
+		t.Fatal("register endpoint was called without a JWT — registration must be refused (login_required), not fall back to admin-console")
 	}
-	if !statusCalled {
-		t.Fatal("status endpoint was not called")
+	if status.SyncStatus != "login_required" {
+		t.Fatalf("SyncStatus = %q, want login_required", status.SyncStatus)
 	}
-	if !status.Enabled || !status.Registered || !status.Bound {
-		t.Fatalf("status did not reflect admin console fallback registration: %#v", status)
+	if status.Enabled || status.Registered || status.Bound {
+		t.Fatalf("status should reflect a refused registration (not bound): %#v", status)
 	}
-	// device_id is client-owned and permanent: the server's dev_admin_console
-	// must be ignored in favour of the id the client generated and registered.
-	if status.Device == nil || status.Device.DeviceID != clientDeviceID || clientDeviceID == "" {
-		t.Fatalf("device = %#v, want client-owned permanent id %q", status.Device, clientDeviceID)
-	}
-	service.Disable()
 }
 
 func TestAgentServiceEnableRegistersLoggedInDevice(t *testing.T) {
@@ -1354,6 +1306,10 @@ while IFS= read -r line; do
       ;;
     *'"method":"thread/start"'*)
       thread_method="start"
+      if [ "$mode" = "thread_error" ]; then
+        printf '{"id":1,"error":{"code":-32600,"message":"thread/start.runtimeWorkspaceRoots requires experimentalApi capability"}}\n'
+        exit 0
+      fi
       printf '{"id":1,"result":{"thread":{"id":"thr_fake"},"model":"fake","modelProvider":"openai","serviceTier":null,"cwd":"%s","instructionSources":[],"approvalPolicy":"on-request","approvalsReviewer":"user","sandbox":{},"reasoningEffort":null}}\n' "$PWD"
       ;;
     *'"method":"turn/start"'*)
@@ -1390,6 +1346,8 @@ while IFS= read -r line; do
           printf '{"method":"turn/completed","params":{"threadId":"thr_fake","turn":{"id":"turn_fake","status":"completed"}}}\n'
           exit 0
           ;;
+        steer)
+          ;;
         *)
           printf '{"method":"item/agentMessage/delta","params":{"threadId":"thr_fake","turnId":"turn_fake","itemId":"msg_fake","delta":"ALIANG_FAKE_CODEX_OUTPUT"}}\n'
           printf '{"method":"turn/completed","params":{"threadId":"thr_fake","turn":{"id":"turn_fake","status":"completed"}}}\n'
@@ -1405,6 +1363,19 @@ while IFS= read -r line; do
       fi
       printf '{"method":"turn/completed","params":{"threadId":"thr_fake","turn":{"id":"turn_fake","status":"failed"}}}\n'
       exit 1
+      ;;
+    *'"method":"turn/steer"'*)
+      if [ "$mode" = "steer" ]; then
+        if printf '%s' "$line" | grep -q '"expectedTurnId":"turn_fake"' && printf '%s' "$line" | grep -q 'steer now'; then
+          printf '{"id":"aliang_steer_101","result":{"turnId":"turn_fake"}}\n'
+          printf '{"method":"item/agentMessage/delta","params":{"threadId":"thr_fake","turnId":"turn_fake","itemId":"msg_fake","delta":"STEER_APPLIED"}}\n'
+          printf '{"method":"turn/completed","params":{"threadId":"thr_fake","turn":{"id":"turn_fake","status":"completed"}}}\n'
+          exit 0
+        fi
+        printf '{"id":"aliang_steer_101","error":{"code":"bad_steer","message":"bad steer payload"}}\n'
+        printf '{"method":"turn/completed","params":{"threadId":"thr_fake","turn":{"id":"turn_fake","status":"failed","error":{"message":"bad steer"}}}}\n'
+        exit 1
+      fi
       ;;
   esac
 done
@@ -1459,6 +1430,182 @@ func TestAgentAIManagerRunsFakeCodex(t *testing.T) {
 	})
 	waitForAgentEvent(t, &mu, &events, "ai.done", func(event map[string]interface{}) bool {
 		return event["session_id"] == "ai_test" && event["message_id"] == "assistant_msg_test"
+	})
+}
+
+func TestAgentAIManagerCodexThreadStartErrorSurfaces(t *testing.T) {
+	projectPath := setupAgentExecutionProjectForTest(t)
+	binDir := t.TempDir()
+	writeFakeCodexAppServerForTest(t, binDir)
+	t.Setenv("ALIANG_FAKE_CODEX_MODE", "thread_error")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	manager := newAgentAIManager()
+	defer manager.closeAll()
+
+	var mu sync.Mutex
+	events := make([]map[string]interface{}, 0)
+	writeJSON := func(payload interface{}) error {
+		event, ok := payload.(map[string]interface{})
+		if !ok {
+			t.Fatalf("payload type = %T, want map[string]interface{}", payload)
+		}
+		mu.Lock()
+		events = append(events, event)
+		mu.Unlock()
+		return nil
+	}
+
+	manager.create(map[string]interface{}{
+		"type":         "ai.session.create",
+		"session_id":   "ai_thread_error",
+		"project_path": projectPath,
+		"provider":     "codex",
+		"mode":         "agent",
+	}, writeJSON)
+	waitForAgentEvent(t, &mu, &events, "ai.session.created", func(event map[string]interface{}) bool {
+		return event["session_id"] == "ai_thread_error"
+	})
+
+	manager.message(map[string]interface{}{
+		"type":       "ai.message",
+		"session_id": "ai_thread_error",
+		"message_id": "msg_thread_error",
+		"content":    "hello broken codex",
+	}, writeJSON)
+
+	errEvent := waitForAgentEvent(t, &mu, &events, "ai.error", func(event map[string]interface{}) bool {
+		errText := remoteString(event, "error")
+		return event["session_id"] == "ai_thread_error" &&
+			strings.Contains(errText, "Codex app-server thread/start failed") &&
+			strings.Contains(errText, "experimentalApi capability")
+	})
+	if errEvent["message_id"] != "assistant_msg_thread_error" {
+		t.Fatalf("message_id = %v, want assistant_msg_thread_error", errEvent["message_id"])
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for _, event := range events {
+		if remoteString(event, "type") == "ai.run.started" && event["session_id"] == "ai_thread_error" {
+			t.Fatalf("ai.run.started should not be emitted after thread/start failure: %#v", events)
+		}
+	}
+}
+
+func TestAgentAIManagerCodexSteerSendsTurnSteer(t *testing.T) {
+	projectPath := setupAgentExecutionProjectForTest(t)
+	binDir := t.TempDir()
+	writeFakeCodexAppServerForTest(t, binDir)
+	t.Setenv("ALIANG_FAKE_CODEX_MODE", "steer")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	manager := newAgentAIManager()
+	defer manager.closeAll()
+
+	var mu sync.Mutex
+	events := make([]map[string]interface{}, 0)
+	writeJSON := func(payload interface{}) error {
+		event, ok := payload.(map[string]interface{})
+		if !ok {
+			t.Fatalf("payload type = %T, want map[string]interface{}", payload)
+		}
+		mu.Lock()
+		events = append(events, event)
+		mu.Unlock()
+		return nil
+	}
+
+	manager.create(map[string]interface{}{
+		"type":         "ai.session.create",
+		"session_id":   "ai_steer",
+		"project_path": projectPath,
+		"provider":     "codex",
+		"mode":         "agent",
+	}, writeJSON)
+	waitForAgentEvent(t, &mu, &events, "ai.session.created", func(event map[string]interface{}) bool {
+		return event["session_id"] == "ai_steer"
+	})
+
+	manager.message(map[string]interface{}{
+		"type":       "ai.message",
+		"session_id": "ai_steer",
+		"message_id": "msg_steer_root",
+		"content":    "start and wait",
+	}, writeJSON)
+	waitForAgentEvent(t, &mu, &events, "ai.run.started", func(event map[string]interface{}) bool {
+		return event["session_id"] == "ai_steer"
+	})
+
+	manager.steer(map[string]interface{}{
+		"type":       "ai.steer",
+		"session_id": "ai_steer",
+		"message_id": "msg_steer",
+		"content":    "steer now",
+	}, writeJSON)
+
+	waitForAgentEvent(t, &mu, &events, "ai.steer.ack", func(event map[string]interface{}) bool {
+		return event["session_id"] == "ai_steer" &&
+			event["message_id"] == "msg_steer" &&
+			remoteString(event, "result") == "queued"
+	})
+	waitForAgentEvent(t, &mu, &events, "ai.steer.ack", func(event map[string]interface{}) bool {
+		return event["session_id"] == "ai_steer" &&
+			event["message_id"] == "msg_steer" &&
+			remoteString(event, "result") == "applied"
+	})
+	waitForAgentEvent(t, &mu, &events, "ai.delta", func(event map[string]interface{}) bool {
+		return strings.Contains(remoteString(event, "delta"), "STEER_APPLIED")
+	})
+	waitForAgentEvent(t, &mu, &events, "ai.done", func(event map[string]interface{}) bool {
+		return event["session_id"] == "ai_steer"
+	})
+}
+
+func TestAgentAIManagerSteerRejectsUnsupportedAndNotRunning(t *testing.T) {
+	projectPath := setupAgentExecutionProjectForTest(t)
+	manager := newAgentAIManager()
+	defer manager.closeAll()
+	mu, events, writer := captureAIWriter(t)
+
+	manager.create(map[string]interface{}{
+		"type":         "ai.session.create",
+		"session_id":   "ai_idle_steer",
+		"project_path": projectPath,
+		"provider":     "codex",
+	}, writer)
+	waitForAgentEvent(t, mu, events, "ai.session.created", func(event map[string]interface{}) bool {
+		return event["session_id"] == "ai_idle_steer"
+	})
+	manager.steer(map[string]interface{}{
+		"type":       "ai.steer",
+		"session_id": "ai_idle_steer",
+		"message_id": "msg_idle_steer",
+		"content":    "too early",
+	}, writer)
+	waitForAgentEvent(t, mu, events, "ai.steer.ack", func(event map[string]interface{}) bool {
+		return event["message_id"] == "msg_idle_steer" &&
+			remoteString(event, "result") == "not_running"
+	})
+
+	manager.mu.Lock()
+	manager.sessions["ai_claude_steer"] = &agentAISession{
+		id:          "ai_claude_steer",
+		mode:        "agent",
+		projectPath: projectPath,
+		provider:    "claudecode",
+		cancel:      func() {},
+		runSeq:      1,
+	}
+	manager.mu.Unlock()
+	manager.steer(map[string]interface{}{
+		"type":       "ai.steer",
+		"session_id": "ai_claude_steer",
+		"message_id": "msg_claude_steer",
+		"content":    "not supported",
+	}, writer)
+	waitForAgentEvent(t, mu, events, "ai.steer.ack", func(event map[string]interface{}) bool {
+		return event["message_id"] == "msg_claude_steer" &&
+			remoteString(event, "result") == "unsupported"
 	})
 }
 

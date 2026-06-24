@@ -250,7 +250,7 @@ func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn) error {
 			case <-pingTicker.C:
 				if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(agentRemoteWriteTimeout)); err != nil {
 					return
-			}
+				}
 			case <-done:
 				return
 			}
@@ -374,6 +374,8 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 	case models.AgentEventDeviceSettings:
 		logger.Info("[AGENT-BOOT] remote_connection settings_updated")
 		s.applyRemoteDeviceSettings(msg)
+	case models.AgentEventProjectSettings:
+		s.applyRemoteProjectSettings(msg)
 	case models.AgentEventProjectDetail, models.AgentEventAISessionDetail, models.AgentEventFileList, models.AgentEventFileRead, models.AgentEventSlashCommandsList:
 		s.setRemoteConnectionState(true, "online", "")
 		go handleAgentDetailMessage(msg, writeJSON)
@@ -401,7 +403,7 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 	case models.AgentEventTerminalClose:
 		s.setRemoteConnectionState(true, "online", "")
 		s.terminal.close(msg, writeJSON)
-	case models.AgentEventAISessionCreate, models.AgentEventAIMessage, models.AgentEventAIApprovalResponse, models.AgentEventAIOptionResponse, models.AgentEventAIStop, models.AgentEventAISessionClose:
+	case models.AgentEventAISessionCreate, models.AgentEventAIMessage, models.AgentEventAISteer, models.AgentEventAIApprovalResponse, models.AgentEventAIOptionResponse, models.AgentEventAIStop, models.AgentEventAISessionClose:
 		s.setRemoteConnectionState(true, "online", "")
 		switch msgType {
 		case models.AgentEventAISessionCreate:
@@ -416,6 +418,12 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 				return
 			}
 			s.ai.message(msg, writeJSON)
+		case models.AgentEventAISteer:
+			if !s.aiControlEnabled() {
+				emitAgentAISteerAck(writeJSON, remoteString(msg, "session_id"), remoteString(msg, "message_id"), "error", "AI control is disabled for this device", "ai_control_disabled")
+				return
+			}
+			s.ai.steer(msg, writeJSON)
 		case models.AgentEventAIApprovalResponse:
 			if !s.aiControlEnabled() {
 				_ = writeJSON(agentAIErrorPayload(remoteString(msg, "session_id"), remoteString(msg, "message_id"), errors.New("AI control is disabled for this device")))
@@ -468,6 +476,7 @@ func remoteAgentMessageRequiresEnabledDevice(msgType string) bool {
 		models.AgentEventTerminalClose,
 		models.AgentEventAISessionCreate,
 		models.AgentEventAIMessage,
+		models.AgentEventAISteer,
 		models.AgentEventAIApprovalResponse,
 		models.AgentEventAIOptionResponse,
 		models.AgentEventAIStop,
@@ -500,6 +509,8 @@ func (s *AgentService) DispatchLocalAI(msg map[string]interface{}, writeJSON fun
 		s.ai.create(msg, writeJSON)
 	case models.AgentEventAIMessage:
 		s.ai.message(msg, writeJSON)
+	case models.AgentEventAISteer:
+		s.ai.steer(msg, writeJSON)
 	case models.AgentEventAIApprovalResponse:
 		s.ai.approval(msg, writeJSON)
 	case models.AgentEventAIStop:
@@ -555,9 +566,10 @@ func (s *AgentService) agentHelloPayload() map[string]interface{} {
 	s.ensureDeviceIdentityLocked()
 	deviceID := s.state.DeviceID
 	uniqueCode := s.state.UniqueCode
+	scanDirs := activeScanDirs(s.state.ScanDirectories, s.state.ScanDirectoriesEnabled)
 	s.mu.Unlock()
 
-	snapshot := collectAgentSyncSnapshot()
+	snapshot := collectAgentSyncSnapshot(scanDirs)
 	return map[string]interface{}{
 		"type":                   models.AgentEventHello,
 		"protocol_version":       models.AgentProtocolVersion,

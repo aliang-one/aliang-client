@@ -2,6 +2,7 @@ package services
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -65,15 +66,22 @@ type agentState struct {
 	LastSyncAt      string              `json:"last_sync_at,omitempty"`
 	LastSyncStatus  string              `json:"last_sync_status,omitempty"`
 	LastSyncMessage string              `json:"last_sync_message,omitempty"`
+
+	// ScanDirectories 限制上传到云端的扫描范围：开启后只有这些目录下的
+	// 项目和会话才会被扫描并上传。空或 ScanDirectoriesEnabled=false 表示不过滤。
+	ScanDirectories        []string `json:"scan_directories,omitempty"`
+	ScanDirectoriesEnabled bool     `json:"scan_directories_enabled,omitempty"`
 }
 
 type AgentService struct {
-	mu       sync.Mutex
-	state    agentState
-	identity *agentDeviceIdentity
-	client   *http.Client
-	terminal *agentTerminalManager
-	ai       *agentAIManager
+	mu                    sync.Mutex
+	state                 agentState
+	identity              *agentDeviceIdentity
+	policyByPath          map[string]*ApprovalPolicy
+	policyLastCheckAtPath map[string]time.Time
+	client                *http.Client
+	terminal              *agentTerminalManager
+	ai                    *agentAIManager
 
 	wsMu         sync.Mutex
 	wsConnected  bool
@@ -117,6 +125,7 @@ func NewAgentService() *AgentService {
 		ai:                newAgentAIManager(),
 		sessionRefreshSig: make(chan struct{}, 1),
 	}
+	s.ai.service = s
 	if err := s.loadState(); err != nil {
 		logger.Warn(fmt.Sprintf("[AGENT-BOOT] state_load failed error=%v", err))
 	} else {
@@ -209,6 +218,58 @@ func (s *AgentService) Status() models.AgentStatusResponse {
 	}
 }
 
+// VibeSessions returns the local AI coding sessions (Claude/Codex) as
+// lightweight summaries, newest first. Transcript is stripped.
+func (s *AgentService) VibeSessions() []models.AgentVibeSession {
+	return summarizeAgentVibeSessions(collectAgentVibeSessions(nil))
+}
+
+// VibeSessionDetail returns a single session's transcript page for the
+// read-only activity view. Assistant messages are capped to a one-line summary;
+// system/tool messages are filtered. Cursor pagination via beforeMessageID.
+func (s *AgentService) VibeSessionDetail(sessionID string, limit int, beforeMessageID string) (models.AgentVibeSession, error) {
+	session := findAgentVibeSessionDetail(sessionID, "", "", agentVibeSessionReadOptions{
+		Limit:           normalizeAgentVibeDetailLimit(limit),
+		BeforeMessageID: beforeMessageID,
+		IncludePageMeta: true,
+	})
+	if session.ID == "" {
+		return models.AgentVibeSession{}, errors.New("vibe session not found")
+	}
+	session.Transcript = summarizeVibeTranscriptForDisplay(session.Transcript, agentVibeAssistantSummaryRunes)
+	return session, nil
+}
+
+// ScanDirectoriesConfig returns the current scan-directory filter setting.
+func (s *AgentService) ScanDirectoriesConfig() ([]string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	dirs := make([]string, len(s.state.ScanDirectories))
+	copy(dirs, s.state.ScanDirectories)
+	return dirs, s.state.ScanDirectoriesEnabled
+}
+
+// SetScanDirectoriesConfig updates the scan-directory filter and persists it.
+// Directories are trimmed, de-duplicated, and empties dropped.
+func (s *AgentService) SetScanDirectoriesConfig(dirs []string, enabled bool) ([]string, bool, error) {
+	cleaned := make([]string, 0, len(dirs))
+	seen := make(map[string]bool, len(dirs))
+	for _, d := range dirs {
+		d = strings.TrimSpace(d)
+		if d == "" || seen[d] {
+			continue
+		}
+		seen[d] = true
+		cleaned = append(cleaned, d)
+	}
+	s.mu.Lock()
+	s.state.ScanDirectories = cleaned
+	s.state.ScanDirectoriesEnabled = enabled
+	err := s.saveStateLocked()
+	s.mu.Unlock()
+	return cleaned, enabled, err
+}
+
 func (s *AgentService) Enable() (models.AgentStatusResponse, error) {
 	return s.EnableWithAuthorization("")
 }
@@ -280,6 +341,69 @@ func (s *AgentService) DisableWithReason(reason string) models.AgentStatusRespon
 
 	s.forceDisconnectRemote(reason)
 	return status
+}
+
+// RecoverIfAuthExpired re-enables the agent if and only if it is currently
+// disabled because of an auth_expired session. A successful token refresh
+// (the caller of this method) means we hold a fresh, valid JWT again, so the
+// reason for the terminal disable is gone: re-enabling re-registers the device
+// with the fresh JWT (via Enable → registerAndSync) and reconnects the remote
+// WS. This turns a one-hit "permanent offline until manual re-login" into a
+// self-healing blip.
+//
+// It is a deliberate no-op for every other disable reason — logout is a
+// deliberate user action, device_unbound means the device was unbound, and
+// device_token_invalid means the token is still rejected; none are resolved by
+// a refresh, so auto-re-enabling would undo an intentional state or loop.
+func (s *AgentService) RecoverIfAuthExpired() (models.AgentStatusResponse, error) {
+	s.mu.Lock()
+	reason := normalizeAgentDisableReason(s.state.LastSyncStatus)
+	enabled := s.state.Enabled
+	status := s.statusLocked()
+	s.mu.Unlock()
+	if enabled || reason != "auth_expired" {
+		return status, nil
+	}
+	logger.Info("[AGENT-BOOT] auth_recover re-enabling agent reason=auth_expired (refresh succeeded)")
+	return s.Enable()
+}
+
+// ReRegisterIfUserIdentityChanged binds the device to the current JWT user when
+// the persisted registration identity no longer matches. Corrects two cases that
+// otherwise leave a device bound to the wrong (or no) owner:
+//   - The agent started before the JWT was available and never registered
+//     (login_required) — now the JWT is here, so register.
+//   - The agent registered under a fallback identity (e.g. admin-console) before
+//     the JWT loaded — clear that token and re-register under the real user.
+//
+// Called after a successful token refresh. No-op when already registered as the
+// current user, or when there is still no JWT.
+func (s *AgentService) ReRegisterIfUserIdentityChanged() {
+	authHeader := effectiveAgentRegisterAuthHeader("")
+	if authHeader == "" {
+		return // JWT still not available
+	}
+	currentUserKey := agentRegistrationUserKey("", authHeader)
+	s.mu.Lock()
+	registeredUser := strings.TrimSpace(s.state.RegisteredUser)
+	hasToken := strings.TrimSpace(s.state.DeviceToken) != ""
+	mismatch := hasToken && registeredUser != "" && registeredUser != currentUserKey
+	if mismatch {
+		logger.Info(fmt.Sprintf("[AGENT-BOOT] identity_changed re-registering registered_user=%s current_user=%s device_id=%s",
+			registeredUser, currentUserKey, s.state.DeviceID))
+		s.state.Device = nil
+		s.state.DeviceToken = ""
+		s.state.Registered = false
+		s.state.RemoteConnected = false
+		s.state.RegisteredUser = ""
+		_ = s.saveStateLocked()
+	}
+	s.mu.Unlock()
+	if !hasToken || mismatch {
+		if err := s.SyncNowWithAuthorization(authHeader); err != nil {
+			logger.Warn(fmt.Sprintf("[AGENT-BOOT] identity_changed re-register failed error=%v", err))
+		}
+	}
 }
 
 func normalizeAgentDisableReason(reason string) string {
@@ -433,6 +557,27 @@ func RequestUserAgentDisableAfterLogout(reason string) {
 			logger.Warn(fmt.Sprintf("[AGENT-BOOT] auth_disable local_user_agent_failed reason=%s error=%v", reason, err))
 		}
 		logger.Info(fmt.Sprintf("[AGENT-BOOT] auth_disable applied reason=%s runtime=user_agent:%t", reason, IsUserAgentRuntime()))
+	}()
+}
+
+// RequestUserAgentRecoverAfterAuthExpired is the self-heal counterpart to
+// RequestUserAgentDisableAfterLogout. It is invoked from the auth-success hook
+// (handleAuthRefreshed) after a token refresh succeeds: if the agent was left
+// in the terminal auth_expired state by a prior refresh failure, a fresh valid
+// JWT means that state is stale — re-enable and reconnect. Cross-process safe,
+// mirroring the disable dispatcher (in-process under the user-agent runtime,
+// otherwise an HTTP POST to the local user-agent server).
+func RequestUserAgentRecoverAfterAuthExpired() {
+	go func() {
+		if IsUserAgentRuntime() {
+			if _, err := GetSharedAgentService().RecoverIfAuthExpired(); err != nil {
+				logger.Warn(fmt.Sprintf("[AGENT-BOOT] auth_recover failed error=%v", err))
+				return
+			}
+			logger.Info(fmt.Sprintf("[AGENT-BOOT] auth_recover applied runtime=user_agent:%t", IsUserAgentRuntime()))
+		} else if err := requestLocalUserAgentRecoverAfterAuthExpired(); err != nil {
+			logger.Warn(fmt.Sprintf("[AGENT-BOOT] auth_recover local_user_agent_failed error=%v", err))
+		}
 	}()
 }
 
@@ -921,7 +1066,13 @@ func (s *AgentService) registerAndSyncLockedWithUserContext(authHeader string, u
 	}
 
 	authHeader = effectiveAgentRegisterAuthHeader(authHeader)
-	if authHeader == "" && !shouldUseAdminConsoleAgentRegistration(authHeader, false) {
+	// Registration requires a valid aliang JWT — it is the sole identity source
+	// for binding a device to an owner. No JWT → login_required. NEVER fall back
+	// to an admin-console / platform identity (that is what bound devices to
+	// platform_admin when the agent started before the JWT was loaded). The
+	// agent retries on the next sync once the JWT is available; see
+	// ReRegisterIfUserIdentityChanged.
+	if authHeader == "" {
 		s.state.Enabled = false
 		s.state.Registered = false
 		s.state.RemoteConnected = false
@@ -1329,6 +1480,14 @@ func requestLocalUserAgentDisableAfterLogout(reason string) error {
 	return requestLocalUserAgentPost(endpoint, "", "")
 }
 
+func requestLocalUserAgentRecoverAfterAuthExpired() error {
+	// /api/agent/auth-recover is self-gating (RecoverIfAuthExpired is a no-op
+	// unless the agent is currently disabled with reason auth_expired), so this
+	// is a safe idempotent nudge from the main process after a refresh.
+	endpoint := strings.TrimRight(localUserAgentBaseURL(), "/") + "/api/agent/auth-recover"
+	return requestLocalUserAgentPost(endpoint, "", "")
+}
+
 func requestLocalUserAgentPost(endpoint string, authHeader string, userKey string) error {
 	req, err := http.NewRequest(http.MethodPost, endpoint, nil)
 	if err != nil {
@@ -1420,6 +1579,27 @@ func (s *AgentService) applyRemoteDeviceSettings(msg map[string]interface{}) {
 	}
 }
 
+// applyRemoteProjectSettings handles a project.settings.updated push: the server
+// signals a project's approval_policy.hash changed. When it differs from the
+// locally-effective policy for that path, reset that path's sync throttle so the
+// next ensurePolicyBeforeRun pulls immediately (this push is the primary update
+// path; the pre-run hash check is just a backstop). No-op when path/hash absent.
+func (s *AgentService) applyRemoteProjectSettings(msg map[string]interface{}) {
+	path := normalizePolicyPath(remoteString(msg, "path"))
+	remoteHash := remoteApprovalPolicyHash(msg, nil)
+	if path == "" || remoteHash == "" {
+		return
+	}
+	if current := s.effectiveApprovalPolicyForPath(path); current.Hash == remoteHash {
+		return
+	}
+	s.mu.Lock()
+	s.resetPolicySyncThrottleLocked(path)
+	s.mu.Unlock()
+	logger.Info(fmt.Sprintf("approval-policy: project.settings.updated push path=%q hash=%q -> refetch", path, remoteHash))
+	go s.ensurePolicyBeforeRun(context.Background(), path)
+}
+
 func remoteStringSlice(msg map[string]interface{}, key string) []string {
 	raw, ok := msg[key]
 	if !ok || raw == nil {
@@ -1452,7 +1632,7 @@ func (s *AgentService) buildAgentStatusSyncPayloadLocked(status string) agentSta
 	if status == "" {
 		status = "online"
 	}
-	snapshot := collectAgentSyncSnapshot()
+	snapshot := collectAgentSyncSnapshot(activeScanDirs(s.state.ScanDirectories, s.state.ScanDirectoriesEnabled))
 	return agentStatusSyncPayload{
 		DeviceID:              s.state.DeviceID,
 		Status:                status,

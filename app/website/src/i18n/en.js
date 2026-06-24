@@ -418,6 +418,11 @@ export default {
   settings_loginRequiredSettingsDesc: 'Customer config editing stays blocked until a backend auth session is restored or you log in with the account card on this page.',
   settings_loginRequiredLogs: 'Login required for status access',
   settings_loginRequiredLogsDesc: 'Status and live logs stay hidden until you log in. The login form stays available in the account card when you switch back to the Settings tab.',
+  settings_tabAgent: 'Agent',
+  settings_pageAgent: 'Agent',
+  settings_pageActivity: 'Activity',
+  settings_loginRequiredAgent: 'Login required for agent activity',
+  settings_loginRequiredAgentDesc: 'Agent sessions and prompts stay hidden until you log in.',
   settings_configSaved: 'Customer configuration saved successfully.',
   settings_configLoadFailed: 'Failed to load customer configuration.',
   settings_configSaveFailed: 'Failed to save customer configuration.',
@@ -897,6 +902,31 @@ export default {
   agent_launchSuccess: 'Command launched.',
   agent_launchFailed: 'Failed to launch command.',
   agent_remoteTerminalDisabled: 'Remote terminal is disabled. Commands cannot run.',
+
+  // -- AgentActivitySettings --
+  agent_activity_title: 'Agent Activity',
+  agent_activity_desc: 'Recent Agent sessions and prompts (prompts in full, replies summarized)',
+  agent_activity_loading: 'Loading…',
+  agent_activity_loadFailed: 'Failed to load',
+  agent_activity_noSessions: 'No agent sessions yet',
+  agent_activity_runtimeOffline: 'Agent runtime is not running',
+  agent_activity_refresh: 'Refresh',
+  agent_activity_messages: 'messages',
+  agent_activity_viewDetail: 'View conversation',
+  agent_activity_loadMore: 'Load earlier',
+  agent_activity_noMore: 'No more',
+  agent_activity_you: 'You',
+  agent_activity_ai: 'AI',
+
+  // -- AgentScanDirectories --
+  agent_scan_title: 'Scan Directories',
+  agent_scan_desc: 'When enabled, only projects and sessions under these directories are uploaded to the cloud.',
+  agent_scan_enable: 'Enable scan-directory filter',
+  agent_scan_dirPlaceholder: 'e.g. /Users/me/code',
+  agent_scan_addDir: 'Add directory',
+  agent_scan_save: 'Save',
+  agent_scan_saved: 'Saved',
+  agent_scan_saveFailed: 'Failed to save',
 
   // -- ModelMappingSettings --
   modelMapping_title: 'Model Mapping',

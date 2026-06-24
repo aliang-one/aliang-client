@@ -38,6 +38,14 @@
             >
               {{ t('settings_tabLogs') }}
             </a>
+            <a
+              class="py-5 text-sm font-medium"
+              :class="currentPage === 'agent' ? 'border-b-2 border-primary text-primary' : 'text-slate-500 hover:text-slate-700 dark:text-slate-300 dark:hover:text-slate-100'"
+              href="javascript:void(0)"
+              @click="showPage('agent')"
+            >
+              {{ t('settings_tabAgent') }}
+            </a>
           </nav>
           <div class="flex items-center gap-4">
             <div class="hidden text-right text-xs lg:flex lg:flex-col">
@@ -74,7 +82,7 @@
           <div class="rounded bg-primary/10 px-3 py-1 text-xs font-bold text-primary">{{ t('settings_live') }}</div>
         </div>
 
-        <div class="mb-6 grid grid-cols-3 gap-2 md:hidden">
+        <div class="mb-6 grid grid-cols-2 gap-2 md:hidden">
           <button
             type="button"
             class="rounded-lg border px-3 py-2 text-sm font-semibold transition"
@@ -98,6 +106,14 @@
             @click="showPage('log')"
           >
             {{ t('settings_tabLogs') }}
+          </button>
+          <button
+            type="button"
+            class="rounded-lg border px-3 py-2 text-sm font-semibold transition"
+            :class="currentPage === 'agent' ? 'border-primary bg-primary text-white' : 'border-slate-200 bg-white text-slate-700 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-100'"
+            @click="showPage('agent')"
+          >
+            {{ t('settings_tabAgent') }}
           </button>
         </div>
 
@@ -147,11 +163,27 @@
           <aside class="flex flex-col gap-6 lg:col-span-4">
             <SystemSettings v-if="isAuthenticated" />
             <AgentSettings v-if="isAuthenticated" />
+            <AgentScanDirectoriesSettings v-if="isAuthenticated" />
           </aside>
         </div>
 
         <section v-else-if="currentPage === 'user'" class="flex flex-col gap-4">
           <UserInfoSettings />
+        </section>
+
+        <section v-else-if="currentPage === 'agent'" class="flex flex-col gap-4">
+          <div
+            v-if="!isAuthenticated"
+            class="rounded-2xl border border-dashed border-slate-300 bg-white px-6 py-8 text-center shadow-sm dark:border-slate-700 dark:bg-slate-900"
+          >
+            <div class="mx-auto max-w-2xl space-y-3">
+              <h2 class="text-xl font-bold text-slate-900 dark:text-white">{{ t('settings_loginRequiredAgent') }}</h2>
+              <p class="text-sm text-slate-500 dark:text-slate-300">
+                {{ t('settings_loginRequiredAgentDesc') }}
+              </p>
+            </div>
+          </div>
+          <AgentActivitySettings v-if="isAuthenticated" />
         </section>
 
         <section v-else class="flex flex-col gap-4">
@@ -203,6 +235,8 @@ import UserInfoSettings from './settings/UserInfoSettings.vue';
 import LogsSettings from './settings/LogsSettings.vue';
 import SystemSettings from './settings/SystemSettings.vue';
 import AgentSettings from './settings/AgentSettings.vue';
+import AgentActivitySettings from './settings/AgentActivitySettings.vue';
+import AgentScanDirectoriesSettings from './settings/AgentScanDirectoriesSettings.vue';
 import ModelMappingSettings from './settings/ModelMappingSettings.vue';
 import { useNavigation } from '../composables/useNavigation';
 import { openTutorialDocs } from '../composables/useTutorialDocs';
@@ -356,6 +390,8 @@ export default {
     LogsSettings,
     SystemSettings,
     AgentSettings,
+    AgentActivitySettings,
+    AgentScanDirectoriesSettings,
     ModelMappingSettings
   },
   setup() {
@@ -388,7 +424,7 @@ export default {
   },
   computed: {
     isVisible() {
-      return ['settings', 'user', 'log'].includes(this.currentPage);
+      return ['settings', 'user', 'log', 'agent'].includes(this.currentPage);
     },
     pageTitle() {
       if (this.currentPage === 'user') {
@@ -396,6 +432,9 @@ export default {
       }
       if (this.currentPage === 'log') {
         return this.t('settings_pageLog');
+      }
+      if (this.currentPage === 'agent') {
+        return this.t('settings_pageAgent');
       }
       return this.t('settings_pageConfiguration');
     },
@@ -405,6 +444,9 @@ export default {
       }
       if (this.currentPage === 'log') {
 	      return this.t('settings_pageOverview');
+      }
+      if (this.currentPage === 'agent') {
+        return this.t('settings_pageActivity');
       }
       return this.t('settings_pageCenter');
     },

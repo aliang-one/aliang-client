@@ -418,6 +418,11 @@ export default {
   settings_loginRequiredSettingsDesc: '在后端认证会话恢复或您在本页登录之前，客户配置编辑将保持锁定状态。',
   settings_loginRequiredLogs: '查看状态需要先登录',
   settings_loginRequiredLogsDesc: '状态与实时日志在您登录前不可见。切换回设置标签页后可使用账户卡片上的登录表单。',
+  settings_tabAgent: 'Agent',
+  settings_pageAgent: 'Agent',
+  settings_pageActivity: '活动',
+  settings_loginRequiredAgent: '查看 Agent 活动需要先登录',
+  settings_loginRequiredAgentDesc: 'Agent 会话与提问记录在您登录前不可见。',
   settings_configSaved: '客户配置已成功保存。',
   settings_configLoadFailed: '加载客户配置失败。',
   settings_configSaveFailed: '保存客户配置失败。',
@@ -897,6 +902,31 @@ export default {
   agent_launchSuccess: '命令已启动。',
   agent_launchFailed: '启动命令失败。',
   agent_remoteTerminalDisabled: '远程终端能力已关闭，无法执行命令。',
+
+  // -- AgentActivitySettings --
+  agent_activity_title: 'Agent 活动',
+  agent_activity_desc: '最近的 Agent 会话与提问记录（仅展示提问，回答为摘要）',
+  agent_activity_loading: '加载中…',
+  agent_activity_loadFailed: '加载失败',
+  agent_activity_noSessions: '暂无 Agent 会话记录',
+  agent_activity_runtimeOffline: 'Agent 运行时未运行，暂无数据',
+  agent_activity_refresh: '刷新',
+  agent_activity_messages: '条消息',
+  agent_activity_viewDetail: '查看对话',
+  agent_activity_loadMore: '加载更早',
+  agent_activity_noMore: '没有更多了',
+  agent_activity_you: '你',
+  agent_activity_ai: 'AI',
+
+  // -- AgentScanDirectories --
+  agent_scan_title: '扫描目录',
+  agent_scan_desc: '开启后，只上传这些目录下的项目和会话到云端。',
+  agent_scan_enable: '启用扫描目录限制',
+  agent_scan_dirPlaceholder: '如 /Users/me/code',
+  agent_scan_addDir: '添加目录',
+  agent_scan_save: '保存',
+  agent_scan_saved: '已保存',
+  agent_scan_saveFailed: '保存失败',
 
   // -- ModelMappingSettings --
   modelMapping_title: '模型映射',

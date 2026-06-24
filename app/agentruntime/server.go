@@ -114,6 +114,9 @@ func registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/agent/protocol", agentHandler.HandleProtocol)
 	mux.HandleFunc("/api/agent/tools/launch", agentHandler.HandleLaunch)
 	mux.HandleFunc("/api/agent/ai/approval-hook", agentHandler.HandleAIApprovalHook)
+	mux.HandleFunc("/api/agent/sessions", agentHandler.HandleVibeSessions)
+	mux.HandleFunc("/api/agent/session", agentHandler.HandleVibeSession)
+	mux.HandleFunc("/api/agent/scan-directories", agentHandler.HandleScanDirectories)
 }
 
 func loopbackOnly(next http.Handler) http.Handler {

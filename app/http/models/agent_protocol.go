@@ -16,6 +16,7 @@ const (
 	AgentEventError                   = "agent.error"
 	AgentEventDeviceUnbound           = "device.unbound"
 	AgentEventDeviceSettings          = "device.settings.updated"
+	AgentEventProjectSettings         = "project.settings.updated"
 	AgentEventTerminalCreate          = "terminal.create"
 	AgentEventTerminalCreated         = "terminal.created"
 	AgentEventTerminalInput           = "terminal.input"
@@ -31,6 +32,8 @@ const (
 	AgentEventAISessionClosed         = "ai.session.closed"
 	AgentEventAIMessage               = "ai.message"
 	AgentEventAIMessageReceived       = "ai.message.received" // agent→cloud receipt ack; drives the admin per-turn pipeline's "Agent 已收到" confirmed node
+	AgentEventAISteer                 = "ai.steer"            // cloud→agent: append user input to the active Codex app-server turn
+	AgentEventAISteerAck              = "ai.steer.ack"        // agent→cloud: non-terminal steer delivery/result ack
 	AgentEventAIRunStarted            = "ai.run.started"
 	AgentEventAIDelta                 = "ai.delta"
 	AgentEventAIDone                  = "ai.done"
@@ -156,6 +159,7 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				{Type: AgentEventTerminalError, Required: []string{"type", "session_id", "error"}},
 				{Type: AgentEventAISessionCreated, Required: []string{"type", "session_id", "mode", "project_path", "provider", "state"}, Optional: []string{"state=idle"}},
 				{Type: AgentEventAIRunStarted, Required: []string{"type", "session_id", "message_id", "provider", "mode", "project_path"}, Optional: []string{"state=running"}},
+				{Type: AgentEventAISteerAck, Required: []string{"type", "session_id", "message_id", "result"}, Optional: []string{"error", "code", "acked_at"}},
 				{Type: AgentEventAIDelta, Required: []string{"type", "session_id", "message_id", "channel", "delta"}},
 				{Type: AgentEventAIDone, Required: []string{"type", "session_id", "message_id"}},
 				{Type: AgentEventAIRunProgress, Required: []string{"type", "session_id"}, Optional: []string{"message_id", "files_touched_count", "git_changed_count"}},
@@ -166,7 +170,7 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				{Type: AgentEventAITask, Required: []string{"type", "session_id", "message_id", "tasks"}},
 				{Type: AgentEventAIStatus, Required: []string{"type", "session_id", "status"}},
 				{Type: AgentEventAIError, Required: []string{"type", "session_id", "error"}},
-				{Type: AgentEventAIApprovalRequest, Required: []string{"type", "session_id", "message_id", "approval_id", "provider", "kind", "status"}, Optional: []string{"title", "reason", "command", "cwd", "tool_name", "tool_input", "file_changes", "available_decisions", "decision", "raw"}},
+				{Type: AgentEventAIApprovalRequest, Required: []string{"type", "session_id", "message_id", "approval_id", "provider", "kind", "status"}, Optional: []string{"title", "reason", "command", "cwd", "tool_name", "tool_input", "file_changes", "available_decisions", "decision", "raw", "matched_rule_id", "policy_version"}},
 				{Type: AgentEventAIApprovalAck, Required: []string{"type", "session_id", "approval_id", "result"}, Optional: []string{"delivery_id"}},
 				{Type: AgentEventAIApprovalSync, Required: []string{"type"}, Optional: []string{"pending"}},
 				{Type: AgentEventAIApprovalCancelled, Required: []string{"type", "session_id"}, Optional: []string{"approval_ids", "reason"}},
@@ -187,12 +191,14 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				{Type: AgentEventSessionRefreshAck, Optional: []string{"ok", "auth_expires_at"}},
 				{Type: AgentEventDeviceUnbound},
 				{Type: AgentEventDeviceSettings, Required: []string{"device"}},
+				{Type: AgentEventProjectSettings, Required: []string{"path"}, Optional: []string{"project_id", "approval_policy"}},
 				{Type: AgentEventTerminalCreate, Required: []string{"type", "session_id"}, Optional: []string{"shell", "cwd", "rows", "cols"}, Emits: []string{AgentEventTerminalCreated, AgentEventTerminalOutput, AgentEventTerminalExit, AgentEventTerminalError}},
 				{Type: AgentEventTerminalInput, Required: []string{"type", "session_id", "data"}, Emits: []string{AgentEventTerminalOutput, AgentEventTerminalError}},
 				{Type: AgentEventTerminalResize, Required: []string{"type", "session_id", "rows", "cols"}, Emits: []string{AgentEventTerminalResized, AgentEventTerminalError}},
 				{Type: AgentEventTerminalClose, Required: []string{"type", "session_id"}, Emits: []string{AgentEventTerminalExit}},
 				{Type: AgentEventAISessionCreate, Required: []string{"type", "session_id"}, Optional: []string{"project_path", "mode", "provider", "tool", "model", "source_session_id", "resume_session_id", "initial_context", "transcript"}, Emits: []string{AgentEventAISessionCreated, AgentEventAIError}},
 				{Type: AgentEventAIMessage, Required: []string{"type", "session_id", "message_id", "content"}, Optional: []string{"attachments", "provider", "tool", "model", "project_path", "source_session_id", "resume_session_id"}, Emits: []string{AgentEventAIMessageReceived, AgentEventAIRunStarted, AgentEventAIDelta, AgentEventAIThinking, AgentEventAICommand, AgentEventAIFileChange, AgentEventAIUsage, AgentEventAITask, AgentEventAIApprovalRequest, AgentEventAIRunProgress, AgentEventAIDone, AgentEventAIError}},
+				{Type: AgentEventAISteer, Required: []string{"type", "session_id", "message_id", "content"}, Optional: []string{"mode"}, Emits: []string{AgentEventAISteerAck}},
 				{Type: AgentEventAIMessageReceived, Required: []string{"type", "session_id", "message_id"}, Optional: []string{"received_at"}},
 				{Type: AgentEventAIApprovalResponse, Required: []string{"type", "session_id", "approval_id", "decision"}, Optional: []string{"message_id", "scope", "raw", "delivery_id", "attempt"}, Emits: []string{AgentEventAIApprovalAck, AgentEventAIStatus, AgentEventAIError}},
 				{Type: AgentEventAIApprovalState, Required: []string{"type", "approval_id", "status"}, Optional: []string{"session_id"}},
@@ -210,7 +216,7 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 		Streams: []AgentProtocolStream{
 			{Name: "terminal", Event: AgentEventTerminalOutput, Required: []string{"session_id", "encoding", "data"}, Description: "PTY bytes are forwarded as text chunks in arrival order."},
 			{Name: "ai_chat", Event: AgentEventAIDelta, Required: []string{"session_id", "message_id", "channel", "delta"}, Optional: []string{"provider"}, Description: "Headless AI CLI stdout/stderr is streamed as soon as bytes arrive."},
-			{Name: "ai_approval", Event: AgentEventAIApprovalRequest, Required: []string{"session_id", "message_id", "approval_id", "provider", "kind", "status"}, Optional: []string{"title", "reason", "command", "cwd", "tool_name", "tool_input", "file_changes", "available_decisions", "decision"}, Description: "Headless AI CLI permission requests are surfaced to the user and resumed only after an ai.approval.response decision."},
+			{Name: "ai_approval", Event: AgentEventAIApprovalRequest, Required: []string{"session_id", "message_id", "approval_id", "provider", "kind", "status"}, Optional: []string{"title", "reason", "command", "cwd", "tool_name", "tool_input", "file_changes", "available_decisions", "decision", "matched_rule_id", "policy_version"}, Description: "Headless AI CLI permission requests are surfaced to the user and resumed only after an ai.approval.response decision. matched_rule_id/policy_version carry the approval-policy context that triggered the escalation (optional; absent for auto-approved tools, which never reach the cloud)."},
 		},
 	}
 }

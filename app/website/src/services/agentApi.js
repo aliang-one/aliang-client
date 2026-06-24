@@ -48,3 +48,29 @@ export async function launchAgentTool(payload) {
     body: JSON.stringify(payload || {}),
   });
 }
+
+export async function getAgentSessions() {
+  return request('/api/agent/sessions', { method: 'GET' });
+}
+
+export async function getAgentSessionDetail(sessionId, { limit, before } = {}) {
+  const params = new URLSearchParams();
+  if (limit) params.set('limit', String(limit));
+  if (before) params.set('before', before);
+  const query = params.toString();
+  return request(
+    `/api/agent/session?id=${encodeURIComponent(sessionId)}${query ? `&${query}` : ''}`,
+    { method: 'GET' }
+  );
+}
+
+export async function getAgentScanDirectories() {
+  return request('/api/agent/scan-directories', { method: 'GET' });
+}
+
+export async function setAgentScanDirectories({ enabled, directories }) {
+  return request('/api/agent/scan-directories', {
+    method: 'POST',
+    body: JSON.stringify({ enabled, directories }),
+  });
+}

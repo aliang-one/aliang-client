@@ -28,6 +28,10 @@ type agentAIManager struct {
 	sessions           map[string]*agentAISession
 	approvals          map[string]*agentAIApprovalWaiter
 	completedApprovals map[string]*agentAICompletedApproval
+	// service is the owning AgentService (set when the service creates this
+	// manager), used to evaluate the device approval policy. nil for standalone
+	// test managers, which fall back to GetSharedAgentService().
+	service *AgentService
 }
 
 type agentAISession struct {
@@ -50,6 +54,38 @@ type agentAISession struct {
 	runSeq          int
 	history         []agentAIMessage
 	pendingOption   *agentAIOptionRequest // run 结束检测到方案块时置位，等 ai.option.response
+	codexSteer      *agentAICodexSteerControl
+}
+
+type agentAISteerMessage struct {
+	MessageID string
+	Content   string
+	CreatedAt time.Time
+}
+
+type agentAICodexSteerControl struct {
+	mu        sync.Mutex
+	sessionID string
+	runSeq    int
+	threadID  string
+	turnID    string
+	closed    bool
+	send      func(map[string]interface{}) error
+	write     agentTerminalWriter
+	nextID    int64
+	pending   map[string]agentAISteerMessage
+	queue     []agentAISteerMessage
+}
+
+func newAgentAICodexSteerControl(run agentAIRun, send func(map[string]interface{}) error, write agentTerminalWriter) *agentAICodexSteerControl {
+	return &agentAICodexSteerControl{
+		sessionID: run.sessionID,
+		runSeq:    run.runSeq,
+		send:      send,
+		write:     write,
+		nextID:    100,
+		pending:   make(map[string]agentAISteerMessage),
+	}
 }
 
 type agentAIMessage struct {
@@ -73,6 +109,10 @@ type agentAIRun struct {
 	cancel          context.CancelFunc
 	approvalToken   string
 	activity        *agentAIActivity
+	// Policy context for an escalated approval: which rule triggered it and the
+	// policy version that decided. Set by the approval hooks before escalation.
+	matchedRuleID string
+	policyVersion int
 }
 
 type agentAITool struct {
@@ -98,7 +138,10 @@ type agentAIApprovalRequest struct {
 	FileChanges        json.RawMessage
 	AvailableDecisions []string
 	Raw                json.RawMessage
-	respond            chan agentAIApprovalResponse
+	// Policy context surfaced to the approver (which rule + which policy version).
+	MatchedRuleID string
+	PolicyVersion int
+	respond       chan agentAIApprovalResponse
 }
 
 type agentAIApprovalResponse struct {
@@ -219,6 +262,16 @@ func newAgentAIManager() *agentAIManager {
 		approvals:          make(map[string]*agentAIApprovalWaiter),
 		completedApprovals: make(map[string]*agentAICompletedApproval),
 	}
+}
+
+// approvalService returns the AgentService that owns this manager (used to
+// evaluate the device approval policy), falling back to the process-wide
+// shared service for standalone test managers that have no owner.
+func (m *agentAIManager) approvalService() *AgentService {
+	if m.service != nil {
+		return m.service
+	}
+	return GetSharedAgentService()
 }
 
 // agentAIActivity tracks whether an AI run is alive. A run is considered active
@@ -514,9 +567,380 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 		return
 	}
 
+	// Slash-command dispatcher: agent-local builtins (/clear /model /help /cost
+	// /compact) run WITHOUT a model turn. The Go agent drives the CLI headlessly
+	// (claude --print --resume / codex app-server --stdio), so there is no live
+	// REPL to receive interactive slash commands — these are direct session
+	// operations (/clear /model) or honest status replies (/help /cost /compact).
+	// Prompt-style commands (/review, custom .claude/commands) and unknown /xxx
+	// fall through to the normal model turn below.
+	if m.handleLocalSlashCommand(session, messageID, content, provider, writeJSON) {
+		return
+	}
+
 	if err := m.runUserMessage(session, messageID, content, provider, writeJSON); err != nil {
 		_ = writeJSON(agentAIErrorPayload(sessionID, messageID, err))
 	}
+}
+
+// parseLocalSlashCommand recognizes a leading "/<name>" with optional args.
+// Returns ok=false when content is not a slash command or the name is empty.
+// Callers further filter to the agent-local builtin set; anything else falls
+// through to a normal model turn.
+func parseLocalSlashCommand(content string) (name, args string, ok bool) {
+	if !strings.HasPrefix(content, "/") {
+		return "", "", false
+	}
+	rest := content[1:]
+	if rest == "" {
+		return "", "", false
+	}
+	for i := 0; i < len(rest); i++ {
+		c := rest[i]
+		if c == ' ' || c == '\t' {
+			return strings.ToLower(rest[:i]), strings.TrimSpace(rest[i:]), true
+		}
+	}
+	return strings.ToLower(rest), "", true
+}
+
+// localSlashBuiltins is the set of agent-local slash commands handled without a
+// model turn. Keep in sync with the catalogs' remote='local' entries
+// (AliangPhoneServer server/src/agentCommands.ts, the phone's
+// src/utils/agentCommands.ts, and scripts/local-agent.ts BUILTIN_COMMANDS).
+var localSlashBuiltins = map[string]struct{}{
+	"clear":   {},
+	"model":   {},
+	"help":    {},
+	"cost":    {},
+	"compact": {},
+}
+
+// handleLocalSlashCommand intercepts agent-local slash commands and runs them
+// without spawning a model turn, replying with ai.run.started + ai.delta(status)
+// + ai.done so the phone settles with a clear outcome. Returns true when handled
+// (the caller then skips runUserMessage).
+func (m *agentAIManager) handleLocalSlashCommand(session *agentAISession, messageID, content, provider string, writeJSON agentTerminalWriter) bool {
+	name, args, ok := parseLocalSlashCommand(content)
+	if !ok {
+		return false
+	}
+	if _, isLocal := localSlashBuiltins[name]; !isLocal {
+		return false // prompt-style (/review, custom .claude/commands) or unknown → normal turn
+	}
+
+	assistantID := agentAssistantMessageID(messageID)
+	_ = writeJSON(map[string]interface{}{
+		"type":         models.AgentEventAIRunStarted,
+		"session_id":   session.id,
+		"message_id":   assistantID,
+		"provider":     provider,
+		"mode":         session.mode,
+		"project_path": session.projectPath,
+		"state":        "running",
+	})
+
+	line := m.applyLocalSlashCommand(session, name, args)
+
+	_ = writeJSON(map[string]interface{}{
+		"type":       models.AgentEventAIDelta,
+		"session_id": session.id,
+		"message_id": assistantID,
+		"channel":    "stdout",
+		"delta":      line + "\n",
+	})
+	_ = writeJSON(map[string]interface{}{
+		"type":       models.AgentEventAIDone,
+		"session_id": session.id,
+		"message_id": assistantID,
+	})
+	return true
+}
+
+// applyLocalSlashCommand performs the side effect (if any) for a local slash
+// command and returns a single status line streamed back as the reply.
+func (m *agentAIManager) applyLocalSlashCommand(session *agentAISession, name, args string) string {
+	switch name {
+	case "clear":
+		// Reset the agent's continuity state so the next turn starts a fresh CLI
+		// session. resumeSessionID is only ever set on ai.session.create (never
+		// recaptured post-run), and when empty runUserMessage rebuilds the prompt
+		// from session.history via buildAgentAIPrompt — so clearing both gives a
+		// clean restart, with continuity re-established from the new history.
+		m.mu.Lock()
+		session.resumeSessionID = ""
+		session.history = nil
+		session.runSeq = 0
+		m.mu.Unlock()
+		return "✓ /clear 已清空当前会话上下文。下一轮将开启全新 CLI 会话(不带 --resume),之后通过本地历史重建连续性。"
+	case "model":
+		newModel := strings.TrimSpace(args)
+		if newModel == "" {
+			m.mu.Lock()
+			cur := session.model
+			m.mu.Unlock()
+			if cur == "" {
+				return "当前未指定模型(使用 CLI 默认)。用法:/model <name>"
+			}
+			return fmt.Sprintf("当前模型: %s。用法:/model <name> 切换。", cur)
+		}
+		m.mu.Lock()
+		session.model = newModel
+		m.mu.Unlock()
+		return fmt.Sprintf("✓ /model 已切换为 %s(下一轮生效)。", newModel)
+	case "help":
+		return "本机命令(remote=local): /clear  /model <name>  /help  /cost  /compact\n注: /compact 在 headless 模式不支持真实压缩。"
+	case "cost":
+		// Per-turn usage is emitted as ai.usage but not accumulated on the
+		// session, so there is no running total to report here.
+		return "⚠ headless agent 未累计会话用量。请在桌面端查看 token / 费用统计。"
+	case "compact":
+		return "⚠ /compact 在 headless (--print --resume) 模式下不支持真实压缩。建议用 /clear 重开新会话,或到桌面端 Claude Code 交互式执行 /compact。"
+	}
+	return ""
+}
+
+func (m *agentAIManager) steer(msg map[string]interface{}, writeJSON agentTerminalWriter) {
+	if writeJSON == nil {
+		return
+	}
+	sessionID := remoteString(msg, "session_id")
+	messageID := remoteString(msg, "message_id")
+	content := strings.TrimSpace(remoteString(msg, "content"))
+	if sessionID == "" {
+		emitAgentAISteerAck(writeJSON, "", messageID, "error", "ai.steer missing session_id", "bad_request")
+		return
+	}
+	if messageID == "" {
+		messageID = sessionID
+	}
+	if content == "" {
+		emitAgentAISteerAck(writeJSON, sessionID, messageID, "error", "ai.steer content is empty", "bad_request")
+		return
+	}
+	if len(content) > agentAIMessageLimitBytes {
+		emitAgentAISteerAck(writeJSON, sessionID, messageID, "error", fmt.Sprintf("ai.steer exceeds %d bytes", agentAIMessageLimitBytes), "bad_request")
+		return
+	}
+
+	m.mu.Lock()
+	session := m.sessions[sessionID]
+	if session == nil {
+		m.mu.Unlock()
+		emitAgentAISteerAck(writeJSON, sessionID, messageID, "not_running", fmt.Sprintf("ai session not found: %s", sessionID), "")
+		return
+	}
+	if session.cancel == nil {
+		m.mu.Unlock()
+		emitAgentAISteerAck(writeJSON, sessionID, messageID, "not_running", fmt.Sprintf("ai session is not running: %s", sessionID), "")
+		return
+	}
+	control := session.codexSteer
+	if control == nil {
+		m.mu.Unlock()
+		emitAgentAISteerAck(writeJSON, sessionID, messageID, "unsupported", "ai.steer is only supported by active Codex app-server runs", "unsupported_provider")
+		return
+	}
+	now := time.Now().UTC()
+	session.history = append(session.history, agentAIMessage{
+		Role:      "user",
+		MessageID: messageID,
+		Content:   content,
+		CreatedAt: now,
+	})
+	m.mu.Unlock()
+
+	result, err := control.enqueue(agentAISteerMessage{
+		MessageID: messageID,
+		Content:   content,
+		CreatedAt: now,
+	})
+	if err != nil {
+		emitAgentAISteerAck(writeJSON, sessionID, messageID, "error", err.Error(), "send_failed")
+		return
+	}
+	emitAgentAISteerAck(writeJSON, sessionID, messageID, result, "", "")
+}
+
+func emitAgentAISteerAck(writeJSON agentTerminalWriter, sessionID, messageID, result, errMsg, code string) {
+	if writeJSON == nil {
+		return
+	}
+	payload := map[string]interface{}{
+		"type":       models.AgentEventAISteerAck,
+		"session_id": sessionID,
+		"message_id": messageID,
+		"result":     result,
+		"acked_at":   time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	if errMsg != "" {
+		payload["error"] = errMsg
+	}
+	if code != "" {
+		payload["code"] = code
+	}
+	_ = writeJSON(payload)
+}
+
+func (c *agentAICodexSteerControl) enqueue(msg agentAISteerMessage) (string, error) {
+	if c == nil {
+		return "", errors.New("codex steer control is unavailable")
+	}
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return "", errors.New("codex turn is no longer running")
+	}
+	if c.threadID == "" || c.turnID == "" {
+		c.queue = append(c.queue, msg)
+		c.mu.Unlock()
+		return "queued", nil
+	}
+	id, payload := c.nextSteerPayloadLocked(msg)
+	send := c.send
+	c.mu.Unlock()
+	if err := send(payload); err != nil {
+		c.mu.Lock()
+		delete(c.pending, id)
+		c.mu.Unlock()
+		return "", err
+	}
+	return "queued", nil
+}
+
+func (c *agentAICodexSteerControl) markReady(threadID, turnID string) {
+	if c == nil {
+		return
+	}
+	type pendingSend struct {
+		id      string
+		payload map[string]interface{}
+	}
+	var sends []pendingSend
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
+	if strings.TrimSpace(threadID) != "" {
+		c.threadID = strings.TrimSpace(threadID)
+	}
+	if strings.TrimSpace(turnID) != "" {
+		c.turnID = strings.TrimSpace(turnID)
+	}
+	if c.threadID != "" && c.turnID != "" && len(c.queue) > 0 {
+		queued := c.queue
+		c.queue = nil
+		sends = make([]pendingSend, 0, len(queued))
+		for _, item := range queued {
+			id, payload := c.nextSteerPayloadLocked(item)
+			sends = append(sends, pendingSend{id: id, payload: payload})
+		}
+	}
+	send := c.send
+	c.mu.Unlock()
+
+	for _, item := range sends {
+		if err := send(item.payload); err != nil {
+			c.completePending(item.id, "error", err.Error(), "send_failed")
+		}
+	}
+}
+
+func (c *agentAICodexSteerControl) nextSteerPayloadLocked(msg agentAISteerMessage) (string, map[string]interface{}) {
+	c.nextID++
+	id := "aliang_steer_" + strconv.FormatInt(c.nextID, 10)
+	c.pending[id] = msg
+	return id, map[string]interface{}{
+		"method": "turn/steer",
+		"id":     id,
+		"params": map[string]interface{}{
+			"threadId":            c.threadID,
+			"expectedTurnId":      c.turnID,
+			"clientUserMessageId": msg.MessageID,
+			"input": []map[string]interface{}{
+				{"type": "text", "text": msg.Content, "text_elements": []interface{}{}},
+			},
+		},
+	}
+}
+
+func (c *agentAICodexSteerControl) handleResponse(msg map[string]interface{}) bool {
+	if c == nil {
+		return false
+	}
+	id := fmt.Sprint(msg["id"])
+	if strings.TrimSpace(id) == "" || id == "<nil>" {
+		return false
+	}
+	c.mu.Lock()
+	steer, ok := c.pending[id]
+	if ok {
+		delete(c.pending, id)
+	}
+	c.mu.Unlock()
+	if !ok {
+		return false
+	}
+	if errObj, ok := msg["error"].(map[string]interface{}); ok {
+		message := firstNonEmpty(remoteString(errObj, "message"), remoteString(errObj, "additionalDetails"), "codex turn/steer failed")
+		code := remoteString(errObj, "code")
+		if info, ok := errObj["codexErrorInfo"].(map[string]interface{}); ok {
+			code = firstNonEmpty(remoteString(info, "code"), code)
+		}
+		emitAgentAISteerAck(c.write, c.sessionID, steer.MessageID, "error", message, code)
+		return true
+	}
+	emitAgentAISteerAck(c.write, c.sessionID, steer.MessageID, "applied", "", "")
+	return true
+}
+
+func (c *agentAICodexSteerControl) completePending(id, result, errMsg, code string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	steer, ok := c.pending[id]
+	if ok {
+		delete(c.pending, id)
+	}
+	c.mu.Unlock()
+	if ok {
+		emitAgentAISteerAck(c.write, c.sessionID, steer.MessageID, result, errMsg, code)
+	}
+}
+
+func (c *agentAICodexSteerControl) close(result, errMsg, code string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
+	c.closed = true
+	items := make([]agentAISteerMessage, 0, len(c.queue)+len(c.pending))
+	items = append(items, c.queue...)
+	for _, item := range c.pending {
+		items = append(items, item)
+	}
+	c.queue = nil
+	c.pending = make(map[string]agentAISteerMessage)
+	write := c.write
+	c.mu.Unlock()
+
+	for _, item := range items {
+		emitAgentAISteerAck(write, c.sessionID, item.MessageID, result, errMsg, code)
+	}
+}
+
+func (m *agentAIManager) setCodexSteerControl(sessionID string, runSeq int, control *agentAICodexSteerControl) {
+	m.mu.Lock()
+	if session := m.sessions[sessionID]; session != nil && session.runSeq == runSeq {
+		session.codexSteer = control
+	}
+	m.mu.Unlock()
 }
 
 // runUserMessage 在 session 上派发一轮新的 AI run。message()（用户消息）与
@@ -564,6 +988,13 @@ func (m *agentAIManager) runUserMessage(session *agentAISession, messageID, cont
 	}
 	m.mu.Unlock()
 
+	// Best-effort sync of the device approval policy before the run starts, so a
+	// just-changed policy (or a fresh process with only the built-in default)
+	// picks up the current rules. Never blocks beyond a short timeout or errors
+	// the turn; failures keep the cached/built-in policy.
+	if svc := m.approvalService(); svc != nil {
+		svc.ensurePolicyBeforeRun(ctx, session.projectPath)
+	}
 	m.startAIWatchdog(ctx, activity, cancel)
 	go m.runCLI(ctx, run, writeJSON)
 	return nil
@@ -1052,6 +1483,29 @@ func (m *agentAIManager) handleClaudeApprovalHook(ctx context.Context, sessionID
 	writeJSON := session.activeWriter
 	m.mu.Unlock()
 
+	// Policy short-circuit: evaluate the device approval policy locally before
+	// hitting the cloud. Auto-approved/denied tools resolve here with no
+	// round-trip; only require_approval falls through to requestApproval.
+	toolName := firstNonEmpty(remoteString(raw, "tool_name"), remoteString(raw, "toolName"))
+	toolInput := marshalAgentAIRaw(raw["tool_input"])
+	if len(toolInput) == 0 {
+		toolInput = marshalAgentAIRaw(raw["toolInput"])
+	}
+	if svc := m.approvalService(); svc != nil {
+		switch decision, matchedID := svc.evaluateApprovalDecision(toolName, toolInput, run.projectPath); decision {
+		case decisionAutoApprove:
+			logger.Info(fmt.Sprintf("approval-hook: AUTO-APPROVE by policy rule=%s tool=%s session=%s (no cloud round-trip)", matchedID, toolName, sessionID))
+			return claudeApprovalHookDecision(hookEventName, true, "auto-approved by policy: "+matchedID), nil
+		case decisionAutoDeny:
+			logger.Info(fmt.Sprintf("approval-hook: AUTO-DENY by policy rule=%s tool=%s session=%s", matchedID, toolName, sessionID))
+			return claudeApprovalHookDecision(hookEventName, false, "denied by policy: "+matchedID), nil
+		case decisionRequireApproval:
+			// Attach policy context so the approver sees why it escalated.
+			run.matchedRuleID = matchedID
+			run.policyVersion = svc.effectiveApprovalPolicyForPath(run.projectPath).Version
+		}
+	}
+
 	req := buildClaudeApprovalRequest(run, raw)
 	approvalCtx, cancel := context.WithTimeout(ctx, 9*time.Minute)
 	defer cancel()
@@ -1104,6 +1558,8 @@ func buildClaudeApprovalRequest(run agentAIRun, raw map[string]interface{}) agen
 			models.AgentAIApprovalDecisionDecline,
 			models.AgentAIApprovalDecisionCancel,
 		},
+		MatchedRuleID: run.matchedRuleID,
+		PolicyVersion: run.policyVersion,
 	}
 }
 
@@ -1241,15 +1697,21 @@ func agentAIApprovalMapKey(sessionID string, approvalID string) string {
 func (m *agentAIManager) clearRunning(sessionID string, runSeq int, writeJSON agentTerminalWriter) {
 	m.mu.Lock()
 	session := m.sessions[sessionID]
+	var steerControl *agentAICodexSteerControl
 	if session != nil && session.runSeq == runSeq {
+		steerControl = session.codexSteer
 		session.cancel = nil
 		session.activeWriter = nil
 		session.approvalToken = ""
 		session.activity = nil
+		session.codexSteer = nil
 		session.history = trimAgentAIHistory(session.history)
 	}
 	cancelled := m.clearPendingApprovalsLocked(sessionID, runSeq, models.AgentAIApprovalDecisionCancel)
 	m.mu.Unlock()
+	if steerControl != nil {
+		steerControl.close("not_running", "codex turn ended before steer was applied", "turn_ended")
+	}
 	m.emitApprovalCancelled(writeJSON, sessionID, cancelled, "run_ended")
 }
 
@@ -1391,6 +1853,32 @@ func summarizeFileDiff(diff string) (added, removed int) {
 		}
 	}
 	return added, removed
+}
+
+func codexAppServerResponseID(msg map[string]interface{}) string {
+	if _, ok := msg["id"]; !ok {
+		return ""
+	}
+	return fmt.Sprint(msg["id"])
+}
+
+func codexAppServerResponseError(msg map[string]interface{}) (string, bool) {
+	errObj, ok := msg["error"].(map[string]interface{})
+	if !ok || errObj == nil {
+		return "", false
+	}
+	message := firstNonEmpty(remoteString(errObj, "message"), remoteString(errObj, "error"))
+	if info, ok := errObj["codexErrorInfo"].(map[string]interface{}); ok {
+		message = firstNonEmpty(message, remoteString(info, "message"), remoteString(info, "code"))
+	}
+	code := remoteString(errObj, "code")
+	if message == "" {
+		message = "unknown error"
+	}
+	if code != "" {
+		return fmt.Sprintf("%s (%s)", message, code), true
+	}
+	return message, true
 }
 
 // extractCodexCommandItem pulls the lifecycle fields of a codex
@@ -1692,16 +2180,6 @@ func (m *agentAIManager) runCodexAppServer(ctx context.Context, run agentAIRun, 
 		return agentAIRunDone
 	}
 
-	_ = writeJSON(map[string]interface{}{
-		"type":         models.AgentEventAIRunStarted,
-		"session_id":   run.sessionID,
-		"message_id":   agentAssistantMessageID(run.messageID),
-		"provider":     "codex",
-		"mode":         run.mode,
-		"project_path": run.projectPath,
-		"state":        "running",
-	})
-
 	var stderrBuf strings.Builder
 	var stderrWG sync.WaitGroup
 	stderrWG.Add(1)
@@ -1723,6 +2201,29 @@ func (m *agentAIManager) runCodexAppServer(ctx context.Context, run agentAIRun, 
 		}
 		return nil
 	}
+	steerControl := newAgentAICodexSteerControl(run, send, writeJSON)
+	m.setCodexSteerControl(run.sessionID, run.runSeq, steerControl)
+
+	model := normalizeAgentAIModel(run.model)
+	effort := strings.TrimSpace(run.effort)
+	codexPhase := "initializing"
+	terminalErr := ""
+	runStartedEmitted := false
+	emitRunStarted := func() {
+		if runStartedEmitted {
+			return
+		}
+		runStartedEmitted = true
+		_ = writeJSON(map[string]interface{}{
+			"type":         models.AgentEventAIRunStarted,
+			"session_id":   run.sessionID,
+			"message_id":   agentAssistantMessageID(run.messageID),
+			"provider":     "codex",
+			"mode":         run.mode,
+			"project_path": run.projectPath,
+			"state":        "running",
+		})
+	}
 
 	_ = send(map[string]interface{}{
 		"method": "initialize",
@@ -1738,20 +2239,20 @@ func (m *agentAIManager) runCodexAppServer(ctx context.Context, run agentAIRun, 
 	})
 	_ = send(map[string]interface{}{"method": "initialized", "params": map[string]interface{}{}})
 	threadParams := map[string]interface{}{
-		"cwd":                   run.projectPath,
-		"runtimeWorkspaceRoots": []string{run.projectPath},
-		"approvalPolicy":        "on-request",
-		"approvalsReviewer":     "user",
-		"sandbox":               "workspace-write",
+		"cwd":               run.projectPath,
+		"approvalPolicy":    "on-request",
+		"approvalsReviewer": "user",
+		"sandbox":           "workspace-write",
 	}
 	threadMethod := "thread/start"
 	if strings.TrimSpace(run.resumeSessionID) != "" {
 		threadMethod = "thread/resume"
 		threadParams["threadId"] = strings.TrimSpace(run.resumeSessionID)
 	}
-	if model := normalizeAgentAIModel(run.model); model != "" {
+	if model != "" {
 		threadParams["model"] = model
 	}
+	codexPhase = threadMethod
 	_ = send(map[string]interface{}{"method": threadMethod, "id": 1, "params": threadParams})
 
 	scanner := bufio.NewScanner(stdout)
@@ -1765,6 +2266,7 @@ func (m *agentAIManager) runCodexAppServer(ctx context.Context, run agentAIRun, 
 		outMu.Unlock()
 	}
 	threadID := ""
+	turnID := ""
 	turnStarted := false
 	completed := false
 	turnStatus := ""
@@ -1776,6 +2278,24 @@ func (m *agentAIManager) runCodexAppServer(ctx context.Context, run agentAIRun, 
 		var msg map[string]interface{}
 		if err := json.Unmarshal(scanner.Bytes(), &msg); err != nil {
 			continue
+		}
+		if steerControl.handleResponse(msg) {
+			continue
+		}
+		if responseID := codexAppServerResponseID(msg); responseID != "" {
+			if detail, ok := codexAppServerResponseError(msg); ok {
+				switch responseID {
+				case "0":
+					terminalErr = "Codex app-server initialize failed: " + detail
+					goto done
+				case "1":
+					terminalErr = fmt.Sprintf("Codex app-server %s failed: %s", threadMethod, detail)
+					goto done
+				case "2":
+					terminalErr = "Codex app-server turn/start failed: " + detail
+					goto done
+				}
+			}
 		}
 		if method := remoteString(msg, "method"); method != "" {
 			if _, hasID := msg["id"]; hasID {
@@ -1797,6 +2317,22 @@ func (m *agentAIManager) runCodexAppServer(ctx context.Context, run agentAIRun, 
 				continue
 			}
 			switch method {
+			case "turn/started":
+				if params, ok := msg["params"].(map[string]interface{}); ok {
+					if value := remoteString(params, "threadId"); value != "" {
+						threadID = value
+					}
+					if turn, ok := params["turn"].(map[string]interface{}); ok {
+						turnID = remoteString(turn, "id")
+					}
+					if turnID == "" {
+						turnID = remoteString(params, "turnId")
+					}
+					if turnID != "" {
+						codexPhase = "running"
+						steerControl.markReady(threadID, turnID)
+					}
+				}
 			case "item/agentMessage/delta":
 				if params, ok := msg["params"].(map[string]interface{}); ok {
 					out := dedup.process(remoteString(params, "itemId"), remoteString(params, "delta"))
@@ -1880,7 +2416,8 @@ func (m *agentAIManager) runCodexAppServer(ctx context.Context, run agentAIRun, 
 				goto done
 			case "error":
 				if params, ok := msg["params"].(map[string]interface{}); ok {
-					_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, fmt.Errorf("%s", firstNonEmpty(remoteString(params, "message"), remoteString(params, "error")))))
+					terminalErr = "Codex app-server error: " + firstNonEmpty(remoteString(params, "message"), remoteString(params, "error"), "unknown error")
+					goto done
 				}
 			}
 			continue
@@ -1893,18 +2430,42 @@ func (m *agentAIManager) runCodexAppServer(ctx context.Context, run agentAIRun, 
 			}
 			if threadID != "" {
 				turnStarted = true
+				emitRunStarted()
+				turnParams := map[string]interface{}{
+					"threadId":            threadID,
+					"clientUserMessageId": run.messageID,
+					"input": []map[string]interface{}{
+						{"type": "text", "text": run.prompt, "text_elements": []interface{}{}},
+					},
+					"approvalPolicy":    "on-request",
+					"approvalsReviewer": "user",
+				}
+				if model != "" {
+					turnParams["model"] = model
+				}
+				if effort != "" {
+					turnParams["effort"] = effort
+				}
+				codexPhase = "turn/start"
 				_ = send(map[string]interface{}{
 					"method": "turn/start",
 					"id":     2,
-					"params": map[string]interface{}{
-						"threadId": threadID,
-						"input": []map[string]interface{}{
-							{"type": "text", "text": run.prompt, "text_elements": []interface{}{}},
-						},
-						"approvalPolicy":    "on-request",
-						"approvalsReviewer": "user",
-					},
+					"params": turnParams,
 				})
+			} else if _, hasResult := msg["result"]; hasResult {
+				terminalErr = fmt.Sprintf("Codex app-server %s returned no thread id", threadMethod)
+				goto done
+			}
+		}
+		if fmt.Sprint(msg["id"]) == "2" && turnID == "" {
+			if result, ok := msg["result"].(map[string]interface{}); ok {
+				if turn, ok := result["turn"].(map[string]interface{}); ok {
+					turnID = remoteString(turn, "id")
+				}
+			}
+			if turnID != "" {
+				codexPhase = "running"
+				steerControl.markReady(threadID, turnID)
 			}
 		}
 	}
@@ -1918,6 +2479,12 @@ done:
 	if ctx.Err() != nil {
 		status, errMsg := agentAIRunStoppedStatus(run.activity, limiter)
 		if errMsg != "" {
+			if codexPhase != "" {
+				errMsg = fmt.Sprintf("%s while %s", errMsg, codexPhase)
+			}
+			if stderrText := strings.TrimSpace(stderrBuf.String()); stderrText != "" {
+				errMsg = fmt.Sprintf("%s; codex stderr: %s", errMsg, truncateForCloud(stderrText))
+			}
 			_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, errors.New(errMsg)))
 		}
 		_ = writeJSON(map[string]interface{}{
@@ -1927,13 +2494,28 @@ done:
 		})
 		return agentAIRunDone
 	}
+	if terminalErr != "" {
+		if stderrText := strings.TrimSpace(stderrBuf.String()); stderrText != "" {
+			terminalErr = fmt.Sprintf("%s; codex stderr: %s", terminalErr, truncateForCloud(stderrText))
+		}
+		_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, errors.New(terminalErr)))
+		return agentAIRunDone
+	}
 	if !completed {
 		if err := scanner.Err(); err != nil {
 			_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, err))
 			return agentAIRunDone
 		}
-		if waitErr != nil && !turnStarted {
-			_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, fmt.Errorf("%w: %s", waitErr, strings.TrimSpace(stderrBuf.String()))))
+		if waitErr != nil {
+			message := fmt.Sprintf("Codex app-server exited before turn completed while %s: %v", codexPhase, waitErr)
+			if stderrText := strings.TrimSpace(stderrBuf.String()); stderrText != "" {
+				message = fmt.Sprintf("%s; codex stderr: %s", message, truncateForCloud(stderrText))
+			}
+			_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, errors.New(message)))
+			return agentAIRunDone
+		}
+		if turnStarted {
+			_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, fmt.Errorf("Codex app-server exited before turn completed while %s", codexPhase)))
 			return agentAIRunDone
 		}
 	}
@@ -1956,6 +2538,23 @@ done:
 }
 
 func (m *agentAIManager) codexAppServerApprovalResult(ctx context.Context, run agentAIRun, writeJSON agentTerminalWriter, method string, params map[string]interface{}, fileChanges json.RawMessage) (map[string]interface{}, error) {
+	// Policy short-circuit (mirrors the Claude hook): auto-approve/deny locally
+	// when the device policy says so, with no cloud round-trip. Only
+	// require_approval falls through to requestApproval.
+	if svc := m.approvalService(); svc != nil {
+		toolName, toolInput := codexPolicyToolHint(method, params)
+		switch decision, matchedID := svc.evaluateApprovalDecision(toolName, toolInput, run.projectPath); decision {
+		case decisionAutoApprove:
+			logger.Info(fmt.Sprintf("approval-hook: AUTO-APPROVE by policy rule=%s method=%s session=%s (codex, no cloud round-trip)", matchedID, method, run.sessionID))
+			return codexApprovalResponseResult(method, params, agentAIApprovalResponse{Decision: models.AgentAIApprovalDecisionAccept})
+		case decisionAutoDeny:
+			logger.Info(fmt.Sprintf("approval-hook: AUTO-DENY by policy rule=%s method=%s session=%s (codex)", matchedID, method, run.sessionID))
+			return codexApprovalResponseResult(method, params, agentAIApprovalResponse{Decision: models.AgentAIApprovalDecisionDecline})
+		case decisionRequireApproval:
+			run.matchedRuleID = matchedID
+			run.policyVersion = svc.effectiveApprovalPolicyForPath(run.projectPath).Version
+		}
+	}
 	req := buildCodexApprovalRequest(run, method, params, fileChanges)
 	approvalCtx, cancel := context.WithTimeout(ctx, 30*time.Minute)
 	defer cancel()
@@ -2012,6 +2611,8 @@ func buildCodexApprovalRequest(run agentAIRun, method string, params map[string]
 	if decisions := codexAvailableDecisions(params["availableDecisions"]); len(decisions) > 0 {
 		req.AvailableDecisions = decisions
 	}
+	req.MatchedRuleID = run.matchedRuleID
+	req.PolicyVersion = run.policyVersion
 	return req
 }
 
@@ -2030,6 +2631,22 @@ func codexApprovalCommand(params map[string]interface{}) string {
 		return strings.Join(parts, " ")
 	}
 	return ""
+}
+
+// codexPolicyToolHint maps a Codex approval method+params to a (toolName,
+// toolInput) hint for device-policy evaluation. Command methods map to Bash +
+// the command string; file-change methods map to a file-mutation tool name;
+// permissions and anything unknown map to "" so the policy's default applies
+// (fail-safe under balanced, approve-all under allow_all).
+func codexPolicyToolHint(method string, params map[string]interface{}) (string, json.RawMessage) {
+	switch method {
+	case "item/commandExecution/requestApproval", "execCommandApproval":
+		return "Bash", marshalAgentAIRaw(map[string]interface{}{"command": codexApprovalCommand(params)})
+	case "item/fileChange/requestApproval", "applyPatchApproval":
+		return "Edit", nil
+	default:
+		return "", nil
+	}
 }
 
 func codexAvailableDecisions(raw interface{}) []string {
@@ -3224,7 +3841,7 @@ func normalizeAgentAIModel(model string) string {
 }
 
 func agentAICapabilities() []string {
-	caps := []string{"ai_chat", "ai_chat_context", "ai_stream", "ai_approval", "vibe_session"}
+	caps := []string{"ai_chat", "ai_chat_context", "ai_stream", "ai_approval", "ai_steer", "vibe_session"}
 	for _, candidate := range []string{"codex", "claude", "claudecode"} {
 		if _, err := exec.LookPath(candidate); err == nil {
 			caps = append(caps, "ai_provider_"+candidate)
@@ -3301,6 +3918,12 @@ func agentAIApprovalRequestPayload(req agentAIApprovalRequest) map[string]interf
 	}
 	if len(req.Raw) > 0 {
 		payload["raw"] = json.RawMessage(req.Raw)
+	}
+	if req.MatchedRuleID != "" {
+		payload["matched_rule_id"] = req.MatchedRuleID
+	}
+	if req.PolicyVersion > 0 {
+		payload["policy_version"] = req.PolicyVersion
 	}
 	return payload
 }
