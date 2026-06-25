@@ -75,6 +75,11 @@ func runCoreWithContext(ctx context.Context) error {
 	logger.Info("Core daemon started successfully")
 	logger.Info("IPC server listening, waiting for commands...")
 
+	// On headless platforms (Linux) there is no tray client to request the
+	// dashboard over IPC, so the Core daemon brings up the HTTP dashboard itself
+	// to keep the deployment self-contained. macOS/Windows rely on the tray.
+	startCoreDashboardIfHeadless()
+
 	// 4. Wait for shutdown signal/context cancellation
 	<-ctx.Done()
 	logger.Info("Received shutdown signal, stopping core daemon...")

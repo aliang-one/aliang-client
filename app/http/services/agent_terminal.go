@@ -637,7 +637,7 @@ func agentTerminalEnv(shell string) []string {
 	if shell != "" {
 		env = append(env, "SHELL="+shell)
 	}
-	if home, err := os.UserHomeDir(); err == nil && home != "" {
+	if home := agentHome(); home != "" {
 		env = append(env, "HOME="+home)
 	}
 	return env

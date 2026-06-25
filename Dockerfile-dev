@@ -1,17 +1,28 @@
-FROM golang:tip-alpine3.21 AS builder
+# Development container for Aliang (used by .devcontainer/devcontainer.json).
+#
+# This image ONLY provisions the toolchain — the repo source is bind-mounted at
+# runtime by the devcontainer, so we do not COPY or build the app here. Build the
+# binary interactively inside the container, e.g.:
+#
+#   CGO_ENABLED=1 go build -trimpath -o dist/aliang ./cmd/aliang
+#
+# Why CGO is on by default: the project depends on github.com/mattn/go-sqlite3
+# (via gorm.io/driver/sqlite) and GTK/AppIndicator (via beeep/systray). A
+# CGO_ENABLED=0 build compiles but crashes at startup when opening SQLite.
 
-LABEL stage=gobuilder
+FROM mcr.microsoft.com/devcontainers/go:1.25-bookworm
 
-ENV CGO_ENABLED 0
-ENV GOPROXY https://goproxy.cn,direct
-RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/g' /etc/apk/repositories
+# CGO build dependencies (matches .github/workflows/tag-build-release.yml).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        pkg-config \
+        libgtk-3-dev \
+        libayatana-appindicator3-dev \
+    && rm -rf /var/lib/apt/lists/*
 
-RUN apk update --no-cache && apk add --no-cache tzdata
+# Frontend toolchain (app/website is a Vite project).
+RUN su vscode -c "umask 0002 && . /usr/local/share/nvm/nvm.sh && nvm install 20" 2>&1 || true
 
-WORKDIR /build
-
-ADD go.mod .
-ADD go.sum .
-RUN go mod download
-COPY . .
-
+ENV CGO_ENABLED=1
+ENV GOPROXY=https://goproxy.cn,direct

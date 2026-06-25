@@ -41,7 +41,7 @@
     <!-- 会话列表 -->
     <ul v-else class="mt-4 space-y-2">
       <li
-        v-for="s in sessions"
+        v-for="s in pagedSessions"
         :key="s.id"
         class="rounded-lg border border-slate-200 bg-slate-50/60 dark:border-slate-700 dark:bg-slate-900/40"
       >
@@ -115,6 +115,46 @@
         </div>
       </li>
     </ul>
+
+    <!-- 分页：仅当超过一页时展示 -->
+    <div
+      v-if="!loading && !error && sessions.length && totalPages > 1"
+      class="mt-4 flex flex-wrap items-center justify-center gap-1.5 text-[11px]"
+    >
+      <button
+        type="button"
+        class="inline-flex h-7 items-center gap-0.5 rounded-md border border-slate-200 px-2 font-semibold text-slate-600 transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-40 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
+        :disabled="currentPage <= 1"
+        @click="goToPage(currentPage - 1)"
+      >
+        <span class="material-symbols-outlined text-sm">chevron_left</span>
+        {{ t('agent_activity_prev') }}
+      </button>
+      <template v-for="(p, i) in pageNumbers" :key="`pager-${i}`">
+        <span v-if="p === '...'" class="px-1 text-slate-400">…</span>
+        <button
+          v-else
+          type="button"
+          class="inline-flex h-7 min-w-[1.75rem] items-center justify-center rounded-md border px-1.5 font-semibold transition"
+          :class="p === currentPage
+            ? 'border-primary bg-primary text-white'
+            : 'border-slate-200 text-slate-600 hover:bg-slate-100 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800'"
+          @click="goToPage(p)"
+        >{{ p }}</button>
+      </template>
+      <button
+        type="button"
+        class="inline-flex h-7 items-center gap-0.5 rounded-md border border-slate-200 px-2 font-semibold text-slate-600 transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-40 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
+        :disabled="currentPage >= totalPages"
+        @click="goToPage(currentPage + 1)"
+      >
+        {{ t('agent_activity_next') }}
+        <span class="material-symbols-outlined text-sm">chevron_right</span>
+      </button>
+      <span class="ml-1 text-slate-400">
+        {{ t('agent_activity_pageInfo', { page: currentPage, total: totalPages, count: sessions.length }) }}
+      </span>
+    </div>
   </div>
 </template>
 
@@ -132,6 +172,8 @@ export default {
     return {
       status: null,
       sessions: [],
+      currentPage: 1,
+      pageSize: 20,
       loading: false,
       error: '',
       offline: false,
@@ -160,6 +202,29 @@ export default {
       if (this.agentEnabled) return 'bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300';
       return 'bg-slate-200 text-slate-600 dark:bg-slate-700 dark:text-slate-300';
     },
+    totalPages() {
+      return Math.max(1, Math.ceil(this.sessions.length / this.pageSize));
+    },
+    pagedSessions() {
+      const start = (this.currentPage - 1) * this.pageSize;
+      return this.sessions.slice(start, start + this.pageSize);
+    },
+    // 生成页码按钮序列：首尾各一页 + 当前页左右各一页，超出用省略号占位
+    pageNumbers() {
+      const total = this.totalPages;
+      const cur = this.currentPage;
+      if (total <= 7) {
+        return Array.from({ length: total }, (_, i) => i + 1);
+      }
+      const pages = [1];
+      const start = Math.max(2, cur - 1);
+      const end = Math.min(total - 1, cur + 1);
+      if (start > 2) pages.push('...');
+      for (let i = start; i <= end; i += 1) pages.push(i);
+      if (end < total - 1) pages.push('...');
+      pages.push(total);
+      return pages;
+    },
   },
   mounted() {
     this.loadStatus();
@@ -179,6 +244,7 @@ export default {
       try {
         const data = await getAgentSessions();
         this.sessions = (data && data.sessions) || [];
+        this.currentPage = 1;
         // 后端在 user_agent runtime 不可达时返回空数组，据此提示运行时离线
         this.offline = this.sessions.length === 0;
       } catch (_) {
@@ -216,6 +282,14 @@ export default {
     },
     loadMore(s) {
       if (this.nextBefore) this.fetchDetail(s.id, this.nextBefore);
+    },
+    goToPage(n) {
+      const clamped = Math.min(Math.max(1, n), this.totalPages);
+      if (clamped === this.currentPage) return;
+      this.currentPage = clamped;
+      // 切页后收起已展开的详情，避免展开行不在当前页造成状态错位
+      this.expandedId = '';
+      this.detailMessages = [];
     },
     sessionTitle(s) {
       return s.title || s.project_path || s.id || '';

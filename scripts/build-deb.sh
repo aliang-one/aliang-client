@@ -32,7 +32,32 @@ mkdir -p "$PAYLOAD_DIR/usr/share/applications"
 mkdir -p "$PAYLOAD_DIR/var/lib/aliang"
 mkdir -p "$PAYLOAD_DIR/var/log/aliang"
 
-# Step 1: Copy pre-built binary
+# Step 1: Obtain the binary (use a pre-built one if present, e.g. from CI;
+# otherwise build it here so the script is self-contained for local use).
+if [ ! -x "$SCRIPT_DIR/aliang" ]; then
+    echo "=== Pre-built binary not found at $SCRIPT_DIR/aliang; building (CGO required) ==="
+    # CGO is mandatory: mattn/go-sqlite3 + GTK/AppIndicator. A CGO_ENABLED=0
+    # build would compile but crash at startup when opening the SQLite store.
+    if ! command -v go >/dev/null 2>&1; then
+        echo "ERROR: go toolchain not found. Build the binary first with:" >&2
+        echo "  CGO_ENABLED=1 GOOS=linux GOARCH=$ARCH go build -trimpath -ldflags=\"-s -w\" -o $SCRIPT_DIR/aliang ./cmd/aliang" >&2
+        exit 1
+    fi
+    cd "$PROJECT_DIR"
+    # Drop the local goproxy replace if the sibling checkout is absent (mirrors CI).
+    if grep -q 'replace github.com/elazarl/goproxy v1.7.2 => ../goproxy' go.mod && [ ! -d ../goproxy ]; then
+        go mod edit -dropreplace=github.com/elazarl/goproxy
+    fi
+    CGO_ENABLED=1 GOOS=linux GOARCH="$ARCH" go build \
+        -trimpath -ldflags="-s -w -X aliang.one/nursorgate/common/version.BuildMode=prod" \
+        -o "$SCRIPT_DIR/aliang" ./cmd/aliang
+    cd "$SCRIPT_DIR"
+    if [ ! -x "$SCRIPT_DIR/aliang" ]; then
+        echo "ERROR: build failed. For ARCH=arm64 on an amd64 host you need a cross C compiler + GTK sysroot; build on a native arm64 host instead." >&2
+        exit 1
+    fi
+fi
+
 echo "=== Copying binary ==="
 cp "$SCRIPT_DIR/aliang" "$APP_DIR/aliang"
 chmod 755 "$APP_DIR/aliang"
@@ -73,10 +98,12 @@ Environment=ALIANG_DATA_DIR=/var/lib/aliang
 Environment=ALIANG_LOG_DIR=/var/log/aliang
 Environment=ALIANG_SOCKET_PATH=/run/aliang-core.sock
 
-# Hardening
+# Hardening.
+# NOTE: ProtectHome is intentionally NOT set. The Core daemon scans the desktop
+# user's ~/.claude and ~/.codex for Claude Code / Codex detection, which requires
+# read access to /home. ProtectHome=true would hide /home and break detection.
 NoNewPrivileges=true
 ProtectSystem=strict
-ProtectHome=true
 ReadWritePaths=/run /var/lib/aliang /var/log/aliang
 
 [Install]
@@ -163,7 +190,7 @@ cat > "$SHARE_DIR/aliang.desktop" << 'DESKTOP_EOF'
 [Desktop Entry]
 Name=Aliang
 Comment=Aliang Gateway Proxy Client
-Exec=/usr/local/bin/aliang
+Exec=xdg-open http://127.0.0.1:56431
 Icon=aliang
 Terminal=false
 Type=Application

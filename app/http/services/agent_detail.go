@@ -240,8 +240,8 @@ func candidateAgentVibeSessionFiles(sourceSessionID string) []string {
 	if sourceSessionID == "" {
 		return nil
 	}
-	home, err := os.UserHomeDir()
-	if err != nil || home == "" {
+	home := agentHome()
+	if home == "" {
 		return nil
 	}
 	var out []string
@@ -253,8 +253,8 @@ func candidateAgentVibeSessionFiles(sourceSessionID string) []string {
 }
 
 func allAgentVibeSessionDetailFiles() []string {
-	home, err := os.UserHomeDir()
-	if err != nil || home == "" {
+	home := agentHome()
+	if home == "" {
 		return nil
 	}
 	files := append(

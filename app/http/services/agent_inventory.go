@@ -222,8 +222,8 @@ func collectAgentVibeSessions(scanDirs []string) []models.AgentVibeSession {
 }
 
 func collectCodexVibeSessions(scanDirs []string) []models.AgentVibeSession {
-	home, err := os.UserHomeDir()
-	if err != nil || home == "" {
+	home := agentHome()
+	if home == "" {
 		return nil
 	}
 	indexPath := filepath.Join(home, ".codex", "session_index.jsonl")
@@ -524,8 +524,8 @@ func inferAgentVibeRoleFromContent(value interface{}) string {
 }
 
 func collectClaudeVibeSessions(scanDirs []string) []models.AgentVibeSession {
-	home, err := os.UserHomeDir()
-	if err != nil || home == "" {
+	home := agentHome()
+	if home == "" {
 		return nil
 	}
 	root := filepath.Join(home, ".claude", "projects")
@@ -871,7 +871,7 @@ func isSafeAgentProjectPath(path string) bool {
 	if path == filepath.Clean(string(filepath.Separator)) {
 		return false
 	}
-	if home, err := os.UserHomeDir(); err == nil && home != "" {
+	if home := agentHome(); home != "" {
 		homeCleaned := filepath.Clean(home)
 		if path == homeCleaned {
 			return false

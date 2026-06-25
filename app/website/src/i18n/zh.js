@@ -917,6 +917,9 @@ export default {
   agent_activity_noMore: '没有更多了',
   agent_activity_you: '你',
   agent_activity_ai: 'AI',
+  agent_activity_prev: '上一页',
+  agent_activity_next: '下一页',
+  agent_activity_pageInfo: '第 {page} / {total} 页 · 共 {count} 条',
 
   // -- AgentScanDirectories --
   agent_scan_title: '扫描目录',

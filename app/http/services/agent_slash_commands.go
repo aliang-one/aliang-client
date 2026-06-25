@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"aliang.one/nursorgate/app/http/models"
-	"aliang.one/nursorgate/common/cache"
 )
 
 const (
@@ -108,10 +107,11 @@ func collectProjectSlashCommands(projectPath string) []map[string]interface{} {
 
 // collectUserSlashCommands scans ~/.claude/{commands,skills}.
 func collectUserSlashCommands() []map[string]interface{} {
-	homeClaude, err := cache.ExpandHomePath("~/.claude")
-	if err != nil || homeClaude == "" {
+	home := agentHome()
+	if home == "" {
 		return nil
 	}
+	homeClaude := filepath.Join(home, ".claude")
 	if _, err := os.Stat(homeClaude); err != nil {
 		return nil
 	}
@@ -126,10 +126,11 @@ func collectUserSlashCommands() []map[string]interface{} {
 // Only user-scoped plugins are included (they apply everywhere); project-scoped
 // plugins require a projectPath match the agent cannot reliably evaluate here.
 func collectPluginSlashCommands() []map[string]interface{} {
-	manifestPath, err := cache.ExpandHomePath("~/.claude/plugins/installed_plugins.json")
-	if err != nil {
+	home := agentHome()
+	if home == "" {
 		return nil
 	}
+	manifestPath := filepath.Join(home, ".claude", "plugins", "installed_plugins.json")
 	data, err := os.ReadFile(manifestPath)
 	if err != nil {
 		return nil
@@ -175,9 +176,8 @@ func collectPluginSlashCommands() []map[string]interface{} {
 // not enumerate builtins itself, so the baseline is sourced here.
 func collectCodexSlashCommands() []map[string]interface{} {
 	out := codexBuiltinCommands()
-	promptsDir, err := cache.ExpandHomePath("~/.codex/prompts")
-	if err == nil && promptsDir != "" {
-		out = append(out, collectCodexPromptCommands(promptsDir)...)
+	if home := agentHome(); home != "" {
+		out = append(out, collectCodexPromptCommands(filepath.Join(home, ".codex", "prompts"))...)
 	}
 	return out
 }

@@ -917,6 +917,9 @@ export default {
   agent_activity_noMore: 'No more',
   agent_activity_you: 'You',
   agent_activity_ai: 'AI',
+  agent_activity_prev: 'Prev',
+  agent_activity_next: 'Next',
+  agent_activity_pageInfo: 'Page {page} / {total} · {count} sessions',
 
   // -- AgentScanDirectories --
   agent_scan_title: 'Scan Directories',

@@ -1778,9 +1778,9 @@ func collectAgentHistoryRoots() []models.AgentHistoryRoot {
 }
 
 func summarizeAgentHistoryRoot(tool string, rawPath string) models.AgentHistoryRoot {
-	expanded, err := cache.ExpandHomePath(rawPath)
-	if err != nil {
-		expanded = rawPath
+	expanded := rawPath
+	if home := agentHome(); home != "" && strings.HasPrefix(rawPath, "~") {
+		expanded = filepath.Join(home, rawPath[1:])
 	}
 	summary := models.AgentHistoryRoot{Tool: tool, Path: expanded}
 	stat, err := os.Stat(expanded)

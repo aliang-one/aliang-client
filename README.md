@@ -74,7 +74,7 @@ GOOS=windows GOARCH=amd64 go build -o aliang.exe ./cmd/aliang
 # Start HTTP proxy mode
 ./aliang start --config ./config.json --mode http
 
-# Start as system tray (desktop)
+# Start as system tray (desktop) — macOS / Windows only
 ./aliang tray --config ./config.json
 
 # Install as system service (admin/root)
@@ -429,13 +429,29 @@ go build -ldflags="-s -w" -o nursorgate ./cmd/nursor
 
 ### Cross-Platform Build Scripts
 
+> ⚠️ **CGO is required.** The build pulls in `github.com/mattn/go-sqlite3` (via
+> `gorm.io/driver/sqlite`) and GTK/AppIndicator (via `beeep`/`systray`). You MUST
+> build with `CGO_ENABLED=1`. A binary built with `CGO_ENABLED=0` **compiles but
+> crashes at startup** when it opens the SQLite store (auth/config persistence).
+> Note: Go auto-disables CGO when cross-compiling (`GOOS`/`GOARCH` ≠ host), so to
+> build Linux/arm64 **on an amd64 host** you must set `CGO_ENABLED=1` explicitly
+> AND provide a cross C compiler + cross GTK sysroot — or simply build on a native
+> arm64 host (this is what CI does).
+
+**Prerequisites (Linux):** `build-essential pkg-config libgtk-3-dev libayatana-appindicator3-dev`
+
+```bash
+# Debian/Ubuntu
+sudo apt-get install -y build-essential pkg-config libgtk-3-dev libayatana-appindicator3-dev
+```
+
 **macOS (arm64 - Apple Silicon):**
 
 ```bash
 export CGO_ENABLED=1
 export GOOS=darwin
 export GOARCH=arm64
-go build -ldflags="-s -w" -tags=with_utls -o nursorgate-darwin-arm64 ./cmd/nursor
+go build -trimpath -ldflags="-s -w" -o aliang-darwin-arm64 ./cmd/aliang
 ```
 
 **macOS (amd64 - Intel):**
@@ -444,7 +460,7 @@ go build -ldflags="-s -w" -tags=with_utls -o nursorgate-darwin-arm64 ./cmd/nurso
 export CGO_ENABLED=1
 export GOOS=darwin
 export GOARCH=amd64
-go build -ldflags="-s -w" -o nursorgate-darwin-amd64 ./cmd/nursor
+go build -trimpath -ldflags="-s -w" -o aliang-darwin-amd64 ./cmd/aliang
 ```
 
 **Linux (amd64):**
@@ -453,24 +469,33 @@ go build -ldflags="-s -w" -o nursorgate-darwin-amd64 ./cmd/nursor
 export CGO_ENABLED=1
 export GOOS=linux
 export GOARCH=amd64
-go build -ldflags="-s -w" -o nursorgate-linux-amd64 ./cmd/nursor
+go build -trimpath -ldflags="-s -w" -o aliang-linux-amd64 ./cmd/aliang
 ```
 
-**Linux (arm64):**
+**Linux (arm64) — build on a native arm64 host (recommended):**
 
 ```bash
+export CGO_ENABLED=1
 export GOOS=linux
 export GOARCH=arm64
-go build -ldflags="-s -w" -o nursorgate-linux-arm64 ./cmd/nursor
+go build -trimpath -ldflags="-s -w" -o aliang-linux-arm64 ./cmd/aliang
 ```
 
 **Windows (amd64):**
 
-```bash
+```cmd
 set CGO_ENABLED=1
 set GOOS=windows
 set GOARCH=amd64
-go build -ldflags="-s -w" -o nursorgate-win-amd64.exe ./cmd/nursor
+go build -trimpath -ldflags="-s -w -H=windowsgui" -o aliang-windows-amd64.exe ./cmd/aliang
+```
+
+**Note on the local `goproxy` replace:** `go.mod` carries
+`replace github.com/elazarl/goproxy v1.7.2 => ../goproxy`. If `../goproxy` is not
+present on your machine, drop it before building:
+
+```bash
+go mod edit -dropreplace=github.com/elazarl/goproxy
 ```
 
 ### Run

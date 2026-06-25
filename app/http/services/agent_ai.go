@@ -549,11 +549,52 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 
 	m.mu.Lock()
 	session := m.sessions[sessionID]
+	m.mu.Unlock()
 	if session == nil {
+		// Lazy creation: a session is born on its first ai.message. The prior
+		// ai.session.create may have errored (the server validates project_path
+		// is AUTHORIZED but not that it EXISTS on disk — a path that's
+		// authorized-but-missing fails the agent's create), been dropped /
+		// reordered across a flaky link, or never sent. The old behavior — a
+		// generic "ai session not found" — ended the turn immediately AND masked
+		// the real cause. Register on demand from the message's own fields; if a
+		// field is invalid, surface THAT clear error instead. Validation runs
+		// outside the manager lock (filesystem ops).
+		projectPath, cwdErr := resolveAgentAICWD(remoteString(msg, "project_path"))
+		if cwdErr != nil {
+			_ = writeJSON(agentAIErrorPayload(sessionID, messageID, cwdErr))
+			return
+		}
+		lazyProvider, providerErr := normalizeAgentAIProvider(firstNonEmpty(
+			strings.TrimSpace(remoteString(msg, "provider")),
+			strings.TrimSpace(remoteString(msg, "tool")),
+		))
+		if providerErr != nil {
+			_ = writeJSON(agentAIErrorPayload(sessionID, messageID, providerErr))
+			return
+		}
+		lazyMode := remoteString(msg, "mode")
+		if lazyMode == "" {
+			lazyMode = "vibe"
+		}
+		session = &agentAISession{
+			id:              sessionID,
+			mode:            lazyMode,
+			projectPath:     projectPath,
+			provider:        lazyProvider,
+			model:           strings.TrimSpace(remoteString(msg, "model")),
+			effort:          strings.TrimSpace(remoteString(msg, "effort")),
+			resumeSessionID: firstNonEmpty(remoteString(msg, "resume_session_id"), remoteString(msg, "source_session_id")),
+		}
+		m.mu.Lock()
+		if existing := m.sessions[sessionID]; existing != nil {
+			session = existing // a concurrent create/message registered it first
+		} else {
+			m.sessions[sessionID] = session
+		}
 		m.mu.Unlock()
-		_ = writeJSON(agentAIErrorPayload(sessionID, messageID, fmt.Errorf("ai session not found: %s", sessionID)))
-		return
 	}
+	m.mu.Lock()
 	if session.cancel != nil {
 		m.mu.Unlock()
 		_ = writeJSON(agentAIErrorPayload(sessionID, messageID, fmt.Errorf("ai session is already running: %s", sessionID)))
@@ -2842,6 +2883,10 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 		}
 	}()
 	limiter := &agentAIOutputLimiter{meter: newOutputMeter(agentAIOutputRateWindow, agentAIOutputRateBytes, int64(agentAIOutputCapBytes))}
+	// lastRetry is written by the stdout goroutine (on each Claude api_retry
+	// event) and read here after wg.Wait(), so the terminal ai.error can carry a
+	// structured cause. wg.Wait() provides the happens-before edge.
+	var lastRetry claudeRetryInfo
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
@@ -2849,7 +2894,7 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 			outMu.Lock()
 			appendAgentAIHistoryCapture(&output, text)
 			outMu.Unlock()
-		}, fileSink)
+		}, fileSink, &lastRetry)
 	}()
 	go func() {
 		defer wg.Done()
@@ -2880,7 +2925,17 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 		if allowResume && strings.Contains(stderrBuf.String(), "No conversation found with session ID") {
 			return agentAIRunResumeMissing
 		}
-		_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, waitErr))
+		// Surface WHY the CLI exited. Prefer the structured cause derived from
+		// the last api_retry (gateway status + retry count) when available; the
+		// bare waitErr ("exit status 1") carries no reason on its own. The stderr
+		// capture goes into "detail" (phone renders the structured cause, not the
+		// raw stderr). Mirrors the codex app-server path's stderr enrichment.
+		cause := claudeFailureCause(waitErr, lastRetry)
+		payload := agentAIErrorPayloadWithRetry(run.sessionID, run.messageID, errors.New(cause), lastRetry)
+		if stderrText := strings.TrimSpace(stderrBuf.String()); stderrText != "" {
+			payload["detail"] = truncateForCloud(stderrText)
+		}
+		_ = writeJSON(payload)
 		return agentAIRunDone
 	}
 	outMu.Lock()
@@ -2963,16 +3018,16 @@ func (l *agentAIOutputLimiter) Exceeded() bool {
 	return l.exceeded
 }
 
-func streamAgentAIStdout(reader io.Reader, format agentAIOutputFormat, run agentAIRun, writeJSON agentTerminalWriter, limiter *agentAIOutputLimiter, capture func(string), fileSink func(string)) {
+func streamAgentAIStdout(reader io.Reader, format agentAIOutputFormat, run agentAIRun, writeJSON agentTerminalWriter, limiter *agentAIOutputLimiter, capture func(string), fileSink func(string), lastRetry *claudeRetryInfo) {
 	switch format {
 	case agentAIOutputCodexJSON, agentAIOutputClaudeStreamJSON:
-		streamStructuredAIDelta(reader, format, run, writeJSON, limiter, capture, fileSink)
+		streamStructuredAIDelta(reader, format, run, writeJSON, limiter, capture, fileSink, lastRetry)
 	default:
 		streamAIDelta(reader, run, "assistant", writeJSON, limiter, capture)
 	}
 }
 
-func streamStructuredAIDelta(reader io.Reader, format agentAIOutputFormat, run agentAIRun, writeJSON agentTerminalWriter, limiter *agentAIOutputLimiter, capture func(string), fileSink func(string)) {
+func streamStructuredAIDelta(reader io.Reader, format agentAIOutputFormat, run agentAIRun, writeJSON agentTerminalWriter, limiter *agentAIOutputLimiter, capture func(string), fileSink func(string), lastRetry *claudeRetryInfo) {
 	decoder := json.NewDecoder(reader)
 	emitted := false
 	// pendingCommands tracks Bash tool_use_id → command so a later user-turn
@@ -2989,6 +3044,84 @@ func streamStructuredAIDelta(reader io.Reader, format agentAIOutputFormat, run a
 			}
 		}
 		emitClaudeStructuredEvents(format, event, run, writeJSON, pendingCommands)
+		// Claude surfaces each upstream retry as a structured system event:
+		// {"type":"system","subtype":"api_retry", attempt, max_retries,
+		// retry_delay_ms, error_status, error}. Forward it as ai.run.progress so
+		// the phone can show "重试 2/10 · 网关 502" instead of a silent gap, and
+		// remember the last one to enrich the terminal ai.error with a structured
+		// cause. The CLI's own "Retrying..." text never appears in stream-json, so
+		// this event is the only retry signal available.
+		if format == agentAIOutputClaudeStreamJSON &&
+			remoteString(event, "type") == "system" &&
+			remoteString(event, "subtype") == "api_retry" {
+			ri := claudeRetryInfo{has: true}
+			if n, ok := event["attempt"].(float64); ok {
+				ri.attempt = int(n)
+			}
+			if n, ok := event["max_retries"].(float64); ok {
+				ri.max = int(n)
+			}
+			if n, ok := event["retry_delay_ms"].(float64); ok {
+				ri.delayMs = n
+			}
+			if n, ok := event["error_status"].(float64); ok {
+				ri.errorStatus = int(n)
+			}
+			ri.errorType = remoteString(event, "error")
+			if lastRetry != nil {
+				*lastRetry = ri
+			}
+			progress := map[string]interface{}{
+				"type":         models.AgentEventAIRunProgress,
+				"session_id":   run.sessionID,
+				"retry_active": true,
+			}
+			if ri.attempt > 0 {
+				progress["retry_attempt"] = ri.attempt
+			}
+			if ri.max > 0 {
+				progress["retry_max"] = ri.max
+			}
+			if ri.delayMs > 0 {
+				progress["retry_delay_ms"] = ri.delayMs
+			}
+			if ri.errorStatus > 0 {
+				progress["error_status"] = ri.errorStatus
+			}
+			if ri.errorType != "" {
+				progress["error_type"] = ri.errorType
+			}
+			_ = writeJSON(progress)
+			continue
+		}
+		// A Claude "result" event that failed (is_error / error_* subtype) must
+		// surface as ai.error with a structured cause, not be masked as an
+		// assistant delta (which would make the turn look successful). Stop the
+		// stream. The raw result text is kept as debug "detail" only — the phone
+		// renders the structured cause derived from the last api_retry.
+		if format == agentAIOutputClaudeStreamJSON {
+			if reason, isErr := claudeResultError(event); isErr {
+				ri := claudeRetryInfo{}
+				if lastRetry != nil {
+					ri = *lastRetry
+				}
+				var cause, detail string
+				if ri.has && ri.errorStatus > 0 {
+					cause = claudeFailureCause(nil, ri)
+					detail = reason
+				} else if reason != "" {
+					cause = reason
+				} else {
+					cause = "claude run failed"
+				}
+				payload := agentAIErrorPayloadWithRetry(run.sessionID, run.messageID, errors.New(cause), ri)
+				if detail != "" {
+					payload["detail"] = truncateForCloud(detail)
+				}
+				_ = writeJSON(payload)
+				return
+			}
+		}
 		for _, text := range extractStructuredAITexts(format, event, !emitted) {
 			if strings.TrimSpace(text) == "" {
 				continue
@@ -3028,16 +3161,54 @@ func extractClaudeStreamTexts(event map[string]interface{}, allowFinal bool) []s
 	switch remoteString(event, "type") {
 	case "assistant":
 		if message, ok := event["message"].(map[string]interface{}); ok {
+			// Claude emits a synthetic assistant message (model "<synthetic>",
+			// carrying the error text) on terminal failure. Streaming it as a
+			// normal reply masks the failure — skip it; the result event (or the
+			// CLI exit) surfaces the failure as ai.error.
+			if remoteString(message, "model") == "<synthetic>" {
+				return nil
+			}
 			if text := claudeMessageContentText(message["content"]); text != "" {
 				return []string{text}
 			}
 		}
 	case "result":
+		// A failed result (is_error / error_* subtype) must NOT be emitted as an
+		// assistant delta — that masks the failure as a successful reply. The
+		// streaming loop surfaces it as ai.error via claudeResultError.
+		if _, isErr := claudeResultError(event); isErr {
+			return nil
+		}
 		if text := remoteString(event, "result"); text != "" {
 			return []string{text}
 		}
 	}
 	return nil
+}
+
+// claudeResultError reports whether a Claude stream-json "result" event is a
+// failure (is_error == true, or an error_* subtype such as
+// error_during_execution / error_max_tokens) and, if so, returns a human
+// reason — the result text, falling back to the subtype. Non-result / success
+// events return ("", false). Used by the streaming loop to surface the failure
+// as ai.error instead of letting it be masked as an assistant delta.
+func claudeResultError(event map[string]interface{}) (string, bool) {
+	if remoteString(event, "type") != "result" {
+		return "", false
+	}
+	isErr, _ := event["is_error"].(bool)
+	subtype := remoteString(event, "subtype")
+	if !isErr && !strings.HasPrefix(subtype, "error_") {
+		return "", false
+	}
+	reason := strings.TrimSpace(remoteString(event, "result"))
+	if reason == "" {
+		reason = subtype
+	}
+	if reason == "" {
+		reason = "claude run failed"
+	}
+	return reason, true
 }
 
 func claudeMessageContentText(raw interface{}) string {
@@ -3616,14 +3787,14 @@ func resolveNamedAgentAITool(name string, prompt string, model string, effort st
 		}
 	case "claude":
 		if path, err := exec.LookPath("claude"); err == nil {
-			return newClaudeCodeAITool("claude", path, prompt, model, resumeSessionID), nil
+			return newClaudeCodeAITool("claude", path, prompt, model, effort, resumeSessionID), nil
 		}
 	case "claudecode":
 		if path, err := exec.LookPath("claudecode"); err == nil {
-			return newClaudeCodeAITool("claudecode", path, prompt, model, resumeSessionID), nil
+			return newClaudeCodeAITool("claudecode", path, prompt, model, effort, resumeSessionID), nil
 		}
 		if path, err := exec.LookPath("claude"); err == nil {
-			return newClaudeCodeAITool("claudecode", path, prompt, model, resumeSessionID), nil
+			return newClaudeCodeAITool("claudecode", path, prompt, model, effort, resumeSessionID), nil
 		}
 	default:
 		return nil, fmt.Errorf("unsupported AI provider: %s", name)
@@ -3637,11 +3808,12 @@ func resolveNamedAgentAITool(name string, prompt string, model string, effort st
 // Skipped when model is empty (no base to suffix), effort is empty, or the model
 // already carries a recognized effort suffix (avoids gpt-5.4-xhigh-xhigh).
 //
-// Claude Code path intentionally does NOT use this: claude effort is conveyed
-// via the request body's output_config.effort, which the CLI has no reliable
-// flag for, and a suffixed claude model name would not be parsed by the gateway
-// and would break the upstream call. Claude effort is recorded on the session
-// only.
+// Claude Code path does NOT use a model-name suffix: the gateway does not parse
+// a suffixed claude model name and the upstream call would break. Claude effort
+// is instead conveyed via the CLI's `--effort <level>` flag (see
+// newClaudeCodeAITool), supported since Claude Code 2.1.x. The two providers
+// therefore carry effort through DIFFERENT channels: codex via model-name
+// suffix, claude via --effort. Both read the same session.effort field.
 func applyCodexEffortSuffix(model, effort string) string {
 	model = strings.TrimSpace(model)
 	effort = strings.TrimSpace(effort)
@@ -3667,7 +3839,7 @@ func endsWithKnownAgentEffortSuffix(model string) bool {
 	return false
 }
 
-func newClaudeCodeAITool(id string, path string, prompt string, model string, resumeSessionID string) *agentAITool {
+func newClaudeCodeAITool(id string, path string, prompt string, model string, effort string, resumeSessionID string) *agentAITool {
 	args := []string{"--print", "--verbose", "--output-format", "stream-json", "--include-partial-messages"}
 	args = append(args, "--append-system-prompt", agentAIOptionSystemPrompt)
 	if resumeSessionID != "" {
@@ -3675,6 +3847,9 @@ func newClaudeCodeAITool(id string, path string, prompt string, model string, re
 	}
 	if model != "" {
 		args = append(args, "--model", model)
+	}
+	if effort = strings.TrimSpace(effort); effort != "" {
+		args = append(args, "--effort", effort)
 	}
 	args = append(args, prompt)
 	return &agentAITool{
@@ -3864,6 +4039,68 @@ func agentAIStringSliceContains(values []string, target string) bool {
 
 func resolveAgentAICWD(raw string) (string, error) {
 	return resolveAgentAuthorizedCWD(raw, "project path")
+}
+
+// claudeRetryInfo captures the most-recent Claude stream-json
+// {"type":"system","subtype":"api_retry", attempt, max_retries, retry_delay_ms,
+// error_status, error} event for a run. It is threaded out of the stdout
+// streaming goroutine so the run loop can (a) surface retries live as
+// ai.run.progress and (b) enrich the terminal ai.error with a structured cause
+// (error_status/error_type + retry counts) instead of a bare "exit status 1".
+type claudeRetryInfo struct {
+	has         bool
+	attempt     int
+	max         int
+	delayMs     float64
+	errorStatus int // upstream HTTP status that triggered the retry (e.g. 502)
+	errorType   string
+}
+
+// claudeFailureCause builds a concise, phone-friendly cause string for a failed
+// Claude turn. When retry info is present it describes the upstream error and
+// how many retries were spent (e.g. "gateway 502 (server_error); retried
+// 10/10"); otherwise it falls back to the CLI exit error. Verbose diagnostics
+// (stderr, the raw result text) travel separately in the ai.error "detail"
+// field, which the phone does not render by default.
+func claudeFailureCause(waitErr error, ri claudeRetryInfo) string {
+	if ri.has && ri.errorStatus > 0 {
+		s := fmt.Sprintf("gateway %d", ri.errorStatus)
+		if ri.errorType != "" {
+			s = fmt.Sprintf("%s (%s)", s, ri.errorType)
+		}
+		if ri.max > 0 {
+			s = fmt.Sprintf("%s; retried %d/%d", s, ri.attempt, ri.max)
+		}
+		return s
+	}
+	if waitErr != nil {
+		return fmt.Sprintf("Claude CLI exited: %v", waitErr)
+	}
+	return "claude run failed"
+}
+
+// agentAIErrorPayloadWithRetry is agentAIErrorPayload + structured retry/error
+// fields so the phone can render "会话失败 · 网关 502 (重试 10/10)" instead of a
+// bare exit message. Fields attach only when retry info is available, so
+// non-retry failures (and codex, which emits no api_retry) are unaffected.
+func agentAIErrorPayloadWithRetry(sessionID string, messageID string, err error, ri claudeRetryInfo) map[string]interface{} {
+	payload := agentAIErrorPayload(sessionID, messageID, err)
+	if !ri.has {
+		return payload
+	}
+	if ri.errorStatus > 0 {
+		payload["error_status"] = ri.errorStatus
+	}
+	if ri.errorType != "" {
+		payload["error_type"] = ri.errorType
+	}
+	if ri.attempt > 0 {
+		payload["retry_attempt"] = ri.attempt
+	}
+	if ri.max > 0 {
+		payload["retry_max"] = ri.max
+	}
+	return payload
 }
 
 func agentAIErrorPayload(sessionID string, messageID string, err error) map[string]interface{} {

@@ -1,7 +1,6 @@
 package services
 
 import (
-	"os"
 	"runtime"
 	"sync"
 	"time"
@@ -131,7 +130,7 @@ func collectAgentLoadSnapshot() agentLoadSnapshot {
 	// Report usage of the filesystem holding the user's home directory as the
 	// "primary disk". gopsutil resolves the path to its underlying mountpoint,
 	// so this works uniformly across darwin/linux/windows.
-	if home, err := os.UserHomeDir(); err == nil && home != "" {
+	if home := agentHome(); home != "" {
 		if usage, err := disk.Usage(home); err == nil && usage != nil {
 			snap.DiskTotalBytes = usage.Total
 			snap.DiskUsedBytes = usage.Used
