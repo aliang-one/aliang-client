@@ -110,6 +110,7 @@ func registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/agent/sync", agentHandler.HandleSync)
 	mux.HandleFunc("/api/agent/enable", agentHandler.HandleEnable)
 	mux.HandleFunc("/api/agent/disable", agentHandler.HandleDisable)
+	mux.HandleFunc("/api/agent/reconnect", agentHandler.HandleReconnect)
 	mux.HandleFunc("/api/agent/tools", agentHandler.HandleTools)
 	mux.HandleFunc("/api/agent/protocol", agentHandler.HandleProtocol)
 	mux.HandleFunc("/api/agent/tools/launch", agentHandler.HandleLaunch)

@@ -20,7 +20,7 @@ func TestClaudeAPIRetrySurfacedAsProgress(t *testing.T) {
 		`{"type":"assistant","message":{"model":"claude-x","content":[{"type":"text","text":"hi"}]}}`,
 		`{"type":"result","subtype":"success","is_error":false,"result":"hi"}`,
 	}, "\n")
-	streamStructuredAIDelta(strings.NewReader(input), agentAIOutputClaudeStreamJSON, run, writer, &agentAIOutputLimiter{}, nil, nil, &lastRetry)
+	streamStructuredAIDelta(strings.NewReader(input), agentAIOutputClaudeStreamJSON, run, writer, &agentAIOutputLimiter{}, nil, nil, &lastRetry, nil)
 
 	progress := findAIEvents(mu, events, "ai.run.progress")
 	if len(progress) != 1 {
@@ -68,7 +68,7 @@ func TestClaudeAPIRetryFailureEnriched(t *testing.T) {
 		`{"type":"assistant","message":{"model":"<synthetic>","content":[{"type":"text","text":"API Error: Repeated 529 Overloaded"}]},"error":"server_error"}`,
 		`{"type":"result","subtype":"success","is_error":true,"result":"API Error: Repeated 529 Overloaded"}`,
 	}, "\n")
-	streamStructuredAIDelta(strings.NewReader(input), agentAIOutputClaudeStreamJSON, run, writer, &agentAIOutputLimiter{}, nil, nil, &lastRetry)
+	streamStructuredAIDelta(strings.NewReader(input), agentAIOutputClaudeStreamJSON, run, writer, &agentAIOutputLimiter{}, nil, nil, &lastRetry, nil)
 
 	errs := findAIEvents(mu, events, "ai.error")
 	if len(errs) != 1 {
@@ -102,5 +102,30 @@ func TestClaudeAPIRetryFailureEnriched(t *testing.T) {
 	// The retry progress must still have been emitted before the failure.
 	if len(findAIEvents(mu, events, "ai.run.progress")) != 1 {
 		t.Fatalf("expected 1 ai.run.progress before failure, got %d", len(findAIEvents(mu, events, "ai.run.progress")))
+	}
+}
+
+// TestClaudeSessionIDCapturedFromResultEvent verifies the agent captures
+// Claude's assigned session_id from the final "result" event. setAgentAIResume
+// SessionIDIfEmpty then pins it on the session so the next turn resumes it via
+// --resume → one continuous .jsonl per vibecoding session instead of N fresh
+// runs. An error result (is_error) must NOT capture (the stream returns early).
+func TestClaudeSessionIDCapturedFromResultEvent(t *testing.T) {
+	run := agentAIRun{sessionID: "s", messageID: "m", runSeq: 1}
+	mu, events, writer := captureAIWriter(t)
+	var lastRetry claudeRetryInfo
+	var capturedSessionID string
+
+	input := strings.Join([]string{
+		`{"type":"assistant","message":{"model":"claude-x","content":[{"type":"text","text":"hi"}]}}`,
+		`{"type":"result","subtype":"success","is_error":false,"session_id":"cl-uuid-123","result":"hi"}`,
+	}, "\n")
+	streamStructuredAIDelta(strings.NewReader(input), agentAIOutputClaudeStreamJSON, run, writer, &agentAIOutputLimiter{}, nil, nil, &lastRetry, &capturedSessionID)
+
+	if capturedSessionID != "cl-uuid-123" {
+		t.Fatalf("capturedSessionID = %q, want cl-uuid-123", capturedSessionID)
+	}
+	if len(findAIEvents(mu, events, "ai.delta")) == 0 {
+		t.Fatalf("expected ai.delta for the assistant reply")
 	}
 }

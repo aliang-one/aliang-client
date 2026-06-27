@@ -180,13 +180,9 @@ func (s *AgentService) Status() models.AgentStatusResponse {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.ensureDeviceIdentityLocked()
-	s.syncRuntimeDeviceStatusLocked()
+	resp := s.statusLocked()
 
-	status := agentStatusDisabled
-	if s.isEnabledLocked() {
-		status = agentStatusEnabled
-	}
-
+	status := resp.Status
 	message := "Agent mode is disabled."
 	if status == agentStatusEnabled {
 		message = "Agent mode is enabled for this user device."
@@ -195,27 +191,8 @@ func (s *AgentService) Status() models.AgentStatusResponse {
 	} else {
 		message = "Agent mode can be enabled directly for this logged-in user."
 	}
-
-	return models.AgentStatusResponse{
-		Status:          status,
-		Enabled:         s.isEnabledLocked(),
-		Bound:           s.isBoundLocked(),
-		Registered:      s.isRegisteredLocked(),
-		RemoteConnected: s.state.RemoteConnected,
-		BindingRequired: false,
-		Platform:        runtime.GOOS,
-		ProtocolVersion: models.AgentProtocolVersion,
-		AgentServer:     currentAgentServerURL(),
-		Runtime:         currentAgentRuntimeStatus(),
-		Device:          s.state.Device,
-		Capabilities:    agentCapabilities(),
-		Tools:           detectAgentTools(),
-		History:         collectAgentHistoryRoots(),
-		LastSyncAt:      s.state.LastSyncAt,
-		SyncStatus:      s.state.LastSyncStatus,
-		SyncMessage:     s.state.LastSyncMessage,
-		Message:         message,
-	}
+	resp.Message = message
+	return resp
 }
 
 // VibeSessions returns the local AI coding sessions (Claude/Codex) as
@@ -323,6 +300,15 @@ func (s *AgentService) Disable() models.AgentStatusResponse {
 }
 
 func (s *AgentService) DisableWithReason(reason string) models.AgentStatusResponse {
+	return s.disableWithReasonMessage(reason, "")
+}
+
+// disableWithReasonMessage is the implementation behind DisableWithReason. A
+// non-empty message overrides the generic per-reason LastSyncMessage so callers
+// can persist the server's actual rejection detail (e.g. the 401 payload),
+// which surfaces as an informative registration_message. message empty falls
+// back to agentDisableMessage(reason).
+func (s *AgentService) disableWithReasonMessage(reason string, message string) models.AgentStatusResponse {
 	reason = normalizeAgentDisableReason(reason)
 	s.mu.Lock()
 	s.ensureDeviceIdentityLocked()
@@ -334,7 +320,11 @@ func (s *AgentService) DisableWithReason(reason string) models.AgentStatusRespon
 	s.state.RemoteConnected = false
 	s.state.LastSyncAt = time.Now().UTC().Format(time.RFC3339)
 	s.state.LastSyncStatus = reason
-	s.state.LastSyncMessage = agentDisableMessage(reason)
+	if strings.TrimSpace(message) != "" {
+		s.state.LastSyncMessage = message
+	} else {
+		s.state.LastSyncMessage = agentDisableMessage(reason)
+	}
 	_ = s.saveStateLocked()
 	status := s.statusLocked()
 	s.mu.Unlock()
@@ -581,6 +571,28 @@ func RequestUserAgentRecoverAfterAuthExpired() {
 	}()
 }
 
+// RequestUserAgentEnsureConnection (re)establishes the remote agent link after
+// the user session is restored (token refresh / login). Idempotent: a no-op when
+// the WS is already connected or connecting, or when there is no device_token /
+// the agent is disabled. Cross-process safe — mirrors the disable/sync
+// dispatchers (in-process under the user-agent runtime, otherwise an HTTP POST
+// to the local user-agent server's /api/agent/reconnect).
+func RequestUserAgentEnsureConnection() {
+	go func() {
+		if IsUserAgentRuntime() {
+			if err := GetSharedAgentService().EnsureRemoteConnection(); err != nil {
+				logger.Warn(fmt.Sprintf("[AGENT-BOOT] ensure_connection failed error=%v", err))
+				return
+			}
+			logger.Info("[AGENT-BOOT] ensure_connection applied runtime=user_agent:true")
+			return
+		}
+		if err := requestLocalUserAgentEnsureConnection(); err != nil {
+			logger.Warn(fmt.Sprintf("[AGENT-BOOT] ensure_connection local_user_agent_failed error=%v", err))
+		}
+	}()
+}
+
 func (s *AgentService) Tools() []models.AgentTool {
 	return detectAgentTools()
 }
@@ -636,12 +648,127 @@ func (s *AgentService) Launch(req models.AgentLaunchRequest) (*models.AgentLaunc
 	}, nil
 }
 
+// Derived registration/connection health enums. These are the authoritative
+// answers to "is this device correctly registered with the server?" and "what
+// is the live link state?". The legacy booleans (Registered/RemoteConnected) are
+// optimistic and kept only for backward compatibility.
+const (
+	registrationNotConfigured = "not_configured" // agent server URL is empty
+	registrationLoginRequired = "login_required" // no user JWT (or session expired)
+	registrationRejected      = "rejected"       // server explicitly refused the binding/token
+	registrationRegistered    = "registered"     // server accepted, token cached and not rejected
+	registrationUnregistered  = "unregistered"   // never registered (no token, no explicit refusal)
+
+	connectionConnected    = "connected"    // websocket link is up
+	connectionConnecting   = "connecting"   // dialing / handshaking
+	connectionError        = "error"        // link failed or dropped with an error
+	connectionDisconnected = "disconnected" // idle / not connected
+)
+
+// deriveRegistrationStateLocked maps the raw agent state to the registration
+// health enum. Registration is a property of the DEVICE credential
+// (device_token), NOT of the user session: a cached device_token means the
+// server issued and has not withdrawn this device's credential, so the device is
+// registered regardless of the current user-session status. This is the fix for
+// the "logged in but agent offline" inconsistency — a transient user-session
+// expiry (LastSyncStatus auth_expired / login_required) no longer downgrades a
+// registered device, because session expiry is no longer allowed to clear the
+// device_token (handleAuthExpired keeps registration intact). Only an explicit
+// device-side refusal (device_token_invalid / device_unbound / device_id_conflict
+// — which clear the token) yields `rejected`, and only when there is no token.
+func (s *AgentService) deriveRegistrationStateLocked() (string, string) {
+	syncStatus := strings.TrimSpace(s.state.LastSyncStatus)
+	syncMessage := s.state.LastSyncMessage
+
+	if strings.TrimSpace(currentAgentServerURL()) == "" {
+		return registrationNotConfigured, "Agent server is not configured."
+	}
+
+	// A device_token is present ⇒ the server accepted this device and has not
+	// rejected the credential. The user-session status (auth_expired /
+	// login_required) is a connection concern, not a registration concern, so it
+	// must NOT override "registered".
+	if strings.TrimSpace(s.state.DeviceToken) != "" {
+		return registrationRegistered, ""
+	}
+
+	// No device_token: explain why, using the last sync outcome.
+	switch syncStatus {
+	case "device_token_invalid", "device_unbound", "device_id_conflict":
+		return registrationRejected, agentHealthMessage(syncMessage, "The agent server rejected this device's registration.")
+	case "enable_failed":
+		// enable_failed is set whenever a register/sync call errored; only treat
+		// it as a refusal when the cause looks like an auth rejection, otherwise
+		// it is a transient/network failure and the device is simply not yet
+		// registered (connection_state will flag the reachability problem).
+		if agentMessageIndicatesAuthError(syncMessage) {
+			return registrationRejected, syncMessage
+		}
+	case "login_required", "auth_expired":
+		// Genuine first-time state: never registered because no user JWT was
+		// available to register with. (After the session/deregistration split, a
+		// real device_token survives session blips, so this only appears before
+		// the first successful registration.)
+		return registrationLoginRequired, agentHealthMessage(syncMessage, "Log in before registering this device with the agent server.")
+	}
+	if agentMessageIndicatesAuthError(syncMessage) {
+		return registrationRejected, syncMessage
+	}
+	return registrationUnregistered, agentHealthMessage(syncMessage, "This device is not registered with the agent server.")
+}
+
+// deriveConnectionStateLocked maps the raw agent state to the live-link health
+// enum. Derived from the live RemoteConnected flag (set by the remote-WS loop)
+// plus the LastSyncStatus the loop writes (online/connecting/connect_failed/
+// disconnected). A user-session expiry (auth_expired / login_required) reads as
+// `disconnected` — "waiting for sign-in, reconnects automatically" — NOT `error`:
+// the link itself is fine, it is just idle until the user re-authenticates.
+// Race-free under s.mu and survives restarts.
+func (s *AgentService) deriveConnectionStateLocked() (string, string) {
+	if s.state.RemoteConnected {
+		return connectionConnected, ""
+	}
+	switch strings.TrimSpace(s.state.LastSyncStatus) {
+	case "connecting":
+		return connectionConnecting, ""
+	case "auth_expired", "login_required":
+		return connectionDisconnected, agentHealthMessage(s.state.LastSyncMessage, "Waiting for sign-in; the link reconnects automatically after login.")
+	case "connect_failed", "disconnected", "server_unavailable":
+		return connectionError, agentHealthMessage(s.state.LastSyncMessage, "Connection to the agent server failed; retrying.")
+	}
+	return connectionDisconnected, ""
+}
+
+// agentHealthMessage returns msg if non-empty, otherwise def.
+func agentHealthMessage(msg, def string) string {
+	if strings.TrimSpace(msg) != "" {
+		return msg
+	}
+	return def
+}
+
+// agentMessageIndicatesAuthError reports whether a sync message looks like a
+// server-side authentication refusal (covers the 401/authentication_required
+// cases that may not always flow through a named disable reason).
+func agentMessageIndicatesAuthError(msg string) bool {
+	m := strings.ToLower(msg)
+	return strings.Contains(m, "authentication_required") || strings.Contains(m, "returned 401") || strings.Contains(m, "unauthorized")
+}
+
 func (s *AgentService) statusLocked() models.AgentStatusResponse {
 	s.syncRuntimeDeviceStatusLocked()
 	status := agentStatusDisabled
 	if s.isEnabledLocked() {
 		status = agentStatusEnabled
 	}
+
+	regState, regMsg := s.deriveRegistrationStateLocked()
+	connState, connMsg := s.deriveConnectionStateLocked()
+	connectedAt := ""
+	if connState == connectionConnected {
+		connectedAt = s.state.LastSyncAt
+	}
+
 	return models.AgentStatusResponse{
 		Status:          status,
 		Enabled:         s.isEnabledLocked(),
@@ -660,6 +787,12 @@ func (s *AgentService) statusLocked() models.AgentStatusResponse {
 		LastSyncAt:      s.state.LastSyncAt,
 		SyncStatus:      s.state.LastSyncStatus,
 		SyncMessage:     s.state.LastSyncMessage,
+
+		RegistrationState:   regState,
+		RegistrationMessage: regMsg,
+		ConnectionState:     connState,
+		ConnectionMessage:   connMsg,
+		ConnectedAt:         connectedAt,
 	}
 }
 
@@ -1296,8 +1429,22 @@ func (s *AgentService) callAgentServerWithAuthorization(method string, endpoint 
 }
 
 func (s *AgentService) handleAgentDeviceTokenRejected(body string) {
-	logger.Warn(fmt.Sprintf("[AGENT-BOOT] device_token rejected by agent server body=%s", strings.TrimSpace(body)))
-	go s.DisableWithReason("device_token_invalid")
+	body = strings.TrimSpace(body)
+	logger.Warn(fmt.Sprintf("[AGENT-BOOT] device_token rejected by agent server body=%s", body))
+	// Persist the server's rejection detail so registration_state=rejected carries
+	// an informative registration_message (the 401 body) instead of the generic
+	// per-reason text. Still dispatched via a goroutine: this runs on the s.mu
+	// critical path (callAgentServer ← registerAndSync), so disabling inline would
+	// self-deadlock.
+	detail := agentDisableMessage("device_token_invalid")
+	if body != "" {
+		snippet := body
+		if len(snippet) > 300 {
+			snippet = snippet[:300]
+		}
+		detail = fmt.Sprintf("%s Server response: %s", detail, snippet)
+	}
+	go s.disableWithReasonMessage("device_token_invalid", detail)
 }
 
 func (s *AgentService) syncAgentInventoryLocked(reason string) error {
@@ -1485,6 +1632,14 @@ func requestLocalUserAgentRecoverAfterAuthExpired() error {
 	// unless the agent is currently disabled with reason auth_expired), so this
 	// is a safe idempotent nudge from the main process after a refresh.
 	endpoint := strings.TrimRight(localUserAgentBaseURL(), "/") + "/api/agent/auth-recover"
+	return requestLocalUserAgentPost(endpoint, "", "")
+}
+
+func requestLocalUserAgentEnsureConnection() error {
+	// /api/agent/reconnect is idempotent (EnsureRemoteConnection is a no-op when
+	// already connected/connecting, or when there is no device_token), so this is
+	// a safe nudge from the main process after every successful token refresh.
+	endpoint := strings.TrimRight(localUserAgentBaseURL(), "/") + "/api/agent/reconnect"
 	return requestLocalUserAgentPost(endpoint, "", "")
 }
 

@@ -80,6 +80,24 @@ func (authProfileRecord) TableName() string {
 }
 
 // GetAuthSessionDBPath returns the canonical shared SQLite data file path.
+//
+// Sharing model: auth (the user JWT) is a USER identity, and there is exactly
+// one auth truth — this file — read live by whoever needs it. The agent does
+// NOT persist a competing auth verdict (no auth_expired/login_required terminal
+// state in agent_state.json); it derives its registration/connection health
+// live from the device_token + WS liveness, and uses the JWT forwarded by the
+// dashboard process for register/sync. So even where two processes don't share
+// this file, agent correctness no longer depends on reading it.
+//
+// Path resolution follows ALIANG_DATA_DIR via ResolveStateDir: interactive
+// processes (tray/start, and the user-agent child which unsets ALIANG_DATA_DIR)
+// resolve to ~/.aliang/aliang.data — shared. A root daemon (core on Linux,
+// which sets ALIANG_DATA_DIR=CoreDataDir) resolves to the system data dir,
+// which a user-context child cannot read. Closing that gap means running login
+// in the user context (not root core) — a process-ownership decision, NOT a
+// path-pinning change (pinning the path alone would not help across the
+// root/user boundary and risks orphaning existing sessions). On macOS the
+// dashboard already runs in user context, so the file is shared there.
 func GetAuthSessionDBPath() (string, error) {
 	return cache.GetUnifiedDataDBPath()
 }

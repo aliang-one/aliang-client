@@ -242,6 +242,7 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	register("/api/agent/sync", h.Agent.HandleSync, http.MethodPost)
 	register("/api/agent/enable", h.Agent.HandleEnable, http.MethodPost)
 	register("/api/agent/auth-recover", h.Agent.HandleAuthRecover, http.MethodPost)
+	register("/api/agent/reconnect", h.Agent.HandleReconnect, http.MethodPost)
 	register("/api/agent/disable", h.Agent.HandleDisable, http.MethodPost)
 	register("/api/agent/tools", h.Agent.HandleTools, http.MethodGet)
 	register("/api/agent/protocol", h.Agent.HandleProtocol, http.MethodGet)

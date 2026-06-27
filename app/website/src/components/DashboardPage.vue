@@ -546,55 +546,80 @@
           </div>
         </div>
 
-        <form class="space-y-4 p-5" @submit.prevent="submitLogin">
-          <div class="rounded-xl border border-dashed border-amber-200 bg-amber-50/70 p-4 text-xs text-amber-700 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
-            {{ t('dash_loginNotLoggedIn') }}
-          </div>
-
-          <div>
-            <label class="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('user_email') }}</label>
-            <input
-              v-model.trim="loginEmail"
-              type="email"
-              autocomplete="username"
-              class="h-11 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm text-slate-700 outline-none transition focus:border-primary dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
-              placeholder="name@example.com"
-              :disabled="loginPending"
-            />
-          </div>
-
-          <div>
-            <label class="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('user_password') }}</label>
-            <input
-              v-model="loginPassword"
-              type="password"
-              autocomplete="current-password"
-              class="h-11 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm text-slate-700 outline-none transition focus:border-primary dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
-              :placeholder="t('user_passwordPh')"
-              :disabled="loginPending"
-            />
-          </div>
-
-          <p v-if="loginError" class="text-xs text-rose-500">{{ loginError }}</p>
-
-          <div class="flex gap-3 pt-1">
+        <div class="space-y-4 p-5">
+          <!-- 登录方式切换：密码 / 扫码 -->
+          <div class="grid grid-cols-2 gap-1 rounded-lg border border-slate-200 bg-slate-50/80 p-1 dark:border-slate-700 dark:bg-slate-800/60">
             <button
               type="button"
-              class="inline-flex h-11 flex-1 items-center justify-center rounded-lg border border-slate-200 px-4 text-sm font-semibold text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60 dark:border-slate-700 dark:text-slate-100 dark:hover:bg-slate-800"
+              class="rounded-md px-3 py-1.5 text-xs font-semibold transition"
+              :class="loginMode === 'password' ? 'bg-primary text-white shadow-sm' : 'text-slate-600 hover:text-slate-900 dark:text-slate-300 dark:hover:text-white'"
               :disabled="loginPending"
-              @click="closeLoginModal"
+              @click="loginMode = 'password'"
             >
-              {{ t('dash_cancel') }}
+              {{ t('scan_tabPassword') }}
             </button>
             <button
-              type="submit"
-              class="inline-flex h-11 flex-1 items-center justify-center rounded-lg bg-primary px-4 text-sm font-semibold text-white transition hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-60"
-              :disabled="loginPending"
+              type="button"
+              class="rounded-md px-3 py-1.5 text-xs font-semibold transition"
+              :class="loginMode === 'scan' ? 'bg-primary text-white shadow-sm' : 'text-slate-600 hover:text-slate-900 dark:text-slate-300 dark:hover:text-white'"
+              @click="loginMode = 'scan'"
             >
-              {{ loginPending ? t('dash_loggingIn') : t('dash_login') }}
+              {{ t('scan_tabScan') }}
             </button>
           </div>
-        </form>
+
+          <form v-if="loginMode === 'password'" class="space-y-4" @submit.prevent="submitLogin">
+            <div class="rounded-xl border border-dashed border-amber-200 bg-amber-50/70 p-4 text-xs text-amber-700 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
+              {{ t('dash_loginNotLoggedIn') }}
+            </div>
+
+            <div>
+              <label class="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('user_email') }}</label>
+              <input
+                v-model.trim="loginEmail"
+                type="email"
+                autocomplete="username"
+                class="h-11 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm text-slate-700 outline-none transition focus:border-primary dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                placeholder="name@example.com"
+                :disabled="loginPending"
+              />
+            </div>
+
+            <div>
+              <label class="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('user_password') }}</label>
+              <input
+                v-model="loginPassword"
+                type="password"
+                autocomplete="current-password"
+                class="h-11 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm text-slate-700 outline-none transition focus:border-primary dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                :placeholder="t('user_passwordPh')"
+                :disabled="loginPending"
+              />
+            </div>
+
+            <p v-if="loginError" class="text-xs text-rose-500">{{ loginError }}</p>
+
+            <div class="flex gap-3 pt-1">
+              <button
+                type="button"
+                class="inline-flex h-11 flex-1 items-center justify-center rounded-lg border border-slate-200 px-4 text-sm font-semibold text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60 dark:border-slate-700 dark:text-slate-100 dark:hover:bg-slate-800"
+                :disabled="loginPending"
+                @click="closeLoginModal"
+              >
+                {{ t('dash_cancel') }}
+              </button>
+              <button
+                type="submit"
+                class="inline-flex h-11 flex-1 items-center justify-center rounded-lg bg-primary px-4 text-sm font-semibold text-white transition hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-60"
+                :disabled="loginPending"
+              >
+                {{ loginPending ? t('dash_loggingIn') : t('dash_login') }}
+              </button>
+            </div>
+          </form>
+
+          <ScanLoginPanel v-else @success="onScanLoginSuccess" />
+        </div>
       </div>
     </div>
 
@@ -763,6 +788,7 @@
 <script setup>
 import { computed, ref, onMounted, onUnmounted, watch, nextTick } from 'vue';
 import OnboardingGuide from './OnboardingGuide.vue';
+import ScanLoginPanel from './settings/ScanLoginPanel.vue';
 import { isOnboardingCompleted, openOnboardingGuide } from '../composables/useOnboardingGuide';
 import { openTutorialDocs } from '../composables/useTutorialDocs';
 import { useI18n } from '../i18n';
@@ -815,6 +841,7 @@ const emit = defineEmits(['openQuickSetup', 'openCertModal', 'startCertReinstall
 const requestFilter = ref('all');
 const pathSearch = ref('');
 const isLoginModalOpen = ref(false);
+const loginMode = ref('password'); // 'password' | 'scan'
 const loginEmail = ref('');
 const loginPassword = ref('');
 const runActionLoading = ref(false);
@@ -1469,6 +1496,7 @@ function openLoginModal() {
   if (isAuthenticated.value) {
     return;
   }
+  loginMode.value = 'password';
   isLoginModalOpen.value = true;
 }
 
@@ -1489,6 +1517,13 @@ async function submitLogin() {
   if (success) {
     closeLoginModal();
   }
+}
+
+// 扫码登录成功：ScanLoginPanel 内部已通过 completeScanLogin 完成认证，
+// 这里只需关闭弹框。组件随弹框卸载会自动清理轮询定时器。
+function onScanLoginSuccess() {
+  isLoginModalOpen.value = false;
+  loginPassword.value = '';
 }
 
 function handleDashboardKeydown(event) {

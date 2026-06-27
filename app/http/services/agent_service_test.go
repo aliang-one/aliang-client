@@ -1316,7 +1316,7 @@ while IFS= read -r line; do
       printf '{"id":2,"result":{"turn":{"id":"turn_fake"}}}\n'
       case "$mode" in
         approval)
-          printf '{"method":"item/commandExecution/requestApproval","id":77,"params":{"threadId":"thr_fake","turnId":"turn_fake","itemId":"cmd_fake","startedAtMs":1,"reason":"needs shell","command":"printf ok","cwd":"%s","availableDecisions":["accept","acceptForSession","decline","cancel"]}}\n' "$PWD"
+          printf '{"method":"item/commandExecution/requestApproval","id":77,"params":{"threadId":"thr_fake","turnId":"turn_fake","itemId":"cmd_fake","startedAtMs":1,"reason":"needs shell","command":"git push","cwd":"%s","availableDecisions":["accept","acceptForSession","decline","cancel"]}}\n' "$PWD"
           ;;
         history)
           if printf '%s' "$line" | grep -q 'ALIANG_FIRST_ASSISTANT'; then
@@ -2207,7 +2207,7 @@ func TestAgentServiceDispatchLocalAIHandlesCodexAppServerApproval(t *testing.T) 
 		return event["session_id"] == "codex_approval" &&
 			remoteString(event, "status") == "pending" &&
 			remoteString(event, "kind") == models.AgentAIApprovalKindCommand &&
-			remoteString(event, "command") == "printf ok"
+			remoteString(event, "command") == "git push"
 	})
 
 	svc.DispatchLocalAI(map[string]interface{}{
@@ -2386,7 +2386,7 @@ func TestAgentServiceRemoteAIApprovalResponseUnblocksCodexAppServer(t *testing.T
 		return event["session_id"] == "remote_codex_approval" &&
 			remoteString(event, "status") == "pending" &&
 			remoteString(event, "kind") == models.AgentAIApprovalKindCommand &&
-			remoteString(event, "command") == "printf ok"
+			remoteString(event, "command") == "git push"
 	})
 
 	svc.handleRemoteAgentMessage(map[string]interface{}{
@@ -2601,7 +2601,7 @@ func TestAgentServiceHandleAIApprovalHookRoundTrip(t *testing.T) {
 			"tool_name":         "Bash",
 			"permission_prompt": "Needs shell access",
 			"tool_input": map[string]interface{}{
-				"command": "printf ok",
+				"command": "git push",
 			},
 		})
 		resultCh <- hookResult{response: response, err: err}
@@ -2611,7 +2611,7 @@ func TestAgentServiceHandleAIApprovalHookRoundTrip(t *testing.T) {
 		return event["session_id"] == "hook_session" &&
 			remoteString(event, "message_id") == "assistant_msg_hook" &&
 			remoteString(event, "kind") == models.AgentAIApprovalKindCommand &&
-			remoteString(event, "command") == "printf ok"
+			remoteString(event, "command") == "git push"
 	})
 	svc.DispatchLocalAI(map[string]interface{}{
 		"type":        "ai.approval.response",
@@ -2692,7 +2692,7 @@ func TestAgentServiceHandleAIPreToolUseApprovalHookRoundTrip(t *testing.T) {
 			"hook_event_name": "PreToolUse",
 			"tool_name":       "Bash",
 			"tool_input": map[string]interface{}{
-				"command": "printf ok",
+				"command": "git push",
 			},
 		})
 		resultCh <- hookResult{response: response, err: err}
@@ -2702,7 +2702,7 @@ func TestAgentServiceHandleAIPreToolUseApprovalHookRoundTrip(t *testing.T) {
 		return event["session_id"] == "pretool_session" &&
 			remoteString(event, "message_id") == "assistant_msg_pretool" &&
 			remoteString(event, "kind") == models.AgentAIApprovalKindCommand &&
-			remoteString(event, "command") == "printf ok"
+			remoteString(event, "command") == "git push"
 	})
 	svc.DispatchLocalAI(map[string]interface{}{
 		"type":        "ai.approval.response",

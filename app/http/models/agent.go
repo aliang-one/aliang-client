@@ -19,6 +19,18 @@ type AgentStatusResponse struct {
 	SyncStatus      string             `json:"sync_status,omitempty"`
 	SyncMessage     string             `json:"sync_message,omitempty"`
 	Message         string             `json:"message,omitempty"`
+
+	// Registration/connection health (derived, authoritative). These answer the
+	// two questions users actually care about: "is this device correctly
+	// registered with the server?" (registration_state) and "what is the live
+	// link state?" (connection_state). The legacy booleans above are optimistic
+	// (Registered is true even when the server has rejected the token) and kept
+	// only for backward compatibility — prefer these.
+	RegistrationState    string `json:"registration_state,omitempty"`
+	RegistrationMessage  string `json:"registration_message,omitempty"`
+	ConnectionState      string `json:"connection_state,omitempty"`
+	ConnectionMessage    string `json:"connection_message,omitempty"`
+	ConnectedAt          string `json:"connected_at,omitempty"`
 }
 
 type AgentDisableRequest struct {

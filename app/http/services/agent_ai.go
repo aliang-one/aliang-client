@@ -703,17 +703,19 @@ func (m *agentAIManager) handleLocalSlashCommand(session *agentAISession, messag
 func (m *agentAIManager) applyLocalSlashCommand(session *agentAISession, name, args string) string {
 	switch name {
 	case "clear":
-		// Reset the agent's continuity state so the next turn starts a fresh CLI
-		// session. resumeSessionID is only ever set on ai.session.create (never
-		// recaptured post-run), and when empty runUserMessage rebuilds the prompt
-		// from session.history via buildAgentAIPrompt — so clearing both gives a
-		// clean restart, with continuity re-established from the new history.
+		// Detach from the current Claude session so the next turn starts FRESH
+		// (no --resume). resumeSessionID may have been set at ai.session.create
+		// or recaptured post-run (setAgentAIResumeSessionIDIfEmpty); clearing it
+		// drops that binding. history is cleared too so the non-resume fallback
+		// prompt (buildAgentAIPrompt) starts clean. The next turn spawns a fresh
+		// claude run that captures a NEW session id, and continuity from there
+		// is owned by Claude's own session manager (not agent-side history).
 		m.mu.Lock()
 		session.resumeSessionID = ""
 		session.history = nil
 		session.runSeq = 0
 		m.mu.Unlock()
-		return "✓ /clear 已清空当前会话上下文。下一轮将开启全新 CLI 会话(不带 --resume),之后通过本地历史重建连续性。"
+		return "✓ /clear 已清空。下一轮开启全新 claude 会话(新 session id),之后连续性由 claude 的 session 管理器接手。"
 	case "model":
 		newModel := strings.TrimSpace(args)
 		if newModel == "" {
@@ -1002,6 +1004,7 @@ func (m *agentAIManager) runUserMessage(session *agentAISession, messageID, cont
 	session.activity = activity
 	session.runSeq++
 	resumeSessionID := strings.TrimSpace(session.resumeSessionID)
+	logger.Info(fmt.Sprintf("ai.run: session=%s runSeq=%d resumeSessionID=%q (empty=fresh claude run this turn; non-empty=--resume)", session.id, session.runSeq, resumeSessionID))
 	session.history = append(session.history, agentAIMessage{
 		Role:      "user",
 		MessageID: messageID,
@@ -1774,6 +1777,35 @@ func (m *agentAIManager) appendAssistantHistory(sessionID string, runSeq int, me
 		CreatedAt: time.Now().UTC(),
 	})
 	session.history = trimAgentAIHistory(session.history)
+}
+
+// setAgentAIResumeSessionIDIfEmpty pins the Claude-assigned session id (captured
+// from the run's "result" event) so the NEXT turn resumes it via --resume
+// instead of starting a fresh CLI. Without this, each turn spawns an isolated
+// claude --print run (N fragmented .jsonl files, no resumable conversation, and
+// no shared context window). No-op when no id was captured, the session is gone,
+// the run is stale, or the session already has a resume id (imported sessions
+// carry one, or it was captured on an earlier turn). Claude-only — codex uses a
+// long-running app-server that holds session state in-process.
+func (m *agentAIManager) setAgentAIResumeSessionIDIfEmpty(sessionID string, runSeq int, resumeSessionID string) {
+	resumeSessionID = strings.TrimSpace(resumeSessionID)
+	if resumeSessionID == "" {
+		logger.Info(fmt.Sprintf("resume-set: skip, no captured id (session %s runSeq %d)", sessionID, runSeq))
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	session := m.sessions[sessionID]
+	if session == nil || session.runSeq != runSeq {
+		logger.Info(fmt.Sprintf("resume-set: skip, session gone/stale (session %s runSeq %d)", sessionID, runSeq))
+		return
+	}
+	if session.resumeSessionID == "" {
+		session.resumeSessionID = resumeSessionID
+		logger.Info(fmt.Sprintf("resume-set: PINNED claude resume id %s on session %s", resumeSessionID, sessionID))
+	} else {
+		logger.Info(fmt.Sprintf("resume-set: already set %s (session %s)", session.resumeSessionID, sessionID))
+	}
 }
 
 // agentAIRunOutcome reports how a single CLI pass finished.
@@ -2887,6 +2919,11 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 	// event) and read here after wg.Wait(), so the terminal ai.error can carry a
 	// structured cause. wg.Wait() provides the happens-before edge.
 	var lastRetry claudeRetryInfo
+	// capturedClaudeSessionID is written by the stdout goroutine (from Claude's
+	// "result" event) and read after wg.Wait(), which gives the happens-before
+	// edge — same pattern as lastRetry. Pinned on the session post-run so the
+	// next turn resumes this Claude session instead of starting fresh.
+	var capturedClaudeSessionID string
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
@@ -2894,7 +2931,7 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 			outMu.Lock()
 			appendAgentAIHistoryCapture(&output, text)
 			outMu.Unlock()
-		}, fileSink, &lastRetry)
+		}, fileSink, &lastRetry, &capturedClaudeSessionID)
 	}()
 	go func() {
 		defer wg.Done()
@@ -2945,16 +2982,24 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 	filesTouchedCount := len(filesTouched)
 	filesMu.Unlock()
 	m.appendAssistantHistory(run.sessionID, run.runSeq, run.messageID, assistantOutput)
+	m.setAgentAIResumeSessionIDIfEmpty(run.sessionID, run.runSeq, capturedClaudeSessionID)
 	if blocks := extractAgentAIOptionBlocks(assistantOutput); len(blocks) > 0 {
 		m.emitOptionRequest(run, writeJSON, blocks)
 	}
-	_ = writeJSON(map[string]interface{}{
+	done := map[string]interface{}{
 		"type":                models.AgentEventAIDone,
 		"session_id":          run.sessionID,
 		"message_id":          agentAssistantMessageID(run.messageID),
 		"files_touched_count": filesTouchedCount,
 		"git_changed_count":   countGitChanged(run.projectPath),
-	})
+	}
+	// Echo the Claude session id so the server can persist it (sourceSessionId)
+	// and feed it back as resume_session_id after an agent restart — keeping the
+	// conversation on one continuous .jsonl across restarts.
+	if sid := strings.TrimSpace(capturedClaudeSessionID); sid != "" {
+		done["claude_session_id"] = sid
+	}
+	_ = writeJSON(done)
 	return agentAIRunDone
 }
 
@@ -3018,16 +3063,16 @@ func (l *agentAIOutputLimiter) Exceeded() bool {
 	return l.exceeded
 }
 
-func streamAgentAIStdout(reader io.Reader, format agentAIOutputFormat, run agentAIRun, writeJSON agentTerminalWriter, limiter *agentAIOutputLimiter, capture func(string), fileSink func(string), lastRetry *claudeRetryInfo) {
+func streamAgentAIStdout(reader io.Reader, format agentAIOutputFormat, run agentAIRun, writeJSON agentTerminalWriter, limiter *agentAIOutputLimiter, capture func(string), fileSink func(string), lastRetry *claudeRetryInfo, claudeSessionID *string) {
 	switch format {
 	case agentAIOutputCodexJSON, agentAIOutputClaudeStreamJSON:
-		streamStructuredAIDelta(reader, format, run, writeJSON, limiter, capture, fileSink, lastRetry)
+		streamStructuredAIDelta(reader, format, run, writeJSON, limiter, capture, fileSink, lastRetry, claudeSessionID)
 	default:
 		streamAIDelta(reader, run, "assistant", writeJSON, limiter, capture)
 	}
 }
 
-func streamStructuredAIDelta(reader io.Reader, format agentAIOutputFormat, run agentAIRun, writeJSON agentTerminalWriter, limiter *agentAIOutputLimiter, capture func(string), fileSink func(string), lastRetry *claudeRetryInfo) {
+func streamStructuredAIDelta(reader io.Reader, format agentAIOutputFormat, run agentAIRun, writeJSON agentTerminalWriter, limiter *agentAIOutputLimiter, capture func(string), fileSink func(string), lastRetry *claudeRetryInfo, claudeSessionID *string) {
 	decoder := json.NewDecoder(reader)
 	emitted := false
 	// pendingCommands tracks Bash tool_use_id → command so a later user-turn
@@ -3037,6 +3082,19 @@ func streamStructuredAIDelta(reader io.Reader, format agentAIOutputFormat, run a
 		var event map[string]interface{}
 		if err := decoder.Decode(&event); err != nil {
 			return
+		}
+		// Capture Claude's session id from whichever event first carries it.
+		// `system`/init emits it immediately (api_retry/result carry the same id).
+		// We deliberately do NOT gate on type=="result": in some Claude versions
+		// the success result event omits session_id, while system/init always has
+		// it — so grabbing the first non-empty value is the robust choice. Pinned
+		// on the session after a successful run so the next turn --resumes it →
+		// one continuous .jsonl instead of N fresh runs.
+		if format == agentAIOutputClaudeStreamJSON && claudeSessionID != nil && *claudeSessionID == "" {
+			if sid := strings.TrimSpace(remoteString(event, "session_id")); sid != "" {
+				*claudeSessionID = sid
+				logger.Info(fmt.Sprintf("claude session_id captured for run %s: %s (from %s event)", run.sessionID, sid, remoteString(event, "type")))
+			}
 		}
 		if fileSink != nil {
 			for _, fp := range extractToolUseFilePaths(format, event) {
@@ -3121,6 +3179,9 @@ func streamStructuredAIDelta(reader io.Reader, format agentAIOutputFormat, run a
 				_ = writeJSON(payload)
 				return
 			}
+			// (claude session_id capture moved to the top of the decode loop —
+			// grabs the first non-empty session_id from any event, not just the
+			// result event, since system/init always carries it.)
 		}
 		for _, text := range extractStructuredAITexts(format, event, !emitted) {
 			if strings.TrimSpace(text) == "" {

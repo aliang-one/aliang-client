@@ -463,10 +463,88 @@ func containsString(list []string, s string) bool {
 
 // ---- Built-in templates (ultimate fallback; shipped in the binary) ----
 
-// builtinBalancedPolicy is the system default: read-only tools and safe bash
-// auto-approve; file mutation, dangerous bash, and anything unmatched escalate
-// (fail-safe). Rules are ordered dangerous-first so an explicit danger rule
-// always beats an overly-broad safe rule evaluated later (defense-in-depth).
+// dangerousBashPattern is the vibe-mode Bash denylist: catastrophic data/system
+// destruction, privilege escalation, repo/publish state changes, ANY network
+// egress (curl/wget — exfil + supply-chain), pipe-to-shell/eval (arbitrary code),
+// and writes to system dirs. It is a SUBSTRING match (no ^ anchor) so it catches
+// a dangerous segment anywhere in a chained command, and it is the FIRST rule, so
+// "dangerous beats safe" no matter how broad safe-bash gets (defense-in-depth).
+func dangerousBashPattern() string {
+	return strings.Join([]string{
+		`rm\s+(-[a-zA-Z]*[rR])`,                                      // recursive rm (-r/-R/-rf/-fr)
+		`\bdd\s+`, `\bmkfs\b`,
+		`>\s*/dev/(sd|nvme|disk|mmcblk)`,                             // write to a block device (/dev/null is safe)
+		`\bsudo\b`, `\bsu\b`,
+		`\bshutdown\b`, `\breboot\b`, `\bhalt\b`, `\bpoweroff\b`,
+		`\bkill\s+-9\b`, `\bkillall\b`, `\bpkill\b`,
+		`\bchmod\s+-R\b`, `\bchown\s+-R\b`,
+		`\bgit\s+push\b`, `\bgit\s+reset\s+--hard\b`, `\bgit\s+clean\s+-[a-zA-Z]*[fd]\b`,
+		`\bnpm\s+publish\b`, `\bpnpm\s+publish\b`,
+		`\bcurl\b`, `\bwget\b`,                                       // any network egress
+		`\|\s*(sh|bash|zsh|fish|python[0-9]?|perl|ruby|node|php)\b`, // pipe to interpreter
+		`\beval\b`,
+		`>>?\s*/(etc|usr|bin|sbin|lib|boot|sys|proc|root|var)\b`,    // write to system dirs
+	}, `|`)
+}
+
+// safeBashPattern is the vibe-mode Bash allowlist: read-only exploration, common
+// text/file utilities, light in-project file ops, package-manager + build/test/
+// lint entry points, and non-destructive git. It is anchored at ^ and matches the
+// LEADING command token only — a chain that starts safe but later runs something
+// catastrophic is still caught by dangerous-bash (evaluated first). Residual
+// non-catastrophic-but-risky tails (e.g. `cd x && node evil.js`) auto-approve;
+// acceptable because Claude is CWD-locked to an authorized project directory and
+// its work is git-reversible. Unknown/unmatched commands fall through to the
+// fail-safe default (require approval).
+func safeBashPattern() string {
+	leaf := strings.Join([]string{
+		// exploration / read-only
+		`cd`, `pushd`, `popd`, `ls`, `ll`, `cat`, `head`, `tail`, `less`, `more`,
+		`wc`, `pwd`, `echo`, `printf`, `grep`, `egrep`, `fgrep`, `rg`, `find`,
+		`file`, `stat`, `sed`, `awk`, `which`, `command`, `type`, `whereis`,
+		`whoami`, `id`, `uname`, `date`, `env`, `printenv`, `test`, `true`, `false`,
+		// text processing
+		`sort`, `uniq`, `tr`, `cut`, `paste`, `column`, `tee`, `seq`, `rev`,
+		`basename`, `dirname`, `realpath`,
+		// light in-project file ops
+		`mkdir`, `touch`, `ln`,
+		// usage
+		`du`, `df`, `free`,
+	}, `|`)
+	gitCmds := strings.Join([]string{
+		`status`, `diff`, `log`, `show`, `branch`, `blame`, `ls-files`,
+		`rev-parse`, `describe`, `shortlog`, `reflog`,
+		`add`, `commit`, `restore`, `stash`, `fetch`, `pull`,
+		`checkout`, `switch`, `merge`, `init`, `config`,
+	}, `|`)
+	npmCmds := strings.Join([]string{
+		`run`, `test`, `ci`, `install`, `i`, `exec`, `start`, `ls`, `view`,
+		`why`, `outdated`, `info`, `ping`,
+	}, `|`)
+	pnpmCmds := strings.Join([]string{`run`, `test`, `install`, `i`, `add`, `exec`, `dlx`, `why`}, `|`)
+	yarnCmds := strings.Join([]string{`run`, `test`, `install`, `add`}, `|`)
+	tools := strings.Join([]string{
+		`tsc`, `tsx`, `ts-node`, `eslint`, `prettier`, `stylelint`,
+		`vitest`, `jest`, `mocha`, `playwright`, `cypress`,
+		`vite`, `webpack`, `rollup`, `esbuild`, `swc`, `babel`,
+		`turbo`, `nx`, `biome`, `oxlint`,
+	}, `|`)
+	return strings.Join([]string{
+		`^\s*(?:` + leaf + `)\b`,
+		`^\s*git\s+(?:` + gitCmds + `)\b`,
+		`^\s*npm\s+(?:` + npmCmds + `)\b`,
+		`^\s*npx\s+\S`,
+		`^\s*pnpm\s+(?:` + pnpmCmds + `)\b`,
+		`^\s*yarn\s+(?:` + yarnCmds + `)\b`,
+		`^\s*(?:` + tools + `)\b`,
+	}, `|`)
+}
+
+// builtinBalancedPolicy is the system default ("vibe" posture): file edits,
+// read-only tools, and common dev commands auto-approve; only catastrophic /
+// destructive Bash (dangerous-bash) and anything unmatched escalate (fail-safe).
+// Rules stay dangerous-first so an explicit danger rule always beats a broad
+// safe rule evaluated later (defense-in-depth).
 func builtinBalancedPolicy() ApprovalPolicy {
 	p := ApprovalPolicy{
 		Scheme:          "balanced",
@@ -475,21 +553,16 @@ func builtinBalancedPolicy() ApprovalPolicy {
 			{
 				ID:       "dangerous-bash",
 				Decision: decisionRequireApproval,
-				Reason:   "危险命令，需审批",
+				Reason:   "危险/破坏性命令，需审批",
 				Match: approvalRuleMatch{
-					Tool: []string{"Bash"},
-					CommandRegex: `rm\s+(-[a-zA-Z]*r[a-zA-Z]*f|-[a-zA-Z]*f[a-zA-Z]*r)` +
-						`|\bsudo\b|\bdd\s|mkfs|>\s*/dev/(sd|nvme|disk)` +
-						`|git\s+push|git\s+reset\s+--hard|git\s+clean\s+-fd` +
-						`|\bcurl\b.*-X\s*(POST|PUT|DELETE|PATCH)|\bwget\b` +
-						`|\bkill\s+-9|\bkillall\b|shutdown|reboot|halt` +
-						`|\bchmod\s+-R\b|\bchown\s+-R\b|npm\s+publish`,
+					Tool:         []string{"Bash"},
+					CommandRegex: dangerousBashPattern(),
 				},
 			},
 			{
 				ID:       "file-mutation",
-				Decision: decisionRequireApproval,
-				Reason:   "文件改写，需审批",
+				Decision: decisionAutoApprove,
+				Reason:   "文件改写，自动放行",
 				Match:    approvalRuleMatch{Tool: []string{"Write", "Edit", "MultiEdit", "NotebookEdit"}},
 			},
 			{
@@ -504,11 +577,10 @@ func builtinBalancedPolicy() ApprovalPolicy {
 			{
 				ID:       "safe-bash",
 				Decision: decisionAutoApprove,
-				Reason:   "只读命令，自动放行",
+				Reason:   "只读/常规开发命令，自动放行",
 				Match: approvalRuleMatch{
-					Tool: []string{"Bash"},
-					CommandRegex: `^(ls|cat|head|tail|wc|pwd|echo|grep|rg|find|file|stat` +
-						`|git\s+(status|diff|log|show|branch))\b`,
+					Tool:         []string{"Bash"},
+					CommandRegex: safeBashPattern(),
 				},
 			},
 		},

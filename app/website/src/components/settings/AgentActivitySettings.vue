@@ -26,6 +26,50 @@
       </button>
     </div>
 
+    <!-- 注册 / 连接健康度 -->
+    <div
+      v-if="status && healthVisible"
+      class="mt-4 grid grid-cols-1 gap-2 sm:grid-cols-2"
+    >
+      <div class="rounded-lg border border-slate-200 bg-slate-50/60 px-3 py-2 dark:border-slate-700 dark:bg-slate-900/40">
+        <div class="flex items-center gap-2">
+          <span class="text-[10px] font-bold uppercase tracking-wide text-slate-400">{{ t('agent_registration_label') }}</span>
+          <span
+            class="shrink-0 rounded-full px-2 py-0.5 text-[10px] font-bold"
+            :class="registrationBadgeClass"
+          >{{ registrationLabel }}</span>
+        </div>
+        <p
+          v-if="status.registration_message"
+          class="mt-1 break-words text-[10px] leading-4 text-slate-500 dark:text-slate-400"
+        >{{ status.registration_message }}</p>
+      </div>
+      <div class="rounded-lg border border-slate-200 bg-slate-50/60 px-3 py-2 dark:border-slate-700 dark:bg-slate-900/40">
+        <div class="flex items-center gap-2">
+          <span class="text-[10px] font-bold uppercase tracking-wide text-slate-400">{{ t('agent_connection_label') }}</span>
+          <span
+            class="shrink-0 rounded-full px-2 py-0.5 text-[10px] font-bold"
+            :class="connectionBadgeClass"
+          >{{ connectionLabel }}</span>
+        </div>
+        <p
+          v-if="status.connection_message"
+          class="mt-1 break-words text-[10px] leading-4 text-slate-500 dark:text-slate-400"
+        >{{ status.connection_message }}</p>
+      </div>
+      <div v-if="canRetry" class="sm:col-span-2">
+        <button
+          type="button"
+          class="inline-flex h-7 items-center gap-1 rounded-md border border-slate-200 px-2 text-[11px] font-semibold text-primary transition hover:bg-slate-100 disabled:opacity-60 dark:border-slate-700 dark:hover:bg-slate-800"
+          :disabled="retrying"
+          @click="retryRegistration"
+        >
+          <span class="material-symbols-outlined text-sm">{{ retrying ? 'progress_activity' : 'sync' }}</span>
+          {{ retrying ? t('agent_health_retrying') : t('agent_health_retry') }}
+        </button>
+      </div>
+    </div>
+
     <!-- loading / error / empty -->
     <div v-if="loading" class="mt-4 text-center text-[11px] text-slate-500 dark:text-slate-400">
       {{ t('agent_activity_loading') }}
@@ -159,7 +203,7 @@
 </template>
 
 <script>
-import { getAgentStatus, getAgentSessions, getAgentSessionDetail } from '../../services/agentApi';
+import { getAgentStatus, getAgentSessions, getAgentSessionDetail, enableAgent } from '../../services/agentApi';
 import { useI18n } from '../../i18n';
 
 export default {
@@ -177,6 +221,7 @@ export default {
       loading: false,
       error: '',
       offline: false,
+      retrying: false,
       expandedId: '',
       detailMessages: [],
       detailLoading: false,
@@ -201,6 +246,54 @@ export default {
       if (!this.runtimeOnline) return 'bg-amber-100 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300';
       if (this.agentEnabled) return 'bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300';
       return 'bg-slate-200 text-slate-600 dark:bg-slate-700 dark:text-slate-300';
+    },
+    // —— 注册 / 连接健康度（来自后端派生的 registration_state / connection_state）——
+    healthVisible() {
+      return Boolean(this.status?.registration_state || this.status?.connection_state);
+    },
+    registrationLabel() {
+      const map = {
+        registered: 'agent_reg_registered',
+        rejected: 'agent_reg_rejected',
+        login_required: 'agent_reg_login_required',
+        unregistered: 'agent_reg_unregistered',
+        not_configured: 'agent_reg_not_configured',
+      };
+      const key = map[this.status?.registration_state];
+      return key ? this.t(key) : '';
+    },
+    registrationBadgeClass() {
+      switch (this.status?.registration_state) {
+        case 'registered': return 'bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300';
+        case 'rejected': return 'bg-rose-100 text-rose-700 dark:bg-rose-500/15 dark:text-rose-300';
+        case 'login_required': return 'bg-amber-100 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300';
+        default: return 'bg-slate-200 text-slate-600 dark:bg-slate-700 dark:text-slate-300';
+      }
+    },
+    connectionLabel() {
+      const map = {
+        connected: 'agent_conn_connected',
+        connecting: 'agent_conn_connecting',
+        error: 'agent_conn_error',
+        disconnected: 'agent_conn_disconnected',
+      };
+      const key = map[this.status?.connection_state];
+      return key ? this.t(key) : '';
+    },
+    connectionBadgeClass() {
+      switch (this.status?.connection_state) {
+        case 'connected': return 'bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300';
+        case 'connecting': return 'bg-amber-100 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300';
+        case 'error': return 'bg-rose-100 text-rose-700 dark:bg-rose-500/15 dark:text-rose-300';
+        default: return 'bg-slate-200 text-slate-600 dark:bg-slate-700 dark:text-slate-300';
+      }
+    },
+    canRetry() {
+      const r = this.status?.registration_state;
+      const c = this.status?.connection_state;
+      // login_required / not_configured need user action (login / config), not an API retry.
+      if (r === 'login_required' || r === 'not_configured') return false;
+      return r !== 'registered' || c !== 'connected';
     },
     totalPages() {
       return Math.max(1, Math.ceil(this.sessions.length / this.pageSize));
@@ -236,6 +329,18 @@ export default {
         this.status = await getAgentStatus();
       } catch (_) {
         // 状态读取失败不影响会话列表展示
+      }
+    },
+    // 重新注册 + 重连：触发后端 Enable（registerAndSync + 远程连接），再刷新健康度。
+    async retryRegistration() {
+      this.retrying = true;
+      try {
+        await enableAgent();
+        await this.loadStatus();
+      } catch (_) {
+        // 忽略：刷新后的 registration/connection_state 会反映结果
+      } finally {
+        this.retrying = false;
       }
     },
     async loadSessions() {
