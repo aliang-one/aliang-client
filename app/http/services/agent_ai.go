@@ -11,7 +11,6 @@ import (
 	"io"
 	"net/url"
 	"os"
-	"os/exec"
 	"regexp"
 	"strconv"
 	"strings"
@@ -1851,7 +1850,7 @@ func agentAIUseCodexAppServer(provider string) bool {
 		return true
 	}
 	if provider == "auto" {
-		_, err := exec.LookPath("codex")
+		_, err := lookPathCLI("codex")
 		return err == nil
 	}
 	return false
@@ -2225,7 +2224,7 @@ func isStringPrefix(s, full string) bool {
 }
 
 func (m *agentAIManager) runCodexAppServer(ctx context.Context, run agentAIRun, writeJSON agentTerminalWriter) agentAIRunOutcome {
-	path, err := exec.LookPath("codex")
+	path, err := lookPathCLI("codex")
 	if err != nil {
 		_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, fmt.Errorf("AI CLI %q was not found in PATH", "codex")))
 		return agentAIRunDone
@@ -3820,7 +3819,7 @@ func resolveNamedAgentAITool(name string, prompt string, model string, effort st
 	resumeSessionID = strings.TrimSpace(resumeSessionID)
 	switch name {
 	case "codex":
-		if path, err := exec.LookPath("codex"); err == nil {
+		if path, err := lookPathCLI("codex"); err == nil {
 			// codex/OpenAI path: reasoning effort is conveyed as a `<base>-<effort>`
 			// model-name suffix — the downstream gateway derives reasoning_effort
 			// from it (gpt-5.4-xhigh → reasoning_effort=xhigh). Applied AFTER model
@@ -3847,14 +3846,14 @@ func resolveNamedAgentAITool(name string, prompt string, model string, effort st
 			}, nil
 		}
 	case "claude":
-		if path, err := exec.LookPath("claude"); err == nil {
+		if path, err := lookPathCLI("claude"); err == nil {
 			return newClaudeCodeAITool("claude", path, prompt, model, effort, resumeSessionID), nil
 		}
 	case "claudecode":
-		if path, err := exec.LookPath("claudecode"); err == nil {
+		if path, err := lookPathCLI("claudecode"); err == nil {
 			return newClaudeCodeAITool("claudecode", path, prompt, model, effort, resumeSessionID), nil
 		}
-		if path, err := exec.LookPath("claude"); err == nil {
+		if path, err := lookPathCLI("claude"); err == nil {
 			return newClaudeCodeAITool("claudecode", path, prompt, model, effort, resumeSessionID), nil
 		}
 	default:
@@ -4079,11 +4078,11 @@ func normalizeAgentAIModel(model string) string {
 func agentAICapabilities() []string {
 	caps := []string{"ai_chat", "ai_chat_context", "ai_stream", "ai_approval", "ai_steer", "vibe_session"}
 	for _, candidate := range []string{"codex", "claude", "claudecode"} {
-		if _, err := exec.LookPath(candidate); err == nil {
+		if _, err := lookPathCLI(candidate); err == nil {
 			caps = append(caps, "ai_provider_"+candidate)
 		}
 	}
-	if _, err := exec.LookPath("claude"); err == nil && !agentAIStringSliceContains(caps, "ai_provider_claudecode") {
+	if _, err := lookPathCLI("claude"); err == nil && !agentAIStringSliceContains(caps, "ai_provider_claudecode") {
 		caps = append(caps, "ai_provider_claudecode")
 	}
 	return caps

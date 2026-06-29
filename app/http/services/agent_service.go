@@ -1091,7 +1091,7 @@ func detectAgentTools() []models.AgentTool {
 		{ID: "opencode", Name: "OpenCode", Command: "opencode", Description: "OpenCode CLI"},
 	}
 	for i := range defs {
-		if path, err := exec.LookPath(defs[i].Command); err == nil {
+		if path, err := lookPathCLI(defs[i].Command); err == nil {
 			defs[i].Path = path
 			defs[i].Available = true
 		}
@@ -1100,7 +1100,7 @@ func detectAgentTools() []models.AgentTool {
 		if defs[i].ID != "claudecode" || defs[i].Available {
 			continue
 		}
-		if path, err := exec.LookPath("claude"); err == nil {
+		if path, err := lookPathCLI("claude"); err == nil {
 			defs[i].Command = "claude"
 			defs[i].Path = path
 			defs[i].Available = true
