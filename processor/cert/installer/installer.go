@@ -1,6 +1,7 @@
 package installer
 
 import (
+	"bytes"
 	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/x509"
@@ -75,17 +76,32 @@ func NewInstaller() CertInstaller {
 
 // ============= Common Helper Functions =============
 
+func parseCertificateBytes(certBytes []byte) (*x509.Certificate, error) {
+	block, _ := pem.Decode(certBytes)
+	if block != nil {
+		certBytes = block.Bytes
+	} else {
+		certBytes = bytes.TrimSpace(certBytes)
+	}
+
+	if len(certBytes) == 0 {
+		return nil, fmt.Errorf("empty certificate data")
+	}
+
+	parsedCert, err := x509.ParseCertificate(certBytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse certificate: %w", err)
+	}
+
+	return parsedCert, nil
+}
+
 // extractCertCommonName extracts the Common Name from certificate PEM bytes
 // This returns the actual certificate CN from the Subject, not a hardcoded value
 func extractCertCommonName(certBytes []byte) (string, error) {
-	block, _ := pem.Decode(certBytes)
-	if block == nil {
-		return "", fmt.Errorf("failed to decode certificate PEM")
-	}
-
-	cert, err := x509.ParseCertificate(block.Bytes)
+	cert, err := parseCertificateBytes(certBytes)
 	if err != nil {
-		return "", fmt.Errorf("failed to parse certificate: %w", err)
+		return "", err
 	}
 
 	if cert.Subject.CommonName == "" {
@@ -97,18 +113,13 @@ func extractCertCommonName(certBytes []byte) (string, error) {
 
 // parseCertificateInfo extracts certificate details from PEM bytes
 func parseCertificateInfo(certBytes []byte) (CertInfo, error) {
-	block, _ := pem.Decode(certBytes)
-	if block == nil {
-		return CertInfo{}, fmt.Errorf("failed to parse certificate PEM")
-	}
-
-	cert, err := x509.ParseCertificate(block.Bytes)
+	cert, err := parseCertificateBytes(certBytes)
 	if err != nil {
-		return CertInfo{}, fmt.Errorf("failed to parse certificate: %w", err)
+		return CertInfo{}, err
 	}
 
 	// Calculate SHA256 fingerprint
-	hash := sha256.Sum256(block.Bytes)
+	hash := sha256.Sum256(cert.Raw)
 	fingerprint := hex.EncodeToString(hash[:])
 
 	return CertInfo{
@@ -122,14 +133,9 @@ func parseCertificateInfo(certBytes []byte) (CertInfo, error) {
 
 // extractCertThumbprint computes the SHA1 thumbprint used by Windows certificate stores.
 func extractCertThumbprint(certBytes []byte) (string, error) {
-	block, _ := pem.Decode(certBytes)
-	if block == nil {
-		return "", fmt.Errorf("failed to decode certificate PEM")
-	}
-
-	parsedCert, err := x509.ParseCertificate(block.Bytes)
+	parsedCert, err := parseCertificateBytes(certBytes)
 	if err != nil {
-		return "", fmt.Errorf("failed to parse certificate: %w", err)
+		return "", err
 	}
 
 	thumbprint := sha1.Sum(parsedCert.Raw)
@@ -137,17 +143,7 @@ func extractCertThumbprint(certBytes []byte) (string, error) {
 }
 
 func parsePEMCertificate(certBytes []byte) (*x509.Certificate, error) {
-	block, _ := pem.Decode(certBytes)
-	if block == nil {
-		return nil, fmt.Errorf("failed to decode certificate PEM")
-	}
-
-	parsedCert, err := x509.ParseCertificate(block.Bytes)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse certificate: %w", err)
-	}
-
-	return parsedCert, nil
+	return parseCertificateBytes(certBytes)
 }
 
 func extractCertSHA256Fingerprint(certBytes []byte) (string, error) {
@@ -638,52 +634,335 @@ func (d *DarwinInstaller) GetTrustStatus(certType string, certBytes []byte) (str
 
 type LinuxInstaller struct{}
 
-// IsInstalled checks if certificate is installed in system or user CA directories.
-// It verifies the actual certificate content (via SHA256 fingerprint), not just file existence,
-// so that a file with the same name but different content is correctly reported as not installed.
-func (l *LinuxInstaller) IsInstalled(certType string, certBytes []byte) (bool, error) {
-	// Compute our certificate's SHA256 fingerprint from its raw bytes
-	block, _ := pem.Decode(certBytes)
-	if block == nil {
-		return false, fmt.Errorf("failed to decode certificate PEM")
-	}
-	cert, err := x509.ParseCertificate(block.Bytes)
-	if err != nil {
-		return false, fmt.Errorf("failed to parse certificate: %w", err)
-	}
-	ourFingerprint := fmt.Sprintf("%X", sha256.Sum256(cert.Raw))
+type linuxTrustAnchor struct {
+	Dir           string
+	UpdateCommand []string
+}
 
-	// Check system CA bundle for our fingerprint
-	for _, caFile := range []string{
-		"/etc/ssl/certs/ca-certificates.crt",
-		"/etc/ssl/certs/ca-bundle.crt",
-	} {
-		caData, err := os.ReadFile(caFile)
+var linuxTrustAnchors = []linuxTrustAnchor{
+	{Dir: "/usr/local/share/ca-certificates", UpdateCommand: []string{"update-ca-certificates"}},
+	{Dir: "/etc/pki/ca-trust/source/anchors", UpdateCommand: []string{"update-ca-trust", "extract"}},
+	{Dir: "/etc/ca-certificates/trust-source/anchors", UpdateCommand: []string{"trust", "extract-compat"}},
+}
+
+var linuxCABundlePaths = []string{
+	"/etc/ssl/certs/ca-certificates.crt",
+	"/etc/pki/tls/certs/ca-bundle.crt",
+	"/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+	"/etc/ssl/ca-bundle.pem",
+	"/etc/ssl/cert.pem",
+}
+
+func resolveLinuxExecutable(name string) (string, bool) {
+	if strings.TrimSpace(name) == "" {
+		return "", false
+	}
+
+	if filepath.IsAbs(name) || strings.Contains(name, string(os.PathSeparator)) {
+		info, err := os.Stat(name)
+		return name, err == nil && !info.IsDir() && info.Mode()&0111 != 0
+	}
+
+	if path, err := exec.LookPath(name); err == nil {
+		return path, true
+	}
+
+	for _, dir := range []string{"/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"} {
+		path := filepath.Join(dir, name)
+		info, err := os.Stat(path)
+		if err == nil && !info.IsDir() && info.Mode()&0111 != 0 {
+			return path, true
+		}
+	}
+
+	return "", false
+}
+
+func linuxPrimaryCertFileName(certType string) string {
+	certName := getCertFileName(certType)
+	ext := filepath.Ext(certName)
+	base := strings.TrimSuffix(certName, ext)
+	if base == "" {
+		base = strings.TrimSuffix(certName, ".")
+	}
+	return base + ".crt"
+}
+
+func linuxCertFileNames(certType string) []string {
+	primary := linuxPrimaryCertFileName(certType)
+	legacy := getCertFileName(certType)
+	if legacy == primary {
+		return []string{primary}
+	}
+	return []string{primary, legacy}
+}
+
+func linuxUserCertPaths(certType string) []string {
+	homeDir, err := os.UserHomeDir()
+	if err != nil || strings.TrimSpace(homeDir) == "" {
+		return nil
+	}
+
+	paths := make([]string, 0, len(linuxCertFileNames(certType)))
+	for _, name := range linuxCertFileNames(certType) {
+		paths = append(paths, filepath.Join(homeDir, ".local/share/ca-certificates/custom", name))
+	}
+	return paths
+}
+
+func linuxKnownCertPaths(certType string) []string {
+	var paths []string
+	for _, anchor := range linuxTrustAnchors {
+		for _, name := range linuxCertFileNames(certType) {
+			paths = append(paths, filepath.Join(anchor.Dir, name))
+		}
+	}
+	for _, name := range linuxCertFileNames(certType) {
+		paths = append(paths, filepath.Join("/etc/ssl/certs", name))
+	}
+	paths = append(paths, linuxUserCertPaths(certType)...)
+	return paths
+}
+
+func linuxPrimaryTrustAnchorPath(certType string) string {
+	return filepath.Join(linuxTrustAnchors[0].Dir, linuxPrimaryCertFileName(certType))
+}
+
+func certificateSHA256Fingerprint(certBytes []byte) (string, error) {
+	parsedCert, err := parseCertificateBytes(certBytes)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(parsedCert.Raw)
+	return strings.ToUpper(hex.EncodeToString(sum[:])), nil
+}
+
+func certificateFileMatchesFingerprint(path string, expectedFingerprint string) (bool, error) {
+	certData, err := os.ReadFile(path)
+	if err != nil {
+		return false, err
+	}
+
+	got, err := certificateSHA256Fingerprint(certData)
+	if err != nil {
+		return false, err
+	}
+
+	return got == expectedFingerprint, nil
+}
+
+func certificateBundleContainsFingerprint(bundleData []byte, expectedFingerprint string) bool {
+	rest := bundleData
+	foundPEM := false
+	for {
+		block, remaining := pem.Decode(rest)
+		if block == nil {
+			break
+		}
+		foundPEM = true
+		rest = remaining
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+
+		parsedCert, err := x509.ParseCertificate(block.Bytes)
 		if err != nil {
 			continue
 		}
-		if strings.Contains(string(caData), ourFingerprint) {
-			logger.Debug(fmt.Sprintf("Certificate %s found in system CA bundle %s", certType, caFile))
+		sum := sha256.Sum256(parsedCert.Raw)
+		if strings.ToUpper(hex.EncodeToString(sum[:])) == expectedFingerprint {
+			return true
+		}
+	}
+
+	if foundPEM {
+		return false
+	}
+
+	certs, err := x509.ParseCertificates(bytes.TrimSpace(bundleData))
+	if err != nil {
+		return false
+	}
+	for _, parsedCert := range certs {
+		sum := sha256.Sum256(parsedCert.Raw)
+		if strings.ToUpper(hex.EncodeToString(sum[:])) == expectedFingerprint {
+			return true
+		}
+	}
+	return false
+}
+
+func linuxCABundleContainsFingerprint(expectedFingerprint string) (bool, error) {
+	var errs []string
+	for _, caFile := range linuxCABundlePaths {
+		caData, err := os.ReadFile(caFile)
+		if err != nil {
+			if !errorsIsNotExist(err) {
+				errs = append(errs, fmt.Sprintf("%s: %v", caFile, err))
+			}
+			continue
+		}
+
+		if certificateBundleContainsFingerprint(caData, expectedFingerprint) {
 			return true, nil
 		}
 	}
 
-	// Check user-level CA directory and verify content matches via fingerprint
-	homeDir, _ := os.UserHomeDir()
-	userPath := filepath.Join(homeDir, ".local/share/ca-certificates/custom", getCertFileName(certType))
-	userData, err := os.ReadFile(userPath)
+	if len(errs) > 0 {
+		return false, errors.New(strings.Join(errs, "; "))
+	}
+	return false, nil
+}
+
+func runLinuxPrivilegedCommand(name string, args ...string) ([]byte, error) {
+	resolvedName, ok := resolveLinuxExecutable(name)
+	if !ok {
+		return nil, fmt.Errorf("command %s not found", name)
+	}
+
+	if os.Geteuid() == 0 {
+		return newPlatformCommand(resolvedName, args...).CombinedOutput()
+	}
+
+	output, err := newPlatformCommand(resolvedName, args...).CombinedOutput()
 	if err == nil {
-		userBlock, _ := pem.Decode(userData)
-		if userBlock != nil {
-			userCert, err := x509.ParseCertificate(userBlock.Bytes)
-			if err == nil {
-				userFingerprint := fmt.Sprintf("%X", sha256.Sum256(userCert.Raw))
-				if userFingerprint == ourFingerprint {
-					logger.Debug(fmt.Sprintf("Certificate %s found in user CA path with matching fingerprint: %s", certType, userPath))
-					return true, nil
-				}
-				logger.Debug(fmt.Sprintf("Certificate %s found in user CA path but fingerprint mismatch (expected %s, got %s)", certType, ourFingerprint, userFingerprint))
+		return output, nil
+	}
+
+	sudoPath, sudoOK := resolveLinuxExecutable("sudo")
+	if !sudoOK {
+		return output, err
+	}
+
+	sudoArgs := append([]string{"-n", resolvedName}, args...)
+	sudoOutput, sudoRunErr := newPlatformCommand(sudoPath, sudoArgs...).CombinedOutput()
+	if sudoRunErr == nil {
+		return sudoOutput, nil
+	}
+
+	if pkexecPath, pkexecOK := resolveLinuxExecutable("pkexec"); pkexecOK {
+		pkexecArgs := append([]string{resolvedName}, args...)
+		pkexecOutput, pkexecErr := newPlatformCommand(pkexecPath, pkexecArgs...).CombinedOutput()
+		if pkexecErr == nil {
+			return pkexecOutput, nil
+		}
+		combined := append(output, sudoOutput...)
+		return append(combined, pkexecOutput...), pkexecErr
+	}
+
+	return append(output, sudoOutput...), sudoRunErr
+}
+
+func writeLinuxSystemCert(targetPath string, certData []byte) error {
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err == nil {
+		if err := os.WriteFile(targetPath, certData, 0644); err == nil {
+			return nil
+		}
+	}
+
+	_, sudoOK := resolveLinuxExecutable("sudo")
+	_, pkexecOK := resolveLinuxExecutable("pkexec")
+	if !sudoOK && !pkexecOK && os.Geteuid() != 0 {
+		return fmt.Errorf("system certificate directory is not writable and neither sudo nor pkexec is available")
+	}
+
+	output, err := runLinuxPrivilegedCommand("mkdir", "-p", filepath.Dir(targetPath))
+	if err != nil {
+		return fmt.Errorf("create system certificate directory failed: %w, output: %s", err, strings.TrimSpace(string(output)))
+	}
+
+	tmpFile, err := os.CreateTemp("", "aliang-cert-*.crt")
+	if err != nil {
+		return fmt.Errorf("create temporary certificate file failed: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath)
+
+	if _, err := tmpFile.Write(certData); err != nil {
+		_ = tmpFile.Close()
+		return fmt.Errorf("write temporary certificate file failed: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("close temporary certificate file failed: %w", err)
+	}
+
+	output, err = runLinuxPrivilegedCommand("install", "-m", "0644", tmpPath, targetPath)
+	if err != nil {
+		return fmt.Errorf("install system certificate failed: %w, output: %s", err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func removeLinuxSystemPath(path string) error {
+	if err := os.Remove(path); err == nil || errorsIsNotExist(err) {
+		return nil
+	}
+
+	output, err := runLinuxPrivilegedCommand("rm", "-f", path)
+	if err != nil {
+		return fmt.Errorf("remove %s failed: %w, output: %s", path, err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func runLinuxTrustUpdate(commands [][]string) error {
+	seen := make(map[string]bool)
+	var errs []string
+	var attempted bool
+
+	for _, command := range commands {
+		commandKey := strings.Join(command, "\x00")
+		if len(command) == 0 || seen[commandKey] {
+			continue
+		}
+		seen[commandKey] = true
+
+		if _, ok := resolveLinuxExecutable(command[0]); !ok {
+			continue
+		}
+
+		attempted = true
+		output, err := runLinuxPrivilegedCommand(command[0], command[1:]...)
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v, output: %s", strings.Join(command, " "), err, strings.TrimSpace(string(output))))
+		}
+	}
+
+	if !attempted {
+		return fmt.Errorf("no supported Linux CA trust update command found")
+	}
+	if len(errs) > 0 {
+		return errors.New(strings.Join(errs, "; "))
+	}
+	return nil
+}
+
+// IsInstalled checks if certificate is installed in system or user CA directories.
+// It verifies the actual certificate content (via SHA256 fingerprint), not just file existence,
+// so that a file with the same name but different content is correctly reported as not installed.
+func (l *LinuxInstaller) IsInstalled(certType string, certBytes []byte) (bool, error) {
+	ourFingerprint, err := certificateSHA256Fingerprint(certBytes)
+	if err != nil {
+		return false, err
+	}
+
+	trusted, err := linuxCABundleContainsFingerprint(ourFingerprint)
+	if err == nil && trusted {
+		logger.Debug(fmt.Sprintf("Certificate %s found in Linux CA bundle", certType))
+		return true, nil
+	}
+
+	for _, path := range linuxKnownCertPaths(certType) {
+		matches, matchErr := certificateFileMatchesFingerprint(path, ourFingerprint)
+		if matchErr != nil {
+			if !errorsIsNotExist(matchErr) {
+				logger.Debug(fmt.Sprintf("Failed to inspect Linux certificate path %s: %v", path, matchErr))
 			}
+			continue
+		}
+		if matches {
+			logger.Debug(fmt.Sprintf("Certificate %s found in Linux certificate path: %s", certType, path))
+			return true, nil
 		}
 	}
 
@@ -695,21 +974,38 @@ func (l *LinuxInstaller) IsInstalled(certType string, certBytes []byte) (bool, e
 func (l *LinuxInstaller) Install(certType string, certPath string) error {
 	logger.Debug(fmt.Sprintf("Installing certificate %s to Linux system", certType))
 
-	certName := getCertFileName(certType)
+	certData, readErr := os.ReadFile(certPath)
+	if readErr != nil {
+		return fmt.Errorf("failed to read certificate file: %w", readErr)
+	}
+	if _, parseErr := parseCertificateBytes(certData); parseErr != nil {
+		return parseErr
+	}
 
-	// Attempt 1: System-level installation (requires sudo)
-	systemCertPath := fmt.Sprintf("/etc/ssl/certs/%s", certName)
-	logger.Debug(fmt.Sprintf("Attempting system-level installation to %s", systemCertPath))
-
-	// Copy file with sudo
-	copyCmd := exec.Command("sudo", "cp", certPath, systemCertPath)
-	if err := copyCmd.Run(); err == nil {
-		// Update CA certificates
-		updateCmd := exec.Command("sudo", "update-ca-certificates")
-		if err := updateCmd.Run(); err == nil {
-			logger.Info("Certificate installed to system keychain and CA certificates updated")
-			return nil
+	var installErrs []string
+	for _, anchor := range linuxTrustAnchors {
+		if len(anchor.UpdateCommand) == 0 {
+			continue
 		}
+		if _, ok := resolveLinuxExecutable(anchor.UpdateCommand[0]); !ok {
+			continue
+		}
+
+		targetPath := filepath.Join(anchor.Dir, linuxPrimaryCertFileName(certType))
+		logger.Debug(fmt.Sprintf("Attempting system-level installation to %s", targetPath))
+
+		if err := writeLinuxSystemCert(targetPath, certData); err != nil {
+			installErrs = append(installErrs, fmt.Sprintf("%s: %v", targetPath, err))
+			continue
+		}
+
+		if err := runLinuxTrustUpdate([][]string{anchor.UpdateCommand}); err != nil {
+			installErrs = append(installErrs, fmt.Sprintf("refresh trust after writing %s: %v", targetPath, err))
+			continue
+		}
+
+		logger.Info(fmt.Sprintf("Certificate installed to Linux system trust anchor %s and CA certificates updated", targetPath))
+		return nil
 	}
 
 	logger.Info("System-level installation failed, attempting user-level installation")
@@ -723,63 +1019,101 @@ func (l *LinuxInstaller) Install(certType string, certPath string) error {
 		return fmt.Errorf("failed to create certificate directory: %w", err)
 	}
 
-	userCertPath := filepath.Join(userCertDir, certName)
-
-	// Copy certificate file (no sudo)
-	certData, readErr := os.ReadFile(certPath)
-	if readErr != nil {
-		return fmt.Errorf("failed to read certificate file: %w", readErr)
-	}
+	userCertPath := filepath.Join(userCertDir, linuxPrimaryCertFileName(certType))
 
 	if writeErr := os.WriteFile(userCertPath, certData, 0644); writeErr != nil {
+		if len(installErrs) > 0 {
+			return fmt.Errorf("system install failed (%s); user install failed: %w", strings.Join(installErrs, "; "), writeErr)
+		}
 		return fmt.Errorf("failed to write certificate file: %w", writeErr)
 	}
 
-	// Update CA certificates
-	updateCmd := exec.Command("update-ca-certificates", "--fresh", "--verbose")
-	if err := updateCmd.Run(); err != nil {
-		logger.Warn(fmt.Sprintf("Failed to update CA certificates: %v", err))
+	if len(installErrs) > 0 {
+		logger.Warn(fmt.Sprintf("Certificate installed only to user path after system install failed: %s", strings.Join(installErrs, "; ")))
 	}
 
-	logger.Debug(fmt.Sprintf("Certificate installed to user keychain at %s", userCertPath))
+	logger.Debug(fmt.Sprintf("Certificate installed to Linux user certificate path at %s", userCertPath))
 	return nil
 }
 
 // Remove deletes certificate from system or user CA directory
 func (l *LinuxInstaller) Remove(certType string, certBytes []byte) error {
-	// Get cert name from config
 	config := cert.GetCertConfig(certType)
 	if config == nil {
 		return fmt.Errorf("unknown certificate type: %s", certType)
 	}
 
-	certName := config.FileName + ".pem"
 	logger.Debug(fmt.Sprintf("Removing certificate %s from Linux system", certType))
 
-	// Attempt 1: Remove from system path (requires sudo)
-	systemCertPath := fmt.Sprintf("/etc/ssl/certs/%s", certName)
-	rmCmd := exec.Command("sudo", "rm", systemCertPath)
-	if err := rmCmd.Run(); err == nil {
-		// Update CA certificates
-		updateCmd := exec.Command("sudo", "update-ca-certificates")
-		_ = updateCmd.Run()
-		logger.Info("Certificate removed from system keychain")
+	var removedAny bool
+	var removeErrs []string
+	var updateCommands [][]string
+
+	for _, anchor := range linuxTrustAnchors {
+		for _, name := range linuxCertFileNames(certType) {
+			path := filepath.Join(anchor.Dir, name)
+			if _, err := os.Stat(path); err != nil {
+				if !errorsIsNotExist(err) {
+					removeErrs = append(removeErrs, fmt.Sprintf("%s: %v", path, err))
+				}
+				continue
+			}
+
+			if err := removeLinuxSystemPath(path); err != nil {
+				removeErrs = append(removeErrs, err.Error())
+				continue
+			}
+
+			removedAny = true
+			updateCommands = append(updateCommands, anchor.UpdateCommand)
+			logger.Debug(fmt.Sprintf("Certificate removed from Linux system certificate path: %s", path))
+		}
+	}
+
+	for _, path := range linuxUserCertPaths(certType) {
+		if err := os.Remove(path); err != nil {
+			if !errorsIsNotExist(err) {
+				removeErrs = append(removeErrs, fmt.Sprintf("%s: %v", path, err))
+			}
+			continue
+		}
+		removedAny = true
+		logger.Debug(fmt.Sprintf("Certificate removed from Linux user certificate path: %s", path))
+	}
+
+	for _, name := range linuxCertFileNames(certType) {
+		legacyPath := filepath.Join("/etc/ssl/certs", name)
+		if _, err := os.Stat(legacyPath); err != nil {
+			if !errorsIsNotExist(err) {
+				removeErrs = append(removeErrs, fmt.Sprintf("%s: %v", legacyPath, err))
+			}
+			continue
+		}
+		if err := removeLinuxSystemPath(legacyPath); err != nil {
+			removeErrs = append(removeErrs, err.Error())
+			continue
+		}
+		removedAny = true
+		updateCommands = append(updateCommands, []string{"update-ca-certificates"})
+		logger.Debug(fmt.Sprintf("Certificate removed from legacy Linux certificate path: %s", legacyPath))
+	}
+
+	if removedAny {
+		if len(updateCommands) > 0 {
+			if err := runLinuxTrustUpdate(updateCommands); err != nil {
+				logger.Warn(fmt.Sprintf("Certificate removed, but failed to refresh Linux CA certificates: %v", err))
+			}
+		}
+		logger.Info("Certificate removal completed across available Linux certificate paths")
 		return nil
 	}
 
-	// Attempt 2: Remove from user path
-	homeDir, _ := os.UserHomeDir()
-	userCertPath := filepath.Join(homeDir, ".local/share/ca-certificates/custom", certName)
-
-	if err := os.Remove(userCertPath); err == nil {
-		// Update CA certificates
-		updateCmd := exec.Command("update-ca-certificates")
-		_ = updateCmd.Run()
-		logger.Debug(fmt.Sprintf("Certificate removed from user keychain at %s", userCertPath))
-		return nil
+	if len(removeErrs) > 0 {
+		return errors.New(strings.Join(removeErrs, "; "))
 	}
 
-	return fmt.Errorf("certificate not found in system or user keychain")
+	logger.Info(fmt.Sprintf("Certificate %s was not present in Linux system or user certificate paths", certType))
+	return nil
 }
 
 // GetCertInfo retrieves certificate information
@@ -789,49 +1123,36 @@ func (l *LinuxInstaller) GetCertInfo(certType string, certBytes []byte) (CertInf
 		return info, err
 	}
 
-	certName := getCertFileName(certType)
-	homeDir, _ := os.UserHomeDir()
-	userPath := filepath.Join(homeDir, ".local/share/ca-certificates/custom", certName)
+	certFingerprint, fingerprintErr := certificateSHA256Fingerprint(certBytes)
+	if fingerprintErr == nil {
+		for _, path := range linuxKnownCertPaths(certType) {
+			matches, matchErr := certificateFileMatchesFingerprint(path, certFingerprint)
+			if matchErr == nil && matches {
+				info.InstallPath = path
+				info.InstalledCount++
+			}
+		}
+	}
 
-	info.InstallPath = userPath
+	if info.InstallPath == "" {
+		info.InstallPath = linuxPrimaryTrustAnchorPath(certType)
+	}
 	return info, nil
 }
 
 // GetInstallPath returns the Linux installation path
 func (l *LinuxInstaller) GetInstallPath(certType string) string {
-	homeDir, _ := os.UserHomeDir()
-	certName := getCertFileName(certType)
-	return filepath.Join(homeDir, ".local/share/ca-certificates/custom", certName)
+	return linuxPrimaryTrustAnchorPath(certType)
 }
 
 // IsTrusted checks if a certificate is in Linux's trusted CA bundle
 func (l *LinuxInstaller) IsTrusted(certType string, certBytes []byte) (bool, error) {
-	// Try to read ca-certificates.crt
-	caFile := "/etc/ssl/certs/ca-certificates.crt"
-	if _, err := os.Stat(caFile); err != nil {
-		// Try alternative path
-		caFile = "/etc/ssl/certs/ca-bundle.crt"
-	}
-
-	caData, err := os.ReadFile(caFile)
+	fingerprint, err := certificateSHA256Fingerprint(certBytes)
 	if err != nil {
-		return false, fmt.Errorf("failed to read CA file: %w", err)
+		return false, err
 	}
 
-	// Extract certificate fingerprint for checking
-	block, _ := pem.Decode(certBytes)
-	if block == nil {
-		return false, fmt.Errorf("failed to decode certificate")
-	}
-
-	cert, err := x509.ParseCertificate(block.Bytes)
-	if err != nil {
-		return false, fmt.Errorf("failed to parse certificate: %w", err)
-	}
-
-	// Get fingerprint and check if present in CA bundle
-	fingerprint := fmt.Sprintf("%X", sha256.Sum256(cert.Raw))
-	return strings.Contains(string(caData), fingerprint), nil
+	return linuxCABundleContainsFingerprint(fingerprint)
 }
 
 // GetTrustStatus returns detailed trust status for Linux certificates
