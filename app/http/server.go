@@ -66,9 +66,14 @@ func StartHttpServer() error {
 	listener, err := net.Listen("tcp", port)
 	if err != nil {
 		if strings.Contains(err.Error(), "address already in use") {
-			// 尝试自动选择可用端口
+			// 尝试自动选择可用端口。沿用配置的 host（默认 0.0.0.0），
+			// 避免端口冲突时退回 loopback 导致外部再次访问不到。
 			logger.Warn(fmt.Sprintf("Port %s is already in use, trying to find an available port...", port))
-			listener, err = net.Listen("tcp", "127.0.0.1:0") // 0 means auto-select port
+			bindHost, _, _ := net.SplitHostPort(port)
+			if bindHost == "" {
+				bindHost = "0.0.0.0"
+			}
+			listener, err = net.Listen("tcp", net.JoinHostPort(bindHost, "0")) // 0 means auto-select port
 			if err != nil {
 				return fmt.Errorf("http server failed: unable to find available port: %w", err)
 			}

@@ -2230,7 +2230,7 @@ func (m *agentAIManager) runCodexAppServer(ctx context.Context, run agentAIRun, 
 		_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, fmt.Errorf("AI CLI %q was not found in PATH", "codex")))
 		return agentAIRunDone
 	}
-	cmd := exec.CommandContext(ctx, path, "app-server", "--stdio")
+	cmd := newBackgroundCommandContext(ctx, path, "app-server", "--stdio")
 	cmd.Dir = run.projectPath
 	cmd.Env = os.Environ()
 	stdin, err := cmd.StdinPipe()
@@ -2839,7 +2839,7 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 		tool = withClaudeApprovalHook(tool, run)
 	}
 
-	cmd := exec.CommandContext(ctx, tool.path, tool.args...)
+	cmd := newBackgroundCommandContext(ctx, tool.path, tool.args...)
 	cmd.Dir = run.projectPath
 	cmd.Env = os.Environ()
 	if len(tool.env) > 0 {
@@ -3612,7 +3612,7 @@ func emitClaudeStructuredEvents(format agentAIOutputFormat, event map[string]int
 // `git -C dir status --porcelain` (modified/added/deleted/untracked). Returns 0
 // for a non-git directory or any git error. Cheap enough to run on a ~10s tick.
 func countGitChanged(dir string) int {
-	out, err := exec.Command("git", "-C", dir, "status", "--porcelain").Output()
+	out, err := newBackgroundCommand("git", "-C", dir, "status", "--porcelain").Output()
 	if err != nil {
 		return 0
 	}
@@ -3628,7 +3628,7 @@ func countGitChanged(dir string) int {
 // file count" used by the mobile dashboard's Files metric; returns 0 for a
 // non-git directory or any git error. Run on the ~1/min inventory tick.
 func countGitTrackedFiles(dir string) int {
-	out, err := exec.Command("git", "-C", dir, "ls-files").Output()
+	out, err := newBackgroundCommand("git", "-C", dir, "ls-files").Output()
 	if err != nil {
 		return 0
 	}
@@ -3988,7 +3988,7 @@ func detectClaudeApprovalHookStrategy(toolPath string) claudeApprovalHookStrateg
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, toolPath, "--version").CombinedOutput()
+	out, err := newBackgroundCommandContext(ctx, toolPath, "--version").CombinedOutput()
 	strategy := claudeApprovalHookPreToolUseCommand
 	if err == nil {
 		strategy = claudeApprovalHookStrategyForVersion(string(out))

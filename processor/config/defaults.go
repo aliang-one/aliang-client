@@ -15,8 +15,11 @@ const (
 	// DefaultUserAgentPort 用户态 Agent 本地端口
 	DefaultUserAgentPort = 56433
 
-	// DefaultManagementAddr 管理面板监听地址
-	DefaultManagementAddr = "127.0.0.1:56431"
+	// DefaultManagementAddr 管理面板监听地址。
+	// 默认 0.0.0.0，支持 headless/服务器部署从外部直接访问管理面板。
+	// 如需收紧暴露面，请在防火墙/反向代理层控制，而不是改回 loopback
+	// （否则 headless 部署会重新变得外部不可达）。
+	DefaultManagementAddr = "0.0.0.0:56431"
 
 	// DefaultHTTPProxyAddr HTTP CONNECT 代理监听地址
 	DefaultHTTPProxyAddr = "127.0.0.1:56432"
