@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -31,6 +32,103 @@ type agentAIManager struct {
 	// manager), used to evaluate the device approval policy. nil for standalone
 	// test managers, which fall back to GetSharedAgentService().
 	service *AgentService
+}
+
+func (m *agentAIManager) activeVibeSessionsSnapshot() []models.AgentVibeSession {
+	if m == nil {
+		return nil
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sessions := make([]models.AgentVibeSession, 0, len(m.sessions))
+	for _, session := range m.sessions {
+		if session == nil || session.cancel == nil {
+			continue
+		}
+		provider := firstNonEmpty(session.provider, "auto")
+		createdAt := now
+		title := ""
+		for _, msg := range session.history {
+			if createdAt == now && !msg.CreatedAt.IsZero() {
+				createdAt = msg.CreatedAt.UTC().Format(time.RFC3339)
+			}
+			if title == "" && strings.EqualFold(msg.Role, "user") {
+				title = msg.Content
+			}
+		}
+		title = firstNonEmpty(title, session.initialContext, agentProjectName(session.projectPath))
+		sessions = append(sessions, models.AgentVibeSession{
+			ID:           session.id,
+			Provider:     provider,
+			Tool:         provider,
+			ProjectPath:  session.projectPath,
+			Title:        truncateAgentText(title, 200),
+			Mode:         firstNonEmpty(session.mode, "vibe"),
+			Status:       "running",
+			MessageCount: len(session.history),
+			Model:        session.model,
+			CreatedAt:    createdAt,
+			UpdatedAt:    now,
+		})
+	}
+	sort.Slice(sessions, func(i, j int) bool {
+		return sessions[i].UpdatedAt > sessions[j].UpdatedAt
+	})
+	return sessions
+}
+
+func agentAIDiagnosticArgs(args []string) []string {
+	out := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch arg {
+		case "--settings":
+			out = append(out, "--settings", "<json>")
+			i++
+		case "--append-system-prompt":
+			out = append(out, "--append-system-prompt", "<prompt>")
+			i++
+		default:
+			out = append(out, arg)
+		}
+	}
+	if len(out) > 0 {
+		out[len(out)-1] = fmt.Sprintf("<prompt:%d chars>", len(args[len(args)-1]))
+	}
+	return out
+}
+
+func agentAIEnvDiagnostic() string {
+	keys := []string{
+		"ANTHROPIC_BASE_URL",
+		"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+		"CLAUDE_CODE_SSE_PORT",
+		"HTTP_PROXY",
+		"HTTPS_PROXY",
+		"ALL_PROXY",
+		"NO_PROXY",
+		"ALIANG_USER_AGENT_ADDR",
+		"ALIANG_CLAUDE_APPROVAL_HOOK",
+		"ALIANG_CLAUDE_HEADLESS_SLIM",
+		"ALIANG_CLAUDE_HEADLESS_TOOLS",
+		"ALIANG_CLAUDE_HEADLESS_ENABLE_MCP",
+	}
+	parts := make([]string, 0, len(keys)+1)
+	for _, key := range keys {
+		value, ok := os.LookupEnv(key)
+		if !ok {
+			parts = append(parts, key+"=<unset>")
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s=%q", key, value))
+	}
+	if token := strings.TrimSpace(os.Getenv("ANTHROPIC_AUTH_TOKEN")); token != "" {
+		parts = append(parts, fmt.Sprintf("ANTHROPIC_AUTH_TOKEN=<set:%d chars>", len(token)))
+	} else {
+		parts = append(parts, "ANTHROPIC_AUTH_TOKEN=<unset>")
+	}
+	return strings.Join(parts, " ")
 }
 
 type agentAISession struct {
@@ -274,13 +372,15 @@ func (m *agentAIManager) approvalService() *AgentService {
 }
 
 // agentAIActivity tracks whether an AI run is alive. A run is considered active
-// while it emits output (bump) or while it is blocked awaiting a human approval
-// decision (awaiting). The watchdog (startAIWatchdog) cancels the run only when
-// it goes silent for longer than agentAIIdleWindow without awaiting approval;
+// while it emits output (bump), while it is blocked awaiting a human approval
+// decision, or while Claude has dispatched tool/subagent work and is waiting for
+// the corresponding tool_result. The watchdog cancels only when the run goes
+// silent for longer than agentAIIdleWindow without one of those waits in flight;
 // agentAIHardCeiling is a runaway backstop. nil-safe so call sites need no guards.
 type agentAIActivity struct {
 	lastActivityAt   atomic.Int64
 	awaitingApproval atomic.Bool
+	pendingToolUses  atomic.Int64
 	runStart         time.Time
 	killReasonMu     sync.RWMutex
 	killReason       string
@@ -317,6 +417,41 @@ func (a *agentAIActivity) awaiting() bool {
 	return a.awaitingApproval.Load()
 }
 
+// beginToolUseWait marks that Claude has emitted a tool_use (Task/subagent,
+// Bash, etc.) and the run is legitimately silent until a matching tool_result
+// arrives. It bumps activity so the run gets a fresh idle window once the tool
+// completes.
+func (a *agentAIActivity) beginToolUseWait() {
+	if a == nil {
+		return
+	}
+	a.pendingToolUses.Add(1)
+	a.bump()
+}
+
+func (a *agentAIActivity) endToolUseWait() {
+	if a == nil {
+		return
+	}
+	for {
+		current := a.pendingToolUses.Load()
+		if current <= 0 {
+			break
+		}
+		if a.pendingToolUses.CompareAndSwap(current, current-1) {
+			break
+		}
+	}
+	a.bump()
+}
+
+func (a *agentAIActivity) idlePaused() bool {
+	if a == nil {
+		return false
+	}
+	return a.awaitingApproval.Load() || a.pendingToolUses.Load() > 0
+}
+
 func (a *agentAIActivity) idleFor() time.Duration {
 	if a == nil {
 		return 0
@@ -351,7 +486,8 @@ func (a *agentAIActivity) killReasonOr(fallback string) string {
 }
 
 // startAIWatchdog cancels ctx when the run goes idle (no output for
-// agentAIIdleWindow and not awaiting approval) or exceeds agentAIHardCeiling.
+// agentAIIdleWindow and not awaiting approval/tool results) or exceeds
+// agentAIHardCeiling.
 // It exits as soon as ctx is done, so it never outlives the run.
 func (m *agentAIManager) startAIWatchdog(ctx context.Context, activity *agentAIActivity, cancel context.CancelFunc) {
 	if activity == nil || cancel == nil {
@@ -370,7 +506,7 @@ func agentAIWatchdogLoop(ctx context.Context, activity *agentAIActivity, cancel 
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if !activity.awaiting() && activity.idleFor() > idleWindow {
+			if !activity.idlePaused() && activity.idleFor() > idleWindow {
 				activity.setKillReason("idle_timeout")
 				cancel()
 				return
@@ -430,6 +566,17 @@ func agentAIApprovalHookURL(sessionID string, messageID string, token string) st
 	values.Set("message_id", messageID)
 	values.Set("token", token)
 	return base + "/api/agent/ai/approval-hook?" + values.Encode()
+}
+
+func currentAgentAIApprovalHookBaseURL() string {
+	agentAIApprovalHookBaseURLMu.RLock()
+	base := agentAIApprovalHookBaseURL
+	agentAIApprovalHookBaseURLMu.RUnlock()
+	base = strings.TrimRight(strings.TrimSpace(base), "/")
+	if base == "" {
+		base = UserAgentBaseURL()
+	}
+	return base
 }
 
 func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTerminalWriter) {
@@ -2844,6 +2991,22 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 	if len(tool.env) > 0 {
 		cmd.Env = append(cmd.Env, tool.env...)
 	}
+	logger.Info(fmt.Sprintf(
+		"ai.run.cli: session=%s runSeq=%d provider=%s path=%q cwd=%q allowResume=%t resume=%t model=%q effort=%q output=%s hook_base=%q args=%v env=%s",
+		run.sessionID,
+		run.runSeq,
+		tool.id,
+		tool.path,
+		run.projectPath,
+		allowResume,
+		strings.TrimSpace(resumeID) != "",
+		normalizeAgentAIModel(run.model),
+		strings.TrimSpace(run.effort),
+		tool.outputFormat,
+		currentAgentAIApprovalHookBaseURL(),
+		agentAIDiagnosticArgs(tool.args),
+		agentAIEnvDiagnostic(),
+	))
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -3077,6 +3240,10 @@ func streamStructuredAIDelta(reader io.Reader, format agentAIOutputFormat, run a
 	// pendingCommands tracks Bash tool_use_id → command so a later user-turn
 	// tool_result can close it as ai.command(completed) with output + exit code.
 	pendingCommands := map[string]string{}
+	// pendingClaudeToolUseIDs tracks every Claude tool_use whose tool_result has
+	// not arrived yet. This keeps the idle watchdog from killing a quiet but
+	// legitimate Task/subagent or long-running tool wait.
+	pendingClaudeToolUseIDs := map[string]struct{}{}
 	for {
 		var event map[string]interface{}
 		if err := decoder.Decode(&event); err != nil {
@@ -3099,6 +3266,9 @@ func streamStructuredAIDelta(reader io.Reader, format agentAIOutputFormat, run a
 			for _, fp := range extractToolUseFilePaths(format, event) {
 				fileSink(fp)
 			}
+		}
+		if format == agentAIOutputClaudeStreamJSON {
+			updateClaudeToolUseActivity(event, run.activity, pendingClaudeToolUseIDs)
 		}
 		emitClaudeStructuredEvents(format, event, run, writeJSON, pendingCommands)
 		// Claude surfaces each upstream retry as a structured system event:
@@ -3128,6 +3298,16 @@ func streamStructuredAIDelta(reader io.Reader, format agentAIOutputFormat, run a
 			if lastRetry != nil {
 				*lastRetry = ri
 			}
+			logger.Warn(fmt.Sprintf(
+				"ai.run.claude_retry: session=%s runSeq=%d attempt=%d max=%d delay_ms=%.0f status=%d error=%q",
+				run.sessionID,
+				run.runSeq,
+				ri.attempt,
+				ri.max,
+				ri.delayMs,
+				ri.errorStatus,
+				ri.errorType,
+			))
 			progress := map[string]interface{}{
 				"type":         models.AgentEventAIRunProgress,
 				"session_id":   run.sessionID,
@@ -3190,6 +3370,54 @@ func streamStructuredAIDelta(reader io.Reader, format agentAIOutputFormat, run a
 				return
 			}
 			emitted = true
+		}
+	}
+}
+
+func updateClaudeToolUseActivity(event map[string]interface{}, activity *agentAIActivity, pending map[string]struct{}) {
+	if activity == nil || pending == nil {
+		return
+	}
+	message := mapIf(event["message"])
+	if message == nil {
+		return
+	}
+	content, _ := message["content"].([]interface{})
+	if len(content) == 0 {
+		return
+	}
+	switch remoteString(event, "type") {
+	case "assistant":
+		for _, raw := range content {
+			row := mapIf(raw)
+			if row == nil || remoteString(row, "type") != "tool_use" {
+				continue
+			}
+			id := remoteString(row, "id")
+			if id == "" {
+				continue
+			}
+			if _, exists := pending[id]; exists {
+				continue
+			}
+			pending[id] = struct{}{}
+			activity.beginToolUseWait()
+		}
+	case "user":
+		for _, raw := range content {
+			row := mapIf(raw)
+			if row == nil || remoteString(row, "type") != "tool_result" {
+				continue
+			}
+			id := remoteString(row, "tool_use_id")
+			if id == "" {
+				continue
+			}
+			if _, exists := pending[id]; !exists {
+				continue
+			}
+			delete(pending, id)
+			activity.endToolUseWait()
 		}
 	}
 }
@@ -3900,7 +4128,8 @@ func endsWithKnownAgentEffortSuffix(model string) bool {
 }
 
 func newClaudeCodeAITool(id string, path string, prompt string, model string, effort string, resumeSessionID string) *agentAITool {
-	args := []string{"--print", "--verbose", "--output-format", "stream-json", "--include-partial-messages"}
+	args := claudeCodeHeadlessSlimArgs()
+	args = append(args, "--print", "--verbose", "--output-format", "stream-json", "--include-partial-messages")
 	args = append(args, "--append-system-prompt", agentAIOptionSystemPrompt)
 	if resumeSessionID != "" {
 		args = append(args, "--resume", resumeSessionID)
@@ -3917,6 +4146,44 @@ func newClaudeCodeAITool(id string, path string, prompt string, model string, ef
 		path:         path,
 		args:         args,
 		outputFormat: agentAIOutputClaudeStreamJSON,
+	}
+}
+
+const (
+	claudeCodeHeadlessDefaultTools = "Bash,Edit,Glob,Grep,Read,Write"
+	claudeCodeHeadlessEmptyMCP     = `{"mcpServers":{}}`
+)
+
+func claudeCodeHeadlessSlimArgs() []string {
+	if !claudeCodeHeadlessSlimEnabled() {
+		return nil
+	}
+	tools := strings.TrimSpace(os.Getenv("ALIANG_CLAUDE_HEADLESS_TOOLS"))
+	if tools == "" {
+		tools = claudeCodeHeadlessDefaultTools
+	}
+	args := []string{"--tools", tools}
+	if truthyEnv("ALIANG_CLAUDE_HEADLESS_ENABLE_MCP") {
+		return args
+	}
+	return append(args, "--strict-mcp-config", "--mcp-config", claudeCodeHeadlessEmptyMCP)
+}
+
+func claudeCodeHeadlessSlimEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("ALIANG_CLAUDE_HEADLESS_SLIM"))) {
+	case "1", "true", "on", "yes", "enable", "enabled":
+		return true
+	default:
+		return false
+	}
+}
+
+func truthyEnv(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
+	case "1", "true", "yes", "on", "enable", "enabled":
+		return true
+	default:
+		return false
 	}
 }
 

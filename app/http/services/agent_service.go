@@ -198,7 +198,11 @@ func (s *AgentService) Status() models.AgentStatusResponse {
 // VibeSessions returns the local AI coding sessions (Claude/Codex) as
 // lightweight summaries, newest first. Transcript is stripped.
 func (s *AgentService) VibeSessions() []models.AgentVibeSession {
-	return summarizeAgentVibeSessions(collectAgentVibeSessions(nil))
+	snapshot := agentSyncSnapshot{VibeSessions: summarizeAgentVibeSessions(collectAgentVibeSessions(nil))}
+	if s == nil || s.ai == nil {
+		return snapshot.VibeSessions
+	}
+	return overlayActiveAgentVibeSessions(snapshot, s.ai.activeVibeSessionsSnapshot(), nil).VibeSessions
 }
 
 // VibeSessionDetail returns a single session's transcript page for the
@@ -1787,7 +1791,8 @@ func (s *AgentService) buildAgentStatusSyncPayloadLocked(status string) agentSta
 	if status == "" {
 		status = "online"
 	}
-	snapshot := collectAgentSyncSnapshot(activeScanDirs(s.state.ScanDirectories, s.state.ScanDirectoriesEnabled))
+	scanDirs := activeScanDirs(s.state.ScanDirectories, s.state.ScanDirectoriesEnabled)
+	snapshot := s.collectAgentSyncSnapshotWithActiveRuns(scanDirs)
 	return agentStatusSyncPayload{
 		DeviceID:              s.state.DeviceID,
 		Status:                status,
@@ -1805,6 +1810,14 @@ func (s *AgentService) buildAgentStatusSyncPayloadLocked(status string) agentSta
 		StartedAt:             time.Now().UTC().Format(time.RFC3339),
 		CollectedAt:           snapshot.CollectedAt,
 	}
+}
+
+func (s *AgentService) collectAgentSyncSnapshotWithActiveRuns(scanDirs []string) agentSyncSnapshot {
+	snapshot := collectAgentSyncSnapshot(scanDirs)
+	if s == nil || s.ai == nil {
+		return snapshot
+	}
+	return overlayActiveAgentVibeSessions(snapshot, s.ai.activeVibeSessionsSnapshot(), scanDirs)
 }
 
 func normalizeRegisteredAgentDevice(resp agentRegisterResponse, fallbackDeviceID string, fallbackUniqueCode string) *models.AgentDevice {

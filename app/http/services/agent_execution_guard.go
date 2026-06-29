@@ -30,7 +30,7 @@ const (
 	agentTerminalOutputCapBytes   = 256 * 1024 * 1024
 	agentTerminalIdleTimeout      = 30 * time.Minute
 
-	agentMaxAISessions       = 4
+	agentMaxAISessions       = 5
 	agentAIMessageLimitBytes = 64 * 1024
 	// AI output flood protection, mirroring the terminal policy: a sliding
 	// window stops runaway bursts (an AI dumping megabytes per second) while
@@ -41,13 +41,14 @@ const (
 	agentAIOutputRateBytes  = 16 * 1024 * 1024
 	agentAIOutputCapBytes   = 256 * 1024 * 1024
 
-	// AI run liveness. A run is kept alive while it produces output OR while it
-	// is awaiting a human approval decision. A run that goes silent (no stdout)
-	// for longer than agentAIIdleWindow AND is not awaiting approval is stopped
-	// as idle. agentAIHardCeiling is a runaway backstop that fires regardless of
-	// activity. Approvals themselves have no wall-clock limit: they are cancelled
-	// only when the enclosing dialogue/session terminates or the agent goes
-	// offline (see agent_ai.go startAIWatchdog / clearPendingApprovalsLocked).
+	// AI run liveness. A run is kept alive while it produces output, awaits a
+	// human approval decision, or waits for Claude tool/subagent results. A run
+	// that goes silent longer than agentAIIdleWindow without one of those waits is
+	// stopped as idle. agentAIHardCeiling is a runaway backstop that fires
+	// regardless of activity. Approvals themselves have no wall-clock limit: they
+	// are cancelled only when the enclosing dialogue/session terminates or the
+	// agent goes offline (see agent_ai.go startAIWatchdog /
+	// clearPendingApprovalsLocked).
 	agentAIIdleWindow        = 10 * time.Minute
 	agentAIHardCeiling       = 4 * time.Hour
 	agentAIIdleCheckInterval = 30 * time.Second

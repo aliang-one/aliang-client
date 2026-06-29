@@ -569,7 +569,7 @@ func (s *AgentService) agentHelloPayload() map[string]interface{} {
 	scanDirs := activeScanDirs(s.state.ScanDirectories, s.state.ScanDirectoriesEnabled)
 	s.mu.Unlock()
 
-	snapshot := collectAgentSyncSnapshot(scanDirs)
+	snapshot := s.collectAgentSyncSnapshotWithActiveRuns(scanDirs)
 	return map[string]interface{}{
 		"type":                   models.AgentEventHello,
 		"protocol_version":       models.AgentProtocolVersion,

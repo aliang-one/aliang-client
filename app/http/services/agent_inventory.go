@@ -92,6 +92,122 @@ func collectAgentSyncSnapshot(scanDirs []string) agentSyncSnapshot {
 	}
 }
 
+func overlayActiveAgentVibeSessions(snapshot agentSyncSnapshot, active []models.AgentVibeSession, scanDirs []string) agentSyncSnapshot {
+	if len(active) == 0 {
+		return snapshot
+	}
+	sessions := make([]models.AgentVibeSession, 0, len(snapshot.VibeSessions)+len(active))
+	byID := make(map[string]int, len(snapshot.VibeSessions)+len(active))
+	for _, session := range snapshot.VibeSessions {
+		idx := len(sessions)
+		sessions = append(sessions, session)
+		if id := strings.TrimSpace(session.ID); id != "" {
+			byID[id] = idx
+		}
+	}
+	projects := append([]models.AgentProject(nil), snapshot.Projects...)
+	for _, session := range active {
+		session = normalizeActiveAgentVibeSession(session)
+		if session.ID == "" {
+			continue
+		}
+		if len(scanDirs) > 0 && session.ProjectPath != "" && !pathUnderAnyScanDir(session.ProjectPath, scanDirs) {
+			continue
+		}
+		if idx, ok := byID[session.ID]; ok {
+			sessions[idx] = mergeActiveAgentVibeSession(sessions[idx], session)
+		} else {
+			byID[session.ID] = len(sessions)
+			sessions = append(sessions, session)
+		}
+		projects = upsertActiveAgentProject(projects, session)
+	}
+	sort.Slice(sessions, func(i, j int) bool {
+		return sessions[i].UpdatedAt > sessions[j].UpdatedAt
+	})
+	if len(sessions) > agentVibeSummaryMaxSessions {
+		sessions = sessions[:agentVibeSummaryMaxSessions]
+	}
+	sort.Slice(projects, func(i, j int) bool {
+		return projects[i].LastActiveAt > projects[j].LastActiveAt
+	})
+	snapshot.VibeSessions = summarizeAgentVibeSessions(sessions)
+	snapshot.Projects = projects
+	snapshot.AuthorizedDirectories = agentProjectPaths(projects)
+	setAgentAuthorizedExecutionDirectoriesCache(snapshot.AuthorizedDirectories)
+	return snapshot
+}
+
+func normalizeActiveAgentVibeSession(session models.AgentVibeSession) models.AgentVibeSession {
+	session.ID = strings.TrimSpace(session.ID)
+	session.Provider = strings.ToLower(strings.TrimSpace(firstNonEmpty(session.Provider, "auto")))
+	session.Tool = strings.ToLower(strings.TrimSpace(firstNonEmpty(session.Tool, session.Provider)))
+	session.ProjectPath = cleanAgentProjectPath(session.ProjectPath)
+	session.Title = truncateAgentText(session.Title, 200)
+	session.Summary = truncateAgentText(session.Summary, 500)
+	session.Mode = strings.TrimSpace(firstNonEmpty(session.Mode, "vibe"))
+	session.Status = "running"
+	session.Model = strings.TrimSpace(session.Model)
+	session.CreatedAt = normalizeAgentTime(session.CreatedAt)
+	session.UpdatedAt = normalizeAgentTime(firstNonEmpty(session.UpdatedAt, time.Now().UTC().Format(time.RFC3339)))
+	session.Transcript = nil
+	session.TranscriptPage = nil
+	if !isSafeAgentProjectPath(session.ProjectPath) {
+		session.ProjectPath = ""
+	}
+	return session
+}
+
+func mergeActiveAgentVibeSession(existing models.AgentVibeSession, active models.AgentVibeSession) models.AgentVibeSession {
+	active.Title = firstNonEmpty(active.Title, existing.Title)
+	active.Summary = firstNonEmpty(active.Summary, existing.Summary)
+	active.ProjectPath = firstNonEmpty(active.ProjectPath, existing.ProjectPath)
+	active.Branch = firstNonEmpty(active.Branch, existing.Branch)
+	active.Model = firstNonEmpty(active.Model, existing.Model)
+	active.CreatedAt = firstNonEmpty(active.CreatedAt, existing.CreatedAt)
+	if active.MessageCount == 0 {
+		active.MessageCount = existing.MessageCount
+	}
+	return active
+}
+
+func upsertActiveAgentProject(projects []models.AgentProject, session models.AgentVibeSession) []models.AgentProject {
+	path := cleanAgentProjectPath(session.ProjectPath)
+	if !isSafeAgentProjectPath(path) {
+		return projects
+	}
+	now := firstNonEmpty(session.UpdatedAt, time.Now().UTC().Format(time.RFC3339))
+	for i := range projects {
+		if cleanAgentProjectPath(projects[i].Path) != path {
+			continue
+		}
+		projects[i].Status = "running"
+		if projects[i].LastActiveAt == "" || compareRFC3339(now, projects[i].LastActiveAt) > 0 {
+			projects[i].LastActiveAt = now
+		}
+		if source := firstNonEmpty(session.Tool, session.Provider); source != "" {
+			addAgentProjectSource(&projects[i], source)
+		}
+		enrichAgentProject(&projects[i])
+		projects[i].Status = "running"
+		return projects
+	}
+	project := models.AgentProject{
+		ID:           stableAgentID("proj", path),
+		Name:         agentProjectName(path),
+		Path:         path,
+		Status:       "running",
+		Branch:       session.Branch,
+		LastActiveAt: now,
+	}
+	if source := firstNonEmpty(session.Tool, session.Provider); source != "" {
+		addAgentProjectSource(&project, source)
+	}
+	enrichAgentProject(&project)
+	project.Status = "running"
+	return append(projects, project)
+}
+
 func summarizeAgentVibeSessions(sessions []models.AgentVibeSession) []models.AgentVibeSession {
 	summaries := make([]models.AgentVibeSession, 0, len(sessions))
 	for _, session := range sessions {

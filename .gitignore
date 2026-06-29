@@ -48,6 +48,7 @@ aliang-test
 dashboard-current-state.png
 tmp*
 aliang
+aliang-linux
 !outbound/proxy/aliang/
 !outbound/proxy/aliang/status.go
 !outbound/proxy/aliang/status_test.go

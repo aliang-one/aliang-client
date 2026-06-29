@@ -426,6 +426,12 @@ func TestEvaluateDecisionForAgentService(t *testing.T) {
 // so handleClaudeApprovalHook's session/token guards pass.
 func setupHookReadySession(t *testing.T, svc *AgentService, sessionID, token string, events *[]map[string]interface{}, mu *sync.Mutex) {
 	t.Helper()
+	projectPath := setupAgentExecutionProjectForTest(t)
+	t.Cleanup(func() {
+		agentAuthorizedDirsMu.Lock()
+		agentAuthorizedDirsCache = nil
+		agentAuthorizedDirsMu.Unlock()
+	})
 	writeJSON := func(payload interface{}) error {
 		if e, ok := payload.(map[string]interface{}); ok {
 			mu.Lock()
@@ -436,7 +442,7 @@ func setupHookReadySession(t *testing.T, svc *AgentService, sessionID, token str
 	}
 	svc.ai.create(map[string]interface{}{
 		"type": "ai.session.create", "session_id": sessionID,
-		"project_path": t.TempDir(), "provider": "claudecode",
+		"project_path": projectPath, "provider": "claudecode",
 	}, writeJSON)
 	_, runCancel := context.WithCancel(context.Background())
 	t.Cleanup(runCancel)

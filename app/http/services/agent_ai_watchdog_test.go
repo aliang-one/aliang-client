@@ -41,6 +41,19 @@ func TestAgentAIActivityLifecycle(t *testing.T) {
 		t.Fatal("setAwaitingApproval(false) should clear awaiting")
 	}
 
+	// Tool/subagent waits also pause the idle watchdog and bump activity.
+	a.beginToolUseWait()
+	if !a.idlePaused() {
+		t.Fatal("beginToolUseWait should pause idle watchdog")
+	}
+	if idle := a.idleFor(); idle > 50*time.Millisecond {
+		t.Fatalf("beginToolUseWait should bump, idleFor = %v", idle)
+	}
+	a.endToolUseWait()
+	if a.idlePaused() {
+		t.Fatal("endToolUseWait should unpause idle watchdog once all tools resolved")
+	}
+
 	a.setKillReason("idle_timeout")
 	if got := a.killReasonOr("fallback"); got != "idle_timeout" {
 		t.Fatalf("killReasonOr = %q, want idle_timeout", got)
@@ -53,6 +66,9 @@ func TestAgentAIActivityNilSafe(t *testing.T) {
 	a.bump()
 	a.setAwaitingApproval(true)
 	_ = a.awaiting()
+	a.beginToolUseWait()
+	a.endToolUseWait()
+	_ = a.idlePaused()
 	_ = a.idleFor()
 	a.setKillReason("idle_timeout")
 	if got := a.killReasonOr("fallback"); got != "fallback" {
@@ -120,9 +136,9 @@ func runWatchdogUntilCancelled(t *testing.T, idleWindow, hardCeiling, interval, 
 func TestAgentAIWatchdogLoopIdleKills(t *testing.T) {
 	// Never bumped, not awaiting -> cancelled shortly after the idle window.
 	cancelled, reason := runWatchdogUntilCancelled(t,
-		50*time.Millisecond, /* idleWindow */
-		0,                   /* hardCeiling disabled */
-		10*time.Millisecond, /* interval */
+		50*time.Millisecond,  /* idleWindow */
+		0,                    /* hardCeiling disabled */
+		10*time.Millisecond,  /* interval */
 		500*time.Millisecond, /* wait */
 		nil)
 	if !cancelled {
@@ -136,9 +152,9 @@ func TestAgentAIWatchdogLoopIdleKills(t *testing.T) {
 func TestAgentAIWatchdogLoopAwaitingExempt(t *testing.T) {
 	// Awaiting approval must pause the idle watchdog: no cancel within the wait.
 	cancelled, reason := runWatchdogUntilCancelled(t,
-		40*time.Millisecond, /* idleWindow */
-		0,                   /* hardCeiling disabled */
-		10*time.Millisecond, /* interval */
+		40*time.Millisecond,  /* idleWindow */
+		0,                    /* hardCeiling disabled */
+		10*time.Millisecond,  /* interval */
 		200*time.Millisecond, /* wait (5x idleWindow) */
 		func(a *agentAIActivity) { a.setAwaitingApproval(true) })
 	if cancelled {
@@ -146,6 +162,51 @@ func TestAgentAIWatchdogLoopAwaitingExempt(t *testing.T) {
 	}
 	if reason != "" {
 		t.Fatalf("kill reason = %q, want empty (no kill)", reason)
+	}
+}
+
+func TestAgentAIWatchdogLoopToolUseWaitExempt(t *testing.T) {
+	// A Claude tool_use (including Task/subagent) can be legitimately silent
+	// while waiting for its tool_result. That must not be mistaken for idle.
+	cancelled, reason := runWatchdogUntilCancelled(t,
+		40*time.Millisecond,  /* idleWindow */
+		0,                    /* hardCeiling disabled */
+		10*time.Millisecond,  /* interval */
+		200*time.Millisecond, /* wait (5x idleWindow) */
+		func(a *agentAIActivity) { a.beginToolUseWait() })
+	if cancelled {
+		t.Fatal("watchdog cancelled a run waiting for a tool/subagent result")
+	}
+	if reason != "" {
+		t.Fatalf("kill reason = %q, want empty (no kill)", reason)
+	}
+}
+
+func TestAgentAIWatchdogLoopToolResultReenablesIdle(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	activity := newAgentAIActivity()
+	activity.beginToolUseWait()
+	done := make(chan struct{})
+	go func() {
+		agentAIWatchdogLoop(ctx, activity, cancel, 40*time.Millisecond, 0, 10*time.Millisecond)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		t.Fatal("watchdog cancelled while tool/subagent result was pending")
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	activity.endToolUseWait()
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("watchdog did not cancel after tool/subagent result wait ended and output stayed idle")
+	}
+	if reason := activity.killReasonOr(""); reason != "idle_timeout" {
+		t.Fatalf("kill reason = %q, want idle_timeout", reason)
 	}
 }
 
@@ -195,9 +256,9 @@ func TestAgentAIWatchdogLoopActivityResetsIdle(t *testing.T) {
 func TestAgentAIWatchdogLoopHardCeilingKills(t *testing.T) {
 	// A tiny hard ceiling fires regardless of idle window (which is set large).
 	cancelled, reason := runWatchdogUntilCancelled(t,
-		time.Hour,           /* idleWindow: never fires */
-		time.Millisecond,    /* hardCeiling */
-		5*time.Millisecond,  /* interval */
+		time.Hour,            /* idleWindow: never fires */
+		time.Millisecond,     /* hardCeiling */
+		5*time.Millisecond,   /* interval */
 		300*time.Millisecond, /* wait */
 		nil)
 	if !cancelled {

@@ -1873,6 +1873,63 @@ func TestResolveNamedAgentAIToolIgnoresProviderPlaceholderModel(t *testing.T) {
 	}
 }
 
+func TestResolveNamedAgentAIToolDoesNotSlimClaudeHeadlessByDefault(t *testing.T) {
+	binDir := t.TempDir()
+	claudeName := "claude"
+	script := "#!/bin/sh\n"
+	if runtime.GOOS == "windows" {
+		claudeName = "claude.bat"
+		script = "@echo off\r\n"
+	}
+	claudePath := filepath.Join(binDir, claudeName)
+	if err := os.WriteFile(claudePath, []byte(script), 0o700); err != nil {
+		t.Fatalf("write fake claude: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("ALIANG_CLAUDE_HEADLESS_SLIM", "")
+	t.Setenv("ALIANG_CLAUDE_HEADLESS_TOOLS", "")
+	t.Setenv("ALIANG_CLAUDE_HEADLESS_ENABLE_MCP", "")
+
+	tool, err := resolveNamedAgentAITool("claude", "hello", "", "", "")
+	if err != nil {
+		t.Fatalf("resolveNamedAgentAITool() error = %v", err)
+	}
+	got := strings.Join(tool.args, " ")
+	if strings.Contains(got, "--tools") || strings.Contains(got, "--strict-mcp-config") {
+		t.Fatalf("claude args = %q, want no slim flags by default", got)
+	}
+}
+
+func TestResolveNamedAgentAIToolClaudeHeadlessSlimCanBeEnabled(t *testing.T) {
+	binDir := t.TempDir()
+	claudeName := "claude"
+	script := "#!/bin/sh\n"
+	if runtime.GOOS == "windows" {
+		claudeName = "claude.bat"
+		script = "@echo off\r\n"
+	}
+	claudePath := filepath.Join(binDir, claudeName)
+	if err := os.WriteFile(claudePath, []byte(script), 0o700); err != nil {
+		t.Fatalf("write fake claude: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("ALIANG_CLAUDE_HEADLESS_SLIM", "1")
+	t.Setenv("ALIANG_CLAUDE_HEADLESS_TOOLS", "")
+	t.Setenv("ALIANG_CLAUDE_HEADLESS_ENABLE_MCP", "")
+
+	tool, err := resolveNamedAgentAITool("claude", "hello", "", "", "")
+	if err != nil {
+		t.Fatalf("resolveNamedAgentAITool() error = %v", err)
+	}
+	got := strings.Join(tool.args, " ")
+	if !strings.Contains(got, "--tools "+claudeCodeHeadlessDefaultTools) {
+		t.Fatalf("claude args = %q, want slim tools allowlist when enabled", got)
+	}
+	if !strings.Contains(got, "--strict-mcp-config --mcp-config "+claudeCodeHeadlessEmptyMCP) {
+		t.Fatalf("claude args = %q, want empty MCP config when enabled", got)
+	}
+}
+
 func TestAgentAIManagerStreamsClaudeCodeTextDelta(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell fake claude in this test is POSIX-only")
@@ -2978,6 +3035,180 @@ func TestAgentHelloPayloadIncludesProjectsAndVibeSessionSummaries(t *testing.T) 
 	if len(codexSession.Transcript) != 0 {
 		t.Fatalf("codex transcript = %#v, want summary-only hello payload", codexSession.Transcript)
 	}
+}
+
+func TestAgentHelloPayloadOverlaysActiveAIRun(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("ALIANG_DATA_DIR", t.TempDir())
+	cache.ResetCacheDirForTest()
+	config.ResetGlobalConfigForTest()
+	t.Cleanup(config.ResetGlobalConfigForTest)
+
+	projectPath := filepath.Join(home, "work", "active-project")
+	if err := os.MkdirAll(projectPath, 0o700); err != nil {
+		t.Fatalf("mkdir project: %v", err)
+	}
+
+	service := NewAgentService()
+	_, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	service.ai.mu.Lock()
+	service.ai.sessions["live-session-1"] = &agentAISession{
+		id:          "live-session-1",
+		mode:        "vibe",
+		projectPath: projectPath,
+		provider:    "claude",
+		model:       "claude-sonnet-4-5",
+		cancel:      cancel,
+		runSeq:      1,
+		history: []agentAIMessage{{
+			Role:      "user",
+			MessageID: "msg-1",
+			Content:   "Keep working on the active task",
+			CreatedAt: time.Date(2026, 6, 29, 1, 2, 3, 0, time.UTC),
+		}},
+	}
+	service.ai.mu.Unlock()
+
+	payload := service.agentHelloPayload()
+	sessions, ok := payload["vibe_sessions"].([]models.AgentVibeSession)
+	if !ok {
+		t.Fatalf("hello vibe_sessions = %T, want []AgentVibeSession", payload["vibe_sessions"])
+	}
+	var live models.AgentVibeSession
+	for _, session := range sessions {
+		if session.ID == "live-session-1" {
+			live = session
+			break
+		}
+	}
+	if live.ID == "" || live.Status != "running" || live.ProjectPath != projectPath {
+		t.Fatalf("live session = %#v, want running session for %s", live, projectPath)
+	}
+
+	projects, ok := payload["projects"].([]models.AgentProject)
+	if !ok {
+		t.Fatalf("hello projects = %T, want []AgentProject", payload["projects"])
+	}
+	var activeProject models.AgentProject
+	for _, project := range projects {
+		if project.Path == projectPath {
+			activeProject = project
+			break
+		}
+	}
+	if activeProject.Path == "" || activeProject.Status != "running" {
+		t.Fatalf("active project = %#v, want running project", activeProject)
+	}
+}
+
+func TestAgentStatusSyncPayloadOverlaysActiveAIRun(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("ALIANG_DATA_DIR", t.TempDir())
+	cache.ResetCacheDirForTest()
+	config.ResetGlobalConfigForTest()
+	t.Cleanup(config.ResetGlobalConfigForTest)
+
+	projectPath := filepath.Join(home, "work", "status-active-project")
+	if err := os.MkdirAll(projectPath, 0o700); err != nil {
+		t.Fatalf("mkdir project: %v", err)
+	}
+
+	service := NewAgentService()
+	_, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	service.ai.mu.Lock()
+	service.ai.sessions["status-live-session"] = &agentAISession{
+		id:          "status-live-session",
+		mode:        "vibe",
+		projectPath: projectPath,
+		provider:    "codex",
+		model:       "gpt-5-codex",
+		cancel:      cancel,
+		runSeq:      1,
+		history: []agentAIMessage{{
+			Role:      "user",
+			MessageID: "msg-2",
+			Content:   "Still running",
+			CreatedAt: time.Date(2026, 6, 29, 2, 3, 4, 0, time.UTC),
+		}},
+	}
+	service.ai.mu.Unlock()
+
+	service.mu.Lock()
+	payload := service.buildAgentStatusSyncPayloadLocked("online")
+	service.mu.Unlock()
+
+	var live models.AgentVibeSession
+	for _, session := range payload.VibeSessions {
+		if session.ID == "status-live-session" {
+			live = session
+			break
+		}
+	}
+	if live.ID == "" || live.Status != "running" || live.Provider != "codex" {
+		t.Fatalf("status live session = %#v, want running codex session", live)
+	}
+	var activeProject models.AgentProject
+	for _, project := range payload.Projects {
+		if project.Path == projectPath {
+			activeProject = project
+			break
+		}
+	}
+	if activeProject.Path == "" || activeProject.Status != "running" {
+		t.Fatalf("status active project = %#v, want running project", activeProject)
+	}
+}
+
+func TestAgentVibeSessionsOverlaysActiveAIRun(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("ALIANG_DATA_DIR", t.TempDir())
+	cache.ResetCacheDirForTest()
+	config.ResetGlobalConfigForTest()
+	t.Cleanup(config.ResetGlobalConfigForTest)
+
+	projectPath := filepath.Join(home, "work", "local-active-project")
+	if err := os.MkdirAll(projectPath, 0o700); err != nil {
+		t.Fatalf("mkdir project: %v", err)
+	}
+
+	service := NewAgentService()
+	_, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	service.ai.mu.Lock()
+	service.ai.sessions["local-live-session"] = &agentAISession{
+		id:          "local-live-session",
+		mode:        "vibe",
+		projectPath: projectPath,
+		provider:    "claude",
+		cancel:      cancel,
+		runSeq:      1,
+		history: []agentAIMessage{{
+			Role:      "user",
+			MessageID: "msg-local",
+			Content:   "Local view should still show running",
+			CreatedAt: time.Date(2026, 6, 29, 3, 4, 5, 0, time.UTC),
+		}},
+	}
+	service.ai.mu.Unlock()
+
+	sessions := service.VibeSessions()
+	for _, session := range sessions {
+		if session.ID == "local-live-session" {
+			if session.Status != "running" || session.ProjectPath != projectPath {
+				t.Fatalf("local live session = %#v, want running session for %s", session, projectPath)
+			}
+			return
+		}
+	}
+	t.Fatalf("local live session missing from VibeSessions(): %#v", sessions)
 }
 
 func TestAgentRemoteDetailRequestsReturnProjectAndVibeSessionDetail(t *testing.T) {

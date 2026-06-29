@@ -129,3 +129,27 @@ func TestClaudeSessionIDCapturedFromResultEvent(t *testing.T) {
 		t.Fatalf("expected ai.delta for the assistant reply")
 	}
 }
+
+func TestClaudeToolUseActivityTracksSubagentWait(t *testing.T) {
+	activity := newAgentAIActivity()
+	run := agentAIRun{sessionID: "s", messageID: "m", runSeq: 1, activity: activity}
+	_, _, writer := captureAIWriter(t)
+
+	input := `{"type":"assistant","message":{"model":"claude-x","content":[{"type":"tool_use","id":"toolu_task_1","name":"Task","input":{"description":"inspect","prompt":"go deep"}}]}}`
+	streamStructuredAIDelta(strings.NewReader(input), agentAIOutputClaudeStreamJSON, run, writer, &agentAIOutputLimiter{}, nil, nil, nil, nil)
+	if !activity.idlePaused() {
+		t.Fatal("Task tool_use should pause the idle watchdog while the subagent is running")
+	}
+
+	updateClaudeToolUseActivity(map[string]interface{}{
+		"type": "user",
+		"message": map[string]interface{}{
+			"content": []interface{}{
+				map[string]interface{}{"type": "tool_result", "tool_use_id": "toolu_task_1", "content": "done"},
+			},
+		},
+	}, activity, map[string]struct{}{"toolu_task_1": {}})
+	if activity.idlePaused() {
+		t.Fatal("matching tool_result should re-enable normal idle timeout")
+	}
+}
