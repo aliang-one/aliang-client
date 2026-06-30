@@ -61,6 +61,12 @@ const (
 	AgentEventFileRead                = "file.read"
 	AgentEventFileReadResult          = "file.read.result"
 	AgentEventFileError               = "file.error"
+	AgentEventGitStatus               = "git.status"
+	AgentEventGitStatusResult         = "git.status.result"
+	AgentEventGitStatusError          = "git.status.error"
+	AgentEventEnvInfo                 = "env.info"
+	AgentEventEnvInfoResult           = "env.info.result"
+	AgentEventEnvInfoError            = "env.info.error"
 	AgentEventProjectDetail           = "project.detail"
 	AgentEventProjectDetailResult     = "project.detail.result"
 	AgentEventAISessionDetail         = "ai.session.detail"
@@ -177,6 +183,10 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				{Type: AgentEventAISessionClosed, Required: []string{"type", "session_id"}},
 				{Type: AgentEventFileListResult, Required: []string{"type", "request_id", "path", "entries"}},
 				{Type: AgentEventFileReadResult, Required: []string{"type", "request_id", "path", "encoding", "content"}},
+				{Type: AgentEventGitStatusResult, Required: []string{"type", "request_id", "is_repo"}, Optional: []string{"branch", "status", "generated_at"}},
+				{Type: AgentEventEnvInfoResult, Required: []string{"type", "request_id", "os"}, Optional: []string{"arch", "shell", "user", "versions", "generated_at"}},
+				{Type: AgentEventGitStatusError, Required: []string{"type", "request_id", "error"}},
+				{Type: AgentEventEnvInfoError, Required: []string{"type", "request_id", "error"}},
 				{Type: AgentEventProjectDetailResult, Required: []string{"type", "request_id", "project"}},
 				{Type: AgentEventAISessionDetailResult, Required: []string{"type", "request_id", "session"}},
 				{Type: AgentEventSlashCommandsListResult, Required: []string{"type", "request_id", "project_path", "commands"}, Optional: []string{"generated_at"}},
@@ -206,6 +216,8 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				{Type: AgentEventAISessionClose, Required: []string{"type", "session_id"}, Emits: []string{AgentEventAISessionClosed}},
 				{Type: AgentEventFileList, Required: []string{"type", "request_id", "project_path", "path"}, Optional: []string{"max_entries"}, Emits: []string{AgentEventFileListResult, AgentEventFileError}},
 				{Type: AgentEventFileRead, Required: []string{"type", "request_id", "project_path", "path"}, Optional: []string{"max_bytes"}, Emits: []string{AgentEventFileReadResult, AgentEventFileError}},
+				{Type: AgentEventGitStatus, Required: []string{"type", "request_id", "cwd"}, Emits: []string{AgentEventGitStatusResult, AgentEventGitStatusError}},
+				{Type: AgentEventEnvInfo, Required: []string{"type", "request_id", "cwd"}, Emits: []string{AgentEventEnvInfoResult, AgentEventEnvInfoError}},
 				{Type: AgentEventProjectDetail, Required: []string{"type", "request_id", "project_id", "project_path"}, Emits: []string{AgentEventProjectDetailResult, AgentEventFileError}},
 				{Type: AgentEventAISessionDetail, Required: []string{"type", "request_id"}, Optional: []string{"session_id", "source_session_id", "project_path", "limit", "before_message_id", "before_timestamp"}, Emits: []string{AgentEventAISessionDetailResult, AgentEventFileError}},
 				{Type: AgentEventSlashCommandsList, Required: []string{"type", "request_id", "project_path"}, Optional: []string{"provider", "include_user_level", "include_plugins"}, Emits: []string{AgentEventSlashCommandsListResult, AgentEventSlashCommandsListError}},
