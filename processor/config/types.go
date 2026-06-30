@@ -420,6 +420,81 @@ func (c *ModelMappingConfig) Validate() error {
 	return nil
 }
 
+// CustomEnvVarsConfig overrides environment variables for AI CLI child processes
+// (claude/codex) spawned by the agent. When enabled, each KEY in Vars replaces any
+// same-named variable inherited from the agent process environment before the child
+// is exec'd; variables absent from Vars are inherited unchanged. The feature is opt-in.
+type CustomEnvVarsConfig struct {
+	Enabled *bool             `json:"enable,omitempty"`
+	Vars    map[string]string `json:"vars,omitempty"` // 环境变量 KEY -> VALUE
+}
+
+func (c *CustomEnvVarsConfig) UnmarshalJSON(data []byte) error {
+	type alias struct {
+		Enabled       *bool             `json:"enable,omitempty"`
+		LegacyEnabled *bool             `json:"enabled,omitempty"`
+		Vars          map[string]string `json:"vars,omitempty"`
+	}
+
+	var decoded alias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+
+	c.Enabled = decoded.Enabled
+	if c.Enabled == nil {
+		c.Enabled = decoded.LegacyEnabled
+	}
+	c.Vars = decoded.Vars
+	return nil
+}
+
+// IsEnabled reports whether custom env-var injection is enabled. The feature is
+// opt-in: it defaults to disabled when Enabled is unset.
+func (c *CustomEnvVarsConfig) IsEnabled() bool {
+	if c == nil || c.Enabled == nil {
+		return false
+	}
+	return *c.Enabled
+}
+
+// EffectiveVars returns the cleaned overrides (trimmed keys, empty keys dropped).
+// Values are preserved verbatim — they may legitimately be empty or contain '='.
+// It returns nil when there are no usable entries.
+func (c *CustomEnvVarsConfig) EffectiveVars() map[string]string {
+	if c == nil || len(c.Vars) == 0 {
+		return nil
+	}
+	vars := make(map[string]string, len(c.Vars))
+	for rawKey, rawValue := range c.Vars {
+		key := strings.TrimSpace(rawKey)
+		if key == "" {
+			continue
+		}
+		vars[key] = rawValue
+	}
+	if len(vars) == 0 {
+		return nil
+	}
+	return vars
+}
+
+func (c *CustomEnvVarsConfig) Validate() error {
+	if c == nil || !c.IsEnabled() {
+		return nil
+	}
+	for rawKey := range c.Vars {
+		key := strings.TrimSpace(rawKey)
+		if key == "" {
+			return fmt.Errorf("custom_env_vars.vars cannot have an empty variable name")
+		}
+		if strings.Contains(key, "=") {
+			return fmt.Errorf("custom_env_vars.vars[%q] cannot contain '=' in the variable name", key)
+		}
+	}
+	return nil
+}
+
 type CustomerConfig struct {
 	Proxy         *CustomerProxyConfig              `json:"proxy,omitempty"`
 	AIRules       map[string]*CustomerAIRuleSetting `json:"ai_rules,omitempty"`
@@ -427,6 +502,7 @@ type CustomerConfig struct {
 	TrafficMirror *TrafficMirrorConfig              `json:"traffic_mirror,omitempty"`
 	HTTP1Drop     *HTTP1DropConfig                  `json:"http1_drop,omitempty"`
 	ModelMapping  *ModelMappingConfig               `json:"model_mapping,omitempty"`
+	CustomEnvVars *CustomEnvVarsConfig              `json:"custom_env_vars,omitempty"`
 }
 
 type AliangServerConfig struct {
@@ -672,6 +748,11 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("invalid model_mapping configuration: %w", err)
 		}
 	}
+	if customEnvVars := c.Customer.CustomEnvVars; customEnvVars != nil {
+		if err := customEnvVars.Validate(); err != nil {
+			return fmt.Errorf("invalid custom_env_vars configuration: %w", err)
+		}
+	}
 
 	return nil
 }
@@ -725,7 +806,7 @@ func (c *Config) customerUnknownKeyErrors() error {
 	if len(c.customerUnknownFields) > 0 {
 		sorted := append([]string(nil), c.customerUnknownFields...)
 		sort.Strings(sorted)
-		return fmt.Errorf("customer.%s is forbidden: editable customer fields are [proxy ai_rules proxy_rules traffic_mirror http1_drop model_mapping]", sorted[0])
+		return fmt.Errorf("customer.%s is forbidden: editable customer fields are [proxy ai_rules proxy_rules traffic_mirror http1_drop model_mapping custom_env_vars]", sorted[0])
 	}
 
 	providers := make([]string, 0, len(c.aiRuleUnknownFields))
@@ -762,7 +843,7 @@ func extractCustomerUnknownFields(root map[string]json.RawMessage) ([]string, ma
 
 	for key := range customerRoot {
 		switch key {
-		case "proxy", "ai_rules", "proxy_rules", "traffic_mirror", "http1_drop", "model_mapping":
+		case "proxy", "ai_rules", "proxy_rules", "traffic_mirror", "http1_drop", "model_mapping", "custom_env_vars":
 		default:
 			unknownCustomer = append(unknownCustomer, key)
 		}
@@ -1080,6 +1161,19 @@ func (c *Config) EffectiveModelMapping() *ModelMappingConfig {
 	}
 	cfg := *c.Customer.ModelMapping
 	return &cfg
+}
+
+// EffectiveCustomEnvVars returns the cleaned custom env-var overrides to apply to
+// AI CLI child processes (claude/codex) when the feature is enabled, otherwise nil.
+// Callers should treat a nil/empty result as a no-op.
+func (c *Config) EffectiveCustomEnvVars() map[string]string {
+	if c == nil || c.Customer == nil || c.Customer.CustomEnvVars == nil {
+		return nil
+	}
+	if !c.Customer.CustomEnvVars.IsEnabled() {
+		return nil
+	}
+	return c.Customer.CustomEnvVars.EffectiveVars()
 }
 
 func sortedMapKeys(values map[string]*CustomerAIRuleSetting) []string {

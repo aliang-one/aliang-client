@@ -21,6 +21,7 @@ import (
 
 	"aliang.one/nursorgate/app/http/models"
 	"aliang.one/nursorgate/common/logger"
+	"aliang.one/nursorgate/processor/config"
 )
 
 type agentAIManager struct {
@@ -128,7 +129,57 @@ func agentAIEnvDiagnostic() string {
 	} else {
 		parts = append(parts, "ANTHROPIC_AUTH_TOKEN=<unset>")
 	}
+	if cfg := config.GetGlobalConfig(); cfg != nil {
+		if applied := len(cfg.EffectiveCustomEnvVars()); applied > 0 {
+			parts = append(parts, fmt.Sprintf("CUSTOM_ENV_OVERRIDES=<applied:%d>", applied))
+		}
+	}
 	return strings.Join(parts, " ")
+}
+
+// mergeEnvOverriding returns base with any entry whose key matches an overrides
+// key removed, then appends "KEY=VALUE" for each override. The result has at most
+// one entry per key, with overrides winning over the inherited values — this is
+// what makes a custom env var reliably replace a same-named system variable for the
+// child process (a plain append would leave both present and the winner would then
+// depend on the child runtime's envp parsing).
+func mergeEnvOverriding(base []string, overrides map[string]string) []string {
+	if len(overrides) == 0 {
+		return base
+	}
+	out := make([]string, 0, len(base)+len(overrides))
+	for _, kv := range base {
+		key := kv
+		if i := strings.IndexByte(kv, '='); i >= 0 {
+			key = kv[:i]
+		}
+		if _, drop := overrides[key]; drop {
+			continue
+		}
+		out = append(out, kv)
+	}
+	for key, value := range overrides {
+		out = append(out, key+"="+value)
+	}
+	return out
+}
+
+// agentChildProcessEnv returns the environment to pass to an AI CLI child process
+// (claude/codex): the agent's inherited environment with custom env vars from the
+// customer config overriding any same-named entries. It does NOT mutate the agent
+// process environment (no os.Setenv), so goroutines spawning children concurrently
+// stay isolated. Callers may still append tool-specific vars afterwards.
+func agentChildProcessEnv() []string {
+	base := os.Environ()
+	cfg := config.GetGlobalConfig()
+	if cfg == nil {
+		return base
+	}
+	overrides := cfg.EffectiveCustomEnvVars()
+	if len(overrides) == 0 {
+		return base
+	}
+	return mergeEnvOverriding(base, overrides)
 }
 
 type agentAISession struct {
@@ -2427,7 +2478,7 @@ func (m *agentAIManager) runCodexAppServer(ctx context.Context, run agentAIRun, 
 	}
 	cmd := newBackgroundCommandContext(ctx, path, "app-server", "--stdio")
 	cmd.Dir = run.projectPath
-	cmd.Env = os.Environ()
+	cmd.Env = agentChildProcessEnv()
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, err))
@@ -2541,6 +2592,32 @@ func (m *agentAIManager) runCodexAppServer(ctx context.Context, run agentAIRun, 
 	fileChangesByID := map[string]json.RawMessage{}
 	commandsByID := map[string]string{}
 	dedup := newCodexAgentMessageDedup()
+	// Progress heartbeat. Within a codex turn the app-server emits nothing
+	// during quiet gaps (long tool runs, model thinking, upstream retries), and
+	// unlike the Claude path there is no per-token stream — so without a
+	// heartbeat the phone receives no "still alive" signal and can demote a
+	// still-running turn mid-run. Tick ai.run.progress on the same interval as
+	// runCLIPass so the run stays running across silent gaps. progressStop is
+	// closed when runCodexAppServer returns (the scan loop below has exited).
+	progressStop := make(chan struct{})
+	defer close(progressStop)
+	go func() {
+		ticker := time.NewTicker(agentAIRunProgressInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-progressStop:
+				return
+			case <-ticker.C:
+				_ = writeJSON(map[string]interface{}{
+					"type":              models.AgentEventAIRunProgress,
+					"session_id":        run.sessionID,
+					"message_id":        agentAssistantMessageID(run.messageID),
+					"git_changed_count": countGitChanged(run.projectPath),
+				})
+			}
+		}
+	}()
 	for scanner.Scan() {
 		run.activity.bump()
 		var msg map[string]interface{}
@@ -3036,7 +3113,7 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 
 	cmd := newBackgroundCommandContext(ctx, tool.path, tool.args...)
 	cmd.Dir = run.projectPath
-	cmd.Env = os.Environ()
+	cmd.Env = agentChildProcessEnv()
 	if len(tool.env) > 0 {
 		cmd.Env = append(cmd.Env, tool.env...)
 	}

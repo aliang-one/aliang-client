@@ -893,6 +893,97 @@ func TestConfigValidate_ModelMappingDisabledSkipsValidation(t *testing.T) {
 	}
 }
 
+func TestConfigEffectiveCustomEnvVars(t *testing.T) {
+	t.Run("nil by default", func(t *testing.T) {
+		cfg := &Config{}
+		if got := cfg.EffectiveCustomEnvVars(); got != nil {
+			t.Fatalf("EffectiveCustomEnvVars() = %v, want nil by default", got)
+		}
+	})
+
+	t.Run("returns cleaned vars when enabled", func(t *testing.T) {
+		enabled := true
+		cfg := &Config{Customer: &CustomerConfig{
+			CustomEnvVars: &CustomEnvVarsConfig{
+				Enabled: &enabled,
+				Vars: map[string]string{
+					"ANTHROPIC_BASE_URL": "https://gw.example",
+					"  ":                 "dropped-empty-key",
+					"FOO":                "bar=baz",
+				},
+			},
+		}}
+		got := cfg.EffectiveCustomEnvVars()
+		if len(got) != 2 {
+			t.Fatalf("EffectiveCustomEnvVars() = %v, want 2 entries (empty key dropped)", got)
+		}
+		if got["ANTHROPIC_BASE_URL"] != "https://gw.example" {
+			t.Fatalf("ANTHROPIC_BASE_URL = %q, want https://gw.example", got["ANTHROPIC_BASE_URL"])
+		}
+		if got["FOO"] != "bar=baz" {
+			t.Fatalf("FOO = %q, value with '=' must be preserved verbatim", got["FOO"])
+		}
+	})
+
+	t.Run("nil when enabled but no vars", func(t *testing.T) {
+		enabled := true
+		cfg := &Config{Customer: &CustomerConfig{
+			CustomEnvVars: &CustomEnvVarsConfig{Enabled: &enabled},
+		}}
+		if got := cfg.EffectiveCustomEnvVars(); got != nil {
+			t.Fatalf("EffectiveCustomEnvVars() = %v, want nil when no vars", got)
+		}
+	})
+}
+
+func TestConfigValidate_CustomEnvVars(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload string
+		wantErr string // substr; empty means no error expected
+	}{
+		{
+			name:    "accepts valid vars including value with equals",
+			payload: `{"core":{"api_server":"https://api.aliang.one"},"customer":{"custom_env_vars":{"enable":true,"vars":{"ANTHROPIC_BASE_URL":"https://x","FOO":"a=b"}}}}`,
+		},
+		{
+			name:    "rejects empty variable name",
+			payload: `{"core":{"api_server":"https://api.aliang.one"},"customer":{"custom_env_vars":{"enable":true,"vars":{"":"v"}}}}`,
+			wantErr: "custom_env_vars",
+		},
+		{
+			name:    "rejects variable name containing equals",
+			payload: `{"core":{"api_server":"https://api.aliang.one"},"customer":{"custom_env_vars":{"enable":true,"vars":{"BAD=KEY":"v"}}}}`,
+			wantErr: "custom_env_vars",
+		},
+		{
+			name:    "disabled skips validation",
+			payload: `{"core":{"api_server":"https://api.aliang.one"},"customer":{"custom_env_vars":{"enable":false,"vars":{"":"v"}}}}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var cfg Config
+			if err := json.Unmarshal([]byte(tc.payload), &cfg); err != nil {
+				t.Fatalf("json.Unmarshal() error = %v", err)
+			}
+			err := cfg.Validate()
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Validate() error = %v, want nil", err)
+				}
+			} else {
+				if err == nil {
+					t.Fatal("Validate() error = nil, want error")
+				}
+				if !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("Validate() error = %v, want substring %q", err, tc.wantErr)
+				}
+			}
+		})
+	}
+}
+
 func TestConfigAgentBaseURL(t *testing.T) {
 	cfg := &Config{Core: &CoreConfig{APIServer: "https://api.example.com/"}}
 	if got := cfg.AgentBaseURL(); got != DefaultAgentServerURL {

@@ -145,6 +145,46 @@ func TestMergeCustomerPayload_ModelMappingEnableRoundTrip(t *testing.T) {
 	}
 }
 
+func TestMergeCustomerPayload_CustomEnvVarsRoundTrip(t *testing.T) {
+	baseCfg := &config.Config{
+		Core:     &config.CoreConfig{APIServer: "https://api.aliang.one"},
+		Customer: &config.CustomerConfig{},
+	}
+
+	cases := []struct {
+		name    string
+		payload string
+	}{
+		{
+			name:    "wrapped customer payload",
+			payload: `{"customer":{"custom_env_vars":{"enable":true,"vars":{"ANTHROPIC_BASE_URL":"https://gw.example"}}}}`,
+		},
+		{
+			name:    "direct customer payload",
+			payload: `{"custom_env_vars":{"enable":true,"vars":{"ANTHROPIC_BASE_URL":"https://gw.example"}}}`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mergedRaw, nextCfg, err := mergeCustomerPayload(baseCfg, []byte(tc.payload))
+			if err != nil {
+				t.Fatalf("mergeCustomerPayload() error = %v", err)
+			}
+			if err := nextCfg.Validate(); err != nil {
+				t.Fatalf("Validate() error = %v", err)
+			}
+			got := nextCfg.EffectiveCustomEnvVars()
+			if got["ANTHROPIC_BASE_URL"] != "https://gw.example" {
+				t.Fatalf("EffectiveCustomEnvVars()[ANTHROPIC_BASE_URL] = %q, want https://gw.example", got["ANTHROPIC_BASE_URL"])
+			}
+			if !strings.Contains(mergedRaw, "custom_env_vars") {
+				t.Fatalf("merged payload missing custom_env_vars: %s", mergedRaw)
+			}
+		})
+	}
+}
+
 func TestResolveBaseConfigForCustomerUpdate_PrefersStartupLocalConfigOverHomeConfig(t *testing.T) {
 	config.ResetGlobalConfigForTest()
 	config.ResetEffectiveConfigCommitCoordinatorForTest()

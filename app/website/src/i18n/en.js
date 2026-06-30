@@ -959,6 +959,20 @@ export default {
   modelMapping_save: 'Save',
   modelMapping_saving: 'Saving...',
 
+  // -- CustomEnvSettings --
+  customEnv_title: 'Custom Environment Variables',
+  customEnv_description: 'Override environment variables for AI CLI child processes (claude/codex). Same-named system variables are replaced; others are inherited unchanged.',
+  customEnv_enable: 'Enable custom environment variables',
+  customEnv_hint: 'Applied every time the agent launches a Claude/Codex child process. Useful for ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN, etc. Saves apply on the next launch — no restart needed.',
+  customEnv_key: 'Variable',
+  customEnv_value: 'Value',
+  customEnv_keyPlaceholder: 'e.g. ANTHROPIC_BASE_URL',
+  customEnv_valuePlaceholder: 'e.g. https://api.example.com',
+  customEnv_addVar: 'Add variable',
+  customEnv_remove: 'Remove variable',
+  customEnv_save: 'Save',
+  customEnv_saving: 'Saving...',
+
   // -- ConfigSyncSettings --
   sync_title: 'Config Sync Center',
   sync_refresh: 'Refresh',

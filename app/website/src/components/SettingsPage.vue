@@ -163,6 +163,15 @@
               :success-message="customerConfigSuccess"
               @save="saveCustomerConfig"
             />
+            <CustomEnvSettings
+              v-if="isAuthenticated"
+              :config="customerConfig"
+              :loading="isLoadingCustomerConfig"
+              :saving="isSavingCustomerConfig"
+              :error="customerConfigError"
+              :success-message="customerConfigSuccess"
+              @save="saveCustomerConfig"
+            />
           </aside>
         </div>
 
@@ -239,6 +248,7 @@ import AgentSettings from './settings/AgentSettings.vue';
 import AgentActivitySettings from './settings/AgentActivitySettings.vue';
 import AgentScanDirectoriesSettings from './settings/AgentScanDirectoriesSettings.vue';
 import ModelMappingSettings from './settings/ModelMappingSettings.vue';
+import CustomEnvSettings from './settings/CustomEnvSettings.vue';
 import { useNavigation } from '../composables/useNavigation';
 import { openTutorialDocs } from '../composables/useTutorialDocs';
 import { useAuthStore } from '../stores/auth';
@@ -258,6 +268,10 @@ function createDefaultCustomerConfig() {
     model_mapping: {
       enable: false,
       rules: {}
+    },
+    custom_env_vars: {
+      enable: false,
+      vars: {}
     }
   };
 }
@@ -303,6 +317,23 @@ function normalizeModelMappingConfig(payload = {}) {
   };
 }
 
+function normalizeCustomEnvVarsConfig(payload = {}) {
+  const source = payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : {};
+  const rawVars = source.vars && typeof source.vars === 'object' && !Array.isArray(source.vars) ? source.vars : {};
+  const vars = {};
+  for (const [key, value] of Object.entries(rawVars)) {
+    const trimmedKey = String(key ?? '').trim();
+    if (trimmedKey) {
+      // value preserved verbatim — it may legitimately be empty or contain '='
+      vars[trimmedKey] = String(value ?? '');
+    }
+  }
+  return {
+    enable: typeof source.enable === 'boolean' ? source.enable : false,
+    vars
+  };
+}
+
 function normalizeCustomerConfig(payload = {}) {
   const defaults = createDefaultCustomerConfig();
   return {
@@ -315,7 +346,8 @@ function normalizeCustomerConfig(payload = {}) {
     },
     ai_rules: normalizeAiRules(payload?.ai_rules),
     proxy_rules: normalizeProxyRules(payload?.proxy_rules),
-    model_mapping: normalizeModelMappingConfig(payload?.model_mapping)
+    model_mapping: normalizeModelMappingConfig(payload?.model_mapping),
+    custom_env_vars: normalizeCustomEnvVarsConfig(payload?.custom_env_vars)
   };
 }
 
@@ -393,7 +425,8 @@ export default {
     AgentSettings,
     AgentActivitySettings,
     AgentScanDirectoriesSettings,
-    ModelMappingSettings
+    ModelMappingSettings,
+    CustomEnvSettings
   },
   setup() {
     const { currentPage, showPage, showDashboard } = useNavigation();

@@ -959,6 +959,20 @@ export default {
   modelMapping_save: '保存',
   modelMapping_saving: '保存中…',
 
+  // -- CustomEnvSettings --
+  customEnv_title: '自定义环境变量',
+  customEnv_description: '覆盖 AI CLI 子进程（claude/codex）的环境变量。同名系统变量会被替换，其余原样继承。',
+  customEnv_enable: '启用自定义环境变量',
+  customEnv_hint: '每次 agent 拉起 Claude/Codex 子进程时生效，常用于 ANTHROPIC_BASE_URL、ANTHROPIC_AUTH_TOKEN 等。保存后下一次启动即生效，无需重启。',
+  customEnv_key: '变量名',
+  customEnv_value: '变量值',
+  customEnv_keyPlaceholder: '例如 ANTHROPIC_BASE_URL',
+  customEnv_valuePlaceholder: '例如 https://api.example.com',
+  customEnv_addVar: '新增变量',
+  customEnv_remove: '删除变量',
+  customEnv_save: '保存',
+  customEnv_saving: '保存中…',
+
   // -- ConfigSyncSettings --
   sync_title: '配置同步中心',
   sync_refresh: '刷新',
