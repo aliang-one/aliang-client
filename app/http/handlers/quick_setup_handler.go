@@ -50,6 +50,31 @@ func (h *QuickSetupHandler) HandleRender(w http.ResponseWriter, r *http.Request)
 	common.Success(w, resp)
 }
 
+func (h *QuickSetupHandler) HandleModels(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
+		return
+	}
+
+	var req models.QuickSetupModelsRequest
+	if err := common.DecodeRequest(r, &req); err != nil {
+		common.ErrorBadRequest(w, "Invalid request body", map[string]interface{}{"error": err.Error()})
+		return
+	}
+
+	resp, err := h.service.Models(req)
+	if err != nil {
+		if isBadRequestError(err) {
+			common.ErrorBadRequest(w, err.Error(), nil)
+			return
+		}
+		common.ErrorInternalServer(w, "Quick setup model list failed", map[string]interface{}{"error": err.Error()})
+		return
+	}
+
+	common.Success(w, resp)
+}
+
 func (h *QuickSetupHandler) HandleApply(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)

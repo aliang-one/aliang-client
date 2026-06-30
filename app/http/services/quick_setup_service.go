@@ -4,9 +4,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"aliang.one/nursorgate/app/http/models"
 	"aliang.one/nursorgate/common/cache"
@@ -17,6 +20,7 @@ import (
 type QuickSetupService struct{}
 
 var quickSetupGetAPIKeysFn = auth.GetUserAPIKeys
+var quickSetupModelsHTTPClient = &http.Client{Timeout: 12 * time.Second}
 
 func NewQuickSetupService() *QuickSetupService {
 	return &QuickSetupService{}
@@ -39,11 +43,12 @@ func (s *QuickSetupService) Catalog() map[string]interface{} {
 		}
 	}
 
+	baseRoot, _ := quickSetupBaseURL()
 	return map[string]interface{}{
 		"status": "success",
 		"data": models.QuickSetupCatalogResponse{
 			Softwares: quickSetupSoftwares(),
-			APIKeys:   toQuickSetupAPIKeys(apiKeys),
+			APIKeys:   toQuickSetupAPIKeys(apiKeys, baseRoot),
 		},
 	}
 }
@@ -74,8 +79,20 @@ func (s *QuickSetupService) Render(req models.QuickSetupRenderRequest) (*models.
 		selectedIDs[id] = struct{}{}
 	}
 
+	keys := toQuickSetupAPIKeys(apiKeys, baseRoot)
+	if softwareDef.Code == "opencode" {
+		variants, err := renderOpenCodeVariants(softwareDef, keys, selectedIDs, req.OpenCode, baseRoot)
+		if err != nil {
+			return nil, err
+		}
+		return &models.QuickSetupRenderResponse{
+			Software: softwareDef.Code,
+			Variants: variants,
+		}, nil
+	}
+
 	var variants []models.QuickSetupVariant
-	for _, key := range toQuickSetupAPIKeys(apiKeys) {
+	for _, key := range keys {
 		if len(selectedIDs) > 0 {
 			if _, ok := selectedIDs[key.ID]; !ok {
 				continue
@@ -110,6 +127,50 @@ func (s *QuickSetupService) Render(req models.QuickSetupRenderRequest) (*models.
 	return &models.QuickSetupRenderResponse{
 		Software: softwareDef.Code,
 		Variants: variants,
+	}, nil
+}
+
+func (s *QuickSetupService) Models(req models.QuickSetupModelsRequest) (*models.QuickSetupModelsResponse, error) {
+	if req.KeyID == 0 {
+		return nil, errors.New("key_id is required")
+	}
+
+	baseRoot, err := quickSetupBaseURL()
+	if err != nil {
+		return nil, err
+	}
+
+	apiKeys, err := quickSetupGetAPIKeysFn()
+	if err != nil {
+		return nil, err
+	}
+
+	keys := toQuickSetupAPIKeys(apiKeys, baseRoot)
+	var selected *models.QuickSetupAPIKey
+	for i := range keys {
+		if keys[i].ID == req.KeyID {
+			selected = &keys[i]
+			break
+		}
+	}
+	if selected == nil {
+		return nil, fmt.Errorf("api key not found: %d", req.KeyID)
+	}
+	if !selected.SecretAvailable || strings.TrimSpace(selected.Key) == "" || selected.Masked {
+		return nil, errors.New("selected API key secret is not available")
+	}
+
+	modelListBaseURL := quickSetupModelListBaseURL(baseRoot)
+	modelsList, err := fetchQuickSetupModels(modelListBaseURL, selected.Key)
+	if err != nil {
+		return nil, err
+	}
+
+	return &models.QuickSetupModelsResponse{
+		KeyID:    selected.ID,
+		Provider: selected.Provider,
+		BaseURL:  modelListBaseURL,
+		Models:   modelsList,
 	}, nil
 }
 
@@ -151,14 +212,14 @@ func quickSetupSoftwares() []models.QuickSetupSoftware {
 		{
 			Code:               "opencode",
 			Name:               "OpenCode",
-			Description:        "Generate a ready-to-edit OpenCode config with your selected gateway API key.",
+			Description:        "Generate a ready-to-edit OpenCode config with selected gateway provider combinations.",
 			SupportedProviders: []string{"openai", "anthropic"},
 			Files: []models.QuickSetupSoftwareFile{
 				{
 					Code:        "config",
-					Label:       "config.json",
-					FileName:    "config.json",
-					DefaultPath: "~/.config/opencode/config.json",
+					Label:       "opencode.json",
+					FileName:    "opencode.json",
+					DefaultPath: "~/.config/opencode/opencode.json",
 					Format:      "json",
 					Kind:        "file",
 					Description: "Main OpenCode runtime configuration.",
@@ -230,7 +291,7 @@ func softwareSupportsProvider(software models.QuickSetupSoftware, provider strin
 	return false
 }
 
-func toQuickSetupAPIKeys(apiKeys []auth.UserAPIKey) []models.QuickSetupAPIKey {
+func toQuickSetupAPIKeys(apiKeys []auth.UserAPIKey, apiRoot string) []models.QuickSetupAPIKey {
 	items := make([]models.QuickSetupAPIKey, 0, len(apiKeys))
 	for _, key := range apiKeys {
 		if strings.ToLower(strings.TrimSpace(key.Status)) == "inactive" {
@@ -255,6 +316,7 @@ func toQuickSetupAPIKeys(apiKeys []auth.UserAPIKey) []models.QuickSetupAPIKey {
 			Key:             key.Key,
 			Name:            key.Name,
 			Provider:        strings.ToLower(strings.TrimSpace(key.Provider)),
+			BaseURL:         quickSetupProviderBaseURL(strings.ToLower(strings.TrimSpace(key.Provider)), apiRoot),
 			Status:          key.Status,
 			Masked:          key.Masked,
 			SecretAvailable: key.SecretAvailable,
@@ -275,7 +337,7 @@ func toQuickSetupAPIKeys(apiKeys []auth.UserAPIKey) []models.QuickSetupAPIKey {
 func renderQuickSetupFiles(software models.QuickSetupSoftware, apiKey models.QuickSetupAPIKey, apiRoot string) ([]models.QuickSetupPreviewFile, []string, error) {
 	switch software.Code {
 	case "opencode":
-		return renderOpenCodeFiles(software, apiKey, apiRoot)
+		return renderOpenCodeFiles(software, []models.QuickSetupAPIKey{apiKey}, apiKey.ID, "", "", "", nil, apiRoot)
 	case "codex":
 		return renderCodexFiles(software, apiKey, apiRoot)
 	case "claude-code":
@@ -285,27 +347,161 @@ func renderQuickSetupFiles(software models.QuickSetupSoftware, apiKey models.Qui
 	}
 }
 
-func renderOpenCodeFiles(software models.QuickSetupSoftware, apiKey models.QuickSetupAPIKey, apiRoot string) ([]models.QuickSetupPreviewFile, []string, error) {
+func renderOpenCodeVariants(software models.QuickSetupSoftware, keys []models.QuickSetupAPIKey, selectedIDs map[int64]struct{}, spec *models.OpenCodeRenderSpec, apiRoot string) ([]models.QuickSetupVariant, error) {
+	providerIDs := make(map[int64]struct{}, len(selectedIDs)+len(specProviderIDs(spec)))
+	for id := range selectedIDs {
+		providerIDs[id] = struct{}{}
+	}
+	for _, id := range specProviderIDs(spec) {
+		providerIDs[id] = struct{}{}
+	}
+
+	var selected []models.QuickSetupAPIKey
+	for _, key := range keys {
+		if !softwareSupportsProvider(software, key.Provider) {
+			continue
+		}
+		if len(providerIDs) > 0 {
+			if _, ok := providerIDs[key.ID]; !ok {
+				continue
+			}
+		}
+		selected = append(selected, key)
+	}
+	if len(selected) == 0 {
+		return nil, nil
+	}
+
+	modelKeyID := int64(0)
+	modelProvider := ""
+	model := ""
+	smallModel := ""
+	baseURL := ""
+	baseURLOverrides := map[int64]string{}
+	if spec != nil {
+		modelKeyID = spec.ModelKeyID
+		modelProvider = strings.TrimSpace(spec.ModelProvider)
+		model = strings.TrimSpace(spec.Model)
+		smallModel = strings.TrimSpace(spec.SmallModel)
+		baseURL = strings.TrimSpace(spec.BaseURL)
+		for _, provider := range spec.Providers {
+			if provider.KeyID == 0 {
+				continue
+			}
+			baseURLOverrides[provider.KeyID] = strings.TrimSpace(provider.BaseURL)
+		}
+	}
+	modelKey := selectOpenCodeModelKey(selected, modelKeyID, modelProvider)
+	files, notes, err := renderOpenCodeFiles(software, selected, modelKey.ID, model, smallModel, baseURL, baseURLOverrides, apiRoot)
+	if err != nil {
+		return nil, err
+	}
+
+	label := fmt.Sprintf("OpenCode · %d provider", len(selected))
+	if len(selected) != 1 {
+		label += "s"
+	}
+	return []models.QuickSetupVariant{
+		{
+			Software: software.Code,
+			Label:    label,
+			Provider: "opencode",
+			APIKey:   modelKey,
+			APIKeys:  selected,
+			Files:    files,
+			Notes:    notes,
+		},
+	}, nil
+}
+
+func specProviderIDs(spec *models.OpenCodeRenderSpec) []int64 {
+	if spec == nil {
+		return nil
+	}
+	ids := make([]int64, 0, len(spec.ProviderIDs)+len(spec.Providers))
+	ids = append(ids, spec.ProviderIDs...)
+	for _, provider := range spec.Providers {
+		if provider.KeyID != 0 {
+			ids = append(ids, provider.KeyID)
+		}
+	}
+	return ids
+}
+
+func selectOpenCodeModelKey(keys []models.QuickSetupAPIKey, preferredID int64, preferredProvider string) models.QuickSetupAPIKey {
+	if len(keys) == 0 {
+		return models.QuickSetupAPIKey{}
+	}
+	for _, key := range keys {
+		if preferredID != 0 && key.ID == preferredID {
+			return key
+		}
+	}
+	for _, key := range keys {
+		if preferredProvider != "" && key.Provider == preferredProvider {
+			return key
+		}
+	}
+	for _, key := range keys {
+		if key.Provider == "openai" {
+			return key
+		}
+	}
+	return keys[0]
+}
+
+func renderOpenCodeFiles(software models.QuickSetupSoftware, apiKeys []models.QuickSetupAPIKey, modelKeyID int64, modelOverride string, smallModelOverride string, baseURLOverride string, baseURLOverrides map[int64]string, apiRoot string) ([]models.QuickSetupPreviewFile, []string, error) {
 	fileDef := software.Files[0]
-	providerKey := apiKey.Provider
-	model := quickSetupDefaultModel(providerKey, false)
-	config := map[string]interface{}{
-		"$schema": "https://opencode.ai/config.json",
-		"theme":   "system",
-		"provider": map[string]interface{}{
-			providerKey: map[string]interface{}{
-				"id":   providerKey,
-				"name": quickSetupProviderLabel(providerKey),
-				"type": providerKey,
-				"options": map[string]interface{}{
-					"baseURL": quickSetupProviderBaseURL(providerKey, apiRoot),
-					"apiKey":  apiKey.Key,
-				},
+	if len(apiKeys) == 0 {
+		return nil, nil, errors.New("at least one API key is required for OpenCode")
+	}
+	providers := make(map[string]interface{}, len(apiKeys))
+	seen := map[string]int{}
+	modelProviderID := ""
+	modelName := ""
+	notes := []string{
+		"OpenCode config uses provider/model strings such as aliang-openai-openai-key/gpt-5.",
+		"Each selected API key becomes one provider entry, so multiple baseURL/API key combinations can coexist.",
+	}
+	for _, apiKey := range apiKeys {
+		providerID := quickSetupOpenCodeProviderID(apiKey, seen)
+		baseURL := quickSetupOpenCodeBaseURL(apiKey.Provider, firstNonEmptyQuickSetupString(baseURLOverrides[apiKey.ID], baseURLOverride), apiRoot)
+		providers[providerID] = map[string]interface{}{
+			"npm":  quickSetupOpenCodeProviderNPM(apiKey.Provider),
+			"name": quickSetupOpenCodeProviderName(apiKey),
+			"options": map[string]interface{}{
+				"baseURL": baseURL,
+				"apiKey":  apiKey.Key,
 			},
-		},
-		"model": map[string]interface{}{
-			"default": fmt.Sprintf("%s/%s", providerKey, model),
-		},
+			"models": quickSetupOpenCodeModels(apiKey.Provider),
+		}
+		if modelProviderID == "" || apiKey.ID == modelKeyID {
+			modelProviderID = providerID
+			modelName = quickSetupDefaultModel(apiKey.Provider, false)
+		}
+		notes = append(notes, fmt.Sprintf("%s uses %s.", providerID, baseURL))
+		if apiKey.Masked {
+			notes = append(notes, fmt.Sprintf("%s looks masked. Replace it with the plaintext value before applying.", apiKey.Name))
+		}
+	}
+	if strings.TrimSpace(modelOverride) != "" {
+		modelName = strings.TrimSpace(modelOverride)
+	}
+	if modelName == "" {
+		modelName = "gpt-5"
+	}
+	ensureOpenCodeProviderModel(providers, modelProviderID, modelName)
+	defaultModel := fmt.Sprintf("%s/%s", modelProviderID, modelName)
+	config := map[string]interface{}{
+		"$schema":  "https://opencode.ai/config.json",
+		"theme":    "system",
+		"provider": providers,
+		"model":    defaultModel,
+	}
+	if strings.TrimSpace(smallModelOverride) != "" {
+		smallModelName := strings.TrimSpace(smallModelOverride)
+		ensureOpenCodeProviderModel(providers, modelProviderID, smallModelName)
+		config["small_model"] = fmt.Sprintf("%s/%s", modelProviderID, smallModelName)
 	}
 	config["workspace"] = map[string]interface{}{
 		"autoApply": false,
@@ -314,13 +510,6 @@ func renderOpenCodeFiles(software models.QuickSetupSoftware, apiKey models.Quick
 	raw, err := json.MarshalIndent(config, "", "  ")
 	if err != nil {
 		return nil, nil, err
-	}
-
-	notes := []string{
-		fmt.Sprintf("Uses %s style requests against %s.", strings.ToUpper(providerKey), quickSetupProviderBaseURL(providerKey, apiRoot)),
-	}
-	if apiKey.Masked {
-		notes = append(notes, "This API key looks masked. Replace it with the plaintext value before applying.")
 	}
 
 	return []models.QuickSetupPreviewFile{
@@ -333,6 +522,172 @@ func renderOpenCodeFiles(software models.QuickSetupSoftware, apiKey models.Quick
 			Content: string(raw),
 		},
 	}, notes, nil
+}
+
+func quickSetupOpenCodeProviderID(apiKey models.QuickSetupAPIKey, seen map[string]int) string {
+	base := "aliang-" + strings.ToLower(strings.TrimSpace(apiKey.Provider))
+	name := strings.ToLower(strings.TrimSpace(apiKey.Name))
+	if name != "" {
+		base += "-" + name
+	}
+	base = strings.Trim(strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' {
+			return r
+		}
+		return '-'
+	}, base), "-")
+	for strings.Contains(base, "--") {
+		base = strings.ReplaceAll(base, "--", "-")
+	}
+	if base == "" {
+		base = "aliang-provider"
+	}
+	seen[base]++
+	if seen[base] == 1 {
+		return base
+	}
+	return fmt.Sprintf("%s-%d", base, seen[base])
+}
+
+func quickSetupOpenCodeProviderName(apiKey models.QuickSetupAPIKey) string {
+	name := strings.TrimSpace(apiKey.Name)
+	if name == "" {
+		name = quickSetupProviderLabel(apiKey.Provider)
+	}
+	return "Aliang " + name
+}
+
+func firstNonEmptyQuickSetupString(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func quickSetupOpenCodeModels(provider string) map[string]interface{} {
+	switch provider {
+	case "anthropic":
+		return map[string]interface{}{
+			"claude-sonnet-4-5": map[string]interface{}{"name": "Claude Sonnet 4.5"},
+			"claude-opus-4-1":   map[string]interface{}{"name": "Claude Opus 4.1"},
+		}
+	default:
+		return map[string]interface{}{
+			"gpt-5": map[string]interface{}{"name": "GPT-5"},
+		}
+	}
+}
+
+func quickSetupOpenCodeProviderNPM(provider string) string {
+	if provider == "anthropic" {
+		return "@ai-sdk/anthropic"
+	}
+	return "@ai-sdk/openai-compatible"
+}
+
+func ensureOpenCodeProviderModel(providers map[string]interface{}, providerID string, modelName string) {
+	if modelName == "" {
+		return
+	}
+	provider, ok := providers[providerID].(map[string]interface{})
+	if !ok {
+		return
+	}
+	models, ok := provider["models"].(map[string]interface{})
+	if !ok {
+		models = map[string]interface{}{}
+		provider["models"] = models
+	}
+	if _, exists := models[modelName]; !exists {
+		models[modelName] = map[string]interface{}{"name": modelName}
+	}
+}
+
+func quickSetupOpenCodeBaseURL(provider string, override string, apiRoot string) string {
+	if trimmed := strings.TrimSpace(override); trimmed != "" {
+		return strings.TrimRight(trimmed, "/")
+	}
+	return quickSetupProviderBaseURL(provider, apiRoot)
+}
+
+func quickSetupModelListBaseURL(apiRoot string) string {
+	root := strings.TrimRight(strings.TrimSpace(apiRoot), "/")
+	if strings.HasSuffix(root, "/v1") {
+		return root
+	}
+	return root + "/v1"
+}
+
+func fetchQuickSetupModels(baseURL string, apiKey string) ([]models.QuickSetupModel, error) {
+	endpoint := strings.TrimRight(strings.TrimSpace(baseURL), "/") + "/models"
+	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(apiKey))
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := quickSetupModelsHTTPClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load model list: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return nil, fmt.Errorf("failed to read model list response: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		message := strings.TrimSpace(string(body))
+		if message == "" {
+			message = resp.Status
+		}
+		if len(message) > 240 {
+			message = message[:240] + "..."
+		}
+		return nil, fmt.Errorf("model list request failed (%d): %s", resp.StatusCode, message)
+	}
+
+	var envelope struct {
+		Data []struct {
+			ID      string `json:"id"`
+			Name    string `json:"name"`
+			OwnedBy string `json:"owned_by"`
+			Created int64  `json:"created"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return nil, fmt.Errorf("failed to parse model list response: %w", err)
+	}
+
+	modelsList := make([]models.QuickSetupModel, 0, len(envelope.Data))
+	seen := map[string]struct{}{}
+	for _, item := range envelope.Data {
+		id := strings.TrimSpace(item.ID)
+		if id == "" {
+			continue
+		}
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		seen[id] = struct{}{}
+		name := strings.TrimSpace(item.Name)
+		if name == "" {
+			name = id
+		}
+		modelsList = append(modelsList, models.QuickSetupModel{
+			ID:      id,
+			Name:    name,
+			OwnedBy: strings.TrimSpace(item.OwnedBy),
+			Created: item.Created,
+		})
+	}
+	sort.SliceStable(modelsList, func(i, j int) bool {
+		return modelsList[i].ID < modelsList[j].ID
+	})
+	return modelsList, nil
 }
 
 func renderCodexFiles(software models.QuickSetupSoftware, apiKey models.QuickSetupAPIKey, apiRoot string) ([]models.QuickSetupPreviewFile, []string, error) {

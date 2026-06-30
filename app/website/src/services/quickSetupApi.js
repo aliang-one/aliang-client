@@ -47,12 +47,22 @@ export async function getQuickSetupCatalog() {
   };
 }
 
-export async function renderQuickSetup(software, keyIds = []) {
+export async function renderQuickSetup(software, keyIds = [], options = {}) {
   return rawRequest('/api/quick-setup/render', {
     method: 'POST',
     body: JSON.stringify({
       software,
       key_ids: Array.isArray(keyIds) ? keyIds : [],
+      ...(options && typeof options === 'object' ? options : {}),
+    }),
+  });
+}
+
+export async function getQuickSetupModels(keyId) {
+  return rawRequest('/api/quick-setup/models', {
+    method: 'POST',
+    body: JSON.stringify({
+      key_id: Number(keyId) || 0,
     }),
   });
 }
