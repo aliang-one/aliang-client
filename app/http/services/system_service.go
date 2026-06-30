@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"aliang.one/nursorgate/processor/config"
 	"aliang.one/nursorgate/processor/setup"
 )
 
@@ -471,9 +472,6 @@ func ensureManagedSystemServiceConfigPath() (string, error) {
 
 func ensureManagedSystemServiceConfigPathWithSource(preferredSourcePath string) (string, error) {
 	targetPath := setup.RuntimeConfigPath()
-	if _, err := os.Stat(targetPath); err == nil {
-		return targetPath, nil
-	}
 
 	sourcePath := strings.TrimSpace(preferredSourcePath)
 	if sourcePath != "" {
@@ -484,6 +482,12 @@ func ensureManagedSystemServiceConfigPathWithSource(preferredSourcePath string) 
 		sourcePath = absSourcePath
 	}
 	if sourcePath == "" {
+		if persisted, err := persistCurrentConfigForManagedSystemService(targetPath); err != nil {
+			return "", err
+		} else if persisted {
+			return targetPath, nil
+		}
+
 		resolvedPath, resolveErr := resolveSystemServiceConfigPath()
 		if resolveErr != nil {
 			return "", resolveErr
@@ -504,6 +508,17 @@ func ensureManagedSystemServiceConfigPathWithSource(preferredSourcePath string) 
 		return "", err
 	}
 	return targetPath, nil
+}
+
+func persistCurrentConfigForManagedSystemService(targetPath string) (bool, error) {
+	currentConfig := config.GetGlobalConfig()
+	if currentConfig == nil {
+		return false, nil
+	}
+	if err := config.SaveConfigToFile(currentConfig, targetPath); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func copyRegularFile(sourcePath string, targetPath string, mode os.FileMode) error {
