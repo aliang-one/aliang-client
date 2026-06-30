@@ -43,9 +43,9 @@ func TestPluginRecordEnabled(t *testing.T) {
 		want bool
 	}{
 		{installedPluginRecord{Scope: "user"}, true},
-		{installedPluginRecord{Scope: ""}, true},                              // absent scope = treated enabled
-		{installedPluginRecord{Scope: "user", Disabled: true}, false},        // explicitly disabled
-		{installedPluginRecord{Scope: "project", ProjectPath: "/x"}, false},  // project scope skipped
+		{installedPluginRecord{Scope: ""}, true},                            // absent scope = treated enabled
+		{installedPluginRecord{Scope: "user", Disabled: true}, false},       // explicitly disabled
+		{installedPluginRecord{Scope: "project", ProjectPath: "/x"}, false}, // project scope skipped
 	}
 	for _, c := range cases {
 		if got := pluginRecordEnabled(c.rec); got != c.want {
@@ -266,6 +266,9 @@ func TestNormalizeSlashProvider(t *testing.T) {
 		"claude":     "claude",
 		"claudecode": "claude",
 		"ClaudeCode": "claude",
+		"open-code":  "opencode",
+		"open_code":  "opencode",
+		"OpenCode":   "opencode",
 		"unknown":    "",
 	}
 	for in, want := range cases {
@@ -340,6 +343,48 @@ func TestCollectCodexPromptCommands(t *testing.T) {
 	}
 }
 
+func TestCollectOpenCodeSlashCommands(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	project := t.TempDir()
+
+	projectCmdDir := filepath.Join(project, ".opencode", "commands")
+	if err := os.MkdirAll(projectCmdDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(projectCmdDir, "ship.md"), []byte("---\ndescription: Ship it\nargument-hint: <target>\n---\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	userCmdDir := filepath.Join(home, ".config", "opencode", "commands")
+	if err := os.MkdirAll(userCmdDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(userCmdDir, "daily.md"), []byte("---\ndescription: Daily work\n---\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cmds := collectOpenCodeSlashCommands(project, true)
+	got := map[string]map[string]interface{}{}
+	for _, c := range cmds {
+		got[c["name"].(string)] = c
+		if c["provider"] != "opencode" {
+			t.Errorf("%v provider=%v want opencode", c["name"], c["provider"])
+		}
+	}
+	for _, want := range []string{"init", "help", "model", "undo", "redo", "ship", "daily"} {
+		if _, ok := got[want]; !ok {
+			t.Errorf("missing opencode command %q; got %+v", want, got)
+		}
+	}
+	if got["ship"]["scope"] != "project" || got["ship"]["arg_hint"] != "<target>" {
+		t.Errorf("ship command = %+v", got["ship"])
+	}
+	if got["daily"]["scope"] != "user" {
+		t.Errorf("daily command = %+v", got["daily"])
+	}
+}
+
 func TestSlashCommandEntryProviderTag(t *testing.T) {
 	e := slashCommandEntry("foo", "d", "<x>", "user", "user", "s", "claude")
 	if e["provider"] != "claude" {
@@ -362,4 +407,3 @@ func TestCollectProjectSlashCommandsProviderTag(t *testing.T) {
 		}
 	}
 }
-

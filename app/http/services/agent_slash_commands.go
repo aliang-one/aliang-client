@@ -22,8 +22,9 @@ const (
 
 // agentSlashCommandsListPayload handles `slash.commands.list`: it introspects
 // the project's `.claude` tree (plus optional user-level `~/.claude` and enabled
-// plugins) for the Claude provider, and `~/.codex/prompts` plus a static builtin
-// baseline for the Codex provider. It returns the `/`-command surface as
+// plugins) for the Claude provider, `~/.codex/prompts` plus a static builtin
+// baseline for the Codex provider, and `.opencode`/`~/.config/opencode` command
+// roots for the OpenCode provider. It returns the `/`-command surface as
 // AgentCommandInfo-like entries, each tagged with the provider it belongs to.
 // Builtins are intentionally NOT reported for Claude — the cloud owns that
 // static builtin baseline; the agent is the source of truth only for custom
@@ -31,8 +32,9 @@ const (
 // because Codex's headless app-server does not enumerate them itself.
 //
 // The optional `provider` field selects which provider's commands to return
-// ("claude"/"claudecode" or "codex"). When absent, both providers' commands are
-// returned tagged, so the client can filter by the active conversation.
+// ("claude"/"claudecode", "codex", or "opencode"). When absent, all providers'
+// commands are returned tagged, so the client can filter by the active
+// conversation.
 func agentSlashCommandsListPayload(msg map[string]interface{}) map[string]interface{} {
 	requestID := remoteString(msg, "request_id")
 	projectPath, err := resolveAgentProjectPath(remoteString(msg, "project_path"))
@@ -45,6 +47,7 @@ func agentSlashCommandsListPayload(msg map[string]interface{}) map[string]interf
 
 	wantClaude := provider == "" || provider == "claude"
 	wantCodex := provider == "" || provider == "codex"
+	wantOpenCode := provider == "" || provider == "opencode"
 
 	var commands []map[string]interface{}
 	if wantClaude {
@@ -59,6 +62,9 @@ func agentSlashCommandsListPayload(msg map[string]interface{}) map[string]interf
 	if wantCodex {
 		commands = append(commands, collectCodexSlashCommands()...)
 	}
+	if wantOpenCode {
+		commands = append(commands, collectOpenCodeSlashCommands(projectPath, includeUser)...)
+	}
 	sortSlashCommands(commands)
 
 	return map[string]interface{}{
@@ -71,15 +77,17 @@ func agentSlashCommandsListPayload(msg map[string]interface{}) map[string]interf
 	}
 }
 
-// normalizeSlashProvider maps a provider hint to "claude" or "codex". An empty
-// or unrecognized value returns "" meaning "unspecified" — callers collect all
-// providers so the client can filter by the active conversation.
+// normalizeSlashProvider maps a provider hint to the command-surface provider.
+// An empty or unrecognized value returns "" meaning "unspecified" — callers
+// collect all providers so the client can filter by the active conversation.
 func normalizeSlashProvider(raw string) string {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case "codex":
 		return "codex"
-	case "claude", "claudecode":
+	case "claude", "claudecode", "claude-code", "claude_code":
 		return "claude"
+	case "opencode", "open-code", "open_code":
+		return "opencode"
 	}
 	return ""
 }
@@ -178,6 +186,53 @@ func collectCodexSlashCommands() []map[string]interface{} {
 	out := codexBuiltinCommands()
 	if home := agentHome(); home != "" {
 		out = append(out, collectCodexPromptCommands(filepath.Join(home, ".codex", "prompts"))...)
+	}
+	return out
+}
+
+// collectOpenCodeSlashCommands returns OpenCode's baseline slash-command surface
+// plus project/user markdown commands when present. OpenCode conventionally uses
+// command roots under `.opencode` and `~/.config/opencode`; both singular and
+// plural directory names are accepted to preserve older/manual setups.
+func collectOpenCodeSlashCommands(projectPath string, includeUser bool) []map[string]interface{} {
+	out := openCodeBuiltinCommands()
+	out = append(out, scanCommandMarkdowns(filepath.Join(projectPath, ".opencode", "commands"), "project", "project", projectPath, "", "opencode")...)
+	out = append(out, scanCommandMarkdowns(filepath.Join(projectPath, ".opencode", "command"), "project", "project", projectPath, "", "opencode")...)
+	if includeUser {
+		for _, root := range openCodeUserCommandRoots() {
+			out = append(out, scanCommandMarkdowns(root, "user", "user", filepath.Dir(root), "", "opencode")...)
+		}
+	}
+	return capSlashCommands(out)
+}
+
+func openCodeUserCommandRoots() []string {
+	home := agentHome()
+	if home == "" {
+		return nil
+	}
+	return []string{
+		filepath.Join(home, ".config", "opencode", "commands"),
+		filepath.Join(home, ".config", "opencode", "command"),
+		filepath.Join(home, ".opencode", "commands"),
+		filepath.Join(home, ".opencode", "command"),
+	}
+}
+
+func openCodeBuiltinCommands() []map[string]interface{} {
+	type builtin struct {
+		name, description, argHint string
+	}
+	builtins := []builtin{
+		{"init", "Create or refresh OpenCode project instructions", ""},
+		{"help", "Show OpenCode help", ""},
+		{"model", "Choose the active model", "<provider/model>"},
+		{"undo", "Undo the previous change", ""},
+		{"redo", "Redo the previous undone change", ""},
+	}
+	out := make([]map[string]interface{}, 0, len(builtins))
+	for _, b := range builtins {
+		out = append(out, slashCommandEntry(b.name, b.description, b.argHint, "builtin", "builtin", "", "opencode"))
 	}
 	return out
 }

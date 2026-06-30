@@ -267,6 +267,10 @@ func normalizeAgentAIProvider(raw string) (string, error) {
 	switch provider {
 	case "auto", "codex", "claude", "claudecode":
 		return provider, nil
+	case "claude-code", "claude_code":
+		return "claudecode", nil
+	case "opencode", "open-code", "open_code":
+		return "opencode", nil
 	default:
 		return "", fmt.Errorf("unsupported AI provider: %s", raw)
 	}

@@ -403,6 +403,7 @@ const (
 	agentAIOutputText             agentAIOutputFormat = "text"
 	agentAIOutputCodexJSON        agentAIOutputFormat = "codex_json"
 	agentAIOutputClaudeStreamJSON agentAIOutputFormat = "claude_stream_json"
+	agentAIOutputOpenCodeJSON     agentAIOutputFormat = "opencode_json"
 )
 
 // agentAIOptionSystemPrompt 引导 Claude 在需要用户多方案抉择时，输出结构化 aliang-options 块，
@@ -2025,14 +2026,11 @@ func (m *agentAIManager) appendAssistantHistory(sessionID string, runSeq int, me
 	session.history = trimAgentAIHistory(session.history)
 }
 
-// setAgentAIResumeSessionIDIfEmpty pins the Claude-assigned session id (captured
-// from the run's "result" event) so the NEXT turn resumes it via --resume
-// instead of starting a fresh CLI. Without this, each turn spawns an isolated
-// claude --print run (N fragmented .jsonl files, no resumable conversation, and
-// no shared context window). No-op when no id was captured, the session is gone,
-// the run is stale, or the session already has a resume id (imported sessions
-// carry one, or it was captured on an earlier turn). Claude-only — codex uses a
-// long-running app-server that holds session state in-process.
+// setAgentAIResumeSessionIDIfEmpty pins a CLI-assigned session id so the NEXT
+// turn resumes it instead of starting a fresh process-local conversation. No-op
+// when no id was captured, the session is gone, the run is stale, or the session
+// already has a resume id (imported sessions carry one, or it was captured on an
+// earlier turn). Codex app-server keeps state in-process and does not use this.
 func (m *agentAIManager) setAgentAIResumeSessionIDIfEmpty(sessionID string, runSeq int, resumeSessionID string) {
 	resumeSessionID = strings.TrimSpace(resumeSessionID)
 	if resumeSessionID == "" {
@@ -2048,7 +2046,7 @@ func (m *agentAIManager) setAgentAIResumeSessionIDIfEmpty(sessionID string, runS
 	}
 	if session.resumeSessionID == "" {
 		session.resumeSessionID = resumeSessionID
-		logger.Info(fmt.Sprintf("resume-set: PINNED claude resume id %s on session %s", resumeSessionID, sessionID))
+		logger.Info(fmt.Sprintf("resume-set: PINNED CLI resume id %s on session %s", resumeSessionID, sessionID))
 	} else {
 		logger.Info(fmt.Sprintf("resume-set: already set %s (session %s)", session.resumeSessionID, sessionID))
 	}
@@ -2077,12 +2075,10 @@ func (m *agentAIManager) runCLI(ctx context.Context, run agentAIRun, writeJSON a
 		return
 	}
 
-	// Try to resume the prior Claude/Codex session when one is referenced. If
-	// that session does not exist locally (an imported/foreign session, or one
-	// filed under a different project path than this run's cwd), the CLI exits
-	// with "No conversation found with session ID" before emitting any output.
-	// Retry the run fresh in that case so the conversation still streams,
-	// rather than surfacing a hard error to the user.
+	// Try to resume the prior CLI session when one is referenced. If that
+	// session does not exist locally (an imported/foreign session, or one filed
+	// under a different project path than this run's cwd), retry fresh so the
+	// conversation still streams instead of surfacing a hard error.
 	if strings.TrimSpace(run.resumeSessionID) != "" {
 		if m.runCLIPass(ctx, run, writeJSON, true) != agentAIRunResumeMissing {
 			return
@@ -3207,11 +3203,11 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 	// event) and read here after wg.Wait(), so the terminal ai.error can carry a
 	// structured cause. wg.Wait() provides the happens-before edge.
 	var lastRetry claudeRetryInfo
-	// capturedClaudeSessionID is written by the stdout goroutine (from Claude's
-	// "result" event) and read after wg.Wait(), which gives the happens-before
-	// edge — same pattern as lastRetry. Pinned on the session post-run so the
-	// next turn resumes this Claude session instead of starting fresh.
-	var capturedClaudeSessionID string
+	// capturedResumeSessionID is written by the stdout goroutine (from the
+	// provider's structured events) and read after wg.Wait(), which gives the
+	// happens-before edge — same pattern as lastRetry. Pinned on the session
+	// post-run so the next CLI turn resumes instead of starting fresh.
+	var capturedResumeSessionID string
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
@@ -3219,7 +3215,7 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 			outMu.Lock()
 			appendAgentAIHistoryCapture(&output, text)
 			outMu.Unlock()
-		}, fileSink, &lastRetry, &capturedClaudeSessionID)
+		}, fileSink, &lastRetry, &capturedResumeSessionID)
 	}()
 	go func() {
 		defer wg.Done()
@@ -3247,7 +3243,7 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 		// The referenced --resume session is not resolvable in this cwd (e.g.
 		// an imported session, or one created under a different project path).
 		// Signal the caller to retry without --resume instead of erroring.
-		if allowResume && strings.Contains(stderrBuf.String(), "No conversation found with session ID") {
+		if allowResume && isAgentAIResumeMissing(stderrBuf.String()) {
 			return agentAIRunResumeMissing
 		}
 		// Surface WHY the CLI exited. Prefer the structured cause derived from
@@ -3270,7 +3266,7 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 	filesTouchedCount := len(filesTouched)
 	filesMu.Unlock()
 	m.appendAssistantHistory(run.sessionID, run.runSeq, run.messageID, assistantOutput)
-	m.setAgentAIResumeSessionIDIfEmpty(run.sessionID, run.runSeq, capturedClaudeSessionID)
+	m.setAgentAIResumeSessionIDIfEmpty(run.sessionID, run.runSeq, capturedResumeSessionID)
 	if blocks := extractAgentAIOptionBlocks(assistantOutput); len(blocks) > 0 {
 		m.emitOptionRequest(run, writeJSON, blocks)
 	}
@@ -3281,14 +3277,26 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 		"files_touched_count": filesTouchedCount,
 		"git_changed_count":   countGitChanged(run.projectPath),
 	}
-	// Echo the Claude session id so the server can persist it (sourceSessionId)
-	// and feed it back as resume_session_id after an agent restart — keeping the
-	// conversation on one continuous .jsonl across restarts.
-	if sid := strings.TrimSpace(capturedClaudeSessionID); sid != "" {
+	// Echo provider-specific CLI session ids so the server can persist them
+	// (sourceSessionId) and feed them back as resume_session_id after an agent
+	// restart — keeping the conversation on one continuous local session.
+	if sid := strings.TrimSpace(capturedResumeSessionID); sid != "" && tool.outputFormat == agentAIOutputClaudeStreamJSON {
 		done["claude_session_id"] = sid
+	}
+	if sid := strings.TrimSpace(capturedResumeSessionID); sid != "" && tool.outputFormat == agentAIOutputOpenCodeJSON {
+		done["opencode_session_id"] = sid
+		done["source_session_id"] = sid
 	}
 	_ = writeJSON(done)
 	return agentAIRunDone
+}
+
+func isAgentAIResumeMissing(stderr string) bool {
+	lower := strings.ToLower(stderr)
+	if strings.Contains(stderr, "No conversation found with session ID") {
+		return true
+	}
+	return strings.Contains(lower, "session") && strings.Contains(lower, "not found")
 }
 
 // captureAgentAIStderr reads everything from reader, storing the first cap
@@ -3351,16 +3359,16 @@ func (l *agentAIOutputLimiter) Exceeded() bool {
 	return l.exceeded
 }
 
-func streamAgentAIStdout(reader io.Reader, format agentAIOutputFormat, run agentAIRun, writeJSON agentTerminalWriter, limiter *agentAIOutputLimiter, capture func(string), fileSink func(string), lastRetry *claudeRetryInfo, claudeSessionID *string) {
+func streamAgentAIStdout(reader io.Reader, format agentAIOutputFormat, run agentAIRun, writeJSON agentTerminalWriter, limiter *agentAIOutputLimiter, capture func(string), fileSink func(string), lastRetry *claudeRetryInfo, resumeSessionID *string) {
 	switch format {
-	case agentAIOutputCodexJSON, agentAIOutputClaudeStreamJSON:
-		streamStructuredAIDelta(reader, format, run, writeJSON, limiter, capture, fileSink, lastRetry, claudeSessionID)
+	case agentAIOutputCodexJSON, agentAIOutputClaudeStreamJSON, agentAIOutputOpenCodeJSON:
+		streamStructuredAIDelta(reader, format, run, writeJSON, limiter, capture, fileSink, lastRetry, resumeSessionID)
 	default:
 		streamAIDelta(reader, run, "assistant", writeJSON, limiter, capture)
 	}
 }
 
-func streamStructuredAIDelta(reader io.Reader, format agentAIOutputFormat, run agentAIRun, writeJSON agentTerminalWriter, limiter *agentAIOutputLimiter, capture func(string), fileSink func(string), lastRetry *claudeRetryInfo, claudeSessionID *string) {
+func streamStructuredAIDelta(reader io.Reader, format agentAIOutputFormat, run agentAIRun, writeJSON agentTerminalWriter, limiter *agentAIOutputLimiter, capture func(string), fileSink func(string), lastRetry *claudeRetryInfo, resumeSessionID *string) {
 	decoder := json.NewDecoder(reader)
 	emitted := false
 	// pendingCommands tracks Bash tool_use_id → command so a later user-turn
@@ -3375,17 +3383,19 @@ func streamStructuredAIDelta(reader io.Reader, format agentAIOutputFormat, run a
 		if err := decoder.Decode(&event); err != nil {
 			return
 		}
-		// Capture Claude's session id from whichever event first carries it.
-		// `system`/init emits it immediately (api_retry/result carry the same id).
-		// We deliberately do NOT gate on type=="result": in some Claude versions
-		// the success result event omits session_id, while system/init always has
-		// it — so grabbing the first non-empty value is the robust choice. Pinned
-		// on the session after a successful run so the next turn --resumes it →
-		// one continuous .jsonl instead of N fresh runs.
-		if format == agentAIOutputClaudeStreamJSON && claudeSessionID != nil && *claudeSessionID == "" {
+		// Capture the provider's resumable session id from whichever structured
+		// event first carries it. Pinned after a successful run so the next turn
+		// resumes one continuous local session instead of N fresh runs.
+		if format == agentAIOutputClaudeStreamJSON && resumeSessionID != nil && *resumeSessionID == "" {
 			if sid := strings.TrimSpace(remoteString(event, "session_id")); sid != "" {
-				*claudeSessionID = sid
+				*resumeSessionID = sid
 				logger.Info(fmt.Sprintf("claude session_id captured for run %s: %s (from %s event)", run.sessionID, sid, remoteString(event, "type")))
+			}
+		}
+		if format == agentAIOutputOpenCodeJSON && resumeSessionID != nil && *resumeSessionID == "" {
+			if sid := openCodeSessionID(event); sid != "" {
+				*resumeSessionID = sid
+				logger.Info(fmt.Sprintf("opencode session id captured for run %s: %s (from %s event)", run.sessionID, sid, remoteString(event, "type")))
 			}
 		}
 		if fileSink != nil {
@@ -3554,9 +3564,139 @@ func extractStructuredAITexts(format agentAIOutputFormat, event map[string]inter
 		return extractClaudeStreamTexts(event, allowFinal)
 	case agentAIOutputCodexJSON:
 		return extractCodexJSONTexts(event, allowFinal)
+	case agentAIOutputOpenCodeJSON:
+		return extractOpenCodeJSONTexts(event, allowFinal)
 	default:
 		return nil
 	}
+}
+
+func extractOpenCodeJSONTexts(event map[string]interface{}, allowFinal bool) []string {
+	eventType := strings.ToLower(strings.TrimSpace(remoteString(event, "type")))
+	props := openCodeEventProperties(event)
+	if strings.Contains(eventType, "part.delta") {
+		if text := firstNonBlankPreserveSpace(remoteString(props, "delta"), remoteString(event, "delta")); text != "" {
+			return []string{text}
+		}
+	}
+	if !allowFinal {
+		return nil
+	}
+	if part := firstOpenCodeMap(props["part"], event["part"]); part != nil {
+		if text := openCodePartText(part); text != "" {
+			return []string{text}
+		}
+	}
+	if message := firstOpenCodeMap(props["message"], event["message"]); message != nil {
+		if role := strings.ToLower(strings.TrimSpace(remoteString(message, "role"))); role == "" || role == "assistant" {
+			if texts := openCodeMessageTexts(message["parts"]); len(texts) > 0 {
+				return texts
+			}
+			if text := firstNonBlankPreserveSpace(remoteString(message, "text"), remoteString(message, "content")); text != "" {
+				return []string{text}
+			}
+		}
+	}
+	if role := strings.ToLower(strings.TrimSpace(remoteString(event, "role"))); role == "assistant" {
+		if texts := openCodeMessageTexts(event["parts"]); len(texts) > 0 {
+			return texts
+		}
+		if text := firstNonBlankPreserveSpace(remoteString(event, "text"), remoteString(event, "content")); text != "" {
+			return []string{text}
+		}
+	}
+	if strings.Contains(eventType, "message") || strings.Contains(eventType, "assistant") {
+		if text := firstNonBlankPreserveSpace(remoteString(props, "text"), remoteString(props, "content"), remoteString(event, "text"), remoteString(event, "content")); text != "" {
+			return []string{text}
+		}
+	}
+	return nil
+}
+
+func openCodeEventProperties(event map[string]interface{}) map[string]interface{} {
+	if props := mapIf(event["properties"]); props != nil {
+		return props
+	}
+	if data := mapIf(event["data"]); data != nil {
+		return data
+	}
+	return event
+}
+
+func openCodeSessionID(event map[string]interface{}) string {
+	props := openCodeEventProperties(event)
+	if sid := strings.TrimSpace(firstNonEmpty(
+		remoteString(event, "sessionID"),
+		remoteString(event, "sessionId"),
+		remoteString(event, "session_id"),
+		remoteString(props, "sessionID"),
+		remoteString(props, "sessionId"),
+		remoteString(props, "session_id"),
+	)); sid != "" {
+		return sid
+	}
+	for _, key := range []string{"session", "info"} {
+		if nested := mapIf(props[key]); nested != nil {
+			if sid := strings.TrimSpace(firstNonEmpty(remoteString(nested, "id"), remoteString(nested, "sessionID"), remoteString(nested, "session_id"))); sid != "" {
+				return sid
+			}
+		}
+	}
+	return ""
+}
+
+func firstOpenCodeMap(values ...interface{}) map[string]interface{} {
+	for _, value := range values {
+		if row := mapIf(value); row != nil {
+			return row
+		}
+	}
+	return nil
+}
+
+func firstNonBlankPreserveSpace(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func openCodeMessageTexts(raw interface{}) []string {
+	parts, ok := raw.([]interface{})
+	if !ok {
+		return nil
+	}
+	var out []string
+	for _, rawPart := range parts {
+		part := mapIf(rawPart)
+		if part == nil {
+			continue
+		}
+		if text := openCodePartText(part); text != "" {
+			out = append(out, text)
+		}
+	}
+	return out
+}
+
+func openCodePartText(part map[string]interface{}) string {
+	partType := strings.ToLower(strings.TrimSpace(remoteString(part, "type")))
+	if partType != "" {
+		for _, blocked := range []string{"tool", "bash", "command", "permission", "reasoning", "thinking"} {
+			if strings.Contains(partType, blocked) {
+				return ""
+			}
+		}
+	}
+	if text := firstNonBlankPreserveSpace(remoteString(part, "text"), remoteString(part, "content"), remoteString(part, "delta")); text != "" {
+		return text
+	}
+	if content := agentContentText(part["content"]); strings.TrimSpace(content) != "" {
+		return strings.TrimSpace(content)
+	}
+	return ""
 }
 
 func extractClaudeStreamTexts(event map[string]interface{}, allowFinal bool) []string {
@@ -4159,12 +4299,12 @@ func resolveAgentAITool(prompt string, preferred string, model string, effort st
 	if preferred != "auto" {
 		return resolveNamedAgentAITool(preferred, prompt, model, effort, resumeSessionID)
 	}
-	for _, candidate := range []string{"codex", "claude", "claudecode"} {
+	for _, candidate := range []string{"codex", "claude", "claudecode", "opencode"} {
 		if tool, err := resolveNamedAgentAITool(candidate, prompt, model, effort, resumeSessionID); err == nil {
 			return tool, nil
 		}
 	}
-	return nil, errors.New("no supported AI CLI found in PATH: codex, claude, or claudecode")
+	return nil, errors.New("no supported AI CLI found in PATH: codex, claude, claudecode, or opencode")
 }
 
 func resolveNamedAgentAITool(name string, prompt string, model string, effort string, resumeSessionID string) (*agentAITool, error) {
@@ -4209,6 +4349,10 @@ func resolveNamedAgentAITool(name string, prompt string, model string, effort st
 		}
 		if path, err := lookPathCLI("claude"); err == nil {
 			return newClaudeCodeAITool("claudecode", path, prompt, model, effort, resumeSessionID), nil
+		}
+	case "opencode":
+		if path, err := lookPathCLI("opencode"); err == nil {
+			return newOpenCodeAITool(path, prompt, model, effort, resumeSessionID), nil
 		}
 	default:
 		return nil, fmt.Errorf("unsupported AI provider: %s", name)
@@ -4272,6 +4416,26 @@ func newClaudeCodeAITool(id string, path string, prompt string, model string, ef
 		path:         path,
 		args:         args,
 		outputFormat: agentAIOutputClaudeStreamJSON,
+	}
+}
+
+func newOpenCodeAITool(path string, prompt string, model string, effort string, resumeSessionID string) *agentAITool {
+	args := []string{"run", "--format", "json"}
+	if resumeSessionID != "" {
+		args = append(args, "--session", resumeSessionID)
+	}
+	if model != "" {
+		args = append(args, "--model", model)
+	}
+	if effort = strings.TrimSpace(effort); effort != "" {
+		args = append(args, "--variant", effort)
+	}
+	args = append(args, prompt)
+	return &agentAITool{
+		id:           "opencode",
+		path:         path,
+		args:         args,
+		outputFormat: agentAIOutputOpenCodeJSON,
 	}
 }
 
@@ -4461,7 +4625,7 @@ func withClaudeApprovalHook(tool *agentAITool, run agentAIRun) *agentAITool {
 func normalizeAgentAIModel(model string) string {
 	model = strings.TrimSpace(model)
 	switch strings.ToLower(model) {
-	case "", "auto", "codex", "claude", "claudecode":
+	case "", "auto", "codex", "claude", "claudecode", "opencode", "open-code", "open_code":
 		return ""
 	default:
 		return model
@@ -4470,7 +4634,7 @@ func normalizeAgentAIModel(model string) string {
 
 func agentAICapabilities() []string {
 	caps := []string{"ai_chat", "ai_chat_context", "ai_stream", "ai_approval", "ai_steer", "vibe_session"}
-	for _, candidate := range []string{"codex", "claude", "claudecode"} {
+	for _, candidate := range []string{"codex", "claude", "claudecode", "opencode"} {
 		if _, err := lookPathCLI(candidate); err == nil {
 			caps = append(caps, "ai_provider_"+candidate)
 		}

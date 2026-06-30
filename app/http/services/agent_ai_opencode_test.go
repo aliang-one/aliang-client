@@ -1,0 +1,182 @@
+package services
+
+import (
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestNormalizeAgentAIProviderAcceptsOpenCodeAliases(t *testing.T) {
+	for _, raw := range []string{"opencode", "open-code", "open_code"} {
+		got, err := normalizeAgentAIProvider(raw)
+		if err != nil {
+			t.Fatalf("normalizeAgentAIProvider(%q) error = %v", raw, err)
+		}
+		if got != "opencode" {
+			t.Fatalf("normalizeAgentAIProvider(%q) = %q, want opencode", raw, got)
+		}
+	}
+}
+
+func TestResolveNamedAgentAIToolOpenCodeArgs(t *testing.T) {
+	binDir := t.TempDir()
+	writeFakeExecutable(t, binDir, "opencode", "#!/bin/sh\nexit 0\n")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	tool, err := resolveNamedAgentAITool("opencode", "hello from phone", "anthropic/claude-sonnet-4-5", "high", "opencode-session-1")
+	if err != nil {
+		t.Fatalf("resolveNamedAgentAITool(opencode) error = %v", err)
+	}
+	if tool.id != "opencode" || tool.outputFormat != agentAIOutputOpenCodeJSON {
+		t.Fatalf("tool = %+v", tool)
+	}
+	want := []string{"run", "--format", "json", "--session", "opencode-session-1", "--model", "anthropic/claude-sonnet-4-5", "--variant", "high", "hello from phone"}
+	if strings.Join(tool.args, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("args = %#v, want %#v", tool.args, want)
+	}
+}
+
+func TestExtractOpenCodeJSONTextsAndSessionID(t *testing.T) {
+	delta := map[string]interface{}{
+		"type": "message.part.delta",
+		"properties": map[string]interface{}{
+			"sessionID": "op-sid",
+			"messageID": "msg-1",
+			"partID":    "part-1",
+			"delta":     " hello",
+		},
+	}
+	if got := openCodeSessionID(delta); got != "op-sid" {
+		t.Fatalf("openCodeSessionID(delta) = %q, want op-sid", got)
+	}
+	texts := extractOpenCodeJSONTexts(delta, false)
+	if len(texts) != 1 || texts[0] != " hello" {
+		t.Fatalf("delta texts = %#v, want [\" hello\"]", texts)
+	}
+
+	partUpdate := map[string]interface{}{
+		"type": "message.part.updated",
+		"properties": map[string]interface{}{
+			"part": map[string]interface{}{
+				"type": "text",
+				"text": "final part",
+			},
+		},
+	}
+	texts = extractOpenCodeJSONTexts(partUpdate, true)
+	if len(texts) != 1 || texts[0] != "final part" {
+		t.Fatalf("part update texts = %#v, want [final part]", texts)
+	}
+
+	messageUpdate := map[string]interface{}{
+		"type": "message.updated",
+		"properties": map[string]interface{}{
+			"message": map[string]interface{}{
+				"role": "assistant",
+				"parts": []interface{}{
+					map[string]interface{}{"type": "text", "text": "done"},
+					map[string]interface{}{"type": "tool", "text": "skip me"},
+				},
+			},
+		},
+	}
+	texts = extractOpenCodeJSONTexts(messageUpdate, true)
+	if len(texts) != 1 || texts[0] != "done" {
+		t.Fatalf("message update texts = %#v, want [done]", texts)
+	}
+}
+
+func TestAgentAIManagerStreamsOpenCodeJSON(t *testing.T) {
+	projectPath := setupAgentExecutionProjectForTest(t)
+	binDir := t.TempDir()
+	writeFakeExecutable(t, binDir, "opencode", `#!/bin/sh
+printf '%s\n' '{"type":"session.updated","properties":{"sessionID":"op-sid"}}'
+printf '%s\n' '{"type":"message.part.delta","properties":{"sessionID":"op-sid","messageID":"msg-1","partID":"part-1","delta":"你"}}'
+printf '%s\n' '{"type":"message.part.delta","properties":{"sessionID":"op-sid","messageID":"msg-1","partID":"part-1","delta":"好"}}'
+`)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	manager := newAgentAIManager()
+	defer manager.closeAll()
+	mu, events, writer := captureAIWriter(t)
+
+	manager.create(map[string]interface{}{
+		"type":         "ai.session.create",
+		"session_id":   "s-opencode",
+		"message_id":   "m-create",
+		"provider":     "opencode",
+		"project_path": projectPath,
+	}, writer)
+	manager.message(map[string]interface{}{
+		"type":         "ai.message",
+		"session_id":   "s-opencode",
+		"message_id":   "m-run",
+		"provider":     "opencode",
+		"project_path": projectPath,
+		"content":      "say hi",
+	}, writer)
+
+	done := waitForAgentEvent(t, mu, events, "ai.done", func(ev map[string]interface{}) bool {
+		return remoteString(ev, "session_id") == "s-opencode"
+	})
+	if remoteString(done, "opencode_session_id") != "op-sid" || remoteString(done, "source_session_id") != "op-sid" {
+		t.Fatalf("done ids = %+v", done)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(joinAgentDeltas(mu, events), "你好") {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := joinAgentDeltas(mu, events); !strings.Contains(got, "你好") {
+		t.Fatalf("streamed deltas = %q, want contains 你好; events=%#v", got, *events)
+	}
+
+	manager.mu.Lock()
+	session := manager.sessions["s-opencode"]
+	manager.mu.Unlock()
+	if session == nil || session.resumeSessionID != "op-sid" {
+		t.Fatalf("resumeSessionID = %q, want op-sid", func() string {
+			if session == nil {
+				return ""
+			}
+			return session.resumeSessionID
+		}())
+	}
+}
+
+func writeFakeExecutable(t *testing.T, dir, name, content string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		name += ".bat"
+		if !strings.HasPrefix(content, "@echo") {
+			content = "@echo off\r\n" + content
+		}
+	}
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte(content), 0o700); err != nil {
+		t.Fatalf("write fake executable %s: %v", path, err)
+	}
+}
+
+func joinAgentDeltas(mu interface {
+	Lock()
+	Unlock()
+}, events *[]map[string]interface{}) string {
+	mu.Lock()
+	defer mu.Unlock()
+	var b strings.Builder
+	for _, ev := range *events {
+		if remoteString(ev, "type") == "ai.delta" {
+			b.WriteString(remoteString(ev, "content"))
+			b.WriteString(remoteString(ev, "text"))
+			b.WriteString(remoteString(ev, "delta"))
+		}
+	}
+	return b.String()
+}

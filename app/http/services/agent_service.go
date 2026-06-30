@@ -1937,6 +1937,9 @@ func collectAgentHistoryRoots() []models.AgentHistoryRoot {
 		{tool: "codex", path: "~/.codex/sessions"},
 		{tool: "claude", path: "~/.claude"},
 		{tool: "claude", path: "~/.claude/projects"},
+		{tool: "opencode", path: "~/.config/opencode"},
+		{tool: "opencode", path: "~/.local/share/opencode"},
+		{tool: "opencode", path: "~/.opencode"},
 	}
 	result := make([]models.AgentHistoryRoot, 0, len(roots))
 	for _, root := range roots {
