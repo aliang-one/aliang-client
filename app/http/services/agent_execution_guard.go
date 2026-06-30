@@ -30,8 +30,17 @@ const (
 	agentTerminalOutputCapBytes   = 256 * 1024 * 1024
 	agentTerminalIdleTimeout      = 30 * time.Minute
 
-	agentMaxAISessions       = 5
-	agentAIMessageLimitBytes = 64 * 1024
+	// agentAISessionResidentCap bounds how many AI session handles the agent
+	// keeps resident at once. This is NOT a gate that blocks new conversations
+	// — it is an LRU eviction threshold. When a new session would exceed it the
+	// oldest idle (non-running) session is dropped (evictOldestIdleAISession-
+	// Locked). Each session holds at most agentAIHistoryCaptureMaxBytes, so this
+	// caps resident memory at roughly cap × 1 MiB. Running turns are never
+	// evicted; if every resident session is mid-turn the new one is still added
+	// (temporary overshoot, re-bounded once a turn settles). The only other
+	// reset is closeAll() on agent↔server reconnect/restart.
+	agentAISessionResidentCap = 8
+	agentAIMessageLimitBytes  = 64 * 1024
 	// AI output flood protection, mirroring the terminal policy: a sliding
 	// window stops runaway bursts (an AI dumping megabytes per second) while
 	// letting long but paced sessions run, with a high lifetime cap as a

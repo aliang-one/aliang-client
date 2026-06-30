@@ -149,9 +149,14 @@ type agentAISession struct {
 	approvalToken   string
 	activity        *agentAIActivity
 	runSeq          int
-	history         []agentAIMessage
-	pendingOption   *agentAIOptionRequest // run 结束检测到方案块时置位，等 ai.option.response
-	codexSteer      *agentAICodexSteerControl
+	// lastActiveAt drives LRU eviction (evictOldestIdleAISessionLocked): the
+	// non-running session with the oldest stamp is dropped when a new session
+	// would exceed agentAISessionResidentCap. Stamped on create and bumped on
+	// every inbound ai.message so actively-used conversations survive.
+	lastActiveAt  time.Time
+	history       []agentAIMessage
+	pendingOption *agentAIOptionRequest // run 结束检测到方案块时置位，等 ai.option.response
+	codexSteer    *agentAICodexSteerControl
 }
 
 type agentAISteerMessage struct {
@@ -359,6 +364,48 @@ func newAgentAIManager() *agentAIManager {
 		approvals:          make(map[string]*agentAIApprovalWaiter),
 		completedApprovals: make(map[string]*agentAICompletedApproval),
 	}
+}
+
+// registerAISessionLocked stores a new session, evicting the oldest idle
+// session first if the resident map is at capacity. The session must NOT
+// already be present — both call sites (create + message lazy-create) resolve
+// or update an existing session before reaching here. MUST be called with m.mu
+// held.
+func (m *agentAIManager) registerAISessionLocked(session *agentAISession) {
+	m.evictOldestIdleAISessionLocked()
+	m.sessions[session.id] = session
+}
+
+// evictOldestIdleAISessionLocked drops the non-running session (cancel == nil)
+// with the oldest lastActiveAt when the resident map is at/over
+// agentAISessionResidentCap, bounding memory (each session holds up to
+// agentAIHistoryCaptureMaxBytes). It never evicts a running turn; if every
+// resident session is mid-turn it is a no-op and the caller adds anyway
+// (temporary overshoot, re-bounded as soon as a turn settles). Eviction is
+// silent to the server: an evicted conversation rebuilds on its next ai.message
+// (lazy-create) and resumes from disk via resume_session_id. MUST be called
+// with m.mu held.
+func (m *agentAIManager) evictOldestIdleAISessionLocked() {
+	if len(m.sessions) < agentAISessionResidentCap {
+		return
+	}
+	var victim *agentAISession
+	for _, s := range m.sessions {
+		if s.cancel != nil {
+			continue // never evict a running turn
+		}
+		if victim == nil || s.lastActiveAt.Before(victim.lastActiveAt) {
+			victim = s
+		}
+	}
+	if victim == nil {
+		return // every resident session is running — allow temporary overshoot
+	}
+	m.clearPendingApprovalsLocked(victim.id, victim.runSeq, models.AgentAIApprovalDecisionCancel)
+	victim.pendingOption = nil
+	delete(m.sessions, victim.id)
+	logger.Info(fmt.Sprintf("ai.session: evicted idle session %s to bound resident set (cap=%d, now=%d)",
+		victim.id, agentAISessionResidentCap, len(m.sessions)))
 }
 
 // approvalService returns the AgentService that owns this manager (used to
@@ -636,11 +683,10 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 		_ = writeJSON(agentAISessionCreatedPayload(existing))
 		return
 	}
-	if len(m.sessions) >= agentMaxAISessions {
-		m.mu.Unlock()
-		_ = writeJSON(agentAIErrorPayload(sessionID, "", fmt.Errorf("ai session limit reached: %d", agentMaxAISessions)))
-		return
-	}
+	// NOTE: no count cap here. The real turn runs on ai.message, whose lazy-create
+	// path (see message()) registers the session unconditionally — so a cap only
+	// in create() was a dead check that emitted a misleading "limit reached"
+	// error while the conversation still ran. Bound via eviction, not a gate.
 	session := &agentAISession{
 		id:              sessionID,
 		mode:            mode,
@@ -651,8 +697,9 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 		resumeSessionID: resumeSessionID,
 		initialContext:  initialContext,
 		history:         trimAgentAIHistory(history),
+		lastActiveAt:    time.Now().UTC(),
 	}
-	m.sessions[sessionID] = session
+	m.registerAISessionLocked(session)
 	m.mu.Unlock()
 
 	_ = writeJSON(agentAISessionCreatedPayload(session))
@@ -731,16 +778,18 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 			model:           strings.TrimSpace(remoteString(msg, "model")),
 			effort:          strings.TrimSpace(remoteString(msg, "effort")),
 			resumeSessionID: firstNonEmpty(remoteString(msg, "resume_session_id"), remoteString(msg, "source_session_id")),
+			lastActiveAt:    time.Now().UTC(),
 		}
 		m.mu.Lock()
 		if existing := m.sessions[sessionID]; existing != nil {
 			session = existing // a concurrent create/message registered it first
 		} else {
-			m.sessions[sessionID] = session
+			m.registerAISessionLocked(session)
 		}
 		m.mu.Unlock()
 	}
 	m.mu.Lock()
+	session.lastActiveAt = time.Now().UTC() // LRU recency: this conversation is active
 	if session.cancel != nil {
 		m.mu.Unlock()
 		_ = writeJSON(agentAIErrorPayload(sessionID, messageID, fmt.Errorf("ai session is already running: %s", sessionID)))
