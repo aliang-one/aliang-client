@@ -376,7 +376,7 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 		s.applyRemoteDeviceSettings(msg)
 	case models.AgentEventProjectSettings:
 		s.applyRemoteProjectSettings(msg)
-	case models.AgentEventProjectDetail, models.AgentEventAISessionDetail, models.AgentEventFileList, models.AgentEventFileRead, models.AgentEventSlashCommandsList:
+	case models.AgentEventProjectDetail, models.AgentEventAISessionDetail, models.AgentEventFileList, models.AgentEventFileRead, models.AgentEventSlashCommandsList, "file.working_tree_diff":
 		s.setRemoteConnectionState(true, "online", "")
 		go handleAgentDetailMessage(msg, writeJSON)
 	case models.AgentEventGitStatus, models.AgentEventEnvInfo:
@@ -472,6 +472,7 @@ func remoteAgentMessageRequiresEnabledDevice(msgType string) bool {
 		models.AgentEventAISessionDetail,
 		models.AgentEventFileList,
 		models.AgentEventFileRead,
+		"file.working_tree_diff",
 		models.AgentEventSlashCommandsList,
 		models.AgentEventGitStatus,
 		models.AgentEventEnvInfo,

@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -116,5 +117,70 @@ func TestWorkingTreeDiffEntries(t *testing.T) {
 	// non-git dir → empty
 	if got := workingTreeDiffEntries(t.TempDir()); len(got) != 0 {
 		t.Errorf("non-git dir: got %d entries, want 0", len(got))
+	}
+}
+
+// TestHandleRemoteAgentMessage_RoutesWorkingTreeDiff pins the dispatch wiring:
+// an inbound `file.working_tree_diff` request from the server must reach
+// handleAgentDetailMessage and return a `file.working_tree_diff.result`. Before
+// the fix, agent_remote_ws.go's detail dispatch case omitted this type, so the
+// request was silently dropped → server 12s timeout → phone "加载改动失败".
+func TestHandleRemoteAgentMessage_RoutesWorkingTreeDiff(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	dir := t.TempDir()
+	run := func(args ...string) {
+		cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	run("init")
+	run("config", "user.email", "t@t")
+	run("config", "user.name", "t")
+	if err := os.WriteFile(filepath.Join(dir, "keep.ts"), []byte("keep\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", ".")
+	run("commit", "-m", "init")
+	// uncommitted modification → non-empty working-tree diff
+	if err := os.WriteFile(filepath.Join(dir, "keep.ts"), []byte("keep\nchanged\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	authorizeEnvToolDir(t, dir)
+
+	svc := &AgentService{terminal: newAgentTerminalManager(), ai: newAgentAIManager()}
+	svc.mu.Lock()
+	svc.state.Enabled = true
+	svc.state.DeviceToken = "dt_test"
+	svc.mu.Unlock()
+	defer svc.ai.closeAll()
+
+	var mu sync.Mutex
+	var events []map[string]interface{}
+	writeJSON := func(payload interface{}) error {
+		event, ok := payload.(map[string]interface{})
+		if !ok {
+			return nil
+		}
+		mu.Lock()
+		events = append(events, event)
+		mu.Unlock()
+		return nil
+	}
+
+	svc.handleRemoteAgentMessage(map[string]interface{}{
+		"type":         "file.working_tree_diff",
+		"request_id":   "req_wtd_dispatch",
+		"project_path": dir,
+	}, writeJSON)
+
+	result := waitForAgentEvent(t, &mu, &events, "file.working_tree_diff.result", func(e map[string]interface{}) bool {
+		return e["request_id"] == "req_wtd_dispatch"
+	})
+	entries, _ := result["entries"].([]map[string]interface{})
+	if len(entries) == 0 {
+		t.Fatalf("expected non-empty entries for an uncommitted change, got 0 (result=%#v)", result)
 	}
 }
