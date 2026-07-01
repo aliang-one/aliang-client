@@ -1699,7 +1699,7 @@ func (m *agentAIManager) requestApproval(ctx context.Context, run agentAIRun, wr
 	}
 	m.mu.Unlock()
 
-	logger.Info(fmt.Sprintf("approval-hook: requestApproval SENDING ai.approval.request to cloud session=%s approval_id=%s kind=%s — awaiting user decision (≤9m)", run.sessionID, req.ID, req.Kind))
+	logger.Info(fmt.Sprintf("approval-hook: requestApproval SENDING ai.approval.request to cloud session=%s approval_id=%s kind=%s — awaiting user decision (≤%s)", run.sessionID, req.ID, req.Kind, agentAIApprovalTimeout))
 	_ = writeJSON(agentAIApprovalRequestPayload(req))
 
 	run.activity.setAwaitingApproval(true)
@@ -1798,7 +1798,7 @@ func (m *agentAIManager) handleClaudeApprovalHook(ctx context.Context, sessionID
 	}
 
 	req := buildClaudeApprovalRequest(run, raw)
-	approvalCtx, cancel := context.WithTimeout(ctx, 9*time.Minute)
+	approvalCtx, cancel := context.WithTimeout(ctx, agentAIApprovalTimeout)
 	defer cancel()
 	response, err := m.requestApproval(approvalCtx, run, writeJSON, req)
 	if err != nil {

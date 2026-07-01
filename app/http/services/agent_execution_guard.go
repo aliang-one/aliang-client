@@ -53,13 +53,16 @@ const (
 	// AI run liveness. A run is kept alive while it produces output, awaits a
 	// human approval decision, or waits for Claude tool/subagent results. A run
 	// that goes silent longer than agentAIIdleWindow without one of those waits is
-	// stopped as idle. agentAIHardCeiling is a runaway backstop that fires
-	// regardless of activity. Approvals themselves have no wall-clock limit: they
-	// are cancelled only when the enclosing dialogue/session terminates or the
-	// agent goes offline (see agent_ai.go startAIWatchdog /
-	// clearPendingApprovalsLocked).
+	// stopped as idle. While awaiting a human decision the idle watchdog is
+	// paused, but the approval wait itself is bounded by agentAIApprovalTimeout
+	// (the env-configured var below): on expiry the request is cancelled (resolved
+	// as denied) so a forgotten approval cannot pin a headless CLI forever. The
+	// hard ceiling (agentAIHardCeiling) is a runaway backstop that fires from run
+	// start regardless of activity; it MUST exceed agentAIApprovalTimeout or a
+	// long approval wait is clipped by the ceiling first. A run/session ending or
+	// the agent going offline also cancels pending approvals
+	// (see agent_ai.go startAIWatchdog / clearPendingApprovalsLocked).
 	agentAIIdleWindow        = 10 * time.Minute
-	agentAIHardCeiling       = 4 * time.Hour
 	agentAIIdleCheckInterval = 30 * time.Second
 
 	// agentAIRunProgressInterval is how often an active run emits ai.run.progress
@@ -79,6 +82,40 @@ var (
 	agentAuthorizedDirsMu    sync.Mutex
 	agentAuthorizedDirsCache []string
 )
+
+// agentAIApprovalTimeout bounds how long a single approval request waits for a
+// human decision before being cancelled (→ denied). Env-configurable so the max
+// confirmation window is tunable without a recompile:
+//
+//	ALIANG_AI_APPROVAL_TIMEOUT  (time.ParseDuration form, e.g. "24h", "30m"). Default 24h.
+//
+// agentAIHardCeiling is the runaway backstop: a run is cancelled once its total
+// active time exceeds this, regardless of approval state. It MUST be greater
+// than agentAIApprovalTimeout, otherwise a long approval wait is clipped by the
+// ceiling first. Env-configurable:
+//
+//	ALIANG_AI_HARD_CEILING  (time.ParseDuration form). Default 48h (> 24h approval).
+//
+// Both resolve once at process start; blank/unparseable/non-positive values
+// fall back to the default (see resolveEnvDuration, which is unit-tested).
+var (
+	agentAIApprovalTimeout = resolveEnvDuration("ALIANG_AI_APPROVAL_TIMEOUT", 24*time.Hour)
+	agentAIHardCeiling     = resolveEnvDuration("ALIANG_AI_HARD_CEILING", 48*time.Hour)
+)
+
+// resolveEnvDuration parses a Go duration from the env key, returning def when
+// the key is unset, blank, unparseable, or non-positive.
+func resolveEnvDuration(key string, def time.Duration) time.Duration {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return def
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		return def
+	}
+	return d
+}
 
 func resolveAgentAuthorizedCWD(raw string, label string) (string, error) {
 	authorized := agentAuthorizedExecutionDirectories()
