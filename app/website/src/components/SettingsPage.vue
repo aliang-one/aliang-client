@@ -163,15 +163,6 @@
               :success-message="customerConfigSuccess"
               @save="saveCustomerConfig"
             />
-            <CustomEnvSettings
-              v-if="isAuthenticated"
-              :config="customerConfig"
-              :loading="isLoadingCustomerConfig"
-              :saving="isSavingCustomerConfig"
-              :error="customerConfigError"
-              :success-message="customerConfigSuccess"
-              @save="saveCustomerConfig"
-            />
           </aside>
         </div>
 
@@ -192,6 +183,15 @@
             </div>
           </div>
           <AgentSettings v-if="isAuthenticated" />
+          <CustomEnvSettings
+            v-if="isAuthenticated"
+            :config="customerConfig"
+            :loading="isLoadingCustomerConfig"
+            :saving="isSavingCustomerConfig"
+            :error="customerConfigError"
+            :success-message="customerConfigSuccess"
+            @save="saveCustomerConfig"
+          />
           <AgentScanDirectoriesSettings v-if="isAuthenticated" />
           <AgentActivitySettings v-if="isAuthenticated" />
         </section>

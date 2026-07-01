@@ -229,7 +229,7 @@
                     <select
                       v-model="openCodeModel"
                       class="h-10 w-full rounded-xl border border-slate-200 bg-white px-3 text-sm text-slate-700 outline-none transition focus:border-primary disabled:cursor-not-allowed disabled:opacity-60 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
-                      :disabled="loadingOpenCodeModels"
+                      :disabled="loadingOpenCodeModels || !currentOpenCodeModels.length"
                     >
                       <option value="" disabled>
                         {{ loadingOpenCodeModels ? t('qs_opencodeModelsLoading') : t('qs_opencodeModelSelectPh') }}
@@ -251,6 +251,23 @@
                     <template v-else-if="currentOpenCodeModels.length">{{ t('qs_opencodeModelsLoaded', { count: currentOpenCodeModels.length }) }}</template>
                     <template v-else>{{ t('qs_opencodeModelsManual') }}</template>
                   </p>
+                  <div v-if="currentOpenCodeModels.length" class="mt-2 flex max-h-24 flex-wrap gap-1.5 overflow-y-auto pr-1 custom-scrollbar">
+                    <button
+                      v-for="model in currentOpenCodeModels"
+                      :key="`model-option-${model.id}`"
+                      type="button"
+                      :class="[
+                        'min-h-7 max-w-full truncate rounded-lg border px-2.5 text-[11px] font-medium transition',
+                        openCodeModel === model.id
+                          ? 'border-primary/40 bg-primary/10 text-primary'
+                          : 'border-slate-200 bg-white text-slate-600 hover:border-primary/30 hover:text-primary dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300',
+                      ]"
+                      :title="model.name && model.name !== model.id ? `${model.id} · ${model.name}` : model.id"
+                      @click="selectOpenCodeModel(model.id)"
+                    >
+                      {{ model.id }}
+                    </button>
+                  </div>
                 </label>
                 <label class="block">
                   <span class="mb-1 block text-[11px] font-semibold uppercase tracking-wide text-slate-500">{{ t('qs_opencodeSmallModel') }}</span>
@@ -279,7 +296,7 @@
                 <button
                   type="button"
                   class="inline-flex h-10 items-center justify-center rounded-xl border border-slate-200 px-4 text-xs font-semibold text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
-                  :disabled="!selectedKey?.secret_available"
+                  :disabled="!apiKeyHasPlainSecret(selectedKey)"
                   @click="copySelectedKey"
                 >
                   {{ t('qs_copyKey') }}
@@ -483,6 +500,7 @@ const currentOpenCodeModels = computed(() => {
   const keyId = String(openCodeModelKeyId.value || '');
   return Array.isArray(openCodeModelsByKeyId.value[keyId]) ? openCodeModelsByKeyId.value[keyId] : [];
 });
+const loadingOpenCodeModelKeyIds = ref(new Set());
 const canApplyCurrentVariant = computed(() => {
   if (!selectedSoftware.value) return false;
   if (isOpenCodeSelected.value) {
@@ -498,6 +516,15 @@ function maskKey(key) {
   if (!key) return '';
   if (key.length <= 12) return key;
   return key.slice(0, 6) + '•••••••' + key.slice(-4);
+}
+function looksMaskedAPIKey(value) {
+  const text = String(value || '').trim();
+  if (!text) return false;
+  return text.includes('***') || text.includes('...') || text.includes('…');
+}
+function apiKeyHasPlainSecret(key) {
+  const value = String(key?.key || '').trim();
+  return Boolean(value) && !looksMaskedAPIKey(value);
 }
 function keyProvider(keyId) {
   return apiKeys.value.find((key) => String(key.id) === String(keyId))?.provider || '';
@@ -549,22 +576,28 @@ function syncOpenCodeModelSelection() {
     openCodeModel.value = defaultOpenCodeModel(keyProvider(openCodeModelKeyId.value));
   }
 }
+function refreshOpenCodeModelsLoading() {
+  loadingOpenCodeModels.value = loadingOpenCodeModelKeyIds.value.has(String(openCodeModelKeyId.value || ''));
+}
+function selectOpenCodeModel(modelId) {
+  const value = String(modelId || '').trim();
+  if (!value) {
+    return;
+  }
+  openCodeModel.value = value;
+}
 async function loadOpenCodeModelsForKey(keyId) {
   const id = String(keyId || '');
   if (!id) {
     return;
   }
-  const key = apiKeys.value.find((item) => String(item.id) === id);
-  if (!key?.secret_available) {
-    openCodeModelsByKeyId.value = {
-      ...openCodeModelsByKeyId.value,
-      [id]: [],
-    };
-    openCodeModelError.value = t('qs_opencodeModelsSecretMissing');
-    return;
-  }
   if (Array.isArray(openCodeModelsByKeyId.value[id])) {
-    openCodeModelError.value = '';
+    if (String(openCodeModelKeyId.value) === id) {
+      openCodeModelError.value = '';
+      if (!openCodeModel.value.trim() && openCodeModelsByKeyId.value[id].length) {
+        openCodeModel.value = openCodeModelsByKeyId.value[id][0].id;
+      }
+    }
     return;
   }
   const pendingLoad = openCodeModelLoadPromises.get(id);
@@ -574,8 +607,11 @@ async function loadOpenCodeModelsForKey(keyId) {
   }
 
   const loadPromise = (async () => {
-    loadingOpenCodeModels.value = true;
-    openCodeModelError.value = '';
+    loadingOpenCodeModelKeyIds.value = new Set([...loadingOpenCodeModelKeyIds.value, id]);
+    refreshOpenCodeModelsLoading();
+    if (String(openCodeModelKeyId.value) === id) {
+      openCodeModelError.value = '';
+    }
     try {
       const result = await getQuickSetupModels(id);
       const models = Array.isArray(result?.models) ? result.models.filter((model) => model?.id) : [];
@@ -594,13 +630,18 @@ async function loadOpenCodeModelsForKey(keyId) {
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : '';
-      openCodeModelError.value = message || t('qs_opencodeModelsFailed');
+      if (String(openCodeModelKeyId.value) === id) {
+        openCodeModelError.value = message || t('qs_opencodeModelsFailed');
+      }
       if (String(openCodeModelKeyId.value) === id && !openCodeModel.value.trim()) {
         openCodeModel.value = defaultOpenCodeModel(keyProvider(id));
       }
     } finally {
       openCodeModelLoadPromises.delete(id);
-      loadingOpenCodeModels.value = openCodeModelLoadPromises.size > 0;
+      const nextLoadingKeyIds = new Set(loadingOpenCodeModelKeyIds.value);
+      nextLoadingKeyIds.delete(id);
+      loadingOpenCodeModelKeyIds.value = nextLoadingKeyIds;
+      refreshOpenCodeModelsLoading();
     }
   })();
   openCodeModelLoadPromises.set(id, loadPromise);
@@ -765,7 +806,7 @@ async function copyText(value, successText) {
   }
 }
 async function copySelectedKey() {
-  if (!selectedKey.value?.secret_available) {
+  if (!apiKeyHasPlainSecret(selectedKey.value)) {
     statusMessage.value = t('qs_keyMasked');
     return;
   }

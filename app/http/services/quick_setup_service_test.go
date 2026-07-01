@@ -34,18 +34,19 @@ func TestQuickSetupService_Catalog_Unauthenticated(t *testing.T) {
 func TestQuickSetupService_Models_FetchesFromSelectedKeyBaseURL(t *testing.T) {
 	requestedPath := ""
 	requestedAuth := ""
+	modelResponse := `{
+		"object": "list",
+		"data": [
+			{"id": "z-model", "owned_by": "aliang"},
+			{"id": "a-model", "name": "A Model", "owned_by": "aliang"},
+			{"id": "a-model", "name": "Duplicate"}
+		]
+	}`
 	modelServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestedPath = r.URL.Path
 		requestedAuth = r.Header.Get("Authorization")
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{
-			"object": "list",
-			"data": [
-				{"id": "z-model", "owned_by": "aliang"},
-				{"id": "a-model", "name": "A Model", "owned_by": "aliang"},
-				{"id": "a-model", "name": "Duplicate"}
-			]
-		}`))
+		_, _ = w.Write([]byte(modelResponse))
 	}))
 	t.Cleanup(modelServer.Close)
 
@@ -60,6 +61,7 @@ func TestQuickSetupService_Models_FetchesFromSelectedKeyBaseURL(t *testing.T) {
 		return []auth.UserAPIKey{
 			{ID: 11, Key: "sk-openai-real", Name: "OpenAI Key", Status: "active", Provider: "openai", SecretAvailable: true},
 			{ID: 22, Key: "sk-ant-real", Name: "Anthropic Key", Status: "active", Provider: "anthropic", SecretAvailable: true},
+			{ID: 33, Key: "sk-flag-false-real", Name: "Flag False Key", Status: "active", Provider: "openai", SecretAvailable: false},
 		}, nil
 	}
 	t.Cleanup(func() {
@@ -102,6 +104,34 @@ func TestQuickSetupService_Models_FetchesFromSelectedKeyBaseURL(t *testing.T) {
 	}
 	if resp.BaseURL != modelServer.URL+"/v1" {
 		t.Fatalf("anthropic model list base_url = %q, want %q", resp.BaseURL, modelServer.URL+"/v1")
+	}
+
+	requestedAuth = ""
+	resp, err = NewQuickSetupService().Models(models.QuickSetupModelsRequest{KeyID: 33})
+	if err != nil {
+		t.Fatalf("plain key with false secret flag failed: %v", err)
+	}
+	if requestedAuth != "Bearer sk-flag-false-real" {
+		t.Fatalf("plain key with false secret flag authorization = %q", requestedAuth)
+	}
+
+	modelResponse = `{
+		"data": {
+			"models": [
+				{"model": "wrapped-b", "display_name": "Wrapped B"},
+				{"name": "wrapped-a"}
+			]
+		}
+	}`
+	resp, err = NewQuickSetupService().Models(models.QuickSetupModelsRequest{KeyID: 11})
+	if err != nil {
+		t.Fatalf("wrapped models failed: %v", err)
+	}
+	if len(resp.Models) != 2 {
+		t.Fatalf("wrapped models length = %d, want 2: %#v", len(resp.Models), resp.Models)
+	}
+	if resp.Models[0].ID != "wrapped-a" || resp.Models[1].ID != "wrapped-b" {
+		t.Fatalf("wrapped models parsed/sorted incorrectly: %#v", resp.Models)
 	}
 }
 

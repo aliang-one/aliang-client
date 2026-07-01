@@ -68,7 +68,7 @@ func (h *QuickSetupHandler) HandleModels(w http.ResponseWriter, r *http.Request)
 			common.ErrorBadRequest(w, err.Error(), nil)
 			return
 		}
-		common.ErrorInternalServer(w, "Quick setup model list failed", map[string]interface{}{"error": err.Error()})
+		common.ErrorInternalServer(w, err.Error(), nil)
 		return
 	}
 

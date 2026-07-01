@@ -156,7 +156,7 @@ func (s *QuickSetupService) Models(req models.QuickSetupModelsRequest) (*models.
 	if selected == nil {
 		return nil, fmt.Errorf("api key not found: %d", req.KeyID)
 	}
-	if !selected.SecretAvailable || strings.TrimSpace(selected.Key) == "" || selected.Masked {
+	if !quickSetupAPIKeyHasPlainSecret(*selected) {
 		return nil, errors.New("selected API key secret is not available")
 	}
 
@@ -332,6 +332,19 @@ func toQuickSetupAPIKeys(apiKeys []auth.UserAPIKey, apiRoot string) []models.Qui
 	})
 
 	return items
+}
+
+func quickSetupAPIKeyHasPlainSecret(apiKey models.QuickSetupAPIKey) bool {
+	keyValue := strings.TrimSpace(apiKey.Key)
+	return keyValue != "" && !quickSetupLooksMaskedAPIKey(keyValue)
+}
+
+func quickSetupLooksMaskedAPIKey(value string) bool {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return false
+	}
+	return strings.Contains(trimmed, "***") || strings.Contains(trimmed, "…") || strings.Contains(trimmed, "...")
 }
 
 func renderQuickSetupFiles(software models.QuickSetupSoftware, apiKey models.QuickSetupAPIKey, apiRoot string) ([]models.QuickSetupPreviewFile, []string, error) {
@@ -650,21 +663,32 @@ func fetchQuickSetupModels(baseURL string, apiKey string) ([]models.QuickSetupMo
 		return nil, fmt.Errorf("model list request failed (%d): %s", resp.StatusCode, message)
 	}
 
-	var envelope struct {
-		Data []struct {
-			ID      string `json:"id"`
-			Name    string `json:"name"`
-			OwnedBy string `json:"owned_by"`
-			Created int64  `json:"created"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(body, &envelope); err != nil {
+	modelsList, err := parseQuickSetupModels(body)
+	if err != nil {
 		return nil, fmt.Errorf("failed to parse model list response: %w", err)
 	}
+	return modelsList, nil
+}
 
-	modelsList := make([]models.QuickSetupModel, 0, len(envelope.Data))
+type quickSetupModelEntry struct {
+	ID      string
+	Name    string
+	OwnedBy string
+	Created int64
+}
+
+func parseQuickSetupModels(body []byte) ([]models.QuickSetupModel, error) {
+	var payload interface{}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, err
+	}
+
+	var entries []quickSetupModelEntry
+	collectQuickSetupModelEntries(payload, &entries)
+
+	modelsList := make([]models.QuickSetupModel, 0, len(entries))
 	seen := map[string]struct{}{}
-	for _, item := range envelope.Data {
+	for _, item := range entries {
 		id := strings.TrimSpace(item.ID)
 		if id == "" {
 			continue
@@ -688,6 +712,118 @@ func fetchQuickSetupModels(baseURL string, apiKey string) ([]models.QuickSetupMo
 		return modelsList[i].ID < modelsList[j].ID
 	})
 	return modelsList, nil
+}
+
+func collectQuickSetupModelEntries(value interface{}, entries *[]quickSetupModelEntry) {
+	switch typed := value.(type) {
+	case []interface{}:
+		for _, item := range typed {
+			collectQuickSetupModelEntries(item, entries)
+		}
+	case map[string]interface{}:
+		entryAdded := false
+		if entry, ok := quickSetupModelEntryFromMap(typed); ok {
+			*entries = append(*entries, entry)
+			entryAdded = true
+		}
+		nestedAdded := false
+		for _, key := range []string{"data", "models", "items"} {
+			if nested, ok := typed[key]; ok {
+				collectQuickSetupModelEntries(nested, entries)
+				nestedAdded = true
+			}
+		}
+		if !entryAdded && !nestedAdded {
+			collectQuickSetupModelMapEntries(typed, entries)
+		}
+	case string:
+		if id := strings.TrimSpace(typed); id != "" {
+			*entries = append(*entries, quickSetupModelEntry{ID: id, Name: id})
+		}
+	}
+}
+
+func collectQuickSetupModelMapEntries(value map[string]interface{}, entries *[]quickSetupModelEntry) {
+	for key, raw := range value {
+		id := strings.TrimSpace(key)
+		if id == "" {
+			continue
+		}
+		switch typed := raw.(type) {
+		case map[string]interface{}:
+			name := firstNonEmptyQuickSetupString(
+				quickSetupStringField(typed, "name"),
+				quickSetupStringField(typed, "display_name"),
+				quickSetupStringField(typed, "label"),
+				id,
+			)
+			*entries = append(*entries, quickSetupModelEntry{
+				ID:      id,
+				Name:    name,
+				OwnedBy: firstNonEmptyQuickSetupString(quickSetupStringField(typed, "owned_by"), quickSetupStringField(typed, "ownedBy"), quickSetupStringField(typed, "owner")),
+				Created: quickSetupInt64Field(typed, "created"),
+			})
+		case string:
+			name := firstNonEmptyQuickSetupString(typed, id)
+			*entries = append(*entries, quickSetupModelEntry{ID: id, Name: name})
+		}
+	}
+}
+
+func quickSetupModelEntryFromMap(item map[string]interface{}) (quickSetupModelEntry, bool) {
+	id := firstNonEmptyQuickSetupString(
+		quickSetupStringField(item, "id"),
+		quickSetupStringField(item, "model"),
+		quickSetupStringField(item, "name"),
+	)
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return quickSetupModelEntry{}, false
+	}
+	name := firstNonEmptyQuickSetupString(
+		quickSetupStringField(item, "name"),
+		quickSetupStringField(item, "display_name"),
+		quickSetupStringField(item, "label"),
+		id,
+	)
+	return quickSetupModelEntry{
+		ID:      id,
+		Name:    name,
+		OwnedBy: firstNonEmptyQuickSetupString(quickSetupStringField(item, "owned_by"), quickSetupStringField(item, "ownedBy"), quickSetupStringField(item, "owner")),
+		Created: quickSetupInt64Field(item, "created"),
+	}, true
+}
+
+func quickSetupStringField(item map[string]interface{}, key string) string {
+	value, ok := item[key]
+	if !ok || value == nil {
+		return ""
+	}
+	switch typed := value.(type) {
+	case string:
+		return strings.TrimSpace(typed)
+	case fmt.Stringer:
+		return strings.TrimSpace(typed.String())
+	default:
+		return strings.TrimSpace(fmt.Sprint(typed))
+	}
+}
+
+func quickSetupInt64Field(item map[string]interface{}, key string) int64 {
+	value, ok := item[key]
+	if !ok || value == nil {
+		return 0
+	}
+	switch typed := value.(type) {
+	case float64:
+		return int64(typed)
+	case int64:
+		return typed
+	case int:
+		return int64(typed)
+	default:
+		return 0
+	}
 }
 
 func renderCodexFiles(software models.QuickSetupSoftware, apiKey models.QuickSetupAPIKey, apiRoot string) ([]models.QuickSetupPreviewFile, []string, error) {
