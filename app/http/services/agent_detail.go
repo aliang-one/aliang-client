@@ -310,6 +310,9 @@ func agentFileListPayload(msg map[string]interface{}) map[string]interface{} {
 	if err != nil {
 		return agentFileErrorPayload(requestID, err)
 	}
+	// Real per-file git status (clean/modified/added/deleted) for the browser's
+	// status filters. Non-git dir → empty map → everything reads as 'clean'.
+	gitStatus := loadGitStatusMap(targetPath)
 	result := make([]map[string]interface{}, 0, minInt(len(entries), maxEntries))
 	for _, entry := range entries {
 		if len(result) >= maxEntries {
@@ -324,6 +327,13 @@ func agentFileListPayload(msg map[string]interface{}) map[string]interface{} {
 			kind = "directory"
 		}
 		itemPath := filepath.Join(targetPath, entry.Name())
+		status := "clean"
+		if entry.IsDir() {
+			// Folder glows if any changed file lives anywhere beneath it.
+			status = gitDirectoryStatus(itemPath, gitStatus)
+		} else if s, ok := gitStatus[itemPath]; ok {
+			status = s
+		}
 		result = append(result, map[string]interface{}{
 			"name":        entry.Name(),
 			"path":        itemPath,
@@ -332,6 +342,7 @@ func agentFileListPayload(msg map[string]interface{}) map[string]interface{} {
 			"modified_at": info.ModTime().UTC().Format(time.RFC3339),
 			"language":    agentFileLanguage(entry.Name(), entry.IsDir()),
 			"summary":     agentFileSummary(entry.IsDir()),
+			"status":      status,
 		})
 	}
 	return map[string]interface{}{
