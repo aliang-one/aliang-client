@@ -470,21 +470,48 @@ func containsString(list []string, s string) bool {
 // a dangerous segment anywhere in a chained command, and it is the FIRST rule, so
 // "dangerous beats safe" no matter how broad safe-bash gets (defense-in-depth).
 func dangerousBashPattern() string {
-	return strings.Join([]string{
-		`rm\s+(-[a-zA-Z]*[rR])`,                                      // recursive rm (-r/-R/-rf/-fr)
+	// Unix catastrophic/system-destructive tokens (kept byte-identical to the
+	// server's DANGEROUS_BASH_UNIX in approval/policy.ts).
+	unix := []string{
+		`rm\s+(-[a-zA-Z]*[rR])`, // recursive rm (-r/-R/-rf/-fr)
 		`\bdd\s+`, `\bmkfs\b`,
-		`>\s*/dev/(sd|nvme|disk|mmcblk)`,                             // write to a block device (/dev/null is safe)
+		`>\s*/dev/(sd|nvme|disk|mmcblk)`, // write to a block device (/dev/null is safe)
 		`\bsudo\b`, `\bsu\b`,
 		`\bshutdown\b`, `\breboot\b`, `\bhalt\b`, `\bpoweroff\b`,
 		`\bkill\s+-9\b`, `\bkillall\b`, `\bpkill\b`,
 		`\bchmod\s+-R\b`, `\bchown\s+-R\b`,
 		`\bgit\s+push\b`, `\bgit\s+reset\s+--hard\b`, `\bgit\s+clean\s+-[a-zA-Z]*[fd]\b`,
 		`\bnpm\s+publish\b`, `\bpnpm\s+publish\b`,
-		`\bcurl\b`, `\bwget\b`,                                       // any network egress
+		`\bcurl\b`, `\bwget\b`, // any network egress
 		`\|\s*(sh|bash|zsh|fish|python[0-9]?|perl|ruby|node|php)\b`, // pipe to interpreter
 		`\beval\b`,
-		`>>?\s*/(etc|usr|bin|sbin|lib|boot|sys|proc|root|var)\b`,    // write to system dirs
-	}, `|`)
+		`>>?\s*/(etc|usr|bin|sbin|lib|boot|sys|proc|root|var)\b`, // write to system dirs
+	}
+	// Windows (cmd / PowerShell) destructive tokens — byte-identical to the
+	// server's DANGEROUS_BASH_WINDOWS: mass delete, disk/volume wipe, privilege/
+	// policy change, broad process/system kill, registry destructive, network
+	// egress (parity with curl/wget), pipe-to-exec (supply-chain), system-dir writes.
+	windows := []string{
+		`\bRemove-Item\b.*-Recurse`, // PS recursive delete
+		`\b(?:rmdir|rd)\b.*\/s`,     // cmd recursive delete
+		`\b(?:del|erase)\b.*\/s`,    // cmd recursive delete
+		`\bformat\b\s+[A-Za-z]:`,    // format a drive (\s+X: avoids matching git --format=)
+		`\bdiskpart\b`, `\bcipher\b.*\/w`,
+		`\breg\s+delete\b`, `\breg\s+import\b`,
+		`\bSet-ExecutionPolicy\b`,
+		`\btakeown\b`,
+		`\bnet\s+localgroup\b`, `\bnet\s+user\b.*\/(?:add|delete)`,
+		`\btaskkill\b.*\/f`, `\bStop-Computer\b`, `\bRestart-Computer\b`,
+		`\bStop-Service\b.*-Force`, `\bsc\s+(?:stop|delete)\b`,
+		`\bInvoke-WebRequest\b`, `\biwr\b`, `\bInvoke-RestMethod\b`, `\birm\b`,
+		`\bStart-BitsTransfer\b`, `\bInvoke-Expression\b`, `\biex\b`, `\bStart-Process\b`,
+		`\|\s*(?:iex|irm)\b`, // pipe-to-exec (PS supply-chain)
+		`>>?\s*[A-Za-z]:[\\/](?:Windows|Program Files|ProgramData|boot)\b`, // write to system dirs
+	}
+	// (?i) prefixed to the JOINED string (NOT a joined element — an empty first
+	// alternative would match everything). RE2 honors the leading flag group;
+	// makes every branch case-insensitive (safer for Unix too: SUDO, RM -RF, RMDIR /S).
+	return "(?i)" + strings.Join(append(unix, windows...), `|`)
 }
 
 // safeBashPattern is the vibe-mode Bash allowlist: read-only exploration, common
@@ -529,7 +556,16 @@ func safeBashPattern() string {
 		`vite`, `webpack`, `rollup`, `esbuild`, `swc`, `babel`,
 		`turbo`, `nx`, `biome`, `oxlint`,
 	}, `|`)
-	return strings.Join([]string{
+	// Windows (cmd / PowerShell) read-only tokens — byte-identical to the server's
+	// SAFE_BASH_WINDOWS_LEAF. Conservative: no del/erase/rmdir/rd/Remove-Item/Move-*
+	// /Set-*/New-*; destructive Windows commands are caught by dangerous-bash first.
+	windowsLeaf := strings.Join([]string{
+		`dir`, `type`, `more`, `find`, `findstr`, `where`, `ver`, `vol`, `tree`, `tasklist`, `whoami`, `hostname`,
+		`Get-ChildItem`, `gci`, `Get-Content`, `gc`, `Select-String`, `sls`,
+		`Get-Location`, `Get-Item`, `Get-Variable`, `Get-Process`, `Get-Service`,
+		`Test-Path`, `Resolve-Path`, `Get-Acl`, `Write-Output`, `Write-Host`,
+	}, `|`)
+	return "(?i)" + strings.Join([]string{
 		`^\s*(?:` + leaf + `)\b`,
 		`^\s*git\s+(?:` + gitCmds + `)\b`,
 		`^\s*npm\s+(?:` + npmCmds + `)\b`,
@@ -537,6 +573,7 @@ func safeBashPattern() string {
 		`^\s*pnpm\s+(?:` + pnpmCmds + `)\b`,
 		`^\s*yarn\s+(?:` + yarnCmds + `)\b`,
 		`^\s*(?:` + tools + `)\b`,
+		`^\s*(?:` + windowsLeaf + `)\b`,
 	}, `|`)
 }
 

