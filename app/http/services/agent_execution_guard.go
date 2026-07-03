@@ -117,30 +117,21 @@ func resolveEnvDuration(key string, def time.Duration) time.Duration {
 	return d
 }
 
+// resolveAgentAuthorizedCWD resolves a working directory for remote execution.
+// Operator policy: authorized-directory confinement REMOVED — commands may run
+// anywhere the agent's OS user can reach. We still validate the path is real and
+// is a directory; an empty cwd falls back to the user's home (else ".").
 func resolveAgentAuthorizedCWD(raw string, label string) (string, error) {
-	authorized := agentAuthorizedExecutionDirectories()
+	_ = label
 	cwd := strings.TrimSpace(raw)
 	if cwd == "" {
-		if len(authorized) == 0 {
-			return "", errors.New("no authorized project directories are available for remote execution")
+		if home, err := cache.ExpandHomePath("~"); err == nil && home != "" {
+			cwd = home
+		} else {
+			cwd = "."
 		}
-		return authorized[0], nil
 	}
-
-	resolved, err := cleanExistingAgentDirectory(cwd)
-	if err != nil {
-		return "", err
-	}
-	if !agentPathInsideAnyDirectory(resolved, authorized) {
-		authorized = refreshAgentAuthorizedExecutionDirectories()
-	}
-	if !agentPathInsideAnyDirectory(resolved, authorized) {
-		if label == "" {
-			label = "working directory"
-		}
-		return "", fmt.Errorf("%s is not inside an authorized project directory: %s", label, resolved)
-	}
-	return resolved, nil
+	return cleanExistingAgentDirectory(cwd)
 }
 
 func agentAuthorizedExecutionDirectories() []string {

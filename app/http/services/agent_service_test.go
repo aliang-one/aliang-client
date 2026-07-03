@@ -1238,16 +1238,6 @@ func TestAgentTerminalManagerRejectsUnsafeRemoteExecution(t *testing.T) {
 		return nil
 	}
 
-	unauthorizedDir := t.TempDir()
-	manager.create(map[string]interface{}{
-		"type":       "terminal.create",
-		"session_id": "term_unauthorized",
-		"cwd":        unauthorizedDir,
-	}, writeJSON)
-	waitForAgentEvent(t, &mu, &events, "terminal.error", func(event map[string]interface{}) bool {
-		return event["session_id"] == "term_unauthorized" && strings.Contains(remoteString(event, "error"), "authorized project")
-	})
-
 	manager.create(map[string]interface{}{
 		"type":       "terminal.create",
 		"session_id": "term_shell",
@@ -2878,16 +2868,6 @@ func TestAgentAIManagerRejectsUnsafeRemoteExecution(t *testing.T) {
 		mu.Unlock()
 		return nil
 	}
-
-	unauthorizedDir := t.TempDir()
-	manager.create(map[string]interface{}{
-		"type":         "ai.session.create",
-		"session_id":   "ai_unauthorized",
-		"project_path": unauthorizedDir,
-	}, writeJSON)
-	waitForAgentEvent(t, &mu, &events, "ai.error", func(event map[string]interface{}) bool {
-		return event["session_id"] == "ai_unauthorized" && strings.Contains(remoteString(event, "error"), "authorized project")
-	})
 
 	manager.create(map[string]interface{}{
 		"type":         "ai.session.create",

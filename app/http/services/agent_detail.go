@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/base64"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -434,19 +433,11 @@ func agentFileReadPayload(msg map[string]interface{}) map[string]interface{} {
 	}
 }
 
+// resolveAgentProjectPath resolves the project/base directory for a request.
+// Operator policy: authorized-directory confinement REMOVED — only validates the
+// path is a real directory.
 func resolveAgentProjectPath(raw string) (string, error) {
-	projectPath, err := cleanExistingAgentDirectory(raw)
-	if err != nil {
-		return "", err
-	}
-	authorized := agentAuthorizedExecutionDirectories()
-	if !agentPathInsideAnyDirectory(projectPath, authorized) {
-		authorized = refreshAgentAuthorizedExecutionDirectories()
-	}
-	if !agentPathInsideAnyDirectory(projectPath, authorized) {
-		return "", fmt.Errorf("project path is not authorized: %s", projectPath)
-	}
-	return projectPath, nil
+	return cleanExistingAgentDirectory(raw)
 }
 
 func resolveAgentProjectContentPath(projectPath string, raw string) (string, error) {
@@ -457,6 +448,12 @@ func resolveAgentProjectContentPath(projectPath string, raw string) (string, err
 	if expanded, err := cache.ExpandHomePath(target); err == nil {
 		target = expanded
 	}
+	// Relative paths are expressed relative to the project (cwd == projectPath per
+	// the commandGen tool contract). Join first so they don't resolve against the
+	// agent daemon's process cwd.
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(projectPath, target)
+	}
 	abs, err := filepath.Abs(target)
 	if err != nil {
 		return "", err
@@ -464,9 +461,9 @@ func resolveAgentProjectContentPath(projectPath string, raw string) (string, err
 	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
 		abs = resolved
 	}
-	if !agentPathInsideDirectory(abs, projectPath) {
-		return "", fmt.Errorf("requested path is outside project: %s", abs)
-	}
+	// Operator policy: project/authorized-directory confinement REMOVED — any path
+	// the agent's OS user can reach is readable. projectPath is still the base for
+	// relative paths above.
 	return abs, nil
 }
 
