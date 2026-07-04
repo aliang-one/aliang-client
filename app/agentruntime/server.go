@@ -23,6 +23,16 @@ var (
 )
 
 func RunForeground(ctx context.Context) error {
+	// 进程级独占锁：保证全局只有一个 user-agent。拿不到锁说明已有实例在跑
+	// （如 EnsureStarted 在本进程启动前刚 spawn 了一份，或用户手动双开）。
+	// 干净退出、不 listen、不报错 —— EnsureStarted 探 56433 会看到先到的实例。
+	lockFile, err := acquireAgentLock()
+	if err != nil {
+		logger.Info(fmt.Sprintf("[AGENT-BOOT] foreground_runtime another_instance_running exiting: %v", err))
+		return nil
+	}
+	defer lockFile.Close()
+
 	logger.Info("[AGENT-BOOT] foreground_runtime starting")
 	if err := StartLocalServer(); err != nil {
 		return err

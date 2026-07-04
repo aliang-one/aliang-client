@@ -99,10 +99,15 @@ func TestAgentSyncResult_DoesNotBlockOnSync(t *testing.T) {
 	// first load) whenever PhoneServer is slow or unreachable. agentSyncResult
 	// must dispatch the sync asynchronously and return immediately.
 	orig := agentSyncDispatch
-	t.Cleanup(func() { agentSyncDispatch = orig })
+	origHook := EnsureAgentAfterAuthHook
+	t.Cleanup(func() { agentSyncDispatch = orig; EnsureAgentAfterAuthHook = origHook })
 
 	fired := make(chan struct{}, 1)
 	agentSyncDispatch = func(string) error { fired <- struct{}{}; return nil }
+	// In production EnsureAgentAfterAuthHook is wired to agentruntime.EnsureStarted by
+	// init(). Stub it to a no-op so the test never spawns a real user-agent child —
+	// which would also block the goroutine past the 1s dispatch wait below.
+	EnsureAgentAfterAuthHook = func() error { return nil }
 
 	res := agentSyncResult("restore_session")
 

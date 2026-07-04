@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"aliang.one/nursorgate/app/http/models"
@@ -23,7 +24,24 @@ const (
 	protocolPath   = "/api/agent/protocol"
 )
 
+// ensureStartedMu 保证 EnsureStarted 在同一进程内串行执行，避免 auth-success 事件、
+// 冷启动以及未来的 watchdog 并发调用时重复 spawn user-agent。跨进程唯一性由 user-agent
+// 自身的端口监听（56433）兜底，后续 pidfile flock 会再补一层内核级互斥。
+var ensureStartedMu sync.Mutex
+
+func init() {
+	// 将 EnsureStarted 注入 services 包的 auth-success 钩子，规避 services → agentruntime
+	// 的循环依赖。所有包 init 跑完后，hook 才会在首次登录事件中被调用，赋值时序安全。
+	services.EnsureAgentAfterAuthHook = EnsureStarted
+}
+
+// EnsureStarted ensures the local user-agent process is running and ready.
+// It is safe to call concurrently or repeatedly: an in-process mutex serializes
+// callers, and the existing-runtime fast path short-circuits when 56433 already
+// answers with a matching protocol.
 func EnsureStarted() error {
+	ensureStartedMu.Lock()
+	defer ensureStartedMu.Unlock()
 	logger.Info(fmt.Sprintf("[AGENT-BOOT] ensure_started begin local_agent_url=%s capability_path=%s", services.UserAgentBaseURL(), capabilityPath))
 	if SupportsCurrentAgentAPI(700 * time.Millisecond) {
 		logger.Info(fmt.Sprintf("[AGENT-BOOT] ensure_started existing_runtime_healthy local_agent_url=%s", services.UserAgentBaseURL()))
@@ -80,9 +98,27 @@ func shouldReplaceExistingRuntimeAfterSyncError(err error) bool {
 		return false
 	}
 	text := strings.ToLower(err.Error())
-	return strings.Contains(text, "login") ||
+	// 鉴权类业务错误：换进程让新 agent 用最新持久化 token 重新注册。
+	if strings.Contains(text, "login") ||
 		strings.Contains(text, "authorization") ||
-		strings.Contains(text, "authentication")
+		strings.Contains(text, "authentication") {
+		return true
+	}
+	// 网络层 / 进程健康错误：agent 半死（端口在但不响应 / EOF / 超时）或协议 stale。
+	// 这正是 .app 重启时旧 agent 被连带杀死过程中的竞态漏 spawn 要修的场景：existing
+	// 分支 sync 失败时若仅因非 auth 错误就保留，会把半死的旧 agent 当健康、永不重 spawn。
+	if strings.Contains(text, "eof") ||
+		strings.Contains(text, "connection refused") ||
+		strings.Contains(text, "broken pipe") ||
+		strings.Contains(text, "reset by peer") ||
+		strings.Contains(text, "no such host") ||
+		strings.Contains(text, "deadline exceeded") ||
+		strings.Contains(text, "timeout") ||
+		strings.Contains(text, "stale protocol") {
+		return true
+	}
+	// 其它（如 PhoneServer 返回的 5xx 业务错误）→ 保留进程，避免远程故障时反复 kill+spawn 抖动。
+	return false
 }
 
 func SupportsCurrentAgentAPI(timeout time.Duration) bool {
@@ -154,11 +190,29 @@ func fetchLocalAgentProtocol(timeout time.Duration) (*models.AgentProtocolContra
 
 func stopStaleUserAgentIfNeeded(timeout time.Duration) {
 	pid, err := fetchLocalAgentPID(timeout)
-	if err != nil {
-		logger.Info(fmt.Sprintf("[AGENT-BOOT] ensure_started stale_stop skipped reason=status_unavailable error=%v", err))
+	if err != nil || pid <= 0 {
+		// HTTP status 拿不到（agent 半死 / 不响应 /api/agent/status）→ 从 pidfile 兜底取 pid。
+		// 否则半死 agent 占着 flock 与端口，新 spawn 永远拿不到锁。
+		if filePID := readAgentPIDFromFile(); filePID > 0 {
+			pid = filePID
+			logger.Info(fmt.Sprintf("[AGENT-BOOT] ensure_started stale_stop pidfile_fallback pid=%d", pid))
+		}
+	}
+	if pid <= 0 {
+		logger.Info("[AGENT-BOOT] ensure_started stale_stop skipped reason=no_pid")
 		return
 	}
-	if pid <= 0 || pid == os.Getpid() {
+	if pid == os.Getpid() {
+		return
+	}
+	// 防御 pid 复用：agent 异常退出后 pidfile 可能残留，OS 把该 pid 复用给无关进程时，
+	// 若不校验直接 kill 会误杀。仅当 pid 仍存活且命令行是 aliang 自身才动手。
+	if !isAgentPIDAlive(pid) {
+		logger.Info(fmt.Sprintf("[AGENT-BOOT] ensure_started stale_stop pid_not_alive pid=%d", pid))
+		return
+	}
+	if !isAgentProcessByComm(pid) {
+		logger.Warn(fmt.Sprintf("[AGENT-BOOT] ensure_started stale_stop skipped reason=pid_reused_not_aliang pid=%d", pid))
 		return
 	}
 	process, err := os.FindProcess(pid)
@@ -171,6 +225,7 @@ func stopStaleUserAgentIfNeeded(timeout time.Duration) {
 		logger.Warn(fmt.Sprintf("[AGENT-BOOT] ensure_started stale_stop kill_failed pid=%d error=%v", pid, err))
 		return
 	}
+	// 等 56433 失联（旧 agent 真正退下），为新 spawn 让出端口与 flock。
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		if _, err := fetchLocalAgentPID(300 * time.Millisecond); err != nil {

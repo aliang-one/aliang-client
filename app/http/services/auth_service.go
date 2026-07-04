@@ -64,6 +64,13 @@ func clearStartupStateAfterLogout() {
 // response is never blocked by this side-effect.
 var agentSyncDispatch = RequestUserAgentSyncAfterAuth
 
+// EnsureAgentAfterAuthHook 在 auth-success 事件上确保 user-agent 进程已在运行。
+// 默认 no-op；真实实现由 agentruntime 包通过 init() 注入，以此规避 services →
+// agentruntime 的循环依赖（agentruntime 已 import services）。所有登录/会话恢复/
+// 会话刷新/扫码激活成功都经 agentSyncResult 触发它，保证 user-agent 缺席时能被
+// 登录事件自愈拉起，而不是只向 127.0.0.1:56433 转发 sync、agent 不在就静默失败。
+var EnsureAgentAfterAuthHook = func() error { return nil }
+
 func agentSyncResult(reason string) map[string]interface{} {
 	// Fire the PhoneServer sync off the request path. Pushing the auth token to
 	// PhoneServer is a side-effect of login/session-restore, not part of
@@ -72,6 +79,16 @@ func agentSyncResult(reason string) map[string]interface{} {
 	// PhoneServer is slow or unreachable. The frontend does not consume the
 	// agent_sync field from this response.
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Warn(fmt.Sprintf("post-auth agent bootstrap panicked (reason=%s): %v", reason, r))
+			}
+		}()
+		// 先确保 user-agent 进程在跑，再触发 PhoneServer sync。顺序不能反：sync 走
+		// 127.0.0.1:56433，agent 缺席时必 refused，所以必须 ensure → sync。
+		if err := EnsureAgentAfterAuthHook(); err != nil {
+			logger.Warn(fmt.Sprintf("Ensure user-agent after auth failed (reason=%s): %v", reason, err))
+		}
 		if err := agentSyncDispatch(reason); err != nil {
 			logger.Warn(fmt.Sprintf("Async agent sync failed (reason=%s): %v", reason, err))
 		}

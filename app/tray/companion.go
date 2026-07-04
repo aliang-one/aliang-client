@@ -102,6 +102,7 @@ func (a *CompanionApp) onReady() {
 		a.connectAndStartHTTP()
 		go a.handleMenuEvents()
 		go a.syncStateLoop()
+		go a.agentWatchdogLoop()
 	}()
 }
 
