@@ -30,9 +30,28 @@ const (
 var ensureStartedMu sync.Mutex
 
 func init() {
-	// 将 EnsureStarted 注入 services 包的 auth-success 钩子，规避 services → agentruntime
-	// 的循环依赖。所有包 init 跑完后，hook 才会在首次登录事件中被调用，赋值时序安全。
-	services.EnsureAgentAfterAuthHook = EnsureStarted
+	// 将 ensureAgentAfterAuth 注入 services 的 auth-success 钩子，规避 services →
+	// agentruntime 的循环依赖。所有包 init 跑完后，hook 才会在首次登录事件中被调用。
+	services.EnsureAgentAfterAuthHook = ensureAgentAfterAuth
+}
+
+// ensureAgentAfterAuth 是 auth-success 钩子的真实实现。
+//
+// core（root daemon）在此跳过 spawn：user-agent 必须以登录用户身份运行，才能读到
+// 正确的家目录、Claude/Codex 凭证与 ~/.aliang 状态。core 是 root，spawn 出的子进程
+// 会继承 root 身份，家目录与凭证全部错位；更糟的是它会与 .app 之后 spawn 的用户态
+// agent 共用 ~/.aliang/agent（HOME 继承），抢 56433 端口和 flock，形成 root+mac 双
+// agent 混战。所以 user-agent 的 spawn 必须交给用户态 .app——它的冷启动 EnsureStarted
+// （companion.go）+ watchdog（companion_watchdog.go）负责拉起并看护。
+//
+// core 跳过 spawn 不影响 token 下发：core 仍会经 agentSyncDispatch 把 token 转发给
+// 已在跑的 user-agent（POST 127.0.0.1:56433/api/agent/sync）。
+func ensureAgentAfterAuth() error {
+	if os.Geteuid() == 0 {
+		logger.Info("[AGENT-BOOT] ensure_agent_after_auth skipped reason=root_daemon (user-agent must run as login user; spawn left to .app)")
+		return nil
+	}
+	return EnsureStarted()
 }
 
 // EnsureStarted ensures the local user-agent process is running and ready.
