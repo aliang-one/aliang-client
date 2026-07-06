@@ -2897,7 +2897,11 @@ func (m *agentAIManager) codexAppServerApprovalResult(ctx context.Context, run a
 		}
 	}
 	req := buildCodexApprovalRequest(run, method, params, fileChanges)
-	approvalCtx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+	// Use the env-configurable approval timeout (ALIANG_AI_APPROVAL_TIMEOUT,
+	// default 24h) — same source as the Claude hook path (see handleClaudeApprovalHook).
+	// Previously this was a hardcoded 30m that clipped long approval waits even when
+	// the operator had raised the configured ceiling.
+	approvalCtx, cancel := context.WithTimeout(ctx, agentAIApprovalTimeout)
 	defer cancel()
 	response, err := m.requestApproval(approvalCtx, run, writeJSON, req)
 	if err != nil {
