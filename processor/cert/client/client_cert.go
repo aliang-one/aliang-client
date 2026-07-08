@@ -10,22 +10,19 @@ import (
 	"math/big"
 	"math/rand"
 	"net"
-	"os"
 	"strings"
 	"sync"
 	"time"
 
 	"aliang.one/nursorgate/common/logger"
-	cert_config "aliang.one/nursorgate/processor/cert"
-	"aliang.one/nursorgate/processor/cert/generator"
 
 	"golang.org/x/net/http2"
 )
 
-var defaultCertificate *tls.Certificate
+// certCache / certAccessTime 是域名证书缓存（按 host 缓存 MITM 签发的叶子证书）。
+// CA 重载时由 CAManager.clearCertCache 整体清空（旧 CA 签的叶子对新 CA 无效）。
 var certCache = sync.Map{}
 var certAccessTime sync.Map // host -> time.Time of last access
-var mu sync.RWMutex
 
 func init() {
 	go func() {
@@ -68,47 +65,11 @@ func buildHostLeafTemplate(host string) x509.Certificate {
 	return template
 }
 
-// LoadMitmCACertificate loads the MITM CA certificate from filesystem
+// LoadMitmCACertificate 返回 MITM CA（委托 CAManager.Get，单一入口）。
+// 保留导出函数名以兼容现有调用方；实际逻辑全部在 CAManager——文件即真相，
+// 内存缓存通过 mtime 校验自动追随文件，CA 重载时联动清空 certCache。
 func LoadMitmCACertificate() (*tls.Certificate, error) {
-	mu.RLock()
-	if defaultCertificate != nil {
-		mu.RUnlock()
-		return defaultCertificate, nil
-	}
-	mu.RUnlock()
-
-	certPath, err := cert_config.GetCertPath(cert_config.CertTypeMitmCA)
-	if err != nil {
-		return nil, fmt.Errorf("failed to resolve MITM CA cert path: %w", err)
-	}
-	keyPath, err := cert_config.GetCertKeyPath(cert_config.CertTypeMitmCA)
-	if err != nil {
-		return nil, fmt.Errorf("failed to resolve MITM CA key path: %w", err)
-	}
-
-	// Check if certificate files exist, if not generate them
-	if _, err := os.Stat(certPath); os.IsNotExist(err) {
-		logger.Warn("MITM CA certificate not found, generating new one")
-		config := cert_config.GetCertConfig("mitm-ca")
-		if config == nil {
-			return nil, fmt.Errorf("MITM CA configuration not found")
-		}
-		if err := generator.GenerateCertificateFromConfig(config, certPath); err != nil {
-			return nil, fmt.Errorf("failed to generate MITM CA certificate: %w", err)
-		}
-	}
-
-	// Load the certificate
-	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load MITM CA certificate: %w", err)
-	}
-
-	mu.Lock()
-	defaultCertificate = &cert
-	mu.Unlock()
-
-	return defaultCertificate, nil
+	return DefaultCAManager().Get()
 }
 
 // creatCertForHost creates a TLS certificate for the specified host signed by the local MITM CA.

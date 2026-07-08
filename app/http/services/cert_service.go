@@ -248,24 +248,18 @@ func (cs *CertService) getCertBytes(certType string) ([]byte, error) {
 	}
 }
 
-// getMitmCACert returns the MITM CA certificate bytes from filesystem
+// getMitmCACert returns the MITM CA certificate bytes.
+// 统一走 CAManager.Get —— 装证书与 MITM 签证书从此读同一个 CA（文件即真相 + mtime
+// 自动追随），不再旁路 os.ReadFile 造成与 MITM 内存缓存不一致。
 func (cs *CertService) getMitmCACert() ([]byte, error) {
-	certPath, err := cert_config.GetCertPath(cert_config.CertTypeMitmCA)
+	caCert, err := client_cert.DefaultCAManager().Get()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to load MITM CA certificate: %w", err)
 	}
-
-	// Check if file exists
-	if _, err := os.Stat(certPath); os.IsNotExist(err) {
-		// Try to generate it through client_cert
-		certBytes, err := client_cert.LoadMitmCACertificate()
-		if err != nil {
-			return nil, fmt.Errorf("failed to load MITM CA certificate: %w", err)
-		}
-		return certBytes.Certificate[0], nil
+	if len(caCert.Certificate) == 0 {
+		return nil, fmt.Errorf("MITM CA certificate has empty chain")
 	}
-
-	return os.ReadFile(certPath)
+	return caCert.Certificate[0], nil
 }
 
 // getMTLSCert returns the mTLS certificate bytes from filesystem
@@ -315,5 +309,13 @@ func (cs *CertService) generateAndExportCert(config *cert_config.CertConfig, cer
 	}
 
 	logger.Debug(fmt.Sprintf("Generated new certificate for %s at %s", config.CertType, certPath))
+
+	// 若生成的是 MITM CA，立即刷新 CAManager：文件已变，让内存追随 + 清空域名证书缓存，
+	// 避免「装证书读新 CA、MITM 还用旧 CA 缓存」的不一致（无需重启进程）。
+	if config.CertType == cert_config.CertTypeMitmCA {
+		if err := client_cert.DefaultCAManager().Reload(); err != nil {
+			logger.Warn(fmt.Sprintf("CAManager reload after regenerating mitm-ca failed: %v", err))
+		}
+	}
 	return nil
 }

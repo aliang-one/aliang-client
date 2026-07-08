@@ -10,6 +10,7 @@ import (
 	"aliang.one/nursorgate/common/cache"
 	"aliang.one/nursorgate/common/logger"
 	cert_config "aliang.one/nursorgate/processor/cert"
+	client_cert "aliang.one/nursorgate/processor/cert/client"
 	"aliang.one/nursorgate/processor/cert/generator"
 )
 
@@ -278,6 +279,13 @@ func (ch *CertHandler) HandleGenerateCert(w http.ResponseWriter, r *http.Request
 		logger.Error(fmt.Sprintf("Failed to generate certificate: %v", err))
 		common.Error(w, common.CodeInternalServer, fmt.Sprintf("Failed to generate certificate: %s", err.Error()), nil)
 		return
+	}
+
+	// 若生成的是 MITM CA，立即刷新 CAManager（文件已变，让内存追随 + 清域名证书缓存）。
+	if config.CertType == cert_config.CertTypeMitmCA {
+		if err := client_cert.DefaultCAManager().Reload(); err != nil {
+			logger.Warn(fmt.Sprintf("CAManager reload after generating mitm-ca failed: %v", err))
+		}
 	}
 
 	common.Success(w, map[string]interface{}{
