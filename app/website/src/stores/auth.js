@@ -218,6 +218,48 @@ export async function logoutUser() {
   }
 }
 
+let sessionEventSource = null;
+
+// connectSessionEvents opens an SSE subscription to /api/session/events so the
+// dashboard reflects identity transitions (login / refresh / soft-expired /
+// hard-invalid / logout) instantly, instead of waiting for the 5s
+// /api/startup/status poll. EventSource auto-reconnects; on reconnect the server
+// re-sends a state snapshot so the UI re-syncs.
+export function connectSessionEvents() {
+  if (sessionEventSource) return;
+  if (typeof window === 'undefined' || typeof window.EventSource === 'undefined') return;
+
+  sessionEventSource = new EventSource('/api/session/events');
+  sessionEventSource.onmessage = (event) => {
+    let payload;
+    try {
+      payload = JSON.parse(event.data);
+    } catch (_) {
+      return;
+    }
+    handleSessionPayload(payload);
+  };
+}
+
+function handleSessionPayload(payload) {
+  const { t } = useI18n();
+  const target = payload.type === 'snapshot' ? payload.state : payload.to;
+
+  if (target === 'active') {
+    // (Re)fetch canonical user info; restoreAuthSession is idempotent
+    // (guarded by restorePending), so the startup snapshot won't double-fetch.
+    void restoreAuthSession();
+  } else if (target === 'soft_expired') {
+    // Degraded but recovering — keep the user visible, surface a notice.
+    state.isReady = true;
+    state.status = 'soft_expired';
+    state.lastActionMessage = t('auth_restoringSession');
+  } else {
+    // hard_invalid / unauthenticated → show the login view.
+    applyUnauthenticatedState(t('auth_pleaseLogin'));
+  }
+}
+
 export function useAuthStore() {
   const { t } = useI18n();
 

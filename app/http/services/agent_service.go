@@ -109,6 +109,22 @@ func (e agentDeviceTokenRejectedError) Error() string {
 	return e.message
 }
 
+// agentUserAuthRejectedError signals that the agent server rejected the USER
+// authorization — a 401 on a call that carried the aliang JWT but no
+// device_token (i.e. the device-register call). It is distinct from
+// agentDeviceTokenRejectedError (device_token rejected) so the caller can
+// recover the session before wiping it: a register 401 may be a stale/expired
+// JWT rather than a truly dead session, and nuking the login on every such 401
+// is what made "login expires very quickly".
+type agentUserAuthRejectedError struct {
+	status int
+	body   string
+}
+
+func (e agentUserAuthRejectedError) Error() string {
+	return fmt.Sprintf("agent server returned %d: %s", e.status, e.body)
+}
+
 func GetSharedAgentService() *AgentService {
 	sharedAgentServiceMu.Lock()
 	defer sharedAgentServiceMu.Unlock()
@@ -279,11 +295,19 @@ func (s *AgentService) enableWithUserContext(authHeader string, userKey string) 
 		return status, err
 	}
 	if err := s.registerAndSyncLockedWithUserContext(authHeader, userKey); err != nil {
+		var authRejectedErr agentUserAuthRejectedError
+		isAuthRejectedErr := errors.As(err, &authRejectedErr)
 		s.state.LastSyncStatus = "enable_failed"
 		s.state.LastSyncMessage = err.Error()
 		_ = s.saveStateLocked()
 		status := s.statusLocked()
 		s.mu.Unlock()
+		// Register-path 401 during an explicit enable: still try a recovery
+		// refresh before letting the session die (the JWT may be stale). Run
+		// outside s.mu — see recoverOrExpireAfterRegisterAuthRejection.
+		if isAuthRejectedErr {
+			s.recoverOrExpireAfterRegisterAuthRejection(err)
+		}
 		return status, err
 	}
 	hasToken := strings.TrimSpace(s.state.DeviceToken) != ""
@@ -441,6 +465,26 @@ func (s *AgentService) SyncNowWithAuthorization(authHeader string) error {
 	return s.SyncNowWithUserContext(authHeader, "")
 }
 
+// shouldBlockBackgroundSyncLocked reports whether a background sync (one with no
+// forwarded JWT) must be skipped because the agent is in a deliberate or
+// server-asserted sticky-disabled state. Caller holds s.mu.
+//
+// This is intentionally a NARROWER check than shouldPreserveDisabledStatus:
+// that one (used by the remote-connection loop) treats a fresh/empty state as
+// "disabled" via normalizeAgentDisableReason, which is harmless there because
+// both loop branches exit anyway. Here it would be wrong — a fresh agent
+// (LastSyncStatus="") must be allowed to perform its first register. So we test
+// the already-normalized stored reason directly: only explicit
+// disable/logout/rejection states block; empty (never synced) does not.
+func (s *AgentService) shouldBlockBackgroundSyncLocked() bool {
+	switch strings.TrimSpace(strings.ToLower(s.state.LastSyncStatus)) {
+	case "disabled", "logout", "auth_expired", "device_token_invalid", "device_unbound":
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *AgentService) SyncNowWithUserContext(authHeader string, userKey string) error {
 	s.mu.Lock()
 	s.ensureDeviceIdentityLocked()
@@ -452,14 +496,40 @@ func (s *AgentService) SyncNowWithUserContext(authHeader string, userKey string)
 		currentAgentServerURL(),
 		IsUserAgentRuntime(),
 	))
+	// A background sync must not undo a deliberate disable (logout / manual /
+	// device_token_invalid / device_unbound / auth_expired) — those states are
+	// sticky until cleared by an explicit action. The one exception is a sync
+	// that carries an explicitly forwarded JWT (authHeader != ""): that means
+	// the dashboard just authenticated the user (login / restore / refresh) and
+	// is the legitimate re-enable signal. A sync with no forwarded JWT falls
+	// back to the agent's OWN cached aliang.data token, which after a logout is
+	// stale — letting it re-register is exactly the "agent reconnects after
+	// logout" self-resurrection. Explicit Enable() bypasses this guard.
+	if strings.TrimSpace(authHeader) == "" && s.shouldBlockBackgroundSyncLocked() {
+		stickyState := normalizeAgentDisableReason(s.state.LastSyncStatus)
+		s.mu.Unlock()
+		logger.Info(fmt.Sprintf("[AGENT-BOOT] sync_now skipped reason=sticky_disabled_no_forwarded_auth state=%s", stickyState))
+		return nil
+	}
 	if err := s.registerAndSyncLockedWithUserContext(authHeader, userKey); err != nil {
 		var deviceTokenErr agentDeviceTokenRejectedError
-		if !errors.As(err, &deviceTokenErr) {
+		var authRejectedErr agentUserAuthRejectedError
+		isDeviceTokenErr := errors.As(err, &deviceTokenErr)
+		isAuthRejectedErr := errors.As(err, &authRejectedErr)
+		// Neither a device-token rejection nor a user-auth rejection is a server
+		// availability problem; leave their dedicated states untouched.
+		if !isDeviceTokenErr && !isAuthRejectedErr {
 			s.state.LastSyncStatus = "server_unavailable"
 			s.state.LastSyncMessage = err.Error()
 			_ = s.saveStateLocked()
 		}
 		s.mu.Unlock()
+		// Register-path 401: try a recovery refresh before letting the session
+		// die. Done outside s.mu — RefreshSession's auth-success hook re-takes
+		// it (ReRegisterIfUserIdentityChanged).
+		if isAuthRejectedErr {
+			s.recoverOrExpireAfterRegisterAuthRejection(err)
+		}
 		logger.Warn(fmt.Sprintf("[AGENT-BOOT] sync_now failed error=%v", err))
 		return err
 	}
@@ -1423,7 +1493,15 @@ func (s *AgentService) callAgentServerWithAuthorization(method string, endpoint 
 				s.handleAgentDeviceTokenRejected(string(raw))
 				return nil, agentDeviceTokenRejectedError{message: fmt.Sprintf("agent server returned %d: %s", resp.StatusCode, string(raw))}
 			} else if authHeader != "" {
-				auth.ExpireLocalSession("agent server rejected user authorization")
+				// Register-path 401: the user JWT was rejected. This MAY be a
+				// stale/expired token rather than a truly dead session, so do
+				// NOT wipe the login here — return a typed error and let the
+				// caller attempt a recovery refresh first
+				// (recoverOrExpireAfterRegisterAuthRejection). Wiping inline
+				// also ran under s.mu, which a recovery refresh cannot do: a
+				// successful RefreshSession fires the auth-success hook whose
+				// handler re-takes s.mu.
+				return nil, agentUserAuthRejectedError{status: resp.StatusCode, body: string(raw)}
 			}
 		}
 		return nil, fmt.Errorf("agent server returned %d: %s", resp.StatusCode, string(raw))
@@ -1449,6 +1527,34 @@ func (s *AgentService) handleAgentDeviceTokenRejected(body string) {
 		detail = fmt.Sprintf("%s Server response: %s", detail, snippet)
 	}
 	go s.disableWithReasonMessage("device_token_invalid", detail)
+}
+
+// registerAuthRecoveryInFlight prevents a register-auth-rejection recovery from
+// recursing into itself. A successful RefreshSession fires the auth-success hook
+// (handleAuthRefreshed → ReRegisterIfUserIdentityChanged → SyncNow); if that
+// re-register 401s again we must NOT start another recovery — that loops
+// refresh→re-register→401→recover→refresh. The try-lock fails for the re-entrant
+// call on the same goroutine stack, so the inner 401 becomes a plain failure
+// resolved by the outer (in-flight) recovery.
+var registerAuthRecoveryInFlight sync.Mutex
+
+// recoverOrExpireAfterRegisterAuthRejection handles a register-path 401 by
+// attempting a recovery refresh before wiping the session. No-op for any error
+// that is not an agentUserAuthRejectedError. MUST run without s.mu held: a
+// successful RefreshSession fires the auth-success hook whose handler
+// re-acquires s.mu (ReRegisterIfUserIdentityChanged).
+func (s *AgentService) recoverOrExpireAfterRegisterAuthRejection(err error) {
+	var rejected agentUserAuthRejectedError
+	if !errors.As(err, &rejected) {
+		return
+	}
+	if !registerAuthRecoveryInFlight.TryLock() {
+		logger.Info("[AGENT-BOOT] register_auth_rejection recovery skipped reason=reentrancy_guarded")
+		return
+	}
+	defer registerAuthRecoveryInFlight.Unlock()
+	logger.Info(fmt.Sprintf("[AGENT-BOOT] register_auth_rejection recovery_begin status=%d", rejected.status))
+	auth.RecoverOrExpireLocalSession("agent server rejected user authorization")
 }
 
 func (s *AgentService) syncAgentInventoryLocked(reason string) error {

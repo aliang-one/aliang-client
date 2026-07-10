@@ -4463,13 +4463,16 @@ func claudeCodeHeadlessSlimArgs() []string {
 	return append(args, "--strict-mcp-config", "--mcp-config", claudeCodeHeadlessEmptyMCP)
 }
 
+// claudeCodeHeadlessSlimEnabled reports whether headless "slim" mode is enabled.
+//
+// 永久停用: slim 会用 --tools 把 built-in tools 砍到 6 个 + 用
+// --strict-mcp-config --mcp-config {} 清空 MCP, 导致 headless 启动的 tools
+// 集合远少于交互式 TUI(实测 6 vs 24+), 被下游网关判定为"非标准 Claude
+// Code"(openclaw)。已验证停用后 tools 恢复到完整 built-in 集。故无视
+// ALIANG_CLAUDE_HEADLESS_SLIM, 一律不启用。若将来确需精简模式, 恢复下方
+// 读 env 的 switch 即可。
 func claudeCodeHeadlessSlimEnabled() bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("ALIANG_CLAUDE_HEADLESS_SLIM"))) {
-	case "1", "true", "on", "yes", "enable", "enabled":
-		return true
-	default:
-		return false
-	}
+	return false
 }
 
 func truthyEnv(key string) bool {

@@ -160,7 +160,7 @@ func TestCallUserCenterAPI_RetainsSessionOnTransient401(t *testing.T) {
 // access token typically expires only because the background refresher missed
 // its lead-time window (e.g. a transient network failure during refresh); that
 // must not escalate to a permanent disable.
-func TestClearLocalSessionAfterExpiredAccessToken_RetainsSessionWhenRefreshSucceeds(t *testing.T) {
+func TestClearLocalSessionAfterExpiredAccessToken_GoesSoftExpiredRetainsSession(t *testing.T) {
 	baseDir, err := os.MkdirTemp("", "aliang-clear-expired-recover-*")
 	if err != nil {
 		t.Fatalf("MkdirTemp() error = %v", err)
@@ -203,23 +203,29 @@ func TestClearLocalSessionAfterExpiredAccessToken_RetainsSessionWhenRefreshSucce
 		t.Fatalf("SaveUserInfo() error = %v", err)
 	}
 
-	expirationFired := false
-	SetAuthExpirationHandler(func() { expirationFired = true })
-	defer SetAuthExpirationHandler(nil)
+	authority := ResetSessionAuthorityForTest()
+	hardInvalidFired := false
+	authority.Subscribe(func(e SessionEvent) {
+		if e.To == StateHardInvalid {
+			hardInvalidFired = true
+		}
+	})
+	authority.NotifyLoggedIn(&UserInfo{}) // session is Active when access is rejected
 
 	clearLocalSessionAfterExpiredAccessToken()
 
-	if expirationFired {
-		t.Fatal("auth expiration handler fired; want no expiration when a recovery refresh succeeds")
+	if hardInvalidFired {
+		t.Fatal("HardInvalid fired; want SoftExpired (recovery is async via the coordinator)")
+	}
+	if authority.State() != StateSoftExpired {
+		t.Fatalf("authority state=%v want SoftExpired", authority.State())
 	}
 	if got := GetCurrentUserInfo(); got == nil {
-		t.Fatal("current user info = nil; want session retained after recovery refresh")
-	} else if got.AccessToken != "fresh-access-token" {
-		t.Fatalf("access token = %q, want fresh-access-token (renewed by recovery refresh)", got.AccessToken)
+		t.Fatal("current user info = nil; want session retained in SoftExpired")
 	}
 	if hasUserInfo, err := HasPersistedUserInfo(); err != nil {
 		t.Fatalf("HasPersistedUserInfo() error = %v", err)
 	} else if !hasUserInfo {
-		t.Fatal("expected persisted user info to be retained after recovery refresh")
+		t.Fatal("expected persisted user info retained in SoftExpired")
 	}
 }

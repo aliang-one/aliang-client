@@ -147,6 +147,8 @@ func finalizeAuthenticatedSession(accessToken, refreshToken, tokenType string, e
 	config.SetUsingDefaultConfig(false)
 	config.SetHasLocalUserInfo(true)
 
+	GetSessionAuthority().NotifyLoggedIn(userInfo)
+
 	return userInfo, nil
 }
 
@@ -336,6 +338,7 @@ func RefreshSession(refreshToken string) (*UserInfo, error) {
 	// push it to PhoneServer (agent.session.refresh) — keeping the server's
 	// recorded session expiry current without a reconnect.
 	notifyAuthSuccessHandler()
+	GetSessionAuthority().NotifyRefreshed(userInfo)
 
 	return userInfo, nil
 }

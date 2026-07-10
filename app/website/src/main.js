@@ -1,7 +1,7 @@
 import { createApp } from 'vue';
 import App from './App.vue';
 import '../assets/styles.css';
-import { restoreAuthSession } from './stores/auth';
+import { restoreAuthSession, connectSessionEvents } from './stores/auth';
 import { initializeTheme } from './composables/useTheme';
 
 function bootstrap() {
@@ -12,6 +12,9 @@ function bootstrap() {
   // state until the auth store flips isReady.
   createApp(App).mount('#app');
   void restoreAuthSession();
+  // Subscribe to identity-transition SSE so login/expiry/recovery reflect
+  // instantly (coexists with the restoreAuthSession fetch above and the 5s poll).
+  connectSessionEvents();
 }
 
 bootstrap();

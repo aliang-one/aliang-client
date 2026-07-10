@@ -1,8 +1,6 @@
 package services
 
 import (
-	"fmt"
-
 	"aliang.one/nursorgate/common/desktop"
 	"aliang.one/nursorgate/common/logger"
 	auth "aliang.one/nursorgate/processor/auth"
@@ -10,8 +8,54 @@ import (
 )
 
 func init() {
-	auth.SetAuthExpirationHandler(handleAuthExpired)
+	auth.GetSessionAuthority().Subscribe(onSessionEvent)
 	auth.SetAuthSuccessHandler(handleAuthRefreshed)
+}
+
+var (
+	// softExpiryRecoveryStarter begins the SoftExpired recovery loop. Injectable
+	// for tests. Defaults to auth.StartSoftExpiryRecovery.
+	softExpiryRecoveryStarter = auth.StartSoftExpiryRecovery
+	// proxyPausedForSoftExpiry records that WE paused the ingress proxy on
+	// entering SoftExpired, so →Active resumes only what we paused (not a proxy
+	// the user never started).
+	proxyPausedForSoftExpiry bool
+)
+
+// onSessionEvent fans session-state transitions out to subsystems (the migration
+// target of the old single authExpirationHandler, now extended to SoftExpired).
+//
+//   - →SoftExpired: pause the ingress proxy (no forwarding with a rejected
+//     token — closes 缺口 B) and start the bounded recovery coordinator.
+//   - →Active: mark the session ready; if we paused the proxy for SoftExpired,
+//     resume it.
+//   - →HardInvalid (non-logout): stop the proxy + clear UI state + notify.
+//     Logout is skipped here — AuthService.LogoutUser owns its own teardown, and
+//     the "认证已过期" wording would be wrong for a user-initiated logout.
+func onSessionEvent(e auth.SessionEvent) {
+	switch e.To {
+	case auth.StateSoftExpired:
+		if GetSharedRunService().StopIngressIfActive() {
+			proxyPausedForSoftExpiry = true
+			logger.Warn("SoftExpired: ingress proxy paused while access token is recovered")
+		}
+		softExpiryRecoveryStarter()
+	case auth.StateActive:
+		startupState := runtime.GetStartupState()
+		startupState.SetFetchSuccess(true)
+		startupState.SetStatus(runtime.READY)
+		if proxyPausedForSoftExpiry {
+			proxyPausedForSoftExpiry = false
+			logger.Info("session recovered: resuming ingress proxy")
+			GetSharedRunService().StartService()
+		}
+	case auth.StateHardInvalid:
+		proxyPausedForSoftExpiry = false
+		if e.Reason == auth.ReasonLogout {
+			return
+		}
+		handleAuthExpired()
+	}
 }
 
 func handleAuthExpired() {
@@ -34,11 +78,15 @@ func handleAuthExpired() {
 	// deregisters now (AuthService.logout → /api/agent/disable "logout").
 
 	runService := GetSharedRunService()
-	if runService.IsRunning() {
-		logger.Warn("Authentication expired, stopping running proxy service")
+	// Stop the ingress proxy based on its REAL listener state, not the
+	// runService.isRunning flag — that flag can desync to false (mode switch,
+	// daemon restart, activation rollback) while 56432 is still bound, which
+	// previously left the proxy serving a dead token (cloud returning 401).
+	if runService.StopIngressIfActive() {
+		logger.Warn("Authentication expired, stopping ingress proxy")
 		desktop.Notify("aliang-gateway", "认证已过期，代理服务已停止，请重新登录")
-		result := runService.StopService()
-		logger.Info(fmt.Sprintf("Proxy stop result after authentication expiration: %+v", result))
+	} else {
+		logger.Debug("Authentication expired; no active ingress proxy to stop")
 	}
 }
 

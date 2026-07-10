@@ -144,6 +144,10 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	register("/api/auth/scan/status", h.Auth.HandleScanStatus, http.MethodGet)
 	register("/api/auth/scan/activate", h.Auth.HandleScanActivate, http.MethodPost)
 
+	// Session-events SSE stream for the dashboard: pushes identity transitions
+	// (login/refresh/soft-expired/hard-invalid/logout) instantly to the browser.
+	register("/api/session/events", services.ServeSessionEvents, http.MethodGet)
+
 	// Run mode routes (/api/run/*)
 	register("/api/run/start", h.Run.HandleRunStart, http.MethodPost)
 	register("/api/run/stop", h.Run.HandleRunStop, http.MethodPost)

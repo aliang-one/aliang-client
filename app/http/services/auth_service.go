@@ -306,6 +306,7 @@ func (s *AuthService) LogoutUser(refreshToken string) map[string]interface{} {
 
 	clearStartupStateAfterLogout()
 	RequestUserAgentDisableAfterLogout("logout")
+	auth.GetSessionAuthority().NotifyLoggedOut()
 
 	logger.Info("User logged out successfully")
 

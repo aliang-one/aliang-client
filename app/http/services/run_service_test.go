@@ -82,6 +82,7 @@ func resetRunServiceHooksForTest() {
 	httpStartRunner = func() {}
 	httpStopRunner = func() {}
 	tunStopRunner = func() {}
+	httpProxyIsRunningProbe = func() bool { return false }
 	runModeStoreFactory = func() runModeSnapshotStore { return storage.NewSoftwareConfigStore() }
 	aliangLinkStatusResolver = resolveAliangLinkStatus
 	softwareUpdateStatusResolver = func() models.SoftwareVersionUpdateFrontendStatus {
@@ -511,5 +512,103 @@ func TestRunServiceGetAliangLinkStatus(t *testing.T) {
 	}
 	if !calls[1] {
 		t.Fatalf("expected second resolver call to be probe mode")
+	}
+}
+
+// TestStopIngressIfActiveStopsDespiteRunningFlagDesync reproduces the
+// auth-expiry bug observed in aliang_core.log: runService.isRunning had
+// desynced to false (after a mode switch / restart / rollback) while the HTTP
+// proxy listener (56432) was still up, so handleAuthExpired's
+// "if IsRunning()" guard skipped the stop and 56432 kept serving a dead token.
+// The fix must stop based on the REAL listener state, not the flag.
+func TestStopIngressIfActiveStopsDespiteRunningFlagDesync(t *testing.T) {
+	defer resetRunServiceHooksForTest()
+
+	var httpStops, tunStops int
+	httpStopRunner = func() { httpStops++ }
+	tunStopRunner = func() { tunStops++ }
+	// The real listener is up even though the flag says otherwise.
+	httpProxyIsRunningProbe = func() bool { return true }
+
+	rs := NewRunService()
+	rs.SetCurrentMode(string(models.ModeHTTP))
+	rs.SetRunning(false) // desynced: flag=false, listener=true
+
+	stopped := rs.StopIngressIfActive()
+
+	if !stopped {
+		t.Fatal("expected ingress torn down despite isRunning=false (listener still up)")
+	}
+	if httpStops != 1 {
+		t.Fatalf("expected httpStopRunner called once in http mode, got %d", httpStops)
+	}
+	if tunStops != 0 {
+		t.Fatalf("expected tunStopRunner NOT called in http mode, got %d", tunStops)
+	}
+	if rs.IsRunning() {
+		t.Fatal("expected isRunning to remain false after stop")
+	}
+}
+
+func TestStopIngressIfActiveUsesTunStopperInTunModeEvenWhenDesynced(t *testing.T) {
+	defer resetRunServiceHooksForTest()
+
+	var httpStops, tunStops int
+	httpStopRunner = func() { httpStops++ }
+	tunStopRunner = func() { tunStops++ }
+	httpProxyIsRunningProbe = func() bool { return true }
+
+	rs := NewRunService()
+	rs.SetCurrentMode(string(models.ModeTUN))
+	rs.SetRunning(false) // desynced
+
+	if !rs.StopIngressIfActive() {
+		t.Fatal("expected ingress torn down in tun mode despite isRunning=false")
+	}
+	if tunStops != 1 {
+		t.Fatalf("expected tunStopRunner called once in tun mode, got %d", tunStops)
+	}
+	if httpStops != 0 {
+		t.Fatalf("expected httpStopRunner NOT called directly in tun mode, got %d", httpStops)
+	}
+}
+
+func TestStopIngressIfActiveNoopWhenNothingRunning(t *testing.T) {
+	defer resetRunServiceHooksForTest()
+
+	httpStopRunner = func() { t.Fatal("httpStopRunner must not be called when nothing is running") }
+	tunStopRunner = func() { t.Fatal("tunStopRunner must not be called when nothing is running") }
+	httpProxyIsRunningProbe = func() bool { return false }
+
+	rs := NewRunService()
+	rs.SetCurrentMode(string(models.ModeHTTP))
+	rs.SetRunning(false)
+
+	if rs.StopIngressIfActive() {
+		t.Fatal("expected no stop when neither flag nor listener is active")
+	}
+}
+
+// TestStopIngressIfActiveStillStopsOnNormalRunningCase guards the non-desync
+// path so the fix does not regress the ordinary expiry-while-running case.
+func TestStopIngressIfActiveStillStopsOnNormalRunningCase(t *testing.T) {
+	defer resetRunServiceHooksForTest()
+
+	var httpStops int
+	httpStopRunner = func() { httpStops++ }
+	httpProxyIsRunningProbe = func() bool { return false } // listener state irrelevant when flag is authoritative
+
+	rs := NewRunService()
+	rs.SetCurrentMode(string(models.ModeHTTP))
+	rs.SetRunning(true)
+
+	if !rs.StopIngressIfActive() {
+		t.Fatal("expected ingress torn down when isRunning=true")
+	}
+	if httpStops != 1 {
+		t.Fatalf("expected httpStopRunner called once, got %d", httpStops)
+	}
+	if rs.IsRunning() {
+		t.Fatal("expected isRunning=false after stop")
 	}
 }

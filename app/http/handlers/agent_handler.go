@@ -392,3 +392,23 @@ func writeAgentServiceError(w http.ResponseWriter, message string, err error) {
 		common.ErrorInternalServer(w, message, details)
 	}
 }
+
+// HandleSessionEvent applies a forwarded session transition (from the dashboard
+// authority) to the user-agent connection lifecycle.
+// POST /api/agent/session-event {to, reason}
+func (h *AgentHandler) HandleSessionEvent(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
+		return
+	}
+	var req struct {
+		To     string `json:"to"`
+		Reason string `json:"reason"`
+	}
+	if err := common.DecodeRequest(r, &req); err != nil {
+		common.ErrorBadRequest(w, "Invalid request format", nil)
+		return
+	}
+	h.service.ApplySessionEvent(req.To, req.Reason)
+	common.Success(w, map[string]interface{}{"status": "ok"})
+}

@@ -16,9 +16,6 @@ var ErrRefreshTokenInvalid = errors.New("refresh token invalid")
 var ErrSessionExpired = errors.New("auth session expired")
 
 var (
-	authExpirationHandlerMu sync.RWMutex
-	authExpirationHandler   func()
-
 	authSuccessHandlerMu sync.RWMutex
 	authSuccessHandler   func()
 )
@@ -124,17 +121,28 @@ func clearLocalSessionAfterExpiredAccessToken() {
 	// refreshing renews the access token and the session survives — no
 	// auth_expired, no forced re-login, no agent going offline. Only when the
 	// refresh genuinely fails do we treat the session as expired.
-	if refreshed, err := RefreshSession(""); err == nil && refreshed != nil {
-		logger.Warn("access token expired but recovery refresh succeeded; retaining session (no auth_expired)")
-		return
+	RecoverOrExpireLocalSession("expired access token")
+}
+
+// RecoverOrExpireLocalSession signals that the cloud rejected the access token
+// (e.g. agent device-register 401, user-center access-token 401). The session
+// enters SoftExpired: the ingress proxy is paused (no forwarding with a rejected
+// token — closes 缺口 B) and the recovery coordinator renews the token async
+// (→ Active on success, → HardInvalid on permanent failure / timeout).
+//
+// MUST NOT be called while the caller holds a lock that the SoftExpired listener
+// re-acquires: onSessionEvent(StateSoftExpired) calls runService.StopIngressIfActive
+// (runService mutex). Recovery itself runs in a goroutine and does not block the caller.
+func RecoverOrExpireLocalSession(reason string) {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "expired access token"
 	}
-	// RefreshSession may have already wiped the session if the refresh token was
-	// invalid (its own invalid-token path clears the session). Avoid double
-	// wiping / double-firing the auth-expired side effects in that case.
-	if GetCurrentUserInfoOrLoad() == nil {
-		return
-	}
-	clearLocalSessionAfterExpiration("expired access token")
+	GetSessionAuthority().NotifyAccessRejected(reason)
+	// Trigger recovery directly (not only via the authority listener) so the
+	// recoverable case is robust to the authority's current state. Single-flight
+	// guards a duplicate start if the SoftExpired listener also fires.
+	StartSoftExpiryRecovery()
 }
 
 func ExpireLocalSession(reason string) {
@@ -155,7 +163,7 @@ func clearLocalSessionAfterExpiration(reason string) {
 
 	config.SetHasLocalUserInfo(false)
 	logger.Info(fmt.Sprintf("Local auth session cleared after %s", reason))
-	notifyAuthExpirationHandler()
+	GetSessionAuthority().NotifyRefreshFailed(true, sessionReasonFromWipeReason(reason))
 	logger.Warn("Authentication expired - proxy service should be stopped")
 }
 
@@ -167,22 +175,6 @@ func stringValue(value any) string {
 		return fmt.Sprintf("%.0f", typed)
 	default:
 		return ""
-	}
-}
-
-func SetAuthExpirationHandler(handler func()) {
-	authExpirationHandlerMu.Lock()
-	defer authExpirationHandlerMu.Unlock()
-	authExpirationHandler = handler
-}
-
-func notifyAuthExpirationHandler() {
-	authExpirationHandlerMu.RLock()
-	handler := authExpirationHandler
-	authExpirationHandlerMu.RUnlock()
-
-	if handler != nil {
-		handler()
 	}
 }
 

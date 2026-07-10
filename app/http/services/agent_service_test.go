@@ -854,6 +854,216 @@ func TestAgentServiceDeviceTokenUnauthorizedDisablesAgent(t *testing.T) {
 	t.Fatalf("status after device token rejection = %#v, want disabled and unbound", service.Status())
 }
 
+// TestAgentServiceSyncDoesNotResurrectAfterLogoutWithoutForwardedJwt locks in
+// the fix for "user logs out but the agent reconnects on its own". After a
+// logout the agent is sticky-disabled (LastSyncStatus=logout, device_token
+// cleared). The agent subprocess still holds a cached JWT in its own aliang.data
+// / in-memory copy (the dashboard's DeleteUserInfo does not reach it). A
+// background sync (startup_sync / watchdog respawn / in-flight post-logout sync)
+// arrives with NO forwarded JWT — the dashboard is logged out. That sync must
+// NOT re-register the device. Only an explicitly forwarded JWT (a fresh login)
+// may clear the sticky logout state.
+func TestAgentServiceSyncDoesNotResurrectAfterLogoutWithoutForwardedJwt(t *testing.T) {
+	t.Setenv("ALIANG_DATA_DIR", t.TempDir())
+	t.Setenv("ALIANG_CACHE_DIR", t.TempDir())
+	cache.ResetCacheDirForTest()
+	auth.ResetAuthPersistenceForTest()
+	config.ResetGlobalConfigForTest()
+	t.Cleanup(func() {
+		auth.ResetAuthPersistenceForTest()
+		config.ResetGlobalConfigForTest()
+	})
+
+	registerCalled := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/api/devices/register" {
+			registerCalled = true
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"code": 0,
+			"data": map[string]interface{}{
+				"device_token": "dt_resurrected",
+				"device_id":    "dev_resurrected",
+			},
+		})
+	}))
+	defer server.Close()
+	config.SetGlobalConfig(&config.Config{Core: &config.CoreConfig{AgentServer: server.URL, APIServer: server.URL}})
+
+	service := NewAgentService()
+	// Simulate a previously-registered, online device.
+	service.mu.Lock()
+	service.ensureDeviceIdentityLocked()
+	service.state.Enabled = true
+	service.state.Registered = true
+	service.state.DeviceToken = "dt_before_logout"
+	service.state.LastSyncStatus = "online"
+	_ = service.saveStateLocked()
+	service.mu.Unlock()
+
+	// User logs out: agent is disabled, device_token cleared, sticky "logout".
+	service.DisableWithReason("logout")
+
+	// The agent subprocess still holds a cached JWT (its aliang.data / in-memory
+	// copy was not cleared by the dashboard's logout).
+	if err := auth.SaveUserInfo(&auth.UserInfo{
+		AccessToken:  "stale_access_after_logout",
+		RefreshToken: "stale_refresh_after_logout",
+		TokenType:    "Bearer",
+	}); err != nil {
+		t.Fatalf("SaveUserInfo() error = %v", err)
+	}
+
+	// Background sync with NO forwarded JWT — the post-logout self-resurrection
+	// path (authHeader falls back to the agent's own stale cached JWT).
+	if err := service.SyncNow(); err != nil {
+		t.Fatalf("SyncNow() error = %v", err)
+	}
+
+	if registerCalled {
+		t.Fatal("register endpoint was called after logout without a forwarded JWT — agent must not self-resurrect via a stale cached JWT")
+	}
+	status := service.Status()
+	if status.Enabled || status.Registered || status.Bound {
+		t.Fatalf("agent resurrected after logout: %#v, want sticky-disabled", status)
+	}
+}
+
+// TestAgentServiceSyncReRegistersAfterLogoutWithForwardedJwt is the companion
+// invariant: a sync that carries an explicitly forwarded JWT (the dashboard just
+// authenticated the user again) MUST still clear the sticky logout state and
+// re-register. Otherwise the logout fix would also break re-login.
+func TestAgentServiceSyncReRegistersAfterLogoutWithForwardedJwt(t *testing.T) {
+	t.Setenv("ALIANG_DATA_DIR", t.TempDir())
+	t.Setenv("ALIANG_CACHE_DIR", t.TempDir())
+	cache.ResetCacheDirForTest()
+	auth.ResetAuthPersistenceForTest()
+	config.ResetGlobalConfigForTest()
+	t.Cleanup(func() {
+		auth.ResetAuthPersistenceForTest()
+		config.ResetGlobalConfigForTest()
+	})
+
+	registerCalled := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/api/devices/register" {
+			registerCalled = true
+			if got := r.Header.Get("Authorization"); got != "Bearer fresh_jwt_on_relogin" {
+				t.Errorf("Authorization = %q, want Bearer fresh_jwt_on_relogin", got)
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"code": 0,
+			"data": map[string]interface{}{
+				"device_token": "dt_relogin",
+				"device_id":    "dev_relogin",
+			},
+		})
+	}))
+	defer server.Close()
+	config.SetGlobalConfig(&config.Config{Core: &config.CoreConfig{AgentServer: server.URL, APIServer: server.URL}})
+
+	service := NewAgentService()
+	service.DisableWithReason("logout")
+
+	if err := service.SyncNowWithUserContext("Bearer fresh_jwt_on_relogin", ""); err != nil {
+		t.Fatalf("SyncNowWithUserContext() error = %v", err)
+	}
+	if !registerCalled {
+		t.Fatal("register endpoint was not called for a re-login sync with a forwarded JWT")
+	}
+	status := service.Status()
+	if !status.Enabled || !status.Registered {
+		t.Fatalf("agent not re-registered after re-login sync: %#v", status)
+	}
+}
+
+// TestAgentServiceRegisterAuth401RecoversSessionBeforeWiping locks in the fix
+// for "login expires very quickly". When the agent server returns 401 on the
+// register call, the local user session must NOT be wiped immediately — a
+// recovery refresh should be attempted first (the 401 may be a stale/expired
+// JWT, not a truly dead session). Here the refresh token is still valid, so the
+// session must survive.
+func TestAgentServiceRegisterAuth401RecoversSessionBeforeWiping(t *testing.T) {
+	t.Setenv("ALIANG_DATA_DIR", t.TempDir())
+	t.Setenv("ALIANG_CACHE_DIR", t.TempDir())
+	cache.ResetCacheDirForTest()
+	auth.ResetAuthPersistenceForTest()
+	config.ResetGlobalConfigForTest()
+	t.Cleanup(func() {
+		auth.ResetAuthPersistenceForTest()
+		config.ResetGlobalConfigForTest()
+	})
+
+	if err := auth.SaveUserInfo(&auth.UserInfo{
+		AccessToken:  "access_about_to_be_rejected",
+		RefreshToken: "refresh_still_valid",
+		TokenType:    "Bearer",
+		ExpiresIn:    3600,
+	}); err != nil {
+		t.Fatalf("SaveUserInfo() error = %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/devices/register":
+			// Agent server rejects the (stale) user JWT.
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"error": "authentication_required"})
+		case "/api/v1/auth/refresh":
+			// But the refresh token is still valid → session is recoverable.
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"data": map[string]interface{}{
+					"access_token":  "access_recovered",
+					"refresh_token": "refresh_rotated",
+					"expires_in":    3600,
+					"token_type":    "Bearer",
+				},
+			})
+		case "/api/v1/user/profile":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"data": map[string]interface{}{
+					"id": "1", "email": "x@y.z", "username": "x", "role": "admin", "status": "active",
+				},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	config.SetGlobalConfig(&config.Config{Core: &config.CoreConfig{AgentServer: server.URL, APIServer: server.URL}})
+
+	// Mirror the real flow: login precedes any register-401, so the authority is
+	// Active when access is rejected (otherwise NotifyAccessRejected no-ops and
+	// the SoftExpired coordinator bails before refreshing). Do NOT reset the
+	// authority — its init-registered listeners must stay attached.
+	auth.GetSessionAuthority().NotifyLoggedIn(&auth.UserInfo{})
+
+	service := NewAgentService()
+	// SyncNow triggers register → 401 → RecoverOrExpire → SoftExpired + async
+	// recovery. The recovery refresh succeeds, so the session must survive with
+	// a renewed token (recovery runs in a goroutine; poll for it).
+	_ = service.SyncNow()
+
+	deadline := time.Now().Add(3 * time.Second)
+	var recovered *auth.UserInfo
+	for time.Now().Before(deadline) {
+		if u := auth.GetCurrentUserInfoOrLoad(); u != nil && u.AccessToken == "access_recovered" {
+			recovered = u
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if recovered == nil {
+		t.Fatal("session was not recovered after a register 401 with a valid refresh token — recovery refresh did not complete (session should survive, not wipe)")
+	}
+}
+
 func TestRequestUserAgentSyncAfterAuthRequestsLocalUserAgentWithUserAuthorization(t *testing.T) {
 	t.Setenv("ALIANG_DATA_DIR", t.TempDir())
 	cache.ResetCacheDirForTest()
@@ -1890,7 +2100,7 @@ func TestResolveNamedAgentAIToolDoesNotSlimClaudeHeadlessByDefault(t *testing.T)
 	}
 }
 
-func TestResolveNamedAgentAIToolClaudeHeadlessSlimCanBeEnabled(t *testing.T) {
+func TestResolveNamedAgentAIToolClaudeHeadlessSlimStaysDisabledEvenWhenEnvSet(t *testing.T) {
 	binDir := t.TempDir()
 	claudeName := "claude"
 	script := "#!/bin/sh\n"
@@ -1903,6 +2113,8 @@ func TestResolveNamedAgentAIToolClaudeHeadlessSlimCanBeEnabled(t *testing.T) {
 		t.Fatalf("write fake claude: %v", err)
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	// slim 已永久停用(会把 tools 砍到 6 个、清空 MCP, 导致被网关判为 openclaw):
+	// 即使 env 显式开启, 也不应再注入 --tools / --strict-mcp-config。
 	t.Setenv("ALIANG_CLAUDE_HEADLESS_SLIM", "1")
 	t.Setenv("ALIANG_CLAUDE_HEADLESS_TOOLS", "")
 	t.Setenv("ALIANG_CLAUDE_HEADLESS_ENABLE_MCP", "")
@@ -1912,11 +2124,8 @@ func TestResolveNamedAgentAIToolClaudeHeadlessSlimCanBeEnabled(t *testing.T) {
 		t.Fatalf("resolveNamedAgentAITool() error = %v", err)
 	}
 	got := strings.Join(tool.args, " ")
-	if !strings.Contains(got, "--tools "+claudeCodeHeadlessDefaultTools) {
-		t.Fatalf("claude args = %q, want slim tools allowlist when enabled", got)
-	}
-	if !strings.Contains(got, "--strict-mcp-config --mcp-config "+claudeCodeHeadlessEmptyMCP) {
-		t.Fatalf("claude args = %q, want empty MCP config when enabled", got)
+	if strings.Contains(got, "--tools") || strings.Contains(got, "--strict-mcp-config") {
+		t.Fatalf("claude args = %q, want NO slim flags even with ALIANG_CLAUDE_HEADLESS_SLIM=1 (slim disabled to keep full tool set)", got)
 	}
 }
 

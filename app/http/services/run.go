@@ -28,6 +28,12 @@ var (
 	httpStartRunner              = httpServer.StartMitmHttp
 	httpStopRunner               = httpServer.StopHttpProxy
 	tunStopRunner                = runner2.Stop
+	// httpProxyIsRunningProbe reports whether the HTTP proxy listener (56432) is
+	// actually accepting connections. Injectable for tests. The auth-expiry stop
+	// path keys off this rather than runService.isRunning, so a desynced flag
+	// (after a mode switch / daemon restart / activation rollback) cannot leave a
+	// live proxy serving a dead token.
+	httpProxyIsRunningProbe      = httpServer.IsHttpRunning
 	runModeStoreFactory          = func() runModeSnapshotStore { return storage.NewSoftwareConfigStore() }
 	aliangLinkStatusResolver     = resolveAliangLinkStatus
 	softwareUpdateStatusResolver = func() models.SoftwareVersionUpdateFrontendStatus {
@@ -268,6 +274,35 @@ func (rs *RunService) StopService() map[string]interface{} {
 	}
 
 	return response
+}
+
+// StopIngressIfActive tears down the ingress proxy when the user session
+// hard-expires. Unlike StopService, it stops based on the REAL listener state
+// (httpProxyIsRunningProbe), so it still closes 56432 when runService.isRunning
+// has desynced to false after a mode switch, daemon restart, or activation
+// rollback. Returns whether anything was stopped.
+func (rs *RunService) StopIngressIfActive() bool {
+	rs.modeChangeMutex.Lock()
+	mode := rs.currentMode
+	wasRunning := rs.isRunning
+	rs.modeChangeMutex.Unlock()
+
+	// Stop based on the REAL listener state. The runService.isRunning flag can
+	// desync false after a mode switch, daemon restart, or activation rollback
+	// while 56432 is still bound — keying off only the flag leaves the proxy
+	// serving a dead token (forwarding to a cloud that returns 401).
+	if !wasRunning && !httpProxyIsRunningProbe() {
+		return false
+	}
+
+	switch mode {
+	case models.ModeTUN:
+		tunStopRunner()
+	default:
+		httpStopRunner()
+	}
+	rs.SetRunning(false)
+	return true
 }
 
 // GetStatus returns the current service status
