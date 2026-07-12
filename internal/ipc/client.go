@@ -145,6 +145,8 @@ func (c *Client) sendHTTP(action string, args interface{}) (*Response, error) {
 		// Core doesn't have HTTP start endpoint in current implementation
 		// This is handled via IPC
 		return nil, fmt.Errorf("start_http must use IPC")
+	case ActionSyncAgentAuth:
+		return nil, fmt.Errorf("sync_agent_auth must use IPC")
 	case ActionStopHTTP:
 		return nil, fmt.Errorf("stop_http must use IPC")
 	case ActionGetStatus:

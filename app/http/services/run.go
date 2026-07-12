@@ -22,12 +22,12 @@ import (
 )
 
 var (
-	activeIngressModeResolver    = activeIngressModeFromSnapshot
-	applyIngressModeUpdater      = applyIngressModeToSnapshot
-	tunStartRunner               = defaultStartTUN
-	httpStartRunner              = httpServer.StartMitmHttp
-	httpStopRunner               = httpServer.StopHttpProxy
-	tunStopRunner                = runner2.Stop
+	activeIngressModeResolver = activeIngressModeFromSnapshot
+	applyIngressModeUpdater   = applyIngressModeToSnapshot
+	tunStartRunner            = defaultStartTUN
+	httpStartRunner           = httpServer.StartMitmHttp
+	httpStopRunner            = httpServer.StopHttpProxy
+	tunStopRunner             = runner2.Stop
 	// httpProxyIsRunningProbe reports whether the HTTP proxy listener (56432) is
 	// actually accepting connections. Injectable for tests. The auth-expiry stop
 	// path keys off this rather than runService.isRunning, so a desynced flag
@@ -160,6 +160,18 @@ func (rs *RunService) StartService() map[string]interface{} {
 	}
 
 	rs.modeChangeMutex.Lock()
+	// Re-check after acquiring the mode lock. Logout closes the startup gate
+	// before taking this lock; without this second check, a start request that
+	// observed READY earlier could wait for logout to stop ingress and then start
+	// it again immediately afterwards.
+	if !canStartProxyWithStatus(runtime.GetStartupState().GetStatus()) {
+		rs.modeChangeMutex.Unlock()
+		return map[string]interface{}{
+			"error":  "activation_required",
+			"status": "failed",
+			"msg":    "系统尚未准备好启动代理，请先完成登录或配置恢复。",
+		}
+	}
 
 	// Check if already running
 	if rs.isRunning {
@@ -303,6 +315,26 @@ func (rs *RunService) StopIngressIfActive() bool {
 	}
 	rs.SetRunning(false)
 	return true
+}
+
+// StopIngressForLogout force-stops the authoritative ingress mode without
+// trusting isRunning or an HTTP-only listener probe. Explicit logout is a
+// security boundary: a desynchronized TUN runtime must be stopped even when the
+// generic activity checks claim nothing is running.
+func (rs *RunService) StopIngressForLogout() models.RunMode {
+	rs.modeChangeMutex.Lock()
+	mode := rs.resolveAuthoritativeModeLocked()
+	rs.isRunning = false
+	rs.modeChangeMutex.Unlock()
+
+	switch mode {
+	case models.ModeTUN:
+		tunStopRunner()
+	default:
+		mode = models.ModeHTTP
+		httpStopRunner()
+	}
+	return mode
 }
 
 // GetStatus returns the current service status

@@ -45,6 +45,7 @@ func runCore(cmd *cobra.Command, args []string) error {
 
 func runCoreWithContext(ctx context.Context) error {
 	ensureCoreRuntimeEnvironment()
+	auth.SetSessionOwnerProcess(true)
 
 	logger.Info("========================================")
 	logger.Info("Starting Aliang Core Daemon")
@@ -182,12 +183,20 @@ func initializeCoreRuleEngine() error {
 func registerIPCHandlers(s *ipc.Server) {
 	s.Register(ipc.ActionPing, handlePing)
 	s.Register(ipc.ActionStartHTTP, handleStartHTTP)
+	s.Register(ipc.ActionSyncAgentAuth, handleSyncAgentAuth)
 	s.Register(ipc.ActionStopHTTP, handleStopHTTP)
 	s.Register(ipc.ActionGetStatus, handleGetStatus)
 	s.Register(ipc.ActionStartProxy, handleStartProxy)
 	s.Register(ipc.ActionStopProxy, handleStopProxy)
 	s.Register(ipc.ActionSwitchMode, handleSwitchMode)
 	s.Register(ipc.ActionShutdown, handleShutdown)
+}
+
+func handleSyncAgentAuth(_ json.RawMessage) (interface{}, error) {
+	if err := services.RequestUserAgentSyncAfterAuth("agent_started"); err != nil {
+		return nil, err
+	}
+	return map[string]interface{}{"status": "synced"}, nil
 }
 
 func handlePing(_ json.RawMessage) (interface{}, error) {

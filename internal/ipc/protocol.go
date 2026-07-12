@@ -25,14 +25,15 @@ type Event struct {
 
 // Action handlers
 const (
-	ActionPing        = "ping"
-	ActionStartHTTP   = "start_http"
-	ActionStopHTTP    = "stop_http"
-	ActionGetStatus   = "get_status"
-	ActionStartProxy  = "start_proxy"
-	ActionStopProxy   = "stop_proxy"
-	ActionSwitchMode  = "switch_mode"
-	ActionShutdown    = "shutdown"
+	ActionPing          = "ping"
+	ActionStartHTTP     = "start_http"
+	ActionSyncAgentAuth = "sync_agent_auth"
+	ActionStopHTTP      = "stop_http"
+	ActionGetStatus     = "get_status"
+	ActionStartProxy    = "start_proxy"
+	ActionStopProxy     = "stop_proxy"
+	ActionSwitchMode    = "switch_mode"
+	ActionShutdown      = "shutdown"
 )
 
 // StatusResponse represents the status returned by get_status.

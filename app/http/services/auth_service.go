@@ -9,11 +9,35 @@ import (
 	"aliang.one/nursorgate/app/http/models"
 	"aliang.one/nursorgate/common/logger"
 	auth "aliang.one/nursorgate/processor/auth"
+	"aliang.one/nursorgate/processor/config"
 	"aliang.one/nursorgate/processor/runtime"
 )
 
 // AuthService 认证服务
 type AuthService struct{}
+
+var remoteLogoutDispatch = auth.LogoutSession
+
+func teardownLocalSessionAfterLogout() {
+	auth.StopTokenRefresh()
+	// Close the activation gate before touching the runtime. StartService checks
+	// this state again after taking its mode lock, so an in-flight start request
+	// cannot restart ingress after the logout stopper releases the lock.
+	config.SetHasLocalUserInfo(false)
+	clearStartupStateAfterLogout()
+	stoppedMode := GetSharedRunService().StopIngressForLogout()
+	logger.Info(fmt.Sprintf("User logout stopped %s ingress", stoppedMode))
+	if err := auth.DeleteUserInfo(); err != nil {
+		logger.Warn(fmt.Sprintf("Failed to delete user info: %v", err))
+		auth.SetCurrentUserInfo(nil)
+	}
+	// Force-broadcasts even when already HardInvalid. Listeners repeat the proxy
+	// stop idempotently and synchronously disable the user-agent connection.
+	auth.GetSessionAuthority().NotifyLoggedOut()
+	// Retry asynchronously in addition to the structured session event. Both
+	// paths are idempotent; this covers a short user-agent restart race.
+	RequestUserAgentDisableAfterLogout("logout")
+}
 
 // NewAuthService 创建新的认证服务实例
 func NewAuthService() *AuthService {
@@ -293,20 +317,25 @@ func (s *AuthService) ActivateScanLogin(sessionToken, refreshToken string) map[s
 
 // LogoutUser 登出用户
 func (s *AuthService) LogoutUser(refreshToken string) map[string]interface{} {
-	err := auth.LogoutSession(refreshToken)
-	if err != nil {
-		logger.Warn(fmt.Sprintf("Remote logout failed, continue local cleanup: %v", err))
+	// Capture the refresh token before deleting the local session. Remote revoke
+	// is best-effort and must never delay the local security boundary.
+	token := strings.TrimSpace(refreshToken)
+	if token == "" {
+		if current := auth.GetCurrentUserInfoOrLoad(); current != nil {
+			token = strings.TrimSpace(current.RefreshToken)
+		}
 	}
 
-	auth.StopTokenRefresh()
+	teardownLocalSessionAfterLogout()
 
-	if err := auth.DeleteUserInfo(); err != nil {
-		logger.Warn(fmt.Sprintf("Failed to delete user info: %v", err))
+	if token != "" {
+		dispatch := remoteLogoutDispatch
+		go func(refreshToken string) {
+			if err := dispatch(refreshToken); err != nil {
+				logger.Warn(fmt.Sprintf("Remote logout failed after local cleanup: %v", err))
+			}
+		}(token)
 	}
-
-	clearStartupStateAfterLogout()
-	RequestUserAgentDisableAfterLogout("logout")
-	auth.GetSessionAuthority().NotifyLoggedOut()
 
 	logger.Info("User logged out successfully")
 

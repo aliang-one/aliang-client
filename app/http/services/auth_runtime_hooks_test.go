@@ -1,11 +1,48 @@
 package services
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"testing"
+	"time"
 
 	auth "aliang.one/nursorgate/processor/auth"
 	"aliang.one/nursorgate/processor/runtime"
 )
+
+func TestHandleAuthRefreshedForwardsFreshAccessTokenToUserAgent(t *testing.T) {
+	auth.SetSessionOwnerProcess(true)
+	auth.SetCurrentUserInfo(&auth.UserInfo{
+		AccessToken: "fresh-access",
+		TokenType:   "Bearer",
+		ID:          42,
+	})
+	t.Cleanup(func() { auth.SetCurrentUserInfo(nil) })
+
+	received := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/agent/sync" {
+			t.Errorf("path = %q, want /api/agent/sync", r.URL.Path)
+		}
+		received <- r.Header.Get(AgentForwardedAuthorizationHeader)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	originalBaseURL := localUserAgentBaseURL
+	localUserAgentBaseURL = func() string { return server.URL }
+	t.Cleanup(func() { localUserAgentBaseURL = originalBaseURL })
+
+	handleAuthRefreshed()
+	select {
+	case header := <-received:
+		if header != "Bearer fresh-access" {
+			t.Fatalf("forwarded authorization = %q, want Bearer fresh-access", header)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for refreshed session to reach user agent")
+	}
+}
 
 func resetAuthHooksForTest() {
 	resetRunServiceHooksForTest()
@@ -93,12 +130,13 @@ func TestOnSessionEventHardInvalidRunsTeardown(t *testing.T) {
 	}
 }
 
-func TestOnSessionEventHardInvalidLogoutSkipsTeardown(t *testing.T) {
+func TestOnSessionEventHardInvalidLogoutStopsIngressWithoutExpiryNotification(t *testing.T) {
 	defer resetAuthHooksForTest()
 	resetAuthHooksForTest()
 
 	httpProxyIsRunningProbe = func() bool { return false }
-	httpStopRunner = func() { t.Fatal("httpStopRunner must not run for logout") }
+	var httpStops int
+	httpStopRunner = func() { httpStops++ }
 
 	rs := GetSharedRunService()
 	rs.SetCurrentMode("http")
@@ -109,12 +147,13 @@ func TestOnSessionEventHardInvalidLogoutSkipsTeardown(t *testing.T) {
 
 	onSessionEvent(auth.SessionEvent{To: auth.StateHardInvalid, Reason: auth.ReasonLogout})
 
-	// Logout teardown is owned by AuthService.LogoutUser; the listener must not
-	// touch the proxy or startup state.
-	if !rs.IsRunning() {
-		t.Fatal("listener must not stop the proxy on logout")
+	if httpStops != 1 {
+		t.Fatalf("logout http stops = %d, want 1", httpStops)
 	}
-	if startup.GetStatus() != runtime.READY {
-		t.Fatalf("logout must not clear startup state via listener; status=%v", startup.GetStatus())
+	if rs.IsRunning() {
+		t.Fatal("logout listener left ingress marked running")
+	}
+	if startup.GetStatus() != runtime.UNCONFIGURED || startup.GetFetchSuccess() {
+		t.Fatalf("logout startup state = %v fetch=%t, want UNCONFIGURED/false", startup.GetStatus(), startup.GetFetchSuccess())
 	}
 }

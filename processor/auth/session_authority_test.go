@@ -110,9 +110,19 @@ func TestSessionAuthoritySoftExpiredRecoversToActive(t *testing.T) {
 
 func TestSessionAuthorityLoggedOutIsHardInvalid(t *testing.T) {
 	a := &SessionAuthority{state: StateActive}
+	var fires int
+	a.Subscribe(func(e SessionEvent) {
+		if e.To == StateHardInvalid && e.Reason == ReasonLogout {
+			fires++
+		}
+	})
+	a.NotifyLoggedOut()
 	a.NotifyLoggedOut()
 	if a.State() != StateHardInvalid {
 		t.Fatalf("state=%v want HardInvalid", a.State())
+	}
+	if fires != 2 {
+		t.Fatalf("logout listener fires=%d want 2", fires)
 	}
 }
 

@@ -43,7 +43,7 @@ func (s *AgentService) ApplySessionEvent(to, reason string) {
 			logger.Warn(fmt.Sprintf("session-event reconnect failed: %v", err))
 		}
 	case "disable":
-		s.Disable()
+		s.DisableWithReason(reason)
 	}
 }
 
@@ -66,7 +66,11 @@ func ForwardSessionEventToUserAgent(e auth.SessionEvent) {
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: agentHTTPTimeout}
+	timeout := agentHTTPTimeout
+	if sessionEventAgentAction(e.To.String(), string(e.Reason)) == "disable" {
+		timeout = agentLogoutTimeout
+	}
+	client := &http.Client{Timeout: timeout}
 	resp, err := client.Do(req)
 	if err != nil {
 		logger.Debug(fmt.Sprintf("forward session-event to user-agent failed (best-effort): %v", err))

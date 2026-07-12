@@ -612,3 +612,57 @@ func TestStopIngressIfActiveStillStopsOnNormalRunningCase(t *testing.T) {
 		t.Fatal("expected isRunning=false after stop")
 	}
 }
+
+func TestStopIngressForLogoutForceStopsDesyncedTUNWithoutHTTPListener(t *testing.T) {
+	defer resetRunServiceHooksForTest()
+
+	var httpStops, tunStops int
+	httpStopRunner = func() { httpStops++ }
+	tunStopRunner = func() { tunStops++ }
+	httpProxyIsRunningProbe = func() bool { return false }
+	activeIngressModeResolver = func() (models.RunMode, bool) { return models.ModeTUN, true }
+
+	rs := NewRunService()
+	rs.SetCurrentMode(string(models.ModeHTTP)) // stale local mode
+	rs.SetRunning(false)                       // stale running flag
+
+	if mode := rs.StopIngressForLogout(); mode != models.ModeTUN {
+		t.Fatalf("stopped mode = %q, want tun", mode)
+	}
+	if tunStops != 1 || httpStops != 0 {
+		t.Fatalf("logout stoppers http=%d tun=%d, want 0/1", httpStops, tunStops)
+	}
+}
+
+func TestStartServiceRechecksActivationAfterWaitingForModeLock(t *testing.T) {
+	defer resetRunServiceHooksForTest()
+	runtime.ResetGlobalStartupStateForTest()
+	startup := runtime.GetStartupState()
+	startup.SetStatus(runtime.READY)
+
+	reachedPreLockCheck := make(chan struct{})
+	softwareUpdateStatusResolver = func() models.SoftwareVersionUpdateFrontendStatus {
+		close(reachedPreLockCheck)
+		return models.SoftwareVersionUpdateFrontendStatus{}
+	}
+	var httpStarts int
+	httpStartRunner = func() { httpStarts++ }
+
+	rs := NewRunService()
+	rs.SetCurrentMode(string(models.ModeHTTP))
+	rs.modeChangeMutex.Lock()
+	resultCh := make(chan map[string]interface{}, 1)
+	go func() { resultCh <- rs.StartService() }()
+
+	<-reachedPreLockCheck
+	startup.SetStatus(runtime.UNCONFIGURED)
+	rs.modeChangeMutex.Unlock()
+
+	result := <-resultCh
+	if result["error"] != "activation_required" {
+		t.Fatalf("start result = %#v, want activation_required", result)
+	}
+	if httpStarts != 0 || rs.IsRunning() {
+		t.Fatalf("logout-racing start escaped gate: starts=%d running=%t", httpStarts, rs.IsRunning())
+	}
+}

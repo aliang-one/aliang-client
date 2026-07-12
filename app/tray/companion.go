@@ -164,6 +164,10 @@ func (a *CompanionApp) connectAndStartHTTP() {
 
 	if err := agentruntime.EnsureStarted(); err != nil {
 		logger.Warn(fmt.Sprintf("Failed to start user agent runtime from tray companion: %v", err))
+	} else if resp, err := a.ipcClient.Send(ipc.ActionSyncAgentAuth, nil); err != nil {
+		logger.Warn(fmt.Sprintf("Failed to request agent auth sync from core: %v", err))
+	} else if !resp.OK {
+		logger.Warn(fmt.Sprintf("Core rejected agent auth sync: %s", resp.Error))
 	}
 }
 

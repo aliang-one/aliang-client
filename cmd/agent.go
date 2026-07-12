@@ -29,10 +29,8 @@ func init() {
 
 func runAgent(cmd *cobra.Command, args []string) error {
 	ensureUserAgentEnvironment()
+	auth.SetSessionOwnerProcess(false)
 
-	if err := auth.InitializeAuthPersistence(); err != nil {
-		return fmt.Errorf("failed to initialize auth persistence: %w", err)
-	}
 	if err := storage.InitializeSoftwareConfigStore(); err != nil {
 		return fmt.Errorf("failed to initialize software config persistence: %w", err)
 	}
@@ -40,9 +38,9 @@ func runAgent(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to initialize agent configuration: %w", err)
 	}
 	logAgentStartupConfig("agent_config_loaded")
-	if err := InitializeUser(""); err != nil {
-		logger.Warn(fmt.Sprintf("Failed to initialize user session for agent: %v", err))
-	}
+	// The user-agent is deliberately not an auth-session owner. The dashboard/core
+	// process restores and refreshes the session, then forwards the current access
+	// token through /api/agent/sync.
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

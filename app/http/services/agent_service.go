@@ -39,6 +39,7 @@ const (
 	agentIdentityFilename  = "device_identity.json"
 	agentDefaultLaunchMode = "external_terminal"
 	agentHTTPTimeout       = 8 * time.Second
+	agentLogoutTimeout     = 2 * time.Second
 	agentStatusSyncPath    = "/api/agent/status"
 	AgentRuntimeEnv        = "ALIANG_USER_AGENT_RUNTIME"
 
@@ -82,6 +83,11 @@ type AgentService struct {
 	client                *http.Client
 	terminal              *agentTerminalManager
 	ai                    *agentAIManager
+	// Forwarded user credentials are process-local only. The session owner sends
+	// them through /api/agent/sync after login/restore/refresh; the agent never
+	// reads or rotates the persisted refresh token.
+	forwardedUserAuthorization string
+	forwardedUserKey           string
 
 	wsMu         sync.Mutex
 	wsConnected  bool
@@ -203,7 +209,7 @@ func (s *AgentService) Status() models.AgentStatusResponse {
 	message := "Agent mode is disabled."
 	if status == agentStatusEnabled {
 		message = "Agent mode is enabled for this user device."
-	} else if strings.TrimSpace(auth.GetCurrentAuthorizationHeader()) == "" {
+	} else if s.effectiveUserAuthorizationLocked("") == "" {
 		message = "Log in before enabling Agent mode for this device."
 	} else {
 		message = "Agent mode can be enabled directly for this logged-in user."
@@ -282,6 +288,7 @@ func (s *AgentService) EnableWithUserContext(authHeader string, userKey string) 
 
 func (s *AgentService) enableWithUserContext(authHeader string, userKey string) (models.AgentStatusResponse, error) {
 	s.mu.Lock()
+	authHeader, userKey, _ = s.resolveForwardedUserContextLocked(authHeader, userKey)
 	s.ensureDeviceIdentityLocked()
 	if effectiveAgentRegisterAuthHeader(authHeader) == "" {
 		err := errors.New("log in before enabling Agent mode for this device")
@@ -349,6 +356,10 @@ func (s *AgentService) disableWithReasonMessage(reason string, message string) m
 	s.state.RemoteConnected = false
 	s.state.LastSyncAt = time.Now().UTC().Format(time.RFC3339)
 	s.state.LastSyncStatus = reason
+	if reason == "logout" {
+		s.forwardedUserAuthorization = ""
+		s.forwardedUserKey = ""
+	}
 	if strings.TrimSpace(message) != "" {
 		s.state.LastSyncMessage = message
 	} else {
@@ -398,12 +409,13 @@ func (s *AgentService) RecoverIfAuthExpired() (models.AgentStatusResponse, error
 // Called after a successful token refresh. No-op when already registered as the
 // current user, or when there is still no JWT.
 func (s *AgentService) ReRegisterIfUserIdentityChanged() {
-	authHeader := effectiveAgentRegisterAuthHeader("")
+	s.mu.Lock()
+	authHeader, userKey, _ := s.resolveForwardedUserContextLocked("", "")
 	if authHeader == "" {
+		s.mu.Unlock()
 		return // JWT still not available
 	}
-	currentUserKey := agentRegistrationUserKey("", authHeader)
-	s.mu.Lock()
+	currentUserKey := agentRegistrationUserKey(userKey, authHeader)
 	registeredUser := strings.TrimSpace(s.state.RegisteredUser)
 	hasToken := strings.TrimSpace(s.state.DeviceToken) != ""
 	mismatch := hasToken && registeredUser != "" && registeredUser != currentUserKey
@@ -419,7 +431,7 @@ func (s *AgentService) ReRegisterIfUserIdentityChanged() {
 	}
 	s.mu.Unlock()
 	if !hasToken || mismatch {
-		if err := s.SyncNowWithAuthorization(authHeader); err != nil {
+		if err := s.SyncNowWithUserContext(authHeader, userKey); err != nil {
 			logger.Warn(fmt.Sprintf("[AGENT-BOOT] identity_changed re-register failed error=%v", err))
 		}
 	}
@@ -488,6 +500,8 @@ func (s *AgentService) shouldBlockBackgroundSyncLocked() bool {
 
 func (s *AgentService) SyncNowWithUserContext(authHeader string, userKey string) error {
 	s.mu.Lock()
+	hasExplicitAuth := strings.TrimSpace(authHeader) != ""
+	authHeader, userKey, authChanged := s.resolveForwardedUserContextLocked(authHeader, userKey)
 	s.ensureDeviceIdentityLocked()
 	logger.Info(fmt.Sprintf("[AGENT-BOOT] sync_now begin device_id=%s enabled=%t registered=%t has_token=%t agent_server=%s runtime=user_agent:%t",
 		s.state.DeviceID,
@@ -506,7 +520,7 @@ func (s *AgentService) SyncNowWithUserContext(authHeader string, userKey string)
 	// back to the agent's OWN cached aliang.data token, which after a logout is
 	// stale — letting it re-register is exactly the "agent reconnects after
 	// logout" self-resurrection. Explicit Enable() bypasses this guard.
-	if strings.TrimSpace(authHeader) == "" && s.shouldBlockBackgroundSyncLocked() {
+	if !hasExplicitAuth && s.shouldBlockBackgroundSyncLocked() {
 		stickyState := normalizeAgentDisableReason(s.state.LastSyncStatus)
 		s.mu.Unlock()
 		logger.Info(fmt.Sprintf("[AGENT-BOOT] sync_now skipped reason=sticky_disabled_no_forwarded_auth state=%s", stickyState))
@@ -539,6 +553,9 @@ func (s *AgentService) SyncNowWithUserContext(authHeader string, userKey string)
 	registered := s.state.Registered
 	deviceID := s.state.DeviceID
 	s.mu.Unlock()
+	if authChanged {
+		s.PushSessionRefresh()
+	}
 	if !hasToken {
 		logger.Info(fmt.Sprintf("[AGENT-BOOT] sync_now complete remote_connection=skipped reason=no_device_token device_id=%s registered=%t enabled=%t", deviceID, registered, enabled))
 		return nil
@@ -617,9 +634,10 @@ func RequestUserAgentDisableAfterLogout(reason string) {
 	}
 	go func() {
 		if IsUserAgentRuntime() {
-			_ = GetSharedAgentService().Disable()
+			_ = GetSharedAgentService().DisableWithReason(reason)
 		} else if err := requestLocalUserAgentDisableAfterLogout(reason); err != nil {
 			logger.Warn(fmt.Sprintf("[AGENT-BOOT] auth_disable local_user_agent_failed reason=%s error=%v", reason, err))
+			return
 		}
 		logger.Info(fmt.Sprintf("[AGENT-BOOT] auth_disable applied reason=%s runtime=user_agent:%t", reason, IsUserAgentRuntime()))
 	}()
@@ -1273,7 +1291,7 @@ func (s *AgentService) registerAndSyncLockedWithUserContext(authHeader string, u
 		return s.saveStateLocked()
 	}
 
-	authHeader = effectiveAgentRegisterAuthHeader(authHeader)
+	authHeader = s.effectiveUserAuthorizationLocked(authHeader)
 	// Registration requires a valid aliang JWT — it is the sole identity source
 	// for binding a device to an owner. No JWT → login_required. NEVER fall back
 	// to an admin-console / platform identity (that is what bound devices to
@@ -1555,6 +1573,10 @@ func (s *AgentService) recoverOrExpireAfterRegisterAuthRejection(err error) {
 	}
 	defer registerAuthRecoveryInFlight.Unlock()
 	logger.Info(fmt.Sprintf("[AGENT-BOOT] register_auth_rejection recovery_begin status=%d", rejected.status))
+	if IsUserAgentRuntime() {
+		logger.Warn("[AGENT-BOOT] register_auth_rejection delegated_to_session_owner")
+		return
+	}
 	auth.RecoverOrExpireLocalSession("agent server rejected user authorization")
 }
 
@@ -1631,21 +1653,66 @@ func effectiveAgentRegisterAuthHeader(authHeader string) string {
 	return strings.TrimSpace(auth.GetCurrentAuthorizationHeader())
 }
 
+// resolveForwardedUserContextLocked installs an explicitly forwarded identity
+// and returns the best process-local identity for subsequent background work.
+// Caller holds s.mu.
+func (s *AgentService) resolveForwardedUserContextLocked(authHeader string, userKey string) (string, string, bool) {
+	authHeader = strings.TrimSpace(authHeader)
+	userKey = strings.TrimSpace(userKey)
+	if !IsUserAgentRuntime() {
+		if authHeader == "" {
+			authHeader = strings.TrimSpace(auth.GetCurrentAuthorizationHeader())
+		}
+		return authHeader, userKey, false
+	}
+
+	authChanged := false
+	if authHeader != "" {
+		authChanged = authHeader != s.forwardedUserAuthorization
+		s.forwardedUserAuthorization = authHeader
+	}
+	if userKey != "" {
+		s.forwardedUserKey = userKey
+	}
+	if authHeader == "" {
+		authHeader = s.forwardedUserAuthorization
+	}
+	if userKey == "" {
+		userKey = s.forwardedUserKey
+	}
+	return authHeader, userKey, authChanged
+}
+
+// effectiveUserAuthorizationLocked returns the cached forwarded credential in
+// the user-agent process. Only a session-owner process may fall back to the
+// persisted auth store. Caller holds s.mu.
+func (s *AgentService) effectiveUserAuthorizationLocked(authHeader string) string {
+	authHeader, _, _ = s.resolveForwardedUserContextLocked(authHeader, "")
+	return authHeader
+}
+
 // currentAccessToken returns the logged-in user's raw access_token (the HS256
 // JWT PhoneServer decodes for identity + exp), without the "Bearer " prefix.
 // Empty when no session is loaded.
 func (s *AgentService) currentAccessToken() string {
-	current := auth.GetCurrentUserInfoOrLoad()
-	if current == nil {
+	s.mu.Lock()
+	authHeader := s.effectiveUserAuthorizationLocked("")
+	s.mu.Unlock()
+	authHeader = strings.TrimSpace(authHeader)
+	if authHeader == "" {
 		return ""
 	}
-	return strings.TrimSpace(current.AccessToken)
+	parts := strings.Fields(authHeader)
+	if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") {
+		return parts[1]
+	}
+	return authHeader
 }
 
 // PushSessionRefresh signals the remote-agent session loop to push the current
-// access_token to PhoneServer (agent.session.refresh). Non-blocking: if a push
-// is already pending or no loop is running, the signal is dropped. Invoked from
-// the auth-success handler after a token refresh.
+// access_token to PhoneServer (agent.session.refresh). Non-blocking and bounded:
+// at most one update is queued until the loop drains it. Invoked after the
+// session owner forwards a changed access token.
 func (s *AgentService) PushSessionRefresh() {
 	select {
 	case s.sessionRefreshSig <- struct{}{}:
@@ -1735,7 +1802,7 @@ func requestLocalUserAgentDisableAfterLogout(reason string) error {
 	if encoded := values.Encode(); encoded != "" {
 		endpoint += "?" + encoded
 	}
-	return requestLocalUserAgentPost(endpoint, "", "")
+	return requestLocalUserAgentPostWithTimeout(endpoint, "", "", agentLogoutTimeout)
 }
 
 func requestLocalUserAgentRecoverAfterAuthExpired() error {
@@ -1755,6 +1822,10 @@ func requestLocalUserAgentEnsureConnection() error {
 }
 
 func requestLocalUserAgentPost(endpoint string, authHeader string, userKey string) error {
+	return requestLocalUserAgentPostWithTimeout(endpoint, authHeader, userKey, agentHTTPTimeout)
+}
+
+func requestLocalUserAgentPostWithTimeout(endpoint string, authHeader string, userKey string, timeout time.Duration) error {
 	req, err := http.NewRequest(http.MethodPost, endpoint, nil)
 	if err != nil {
 		return err
@@ -1768,7 +1839,7 @@ func requestLocalUserAgentPost(endpoint string, authHeader string, userKey strin
 		req.Header.Set(AgentForwardedUserKeyHeader, userKey)
 	}
 
-	client := &http.Client{Timeout: agentHTTPTimeout}
+	client := &http.Client{Timeout: timeout}
 	resp, err := client.Do(req)
 	if err != nil {
 		return err

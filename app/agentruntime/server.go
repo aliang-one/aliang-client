@@ -81,18 +81,9 @@ func StartLocalServer() error {
 		}
 	}()
 
-	go func() {
-		logger.Info(fmt.Sprintf("[AGENT-BOOT] startup_sync begin agent_server=%s runtime=user_agent", services.UserAgentOfflineStatus(nil).AgentServer))
-		if err := services.GetSharedAgentService().SyncNow(); err != nil {
-			logger.Warn(fmt.Sprintf("User agent startup sync failed: %v", err))
-			logger.Warn(fmt.Sprintf("[AGENT-BOOT] startup_sync failed error=%v", err))
-			return
-		}
-		logger.Info("[AGENT-BOOT] startup_sync success")
-	}()
-
 	logger.Info(fmt.Sprintf("User agent runtime listening on http://%s", config.DefaultUserAgentAddr))
 	logger.Info(fmt.Sprintf("[AGENT-BOOT] local_server listening url=http://%s routes_registered=true", config.DefaultUserAgentAddr))
+	logger.Info("[AGENT-BOOT] local_server awaiting session owner sync")
 	return nil
 }
 

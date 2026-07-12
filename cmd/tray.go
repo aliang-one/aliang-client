@@ -8,6 +8,7 @@ import (
 	httpServer "aliang.one/nursorgate/app/http"
 	"aliang.one/nursorgate/app/tray"
 	"aliang.one/nursorgate/common/logger"
+	auth "aliang.one/nursorgate/processor/auth"
 	"aliang.one/nursorgate/processor/runtime"
 	"aliang.one/nursorgate/processor/setup"
 	"github.com/spf13/cobra"
@@ -36,6 +37,7 @@ func init() {
 
 func runTray(cmd *cobra.Command, args []string) error {
 	logger.Info("Starting Aliang in system tray mode...")
+	auth.SetSessionOwnerProcess(true)
 
 	guard, acquired, err := acquireSingleInstanceGuard()
 	if err != nil {

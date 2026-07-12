@@ -24,6 +24,9 @@ func TestAgentServiceEnableRequiresLogin(t *testing.T) {
 	t.Setenv("ALIANG_DATA_DIR", t.TempDir())
 	cache.ResetCacheDirForTest()
 	auth.ResetAuthPersistenceForTest()
+	if err := auth.DeleteUserInfo(); err != nil {
+		t.Fatalf("DeleteUserInfo() error = %v", err)
+	}
 	config.ResetGlobalConfigForTest()
 	t.Cleanup(func() {
 		auth.ResetAuthPersistenceForTest()
@@ -44,6 +47,9 @@ func TestAgentServiceRegisterRefusedWithoutJwtNoFallback(t *testing.T) {
 	t.Setenv("ALIANG_DATA_DIR", t.TempDir())
 	cache.ResetCacheDirForTest()
 	auth.ResetAuthPersistenceForTest()
+	if err := auth.DeleteUserInfo(); err != nil {
+		t.Fatalf("DeleteUserInfo() error = %v", err)
+	}
 	config.ResetGlobalConfigForTest()
 	t.Cleanup(func() {
 		auth.ResetAuthPersistenceForTest()
@@ -857,8 +863,8 @@ func TestAgentServiceDeviceTokenUnauthorizedDisablesAgent(t *testing.T) {
 // TestAgentServiceSyncDoesNotResurrectAfterLogoutWithoutForwardedJwt locks in
 // the fix for "user logs out but the agent reconnects on its own". After a
 // logout the agent is sticky-disabled (LastSyncStatus=logout, device_token
-// cleared). The agent subprocess still holds a cached JWT in its own aliang.data
-// / in-memory copy (the dashboard's DeleteUserInfo does not reach it). A
+// cleared). Even if a stale JWT is still observable through a legacy/local
+// fallback, a
 // background sync (startup_sync / watchdog respawn / in-flight post-logout sync)
 // arrives with NO forwarded JWT — the dashboard is logged out. That sync must
 // NOT re-register the device. Only an explicitly forwarded JWT (a fresh login)
@@ -905,8 +911,7 @@ func TestAgentServiceSyncDoesNotResurrectAfterLogoutWithoutForwardedJwt(t *testi
 	// User logs out: agent is disabled, device_token cleared, sticky "logout".
 	service.DisableWithReason("logout")
 
-	// The agent subprocess still holds a cached JWT (its aliang.data / in-memory
-	// copy was not cleared by the dashboard's logout).
+	// Simulate a stale JWT still observable through a legacy/local fallback.
 	if err := auth.SaveUserInfo(&auth.UserInfo{
 		AccessToken:  "stale_access_after_logout",
 		RefreshToken: "stale_refresh_after_logout",
@@ -977,6 +982,47 @@ func TestAgentServiceSyncReRegistersAfterLogoutWithForwardedJwt(t *testing.T) {
 	status := service.Status()
 	if !status.Enabled || !status.Registered {
 		t.Fatalf("agent not re-registered after re-login sync: %#v", status)
+	}
+}
+
+func TestAgentServiceKeepsForwardedAccessTokenInMemory(t *testing.T) {
+	t.Setenv(AgentRuntimeEnv, "1")
+	t.Setenv("ALIANG_DATA_DIR", t.TempDir())
+	t.Setenv("ALIANG_CACHE_DIR", t.TempDir())
+	cache.ResetCacheDirForTest()
+	auth.SetSessionOwnerProcess(false)
+	t.Cleanup(func() {
+		auth.SetSessionOwnerProcess(true)
+		cache.ResetCacheDirForTest()
+	})
+
+	service := NewAgentService()
+	service.mu.Lock()
+	_, _, changed := service.resolveForwardedUserContextLocked("Bearer access-1", "id:1")
+	service.mu.Unlock()
+	if !changed {
+		t.Fatal("first forwarded access token was not recorded as changed")
+	}
+	if got := service.currentAccessToken(); got != "access-1" {
+		t.Fatalf("currentAccessToken() = %q, want access-1", got)
+	}
+
+	// A stale auth-package snapshot must never override the owner-forwarded token
+	// inside the user-agent process.
+	auth.SetCurrentUserInfo(&auth.UserInfo{AccessToken: "stale-from-sqlite", TokenType: "Bearer"})
+	service.mu.Lock()
+	_, _, changed = service.resolveForwardedUserContextLocked("Bearer access-2", "id:1")
+	service.mu.Unlock()
+	if !changed {
+		t.Fatal("rotated forwarded access token was not recorded as changed")
+	}
+	if got := service.currentAccessToken(); got != "access-2" {
+		t.Fatalf("currentAccessToken() = %q, want access-2", got)
+	}
+
+	service.DisableWithReason("logout")
+	if got := service.currentAccessToken(); got != "" {
+		t.Fatalf("currentAccessToken() after logout = %q, want empty", got)
 	}
 }
 

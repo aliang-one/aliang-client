@@ -155,6 +155,12 @@ func ExpireLocalSession(reason string) {
 
 func clearLocalSessionAfterExpiration(reason string) {
 	StopTokenRefresh()
+	if !IsSessionOwnerProcess() {
+		SetCurrentUserInfo(nil)
+		logger.Warn(fmt.Sprintf("Non-owner process ignored persisted session cleanup after %s", reason))
+		GetSessionAuthority().NotifyRefreshFailed(true, sessionReasonFromWipeReason(reason))
+		return
+	}
 
 	if err := DeleteUserInfo(); err != nil {
 		logger.Warn(fmt.Sprintf("Failed to clear invalid local auth session: %v", err))

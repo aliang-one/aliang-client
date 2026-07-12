@@ -13,10 +13,10 @@ import (
 // / logout) call Notify*; consumers Subscribe to SessionEvent to fan out
 // per-transition side effects (clear local data, UI state, proxy, agent).
 //
-// Transitions are idempotent: a Notify that lands in the current state does not
-// refire listeners (repeated signals produce no repeated side effects). A
-// panicking listener is recovered + logged so one bad consumer cannot break
-// auth-critical paths (login/refresh).
+// Ordinary transitions are idempotent. Explicit teardown commands (permanent
+// refresh failure and logout) force-fire listeners so repeated cleanup remains
+// safe. A panicking listener is recovered + logged so one bad consumer cannot
+// break auth-critical paths (login/refresh).
 
 type SessionState int
 
@@ -179,7 +179,9 @@ func (a *SessionAuthority) softExpire(reason SessionReason) bool {
 }
 
 func (a *SessionAuthority) NotifyLoggedOut() bool {
-	return a.transition(StateHardInvalid, ReasonLogout, nil)
+	// Logout is an explicit teardown command. Force-fire listeners even when the
+	// session is already HardInvalid so proxy/agent cleanup is never skipped.
+	return a.forceTransition(StateHardInvalid, ReasonLogout, nil)
 }
 
 // sessionReasonFromWipeReason maps the free-form reason string carried by

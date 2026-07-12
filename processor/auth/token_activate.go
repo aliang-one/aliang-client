@@ -214,6 +214,10 @@ func RestoreSession() (*UserInfo, error) {
 }
 
 func RefreshSession(refreshToken string) (*UserInfo, error) {
+	if !IsSessionOwnerProcess() {
+		return nil, ErrSessionOwnerRequired
+	}
+
 	token := strings.TrimSpace(refreshToken)
 	if token == "" {
 		current := GetCurrentUserInfoOrLoad()
@@ -466,6 +470,10 @@ var (
 
 // startTokenRefresh 启动定时刷新
 func startTokenRefresh() {
+	if !IsSessionOwnerProcess() {
+		return
+	}
+
 	tokenRefresherMu.Lock()
 	defer tokenRefresherMu.Unlock()
 

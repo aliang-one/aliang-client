@@ -9,6 +9,7 @@ import (
 
 	"aliang.one/nursorgate/app/agentruntime"
 	httpServer "aliang.one/nursorgate/app/http"
+	"aliang.one/nursorgate/app/http/services"
 	"aliang.one/nursorgate/app/http/storage"
 	"aliang.one/nursorgate/common/logger"
 	auth "aliang.one/nursorgate/processor/auth"
@@ -65,6 +66,7 @@ func ApplyDefaultConfig() error {
 }
 
 func runStart(cmd *cobra.Command, args []string) error {
+	auth.SetSessionOwnerProcess(true)
 	guard, acquired, err := acquireSingleInstanceGuard()
 	if err != nil {
 		return err
@@ -125,6 +127,8 @@ func runStart(cmd *cobra.Command, args []string) error {
 	logAgentStartupConfig("core_ensure_agent")
 	if err := agentruntime.EnsureStarted(); err != nil {
 		logger.Warn(fmt.Sprintf("Failed to start user agent runtime: %v", err))
+	} else if err := services.RequestUserAgentSyncAfterAuth("agent_started"); err != nil {
+		logger.Warn(fmt.Sprintf("Failed to sync user session to agent runtime: %v", err))
 	}
 
 	// 等待信号并优雅关闭

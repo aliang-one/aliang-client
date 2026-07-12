@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,6 +15,8 @@ import (
 	"aliang.one/nursorgate/common/cache"
 	"aliang.one/nursorgate/common/logger"
 )
+
+const authSessionDBPathEnv = "ALIANG_AUTH_SESSION_DB"
 
 // UserInfo is the locally persisted Sub2API session snapshot.
 type UserInfo struct {
@@ -37,6 +40,7 @@ type UserInfo struct {
 var (
 	userInfoMutex     sync.RWMutex
 	currentUserInfo   *UserInfo
+	authSessionDBMu   sync.Mutex
 	authSessionDBOnce sync.Once
 	authSessionDB     *gorm.DB
 	authSessionDBErr  error
@@ -99,6 +103,9 @@ func (authProfileRecord) TableName() string {
 // root/user boundary and risks orphaning existing sessions). On macOS the
 // dashboard already runs in user context, so the file is shared there.
 func GetAuthSessionDBPath() (string, error) {
+	if path := strings.TrimSpace(os.Getenv(authSessionDBPathEnv)); path != "" {
+		return filepath.Clean(path), nil
+	}
 	return cache.GetUnifiedDataDBPath()
 }
 
@@ -185,6 +192,9 @@ func HasPersistedUserInfo() (bool, error) {
 }
 
 func getAuthSessionDB() (*gorm.DB, error) {
+	authSessionDBMu.Lock()
+	defer authSessionDBMu.Unlock()
+
 	authSessionDBOnce.Do(func() {
 		dbPath, err := GetAuthSessionDBPath()
 		if err != nil {
@@ -353,10 +363,15 @@ func SetCurrentUserInfo(info *UserInfo) {
 
 // ResetAuthPersistenceForTest resets auth persistence singletons for isolated tests.
 func ResetAuthPersistenceForTest() {
+	sessionOwnerProcess.Store(true)
+
 	userInfoMutex.Lock()
 	currentUserInfo = nil
 	userInfoMutex.Unlock()
 
+	// A refresh/recovery goroutine may still be initializing the test database.
+	// Replacing sync.Once concurrently with Once.Do corrupts its internal mutex.
+	authSessionDBMu.Lock()
 	if authSessionDB != nil {
 		if sqlDB, err := authSessionDB.DB(); err == nil {
 			_ = sqlDB.Close()
@@ -365,5 +380,6 @@ func ResetAuthPersistenceForTest() {
 	authSessionDB = nil
 	authSessionDBErr = nil
 	authSessionDBOnce = sync.Once{}
+	authSessionDBMu.Unlock()
 	cache.ResetCacheDirForTest()
 }

@@ -1,6 +1,8 @@
 package services
 
 import (
+	"fmt"
+
 	"aliang.one/nursorgate/common/desktop"
 	"aliang.one/nursorgate/common/logger"
 	auth "aliang.one/nursorgate/processor/auth"
@@ -29,9 +31,8 @@ var (
 //     token — closes 缺口 B) and start the bounded recovery coordinator.
 //   - →Active: mark the session ready; if we paused the proxy for SoftExpired,
 //     resume it.
-//   - →HardInvalid (non-logout): stop the proxy + clear UI state + notify.
-//     Logout is skipped here — AuthService.LogoutUser owns its own teardown, and
-//     the "认证已过期" wording would be wrong for a user-initiated logout.
+//   - →HardInvalid: stop the proxy and clear UI state. User logout uses the same
+//     teardown without the "认证已过期" desktop notification.
 func onSessionEvent(e auth.SessionEvent) {
 	switch e.To {
 	case auth.StateSoftExpired:
@@ -52,9 +53,19 @@ func onSessionEvent(e auth.SessionEvent) {
 	case auth.StateHardInvalid:
 		proxyPausedForSoftExpiry = false
 		if e.Reason == auth.ReasonLogout {
+			handleLoggedOut()
 			return
 		}
 		handleAuthExpired()
+	}
+}
+
+func handleLoggedOut() {
+	startupState := runtime.GetStartupState()
+	startupState.SetFetchSuccess(false)
+	startupState.SetStatus(runtime.UNCONFIGURED)
+	if GetSharedRunService().StopIngressIfActive() {
+		logger.Info("User logout stopped the active ingress proxy")
 	}
 }
 
@@ -90,26 +101,17 @@ func handleAuthExpired() {
 	}
 }
 
-// handleAuthRefreshed fires after a successful token refresh (or login). The
-// access_token now carries a fresh exp; push it to PhoneServer over the live
-// agent WS so the server's recorded session expiry (userTokenExp) advances
-// without a reconnect. No-op when the agent isn't connected (the next connect
-// carries the current JWT via the user_token query param).
+// handleAuthRefreshed fires after a successful token refresh. It forwards the
+// new access token to the user-agent process, which updates the live PhoneServer
+// session or uses it on the next connection.
 func handleAuthRefreshed() {
-	GetSharedAgentService().PushSessionRefresh()
-	// Session restored: ensure the remote link is up. If the expiry dropped the
-	// WS, this reconnects it (idempotent — a no-op when already connected /
-	// connecting, or when there is no device_token yet). The device_token was
-	// preserved across the blip (handleAuthExpired no longer deregisters), so
-	// this is the fast syncExistingRegisteredDevice path, not a full re-register.
-	// This replaces the old RecoverIfAuthExpired nudge, which keyed off the
-	// now-removed auth_expired terminal state.
-	RequestUserAgentEnsureConnection()
-	// Bind the device to the real JWT user if it registered under a fallback
-	// identity (e.g. admin-console → platform_admin) or not at all before the
-	// JWT was loaded. Only meaningful in the user-agent runtime, where the
-	// agent state + WS connection live.
-	if IsUserAgentRuntime() {
-		GetSharedAgentService().ReRegisterIfUserIdentityChanged()
-	}
+	// The dashboard/core process is the sole refresh-token owner. Forward the
+	// freshly issued access token to the user-agent process; SyncNow installs it
+	// in process-local memory, updates the live PhoneServer session, and reconnects
+	// when needed. The agent never reads or rotates the persisted refresh token.
+	go func() {
+		if err := RequestUserAgentSyncAfterAuth("session_refreshed"); err != nil {
+			logger.Warn(fmt.Sprintf("Failed to forward refreshed session to user agent: %v", err))
+		}
+	}()
 }
