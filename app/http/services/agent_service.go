@@ -142,6 +142,7 @@ func NewAgentService() *AgentService {
 		sessionRefreshSig: make(chan struct{}, 1),
 	}
 	s.ai.service = s
+	s.ai.loadPendingTerminals()
 	if err := s.loadState(); err != nil {
 		logger.Warn(fmt.Sprintf("[AGENT-BOOT] state_load failed error=%v", err))
 	} else {

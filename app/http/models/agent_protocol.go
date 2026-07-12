@@ -1,7 +1,7 @@
 package models
 
 const (
-	AgentProtocolVersion = "2026-06-12"
+	AgentProtocolVersion = "2026-07-12"
 
 	AgentHTTPRegisterEndpoint   = "/api/devices/register"
 	AgentHTTPStatusSyncEndpoint = "/api/agent/status"
@@ -38,6 +38,7 @@ const (
 	AgentEventAIDelta                 = "ai.delta"
 	AgentEventAIDone                  = "ai.done"
 	AgentEventAIRunProgress           = "ai.run.progress" // server→mobile: live per-run files_touched_count + git_changed_count
+	AgentEventAIRunEventAck           = "ai.run.event.ack"
 	AgentEventAIStop                  = "ai.stop"
 	AgentEventAIStatus                = "ai.status"
 	AgentEventAIError                 = "ai.error"
@@ -164,23 +165,24 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				{Type: AgentEventTerminalExit, Required: []string{"type", "session_id", "exit_code"}},
 				{Type: AgentEventTerminalError, Required: []string{"type", "session_id", "error"}},
 				{Type: AgentEventAISessionCreated, Required: []string{"type", "session_id", "mode", "project_path", "provider", "state"}, Optional: []string{"state=idle"}},
-				{Type: AgentEventAIRunStarted, Required: []string{"type", "session_id", "message_id", "provider", "mode", "project_path"}, Optional: []string{"state=running"}},
+				{Type: AgentEventAIMessageReceived, Required: []string{"type", "session_id", "message_id", "run_id", "event_seq"}, Optional: []string{"received_at"}},
+				{Type: AgentEventAIRunStarted, Required: []string{"type", "session_id", "message_id", "provider", "mode", "project_path", "run_id", "event_seq"}, Optional: []string{"state=running"}},
 				{Type: AgentEventAISteerAck, Required: []string{"type", "session_id", "message_id", "result"}, Optional: []string{"error", "code", "acked_at"}},
-				{Type: AgentEventAIDelta, Required: []string{"type", "session_id", "message_id", "channel", "delta"}},
-				{Type: AgentEventAIDone, Required: []string{"type", "session_id", "message_id"}},
-				{Type: AgentEventAIRunProgress, Required: []string{"type", "session_id"}, Optional: []string{"message_id", "files_touched_count", "git_changed_count", "retry_active", "retry_attempt", "retry_max", "retry_delay_ms", "error_status", "error_type"}},
-				{Type: AgentEventAICommand, Required: []string{"type", "session_id", "message_id", "item_id", "status"}, Optional: []string{"command", "cwd", "exit_code", "output"}},
-				{Type: AgentEventAIFileChange, Required: []string{"type", "session_id", "message_id", "item_id"}, Optional: []string{"path", "kind", "added", "removed", "diff", "changes"}},
-				{Type: AgentEventAIThinking, Required: []string{"type", "session_id", "message_id", "delta"}},
-				{Type: AgentEventAIUsage, Required: []string{"type", "session_id"}, Optional: []string{"message_id", "input_tokens", "output_tokens", "cache_read_tokens", "model"}},
-				{Type: AgentEventAITask, Required: []string{"type", "session_id", "message_id", "tasks"}},
-				{Type: AgentEventAIStatus, Required: []string{"type", "session_id", "status"}},
-				{Type: AgentEventAIError, Required: []string{"type", "session_id", "error"}, Optional: []string{"message_id", "error_status", "error_type", "retry_attempt", "retry_max", "detail"}},
-				{Type: AgentEventAIApprovalRequest, Required: []string{"type", "session_id", "message_id", "approval_id", "provider", "kind", "status"}, Optional: []string{"title", "reason", "command", "cwd", "tool_name", "tool_input", "file_changes", "available_decisions", "decision", "raw", "matched_rule_id", "policy_version"}},
+				{Type: AgentEventAIDelta, Required: []string{"type", "session_id", "message_id", "channel", "delta", "run_id", "event_seq"}},
+				{Type: AgentEventAIDone, Required: []string{"type", "session_id", "message_id", "run_id", "event_seq"}},
+				{Type: AgentEventAIRunProgress, Required: []string{"type", "session_id", "run_id", "event_seq"}, Optional: []string{"message_id", "files_touched_count", "git_changed_count", "retry_active", "retry_attempt", "retry_max", "retry_delay_ms", "error_status", "error_type"}},
+				{Type: AgentEventAICommand, Required: []string{"type", "session_id", "message_id", "item_id", "status", "run_id", "event_seq"}, Optional: []string{"command", "cwd", "exit_code", "output"}},
+				{Type: AgentEventAIFileChange, Required: []string{"type", "session_id", "message_id", "item_id", "run_id", "event_seq"}, Optional: []string{"path", "kind", "added", "removed", "diff", "changes"}},
+				{Type: AgentEventAIThinking, Required: []string{"type", "session_id", "message_id", "delta", "run_id", "event_seq"}},
+				{Type: AgentEventAIUsage, Required: []string{"type", "session_id", "run_id", "event_seq"}, Optional: []string{"message_id", "input_tokens", "output_tokens", "cache_read_tokens", "model"}},
+				{Type: AgentEventAITask, Required: []string{"type", "session_id", "message_id", "tasks", "run_id", "event_seq"}},
+				{Type: AgentEventAIStatus, Required: []string{"type", "session_id", "status", "run_id", "event_seq"}},
+				{Type: AgentEventAIError, Required: []string{"type", "session_id", "error", "run_id", "event_seq"}, Optional: []string{"message_id", "error_status", "error_type", "retry_attempt", "retry_max", "detail"}},
+				{Type: AgentEventAIApprovalRequest, Required: []string{"type", "session_id", "message_id", "approval_id", "provider", "kind", "status", "run_id", "event_seq"}, Optional: []string{"title", "reason", "command", "cwd", "tool_name", "tool_input", "file_changes", "available_decisions", "decision", "raw", "matched_rule_id", "policy_version"}},
 				{Type: AgentEventAIApprovalAck, Required: []string{"type", "session_id", "approval_id", "result"}, Optional: []string{"delivery_id"}},
 				{Type: AgentEventAIApprovalSync, Required: []string{"type"}, Optional: []string{"pending"}},
 				{Type: AgentEventAIApprovalCancelled, Required: []string{"type", "session_id"}, Optional: []string{"approval_ids", "reason"}},
-				{Type: AgentEventAISessionClosed, Required: []string{"type", "session_id"}},
+				{Type: AgentEventAISessionClosed, Required: []string{"type", "session_id"}, Optional: []string{"run_id", "event_seq"}},
 				{Type: AgentEventFileListResult, Required: []string{"type", "request_id", "path", "entries"}},
 				{Type: AgentEventFileReadResult, Required: []string{"type", "request_id", "path", "encoding", "content"}},
 				{Type: AgentEventGitStatusResult, Required: []string{"type", "request_id", "is_repo"}, Optional: []string{"branch", "status", "generated_at"}},
@@ -193,11 +195,12 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				{Type: AgentEventSlashCommandsListError, Required: []string{"type", "request_id", "error"}},
 				{Type: AgentEventFileError, Required: []string{"type", "request_id", "error"}},
 				{Type: AgentEventError, Required: []string{"type", "error"}},
-				{Type: AgentEventAIOptionRequest, Required: []string{"type", "session_id", "option_id", "options"}, Optional: []string{"message_id", "title", "allow_custom", "multi", "provider"}},
+				{Type: AgentEventAIOptionRequest, Required: []string{"type", "session_id", "option_id", "options", "run_id", "event_seq"}, Optional: []string{"message_id", "title", "allow_custom", "multi", "provider"}},
 			},
 			ServerSends: []AgentProtocolEvent{
 				{Type: AgentEventRegistered, Optional: []string{"device_id"}},
 				{Type: AgentEventHeartbeatAck},
+				{Type: AgentEventAIRunEventAck, Required: []string{"type", "run_id", "accepted_seq", "run_state_version"}, Optional: []string{"result"}},
 				{Type: AgentEventSessionRefreshAck, Optional: []string{"ok", "auth_expires_at"}},
 				{Type: AgentEventDeviceUnbound},
 				{Type: AgentEventDeviceSettings, Required: []string{"device"}},
@@ -209,7 +212,6 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				{Type: AgentEventAISessionCreate, Required: []string{"type", "session_id"}, Optional: []string{"project_path", "mode", "provider", "tool", "model", "source_session_id", "resume_session_id", "initial_context", "transcript"}, Emits: []string{AgentEventAISessionCreated, AgentEventAIError}},
 				{Type: AgentEventAIMessage, Required: []string{"type", "session_id", "message_id", "content"}, Optional: []string{"attachments", "provider", "tool", "model", "project_path", "source_session_id", "resume_session_id"}, Emits: []string{AgentEventAIMessageReceived, AgentEventAIRunStarted, AgentEventAIDelta, AgentEventAIThinking, AgentEventAICommand, AgentEventAIFileChange, AgentEventAIUsage, AgentEventAITask, AgentEventAIApprovalRequest, AgentEventAIRunProgress, AgentEventAIDone, AgentEventAIError}},
 				{Type: AgentEventAISteer, Required: []string{"type", "session_id", "message_id", "content"}, Optional: []string{"mode"}, Emits: []string{AgentEventAISteerAck}},
-				{Type: AgentEventAIMessageReceived, Required: []string{"type", "session_id", "message_id"}, Optional: []string{"received_at"}},
 				{Type: AgentEventAIApprovalResponse, Required: []string{"type", "session_id", "approval_id", "decision"}, Optional: []string{"message_id", "scope", "raw", "delivery_id", "attempt"}, Emits: []string{AgentEventAIApprovalAck, AgentEventAIStatus, AgentEventAIError}},
 				{Type: AgentEventAIApprovalState, Required: []string{"type", "approval_id", "status"}, Optional: []string{"session_id"}},
 				{Type: AgentEventAIStop, Required: []string{"type", "session_id"}, Emits: []string{AgentEventAIStatus}},
@@ -227,8 +229,8 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 		},
 		Streams: []AgentProtocolStream{
 			{Name: "terminal", Event: AgentEventTerminalOutput, Required: []string{"session_id", "encoding", "data"}, Description: "PTY bytes are forwarded as text chunks in arrival order."},
-			{Name: "ai_chat", Event: AgentEventAIDelta, Required: []string{"session_id", "message_id", "channel", "delta"}, Optional: []string{"provider"}, Description: "Headless AI CLI stdout/stderr is streamed as soon as bytes arrive."},
-			{Name: "ai_approval", Event: AgentEventAIApprovalRequest, Required: []string{"session_id", "message_id", "approval_id", "provider", "kind", "status"}, Optional: []string{"title", "reason", "command", "cwd", "tool_name", "tool_input", "file_changes", "available_decisions", "decision", "matched_rule_id", "policy_version"}, Description: "Headless AI CLI permission requests are surfaced to the user and resumed only after an ai.approval.response decision. matched_rule_id/policy_version carry the approval-policy context that triggered the escalation (optional; absent for auto-approved tools, which never reach the cloud)."},
+			{Name: "ai_chat", Event: AgentEventAIDelta, Required: []string{"session_id", "message_id", "channel", "delta", "run_id", "event_seq"}, Optional: []string{"provider"}, Description: "Headless AI CLI stdout/stderr is streamed as soon as bytes arrive."},
+			{Name: "ai_approval", Event: AgentEventAIApprovalRequest, Required: []string{"session_id", "message_id", "approval_id", "provider", "kind", "status", "run_id", "event_seq"}, Optional: []string{"title", "reason", "command", "cwd", "tool_name", "tool_input", "file_changes", "available_decisions", "decision", "matched_rule_id", "policy_version"}, Description: "Headless AI CLI permission requests are surfaced to the user and resumed only after an ai.approval.response decision. matched_rule_id/policy_version carry the approval-policy context that triggered the escalation (optional; absent for auto-approved tools, which never reach the cloud)."},
 		},
 	}
 }

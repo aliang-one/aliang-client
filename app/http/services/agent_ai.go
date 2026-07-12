@@ -29,6 +29,8 @@ type agentAIManager struct {
 	sessions           map[string]*agentAISession
 	approvals          map[string]*agentAIApprovalWaiter
 	completedApprovals map[string]*agentAICompletedApproval
+	pendingTerminals   map[string]map[string]interface{}
+	runJournalEnabled  bool
 	// service is the owning AgentService (set when the service creates this
 	// manager), used to evaluate the device approval policy. nil for standalone
 	// test managers, which fall back to GetSharedAgentService().
@@ -250,6 +252,7 @@ type agentAIMessage struct {
 
 type agentAIRun struct {
 	sessionID       string
+	runID           string
 	messageID       string
 	runSeq          int
 	mode            string
@@ -266,6 +269,76 @@ type agentAIRun struct {
 	// policy version that decided. Set by the approval hooks before escalation.
 	matchedRuleID string
 	policyVersion int
+}
+
+// agentAIRunEmitter serializes every event emitted by one run. Besides adding
+// the v2 run identity/order fields, it is a terminal barrier: once a terminal
+// event has been accepted, no concurrently-ticking progress goroutine can emit
+// after it. Holding the mutex through write preserves event_seq wire order.
+type agentAIRunEmitter struct {
+	mu         sync.Mutex
+	runID      string
+	nextSeq    int64
+	terminal   bool
+	write      agentTerminalWriter
+	onTerminal func(map[string]interface{}) error
+}
+
+func newAgentAIRunEmitter(run agentAIRun, write agentTerminalWriter) *agentAIRunEmitter {
+	runID := strings.TrimSpace(run.runID)
+	if runID == "" {
+		// Compatibility for older servers: message ids are unique per user turn,
+		// so they are a stable fallback run identity until the server sends run_id.
+		runID = run.messageID
+	}
+	return &agentAIRunEmitter{runID: runID, write: write}
+}
+
+func agentAIRunEventTerminal(payload map[string]interface{}) bool {
+	typeName := strings.TrimSpace(fmt.Sprint(payload["type"]))
+	if typeName == models.AgentEventAIDone || typeName == models.AgentEventAIError || typeName == models.AgentEventAISessionClosed {
+		if payload["retry_active"] == true || strings.Contains(strings.ToLower(fmt.Sprint(payload["error"])), "reconnecting") {
+			return false
+		}
+		return true
+	}
+	if typeName != models.AgentEventAIStatus {
+		return false
+	}
+	switch strings.TrimSpace(fmt.Sprint(payload["status"])) {
+	case "stopped", "cancelled", "interrupted", "timeout", "idle_timeout", "hard_timeout", "output_limited":
+		return true
+	default:
+		return false
+	}
+}
+
+func (e *agentAIRunEmitter) emit(value interface{}) error {
+	payload, ok := value.(map[string]interface{})
+	if !ok {
+		return e.write(value)
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.terminal {
+		return nil
+	}
+	e.nextSeq++
+	payload["run_id"] = e.runID
+	payload["event_seq"] = e.nextSeq
+	terminal := agentAIRunEventTerminal(payload)
+	if terminal {
+		// Close before the write. A concurrent heartbeat blocks on the mutex and
+		// observes terminal=true after this write completes, so done->progress is
+		// impossible even at the ticker boundary.
+		e.terminal = true
+		if e.onTerminal != nil {
+			if err := e.onTerminal(payload); err != nil {
+				return err
+			}
+		}
+	}
+	return e.write(payload)
 }
 
 type agentAITool struct {
@@ -411,11 +484,23 @@ const (
 const agentAIOptionSystemPrompt = `When you have multiple viable approaches/options and the best choice depends on user preference, you MUST let the user choose instead of deciding for them. Present options using a fenced code block with language "aliang-options" containing one JSON object on its own line, shaped exactly: {"title":string,"options":[{"id":string,"label":string,"description":string}],"allow_custom":bool,"multi":bool}. Keep "id" short stable slugs. After the block, stop and wait for the user's choice in the next message; do not proceed on assumption.`
 
 func newAgentAIManager() *agentAIManager {
-	return &agentAIManager{
+	m := &agentAIManager{
 		sessions:           make(map[string]*agentAISession),
 		approvals:          make(map[string]*agentAIApprovalWaiter),
 		completedApprovals: make(map[string]*agentAICompletedApproval),
+		pendingTerminals:   make(map[string]map[string]interface{}),
 	}
+	return m
+}
+
+func (m *agentAIManager) runEmitter(run agentAIRun, write agentTerminalWriter) *agentAIRunEmitter {
+	e := newAgentAIRunEmitter(run, write)
+	// Only protocol-v2 cloud runs have a Server ACK peer. Local in-app chat and
+	// legacy servers omit run_id; journaling those terminals would leak forever.
+	if strings.TrimSpace(run.runID) != "" {
+		e.onTerminal = m.rememberPendingTerminal
+	}
+	return e
 }
 
 // registerAISessionLocked stores a new session, evicting the oldest idle
@@ -771,12 +856,19 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 	if messageID == "" {
 		messageID = sessionID
 	}
+	messageRun := agentAIRun{
+		sessionID: sessionID,
+		runID:     remoteString(msg, "run_id"),
+		messageID: messageID,
+	}
+	emitter := m.runEmitter(messageRun, writeJSON)
+	runWrite := agentTerminalWriter(emitter.emit)
 	if content == "" {
-		_ = writeJSON(agentAIErrorPayload(sessionID, messageID, errors.New("ai.message content is empty")))
+		_ = runWrite(agentAIErrorPayload(sessionID, messageID, errors.New("ai.message content is empty")))
 		return
 	}
 	if len(content) > agentAIMessageLimitBytes {
-		_ = writeJSON(agentAIErrorPayload(sessionID, messageID, fmt.Errorf("ai.message exceeds %d bytes", agentAIMessageLimitBytes)))
+		_ = runWrite(agentAIErrorPayload(sessionID, messageID, fmt.Errorf("ai.message exceeds %d bytes", agentAIMessageLimitBytes)))
 		return
 	}
 
@@ -785,7 +877,7 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 	// from the server's own "送达 Agent" (dispatched). Mirrors
 	// scripts/local-agent.ts. Optional for older agents — the server falls back
 	// to "已转发·待确认" when this is absent.
-	_ = writeJSON(map[string]interface{}{
+	_ = runWrite(map[string]interface{}{
 		"type":        models.AgentEventAIMessageReceived,
 		"session_id":  sessionID,
 		"message_id":  messageID,
@@ -807,7 +899,7 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 		// outside the manager lock (filesystem ops).
 		projectPath, cwdErr := resolveAgentAICWD(remoteString(msg, "project_path"))
 		if cwdErr != nil {
-			_ = writeJSON(agentAIErrorPayload(sessionID, messageID, cwdErr))
+			_ = runWrite(agentAIErrorPayload(sessionID, messageID, cwdErr))
 			return
 		}
 		lazyProvider, providerErr := normalizeAgentAIProvider(firstNonEmpty(
@@ -815,7 +907,7 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 			strings.TrimSpace(remoteString(msg, "tool")),
 		))
 		if providerErr != nil {
-			_ = writeJSON(agentAIErrorPayload(sessionID, messageID, providerErr))
+			_ = runWrite(agentAIErrorPayload(sessionID, messageID, providerErr))
 			return
 		}
 		lazyMode := remoteString(msg, "mode")
@@ -844,14 +936,14 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 	session.lastActiveAt = time.Now().UTC() // LRU recency: this conversation is active
 	if session.cancel != nil {
 		m.mu.Unlock()
-		_ = writeJSON(agentAIErrorPayload(sessionID, messageID, fmt.Errorf("ai session is already running: %s", sessionID)))
+		_ = runWrite(agentAIErrorPayload(sessionID, messageID, fmt.Errorf("ai session is already running: %s", sessionID)))
 		return
 	}
 	m.mu.Unlock()
 
 	provider, err := normalizeAgentAIProvider(firstNonEmpty(strings.TrimSpace(remoteString(msg, "provider")), strings.TrimSpace(remoteString(msg, "tool")), session.provider))
 	if err != nil {
-		_ = writeJSON(agentAIErrorPayload(sessionID, messageID, err))
+		_ = runWrite(agentAIErrorPayload(sessionID, messageID, err))
 		return
 	}
 
@@ -862,12 +954,12 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 	// operations (/clear /model) or honest status replies (/help /cost /compact).
 	// Prompt-style commands (/review, custom .claude/commands) and unknown /xxx
 	// fall through to the normal model turn below.
-	if m.handleLocalSlashCommand(session, messageID, content, provider, writeJSON) {
+	if m.handleLocalSlashCommand(session, messageID, content, provider, runWrite) {
 		return
 	}
 
-	if err := m.runUserMessage(session, messageID, content, provider, writeJSON); err != nil {
-		_ = writeJSON(agentAIErrorPayload(sessionID, messageID, err))
+	if err := m.runUserMessage(session, remoteString(msg, "run_id"), messageID, content, provider, emitter); err != nil {
+		_ = runWrite(agentAIErrorPayload(sessionID, messageID, err))
 	}
 }
 
@@ -1235,7 +1327,8 @@ func (m *agentAIManager) setCodexSteerControl(sessionID string, runSeq int, cont
 
 // runUserMessage 在 session 上派发一轮新的 AI run。message()（用户消息）与
 // optionResponse()（用户方案选择续接）共用。调用者须已确认 session 存在且当前未在跑。
-func (m *agentAIManager) runUserMessage(session *agentAISession, messageID, content, provider string, writeJSON agentTerminalWriter) error {
+func (m *agentAIManager) runUserMessage(session *agentAISession, runID, messageID, content, provider string, emitter *agentAIRunEmitter) error {
+	writeJSON := agentTerminalWriter(emitter.emit)
 	approvalToken, err := newAgentAIApprovalToken()
 	if err != nil {
 		return err
@@ -1264,6 +1357,7 @@ func (m *agentAIManager) runUserMessage(session *agentAISession, messageID, cont
 	}
 	run := agentAIRun{
 		sessionID:       session.id,
+		runID:           runID,
 		messageID:       messageID,
 		runSeq:          session.runSeq,
 		mode:            session.mode,
@@ -1287,7 +1381,15 @@ func (m *agentAIManager) runUserMessage(session *agentAISession, messageID, cont
 		svc.ensurePolicyBeforeRun(ctx, session.projectPath)
 	}
 	m.startAIWatchdog(ctx, activity, cancel)
-	go m.runCLI(ctx, run, writeJSON)
+	m.mu.Lock()
+	if current := m.sessions[run.sessionID]; current != nil && current.runSeq == run.runSeq {
+		// Approval HTTP hooks emit asynchronously through activeWriter. Point them
+		// at the same per-run emitter so they share run_id/event_seq and cannot
+		// escape the terminal barrier through the original socket writer.
+		current.activeWriter = emitter.emit
+	}
+	m.mu.Unlock()
+	go m.runCLI(ctx, run, emitter.emit)
 	return nil
 }
 
@@ -1320,8 +1422,10 @@ func (m *agentAIManager) optionResponse(msg map[string]interface{}, writeJSON ag
 	content := buildAgentAIOptionFollowup(pending, selected, custom)
 	messageID := pending.MessageID + ".option"
 
-	if err := m.runUserMessage(session, messageID, content, provider, writeJSON); err != nil {
-		_ = writeJSON(agentAIErrorPayload(sessionID, messageID, err))
+	run := agentAIRun{sessionID: sessionID, runID: remoteString(msg, "run_id"), messageID: messageID}
+	emitter := m.runEmitter(run, writeJSON)
+	if err := m.runUserMessage(session, remoteString(msg, "run_id"), messageID, content, provider, emitter); err != nil {
+		_ = emitter.emit(agentAIErrorPayload(sessionID, messageID, err))
 	}
 }
 
@@ -1389,11 +1493,15 @@ func (m *agentAIManager) stop(msg map[string]interface{}, writeJSON agentTermina
 		return
 	}
 	cancel := session.cancel
+	runWrite := session.activeWriter
 	m.mu.Unlock()
+	if runWrite == nil {
+		runWrite = writeJSON
+	}
 	if cancel != nil {
 		cancel()
 	}
-	_ = writeJSON(map[string]interface{}{
+	_ = runWrite(map[string]interface{}{
 		"type":       models.AgentEventAIStatus,
 		"session_id": sessionID,
 		"status":     "stopping",
@@ -1591,20 +1699,27 @@ func (m *agentAIManager) close(msg map[string]interface{}, writeJSON agentTermin
 		cancelled = m.clearPendingApprovalsLocked(sessionID, session.runSeq, models.AgentAIApprovalDecisionCancel)
 	}
 	var cancel context.CancelFunc
+	var runWrite agentTerminalWriter
 	if session != nil {
 		cancel = session.cancel
+		runWrite = session.activeWriter
 	}
 	m.mu.Unlock()
 	m.emitApprovalCancelled(writeJSON, sessionID, cancelled, "session_closed")
 	m.emitOptionCancelled(writeJSON, sessionID, cancelledOptions, "session_closed")
 
+	if runWrite == nil {
+		runWrite = writeJSON
+	}
+	if err := runWrite(map[string]interface{}{
+		"type":       models.AgentEventAISessionClosed,
+		"session_id": sessionID,
+	}); err != nil {
+		logger.Warn(fmt.Sprintf("ai.session.close: terminal delivery deferred session=%s error=%v", sessionID, err))
+	}
 	if cancel != nil {
 		cancel()
 	}
-	_ = writeJSON(map[string]interface{}{
-		"type":       models.AgentEventAISessionClosed,
-		"session_id": sessionID,
-	})
 }
 
 func (m *agentAIManager) closeAll() {
@@ -2819,6 +2934,11 @@ done:
 	stderrWG.Wait()
 	if ctx.Err() != nil {
 		status, errMsg := agentAIRunStoppedStatus(run.activity, limiter)
+		statusPayload := map[string]interface{}{
+			"type":       models.AgentEventAIStatus,
+			"session_id": run.sessionID,
+			"status":     status,
+		}
 		if errMsg != "" {
 			if codexPhase != "" {
 				errMsg = fmt.Sprintf("%s while %s", errMsg, codexPhase)
@@ -2826,13 +2946,9 @@ done:
 			if stderrText := strings.TrimSpace(stderrBuf.String()); stderrText != "" {
 				errMsg = fmt.Sprintf("%s; codex stderr: %s", errMsg, truncateForCloud(stderrText))
 			}
-			_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, errors.New(errMsg)))
+			statusPayload["error"] = errMsg
 		}
-		_ = writeJSON(map[string]interface{}{
-			"type":       models.AgentEventAIStatus,
-			"session_id": run.sessionID,
-			"status":     status,
-		})
+		_ = writeJSON(statusPayload)
 		return agentAIRunDone
 	}
 	if terminalErr != "" {
@@ -3233,14 +3349,15 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 
 	if ctx.Err() != nil {
 		status, errMsg := agentAIRunStoppedStatus(run.activity, limiter)
-		if errMsg != "" {
-			_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, errors.New(errMsg)))
-		}
-		_ = writeJSON(map[string]interface{}{
+		statusPayload := map[string]interface{}{
 			"type":       models.AgentEventAIStatus,
 			"session_id": run.sessionID,
 			"status":     status,
-		})
+		}
+		if errMsg != "" {
+			statusPayload["error"] = errMsg
+		}
+		_ = writeJSON(statusPayload)
 		return agentAIRunDone
 	}
 	if waitErr != nil {

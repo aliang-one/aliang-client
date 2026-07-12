@@ -743,14 +743,16 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("invalid http1_drop configuration: %w", err)
 		}
 	}
-	if modelMapping := c.Customer.ModelMapping; modelMapping != nil {
-		if err := modelMapping.Validate(); err != nil {
-			return fmt.Errorf("invalid model_mapping configuration: %w", err)
+	if c.Customer != nil {
+		if modelMapping := c.Customer.ModelMapping; modelMapping != nil {
+			if err := modelMapping.Validate(); err != nil {
+				return fmt.Errorf("invalid model_mapping configuration: %w", err)
+			}
 		}
-	}
-	if customEnvVars := c.Customer.CustomEnvVars; customEnvVars != nil {
-		if err := customEnvVars.Validate(); err != nil {
-			return fmt.Errorf("invalid custom_env_vars configuration: %w", err)
+		if customEnvVars := c.Customer.CustomEnvVars; customEnvVars != nil {
+			if err := customEnvVars.Validate(); err != nil {
+				return fmt.Errorf("invalid custom_env_vars configuration: %w", err)
+			}
 		}
 	}
 

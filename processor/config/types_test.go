@@ -1001,3 +1001,15 @@ func TestConfigAgentBaseURL(t *testing.T) {
 		t.Fatalf("AgentBaseURL() aliangServer fallback = %q, want http://localhost:4000", got)
 	}
 }
+
+func TestConfigValidateAllowsMinimalAgentConfigWithoutCustomer(t *testing.T) {
+	cfg := &Config{
+		Core: &CoreConfig{
+			APIServer:   "http://127.0.0.1:4106",
+			AgentServer: "http://127.0.0.1:4106",
+		},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v, want nil for minimal agent config", err)
+	}
+}

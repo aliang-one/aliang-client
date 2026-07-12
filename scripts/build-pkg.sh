@@ -13,6 +13,14 @@ APP_DIR="$PAYLOAD_DIR/Applications/Aliang.app"
 CORE_DIR="$PAYLOAD_DIR/Library/Application Support/one.aliang.aliang"
 VERSION="${VERSION:-1.0.0}"
 ARCH="${ARCH:-}"
+MAC_APPLICATION_IDENTITY="${MAC_APPLICATION_IDENTITY:-}"
+MAC_INSTALLER_IDENTITY="${MAC_INSTALLER_IDENTITY:-}"
+REQUIRE_SIGNED_RELEASE="${REQUIRE_SIGNED_RELEASE:-0}"
+
+if [ "$REQUIRE_SIGNED_RELEASE" = "1" ] && { [ -z "$MAC_APPLICATION_IDENTITY" ] || [ -z "$MAC_INSTALLER_IDENTITY" ]; }; then
+	echo "ERROR: signed release requires MAC_APPLICATION_IDENTITY and MAC_INSTALLER_IDENTITY" >&2
+	exit 1
+fi
 
 if [ -z "$ARCH" ]; then
     case "$(uname -m)" in
@@ -76,6 +84,18 @@ if [ -f "$SCRIPT_DIR/Aliang.icns" ]; then
     echo "=== App icon copied ==="
 else
     echo "=== Warning: Aliang.icns not found, skipping icon ==="
+fi
+
+# Sign both installed executables before packaging. The app bundle owns its own
+# copy while the LaunchDaemon installs the Core copy separately.
+if [ -n "$MAC_APPLICATION_IDENTITY" ]; then
+	echo "=== Signing app and Core binaries ==="
+	codesign --force --options runtime --timestamp \
+		--sign "$MAC_APPLICATION_IDENTITY" "$CORE_DIR/aliang"
+	codesign --force --options runtime --timestamp \
+		--sign "$MAC_APPLICATION_IDENTITY" "$APP_DIR"
+else
+	echo "=== App signing skipped (development package only) ==="
 fi
 
 # Step 5: Create preinstall script
@@ -202,19 +222,33 @@ echo "=== App bundle and Core binary ready ==="
 
 # Step 8: Build component package with pkgbuild
 echo "=== Building component package ==="
-pkgbuild --identifier one.aliang.aliang \
-    --version "$VERSION" \
-    --root "$PAYLOAD_DIR" \
-    --scripts "$SCRIPTS_DIR" \
-    --install-location "/" \
-    "$BUILD_DIR/Aliang.pkg"
+PKGBUILD_ARGS=(
+	--identifier one.aliang.aliang
+	--version "$VERSION"
+	--root "$PAYLOAD_DIR"
+	--scripts "$SCRIPTS_DIR"
+	--install-location "/"
+)
+if [ -n "$MAC_INSTALLER_IDENTITY" ]; then
+	PKGBUILD_ARGS+=(--sign "$MAC_INSTALLER_IDENTITY")
+fi
+pkgbuild "${PKGBUILD_ARGS[@]}" "$BUILD_DIR/Aliang.pkg"
 
 # Step 9: Create distribution package with productbuild
 echo "=== Building distribution package ==="
-productbuild --identifier one.aliang.aliang \
-    --version "$VERSION" \
-    --package "$BUILD_DIR/Aliang.pkg" \
-    "$PKG_PATH"
+PRODUCTBUILD_ARGS=(
+	--identifier one.aliang.aliang
+	--version "$VERSION"
+	--package "$BUILD_DIR/Aliang.pkg"
+)
+if [ -n "$MAC_INSTALLER_IDENTITY" ]; then
+	PRODUCTBUILD_ARGS+=(--sign "$MAC_INSTALLER_IDENTITY")
+fi
+productbuild "${PRODUCTBUILD_ARGS[@]}" "$PKG_PATH"
+
+if [ -n "$MAC_INSTALLER_IDENTITY" ]; then
+	pkgutil --check-signature "$PKG_PATH"
+fi
 
 echo ""
 echo "=== Build Complete ==="

@@ -223,6 +223,9 @@ func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn) error {
 	if err := s.sendAgentHello(writeJSON, "connect"); err != nil {
 		return err
 	}
+	// Re-send terminal events whose ACK was lost across a socket/process restart.
+	// Server handling is idempotent by run_id + event_seq.
+	s.ai.replayPendingTerminals(writeJSON)
 
 	defer s.terminal.closeAll()
 	// NOTE: AI sessions are intentionally NOT closed here. A transient WS
@@ -368,6 +371,16 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 		s.mu.Unlock()
 	case models.AgentEventHeartbeatAck:
 		s.setRemoteConnectionState(true, "online", "")
+		// Retry durable terminals while the socket remains healthy. A prior
+		// delivery may have reached Server while its database was unavailable;
+		// waiting for another reconnect would otherwise leave the run stuck.
+		s.ai.replayPendingTerminals(writeJSON)
+	case models.AgentEventAIRunEventAck:
+		s.setRemoteConnectionState(true, "online", "")
+		s.ai.acknowledgePendingTerminal(
+			remoteString(msg, "run_id"),
+			int64(remoteInt(msg, "accepted_seq", 0)),
+		)
 	case models.AgentEventDeviceUnbound:
 		logger.Warn("[AGENT-BOOT] remote_connection device_unbound")
 		s.DisableWithReason("device_unbound")
@@ -668,7 +681,7 @@ func agentPlatform() string {
 }
 
 func agentCapabilities() []string {
-	caps := []string{"terminal", "terminal_stream", "file_read", "file_diff", "command_launch"}
+	caps := []string{"terminal", "terminal_stream", "file_read", "file_diff", "command_launch", "ai_run_protocol_v2"}
 	if agentNativePTYSupported() {
 		caps = append(caps, "terminal_pty", "terminal_resize")
 	} else {
