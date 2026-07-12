@@ -127,7 +127,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 	logAgentStartupConfig("core_ensure_agent")
 	if err := agentruntime.EnsureStarted(); err != nil {
 		logger.Warn(fmt.Sprintf("Failed to start user agent runtime: %v", err))
-	} else if err := services.RequestUserAgentSyncAfterAuth("agent_started"); err != nil {
+	} else if err := services.SyncUserAgentAfterAuthWithRetry("agent_started"); err != nil {
 		logger.Warn(fmt.Sprintf("Failed to sync user session to agent runtime: %v", err))
 	}
 

@@ -12,7 +12,7 @@ const Name = "AliangCore"
 var (
 	// Version can be set at link time by executing
 	// the command: `git describe --abbrev=0 --tags HEAD`
-	Version string
+	Version = "v1.1.10"
 
 	// GitCommit can be set at link time by executing
 	// the command: `git rev-parse --short HEAD`

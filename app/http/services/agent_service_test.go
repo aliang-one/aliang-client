@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1163,6 +1165,106 @@ func TestRequestUserAgentSyncAfterAuthRequestsLocalUserAgentWithUserAuthorizatio
 	}
 	if !syncCalled {
 		t.Fatal("local user-agent sync endpoint was not called")
+	}
+}
+
+func resetAgentAuthSyncCoordinatorForTest(t *testing.T) {
+	t.Helper()
+	originalAttempt := agentAuthSyncAttempt
+	originalSleep := agentAuthSyncSleep
+	originalRejectedHandler := agentAuthRejectedHandler
+	originalOwner := auth.IsSessionOwnerProcess()
+	agentAuthSyncStateMu.Lock()
+	lastAgentSyncedAuth = ""
+	agentAuthSyncStateMu.Unlock()
+	agentAuthSyncGroup.Forget("session-owner-agent-sync")
+	t.Cleanup(func() {
+		agentAuthSyncAttempt = originalAttempt
+		agentAuthSyncSleep = originalSleep
+		agentAuthRejectedHandler = originalRejectedHandler
+		auth.SetSessionOwnerProcess(originalOwner)
+		auth.SetCurrentUserInfo(nil)
+		agentAuthSyncStateMu.Lock()
+		lastAgentSyncedAuth = ""
+		agentAuthSyncStateMu.Unlock()
+		agentAuthSyncGroup.Forget("session-owner-agent-sync")
+	})
+}
+
+func TestSyncUserAgentAfterAuthWithRetryConvergesAfterAgentStarts(t *testing.T) {
+	resetAgentAuthSyncCoordinatorForTest(t)
+	auth.SetSessionOwnerProcess(true)
+	auth.SetCurrentUserInfo(&auth.UserInfo{AccessToken: "access-retry", TokenType: "Bearer"})
+
+	var attempts int
+	agentAuthSyncAttempt = func(string) error {
+		attempts++
+		if attempts < 3 {
+			return errors.New("dial tcp 127.0.0.1:56433: connect: connection refused")
+		}
+		return nil
+	}
+	agentAuthSyncSleep = func(time.Duration) {}
+
+	if err := SyncUserAgentAfterAuthWithRetry("login"); err != nil {
+		t.Fatalf("SyncUserAgentAfterAuthWithRetry() error = %v", err)
+	}
+	if attempts != 3 {
+		t.Fatalf("sync attempts = %d, want 3", attempts)
+	}
+}
+
+func TestSyncUserAgentAfterAuthWithRetryCoalescesConcurrentRefreshAndRestore(t *testing.T) {
+	resetAgentAuthSyncCoordinatorForTest(t)
+	auth.SetSessionOwnerProcess(true)
+	auth.SetCurrentUserInfo(&auth.UserInfo{AccessToken: "access-shared", TokenType: "Bearer"})
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var attempts atomic.Int32
+	agentAuthSyncAttempt = func(string) error {
+		if attempts.Add(1) == 1 {
+			close(started)
+		}
+		<-release
+		return nil
+	}
+
+	errs := make(chan error, 2)
+	go func() { errs <- SyncUserAgentAfterAuthWithRetry("session_refreshed") }()
+	<-started
+	go func() { errs <- SyncUserAgentAfterAuthWithRetry("restore_session") }()
+	close(release)
+	for i := 0; i < 2; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("concurrent sync error = %v", err)
+		}
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("sync attempts = %d, want 1", got)
+	}
+}
+
+func TestSyncUserAgentAfterAuthWithRetryDelegates401ToSessionOwner(t *testing.T) {
+	resetAgentAuthSyncCoordinatorForTest(t)
+	auth.SetSessionOwnerProcess(true)
+	auth.SetCurrentUserInfo(&auth.UserInfo{AccessToken: "access-rejected", TokenType: "Bearer"})
+
+	recovered := false
+	agentAuthRejectedHandler = func() { recovered = true }
+	agentAuthSyncAttempt = func(string) error {
+		return &localUserAgentResponseError{
+			StatusCode: http.StatusUnauthorized,
+			Body:       `{"error":"authentication_required"}`,
+		}
+	}
+
+	err := SyncUserAgentAfterAuthWithRetry("login")
+	if err == nil {
+		t.Fatal("SyncUserAgentAfterAuthWithRetry() error = nil, want 401")
+	}
+	if !recovered {
+		t.Fatal("session owner recovery was not requested after forwarded authorization 401")
 	}
 }
 

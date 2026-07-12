@@ -110,7 +110,7 @@ func handleAuthRefreshed() {
 	// in process-local memory, updates the live PhoneServer session, and reconnects
 	// when needed. The agent never reads or rotates the persisted refresh token.
 	go func() {
-		if err := RequestUserAgentSyncAfterAuth("session_refreshed"); err != nil {
+		if err := SyncUserAgentAfterAuthWithRetry("session_refreshed"); err != nil {
 			logger.Warn(fmt.Sprintf("Failed to forward refreshed session to user agent: %v", err))
 		}
 	}()

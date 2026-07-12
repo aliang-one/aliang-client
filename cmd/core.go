@@ -192,11 +192,21 @@ func registerIPCHandlers(s *ipc.Server) {
 	s.Register(ipc.ActionShutdown, handleShutdown)
 }
 
-func handleSyncAgentAuth(_ json.RawMessage) (interface{}, error) {
-	if err := services.RequestUserAgentSyncAfterAuth("agent_started"); err != nil {
+func handleSyncAgentAuth(raw json.RawMessage) (interface{}, error) {
+	reason := "agent_started"
+	if len(raw) > 0 {
+		var args ipc.SyncAgentAuthArgs
+		if err := json.Unmarshal(raw, &args); err != nil {
+			return nil, fmt.Errorf("invalid sync_agent_auth args: %w", err)
+		}
+		if strings.TrimSpace(args.Reason) != "" {
+			reason = strings.TrimSpace(args.Reason)
+		}
+	}
+	if err := services.SyncUserAgentAfterAuthWithRetry(reason); err != nil {
 		return nil, err
 	}
-	return map[string]interface{}{"status": "synced"}, nil
+	return map[string]interface{}{"status": "synced", "reason": reason}, nil
 }
 
 func handlePing(_ json.RawMessage) (interface{}, error) {

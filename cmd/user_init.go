@@ -32,7 +32,7 @@ func InitializeUser(token string) error {
 			// 登录成功即视为可启动
 			startupState.SetFetchSuccess(true)
 			startupState.SetStatus(runtime.READY)
-			if err := services.RequestUserAgentSyncAfterAuth("token_activation"); err != nil {
+			if err := services.SyncUserAgentAfterAuthWithRetry("token_activation"); err != nil {
 				logger.Warn(fmt.Sprintf("Agent device registration failed after token activation: %v", err))
 			}
 			logger.Info("User activated successfully, status: READY")
@@ -55,7 +55,7 @@ func InitializeUser(token string) error {
 				// 标记为有本地用户信息
 				config.SetHasLocalUserInfo(true)
 				logger.Debug("Local user info loaded")
-				if err := services.RequestUserAgentSyncAfterAuth("startup_restore"); err != nil {
+				if err := services.SyncUserAgentAfterAuthWithRetry("startup_restore"); err != nil {
 					logger.Warn(fmt.Sprintf("Agent device registration failed after startup restore: %v", err))
 				}
 			}

@@ -157,10 +157,8 @@ func (a *CompanionApp) connectAndStartHTTP() {
 
 	if err := agentruntime.EnsureStarted(); err != nil {
 		logger.Warn("Failed to start user agent runtime from Windows companion", "error", err)
-	} else if resp, err := a.ipcClient.Send(ipc.ActionSyncAgentAuth, nil); err != nil {
+	} else if err := a.syncAgentAuthFromCore("companion_agent_started"); err != nil {
 		logger.Warn("Failed to request agent auth sync from core", "error", err)
-	} else if !resp.OK {
-		logger.Warn("Core rejected agent auth sync", "error", resp.Error)
 	}
 
 	a.syncState()

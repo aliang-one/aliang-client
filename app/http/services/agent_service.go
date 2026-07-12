@@ -29,6 +29,7 @@ import (
 	"github.com/google/shlex"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -39,6 +40,7 @@ const (
 	agentIdentityFilename  = "device_identity.json"
 	agentDefaultLaunchMode = "external_terminal"
 	agentHTTPTimeout       = 8 * time.Second
+	agentAuthSyncTimeout   = 20 * time.Second
 	agentLogoutTimeout     = 2 * time.Second
 	agentStatusSyncPath    = "/api/agent/status"
 	AgentRuntimeEnv        = "ALIANG_USER_AGENT_RUNTIME"
@@ -46,6 +48,23 @@ const (
 	AgentForwardedAuthorizationHeader = "X-Aliang-User-Authorization"
 	AgentForwardedUserKeyHeader       = "X-Aliang-User-Key"
 	AgentUserKeyHeader                = "X-Aliang-User-Key"
+)
+
+const (
+	agentAuthSyncRetryWindow = 45 * time.Second
+	agentAuthSyncRetryMin    = 500 * time.Millisecond
+	agentAuthSyncRetryMax    = 2 * time.Second
+)
+
+var (
+	agentAuthSyncGroup       singleflight.Group
+	agentAuthSyncStateMu     sync.Mutex
+	lastAgentSyncedAuth      string
+	agentAuthSyncAttempt     = RequestUserAgentSyncAfterAuth
+	agentAuthSyncSleep       = time.Sleep
+	agentAuthRejectedHandler = func() {
+		auth.RecoverOrExpireLocalSession("user agent rejected forwarded authorization")
+	}
 )
 
 var (
@@ -594,6 +613,110 @@ func RequestUserAgentSyncAfterAuth(reason string) error {
 	}
 	logger.Info(fmt.Sprintf("[AGENT-BOOT] auth_sync success reason=%s", reason))
 	return nil
+}
+
+// SyncUserAgentAfterAuthWithRetry is the session-owner side of the agent
+// bootstrap handshake. Login can be handled by the root core before the
+// login-user watchdog has started the user-agent process, so a single POST to
+// 56433 is not sufficient. Concurrent login/restore/refresh triggers collapse
+// into one flight, and transient local/remote failures are retried until the
+// user-agent has had enough time to become ready.
+func SyncUserAgentAfterAuthWithRetry(reason string) error {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "auth"
+	}
+
+	_, err, _ := agentAuthSyncGroup.Do("session-owner-agent-sync", func() (interface{}, error) {
+		authHeader := effectiveAgentRegisterAuthHeader("")
+		if authHeader == "" {
+			return nil, errors.New("user authorization is not available for agent device registration")
+		}
+
+		force := shouldForceAgentAuthSync(reason)
+		agentAuthSyncStateMu.Lock()
+		alreadySynced := !force && lastAgentSyncedAuth == authHeader
+		agentAuthSyncStateMu.Unlock()
+		if alreadySynced {
+			logger.Info(fmt.Sprintf("[AGENT-BOOT] auth_sync coalesced reason=%s", reason))
+			return nil, nil
+		}
+
+		deadline := time.Now().Add(agentAuthSyncRetryWindow)
+		delay := agentAuthSyncRetryMin
+		attempt := 0
+		for {
+			attempt++
+			err := agentAuthSyncAttempt(reason)
+			if err == nil {
+				agentAuthSyncStateMu.Lock()
+				lastAgentSyncedAuth = effectiveAgentRegisterAuthHeader("")
+				agentAuthSyncStateMu.Unlock()
+				logger.Info(fmt.Sprintf("[AGENT-BOOT] auth_sync converged reason=%s attempts=%d", reason, attempt))
+				return nil, nil
+			}
+
+			if isForwardedUserAuthorizationRejected(err) && auth.IsSessionOwnerProcess() {
+				logger.Warn(fmt.Sprintf("[AGENT-BOOT] auth_sync owner_recovery_requested reason=%s error=%v", reason, err))
+				agentAuthRejectedHandler()
+				return nil, err
+			}
+			if !isRetryableAgentAuthSyncError(err) || time.Now().Add(delay).After(deadline) {
+				return nil, err
+			}
+
+			logger.Info(fmt.Sprintf("[AGENT-BOOT] auth_sync retrying reason=%s attempt=%d delay=%s error=%v", reason, attempt, delay, err))
+			agentAuthSyncSleep(delay)
+			delay *= 2
+			if delay > agentAuthSyncRetryMax {
+				delay = agentAuthSyncRetryMax
+			}
+		}
+	})
+	return err
+}
+
+func shouldForceAgentAuthSync(reason string) bool {
+	reason = strings.ToLower(strings.TrimSpace(reason))
+	return strings.Contains(reason, "agent_started") ||
+		strings.Contains(reason, "agent_restarted") ||
+		strings.Contains(reason, "watchdog")
+}
+
+func isRetryableAgentAuthSyncError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var responseErr *localUserAgentResponseError
+	if errors.As(err, &responseErr) {
+		return responseErr.StatusCode >= http.StatusInternalServerError
+	}
+	text := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"connection refused",
+		"connection reset",
+		"broken pipe",
+		"unexpected eof",
+		"deadline exceeded",
+		"timeout",
+		"no such host",
+	} {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func isForwardedUserAuthorizationRejected(err error) bool {
+	var responseErr *localUserAgentResponseError
+	if !errors.As(err, &responseErr) || responseErr.StatusCode != http.StatusUnauthorized {
+		return false
+	}
+	text := strings.ToLower(responseErr.Body)
+	return strings.Contains(text, "authentication_required") ||
+		strings.Contains(text, "missing_bearer_token") ||
+		strings.Contains(text, "user authorization")
 }
 
 func RequestUserAgentStartupSync(reason string) error {
@@ -1790,7 +1913,7 @@ func requestLocalUserAgentSyncAfterAuth(reason string, authHeader string, userKe
 	if encoded := values.Encode(); encoded != "" {
 		endpoint += "?" + encoded
 	}
-	return requestLocalUserAgentPost(endpoint, authHeader, userKey)
+	return requestLocalUserAgentPostWithTimeout(endpoint, authHeader, userKey, agentAuthSyncTimeout)
 }
 
 func requestLocalUserAgentDisableAfterLogout(reason string) error {
@@ -1825,6 +1948,15 @@ func requestLocalUserAgentPost(endpoint string, authHeader string, userKey strin
 	return requestLocalUserAgentPostWithTimeout(endpoint, authHeader, userKey, agentHTTPTimeout)
 }
 
+type localUserAgentResponseError struct {
+	StatusCode int
+	Body       string
+}
+
+func (e *localUserAgentResponseError) Error() string {
+	return fmt.Sprintf("local user agent returned %d: %s", e.StatusCode, e.Body)
+}
+
 func requestLocalUserAgentPostWithTimeout(endpoint string, authHeader string, userKey string, timeout time.Duration) error {
 	req, err := http.NewRequest(http.MethodPost, endpoint, nil)
 	if err != nil {
@@ -1847,7 +1979,7 @@ func requestLocalUserAgentPostWithTimeout(endpoint string, authHeader string, us
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("local user agent returned %d: %s", resp.StatusCode, string(raw))
+		return &localUserAgentResponseError{StatusCode: resp.StatusCode, Body: string(raw)}
 	}
 	return nil
 }

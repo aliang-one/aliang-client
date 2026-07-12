@@ -2,7 +2,7 @@
 # This script should be run on Windows with WiX installed
 
 param(
-    [string]$Version = "1.0.0",
+    [string]$Version = "1.1.10",
     [string]$OutputDir = ".",
     [string]$WiXPath = "",
     [string]$CandleExe = "",

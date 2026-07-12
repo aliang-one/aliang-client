@@ -86,7 +86,7 @@ func clearStartupStateAfterLogout() {
 // It is a package-level var so tests can swap in a recording/blocking stub.
 // Auth HTTP handlers fire it asynchronously (see agentSyncResult) so the
 // response is never blocked by this side-effect.
-var agentSyncDispatch = RequestUserAgentSyncAfterAuth
+var agentSyncDispatch = SyncUserAgentAfterAuthWithRetry
 
 // EnsureAgentAfterAuthHook 在 auth-success 事件上确保 user-agent 进程已在运行。
 // 默认 no-op；真实实现由 agentruntime 包通过 init() 注入，以此规避 services →

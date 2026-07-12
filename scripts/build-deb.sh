@@ -14,7 +14,7 @@ CONTROL_DIR="$PAYLOAD_DIR/DEBIAN"
 SYSTEMD_DIR="$PAYLOAD_DIR/lib/systemd/system"
 APP_DIR="$PAYLOAD_DIR/usr/local/bin"
 SHARE_DIR="$PAYLOAD_DIR/usr/share/aliang"
-VERSION="${VERSION:-1.0.0}"
+VERSION="${VERSION:-1.1.10}"
 ARCH="${ARCH:-amd64}"
 
 echo "=== Building Aliang DEB Package ==="

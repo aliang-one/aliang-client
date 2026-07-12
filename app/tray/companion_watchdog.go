@@ -2,10 +2,12 @@ package tray
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"aliang.one/nursorgate/app/agentruntime"
 	"aliang.one/nursorgate/common/logger"
+	"aliang.one/nursorgate/internal/ipc"
 )
 
 // user-agent 看护节奏。写成常量方便按实测调整；不引入配置项，避免给 core 配置面
@@ -49,6 +51,8 @@ func (a *CompanionApp) agentWatchdogLoop() {
 			logger.Warn("[AGENT-WATCHDOG] threshold_reached, calling EnsureStarted")
 			if err := agentruntime.EnsureStarted(); err != nil {
 				logger.Warn(fmt.Sprintf("[AGENT-WATCHDOG] ensure_failed (will retry next cycle): %v", err))
+			} else if err := a.syncAgentAuthFromCore("watchdog_agent_restarted"); err != nil {
+				logger.Warn(fmt.Sprintf("[AGENT-WATCHDOG] auth_sync_failed (will retry next cycle): %v", err))
 			}
 			// 无论 EnsureStarted 成败都复位计数：
 			// 成功 → agent 已起，下一周期确认健康；
@@ -56,4 +60,19 @@ func (a *CompanionApp) agentWatchdogLoop() {
 			consecutiveFails = 0
 		}
 	}
+}
+
+func (a *CompanionApp) syncAgentAuthFromCore(reason string) error {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "agent_started"
+	}
+	resp, err := a.ipcClient.Send(ipc.ActionSyncAgentAuth, ipc.SyncAgentAuthArgs{Reason: reason})
+	if err != nil {
+		return err
+	}
+	if !resp.OK {
+		return fmt.Errorf("core rejected agent auth sync: %s", resp.Error)
+	}
+	return nil
 }

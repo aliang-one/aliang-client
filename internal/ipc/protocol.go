@@ -55,6 +55,12 @@ type SwitchModeArgs struct {
 	Mode string `json:"mode"` // "http" or "tun"
 }
 
+// SyncAgentAuthArgs identifies why the login-user runtime needs a fresh
+// identity handoff from the session-owner core.
+type SyncAgentAuthArgs struct {
+	Reason string `json:"reason,omitempty"`
+}
+
 // ErrorResponse creates an error response.
 func ErrorResponse(id string, err error) *Response {
 	return &Response{

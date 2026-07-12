@@ -128,7 +128,7 @@ func onReady() {
 		time.Sleep(250 * time.Millisecond)
 		if err := agentruntime.EnsureStarted(); err != nil {
 			logger.Warn(fmt.Sprintf("Failed to start user agent runtime from tray: %v", err))
-		} else if err := services.RequestUserAgentSyncAfterAuth("agent_started"); err != nil {
+		} else if err := services.SyncUserAgentAfterAuthWithRetry("agent_started"); err != nil {
 			logger.Warn(fmt.Sprintf("Failed to sync user session to agent runtime: %v", err))
 		}
 		app.ensureDashboardServer()
