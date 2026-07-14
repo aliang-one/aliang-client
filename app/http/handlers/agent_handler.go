@@ -257,6 +257,26 @@ func (h *AgentHandler) HandleVibeSessions(w http.ResponseWriter, r *http.Request
 	}
 }
 
+// HandleRuntimeSessions returns only sessions currently executing in the
+// user-agent process. The main process proxies this request to that runtime.
+func (h *AgentHandler) HandleRuntimeSessions(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
+		return
+	}
+	if services.IsUserAgentRuntime() {
+		common.Success(w, h.service.RuntimeSessions())
+		return
+	}
+	if err := h.proxyToUserAgent(w, r); err != nil {
+		common.Success(w, models.AgentRuntimeSnapshot{
+			AIConversations: []models.AgentVibeSession{},
+			Terminals:       []models.AgentTerminalRuntime{},
+			CollectedAt:     time.Now().UTC().Format(time.RFC3339),
+		})
+	}
+}
+
 // HandleVibeSession returns one session's transcript page (?id=&limit=&before=).
 func (h *AgentHandler) HandleVibeSession(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {

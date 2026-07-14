@@ -24,6 +24,7 @@ func TestAgentVibeSessionRoutesRegistered(t *testing.T) {
 		notFound bool
 	}{
 		{"/api/agent/sessions", false},
+		{"/api/agent/runtime-sessions", false},
 		{"/api/agent/session", false},
 		{"/api/agent/tools", false},
 	} {

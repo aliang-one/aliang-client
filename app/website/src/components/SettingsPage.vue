@@ -118,7 +118,7 @@
         </div>
 
         <div
-          v-if="currentPage !== 'user'"
+          v-if="currentPage !== 'user' && currentPage !== 'agent'"
           class="mb-6 rounded-xl border px-4 py-3 text-sm"
           :class="isAuthenticated ? 'border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-300' : 'border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-300'"
         >
@@ -170,7 +170,7 @@
           <UserInfoSettings />
         </section>
 
-        <section v-else-if="currentPage === 'agent'" class="flex flex-col gap-4">
+        <section v-else-if="currentPage === 'agent'" class="flex flex-col gap-5">
           <div
             v-if="!isAuthenticated"
             class="rounded-2xl border border-dashed border-slate-300 bg-white px-6 py-8 text-center shadow-sm dark:border-slate-700 dark:bg-slate-900"
@@ -182,18 +182,22 @@
               </p>
             </div>
           </div>
-          <AgentSettings v-if="isAuthenticated" />
-          <CustomEnvSettings
-            v-if="isAuthenticated"
-            :config="customerConfig"
-            :loading="isLoadingCustomerConfig"
-            :saving="isSavingCustomerConfig"
-            :error="customerConfigError"
-            :success-message="customerConfigSuccess"
-            @save="saveCustomerConfig"
-          />
-          <AgentScanDirectoriesSettings v-if="isAuthenticated" />
-          <AgentActivitySettings v-if="isAuthenticated" />
+          <template v-else>
+            <AgentSettings />
+            <AgentRuntimeSessions />
+            <AgentActivitySettings />
+            <div class="grid grid-cols-1 items-stretch gap-5 lg:grid-cols-2">
+              <CustomEnvSettings
+                :config="customerConfig"
+                :loading="isLoadingCustomerConfig"
+                :saving="isSavingCustomerConfig"
+                :error="customerConfigError"
+                :success-message="customerConfigSuccess"
+                @save="saveCustomerConfig"
+              />
+              <AgentScanDirectoriesSettings />
+            </div>
+          </template>
         </section>
 
         <section v-else class="flex flex-col gap-4">
@@ -245,6 +249,7 @@ import UserInfoSettings from './settings/UserInfoSettings.vue';
 import LogsSettings from './settings/LogsSettings.vue';
 import SystemSettings from './settings/SystemSettings.vue';
 import AgentSettings from './settings/AgentSettings.vue';
+import AgentRuntimeSessions from './settings/AgentRuntimeSessions.vue';
 import AgentActivitySettings from './settings/AgentActivitySettings.vue';
 import AgentScanDirectoriesSettings from './settings/AgentScanDirectoriesSettings.vue';
 import ModelMappingSettings from './settings/ModelMappingSettings.vue';
@@ -423,6 +428,7 @@ export default {
     LogsSettings,
     SystemSettings,
     AgentSettings,
+    AgentRuntimeSessions,
     AgentActivitySettings,
     AgentScanDirectoriesSettings,
     ModelMappingSettings,

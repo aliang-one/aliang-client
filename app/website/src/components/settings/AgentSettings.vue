@@ -1,79 +1,94 @@
 <template>
-  <div class="rounded-xl border border-slate-200 bg-white p-5 dark:border-slate-800 dark:bg-background-dark">
-    <div class="flex items-start justify-between gap-4">
-      <div class="min-w-0">
-        <h3 class="flex items-center gap-2 font-bold">
-          <span class="material-symbols-outlined text-primary">terminal</span>
-          {{ t('agent_title') }}
-        </h3>
-        <p class="mt-1 text-[11px] leading-5 text-slate-500 dark:text-slate-400">
-          {{ t('agent_desc') }}
-        </p>
-      </div>
-      <span class="shrink-0 rounded-full px-2 py-0.5 text-[10px] font-bold" :class="statusBadgeClass">
-        {{ statusLabel }}
-      </span>
-    </div>
-
-    <div class="mt-4 rounded-lg border px-3 py-3" :class="statusPanelClass">
-      <div class="flex items-center justify-between gap-3">
-        <div class="min-w-0">
-          <p class="text-sm font-semibold text-slate-800 dark:text-slate-100">{{ statusTitle }}</p>
-          <p class="mt-1 text-[11px] leading-5 text-slate-600 dark:text-slate-400">{{ statusMessage }}</p>
+  <div class="overflow-hidden rounded-xl border border-slate-200 bg-white dark:border-slate-800 dark:bg-background-dark">
+    <div class="p-5 sm:p-6">
+      <div class="flex flex-col gap-5 sm:flex-row sm:items-start sm:justify-between">
+        <div class="flex min-w-0 items-start gap-3">
+          <div class="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
+            <span class="material-symbols-outlined">terminal</span>
+          </div>
+          <div class="min-w-0">
+            <div class="flex flex-wrap items-center gap-2">
+              <h2 class="text-base font-bold text-slate-900 dark:text-white">{{ t('agent_title') }}</h2>
+              <span class="rounded-full px-2 py-0.5 text-[10px] font-bold" :class="statusBadgeClass">
+                {{ statusLabel }}
+              </span>
+            </div>
+            <p class="mt-1 max-w-2xl text-xs leading-5 text-slate-500 dark:text-slate-400">
+              {{ t('agent_desc') }}
+            </p>
+          </div>
         </div>
-        <div class="flex shrink-0 flex-col gap-2 sm:flex-row">
+
+        <div class="flex shrink-0 flex-wrap gap-2 sm:justify-end">
           <button
             v-if="agentEnabled"
             type="button"
-            class="inline-flex h-9 items-center justify-center gap-1 rounded-lg bg-slate-900 px-3 text-[11px] font-bold text-white transition hover:opacity-90 dark:bg-primary"
+            class="inline-flex h-11 items-center justify-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 text-xs font-bold text-slate-700 transition-colors hover:border-primary/40 hover:bg-primary/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-primary/10"
             @click="settingsModalOpen = true"
           >
-            <span class="material-symbols-outlined text-sm">tune</span>
+            <span class="material-symbols-outlined text-base">tune</span>
             {{ t('agent_settings') }}
           </button>
           <button
             type="button"
-            class="inline-flex h-9 items-center justify-center rounded-lg px-3 text-[11px] font-bold transition disabled:cursor-not-allowed disabled:opacity-60"
-            :class="agentEnabled ? 'border border-red-200 text-red-600 hover:bg-red-50 dark:border-red-500/30 dark:text-red-300 dark:hover:bg-red-500/10' : 'bg-primary text-white hover:bg-primary/90'"
+            class="inline-flex h-11 items-center justify-center gap-1.5 rounded-lg px-3 text-xs font-bold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30 disabled:cursor-not-allowed disabled:opacity-60"
+            :class="agentEnabled ? 'border border-red-200 bg-white text-red-600 hover:bg-red-50 dark:border-red-500/30 dark:bg-slate-900 dark:text-red-300 dark:hover:bg-red-500/10' : 'bg-primary text-white hover:bg-primary/90'"
             :disabled="loading || binding"
             @click="agentEnabled ? turnOffAgent() : turnOnAgent()"
           >
+            <span class="material-symbols-outlined text-base">{{ agentEnabled ? 'power_settings_new' : 'play_arrow' }}</span>
             {{ agentEnabled ? t('agent_disable') : t('agent_enable') }}
           </button>
         </div>
       </div>
-      <div v-if="deviceSummary" class="mt-3 rounded border border-slate-200 bg-white/80 px-3 py-2 text-[11px] text-slate-600 dark:border-slate-700 dark:bg-slate-900/50 dark:text-slate-300">
-        {{ deviceSummary }}
-      </div>
-      <div class="mt-3 grid grid-cols-2 gap-2 text-[10px] text-slate-500 dark:text-slate-400">
-        <div class="rounded border border-slate-200 bg-white/80 px-2 py-2 dark:border-slate-700 dark:bg-slate-900/50">
-          <span class="block font-bold uppercase tracking-[0.16em]">{{ t('agent_runtime') }}</span>
-          <span class="mt-1 block font-semibold" :class="runtimeOnline ? 'text-emerald-600 dark:text-emerald-300' : 'text-amber-600 dark:text-amber-300'" :title="runtimeTitle">
-            {{ runtimeLabel }}
-          </span>
+
+      <div class="mt-6 flex items-start gap-3 border-t border-slate-100 pt-5 dark:border-slate-800">
+        <div class="flex h-9 w-9 shrink-0 items-center justify-center rounded-full" :class="statusIconClass">
+          <span class="material-symbols-outlined text-lg">{{ statusIcon }}</span>
         </div>
-        <div class="rounded border border-slate-200 bg-white/80 px-2 py-2 dark:border-slate-700 dark:bg-slate-900/50">
-          <span class="block font-bold uppercase tracking-[0.16em]">{{ t('agent_platform') }}</span>
-          <span class="mt-1 block text-slate-700 dark:text-slate-200">{{ platformLabel }}</span>
-        </div>
-        <div class="rounded border border-slate-200 bg-white/80 px-2 py-2 dark:border-slate-700 dark:bg-slate-900/50">
-          <span class="block font-bold uppercase tracking-[0.16em]">{{ t('agent_deviceStatus') }}</span>
-          <span class="mt-1 block font-semibold" :class="deviceStatusClass">{{ deviceStatusLabel }}</span>
-        </div>
-        <div class="rounded border border-slate-200 bg-white/80 px-2 py-2 dark:border-slate-700 dark:bg-slate-900/50">
-          <span class="block font-bold uppercase tracking-[0.16em]">{{ t('agent_toolsFound') }}</span>
-          <span class="mt-1 block text-slate-700 dark:text-slate-200">{{ toolAvailabilitySummary }}</span>
-        </div>
-        <div class="rounded border border-slate-200 bg-white/80 px-2 py-2 dark:border-slate-700 dark:bg-slate-900/50">
-          <span class="block font-bold uppercase tracking-[0.16em]">{{ t('agent_server') }}</span>
-          <span class="mt-1 block truncate text-slate-700 dark:text-slate-200" :title="agentServerLabel">{{ agentServerLabel }}</span>
-        </div>
-        <div class="rounded border border-slate-200 bg-white/80 px-2 py-2 dark:border-slate-700 dark:bg-slate-900/50">
-          <span class="block font-bold uppercase tracking-[0.16em]">{{ t('agent_sync') }}</span>
-          <span class="mt-1 block truncate text-slate-700 dark:text-slate-200" :title="syncTitle">{{ syncLabel }}</span>
+        <div class="min-w-0">
+          <p class="text-sm font-semibold text-slate-900 dark:text-slate-100">{{ statusTitle }}</p>
+          <p class="mt-1 text-xs leading-5 text-slate-500 dark:text-slate-400">{{ statusMessage }}</p>
+          <p v-if="deviceSummary" class="mt-2 flex items-center gap-1.5 text-[11px] font-medium text-slate-600 dark:text-slate-300">
+            <span class="material-symbols-outlined text-sm text-slate-400">devices</span>
+            <span class="truncate">{{ deviceSummary }}</span>
+          </p>
         </div>
       </div>
     </div>
+
+    <dl class="grid grid-cols-2 border-t border-slate-200 bg-slate-50/70 dark:border-slate-800 dark:bg-slate-900/35 lg:grid-cols-4">
+      <div class="border-b border-slate-200 p-4 dark:border-slate-800 lg:border-b-0 lg:border-r">
+        <dt class="flex items-center gap-1.5 text-[10px] font-bold uppercase text-slate-400">
+          <span class="material-symbols-outlined text-sm">memory</span>
+          {{ t('agent_runtime') }}
+        </dt>
+        <dd class="mt-1.5 text-sm font-semibold" :class="runtimeOnline ? 'text-emerald-600 dark:text-emerald-300' : 'text-amber-600 dark:text-amber-300'" :title="runtimeTitle">
+          {{ runtimeLabel }}
+        </dd>
+      </div>
+      <div class="border-b border-l border-slate-200 p-4 dark:border-slate-800 lg:border-b-0 lg:border-l-0 lg:border-r">
+        <dt class="flex items-center gap-1.5 text-[10px] font-bold uppercase text-slate-400">
+          <span class="material-symbols-outlined text-sm">laptop_mac</span>
+          {{ t('agent_deviceStatus') }}
+        </dt>
+        <dd class="mt-1.5 text-sm font-semibold" :class="deviceStatusClass">{{ deviceStatusLabel }}</dd>
+      </div>
+      <div class="p-4 lg:border-r lg:border-slate-200 dark:lg:border-slate-800">
+        <dt class="flex items-center gap-1.5 text-[10px] font-bold uppercase text-slate-400">
+          <span class="material-symbols-outlined text-sm">build</span>
+          {{ t('agent_toolsFound') }}
+        </dt>
+        <dd class="mt-1.5 text-sm font-semibold text-slate-700 dark:text-slate-200">{{ toolAvailabilitySummary }}</dd>
+      </div>
+      <div class="border-l border-slate-200 p-4 dark:border-slate-800 lg:border-l-0">
+        <dt class="flex items-center gap-1.5 text-[10px] font-bold uppercase text-slate-400">
+          <span class="material-symbols-outlined text-sm">sync</span>
+          {{ t('agent_sync') }}
+        </dt>
+        <dd class="mt-1.5 truncate text-sm font-semibold text-slate-700 dark:text-slate-200" :title="syncTitle">{{ syncLabel }}</dd>
+      </div>
+    </dl>
 
     <div
       v-if="settingsModalOpen"
@@ -93,7 +108,8 @@
             </div>
             <button
               type="button"
-              class="rounded-xl p-2 text-slate-500 transition hover:bg-slate-100 hover:text-slate-700 dark:hover:bg-slate-800 dark:hover:text-slate-200"
+              class="flex h-11 w-11 items-center justify-center rounded-lg text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30 dark:hover:bg-slate-800 dark:hover:text-slate-200"
+              :aria-label="t('agent_closeSettings')"
               @click="settingsModalOpen = false"
             >
               <span class="material-symbols-outlined text-lg">close</span>
@@ -310,10 +326,14 @@ export default {
       if (this.agentEnabled) return 'bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300';
       return 'bg-slate-200 text-slate-600 dark:bg-slate-700 dark:text-slate-300';
     },
-    statusPanelClass() {
-      if (!this.runtimeOnline) return 'border-amber-200 bg-amber-50/70 dark:border-amber-500/30 dark:bg-amber-500/10';
-      if (this.agentEnabled) return 'border-emerald-200 bg-emerald-50/70 dark:border-emerald-500/30 dark:bg-emerald-500/10';
-      return 'border-slate-200 bg-slate-50 dark:border-slate-700 dark:bg-slate-900/50';
+    statusIcon() {
+      if (!this.runtimeOnline) return 'cloud_off';
+      return this.agentEnabled ? 'check_circle' : 'pause_circle';
+    },
+    statusIconClass() {
+      if (!this.runtimeOnline) return 'bg-amber-100 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300';
+      if (this.agentEnabled) return 'bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300';
+      return 'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-300';
     },
     deviceSummary() {
       const device = this.status?.device;
@@ -379,9 +399,6 @@ export default {
     availablePrimaryTools() {
       return this.primaryTools.filter(tool => tool.available);
     },
-    platformLabel() {
-      return this.status?.platform || '-';
-    },
     runtimeLabel() {
       if (!this.status?.runtime) return '-';
       return this.runtimeOnline ? this.t('agent_runtimeOnline') : this.t('agent_runtimeOffline');
@@ -431,9 +448,6 @@ export default {
           label: this.aiControlFeatureEnabled ? this.t('agent_preAIOk') : this.t('agent_preAIDisabled'),
         },
       ];
-    },
-    agentServerLabel() {
-      return this.status?.agent_server || '-';
     },
     syncLabel() {
       return this.status?.sync_status || (this.status?.registered ? this.t('agent_syncRegistered') : this.t('agent_syncNotRegistered'));

@@ -26,11 +26,11 @@ type AgentStatusResponse struct {
 	// link state?" (connection_state). The legacy booleans above are optimistic
 	// (Registered is true even when the server has rejected the token) and kept
 	// only for backward compatibility — prefer these.
-	RegistrationState    string `json:"registration_state,omitempty"`
-	RegistrationMessage  string `json:"registration_message,omitempty"`
-	ConnectionState      string `json:"connection_state,omitempty"`
-	ConnectionMessage    string `json:"connection_message,omitempty"`
-	ConnectedAt          string `json:"connected_at,omitempty"`
+	RegistrationState   string `json:"registration_state,omitempty"`
+	RegistrationMessage string `json:"registration_message,omitempty"`
+	ConnectionState     string `json:"connection_state,omitempty"`
+	ConnectionMessage   string `json:"connection_message,omitempty"`
+	ConnectedAt         string `json:"connected_at,omitempty"`
 }
 
 type AgentDisableRequest struct {
@@ -142,6 +142,21 @@ type AgentVibeTranscriptPage struct {
 	HasMore             bool   `json:"has_more"`
 	NextBeforeMessageID string `json:"next_before_message_id,omitempty"`
 	Order               string `json:"order,omitempty"`
+}
+
+type AgentRuntimeSnapshot struct {
+	AIConversations []AgentVibeSession     `json:"ai_conversations"`
+	Terminals       []AgentTerminalRuntime `json:"terminals"`
+	CollectedAt     string                 `json:"collected_at"`
+}
+
+type AgentTerminalRuntime struct {
+	ID           string `json:"id"`
+	Shell        string `json:"shell"`
+	CWD          string `json:"cwd"`
+	PTY          bool   `json:"pty"`
+	StartedAt    string `json:"started_at"`
+	LastActiveAt string `json:"last_active_at"`
 }
 
 type AgentLaunchRequest struct {

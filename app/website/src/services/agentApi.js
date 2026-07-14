@@ -53,6 +53,10 @@ export async function getAgentSessions() {
   return request('/api/agent/sessions', { method: 'GET' });
 }
 
+export async function getAgentRuntimeSessions() {
+  return request('/api/agent/runtime-sessions', { method: 'GET' });
+}
+
 export async function getAgentSessionDetail(sessionId, { limit, before } = {}) {
   const params = new URLSearchParams();
   if (limit) params.set('limit', String(limit));

@@ -247,6 +247,26 @@ func (s *AgentService) VibeSessions() []models.AgentVibeSession {
 	return overlayActiveAgentVibeSessions(snapshot, s.ai.activeVibeSessionsSnapshot(), nil).VibeSessions
 }
 
+// RuntimeSessions returns process-local sessions that are actively executing.
+// It intentionally excludes resident but idle AI conversations and terminal history.
+func (s *AgentService) RuntimeSessions() models.AgentRuntimeSnapshot {
+	snapshot := models.AgentRuntimeSnapshot{
+		AIConversations: []models.AgentVibeSession{},
+		Terminals:       []models.AgentTerminalRuntime{},
+		CollectedAt:     time.Now().UTC().Format(time.RFC3339),
+	}
+	if s == nil {
+		return snapshot
+	}
+	if s.ai != nil {
+		snapshot.AIConversations = s.ai.activeVibeSessionsSnapshot()
+	}
+	if s.terminal != nil {
+		snapshot.Terminals = s.terminal.activeSessionsSnapshot()
+	}
+	return snapshot
+}
+
 // VibeSessionDetail returns a single session's transcript page for the
 // read-only activity view. Assistant messages are capped to a one-line summary;
 // system/tool messages are filtered. Cursor pagination via beforeMessageID.

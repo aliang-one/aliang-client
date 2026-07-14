@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -43,6 +44,7 @@ type agentTerminalSession struct {
 
 	meter        *outputMeter
 	token        *struct{}
+	startedAt    time.Time
 	lastActiveAt time.Time
 }
 
@@ -235,6 +237,32 @@ func (m *agentTerminalManager) closeAll() {
 	}
 }
 
+func (m *agentTerminalManager) activeSessionsSnapshot() []models.AgentTerminalRuntime {
+	if m == nil {
+		return []models.AgentTerminalRuntime{}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sessions := make([]models.AgentTerminalRuntime, 0, len(m.sessions))
+	for _, session := range m.sessions {
+		if session == nil {
+			continue
+		}
+		sessions = append(sessions, models.AgentTerminalRuntime{
+			ID:           session.id,
+			Shell:        session.shell,
+			CWD:          session.cwd,
+			PTY:          session.isPTY,
+			StartedAt:    session.startedAt.UTC().Format(time.RFC3339),
+			LastActiveAt: session.lastActiveAt.UTC().Format(time.RFC3339),
+		})
+	}
+	sort.Slice(sessions, func(i, j int) bool {
+		return sessions[i].LastActiveAt > sessions[j].LastActiveAt
+	})
+	return sessions
+}
+
 func (m *agentTerminalManager) get(sessionID string) *agentTerminalSession {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -381,6 +409,7 @@ func startAgentTerminalProcess(sessionID string, shell string, cwd string, rows 
 }
 
 func newAgentTerminalSession(id string, shell string, cwd string, handle *agentTerminalHandle, isPTY bool) *agentTerminalSession {
+	now := time.Now()
 	return &agentTerminalSession{
 		id:           id,
 		shell:        shell,
@@ -393,7 +422,8 @@ func newAgentTerminalSession(id string, shell string, cwd string, handle *agentT
 		closer:       handle.close,
 		meter:        newOutputMeter(agentTerminalOutputRateWindow, agentTerminalOutputRateBytes, int64(agentTerminalOutputCapBytes)),
 		token:        new(struct{}),
-		lastActiveAt: time.Now(),
+		startedAt:    now,
+		lastActiveAt: now,
 	}
 }
 

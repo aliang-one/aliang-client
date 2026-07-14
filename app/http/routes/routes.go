@@ -255,6 +255,7 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	register("/api/agent/ai/stream", h.Agent.HandleAIStream, http.MethodGet)
 	register("/api/agent/ai/approval-hook", h.Agent.HandleAIApprovalHook, http.MethodPost)
 	register("/api/agent/sessions", h.Agent.HandleVibeSessions, http.MethodGet)
+	register("/api/agent/runtime-sessions", h.Agent.HandleRuntimeSessions, http.MethodGet)
 	register("/api/agent/session", h.Agent.HandleVibeSession, http.MethodGet)
 	register("/api/agent/scan-directories", h.Agent.HandleScanDirectories, http.MethodGet, http.MethodPost)
 	register("/api/docs/tutorials", h.Tutorial.HandleGetTutorial, http.MethodGet)
