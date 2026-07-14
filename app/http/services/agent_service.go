@@ -168,6 +168,7 @@ func NewAgentService() *AgentService {
 	}
 	s.ai.service = s
 	s.ai.loadPendingTerminals()
+	s.ai.loadIdentityState()
 	if err := s.loadState(); err != nil {
 		logger.Warn(fmt.Sprintf("[AGENT-BOOT] state_load failed error=%v", err))
 	} else {
@@ -1333,6 +1334,11 @@ func detectAgentTools() []models.AgentTool {
 		}
 	}
 	for i := range defs {
+		if defs[i].ID == "codex" && defs[i].Available && !codexAppServerAvailable() {
+			defs[i].Description = "OpenAI Codex CLI（app-server 不可用，将使用兼容模式）"
+		}
+	}
+	for i := range defs {
 		if defs[i].ID != "claudecode" || defs[i].Available {
 			continue
 		}
@@ -2147,6 +2153,7 @@ func (s *AgentService) collectAgentSyncSnapshotWithActiveRuns(scanDirs []string)
 	if s == nil || s.ai == nil {
 		return snapshot
 	}
+	snapshot.VibeSessions = s.ai.annotateManagedVibeSessions(snapshot.VibeSessions)
 	return overlayActiveAgentVibeSessions(snapshot, s.ai.activeVibeSessionsSnapshot(), scanDirs)
 }
 

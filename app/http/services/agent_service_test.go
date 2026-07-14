@@ -1635,6 +1635,10 @@ if [ "$1" != "app-server" ]; then
   echo "expected codex app-server, got: $*" >&2
   exit 2
 fi
+if [ "$2" = "--help" ]; then
+  echo "Usage: codex app-server --stdio"
+  exit 0
+fi
 
 mode="${ALIANG_FAKE_CODEX_MODE:-basic}"
 thread_method="start"
@@ -1649,6 +1653,10 @@ while IFS= read -r line; do
       thread_method="resume"
       if printf '%s' "$line" | grep -q 'codex-session-raw'; then
         thread_seen="1"
+      fi
+      if [ "$mode" = "resume_missing" ]; then
+        printf '{"id":1,"error":{"code":-32000,"message":"thread not found"}}\n'
+        exit 0
       fi
       printf '{"id":1,"result":{"thread":{"id":"thr_fake"},"model":"fake","modelProvider":"openai","serviceTier":null,"cwd":"%s","instructionSources":[],"approvalPolicy":"on-request","approvalsReviewer":"user","sandbox":{},"reasoningEffort":null}}\n' "$PWD"
       ;;
@@ -1667,7 +1675,7 @@ while IFS= read -r line; do
           printf '{"method":"item/commandExecution/requestApproval","id":77,"params":{"threadId":"thr_fake","turnId":"turn_fake","itemId":"cmd_fake","startedAtMs":1,"reason":"needs shell","command":"git push","cwd":"%s","availableDecisions":["accept","acceptForSession","decline","cancel"]}}\n' "$PWD"
           ;;
         history)
-          if printf '%s' "$line" | grep -q 'ALIANG_FIRST_ASSISTANT'; then
+          if [ "$thread_method" = "resume" ]; then
             text="SECOND_CONTEXT_OK"
           else
             text="FIRST ANSWER ALIANG_FIRST_ASSISTANT"
@@ -1686,15 +1694,26 @@ while IFS= read -r line; do
           exit 0
           ;;
         structured)
+          printf '{"method":"item/reasoning/summaryTextDelta","params":{"threadId":"thr_fake","turnId":"turn_fake","itemId":"reason_struct","summaryIndex":0,"delta":"分析中"}}\n'
+          printf '{"method":"thread/tokenUsage/updated","params":{"threadId":"thr_fake","turnId":"turn_fake","tokenUsage":{"last":{"inputTokens":120,"cachedInputTokens":20,"outputTokens":30,"reasoningOutputTokens":10,"totalTokens":150},"total":{"inputTokens":120,"cachedInputTokens":20,"outputTokens":30,"reasoningOutputTokens":10,"totalTokens":150},"modelContextWindow":200000}}}\n'
+          printf '{"method":"turn/plan/updated","params":{"threadId":"thr_fake","turnId":"turn_fake","explanation":"执行计划","plan":[{"step":"检查代码","status":"completed"},{"step":"修复问题","status":"inProgress"}]}}\n'
           printf '{"method":"item/started","params":{"threadId":"thr_fake","turnId":"turn_fake","item":{"type":"commandExecution","id":"cmd_struct","command":["echo","hello"],"cwd":"%s"}}}\n' "$PWD"
+          printf '{"method":"item/commandExecution/outputDelta","params":{"threadId":"thr_fake","turnId":"turn_fake","itemId":"cmd_struct","delta":"hello "}}\n'
           printf '{"method":"item/completed","params":{"threadId":"thr_fake","turnId":"turn_fake","item":{"type":"commandExecution","id":"cmd_struct","exitCode":0,"stdout":"hello world"}}}\n'
           printf '{"method":"item/started","params":{"threadId":"thr_fake","turnId":"turn_fake","item":{"type":"fileChange","id":"fc_struct","changes":[{"path":"%s/out.txt","kind":"edit","diff":"@@ -1,1 +1,2 @@\\n-old\\n+new\\n+newer\\n"}]}}}\n' "$PWD"
           printf '{"method":"item/completed","params":{"threadId":"thr_fake","turnId":"turn_fake","item":{"type":"fileChange","id":"fc_struct","changes":[{"path":"%s/out.txt","kind":"edit","diff":"@@ -1,1 +1,2 @@\\n-old\\n+new\\n+newer\\n"}]}}}\n' "$PWD"
+          printf '{"method":"turn/diff/updated","params":{"threadId":"thr_fake","turnId":"turn_fake","diff":"diff --git a/out.txt b/out.txt"}}\n'
           printf '{"method":"item/agentMessage/delta","params":{"threadId":"thr_fake","turnId":"turn_fake","itemId":"msg_fake","delta":"STRUCTURED_DONE"}}\n'
           printf '{"method":"turn/completed","params":{"threadId":"thr_fake","turn":{"id":"turn_fake","status":"completed"}}}\n'
           exit 0
           ;;
         steer)
+          ;;
+        user_input)
+          printf '{"method":"item/tool/requestUserInput","id":88,"params":{"threadId":"thr_fake","turnId":"turn_fake","itemId":"input_fake","questions":[{"id":"strategy","header":"实现策略","question":"选择实现策略","options":[{"label":"稳健方案","description":"优先兼容"},{"label":"激进方案","description":"优先速度"}],"isOther":true}]}}\n'
+          ;;
+        unknown_request)
+          printf '{"method":"item/tool/call","id":89,"params":{"threadId":"thr_fake","turnId":"turn_fake","tool":"unknown"}}\n'
           ;;
         *)
           printf '{"method":"item/agentMessage/delta","params":{"threadId":"thr_fake","turnId":"turn_fake","itemId":"msg_fake","delta":"ALIANG_FAKE_CODEX_OUTPUT"}}\n'
@@ -1711,6 +1730,22 @@ while IFS= read -r line; do
       fi
       printf '{"method":"turn/completed","params":{"threadId":"thr_fake","turn":{"id":"turn_fake","status":"failed"}}}\n'
       exit 1
+      ;;
+    *'"id":88'*)
+      if printf '%s' "$line" | grep -q '"answers"' && printf '%s' "$line" | grep -q '稳健方案'; then
+        printf '{"method":"item/agentMessage/delta","params":{"threadId":"thr_fake","turnId":"turn_fake","itemId":"msg_fake","delta":"USER_INPUT_OK"}}\n'
+        printf '{"method":"turn/completed","params":{"threadId":"thr_fake","turn":{"id":"turn_fake","status":"completed"}}}\n'
+        exit 0
+      fi
+      exit 3
+      ;;
+    *'"id":89'*)
+      if printf '%s' "$line" | grep -q '"code":-32601'; then
+        printf '{"method":"item/agentMessage/delta","params":{"threadId":"thr_fake","turnId":"turn_fake","itemId":"msg_fake","delta":"UNKNOWN_REQUEST_REJECTED"}}\n'
+        printf '{"method":"turn/completed","params":{"threadId":"thr_fake","turn":{"id":"turn_fake","status":"completed"}}}\n'
+        exit 0
+      fi
+      exit 4
       ;;
     *'"method":"turn/steer"'*)
       if [ "$mode" = "steer" ]; then
@@ -1995,8 +2030,8 @@ func TestAgentAIManagerEmitsStructuredCodexEvents(t *testing.T) {
 	})
 
 	commands := filterEvents(&mu, &events, "ai.command")
-	if len(commands) != 2 {
-		t.Fatalf("ai.command events = %d, want 2 (started+completed)", len(commands))
+	if len(commands) != 3 {
+		t.Fatalf("ai.command events = %d, want 3 (started+running+completed)", len(commands))
 	}
 	byStatus := map[string]map[string]interface{}{}
 	for _, ev := range commands {
@@ -2004,6 +2039,9 @@ func TestAgentAIManagerEmitsStructuredCodexEvents(t *testing.T) {
 	}
 	if started := byStatus["started"]; started == nil || remoteString(started, "command") != "echo hello" {
 		t.Fatalf("ai.command started = %#v, want command echo hello", started)
+	}
+	if running := byStatus["running"]; running == nil || remoteString(running, "output_delta") != "hello " {
+		t.Fatalf("ai.command running = %#v, want output delta", running)
 	}
 	if completed := byStatus["completed"]; completed == nil {
 		t.Fatal("missing ai.command completed")
@@ -2019,9 +2057,15 @@ func TestAgentAIManagerEmitsStructuredCodexEvents(t *testing.T) {
 		}
 	}
 
-	fileChanges := filterEvents(&mu, &events, "ai.file_change")
+	allFileChanges := filterEvents(&mu, &events, "ai.file_change")
+	var fileChanges []map[string]interface{}
+	for _, event := range allFileChanges {
+		if remoteString(event, "item_id") == "fc_struct" {
+			fileChanges = append(fileChanges, event)
+		}
+	}
 	if len(fileChanges) != 1 {
-		t.Fatalf("ai.file_change events = %d, want 1", len(fileChanges))
+		t.Fatalf("file change item events = %d, want 1; all=%+v", len(fileChanges), allFileChanges)
 	}
 	fc := fileChanges[0]
 	if !strings.HasSuffix(remoteString(fc, "path"), "/out.txt") {
@@ -2038,6 +2082,34 @@ func TestAgentAIManagerEmitsStructuredCodexEvents(t *testing.T) {
 	}
 	if remoteString(fc, "diff") == "" {
 		t.Fatal("file_change diff should be forwarded to the cloud")
+	}
+	thinking := filterEvents(&mu, &events, "ai.thinking")
+	if len(thinking) != 1 || remoteString(thinking[0], "delta") != "分析中" {
+		t.Fatalf("thinking events = %+v", thinking)
+	}
+	usage := filterEvents(&mu, &events, "ai.usage")
+	if len(usage) != 1 {
+		t.Fatalf("usage events = %+v", usage)
+	}
+	if input, ok := eventInt(usage[0], "input_tokens"); !ok || input != 120 {
+		t.Fatalf("usage input_tokens = %v", usage[0]["input_tokens"])
+	}
+	if contextWindow, ok := eventInt(usage[0], "model_context_window"); !ok || contextWindow != 200000 {
+		t.Fatalf("usage model_context_window = %v", usage[0]["model_context_window"])
+	}
+	tasks := filterEvents(&mu, &events, "ai.task")
+	if len(tasks) != 1 {
+		t.Fatalf("task events = %+v", tasks)
+	}
+	var turnDiff map[string]interface{}
+	for _, event := range allFileChanges {
+		if remoteString(event, "item_id") == "turn_diff" {
+			turnDiff = event
+			break
+		}
+	}
+	if turnDiff == nil || remoteString(turnDiff, "diff") == "" {
+		t.Fatalf("turn diff event = %+v", turnDiff)
 	}
 }
 
@@ -2065,7 +2137,7 @@ func eventInt(event map[string]interface{}, key string) (int, bool) {
 	return 0, false
 }
 
-func TestAgentAIManagerKeepsSessionHistory(t *testing.T) {
+func TestAgentAIManagerPersistsCodexThreadAcrossTurns(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell prompt inspection in this test is POSIX-only")
 	}
@@ -2108,9 +2180,18 @@ func TestAgentAIManagerKeepsSessionHistory(t *testing.T) {
 		"message_id": "msg_first",
 		"content":    "ALIANG_FIRST_USER",
 	}, writeJSON)
-	waitForAgentEvent(t, &mu, &events, "ai.done", func(event map[string]interface{}) bool {
+	firstDone := waitForAgentEvent(t, &mu, &events, "ai.done", func(event map[string]interface{}) bool {
 		return event["session_id"] == "ai_history" && event["message_id"] == "assistant_msg_first"
 	})
+	if remoteString(firstDone, "source_session_id") != "thr_fake" || remoteString(firstDone, "codex_thread_id") != "thr_fake" {
+		t.Fatalf("first done thread ids = %+v", firstDone)
+	}
+	manager.mu.Lock()
+	resumeID := manager.sessions["ai_history"].resumeSessionID
+	manager.mu.Unlock()
+	if resumeID != "thr_fake" {
+		t.Fatalf("resumeSessionID = %q, want thr_fake", resumeID)
+	}
 
 	manager.message(map[string]interface{}{
 		"type":       "ai.message",
@@ -2192,6 +2273,104 @@ func TestAgentAIManagerResumesImportedCodexSession(t *testing.T) {
 	if strings.Contains(got, "--color") {
 		t.Fatalf("codex resume output = %q, want no unsupported color flag on resume", got)
 	}
+}
+
+func TestAgentAIManagerCodexResumeMissingFallsBackFresh(t *testing.T) {
+	projectPath := setupAgentExecutionProjectForTest(t)
+	binDir := t.TempDir()
+	writeFakeCodexAppServerForTest(t, binDir)
+	t.Setenv("ALIANG_FAKE_CODEX_MODE", "resume_missing")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	manager := newAgentAIManager()
+	defer manager.closeAll()
+	mu, events, writer := captureAIWriter(t)
+	manager.create(map[string]interface{}{
+		"type":              "ai.session.create",
+		"session_id":        "ai_resume_missing",
+		"project_path":      projectPath,
+		"provider":          "codex",
+		"resume_session_id": "missing-thread",
+		"transcript": []interface{}{
+			map[string]interface{}{"id": "old", "role": "user", "content": "old context"},
+		},
+	}, writer)
+	manager.message(map[string]interface{}{
+		"type":       "ai.message",
+		"session_id": "ai_resume_missing",
+		"message_id": "msg_resume_missing",
+		"content":    "continue after fallback",
+		"provider":   "codex",
+	}, writer)
+	done := waitForAgentEvent(t, mu, events, "ai.done", func(event map[string]interface{}) bool {
+		return remoteString(event, "session_id") == "ai_resume_missing"
+	})
+	if remoteString(done, "source_session_id") != "thr_fake" {
+		t.Fatalf("done = %+v, want fresh thr_fake", done)
+	}
+	manager.mu.Lock()
+	resumeID := manager.sessions["ai_resume_missing"].resumeSessionID
+	manager.mu.Unlock()
+	if resumeID != "thr_fake" {
+		t.Fatalf("resumeSessionID = %q, want thr_fake", resumeID)
+	}
+	if got := findAIEvents(mu, events, "ai.error"); len(got) != 0 {
+		t.Fatalf("resume fallback emitted errors: %+v", got)
+	}
+}
+
+func TestAgentAIManagerCodexRequestUserInputUsesOptionProtocol(t *testing.T) {
+	projectPath := setupAgentExecutionProjectForTest(t)
+	binDir := t.TempDir()
+	writeFakeCodexAppServerForTest(t, binDir)
+	t.Setenv("ALIANG_FAKE_CODEX_MODE", "user_input")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	manager := newAgentAIManager()
+	defer manager.closeAll()
+	mu, events, writer := captureAIWriter(t)
+	manager.create(map[string]interface{}{
+		"type": "ai.session.create", "session_id": "ai_user_input", "project_path": projectPath, "provider": "codex",
+	}, writer)
+	manager.message(map[string]interface{}{
+		"type": "ai.message", "session_id": "ai_user_input", "message_id": "msg_user_input", "content": "ask me", "provider": "codex",
+	}, writer)
+	option := waitForAgentEvent(t, mu, events, "ai.option.request", func(event map[string]interface{}) bool {
+		return remoteString(event, "session_id") == "ai_user_input"
+	})
+	if remoteString(option, "question_id") != "strategy" || remoteString(option, "question") != "选择实现策略" {
+		t.Fatalf("option request = %+v", option)
+	}
+	manager.optionResponse(map[string]interface{}{
+		"type": "ai.option.response", "session_id": "ai_user_input", "option_id": remoteString(option, "option_id"), "selected": []interface{}{"option_1"},
+	}, writer)
+	waitForAgentEvent(t, mu, events, "ai.delta", func(event map[string]interface{}) bool {
+		return strings.Contains(remoteString(event, "delta"), "USER_INPUT_OK")
+	})
+	waitForAgentEvent(t, mu, events, "ai.done", func(event map[string]interface{}) bool {
+		return remoteString(event, "session_id") == "ai_user_input"
+	})
+}
+
+func TestAgentAIManagerCodexRejectsUnknownServerRequest(t *testing.T) {
+	projectPath := setupAgentExecutionProjectForTest(t)
+	binDir := t.TempDir()
+	writeFakeCodexAppServerForTest(t, binDir)
+	t.Setenv("ALIANG_FAKE_CODEX_MODE", "unknown_request")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	manager := newAgentAIManager()
+	defer manager.closeAll()
+	mu, events, writer := captureAIWriter(t)
+	manager.create(map[string]interface{}{
+		"type": "ai.session.create", "session_id": "ai_unknown_request", "project_path": projectPath, "provider": "codex",
+	}, writer)
+	manager.message(map[string]interface{}{
+		"type": "ai.message", "session_id": "ai_unknown_request", "message_id": "msg_unknown", "content": "run", "provider": "codex",
+	}, writer)
+	waitForAgentEvent(t, mu, events, "ai.delta", func(event map[string]interface{}) bool {
+		return strings.Contains(remoteString(event, "delta"), "UNKNOWN_REQUEST_REJECTED")
+	})
 }
 
 func TestResolveNamedAgentAIToolIgnoresProviderPlaceholderModel(t *testing.T) {
@@ -3841,6 +4020,8 @@ func stringSliceContains(values []string, target string) bool {
 
 func setupAgentExecutionProjectForTest(t *testing.T) string {
 	t.Helper()
+	setAgentAuthorizedExecutionDirectoriesCache(nil)
+	t.Cleanup(func() { setAgentAuthorizedExecutionDirectoriesCache(nil) })
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)

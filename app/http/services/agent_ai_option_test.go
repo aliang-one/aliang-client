@@ -1,6 +1,7 @@
 package services
 
 import (
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -95,6 +96,9 @@ func TestEmitOptionRequestSkipsStaleRunSeq(t *testing.T) {
 }
 
 func TestOptionResponseClearsPendingAndDispatchesRun(t *testing.T) {
+	binDir := t.TempDir()
+	writeFakeExecutable(t, binDir, "claude", "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"ok\",\"session_id\":\"option-session\"}'\n")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	manager := newAgentAIManager()
 	defer manager.closeAll()
 	mu, events, writer := captureAIWriter(t)

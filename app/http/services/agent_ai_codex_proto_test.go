@@ -2,6 +2,7 @@ package services
 
 import (
 	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 )
@@ -12,10 +13,10 @@ import (
 // "failed", or "" when the payload is missing/unknown.
 func TestCodexTurnResult(t *testing.T) {
 	tests := []struct {
-		name    string
-		params  map[string]interface{}
-		status  string
-		errMsg  string
+		name   string
+		params map[string]interface{}
+		status string
+		errMsg string
 	}{
 		{
 			name:   "completed",
@@ -205,4 +206,19 @@ func TestCodexAgentMessageDedup(t *testing.T) {
 			t.Fatalf("replay+tail = %q, want %q", got, " again")
 		}
 	})
+}
+
+func TestResolveAgentAIToolAutoSkipsCodexWithoutAppServer(t *testing.T) {
+	binDir := t.TempDir()
+	writeFakeExecutable(t, binDir, "codex", "#!/bin/sh\nexit 2\n")
+	writeFakeExecutable(t, binDir, "claude", "#!/bin/sh\nexit 0\n")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	tool, err := resolveAgentAITool("hello", "auto", "", "", "")
+	if err != nil {
+		t.Fatalf("resolveAgentAITool(auto) error = %v", err)
+	}
+	if tool.id != "claude" {
+		t.Fatalf("tool.id = %q, want claude fallback", tool.id)
+	}
 }

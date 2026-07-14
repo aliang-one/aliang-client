@@ -89,6 +89,40 @@ func TestExtractOpenCodeJSONTextsAndSessionID(t *testing.T) {
 	}
 }
 
+func TestOpenCodeStructuredEventsAndErrors(t *testing.T) {
+	mu, events, writer := captureAIWriter(t)
+	run := agentAIRun{sessionID: "s", messageID: "m", activity: newAgentAIActivity()}
+	emitOpenCodeStructuredEvents(agentAIOutputOpenCodeJSON, map[string]interface{}{
+		"type": "message.part.updated",
+		"properties": map[string]interface{}{"part": map[string]interface{}{
+			"type": "reasoning", "text": "分析中",
+		}},
+	}, run, writer)
+	emitOpenCodeStructuredEvents(agentAIOutputOpenCodeJSON, map[string]interface{}{
+		"type": "message.part.updated",
+		"properties": map[string]interface{}{"part": map[string]interface{}{
+			"type": "tool", "tool": "bash", "callID": "tool-1",
+			"state": map[string]interface{}{"status": "completed", "input": map[string]interface{}{"command": "go test ./..."}, "output": "ok"},
+		}},
+	}, run, writer)
+	emitOpenCodeStructuredEvents(agentAIOutputOpenCodeJSON, map[string]interface{}{
+		"type": "message.updated",
+		"properties": map[string]interface{}{"message": map[string]interface{}{
+			"tokens": map[string]interface{}{"input": 12, "output": 7, "reasoning": 3, "cache": map[string]interface{}{"read": 2}},
+		}},
+	}, run, writer)
+	if len(findAIEvents(mu, events, "ai.thinking")) != 1 || len(findAIEvents(mu, events, "ai.command")) != 1 || len(findAIEvents(mu, events, "ai.usage")) != 1 {
+		t.Fatalf("structured events = %#v", *events)
+	}
+
+	reason, ok := openCodeEventError(map[string]interface{}{
+		"type": "session.error", "properties": map[string]interface{}{"error": map[string]interface{}{"message": "provider failed"}},
+	})
+	if !ok || reason != "provider failed" {
+		t.Fatalf("openCodeEventError = %q, %v", reason, ok)
+	}
+}
+
 func TestAgentAIManagerStreamsOpenCodeJSON(t *testing.T) {
 	projectPath := setupAgentExecutionProjectForTest(t)
 	binDir := t.TempDir()

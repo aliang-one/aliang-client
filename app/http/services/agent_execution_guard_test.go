@@ -2,16 +2,15 @@ package services
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
 
-// TestResolveEnvDuration covers the env→duration resolution used by the
-// approval-timeout / hard-ceiling knobs. It targets the pure helper directly so
-// the package-level vars (resolved once at process start) don't need re-init.
+// TestResolveEnvDuration covers the env-to-duration resolution used by the
+// approval-timeout and hard-ceiling knobs.
 func TestResolveEnvDuration(t *testing.T) {
 	const key = "ALIANG_TEST_RESOLVE_DURATION"
-
 	cases := []struct {
 		name string
 		env  string
@@ -27,28 +26,22 @@ func TestResolveEnvDuration(t *testing.T) {
 		{"zero returns default", "0s", 24 * time.Hour, 24 * time.Hour},
 		{"negative returns default", "-5m", 24 * time.Hour, 24 * time.Hour},
 	}
-
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			t.Setenv(key, c.env)
-			got := resolveEnvDuration(key, c.def)
-			if got != c.want {
-				t.Fatalf("resolveEnvDuration(%q, def=%s) with env=%q = %s, want %s",
-					key, c.def, c.env, got, c.want)
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv(key, test.env)
+			if got := resolveEnvDuration(key, test.def); got != test.want {
+				t.Fatalf("resolveEnvDuration(%q, %s) with env %q = %s, want %s", key, test.def, test.env, got, test.want)
 			}
 		})
 	}
 }
 
-// TestAgentAITimeoutDefaults locks in the shipped fallback values so a future
-// change is conscious. The package vars resolve once at process start, so an
-// operator running tests with an override is skipped rather than failed.
 func TestAgentAITimeoutDefaults(t *testing.T) {
-	if v := os.Getenv("ALIANG_AI_APPROVAL_TIMEOUT"); v != "" {
-		t.Skipf("ALIANG_AI_APPROVAL_TIMEOUT=%s set at start; skipping default assertion", v)
+	if value := os.Getenv("ALIANG_AI_APPROVAL_TIMEOUT"); value != "" {
+		t.Skipf("ALIANG_AI_APPROVAL_TIMEOUT=%s set at start; skipping default assertion", value)
 	}
-	if v := os.Getenv("ALIANG_AI_HARD_CEILING"); v != "" {
-		t.Skipf("ALIANG_AI_HARD_CEILING=%s set at start; skipping default assertion", v)
+	if value := os.Getenv("ALIANG_AI_HARD_CEILING"); value != "" {
+		t.Skipf("ALIANG_AI_HARD_CEILING=%s set at start; skipping default assertion", value)
 	}
 	if agentAIApprovalTimeout != 24*time.Hour {
 		t.Fatalf("default agentAIApprovalTimeout = %s, want 24h", agentAIApprovalTimeout)
@@ -56,10 +49,37 @@ func TestAgentAITimeoutDefaults(t *testing.T) {
 	if agentAIHardCeiling != 48*time.Hour {
 		t.Fatalf("default agentAIHardCeiling = %s, want 48h", agentAIHardCeiling)
 	}
-	// Hard ceiling must exceed the approval timeout or a long approval wait is
-	// clipped by the runaway backstop first.
 	if agentAIHardCeiling <= agentAIApprovalTimeout {
-		t.Fatalf("agentAIHardCeiling (%s) must exceed agentAIApprovalTimeout (%s)",
-			agentAIHardCeiling, agentAIApprovalTimeout)
+		t.Fatalf("agentAIHardCeiling (%s) must exceed agentAIApprovalTimeout (%s)", agentAIHardCeiling, agentAIApprovalTimeout)
+	}
+}
+
+func TestResolveAgentAuthorizedCWDConfinesExecution(t *testing.T) {
+	root := t.TempDir()
+	child := filepath.Join(root, "project")
+	if err := os.Mkdir(child, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	setAgentAuthorizedExecutionDirectoriesCache([]string{root})
+	t.Cleanup(func() { setAgentAuthorizedExecutionDirectoriesCache(nil) })
+
+	resolved, err := resolveAgentAuthorizedCWD(child, "working directory")
+	want, cleanErr := cleanExistingAgentDirectory(child)
+	if cleanErr != nil {
+		t.Fatal(cleanErr)
+	}
+	if err != nil || resolved != want {
+		t.Fatalf("authorized child = %q, %v", resolved, err)
+	}
+	outside := t.TempDir()
+	if _, err := resolveAgentAuthorizedCWD(outside, "working directory"); err == nil {
+		t.Fatal("outside working directory should be rejected")
+	}
+
+	link := filepath.Join(root, "escape")
+	if err := os.Symlink(outside, link); err == nil {
+		if _, err := resolveAgentAuthorizedCWD(link, "working directory"); err == nil {
+			t.Fatal("symlink escaping the authorized root should be rejected")
+		}
 	}
 }

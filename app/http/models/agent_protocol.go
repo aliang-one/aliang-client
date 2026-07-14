@@ -31,6 +31,8 @@ const (
 	AgentEventAISessionClose          = "ai.session.close"
 	AgentEventAISessionClosed         = "ai.session.closed"
 	AgentEventAIMessage               = "ai.message"
+	AgentEventAIRunStart              = "ai.run.start"
+	AgentEventAISessionBound          = "ai.session.bound"
 	AgentEventAIMessageReceived       = "ai.message.received" // agent→cloud receipt ack; drives the admin per-turn pipeline's "Agent 已收到" confirmed node
 	AgentEventAISteer                 = "ai.steer"            // cloud→agent: append user input to the active Codex app-server turn
 	AgentEventAISteerAck              = "ai.steer.ack"        // agent→cloud: non-terminal steer delivery/result ack

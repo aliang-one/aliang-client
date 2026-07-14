@@ -419,7 +419,7 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 	case models.AgentEventTerminalClose:
 		s.setRemoteConnectionState(true, "online", "")
 		s.terminal.close(msg, writeJSON)
-	case models.AgentEventAISessionCreate, models.AgentEventAIMessage, models.AgentEventAISteer, models.AgentEventAIApprovalResponse, models.AgentEventAIOptionResponse, models.AgentEventAIStop, models.AgentEventAISessionClose:
+	case models.AgentEventAISessionCreate, models.AgentEventAIMessage, models.AgentEventAIRunStart, models.AgentEventAISteer, models.AgentEventAIApprovalResponse, models.AgentEventAIOptionResponse, models.AgentEventAIStop, models.AgentEventAISessionClose:
 		s.setRemoteConnectionState(true, "online", "")
 		switch msgType {
 		case models.AgentEventAISessionCreate:
@@ -434,6 +434,12 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 				return
 			}
 			s.ai.message(msg, writeJSON)
+		case models.AgentEventAIRunStart:
+			if !s.aiControlEnabled() {
+				_ = writeJSON(agentAIErrorPayload(remoteString(msg, "session_id"), remoteString(msg, "message_id"), errors.New("AI control is disabled for this device")))
+				return
+			}
+			s.ai.runStart(msg, writeJSON)
 		case models.AgentEventAISteer:
 			if !s.aiControlEnabled() {
 				emitAgentAISteerAck(writeJSON, remoteString(msg, "session_id"), remoteString(msg, "message_id"), "error", "AI control is disabled for this device", "ai_control_disabled")
@@ -495,6 +501,7 @@ func remoteAgentMessageRequiresEnabledDevice(msgType string) bool {
 		models.AgentEventTerminalClose,
 		models.AgentEventAISessionCreate,
 		models.AgentEventAIMessage,
+		models.AgentEventAIRunStart,
 		models.AgentEventAISteer,
 		models.AgentEventAIApprovalResponse,
 		models.AgentEventAIOptionResponse,
@@ -681,7 +688,7 @@ func agentPlatform() string {
 }
 
 func agentCapabilities() []string {
-	caps := []string{"terminal", "terminal_stream", "file_read", "file_diff", "command_launch", "ai_run_protocol_v2"}
+	caps := []string{"terminal", "terminal_stream", "file_read", "file_diff", "command_launch", "ai_run_protocol_v2", "ai_run_start_v3", "ai_provider_binding_v1"}
 	if agentNativePTYSupported() {
 		caps = append(caps, "terminal_pty", "terminal_resize")
 	} else {

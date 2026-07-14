@@ -110,21 +110,26 @@ type AgentProject struct {
 }
 
 type AgentVibeSession struct {
-	ID             string                   `json:"id"`
-	Provider       string                   `json:"provider"`
-	Tool           string                   `json:"tool,omitempty"`
-	ProjectPath    string                   `json:"project_path,omitempty"`
-	Title          string                   `json:"title,omitempty"`
-	Summary        string                   `json:"summary,omitempty"`
-	Mode           string                   `json:"mode,omitempty"`
-	Status         string                   `json:"status,omitempty"`
-	MessageCount   int                      `json:"message_count,omitempty"`
-	Branch         string                   `json:"branch,omitempty"`
-	Model          string                   `json:"model,omitempty"`
-	Transcript     []AgentVibeMessage       `json:"transcript,omitempty"`
-	TranscriptPage *AgentVibeTranscriptPage `json:"transcript_page,omitempty"`
-	CreatedAt      string                   `json:"created_at,omitempty"`
-	UpdatedAt      string                   `json:"updated_at,omitempty"`
+	ID                    string                   `json:"id"`
+	Provider              string                   `json:"provider"`
+	Tool                  string                   `json:"tool,omitempty"`
+	SourceSessionID       string                   `json:"source_session_id,omitempty"`
+	Origin                string                   `json:"origin,omitempty"`
+	ManagedConversationID string                   `json:"managed_conversation_id,omitempty"`
+	BindingState          string                   `json:"binding_state,omitempty"`
+	BindingVersion        int                      `json:"binding_version,omitempty"`
+	ProjectPath           string                   `json:"project_path,omitempty"`
+	Title                 string                   `json:"title,omitempty"`
+	Summary               string                   `json:"summary,omitempty"`
+	Mode                  string                   `json:"mode,omitempty"`
+	Status                string                   `json:"status,omitempty"`
+	MessageCount          int                      `json:"message_count,omitempty"`
+	Branch                string                   `json:"branch,omitempty"`
+	Model                 string                   `json:"model,omitempty"`
+	Transcript            []AgentVibeMessage       `json:"transcript,omitempty"`
+	TranscriptPage        *AgentVibeTranscriptPage `json:"transcript_page,omitempty"`
+	CreatedAt             string                   `json:"created_at,omitempty"`
+	UpdatedAt             string                   `json:"updated_at,omitempty"`
 }
 
 type AgentVibeMessage struct {
