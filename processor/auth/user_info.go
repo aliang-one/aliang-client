@@ -18,7 +18,9 @@ import (
 
 const authSessionDBPathEnv = "ALIANG_AUTH_SESSION_DB"
 
-// UserInfo is the locally persisted Sub2API session snapshot.
+// UserInfo is the locally persisted official-website session snapshot. Both
+// token fields are local session credentials; upstream sub2api tokens never
+// leave the official-website broker.
 type UserInfo struct {
 	AccessToken    string    `json:"access_token"`
 	RefreshToken   string    `json:"refresh_token"`

@@ -97,7 +97,7 @@ func (h *AuthHandler) HandleScanStatus(w http.ResponseWriter, r *http.Request) {
 	common.Success(w, result)
 }
 
-// HandleScanActivate 扫码登录激活（用 st_ + refresh_token 完成本地登录）
+// HandleScanActivate 扫码登录激活（两个字段均为本地 session 凭证）
 // POST /api/auth/scan/activate
 func (h *AuthHandler) HandleScanActivate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {

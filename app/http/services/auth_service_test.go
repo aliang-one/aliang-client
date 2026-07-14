@@ -175,8 +175,8 @@ func TestAuthServiceLogoutStopsHTTPBeforeRemoteRevokeCompletes(t *testing.T) {
 
 	select {
 	case token := <-remoteStarted:
-		if token != "logout-refresh" {
-			t.Fatalf("remote revoke token = %q, want logout-refresh", token)
+		if token != "logout-access" {
+			t.Fatalf("remote revoke token = %q, want local logout-access", token)
 		}
 	case <-time.After(time.Second):
 		close(remoteRelease)

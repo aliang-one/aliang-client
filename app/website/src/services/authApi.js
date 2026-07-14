@@ -82,7 +82,7 @@ export async function scanInit() {
   });
 }
 
-// 扫码登录：按 device_code 轮询状态。authorized 时 data 含 session_token + refresh_token。
+// 扫码登录：authorized 时两个 token 字段都是本地 session 凭证。
 export async function scanStatus(deviceCode) {
   const query = new URLSearchParams({ device_code: deviceCode }).toString();
   return request(`/api/auth/scan/status?${query}`, {
@@ -90,7 +90,7 @@ export async function scanStatus(deviceCode) {
   });
 }
 
-// 扫码登录：用 st_(session_token) + refresh_token 完成本地激活，返回与密码登录同构的用户信息。
+// 扫码登录：用本地 session 兼容字段完成激活，返回与密码登录同构的用户信息。
 export async function activateScanLogin({ sessionToken, refreshToken }) {
   return request('/api/auth/scan/activate', {
     method: 'POST',

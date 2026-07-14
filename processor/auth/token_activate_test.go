@@ -50,21 +50,21 @@ func TestRefreshSession_SerializesTokenRotation(t *testing.T) {
 			refreshTokensMu.Unlock()
 
 			callIndex := atomic.AddInt32(&refreshCalls, 1)
-			if payload.RefreshToken == "refresh-1" && callIndex == 1 {
+			if payload.RefreshToken == "st-1" && callIndex == 1 {
 				time.Sleep(120 * time.Millisecond)
 				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write([]byte(`{"data":{"access_token":"access-2","refresh_token":"refresh-2","expires_in":3600,"token_type":"Bearer"}}`))
+				_, _ = w.Write([]byte(`{"data":{"access_token":"st-2","refresh_token":"st-2","expires_in":3600,"token_type":"Bearer"}}`))
 				return
 			}
-			if payload.RefreshToken == "refresh-1" {
+			if payload.RefreshToken == "st-1" {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusUnauthorized)
 				_, _ = w.Write([]byte(`{"code":401,"message":"invalid refresh token","reason":"REFRESH_TOKEN_INVALID"}`))
 				return
 			}
-			if payload.RefreshToken == "refresh-2" {
+			if payload.RefreshToken == "st-2" {
 				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write([]byte(`{"data":{"access_token":"access-3","refresh_token":"refresh-3","expires_in":3600,"token_type":"Bearer"}}`))
+				_, _ = w.Write([]byte(`{"data":{"access_token":"st-3","refresh_token":"st-3","expires_in":3600,"token_type":"Bearer"}}`))
 				return
 			}
 
@@ -83,8 +83,8 @@ func TestRefreshSession_SerializesTokenRotation(t *testing.T) {
 	config.SetGlobalConfig(&config.Config{Core: &config.CoreConfig{APIServer: server.URL}})
 
 	if err := SaveUserInfo(&UserInfo{
-		AccessToken:  "access-1",
-		RefreshToken: "refresh-1",
+		AccessToken:  "st-1",
+		RefreshToken: "st-1",
 		TokenType:    "Bearer",
 		Username:     "user",
 		Email:        "user@example.com",
@@ -104,7 +104,7 @@ func TestRefreshSession_SerializesTokenRotation(t *testing.T) {
 		go func(index int) {
 			defer wg.Done()
 			<-start
-			results[index], errs[index] = RefreshSession("refresh-1")
+			results[index], errs[index] = RefreshSession("st-1")
 		}(i)
 	}
 
@@ -118,8 +118,8 @@ func TestRefreshSession_SerializesTokenRotation(t *testing.T) {
 		if results[i] == nil {
 			t.Fatalf("RefreshSession() #%d returned nil user info", i)
 		}
-		if results[i].RefreshToken != "refresh-2" {
-			t.Fatalf("RefreshSession() #%d refresh token = %q, want refresh-2", i, results[i].RefreshToken)
+		if results[i].RefreshToken != "st-2" {
+			t.Fatalf("RefreshSession() #%d refresh token = %q, want st-2", i, results[i].RefreshToken)
 		}
 	}
 
@@ -131,8 +131,8 @@ func TestRefreshSession_SerializesTokenRotation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadUserInfo() error = %v", err)
 	}
-	if saved.RefreshToken != "refresh-2" {
-		t.Fatalf("saved refresh token = %q, want refresh-2", saved.RefreshToken)
+	if saved.RefreshToken != "st-2" {
+		t.Fatalf("saved refresh token = %q, want st-2", saved.RefreshToken)
 	}
 }
 
@@ -168,17 +168,17 @@ func TestRefreshSession_PersistsRotatedTokenWhenProfileSyncFails(t *testing.T) {
 
 			switch atomic.AddInt32(&refreshCalls, 1) {
 			case 1:
-				if payload.RefreshToken != "refresh-1" {
-					t.Fatalf("first refresh token = %q, want refresh-1", payload.RefreshToken)
+				if payload.RefreshToken != "st-1" {
+					t.Fatalf("first refresh token = %q, want st-1", payload.RefreshToken)
 				}
 				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write([]byte(`{"data":{"access_token":"access-2","refresh_token":"refresh-2","expires_in":3600,"token_type":"Bearer"}}`))
+				_, _ = w.Write([]byte(`{"data":{"access_token":"st-2","refresh_token":"st-2","expires_in":3600,"token_type":"Bearer"}}`))
 			case 2:
-				if payload.RefreshToken != "refresh-2" {
-					t.Fatalf("second refresh token = %q, want refresh-2", payload.RefreshToken)
+				if payload.RefreshToken != "st-2" {
+					t.Fatalf("second refresh token = %q, want st-2", payload.RefreshToken)
 				}
 				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write([]byte(`{"data":{"access_token":"access-3","refresh_token":"refresh-3","expires_in":3600,"token_type":"Bearer"}}`))
+				_, _ = w.Write([]byte(`{"data":{"access_token":"st-3","refresh_token":"st-3","expires_in":3600,"token_type":"Bearer"}}`))
 			default:
 				t.Fatalf("unexpected refresh call #%d with token %q", refreshCalls, payload.RefreshToken)
 			}
@@ -204,8 +204,8 @@ func TestRefreshSession_PersistsRotatedTokenWhenProfileSyncFails(t *testing.T) {
 	config.SetGlobalConfig(&config.Config{Core: &config.CoreConfig{APIServer: server.URL}})
 
 	if err := SaveUserInfo(&UserInfo{
-		AccessToken:  "access-1",
-		RefreshToken: "refresh-1",
+		AccessToken:  "st-1",
+		RefreshToken: "st-1",
 		TokenType:    "Bearer",
 		Username:     "cached-user",
 		Email:        "cached@example.com",
@@ -215,12 +215,12 @@ func TestRefreshSession_PersistsRotatedTokenWhenProfileSyncFails(t *testing.T) {
 		t.Fatalf("SaveUserInfo() error = %v", err)
 	}
 
-	refreshed, err := RefreshSession("refresh-1")
+	refreshed, err := RefreshSession("st-1")
 	if err != nil {
 		t.Fatalf("first RefreshSession() error = %v", err)
 	}
-	if refreshed.RefreshToken != "refresh-2" {
-		t.Fatalf("first RefreshSession() refresh token = %q, want refresh-2", refreshed.RefreshToken)
+	if refreshed.RefreshToken != "st-2" {
+		t.Fatalf("first RefreshSession() refresh token = %q, want st-2", refreshed.RefreshToken)
 	}
 	if refreshed.Username != "cached-user" {
 		t.Fatalf("first RefreshSession() username = %q, want cached-user fallback", refreshed.Username)
@@ -230,16 +230,16 @@ func TestRefreshSession_PersistsRotatedTokenWhenProfileSyncFails(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadUserInfo() after first refresh error = %v", err)
 	}
-	if savedAfterFirstRefresh.RefreshToken != "refresh-2" {
-		t.Fatalf("saved refresh token after first refresh = %q, want refresh-2", savedAfterFirstRefresh.RefreshToken)
+	if savedAfterFirstRefresh.RefreshToken != "st-2" {
+		t.Fatalf("saved refresh token after first refresh = %q, want st-2", savedAfterFirstRefresh.RefreshToken)
 	}
 
 	refreshedAgain, err := RefreshSession("")
 	if err != nil {
 		t.Fatalf("second RefreshSession() error = %v", err)
 	}
-	if refreshedAgain.RefreshToken != "refresh-3" {
-		t.Fatalf("second RefreshSession() refresh token = %q, want refresh-3", refreshedAgain.RefreshToken)
+	if refreshedAgain.RefreshToken != "st-3" {
+		t.Fatalf("second RefreshSession() refresh token = %q, want st-3", refreshedAgain.RefreshToken)
 	}
 	if refreshedAgain.Username != "user" {
 		t.Fatalf("second RefreshSession() username = %q, want user", refreshedAgain.Username)
@@ -287,8 +287,8 @@ func TestRefreshSession_RenewsAccessTokenAndRetainsRefreshTokenWhenOmitted(t *te
 	config.SetGlobalConfig(&config.Config{Core: &config.CoreConfig{APIServer: server.URL}})
 
 	if err := SaveUserInfo(&UserInfo{
-		AccessToken:  "access-1",
-		RefreshToken: "refresh-1",
+		AccessToken:  "st-1",
+		RefreshToken: "legacy-upstream-refresh",
 		TokenType:    "Bearer",
 		Username:     "cached-user",
 		Email:        "cached@example.com",
@@ -298,15 +298,15 @@ func TestRefreshSession_RenewsAccessTokenAndRetainsRefreshTokenWhenOmitted(t *te
 		t.Fatalf("SaveUserInfo() error = %v", err)
 	}
 
-	refreshed, err := RefreshSession("refresh-1")
+	refreshed, err := RefreshSession("legacy-upstream-refresh")
 	if err != nil {
 		t.Fatalf("RefreshSession() error = %v, want nil (access_token must be renewed even when no refresh_token is returned)", err)
 	}
 	if refreshed.AccessToken != "access-2" {
 		t.Fatalf("RefreshSession() access token = %q, want access-2 (renewed)", refreshed.AccessToken)
 	}
-	if refreshed.RefreshToken != "refresh-1" {
-		t.Fatalf("RefreshSession() refresh token = %q, want refresh-1 (retain existing when none returned)", refreshed.RefreshToken)
+	if refreshed.RefreshToken != "access-2" {
+		t.Fatalf("RefreshSession() refresh token = %q, want access-2 local fallback", refreshed.RefreshToken)
 	}
 	if got := atomic.LoadInt32(&profileCalls); got != 1 {
 		t.Fatalf("profile calls = %d, want 1 (renewed access_token should be used to sync profile)", got)
@@ -319,8 +319,8 @@ func TestRefreshSession_RenewsAccessTokenAndRetainsRefreshTokenWhenOmitted(t *te
 	if saved.AccessToken != "access-2" {
 		t.Fatalf("saved access token = %q, want access-2", saved.AccessToken)
 	}
-	if saved.RefreshToken != "refresh-1" {
-		t.Fatalf("saved refresh token = %q, want refresh-1 (existing token retained)", saved.RefreshToken)
+	if saved.RefreshToken != "access-2" {
+		t.Fatalf("saved refresh token = %q, want access-2 local fallback", saved.RefreshToken)
 	}
 }
 

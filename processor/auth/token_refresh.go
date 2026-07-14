@@ -143,7 +143,7 @@ func (tr *TokenRefresher) refreshUserInfo() error {
 	}
 
 	logger.Info("Access token expired or expiring soon, refreshing session")
-	if _, err := RefreshSession(currentInfo.RefreshToken); err != nil {
+	if _, err := RefreshSession(currentInfo.AccessToken); err != nil {
 		return fmt.Errorf("failed to refresh session: %w", err)
 	}
 

@@ -274,7 +274,7 @@ func (s *AuthService) ScanStatus(deviceCode string) map[string]interface{} {
 	}
 }
 
-// ActivateScanLogin 用扫码拿到的 st_(session_token) + refresh_token 完成本地登录，
+// ActivateScanLogin 用扫码拿到的本地 session 兼容字段完成登录，
 // 返回结构与密码登录 Login 一致（data 为 UserInfoResponse、附带 agent_sync）。
 func (s *AuthService) ActivateScanLogin(sessionToken, refreshToken string) map[string]interface{} {
 	sessionToken = strings.TrimSpace(sessionToken)
@@ -317,13 +317,14 @@ func (s *AuthService) ActivateScanLogin(sessionToken, refreshToken string) map[s
 
 // LogoutUser 登出用户
 func (s *AuthService) LogoutUser(refreshToken string) map[string]interface{} {
-	// Capture the refresh token before deleting the local session. Remote revoke
+	// Capture the local st_ before deleting the local session. Remote revoke
 	// is best-effort and must never delay the local security boundary.
-	token := strings.TrimSpace(refreshToken)
+	token := ""
+	if current := auth.GetCurrentUserInfoOrLoad(); current != nil {
+		token = strings.TrimSpace(current.AccessToken)
+	}
 	if token == "" {
-		if current := auth.GetCurrentUserInfoOrLoad(); current != nil {
-			token = strings.TrimSpace(current.RefreshToken)
-		}
+		token = strings.TrimSpace(refreshToken)
 	}
 
 	teardownLocalSessionAfterLogout()

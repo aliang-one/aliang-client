@@ -35,14 +35,14 @@ type ScanStatusUser struct {
 }
 
 // ScanStatusResult 对应 official-website GET /auth/scan/status 的响应。
-// authorized 时携带 session_token(st_) + refresh_token(sub2api) + user，
-// 使 alianggate 能落地与密码登录等价的令牌对。
+// authorized 时携带本设备的 session_token(st_)，refresh_token 为同一
+// 本地凭证的兼容字段；上游 token 不会下发到 alianggate。
 type ScanStatusResult struct {
 	Status       string          `json:"status"` // pending|scanned|authorized|denied|expired
 	ExpiresIn    int             `json:"expires_in"`
 	Interval     int             `json:"interval"`
 	SessionToken string          `json:"session_token"` // authorized 时下发（st_）
-	RefreshToken string          `json:"refresh_token"` // authorized 时下发（sub2api refresh_token）
+	RefreshToken string          `json:"refresh_token"` // authorized 时下发（本地 st_ 兼容字段）
 	User         *ScanStatusUser `json:"user"`
 }
 
@@ -88,7 +88,7 @@ func ScanInit() (*ScanInitResult, error) {
 	return &result, nil
 }
 
-// ScanStatus 按 device_code 轮询扫码状态。authorized 时返回 st_(session_token) + sub2api refresh_token。
+// ScanStatus 按 device_code 轮询扫码状态。authorized 时只返回本地 session 凭证。
 func ScanStatus(deviceCode string) (*ScanStatusResult, error) {
 	deviceCode = strings.TrimSpace(deviceCode)
 	if deviceCode == "" {

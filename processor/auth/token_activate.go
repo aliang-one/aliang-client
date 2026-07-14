@@ -20,10 +20,9 @@ const (
 	apiTimeout = 10 * time.Second
 
 	// scanAccessTokenTTLSeconds 是扫码登录落地的 st_(access_token) 在客户端侧登记的过期秒数。
-	// official-website 的本地会话(st_)服务端寿命为 24h，每次 /api/v1/auth/refresh 会顺带
-	// extendLocalSessionExpiry 续 +24h。此处取 1h 仅用于驱动 TokenRefresher 的「提前刷新」节奏，
-	// 使其与密码登录（sub2api access_token ~1h）一致；每次刷新都会续命服务端 st_，故 24h 内必被刷新。
-	scanAccessTokenTTLSeconds = 3600
+	// official-website 的本地会话(st_)服务端寿命为 24h；客户端在到期前 10 分钟
+	// 调用本地 refresh 续期。上游 access token 由网关按自身 exp 独立维护。
+	scanAccessTokenTTLSeconds = 24 * 60 * 60
 )
 
 func ActivateToken(token string) (*UserInfo, error) {
@@ -152,9 +151,9 @@ func finalizeAuthenticatedSession(accessToken, refreshToken, tokenType string, e
 	return userInfo, nil
 }
 
-// ActivateWithTokens 用扫码登录拿到的令牌对完成登录收尾。
-// accessToken 为 official-website 下发的本地 st_（作 Bearer / Authorization-Inner），
-// refreshToken 为该用户的 sub2api refresh_token（驱动刷新器，每次刷新顺带续命服务端 st_）。
+// ActivateWithTokens 用扫码登录拿到的本地令牌完成登录收尾。
+// accessToken 和兼容字段 refreshToken 都由 official-website 签发；sub2api
+// token 始终留在服务端 broker 中。
 // 与 LoginWithPassword 走同一条 finalizeAuthenticatedSession，故扫码后状态与密码登录等价。
 func ActivateWithTokens(accessToken, refreshToken string) (*UserInfo, error) {
 	accessToken = strings.TrimSpace(accessToken)
@@ -174,7 +173,7 @@ func RestoreSession() (*UserInfo, error) {
 		return nil, err
 	}
 
-	refreshedInfo, refreshErr := RefreshSession(localUserInfo.RefreshToken)
+	refreshedInfo, refreshErr := RefreshSession(localUserInfo.AccessToken)
 	if refreshErr == nil {
 		return refreshedInfo, nil
 	}
@@ -218,12 +217,15 @@ func RefreshSession(refreshToken string) (*UserInfo, error) {
 		return nil, ErrSessionOwnerRequired
 	}
 
-	token := strings.TrimSpace(refreshToken)
+	current := GetCurrentUserInfoOrLoad()
+	token := ""
+	if current != nil {
+		// official-website owns the upstream token family. Its refresh endpoint
+		// accepts this device's local st_ session, never a sub2api refresh token.
+		token = strings.TrimSpace(current.AccessToken)
+	}
 	if token == "" {
-		current := GetCurrentUserInfoOrLoad()
-		if current != nil {
-			token = strings.TrimSpace(current.RefreshToken)
-		}
+		token = strings.TrimSpace(refreshToken)
 	}
 	if token == "" {
 		return nil, fmt.Errorf("refresh token cannot be empty")
@@ -235,9 +237,9 @@ func RefreshSession(refreshToken string) (*UserInfo, error) {
 	// Another caller may have refreshed and rotated the token while we were
 	// waiting for the lock. Reuse the newest local session to avoid sending an
 	// already-invalidated refresh token again.
-	current := GetCurrentUserInfoOrLoad()
+	current = GetCurrentUserInfoOrLoad()
 	if current != nil {
-		latestToken := strings.TrimSpace(current.RefreshToken)
+		latestToken := strings.TrimSpace(current.AccessToken)
 		if latestToken != "" && latestToken != token && strings.TrimSpace(current.AccessToken) != "" {
 			logger.Debug("Refresh token rotated while waiting; reusing latest local session")
 			return current, nil
@@ -303,23 +305,12 @@ func RefreshSession(refreshToken string) (*UserInfo, error) {
 
 	nextRefreshToken := strings.TrimSpace(response.Data.RefreshToken)
 	if nextRefreshToken == "" {
-		// The server renewed the access_token but did not return a (rotated)
-		// refresh_token — some refresh endpoints keep the same refresh_token
-		// valid across calls. We MUST still persist the renewed access_token;
-		// otherwise it is never refreshed and the session expires (auth_expired)
-		// on a fixed cadence, taking the agent offline periodically. Retain the
-		// existing refresh_token as a fallback so the next refresh cycle retries.
-		// If the old token was genuinely consumed/invalidated, the next refresh
-		// returns REFRESH_TOKEN_INVALID and clears the session then — no worse
-		// than failing now, but with a renewed access_token in between.
-		retained := token
-		if current != nil {
-			if latest := strings.TrimSpace(current.RefreshToken); latest != "" {
-				retained = latest
-			}
-		}
-		logger.Warn("Refresh response missing refresh_token; retaining existing refresh_token and persisting renewed access_token")
-		nextRefreshToken = retained
+		// The hardened broker uses the local st_ for both compatibility fields.
+		// If an older server omits refresh_token, the newly returned local access
+		// credential is the only safe fallback; never resurrect a legacy upstream
+		// refresh token from local persistence.
+		logger.Warn("Refresh response missing refresh_token; using renewed local access token")
+		nextRefreshToken = strings.TrimSpace(response.Data.AccessToken)
 	}
 
 	userInfo := mergeRefreshedSessionWithCurrentUser(current, response.Data.AccessToken, nextRefreshToken, response.Data.TokenType, response.Data.ExpiresIn)
@@ -363,12 +354,13 @@ func mergeRefreshedSessionWithCurrentUser(current *UserInfo, accessToken, refres
 }
 
 func LogoutSession(refreshToken string) error {
-	token := strings.TrimSpace(refreshToken)
+	token := ""
+	current := GetCurrentUserInfoOrLoad()
+	if current != nil {
+		token = strings.TrimSpace(current.AccessToken)
+	}
 	if token == "" {
-		current := GetCurrentUserInfoOrLoad()
-		if current != nil {
-			token = strings.TrimSpace(current.RefreshToken)
-		}
+		token = strings.TrimSpace(refreshToken)
 	}
 
 	urlBuilder, err := config.NewURLBuilder()
@@ -396,6 +388,9 @@ func LogoutSession(refreshToken string) error {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 
 	client := &http.Client{Timeout: apiTimeout}
 	resp, err := client.Do(req)
