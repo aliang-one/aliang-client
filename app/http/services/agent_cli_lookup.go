@@ -59,9 +59,13 @@ func cliSearchHomes() []string {
 	return dedupStrings(homes)
 }
 
-// lookPathInHomes 在给定家目录集合与平台全局目录中查找可执行文件 name。
+// lookPathInHomes 在给定家目录集合与平台目录中查找可执行文件 name。
 // 抽出来便于单测注入临时目录，不依赖真实家目录。
 func lookPathInHomes(homes []string, name string) (string, error) {
+	return lookPathInHomesForOS(homes, name, runtime.GOOS)
+}
+
+func lookPathInHomesForOS(homes []string, name, goos string) (string, error) {
 	for _, home := range homes {
 		for _, candidate := range userBinCandidates(home, name) {
 			if isExecutableFile(candidate) {
@@ -69,7 +73,7 @@ func lookPathInHomes(homes []string, name string) (string, error) {
 			}
 		}
 	}
-	for _, candidate := range globalBinCandidates(name) {
+	for _, candidate := range platformBinCandidates(goos, homes, name) {
 		if isExecutableFile(candidate) {
 			return candidate, nil
 		}
@@ -94,14 +98,42 @@ func userBinCandidates(home, name string) []string {
 	return out
 }
 
-func globalBinCandidates(name string) []string {
-	if runtime.GOOS == "darwin" {
-		return []string{
-			filepath.Join("/opt/homebrew/bin", name),
-			filepath.Join("/usr/local/bin", name),
-		}
+func platformBinCandidates(goos string, homes []string, name string) []string {
+	if goos != "darwin" {
+		return nil
 	}
-	return nil
+
+	// Prefer standalone package-manager installs over application-bundled CLIs.
+	// They have an independent lifecycle and remain stable across app updates.
+	out := []string{
+		filepath.Join("/opt/homebrew/bin", name),
+		filepath.Join("/usr/local/bin", name),
+	}
+	if name != "codex" {
+		return out
+	}
+
+	// ChatGPT for macOS ships a fully functional Codex CLI, but LaunchAgents and
+	// services do not inherit the interactive shell path that exposes it. Support
+	// both per-user and system-wide app installs as a deterministic fallback.
+	for _, home := range homes {
+		out = append(out, filepath.Join(
+			home,
+			"Applications",
+			"ChatGPT.app",
+			"Contents",
+			"Resources",
+			"codex",
+		))
+	}
+	out = append(out, filepath.Join(
+		"/Applications",
+		"ChatGPT.app",
+		"Contents",
+		"Resources",
+		"codex",
+	))
+	return dedupStrings(out)
 }
 
 // isExecutableFile 判断路径是否为可执行文件（非目录且带任意执行位）。
