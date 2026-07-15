@@ -52,15 +52,10 @@ const (
 	// tcpMaxBufferSize is the maximum permitted size of a send/recv buffer.
 	tcpMaxBufferSize = tcp.MaxBufferSize
 
-	// tcpDefaultBufferSize is the default size of the send buffer for
-	// a transport endpoint.
-	// Increased to 256KB for better throughput (was tcp.DefaultSendBufferSize)
-	tcpDefaultSendBufferSize = 256 << 10 // 256 KB
-
-	// tcpDefaultReceiveBufferSize is the default size of the receive buffer
-	// for a transport endpoint.
-	// Increased to 256KB for better throughput (was tcp.DefaultReceiveBufferSize)
-	tcpDefaultReceiveBufferSize = 256 << 10 // 256 KB
+	// Keep per-endpoint buffers bounded. TUN mode sees all system traffic, so
+	// large defaults multiply quickly across hundreds of concurrent connections.
+	tcpDefaultSendBufferSize    = 64 << 10
+	tcpDefaultReceiveBufferSize = 64 << 10
 )
 
 type Option func(*stack.Stack) error

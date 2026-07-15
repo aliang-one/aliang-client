@@ -1,6 +1,7 @@
 package dns
 
 import (
+	"reflect"
 	"sync"
 
 	"aliang.one/nursorgate/common/logger"
@@ -52,7 +53,13 @@ func InitGlobalResolver(primaryProxy, fallbackProxy proxy.Proxy, cfg *config.Con
 func SetGlobalResolver(resolver DNSResolverInterface) {
 	resolverMu.Lock()
 	defer resolverMu.Unlock()
+
+	previous := globalResolver
+	if sameResolver(previous, resolver) {
+		return
+	}
 	globalResolver = resolver
+	closeResolver(previous)
 }
 
 // GetGlobalResolver returns the global DNS resolver instance.
@@ -72,7 +79,27 @@ func HasGlobalResolver() bool {
 
 // ResetGlobalResolver clears the global resolver (mainly for testing).
 func ResetGlobalResolver() {
-	resolverMu.Lock()
-	defer resolverMu.Unlock()
-	globalResolver = nil
+	SetGlobalResolver(nil)
+}
+
+type resolverCloser interface {
+	Close()
+}
+
+func closeResolver(resolver DNSResolverInterface) {
+	if closer, ok := resolver.(resolverCloser); ok {
+		closer.Close()
+	}
+}
+
+func sameResolver(a, b DNSResolverInterface) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	aValue := reflect.ValueOf(a)
+	bValue := reflect.ValueOf(b)
+	if aValue.Type() != bValue.Type() || !aValue.Type().Comparable() {
+		return false
+	}
+	return aValue.Interface() == bValue.Interface()
 }

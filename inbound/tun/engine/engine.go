@@ -88,6 +88,10 @@ func stop() (err error) {
 	if device != nil {
 		device.Close()
 	}
+	closedConnections := tunnel.T().CloseActiveTCPConnections()
+	if closedConnections > 0 {
+		logger.Debug(fmt.Sprintf("[ENGINE] closed %d active TUN TCP connection(s)", closedConnections))
+	}
 	if stack != nil {
 		stack.Close()
 		stack.Wait()

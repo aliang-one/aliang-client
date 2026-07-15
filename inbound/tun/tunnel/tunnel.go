@@ -26,7 +26,7 @@ const (
 	// tcpMaxConcurrentConn limits the number of simultaneously relayed TCP
 	// sessions. Each accepted TCP flow gets its own goroutine, so this limiter
 	// protects memory/file descriptors while avoiding worker-pool starvation.
-	tcpMaxConcurrentConn = 2000
+	tcpMaxConcurrentConn = 512
 	// udpWorkerCount is the number of UDP worker goroutines
 	udpWorkerCount = 50
 	// tcpStatsLogInterval controls periodic TCP concurrency diagnostics.
@@ -41,6 +41,10 @@ type Tunnel struct {
 	udpQueue chan adapter.UDPConn
 	// tcpLimiter bounds the number of active TCP relay goroutines.
 	tcpLimiter chan struct{}
+	// activeTCPConns lets engine shutdown interrupt relays that are blocked in
+	// network reads instead of waiting for the remote peer to close first.
+	activeTCPMu    sync.Mutex
+	activeTCPConns map[adapter.TCPConn]struct{}
 
 	// UDP session timeout.
 	udpTimeout *atomic.Duration
@@ -62,12 +66,13 @@ type Tunnel struct {
 
 func New(dialer proxy.Dialer, manager *statistic.Manager) *Tunnel {
 	return &Tunnel{
-		udpQueue:   make(chan adapter.UDPConn, 128),
-		tcpLimiter: make(chan struct{}, tcpMaxConcurrentConn),
-		udpTimeout: atomic.NewDuration(udpSessionTimeout),
-		dialer:     dialer,
-		manager:    manager,
-		procCancel: func() { /* nop */ },
+		udpQueue:       make(chan adapter.UDPConn, 128),
+		tcpLimiter:     make(chan struct{}, tcpMaxConcurrentConn),
+		activeTCPConns: make(map[adapter.TCPConn]struct{}),
+		udpTimeout:     atomic.NewDuration(udpSessionTimeout),
+		dialer:         dialer,
+		manager:        manager,
+		procCancel:     func() { /* nop */ },
 	}
 }
 
@@ -79,6 +84,7 @@ func (t *Tunnel) UDPIn() chan<- adapter.UDPConn {
 func (t *Tunnel) HandleTCP(conn adapter.TCPConn) {
 	select {
 	case t.tcpLimiter <- struct{}{}:
+		t.trackTCPConn(conn)
 		active := t.activeTCPConn.Inc()
 		t.updatePeakTCP(active)
 
@@ -89,6 +95,7 @@ func (t *Tunnel) HandleTCP(conn adapter.TCPConn) {
 					debug.PrintStack()
 				}
 				t.activeTCPConn.Dec()
+				t.untrackTCPConn(conn)
 				<-t.tcpLimiter
 			}()
 
@@ -155,7 +162,47 @@ func (t *Tunnel) ProcessAsync() {
 
 // Close closes the Tunnel and releases its resources.
 func (t *Tunnel) Close() {
+	t.CloseActiveTCPConnections()
 	t.procCancel()
+}
+
+func (t *Tunnel) trackTCPConn(conn adapter.TCPConn) {
+	if conn == nil {
+		return
+	}
+	t.activeTCPMu.Lock()
+	t.activeTCPConns[conn] = struct{}{}
+	t.activeTCPMu.Unlock()
+}
+
+func (t *Tunnel) untrackTCPConn(conn adapter.TCPConn) {
+	if conn == nil {
+		return
+	}
+	t.activeTCPMu.Lock()
+	delete(t.activeTCPConns, conn)
+	t.activeTCPMu.Unlock()
+}
+
+// CloseActiveTCPConnections interrupts active TUN relays and releases the
+// references held by the tunnel. It returns the number of close attempts.
+func (t *Tunnel) CloseActiveTCPConnections() int {
+	if t == nil {
+		return 0
+	}
+
+	t.activeTCPMu.Lock()
+	connections := make([]adapter.TCPConn, 0, len(t.activeTCPConns))
+	for conn := range t.activeTCPConns {
+		connections = append(connections, conn)
+	}
+	t.activeTCPConns = make(map[adapter.TCPConn]struct{})
+	t.activeTCPMu.Unlock()
+
+	for _, conn := range connections {
+		_ = conn.Close()
+	}
+	return len(connections)
 }
 
 func (t *Tunnel) Dialer() proxy.Dialer {
