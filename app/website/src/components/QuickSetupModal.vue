@@ -165,7 +165,8 @@
                     v-for="key in compatibleKeys"
                     :key="key.id"
                     :class="[
-                      'flex cursor-pointer items-start gap-3 rounded-xl border px-3 py-2 transition',
+                      'flex items-start gap-3 rounded-xl border px-3 py-2 transition',
+                      apiKeyHasPlainSecret(key) ? 'cursor-pointer' : 'cursor-not-allowed opacity-60',
                       isOpenCodeKeySelected(key.id)
                         ? 'border-primary/40 bg-primary/5 text-slate-900 dark:bg-primary/10 dark:text-white'
                         : 'border-slate-200 bg-white text-slate-700 hover:border-primary/30 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200',
@@ -175,6 +176,7 @@
                       class="sr-only"
                       type="checkbox"
                       :checked="isOpenCodeKeySelected(key.id)"
+                      :disabled="!apiKeyHasPlainSecret(key)"
                       @change="toggleOpenCodeKey(key.id, $event.target.checked)"
                     />
                     <span class="material-symbols-outlined mt-0.5 text-base text-primary">
@@ -187,6 +189,9 @@
                       </span>
                       <span class="mt-1 block truncate font-mono text-[10px] text-slate-400 dark:text-slate-500">
                         {{ key.base_url || providerBaseUrl(key.provider) }}
+                      </span>
+                      <span v-if="!apiKeyHasPlainSecret(key)" class="mt-1 block text-[10px] text-amber-600 dark:text-amber-400">
+                        {{ t('qs_keyMasked') }}
                       </span>
                     </span>
                   </label>
@@ -289,8 +294,8 @@
                   class="flex-1 h-10 rounded-xl border border-slate-200 bg-white px-3 text-sm text-slate-700 outline-none transition focus:border-primary dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
                 >
                   <option value="" disabled>{{ t('qs_selectKeyPh') }}</option>
-                  <option v-for="key in apiKeys" :key="key.id" :value="key.id" :disabled="!isKeyCompatible(key)">
-                    {{ key.name }} · {{ key.group?.name || t('qs_noGroup') }} ({{ key.provider }}){{ isKeyCompatible(key) ? '' : ' ' + t('qs_incompatible') }}
+                  <option v-for="key in apiKeys" :key="key.id" :value="key.id" :disabled="!isKeySelectable(key)">
+                    {{ key.name }} · {{ key.group?.name || t('qs_noGroup') }} ({{ key.provider }}){{ !isKeyCompatible(key) ? ' ' + t('qs_incompatible') : !apiKeyHasPlainSecret(key) ? ' · ' + t('qs_keyMasked') : '' }}
                   </option>
                 </select>
                 <button
@@ -484,6 +489,9 @@ function isKeyCompatible(key) {
   const supportedProviders = new Set(selectedSoftwareDef.value?.supported_providers || []);
   return supportedProviders.size === 0 || supportedProviders.has(key.provider);
 }
+function isKeySelectable(key) {
+  return isKeyCompatible(key) && apiKeyHasPlainSecret(key);
+}
 const selectedKey = computed(() => {
   if (!selectedKeyId.value) return null;
   return apiKeys.value.find((k) => String(k.id) === String(selectedKeyId.value)) || null;
@@ -503,10 +511,13 @@ const currentOpenCodeModels = computed(() => {
 const loadingOpenCodeModelKeyIds = ref(new Set());
 const canApplyCurrentVariant = computed(() => {
   if (!selectedSoftware.value) return false;
-  if (isOpenCodeSelected.value) {
-    return selectedOpenCodeKeys.value.length > 0;
+  if (selectedSoftwareDef.value?.isCustom) {
+    return editableFiles.value.length > 0;
   }
-  return editableFiles.value.length > 0;
+  if (isOpenCodeSelected.value) {
+    return selectedOpenCodeKeys.value.length > 0 && selectedOpenCodeKeys.value.every(apiKeyHasPlainSecret);
+  }
+  return apiKeyHasPlainSecret(selectedKey.value) && editableFiles.value.length > 0;
 });
 const currentFile = computed(() => {
   return editableFiles.value.find((item) => item.code === selectedFileCode.value) || editableFiles.value[0] || null;
@@ -541,7 +552,7 @@ function providerBaseUrl(provider) {
   if (trimmed.endsWith('/v1')) {
     trimmed = trimmed.slice(0, -3);
   }
-  if (provider === 'openai') {
+  if (provider === 'openai' || provider === 'anthropic') {
     return `${trimmed}/v1`;
   }
   return trimmed;
@@ -551,6 +562,11 @@ function isOpenCodeKeySelected(keyId) {
 }
 function toggleOpenCodeKey(keyId, checked) {
   const id = String(keyId);
+  const key = apiKeys.value.find((item) => String(item.id) === id);
+  if (checked && !apiKeyHasPlainSecret(key)) {
+    statusMessage.value = t('qs_keyMasked');
+    return;
+  }
   if (checked) {
     if (!isOpenCodeKeySelected(id)) {
       selectedOpenCodeKeyIds.value = [...selectedOpenCodeKeyIds.value, id];
@@ -654,11 +670,6 @@ function buildOpenCodeSpec() {
     model_provider: keyProvider(openCodeModelKeyId.value),
     model: openCodeModel.value.trim() || defaultOpenCodeModel(keyProvider(openCodeModelKeyId.value)),
     small_model: openCodeSmallModel.value.trim(),
-    provider_ids: selectedOpenCodeKeys.value.map((key) => Number(key.id)).filter(Boolean),
-    providers: selectedOpenCodeKeys.value.map((key) => ({
-      key_id: Number(key.id),
-      base_url: String(key.base_url || providerBaseUrl(key.provider) || '').trim(),
-    })),
   };
 }
 function clearCurrentRender() {
@@ -745,7 +756,15 @@ function selectSoftware(code) {
 function confirmAddSoftware() {
   const name = newSoftwareName.value.trim();
   if (!name) return;
-  const code = 'custom-' + name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
+  const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '')
+    || `software-${customSoftwares.value.length + 1}`;
+  const baseCode = `custom-${slug}`;
+  let code = baseCode;
+  let suffix = 2;
+  while (allSoftwares.value.some((software) => software.code === code)) {
+    code = `${baseCode}-${suffix}`;
+    suffix++;
+  }
   customSoftwares.value.push({
     code,
     name,
@@ -770,7 +789,7 @@ function addNewFile() {
   const newFile = {
     code: `custom-file-${fileCounter}`,
     label: `file-${fileCounter}`,
-    path: '~/path/to/config',
+    path: `~/.aliang/quick-setup/custom/${selectedSoftware.value}/file-${fileCounter}`,
     format: 'text',
     kind: 'file',
     content: '',
@@ -868,20 +887,28 @@ watch(selectedSoftware, async () => {
     openCodeModelError.value = '';
     return;
   }
-  const preferred = keys.find((k) => k.provider === 'openai') || keys[0];
+  const usablePreferred = keys.find((key) => key.provider === 'openai' && apiKeyHasPlainSecret(key))
+    || keys.find(apiKeyHasPlainSecret);
+  if (!usablePreferred) {
+    selectedKeyId.value = '';
+    selectedOpenCodeKeyIds.value = [];
+    openCodeModelKeyId.value = '';
+    openCodeModelError.value = t('qs_keyMasked');
+    return;
+  }
   if (isOpenCodeSelected.value) {
-    selectedOpenCodeKeyIds.value = [String(preferred.id)];
-    openCodeModelKeyId.value = String(preferred.id);
+    selectedOpenCodeKeyIds.value = [String(usablePreferred.id)];
+    openCodeModelKeyId.value = String(usablePreferred.id);
     openCodeModel.value = '';
     openCodeSmallModel.value = '';
     await loadOpenCodeModelsForKey(openCodeModelKeyId.value);
     if (!openCodeModel.value.trim()) {
-      openCodeModel.value = defaultOpenCodeModel(preferred.provider);
+      openCodeModel.value = defaultOpenCodeModel(usablePreferred.provider);
     }
     scheduleOpenCodeRender(0);
     return;
   }
-  selectedKeyId.value = preferred.id;
+  selectedKeyId.value = usablePreferred.id;
 });
 // Key switch -> render config
 watch(selectedKeyId, () => {

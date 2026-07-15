@@ -1,12 +1,15 @@
 package handlers
 
 import (
+	"errors"
 	"net/http"
 
 	"aliang.one/nursorgate/app/http/common"
 	"aliang.one/nursorgate/app/http/models"
 	"aliang.one/nursorgate/app/http/services"
 )
+
+const quickSetupRequestMaxBytes = 2 << 20
 
 type QuickSetupHandler struct {
 	service *services.QuickSetupService
@@ -32,6 +35,7 @@ func (h *QuickSetupHandler) HandleRender(w http.ResponseWriter, r *http.Request)
 	}
 
 	var req models.QuickSetupRenderRequest
+	r.Body = http.MaxBytesReader(w, r.Body, quickSetupRequestMaxBytes)
 	if err := common.DecodeRequest(r, &req); err != nil {
 		common.ErrorBadRequest(w, "Invalid request body", map[string]interface{}{"error": err.Error()})
 		return
@@ -39,6 +43,10 @@ func (h *QuickSetupHandler) HandleRender(w http.ResponseWriter, r *http.Request)
 
 	resp, err := h.service.Render(req)
 	if err != nil {
+		if errors.Is(err, services.ErrQuickSetupUnauthenticated) {
+			common.ErrorUnauthorized(w, err.Error())
+			return
+		}
 		if isBadRequestError(err) {
 			common.ErrorBadRequest(w, err.Error(), nil)
 			return
@@ -57,6 +65,7 @@ func (h *QuickSetupHandler) HandleModels(w http.ResponseWriter, r *http.Request)
 	}
 
 	var req models.QuickSetupModelsRequest
+	r.Body = http.MaxBytesReader(w, r.Body, quickSetupRequestMaxBytes)
 	if err := common.DecodeRequest(r, &req); err != nil {
 		common.ErrorBadRequest(w, "Invalid request body", map[string]interface{}{"error": err.Error()})
 		return
@@ -64,6 +73,10 @@ func (h *QuickSetupHandler) HandleModels(w http.ResponseWriter, r *http.Request)
 
 	resp, err := h.service.Models(req)
 	if err != nil {
+		if errors.Is(err, services.ErrQuickSetupUnauthenticated) {
+			common.ErrorUnauthorized(w, err.Error())
+			return
+		}
 		if isBadRequestError(err) {
 			common.ErrorBadRequest(w, err.Error(), nil)
 			return
@@ -82,6 +95,7 @@ func (h *QuickSetupHandler) HandleApply(w http.ResponseWriter, r *http.Request) 
 	}
 
 	var req models.QuickSetupApplyRequest
+	r.Body = http.MaxBytesReader(w, r.Body, quickSetupRequestMaxBytes)
 	if err := common.DecodeRequest(r, &req); err != nil {
 		common.ErrorBadRequest(w, "Invalid request body", map[string]interface{}{"error": err.Error()})
 		return
@@ -89,6 +103,10 @@ func (h *QuickSetupHandler) HandleApply(w http.ResponseWriter, r *http.Request) 
 
 	resp, err := h.service.Apply(req)
 	if err != nil {
+		if errors.Is(err, services.ErrQuickSetupUnauthenticated) {
+			common.ErrorUnauthorized(w, err.Error())
+			return
+		}
 		if isBadRequestError(err) {
 			common.ErrorBadRequest(w, err.Error(), nil)
 			return

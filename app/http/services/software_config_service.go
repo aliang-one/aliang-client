@@ -659,11 +659,52 @@ func writeConfigFile(filePath string, content string) error {
 	if filePath == "" {
 		return errors.New("file_path is required")
 	}
+	if info, err := os.Lstat(filePath); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			resolved, resolveErr := filepath.EvalSymlinks(filePath)
+			if resolveErr != nil {
+				return resolveErr
+			}
+			filePath = resolved
+		} else if !info.Mode().IsRegular() {
+			return errors.New("file_path must reference a regular file")
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
 	dir := filepath.Dir(filePath)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	return os.WriteFile(filePath, []byte(content), 0o644)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(filePath)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	closed := false
+	defer func() {
+		if !closed {
+			_ = tmp.Close()
+		}
+		_ = os.Remove(tmpPath)
+	}()
+	if err := tmp.Chmod(0o600); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(tmp, content); err != nil {
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	closed = true
+	if err := os.Rename(tmpPath, filePath); err != nil {
+		return err
+	}
+	return os.Chmod(filePath, 0o600)
 }
 
 func buildEffectiveSnapshotJSON(snapshot *config.EffectiveConfigSnapshot) (string, error) {

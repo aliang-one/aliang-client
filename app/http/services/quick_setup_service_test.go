@@ -2,11 +2,13 @@ package services
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -28,6 +30,39 @@ func TestQuickSetupService_Catalog_Unauthenticated(t *testing.T) {
 	result := svc.Catalog()
 	if result["status"] != "unauthenticated" {
 		t.Fatalf("expected unauthenticated status, got %#v", result["status"])
+	}
+}
+
+func TestQuickSetupService_RenderAndModelsReturnUnauthenticatedError(t *testing.T) {
+	config.ResetGlobalConfigForTest()
+	config.SetGlobalConfig(&config.Config{Core: &config.CoreConfig{APIServer: "https://api.example.com"}})
+	t.Cleanup(config.ResetGlobalConfigForTest)
+
+	previous := quickSetupGetAPIKeysFn
+	quickSetupGetAPIKeysFn = func() ([]auth.UserAPIKey, error) {
+		return nil, fmt.Errorf("no user session")
+	}
+	t.Cleanup(func() { quickSetupGetAPIKeysFn = previous })
+
+	if _, err := NewQuickSetupService().Render(models.QuickSetupRenderRequest{Software: "opencode", KeyIDs: []int64{1}}); !errors.Is(err, ErrQuickSetupUnauthenticated) {
+		t.Fatalf("Render() error = %v, want ErrQuickSetupUnauthenticated", err)
+	}
+	if _, err := NewQuickSetupService().Models(models.QuickSetupModelsRequest{KeyID: 1}); !errors.Is(err, ErrQuickSetupUnauthenticated) {
+		t.Fatalf("Models() error = %v, want ErrQuickSetupUnauthenticated", err)
+	}
+}
+
+func TestQuickSetupService_Catalog_FailsWithoutAPIBaseURL(t *testing.T) {
+	config.ResetGlobalConfigForTest()
+	t.Cleanup(config.ResetGlobalConfigForTest)
+
+	previous := quickSetupGetAPIKeysFn
+	quickSetupGetAPIKeysFn = func() ([]auth.UserAPIKey, error) { return nil, nil }
+	t.Cleanup(func() { quickSetupGetAPIKeysFn = previous })
+
+	result := NewQuickSetupService().Catalog()
+	if result["status"] != "failed" {
+		t.Fatalf("Catalog() status = %#v, want failed", result["status"])
 	}
 }
 
@@ -158,9 +193,8 @@ func TestQuickSetupService_Render_OpenCodeCombinedProviders(t *testing.T) {
 		Software: "opencode",
 		KeyIDs:   []int64{11, 22},
 		OpenCode: &models.OpenCodeRenderSpec{
-			ModelKeyID:  22,
-			Model:       "claude-sonnet-4-5",
-			ProviderIDs: []int64{11, 22},
+			ModelKeyID: 22,
+			Model:      "claude-sonnet-4-5",
 		},
 	})
 	if err != nil {
@@ -184,6 +218,12 @@ func TestQuickSetupService_Render_OpenCodeCombinedProviders(t *testing.T) {
 	if _, ok := cfg["model"].(map[string]interface{}); ok {
 		t.Fatalf("model must be a provider/model string, got object")
 	}
+	if _, ok := cfg["workspace"]; ok {
+		t.Fatalf("workspace is not supported by the OpenCode schema: %#v", cfg["workspace"])
+	}
+	if _, ok := cfg["theme"]; ok {
+		t.Fatalf("theme is not supported by the current OpenCode schema: %#v", cfg["theme"])
+	}
 	providers, ok := cfg["provider"].(map[string]interface{})
 	if !ok || len(providers) != 2 {
 		t.Fatalf("providers = %#v, want 2 entries", cfg["provider"])
@@ -204,10 +244,8 @@ func TestQuickSetupService_Render_OpenCodeCombinedProviders(t *testing.T) {
 			t.Fatalf("%s npm = %#v", id, provider["npm"])
 		}
 	}
-	for _, want := range []string{"https://api.example.com/v1", "https://api.example.com"} {
-		if !baseURLs[want] {
-			t.Fatalf("missing baseURL %s in %#v", want, baseURLs)
-		}
+	if want := "https://api.example.com/v1"; !baseURLs[want] {
+		t.Fatalf("missing baseURL %s in %#v", want, baseURLs)
 	}
 }
 
@@ -250,8 +288,8 @@ func TestQuickSetupService_Render_OpenCodeDefaultsToProviderAwareGateway(t *test
 	for id, raw := range providers {
 		provider := raw.(map[string]interface{})
 		options := provider["options"].(map[string]interface{})
-		if options["baseURL"] != "https://api.example.com" {
-			t.Fatalf("%s default baseURL = %#v, want Anthropic gateway root", id, options["baseURL"])
+		if options["baseURL"] != "https://api.example.com/v1" {
+			t.Fatalf("%s default baseURL = %#v, want versioned Anthropic gateway URL", id, options["baseURL"])
 		}
 		if provider["npm"] != "@ai-sdk/anthropic" {
 			t.Fatalf("%s npm = %#v, want Anthropic provider package", id, provider["npm"])
@@ -296,8 +334,83 @@ func TestQuickSetupService_Catalog_IncludesProviderAwareBaseURLs(t *testing.T) {
 	if baseURLs["openai"] != "https://api.example.com/v1" {
 		t.Fatalf("openai base_url = %q", baseURLs["openai"])
 	}
-	if baseURLs["anthropic"] != "https://api.example.com" {
+	if baseURLs["anthropic"] != "https://api.example.com/v1" {
 		t.Fatalf("anthropic base_url = %q", baseURLs["anthropic"])
+	}
+}
+
+func TestQuickSetupProviderBaseURL_UsesSingleVersionPrefix(t *testing.T) {
+	for _, provider := range []string{"openai", "anthropic"} {
+		for _, root := range []string{"https://api.example.com", "https://api.example.com/v1"} {
+			if got := quickSetupProviderBaseURL(provider, root); got != "https://api.example.com/v1" {
+				t.Fatalf("provider %s root %s = %q", provider, root, got)
+			}
+		}
+	}
+}
+
+func TestQuickSetupService_Render_OpenCodeRejectsUnavailableSecrets(t *testing.T) {
+	config.ResetGlobalConfigForTest()
+	config.SetGlobalConfig(&config.Config{
+		Core: &config.CoreConfig{APIServer: "https://api.example.com"},
+	})
+	t.Cleanup(config.ResetGlobalConfigForTest)
+
+	previous := quickSetupGetAPIKeysFn
+	t.Cleanup(func() {
+		quickSetupGetAPIKeysFn = previous
+	})
+
+	for _, tc := range []struct {
+		name string
+		key  string
+	}{
+		{name: "empty", key: ""},
+		{name: "masked", key: "sk-***-masked"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			quickSetupGetAPIKeysFn = func() ([]auth.UserAPIKey, error) {
+				return []auth.UserAPIKey{
+					{ID: 11, Key: tc.key, Name: "Unavailable Key", Status: "active", Provider: "openai"},
+				}, nil
+			}
+
+			_, err := NewQuickSetupService().Render(models.QuickSetupRenderRequest{
+				Software: "opencode",
+				KeyIDs:   []int64{11},
+			})
+			if err == nil || !strings.Contains(err.Error(), "plaintext secret is required") {
+				t.Fatalf("render error = %v, want plaintext secret validation", err)
+			}
+		})
+	}
+}
+
+func TestQuickSetupService_Render_RequiresExplicitValidSelection(t *testing.T) {
+	config.ResetGlobalConfigForTest()
+	config.SetGlobalConfig(&config.Config{
+		Core: &config.CoreConfig{APIServer: "https://api.example.com"},
+	})
+	t.Cleanup(config.ResetGlobalConfigForTest)
+
+	previous := quickSetupGetAPIKeysFn
+	quickSetupGetAPIKeysFn = func() ([]auth.UserAPIKey, error) {
+		return []auth.UserAPIKey{
+			{ID: 11, Key: "sk-openai-real", Name: "OpenAI Key", Status: "active", Provider: "openai"},
+		}, nil
+	}
+	t.Cleanup(func() {
+		quickSetupGetAPIKeysFn = previous
+	})
+
+	for _, req := range []models.QuickSetupRenderRequest{
+		{Software: "opencode"},
+		{Software: "opencode", KeyIDs: []int64{999}},
+		{Software: "opencode", KeyIDs: []int64{11}, OpenCode: &models.OpenCodeRenderSpec{ModelKeyID: 999}},
+	} {
+		if _, err := NewQuickSetupService().Render(req); err == nil {
+			t.Fatalf("Render(%+v) succeeded, want selection validation error", req)
+		}
 	}
 }
 
@@ -350,7 +463,7 @@ func TestQuickSetupService_Render_MultiProvider(t *testing.T) {
 	})
 
 	svc := NewQuickSetupService()
-	resp, err := svc.Render(models.QuickSetupRenderRequest{Software: "codex"})
+	resp, err := svc.Render(models.QuickSetupRenderRequest{Software: "codex", KeyIDs: []int64{11, 22}})
 	if err != nil {
 		t.Fatalf("render failed: %v", err)
 	}
@@ -369,6 +482,9 @@ func TestQuickSetupService_Render_MultiProvider(t *testing.T) {
 func TestQuickSetupService_Apply_WritesFiles(t *testing.T) {
 	tempHome := t.TempDir()
 	t.Setenv("HOME", tempHome)
+	previousAuth := quickSetupAuthorizationHeaderFn
+	quickSetupAuthorizationHeaderFn = func() string { return "Bearer test-access" }
+	t.Cleanup(func() { quickSetupAuthorizationHeaderFn = previousAuth })
 
 	svc := NewQuickSetupService()
 	resp, err := svc.Apply(models.QuickSetupApplyRequest{
@@ -400,5 +516,147 @@ func TestQuickSetupService_Apply_WritesFiles(t *testing.T) {
 	}
 	if !strings.Contains(string(content), "gpt-5-codex") {
 		t.Fatalf("unexpected config content: %s", string(content))
+	}
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(configPath)
+		if err != nil {
+			t.Fatalf("stat written config failed: %v", err)
+		}
+		if got := info.Mode().Perm(); got != 0o600 {
+			t.Fatalf("written config permissions = %o, want 600", got)
+		}
+	}
+	entries, err := os.ReadDir(filepath.Dir(configPath))
+	if err != nil {
+		t.Fatalf("read config directory failed: %v", err)
+	}
+	for _, entry := range entries {
+		if strings.Contains(entry.Name(), ".tmp-") {
+			t.Fatalf("atomic write left temporary file %q", entry.Name())
+		}
+	}
+}
+
+func TestQuickSetupService_Apply_RejectsUnauthenticatedAndUnsafePathsBeforeWriting(t *testing.T) {
+	tempHome := t.TempDir()
+	t.Setenv("HOME", tempHome)
+	previousAuth := quickSetupAuthorizationHeaderFn
+	quickSetupAuthorizationHeaderFn = func() string { return "" }
+	t.Cleanup(func() { quickSetupAuthorizationHeaderFn = previousAuth })
+
+	svc := NewQuickSetupService()
+	request := models.QuickSetupApplyRequest{
+		Software: "opencode",
+		Files: []models.QuickSetupApplyFile{
+			{Path: "~/.config/opencode/opencode.json", Content: "{}"},
+		},
+	}
+	if _, err := svc.Apply(request); !errors.Is(err, ErrQuickSetupUnauthenticated) {
+		t.Fatalf("unauthenticated Apply() error = %v", err)
+	}
+
+	quickSetupAuthorizationHeaderFn = func() string { return "Bearer test-access" }
+	outside := filepath.Join(filepath.Dir(tempHome), "outside-opencode.json")
+	firstPath := filepath.Join(tempHome, ".config", "opencode", "opencode.json")
+	request.Files = []models.QuickSetupApplyFile{
+		{Path: firstPath, Content: "{}"},
+		{Path: outside, Content: "{}"},
+	}
+	if _, err := svc.Apply(request); err == nil {
+		t.Fatal("Apply() accepted a target outside HOME")
+	}
+	if _, err := os.Stat(firstPath); !os.IsNotExist(err) {
+		t.Fatalf("first file was written before validation completed: %v", err)
+	}
+	request.Files = []models.QuickSetupApplyFile{{Path: filepath.Join(tempHome, ".zshrc"), Content: "malicious"}}
+	if _, err := svc.Apply(request); err == nil {
+		t.Fatal("Apply() accepted a path outside the software config directory")
+	}
+	request.Files = []models.QuickSetupApplyFile{{Path: filepath.Join(tempHome, ".config", "opencode", "plugin.js"), Content: "malicious"}}
+	if _, err := svc.Apply(request); err == nil {
+		t.Fatal("Apply() accepted an undeclared file inside the software config directory")
+	}
+}
+
+func TestQuickSetupService_Apply_RejectsSymlinkEscape(t *testing.T) {
+	tempHome := t.TempDir()
+	outside := t.TempDir()
+	t.Setenv("HOME", tempHome)
+	previousAuth := quickSetupAuthorizationHeaderFn
+	quickSetupAuthorizationHeaderFn = func() string { return "Bearer test-access" }
+	t.Cleanup(func() { quickSetupAuthorizationHeaderFn = previousAuth })
+
+	configDir := filepath.Join(tempHome, ".config")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(configDir, "opencode")
+	if err := os.Symlink(outside, link); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skipf("symlink unavailable on Windows: %v", err)
+		}
+		t.Fatal(err)
+	}
+	_, err := NewQuickSetupService().Apply(models.QuickSetupApplyRequest{
+		Software: "opencode",
+		Files: []models.QuickSetupApplyFile{
+			{Path: filepath.Join(link, "opencode.json"), Content: "{}"},
+		},
+	})
+	if err == nil {
+		t.Fatal("Apply() accepted a symlink target outside HOME")
+	}
+}
+
+func TestQuickSetupService_Apply_RollsBackEarlierFilesOnWriteFailure(t *testing.T) {
+	tempHome := t.TempDir()
+	t.Setenv("HOME", tempHome)
+	previousAuth := quickSetupAuthorizationHeaderFn
+	quickSetupAuthorizationHeaderFn = func() string { return "Bearer test-access" }
+	t.Cleanup(func() { quickSetupAuthorizationHeaderFn = previousAuth })
+
+	configDir := filepath.Join(tempHome, ".codex")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	firstPath := filepath.Join(configDir, "config.toml")
+	secondPath := filepath.Join(configDir, "auth.json")
+	if err := os.WriteFile(firstPath, []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	previousWriter := quickSetupWriteConfigFileFn
+	writes := 0
+	quickSetupWriteConfigFileFn = func(path string, content string) error {
+		writes++
+		if writes == 2 {
+			if err := writeConfigFile(path, content); err != nil {
+				return err
+			}
+			return errors.New("injected write failure")
+		}
+		return writeConfigFile(path, content)
+	}
+	t.Cleanup(func() { quickSetupWriteConfigFileFn = previousWriter })
+
+	_, err := NewQuickSetupService().Apply(models.QuickSetupApplyRequest{
+		Software: "codex",
+		Files: []models.QuickSetupApplyFile{
+			{Path: firstPath, Content: "replacement"},
+			{Path: secondPath, Content: "new auth"},
+		},
+	})
+	if err == nil {
+		t.Fatal("Apply() succeeded despite injected write failure")
+	}
+	content, readErr := os.ReadFile(firstPath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(content) != "original" {
+		t.Fatalf("first file content = %q, want rollback to original", content)
+	}
+	if _, statErr := os.Stat(secondPath); !os.IsNotExist(statErr) {
+		t.Fatalf("second file exists after failed apply: %v", statErr)
 	}
 }

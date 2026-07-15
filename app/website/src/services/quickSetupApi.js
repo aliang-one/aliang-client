@@ -23,6 +23,9 @@ async function rawRequest(path, options = {}) {
   const envelope = extractOuterEnvelope(json);
 
   if (!response.ok || envelope.code !== 0) {
+    if (response.status === 401) {
+      syncUnauthenticatedAuthState(envelope.msg);
+    }
     throw new Error(envelope.msg || `Request failed with HTTP ${response.status}`);
   }
 

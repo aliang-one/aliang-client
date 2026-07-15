@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"aliang.one/nursorgate/app/http/models"
@@ -19,8 +21,28 @@ import (
 
 type QuickSetupService struct{}
 
+type quickSetupPreparedFile struct {
+	path    string
+	content string
+}
+
+type quickSetupFileBackup struct {
+	existed bool
+	content []byte
+}
+
+const (
+	quickSetupMaxApplyFiles     = 16
+	quickSetupMaxApplyFileBytes = 1 << 20
+)
+
+var ErrQuickSetupUnauthenticated = errors.New("authenticated session is required")
+
 var quickSetupGetAPIKeysFn = auth.GetUserAPIKeys
+var quickSetupAuthorizationHeaderFn = auth.GetCurrentAuthorizationHeader
 var quickSetupModelsHTTPClient = &http.Client{Timeout: 12 * time.Second}
+var quickSetupWriteConfigFileFn = writeConfigFile
+var quickSetupApplyMu sync.Mutex
 
 func NewQuickSetupService() *QuickSetupService {
 	return &QuickSetupService{}
@@ -43,7 +65,14 @@ func (s *QuickSetupService) Catalog() map[string]interface{} {
 		}
 	}
 
-	baseRoot, _ := quickSetupBaseURL()
+	baseRoot, err := quickSetupBaseURL()
+	if err != nil {
+		return map[string]interface{}{
+			"status": "failed",
+			"error":  "quick_setup_catalog_failed",
+			"msg":    fmt.Sprintf("Failed to load quick setup catalog: %v", err),
+		}
+	}
 	return map[string]interface{}{
 		"status": "success",
 		"data": models.QuickSetupCatalogResponse{
@@ -63,6 +92,9 @@ func (s *QuickSetupService) Render(req models.QuickSetupRenderRequest) (*models.
 	if !ok {
 		return nil, fmt.Errorf("unsupported software: %s", software)
 	}
+	if len(req.KeyIDs) == 0 {
+		return nil, errors.New("at least one key_id is required")
+	}
 
 	baseRoot, err := quickSetupBaseURL()
 	if err != nil {
@@ -71,11 +103,17 @@ func (s *QuickSetupService) Render(req models.QuickSetupRenderRequest) (*models.
 
 	apiKeys, err := quickSetupGetAPIKeysFn()
 	if err != nil {
+		if isSessionMissingError(err) {
+			return nil, ErrQuickSetupUnauthenticated
+		}
 		return nil, err
 	}
 
 	selectedIDs := make(map[int64]struct{}, len(req.KeyIDs))
 	for _, id := range req.KeyIDs {
+		if id <= 0 {
+			return nil, fmt.Errorf("selected API key id is not valid: %d", id)
+		}
 		selectedIDs[id] = struct{}{}
 	}
 
@@ -92,14 +130,16 @@ func (s *QuickSetupService) Render(req models.QuickSetupRenderRequest) (*models.
 	}
 
 	var variants []models.QuickSetupVariant
+	matchedIDs := make(map[int64]struct{}, len(selectedIDs))
 	for _, key := range keys {
-		if len(selectedIDs) > 0 {
-			if _, ok := selectedIDs[key.ID]; !ok {
-				continue
-			}
+		if _, ok := selectedIDs[key.ID]; !ok {
+			continue
 		}
 		if !softwareSupportsProvider(softwareDef, key.Provider) {
 			continue
+		}
+		if !quickSetupAPIKeyHasPlainSecret(key) {
+			return nil, fmt.Errorf("plaintext secret is required for selected API key %q", key.Name)
 		}
 
 		files, notes, err := renderQuickSetupFiles(softwareDef, key, baseRoot)
@@ -115,6 +155,10 @@ func (s *QuickSetupService) Render(req models.QuickSetupRenderRequest) (*models.
 			Files:    files,
 			Notes:    notes,
 		})
+		matchedIDs[key.ID] = struct{}{}
+	}
+	if len(matchedIDs) != len(selectedIDs) {
+		return nil, errors.New("one or more selected API keys are not valid for this software")
 	}
 
 	sort.SliceStable(variants, func(i, j int) bool {
@@ -142,6 +186,9 @@ func (s *QuickSetupService) Models(req models.QuickSetupModelsRequest) (*models.
 
 	apiKeys, err := quickSetupGetAPIKeysFn()
 	if err != nil {
+		if isSessionMissingError(err) {
+			return nil, ErrQuickSetupUnauthenticated
+		}
 		return nil, err
 	}
 
@@ -154,10 +201,10 @@ func (s *QuickSetupService) Models(req models.QuickSetupModelsRequest) (*models.
 		}
 	}
 	if selected == nil {
-		return nil, fmt.Errorf("api key not found: %d", req.KeyID)
+		return nil, fmt.Errorf("selected API key id is not valid: %d", req.KeyID)
 	}
 	if !quickSetupAPIKeyHasPlainSecret(*selected) {
-		return nil, errors.New("selected API key secret is not available")
+		return nil, errors.New("plaintext secret is required for selected API key")
 	}
 
 	modelListBaseURL := quickSetupModelListBaseURL(baseRoot)
@@ -179,32 +226,87 @@ func (s *QuickSetupService) Apply(req models.QuickSetupApplyRequest) (*models.Qu
 	if software == "" {
 		return nil, errors.New("software is required")
 	}
+	if strings.TrimSpace(quickSetupAuthorizationHeaderFn()) == "" {
+		return nil, ErrQuickSetupUnauthenticated
+	}
 	if len(req.Files) == 0 {
 		return nil, errors.New("files are required")
 	}
+	if len(req.Files) > quickSetupMaxApplyFiles {
+		return nil, fmt.Errorf("files are not valid: maximum is %d", quickSetupMaxApplyFiles)
+	}
 
-	written := make([]string, 0, len(req.Files))
+	prepared := make([]quickSetupPreparedFile, 0, len(req.Files))
+	seenPaths := make(map[string]struct{}, len(req.Files))
 	for _, file := range req.Files {
 		targetPath := strings.TrimSpace(file.Path)
 		if targetPath == "" {
 			return nil, errors.New("file path is required")
 		}
+		if len(file.Content) > quickSetupMaxApplyFileBytes {
+			return nil, fmt.Errorf("file content is not valid: exceeds %d bytes", quickSetupMaxApplyFileBytes)
+		}
 
-		resolvedPath, err := expandQuickSetupPath(targetPath)
+		resolvedPath, err := resolveQuickSetupApplyPath(software, targetPath)
 		if err != nil {
 			return nil, err
 		}
+		if _, exists := seenPaths[resolvedPath]; exists {
+			return nil, fmt.Errorf("file path is not valid: duplicate target %s", targetPath)
+		}
+		seenPaths[resolvedPath] = struct{}{}
+		prepared = append(prepared, quickSetupPreparedFile{path: resolvedPath, content: file.Content})
+	}
 
-		if err := writeConfigFile(resolvedPath, file.Content); err != nil {
+	quickSetupApplyMu.Lock()
+	defer quickSetupApplyMu.Unlock()
+
+	backups := make([]quickSetupFileBackup, len(prepared))
+	for i, file := range prepared {
+		content, readErr := os.ReadFile(file.path)
+		if readErr == nil {
+			if len(content) > quickSetupMaxApplyFileBytes {
+				return nil, fmt.Errorf("existing config is not valid: %s exceeds %d bytes", file.path, quickSetupMaxApplyFileBytes)
+			}
+			backups[i] = quickSetupFileBackup{existed: true, content: content}
+			continue
+		}
+		if !os.IsNotExist(readErr) {
+			return nil, readErr
+		}
+	}
+
+	written := make([]string, 0, len(prepared))
+	for i, file := range prepared {
+		if err := quickSetupWriteConfigFileFn(file.path, file.content); err != nil {
+			if rollbackErr := rollbackQuickSetupFiles(prepared[:i+1], backups[:i+1]); rollbackErr != nil {
+				return nil, fmt.Errorf("write config failed: %w; rollback failed: %v", err, rollbackErr)
+			}
 			return nil, err
 		}
-		written = append(written, resolvedPath)
+		written = append(written, file.path)
 	}
 
 	return &models.QuickSetupApplyResponse{
 		Software: software,
 		Written:  written,
 	}, nil
+}
+
+func rollbackQuickSetupFiles(files []quickSetupPreparedFile, backups []quickSetupFileBackup) error {
+	var rollbackErr error
+	for i := len(files) - 1; i >= 0; i-- {
+		if backups[i].existed {
+			if err := writeConfigFile(files[i].path, string(backups[i].content)); err != nil {
+				rollbackErr = errors.Join(rollbackErr, err)
+			}
+			continue
+		}
+		if err := os.Remove(files[i].path); err != nil && !os.IsNotExist(err) {
+			rollbackErr = errors.Join(rollbackErr, err)
+		}
+	}
+	return rollbackErr
 }
 
 func quickSetupSoftwares() []models.QuickSetupSoftware {
@@ -350,7 +452,7 @@ func quickSetupLooksMaskedAPIKey(value string) bool {
 func renderQuickSetupFiles(software models.QuickSetupSoftware, apiKey models.QuickSetupAPIKey, apiRoot string) ([]models.QuickSetupPreviewFile, []string, error) {
 	switch software.Code {
 	case "opencode":
-		return renderOpenCodeFiles(software, []models.QuickSetupAPIKey{apiKey}, apiKey.ID, "", "", "", nil, apiRoot)
+		return renderOpenCodeFiles(software, []models.QuickSetupAPIKey{apiKey}, apiKey.ID, "", "", apiRoot)
 	case "codex":
 		return renderCodexFiles(software, apiKey, apiRoot)
 	case "claude-code":
@@ -361,51 +463,42 @@ func renderQuickSetupFiles(software models.QuickSetupSoftware, apiKey models.Qui
 }
 
 func renderOpenCodeVariants(software models.QuickSetupSoftware, keys []models.QuickSetupAPIKey, selectedIDs map[int64]struct{}, spec *models.OpenCodeRenderSpec, apiRoot string) ([]models.QuickSetupVariant, error) {
-	providerIDs := make(map[int64]struct{}, len(selectedIDs)+len(specProviderIDs(spec)))
-	for id := range selectedIDs {
-		providerIDs[id] = struct{}{}
-	}
-	for _, id := range specProviderIDs(spec) {
-		providerIDs[id] = struct{}{}
-	}
-
 	var selected []models.QuickSetupAPIKey
+	matchedIDs := make(map[int64]struct{}, len(selectedIDs))
 	for _, key := range keys {
 		if !softwareSupportsProvider(software, key.Provider) {
 			continue
 		}
-		if len(providerIDs) > 0 {
-			if _, ok := providerIDs[key.ID]; !ok {
-				continue
-			}
+		if _, ok := selectedIDs[key.ID]; !ok {
+			continue
 		}
 		selected = append(selected, key)
+		matchedIDs[key.ID] = struct{}{}
 	}
-	if len(selected) == 0 {
-		return nil, nil
+	if len(matchedIDs) != len(selectedIDs) {
+		return nil, errors.New("one or more selected API keys are not valid for OpenCode")
 	}
 
 	modelKeyID := int64(0)
 	modelProvider := ""
 	model := ""
 	smallModel := ""
-	baseURL := ""
-	baseURLOverrides := map[int64]string{}
 	if spec != nil {
 		modelKeyID = spec.ModelKeyID
 		modelProvider = strings.TrimSpace(spec.ModelProvider)
 		model = strings.TrimSpace(spec.Model)
 		smallModel = strings.TrimSpace(spec.SmallModel)
-		baseURL = strings.TrimSpace(spec.BaseURL)
-		for _, provider := range spec.Providers {
-			if provider.KeyID == 0 {
-				continue
+		if modelKeyID != 0 {
+			if _, ok := matchedIDs[modelKeyID]; !ok {
+				return nil, errors.New("model_key_id must reference a selected API key")
 			}
-			baseURLOverrides[provider.KeyID] = strings.TrimSpace(provider.BaseURL)
 		}
 	}
 	modelKey := selectOpenCodeModelKey(selected, modelKeyID, modelProvider)
-	files, notes, err := renderOpenCodeFiles(software, selected, modelKey.ID, model, smallModel, baseURL, baseURLOverrides, apiRoot)
+	if modelProvider != "" && modelKey.Provider != modelProvider {
+		return nil, errors.New("model_provider must reference a selected API key provider")
+	}
+	files, notes, err := renderOpenCodeFiles(software, selected, modelKey.ID, model, smallModel, apiRoot)
 	if err != nil {
 		return nil, err
 	}
@@ -425,20 +518,6 @@ func renderOpenCodeVariants(software models.QuickSetupSoftware, keys []models.Qu
 			Notes:    notes,
 		},
 	}, nil
-}
-
-func specProviderIDs(spec *models.OpenCodeRenderSpec) []int64 {
-	if spec == nil {
-		return nil
-	}
-	ids := make([]int64, 0, len(spec.ProviderIDs)+len(spec.Providers))
-	ids = append(ids, spec.ProviderIDs...)
-	for _, provider := range spec.Providers {
-		if provider.KeyID != 0 {
-			ids = append(ids, provider.KeyID)
-		}
-	}
-	return ids
 }
 
 func selectOpenCodeModelKey(keys []models.QuickSetupAPIKey, preferredID int64, preferredProvider string) models.QuickSetupAPIKey {
@@ -463,10 +542,15 @@ func selectOpenCodeModelKey(keys []models.QuickSetupAPIKey, preferredID int64, p
 	return keys[0]
 }
 
-func renderOpenCodeFiles(software models.QuickSetupSoftware, apiKeys []models.QuickSetupAPIKey, modelKeyID int64, modelOverride string, smallModelOverride string, baseURLOverride string, baseURLOverrides map[int64]string, apiRoot string) ([]models.QuickSetupPreviewFile, []string, error) {
+func renderOpenCodeFiles(software models.QuickSetupSoftware, apiKeys []models.QuickSetupAPIKey, modelKeyID int64, modelOverride string, smallModelOverride string, apiRoot string) ([]models.QuickSetupPreviewFile, []string, error) {
 	fileDef := software.Files[0]
 	if len(apiKeys) == 0 {
 		return nil, nil, errors.New("at least one API key is required for OpenCode")
+	}
+	for _, apiKey := range apiKeys {
+		if !quickSetupAPIKeyHasPlainSecret(apiKey) {
+			return nil, nil, fmt.Errorf("plaintext secret is required for selected API key %q", apiKey.Name)
+		}
 	}
 	providers := make(map[string]interface{}, len(apiKeys))
 	seen := map[string]int{}
@@ -478,7 +562,7 @@ func renderOpenCodeFiles(software models.QuickSetupSoftware, apiKeys []models.Qu
 	}
 	for _, apiKey := range apiKeys {
 		providerID := quickSetupOpenCodeProviderID(apiKey, seen)
-		baseURL := quickSetupOpenCodeBaseURL(apiKey.Provider, firstNonEmptyQuickSetupString(baseURLOverrides[apiKey.ID], baseURLOverride), apiRoot)
+		baseURL := quickSetupProviderBaseURL(apiKey.Provider, apiRoot)
 		providers[providerID] = map[string]interface{}{
 			"npm":  quickSetupOpenCodeProviderNPM(apiKey.Provider),
 			"name": quickSetupOpenCodeProviderName(apiKey),
@@ -507,7 +591,6 @@ func renderOpenCodeFiles(software models.QuickSetupSoftware, apiKeys []models.Qu
 	defaultModel := fmt.Sprintf("%s/%s", modelProviderID, modelName)
 	config := map[string]interface{}{
 		"$schema":  "https://opencode.ai/config.json",
-		"theme":    "system",
 		"provider": providers,
 		"model":    defaultModel,
 	}
@@ -516,10 +599,6 @@ func renderOpenCodeFiles(software models.QuickSetupSoftware, apiKeys []models.Qu
 		ensureOpenCodeProviderModel(providers, modelProviderID, smallModelName)
 		config["small_model"] = fmt.Sprintf("%s/%s", modelProviderID, smallModelName)
 	}
-	config["workspace"] = map[string]interface{}{
-		"autoApply": false,
-	}
-
 	raw, err := json.MarshalIndent(config, "", "  ")
 	if err != nil {
 		return nil, nil, err
@@ -616,13 +695,6 @@ func ensureOpenCodeProviderModel(providers map[string]interface{}, providerID st
 	if _, exists := models[modelName]; !exists {
 		models[modelName] = map[string]interface{}{"name": modelName}
 	}
-}
-
-func quickSetupOpenCodeBaseURL(provider string, override string, apiRoot string) string {
-	if trimmed := strings.TrimSpace(override); trimmed != "" {
-		return strings.TrimRight(trimmed, "/")
-	}
-	return quickSetupProviderBaseURL(provider, apiRoot)
 }
 
 func quickSetupModelListBaseURL(apiRoot string) string {
@@ -973,9 +1045,10 @@ func quickSetupDefaultModel(provider string, codex bool) string {
 func quickSetupProviderBaseURL(provider string, apiRoot string) string {
 	root := strings.TrimRight(strings.TrimSpace(apiRoot), "/")
 	switch provider {
-	case "anthropic":
-		return root
-	case "openai":
+	case "anthropic", "openai":
+		if strings.HasSuffix(root, "/v1") {
+			return root
+		}
 		return root + "/v1"
 	default:
 		return root
@@ -994,10 +1067,132 @@ func quickSetupBaseURL() (string, error) {
 	return strings.TrimRight(baseURL, "/"), nil
 }
 
-func expandQuickSetupPath(path string) (string, error) {
+func resolveQuickSetupApplyPath(software string, path string) (string, error) {
 	expanded, err := cache.ExpandHomePath(path)
-	if err == nil {
-		return expanded, nil
+	if err != nil {
+		return "", fmt.Errorf("file path is not valid: %w", err)
 	}
-	return filepath.Clean(path), nil
+	if !filepath.IsAbs(expanded) {
+		return "", errors.New("file path is not valid: an absolute path or ~/ path is required")
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("file path is not valid: resolve user home: %w", err)
+	}
+	canonicalHome, err := canonicalizeQuickSetupPath(home)
+	if err != nil {
+		return "", fmt.Errorf("file path is not valid: resolve user home: %w", err)
+	}
+	canonicalTarget, err := canonicalizeQuickSetupPath(expanded)
+	if err != nil {
+		return "", fmt.Errorf("file path is not valid: %w", err)
+	}
+	if !quickSetupPathWithin(canonicalHome, canonicalTarget) {
+		return "", errors.New("file path is not valid: target must stay within the user home directory")
+	}
+	allowedRoot, err := quickSetupAllowedRoot(software, home)
+	if err != nil {
+		return "", err
+	}
+	canonicalAllowedRoot, err := canonicalizeQuickSetupPath(allowedRoot)
+	if err != nil {
+		return "", fmt.Errorf("file path is not valid: resolve software config directory: %w", err)
+	}
+	if !quickSetupPathWithin(canonicalHome, canonicalAllowedRoot) || !quickSetupPathWithin(canonicalAllowedRoot, canonicalTarget) {
+		return "", errors.New("file path is not valid: target must stay within the software config directory")
+	}
+	if !strings.HasPrefix(software, "custom-") {
+		allowed, err := quickSetupBuiltInPathAllowed(software, canonicalTarget)
+		if err != nil {
+			return "", err
+		}
+		if !allowed {
+			return "", errors.New("file path is not valid: target is not a declared config file for this software")
+		}
+	}
+	if info, statErr := os.Stat(canonicalTarget); statErr == nil && !info.Mode().IsRegular() {
+		return "", errors.New("file path is not valid: target must be a regular file")
+	} else if statErr != nil && !os.IsNotExist(statErr) {
+		return "", fmt.Errorf("file path is not valid: %w", statErr)
+	}
+	return canonicalTarget, nil
+}
+
+func quickSetupBuiltInPathAllowed(software string, target string) (bool, error) {
+	definition, ok := findQuickSetupSoftware(software)
+	if !ok {
+		return false, fmt.Errorf("software is not valid: %s", software)
+	}
+	for _, file := range definition.Files {
+		expanded, err := cache.ExpandHomePath(file.DefaultPath)
+		if err != nil {
+			return false, err
+		}
+		allowed, err := canonicalizeQuickSetupPath(expanded)
+		if err != nil {
+			return false, err
+		}
+		if target == allowed {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func quickSetupAllowedRoot(software string, home string) (string, error) {
+	switch software {
+	case "opencode":
+		return filepath.Join(home, ".config", "opencode"), nil
+	case "codex":
+		return filepath.Join(home, ".codex"), nil
+	case "claude-code":
+		return filepath.Join(home, ".claude-code"), nil
+	default:
+		if !strings.HasPrefix(software, "custom-") || len(software) <= len("custom-") || len(software) > 72 {
+			return "", fmt.Errorf("software is not valid: %s", software)
+		}
+		for _, r := range software {
+			if r != '-' && (r < 'a' || r > 'z') && (r < '0' || r > '9') {
+				return "", fmt.Errorf("software is not valid: %s", software)
+			}
+		}
+		return filepath.Join(home, ".aliang", "quick-setup", "custom", software), nil
+	}
+}
+
+func canonicalizeQuickSetupPath(path string) (string, error) {
+	absPath, err := filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		return "", err
+	}
+
+	current := absPath
+	missing := make([]string, 0, 4)
+	for {
+		resolved, resolveErr := filepath.EvalSymlinks(current)
+		if resolveErr == nil {
+			for i := len(missing) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, missing[i])
+			}
+			return filepath.Clean(resolved), nil
+		}
+		if !os.IsNotExist(resolveErr) {
+			return "", resolveErr
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return "", resolveErr
+		}
+		missing = append(missing, filepath.Base(current))
+		current = parent
+	}
+}
+
+func quickSetupPathWithin(base string, target string) bool {
+	rel, err := filepath.Rel(base, target)
+	if err != nil || filepath.IsAbs(rel) {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator))
 }

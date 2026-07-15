@@ -60,18 +60,10 @@ type QuickSetupRenderRequest struct {
 }
 
 type OpenCodeRenderSpec struct {
-	ModelKeyID    int64                  `json:"model_key_id,omitempty"`
-	ModelProvider string                 `json:"model_provider,omitempty"`
-	Model         string                 `json:"model,omitempty"`
-	SmallModel    string                 `json:"small_model,omitempty"`
-	BaseURL       string                 `json:"base_url,omitempty"`
-	ProviderIDs   []int64                `json:"provider_ids,omitempty"`
-	Providers     []OpenCodeProviderSpec `json:"providers,omitempty"`
-}
-
-type OpenCodeProviderSpec struct {
-	KeyID   int64  `json:"key_id,omitempty"`
-	BaseURL string `json:"base_url,omitempty"`
+	ModelKeyID    int64  `json:"model_key_id,omitempty"`
+	ModelProvider string `json:"model_provider,omitempty"`
+	Model         string `json:"model,omitempty"`
+	SmallModel    string `json:"small_model,omitempty"`
 }
 
 type QuickSetupPreviewFile struct {
