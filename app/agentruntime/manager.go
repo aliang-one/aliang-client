@@ -148,6 +148,29 @@ func SupportsCurrentAgentAPI(timeout time.Duration) bool {
 	return true
 }
 
+// NeedsAuthenticatedSync detects a state that contradicts an authenticated
+// core session: the Agent process is healthy, but a prior logout/session expiry
+// cleared its remote registration. The caller must still ask the core to sync;
+// the core remains the authority on whether a valid user session exists.
+func NeedsAuthenticatedSync(timeout time.Duration) bool {
+	var envelope struct {
+		Code int                        `json:"code"`
+		Data models.AgentStatusResponse `json:"data"`
+	}
+	if err := getLocalAgentJSON(timeout, capabilityPath, &envelope); err != nil || envelope.Code != 0 {
+		return false
+	}
+	if envelope.Data.Enabled || envelope.Data.Registered {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(envelope.Data.SyncStatus)) {
+	case "logout", "auth_expired":
+		return true
+	default:
+		return false
+	}
+}
+
 func waitForCurrentAgentAPI(maxWait time.Duration, probeTimeout time.Duration) (int, error) {
 	deadline := time.Now().Add(maxWait)
 	attempts := 0

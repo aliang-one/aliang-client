@@ -192,6 +192,11 @@ func registerIPCHandlers(s *ipc.Server) {
 	s.Register(ipc.ActionShutdown, handleShutdown)
 }
 
+var (
+	currentAgentRegisterAuthorizationHeader = services.CurrentAgentRegisterAuthorizationHeader
+	syncUserAgentAfterAuthWithRetry         = services.SyncUserAgentAfterAuthWithRetry
+)
+
 func handleSyncAgentAuth(raw json.RawMessage) (interface{}, error) {
 	reason := "agent_started"
 	if len(raw) > 0 {
@@ -203,7 +208,14 @@ func handleSyncAgentAuth(raw json.RawMessage) (interface{}, error) {
 			reason = strings.TrimSpace(args.Reason)
 		}
 	}
-	if err := services.SyncUserAgentAfterAuthWithRetry(reason); err != nil {
+	if strings.TrimSpace(currentAgentRegisterAuthorizationHeader()) == "" {
+		return map[string]interface{}{
+			"status":  "skipped",
+			"reason":  reason,
+			"message": "no authenticated user session",
+		}, nil
+	}
+	if err := syncUserAgentAfterAuthWithRetry(reason); err != nil {
 		return nil, err
 	}
 	return map[string]interface{}{"status": "synced", "reason": reason}, nil

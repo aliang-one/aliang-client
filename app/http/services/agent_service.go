@@ -2359,8 +2359,13 @@ func sanitizeAgentEndpoint(endpoint string) string {
 		return strings.TrimSpace(endpoint)
 	}
 	values := parsed.Query()
-	for _, key := range []string{"token", "agent_secret", "device_token"} {
-		if values.Has(key) {
+	sensitiveKeys := map[string]struct{}{
+		"token": {}, "agent_secret": {}, "agent_token": {}, "device_token": {},
+		"user_token": {}, "access_token": {}, "authorization": {}, "api_key": {}, "apikey": {},
+	}
+	for key := range values {
+		normalizedKey := strings.ToLower(strings.ReplaceAll(key, "-", "_"))
+		if _, sensitive := sensitiveKeys[normalizedKey]; sensitive {
 			values.Set(key, "<redacted>")
 		}
 	}

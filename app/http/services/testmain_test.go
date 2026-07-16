@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	auth "aliang.one/nursorgate/processor/auth"
+	"aliang.one/nursorgate/processor/config"
 )
 
 func TestMain(m *testing.M) {
@@ -16,6 +17,9 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 	_ = os.Setenv("ALIANG_AUTH_SESSION_DB", filepath.Join(baseDir, "auth.data"))
+	// Package tests must never control a real desktop Agent that happens to be
+	// listening on the developer machine's default port.
+	config.DefaultUserAgentAddr = "127.0.0.1:0"
 
 	code := m.Run()
 	auth.StopTokenRefresh()

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -1165,6 +1166,23 @@ func TestRequestUserAgentSyncAfterAuthRequestsLocalUserAgentWithUserAuthorizatio
 	}
 	if !syncCalled {
 		t.Fatal("local user-agent sync endpoint was not called")
+	}
+}
+
+func TestSanitizeAgentEndpointRedactsAllCredentialQueryParameters(t *testing.T) {
+	raw := "wss://agent.example/ws?token=device-secret&User-Token=user-secret&access_token=access-secret&authorization=bearer-secret&API-Key=api-secret&safe=value"
+	got := sanitizeAgentEndpoint(raw)
+	parsed, err := url.Parse(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"token", "User-Token", "access_token", "authorization", "API-Key"} {
+		if value := parsed.Query().Get(key); value != "<redacted>" {
+			t.Fatalf("%s = %q, want redacted", key, value)
+		}
+	}
+	if value := parsed.Query().Get("safe"); value != "value" {
+		t.Fatalf("safe query value = %q", value)
 	}
 }
 

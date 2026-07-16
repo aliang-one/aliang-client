@@ -31,6 +31,7 @@ func (a *CompanionApp) agentWatchdogLoop() {
 	defer ticker.Stop()
 
 	consecutiveFails := 0
+	reconcileAttempted := false
 	for {
 		select {
 		case <-a.done:
@@ -41,8 +42,23 @@ func (a *CompanionApp) agentWatchdogLoop() {
 					logger.Info(fmt.Sprintf("[AGENT-WATCHDOG] recovered after %d failures", consecutiveFails))
 				}
 				consecutiveFails = 0
+				needsSync := agentruntime.NeedsAuthenticatedSync(agentWatchdogProbeTimeout)
+				if !needsSync {
+					reconcileAttempted = false
+					continue
+				}
+				if reconcileAttempted {
+					continue
+				}
+				reconcileAttempted = true
+				logger.Warn("[AGENT-WATCHDOG] healthy process has stale auth-disabled state, requesting core reconciliation")
+				if err := a.syncAgentAuthFromCore("watchdog_auth_reconcile"); err != nil {
+					reconcileAttempted = false
+					logger.Warn(fmt.Sprintf("[AGENT-WATCHDOG] auth_reconcile_failed: %v", err))
+				}
 				continue
 			}
+			reconcileAttempted = false
 			consecutiveFails++
 			logger.Warn(fmt.Sprintf("[AGENT-WATCHDOG] health_check failed (%d/%d)", consecutiveFails, agentWatchdogFailThreshold))
 			if consecutiveFails < agentWatchdogFailThreshold {
