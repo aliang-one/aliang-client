@@ -57,8 +57,15 @@ func EnsureCoreDataDir() error {
 	}
 
 	for _, dir := range dirs {
-		if err := os.MkdirAll(dir, 0755); err != nil {
+		mode := os.FileMode(0o755)
+		if filepath.Base(dir) == "certs" {
+			mode = 0o700
+		}
+		if err := os.MkdirAll(dir, mode); err != nil {
 			return fmt.Errorf("failed to create data directory %s: %w", dir, err)
+		}
+		if err := os.Chmod(dir, mode); err != nil && runtime.GOOS != "windows" {
+			return fmt.Errorf("failed to set data directory permissions %s: %w", dir, err)
 		}
 		logger.Debug(fmt.Sprintf("[Setup] Ensured data directory: %s", dir))
 	}

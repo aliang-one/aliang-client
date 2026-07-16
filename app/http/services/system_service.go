@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	cert_config "aliang.one/nursorgate/processor/cert"
 	"aliang.one/nursorgate/processor/config"
 	"aliang.one/nursorgate/processor/setup"
 )
@@ -368,11 +369,34 @@ func resolveManagedRuntimeDataDir() (string, error) {
 func ensureManagedCertificateAssets(sourceDir string, targetDir string) error {
 	sourceDir = strings.TrimSpace(sourceDir)
 	targetDir = strings.TrimSpace(targetDir)
-	if sourceDir == "" || targetDir == "" || sameFile(sourceDir, targetDir) {
+	if targetDir == "" {
+		return nil
+	}
+	// Resolving the concrete paths also migrates legacy certificate pairs from
+	// the state root before a newly installed Core service copies its assets.
+	if _, err := cert_config.GetCertPath(cert_config.CertTypeMitmCA); err != nil {
+		return err
+	}
+	if _, err := cert_config.GetCertPath(cert_config.CertTypeMtlsClient); err != nil {
+		return err
+	}
+	if canonicalSourceDir, err := cert_config.GetCertDir(); err == nil {
+		sourceDir = canonicalSourceDir
+	} else if sourceDir != "" {
+		certSubdir := filepath.Join(sourceDir, "certs")
+		if _, statErr := os.Stat(certSubdir); statErr == nil {
+			sourceDir = certSubdir
+		}
+	}
+	targetDir = filepath.Join(targetDir, "certs")
+	if sourceDir == "" || sameFile(sourceDir, targetDir) {
 		return nil
 	}
 
-	if err := os.MkdirAll(targetDir, 0o755); err != nil {
+	if err := os.MkdirAll(targetDir, 0o700); err != nil {
+		return err
+	}
+	if err := os.Chmod(targetDir, 0o700); err != nil && runtime.GOOS != "windows" {
 		return err
 	}
 
@@ -381,6 +405,7 @@ func ensureManagedCertificateAssets(sourceDir string, targetDir string) error {
 		"mitm-ca.pem.key",
 		"mtls-client.pem",
 		"mtls-client.pem.key",
+		"mitm-ca.metadata.json",
 	} {
 		sourcePath := filepath.Join(sourceDir, name)
 		if _, err := os.Stat(sourcePath); err != nil {
@@ -394,7 +419,11 @@ func ensureManagedCertificateAssets(sourceDir string, targetDir string) error {
 		if sameFile(sourcePath, targetPath) {
 			continue
 		}
-		if err := copyRegularFile(sourcePath, targetPath, 0o600); err != nil {
+		mode := os.FileMode(0o600)
+		if strings.HasSuffix(name, ".pem") {
+			mode = 0o644
+		}
+		if err := copyRegularFile(sourcePath, targetPath, mode); err != nil {
 			return err
 		}
 	}

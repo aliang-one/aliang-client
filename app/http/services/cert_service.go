@@ -3,10 +3,12 @@ package services
 import (
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 
 	"aliang.one/nursorgate/common/logger"
 	cert_config "aliang.one/nursorgate/processor/cert"
@@ -30,6 +32,28 @@ type CertStatusResult struct {
 	Fingerprint    string `json:"fingerprint"`     // SHA256 fingerprint
 	InstalledCount int    `json:"installed_count"` // Number of installed copies
 	ExportedPath   string `json:"exported_path"`   // Path where exported
+	Source         string `json:"source"`
+	SourceFormat   string `json:"source_format,omitempty"`
+	KeyAlgorithm   string `json:"key_algorithm,omitempty"`
+	ActivatedAt    string `json:"activated_at,omitempty"`
+	CanRollback    bool   `json:"can_rollback"`
+}
+
+type CertImportResult struct {
+	cert_config.MITMCAImportInfo
+	Source      string `json:"source"`
+	IsInstalled bool   `json:"is_installed"`
+	IsTrusted   bool   `json:"is_trusted"`
+	CanRollback bool   `json:"can_rollback"`
+}
+
+type CertGenerationResult struct {
+	CertType   string `json:"cert_type"`
+	CertPath   string `json:"cert_path"`
+	KeyPath    string `json:"key_path"`
+	CN         string `json:"cn"`
+	Issuer     string `json:"issuer"`
+	ValidYears int    `json:"valid_years"`
 }
 
 // SystemInfo holds system information
@@ -43,11 +67,22 @@ type CertService struct {
 	installer cert_installer.CertInstaller
 }
 
+var mitmOperationMu sync.Mutex
+
 // NewCertService creates a new certificate service
 func NewCertService() *CertService {
 	return &CertService{
 		installer: cert_installer.NewInstaller(),
 	}
+}
+
+// NewCertServiceWithInstaller allows platform adapters and tests to supply an
+// installer while keeping all certificate lifecycle rules in CertService.
+func NewCertServiceWithInstaller(installer cert_installer.CertInstaller) *CertService {
+	if installer == nil {
+		installer = cert_installer.NewInstaller()
+	}
+	return &CertService{installer: installer}
 }
 
 // GetCertStatus returns the current status of a certificate
@@ -88,6 +123,17 @@ func (cs *CertService) GetCertStatus(certType string) (CertStatusResult, error) 
 	if _, err := os.Stat(exportedPath); err == nil {
 		result.IsExported = true
 		result.ExportedPath = exportedPath
+	}
+	if certType == cert_config.CertTypeMitmCA {
+		result.CanRollback = cert_config.CanRollbackMITMCA()
+		if metadata, metadataErr := cert_config.GetMITMCAMetadata(); metadataErr == nil {
+			result.Source = metadata.Source
+			result.SourceFormat = metadata.SourceFormat
+			result.KeyAlgorithm = metadata.KeyAlgorithm
+			result.ActivatedAt = metadata.ActivatedAt
+		} else {
+			result.Source = "legacy"
+		}
 	}
 
 	// Check if installed (pass certBytes so installer can extract the real CN from the certificate)
@@ -185,6 +231,14 @@ func (cs *CertService) DownloadCert(certType string) ([]byte, error) {
 
 // InstallCert installs a certificate to the system trust store
 func (cs *CertService) InstallCert(certType string) error {
+	if certType == cert_config.CertTypeMitmCA {
+		mitmOperationMu.Lock()
+		defer mitmOperationMu.Unlock()
+	}
+	return cs.installCertUnlocked(certType)
+}
+
+func (cs *CertService) installCertUnlocked(certType string) error {
 	// First, export the certificate to a temporary location if not already exported
 	certPath, err := cs.ExportCert(certType)
 	if err != nil {
@@ -196,12 +250,20 @@ func (cs *CertService) InstallCert(certType string) error {
 		return fmt.Errorf("failed to install certificate: %w", err)
 	}
 
-	logger.Info(fmt.Sprintf("Certificate %s install flow started successfully", certType))
+	logger.Info(fmt.Sprintf("Certificate %s installed and verified successfully", certType))
 	return nil
 }
 
 // RemoveCert removes a certificate from the system trust store
 func (cs *CertService) RemoveCert(certType string) error {
+	if certType == cert_config.CertTypeMitmCA {
+		mitmOperationMu.Lock()
+		defer mitmOperationMu.Unlock()
+	}
+	return cs.removeCertUnlocked(certType)
+}
+
+func (cs *CertService) removeCertUnlocked(certType string) error {
 	// Get certificate bytes for accurate CN extraction
 	certBytes, err := cs.getCertBytes(certType)
 	if err != nil {
@@ -214,6 +276,131 @@ func (cs *CertService) RemoveCert(certType string) error {
 
 	logger.Info(fmt.Sprintf("Certificate %s removed successfully", certType))
 	return nil
+}
+
+func (cs *CertService) ValidateMITMCAImport(certPEM, keyPEM, bundle []byte, password string) (CertImportResult, error) {
+	material, err := parseMITMCAImport(certPEM, keyPEM, bundle, password)
+	if err != nil {
+		return CertImportResult{}, err
+	}
+	return cs.importResult(material), nil
+}
+
+func (cs *CertService) ImportMITMCA(certPEM, keyPEM, bundle []byte, password string) (CertImportResult, error) {
+	material, err := parseMITMCAImport(certPEM, keyPEM, bundle, password)
+	if err != nil {
+		return CertImportResult{}, err
+	}
+
+	mitmOperationMu.Lock()
+	defer mitmOperationMu.Unlock()
+	if err := cs.activateTrustedMITMCA(material, "imported"); err != nil {
+		return CertImportResult{}, err
+	}
+	result := cs.importResult(material)
+	if metadata, metadataErr := cert_config.GetMITMCAMetadata(); metadataErr == nil && metadata.Source != "" {
+		result.Source = metadata.Source
+	}
+	return result, nil
+}
+
+func (cs *CertService) RollbackMITMCA() (CertImportResult, error) {
+	mitmOperationMu.Lock()
+	defer mitmOperationMu.Unlock()
+
+	currentCert, err := cs.getMitmCACert()
+	if err != nil {
+		return CertImportResult{}, err
+	}
+	currentState, err := cs.certificateTrustState(currentCert)
+	if err != nil {
+		return CertImportResult{}, err
+	}
+	if _, err := cert_config.RollbackMITMCA(); err != nil {
+		return CertImportResult{}, err
+	}
+	if err := client_cert.DefaultCAManager().Reload(); err != nil {
+		_, rollbackErr := cert_config.RollbackMITMCA()
+		var reloadRecoveryErr error
+		if rollbackErr == nil {
+			reloadRecoveryErr = client_cert.DefaultCAManager().Reload()
+		}
+		return CertImportResult{}, errors.Join(fmt.Errorf("previous MITM CA was restored on disk but could not be reloaded: %w", err), rollbackErr, reloadRecoveryErr)
+	}
+	restoredCert, err := cs.getMitmCACert()
+	if err != nil {
+		return CertImportResult{}, err
+	}
+	restoredPreviousState, err := cs.ensureCertificateTrusted(restoredCert)
+	if err != nil {
+		_, rollbackErr := cert_config.RollbackMITMCA()
+		var reloadErr, cleanupErr error
+		if rollbackErr == nil {
+			reloadErr = client_cert.DefaultCAManager().Reload()
+			if reloadErr == nil {
+				cleanupErr = cs.cleanupNewlyInstalledCertificate(restoredCert, restoredPreviousState)
+			}
+		}
+		return CertImportResult{}, errors.Join(fmt.Errorf("failed to restore previous CA trust: %w", err), rollbackErr, reloadErr, cleanupErr)
+	}
+	if !sameCertificateFingerprint(currentCert, restoredCert) && currentState.installed {
+		if err := cs.installer.Remove(cert_config.CertTypeMitmCA, currentCert); err != nil {
+			recoveryErr := cs.restoreCurrentAfterFailedRollback(currentCert, currentState, restoredCert, restoredPreviousState)
+			return CertImportResult{}, errors.Join(fmt.Errorf("failed to remove superseded CA during rollback: %w", err), recoveryErr)
+		}
+	}
+	material, err := cs.activeMITMMaterial()
+	if err != nil {
+		return CertImportResult{}, err
+	}
+	result := cs.importResult(material)
+	if metadata, metadataErr := cert_config.GetMITMCAMetadata(); metadataErr == nil && metadata.Source != "" {
+		result.Source = metadata.Source
+	}
+	return result, nil
+}
+
+func (cs *CertService) RegenerateCert(certType string) (CertGenerationResult, error) {
+	config := cert_config.GetCertConfig(certType)
+	if config == nil {
+		return CertGenerationResult{}, fmt.Errorf("unsupported certificate type: %s", certType)
+	}
+	certPath, err := cert_config.GetCertPath(config.CertType)
+	if err != nil {
+		return CertGenerationResult{}, err
+	}
+	if certType == cert_config.CertTypeMitmCA {
+		mitmOperationMu.Lock()
+		defer mitmOperationMu.Unlock()
+
+		tempPath := certPath + ".generated"
+		defer os.Remove(tempPath)
+		defer os.Remove(tempPath + ".key")
+		if err := cert_generator.GenerateCertificateFromConfig(config, tempPath); err != nil {
+			return CertGenerationResult{}, err
+		}
+		certPEM, err := os.ReadFile(tempPath)
+		if err != nil {
+			return CertGenerationResult{}, err
+		}
+		keyPEM, err := os.ReadFile(tempPath + ".key")
+		if err != nil {
+			return CertGenerationResult{}, err
+		}
+		material, err := cert_config.ParseMITMCAPEM(certPEM, keyPEM)
+		if err != nil {
+			return CertGenerationResult{}, err
+		}
+		if err := cs.activateTrustedMITMCA(material, "generated"); err != nil {
+			return CertGenerationResult{}, err
+		}
+	} else if err := cs.generateAndExportCert(config, certPath); err != nil {
+		return CertGenerationResult{}, err
+	}
+	return CertGenerationResult{
+		CertType: certType, CertPath: certPath, KeyPath: certPath + ".key",
+		CN: config.CN, Issuer: config.Issuer, ValidYears: config.ValidityYears,
+	}, nil
 }
 
 // GetSystemInfo returns system information
@@ -259,7 +446,7 @@ func (cs *CertService) getMitmCACert() ([]byte, error) {
 	if len(caCert.Certificate) == 0 {
 		return nil, fmt.Errorf("MITM CA certificate has empty chain")
 	}
-	return caCert.Certificate[0], nil
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caCert.Certificate[0]}), nil
 }
 
 // getMTLSCert returns the mTLS certificate bytes from filesystem
@@ -313,9 +500,226 @@ func (cs *CertService) generateAndExportCert(config *cert_config.CertConfig, cer
 	// 若生成的是 MITM CA，立即刷新 CAManager：文件已变，让内存追随 + 清空域名证书缓存，
 	// 避免「装证书读新 CA、MITM 还用旧 CA 缓存」的不一致（无需重启进程）。
 	if config.CertType == cert_config.CertTypeMitmCA {
+		if err := cert_config.RecordMITMCASource("generated"); err != nil {
+			logger.Warn(fmt.Sprintf("Failed to record generated MITM CA metadata: %v", err))
+		}
 		if err := client_cert.DefaultCAManager().Reload(); err != nil {
 			logger.Warn(fmt.Sprintf("CAManager reload after regenerating mitm-ca failed: %v", err))
 		}
 	}
 	return nil
+}
+
+func parseMITMCAImport(certPEM, keyPEM, bundle []byte, password string) (*cert_config.MITMCAMaterial, error) {
+	if len(bundle) > 0 {
+		if len(certPEM) > 0 || len(keyPEM) > 0 {
+			return nil, fmt.Errorf("provide either a PKCS#12 bundle or a PEM certificate pair, not both")
+		}
+		return cert_config.ParseMITMCAPKCS12(bundle, password)
+	}
+	if len(certPEM) == 0 || len(keyPEM) == 0 {
+		return nil, fmt.Errorf("both certificate and private key files are required")
+	}
+	return cert_config.ParseMITMCAPEM(certPEM, keyPEM)
+}
+
+func (cs *CertService) importResult(material *cert_config.MITMCAMaterial) CertImportResult {
+	result := CertImportResult{
+		MITMCAImportInfo: material.ImportInfo(),
+		Source:           "imported",
+		CanRollback:      cert_config.CanRollbackMITMCA(),
+	}
+	if installed, err := cs.installer.IsInstalled(cert_config.CertTypeMitmCA, material.CertificatePEM); err == nil {
+		result.IsInstalled = installed
+	}
+	if trusted, err := cs.installer.IsTrusted(cert_config.CertTypeMitmCA, material.CertificatePEM); err == nil {
+		result.IsTrusted = trusted
+	}
+	return result
+}
+
+type certificateTrustState struct {
+	installed bool
+	trusted   bool
+}
+
+func (cs *CertService) certificateTrustState(certBytes []byte) (certificateTrustState, error) {
+	installed, err := cs.installer.IsInstalled(cert_config.CertTypeMitmCA, certBytes)
+	if err != nil {
+		return certificateTrustState{}, fmt.Errorf("inspect certificate installation: %w", err)
+	}
+	if !installed {
+		return certificateTrustState{}, nil
+	}
+	trusted, err := cs.installer.IsTrusted(cert_config.CertTypeMitmCA, certBytes)
+	if err != nil {
+		return certificateTrustState{}, fmt.Errorf("inspect certificate trust: %w", err)
+	}
+	return certificateTrustState{installed: true, trusted: trusted}, nil
+}
+
+func (cs *CertService) ensureCertificateTrusted(certBytes []byte) (certificateTrustState, error) {
+	previousState, err := cs.certificateTrustState(certBytes)
+	if err != nil {
+		return certificateTrustState{}, err
+	}
+	if previousState.trusted {
+		return previousState, nil
+	}
+
+	tempFile, err := os.CreateTemp("", "aliang-install-ca-*.pem")
+	if err != nil {
+		return previousState, err
+	}
+	tempPath := tempFile.Name()
+	defer os.Remove(tempPath)
+	if err := tempFile.Chmod(0o600); err != nil {
+		tempFile.Close()
+		return previousState, err
+	}
+	if _, err := tempFile.Write(certBytes); err != nil {
+		tempFile.Close()
+		return previousState, err
+	}
+	if err := tempFile.Close(); err != nil {
+		return previousState, err
+	}
+	if err := cs.installer.Install(cert_config.CertTypeMitmCA, tempPath); err != nil {
+		return previousState, err
+	}
+	after, err := cs.certificateTrustState(certBytes)
+	if err != nil {
+		return previousState, err
+	}
+	if !after.installed || !after.trusted {
+		return previousState, fmt.Errorf("certificate installer completed without establishing system trust")
+	}
+	return previousState, nil
+}
+
+func (cs *CertService) activateTrustedMITMCA(material *cert_config.MITMCAMaterial, source string) error {
+	oldCert, err := cs.getMitmCACert()
+	if err != nil {
+		return fmt.Errorf("load current MITM CA before activation: %w", err)
+	}
+	oldState, err := cs.certificateTrustState(oldCert)
+	if err != nil {
+		return err
+	}
+	newPreviousState, err := cs.ensureCertificateTrusted(material.CertificatePEM)
+	if err != nil {
+		cleanupErr := cs.cleanupNewlyInstalledCertificate(material.CertificatePEM, newPreviousState)
+		return errors.Join(fmt.Errorf("install new MITM CA before activation: %w", err), cleanupErr)
+	}
+
+	if _, err := cert_config.ActivateMITMCA(material, source); err != nil {
+		cleanupErr := cs.cleanupNewlyInstalledCertificate(material.CertificatePEM, newPreviousState)
+		return errors.Join(fmt.Errorf("activate %s MITM CA: %w", source, err), cleanupErr)
+	}
+	if err := client_cert.DefaultCAManager().Reload(); err != nil {
+		recoveryErr := cs.recoverPreviousMITMCA(oldCert, oldState, material.CertificatePEM, newPreviousState)
+		return errors.Join(fmt.Errorf("reload %s MITM CA: %w", source, err), recoveryErr)
+	}
+
+	if !sameCertificateFingerprint(oldCert, material.CertificatePEM) && oldState.installed {
+		if err := cs.installer.Remove(cert_config.CertTypeMitmCA, oldCert); err != nil {
+			recoveryErr := cs.recoverPreviousMITMCA(oldCert, oldState, material.CertificatePEM, newPreviousState)
+			return errors.Join(fmt.Errorf("remove superseded MITM CA: %w", err), recoveryErr)
+		}
+	}
+
+	newState, err := cs.certificateTrustState(material.CertificatePEM)
+	if err != nil {
+		return err
+	}
+	if !newState.installed || !newState.trusted {
+		recoveryErr := cs.recoverPreviousMITMCA(oldCert, oldState, material.CertificatePEM, newPreviousState)
+		return errors.Join(fmt.Errorf("new MITM CA is active but system trust verification failed"), recoveryErr)
+	}
+	return nil
+}
+
+func (cs *CertService) recoverPreviousMITMCA(oldCert []byte, oldState certificateTrustState, newCert []byte, newPreviousState certificateTrustState) error {
+	if _, err := cert_config.RollbackMITMCA(); err != nil {
+		return fmt.Errorf("rollback active MITM CA: %w", err)
+	}
+	if err := client_cert.DefaultCAManager().Reload(); err != nil {
+		_, forwardErr := cert_config.RollbackMITMCA()
+		var forwardReloadErr error
+		if forwardErr == nil {
+			forwardReloadErr = client_cert.DefaultCAManager().Reload()
+		}
+		return errors.Join(fmt.Errorf("reload previous MITM CA: %w", err), forwardErr, forwardReloadErr)
+	}
+	if err := cs.restoreTrustState(oldCert, oldState); err != nil {
+		_, forwardErr := cert_config.RollbackMITMCA()
+		var forwardReloadErr error
+		if forwardErr == nil {
+			forwardReloadErr = client_cert.DefaultCAManager().Reload()
+		}
+		return errors.Join(fmt.Errorf("restore previous MITM CA trust: %w", err), forwardErr, forwardReloadErr)
+	}
+	return cs.cleanupNewlyInstalledCertificate(newCert, newPreviousState)
+}
+
+func (cs *CertService) restoreCurrentAfterFailedRollback(currentCert []byte, currentState certificateTrustState, restoredCert []byte, restoredPreviousState certificateTrustState) error {
+	if _, err := cert_config.RollbackMITMCA(); err != nil {
+		return fmt.Errorf("restore current MITM CA after failed rollback: %w", err)
+	}
+	if err := client_cert.DefaultCAManager().Reload(); err != nil {
+		return fmt.Errorf("reload current MITM CA after failed rollback: %w", err)
+	}
+	if err := cs.restoreTrustState(currentCert, currentState); err != nil {
+		return fmt.Errorf("restore current MITM CA trust after failed rollback: %w", err)
+	}
+	return cs.cleanupNewlyInstalledCertificate(restoredCert, restoredPreviousState)
+}
+
+func (cs *CertService) restoreTrustState(certBytes []byte, state certificateTrustState) error {
+	if !state.trusted {
+		return nil
+	}
+	_, err := cs.ensureCertificateTrusted(certBytes)
+	return err
+}
+
+func (cs *CertService) cleanupNewlyInstalledCertificate(certBytes []byte, previousState certificateTrustState) error {
+	if previousState.installed {
+		return nil
+	}
+	return cs.installer.Remove(cert_config.CertTypeMitmCA, certBytes)
+}
+
+func (cs *CertService) activeMITMMaterial() (*cert_config.MITMCAMaterial, error) {
+	certPath, err := cert_config.GetCertPath(cert_config.CertTypeMitmCA)
+	if err != nil {
+		return nil, err
+	}
+	certPEM, err := os.ReadFile(certPath)
+	if err != nil {
+		return nil, err
+	}
+	keyPEM, err := os.ReadFile(certPath + ".key")
+	if err != nil {
+		return nil, err
+	}
+	return cert_config.ParseMITMCAPEM(certPEM, keyPEM)
+}
+
+func sameCertificateFingerprint(left, right []byte) bool {
+	leftCert, leftErr := x509CertificateFingerprint(left)
+	rightCert, rightErr := x509CertificateFingerprint(right)
+	return leftErr == nil && rightErr == nil && leftCert == rightCert
+}
+
+func x509CertificateFingerprint(certBytes []byte) (string, error) {
+	block, _ := pem.Decode(certBytes)
+	if block == nil {
+		return "", fmt.Errorf("failed to decode certificate PEM")
+	}
+	parsed, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return "", err
+	}
+	return string(parsed.Raw), nil
 }

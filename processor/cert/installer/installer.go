@@ -156,6 +156,17 @@ func extractCertSHA256Fingerprint(certBytes []byte) (string, error) {
 	return strings.ToUpper(hex.EncodeToString(sum[:])), nil
 }
 
+func errorsIsNotExist(err error) bool {
+	if err == nil {
+		return false
+	}
+	if os.IsNotExist(err) {
+		return true
+	}
+	var pathErr *fs.PathError
+	return errors.As(err, &pathErr) && os.IsNotExist(pathErr.Err)
+}
+
 func escapePowerShellSingleQuoted(value string) string {
 	return strings.ReplaceAll(value, "'", "''")
 }
@@ -331,6 +342,15 @@ type DarwinInstaller struct{}
 
 const (
 	darwinSystemKeychainPath = "/Library/Keychains/System.keychain"
+	darwinSecurityPath       = "/usr/bin/security"
+	darwinOSAScriptPath      = "/usr/bin/osascript"
+	darwinPrivilegedScript   = `on run argv
+set commandText to "/usr/bin/security"
+repeat with argValue in argv
+set commandText to commandText & " " & quoted form of (contents of argValue)
+end repeat
+do shell script commandText with administrator privileges
+end run`
 )
 
 type darwinKeychainMatch struct {
@@ -338,34 +358,39 @@ type darwinKeychainMatch struct {
 	Count int
 }
 
-// isRunningAsSudo checks if the current process is running with sudo privileges
-func isRunningAsSudo() bool {
-	// Check if SUDO_UID environment variable is set (indicates sudo execution)
-	return os.Getenv("SUDO_UID") != ""
-}
+var (
+	darwinEffectiveUID = os.Geteuid
+	runDarwinCommand   = func(name string, args ...string) ([]byte, error) {
+		return newPlatformCommand(name, args...).CombinedOutput()
+	}
+)
 
-func darwinKeychainCandidates() []string {
-	candidates := []string{darwinSystemKeychainPath}
-
-	homeDir, err := os.UserHomeDir()
-	if err == nil && strings.TrimSpace(homeDir) != "" {
-		candidates = append(candidates, filepath.Join(homeDir, "Library/Keychains/login.keychain-db"))
+func buildDarwinPrivilegedCommand(isRoot bool, securityArgs ...string) (string, []string) {
+	if isRoot {
+		return darwinSecurityPath, append([]string(nil), securityArgs...)
 	}
 
-	return candidates
+	args := []string{"-e", darwinPrivilegedScript, "--"}
+	args = append(args, securityArgs...)
+	return darwinOSAScriptPath, args
+}
+
+func runDarwinPrivilegedSecurity(securityArgs ...string) ([]byte, error) {
+	name, args := buildDarwinPrivilegedCommand(darwinEffectiveUID() == 0, securityArgs...)
+	return runDarwinCommand(name, args...)
 }
 
 func countDarwinKeychainFingerprintMatches(certPath string, fingerprint string) (int, error) {
-	cmd := newPlatformCommand("security", "find-certificate", "-a", "-Z", certPath)
-	output, err := cmd.CombinedOutput()
+	output, err := runDarwinCommand(darwinSecurityPath, "find-certificate", "-a", "-Z", certPath)
 	if err != nil {
-		if errors, ok := err.(*exec.ExitError); ok {
+		if exitErr, ok := err.(*exec.ExitError); ok {
 			stderrText := strings.TrimSpace(string(output))
 			if strings.Contains(stderrText, "could not be found in the keychain") ||
-				strings.Contains(stderrText, "The specified item could not be found in the keychain") {
+				strings.Contains(stderrText, "The specified item could not be found in the keychain") ||
+				strings.Contains(stderrText, "Unable to delete certificate matching") {
 				return 0, nil
 			}
-			logger.Debug(fmt.Sprintf("Failed to inspect macOS keychain %s: exit=%d output=%s", certPath, errors.ExitCode(), stderrText))
+			logger.Debug(fmt.Sprintf("Failed to inspect macOS keychain %s: exit=%d output=%s", certPath, exitErr.ExitCode(), stderrText))
 		}
 		return 0, fmt.Errorf("security find-certificate %s failed: %w", certPath, err)
 	}
@@ -393,80 +418,65 @@ func findDarwinInstalledKeychains(certBytes []byte) ([]darwinKeychainMatch, erro
 		return nil, err
 	}
 
-	var matches []darwinKeychainMatch
-	var errs []string
-
-	for _, candidate := range darwinKeychainCandidates() {
-		if _, statErr := os.Stat(candidate); statErr != nil {
-			if !errorsIsNotExist(statErr) {
-				errs = append(errs, fmt.Sprintf("%s: %v", candidate, statErr))
-			}
-			continue
-		}
-
-		count, countErr := countDarwinKeychainFingerprintMatches(candidate, fingerprint)
-		if countErr != nil {
-			errs = append(errs, fmt.Sprintf("%s: %v", candidate, countErr))
-			continue
-		}
-		if count > 0 {
-			matches = append(matches, darwinKeychainMatch{Path: candidate, Count: count})
-		}
+	count, err := countDarwinKeychainFingerprintMatches(darwinSystemKeychainPath, fingerprint)
+	if err != nil {
+		return nil, err
 	}
-
-	if len(matches) > 0 {
-		return matches, nil
+	if count == 0 {
+		return nil, nil
 	}
-	if len(errs) > 0 {
-		return nil, errors.New(strings.Join(errs, "; "))
-	}
-	return nil, nil
+	return []darwinKeychainMatch{{Path: darwinSystemKeychainPath, Count: count}}, nil
 }
 
-func errorsIsNotExist(err error) bool {
-	return err != nil && (os.IsNotExist(err) || errorsAsPathNotExist(err))
+func verifyDarwinSystemTrust(certBytes []byte) (bool, error) {
+	tempPath, cleanup, err := writeDarwinTemporaryCertificate(certBytes)
+	if err != nil {
+		return false, err
+	}
+	defer cleanup()
+
+	output, err := runDarwinCommand(darwinSecurityPath, "verify-cert", "-c", tempPath,
+		"-k", darwinSystemKeychainPath, "-L", "-l", "-q")
+	if err == nil {
+		return true, nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		logger.Debug(fmt.Sprintf("macOS system trust verification failed: exit=%d output=%s", exitErr.ExitCode(), strings.TrimSpace(string(output))))
+		return false, nil
+	}
+	return false, fmt.Errorf("security verify-cert failed: %w", err)
 }
 
-func errorsAsPathNotExist(err error) bool {
-	var pathErr *fs.PathError
-	return err != nil && (errors.As(err, &pathErr) && os.IsNotExist(pathErr.Err))
-}
-
-func collectDarwinTrustSettings() map[string]string {
-	scopes := []struct {
-		flag   string
-		status string
-	}{
-		{"", "user_trusted"},
-		{"-d", "admin_trusted"},
-		{"-s", "system_trusted"},
+func writeDarwinTemporaryCertificate(certBytes []byte) (string, func(), error) {
+	parsedCert, err := parseCertificateBytes(certBytes)
+	if err != nil {
+		return "", nil, err
 	}
-
-	results := make(map[string]string, len(scopes))
-	for _, scope := range scopes {
-		args := []string{"dump-trust-settings"}
-		if scope.flag != "" {
-			args = append(args, scope.flag)
-		}
-
-		cmd := newPlatformCommand("security", args...)
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			logger.Debug(fmt.Sprintf("Failed to dump macOS trust settings for scope %q: %v, output: %s", scope.flag, err, strings.TrimSpace(string(output))))
-			continue
-		}
-		results[scope.status] = string(output)
+	tempFile, err := os.CreateTemp("", "aliang-system-trust-*.pem")
+	if err != nil {
+		return "", nil, fmt.Errorf("create temporary certificate: %w", err)
 	}
-
-	return results
+	tempPath := tempFile.Name()
+	cleanup := func() { _ = os.Remove(tempPath) }
+	if err := tempFile.Chmod(0o600); err != nil {
+		tempFile.Close()
+		cleanup()
+		return "", nil, err
+	}
+	if _, err := tempFile.Write(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: parsedCert.Raw})); err != nil {
+		tempFile.Close()
+		cleanup()
+		return "", nil, err
+	}
+	if err := tempFile.Close(); err != nil {
+		cleanup()
+		return "", nil, err
+	}
+	return tempPath, cleanup, nil
 }
 
 func detectDarwinTrustStatus(certBytes []byte) (string, bool, error) {
-	commonName, err := extractCertCommonName(certBytes)
-	if err != nil {
-		return "unknown", false, err
-	}
-
 	matches, err := findDarwinInstalledKeychains(certBytes)
 	if err != nil {
 		return "unknown", false, err
@@ -475,17 +485,13 @@ func detectDarwinTrustStatus(certBytes []byte) (string, bool, error) {
 		return "not_found", false, nil
 	}
 
-	trustOutputs := collectDarwinTrustSettings()
-	if len(trustOutputs) == 0 {
-		return "unknown", false, nil
+	trusted, err := verifyDarwinSystemTrust(certBytes)
+	if err != nil {
+		return "unknown", false, err
 	}
-
-	for status, output := range trustOutputs {
-		if strings.Contains(output, commonName) {
-			return status, true, nil
-		}
+	if trusted {
+		return "system_trusted", true, nil
 	}
-
 	return "installed_not_trusted", false, nil
 }
 
@@ -498,88 +504,116 @@ func (d *DarwinInstaller) IsInstalled(certType string, certBytes []byte) (bool, 
 	return len(matches) > 0, nil
 }
 
-// Install adds certificate to macOS System keychain with appropriate elevation strategy
+// Install adds a CA certificate to the macOS System keychain and marks it trusted.
 func (d *DarwinInstaller) Install(certType string, certPath string) error {
-	logger.Debug(fmt.Sprintf("Opening certificate %s for manual macOS trust flow", certType))
+	if certType != cert.CertTypeMitmCA {
+		return fmt.Errorf("macOS system trust installation is only supported for %s", cert.CertTypeMitmCA)
+	}
 
 	absPath, err := filepath.Abs(certPath)
 	if err != nil {
 		return fmt.Errorf("failed to get absolute path: %w", err)
 	}
-
-	cmd := newPlatformCommand("open", absPath)
-	output, err := cmd.CombinedOutput()
-
+	certBytes, err := os.ReadFile(absPath)
 	if err != nil {
-		if strings.Contains(string(output), "canceled") {
+		return fmt.Errorf("failed to read certificate for installation: %w", err)
+	}
+	parsedCert, err := parseCertificateBytes(certBytes)
+	if err != nil {
+		return err
+	}
+	if !parsedCert.IsCA || parsedCert.KeyUsage&x509.KeyUsageCertSign == 0 {
+		return fmt.Errorf("certificate is not a certificate-signing CA")
+	}
+
+	logger.Debug(fmt.Sprintf("Installing certificate %s into macOS System keychain", certType))
+	output, err := runDarwinPrivilegedSecurity("add-trusted-cert", "-d", "-r", "trustRoot",
+		"-k", darwinSystemKeychainPath, absPath)
+	if err != nil {
+		outputText := strings.TrimSpace(string(output))
+		if strings.Contains(strings.ToLower(outputText), "canceled") || strings.Contains(outputText, "(-128)") {
 			logger.Warn("User canceled the certificate installation")
 			return fmt.Errorf("installation canceled by user")
 		}
-
-		logger.Error(fmt.Sprintf("Failed to install certificate (osascript): %v, output: %s", err, string(output)))
-		return fmt.Errorf("certificate installation failed. Output: %s", string(output))
+		return fmt.Errorf("security add-trusted-cert failed: %w, output: %s", err, outputText)
 	}
 
-	logger.Info("Certificate file opened. User must finish importing and trusting it in Keychain Access.")
+	fingerprint, err := extractCertSHA256Fingerprint(certBytes)
+	if err != nil {
+		return err
+	}
+	count, err := countDarwinKeychainFingerprintMatches(darwinSystemKeychainPath, fingerprint)
+	if err != nil {
+		return fmt.Errorf("verify installed certificate fingerprint: %w", err)
+	}
+	if count == 0 {
+		return fmt.Errorf("certificate installation command completed but the exact certificate was not found in the System keychain")
+	}
+	trusted, err := verifyDarwinSystemTrust(certBytes)
+	if err != nil {
+		return fmt.Errorf("verify installed certificate trust: %w", err)
+	}
+	if !trusted {
+		return fmt.Errorf("certificate was added to the System keychain but is not trusted as a root CA")
+	}
+
+	logger.Info(fmt.Sprintf("Certificate %s installed and trusted in macOS System keychain (SHA-256: %s)", certType, fingerprint))
 	return nil
 }
 
-// Remove deletes certificate from macOS System keychain
+// Remove deletes the exact certificate and its trust settings from the System keychain.
 func (d *DarwinInstaller) Remove(certType string, certBytes []byte) error {
-	// Extract the real certificate Common Name from the certificate itself
-	commonName, err := extractCertCommonName(certBytes)
+	fingerprint, err := extractCertSHA256Fingerprint(certBytes)
 	if err != nil {
-		logger.Warn(fmt.Sprintf("Failed to extract cert CN from bytes, falling back to config: %v", err))
-		// Fallback to configuration if extraction fails
-		config := cert.GetCertConfig(certType)
-		if config != nil {
-			commonName = config.CN
-		} else {
-			commonName = certType
-		}
+		return err
 	}
-
-	logger.Debug(fmt.Sprintf("Removing certificate %s (CN: %s) from macOS keychains", certType, commonName))
-
-	if isRunningAsSudo() {
-		logger.Info("Running with sudo privileges, executing security delete-certificate directly")
-		for _, candidate := range darwinKeychainCandidates() {
-			if _, statErr := os.Stat(candidate); statErr != nil {
-				continue
-			}
-
-			cmd := newPlatformCommand("security", "delete-certificate", "-c", commonName, candidate)
-			output, err := cmd.CombinedOutput()
-			if err != nil && !strings.Contains(string(output), "could not be found") {
-				logger.Error(fmt.Sprintf("Failed to remove certificate from %s: %v, output: %s", candidate, err, string(output)))
-				return fmt.Errorf("certificate removal failed: %w", err)
-			}
-		}
-		logger.Info("Certificate removal completed across available macOS keychains (via sudo)")
+	count, err := countDarwinKeychainFingerprintMatches(darwinSystemKeychainPath, fingerprint)
+	if err != nil {
+		return err
+	}
+	if count == 0 {
+		logger.Info(fmt.Sprintf("Certificate %s is not present in the macOS System keychain", certType))
 		return nil
 	}
 
-	logger.Info("Not running with sudo, requesting elevation via osascript")
-	for _, candidate := range darwinKeychainCandidates() {
-		if _, statErr := os.Stat(candidate); statErr != nil {
-			continue
-		}
+	tempPath, cleanup, err := writeDarwinTemporaryCertificate(certBytes)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	trustOutput, trustErr := runDarwinPrivilegedSecurity("remove-trusted-cert", "-d", tempPath)
+	afterTrustRemoval, inspectErr := countDarwinKeychainFingerprintMatches(darwinSystemKeychainPath, fingerprint)
+	if inspectErr != nil {
+		return fmt.Errorf("verify trust removal: %w", inspectErr)
+	}
+	if afterTrustRemoval == 0 {
+		logger.Info(fmt.Sprintf("Certificate %s trust and System keychain entry removed (SHA-256: %s)", certType, fingerprint))
+		return nil
+	}
+	if trustErr != nil {
+		logger.Debug(fmt.Sprintf("remove-trusted-cert did not remove the certificate; deleting the exact keychain entry: %v, output: %s", trustErr, strings.TrimSpace(string(trustOutput))))
+	}
+	count = afterTrustRemoval
 
-		script := fmt.Sprintf(
-			"do shell script \"security delete-certificate -c '%s' '%s'\" with administrator privileges",
-			commonName,
-			candidate,
-		)
-
-		cmd := newPlatformCommand("osascript", "-e", script)
-		output, err := cmd.CombinedOutput()
-		if err != nil && !strings.Contains(string(output), "could not be found") {
-			logger.Error(fmt.Sprintf("Failed to remove certificate from %s via osascript: %v, output: %s", candidate, err, string(output)))
-			return fmt.Errorf("certificate removal failed. You may need to run this application with 'sudo' privilege: %w", err)
+	for remaining := count; remaining > 0; {
+		output, removeErr := runDarwinPrivilegedSecurity("delete-certificate", "-Z", fingerprint, "-t", darwinSystemKeychainPath)
+		after, inspectErr := countDarwinKeychainFingerprintMatches(darwinSystemKeychainPath, fingerprint)
+		if inspectErr != nil {
+			return fmt.Errorf("verify certificate removal: %w", inspectErr)
 		}
+		if after == 0 {
+			logger.Info(fmt.Sprintf("Certificate %s removed from macOS System keychain (SHA-256: %s)", certType, fingerprint))
+			return nil
+		}
+		if removeErr != nil {
+			return fmt.Errorf("security delete-certificate failed: %w, output: %s", removeErr, strings.TrimSpace(string(output)))
+		}
+		if after >= remaining {
+			return fmt.Errorf("security delete-certificate completed but %d matching certificate(s) remain", after)
+		}
+		remaining = after
 	}
 
-	logger.Info("Certificate removal completed across available macOS keychains (via osascript)")
 	return nil
 }
 

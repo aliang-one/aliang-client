@@ -8,7 +8,6 @@ import (
 	"crypto/x509/pkix"
 	"fmt"
 	"math/big"
-	"math/rand"
 	"net"
 	"strings"
 	"sync"
@@ -41,15 +40,24 @@ func init() {
 	}()
 }
 
-func buildHostLeafTemplate(host string) x509.Certificate {
+func buildHostLeafTemplate(host string, caNotAfter time.Time) (x509.Certificate, error) {
+	serialLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serialNumber, err := crand.Int(crand.Reader, serialLimit)
+	if err != nil {
+		return x509.Certificate{}, fmt.Errorf("failed to generate certificate serial number: %w", err)
+	}
+	notAfter := time.Now().Add(365 * 24 * time.Hour)
+	if caNotAfter.Before(notAfter) {
+		notAfter = caNotAfter
+	}
 	template := x509.Certificate{
-		SerialNumber: big.NewInt(rand.Int63n(1 << 62)),
+		SerialNumber: serialNumber,
 		Subject: pkix.Name{
 			CommonName: host,
 		},
 		// Backdate slightly to avoid transient validation failures from small clock skew.
 		NotBefore:             time.Now().Add(-5 * time.Minute),
-		NotAfter:              time.Now().Add(365 * 24 * time.Hour),
+		NotAfter:              notAfter,
 		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		IsCA:                  false,
@@ -58,11 +66,11 @@ func buildHostLeafTemplate(host string) x509.Certificate {
 
 	if ip := net.ParseIP(host); ip != nil {
 		template.IPAddresses = append(template.IPAddresses, ip)
-		return template
+		return template, nil
 	}
 
 	template.DNSNames = []string{host}
-	return template
+	return template, nil
 }
 
 // LoadMitmCACertificate 返回 MITM CA（委托 CAManager.Get，单一入口）。
@@ -99,8 +107,6 @@ func creatCertForHost(host string) (tls.Certificate, error) {
 		return tls.Certificate{}, err
 	}
 
-	template := buildHostLeafTemplate(host)
-
 	// Parse CA certificate
 	// caCert.Certificate[0] is already DER-encoded bytes (not PEM),
 	// so we can parse it directly without PEM decoding
@@ -112,6 +118,10 @@ func creatCertForHost(host string) (tls.Certificate, error) {
 	ca, err := x509.ParseCertificate(caCert.Certificate[0])
 	if err != nil {
 		return tls.Certificate{}, fmt.Errorf("failed to parse CA certificate: %w", err)
+	}
+	template, err := buildHostLeafTemplate(host, ca.NotAfter)
+	if err != nil {
+		return tls.Certificate{}, err
 	}
 	if len(ca.SubjectKeyId) > 0 {
 		template.AuthorityKeyId = append([]byte(nil), ca.SubjectKeyId...)

@@ -406,29 +406,29 @@
         <div class="space-y-3">
           <div class="flex items-center justify-between">
             <p class="text-sm font-semibold">{{ t('sys_certCa') }}</p>
-            <span class="flex items-center gap-1 text-[10px] font-bold text-primary">
+            <span class="flex items-center gap-1 text-[10px] font-bold" :class="sharedCertStatus?.is_trusted ? 'text-emerald-600 dark:text-emerald-400' : 'text-amber-600 dark:text-amber-300'">
               <span class="material-symbols-outlined text-xs">verified_user</span>
-              {{ t('sys_trusted') }}
+              {{ sharedCertStatus?.is_trusted ? t('sys_trusted') : t('cert_notTrusted') }}
             </span>
           </div>
           <div class="space-y-1 rounded border border-slate-100 p-2 font-mono text-[10px] text-slate-500 dark:border-slate-800">
-            <div><span class="text-slate-400">{{ t('sys_subject') }}</span> Opencode Local CA</div>
-            <div><span class="text-slate-400">{{ t('sys_validity') }}</span> 2026-2031 (Valid)</div>
-            <div class="truncate"><span class="text-slate-400">{{ t('sys_finger') }}</span> 7A:9C:B5:E1:02...</div>
+            <div><span class="text-slate-400">{{ t('sys_subject') }}</span> {{ sharedCertStatus?.subject || '-' }}</div>
+            <div><span class="text-slate-400">{{ t('sys_validity') }}</span> {{ sharedCertStatus?.not_before || '-' }} - {{ sharedCertStatus?.not_after || '-' }}</div>
+            <div class="truncate"><span class="text-slate-400">{{ t('sys_finger') }}</span> {{ sharedCertStatus?.fingerprint || '-' }}</div>
           </div>
           <div class="grid grid-cols-2 gap-2">
-            <button type="button" class="flex items-center justify-center gap-1 rounded border border-slate-200 py-1.5 text-[10px] font-bold hover:bg-slate-50 dark:border-slate-800 dark:hover:bg-slate-800">
+            <button type="button" class="flex min-h-11 cursor-pointer items-center justify-center gap-1 rounded border border-slate-200 py-1.5 text-[10px] font-bold hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary dark:border-slate-800 dark:hover:bg-slate-800" @click="downloadCurrentCertificate">
               <span class="material-symbols-outlined text-sm">download</span>
               {{ t('sys_export') }}
             </button>
-            <button type="button" class="flex items-center justify-center gap-1 rounded border border-primary py-1.5 text-[10px] font-bold text-primary hover:bg-primary/5">
+            <button type="button" class="flex min-h-11 cursor-pointer items-center justify-center gap-1 rounded border border-primary py-1.5 text-[10px] font-bold text-primary hover:bg-primary/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary" @click="openCertificateModal">
               <span class="material-symbols-outlined text-sm">install_desktop</span>
               {{ t('sys_install') }}
             </button>
           </div>
-          <button type="button" class="flex w-full items-center justify-center gap-1 text-[10px] font-medium text-red-500">
-            <span class="material-symbols-outlined text-sm">delete</span>
-            {{ t('sys_removeRootCert') }}
+          <button type="button" class="flex min-h-11 w-full cursor-pointer items-center justify-center gap-1 text-[10px] font-semibold text-slate-600 hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary dark:text-slate-300" @click="openCertificateModal">
+            <span class="material-symbols-outlined text-sm">admin_panel_settings</span>
+            {{ t('sys_manageCertificates') }}
           </button>
         </div>
 
@@ -475,6 +475,7 @@ import { useNavigation } from '../../composables/useNavigation';
 import { useRunStatus } from '../../composables/useRunStatus';
 import { useTheme } from '../../composables/useTheme';
 import { useI18n } from '../../i18n';
+import { useCertStatus } from '../../composables/useCertStatus';
 
 export default {
   name: 'SystemSettings',
@@ -482,6 +483,7 @@ export default {
     const { locale, t, setLocale } = useI18n();
     const { themeMode, resolvedTheme, setThemeMode } = useTheme();
     const { showDashboard } = useNavigation();
+    const { certStatus, startPolling: startCertPolling, stopPolling: stopCertPolling } = useCertStatus();
     const {
       runMode,
       runIsRunning,
@@ -517,7 +519,10 @@ export default {
       sharedRunSyncError: runSyncError,
       refreshSharedRunState: refreshRunState,
       startRunStatePolling: startPolling,
-      stopRunStatePolling: stopPolling
+      stopRunStatePolling: stopPolling,
+      sharedCertStatus: certStatus,
+      startCertStatusPolling: startCertPolling,
+      stopCertStatusPolling: stopCertPolling
     };
   },
   data() {
@@ -749,6 +754,7 @@ export default {
   },
   mounted() {
     this.startRunStatePolling();
+    this.startCertStatusPolling();
     this.refreshModeState().finally(() => {
       if (this.wintunDependency.installing) {
         this.ensureWintunInstallProgressModal();
@@ -759,6 +765,7 @@ export default {
   },
   beforeUnmount() {
     this.stopRunStatePolling();
+    this.stopCertStatusPolling();
     this.stopWintunInstallPolling();
   },
   watch: {
@@ -783,6 +790,23 @@ export default {
     }
   },
   methods: {
+    openCertificateModal() {
+      window.dispatchEvent(new CustomEvent('aliang:open-cert-modal'));
+    },
+    async downloadCurrentCertificate() {
+      try {
+        const response = await fetch('/api/cert/download?cert_type=mitm-ca');
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const url = URL.createObjectURL(await response.blob());
+        const anchor = document.createElement('a');
+        anchor.href = url;
+        anchor.download = 'mitm-ca.pem';
+        anchor.click();
+        URL.revokeObjectURL(url);
+      } catch (err) {
+        this.systemServiceError = err instanceof Error ? err.message : this.t('cert_downloadFailed');
+      }
+    },
     clearMessages() {
       this.modeError = '';
       this.modeSuccess = '';

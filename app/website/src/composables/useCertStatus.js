@@ -17,7 +17,11 @@ function statusKey(data) {
     data.is_exported,
     data.is_installed,
     data.is_trusted,
-    data.trust_status
+    data.trust_status,
+    data.fingerprint,
+    data.source,
+    data.activated_at,
+    data.can_rollback
   ]);
 }
 

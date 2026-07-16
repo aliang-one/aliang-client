@@ -184,6 +184,9 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	register("/api/cert/install", h.Cert.HandleInstall, http.MethodPost)
 	register("/api/cert/remove", h.Cert.HandleRemove, http.MethodPost)
 	register("/api/cert/generate", h.Cert.HandleGenerateCert, http.MethodPost)
+	register("/api/cert/import/validate", h.Cert.HandleValidateImport, http.MethodPost)
+	register("/api/cert/import", h.Cert.HandleImport, http.MethodPost)
+	register("/api/cert/rollback", h.Cert.HandleRollback, http.MethodPost)
 	register("/api/cert/info", h.Cert.HandleGetInfo, http.MethodGet)
 
 	// DNS Cache API (/api/dns/*)

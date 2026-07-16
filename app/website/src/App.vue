@@ -34,7 +34,7 @@
 </template>
 
 <script setup>
-import { ref, watch } from 'vue';
+import { onMounted, onUnmounted, ref, watch } from 'vue';
 import { useI18n } from './i18n';
 import DashboardPage from './components/DashboardPage.vue';
 import SettingsPage from './components/SettingsPage.vue';
@@ -55,6 +55,13 @@ const isCertModalOpen = ref(false);
 const certModalRef = ref(null);
 const { isReady, isAuthenticated } = useAuthStore();
 const { currentPage } = useNavigation();
+
+function openCertificateModal() {
+  isCertModalOpen.value = true;
+}
+
+onMounted(() => window.addEventListener('aliang:open-cert-modal', openCertificateModal));
+onUnmounted(() => window.removeEventListener('aliang:open-cert-modal', openCertificateModal));
 
 async function syncChatIdentityProfile() {
   if (!isReady.value) {

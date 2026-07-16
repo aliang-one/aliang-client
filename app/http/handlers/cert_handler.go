@@ -2,17 +2,19 @@ package handlers
 
 import (
 	"fmt"
+	"io"
+	"net"
 	"net/http"
-	"path/filepath"
+	"net/url"
+	"strings"
 
 	"aliang.one/nursorgate/app/http/common"
 	"aliang.one/nursorgate/app/http/services"
-	"aliang.one/nursorgate/common/cache"
 	"aliang.one/nursorgate/common/logger"
 	cert_config "aliang.one/nursorgate/processor/cert"
-	client_cert "aliang.one/nursorgate/processor/cert/client"
-	"aliang.one/nursorgate/processor/cert/generator"
 )
+
+const maxCertificateImportBytes = 4 << 20
 
 // CertHandler handles certificate management endpoints
 type CertHandler struct {
@@ -144,6 +146,9 @@ func (ch *CertHandler) HandleInstall(w http.ResponseWriter, r *http.Request) {
 		common.ErrorBadRequest(w, "Method not allowed", nil)
 		return
 	}
+	if !allowLocalCertificateMutation(w, r) {
+		return
+	}
 
 	var req struct {
 		CertType string `json:"cert_type"`
@@ -168,7 +173,7 @@ func (ch *CertHandler) HandleInstall(w http.ResponseWriter, r *http.Request) {
 
 	common.Success(w, map[string]interface{}{
 		"cert_type": req.CertType,
-		"message":   "Certificate trust flow opened successfully",
+		"message":   "Certificate installed and trusted successfully",
 	})
 }
 
@@ -176,6 +181,9 @@ func (ch *CertHandler) HandleInstall(w http.ResponseWriter, r *http.Request) {
 func (ch *CertHandler) HandleRemove(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		common.ErrorBadRequest(w, "Method not allowed", nil)
+		return
+	}
+	if !allowLocalCertificateMutation(w, r) {
 		return
 	}
 
@@ -242,6 +250,9 @@ func (ch *CertHandler) HandleGenerateCert(w http.ResponseWriter, r *http.Request
 		common.ErrorBadRequest(w, "Method not allowed", nil)
 		return
 	}
+	if !allowLocalCertificateMutation(w, r) {
+		return
+	}
 
 	var req struct {
 		CertType string `json:"cert_type"`
@@ -257,44 +268,118 @@ func (ch *CertHandler) HandleGenerateCert(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Get certificate configuration
-	config := cert_config.GetCertConfig(req.CertType)
-	if config == nil {
-		common.ErrorBadRequest(w, fmt.Sprintf("Unknown certificate type: %s", req.CertType), nil)
-		return
-	}
-
-	// Determine export path
-	certDir, err := cache.GetCacheDir()
+	result, err := ch.certService.RegenerateCert(req.CertType)
 	if err != nil {
-		logger.Error(fmt.Sprintf("Failed to resolve certificate directory: %v", err))
-		common.Error(w, common.CodeInternalServer, "Failed to resolve certificate directory", nil)
-		return
-	}
-
-	exportPath := filepath.Join(certDir, config.FileName+".pem")
-
-	// Generate certificate
-	if err := generator.GenerateCertificateFromConfig(config, exportPath); err != nil {
 		logger.Error(fmt.Sprintf("Failed to generate certificate: %v", err))
 		common.Error(w, common.CodeInternalServer, fmt.Sprintf("Failed to generate certificate: %s", err.Error()), nil)
 		return
 	}
+	common.Success(w, result)
+}
 
-	// 若生成的是 MITM CA，立即刷新 CAManager（文件已变，让内存追随 + 清域名证书缓存）。
-	if config.CertType == cert_config.CertTypeMitmCA {
-		if err := client_cert.DefaultCAManager().Reload(); err != nil {
-			logger.Warn(fmt.Sprintf("CAManager reload after generating mitm-ca failed: %v", err))
-		}
+func (ch *CertHandler) HandleValidateImport(w http.ResponseWriter, r *http.Request) {
+	ch.handleMITMCAImport(w, r, true)
+}
+
+func (ch *CertHandler) HandleImport(w http.ResponseWriter, r *http.Request) {
+	ch.handleMITMCAImport(w, r, false)
+}
+
+func (ch *CertHandler) HandleRollback(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		common.ErrorBadRequest(w, "Method not allowed", nil)
+		return
 	}
+	if !allowLocalCertificateMutation(w, r) {
+		return
+	}
+	result, err := ch.certService.RollbackMITMCA()
+	if err != nil {
+		common.ErrorBadRequest(w, "Failed to rollback MITM CA", map[string]string{"error": err.Error()})
+		return
+	}
+	common.Success(w, result)
+}
 
-	common.Success(w, map[string]interface{}{
-		"cert_type":   req.CertType,
-		"message":     "Certificate generated successfully",
-		"cert_path":   exportPath,
-		"key_path":    exportPath + ".key",
-		"cn":          config.CN,
-		"issuer":      config.Issuer,
-		"valid_years": config.ValidityYears,
-	})
+func (ch *CertHandler) handleMITMCAImport(w http.ResponseWriter, r *http.Request, validateOnly bool) {
+	if r.Method != http.MethodPost {
+		common.ErrorBadRequest(w, "Method not allowed", nil)
+		return
+	}
+	if !allowLocalCertificateMutation(w, r) {
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxCertificateImportBytes)
+	if err := r.ParseMultipartForm(maxCertificateImportBytes); err != nil {
+		common.ErrorBadRequest(w, "Invalid or oversized certificate upload", nil)
+		return
+	}
+	defer r.MultipartForm.RemoveAll()
+
+	certificate, err := readOptionalUpload(r, "certificate")
+	if err != nil {
+		common.ErrorBadRequest(w, "Failed to read certificate file", nil)
+		return
+	}
+	privateKey, err := readOptionalUpload(r, "private_key")
+	if err != nil {
+		common.ErrorBadRequest(w, "Failed to read private key file", nil)
+		return
+	}
+	bundle, err := readOptionalUpload(r, "bundle")
+	if err != nil {
+		common.ErrorBadRequest(w, "Failed to read PKCS#12 bundle", nil)
+		return
+	}
+	password := r.FormValue("password")
+
+	var result services.CertImportResult
+	if validateOnly {
+		result, err = ch.certService.ValidateMITMCAImport(certificate, privateKey, bundle, password)
+	} else {
+		result, err = ch.certService.ImportMITMCA(certificate, privateKey, bundle, password)
+	}
+	for i := range privateKey {
+		privateKey[i] = 0
+	}
+	for i := range bundle {
+		bundle[i] = 0
+	}
+	if err != nil {
+		common.ErrorBadRequest(w, "Invalid MITM CA certificate pair", map[string]string{"error": err.Error()})
+		return
+	}
+	common.Success(w, result)
+}
+
+func readOptionalUpload(r *http.Request, field string) ([]byte, error) {
+	file, _, err := r.FormFile(field)
+	if err != nil {
+		if err == http.ErrMissingFile {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer file.Close()
+	return io.ReadAll(io.LimitReader(file, maxCertificateImportBytes+1))
+}
+
+func allowLocalCertificateMutation(w http.ResponseWriter, r *http.Request) bool {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
+	if err != nil || net.ParseIP(host) == nil || !net.ParseIP(host).IsLoopback() {
+		common.ErrorForbidden(w, "Certificate private-key operations are only available from localhost")
+		return false
+	}
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return true
+	}
+	parsed, err := url.Parse(origin)
+	originIP := net.ParseIP(parsed.Hostname())
+	originIsLoopback := strings.EqualFold(parsed.Hostname(), "localhost") || (originIP != nil && originIP.IsLoopback())
+	if err != nil || !originIsLoopback || r.Header.Get("X-Aliang-Local-Request") != "1" {
+		common.ErrorForbidden(w, "Certificate operation failed same-origin validation")
+		return false
+	}
+	return true
 }

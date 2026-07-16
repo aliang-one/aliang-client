@@ -29,6 +29,7 @@ require (
 	github.com/swaggo/http-swagger/v2 v2.0.2
 	github.com/xjasonlyu/tun2socks/v2 v2.6.0
 	go.uber.org/automaxprocs v1.6.0
+	golang.org/x/term v0.37.0
 	golang.org/x/time v0.14.0
 	golang.zx2c4.com/wireguard v0.0.0-20250521234502-f333402bd9cb
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
@@ -36,6 +37,7 @@ require (
 	gorm.io/driver/mysql v1.6.0
 	gorm.io/driver/sqlite v1.6.0
 	gorm.io/gorm v1.30.0
+	software.sslmate.com/src/go-pkcs12 v0.7.3
 )
 
 require (

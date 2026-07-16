@@ -5,7 +5,7 @@
   >
     <div class="absolute inset-0 bg-slate-900/45 backdrop-blur-sm" @click="close"></div>
     <div
-      class="relative z-10 w-full max-w-2xl bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-700 shadow-2xl overflow-hidden"
+      class="relative z-10 w-full max-w-3xl bg-white dark:bg-slate-900 rounded-lg border border-slate-200 dark:border-slate-700 shadow-2xl overflow-hidden"
     >
       <div class="px-6 py-4 border-b border-slate-200 dark:border-slate-700 flex items-center justify-between">
         <div>
@@ -15,19 +15,20 @@
         <button
           type="button"
           :aria-label="t('cert_title')"
-          class="size-9 rounded-full flex items-center justify-center text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"
+          class="size-11 rounded-full flex items-center justify-center text-slate-500 hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary dark:hover:bg-slate-800"
           @click="close"
         >
           <span class="material-symbols-outlined">close</span>
         </button>
       </div>
 
-      <div class="p-6 space-y-5">
+      <div class="max-h-[calc(100vh-7rem)] space-y-5 overflow-y-auto p-6">
         <div class="flex items-center gap-2 flex-wrap">
           <span class="px-2.5 py-1.5 bg-slate-100 dark:bg-slate-800 rounded-md text-xs font-medium text-slate-700 dark:text-slate-300">
             {{ t('cert_localCert') }}
           </span>
           <span class="text-[11px] text-slate-400">{{ t('cert_autoRefreshing') }}</span>
+          <span class="text-[11px] text-slate-400">{{ t('cert_lastRefreshed', { time: lastRefreshed }) }}</span>
           <span
             class="inline-block size-3.5 border-2 border-slate-200 border-t-primary rounded-full animate-spin"
           ></span>
@@ -74,6 +75,8 @@
               <div><strong>{{ t('cert_validity') }}</strong> {{ certStatus.not_before || '-' }} ~ {{ certStatus.not_after || '-' }}</div>
               <div><strong>{{ t('cert_fingerprint') }}</strong> <code class="break-all">{{ certStatus.fingerprint || '-' }}</code></div>
               <div v-if="certStatus.install_path"><strong>{{ t('cert_installPath') }}</strong> <code class="break-all">{{ certStatus.install_path }}</code></div>
+              <div><strong>{{ t('cert_source') }}</strong> {{ sourceLabel(certStatus.source) }}</div>
+              <div v-if="certStatus.key_algorithm"><strong>{{ t('cert_keyAlgorithm') }}</strong> {{ certStatus.key_algorithm }}</div>
             </div>
           </div>
           <div v-else class="text-sm text-slate-400">{{ t('cert_loadingCertInfo') }}</div>
@@ -83,7 +86,7 @@
         <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-2">
           <button
             type="button"
-            :disabled="busy"
+            :disabled="operationBusy"
             class="min-h-9 flex items-center justify-center gap-1.5 px-2.5 py-1.5 border border-slate-200 dark:border-slate-700 rounded-md text-xs hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
             @click="installCert"
           >
@@ -105,7 +108,7 @@
           </button>
           <button
             type="button"
-            :disabled="busy"
+            :disabled="operationBusy"
             class="min-h-9 flex items-center justify-center gap-1.5 px-2.5 py-1.5 border border-red-200 dark:border-red-500/40 rounded-md text-xs text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
             @click="removeCert"
           >
@@ -114,7 +117,7 @@
           </button>
           <button
             type="button"
-            :disabled="busy"
+            :disabled="operationBusy"
             class="min-h-9 flex items-center justify-center gap-1.5 px-2.5 py-1.5 border border-amber-200 dark:border-amber-500/40 rounded-md text-xs text-amber-700 dark:text-amber-300 hover:bg-amber-50 dark:hover:bg-amber-900/20 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
             @click="generateCert"
           >
@@ -122,6 +125,121 @@
             <span>{{ t('cert_regenerateCert') }}</span>
           </button>
         </div>
+
+        <section class="border-y border-slate-200 py-5 dark:border-slate-700" aria-labelledby="cert-import-title">
+          <div class="flex flex-col gap-4">
+            <div class="flex flex-col gap-1 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
+              <div>
+                <h4 id="cert-import-title" class="text-sm font-semibold text-slate-800 dark:text-slate-100">{{ t('cert_importTitle') }}</h4>
+                <p class="mt-1 text-xs leading-5 text-slate-600 dark:text-slate-400">{{ t('cert_importDesc') }}</p>
+              </div>
+              <button
+                v-if="certStatus?.can_rollback"
+                type="button"
+                :disabled="operationBusy"
+                class="min-h-11 shrink-0 cursor-pointer rounded-md border border-slate-300 px-3 text-xs font-semibold text-slate-700 transition-colors duration-200 hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-not-allowed disabled:opacity-50 dark:border-slate-600 dark:text-slate-200 dark:hover:bg-slate-800"
+                @click="rollbackCertificate"
+              >
+                <span class="material-symbols-outlined mr-1 align-middle text-[16px]">undo</span>
+                {{ t('cert_rollback') }}
+              </button>
+            </div>
+
+            <div class="inline-flex w-full rounded-md border border-slate-200 p-1 sm:w-fit dark:border-slate-700" role="radiogroup" :aria-label="t('cert_importFormat')">
+              <button
+                v-for="mode in importModes"
+                :key="mode.value"
+                type="button"
+                role="radio"
+                :aria-checked="importMode === mode.value"
+                class="min-h-11 flex-1 cursor-pointer rounded px-4 text-xs font-semibold transition-colors duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary sm:flex-none"
+                :class="importMode === mode.value ? 'bg-slate-900 text-white dark:bg-primary' : 'text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800'"
+                @click="setImportMode(mode.value)"
+              >
+                {{ t(mode.labelKey) }}
+              </button>
+            </div>
+
+            <div v-if="importMode === 'pem'" class="grid gap-4 sm:grid-cols-2">
+              <label class="block text-xs font-semibold text-slate-700 dark:text-slate-200">
+                {{ t('cert_caFile') }}
+                <input
+                  type="file"
+                  accept=".pem,.crt,.cer,application/x-x509-ca-cert"
+                  class="mt-2 block min-h-11 w-full cursor-pointer rounded-md border border-slate-300 bg-white px-3 py-2 text-xs text-slate-700 file:mr-3 file:cursor-pointer file:rounded file:border-0 file:bg-slate-100 file:px-3 file:py-1 file:text-xs file:font-semibold focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary dark:border-slate-600 dark:bg-slate-950 dark:text-slate-200 dark:file:bg-slate-800"
+                  @change="setImportFile('certificate', $event)"
+                />
+              </label>
+              <label class="block text-xs font-semibold text-slate-700 dark:text-slate-200">
+                {{ t('cert_keyFile') }}
+                <input
+                  type="file"
+                  accept=".pem,.key,application/x-pem-file"
+                  class="mt-2 block min-h-11 w-full cursor-pointer rounded-md border border-slate-300 bg-white px-3 py-2 text-xs text-slate-700 file:mr-3 file:cursor-pointer file:rounded file:border-0 file:bg-slate-100 file:px-3 file:py-1 file:text-xs file:font-semibold focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary dark:border-slate-600 dark:bg-slate-950 dark:text-slate-200 dark:file:bg-slate-800"
+                  @change="setImportFile('privateKey', $event)"
+                />
+              </label>
+            </div>
+
+            <div v-else class="grid gap-4 sm:grid-cols-2">
+              <label class="block text-xs font-semibold text-slate-700 dark:text-slate-200">
+                {{ t('cert_bundleFile') }}
+                <input
+                  type="file"
+                  accept=".p12,.pfx,application/x-pkcs12"
+                  class="mt-2 block min-h-11 w-full cursor-pointer rounded-md border border-slate-300 bg-white px-3 py-2 text-xs text-slate-700 file:mr-3 file:cursor-pointer file:rounded file:border-0 file:bg-slate-100 file:px-3 file:py-1 file:text-xs file:font-semibold focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary dark:border-slate-600 dark:bg-slate-950 dark:text-slate-200 dark:file:bg-slate-800"
+                  @change="setImportFile('bundle', $event)"
+                />
+              </label>
+              <label class="block text-xs font-semibold text-slate-700 dark:text-slate-200">
+                {{ t('cert_bundlePassword') }}
+                <input
+                  v-model="importPassword"
+                  type="password"
+                  autocomplete="off"
+                  class="mt-2 min-h-11 w-full rounded-md border border-slate-300 bg-white px-3 text-sm text-slate-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary dark:border-slate-600 dark:bg-slate-950 dark:text-slate-100"
+                  @input="clearImportValidation"
+                />
+              </label>
+            </div>
+
+            <div v-if="importValidation" class="rounded-md border border-emerald-200 bg-emerald-50/70 p-4 text-xs text-slate-700 dark:border-emerald-700/40 dark:bg-emerald-900/10 dark:text-slate-200">
+              <div class="flex items-center gap-2 font-semibold text-emerald-700 dark:text-emerald-300">
+                <span class="material-symbols-outlined text-[18px]">verified</span>
+                {{ t('cert_validationPassed') }}
+              </div>
+              <dl class="mt-3 grid gap-x-4 gap-y-2 sm:grid-cols-[8rem_1fr]">
+                <dt class="text-slate-500">{{ t('cert_subject') }}</dt><dd class="break-all">{{ importValidation.subject }}</dd>
+                <dt class="text-slate-500">{{ t('cert_fingerprint') }}</dt><dd class="break-all font-mono">{{ importValidation.fingerprint }}</dd>
+                <dt class="text-slate-500">{{ t('cert_keyAlgorithm') }}</dt><dd>{{ importValidation.key_algorithm }}</dd>
+                <dt class="text-slate-500">{{ t('cert_systemTrust') }}</dt><dd>{{ importValidation.is_trusted ? t('cert_trusted') : t('cert_notTrusted') }}</dd>
+              </dl>
+              <ul v-if="importValidation.warnings?.length" class="mt-3 space-y-1 text-amber-700 dark:text-amber-300">
+                <li v-for="warning in importValidation.warnings" :key="warning">{{ warningLabel(warning) }}</li>
+              </ul>
+            </div>
+
+            <div class="flex flex-col gap-2 sm:flex-row sm:justify-end">
+              <button
+                type="button"
+                :disabled="importBusy || !canValidateImport"
+                class="min-h-11 cursor-pointer rounded-md border border-slate-300 px-4 text-xs font-semibold text-slate-700 transition-colors duration-200 hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-not-allowed disabled:opacity-50 dark:border-slate-600 dark:text-slate-200 dark:hover:bg-slate-800"
+                @click="validateImport"
+              >
+                {{ importBusy ? t('cert_validating') : t('cert_validatePair') }}
+              </button>
+              <button
+                type="button"
+                :disabled="importBusy || !importValidation"
+                class="min-h-11 cursor-pointer rounded-md bg-primary px-4 text-xs font-semibold text-white transition-colors duration-200 hover:bg-primary/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+                @click="activateImport"
+              >
+                <span class="material-symbols-outlined mr-1 align-middle text-[16px]">publish</span>
+                {{ t('cert_activateCustom') }}
+              </button>
+            </div>
+          </div>
+        </section>
 
         <!-- Generate Result -->
         <div
@@ -147,7 +265,7 @@
             </div>
             <button
               type="button"
-              :disabled="busy"
+              :disabled="operationBusy"
               class="min-h-9 flex items-center justify-center gap-1.5 px-2.5 py-1.5 border border-sky-300 dark:border-sky-600 rounded-md text-xs text-sky-700 dark:text-sky-300 hover:bg-sky-100/70 dark:hover:bg-sky-900/20 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
               @click="startReinstall"
             >
@@ -181,9 +299,6 @@
         </div>
       </div>
 
-      <div class="px-6 pb-5">
-        <div class="text-center text-[11px] text-slate-400">{{ t('cert_lastRefreshed', { time: lastRefreshed }) }}</div>
-      </div>
     </div>
 
     <!-- Reinstall Progress Overlay -->
@@ -225,7 +340,7 @@
 </template>
 
 <script setup>
-import { reactive, ref, onMounted, onUnmounted, watch } from 'vue';
+import { computed, reactive, ref, onMounted, onUnmounted, watch } from 'vue';
 import { useCertStatus } from '../composables/useCertStatus';
 import { useI18n } from '../i18n';
 
@@ -248,6 +363,20 @@ const generateResult = ref(null);
 const feedback = ref(null);
 const lastRefreshed = ref('-');
 const lastAudit = ref(null);
+const importMode = ref('pem');
+const importPassword = ref('');
+const importBusy = ref(false);
+const importValidation = ref(null);
+const importFiles = reactive({ certificate: null, privateKey: null, bundle: null });
+const importModes = [
+  { value: 'pem', labelKey: 'cert_formatPem' },
+  { value: 'pkcs12', labelKey: 'cert_formatPkcs12' }
+];
+
+const canValidateImport = computed(() => importMode.value === 'pem'
+  ? Boolean(importFiles.certificate && importFiles.privateKey)
+  : Boolean(importFiles.bundle));
+const operationBusy = computed(() => busy.value || importBusy.value);
 
 const progress = reactive({
   visible: false,
@@ -287,7 +416,7 @@ function clearResults() {
 }
 
 async function apiCall(method, path, body) {
-  const opts = { method, headers: { 'Content-Type': 'application/json' } };
+  const opts = { method, headers: { 'Content-Type': 'application/json', 'X-Aliang-Local-Request': '1' } };
   if (body) opts.body = JSON.stringify(body);
   const res = await fetch(`${API_BASE}${path}`, opts);
   if (!res.ok) {
@@ -301,6 +430,116 @@ async function apiCall(method, path, body) {
   if (method === 'GET' && path.includes('/download')) return res;
   const json = await res.json();
   return json.data || json;
+}
+
+function sourceLabel(source) {
+  const labels = {
+    imported: t('cert_sourceImported'),
+    generated: t('cert_sourceGenerated'),
+    legacy: t('cert_sourceLegacy')
+  };
+  return labels[source] || source || '-';
+}
+
+function warningLabel(warning) {
+  const labels = {
+    expires_soon: t('cert_warningExpiresSoon'),
+    weak_signature_algorithm: t('cert_warningWeakSignature'),
+    name_constraints_present: t('cert_warningNameConstraints')
+  };
+  return labels[warning] || warning;
+}
+
+function clearImportValidation() {
+  importValidation.value = null;
+}
+
+function setImportMode(mode) {
+  importMode.value = mode;
+  importPassword.value = '';
+  importFiles.certificate = null;
+  importFiles.privateKey = null;
+  importFiles.bundle = null;
+  clearImportValidation();
+}
+
+function setImportFile(field, event) {
+  importFiles[field] = event.target.files?.[0] || null;
+  clearImportValidation();
+}
+
+function buildImportFormData() {
+  const form = new FormData();
+  if (importMode.value === 'pem') {
+    form.append('certificate', importFiles.certificate);
+    form.append('private_key', importFiles.privateKey);
+  } else {
+    form.append('bundle', importFiles.bundle);
+    form.append('password', importPassword.value);
+  }
+  return form;
+}
+
+async function importRequest(path) {
+  const response = await fetch(`${API_BASE}${path}`, {
+    method: 'POST',
+    headers: { 'X-Aliang-Local-Request': '1' },
+    body: buildImportFormData()
+  });
+  const payload = await response.json().catch(() => null);
+  if (!response.ok || payload?.code !== 0) {
+    throw new Error(payload?.data?.details?.error || payload?.data?.error_msg || payload?.msg || t('cert_importFailed'));
+  }
+  return payload.data || {};
+}
+
+async function validateImport() {
+  if (!canValidateImport.value) return;
+  importBusy.value = true;
+  clearImportValidation();
+  try {
+    importValidation.value = await importRequest('/cert/import/validate');
+    showFeedback(t('cert_validationPassed'));
+  } catch (err) {
+    showFeedback(t('cert_validationFailed') + ': ' + err.message, 'error');
+  } finally {
+    importBusy.value = false;
+  }
+}
+
+async function activateImport() {
+  if (!importValidation.value || !confirm(t('cert_confirmActivateCustom'))) return;
+  importBusy.value = true;
+  try {
+    const result = await importRequest('/cert/import');
+    showFeedback(result.is_trusted ? t('cert_importTrustedSuccess') : t('cert_importSuccess'));
+    saveAudit(t('cert_importTitle'), true, result.fingerprint || '');
+    importValidation.value = result;
+    invalidateCache();
+    await checkStatus();
+  } catch (err) {
+    showFeedback(t('cert_importFailed') + ': ' + err.message, 'error');
+    saveAudit(t('cert_importTitle'), false, err.message);
+  } finally {
+    importBusy.value = false;
+  }
+}
+
+async function rollbackCertificate() {
+  if (!confirm(t('cert_confirmRollback'))) return;
+  importBusy.value = true;
+  try {
+    const result = await apiCall('POST', '/cert/rollback', {});
+    showFeedback(t('cert_rollbackSuccess'));
+    saveAudit(t('cert_rollback'), true, result.fingerprint || '');
+    clearImportValidation();
+    invalidateCache();
+    await checkStatus();
+  } catch (err) {
+    showFeedback(t('cert_rollbackFailed') + ': ' + err.message, 'error');
+  } finally {
+    importBusy.value = false;
+  }
 }
 
 async function checkStatus() {
@@ -424,9 +663,9 @@ async function startReinstall() {
   stopReinstallPoll();
 
   const steps = [
-    { label: t('cert_stepRemoveOld'), state: 'pending', message: '' },
     { label: t('cert_stepRegenerate'), state: 'pending', message: '' },
     { label: t('cert_stepInstall'), state: 'pending', message: '' },
+    { label: t('cert_stepRemoveOld'), state: 'pending', message: '' },
     { label: t('cert_stepVerify'), state: 'pending', message: '' }
   ];
 
@@ -446,48 +685,30 @@ async function startReinstall() {
     }
   }, 1500);
 
-  // Step 1: Remove old cert (ignore errors - cert may not exist)
-  setStepState(steps, 0, 'running', t('cert_removing'));
-  try {
-    await apiCall('POST', '/cert/remove', { cert_type: CERT_TYPE });
-    setStepState(steps, 0, 'done', t('cert_removedOrNotExist'));
-  } catch (_) {
-    setStepState(steps, 0, 'done', t('cert_oldCertNotExist'));
-  }
-
-  // Step 2: Generate new cert
-  setStepState(steps, 1, 'running', t('cert_generating'));
+  // The backend performs trust-first rotation atomically: install and verify the
+  // new CA, activate it, then remove the old CA by fingerprint.
+  setStepState(steps, 0, 'running', t('cert_generating'));
   try {
     await apiCall('POST', '/cert/generate', { cert_type: CERT_TYPE });
-    setStepState(steps, 1, 'done', t('cert_generateSuccess'));
+    setStepState(steps, 0, 'done', t('cert_generateSuccess'));
+    setStepState(steps, 1, 'done', t('cert_installSuccess2'));
+    setStepState(steps, 2, 'done', t('cert_removedOrNotExist'));
   } catch (err) {
-    setStepState(steps, 1, 'error', err.message);
+    setStepState(steps, 0, 'error', err.message);
     finalStatus.success = false;
     finishReinstall(steps, false, t('cert_generateCertFailed'));
     return;
   }
 
-  // Step 3: Install to system
-  setStepState(steps, 2, 'running', t('cert_installing'));
-  try {
-    await apiCall('POST', '/cert/install', { cert_type: CERT_TYPE });
-    setStepState(steps, 2, 'done', t('cert_installSuccess2'));
-  } catch (err) {
-    setStepState(steps, 2, 'error', err.message);
-    finalStatus.success = false;
-    finishReinstall(steps, false, t('cert_installCertFailed'));
-    return;
-  }
-
-  // Step 4: Verify
+  // Verify the exact active certificate is both present and trusted.
   setStepState(steps, 3, 'running', t('cert_verifying'));
   try {
     const status = await apiCall('GET', `/cert/status?cert_type=${encodeURIComponent(CERT_TYPE)}`);
     certStatus.value = status;
     invalidateCache();
     updateRefreshed();
-    if (status.is_installed) {
-      setStepState(steps, 3, 'done', status.is_trusted ? t('cert_installedAndTrusted') : t('cert_installed'));
+    if (status.is_installed && status.is_trusted) {
+      setStepState(steps, 3, 'done', t('cert_installedAndTrusted'));
       finishReinstall(steps, true, t('cert_success'));
     } else {
       setStepState(steps, 3, 'error', t('cert_installedNotDetected'));
@@ -537,13 +758,13 @@ function open() {
 }
 
 function close() {
-  if (busy.value) return;
+  if (operationBusy.value) return;
   stopPolling();
   emit('update:modelValue', false);
 }
 
 function onKeydown(e) {
-  if (e.key === 'Escape' && props.modelValue && !busy.value) {
+  if (e.key === 'Escape' && props.modelValue && !operationBusy.value) {
     close();
   }
 }
@@ -553,7 +774,7 @@ watch(() => props.modelValue, (val) => {
     loadAudit();
     startPolling();
   } else {
-    if (!busy.value) stopPolling();
+    if (!operationBusy.value) stopPolling();
   }
 });
 

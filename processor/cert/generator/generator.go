@@ -67,7 +67,7 @@ func GenerateCertificateFromConfig(config *cert_config.CertConfig, exportPath st
 
 	// Export certificate
 	certFile := exportPath
-	certOut, err := os.Create(certFile)
+	certOut, err := os.OpenFile(certFile, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
 	if err != nil {
 		return fmt.Errorf("failed to create certificate file: %w", err)
 	}
@@ -79,7 +79,7 @@ func GenerateCertificateFromConfig(config *cert_config.CertConfig, exportPath st
 
 	// Export private key
 	keyFile := exportPath + ".key"
-	keyOut, err := os.Create(keyFile)
+	keyOut, err := os.OpenFile(keyFile, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
 		return fmt.Errorf("failed to create key file: %w", err)
 	}
@@ -174,7 +174,7 @@ func GenerateSignedCertificate(caCertPath, caKeyPath string, config *cert_config
 
 	// Export certificate
 	certFile := exportPath
-	certOut, err := os.Create(certFile)
+	certOut, err := os.OpenFile(certFile, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
 	if err != nil {
 		return fmt.Errorf("failed to create certificate file: %w", err)
 	}
@@ -186,7 +186,7 @@ func GenerateSignedCertificate(caCertPath, caKeyPath string, config *cert_config
 
 	// Export private key
 	keyFile := exportPath + ".key"
-	keyOut, err := os.Create(keyFile)
+	keyOut, err := os.OpenFile(keyFile, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
 		return fmt.Errorf("failed to create key file: %w", err)
 	}
