@@ -36,6 +36,10 @@ const (
 // commands are returned tagged, so the client can filter by the active
 // conversation.
 func agentSlashCommandsListPayload(msg map[string]interface{}) map[string]interface{} {
+	return agentSlashCommandsListPayloadWithManager(msg, nil)
+}
+
+func agentSlashCommandsListPayloadWithManager(msg map[string]interface{}, manager *agentAIManager) map[string]interface{} {
 	requestID := remoteString(msg, "request_id")
 	projectPath, err := resolveAgentProjectPath(remoteString(msg, "project_path"))
 	if err != nil {
@@ -44,6 +48,8 @@ func agentSlashCommandsListPayload(msg map[string]interface{}) map[string]interf
 	provider := normalizeSlashProvider(remoteString(msg, "provider"))
 	includeUser := remoteBool(msg, "include_user_level", true)
 	includePlugins := remoteBool(msg, "include_plugins", true)
+	remotePolicy := parseAgentAIClaudeRemotePolicy(msg)
+	includeProjectClaude := !remotePolicy.enabled || remotePolicy.projectSkillTrusted
 
 	wantClaude := provider == "" || provider == "claude"
 	wantCodex := provider == "" || provider == "codex"
@@ -51,7 +57,9 @@ func agentSlashCommandsListPayload(msg map[string]interface{}) map[string]interf
 
 	var commands []map[string]interface{}
 	if wantClaude {
-		commands = append(commands, collectProjectSlashCommands(projectPath)...)
+		if includeProjectClaude {
+			commands = append(commands, collectProjectSlashCommands(projectPath)...)
+		}
 		if includeUser {
 			commands = append(commands, collectUserSlashCommands()...)
 		}
@@ -66,15 +74,54 @@ func agentSlashCommandsListPayload(msg map[string]interface{}) map[string]interf
 		commands = append(commands, collectOpenCodeSlashCommands(projectPath, includeUser)...)
 	}
 	sortSlashCommands(commands)
+	verified := !wantClaude
+	var claudeVersion, capabilityGeneration string
+	if provider == "claude" && manager != nil {
+		if caps, ok := manager.claudeCapabilities(remoteString(msg, "session_id"), projectPath); ok {
+			verified = true
+			claudeVersion = caps.version
+			capabilityGeneration = caps.generation
+			commands = filterVerifiedClaudeCommands(commands, caps.commands)
+		}
+	}
 
-	return map[string]interface{}{
+	payload := map[string]interface{}{
 		"type":         models.AgentEventSlashCommandsListResult,
 		"request_id":   requestID,
 		"project_path": projectPath,
 		"provider":     provider,
 		"commands":     commands,
 		"generated_at": time.Now().UTC().Format(time.RFC3339),
+		"verified":     verified,
 	}
+	if claudeVersion != "" {
+		payload["claude_version"] = claudeVersion
+	}
+	if capabilityGeneration != "" {
+		payload["capability_generation"] = capabilityGeneration
+	}
+	return payload
+}
+
+func filterVerifiedClaudeCommands(commands []map[string]interface{}, available map[string]struct{}) []map[string]interface{} {
+	filtered := make([]map[string]interface{}, 0, len(commands))
+	for _, command := range commands {
+		name := normalizeClaudeCapabilityName(remoteString(command, "name"))
+		if name == "" {
+			continue
+		}
+		if _, ok := available[name]; ok {
+			filtered = append(filtered, command)
+			continue
+		}
+		for capability := range available {
+			if strings.HasSuffix(capability, ":"+name) || strings.HasSuffix(name, ":"+capability) {
+				filtered = append(filtered, command)
+				break
+			}
+		}
+	}
+	return filtered
 }
 
 // normalizeSlashProvider maps a provider hint to the command-surface provider.
@@ -166,8 +213,8 @@ func collectPluginSlashCommands() []map[string]interface{} {
 			if _, err := os.Stat(installPath); err != nil {
 				continue
 			}
-			out = append(out, scanCommandMarkdowns(filepath.Join(installPath, "commands"), "user", "plugin", installPath, prefix, "claude")...)
-			out = append(out, scanSkillMarkdowns(filepath.Join(installPath, "skills"), "user", "plugin", installPath, prefix, "claude")...)
+			out = append(out, scanCommandMarkdowns(filepath.Join(installPath, "commands"), "plugin", "plugin", installPath, prefix, "claude")...)
+			out = append(out, scanSkillMarkdowns(filepath.Join(installPath, "skills"), "plugin", "plugin", installPath, prefix, "claude")...)
 		}
 		handled++
 		if handled >= slashCommandMaxPlugins {
@@ -232,7 +279,7 @@ func openCodeBuiltinCommands() []map[string]interface{} {
 	}
 	out := make([]map[string]interface{}, 0, len(builtins))
 	for _, b := range builtins {
-		out = append(out, slashCommandEntry(b.name, b.description, b.argHint, "builtin", "builtin", "", "opencode"))
+		out = append(out, slashCapabilityEntry(b.name, b.description, b.argHint, "builtin", "builtin", "", "opencode", "command", true, true))
 	}
 	return out
 }
@@ -259,7 +306,7 @@ func collectCodexPromptCommands(promptsDir string) []map[string]interface{} {
 		}
 		full := filepath.Join(promptsDir, entry.Name())
 		fm, _ := parseSlashFrontmatter(full)
-		out = append(out, slashCommandEntry(name, fm.description, fm.argumentHint, "user", "user", entry.Name(), "codex"))
+		out = append(out, slashCapabilityEntry(name, fm.description, fm.argumentHint, "user", "user", entry.Name(), "codex", "command", fm.isUserInvocable(), fm.isModelInvocable()))
 	}
 	return capSlashCommands(out)
 }
@@ -301,7 +348,7 @@ func codexBuiltinCommands() []map[string]interface{} {
 	}
 	out := make([]map[string]interface{}, 0, len(builtins))
 	for _, b := range builtins {
-		out = append(out, slashCommandEntry(b.name, b.description, b.argHint, "builtin", "builtin", "", "codex"))
+		out = append(out, slashCapabilityEntry(b.name, b.description, b.argHint, "builtin", "builtin", "", "codex", "command", true, true))
 	}
 	return out
 }
@@ -359,7 +406,7 @@ func scanCommandMarkdowns(root, scope, origin, sourceBase, namePrefix, provider 
 			return nil
 		}
 		fm, _ := parseSlashFrontmatter(path)
-		out = append(out, slashCommandEntry(namePrefix+name, fm.description, fm.argumentHint, scope, origin, relSource(sourceBase, path), provider))
+		out = append(out, slashCapabilityEntry(namePrefix+name, fm.description, fm.argumentHint, scope, origin, relSource(sourceBase, path), provider, "command", fm.isUserInvocable(), fm.isModelInvocable()))
 		return nil
 	})
 	return capSlashCommands(out)
@@ -388,19 +435,26 @@ func scanSkillMarkdowns(root, scope, origin, sourceBase, namePrefix, provider st
 		if name == "" {
 			name = entry.Name()
 		}
-		out = append(out, slashCommandEntry(namePrefix+name, fm.description, "", scope, origin, relSource(sourceBase, skillMd), provider))
+		out = append(out, slashCapabilityEntry(namePrefix+name, fm.description, fm.argumentHint, scope, origin, relSource(sourceBase, skillMd), provider, "skill", fm.isUserInvocable(), fm.isModelInvocable()))
 	}
 	return capSlashCommands(out)
 }
 
 func slashCommandEntry(name, description, argHint, scope, origin, source, provider string) map[string]interface{} {
+	return slashCapabilityEntry(name, description, argHint, scope, origin, source, provider, "command", true, true)
+}
+
+func slashCapabilityEntry(name, description, argHint, scope, origin, source, provider, kind string, userInvocable, modelInvocable bool) map[string]interface{} {
 	entry := map[string]interface{}{
-		"name":        name,
-		"description": description,
-		"scope":       scope,
-		"origin":      origin,
-		"source":      source,
-		"provider":    provider,
+		"name":            name,
+		"description":     description,
+		"kind":            kind,
+		"scope":           scope,
+		"origin":          origin,
+		"source":          source,
+		"provider":        provider,
+		"user_invocable":  userInvocable,
+		"model_invocable": modelInvocable,
 	}
 	if strings.TrimSpace(argHint) != "" {
 		entry["arg_hint"] = strings.TrimSpace(argHint)
@@ -452,9 +506,19 @@ func pluginShortName(key string) string {
 }
 
 type slashFrontmatter struct {
-	description  string
-	argumentHint string
-	name         string
+	description            string
+	argumentHint           string
+	name                   string
+	userInvocable          *bool
+	disableModelInvocation bool
+}
+
+func (fm slashFrontmatter) isUserInvocable() bool {
+	return fm.userInvocable == nil || *fm.userInvocable
+}
+
+func (fm slashFrontmatter) isModelInvocable() bool {
+	return !fm.disableModelInvocation
 }
 
 // parseSlashFrontmatter reads a markdown file and extracts the handful of
@@ -488,9 +552,28 @@ func parseSlashFrontmatter(path string) (slashFrontmatter, bool) {
 			fm.argumentHint = value
 		case "name":
 			fm.name = value
+		case "user-invocable", "user_invocable":
+			if parsed, ok := parseSlashFrontmatterBool(value); ok {
+				fm.userInvocable = &parsed
+			}
+		case "disable-model-invocation", "disable_model_invocation":
+			if parsed, ok := parseSlashFrontmatterBool(value); ok {
+				fm.disableModelInvocation = parsed
+			}
 		}
 	}
 	return fm, true
+}
+
+func parseSlashFrontmatterBool(value string) (bool, bool) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "true", "yes", "1":
+		return true, true
+	case "false", "no", "0":
+		return false, true
+	default:
+		return false, false
+	}
 }
 
 func splitFrontmatterField(line string) (string, string, bool) {

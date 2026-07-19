@@ -270,8 +270,12 @@ func (ch *CertHandler) HandleGenerateCert(w http.ResponseWriter, r *http.Request
 
 	result, err := ch.certService.RegenerateCert(req.CertType)
 	if err != nil {
-		logger.Error(fmt.Sprintf("Failed to generate certificate: %v", err))
-		common.Error(w, common.CodeInternalServer, fmt.Sprintf("Failed to generate certificate: %s", err.Error()), nil)
+		logger.Error(fmt.Sprintf("Failed to rotate certificate: %v", err))
+		details := map[string]string{"error": err.Error()}
+		if stage := services.CertificateOperationStage(err); stage != "" {
+			details["stage"] = stage
+		}
+		common.Error(w, common.CodeInternalServer, "Failed to rotate certificate", details)
 		return
 	}
 	common.Success(w, result)

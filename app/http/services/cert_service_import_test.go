@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"math/big"
 	"os"
@@ -33,6 +34,54 @@ type transactionTestInstaller struct {
 	trusted           map[string]bool
 	failInstall       bool
 	failRemoveForCert string
+}
+
+type postconditionTestInstaller struct {
+	installed         bool
+	trusted           bool
+	trustAfterInstall bool
+	installErr        error
+	keepAfterRemove   bool
+	removeCalls       int
+}
+
+func (i *postconditionTestInstaller) IsInstalled(string, []byte) (bool, error) {
+	return i.installed, nil
+}
+
+func (i *postconditionTestInstaller) Install(string, string) error {
+	i.installed = true
+	i.trusted = i.trustAfterInstall
+	return i.installErr
+}
+
+func (i *postconditionTestInstaller) Remove(string, []byte) error {
+	i.removeCalls++
+	if !i.keepAfterRemove {
+		i.installed = false
+		i.trusted = false
+	}
+	return nil
+}
+
+func (i *postconditionTestInstaller) GetCertInfo(string, []byte) (cert_installer.CertInfo, error) {
+	return cert_installer.CertInfo{}, nil
+}
+
+func (i *postconditionTestInstaller) GetInstallPath(string) string { return "test-store" }
+
+func (i *postconditionTestInstaller) IsTrusted(string, []byte) (bool, error) {
+	return i.trusted, nil
+}
+
+func (i *postconditionTestInstaller) GetTrustStatus(string, []byte) (string, error) {
+	if !i.installed {
+		return "not_found", nil
+	}
+	if i.trusted {
+		return "system_trusted", nil
+	}
+	return "installed_not_trusted", nil
 }
 
 func newTransactionTestInstaller() *transactionTestInstaller {
@@ -191,6 +240,8 @@ func TestImportInstallFailureKeepsPreviousCAActive(t *testing.T) {
 	newCert, newKey := generateImportTestCA(t, "replacement-root")
 	if _, err := service.ImportMITMCA(newCert, newKey, nil, ""); err == nil {
 		t.Fatal("expected injected installation failure")
+	} else if stage := CertificateOperationStage(err); stage != "install" {
+		t.Fatalf("operation stage = %q, want install; error=%v", stage, err)
 	}
 	assertServiceActiveCertificateCN(t, "previous-root")
 }
@@ -217,6 +268,8 @@ func TestImportRemoveFailureRollsBackActiveCAAndTrust(t *testing.T) {
 	}
 	if _, err := service.ImportMITMCA(newCert, newKey, nil, ""); err == nil {
 		t.Fatal("expected injected old-certificate removal failure")
+	} else if stage := CertificateOperationStage(err); stage != "remove" {
+		t.Fatalf("operation stage = %q, want remove; error=%v", stage, err)
 	}
 	assertServiceActiveCertificateCN(t, "previous-root")
 	if !installer.trusted[oldFingerprint] {
@@ -224,6 +277,52 @@ func TestImportRemoveFailureRollsBackActiveCAAndTrust(t *testing.T) {
 	}
 	if installer.trusted[newFingerprint] {
 		t.Fatal("new CA trust was not cleaned up after rollback")
+	}
+}
+
+func TestInstallCertAcceptsVerifiedTrustAfterInstallerError(t *testing.T) {
+	prepareActiveTestCA(t, "active-root")
+	installer := &postconditionTestInstaller{
+		trustAfterInstall: true,
+		installErr:        errors.New("command returned non-zero after applying trust"),
+	}
+	service := NewCertServiceWithInstaller(installer)
+
+	if err := service.InstallCert(cert_config.CertTypeMitmCA); err != nil {
+		t.Fatalf("InstallCert() must accept verified final state: %v", err)
+	}
+	if !installer.installed || !installer.trusted {
+		t.Fatalf("final state installed=%v trusted=%v", installer.installed, installer.trusted)
+	}
+}
+
+func TestInstallCertCleansNewPartialInstall(t *testing.T) {
+	prepareActiveTestCA(t, "active-root")
+	installer := &postconditionTestInstaller{
+		trustAfterInstall: false,
+		installErr:        errors.New("command failed after inserting certificate"),
+	}
+	service := NewCertServiceWithInstaller(installer)
+
+	if err := service.InstallCert(cert_config.CertTypeMitmCA); err == nil {
+		t.Fatal("expected partial installation failure")
+	}
+	if installer.installed || installer.trusted || installer.removeCalls != 1 {
+		t.Fatalf("partial state was not cleaned: installed=%v trusted=%v removeCalls=%d", installer.installed, installer.trusted, installer.removeCalls)
+	}
+}
+
+func TestRemoveCertRejectsSuccessWhileExactCertificateRemains(t *testing.T) {
+	prepareActiveTestCA(t, "active-root")
+	installer := &postconditionTestInstaller{
+		installed:       true,
+		trusted:         true,
+		keepAfterRemove: true,
+	}
+	service := NewCertServiceWithInstaller(installer)
+
+	if err := service.RemoveCert(cert_config.CertTypeMitmCA); err == nil {
+		t.Fatal("expected removal postcondition failure")
 	}
 }
 

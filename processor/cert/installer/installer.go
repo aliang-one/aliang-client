@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 
 	"aliang.one/nursorgate/common/logger"
@@ -80,11 +81,9 @@ func parseCertificateBytes(certBytes []byte) (*x509.Certificate, error) {
 	block, _ := pem.Decode(certBytes)
 	if block != nil {
 		certBytes = block.Bytes
-	} else {
-		certBytes = bytes.TrimSpace(certBytes)
 	}
 
-	if len(certBytes) == 0 {
+	if len(bytes.TrimSpace(certBytes)) == 0 {
 		return nil, fmt.Errorf("empty certificate data")
 	}
 
@@ -197,10 +196,10 @@ func getWindowsStoreTargets(certType string) []windowsStoreTarget {
 		}
 	}
 
-	// When running as a Windows service (for example LocalSystem), CurrentUser points
-	// at the service account profile. Prefer LocalMachine first in that context.
+	// A service account's CurrentUser store is not visible to the interactive user.
+	// Daemon installs must therefore target LocalMachine only.
 	if isWindowsDaemonRuntime() && len(targets) > 1 {
-		targets[0], targets[1] = targets[1], targets[0]
+		targets = targets[1:]
 	}
 
 	return targets
@@ -218,12 +217,12 @@ try {
 `, target.StoreName, target.Location, openFlags, body)
 }
 
-func runWindowsPowerShell(script string) ([]byte, error) {
+var runWindowsPowerShell = func(script string) ([]byte, error) {
 	cmd := newPlatformCommand("powershell", "-NoProfile", "-NonInteractive", "-Command", script)
 	return cmd.CombinedOutput()
 }
 
-func runWindowsCommand(name string, args ...string) ([]byte, error) {
+var runWindowsCommand = func(name string, args ...string) ([]byte, error) {
 	cmd := newPlatformCommand(name, args...)
 	return cmd.CombinedOutput()
 }
@@ -257,66 +256,58 @@ func installWindowsCertWithCertutil(target windowsStoreTarget, certPath string) 
 	return runWindowsCommand("certutil", args...)
 }
 
-func findWindowsInstalledStore(certType string, certBytes []byte) (windowsStoreTarget, bool, error) {
-	thumbprint, thumbprintErr := extractCertThumbprint(certBytes)
-	commonName, commonNameErr := extractCertCommonName(certBytes)
-	if thumbprintErr != nil && commonNameErr != nil {
-		return windowsStoreTarget{}, false, fmt.Errorf("failed to extract certificate identity: thumbprint=%v commonName=%v", thumbprintErr, commonNameErr)
-	}
-
-	for _, target := range getWindowsStoreTargets(certType) {
-		var body string
-		if thumbprintErr == nil {
-			body = fmt.Sprintf(`
+func windowsStoreContainsThumbprint(target windowsStoreTarget, thumbprint string) (bool, error) {
+	body := fmt.Sprintf(`
     $match = $store.Certificates | Where-Object { $_.Thumbprint -eq '%s' } | Select-Object -First 1
     if ($match) { Write-Output 'FOUND' }
-`, escapePowerShellSingleQuoted(thumbprint))
-		} else {
-			body = fmt.Sprintf(`
-    $match = $store.Certificates | Where-Object { $_.Subject -like '*%s*' } | Select-Object -First 1
-    if ($match) { Write-Output 'FOUND' }
-`, escapePowerShellSingleQuoted(commonName))
-		}
+	`, escapePowerShellSingleQuoted(thumbprint))
+	output, err := runWindowsPowerShell(buildWindowsStoreScript(target, "ReadOnly", body))
+	if err != nil {
+		return false, fmt.Errorf("inspect %s: %w, output: %s", target.PSPath, err, strings.TrimSpace(string(output)))
+	}
+	return strings.Contains(string(output), "FOUND"), nil
+}
 
-		output, err := runWindowsPowerShell(buildWindowsStoreScript(target, "ReadOnly", body))
-		if err != nil {
-			logger.Warn(fmt.Sprintf("Failed to inspect Windows certificate store %s: %v, output: %s", target.PSPath, err, string(output)))
+func findWindowsInstalledStore(certType string, certBytes []byte) (windowsStoreTarget, bool, error) {
+	thumbprint, err := extractCertThumbprint(certBytes)
+	if err != nil {
+		return windowsStoreTarget{}, false, fmt.Errorf("failed to extract certificate thumbprint: %w", err)
+	}
+
+	var inspectErrs []string
+	for _, target := range getWindowsStoreTargets(certType) {
+		found, inspectErr := windowsStoreContainsThumbprint(target, thumbprint)
+		if inspectErr != nil {
+			inspectErrs = append(inspectErrs, inspectErr.Error())
 			continue
 		}
-
-		if strings.Contains(string(output), "FOUND") {
+		if found {
 			return target, true, nil
 		}
 	}
-
+	if len(inspectErrs) > 0 {
+		return windowsStoreTarget{}, false, errors.New(strings.Join(inspectErrs, "; "))
+	}
 	return windowsStoreTarget{}, false, nil
 }
 
 func countWindowsInstalledCopies(certType string, certBytes []byte) (int, error) {
-	thumbprint, thumbprintErr := extractCertThumbprint(certBytes)
-	commonName, commonNameErr := extractCertCommonName(certBytes)
-	if thumbprintErr != nil && commonNameErr != nil {
-		return 0, fmt.Errorf("failed to extract certificate identity: thumbprint=%v commonName=%v", thumbprintErr, commonNameErr)
+	thumbprint, err := extractCertThumbprint(certBytes)
+	if err != nil {
+		return 0, fmt.Errorf("failed to extract certificate thumbprint: %w", err)
 	}
 
 	total := 0
+	var inspectErrs []string
 	for _, target := range getWindowsStoreTargets(certType) {
-		var body string
-		if thumbprintErr == nil {
-			body = fmt.Sprintf(`
+		body := fmt.Sprintf(`
     $matches = @($store.Certificates | Where-Object { $_.Thumbprint -eq '%s' })
     Write-Output $matches.Count
-`, escapePowerShellSingleQuoted(thumbprint))
-		} else {
-			body = fmt.Sprintf(`
-    $matches = @($store.Certificates | Where-Object { $_.Subject -like '*%s*' })
-    Write-Output $matches.Count
-`, escapePowerShellSingleQuoted(commonName))
-		}
+	`, escapePowerShellSingleQuoted(thumbprint))
 
 		output, err := runWindowsPowerShell(buildWindowsStoreScript(target, "ReadOnly", body))
 		if err != nil {
-			logger.Warn(fmt.Sprintf("Failed to count Windows certificates in %s: %v, output: %s", target.PSPath, err, strings.TrimSpace(string(output))))
+			inspectErrs = append(inspectErrs, fmt.Sprintf("%s: %v, output: %s", target.PSPath, err, strings.TrimSpace(string(output))))
 			continue
 		}
 
@@ -327,12 +318,14 @@ func countWindowsInstalledCopies(certType string, certBytes []byte) (int, error)
 
 		var count int
 		if _, scanErr := fmt.Sscanf(countText, "%d", &count); scanErr != nil {
-			logger.Warn(fmt.Sprintf("Failed to parse Windows certificate count from %s output %q: %v", target.PSPath, countText, scanErr))
+			inspectErrs = append(inspectErrs, fmt.Sprintf("%s returned invalid count %q: %v", target.PSPath, countText, scanErr))
 			continue
 		}
 		total += count
 	}
-
+	if len(inspectErrs) > 0 {
+		return total, errors.New(strings.Join(inspectErrs, "; "))
+	}
 	return total, nil
 }
 
@@ -344,6 +337,8 @@ const (
 	darwinSystemKeychainPath = "/Library/Keychains/System.keychain"
 	darwinSecurityPath       = "/usr/bin/security"
 	darwinOSAScriptPath      = "/usr/bin/osascript"
+	darwinLaunchctlPath      = "/bin/launchctl"
+	darwinStatPath           = "/usr/bin/stat"
 	darwinPrivilegedScript   = `on run argv
 set commandText to "/usr/bin/security"
 repeat with argValue in argv
@@ -359,24 +354,49 @@ type darwinKeychainMatch struct {
 }
 
 var (
-	darwinEffectiveUID = os.Geteuid
-	runDarwinCommand   = func(name string, args ...string) ([]byte, error) {
+	darwinEffectiveUID   = os.Geteuid
+	darwinConsoleUserUID = func() (string, error) {
+		output, err := newPlatformCommand(darwinStatPath, "-f", "%u", "/dev/console").CombinedOutput()
+		if err != nil {
+			return "", fmt.Errorf("resolve macOS console user: %w, output: %s", err, strings.TrimSpace(string(output)))
+		}
+		return strings.TrimSpace(string(output)), nil
+	}
+	runDarwinCommand = func(name string, args ...string) ([]byte, error) {
 		return newPlatformCommand(name, args...).CombinedOutput()
 	}
 )
 
-func buildDarwinPrivilegedCommand(isRoot bool, securityArgs ...string) (string, []string) {
+func buildDarwinPrivilegedCommand(isRoot bool, consoleUID string, securityArgs ...string) (string, []string, error) {
 	if isRoot {
-		return darwinSecurityPath, append([]string(nil), securityArgs...)
+		uid, err := strconv.Atoi(strings.TrimSpace(consoleUID))
+		if err != nil || uid <= 0 {
+			return "", nil, fmt.Errorf("no logged-in macOS console user is available for certificate authorization")
+		}
+		args := []string{"asuser", strconv.Itoa(uid), darwinSecurityPath}
+		args = append(args, securityArgs...)
+		return darwinLaunchctlPath, args, nil
 	}
 
 	args := []string{"-e", darwinPrivilegedScript, "--"}
 	args = append(args, securityArgs...)
-	return darwinOSAScriptPath, args
+	return darwinOSAScriptPath, args, nil
 }
 
 func runDarwinPrivilegedSecurity(securityArgs ...string) ([]byte, error) {
-	name, args := buildDarwinPrivilegedCommand(darwinEffectiveUID() == 0, securityArgs...)
+	isRoot := darwinEffectiveUID() == 0
+	consoleUID := ""
+	if isRoot {
+		var err error
+		consoleUID, err = darwinConsoleUserUID()
+		if err != nil {
+			return nil, err
+		}
+	}
+	name, args, err := buildDarwinPrivilegedCommand(isRoot, consoleUID, securityArgs...)
+	if err != nil {
+		return nil, err
+	}
 	return runDarwinCommand(name, args...)
 }
 
@@ -495,6 +515,47 @@ func detectDarwinTrustStatus(certBytes []byte) (string, bool, error) {
 	return "installed_not_trusted", false, nil
 }
 
+func deleteDarwinCertificateCopiesUntil(fingerprint string, targetCount int) error {
+	if targetCount < 0 {
+		targetCount = 0
+	}
+
+	for {
+		before, err := countDarwinKeychainFingerprintMatches(darwinSystemKeychainPath, fingerprint)
+		if err != nil {
+			return fmt.Errorf("inspect certificate copies before deletion: %w", err)
+		}
+		if before <= targetCount {
+			return nil
+		}
+
+		output, removeErr := runDarwinPrivilegedSecurity("delete-certificate", "-Z", fingerprint, "-t", darwinSystemKeychainPath)
+		after, inspectErr := countDarwinKeychainFingerprintMatches(darwinSystemKeychainPath, fingerprint)
+		if inspectErr != nil {
+			return errors.Join(removeErr, fmt.Errorf("verify certificate removal: %w", inspectErr))
+		}
+		if after <= targetCount {
+			return nil
+		}
+		if removeErr != nil {
+			return fmt.Errorf("security delete-certificate failed: %w, output: %s", removeErr, strings.TrimSpace(string(output)))
+		}
+		if after >= before {
+			return fmt.Errorf("security delete-certificate completed but %d matching certificate(s) remain", after)
+		}
+	}
+}
+
+func (d *DarwinInstaller) restoreInstallState(certType string, certBytes []byte, fingerprint string, beforeCount, afterCount int) error {
+	if afterCount <= beforeCount {
+		return nil
+	}
+	if beforeCount == 0 {
+		return d.Remove(certType, certBytes)
+	}
+	return deleteDarwinCertificateCopiesUntil(fingerprint, beforeCount)
+}
+
 // IsInstalled checks if certificate is installed in macOS System keychain
 func (d *DarwinInstaller) IsInstalled(certType string, certBytes []byte) (bool, error) {
 	matches, err := findDarwinInstalledKeychains(certBytes)
@@ -525,40 +586,65 @@ func (d *DarwinInstaller) Install(certType string, certPath string) error {
 	if !parsedCert.IsCA || parsedCert.KeyUsage&x509.KeyUsageCertSign == 0 {
 		return fmt.Errorf("certificate is not a certificate-signing CA")
 	}
-
-	logger.Debug(fmt.Sprintf("Installing certificate %s into macOS System keychain", certType))
-	output, err := runDarwinPrivilegedSecurity("add-trusted-cert", "-d", "-r", "trustRoot",
-		"-k", darwinSystemKeychainPath, absPath)
-	if err != nil {
-		outputText := strings.TrimSpace(string(output))
-		if strings.Contains(strings.ToLower(outputText), "canceled") || strings.Contains(outputText, "(-128)") {
-			logger.Warn("User canceled the certificate installation")
-			return fmt.Errorf("installation canceled by user")
-		}
-		return fmt.Errorf("security add-trusted-cert failed: %w, output: %s", err, outputText)
-	}
-
 	fingerprint, err := extractCertSHA256Fingerprint(certBytes)
 	if err != nil {
 		return err
 	}
-	count, err := countDarwinKeychainFingerprintMatches(darwinSystemKeychainPath, fingerprint)
+	beforeCount, err := countDarwinKeychainFingerprintMatches(darwinSystemKeychainPath, fingerprint)
 	if err != nil {
-		return fmt.Errorf("verify installed certificate fingerprint: %w", err)
+		return fmt.Errorf("inspect certificate before installation: %w", err)
 	}
-	if count == 0 {
-		return fmt.Errorf("certificate installation command completed but the exact certificate was not found in the System keychain")
-	}
-	trusted, err := verifyDarwinSystemTrust(certBytes)
-	if err != nil {
-		return fmt.Errorf("verify installed certificate trust: %w", err)
-	}
-	if !trusted {
-		return fmt.Errorf("certificate was added to the System keychain but is not trusted as a root CA")
+	if beforeCount > 0 {
+		alreadyTrusted, trustErr := verifyDarwinSystemTrust(certBytes)
+		if trustErr != nil {
+			return fmt.Errorf("inspect certificate trust before installation: %w", trustErr)
+		}
+		if alreadyTrusted {
+			logger.Info(fmt.Sprintf("Certificate %s is already installed and trusted in macOS System keychain (SHA-256: %s)", certType, fingerprint))
+			return nil
+		}
 	}
 
-	logger.Info(fmt.Sprintf("Certificate %s installed and trusted in macOS System keychain (SHA-256: %s)", certType, fingerprint))
-	return nil
+	logger.Debug(fmt.Sprintf("Installing certificate %s into macOS System keychain", certType))
+	output, installErr := runDarwinPrivilegedSecurity("add-trusted-cert", "-d", "-r", "trustRoot",
+		"-k", darwinSystemKeychainPath, absPath)
+	afterCount, countErr := countDarwinKeychainFingerprintMatches(darwinSystemKeychainPath, fingerprint)
+	if countErr != nil {
+		var commandErr error
+		if installErr != nil {
+			commandErr = fmt.Errorf("security add-trusted-cert failed: %w, output: %s", installErr, strings.TrimSpace(string(output)))
+		}
+		return errors.Join(commandErr, fmt.Errorf("verify installed certificate fingerprint: %w", countErr))
+	}
+	trusted := false
+	var trustErr error
+	if afterCount > 0 {
+		trusted, trustErr = verifyDarwinSystemTrust(certBytes)
+	}
+	if trustErr == nil && trusted {
+		if installErr != nil {
+			logger.Warn(fmt.Sprintf("security add-trusted-cert returned an error after establishing trust; accepting verified final state: %v", installErr))
+		}
+		logger.Info(fmt.Sprintf("Certificate %s installed and trusted in macOS System keychain (SHA-256: %s)", certType, fingerprint))
+		return nil
+	}
+
+	cleanupErr := d.restoreInstallState(certType, certBytes, fingerprint, beforeCount, afterCount)
+	if trustErr != nil {
+		return errors.Join(fmt.Errorf("verify installed certificate trust: %w", trustErr), cleanupErr)
+	}
+	if installErr != nil {
+		outputText := strings.TrimSpace(string(output))
+		if strings.Contains(strings.ToLower(outputText), "canceled") || strings.Contains(outputText, "(-128)") {
+			logger.Warn("User canceled the certificate installation")
+			return errors.Join(fmt.Errorf("installation canceled by user: %w", installErr), cleanupErr)
+		}
+		return errors.Join(fmt.Errorf("security add-trusted-cert failed: %w, output: %s", installErr, outputText), cleanupErr)
+	}
+	if afterCount == 0 {
+		return errors.Join(fmt.Errorf("certificate installation command completed but the exact certificate was not found in the System keychain"), cleanupErr)
+	}
+	return errors.Join(fmt.Errorf("certificate was added to the System keychain but is not trusted as a root CA"), cleanupErr)
 }
 
 // Remove deletes the exact certificate and its trust settings from the System keychain.
@@ -593,27 +679,10 @@ func (d *DarwinInstaller) Remove(certType string, certBytes []byte) error {
 	if trustErr != nil {
 		logger.Debug(fmt.Sprintf("remove-trusted-cert did not remove the certificate; deleting the exact keychain entry: %v, output: %s", trustErr, strings.TrimSpace(string(trustOutput))))
 	}
-	count = afterTrustRemoval
-
-	for remaining := count; remaining > 0; {
-		output, removeErr := runDarwinPrivilegedSecurity("delete-certificate", "-Z", fingerprint, "-t", darwinSystemKeychainPath)
-		after, inspectErr := countDarwinKeychainFingerprintMatches(darwinSystemKeychainPath, fingerprint)
-		if inspectErr != nil {
-			return fmt.Errorf("verify certificate removal: %w", inspectErr)
-		}
-		if after == 0 {
-			logger.Info(fmt.Sprintf("Certificate %s removed from macOS System keychain (SHA-256: %s)", certType, fingerprint))
-			return nil
-		}
-		if removeErr != nil {
-			return fmt.Errorf("security delete-certificate failed: %w, output: %s", removeErr, strings.TrimSpace(string(output)))
-		}
-		if after >= remaining {
-			return fmt.Errorf("security delete-certificate completed but %d matching certificate(s) remain", after)
-		}
-		remaining = after
+	if err := deleteDarwinCertificateCopiesUntil(fingerprint, 0); err != nil {
+		return err
 	}
-
+	logger.Info(fmt.Sprintf("Certificate %s removed from macOS System keychain (SHA-256: %s)", certType, fingerprint))
 	return nil
 }
 
@@ -687,6 +756,8 @@ var linuxCABundlePaths = []string{
 	"/etc/ssl/cert.pem",
 }
 
+var linuxLegacyCertDir = "/etc/ssl/certs"
+
 func resolveLinuxExecutable(name string) (string, bool) {
 	if strings.TrimSpace(name) == "" {
 		return "", false
@@ -752,7 +823,7 @@ func linuxKnownCertPaths(certType string) []string {
 		}
 	}
 	for _, name := range linuxCertFileNames(certType) {
-		paths = append(paths, filepath.Join("/etc/ssl/certs", name))
+		paths = append(paths, filepath.Join(linuxLegacyCertDir, name))
 	}
 	paths = append(paths, linuxUserCertPaths(certType)...)
 	return paths
@@ -848,7 +919,7 @@ func linuxCABundleContainsFingerprint(expectedFingerprint string) (bool, error) 
 	return false, nil
 }
 
-func runLinuxPrivilegedCommand(name string, args ...string) ([]byte, error) {
+var runLinuxPrivilegedCommand = func(name string, args ...string) ([]byte, error) {
 	resolvedName, ok := resolveLinuxExecutable(name)
 	if !ok {
 		return nil, fmt.Errorf("command %s not found", name)
@@ -939,6 +1010,44 @@ func removeLinuxSystemPath(path string) error {
 	return nil
 }
 
+func snapshotLinuxSystemCert(path string) ([]byte, bool, error) {
+	data, err := os.ReadFile(path)
+	if err == nil {
+		return data, true, nil
+	}
+	if errorsIsNotExist(err) {
+		return nil, false, nil
+	}
+	return nil, false, err
+}
+
+func restoreLinuxSystemCert(path string, previousData []byte, existed bool) error {
+	if existed {
+		return writeLinuxSystemCert(path, previousData)
+	}
+	return removeLinuxSystemPath(path)
+}
+
+type linuxRemovedSystemCert struct {
+	path string
+	data []byte
+}
+
+func restoreRemovedLinuxSystemCerts(removed []linuxRemovedSystemCert, updateCommands [][]string) error {
+	var restoreErrs []error
+	for _, item := range removed {
+		if err := writeLinuxSystemCert(item.path, item.data); err != nil {
+			restoreErrs = append(restoreErrs, fmt.Errorf("restore %s: %w", item.path, err))
+		}
+	}
+	if len(restoreErrs) == 0 && len(updateCommands) > 0 {
+		if err := runLinuxTrustUpdate(updateCommands); err != nil {
+			restoreErrs = append(restoreErrs, fmt.Errorf("refresh trust after restoring certificate files: %w", err))
+		}
+	}
+	return errors.Join(restoreErrs...)
+}
+
 func runLinuxTrustUpdate(commands [][]string) error {
 	seen := make(map[string]bool)
 	var errs []string
@@ -985,12 +1094,17 @@ func (l *LinuxInstaller) IsInstalled(certType string, certBytes []byte) (bool, e
 		logger.Debug(fmt.Sprintf("Certificate %s found in Linux CA bundle", certType))
 		return true, nil
 	}
+	var inspectErrs []string
+	if err != nil {
+		inspectErrs = append(inspectErrs, err.Error())
+	}
 
 	for _, path := range linuxKnownCertPaths(certType) {
 		matches, matchErr := certificateFileMatchesFingerprint(path, ourFingerprint)
 		if matchErr != nil {
 			if !errorsIsNotExist(matchErr) {
 				logger.Debug(fmt.Sprintf("Failed to inspect Linux certificate path %s: %v", path, matchErr))
+				inspectErrs = append(inspectErrs, fmt.Sprintf("%s: %v", path, matchErr))
 			}
 			continue
 		}
@@ -999,12 +1113,15 @@ func (l *LinuxInstaller) IsInstalled(certType string, certBytes []byte) (bool, e
 			return true, nil
 		}
 	}
+	if len(inspectErrs) > 0 {
+		return false, errors.New(strings.Join(inspectErrs, "; "))
+	}
 
 	logger.Debug(fmt.Sprintf("Certificate %s not found in Linux system", certType))
 	return false, nil
 }
 
-// Install attempts to install certificate to system or user CA directory
+// Install adds the certificate to a system trust anchor and verifies the CA bundle.
 func (l *LinuxInstaller) Install(certType string, certPath string) error {
 	logger.Debug(fmt.Sprintf("Installing certificate %s to Linux system", certType))
 
@@ -1015,8 +1132,17 @@ func (l *LinuxInstaller) Install(certType string, certPath string) error {
 	if _, parseErr := parseCertificateBytes(certData); parseErr != nil {
 		return parseErr
 	}
+	fingerprint, err := certificateSHA256Fingerprint(certData)
+	if err != nil {
+		return err
+	}
+	if trusted, trustErr := linuxCABundleContainsFingerprint(fingerprint); trustErr == nil && trusted {
+		logger.Info(fmt.Sprintf("Certificate %s is already trusted by the Linux CA bundle", certType))
+		return nil
+	}
 
 	var installErrs []string
+	var attempted bool
 	for _, anchor := range linuxTrustAnchors {
 		if len(anchor.UpdateCommand) == 0 {
 			continue
@@ -1024,50 +1150,48 @@ func (l *LinuxInstaller) Install(certType string, certPath string) error {
 		if _, ok := resolveLinuxExecutable(anchor.UpdateCommand[0]); !ok {
 			continue
 		}
+		attempted = true
 
 		targetPath := filepath.Join(anchor.Dir, linuxPrimaryCertFileName(certType))
 		logger.Debug(fmt.Sprintf("Attempting system-level installation to %s", targetPath))
+		previousData, existed, snapshotErr := snapshotLinuxSystemCert(targetPath)
+		if snapshotErr != nil {
+			installErrs = append(installErrs, fmt.Sprintf("snapshot %s: %v", targetPath, snapshotErr))
+			continue
+		}
 
 		if err := writeLinuxSystemCert(targetPath, certData); err != nil {
 			installErrs = append(installErrs, fmt.Sprintf("%s: %v", targetPath, err))
 			continue
 		}
 
-		if err := runLinuxTrustUpdate([][]string{anchor.UpdateCommand}); err != nil {
-			installErrs = append(installErrs, fmt.Sprintf("refresh trust after writing %s: %v", targetPath, err))
+		updateErr := runLinuxTrustUpdate([][]string{anchor.UpdateCommand})
+		trusted := false
+		var verifyErr error
+		if updateErr == nil {
+			trusted, verifyErr = linuxCABundleContainsFingerprint(fingerprint)
+		}
+		if updateErr != nil || verifyErr != nil || !trusted {
+			restoreErr := restoreLinuxSystemCert(targetPath, previousData, existed)
+			var restoreUpdateErr error
+			if restoreErr == nil {
+				restoreUpdateErr = runLinuxTrustUpdate([][]string{anchor.UpdateCommand})
+			}
+			failure := errors.Join(updateErr, verifyErr, restoreErr, restoreUpdateErr)
+			if failure == nil {
+				failure = fmt.Errorf("exact certificate fingerprint was not found in the Linux CA bundle after trust refresh")
+			}
+			installErrs = append(installErrs, fmt.Sprintf("install %s: %v", targetPath, failure))
 			continue
 		}
 
 		logger.Info(fmt.Sprintf("Certificate installed to Linux system trust anchor %s and CA certificates updated", targetPath))
 		return nil
 	}
-
-	logger.Info("System-level installation failed, attempting user-level installation")
-
-	// Attempt 2: User-level installation (no sudo needed)
-	homeDir, _ := os.UserHomeDir()
-	userCertDir := filepath.Join(homeDir, ".local/share/ca-certificates/custom")
-
-	if err := os.MkdirAll(userCertDir, 0700); err != nil {
-		logger.Error(fmt.Sprintf("Failed to create certificate directory: %v", err))
-		return fmt.Errorf("failed to create certificate directory: %w", err)
+	if !attempted {
+		return fmt.Errorf("no supported Linux system CA trust anchor found")
 	}
-
-	userCertPath := filepath.Join(userCertDir, linuxPrimaryCertFileName(certType))
-
-	if writeErr := os.WriteFile(userCertPath, certData, 0644); writeErr != nil {
-		if len(installErrs) > 0 {
-			return fmt.Errorf("system install failed (%s); user install failed: %w", strings.Join(installErrs, "; "), writeErr)
-		}
-		return fmt.Errorf("failed to write certificate file: %w", writeErr)
-	}
-
-	if len(installErrs) > 0 {
-		logger.Warn(fmt.Sprintf("Certificate installed only to user path after system install failed: %s", strings.Join(installErrs, "; ")))
-	}
-
-	logger.Debug(fmt.Sprintf("Certificate installed to Linux user certificate path at %s", userCertPath))
-	return nil
+	return fmt.Errorf("certificate was not installed into the Linux system trust store: %s", strings.Join(installErrs, "; "))
 }
 
 // Remove deletes certificate from system or user CA directory
@@ -1078,18 +1202,32 @@ func (l *LinuxInstaller) Remove(certType string, certBytes []byte) error {
 	}
 
 	logger.Debug(fmt.Sprintf("Removing certificate %s from Linux system", certType))
+	fingerprint, err := certificateSHA256Fingerprint(certBytes)
+	if err != nil {
+		return err
+	}
 
-	var removedAny bool
+	var removedSystem []linuxRemovedSystemCert
+	var removedUserAny bool
 	var removeErrs []string
 	var updateCommands [][]string
 
 	for _, anchor := range linuxTrustAnchors {
 		for _, name := range linuxCertFileNames(certType) {
 			path := filepath.Join(anchor.Dir, name)
-			if _, err := os.Stat(path); err != nil {
-				if !errorsIsNotExist(err) {
-					removeErrs = append(removeErrs, fmt.Sprintf("%s: %v", path, err))
+			matches, matchErr := certificateFileMatchesFingerprint(path, fingerprint)
+			if matchErr != nil {
+				if !errorsIsNotExist(matchErr) {
+					removeErrs = append(removeErrs, fmt.Sprintf("%s: %v", path, matchErr))
 				}
+				continue
+			}
+			if !matches {
+				continue
+			}
+			data, readErr := os.ReadFile(path)
+			if readErr != nil {
+				removeErrs = append(removeErrs, fmt.Sprintf("%s: %v", path, readErr))
 				continue
 			}
 
@@ -1098,52 +1236,75 @@ func (l *LinuxInstaller) Remove(certType string, certBytes []byte) error {
 				continue
 			}
 
-			removedAny = true
+			removedSystem = append(removedSystem, linuxRemovedSystemCert{path: path, data: data})
 			updateCommands = append(updateCommands, anchor.UpdateCommand)
 			logger.Debug(fmt.Sprintf("Certificate removed from Linux system certificate path: %s", path))
 		}
 	}
 
-	for _, path := range linuxUserCertPaths(certType) {
-		if err := os.Remove(path); err != nil {
-			if !errorsIsNotExist(err) {
-				removeErrs = append(removeErrs, fmt.Sprintf("%s: %v", path, err))
+	for _, name := range linuxCertFileNames(certType) {
+		legacyPath := filepath.Join(linuxLegacyCertDir, name)
+		matches, matchErr := certificateFileMatchesFingerprint(legacyPath, fingerprint)
+		if matchErr != nil {
+			if !errorsIsNotExist(matchErr) {
+				removeErrs = append(removeErrs, fmt.Sprintf("%s: %v", legacyPath, matchErr))
 			}
 			continue
 		}
-		removedAny = true
-		logger.Debug(fmt.Sprintf("Certificate removed from Linux user certificate path: %s", path))
-	}
-
-	for _, name := range linuxCertFileNames(certType) {
-		legacyPath := filepath.Join("/etc/ssl/certs", name)
-		if _, err := os.Stat(legacyPath); err != nil {
-			if !errorsIsNotExist(err) {
-				removeErrs = append(removeErrs, fmt.Sprintf("%s: %v", legacyPath, err))
-			}
+		if !matches {
+			continue
+		}
+		data, readErr := os.ReadFile(legacyPath)
+		if readErr != nil {
+			removeErrs = append(removeErrs, fmt.Sprintf("%s: %v", legacyPath, readErr))
 			continue
 		}
 		if err := removeLinuxSystemPath(legacyPath); err != nil {
 			removeErrs = append(removeErrs, err.Error())
 			continue
 		}
-		removedAny = true
+		removedSystem = append(removedSystem, linuxRemovedSystemCert{path: legacyPath, data: data})
 		updateCommands = append(updateCommands, []string{"update-ca-certificates"})
 		logger.Debug(fmt.Sprintf("Certificate removed from legacy Linux certificate path: %s", legacyPath))
 	}
 
-	if removedAny {
+	if len(removeErrs) > 0 {
+		restoreErr := restoreRemovedLinuxSystemCerts(removedSystem, updateCommands)
+		return errors.Join(errors.New(strings.Join(removeErrs, "; ")), restoreErr)
+	}
+	if len(removedSystem) > 0 {
 		if len(updateCommands) > 0 {
 			if err := runLinuxTrustUpdate(updateCommands); err != nil {
-				logger.Warn(fmt.Sprintf("Certificate removed, but failed to refresh Linux CA certificates: %v", err))
+				restoreErr := restoreRemovedLinuxSystemCerts(removedSystem, updateCommands)
+				return errors.Join(fmt.Errorf("certificate files were removed but Linux CA trust refresh failed: %w", err), restoreErr)
 			}
 		}
-		logger.Info("Certificate removal completed across available Linux certificate paths")
-		return nil
 	}
 
+	for _, path := range linuxUserCertPaths(certType) {
+		matches, matchErr := certificateFileMatchesFingerprint(path, fingerprint)
+		if matchErr != nil {
+			if !errorsIsNotExist(matchErr) {
+				removeErrs = append(removeErrs, fmt.Sprintf("%s: %v", path, matchErr))
+			}
+			continue
+		}
+		if !matches {
+			continue
+		}
+		if err := os.Remove(path); err != nil {
+			removeErrs = append(removeErrs, fmt.Sprintf("%s: %v", path, err))
+			continue
+		}
+		removedUserAny = true
+		logger.Debug(fmt.Sprintf("Certificate removed from Linux user certificate path: %s", path))
+	}
 	if len(removeErrs) > 0 {
 		return errors.New(strings.Join(removeErrs, "; "))
+	}
+	if len(removedSystem) > 0 || removedUserAny {
+		logger.Info("Certificate removal completed across available Linux certificate paths")
+		return nil
 	}
 
 	logger.Info(fmt.Sprintf("Certificate %s was not present in Linux system or user certificate paths", certType))
@@ -1192,13 +1353,19 @@ func (l *LinuxInstaller) IsTrusted(certType string, certBytes []byte) (bool, err
 // GetTrustStatus returns detailed trust status for Linux certificates
 func (l *LinuxInstaller) GetTrustStatus(certType string, certBytes []byte) (string, error) {
 	// Check if installed
-	installed, _ := l.IsInstalled(certType, certBytes)
+	installed, err := l.IsInstalled(certType, certBytes)
+	if err != nil {
+		return "unknown", err
+	}
 	if !installed {
 		return "not_found", nil
 	}
 
 	// Check if trusted
-	trusted, _ := l.IsTrusted(certType, certBytes)
+	trusted, err := l.IsTrusted(certType, certBytes)
+	if err != nil {
+		return "unknown", err
+	}
 	if trusted {
 		return "system_trusted", nil
 	}
@@ -1229,6 +1396,14 @@ func (w *WindowsInstaller) IsInstalled(certType string, certBytes []byte) (bool,
 // Install adds certificate to Windows certificate store
 func (w *WindowsInstaller) Install(certType string, certPath string) error {
 	logger.Debug(fmt.Sprintf("Installing certificate %s to Windows certificate store", certType))
+	certBytes, err := os.ReadFile(certPath)
+	if err != nil {
+		return fmt.Errorf("failed to read certificate file: %w", err)
+	}
+	thumbprint, err := extractCertThumbprint(certBytes)
+	if err != nil {
+		return fmt.Errorf("failed to extract certificate thumbprint: %w", err)
+	}
 
 	// Convert path to Windows format
 	certPath = strings.ReplaceAll(certPath, "/", "\\")
@@ -1245,18 +1420,23 @@ func (w *WindowsInstaller) Install(certType string, certPath string) error {
 
 	for _, target := range targets {
 		for _, strategy := range strategies {
-			output, err := strategy.run(target, certPath)
-			if err == nil {
-				logger.Debug(fmt.Sprintf("Certificate installed successfully to Windows certificate store %s via %s", target.PSPath, strategy.name))
+			output, installErr := strategy.run(target, certPath)
+			found, inspectErr := windowsStoreContainsThumbprint(target, thumbprint)
+			if inspectErr == nil && found {
+				if installErr != nil {
+					logger.Warn(fmt.Sprintf("Windows certificate command returned an error after the exact certificate appeared in %s via %s: %v", target.PSPath, strategy.name, installErr))
+				}
+				logger.Debug(fmt.Sprintf("Certificate installed and verified in Windows certificate store %s via %s", target.PSPath, strategy.name))
 				return nil
 			}
 
 			trimmedOutput := strings.TrimSpace(string(output))
-			logger.Warn(fmt.Sprintf("Failed to install certificate %s to %s via %s: %v, output: %s", certType, target.PSPath, strategy.name, err, trimmedOutput))
-			if trimmedOutput == "" {
-				trimmedOutput = err.Error()
+			failure := errors.Join(installErr, inspectErr)
+			if failure == nil {
+				failure = fmt.Errorf("command completed but the exact certificate was not found")
 			}
-			failures = append(failures, fmt.Sprintf("%s via %s: %s", target.PSPath, strategy.name, trimmedOutput))
+			logger.Warn(fmt.Sprintf("Failed to install certificate %s to %s via %s: %v, output: %s", certType, target.PSPath, strategy.name, failure, trimmedOutput))
+			failures = append(failures, fmt.Sprintf("%s via %s: %v, output: %s", target.PSPath, strategy.name, failure, trimmedOutput))
 		}
 	}
 
@@ -1265,59 +1445,41 @@ func (w *WindowsInstaller) Install(certType string, certPath string) error {
 
 // Remove deletes certificate from Windows certificate store
 func (w *WindowsInstaller) Remove(certType string, certBytes []byte) error {
-	thumbprint, thumbprintErr := extractCertThumbprint(certBytes)
-	commonName, commonNameErr := extractCertCommonName(certBytes)
-	if thumbprintErr != nil && commonNameErr != nil {
-		logger.Warn(fmt.Sprintf("Failed to extract certificate identity for removal, falling back to config CN: thumbprint=%v commonName=%v", thumbprintErr, commonNameErr))
-		config := cert.GetCertConfig(certType)
-		if config != nil {
-			commonName = config.CN
-			commonNameErr = nil
-		}
+	thumbprint, err := extractCertThumbprint(certBytes)
+	if err != nil {
+		return fmt.Errorf("failed to extract certificate thumbprint for removal: %w", err)
 	}
 
 	logger.Debug(fmt.Sprintf("Removing certificate %s from Windows certificate stores", certType))
 
-	removedAny := false
+	var removeErrs []string
 	for _, target := range getWindowsStoreTargets(certType) {
-		var body string
-		if thumbprintErr == nil {
-			body = fmt.Sprintf(`
+		body := fmt.Sprintf(`
     $matches = @($store.Certificates | Where-Object { $_.Thumbprint -eq '%s' })
     foreach ($match in $matches) {
         $store.Remove($match)
     }
     Write-Output $matches.Count
-`, escapePowerShellSingleQuoted(thumbprint))
-		} else if commonNameErr == nil {
-			body = fmt.Sprintf(`
-    $matches = @($store.Certificates | Where-Object { $_.Subject -like '*%s*' })
-    foreach ($match in $matches) {
-        $store.Remove($match)
-    }
-    Write-Output $matches.Count
-`, escapePowerShellSingleQuoted(commonName))
-		} else {
-			continue
-		}
+	`, escapePowerShellSingleQuoted(thumbprint))
 
 		output, err := runWindowsPowerShell(buildWindowsStoreScript(target, "ReadWrite", body))
 		if err != nil {
-			logger.Warn(fmt.Sprintf("Failed to remove certificate %s from %s: %v, output: %s", certType, target.PSPath, err, strings.TrimSpace(string(output))))
+			removeErrs = append(removeErrs, fmt.Sprintf("%s: %v, output: %s", target.PSPath, err, strings.TrimSpace(string(output))))
 			continue
 		}
-
-		if strings.TrimSpace(string(output)) != "0" {
-			removedAny = true
+		found, inspectErr := windowsStoreContainsThumbprint(target, thumbprint)
+		if inspectErr != nil {
+			removeErrs = append(removeErrs, inspectErr.Error())
+			continue
+		}
+		if found {
+			removeErrs = append(removeErrs, fmt.Sprintf("exact certificate remains in %s after removal", target.PSPath))
 		}
 	}
-
-	if removedAny {
-		logger.Info("Certificate removed successfully from Windows certificate store")
-		return nil
+	if len(removeErrs) > 0 {
+		return fmt.Errorf("certificate removal failed in one or more Windows stores: %s", strings.Join(removeErrs, "; "))
 	}
-
-	logger.Info("Certificate was not present in Windows certificate stores")
+	logger.Info("Certificate removal verified across Windows certificate stores")
 	return nil
 }
 
@@ -1361,7 +1523,10 @@ func (w *WindowsInstaller) IsTrusted(certType string, certBytes []byte) (bool, e
 // GetTrustStatus returns detailed trust status for Windows certificates
 func (w *WindowsInstaller) GetTrustStatus(certType string, certBytes []byte) (string, error) {
 	// Check if installed
-	installed, _ := w.IsInstalled(certType, certBytes)
+	installed, err := w.IsInstalled(certType, certBytes)
+	if err != nil {
+		return "unknown", err
+	}
 	if !installed {
 		return "not_found", nil
 	}

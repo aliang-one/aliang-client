@@ -32,6 +32,10 @@ type agentProjectFileCandidate struct {
 }
 
 func handleAgentDetailMessage(msg map[string]interface{}, writeJSON func(interface{}) error) {
+	handleAgentDetailMessageWithAI(msg, writeJSON, nil)
+}
+
+func handleAgentDetailMessageWithAI(msg map[string]interface{}, writeJSON func(interface{}) error, manager *agentAIManager) {
 	switch remoteString(msg, "type") {
 	case models.AgentEventProjectDetail:
 		_ = writeJSON(agentProjectDetailPayload(msg))
@@ -44,7 +48,7 @@ func handleAgentDetailMessage(msg map[string]interface{}, writeJSON func(interfa
 	case "file.working_tree_diff":
 		_ = writeJSON(agentWorkingTreeDiffPayload(msg))
 	case models.AgentEventSlashCommandsList:
-		_ = writeJSON(agentSlashCommandsListPayload(msg))
+		_ = writeJSON(agentSlashCommandsListPayloadWithManager(msg, manager))
 	}
 }
 

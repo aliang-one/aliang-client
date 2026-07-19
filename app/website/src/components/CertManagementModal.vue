@@ -421,11 +421,15 @@ async function apiCall(method, path, body) {
   const res = await fetch(`${API_BASE}${path}`, opts);
   if (!res.ok) {
     let msg = t('cert_requestFailed', { status: res.status });
+    let stage = '';
     try {
       const data = await res.json();
       msg = data?.data?.details?.error || data?.data?.error_msg || data?.msg || data?.message || msg;
+      stage = data?.data?.details?.stage || '';
     } catch (_) {}
-    throw new Error(msg);
+    const requestError = new Error(msg);
+    requestError.stage = stage;
+    throw requestError;
   }
   if (method === 'GET' && path.includes('/download')) return res;
   const json = await res.json();
@@ -665,6 +669,7 @@ async function startReinstall() {
   const steps = [
     { label: t('cert_stepRegenerate'), state: 'pending', message: '' },
     { label: t('cert_stepInstall'), state: 'pending', message: '' },
+    { label: t('cert_stepActivate'), state: 'pending', message: '' },
     { label: t('cert_stepRemoveOld'), state: 'pending', message: '' },
     { label: t('cert_stepVerify'), state: 'pending', message: '' }
   ];
@@ -692,30 +697,48 @@ async function startReinstall() {
     await apiCall('POST', '/cert/generate', { cert_type: CERT_TYPE });
     setStepState(steps, 0, 'done', t('cert_generateSuccess'));
     setStepState(steps, 1, 'done', t('cert_installSuccess2'));
-    setStepState(steps, 2, 'done', t('cert_removedOrNotExist'));
+    setStepState(steps, 2, 'done', t('cert_activateSuccess'));
+    setStepState(steps, 3, 'done', t('cert_removedOrNotExist'));
   } catch (err) {
-    setStepState(steps, 0, 'error', err.message);
+    const failures = {
+      generate: { index: 0, message: t('cert_generateCertFailed') },
+      install: { index: 1, message: t('cert_installCertFailed') },
+      activate: { index: 2, message: t('cert_activateCertFailed') },
+      remove: { index: 3, message: t('cert_removeFailed') },
+      verify: { index: 4, message: t('cert_verifyFailed') }
+    };
+    const failure = failures[err.stage] || failures.generate;
+    const completedMessages = [
+      t('cert_generateSuccess'),
+      t('cert_installSuccess2'),
+      t('cert_activateSuccess'),
+      t('cert_removedOrNotExist')
+    ];
+    for (let index = 0; index < failure.index; index += 1) {
+      setStepState(steps, index, 'done', completedMessages[index] || '');
+    }
+    setStepState(steps, failure.index, 'error', err.message);
     finalStatus.success = false;
-    finishReinstall(steps, false, t('cert_generateCertFailed'));
+    finishReinstall(steps, false, failure.message);
     return;
   }
 
   // Verify the exact active certificate is both present and trusted.
-  setStepState(steps, 3, 'running', t('cert_verifying'));
+  setStepState(steps, 4, 'running', t('cert_verifying'));
   try {
     const status = await apiCall('GET', `/cert/status?cert_type=${encodeURIComponent(CERT_TYPE)}`);
     certStatus.value = status;
     invalidateCache();
     updateRefreshed();
     if (status.is_installed && status.is_trusted) {
-      setStepState(steps, 3, 'done', t('cert_installedAndTrusted'));
+      setStepState(steps, 4, 'done', t('cert_installedAndTrusted'));
       finishReinstall(steps, true, t('cert_success'));
     } else {
-      setStepState(steps, 3, 'error', t('cert_installedNotDetected'));
+      setStepState(steps, 4, 'error', t('cert_installedNotDetected'));
       finishReinstall(steps, false, t('cert_verifyFailed'));
     }
   } catch (err) {
-    setStepState(steps, 3, 'error', err.message);
+    setStepState(steps, 4, 'error', err.message);
     finishReinstall(steps, false, t('cert_verifyFailed') + ': ' + err.message);
   }
 }

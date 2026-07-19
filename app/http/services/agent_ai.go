@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -232,6 +233,8 @@ type agentAISession struct {
 	history       []agentAIMessage
 	pendingOption *agentAIOptionRequest // run 结束检测到方案块时置位，等 ai.option.response
 	codexSteer    *agentAICodexSteerControl
+	claudePolicy  agentAIClaudeRemotePolicy
+	claudeCaps    agentAIClaudeCapabilities
 }
 
 type agentAISteerMessage struct {
@@ -291,6 +294,8 @@ type agentAIRun struct {
 	cancel                  context.CancelFunc
 	approvalToken           string
 	activity                *agentAIActivity
+	claudePolicy            agentAIClaudeRemotePolicy
+	onClaudeInit            func([]string, string)
 	// Policy context for an escalated approval: which rule triggered it and the
 	// policy version that decided. Set by the approval hooks before escalation.
 	matchedRuleID string
@@ -512,6 +517,124 @@ const (
 	claudeApprovalHookPreToolUseCommand     claudeApprovalHookStrategy = "pretool_command"
 	claudeApprovalHookPermissionRequestHTTP claudeApprovalHookStrategy = "permission_request_http"
 )
+
+type agentAIClaudeRemotePolicy struct {
+	enabled                 bool
+	requireInitVerification bool
+	projectSkillTrusted     bool
+	projectCapabilityMode   string
+	settingSources          []string
+	disableSkillShell       bool
+	permissionAsk           []string
+}
+
+type agentAIClaudeCapabilities struct {
+	verified    bool
+	projectPath string
+	version     string
+	generation  string
+	commands    map[string]struct{}
+}
+
+func parseAgentAIClaudeRemotePolicy(msg map[string]interface{}) agentAIClaudeRemotePolicy {
+	raw, ok := msg["claude_remote_policy"].(map[string]interface{})
+	if !ok || raw == nil {
+		return agentAIClaudeRemotePolicy{}
+	}
+	policy := agentAIClaudeRemotePolicy{
+		enabled:                 true,
+		requireInitVerification: remoteBool(raw, "require_system_init_verification", true),
+		projectSkillTrusted:     remoteBool(raw, "project_skill_trusted", false),
+		projectCapabilityMode:   remoteString(raw, "project_capability_mode"),
+		settingSources:          remoteStringSlice(raw, "setting_sources"),
+	}
+	if policy.projectCapabilityMode != "sanitized_plugin" {
+		policy.projectCapabilityMode = "disabled"
+	}
+	// Remote mode never reads project/local settings directly. Trusted project
+	// capabilities are loaded separately through a sanitized temporary plugin.
+	policy.settingSources = []string{"user"}
+	if settings, ok := raw["settings"].(map[string]interface{}); ok {
+		policy.disableSkillShell = remoteBool(settings, "disableSkillShellExecution", true)
+		if permissions, ok := settings["permissions"].(map[string]interface{}); ok {
+			policy.permissionAsk = remoteStringSlice(permissions, "ask")
+		}
+	}
+	if len(policy.permissionAsk) == 0 {
+		policy.permissionAsk = []string{"Bash", "Edit", "Write", "NotebookEdit", "mcp__*"}
+	}
+	return policy
+}
+
+func cloneAgentAIClaudeRemotePolicy(policy agentAIClaudeRemotePolicy) agentAIClaudeRemotePolicy {
+	policy.settingSources = append([]string(nil), policy.settingSources...)
+	policy.permissionAsk = append([]string(nil), policy.permissionAsk...)
+	return policy
+}
+
+func normalizeClaudeCapabilityName(name string) string {
+	return strings.TrimPrefix(strings.TrimSpace(name), "/")
+}
+
+func claudeCapabilityProjectPath(path string) string {
+	path = cleanAgentProjectPath(path)
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		return filepath.Clean(resolved)
+	}
+	return path
+}
+
+func (m *agentAIManager) recordClaudeCapabilities(sessionID, projectPath string, names []string, version string) {
+	if m == nil || strings.TrimSpace(sessionID) == "" {
+		return
+	}
+	commands := make(map[string]struct{}, len(names))
+	ordered := make([]string, 0, len(names))
+	for _, name := range names {
+		name = normalizeClaudeCapabilityName(name)
+		if name == "" {
+			continue
+		}
+		if _, exists := commands[name]; exists {
+			continue
+		}
+		commands[name] = struct{}{}
+		ordered = append(ordered, name)
+	}
+	sort.Strings(ordered)
+	digest := sha256.Sum256([]byte(strings.Join(append([]string{strings.TrimSpace(version)}, ordered...), "\x00")))
+	caps := agentAIClaudeCapabilities{
+		verified:    true,
+		projectPath: claudeCapabilityProjectPath(projectPath),
+		version:     strings.TrimSpace(version),
+		generation:  hex.EncodeToString(digest[:8]),
+		commands:    commands,
+	}
+	m.mu.Lock()
+	if session := m.sessions[sessionID]; session != nil && claudeCapabilityProjectPath(session.projectPath) == caps.projectPath {
+		session.claudeCaps = caps
+	}
+	m.mu.Unlock()
+}
+
+func (m *agentAIManager) claudeCapabilities(sessionID, projectPath string) (agentAIClaudeCapabilities, bool) {
+	if m == nil || strings.TrimSpace(sessionID) == "" {
+		return agentAIClaudeCapabilities{}, false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	session := m.sessions[sessionID]
+	if session == nil || !session.claudeCaps.verified ||
+		claudeCapabilityProjectPath(projectPath) != session.claudeCaps.projectPath {
+		return agentAIClaudeCapabilities{}, false
+	}
+	caps := session.claudeCaps
+	caps.commands = make(map[string]struct{}, len(session.claudeCaps.commands))
+	for name := range session.claudeCaps.commands {
+		caps.commands[name] = struct{}{}
+	}
+	return caps, true
+}
 
 var claudeCodeVersionRe = regexp.MustCompile(`\b(\d+)\.(\d+)\.(\d+)\b`)
 
@@ -854,6 +977,7 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 	reservedNativeSessionID := strings.TrimSpace(remoteString(msg, "reserved_native_session_id"))
 	bindingVersion := remoteInt(msg, "binding_version", 0)
 	initialContext := strings.TrimSpace(remoteString(msg, "initial_context"))
+	claudePolicy := parseAgentAIClaudeRemotePolicy(msg)
 	history := remoteAgentAIHistory(msg)
 	if initialContext != "" {
 		history = append([]agentAIMessage{{
@@ -875,6 +999,10 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 		existing.reservedNativeSessionID = reservedNativeSessionID
 		existing.bindingVersion = bindingVersion
 		existing.initialContext = initialContext
+		if claudePolicy.enabled {
+			existing.claudePolicy = cloneAgentAIClaudeRemotePolicy(claudePolicy)
+			existing.claudeCaps = agentAIClaudeCapabilities{}
+		}
 		if len(history) > 0 {
 			existing.history = trimAgentAIHistory(history)
 		}
@@ -897,6 +1025,7 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 		reservedNativeSessionID: reservedNativeSessionID,
 		bindingVersion:          bindingVersion,
 		initialContext:          initialContext,
+		claudePolicy:            cloneAgentAIClaudeRemotePolicy(claudePolicy),
 		history:                 trimAgentAIHistory(history),
 		lastActiveAt:            time.Now().UTC(),
 	}
@@ -988,6 +1117,7 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 			resumeSessionID:         firstNonEmpty(remoteString(msg, "resume_session_id"), remoteString(msg, "source_session_id")),
 			reservedNativeSessionID: strings.TrimSpace(remoteString(msg, "reserved_native_session_id")),
 			bindingVersion:          remoteInt(msg, "binding_version", 0),
+			claudePolicy:            cloneAgentAIClaudeRemotePolicy(parseAgentAIClaudeRemotePolicy(msg)),
 			lastActiveAt:            time.Now().UTC(),
 		}
 		m.mu.Lock()
@@ -999,6 +1129,10 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 		m.mu.Unlock()
 	}
 	m.mu.Lock()
+	if policy := parseAgentAIClaudeRemotePolicy(msg); policy.enabled {
+		session.claudePolicy = cloneAgentAIClaudeRemotePolicy(policy)
+		session.claudeCaps = agentAIClaudeCapabilities{}
+	}
 	session.lastActiveAt = time.Now().UTC() // LRU recency: this conversation is active
 	if session.cancel != nil {
 		m.mu.Unlock()
@@ -1097,6 +1231,10 @@ func (m *agentAIManager) runStart(msg map[string]interface{}, writeJSON agentTer
 		session.resumeSessionID = resumeID
 		session.reservedNativeSessionID = reservedID
 		session.bindingVersion = remoteInt(msg, "binding_version", session.bindingVersion)
+		if policy := parseAgentAIClaudeRemotePolicy(msg); policy.enabled {
+			session.claudePolicy = cloneAgentAIClaudeRemotePolicy(policy)
+			session.claudeCaps = agentAIClaudeCapabilities{}
+		}
 	}
 	m.mu.Unlock()
 
@@ -1656,6 +1794,10 @@ func (m *agentAIManager) runUserMessage(session *agentAISession, runID, messageI
 		cancel:                  cancel,
 		approvalToken:           approvalToken,
 		activity:                activity,
+		claudePolicy:            cloneAgentAIClaudeRemotePolicy(session.claudePolicy),
+	}
+	run.onClaudeInit = func(commands []string, version string) {
+		m.recordClaudeCapabilities(run.sessionID, run.projectPath, commands, version)
 	}
 	m.mu.Unlock()
 
@@ -3951,7 +4093,15 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 		return agentAIRunDone
 	}
 	tool = withAgentAIAttachments(tool, run.attachments)
+	cleanupClaudePolicy := func() {}
 	if tool.outputFormat == agentAIOutputClaudeStreamJSON {
+		var policyErr error
+		tool, cleanupClaudePolicy, policyErr = withClaudeRemotePolicy(tool, run)
+		if policyErr != nil {
+			_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, policyErr))
+			return agentAIRunDone
+		}
+		defer cleanupClaudePolicy()
 		tool = withClaudeApprovalHook(tool, run)
 	}
 
@@ -4281,6 +4431,15 @@ func streamStructuredAIDelta(reader io.Reader, format agentAIOutputFormat, run a
 					onSessionID[0](sid)
 				}
 			}
+		}
+		if format == agentAIOutputClaudeStreamJSON &&
+			remoteString(event, "type") == "system" &&
+			remoteString(event, "subtype") == "init" &&
+			run.onClaudeInit != nil {
+			run.onClaudeInit(
+				remoteStringSlice(event, "slash_commands"),
+				firstNonEmpty(remoteString(event, "claude_code_version"), remoteString(event, "version")),
+			)
 		}
 		if format == agentAIOutputOpenCodeJSON && resumeSessionID != nil && *resumeSessionID == "" {
 			if sid := openCodeSessionID(event); sid != "" {
@@ -5654,9 +5813,10 @@ func detectClaudeApprovalHookStrategy(toolPath string) claudeApprovalHookStrateg
 
 func claudeApprovalHookSettings(strategy claudeApprovalHookStrategy, run agentAIRun) (map[string]interface{}, error) {
 	hookURL := agentAIApprovalHookURL(run.sessionID, agentAssistantMessageID(run.messageID), run.approvalToken)
+	var settings map[string]interface{}
 	switch strategy {
 	case claudeApprovalHookPermissionRequestHTTP:
-		return map[string]interface{}{
+		settings = map[string]interface{}{
 			"hooks": map[string]interface{}{
 				"PermissionRequest": []interface{}{
 					map[string]interface{}{
@@ -5671,9 +5831,9 @@ func claudeApprovalHookSettings(strategy claudeApprovalHookStrategy, run agentAI
 					},
 				},
 			},
-		}, nil
+		}
 	default:
-		return map[string]interface{}{
+		settings = map[string]interface{}{
 			"hooks": map[string]interface{}{
 				"PreToolUse": []interface{}{
 					map[string]interface{}{
@@ -5688,8 +5848,15 @@ func claudeApprovalHookSettings(strategy claudeApprovalHookStrategy, run agentAI
 					},
 				},
 			},
-		}, nil
+		}
 	}
+	if run.claudePolicy.enabled {
+		settings["disableSkillShellExecution"] = true
+		settings["permissions"] = map[string]interface{}{
+			"ask": append([]string(nil), run.claudePolicy.permissionAsk...),
+		}
+	}
+	return settings, nil
 }
 
 func claudeApprovalHookCurlCommand(hookURL string) string {

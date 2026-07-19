@@ -167,12 +167,12 @@ func TestScanCommandMarkdownsNamespacing(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	entries := scanCommandMarkdowns(root, "user", "plugin", root, "plugin-dev:", "claude")
+	entries := scanCommandMarkdowns(root, "plugin", "plugin", root, "plugin-dev:", "claude")
 	names := map[string]bool{}
 	for _, e := range entries {
 		names[e["name"].(string)] = true
-		if e["origin"] != "plugin" || e["scope"] != "user" {
-			t.Errorf("expected plugin/user, got scope=%v origin=%v", e["scope"], e["origin"])
+		if e["origin"] != "plugin" || e["scope"] != "plugin" {
+			t.Errorf("expected plugin/plugin, got scope=%v origin=%v", e["scope"], e["origin"])
 		}
 		if e["provider"] != "claude" {
 			t.Errorf("expected claude provider tag, got %v", e["provider"])

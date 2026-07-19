@@ -1,5 +1,3 @@
-//go:build windows
-
 package installer
 
 import (
@@ -10,7 +8,10 @@ import (
 	"crypto/x509/pkix"
 	"encoding/hex"
 	"encoding/pem"
+	"errors"
 	"math/big"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -50,24 +51,18 @@ func TestGetWindowsStoreTargetsPrefersLocalMachineInDaemonMode(t *testing.T) {
 	t.Setenv("ALIANG_SOCKET_PATH", `\\.\pipe\aliang-core`)
 
 	rootTargets := getWindowsStoreTargets(cert_config.CertTypeMitmCA)
-	if rootTargets[0].PSPath != "Cert:\\LocalMachine\\Root" {
-		t.Fatalf("unexpected primary root store in daemon mode: %s", rootTargets[0].PSPath)
-	}
-	if rootTargets[1].PSPath != "Cert:\\CurrentUser\\Root" {
-		t.Fatalf("unexpected fallback root store in daemon mode: %s", rootTargets[1].PSPath)
+	if len(rootTargets) != 1 || rootTargets[0].PSPath != "Cert:\\LocalMachine\\Root" {
+		t.Fatalf("unexpected root stores in daemon mode: %#v", rootTargets)
 	}
 
 	mtlsTargets := getWindowsStoreTargets(cert_config.CertTypeMtlsClient)
-	if mtlsTargets[0].PSPath != "Cert:\\LocalMachine\\My" {
-		t.Fatalf("unexpected primary mTLS store in daemon mode: %s", mtlsTargets[0].PSPath)
-	}
-	if mtlsTargets[1].PSPath != "Cert:\\CurrentUser\\My" {
-		t.Fatalf("unexpected fallback mTLS store in daemon mode: %s", mtlsTargets[1].PSPath)
+	if len(mtlsTargets) != 1 || mtlsTargets[0].PSPath != "Cert:\\LocalMachine\\My" {
+		t.Fatalf("unexpected mTLS stores in daemon mode: %#v", mtlsTargets)
 	}
 }
 
 func TestExtractCertThumbprint(t *testing.T) {
-	pemBytes, rawBytes := mustCreateTestCertificate(t)
+	pemBytes, rawBytes := mustCreateWindowsTestCertificate(t)
 
 	got, err := extractCertThumbprint(pemBytes)
 	if err != nil {
@@ -101,7 +96,80 @@ func TestWindowsInstallerIsTrustedReturnsFalseForMtls(t *testing.T) {
 	}
 }
 
-func mustCreateTestCertificate(t *testing.T) ([]byte, []byte) {
+func TestWindowsInstallRequiresExactCertificatePostcondition(t *testing.T) {
+	certPEM, _ := mustCreateWindowsTestCertificate(t)
+	certPath := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(certPath, certPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	restoreWindowsTestHooks(t)
+	runWindowsPowerShell = func(string) ([]byte, error) { return nil, nil }
+	runWindowsCommand = func(string, ...string) ([]byte, error) { return nil, nil }
+
+	if err := (&WindowsInstaller{}).Install(cert_config.CertTypeMitmCA, certPath); err == nil {
+		t.Fatal("expected install failure when commands succeed without adding the exact certificate")
+	}
+}
+
+func TestWindowsInstallAcceptsVerifiedFinalStateAfterCommandError(t *testing.T) {
+	certPEM, _ := mustCreateWindowsTestCertificate(t)
+	certPath := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(certPath, certPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	restoreWindowsTestHooks(t)
+	runWindowsPowerShell = func(script string) ([]byte, error) {
+		if strings.Contains(script, "::ReadOnly") {
+			return []byte("FOUND\n"), nil
+		}
+		return []byte("command reported failure"), errors.New("exit status 1")
+	}
+
+	if err := (&WindowsInstaller{}).Install(cert_config.CertTypeMitmCA, certPath); err != nil {
+		t.Fatalf("Install() must accept verified Root-store state: %v", err)
+	}
+}
+
+func TestWindowsRemoveDoesNotSwallowStoreErrors(t *testing.T) {
+	certPEM, _ := mustCreateWindowsTestCertificate(t)
+	restoreWindowsTestHooks(t)
+	runWindowsPowerShell = func(string) ([]byte, error) {
+		return []byte("access denied"), errors.New("exit status 1")
+	}
+
+	if err := (&WindowsInstaller{}).Remove(cert_config.CertTypeMitmCA, certPEM); err == nil {
+		t.Fatal("expected Windows store removal error")
+	}
+}
+
+func TestWindowsInstalledStatusDoesNotTurnInspectionErrorsIntoNotFound(t *testing.T) {
+	certPEM, _ := mustCreateWindowsTestCertificate(t)
+	restoreWindowsTestHooks(t)
+	runWindowsPowerShell = func(string) ([]byte, error) {
+		return []byte("access denied"), errors.New("exit status 1")
+	}
+
+	if _, err := (&WindowsInstaller{}).IsInstalled(cert_config.CertTypeMitmCA, certPEM); err == nil {
+		t.Fatal("expected Windows store inspection error")
+	}
+	if status, err := (&WindowsInstaller{}).GetTrustStatus(cert_config.CertTypeMitmCA, certPEM); err == nil || status != "unknown" {
+		t.Fatalf("status=%q error=%v, want unknown with error", status, err)
+	}
+}
+
+func restoreWindowsTestHooks(t *testing.T) {
+	t.Helper()
+	originalPowerShell := runWindowsPowerShell
+	originalCommand := runWindowsCommand
+	t.Cleanup(func() {
+		runWindowsPowerShell = originalPowerShell
+		runWindowsCommand = originalCommand
+	})
+	t.Setenv("ALIANG_DATA_DIR", "")
+	t.Setenv("ALIANG_SOCKET_PATH", "")
+}
+
+func mustCreateWindowsTestCertificate(t *testing.T) ([]byte, []byte) {
 	t.Helper()
 
 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)

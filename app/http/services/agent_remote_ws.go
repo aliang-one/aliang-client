@@ -391,7 +391,7 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 		s.applyRemoteProjectSettings(msg)
 	case models.AgentEventProjectDetail, models.AgentEventAISessionDetail, models.AgentEventFileList, models.AgentEventFileRead, models.AgentEventSlashCommandsList, "file.working_tree_diff":
 		s.setRemoteConnectionState(true, "online", "")
-		go handleAgentDetailMessage(msg, writeJSON)
+		go handleAgentDetailMessageWithAI(msg, writeJSON, s.ai)
 	case models.AgentEventGitStatus, models.AgentEventEnvInfo:
 		s.setRemoteConnectionState(true, "online", "")
 		go handleAgentEnvToolsMessage(msg, writeJSON)
@@ -547,7 +547,7 @@ func (s *AgentService) DispatchLocalAI(msg map[string]interface{}, writeJSON fun
 		// Slash-command discovery shares the local chat socket so the web UI can
 		// offer `/` completion. It routes through the same detail handler as the
 		// remote link and is provider-aware (claude vs codex).
-		handleAgentDetailMessage(msg, writeJSON)
+		handleAgentDetailMessageWithAI(msg, writeJSON, s.ai)
 	default:
 		_ = writeJSON(map[string]interface{}{
 			"type":  models.AgentEventAIError,
