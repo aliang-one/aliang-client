@@ -15,19 +15,14 @@ import (
 // connection action. Pure (unit-tested).
 //
 //   - active                       -> reconnect (ensure WS up; idempotent)
-//   - hard_invalid + logout        -> disable  (drop device_token + WS)
-//   - hard_invalid (expiry/timeout/revoke) -> none (keep device_token per v1.0.95;
-//     WS drops naturally, reconnects on next active)
+//   - hard_invalid (any reason)    -> disable  (drop JWT context + WS)
 //   - soft_expired / unauthenticated -> none (recovery / idle handled elsewhere)
 func sessionEventAgentAction(to, reason string) string {
 	switch strings.ToLower(strings.TrimSpace(to)) {
 	case "active":
 		return "reconnect"
 	case "hard_invalid":
-		if strings.ToLower(strings.TrimSpace(reason)) == "logout" {
-			return "disable"
-		}
-		return "none"
+		return "disable"
 	default:
 		return "none"
 	}

@@ -177,7 +177,7 @@ func RestoreSession() (*UserInfo, error) {
 	if refreshErr == nil {
 		return refreshedInfo, nil
 	}
-	if errors.Is(refreshErr, ErrRefreshTokenInvalid) {
+	if isTerminalSessionError(refreshErr) {
 		return nil, refreshErr
 	}
 
@@ -210,6 +210,10 @@ func RestoreSession() (*UserInfo, error) {
 	config.SetHasLocalUserInfo(true)
 
 	return latestProfile, nil
+}
+
+func isTerminalSessionError(err error) bool {
+	return errors.Is(err, ErrRefreshTokenInvalid) || errors.Is(err, ErrSessionExpired)
 }
 
 func RefreshSession(refreshToken string) (*UserInfo, error) {
@@ -317,6 +321,11 @@ func RefreshSession(refreshToken string) (*UserInfo, error) {
 
 	profile, err := GetUserProfileWithToken(response.Data.AccessToken)
 	if err != nil {
+		var profileAPIError *authenticatedAPIError
+		if errors.As(err, &profileAPIError) && profileAPIError.StatusCode == http.StatusUnauthorized {
+			clearLocalSessionAfterExpiration("refreshed access token rejected by profile endpoint")
+			return nil, fmt.Errorf("refreshed session rejected: %w", ErrSessionExpired)
+		}
 		logger.Warn(fmt.Sprintf("Profile sync after refresh failed, keeping last known user profile: %v", err))
 	} else {
 		applyUserProfileToUserInfo(userInfo, profile)

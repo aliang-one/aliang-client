@@ -164,13 +164,14 @@ const agentPolicySyncThrottle = 60 * time.Second
 func (s *AgentService) ensurePolicyBeforeRun(ctx context.Context, projectPath string) {
 	key := normalizePolicyPath(projectPath)
 	s.mu.Lock()
-	token := strings.TrimSpace(s.state.DeviceToken)
+	authHeader := strings.TrimSpace(s.effectiveUserAuthorizationLocked(""))
+	registered := s.state.Registered
 	var last time.Time
 	if s.policyLastCheckAtPath != nil {
 		last = s.policyLastCheckAtPath[key]
 	}
 	s.mu.Unlock()
-	if token == "" {
+	if authHeader == "" || !registered {
 		return
 	}
 	if !last.IsZero() && time.Since(last) < agentPolicySyncThrottle {
@@ -241,16 +242,18 @@ func (s *AgentService) resetPolicySyncThrottleLocked(key string) {
 	delete(s.policyLastCheckAtPath, key)
 }
 
-// doAgentServerGET issues an authenticated GET to an agent-server endpoint using
-// the device token, honoring the request context (callers pass a short timeout).
+// doAgentServerGET issues a user-JWT-authenticated GET scoped to this device_id.
 func (s *AgentService) doAgentServerGET(ctx context.Context, endpoint string) ([]byte, error) {
-	deviceToken := strings.TrimSpace(s.state.DeviceToken)
-	if deviceToken == "" {
-		return nil, errors.New("device token is empty")
+	s.mu.Lock()
+	authHeader := strings.TrimSpace(s.effectiveUserAuthorizationLocked(""))
+	deviceID := strings.TrimSpace(s.state.DeviceID)
+	registered := s.state.Registered
+	s.mu.Unlock()
+	if authHeader == "" {
+		return nil, errors.New("user authorization is empty")
 	}
-	authHeader := deviceToken
-	if !strings.HasPrefix(strings.ToLower(authHeader), "bearer ") {
-		authHeader = "Bearer " + authHeader
+	if deviceID == "" || !registered {
+		return nil, errors.New("device is not registered")
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
@@ -258,6 +261,7 @@ func (s *AgentService) doAgentServerGET(ctx context.Context, endpoint string) ([
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Authorization", authHeader)
+	req.Header.Set("X-Aliang-Device-ID", deviceID)
 	resp, err := s.client.Do(req)
 	if err != nil {
 		return nil, err

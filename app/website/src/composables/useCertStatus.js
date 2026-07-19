@@ -1,4 +1,6 @@
 import { ref } from 'vue';
+import { handleAuthenticationFailure } from '../services/authFailure';
+import { syncUnauthenticatedAuthState } from '../stores/auth';
 
 const API_BASE = '/api';
 const CERT_TYPE = 'mitm-ca';
@@ -52,11 +54,12 @@ async function fetchStatus() {
 
   try {
     const res = await fetch(`${API_BASE}/cert/status?cert_type=${encodeURIComponent(CERT_TYPE)}`);
+    const payload = await res.json().catch(() => ({}));
+    handleAuthenticationFailure(res.status, payload, syncUnauthenticatedAuthState);
     if (!res.ok) {
-      const data = await res.json().catch(() => null);
-      throw new Error(data?.data?.error_msg || data?.msg || data?.message || `HTTP ${res.status}`);
+      throw new Error(payload?.data?.error_msg || payload?.msg || payload?.message || `HTTP ${res.status}`);
     }
-    const data = (await res.json()).data || {};
+    const data = payload.data || {};
     const key = statusKey(data);
     if (key !== lastKey) {
       lastKey = key;

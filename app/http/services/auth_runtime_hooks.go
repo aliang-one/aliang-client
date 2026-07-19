@@ -18,6 +18,7 @@ var (
 	// softExpiryRecoveryStarter begins the SoftExpired recovery loop. Injectable
 	// for tests. Defaults to auth.StartSoftExpiryRecovery.
 	softExpiryRecoveryStarter = auth.StartSoftExpiryRecovery
+	userAgentDisableRequester = RequestUserAgentDisableForSessionEnd
 	// proxyPausedForSoftExpiry records that WE paused the ingress proxy on
 	// entering SoftExpired, so →Active resumes only what we paused (not a proxy
 	// the user never started).
@@ -31,8 +32,8 @@ var (
 //     token — closes 缺口 B) and start the bounded recovery coordinator.
 //   - →Active: mark the session ready; if we paused the proxy for SoftExpired,
 //     resume it.
-//   - →HardInvalid: stop the proxy and clear UI state. User logout uses the same
-//     teardown without the "认证已过期" desktop notification.
+//   - →HardInvalid: stop the proxy, disable Agent, and clear UI state. User logout
+//     uses the same teardown without the "认证已过期" desktop notification.
 func onSessionEvent(e auth.SessionEvent) {
 	switch e.To {
 	case auth.StateSoftExpired:
@@ -56,7 +57,7 @@ func onSessionEvent(e auth.SessionEvent) {
 			handleLoggedOut()
 			return
 		}
-		handleAuthExpired()
+		handleAuthExpired(e.Reason)
 	}
 }
 
@@ -69,24 +70,18 @@ func handleLoggedOut() {
 	}
 }
 
-func handleAuthExpired() {
+func handleAuthExpired(reason auth.SessionReason) {
 	startupState := runtime.GetStartupState()
 	startupState.SetFetchSuccess(false)
 	startupState.SetStatus(runtime.UNCONFIGURED)
-	// A user-session expiry is intentionally NOT a device deregistration. The
-	// device_token is a per-device credential independent of the user JWT, so we
-	// keep the registration intact and let the remote link drop on its own
-	// (PhoneServer closes the WS when the user_token expires; the child then
-	// reports connection_state=disconnected while registration_state stays
-	// registered). The link is re-established when the session is restored — see
-	// handleAuthRefreshed → RequestUserAgentEnsureConnection.
-	//
-	// Previously this called RequestUserAgentDisableAfterLogout("auth_expired"),
-	// which terminal-disabled the agent: clearing device_token and writing a
-	// sticky auth_expired. That is exactly what produced "logged in but agent
-	// offline" — a transient session blip was promoted to a device deregistration
-	// that session recovery never undid. Only a deliberate user logout
-	// deregisters now (AuthService.logout → /api/agent/disable "logout").
+	// HardInvalid is a full local security boundary. The user-agent must lose its
+	// forwarded access token and remote connection just like an explicit logout;
+	// it may only reconnect after a later login/refresh emits Active.
+	disableReason := string(reason)
+	if disableReason == "" {
+		disableReason = "auth_expired"
+	}
+	userAgentDisableRequester(disableReason)
 
 	runService := GetSharedRunService()
 	// Stop the ingress proxy based on its REAL listener state, not the

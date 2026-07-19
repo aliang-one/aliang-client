@@ -1,7 +1,7 @@
 package models
 
 const (
-	AgentProtocolVersion = "2026-07-12"
+	AgentProtocolVersion = "2026-07-19"
 
 	AgentHTTPRegisterEndpoint   = "/api/devices/register"
 	AgentHTTPStatusSyncEndpoint = "/api/agent/status"
@@ -129,18 +129,18 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				Method:         "POST",
 				Path:           AgentHTTPRegisterEndpoint,
 				Auth:           "Authorization: Bearer <user_access_token>",
-				RequestFields:  []string{"device_id", "unique_code"},
-				ResponseFields: []string{"device_token", "device_id", "device"},
+				RequestFields:  []string{"device_id"},
+				ResponseFields: []string{"device_id", "device"},
 				Notes:          "Registration uses the logged-in user identity. Device details are sent later over sync_agent_status and agent.hello.",
 			},
 			{
 				Name:           "sync_agent_status",
 				Method:         "POST",
 				Path:           AgentHTTPStatusSyncEndpoint,
-				Auth:           "Authorization: Bearer <device_token>",
-				RequestFields:  []string{"device_id", "status", "unique_code", "device_name", "platform", "agent_version", "capabilities", "tools", "history", "projects", "vibe_sessions", "authorized_directories", "started_at", "collected_at", "load"},
+				Auth:           "Authorization: Bearer <user_access_token>",
+				RequestFields:  []string{"device_id", "status", "device_name", "platform", "agent_version", "capabilities", "tools", "history", "projects", "vibe_sessions", "authorized_directories", "started_at", "collected_at", "load"},
 				ResponseFields: []string{"status", "device", "settings", "project_count", "vibe_session_count"},
-				Notes:          "Sent immediately after device registration and on explicit sync so the cloud can list local projects and vibecoding sessions before websocket hello succeeds. A 401 response means the device token is invalid; the local agent must clear the device token and close its websocket.",
+				Notes:          "Sent after registration and on explicit sync. A 401 response means the user session must be recovered or hard-invalidated; a device_id owned by another user is rejected.",
 			},
 			{
 				Name:           "disable_local_agent",
@@ -149,16 +149,16 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				Auth:           "local dashboard or local auth hook",
 				RequestFields:  []string{"reason?"},
 				ResponseFields: []string{"status", "enabled", "registered", "remote_connected", "sync_status", "sync_message"},
-				Notes:          "Local-only control endpoint. Supported reasons include manual, logout, auth_expired, device_token_invalid, and device_unbound; disabling actively closes the remote websocket and local terminal/AI sessions.",
+				Notes:          "Local-only control endpoint. Supported reasons include manual, logout, auth_expired, and device_unbound; disabling actively closes the remote websocket and local terminal/AI sessions.",
 			},
 		},
 		WebSocket: AgentProtocolWebSocket{
-			Path:        AgentWSEndpoint + "?token=<device_token>",
-			Auth:        "device_token query parameter returned by register_device",
+			Path:        AgentWSEndpoint,
+			Auth:        "Authorization: Bearer <user_access_token>; X-Aliang-Device-ID: <device_id>",
 			ClosePolicy: "Agent closes terminal and AI sessions when the websocket disconnects.",
 			HeartbeatMs: 10000,
 			ClientSends: []AgentProtocolEvent{
-				{Type: AgentEventHello, Required: []string{"type", "device_id", "unique_code", "protocol_version", "device_name", "platform", "agent_version", "capabilities", "tools", "history", "projects", "vibe_sessions", "started_at"}, Optional: []string{"host", "authorized_directories", "collected_at", "load"}},
+				{Type: AgentEventHello, Required: []string{"type", "device_id", "protocol_version", "device_name", "platform", "agent_version", "capabilities", "tools", "history", "projects", "vibe_sessions", "started_at"}, Optional: []string{"host", "authorized_directories", "collected_at", "load"}},
 				{Type: AgentEventHeartbeat, Required: []string{"type", "device_id", "ts"}, Optional: []string{"load"}},
 				{Type: AgentEventSessionRefresh, Required: []string{"type", "access_token"}},
 				{Type: AgentEventTerminalCreated, Required: []string{"type", "session_id", "shell", "cwd", "pty", "rows", "cols"}},

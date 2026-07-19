@@ -19,7 +19,8 @@ test('critical unauthenticated auth display logic is present in frontend sources
   assert.match(settingsPageSource, /<UserInfoSettings\s*\/>/);
 
   const userInfoSettingsSource = readFileSync(resolve(currentDir, '../components/settings/UserInfoSettings.vue'), 'utf8');
-  assert.match(userInfoSettingsSource, /<form v-if="!isAuthenticated"/);
+  assert.match(userInfoSettingsSource, /<div v-if="!isAuthenticated"/);
+  assert.match(userInfoSettingsSource, /<form v-if="loginMode === 'password'"/);
 
   const dashboardPageSource = readFileSync(resolve(currentDir, '../components/DashboardPage.vue'), 'utf8');
   assert.match(dashboardPageSource, /@click="handleShowSettings"/);

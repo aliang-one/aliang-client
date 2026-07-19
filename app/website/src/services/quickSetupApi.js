@@ -1,4 +1,5 @@
 import { syncUnauthenticatedAuthState } from '../stores/auth';
+import { handleAuthenticationFailure } from './authFailure';
 
 function extractOuterEnvelope(json) {
   const payload = json && typeof json === 'object' ? json : {};
@@ -22,16 +23,10 @@ async function rawRequest(path, options = {}) {
   const json = await response.json().catch(() => ({}));
   const envelope = extractOuterEnvelope(json);
 
-  if (!response.ok || envelope.code !== 0) {
-    if (response.status === 401) {
-      syncUnauthenticatedAuthState(envelope.msg);
-    }
-    throw new Error(envelope.msg || `Request failed with HTTP ${response.status}`);
-  }
+  handleAuthenticationFailure(response.status, envelope, syncUnauthenticatedAuthState);
 
-  const wrapper = envelope.data && typeof envelope.data === 'object' ? envelope.data : {};
-  if (wrapper.status === 'unauthenticated' || wrapper.error === 'session_expired') {
-    syncUnauthenticatedAuthState(wrapper.msg || envelope.msg);
+  if (!response.ok || envelope.code !== 0) {
+    throw new Error(envelope.msg || `Request failed with HTTP ${response.status}`);
   }
 
   return envelope.data;

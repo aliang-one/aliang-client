@@ -2,6 +2,7 @@ package user
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -243,6 +244,69 @@ func TestRefreshSession_PersistsRotatedTokenWhenProfileSyncFails(t *testing.T) {
 	}
 	if refreshedAgain.Username != "user" {
 		t.Fatalf("second RefreshSession() username = %q, want user", refreshedAgain.Username)
+	}
+}
+
+func TestRestoreSession_ProfileRejectsRefreshedTokenDoesNotResurrectSession(t *testing.T) {
+	baseDir, err := os.MkdirTemp("", "aliang-refresh-profile-unauthorized-*")
+	if err != nil {
+		t.Fatalf("MkdirTemp() error = %v", err)
+	}
+	t.Setenv("HOME", filepath.Join(baseDir, "home"))
+	t.Setenv("ALIANG_CACHE_DIR", filepath.Join(baseDir, "cache"))
+	defer os.RemoveAll(baseDir)
+
+	defer StopTokenRefresh()
+	defer ResetAuthPersistenceForTest()
+	defer config.ResetGlobalConfigForTest()
+
+	ResetAuthPersistenceForTest()
+	StopTokenRefresh()
+	config.ResetGlobalConfigForTest()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/auth/refresh":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":{"access_token":"rejected-access","refresh_token":"rotated-refresh","expires_in":3600,"token_type":"Bearer"}}`))
+		case "/api/v1/user/profile":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"code":"TOKEN_EXPIRED","message":"Token has expired"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	config.SetGlobalConfig(&config.Config{Core: &config.CoreConfig{APIServer: server.URL}})
+	if err := SaveUserInfo(&UserInfo{
+		AccessToken:  "stale-access",
+		RefreshToken: "stale-refresh",
+		TokenType:    "Bearer",
+		Username:     "stale-user",
+		UpdatedAt:    time.Now(),
+	}); err != nil {
+		t.Fatalf("SaveUserInfo() error = %v", err)
+	}
+
+	authority := ResetSessionAuthorityForTest()
+	authority.NotifyLoggedIn(&UserInfo{Username: "stale-user"})
+
+	_, err = RestoreSession()
+	if !errors.Is(err, ErrSessionExpired) {
+		t.Fatalf("RestoreSession() error = %v, want ErrSessionExpired", err)
+	}
+	if authority.State() != StateHardInvalid {
+		t.Fatalf("authority state = %v, want HardInvalid", authority.State())
+	}
+	if got := GetCurrentUserInfo(); got != nil {
+		t.Fatalf("current user info = %#v, want nil", got)
+	}
+	if hasUserInfo, err := HasPersistedUserInfo(); err != nil {
+		t.Fatalf("HasPersistedUserInfo() error = %v", err)
+	} else if hasUserInfo {
+		t.Fatal("expected persisted user info to be cleared")
 	}
 }
 

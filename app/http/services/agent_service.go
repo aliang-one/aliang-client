@@ -78,8 +78,6 @@ type agentState struct {
 	Enabled         bool                `json:"enabled"`
 	Device          *models.AgentDevice `json:"device,omitempty"`
 	DeviceID        string              `json:"device_id,omitempty"`
-	UniqueCode      string              `json:"unique_code,omitempty"`
-	DeviceToken     string              `json:"device_token,omitempty"`
 	RegisteredUser  string              `json:"registered_user,omitempty"`
 	Registered      bool                `json:"registered"`
 	RemoteConnected bool                `json:"remote_connected"`
@@ -126,21 +124,8 @@ type AgentService struct {
 	remoteWriter atomic.Pointer[agentTerminalWriter]
 }
 
-type agentDeviceTokenRejectedError struct {
-	message string
-}
-
-func (e agentDeviceTokenRejectedError) Error() string {
-	return e.message
-}
-
-// agentUserAuthRejectedError signals that the agent server rejected the USER
-// authorization — a 401 on a call that carried the aliang JWT but no
-// device_token (i.e. the device-register call). It is distinct from
-// agentDeviceTokenRejectedError (device_token rejected) so the caller can
-// recover the session before wiping it: a register 401 may be a stale/expired
-// JWT rather than a truly dead session, and nuking the login on every such 401
-// is what made "login expires very quickly".
+// agentUserAuthRejectedError signals that the agent server rejected the user's
+// JWT. Every remote Agent API uses this same authorization contract.
 type agentUserAuthRejectedError struct {
 	status int
 	body   string
@@ -172,11 +157,10 @@ func NewAgentService() *AgentService {
 	if err := s.loadState(); err != nil {
 		logger.Warn(fmt.Sprintf("[AGENT-BOOT] state_load failed error=%v", err))
 	} else {
-		logger.Info(fmt.Sprintf("[AGENT-BOOT] state_load complete enabled=%t registered=%t has_device=%t has_token=%t agent_server=%s runtime=user_agent:%t",
+		logger.Info(fmt.Sprintf("[AGENT-BOOT] state_load complete enabled=%t registered=%t has_device=%t agent_server=%s runtime=user_agent:%t",
 			s.state.Enabled,
 			s.state.Registered,
 			s.state.Device != nil,
-			strings.TrimSpace(s.state.DeviceToken) != "",
 			currentAgentServerURL(),
 			IsUserAgentRuntime(),
 		))
@@ -358,10 +342,10 @@ func (s *AgentService) enableWithUserContext(authHeader string, userKey string) 
 		}
 		return status, err
 	}
-	hasToken := strings.TrimSpace(s.state.DeviceToken) != ""
+	registered := s.state.Registered
 	status := s.statusLocked()
 	s.mu.Unlock()
-	if hasToken {
+	if registered {
 		go func() {
 			if err := s.EnsureRemoteConnection(); err != nil {
 				logger.Warn(fmt.Sprintf("[AGENT-BOOT] enable remote_connection_start_failed error=%v", err))
@@ -390,13 +374,12 @@ func (s *AgentService) disableWithReasonMessage(reason string, message string) m
 	s.ensureDeviceIdentityLocked()
 	s.state.Enabled = false
 	s.state.Device = nil
-	s.state.DeviceToken = ""
 	s.state.RegisteredUser = ""
 	s.state.Registered = false
 	s.state.RemoteConnected = false
 	s.state.LastSyncAt = time.Now().UTC().Format(time.RFC3339)
 	s.state.LastSyncStatus = reason
-	if reason == "logout" {
+	if isSessionInvalidDisableReason(reason) {
 		s.forwardedUserAuthorization = ""
 		s.forwardedUserKey = ""
 	}
@@ -413,6 +396,15 @@ func (s *AgentService) disableWithReasonMessage(reason string, message string) m
 	return status
 }
 
+func isSessionInvalidDisableReason(reason string) bool {
+	switch normalizeAgentDisableReason(reason) {
+	case "logout", "auth_expired", "refresh_invalid", "soft_expiry_timeout", "revoked":
+		return true
+	default:
+		return false
+	}
+}
+
 // RecoverIfAuthExpired re-enables the agent if and only if it is currently
 // disabled because of an auth_expired session. A successful token refresh
 // (the caller of this method) means we hold a fresh, valid JWT again, so the
@@ -421,10 +413,8 @@ func (s *AgentService) disableWithReasonMessage(reason string, message string) m
 // WS. This turns a one-hit "permanent offline until manual re-login" into a
 // self-healing blip.
 //
-// It is a deliberate no-op for every other disable reason — logout is a
-// deliberate user action, device_unbound means the device was unbound, and
-// device_token_invalid means the token is still rejected; none are resolved by
-// a refresh, so auto-re-enabling would undo an intentional state or loop.
+// It is a deliberate no-op for every other disable reason: a refresh must not
+// undo logout, explicit disable, or a server-side unbind.
 func (s *AgentService) RecoverIfAuthExpired() (models.AgentStatusResponse, error) {
 	s.mu.Lock()
 	reason := normalizeAgentDisableReason(s.state.LastSyncStatus)
@@ -457,20 +447,19 @@ func (s *AgentService) ReRegisterIfUserIdentityChanged() {
 	}
 	currentUserKey := agentRegistrationUserKey(userKey, authHeader)
 	registeredUser := strings.TrimSpace(s.state.RegisteredUser)
-	hasToken := strings.TrimSpace(s.state.DeviceToken) != ""
-	mismatch := hasToken && registeredUser != "" && registeredUser != currentUserKey
+	registered := s.state.Registered
+	mismatch := registered && registeredUser != "" && registeredUser != currentUserKey
 	if mismatch {
 		logger.Info(fmt.Sprintf("[AGENT-BOOT] identity_changed re-registering registered_user=%s current_user=%s device_id=%s",
 			registeredUser, currentUserKey, s.state.DeviceID))
 		s.state.Device = nil
-		s.state.DeviceToken = ""
 		s.state.Registered = false
 		s.state.RemoteConnected = false
 		s.state.RegisteredUser = ""
 		_ = s.saveStateLocked()
 	}
 	s.mu.Unlock()
-	if !hasToken || mismatch {
+	if !registered || mismatch {
 		if err := s.SyncNowWithUserContext(authHeader, userKey); err != nil {
 			logger.Warn(fmt.Sprintf("[AGENT-BOOT] identity_changed re-register failed error=%v", err))
 		}
@@ -486,8 +475,6 @@ func normalizeAgentDisableReason(reason string) string {
 		return "logout"
 	case "auth_expired":
 		return "auth_expired"
-	case "device_token_invalid":
-		return "device_token_invalid"
 	case "device_unbound":
 		return "device_unbound"
 	default:
@@ -499,10 +486,8 @@ func agentDisableMessage(reason string) string {
 	switch normalizeAgentDisableReason(reason) {
 	case "logout":
 		return "Agent mode was disabled after logout."
-	case "auth_expired":
+	case "auth_expired", "refresh_invalid", "soft_expiry_timeout", "revoked":
 		return "Agent mode was disabled because the session expired."
-	case "device_token_invalid":
-		return "Agent mode was disabled because the device token was rejected."
 	case "device_unbound":
 		return "Agent mode was disabled because the device was unbound."
 	default:
@@ -531,7 +516,7 @@ func (s *AgentService) SyncNowWithAuthorization(authHeader string) error {
 // disable/logout/rejection states block; empty (never synced) does not.
 func (s *AgentService) shouldBlockBackgroundSyncLocked() bool {
 	switch strings.TrimSpace(strings.ToLower(s.state.LastSyncStatus)) {
-	case "disabled", "logout", "auth_expired", "device_token_invalid", "device_unbound":
+	case "disabled", "logout", "auth_expired", "refresh_invalid", "soft_expiry_timeout", "revoked", "device_unbound":
 		return true
 	default:
 		return false
@@ -543,17 +528,16 @@ func (s *AgentService) SyncNowWithUserContext(authHeader string, userKey string)
 	hasExplicitAuth := strings.TrimSpace(authHeader) != ""
 	authHeader, userKey, authChanged := s.resolveForwardedUserContextLocked(authHeader, userKey)
 	s.ensureDeviceIdentityLocked()
-	logger.Info(fmt.Sprintf("[AGENT-BOOT] sync_now begin device_id=%s enabled=%t registered=%t has_token=%t agent_server=%s runtime=user_agent:%t",
+	logger.Info(fmt.Sprintf("[AGENT-BOOT] sync_now begin device_id=%s enabled=%t registered=%t agent_server=%s runtime=user_agent:%t",
 		s.state.DeviceID,
 		s.state.Enabled,
 		s.state.Registered,
-		strings.TrimSpace(s.state.DeviceToken) != "",
 		currentAgentServerURL(),
 		IsUserAgentRuntime(),
 	))
-	// A background sync must not undo a deliberate disable (logout / manual /
-	// device_token_invalid / device_unbound / auth_expired) — those states are
-	// sticky until cleared by an explicit action. The one exception is a sync
+	// A background sync must not undo a deliberate disable (logout, hard-invalid,
+	// device-token rejection, or unbind). Those states remain sticky until cleared
+	// by an explicit action. The one exception is a sync
 	// that carries an explicitly forwarded JWT (authHeader != ""): that means
 	// the dashboard just authenticated the user (login / restore / refresh) and
 	// is the legitimate re-enable signal. A sync with no forwarded JWT falls
@@ -567,13 +551,11 @@ func (s *AgentService) SyncNowWithUserContext(authHeader string, userKey string)
 		return nil
 	}
 	if err := s.registerAndSyncLockedWithUserContext(authHeader, userKey); err != nil {
-		var deviceTokenErr agentDeviceTokenRejectedError
 		var authRejectedErr agentUserAuthRejectedError
-		isDeviceTokenErr := errors.As(err, &deviceTokenErr)
 		isAuthRejectedErr := errors.As(err, &authRejectedErr)
-		// Neither a device-token rejection nor a user-auth rejection is a server
-		// availability problem; leave their dedicated states untouched.
-		if !isDeviceTokenErr && !isAuthRejectedErr {
+		// A user-auth rejection has its own recovery path; do not flatten it into
+		// a generic server availability problem.
+		if !isAuthRejectedErr {
 			s.state.LastSyncStatus = "server_unavailable"
 			s.state.LastSyncMessage = err.Error()
 			_ = s.saveStateLocked()
@@ -588,7 +570,6 @@ func (s *AgentService) SyncNowWithUserContext(authHeader string, userKey string)
 		logger.Warn(fmt.Sprintf("[AGENT-BOOT] sync_now failed error=%v", err))
 		return err
 	}
-	hasToken := strings.TrimSpace(s.state.DeviceToken) != ""
 	enabled := s.state.Enabled
 	registered := s.state.Registered
 	deviceID := s.state.DeviceID
@@ -596,8 +577,8 @@ func (s *AgentService) SyncNowWithUserContext(authHeader string, userKey string)
 	if authChanged {
 		s.PushSessionRefresh()
 	}
-	if !hasToken {
-		logger.Info(fmt.Sprintf("[AGENT-BOOT] sync_now complete remote_connection=skipped reason=no_device_token device_id=%s registered=%t enabled=%t", deviceID, registered, enabled))
+	if !registered || !enabled {
+		logger.Info(fmt.Sprintf("[AGENT-BOOT] sync_now complete remote_connection=skipped reason=not_registered_or_disabled device_id=%s registered=%t enabled=%t", deviceID, registered, enabled))
 		return nil
 	}
 	if err := s.EnsureRemoteConnection(); err != nil {
@@ -751,11 +732,10 @@ func RequestUserAgentStartupSync(reason string) error {
 		userKey = agentRegistrationUserKey(userKey, authHeader)
 	}
 
-	logger.Info(fmt.Sprintf("[AGENT-BOOT] startup_sync_request begin reason=%s runtime=user_agent:%t has_auth=%t admin_console_fallback=%t",
+	logger.Info(fmt.Sprintf("[AGENT-BOOT] startup_sync_request begin reason=%s runtime=user_agent:%t has_auth=%t",
 		reason,
 		IsUserAgentRuntime(),
 		authHeader != "",
-		shouldUseAdminConsoleAgentRegistration(authHeader, false),
 	))
 	var err error
 	if IsUserAgentRuntime() {
@@ -771,7 +751,7 @@ func RequestUserAgentStartupSync(reason string) error {
 	return nil
 }
 
-func RequestUserAgentDisableAfterLogout(reason string) {
+func RequestUserAgentDisableForSessionEnd(reason string) {
 	reason = strings.TrimSpace(reason)
 	if reason == "" {
 		reason = "logout"
@@ -788,7 +768,7 @@ func RequestUserAgentDisableAfterLogout(reason string) {
 }
 
 // RequestUserAgentRecoverAfterAuthExpired is the self-heal counterpart to
-// RequestUserAgentDisableAfterLogout. It is invoked from the auth-success hook
+// RequestUserAgentDisableForSessionEnd. It is invoked from the auth-success hook
 // (handleAuthRefreshed) after a token refresh succeeds: if the agent was left
 // in the terminal auth_expired state by a prior refresh failure, a fresh valid
 // JWT means that state is stale — re-enable and reconnect. Cross-process safe,
@@ -810,7 +790,7 @@ func RequestUserAgentRecoverAfterAuthExpired() {
 
 // RequestUserAgentEnsureConnection (re)establishes the remote agent link after
 // the user session is restored (token refresh / login). Idempotent: a no-op when
-// the WS is already connected or connecting, or when there is no device_token /
+// the WS is already connected or connecting, or when registration/auth is absent /
 // the agent is disabled. Cross-process safe — mirrors the disable/sync
 // dispatchers (in-process under the user-agent runtime, otherwise an HTTP POST
 // to the local user-agent server's /api/agent/reconnect).
@@ -892,9 +872,9 @@ func (s *AgentService) Launch(req models.AgentLaunchRequest) (*models.AgentLaunc
 const (
 	registrationNotConfigured = "not_configured" // agent server URL is empty
 	registrationLoginRequired = "login_required" // no user JWT (or session expired)
-	registrationRejected      = "rejected"       // server explicitly refused the binding/token
-	registrationRegistered    = "registered"     // server accepted, token cached and not rejected
-	registrationUnregistered  = "unregistered"   // never registered (no token, no explicit refusal)
+	registrationRejected      = "rejected"       // server explicitly refused the device binding
+	registrationRegistered    = "registered"     // server accepted the JWT-owned device binding
+	registrationUnregistered  = "unregistered"   // device has not been registered
 
 	connectionConnected    = "connected"    // websocket link is up
 	connectionConnecting   = "connecting"   // dialing / handshaking
@@ -902,17 +882,9 @@ const (
 	connectionDisconnected = "disconnected" // idle / not connected
 )
 
-// deriveRegistrationStateLocked maps the raw agent state to the registration
-// health enum. Registration is a property of the DEVICE credential
-// (device_token), NOT of the user session: a cached device_token means the
-// server issued and has not withdrawn this device's credential, so the device is
-// registered regardless of the current user-session status. This is the fix for
-// the "logged in but agent offline" inconsistency — a transient user-session
-// expiry (LastSyncStatus auth_expired / login_required) no longer downgrades a
-// registered device, because session expiry is no longer allowed to clear the
-// device_token (handleAuthExpired keeps registration intact). Only an explicit
-// device-side refusal (device_token_invalid / device_unbound / device_id_conflict
-// — which clear the token) yields `rejected`, and only when there is no token.
+// deriveRegistrationStateLocked maps the raw agent state to registration health.
+// Registration is explicit state established by a successful JWT-authenticated
+// register call; no secondary device credential participates.
 func (s *AgentService) deriveRegistrationStateLocked() (string, string) {
 	syncStatus := strings.TrimSpace(s.state.LastSyncStatus)
 	syncMessage := s.state.LastSyncMessage
@@ -921,18 +893,11 @@ func (s *AgentService) deriveRegistrationStateLocked() (string, string) {
 		return registrationNotConfigured, "Agent server is not configured."
 	}
 
-	// A device_token is present ⇒ the server accepted this device and has not
-	// rejected the credential. The user-session status (auth_expired /
-	// login_required) is a connection concern, not a registration concern, so it
-	// must NOT override "registered".
-	if strings.TrimSpace(s.state.DeviceToken) != "" {
-		return registrationRegistered, ""
-	}
-
-	// No device_token: explain why, using the last sync outcome.
 	switch syncStatus {
-	case "device_token_invalid", "device_unbound", "device_id_conflict":
+	case "device_unbound", "device_id_conflict":
 		return registrationRejected, agentHealthMessage(syncMessage, "The agent server rejected this device's registration.")
+	case "login_required", "auth_expired", "refresh_invalid", "soft_expiry_timeout", "revoked":
+		return registrationLoginRequired, agentHealthMessage(syncMessage, "Log in before registering this device with the agent server.")
 	case "enable_failed":
 		// enable_failed is set whenever a register/sync call errored; only treat
 		// it as a refusal when the cause looks like an auth rejection, otherwise
@@ -941,12 +906,9 @@ func (s *AgentService) deriveRegistrationStateLocked() (string, string) {
 		if agentMessageIndicatesAuthError(syncMessage) {
 			return registrationRejected, syncMessage
 		}
-	case "login_required", "auth_expired":
-		// Genuine first-time state: never registered because no user JWT was
-		// available to register with. (After the session/deregistration split, a
-		// real device_token survives session blips, so this only appears before
-		// the first successful registration.)
-		return registrationLoginRequired, agentHealthMessage(syncMessage, "Log in before registering this device with the agent server.")
+	}
+	if s.state.Registered {
+		return registrationRegistered, ""
 	}
 	if agentMessageIndicatesAuthError(syncMessage) {
 		return registrationRejected, syncMessage
@@ -968,7 +930,7 @@ func (s *AgentService) deriveConnectionStateLocked() (string, string) {
 	switch strings.TrimSpace(s.state.LastSyncStatus) {
 	case "connecting":
 		return connectionConnecting, ""
-	case "auth_expired", "login_required":
+	case "auth_expired", "refresh_invalid", "soft_expiry_timeout", "revoked", "login_required":
 		return connectionDisconnected, agentHealthMessage(s.state.LastSyncMessage, "Waiting for sign-in; the link reconnects automatically after login.")
 	case "connect_failed", "disconnected", "server_unavailable":
 		return connectionError, agentHealthMessage(s.state.LastSyncMessage, "Connection to the agent server failed; retrying.")
@@ -1034,11 +996,11 @@ func (s *AgentService) statusLocked() models.AgentStatusResponse {
 }
 
 func (s *AgentService) isRegisteredLocked() bool {
-	return s.state.Registered || strings.TrimSpace(s.state.DeviceToken) != ""
+	return s.state.Registered
 }
 
 func (s *AgentService) isBoundLocked() bool {
-	return s.state.Device != nil || strings.TrimSpace(s.state.DeviceToken) != ""
+	return s.state.Registered && s.state.Device != nil
 }
 
 func (s *AgentService) isEnabledLocked() bool {
@@ -1046,11 +1008,10 @@ func (s *AgentService) isEnabledLocked() bool {
 }
 
 func (s *AgentService) syncRuntimeDeviceStatusLocked() {
-	if s.state.Device == nil && strings.TrimSpace(s.state.DeviceToken) != "" {
+	if s.state.Device == nil && s.state.Registered {
 		s.state.Device = &models.AgentDevice{
 			ID:                    s.state.DeviceID,
 			DeviceID:              s.state.DeviceID,
-			UniqueCode:            s.state.UniqueCode,
 			Name:                  defaultAgentDeviceName(),
 			Platform:              agentPlatform(),
 			Status:                "offline",
@@ -1067,9 +1028,6 @@ func (s *AgentService) syncRuntimeDeviceStatusLocked() {
 	}
 	if strings.TrimSpace(s.state.Device.DeviceID) == "" {
 		s.state.Device.DeviceID = s.state.Device.ID
-	}
-	if strings.TrimSpace(s.state.Device.UniqueCode) == "" {
-		s.state.Device.UniqueCode = s.state.UniqueCode
 	}
 	if strings.TrimSpace(s.state.Device.Platform) == "" {
 		s.state.Device.Platform = agentPlatform()
@@ -1091,12 +1049,11 @@ func (s *AgentService) resolveDeviceIDLocked() string {
 
 func (s *AgentService) ensureDeviceIdentityLocked() {
 	beforeID := s.state.DeviceID
-	beforeUC := s.state.UniqueCode
 	// The device identity is permanent and client-owned: resolve it from the
 	// dedicated identity file (creating it once if needed) and pin it into
 	// state, never generating or adopting a server-provided id here.
 	s.pinPermanentDeviceIDLocked()
-	changed := s.state.DeviceID != beforeID || s.state.UniqueCode != beforeUC
+	changed := s.state.DeviceID != beforeID
 	if s.state.Device != nil {
 		if strings.TrimSpace(s.state.Device.ID) == "" {
 			s.state.Device.ID = s.state.DeviceID
@@ -1104,10 +1061,6 @@ func (s *AgentService) ensureDeviceIdentityLocked() {
 		}
 		if strings.TrimSpace(s.state.Device.DeviceID) == "" {
 			s.state.Device.DeviceID = s.state.Device.ID
-			changed = true
-		}
-		if strings.TrimSpace(s.state.Device.UniqueCode) == "" {
-			s.state.Device.UniqueCode = s.state.UniqueCode
 			changed = true
 		}
 	}
@@ -1135,6 +1088,9 @@ func (s *AgentService) loadState() error {
 		return err
 	}
 	applyAgentDeviceFeatureDefaults(raw, &state)
+	// Migrate legacy Agent credentials out of runtime state. The only durable
+	// installation identity is device_id; authorization always comes from the
+	// current user session.
 	s.state = state
 	return nil
 }
@@ -1172,15 +1128,11 @@ func (s *AgentService) saveStateLocked() error {
 	return os.WriteFile(path, raw, 0o600)
 }
 
-// agentDeviceIdentity is the installation-permanent device identity: the
-// device_id and its pairing unique_code. It is generated ONCE, persisted to a
-// dedicated file (device_identity.json), and never mutated afterwards — not by
-// server responses, not by auth/user-session changes, not by registration
-// conflicts. It is the single source of truth for who this device is.
+// agentDeviceIdentity is the installation-permanent device_id. It is generated
+// once and never replaced by server responses or user-session changes.
 type agentDeviceIdentity struct {
-	DeviceID   string `json:"device_id"`
-	UniqueCode string `json:"unique_code"`
-	CreatedAt  string `json:"created_at,omitempty"`
+	DeviceID  string `json:"device_id"`
+	CreatedAt string `json:"created_at,omitempty"`
 }
 
 func agentIdentityPath() (string, error) {
@@ -1244,10 +1196,8 @@ func (s *AgentService) permanentDeviceIdentityLocked() agentDeviceIdentity {
 			// Migration: promote the existing session device_id to the permanent
 			// identity instead of minting a new one.
 			id.DeviceID = existing
-			id.UniqueCode = firstNonEmpty(strings.TrimSpace(s.state.UniqueCode), newAgentUniqueDeviceCode())
 		} else {
 			id.DeviceID = "dev-" + uuid.NewString()
-			id.UniqueCode = newAgentUniqueDeviceCode()
 		}
 		if strings.TrimSpace(id.CreatedAt) == "" {
 			id.CreatedAt = time.Now().UTC().Format(time.RFC3339)
@@ -1267,11 +1217,9 @@ func (s *AgentService) permanentDeviceIdentityLocked() agentDeviceIdentity {
 func (s *AgentService) pinPermanentDeviceIDLocked() {
 	id := s.permanentDeviceIdentityLocked()
 	s.state.DeviceID = id.DeviceID
-	s.state.UniqueCode = id.UniqueCode
 	if s.state.Device != nil {
 		s.state.Device.ID = id.DeviceID
 		s.state.Device.DeviceID = id.DeviceID
-		s.state.Device.UniqueCode = id.UniqueCode
 	}
 }
 
@@ -1371,34 +1319,27 @@ func defaultAgentDeviceName() string {
 }
 
 type agentRegisterPayload struct {
-	DeviceID   string `json:"device_id"`
-	UniqueCode string `json:"unique_code"`
+	DeviceID string `json:"device_id"`
 }
 
 type agentRegisterResponse struct {
-	DeviceToken string                    `json:"device_token"`
-	AgentToken  string                    `json:"agent_token"`
-	Token       string                    `json:"token"`
-	AccessToken string                    `json:"access_token"`
-	DeviceID    string                    `json:"device_id"`
-	UniqueCode  string                    `json:"unique_code"`
-	DeviceName  string                    `json:"device_name"`
-	Name        string                    `json:"name"`
-	Platform    string                    `json:"platform"`
-	Status      string                    `json:"status"`
-	Device      *models.AgentDevice       `json:"device"`
-	UserID      string                    `json:"user_id"`
-	User        *models.AgentUserIdentity `json:"user"`
-	CreatedAt   string                    `json:"created_at"`
-	PairedAt    string                    `json:"paired_at"`
-	BoundAt     string                    `json:"bound_at"`
-	LastSeenAt  string                    `json:"last_seen_at"`
+	DeviceID   string                    `json:"device_id"`
+	DeviceName string                    `json:"device_name"`
+	Name       string                    `json:"name"`
+	Platform   string                    `json:"platform"`
+	Status     string                    `json:"status"`
+	Device     *models.AgentDevice       `json:"device"`
+	UserID     string                    `json:"user_id"`
+	User       *models.AgentUserIdentity `json:"user"`
+	CreatedAt  string                    `json:"created_at"`
+	PairedAt   string                    `json:"paired_at"`
+	BoundAt    string                    `json:"bound_at"`
+	LastSeenAt string                    `json:"last_seen_at"`
 }
 
 type agentStatusSyncPayload struct {
 	DeviceID              string                    `json:"device_id"`
 	Status                string                    `json:"status"`
-	UniqueCode            string                    `json:"unique_code,omitempty"`
 	DeviceName            string                    `json:"device_name"`
 	Platform              string                    `json:"platform"`
 	AgentVersion          string                    `json:"agent_version,omitempty"`
@@ -1463,19 +1404,11 @@ func (s *AgentService) registerAndSyncLockedWithUserContext(authHeader string, u
 	currentUserKey := agentRegistrationUserKey(userKey, authHeader)
 	s.resetRegisteredDeviceIfUserChangedLocked(currentUserKey)
 
-	if strings.TrimSpace(s.state.DeviceToken) != "" {
-		if s.state.RegisteredUser == "" {
-			s.state.RegisteredUser = currentUserKey
-		}
-		return s.syncExistingRegisteredDeviceLocked()
-	}
-
 	endpoint := cfg.GetAgentDeviceRegisterURL()
-	payload := buildAgentRegisterPayload(s.state.DeviceID, s.state.UniqueCode)
-	logger.Info(fmt.Sprintf("[AGENT-BOOT] register_sync begin endpoint=%s device_id=%s unique_code=%s",
+	payload := buildAgentRegisterPayload(s.state.DeviceID)
+	logger.Info(fmt.Sprintf("[AGENT-BOOT] register_sync begin endpoint=%s device_id=%s",
 		sanitizeAgentEndpoint(endpoint),
 		s.state.DeviceID,
-		s.state.UniqueCode,
 	))
 	raw, err := s.callAgentServer(http.MethodPost, endpoint, payload, authHeader)
 	if err != nil {
@@ -1504,19 +1437,11 @@ func (s *AgentService) registerAndSyncLockedWithUserContext(authHeader string, u
 	if err := json.Unmarshal(raw, &resp); err != nil {
 		return err
 	}
-	deviceToken := firstNonEmpty(resp.DeviceToken, resp.AgentToken, resp.Token)
-	if deviceToken == "" {
-		return errors.New("agent server register response missing device_token")
-	}
-
-	device := normalizeRegisteredAgentDevice(resp, s.state.DeviceID, s.state.UniqueCode)
-	// device_id / unique_code are client-owned and permanent: ignore whatever
-	// the server returned and re-pin to the installation identity.
+	device := normalizeRegisteredAgentDevice(resp, s.state.DeviceID)
+	// device_id is client-owned and permanent: ignore a mismatched response id.
 	s.pinPermanentDeviceIDLocked()
 	device.ID = s.state.DeviceID
 	device.DeviceID = s.state.DeviceID
-	device.UniqueCode = s.state.UniqueCode
-	s.state.DeviceToken = deviceToken
 	s.state.RegisteredUser = currentUserKey
 	s.state.Device = device
 	s.state.Enabled = true
@@ -1524,7 +1449,7 @@ func (s *AgentService) registerAndSyncLockedWithUserContext(authHeader string, u
 	s.state.LastSyncAt = time.Now().UTC().Format(time.RFC3339)
 	s.state.LastSyncStatus = "connecting"
 	s.state.LastSyncMessage = ""
-	logger.Info(fmt.Sprintf("[AGENT-BOOT] register_sync registered device_id=%s agent_server=%s register_url=%s has_device_token=true",
+	logger.Info(fmt.Sprintf("[AGENT-BOOT] register_sync registered device_id=%s agent_server=%s register_url=%s auth=user_jwt",
 		s.state.DeviceID,
 		currentAgentServerURL(),
 		agentRegisterURLForLog(),
@@ -1534,42 +1459,24 @@ func (s *AgentService) registerAndSyncLockedWithUserContext(authHeader string, u
 	}
 	if err := s.syncAgentInventoryLocked("register"); err != nil {
 		logger.Warn(fmt.Sprintf("[AGENT-BOOT] inventory_sync failed reason=register device_id=%s error=%v", s.state.DeviceID, err))
-	}
-	return nil
-}
-
-func (s *AgentService) syncExistingRegisteredDeviceLocked() error {
-	s.state.Enabled = true
-	s.state.Registered = true
-	s.state.LastSyncAt = time.Now().UTC().Format(time.RFC3339)
-	s.state.LastSyncStatus = "connecting"
-	s.state.LastSyncMessage = ""
-	s.syncRuntimeDeviceStatusLocked()
-	logger.Info(fmt.Sprintf("[AGENT-BOOT] register_sync skipped reason=existing_device_token device_id=%s agent_server=%s register_url=%s has_device_token=true",
-		s.state.DeviceID,
-		currentAgentServerURL(),
-		agentRegisterURLForLog(),
-	))
-	if err := s.saveStateLocked(); err != nil {
-		return err
-	}
-	if err := s.syncAgentInventoryLocked("existing_device_token"); err != nil {
-		logger.Warn(fmt.Sprintf("[AGENT-BOOT] inventory_sync failed reason=existing_device_token device_id=%s error=%v", s.state.DeviceID, err))
+		var authRejected agentUserAuthRejectedError
+		if errors.As(err, &authRejected) {
+			return err
+		}
 	}
 	return nil
 }
 
 func (s *AgentService) resetRegisteredDeviceIfUserChangedLocked(currentUserKey string) {
 	currentUserKey = strings.TrimSpace(currentUserKey)
-	if currentUserKey == "" || strings.TrimSpace(s.state.DeviceToken) == "" || strings.TrimSpace(s.state.RegisteredUser) == "" {
+	if currentUserKey == "" || !s.state.Registered || strings.TrimSpace(s.state.RegisteredUser) == "" {
 		return
 	}
 	if s.state.RegisteredUser == currentUserKey {
 		return
 	}
-	logger.Info(fmt.Sprintf("[AGENT-BOOT] register_sync reset_device_token reason=user_changed device_id=%s", s.state.DeviceID))
+	logger.Info(fmt.Sprintf("[AGENT-BOOT] register_sync reset_registration reason=user_changed device_id=%s", s.state.DeviceID))
 	s.state.Device = nil
-	s.state.DeviceToken = ""
 	s.state.Registered = false
 	s.state.RemoteConnected = false
 }
@@ -1589,22 +1496,10 @@ func isDeviceIDAlreadyBoundError(err error) bool {
 }
 
 func (s *AgentService) callAgentServer(method string, endpoint string, payload interface{}, authHeader string) ([]byte, error) {
-	return s.callAgentServerWithAuthorization(method, endpoint, payload, effectiveAgentRegisterAuthHeader(authHeader), false)
+	return s.callAgentServerWithAuthorization(method, endpoint, payload, effectiveAgentRegisterAuthHeader(authHeader))
 }
 
-func (s *AgentService) callAgentServerWithDeviceToken(method string, endpoint string, payload interface{}, deviceToken string) ([]byte, error) {
-	deviceToken = strings.TrimSpace(deviceToken)
-	if deviceToken == "" {
-		return nil, errors.New("device token is empty")
-	}
-	authHeader := deviceToken
-	if !strings.HasPrefix(strings.ToLower(authHeader), "bearer ") {
-		authHeader = "Bearer " + authHeader
-	}
-	return s.callAgentServerWithAuthorization(method, endpoint, payload, authHeader, true)
-}
-
-func (s *AgentService) callAgentServerWithAuthorization(method string, endpoint string, payload interface{}, authHeader string, hasDeviceToken bool) ([]byte, error) {
+func (s *AgentService) callAgentServerWithAuthorization(method string, endpoint string, payload interface{}, authHeader string) ([]byte, error) {
 	endpoint = strings.TrimSpace(endpoint)
 	if endpoint == "" {
 		return nil, errors.New("agent server endpoint is empty")
@@ -1624,12 +1519,11 @@ func (s *AgentService) callAgentServerWithAuthorization(method string, endpoint 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 	authHeader = strings.TrimSpace(authHeader)
-	useAdminConsoleFallback := shouldUseAdminConsoleAgentRegistration(authHeader, hasDeviceToken)
 	if authHeader != "" {
 		req.Header.Set("Authorization", authHeader)
 	}
-	if useAdminConsoleFallback {
-		req.Header.Set("X-Admin-Console", "1")
+	if deviceID := strings.TrimSpace(s.state.DeviceID); deviceID != "" {
+		req.Header.Set("X-Aliang-Device-ID", deviceID)
 	}
 	// Identity is carried solely by the standard `Authorization: <aliang JWT>`
 	// header above. The PhoneServer decodes it (shared HS256 secret) → canonical
@@ -1637,12 +1531,11 @@ func (s *AgentService) callAgentServerWithAuthorization(method string, endpoint 
 	// phone. The legacy X-Aliang-User-* headers were intentionally dropped: they
 	// produced synthetic `agent_user_<sha1(key)>` accounts that drifted from the
 	// logged-in user whenever the key changed, hiding devices from the phone.
-	logger.Info(fmt.Sprintf("[AGENT-BOOT] agent_server_call begin method=%s endpoint=%s has_auth=%t has_device_token=%t admin_console_fallback=%t",
+	logger.Info(fmt.Sprintf("[AGENT-BOOT] agent_server_call begin method=%s endpoint=%s has_auth=%t device_id=%s",
 		method,
 		sanitizeAgentEndpoint(endpoint),
 		strings.TrimSpace(req.Header.Get("Authorization")) != "",
-		hasDeviceToken,
-		useAdminConsoleFallback,
+		req.Header.Get("X-Aliang-Device-ID"),
 	))
 	resp, err := s.client.Do(req)
 	if err != nil {
@@ -1657,18 +1550,7 @@ func (s *AgentService) callAgentServerWithAuthorization(method string, endpoint 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		logger.Warn(fmt.Sprintf("[AGENT-BOOT] agent_server_call non_2xx method=%s endpoint=%s status=%d", method, sanitizeAgentEndpoint(endpoint), resp.StatusCode))
 		if resp.StatusCode == http.StatusUnauthorized {
-			if hasDeviceToken {
-				s.handleAgentDeviceTokenRejected(string(raw))
-				return nil, agentDeviceTokenRejectedError{message: fmt.Sprintf("agent server returned %d: %s", resp.StatusCode, string(raw))}
-			} else if authHeader != "" {
-				// Register-path 401: the user JWT was rejected. This MAY be a
-				// stale/expired token rather than a truly dead session, so do
-				// NOT wipe the login here — return a typed error and let the
-				// caller attempt a recovery refresh first
-				// (recoverOrExpireAfterRegisterAuthRejection). Wiping inline
-				// also ran under s.mu, which a recovery refresh cannot do: a
-				// successful RefreshSession fires the auth-success hook whose
-				// handler re-takes s.mu.
+			if authHeader != "" {
 				return nil, agentUserAuthRejectedError{status: resp.StatusCode, body: string(raw)}
 			}
 		}
@@ -1676,25 +1558,6 @@ func (s *AgentService) callAgentServerWithAuthorization(method string, endpoint 
 	}
 	logger.Info(fmt.Sprintf("[AGENT-BOOT] agent_server_call success method=%s endpoint=%s status=%d", method, sanitizeAgentEndpoint(endpoint), resp.StatusCode))
 	return unwrapAgentServerData(raw)
-}
-
-func (s *AgentService) handleAgentDeviceTokenRejected(body string) {
-	body = strings.TrimSpace(body)
-	logger.Warn(fmt.Sprintf("[AGENT-BOOT] device_token rejected by agent server body=%s", body))
-	// Persist the server's rejection detail so registration_state=rejected carries
-	// an informative registration_message (the 401 body) instead of the generic
-	// per-reason text. Still dispatched via a goroutine: this runs on the s.mu
-	// critical path (callAgentServer ← registerAndSync), so disabling inline would
-	// self-deadlock.
-	detail := agentDisableMessage("device_token_invalid")
-	if body != "" {
-		snippet := body
-		if len(snippet) > 300 {
-			snippet = snippet[:300]
-		}
-		detail = fmt.Sprintf("%s Server response: %s", detail, snippet)
-	}
-	go s.disableWithReasonMessage("device_token_invalid", detail)
 }
 
 // registerAuthRecoveryInFlight prevents a register-auth-rejection recovery from
@@ -1734,9 +1597,9 @@ func (s *AgentService) syncAgentInventoryLocked(reason string) error {
 	if cfg == nil || strings.TrimSpace(cfg.AgentBaseURL()) == "" {
 		return errors.New("agent server is not configured")
 	}
-	deviceToken := strings.TrimSpace(s.state.DeviceToken)
-	if deviceToken == "" {
-		return errors.New("device token is not available")
+	authHeader := s.effectiveUserAuthorizationLocked("")
+	if authHeader == "" {
+		return errors.New("user authorization is not available")
 	}
 	payload := s.buildAgentStatusSyncPayloadLocked("online")
 	endpoint := currentAgentStatusSyncURL()
@@ -1748,8 +1611,20 @@ func (s *AgentService) syncAgentInventoryLocked(reason string) error {
 		len(payload.VibeSessions),
 		len(payload.AuthorizedDirectories),
 	))
-	raw, err := s.callAgentServerWithDeviceToken(http.MethodPost, endpoint, payload, deviceToken)
+	raw, err := s.callAgentServer(http.MethodPost, endpoint, payload, authHeader)
 	if err != nil {
+		var authRejected agentUserAuthRejectedError
+		if errors.As(err, &authRejected) {
+			// A JWT 401 is an authentication state transition, not a transient
+			// inventory failure. Mark the Agent unavailable before the caller starts
+			// refresh/hard-invalid recovery so status cannot remain "registered".
+			s.state.Enabled = false
+			s.state.Registered = false
+			s.state.RemoteConnected = false
+			s.state.LastSyncStatus = "auth_expired"
+			s.state.LastSyncMessage = err.Error()
+			_ = s.saveStateLocked()
+		}
 		return err
 	}
 	var resp agentStatusSyncResponse
@@ -1870,40 +1745,12 @@ func (s *AgentService) PushSessionRefresh() {
 }
 
 func CanUseAdminConsoleAgentRegistration() bool {
-	return shouldUseAdminConsoleAgentRegistration("", false)
-}
-
-func shouldUseAdminConsoleAgentRegistration(authHeader string, hasDeviceToken bool) bool {
-	if hasDeviceToken || strings.TrimSpace(authHeader) != "" {
-		return false
-	}
-	cfg := config.GetGlobalConfig()
-	if cfg == nil {
-		return false
-	}
-	return isLoopbackAgentServer(cfg.AgentBaseURL())
-}
-
-func isLoopbackAgentServer(rawURL string) bool {
-	parsed, err := url.Parse(strings.TrimSpace(rawURL))
-	if err != nil {
-		return false
-	}
-	host := strings.ToLower(strings.TrimSpace(parsed.Hostname()))
-	switch host {
-	case "localhost", "127.0.0.1", "::1":
-		return true
-	default:
-		return false
-	}
+	return false
 }
 
 func agentRegistrationUserKey(userKey string, authHeader string) string {
 	if key := currentAgentUserKey(userKey, authHeader); key != "" {
 		return key
-	}
-	if shouldUseAdminConsoleAgentRegistration(authHeader, false) {
-		return "admin-console:" + currentAgentServerURL()
 	}
 	return ""
 }
@@ -1964,7 +1811,7 @@ func requestLocalUserAgentRecoverAfterAuthExpired() error {
 
 func requestLocalUserAgentEnsureConnection() error {
 	// /api/agent/reconnect is idempotent (EnsureRemoteConnection is a no-op when
-	// already connected/connecting, or when there is no device_token), so this is
+	// already connected/connecting, disabled, or unauthenticated), so this is
 	// a safe nudge from the main process after every successful token refresh.
 	endpoint := strings.TrimRight(localUserAgentBaseURL(), "/") + "/api/agent/reconnect"
 	return requestLocalUserAgentPost(endpoint, "", "")
@@ -2114,10 +1961,9 @@ func remoteStringSlice(msg map[string]interface{}, key string) []string {
 	return out
 }
 
-func buildAgentRegisterPayload(deviceID string, uniqueCode string) agentRegisterPayload {
+func buildAgentRegisterPayload(deviceID string) agentRegisterPayload {
 	return agentRegisterPayload{
-		DeviceID:   deviceID,
-		UniqueCode: uniqueCode,
+		DeviceID: deviceID,
 	}
 }
 
@@ -2132,7 +1978,6 @@ func (s *AgentService) buildAgentStatusSyncPayloadLocked(status string) agentSta
 	return agentStatusSyncPayload{
 		DeviceID:              s.state.DeviceID,
 		Status:                status,
-		UniqueCode:            s.state.UniqueCode,
 		DeviceName:            snapshot.DeviceName,
 		Platform:              snapshot.Platform,
 		AgentVersion:          snapshot.AgentVersion,
@@ -2157,7 +2002,7 @@ func (s *AgentService) collectAgentSyncSnapshotWithActiveRuns(scanDirs []string)
 	return overlayActiveAgentVibeSessions(snapshot, s.ai.activeVibeSessionsSnapshot(), scanDirs)
 }
 
-func normalizeRegisteredAgentDevice(resp agentRegisterResponse, fallbackDeviceID string, fallbackUniqueCode string) *models.AgentDevice {
+func normalizeRegisteredAgentDevice(resp agentRegisterResponse, fallbackDeviceID string) *models.AgentDevice {
 	now := time.Now().UTC().Format(time.RFC3339)
 	if resp.Device != nil {
 		device := *resp.Device
@@ -2167,7 +2012,6 @@ func normalizeRegisteredAgentDevice(resp agentRegisterResponse, fallbackDeviceID
 		if strings.TrimSpace(device.DeviceID) == "" {
 			device.DeviceID = firstNonEmpty(resp.DeviceID, device.ID, fallbackDeviceID)
 		}
-		device.UniqueCode = firstNonEmpty(fallbackUniqueCode, device.UniqueCode, resp.UniqueCode)
 		if strings.TrimSpace(device.UserID) == "" {
 			device.UserID = firstNonEmpty(resp.UserID, userIDFromIdentity(resp.User))
 		}
@@ -2179,13 +2023,11 @@ func normalizeRegisteredAgentDevice(resp agentRegisterResponse, fallbackDeviceID
 	}
 
 	deviceID := firstNonEmpty(resp.DeviceID, fallbackDeviceID)
-	uniqueCode := firstNonEmpty(fallbackUniqueCode, resp.UniqueCode)
 	device := &models.AgentDevice{
 		ID:                    deviceID,
 		DeviceID:              deviceID,
 		UserID:                firstNonEmpty(resp.UserID, userIDFromIdentity(resp.User)),
 		User:                  resp.User,
-		UniqueCode:            uniqueCode,
 		Name:                  firstNonEmpty(resp.DeviceName, resp.Name, defaultAgentDeviceName()),
 		Platform:              firstNonEmpty(resp.Platform, agentPlatform()),
 		AgentVersion:          agentVersion(),
@@ -2214,9 +2056,6 @@ func fillAgentDeviceDefaults(device *models.AgentDevice, now string) {
 	}
 	if strings.TrimSpace(device.UserID) == "" && device.User != nil {
 		device.UserID = strings.TrimSpace(device.User.ID)
-	}
-	if strings.TrimSpace(device.UniqueCode) == "" {
-		device.UniqueCode = newAgentUniqueDeviceCode()
 	}
 	if strings.TrimSpace(device.Name) == "" {
 		device.Name = defaultAgentDeviceName()

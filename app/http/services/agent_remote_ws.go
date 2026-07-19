@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"runtime"
 	"strings"
@@ -19,12 +20,17 @@ import (
 func (s *AgentService) EnsureRemoteConnection() error {
 	s.mu.Lock()
 	s.ensureDeviceIdentityLocked()
-	token := strings.TrimSpace(s.state.DeviceToken)
 	enabled := s.state.Enabled
+	registered := s.state.Registered
+	authHeader := s.effectiveUserAuthorizationLocked("")
 	s.mu.Unlock()
-	if token == "" {
-		logger.Info("[AGENT-BOOT] remote_connection skipped reason=no_device_token")
-		return errors.New("device token is not available; register this device first")
+	if !registered {
+		logger.Info("[AGENT-BOOT] remote_connection skipped reason=device_not_registered")
+		return errors.New("device is not registered")
+	}
+	if strings.TrimSpace(authHeader) == "" {
+		logger.Info("[AGENT-BOOT] remote_connection skipped reason=no_user_authorization")
+		return errors.New("user authorization is not available")
 	}
 	if !enabled {
 		logger.Info("[AGENT-BOOT] remote_connection skipped reason=agent_disabled")
@@ -47,7 +53,7 @@ func (s *AgentService) EnsureRemoteConnection() error {
 func (s *AgentService) remoteConnectionLoop() {
 	defer func() {
 		// The remote connection is being torn down for good (disabled / no
-		// token): clean up AI sessions that were deliberately kept alive across
+		// authorization): clean up AI sessions deliberately kept alive across
 		// transient reconnects inside runRemoteAgentSession.
 		s.ai.closeAll()
 		s.wsMu.Lock()
@@ -56,17 +62,17 @@ func (s *AgentService) remoteConnectionLoop() {
 	}()
 
 	for {
-		token, shouldRun := s.remoteConnectionSnapshot()
+		identity, shouldRun := s.remoteConnectionSnapshot()
 		if !shouldRun {
 			if s.shouldPreserveDisabledStatus() {
 				return
 			}
-			logger.Info("[AGENT-BOOT] remote_connection loop_stop reason=disabled_or_missing_token")
+			logger.Info("[AGENT-BOOT] remote_connection loop_stop reason=disabled_unregistered_or_missing_auth")
 			s.setRemoteConnectionState(false, "offline", "")
 			return
 		}
 
-		wsURL, err := currentAgentWebSocketURL(token, s.currentAccessToken())
+		wsURL, err := currentAgentWebSocketURL()
 		if err != nil {
 			logger.Warn(fmt.Sprintf("[AGENT-BOOT] remote_connection ws_url_failed error=%v", err))
 			s.setRemoteConnectionState(false, "connect_failed", err.Error())
@@ -75,8 +81,22 @@ func (s *AgentService) remoteConnectionLoop() {
 		}
 
 		logger.Info(fmt.Sprintf("[AGENT-BOOT] remote_connection dialing endpoint=%s", sanitizeAgentEndpoint(wsURL)))
-		conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+		headers := http.Header{}
+		headers.Set("Authorization", identity.authorization)
+		headers.Set("X-Aliang-Device-ID", identity.deviceID)
+		conn, resp, err := websocket.DefaultDialer.Dial(wsURL, headers)
 		if err != nil {
+			if resp != nil && resp.StatusCode == http.StatusUnauthorized {
+				// The websocket is authenticated with the same user JWT as the
+				// register/status calls. A handshake 401 is therefore a real auth
+				// transition: stop the Agent immediately and let the session owner
+				// run refresh/hard-invalid handling instead of retrying forever.
+				s.disableWithReasonMessage("auth_expired", "Agent server rejected the user authorization during websocket handshake.")
+				if !IsUserAgentRuntime() {
+					agentAuthRejectedHandler()
+				}
+				return
+			}
 			logger.Warn(fmt.Sprintf("[AGENT-BOOT] remote_connection dial_failed endpoint=%s error=%v", sanitizeAgentEndpoint(wsURL), err))
 			s.setRemoteConnectionState(false, "connect_failed", err.Error())
 			time.Sleep(2 * time.Second)
@@ -164,7 +184,7 @@ func (s *AgentService) shouldPreserveDisabledStatus() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	switch normalizeAgentDisableReason(s.state.LastSyncStatus) {
-	case "disabled", "logout", "auth_expired", "device_token_invalid", "device_unbound":
+	case "disabled", "logout", "auth_expired", "refresh_invalid", "soft_expiry_timeout", "revoked", "device_unbound":
 		return true
 	default:
 		return false
@@ -516,7 +536,7 @@ func remoteAgentMessageRequiresEnabledDevice(msgType string) bool {
 func (s *AgentService) remoteControlAllowed() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.state.Enabled && strings.TrimSpace(s.state.DeviceToken) != ""
+	return s.state.Enabled && s.state.Registered
 }
 
 // DispatchLocalAI routes a single in-process AI protocol event to the agent AI
@@ -556,11 +576,20 @@ func (s *AgentService) DispatchLocalAI(msg map[string]interface{}, writeJSON fun
 	}
 }
 
-func (s *AgentService) remoteConnectionSnapshot() (string, bool) {
+type remoteConnectionIdentity struct {
+	authorization string
+	deviceID      string
+}
+
+func (s *AgentService) remoteConnectionSnapshot() (remoteConnectionIdentity, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	token := strings.TrimSpace(s.state.DeviceToken)
-	return token, token != "" && s.state.Enabled
+	authHeader := strings.TrimSpace(s.effectiveUserAuthorizationLocked(""))
+	identity := remoteConnectionIdentity{
+		authorization: authHeader,
+		deviceID:      strings.TrimSpace(s.state.DeviceID),
+	}
+	return identity, authHeader != "" && identity.deviceID != "" && s.state.Enabled && s.state.Registered
 }
 
 func (s *AgentService) setRemoteConnectionState(connected bool, status string, message string) {
@@ -572,7 +601,9 @@ func (s *AgentService) setRemoteConnectionState(connected bool, status string, m
 
 func (s *AgentService) setRemoteConnectionStateLocked(connected bool, status string, message string) {
 	s.state.RemoteConnected = connected
-	s.state.Registered = connected || strings.TrimSpace(s.state.DeviceToken) != ""
+	if connected {
+		s.state.Registered = true
+	}
 	s.state.LastSyncAt = time.Now().UTC().Format(time.RFC3339)
 	s.state.LastSyncStatus = status
 	s.state.LastSyncMessage = message
@@ -591,7 +622,6 @@ func (s *AgentService) agentHelloPayload() map[string]interface{} {
 	s.mu.Lock()
 	s.ensureDeviceIdentityLocked()
 	deviceID := s.state.DeviceID
-	uniqueCode := s.state.UniqueCode
 	scanDirs := activeScanDirs(s.state.ScanDirectories, s.state.ScanDirectoriesEnabled)
 	s.mu.Unlock()
 
@@ -600,7 +630,6 @@ func (s *AgentService) agentHelloPayload() map[string]interface{} {
 		"type":                   models.AgentEventHello,
 		"protocol_version":       models.AgentProtocolVersion,
 		"device_id":              deviceID,
-		"unique_code":            uniqueCode,
 		"device_name":            snapshot.DeviceName,
 		"platform":               snapshot.Platform,
 		"agent_version":          snapshot.AgentVersion,
@@ -620,7 +649,7 @@ func (s *AgentService) agentHelloPayload() map[string]interface{} {
 func (s *AgentService) remoteTerminalEnabled() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.state.Enabled || strings.TrimSpace(s.state.DeviceToken) == "" {
+	if !s.state.Enabled || !s.state.Registered {
 		return false
 	}
 	if s.state.Device == nil {
@@ -632,7 +661,7 @@ func (s *AgentService) remoteTerminalEnabled() bool {
 func (s *AgentService) aiControlEnabled() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.state.Enabled || strings.TrimSpace(s.state.DeviceToken) == "" {
+	if !s.state.Enabled || !s.state.Registered {
 		return false
 	}
 	if s.state.Device == nil {
@@ -648,7 +677,7 @@ func (s *AgentService) currentDeviceID() string {
 	return s.state.DeviceID
 }
 
-func currentAgentWebSocketURL(token, userToken string) (string, error) {
+func currentAgentWebSocketURL() (string, error) {
 	cfg := config.GetGlobalConfig()
 	if cfg == nil || strings.TrimSpace(cfg.AgentBaseURL()) == "" {
 		return "", errors.New("agent server is not configured")
@@ -671,15 +700,6 @@ func currentAgentWebSocketURL(token, userToken string) (string, error) {
 	}
 	parsed.Path = models.AgentWSEndpoint
 	parsed.RawQuery = ""
-	values := parsed.Query()
-	values.Set("token", token)
-	// Present the current user JWT so a reconnect after a stale-exp kick
-	// self-heals: PhoneServer refreshes the device's userTokenExp from a valid
-	// future-exp token before running the handshake gate.
-	if strings.TrimSpace(userToken) != "" {
-		values.Set("user_token", userToken)
-	}
-	parsed.RawQuery = values.Encode()
 	return parsed.String(), nil
 }
 

@@ -19,40 +19,30 @@ func TestDeriveRegistrationState(t *testing.T) {
 	withAgentServerConfig(t)
 
 	cases := []struct {
-		name  string
-		token string
-		sync  string
-		msg   string
-		want  string
+		name       string
+		registered bool
+		sync       string
+		msg        string
+		want       string
 	}{
-		// A cached device_token is the live authority for "registered": the
-		// server issued it and clears it on rejection, so while it is present the
-		// device is in good standing. The user-session status (auth_expired /
-		// login_required) is a connection concern and must NOT downgrade a
-		// registered device. This is the regression guard for the "logged in but
-		// agent offline" inconsistency.
-		{"registered with token", "dev-token", "online", "", registrationRegistered},
-		{"token present survives auth_expired", "dev-token", "auth_expired", "", registrationRegistered},
-		{"token present survives login_required", "dev-token", "login_required", "", registrationRegistered},
-		{"token present overrides stale rejection status", "dev-token", "device_token_invalid", "", registrationRegistered},
-
-		// No device_token: the reason comes from the last sync outcome. Note the
-		// rejection cases carry NO token — a real server rejection clears it, so
-		// "rejected with a token still present" is contradictory state that the
-		// derive logic resolves in favor of the live token (registered) above.
-		{"unregistered no token", "", "", "", registrationUnregistered},
-		{"login_required", "", "login_required", "", registrationLoginRequired},
-		{"auth_expired maps to login_required", "", "auth_expired", "", registrationLoginRequired},
-		{"device_token_invalid is rejected", "", "device_token_invalid", "agent server returned 401: authentication_required", registrationRejected},
-		{"device_id_conflict is rejected", "", "device_id_conflict", "", registrationRejected},
-		{"device_unbound is rejected", "", "device_unbound", "", registrationRejected},
-		{"enable_failed with 401 is rejected", "", "enable_failed", "returned 401: authentication_required", registrationRejected},
-		{"enable_failed network error stays unregistered", "", "enable_failed", "dial tcp: i/o timeout", registrationUnregistered},
+		{"registered", true, "online", "", registrationRegistered},
+		{"hard invalid overrides stale registered state", true, "auth_expired", "", registrationLoginRequired},
+		{"login required overrides stale registered state", true, "login_required", "", registrationLoginRequired},
+		{"unregistered", false, "", "", registrationUnregistered},
+		{"login_required", false, "login_required", "", registrationLoginRequired},
+		{"auth_expired maps to login_required", false, "auth_expired", "", registrationLoginRequired},
+		{"refresh_invalid maps to login_required", false, "refresh_invalid", "", registrationLoginRequired},
+		{"soft_expiry_timeout maps to login_required", false, "soft_expiry_timeout", "", registrationLoginRequired},
+		{"revoked maps to login_required", false, "revoked", "", registrationLoginRequired},
+		{"device_id_conflict is rejected", false, "device_id_conflict", "", registrationRejected},
+		{"device_unbound is rejected", false, "device_unbound", "", registrationRejected},
+		{"enable_failed with 401 is rejected", false, "enable_failed", "returned 401: authentication_required", registrationRejected},
+		{"enable_failed network error stays unregistered", false, "enable_failed", "dial tcp: i/o timeout", registrationUnregistered},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			svc := &AgentService{}
-			svc.state.DeviceToken = c.token
+			svc.state.Registered = c.registered
 			svc.state.LastSyncStatus = c.sync
 			svc.state.LastSyncMessage = c.msg
 			got, _ := svc.deriveRegistrationStateLocked()
@@ -66,7 +56,6 @@ func TestDeriveRegistrationState(t *testing.T) {
 func TestDeriveRegistrationState_NotConfigured(t *testing.T) {
 	config.ResetGlobalConfigForTest() // currentAgentServerURL() → ""
 	svc := &AgentService{}
-	svc.state.DeviceToken = "whatever"
 	got, _ := svc.deriveRegistrationStateLocked()
 	if got != registrationNotConfigured {
 		t.Errorf("without agent server config = %q, want %q", got, registrationNotConfigured)
@@ -87,6 +76,9 @@ func TestDeriveConnectionState(t *testing.T) {
 		// session is restored. This keeps the UI from crying "connection error"
 		// during an ordinary login blip.
 		{"auth_expired is idle not error", false, "auth_expired", connectionDisconnected},
+		{"refresh_invalid is idle not error", false, "refresh_invalid", connectionDisconnected},
+		{"soft_expiry_timeout is idle not error", false, "soft_expiry_timeout", connectionDisconnected},
+		{"revoked is idle not error", false, "revoked", connectionDisconnected},
 		{"login_required is idle not error", false, "login_required", connectionDisconnected},
 		{"connect_failed is error", false, "connect_failed", connectionError},
 		{"disconnected is error", false, "disconnected", connectionError},
@@ -108,15 +100,12 @@ func TestDeriveConnectionState(t *testing.T) {
 }
 
 // TestRegistrationRejectedCarriesMessage ensures the rejected state surfaces a
-// non-empty, informative registration_message (the persisted 401 body). The token
-// is empty here because a real server rejection clears it — that is what lets
-// the derive logic take the rejected branch.
+// non-empty, informative registration_message for a server-side unbind.
 func TestRegistrationRejectedCarriesMessage(t *testing.T) {
 	withAgentServerConfig(t)
 	svc := &AgentService{}
-	svc.state.DeviceToken = ""
-	svc.state.LastSyncStatus = "device_token_invalid"
-	svc.state.LastSyncMessage = "Agent mode was disabled because the device token was rejected. Server response: {\"error\":\"authentication_required\"}"
+	svc.state.LastSyncStatus = "device_unbound"
+	svc.state.LastSyncMessage = "Agent mode was disabled because the device was unbound."
 	state, msg := svc.deriveRegistrationStateLocked()
 	if state != registrationRejected {
 		t.Fatalf("state = %q, want %q", state, registrationRejected)

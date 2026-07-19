@@ -21,11 +21,9 @@ var (
 )
 
 // refreshRejectionPhrases are lowercase substrings the auth backend emits (in
-// either the "message" or "error" field) to signal that a refresh token was
-// rejected. The backend is inconsistent across endpoints: password-login
-// refresh returns {"code":401,"reason":"REFRESH_TOKEN_INVALID","message":
-// "invalid refresh token"}, while the scan/st_ path returns a bare
-// {"error":"refresh token is no longer valid"} with no code/reason/message.
+// either the "message" or "error" field) to describe a rejected refresh
+// credential. A refresh endpoint 401 is terminal even when the body is not one
+// of these known shapes; the phrases are retained for diagnostics and tests.
 var refreshRejectionPhrases = []string{
 	"invalid refresh token",
 	"refresh token is no longer valid",
@@ -60,7 +58,7 @@ func classifyRefreshSessionFailure(statusCode int, body []byte) error {
 	// very field we must match on.
 	var envelope map[string]any
 	if err := json.Unmarshal(body, &envelope); err != nil {
-		return nil
+		return ErrRefreshTokenInvalid
 	}
 
 	reason := strings.ToUpper(strings.TrimSpace(stringValue(envelope["reason"])))
@@ -72,10 +70,12 @@ func classifyRefreshSessionFailure(statusCode int, body []byte) error {
 		return ErrRefreshTokenInvalid
 	}
 
-	// Unrecognized 401 (e.g. a transient "reason":"OTHER") stays nil so
-	// RestoreSession keeps retrying instead of wiping a session whose refresh
-	// token may still be valid.
-	return nil
+	// A refresh endpoint has already authenticated the refresh credential before
+	// issuing a new access token. Its 401 is therefore a definitive rejection,
+	// including unknown JSON and the backend's "local session is no longer valid"
+	// response. Network errors and 5xx responses remain retryable because they do
+	// not prove that the credential is dead.
+	return ErrRefreshTokenInvalid
 }
 
 func classifyAccessTokenFailure(statusCode int, body []byte) error {

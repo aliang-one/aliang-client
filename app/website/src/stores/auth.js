@@ -20,6 +20,11 @@ const state = reactive({
   lastActionMessage: ''
 });
 
+// Incremented whenever authentication is accepted or invalidated. Async login
+// and restore responses capture the current epoch so an older response cannot
+// resurrect the UI after a HardInvalid/logout event has already cleared it.
+let sessionEpoch = 0;
+
 function normalizeUser(user) {
   if (!user || typeof user !== 'object') {
     return null;
@@ -45,6 +50,7 @@ function normalizeUser(user) {
 }
 
 function applyAuthenticatedState(user, message = '') {
+  sessionEpoch += 1;
   state.user = normalizeUser(user);
   state.isAuthenticated = Boolean(state.user);
   state.status = state.isAuthenticated ? 'authenticated' : 'unauthenticated';
@@ -54,6 +60,7 @@ function applyAuthenticatedState(user, message = '') {
 }
 
 function applyUnauthenticatedState(message = '', options = {}) {
+  sessionEpoch += 1;
   state.user = null;
   state.isAuthenticated = false;
   state.status = 'unauthenticated';
@@ -77,7 +84,11 @@ export function syncAuthFromStartupStatus(data) {
   const user = data.user;
   const fetchSuccess = data.fetch_success;
 
-  if (user && typeof user === 'object' && fetchSuccess) {
+  // Startup polling is a logout/reconciliation backstop, not a login source.
+  // Only an explicit login/restore or Active SSE transition may authenticate a
+  // previously unauthenticated UI. This blocks a stale in-flight READY response
+  // from resurrecting the user after HardInvalid.
+  if (state.isAuthenticated && user && typeof user === 'object' && fetchSuccess) {
     const normalized = normalizeUser(user);
     if (normalized) {
       state.user = normalized;
@@ -121,9 +132,13 @@ export async function restoreAuthSession() {
   state.status = 'restoring';
   state.restoreError = '';
   state.lastActionMessage = '';
+  const requestEpoch = sessionEpoch;
 
   try {
     const result = await restoreSessionRequest();
+    if (requestEpoch !== sessionEpoch) {
+      return state.isAuthenticated;
+    }
     if (result.status === 'success' && result.data) {
       applyAuthenticatedState(result.data, result.message || t('auth_sessionRestored'));
       return true;
@@ -146,9 +161,13 @@ export async function loginWithPassword(credentials) {
   state.loginPending = true;
   state.loginError = '';
   state.lastActionMessage = '';
+  const requestEpoch = sessionEpoch;
 
   try {
     const result = await loginRequest(credentials);
+    if (requestEpoch !== sessionEpoch) {
+      return state.isAuthenticated;
+    }
     if (result.status !== 'success' || !result.data) {
       throw new Error(result.message || t('auth_loginFailed'));
     }
@@ -157,6 +176,10 @@ export async function loginWithPassword(credentials) {
     state.isReady = true;
     return true;
   } catch (error) {
+    if (requestEpoch !== sessionEpoch) {
+      return false;
+    }
+    sessionEpoch += 1;
     state.user = null;
     state.isAuthenticated = false;
     state.status = 'unauthenticated';
@@ -175,9 +198,13 @@ export async function completeScanLogin({ sessionToken, refreshToken }) {
   state.loginPending = true;
   state.loginError = '';
   state.lastActionMessage = '';
+  const requestEpoch = sessionEpoch;
 
   try {
     const result = await activateScanLoginRequest({ sessionToken, refreshToken });
+    if (requestEpoch !== sessionEpoch) {
+      return state.isAuthenticated;
+    }
     if (result.status !== 'success' || !result.data) {
       throw new Error(result.message || t('auth_loginFailed'));
     }
@@ -186,6 +213,10 @@ export async function completeScanLogin({ sessionToken, refreshToken }) {
     state.isReady = true;
     return true;
   } catch (error) {
+    if (requestEpoch !== sessionEpoch) {
+      return false;
+    }
+    sessionEpoch += 1;
     state.user = null;
     state.isAuthenticated = false;
     state.status = 'unauthenticated';

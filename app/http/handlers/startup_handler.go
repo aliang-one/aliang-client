@@ -28,6 +28,12 @@ func (h *StartupHandler) HandleStartupStatus(w http.ResponseWriter, r *http.Requ
 	status := startupState.GetStatus()
 	fetchSuccess := startupState.GetFetchSuccess()
 	userInfo := authuser.GetCurrentUserInfoOrLoad()
+	status, fetchSuccess, userInfo = effectiveStartupAuthSnapshot(
+		status,
+		fetchSuccess,
+		userInfo,
+		authuser.GetSessionAuthority().State(),
+	)
 
 	// Build response data
 	response := map[string]interface{}{
@@ -54,6 +60,16 @@ func (h *StartupHandler) HandleStartupStatus(w http.ResponseWriter, r *http.Requ
 	response["transitions"] = getStatusTransitionInfo(status)
 
 	common.Success(w, response)
+}
+
+func effectiveStartupAuthSnapshot(status runtime.StartupStatus, fetchSuccess bool, userInfo *authuser.UserInfo, sessionState authuser.SessionState) (runtime.StartupStatus, bool, *authuser.UserInfo) {
+	if sessionState != authuser.StateHardInvalid && sessionState != authuser.StateUnauthenticated {
+		return status, fetchSuccess, userInfo
+	}
+	// Do not resurrect a persisted profile after the authority has declared the
+	// session dead. The frontend polls this endpoint as a recovery backstop when
+	// an SSE transition is delayed or unavailable.
+	return runtime.UNCONFIGURED, false, nil
 }
 
 // HandleStartupDetail handles GET /api/startup/detail

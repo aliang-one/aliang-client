@@ -88,19 +88,7 @@ func ServeSessionEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
 
-	snapshot := map[string]any{
-		"type":  "snapshot",
-		"state": auth.GetSessionAuthority().State().String(),
-	}
-	if user := auth.GetCurrentUserInfo(); user != nil {
-		snapshot["user"] = map[string]any{
-			"id":       user.ID,
-			"email":    user.Email,
-			"username": user.Username,
-			"role":     user.Role,
-			"status":   user.Status,
-		}
-	}
+	snapshot := buildSessionSnapshot(auth.GetSessionAuthority().State(), auth.GetCurrentUserInfo())
 	writeSSE(w, snapshot)
 	flusher.Flush()
 
@@ -125,6 +113,23 @@ func ServeSessionEvents(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 		}
 	}
+}
+
+func buildSessionSnapshot(state auth.SessionState, user *auth.UserInfo) map[string]any {
+	snapshot := map[string]any{
+		"type":  "snapshot",
+		"state": state.String(),
+	}
+	if user != nil && (state == auth.StateActive || state == auth.StateSoftExpired) {
+		snapshot["user"] = map[string]any{
+			"id":       user.ID,
+			"email":    user.Email,
+			"username": user.Username,
+			"role":     user.Role,
+			"status":   user.Status,
+		}
+	}
+	return snapshot
 }
 
 func writeSSE(w http.ResponseWriter, payload map[string]any) {

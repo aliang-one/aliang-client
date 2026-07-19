@@ -153,7 +153,7 @@ func TestHandleRemoteAgentMessage_RoutesWorkingTreeDiff(t *testing.T) {
 	svc := &AgentService{terminal: newAgentTerminalManager(), ai: newAgentAIManager()}
 	svc.mu.Lock()
 	svc.state.Enabled = true
-	svc.state.DeviceToken = "dt_test"
+	svc.state.Registered = true
 	svc.mu.Unlock()
 	defer svc.ai.closeAll()
 

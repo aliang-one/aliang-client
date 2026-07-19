@@ -153,16 +153,16 @@ func TestClassifyRefreshSessionFailure_KnownPatterns(t *testing.T) {
 			wantErr:    nil,
 		},
 		{
-			name:       "unknown 401 returns nil",
+			name:       "unknown 401 is terminal",
 			statusCode: http.StatusUnauthorized,
 			body:       `{"code":401,"reason":"OTHER","message":"something else"}`,
-			wantErr:    nil,
+			wantErr:    ErrRefreshTokenInvalid,
 		},
 		{
-			name:       "invalid JSON 401 returns nil",
+			name:       "invalid JSON 401 is terminal",
 			statusCode: http.StatusUnauthorized,
 			body:       `not json`,
-			wantErr:    nil,
+			wantErr:    ErrRefreshTokenInvalid,
 		},
 		// The auth backend's scan/st_ refresh path returns a bare {"error": ...}
 		// with no code/reason/message fields. The classifier must still recognize
@@ -185,6 +185,12 @@ func TestClassifyRefreshSessionFailure_KnownPatterns(t *testing.T) {
 			name:       "error field: refresh token has been revoked",
 			statusCode: http.StatusUnauthorized,
 			body:       `{"error":"refresh token has been revoked"}`,
+			wantErr:    ErrRefreshTokenInvalid,
+		},
+		{
+			name:       "error field: local session is no longer valid",
+			statusCode: http.StatusUnauthorized,
+			body:       `{"error":"local session is no longer valid"}`,
 			wantErr:    ErrRefreshTokenInvalid,
 		},
 		{

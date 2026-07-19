@@ -49,7 +49,6 @@ type AgentDevice struct {
 	DeviceID              string             `json:"device_id,omitempty"`
 	UserID                string             `json:"user_id,omitempty"`
 	User                  *AgentUserIdentity `json:"user,omitempty"`
-	UniqueCode            string             `json:"unique_code,omitempty"`
 	Name                  string             `json:"name"`
 	Platform              string             `json:"platform"`
 	AgentVersion          string             `json:"agent_version,omitempty"`

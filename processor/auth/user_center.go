@@ -187,8 +187,19 @@ func callUserCenterAPI(method, endpoint string, body any) ([]byte, error) {
 			// skew, or a momentary network failure surfacing as 401). Confirm the
 			// session is really dead before wiping — wiping forces a full re-login
 			// and is the reason a single hiccup took the agent offline.
-			if sessionConfirmedDeadAfter401() {
+			dead, refreshed := recoverSessionAfter401()
+			if dead {
 				return nil, ErrSessionExpired
+			}
+			if refreshed {
+				current := GetCurrentUserInfoOrLoad()
+				if current == nil || strings.TrimSpace(current.AccessToken) == "" {
+					return nil, ErrSessionExpired
+				}
+				// Do not expose a recoverable upstream 401 to the browser. The
+				// frontend correctly treats every local 401 as a hard-invalid signal,
+				// so a successful refresh must retry the original operation here.
+				return callAuthenticatedAPI(method, endpoint, current.AccessToken, body)
 			}
 			// Transient: retain the session (and the freshly refreshed token) so
 			// the caller retries next cycle instead of forcing a re-login.
@@ -199,29 +210,28 @@ func callUserCenterAPI(method, endpoint string, body any) ([]byte, error) {
 	return responseBody, nil
 }
 
-// sessionConfirmedDeadAfter401 decides whether a 401 from a user-center API
-// really means the local session is dead. It probes liveness by attempting a
+// recoverSessionAfter401 decides whether a 401 from a user-center API really
+// means the local session is dead. It probes liveness by attempting a
 // token refresh:
 //   - refresh succeeds  -> the session is alive; the 401 was spurious.
 //   - refresh fails      -> if the refresh attempt itself invalidated the
-//                           session (refresh token rejected) the session is
-//                           genuinely dead; otherwise the refresh failure was
-//                           transient (e.g. network) and we keep the session so
-//                           the caller retries later.
+//     session (refresh token rejected) the session is
+//     genuinely dead; otherwise the refresh failure was
+//     transient (e.g. network) and we keep the session so
+//     the caller retries later.
 //
-// Returns true only when the session is confirmed dead. In that case the
-// session has already been wiped by the refresh path, so callers must NOT wipe
-// again (doing so would re-fire the auth-expired side effects).
-func sessionConfirmedDeadAfter401() bool {
+// The first result is true only when the session is confirmed dead. The second
+// reports a successful refresh so the caller can retry the original request.
+func recoverSessionAfter401() (dead bool, refreshed bool) {
 	if refreshed, refreshErr := RefreshSession(""); refreshErr == nil && refreshed != nil {
-		logger.Warn("user-center API returned 401 but token refresh succeeded; treating 401 as transient and retaining session")
-		return false
+		logger.Warn("user-center API returned 401 but token refresh succeeded; retrying with the renewed access token")
+		return false, true
 	}
 	if GetCurrentUserInfoOrLoad() == nil {
-		return true
+		return true, false
 	}
 	logger.Warn("user-center API returned 401 and refresh failed transiently; retaining session for retry")
-	return false
+	return false, false
 }
 
 func resolveAuthTokenForEndpoint(endpoint string) (string, error) {

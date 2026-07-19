@@ -42,14 +42,13 @@ func agentIdentityFilePathForTest(t *testing.T) string {
 
 // The device_id is an installation-permanent identity: generated once and never
 // regenerated. A fresh process that reads the same on-disk identity file must
-// resolve the exact same id + unique_code.
+// resolve the exact same id without minting any secondary credential.
 func TestAgentDeviceIdentityGeneratedOncePersistsAcrossRestart(t *testing.T) {
 	setupAgentIdentityTestEnv(t)
 
 	svc1 := NewAgentService()
 	svc1.mu.Lock()
 	id1 := svc1.resolveDeviceIDLocked()
-	uc1 := svc1.state.UniqueCode
 	_ = svc1.saveStateLocked()
 	svc1.mu.Unlock()
 	if !strings.HasPrefix(id1, "dev-") {
@@ -60,13 +59,9 @@ func TestAgentDeviceIdentityGeneratedOncePersistsAcrossRestart(t *testing.T) {
 	svc2 := NewAgentService()
 	svc2.mu.Lock()
 	id2 := svc2.resolveDeviceIDLocked()
-	uc2 := svc2.state.UniqueCode
 	svc2.mu.Unlock()
 	if id2 != id1 {
 		t.Fatalf("device_id changed across restart: %q -> %q", id1, id2)
-	}
-	if uc2 != uc1 || uc1 == "" {
-		t.Fatalf("unique_code not stable across restart: %q -> %q", uc1, uc2)
 	}
 }
 
@@ -113,13 +108,13 @@ func TestAgentDeviceIdentityUnchangedByDisableAndUserSwitch(t *testing.T) {
 	svc.DisableWithReason("auth_expired")
 	svc.mu.Lock()
 	afterDisable := svc.resolveDeviceIDLocked()
-	// Drive the user-switch reset path directly: it must clear the token but
+	// Drive the user-switch reset path directly: it must clear registration but
 	// leave the device_id untouched.
-	svc.state.DeviceToken = "tok_should_be_cleared"
+	svc.state.Registered = true
 	svc.state.RegisteredUser = "user-A"
 	svc.resetRegisteredDeviceIfUserChangedLocked("user-B")
 	afterSwitch := svc.state.DeviceID
-	tokenAfter := svc.state.DeviceToken
+	registeredAfter := svc.state.Registered
 	svc.mu.Unlock()
 
 	if afterDisable != id {
@@ -128,8 +123,8 @@ func TestAgentDeviceIdentityUnchangedByDisableAndUserSwitch(t *testing.T) {
 	if afterSwitch != id {
 		t.Fatalf("device_id changed after user switch: %q -> %q", id, afterSwitch)
 	}
-	if tokenAfter != "" {
-		t.Fatalf("user-switch reset should clear token, got %q", tokenAfter)
+	if registeredAfter {
+		t.Fatal("user-switch reset should clear registration")
 	}
 }
 
@@ -163,10 +158,8 @@ func TestAgentServiceRegisterKeepsPermanentDeviceIDOnAlreadyBound(t *testing.T) 
 	svc := NewAgentService()
 	svc.mu.Lock()
 	svc.state.DeviceID = "dev_permanent"
-	svc.state.UniqueCode = "adc-permanent"
 	err := svc.registerAndSyncLocked()
 	idAfter := svc.state.DeviceID
-	ucAfter := svc.state.UniqueCode
 	status := svc.state.LastSyncStatus
 	svc.mu.Unlock()
 
@@ -175,9 +168,6 @@ func TestAgentServiceRegisterKeepsPermanentDeviceIDOnAlreadyBound(t *testing.T) 
 	}
 	if idAfter != "dev_permanent" {
 		t.Fatalf("device_id changed on already_bound: %q -> %q (must stay dev_permanent)", "dev_permanent", idAfter)
-	}
-	if ucAfter != "adc-permanent" {
-		t.Fatalf("unique_code changed on already_bound: %q -> %q", "adc-permanent", ucAfter)
 	}
 	if registerCalls != 1 {
 		t.Fatalf("register call count = %d, want 1 (no rotation retry)", registerCalls)
@@ -201,16 +191,22 @@ func TestAgentServiceRegisterIgnoresServerAssignedDeviceID(t *testing.T) {
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		if r.Method != http.MethodPost || r.URL.Path != "/api/devices/register" {
+		if r.Method != http.MethodPost {
+			http.NotFound(w, r)
+			return
+		}
+		if r.URL.Path == "/api/agent/status" {
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok"})
+			return
+		}
+		if r.URL.Path != "/api/devices/register" {
 			http.NotFound(w, r)
 			return
 		}
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"code": 0,
 			"data": map[string]interface{}{
-				"device_token": "dt_local",
-				"device_id":    "dev_server_assigned",
-				"unique_code":  "adc-server",
+				"device_id": "dev_server_assigned",
 				"device": map[string]interface{}{
 					"id":        "dev_server_assigned",
 					"device_id": "dev_server_assigned",
@@ -225,10 +221,8 @@ func TestAgentServiceRegisterIgnoresServerAssignedDeviceID(t *testing.T) {
 	svc := NewAgentService()
 	svc.mu.Lock()
 	svc.state.DeviceID = "dev_local"
-	svc.state.UniqueCode = "adc-local"
 	err := svc.registerAndSyncLocked()
 	idAfter := svc.state.DeviceID
-	ucAfter := svc.state.UniqueCode
 	svc.mu.Unlock()
 
 	if err != nil {
@@ -236,9 +230,6 @@ func TestAgentServiceRegisterIgnoresServerAssignedDeviceID(t *testing.T) {
 	}
 	if idAfter != "dev_local" {
 		t.Fatalf("server device_id overrode permanent id: %q (want dev_local)", idAfter)
-	}
-	if ucAfter != "adc-local" {
-		t.Fatalf("unique_code changed by server response: %q (want adc-local)", ucAfter)
 	}
 }
 
@@ -282,7 +273,7 @@ func TestAgentDeviceIdentityAdoptsExistingStateOnUpgrade(t *testing.T) {
 	if persisted["device_id"] != "dev_legacy" {
 		t.Fatalf("identity file device_id = %q, want dev_legacy", persisted["device_id"])
 	}
-	if persisted["unique_code"] != "adc-legacy" {
-		t.Fatalf("identity file unique_code = %q, want adc-legacy", persisted["unique_code"])
+	if _, ok := persisted["unique_code"]; ok {
+		t.Fatal("identity file must not persist unique_code")
 	}
 }

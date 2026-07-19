@@ -49,6 +49,7 @@ func resetAuthHooksForTest() {
 	ResetSharedRunServiceForTest()
 	proxyPausedForSoftExpiry = false
 	softExpiryRecoveryStarter = auth.StartSoftExpiryRecovery
+	userAgentDisableRequester = RequestUserAgentDisableForSessionEnd
 }
 
 func TestOnSessionEventSoftExpiredPausesProxyAndStartsRecovery(t *testing.T) {
@@ -112,6 +113,8 @@ func TestOnSessionEventHardInvalidRunsTeardown(t *testing.T) {
 	httpProxyIsRunningProbe = func() bool { return false }
 	var httpStops int
 	httpStopRunner = func() { httpStops++ }
+	var disableReasons []string
+	userAgentDisableRequester = func(reason string) { disableReasons = append(disableReasons, reason) }
 
 	rs := GetSharedRunService()
 	rs.SetCurrentMode("http")
@@ -127,6 +130,9 @@ func TestOnSessionEventHardInvalidRunsTeardown(t *testing.T) {
 	}
 	if rs.IsRunning() {
 		t.Fatal("expected isRunning=false after HardInvalid teardown")
+	}
+	if len(disableReasons) != 1 || disableReasons[0] != "refresh_invalid" {
+		t.Fatalf("agent disable reasons = %v, want [refresh_invalid]", disableReasons)
 	}
 }
 

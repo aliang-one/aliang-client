@@ -1,5 +1,6 @@
 import { clearChatIdentityProfileCache, persistChatIdentityProfile } from '../utils/chatIdentityCache';
 import { syncUnauthenticatedAuthState } from '../stores/auth';
+import { handleAuthenticationFailure } from './authFailure';
 
 function extractEnvelope(json) {
   const payload = json && typeof json === 'object' ? json : {};
@@ -27,12 +28,10 @@ async function request(path, options = {}) {
   const json = await response.json().catch(() => ({}));
   const envelope = extractEnvelope(json);
 
+  handleAuthenticationFailure(response.status, envelope, syncUnauthenticatedAuthState);
+
   if (!response.ok || envelope.code !== 0) {
     throw new Error(envelope.message || envelope.msg || `Request failed with HTTP ${response.status}`);
-  }
-
-  if (envelope.status === 'unauthenticated' || envelope.error === 'session_expired') {
-    syncUnauthenticatedAuthState(envelope.message || envelope.msg);
   }
 
   return envelope;

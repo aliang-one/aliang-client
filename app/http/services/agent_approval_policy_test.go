@@ -31,6 +31,18 @@ func setupAgentPolicyTestEnv(t *testing.T) {
 	})
 }
 
+func authorizeAgentPolicyTestService(t *testing.T, svc *AgentService) {
+	t.Helper()
+	if err := auth.SaveUserInfo(&auth.UserInfo{AccessToken: "test-user-jwt", TokenType: "Bearer"}); err != nil {
+		t.Fatalf("SaveUserInfo() error = %v", err)
+	}
+	svc.mu.Lock()
+	defer svc.mu.Unlock()
+	svc.ensureDeviceIdentityLocked()
+	svc.state.Registered = true
+	svc.forwardedUserAuthorization = "Bearer test-user-jwt"
+}
+
 // ruleIDs returns the ordered rule IDs of a policy — used to assert dangerous-first
 // ordering of the built-in template.
 func ruleIDs(p ApprovalPolicy) []string {
@@ -651,9 +663,7 @@ func TestEnsurePolicyHashMismatchRefetchesAndCaches(t *testing.T) {
 	config.SetGlobalConfig(&config.Config{Core: &config.CoreConfig{AgentServer: server.URL}})
 
 	svc := NewAgentService()
-	svc.mu.Lock()
-	svc.state.DeviceToken = "dev-tok"
-	svc.mu.Unlock()
+	authorizeAgentPolicyTestService(t, svc)
 
 	svc.ensurePolicyBeforeRun(context.Background(), "/proj/p")
 
@@ -690,8 +700,8 @@ func TestEnsurePolicyHashMatchSkipsRefetch(t *testing.T) {
 	svc := NewAgentService()
 	mem := builtinBalancedPolicy()
 	mem.Hash = "sha256:same"
+	authorizeAgentPolicyTestService(t, svc)
 	svc.mu.Lock()
-	svc.state.DeviceToken = "dev-tok"
 	svc.setEffectivePolicyForPathLocked("/proj/p", mem)
 	svc.mu.Unlock()
 
@@ -710,9 +720,7 @@ func TestEnsurePolicyFetchFailsFallsBackGracefully(t *testing.T) {
 	config.SetGlobalConfig(&config.Config{Core: &config.CoreConfig{AgentServer: server.URL}})
 
 	svc := NewAgentService()
-	svc.mu.Lock()
-	svc.state.DeviceToken = "dev-tok"
-	svc.mu.Unlock()
+	authorizeAgentPolicyTestService(t, svc)
 
 	// Must not block, panic, or error out — degrades to built-in balanced.
 	done := make(chan struct{})
@@ -730,7 +738,7 @@ func TestEnsurePolicyFetchFailsFallsBackGracefully(t *testing.T) {
 	}
 }
 
-func TestEnsurePolicySkipsWhenNoDeviceToken(t *testing.T) {
+func TestEnsurePolicySkipsWhenNoUserAuthorization(t *testing.T) {
 	setupAgentPolicyTestEnv(t)
 	hashHits := 0
 	server := approvalPolicyTestServer(t, `{"version":1,"hash":"sha256:x"}`, `{}`, &hashHits, nil, nil)
@@ -738,10 +746,10 @@ func TestEnsurePolicySkipsWhenNoDeviceToken(t *testing.T) {
 	config.SetGlobalConfig(&config.Config{Core: &config.CoreConfig{AgentServer: server.URL}})
 
 	svc := NewAgentService()
-	// No device token -> cannot authenticate -> skip sync entirely.
+	// No user JWT -> cannot authenticate -> skip sync entirely.
 	svc.ensurePolicyBeforeRun(context.Background(), "/proj/p")
 	if hashHits != 0 {
-		t.Fatalf("should not hit server without device token, got %d", hashHits)
+		t.Fatalf("should not hit server without user authorization, got %d", hashHits)
 	}
 }
 
@@ -757,9 +765,7 @@ func TestApplyRemoteProjectSettingsTriggersPolicyRefetch(t *testing.T) {
 	config.SetGlobalConfig(&config.Config{Core: &config.CoreConfig{AgentServer: server.URL}})
 
 	svc := NewAgentService()
-	svc.mu.Lock()
-	svc.state.DeviceToken = "dev-tok"
-	svc.mu.Unlock()
+	authorizeAgentPolicyTestService(t, svc)
 
 	if h := svc.effectiveApprovalPolicyForPath("/proj/push").Hash; h != "" {
 		t.Fatalf("expected builtin (empty hash) before push, got %q", h)

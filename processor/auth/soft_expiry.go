@@ -90,6 +90,6 @@ func runSoftExpiryRecovery() {
 
 	if GetSessionAuthority().State() == StateSoftExpired {
 		logger.Warn(fmt.Sprintf("SoftExpired recovery timed out after %s; escalating to HardInvalid", softExpiryTimeout))
-		GetSessionAuthority().NotifyRefreshFailed(true, ReasonSoftExpiryTimeout)
+		ExpireLocalSession("soft expiry timeout")
 	}
 }

@@ -1,5 +1,6 @@
 import { ref } from 'vue';
-import { syncAuthFromStartupStatus } from '../stores/auth';
+import { handleAuthenticationFailure } from '../services/authFailure';
+import { syncAuthFromStartupStatus, syncUnauthenticatedAuthState } from '../stores/auth';
 
 const runMode = ref('unknown');
 const runIsRunning = ref(false);
@@ -50,6 +51,7 @@ export async function syncRunStatus() {
   try {
     const response = await fetch('/api/run/status');
     const payload = await response.json().catch(() => ({}));
+    handleAuthenticationFailure(response.status, payload, syncUnauthenticatedAuthState);
     if (!response.ok) {
       throw new Error(extractApiErrorMessage(payload, response.status, 'Failed to sync run status'));
     }
@@ -89,6 +91,7 @@ export async function syncStartupStatus() {
   try {
     const response = await fetch('/api/startup/status');
     const payload = await response.json().catch(() => ({}));
+    handleAuthenticationFailure(response.status, payload, syncUnauthenticatedAuthState);
     if (!response.ok) {
       throw new Error(extractApiErrorMessage(payload, response.status, 'Failed to sync startup status'));
     }

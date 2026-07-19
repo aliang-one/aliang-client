@@ -114,7 +114,15 @@ func TestAgentServiceEnableRegistersLoggedInDevice(t *testing.T) {
 	registerCalled := false
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/api/devices/register" {
+		if r.Method != http.MethodPost {
+			http.NotFound(w, r)
+			return
+		}
+		if r.URL.Path == "/api/agent/status" {
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok"})
+			return
+		}
+		if r.URL.Path != "/api/devices/register" {
 			http.NotFound(w, r)
 			return
 		}
@@ -132,8 +140,7 @@ func TestAgentServiceEnableRegistersLoggedInDevice(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"code": 0,
 			"data": map[string]interface{}{
-				"device_token": "dt_enable",
-				"device_id":    "dev_enable",
+				"device_id": "dev_enable",
 			},
 		})
 	}))
@@ -148,11 +155,11 @@ func TestAgentServiceEnableRegistersLoggedInDevice(t *testing.T) {
 	if !registerCalled {
 		t.Fatal("register endpoint was not called")
 	}
-	if strings.TrimSpace(remoteString(registerPayload, "device_id")) == "" || strings.TrimSpace(remoteString(registerPayload, "unique_code")) == "" {
-		t.Fatalf("register payload missing stable identifiers: %#v", registerPayload)
+	if strings.TrimSpace(remoteString(registerPayload, "device_id")) == "" {
+		t.Fatalf("register payload missing device_id: %#v", registerPayload)
 	}
-	if len(registerPayload) != 2 {
-		t.Fatalf("register payload should only contain device_id and unique_code, got %#v", registerPayload)
+	if len(registerPayload) != 1 {
+		t.Fatalf("register payload should only contain device_id, got %#v", registerPayload)
 	}
 	if !status.Enabled || !status.Registered || !status.Bound {
 		t.Fatalf("Enable() did not reflect registered device: %#v", status)
@@ -205,7 +212,6 @@ func TestAgentServiceRegisterAndSyncUsesLoggedInSession(t *testing.T) {
 			"code": 0,
 			"msg":  "success",
 			"data": map[string]interface{}{
-				"device_token": "dt_auto_register",
 				"device": map[string]interface{}{
 					"id":                      "dev_backend",
 					"device_id":               "dev_backend",
@@ -226,7 +232,6 @@ func TestAgentServiceRegisterAndSyncUsesLoggedInSession(t *testing.T) {
 	service.mu.Lock()
 	service.ensureDeviceIdentityLocked()
 	originalDeviceID := service.state.DeviceID
-	originalUniqueCode := service.state.UniqueCode
 	err := service.registerAndSyncLocked()
 	service.mu.Unlock()
 	if err != nil {
@@ -239,11 +244,11 @@ func TestAgentServiceRegisterAndSyncUsesLoggedInSession(t *testing.T) {
 	if remoteString(registerPayload, "device_id") != originalDeviceID {
 		t.Fatalf("register payload device_id = %q, want %q", remoteString(registerPayload, "device_id"), originalDeviceID)
 	}
-	if remoteString(registerPayload, "unique_code") != originalUniqueCode {
-		t.Fatalf("register payload unique_code = %q, want %q", remoteString(registerPayload, "unique_code"), originalUniqueCode)
+	if _, ok := registerPayload["unique_code"]; ok {
+		t.Fatal("register payload must not contain unique_code")
 	}
-	if len(registerPayload) != 2 {
-		t.Fatalf("register payload should only contain device_id and unique_code, got %#v", registerPayload)
+	if len(registerPayload) != 1 {
+		t.Fatalf("register payload should only contain device_id, got %#v", registerPayload)
 	}
 
 	status := service.Status()
@@ -261,7 +266,7 @@ func TestAgentServiceRegisterAndSyncUsesLoggedInSession(t *testing.T) {
 	service.Disable()
 }
 
-func TestAgentServiceRegisterAndSyncUploadsInventoryWithDeviceToken(t *testing.T) {
+func TestAgentServiceRegisterAndSyncUploadsInventoryWithUserJWT(t *testing.T) {
 	t.Setenv("ALIANG_DATA_DIR", t.TempDir())
 	projectPath := setupAgentExecutionProjectForTest(t)
 	cache.ResetCacheDirForTest()
@@ -297,7 +302,6 @@ func TestAgentServiceRegisterAndSyncUploadsInventoryWithDeviceToken(t *testing.T
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{
 				"code": 0,
 				"data": map[string]interface{}{
-					"device_token": "dt_inventory",
 					"device": map[string]interface{}{
 						"id":                      "dev_inventory",
 						"device_id":               "dev_inventory",
@@ -312,8 +316,8 @@ func TestAgentServiceRegisterAndSyncUploadsInventoryWithDeviceToken(t *testing.T
 			})
 		case r.Method == http.MethodPost && r.URL.Path == "/api/agent/status":
 			statusCalled = true
-			if got := r.Header.Get("Authorization"); got != "Bearer dt_inventory" {
-				t.Errorf("status Authorization = %q, want device token", got)
+			if got := r.Header.Get("Authorization"); got != "Bearer access_inventory" {
+				t.Errorf("status Authorization = %q, want user JWT", got)
 			}
 			if err := json.NewDecoder(r.Body).Decode(&statusPayload); err != nil {
 				t.Errorf("decode status payload: %v", err)
@@ -347,8 +351,8 @@ func TestAgentServiceRegisterAndSyncUploadsInventoryWithDeviceToken(t *testing.T
 	if err != nil {
 		t.Fatalf("registerAndSyncLocked() error = %v", err)
 	}
-	if len(registerPayload) != 2 {
-		t.Fatalf("register payload should only contain device_id and unique_code, got %#v", registerPayload)
+	if len(registerPayload) != 1 {
+		t.Fatalf("register payload should only contain device_id, got %#v", registerPayload)
 	}
 	if !statusCalled {
 		t.Fatal("status sync endpoint was not called after registration")
@@ -373,7 +377,7 @@ func TestAgentServiceRegisterAndSyncUploadsInventoryWithDeviceToken(t *testing.T
 	service.Disable()
 }
 
-func TestAgentServiceRegisterAndSyncReusesExistingDeviceToken(t *testing.T) {
+func TestAgentServiceRegisterAndSyncRefreshesExistingRegistration(t *testing.T) {
 	t.Setenv("ALIANG_DATA_DIR", t.TempDir())
 	cache.ResetCacheDirForTest()
 	auth.ResetAuthPersistenceForTest()
@@ -397,11 +401,11 @@ func TestAgentServiceRegisterAndSyncReusesExistingDeviceToken(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case r.Method == http.MethodPost && r.URL.Path == "/api/devices/register":
-			t.Fatalf("register endpoint should not be called when device_token already exists")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"device_id": "dev_existing", "device": map[string]interface{}{"device_id": "dev_existing"}})
 		case r.Method == http.MethodPost && r.URL.Path == "/api/agent/status":
 			statusCalled = true
-			if got := r.Header.Get("Authorization"); got != "Bearer dt_existing" {
-				t.Errorf("status Authorization = %q, want existing device token", got)
+			if got := r.Header.Get("Authorization"); got != "Bearer access_existing" {
+				t.Errorf("status Authorization = %q, want user JWT", got)
 			}
 			if err := json.NewDecoder(r.Body).Decode(&statusPayload); err != nil {
 				t.Errorf("decode status payload: %v", err)
@@ -429,10 +433,7 @@ func TestAgentServiceRegisterAndSyncReusesExistingDeviceToken(t *testing.T) {
 	service := NewAgentService()
 	service.mu.Lock()
 	service.state.DeviceID = "dev_existing"
-	service.state.UniqueCode = "adc-test-existing"
-	service.state.DeviceToken = "dt_existing"
 	err := service.registerAndSyncLocked()
-	deviceToken := service.state.DeviceToken
 	enabled := service.state.Enabled
 	registered := service.state.Registered
 	service.mu.Unlock()
@@ -440,13 +441,10 @@ func TestAgentServiceRegisterAndSyncReusesExistingDeviceToken(t *testing.T) {
 		t.Fatalf("registerAndSyncLocked() error = %v", err)
 	}
 	if !statusCalled {
-		t.Fatal("status sync endpoint was not called for existing device token")
+		t.Fatal("status sync endpoint was not called for registered device")
 	}
 	if remoteString(statusPayload, "device_id") != "dev_existing" {
 		t.Fatalf("status payload device_id = %q, want dev_existing", remoteString(statusPayload, "device_id"))
-	}
-	if deviceToken != "dt_existing" {
-		t.Fatalf("device token = %q, want dt_existing", deviceToken)
 	}
 	if !enabled || !registered {
 		t.Fatalf("state enabled=%t registered=%t, want true/true", enabled, registered)
@@ -473,15 +471,9 @@ func TestAgentServiceRegisterAndSyncReregistersWhenUserChanges(t *testing.T) {
 			if got := r.Header.Get("Authorization"); got != "Bearer user_two" {
 				t.Errorf("register Authorization = %q, want Bearer user_two", got)
 			}
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{
-				"code": 0,
-				"data": map[string]interface{}{
-					"device_token": "dt_user_two",
-					"device_id":    "dev_existing",
-				},
-			})
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"device_id": "dev_existing"})
 		case r.Method == http.MethodPost && r.URL.Path == "/api/agent/status":
-			if got := r.Header.Get("Authorization"); got == "Bearer dt_user_one" {
+			if got := r.Header.Get("Authorization"); got == "Bearer user_one" {
 				statusCalledWithOldToken = true
 			}
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok"})
@@ -495,11 +487,9 @@ func TestAgentServiceRegisterAndSyncReregistersWhenUserChanges(t *testing.T) {
 	service := NewAgentService()
 	service.mu.Lock()
 	service.state.DeviceID = "dev_existing"
-	service.state.UniqueCode = "adc-test-existing"
-	service.state.DeviceToken = "dt_user_one"
+	service.state.Registered = true
 	service.state.RegisteredUser = "user:user_one"
 	err := service.registerAndSyncLockedWithUserContext("Bearer user_two", "user:user_two")
-	deviceToken := service.state.DeviceToken
 	registeredUser := service.state.RegisteredUser
 	service.mu.Unlock()
 	if err != nil {
@@ -510,9 +500,6 @@ func TestAgentServiceRegisterAndSyncReregistersWhenUserChanges(t *testing.T) {
 	}
 	if statusCalledWithOldToken {
 		t.Fatal("old device token was used after user changed")
-	}
-	if deviceToken != "dt_user_two" {
-		t.Fatalf("device token = %q, want dt_user_two", deviceToken)
 	}
 	if registeredUser != "user:user_two" {
 		t.Fatalf("registered user = %q, want user:user_two", registeredUser)
@@ -561,7 +548,6 @@ func TestAgentServiceRegisterAndSyncAcceptsAliangPhoneServerResponse(t *testing.
 				"user":                    map[string]interface{}{"id": "user_123", "email": "user@example.local", "name": "User 123", "role": "user"},
 				"name":                    "phone-server-device",
 				"platform":                agentPlatform(),
-				"unique_code":             remoteString(registerPayload, "unique_code"),
 				"agent_version":           agentVersion(),
 				"status":                  "offline",
 				"capabilities":            agentCapabilities(),
@@ -573,9 +559,8 @@ func TestAgentServiceRegisterAndSyncAcceptsAliangPhoneServerResponse(t *testing.
 				"paired_at":               now,
 				"bound_at":                now,
 			},
-			"device_id":    "dev_phone_server",
-			"user":         map[string]interface{}{"id": "user_123", "email": "user@example.local", "name": "User 123", "role": "user"},
-			"device_token": "dt_phone_server",
+			"device_id": "dev_phone_server",
+			"user":      map[string]interface{}{"id": "user_123", "email": "user@example.local", "name": "User 123", "role": "user"},
 		})
 	}))
 	defer server.Close()
@@ -585,20 +570,16 @@ func TestAgentServiceRegisterAndSyncAcceptsAliangPhoneServerResponse(t *testing.
 	service.mu.Lock()
 	service.ensureDeviceIdentityLocked()
 	err := service.registerAndSyncLocked()
-	deviceToken := service.state.DeviceToken
 	service.mu.Unlock()
 	if err != nil {
 		t.Fatalf("registerAndSyncLocked() error = %v", err)
 	}
 
-	if strings.TrimSpace(remoteString(registerPayload, "device_id")) == "" || strings.TrimSpace(remoteString(registerPayload, "unique_code")) == "" {
-		t.Fatalf("register payload missing stable identifiers: %#v", registerPayload)
+	if strings.TrimSpace(remoteString(registerPayload, "device_id")) == "" {
+		t.Fatalf("register payload missing device_id: %#v", registerPayload)
 	}
-	if len(registerPayload) != 2 {
-		t.Fatalf("register payload should only contain device_id and unique_code, got %#v", registerPayload)
-	}
-	if deviceToken != "dt_phone_server" {
-		t.Fatalf("device token = %q, want dt_phone_server", deviceToken)
+	if len(registerPayload) != 1 {
+		t.Fatalf("register payload should only contain device_id, got %#v", registerPayload)
 	}
 
 	status := service.Status()
@@ -647,8 +628,7 @@ func TestAgentServiceRegisterUsesForwardedUserAuthorization(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"code": 0,
 			"data": map[string]interface{}{
-				"device_token": "dt_forwarded",
-				"device_id":    "dev_forwarded",
+				"device_id": "dev_forwarded",
 			},
 		})
 	}))
@@ -671,7 +651,7 @@ func TestAgentServiceRegisterUsesForwardedUserAuthorization(t *testing.T) {
 	service.Disable()
 }
 
-func TestAgentServiceRegisterDoesNotTreatUserAccessTokenAsDeviceToken(t *testing.T) {
+func TestAgentServiceRegisterUsesUserAccessTokenWithoutSecondaryDeviceCredential(t *testing.T) {
 	t.Setenv("ALIANG_DATA_DIR", t.TempDir())
 	cache.ResetCacheDirForTest()
 	auth.ResetAuthPersistenceForTest()
@@ -707,10 +687,14 @@ func TestAgentServiceRegisterDoesNotTreatUserAccessTokenAsDeviceToken(t *testing
 	config.SetGlobalConfig(&config.Config{Core: &config.CoreConfig{AgentServer: server.URL}})
 
 	service := NewAgentService()
-	_, err := service.Enable()
-	if err == nil || !strings.Contains(err.Error(), "missing device_token") {
-		t.Fatalf("Enable() error = %v, want missing device_token", err)
+	status, err := service.Enable()
+	if err != nil {
+		t.Fatalf("Enable() error = %v", err)
 	}
+	if !status.Registered || status.Device == nil {
+		t.Fatalf("Enable() status = %#v, want registered device", status)
+	}
+	service.Disable()
 }
 
 func TestAgentServiceDisableWithReasonClearsRemoteState(t *testing.T) {
@@ -726,11 +710,9 @@ func TestAgentServiceDisableWithReasonClearsRemoteState(t *testing.T) {
 	service.state.Enabled = true
 	service.state.Registered = true
 	service.state.RemoteConnected = true
-	service.state.DeviceToken = "dt_test"
 	service.state.Device = &models.AgentDevice{
 		ID:                    deviceID,
 		DeviceID:              deviceID,
-		UniqueCode:            service.state.UniqueCode,
 		Name:                  "disable-reason-device",
 		Platform:              agentPlatform(),
 		Status:                "online",
@@ -764,11 +746,9 @@ func TestAgentServiceRejectsRemoteCommandsAfterDisable(t *testing.T) {
 	deviceID := service.state.DeviceID
 	service.state.Enabled = true
 	service.state.Registered = true
-	service.state.DeviceToken = "dt_test"
 	service.state.Device = &models.AgentDevice{
 		ID:                    deviceID,
 		DeviceID:              deviceID,
-		UniqueCode:            service.state.UniqueCode,
 		Name:                  "old-ws-device",
 		Platform:              agentPlatform(),
 		Status:                "online",
@@ -802,7 +782,7 @@ func TestAgentServiceRejectsRemoteCommandsAfterDisable(t *testing.T) {
 	})
 }
 
-func TestAgentServiceDeviceTokenUnauthorizedDisablesAgent(t *testing.T) {
+func TestAgentServiceUserJwtUnauthorizedPropagatesFromStatusSync(t *testing.T) {
 	t.Setenv("ALIANG_DATA_DIR", t.TempDir())
 	cache.ResetCacheDirForTest()
 	auth.ResetAuthPersistenceForTest()
@@ -811,15 +791,22 @@ func TestAgentServiceDeviceTokenUnauthorizedDisablesAgent(t *testing.T) {
 		auth.ResetAuthPersistenceForTest()
 		config.ResetGlobalConfigForTest()
 	})
+	if err := auth.SaveUserInfo(&auth.UserInfo{AccessToken: "access_invalid", RefreshToken: "refresh_invalid", TokenType: "Bearer"}); err != nil {
+		t.Fatalf("SaveUserInfo() error = %v", err)
+	}
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/api/devices/register" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"device_id": "dev-invalid"})
+			return
+		}
 		if r.Method == http.MethodPost && r.URL.Path == "/api/agent/status" {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusUnauthorized)
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{
 				"code":    http.StatusUnauthorized,
-				"message": "device token invalid",
-				"reason":  "DEVICE_TOKEN_INVALID",
+				"message": "user authorization expired",
 			})
 			return
 		}
@@ -834,11 +821,9 @@ func TestAgentServiceDeviceTokenUnauthorizedDisablesAgent(t *testing.T) {
 	deviceID := service.state.DeviceID
 	service.state.Enabled = true
 	service.state.Registered = true
-	service.state.DeviceToken = "dt_invalid"
 	service.state.Device = &models.AgentDevice{
 		ID:                    deviceID,
 		DeviceID:              deviceID,
-		UniqueCode:            service.state.UniqueCode,
 		Name:                  "invalid-token-device",
 		Platform:              agentPlatform(),
 		Status:                "online",
@@ -846,27 +831,21 @@ func TestAgentServiceDeviceTokenUnauthorizedDisablesAgent(t *testing.T) {
 		AIControlEnabled:      true,
 		BoundAt:               time.Now().UTC().Format(time.RFC3339),
 	}
-	err := service.syncAgentInventoryLocked("test_device_token_invalid")
+	err := service.syncAgentInventoryLocked("test_user_jwt_invalid")
 	service.mu.Unlock()
 	if err == nil || !strings.Contains(err.Error(), "401") {
 		t.Fatalf("syncAgentInventoryLocked() error = %v, want 401", err)
 	}
 
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		status := service.Status()
-		if !status.Enabled && !status.Bound && status.SyncStatus == "device_token_invalid" {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
+	if service.Status().Registered {
+		t.Fatal("401 status sync must not be reported as a healthy registered Agent")
 	}
-	t.Fatalf("status after device token rejection = %#v, want disabled and unbound", service.Status())
 }
 
 // TestAgentServiceSyncDoesNotResurrectAfterLogoutWithoutForwardedJwt locks in
 // the fix for "user logs out but the agent reconnects on its own". After a
-// logout the agent is sticky-disabled (LastSyncStatus=logout, device_token
-// cleared). Even if a stale JWT is still observable through a legacy/local
+// logout the agent is sticky-disabled (LastSyncStatus=logout). Even if a stale
+// JWT is still observable through a legacy/local
 // fallback, a
 // background sync (startup_sync / watchdog respawn / in-flight post-logout sync)
 // arrives with NO forwarded JWT — the dashboard is logged out. That sync must
@@ -892,8 +871,7 @@ func TestAgentServiceSyncDoesNotResurrectAfterLogoutWithoutForwardedJwt(t *testi
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"code": 0,
 			"data": map[string]interface{}{
-				"device_token": "dt_resurrected",
-				"device_id":    "dev_resurrected",
+				"device_id": "dev_resurrected",
 			},
 		})
 	}))
@@ -906,12 +884,11 @@ func TestAgentServiceSyncDoesNotResurrectAfterLogoutWithoutForwardedJwt(t *testi
 	service.ensureDeviceIdentityLocked()
 	service.state.Enabled = true
 	service.state.Registered = true
-	service.state.DeviceToken = "dt_before_logout"
 	service.state.LastSyncStatus = "online"
 	_ = service.saveStateLocked()
 	service.mu.Unlock()
 
-	// User logs out: agent is disabled, device_token cleared, sticky "logout".
+	// User logs out: Agent is disabled and the logout state is sticky.
 	service.DisableWithReason("logout")
 
 	// Simulate a stale JWT still observable through a legacy/local fallback.
@@ -965,8 +942,7 @@ func TestAgentServiceSyncReRegistersAfterLogoutWithForwardedJwt(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"code": 0,
 			"data": map[string]interface{}{
-				"device_token": "dt_relogin",
-				"device_id":    "dev_relogin",
+				"device_id": "dev_relogin",
 			},
 		})
 	}))
@@ -1298,11 +1274,9 @@ func TestAgentServiceAppliesRemoteDeviceSettings(t *testing.T) {
 	deviceID := service.state.DeviceID
 	service.state.Enabled = true
 	service.state.Registered = true
-	service.state.DeviceToken = "dt_test"
 	service.state.Device = &models.AgentDevice{
 		ID:                    deviceID,
 		DeviceID:              deviceID,
-		UniqueCode:            service.state.UniqueCode,
 		Name:                  "before",
 		Platform:              agentPlatform(),
 		Status:                "online",
@@ -1361,11 +1335,9 @@ func TestAgentServiceRejectsRemoteCommandsWhenDeviceFeaturesDisabled(t *testing.
 	deviceID := service.state.DeviceID
 	service.state.Enabled = true
 	service.state.Registered = true
-	service.state.DeviceToken = "dt_test"
 	service.state.Device = &models.AgentDevice{
 		ID:                    deviceID,
 		DeviceID:              deviceID,
-		UniqueCode:            service.state.UniqueCode,
 		Name:                  "disabled-device",
 		Platform:              agentPlatform(),
 		Status:                "online",
@@ -1420,11 +1392,9 @@ func TestAgentServiceLaunchRejectsWhenRemoteTerminalDisabled(t *testing.T) {
 	deviceID := service.state.DeviceID
 	service.state.Enabled = true
 	service.state.Registered = true
-	service.state.DeviceToken = "dt_test"
 	service.state.Device = &models.AgentDevice{
 		ID:                    deviceID,
 		DeviceID:              deviceID,
-		UniqueCode:            service.state.UniqueCode,
 		Name:                  "disabled-device",
 		Platform:              agentPlatform(),
 		Status:                "online",
@@ -1486,15 +1456,12 @@ func TestCurrentAgentWebSocketURLUsesDevServerPort(t *testing.T) {
 	t.Cleanup(config.ResetGlobalConfigForTest)
 	config.SetGlobalConfig(&config.Config{Core: &config.CoreConfig{AgentServer: "http://localhost:5174"}})
 
-	got, err := currentAgentWebSocketURL("dt_test", "")
+	got, err := currentAgentWebSocketURL()
 	if err != nil {
 		t.Fatalf("currentAgentWebSocketURL() error = %v", err)
 	}
-	if !strings.HasPrefix(got, "ws://localhost:4000/ws/agent?") {
+	if got != "ws://localhost:4000/ws/agent" {
 		t.Fatalf("currentAgentWebSocketURL() = %q, want localhost:4000 ws URL", got)
-	}
-	if !strings.Contains(got, "token=dt_test") {
-		t.Fatalf("currentAgentWebSocketURL() = %q, want token query", got)
 	}
 }
 
@@ -2929,6 +2896,7 @@ func TestAgentServiceDispatchLocalAIListsSlashCommandsByProvider(t *testing.T) {
 }
 
 func TestAgentServiceRemoteAIApprovalResponseUnblocksCodexAppServer(t *testing.T) {
+	t.Setenv(AgentRuntimeEnv, "1")
 	projectPath := setupAgentExecutionProjectForTest(t)
 	defer func() {
 		agentAuthorizedDirsMu.Lock()
@@ -2945,11 +2913,13 @@ func TestAgentServiceRemoteAIApprovalResponseUnblocksCodexAppServer(t *testing.T
 		ai:       newAgentAIManager(),
 	}
 	// The remote link gates every AI event behind remoteControlAllowed()
-	// (Enabled + device token). The local dispatch path bypasses that gate, so
+	// (Enabled + registered device + user JWT). The local dispatch path bypasses that gate, so
 	// only this remote test must opt into the enabled state to reach ai.create.
 	svc.mu.Lock()
 	svc.state.Enabled = true
-	svc.state.DeviceToken = "dt_test"
+	svc.state.Registered = true
+	svc.state.DeviceID = "dev_test"
+	svc.forwardedUserAuthorization = "Bearer test-user-jwt"
 	svc.mu.Unlock()
 	defer svc.ai.closeAll()
 
@@ -3460,14 +3430,14 @@ func TestAgentProtocolContractDefinesRemoteFlow(t *testing.T) {
 	if len(contract.HTTP) != 3 || contract.HTTP[0].Path != models.AgentHTTPRegisterEndpoint || contract.HTTP[1].Path != models.AgentHTTPStatusSyncEndpoint || contract.HTTP[2].Path != "/api/agent/disable" {
 		t.Fatalf("HTTP contract = %#v, want register, status sync, and local disable endpoints", contract.HTTP)
 	}
-	if got := strings.Join(contract.HTTP[0].RequestFields, ","); got != "device_id,unique_code" {
-		t.Fatalf("register request fields = %q, want device_id,unique_code", got)
+	if got := strings.Join(contract.HTTP[0].RequestFields, ","); got != "device_id" {
+		t.Fatalf("register request fields = %q, want device_id", got)
 	}
 	if !strings.Contains(contract.HTTP[0].Auth, "user_access_token") {
 		t.Fatalf("register auth = %q, want user auth", contract.HTTP[0].Auth)
 	}
-	if !strings.Contains(contract.HTTP[1].Auth, "device_token") {
-		t.Fatalf("status sync auth = %q, want device token auth", contract.HTTP[1].Auth)
+	if !strings.Contains(contract.HTTP[1].Auth, "user_access_token") {
+		t.Fatalf("status sync auth = %q, want user JWT auth", contract.HTTP[1].Auth)
 	}
 	if !stringSliceContains(contract.HTTP[2].RequestFields, "reason?") {
 		t.Fatalf("disable request fields = %#v, want optional reason", contract.HTTP[2].RequestFields)
@@ -3475,8 +3445,8 @@ func TestAgentProtocolContractDefinesRemoteFlow(t *testing.T) {
 	if !stringSliceContains(contract.HTTP[1].RequestFields, "projects") || !stringSliceContains(contract.HTTP[1].RequestFields, "vibe_sessions") {
 		t.Fatalf("status sync fields = %#v, want projects and vibe_sessions", contract.HTTP[1].RequestFields)
 	}
-	if !strings.Contains(contract.WebSocket.Path, models.AgentWSEndpoint) || !strings.Contains(contract.WebSocket.Auth, "device_token") {
-		t.Fatalf("websocket contract = %#v, want device token websocket", contract.WebSocket)
+	if contract.WebSocket.Path != models.AgentWSEndpoint || !strings.Contains(contract.WebSocket.Auth, "user_access_token") {
+		t.Fatalf("websocket contract = %#v, want user JWT websocket", contract.WebSocket)
 	}
 	if !protocolEventsContain(contract.WebSocket.ServerSends, models.AgentEventTerminalResize) {
 		t.Fatal("protocol missing terminal.resize server event")
@@ -3793,11 +3763,9 @@ func TestAgentRemoteDetailRequestsReturnProjectAndVibeSessionDetail(t *testing.T
 	service.ensureDeviceIdentityLocked()
 	service.state.Enabled = true
 	service.state.Registered = true
-	service.state.DeviceToken = "dt_test"
 	service.state.Device = &models.AgentDevice{
 		ID:                    service.state.DeviceID,
 		DeviceID:              service.state.DeviceID,
-		UniqueCode:            service.state.UniqueCode,
 		Name:                  "detail-device",
 		Platform:              agentPlatform(),
 		Status:                "online",
@@ -4098,6 +4066,24 @@ func TestResolveAgentLaunchSpecCommandLine(t *testing.T) {
 	}
 	if len(spec.Args) != 1 || spec.Args[0] != "version" {
 		t.Fatalf("Args = %#v, want [version]", spec.Args)
+	}
+}
+
+func TestSessionInvalidAgentStatesBlockBackgroundSync(t *testing.T) {
+	service := NewAgentService()
+	for _, reason := range []string{"logout", "auth_expired", "refresh_invalid", "soft_expiry_timeout", "revoked"} {
+		t.Run(reason, func(t *testing.T) {
+			service.mu.Lock()
+			service.state.LastSyncStatus = reason
+			blocked := service.shouldBlockBackgroundSyncLocked()
+			service.mu.Unlock()
+			if !blocked {
+				t.Fatalf("background sync not blocked for %q", reason)
+			}
+			if !service.shouldPreserveDisabledStatus() {
+				t.Fatalf("disabled status not preserved for %q", reason)
+			}
+		})
 	}
 }
 

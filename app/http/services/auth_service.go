@@ -36,7 +36,7 @@ func teardownLocalSessionAfterLogout() {
 	auth.GetSessionAuthority().NotifyLoggedOut()
 	// Retry asynchronously in addition to the structured session event. Both
 	// paths are idempotent; this covers a short user-agent restart race.
-	RequestUserAgentDisableAfterLogout("logout")
+	RequestUserAgentDisableForSessionEnd("logout")
 }
 
 // NewAuthService 创建新的认证服务实例
@@ -162,7 +162,7 @@ func (s *AuthService) Login(email, password, turnstileToken string) map[string]i
 func (s *AuthService) RestoreSession() map[string]interface{} {
 	userInfo, err := auth.RestoreSession()
 	if err != nil {
-		if errors.Is(err, auth.ErrRefreshTokenInvalid) {
+		if errors.Is(err, auth.ErrRefreshTokenInvalid) || errors.Is(err, auth.ErrSessionExpired) {
 			clearStartupStateAfterLogout()
 			return map[string]interface{}{
 				"status": "no_session",
@@ -190,7 +190,7 @@ func (s *AuthService) RestoreSession() map[string]interface{} {
 func (s *AuthService) RefreshSession(refreshToken string) map[string]interface{} {
 	userInfo, err := auth.RefreshSession(refreshToken)
 	if err != nil {
-		if errors.Is(err, auth.ErrRefreshTokenInvalid) {
+		if errors.Is(err, auth.ErrRefreshTokenInvalid) || errors.Is(err, auth.ErrSessionExpired) {
 			clearStartupStateAfterLogout()
 			return map[string]interface{}{
 				"status": "failed",

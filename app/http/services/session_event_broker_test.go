@@ -40,4 +40,21 @@ func TestSessionEventBrokerBroadcastDoesNotBlockOnFullBuffer(t *testing.T) {
 	}
 }
 
+func TestSessionSnapshotNeverIncludesUserAfterHardInvalid(t *testing.T) {
+	snapshot := buildSessionSnapshot(auth.StateHardInvalid, &auth.UserInfo{Username: "stale-user"})
+	if _, ok := snapshot["user"]; ok {
+		t.Fatalf("hard-invalid snapshot exposed stale user: %#v", snapshot["user"])
+	}
+	if snapshot["state"] != "hard_invalid" {
+		t.Fatalf("snapshot state = %#v, want hard_invalid", snapshot["state"])
+	}
+}
+
+func TestSessionSnapshotIncludesUserWhileActive(t *testing.T) {
+	snapshot := buildSessionSnapshot(auth.StateActive, &auth.UserInfo{Username: "active-user"})
+	if _, ok := snapshot["user"]; !ok {
+		t.Fatal("active snapshot omitted user")
+	}
+}
+
 func closeDiscard(_ <-chan auth.SessionEvent) {}

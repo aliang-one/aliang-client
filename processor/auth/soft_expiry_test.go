@@ -2,9 +2,13 @@ package user
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"aliang.one/nursorgate/processor/config"
 )
 
 func resetSoftExpiryForTest() {
@@ -118,6 +122,21 @@ func TestSoftExpiryRecoveryPermanentFailureEscalates(t *testing.T) {
 }
 
 func TestSoftExpiryRecoveryTimeoutEscalates(t *testing.T) {
+	baseDir := t.TempDir()
+	t.Setenv("HOME", filepath.Join(baseDir, "home"))
+	t.Setenv("ALIANG_CACHE_DIR", filepath.Join(baseDir, "cache"))
+	defer StopTokenRefresh()
+	defer ResetAuthPersistenceForTest()
+	defer config.ResetGlobalConfigForTest()
+	ResetAuthPersistenceForTest()
+	config.ResetGlobalConfigForTest()
+	if err := os.MkdirAll(filepath.Join(baseDir, "home"), 0o700); err != nil {
+		t.Fatalf("mkdir home: %v", err)
+	}
+	if err := SaveUserInfo(&UserInfo{AccessToken: "stale", RefreshToken: "stale", UpdatedAt: time.Now()}); err != nil {
+		t.Fatalf("SaveUserInfo() error = %v", err)
+	}
+
 	resetSoftExpiryForTest()
 	softExpiryBackoff = []time.Duration{0}
 	softExpiryTimeout = 1 * time.Second
@@ -139,5 +158,13 @@ func TestSoftExpiryRecoveryTimeoutEscalates(t *testing.T) {
 
 	if a.State() != StateHardInvalid {
 		t.Fatalf("state=%v want HardInvalid after timeout", a.State())
+	}
+	if got := GetCurrentUserInfo(); got != nil {
+		t.Fatalf("current user after timeout = %#v, want nil", got)
+	}
+	if hasUserInfo, err := HasPersistedUserInfo(); err != nil {
+		t.Fatalf("HasPersistedUserInfo() error = %v", err)
+	} else if hasUserInfo {
+		t.Fatal("persisted user survived soft-expiry timeout")
 	}
 }

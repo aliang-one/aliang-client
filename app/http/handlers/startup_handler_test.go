@@ -4,8 +4,36 @@ import (
 	"reflect"
 	"testing"
 
+	authuser "aliang.one/nursorgate/processor/auth"
 	"aliang.one/nursorgate/processor/runtime"
 )
+
+func TestEffectiveStartupAuthSnapshotHidesUserAfterHardInvalid(t *testing.T) {
+	status, fetchSuccess, user := effectiveStartupAuthSnapshot(
+		runtime.READY,
+		true,
+		&authuser.UserInfo{Username: "stale-user"},
+		authuser.StateHardInvalid,
+	)
+
+	if status != runtime.UNCONFIGURED || fetchSuccess || user != nil {
+		t.Fatalf("snapshot = status=%v fetch=%t user=%#v, want UNCONFIGURED/false/nil", status, fetchSuccess, user)
+	}
+}
+
+func TestEffectiveStartupAuthSnapshotKeepsSoftExpiredUser(t *testing.T) {
+	wantUser := &authuser.UserInfo{Username: "recovering-user"}
+	status, fetchSuccess, user := effectiveStartupAuthSnapshot(
+		runtime.READY,
+		true,
+		wantUser,
+		authuser.StateSoftExpired,
+	)
+
+	if status != runtime.READY || !fetchSuccess || user != wantUser {
+		t.Fatalf("snapshot = status=%v fetch=%t user=%#v, want READY/true/original user", status, fetchSuccess, user)
+	}
+}
 
 func TestGetSuggestedActions_UsesSessionLoginSemanticsForConfiguring(t *testing.T) {
 	actions := getSuggestedActions(runtime.CONFIGURING)

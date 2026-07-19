@@ -35,13 +35,13 @@ func TestGetUserProfile_ClearsSessionWhenRefreshTokenAlsoInvalid(t *testing.T) {
 		case "/api/v1/user/profile":
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusUnauthorized)
-			_, _ = w.Write([]byte(`{"code":"TOKEN_REVOKED","message":"Token has been revoked (password changed)"}`))
+			_, _ = w.Write([]byte(`{"code":"TOKEN_EXPIRED","message":"Token has expired"}`))
 		case "/api/v1/auth/refresh":
-			// Genuinely revoked session: the refresh token is also invalid, so the
-			// liveness probe confirms the session is dead and clears it.
+			// Exact production response observed in the incident logs. This is a terminal
+			// refresh rejection even though it does not mention "refresh token".
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusUnauthorized)
-			_, _ = w.Write([]byte(`{"code":401,"message":"invalid refresh token","reason":"REFRESH_TOKEN_INVALID"}`))
+			_, _ = w.Write([]byte(`{"error":"local session is no longer valid"}`))
 		default:
 			http.NotFound(w, r)
 		}
@@ -78,8 +78,8 @@ func TestGetUserProfile_ClearsSessionWhenRefreshTokenAlsoInvalid(t *testing.T) {
 // spurious 401 from a user-center API (backend deploy, load-balancer hiccup,
 // clock skew, momentary network blip surfacing as 401) must NOT wipe the local
 // session. The session is probed via a refresh — when refresh succeeds the 401
-// is treated as transient, the access_token is renewed, and the caller retries
-// later instead of being forced to re-login.
+// is treated as transient, the access_token is renewed, and the original
+// request is retried immediately instead of leaking a recoverable 401 to the UI.
 func TestCallUserCenterAPI_RetainsSessionOnTransient401(t *testing.T) {
 	baseDir, err := os.MkdirTemp("", "aliang-user-center-transient-*")
 	if err != nil {
@@ -132,12 +132,12 @@ func TestCallUserCenterAPI_RetainsSessionOnTransient401(t *testing.T) {
 		t.Fatalf("SaveUserInfo() error = %v", err)
 	}
 
-	_, err = GetUserProfile()
-	if err == nil {
-		t.Fatal("GetUserProfile() error = nil, want the original 401 error (not a silent success)")
+	profile, err := GetUserProfile()
+	if err != nil {
+		t.Fatalf("GetUserProfile() error = %v, want refresh + retry success", err)
 	}
-	if errors.Is(err, ErrSessionExpired) {
-		t.Fatalf("GetUserProfile() error = ErrSessionExpired; a transient 401 must NOT expire the session (got %v)", err)
+	if profile == nil || profile.Email != "user@example.com" {
+		t.Fatalf("GetUserProfile() = %#v, want refreshed profile", profile)
 	}
 
 	// Session must be retained and the token renewed by the liveness refresh.
