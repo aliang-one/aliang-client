@@ -33,6 +33,8 @@ type agentAIProcessedRun struct {
 	State          string                 `json:"state"`
 	Terminal       map[string]interface{} `json:"terminal,omitempty"`
 	UpdatedAt      string                 `json:"updated_at"`
+	GoalIdentity   map[string]interface{} `json:"goal_identity,omitempty"`
+	Recovered      bool                   `json:"-"`
 }
 
 type agentAIIdentityState struct {
@@ -70,6 +72,7 @@ func (m *agentAIManager) loadIdentityState() {
 	}
 	for _, run := range state.ProcessedRuns {
 		if run.RunID != "" {
+			run.Recovered = true
 			m.processedRuns[run.RunID] = run
 		}
 	}
@@ -117,7 +120,7 @@ func (m *agentAIManager) persistIdentityState() error {
 	return os.Rename(tmp, path)
 }
 
-func (m *agentAIManager) claimProcessedRun(runID, sessionID, messageID string) (bool, error) {
+func (m *agentAIManager) claimProcessedRun(runID, sessionID, messageID string, goalIdentity map[string]interface{}) (bool, error) {
 	m.mu.Lock()
 	if _, exists := m.processedRuns[runID]; exists {
 		m.mu.Unlock()
@@ -129,6 +132,7 @@ func (m *agentAIManager) claimProcessedRun(runID, sessionID, messageID string) (
 		MessageID:      messageID,
 		State:          "received",
 		UpdatedAt:      time.Now().UTC().Format(time.RFC3339Nano),
+		GoalIdentity:   cloneGoalIdentity(goalIdentity),
 	}
 	m.mu.Unlock()
 	if err := m.persistIdentityState(); err != nil {
@@ -155,6 +159,30 @@ func (m *agentAIManager) replayProcessedRun(runID string, writeJSON agentTermina
 			copy[key] = value
 		}
 		_ = writeJSON(copy)
+		return true
+	}
+	if run.Recovered && len(run.GoalIdentity) > 0 {
+		terminal := map[string]interface{}{
+			"type":       models.AgentEventAIError,
+			"session_id": run.ConversationID,
+			"message_id": run.MessageID,
+			"run_id":     run.RunID,
+			"event_seq":  1,
+			"error":      "agent restarted before the Goal run reached a terminal event",
+			"goal_report": map[string]interface{}{
+				"schema_version":      1,
+				"outcome":             "failed",
+				"summary":             "Agent restarted before the Goal run reached a terminal event.",
+				"blocker_code":        "agent_restarted_before_terminal",
+				"evidence_refs":       []interface{}{},
+				"completion_proposed": false,
+			},
+		}
+		for key, value := range run.GoalIdentity {
+			terminal[key] = value
+		}
+		_ = m.completeProcessedRun(runID, terminal)
+		_ = writeJSON(terminal)
 		return true
 	}
 	_ = writeJSON(map[string]interface{}{

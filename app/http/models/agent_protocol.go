@@ -1,7 +1,7 @@
 package models
 
 const (
-	AgentProtocolVersion = "2026-07-19"
+	AgentProtocolVersion = "2026-07-21"
 
 	AgentHTTPRegisterEndpoint   = "/api/devices/register"
 	AgentHTTPStatusSyncEndpoint = "/api/agent/status"
@@ -17,6 +17,10 @@ const (
 	AgentEventDeviceUnbound           = "device.unbound"
 	AgentEventDeviceSettings          = "device.settings.updated"
 	AgentEventProjectSettings         = "project.settings.updated"
+	AgentEventTunnelConfigure         = "tunnel.configure"
+	AgentEventTunnelConfigured        = "tunnel.configured"
+	AgentEventTunnelStatus            = "tunnel.status"
+	AgentEventTunnelError             = "tunnel.error"
 	AgentEventTerminalCreate          = "terminal.create"
 	AgentEventTerminalCreated         = "terminal.created"
 	AgentEventTerminalInput           = "terminal.input"
@@ -41,6 +45,7 @@ const (
 	AgentEventAIDone                  = "ai.done"
 	AgentEventAIRunProgress           = "ai.run.progress" // server→mobile: live per-run files_touched_count + git_changed_count
 	AgentEventAIRunEventAck           = "ai.run.event.ack"
+	AgentEventGoalRunEventAck         = "goal.run.event.ack"
 	AgentEventAIStop                  = "ai.stop"
 	AgentEventAIStatus                = "ai.status"
 	AgentEventAIError                 = "ai.error"
@@ -77,6 +82,12 @@ const (
 	AgentEventSlashCommandsList       = "slash.commands.list"
 	AgentEventSlashCommandsListResult = "slash.commands.list.result"
 	AgentEventSlashCommandsListError  = "slash.commands.list.error"
+	AgentEventGoalPlan                = "goal.plan"
+	AgentEventGoalPlanResult          = "goal.plan.result"
+	AgentEventGoalPlanError           = "goal.plan.error"
+	AgentEventGoalVerify              = "goal.verify"
+	AgentEventGoalVerifyResult        = "goal.verify.result"
+	AgentEventGoalVerifyError         = "goal.verify.error"
 )
 
 type AgentProtocolContract struct {
@@ -198,11 +209,19 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				{Type: AgentEventFileError, Required: []string{"type", "request_id", "error"}},
 				{Type: AgentEventError, Required: []string{"type", "error"}},
 				{Type: AgentEventAIOptionRequest, Required: []string{"type", "session_id", "option_id", "options", "run_id", "event_seq"}, Optional: []string{"message_id", "title", "allow_custom", "multi", "provider"}},
+				{Type: AgentEventGoalPlanResult, Required: []string{"type", "request_id", "workspace_fingerprint_before", "workspace_fingerprint_after", "proposal"}, Optional: []string{"provider_run_id"}},
+				{Type: AgentEventGoalPlanError, Required: []string{"type", "request_id", "error"}},
+				{Type: AgentEventGoalVerifyResult, Required: []string{"type", "request_id", "batch_id", "workspace_fingerprint_before", "workspace_fingerprint_after", "results"}},
+				{Type: AgentEventGoalVerifyError, Required: []string{"type", "request_id", "error"}},
+				{Type: AgentEventTunnelConfigured, Required: []string{"type", "request_id", "device_id", "state", "changed"}},
+				{Type: AgentEventTunnelStatus, Required: []string{"type", "device_id", "state"}, Optional: []string{"error"}},
+				{Type: AgentEventTunnelError, Required: []string{"type", "error"}, Optional: []string{"request_id"}},
 			},
 			ServerSends: []AgentProtocolEvent{
 				{Type: AgentEventRegistered, Optional: []string{"device_id"}},
 				{Type: AgentEventHeartbeatAck},
 				{Type: AgentEventAIRunEventAck, Required: []string{"type", "run_id", "accepted_seq", "run_state_version"}, Optional: []string{"result"}},
+				{Type: AgentEventGoalRunEventAck, Required: []string{"type", "goal_run_id"}, Optional: []string{"accepted_seq", "result", "reason"}},
 				{Type: AgentEventSessionRefreshAck, Optional: []string{"ok", "auth_expires_at"}},
 				{Type: AgentEventDeviceUnbound},
 				{Type: AgentEventDeviceSettings, Required: []string{"device"}},
@@ -226,6 +245,9 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				{Type: AgentEventAISessionDetail, Required: []string{"type", "request_id"}, Optional: []string{"session_id", "source_session_id", "project_path", "limit", "before_message_id", "before_timestamp"}, Emits: []string{AgentEventAISessionDetailResult, AgentEventFileError}},
 				{Type: AgentEventSlashCommandsList, Required: []string{"type", "request_id", "project_path"}, Optional: []string{"session_id", "provider", "include_user_level", "include_plugins", "claude_remote_policy"}, Emits: []string{AgentEventSlashCommandsListResult, AgentEventSlashCommandsListError}},
 				{Type: AgentEventAIOptionResponse, Required: []string{"type", "session_id", "option_id", "selected"}, Optional: []string{"message_id", "custom_text", "decision", "delivery_id"}, Emits: []string{AgentEventAIRunStarted, AgentEventAIDelta, AgentEventAIRunProgress, AgentEventAIDone, AgentEventAIError, AgentEventAIOptionRequest}},
+				{Type: AgentEventGoalPlan, Required: []string{"type", "request_id", "goal_id", "planning_attempt_id", "project_path", "objective", "provider"}, Emits: []string{AgentEventGoalPlanResult, AgentEventGoalPlanError}},
+				{Type: AgentEventGoalVerify, Required: []string{"type", "request_id", "goal_id", "verification_batch_id", "project_path", "checks"}, Emits: []string{AgentEventGoalVerifyResult, AgentEventGoalVerifyError}},
+				{Type: AgentEventTunnelConfigure, Required: []string{"type", "request_id", "device_id", "piko_upstream_url", "tunnel_token", "route_public_key", "expires_at"}, Emits: []string{AgentEventTunnelConfigured, AgentEventTunnelStatus, AgentEventTunnelError}},
 				{Type: AgentEventAIOptionCancelled, Required: []string{"type", "session_id"}, Optional: []string{"option_ids", "reason"}},
 			},
 		},

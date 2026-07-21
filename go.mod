@@ -1,18 +1,20 @@
 module aliang.one/nursorgate
 
-go 1.25.1
+go 1.25.5
 
 replace github.com/elazarl/goproxy v1.7.2 => ../goproxy
 
 require (
 	github.com/Microsoft/go-winio v0.6.2
 	github.com/UserExistsError/conpty v0.1.4
+	github.com/andydunstall/piko v0.10.0
 	github.com/creack/pty v1.1.24
 	github.com/docker/go-units v0.5.0
 	github.com/gen2brain/beeep v0.11.2
 	github.com/getkin/kin-openapi v0.134.0
 	github.com/getlantern/systray v1.2.2
 	github.com/getsentry/sentry-go v0.40.0
+	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/schema v1.4.1
@@ -24,12 +26,12 @@ require (
 	github.com/sagernet/sing-box v1.12.12
 	github.com/sagernet/sing-vmess v0.2.7
 	github.com/shirou/gopsutil/v4 v4.26.5
-	github.com/spf13/cobra v1.10.1
+	github.com/spf13/cobra v1.10.2
 	github.com/stretchr/testify v1.11.1
 	github.com/swaggo/http-swagger/v2 v2.0.2
 	github.com/xjasonlyu/tun2socks/v2 v2.6.0
 	go.uber.org/automaxprocs v1.6.0
-	golang.org/x/term v0.37.0
+	golang.org/x/term v0.40.0
 	golang.org/x/time v0.14.0
 	golang.zx2c4.com/wireguard v0.0.0-20250521234502-f333402bd9cb
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
@@ -44,6 +46,7 @@ require (
 	git.sr.ht/~jackmordaunt/go-toast v1.1.2 // indirect
 	github.com/KyleBanks/depth v1.2.1 // indirect
 	github.com/andybalholm/brotli v1.1.0 // indirect
+	github.com/andydunstall/yamux v0.1.6 // indirect
 	github.com/caddyserver/certmagic v0.23.0 // indirect
 	github.com/caddyserver/zerossl v0.1.3 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
@@ -69,7 +72,7 @@ require (
 	github.com/jackmordaunt/icns/v3 v3.0.1 // indirect
 	github.com/josharian/intern v1.0.0 // indirect
 	github.com/klauspost/compress v1.17.11 // indirect
-	github.com/klauspost/cpuid/v2 v2.2.10 // indirect
+	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/libdns/alidns v1.0.5-libdns.v1.beta1 // indirect
 	github.com/libdns/cloudflare v0.2.2-0.20250708034226-c574dccb31a6 // indirect
 	github.com/libdns/libdns v1.1.0 // indirect
@@ -108,10 +111,10 @@ require (
 	github.com/zeebo/blake3 v0.2.4 // indirect
 	go.uber.org/zap/exp v0.3.0 // indirect
 	go4.org/netipx v0.0.0-20231129151722-fdeea329fbba // indirect
-	golang.org/x/crypto v0.44.0 // indirect
+	golang.org/x/crypto v0.48.0 // indirect
 	golang.org/x/exp v0.0.0-20250506013437-ce4c2cf36ca6 // indirect
-	golang.org/x/mod v0.29.0 // indirect
-	golang.org/x/tools v0.38.0 // indirect
+	golang.org/x/mod v0.32.0 // indirect
+	golang.org/x/tools v0.41.0 // indirect
 	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 // indirect
 )
 
@@ -121,12 +124,12 @@ require (
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/jinzhu/inflection v1.0.0 // indirect
 	github.com/jinzhu/now v1.1.5 // indirect
-	github.com/spf13/pflag v1.0.9 // indirect
+	github.com/spf13/pflag v1.0.10 // indirect
 	go.uber.org/atomic v1.11.0
 	go.uber.org/multierr v1.11.0 // indirect
-	go.uber.org/zap v1.27.0 // indirect
-	golang.org/x/net v0.47.0
-	golang.org/x/sync v0.18.0
+	go.uber.org/zap v1.28.0 // indirect
+	golang.org/x/net v0.51.0
+	golang.org/x/sync v0.20.0
 	golang.org/x/sys v0.41.0
-	golang.org/x/text v0.31.0
+	golang.org/x/text v0.34.0
 )

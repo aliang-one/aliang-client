@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"aliang.one/nursorgate/app/http/models"
+	"aliang.one/nursorgate/app/tunnel"
 	"aliang.one/nursorgate/common/cache"
 	"aliang.one/nursorgate/common/logger"
 	"aliang.one/nursorgate/common/version"
@@ -100,6 +101,7 @@ type AgentService struct {
 	client                *http.Client
 	terminal              *agentTerminalManager
 	ai                    *agentAIManager
+	tunnel                *tunnel.Manager
 	// Forwarded user credentials are process-local only. The session owner sends
 	// them through /api/agent/sync after login/restore/refresh; the agent never
 	// reads or rotates the persisted refresh token.
@@ -151,6 +153,7 @@ func NewAgentService() *AgentService {
 		ai:                newAgentAIManager(),
 		sessionRefreshSig: make(chan struct{}, 1),
 	}
+	s.tunnel = tunnel.NewManager(s.emitTunnelStatus)
 	s.ai.service = s
 	s.ai.loadPendingTerminals()
 	s.ai.loadIdentityState()

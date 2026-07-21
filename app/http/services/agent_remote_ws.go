@@ -176,6 +176,9 @@ func (s *AgentService) forceDisconnectRemote(reason string) {
 		logger.Info(fmt.Sprintf("[AGENT-BOOT] remote_connection force_close reason=%s", normalizeAgentDisableReason(reason)))
 		_ = conn.Close()
 	}
+	if s.tunnel != nil {
+		s.tunnel.Stop()
+	}
 	s.terminal.closeAll()
 	s.ai.closeAll()
 }
@@ -401,6 +404,14 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 			remoteString(msg, "run_id"),
 			int64(remoteInt(msg, "accepted_seq", 0)),
 		)
+	case models.AgentEventGoalRunEventAck:
+		s.setRemoteConnectionState(true, "online", "")
+		if remoteString(msg, "result") == "accepted" {
+			s.ai.acknowledgePendingTerminal(
+				remoteString(msg, "goal_run_id"),
+				int64(remoteInt(msg, "accepted_seq", 0)),
+			)
+		}
 	case models.AgentEventDeviceUnbound:
 		logger.Warn("[AGENT-BOOT] remote_connection device_unbound")
 		s.DisableWithReason("device_unbound")
@@ -409,12 +420,22 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 		s.applyRemoteDeviceSettings(msg)
 	case models.AgentEventProjectSettings:
 		s.applyRemoteProjectSettings(msg)
+	case models.AgentEventTunnelConfigure:
+		s.setRemoteConnectionState(true, "online", "")
+		s.configureTunnel(msg, writeJSON)
 	case models.AgentEventProjectDetail, models.AgentEventAISessionDetail, models.AgentEventFileList, models.AgentEventFileRead, models.AgentEventSlashCommandsList, "file.working_tree_diff":
 		s.setRemoteConnectionState(true, "online", "")
 		go handleAgentDetailMessageWithAI(msg, writeJSON, s.ai)
 	case models.AgentEventGitStatus, models.AgentEventEnvInfo:
 		s.setRemoteConnectionState(true, "online", "")
 		go handleAgentEnvToolsMessage(msg, writeJSON)
+	case models.AgentEventGoalPlan, models.AgentEventGoalVerify:
+		s.setRemoteConnectionState(true, "online", "")
+		if !s.aiControlEnabled() {
+			_ = writeJSON(agentGoalErrorPayload(msg, errors.New("AI control is disabled for this device")))
+			return
+		}
+		go handleAgentGoalMessage(msg, writeJSON, s.ai)
 	case models.AgentEventTerminalCreate:
 		s.setRemoteConnectionState(true, "online", "")
 		if !s.remoteTerminalEnabled() {
@@ -508,6 +529,7 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 func remoteAgentMessageRequiresEnabledDevice(msgType string) bool {
 	switch msgType {
 	case models.AgentEventProjectDetail,
+		models.AgentEventTunnelConfigure,
 		models.AgentEventAISessionDetail,
 		models.AgentEventFileList,
 		models.AgentEventFileRead,
@@ -515,6 +537,8 @@ func remoteAgentMessageRequiresEnabledDevice(msgType string) bool {
 		models.AgentEventSlashCommandsList,
 		models.AgentEventGitStatus,
 		models.AgentEventEnvInfo,
+		models.AgentEventGoalPlan,
+		models.AgentEventGoalVerify,
 		models.AgentEventTerminalCreate,
 		models.AgentEventTerminalInput,
 		models.AgentEventTerminalResize,
@@ -715,6 +739,15 @@ func agentCapabilities() []string {
 		caps = append(caps, "terminal_pipe")
 	}
 	caps = append(caps, agentAICapabilities()...)
+	caps = append(caps,
+		"http_tunnel_v1",
+		"websocket_tunnel_v1",
+		"goal_server_v1",
+		"goal_plan_readonly_v1",
+		"goal_report_v1",
+		"goal_verify_v1",
+		"workspace_fingerprint_v1",
+	)
 	return caps
 }
 

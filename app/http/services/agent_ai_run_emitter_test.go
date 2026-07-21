@@ -147,3 +147,35 @@ func TestAgentAIRunTerminalRemainsUntilAck(t *testing.T) {
 		t.Fatalf("pending after ack = %#v", got)
 	}
 }
+
+func TestAgentGoalRunTerminalClearsOnGoalAck(t *testing.T) {
+	m := newAgentAIManager()
+	emitter := m.runEmitter(
+		agentAIRun{
+			runID:     "goal-run-pending",
+			messageID: "goal-message-pending",
+			goalIdentity: map[string]interface{}{
+				"goal_id":     "goal-1",
+				"goal_run_id": "goal-run-pending",
+			},
+		},
+		agentTerminalWriter(func(interface{}) error { return nil }),
+	)
+	if err := emitter.emit(map[string]interface{}{"type": "ai.error", "session_id": "goal-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.pendingTerminalSnapshot(); len(got) != 1 {
+		t.Fatalf("pending before Goal ACK = %#v", got)
+	}
+
+	svc := &AgentService{ai: m}
+	svc.handleRemoteAgentMessage(map[string]interface{}{
+		"type":         models.AgentEventGoalRunEventAck,
+		"goal_run_id":  "goal-run-pending",
+		"accepted_seq": 6,
+		"result":       "accepted",
+	}, func(interface{}) error { return nil })
+	if got := m.pendingTerminalSnapshot(); len(got) != 0 {
+		t.Fatalf("pending after Goal ACK = %#v", got)
+	}
+}

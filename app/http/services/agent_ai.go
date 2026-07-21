@@ -300,6 +300,8 @@ type agentAIRun struct {
 	// policy version that decided. Set by the approval hooks before escalation.
 	matchedRuleID string
 	policyVersion int
+	goalIdentity  map[string]interface{}
+	readOnly      bool
 }
 
 type agentAIAttachment struct {
@@ -314,12 +316,16 @@ type agentAIAttachment struct {
 // event has been accepted, no concurrently-ticking progress goroutine can emit
 // after it. Holding the mutex through write preserves event_seq wire order.
 type agentAIRunEmitter struct {
-	mu         sync.Mutex
-	runID      string
-	nextSeq    int64
-	terminal   bool
-	write      agentTerminalWriter
-	onTerminal func(map[string]interface{}) error
+	mu                  sync.Mutex
+	runID               string
+	nextSeq             int64
+	terminal            bool
+	write               agentTerminalWriter
+	onTerminal          func(map[string]interface{}) error
+	goalIdentity        map[string]interface{}
+	goalOutput          strings.Builder
+	goalProjectPath     string
+	goalWorkspaceBefore string
 }
 
 func newAgentAIRunEmitter(run agentAIRun, write agentTerminalWriter) *agentAIRunEmitter {
@@ -329,7 +335,11 @@ func newAgentAIRunEmitter(run agentAIRun, write agentTerminalWriter) *agentAIRun
 		// so they are a stable fallback run identity until the server sends run_id.
 		runID = run.messageID
 	}
-	return &agentAIRunEmitter{runID: runID, write: write}
+	return &agentAIRunEmitter{
+		runID:        runID,
+		write:        write,
+		goalIdentity: cloneGoalIdentity(run.goalIdentity),
+	}
 }
 
 func agentAIRunEventTerminal(payload map[string]interface{}) bool {
@@ -364,8 +374,15 @@ func (e *agentAIRunEmitter) emit(value interface{}) error {
 	e.nextSeq++
 	payload["run_id"] = e.runID
 	payload["event_seq"] = e.nextSeq
+	for key, identityValue := range e.goalIdentity {
+		payload[key] = identityValue
+	}
+	if payload["type"] == models.AgentEventAIDelta {
+		e.appendGoalOutput(remoteString(payload, "delta"))
+	}
 	terminal := agentAIRunEventTerminal(payload)
 	if terminal {
+		e.attachGoalReport(payload)
 		// Close before the write. A concurrent heartbeat blocks on the mutex and
 		// observes terminal=true after this write completes, so done->progress is
 		// impossible even at the ticker boundary.
@@ -1052,9 +1069,10 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 		messageID = sessionID
 	}
 	messageRun := agentAIRun{
-		sessionID: sessionID,
-		runID:     remoteString(msg, "run_id"),
-		messageID: messageID,
+		sessionID:    sessionID,
+		runID:        remoteString(msg, "run_id"),
+		messageID:    messageID,
+		goalIdentity: goalRunIdentityFromMessage(msg),
 	}
 	emitter := m.runEmitter(messageRun, writeJSON)
 	runWrite := agentTerminalWriter(emitter.emit)
@@ -1153,6 +1171,12 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 		_ = runWrite(agentAIErrorPayload(sessionID, messageID, err))
 		return
 	}
+	if len(messageRun.goalIdentity) > 0 {
+		if err := emitter.captureGoalWorkspace(session.projectPath); err != nil {
+			_ = runWrite(agentAIErrorPayload(sessionID, messageID, fmt.Errorf("goal workspace fingerprint failed: %w", err)))
+			return
+		}
+	}
 
 	// Slash-command dispatcher: agent-local builtins (/clear /model /help /cost
 	// /compact) run WITHOUT a model turn. The Go agent drives the CLI headlessly
@@ -1184,7 +1208,12 @@ func (m *agentAIManager) runStart(msg map[string]interface{}, writeJSON agentTer
 	if m.replayProcessedRun(runID, writeJSON) {
 		return
 	}
-	claimed, claimErr := m.claimProcessedRun(runID, sessionID, messageID)
+	claimed, claimErr := m.claimProcessedRun(
+		runID,
+		sessionID,
+		messageID,
+		goalRunIdentityFromMessage(msg),
+	)
 	if claimErr != nil {
 		// Do not launch without a durable claim and do not emit a terminal run
 		// event: the server outbox must remain pending and retry after storage
@@ -1211,6 +1240,7 @@ func (m *agentAIManager) runStart(msg map[string]interface{}, writeJSON agentTer
 		// terminal instead of leaving a permanently "received" processed-run row.
 		emitter := m.runEmitter(agentAIRun{
 			runID: runID, sessionID: sessionID, messageID: messageID,
+			goalIdentity: goalRunIdentityFromMessage(msg),
 		}, writeJSON)
 		_ = emitter.emit(agentAIErrorPayload(sessionID, messageID, err))
 		return
@@ -1797,6 +1827,7 @@ func (m *agentAIManager) runUserMessage(session *agentAISession, runID, messageI
 		approvalToken:           approvalToken,
 		activity:                activity,
 		claudePolicy:            cloneAgentAIClaudeRemotePolicy(session.claudePolicy),
+		goalIdentity:            cloneGoalIdentity(emitter.goalIdentity),
 	}
 	run.onClaudeInit = func(commands []string, version string) {
 		m.recordClaudeCapabilities(run.sessionID, run.projectPath, commands, version)
@@ -4121,14 +4152,29 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 		resumeID = ""
 	}
 
-	tool, err := resolveAgentAITool(run.prompt, run.provider, run.model, run.effort, resumeID, newSessionID)
+	var tool *agentAITool
+	var err error
+	if run.readOnly || len(run.goalIdentity) > 0 {
+		tool, err = resolveGoalAgentAITool(run.prompt, run.provider, run.model, run.effort, resumeID, newSessionID)
+	} else {
+		tool, err = resolveAgentAITool(run.prompt, run.provider, run.model, run.effort, resumeID, newSessionID)
+	}
 	if err != nil {
 		_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, err))
 		return agentAIRunDone
 	}
+	if run.readOnly {
+		tool = withGoalPlanningReadOnly(tool)
+		if tool == nil {
+			_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, errors.New("provider does not support enforced read-only planning")))
+			return agentAIRunDone
+		}
+	} else if len(run.goalIdentity) > 0 {
+		tool = withGoalExecutionPolicy(tool)
+	}
 	tool = withAgentAIAttachments(tool, run.attachments)
 	cleanupClaudePolicy := func() {}
-	if tool.outputFormat == agentAIOutputClaudeStreamJSON {
+	if tool.outputFormat == agentAIOutputClaudeStreamJSON && !run.readOnly {
 		var policyErr error
 		tool, cleanupClaudePolicy, policyErr = withClaudeRemotePolicy(tool, run)
 		if policyErr != nil {
@@ -5534,6 +5580,17 @@ func resolveAgentAITool(prompt string, preferred string, model string, effort st
 		}
 	}
 	return nil, errors.New("no approval-capable AI CLI found in PATH: Codex app-server, Claude, or Claude Code")
+}
+
+func resolveGoalAgentAITool(prompt string, preferred string, model string, effort string, resumeSessionID string, newSessionID ...string) (*agentAITool, error) {
+	preferred, err := normalizeAgentAIProvider(preferred)
+	if err != nil {
+		return nil, err
+	}
+	if preferred == "auto" {
+		return nil, errors.New("Goal execution requires an explicit AI provider")
+	}
+	return resolveNamedAgentAITool(preferred, prompt, model, effort, resumeSessionID, newSessionID...)
 }
 
 func validateApprovalCapableProvider(provider string, hasCodexAppServer bool) error {
