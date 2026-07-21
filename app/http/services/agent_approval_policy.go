@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"aliang.one/nursorgate/common/logger"
+	"github.com/google/shlex"
 )
 
 const approvalPolicyFilename = "approval_policy.json"
@@ -148,6 +149,9 @@ func (s *AgentService) setEffectivePolicyForPathLocked(projectPath string, p App
 // evaluateApprovalDecision evaluates the effective policy for the given project
 // path for one tool call. Convenience used by the approval hooks.
 func (s *AgentService) evaluateApprovalDecision(toolName string, toolInput json.RawMessage, projectPath string) (policyDecision, string) {
+	if decision, ruleID, constrained := approvalProjectBoundaryDecision(toolName, toolInput, projectPath); constrained {
+		return decision, ruleID
+	}
 	return evaluateApprovalPolicy(s.effectiveApprovalPolicyForPath(projectPath), toolName, toolInput)
 }
 
@@ -437,7 +441,13 @@ func ruleMatches(r approvalRule, toolName string, toolInput json.RawMessage) boo
 		return true
 	}
 	cmd := commandFromToolInput(toolInput)
-	return cmd != "" && r.cmdRe.MatchString(cmd)
+	if cmd == "" {
+		return false
+	}
+	if r.ID == "safe-bash" {
+		return safeBashSegmentsMatch(r.cmdRe, cmd)
+	}
+	return r.cmdRe.MatchString(cmd)
 }
 
 // commandFromToolInput extracts the Bash command from a tool_use input payload
@@ -454,6 +464,288 @@ func commandFromToolInput(toolInput json.RawMessage) string {
 		return c
 	}
 	return strings.TrimSpace(remoteString(m, "cmd"))
+}
+
+func approvalProjectBoundaryDecision(toolName string, toolInput json.RawMessage, projectPath string) (policyDecision, string, bool) {
+	projectPath = strings.TrimSpace(projectPath)
+	if projectPath == "" {
+		return "", "", false
+	}
+	if strings.EqualFold(strings.TrimSpace(toolName), "Bash") {
+		if command := commandFromToolInput(toolInput); command != "" && bashReferencesOutsideProject(command, projectPath) {
+			return decisionRequireApproval, "outside-project-bash", true
+		}
+		return "", "", false
+	}
+	paths, scoped, valid := approvalToolPaths(toolName, toolInput)
+	if !scoped {
+		return "", "", false
+	}
+	if !valid {
+		return decisionAutoDeny, "invalid-project-path", true
+	}
+	for _, path := range paths {
+		if !approvalPathWithinProject(projectPath, path) {
+			return decisionAutoDeny, "outside-project-path", true
+		}
+	}
+	return "", "", false
+}
+
+func approvalToolPaths(toolName string, toolInput json.RawMessage) ([]string, bool, bool) {
+	toolName = strings.ToLower(strings.TrimSpace(toolName))
+	fields := []string(nil)
+	pathOptional := false
+	switch toolName {
+	case "read", "write", "edit", "multiedit":
+		fields = []string{"file_path", "filePath", "path"}
+	case "notebookedit":
+		fields = []string{"notebook_path", "notebookPath", "file_path", "filePath", "path"}
+	case "grep", "glob", "ls":
+		fields = []string{"path"}
+		pathOptional = true
+	default:
+		return nil, false, true
+	}
+	var input map[string]interface{}
+	if len(toolInput) == 0 || json.Unmarshal(toolInput, &input) != nil {
+		return nil, true, pathOptional
+	}
+	paths := make([]string, 0, 2)
+	for _, field := range fields {
+		if path := strings.TrimSpace(remoteString(input, field)); path != "" {
+			paths = append(paths, path)
+		}
+	}
+	for _, raw := range []interface{}{input["paths"], input["file_paths"], input["filePaths"]} {
+		switch values := raw.(type) {
+		case []string:
+			for _, value := range values {
+				if value = strings.TrimSpace(value); value != "" {
+					paths = append(paths, value)
+				}
+			}
+		case []interface{}:
+			for _, value := range values {
+				if path := strings.TrimSpace(fmt.Sprint(value)); path != "" && path != "<nil>" {
+					paths = append(paths, path)
+				}
+			}
+		}
+	}
+	if len(paths) == 0 && !pathOptional {
+		return nil, true, false
+	}
+	return paths, true, true
+}
+
+func approvalPathWithinProject(projectPath, candidate string) bool {
+	projectRoot, err := filepath.Abs(projectPath)
+	if err != nil {
+		return false
+	}
+	projectRoot, err = filepath.EvalSymlinks(projectRoot)
+	if err != nil {
+		return false
+	}
+	candidate = strings.TrimSpace(candidate)
+	if candidate == "" || strings.HasPrefix(candidate, "~") {
+		return false
+	}
+	if !filepath.IsAbs(candidate) {
+		candidate = filepath.Join(projectRoot, candidate)
+	}
+	candidate, err = evalSymlinksAllowMissing(candidate)
+	if err != nil {
+		return false
+	}
+	rel, err := filepath.Rel(projectRoot, candidate)
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+func evalSymlinksAllowMissing(path string) (string, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	current := filepath.Clean(absolute)
+	missing := make([]string, 0, 4)
+	for {
+		resolved, resolveErr := filepath.EvalSymlinks(current)
+		if resolveErr == nil {
+			for i := len(missing) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, missing[i])
+			}
+			return filepath.Clean(resolved), nil
+		}
+		if !os.IsNotExist(resolveErr) {
+			return "", resolveErr
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return "", resolveErr
+		}
+		missing = append(missing, filepath.Base(current))
+		current = parent
+	}
+}
+
+func safeBashSegmentsMatch(pattern *regexp.Regexp, command string) bool {
+	segments, ok := splitShellCommandSegments(command)
+	if !ok || len(segments) == 0 {
+		return false
+	}
+	for _, segment := range segments {
+		words, err := shlex.Split(segment)
+		if err != nil || !pattern.MatchString(segment) || unsafeSafeBashLauncher(words) {
+			return false
+		}
+	}
+	return true
+}
+
+func unsafeSafeBashLauncher(words []string) bool {
+	if len(words) == 0 {
+		return true
+	}
+	switch strings.ToLower(filepath.Base(words[0])) {
+	case "env":
+		for _, word := range words[1:] {
+			if strings.HasPrefix(word, "-") || strings.Contains(word, "=") {
+				continue
+			}
+			return true
+		}
+	case "command":
+		if len(words) < 3 || (words[1] != "-v" && words[1] != "-V") {
+			return true
+		}
+	case "find":
+		for _, word := range words[1:] {
+			switch strings.ToLower(word) {
+			case "-exec", "-execdir", "-ok", "-okdir", "-delete", "-fls", "-fprint", "-fprint0", "-fprintf":
+				return true
+			}
+		}
+	case "awk":
+		joined := strings.ToLower(strings.Join(words[1:], " "))
+		if strings.Contains(joined, "system(") || strings.Contains(joined, "|getline") || strings.Contains(joined, "| getline") {
+			return true
+		}
+	}
+	return false
+}
+
+func splitShellCommandSegments(command string) ([]string, bool) {
+	var segments []string
+	start := 0
+	quote := rune(0)
+	escaped := false
+	runes := []rune(command)
+	flush := func(end int) bool {
+		segment := strings.TrimSpace(string(runes[start:end]))
+		if segment == "" {
+			return false
+		}
+		segments = append(segments, segment)
+		return true
+	}
+	for i, ch := range runes {
+		if escaped {
+			escaped = false
+			continue
+		}
+		if ch == '\\' && quote != '\'' {
+			escaped = true
+			continue
+		}
+		if quote != 0 {
+			if ch == quote {
+				quote = 0
+			} else if quote != '\'' && (ch == '`' || ch == '$' && i+1 < len(runes) && runes[i+1] == '(') {
+				return nil, false
+			}
+			continue
+		}
+		if ch == '\'' || ch == '"' {
+			quote = ch
+			continue
+		}
+		if ch == '`' || ch == '$' && i+1 < len(runes) && runes[i+1] == '(' {
+			return nil, false
+		}
+		operatorWidth := 0
+		switch ch {
+		case ';', '\n', '\r', '|':
+			operatorWidth = 1
+			if (ch == '|') && i+1 < len(runes) && runes[i+1] == '|' {
+				operatorWidth = 2
+			}
+		case '&':
+			if i+1 >= len(runes) || runes[i+1] != '&' {
+				return nil, false
+			}
+			operatorWidth = 2
+		}
+		if operatorWidth > 0 {
+			if !flush(i) {
+				return nil, false
+			}
+			start = i + operatorWidth
+			if operatorWidth == 2 {
+				runes[i+1] = ' '
+			}
+		}
+	}
+	if quote != 0 || escaped || !flush(len(runes)) {
+		return nil, false
+	}
+	return segments, true
+}
+
+func bashReferencesOutsideProject(command, projectPath string) bool {
+	segments, ok := splitShellCommandSegments(command)
+	if !ok {
+		return false
+	}
+	for _, segment := range segments {
+		words, err := shlex.Split(segment)
+		if err != nil {
+			return false
+		}
+		for _, word := range words[1:] {
+			for _, candidate := range shellWordPathCandidates(word) {
+				if !approvalPathWithinProject(projectPath, candidate) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func shellWordPathCandidates(word string) []string {
+	values := []string{strings.TrimSpace(word)}
+	if index := strings.Index(word, "="); index >= 0 && index+1 < len(word) {
+		values = append(values, word[index+1:])
+	}
+	for _, marker := range []string{">", "<"} {
+		if index := strings.LastIndex(word, marker); index >= 0 && index+1 < len(word) {
+			values = append(values, word[index+1:])
+		}
+	}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || strings.HasPrefix(value, "-") || strings.Contains(value, "://") {
+			continue
+		}
+		out = append(out, value)
+	}
+	return out
 }
 
 func containsString(list []string, s string) bool {
@@ -520,13 +812,10 @@ func dangerousBashPattern() string {
 
 // safeBashPattern is the vibe-mode Bash allowlist: read-only exploration, common
 // text/file utilities, light in-project file ops, package-manager + build/test/
-// lint entry points, and non-destructive git. It is anchored at ^ and matches the
-// LEADING command token only — a chain that starts safe but later runs something
-// catastrophic is still caught by dangerous-bash (evaluated first). Residual
-// non-catastrophic-but-risky tails (e.g. `cd x && node evil.js`) auto-approve;
-// acceptable because Claude is CWD-locked to an authorized project directory and
-// its work is git-reversible. Unknown/unmatched commands fall through to the
-// fail-safe default (require approval).
+// lint entry points, and non-destructive git. Each shell segment must match this
+// leading-token allowlist; a chain containing any unknown segment falls through
+// to the fail-safe default. Dangerous segments are still caught first by the
+// substring denylist.
 func safeBashPattern() string {
 	leaf := strings.Join([]string{
 		// exploration / read-only

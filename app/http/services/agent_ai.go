@@ -508,7 +508,7 @@ type agentAICodexInputAnswer struct {
 var (
 	agentAIApprovalHookBaseURLMu sync.RWMutex
 	agentAIApprovalHookBaseURL   = UserAgentBaseURL()
-	claudeApprovalHookCache      sync.Map // map[tool path]claudeApprovalHookStrategy
+	claudeApprovalHookCache      sync.Map // map[executable fingerprint]claudeApprovalHookStrategy
 )
 
 type claudeApprovalHookStrategy string
@@ -551,9 +551,11 @@ func parseAgentAIClaudeRemotePolicy(msg map[string]interface{}) agentAIClaudeRem
 	if policy.projectCapabilityMode != "sanitized_plugin" {
 		policy.projectCapabilityMode = "disabled"
 	}
-	// Remote mode never reads project/local settings directly. Trusted project
+	// Remote mode never reads filesystem settings. User/project/local permission
+	// arrays merge across scopes in Claude Code, so even a higher-precedence empty
+	// list cannot neutralize a stale user permissions.ask rule. Trusted project
 	// capabilities are loaded separately through a sanitized temporary plugin.
-	policy.settingSources = []string{"user"}
+	policy.settingSources = nil
 	if settings, ok := raw["settings"].(map[string]interface{}); ok {
 		policy.disableSkillShell = remoteBool(settings, "disableSkillShellExecution", true)
 		if permissions, ok := settings["permissions"].(map[string]interface{}); ok {
@@ -2367,12 +2369,21 @@ func (m *agentAIManager) requestApproval(ctx context.Context, run agentAIRun, wr
 		})
 		return response, nil
 	case <-ctx.Done():
+		cancelled := false
 		m.mu.Lock()
 		if waiter := m.approvals[approvalKey]; waiter != nil && waiter.sessionID == run.sessionID && waiter.runSeq == run.runSeq {
 			delete(m.approvals, approvalKey)
 			m.rememberCompletedApprovalLocked(req.ID, run.sessionID, run.runSeq, agentAIApprovalResponse{Decision: models.AgentAIApprovalDecisionCancel})
+			cancelled = true
 		}
 		m.mu.Unlock()
+		if cancelled {
+			reason := "run_cancelled"
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				reason = "approval_timeout"
+			}
+			m.emitApprovalCancelled(writeJSON, run.sessionID, []string{req.ID}, reason)
+		}
 		return agentAIApprovalResponse{}, ctx.Err()
 	}
 }
@@ -2761,15 +2772,27 @@ func agentAIUseCodexAppServer(provider string) bool {
 
 var codexAppServerProbeCache sync.Map
 
+func executableProbeCacheKey(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	key := path
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		key += ":" + resolved
+	}
+	if stat, err := os.Stat(path); err == nil {
+		key += fmt.Sprintf(":%d:%d", stat.ModTime().UnixNano(), stat.Size())
+	}
+	return key
+}
+
 func codexAppServerAvailable() bool {
 	path, err := lookPathCLI("codex")
 	if err != nil {
 		return false
 	}
-	cacheKey := path
-	if stat, statErr := os.Stat(path); statErr == nil {
-		cacheKey = fmt.Sprintf("%s:%d:%d", path, stat.ModTime().UnixNano(), stat.Size())
-	}
+	cacheKey := executableProbeCacheKey(path)
 	if cached, ok := codexAppServerProbeCache.Load(cacheKey); ok {
 		return cached.(bool)
 	}
@@ -3864,7 +3887,7 @@ func (m *agentAIManager) codexAppServerApprovalResult(ctx context.Context, run a
 	// when the device policy says so, with no cloud round-trip. Only
 	// require_approval falls through to requestApproval.
 	if svc := m.approvalService(); svc != nil {
-		toolName, toolInput := codexPolicyToolHint(method, params)
+		toolName, toolInput := codexPolicyToolHint(method, params, fileChanges)
 		switch decision, matchedID := svc.evaluateApprovalDecision(toolName, toolInput, run.projectPath); decision {
 		case decisionAutoApprove:
 			logger.Info(fmt.Sprintf("approval-hook: AUTO-APPROVE by policy rule=%s method=%s session=%s (codex, no cloud round-trip)", matchedID, method, run.sessionID))
@@ -3964,12 +3987,23 @@ func codexApprovalCommand(params map[string]interface{}) string {
 // the command string; file-change methods map to a file-mutation tool name;
 // permissions and anything unknown map to "" so the policy's default applies
 // (fail-safe under balanced, approve-all under allow_all).
-func codexPolicyToolHint(method string, params map[string]interface{}) (string, json.RawMessage) {
+func codexPolicyToolHint(method string, params map[string]interface{}, fileChanges json.RawMessage) (string, json.RawMessage) {
 	switch method {
 	case "item/commandExecution/requestApproval", "execCommandApproval":
 		return "Bash", marshalAgentAIRaw(map[string]interface{}{"command": codexApprovalCommand(params)})
 	case "item/fileChange/requestApproval", "applyPatchApproval":
-		return "Edit", nil
+		if len(fileChanges) == 0 {
+			fileChanges = marshalAgentAIRaw(firstNonNil(params["fileChanges"], params["file_changes"]))
+		}
+		var changes []map[string]interface{}
+		_ = json.Unmarshal(fileChanges, &changes)
+		paths := make([]string, 0, len(changes))
+		for _, change := range changes {
+			if path := strings.TrimSpace(remoteString(change, "path")); path != "" {
+				paths = append(paths, path)
+			}
+		}
+		return "Edit", marshalAgentAIRaw(map[string]interface{}{"paths": paths})
 	default:
 		return "", nil
 	}
@@ -5485,9 +5519,12 @@ func resolveAgentAITool(prompt string, preferred string, model string, effort st
 		return nil, err
 	}
 	if preferred != "auto" {
+		if err := validateApprovalCapableProvider(preferred, codexAppServerAvailable()); err != nil {
+			return nil, err
+		}
 		return resolveNamedAgentAITool(preferred, prompt, model, effort, resumeSessionID, reservedID)
 	}
-	candidates := []string{"claude", "claudecode", "opencode"}
+	candidates := []string{"claude", "claudecode"}
 	if codexAppServerAvailable() {
 		candidates = append([]string{"codex"}, candidates...)
 	}
@@ -5496,7 +5533,19 @@ func resolveAgentAITool(prompt string, preferred string, model string, effort st
 			return tool, nil
 		}
 	}
-	return nil, errors.New("no supported AI CLI found in PATH: codex, claude, claudecode, or opencode")
+	return nil, errors.New("no approval-capable AI CLI found in PATH: Codex app-server, Claude, or Claude Code")
+}
+
+func validateApprovalCapableProvider(provider string, hasCodexAppServer bool) error {
+	switch provider {
+	case "codex":
+		if !hasCodexAppServer {
+			return errors.New("Codex app-server is required for remote approval support; update Codex before using it from Aliang")
+		}
+	case "opencode":
+		return errors.New("OpenCode is unavailable for remote execution because it does not provide an Aliang approval bridge")
+	}
+	return nil
 }
 
 func resolveNamedAgentAITool(name string, prompt string, model string, effort string, resumeSessionID string, newSessionID ...string) (*agentAITool, error) {
@@ -5795,7 +5844,8 @@ func detectClaudeApprovalHookStrategy(toolPath string) claudeApprovalHookStrateg
 	if toolPath == "" {
 		return claudeApprovalHookPreToolUseCommand
 	}
-	if cached, ok := claudeApprovalHookCache.Load(toolPath); ok {
+	cacheKey := executableProbeCacheKey(toolPath)
+	if cached, ok := claudeApprovalHookCache.Load(cacheKey); ok {
 		if strategy, ok := cached.(claudeApprovalHookStrategy); ok {
 			return strategy
 		}
@@ -5807,12 +5857,26 @@ func detectClaudeApprovalHookStrategy(toolPath string) claudeApprovalHookStrateg
 	if err == nil {
 		strategy = claudeApprovalHookStrategyForVersion(string(out))
 	}
-	claudeApprovalHookCache.Store(toolPath, strategy)
+	claudeApprovalHookCache.Store(cacheKey, strategy)
 	return strategy
+}
+
+const claudeApprovalHookTimeoutGrace = 30 * time.Second
+
+func claudeApprovalHookTimeoutSeconds(approvalTimeout time.Duration) int64 {
+	if approvalTimeout <= 0 {
+		approvalTimeout = time.Second
+	}
+	seconds := int64(approvalTimeout / time.Second)
+	if approvalTimeout%time.Second != 0 {
+		seconds++
+	}
+	return seconds + int64(claudeApprovalHookTimeoutGrace/time.Second)
 }
 
 func claudeApprovalHookSettings(strategy claudeApprovalHookStrategy, run agentAIRun) (map[string]interface{}, error) {
 	hookURL := agentAIApprovalHookURL(run.sessionID, agentAssistantMessageID(run.messageID), run.approvalToken)
+	hookTimeout := claudeApprovalHookTimeoutSeconds(agentAIApprovalTimeout)
 	var settings map[string]interface{}
 	switch strategy {
 	case claudeApprovalHookPermissionRequestHTTP:
@@ -5825,7 +5889,7 @@ func claudeApprovalHookSettings(strategy claudeApprovalHookStrategy, run agentAI
 							map[string]interface{}{
 								"type":    "http",
 								"url":     hookURL,
-								"timeout": 600,
+								"timeout": hookTimeout,
 							},
 						},
 					},
@@ -5842,7 +5906,7 @@ func claudeApprovalHookSettings(strategy claudeApprovalHookStrategy, run agentAI
 							map[string]interface{}{
 								"type":    "command",
 								"command": claudeApprovalHookCurlCommand(hookURL),
-								"timeout": 600,
+								"timeout": hookTimeout,
 							},
 						},
 					},
@@ -5852,8 +5916,16 @@ func claudeApprovalHookSettings(strategy claudeApprovalHookStrategy, run agentAI
 	}
 	if run.claudePolicy.enabled {
 		settings["disableSkillShellExecution"] = true
-		settings["permissions"] = map[string]interface{}{
-			"ask": append([]string(nil), run.claudePolicy.permissionAsk...),
+		// Claude Code 2.1.x never invokes PermissionRequest hooks in headless
+		// --print mode. Its explicit ask rules also take precedence over an
+		// allowing PreToolUse result, so combining the two makes tools such as
+		// Edit fail even after our policy hook auto-approves them. Legacy runs
+		// enforce the same policy entirely in PreToolUse; modern runs keep the
+		// fail-closed ask layer and resolve it through PermissionRequest.
+		if strategy == claudeApprovalHookPermissionRequestHTTP {
+			settings["permissions"] = map[string]interface{}{
+				"ask": append([]string(nil), run.claudePolicy.permissionAsk...),
+			}
 		}
 	}
 	return settings, nil
@@ -5883,9 +5955,23 @@ func withClaudeApprovalHook(tool *agentAITool, run agentAIRun) *agentAITool {
 		return tool
 	}
 	copied := *tool
-	copied.args = append([]string(nil), tool.args...)
-	copied.args = append([]string{"--permission-mode", "default", "--settings", string(settingsRaw)}, copied.args...)
+	copied.args = withoutCLIArgumentValue(tool.args, "--setting-sources")
+	copied.args = append([]string{"--setting-sources", "", "--permission-mode", "default", "--settings", string(settingsRaw)}, copied.args...)
 	return &copied
+}
+
+func withoutCLIArgumentValue(args []string, flag string) []string {
+	out := make([]string, 0, len(args))
+	for index := 0; index < len(args); index++ {
+		if args[index] == flag {
+			if index+1 < len(args) {
+				index++
+			}
+			continue
+		}
+		out = append(out, args[index])
+	}
+	return out
 }
 
 func normalizeAgentAIModel(model string) string {
@@ -5899,19 +5985,24 @@ func normalizeAgentAIModel(model string) string {
 }
 
 func agentAICapabilities() []string {
+	_, hasClaude := lookPathCLI("claude")
+	_, hasClaudeCode := lookPathCLI("claudecode")
+	_, hasOpenCode := lookPathCLI("opencode")
+	return agentAICapabilitiesForTools(hasClaude == nil, hasClaudeCode == nil, codexAppServerAvailable(), hasOpenCode == nil)
+}
+
+func agentAICapabilitiesForTools(hasClaude, hasClaudeCode, hasCodexAppServer, hasOpenCode bool) []string {
 	caps := []string{"ai_chat", "ai_chat_context", "ai_stream", "ai_approval", "ai_steer", "vibe_session"}
-	for _, candidate := range []string{"codex", "claude", "claudecode", "opencode"} {
-		if _, err := lookPathCLI(candidate); err == nil {
-			caps = append(caps, "ai_provider_"+candidate)
-		}
+	if hasClaude {
+		caps = append(caps, "ai_provider_claude")
 	}
-	if _, err := lookPathCLI("claude"); err == nil && !agentAIStringSliceContains(caps, "ai_provider_claudecode") {
+	if hasClaudeCode || hasClaude {
 		caps = append(caps, "ai_provider_claudecode")
 	}
-	if codexAppServerAvailable() {
-		caps = append(caps, "ai_provider_codex_app_server")
+	if hasCodexAppServer {
+		caps = append(caps, "ai_provider_codex", "ai_provider_codex_app_server")
 	}
-	if _, err := lookPathCLI("opencode"); err == nil {
+	if hasOpenCode {
 		caps = append(caps, "ai_provider_opencode_basic")
 	}
 	return caps

@@ -6,7 +6,6 @@ import (
 	"runtime"
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestNormalizeAgentAIProviderAcceptsOpenCodeAliases(t *testing.T) {
@@ -123,7 +122,7 @@ func TestOpenCodeStructuredEventsAndErrors(t *testing.T) {
 	}
 }
 
-func TestAgentAIManagerStreamsOpenCodeJSON(t *testing.T) {
+func TestAgentAIManagerRejectsOpenCodeWithoutApprovalBridge(t *testing.T) {
 	projectPath := setupAgentExecutionProjectForTest(t)
 	binDir := t.TempDir()
 	writeFakeExecutable(t, binDir, "opencode", `#!/bin/sh
@@ -153,34 +152,21 @@ printf '%s\n' '{"type":"message.part.delta","properties":{"sessionID":"op-sid","
 		"content":      "say hi",
 	}, writer)
 
-	done := waitForAgentEvent(t, mu, events, "ai.done", func(ev map[string]interface{}) bool {
+	failed := waitForAgentEvent(t, mu, events, "ai.error", func(ev map[string]interface{}) bool {
 		return remoteString(ev, "session_id") == "s-opencode"
 	})
-	if remoteString(done, "opencode_session_id") != "op-sid" || remoteString(done, "source_session_id") != "op-sid" {
-		t.Fatalf("done ids = %+v", done)
-	}
-
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		if strings.Contains(joinAgentDeltas(mu, events), "你好") {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if got := joinAgentDeltas(mu, events); !strings.Contains(got, "你好") {
-		t.Fatalf("streamed deltas = %q, want contains 你好; events=%#v", got, *events)
+	if !strings.Contains(remoteString(failed, "error"), "approval bridge") {
+		t.Fatalf("error event = %+v", failed)
 	}
 
 	manager.mu.Lock()
 	session := manager.sessions["s-opencode"]
 	manager.mu.Unlock()
-	if session == nil || session.resumeSessionID != "op-sid" {
-		t.Fatalf("resumeSessionID = %q, want op-sid", func() string {
-			if session == nil {
-				return ""
-			}
-			return session.resumeSessionID
-		}())
+	if session == nil {
+		t.Fatal("rejected OpenCode session was unexpectedly removed")
+	}
+	if session.resumeSessionID != "" {
+		t.Fatalf("rejected OpenCode run persisted resumeSessionID = %q", session.resumeSessionID)
 	}
 }
 

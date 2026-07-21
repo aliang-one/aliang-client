@@ -22,9 +22,6 @@ func withClaudeRemotePolicy(tool *agentAITool, run agentAIRun) (*agentAITool, fu
 	copied := *tool
 	copied.args = append([]string(nil), tool.args...)
 	sources := strings.Join(run.claudePolicy.settingSources, ",")
-	if sources == "" {
-		sources = "user"
-	}
 	flags := []string{"--setting-sources", sources}
 	if run.claudePolicy.projectSkillTrusted && run.claudePolicy.projectCapabilityMode == "sanitized_plugin" {
 		pluginDir, err := prepareClaudeProjectCapabilityPlugin(run.projectPath)

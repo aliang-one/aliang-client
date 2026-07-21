@@ -432,6 +432,88 @@ func TestEvaluateDecisionForAgentService(t *testing.T) {
 	}
 }
 
+func TestEvaluateDecisionConfinesFileToolsToProject(t *testing.T) {
+	setupAgentPolicyTestEnv(t)
+	svc := NewAgentService()
+	project := t.TempDir()
+	inside := filepath.Join(project, "src", "new.go")
+	outside := filepath.Join(t.TempDir(), "outside.go")
+	toolInput := func(values map[string]interface{}) json.RawMessage {
+		raw, err := json.Marshal(values)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+
+	if d, _ := svc.evaluateApprovalDecision("Edit", toolInput(map[string]interface{}{"file_path": inside}), project); d != decisionAutoApprove {
+		t.Fatalf("inside edit -> %s, want auto_approve", d)
+	}
+	if d, id := svc.evaluateApprovalDecision("Write", toolInput(map[string]interface{}{"file_path": outside}), project); d != decisionAutoDeny || id != "outside-project-path" {
+		t.Fatalf("outside write -> (%s, %s), want auto_deny/outside-project-path", d, id)
+	}
+	if d, id := svc.evaluateApprovalDecision("Read", nil, project); d != decisionAutoDeny || id != "invalid-project-path" {
+		t.Fatalf("missing read path -> (%s, %s), want auto_deny/invalid-project-path", d, id)
+	}
+
+	link := filepath.Join(project, "outside-link")
+	if err := os.Symlink(filepath.Dir(outside), link); err == nil {
+		linked := filepath.Join(link, filepath.Base(outside))
+		if d, id := svc.evaluateApprovalDecision("Edit", toolInput(map[string]interface{}{"file_path": linked}), project); d != decisionAutoDeny || id != "outside-project-path" {
+			t.Fatalf("symlink escape -> (%s, %s), want auto_deny/outside-project-path", d, id)
+		}
+	}
+	changes, _ := json.Marshal([]map[string]interface{}{{"path": outside, "kind": "edit"}})
+	toolName, codexInput := codexPolicyToolHint("item/fileChange/requestApproval", map[string]interface{}{}, changes)
+	if d, id := svc.evaluateApprovalDecision(toolName, codexInput, project); d != decisionAutoDeny || id != "outside-project-path" {
+		t.Fatalf("Codex outside fileChange -> (%s, %s), want auto_deny/outside-project-path", d, id)
+	}
+}
+
+func TestEvaluateDecisionEscalatesBashOutsideProject(t *testing.T) {
+	setupAgentPolicyTestEnv(t)
+	svc := NewAgentService()
+	project := t.TempDir()
+	inside := filepath.Join(project, "README.md")
+	insideInput, _ := json.Marshal(map[string]interface{}{"command": "cat " + inside})
+	if d, _ := svc.evaluateApprovalDecision("Bash", insideInput, project); d != decisionAutoApprove {
+		t.Fatalf("inside cat -> %s, want auto_approve", d)
+	}
+	if d, id := svc.evaluateApprovalDecision("Bash", json.RawMessage(`{"command":"cat /etc/passwd"}`), project); d != decisionRequireApproval || id != "outside-project-bash" {
+		t.Fatalf("outside cat -> (%s, %s), want require_approval/outside-project-bash", d, id)
+	}
+	outsideDir := t.TempDir()
+	link := filepath.Join(project, "outside-link")
+	if err := os.Symlink(outsideDir, link); err == nil {
+		input, _ := json.Marshal(map[string]interface{}{"command": "cat outside-link/secret.txt"})
+		if d, id := svc.evaluateApprovalDecision("Bash", input, project); d != decisionRequireApproval || id != "outside-project-bash" {
+			t.Fatalf("Bash symlink escape -> (%s, %s), want require_approval/outside-project-bash", d, id)
+		}
+	}
+}
+
+func TestEvaluateSafeBashRejectsUnknownChainedCommand(t *testing.T) {
+	p := builtinBalancedPolicy()
+	for _, command := range []string{
+		`cd src && node evil.js`,
+		`echo ok | node evil.js`,
+		`echo $(node evil.js)`,
+		`env node evil.js`,
+		`command node evil.js`,
+		`find . -exec node evil.js ;`,
+		`awk 'BEGIN { system("node evil.js") }'`,
+	} {
+		input, _ := json.Marshal(map[string]interface{}{"command": command})
+		if d, _ := evaluateApprovalPolicy(p, "Bash", input); d != decisionRequireApproval {
+			t.Fatalf("unsafe chain %q -> %s, want require_approval", command, d)
+		}
+	}
+	input, _ := json.Marshal(map[string]interface{}{"command": "cd src && npm run build"})
+	if d, _ := evaluateApprovalPolicy(p, "Bash", input); d != decisionAutoApprove {
+		t.Fatalf("safe chain -> %s, want auto_approve", d)
+	}
+}
+
 // ---- Task 5: approval hook short-circuits on auto-approve ----
 
 // setupHookReadySession creates a session and arms it like an in-flight AI run

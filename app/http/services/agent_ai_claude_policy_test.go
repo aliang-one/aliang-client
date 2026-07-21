@@ -1,10 +1,13 @@
 package services
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func testClaudeRemotePolicy(trusted bool) map[string]interface{} {
@@ -26,15 +29,15 @@ func testClaudeRemotePolicy(trusted bool) map[string]interface{} {
 	}
 }
 
-func TestParseAgentAIClaudeRemotePolicyForcesUserSettings(t *testing.T) {
+func TestParseAgentAIClaudeRemotePolicyDisablesFilesystemSettings(t *testing.T) {
 	policy := parseAgentAIClaudeRemotePolicy(map[string]interface{}{
 		"claude_remote_policy": testClaudeRemotePolicy(true),
 	})
 	if !policy.enabled || !policy.projectSkillTrusted || policy.projectCapabilityMode != "sanitized_plugin" {
 		t.Fatalf("unexpected policy: %+v", policy)
 	}
-	if len(policy.settingSources) != 1 || policy.settingSources[0] != "user" {
-		t.Fatalf("setting sources = %v, want user only", policy.settingSources)
+	if len(policy.settingSources) != 0 {
+		t.Fatalf("setting sources = %v, want none", policy.settingSources)
 	}
 }
 
@@ -72,8 +75,8 @@ func TestClaudeRemotePolicyBuildsSanitizedProjectPlugin(t *testing.T) {
 	if pluginDir == "" {
 		t.Fatalf("missing --plugin-dir in %v", tool.args)
 	}
-	if got := argumentValue(tool.args, "--setting-sources"); got != "user" {
-		t.Fatalf("setting sources = %q, want user", got)
+	if got := argumentValue(tool.args, "--setting-sources"); got != "" {
+		t.Fatalf("setting sources = %q, want none", got)
 	}
 	sanitized, err := os.ReadFile(filepath.Join(pluginDir, "skills", "deploy", "SKILL.md"))
 	if err != nil {
@@ -123,6 +126,133 @@ func TestClaudeApprovalSettingsPreserveRemoteAskRules(t *testing.T) {
 	ask := permissions["ask"].([]string)
 	if strings.Join(ask, ",") != "Bash,Edit,mcp__*" {
 		t.Fatalf("ask = %v", ask)
+	}
+}
+
+func TestClaudeApprovalSettingsLegacyOmitsRemoteAskRules(t *testing.T) {
+	run := agentAIRun{
+		sessionID:     "s1",
+		messageID:     "m1",
+		approvalToken: "token",
+		claudePolicy:  parseAgentAIClaudeRemotePolicy(map[string]interface{}{"claude_remote_policy": testClaudeRemotePolicy(false)}),
+	}
+	settings, err := claudeApprovalHookSettings(claudeApprovalHookPreToolUseCommand, run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settings["disableSkillShellExecution"] != true {
+		t.Fatalf("disableSkillShellExecution = %v", settings["disableSkillShellExecution"])
+	}
+	if _, exists := settings["permissions"]; exists {
+		t.Fatalf("legacy settings must not combine explicit ask rules with PreToolUse: %v", settings["permissions"])
+	}
+}
+
+func TestClaudeApprovalHookTimeoutCoversAgentApprovalWindow(t *testing.T) {
+	if got, want := claudeApprovalHookTimeoutSeconds(1500*time.Millisecond), int64(32); got != want {
+		t.Fatalf("hook timeout = %d, want %d", got, want)
+	}
+	settings, err := claudeApprovalHookSettings(claudeApprovalHookPermissionRequestHTTP, agentAIRun{
+		sessionID: "s-timeout", messageID: "m-timeout", approvalToken: "token",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	hooks := settings["hooks"].(map[string]interface{})["PermissionRequest"].([]interface{})
+	handler := hooks[0].(map[string]interface{})["hooks"].([]interface{})[0].(map[string]interface{})
+	if got, want := handler["timeout"], claudeApprovalHookTimeoutSeconds(agentAIApprovalTimeout); got != want {
+		t.Fatalf("configured hook timeout = %v, want %v", got, want)
+	}
+}
+
+func TestRequestApprovalCancellationEmitsTerminalEvent(t *testing.T) {
+	manager := newAgentAIManager()
+	defer manager.closeAll()
+	mu, events, writer := captureAIWriter(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := manager.requestApproval(ctx, agentAIRun{
+			sessionID: "s-cancel", messageID: "m-cancel", runSeq: 1, provider: "claude", activity: newAgentAIActivity(),
+		}, writer, agentAIApprovalRequest{ID: "ap-cancel", Kind: "tool"})
+		result <- err
+	}()
+	waitForAgentEvent(t, mu, events, "ai.approval.request", func(event map[string]interface{}) bool {
+		return remoteString(event, "approval_id") == "ap-cancel" && remoteString(event, "status") == "pending"
+	})
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("requestApproval error = %v, want context canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("requestApproval did not stop after cancellation")
+	}
+	cancelled := lastAIEvent(mu, events, "ai.approval.cancelled")
+	if cancelled == nil || remoteString(cancelled, "reason") != "run_cancelled" {
+		t.Fatalf("cancelled event = %#v, want run_cancelled", cancelled)
+	}
+	ids, _ := cancelled["approval_ids"].([]string)
+	if len(ids) != 1 || ids[0] != "ap-cancel" {
+		t.Fatalf("cancelled approval_ids = %#v", cancelled["approval_ids"])
+	}
+}
+
+func TestExecutableProbeCacheKeyRefreshesAfterExecutableUpdate(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "claude")
+	if err := os.WriteFile(path, []byte("old executable"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	before := executableProbeCacheKey(path)
+	if err := os.WriteFile(path, []byte("new executable with different size"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	after := executableProbeCacheKey(path)
+	if before == after {
+		t.Fatalf("executable cache key stayed stale: %q", before)
+	}
+}
+
+func TestAgentAICapabilitiesOnlyAdvertiseApprovalCapableProviders(t *testing.T) {
+	caps := agentAICapabilitiesForTools(true, false, false, true)
+	for _, want := range []string{"ai_provider_claude", "ai_provider_claudecode", "ai_provider_opencode_basic"} {
+		if !agentAIStringSliceContains(caps, want) {
+			t.Fatalf("capabilities %v missing %s", caps, want)
+		}
+	}
+	for _, forbidden := range []string{"ai_provider_codex", "ai_provider_codex_app_server", "ai_provider_opencode"} {
+		if agentAIStringSliceContains(caps, forbidden) {
+			t.Fatalf("capabilities %v unexpectedly contain %s", caps, forbidden)
+		}
+	}
+	withCodex := agentAICapabilitiesForTools(false, false, true, false)
+	for _, want := range []string{"ai_provider_codex", "ai_provider_codex_app_server"} {
+		if !agentAIStringSliceContains(withCodex, want) {
+			t.Fatalf("capabilities %v missing %s", withCodex, want)
+		}
+	}
+}
+
+func TestResolveAgentAIToolRejectsOpenCodeWithoutApprovalBridge(t *testing.T) {
+	if _, err := resolveAgentAITool("edit a file", "opencode", "", "", ""); err == nil || !strings.Contains(err.Error(), "approval bridge") {
+		t.Fatalf("resolveAgentAITool(opencode) error = %v", err)
+	}
+	if err := validateApprovalCapableProvider("codex", false); err == nil || !strings.Contains(err.Error(), "app-server") {
+		t.Fatalf("validateApprovalCapableProvider(codex) error = %v", err)
+	}
+}
+
+func TestClaudeApprovalHookDisablesFilesystemSettingsWithoutRemotePolicy(t *testing.T) {
+	tool := withClaudeApprovalHook(&agentAITool{
+		path: "/bin/claude",
+		args: []string{"--setting-sources", "user", "--print", "prompt"},
+	}, agentAIRun{sessionID: "s-isolated", messageID: "m-isolated", runSeq: 1, approvalToken: "token"})
+	if got := argumentValue(tool.args, "--setting-sources"); got != "" {
+		t.Fatalf("setting sources = %q, want none", got)
+	}
+	if strings.Count(strings.Join(tool.args, "\x00"), "--setting-sources") != 1 {
+		t.Fatalf("setting sources flag was not normalized: %v", tool.args)
 	}
 }
 

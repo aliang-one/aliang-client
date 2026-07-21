@@ -35,10 +35,15 @@ func TestRunStartRedeliveryLaunchesProviderOnce(t *testing.T) {
 	binDir := t.TempDir()
 	counterPath := t.TempDir() + "/launches"
 	t.Setenv("COUNTER_FILE", counterPath)
-	writeFakeExecutable(t, binDir, "opencode", `#!/bin/sh
+	writeFakeExecutable(t, binDir, "claude", `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  printf '%s\n' '2.1.17 (Claude Code)'
+  exit 0
+fi
 printf x >> "$COUNTER_FILE"
-printf '%s\n' '{"type":"session.updated","properties":{"sessionID":"native-opencode-1"}}'
-printf '%s\n' '{"type":"message.part.delta","properties":{"sessionID":"native-opencode-1","delta":"ok"}}'
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"native-claude-1"}'
+printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"ok"}]}}'
+printf '%s\n' '{"type":"result","subtype":"success","session_id":"native-claude-1","result":"ok"}'
 `)
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
@@ -50,7 +55,7 @@ printf '%s\n' '{"type":"message.part.delta","properties":{"sessionID":"native-op
 		"session_id":   "managed-conversation-1",
 		"run_id":       "run-idempotent-1",
 		"message_id":   "message-idempotent-1",
-		"provider":     "opencode",
+		"provider":     "claude",
 		"project_path": projectPath,
 		"content":      "hello",
 	}
