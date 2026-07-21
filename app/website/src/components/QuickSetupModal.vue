@@ -369,7 +369,13 @@
                   <input
                     :value="currentFile.path"
                     type="text"
-                    class="h-10 w-full rounded-xl border border-slate-200 bg-slate-50 px-3 text-sm text-slate-700 outline-none transition focus:border-primary dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
+                    :readonly="isBuiltInQuickSetupSoftware(selectedSoftwareDef)"
+                    :class="[
+                      'h-10 w-full rounded-xl border border-slate-200 px-3 text-sm outline-none transition dark:border-slate-700',
+                      isBuiltInQuickSetupSoftware(selectedSoftwareDef)
+                        ? 'cursor-default bg-slate-100 text-slate-500 dark:bg-slate-900 dark:text-slate-400'
+                        : 'bg-slate-50 text-slate-700 focus:border-primary dark:bg-slate-950 dark:text-slate-100',
+                    ]"
                     @input="updateCurrentFile('path', $event.target.value)"
                   />
                 </div>
@@ -439,6 +445,7 @@
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 import { applyQuickSetup, getQuickSetupCatalog, getQuickSetupModels, renderQuickSetup } from '../services/quickSetupApi';
 import { useI18n } from '../i18n';
+import { createLatestRenderGuard, isBuiltInQuickSetupSoftware, snapshotQuickSetupFiles } from '../utils/quickSetupState';
 
 const { t } = useI18n();
 
@@ -470,11 +477,13 @@ const openCodeModelLoadPromises = new Map();
 const currentVariant = ref(null);
 const selectedFileCode = ref('');
 const editableFiles = ref([]);
+const filesDirty = ref(false);
 const customSoftwares = ref([]);
 const showAddSoftware = ref(false);
 const newSoftwareName = ref('');
 const newSoftwareDesc = ref('');
 let fileCounter = 0;
+const renderGuard = createLatestRenderGuard();
 const allSoftwares = computed(() => [
   ...softwares.value,
   ...customSoftwares.value,
@@ -515,7 +524,9 @@ const canApplyCurrentVariant = computed(() => {
     return editableFiles.value.length > 0;
   }
   if (isOpenCodeSelected.value) {
-    return selectedOpenCodeKeys.value.length > 0 && selectedOpenCodeKeys.value.every(apiKeyHasPlainSecret);
+    return selectedOpenCodeKeys.value.length > 0
+      && selectedOpenCodeKeys.value.every(apiKeyHasPlainSecret)
+      && editableFiles.value.length > 0;
   }
   return apiKeyHasPlainSecret(selectedKey.value) && editableFiles.value.length > 0;
 });
@@ -541,7 +552,7 @@ function keyProvider(keyId) {
   return apiKeys.value.find((key) => String(key.id) === String(keyId))?.provider || '';
 }
 function defaultOpenCodeModel(provider) {
-  return provider === 'anthropic' ? 'claude-sonnet-4-5' : 'gpt-5';
+  return provider === 'anthropic' ? 'claude-sonnet-4-5-20250929' : 'gpt-5.4';
 }
 function providerBaseUrl(provider) {
   const exact = apiKeys.value.find((key) => key.provider === provider && key.base_url)?.base_url;
@@ -673,12 +684,15 @@ function buildOpenCodeSpec() {
   };
 }
 function clearCurrentRender() {
+  renderGuard.invalidate();
+  rendering.value = false;
   currentVariant.value = null;
   editableFiles.value = [];
   selectedFileCode.value = '';
+  filesDirty.value = false;
 }
 function scheduleOpenCodeRender(delay = 450) {
-  if (!isOpenCodeSelected.value || selectedSoftwareDef.value?.isCustom) {
+  if (!isOpenCodeSelected.value || selectedSoftwareDef.value?.isCustom || filesDirty.value) {
     return;
   }
   if (openCodeRenderTimer) {
@@ -728,23 +742,38 @@ async function renderSelectedKey() {
     clearCurrentRender();
     return;
   }
+  if (filesDirty.value) {
+    return;
+  }
+  const requestId = renderGuard.begin();
   rendering.value = true;
   try {
     const options = isOpenCodeSelected.value ? { opencode: buildOpenCodeSpec() } : {};
     const result = await renderQuickSetup(selectedSoftware.value, keyIds, options);
+    if (!renderGuard.canCommit(requestId, filesDirty.value)) {
+      return;
+    }
     const variantList = Array.isArray(result?.variants) ? result.variants : [];
     if (variantList.length > 0) {
       currentVariant.value = variantList[0];
       editableFiles.value = (variantList[0].files || []).map((f) => ({ ...f }));
       selectedFileCode.value = editableFiles.value[0]?.code || '';
+      filesDirty.value = false;
     } else {
       clearCurrentRender();
     }
   } catch (error) {
+    if (!renderGuard.isCurrent(requestId)) {
+      return;
+    }
     statusMessage.value = error instanceof Error ? error.message : t('qs_failedRender');
-    clearCurrentRender();
+    if (!filesDirty.value) {
+      clearCurrentRender();
+    }
   } finally {
-    rendering.value = false;
+    if (renderGuard.isCurrent(requestId)) {
+      rendering.value = false;
+    }
   }
 }
 function selectSoftware(code) {
@@ -797,11 +826,13 @@ function addNewFile() {
   };
   editableFiles.value.push(newFile);
   selectedFileCode.value = newFile.code;
+  filesDirty.value = true;
 }
 function removeFile(code) {
   const idx = editableFiles.value.findIndex((f) => f.code === code);
   if (idx < 0) return;
   editableFiles.value.splice(idx, 1);
+  filesDirty.value = true;
   if (selectedFileCode.value === code) {
     selectedFileCode.value = editableFiles.value[0]?.code || ''
   }
@@ -811,10 +842,18 @@ function updateCurrentFile(field, value) {
   if (index < 0) {
     return;
   }
+  if (field === 'path' && isBuiltInQuickSetupSoftware(selectedSoftwareDef.value)) {
+    return;
+  }
   editableFiles.value[index] = {
     ...editableFiles.value[index],
     [field]: value,
   };
+  filesDirty.value = true;
+  if (openCodeRenderTimer) {
+    window.clearTimeout(openCodeRenderTimer);
+    openCodeRenderTimer = null;
+  }
 }
 async function copyText(value, successText) {
   try {
@@ -843,17 +882,18 @@ async function applyCurrentVariant() {
   }
   applying.value = true;
   try {
-    if (isOpenCodeSelected.value) {
-      await renderSelectedKey();
-    }
     if (!editableFiles.value.length) {
       return;
     }
-    const result = await applyQuickSetup(selectedSoftware.value, editableFiles.value);
+    const filesToApply = snapshotQuickSetupFiles(editableFiles.value);
+    const result = await applyQuickSetup(selectedSoftware.value, filesToApply);
     const writtenCount = Array.isArray(result?.written) ? result.written.length : 0;
     statusMessage.value = writtenCount > 0
       ? t('qs_appliedFiles', { count: writtenCount, name: selectedSoftwareDef.value?.name || selectedSoftware.value })
       : t('qs_noFilesWritten');
+    if (writtenCount > 0) {
+      filesDirty.value = false;
+    }
   } catch (error) {
     statusMessage.value = error instanceof Error ? error.message : t('qs_failedApply');
   } finally {
@@ -949,6 +989,7 @@ onMounted(() => {
   window.addEventListener('keydown', onModalKeydown, true);
 });
 onUnmounted(() => {
+  renderGuard.invalidate();
   if (openCodeRenderTimer) {
     window.clearTimeout(openCodeRenderTimer);
   }

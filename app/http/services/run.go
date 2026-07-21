@@ -277,7 +277,7 @@ func (rs *RunService) StopService() map[string]interface{} {
 	case models.ModeHTTP:
 		logger.Info("Stopping HTTP proxy server...")
 		httpStopRunner()
-		response["details"] = fmt.Sprintf("HTTP proxy server on %s has been stopped", config.DefaultHTTPProxyAddr)
+		response["details"] = fmt.Sprintf("HTTP proxy server on %s has been stopped", config.HTTPProxyListenAddr())
 
 	case models.ModeTUN:
 		logger.Info("Stopping TUN service...")

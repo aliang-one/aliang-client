@@ -4,7 +4,7 @@ package setup
 
 import "fmt"
 
-func InstallMacOSCoreService(execPath string) error {
+func InstallMacOSCoreService(execPath string, args []string) error {
 	return fmt.Errorf("macOS core service is not supported on this platform")
 }
 

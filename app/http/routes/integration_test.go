@@ -273,6 +273,7 @@ func TestAuthSessionAndUserCenterLifecycleIntegration(t *testing.T) {
 	RegisterRoutes(h, mux)
 
 	sessionReq := httptest.NewRequest(http.MethodGet, "/api/auth/session", nil)
+	sessionReq.RemoteAddr = "127.0.0.1:40000"
 	sessionRec := httptest.NewRecorder()
 	mux.ServeHTTP(sessionRec, sessionReq)
 	if sessionRec.Code != http.StatusOK {
@@ -318,6 +319,7 @@ func TestAuthSessionAndUserCenterLifecycleIntegration(t *testing.T) {
 	}
 
 	secondSessionReq := httptest.NewRequest(http.MethodGet, "/api/auth/session", nil)
+	secondSessionReq.RemoteAddr = "127.0.0.1:40001"
 	secondSessionRec := httptest.NewRecorder()
 	mux.ServeHTTP(secondSessionRec, secondSessionReq)
 	if secondSessionRec.Code != http.StatusOK {

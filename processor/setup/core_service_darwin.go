@@ -15,7 +15,7 @@ const macOSCoreServiceLabel = "one.aliang.aliang.core"
 // InstallMacOSCoreService installs the core service as a LaunchDaemon.
 // RunAtLoad=true, KeepAlive=true — the service starts automatically at system boot.
 // Core runs as root and uses system-level directories.
-func InstallMacOSCoreService(execPath string) error {
+func InstallMacOSCoreService(execPath string, args []string) error {
 	if !IsRoot() {
 		return fmt.Errorf("installing LaunchDaemon requires root privileges")
 	}
@@ -26,6 +26,9 @@ func InstallMacOSCoreService(execPath string) error {
 		if err != nil {
 			return fmt.Errorf("failed to determine executable for core service: %w", err)
 		}
+	}
+	if len(args) == 0 {
+		args = []string{"core"}
 	}
 
 	launchDaemonsDir := "/Library/LaunchDaemons"
@@ -44,7 +47,7 @@ func InstallMacOSCoreService(execPath string) error {
 	plistContent, err := RenderLaunchdPlist(LaunchdPlistData{
 		Label:             macOSCoreServiceLabel,
 		ProgramPath:       execPath,
-		Args:              []string{"core"},
+		Args:              args,
 		RunAtLoad:         true,
 		KeepAlive:         true,
 		WorkingDirectory:  dataDir,

@@ -7,6 +7,7 @@ import (
 	"fmt"
 
 	"aliang.one/nursorgate/common/logger"
+	"aliang.one/nursorgate/processor/config"
 	"aliang.one/nursorgate/processor/setup"
 	"golang.org/x/sys/windows/svc"
 )
@@ -36,7 +37,10 @@ type aliangWindowsService struct{}
 func (s *aliangWindowsService) Execute(args []string, req <-chan svc.ChangeRequest, status chan<- svc.Status) (bool, uint32) {
 	const accepted = svc.AcceptStop | svc.AcceptShutdown
 
-	applyWindowsServiceRuntimeArgs(args)
+	if err := applyWindowsServiceRuntimeArgs(args); err != nil {
+		logger.Error("Invalid Windows service runtime arguments", "error", err)
+		return false, 1
+	}
 
 	status <- svc.Status{State: svc.StartPending}
 
@@ -79,7 +83,7 @@ func (s *aliangWindowsService) Execute(args []string, req <-chan svc.ChangeReque
 	}
 }
 
-func applyWindowsServiceRuntimeArgs(args []string) {
+func applyWindowsServiceRuntimeArgs(args []string) error {
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--config", "-c":
@@ -87,6 +91,15 @@ func applyWindowsServiceRuntimeArgs(args []string) {
 				configPath = args[i+1]
 				i++
 			}
+		case "--host":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--host requires a value")
+			}
+			if err := config.SetServiceBindHost(args[i+1]); err != nil {
+				return err
+			}
+			i++
 		}
 	}
+	return nil
 }

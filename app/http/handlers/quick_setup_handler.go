@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"aliang.one/nursorgate/app/http/common"
+	"aliang.one/nursorgate/app/http/middleware"
 	"aliang.one/nursorgate/app/http/models"
 	"aliang.one/nursorgate/app/http/services"
 )
@@ -24,6 +25,9 @@ func (h *QuickSetupHandler) HandleCatalog(w http.ResponseWriter, r *http.Request
 		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
 		return
 	}
+	if !middleware.RequireDashboardSession(w, r) {
+		return
+	}
 
 	common.Success(w, h.service.Catalog())
 }
@@ -31,6 +35,9 @@ func (h *QuickSetupHandler) HandleCatalog(w http.ResponseWriter, r *http.Request
 func (h *QuickSetupHandler) HandleRender(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
+		return
+	}
+	if !middleware.RequireDashboardSession(w, r) {
 		return
 	}
 
@@ -63,6 +70,9 @@ func (h *QuickSetupHandler) HandleModels(w http.ResponseWriter, r *http.Request)
 		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
 		return
 	}
+	if !middleware.RequireDashboardSession(w, r) {
+		return
+	}
 
 	var req models.QuickSetupModelsRequest
 	r.Body = http.MaxBytesReader(w, r.Body, quickSetupRequestMaxBytes)
@@ -91,6 +101,9 @@ func (h *QuickSetupHandler) HandleModels(w http.ResponseWriter, r *http.Request)
 func (h *QuickSetupHandler) HandleApply(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
+		return
+	}
+	if !middleware.RequireDashboardSession(w, r) {
 		return
 	}
 

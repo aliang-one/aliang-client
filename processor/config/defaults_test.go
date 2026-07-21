@@ -1,26 +1,60 @@
 package config
 
-import (
-	"net"
-	"testing"
-)
+import "testing"
 
-// TestDefaultManagementAddrNotLoopback 守护管理面板的默认监听地址。
-// headless/服务器部署依赖它绑在 0.0.0.0 才能从外部访问；若被改回
-// loopback（127.0.0.1），外部将再次无法访问，且不会产生任何运行时报错，
-// 因此用测试固定这一不变量。
-func TestDefaultManagementAddrNotLoopback(t *testing.T) {
-	host, port, err := net.SplitHostPort(DefaultManagementAddr)
-	if err != nil {
-		t.Fatalf("DefaultManagementAddr %q 不是合法的 host:port: %v", DefaultManagementAddr, err)
+func TestServiceAddressesDefaultToLoopback(t *testing.T) {
+	if DefaultManagementAddr != "127.0.0.1:56431" {
+		t.Fatalf("DefaultManagementAddr = %q, want loopback", DefaultManagementAddr)
 	}
-	if port != "56431" {
-		t.Errorf("管理端口应为 56431，实际 %q", port)
+	if DefaultHTTPProxyAddr != "127.0.0.1:56432" {
+		t.Fatalf("DefaultHTTPProxyAddr = %q, want loopback", DefaultHTTPProxyAddr)
 	}
-	if host == "" {
-		return // ":port" 形式等同于 0.0.0.0，可接受
+
+	resetServiceBindHost(t)
+	if got := ManagementListenAddr(); got != DefaultManagementAddr {
+		t.Fatalf("ManagementListenAddr() = %q, want %q", got, DefaultManagementAddr)
 	}
-	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
-		t.Errorf("DefaultManagementAddr 绑定在 loopback %q，headless 部署将从外部不可达", host)
+	if got := HTTPProxyListenAddr(); got != DefaultHTTPProxyAddr {
+		t.Fatalf("HTTPProxyListenAddr() = %q, want %q", got, DefaultHTTPProxyAddr)
 	}
+}
+
+func TestSetServiceBindHostExposesBothServices(t *testing.T) {
+	resetServiceBindHost(t)
+	userAgentAddr := DefaultUserAgentAddr
+
+	if err := SetServiceBindHost("0.0.0.0"); err != nil {
+		t.Fatalf("SetServiceBindHost() error = %v", err)
+	}
+	if got := ManagementListenAddr(); got != "0.0.0.0:56431" {
+		t.Fatalf("ManagementListenAddr() = %q", got)
+	}
+	if got := HTTPProxyListenAddr(); got != "0.0.0.0:56432" {
+		t.Fatalf("HTTPProxyListenAddr() = %q", got)
+	}
+
+	if DefaultUserAgentAddr != userAgentAddr {
+		t.Fatalf("user agent address changed from %q to %q", userAgentAddr, DefaultUserAgentAddr)
+	}
+}
+
+func TestSetServiceBindHostRejectsInvalidValueWithoutMutation(t *testing.T) {
+	resetServiceBindHost(t)
+
+	if err := SetServiceBindHost("0.0.0.0:56431"); err == nil {
+		t.Fatal("SetServiceBindHost() accepted a host containing a port")
+	}
+	if got := ServiceBindHost(); got != DefaultServiceBindHost {
+		t.Fatalf("ServiceBindHost() = %q after invalid update", got)
+	}
+}
+
+func resetServiceBindHost(t *testing.T) {
+	t.Helper()
+	if err := SetServiceBindHost(DefaultServiceBindHost); err != nil {
+		t.Fatalf("reset service bind host: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = SetServiceBindHost(DefaultServiceBindHost)
+	})
 }

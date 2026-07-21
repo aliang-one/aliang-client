@@ -41,19 +41,20 @@ func StartMitmHttp() {
 	httpMutex.Unlock()
 
 	// Create listener
-	listener, err := net.Listen("tcp", config.DefaultHTTPProxyAddr)
+	listenAddr := config.HTTPProxyListenAddr()
+	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		httpMutex.Lock()
 		isHttpRunning = false
 		httpMutex.Unlock()
-		logger.GetMainLogger().Fatal(fmt.Sprintf("Failed to listen on %s: %v", config.DefaultHTTPProxyAddr, err))
+		logger.GetMainLogger().Fatal(fmt.Sprintf("Failed to listen on %s: %v", listenAddr, err))
 	}
 
 	httpMutex.Lock()
 	httpListener = listener
 	httpMutex.Unlock()
 
-	logger.Info(fmt.Sprintf("HTTP CONNECT proxy server starting on %s", config.DefaultHTTPProxyAddr))
+	logger.Info(fmt.Sprintf("HTTP CONNECT proxy server starting on %s", listenAddr))
 
 	// Accept connections in a loop until context is cancelled
 	for {
@@ -127,7 +128,7 @@ func handleRawConnection(conn net.Conn) {
 
 	// 为每个连接分配唯一ID
 	connID := atomic.AddInt64(&connIDCounter, 1)
-	logger.Debug(fmt.Sprintf("[CONN#%d] 新连接建立 - %s → %s", connID, conn.RemoteAddr(), config.DefaultHTTPProxyAddr))
+	logger.Debug(fmt.Sprintf("[CONN#%d] 新连接建立 - %s → %s", connID, conn.RemoteAddr(), config.HTTPProxyListenAddr()))
 
 	// 读取客户端初始数据，检查是否为 CONNECT 请求
 	reader := bufio.NewReader(conn)

@@ -6,6 +6,7 @@ import (
 
 	"aliang.one/nursorgate/app/http/services"
 	"aliang.one/nursorgate/common/logger"
+	"aliang.one/nursorgate/processor/config"
 	"aliang.one/nursorgate/processor/setup"
 	"github.com/spf13/cobra"
 )
@@ -29,6 +30,9 @@ This command supports multiple platforms:
 Examples:
   # Install as system service (requires root/admin)
   sudo aliang service install --system-wide --config /etc/aliang/config.json
+
+  # Explicitly expose management and HTTP proxy ports on all IPv4 interfaces
+  sudo aliang service install --system-wide --host 0.0.0.0
 
   # Install as user service
   aliang service install --config ~/.aliang/config.json
@@ -148,6 +152,8 @@ func runServiceInstall(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	hostExplicit := cmd.Flags().Changed("host")
+	options.Args = serviceArgsWithHost(options.Args, hostExplicit)
 
 	// 安装服务
 	if err := setup.InstallService(options); err != nil {
@@ -158,7 +164,8 @@ func runServiceInstall(cmd *cobra.Command, args []string) error {
 	fmt.Println("✓ Service installed successfully")
 	if runtime.GOOS == "darwin" {
 		// Install core service LaunchAgent (for PKG scenario or standalone development)
-		if err := setup.InstallMacOSCoreService(options.ExecutablePath); err != nil {
+		coreArgs := serviceArgsWithHost([]string{"core"}, hostExplicit)
+		if err := setup.InstallMacOSCoreService(options.ExecutablePath, coreArgs); err != nil {
 			fmt.Printf("Warning: Service installed, but failed to install macOS core service: %v\n", err)
 		} else {
 			fmt.Println("✓ macOS core service installed successfully")
@@ -181,6 +188,13 @@ func runServiceInstall(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+func serviceArgsWithHost(args []string, explicit bool) []string {
+	if !explicit {
+		return args
+	}
+	return append(args, "--host", config.ServiceBindHost())
 }
 
 func runServiceUninstall(cmd *cobra.Command, args []string) error {

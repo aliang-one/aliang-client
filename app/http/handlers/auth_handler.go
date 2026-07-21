@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"aliang.one/nursorgate/app/http/common"
+	"aliang.one/nursorgate/app/http/middleware"
 	"aliang.one/nursorgate/app/http/models"
 	"aliang.one/nursorgate/app/http/services"
 )
@@ -34,7 +35,7 @@ func (h *AuthHandler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	result := h.authService.Login(req.Email, req.Password, req.TurnstileToken)
-	common.Success(w, result)
+	writeAuthResult(w, r, result)
 }
 
 func (h *AuthHandler) HandleRestoreSession(w http.ResponseWriter, r *http.Request) {
@@ -43,8 +44,12 @@ func (h *AuthHandler) HandleRestoreSession(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	if !middleware.CanBootstrapDashboardSession(r) {
+		common.ErrorUnauthorized(w, "Remote session restore requires an authenticated dashboard session")
+		return
+	}
 	result := h.authService.RestoreSession()
-	common.Success(w, result)
+	writeAuthResult(w, r, result)
 }
 
 func (h *AuthHandler) HandleRefreshSession(w http.ResponseWriter, r *http.Request) {
@@ -60,7 +65,7 @@ func (h *AuthHandler) HandleRefreshSession(w http.ResponseWriter, r *http.Reques
 	}
 
 	result := h.authService.RefreshSession(req.RefreshToken)
-	common.Success(w, result)
+	writeAuthResult(w, r, result)
 }
 
 func (h *AuthHandler) HandleMe(w http.ResponseWriter, r *http.Request) {
@@ -112,7 +117,7 @@ func (h *AuthHandler) HandleScanActivate(w http.ResponseWriter, r *http.Request)
 	}
 
 	result := h.authService.ActivateScanLogin(req.SessionToken, req.RefreshToken)
-	common.Success(w, result)
+	writeAuthResult(w, r, result)
 }
 
 // HandleLogout 处理登出请求
@@ -131,6 +136,22 @@ func (h *AuthHandler) HandleLogout(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	middleware.RevokeDashboardSession(w)
 	result := h.authService.LogoutUser(req.RefreshToken)
+	common.Success(w, result)
+}
+
+func authResultSucceeded(result map[string]interface{}) bool {
+	status, _ := result["status"].(string)
+	return status == "success"
+}
+
+func writeAuthResult(w http.ResponseWriter, r *http.Request, result map[string]interface{}) {
+	if authResultSucceeded(result) {
+		if err := middleware.IssueDashboardSession(w, r); err != nil {
+			common.ErrorInternalServer(w, "Failed to establish dashboard session", map[string]interface{}{"error": err.Error()})
+			return
+		}
+	}
 	common.Success(w, result)
 }

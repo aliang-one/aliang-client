@@ -48,7 +48,7 @@ func StartHttpServer() error {
 	}
 
 	// 定义 HTTP 服务端口
-	port := config.DefaultManagementAddr
+	port := config.ManagementListenAddr()
 
 	// Initialize custom mux
 	mux = http.NewServeMux()
@@ -66,12 +66,11 @@ func StartHttpServer() error {
 	listener, err := net.Listen("tcp", port)
 	if err != nil {
 		if strings.Contains(err.Error(), "address already in use") {
-			// 尝试自动选择可用端口。沿用配置的 host（默认 0.0.0.0），
-			// 避免端口冲突时退回 loopback 导致外部再次访问不到。
+			// 尝试自动选择可用端口，并沿用显式配置的 host。
 			logger.Warn(fmt.Sprintf("Port %s is already in use, trying to find an available port...", port))
 			bindHost, _, _ := net.SplitHostPort(port)
 			if bindHost == "" {
-				bindHost = "0.0.0.0"
+				bindHost = config.DefaultServiceBindHost
 			}
 			listener, err = net.Listen("tcp", net.JoinHostPort(bindHost, "0")) // 0 means auto-select port
 			if err != nil {

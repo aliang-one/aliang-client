@@ -6,15 +6,20 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
+	"os/exec"
+	"os/user"
 	"path/filepath"
+	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"aliang.one/nursorgate/app/http/models"
-	"aliang.one/nursorgate/common/cache"
+	"aliang.one/nursorgate/internal/runtimepath"
 	auth "aliang.one/nursorgate/processor/auth"
 	"aliang.one/nursorgate/processor/config"
 )
@@ -31,9 +36,35 @@ type quickSetupFileBackup struct {
 	content []byte
 }
 
+type quickSetupTargetUser struct {
+	homeDir     string
+	uid         int
+	gid         int
+	adjustOwner bool
+}
+
+type quickSetupOpenCodeConfig struct {
+	Providers  map[string]json.RawMessage `json:"provider"`
+	Model      string                     `json:"model"`
+	SmallModel string                     `json:"small_model,omitempty"`
+}
+
+type quickSetupOpenCodeProvider struct {
+	NPM     string                            `json:"npm"`
+	Options quickSetupOpenCodeProviderOptions `json:"options"`
+	Models  map[string]json.RawMessage        `json:"models"`
+}
+
+type quickSetupOpenCodeProviderOptions struct {
+	APIKey  string `json:"apiKey"`
+	BaseURL string `json:"baseURL"`
+}
+
 const (
 	quickSetupMaxApplyFiles     = 16
 	quickSetupMaxApplyFileBytes = 1 << 20
+	quickSetupControlPlaneHost  = "backend.aliang.one"
+	quickSetupInferenceHost     = "api.aliang.one"
 )
 
 var ErrQuickSetupUnauthenticated = errors.New("authenticated session is required")
@@ -42,6 +73,8 @@ var quickSetupGetAPIKeysFn = auth.GetUserAPIKeys
 var quickSetupAuthorizationHeaderFn = auth.GetCurrentAuthorizationHeader
 var quickSetupModelsHTTPClient = &http.Client{Timeout: 12 * time.Second}
 var quickSetupWriteConfigFileFn = writeConfigFile
+var quickSetupTargetUserFn = resolveQuickSetupTargetUser
+var quickSetupAdjustOwnershipFn = adjustQuickSetupOwnership
 var quickSetupApplyMu sync.Mutex
 
 func NewQuickSetupService() *QuickSetupService {
@@ -222,7 +255,7 @@ func (s *QuickSetupService) Models(req models.QuickSetupModelsRequest) (*models.
 }
 
 func (s *QuickSetupService) Apply(req models.QuickSetupApplyRequest) (*models.QuickSetupApplyResponse, error) {
-	software := strings.TrimSpace(req.Software)
+	software := strings.ToLower(strings.TrimSpace(req.Software))
 	if software == "" {
 		return nil, errors.New("software is required")
 	}
@@ -234,6 +267,10 @@ func (s *QuickSetupService) Apply(req models.QuickSetupApplyRequest) (*models.Qu
 	}
 	if len(req.Files) > quickSetupMaxApplyFiles {
 		return nil, fmt.Errorf("files are not valid: maximum is %d", quickSetupMaxApplyFiles)
+	}
+	targetUser, err := quickSetupTargetUserFn()
+	if err != nil {
+		return nil, fmt.Errorf("resolve quick setup user: %w", err)
 	}
 
 	prepared := make([]quickSetupPreparedFile, 0, len(req.Files))
@@ -247,8 +284,11 @@ func (s *QuickSetupService) Apply(req models.QuickSetupApplyRequest) (*models.Qu
 			return nil, fmt.Errorf("file content is not valid: exceeds %d bytes", quickSetupMaxApplyFileBytes)
 		}
 
-		resolvedPath, err := resolveQuickSetupApplyPath(software, targetPath)
+		resolvedPath, err := resolveQuickSetupApplyPath(software, targetPath, targetUser.homeDir)
 		if err != nil {
+			return nil, err
+		}
+		if err := validateQuickSetupApplyFile(software, file, resolvedPath, targetUser.homeDir); err != nil {
 			return nil, err
 		}
 		if _, exists := seenPaths[resolvedPath]; exists {
@@ -278,11 +318,15 @@ func (s *QuickSetupService) Apply(req models.QuickSetupApplyRequest) (*models.Qu
 
 	written := make([]string, 0, len(prepared))
 	for i, file := range prepared {
-		if err := quickSetupWriteConfigFileFn(file.path, file.content); err != nil {
-			if rollbackErr := rollbackQuickSetupFiles(prepared[:i+1], backups[:i+1]); rollbackErr != nil {
-				return nil, fmt.Errorf("write config failed: %w; rollback failed: %v", err, rollbackErr)
+		writeErr := quickSetupWriteConfigFileFn(file.path, file.content)
+		if writeErr == nil {
+			writeErr = quickSetupAdjustOwnershipFn(file.path, targetUser)
+		}
+		if writeErr != nil {
+			if rollbackErr := rollbackQuickSetupFiles(prepared[:i+1], backups[:i+1], targetUser); rollbackErr != nil {
+				return nil, fmt.Errorf("write config failed: %w; rollback failed: %v", writeErr, rollbackErr)
 			}
-			return nil, err
+			return nil, writeErr
 		}
 		written = append(written, file.path)
 	}
@@ -293,11 +337,156 @@ func (s *QuickSetupService) Apply(req models.QuickSetupApplyRequest) (*models.Qu
 	}, nil
 }
 
-func rollbackQuickSetupFiles(files []quickSetupPreparedFile, backups []quickSetupFileBackup) error {
+func validateQuickSetupApplyFile(software string, file models.QuickSetupApplyFile, resolvedPath string, home string) error {
+	content := strings.TrimSpace(file.Content)
+	if content == "" {
+		return errors.New("file content is not valid: content cannot be empty")
+	}
+
+	format := strings.ToLower(strings.TrimSpace(file.Format))
+	kind := strings.ToLower(strings.TrimSpace(file.Kind))
+	if strings.HasPrefix(software, "custom-") {
+		if kind != "" && kind != "file" {
+			return fmt.Errorf("file kind is not valid: %s", file.Kind)
+		}
+		if format == "json" {
+			return validateQuickSetupJSON(content)
+		}
+		return nil
+	}
+
+	definition, ok := findQuickSetupSoftware(software)
+	if !ok {
+		return fmt.Errorf("software is not valid: %s", software)
+	}
+	declared, ok, err := quickSetupDeclaredFileForPath(definition, resolvedPath, home)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return errors.New("file path is not valid: target is not declared by the selected software")
+	}
+	if format != "" && !strings.EqualFold(format, declared.Format) {
+		return fmt.Errorf("file format is not valid: expected %s", declared.Format)
+	}
+	if kind != "" && !strings.EqualFold(kind, declared.Kind) {
+		return fmt.Errorf("file kind is not valid: expected %s", declared.Kind)
+	}
+
+	if strings.EqualFold(declared.Format, "json") {
+		if err := validateQuickSetupJSON(content); err != nil {
+			return err
+		}
+	}
+	if software == "opencode" {
+		if err := validateQuickSetupOpenCode(content); err != nil {
+			return fmt.Errorf("OpenCode config is not valid: %w", err)
+		}
+	}
+	return nil
+}
+
+func quickSetupDeclaredFileForPath(software models.QuickSetupSoftware, resolvedPath string, home string) (models.QuickSetupSoftwareFile, bool, error) {
+	for _, file := range software.Files {
+		allowed, err := canonicalizeQuickSetupPath(expandQuickSetupHomePath(file.DefaultPath, home))
+		if err != nil {
+			return models.QuickSetupSoftwareFile{}, false, err
+		}
+		if resolvedPath == allowed {
+			return file, true, nil
+		}
+	}
+	return models.QuickSetupSoftwareFile{}, false, nil
+}
+
+func validateQuickSetupJSON(content string) error {
+	var value interface{}
+	decoder := json.NewDecoder(strings.NewReader(content))
+	decoder.UseNumber()
+	if err := decoder.Decode(&value); err != nil {
+		return fmt.Errorf("file content is not valid JSON: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return errors.New("file content is not valid JSON: multiple JSON values are not allowed")
+	}
+	return nil
+}
+
+func validateQuickSetupOpenCode(content string) error {
+	var cfg quickSetupOpenCodeConfig
+	if err := json.Unmarshal([]byte(content), &cfg); err != nil {
+		return err
+	}
+	if len(cfg.Providers) == 0 {
+		return errors.New("provider must contain at least one entry")
+	}
+
+	providers := make(map[string]quickSetupOpenCodeProvider, len(cfg.Providers))
+	for providerID, raw := range cfg.Providers {
+		providerID = strings.TrimSpace(providerID)
+		if providerID == "" {
+			return errors.New("provider id cannot be empty")
+		}
+		var provider quickSetupOpenCodeProvider
+		if err := json.Unmarshal(raw, &provider); err != nil {
+			return fmt.Errorf("provider %q must be an object", providerID)
+		}
+		if strings.TrimSpace(provider.NPM) == "" {
+			return fmt.Errorf("provider %q npm is required", providerID)
+		}
+		if strings.TrimSpace(provider.Options.APIKey) == "" || quickSetupLooksMaskedAPIKey(provider.Options.APIKey) {
+			return fmt.Errorf("provider %q requires a plaintext options.apiKey", providerID)
+		}
+		baseURL, err := url.Parse(strings.TrimSpace(provider.Options.BaseURL))
+		if err != nil || baseURL.Host == "" || (baseURL.Scheme != "http" && baseURL.Scheme != "https") {
+			return fmt.Errorf("provider %q options.baseURL must be an absolute HTTP(S) URL", providerID)
+		}
+		if len(provider.Models) == 0 {
+			return fmt.Errorf("provider %q models must contain at least one model", providerID)
+		}
+		providers[providerID] = provider
+	}
+
+	if err := validateQuickSetupOpenCodeModelRef("model", cfg.Model, providers, true); err != nil {
+		return err
+	}
+	if err := validateQuickSetupOpenCodeModelRef("small_model", cfg.SmallModel, providers, false); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateQuickSetupOpenCodeModelRef(field string, ref string, providers map[string]quickSetupOpenCodeProvider, required bool) error {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		if required {
+			return fmt.Errorf("%s is required", field)
+		}
+		return nil
+	}
+	providerID, modelID, ok := strings.Cut(ref, "/")
+	providerID = strings.TrimSpace(providerID)
+	modelID = strings.TrimSpace(modelID)
+	if !ok || providerID == "" || modelID == "" {
+		return fmt.Errorf("%s must use provider/model format", field)
+	}
+	provider, exists := providers[providerID]
+	if !exists {
+		return fmt.Errorf("%s references unknown provider %q", field, providerID)
+	}
+	if _, exists := provider.Models[modelID]; !exists {
+		return fmt.Errorf("%s references unknown model %q for provider %q", field, modelID, providerID)
+	}
+	return nil
+}
+
+func rollbackQuickSetupFiles(files []quickSetupPreparedFile, backups []quickSetupFileBackup, targetUser quickSetupTargetUser) error {
 	var rollbackErr error
 	for i := len(files) - 1; i >= 0; i-- {
 		if backups[i].existed {
 			if err := writeConfigFile(files[i].path, string(backups[i].content)); err != nil {
+				rollbackErr = errors.Join(rollbackErr, err)
+			} else if err := quickSetupAdjustOwnershipFn(files[i].path, targetUser); err != nil {
 				rollbackErr = errors.Join(rollbackErr, err)
 			}
 			continue
@@ -557,7 +746,7 @@ func renderOpenCodeFiles(software models.QuickSetupSoftware, apiKeys []models.Qu
 	modelProviderID := ""
 	modelName := ""
 	notes := []string{
-		"OpenCode config uses provider/model strings such as aliang-openai-openai-key/gpt-5.",
+		"OpenCode config uses provider/model strings such as aliang-openai-openai-key/gpt-5.4.",
 		"Each selected API key becomes one provider entry, so multiple baseURL/API key combinations can coexist.",
 	}
 	for _, apiKey := range apiKeys {
@@ -585,7 +774,7 @@ func renderOpenCodeFiles(software models.QuickSetupSoftware, apiKeys []models.Qu
 		modelName = strings.TrimSpace(modelOverride)
 	}
 	if modelName == "" {
-		modelName = "gpt-5"
+		modelName = "gpt-5.4"
 	}
 	ensureOpenCodeProviderModel(providers, modelProviderID, modelName)
 	defaultModel := fmt.Sprintf("%s/%s", modelProviderID, modelName)
@@ -662,12 +851,11 @@ func quickSetupOpenCodeModels(provider string) map[string]interface{} {
 	switch provider {
 	case "anthropic":
 		return map[string]interface{}{
-			"claude-sonnet-4-5": map[string]interface{}{"name": "Claude Sonnet 4.5"},
-			"claude-opus-4-1":   map[string]interface{}{"name": "Claude Opus 4.1"},
+			"claude-sonnet-4-5-20250929": map[string]interface{}{"name": "Claude Sonnet 4.5"},
 		}
 	default:
 		return map[string]interface{}{
-			"gpt-5": map[string]interface{}{"name": "GPT-5"},
+			"gpt-5.4": map[string]interface{}{"name": "GPT-5.4"},
 		}
 	}
 }
@@ -1028,17 +1216,17 @@ func quickSetupDefaultModel(provider string, codex bool) string {
 		if codex {
 			return "claude-sonnet-4-5"
 		}
-		return "claude-sonnet-4-5"
+		return "claude-sonnet-4-5-20250929"
 	case "openai":
 		if codex {
 			return "gpt-5-codex"
 		}
-		return "gpt-5"
+		return "gpt-5.4"
 	default:
 		if codex {
 			return "gpt-5-codex"
 		}
-		return "gpt-5"
+		return "gpt-5.4"
 	}
 }
 
@@ -1064,21 +1252,32 @@ func quickSetupBaseURL() (string, error) {
 	if baseURL == "" {
 		return "", errors.New("config.core.api_server is required for quick setup")
 	}
-	return strings.TrimRight(baseURL, "/"), nil
+	return resolveQuickSetupInferenceBaseURL(baseURL), nil
 }
 
-func resolveQuickSetupApplyPath(software string, path string) (string, error) {
-	expanded, err := cache.ExpandHomePath(path)
-	if err != nil {
-		return "", fmt.Errorf("file path is not valid: %w", err)
+func resolveQuickSetupInferenceBaseURL(baseURL string) string {
+	trimmed := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	parsed, err := url.Parse(trimmed)
+	if err != nil || !strings.EqualFold(parsed.Hostname(), quickSetupControlPlaneHost) {
+		return trimmed
 	}
+	host := quickSetupInferenceHost
+	if port := parsed.Port(); port != "" {
+		host += ":" + port
+	}
+	parsed.Host = host
+	return strings.TrimRight(parsed.String(), "/")
+}
+
+func resolveQuickSetupApplyPath(software string, path string, home string) (string, error) {
+	expanded := expandQuickSetupHomePath(path, home)
 	if !filepath.IsAbs(expanded) {
 		return "", errors.New("file path is not valid: an absolute path or ~/ path is required")
 	}
 
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("file path is not valid: resolve user home: %w", err)
+	home = strings.TrimSpace(home)
+	if home == "" {
+		return "", errors.New("file path is not valid: user home directory is empty")
 	}
 	canonicalHome, err := canonicalizeQuickSetupPath(home)
 	if err != nil {
@@ -1103,7 +1302,7 @@ func resolveQuickSetupApplyPath(software string, path string) (string, error) {
 		return "", errors.New("file path is not valid: target must stay within the software config directory")
 	}
 	if !strings.HasPrefix(software, "custom-") {
-		allowed, err := quickSetupBuiltInPathAllowed(software, canonicalTarget)
+		allowed, err := quickSetupBuiltInPathAllowed(software, canonicalTarget, home)
 		if err != nil {
 			return "", err
 		}
@@ -1119,16 +1318,23 @@ func resolveQuickSetupApplyPath(software string, path string) (string, error) {
 	return canonicalTarget, nil
 }
 
-func quickSetupBuiltInPathAllowed(software string, target string) (bool, error) {
+func expandQuickSetupHomePath(path string, home string) string {
+	if path == "~" {
+		return home
+	}
+	if strings.HasPrefix(path, "~/") || strings.HasPrefix(path, `~\`) {
+		return filepath.Join(home, path[2:])
+	}
+	return path
+}
+
+func quickSetupBuiltInPathAllowed(software string, target string, home string) (bool, error) {
 	definition, ok := findQuickSetupSoftware(software)
 	if !ok {
 		return false, fmt.Errorf("software is not valid: %s", software)
 	}
 	for _, file := range definition.Files {
-		expanded, err := cache.ExpandHomePath(file.DefaultPath)
-		if err != nil {
-			return false, err
-		}
+		expanded := expandQuickSetupHomePath(file.DefaultPath, home)
 		allowed, err := canonicalizeQuickSetupPath(expanded)
 		if err != nil {
 			return false, err
@@ -1159,6 +1365,86 @@ func quickSetupAllowedRoot(software string, home string) (string, error) {
 		}
 		return filepath.Join(home, ".aliang", "quick-setup", "custom", software), nil
 	}
+}
+
+func resolveQuickSetupTargetUser() (quickSetupTargetUser, error) {
+	current, err := user.Current()
+	if err != nil {
+		return quickSetupTargetUser{}, err
+	}
+
+	target := current
+	adjustOwner := false
+	if runtime.GOOS == "darwin" && current.Uid == "0" {
+		output, statErr := exec.Command("/usr/bin/stat", "-f", "%Su", "/dev/console").CombinedOutput()
+		if statErr != nil {
+			return quickSetupTargetUser{}, fmt.Errorf("resolve macOS console user: %w", statErr)
+		}
+		consoleUser := strings.TrimSpace(string(output))
+		if consoleUser == "" || consoleUser == "root" || consoleUser == "loginwindow" || consoleUser == "_mbsetupuser" {
+			return quickSetupTargetUser{}, errors.New("no logged-in macOS console user is available")
+		}
+		target, err = user.Lookup(consoleUser)
+		if err != nil {
+			return quickSetupTargetUser{}, fmt.Errorf("lookup macOS console user %q: %w", consoleUser, err)
+		}
+		adjustOwner = true
+	}
+
+	homeDir := strings.TrimSpace(target.HomeDir)
+	if !adjustOwner {
+		homeDir, err = runtimepath.UserHomeDir()
+		if err != nil {
+			return quickSetupTargetUser{}, err
+		}
+	}
+	if homeDir == "" {
+		return quickSetupTargetUser{}, errors.New("user home directory is empty")
+	}
+
+	uid, uidErr := strconv.Atoi(strings.TrimSpace(target.Uid))
+	gid, gidErr := strconv.Atoi(strings.TrimSpace(target.Gid))
+	if uidErr != nil || gidErr != nil {
+		uid, gid = -1, -1
+		adjustOwner = false
+	}
+	return quickSetupTargetUser{
+		homeDir:     homeDir,
+		uid:         uid,
+		gid:         gid,
+		adjustOwner: adjustOwner,
+	}, nil
+}
+
+func adjustQuickSetupOwnership(filePath string, target quickSetupTargetUser) error {
+	if !target.adjustOwner {
+		return nil
+	}
+	if target.uid < 0 || target.gid < 0 {
+		return errors.New("quick setup target user ownership is not valid")
+	}
+
+	home := filepath.Clean(target.homeDir)
+	dir := filepath.Dir(filepath.Clean(filePath))
+	if !quickSetupPathWithin(home, dir) {
+		return errors.New("quick setup target directory is outside the user home directory")
+	}
+	dirs := make([]string, 0, 4)
+	for current := dir; current != home; current = filepath.Dir(current) {
+		if current == filepath.Dir(current) || !quickSetupPathWithin(home, current) {
+			return errors.New("quick setup target directory is outside the user home directory")
+		}
+		dirs = append(dirs, current)
+	}
+	for i := len(dirs) - 1; i >= 0; i-- {
+		if err := os.Chown(dirs[i], target.uid, target.gid); err != nil {
+			return fmt.Errorf("set config directory ownership: %w", err)
+		}
+	}
+	if err := os.Chown(filePath, target.uid, target.gid); err != nil {
+		return fmt.Errorf("set config file ownership: %w", err)
+	}
+	return nil
 }
 
 func canonicalizeQuickSetupPath(path string) (string, error) {

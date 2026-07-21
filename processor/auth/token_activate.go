@@ -184,6 +184,7 @@ func RestoreSession() (*UserInfo, error) {
 	if strings.TrimSpace(localUserInfo.AccessToken) == "" {
 		startTokenRefresh()
 		config.SetHasLocalUserInfo(true)
+		GetSessionAuthority().NotifyLoggedIn(localUserInfo)
 		return localUserInfo, nil
 	}
 
@@ -192,6 +193,7 @@ func RestoreSession() (*UserInfo, error) {
 		logger.Warn(fmt.Sprintf("Session restore profile sync skipped: refresh failed (%v), profile fetch failed (%v)", refreshErr, profileErr))
 		startTokenRefresh()
 		config.SetHasLocalUserInfo(true)
+		GetSessionAuthority().NotifyLoggedIn(localUserInfo)
 		return localUserInfo, nil
 	}
 
@@ -208,6 +210,7 @@ func RestoreSession() (*UserInfo, error) {
 
 	startTokenRefresh()
 	config.SetHasLocalUserInfo(true)
+	GetSessionAuthority().NotifyLoggedIn(latestProfile)
 
 	return latestProfile, nil
 }
