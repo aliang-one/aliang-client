@@ -1653,6 +1653,21 @@ while IFS= read -r line; do
       fi
       printf '{"id":1,"result":{"thread":{"id":"thr_fake"},"model":"fake","modelProvider":"openai","serviceTier":null,"cwd":"%s","instructionSources":[],"approvalPolicy":"on-request","approvalsReviewer":"user","sandbox":{},"reasoningEffort":null}}\n' "$PWD"
       ;;
+	    *'"method":"thread/goal/set"'*)
+	      if printf '%s' "$line" | grep -q '"id":3' && printf '%s' "$line" | grep -q 'Ship native Goal'; then
+	        printf '{"id":3,"result":{"goal":{"threadId":"thr_fake","objective":"Ship native Goal","status":"active","tokenBudget":null,"tokensUsed":0,"timeUsedSeconds":0,"createdAt":10,"updatedAt":10}}}\n'
+	      elif printf '%s' "$line" | grep -q '"id":5' && printf '%s' "$line" | grep -q '"status":"complete"'; then
+	        printf '{"id":5,"result":{"goal":{"threadId":"thr_fake","objective":"Ship native Goal","status":"complete","tokenBudget":null,"tokensUsed":125,"timeUsedSeconds":20,"createdAt":10,"updatedAt":30}}}\n'
+	      elif printf '%s' "$line" | grep -q '"id":5' && printf '%s' "$line" | grep -q '"status":"blocked"'; then
+	        printf '{"id":5,"result":{"goal":{"threadId":"thr_fake","objective":"Ship native Goal","status":"blocked","tokenBudget":null,"tokensUsed":125,"timeUsedSeconds":20,"createdAt":10,"updatedAt":30}}}\n'
+	      else
+	        printf '{"id":3,"error":{"code":-32602,"message":"unexpected native Goal request"}}\n'
+	        exit 5
+	      fi
+	      ;;
+	    *'"method":"thread/goal/get"'*)
+	      printf '{"id":4,"result":{"goal":{"threadId":"thr_fake","objective":"Ship native Goal","status":"active","tokenBudget":null,"tokensUsed":100,"timeUsedSeconds":18,"createdAt":10,"updatedAt":25}}}\n'
+	      ;;
     *'"method":"turn/start"'*)
       printf '{"id":2,"result":{"turn":{"id":"turn_fake"}}}\n'
       case "$mode" in
@@ -1697,9 +1712,16 @@ while IFS= read -r line; do
         user_input)
           printf '{"method":"item/tool/requestUserInput","id":88,"params":{"threadId":"thr_fake","turnId":"turn_fake","itemId":"input_fake","questions":[{"id":"strategy","header":"实现策略","question":"选择实现策略","options":[{"label":"稳健方案","description":"优先兼容"},{"label":"激进方案","description":"优先速度"}],"isOther":true}]}}\n'
           ;;
-        unknown_request)
-          printf '{"method":"item/tool/call","id":89,"params":{"threadId":"thr_fake","turnId":"turn_fake","tool":"unknown"}}\n'
-          ;;
+	        unknown_request)
+	          printf '{"method":"item/tool/call","id":89,"params":{"threadId":"thr_fake","turnId":"turn_fake","tool":"unknown"}}\n'
+	          ;;
+	        goal_native)
+	          printf '%s\n' '{"method":"item/agentMessage/delta","params":{"threadId":"thr_fake","turnId":"turn_fake","itemId":"msg_fake","delta":"native done\nALIANG_GOAL_REPORT: {\"schema_version\":1,\"outcome\":\"task_completed\",\"summary\":\"done\",\"evidence_refs\":[],\"completion_proposed\":true}"}}'
+	          printf '{"method":"turn/completed","params":{"threadId":"thr_fake","turn":{"id":"turn_fake","status":"completed"}}}\n'
+	          ;;
+	        goal_native_failed)
+	          printf '{"method":"turn/completed","params":{"threadId":"thr_fake","turn":{"id":"turn_fake","status":"failed","error":{"message":"native provider failed"}}}}\n'
+	          ;;
         *)
           printf '{"method":"item/agentMessage/delta","params":{"threadId":"thr_fake","turnId":"turn_fake","itemId":"msg_fake","delta":"ALIANG_FAKE_CODEX_OUTPUT"}}\n'
           printf '{"method":"turn/completed","params":{"threadId":"thr_fake","turn":{"id":"turn_fake","status":"completed"}}}\n'
@@ -1752,6 +1774,99 @@ done
 		t.Fatalf("write fake codex: %v", err)
 	}
 	return codexPath
+}
+
+func TestAgentAIManagerCodexNativeGoalLifecycle(t *testing.T) {
+	projectPath := setupAgentExecutionProjectForTest(t)
+	binDir := t.TempDir()
+	writeFakeCodexAppServerForTest(t, binDir)
+	t.Setenv("ALIANG_FAKE_CODEX_MODE", "goal_native")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	manager := newAgentAIManager()
+	defer manager.closeAll()
+	var mu sync.Mutex
+	events := make([]map[string]interface{}, 0)
+	writeJSON := func(payload interface{}) error {
+		event := payload.(map[string]interface{})
+		mu.Lock()
+		events = append(events, event)
+		mu.Unlock()
+		return nil
+	}
+
+	manager.create(map[string]interface{}{
+		"type": "ai.session.create", "session_id": "goal_native",
+		"project_path": projectPath, "provider": "codex", "mode": "agent",
+	}, writeJSON)
+	waitForAgentEvent(t, &mu, &events, "ai.session.created", func(event map[string]interface{}) bool {
+		return event["session_id"] == "goal_native"
+	})
+	request := map[string]interface{}{
+		"type": "ai.run.start", "session_id": "goal_native", "run_id": "run-native",
+		"message_id": "message-native", "content": "execute native task", "provider": "codex",
+		"goal_driver": "hybrid",
+		"native_goal": map[string]interface{}{"provider": "codex", "objective": "Ship native Goal", "status": "active"},
+	}
+	for key, value := range testGoalIdentity() {
+		request[key] = value
+	}
+	manager.runStart(request, writeJSON)
+	done := waitForAgentEvent(t, &mu, &events, "ai.done", func(event map[string]interface{}) bool {
+		return event["session_id"] == "goal_native"
+	})
+	snapshot := mapIf(done["native_goal"])
+	if snapshot == nil || remoteString(snapshot, "status") != "complete" || remoteInt(snapshot, "tokens_used", 0) != 125 {
+		t.Fatalf("native Goal snapshot = %#v", done["native_goal"])
+	}
+	if report := mapIf(done["goal_report"]); report == nil || remoteString(report, "outcome") != "task_completed" {
+		t.Fatalf("goal report = %#v", done["goal_report"])
+	}
+}
+
+func TestAgentAIManagerCodexNativeGoalFailureClosesNativeState(t *testing.T) {
+	projectPath := setupAgentExecutionProjectForTest(t)
+	binDir := t.TempDir()
+	writeFakeCodexAppServerForTest(t, binDir)
+	t.Setenv("ALIANG_FAKE_CODEX_MODE", "goal_native_failed")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	manager := newAgentAIManager()
+	defer manager.closeAll()
+	var mu sync.Mutex
+	events := make([]map[string]interface{}, 0)
+	writeJSON := func(payload interface{}) error {
+		mu.Lock()
+		events = append(events, payload.(map[string]interface{}))
+		mu.Unlock()
+		return nil
+	}
+
+	manager.create(map[string]interface{}{
+		"type": "ai.session.create", "session_id": "goal_native_failed",
+		"project_path": projectPath, "provider": "codex", "mode": "agent",
+	}, writeJSON)
+	waitForAgentEvent(t, &mu, &events, "ai.session.created", nil)
+	request := map[string]interface{}{
+		"type": "ai.run.start", "session_id": "goal_native_failed", "run_id": "run-native-failed",
+		"message_id": "message-native-failed", "content": "execute native task", "provider": "codex",
+		"goal_driver": "hybrid",
+		"native_goal": map[string]interface{}{"provider": "codex", "objective": "Ship native Goal", "status": "active"},
+	}
+	for key, value := range testGoalIdentity() {
+		request[key] = value
+	}
+	manager.runStart(request, writeJSON)
+	failed := waitForAgentEvent(t, &mu, &events, "ai.error", func(event map[string]interface{}) bool {
+		return event["session_id"] == "goal_native_failed"
+	})
+	snapshot := mapIf(failed["native_goal"])
+	if snapshot == nil || remoteString(snapshot, "status") != "blocked" {
+		t.Fatalf("native Goal failure snapshot = %#v", failed["native_goal"])
+	}
+	if report := mapIf(failed["goal_report"]); report == nil || remoteString(report, "outcome") != "failed" {
+		t.Fatalf("goal report = %#v", failed["goal_report"])
+	}
 }
 
 func TestAgentAIManagerRunsFakeCodex(t *testing.T) {

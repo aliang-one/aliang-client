@@ -280,6 +280,34 @@ func TestAgentCapabilitiesAdvertiseGoalProtocol(t *testing.T) {
 	}
 }
 
+func TestCodexFeatureEnabledRecognizesGoalsOnlyWhenEnabled(t *testing.T) {
+	output := "shell_tool stable true\ngoals stable true\nother experimental false\n"
+	if !codexFeatureEnabled(output, "goals") {
+		t.Fatal("enabled goals feature was not recognized")
+	}
+	if codexFeatureEnabled("goals stable false\n", "goals") {
+		t.Fatal("disabled goals feature was recognized")
+	}
+}
+
+func TestCodexNativeGoalSnapshotNormalizesAppServerShape(t *testing.T) {
+	snapshot := codexNativeGoalSnapshot(map[string]interface{}{
+		"threadId": "thread-1", "objective": "ship", "status": "active",
+		"tokenBudget": float64(1000), "tokensUsed": float64(25),
+		"timeUsedSeconds": float64(4), "createdAt": float64(10), "updatedAt": float64(11),
+	})
+	if snapshot["thread_id"] != "thread-1" || snapshot["token_budget"] != 1000 || snapshot["sync_state"] != "confirmed" {
+		t.Fatalf("snapshot = %#v", snapshot)
+	}
+	stale := codexNativeGoalStaleSnapshot(snapshot, "app-server unavailable")
+	if stale["sync_state"] != "stale" || stale["sync_error"] != "app-server unavailable" {
+		t.Fatalf("stale snapshot = %#v", stale)
+	}
+	if snapshot["sync_state"] != "confirmed" || snapshot["sync_error"] != nil {
+		t.Fatalf("source snapshot mutated = %#v", snapshot)
+	}
+}
+
 func TestRecoveredGoalRunReplaysFencedFailureTerminal(t *testing.T) {
 	setupAgentIdentityTestEnv(t)
 	m := newAgentAIManager()

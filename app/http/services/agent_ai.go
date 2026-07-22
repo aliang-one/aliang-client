@@ -301,6 +301,7 @@ type agentAIRun struct {
 	matchedRuleID string
 	policyVersion int
 	goalIdentity  map[string]interface{}
+	nativeGoal    map[string]interface{}
 	readOnly      bool
 }
 
@@ -1073,6 +1074,7 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 		runID:        remoteString(msg, "run_id"),
 		messageID:    messageID,
 		goalIdentity: goalRunIdentityFromMessage(msg),
+		nativeGoal:   cloneAgentAIMap(mapIf(msg["native_goal"])),
 	}
 	emitter := m.runEmitter(messageRun, writeJSON)
 	runWrite := agentTerminalWriter(emitter.emit)
@@ -1189,7 +1191,7 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 		return
 	}
 
-	if err := m.runUserMessage(session, remoteString(msg, "run_id"), messageID, content, provider, attachments, emitter); err != nil {
+	if err := m.runUserMessage(session, remoteString(msg, "run_id"), messageID, content, provider, attachments, emitter, messageRun.nativeGoal); err != nil {
 		_ = runWrite(agentAIErrorPayload(sessionID, messageID, err))
 	}
 }
@@ -1774,7 +1776,7 @@ func (m *agentAIManager) setCodexSteerControl(sessionID string, runSeq int, cont
 
 // runUserMessage 在 session 上派发一轮新的 AI run。message()（用户消息）与
 // optionResponse()（用户方案选择续接）共用。调用者须已确认 session 存在且当前未在跑。
-func (m *agentAIManager) runUserMessage(session *agentAISession, runID, messageID, content, provider string, attachments []agentAIAttachment, emitter *agentAIRunEmitter) error {
+func (m *agentAIManager) runUserMessage(session *agentAISession, runID, messageID, content, provider string, attachments []agentAIAttachment, emitter *agentAIRunEmitter, nativeGoal map[string]interface{}) error {
 	writeJSON := agentTerminalWriter(emitter.emit)
 	approvalToken, err := newAgentAIApprovalToken()
 	if err != nil {
@@ -1825,6 +1827,7 @@ func (m *agentAIManager) runUserMessage(session *agentAISession, runID, messageI
 		activity:                activity,
 		claudePolicy:            cloneAgentAIClaudeRemotePolicy(session.claudePolicy),
 		goalIdentity:            cloneGoalIdentity(emitter.goalIdentity),
+		nativeGoal:              cloneAgentAIMap(nativeGoal),
 	}
 	run.onClaudeInit = func(commands []string, version string) {
 		m.recordClaudeCapabilities(run.sessionID, run.projectPath, commands, version)
@@ -1889,7 +1892,7 @@ func (m *agentAIManager) optionResponse(msg map[string]interface{}, writeJSON ag
 
 	run := agentAIRun{sessionID: sessionID, runID: remoteString(msg, "run_id"), messageID: messageID}
 	emitter := m.runEmitter(run, writeJSON)
-	if err := m.runUserMessage(session, remoteString(msg, "run_id"), messageID, content, provider, nil, emitter); err != nil {
+	if err := m.runUserMessage(session, remoteString(msg, "run_id"), messageID, content, provider, nil, emitter, nil); err != nil {
 		_ = emitter.emit(agentAIErrorPayload(sessionID, messageID, err))
 	}
 }
@@ -2832,6 +2835,33 @@ func codexAppServerAvailable() bool {
 	return available
 }
 
+func codexNativeGoalAvailable() bool {
+	path, err := lookPathCLI("codex")
+	if err != nil || !codexAppServerAvailable() {
+		return false
+	}
+	cacheKey := "goal:" + executableProbeCacheKey(path)
+	if cached, ok := codexAppServerProbeCache.Load(cacheKey); ok {
+		return cached.(bool)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	output, probeErr := newBackgroundCommandContext(ctx, path, "features", "list").CombinedOutput()
+	available := probeErr == nil && codexFeatureEnabled(string(output), "goals")
+	codexAppServerProbeCache.Store(cacheKey, available)
+	return available
+}
+
+func codexFeatureEnabled(output, feature string) bool {
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 3 && fields[0] == feature && fields[len(fields)-1] == "true" {
+			return true
+		}
+	}
+	return false
+}
+
 // codexTurnResult inspects a codex `turn/completed` notification params payload
 // and reports the terminal status the agent should surface, plus any error
 // message carried by a failed turn. Status is "completed", "interrupted",
@@ -3397,6 +3427,33 @@ func (m *agentAIManager) runCodexAppServer(ctx context.Context, run agentAIRun, 
 	fileChangesByID := map[string]json.RawMessage{}
 	commandsByID := map[string]string{}
 	dedup := newCodexAgentMessageDedup()
+	var nativeGoalSnapshot map[string]interface{}
+	nativeGoalTerminalDesired := ""
+	nativeGoalSyncErr := ""
+	startTurn := func() {
+		m.setAgentAIResumeSessionIDIfEmpty(run.sessionID, run.runSeq, threadID)
+		turnStarted = true
+		emitRunStarted()
+		turnParams := map[string]interface{}{
+			"threadId":            threadID,
+			"clientUserMessageId": run.messageID,
+			"input":               codexTurnInput(run),
+			"approvalPolicy":      "on-request",
+			"approvalsReviewer":   "user",
+		}
+		if model != "" {
+			turnParams["model"] = model
+		}
+		if effort != "" {
+			turnParams["effort"] = effort
+		}
+		codexPhase = "turn/start"
+		_ = send(map[string]interface{}{
+			"method": "turn/start",
+			"id":     2,
+			"params": turnParams,
+		})
+	}
 	// Progress heartbeat. Within a codex turn the app-server emits nothing
 	// during quiet gaps (long tool runs, model thinking, upstream retries), and
 	// unlike the Claude path there is no per-token stream — so without a
@@ -3447,6 +3504,10 @@ func (m *agentAIManager) runCodexAppServer(ctx context.Context, run agentAIRun, 
 					goto done
 				case "2":
 					terminalErr = "Codex app-server turn/start failed: " + detail
+					goto done
+				case "3", "4", "5":
+					nativeGoalSyncErr = "Codex app-server native Goal synchronization failed: " + detail
+					terminalErr = nativeGoalSyncErr
 					goto done
 				}
 			}
@@ -3516,6 +3577,18 @@ func (m *agentAIManager) runCodexAppServer(ctx context.Context, run agentAIRun, 
 			case "thread/tokenUsage/updated":
 				if params, ok := msg["params"].(map[string]interface{}); ok {
 					emitCodexThreadUsage(run, writeJSON, params)
+				}
+			case "thread/goal/updated":
+				if params, ok := msg["params"].(map[string]interface{}); ok {
+					nativeGoalSnapshot = codexNativeGoalSnapshot(params["goal"])
+					if nativeGoalSnapshot != nil {
+						_ = writeJSON(map[string]interface{}{
+							"type":        models.AgentEventAIRunProgress,
+							"session_id":  run.sessionID,
+							"message_id":  agentAssistantMessageID(run.messageID),
+							"native_goal": nativeGoalSnapshot,
+						})
+					}
 				}
 			case "turn/plan/updated":
 				if params, ok := msg["params"].(map[string]interface{}); ok {
@@ -3616,18 +3689,24 @@ func (m *agentAIManager) runCodexAppServer(ctx context.Context, run agentAIRun, 
 				var turnErr string
 				turnStatus, turnErr = codexTurnResult(completedParams)
 				emitCodexUsageIfPresent(run, writeJSON, completedParams)
-				if turnStatus == "failed" {
-					// A failed turn (ContextWindowExceeded, upstream 5xx, etc.) must
-					// surface as an error, never as a successful ai.done. The error
-					// notification may or may not have preceded this; either way the
-					// terminal state here is failure.
-					_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, errors.New(firstNonEmpty(turnErr, "codex turn failed"))))
-				} else if turnStatus == "interrupted" {
-					_ = writeJSON(map[string]interface{}{
-						"type":       models.AgentEventAIStatus,
-						"session_id": run.sessionID,
-						"status":     "interrupted",
+				if turnStatus == "failed" && turnErr != "" {
+					terminalErr = firstNonEmpty(turnErr, "codex turn failed")
+				}
+				if len(run.nativeGoal) > 0 {
+					if turnStatus == "failed" || turnStatus == "interrupted" {
+						nativeGoalTerminalDesired = "blocked"
+					} else {
+						outMu.Lock()
+						nativeGoalTerminalDesired = codexNativeGoalTerminalStatus(output.String())
+						outMu.Unlock()
+					}
+					codexPhase = "thread/goal/get(final)"
+					_ = send(map[string]interface{}{
+						"method": "thread/goal/get",
+						"id":     4,
+						"params": map[string]interface{}{"threadId": threadID},
 					})
+					continue
 				}
 				completed = true
 				goto done
@@ -3646,32 +3725,76 @@ func (m *agentAIManager) runCodexAppServer(ctx context.Context, run agentAIRun, 
 				}
 			}
 			if threadID != "" {
-				m.setAgentAIResumeSessionIDIfEmpty(run.sessionID, run.runSeq, threadID)
-				turnStarted = true
-				emitRunStarted()
-				turnParams := map[string]interface{}{
-					"threadId":            threadID,
-					"clientUserMessageId": run.messageID,
-					"input":               codexTurnInput(run),
-					"approvalPolicy":      "on-request",
-					"approvalsReviewer":   "user",
+				if len(run.nativeGoal) > 0 {
+					params := map[string]interface{}{
+						"threadId":  threadID,
+						"objective": remoteString(run.nativeGoal, "objective"),
+						"status":    firstNonEmpty(remoteString(run.nativeGoal, "status"), "active"),
+					}
+					if budget := remoteInt(run.nativeGoal, "token_budget", 0); budget > 0 {
+						params["tokenBudget"] = budget
+					}
+					codexPhase = "thread/goal/set"
+					_ = send(map[string]interface{}{"method": "thread/goal/set", "id": 3, "params": params})
+				} else {
+					startTurn()
 				}
-				if model != "" {
-					turnParams["model"] = model
-				}
-				if effort != "" {
-					turnParams["effort"] = effort
-				}
-				codexPhase = "turn/start"
-				_ = send(map[string]interface{}{
-					"method": "turn/start",
-					"id":     2,
-					"params": turnParams,
-				})
 			} else if _, hasResult := msg["result"]; hasResult {
 				terminalErr = fmt.Sprintf("Codex app-server %s returned no thread id", threadMethod)
 				goto done
 			}
+		}
+		if fmt.Sprint(msg["id"]) == "3" {
+			if result, ok := msg["result"].(map[string]interface{}); ok {
+				nativeGoalSnapshot = codexNativeGoalSnapshot(result["goal"])
+			}
+			if nativeGoalSnapshot == nil {
+				nativeGoalSyncErr = "Codex app-server thread/goal/set returned no Goal snapshot"
+				terminalErr = nativeGoalSyncErr
+				goto done
+			}
+			_ = writeJSON(map[string]interface{}{
+				"type":        models.AgentEventAIRunProgress,
+				"session_id":  run.sessionID,
+				"message_id":  agentAssistantMessageID(run.messageID),
+				"native_goal": nativeGoalSnapshot,
+			})
+			startTurn()
+		}
+		if fmt.Sprint(msg["id"]) == "4" {
+			if result, ok := msg["result"].(map[string]interface{}); ok {
+				nativeGoalSnapshot = codexNativeGoalSnapshot(result["goal"])
+			}
+			if nativeGoalSnapshot == nil {
+				nativeGoalSyncErr = "Codex app-server final native Goal read returned no Goal snapshot"
+				terminalErr = nativeGoalSyncErr
+				goto done
+			}
+			currentNativeStatus := remoteString(nativeGoalSnapshot, "status")
+			if currentNativeStatus == "active" ||
+				((turnStatus == "failed" || turnStatus == "interrupted") && currentNativeStatus != "blocked") {
+				codexPhase = "thread/goal/set(final)"
+				_ = send(map[string]interface{}{
+					"method": "thread/goal/set",
+					"id":     5,
+					"params": map[string]interface{}{"threadId": threadID, "status": nativeGoalTerminalDesired},
+				})
+				continue
+			}
+			completed = true
+			goto done
+		}
+		if fmt.Sprint(msg["id"]) == "5" {
+			if result, ok := msg["result"].(map[string]interface{}); ok {
+				nativeGoalSnapshot = codexNativeGoalSnapshot(result["goal"])
+			}
+			if nativeGoalSnapshot == nil {
+				nativeGoalSyncErr = "Codex app-server final native Goal update returned no Goal snapshot"
+				terminalErr = nativeGoalSyncErr
+				goto done
+			}
+			completed = true
+			goto done
 		}
 		if fmt.Sprint(msg["id"]) == "2" && turnID == "" {
 			if result, ok := msg["result"].(map[string]interface{}); ok {
@@ -3697,6 +3820,21 @@ done:
 	}
 	if ctx.Err() != nil {
 		status, errMsg := agentAIRunStoppedStatus(run.activity, limiter)
+		if len(run.goalIdentity) > 0 {
+			if errMsg == "" {
+				errMsg = "Codex Goal run stopped with status " + status
+			}
+			if codexPhase != "" {
+				errMsg = fmt.Sprintf("%s while %s", errMsg, codexPhase)
+			}
+			if stderrText := strings.TrimSpace(stderrBuf.String()); stderrText != "" {
+				errMsg = fmt.Sprintf("%s; codex stderr: %s", errMsg, truncateForCloud(stderrText))
+			}
+			payload := agentAIErrorPayload(run.sessionID, run.messageID, errors.New(errMsg))
+			payload["native_goal"] = codexNativeGoalStaleSnapshot(nativeGoalSnapshot, errMsg)
+			_ = writeJSON(payload)
+			return agentAIRunDone
+		}
 		statusPayload := map[string]interface{}{
 			"type":       models.AgentEventAIStatus,
 			"session_id": run.sessionID,
@@ -3718,12 +3856,20 @@ done:
 		if stderrText := strings.TrimSpace(stderrBuf.String()); stderrText != "" {
 			terminalErr = fmt.Sprintf("%s; codex stderr: %s", terminalErr, truncateForCloud(stderrText))
 		}
-		_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, errors.New(terminalErr)))
+		payload := agentAIErrorPayload(run.sessionID, run.messageID, errors.New(terminalErr))
+		if nativeGoalSyncErr != "" {
+			payload["native_goal"] = codexNativeGoalStaleSnapshot(nativeGoalSnapshot, nativeGoalSyncErr)
+		} else {
+			payload["native_goal"] = nativeGoalSnapshot
+		}
+		_ = writeJSON(payload)
 		return agentAIRunDone
 	}
 	if !completed {
 		if err := scanner.Err(); err != nil {
-			_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, err))
+			payload := agentAIErrorPayload(run.sessionID, run.messageID, err)
+			payload["native_goal"] = codexNativeGoalStaleSnapshot(nativeGoalSnapshot, err.Error())
+			_ = writeJSON(payload)
 			return agentAIRunDone
 		}
 		if waitErr != nil {
@@ -3731,18 +3877,35 @@ done:
 			if stderrText := strings.TrimSpace(stderrBuf.String()); stderrText != "" {
 				message = fmt.Sprintf("%s; codex stderr: %s", message, truncateForCloud(stderrText))
 			}
-			_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, errors.New(message)))
+			payload := agentAIErrorPayload(run.sessionID, run.messageID, errors.New(message))
+			payload["native_goal"] = codexNativeGoalStaleSnapshot(nativeGoalSnapshot, message)
+			_ = writeJSON(payload)
 			return agentAIRunDone
 		}
 		if turnStarted {
-			_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, fmt.Errorf("Codex app-server exited before turn completed while %s", codexPhase)))
+			message := fmt.Sprintf("Codex app-server exited before turn completed while %s", codexPhase)
+			payload := agentAIErrorPayload(run.sessionID, run.messageID, errors.New(message))
+			payload["native_goal"] = codexNativeGoalStaleSnapshot(nativeGoalSnapshot, message)
+			_ = writeJSON(payload)
 			return agentAIRunDone
 		}
 	}
 	if turnStatus == "failed" || turnStatus == "interrupted" {
-		// Terminal event already emitted above (ai.error / ai.status). Skip the
-		// success path so a failed turn is not stored as a completed assistant
-		// message and does not emit ai.done.
+		if turnStatus == "failed" {
+			payload := agentAIErrorPayload(run.sessionID, run.messageID, errors.New("codex turn failed"))
+			payload["native_goal"] = nativeGoalSnapshot
+			_ = writeJSON(payload)
+		} else if len(run.goalIdentity) > 0 {
+			payload := agentAIErrorPayload(run.sessionID, run.messageID, errors.New("codex turn interrupted"))
+			payload["native_goal"] = nativeGoalSnapshot
+			_ = writeJSON(payload)
+		} else {
+			_ = writeJSON(map[string]interface{}{
+				"type":       models.AgentEventAIStatus,
+				"session_id": run.sessionID,
+				"status":     "interrupted",
+			})
+		}
 		return agentAIRunDone
 	}
 	outMu.Lock()
@@ -3755,6 +3918,7 @@ done:
 		"message_id":        agentAssistantMessageID(run.messageID),
 		"codex_thread_id":   threadID,
 		"source_session_id": threadID,
+		"native_goal":       nativeGoalSnapshot,
 	})
 	return agentAIRunDone
 }
@@ -6042,10 +6206,10 @@ func agentAICapabilities() []string {
 	_, hasClaude := lookPathCLI("claude")
 	_, hasClaudeCode := lookPathCLI("claudecode")
 	_, hasOpenCode := lookPathCLI("opencode")
-	return agentAICapabilitiesForTools(hasClaude == nil, hasClaudeCode == nil, codexAppServerAvailable(), hasOpenCode == nil)
+	return agentAICapabilitiesForTools(hasClaude == nil, hasClaudeCode == nil, codexAppServerAvailable(), hasOpenCode == nil, codexNativeGoalAvailable())
 }
 
-func agentAICapabilitiesForTools(hasClaude, hasClaudeCode, hasCodexAppServer, hasOpenCode bool) []string {
+func agentAICapabilitiesForTools(hasClaude, hasClaudeCode, hasCodexAppServer, hasOpenCode, hasCodexNativeGoal bool) []string {
 	caps := []string{"ai_chat", "ai_chat_context", "ai_stream", "ai_approval", "ai_steer", "vibe_session"}
 	if hasClaude {
 		caps = append(caps, "ai_provider_claude")
@@ -6055,6 +6219,9 @@ func agentAICapabilitiesForTools(hasClaude, hasClaudeCode, hasCodexAppServer, ha
 	}
 	if hasCodexAppServer {
 		caps = append(caps, "ai_provider_codex", "ai_provider_codex_app_server")
+	}
+	if hasCodexAppServer && hasCodexNativeGoal {
+		caps = append(caps, "goal_codex_native_v1")
 	}
 	if hasOpenCode {
 		caps = append(caps, "ai_provider_opencode_basic")

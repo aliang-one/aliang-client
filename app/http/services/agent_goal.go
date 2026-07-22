@@ -69,6 +69,67 @@ func cloneGoalIdentity(identity map[string]interface{}) map[string]interface{} {
 	return cloned
 }
 
+func cloneAgentAIMap(value map[string]interface{}) map[string]interface{} {
+	if len(value) == 0 {
+		return nil
+	}
+	cloned := make(map[string]interface{}, len(value))
+	for key, item := range value {
+		cloned[key] = item
+	}
+	return cloned
+}
+
+func codexNativeGoalSnapshot(value interface{}) map[string]interface{} {
+	row := mapIf(value)
+	if row == nil {
+		return nil
+	}
+	threadID := strings.TrimSpace(remoteString(row, "threadId"))
+	status := strings.TrimSpace(remoteString(row, "status"))
+	if threadID == "" || status == "" {
+		return nil
+	}
+	snapshot := map[string]interface{}{
+		"provider":          "codex",
+		"thread_id":         threadID,
+		"objective":         remoteString(row, "objective"),
+		"status":            status,
+		"tokens_used":       remoteInt(row, "tokensUsed", 0),
+		"time_used_seconds": remoteInt(row, "timeUsedSeconds", 0),
+		"created_at":        remoteInt(row, "createdAt", 0),
+		"updated_at":        remoteInt(row, "updatedAt", 0),
+		"sync_state":        "confirmed",
+	}
+	if budget, ok := row["tokenBudget"].(float64); ok && budget >= 0 {
+		snapshot["token_budget"] = int(budget)
+	}
+	return snapshot
+}
+
+func codexNativeGoalStaleSnapshot(snapshot map[string]interface{}, syncErr string) map[string]interface{} {
+	if len(snapshot) == 0 {
+		return nil
+	}
+	stale := cloneAgentAIMap(snapshot)
+	stale["sync_state"] = "stale"
+	if syncErr = strings.TrimSpace(syncErr); syncErr != "" {
+		stale["sync_error"] = syncErr
+	}
+	return stale
+}
+
+func codexNativeGoalTerminalStatus(output string) string {
+	report, ok := parseMarkedJSONObject(output, goalReportMarker)
+	if !ok || !validGoalReport(report) {
+		return "blocked"
+	}
+	if remoteString(report, "outcome") == "task_completed" {
+		return "complete"
+	}
+	return "blocked"
+}
+
 func (e *agentAIRunEmitter) appendGoalOutput(delta string) {
 	if e == nil || len(e.goalIdentity) == 0 || delta == "" {
 		return
