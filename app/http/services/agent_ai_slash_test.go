@@ -43,10 +43,10 @@ func newSlashTestSession() *agentAISession {
 }
 
 func TestHandleLocalSlashCommand(t *testing.T) {
-	t.Run("clear resets session continuity", func(t *testing.T) {
-		mgr := newAgentAIManager()
-		sess := newSlashTestSession()
-		mu, events, w := captureAIWriter(t)
+		t.Run("clear resets session continuity", func(t *testing.T) {
+			mgr := newAgentAIManager()
+			sess := newSlashTestSession()
+			mu, events, w := captureAIWriter(t)
 		if !mgr.handleLocalSlashCommand(sess, "msg_1", "/clear", "claudecode", w) {
 			t.Fatal("expected /clear to be handled")
 		}
@@ -67,15 +67,20 @@ func TestHandleLocalSlashCommand(t *testing.T) {
 		}
 	})
 
-	t.Run("model sets session model", func(t *testing.T) {
-		mgr := newAgentAIManager()
-		sess := newSlashTestSession()
-		_, _, w := captureAIWriter(t)
+		t.Run("model is read-only because server owns configuration", func(t *testing.T) {
+			mgr := newAgentAIManager()
+			sess := newSlashTestSession()
+			initialModel := sess.model
+			mu, events, w := captureAIWriter(t)
 		if !mgr.handleLocalSlashCommand(sess, "msg_2", "/model gpt-5.2", "claudecode", w) {
 			t.Fatal("expected /model to be handled")
 		}
-		if sess.model != "gpt-5.2" {
-			t.Errorf("model = %q, want gpt-5.2", sess.model)
+		if sess.model != initialModel {
+			t.Errorf("remote /model changed model from %q to %q", initialModel, sess.model)
+		}
+		deltas := findAIEvents(mu, events, "ai.delta")
+		if len(deltas) != 1 || !strings.Contains(remoteString(deltas[0], "delta"), "手机会话工具") {
+			t.Fatalf("remote /model should explain the server-owned setting: %#v", deltas)
 		}
 		// /model without args reports the current model and does not change it.
 		sess.model = "glm-5.2"

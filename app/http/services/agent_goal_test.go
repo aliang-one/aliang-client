@@ -195,6 +195,36 @@ func TestGoalCommandCheckRejectsUnapprovedExecutable(t *testing.T) {
 	}
 }
 
+func TestGoalCommandCheckRejectsSideEffectingAllowedExecutable(t *testing.T) {
+	result := executeGoalCheck(t.TempDir(), map[string]interface{}{
+		"check_id":          "check-1",
+		"type":              "command",
+		"command":           "npm publish",
+		"timeout_ms":        30_000,
+		"definition_digest": "sha256:test",
+	}, "sha256:workspace")
+	if result["status"] != "error" || result["output"] != "check command is not verification-safe" {
+		t.Fatalf("side-effecting command result = %#v", result)
+	}
+}
+
+func TestGoalReportValidationMatchesServerContract(t *testing.T) {
+	valid := map[string]interface{}{
+		"schema_version": 1, "outcome": "task_completed", "summary": "done",
+		"evidence_refs": []interface{}{}, "completion_proposed": true,
+	}
+	if !validGoalReport(valid) {
+		t.Fatal("valid report was rejected")
+	}
+	invalid := map[string]interface{}{
+		"schema_version": 1, "outcome": "task_completed", "summary": 42,
+		"evidence_refs": []interface{}{}, "completion_proposed": true,
+	}
+	if validGoalReport(invalid) {
+		t.Fatal("server-invalid report was accepted")
+	}
+}
+
 func TestGoalCommandCheckRejectsExecutablePath(t *testing.T) {
 	root := t.TempDir()
 	fakeNPM := filepath.Join(root, "npm")

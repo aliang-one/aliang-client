@@ -1182,7 +1182,7 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 	// /compact) run WITHOUT a model turn. The Go agent drives the CLI headlessly
 	// (claude --print --resume / codex app-server --stdio), so there is no live
 	// REPL to receive interactive slash commands — these are direct session
-	// operations (/clear /model) or honest status replies (/help /cost /compact).
+	// operations (/clear) or honest status replies (/model /help /cost /compact).
 	// Prompt-style commands (/review, custom .claude/commands) and unknown /xxx
 	// fall through to the normal model turn below.
 	if m.handleLocalSlashCommand(session, messageID, content, provider, runWrite) {
@@ -1373,21 +1373,18 @@ func (m *agentAIManager) applyLocalSlashCommand(session *agentAISession, name, a
 		return fmt.Sprintf("✓ /clear 已清空。下一轮将开启全新的 %s 会话。", agentAIProviderDisplayName(provider))
 	case "model":
 		newModel := strings.TrimSpace(args)
-		if newModel == "" {
-			m.mu.Lock()
-			cur := session.model
-			m.mu.Unlock()
-			if cur == "" {
-				return "当前未指定模型(使用 CLI 默认)。用法:/model <name>"
-			}
-			return fmt.Sprintf("当前模型: %s。用法:/model <name> 切换。", cur)
-		}
 		m.mu.Lock()
-		session.model = newModel
+		cur := session.model
 		m.mu.Unlock()
-		return fmt.Sprintf("✓ /model 已切换为 %s(下一轮生效)。", newModel)
+		if newModel != "" {
+			return "远程 /model 不会修改服务器会话配置。请在手机会话工具中切换模型，修改将在下一轮生效。"
+		}
+		if cur == "" {
+			return "当前未指定模型(使用服务器或 CLI 默认)。请在手机会话工具中切换。"
+		}
+		return fmt.Sprintf("当前模型: %s。请在手机会话工具中切换。", cur)
 	case "help":
-		return "本机命令(remote=local): /clear  /model <name>  /help  /cost  /compact\n注: /compact 在 headless 模式不支持真实压缩。"
+		return "本机命令(remote=local): /clear  /model  /help  /cost  /compact\n注: 模型切换请使用手机会话设置；/compact 在 headless 模式不支持真实压缩。"
 	case "cost":
 		// Per-turn usage is emitted as ai.usage but not accumulated on the
 		// session, so there is no running total to report here.

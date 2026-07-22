@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,6 +23,7 @@ import (
 const (
 	goalPlannerTimeout       = 2 * time.Minute
 	goalEvidenceOutputLimit  = 16 * 1024
+	goalPlanOutputLimit      = 256 * 1024
 	goalFingerprintFileLimit = 50_000
 	goalFingerprintByteLimit = 256 * 1024 * 1024
 	goalReportMarker         = "ALIANG_GOAL_REPORT:"
@@ -132,10 +134,74 @@ func validGoalReport(report map[string]interface{}) bool {
 	}
 	switch remoteString(report, "outcome") {
 	case "task_completed", "blocked", "failed", "no_progress":
-		return true
 	default:
 		return false
 	}
+	summary, ok := report["summary"].(string)
+	if !ok || len(summary) > 8_000 {
+		return false
+	}
+	if blocker, exists := report["blocker_code"]; exists && blocker != nil {
+		value, valid := blocker.(string)
+		if !valid || len(value) > 160 {
+			return false
+		}
+	}
+	evidence, ok := report["evidence_refs"].([]interface{})
+	if !ok || len(evidence) > 100 {
+		return false
+	}
+	for _, item := range evidence {
+		value, valid := item.(string)
+		if !valid || len(value) > 500 {
+			return false
+		}
+	}
+	completionProposed, ok := report["completion_proposed"].(bool)
+	return ok && completionProposed == (remoteString(report, "outcome") == "task_completed")
+}
+
+func validGoalPlan(plan map[string]interface{}) bool {
+	if remoteInt(plan, "schema_version", 0) != 1 || strings.TrimSpace(remoteString(plan, "objective")) == "" {
+		return false
+	}
+	tasks, ok := plan["tasks"].([]interface{})
+	if !ok || len(tasks) == 0 || len(tasks) > 100 {
+		return false
+	}
+	for _, rawTask := range tasks {
+		task, valid := rawTask.(map[string]interface{})
+		if !valid || strings.TrimSpace(remoteString(task, "key")) == "" || strings.TrimSpace(remoteString(task, "title")) == "" {
+			return false
+		}
+		roots, rootsOK := task["allowed_roots"].([]interface{})
+		checks, checksOK := task["checks"].([]interface{})
+		if !rootsOK || len(roots) == 0 || !checksOK || len(checks) == 0 {
+			return false
+		}
+		for _, rawCheck := range checks {
+			check, checkOK := rawCheck.(map[string]interface{})
+			if !checkOK || strings.TrimSpace(remoteString(check, "key")) == "" {
+				return false
+			}
+			if _, requiredOK := check["required"].(bool); !requiredOK {
+				return false
+			}
+			switch remoteString(check, "type") {
+			case "command":
+				if strings.TrimSpace(remoteString(check, "command")) == "" {
+					return false
+				}
+			case "file_exists", "file_contains":
+				if strings.TrimSpace(remoteString(check, "path")) == "" {
+					return false
+				}
+			default:
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func parseMarkedJSONObject(output, marker string) (map[string]interface{}, bool) {
@@ -144,11 +210,13 @@ func parseMarkedJSONObject(output, marker string) (map[string]interface{}, bool)
 		return nil, false
 	}
 	raw := strings.TrimSpace(output[index+len(marker):])
-	if newline := strings.IndexByte(raw, '\n'); newline >= 0 {
-		raw = strings.TrimSpace(raw[:newline])
-	}
 	var parsed map[string]interface{}
-	if raw == "" || json.Unmarshal([]byte(raw), &parsed) != nil {
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	if raw == "" || decoder.Decode(&parsed) != nil {
+		return nil, false
+	}
+	var trailing interface{}
+	if decoder.Decode(&trailing) != io.EOF {
 		return nil, false
 	}
 	return parsed, true
@@ -205,9 +273,9 @@ User constraints (authoritative): %s
 Non-goals (authoritative): %s
 Workspace root: %s
 Inspect the current workspace. Do not edit files, install dependencies, or run mutating commands.
-Produce a small dependency-aware plan. Every task must stay under the workspace root. Checks must be deterministic command, file_exists, or file_contains checks. Use only these command families: git, npm, npx, pnpm, yarn, node, tsc, vitest, jest, go, cargo, rustc, python, python3, pytest, make, cmake, gradle, mvn, dotnet, swift.
-End with exactly one line beginning %s followed by JSON shaped as:
-{"objective":string,"constraints":[string],"non_goals":[string],"tasks":[{"key":string,"title":string,"description":string,"depends_on":[string],"allowed_roots":[%q],"allowed_commands":[string],"checks":[{"key":string,"type":"command|file_exists|file_contains","command":string,"path":string,"contains":string,"required":true,"timeout_ms":number}],"retry_safety":"safe|idempotent_with_key|unsafe"}],"budget":{"max_attempts_per_task":number,"max_turns":number,"command_timeout_ms":number}}`, objective, goalPromptList(constraints), goalPromptList(nonGoals), projectPath, goalPlanMarker, projectPath)
+Produce a small dependency-aware plan. Every task must stay under the workspace root. Checks must be deterministic command, file_exists, or file_contains checks. Command checks must be verification-only: use test/lint/check/typecheck/verify/build scripts; read-only git subcommands; direct tsc/vitest/jest/pytest; go test/vet; cargo test/check/clippy; or dotnet/swift test/build. Never propose install, add, remove, publish, deploy, push, commit, checkout, reset, clean, or shell-composed commands. npx checks must use --no-install.
+End with exactly one line beginning %s followed by compact single-line JSON shaped as:
+{"schema_version":1,"objective":string,"constraints":[string],"non_goals":[string],"tasks":[{"key":string,"title":string,"description":string,"depends_on":[string],"allowed_roots":[%q],"allowed_commands":[string],"checks":[{"key":string,"type":"command|file_exists|file_contains","command":string,"path":string,"contains":string,"required":true,"timeout_ms":number}],"retry_safety":"safe|idempotent_with_key|unsafe","idempotency_key_template":"required when retry_safety is idempotent_with_key"}],"budget":{"max_attempts_per_task":number,"max_turns":number,"command_timeout_ms":number}}`, objective, goalPromptList(constraints), goalPromptList(nonGoals), projectPath, goalPlanMarker, projectPath)
 
 	var captureMu sync.Mutex
 	var output strings.Builder
@@ -221,9 +289,9 @@ End with exactly one line beginning %s followed by JSON shaped as:
 		defer captureMu.Unlock()
 		switch remoteString(payload, "type") {
 		case models.AgentEventAIDelta:
-			if output.Len() < agentAIMessageLimitBytes {
+			if output.Len() < goalPlanOutputLimit {
 				delta := remoteString(payload, "delta")
-				remaining := agentAIMessageLimitBytes - output.Len()
+				remaining := goalPlanOutputLimit - output.Len()
 				if len(delta) > remaining {
 					delta = delta[:remaining]
 				}
@@ -243,6 +311,8 @@ End with exactly one line beginning %s followed by JSON shaped as:
 		mode:        "agent",
 		projectPath: projectPath,
 		provider:    firstNonEmpty(remoteString(msg, "provider"), "auto"),
+		model:       remoteString(msg, "model"),
+		effort:      remoteString(msg, "effort"),
 		prompt:      prompt,
 		freshPrompt: prompt,
 		activity:    newAgentAIActivity(),
@@ -262,8 +332,8 @@ End with exactly one line beginning %s followed by JSON shaped as:
 		return
 	}
 	proposal, ok := parseMarkedJSONObject(providerOutput, goalPlanMarker)
-	if !ok {
-		_ = writeJSON(agentGoalErrorPayload(msg, errors.New("planner did not return ALIANG_GOAL_PLAN JSON")))
+	if !ok || !validGoalPlan(proposal) {
+		_ = writeJSON(agentGoalErrorPayload(msg, errors.New("planner did not return valid ALIANG_GOAL_PLAN v1 JSON")))
 		return
 	}
 	after, err := goalWorkspaceFingerprint(projectPath)
@@ -384,6 +454,101 @@ func handleAgentGoalVerify(msg map[string]interface{}, writeJSON func(interface{
 	})
 }
 
+func goalSafeCheckScript(value string) bool {
+	value = strings.ToLower(strings.TrimSpace(value))
+	for _, prefix := range []string{"test", "lint", "check", "typecheck", "verify", "build"} {
+		if value == prefix || strings.HasPrefix(value, prefix+":") || strings.HasPrefix(value, prefix+".") || strings.HasPrefix(value, prefix+"-") || strings.HasPrefix(value, prefix+"_") {
+			return true
+		}
+	}
+	return false
+}
+
+func goalSafeCheckTool(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "tsc", "vitest", "jest", "pytest", "eslint":
+		return true
+	default:
+		return false
+	}
+}
+
+func goalCheckCommandSafe(argv []string) bool {
+	if len(argv) == 0 {
+		return false
+	}
+	executable := strings.ToLower(argv[0])
+	plain := make([]string, 0, len(argv)-1)
+	for _, value := range argv[1:] {
+		if !strings.HasPrefix(value, "-") {
+			plain = append(plain, value)
+		}
+	}
+	first := ""
+	if len(plain) > 0 {
+		first = strings.ToLower(plain[0])
+	}
+	switch executable {
+	case "git":
+		for _, allowed := range []string{"status", "diff", "rev-parse", "log", "show", "ls-files", "grep", "check-ignore"} {
+			if first == allowed {
+				return true
+			}
+		}
+	case "npm", "pnpm", "yarn":
+		if first == "test" {
+			return true
+		}
+		if first == "run" && len(plain) > 1 {
+			return goalSafeCheckScript(plain[1])
+		}
+		if first == "exec" && len(plain) > 1 {
+			return goalSafeCheckTool(plain[1])
+		}
+	case "npx":
+		hasNoInstall := false
+		for _, value := range argv[1:] {
+			if value == "--no-install" {
+				hasNoInstall = true
+			}
+		}
+		return hasNoInstall && len(plain) > 0 && goalSafeCheckTool(plain[0])
+	case "tsc", "vitest", "jest", "pytest":
+		return true
+	case "node":
+		return len(argv) > 1 && argv[1] == "--check"
+	case "python", "python3":
+		return len(argv) > 2 && argv[1] == "-m" && (argv[2] == "pytest" || argv[2] == "compileall")
+	case "go":
+		return first == "test" || first == "vet"
+	case "cargo":
+		return first == "test" || first == "check" || first == "clippy"
+	case "make", "gradle":
+		if len(plain) == 0 {
+			return false
+		}
+		for _, value := range plain {
+			if !goalSafeCheckScript(value) {
+				return false
+			}
+		}
+		return true
+	case "mvn":
+		if len(plain) == 0 {
+			return false
+		}
+		for _, value := range plain {
+			if value != "test" && value != "verify" && value != "package" {
+				return false
+			}
+		}
+		return true
+	case "dotnet", "swift":
+		return first == "test" || first == "build"
+	}
+	return false
+}
+
 func executeGoalCheck(projectPath string, definition map[string]interface{}, fingerprint string) map[string]interface{} {
 	started := time.Now().UTC()
 	status := "error"
@@ -407,6 +572,11 @@ func executeGoalCheck(projectPath string, definition map[string]interface{}, fin
 		commandName = strings.TrimSuffix(commandName, ".cmd")
 		if _, allowed := goalAllowedCheckCommands[commandName]; !allowed {
 			output = "check command is not allowed"
+			break
+		}
+		argv[0] = commandName
+		if !goalCheckCommandSafe(argv) {
+			output = "check command is not verification-safe"
 			break
 		}
 		timeout := time.Duration(remoteInt(definition, "timeout_ms", 30_000)) * time.Millisecond
