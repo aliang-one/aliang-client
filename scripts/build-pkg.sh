@@ -11,7 +11,12 @@ PAYLOAD_DIR="$BUILD_DIR/payload"
 SCRIPTS_DIR="$BUILD_DIR/scripts"
 APP_DIR="$PAYLOAD_DIR/Applications/Aliang.app"
 CORE_DIR="$PAYLOAD_DIR/Library/Application Support/one.aliang.aliang"
-VERSION="${VERSION:-1.1.10}"
+VERSION="${VERSION:-$(git -C "$PROJECT_DIR" tag --points-at HEAD --sort=-version:refname 2>/dev/null | head -1)}"
+if [ -z "$VERSION" ]; then
+	echo "ERROR: VERSION is required when HEAD has no release tag" >&2
+	exit 1
+fi
+BUNDLE_VERSION="${VERSION#v}"
 ARCH="${ARCH:-}"
 MAC_APPLICATION_IDENTITY="${MAC_APPLICATION_IDENTITY:-}"
 MAC_INSTALLER_IDENTITY="${MAC_INSTALLER_IDENTITY:-}"
@@ -59,11 +64,19 @@ else
 	cd "$PROJECT_DIR"
 
 	# On macOS, CGO is required for systray (Cocoa/Objective-C)
+	COMMIT="$(git rev-parse --short HEAD)"
+	LDFLAGS="-s -w -X aliang.one/nursorgate/common/version.Version=$VERSION -X aliang.one/nursorgate/common/version.GitCommit=$COMMIT -X aliang.one/nursorgate/common/version.BuildMode=prod"
 	if [ "$(uname)" = "Darwin" ]; then
-		go build -ldflags="-s -w -X aliang.one/nursorgate/common/version.BuildMode=prod" -o "$SCRIPT_DIR/aliang" ./cmd/aliang/main.go
+		go build -ldflags="$LDFLAGS" -o "$SCRIPT_DIR/aliang" ./cmd/aliang/main.go
 	else
-		CGO_ENABLED=0 go build -ldflags="-s -w -X aliang.one/nursorgate/common/version.BuildMode=prod" -o "$SCRIPT_DIR/aliang" ./cmd/aliang/main.go
+		CGO_ENABLED=0 go build -ldflags="$LDFLAGS" -o "$SCRIPT_DIR/aliang" ./cmd/aliang/main.go
 	fi
+fi
+
+BINARY_VERSION="$("$SCRIPT_DIR/aliang" version 2>/dev/null | awk 'NR == 1 { print $NF }')"
+if [ -z "$BINARY_VERSION" ] || [ "$BINARY_VERSION" = "unknown" ] || [ "${BINARY_VERSION#v}" != "$BUNDLE_VERSION" ]; then
+	echo "ERROR: binary version ${BINARY_VERSION:-unknown} does not match package version $VERSION" >&2
+	exit 1
 fi
 
 # Step 2: Copy binary to app bundle (Shell entry point)
@@ -79,6 +92,8 @@ chmod +x "$CORE_DIR/aliang"
 # Step 4: Copy Info.plist and icon
 echo "=== Copying Info.plist and icon ==="
 cp "$SCRIPT_DIR/Info.plist" "$APP_DIR/Contents/Info.plist"
+plutil -replace CFBundleShortVersionString -string "$BUNDLE_VERSION" "$APP_DIR/Contents/Info.plist"
+plutil -replace CFBundleVersion -string "$BUNDLE_VERSION" "$APP_DIR/Contents/Info.plist"
 if [ -f "$SCRIPT_DIR/Aliang.icns" ]; then
     cp "$SCRIPT_DIR/Aliang.icns" "$APP_DIR/Contents/Resources/Aliang.icns"
     echo "=== App icon copied ==="
@@ -120,9 +135,25 @@ echo "Preinstall: Stopping old core LaunchAgent..."
 launchctl bootout "gui/${USER_ID}/one.aliang.core" 2>&1 || true
 rm -f "$HOME/Library/LaunchAgents/one.aliang.core.plist" 2>&1 || true
 
-# Stop and remove old core LaunchDaemon if exists (system-wide)
+# Stop the old Core completely. Continuing while launchd still owns the old
+# process makes Installer report success while macOS keeps executing old code.
 echo "Preinstall: Stopping old core LaunchDaemon..."
-launchctl bootout "system/one.aliang.aliang.core" 2>&1 || true
+if launchctl print "system/one.aliang.aliang.core" >/dev/null 2>&1; then
+    if ! launchctl bootout "system/one.aliang.aliang.core" 2>&1; then
+        echo "Preinstall: ERROR - failed to stop the existing Core service" >&2
+        exit 1
+    fi
+    for _ in $(seq 1 30); do
+        if ! launchctl print "system/one.aliang.aliang.core" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 1
+    done
+    if launchctl print "system/one.aliang.aliang.core" >/dev/null 2>&1; then
+        echo "Preinstall: ERROR - old Core service did not exit within 30 seconds" >&2
+        exit 1
+    fi
+fi
 rm -f "/Library/LaunchDaemons/one.aliang.aliang.core.plist" 2>&1 || true
 
 echo "Preinstall: Old services cleaned up"
@@ -205,12 +236,24 @@ PLIST_EOF
 chmod 644 "$PLIST_PATH"
 echo "Postinstall: LaunchDaemon plist created at $PLIST_PATH"
 
-# Bootstrap as system LaunchDaemon
+# Bootstrap as system LaunchDaemon. A non-zero result is an installation
+# failure: otherwise the files update while the live service remains stale.
 echo "Postinstall: Bootstrapping Core service..."
-if launchctl bootstrap "system" "$PLIST_PATH" 2>&1; then
-    echo "Postinstall: Core service registered successfully"
-else
-    echo "Postinstall: WARNING - bootstrap returned non-zero (service may already be registered)"
+if ! launchctl bootstrap "system" "$PLIST_PATH" 2>&1; then
+    echo "Postinstall: ERROR - failed to register Core service" >&2
+    exit 1
+fi
+launchctl kickstart -k "system/one.aliang.aliang.core"
+for _ in $(seq 1 30); do
+    if launchctl print "system/one.aliang.aliang.core" 2>/dev/null | grep -q "state = running"; then
+        echo "Postinstall: Core service is running"
+        break
+    fi
+    sleep 1
+done
+if ! launchctl print "system/one.aliang.aliang.core" 2>/dev/null | grep -q "state = running"; then
+    echo "Postinstall: ERROR - Core service did not reach running state" >&2
+    exit 1
 fi
 
 echo "Postinstall: Core service setup complete"
@@ -245,6 +288,13 @@ if [ -n "$MAC_INSTALLER_IDENTITY" ]; then
 	PRODUCTBUILD_ARGS+=(--sign "$MAC_INSTALLER_IDENTITY")
 fi
 productbuild "${PRODUCTBUILD_ARGS[@]}" "$PKG_PATH"
+
+# Fail the release before upload if the app metadata drifted from the binary.
+PACKAGED_BUNDLE_VERSION="$(plutil -extract CFBundleShortVersionString raw "$APP_DIR/Contents/Info.plist")"
+if [ "$PACKAGED_BUNDLE_VERSION" != "$BUNDLE_VERSION" ]; then
+	echo "ERROR: packaged bundle version $PACKAGED_BUNDLE_VERSION does not match $BUNDLE_VERSION" >&2
+	exit 1
+fi
 
 if [ -n "$MAC_INSTALLER_IDENTITY" ]; then
 	pkgutil --check-signature "$PKG_PATH"

@@ -76,7 +76,7 @@ func TestGoalPlannerUsesProviderNativeReadOnlyPolicies(t *testing.T) {
 		wantArgs []string
 		wantEnv  string
 	}{
-		{id: "codex", wantArgs: []string{"--sandbox", "read-only", "--ignore-user-config"}},
+		{id: "codex", wantArgs: []string{"--sandbox", "read-only", "--ignore-rules", "--ephemeral"}},
 		{id: "claudecode", wantArgs: []string{"--permission-mode", "plan", "--disallowedTools", "Bash,Edit,Write,NotebookEdit"}},
 		{id: "opencode", wantArgs: []string{"--pure", "--agent", "plan"}, wantEnv: "OPENCODE_CONFIG_CONTENT="},
 	}

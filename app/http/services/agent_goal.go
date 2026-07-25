@@ -616,7 +616,10 @@ func withGoalPlanningReadOnly(tool *agentAITool) *agentAITool {
 	flags := []string{}
 	switch copied.id {
 	case "codex":
-		flags = []string{"--sandbox", "read-only", "--ignore-user-config"}
+		// Keep CODEX_HOME/config.toml loaded: Aliang uses it for the selected
+		// model provider and gateway base URL. Isolate planning from rules and
+		// persisted sessions without disabling the provider configuration.
+		flags = []string{"--sandbox", "read-only", "--ignore-rules", "--ephemeral"}
 	case "claude", "claudecode":
 		flags = []string{
 			"--permission-mode", "plan",
