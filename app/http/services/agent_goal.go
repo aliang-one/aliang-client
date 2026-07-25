@@ -334,6 +334,16 @@ func handleAgentGoalPlan(msg map[string]interface{}, writeJSON func(interface{})
 	provider := firstNonEmpty(remoteString(msg, "provider"), "auto")
 	model := remoteString(msg, "model")
 	effort := remoteString(msg, "effort")
+	// Planning is a structured-emit task, not open-ended reasoning. Extreme effort
+	// (xhigh) makes the provider over-think and never reach the ALIANG_GOAL_PLAN
+	// line within the per-call/output budget — observed: glm-5.2[1m]+xhigh spent
+	// 2min "exploring" with no plan emitted, which blows the server's goal.plan
+	// RPC timeout and triggers a re-dispatch loop (goal appears stuck in planning).
+	// Clamp to high so the planner converges promptly; task execution still
+	// honors the user's full effort.
+	if effort == "xhigh" || effort == "" {
+		effort = "high"
+	}
 
 	// Safety net: a goal must never be left dangling. A blocking provider run or
 	// an unexpected panic still yields a typed error so the server settles it.
@@ -566,8 +576,8 @@ Objective: %s
 User constraints (authoritative): %s
 Non-goals (authoritative): %s
 Workspace root: %s
-Inspect the current workspace. Do not edit files, install dependencies, or run mutating commands.
-Produce a small dependency-aware plan. Every task must stay under the workspace root. Checks must be deterministic command, file_exists, or file_contains checks. HARD CONSTRAINTS (the server rejects any plan that violates these, so follow exactly):
+You may inspect at most a few key files to ground the plan, but keep exploration BRIEF — do not read the whole tree. Do not edit files, install dependencies, or run mutating commands.
+Produce a small dependency-aware plan promptly and emit the ALIANG_GOAL_PLAN line as soon as the plan is ready. Every task must stay under the workspace root. Checks must be deterministic command, file_exists, or file_contains checks. HARD CONSTRAINTS (the server rejects any plan that violates these, so follow exactly):
 - Commands (both task allowed_commands AND check commands): the FIRST word MUST be one of exactly these executables: git, npm, npx, pnpm, yarn, node, tsc, vitest, jest, go, cargo, rustc, python, python3, pytest, make, cmake, gradle, mvn, dotnet, swift. Do NOT propose any other executable — never ls, cat, grep, find, sed, awk, curl, wget, sh, bash, docker, or similar.
 - file_exists/file_contains check paths MUST be absolute paths INSIDE the workspace root shown above (e.g. %s/src/foo.ts). NEVER relative paths (src/foo.ts) and NEVER paths outside the workspace root — no ~/.claude/, /etc/, /tmp/, or any path that does not begin with the workspace root.
 - Command checks must be verification-only (test/lint/typecheck/build). Never install, add, remove, publish, deploy, push, commit, checkout, reset, clean, or shell-composed commands. npx checks must use --no-install.
