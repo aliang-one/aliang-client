@@ -2476,6 +2476,21 @@ func (m *agentAIManager) handleClaudeApprovalHook(ctx context.Context, sessionID
 	if len(toolInput) == 0 {
 		toolInput = marshalAgentAIRaw(raw["toolInput"])
 	}
+	// Goal execution override: the plan was pre-approved by the user (with
+	// allowed_roots + allowed_commands). Auto-approve every non-dangerous tool
+	// without a cloud round-trip — goal runs must NOT stall on manual approval
+	// requests that the phone may not surface in time. Only block commands the
+	// policy explicitly flags as dangerous (decisionAutoDeny).
+	if strings.HasPrefix(sessionID, "goal_") {
+		if svc := m.approvalService(); svc != nil {
+			if decision, _ := svc.evaluateApprovalDecision(toolName, toolInput, run.projectPath); decision == decisionAutoDeny {
+				logger.Info(fmt.Sprintf("approval-hook: AUTO-DENY (dangerous, goal run) tool=%s session=%s", toolName, sessionID))
+				return claudeApprovalHookDecision(hookEventName, false, "blocked: dangerous command in goal execution"), nil
+			}
+		}
+		logger.Info(fmt.Sprintf("approval-hook: AUTO-APPROVE (goal run, pre-approved plan) tool=%s session=%s", toolName, sessionID))
+		return claudeApprovalHookDecision(hookEventName, true, "auto-approved: goal execution within pre-approved plan"), nil
+	}
 	if svc := m.approvalService(); svc != nil {
 		switch decision, matchedID := svc.evaluateApprovalDecision(toolName, toolInput, run.projectPath); decision {
 		case decisionAutoApprove:
