@@ -308,6 +308,8 @@ func agentGoalErrorPayload(msg map[string]interface{}, err error) map[string]int
 	}
 }
 
+const goalPlanMaxEmitAttempts = 3
+
 func handleAgentGoalPlan(msg map[string]interface{}, writeJSON func(interface{}) error, manager *agentAIManager) {
 	requestID := strings.TrimSpace(remoteString(msg, "request_id"))
 	objective := strings.TrimSpace(remoteString(msg, "objective"))
@@ -327,20 +329,56 @@ func handleAgentGoalPlan(msg map[string]interface{}, writeJSON func(interface{})
 		_ = writeJSON(agentGoalErrorPayload(msg, err))
 		return
 	}
+	goalID := remoteString(msg, "goal_id")
+	goalSessionID := "goal-plan:" + goalID
+	provider := firstNonEmpty(remoteString(msg, "provider"), "auto")
+	model := remoteString(msg, "model")
+	effort := remoteString(msg, "effort")
 
-	prompt := fmt.Sprintf(`You are planning one software-development Goal in read-only mode.
-Objective: %s
-User constraints (authoritative): %s
-Non-goals (authoritative): %s
-Workspace root: %s
-Inspect the current workspace. Do not edit files, install dependencies, or run mutating commands.
-Produce a small dependency-aware plan. Every task must stay under the workspace root. Checks must be deterministic command, file_exists, or file_contains checks. Command checks must be verification-only: use test/lint/check/typecheck/verify/build scripts; read-only git subcommands; direct tsc/vitest/jest/pytest; go test/vet; cargo test/check/clippy; or dotnet/swift test/build. Never propose install, add, remove, publish, deploy, push, commit, checkout, reset, clean, or shell-composed commands. npx checks must use --no-install.
-End with exactly one line beginning %s followed by compact single-line JSON shaped as:
-{"schema_version":1,"objective":string,"constraints":[string],"non_goals":[string],"tasks":[{"key":string,"title":string,"description":string,"depends_on":[string],"allowed_roots":[%q],"allowed_commands":[string],"checks":[{"key":string,"type":"command|file_exists|file_contains","command":string,"path":string,"contains":string,"required":true,"timeout_ms":number}],"retry_safety":"safe|idempotent_with_key|unsafe","idempotency_key_template":"required when retry_safety is idempotent_with_key"}],"budget":{"max_attempts_per_task":number,"max_turns":number,"command_timeout_ms":number}}`, objective, goalPromptList(constraints), goalPromptList(nonGoals), projectPath, goalPlanMarker, projectPath)
+	// Safety net: a goal must never be left dangling. A blocking provider run or
+	// an unexpected panic still yields a typed error so the server settles it.
+	defer func() {
+		if r := recover(); r != nil {
+			_ = writeJSON(agentGoalErrorPayload(msg, fmt.Errorf("goal planner crashed: %v", r)))
+		}
+	}()
 
+	// Phase A — read-only exploration on the primary goal-plan session.
+	emitGoalPlanPhase(writeJSON, requestID, "exploring", 0)
+	if plan, ok := extractGoalPlan(runGoalPlanCLIPass(manager, goalSessionID, requestID, projectPath, provider, model, effort, goalPlanExplorePrompt(objective, constraints, nonGoals, projectPath), false, "")); ok {
+		normalizeGoalPlanPaths(plan, projectPath)
+		finalizeGoalPlan(writeJSON, msg, requestID, before, projectPath, plan)
+		return
+	}
+	nativeSID := manager.resumeSessionIDFor(goalSessionID)
+
+	// Phase B — forced emission. Each attempt runs on its OWN manager session
+	// (goal-plan-emit-<attempt>:<id>) so runCLIPass is never called twice on the
+	// same session (that blocked the earlier implementation). We pass the
+	// exploration's native claude session id so the emission turn resumes it.
+	emitPrompt := goalPlanEmitPrompt(objective, constraints, nonGoals, projectPath)
+	for attempt := 1; attempt <= goalPlanMaxEmitAttempts; attempt++ {
+		emitGoalPlanPhase(writeJSON, requestID, "emitting", attempt)
+		emitSession := fmt.Sprintf("goal-plan-emit-%d:%s", attempt, goalID)
+		if plan, ok := extractGoalPlan(runGoalPlanCLIPass(manager, emitSession, requestID, projectPath, provider, model, effort, emitPrompt, true, nativeSID)); ok {
+			normalizeGoalPlanPaths(plan, projectPath)
+			finalizeGoalPlan(writeJSON, msg, requestID, before, projectPath, plan)
+			return
+		}
+	}
+
+	// Convergence guarantee: typed failure instead of a vague planner_failed.
+	_ = writeJSON(agentGoalErrorPayload(msg, errors.New("planner_did_not_converge: provider did not emit valid ALIANG_GOAL_PLAN after exploration and bounded emission attempts")))
+}
+
+// runGoalPlanCLIPass runs one goal-planning CLI turn: read-only exploration when
+// emission is false, tool-locked emission when true. It returns the captured
+// provider text output. Emission turns resume the exploration session when the
+// native session id was pinned on the goal session.
+func runGoalPlanCLIPass(manager *agentAIManager, sessionID, messageID, projectPath, provider, model, effort, prompt string, emission bool, resumeSID string) string {
+	allowResume := emission && resumeSID != ""
 	var captureMu sync.Mutex
 	var output strings.Builder
-	var runError string
 	capture := func(value interface{}) error {
 		payload, ok := value.(map[string]interface{})
 		if !ok {
@@ -348,55 +386,150 @@ End with exactly one line beginning %s followed by compact single-line JSON shap
 		}
 		captureMu.Lock()
 		defer captureMu.Unlock()
-		switch remoteString(payload, "type") {
-		case models.AgentEventAIDelta:
-			if output.Len() < goalPlanOutputLimit {
-				delta := remoteString(payload, "delta")
-				remaining := goalPlanOutputLimit - output.Len()
-				if len(delta) > remaining {
-					delta = delta[:remaining]
-				}
-				output.WriteString(delta)
+		if remoteString(payload, "type") == models.AgentEventAIDelta && output.Len() < goalPlanOutputLimit {
+			delta := remoteString(payload, "delta")
+			remaining := goalPlanOutputLimit - output.Len()
+			if len(delta) > remaining {
+				delta = delta[:remaining]
 			}
-		case models.AgentEventAIError:
-			runError = firstNonEmpty(remoteString(payload, "error"), remoteString(payload, "detail"), "planner provider failed")
+			output.WriteString(delta)
 		}
 		return nil
 	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), goalPlannerTimeout)
 	defer cancel()
 	manager.runCLIPass(ctx, agentAIRun{
-		sessionID:   "goal-plan:" + remoteString(msg, "goal_id"),
-		messageID:   requestID,
-		mode:        "agent",
-		projectPath: projectPath,
-		provider:    firstNonEmpty(remoteString(msg, "provider"), "auto"),
-		model:       remoteString(msg, "model"),
-		effort:      remoteString(msg, "effort"),
-		prompt:      prompt,
-		freshPrompt: prompt,
-		activity:    newAgentAIActivity(),
-		readOnly:    true,
-	}, capture, false)
-
+		sessionID:       sessionID,
+		messageID:       messageID,
+		mode:            "agent",
+		projectPath:     projectPath,
+		provider:        provider,
+		model:           model,
+		effort:          effort,
+		prompt:          prompt,
+		freshPrompt:     prompt,
+		activity:        newAgentAIActivity(),
+		readOnly:        true,
+		emissionOnly:    emission,
+		resumeSessionID: resumeSID,
+	}, capture, allowResume)
 	captureMu.Lock()
-	providerOutput := output.String()
-	providerError := runError
+	out := output.String()
 	captureMu.Unlock()
-	if ctx.Err() != nil {
-		_ = writeJSON(agentGoalErrorPayload(msg, fmt.Errorf("goal planner timed out: %w", ctx.Err())))
-		return
-	}
-	if providerError != "" {
-		_ = writeJSON(agentGoalErrorPayload(msg, errors.New(providerError)))
-		return
-	}
-	proposal, ok := parseMarkedJSONObject(providerOutput, goalPlanMarker)
+	return out
+}
+
+func extractGoalPlan(output string) (map[string]interface{}, bool) {
+	proposal, ok := parseMarkedJSONObject(output, goalPlanMarker)
 	if !ok || !validGoalPlan(proposal) {
-		_ = writeJSON(agentGoalErrorPayload(msg, errors.New("planner did not return valid ALIANG_GOAL_PLAN v1 JSON")))
-		return
+		return nil, false
 	}
+	return proposal, true
+}
+
+// goalAllowedCommandNames mirrors the server's DEFAULT_ALLOWED_COMMANDS
+// (build/test/vcs command families). Providers often propose read-only shell
+// utilities (ls/cat/grep) as task allowed_commands; the server rejects any
+// command whose first token is not in this set (task_command_out_of_scope), so
+// we filter those out before sending. Keep in sync with the server list.
+var goalAllowedCommandNames = map[string]bool{
+	"git": true, "npm": true, "npx": true, "pnpm": true, "yarn": true, "node": true,
+	"tsc": true, "vitest": true, "jest": true, "go": true, "cargo": true, "rustc": true,
+	"python": true, "python3": true, "pytest": true, "make": true, "cmake": true,
+	"gradle": true, "mvn": true, "dotnet": true, "swift": true,
+}
+
+func goalCommandName(cmd string) string {
+	cmd = strings.TrimSpace(cmd)
+	if i := strings.IndexByte(cmd, ' '); i >= 0 {
+		return cmd[:i]
+	}
+	return cmd
+}
+
+// normalizeGoalPlanPaths (misnomer retained for call-site stability) is the
+// agent-side goal plan sanitizer: it rewrites the provider's raw plan into one
+// the server's strict manifest compiler will accept, so an unreliable model
+// (glm-5.2) does not fail the whole goal on scope nits. It:
+//   - filters task allowed_commands to the server's allowed command families;
+//   - drops check commands whose first token is not in the allowlist;
+//   - resolves relative check paths against the project root;
+//   - drops check paths that are absolute but OUTSIDE the project root (models
+//     sometimes point checks at their own ~/.claude cache or other system dirs);
+//   - drops any task that loses all its checks (server requires >=1 per task).
+// A plan with zero surviving tasks is left empty, which extractGoalPlan then
+// rejects (-> did_not_converge) rather than sending an empty proposal.
+// Mutates the proposal in place.
+func normalizeGoalPlanPaths(proposal map[string]interface{}, projectRoot string) {
+	root := strings.TrimRight(strings.TrimSpace(projectRoot), "/")
+	rootSlash := root + "/"
+	insideRoot := func(p string) bool {
+		if p == "" || !strings.HasPrefix(p, "/") || root == "" {
+			return false
+		}
+		return p == root || strings.HasPrefix(p, rootSlash)
+	}
+	tasks, _ := proposal["tasks"].([]interface{})
+	cleanedTasks := make([]interface{}, 0, len(tasks))
+	for _, rawTask := range tasks {
+		task, _ := rawTask.(map[string]interface{})
+		if task == nil {
+			continue
+		}
+		if rawCmds, ok := task["allowed_commands"].([]interface{}); ok {
+			kept := make([]interface{}, 0, len(rawCmds))
+			for _, raw := range rawCmds {
+				cmd, _ := raw.(string)
+				cmd = strings.TrimSpace(cmd)
+				if cmd == "" || !goalAllowedCommandNames[goalCommandName(cmd)] {
+					continue
+				}
+				kept = append(kept, cmd)
+			}
+			task["allowed_commands"] = kept
+		}
+		if rawChecks, ok := task["checks"].([]interface{}); ok {
+			keptChecks := make([]interface{}, 0, len(rawChecks))
+			for _, rawCheck := range rawChecks {
+				check, _ := rawCheck.(map[string]interface{})
+				if check == nil {
+					continue
+				}
+				switch strings.TrimSpace(remoteString(check, "type")) {
+				case "command":
+					cmd := strings.TrimSpace(remoteString(check, "command"))
+					if cmd == "" || !goalAllowedCommandNames[goalCommandName(cmd)] {
+						continue // drop out-of-scope / empty check command
+					}
+				case "file_exists", "file_contains":
+					path := strings.TrimSpace(remoteString(check, "path"))
+					if path == "" {
+						continue
+					}
+					if !strings.HasPrefix(path, "/") && root != "" {
+						path = root + "/" + path // resolve relative → absolute
+						check["path"] = path
+					}
+					if !insideRoot(path) {
+						continue // drop absolute path outside project root
+					}
+				default:
+					// keep unknown check types; server validates them
+				}
+				keptChecks = append(keptChecks, check)
+			}
+			task["checks"] = keptChecks
+		}
+		checks, _ := task["checks"].([]interface{})
+		if len(checks) == 0 {
+			continue // drop task with no surviving checks
+		}
+		cleanedTasks = append(cleanedTasks, task)
+	}
+	proposal["tasks"] = cleanedTasks
+}
+
+func finalizeGoalPlan(writeJSON func(interface{}) error, msg map[string]interface{}, requestID, before, projectPath string, proposal map[string]interface{}) {
 	after, err := goalWorkspaceFingerprint(projectPath)
 	if err != nil {
 		_ = writeJSON(agentGoalErrorPayload(msg, err))
@@ -410,6 +543,66 @@ End with exactly one line beginning %s followed by compact single-line JSON shap
 		"provider_run_id":              requestID,
 		"proposal":                     proposal,
 	})
+}
+
+// emitGoalPlanPhase surfaces the current planning phase (exploring / emitting)
+// so the phone can show whether the provider is still exploring or producing the
+// plan. It is a progress hint; it does not mutate goal state.
+func emitGoalPlanPhase(writeJSON func(interface{}) error, requestID, phase string, attempt int) {
+	payload := map[string]interface{}{
+		"type":            models.AgentEventAIRunProgress,
+		"message_id":      requestID,
+		"goal_plan_phase": phase,
+	}
+	if attempt > 0 {
+		payload["goal_plan_attempt"] = attempt
+	}
+	_ = writeJSON(payload)
+}
+
+func goalPlanExplorePrompt(objective string, constraints, nonGoals []string, projectPath string) string {
+	return fmt.Sprintf(`You are planning one software-development Goal in read-only mode.
+Objective: %s
+User constraints (authoritative): %s
+Non-goals (authoritative): %s
+Workspace root: %s
+Inspect the current workspace. Do not edit files, install dependencies, or run mutating commands.
+Produce a small dependency-aware plan. Every task must stay under the workspace root. Checks must be deterministic command, file_exists, or file_contains checks. HARD CONSTRAINTS (the server rejects any plan that violates these, so follow exactly):
+- Commands (both task allowed_commands AND check commands): the FIRST word MUST be one of exactly these executables: git, npm, npx, pnpm, yarn, node, tsc, vitest, jest, go, cargo, rustc, python, python3, pytest, make, cmake, gradle, mvn, dotnet, swift. Do NOT propose any other executable — never ls, cat, grep, find, sed, awk, curl, wget, sh, bash, docker, or similar.
+- file_exists/file_contains check paths MUST be absolute paths INSIDE the workspace root shown above (e.g. %s/src/foo.ts). NEVER relative paths (src/foo.ts) and NEVER paths outside the workspace root — no ~/.claude/, /etc/, /tmp/, or any path that does not begin with the workspace root.
+- Command checks must be verification-only (test/lint/typecheck/build). Never install, add, remove, publish, deploy, push, commit, checkout, reset, clean, or shell-composed commands. npx checks must use --no-install.
+End with exactly one line beginning %s followed by compact single-line JSON shaped as:
+{"schema_version":1,"objective":string,"constraints":[string],"non_goals":[string],"tasks":[{"key":string,"title":string,"description":string,"depends_on":[string],"allowed_roots":[%q],"allowed_commands":[string],"checks":[{"key":string,"type":"command|file_exists|file_contains","command":string,"path":string,"contains":string,"required":true,"timeout_ms":number}],"retry_safety":"safe|idempotent_with_key|unsafe","idempotency_key_template":"required when retry_safety is idempotent_with_key"}],"budget":{"max_attempts_per_task":number,"max_turns":number,"command_timeout_ms":number}}`, objective, goalPromptList(constraints), goalPromptList(nonGoals), projectPath, projectPath, goalPlanMarker, projectPath)
+}
+
+// goalPlanEmitPrompt is the forced-emission instruction used in Phase B. The
+// provider has no tools available there, so this text is the only thing it can
+// act on; it must emit the ALIANG_GOAL_PLAN line.
+func goalPlanEmitPrompt(objective string, constraints, nonGoals []string, projectPath string) string {
+	return fmt.Sprintf(`You have finished exploring the workspace. Do NOT call any tool and do NOT explore further.
+Your only output must be a single line beginning %s followed by compact single-line JSON shaped as:
+{"schema_version":1,"objective":string,"constraints":[string],"non_goals":[string],"tasks":[{"key":string,"title":string,"description":string,"depends_on":[string],"allowed_roots":[%q],"allowed_commands":[string],"checks":[{"key":string,"type":"command|file_exists|file_contains","command":string,"path":string,"contains":string,"required":true,"timeout_ms":number}],"retry_safety":"safe|idempotent_with_key|unsafe","idempotency_key_template":"required when retry_safety is idempotent_with_key"}],"budget":{"max_attempts_per_task":number,"max_turns":number,"command_timeout_ms":number}}
+Objective: %s
+User constraints (authoritative): %s
+Non-goals (authoritative): %s
+Workspace root: %s
+Hard constraints (server rejects violations): commands (allowed_commands AND check commands) first word MUST be one of git, npm, npx, pnpm, yarn, node, tsc, vitest, jest, go, cargo, rustc, python, python3, pytest, make, cmake, gradle, mvn, dotnet, swift only — no ls/cat/grep/find/curl/sh/etc. file_exists/file_contains paths MUST be absolute paths INSIDE the workspace root above — never relative (src/foo.ts), never outside it (~/.claude/, /etc/, /tmp/, or any path not beginning with that root).
+Emit the plan now. No prose before or after the %s line.`, goalPlanMarker, projectPath, objective, goalPromptList(constraints), goalPromptList(nonGoals), projectPath, goalPlanMarker)
+}
+
+// resumeSessionIDFor returns the native provider session id pinned on the goal
+// session after the exploration turn, so the emission turn can resume it.
+func (m *agentAIManager) resumeSessionIDFor(sessionID string) string {
+	if m == nil {
+		return ""
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	session := m.sessions[sessionID]
+	if session == nil {
+		return ""
+	}
+	return strings.TrimSpace(session.resumeSessionID)
 }
 
 func withGoalPlanningReadOnly(tool *agentAITool) *agentAITool {
@@ -428,8 +621,8 @@ func withGoalPlanningReadOnly(tool *agentAITool) *agentAITool {
 		flags = []string{
 			"--permission-mode", "plan",
 			"--disallowedTools", "Bash,Edit,Write,NotebookEdit",
-			"--setting-sources", "",
 			"--strict-mcp-config", "--mcp-config", claudeCodeHeadlessEmptyMCP,
+			"--",
 		}
 	case "opencode":
 		flags = []string{"--pure", "--agent", "plan"}
@@ -440,6 +633,35 @@ func withGoalPlanningReadOnly(tool *agentAITool) *agentAITool {
 		return nil
 	}
 	copied.args = append(copied.args[:promptIndex], append(flags, copied.args[promptIndex])...)
+	return &copied
+}
+
+// withGoalEmissionOnly forces a follow-up planning turn in which the provider
+// cannot use any tool, so its only possible output is the ALIANG_GOAL_PLAN text.
+// Used by the goal planner convergence loop after the read-only exploration.
+// --tools "" + a broad --disallowedTools (subagent/exploration/mutation tools)
+// + "--" so no variadic flag eats the prompt.
+func withGoalEmissionOnly(tool *agentAITool) *agentAITool {
+	if tool == nil || len(tool.args) == 0 {
+		return tool
+	}
+	if tool.id != "claude" && tool.id != "claudecode" {
+		return nil
+	}
+	copied := *tool
+	args := append([]string(nil), tool.args...)
+	args = withoutCLIArgumentValue(args, "--disallowedTools")
+	args = withoutCLIArgumentValue(args, "--allowedTools")
+	args = withoutCLIArgumentValue(args, "--tools")
+	promptIndex := len(args) - 1
+	flags := []string{
+		"--permission-mode", "plan",
+		"--tools", "",
+		"--disallowedTools", "Agent,Task,Bash,Edit,Write,NotebookEdit,Read,Read_file,Grep,Glob,Ls,WebSearch,WebFetch,TodoWrite",
+		"--strict-mcp-config", "--mcp-config", claudeCodeHeadlessEmptyMCP,
+		"--",
+	}
+	copied.args = append(args[:promptIndex], append(flags, args[promptIndex])...)
 	return &copied
 }
 

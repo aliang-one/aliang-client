@@ -303,6 +303,10 @@ type agentAIRun struct {
 	goalIdentity  map[string]interface{}
 	nativeGoal    map[string]interface{}
 	readOnly      bool
+	// emissionOnly forces a follow-up planning turn that may not use any tools,
+	// so the provider can only emit the structured ALIANG_GOAL_PLAN text. Used by
+	// the goal planner's convergence loop after the read-only exploration turn.
+	emissionOnly bool
 }
 
 type agentAIAttachment struct {
@@ -4315,7 +4319,7 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 
 	var tool *agentAITool
 	var err error
-	if run.readOnly || len(run.goalIdentity) > 0 {
+	if run.readOnly || run.emissionOnly || len(run.goalIdentity) > 0 {
 		tool, err = resolveGoalAgentAITool(run.prompt, run.provider, run.model, run.effort, resumeID, newSessionID)
 	} else {
 		tool, err = resolveAgentAITool(run.prompt, run.provider, run.model, run.effort, resumeID, newSessionID)
@@ -4324,7 +4328,13 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 		_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, err))
 		return agentAIRunDone
 	}
-	if run.readOnly {
+	if run.emissionOnly {
+		tool = withGoalEmissionOnly(tool)
+		if tool == nil {
+			_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, errors.New("provider does not support emission-only planning")))
+			return agentAIRunDone
+		}
+	} else if run.readOnly {
 		tool = withGoalPlanningReadOnly(tool)
 		if tool == nil {
 			_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, errors.New("provider does not support enforced read-only planning")))
@@ -6220,9 +6230,12 @@ func agentAICapabilitiesForTools(hasClaude, hasClaudeCode, hasCodexAppServer, ha
 	if hasCodexAppServer {
 		caps = append(caps, "ai_provider_codex", "ai_provider_codex_app_server")
 	}
-	if hasCodexAppServer && hasCodexNativeGoal {
-		caps = append(caps, "goal_codex_native_v1")
-	}
+	// goal_codex_native_v1 intentionally NOT advertised: the native hybrid
+	// driver lacks terminal-state validation (see docs/goal-master.md §五).
+	// All goals (including Codex) use the Server-driven Phase 1 path until the
+	// native conformance suite passes. hasCodexNativeGoal param retained for
+	// the call signature; reuse it when re-enabling native.
+	_ = hasCodexNativeGoal
 	if hasOpenCode {
 		caps = append(caps, "ai_provider_opencode_basic")
 	}
