@@ -23,7 +23,13 @@ import (
 const (
 	goalPlannerTimeout       = 2 * time.Minute
 	goalEvidenceOutputLimit  = 16 * 1024
-	goalPlanOutputLimit      = 256 * 1024
+	// goalPlanOutputLimit caps how much of the provider's planning stream we
+	// capture (to then extract the trailing ALIANG_GOAL_PLAN marker). Deep-effort
+	// turns (e.g. glm-5.2[1m] @ xhigh) can emit 500KB-1MB+ of reasoning before the
+	// marker; the old 256KB cap truncated the marker off the end -> "did not
+	// converge" -> server re-dispatched -> goal stuck in planning. 2MB leaves
+	// headroom for thorough planning while bounding memory.
+	goalPlanOutputLimit      = 2 * 1024 * 1024
 	goalFingerprintFileLimit = 50_000
 	goalFingerprintByteLimit = 256 * 1024 * 1024
 	goalReportMarker         = "ALIANG_GOAL_REPORT:"
@@ -334,16 +340,6 @@ func handleAgentGoalPlan(msg map[string]interface{}, writeJSON func(interface{})
 	provider := firstNonEmpty(remoteString(msg, "provider"), "auto")
 	model := remoteString(msg, "model")
 	effort := remoteString(msg, "effort")
-	// Planning is a structured-emit task, not open-ended reasoning. Extreme effort
-	// (xhigh) makes the provider over-think and never reach the ALIANG_GOAL_PLAN
-	// line within the per-call/output budget — observed: glm-5.2[1m]+xhigh spent
-	// 2min "exploring" with no plan emitted, which blows the server's goal.plan
-	// RPC timeout and triggers a re-dispatch loop (goal appears stuck in planning).
-	// Clamp to high so the planner converges promptly; task execution still
-	// honors the user's full effort.
-	if effort == "xhigh" || effort == "" {
-		effort = "high"
-	}
 
 	// Safety net: a goal must never be left dangling. A blocking provider run or
 	// an unexpected panic still yields a typed error so the server settles it.
@@ -355,7 +351,7 @@ func handleAgentGoalPlan(msg map[string]interface{}, writeJSON func(interface{})
 
 	// Phase A — read-only exploration on the primary goal-plan session.
 	emitGoalPlanPhase(writeJSON, requestID, "exploring", 0)
-	if plan, ok := extractGoalPlan(runGoalPlanCLIPass(manager, goalSessionID, requestID, projectPath, provider, model, effort, goalPlanExplorePrompt(objective, constraints, nonGoals, projectPath), false, "")); ok {
+	if plan, ok := extractGoalPlan(runGoalPlanCLIPass(manager, goalSessionID, requestID, projectPath, provider, model, effort, goalPlanExplorePrompt(objective, constraints, nonGoals, projectPath), false, "", makeGoalPlanThinkingEmitter(writeJSON, requestID, "exploring", 0))); ok {
 		normalizeGoalPlanPaths(plan, projectPath)
 		finalizeGoalPlan(writeJSON, msg, requestID, before, projectPath, plan)
 		return
@@ -370,7 +366,7 @@ func handleAgentGoalPlan(msg map[string]interface{}, writeJSON func(interface{})
 	for attempt := 1; attempt <= goalPlanMaxEmitAttempts; attempt++ {
 		emitGoalPlanPhase(writeJSON, requestID, "emitting", attempt)
 		emitSession := fmt.Sprintf("goal-plan-emit-%d:%s", attempt, goalID)
-		if plan, ok := extractGoalPlan(runGoalPlanCLIPass(manager, emitSession, requestID, projectPath, provider, model, effort, emitPrompt, true, nativeSID)); ok {
+		if plan, ok := extractGoalPlan(runGoalPlanCLIPass(manager, emitSession, requestID, projectPath, provider, model, effort, emitPrompt, true, nativeSID, makeGoalPlanThinkingEmitter(writeJSON, requestID, "emitting", attempt))); ok {
 			normalizeGoalPlanPaths(plan, projectPath)
 			finalizeGoalPlan(writeJSON, msg, requestID, before, projectPath, plan)
 			return
@@ -385,10 +381,14 @@ func handleAgentGoalPlan(msg map[string]interface{}, writeJSON func(interface{})
 // emission is false, tool-locked emission when true. It returns the captured
 // provider text output. Emission turns resume the exploration session when the
 // native session id was pinned on the goal session.
-func runGoalPlanCLIPass(manager *agentAIManager, sessionID, messageID, projectPath, provider, model, effort, prompt string, emission bool, resumeSID string) string {
+func runGoalPlanCLIPass(manager *agentAIManager, sessionID, messageID, projectPath, provider, model, effort, prompt string, emission bool, resumeSID string, emitThinking func(totalChars int, preview string)) string {
 	allowResume := emission && resumeSID != ""
 	var captureMu sync.Mutex
 	var output strings.Builder
+	var lastEmit time.Time
+	var emittedChars int
+	const goalPlanThinkingThrottle = 1200 * time.Millisecond
+	const goalPlanThinkingPreview = 600
 	capture := func(value interface{}) error {
 		payload, ok := value.(map[string]interface{})
 		if !ok {
@@ -403,6 +403,22 @@ func runGoalPlanCLIPass(manager *agentAIManager, sessionID, messageID, projectPa
 				delta = delta[:remaining]
 			}
 			output.WriteString(delta)
+		}
+		// Throttled live-thinking push so the phone sees the planner reasoning
+		// (turns "stuck" into "visibly working"). One snapshot at most every
+		// ~1.2s, only when fresh content arrived since the last push.
+		if emitThinking != nil {
+			now := time.Now()
+			total := output.Len()
+			if total > emittedChars && (lastEmit.IsZero() || now.Sub(lastEmit) >= goalPlanThinkingThrottle) {
+				preview := output.String()
+				if len(preview) > goalPlanThinkingPreview {
+					preview = preview[len(preview)-goalPlanThinkingPreview:]
+				}
+				emitThinking(total, preview)
+				lastEmit = now
+				emittedChars = total
+			}
 		}
 		return nil
 	}
@@ -423,7 +439,15 @@ func runGoalPlanCLIPass(manager *agentAIManager, sessionID, messageID, projectPa
 		emissionOnly:    emission,
 		resumeSessionID: resumeSID,
 	}, capture, allowResume)
+	// Final flush so the UI sees the last chunk written after the throttle window.
 	captureMu.Lock()
+	if emitThinking != nil && output.Len() > emittedChars {
+		preview := output.String()
+		if len(preview) > goalPlanThinkingPreview {
+			preview = preview[len(preview)-goalPlanThinkingPreview:]
+		}
+		emitThinking(output.Len(), preview)
+	}
 	out := output.String()
 	captureMu.Unlock()
 	return out
@@ -570,14 +594,35 @@ func emitGoalPlanPhase(writeJSON func(interface{}) error, requestID, phase strin
 	_ = writeJSON(payload)
 }
 
+// makeGoalPlanThinkingEmitter returns a sink that pushes a throttled snapshot
+// of the planner's live reasoning to the server (same ai.run.progress channel
+// as the phase events) so the phone can render "exploring/emitting · attempt N
+// · thinking…" instead of a silent "planning…". totalChars is the cumulative
+// captured output length (a progress proxy); preview is the trailing slice.
+func makeGoalPlanThinkingEmitter(writeJSON func(interface{}) error, requestID, phase string, attempt int) func(totalChars int, preview string) {
+	return func(totalChars int, preview string) {
+		payload := map[string]interface{}{
+			"type":                   models.AgentEventAIRunProgress,
+			"message_id":             requestID,
+			"goal_plan_phase":        phase,
+			"goal_plan_thinking_chars": totalChars,
+			"goal_plan_thinking_preview": preview,
+		}
+		if attempt > 0 {
+			payload["goal_plan_attempt"] = attempt
+		}
+		_ = writeJSON(payload)
+	}
+}
+
 func goalPlanExplorePrompt(objective string, constraints, nonGoals []string, projectPath string) string {
 	return fmt.Sprintf(`You are planning one software-development Goal in read-only mode.
 Objective: %s
 User constraints (authoritative): %s
 Non-goals (authoritative): %s
 Workspace root: %s
-You may inspect at most a few key files to ground the plan, but keep exploration BRIEF — do not read the whole tree. Do not edit files, install dependencies, or run mutating commands.
-Produce a small dependency-aware plan promptly and emit the ALIANG_GOAL_PLAN line as soon as the plan is ready. Every task must stay under the workspace root. Checks must be deterministic command, file_exists, or file_contains checks. HARD CONSTRAINTS (the server rejects any plan that violates these, so follow exactly):
+Inspect the workspace as needed to ground a concrete plan — read the key files relevant to the objective. Do not edit files, install dependencies, or run mutating commands.
+When you have enough context, produce a small dependency-aware plan and emit the ALIANG_GOAL_PLAN line. Every task must stay under the workspace root. Checks must be deterministic command, file_exists, or file_contains checks. HARD CONSTRAINTS (the server rejects any plan that violates these, so follow exactly):
 - Commands (both task allowed_commands AND check commands): the FIRST word MUST be one of exactly these executables: git, npm, npx, pnpm, yarn, node, tsc, vitest, jest, go, cargo, rustc, python, python3, pytest, make, cmake, gradle, mvn, dotnet, swift. Do NOT propose any other executable — never ls, cat, grep, find, sed, awk, curl, wget, sh, bash, docker, or similar.
 - file_exists/file_contains check paths MUST be absolute paths INSIDE the workspace root shown above (e.g. %s/src/foo.ts). NEVER relative paths (src/foo.ts) and NEVER paths outside the workspace root — no ~/.claude/, /etc/, /tmp/, or any path that does not begin with the workspace root.
 - Command checks must be verification-only (test/lint/typecheck/build). Never install, add, remove, publish, deploy, push, commit, checkout, reset, clean, or shell-composed commands. npx checks must use --no-install.
