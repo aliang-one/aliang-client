@@ -342,3 +342,154 @@ func TestRecoveredGoalRunReplaysFencedFailureTerminal(t *testing.T) {
 		t.Fatalf("processed run was not completed: %#v", stored)
 	}
 }
+
+// parseMarkedJSONObject 容错：provider 把 report JSON 包在 ```json 围栏里。
+func TestParseMarkedJSONObjectHandlesCodeFence(t *testing.T) {
+	output := "thinking...\n```json\n" + goalReportMarker + ` {"schema_version":1,"outcome":"task_completed","summary":"done","evidence_refs":[],"completion_proposed":true}` + "\n```"
+	report, ok := parseMarkedJSONObject(output, goalReportMarker)
+	if !ok {
+		t.Fatal("expected fenced report to parse")
+	}
+	if report["outcome"] != "task_completed" {
+		t.Fatalf("outcome = %v", report["outcome"])
+	}
+}
+
+// parseMarkedJSONObject 容错：marker 出现在中间（thinking 复述指令后真 report）。
+func TestParseMarkedJSONObjectHandlesMidTextMarker(t *testing.T) {
+	output := goalReportMarker + ` {"schema_version":1,"outcome":"failed","summary":"cmd err","evidence_refs":[],"completion_proposed":false}` + "\ntrailing text"
+	report, ok := parseMarkedJSONObject(output, goalReportMarker)
+	if !ok {
+		t.Fatal("expected mid-text report to parse")
+	}
+	if report["outcome"] != "failed" {
+		t.Fatalf("outcome = %v", report["outcome"])
+	}
+}
+
+// attachGoalReport fallback：provider 没输出 report，但有正常输出 → 乐观 task_completed。
+func TestAttachGoalReportFallbackInfersCompletedFromOutput(t *testing.T) {
+	var terminal map[string]interface{}
+	emitter := newAgentAIRunEmitter(agentAIRun{
+		runID: "run-1", goalIdentity: testGoalIdentity(),
+	}, func(value interface{}) error {
+		terminal = value.(map[string]interface{})
+		return nil
+	})
+	_ = emitter.emit(map[string]interface{}{"type": models.AgentEventAIDelta, "delta": "Installed dependencies.\nRan tests: all passing."})
+	_ = emitter.emit(map[string]interface{}{"type": models.AgentEventAIDone})
+	report := terminal["goal_report"].(map[string]interface{})
+	if report["outcome"] != "task_completed" {
+		t.Fatalf("outcome = %v, want task_completed (fallback should be optimistic)", report["outcome"])
+	}
+	if report["completion_proposed"] != true {
+		t.Fatalf("completion_proposed = %v", report["completion_proposed"])
+	}
+	if _, hasOutput := terminal["output"].(string); !hasOutput {
+		t.Fatalf("output field not attached: %#v", terminal["output"])
+	}
+}
+
+// attachGoalReport fallback：输出含 "command not found" → failed。
+func TestAttachGoalReportFallbackDetectsErrorSignal(t *testing.T) {
+	var terminal map[string]interface{}
+	emitter := newAgentAIRunEmitter(agentAIRun{
+		runID: "run-1", goalIdentity: testGoalIdentity(),
+	}, func(value interface{}) error {
+		terminal = value.(map[string]interface{})
+		return nil
+	})
+	_ = emitter.emit(map[string]interface{}{"type": models.AgentEventAIDelta, "delta": "sh: npm: command not found"})
+	_ = emitter.emit(map[string]interface{}{"type": models.AgentEventAIDone})
+	report := terminal["goal_report"].(map[string]interface{})
+	if report["outcome"] != "failed" {
+		t.Fatalf("outcome = %v, want failed", report["outcome"])
+	}
+	if report["blocker_code"] != "task_command_failed" {
+		t.Fatalf("blocker_code = %v", report["blocker_code"])
+	}
+}
+
+// attachGoalReport fallback：AIError 事件 → failed。
+func TestAttachGoalReportFallbackOnAIError(t *testing.T) {
+	var terminal map[string]interface{}
+	emitter := newAgentAIRunEmitter(agentAIRun{
+		runID: "run-1", goalIdentity: testGoalIdentity(),
+	}, func(value interface{}) error {
+		terminal = value.(map[string]interface{})
+		return nil
+	})
+	_ = emitter.emit(map[string]interface{}{"type": models.AgentEventAIDelta, "delta": "partial work"})
+	_ = emitter.emit(map[string]interface{}{"type": models.AgentEventAIError, "error": "provider crashed"})
+	report := terminal["goal_report"].(map[string]interface{})
+	if report["outcome"] != "failed" || report["blocker_code"] != "provider_error" {
+		t.Fatalf("goal_report = %#v", report)
+	}
+}
+
+// output 字段截断到 16KB（尾部保留）。
+func TestAttachGoalReportOutputIsTruncated(t *testing.T) {
+	var terminal map[string]interface{}
+	emitter := newAgentAIRunEmitter(agentAIRun{
+		runID: "run-1", goalIdentity: testGoalIdentity(),
+	}, func(value interface{}) error {
+		terminal = value.(map[string]interface{})
+		return nil
+	})
+	big := strings.Repeat("a", goalReportOutputByteLimit*2)
+	_ = emitter.emit(map[string]interface{}{"type": models.AgentEventAIDelta, "delta": big})
+	_ = emitter.emit(map[string]interface{}{"type": models.AgentEventAIDone})
+	output := terminal["output"].(string)
+	if len(output) != goalReportOutputByteLimit {
+		t.Fatalf("output length = %d, want %d", len(output), goalReportOutputByteLimit)
+	}
+}
+
+// 守格式的 report（严格末行）仍走最严格解析路径，且 output 被剥掉 marker 行。
+func TestAttachGoalReportStrictReportAlsoGetsOutput(t *testing.T) {
+	var terminal map[string]interface{}
+	emitter := newAgentAIRunEmitter(agentAIRun{
+		runID: "run-1", goalIdentity: testGoalIdentity(),
+	}, func(value interface{}) error {
+		terminal = value.(map[string]interface{})
+		return nil
+	})
+	body := "Installing...\nRunning tests...\n"
+	_ = emitter.emit(map[string]interface{}{"type": models.AgentEventAIDelta, "delta": body + goalReportMarker + ` {"schema_version":1,"outcome":"task_completed","summary":"done","evidence_refs":[],"completion_proposed":true}`})
+	_ = emitter.emit(map[string]interface{}{"type": models.AgentEventAIDone})
+	report := terminal["goal_report"].(map[string]interface{})
+	if report["outcome"] != "task_completed" {
+		t.Fatalf("outcome = %v", report["outcome"])
+	}
+	output := report["output"].(string)
+	if strings.Contains(output, goalReportMarker) {
+		t.Fatalf("output should not contain the report marker: %q", output)
+	}
+}
+
+// goal task 的 Claude --append-system-prompt 被追加 report 强制段。
+func TestWithGoalTaskReportSystemPromptAugmentsClaude(t *testing.T) {
+	original := &agentAITool{
+		id:   "claude",
+		args: []string{"claude", "--append-system-prompt", "base", "--print", "task prompt"},
+	}
+	augmented := withGoalTaskReportSystemPrompt(original)
+	if augmented.args[2] == "base" {
+		t.Fatal("append-system-prompt value was not augmented")
+	}
+	if !strings.Contains(augmented.args[2], goalReportMarker) {
+		t.Fatalf("augmented prompt missing ALIANG_GOAL_REPORT reference: %q", augmented.args[2])
+	}
+	if !strings.HasPrefix(augmented.args[2], "base") {
+		t.Fatalf("augmented prompt should preserve original prefix: %q", augmented.args[2])
+	}
+	// non-claude 路径不被修改。
+	codex := &agentAITool{id: "codex", args: []string{"codex", "exec", "task"}}
+	if got := withGoalTaskReportSystemPrompt(codex); got != codex {
+		t.Fatal("codex tool should pass through unchanged")
+	}
+	// 原对象未被 mutate。
+	if original.args[2] != "base" {
+		t.Fatalf("original tool mutated: %q", original.args[2])
+	}
+}

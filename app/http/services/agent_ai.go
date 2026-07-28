@@ -4357,6 +4357,10 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 		}
 	} else if len(run.goalIdentity) > 0 {
 		tool = withGoalExecutionPolicy(tool)
+		// 强化 goal task 的 report 输出指令（provider 经代理常漏 ALIANG_GOAL_REPORT
+		// 行，导致 goal 无故失败）。仅 claude stream-json 路径下 --append-system-prompt
+		// 已挂载；这里把它扩展为原值 + goal report 强制段。
+		tool = withGoalTaskReportSystemPrompt(tool)
 	}
 	tool = withAgentAIAttachments(tool, run.attachments)
 	cleanupClaudePolicy := func() {}

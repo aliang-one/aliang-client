@@ -29,12 +29,32 @@ const (
 	// marker; the old 256KB cap truncated the marker off the end -> "did not
 	// converge" -> server re-dispatched -> goal stuck in planning. 2MB leaves
 	// headroom for thorough planning while bounding memory.
-	goalPlanOutputLimit      = 2 * 1024 * 1024
-	goalFingerprintFileLimit = 50_000
-	goalFingerprintByteLimit = 256 * 1024 * 1024
-	goalReportMarker         = "ALIANG_GOAL_REPORT:"
-	goalPlanMarker           = "ALIANG_GOAL_PLAN:"
+	goalPlanOutputLimit       = 2 * 1024 * 1024
+	goalFingerprintFileLimit  = 50_000
+	goalFingerprintByteLimit  = 256 * 1024 * 1024
+	goalReportMarker          = "ALIANG_GOAL_REPORT:"
+	goalPlanMarker            = "ALIANG_GOAL_PLAN:"
+	goalReportOutputByteLimit = 16 * 1024
 )
+
+// goalTaskReportSystemPrompt 是注入到 Goal task 执行回合的强化指令（拼到
+// Claude --append-system-prompt 末尾）。作用：强制 provider 无论成败都在回复末尾
+// 输出 ALIANG_GOAL_REPORT 行，并给最小示例。glm-5.2 经代理时经常不输出该行 ->
+// agent 解析不到 -> goal 无故失败；此 prompt 是第一道防线。
+//
+// 注意：这是 agent 端的最后一道保障；server 侧 task prompt 也应含类似指令，但
+// 即使 server prompt 缺失/被裁剪，这里仍生效。
+const goalTaskReportSystemPrompt = `
+
+[Aliang Goal Task — MANDATORY final report]
+You are executing ONE Goal task. Regardless of success OR failure, your response MUST end with exactly one line beginning "ALIANG_GOAL_REPORT:" followed by compact single-line JSON. If you omit this line the task is treated as FAILED. Emit the line even on error, even if you only did partial work, even if you were blocked.
+Schema: {"schema_version":1,"outcome":"task_completed|failed|blocked|no_progress","summary":string,"blocker_code":string,"evidence_refs":[string],"completion_proposed":bool}
+- outcome="task_completed" IFF the task fully succeeded -> completion_proposed MUST be true, blocker_code "".
+- outcome="failed" when the task could not be completed (command error, missing tool, missing file, etc.) -> completion_proposed MUST be false; put the root cause in summary (e.g. "npm install failed: command not found").
+- outcome="blocked" when you need a human decision; outcome="no_progress" only as a last resort.
+Minimal example (copy the shape, fill your own fields):
+ALIANG_GOAL_REPORT: {"schema_version":1,"outcome":"task_completed","summary":"installed deps and ran tests","blocker_code":"","evidence_refs":[],"completion_proposed":true}
+Do NOT wrap the report line in a code fence. Do NOT put any text after the report line. The report line MUST be plain text starting exactly with "ALIANG_GOAL_REPORT:".`
 
 var goalIdentityFields = []string{
 	"goal_id",
@@ -163,6 +183,16 @@ func (e *agentAIRunEmitter) captureGoalWorkspace(projectPath string) error {
 	return nil
 }
 
+// attachGoalReport 在 goal task 的 terminal 事件上附加结构化 goal_report。
+// 三层策略，从最可信到最兜底：
+//  1. 严格/容错解析 ALIANG_GOAL_REPORT —— provider 守格式时直接采用。
+//  2. fallback 推断：provider 没输出 report 时（glm-5.2 经代理常见），从
+//     claude 的累计输出（ai.delta 收集到 goalOutput）推断 outcome/summary，
+//     不再直接报 goal_report_missing 让 goal 无故死掉。
+//  3. 兜底：推断不出（如完全没输出）才报 goal_report_missing。
+//
+// 同时无论成败都填 `output`（截断 16KB）—— server schema 已支持，用于失败时
+// 显示真实命令输出/stderr，闭环失败原因（之前的根因：goal 失败但 admin 看不到为何）。
 func (e *agentAIRunEmitter) attachGoalReport(payload map[string]interface{}) {
 	if e == nil || len(e.goalIdentity) == 0 || payload["goal_report"] != nil {
 		return
@@ -175,24 +205,160 @@ func (e *agentAIRunEmitter) attachGoalReport(payload map[string]interface{}) {
 			payload["workspace_fingerprint_error"] = err.Error()
 		}
 	}
-	if report, ok := parseMarkedJSONObject(e.goalOutput.String(), goalReportMarker); ok && validGoalReport(report) {
+
+	// 提取并填 output（无论成败，server schema 已支持，用于失败诊断）。
+	capturedOutput := e.goalOutput.String()
+	payload["output"] = truncateGoalReportOutput(capturedOutput)
+
+	if report, ok := parseMarkedJSONObject(capturedOutput, goalReportMarker); ok && validGoalReport(report) {
+		// provider 守格式：补全 output（若 report 自带 output 则保留其值）。
+		if _, hasOutput := report["output"]; !hasOutput {
+			report["output"] = truncateGoalReportOutput(stripGoalReportMarkerFromOutput(capturedOutput))
+		}
 		payload["goal_report"] = report
 		return
 	}
-	outcome := "no_progress"
-	blocker := "goal_report_missing"
-	if remoteString(payload, "type") == models.AgentEventAIError {
-		outcome = "failed"
-		blocker = "provider_error"
+
+	// provider 未守格式：从输出推断 outcome/summary（fallback）。
+	report := inferGoalReportFromOutput(capturedOutput, remoteString(payload, "type"))
+	payload["goal_report"] = report
+}
+
+// inferGoalReportFromOutput 在 provider 没输出 ALIANG_GOAL_REPORT 时推断一份。
+// 推断规则（乐观优先，避免误杀成功的任务）：
+//   - AIError 事件 → failed（provider 进程级失败）。
+//   - 输出明显含错误信号（"error:"、"failed:"、"command not found"、"ENOENT"、
+//     "No such file"）→ failed，summary 含错误片段。
+//   - 输出非空且无明显错误信号 → task_completed（乐观：claude 干完活只是没补 report）。
+//   - 输出为空 → no_progress + goal_report_missing（真兜底）。
+func inferGoalReportFromOutput(capturedOutput, terminalEventType string) map[string]interface{} {
+	trimmed := strings.TrimSpace(capturedOutput)
+	tail := trimmed
+	if len(tail) > 600 {
+		tail = tail[len(tail)-600:]
 	}
-	payload["goal_report"] = map[string]interface{}{
+
+	if terminalEventType == models.AgentEventAIError {
+		return map[string]interface{}{
+			"schema_version":      1,
+			"outcome":             "failed",
+			"summary":             "Goal task failed before a structured report was produced; provider output tail: " + clipSummary(tail),
+			"blocker_code":        "provider_error",
+			"evidence_refs":       []interface{}{},
+			"completion_proposed": false,
+		}
+	}
+
+	if trimmed == "" {
+		return map[string]interface{}{
+			"schema_version":      1,
+			"outcome":             "no_progress",
+			"summary":             "Provider did not return a structured Goal report and produced no usable output.",
+			"blocker_code":        "goal_report_missing",
+			"evidence_refs":       []interface{}{},
+			"completion_proposed": false,
+		}
+	}
+
+	lower := strings.ToLower(trimmed)
+	if errorSignal, hit := detectGoalErrorSignal(lower); hit {
+		return map[string]interface{}{
+			"schema_version":      1,
+			"outcome":             "failed",
+			"summary":             "Goal task appears to have failed (" + errorSignal + "); provider output tail: " + clipSummary(tail),
+			"blocker_code":        "task_command_failed",
+			"evidence_refs":       []interface{}{},
+			"completion_proposed": false,
+		}
+	}
+
+	// 乐观：有输出且无明显错误 → task_completed。这是关键修复 —— 之前直接
+	// goal_report_missing 让很多成功的 task 失败。
+	return map[string]interface{}{
 		"schema_version":      1,
-		"outcome":             outcome,
-		"summary":             "Provider did not return a valid structured Goal report.",
-		"blocker_code":        blocker,
+		"outcome":             "task_completed",
+		"summary":             "Goal task completed; provider did not emit a structured report (inferred from output). Output tail: " + clipSummary(tail),
+		"blocker_code":        "",
 		"evidence_refs":       []interface{}{},
-		"completion_proposed": false,
+		"completion_proposed": true,
 	}
+}
+
+// detectGoalErrorSignal 在（已小写化的）输出里寻找常见错误信号，命中则返回
+// 信号描述 + true。覆盖：命令找不到、文件缺失、退出码、显式 error/failed 前缀。
+func detectGoalErrorSignal(lowered string) (string, bool) {
+	signals := []struct {
+		label   string
+		pattern string
+	}{
+		{"command not found", "command not found"},
+		{"command not found", "not found in path"},
+		{"file not found", "no such file or directory"},
+		{"file not found", "enoent"},
+		{"permission denied", "permission denied"},
+		{"nonzero exit", "nonzero exit"},
+		{"exit code", "exit code"},
+		{"fatal", "fatal"},
+		{"timeout", "timed out"},
+	}
+	for _, sig := range signals {
+		if strings.Contains(lowered, sig.pattern) {
+			return sig.label, true
+		}
+	}
+	// "error:" / "failed:" 词边界检查（避免 hit "error" 变量名）。
+	if hasGoalErrorPrefixLine(lowered, "error") || hasGoalErrorPrefixLine(lowered, "failed") {
+		return "error/failed line", true
+	}
+	return "", false
+}
+
+// hasGoalErrorPrefixLine 检查输出里是否存在 "word:" 或 "word " 开头的行。
+func hasGoalErrorPrefixLine(lowered, word string) bool {
+	for _, line := range strings.Split(lowered, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, word+":") || strings.HasPrefix(line+" ", word+" ") {
+			return true
+		}
+	}
+	return false
+}
+
+// clipSummary 把 summary 文本约束在 ~500 字符（远小于 server schema 的 8000），
+// 因为 tail 已截到 600 字符，这里再做防御，避免极端长行把 server 字段撑爆。
+func clipSummary(value string) string {
+	const limit = 500
+	if len(value) <= limit {
+		return value
+	}
+	return value[:limit] + "…"
+}
+
+// truncateGoalReportOutput 截断 goal_report.output 字段到 16KB（尾部保留）。
+// server schema 限制 output 16KB；尾部最有诊断价值（错误信息通常在末尾）。
+func truncateGoalReportOutput(value string) string {
+	if len(value) <= goalReportOutputByteLimit {
+		return value
+	}
+	return value[len(value)-goalReportOutputByteLimit:]
+}
+
+// stripGoalReportMarkerFromOutput 从累计输出里删掉 ALIANG_GOAL_REPORT 行，
+// 给 report.output 用（report 本身的 JSON 不该出现在 output 里）。
+func stripGoalReportMarkerFromOutput(value string) string {
+	idx := strings.Index(value, goalReportMarker)
+	if idx < 0 {
+		return value
+	}
+	// 删掉 marker 所在的整行（到下一个换行）。
+	end := strings.IndexByte(value[idx:], '\n')
+	if end < 0 {
+		return strings.TrimSpace(value[:idx])
+	}
+	return strings.TrimSpace(value[:idx] + value[idx+end+1:])
 }
 
 func validGoalReport(report map[string]interface{}) bool {
@@ -271,7 +437,47 @@ func validGoalPlan(plan map[string]interface{}) bool {
 	return true
 }
 
+// parseMarkedJSONObject 在 output 里寻找 "MARKER" 之后的 JSON 对象。
+// 容错策略（关键：provider 经代理时可能把 report 放在中间、用 ```json 包裹、
+// 或在 marker 后混入空白/换行/多余文本）：
+//  1. 取 marker 的第一个出现（不是最后一个）—— provider 偶尔在 thinking 里
+//     复述指令会导致末尾反而没有真正的 report，但第一处真实 report 通常有效。
+//  2. 容忍 marker 与 JSON 之间的空白/换行/可选的 ```json fence 开头。
+//  3. 用 json.Decoder 流式解析，允许 JSON 后有尾随空白（但非空白尾随 → 失败）。
+//
+// 注意：原来用 strings.LastIndex 严格匹配末行；改成 Index（首个）+ 容错后，
+// 对 plan/report 两种 marker 都更鲁棒。valid* 仍把关 schema，所以误命中会被拒。
 func parseMarkedJSONObject(output, marker string) (map[string]interface{}, bool) {
+	// 1. 首选：marker 后紧跟完整 JSON 到结尾（最常见、最严格）。
+	if parsed, ok := parseMarkedJSONObjectStrict(output, marker); ok {
+		return parsed, true
+	}
+	// 2. 容错：全文搜首个 marker 出现，剥掉 ```json/``` 围栏与多余空白后再解。
+	index := strings.Index(output, marker)
+	if index < 0 {
+		return nil, false
+	}
+	tail := output[index+len(marker):]
+	tail = strings.TrimSpace(stripCodeFence(tail))
+	if tail == "" {
+		return nil, false
+	}
+	var parsed map[string]interface{}
+	decoder := json.NewDecoder(strings.NewReader(tail))
+	if decoder.Decode(&parsed) != nil {
+		return nil, false
+	}
+	// 允许 JSON 后有尾随空白（但不允许有意义的额外 token —— 那多半是解析串了）。
+	var trailing interface{}
+	if err := decoder.Decode(&trailing); err != nil && err != io.EOF {
+		return nil, false
+	}
+	return parsed, true
+}
+
+// parseMarkedJSONObjectStrict 是原始的"最后一个 marker + 严格无尾随"解析。
+// 先试它，命中则最可信（provider 严格遵守指令的常见路径）。
+func parseMarkedJSONObjectStrict(output, marker string) (map[string]interface{}, bool) {
 	index := strings.LastIndex(output, marker)
 	if index < 0 {
 		return nil, false
@@ -287,6 +493,23 @@ func parseMarkedJSONObject(output, marker string) (map[string]interface{}, bool)
 		return nil, false
 	}
 	return parsed, true
+}
+
+// stripCodeFence 去掉字符串开头的 ```json / ``` 围栏开头与结尾的 ```。
+// 用于容错 provider 把 marker JSON 包在 code fence 里输出。
+func stripCodeFence(value string) string {
+	value = strings.TrimSpace(value)
+	if !strings.HasPrefix(value, "```") {
+		return value
+	}
+	// 去掉开头的 ```json 或 ``` 行。
+	if nl := strings.IndexByte(value, '\n'); nl >= 0 {
+		value = strings.TrimSpace(value[nl+1:])
+	} else {
+		value = strings.TrimSpace(strings.TrimPrefix(value, "```"))
+	}
+	value = strings.TrimSuffix(strings.TrimSpace(value), "```")
+	return strings.TrimSpace(value)
 }
 
 func handleAgentGoalMessage(msg map[string]interface{}, writeJSON func(interface{}) error, manager *agentAIManager) {
@@ -735,6 +958,32 @@ func withGoalExecutionPolicy(tool *agentAITool) *agentAITool {
 	copied.env = append(copied.env,
 		`OPENCODE_CONFIG_CONTENT={"share":"disabled","permission":{"external_directory":"deny","task":"deny"}}`,
 	)
+	return &copied
+}
+
+// withGoalTaskReportSystemPrompt 把 goal report 强制段拼到 Claude 路径的
+// --append-system-prompt 末尾。非 Claude 路径（codex/opencode）原样返回（它们
+// 不通过该 flag 注入；codex 走 native goal，opencode 当前不走 goal task）。
+//
+// 为什么放 agent 端：server 下发的 task prompt 也可能含类似指令，但 server
+// prompt 在 provider 侧可能被裁剪/覆盖（claude --append-system-prompt 是显式
+// 顶层指令，优先级高于用户消息里的相同指令），agent 端再补一道最稳。
+func withGoalTaskReportSystemPrompt(tool *agentAITool) *agentAITool {
+	if tool == nil || len(tool.args) == 0 {
+		return tool
+	}
+	if tool.id != "claude" && tool.id != "claudecode" {
+		return tool
+	}
+	copied := *tool
+	copied.args = append([]string(nil), tool.args...)
+	for i := 0; i+1 < len(copied.args); i++ {
+		if copied.args[i] == "--append-system-prompt" {
+			original := copied.args[i+1]
+			copied.args[i+1] = original + goalTaskReportSystemPrompt
+			break
+		}
+	}
 	return &copied
 }
 
