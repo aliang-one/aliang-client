@@ -429,7 +429,7 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 	case models.AgentEventGitStatus, models.AgentEventEnvInfo:
 		s.setRemoteConnectionState(true, "online", "")
 		go handleAgentEnvToolsMessage(msg, writeJSON)
-	case models.AgentEventGoalPlan, models.AgentEventGoalVerify:
+	case models.AgentEventGoalPlan, models.AgentEventGoalVerify, models.AgentEventGoalContinue:
 		s.setRemoteConnectionState(true, "online", "")
 		if !s.aiControlEnabled() {
 			_ = writeJSON(agentGoalErrorPayload(msg, errors.New("AI control is disabled for this device")))
@@ -539,6 +539,7 @@ func remoteAgentMessageRequiresEnabledDevice(msgType string) bool {
 		models.AgentEventEnvInfo,
 		models.AgentEventGoalPlan,
 		models.AgentEventGoalVerify,
+		models.AgentEventGoalContinue,
 		models.AgentEventTerminalCreate,
 		models.AgentEventTerminalInput,
 		models.AgentEventTerminalResize,
@@ -746,6 +747,7 @@ func agentCapabilities() []string {
 		"goal_plan_readonly_v1",
 		"goal_report_v1",
 		"goal_verify_v1",
+		"goal_continue_v1",
 		"workspace_fingerprint_v1",
 	)
 	return caps

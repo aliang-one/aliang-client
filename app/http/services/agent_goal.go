@@ -21,8 +21,8 @@ import (
 )
 
 const (
-	goalPlannerTimeout       = 2 * time.Minute
-	goalEvidenceOutputLimit  = 16 * 1024
+	goalPlannerTimeout      = 2 * time.Minute
+	goalEvidenceOutputLimit = 16 * 1024
 	// goalPlanOutputLimit caps how much of the provider's planning stream we
 	// capture (to then extract the trailing ALIANG_GOAL_PLAN marker). Deep-effort
 	// turns (e.g. glm-5.2[1m] @ xhigh) can emit 500KB-1MB+ of reasoning before the
@@ -443,7 +443,8 @@ func validGoalPlan(plan map[string]interface{}) bool {
 //  1. 取 marker 的第一个出现（不是最后一个）—— provider 偶尔在 thinking 里
 //     复述指令会导致末尾反而没有真正的 report，但第一处真实 report 通常有效。
 //  2. 容忍 marker 与 JSON 之间的空白/换行/可选的 ```json fence 开头。
-//  3. 用 json.Decoder 流式解析，允许 JSON 后有尾随空白（但非空白尾随 → 失败）。
+//  3. 用 json.Decoder 流式解析，允许 JSON 后有 provider prose；如果尾随部分
+//     仍是一个完整 JSON value，则拒绝，避免把两个候选结果拼在一起。
 //
 // 注意：原来用 strings.LastIndex 严格匹配末行；改成 Index（首个）+ 容错后，
 // 对 plan/report 两种 marker 都更鲁棒。valid* 仍把关 schema，所以误命中会被拒。
@@ -467,9 +468,10 @@ func parseMarkedJSONObject(output, marker string) (map[string]interface{}, bool)
 	if decoder.Decode(&parsed) != nil {
 		return nil, false
 	}
-	// 允许 JSON 后有尾随空白（但不允许有意义的额外 token —— 那多半是解析串了）。
+	// Provider 经常在 JSON 后补一小段解释文字。完整的第二个 JSON value
+	// 仍然拒绝；语法错误则视为 prose，schema 校验会继续把 parsed 把关。
 	var trailing interface{}
-	if err := decoder.Decode(&trailing); err != nil && err != io.EOF {
+	if err := decoder.Decode(&trailing); err == nil {
 		return nil, false
 	}
 	return parsed, true
@@ -499,6 +501,10 @@ func parseMarkedJSONObjectStrict(output, marker string) (map[string]interface{},
 // 用于容错 provider 把 marker JSON 包在 code fence 里输出。
 func stripCodeFence(value string) string {
 	value = strings.TrimSpace(value)
+	// A marker may appear inside a fenced block, so after the marker the tail
+	// starts with JSON and ends with the closing fence. Remove that suffix before
+	// attempting JSON decoding; the opening fence was already consumed.
+	value = strings.TrimSpace(strings.TrimSuffix(value, "```"))
 	if !strings.HasPrefix(value, "```") {
 		return value
 	}
@@ -518,6 +524,8 @@ func handleAgentGoalMessage(msg map[string]interface{}, writeJSON func(interface
 		handleAgentGoalPlan(msg, writeJSON, manager)
 	case models.AgentEventGoalVerify:
 		handleAgentGoalVerify(msg, writeJSON)
+	case models.AgentEventGoalContinue:
+		handleAgentGoalContinue(msg, writeJSON, manager)
 	}
 }
 
@@ -563,6 +571,13 @@ func handleAgentGoalPlan(msg map[string]interface{}, writeJSON func(interface{})
 	provider := firstNonEmpty(remoteString(msg, "provider"), "auto")
 	model := remoteString(msg, "model")
 	effort := remoteString(msg, "effort")
+	if err := preflightGoalPlannerProvider(provider, model, effort); err != nil {
+		_ = writeJSON(agentGoalErrorPayload(msg, err))
+		return
+	}
+
+	manager.ensureGoalPlanningSession(goalSessionID, projectPath, provider, model, effort)
+	defer manager.removeGoalPlanningSession(goalSessionID)
 
 	// Safety net: a goal must never be left dangling. A blocking provider run or
 	// an unexpected panic still yields a typed error so the server settles it.
@@ -574,7 +589,12 @@ func handleAgentGoalPlan(msg map[string]interface{}, writeJSON func(interface{})
 
 	// Phase A — read-only exploration on the primary goal-plan session.
 	emitGoalPlanPhase(writeJSON, requestID, "exploring", 0)
-	if plan, ok := extractGoalPlan(runGoalPlanCLIPass(manager, goalSessionID, requestID, projectPath, provider, model, effort, goalPlanExplorePrompt(objective, constraints, nonGoals, projectPath), false, "", makeGoalPlanThinkingEmitter(writeJSON, requestID, "exploring", 0))); ok {
+	explore := runGoalPlanCLIPass(manager, goalSessionID, requestID, projectPath, provider, model, effort, goalPlanExplorePrompt(objective, constraints, nonGoals, projectPath), false, "", makeGoalPlanThinkingEmitter(writeJSON, requestID, "exploring", 0))
+	if explore.providerError != "" {
+		_ = writeJSON(agentGoalErrorPayload(msg, fmt.Errorf("planner_provider_error: %s", explore.providerError)))
+		return
+	}
+	if plan, ok := extractGoalPlan(explore.output); ok {
 		normalizeGoalPlanPaths(plan, projectPath)
 		finalizeGoalPlan(writeJSON, msg, requestID, before, projectPath, plan)
 		return
@@ -589,7 +609,14 @@ func handleAgentGoalPlan(msg map[string]interface{}, writeJSON func(interface{})
 	for attempt := 1; attempt <= goalPlanMaxEmitAttempts; attempt++ {
 		emitGoalPlanPhase(writeJSON, requestID, "emitting", attempt)
 		emitSession := fmt.Sprintf("goal-plan-emit-%d:%s", attempt, goalID)
-		if plan, ok := extractGoalPlan(runGoalPlanCLIPass(manager, emitSession, requestID, projectPath, provider, model, effort, emitPrompt, true, nativeSID, makeGoalPlanThinkingEmitter(writeJSON, requestID, "emitting", attempt))); ok {
+		manager.ensureGoalPlanningSession(emitSession, projectPath, provider, model, effort)
+		emit := runGoalPlanCLIPass(manager, emitSession, requestID, projectPath, provider, model, effort, emitPrompt, true, nativeSID, makeGoalPlanThinkingEmitter(writeJSON, requestID, "emitting", attempt))
+		manager.removeGoalPlanningSession(emitSession)
+		if emit.providerError != "" {
+			_ = writeJSON(agentGoalErrorPayload(msg, fmt.Errorf("planner_provider_error: %s", emit.providerError)))
+			return
+		}
+		if plan, ok := extractGoalPlan(emit.output); ok {
 			normalizeGoalPlanPaths(plan, projectPath)
 			finalizeGoalPlan(writeJSON, msg, requestID, before, projectPath, plan)
 			return
@@ -600,14 +627,44 @@ func handleAgentGoalPlan(msg map[string]interface{}, writeJSON func(interface{})
 	_ = writeJSON(agentGoalErrorPayload(msg, errors.New("planner_did_not_converge: provider did not emit valid ALIANG_GOAL_PLAN after exploration and bounded emission attempts")))
 }
 
+func preflightGoalPlannerProvider(provider, model, effort string) error {
+	normalized, err := normalizeAgentAIProvider(provider)
+	if err != nil {
+		return fmt.Errorf("planner_provider_invalid: %w", err)
+	}
+	if normalized == "auto" {
+		return errors.New("planner_provider_invalid: Goal planning requires an explicit AI provider")
+	}
+	if _, err := resolveGoalAgentAITool("planner preflight", normalized, model, effort, "", "goal-plan-preflight"); err != nil {
+		return fmt.Errorf("planner_provider_unavailable: %w", err)
+	}
+	if normalized == "claude" || normalized == "claudecode" {
+		baseURL, hasBaseURL := agentChildProcessEnvValue("ANTHROPIC_BASE_URL")
+		token, hasToken := agentChildProcessEnvValue("ANTHROPIC_AUTH_TOKEN")
+		if !hasBaseURL && !hasToken {
+			return errors.New("planner_provider_unconfigured: Claude provider has neither ANTHROPIC_BASE_URL nor ANTHROPIC_AUTH_TOKEN in the agent environment")
+		}
+		if strings.TrimSpace(baseURL) == "" && strings.TrimSpace(token) == "" {
+			return errors.New("planner_provider_unconfigured: Claude provider has empty ANTHROPIC_BASE_URL and ANTHROPIC_AUTH_TOKEN")
+		}
+	}
+	return nil
+}
+
 // runGoalPlanCLIPass runs one goal-planning CLI turn: read-only exploration when
 // emission is false, tool-locked emission when true. It returns the captured
 // provider text output. Emission turns resume the exploration session when the
 // native session id was pinned on the goal session.
-func runGoalPlanCLIPass(manager *agentAIManager, sessionID, messageID, projectPath, provider, model, effort, prompt string, emission bool, resumeSID string, emitThinking func(totalChars int, preview string)) string {
+type goalPlanCLIPassResult struct {
+	output        string
+	providerError string
+}
+
+func runGoalPlanCLIPass(manager *agentAIManager, sessionID, messageID, projectPath, provider, model, effort, prompt string, emission bool, resumeSID string, emitThinking func(totalChars int, preview string)) goalPlanCLIPassResult {
 	allowResume := emission && resumeSID != ""
 	var captureMu sync.Mutex
 	var output strings.Builder
+	var providerError string
 	var lastEmit time.Time
 	var emittedChars int
 	const goalPlanThinkingThrottle = 1200 * time.Millisecond
@@ -626,6 +683,15 @@ func runGoalPlanCLIPass(manager *agentAIManager, sessionID, messageID, projectPa
 				delta = delta[:remaining]
 			}
 			output.WriteString(delta)
+		}
+		if remoteString(payload, "type") == models.AgentEventAIError && providerError == "" {
+			providerError = strings.TrimSpace(remoteString(payload, "error"))
+			if detail := strings.TrimSpace(remoteString(payload, "detail")); detail != "" {
+				providerError = strings.TrimSpace(providerError + ": " + detail)
+			}
+			if len(providerError) > 2_000 {
+				providerError = providerError[:2_000]
+			}
 		}
 		// Throttled live-thinking push so the phone sees the planner reasoning
 		// (turns "stuck" into "visibly working"). One snapshot at most every
@@ -660,6 +726,7 @@ func runGoalPlanCLIPass(manager *agentAIManager, sessionID, messageID, projectPa
 		activity:        newAgentAIActivity(),
 		readOnly:        true,
 		emissionOnly:    emission,
+		plannerInternal: true,
 		resumeSessionID: resumeSID,
 	}, capture, allowResume)
 	// Final flush so the UI sees the last chunk written after the throttle window.
@@ -673,7 +740,7 @@ func runGoalPlanCLIPass(manager *agentAIManager, sessionID, messageID, projectPa
 	}
 	out := output.String()
 	captureMu.Unlock()
-	return out
+	return goalPlanCLIPassResult{output: out, providerError: providerError}
 }
 
 func extractGoalPlan(output string) (map[string]interface{}, bool) {
@@ -714,6 +781,7 @@ func goalCommandName(cmd string) string {
 //   - drops check paths that are absolute but OUTSIDE the project root (models
 //     sometimes point checks at their own ~/.claude cache or other system dirs);
 //   - drops any task that loses all its checks (server requires >=1 per task).
+//
 // A plan with zero surviving tasks is left empty, which extractGoalPlan then
 // rejects (-> did_not_converge) rather than sending an empty proposal.
 // Mutates the proposal in place.
@@ -786,6 +854,110 @@ func normalizeGoalPlanPaths(proposal map[string]interface{}, projectRoot string)
 	proposal["tasks"] = cleanedTasks
 }
 
+const goalContinueMarker = "ALIANG_GOAL_CONTINUE:"
+
+// handleAgentGoalContinue — Phase 2 rolling-planning assessor. Before the server
+// dispatches the next task it asks the provider (read-only, single pass) whether
+// to run_next / propose_complete / request_user. The server's routeContinueDecision
+// guards the response (propose_complete is ignored unless all tasks are done), so a
+// bad decision degrades to run_next rather than misrouting. Mirrors handleAgentGoalPlan
+// but simpler: one read-only pass, no two-phase convergence.
+func handleAgentGoalContinue(msg map[string]interface{}, writeJSON func(interface{}) error, manager *agentAIManager) {
+	requestID := strings.TrimSpace(remoteString(msg, "request_id"))
+	objective := strings.TrimSpace(remoteString(msg, "objective"))
+	if requestID == "" || objective == "" || manager == nil {
+		_ = writeJSON(agentGoalContinueErrorPayload(msg, errors.New("goal.continue missing request_id, objective, or AI runtime")))
+		return
+	}
+	projectPath, err := resolveAgentProjectPath(remoteString(msg, "project_path"))
+	if err != nil {
+		_ = writeJSON(agentGoalContinueErrorPayload(msg, err))
+		return
+	}
+	before, err := goalWorkspaceFingerprint(projectPath)
+	if err != nil {
+		_ = writeJSON(agentGoalContinueErrorPayload(msg, err))
+		return
+	}
+	provider := strings.TrimSpace(remoteString(msg, "provider"))
+	model := strings.TrimSpace(remoteString(msg, "model"))
+	effort := strings.TrimSpace(remoteString(msg, "effort"))
+	if err := preflightGoalPlannerProvider(provider, model, effort); err != nil {
+		_ = writeJSON(agentGoalContinueErrorPayload(msg, err))
+		return
+	}
+	runID := strings.TrimSpace(remoteString(msg, "run_id"))
+	continueSession := fmt.Sprintf("goal-continue:%s", runID)
+	manager.ensureGoalPlanningSession(continueSession, projectPath, provider, model, effort)
+	defer manager.removeGoalPlanningSession(continueSession)
+	constraints := remoteStringSlice(msg, "constraints")
+	nonGoals := remoteStringSlice(msg, "non_goals")
+	pass := runGoalPlanCLIPass(manager, continueSession, requestID, projectPath, provider, model, effort,
+		goalContinuePrompt(objective, constraints, nonGoals, projectPath, msg), true, "", makeGoalPlanThinkingEmitter(writeJSON, requestID, "continue", 0))
+	if pass.providerError != "" {
+		_ = writeJSON(agentGoalContinueErrorPayload(msg, fmt.Errorf("continue_provider_error: %s", pass.providerError)))
+		return
+	}
+	decision, ok := parseMarkedJSONObject(pass.output, goalContinueMarker)
+	if !ok {
+		_ = writeJSON(agentGoalContinueErrorPayload(msg, errors.New("continue_did_not_emit: provider did not emit "+goalContinueMarker)))
+		return
+	}
+	after, afterErr := goalWorkspaceFingerprint(projectPath)
+	afterStr := ""
+	if afterErr == nil {
+		afterStr = after
+	}
+	// Flatten the decision fields into the top-level result so the server's
+	// decisionSchema (which parses the whole payload) sees next_action etc.
+	result := map[string]interface{}{
+		"type":                         models.AgentEventGoalContinueResult,
+		"request_id":                   requestID,
+		"workspace_fingerprint_before": before,
+		"workspace_fingerprint_after":  afterStr,
+	}
+	for k, v := range decision {
+		result[k] = v
+	}
+	_ = writeJSON(result)
+}
+
+func agentGoalContinueErrorPayload(msg map[string]interface{}, err error) map[string]interface{} {
+	message := "Goal continue request failed"
+	if err != nil {
+		message = err.Error()
+	}
+	return map[string]interface{}{
+		"type":       models.AgentEventGoalContinueError,
+		"request_id": remoteString(msg, "request_id"),
+		"error":      message,
+	}
+}
+
+func goalContinuePrompt(objective string, constraints, nonGoals []string, projectPath string, msg map[string]interface{}) string {
+	completed := fmt.Sprintf("%v", msg["completed_tasks"])
+	total := fmt.Sprintf("%v", msg["total_tasks"])
+	currentTaskTitle := "the next queued task"
+	if ct, ok := msg["current_task"].(map[string]interface{}); ok {
+		if t, ok := ct["title"].(string); ok && strings.TrimSpace(t) != "" {
+			currentTaskTitle = strings.TrimSpace(t)
+		}
+	}
+	return fmt.Sprintf(`You are the goal-continuation assessor for an autonomous software goal. A task is about to be dispatched. Decide the single best next action. Do NOT call any tool — this is a read-only judgment from the context provided.
+Your only output must be a single line beginning %s followed by compact single-line JSON shaped as:
+{"schema_version":1,"next_action":"run_next|propose_complete|request_user","rationale":string,"magnitude":"minor|major"}
+Objective: %s
+User constraints (authoritative): %s
+Non-goals (authoritative): %s
+Workspace root: %s
+Progress: %s of %s tasks completed. Current task about to run: %s.
+Decision rules:
+- next_action="run_next" = the plan is still correct; dispatch the current task. Choose this when in doubt.
+- next_action="propose_complete" = the goal's outcome is already met by the completed work; skip remaining tasks and ask the user to sign off. Only when every remaining task is genuinely unnecessary.
+- next_action="request_user" = a human decision is needed first (ambiguity, conflict with constraints/non-goals, or blocked).
+Emit the decision now. No prose before or after the %s line.`, goalContinueMarker, objective, goalPromptList(constraints), goalPromptList(nonGoals), projectPath, completed, total, currentTaskTitle, goalContinueMarker)
+}
+
 func finalizeGoalPlan(writeJSON func(interface{}) error, msg map[string]interface{}, requestID, before, projectPath string, proposal map[string]interface{}) {
 	after, err := goalWorkspaceFingerprint(projectPath)
 	if err != nil {
@@ -825,10 +997,10 @@ func emitGoalPlanPhase(writeJSON func(interface{}) error, requestID, phase strin
 func makeGoalPlanThinkingEmitter(writeJSON func(interface{}) error, requestID, phase string, attempt int) func(totalChars int, preview string) {
 	return func(totalChars int, preview string) {
 		payload := map[string]interface{}{
-			"type":                   models.AgentEventAIRunProgress,
-			"message_id":             requestID,
-			"goal_plan_phase":        phase,
-			"goal_plan_thinking_chars": totalChars,
+			"type":                       models.AgentEventAIRunProgress,
+			"message_id":                 requestID,
+			"goal_plan_phase":            phase,
+			"goal_plan_thinking_chars":   totalChars,
 			"goal_plan_thinking_preview": preview,
 		}
 		if attempt > 0 {
@@ -881,6 +1053,48 @@ func (m *agentAIManager) resumeSessionIDFor(sessionID string) string {
 		return ""
 	}
 	return strings.TrimSpace(session.resumeSessionID)
+}
+
+func (m *agentAIManager) ensureGoalPlanningSession(sessionID, projectPath, provider, model, effort string) {
+	if m == nil || strings.TrimSpace(sessionID) == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if existing := m.sessions[sessionID]; existing != nil {
+		existing.projectPath = projectPath
+		existing.provider = provider
+		existing.model = model
+		existing.effort = effort
+		existing.lastActiveAt = time.Now().UTC()
+		return
+	}
+	m.registerAISessionLocked(&agentAISession{
+		id:           sessionID,
+		mode:         "agent",
+		projectPath:  projectPath,
+		provider:     provider,
+		model:        model,
+		effort:       effort,
+		lastActiveAt: time.Now().UTC(),
+	})
+}
+
+func (m *agentAIManager) removeGoalPlanningSession(sessionID string) {
+	if m == nil || strings.TrimSpace(sessionID) == "" {
+		return
+	}
+	m.mu.Lock()
+	delete(m.sessions, sessionID)
+	_, hadBinding := m.bindings[sessionID]
+	delete(m.bindings, sessionID)
+	m.mu.Unlock()
+	if hadBinding {
+		// Older planner runs persisted a normal conversation binding before
+		// plannerInternal was introduced. Remove that stale record so a retry
+		// cannot collide with the native session it represents.
+		_ = m.persistIdentityState()
+	}
 }
 
 func withGoalPlanningReadOnly(tool *agentAITool) *agentAITool {
