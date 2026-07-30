@@ -1031,12 +1031,13 @@ End with exactly one line beginning %s followed by compact single-line JSON shap
 func goalPlanEmitPrompt(objective string, constraints, nonGoals []string, projectPath string) string {
 	return fmt.Sprintf(`You have finished exploring the workspace. Do NOT call any tool and do NOT explore further.
 Your only output must be a single line beginning %s followed by compact single-line JSON shaped as:
-{"schema_version":1,"objective":string,"constraints":[string],"non_goals":[string],"tasks":[{"key":string,"title":string,"description":string,"depends_on":[string],"allowed_roots":[%q],"allowed_commands":[string],"checks":[{"key":string,"type":"command|file_exists|file_contains","command":string,"path":string,"contains":string,"required":true,"timeout_ms":number}],"retry_safety":"safe|idempotent_with_key|unsafe","idempotency_key_template":"required when retry_safety is idempotent_with_key"}],"budget":{"max_attempts_per_task":number,"max_turns":number,"command_timeout_ms":number}}
+{"schema_version":1,"objective":string,"constraints":[string],"non_goals":[string],"tasks":[{"key":string,"title":string,"description":string,"depends_on":[string],"allowed_roots":[%q],"allowed_commands":[string],"checks":[{"key":string,"type":"command|file_exists|file_contains","command":string,"path":string,"contains":string,"required":true,"timeout_ms":number,"criterion_key":string}],"retry_safety":"safe|idempotent_with_key|unsafe","idempotency_key_template":"required when retry_safety is idempotent_with_key"}],"criteria":[{"key":string,"statement":string,"kind":"functional|regression|integration|device|delivery","verification":"auto|manual|unverifiable","required":boolean}],"budget":{"max_attempts_per_task":number,"max_turns":number,"command_timeout_ms":number}}
 Objective: %s
 User constraints (authoritative): %s
 Non-goals (authoritative): %s
 Workspace root: %s
 Hard constraints (server rejects violations): commands (allowed_commands AND check commands) first word MUST be one of git, npm, npx, pnpm, yarn, node, tsc, vitest, jest, go, cargo, rustc, python, python3, pytest, make, cmake, gradle, mvn, dotnet, swift only — no ls/cat/grep/find/curl/sh/etc. file_exists/file_contains paths MUST be absolute paths INSIDE the workspace root above — never relative (src/foo.ts), never outside it (~/.claude/, /etc/, /tmp/, or any path not beginning with that root).
+Acceptance criteria (2-5): define what "done" means for this goal. Each criterion is a single statement the user will verify at sign-off. For verification="auto", set criterion_key on the check that proves it. For verification="manual", no check is needed (the user signs off directly).
 Emit the plan now. No prose before or after the %s line.`, goalPlanMarker, projectPath, objective, goalPromptList(constraints), goalPromptList(nonGoals), projectPath, goalPlanMarker)
 }
 
