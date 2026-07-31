@@ -79,3 +79,6 @@ release/*
 # CodeGraph 本地索引（生成物，不入库）
 .codegraph/
 .cgmcp/
+
+# git worktrees（superpowers 隔离工作树）
+.worktrees/
