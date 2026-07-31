@@ -976,6 +976,33 @@ func goalContinuePrompt(objective string, constraints, nonGoals []string, projec
 			currentTaskTitle = strings.TrimSpace(t)
 		}
 	}
+	// P1-4: post-verify drift evaluation. The server sends post_verify=true after
+	// a task verifies (assessPostVerify). v1 ignored the flag + the prompt enum
+	// lacked propose_branch, so the agent could never emit it — the
+	// goal_continue_v1 propose_branch half was a fake capability. Branch the
+	// prompt: post-verify frames a drift check + allows propose_branch; the
+	// pre-dispatch path stays the existing run_next/propose_complete/request_user.
+	postVerify, _ := msg["post_verify"].(bool)
+	verifiedTaskTitle := "the just-verified task"
+	if vt, ok := msg["verified_task"].(map[string]interface{}); ok {
+		if t, ok := vt["title"].(string); ok && strings.TrimSpace(t) != "" {
+			verifiedTaskTitle = strings.TrimSpace(t)
+		}
+	}
+	if postVerify {
+		return fmt.Sprintf(`You are the post-verification drift assessor for an autonomous software goal. The task "%s" just completed AND passed its machine checks. Decide whether the goal is still on track. Do NOT call any tool — this is a read-only judgment from the context provided.
+Your only output must be a single line beginning %s followed by compact single-line JSON shaped as:
+{"schema_version":1,"next_action":"run_next|propose_branch","rationale":string,"magnitude":"minor|major"}
+Objective: %s
+User constraints (authoritative): %s
+Non-goals (authoritative): %s
+Workspace root: %s
+Progress: %s of %s tasks completed. Just verified: %s.
+Decision rules:
+- next_action="run_next" = the goal is still on track; continue dispatching the next task. Choose this when in doubt.
+- next_action="propose_branch" = goal drift detected: the completed work revealed a wrong assumption, an unknown decision, or that the remaining plan is materially wrong — the user should open a fork to re-plan from a branch point. Use only for MATERIAL drift (magnitude major), not minor adjustments.
+Emit the decision now. No prose before or after the %s line.`, verifiedTaskTitle, goalContinueMarker, objective, goalPromptList(constraints), goalPromptList(nonGoals), projectPath, completed, total, verifiedTaskTitle, goalContinueMarker)
+	}
 	return fmt.Sprintf(`You are the goal-continuation assessor for an autonomous software goal. A task is about to be dispatched. Decide the single best next action. Do NOT call any tool — this is a read-only judgment from the context provided.
 Your only output must be a single line beginning %s followed by compact single-line JSON shaped as:
 {"schema_version":1,"next_action":"run_next|propose_complete|request_user","rationale":string,"magnitude":"minor|major"}
