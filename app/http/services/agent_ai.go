@@ -1099,16 +1099,18 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 	if messageID == "" {
 		messageID = sessionID
 	}
+	// #5: a fork (re-planning exploration) session runs READ-ONLY so the AI can't
+	// mutate the workspace during exploration. Read the flag from the payload
+	// here (the session object is resolved only later); the atomic run.start path
+	// carries is_goal_fork, and lazy-create persists it for subsequent turns.
+	messageIsGoalFork, _ := msg["is_goal_fork"].(bool)
 	messageRun := agentAIRun{
 		sessionID:    sessionID,
 		runID:        remoteString(msg, "run_id"),
 		messageID:    messageID,
 		goalIdentity: goalRunIdentityFromMessage(msg),
 		nativeGoal:   cloneAgentAIMap(mapIf(msg["native_goal"])),
-		// #5: a fork (re-planning exploration) session runs READ-ONLY so the AI
-		// can't mutate the workspace during exploration. Provider-level
-		// enforcement (same mechanism the goal planner uses), not just a prompt.
-		readOnly: session != nil && session.isGoalFork,
+		readOnly:     messageIsGoalFork,
 	}
 	emitter := m.runEmitter(messageRun, writeJSON)
 	runWrite := agentTerminalWriter(emitter.emit)
