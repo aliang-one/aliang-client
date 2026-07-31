@@ -21,8 +21,10 @@ import (
 )
 
 const (
-	goalPlannerTimeout      = 2 * time.Minute
-	goalEvidenceOutputLimit = 16 * 1024
+	goalPlannerExploreTimeout = 7 * time.Minute
+	goalPlannerEmitTimeout    = 50 * time.Second
+	goalContinueTimeout       = 50 * time.Second
+	goalEvidenceOutputLimit   = 16 * 1024
 	// goalPlanOutputLimit caps how much of the provider's planning stream we
 	// capture (to then extract the trailing ALIANG_GOAL_PLAN marker). Deep-effort
 	// turns (e.g. glm-5.2[1m] @ xhigh) can emit 500KB-1MB+ of reasoning before the
@@ -221,6 +223,7 @@ func (e *agentAIRunEmitter) attachGoalReport(payload map[string]interface{}) {
 
 	// provider 未守格式：从输出推断 outcome/summary（fallback）。
 	report := inferGoalReportFromOutput(capturedOutput, remoteString(payload, "type"))
+	report["output"] = truncateGoalReportOutput(capturedOutput)
 	payload["goal_report"] = report
 }
 
@@ -589,14 +592,18 @@ func handleAgentGoalPlan(msg map[string]interface{}, writeJSON func(interface{})
 
 	// Phase A — read-only exploration on the primary goal-plan session.
 	emitGoalPlanPhase(writeJSON, requestID, "exploring", 0)
-	explore := runGoalPlanCLIPass(manager, goalSessionID, requestID, projectPath, provider, model, effort, goalPlanExplorePrompt(objective, constraints, nonGoals, projectPath), false, "", makeGoalPlanThinkingEmitter(writeJSON, requestID, "exploring", 0))
-	if explore.providerError != "" {
-		_ = writeJSON(agentGoalErrorPayload(msg, fmt.Errorf("planner_provider_error: %s", explore.providerError)))
-		return
-	}
+	explore := runGoalPlanCLIPass(manager, goalSessionID, requestID, projectPath, provider, model, effort, goalPlanExplorePrompt(objective, constraints, nonGoals, projectPath), false, "", goalPlannerExploreTimeout, makeGoalPlanThinkingEmitter(writeJSON, requestID, "exploring", 0))
 	if plan, ok := extractGoalPlan(explore.output); ok {
 		normalizeGoalPlanPaths(plan, projectPath)
 		finalizeGoalPlan(writeJSON, msg, requestID, before, projectPath, plan)
+		return
+	}
+	// The exploration deadline is a phase boundary, not a terminal provider
+	// failure. Claude may spend the entire read-only pass inspecting the repo;
+	// the bounded emission pass below resumes that native session and forces the
+	// structured result. Explicit provider errors remain terminal.
+	if providerError := explore.terminalProviderError(); providerError != "" {
+		_ = writeJSON(agentGoalErrorPayload(msg, fmt.Errorf("planner_provider_error: %s", providerError)))
 		return
 	}
 	nativeSID := manager.resumeSessionIDFor(goalSessionID)
@@ -610,15 +617,15 @@ func handleAgentGoalPlan(msg map[string]interface{}, writeJSON func(interface{})
 		emitGoalPlanPhase(writeJSON, requestID, "emitting", attempt)
 		emitSession := fmt.Sprintf("goal-plan-emit-%d:%s", attempt, goalID)
 		manager.ensureGoalPlanningSession(emitSession, projectPath, provider, model, effort)
-		emit := runGoalPlanCLIPass(manager, emitSession, requestID, projectPath, provider, model, effort, emitPrompt, true, nativeSID, makeGoalPlanThinkingEmitter(writeJSON, requestID, "emitting", attempt))
+		emit := runGoalPlanCLIPass(manager, emitSession, requestID, projectPath, provider, model, effort, emitPrompt, true, nativeSID, goalPlannerEmitTimeout, makeGoalPlanThinkingEmitter(writeJSON, requestID, "emitting", attempt))
 		manager.removeGoalPlanningSession(emitSession)
-		if emit.providerError != "" {
-			_ = writeJSON(agentGoalErrorPayload(msg, fmt.Errorf("planner_provider_error: %s", emit.providerError)))
-			return
-		}
 		if plan, ok := extractGoalPlan(emit.output); ok {
 			normalizeGoalPlanPaths(plan, projectPath)
 			finalizeGoalPlan(writeJSON, msg, requestID, before, projectPath, plan)
+			return
+		}
+		if providerError := emit.terminalProviderError(); providerError != "" {
+			_ = writeJSON(agentGoalErrorPayload(msg, fmt.Errorf("planner_provider_error: %s", providerError)))
 			return
 		}
 	}
@@ -658,9 +665,17 @@ func preflightGoalPlannerProvider(provider, model, effort string) error {
 type goalPlanCLIPassResult struct {
 	output        string
 	providerError string
+	timedOut      bool
 }
 
-func runGoalPlanCLIPass(manager *agentAIManager, sessionID, messageID, projectPath, provider, model, effort, prompt string, emission bool, resumeSID string, emitThinking func(totalChars int, preview string)) goalPlanCLIPassResult {
+func (result goalPlanCLIPassResult) terminalProviderError() string {
+	if result.timedOut {
+		return ""
+	}
+	return strings.TrimSpace(result.providerError)
+}
+
+func runGoalPlanCLIPass(manager *agentAIManager, sessionID, messageID, projectPath, provider, model, effort, prompt string, emission bool, resumeSID string, timeout time.Duration, emitThinking func(totalChars int, preview string)) goalPlanCLIPassResult {
 	allowResume := emission && resumeSID != ""
 	var captureMu sync.Mutex
 	var output strings.Builder
@@ -711,7 +726,7 @@ func runGoalPlanCLIPass(manager *agentAIManager, sessionID, messageID, projectPa
 		}
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), goalPlannerTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	manager.runCLIPass(ctx, agentAIRun{
 		sessionID:       sessionID,
@@ -729,6 +744,7 @@ func runGoalPlanCLIPass(manager *agentAIManager, sessionID, messageID, projectPa
 		plannerInternal: true,
 		resumeSessionID: resumeSID,
 	}, capture, allowResume)
+	ctxErr := ctx.Err()
 	// Final flush so the UI sees the last chunk written after the throttle window.
 	captureMu.Lock()
 	if emitThinking != nil && output.Len() > emittedChars {
@@ -740,7 +756,24 @@ func runGoalPlanCLIPass(manager *agentAIManager, sessionID, messageID, projectPa
 	}
 	out := output.String()
 	captureMu.Unlock()
-	return goalPlanCLIPassResult{output: out, providerError: providerError}
+	return goalPlanCLIPassResult{
+		output:        out,
+		providerError: goalPlanPassProviderError(providerError, ctxErr, timeout),
+		timedOut:      strings.TrimSpace(providerError) == "" && errors.Is(ctxErr, context.DeadlineExceeded),
+	}
+}
+
+func goalPlanPassProviderError(providerError string, ctxErr error, timeout time.Duration) string {
+	if providerError = strings.TrimSpace(providerError); providerError != "" {
+		return providerError
+	}
+	if errors.Is(ctxErr, context.DeadlineExceeded) {
+		return fmt.Sprintf("planner_timeout: provider exceeded %s", timeout)
+	}
+	if ctxErr != nil {
+		return "planner_cancelled: " + ctxErr.Error()
+	}
+	return ""
 }
 
 func extractGoalPlan(output string) (map[string]interface{}, bool) {
@@ -893,7 +926,7 @@ func handleAgentGoalContinue(msg map[string]interface{}, writeJSON func(interfac
 	constraints := remoteStringSlice(msg, "constraints")
 	nonGoals := remoteStringSlice(msg, "non_goals")
 	pass := runGoalPlanCLIPass(manager, continueSession, requestID, projectPath, provider, model, effort,
-		goalContinuePrompt(objective, constraints, nonGoals, projectPath, msg), true, "", makeGoalPlanThinkingEmitter(writeJSON, requestID, "continue", 0))
+		goalContinuePrompt(objective, constraints, nonGoals, projectPath, msg), true, "", goalContinueTimeout, makeGoalPlanThinkingEmitter(writeJSON, requestID, "continue", 0))
 	if pass.providerError != "" {
 		_ = writeJSON(agentGoalContinueErrorPayload(msg, fmt.Errorf("continue_provider_error: %s", pass.providerError)))
 		return

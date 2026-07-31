@@ -12,6 +12,7 @@ import (
 	"time"
 
 	M "aliang.one/nursorgate/inbound/tun/metadata"
+	auth "aliang.one/nursorgate/processor/auth"
 	"aliang.one/nursorgate/processor/tcp"
 )
 
@@ -169,6 +170,92 @@ func TestExtractMetadataFromHTTP_RejectsExplicitNonLoopbackHost(t *testing.T) {
 	_, err := extractMetadataFromHTTP(req, conn)
 	if err == nil {
 		t.Fatal("expected explicit non-loopback host to be rejected")
+	}
+}
+
+func TestRawHTTPConnectionRejectedWithoutActiveSession(t *testing.T) {
+	auth.ResetSessionAuthorityForTest()
+	t.Cleanup(func() { auth.ResetSessionAuthorityForTest() })
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+	done := make(chan struct{})
+	go func() {
+		handleRawConnection(serverConn)
+		close(done)
+	}()
+
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := io.WriteString(clientConn, "GET / HTTP/1.1\r\nHost: 127.0.0.1:56432\r\n\r\n")
+		writeDone <- err
+	}()
+	response, err := stdhttp.ReadResponse(bufio.NewReader(clientConn), nil)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	_, _ = io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if response.StatusCode != stdhttp.StatusServiceUnavailable {
+		t.Fatalf("status=%d, want 503", response.StatusCode)
+	}
+	if err := <-writeDone; err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	<-done
+}
+
+type blockingTCPHandler struct {
+	entered chan struct{}
+	done    chan struct{}
+}
+
+func (h *blockingTCPHandler) Handle(_ context.Context, conn net.Conn, _ *M.Metadata) error {
+	close(h.entered)
+	defer close(h.done)
+	var buf [1]byte
+	_, err := conn.Read(buf[:])
+	return err
+}
+
+func TestActiveCONNECTClosedWhenSessionDemotes(t *testing.T) {
+	authority := auth.ResetSessionAuthorityForTest()
+	authority.NotifyLoggedIn(&auth.UserInfo{ID: 1})
+	t.Cleanup(func() { auth.ResetSessionAuthorityForTest() })
+	tcp.ResetHandler()
+	t.Cleanup(tcp.ResetHandler)
+	handler := &blockingTCPHandler{entered: make(chan struct{}), done: make(chan struct{})}
+	tcp.SetHandler(handler)
+
+	serverConn, clientConn := net.Pipe()
+	defer clientConn.Close()
+	go handleRawConnection(serverConn)
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := io.WriteString(clientConn, "CONNECT 127.0.0.1:443 HTTP/1.1\r\nHost: 127.0.0.1:443\r\n\r\n")
+		writeDone <- err
+	}()
+	response, err := stdhttp.ReadResponse(bufio.NewReader(clientConn), &stdhttp.Request{Method: stdhttp.MethodConnect})
+	if err != nil {
+		t.Fatalf("read CONNECT response: %v", err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != stdhttp.StatusOK {
+		t.Fatalf("status=%d, want 200", response.StatusCode)
+	}
+	if err := <-writeDone; err != nil {
+		t.Fatalf("write CONNECT: %v", err)
+	}
+	<-handler.entered
+	authority.NotifyLoggedOut()
+
+	select {
+	case <-handler.done:
+	case <-time.After(time.Second):
+		t.Fatal("CONNECT handler remained active after logout")
+	}
+	_ = clientConn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	if _, err := clientConn.Read(make([]byte, 1)); err == nil {
+		t.Fatal("CONNECT client remained open after logout")
 	}
 }
 

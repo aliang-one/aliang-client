@@ -10,6 +10,7 @@ import (
 	httpServer "aliang.one/nursorgate/inbound/http"
 	tunDevice "aliang.one/nursorgate/inbound/tun/device/tun"
 	"aliang.one/nursorgate/inbound/tun/engine"
+	auth "aliang.one/nursorgate/processor/auth"
 	"aliang.one/nursorgate/processor/config"
 	"go.uber.org/automaxprocs/maxprocs"
 )
@@ -71,17 +72,38 @@ func Start() {
 
 	signal.Notify(TunSignal, syscall.SIGINT, syscall.SIGTERM)
 	<-TunSignal
+	signal.Stop(TunSignal)
 
 	// 收到信号后调用 Stop
 	stopTun()
 }
 
+// PrepareStart advances the TUN lifecycle before RunService marks the new run
+// active. A stop left by a failed previous startup cannot leak into this run;
+// any stop emitted after preparation belongs to the new lifecycle.
+func PrepareStart() {
+	for {
+		select {
+		case <-TunSignal:
+			continue
+		default:
+			return
+		}
+	}
+}
+
 // startWithRollback 执行启动步骤并追踪状态
 func startWithRollback(state *StartupState) error {
+	if err := requireActiveSessionForTUNStart(); err != nil {
+		return err
+	}
 	// Step 1: 添加设备状态监控
 	UpdateStartupProgress("starting", "monitoring_device", 10, "Starting TUN device monitoring.", "", false)
 	startTunDeviceMonitor(defaultConfig.Device)
 	state.monitorStarted = true
+	if err := requireActiveSessionForTUNStart(); err != nil {
+		return err
+	}
 
 	// Step 2: 插入配置并启动 engine
 	UpdateStartupProgress("starting", "creating_tun", 25, "Creating the virtual TUN adapter.", "", false)
@@ -91,6 +113,9 @@ func startWithRollback(state *StartupState) error {
 		return fmt.Errorf("engine 启动失败: %w", err)
 	}
 	state.engineStarted = true
+	if err := requireActiveSessionForTUNStart(); err != nil {
+		return err
+	}
 
 	// NOTE: Rule engine initialization has been MOVED to cmd/start.go:InitializeGlobalRuleEngine()
 	// This ensures the singleton rule engine is initialized only ONCE at startup
@@ -105,6 +130,9 @@ func startWithRollback(state *StartupState) error {
 		return fmt.Errorf("获取默认网关失败: %w", err)
 	}
 	defaultGateway = _dfgw
+	if err := requireActiveSessionForTUNStart(); err != nil {
+		return err
+	}
 
 	// Step 4: 配置 TUN 接口
 	UpdateStartupProgress("starting", "configuring_interface", 60, "Configuring the virtual adapter interface.", "", false)
@@ -113,12 +141,18 @@ func startWithRollback(state *StartupState) error {
 		return fmt.Errorf("配置 TUN 接口失败: %w", err)
 	}
 	state.interfaceConfigured = true
+	if err := requireActiveSessionForTUNStart(); err != nil {
+		return err
+	}
 
 	// Step 5: 等待设备就绪（最多等待 10 秒）
 	UpdateStartupProgress("starting", "waiting_device_ready", 78, "Waiting for the virtual adapter to become ready.", "", false)
 	if err := waitForTunDeviceReady(defaultConfig.Device, 10*time.Second); err != nil {
 		AppendStartupError(fmt.Sprintf("等待 TUN 设备就绪失败: %v", err))
 		return fmt.Errorf("等待 TUN 设备就绪失败: %w", err)
+	}
+	if err := requireActiveSessionForTUNStart(); err != nil {
+		return err
 	}
 
 	// Step 6: 配置路由（最关键的步骤）
@@ -128,6 +162,9 @@ func startWithRollback(state *StartupState) error {
 		return fmt.Errorf("配置 TUN 路由失败: %w", err)
 	}
 	state.routesConfigured = true
+	if err := requireActiveSessionForTUNStart(); err != nil {
+		return err
+	}
 
 	// Step 7: 启动 HTTP 代理 (56432端口)
 	UpdateStartupProgress("starting", "starting_proxy", 95, "Starting HTTP proxy on port 56432.", "", false)
@@ -136,6 +173,13 @@ func startWithRollback(state *StartupState) error {
 		return fmt.Errorf("启动 HTTP 代理失败: %w", err)
 	}
 
+	return nil
+}
+
+func requireActiveSessionForTUNStart() error {
+	if !auth.GetSessionAuthority().CanProxy() {
+		return fmt.Errorf("TUN startup cancelled: %w", auth.ErrProxyAdmissionDenied)
+	}
 	return nil
 }
 
@@ -188,7 +232,10 @@ func rollbackStartup(state *StartupState) {
 }
 
 func Stop() {
-	TunSignal <- syscall.SIGTERM // 或其他自定义信号
+	select {
+	case TunSignal <- syscall.SIGTERM:
+	default:
+	}
 }
 
 // initializeRuleEngineForTUN has been REMOVED - replaced by cmd/start.go:InitializeGlobalRuleEngine()

@@ -1,7 +1,7 @@
 import { createApp } from 'vue';
 import App from './App.vue';
 import '../assets/styles.css';
-import { restoreAuthSession, connectSessionEvents } from './stores/auth';
+import { initializeAuthSession } from './stores/auth';
 import { initializeTheme } from './composables/useTheme';
 
 function bootstrap() {
@@ -11,10 +11,10 @@ function bootstrap() {
   // /api/auth/session was slow or hung — App.vue now renders its own loading
   // state until the auth store flips isReady.
   createApp(App).mount('#app');
-  void restoreAuthSession();
-  // Subscribe to identity-transition SSE so login/expiry/recovery reflect
-  // instantly (coexists with the restoreAuthSession fetch above and the 5s poll).
-  connectSessionEvents();
+  // Establish the loopback management session before SSE/GET reconciliation.
+  // The app remains mounted while slow or unavailable backends are represented
+  // as connectivity state rather than a false logout.
+  void initializeAuthSession();
 }
 
 bootstrap();

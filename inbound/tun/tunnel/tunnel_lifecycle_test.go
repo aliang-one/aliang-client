@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	auth "aliang.one/nursorgate/processor/auth"
 	"github.com/sagernet/gvisor/pkg/tcpip/stack"
 )
 
@@ -62,5 +63,21 @@ func TestNewBoundsTCPConcurrency(t *testing.T) {
 	}
 	if tcpMaxConcurrentConn > 512 {
 		t.Fatalf("tcp concurrency limit = %d, want at most 512", tcpMaxConcurrentConn)
+	}
+}
+
+func TestHandleTCPRejectsConnectionWithoutActiveSession(t *testing.T) {
+	auth.ResetSessionAuthorityForTest()
+	t.Cleanup(func() { auth.ResetSessionAuthorityForTest() })
+	tunnel := New(nil, nil)
+	conn := &lifecycleTCPConn{}
+
+	tunnel.HandleTCP(conn)
+
+	if conn.closes() != 1 {
+		t.Fatalf("rejected TUN TCP close count=%d, want 1", conn.closes())
+	}
+	if tunnel.activeTCPConn.Load() != 0 {
+		t.Fatalf("active TUN TCP=%d, want 0", tunnel.activeTCPConn.Load())
 	}
 }

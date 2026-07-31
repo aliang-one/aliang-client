@@ -260,9 +260,11 @@ func TestAuthSessionAndUserCenterLifecycleIntegration(t *testing.T) {
 	t.Setenv("ALIANG_CACHE_DIR", baseDir)
 
 	auth.ResetAuthPersistenceForTest()
+	authority := auth.ResetSessionAuthorityForTest()
 	config.ResetGlobalConfigForTest()
 	t.Cleanup(func() {
 		auth.ResetAuthPersistenceForTest()
+		auth.ResetSessionAuthorityForTest()
 		config.ResetGlobalConfigForTest()
 	})
 
@@ -271,9 +273,21 @@ func TestAuthSessionAndUserCenterLifecycleIntegration(t *testing.T) {
 	h := NewHandlers()
 	mux := http.NewServeMux()
 	RegisterRoutes(h, mux)
+	bootstrapReq := httptest.NewRequest(http.MethodPost, "/api/dashboard/session", nil)
+	bootstrapReq.RemoteAddr = "127.0.0.1:39999"
+	bootstrapRec := httptest.NewRecorder()
+	mux.ServeHTTP(bootstrapRec, bootstrapReq)
+	if bootstrapRec.Code != http.StatusOK {
+		t.Fatalf("dashboard session bootstrap status=%d body=%s", bootstrapRec.Code, bootstrapRec.Body.String())
+	}
+	dashboardCookies := bootstrapRec.Result().Cookies()
+	if len(dashboardCookies) != 1 {
+		t.Fatalf("dashboard session bootstrap cookies=%#v", dashboardCookies)
+	}
 
 	sessionReq := httptest.NewRequest(http.MethodGet, "/api/auth/session", nil)
 	sessionReq.RemoteAddr = "127.0.0.1:40000"
+	sessionReq.AddCookie(dashboardCookies[0])
 	sessionRec := httptest.NewRecorder()
 	mux.ServeHTTP(sessionRec, sessionReq)
 	if sessionRec.Code != http.StatusOK {
@@ -285,9 +299,10 @@ func TestAuthSessionAndUserCenterLifecycleIntegration(t *testing.T) {
 		t.Fatalf("decode auth session response failed: %v", err)
 	}
 	sessionData, _ := sessionResp["data"].(map[string]interface{})
-	if sessionData["status"] != "no_session" {
-		t.Fatalf("expected no_session status, got %#v", sessionData["status"])
+	if sessionData["state"] != "restoring" || sessionData["outcome"] != "session_recovering" {
+		t.Fatalf("expected restoring snapshot, got %#v", sessionData)
 	}
+	initialRevision := sessionData["revision"]
 
 	profileReq := httptest.NewRequest(http.MethodGet, "/api/user-center/profile", nil)
 	profileRec := httptest.NewRecorder()
@@ -320,6 +335,7 @@ func TestAuthSessionAndUserCenterLifecycleIntegration(t *testing.T) {
 
 	secondSessionReq := httptest.NewRequest(http.MethodGet, "/api/auth/session", nil)
 	secondSessionReq.RemoteAddr = "127.0.0.1:40001"
+	secondSessionReq.AddCookie(dashboardCookies[0])
 	secondSessionRec := httptest.NewRecorder()
 	mux.ServeHTTP(secondSessionRec, secondSessionReq)
 	if secondSessionRec.Code != http.StatusOK {
@@ -331,12 +347,31 @@ func TestAuthSessionAndUserCenterLifecycleIntegration(t *testing.T) {
 		t.Fatalf("decode auth session restore response failed: %v", err)
 	}
 	secondSessionData, _ := secondSessionResp["data"].(map[string]interface{})
-	if secondSessionData["status"] != "success" {
-		t.Fatalf("expected success status for restored session, got %#v", secondSessionData["status"])
+	if secondSessionData["state"] != "restoring" || secondSessionData["revision"] != initialRevision {
+		t.Fatalf("pure session read mutated or restored authority: %#v", secondSessionData)
 	}
-	restoredPayload, _ := secondSessionData["data"].(map[string]interface{})
-	if restoredPayload["username"] != "restored-user" {
-		t.Fatalf("expected restored username=restored-user, got %#v", restoredPayload["username"])
+	if _, ok := secondSessionData["user"]; ok {
+		t.Fatalf("restoring snapshot exposed persisted user before coordinator commit: %#v", secondSessionData)
+	}
+
+	// Session restoration is owned by the boot coordinator, not by GET.
+	authority.NotifyLoggedIn(userInfo)
+	activeSessionReq := httptest.NewRequest(http.MethodGet, "/api/auth/session", nil)
+	activeSessionReq.RemoteAddr = "127.0.0.1:40002"
+	activeSessionReq.AddCookie(dashboardCookies[0])
+	activeSessionRec := httptest.NewRecorder()
+	mux.ServeHTTP(activeSessionRec, activeSessionReq)
+	if activeSessionRec.Code != http.StatusOK {
+		t.Fatalf("active auth session status=%d body=%s", activeSessionRec.Code, activeSessionRec.Body.String())
+	}
+	var activeSessionResp map[string]interface{}
+	if err := json.Unmarshal(activeSessionRec.Body.Bytes(), &activeSessionResp); err != nil {
+		t.Fatalf("decode active auth session response failed: %v", err)
+	}
+	activeSessionData, _ := activeSessionResp["data"].(map[string]interface{})
+	activeUser, _ := activeSessionData["user"].(map[string]interface{})
+	if activeSessionData["state"] != "active" || activeUser["username"] != "restored-user" {
+		t.Fatalf("expected coordinator-committed active snapshot, got %#v", activeSessionData)
 	}
 
 	meReq := httptest.NewRequest(http.MethodGet, "/api/auth/me", nil)

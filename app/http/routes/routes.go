@@ -134,6 +134,7 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 
 	// Authentication routes (/api/auth/*)
 	register("/api/auth/login", h.Auth.HandleLogin, http.MethodPost)
+	register("/api/dashboard/session", h.Auth.HandleDashboardSessionBootstrap, http.MethodPost)
 	register("/api/auth/session", h.Auth.HandleRestoreSession, http.MethodGet)
 	register("/api/auth/refresh", h.Auth.HandleRefreshSession, http.MethodPost)
 	register("/api/auth/me", h.Auth.HandleMe, http.MethodGet)

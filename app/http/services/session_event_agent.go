@@ -16,16 +16,24 @@ import (
 //
 //   - active                       -> reconnect (ensure WS up; idempotent)
 //   - hard_invalid (any reason)    -> disable  (drop JWT context + WS)
-//   - soft_expired / unauthenticated -> none (recovery / idle handled elsewhere)
+//   - unauthenticated + logout     -> disable  (explicit local session end)
+//   - soft_expired / other unauthenticated -> none (recovery / idle handled elsewhere)
 func sessionEventAgentAction(to, reason string) string {
-	switch strings.ToLower(strings.TrimSpace(to)) {
+	normalizedState := strings.ToLower(strings.TrimSpace(to))
+	normalizedReason := strings.ToLower(strings.TrimSpace(reason))
+	switch normalizedState {
 	case "active":
 		return "reconnect"
 	case "hard_invalid":
 		return "disable"
+	case "unauthenticated":
+		if normalizedReason == string(auth.ReasonLogout) {
+			return "disable"
+		}
 	default:
 		return "none"
 	}
+	return "none"
 }
 
 // ApplySessionEvent applies a forwarded session transition to the local
@@ -77,5 +85,5 @@ func ForwardSessionEventToUserAgent(e auth.SessionEvent) {
 func init() {
 	// Cross-process fan-out: every dashboard authority transition is forwarded
 	// to the user-agent subprocess so its connection lifecycle follows identity.
-	auth.GetSessionAuthority().Subscribe(ForwardSessionEventToUserAgent)
+	auth.SubscribeGlobal(ForwardSessionEventToUserAgent)
 }

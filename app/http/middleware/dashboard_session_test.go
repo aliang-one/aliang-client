@@ -8,7 +8,7 @@ import (
 	auth "aliang.one/nursorgate/processor/auth"
 )
 
-func TestDashboardSessionRequiresIssuedCookieAndRevokesOnHardInvalid(t *testing.T) {
+func TestDashboardSessionIsIndependentFromUpstreamAuthState(t *testing.T) {
 	authority := auth.ResetSessionAuthorityForTest()
 	auth.SetCurrentUserInfo(&auth.UserInfo{ID: 7, Username: "liang", AccessToken: "access", TokenType: "Bearer"})
 	authority.NotifyLoggedIn(auth.GetCurrentUserInfo())
@@ -43,8 +43,54 @@ func TestDashboardSessionRequiresIssuedCookieAndRevokesOnHardInvalid(t *testing.
 	}
 
 	authority.NotifyRefreshFailed(true, auth.ReasonRefreshInvalid)
-	if ValidateDashboardSession(request) {
-		t.Fatal("hard-invalid session retained dashboard authorization")
+	if !ValidateDashboardSession(request) {
+		t.Fatal("hard-invalid upstream session discarded local management authorization")
+	}
+}
+
+func TestIssueDashboardSessionAllowsLoopbackWhileRestoring(t *testing.T) {
+	auth.ResetSessionAuthorityForTest()
+	ResetDashboardSessionForTest()
+	t.Cleanup(ResetDashboardSessionForTest)
+
+	request := httptest.NewRequest(http.MethodPost, "/api/dashboard/session", nil)
+	request.RemoteAddr = "127.0.0.1:40000"
+	recorder := httptest.NewRecorder()
+	if err := IssueDashboardSession(recorder, request); err != nil {
+		t.Fatalf("loopback bootstrap while restoring: %v", err)
+	}
+	request.AddCookie(recorder.Result().Cookies()[0])
+	if !ValidateDashboardSession(request) {
+		t.Fatal("restoring dashboard bootstrap cookie was rejected")
+	}
+}
+
+func TestDashboardSessionsFromTwoClientsRemainValid(t *testing.T) {
+	auth.ResetSessionAuthorityForTest()
+	ResetDashboardSessionForTest()
+	t.Cleanup(ResetDashboardSessionForTest)
+
+	first := httptest.NewRequest(http.MethodPost, "/api/dashboard/session", nil)
+	first.RemoteAddr = "127.0.0.1:40001"
+	firstRecorder := httptest.NewRecorder()
+	if err := IssueDashboardSession(firstRecorder, first); err != nil {
+		t.Fatalf("issue first dashboard session: %v", err)
+	}
+	first.AddCookie(firstRecorder.Result().Cookies()[0])
+
+	second := httptest.NewRequest(http.MethodPost, "/api/dashboard/session", nil)
+	second.RemoteAddr = "127.0.0.1:40002"
+	secondRecorder := httptest.NewRecorder()
+	if err := IssueDashboardSession(secondRecorder, second); err != nil {
+		t.Fatalf("issue second dashboard session: %v", err)
+	}
+	second.AddCookie(secondRecorder.Result().Cookies()[0])
+
+	if !ValidateDashboardSession(first) {
+		t.Fatal("issuing a second client session revoked the first client")
+	}
+	if !ValidateDashboardSession(second) {
+		t.Fatal("second client dashboard session was rejected")
 	}
 }
 

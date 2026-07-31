@@ -205,6 +205,15 @@ func agentChildProcessEnv() []string {
 	return mergeEnvOverriding(base, overrides)
 }
 
+func agentChildProcessEnvValue(key string) (string, bool) {
+	for _, entry := range agentChildProcessEnv() {
+		if index := strings.IndexByte(entry, '='); index >= 0 && entry[:index] == key {
+			return entry[index+1:], true
+		}
+	}
+	return "", false
+}
+
 type agentAISession struct {
 	id          string
 	mode        string
@@ -225,6 +234,8 @@ type agentAISession struct {
 	approvalToken           string
 	activity                *agentAIActivity
 	runSeq                  int
+	activeRunID             string
+	goalIdentity            map[string]interface{}
 	// lastActiveAt drives LRU eviction (evictOldestIdleAISessionLocked): the
 	// non-running session with the oldest stamp is dropped when a new session
 	// would exceed agentAISessionResidentCap. Stamped on create and bumped on
@@ -303,6 +314,11 @@ type agentAIRun struct {
 	goalIdentity  map[string]interface{}
 	nativeGoal    map[string]interface{}
 	readOnly      bool
+	// plannerInternal marks the short-lived read-only/emission passes used by
+	// Goal planning. They may intentionally resume a native provider session
+	// across synthetic internal conversation IDs, so they must not participate
+	// in the persistent one-native-session-per-conversation binding registry.
+	plannerInternal bool
 	// emissionOnly forces a follow-up planning turn that may not use any tools,
 	// so the provider can only emit the structured ALIANG_GOAL_PLAN text. Used by
 	// the goal planner's convergence loop after the read-only exploration turn.
@@ -384,6 +400,9 @@ func (e *agentAIRunEmitter) emit(value interface{}) error {
 	}
 	if payload["type"] == models.AgentEventAIDelta {
 		e.appendGoalOutput(remoteString(payload, "delta"))
+	}
+	if payload["type"] == models.AgentEventAIError {
+		e.appendGoalOutput(remoteString(payload, "error"))
 	}
 	terminal := agentAIRunEventTerminal(payload)
 	if terminal {
@@ -1103,6 +1122,16 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 		"received_at": time.Now().UTC().Format(time.RFC3339Nano),
 	})
 
+	if err := m.preemptForGoalRun(
+		sessionID,
+		messageRun.runID,
+		messageRun.goalIdentity,
+		10*time.Second,
+	); err != nil {
+		_ = runWrite(agentAIErrorPayload(sessionID, messageID, err))
+		return
+	}
+
 	m.mu.Lock()
 	session := m.sessions[sessionID]
 	m.mu.Unlock()
@@ -1796,6 +1825,8 @@ func (m *agentAIManager) runUserMessage(session *agentAISession, runID, messageI
 	session.approvalToken = approvalToken
 	session.activity = activity
 	session.runSeq++
+	session.activeRunID = runID
+	session.goalIdentity = cloneGoalIdentity(emitter.goalIdentity)
 	resumeSessionID := strings.TrimSpace(session.resumeSessionID)
 	reservedNativeSessionID := strings.TrimSpace(session.reservedNativeSessionID)
 	logger.Info(fmt.Sprintf("ai.run: session=%s runSeq=%d resumeSessionID=%q (empty=fresh claude run this turn; non-empty=--resume)", session.id, session.runSeq, resumeSessionID))
@@ -2062,8 +2093,20 @@ func (m *agentAIManager) stop(msg map[string]interface{}, writeJSON agentTermina
 		})
 		return
 	}
+	requestedRunID := strings.TrimSpace(remoteString(msg, "run_id"))
+	if requestedRunID != "" && session.activeRunID != "" && requestedRunID != session.activeRunID {
+		activeRunID := session.activeRunID
+		m.mu.Unlock()
+		logger.Info(fmt.Sprintf("ai.stop: ignored stale run session=%s requested=%s active=%s", sessionID, requestedRunID, activeRunID))
+		return
+	}
 	cancel := session.cancel
 	runWrite := session.activeWriter
+	cancelledApprovals := m.clearPendingApprovalsLocked(
+		sessionID,
+		session.runSeq,
+		models.AgentAIApprovalDecisionCancel,
+	)
 	m.mu.Unlock()
 	if runWrite == nil {
 		runWrite = writeJSON
@@ -2071,11 +2114,68 @@ func (m *agentAIManager) stop(msg map[string]interface{}, writeJSON agentTermina
 	if cancel != nil {
 		cancel()
 	}
+	m.emitApprovalCancelled(runWrite, sessionID, cancelledApprovals, "run_cancelled")
 	_ = runWrite(map[string]interface{}{
 		"type":       models.AgentEventAIStatus,
 		"session_id": sessionID,
 		"status":     "stopping",
 	})
+}
+
+// preemptForGoalRun makes a newer server-authoritative Goal run replace a
+// locally-stuck run in the same conversation. Ordinary chat messages retain the
+// existing single-run guard. The run_id fence prevents a redelivered copy of the
+// same Goal run from cancelling itself.
+func (m *agentAIManager) preemptForGoalRun(
+	sessionID string,
+	incomingRunID string,
+	goalIdentity map[string]interface{},
+	timeout time.Duration,
+) error {
+	if len(goalIdentity) == 0 || strings.TrimSpace(incomingRunID) == "" {
+		return nil
+	}
+
+	m.mu.Lock()
+	session := m.sessions[sessionID]
+	if session == nil || session.cancel == nil {
+		m.mu.Unlock()
+		return nil
+	}
+	if session.activeRunID == incomingRunID {
+		m.mu.Unlock()
+		return fmt.Errorf("ai session is already running: %s", sessionID)
+	}
+	cancel := session.cancel
+	runWrite := session.activeWriter
+	cancelledApprovals := m.clearPendingApprovalsLocked(
+		sessionID,
+		session.runSeq,
+		models.AgentAIApprovalDecisionCancel,
+	)
+	m.mu.Unlock()
+
+	cancel()
+	m.emitApprovalCancelled(runWrite, sessionID, cancelledApprovals, "goal_run_preempted")
+
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		m.mu.Lock()
+		current := m.sessions[sessionID]
+		idle := current == nil || current.cancel == nil
+		m.mu.Unlock()
+		if idle {
+			return nil
+		}
+		select {
+		case <-deadline.C:
+			return fmt.Errorf("goal run preemption timed out: %s", sessionID)
+		case <-ticker.C:
+		}
+	}
 }
 
 func (m *agentAIManager) approval(msg map[string]interface{}, writeJSON agentTerminalWriter) {
@@ -2384,11 +2484,17 @@ func (m *agentAIManager) requestApproval(ctx context.Context, run agentAIRun, wr
 	}
 	m.mu.Unlock()
 
-	logger.Info(fmt.Sprintf("approval-hook: requestApproval SENDING ai.approval.request to cloud session=%s approval_id=%s kind=%s — awaiting user decision (≤%s)", run.sessionID, req.ID, req.Kind, agentAIApprovalTimeout))
-	_ = writeJSON(agentAIApprovalRequestPayload(req))
-
 	run.activity.setAwaitingApproval(true)
 	defer run.activity.setAwaitingApproval(false)
+	logger.Info(fmt.Sprintf("approval-hook: requestApproval SENDING ai.approval.request to cloud session=%s approval_id=%s kind=%s — awaiting user decision (≤%s)", run.sessionID, req.ID, req.Kind, agentAIApprovalTimeout))
+	if err := writeAgentAIApprovalRequest(ctx, writeJSON, agentAIApprovalRequestPayload(req), 5, time.Second); err != nil {
+		m.mu.Lock()
+		if waiter := m.approvals[approvalKey]; waiter != nil && waiter.sessionID == run.sessionID && waiter.runSeq == run.runSeq {
+			delete(m.approvals, approvalKey)
+		}
+		m.mu.Unlock()
+		return agentAIApprovalResponse{}, fmt.Errorf("send approval request: %w", err)
+	}
 
 	select {
 	case response := <-req.respond:
@@ -2421,6 +2527,38 @@ func (m *agentAIManager) requestApproval(ctx context.Context, run agentAIRun, wr
 		}
 		return agentAIApprovalResponse{}, ctx.Err()
 	}
+}
+
+func writeAgentAIApprovalRequest(
+	ctx context.Context,
+	writeJSON agentTerminalWriter,
+	payload map[string]interface{},
+	maxAttempts int,
+	retryDelay time.Duration,
+) error {
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if err := writeJSON(payload); err == nil {
+			return nil
+		} else {
+			lastErr = err
+			logger.Warn(fmt.Sprintf("approval-hook: request send failed attempt=%d/%d error=%v", attempt, maxAttempts, err))
+		}
+		if attempt == maxAttempts {
+			break
+		}
+		timer := time.NewTimer(retryDelay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return lastErr
 }
 
 func (m *agentAIManager) handleClaudeApprovalHook(ctx context.Context, sessionID string, messageID string, token string, raw map[string]interface{}) (map[string]interface{}, error) {
@@ -2464,6 +2602,7 @@ func (m *agentAIManager) handleClaudeApprovalHook(ctx context.Context, sessionID
 		cancel:        session.cancel,
 		approvalToken: session.approvalToken,
 		activity:      session.activity,
+		goalIdentity:  cloneGoalIdentity(session.goalIdentity),
 	}
 	writeJSON := session.activeWriter
 	m.mu.Unlock()
@@ -2481,7 +2620,7 @@ func (m *agentAIManager) handleClaudeApprovalHook(ctx context.Context, sessionID
 	// without a cloud round-trip — goal runs must NOT stall on manual approval
 	// requests that the phone may not surface in time. Only block commands the
 	// policy explicitly flags as dangerous (decisionAutoDeny).
-	if strings.HasPrefix(sessionID, "goal_") {
+	if len(run.goalIdentity) > 0 {
 		if svc := m.approvalService(); svc != nil {
 			if decision, _ := svc.evaluateApprovalDecision(toolName, toolInput, run.projectPath); decision == decisionAutoDeny {
 				logger.Info(fmt.Sprintf("approval-hook: AUTO-DENY (dangerous, goal run) tool=%s session=%s", toolName, sessionID))
@@ -2705,6 +2844,8 @@ func (m *agentAIManager) clearRunning(sessionID string, runSeq int, writeJSON ag
 		session.approvalToken = ""
 		session.activity = nil
 		session.codexSteer = nil
+		session.activeRunID = ""
+		session.goalIdentity = nil
 		session.history = trimAgentAIHistory(session.history)
 	}
 	cancelled := m.clearPendingApprovalsLocked(sessionID, runSeq, models.AgentAIApprovalDecisionCancel)
@@ -4479,6 +4620,13 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 	var bindingOnce sync.Once
 	var bindingErr error
 	onNativeSessionID := func(nativeSessionID string) {
+		if run.plannerInternal {
+			// Planner passes are ephemeral and may use a synthetic conversation ID
+			// for each bounded emission attempt while resuming the same provider
+			// session. Keep the captured ID for resume, but do not bind it as a
+			// normal user conversation.
+			return
+		}
 		bindingOnce.Do(func() {
 			record, err := m.confirmBinding(
 				run.sessionID,
@@ -6224,7 +6372,7 @@ func withoutCLIArgumentValue(args []string, flag string) []string {
 func normalizeAgentAIModel(model string) string {
 	model = strings.TrimSpace(model)
 	switch strings.ToLower(model) {
-	case "", "auto", "codex", "claude", "claudecode", "opencode", "open-code", "open_code":
+	case "", "auto", "codex", "claude", "claude code", "claudecode", "opencode", "open-code", "open_code", "provider default", "default":
 		return ""
 	default:
 		return model

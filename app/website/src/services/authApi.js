@@ -1,23 +1,43 @@
+function objectValue(value) {
+  return value && typeof value === 'object' ? value : {};
+}
+
 function extractEnvelope(json) {
-  const payload = json && typeof json === 'object' ? json : {};
-  const data = payload?.data && typeof payload.data === 'object' ? payload.data : {};
+  const root = objectValue(json);
+  const payload = objectValue(root.data);
   return {
-    code: typeof payload.code === 'number' ? payload.code : 0,
-    msg: typeof payload.msg === 'string' ? payload.msg : '',
-    status: typeof data.status === 'string' ? data.status : '',
-    error: typeof data.error === 'string' ? data.error : '',
-    message: typeof data.msg === 'string' ? data.msg : '',
-    data: data?.data && typeof data.data === 'object' ? data.data : null
+    code: typeof root.code === 'number' ? root.code : 0,
+    msg: typeof root.msg === 'string' ? root.msg : '',
+    status: typeof payload.status === 'string' ? payload.status : '',
+    error: typeof payload.error === 'string' ? payload.error : '',
+    message: typeof payload.msg === 'string' ? payload.msg : '',
+    data: payload.data && typeof payload.data === 'object' ? payload.data : null,
+    payload
   };
 }
 
+export class AuthRequestError extends Error {
+  constructor(message, { type = 'server_error', status = 0, code = '' } = {}) {
+    super(message);
+    this.name = 'AuthRequestError';
+    this.type = type;
+    this.status = status;
+    this.code = code;
+  }
+}
+
+function classifyStructuredError(envelope) {
+  const code = String(envelope.error || envelope.payload?.outcome || '').trim().toLowerCase();
+  if (code === 'session_recovering') return 'session_recovering';
+  if (code === 'session_invalid' || code === 'session_expired' || code === 'token_expired') {
+    return 'session_invalid';
+  }
+  return 'server_error';
+}
+
 async function request(path, options = {}, timeoutMs) {
-  // Optional client-side timeout so a request can never hang forever when the
-  // backend is slow or unreachable. Aborts the fetch after timeoutMs and throws
-  // a clear error the caller can treat as a failure.
   const controller = new AbortController();
   const timer = timeoutMs ? setTimeout(() => controller.abort(), timeoutMs) : null;
-
   let response;
   try {
     response = await fetch(path, {
@@ -30,73 +50,60 @@ async function request(path, options = {}, timeoutMs) {
       signal: controller.signal
     });
   } catch (error) {
-    if (error && error.name === 'AbortError') {
-      throw new Error(`Request to ${path} timed out after ${timeoutMs}ms`);
-    }
-    throw error;
+    const message = error?.name === 'AbortError'
+      ? `Request to ${path} timed out after ${timeoutMs}ms`
+      : (error instanceof Error ? error.message : 'Backend transport unavailable');
+    throw new AuthRequestError(message, { type: 'transport_unavailable' });
   } finally {
-    if (timer) {
-      clearTimeout(timer);
-    }
+    if (timer) clearTimeout(timer);
   }
 
-  const json = await response.json().catch(() => ({}));
-  const envelope = extractEnvelope(json);
-
+  const envelope = extractEnvelope(await response.json().catch(() => ({})));
   if (!response.ok || envelope.code !== 0) {
-    throw new Error(envelope.message || envelope.msg || `Request failed with HTTP ${response.status}`);
+    throw new AuthRequestError(
+      envelope.message || envelope.msg || `Request failed with HTTP ${response.status}`,
+      {
+        type: classifyStructuredError(envelope),
+        status: response.status,
+        code: envelope.error
+      }
+    );
   }
-
   return envelope;
+}
+
+export async function bootstrapDashboardSession() {
+  return request('/api/dashboard/session', { method: 'POST', body: JSON.stringify({}) }, 5000);
 }
 
 export async function login({ email, password }) {
   return request('/api/auth/login', {
     method: 'POST',
-    body: JSON.stringify({
-      email,
-      password
-    })
+    body: JSON.stringify({ email, password })
   });
 }
 
 export async function restoreSession() {
-  // Bounded timeout: this runs on first paint, so a hung backend must not leave
-  // the UI stuck restoring. On timeout the auth store falls back to the
-  // unauthenticated view and /api/startup/status polling corrects it.
-  return request('/api/auth/session', { method: 'GET' }, 5000);
+  const envelope = await request('/api/auth/session', { method: 'GET' }, 5000);
+  return envelope.payload;
 }
 
 export async function logout() {
-  return request('/api/auth/logout', {
-    method: 'POST',
-    body: JSON.stringify({})
-  });
+  return request('/api/auth/logout', { method: 'POST', body: JSON.stringify({}) });
 }
 
-// 扫码登录：初始化，换取 device_code + 二维码内容(qr_payload)。
 export async function scanInit() {
-  return request('/api/auth/scan/init', {
-    method: 'POST',
-    body: JSON.stringify({})
-  });
+  return request('/api/auth/scan/init', { method: 'POST', body: JSON.stringify({}) });
 }
 
-// 扫码登录：authorized 时两个 token 字段都是本地 session 凭证。
 export async function scanStatus(deviceCode) {
   const query = new URLSearchParams({ device_code: deviceCode }).toString();
-  return request(`/api/auth/scan/status?${query}`, {
-    method: 'GET'
-  });
+  return request(`/api/auth/scan/status?${query}`, { method: 'GET' });
 }
 
-// 扫码登录：用本地 session 兼容字段完成激活，返回与密码登录同构的用户信息。
 export async function activateScanLogin({ sessionToken, refreshToken }) {
   return request('/api/auth/scan/activate', {
     method: 'POST',
-    body: JSON.stringify({
-      session_token: sessionToken,
-      refresh_token: refreshToken
-    })
+    body: JSON.stringify({ session_token: sessionToken, refresh_token: refreshToken })
   });
 }

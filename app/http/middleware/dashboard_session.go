@@ -2,7 +2,7 @@ package middleware
 
 import (
 	"crypto/rand"
-	"crypto/subtle"
+	"crypto/sha256"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -19,28 +19,22 @@ import (
 const (
 	DashboardSessionCookieName = "aliang_dashboard_session"
 	dashboardSessionTTL        = 24 * time.Hour
+	dashboardSessionMaxActive  = 64
 )
-
-type dashboardSession struct {
-	token       string
-	identity    string
-	expiresAt   time.Time
-	authority   *auth.SessionAuthority
-	initialized bool
-}
 
 var dashboardSessionState struct {
 	sync.Mutex
-	dashboardSession
+	sessions map[[sha256.Size]byte]time.Time
 }
 
-// IssueDashboardSession rotates the browser credential after a successful
-// login or local session restore. Only one dashboard browser session is active
-// at a time, which keeps revocation deterministic for this desktop service.
+// IssueDashboardSession rotates the request-bound local management credential.
+// Loopback may bootstrap it before upstream authentication; a remote browser
+// may only receive it after a successful upstream login.
 func IssueDashboardSession(w http.ResponseWriter, r *http.Request) error {
-	identity, ok := dashboardIdentity(false)
-	if !ok {
-		return errors.New("cannot issue dashboard session without an active user session")
+	if !isLoopbackRequest(r) {
+		if auth.GetSessionAuthority().State() != auth.StateActive {
+			return errors.New("cannot issue remote dashboard session without an active user session")
+		}
 	}
 
 	raw := make([]byte, 32)
@@ -48,17 +42,16 @@ func IssueDashboardSession(w http.ResponseWriter, r *http.Request) error {
 		return fmt.Errorf("generate dashboard session: %w", err)
 	}
 	token := base64.RawURLEncoding.EncodeToString(raw)
-	authority := auth.GetSessionAuthority()
-	ensureDashboardSessionSubscription(authority)
-
+	now := time.Now()
 	dashboardSessionState.Lock()
-	dashboardSessionState.dashboardSession = dashboardSession{
-		token:       token,
-		identity:    identity,
-		expiresAt:   time.Now().Add(dashboardSessionTTL),
-		authority:   authority,
-		initialized: true,
+	if dashboardSessionState.sessions == nil {
+		dashboardSessionState.sessions = make(map[[sha256.Size]byte]time.Time)
 	}
+	pruneDashboardSessionsLocked(now)
+	for len(dashboardSessionState.sessions) >= dashboardSessionMaxActive {
+		evictOldestDashboardSessionLocked()
+	}
+	dashboardSessionState.sessions[sha256.Sum256([]byte(token))] = now.Add(dashboardSessionTTL)
 	dashboardSessionState.Unlock()
 
 	http.SetCookie(w, &http.Cookie{
@@ -73,8 +66,9 @@ func IssueDashboardSession(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-// RevokeDashboardSession clears both the server-side credential and browser
-// cookie. SessionAuthority hard-invalid transitions also clear server state.
+// RevokeDashboardSession explicitly clears the local management credential.
+// Upstream logout does not call this: the local dashboard must remain able to
+// observe the Unauthenticated snapshot and initiate a new login.
 func RevokeDashboardSession(w http.ResponseWriter) {
 	clearDashboardSession()
 	if w == nil {
@@ -106,22 +100,19 @@ func ValidateDashboardSession(r *http.Request) bool {
 	if err != nil || strings.TrimSpace(cookie.Value) == "" {
 		return false
 	}
-	identity, ok := dashboardIdentity(true)
+	key := sha256.Sum256([]byte(strings.TrimSpace(cookie.Value)))
+	now := time.Now()
+	dashboardSessionState.Lock()
+	expiresAt, ok := dashboardSessionState.sessions[key]
+	if ok && !now.Before(expiresAt) {
+		delete(dashboardSessionState.sessions, key)
+		ok = false
+	}
+	dashboardSessionState.Unlock()
 	if !ok {
 		return false
 	}
-	authority := auth.GetSessionAuthority()
-	ensureDashboardSessionSubscription(authority)
-
-	dashboardSessionState.Lock()
-	session := dashboardSessionState.dashboardSession
-	dashboardSessionState.Unlock()
-	if !session.initialized || session.authority != authority || time.Now().After(session.expiresAt) || session.identity != identity {
-		return false
-	}
-	provided := []byte(cookie.Value)
-	expected := []byte(session.token)
-	return len(provided) == len(expected) && subtle.ConstantTimeCompare(provided, expected) == 1
+	return true
 }
 
 // CanBootstrapDashboardSession allows persisted-session restoration only from
@@ -130,6 +121,10 @@ func CanBootstrapDashboardSession(r *http.Request) bool {
 	if ValidateDashboardSession(r) {
 		return true
 	}
+	return isLoopbackRequest(r)
+}
+
+func isLoopbackRequest(r *http.Request) bool {
 	if r == nil {
 		return false
 	}
@@ -141,47 +136,36 @@ func CanBootstrapDashboardSession(r *http.Request) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-func dashboardIdentity(allowSoftExpired bool) (string, bool) {
-	state := auth.GetSessionAuthority().State()
-	if state != auth.StateActive && !(allowSoftExpired && state == auth.StateSoftExpired) {
-		return "", false
-	}
-	current := auth.GetCurrentUserInfoOrLoad()
-	if current == nil {
-		return "", false
-	}
-	return fmt.Sprintf("%d\x00%s\x00%s", current.ID, current.Username, current.Email), true
-}
-
-func ensureDashboardSessionSubscription(authority *auth.SessionAuthority) {
-	if authority == nil {
-		return
-	}
-	dashboardSessionState.Lock()
-	alreadySubscribed := dashboardSessionState.authority == authority
-	if !alreadySubscribed {
-		dashboardSessionState.authority = authority
-	}
-	dashboardSessionState.Unlock()
-	if alreadySubscribed {
-		return
-	}
-	authority.Subscribe(func(event auth.SessionEvent) {
-		if event.To == auth.StateHardInvalid || event.To == auth.StateUnauthenticated {
-			clearDashboardSession()
-		}
-	})
-}
-
 func clearDashboardSession() {
 	dashboardSessionState.Lock()
-	authority := dashboardSessionState.authority
-	dashboardSessionState.dashboardSession = dashboardSession{authority: authority}
+	dashboardSessionState.sessions = nil
 	dashboardSessionState.Unlock()
+}
+
+func pruneDashboardSessionsLocked(now time.Time) {
+	for key, expiresAt := range dashboardSessionState.sessions {
+		if !now.Before(expiresAt) {
+			delete(dashboardSessionState.sessions, key)
+		}
+	}
+}
+
+func evictOldestDashboardSessionLocked() {
+	var oldestKey [sha256.Size]byte
+	var oldestExpiry time.Time
+	found := false
+	for key, expiresAt := range dashboardSessionState.sessions {
+		if !found || expiresAt.Before(oldestExpiry) {
+			oldestKey = key
+			oldestExpiry = expiresAt
+			found = true
+		}
+	}
+	if found {
+		delete(dashboardSessionState.sessions, oldestKey)
+	}
 }
 
 func ResetDashboardSessionForTest() {
-	dashboardSessionState.Lock()
-	dashboardSessionState.dashboardSession = dashboardSession{}
-	dashboardSessionState.Unlock()
+	clearDashboardSession()
 }

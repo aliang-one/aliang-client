@@ -2,6 +2,7 @@ package services
 
 import (
 	"fmt"
+	"sync"
 
 	"aliang.one/nursorgate/common/desktop"
 	"aliang.one/nursorgate/common/logger"
@@ -10,7 +11,7 @@ import (
 )
 
 func init() {
-	auth.GetSessionAuthority().Subscribe(onSessionEvent)
+	auth.SubscribeGlobal(onSessionEvent)
 	auth.SetAuthSuccessHandler(handleAuthRefreshed)
 }
 
@@ -19,6 +20,7 @@ var (
 	// for tests. Defaults to auth.StartSoftExpiryRecovery.
 	softExpiryRecoveryStarter = auth.StartSoftExpiryRecovery
 	userAgentDisableRequester = RequestUserAgentDisableForSessionEnd
+	authRuntimeMu             sync.Mutex
 	// proxyPausedForSoftExpiry records that WE paused the ingress proxy on
 	// entering SoftExpired, so →Active resumes only what we paused (not a proxy
 	// the user never started).
@@ -36,9 +38,16 @@ var (
 //     uses the same teardown without the "认证已过期" desktop notification.
 func onSessionEvent(e auth.SessionEvent) {
 	switch e.To {
+	case auth.StateRestoring:
+		startupState := runtime.GetStartupState()
+		startupState.SetFetchSuccess(false)
+		startupState.SetStatus(runtime.CONFIGURING)
+		GetSharedRunService().StopIngressIfActive()
 	case auth.StateSoftExpired:
 		if GetSharedRunService().StopIngressIfActive() {
+			authRuntimeMu.Lock()
 			proxyPausedForSoftExpiry = true
+			authRuntimeMu.Unlock()
 			logger.Warn("SoftExpired: ingress proxy paused while access token is recovered")
 		}
 		softExpiryRecoveryStarter()
@@ -46,18 +55,28 @@ func onSessionEvent(e auth.SessionEvent) {
 		startupState := runtime.GetStartupState()
 		startupState.SetFetchSuccess(true)
 		startupState.SetStatus(runtime.READY)
-		if proxyPausedForSoftExpiry {
-			proxyPausedForSoftExpiry = false
+		authRuntimeMu.Lock()
+		shouldResume := proxyPausedForSoftExpiry
+		proxyPausedForSoftExpiry = false
+		authRuntimeMu.Unlock()
+		if shouldResume {
 			logger.Info("session recovered: resuming ingress proxy")
 			GetSharedRunService().StartService()
 		}
 	case auth.StateHardInvalid:
+		authRuntimeMu.Lock()
 		proxyPausedForSoftExpiry = false
+		authRuntimeMu.Unlock()
 		if e.Reason == auth.ReasonLogout {
 			handleLoggedOut()
 			return
 		}
 		handleAuthExpired(e.Reason)
+	case auth.StateUnauthenticated:
+		authRuntimeMu.Lock()
+		proxyPausedForSoftExpiry = false
+		authRuntimeMu.Unlock()
+		handleLoggedOut()
 	}
 }
 
@@ -65,8 +84,11 @@ func handleLoggedOut() {
 	startupState := runtime.GetStartupState()
 	startupState.SetFetchSuccess(false)
 	startupState.SetStatus(runtime.UNCONFIGURED)
-	if GetSharedRunService().StopIngressIfActive() {
-		logger.Info("User logout stopped the active ingress proxy")
+	mode, stopped := GetSharedRunService().StopIngressForLogout()
+	if stopped {
+		logger.Info(fmt.Sprintf("User logout stopped %s ingress", mode))
+	} else {
+		logger.Debug(fmt.Sprintf("User logout found no active %s ingress", mode))
 	}
 }
 
@@ -104,9 +126,17 @@ func handleAuthRefreshed() {
 	// freshly issued access token to the user-agent process; SyncNow installs it
 	// in process-local memory, updates the live PhoneServer session, and reconnects
 	// when needed. The agent never reads or rotates the persisted refresh token.
+	snapshot := auth.GetSessionAuthority().Snapshot()
+	generation := snapshot.Generation
 	go func() {
+		if !auth.GetSessionAuthority().GenerationActive(generation) {
+			return
+		}
 		if err := SyncUserAgentAfterAuthWithRetry("session_refreshed"); err != nil {
 			logger.Warn(fmt.Sprintf("Failed to forward refreshed session to user agent: %v", err))
+		}
+		if !auth.GetSessionAuthority().GenerationActive(generation) {
+			RequestUserAgentDisableForSessionEnd("stale_auth_sync")
 		}
 	}()
 }

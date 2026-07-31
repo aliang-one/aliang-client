@@ -4,6 +4,7 @@ import (
 	"net/http"
 
 	"aliang.one/nursorgate/app/http/common"
+	"aliang.one/nursorgate/app/http/services"
 	authuser "aliang.one/nursorgate/processor/auth"
 	"aliang.one/nursorgate/processor/runtime"
 )
@@ -27,12 +28,13 @@ func (h *StartupHandler) HandleStartupStatus(w http.ResponseWriter, r *http.Requ
 	startupState := runtime.GetStartupState()
 	status := startupState.GetStatus()
 	fetchSuccess := startupState.GetFetchSuccess()
-	userInfo := authuser.GetCurrentUserInfoOrLoad()
+	sessionSnapshot := authuser.GetSessionAuthority().Snapshot()
+	userInfo := sessionSnapshot.User
 	status, fetchSuccess, userInfo = effectiveStartupAuthSnapshot(
 		status,
 		fetchSuccess,
 		userInfo,
-		authuser.GetSessionAuthority().State(),
+		sessionSnapshot.State,
 	)
 
 	// Build response data
@@ -40,6 +42,7 @@ func (h *StartupHandler) HandleStartupStatus(w http.ResponseWriter, r *http.Requ
 		"status":        string(status),
 		"fetch_success": fetchSuccess,
 		"timestamp":     startupState.GetTimestamp().Unix(),
+		"session":       services.BuildSessionSnapshotPayload(sessionSnapshot),
 	}
 
 	// Add user info if available
@@ -63,13 +66,16 @@ func (h *StartupHandler) HandleStartupStatus(w http.ResponseWriter, r *http.Requ
 }
 
 func effectiveStartupAuthSnapshot(status runtime.StartupStatus, fetchSuccess bool, userInfo *authuser.UserInfo, sessionState authuser.SessionState) (runtime.StartupStatus, bool, *authuser.UserInfo) {
-	if sessionState != authuser.StateHardInvalid && sessionState != authuser.StateUnauthenticated {
-		return status, fetchSuccess, userInfo
+	switch sessionState {
+	case authuser.StateActive:
+		return status, true, userInfo
+	case authuser.StateRestoring:
+		return runtime.CONFIGURING, false, nil
+	case authuser.StateSoftExpired:
+		return runtime.CONFIGURING, false, userInfo
+	default:
+		return runtime.UNCONFIGURED, false, nil
 	}
-	// Do not resurrect a persisted profile after the authority has declared the
-	// session dead. The frontend polls this endpoint as a recovery backstop when
-	// an SSE transition is delayed or unavailable.
-	return runtime.UNCONFIGURED, false, nil
 }
 
 // HandleStartupDetail handles GET /api/startup/detail
@@ -83,7 +89,8 @@ func (h *StartupHandler) HandleStartupDetail(w http.ResponseWriter, r *http.Requ
 	startupState := runtime.GetStartupState()
 	status := startupState.GetStatus()
 	fetchSuccess := startupState.GetFetchSuccess()
-	userInfo := authuser.GetCurrentUserInfoOrLoad()
+	sessionSnapshot := authuser.GetSessionAuthority().Snapshot()
+	userInfo := sessionSnapshot.User
 
 	hasLocalUserInfo, checkErr := authuser.HasPersistedUserInfo()
 	if checkErr != nil {
@@ -163,11 +170,11 @@ func getSuggestedActions(status runtime.StartupStatus) []string {
 		runtime.UNCONFIGURED: {
 			"POST /api/auth/login - Login with email/password",
 			"POST /api/auth/scan/init - Scan to sign in with the mobile app",
-			"GET /api/auth/session - Try local session restore",
+			"GET /api/auth/session - Read current session state",
 			"GET /api/startup/status - Check status again",
 		},
 		runtime.CONFIGURING: {
-			"GET /api/auth/session - Retry local session restore",
+			"GET /api/auth/session - Read current session recovery state",
 			"POST /api/auth/login - Login if no local session",
 			"GET /api/startup/status - Check authentication progress",
 		},

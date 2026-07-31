@@ -19,21 +19,19 @@ type AuthService struct{}
 var remoteLogoutDispatch = auth.LogoutSession
 
 func teardownLocalSessionAfterLogout() {
+	// Logout is the linearization point: invalidate remote auth operations before
+	// any local teardown that an old completion could otherwise undo.
+	auth.GetSessionAuthority().NotifyLoggedOut()
 	auth.StopTokenRefresh()
-	// Close the activation gate before touching the runtime. StartService checks
-	// this state again after taking its mode lock, so an in-flight start request
-	// cannot restart ingress after the logout stopper releases the lock.
+	// The synchronous authority listener closes ingress before this function
+	// proceeds. Keep teardown single-sourced through that transition so a logout
+	// cannot race or double-stop the proxy lifecycle.
 	config.SetHasLocalUserInfo(false)
 	clearStartupStateAfterLogout()
-	stoppedMode := GetSharedRunService().StopIngressForLogout()
-	logger.Info(fmt.Sprintf("User logout stopped %s ingress", stoppedMode))
 	if err := auth.DeleteUserInfo(); err != nil {
 		logger.Warn(fmt.Sprintf("Failed to delete user info: %v", err))
 		auth.SetCurrentUserInfo(nil)
 	}
-	// Force-broadcasts even when already HardInvalid. Listeners repeat the proxy
-	// stop idempotently and synchronously disable the user-agent connection.
-	auth.GetSessionAuthority().NotifyLoggedOut()
 	// Retry asynchronously in addition to the structured session event. Both
 	// paths are idempotent; this covers a short user-agent restart race.
 	RequestUserAgentDisableForSessionEnd("logout")
@@ -160,31 +158,17 @@ func (s *AuthService) Login(email, password, turnstileToken string) map[string]i
 }
 
 func (s *AuthService) RestoreSession() map[string]interface{} {
-	userInfo, err := auth.RestoreSession()
-	if err != nil {
-		if errors.Is(err, auth.ErrRefreshTokenInvalid) || errors.Is(err, auth.ErrSessionExpired) {
-			clearStartupStateAfterLogout()
-			return map[string]interface{}{
-				"status": "no_session",
-				"error":  "session_expired",
-				"msg":    "Saved session expired. Please log in again.",
-			}
-		}
-		return map[string]interface{}{
-			"status": "no_session",
-			"msg":    "No local auth session available",
-		}
-	}
-
-	syncStartupStateForAuthenticatedUser(userInfo)
-	agentSync := agentSyncResult("restore_session")
-
 	return map[string]interface{}{
-		"status":     "success",
-		"msg":        "Session restored successfully",
-		"data":       mapUserInfo(userInfo),
-		"agent_sync": agentSync,
+		"status": "success",
+		"data":   s.GetSessionSnapshot(),
 	}
+}
+
+// GetSessionSnapshot is deliberately side-effect free. Session restore belongs
+// to the session-owner boot coordinator; browser reads never perform remote I/O,
+// mutate persistence, transition authority state, sync Agent, or issue cookies.
+func (s *AuthService) GetSessionSnapshot() SessionSnapshotPayload {
+	return BuildSessionSnapshotPayload(auth.GetSessionAuthority().Snapshot())
 }
 
 func (s *AuthService) RefreshSession(refreshToken string) map[string]interface{} {

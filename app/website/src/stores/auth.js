@@ -1,190 +1,165 @@
 import { computed, reactive, readonly, toRefs } from 'vue';
 import {
+  AuthRequestError,
+  activateScanLogin as activateScanLoginRequest,
+  bootstrapDashboardSession,
   login as loginRequest,
   logout as logoutRequest,
-  restoreSession as restoreSessionRequest,
-  activateScanLogin as activateScanLoginRequest
+  restoreSession as restoreSessionRequest
 } from '../services/authApi';
 import { useI18n } from '../i18n';
+import {
+  createSessionViewState,
+  normalizeSessionUser,
+  reduceSessionReadFailure,
+  reduceSessionSnapshot
+} from './sessionSnapshot';
 
+const initialSession = createSessionViewState();
 const state = reactive({
-  user: null,
-  status: 'idle',
-  isAuthenticated: false,
+  user: initialSession.user,
+  status: initialSession.status,
+  sessionState: initialSession.sessionState,
+  sessionInstanceId: initialSession.instanceId,
+  sessionRevision: initialSession.revision,
+  retiredSessionInstanceIds: initialSession.retiredInstanceIds,
+  isAuthenticated: initialSession.isAuthenticated,
   isReady: false,
   loginPending: false,
   logoutPending: false,
   restorePending: false,
   loginError: '',
   restoreError: '',
-  lastActionMessage: ''
+  lastActionMessage: '',
+  connectionStatus: 'connecting'
 });
 
-// Incremented whenever authentication is accepted or invalidated. Async login
-// and restore responses capture the current epoch so an older response cannot
-// resurrect the UI after a HardInvalid/logout event has already cleared it.
-let sessionEpoch = 0;
-
-function normalizeUser(user) {
-  if (!user || typeof user !== 'object') {
-    return null;
-  }
-
-  return {
-    id: Number(user.id || 0),
-    username: typeof user.username === 'string' ? user.username : '',
-    email: typeof user.email === 'string' ? user.email : '',
-    role: typeof user.role === 'string' ? user.role : '',
-    status: typeof user.status === 'string' ? user.status : '',
-    balance: Number(user.balance || 0),
-    concurrency: Number(user.concurrency || 0),
-    allowedGroups: Array.isArray(user.allowed_groups)
-      ? user.allowed_groups.map((value) => Number(value)).filter((value) => Number.isFinite(value))
-      : [],
-    createdAt: typeof user.created_at === 'string' ? user.created_at : '',
-    profileUpdatedAt: typeof user.profile_updated_at === 'string' ? user.profile_updated_at : '',
-    expiresIn: Number(user.expires_in || 0),
-    expiresAt: typeof user.expires_at === 'string' ? user.expires_at : '',
-    updatedAt: typeof user.updated_at === 'string' ? user.updated_at : ''
-  };
+function currentSessionView() {
+  return createSessionViewState({
+    instanceId: state.sessionInstanceId,
+    revision: state.sessionRevision,
+    retiredInstanceIds: [...state.retiredSessionInstanceIds],
+    sessionState: state.sessionState,
+    user: state.user,
+    isAuthenticated: state.isAuthenticated,
+    status: state.status
+  });
 }
 
-function applyAuthenticatedState(user, message = '') {
-  sessionEpoch += 1;
-  state.user = normalizeUser(user);
-  state.isAuthenticated = Boolean(state.user);
-  state.status = state.isAuthenticated ? 'authenticated' : 'unauthenticated';
-  state.loginError = '';
+function commitSessionView(next) {
+  state.sessionInstanceId = next.instanceId;
+  state.sessionRevision = next.revision;
+  state.retiredSessionInstanceIds = [...next.retiredInstanceIds];
+  state.sessionState = next.sessionState;
+  state.user = next.user;
+  state.isAuthenticated = next.isAuthenticated;
+  state.status = next.status;
+}
+
+export function applySessionSnapshot(payload, message = '') {
+  const result = reduceSessionSnapshot(currentSessionView(), payload);
+  if (!result.accepted) return false;
+
+  commitSessionView(result.state);
+  state.isReady = true;
   state.restoreError = '';
-  state.lastActionMessage = message;
+  state.connectionStatus = 'connected';
+  if (result.state.sessionState === 'active') {
+    state.loginError = '';
+  }
+  if (message) state.lastActionMessage = message;
+  return true;
 }
 
-function applyUnauthenticatedState(message = '', options = {}) {
-  sessionEpoch += 1;
-  state.user = null;
-  state.isAuthenticated = false;
-  state.status = 'unauthenticated';
-  state.loginError = options.preserveLoginError ? state.loginError : '';
-  state.restoreError = message;
-  state.lastActionMessage = message;
+function applySessionReadFailure(error) {
+  const errorType = error instanceof AuthRequestError ? error.type : 'server_error';
+  if (error instanceof AuthRequestError && error.status === 401) {
+    dashboardSessionReady = false;
+  }
+  commitSessionView(reduceSessionReadFailure(currentSessionView(), errorType));
+  state.connectionStatus = 'disconnected';
+  state.restoreError = error instanceof Error ? error.message : 'Session state is unavailable';
+  state.isReady = true;
 }
 
-export function syncUnauthenticatedAuthState(message = '', options = {}) {
-  const { t } = useI18n();
-  applyUnauthenticatedState(message || t('auth_pleaseLogin'), options);
+// Auth-like failures from feature APIs are signals to reconcile with the
+// authority. They are never themselves authoritative logout events.
+export function syncUnauthenticatedAuthState(message = '') {
+  if (message) state.restoreError = message;
+  void restoreAuthSession({ background: true });
 }
 
-// syncAuthFromStartupStatus syncs the auth store with the kernel state from
-// the /api/startup/status response.  Called by useRunStatus every 5 seconds.
 export function syncAuthFromStartupStatus(data) {
-  if (!data || typeof data !== 'object') {
-    return;
-  }
-
-  const user = data.user;
-  const fetchSuccess = data.fetch_success;
-
-  // Startup polling is a logout/reconciliation backstop, not a login source.
-  // Only an explicit login/restore or Active SSE transition may authenticate a
-  // previously unauthenticated UI. This blocks a stale in-flight READY response
-  // from resurrecting the user after HardInvalid.
-  if (state.isAuthenticated && user && typeof user === 'object' && fetchSuccess) {
-    const normalized = normalizeUser(user);
-    if (normalized) {
-      state.user = normalized;
-      state.isAuthenticated = true;
-      state.status = 'authenticated';
-      state.restoreError = '';
-      return;
-    }
-  }
-
-  if (!fetchSuccess && state.isAuthenticated) {
-    const { t } = useI18n();
-    applyUnauthenticatedState(t('auth_pleaseLogin'));
-  }
+  if (data?.session) applySessionSnapshot(data.session);
 }
 
 export function mergeAuthUser(partialUser, message = '') {
-  if (!state.user || !partialUser || typeof partialUser !== 'object') {
-    return;
+  if (!state.user || !partialUser || typeof partialUser !== 'object') return;
+  state.user = { ...state.user, ...partialUser };
+  if (message) state.lastActionMessage = message;
+}
+
+let reconcileSequence = 0;
+
+export async function restoreAuthSession(options = {}) {
+  const { background = false, force = false } = options;
+  if (state.restorePending && !force) return state.isAuthenticated;
+  const { t } = useI18n();
+  const requestSequence = ++reconcileSequence;
+  state.restorePending = true;
+  if (!background && !state.sessionInstanceId) {
+    state.status = 'restoring';
+    state.lastActionMessage = '';
   }
 
-  state.user = {
-    ...state.user,
-    ...partialUser
-  };
-
-  if (message) {
-    state.lastActionMessage = message;
+  try {
+    const snapshot = await restoreSessionRequest();
+    if (requestSequence !== reconcileSequence) return state.isAuthenticated;
+    applySessionSnapshot(snapshot,
+      snapshot?.state === 'active' ? t('auth_sessionRestored') : '');
+    return state.isAuthenticated;
+  } catch (error) {
+    if (requestSequence === reconcileSequence) applySessionReadFailure(error);
+    return state.isAuthenticated;
+  } finally {
+    if (requestSequence === reconcileSequence) state.restorePending = false;
+    state.isReady = true;
   }
 }
 
-export async function restoreAuthSession() {
-  if (state.restorePending) {
-    return state.isAuthenticated;
+let dashboardBootstrapPromise = null;
+let dashboardSessionReady = false;
+
+async function ensureDashboardSession() {
+  if (dashboardSessionReady) return;
+  if (!dashboardBootstrapPromise) {
+    dashboardBootstrapPromise = bootstrapDashboardSession()
+      .then(() => { dashboardSessionReady = true; })
+      .finally(() => { dashboardBootstrapPromise = null; });
   }
+  return dashboardBootstrapPromise;
+}
 
-  const { t } = useI18n();
-
-  state.restorePending = true;
-  state.isReady = false;
-  state.status = 'restoring';
-  state.restoreError = '';
-  state.lastActionMessage = '';
-  const requestEpoch = sessionEpoch;
-
-  try {
-    const result = await restoreSessionRequest();
-    if (requestEpoch !== sessionEpoch) {
-      return state.isAuthenticated;
-    }
-    if (result.status === 'success' && result.data) {
-      applyAuthenticatedState(result.data, result.message || t('auth_sessionRestored'));
-      return true;
-    }
-
-    applyUnauthenticatedState(result.message || t('auth_pleaseLogin'));
-    return false;
-  } catch (error) {
-    applyUnauthenticatedState(error instanceof Error ? error.message : t('auth_pleaseLogin'));
-    return false;
-  } finally {
-    state.restorePending = false;
-    state.isReady = true;
-  }
+async function reconcileAfterAuthCommand() {
+  await ensureDashboardSession();
+  connectSessionEvents();
+  return restoreAuthSession({ force: true });
 }
 
 export async function loginWithPassword(credentials) {
   const { t } = useI18n();
-
   state.loginPending = true;
   state.loginError = '';
   state.lastActionMessage = '';
-  const requestEpoch = sessionEpoch;
-
   try {
     const result = await loginRequest(credentials);
-    if (requestEpoch !== sessionEpoch) {
-      return state.isAuthenticated;
-    }
-    if (result.status !== 'success' || !result.data) {
-      throw new Error(result.message || t('auth_loginFailed'));
-    }
-
-    applyAuthenticatedState(result.data, result.message || t('auth_loginSuccess'));
-    state.isReady = true;
+    if (result.status !== 'success') throw new Error(result.message || t('auth_loginFailed'));
+    await reconcileAfterAuthCommand();
+    if (!state.isAuthenticated) throw new Error(t('auth_loginFailed'));
+    state.lastActionMessage = result.message || t('auth_loginSuccess');
     return true;
   } catch (error) {
-    if (requestEpoch !== sessionEpoch) {
-      return false;
-    }
-    sessionEpoch += 1;
-    state.user = null;
-    state.isAuthenticated = false;
-    state.status = 'unauthenticated';
     state.loginError = error instanceof Error ? error.message : t('auth_loginFailed');
-    state.lastActionMessage = '';
     state.isReady = true;
     return false;
   } finally {
@@ -194,34 +169,18 @@ export async function loginWithPassword(credentials) {
 
 export async function completeScanLogin({ sessionToken, refreshToken }) {
   const { t } = useI18n();
-
   state.loginPending = true;
   state.loginError = '';
   state.lastActionMessage = '';
-  const requestEpoch = sessionEpoch;
-
   try {
     const result = await activateScanLoginRequest({ sessionToken, refreshToken });
-    if (requestEpoch !== sessionEpoch) {
-      return state.isAuthenticated;
-    }
-    if (result.status !== 'success' || !result.data) {
-      throw new Error(result.message || t('auth_loginFailed'));
-    }
-
-    applyAuthenticatedState(result.data, result.message || t('auth_loginSuccess'));
-    state.isReady = true;
+    if (result.status !== 'success') throw new Error(result.message || t('auth_loginFailed'));
+    await reconcileAfterAuthCommand();
+    if (!state.isAuthenticated) throw new Error(t('auth_loginFailed'));
+    state.lastActionMessage = result.message || t('auth_loginSuccess');
     return true;
   } catch (error) {
-    if (requestEpoch !== sessionEpoch) {
-      return false;
-    }
-    sessionEpoch += 1;
-    state.user = null;
-    state.isAuthenticated = false;
-    state.status = 'unauthenticated';
     state.loginError = error instanceof Error ? error.message : t('auth_loginFailed');
-    state.lastActionMessage = '';
     state.isReady = true;
     return false;
   } finally {
@@ -230,19 +189,18 @@ export async function completeScanLogin({ sessionToken, refreshToken }) {
 }
 
 export async function logoutUser() {
-  if (state.logoutPending) {
-    return;
-  }
-
+  if (state.logoutPending) return;
   const { t } = useI18n();
-
   state.logoutPending = true;
-
   try {
     const result = await logoutRequest();
-    applyUnauthenticatedState(result.message || t('auth_loggedOut'));
+    await reconcileAfterAuthCommand();
+    state.lastActionMessage = result.message || t('auth_loggedOut');
   } catch (error) {
-    applyUnauthenticatedState(error instanceof Error ? error.message : t('auth_loggedOutLocally'));
+    // Preserve the last authoritative user on transport/server failure. SSE or
+    // the periodic pure GET will converge if the backend completed the logout.
+    applySessionReadFailure(error);
+    state.lastActionMessage = '';
   } finally {
     state.logoutPending = false;
     state.isReady = true;
@@ -250,74 +208,73 @@ export async function logoutUser() {
 }
 
 let sessionEventSource = null;
+let sessionEventSourceGeneration = 0;
 
-// connectSessionEvents opens an SSE subscription to /api/session/events so the
-// dashboard reflects identity transitions (login / refresh / soft-expired /
-// hard-invalid / logout) instantly, instead of waiting for the 5s
-// /api/startup/status poll. EventSource auto-reconnects; on reconnect the server
-// re-sends a state snapshot so the UI re-syncs.
 export function connectSessionEvents() {
   if (sessionEventSource) return;
   if (typeof window === 'undefined' || typeof window.EventSource === 'undefined') return;
 
-  sessionEventSource = new EventSource('/api/session/events');
-  sessionEventSource.onmessage = (event) => {
-    let payload;
+  const generation = ++sessionEventSourceGeneration;
+  const source = new window.EventSource('/api/session/events');
+  sessionEventSource = source;
+  source.onopen = () => {
+    if (generation === sessionEventSourceGeneration) state.connectionStatus = 'connected';
+  };
+  source.onmessage = (event) => {
+    if (generation !== sessionEventSourceGeneration) return;
     try {
-      payload = JSON.parse(event.data);
+      applySessionSnapshot(JSON.parse(event.data));
     } catch (_) {
-      return;
+      // Ignore malformed events; the periodic GET remains authoritative.
     }
-    handleSessionPayload(payload);
+  };
+  source.onerror = () => {
+    if (generation !== sessionEventSourceGeneration) return;
+    state.connectionStatus = 'disconnected';
+    void restoreAuthSession({ background: true });
   };
 }
 
-function handleSessionPayload(payload) {
-  const { t } = useI18n();
-  const target = payload.type === 'snapshot' ? payload.state : payload.to;
+let reconciliationTimer = null;
 
-  if (target === 'active') {
-    // (Re)fetch canonical user info; restoreAuthSession is idempotent
-    // (guarded by restorePending), so the startup snapshot won't double-fetch.
-    void restoreAuthSession();
-  } else if (target === 'soft_expired') {
-    // Degraded but recovering — keep the user visible, surface a notice.
-    state.isReady = true;
-    state.status = 'soft_expired';
-    state.lastActionMessage = t('auth_restoringSession');
-  } else {
-    // hard_invalid / unauthenticated → show the login view.
-    applyUnauthenticatedState(t('auth_pleaseLogin'));
+function startPeriodicReconciliation() {
+  if (reconciliationTimer || typeof window === 'undefined') return;
+  reconciliationTimer = window.setInterval(() => {
+    void ensureDashboardSession()
+      .then(() => {
+        connectSessionEvents();
+        return restoreAuthSession({ background: true });
+      })
+      .catch(applySessionReadFailure);
+  }, 5000);
+}
+
+export async function initializeAuthSession() {
+  state.status = 'restoring';
+  state.isReady = false;
+  startPeriodicReconciliation();
+  try {
+    await ensureDashboardSession();
+    connectSessionEvents();
+    return await restoreAuthSession();
+  } catch (error) {
+    applySessionReadFailure(error);
+    return state.isAuthenticated;
   }
 }
 
 export function useAuthStore() {
   const { t } = useI18n();
-
-  const userDisplayName = computed(() => {
-    if (state.user?.username) {
-      return state.user.username;
-    }
-    return t('auth_guest');
-  });
-
-  const planLabel = computed(() => {
-    if (state.user?.status) {
-      return state.user.status;
-    }
-    if (state.user?.email) {
-      return state.user.email;
-    }
-    return t('auth_loginRequired');
-  });
-
+  const userDisplayName = computed(() => state.user?.username || t('auth_guest'));
+  const planLabel = computed(() => state.user?.status || state.user?.email || t('auth_loginRequired'));
   const authNotice = computed(() => {
-    if (state.isAuthenticated) {
-      return state.lastActionMessage || t('auth_sessionActive');
+    if (state.status === 'transport_unavailable' || state.status === 'server_error') {
+      return state.restoreError || t('auth_restoringSession');
     }
-    if (state.restorePending) {
+    if (state.sessionState === 'soft_expired' || state.sessionState === 'restoring' || state.restorePending) {
       return t('auth_restoringSession');
     }
+    if (state.isAuthenticated) return state.lastActionMessage || t('auth_sessionActive');
     return state.loginError || state.restoreError || t('auth_loginPrompt');
   });
 
@@ -333,3 +290,5 @@ export function useAuthStore() {
     mergeAuthUser
   };
 }
+
+export { normalizeSessionUser };

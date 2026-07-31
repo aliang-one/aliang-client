@@ -3414,6 +3414,201 @@ func TestAgentServiceHandleAIPreToolUseApprovalHookRoundTrip(t *testing.T) {
 	}
 }
 
+func TestGoalApprovalHookUsesProtocolIdentityInsteadOfSessionPrefix(t *testing.T) {
+	setupAgentPolicyTestEnv(t)
+	projectPath := setupAgentExecutionProjectForTest(t)
+	manager := newAgentAIManager()
+	svc := &AgentService{ai: manager}
+	manager.service = svc
+	defer manager.closeAll()
+
+	mu, events, writer := captureAIWriter(t)
+	_, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	manager.sessions["ai_goal_actual"] = &agentAISession{
+		id:            "ai_goal_actual",
+		projectPath:   projectPath,
+		provider:      "claudecode",
+		cancel:        cancel,
+		activeWriter:  writer,
+		approvalToken: "goal-token",
+		runSeq:        1,
+		activeRunID:   "goal-run-1",
+		goalIdentity: map[string]interface{}{
+			"goal_id":     "goal-1",
+			"goal_run_id": "goal-run-1",
+		},
+	}
+
+	response, err := manager.handleClaudeApprovalHook(
+		context.Background(),
+		"ai_goal_actual",
+		"assistant_goal:goal-run-1",
+		"goal-token",
+		map[string]interface{}{
+			"hook_event_name": "PreToolUse",
+			"tool_name":       "Bash",
+			"tool_input": map[string]interface{}{
+				"command": "cat /etc/passwd",
+			},
+		},
+	)
+	if err != nil {
+		t.Fatalf("handleClaudeApprovalHook() error = %v", err)
+	}
+	hookOutput, _ := response["hookSpecificOutput"].(map[string]interface{})
+	if remoteString(hookOutput, "permissionDecision") != "allow" {
+		t.Fatalf("permissionDecision = %#v, want allow", hookOutput["permissionDecision"])
+	}
+	if got := findAIEvents(mu, events, models.AgentEventAIApprovalRequest); len(got) != 0 {
+		t.Fatalf("Goal hook escalated to cloud approval: %#v", got)
+	}
+}
+
+func TestNewGoalRunPreemptsStuckRunAndClearsApproval(t *testing.T) {
+	manager := newAgentAIManager()
+	mu, events, writer := captureAIWriter(t)
+	runCtx, cancel := context.WithCancel(context.Background())
+	manager.sessions["ai_goal_actual"] = &agentAISession{
+		id:           "ai_goal_actual",
+		cancel:       cancel,
+		activeWriter: writer,
+		runSeq:       1,
+		activeRunID:  "goal-run-old",
+	}
+	registerPendingApproval(manager, "ai_goal_actual", "approval-old", 1)
+	go func() {
+		<-runCtx.Done()
+		manager.clearRunning("ai_goal_actual", 1, writer)
+	}()
+
+	err := manager.preemptForGoalRun(
+		"ai_goal_actual",
+		"goal-run-new",
+		map[string]interface{}{"goal_id": "goal-1", "goal_run_id": "goal-run-new"},
+		time.Second,
+	)
+	if err != nil {
+		t.Fatalf("preemptForGoalRun() error = %v", err)
+	}
+	manager.mu.Lock()
+	session := manager.sessions["ai_goal_actual"]
+	stillRunning := session != nil && session.cancel != nil
+	_, approvalPending := manager.approvals[agentAIApprovalMapKey("ai_goal_actual", "approval-old")]
+	manager.mu.Unlock()
+	if stillRunning || approvalPending {
+		t.Fatalf("preemption left state running=%t approvalPending=%t", stillRunning, approvalPending)
+	}
+	cancelled := lastAIEvent(mu, events, models.AgentEventAIApprovalCancelled)
+	if cancelled == nil || remoteString(cancelled, "reason") != "goal_run_preempted" {
+		t.Fatalf("approval cancellation = %#v", cancelled)
+	}
+}
+
+func TestStopRunIDFenceDoesNotCancelNewerRun(t *testing.T) {
+	manager := newAgentAIManager()
+	_, _, writer := captureAIWriter(t)
+	var cancelled atomic.Bool
+	manager.sessions["ai_goal_actual"] = &agentAISession{
+		id:           "ai_goal_actual",
+		cancel:       func() { cancelled.Store(true) },
+		activeWriter: writer,
+		runSeq:       2,
+		activeRunID:  "goal-run-new",
+	}
+
+	manager.stop(map[string]interface{}{
+		"session_id": "ai_goal_actual",
+		"run_id":     "goal-run-old",
+	}, writer)
+	if cancelled.Load() {
+		t.Fatal("stale ai.stop cancelled the newer Goal run")
+	}
+}
+
+func TestApprovalRequestWriteRetriesTransientDisconnect(t *testing.T) {
+	attempts := 0
+	writer := func(interface{}) error {
+		attempts++
+		if attempts < 3 {
+			return errors.New("remote writer unavailable")
+		}
+		return nil
+	}
+	err := writeAgentAIApprovalRequest(
+		context.Background(),
+		writer,
+		map[string]interface{}{"type": models.AgentEventAIApprovalRequest},
+		3,
+		time.Millisecond,
+	)
+	if err != nil {
+		t.Fatalf("writeAgentAIApprovalRequest() error = %v", err)
+	}
+	if attempts != 3 {
+		t.Fatalf("attempts = %d, want 3", attempts)
+	}
+}
+
+func TestGoalErrorIncludesImmediateProviderFailureInReport(t *testing.T) {
+	mu, events, writer := captureAIWriter(t)
+	emitter := newAgentAIRunEmitter(agentAIRun{
+		runID: "goal-run-1",
+		goalIdentity: map[string]interface{}{
+			"goal_id":     "goal-1",
+			"goal_run_id": "goal-run-1",
+		},
+	}, writer)
+	if err := emitter.emit(map[string]interface{}{
+		"type":  models.AgentEventAIError,
+		"error": "ai session is already running",
+	}); err != nil {
+		t.Fatalf("emit() error = %v", err)
+	}
+	failed := lastAIEvent(mu, events, models.AgentEventAIError)
+	report, _ := failed["goal_report"].(map[string]interface{})
+	if !strings.Contains(remoteString(report, "output"), "already running") {
+		t.Fatalf("goal_report.output = %#v", report["output"])
+	}
+}
+
+func TestGoalPlanPassProviderErrorSurfacesDeadline(t *testing.T) {
+	if goalPlannerExploreTimeout+goalPlanMaxEmitAttempts*goalPlannerEmitTimeout >= 10*time.Minute {
+		t.Fatalf("planner budget exceeds Server goal.plan RPC timeout")
+	}
+	got := goalPlanPassProviderError("", context.DeadlineExceeded, goalPlannerExploreTimeout)
+	if !strings.Contains(got, "planner_timeout") || !strings.Contains(got, goalPlannerExploreTimeout.String()) {
+		t.Fatalf("goalPlanPassProviderError() = %q", got)
+	}
+	if got := goalPlanPassProviderError("upstream failed", context.DeadlineExceeded, goalPlannerExploreTimeout); got != "upstream failed" {
+		t.Fatalf("explicit provider error was replaced: %q", got)
+	}
+}
+
+func TestGoalPlanTimeoutOnlyAdvancesPhaseWithoutExplicitProviderError(t *testing.T) {
+	timedOut := goalPlanCLIPassResult{
+		providerError: goalPlanPassProviderError("", context.DeadlineExceeded, goalPlannerExploreTimeout),
+		timedOut:      true,
+	}
+	if timedOut.providerError == "" || !timedOut.timedOut {
+		t.Fatalf("expected a typed phase-boundary timeout, got %#v", timedOut)
+	}
+	if got := timedOut.terminalProviderError(); got != "" {
+		t.Fatalf("exploration timeout should advance to emission, got terminal error %q", got)
+	}
+
+	providerFailure := goalPlanCLIPassResult{
+		providerError: goalPlanPassProviderError("upstream failed", context.DeadlineExceeded, goalPlannerExploreTimeout),
+		timedOut:      false,
+	}
+	if providerFailure.timedOut || providerFailure.providerError != "upstream failed" {
+		t.Fatalf("explicit provider error must remain terminal, got %#v", providerFailure)
+	}
+	if got := providerFailure.terminalProviderError(); got != "upstream failed" {
+		t.Fatalf("expected explicit provider error to remain terminal, got %q", got)
+	}
+}
+
 func TestClaudeCodeToolFallsBackToClaudeBinary(t *testing.T) {
 	binDir := t.TempDir()
 	script := "#!/bin/sh\nprintf 'fallback-ok\\n'\n"

@@ -1,55 +1,44 @@
-import assert from 'node:assert/strict';
-import test from 'node:test';
+import { expect, it } from 'vitest';
 
 import { extractUsagePagination, extractUsageRecords } from './dashboardData.js';
 
-test('extractUsageRecords accepts direct array payloads', () => {
-  const records = [{ id: 1 }, { id: 2 }];
-  assert.deepEqual(extractUsageRecords(records), records);
+it('extractUsageRecords accepts direct array payloads', () => {
+	const records = [{ id: 1 }, { id: 2 }];
+	expect(extractUsageRecords(records)).toEqual(records);
 });
 
-test('extractUsageRecords accepts paginated payloads', () => {
+it('extractUsageRecords accepts paginated payloads', () => {
   const records = [{ id: 1001, model: 'claude-sonnet-4-20250514' }];
 
-  assert.deepEqual(
-    extractUsageRecords({
-      items: records,
-      total: 1,
-      page: 1
-    }),
-    records
-  );
+	expect(extractUsageRecords({
+			items: records,
+			total: 1,
+			page: 1
+		})).toEqual(records);
 
-  assert.deepEqual(
-    extractUsageRecords({
-      data: {
-        items: records,
-        total: 1
-      }
-    }),
-    records
-  );
+	expect(extractUsageRecords({
+			data: {
+				items: records,
+				total: 1
+			}
+		})).toEqual(records);
 });
 
-test('extractUsagePagination reads pagination metadata from payloads', () => {
-  assert.deepEqual(
-    extractUsagePagination({
+it('extractUsagePagination reads pagination metadata from payloads', () => {
+	expect(extractUsagePagination({
       items: [{ id: 1 }],
       total: 42,
       page: 2,
       page_size: 20,
       total_pages: 3
-    }),
-    {
+		})).toEqual({
       page: 2,
       pageSize: 20,
       total: 42,
       totalPages: 3
-    }
-  );
+		});
 
-  assert.deepEqual(
-    extractUsagePagination({
+	expect(extractUsagePagination({
       data: {
         items: [{ id: 1 }],
         pagination: {
@@ -59,12 +48,10 @@ test('extractUsagePagination reads pagination metadata from payloads', () => {
           pages: 2
         }
       }
-    }, 1, 5),
-    {
+		}, 1, 5)).toEqual({
       page: 1,
       pageSize: 5,
       total: 8,
       totalPages: 2
-    }
-  );
+		});
 });

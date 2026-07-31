@@ -6,11 +6,24 @@ import (
 
 	"aliang.one/nursorgate/app/http/services"
 	"aliang.one/nursorgate/cmd"
+	auth "aliang.one/nursorgate/processor/auth"
 	"aliang.one/nursorgate/processor/config"
+	"aliang.one/nursorgate/processor/runtime"
 )
+
+func activateSessionForStartupTest(t *testing.T) {
+	t.Helper()
+	auth.ResetSessionAuthorityForTest().NotifyLoggedIn(&auth.UserInfo{ID: 1, Username: "startup-test"})
+	runtime.GetStartupState().SetStatus(runtime.UNCONFIGURED)
+	t.Cleanup(func() {
+		auth.ResetSessionAuthorityForTest()
+		runtime.ResetGlobalStartupStateForTest()
+	})
+}
 
 // TestRunServiceWithDefaultConfig 测试当使用默认配置时，RunService.StartService() 返回错误
 func TestRunServiceWithDefaultConfig(t *testing.T) {
+	activateSessionForStartupTest(t)
 	// 步骤1: 准备 - 创建 RunService 实例
 	runService := services.NewRunService()
 	t.Log("✓ Step 1: RunService instance created")
@@ -63,6 +76,7 @@ func TestRunServiceWithDefaultConfig(t *testing.T) {
 
 // TestRunServiceWithoutDefaultConfig 测试当不使用默认配置时，StartService() 可以继续执行
 func TestRunServiceWithoutDefaultConfig(t *testing.T) {
+	activateSessionForStartupTest(t)
 	// 步骤1: 确保不使用默认配置
 	config.SetUsingDefaultConfig(false)
 	t.Log("✓ Step 1: Confirmed not using default config")
@@ -91,6 +105,7 @@ func TestRunServiceWithoutDefaultConfig(t *testing.T) {
 
 // TestCompleteStartupFlow 测试完整的启动流程
 func TestCompleteStartupFlow(t *testing.T) {
+	activateSessionForStartupTest(t)
 	t.Log("=== Complete Startup Flow Test ===\n")
 
 	// 场景 1: 直接启动（模拟 ./nursorgate-darwin-arm64）

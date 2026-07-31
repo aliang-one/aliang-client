@@ -106,6 +106,45 @@ func TestGoalPlannerUsesProviderNativeReadOnlyPolicies(t *testing.T) {
 	}
 }
 
+func TestGoalPlannerPreflightRejectsMissingClaudeProviderConfiguration(t *testing.T) {
+	t.Setenv("ANTHROPIC_BASE_URL", "")
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "")
+	err := preflightGoalPlannerProvider("claudecode", "", "")
+	if err == nil || !strings.HasPrefix(err.Error(), "planner_provider_unconfigured:") {
+		t.Fatalf("preflight error = %v, want planner_provider_unconfigured", err)
+	}
+}
+
+func TestGoalPlanningSessionPinsNativeResumeID(t *testing.T) {
+	m := newAgentAIManager()
+	m.ensureGoalPlanningSession("goal-plan:test", t.TempDir(), "claudecode", "", "")
+	m.bindings["goal-plan:test"] = agentAIBindingRecord{
+		ConversationID:  "goal-plan:test",
+		Provider:        "claudecode",
+		NativeSessionID: "stale-planner-session",
+		State:           "confirmed",
+	}
+	m.setAgentAIResumeSessionIDIfEmpty("goal-plan:test", 0, "native-session-1")
+	if got := m.resumeSessionIDFor("goal-plan:test"); got != "native-session-1" {
+		t.Fatalf("resume session id = %q, want native-session-1", got)
+	}
+	m.removeGoalPlanningSession("goal-plan:test")
+	if got := m.resumeSessionIDFor("goal-plan:test"); got != "" {
+		t.Fatalf("removed planner session still has resume id %q", got)
+	}
+	if _, ok := m.bindings["goal-plan:test"]; ok {
+		t.Fatal("removed planner session retained a persistent binding")
+	}
+}
+
+func TestAgentAIModelNormalizerDropsDisplayLabels(t *testing.T) {
+	for _, displayLabel := range []string{"Claude Code", "provider default", "default"} {
+		if got := normalizeAgentAIModel(displayLabel); got != "" {
+			t.Fatalf("normalizeAgentAIModel(%q) = %q, want empty", displayLabel, got)
+		}
+	}
+}
+
 func TestOpenCodeGoalExecutionUsesBoundedAutoPolicy(t *testing.T) {
 	original := &agentAITool{id: "opencode", args: []string{"run", "goal prompt"}}
 	goalTool := withGoalExecutionPolicy(original)

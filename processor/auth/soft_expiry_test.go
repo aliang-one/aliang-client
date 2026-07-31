@@ -2,22 +2,31 @@ package user
 
 import (
 	"errors"
-	"os"
-	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"aliang.one/nursorgate/processor/config"
 )
 
 func resetSoftExpiryForTest() {
-	softExpiryRunning = false
-	softExpiryTimeout = defaultSoftExpiryTimeout
-	softExpiryBackoff = []time.Duration{0, 5 * time.Second, 15 * time.Second}
-	softExpiryRefresh = func() (*UserInfo, error) { return RefreshSession("") }
-	softExpirySleep = func(time.Duration) {}
-	softExpiryNow = time.Now
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		softExpiryMu.Lock()
+		if !softExpiryRunning {
+			softExpiryTimeout = defaultSoftExpiryTimeout
+			softExpiryBackoff = []time.Duration{0, 5 * time.Second, 15 * time.Second}
+			softExpiryRefresh = func() (*UserInfo, error) { return RefreshSession("") }
+			softExpirySleep = func(time.Duration) {}
+			softExpiryNow = time.Now
+			softExpiryMaxAttempts = 0
+			softExpiryMu.Unlock()
+			return
+		}
+		softExpiryMu.Unlock()
+		if time.Now().After(deadline) {
+			panic("previous soft-expiry recovery did not stop")
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 // waitNotSoftExpired polls the authority until it leaves SoftExpired (or times out).
@@ -121,50 +130,56 @@ func TestSoftExpiryRecoveryPermanentFailureEscalates(t *testing.T) {
 	}
 }
 
-func TestSoftExpiryRecoveryTimeoutEscalates(t *testing.T) {
-	baseDir := t.TempDir()
-	t.Setenv("HOME", filepath.Join(baseDir, "home"))
-	t.Setenv("ALIANG_CACHE_DIR", filepath.Join(baseDir, "cache"))
-	defer StopTokenRefresh()
-	defer ResetAuthPersistenceForTest()
-	defer config.ResetGlobalConfigForTest()
-	ResetAuthPersistenceForTest()
-	config.ResetGlobalConfigForTest()
-	if err := os.MkdirAll(filepath.Join(baseDir, "home"), 0o700); err != nil {
-		t.Fatalf("mkdir home: %v", err)
-	}
-	if err := SaveUserInfo(&UserInfo{AccessToken: "stale", RefreshToken: "stale", UpdatedAt: time.Now()}); err != nil {
-		t.Fatalf("SaveUserInfo() error = %v", err)
-	}
-
+// TestSoftExpiryRecoveryTransientDoesNotForceRelogin asserts fix A: a transient
+// refresh failure (cloud briefly unreachable, local session retained) MUST NOT
+// escalate to HardInvalid or force a re-login. The session stays SoftExpired,
+// the recovery loop keeps retrying, and local user info is preserved so a later
+// refresh can succeed. Only a permanent rejection forces re-login (covered by
+// TestSoftExpiryRecoveryPermanentFailureEscalates).
+//
+// OLD behavior (the bug this replaces): after the soft-expiry deadline the loop
+// called ExpireLocalSession("soft expiry timeout") -> HardInvalid -> proxy
+// stopped + "认证已过期，请重新登录". A ~30s network blip forced a full re-login.
+// Recorded as a Bug-class divergence for the Rust port (REWRITE_DESIGN.md §4 现场 3).
+func TestSoftExpiryRecoveryTransientDoesNotForceRelogin(t *testing.T) {
 	resetSoftExpiryForTest()
+	ResetAuthPersistenceForTest()
+	SetCurrentUserInfo(&UserInfo{AccessToken: "x"}) // retained across transient failures
 	softExpiryBackoff = []time.Duration{0}
-	softExpiryTimeout = 1 * time.Second
-	var ticks int64
-	softExpiryNow = func() time.Time {
-		n := atomic.AddInt64(&ticks, 1)
-		return time.Unix(n*100, 0) // each call advances +100s, so deadline passes immediately
-	}
+	softExpiryMaxAttempts = 3
+	var refreshCalls int32
 	softExpiryRefresh = func() (*UserInfo, error) {
-		return nil, errors.New("transient")
+		atomic.AddInt32(&refreshCalls, 1)
+		return nil, errors.New("transient network") // session retained -> retry, never wipes
 	}
 
 	a := ResetSessionAuthorityForTest()
 	a.NotifyLoggedIn(&UserInfo{})
 	a.NotifyAccessRejected("agent rejected")
+	if a.State() != StateSoftExpired {
+		t.Fatalf("precondition: state=%v want SoftExpired", a.State())
+	}
 
 	StartSoftExpiryRecovery()
-	waitNotSoftExpired(t, a)
+	// The loop now terminates after softExpiryMaxAttempts transient failures
+	// WITHOUT leaving SoftExpired, so waitNotSoftExpired does not apply. Poll
+	// until the recovery goroutine has made all its attempts, then let it return.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if atomic.LoadInt32(&refreshCalls) >= 3 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(20 * time.Millisecond) // allow the goroutine to return after its final attempt
 
-	if a.State() != StateHardInvalid {
-		t.Fatalf("state=%v want HardInvalid after timeout", a.State())
+	if a.State() != StateSoftExpired {
+		t.Fatalf("state=%v want SoftExpired (transient failure must NOT force re-login)", a.State())
 	}
-	if got := GetCurrentUserInfo(); got != nil {
-		t.Fatalf("current user after timeout = %#v, want nil", got)
+	if got := atomic.LoadInt32(&refreshCalls); got != 3 {
+		t.Fatalf("expected 3 transient refresh attempts then stop, got %d", got)
 	}
-	if hasUserInfo, err := HasPersistedUserInfo(); err != nil {
-		t.Fatalf("HasPersistedUserInfo() error = %v", err)
-	} else if hasUserInfo {
-		t.Fatal("persisted user survived soft-expiry timeout")
+	if GetCurrentUserInfo() == nil {
+		t.Fatal("local user info was wiped on transient failure; must be retained for recovery")
 	}
 }

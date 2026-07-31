@@ -81,6 +81,8 @@ func TestOnSessionEventSoftExpiredPausesProxyAndStartsRecovery(t *testing.T) {
 func TestOnSessionEventActiveResumesPausedProxy(t *testing.T) {
 	defer resetAuthHooksForTest()
 	resetAuthHooksForTest()
+	auth.ResetSessionAuthorityForTest().NotifyLoggedIn(&auth.UserInfo{ID: 1, Username: "recovered-user"})
+	t.Cleanup(func() { auth.ResetSessionAuthorityForTest() })
 
 	httpProxyIsRunningProbe = func() bool { return false }
 	httpStopRunner = func() {}

@@ -15,6 +15,7 @@ func TestSessionEventAgentAction(t *testing.T) {
 		{"hard_invalid", "soft_expiry_timeout", "disable"},
 		{"hard_invalid", "revoked", "disable"},
 		{"soft_expired", "access_rejected", "none"},
+		{"unauthenticated", "logout", "disable"},
 		{"unauthenticated", "", "none"},
 		{"ACTIVE", "X", "reconnect"}, // case-insensitive
 		{"hard_invalid", "LOGOUT", "disable"},
@@ -42,7 +43,7 @@ func TestApplyLogoutSessionEventClearsForwardedIdentityAndAgentState(t *testing.
 	service.state.Registered = true
 	service.mu.Unlock()
 
-	service.ApplySessionEvent("hard_invalid", "logout")
+	service.ApplySessionEvent("unauthenticated", "logout")
 
 	service.mu.Lock()
 	defer service.mu.Unlock()

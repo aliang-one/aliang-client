@@ -59,6 +59,14 @@ func InitializeUser(token string) error {
 					logger.Warn(fmt.Sprintf("Agent device registration failed after startup restore: %v", err))
 				}
 			}
+		} else if errors.Is(err, auth.ErrSessionRecovering) {
+			// A saved identity exists but remote validation is temporarily
+			// unavailable. Keep the profile visible while SessionAuthority remains
+			// SoftExpired; proxy eligibility stays closed until recovery succeeds.
+			config.SetHasLocalUserInfo(true)
+			startupState.SetFetchSuccess(false)
+			startupState.SetStatus(runtime.CONFIGURING)
+			logger.Warn(fmt.Sprintf("Saved session is recovering; ingress remains paused: %v", err))
 		} else {
 			logger.Debug("No local user info found, starting without user authentication")
 			// 标记为没有本地用户信息
@@ -82,7 +90,12 @@ func loadLocalUserInfo() error {
 	// 获取启动状态以跟踪fetch结果
 	startupState := runtime.GetStartupState()
 
-	// 有本地用户信息即可进入 READY
+	// Only an authority-validated Active session may enter READY.
+	if auth.GetSessionAuthority().State() != auth.StateActive {
+		startupState.SetFetchSuccess(false)
+		startupState.SetStatus(runtime.CONFIGURING)
+		return auth.ErrSessionRecovering
+	}
 	startupState.SetFetchSuccess(true)
 	startupState.SetStatus(runtime.READY)
 

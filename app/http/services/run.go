@@ -14,8 +14,10 @@ import (
 	"aliang.one/nursorgate/common/logger"
 	model "aliang.one/nursorgate/common/model"
 	httpServer "aliang.one/nursorgate/inbound/http"
+	"aliang.one/nursorgate/inbound/tun/engine"
 	runner2 "aliang.one/nursorgate/inbound/tun/runner"
 	"aliang.one/nursorgate/outbound"
+	auth "aliang.one/nursorgate/processor/auth"
 	"aliang.one/nursorgate/processor/config"
 	"aliang.one/nursorgate/processor/routing"
 	"aliang.one/nursorgate/processor/runtime"
@@ -25,6 +27,7 @@ var (
 	activeIngressModeResolver = activeIngressModeFromSnapshot
 	applyIngressModeUpdater   = applyIngressModeToSnapshot
 	tunStartRunner            = defaultStartTUN
+	tunPrepareStartRunner     = runner2.PrepareStart
 	httpStartRunner           = httpServer.StartMitmHttp
 	httpStopRunner            = httpServer.StopHttpProxy
 	tunStopRunner             = runner2.Stop
@@ -34,6 +37,7 @@ var (
 	// (after a mode switch / daemon restart / activation rollback) cannot leave a
 	// live proxy serving a dead token.
 	httpProxyIsRunningProbe      = httpServer.IsHttpRunning
+	tunProxyIsRunningProbe       = engine.IsRunning
 	runModeStoreFactory          = func() runModeSnapshotStore { return storage.NewSoftwareConfigStore() }
 	aliangLinkStatusResolver     = resolveAliangLinkStatus
 	softwareUpdateStatusResolver = func() models.SoftwareVersionUpdateFrontendStatus {
@@ -140,6 +144,9 @@ func (rs *RunService) SetRunning(running bool) {
 
 // StartService starts the service for the current mode
 func (rs *RunService) StartService() map[string]interface{} {
+	if result := proxySessionStartFailure(); result != nil {
+		return result
+	}
 	startupState := runtime.GetStartupState()
 	if !canStartProxyWithStatus(startupState.GetStatus()) {
 		return map[string]interface{}{
@@ -148,7 +155,6 @@ func (rs *RunService) StartService() map[string]interface{} {
 			"msg":    "系统尚未准备好启动代理，请先完成登录或配置恢复。",
 		}
 	}
-
 	updateStatus := softwareUpdateStatusResolver()
 	if updateStatus.BlockingProxyStart {
 		return map[string]interface{}{
@@ -171,6 +177,10 @@ func (rs *RunService) StartService() map[string]interface{} {
 			"status": "failed",
 			"msg":    "系统尚未准备好启动代理，请先完成登录或配置恢复。",
 		}
+	}
+	if result := proxySessionStartFailure(); result != nil {
+		rs.modeChangeMutex.Unlock()
+		return result
 	}
 
 	// Check if already running
@@ -199,6 +209,9 @@ func (rs *RunService) StartService() map[string]interface{} {
 			}
 		}
 	}
+	if startMode == models.ModeTUN {
+		tunPrepareStartRunner()
+	}
 	rs.isRunning = true // 先设置运行状态，避免并发启动
 	rs.modeChangeMutex.Unlock()
 
@@ -209,11 +222,12 @@ func (rs *RunService) StartService() map[string]interface{} {
 		return rs.startTUN()
 	case models.ModeHTTP:
 		// HTTP 服务内部也有检查，但我们需要先设置状态
-		go func() {
-			httpStartRunner()
+		startHTTP := httpStartRunner
+		go func(runner func()) {
+			runner()
 			// 如果启动失败，HTTP 服务内部会处理，但我们需要确保状态同步
 			// 注意：StartMitmHttp 是阻塞的，只有在停止时才会返回
-		}()
+		}(startHTTP)
 		return map[string]interface{}{
 			"status":  "success",
 			"message": "HTTP proxy server is starting",
@@ -235,6 +249,24 @@ func (rs *RunService) StartService() map[string]interface{} {
 
 func canStartProxyWithStatus(status runtime.StartupStatus) bool {
 	return status == runtime.READY || status == runtime.CONFIGURED
+}
+
+func proxySessionStartFailure() map[string]interface{} {
+	snapshot := auth.GetSessionAuthority().Snapshot()
+	if snapshot.State == auth.StateActive {
+		return nil
+	}
+	errorCode := "session_invalid"
+	message := "登录状态已失效，请重新登录后再启动代理。"
+	if snapshot.State == auth.StateRestoring || snapshot.State == auth.StateSoftExpired {
+		errorCode = "session_recovering"
+		message = "登录状态正在恢复，恢复完成前不能启动代理。"
+	}
+	return map[string]interface{}{
+		"error":  errorCode,
+		"status": "failed",
+		"msg":    message,
+	}
 }
 
 // startTUN handles TUN mode startup
@@ -295,7 +327,7 @@ func (rs *RunService) StopService() map[string]interface{} {
 // rollback. Returns whether anything was stopped.
 func (rs *RunService) StopIngressIfActive() bool {
 	rs.modeChangeMutex.Lock()
-	mode := rs.currentMode
+	mode := rs.resolveAuthoritativeModeLocked()
 	wasRunning := rs.isRunning
 	rs.modeChangeMutex.Unlock()
 
@@ -303,7 +335,11 @@ func (rs *RunService) StopIngressIfActive() bool {
 	// desync false after a mode switch, daemon restart, or activation rollback
 	// while 56432 is still bound — keying off only the flag leaves the proxy
 	// serving a dead token (forwarding to a cloud that returns 401).
-	if !wasRunning && !httpProxyIsRunningProbe() {
+	actualRunning := httpProxyIsRunningProbe()
+	if mode == models.ModeTUN {
+		actualRunning = tunProxyIsRunningProbe()
+	}
+	if !wasRunning && !actualRunning {
 		return false
 	}
 
@@ -317,15 +353,24 @@ func (rs *RunService) StopIngressIfActive() bool {
 	return true
 }
 
-// StopIngressForLogout force-stops the authoritative ingress mode without
-// trusting isRunning or an HTTP-only listener probe. Explicit logout is a
-// security boundary: a desynchronized TUN runtime must be stopped even when the
-// generic activity checks claim nothing is running.
-func (rs *RunService) StopIngressForLogout() models.RunMode {
+// StopIngressForLogout stops the authoritative ingress mode when either local
+// bookkeeping or the mode-specific resource probe says it is active. Explicit
+// logout is a security boundary, but an already inactive TUN must not receive a
+// stop signal that could leak into its next lifecycle.
+func (rs *RunService) StopIngressForLogout() (models.RunMode, bool) {
 	rs.modeChangeMutex.Lock()
 	mode := rs.resolveAuthoritativeModeLocked()
+	wasRunning := rs.isRunning
 	rs.isRunning = false
 	rs.modeChangeMutex.Unlock()
+
+	actualRunning := httpProxyIsRunningProbe()
+	if mode == models.ModeTUN {
+		actualRunning = tunProxyIsRunningProbe()
+	}
+	if !wasRunning && !actualRunning {
+		return mode, false
+	}
 
 	switch mode {
 	case models.ModeTUN:
@@ -334,7 +379,7 @@ func (rs *RunService) StopIngressForLogout() models.RunMode {
 		mode = models.ModeHTTP
 		httpStopRunner()
 	}
-	return mode
+	return mode, true
 }
 
 // GetStatus returns the current service status

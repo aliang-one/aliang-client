@@ -1,12 +1,15 @@
 package user
 
 import (
+	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
 func TestSessionAuthorityLoginTransitionsToActive(t *testing.T) {
-	a := &SessionAuthority{}
+	a := newSessionAuthority(StateRestoring)
 	var got []SessionEvent
 	a.Subscribe(func(e SessionEvent) { got = append(got, e) })
 
@@ -23,24 +26,40 @@ func TestSessionAuthorityLoginTransitionsToActive(t *testing.T) {
 	}
 }
 
-func TestSessionAuthorityIdempotentNoRefireOnSameState(t *testing.T) {
-	a := &SessionAuthority{}
+func TestSessionAuthorityRejectsNilAuthenticatedUser(t *testing.T) {
+	a := newSessionAuthority(StateUnauthenticated)
+
+	if a.NotifyLoggedIn(nil) {
+		t.Fatal("nil user must not produce an authenticated transition")
+	}
+	if got := a.State(); got != StateUnauthenticated {
+		t.Fatalf("state = %s, want unauthenticated", got)
+	}
+	if a.CanProxy() {
+		t.Fatal("nil authenticated user must not enable proxy admission")
+	}
+}
+
+func TestSessionAuthorityRefreshPublishesNewRevisionInSameState(t *testing.T) {
+	a := newSessionAuthority(StateRestoring)
 	var fires int
 	a.Subscribe(func(e SessionEvent) { fires++ })
 
-	a.NotifyLoggedIn(&UserInfo{})  // →Active, fires once
-	a.NotifyRefreshed(&UserInfo{}) // Active→Active: must NOT refire
+	a.NotifyLoggedIn(&UserInfo{})
+	first := a.Snapshot()
+	a.NotifyRefreshed(&UserInfo{})
+	second := a.Snapshot()
 
-	if fires != 1 {
-		t.Fatalf("expected 1 fire (idempotent), got %d", fires)
+	if fires != 2 {
+		t.Fatalf("expected login and refresh snapshots, got %d events", fires)
 	}
-	if a.State() != StateActive {
-		t.Fatalf("state=%v want Active", a.State())
+	if second.Revision != first.Revision+1 || second.InstanceID != first.InstanceID {
+		t.Fatalf("bad snapshot versions: first=%+v second=%+v", first, second)
 	}
 }
 
 func TestSessionAuthorityAccessRejectedGoesSoftExpired(t *testing.T) {
-	a := &SessionAuthority{state: StateActive}
+	a := newSessionAuthority(StateActive)
 	var got SessionEvent
 	a.Subscribe(func(e SessionEvent) { got = e })
 
@@ -55,7 +74,7 @@ func TestSessionAuthorityAccessRejectedGoesSoftExpired(t *testing.T) {
 }
 
 func TestSessionAuthorityAccessRejectedNoOpFromHardInvalid(t *testing.T) {
-	a := &SessionAuthority{state: StateHardInvalid}
+	a := newSessionAuthority(StateHardInvalid)
 	var fired bool
 	a.Subscribe(func(e SessionEvent) { fired = true })
 
@@ -71,7 +90,7 @@ func TestSessionAuthorityAccessRejectedNoOpFromHardInvalid(t *testing.T) {
 }
 
 func TestSessionAuthorityRefreshFailedPermanentIsHardInvalid(t *testing.T) {
-	a := &SessionAuthority{state: StateActive}
+	a := newSessionAuthority(StateActive)
 	var got SessionEvent
 	a.Subscribe(func(e SessionEvent) { got = e })
 
@@ -86,7 +105,7 @@ func TestSessionAuthorityRefreshFailedPermanentIsHardInvalid(t *testing.T) {
 }
 
 func TestSessionAuthorityRefreshFailedTransientIsSoftExpired(t *testing.T) {
-	a := &SessionAuthority{state: StateActive}
+	a := newSessionAuthority(StateActive)
 	a.NotifyRefreshFailed(false, "")
 	if a.State() != StateSoftExpired {
 		t.Fatalf("state=%v want SoftExpired", a.State())
@@ -94,7 +113,7 @@ func TestSessionAuthorityRefreshFailedTransientIsSoftExpired(t *testing.T) {
 }
 
 func TestSessionAuthoritySoftExpiredRecoversToActive(t *testing.T) {
-	a := &SessionAuthority{state: StateSoftExpired}
+	a := newSessionAuthority(StateSoftExpired)
 	var got SessionEvent
 	a.Subscribe(func(e SessionEvent) { got = e })
 
@@ -108,18 +127,18 @@ func TestSessionAuthoritySoftExpiredRecoversToActive(t *testing.T) {
 	}
 }
 
-func TestSessionAuthorityLoggedOutIsHardInvalid(t *testing.T) {
-	a := &SessionAuthority{state: StateActive}
+func TestSessionAuthorityLoggedOutIsUnauthenticated(t *testing.T) {
+	a := newSessionAuthority(StateActive)
 	var fires int
 	a.Subscribe(func(e SessionEvent) {
-		if e.To == StateHardInvalid && e.Reason == ReasonLogout {
+		if e.To == StateUnauthenticated && e.Reason == ReasonLogout {
 			fires++
 		}
 	})
 	a.NotifyLoggedOut()
 	a.NotifyLoggedOut()
-	if a.State() != StateHardInvalid {
-		t.Fatalf("state=%v want HardInvalid", a.State())
+	if a.State() != StateUnauthenticated {
+		t.Fatalf("state=%v want Unauthenticated", a.State())
 	}
 	if fires != 2 {
 		t.Fatalf("logout listener fires=%d want 2", fires)
@@ -131,7 +150,7 @@ func TestSessionAuthorityLoggedOutIsHardInvalid(t *testing.T) {
 // it must re-fire HardInvalid listeners every time — even when already
 // HardInvalid — so idempotent cleanup re-runs on every wipe.
 func TestSessionAuthorityRefreshFailedPermanentForceFiresOnEveryWipe(t *testing.T) {
-	a := &SessionAuthority{state: StateActive}
+	a := newSessionAuthority(StateActive)
 	var fires int
 	a.Subscribe(func(e SessionEvent) {
 		if e.To == StateHardInvalid {
@@ -146,7 +165,7 @@ func TestSessionAuthorityRefreshFailedPermanentForceFiresOnEveryWipe(t *testing.
 }
 
 func TestSessionAuthorityListenerPanicDoesNotBreakTransition(t *testing.T) {
-	a := &SessionAuthority{}
+	a := newSessionAuthority(StateRestoring)
 	var got SessionEvent
 	a.Subscribe(func(e SessionEvent) { panic("boom") })
 	a.Subscribe(func(e SessionEvent) { got = e })
@@ -158,6 +177,146 @@ func TestSessionAuthorityListenerPanicDoesNotBreakTransition(t *testing.T) {
 	}
 	if got.To != StateActive {
 		t.Fatalf("second listener did not run after first panicked: %+v", got)
+	}
+}
+
+func TestSessionAuthoritySnapshotOwnsUserData(t *testing.T) {
+	a := newSessionAuthority(StateRestoring)
+	user := &UserInfo{Email: "owner@example.com", AllowedGroups: []int64{1, 2}}
+	a.NotifyLoggedIn(user)
+
+	user.Email = "mutated@example.com"
+	user.AllowedGroups[0] = 99
+	first := a.Snapshot()
+	if first.User == nil || first.User.Email != "owner@example.com" || first.User.AllowedGroups[0] != 1 {
+		t.Fatalf("authority retained mutable input: %+v", first.User)
+	}
+
+	first.User.Email = "consumer-mutated@example.com"
+	first.User.AllowedGroups[0] = 88
+	second := a.Snapshot()
+	if second.User.Email != "owner@example.com" || second.User.AllowedGroups[0] != 1 {
+		t.Fatalf("authority exposed mutable snapshot: %+v", second.User)
+	}
+}
+
+func TestSessionAuthorityStaleOperationCannotReactivateAfterLogout(t *testing.T) {
+	a := newSessionAuthority(StateActive)
+	operation := a.BeginOperation()
+	defer operation.Close()
+
+	a.NotifyLoggedOut()
+	persisted := false
+	err := a.CommitAuthenticated(operation, &UserInfo{Email: "late@example.com"}, ReasonRefreshed, func(*UserInfo) error {
+		persisted = true
+		return nil
+	})
+	if !errors.Is(err, ErrStaleSessionOperation) {
+		t.Fatalf("CommitAuthenticated() error=%v want ErrStaleSessionOperation", err)
+	}
+	if persisted {
+		t.Fatal("stale operation executed persistence callback")
+	}
+	if a.State() != StateUnauthenticated || a.CanProxy() {
+		t.Fatalf("stale operation revived authority: %+v", a.Snapshot())
+	}
+	if stats := a.Stats(); stats.StaleOperationCommits != 1 {
+		t.Fatalf("stale operation commits=%d, want 1", stats.StaleOperationCommits)
+	}
+}
+
+func TestSessionAuthorityCommitAuthenticatedInvalidatesPeerOperations(t *testing.T) {
+	a := newSessionAuthority(StateRestoring)
+	winner := a.BeginOperation()
+	loser := a.BeginOperation()
+	defer winner.Close()
+	defer loser.Close()
+
+	if err := a.CommitAuthenticated(winner, &UserInfo{Email: "winner@example.com"}, ReasonLogin, nil); err != nil {
+		t.Fatalf("winner commit: %v", err)
+	}
+	if err := a.CommitAuthenticated(loser, &UserInfo{Email: "loser@example.com"}, ReasonLogin, nil); !errors.Is(err, ErrStaleSessionOperation) {
+		t.Fatalf("loser commit error=%v want stale", err)
+	}
+	if got := a.Snapshot().User.Email; got != "winner@example.com" {
+		t.Fatalf("active user=%q want winner", got)
+	}
+}
+
+func TestSessionAuthorityCanProxyOnlyWhenActive(t *testing.T) {
+	for _, state := range []SessionState{StateRestoring, StateUnauthenticated, StateSoftExpired, StateHardInvalid} {
+		if newSessionAuthority(state).CanProxy() {
+			t.Fatalf("CanProxy()=true for %s", state)
+		}
+	}
+	if !newSessionAuthority(StateActive).CanProxy() {
+		t.Fatal("CanProxy()=false for Active")
+	}
+}
+
+func TestSessionAuthorityProxyLeaseDeniedOutsideActive(t *testing.T) {
+	a := newSessionAuthority(StateRestoring)
+	if lease, err := a.AcquireProxyLease(func() {}); !errors.Is(err, ErrProxyAdmissionDenied) || lease != nil {
+		t.Fatalf("AcquireProxyLease()=(%#v,%v), want nil/ErrProxyAdmissionDenied", lease, err)
+	}
+	rejected, forced := a.ProxyAdmissionStats()
+	if rejected != 1 || forced != 0 {
+		t.Fatalf("proxy admission stats=(%d,%d), want (1,0)", rejected, forced)
+	}
+}
+
+func TestSessionAuthorityDemotionClosesAdmittedProxyLease(t *testing.T) {
+	a := newSessionAuthority(StateActive)
+	var closes atomic.Int32
+	lease, err := a.AcquireProxyLease(func() { closes.Add(1) })
+	if err != nil {
+		t.Fatalf("AcquireProxyLease() error=%v", err)
+	}
+
+	a.NotifyAccessRejected("rejected")
+	lease.Release()
+
+	if closes.Load() != 1 {
+		t.Fatalf("flow close callbacks=%d, want 1", closes.Load())
+	}
+	if lease, err := a.AcquireProxyLease(nil); !errors.Is(err, ErrProxyAdmissionDenied) || lease != nil {
+		t.Fatalf("post-demotion admission=(%#v,%v), want denied", lease, err)
+	}
+	_, forced := a.ProxyAdmissionStats()
+	if forced != 1 {
+		t.Fatalf("forced flow closes=%d, want 1", forced)
+	}
+	if stats := a.Stats(); stats.ActiveProxyFlows != 0 {
+		t.Fatalf("active proxy flows=%d, want 0", stats.ActiveProxyFlows)
+	}
+}
+
+func TestSessionAuthorityProxyAdmissionLinearizesWithDemotion(t *testing.T) {
+	a := newSessionAuthority(StateActive)
+	const attempts = 128
+	var admitted atomic.Int32
+	var closed atomic.Int32
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			lease, err := a.AcquireProxyLease(func() { closed.Add(1) })
+			if err != nil {
+				return
+			}
+			admitted.Add(1)
+			defer lease.Release()
+		}()
+	}
+	close(start)
+	a.NotifyLoggedOut()
+	wg.Wait()
+
+	if got, want := closed.Load(), admitted.Load(); got != want {
+		t.Fatalf("closed admitted flows=%d, want %d", got, want)
 	}
 }
 

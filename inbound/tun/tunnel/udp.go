@@ -17,7 +17,7 @@ import (
 )
 
 // TODO: Port Restricted NAT support.
-func (t *Tunnel) handleUDPConn(uc adapter.UDPConn) {
+func (t *Tunnel) handleUDPConn(uc adapter.UDPConn, flow *udpFlowCloser) {
 	defer uc.Close()
 
 	id := uc.ID()
@@ -34,6 +34,7 @@ func (t *Tunnel) handleUDPConn(uc adapter.UDPConn) {
 		logger.Warn(fmt.Sprintf("[UDP] dial %s: %v", metadata.DestinationAddress(), err))
 		return
 	}
+	flow.Add(pc)
 	metadata.MidIP, metadata.MidPort = parseNetAddr(pc.LocalAddr())
 
 	// UDP connections are always direct (no MitM/proxy support)
@@ -57,6 +58,49 @@ func (t *Tunnel) handleUDPConn(uc adapter.UDPConn) {
 
 	logger.Debug(fmt.Sprintf("[UDP] %s <-> %s", metadata.SourceAddress(), metadata.DestinationAddress()))
 	pipePacket(uc, pc, remote, t.udpTimeout.Load())
+}
+
+type udpFlowCloser struct {
+	mu      sync.Mutex
+	closed  bool
+	closers []io.Closer
+}
+
+func newUDPFlowCloser(closers ...io.Closer) *udpFlowCloser {
+	return &udpFlowCloser{closers: closers}
+}
+
+func (f *udpFlowCloser) Add(closer io.Closer) {
+	if closer == nil {
+		return
+	}
+
+	f.mu.Lock()
+	if !f.closed {
+		f.closers = append(f.closers, closer)
+		f.mu.Unlock()
+		return
+	}
+	f.mu.Unlock()
+	_ = closer.Close()
+}
+
+func (f *udpFlowCloser) Close() {
+	f.mu.Lock()
+	if f.closed {
+		f.mu.Unlock()
+		return
+	}
+	f.closed = true
+	closers := f.closers
+	f.closers = nil
+	f.mu.Unlock()
+
+	for _, closer := range closers {
+		if closer != nil {
+			_ = closer.Close()
+		}
+	}
 }
 
 // dnsLoggingPacketConn logs DNS query names for UDP/53 traffic by decoding the

@@ -5,39 +5,41 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"time"
 
+	"aliang.one/nursorgate/app/http/middleware"
 	auth "aliang.one/nursorgate/processor/auth"
 )
 
-// SessionEventBroker fans SessionAuthority transitions out to connected SSE
-// clients (the browser dashboard). It bridges the in-process authority to a push
-// channel so the UI reflects identity changes instantly instead of waiting for
-// the 5s /api/startup/status poll.
+const sessionSSEHeartbeatInterval = 15 * time.Second
+
+// SessionEventBroker is a latest-value broadcaster. Each subscriber retains at
+// most one complete immutable snapshot; a slow browser loses intermediate
+// transitions but always converges to the newest authority revision.
 type SessionEventBroker struct {
-	mu      sync.RWMutex
-	clients map[uint64]chan auth.SessionEvent
+	mu      sync.Mutex
+	clients map[uint64]chan auth.SessionSnapshot
 	nextID  uint64
 }
 
 var sessionEventBroker = NewSessionEventBroker()
 
 func NewSessionEventBroker() *SessionEventBroker {
-	return &SessionEventBroker{clients: make(map[uint64]chan auth.SessionEvent)}
+	return &SessionEventBroker{clients: make(map[uint64]chan auth.SessionSnapshot)}
 }
 
 func init() {
-	// Broadcast every authority transition to connected SSE clients.
-	auth.GetSessionAuthority().Subscribe(func(e auth.SessionEvent) {
-		sessionEventBroker.Broadcast(e)
+	auth.SubscribeGlobal(func(event auth.SessionEvent) {
+		sessionEventBroker.Publish(event.Snapshot)
 	})
 }
 
-func (b *SessionEventBroker) Subscribe() (uint64, <-chan auth.SessionEvent) {
+func (b *SessionEventBroker) Subscribe() (uint64, <-chan auth.SessionSnapshot) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.nextID++
 	id := b.nextID
-	ch := make(chan auth.SessionEvent, 16)
+	ch := make(chan auth.SessionSnapshot, 1)
 	b.clients[id] = ch
 	return id, ch
 }
@@ -51,31 +53,44 @@ func (b *SessionEventBroker) Unsubscribe(id uint64) {
 	}
 }
 
-// Broadcast is non-blocking: a slow client whose buffer is full is dropped
-// (it will re-sync on the next reconnect's snapshot).
-func (b *SessionEventBroker) Broadcast(e auth.SessionEvent) {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
+func (b *SessionEventBroker) Publish(snapshot auth.SessionSnapshot) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	for _, ch := range b.clients {
 		select {
-		case ch <- e:
+		case ch <- snapshot:
+			continue
+		default:
+		}
+
+		// Replace the stale pending snapshot. Publish calls are serialized by b.mu,
+		// so the single queued value cannot move backwards in revision order.
+		select {
+		case <-ch:
+		default:
+		}
+		select {
+		case ch <- snapshot:
 		default:
 		}
 	}
 }
 
 func (b *SessionEventBroker) ClientCount() int {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	return len(b.clients)
 }
 
-// ServeSessionEvents is the SSE endpoint for the browser dashboard.
-// GET /api/session/events — sends a state snapshot on connect, then streams
-// each transition until the client disconnects.
+// ServeSessionEvents subscribes before reading the initial authority snapshot.
+// A transition racing that read is either reflected in the read or queued; the
+// browser revision reducer safely ignores any duplicate/older queued snapshot.
 func ServeSessionEvents(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !middleware.RequireDashboardSession(w, r) {
 		return
 	}
 	flusher, ok := w.(http.Flusher)
@@ -88,54 +103,42 @@ func ServeSessionEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
 
-	snapshot := buildSessionSnapshot(auth.GetSessionAuthority().State(), auth.GetCurrentUserInfo())
-	writeSSE(w, snapshot)
-	flusher.Flush()
-
 	id, ch := sessionEventBroker.Subscribe()
 	defer sessionEventBroker.Unsubscribe(id)
 
-	ctx := r.Context()
+	if err := writeSessionSSE(w, BuildSessionSnapshotPayload(auth.GetSessionAuthority().Snapshot())); err != nil {
+		return
+	}
+	flusher.Flush()
+
+	heartbeat := time.NewTicker(sessionSSEHeartbeatInterval)
+	defer heartbeat.Stop()
 	for {
 		select {
-		case <-ctx.Done():
+		case <-r.Context().Done():
 			return
-		case e, ok := <-ch:
+		case snapshot, ok := <-ch:
 			if !ok {
 				return
 			}
-			writeSSE(w, map[string]any{
-				"type":   "transition",
-				"from":   e.From.String(),
-				"to":     e.To.String(),
-				"reason": string(e.Reason),
-			})
+			if err := writeSessionSSE(w, BuildSessionSnapshotPayload(snapshot)); err != nil {
+				return
+			}
+			flusher.Flush()
+		case <-heartbeat.C:
+			if _, err := fmt.Fprint(w, ": heartbeat\n\n"); err != nil {
+				return
+			}
 			flusher.Flush()
 		}
 	}
 }
 
-func buildSessionSnapshot(state auth.SessionState, user *auth.UserInfo) map[string]any {
-	snapshot := map[string]any{
-		"type":  "snapshot",
-		"state": state.String(),
-	}
-	if user != nil && (state == auth.StateActive || state == auth.StateSoftExpired) {
-		snapshot["user"] = map[string]any{
-			"id":       user.ID,
-			"email":    user.Email,
-			"username": user.Username,
-			"role":     user.Role,
-			"status":   user.Status,
-		}
-	}
-	return snapshot
-}
-
-func writeSSE(w http.ResponseWriter, payload map[string]any) {
+func writeSessionSSE(w http.ResponseWriter, payload SessionSnapshotPayload) error {
 	data, err := json.Marshal(payload)
 	if err != nil {
-		return
+		return err
 	}
-	_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
+	_, err = fmt.Fprintf(w, "data: %s\n\n", data)
+	return err
 }

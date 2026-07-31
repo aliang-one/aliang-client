@@ -10,6 +10,7 @@ import (
 	"aliang.one/nursorgate/common/logger"
 	"aliang.one/nursorgate/inbound/tun/adapter"
 	"aliang.one/nursorgate/outbound/proxy"
+	auth "aliang.one/nursorgate/processor/auth"
 	"aliang.one/nursorgate/processor/statistic"
 
 	"go.uber.org/atomic"
@@ -82,6 +83,11 @@ func (t *Tunnel) UDPIn() chan<- adapter.UDPConn {
 }
 
 func (t *Tunnel) HandleTCP(conn adapter.TCPConn) {
+	lease, err := auth.GetSessionAuthority().AcquireProxyLease(func() { _ = conn.Close() })
+	if err != nil {
+		_ = conn.Close()
+		return
+	}
 	select {
 	case t.tcpLimiter <- struct{}{}:
 		t.trackTCPConn(conn)
@@ -90,6 +96,7 @@ func (t *Tunnel) HandleTCP(conn adapter.TCPConn) {
 
 		go func() {
 			defer func() {
+				lease.Release()
 				if r := recover(); r != nil {
 					logger.Error("Recovered from panic in Tunnel.HandleTCP goroutine: ", logger.SafeRecoveredValueString(r))
 					debug.PrintStack()
@@ -102,6 +109,7 @@ func (t *Tunnel) HandleTCP(conn adapter.TCPConn) {
 			t.handleTCPConn(conn)
 		}()
 	default:
+		lease.Release()
 		rejected := t.rejectedTCPConn.Inc()
 		logger.Warn(fmt.Sprintf(
 			"[TUN TCP] concurrency limit reached active=%d limit=%d rejected_total=%d; closing new connection",
@@ -139,7 +147,16 @@ func (t *Tunnel) process(ctx context.Context) {
 			for {
 				select {
 				case conn := <-t.udpQueue:
-					t.handleUDPConn(conn)
+					flow := newUDPFlowCloser(conn)
+					lease, err := auth.GetSessionAuthority().AcquireProxyLease(flow.Close)
+					if err != nil {
+						flow.Close()
+						continue
+					}
+					func() {
+						defer lease.Release()
+						t.handleUDPConn(conn, flow)
+					}()
 				case <-ctx.Done():
 					return
 				}

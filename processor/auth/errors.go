@@ -14,6 +14,8 @@ import (
 
 var ErrRefreshTokenInvalid = errors.New("refresh token invalid")
 var ErrSessionExpired = errors.New("auth session expired")
+var ErrSessionRecovering = errors.New("auth session recovering")
+var ErrNoLocalSession = errors.New("no local auth session")
 
 var (
 	authSuccessHandlerMu sync.RWMutex
@@ -127,8 +129,9 @@ func clearLocalSessionAfterExpiredAccessToken() {
 // RecoverOrExpireLocalSession signals that the cloud rejected the access token
 // (e.g. agent device-register 401, user-center access-token 401). The session
 // enters SoftExpired: the ingress proxy is paused (no forwarding with a rejected
-// token — closes 缺口 B) and the recovery coordinator renews the token async
-// (→ Active on success, → HardInvalid on permanent failure / timeout).
+// token — closes 缺口 B) and the recovery coordinator renews the token async.
+// Transient failures keep retrying without forcing a re-login; only a permanent
+// rejection escalates to HardInvalid.
 //
 // MUST NOT be called while the caller holds a lock that the SoftExpired listener
 // re-acquires: onSessionEvent(StateSoftExpired) calls runService.StopIngressIfActive
@@ -154,11 +157,14 @@ func ExpireLocalSession(reason string) {
 }
 
 func clearLocalSessionAfterExpiration(reason string) {
+	// Invalidate every in-flight restore/refresh/login before deleting local data.
+	// A late success can no longer repersist credentials or publish Active after
+	// this terminal boundary.
+	GetSessionAuthority().NotifyRefreshFailed(true, sessionReasonFromWipeReason(reason))
 	StopTokenRefresh()
 	if !IsSessionOwnerProcess() {
 		SetCurrentUserInfo(nil)
 		logger.Warn(fmt.Sprintf("Non-owner process ignored persisted session cleanup after %s", reason))
-		GetSessionAuthority().NotifyRefreshFailed(true, sessionReasonFromWipeReason(reason))
 		return
 	}
 
@@ -169,7 +175,6 @@ func clearLocalSessionAfterExpiration(reason string) {
 
 	config.SetHasLocalUserInfo(false)
 	logger.Info(fmt.Sprintf("Local auth session cleared after %s", reason))
-	GetSessionAuthority().NotifyRefreshFailed(true, sessionReasonFromWipeReason(reason))
 	logger.Warn("Authentication expired - proxy service should be stopped")
 }
 

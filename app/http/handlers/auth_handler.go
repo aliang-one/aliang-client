@@ -44,12 +44,29 @@ func (h *AuthHandler) HandleRestoreSession(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	if !middleware.CanBootstrapDashboardSession(r) {
-		common.ErrorUnauthorized(w, "Remote session restore requires an authenticated dashboard session")
+	if !middleware.RequireDashboardSession(w, r) {
 		return
 	}
-	result := h.authService.RestoreSession()
-	writeAuthResult(w, r, result)
+	common.Success(w, h.authService.GetSessionSnapshot())
+}
+
+// HandleDashboardSessionBootstrap establishes request-bound local management
+// identity before the dashboard reads auth state or opens SSE. Only loopback or
+// an already authenticated dashboard session may rotate this credential.
+func (h *AuthHandler) HandleDashboardSessionBootstrap(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
+		return
+	}
+	if !middleware.CanBootstrapDashboardSession(r) {
+		common.ErrorUnauthorized(w, "Dashboard session bootstrap is restricted to loopback")
+		return
+	}
+	if err := middleware.IssueDashboardSession(w, r); err != nil {
+		common.ErrorInternalServer(w, "Failed to establish dashboard session", map[string]interface{}{"error": err.Error()})
+		return
+	}
+	common.Success(w, map[string]interface{}{"status": "success"})
 }
 
 func (h *AuthHandler) HandleRefreshSession(w http.ResponseWriter, r *http.Request) {
@@ -136,7 +153,6 @@ func (h *AuthHandler) HandleLogout(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	middleware.RevokeDashboardSession(w)
 	result := h.authService.LogoutUser(req.RefreshToken)
 	common.Success(w, result)
 }

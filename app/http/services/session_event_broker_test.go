@@ -13,11 +13,11 @@ func TestSessionEventBrokerBroadcastSubscribeUnsubscribe(t *testing.T) {
 		t.Fatalf("client count=%d want 1", b.ClientCount())
 	}
 
-	b.Broadcast(auth.SessionEvent{To: auth.StateActive, Reason: auth.ReasonLogin})
+	b.Publish(auth.SessionSnapshot{InstanceID: "instance", Revision: 2, State: auth.StateActive, Reason: auth.ReasonLogin})
 	select {
-	case e := <-ch:
-		if e.To != auth.StateActive {
-			t.Fatalf("received event To=%v want StateActive", e.To)
+	case snapshot := <-ch:
+		if snapshot.State != auth.StateActive {
+			t.Fatalf("received state=%v want StateActive", snapshot.State)
 		}
 	default:
 		t.Fatal("expected to receive the broadcast")
@@ -29,32 +29,61 @@ func TestSessionEventBrokerBroadcastSubscribeUnsubscribe(t *testing.T) {
 	}
 }
 
-func TestSessionEventBrokerBroadcastDoesNotBlockOnFullBuffer(t *testing.T) {
+func TestSessionEventBrokerPublishCoalescesToLatestSnapshot(t *testing.T) {
 	b := NewSessionEventBroker()
 	_, ch := b.Subscribe()
 	defer closeDiscard(ch)
 
-	// Overflow the 16-deep buffer; Broadcast must not block (drops instead).
+	// A slow client keeps one complete latest snapshot rather than an arbitrary
+	// stale transition from the front of a larger queue.
 	for i := 0; i < 100; i++ {
-		b.Broadcast(auth.SessionEvent{To: auth.StateActive})
+		b.Publish(auth.SessionSnapshot{InstanceID: "instance", Revision: uint64(i + 1), State: auth.StateActive})
+	}
+	select {
+	case snapshot := <-ch:
+		if snapshot.Revision != 100 {
+			t.Fatalf("coalesced revision=%d want 100", snapshot.Revision)
+		}
+	default:
+		t.Fatal("expected latest queued snapshot")
+	}
+}
+
+func TestGlobalSessionEventBrokerSurvivesAuthorityReset(t *testing.T) {
+	authority := auth.ResetSessionAuthorityForTest()
+	id, ch := sessionEventBroker.Subscribe()
+	defer sessionEventBroker.Unsubscribe(id)
+
+	authority.NotifyLoggedIn(&auth.UserInfo{Username: "reset-user"})
+
+	select {
+	case snapshot := <-ch:
+		if snapshot.State != auth.StateActive || snapshot.User == nil || snapshot.User.Username != "reset-user" {
+			t.Fatalf("broker snapshot after authority reset=%+v", snapshot)
+		}
+	default:
+		t.Fatal("global broker listener was not reattached after authority reset")
 	}
 }
 
 func TestSessionSnapshotNeverIncludesUserAfterHardInvalid(t *testing.T) {
-	snapshot := buildSessionSnapshot(auth.StateHardInvalid, &auth.UserInfo{Username: "stale-user"})
-	if _, ok := snapshot["user"]; ok {
-		t.Fatalf("hard-invalid snapshot exposed stale user: %#v", snapshot["user"])
+	snapshot := BuildSessionSnapshotPayload(auth.SessionSnapshot{State: auth.StateHardInvalid, User: &auth.UserInfo{Username: "stale-user"}})
+	if snapshot.User != nil {
+		t.Fatalf("hard-invalid snapshot exposed stale user: %#v", snapshot.User)
 	}
-	if snapshot["state"] != "hard_invalid" {
-		t.Fatalf("snapshot state = %#v, want hard_invalid", snapshot["state"])
+	if snapshot.State != "hard_invalid" || snapshot.Outcome != "session_invalid" {
+		t.Fatalf("snapshot = %#v, want hard_invalid/session_invalid", snapshot)
 	}
 }
 
 func TestSessionSnapshotIncludesUserWhileActive(t *testing.T) {
-	snapshot := buildSessionSnapshot(auth.StateActive, &auth.UserInfo{Username: "active-user"})
-	if _, ok := snapshot["user"]; !ok {
+	snapshot := BuildSessionSnapshotPayload(auth.SessionSnapshot{InstanceID: "instance", Revision: 7, State: auth.StateActive, User: &auth.UserInfo{Username: "active-user"}})
+	if snapshot.User == nil {
 		t.Fatal("active snapshot omitted user")
+	}
+	if snapshot.InstanceID != "instance" || snapshot.Revision != 7 {
+		t.Fatalf("snapshot version lost: %#v", snapshot)
 	}
 }
 
-func closeDiscard(_ <-chan auth.SessionEvent) {}
+func closeDiscard(_ <-chan auth.SessionSnapshot) {}

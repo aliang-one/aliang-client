@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 
 	"aliang.one/nursorgate/common/logger"
+	auth "aliang.one/nursorgate/processor/auth"
 	"aliang.one/nursorgate/processor/config"
 )
 
@@ -34,23 +35,25 @@ func StartMitmHttp() {
 		logger.Warn("HTTP proxy is already running")
 		return
 	}
+	if !auth.GetSessionAuthority().CanProxy() {
+		httpMutex.Unlock()
+		logger.Warn("HTTP proxy start rejected: active session required")
+		return
+	}
 
-	// Create a cancellable context for shutdown
-	httpCtx, httpCancel = context.WithCancel(context.Background())
-	isHttpRunning = true
-	httpMutex.Unlock()
-
-	// Create listener
+	// Bind while holding the lifecycle lock. Logout first demotes authority, then
+	// StopHttpProxy takes this same lock; this prevents a delayed start from
+	// binding after the stop path observed an empty listener.
 	listenAddr := config.HTTPProxyListenAddr()
 	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
-		httpMutex.Lock()
 		isHttpRunning = false
 		httpMutex.Unlock()
 		logger.GetMainLogger().Fatal(fmt.Sprintf("Failed to listen on %s: %v", listenAddr, err))
 	}
 
-	httpMutex.Lock()
+	httpCtx, httpCancel = context.WithCancel(context.Background())
+	isHttpRunning = true
 	httpListener = listener
 	httpMutex.Unlock()
 
@@ -137,6 +140,23 @@ func handleRawConnection(conn net.Conn) {
 		logger.Error(fmt.Sprintf("[CONN#%d] 读取请求失败: %v", connID, err))
 		return
 	}
+
+	lease, err := auth.GetSessionAuthority().AcquireProxyLease(func() { _ = conn.Close() })
+	if err != nil {
+		response := &http.Response{
+			Status:        "503 Service Unavailable",
+			StatusCode:    http.StatusServiceUnavailable,
+			Proto:         "HTTP/1.1",
+			ProtoMajor:    1,
+			ProtoMinor:    1,
+			Body:          io.NopCloser(strings.NewReader("active session required")),
+			ContentLength: int64(len("active session required")),
+			Close:         true,
+		}
+		_ = response.Write(conn)
+		return
+	}
+	defer lease.Release()
 
 	if req.Method == "CONNECT" {
 		logger.Debug(fmt.Sprintf("[CONN#%d] CONNECT请求: %s", connID, req.Host))

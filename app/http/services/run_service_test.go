@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"aliang.one/nursorgate/app/http/models"
 	"aliang.one/nursorgate/app/http/storage"
+	auth "aliang.one/nursorgate/processor/auth"
 	"aliang.one/nursorgate/processor/config"
 	"aliang.one/nursorgate/processor/routing"
 	"aliang.one/nursorgate/processor/runtime"
@@ -57,6 +59,7 @@ func (s *fakeRunModeSnapshotStore) GetLatestEffectiveConfigSnapshotBySoftwareAnd
 
 func seedActiveIngressSnapshot(t *testing.T, mode string) {
 	t.Helper()
+	auth.ResetSessionAuthorityForTest().NotifyLoggedIn(&auth.UserInfo{ID: 1, Username: "run-test"})
 	config.ResetRoutingApplyStoreForTest()
 	raw := []byte(fmt.Sprintf(`{
 "version": 1,
@@ -79,10 +82,12 @@ func resetRunServiceHooksForTest() {
 	activeIngressModeResolver = activeIngressModeFromSnapshot
 	applyIngressModeUpdater = applyIngressModeToSnapshot
 	tunStartRunner = defaultStartTUN
+	tunPrepareStartRunner = func() {}
 	httpStartRunner = func() {}
 	httpStopRunner = func() {}
 	tunStopRunner = func() {}
 	httpProxyIsRunningProbe = func() bool { return false }
+	tunProxyIsRunningProbe = func() bool { return false }
 	runModeStoreFactory = func() runModeSnapshotStore { return storage.NewSoftwareConfigStore() }
 	aliangLinkStatusResolver = resolveAliangLinkStatus
 	softwareUpdateStatusResolver = func() models.SoftwareVersionUpdateFrontendStatus {
@@ -128,6 +133,57 @@ func TestRunServiceCharacterization_StartServiceActivationGuard(t *testing.T) {
 	}
 	if runService.IsRunning() {
 		t.Fatalf("expected service to remain not running when activation guard rejects start")
+	}
+}
+
+func TestRunServiceStartRequiresActiveSession(t *testing.T) {
+	defer resetRunServiceHooksForTest()
+	seedActiveIngressSnapshot(t, string(models.ModeHTTP))
+	runtime.ResetGlobalStartupStateForTest()
+	runtime.GetStartupState().SetStatus(runtime.READY)
+	auth.ResetSessionAuthorityForTest()
+
+	result := NewRunService().StartService()
+
+	if result["error"] != "session_recovering" {
+		t.Fatalf("start result=%#v, want session_recovering", result)
+	}
+}
+
+func TestRunServiceStartRejectsTerminalSession(t *testing.T) {
+	defer resetRunServiceHooksForTest()
+	seedActiveIngressSnapshot(t, string(models.ModeHTTP))
+	runtime.ResetGlobalStartupStateForTest()
+	runtime.GetStartupState().SetStatus(runtime.READY)
+	authority := auth.ResetSessionAuthorityForTest()
+	authority.NotifyLoggedOut()
+
+	result := NewRunService().StartService()
+
+	if result["error"] != "session_invalid" {
+		t.Fatalf("start result=%#v, want session_invalid", result)
+	}
+}
+
+func TestRunServicePreparesTUNLifecycleBeforeStarting(t *testing.T) {
+	defer resetRunServiceHooksForTest()
+	seedActiveIngressSnapshot(t, string(models.ModeTUN))
+	runtime.ResetGlobalStartupStateForTest()
+	runtime.GetStartupState().SetStatus(runtime.READY)
+	events := make([]string, 0, 2)
+	tunPrepareStartRunner = func() { events = append(events, "prepare") }
+	tunStartRunner = func() map[string]string {
+		events = append(events, "start")
+		return map[string]string{"status": "success"}
+	}
+
+	result := NewRunService().StartService()
+
+	if result["status"] != "success" {
+		t.Fatalf("TUN start result=%#v", result)
+	}
+	if got := strings.Join(events, ","); got != "prepare,start" {
+		t.Fatalf("TUN lifecycle order=%q, want prepare,start", got)
 	}
 }
 
@@ -529,6 +585,7 @@ func TestStopIngressIfActiveStopsDespiteRunningFlagDesync(t *testing.T) {
 	tunStopRunner = func() { tunStops++ }
 	// The real listener is up even though the flag says otherwise.
 	httpProxyIsRunningProbe = func() bool { return true }
+	activeIngressModeResolver = func() (models.RunMode, bool) { return models.ModeHTTP, true }
 
 	rs := NewRunService()
 	rs.SetCurrentMode(string(models.ModeHTTP))
@@ -556,7 +613,9 @@ func TestStopIngressIfActiveUsesTunStopperInTunModeEvenWhenDesynced(t *testing.T
 	var httpStops, tunStops int
 	httpStopRunner = func() { httpStops++ }
 	tunStopRunner = func() { tunStops++ }
-	httpProxyIsRunningProbe = func() bool { return true }
+	httpProxyIsRunningProbe = func() bool { return false }
+	tunProxyIsRunningProbe = func() bool { return true }
+	activeIngressModeResolver = func() (models.RunMode, bool) { return models.ModeTUN, true }
 
 	rs := NewRunService()
 	rs.SetCurrentMode(string(models.ModeTUN))
@@ -579,6 +638,8 @@ func TestStopIngressIfActiveNoopWhenNothingRunning(t *testing.T) {
 	httpStopRunner = func() { t.Fatal("httpStopRunner must not be called when nothing is running") }
 	tunStopRunner = func() { t.Fatal("tunStopRunner must not be called when nothing is running") }
 	httpProxyIsRunningProbe = func() bool { return false }
+	tunProxyIsRunningProbe = func() bool { return false }
+	activeIngressModeResolver = func() (models.RunMode, bool) { return models.ModeHTTP, true }
 
 	rs := NewRunService()
 	rs.SetCurrentMode(string(models.ModeHTTP))
@@ -597,6 +658,7 @@ func TestStopIngressIfActiveStillStopsOnNormalRunningCase(t *testing.T) {
 	var httpStops int
 	httpStopRunner = func() { httpStops++ }
 	httpProxyIsRunningProbe = func() bool { return false } // listener state irrelevant when flag is authoritative
+	activeIngressModeResolver = func() (models.RunMode, bool) { return models.ModeHTTP, true }
 
 	rs := NewRunService()
 	rs.SetCurrentMode(string(models.ModeHTTP))
@@ -620,13 +682,14 @@ func TestStopIngressForLogoutForceStopsDesyncedTUNWithoutHTTPListener(t *testing
 	httpStopRunner = func() { httpStops++ }
 	tunStopRunner = func() { tunStops++ }
 	httpProxyIsRunningProbe = func() bool { return false }
+	tunProxyIsRunningProbe = func() bool { return true }
 	activeIngressModeResolver = func() (models.RunMode, bool) { return models.ModeTUN, true }
 
 	rs := NewRunService()
 	rs.SetCurrentMode(string(models.ModeHTTP)) // stale local mode
 	rs.SetRunning(false)                       // stale running flag
 
-	if mode := rs.StopIngressForLogout(); mode != models.ModeTUN {
+	if mode, stopped := rs.StopIngressForLogout(); mode != models.ModeTUN || !stopped {
 		t.Fatalf("stopped mode = %q, want tun", mode)
 	}
 	if tunStops != 1 || httpStops != 0 {
@@ -634,8 +697,48 @@ func TestStopIngressForLogoutForceStopsDesyncedTUNWithoutHTTPListener(t *testing
 	}
 }
 
+func TestStopIngressForLogoutDoesNotSignalInactiveTUN(t *testing.T) {
+	defer resetRunServiceHooksForTest()
+
+	tunStopRunner = func() { t.Fatal("inactive TUN must not receive a buffered stop signal") }
+	httpStopRunner = func() { t.Fatal("inactive TUN logout must not call HTTP stopper") }
+	httpProxyIsRunningProbe = func() bool { return false }
+	tunProxyIsRunningProbe = func() bool { return false }
+	activeIngressModeResolver = func() (models.RunMode, bool) { return models.ModeTUN, true }
+
+	rs := NewRunService()
+	rs.SetRunning(false)
+	mode, stopped := rs.StopIngressForLogout()
+	if mode != models.ModeTUN || stopped {
+		t.Fatalf("inactive logout stop=(%q,%t), want (tun,false)", mode, stopped)
+	}
+}
+
+func TestStopIngressIfActiveUsesActualTUNEngineState(t *testing.T) {
+	defer resetRunServiceHooksForTest()
+
+	var httpStops, tunStops int
+	httpStopRunner = func() { httpStops++ }
+	tunStopRunner = func() { tunStops++ }
+	httpProxyIsRunningProbe = func() bool { return false }
+	tunProxyIsRunningProbe = func() bool { return true }
+	activeIngressModeResolver = func() (models.RunMode, bool) { return models.ModeTUN, true }
+
+	rs := NewRunService()
+	rs.SetCurrentMode(string(models.ModeHTTP))
+	rs.SetRunning(false)
+
+	if !rs.StopIngressIfActive() {
+		t.Fatal("desynchronized live TUN engine was not detected")
+	}
+	if tunStops != 1 || httpStops != 0 || rs.IsRunning() {
+		t.Fatalf("stoppers http=%d tun=%d running=%t, want 0/1/false", httpStops, tunStops, rs.IsRunning())
+	}
+}
+
 func TestStartServiceRechecksActivationAfterWaitingForModeLock(t *testing.T) {
 	defer resetRunServiceHooksForTest()
+	auth.ResetSessionAuthorityForTest().NotifyLoggedIn(&auth.UserInfo{ID: 1, Username: "run-test"})
 	runtime.ResetGlobalStartupStateForTest()
 	startup := runtime.GetStartupState()
 	startup.SetStatus(runtime.READY)
@@ -664,5 +767,41 @@ func TestStartServiceRechecksActivationAfterWaitingForModeLock(t *testing.T) {
 	}
 	if httpStarts != 0 || rs.IsRunning() {
 		t.Fatalf("logout-racing start escaped gate: starts=%d running=%t", httpStarts, rs.IsRunning())
+	}
+}
+
+func TestStartServiceRechecksSessionAfterWaitingForModeLock(t *testing.T) {
+	defer resetRunServiceHooksForTest()
+	authority := auth.ResetSessionAuthorityForTest()
+	authority.NotifyLoggedIn(&auth.UserInfo{ID: 1, Username: "run-test"})
+	runtime.ResetGlobalStartupStateForTest()
+	runtime.GetStartupState().SetStatus(runtime.READY)
+
+	reachedPreLockCheck := make(chan struct{})
+	softwareUpdateStatusResolver = func() models.SoftwareVersionUpdateFrontendStatus {
+		close(reachedPreLockCheck)
+		return models.SoftwareVersionUpdateFrontendStatus{}
+	}
+	var httpStarts int
+	httpStartRunner = func() { httpStarts++ }
+
+	rs := NewRunService()
+	rs.SetCurrentMode(string(models.ModeHTTP))
+	rs.modeChangeMutex.Lock()
+	resultCh := make(chan map[string]interface{}, 1)
+	go func() { resultCh <- rs.StartService() }()
+
+	<-reachedPreLockCheck
+	authority.NotifyLoggedOut()
+	// Isolate the session recheck from the startup listener's orthogonal gate.
+	runtime.GetStartupState().SetStatus(runtime.READY)
+	rs.modeChangeMutex.Unlock()
+
+	result := <-resultCh
+	if result["error"] != "session_invalid" {
+		t.Fatalf("start result=%#v, want session_invalid", result)
+	}
+	if httpStarts != 0 || rs.IsRunning() {
+		t.Fatalf("logout-racing start escaped session gate: starts=%d running=%t", httpStarts, rs.IsRunning())
 	}
 }

@@ -21,6 +21,7 @@ import (
 	"aliang.one/nursorgate/inbound/tun/option"
 	"aliang.one/nursorgate/inbound/tun/tunnel"
 	proxyRegistry "aliang.one/nursorgate/outbound"
+	auth "aliang.one/nursorgate/processor/auth"
 	config "aliang.one/nursorgate/processor/config"
 	"aliang.one/nursorgate/processor/dns"
 	"github.com/docker/go-units"
@@ -56,9 +57,21 @@ func Stop() {
 	}
 }
 
+// IsRunning reports the actual engine resource state rather than a UI/service
+// bookkeeping flag. It is used by auth demotion to tear down a desynchronized
+// TUN runtime safely.
+func IsRunning() bool {
+	_engineMu.Lock()
+	defer _engineMu.Unlock()
+	return _defaultDevice != nil || _defaultStack != nil
+}
+
 func start() error {
 	_engineMu.Lock()
 	defer _engineMu.Unlock()
+	if !auth.GetSessionAuthority().CanProxy() {
+		return auth.ErrProxyAdmissionDenied
+	}
 
 	if config.GetDefaultEngineConf() == nil {
 		return errors.New("empty key")

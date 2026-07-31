@@ -45,3 +45,20 @@ func TestAuthHandlerRejectsRemoteSessionBootstrapWithoutCookie(t *testing.T) {
 		t.Fatalf("status = %d, want 401; body=%s", rec.Code, rec.Body.String())
 	}
 }
+
+func TestAuthHandlerBootstrapsLoopbackManagementSession(t *testing.T) {
+	middleware.ResetDashboardSessionForTest()
+	t.Cleanup(middleware.ResetDashboardSessionForTest)
+	req := httptest.NewRequest(http.MethodPost, "/api/dashboard/session", nil)
+	req.RemoteAddr = "127.0.0.1:40000"
+	rec := httptest.NewRecorder()
+
+	NewAuthHandler().HandleDashboardSessionBootstrap(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if cookies := rec.Result().Cookies(); len(cookies) != 1 || cookies[0].Name != middleware.DashboardSessionCookieName {
+		t.Fatalf("bootstrap cookies = %#v", cookies)
+	}
+}

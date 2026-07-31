@@ -310,6 +310,56 @@ func TestRestoreSession_ProfileRejectsRefreshedTokenDoesNotResurrectSession(t *t
 	}
 }
 
+func TestRestoreSessionTransientFailurePublishesRecoveringSnapshot(t *testing.T) {
+	baseDir := t.TempDir()
+	t.Setenv("HOME", filepath.Join(baseDir, "home"))
+	t.Setenv("ALIANG_CACHE_DIR", filepath.Join(baseDir, "cache"))
+	ResetAuthPersistenceForTest()
+	StopTokenRefresh()
+	config.ResetGlobalConfigForTest()
+	t.Cleanup(func() {
+		StopTokenRefresh()
+		ResetAuthPersistenceForTest()
+		config.ResetGlobalConfigForTest()
+	})
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "temporary upstream outage", http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	config.SetGlobalConfig(&config.Config{Core: &config.CoreConfig{APIServer: server.URL}})
+
+	want := &UserInfo{
+		AccessToken:  "cached-access",
+		RefreshToken: "cached-refresh",
+		TokenType:    "Bearer",
+		Username:     "cached-user",
+		UpdatedAt:    time.Now(),
+	}
+	if err := SaveUserInfo(want); err != nil {
+		t.Fatalf("SaveUserInfo() error=%v", err)
+	}
+	authority := ResetSessionAuthorityForTest()
+
+	got, err := RestoreSession()
+	if !errors.Is(err, ErrSessionRecovering) {
+		t.Fatalf("RestoreSession() error=%v, want ErrSessionRecovering", err)
+	}
+	if got == nil || got.Username != "cached-user" {
+		t.Fatalf("RestoreSession() user=%#v, want cached user", got)
+	}
+	snapshot := authority.Snapshot()
+	if snapshot.State != StateSoftExpired || snapshot.Reason != ReasonRestoreUnavailable {
+		t.Fatalf("authority snapshot=%+v, want SoftExpired/RestoreUnavailable", snapshot)
+	}
+	if snapshot.User == nil || snapshot.User.Username != "cached-user" || authority.CanProxy() {
+		t.Fatalf("recovering authority user/gate mismatch: %+v", snapshot)
+	}
+	if persisted, loadErr := LoadUserInfo(); loadErr != nil || persisted.Username != "cached-user" {
+		t.Fatalf("persisted session was lost: user=%#v err=%v", persisted, loadErr)
+	}
+}
+
 func TestRefreshSession_RenewsAccessTokenAndRetainsRefreshTokenWhenOmitted(t *testing.T) {
 	baseDir, err := os.MkdirTemp("", "aliang-refresh-missing-token-*")
 	if err != nil {

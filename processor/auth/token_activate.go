@@ -57,6 +57,9 @@ func LoginWithPassword(email, password, turnstileToken string) (*UserInfo, error
 	if strings.TrimSpace(password) == "" {
 		return nil, fmt.Errorf("password cannot be empty")
 	}
+	authority := GetSessionAuthority()
+	operation := authority.BeginOperation()
+	defer operation.Close()
 
 	urlBuilder, err := config.NewURLBuilder()
 	if err != nil {
@@ -87,6 +90,7 @@ func LoginWithPassword(email, password, turnstileToken string) (*UserInfo, error
 	}
 
 	req.Header.Set("Content-Type", "application/json")
+	req = req.WithContext(operation.Context())
 
 	client := &http.Client{
 		Timeout: apiTimeout,
@@ -94,6 +98,9 @@ func LoginWithPassword(email, password, turnstileToken string) (*UserInfo, error
 
 	resp, err := client.Do(req)
 	if err != nil {
+		if !authority.OperationCurrent(operation) {
+			return nil, ErrStaleSessionOperation
+		}
 		return nil, fmt.Errorf("failed to send request: %w", err)
 	}
 	defer resp.Body.Close()
@@ -119,15 +126,25 @@ func LoginWithPassword(email, password, turnstileToken string) (*UserInfo, error
 		return nil, fmt.Errorf("login response missing refresh_token")
 	}
 
-	return finalizeAuthenticatedSession(response.Data.AccessToken, response.Data.RefreshToken, response.Data.TokenType, response.Data.ExpiresIn)
+	return finalizeAuthenticatedSessionWithOperation(operation, response.Data.AccessToken, response.Data.RefreshToken, response.Data.TokenType, response.Data.ExpiresIn)
 }
 
 // finalizeAuthenticatedSession 把已取得的 access/refresh token 落地为本地登录态：拉取个人资料、
 // 组装 UserInfo、持久化、启动刷新器、置位就绪标志。密码登录与扫码登录共用此收尾，
 // 确保两条登录路径产出的本地态逐字段等价（下游 /me、刷新器、Authorization-Inner 行为一致）。
 func finalizeAuthenticatedSession(accessToken, refreshToken, tokenType string, expiresIn int) (*UserInfo, error) {
+	authority := GetSessionAuthority()
+	operation := authority.BeginOperation()
+	defer operation.Close()
+	return finalizeAuthenticatedSessionWithOperation(operation, accessToken, refreshToken, tokenType, expiresIn)
+}
+
+func finalizeAuthenticatedSessionWithOperation(operation *SessionOperation, accessToken, refreshToken, tokenType string, expiresIn int) (*UserInfo, error) {
 	profile, err := GetUserProfileWithToken(accessToken)
 	if err != nil {
+		if !GetSessionAuthority().OperationCurrent(operation) {
+			return nil, ErrStaleSessionOperation
+		}
 		return nil, fmt.Errorf("failed to fetch user profile after login: %w", err)
 	}
 
@@ -138,15 +155,19 @@ func finalizeAuthenticatedSession(accessToken, refreshToken, tokenType string, e
 	userInfo.ExpiresIn = expiresIn
 	userInfo.UpdatedAt = time.Now()
 
-	if err := SaveUserInfo(userInfo); err != nil {
-		logger.Warn(fmt.Sprintf("Failed to save user info locally: %v", err))
+	authority := GetSessionAuthority()
+	snapshot, err := authority.CommitAuthenticatedSnapshot(operation, userInfo, ReasonLogin, func(committed *UserInfo) error {
+		if err := SaveUserInfo(committed); err != nil {
+			logger.Warn(fmt.Sprintf("Failed to save user info locally: %v", err))
+		}
+		config.SetUsingDefaultConfig(false)
+		config.SetHasLocalUserInfo(true)
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
-
-	startTokenRefresh()
-	config.SetUsingDefaultConfig(false)
-	config.SetHasLocalUserInfo(true)
-
-	GetSessionAuthority().NotifyLoggedIn(userInfo)
+	authority.RunIfGenerationActive(snapshot.Generation, startTokenRefresh)
 
 	return userInfo, nil
 }
@@ -164,37 +185,62 @@ func ActivateWithTokens(accessToken, refreshToken string) (*UserInfo, error) {
 	if refreshToken == "" {
 		return nil, fmt.Errorf("refresh token cannot be empty")
 	}
-	return finalizeAuthenticatedSession(accessToken, refreshToken, "Bearer", scanAccessTokenTTLSeconds)
+	authority := GetSessionAuthority()
+	operation := authority.BeginOperation()
+	defer operation.Close()
+	return finalizeAuthenticatedSessionWithOperation(operation, accessToken, refreshToken, "Bearer", scanAccessTokenTTLSeconds)
 }
 
 func RestoreSession() (*UserInfo, error) {
+	authority := GetSessionAuthority()
+	operation := authority.BeginOperation()
+	defer operation.Close()
+
 	localUserInfo, err := LoadUserInfo()
 	if err != nil {
-		return nil, err
+		if commitErr := authority.CommitUnauthenticated(operation, ReasonNoSession); commitErr != nil && !errors.Is(commitErr, ErrStaleSessionOperation) {
+			logger.Warn(fmt.Sprintf("Failed to publish missing local session: %v", commitErr))
+		}
+		return nil, fmt.Errorf("%w: %v", ErrNoLocalSession, err)
 	}
 
 	refreshedInfo, refreshErr := RefreshSession(localUserInfo.AccessToken)
 	if refreshErr == nil {
 		return refreshedInfo, nil
 	}
+	if errors.Is(refreshErr, ErrStaleSessionOperation) {
+		snapshot := authority.Snapshot()
+		if snapshot.State == StateActive && snapshot.User != nil {
+			return snapshot.User, nil
+		}
+		return nil, refreshErr
+	}
 	if isTerminalSessionError(refreshErr) {
 		return nil, refreshErr
 	}
+	if !authority.OperationCurrent(operation) {
+		return nil, ErrStaleSessionOperation
+	}
 
 	if strings.TrimSpace(localUserInfo.AccessToken) == "" {
-		startTokenRefresh()
 		config.SetHasLocalUserInfo(true)
-		GetSessionAuthority().NotifyLoggedIn(localUserInfo)
-		return localUserInfo, nil
+		if err := authority.CommitSoftExpired(operation, localUserInfo, ReasonRestoreUnavailable); err != nil {
+			return nil, err
+		}
+		return localUserInfo, fmt.Errorf("%w: refresh failed and saved access token is empty", ErrSessionRecovering)
 	}
 
 	profile, profileErr := GetUserProfileWithToken(localUserInfo.AccessToken)
 	if profileErr != nil {
+		if !authority.OperationCurrent(operation) {
+			return nil, ErrStaleSessionOperation
+		}
 		logger.Warn(fmt.Sprintf("Session restore profile sync skipped: refresh failed (%v), profile fetch failed (%v)", refreshErr, profileErr))
-		startTokenRefresh()
 		config.SetHasLocalUserInfo(true)
-		GetSessionAuthority().NotifyLoggedIn(localUserInfo)
-		return localUserInfo, nil
+		if err := authority.CommitSoftExpired(operation, localUserInfo, ReasonRestoreUnavailable); err != nil {
+			return nil, err
+		}
+		return localUserInfo, fmt.Errorf("%w: refresh failed: %v; profile failed: %v", ErrSessionRecovering, refreshErr, profileErr)
 	}
 
 	latestProfile := buildUserInfoFromProfile(profile)
@@ -204,13 +250,17 @@ func RestoreSession() (*UserInfo, error) {
 	latestProfile.ExpiresIn = localUserInfo.ExpiresIn
 	latestProfile.UpdatedAt = time.Now()
 
-	if err := SaveUserInfo(latestProfile); err != nil {
-		logger.Warn(fmt.Sprintf("Failed to save restored session profile: %v", err))
+	snapshot, err := authority.CommitAuthenticatedSnapshot(operation, latestProfile, ReasonRestored, func(committed *UserInfo) error {
+		if err := SaveUserInfo(committed); err != nil {
+			logger.Warn(fmt.Sprintf("Failed to save restored session profile: %v", err))
+		}
+		config.SetHasLocalUserInfo(true)
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
-
-	startTokenRefresh()
-	config.SetHasLocalUserInfo(true)
-	GetSessionAuthority().NotifyLoggedIn(latestProfile)
+	authority.RunIfGenerationActive(snapshot.Generation, startTokenRefresh)
 
 	return latestProfile, nil
 }
@@ -223,6 +273,9 @@ func RefreshSession(refreshToken string) (*UserInfo, error) {
 	if !IsSessionOwnerProcess() {
 		return nil, ErrSessionOwnerRequired
 	}
+	authority := GetSessionAuthority()
+	operation := authority.BeginOperation()
+	defer operation.Close()
 
 	current := GetCurrentUserInfoOrLoad()
 	token := ""
@@ -249,11 +302,18 @@ func RefreshSession(refreshToken string) (*UserInfo, error) {
 		latestToken := strings.TrimSpace(current.AccessToken)
 		if latestToken != "" && latestToken != token && strings.TrimSpace(current.AccessToken) != "" {
 			logger.Debug("Refresh token rotated while waiting; reusing latest local session")
-			return current, nil
+			snapshot := authority.Snapshot()
+			if snapshot.State == StateActive && snapshot.User != nil {
+				return snapshot.User, nil
+			}
+			return nil, ErrStaleSessionOperation
 		}
 		if latestToken != "" {
 			token = latestToken
 		}
+	}
+	if !authority.OperationCurrent(operation) {
+		return nil, ErrStaleSessionOperation
 	}
 
 	urlBuilder, err := config.NewURLBuilder()
@@ -280,10 +340,14 @@ func RefreshSession(refreshToken string) (*UserInfo, error) {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req = req.WithContext(operation.Context())
 
 	client := &http.Client{Timeout: apiTimeout}
 	resp, err := client.Do(req)
 	if err != nil {
+		if !authority.OperationCurrent(operation) {
+			return nil, ErrStaleSessionOperation
+		}
 		return nil, fmt.Errorf("failed to send request: %w", err)
 	}
 	defer resp.Body.Close()
@@ -295,6 +359,9 @@ func RefreshSession(refreshToken string) (*UserInfo, error) {
 
 	if resp.StatusCode != http.StatusOK {
 		if invalidTokenErr := classifyRefreshSessionFailure(resp.StatusCode, body); invalidTokenErr != nil {
+			if !authority.OperationCurrent(operation) {
+				return nil, ErrStaleSessionOperation
+			}
 			clearLocalSessionAfterInvalidRefreshToken()
 			return nil, fmt.Errorf("saved session expired: %w", invalidTokenErr)
 		}
@@ -324,6 +391,9 @@ func RefreshSession(refreshToken string) (*UserInfo, error) {
 
 	profile, err := GetUserProfileWithToken(response.Data.AccessToken)
 	if err != nil {
+		if !authority.OperationCurrent(operation) {
+			return nil, ErrStaleSessionOperation
+		}
 		var profileAPIError *authenticatedAPIError
 		if errors.As(err, &profileAPIError) && profileAPIError.StatusCode == http.StatusUnauthorized {
 			clearLocalSessionAfterExpiration("refreshed access token rejected by profile endpoint")
@@ -334,18 +404,22 @@ func RefreshSession(refreshToken string) (*UserInfo, error) {
 		applyUserProfileToUserInfo(userInfo, profile)
 	}
 
-	if err := SaveUserInfo(userInfo); err != nil {
-		logger.Warn(fmt.Sprintf("Failed to persist refreshed user info: %v", err))
+	snapshot, err := authority.CommitAuthenticatedSnapshot(operation, userInfo, ReasonRefreshed, func(committed *UserInfo) error {
+		if err := SaveUserInfo(committed); err != nil {
+			logger.Warn(fmt.Sprintf("Failed to persist refreshed user info: %v", err))
+		}
+		config.SetHasLocalUserInfo(true)
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
-
-	startTokenRefresh()
-	config.SetHasLocalUserInfo(true)
-
-	// A fresh access_token was obtained (new exp). Notify the agent so it can
-	// push it to PhoneServer (agent.session.refresh) — keeping the server's
-	// recorded session expiry current without a reconnect.
-	notifyAuthSuccessHandler()
-	GetSessionAuthority().NotifyRefreshed(userInfo)
+	authority.RunIfGenerationActive(snapshot.Generation, func() {
+		startTokenRefresh()
+		// A fresh access_token was obtained (new exp). Notify the agent so it can
+		// push it to PhoneServer while this generation is still authoritative.
+		notifyAuthSuccessHandler()
+	})
 
 	return userInfo, nil
 }
