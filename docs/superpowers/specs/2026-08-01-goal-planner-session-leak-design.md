@@ -116,23 +116,20 @@ Codex `exec --json` 不进入 `onNativeSessionID`。Codex 的 native thread id �
 
 ### 5.4 组件 4 — 扫描器排除（过滤位置是本设计最易出错点）
 
-**过滤顺序硬性要求**：
+**关键事实（纠偏）**：`collectAgentSyncSnapshot` 在 `agent_inventory.go:76` 用 `collectAgentProjects(vibeSessions)` **直接从 vibe 候选列表**派生 `Projects`，:77 `agentProjectPaths(projects)` 派生 `AuthorizedDirectories`——**不是**独立扫描。因此过滤不能在 `collectAgentProjects` 消费候选之前就把 planner session 删掉，否则会撤掉其 `projectPath` 对应的项目授权。
 
-1. 先构建**未截断**候选（codex + claude 全量）。
-2. 过滤掉 canonical id ∈ 内部 SID 集合 的条目。
-3. **然后**再取 `agentVibeSummaryMaxSessions = 200` 截断。
+**分流设计（同时满足「internal 不占名额」与「项目授权从未过滤派生」）**：
 
-否则被隐藏的内部记录仍会占用 200 个名额，挤掉真实对话。截断发生在两处——`collectAgentVibeSessions`（`agent_inventory.go:335`）与 `overlayActiveAgentVibeSessions`（`agent_inventory.go:129`）——两处的「过滤 → 截断」顺序都要对。
+把候选构建拆成 `collectRawAgentVibeSessions(scanDirs)`（codex+claude 全量、按 `UpdatedAt` 排序、**不截断不过滤**），再在消费侧分流。核心是纯函数 `partitionAgentVibeSessions(full, internal)`（`full` 已排序），返回两份：
 
-**只过滤对外 `VibeSessions`，`Projects` / `AuthorizedDirectories` 继续从未过滤候选派生**：
+- `projectsSource` = `full` 的前 `agentVibeSummaryMaxSessions=200`（**含** internal）→ 供 `collectAgentProjects` / `agentProjectPaths` 派生项目与授权目录。
+- `vibe` = `excludeInternalVibeSessions(full, internal)` 后再取前 200（**不含** internal）→ 作 `VibeSessions` 输出。
 
-- `Projects`（`agent_inventory.go:108`）与 `AuthorizedDirectories`（`agent_inventory.go:136`，经 `agentProjectPaths`）的派生必须看到**未过滤**候选。
-- 这样隐藏 planner 对话不会意外撤掉其 `project_path` 对应的项目授权（planner 跑在 goal 的 projectPath 下，授权不应因隐藏对话而消失）。
-- 落实方式：把过滤做成「仅作用于最终 `VibeSessions` 输出」的一步，不要在公共候选构建早期就把 planner session 删掉。
+这样：vibe 路径是「先过滤后截断」（internal 不占名额）；projects 路径看到含 internal 的未过滤候选（授权不丢）。两份独立截断，互不影响。
 
-**过滤落点（覆盖所有消费方）**：`collectAgentVibeSessions` 有**两个调用方**——库存同步（`collectAgentSyncSnapshot`）和 `AgentService.VibeSessions()`（`agent_service.go:231`）。过滤必须对两者都生效。最稳是让候选构建 `collectAgentVibeSessions` 自身完成「构建全量 → 过滤内部 SID → 截断 200」（把 SID 集合快照作为参数传入），这样无论哪个调用方都自动覆盖；若改在调用方过滤，则**两个**调用点都必须做，不得遗漏 `agent_service.go:231`，否则第三消费方仍会泄漏未过滤的 planner session。由于 `Projects`/`AuthorizedDirectories` 在 `overlayActiveAgentVibeSessions` 里从 `snapshot.Projects`（独立扫描）派生、而非从这些 vibe 候选派生，过滤候选不会影响项目授权——这天然满足上一条「项目授权从未过滤派生」。
+**覆盖所有消费方**：`collectAgentSyncSnapshot`（库存同步，`agent_inventory.go:73`）走上面的分流——projects 用 `projectsSource`、`VibeSessions` 用 `vibe`。`AgentService.VibeSessions()`（`agent_service.go:231`，只要可见列表、不要 projects）调用 `collectRawAgentVibeSessions` + `excludeInternalVibeSessions` + 截断 200。两路都过滤，不漏。`overlayActiveAgentVibeSessions`（`agent_inventory.go:95`）在已过滤的 `snapshot.VibeSessions` 之上叠加 active runs，其内部 :129 的截断保持不变（叠加后总量再 cap 200）。
 
-**集合传递**：内部 SID 集合由 `AgentService` / `agentAIManager` 持有，扫描时传**快照**（拷贝）给 inventory 扫描函数（含上述 `collectAgentVibeSessions` 参数）。**禁止 package global。**
+**集合传递**：内部 SID 集合由 `agentAIManager` 持有，`(m).internalNativeSessionSnapshot()` 返回拷贝；`AgentService` 经 `s.ai` 取快照传入上述函数。**禁止 package global。**
 
 ## 6. 数据流（修复后）
 
@@ -151,7 +148,8 @@ Codex `exec --json` 不进入 `onNativeSessionID`。Codex 的 native thread id �
   - 新增 `rememberPlannerNativeSession` + 内存集合 + 归一化 helper + 分桶剪枝（max 512/provider）。
   - `onNativeSessionID` plannerInternal 分支：补捕获（点 A）。
   - Codex threadID 捕获处：`plannerInternal` 时补捕获（点 B）。
-- `app/http/services/agent_inventory.go`：候选构建后、截断前过滤；`Projects`/`AuthorizedDirectories` 保持从未过滤派生；集合以参数快照传入。过滤对 `collectAgentVibeSessions` 的两个调用方（库存同步 + `agent_service.go:231` `AgentService.VibeSessions()`）都须生效——过滤做进候选构建器即自动满足。
+- `app/http/services/agent_inventory.go`：拆出 `collectRawAgentVibeSessions`（不截断不过滤）+ 纯函数 `partitionAgentVibeSessions(full, internal)`（projects 取未过滤前 200、vibe 取过滤后前 200）+ `excludeInternalVibeSessions`；`collectAgentSyncSnapshot` 用 `partition` 分流；集合以参数快照传入。
+- `app/http/services/agent_service.go`：`VibeSessions()`（:231）改用 `collectRawAgentVibeSessions` + 过滤 + 截断；`collectAgentSyncSnapshotWithActiveRuns`（:1999）把 `s.ai.internalNativeSessionSnapshot()` 传入 `collectAgentSyncSnapshot`。两个消费方都过滤，不漏。
 - 测试（见 §9）。
 
 ## 8. 风险
@@ -168,7 +166,8 @@ Codex `exec --json` 不进入 `onNativeSessionID`。Codex 的 native thread id �
 - 归一化：`claude`/`claudecode` → `claude_<id>`；`codex` → `codex_<id>`。
 - 旧 JSON 兼容 + 重启恢复：缺失新字段的旧 state 文件加载为空集合且不丢其它字段；写入后重启能读回。
 - 剪枝：单 provider 超 512 淘汰最旧；Codex 桶满不挤占 Claude 桶。
-- **过滤发生在 200 截断前**：构造候选含 ≥200 真实 + 若干 internal，断言被过滤的是 internal 且真实对话未被挤掉。
+- **过滤发生在 200 截断前**：`partitionAgentVibeSessions` 构造候选含 ≥200 真实 + 若干 internal，断言 `vibe` 被过滤的是 internal 且真实对话未被挤掉（先过滤后截断）。
+- **项目授权从未过滤派生**：同一构造里，`projectsSource`（前 200）**仍含** internal session 的 `project_path`——隐藏 planner 对话不撤授权。
 - **两个调用方都过滤**：`collectAgentVibeSessions` 的两个消费点（库存同步路径 + `AgentService.VibeSessions()`）输出都不含 internal session。
 - **隐藏 session 不影响项目授权**：含 internal 的候选，过滤后 `Projects`/`AuthorizedDirectories` 仍包含其 `project_path`。
 - 持久化失败容忍：模拟写盘失败 → 只告警、不 panic、不中断 planner。
