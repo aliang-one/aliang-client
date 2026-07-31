@@ -232,8 +232,10 @@ func TestAgentAICapabilitiesOnlyAdvertiseApprovalCapableProviders(t *testing.T) 
 			t.Fatalf("capabilities %v missing %s", withCodex, want)
 		}
 	}
-	if !agentAIStringSliceContains(withCodex, "goal_codex_native_v1") {
-		t.Fatalf("capabilities %v missing goal_codex_native_v1", withCodex)
+	// goal_codex_native_v1 is intentionally NOT advertised: native goal support
+	// for codex hasn't passed consistency verification.
+	if agentAIStringSliceContains(withCodex, "goal_codex_native_v1") {
+		t.Fatalf("capabilities %v unexpectedly contain goal_codex_native_v1", withCodex)
 	}
 }
 
