@@ -229,6 +229,10 @@ type agentAISession struct {
 	reservedNativeSessionID string
 	bindingVersion          int
 	initialContext          string
+	// isGoalFork marks a fork (re-planning exploration) session. #5: its runs are
+	// forced read-only (run.readOnly) so exploration can't mutate the workspace —
+	// real provider-level enforcement, not just a prompt.
+	isGoalFork              bool
 	cancel                  context.CancelFunc
 	activeWriter            agentTerminalWriter
 	approvalToken           string
@@ -1020,6 +1024,7 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 	reservedNativeSessionID := strings.TrimSpace(remoteString(msg, "reserved_native_session_id"))
 	bindingVersion := remoteInt(msg, "binding_version", 0)
 	initialContext := strings.TrimSpace(remoteString(msg, "initial_context"))
+	isGoalFork, _ := msg["is_goal_fork"].(bool) // #5: server flags fork sessions
 	claudePolicy := parseAgentAIClaudeRemotePolicy(msg)
 	history := remoteAgentAIHistory(msg)
 	if initialContext != "" {
@@ -1042,6 +1047,7 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 		existing.reservedNativeSessionID = reservedNativeSessionID
 		existing.bindingVersion = bindingVersion
 		existing.initialContext = initialContext
+		existing.isGoalFork = isGoalFork
 		if claudePolicy.enabled {
 			existing.claudePolicy = cloneAgentAIClaudeRemotePolicy(claudePolicy)
 			existing.claudeCaps = agentAIClaudeCapabilities{}
@@ -1068,6 +1074,7 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 		reservedNativeSessionID: reservedNativeSessionID,
 		bindingVersion:          bindingVersion,
 		initialContext:          initialContext,
+		isGoalFork:              isGoalFork,
 		claudePolicy:            cloneAgentAIClaudeRemotePolicy(claudePolicy),
 		history:                 trimAgentAIHistory(history),
 		lastActiveAt:            time.Now().UTC(),
@@ -1098,6 +1105,10 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 		messageID:    messageID,
 		goalIdentity: goalRunIdentityFromMessage(msg),
 		nativeGoal:   cloneAgentAIMap(mapIf(msg["native_goal"])),
+		// #5: a fork (re-planning exploration) session runs READ-ONLY so the AI
+		// can't mutate the workspace during exploration. Provider-level
+		// enforcement (same mechanism the goal planner uses), not just a prompt.
+		readOnly: session != nil && session.isGoalFork,
 	}
 	emitter := m.runEmitter(messageRun, writeJSON)
 	runWrite := agentTerminalWriter(emitter.emit)
@@ -1170,6 +1181,7 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 		// persisting it here is the robust fix (offline / reconnect / lost create
 		// all still converge here on first run.start → message lazy-create).
 		lazyInitialContext := strings.TrimSpace(remoteString(msg, "initial_context"))
+		lazyIsGoalFork, _ := msg["is_goal_fork"].(bool) // #5: ai.run.start lazy-create
 		lazyHistory := remoteAgentAIHistory(msg)
 		if lazyInitialContext != "" {
 			lazyHistory = append([]agentAIMessage{{
@@ -1191,6 +1203,7 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 			bindingVersion:          remoteInt(msg, "binding_version", 0),
 			claudePolicy:            cloneAgentAIClaudeRemotePolicy(parseAgentAIClaudeRemotePolicy(msg)),
 			initialContext:          lazyInitialContext,
+			isGoalFork:              lazyIsGoalFork,
 			history:                 trimAgentAIHistory(lazyHistory),
 			lastActiveAt:            time.Now().UTC(),
 		}
