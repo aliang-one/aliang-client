@@ -1162,6 +1162,23 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 		if lazyMode == "" {
 			lazyMode = "vibe"
 		}
+		// P0-1 root cause: mirror create()'s initial_context handling. ai.run.start
+		// (atomic v3) carries initial_context (the fork snapshot / goal context),
+		// but the v1 lazy-create dropped it → a fork session born via run.start
+		// never saw the goal snapshot / ALIANG_GOAL_REPLAN_DELTA contract. The
+		// server's proactive ai.session.create only covers the online happy path;
+		// persisting it here is the robust fix (offline / reconnect / lost create
+		// all still converge here on first run.start → message lazy-create).
+		lazyInitialContext := strings.TrimSpace(remoteString(msg, "initial_context"))
+		lazyHistory := remoteAgentAIHistory(msg)
+		if lazyInitialContext != "" {
+			lazyHistory = append([]agentAIMessage{{
+				Role:      "system",
+				MessageID: "initial_context",
+				Content:   lazyInitialContext,
+				CreatedAt: time.Now().UTC(),
+			}}, lazyHistory...)
+		}
 		session = &agentAISession{
 			id:                      sessionID,
 			mode:                    lazyMode,
@@ -1173,6 +1190,8 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 			reservedNativeSessionID: strings.TrimSpace(remoteString(msg, "reserved_native_session_id")),
 			bindingVersion:          remoteInt(msg, "binding_version", 0),
 			claudePolicy:            cloneAgentAIClaudeRemotePolicy(parseAgentAIClaudeRemotePolicy(msg)),
+			initialContext:          lazyInitialContext,
+			history:                 trimAgentAIHistory(lazyHistory),
 			lastActiveAt:            time.Now().UTC(),
 		}
 		m.mu.Lock()
