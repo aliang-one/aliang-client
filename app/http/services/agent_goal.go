@@ -989,19 +989,26 @@ func goalContinuePrompt(objective string, constraints, nonGoals []string, projec
 			verifiedTaskTitle = strings.TrimSpace(t)
 		}
 	}
+	// P1 reflection: surface the just-verified run's terminal report so the
+	// assessor judges drift from execution FACTS, not just titles/counts.
+	verifiedRunReport := "no execution report available"
+	if summary, _ := msg["verified_run_summary"].(string); strings.TrimSpace(summary) != "" {
+		outcome, _ := msg["verified_run_outcome"].(string)
+		verifiedRunReport = fmt.Sprintf("outcome=%s summary: %s", outcome, strings.TrimSpace(summary))
+	}
 	if postVerify {
-		return fmt.Sprintf(`You are the post-verification drift assessor for an autonomous software goal. The task "%s" just completed AND passed its machine checks. Decide whether the goal is still on track. Do NOT call any tool — this is a read-only judgment from the context provided.
+		return fmt.Sprintf(`You are the post-verification drift assessor for an autonomous software goal. The task "%s" just completed AND passed its machine checks. Decide whether the goal is still on track given what this execution revealed. Do NOT call any tool — read-only judgment.
 Your only output must be a single line beginning %s followed by compact single-line JSON shaped as:
 {"schema_version":1,"next_action":"run_next|propose_branch","rationale":string,"magnitude":"minor|major"}
 Objective: %s
 User constraints (authoritative): %s
 Non-goals (authoritative): %s
 Workspace root: %s
-Progress: %s of %s tasks completed. Just verified: %s.
+Progress: %s of %s tasks completed. Just verified: %s. Execution report: %s.
 Decision rules:
-- next_action="run_next" = the goal is still on track; continue dispatching the next task. Choose this when in doubt.
-- next_action="propose_branch" = goal drift detected: the completed work revealed a wrong assumption, an unknown decision, or that the remaining plan is materially wrong — the user should open a fork to re-plan from a branch point. Use only for MATERIAL drift (magnitude major), not minor adjustments.
-Emit the decision now. No prose before or after the %s line.`, verifiedTaskTitle, goalContinueMarker, objective, goalPromptList(constraints), goalPromptList(nonGoals), projectPath, completed, total, verifiedTaskTitle, goalContinueMarker)
+- next_action="run_next" = the goal is still on track; the execution confirmed the plan's assumptions; continue dispatching the next task. Choose this when in doubt.
+- next_action="propose_branch" = goal drift detected: the execution revealed a wrong assumption, an unknown decision, or that the remaining plan is materially wrong — the user should open a fork to re-plan from a branch point. Use only for MATERIAL drift (magnitude major) backed by the execution report, not minor adjustments.
+Emit the decision now. No prose before or after the %s line.`, verifiedTaskTitle, goalContinueMarker, objective, goalPromptList(constraints), goalPromptList(nonGoals), projectPath, completed, total, verifiedTaskTitle, verifiedRunReport, goalContinueMarker)
 	}
 	return fmt.Sprintf(`You are the goal-continuation assessor for an autonomous software goal. A task is about to be dispatched. Decide the single best next action. Do NOT call any tool — this is a read-only judgment from the context provided.
 Your only output must be a single line beginning %s followed by compact single-line JSON shaped as:
