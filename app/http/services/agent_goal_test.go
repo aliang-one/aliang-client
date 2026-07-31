@@ -532,3 +532,52 @@ func TestWithGoalTaskReportSystemPromptAugmentsClaude(t *testing.T) {
 		t.Fatalf("original tool mutated: %q", original.args[2])
 	}
 }
+
+func TestCodexSandboxMode(t *testing.T) {
+	if got := codexSandboxMode(true); got != "read-only" {
+		t.Fatalf("readOnly=true -> %q, want read-only", got)
+	}
+	if got := codexSandboxMode(false); got != "workspace-write" {
+		t.Fatalf("readOnly=false -> %q, want workspace-write", got)
+	}
+}
+
+func TestGoalContinuePostVerifyPromptIncludesPlanContext(t *testing.T) {
+	msg := map[string]interface{}{
+		"post_verify":          true,
+		"completed_tasks":      2,
+		"total_tasks":          5,
+		"verified_task":        map[string]interface{}{"key": "impl-api", "title": "Implement API"},
+		"verified_run_summary": "Built auth endpoints",
+		"verified_run_outcome": "task_completed",
+		"verified_run_output":  "POST /login returned 200",
+		"remaining_tasks": []interface{}{
+			map[string]interface{}{"key": "add-tests", "title": "Add integration tests"},
+			map[string]interface{}{"key": "docs", "title": "Write API docs"},
+		},
+		"recent_failures": []interface{}{
+			map[string]interface{}{"task_key": "old-auth", "summary": "token expiry bug"},
+		},
+	}
+	prompt := goalContinuePrompt("Build auth system", []string{"Keep it simple"}, []string{"No OAuth"}, "/app", msg)
+	for _, want := range []string{"add-tests", "Add integration tests", "docs", "Write API docs", "old-auth", "token expiry", "POST /login returned 200", "propose_complete", "propose_branch", "request_user"} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("post-verify prompt missing %q", want)
+		}
+	}
+}
+
+func TestGoalContinuePreDispatchPromptExcludesPlanContext(t *testing.T) {
+	msg := map[string]interface{}{
+		"completed_tasks": 2,
+		"total_tasks":     5,
+		"current_task":    map[string]interface{}{"key": "next", "title": "Next task"},
+	}
+	prompt := goalContinuePrompt("obj", nil, nil, "/app", msg)
+	if strings.Contains(prompt, "Remaining tasks:") {
+		t.Error("pre-dispatch prompt should NOT include planContext")
+	}
+	if strings.Contains(prompt, "propose_branch") {
+		t.Error("pre-dispatch prompt should NOT include propose_branch")
+	}
+}

@@ -634,6 +634,15 @@ func handleAgentGoalPlan(msg map[string]interface{}, writeJSON func(interface{})
 	_ = writeJSON(agentGoalErrorPayload(msg, errors.New("planner_did_not_converge: provider did not emit valid ALIANG_GOAL_PLAN after exploration and bounded emission attempts")))
 }
 
+// codexSandboxMode selects the Codex app-server sandbox based on readOnly.
+// Extracted from runCodexAppServer for testability (#5 fork read-only).
+func codexSandboxMode(readOnly bool) string {
+	if readOnly {
+		return "read-only"
+	}
+	return "workspace-write"
+}
+
 func preflightGoalPlannerProvider(provider, model, effort string) error {
 	normalized, err := normalizeAgentAIProvider(provider)
 	if err != nil {

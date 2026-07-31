@@ -3592,15 +3592,11 @@ func (m *agentAIManager) runCodexAppServer(ctx context.Context, run agentAIRun, 
 	// #5: fork (re-planning exploration) sessions run in a READ-ONLY codex sandbox
 	// so exploration can't mutate the workspace. v1 always used workspace-write,
 	// bypassing the runCLIPass readOnly enforcement entirely on the app-server path.
-	codexSandbox := "workspace-write"
-	if run.readOnly {
-		codexSandbox = "read-only"
-	}
 	threadParams := map[string]interface{}{
 		"cwd":               run.projectPath,
 		"approvalPolicy":    "on-request",
 		"approvalsReviewer": "user",
-		"sandbox":           codexSandbox,
+		"sandbox":           codexSandboxMode(run.readOnly),
 	}
 	threadMethod := "thread/start"
 	if strings.TrimSpace(run.resumeSessionID) != "" {
