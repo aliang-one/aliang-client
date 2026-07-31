@@ -1897,6 +1897,10 @@ func (m *agentAIManager) runUserMessage(session *agentAISession, runID, messageI
 		claudePolicy:            cloneAgentAIClaudeRemotePolicy(session.claudePolicy),
 		goalIdentity:            cloneGoalIdentity(emitter.goalIdentity),
 		nativeGoal:              cloneAgentAIMap(nativeGoal),
+		// #5 (v2): enforce read-only on the EXECUTION run for fork sessions.
+		// v1 set this only on the temporary messageRun, which is discarded before
+		// the real run is built here — so it never reached runCLIPass/codex.
+		readOnly:                session.isGoalFork,
 	}
 	run.onClaudeInit = func(commands []string, version string) {
 		m.recordClaudeCapabilities(run.sessionID, run.projectPath, commands, version)
@@ -3585,11 +3589,18 @@ func (m *agentAIManager) runCodexAppServer(ctx context.Context, run agentAIRun, 
 		},
 	})
 	_ = send(map[string]interface{}{"method": "initialized", "params": map[string]interface{}{}})
+	// #5: fork (re-planning exploration) sessions run in a READ-ONLY codex sandbox
+	// so exploration can't mutate the workspace. v1 always used workspace-write,
+	// bypassing the runCLIPass readOnly enforcement entirely on the app-server path.
+	codexSandbox := "workspace-write"
+	if run.readOnly {
+		codexSandbox = "read-only"
+	}
 	threadParams := map[string]interface{}{
 		"cwd":               run.projectPath,
 		"approvalPolicy":    "on-request",
 		"approvalsReviewer": "user",
-		"sandbox":           "workspace-write",
+		"sandbox":           codexSandbox,
 	}
 	threadMethod := "thread/start"
 	if strings.TrimSpace(run.resumeSessionID) != "" {
