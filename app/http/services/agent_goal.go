@@ -996,6 +996,48 @@ func goalContinuePrompt(objective string, constraints, nonGoals []string, projec
 		outcome, _ := msg["verified_run_outcome"].(string)
 		verifiedRunReport = fmt.Sprintf("outcome=%s summary: %s", outcome, strings.TrimSpace(summary))
 	}
+	// #2 reflection depth: also surface the remaining plan (so the assessor can
+	// judge whether the upcoming tasks are still valid), recent failures, and the
+	// full verified-run output — not just summary/outcome. v1 sent these on the
+	// wire but the prompt ignored them, so the AI couldn't compare execution
+	// results against the remaining plan.
+	planContext := ""
+	if rem, ok := msg["remaining_tasks"].([]interface{}); ok && len(rem) > 0 {
+		parts := []string{}
+		for _, r := range rem {
+			if rm, ok := r.(map[string]interface{}); ok {
+				k, _ := rm["key"].(string)
+				t, _ := rm["title"].(string)
+				if strings.TrimSpace(k) != "" {
+					parts = append(parts, fmt.Sprintf("%s: %s", k, t))
+				}
+			}
+		}
+		if len(parts) > 0 {
+			planContext += "Remaining tasks: " + strings.Join(parts, ", ") + ". "
+		}
+	}
+	if fails, ok := msg["recent_failures"].([]interface{}); ok && len(fails) > 0 {
+		parts := []string{}
+		for _, f := range fails {
+			if fm, ok := f.(map[string]interface{}); ok {
+				k, _ := fm["task_key"].(string)
+				s, _ := fm["summary"].(string)
+				if strings.TrimSpace(k) != "" {
+					parts = append(parts, fmt.Sprintf("%s (%s)", k, s))
+				}
+			}
+		}
+		if len(parts) > 0 {
+			planContext += "Recent failures: " + strings.Join(parts, "; ") + ". "
+		}
+	}
+	if output, _ := msg["verified_run_output"].(string); strings.TrimSpace(output) != "" {
+		planContext += "Verified run output: " + strings.TrimSpace(output)
+	}
+	if planContext == "" {
+		planContext = "(no additional plan context)"
+	}
 	if postVerify {
 		return fmt.Sprintf(`You are the post-verification reflection assessor for an autonomous software goal. The task "%s" just completed AND passed its machine checks. Decide the single best next step given what this execution revealed. Do NOT call any tool — read-only judgment.
 Your only output must be a single line beginning %s followed by compact single-line JSON shaped as:
@@ -1005,12 +1047,13 @@ User constraints (authoritative): %s
 Non-goals (authoritative): %s
 Workspace root: %s
 Progress: %s of %s tasks completed. Just verified: %s. Execution report: %s.
+Plan context: %s.
 Decision rules:
 - next_action="run_next" = the goal is still on track; the execution confirmed the plan's assumptions; continue dispatching the next task. Choose this when in doubt.
 - next_action="propose_complete" = the completed work has ALREADY met the goal's outcome; the remaining tasks are genuinely unnecessary. Skip them and ask the user to sign off. (The user still verifies — do not use this to shortcut real remaining work.)
 - next_action="propose_branch" = MATERIAL drift: the execution revealed a wrong assumption, an unknown decision, or that the remaining plan is wrong — the user should fork to re-plan from a branch point. Only for magnitude major, backed by the execution report.
 - next_action="request_user" = a human decision is needed before continuing (ambiguity, constraint conflict, or blocked).
-Emit the decision now. No prose before or after the %s line.`, verifiedTaskTitle, goalContinueMarker, objective, goalPromptList(constraints), goalPromptList(nonGoals), projectPath, completed, total, verifiedTaskTitle, verifiedRunReport, goalContinueMarker)
+Emit the decision now. No prose before or after the %s line.`, verifiedTaskTitle, goalContinueMarker, objective, goalPromptList(constraints), goalPromptList(nonGoals), projectPath, completed, total, verifiedTaskTitle, verifiedRunReport, planContext, goalContinueMarker)
 	}
 	return fmt.Sprintf(`You are the goal-continuation assessor for an autonomous software goal. A task is about to be dispatched. Decide the single best next action. Do NOT call any tool — this is a read-only judgment from the context provided.
 Your only output must be a single line beginning %s followed by compact single-line JSON shaped as:
