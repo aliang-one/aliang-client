@@ -261,3 +261,13 @@ func TestObservePlannerNativeSessionID(t *testing.T) {
 		t.Error("非 planner 不应进内部 SID 集合")
 	}
 }
+
+func TestRememberCodexPlannerThread(t *testing.T) {
+	m := newAgentAIManager()
+	if !m.rememberPlannerNativeSession("codex", "thread-7") {
+		t.Fatal("应记新增")
+	}
+	if !m.internalNativeSessionSnapshot()["codex_thread-7"] {
+		t.Fatal("缺 codex_thread-7（codex 归一应为 codex_<id>）")
+	}
+}

@@ -3742,6 +3742,12 @@ func (m *agentAIManager) runCodexAppServer(ctx context.Context, run agentAIRun, 
 				if params, ok := msg["params"].(map[string]interface{}); ok {
 					if value := remoteString(params, "threadId"); value != "" {
 						threadID = value
+						// Goal-planner Codex run: capture threadID into the internal
+						// exclusion set (turn/started path) so the inventory scanner
+						// skips this short-lived read-only thread. Idempotent.
+						if run.plannerInternal {
+							m.rememberPlannerNativeSession("codex", threadID)
+						}
 					}
 					if turn, ok := params["turn"].(map[string]interface{}); ok {
 						turnID = remoteString(turn, "id")
@@ -3928,6 +3934,12 @@ func (m *agentAIManager) runCodexAppServer(ctx context.Context, run agentAIRun, 
 				}
 			}
 			if threadID != "" {
+				// Goal-planner Codex run: capture threadID into the internal
+				// exclusion set (thread.create response path) so the inventory
+				// scanner skips this short-lived read-only thread. Idempotent.
+				if run.plannerInternal {
+					m.rememberPlannerNativeSession("codex", threadID)
+				}
 				if len(run.nativeGoal) > 0 {
 					params := map[string]interface{}{
 						"threadId":  threadID,
