@@ -1092,6 +1092,13 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 	sessionID := remoteString(msg, "session_id")
 	messageID := remoteString(msg, "message_id")
 	content := strings.TrimSpace(remoteString(msg, "content"))
+	// CRITICAL: inject structured goal_context into the prompt so the AI knows
+	// the task details, required checks, file requirements, etc. Without this,
+	// Claude only sees the task title in `content` and has no idea what files
+	// to create or what verification will check — causing repeated failures.
+	if gc := serializeGoalContext(msg["goal_context"]); gc != "" {
+		content = gc + "\n\n" + content
+	}
 	if sessionID == "" {
 		_ = writeJSON(agentAIErrorPayload("", messageID, errors.New("ai.message missing session_id")))
 		return
@@ -5870,6 +5877,104 @@ func emitAIDelta(text string, run agentAIRun, channel string, writeJSON agentTer
 		return false
 	}
 	return true
+}
+
+// serializeGoalContext converts the structured goal_context envelope (sent by the
+// server in ai.run.start) into a readable text block for the AI prompt. Without
+// this, Claude only sees the task title and has no idea what to produce or what
+// checks will verify — causing repeated blind failures.
+func serializeGoalContext(raw interface{}) string {
+	if raw == nil {
+		return ""
+	}
+	gc, ok := raw.(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("=== Goal Context (authoritative) ===")
+
+	// Objective + constraints
+	if goal, ok := gc["goal"].(map[string]interface{}); ok {
+		if obj, ok := goal["objective"].(string); ok && strings.TrimSpace(obj) != "" {
+			b.WriteString("\nObjective: ")
+			b.WriteString(obj)
+		}
+		if rev, ok := goal["revisionNumber"]; ok {
+			b.WriteString(fmt.Sprintf("\nRevision: %v", rev))
+		}
+		if attempt, ok := goal["taskAttempt"]; ok {
+			b.WriteString(fmt.Sprintf("\nAttempt: %v", attempt))
+		}
+	}
+
+	// Task details — THE critical part
+	if task, ok := gc["task"].(map[string]interface{}); ok {
+		b.WriteString("\n\n--- Current Task ---")
+		if key, ok := task["key"].(string); ok {
+			b.WriteString("\nKey: ")
+			b.WriteString(key)
+		}
+		if title, ok := task["title"].(string); ok {
+			b.WriteString("\nTitle: ")
+			b.WriteString(title)
+		}
+		if desc, ok := task["description"].(string); ok && strings.TrimSpace(desc) != "" {
+			b.WriteString("\nDescription: ")
+			b.WriteString(desc)
+		}
+		if roots, ok := task["allowedRoots"].([]interface{}); ok && len(roots) > 0 {
+			b.WriteString("\nAllowed roots: ")
+			for i, r := range roots {
+				if i > 0 {
+					b.WriteString(", ")
+				}
+				b.WriteString(fmt.Sprintf("%v", r))
+			}
+		}
+		if cmds, ok := task["allowedCommands"].([]interface{}); ok && len(cmds) > 0 {
+			b.WriteString("\nAllowed commands: ")
+			for i, c := range cmds {
+				if i > 0 {
+					b.WriteString(", ")
+				}
+				b.WriteString(fmt.Sprintf("%v", c))
+			}
+		}
+		// Required checks — tells the AI what must pass (and thus what to produce)
+		if checks, ok := task["requiredChecks"].([]interface{}); ok && len(checks) > 0 {
+			b.WriteString("\n\nRequired verification checks (your work must satisfy these):")
+			for _, c := range checks {
+				if check, ok := c.(map[string]interface{}); ok {
+					b.WriteString("\n  - ")
+					if ck, ok := check["key"].(string); ok {
+						b.WriteString(ck)
+					}
+					if ct, ok := check["type"].(string); ok {
+						b.WriteString(" (")
+						b.WriteString(ct)
+						b.WriteString(")")
+					}
+				}
+			}
+		}
+	}
+
+	// Queued inputs (user messages that clarify the task)
+	if inputs, ok := gc["queuedInputs"].([]interface{}); ok && len(inputs) > 0 {
+		b.WriteString("\n\n--- Queued Inputs ---")
+		for _, inp := range inputs {
+			if input, ok := inp.(map[string]interface{}); ok {
+				if content, ok := input["content"].(string); ok && strings.TrimSpace(content) != "" {
+					b.WriteString("\n  ")
+					b.WriteString(strings.TrimSpace(content))
+				}
+			}
+		}
+	}
+
+	b.WriteString("\n=== End Goal Context ===")
+	return b.String()
 }
 
 func buildAgentAIPrompt(session *agentAISession, latestContent string) string {
