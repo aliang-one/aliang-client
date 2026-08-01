@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"aliang.one/nursorgate/app/http/models"
+	"aliang.one/nursorgate/common/logger"
 )
 
 const (
@@ -87,8 +88,8 @@ func (m *agentAIManager) rememberPlannerNativeSession(provider, nativeSessionID 
 		canonProvider = "claude"
 	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if _, exists := m.internalNativeSessions[key]; exists {
+		m.mu.Unlock()
 		return false
 	}
 	m.internalNativeSessions[key] = rememberedInternalSession{
@@ -97,6 +98,14 @@ func (m *agentAIManager) rememberPlannerNativeSession(provider, nativeSessionID 
 		CapturedAt:      now,
 	}
 	pruneInternalSessionsLocked(m.internalNativeSessions)
+	m.mu.Unlock()
+	// Persist so the set survives agent restart. Mirrors confirmBinding/reserveBinding:
+	// mu is released BEFORE persisting (persistIdentityState re-locks mu). Failure is
+	// non-fatal — the in-memory marker still excludes the session this process lifetime
+	// (spec §5.3), so swallow the error with a warn and keep the newly-added return value.
+	if err := m.persistIdentityState(); err != nil {
+		logger.Warn(fmt.Sprintf("persist internal native sessions failed (non-fatal): %v", err))
+	}
 	return true
 }
 

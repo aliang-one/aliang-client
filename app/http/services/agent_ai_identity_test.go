@@ -115,27 +115,29 @@ func TestManagedInventoryUsesBindingAlias(t *testing.T) {
 }
 
 func TestRememberPlannerNativeSession(t *testing.T) {
-	m := newAgentAIManager()
-	// First insert returns true (new); duplicate returns false (idempotent).
-	if !m.rememberPlannerNativeSession("claude", "sid-1") {
-		t.Fatal("首次插入应为新增")
-	}
-	if m.rememberPlannerNativeSession("claude", "sid-1") {
-		t.Fatal("重复插入不应算新增")
-	}
-	// claudecode normalizes to the same key as claude.
-	m.rememberPlannerNativeSession("claudecode", "sid-1")
-	// Unknown provider / empty native not recorded, not new.
-	if m.rememberPlannerNativeSession("foo", "x") {
-		t.Fatal("未知 provider 不应记")
-	}
-	if m.rememberPlannerNativeSession("claude", "") {
-		t.Fatal("空 native 不应记")
-	}
-	snap := m.internalNativeSessionSnapshot()
-	if !snap["claude_sid-1"] {
-		t.Errorf("snapshot 缺 claude_sid-1: %v", snap)
-	}
+	withIdentityPath(t.TempDir(), func() {
+		m := newAgentAIManager()
+		// First insert returns true (new); duplicate returns false (idempotent).
+		if !m.rememberPlannerNativeSession("claude", "sid-1") {
+			t.Fatal("首次插入应为新增")
+		}
+		if m.rememberPlannerNativeSession("claude", "sid-1") {
+			t.Fatal("重复插入不应算新增")
+		}
+		// claudecode normalizes to the same key as claude.
+		m.rememberPlannerNativeSession("claudecode", "sid-1")
+		// Unknown provider / empty native not recorded, not new.
+		if m.rememberPlannerNativeSession("foo", "x") {
+			t.Fatal("未知 provider 不应记")
+		}
+		if m.rememberPlannerNativeSession("claude", "") {
+			t.Fatal("空 native 不应记")
+		}
+		snap := m.internalNativeSessionSnapshot()
+		if !snap["claude_sid-1"] {
+			t.Errorf("snapshot 缺 claude_sid-1: %v", snap)
+		}
+	})
 }
 
 func TestPruneInternalSessionsPerProviderBucket(t *testing.T) {
@@ -178,13 +180,15 @@ func TestPruneInternalSessionsPerProviderBucket(t *testing.T) {
 }
 
 func TestInternalNativeSessionSnapshotIsolation(t *testing.T) {
-	m := newAgentAIManager()
-	m.rememberPlannerNativeSession("claude", "sid")
-	snap := m.internalNativeSessionSnapshot()
-	snap["claude_injected"] = true // mutating the returned snapshot must not affect the manager
-	if m.internalNativeSessionSnapshot()["claude_injected"] {
-		t.Error("snapshot 必须是拷贝，外部篡改不应泄漏回 manager")
-	}
+	withIdentityPath(t.TempDir(), func() {
+		m := newAgentAIManager()
+		m.rememberPlannerNativeSession("claude", "sid")
+		snap := m.internalNativeSessionSnapshot()
+		snap["claude_injected"] = true // mutating the returned snapshot must not affect the manager
+		if m.internalNativeSessionSnapshot()["claude_injected"] {
+			t.Error("snapshot 必须是拷贝，外部篡改不应泄漏回 manager")
+		}
+	})
 }
 
 func TestInternalSessionPersistRoundTrip(t *testing.T) {
@@ -248,26 +252,49 @@ func TestInternalSessionSaveThenReload(t *testing.T) {
 }
 
 func TestObservePlannerNativeSessionID(t *testing.T) {
-	m := newAgentAIManager()
-	// plannerInternal path: records internal SID, does not bind.
-	m.observePlannerNativeSessionID(true, "claudecode", "abc")
-	if !m.internalNativeSessionSnapshot()["claude_abc"] {
-		t.Error("plannerInternal 应记内部 SID claude_abc")
-	}
-	// Non-planner: must NOT enter the internal set (binding is confirmBinding's job).
-	m2 := newAgentAIManager()
-	m2.observePlannerNativeSessionID(false, "claudecode", "xyz")
-	if len(m2.internalNativeSessionSnapshot()) != 0 {
-		t.Error("非 planner 不应进内部 SID 集合")
-	}
+	withIdentityPath(t.TempDir(), func() {
+		m := newAgentAIManager()
+		// plannerInternal path: records internal SID, does not bind.
+		m.observePlannerNativeSessionID(true, "claudecode", "abc")
+		if !m.internalNativeSessionSnapshot()["claude_abc"] {
+			t.Error("plannerInternal 应记内部 SID claude_abc")
+		}
+		// Non-planner: must NOT enter the internal set (binding is confirmBinding's job).
+		m2 := newAgentAIManager()
+		m2.observePlannerNativeSessionID(false, "claudecode", "xyz")
+		if len(m2.internalNativeSessionSnapshot()) != 0 {
+			t.Error("非 planner 不应进内部 SID 集合")
+		}
+	})
 }
 
 func TestRememberCodexPlannerThread(t *testing.T) {
-	m := newAgentAIManager()
-	if !m.rememberPlannerNativeSession("codex", "thread-7") {
-		t.Fatal("应记新增")
-	}
-	if !m.internalNativeSessionSnapshot()["codex_thread-7"] {
-		t.Fatal("缺 codex_thread-7（codex 归一应为 codex_<id>）")
-	}
+	withIdentityPath(t.TempDir(), func() {
+		m := newAgentAIManager()
+		if !m.rememberPlannerNativeSession("codex", "thread-7") {
+			t.Fatal("应记新增")
+		}
+		if !m.internalNativeSessionSnapshot()["codex_thread-7"] {
+			t.Fatal("缺 codex_thread-7（codex 归一应为 codex_<id>）")
+		}
+	})
+}
+
+// TestRememberPlannerNativeSessionPersistsOnFirstInsert proves the reviewer-flagged gap is
+// closed: remember alone (NO explicit persistIdentityState call) must survive a reload.
+// Without the persist-on-first-insert, the set is written only when an unrelated mutation
+// triggers a save, so after an agent restart the planner session gets re-imported.
+func TestRememberPlannerNativeSessionPersistsOnFirstInsert(t *testing.T) {
+	dir := t.TempDir()
+	withIdentityPath(dir, func() {
+		m := newAgentAIManager()
+		if !m.rememberPlannerNativeSession("codex", "persist-1") {
+			t.Fatal("首次插入应返回 true")
+		}
+		m2 := newAgentAIManager()
+		m2.loadIdentityState()
+		if !m2.internalNativeSessionSnapshot()["codex_persist-1"] {
+			t.Fatal("remember 应在首次插入时自动落盘，重启后应能读回 codex_persist-1")
+		}
+	})
 }
