@@ -246,3 +246,18 @@ func TestInternalSessionSaveThenReload(t *testing.T) {
 		}
 	})
 }
+
+func TestObservePlannerNativeSessionID(t *testing.T) {
+	m := newAgentAIManager()
+	// plannerInternal path: records internal SID, does not bind.
+	m.observePlannerNativeSessionID(true, "claudecode", "abc")
+	if !m.internalNativeSessionSnapshot()["claude_abc"] {
+		t.Error("plannerInternal 应记内部 SID claude_abc")
+	}
+	// Non-planner: must NOT enter the internal set (binding is confirmBinding's job).
+	m2 := newAgentAIManager()
+	m2.observePlannerNativeSessionID(false, "claudecode", "xyz")
+	if len(m2.internalNativeSessionSnapshot()) != 0 {
+		t.Error("非 planner 不应进内部 SID 集合")
+	}
+}

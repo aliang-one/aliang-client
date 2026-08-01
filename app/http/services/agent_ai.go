@@ -4666,8 +4666,10 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 		if run.plannerInternal {
 			// Planner passes are ephemeral and may use a synthetic conversation ID
 			// for each bounded emission attempt while resuming the same provider
-			// session. Keep the captured ID for resume, but do not bind it as a
-			// normal user conversation.
+			// session. Do not bind it as a normal user conversation, but remember
+			// the native id so the inventory scanner can exclude it (else it gets
+			// imported as a phantom ai_import_ conversation on the phone).
+			m.observePlannerNativeSessionID(true, tool.id, nativeSessionID)
 			return
 		}
 		bindingOnce.Do(func() {

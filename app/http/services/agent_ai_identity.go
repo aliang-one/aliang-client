@@ -100,6 +100,17 @@ func (m *agentAIManager) rememberPlannerNativeSession(provider, nativeSessionID 
 	return true
 }
 
+// observePlannerNativeSessionID is called when a native session id is captured.
+// plannerInternal=true means this is a goal-planner CLI run — record the native id into
+// the internal-SID set (so the inventory scanner excludes it) and do NOT bind a conversation.
+// plannerInternal=false is a normal run — do not touch the internal set; binding is confirmBinding's job.
+func (m *agentAIManager) observePlannerNativeSessionID(plannerInternal bool, provider, nativeSessionID string) {
+	if !plannerInternal {
+		return
+	}
+	m.rememberPlannerNativeSession(provider, nativeSessionID)
+}
+
 // pruneInternalSessionsLocked evicts oldest per provider so each bucket ≤ cap. Caller holds m.mu.
 func pruneInternalSessionsLocked(m map[string]rememberedInternalSession) {
 	for provider, over := range bucketOverage(m) {
