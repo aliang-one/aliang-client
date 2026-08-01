@@ -228,7 +228,11 @@ func (s *AgentService) Status() models.AgentStatusResponse {
 // VibeSessions returns the local AI coding sessions (Claude/Codex) as
 // lightweight summaries, newest first. Transcript is stripped.
 func (s *AgentService) VibeSessions() []models.AgentVibeSession {
-	snapshot := agentSyncSnapshot{VibeSessions: summarizeAgentVibeSessions(collectAgentVibeSessions(nil))}
+	var internal map[string]bool
+	if s != nil && s.ai != nil {
+		internal = s.ai.internalNativeSessionSnapshot()
+	}
+	snapshot := agentSyncSnapshot{VibeSessions: summarizeAgentVibeSessions(collectAgentVibeSessions(nil, internal))}
 	if s == nil || s.ai == nil {
 		return snapshot.VibeSessions
 	}
@@ -1997,7 +2001,11 @@ func (s *AgentService) buildAgentStatusSyncPayloadLocked(status string) agentSta
 }
 
 func (s *AgentService) collectAgentSyncSnapshotWithActiveRuns(scanDirs []string) agentSyncSnapshot {
-	snapshot := collectAgentSyncSnapshot(scanDirs)
+	var internal map[string]bool
+	if s != nil && s.ai != nil {
+		internal = s.ai.internalNativeSessionSnapshot()
+	}
+	snapshot := collectAgentSyncSnapshot(scanDirs, internal)
 	if s == nil || s.ai == nil {
 		return snapshot
 	}

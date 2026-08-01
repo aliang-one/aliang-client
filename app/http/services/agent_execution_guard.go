@@ -151,7 +151,10 @@ func agentAuthorizedExecutionDirectories() []string {
 }
 
 func refreshAgentAuthorizedExecutionDirectories() []string {
-	snapshot := collectAgentSyncSnapshot(nil)
+	// Package-level refresh has no manager access; it only consumes
+	// AuthorizedDirectories, which derive from the UNFILTERED projects source
+	// inside collectAgentSyncSnapshot. Passing nil preserves that behavior.
+	snapshot := collectAgentSyncSnapshot(nil, nil)
 	return setAgentAuthorizedExecutionDirectoriesCache(snapshot.AuthorizedDirectories)
 }
 
