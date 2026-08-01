@@ -165,6 +165,49 @@ func (s *AgentService) currentRemoteWriter() agentTerminalWriter {
 	return *p
 }
 
+// armRegistrationGate closes the gate so outbound business writes block until
+// markRegistrationReady opens it. Called once per connection at the start of
+// runRemoteAgentSession. The connect-time agent.hello bypasses the gate (it is
+// the message that causes registration); every other write goes through the
+// published writer and therefore waits.
+func (s *AgentService) armRegistrationGate() {
+	ch := make(chan struct{})
+	s.regMu.Lock()
+	s.registrationGate = ch
+	s.regMu.Unlock()
+}
+
+// markRegistrationReady opens the gate, releasing any blocked business writes.
+// Called from the agent.registered handler. Idempotent: a nil/already-open gate
+// is a no-op, so periodic re-hellos that re-ACK registration do nothing.
+func (s *AgentService) markRegistrationReady() {
+	s.regMu.Lock()
+	ch := s.registrationGate
+	s.registrationGate = nil // nil ⇒ gate open / not armed
+	s.regMu.Unlock()
+	if ch != nil {
+		close(ch)
+	}
+}
+
+// waitForRegistration blocks until the current connection is registered (gate
+// opened) or the deadline elapses. Returns true if registered. A nil/absent
+// gate means "not armed" (open) — used by tests and any non-remote-WS caller.
+func (s *AgentService) waitForRegistration(timeout time.Duration) bool {
+	s.regMu.Lock()
+	ch := s.registrationGate
+	s.regMu.Unlock()
+	if ch == nil {
+		return true
+	}
+	select {
+	case <-ch:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
+
 func (s *AgentService) forceDisconnectRemote(reason string) {
 	s.wsMu.Lock()
 	conn := s.wsConn
@@ -204,6 +247,13 @@ var (
 	agentRemotePingInterval      = 30 * time.Second
 	agentRemoteReadWindow        = 90 * time.Second
 	agentRemoteWriteTimeout      = 10 * time.Second
+	// agentRemoteRegistrationWait bounds how long a business write blocks for the
+	// server to ACK agent.registered before failing. Registration normally
+	// completes within a single RTT; this is a safety net for slow networks. On
+	// timeout the write fails and existing per-call retry (e.g.
+	// writeAgentAIApprovalRequest's 5×/1s loop) recovers once registration lands.
+	// Package var so tests can shrink it.
+	agentRemoteRegistrationWait = 5 * time.Second
 )
 
 func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn) error {
@@ -216,9 +266,22 @@ func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn) error {
 		_ = conn.SetWriteDeadline(time.Now().Add(agentRemoteWriteTimeout))
 		return conn.WriteJSON(payload)
 	}
-	// Publish this connection's writer so AI runs that outlive the socket keep
-	// streaming after a reconnect (they emit through currentRemoteWriter()).
-	s.setCurrentRemoteWriter(rawWriter)
+	// Arm the registration gate, then publish a writer that waits for the gate
+	// before each write. Business messages (notably ai.approval.request from an
+	// in-flight AI turn) must never reach the server before it has ACKed
+	// agent.registered — otherwise they hit the agent_not_registered guard and
+	// are silently dropped, leaving the approval waiter blocked for up to 24h
+	// while heartbeats keep the session looking alive (the vibecoding "stuck on
+	// thinking" race). agent.hello below bypasses the gate via rawWriter (it is
+	// what triggers registration); the gate opens in the agent.registered handler.
+	s.armRegistrationGate()
+	publishedWriter := func(payload interface{}) error {
+		if !s.waitForRegistration(agentRemoteRegistrationWait) {
+			return errors.New("remote agent not registered within deadline")
+		}
+		return rawWriter(payload)
+	}
+	s.setCurrentRemoteWriter(publishedWriter)
 	defer s.clearCurrentRemoteWriter()
 	// writeJSON is an indirection: it always writes to the *current* live writer,
 	// not the closure captured here, so a reconnect reattaches in-flight runs.
@@ -243,12 +306,9 @@ func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn) error {
 		return nil
 	})
 
-	if err := s.sendAgentHello(writeJSON, "connect"); err != nil {
+	if err := s.sendAgentHello(rawWriter, "connect"); err != nil {
 		return err
 	}
-	// Re-send terminal events whose ACK was lost across a socket/process restart.
-	// Server handling is idempotent by run_id + event_seq.
-	s.ai.replayPendingTerminals(writeJSON)
 
 	defer s.terminal.closeAll()
 	// NOTE: AI sessions are intentionally NOT closed here. A transient WS
@@ -256,10 +316,10 @@ func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn) error {
 	// survive and re-stream over the next connection via currentRemoteWriter().
 	// True shutdown paths (remoteConnectionLoop exit, forceDisconnectRemote)
 	// close AI sessions explicitly.
-
-	// Reconcile on (re)connect: re-surface approvals we are still waiting on so
-	// the server can re-deliver decided ones and confirm still-pending ones.
-	s.ai.emitApprovalSync(writeJSON)
+	//
+	// terminal replay + approval sync used to run here, before the read loop.
+	// They are business writes that must wait for registration, so they now run
+	// in the agent.registered handler below once the gate opens.
 
 	done := make(chan struct{})
 	defer close(done)
@@ -392,6 +452,14 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 		s.setRemoteConnectionStateLocked(true, "online", "")
 		_ = s.saveStateLocked()
 		s.mu.Unlock()
+		// Registration is now server-confirmed: open the gate so business writes
+		// blocked on it proceed, then run the post-registration reconciliation
+		// that used to run before the read loop (and therefore before
+		// registration). Both are idempotent (run_id+event_seq / approval-id
+		// keyed), so periodic re-hellos re-triggering them is safe.
+		s.markRegistrationReady()
+		s.ai.replayPendingTerminals(writeJSON)
+		s.ai.emitApprovalSync(writeJSON)
 	case models.AgentEventHeartbeatAck:
 		s.setRemoteConnectionState(true, "online", "")
 		// Retry durable terminals while the socket remains healthy. A prior
@@ -518,6 +586,15 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 		// local pendingOption so a later stray response is ignored.
 		s.setRemoteConnectionState(true, "online", "")
 		s.ai.cancelOptions(msg)
+	case models.AgentEventError:
+		// Server rejected something. With the registration gate, business
+		// messages should never be sent before registration, but surface the
+		// error instead of letting it fall through to "unsupported event type"
+		// — which silently buried agent_not_registered and left approval
+		// waiters blocked for 24h. No auto-recovery here: the gate prevents the
+		// condition; observing agent_not_registered now signals a regression.
+		errCode := strings.TrimSpace(fmt.Sprint(msg["error"]))
+		logger.Warn(fmt.Sprintf("[AGENT-BOOT] remote_connection server_rejected error=%s detail=%v", errCode, msg["message"]))
 	default:
 		_ = writeJSON(map[string]interface{}{
 			"type":  models.AgentEventError,

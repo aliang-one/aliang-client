@@ -124,6 +124,21 @@ type AgentService struct {
 	// captured at message-arrival time, so a reconnect reattaches in-flight AI
 	// runs to the new socket instead of streaming into a dead one.
 	remoteWriter atomic.Pointer[agentTerminalWriter]
+
+	// registrationGate aligns "the writer is publishable" with "the server has
+	// registered this connection". runRemoteAgentSession arms the gate (closes
+	// it) before publishing the writer and opens it when the server ACKs via
+	// agent.registered. Until it opens, the published writer blocks (bounded by
+	// agentRemoteRegistrationWait) so business messages — critically
+	// ai.approval.request from an in-flight AI turn — can never reach a
+	// not-yet-registered socket. That race was the root cause of vibecoding
+	// getting stuck on "thinking": the approval was flushed right after the
+	// writer was published but before agent.hello was processed, silently
+	// rejected with agent_not_registered, and the waiter then blocked for up to
+	// ALIANG_AI_APPROVAL_TIMEOUT (24h) while heartbeats kept the session
+	// looking alive.
+	registrationGate chan struct{}
+	regMu            sync.Mutex
 }
 
 // agentUserAuthRejectedError signals that the agent server rejected the user's
