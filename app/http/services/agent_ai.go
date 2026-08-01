@@ -27,16 +27,17 @@ import (
 )
 
 type agentAIManager struct {
-	mu                 sync.Mutex
-	identityPersistMu  sync.Mutex
-	sessions           map[string]*agentAISession
-	approvals          map[string]*agentAIApprovalWaiter
-	completedApprovals map[string]*agentAICompletedApproval
-	codexInputs        map[string]*agentAICodexInputWaiter
-	pendingTerminals   map[string]map[string]interface{}
-	runJournalEnabled  bool
-	bindings           map[string]agentAIBindingRecord
-	processedRuns      map[string]agentAIProcessedRun
+	mu                     sync.Mutex
+	identityPersistMu      sync.Mutex
+	sessions               map[string]*agentAISession
+	approvals              map[string]*agentAIApprovalWaiter
+	completedApprovals     map[string]*agentAICompletedApproval
+	codexInputs            map[string]*agentAICodexInputWaiter
+	pendingTerminals       map[string]map[string]interface{}
+	runJournalEnabled      bool
+	bindings               map[string]agentAIBindingRecord
+	processedRuns          map[string]agentAIProcessedRun
+	internalNativeSessions map[string]rememberedInternalSession // key = canonicalInternalInventoryID
 	// service is the owning AgentService (set when the service creates this
 	// manager), used to evaluate the device approval policy. nil for standalone
 	// test managers, which fall back to GetSharedAgentService().
@@ -232,14 +233,14 @@ type agentAISession struct {
 	// isGoalFork marks a fork (re-planning exploration) session. #5: its runs are
 	// forced read-only (run.readOnly) so exploration can't mutate the workspace —
 	// real provider-level enforcement, not just a prompt.
-	isGoalFork              bool
-	cancel                  context.CancelFunc
-	activeWriter            agentTerminalWriter
-	approvalToken           string
-	activity                *agentAIActivity
-	runSeq                  int
-	activeRunID             string
-	goalIdentity            map[string]interface{}
+	isGoalFork    bool
+	cancel        context.CancelFunc
+	activeWriter  agentTerminalWriter
+	approvalToken string
+	activity      *agentAIActivity
+	runSeq        int
+	activeRunID   string
+	goalIdentity  map[string]interface{}
 	// lastActiveAt drives LRU eviction (evictOldestIdleAISessionLocked): the
 	// non-running session with the oldest stamp is dropped when a new session
 	// would exceed agentAISessionResidentCap. Stamped on create and bumped on
@@ -700,13 +701,14 @@ const agentAIOptionSystemPrompt = `When you have multiple viable approaches/opti
 
 func newAgentAIManager() *agentAIManager {
 	m := &agentAIManager{
-		sessions:           make(map[string]*agentAISession),
-		approvals:          make(map[string]*agentAIApprovalWaiter),
-		completedApprovals: make(map[string]*agentAICompletedApproval),
-		codexInputs:        make(map[string]*agentAICodexInputWaiter),
-		pendingTerminals:   make(map[string]map[string]interface{}),
-		bindings:           make(map[string]agentAIBindingRecord),
-		processedRuns:      make(map[string]agentAIProcessedRun),
+		sessions:               make(map[string]*agentAISession),
+		approvals:              make(map[string]*agentAIApprovalWaiter),
+		completedApprovals:     make(map[string]*agentAICompletedApproval),
+		codexInputs:            make(map[string]*agentAICodexInputWaiter),
+		pendingTerminals:       make(map[string]map[string]interface{}),
+		bindings:               make(map[string]agentAIBindingRecord),
+		processedRuns:          make(map[string]agentAIProcessedRun),
+		internalNativeSessions: make(map[string]rememberedInternalSession),
 	}
 	return m
 }
@@ -1900,7 +1902,7 @@ func (m *agentAIManager) runUserMessage(session *agentAISession, runID, messageI
 		// #5 (v2): enforce read-only on the EXECUTION run for fork sessions.
 		// v1 set this only on the temporary messageRun, which is discarded before
 		// the real run is built here — so it never reached runCLIPass/codex.
-		readOnly:                session.isGoalFork,
+		readOnly: session.isGoalFork,
 	}
 	run.onClaudeInit = func(commands []string, version string) {
 		m.recordClaudeCapabilities(run.sessionID, run.projectPath, commands, version)

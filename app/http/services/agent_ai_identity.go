@@ -15,7 +15,17 @@ import (
 const (
 	agentAIIdentityFilename = "agent_ai_identity.json"
 	agentAIProcessedRunCap  = 512
+
+	agentInternalSessionBucketCap = 512 // per-provider cap; >> scanner's 120-file window
 )
+
+// rememberedInternalSession is a native CLI session known to be internal (goal planner).
+// Used so the inventory scanner can skip it, avoiding import as an ai_import_ conversation.
+type rememberedInternalSession struct {
+	Provider        string    `json:"provider"` // canonical: "claude" | "codex"
+	NativeSessionID string    `json:"native_session_id"`
+	CapturedAt      time.Time `json:"captured_at"`
+}
 
 type agentAIBindingRecord struct {
 	ConversationID  string `json:"conversation_id"`
@@ -59,6 +69,83 @@ func canonicalInternalInventoryID(provider, nativeSessionID string) string {
 	default:
 		return ""
 	}
+}
+
+// rememberPlannerNativeSession records a goal-planner internal CLI run's native session id.
+// Returns whether it was newly added (used to decide whether to persist). Idempotent;
+// unknown provider / empty native returns false. Per-provider bucket ≤ agentInternalSessionBucketCap,
+// evicting oldest — prevents a flood of Codex records evicting Claude markers still in scan window.
+func (m *agentAIManager) rememberPlannerNativeSession(provider, nativeSessionID string) bool {
+	key := canonicalInternalInventoryID(provider, nativeSessionID)
+	if key == "" || m == nil {
+		return false
+	}
+	now := time.Now().UTC()
+	canonProvider := "codex"
+	if strings.HasPrefix(key, "claude_") {
+		canonProvider = "claude"
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, exists := m.internalNativeSessions[key]; exists {
+		return false
+	}
+	m.internalNativeSessions[key] = rememberedInternalSession{
+		Provider:        canonProvider,
+		NativeSessionID: strings.TrimSpace(nativeSessionID),
+		CapturedAt:      now,
+	}
+	pruneInternalSessionsLocked(m.internalNativeSessions)
+	return true
+}
+
+// pruneInternalSessionsLocked evicts oldest per provider so each bucket ≤ cap. Caller holds m.mu.
+func pruneInternalSessionsLocked(m map[string]rememberedInternalSession) {
+	for provider, over := range bucketOverage(m) {
+		type entry struct {
+			key string
+			at  time.Time
+		}
+		var es []entry
+		for k, v := range m {
+			if v.Provider == provider {
+				es = append(es, entry{k, v.CapturedAt})
+			}
+		}
+		sort.Slice(es, func(i, j int) bool { return es[i].at.Before(es[j].at) })
+		for i := 0; i < over && i < len(es); i++ {
+			delete(m, es[i].key)
+		}
+	}
+}
+
+// bucketOverage returns how many to evict per over-cap provider. Caller holds m.mu.
+func bucketOverage(m map[string]rememberedInternalSession) map[string]int {
+	counts := map[string]int{}
+	for _, v := range m {
+		counts[v.Provider]++
+	}
+	over := map[string]int{}
+	for p, c := range counts {
+		if c > agentInternalSessionBucketCap {
+			over[p] = c - agentInternalSessionBucketCap
+		}
+	}
+	return over
+}
+
+// internalNativeSessionSnapshot returns a copy of all canonical ids for the scanner to filter.
+func (m *agentAIManager) internalNativeSessionSnapshot() map[string]bool {
+	out := make(map[string]bool)
+	if m == nil {
+		return out
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for k := range m.internalNativeSessions {
+		out[k] = true
+	}
+	return out
 }
 
 func agentAIIdentityPath() (string, error) {

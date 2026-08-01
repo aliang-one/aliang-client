@@ -1,9 +1,11 @@
 package services
 
 import (
+	"fmt"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"aliang.one/nursorgate/app/http/models"
 )
@@ -77,11 +79,11 @@ printf '%s\n' '{"type":"result","subtype":"success","session_id":"native-claude-
 func TestCanonicalInternalInventoryID(t *testing.T) {
 	cases := []struct{ provider, native, want string }{
 		{"claude", "abc-123", "claude_abc-123"},
-		{"claudecode", "abc-123", "claude_abc-123"},   // tool.id is claudecode, but scanner emits claude_
-		{"CLAUDE", "x", "claude_x"},                    // case-insensitive
+		{"claudecode", "abc-123", "claude_abc-123"}, // tool.id is claudecode, but scanner emits claude_
+		{"CLAUDE", "x", "claude_x"},                 // case-insensitive
 		{"codex", "thread-9", "codex_thread-9"},
-		{"codex", "", ""},                              // empty native -> empty key (not recorded)
-		{"unknown", "y", ""},                           // unknown provider -> empty key
+		{"codex", "", ""},    // empty native -> empty key (not recorded)
+		{"unknown", "y", ""}, // unknown provider -> empty key
 	}
 	for _, c := range cases {
 		if got := canonicalInternalInventoryID(c.provider, c.native); got != c.want {
@@ -108,5 +110,78 @@ func TestManagedInventoryUsesBindingAlias(t *testing.T) {
 	}
 	if sessions[1].Origin != "external" || sessions[1].ManagedConversationID != "" {
 		t.Fatalf("external inventory = %+v", sessions[1])
+	}
+}
+
+func TestRememberPlannerNativeSession(t *testing.T) {
+	m := newAgentAIManager()
+	// First insert returns true (new); duplicate returns false (idempotent).
+	if !m.rememberPlannerNativeSession("claude", "sid-1") {
+		t.Fatal("首次插入应为新增")
+	}
+	if m.rememberPlannerNativeSession("claude", "sid-1") {
+		t.Fatal("重复插入不应算新增")
+	}
+	// claudecode normalizes to the same key as claude.
+	m.rememberPlannerNativeSession("claudecode", "sid-1")
+	// Unknown provider / empty native not recorded, not new.
+	if m.rememberPlannerNativeSession("foo", "x") {
+		t.Fatal("未知 provider 不应记")
+	}
+	if m.rememberPlannerNativeSession("claude", "") {
+		t.Fatal("空 native 不应记")
+	}
+	snap := m.internalNativeSessionSnapshot()
+	if !snap["claude_sid-1"] {
+		t.Errorf("snapshot 缺 claude_sid-1: %v", snap)
+	}
+}
+
+func TestPruneInternalSessionsPerProviderBucket(t *testing.T) {
+	m := newAgentAIManager()
+	// Deterministic timestamps (avoid sub-microsecond collisions). Codex cap+10,
+	// c-0 oldest; one Claude entry.
+	base := time.Now().UTC()
+	for i := 0; i < agentInternalSessionBucketCap+10; i++ {
+		m.internalNativeSessions[fmt.Sprintf("codex_c-%d", i)] = rememberedInternalSession{
+			Provider:        "codex",
+			NativeSessionID: fmt.Sprintf("c-%d", i),
+			CapturedAt:      base.Add(time.Duration(i) * time.Second),
+		}
+	}
+	m.internalNativeSessions["claude_keep"] = rememberedInternalSession{
+		Provider: "claude", NativeSessionID: "keep", CapturedAt: base,
+	}
+	m.mu.Lock()
+	pruneInternalSessionsLocked(m.internalNativeSessions)
+	m.mu.Unlock()
+	snap := m.internalNativeSessionSnapshot()
+	gotCodex := 0
+	for k := range snap {
+		if strings.HasPrefix(k, "codex_") {
+			gotCodex++
+		}
+	}
+	if gotCodex != agentInternalSessionBucketCap {
+		t.Errorf("codex 桶 = %d, want %d", gotCodex, agentInternalSessionBucketCap)
+	}
+	if !snap["claude_keep"] {
+		t.Error("Claude 不应被 Codex 挤掉（按 provider 分桶）")
+	}
+	if snap["codex_c-0"] {
+		t.Error("最旧 codex_c-0 应被淘汰")
+	}
+	if !snap[fmt.Sprintf("codex_c-%d", agentInternalSessionBucketCap+9)] {
+		t.Error("最新 codex 条目应保留")
+	}
+}
+
+func TestInternalNativeSessionSnapshotIsolation(t *testing.T) {
+	m := newAgentAIManager()
+	m.rememberPlannerNativeSession("claude", "sid")
+	snap := m.internalNativeSessionSnapshot()
+	snap["claude_injected"] = true // mutating the returned snapshot must not affect the manager
+	if m.internalNativeSessionSnapshot()["claude_injected"] {
+		t.Error("snapshot 必须是拷贝，外部篡改不应泄漏回 manager")
 	}
 }
