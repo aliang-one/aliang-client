@@ -70,10 +70,10 @@ type agentSyncSnapshot struct {
 	CollectedAt           string                    `json:"collected_at"`
 }
 
-func collectAgentSyncSnapshot(scanDirs []string) agentSyncSnapshot {
+func collectAgentSyncSnapshot(scanDirs []string, internal map[string]bool) agentSyncSnapshot {
 	history := collectAgentHistoryRoots()
-	vibeSessions := collectAgentVibeSessions(scanDirs)
-	projects := collectAgentProjects(vibeSessions)
+	projectsSource, vibe := partitionAgentVibeSessions(collectRawAgentVibeSessions(scanDirs), internal)
+	projects := collectAgentProjects(projectsSource)
 	authorizedDirectories := agentProjectPaths(projects)
 	setAgentAuthorizedExecutionDirectoriesCache(authorizedDirectories)
 
@@ -86,7 +86,7 @@ func collectAgentSyncSnapshot(scanDirs []string) agentSyncSnapshot {
 		Tools:                 detectAgentTools(),
 		History:               history,
 		Projects:              projects,
-		VibeSessions:          summarizeAgentVibeSessions(vibeSessions),
+		VibeSessions:          summarizeAgentVibeSessions(vibe),
 		AuthorizedDirectories: authorizedDirectories,
 		CollectedAt:           time.Now().UTC().Format(time.RFC3339),
 	}
@@ -326,15 +326,55 @@ func enrichAgentProject(project *models.AgentProject) {
 	}
 }
 
-func collectAgentVibeSessions(scanDirs []string) []models.AgentVibeSession {
+// excludeInternalVibeSessions removes sessions whose canonical id is in the internal set.
+func excludeInternalVibeSessions(in []models.AgentVibeSession, internal map[string]bool) []models.AgentVibeSession {
+	if len(internal) == 0 {
+		return in
+	}
+	out := make([]models.AgentVibeSession, 0, len(in))
+	for _, s := range in {
+		if internal[s.ID] {
+			continue
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+// partitionAgentVibeSessions splits a list ALREADY sorted by UpdatedAt desc into:
+//   - projectsSource: top agentVibeSummaryMaxSessions (INCLUDES internal) → for
+//     collectAgentProjects/agentProjectPaths (hiding planner must not revoke authorization);
+//   - vibe: excludeInternalVibeSessions then top 200 (EXCLUDES internal) → VibeSessions output
+//     (internal don't occupy slots: filter before truncate).
+func partitionAgentVibeSessions(full []models.AgentVibeSession, internal map[string]bool) (projectsSource, vibe []models.AgentVibeSession) {
+	projectsSource = full
+	if len(projectsSource) > agentVibeSummaryMaxSessions {
+		projectsSource = projectsSource[:agentVibeSummaryMaxSessions]
+	}
+	vibe = excludeInternalVibeSessions(full, internal)
+	if len(vibe) > agentVibeSummaryMaxSessions {
+		vibe = vibe[:agentVibeSummaryMaxSessions]
+	}
+	return projectsSource, vibe
+}
+
+// collectRawAgentVibeSessions builds codex+claude candidates, sorts by UpdatedAt desc. No truncate, no filter.
+func collectRawAgentVibeSessions(scanDirs []string) []models.AgentVibeSession {
 	sessions := append(collectCodexVibeSessions(scanDirs), collectClaudeVibeSessions(scanDirs)...)
 	sort.Slice(sessions, func(i, j int) bool {
 		return sessions[i].UpdatedAt > sessions[j].UpdatedAt
 	})
-	if len(sessions) > agentVibeSummaryMaxSessions {
-		sessions = sessions[:agentVibeSummaryMaxSessions]
-	}
 	return sessions
+}
+
+// collectAgentVibeSessions returns the visible list: filter internal, then truncate 200.
+// For callers that want only the list (AgentService.VibeSessions).
+func collectAgentVibeSessions(scanDirs []string, internal map[string]bool) []models.AgentVibeSession {
+	vibe := excludeInternalVibeSessions(collectRawAgentVibeSessions(scanDirs), internal)
+	if len(vibe) > agentVibeSummaryMaxSessions {
+		vibe = vibe[:agentVibeSummaryMaxSessions]
+	}
+	return vibe
 }
 
 func collectCodexVibeSessions(scanDirs []string) []models.AgentVibeSession {
