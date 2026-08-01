@@ -37,6 +37,7 @@ type agentAIManager struct {
 	runJournalEnabled  bool
 	bindings           map[string]agentAIBindingRecord
 	processedRuns      map[string]agentAIProcessedRun
+	internalNativeSessions map[string]rememberedInternalSession // key = canonicalInternalInventoryID
 	// service is the owning AgentService (set when the service creates this
 	// manager), used to evaluate the device approval policy. nil for standalone
 	// test managers, which fall back to GetSharedAgentService().
@@ -707,6 +708,7 @@ func newAgentAIManager() *agentAIManager {
 		pendingTerminals:   make(map[string]map[string]interface{}),
 		bindings:           make(map[string]agentAIBindingRecord),
 		processedRuns:      make(map[string]agentAIProcessedRun),
+		internalNativeSessions: make(map[string]rememberedInternalSession),
 	}
 	return m
 }
