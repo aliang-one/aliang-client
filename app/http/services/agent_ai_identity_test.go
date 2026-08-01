@@ -74,6 +74,22 @@ printf '%s\n' '{"type":"result","subtype":"success","session_id":"native-claude-
 	}
 }
 
+func TestCanonicalInternalInventoryID(t *testing.T) {
+	cases := []struct{ provider, native, want string }{
+		{"claude", "abc-123", "claude_abc-123"},
+		{"claudecode", "abc-123", "claude_abc-123"},   // tool.id is claudecode, but scanner emits claude_
+		{"CLAUDE", "x", "claude_x"},                    // case-insensitive
+		{"codex", "thread-9", "codex_thread-9"},
+		{"codex", "", ""},                              // empty native -> empty key (not recorded)
+		{"unknown", "y", ""},                           // unknown provider -> empty key
+	}
+	for _, c := range cases {
+		if got := canonicalInternalInventoryID(c.provider, c.native); got != c.want {
+			t.Errorf("canonicalInternalInventoryID(%q,%q)=%q want %q", c.provider, c.native, got, c.want)
+		}
+	}
+}
+
 func TestManagedInventoryUsesBindingAlias(t *testing.T) {
 	manager := newAgentAIManager()
 	manager.bindings["ai-canonical"] = agentAIBindingRecord{

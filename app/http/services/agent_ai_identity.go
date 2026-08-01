@@ -42,6 +42,25 @@ type agentAIIdentityState struct {
 	ProcessedRuns []agentAIProcessedRun  `json:"processed_runs"`
 }
 
+// canonicalInternalInventoryID normalizes provider + raw native session id into the
+// inventory id form the scanner emits (codex_<id> / claude_<id>). Note claudecode's
+// tool.id is "claudecode" but the scanner emits "claude_<id>" — must normalize or the
+// filter won't match. Unknown provider or empty native returns "" (caller skips).
+func canonicalInternalInventoryID(provider, nativeSessionID string) string {
+	nativeSessionID = strings.TrimSpace(nativeSessionID)
+	if nativeSessionID == "" {
+		return ""
+	}
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "claude", "claudecode":
+		return "claude_" + nativeSessionID
+	case "codex":
+		return "codex_" + nativeSessionID
+	default:
+		return ""
+	}
+}
+
 func agentAIIdentityPath() (string, error) {
 	statePath, err := agentStatePath()
 	if err != nil {
