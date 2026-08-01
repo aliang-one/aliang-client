@@ -3,6 +3,7 @@ package services
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -184,4 +185,64 @@ func TestInternalNativeSessionSnapshotIsolation(t *testing.T) {
 	if m.internalNativeSessionSnapshot()["claude_injected"] {
 		t.Error("snapshot 必须是拷贝，外部篡改不应泄漏回 manager")
 	}
+}
+
+func TestInternalSessionPersistRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	raw := `{
+	  "bindings": [],
+	  "processed_runs": [],
+	  "internal_native_sessions": [
+	    {"provider":"codex","native_session_id":"t-1","captured_at":"2026-08-01T00:00:00Z"},
+	    {"provider":"claude","native_session_id":"s-1","captured_at":"2026-08-01T00:00:01Z"}
+	  ]
+	}`
+	path := filepath.Join(dir, agentAIIdentityFilename)
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m := newAgentAIManager()
+	withIdentityPath(dir, func() {
+		m.loadIdentityState()
+	})
+	snap := m.internalNativeSessionSnapshot()
+	if !snap["codex_t-1"] || !snap["claude_s-1"] {
+		t.Fatalf("加载后 snapshot 缺失: %v", snap)
+	}
+}
+
+func TestInternalSessionOldJSONCompat(t *testing.T) {
+	dir := t.TempDir()
+	// Old format: no internal_native_sessions field.
+	raw := `{"bindings":[{"conversation_id":"c1","native_session_id":"n1","state":"confirmed","binding_version":1,"updated_at":"x"}],"processed_runs":[]}`
+	path := filepath.Join(dir, agentAIIdentityFilename)
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m := newAgentAIManager()
+	withIdentityPath(dir, func() {
+		m.loadIdentityState()
+	})
+	if m.bindings["c1"].NativeSessionID != "n1" {
+		t.Error("旧 JSON 的 binding 应保留")
+	}
+	if len(m.internalNativeSessions) != 0 {
+		t.Errorf("旧 JSON 应加载为空集合，got %d", len(m.internalNativeSessions))
+	}
+}
+
+func TestInternalSessionSaveThenReload(t *testing.T) {
+	dir := t.TempDir()
+	withIdentityPath(dir, func() {
+		m := newAgentAIManager()
+		m.rememberPlannerNativeSession("codex", "zz-1")
+		if err := m.persistIdentityState(); err != nil {
+			t.Fatal(err)
+		}
+		m2 := newAgentAIManager()
+		m2.loadIdentityState()
+		if !m2.internalNativeSessionSnapshot()["codex_zz-1"] {
+			t.Fatal("重启后应能读回 codex_zz-1")
+		}
+	})
 }

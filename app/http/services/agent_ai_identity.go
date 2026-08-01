@@ -48,8 +48,9 @@ type agentAIProcessedRun struct {
 }
 
 type agentAIIdentityState struct {
-	Bindings      []agentAIBindingRecord `json:"bindings"`
-	ProcessedRuns []agentAIProcessedRun  `json:"processed_runs"`
+	Bindings               []agentAIBindingRecord      `json:"bindings"`
+	ProcessedRuns          []agentAIProcessedRun       `json:"processed_runs"`
+	InternalNativeSessions []rememberedInternalSession `json:"internal_native_sessions,omitempty"`
 }
 
 // canonicalInternalInventoryID normalizes provider + raw native session id into the
@@ -148,12 +149,25 @@ func (m *agentAIManager) internalNativeSessionSnapshot() map[string]bool {
 	return out
 }
 
-func agentAIIdentityPath() (string, error) {
+// identityPathResolver can be swapped in tests to point load/persist at a TempDir.
+// Production path is unchanged.
+var identityPathResolver = func() (string, error) {
 	statePath, err := agentStatePath()
 	if err != nil {
 		return "", err
 	}
 	return filepath.Join(filepath.Dir(statePath), agentAIIdentityFilename), nil
+}
+
+func agentAIIdentityPath() (string, error) { return identityPathResolver() }
+
+func withIdentityPath(dir string, fn func()) {
+	prev := identityPathResolver
+	identityPathResolver = func() (string, error) {
+		return filepath.Join(dir, agentAIIdentityFilename), nil
+	}
+	defer func() { identityPathResolver = prev }()
+	fn()
 }
 
 func (m *agentAIManager) loadIdentityState() {
@@ -182,6 +196,23 @@ func (m *agentAIManager) loadIdentityState() {
 			m.processedRuns[run.RunID] = run
 		}
 	}
+	for _, s := range state.InternalNativeSessions {
+		key := canonicalInternalInventoryID(s.Provider, s.NativeSessionID)
+		if key == "" {
+			continue
+		}
+		rec := s
+		if rec.CapturedAt.IsZero() {
+			rec.CapturedAt = time.Now().UTC()
+		}
+		if strings.HasPrefix(key, "claude_") {
+			rec.Provider = "claude"
+		} else if strings.HasPrefix(key, "codex_") {
+			rec.Provider = "codex"
+		}
+		m.internalNativeSessions[key] = rec
+	}
+	pruneInternalSessionsLocked(m.internalNativeSessions)
 }
 
 func (m *agentAIManager) persistIdentityState() error {
@@ -198,6 +229,10 @@ func (m *agentAIManager) persistIdentityState() error {
 	for _, run := range m.processedRuns {
 		state.ProcessedRuns = append(state.ProcessedRuns, run)
 	}
+	state.InternalNativeSessions = make([]rememberedInternalSession, 0, len(m.internalNativeSessions))
+	for _, s := range m.internalNativeSessions {
+		state.InternalNativeSessions = append(state.InternalNativeSessions, s)
+	}
 	m.mu.Unlock()
 	sort.Slice(state.Bindings, func(i, j int) bool {
 		return state.Bindings[i].ConversationID < state.Bindings[j].ConversationID
@@ -207,6 +242,12 @@ func (m *agentAIManager) persistIdentityState() error {
 	})
 	if len(state.ProcessedRuns) > agentAIProcessedRunCap {
 		state.ProcessedRuns = state.ProcessedRuns[:agentAIProcessedRunCap]
+	}
+	sort.Slice(state.InternalNativeSessions, func(i, j int) bool {
+		return state.InternalNativeSessions[i].CapturedAt.After(state.InternalNativeSessions[j].CapturedAt)
+	})
+	if len(state.InternalNativeSessions) > agentInternalSessionBucketCap*2 {
+		state.InternalNativeSessions = state.InternalNativeSessions[:agentInternalSessionBucketCap*2]
 	}
 	path, err := agentAIIdentityPath()
 	if err != nil {
