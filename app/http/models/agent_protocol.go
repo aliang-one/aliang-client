@@ -1,7 +1,7 @@
 package models
 
 const (
-	AgentProtocolVersion = "2026-07-21"
+	AgentProtocolVersion = "2026-08-02"
 
 	AgentHTTPRegisterEndpoint   = "/api/devices/register"
 	AgentHTTPStatusSyncEndpoint = "/api/agent/status"
@@ -83,14 +83,14 @@ const (
 	AgentEventSlashCommandsListResult = "slash.commands.list.result"
 	AgentEventSlashCommandsListError  = "slash.commands.list.error"
 	AgentEventGoalPlan                = "goal.plan"
+	AgentEventGoalPlanAIRequest       = "goal.plan.ai.request"
+	AgentEventGoalPlanAIResponse      = "goal.plan.ai.response"
+	AgentEventGoalPlanAIError         = "goal.plan.ai.error"
 	AgentEventGoalPlanResult          = "goal.plan.result"
 	AgentEventGoalPlanError           = "goal.plan.error"
 	AgentEventGoalVerify              = "goal.verify"
 	AgentEventGoalVerifyResult        = "goal.verify.result"
 	AgentEventGoalVerifyError         = "goal.verify.error"
-	AgentEventGoalContinue            = "goal.continue"
-	AgentEventGoalContinueResult      = "goal.continue.result"
-	AgentEventGoalContinueError       = "goal.continue.error"
 )
 
 type AgentProtocolContract struct {
@@ -212,12 +212,11 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				{Type: AgentEventFileError, Required: []string{"type", "request_id", "error"}},
 				{Type: AgentEventError, Required: []string{"type", "error"}},
 				{Type: AgentEventAIOptionRequest, Required: []string{"type", "session_id", "option_id", "options", "run_id", "event_seq"}, Optional: []string{"message_id", "title", "allow_custom", "multi", "provider"}},
+				{Type: AgentEventGoalPlanAIRequest, Required: []string{"type", "request_id", "goal_id", "planning_attempt_id", "ai_session_id", "turn", "messages"}},
 				{Type: AgentEventGoalPlanResult, Required: []string{"type", "request_id", "workspace_fingerprint_before", "workspace_fingerprint_after", "proposal"}, Optional: []string{"provider_run_id"}},
 				{Type: AgentEventGoalPlanError, Required: []string{"type", "request_id", "error"}},
 				{Type: AgentEventGoalVerifyResult, Required: []string{"type", "request_id", "batch_id", "workspace_fingerprint_before", "workspace_fingerprint_after", "results"}},
 				{Type: AgentEventGoalVerifyError, Required: []string{"type", "request_id", "error"}},
-				{Type: AgentEventGoalContinueResult, Required: []string{"type", "request_id", "workspace_fingerprint_before", "workspace_fingerprint_after", "next_action"}, Optional: []string{"schema_version", "rationale", "magnitude"}},
-				{Type: AgentEventGoalContinueError, Required: []string{"type", "request_id", "error"}},
 				{Type: AgentEventTunnelConfigured, Required: []string{"type", "request_id", "device_id", "state", "changed"}},
 				{Type: AgentEventTunnelStatus, Required: []string{"type", "device_id", "state"}, Optional: []string{"error"}},
 				{Type: AgentEventTunnelError, Required: []string{"type", "error"}, Optional: []string{"request_id"}},
@@ -250,9 +249,10 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				{Type: AgentEventAISessionDetail, Required: []string{"type", "request_id"}, Optional: []string{"session_id", "source_session_id", "project_path", "limit", "before_message_id", "before_timestamp"}, Emits: []string{AgentEventAISessionDetailResult, AgentEventFileError}},
 				{Type: AgentEventSlashCommandsList, Required: []string{"type", "request_id", "project_path"}, Optional: []string{"session_id", "provider", "include_user_level", "include_plugins", "claude_remote_policy"}, Emits: []string{AgentEventSlashCommandsListResult, AgentEventSlashCommandsListError}},
 				{Type: AgentEventAIOptionResponse, Required: []string{"type", "session_id", "option_id", "selected"}, Optional: []string{"message_id", "custom_text", "decision", "delivery_id"}, Emits: []string{AgentEventAIRunStarted, AgentEventAIDelta, AgentEventAIRunProgress, AgentEventAIDone, AgentEventAIError, AgentEventAIOptionRequest}},
-				{Type: AgentEventGoalPlan, Required: []string{"type", "request_id", "goal_id", "planning_attempt_id", "project_path", "objective", "provider"}, Emits: []string{AgentEventGoalPlanResult, AgentEventGoalPlanError}},
+				{Type: AgentEventGoalPlan, Required: []string{"type", "request_id", "protocol_version", "goal_id", "planning_attempt_id", "ai_session_id", "project_path", "objective", "plan_skill", "planner_timeout_ms"}, Optional: []string{"conversation_context"}, Emits: []string{AgentEventGoalPlanAIRequest, AgentEventGoalPlanResult, AgentEventGoalPlanError}},
+				{Type: AgentEventGoalPlanAIResponse, Required: []string{"type", "request_id", "goal_id", "planning_attempt_id", "ai_session_id", "response"}, Emits: []string{AgentEventGoalPlanResult, AgentEventGoalPlanError}},
+				{Type: AgentEventGoalPlanAIError, Required: []string{"type", "request_id", "error"}, Emits: []string{AgentEventGoalPlanError}},
 				{Type: AgentEventGoalVerify, Required: []string{"type", "request_id", "goal_id", "verification_batch_id", "project_path", "checks"}, Emits: []string{AgentEventGoalVerifyResult, AgentEventGoalVerifyError}},
-				{Type: AgentEventGoalContinue, Required: []string{"type", "request_id", "goal_id", "run_id", "project_path", "objective", "provider"}, Optional: []string{"task_id", "model", "effort", "constraints", "non_goals", "completed_tasks", "total_tasks", "remaining_tasks", "current_task", "recent_failures"}, Emits: []string{AgentEventGoalContinueResult, AgentEventGoalContinueError}},
 				{Type: AgentEventTunnelConfigure, Required: []string{"type", "request_id", "device_id", "piko_upstream_url", "tunnel_token", "route_public_key", "expires_at"}, Emits: []string{AgentEventTunnelConfigured, AgentEventTunnelStatus, AgentEventTunnelError}},
 				{Type: AgentEventAIOptionCancelled, Required: []string{"type", "session_id"}, Optional: []string{"option_ids", "reason"}},
 			},

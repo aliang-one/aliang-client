@@ -1812,6 +1812,12 @@ func TestAgentAIManagerCodexNativeGoalLifecycle(t *testing.T) {
 		request[key] = value
 	}
 	manager.runStart(request, writeJSON)
+	bound := waitForAgentEvent(t, &mu, &events, models.AgentEventAISessionBound, func(event map[string]interface{}) bool {
+		return event["session_id"] == "goal_native"
+	})
+	if remoteString(bound, "native_session_id") != "thr_fake" || remoteString(bound, "run_id") != "run-native" {
+		t.Fatalf("Codex binding = %#v", bound)
+	}
 	done := waitForAgentEvent(t, &mu, &events, "ai.done", func(event map[string]interface{}) bool {
 		return event["session_id"] == "goal_native"
 	})
@@ -3569,43 +3575,6 @@ func TestGoalErrorIncludesImmediateProviderFailureInReport(t *testing.T) {
 	report, _ := failed["goal_report"].(map[string]interface{})
 	if !strings.Contains(remoteString(report, "output"), "already running") {
 		t.Fatalf("goal_report.output = %#v", report["output"])
-	}
-}
-
-func TestGoalPlanPassProviderErrorSurfacesDeadline(t *testing.T) {
-	if goalPlannerExploreTimeout+goalPlanMaxEmitAttempts*goalPlannerEmitTimeout >= 10*time.Minute {
-		t.Fatalf("planner budget exceeds Server goal.plan RPC timeout")
-	}
-	got := goalPlanPassProviderError("", context.DeadlineExceeded, goalPlannerExploreTimeout)
-	if !strings.Contains(got, "planner_timeout") || !strings.Contains(got, goalPlannerExploreTimeout.String()) {
-		t.Fatalf("goalPlanPassProviderError() = %q", got)
-	}
-	if got := goalPlanPassProviderError("upstream failed", context.DeadlineExceeded, goalPlannerExploreTimeout); got != "upstream failed" {
-		t.Fatalf("explicit provider error was replaced: %q", got)
-	}
-}
-
-func TestGoalPlanTimeoutOnlyAdvancesPhaseWithoutExplicitProviderError(t *testing.T) {
-	timedOut := goalPlanCLIPassResult{
-		providerError: goalPlanPassProviderError("", context.DeadlineExceeded, goalPlannerExploreTimeout),
-		timedOut:      true,
-	}
-	if timedOut.providerError == "" || !timedOut.timedOut {
-		t.Fatalf("expected a typed phase-boundary timeout, got %#v", timedOut)
-	}
-	if got := timedOut.terminalProviderError(); got != "" {
-		t.Fatalf("exploration timeout should advance to emission, got terminal error %q", got)
-	}
-
-	providerFailure := goalPlanCLIPassResult{
-		providerError: goalPlanPassProviderError("upstream failed", context.DeadlineExceeded, goalPlannerExploreTimeout),
-		timedOut:      false,
-	}
-	if providerFailure.timedOut || providerFailure.providerError != "upstream failed" {
-		t.Fatalf("explicit provider error must remain terminal, got %#v", providerFailure)
-	}
-	if got := providerFailure.terminalProviderError(); got != "upstream failed" {
-		t.Fatalf("expected explicit provider error to remain terminal, got %q", got)
 	}
 }
 

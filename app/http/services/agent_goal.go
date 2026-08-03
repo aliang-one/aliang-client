@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -21,22 +22,23 @@ import (
 )
 
 const (
-	goalPlannerExploreTimeout = 7 * time.Minute
-	goalPlannerEmitTimeout    = 50 * time.Second
-	goalContinueTimeout       = 50 * time.Second
-	goalEvidenceOutputLimit   = 16 * 1024
-	// goalPlanOutputLimit caps how much of the provider's planning stream we
-	// capture (to then extract the trailing ALIANG_GOAL_PLAN marker). Deep-effort
-	// turns (e.g. glm-5.2[1m] @ xhigh) can emit 500KB-1MB+ of reasoning before the
-	// marker; the old 256KB cap truncated the marker off the end -> "did not
-	// converge" -> server re-dispatched -> goal stuck in planning. 2MB leaves
-	// headroom for thorough planning while bounding memory.
-	goalPlanOutputLimit       = 2 * 1024 * 1024
-	goalFingerprintFileLimit  = 50_000
-	goalFingerprintByteLimit  = 256 * 1024 * 1024
-	goalReportMarker          = "ALIANG_GOAL_REPORT:"
-	goalPlanMarker            = "ALIANG_GOAL_PLAN:"
-	goalReportOutputByteLimit = 16 * 1024
+	goalPlannerTransportMargin  = 30 * time.Second
+	goalPlannerProgressInterval = 15 * time.Second
+	goalPlanContextMaxBytes     = 128 * 1024
+	goalPlanFileListMaxBytes    = 16 * 1024
+	goalPlanKeyFilesMaxBytes    = 32 * 1024
+	goalPlanReadFileMaxBytes    = 32 * 1024
+	goalPlanListDirMaxEntries   = 500
+	goalPlanGrepMaxResults      = 50
+	goalPlanGrepFileMaxBytes    = 256 * 1024
+	goalPlanGitPatchMaxBytes    = 48 * 1024
+	goalPlanGitPatchPerFile     = 16 * 1024
+	goalPlanGitDiffStatMaxBytes = 8 * 1024
+	goalEvidenceOutputLimit     = 16 * 1024
+	goalFingerprintFileLimit    = 50_000
+	goalFingerprintByteLimit    = 256 * 1024 * 1024
+	goalReportMarker            = "ALIANG_GOAL_REPORT:"
+	goalReportOutputByteLimit   = 16 * 1024
 )
 
 // goalTaskReportSystemPrompt 是注入到 Goal task 执行回合的强化指令（拼到
@@ -521,14 +523,12 @@ func stripCodeFence(value string) string {
 	return strings.TrimSpace(value)
 }
 
-func handleAgentGoalMessage(msg map[string]interface{}, writeJSON func(interface{}) error, manager *agentAIManager) {
+func handleAgentGoalMessage(msg map[string]interface{}, writeJSON func(interface{}) error) {
 	switch remoteString(msg, "type") {
 	case models.AgentEventGoalPlan:
-		handleAgentGoalPlan(msg, writeJSON, manager)
+		handleAgentGoalPlan(msg, writeJSON)
 	case models.AgentEventGoalVerify:
 		handleAgentGoalVerify(msg, writeJSON)
-	case models.AgentEventGoalContinue:
-		handleAgentGoalContinue(msg, writeJSON, manager)
 	}
 }
 
@@ -548,15 +548,37 @@ func agentGoalErrorPayload(msg map[string]interface{}, err error) map[string]int
 	}
 }
 
-const goalPlanMaxEmitAttempts = 3
+var pendingGoalPlanAIResponses sync.Map
 
-func handleAgentGoalPlan(msg map[string]interface{}, writeJSON func(interface{}) error, manager *agentAIManager) {
+func deliverGoalPlanAIResponse(msg map[string]interface{}) {
+	requestID := strings.TrimSpace(remoteString(msg, "request_id"))
+	value, ok := pendingGoalPlanAIResponses.Load(requestID)
+	if !ok {
+		return
+	}
+	select {
+	case value.(chan map[string]interface{}) <- msg:
+	default:
+	}
+}
+
+func handleAgentGoalPlan(msg map[string]interface{}, writeJSON func(interface{}) error) {
 	requestID := strings.TrimSpace(remoteString(msg, "request_id"))
 	objective := strings.TrimSpace(remoteString(msg, "objective"))
-	constraints := remoteStringSlice(msg, "constraints")
-	nonGoals := remoteStringSlice(msg, "non_goals")
-	if requestID == "" || objective == "" || manager == nil {
-		_ = writeJSON(agentGoalErrorPayload(msg, errors.New("goal.plan missing request_id, objective, or AI runtime")))
+	goalID := strings.TrimSpace(remoteString(msg, "goal_id"))
+	attemptID := strings.TrimSpace(remoteString(msg, "planning_attempt_id"))
+	aiSessionID := strings.TrimSpace(remoteString(msg, "ai_session_id"))
+	if remoteInt(msg, "protocol_version", 0) != 3 {
+		_ = writeJSON(agentGoalErrorPayload(msg, errors.New("goal.plan protocol_version unsupported")))
+		return
+	}
+	if requestID == "" || objective == "" || goalID == "" || attemptID == "" || aiSessionID == "" {
+		_ = writeJSON(agentGoalErrorPayload(msg, errors.New("goal.plan missing request, goal, attempt, session, or objective")))
+		return
+	}
+	plannerWait, err := goalPlannerWaitTimeout(msg)
+	if err != nil {
+		_ = writeJSON(agentGoalErrorPayload(msg, err))
 		return
 	}
 	projectPath, err := resolveAgentProjectPath(remoteString(msg, "project_path"))
@@ -569,69 +591,783 @@ func handleAgentGoalPlan(msg map[string]interface{}, writeJSON func(interface{})
 		_ = writeJSON(agentGoalErrorPayload(msg, err))
 		return
 	}
-	goalID := remoteString(msg, "goal_id")
-	goalSessionID := "goal-plan:" + goalID
-	provider := firstNonEmpty(remoteString(msg, "provider"), "auto")
-	model := remoteString(msg, "model")
-	effort := remoteString(msg, "effort")
-	if err := preflightGoalPlannerProvider(provider, model, effort); err != nil {
+	conversationContext, _ := msg["conversation_context"].(map[string]interface{})
+	evidence, err := buildGoalPlanContext(projectPath, conversationContext)
+	if err != nil {
 		_ = writeJSON(agentGoalErrorPayload(msg, err))
 		return
 	}
-
-	manager.ensureGoalPlanningSession(goalSessionID, projectPath, provider, model, effort)
-	defer manager.removeGoalPlanningSession(goalSessionID)
-
-	// Safety net: a goal must never be left dangling. A blocking provider run or
-	// an unexpected panic still yields a typed error so the server settles it.
-	defer func() {
-		if r := recover(); r != nil {
-			_ = writeJSON(agentGoalErrorPayload(msg, fmt.Errorf("goal planner crashed: %v", r)))
-		}
-	}()
-
-	// Phase A — read-only exploration on the primary goal-plan session.
 	emitGoalPlanPhase(writeJSON, requestID, "exploring", 0)
-	explore := runGoalPlanCLIPass(manager, goalSessionID, requestID, projectPath, provider, model, effort, goalPlanExplorePrompt(objective, constraints, nonGoals, projectPath), false, "", goalPlannerExploreTimeout, makeGoalPlanThinkingEmitter(writeJSON, requestID, "exploring", 0))
-	if plan, ok := extractGoalPlan(explore.output); ok {
-		normalizeGoalPlanPaths(plan, projectPath)
-		finalizeGoalPlan(writeJSON, msg, requestID, before, projectPath, plan)
+	responseCh := make(chan map[string]interface{}, 1)
+	pendingGoalPlanAIResponses.Store(requestID, responseCh)
+	defer pendingGoalPlanAIResponses.Delete(requestID)
+	deadline := time.Now().Add(plannerWait)
+	progress := time.NewTicker(goalPlannerProgressInterval)
+	defer progress.Stop()
+	// callServer drives one planning turn over the WS: send goal.plan.ai.request
+	// with the conversation only (the server owns the system prompt, objective
+	// contract, and canonical tools), then wait for the server's
+	// goal.plan.ai.response (the OpenAI assistant message). The whole loop shares
+	// one wall-clock deadline (planner_timeout_ms + margin); each turn waits at
+	// most until that deadline.
+	callServer := func(turn int, messages []map[string]interface{}) (map[string]interface{}, string, error) {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil, "", errors.New("planner_service_transport_timeout")
+		}
+		if err := writeJSON(map[string]interface{}{
+			"type":                models.AgentEventGoalPlanAIRequest,
+			"request_id":          requestID,
+			"goal_id":             goalID,
+			"planning_attempt_id": attemptID,
+			"ai_session_id":       aiSessionID,
+			"turn":                turn,
+			"messages":            messages,
+		}); err != nil {
+			return nil, "", err
+		}
+		emitGoalPlanPhase(writeJSON, requestID, "planning", turn)
+		timer := time.NewTimer(remaining)
+		defer timer.Stop()
+		for {
+			select {
+			case response := <-responseCh:
+				if remoteString(response, "goal_id") != goalID ||
+					remoteString(response, "planning_attempt_id") != attemptID ||
+					remoteString(response, "ai_session_id") != aiSessionID {
+					return nil, "", errors.New("planner_service_identity_mismatch")
+				}
+				if remoteString(response, "type") == models.AgentEventGoalPlanAIError {
+					return nil, "", errors.New(remoteString(response, "error"))
+				}
+				return extractGoalPlanAssistant(response)
+			case <-progress.C:
+				emitGoalPlanPhase(writeJSON, requestID, "planning", turn)
+			case <-timer.C:
+				return nil, "", errors.New("planner_service_transport_timeout")
+			}
+		}
+	}
+	emitGoalPlanPhase(writeJSON, requestID, "planning", 1)
+	proposal, providerRunID, err := runGoalPlanLoop(goalPlanLoopInput{
+		projectRoot: projectPath,
+		evidence:    evidence,
+		callServer:  callServer,
+		maxTurns:    goalPlannerMaxTurns,
+	})
+	if err != nil {
+		_ = writeJSON(agentGoalErrorPayload(msg, err))
 		return
 	}
-	// The exploration deadline is a phase boundary, not a terminal provider
-	// failure. Claude may spend the entire read-only pass inspecting the repo;
-	// the bounded emission pass below resumes that native session and forces the
-	// structured result. Explicit provider errors remain terminal.
-	if providerError := explore.terminalProviderError(); providerError != "" {
-		_ = writeJSON(agentGoalErrorPayload(msg, fmt.Errorf("planner_provider_error: %s", providerError)))
-		return
-	}
-	nativeSID := manager.resumeSessionIDFor(goalSessionID)
+	normalizeGoalPlanPaths(proposal, projectPath)
+	finalizeGoalPlan(writeJSON, msg, requestID, before, projectPath, providerRunID, proposal)
+}
 
-	// Phase B — forced emission. Each attempt runs on its OWN manager session
-	// (goal-plan-emit-<attempt>:<id>) so runCLIPass is never called twice on the
-	// same session (that blocked the earlier implementation). We pass the
-	// exploration's native claude session id so the emission turn resumes it.
-	emitPrompt := goalPlanEmitPrompt(objective, constraints, nonGoals, projectPath)
-	for attempt := 1; attempt <= goalPlanMaxEmitAttempts; attempt++ {
-		emitGoalPlanPhase(writeJSON, requestID, "emitting", attempt)
-		emitSession := fmt.Sprintf("goal-plan-emit-%d:%s", attempt, goalID)
-		manager.ensureGoalPlanningSession(emitSession, projectPath, provider, model, effort)
-		emit := runGoalPlanCLIPass(manager, emitSession, requestID, projectPath, provider, model, effort, emitPrompt, true, nativeSID, goalPlannerEmitTimeout, makeGoalPlanThinkingEmitter(writeJSON, requestID, "emitting", attempt))
-		manager.removeGoalPlanningSession(emitSession)
-		if plan, ok := extractGoalPlan(emit.output); ok {
-			normalizeGoalPlanPaths(plan, projectPath)
-			finalizeGoalPlan(writeJSON, msg, requestID, before, projectPath, plan)
-			return
+// extractGoalPlanAssistant pulls the OpenAI assistant message (choices[0].message)
+// and the planning response id out of a goal.plan.ai.response envelope. The
+// assistant message may carry tool_calls (read-only exploration or
+// submit_goal_plan) or plain content (JSON fallback); the loop interprets it.
+func extractGoalPlanAssistant(response map[string]interface{}) (map[string]interface{}, string, error) {
+	openai, ok := response["response"].(map[string]interface{})
+	if !ok {
+		return nil, "", errors.New("planner_service_response_invalid")
+	}
+	choices, _ := openai["choices"].([]interface{})
+	if len(choices) == 0 {
+		return nil, "", errors.New("planner_service_response_invalid")
+	}
+	choice, _ := choices[0].(map[string]interface{})
+	message, _ := choice["message"].(map[string]interface{})
+	if message == nil {
+		return nil, "", errors.New("planner_service_response_invalid")
+	}
+	return message, remoteString(openai, "id"), nil
+}
+
+// goalPlannerWaitTimeout derives the Agent's SHARED wall-clock deadline for the
+// whole planning loop from planner_timeout_ms. planner_timeout_ms is the
+// whole-plan budget (NOT per-turn): the Agent spends it across all turns, so a
+// slow first turn leaves less for the rest. The +margin covers WS round-trips so
+// the Agent never times out before the server's per-turn call (which is bounded
+// by the same planner_timeout_ms as a single-turn safety net).
+func goalPlannerWaitTimeout(msg map[string]interface{}) (time.Duration, error) {
+	plannerTimeoutMs := remoteInt(msg, "planner_timeout_ms", -1)
+	if plannerTimeoutMs < 1_000 || plannerTimeoutMs > 600_000 {
+		return 0, errors.New("goal.plan planner_timeout_ms invalid")
+	}
+	return time.Duration(plannerTimeoutMs)*time.Millisecond + goalPlannerTransportMargin, nil
+}
+
+func buildGoalPlanProjectContext(projectPath string) (map[string]interface{}, error) {
+	files, fileCount, totalSize := summarizeAgentProjectFiles(projectPath, 1200)
+	keyNames := map[string]struct{}{
+		"package.json": {}, "tsconfig.json": {}, "go.mod": {}, "cargo.toml": {},
+		"pyproject.toml": {}, "requirements.txt": {}, "makefile": {}, "dockerfile": {},
+		"docker-compose.yml": {}, "docker-compose.yaml": {}, "agents.md": {}, "claude.md": {},
+	}
+	keyFiles := make([]map[string]interface{}, 0, 16)
+	remaining := goalPlanKeyFilesMaxBytes
+	for _, rel := range files {
+		if _, ok := keyNames[strings.ToLower(filepath.Base(rel))]; !ok || remaining <= 0 {
+			continue
 		}
-		if providerError := emit.terminalProviderError(); providerError != "" {
-			_ = writeJSON(agentGoalErrorPayload(msg, fmt.Errorf("planner_provider_error: %s", providerError)))
-			return
+		path := filepath.Join(projectPath, filepath.FromSlash(rel))
+		resolved, err := filepath.EvalSymlinks(path)
+		if err != nil {
+			continue
+		}
+		inside, err := filepath.Rel(projectPath, resolved)
+		if err != nil || inside == ".." || strings.HasPrefix(inside, ".."+string(filepath.Separator)) {
+			continue
+		}
+		info, err := os.Stat(resolved)
+		if err != nil || !info.Mode().IsRegular() || info.Size() > 128*1024 {
+			continue
+		}
+		raw, err := os.ReadFile(resolved)
+		if err != nil || bytesContainNUL(raw) {
+			continue
+		}
+		if len(raw) > 32*1024 {
+			raw = raw[:32*1024]
+		}
+		if len(raw) > remaining {
+			raw = raw[:remaining]
+		}
+		remaining -= len(raw)
+		keyFiles = append(keyFiles, map[string]interface{}{"path": rel, "content": string(raw)})
+	}
+	contextPayload := map[string]interface{}{
+		"schema_version": 1, "workspace_root": projectPath, "files": boundedGoalPlanFiles(files),
+		"file_count": fileCount, "total_size_bytes": totalSize,
+		"readme": readAgentProjectReadme(projectPath), "key_files": keyFiles,
+	}
+	if err := fitGoalPlanProjectContext(contextPayload); err != nil {
+		return nil, err
+	}
+	return contextPayload, nil
+}
+
+func boundedGoalPlanFiles(files []string) []string {
+	bounded := make([]string, 0, len(files))
+	remaining := goalPlanFileListMaxBytes
+	for _, path := range files {
+		cost := len([]byte(path)) + 3
+		if cost > remaining {
+			break
+		}
+		bounded = append(bounded, path)
+		remaining -= cost
+	}
+	return bounded
+}
+
+func fitGoalPlanProjectContext(contextPayload map[string]interface{}) error {
+	encodedSize := func() (int, error) {
+		raw, err := json.Marshal(contextPayload)
+		return len(raw), err
+	}
+	for {
+		size, err := encodedSize()
+		if err != nil {
+			return fmt.Errorf("goal planner context encoding failed: %w", err)
+		}
+		if size <= goalPlanContextMaxBytes {
+			return nil
+		}
+		if keyFiles, ok := contextPayload["key_files"].([]map[string]interface{}); ok && len(keyFiles) > 0 {
+			contextPayload["key_files"] = keyFiles[:len(keyFiles)/2]
+			continue
+		}
+		if readme, ok := contextPayload["readme"].(string); ok && len(readme) > 0 {
+			contextPayload["readme"] = readme[:len(readme)/2]
+			continue
+		}
+		if files, ok := contextPayload["files"].([]string); ok && len(files) > 0 {
+			contextPayload["files"] = files[:len(files)/2]
+			continue
+		}
+		return errors.New("goal planner context exceeds agent limit")
+	}
+}
+
+// buildGoalPlanContext assembles the evidence the planner receives in its first
+// user turn: bounded recent conversation (server-supplied), a projectPath-scoped
+// Git snapshot, and a workspace scan (key files + file list + README). The
+// server injects the authoritative objective/constraints/non-goals + skill as
+// the system message, so the evidence carries NO objective — it is purely
+// grounding ("what was discussed / what changed / what files exist"). Trimmed to
+// the planner budget (per-turn resend cost is bounded by this cap × max turns).
+func buildGoalPlanContext(projectPath string, conversation map[string]interface{}) (map[string]interface{}, error) {
+	workspace, err := buildGoalPlanProjectContext(projectPath)
+	if err != nil {
+		return nil, err
+	}
+	evidence := map[string]interface{}{
+		"conversation_context": conversation,
+		"git_context":          buildGoalPlanGitContext(projectPath),
+		"workspace_context": map[string]interface{}{
+			"readme":    workspace["readme"],
+			"key_files": workspace["key_files"],
+			"files":     workspace["files"],
+		},
+	}
+	if err := fitGoalPlanContext(evidence); err != nil {
+		return nil, err
+	}
+	return evidence, nil
+}
+
+// fitGoalPlanContext bounds the evidence to goalPlanContextMaxBytes by halving
+// fields in priority order: static workspace first (key_files → file list →
+// README), then git patches + changed_files, keeping conversation + git metadata
+// (small, high-value for "continue from latest changes") as long as possible.
+func fitGoalPlanContext(evidence map[string]interface{}) error {
+	for {
+		raw, err := json.Marshal(evidence)
+		if err != nil {
+			return fmt.Errorf("goal planner evidence encoding failed: %w", err)
+		}
+		if len(raw) <= goalPlanContextMaxBytes {
+			return nil
+		}
+		if halveGoalPlanSliceField(evidence, "workspace_context", "key_files") {
+			continue
+		}
+		if halveGoalPlanSliceField(evidence, "workspace_context", "files") {
+			continue
+		}
+		if halveGoalPlanStringField(evidence, "workspace_context", "readme") {
+			continue
+		}
+		if halveGoalPlanSliceField(evidence, "git_context", "patches") {
+			continue
+		}
+		if halveGoalPlanSliceField(evidence, "git_context", "changed_files") {
+			continue
+		}
+		return errors.New("goal planner evidence exceeds agent limit")
+	}
+}
+
+func halveGoalPlanSliceField(evidence map[string]interface{}, parent, field string) bool {
+	m, ok := evidence[parent].(map[string]interface{})
+	if !ok {
+		return false
+	}
+	switch slice := m[field].(type) {
+	case []map[string]interface{}:
+		if len(slice) <= 1 {
+			return false
+		}
+		m[field] = slice[:len(slice)/2]
+		return true
+	case []string:
+		if len(slice) <= 1 {
+			return false
+		}
+		m[field] = slice[:len(slice)/2]
+		return true
+	case []interface{}:
+		if len(slice) <= 1 {
+			return false
+		}
+		m[field] = slice[:len(slice)/2]
+		return true
+	}
+	return false
+}
+
+func halveGoalPlanStringField(evidence map[string]interface{}, parent, field string) bool {
+	m, ok := evidence[parent].(map[string]interface{})
+	if !ok {
+		return false
+	}
+	value, ok := m[field].(string)
+	if !ok || len(value) <= 1 {
+		return false
+	}
+	m[field] = value[:len(value)/2]
+	return true
+}
+
+func bytesContainNUL(value []byte) bool {
+	for _, b := range value {
+		if b == 0 {
+			return true
 		}
 	}
+	return false
+}
 
-	// Convergence guarantee: typed failure instead of a vague planner_failed.
-	_ = writeJSON(agentGoalErrorPayload(msg, errors.New("planner_did_not_converge: provider did not emit valid ALIANG_GOAL_PLAN after exploration and bounded emission attempts")))
+// buildGoalPlanGitContext gathers a bounded, projectPath-scoped Git snapshot for
+// planning. Every command carries a fixed `-- .` pathspec (so a monorepo's
+// sibling directories are never leaked) plus --no-ext-diff/--no-textconv (so
+// repo config can't trigger external programs). Each command degrades
+// INDEPENDENTLY: an unborn repo fails `log`/`diff HEAD`/`rev-parse` but still
+// yields status + untracked files. Only a `status` failure (not a git repo /
+// git missing) marks the whole context unavailable — it never fails planning.
+func buildGoalPlanGitContext(projectPath string) map[string]interface{} {
+	statusOut, err := agentRunGit(projectPath, "status", "--porcelain=v2", "-z", "--branch",
+		"--untracked-files=all", "--", ".")
+	if err != nil {
+		return map[string]interface{}{"available": false, "reason": "git status unavailable"}
+	}
+	// prefix = repo-root → projectPath relative path (e.g. "a/"); stripped from
+	// git paths so they are projectPath-relative and round-trip with read_file.
+	prefix, _ := agentRunGit(projectPath, "rev-parse", "--show-prefix")
+	prefix = strings.TrimRight(prefix, "\n")
+	branch, changedFiles := parseGoalPlanGitStatusV2(statusOut, prefix)
+	ctx := map[string]interface{}{
+		"available":     true,
+		"branch":        branch,
+		"changed_files": changedFiles,
+	}
+	if sha, err := agentRunGit(projectPath, "rev-parse", "--verify", "HEAD"); err == nil {
+		ctx["head_sha"] = strings.TrimSpace(sha)
+	} else {
+		ctx["head_sha"] = ""
+	}
+	if stat, err := agentRunGit(projectPath, "diff", "--no-ext-diff", "--no-textconv",
+		"--stat", "HEAD", "--", "."); err == nil {
+		ctx["diff_stat"] = clipBytes(stat, goalPlanGitDiffStatMaxBytes)
+	}
+	ctx["patches"] = goalPlanGitPatches(projectPath, prefix)
+	if logOut, err := agentRunGit(projectPath, "log", "-10", "--format=%H%x09%s", "--", "."); err == nil {
+		ctx["recent_commits"] = parseGoalPlanGitLog(logOut)
+	} else {
+		ctx["recent_commits"] = []interface{}{}
+	}
+	return ctx
+}
+
+// goalPlanGitPatches returns per-file diff chunks (capped) for tracked changes
+// under projectPath. Truncation is per-file + total-bounded so a hunk is never
+// hard-cut by a single global cap. Reuses parseGitDiffFiles for robust path
+// extraction (handles renames, spaces, non-ASCII via the +++/--- headers).
+func goalPlanGitPatches(projectPath, prefix string) []map[string]interface{} {
+	diffOut, err := agentRunGit(projectPath, "diff", "--no-ext-diff", "--no-textconv",
+		"--no-color", "--unified=3", "HEAD", "--", ".")
+	if err != nil {
+		return []map[string]interface{}{}
+	}
+	patches := []map[string]interface{}{}
+	total := 0
+	for _, file := range parseGitDiffFiles(diffOut) {
+		if total >= goalPlanGitPatchMaxBytes {
+			break
+		}
+		original := len(file.diff)
+		capped := file.diff
+		if len(capped) > goalPlanGitPatchPerFile {
+			capped = capped[:goalPlanGitPatchPerFile]
+		}
+		if remaining := goalPlanGitPatchMaxBytes - total; len(capped) > remaining {
+			capped = capped[:remaining]
+		}
+		total += len(capped)
+		patches = append(patches, map[string]interface{}{
+			"path": stripGoalPlanPathPrefix(file.relPath, prefix), "diff": capped, "truncated": len(capped) < original,
+		})
+	}
+	return patches
+}
+
+// parseGoalPlanGitStatusV2 parses `git status --porcelain=v2 -z --branch` output
+// (NUL-delimited, so paths with spaces / non-ASCII / renames decode verbatim —
+// unlike the v1 octal-escaped path quirk). Returns the branch head + a list of
+// {path, status} for changed/untracked files.
+// parseGoalPlanGitStatusV2 parses `git status --porcelain=v2 -z --branch` output
+// (NUL-delimited, so paths with spaces / non-ASCII / renames decode verbatim —
+// unlike the v1 octal-escaped path quirk). prefix is `git rev-parse
+// --show-prefix` (the repo-root→projectPath relative path, e.g. "a/"); it is
+// stripped from each path so changed_files entries are projectPath-relative and
+// the model can feed them straight back to read_file. Returns the branch head +
+// a list of {path, status} for changed/untracked files.
+func parseGoalPlanGitStatusV2(out, prefix string) (branch string, entries []map[string]interface{}) {
+	entries = []map[string]interface{}{}
+	for _, field := range strings.Split(out, "\x00") {
+		if field == "" {
+			continue
+		}
+		if strings.HasPrefix(field, "# branch.head ") {
+			branch = strings.TrimSpace(strings.TrimPrefix(field, "# branch.head "))
+			continue
+		}
+		if strings.HasPrefix(field, "#") {
+			continue
+		}
+		switch field[0] {
+		case '1':
+			// "1 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <path>" → 9 fields, path=parts[8].
+			parts := strings.SplitN(field, " ", 9)
+			if len(parts) >= 9 {
+				entries = append(entries, map[string]interface{}{
+					"path": stripGoalPlanPathPrefix(parts[8], prefix),
+					"status": classifyGitStatusCode(parts[1]),
+				})
+			}
+		case '2':
+			// "2 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <Rscore> <path>" → 10 fields,
+			// path=parts[9] (the rename/copy score occupies parts[8]). The original
+			// path follows in the next NUL field and is a bare path (no case match).
+			parts := strings.SplitN(field, " ", 10)
+			if len(parts) >= 10 {
+				entries = append(entries, map[string]interface{}{
+					"path": stripGoalPlanPathPrefix(parts[9], prefix),
+					"status": classifyGitStatusCode(parts[1]),
+				})
+			}
+		case '?':
+			if rel := strings.TrimPrefix(field, "? "); rel != "" {
+				entries = append(entries, map[string]interface{}{
+					"path": stripGoalPlanPathPrefix(rel, prefix), "status": "added",
+				})
+			}
+		case '!':
+			// ignored — skip
+		}
+	}
+	if branch == "" {
+		branch = "(unknown)"
+	}
+	return
+}
+
+// stripGoalPlanPathPrefix removes the repo-root→projectPath prefix (e.g. "a/")
+// that git emits, so paths become projectPath-relative and the model can pass
+// them to read_file without a doubled "a/a/..." segment.
+func stripGoalPlanPathPrefix(path, prefix string) string {
+	if prefix == "" {
+		return path
+	}
+	if strings.HasPrefix(path, prefix) {
+		return path[len(prefix):]
+	}
+	return path
+}
+
+func parseGoalPlanGitLog(out string) []map[string]interface{} {
+	commits := []map[string]interface{}{}
+	for _, line := range strings.Split(strings.TrimRight(out, "\n"), "\n") {
+		if line == "" {
+			continue
+		}
+		tab := strings.IndexByte(line, '\t')
+		if tab < 0 {
+			continue
+		}
+		commits = append(commits, map[string]interface{}{"sha": line[:tab], "subject": line[tab+1:]})
+	}
+	return commits
+}
+
+func clipBytes(value string, max int) string {
+	if len(value) <= max {
+		return value
+	}
+	return value[:max]
+}
+
+// goalPlanToolResult is the content of the {role:"tool"} message the bounded
+// planning loop appends after running one read-only exploration tool locally.
+// isError marks a failed tool call (bad path / bad regex / unknown tool) so the
+// model can react instead of the loop stalling on an empty success.
+type goalPlanToolResult struct {
+	content string
+	isError bool
+}
+
+// resolveGoalPlanReadPath resolves a planner-tool path under projectRoot with
+// symlink awareness. resolveGoalCheckPath only does a LEXICAL boundary check, so
+// a symlink inside the root that points outside would let the model read beyond
+// the authorized project. EvalSymlinks + a canonical-root re-check closes that.
+func resolveGoalPlanReadPath(projectRoot, raw string) (string, error) {
+	lexical, err := resolveGoalCheckPath(projectRoot, raw)
+	if err != nil {
+		return "", err
+	}
+	// Canonicalize both sides: on macOS /var → /private/var, so EvalSymlinks of
+	// the file lands in /private/... while a raw projectRoot stays in /var/...,
+	// making a legitimate file look like an escape. Resolve the root too.
+	rootResolved, err := filepath.EvalSymlinks(projectRoot)
+	if err != nil {
+		rootResolved = projectRoot
+	}
+	resolved, err := filepath.EvalSymlinks(lexical)
+	if err != nil {
+		return "", err
+	}
+	rel, err := filepath.Rel(rootResolved, resolved)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", errors.New("path escapes the authorized project")
+	}
+	return resolved, nil
+}
+
+// executeGoalPlanReadOnlyTool dispatches one read-only planning tool call from
+// the LLM against the agent's local filesystem, sandboxed to projectRoot. The
+// terminal submit_goal_plan tool is handled by the loop driver, not here.
+func executeGoalPlanReadOnlyTool(projectRoot, toolName, argumentsJSON string) goalPlanToolResult {
+	switch toolName {
+	case "read_file":
+		return goalPlanReadFileTool(projectRoot, argumentsJSON)
+	case "list_dir":
+		return goalPlanListDirTool(projectRoot, argumentsJSON)
+	case "grep":
+		return goalPlanGrepTool(projectRoot, argumentsJSON)
+	default:
+		return goalPlanToolResult{content: "unknown planning tool: " + toolName, isError: true}
+	}
+}
+
+func goalPlanReadFileTool(projectRoot, argumentsJSON string) goalPlanToolResult {
+	var args struct {
+		Path string `json:"path"`
+	}
+	if err := json.Unmarshal([]byte(argumentsJSON), &args); err != nil {
+		return goalPlanToolResult{content: "invalid arguments: " + err.Error(), isError: true}
+	}
+	path, err := resolveGoalPlanReadPath(projectRoot, args.Path)
+	if err != nil {
+		return goalPlanToolResult{content: "path rejected: " + err.Error(), isError: true}
+	}
+	// io.LimitReader: read at most cap+1 bytes so a multi-GB file can't be
+	// fully allocated before truncation (the +1 detects truncation).
+	f, err := os.Open(path)
+	if err != nil {
+		return goalPlanToolResult{content: "read failed: " + err.Error(), isError: true}
+	}
+	raw, readErr := io.ReadAll(io.LimitReader(f, goalPlanReadFileMaxBytes+1))
+	f.Close()
+	if readErr != nil {
+		return goalPlanToolResult{content: "read failed: " + readErr.Error(), isError: true}
+	}
+	if len(raw) > goalPlanReadFileMaxBytes {
+		raw = raw[:goalPlanReadFileMaxBytes]
+	}
+	return goalPlanToolResult{content: string(raw)}
+}
+
+func goalPlanListDirTool(projectRoot, argumentsJSON string) goalPlanToolResult {
+	var args struct {
+		Path string `json:"path"`
+	}
+	if err := json.Unmarshal([]byte(argumentsJSON), &args); err != nil {
+		return goalPlanToolResult{content: "invalid arguments: " + err.Error(), isError: true}
+	}
+	target := strings.TrimSpace(args.Path)
+	if target == "" {
+		target = "."
+	}
+	path, err := resolveGoalPlanReadPath(projectRoot, target)
+	if err != nil {
+		return goalPlanToolResult{content: "path rejected: " + err.Error(), isError: true}
+	}
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return goalPlanToolResult{content: "list failed: " + err.Error(), isError: true}
+	}
+	type listEntry struct {
+		Name  string `json:"name"`
+		IsDir bool   `json:"is_dir"`
+	}
+	out := make([]listEntry, 0, len(entries))
+	for i, entry := range entries {
+		if i >= goalPlanListDirMaxEntries {
+			break
+		}
+		out = append(out, listEntry{Name: entry.Name(), IsDir: entry.IsDir()})
+	}
+	encoded, _ := json.Marshal(out)
+	return goalPlanToolResult{content: string(encoded)}
+}
+
+var errGoalPlanGrepEnough = errors.New("goal plan grep result cap reached")
+
+func goalPlanGrepTool(projectRoot, argumentsJSON string) goalPlanToolResult {
+	var args struct {
+		Pattern string `json:"pattern"`
+		Path    string `json:"path"`
+	}
+	if err := json.Unmarshal([]byte(argumentsJSON), &args); err != nil {
+		return goalPlanToolResult{content: "invalid arguments: " + err.Error(), isError: true}
+	}
+	if strings.TrimSpace(args.Pattern) == "" {
+		return goalPlanToolResult{content: "pattern is empty", isError: true}
+	}
+	re, err := regexp.Compile(args.Pattern)
+	if err != nil {
+		return goalPlanToolResult{content: "invalid regex: " + err.Error(), isError: true}
+	}
+	scope := projectRoot
+	if strings.TrimSpace(args.Path) != "" {
+		resolved, err := resolveGoalPlanReadPath(projectRoot, args.Path)
+		if err != nil {
+			return goalPlanToolResult{content: "path rejected: " + err.Error(), isError: true}
+		}
+		scope = resolved
+	}
+	type grepMatch struct {
+		Path string `json:"path"`
+		Line int    `json:"line"`
+		Text string `json:"text"`
+	}
+	matches := make([]grepMatch, 0, goalPlanGrepMaxResults)
+	walkErr := filepath.WalkDir(scope, func(p string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if p != scope && shouldSkipGoalFingerprintDir(d.Name()) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !d.Type().IsRegular() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil || info.Size() > goalPlanGrepFileMaxBytes {
+			return nil
+		}
+		rel, err := filepath.Rel(projectRoot, p)
+		if err != nil {
+			return nil
+		}
+		raw, err := os.ReadFile(p)
+		if err != nil {
+			return nil
+		}
+		for lineNo, line := range strings.Split(string(raw), "\n") {
+			if re.MatchString(line) {
+				matches = append(matches, grepMatch{
+					Path: filepath.ToSlash(rel), Line: lineNo + 1, Text: clipGoalPlanLine(line),
+				})
+				if len(matches) >= goalPlanGrepMaxResults {
+					return errGoalPlanGrepEnough
+				}
+			}
+		}
+		return nil
+	})
+	if walkErr != nil && !errors.Is(walkErr, errGoalPlanGrepEnough) {
+		return goalPlanToolResult{content: "grep failed: " + walkErr.Error(), isError: true}
+	}
+	encoded, _ := json.Marshal(matches)
+	return goalPlanToolResult{content: string(encoded)}
+}
+
+func clipGoalPlanLine(line string) string {
+	if len(line) <= 500 {
+		return line
+	}
+	return line[:500] + "…"
+}
+
+// goalPlannerMaxTurns is the default soft cap for the bounded planning loop. It
+// bounds cost on the free planner channel while leaving ample room to explore a
+// real repo (the LLM rarely needs more than a handful of file reads before
+// submitting). Reached only when the model loops without converging.
+const goalPlannerMaxTurns = 8
+
+// goalPlanTurnCaller sends one planning turn to the server and returns the
+// assistant message + the planning response id. Injected so the loop logic is
+// unit-testable without a live WebSocket; the production caller in
+// handleAgentGoalPlan performs the real goal.plan.ai.request round-trip.
+type goalPlanTurnCaller func(turn int, messages []map[string]interface{}) (assistant map[string]interface{}, responseID string, err error)
+
+type goalPlanLoopInput struct {
+	projectRoot string
+	evidence    map[string]interface{}
+	callServer  goalPlanTurnCaller
+	maxTurns    int
+}
+
+// goalPlannerTools was removed: the server now owns the canonical tool
+// definitions (read_file/list_dir/grep/submit_goal_plan); the agent never
+// supplies tool schemas, only implements the matching handlers below.
+
+// extractSubmitGoalPlanProposal pulls the plan out of a submit_goal_plan tool
+// call's arguments. The server's canonical tool schema wraps the plan as
+// {"proposal": {...}}, so a schema-compliant model sends the plan under
+// "proposal"; accept that shape and fall back to a bare plan object for
+// robustness. Returns nil if the arguments are not a JSON object.
+func extractSubmitGoalPlanProposal(arguments string) map[string]interface{} {
+	var wrapper struct {
+		Proposal map[string]interface{} `json:"proposal"`
+	}
+	if json.Unmarshal([]byte(arguments), &wrapper) == nil && wrapper.Proposal != nil {
+		return wrapper.Proposal
+	}
+	var bare map[string]interface{}
+	if json.Unmarshal([]byte(arguments), &bare) == nil {
+		return bare
+	}
+	return nil
+}
+
+// runGoalPlanLoop drives the bounded, read-only exploration loop: the agent
+// holds the conversation, calls the server once per turn (the server injects
+// the skill system prompt and forwards a single OpenAI call), executes any
+// read-only tool calls locally against projectRoot, and ends when the model
+// calls submit_goal_plan with a valid plan. A content-only assistant turn is
+// parsed as a JSON fallback. Returns planner_budget_exceeded if maxTurns is
+// reached without convergence.
+func runGoalPlanLoop(input goalPlanLoopInput) (map[string]interface{}, string, error) {
+	if input.maxTurns <= 0 {
+		input.maxTurns = goalPlannerMaxTurns
+	}
+	firstUser, _ := json.Marshal(input.evidence)
+	messages := []map[string]interface{}{
+		{"role": "user", "content": string(firstUser)},
+	}
+	for turn := 1; turn <= input.maxTurns; turn++ {
+		assistant, responseID, err := input.callServer(turn, messages)
+		if err != nil {
+			return nil, "", err
+		}
+		toolCalls, _ := assistant["tool_calls"].([]interface{})
+		if len(toolCalls) == 0 {
+			content := strings.TrimSpace(remoteString(assistant, "content"))
+			var proposal map[string]interface{}
+			if content != "" && json.Unmarshal([]byte(content), &proposal) == nil && validGoalPlan(proposal) {
+				return proposal, responseID, nil
+			}
+			messages = append(messages, assistant, map[string]interface{}{
+				"role":    "user",
+				"content": "You did not call submit_goal_plan and your content was not a valid plan. Call submit_goal_plan with the full proposal now.",
+			})
+			continue
+		}
+		messages = append(messages, assistant)
+		for _, raw := range toolCalls {
+			call, ok := raw.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			fn, _ := call["function"].(map[string]interface{})
+			name := strings.TrimSpace(remoteString(fn, "name"))
+			arguments := remoteString(fn, "arguments")
+			callID := strings.TrimSpace(remoteString(call, "id"))
+			if name == "submit_goal_plan" {
+				proposal := extractSubmitGoalPlanProposal(arguments)
+				if proposal != nil && validGoalPlan(proposal) {
+					return proposal, responseID, nil
+				}
+				messages = append(messages, map[string]interface{}{
+					"role": "tool", "tool_call_id": callID,
+					"content": "invalid plan: the proposal failed validation (schema_version/objective/tasks/allowed_roots/checks). Re-emit submit_goal_plan with a complete valid plan.",
+				})
+				continue
+			}
+			result := executeGoalPlanReadOnlyTool(input.projectRoot, name, arguments)
+			messages = append(messages, map[string]interface{}{
+				"role": "tool", "tool_call_id": callID, "content": result.content,
+			})
+		}
+	}
+	return nil, "", errors.New("planner_budget_exceeded: max planning turns reached without a valid plan")
 }
 
 // codexSandboxMode selects the Codex app-server sandbox based on readOnly.
@@ -641,156 +1377,6 @@ func codexSandboxMode(readOnly bool) string {
 		return "read-only"
 	}
 	return "workspace-write"
-}
-
-func preflightGoalPlannerProvider(provider, model, effort string) error {
-	normalized, err := normalizeAgentAIProvider(provider)
-	if err != nil {
-		return fmt.Errorf("planner_provider_invalid: %w", err)
-	}
-	if normalized == "auto" {
-		return errors.New("planner_provider_invalid: Goal planning requires an explicit AI provider")
-	}
-	if _, err := resolveGoalAgentAITool("planner preflight", normalized, model, effort, "", "goal-plan-preflight"); err != nil {
-		return fmt.Errorf("planner_provider_unavailable: %w", err)
-	}
-	if normalized == "claude" || normalized == "claudecode" {
-		baseURL, hasBaseURL := agentChildProcessEnvValue("ANTHROPIC_BASE_URL")
-		token, hasToken := agentChildProcessEnvValue("ANTHROPIC_AUTH_TOKEN")
-		if !hasBaseURL && !hasToken {
-			return errors.New("planner_provider_unconfigured: Claude provider has neither ANTHROPIC_BASE_URL nor ANTHROPIC_AUTH_TOKEN in the agent environment")
-		}
-		if strings.TrimSpace(baseURL) == "" && strings.TrimSpace(token) == "" {
-			return errors.New("planner_provider_unconfigured: Claude provider has empty ANTHROPIC_BASE_URL and ANTHROPIC_AUTH_TOKEN")
-		}
-	}
-	return nil
-}
-
-// runGoalPlanCLIPass runs one goal-planning CLI turn: read-only exploration when
-// emission is false, tool-locked emission when true. It returns the captured
-// provider text output. Emission turns resume the exploration session when the
-// native session id was pinned on the goal session.
-type goalPlanCLIPassResult struct {
-	output        string
-	providerError string
-	timedOut      bool
-}
-
-func (result goalPlanCLIPassResult) terminalProviderError() string {
-	if result.timedOut {
-		return ""
-	}
-	return strings.TrimSpace(result.providerError)
-}
-
-func runGoalPlanCLIPass(manager *agentAIManager, sessionID, messageID, projectPath, provider, model, effort, prompt string, emission bool, resumeSID string, timeout time.Duration, emitThinking func(totalChars int, preview string)) goalPlanCLIPassResult {
-	allowResume := emission && resumeSID != ""
-	var captureMu sync.Mutex
-	var output strings.Builder
-	var providerError string
-	var lastEmit time.Time
-	var emittedChars int
-	const goalPlanThinkingThrottle = 1200 * time.Millisecond
-	const goalPlanThinkingPreview = 600
-	capture := func(value interface{}) error {
-		payload, ok := value.(map[string]interface{})
-		if !ok {
-			return nil
-		}
-		captureMu.Lock()
-		defer captureMu.Unlock()
-		if remoteString(payload, "type") == models.AgentEventAIDelta && output.Len() < goalPlanOutputLimit {
-			delta := remoteString(payload, "delta")
-			remaining := goalPlanOutputLimit - output.Len()
-			if len(delta) > remaining {
-				delta = delta[:remaining]
-			}
-			output.WriteString(delta)
-		}
-		if remoteString(payload, "type") == models.AgentEventAIError && providerError == "" {
-			providerError = strings.TrimSpace(remoteString(payload, "error"))
-			if detail := strings.TrimSpace(remoteString(payload, "detail")); detail != "" {
-				providerError = strings.TrimSpace(providerError + ": " + detail)
-			}
-			if len(providerError) > 2_000 {
-				providerError = providerError[:2_000]
-			}
-		}
-		// Throttled live-thinking push so the phone sees the planner reasoning
-		// (turns "stuck" into "visibly working"). One snapshot at most every
-		// ~1.2s, only when fresh content arrived since the last push.
-		if emitThinking != nil {
-			now := time.Now()
-			total := output.Len()
-			if total > emittedChars && (lastEmit.IsZero() || now.Sub(lastEmit) >= goalPlanThinkingThrottle) {
-				preview := output.String()
-				if len(preview) > goalPlanThinkingPreview {
-					preview = preview[len(preview)-goalPlanThinkingPreview:]
-				}
-				emitThinking(total, preview)
-				lastEmit = now
-				emittedChars = total
-			}
-		}
-		return nil
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	manager.runCLIPass(ctx, agentAIRun{
-		sessionID:       sessionID,
-		messageID:       messageID,
-		mode:            "agent",
-		projectPath:     projectPath,
-		provider:        provider,
-		model:           model,
-		effort:          effort,
-		prompt:          prompt,
-		freshPrompt:     prompt,
-		activity:        newAgentAIActivity(),
-		readOnly:        true,
-		emissionOnly:    emission,
-		plannerInternal: true,
-		resumeSessionID: resumeSID,
-	}, capture, allowResume)
-	ctxErr := ctx.Err()
-	// Final flush so the UI sees the last chunk written after the throttle window.
-	captureMu.Lock()
-	if emitThinking != nil && output.Len() > emittedChars {
-		preview := output.String()
-		if len(preview) > goalPlanThinkingPreview {
-			preview = preview[len(preview)-goalPlanThinkingPreview:]
-		}
-		emitThinking(output.Len(), preview)
-	}
-	out := output.String()
-	captureMu.Unlock()
-	return goalPlanCLIPassResult{
-		output:        out,
-		providerError: goalPlanPassProviderError(providerError, ctxErr, timeout),
-		timedOut:      strings.TrimSpace(providerError) == "" && errors.Is(ctxErr, context.DeadlineExceeded),
-	}
-}
-
-func goalPlanPassProviderError(providerError string, ctxErr error, timeout time.Duration) string {
-	if providerError = strings.TrimSpace(providerError); providerError != "" {
-		return providerError
-	}
-	if errors.Is(ctxErr, context.DeadlineExceeded) {
-		return fmt.Sprintf("planner_timeout: provider exceeded %s", timeout)
-	}
-	if ctxErr != nil {
-		return "planner_cancelled: " + ctxErr.Error()
-	}
-	return ""
-}
-
-func extractGoalPlan(output string) (map[string]interface{}, bool) {
-	proposal, ok := parseMarkedJSONObject(output, goalPlanMarker)
-	if !ok || !validGoalPlan(proposal) {
-		return nil, false
-	}
-	return proposal, true
 }
 
 // goalAllowedCommandNames mirrors the server's DEFAULT_ALLOWED_COMMANDS
@@ -824,8 +1410,8 @@ func goalCommandName(cmd string) string {
 //     sometimes point checks at their own ~/.claude cache or other system dirs);
 //   - drops any task that loses all its checks (server requires >=1 per task).
 //
-// A plan with zero surviving tasks is left empty, which extractGoalPlan then
-// rejects (-> did_not_converge) rather than sending an empty proposal.
+// A plan with zero surviving tasks is left empty so the server rejects it as an
+// invalid proposal rather than accepting an unverifiable plan.
 // Mutates the proposal in place.
 func normalizeGoalPlanPaths(proposal map[string]interface{}, projectRoot string) {
 	root := strings.TrimRight(strings.TrimSpace(projectRoot), "/")
@@ -896,190 +1482,7 @@ func normalizeGoalPlanPaths(proposal map[string]interface{}, projectRoot string)
 	proposal["tasks"] = cleanedTasks
 }
 
-const goalContinueMarker = "ALIANG_GOAL_CONTINUE:"
-
-// handleAgentGoalContinue — Phase 2 rolling-planning assessor. Before the server
-// dispatches the next task it asks the provider (read-only, single pass) whether
-// to run_next / propose_complete / request_user. The server's routeContinueDecision
-// guards the response (propose_complete is ignored unless all tasks are done), so a
-// bad decision degrades to run_next rather than misrouting. Mirrors handleAgentGoalPlan
-// but simpler: one read-only pass, no two-phase convergence.
-func handleAgentGoalContinue(msg map[string]interface{}, writeJSON func(interface{}) error, manager *agentAIManager) {
-	requestID := strings.TrimSpace(remoteString(msg, "request_id"))
-	objective := strings.TrimSpace(remoteString(msg, "objective"))
-	if requestID == "" || objective == "" || manager == nil {
-		_ = writeJSON(agentGoalContinueErrorPayload(msg, errors.New("goal.continue missing request_id, objective, or AI runtime")))
-		return
-	}
-	projectPath, err := resolveAgentProjectPath(remoteString(msg, "project_path"))
-	if err != nil {
-		_ = writeJSON(agentGoalContinueErrorPayload(msg, err))
-		return
-	}
-	before, err := goalWorkspaceFingerprint(projectPath)
-	if err != nil {
-		_ = writeJSON(agentGoalContinueErrorPayload(msg, err))
-		return
-	}
-	provider := strings.TrimSpace(remoteString(msg, "provider"))
-	model := strings.TrimSpace(remoteString(msg, "model"))
-	effort := strings.TrimSpace(remoteString(msg, "effort"))
-	if err := preflightGoalPlannerProvider(provider, model, effort); err != nil {
-		_ = writeJSON(agentGoalContinueErrorPayload(msg, err))
-		return
-	}
-	runID := strings.TrimSpace(remoteString(msg, "run_id"))
-	continueSession := fmt.Sprintf("goal-continue:%s", runID)
-	manager.ensureGoalPlanningSession(continueSession, projectPath, provider, model, effort)
-	defer manager.removeGoalPlanningSession(continueSession)
-	constraints := remoteStringSlice(msg, "constraints")
-	nonGoals := remoteStringSlice(msg, "non_goals")
-	pass := runGoalPlanCLIPass(manager, continueSession, requestID, projectPath, provider, model, effort,
-		goalContinuePrompt(objective, constraints, nonGoals, projectPath, msg), true, "", goalContinueTimeout, makeGoalPlanThinkingEmitter(writeJSON, requestID, "continue", 0))
-	if pass.providerError != "" {
-		_ = writeJSON(agentGoalContinueErrorPayload(msg, fmt.Errorf("continue_provider_error: %s", pass.providerError)))
-		return
-	}
-	decision, ok := parseMarkedJSONObject(pass.output, goalContinueMarker)
-	if !ok {
-		_ = writeJSON(agentGoalContinueErrorPayload(msg, errors.New("continue_did_not_emit: provider did not emit "+goalContinueMarker)))
-		return
-	}
-	after, afterErr := goalWorkspaceFingerprint(projectPath)
-	afterStr := ""
-	if afterErr == nil {
-		afterStr = after
-	}
-	// Flatten the decision fields into the top-level result so the server's
-	// decisionSchema (which parses the whole payload) sees next_action etc.
-	result := map[string]interface{}{
-		"type":                         models.AgentEventGoalContinueResult,
-		"request_id":                   requestID,
-		"workspace_fingerprint_before": before,
-		"workspace_fingerprint_after":  afterStr,
-	}
-	for k, v := range decision {
-		result[k] = v
-	}
-	_ = writeJSON(result)
-}
-
-func agentGoalContinueErrorPayload(msg map[string]interface{}, err error) map[string]interface{} {
-	message := "Goal continue request failed"
-	if err != nil {
-		message = err.Error()
-	}
-	return map[string]interface{}{
-		"type":       models.AgentEventGoalContinueError,
-		"request_id": remoteString(msg, "request_id"),
-		"error":      message,
-	}
-}
-
-func goalContinuePrompt(objective string, constraints, nonGoals []string, projectPath string, msg map[string]interface{}) string {
-	completed := fmt.Sprintf("%v", msg["completed_tasks"])
-	total := fmt.Sprintf("%v", msg["total_tasks"])
-	currentTaskTitle := "the next queued task"
-	if ct, ok := msg["current_task"].(map[string]interface{}); ok {
-		if t, ok := ct["title"].(string); ok && strings.TrimSpace(t) != "" {
-			currentTaskTitle = strings.TrimSpace(t)
-		}
-	}
-	// P1-4: post-verify drift evaluation. The server sends post_verify=true after
-	// a task verifies (assessPostVerify). v1 ignored the flag + the prompt enum
-	// lacked propose_branch, so the agent could never emit it — the
-	// goal_continue_v1 propose_branch half was a fake capability. Branch the
-	// prompt: post-verify frames a drift check + allows propose_branch; the
-	// pre-dispatch path stays the existing run_next/propose_complete/request_user.
-	postVerify, _ := msg["post_verify"].(bool)
-	verifiedTaskTitle := "the just-verified task"
-	if vt, ok := msg["verified_task"].(map[string]interface{}); ok {
-		if t, ok := vt["title"].(string); ok && strings.TrimSpace(t) != "" {
-			verifiedTaskTitle = strings.TrimSpace(t)
-		}
-	}
-	// P1 reflection: surface the just-verified run's terminal report so the
-	// assessor judges drift from execution FACTS, not just titles/counts.
-	verifiedRunReport := "no execution report available"
-	if summary, _ := msg["verified_run_summary"].(string); strings.TrimSpace(summary) != "" {
-		outcome, _ := msg["verified_run_outcome"].(string)
-		verifiedRunReport = fmt.Sprintf("outcome=%s summary: %s", outcome, strings.TrimSpace(summary))
-	}
-	// #2 reflection depth: also surface the remaining plan (so the assessor can
-	// judge whether the upcoming tasks are still valid), recent failures, and the
-	// full verified-run output — not just summary/outcome. v1 sent these on the
-	// wire but the prompt ignored them, so the AI couldn't compare execution
-	// results against the remaining plan.
-	planContext := ""
-	if rem, ok := msg["remaining_tasks"].([]interface{}); ok && len(rem) > 0 {
-		parts := []string{}
-		for _, r := range rem {
-			if rm, ok := r.(map[string]interface{}); ok {
-				k, _ := rm["key"].(string)
-				t, _ := rm["title"].(string)
-				if strings.TrimSpace(k) != "" {
-					parts = append(parts, fmt.Sprintf("%s: %s", k, t))
-				}
-			}
-		}
-		if len(parts) > 0 {
-			planContext += "Remaining tasks: " + strings.Join(parts, ", ") + ". "
-		}
-	}
-	if fails, ok := msg["recent_failures"].([]interface{}); ok && len(fails) > 0 {
-		parts := []string{}
-		for _, f := range fails {
-			if fm, ok := f.(map[string]interface{}); ok {
-				k, _ := fm["task_key"].(string)
-				s, _ := fm["summary"].(string)
-				if strings.TrimSpace(k) != "" {
-					parts = append(parts, fmt.Sprintf("%s (%s)", k, s))
-				}
-			}
-		}
-		if len(parts) > 0 {
-			planContext += "Recent failures: " + strings.Join(parts, "; ") + ". "
-		}
-	}
-	if output, _ := msg["verified_run_output"].(string); strings.TrimSpace(output) != "" {
-		planContext += "Verified run output: " + strings.TrimSpace(output)
-	}
-	if planContext == "" {
-		planContext = "(no additional plan context)"
-	}
-	if postVerify {
-		return fmt.Sprintf(`You are the post-verification reflection assessor for an autonomous software goal. The task "%s" just completed AND passed its machine checks. Decide the single best next step given what this execution revealed. Do NOT call any tool — read-only judgment.
-Your only output must be a single line beginning %s followed by compact single-line JSON shaped as:
-{"schema_version":1,"next_action":"run_next|propose_branch|propose_complete|request_user","rationale":string,"magnitude":"minor|major"}
-Objective: %s
-User constraints (authoritative): %s
-Non-goals (authoritative): %s
-Workspace root: %s
-Progress: %s of %s tasks completed. Just verified: %s. Execution report: %s.
-Plan context: %s.
-Decision rules:
-- next_action="run_next" = the goal is still on track; the execution confirmed the plan's assumptions; continue dispatching the next task. Choose this when in doubt.
-- next_action="propose_complete" = the completed work has ALREADY met the goal's outcome; the remaining tasks are genuinely unnecessary. Skip them and ask the user to sign off. (The user still verifies — do not use this to shortcut real remaining work.)
-- next_action="propose_branch" = MATERIAL drift: the execution revealed a wrong assumption, an unknown decision, or that the remaining plan is wrong — the user should fork to re-plan from a branch point. Only for magnitude major, backed by the execution report.
-- next_action="request_user" = a human decision is needed before continuing (ambiguity, constraint conflict, or blocked).
-Emit the decision now. No prose before or after the %s line.`, verifiedTaskTitle, goalContinueMarker, objective, goalPromptList(constraints), goalPromptList(nonGoals), projectPath, completed, total, verifiedTaskTitle, verifiedRunReport, planContext, goalContinueMarker)
-	}
-	return fmt.Sprintf(`You are the goal-continuation assessor for an autonomous software goal. A task is about to be dispatched. Decide the single best next action. Do NOT call any tool — this is a read-only judgment from the context provided.
-Your only output must be a single line beginning %s followed by compact single-line JSON shaped as:
-{"schema_version":1,"next_action":"run_next|propose_complete|request_user","rationale":string,"magnitude":"minor|major"}
-Objective: %s
-User constraints (authoritative): %s
-Non-goals (authoritative): %s
-Workspace root: %s
-Progress: %s of %s tasks completed. Current task about to run: %s.
-Decision rules:
-- next_action="run_next" = the plan is still correct; dispatch the current task. Choose this when in doubt.
-- next_action="propose_complete" = the goal's outcome is already met by the completed work; skip remaining tasks and ask the user to sign off. Only when every remaining task is genuinely unnecessary.
-- next_action="request_user" = a human decision is needed first (ambiguity, conflict with constraints/non-goals, or blocked).
-Emit the decision now. No prose before or after the %s line.`, goalContinueMarker, objective, goalPromptList(constraints), goalPromptList(nonGoals), projectPath, completed, total, currentTaskTitle, goalContinueMarker)
-}
-
-func finalizeGoalPlan(writeJSON func(interface{}) error, msg map[string]interface{}, requestID, before, projectPath string, proposal map[string]interface{}) {
+func finalizeGoalPlan(writeJSON func(interface{}) error, msg map[string]interface{}, requestID, before, projectPath, providerRunID string, proposal map[string]interface{}) {
 	after, err := goalWorkspaceFingerprint(projectPath)
 	if err != nil {
 		_ = writeJSON(agentGoalErrorPayload(msg, err))
@@ -1090,7 +1493,7 @@ func finalizeGoalPlan(writeJSON func(interface{}) error, msg map[string]interfac
 		"request_id":                   requestID,
 		"workspace_fingerprint_before": before,
 		"workspace_fingerprint_after":  after,
-		"provider_run_id":              requestID,
+		"provider_run_id":              firstNonEmpty(providerRunID, requestID),
 		"proposal":                     proposal,
 	})
 }
@@ -1110,116 +1513,7 @@ func emitGoalPlanPhase(writeJSON func(interface{}) error, requestID, phase strin
 	_ = writeJSON(payload)
 }
 
-// makeGoalPlanThinkingEmitter returns a sink that pushes a throttled snapshot
-// of the planner's live reasoning to the server (same ai.run.progress channel
-// as the phase events) so the phone can render "exploring/emitting · attempt N
-// · thinking…" instead of a silent "planning…". totalChars is the cumulative
-// captured output length (a progress proxy); preview is the trailing slice.
-func makeGoalPlanThinkingEmitter(writeJSON func(interface{}) error, requestID, phase string, attempt int) func(totalChars int, preview string) {
-	return func(totalChars int, preview string) {
-		payload := map[string]interface{}{
-			"type":                       models.AgentEventAIRunProgress,
-			"message_id":                 requestID,
-			"goal_plan_phase":            phase,
-			"goal_plan_thinking_chars":   totalChars,
-			"goal_plan_thinking_preview": preview,
-		}
-		if attempt > 0 {
-			payload["goal_plan_attempt"] = attempt
-		}
-		_ = writeJSON(payload)
-	}
-}
-
-func goalPlanExplorePrompt(objective string, constraints, nonGoals []string, projectPath string) string {
-	return fmt.Sprintf(`You are planning one software-development Goal in read-only mode.
-Objective: %s
-User constraints (authoritative): %s
-Non-goals (authoritative): %s
-Workspace root: %s
-Inspect the workspace as needed to ground a concrete plan — read the key files relevant to the objective. Do not edit files, install dependencies, or run mutating commands.
-When you have enough context, produce a small dependency-aware plan and emit the ALIANG_GOAL_PLAN line. Every task must stay under the workspace root. Checks must be deterministic command, file_exists, or file_contains checks. HARD CONSTRAINTS (the server rejects any plan that violates these, so follow exactly):
-- Commands (both task allowed_commands AND check commands): the FIRST word MUST be one of exactly these executables: git, npm, npx, pnpm, yarn, node, tsc, vitest, jest, go, cargo, rustc, python, python3, pytest, make, cmake, gradle, mvn, dotnet, swift. Do NOT propose any other executable — never ls, cat, grep, find, sed, awk, curl, wget, sh, bash, docker, or similar.
-- file_exists/file_contains check paths MUST be absolute paths INSIDE the workspace root shown above (e.g. %s/src/foo.ts). NEVER relative paths (src/foo.ts) and NEVER paths outside the workspace root — no ~/.claude/, /etc/, /tmp/, or any path that does not begin with the workspace root.
-- Command checks must be verification-only (test/lint/typecheck/build). Never install, add, remove, publish, deploy, push, commit, checkout, reset, clean, or shell-composed commands. npx checks must use --no-install.
-End with exactly one line beginning %s followed by compact single-line JSON shaped as:
-{"schema_version":1,"objective":string,"constraints":[string],"non_goals":[string],"tasks":[{"key":string,"title":string,"description":string,"depends_on":[string],"allowed_roots":[%q],"allowed_commands":[string],"checks":[{"key":string,"type":"command|file_exists|file_contains","command":string,"path":string,"contains":string,"required":true,"timeout_ms":number}],"retry_safety":"safe|idempotent_with_key|unsafe","idempotency_key_template":"required when retry_safety is idempotent_with_key"}],"budget":{"max_attempts_per_task":number,"max_turns":number,"command_timeout_ms":number}}`, objective, goalPromptList(constraints), goalPromptList(nonGoals), projectPath, projectPath, goalPlanMarker, projectPath)
-}
-
-// goalPlanEmitPrompt is the forced-emission instruction used in Phase B. The
-// provider has no tools available there, so this text is the only thing it can
-// act on; it must emit the ALIANG_GOAL_PLAN line.
-func goalPlanEmitPrompt(objective string, constraints, nonGoals []string, projectPath string) string {
-	return fmt.Sprintf(`You have finished exploring the workspace. Do NOT call any tool and do NOT explore further.
-Your only output must be a single line beginning %s followed by compact single-line JSON shaped as:
-{"schema_version":1,"objective":string,"constraints":[string],"non_goals":[string],"tasks":[{"key":string,"title":string,"description":string,"depends_on":[string],"allowed_roots":[%q],"allowed_commands":[string],"checks":[{"key":string,"type":"command|file_exists|file_contains","command":string,"path":string,"contains":string,"required":true,"timeout_ms":number,"criterion_key":string}],"retry_safety":"safe|idempotent_with_key|unsafe","idempotency_key_template":"required when retry_safety is idempotent_with_key"}],"criteria":[{"key":string,"statement":string,"kind":"functional|regression|integration|device|delivery","verification":"auto|manual|unverifiable","required":boolean}],"budget":{"max_attempts_per_task":number,"max_turns":number,"command_timeout_ms":number}}
-Objective: %s
-User constraints (authoritative): %s
-Non-goals (authoritative): %s
-Workspace root: %s
-Hard constraints (server rejects violations): commands (allowed_commands AND check commands) first word MUST be one of git, npm, npx, pnpm, yarn, node, tsc, vitest, jest, go, cargo, rustc, python, python3, pytest, make, cmake, gradle, mvn, dotnet, swift only — no ls/cat/grep/find/curl/sh/etc. file_exists/file_contains paths MUST be absolute paths INSIDE the workspace root above — never relative (src/foo.ts), never outside it (~/.claude/, /etc/, /tmp/, or any path not beginning with that root).
-Acceptance criteria (2-5): define what "done" means for this goal. Each criterion is a single statement the user will verify at sign-off. For verification="auto", set criterion_key on the check that proves it. For verification="manual", no check is needed (the user signs off directly).
-Emit the plan now. No prose before or after the %s line.`, goalPlanMarker, projectPath, objective, goalPromptList(constraints), goalPromptList(nonGoals), projectPath, goalPlanMarker)
-}
-
-// resumeSessionIDFor returns the native provider session id pinned on the goal
-// session after the exploration turn, so the emission turn can resume it.
-func (m *agentAIManager) resumeSessionIDFor(sessionID string) string {
-	if m == nil {
-		return ""
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	session := m.sessions[sessionID]
-	if session == nil {
-		return ""
-	}
-	return strings.TrimSpace(session.resumeSessionID)
-}
-
-func (m *agentAIManager) ensureGoalPlanningSession(sessionID, projectPath, provider, model, effort string) {
-	if m == nil || strings.TrimSpace(sessionID) == "" {
-		return
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if existing := m.sessions[sessionID]; existing != nil {
-		existing.projectPath = projectPath
-		existing.provider = provider
-		existing.model = model
-		existing.effort = effort
-		existing.lastActiveAt = time.Now().UTC()
-		return
-	}
-	m.registerAISessionLocked(&agentAISession{
-		id:           sessionID,
-		mode:         "agent",
-		projectPath:  projectPath,
-		provider:     provider,
-		model:        model,
-		effort:       effort,
-		lastActiveAt: time.Now().UTC(),
-	})
-}
-
-func (m *agentAIManager) removeGoalPlanningSession(sessionID string) {
-	if m == nil || strings.TrimSpace(sessionID) == "" {
-		return
-	}
-	m.mu.Lock()
-	delete(m.sessions, sessionID)
-	_, hadBinding := m.bindings[sessionID]
-	delete(m.bindings, sessionID)
-	m.mu.Unlock()
-	if hadBinding {
-		// Older planner runs persisted a normal conversation binding before
-		// plannerInternal was introduced. Remove that stale record so a retry
-		// cannot collide with the native session it represents.
-		_ = m.persistIdentityState()
-	}
-}
-
-func withGoalPlanningReadOnly(tool *agentAITool) *agentAITool {
+func withAgentReadOnlyPolicy(tool *agentAITool) *agentAITool {
 	if tool == nil || len(tool.args) == 0 {
 		return tool
 	}
@@ -1231,7 +1525,7 @@ func withGoalPlanningReadOnly(tool *agentAITool) *agentAITool {
 	switch copied.id {
 	case "codex":
 		// Keep CODEX_HOME/config.toml loaded: Aliang uses it for the selected
-		// model provider and gateway base URL. Isolate planning from rules and
+		// model provider and gateway base URL. Isolate the read-only session from rules and
 		// persisted sessions without disabling the provider configuration.
 		flags = []string{"--sandbox", "read-only", "--ignore-rules", "--ephemeral"}
 	case "claude", "claudecode":
@@ -1250,35 +1544,6 @@ func withGoalPlanningReadOnly(tool *agentAITool) *agentAITool {
 		return nil
 	}
 	copied.args = append(copied.args[:promptIndex], append(flags, copied.args[promptIndex])...)
-	return &copied
-}
-
-// withGoalEmissionOnly forces a follow-up planning turn in which the provider
-// cannot use any tool, so its only possible output is the ALIANG_GOAL_PLAN text.
-// Used by the goal planner convergence loop after the read-only exploration.
-// --tools "" + a broad --disallowedTools (subagent/exploration/mutation tools)
-// + "--" so no variadic flag eats the prompt.
-func withGoalEmissionOnly(tool *agentAITool) *agentAITool {
-	if tool == nil || len(tool.args) == 0 {
-		return tool
-	}
-	if tool.id != "claude" && tool.id != "claudecode" {
-		return nil
-	}
-	copied := *tool
-	args := append([]string(nil), tool.args...)
-	args = withoutCLIArgumentValue(args, "--disallowedTools")
-	args = withoutCLIArgumentValue(args, "--allowedTools")
-	args = withoutCLIArgumentValue(args, "--tools")
-	promptIndex := len(args) - 1
-	flags := []string{
-		"--permission-mode", "plan",
-		"--tools", "",
-		"--disallowedTools", "Agent,Task,Bash,Edit,Write,NotebookEdit,Read,Read_file,Grep,Glob,Ls,WebSearch,WebFetch,TodoWrite",
-		"--strict-mcp-config", "--mcp-config", claudeCodeHeadlessEmptyMCP,
-		"--",
-	}
-	copied.args = append(args[:promptIndex], append(flags, args[promptIndex])...)
 	return &copied
 }
 
@@ -1321,14 +1586,6 @@ func withGoalTaskReportSystemPrompt(tool *agentAITool) *agentAITool {
 		}
 	}
 	return &copied
-}
-
-func goalPromptList(values []string) string {
-	raw, err := json.Marshal(values)
-	if err != nil {
-		return "[]"
-	}
-	return string(raw)
 }
 
 func handleAgentGoalVerify(msg map[string]interface{}, writeJSON func(interface{}) error) {

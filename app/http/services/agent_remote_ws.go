@@ -497,13 +497,15 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 	case models.AgentEventGitStatus, models.AgentEventEnvInfo:
 		s.setRemoteConnectionState(true, "online", "")
 		go handleAgentEnvToolsMessage(msg, writeJSON)
-	case models.AgentEventGoalPlan, models.AgentEventGoalVerify, models.AgentEventGoalContinue:
+	case models.AgentEventGoalPlan, models.AgentEventGoalVerify:
 		s.setRemoteConnectionState(true, "online", "")
 		if !s.aiControlEnabled() {
 			_ = writeJSON(agentGoalErrorPayload(msg, errors.New("AI control is disabled for this device")))
 			return
 		}
-		go handleAgentGoalMessage(msg, writeJSON, s.ai)
+		go handleAgentGoalMessage(msg, writeJSON)
+	case models.AgentEventGoalPlanAIResponse, models.AgentEventGoalPlanAIError:
+		deliverGoalPlanAIResponse(msg)
 	case models.AgentEventTerminalCreate:
 		s.setRemoteConnectionState(true, "online", "")
 		if !s.remoteTerminalEnabled() {
@@ -616,7 +618,6 @@ func remoteAgentMessageRequiresEnabledDevice(msgType string) bool {
 		models.AgentEventEnvInfo,
 		models.AgentEventGoalPlan,
 		models.AgentEventGoalVerify,
-		models.AgentEventGoalContinue,
 		models.AgentEventTerminalCreate,
 		models.AgentEventTerminalInput,
 		models.AgentEventTerminalResize,
@@ -821,10 +822,9 @@ func agentCapabilities() []string {
 		"http_tunnel_v1",
 		"websocket_tunnel_v1",
 		"goal_server_v1",
-		"goal_plan_readonly_v1",
+		"goal_plan_service_v1",
 		"goal_report_v1",
 		"goal_verify_v1",
-		"goal_continue_v1",
 		"workspace_fingerprint_v1",
 	)
 	return caps

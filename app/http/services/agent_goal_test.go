@@ -1,10 +1,15 @@
 package services
 
 import (
+	"bytes"
+	"encoding/json"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"aliang.one/nursorgate/app/http/models"
 )
@@ -70,7 +75,108 @@ func TestGoalRunEmitterDecoratesEventsAndParsesTerminalReport(t *testing.T) {
 	}
 }
 
-func TestGoalPlannerUsesProviderNativeReadOnlyPolicies(t *testing.T) {
+func TestGoalPlannerUsesDedicatedServerServiceWithoutLocalProviderSession(t *testing.T) {
+	workspace := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workspace, "package.json"), []byte(`{"scripts":{"test":"vitest"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	request := map[string]interface{}{
+		"type": models.AgentEventGoalPlan, "request_id": "req-plan-1", "protocol_version": 3,
+		"goal_id": "goal-1", "planning_attempt_id": "attempt-1", "ai_session_id": "session-1",
+		"project_path": workspace, "objective": "Ship the feature", "plan_skill": "gstack",
+		"planner_timeout_ms": 120_000,
+	}
+	var events []map[string]interface{}
+	writeJSON := func(value interface{}) error {
+		event := value.(map[string]interface{})
+		events = append(events, event)
+		// Simulate the dedicated planner service: on each goal.plan.ai.request
+		// reply with an assistant message whose content is a valid plan JSON.
+		// The loop's content-fallback path converges in a single turn.
+		if event["type"] == models.AgentEventGoalPlanAIRequest {
+			content := fmt.Sprintf(`{"schema_version":1,"objective":"Ship the feature","tasks":[{"key":"implement","title":"Implement","allowed_roots":[%q],"checks":[{"key":"package","type":"file_exists","path":"package.json","required":true}]}]}`, workspace)
+			deliverGoalPlanAIResponse(map[string]interface{}{
+				"type": models.AgentEventGoalPlanAIResponse, "request_id": "req-plan-1",
+				"goal_id": "goal-1", "planning_attempt_id": "attempt-1", "ai_session_id": "session-1",
+				"response": map[string]interface{}{
+					"id": "chatcmpl-plan-1",
+					"choices": []interface{}{map[string]interface{}{
+						"message": map[string]interface{}{"role": "assistant", "content": content},
+					}},
+				},
+			})
+		}
+		return nil
+	}
+
+	handleAgentGoalPlan(request, writeJSON)
+
+	var requestSeen, resultEvent map[string]interface{}
+	for _, event := range events {
+		switch event["type"] {
+		case models.AgentEventGoalPlanAIRequest:
+			requestSeen = event
+		case models.AgentEventGoalPlanResult:
+			resultEvent = event
+		}
+	}
+	if requestSeen == nil || resultEvent == nil {
+		t.Fatalf("events = %#v, want ai.request and result", events)
+	}
+	if resultEvent["provider_run_id"] != "chatcmpl-plan-1" {
+		t.Fatalf("provider run id = %v", resultEvent["provider_run_id"])
+	}
+	proposal, _ := resultEvent["proposal"].(map[string]interface{})
+	if proposal == nil || proposal["objective"] != "Ship the feature" {
+		t.Fatalf("proposal = %#v", resultEvent["proposal"])
+	}
+}
+
+func TestGoalPlannerWaitTimeoutAddsTransportMargin(t *testing.T) {
+	got, err := goalPlannerWaitTimeout(map[string]interface{}{"planner_timeout_ms": 120_000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := 150 * time.Second; got != want {
+		t.Fatalf("planner wait = %s, want %s", got, want)
+	}
+	if _, err := goalPlannerWaitTimeout(map[string]interface{}{}); err == nil {
+		t.Fatal("missing planner_timeout_ms was accepted")
+	}
+}
+
+func TestGoalPlanProjectContextStaysWithinAgentBudget(t *testing.T) {
+	workspace := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workspace, "README.md"), []byte(strings.Repeat("r", 200*1024)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < 20; index++ {
+		dir := filepath.Join(workspace, fmt.Sprintf("pkg-%02d", index))
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "package.json"), []byte(strings.Repeat("\"", 32*1024)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	contextPayload, err := buildGoalPlanProjectContext(workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(contextPayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) > goalPlanContextMaxBytes {
+		t.Fatalf("context bytes = %d, max = %d", len(raw), goalPlanContextMaxBytes)
+	}
+	if readme := contextPayload["readme"].(string); len(readme) > agentProjectReadmeMaxBytes {
+		t.Fatalf("README bytes = %d, max = %d", len(readme), agentProjectReadmeMaxBytes)
+	}
+}
+
+func TestGoalForkUsesProviderNativeReadOnlyPolicies(t *testing.T) {
 	tests := []struct {
 		id       string
 		wantArgs []string
@@ -83,7 +189,7 @@ func TestGoalPlannerUsesProviderNativeReadOnlyPolicies(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.id, func(t *testing.T) {
 			original := &agentAITool{id: test.id, args: []string{"run", "planner prompt"}}
-			readOnly := withGoalPlanningReadOnly(original)
+			readOnly := withAgentReadOnlyPolicy(original)
 			if readOnly == nil {
 				t.Fatal("read-only adapter missing")
 			}
@@ -103,37 +209,6 @@ func TestGoalPlannerUsesProviderNativeReadOnlyPolicies(t *testing.T) {
 				t.Fatalf("read-only adapter mutated original tool: %#v", original.args)
 			}
 		})
-	}
-}
-
-func TestGoalPlannerPreflightRejectsMissingClaudeProviderConfiguration(t *testing.T) {
-	t.Setenv("ANTHROPIC_BASE_URL", "")
-	t.Setenv("ANTHROPIC_AUTH_TOKEN", "")
-	err := preflightGoalPlannerProvider("claudecode", "", "")
-	if err == nil || !strings.HasPrefix(err.Error(), "planner_provider_unconfigured:") {
-		t.Fatalf("preflight error = %v, want planner_provider_unconfigured", err)
-	}
-}
-
-func TestGoalPlanningSessionPinsNativeResumeID(t *testing.T) {
-	m := newAgentAIManager()
-	m.ensureGoalPlanningSession("goal-plan:test", t.TempDir(), "claudecode", "", "")
-	m.bindings["goal-plan:test"] = agentAIBindingRecord{
-		ConversationID:  "goal-plan:test",
-		Provider:        "claudecode",
-		NativeSessionID: "stale-planner-session",
-		State:           "confirmed",
-	}
-	m.setAgentAIResumeSessionIDIfEmpty("goal-plan:test", 0, "native-session-1")
-	if got := m.resumeSessionIDFor("goal-plan:test"); got != "native-session-1" {
-		t.Fatalf("resume session id = %q, want native-session-1", got)
-	}
-	m.removeGoalPlanningSession("goal-plan:test")
-	if got := m.resumeSessionIDFor("goal-plan:test"); got != "" {
-		t.Fatalf("removed planner session still has resume id %q", got)
-	}
-	if _, ok := m.bindings["goal-plan:test"]; ok {
-		t.Fatal("removed planner session retained a persistent binding")
 	}
 }
 
@@ -308,7 +383,7 @@ func TestAgentCapabilitiesAdvertiseGoalProtocol(t *testing.T) {
 	caps := agentCapabilities()
 	for _, want := range []string{
 		"goal_server_v1",
-		"goal_plan_readonly_v1",
+		"goal_plan_service_v1",
 		"goal_report_v1",
 		"goal_verify_v1",
 		"workspace_fingerprint_v1",
@@ -542,42 +617,492 @@ func TestCodexSandboxMode(t *testing.T) {
 	}
 }
 
-func TestGoalContinuePostVerifyPromptIncludesPlanContext(t *testing.T) {
-	msg := map[string]interface{}{
-		"post_verify":          true,
-		"completed_tasks":      2,
-		"total_tasks":          5,
-		"verified_task":        map[string]interface{}{"key": "impl-api", "title": "Implement API"},
-		"verified_run_summary": "Built auth endpoints",
-		"verified_run_outcome": "task_completed",
-		"verified_run_output":  "POST /login returned 200",
-		"remaining_tasks": []interface{}{
-			map[string]interface{}{"key": "add-tests", "title": "Add integration tests"},
-			map[string]interface{}{"key": "docs", "title": "Write API docs"},
-		},
-		"recent_failures": []interface{}{
-			map[string]interface{}{"task_key": "old-auth", "summary": "token expiry bug"},
+func TestGoalPlanReadOnlyTools(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "node_modules"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("alpha\nbeta\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "sub", "b.go"), []byte("package sub\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "node_modules", "c.txt"), []byte("alpha noise\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "big.txt"), bytes.Repeat([]byte("x"), goalPlanReadFileMaxBytes+1024), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("read_file reads within root", func(t *testing.T) {
+		r := executeGoalPlanReadOnlyTool(root, "read_file", `{"path":"a.txt"}`)
+		if r.isError {
+			t.Fatalf("unexpected error: %s", r.content)
+		}
+		if !strings.Contains(r.content, "alpha") {
+			t.Fatalf("missing content: %q", r.content)
+		}
+	})
+	t.Run("read_file rejects escape", func(t *testing.T) {
+		r := executeGoalPlanReadOnlyTool(root, "read_file", `{"path":"../secret"}`)
+		if !r.isError {
+			t.Fatalf("expected error, got %q", r.content)
+		}
+	})
+	t.Run("read_file truncates over cap", func(t *testing.T) {
+		r := executeGoalPlanReadOnlyTool(root, "read_file", `{"path":"big.txt"}`)
+		if r.isError {
+			t.Fatalf("unexpected error: %s", r.content)
+		}
+		if len(r.content) > goalPlanReadFileMaxBytes {
+			t.Fatalf("content not truncated: %d bytes", len(r.content))
+		}
+	})
+	t.Run("list_dir lists children", func(t *testing.T) {
+		r := executeGoalPlanReadOnlyTool(root, "list_dir", `{"path":"."}`)
+		if r.isError {
+			t.Fatalf("unexpected error: %s", r.content)
+		}
+		if !strings.Contains(r.content, "sub") || !strings.Contains(r.content, "a.txt") {
+			t.Fatalf("missing entries: %q", r.content)
+		}
+	})
+	t.Run("list_dir rejects escape", func(t *testing.T) {
+		r := executeGoalPlanReadOnlyTool(root, "list_dir", `{"path":".."}`)
+		if !r.isError {
+			t.Fatalf("expected error, got %q", r.content)
+		}
+	})
+	t.Run("grep finds matches and skips node_modules", func(t *testing.T) {
+		r := executeGoalPlanReadOnlyTool(root, "grep", `{"pattern":"alpha"}`)
+		if r.isError {
+			t.Fatalf("unexpected error: %s", r.content)
+		}
+		if !strings.Contains(r.content, "a.txt") {
+			t.Fatalf("expected a.txt match: %q", r.content)
+		}
+		if strings.Contains(r.content, "node_modules") {
+			t.Fatalf("node_modules not skipped: %q", r.content)
+		}
+	})
+	t.Run("grep rejects invalid regex", func(t *testing.T) {
+		r := executeGoalPlanReadOnlyTool(root, "grep", `{"pattern":"("}`)
+		if !r.isError {
+			t.Fatalf("expected error, got %q", r.content)
+		}
+	})
+	t.Run("unknown tool errors", func(t *testing.T) {
+		r := executeGoalPlanReadOnlyTool(root, "write_file", `{"path":"x"}`)
+		if !r.isError {
+			t.Fatalf("expected error, got %q", r.content)
+		}
+	})
+	t.Run("read_file rejects a symlink escaping the project root", func(t *testing.T) {
+		outside := t.TempDir()
+		outsideFile := filepath.Join(outside, "secret.txt")
+		if err := os.WriteFile(outsideFile, []byte("secret"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		link := filepath.Join(root, "escape")
+		if err := os.Symlink(outsideFile, link); err != nil {
+			t.Fatal(err)
+		}
+		r := executeGoalPlanReadOnlyTool(root, "read_file", `{"path":"escape"}`)
+		if !r.isError {
+			t.Fatalf("expected symlink escape rejected, got %q", r.content)
+		}
+	})
+}
+
+func validGoalPlanProposal() map[string]interface{} {
+	return map[string]interface{}{
+		"schema_version": 1,
+		"objective":      "ship it",
+		"tasks": []map[string]interface{}{
+			{
+				"key":           "t1",
+				"title":         "Task one",
+				"allowed_roots": []string{"/workspace"},
+				"checks": []map[string]interface{}{
+					{"key": "c1", "type": "command", "command": "npm test", "required": true},
+				},
+			},
 		},
 	}
-	prompt := goalContinuePrompt("Build auth system", []string{"Keep it simple"}, []string{"No OAuth"}, "/app", msg)
-	for _, want := range []string{"add-tests", "Add integration tests", "docs", "Write API docs", "old-auth", "token expiry", "POST /login returned 200", "propose_complete", "propose_branch", "request_user"} {
-		if !strings.Contains(prompt, want) {
-			t.Errorf("post-verify prompt missing %q", want)
+}
+
+// assistantWithToolCalls builds an assistant message with tool_calls shaped as a
+// JSON-unmarshalled []interface{} (the production shape the loop asserts).
+func assistantWithToolCalls(calls ...map[string]interface{}) map[string]interface{} {
+	arr := make([]interface{}, len(calls))
+	for i, c := range calls {
+		arr[i] = c
+	}
+	return map[string]interface{}{"role": "assistant", "content": "", "tool_calls": arr}
+}
+
+func toolCall(id, name, args string) map[string]interface{} {
+	return map[string]interface{}{
+		"id":   id,
+		"type": "function",
+		"function": map[string]interface{}{
+			"name":      name,
+			"arguments": args,
+		},
+	}
+}
+
+func assistantWithContent(content string) map[string]interface{} {
+	return map[string]interface{}{"role": "assistant", "content": content}
+}
+
+func TestGoalPlanLoop(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a.txt"), []byte("alpha\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	scan := map[string]interface{}{"files": []string{"a.txt"}}
+
+	t.Run("returns proposal when model submits immediately", func(t *testing.T) {
+		proposal := validGoalPlanProposal()
+		args, _ := json.Marshal(map[string]interface{}{"proposal": proposal})
+		var calls int
+		caller := func(turn int, messages []map[string]interface{}) (map[string]interface{}, string, error) {
+			calls++
+			return assistantWithToolCalls(toolCall("c1", "submit_goal_plan", string(args))), "resp-1", nil
+		}
+		got, runID, err := runGoalPlanLoop(goalPlanLoopInput{
+			projectRoot: root, evidence: scan,
+			callServer: caller, maxTurns: 8,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if calls != 1 {
+			t.Fatalf("calls=%d want 1", calls)
+		}
+		if runID != "resp-1" {
+			t.Fatalf("runID=%q want resp-1", runID)
+		}
+		if fmt.Sprint(got["objective"]) != "ship it" {
+			t.Fatalf("proposal=%v", got)
+		}
+	})
+
+	t.Run("executes read_file then submits over two turns", func(t *testing.T) {
+		proposal := validGoalPlanProposal()
+		propArgs, _ := json.Marshal(map[string]interface{}{"proposal": proposal})
+		var calls int
+		caller := func(turn int, messages []map[string]interface{}) (map[string]interface{}, string, error) {
+			calls++
+			if turn == 1 {
+				return assistantWithToolCalls(toolCall("c1", "read_file", `{"path":"a.txt"}`)), "resp-1", nil
+			}
+			return assistantWithToolCalls(toolCall("c2", "submit_goal_plan", string(propArgs))), "resp-2", nil
+		}
+		got, _, err := runGoalPlanLoop(goalPlanLoopInput{
+			projectRoot: root, evidence: scan,
+			callServer: caller, maxTurns: 8,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if calls != 2 {
+			t.Fatalf("calls=%d want 2", calls)
+		}
+		if fmt.Sprint(got["objective"]) != "ship it" {
+			t.Fatalf("proposal=%v", got)
+		}
+	})
+
+	t.Run("appends tool result before the next turn", func(t *testing.T) {
+		proposal := validGoalPlanProposal()
+		propArgs, _ := json.Marshal(map[string]interface{}{"proposal": proposal})
+		var turn2Messages []map[string]interface{}
+		caller := func(turn int, messages []map[string]interface{}) (map[string]interface{}, string, error) {
+			if turn == 2 {
+				turn2Messages = messages
+				return assistantWithToolCalls(toolCall("c2", "submit_goal_plan", string(propArgs))), "resp-2", nil
+			}
+			return assistantWithToolCalls(toolCall("c1", "read_file", `{"path":"a.txt"}`)), "resp-1", nil
+		}
+		if _, _, err := runGoalPlanLoop(goalPlanLoopInput{
+			projectRoot: root, evidence: scan,
+			callServer: caller, maxTurns: 8,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		var hasToolResult bool
+		for _, m := range turn2Messages {
+			if fmt.Sprint(m["role"]) == "tool" && strings.Contains(fmt.Sprint(m["content"]), "alpha") {
+				hasToolResult = true
+			}
+		}
+		if !hasToolResult {
+			t.Fatalf("tool result not appended before turn 2: %v", turn2Messages)
+		}
+	})
+
+	t.Run("errors when max turns exhausted without a plan", func(t *testing.T) {
+		caller := func(turn int, messages []map[string]interface{}) (map[string]interface{}, string, error) {
+			return assistantWithToolCalls(toolCall("c1", "read_file", `{"path":"a.txt"}`)), "resp-x", nil
+		}
+		_, _, err := runGoalPlanLoop(goalPlanLoopInput{
+			projectRoot: root, evidence: scan,
+			callServer: caller, maxTurns: 2,
+		})
+		if err == nil || !strings.Contains(err.Error(), "planner_budget_exceeded") {
+			t.Fatalf("want planner_budget_exceeded, got %v", err)
+		}
+	})
+
+	t.Run("parses content fallback when no tool_calls", func(t *testing.T) {
+		proposal := validGoalPlanProposal()
+		propJSON, _ := json.Marshal(proposal)
+		caller := func(turn int, messages []map[string]interface{}) (map[string]interface{}, string, error) {
+			return assistantWithContent(string(propJSON)), "resp-1", nil
+		}
+		got, _, err := runGoalPlanLoop(goalPlanLoopInput{
+			projectRoot: root, evidence: scan,
+			callServer: caller, maxTurns: 8,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fmt.Sprint(got["objective"]) != "ship it" {
+			t.Fatalf("proposal=%v", got)
+		}
+	})
+
+	t.Run("retries after an invalid submit_goal_plan", func(t *testing.T) {
+		valid := validGoalPlanProposal()
+		validArgs, _ := json.Marshal(map[string]interface{}{"proposal": valid})
+		var calls int
+		caller := func(turn int, messages []map[string]interface{}) (map[string]interface{}, string, error) {
+			calls++
+			if turn == 1 {
+				return assistantWithToolCalls(toolCall("c1", "submit_goal_plan", `{"proposal":{"schema_version":1,"objective":"x"}}`)), "resp-1", nil
+			}
+			return assistantWithToolCalls(toolCall("c2", "submit_goal_plan", string(validArgs))), "resp-2", nil
+		}
+		got, _, err := runGoalPlanLoop(goalPlanLoopInput{
+			projectRoot: root, evidence: scan,
+			callServer: caller, maxTurns: 8,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if calls != 2 {
+			t.Fatalf("calls=%d want 2 (retry after invalid submit)", calls)
+		}
+		if got["tasks"] == nil {
+			t.Fatalf("expected valid proposal, got %v", got)
+		}
+	})
+
+	t.Run("accepts a bare plan via fallback when not wrapped", func(t *testing.T) {
+		proposal := validGoalPlanProposal()
+		bareArgs, _ := json.Marshal(proposal)
+		caller := func(turn int, messages []map[string]interface{}) (map[string]interface{}, string, error) {
+			return assistantWithToolCalls(toolCall("c1", "submit_goal_plan", string(bareArgs))), "resp-1", nil
+		}
+		got, _, err := runGoalPlanLoop(goalPlanLoopInput{
+			projectRoot: root, evidence: scan, callServer: caller, maxTurns: 8,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fmt.Sprint(got["objective"]) != "ship it" {
+			t.Fatalf("bare fallback proposal=%v", got)
+		}
+	})
+}
+
+func goalPlanGitInit(t *testing.T, dir string) {
+	t.Helper()
+	for _, args := range [][]string{
+		{"init", dir},
+		{"-C", dir, "config", "user.email", "t@t.test"},
+		{"-C", dir, "config", "user.name", "test"},
+	} {
+		if err := exec.Command("git", args...).Run(); err != nil {
+			t.Fatalf("git %v: %v", args, err)
 		}
 	}
 }
 
-func TestGoalContinuePreDispatchPromptExcludesPlanContext(t *testing.T) {
-	msg := map[string]interface{}{
-		"completed_tasks": 2,
-		"total_tasks":     5,
-		"current_task":    map[string]interface{}{"key": "next", "title": "Next task"},
+func goalPlanGitCommit(t *testing.T, dir, msg string) {
+	t.Helper()
+	exec.Command("git", "-C", dir, "add", "-A").Run()
+	c := exec.Command("git", "-C", dir, "commit", "-m", msg)
+	c.Env = append(os.Environ(),
+		"GIT_AUTHOR_NAME=test", "GIT_AUTHOR_EMAIL=t@t.test",
+		"GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=t@t.test")
+	if err := c.Run(); err != nil {
+		t.Fatalf("git commit: %v", err)
 	}
-	prompt := goalContinuePrompt("obj", nil, nil, "/app", msg)
-	if strings.Contains(prompt, "Remaining tasks:") {
-		t.Error("pre-dispatch prompt should NOT include planContext")
+}
+
+func goalPlanChangedPaths(ctx map[string]interface{}) []string {
+	entries, _ := ctx["changed_files"].([]map[string]interface{})
+	out := []string{}
+	for _, e := range entries {
+		out = append(out, fmt.Sprint(e["path"]))
 	}
-	if strings.Contains(prompt, "propose_branch") {
-		t.Error("pre-dispatch prompt should NOT include propose_branch")
+	return out
+}
+
+func anyContains(values []string, substr string) bool {
+	for _, v := range values {
+		if strings.Contains(v, substr) {
+			return true
+		}
 	}
+	return false
+}
+
+func TestBuildGoalPlanGitContext(t *testing.T) {
+	t.Run("committed change plus untracked file", func(t *testing.T) {
+		root := t.TempDir()
+		goalPlanGitInit(t, root)
+		if err := os.WriteFile(filepath.Join(root, "committed.txt"), []byte("v1"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		goalPlanGitCommit(t, root, "init")
+		if err := os.WriteFile(filepath.Join(root, "committed.txt"), []byte("v2"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, "new.txt"), []byte("new"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		ctx := buildGoalPlanGitContext(root)
+		if ctx["available"] != true {
+			t.Fatalf("available = %v, want true", ctx["available"])
+		}
+		if ctx["head_sha"] == "" {
+			t.Fatalf("head_sha empty after a commit")
+		}
+		paths := goalPlanChangedPaths(ctx)
+		if !anyContains(paths, "committed.txt") || !anyContains(paths, "new.txt") {
+			t.Fatalf("changed_files missing entries: %v", paths)
+		}
+		patches, _ := ctx["patches"].([]map[string]interface{})
+		if len(patches) != 1 || !anyContains([]string{fmt.Sprint(patches[0]["path"])}, "committed.txt") {
+			t.Fatalf("patches = %v, want one for committed.txt", patches)
+		}
+		commits, _ := ctx["recent_commits"].([]map[string]interface{})
+		if len(commits) != 1 {
+			t.Fatalf("recent_commits = %v, want 1", commits)
+		}
+	})
+
+	t.Run("unborn repo degrades per command", func(t *testing.T) {
+		root := t.TempDir()
+		goalPlanGitInit(t, root)
+		if err := os.WriteFile(filepath.Join(root, "u.txt"), []byte("u"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		ctx := buildGoalPlanGitContext(root)
+		if ctx["available"] != true {
+			t.Fatalf("available = %v, want true (status still works)", ctx["available"])
+		}
+		if ctx["head_sha"] != "" {
+			t.Fatalf("head_sha = %v, want empty (unborn)", ctx["head_sha"])
+		}
+		paths := goalPlanChangedPaths(ctx)
+		if !anyContains(paths, "u.txt") {
+			t.Fatalf("untracked u.txt missing: %v", paths)
+		}
+		if patches, _ := ctx["patches"].([]map[string]interface{}); len(patches) != 0 {
+			t.Fatalf("patches = %v, want empty (unborn)", patches)
+		}
+		if commits, _ := ctx["recent_commits"].([]map[string]interface{}); len(commits) != 0 {
+			t.Fatalf("recent_commits = %v, want empty (unborn)", commits)
+		}
+	})
+
+	t.Run("non-git dir unavailable", func(t *testing.T) {
+		ctx := buildGoalPlanGitContext(t.TempDir())
+		if ctx["available"] != false {
+			t.Fatalf("available = %v, want false", ctx["available"])
+		}
+	})
+
+	t.Run("monorepo sibling directory not leaked", func(t *testing.T) {
+		repo := t.TempDir()
+		goalPlanGitInit(t, repo)
+		if err := os.MkdirAll(filepath.Join(repo, "a"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Join(repo, "b"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(repo, "a", "x.txt"), []byte("a"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(repo, "b", "y.txt"), []byte("b"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		goalPlanGitCommit(t, repo, "init")
+		if err := os.WriteFile(filepath.Join(repo, "a", "x.txt"), []byte("aa"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(repo, "b", "y.txt"), []byte("bb"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		// projectPath = repo/a; sibling repo/b's changes must NOT appear.
+		projectPath := filepath.Join(repo, "a")
+		ctx := buildGoalPlanGitContext(projectPath)
+		paths := goalPlanChangedPaths(ctx)
+		var changed string
+		for _, p := range paths {
+			if strings.Contains(p, "x.txt") {
+				changed = p
+			}
+			if strings.Contains(p, "y.txt") {
+				t.Fatalf("sibling y.txt leaked into projectPath context: %v", paths)
+			}
+		}
+		if changed == "" {
+			t.Fatalf("projectPath change x.txt missing: %v", paths)
+		}
+		// Path must be projectPath-relative (not repo-root "a/x.txt"), else the
+		// model's read_file would resolve to repo/a/a/x.txt.
+		if changed != "x.txt" {
+			t.Fatalf("path not projectPath-relative: %q (would break read_file)", changed)
+		}
+		// Round-trip: the model can read the changed file via read_file using the
+		// projectPath-relative path git reported.
+		read := executeGoalPlanReadOnlyTool(projectPath, "read_file", fmt.Sprintf(`{"path":%q}`, changed))
+		if read.isError {
+			t.Fatalf("read_file(%q) failed: %s", changed, read.content)
+		}
+	})
+
+	t.Run("rename parses path without leaking the v2 score field", func(t *testing.T) {
+		root := t.TempDir()
+		goalPlanGitInit(t, root)
+		if err := os.WriteFile(filepath.Join(root, "old.txt"), []byte("v1"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		goalPlanGitCommit(t, root, "init")
+		if err := os.Rename(filepath.Join(root, "old.txt"), filepath.Join(root, "new.txt")); err != nil {
+			t.Fatal(err)
+		}
+		exec.Command("git", "-C", root, "add", "-A").Run()
+		ctx := buildGoalPlanGitContext(root)
+		paths := goalPlanChangedPaths(ctx)
+		if !anyContains(paths, "new.txt") {
+			t.Fatalf("rename target new.txt missing: %v", paths)
+		}
+		for _, p := range paths {
+			if strings.Contains(p, "R100") || strings.HasPrefix(p, "R") {
+				t.Fatalf("rename score leaked into path: %v", paths)
+			}
+		}
+	})
 }

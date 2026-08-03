@@ -318,15 +318,6 @@ type agentAIRun struct {
 	goalIdentity  map[string]interface{}
 	nativeGoal    map[string]interface{}
 	readOnly      bool
-	// plannerInternal marks the short-lived read-only/emission passes used by
-	// Goal planning. They may intentionally resume a native provider session
-	// across synthetic internal conversation IDs, so they must not participate
-	// in the persistent one-native-session-per-conversation binding registry.
-	plannerInternal bool
-	// emissionOnly forces a follow-up planning turn that may not use any tools,
-	// so the provider can only emit the structured ALIANG_GOAL_PLAN text. Used by
-	// the goal planner's convergence loop after the read-only exploration turn.
-	emissionOnly bool
 }
 
 type agentAIAttachment struct {
@@ -3628,6 +3619,28 @@ func (m *agentAIManager) runCodexAppServer(ctx context.Context, run agentAIRun, 
 	}
 	threadID := ""
 	turnID := ""
+	threadBound := false
+	bindThread := func() error {
+		if threadBound || threadID == "" {
+			return nil
+		}
+		record, err := m.confirmBinding(run.sessionID, "codex", threadID, run.bindingVersion)
+		if err != nil {
+			return err
+		}
+		threadBound = true
+		return writeJSON(map[string]interface{}{
+			"type":              models.AgentEventAISessionBound,
+			"session_id":        run.sessionID,
+			"message_id":        run.messageID,
+			"run_id":            run.runID,
+			"provider":          "codex",
+			"native_session_id": record.NativeSessionID,
+			"source_session_id": record.NativeSessionID,
+			"binding_version":   record.BindingVersion,
+			"binding_state":     record.State,
+		})
+	}
 	turnStarted := false
 	completed := false
 	resumeMissing := false
@@ -3933,6 +3946,10 @@ func (m *agentAIManager) runCodexAppServer(ctx context.Context, run agentAIRun, 
 				}
 			}
 			if threadID != "" {
+				if err := bindThread(); err != nil {
+					terminalErr = "Codex provider binding failed: " + err.Error()
+					goto done
+				}
 				if len(run.nativeGoal) > 0 {
 					params := map[string]interface{}{
 						"threadId":  threadID,
@@ -4523,7 +4540,7 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 
 	var tool *agentAITool
 	var err error
-	if run.readOnly || run.emissionOnly || len(run.goalIdentity) > 0 {
+	if run.readOnly || len(run.goalIdentity) > 0 {
 		tool, err = resolveGoalAgentAITool(run.prompt, run.provider, run.model, run.effort, resumeID, newSessionID)
 	} else {
 		tool, err = resolveAgentAITool(run.prompt, run.provider, run.model, run.effort, resumeID, newSessionID)
@@ -4532,16 +4549,10 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 		_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, err))
 		return agentAIRunDone
 	}
-	if run.emissionOnly {
-		tool = withGoalEmissionOnly(tool)
+	if run.readOnly {
+		tool = withAgentReadOnlyPolicy(tool)
 		if tool == nil {
-			_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, errors.New("provider does not support emission-only planning")))
-			return agentAIRunDone
-		}
-	} else if run.readOnly {
-		tool = withGoalPlanningReadOnly(tool)
-		if tool == nil {
-			_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, errors.New("provider does not support enforced read-only planning")))
+			_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, errors.New("provider does not support enforced read-only mode")))
 			return agentAIRunDone
 		}
 	} else if len(run.goalIdentity) > 0 {
@@ -4668,13 +4679,6 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 	var bindingOnce sync.Once
 	var bindingErr error
 	onNativeSessionID := func(nativeSessionID string) {
-		if run.plannerInternal {
-			// Planner passes are ephemeral and may use a synthetic conversation ID
-			// for each bounded emission attempt while resuming the same provider
-			// session. Keep the captured ID for resume, but do not bind it as a
-			// normal user conversation.
-			return
-		}
 		bindingOnce.Do(func() {
 			record, err := m.confirmBinding(
 				run.sessionID,
