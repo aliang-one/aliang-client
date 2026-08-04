@@ -167,7 +167,7 @@ func TestStreamClaudeMultiTurnPerMessageIdentity(t *testing.T) {
 		`{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"text"}}}` + "\n" +
 		`{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"answerA"}}}` + "\n" +
 		`{"type":"stream_event","event":{"type":"content_block_stop","index":1}}` + "\n" +
-		`{"type":"assistant","message":{"id":"msg_1","role":"assistant","model":"claude","content":[{"type":"text","text":"answerA"}]}}` + "\n" +
+		`{"type":"assistant","message":{"id":"msg_1","role":"assistant","model":"claude","content":[{"type":"text","text":"answerA"},{"type":"tool_use","id":"call_A","name":"Bash","input":{"command":"ls A"}}]}}` + "\n" +
 		`{"type":"stream_event","event":{"type":"message_start","message":{"id":"msg_2"}}}` + "\n" +
 		`{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking"}}}` + "\n" +
 		`{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"thinkB"}}}` + "\n" +
@@ -175,7 +175,7 @@ func TestStreamClaudeMultiTurnPerMessageIdentity(t *testing.T) {
 		`{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"text"}}}` + "\n" +
 		`{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"answerB"}}}` + "\n" +
 		`{"type":"stream_event","event":{"type":"content_block_stop","index":1}}` + "\n" +
-		`{"type":"assistant","message":{"id":"msg_2","role":"assistant","model":"claude","content":[{"type":"text","text":"answerB"}]}}` + "\n" +
+		`{"type":"assistant","message":{"id":"msg_2","role":"assistant","model":"claude","content":[{"type":"text","text":"answerB"},{"type":"tool_use","id":"call_B","name":"Bash","input":{"command":"ls B"}}]}}` + "\n" +
 		`{"type":"result","result":"answerB","session_id":"sess_test","is_error":false}` + "\n"
 
 	events := driveClaudeStreamEvents(t, ndjson)
@@ -220,6 +220,21 @@ func TestStreamClaudeMultiTurnPerMessageIdentity(t *testing.T) {
 	}
 	if activeFalse != 2 {
 		t.Fatalf("active:false thinking events = %d, want 2 (one stop per block)", activeFalse)
+	}
+
+	// ai.command (from each finalized assistant's tool_use) MUST share the same
+	// per-turn native message_id — locking streaming-event identity consistency
+	// across delta/thinking/command (no assistant_<run> mixing in). Each turn's
+	// command carries that turn's msg_N.
+	commandMsgIDs := map[string]bool{}
+	for _, ev := range events {
+		if remoteString(ev, "type") != "ai.command" {
+			continue
+		}
+		commandMsgIDs[remoteString(ev, "message_id")] = true
+	}
+	if !commandMsgIDs["msg_1"] || !commandMsgIDs["msg_2"] {
+		t.Fatalf("ai.command message_ids = %v, want msg_1 and msg_2 (all streaming event types share the turn's native id)", commandMsgIDs)
 	}
 }
 

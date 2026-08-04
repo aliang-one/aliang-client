@@ -5535,7 +5535,7 @@ func claudeEditLineDelta(toolName string, input map[string]interface{}) (added, 
 // ai.task. Read-only and other tools are ignored (write/exec surface only).
 func claudeToolUseEvents(content []interface{}, run agentAIRun, pending map[string]string) []map[string]interface{} {
 	items := content
-	msgID := agentAssistantMessageID(run.messageID)
+	msgID := streamingMessageID(run)
 	var out []map[string]interface{}
 	for _, raw := range items {
 		row, ok := raw.(map[string]interface{})
@@ -5626,7 +5626,7 @@ func claudeToolResultEvents(content []interface{}, run agentAIRun, pending map[s
 	if len(pending) == 0 {
 		return nil
 	}
-	msgID := agentAssistantMessageID(run.messageID)
+	msgID := streamingMessageID(run)
 	var out []map[string]interface{}
 	for _, raw := range items {
 		row, ok := raw.(map[string]interface{})
