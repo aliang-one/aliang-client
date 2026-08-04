@@ -51,9 +51,9 @@ func TestExtractOpenCodeJSONTextsAndSessionID(t *testing.T) {
 	if got := openCodeSessionID(delta); got != "op-sid" {
 		t.Fatalf("openCodeSessionID(delta) = %q, want op-sid", got)
 	}
-	texts := extractOpenCodeJSONTexts(delta, false)
-	if len(texts) != 1 || texts[0] != " hello" {
-		t.Fatalf("delta texts = %#v, want [\" hello\"]", texts)
+	parts := extractOpenCodeJSONTexts(delta)
+	if len(parts.deltas) != 1 || parts.deltas[0] != " hello" || parts.finalText != "" {
+		t.Fatalf("delta parts = %+v, want deltas=[\" hello\"] no finalText", parts)
 	}
 
 	partUpdate := map[string]interface{}{
@@ -65,9 +65,9 @@ func TestExtractOpenCodeJSONTextsAndSessionID(t *testing.T) {
 			},
 		},
 	}
-	texts = extractOpenCodeJSONTexts(partUpdate, true)
-	if len(texts) != 1 || texts[0] != "final part" {
-		t.Fatalf("part update texts = %#v, want [final part]", texts)
+	parts = extractOpenCodeJSONTexts(partUpdate)
+	if len(parts.deltas) != 0 || parts.finalText != "final part" {
+		t.Fatalf("part update parts = %+v, want finalText=final part", parts)
 	}
 
 	messageUpdate := map[string]interface{}{
@@ -82,9 +82,9 @@ func TestExtractOpenCodeJSONTextsAndSessionID(t *testing.T) {
 			},
 		},
 	}
-	texts = extractOpenCodeJSONTexts(messageUpdate, true)
-	if len(texts) != 1 || texts[0] != "done" {
-		t.Fatalf("message update texts = %#v, want [done]", texts)
+	parts = extractOpenCodeJSONTexts(messageUpdate)
+	if len(parts.deltas) != 0 || parts.finalText != "done" {
+		t.Fatalf("message update parts = %+v, want finalText=done (text only, tool skipped)", parts)
 	}
 }
 

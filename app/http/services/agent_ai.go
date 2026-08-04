@@ -4877,10 +4877,23 @@ func streamAgentAIStdout(reader io.Reader, format agentAIOutputFormat, run agent
 
 func streamStructuredAIDelta(reader io.Reader, format agentAIOutputFormat, run agentAIRun, writeJSON agentTerminalWriter, limiter *agentAIOutputLimiter, capture func(string), fileSink func(string), lastRetry *claudeRetryInfo, resumeSessionID *string, onSessionID ...func(string)) {
 	decoder := json.NewDecoder(reader)
-	emitted := false
+	// Per-message streamed-text buffer + last finalized text. Replaces the old
+	// per-run `emitted` flag (which, once set by the first text_delta,永久抑制
+	// 后续所有 finalized assistant 文本). Now: text_delta 积进 currentStreamed；
+	// 每个 finalized assistant 事件只补发未流过的后缀并重置 currentStreamed
+	// (按 message 边界去重)。result 事件对齐 lastFinalText 去重。这样工具型
+	// 多段 assistant 回合里，即便某段文本只出现在 finalized 事件(未经
+	// text_delta 流式)，也能实时作为 ai.delta 发出，不再被丢到结束才回拉。
+	currentStreamed := ""
+	lastFinalText := ""
 	// pendingCommands tracks Bash tool_use_id → command so a later user-turn
 	// tool_result can close it as ai.command(completed) with output + exit code.
 	pendingCommands := map[string]string{}
+	// claudeBlockTypes tracks content_block index → block type (thinking/text/
+	// tool_use) so content_block_stop can emit an explicit ai.thinking
+	// active:false when a thinking span ends — giving the thinking activity a
+	// reliable stop boundary (not only the run-terminal ai.done).
+	claudeBlockTypes := map[int]string{}
 	// pendingClaudeToolUseIDs tracks every Claude tool_use whose tool_result has
 	// not arrived yet. This keeps the idle watchdog from killing a quiet but
 	// legitimate Task/subagent or long-running tool wait.
@@ -4928,7 +4941,7 @@ func streamStructuredAIDelta(reader io.Reader, format agentAIOutputFormat, run a
 		if format == agentAIOutputClaudeStreamJSON {
 			updateClaudeToolUseActivity(event, run.activity, pendingClaudeToolUseIDs)
 		}
-		emitClaudeStructuredEvents(format, event, run, writeJSON, pendingCommands)
+		emitClaudeStructuredEvents(format, event, run, writeJSON, pendingCommands, claudeBlockTypes)
 		emitOpenCodeStructuredEvents(format, event, run, writeJSON)
 		if format == agentAIOutputOpenCodeJSON {
 			if reason, isErr := openCodeEventError(event); isErr {
@@ -5030,14 +5043,38 @@ func streamStructuredAIDelta(reader io.Reader, format agentAIOutputFormat, run a
 			// grabs the first non-empty session_id from any event, not just the
 			// result event, since system/init always carries it.)
 		}
-		for _, text := range extractStructuredAITexts(format, event, !emitted) {
-			if strings.TrimSpace(text) == "" {
+		parts := extractStructuredAITexts(format, event)
+		for _, d := range parts.deltas {
+			if strings.TrimSpace(d) == "" {
 				continue
 			}
-			if !emitAIDelta(text, run, "assistant", writeJSON, limiter, capture) {
+			if !emitAIDelta(d, run, "assistant", writeJSON, limiter, capture) {
 				return
 			}
-			emitted = true
+			currentStreamed += d
+		}
+		if parts.finalText != "" {
+			// A finalized assistant message emits only the text not already
+			// streamed for this message (suffix). The run result event is the
+			// LAST assistant message's text — dedup against whatever was emitted
+			// for it: the streamed deltas if it never finalized, else the
+			// finalized text. Either way, never silently drop finalized text
+			// (the old global-flag bug) nor double-emit already-streamed text.
+			reference := currentStreamed
+			if parts.isResult && currentStreamed == "" {
+				reference = lastFinalText
+			}
+			if suffix := suffixNotStreamed(reference, parts.finalText); strings.TrimSpace(suffix) != "" {
+				if !emitAIDelta(suffix, run, "assistant", writeJSON, limiter, capture) {
+					return
+				}
+			}
+			if parts.isResult {
+				lastFinalText = parts.finalText
+			} else {
+				currentStreamed = ""
+				lastFinalText = parts.finalText
+			}
 		}
 	}
 }
@@ -5090,59 +5127,109 @@ func updateClaudeToolUseActivity(event map[string]interface{}, activity *agentAI
 	}
 }
 
-func extractStructuredAITexts(format agentAIOutputFormat, event map[string]interface{}, allowFinal bool) []string {
+// aiStreamTexts describes the user-visible text carried by one structured
+// stream event, split into two channels that the run loop dedups differently:
+//
+//   - deltas    — streaming text_delta fragments. Always emitted as they
+//     arrive, and accumulated into the current message's streamed buffer.
+//   - finalText — the finalized assistant message's full text (a message
+//     boundary). Emitted only as the un-streamed suffix (see suffixNotStreamed)
+//     so messages whose text arrived only in the finalized event — never as
+//     text_delta partials — are still delivered in real time.
+//
+// This replaces the old global per-run `emitted`/`allowFinal` flag, which once
+// the first text_delta set it permanently suppressed every later finalized
+// assistant message, dropping its text on the wire (only recoverable later by
+// the server's end-of-run session-detail pull). isResult marks the run's
+// terminal result event (deduped against the last assistant message instead
+// of resetting the per-message buffer).
+type aiStreamTexts struct {
+	deltas    []string
+	finalText string
+	isResult  bool
+}
+
+func extractStructuredAITexts(format agentAIOutputFormat, event map[string]interface{}) aiStreamTexts {
 	switch format {
 	case agentAIOutputClaudeStreamJSON:
-		return extractClaudeStreamTexts(event, allowFinal)
+		return extractClaudeStreamTexts(event)
 	case agentAIOutputCodexJSON:
-		return extractCodexJSONTexts(event, allowFinal)
+		return extractCodexJSONTexts(event)
 	case agentAIOutputOpenCodeJSON:
-		return extractOpenCodeJSONTexts(event, allowFinal)
+		return extractOpenCodeJSONTexts(event)
 	default:
-		return nil
+		return aiStreamTexts{}
 	}
 }
 
-func extractOpenCodeJSONTexts(event map[string]interface{}, allowFinal bool) []string {
+// suffixNotStreamed returns the portion of final that was not already streamed.
+//   - Empty final ⇒ nothing to emit.
+//   - streamed already covers final (or more) ⇒ nothing.
+//   - final extends streamed ⇒ the un-streamed tail.
+//   - they diverge (neither is a prefix of the other) ⇒ final wholesale.
+//   - Empty streamed ⇒ all of final (recovers finalized-only messages).
+func suffixNotStreamed(streamed, final string) string {
+	if final == "" {
+		return ""
+	}
+	if strings.HasPrefix(streamed, final) {
+		return ""
+	}
+	if strings.HasPrefix(final, streamed) {
+		return final[len(streamed):]
+	}
+	return final
+}
+
+func extractOpenCodeJSONTexts(event map[string]interface{}) aiStreamTexts {
+	var out aiStreamTexts
 	eventType := strings.ToLower(strings.TrimSpace(remoteString(event, "type")))
 	props := openCodeEventProperties(event)
 	if strings.Contains(eventType, "part.delta") {
 		if text := firstNonBlankPreserveSpace(remoteString(props, "delta"), remoteString(event, "delta")); text != "" {
-			return []string{text}
+			out.deltas = []string{text}
+			return out
 		}
 	}
-	if !allowFinal {
-		return nil
-	}
+	// Finalized (per-message) text — emitted by the loop as the un-streamed
+	// suffix. Routing it here (instead of the old allowFinal-guarded return)
+	// means a later opencode assistant message whose text arrives only in its
+	// finalized event is no longer dropped by a global per-run flag.
 	if part := firstOpenCodeMap(props["part"], event["part"]); part != nil {
 		if text := openCodePartText(part); text != "" {
-			return []string{text}
+			out.finalText = text
+			return out
 		}
 	}
 	if message := firstOpenCodeMap(props["message"], event["message"]); message != nil {
 		if role := strings.ToLower(strings.TrimSpace(remoteString(message, "role"))); role == "" || role == "assistant" {
 			if texts := openCodeMessageTexts(message["parts"]); len(texts) > 0 {
-				return texts
+				out.finalText = strings.Join(texts, "")
+				return out
 			}
 			if text := firstNonBlankPreserveSpace(remoteString(message, "text"), remoteString(message, "content")); text != "" {
-				return []string{text}
+				out.finalText = text
+				return out
 			}
 		}
 	}
 	if role := strings.ToLower(strings.TrimSpace(remoteString(event, "role"))); role == "assistant" {
 		if texts := openCodeMessageTexts(event["parts"]); len(texts) > 0 {
-			return texts
+			out.finalText = strings.Join(texts, "")
+			return out
 		}
 		if text := firstNonBlankPreserveSpace(remoteString(event, "text"), remoteString(event, "content")); text != "" {
-			return []string{text}
+			out.finalText = text
+			return out
 		}
 	}
 	if strings.Contains(eventType, "message") || strings.Contains(eventType, "assistant") {
 		if text := firstNonBlankPreserveSpace(remoteString(props, "text"), remoteString(props, "content"), remoteString(event, "text"), remoteString(event, "content")); text != "" {
-			return []string{text}
+			out.finalText = text
+			return out
 		}
 	}
-	return nil
+	return out
 }
 
 func openCodeEventProperties(event map[string]interface{}) map[string]interface{} {
@@ -5254,18 +5341,17 @@ func openCodeEventError(event map[string]interface{}) (string, bool) {
 	return firstNonEmpty(eventType, "opencode run failed"), true
 }
 
-func extractClaudeStreamTexts(event map[string]interface{}, allowFinal bool) []string {
+func extractClaudeStreamTexts(event map[string]interface{}) aiStreamTexts {
+	var out aiStreamTexts
 	if remoteString(event, "type") == "stream_event" {
 		if streamEvent, ok := event["event"].(map[string]interface{}); ok && remoteString(streamEvent, "type") == "content_block_delta" {
 			if delta, ok := streamEvent["delta"].(map[string]interface{}); ok && remoteString(delta, "type") == "text_delta" {
 				if text := remoteString(delta, "text"); text != "" {
-					return []string{text}
+					out.deltas = []string{text}
 				}
 			}
 		}
-	}
-	if !allowFinal {
-		return nil
+		return out
 	}
 	switch remoteString(event, "type") {
 	case "assistant":
@@ -5275,10 +5361,10 @@ func extractClaudeStreamTexts(event map[string]interface{}, allowFinal bool) []s
 			// normal reply masks the failure — skip it; the result event (or the
 			// CLI exit) surfaces the failure as ai.error.
 			if remoteString(message, "model") == "<synthetic>" {
-				return nil
+				return out
 			}
 			if text := claudeMessageContentText(message["content"]); text != "" {
-				return []string{text}
+				out.finalText = text
 			}
 		}
 	case "result":
@@ -5286,13 +5372,14 @@ func extractClaudeStreamTexts(event map[string]interface{}, allowFinal bool) []s
 		// assistant delta — that masks the failure as a successful reply. The
 		// streaming loop surfaces it as ai.error via claudeResultError.
 		if _, isErr := claudeResultError(event); isErr {
-			return nil
+			return out
 		}
 		if text := remoteString(event, "result"); text != "" {
-			return []string{text}
+			out.finalText = text
+			out.isResult = true
 		}
 	}
-	return nil
+	return out
 }
 
 // claudeResultError reports whether a Claude stream-json "result" event is a
@@ -5608,25 +5695,69 @@ func claudeUsageEvent(message map[string]interface{}) map[string]interface{} {
 // assistant message's tool_use blocks→ai.command/ai.file_change/ai.task plus
 // ai.usage, and a later user-turn tool_result closes a pending Bash command as
 // ai.command(completed). Only write/exec tools surface; reads are ignored.
-func emitClaudeStructuredEvents(format agentAIOutputFormat, event map[string]interface{}, run agentAIRun, writeJSON agentTerminalWriter, pending map[string]string) {
+// streamFloatIndex parses a claude stream-json content_block "index" (a JSON
+// number, decoded by encoding/json as float64) into an int. Returns
+// (0,false) if absent or not a number.
+func streamFloatIndex(raw interface{}) (int, bool) {
+	f, ok := raw.(float64)
+	if !ok {
+		return 0, false
+	}
+	return int(f), true
+}
+
+func emitClaudeStructuredEvents(format agentAIOutputFormat, event map[string]interface{}, run agentAIRun, writeJSON agentTerminalWriter, pending map[string]string, blockTypes map[int]string) {
 	if format != agentAIOutputClaudeStreamJSON {
 		return
 	}
 	msgID := agentAssistantMessageID(run.messageID)
 
 	if remoteString(event, "type") == "stream_event" {
-		if streamEvent := mapIf(event["event"]); streamEvent != nil && remoteString(streamEvent, "type") == "content_block_delta" {
-			if delta := mapIf(streamEvent["delta"]); delta != nil && remoteString(delta, "type") == "thinking_delta" {
-				if text := remoteString(delta, "thinking"); strings.TrimSpace(text) != "" {
-					_ = writeJSON(map[string]interface{}{
-						"type":       models.AgentEventAIThinking,
-						"session_id": run.sessionID,
-						"message_id": msgID,
-						"delta":      text,
-					})
+		streamEvent := mapIf(event["event"])
+		if streamEvent != nil {
+			switch remoteString(streamEvent, "type") {
+			case "content_block_start":
+				// Record this block's type so its content_block_stop can tell
+				// whether a thinking span ended.
+				if blockTypes != nil {
+					if idx, ok := streamFloatIndex(streamEvent["index"]); ok {
+						if cb := mapIf(streamEvent["content_block"]); cb != nil {
+							blockTypes[idx] = remoteString(cb, "type")
+						}
+					}
+				}
+			case "content_block_stop":
+				// A thinking span ending emits an explicit active:false so the
+				// activity headline can leave "思考中" the moment the model
+				// moves on — not only at run-terminal ai.done. The next
+				// thinking_delta re-activates it (server-side merge).
+				if blockTypes != nil {
+					if idx, ok := streamFloatIndex(streamEvent["index"]); ok {
+						if blockTypes[idx] == "thinking" {
+							_ = writeJSON(map[string]interface{}{
+								"type":       models.AgentEventAIThinking,
+								"session_id": run.sessionID,
+								"message_id": msgID,
+								"active":     false,
+							})
+						}
+						delete(blockTypes, idx)
+					}
+				}
+			case "content_block_delta":
+				if delta := mapIf(streamEvent["delta"]); delta != nil && remoteString(delta, "type") == "thinking_delta" {
+					if text := remoteString(delta, "thinking"); strings.TrimSpace(text) != "" {
+						_ = writeJSON(map[string]interface{}{
+							"type":       models.AgentEventAIThinking,
+							"session_id": run.sessionID,
+							"message_id": msgID,
+							"delta":      text,
+						})
+					}
 				}
 			}
 		}
+		return
 	}
 
 	switch remoteString(event, "type") {
@@ -5786,32 +5917,32 @@ func countGitTrackedFiles(dir string) int {
 	return strings.Count(trimmed, "\n") + 1
 }
 
-func extractCodexJSONTexts(event map[string]interface{}, allowFinal bool) []string {
+func extractCodexJSONTexts(event map[string]interface{}) aiStreamTexts {
+	var out aiStreamTexts
 	eventType := remoteString(event, "type")
 	if strings.Contains(eventType, "delta") {
 		if text := firstNonEmpty(remoteString(event, "delta"), remoteString(event, "text")); text != "" {
-			return []string{text}
+			out.deltas = []string{text}
+			return out
 		}
 		if item, ok := event["item"].(map[string]interface{}); ok && remoteString(item, "type") == "agent_message" {
 			if text := firstNonEmpty(remoteString(item, "delta"), remoteString(item, "text")); text != "" {
-				return []string{text}
+				out.deltas = []string{text}
+				return out
 			}
 		}
 	}
-	if !allowFinal {
-		return nil
-	}
 	if item, ok := event["item"].(map[string]interface{}); ok && remoteString(item, "type") == "agent_message" {
 		if text := remoteString(item, "text"); text != "" {
-			return []string{text}
+			out.finalText = text
 		}
 	}
 	if eventType == "agent_message" {
 		if text := remoteString(event, "text"); text != "" {
-			return []string{text}
+			out.finalText = text
 		}
 	}
-	return nil
+	return out
 }
 
 func streamAIDelta(reader io.Reader, run agentAIRun, channel string, writeJSON agentTerminalWriter, limiter *agentAIOutputLimiter, capture func(string)) {
