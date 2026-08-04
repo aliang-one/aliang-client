@@ -294,6 +294,15 @@ type agentAIRun struct {
 	sessionID               string
 	runID                   string
 	messageID               string
+	// providerMsgID is the provider's native assistant message id for the
+	// CURRENT turn (claude msg_*, captured from message_start / finalized
+	// assistant events). Streaming events (ai.delta / ai.thinking /
+	// ai.command / ai.file_change) carry it as message_id so each assistant
+	// turn becomes a distinct transcript message + distinct structured events
+	// — matching what the server rebuilds from the native session log on
+	// refresh. Empty when not yet captured; streamingMessageID falls back to
+	// the run-derived id.
+	providerMsgID           string
 	runSeq                  int
 	mode                    string
 	projectPath             string
@@ -4924,6 +4933,17 @@ func streamStructuredAIDelta(reader io.Reader, format agentAIOutputFormat, run a
 				firstNonEmpty(remoteString(event, "claude_code_version"), remoteString(event, "version")),
 			)
 		}
+		// Capture the provider's native assistant message id for the CURRENT
+		// turn (claude message_start / finalized assistant). Streaming events
+		// then carry it so each turn is a distinct transcript message + distinct
+		// structured events — matching the post-refresh native-log view, instead
+		// of the whole run collapsing into one assistant bubble + one growing
+		// thinking event.
+		if format == agentAIOutputClaudeStreamJSON {
+			if mid := claudeStreamMessageID(event); mid != "" && mid != run.providerMsgID {
+				run.providerMsgID = mid
+			}
+		}
 		if format == agentAIOutputOpenCodeJSON && resumeSessionID != nil && *resumeSessionID == "" {
 			if sid := openCodeSessionID(event); sid != "" {
 				*resumeSessionID = sid
@@ -5710,7 +5730,7 @@ func emitClaudeStructuredEvents(format agentAIOutputFormat, event map[string]int
 	if format != agentAIOutputClaudeStreamJSON {
 		return
 	}
-	msgID := agentAssistantMessageID(run.messageID)
+	msgID := streamingMessageID(run)
 
 	if remoteString(event, "type") == "stream_event" {
 		streamEvent := mapIf(event["event"])
@@ -5730,7 +5750,10 @@ func emitClaudeStructuredEvents(format agentAIOutputFormat, event map[string]int
 				// A thinking span ending emits an explicit active:false so the
 				// activity headline can leave "思考中" the moment the model
 				// moves on — not only at run-terminal ai.done. The next
-				// thinking_delta re-activates it (server-side merge).
+				// thinking_delta re-activates it (server-side merge). item_id is
+				// the block index → this thinking block's event_id
+				// (type+session+message+item) is distinct per block, so multiple
+				// thinking blocks (across turns or within one) don't collapse.
 				if blockTypes != nil {
 					if idx, ok := streamFloatIndex(streamEvent["index"]); ok {
 						if blockTypes[idx] == "thinking" {
@@ -5738,6 +5761,7 @@ func emitClaudeStructuredEvents(format agentAIOutputFormat, event map[string]int
 								"type":       models.AgentEventAIThinking,
 								"session_id": run.sessionID,
 								"message_id": msgID,
+								"item_id":    fmt.Sprintf("tb%d", idx),
 								"active":     false,
 							})
 						}
@@ -5747,10 +5771,12 @@ func emitClaudeStructuredEvents(format agentAIOutputFormat, event map[string]int
 			case "content_block_delta":
 				if delta := mapIf(streamEvent["delta"]); delta != nil && remoteString(delta, "type") == "thinking_delta" {
 					if text := remoteString(delta, "thinking"); strings.TrimSpace(text) != "" {
+						idx, _ := streamFloatIndex(streamEvent["index"])
 						_ = writeJSON(map[string]interface{}{
 							"type":       models.AgentEventAIThinking,
 							"session_id": run.sessionID,
 							"message_id": msgID,
+							"item_id":    fmt.Sprintf("tb%d", idx),
 							"delta":      text,
 						})
 					}
@@ -6004,7 +6030,7 @@ func emitAIDelta(text string, run agentAIRun, channel string, writeJSON agentTer
 	_ = writeJSON(map[string]interface{}{
 		"type":       models.AgentEventAIDelta,
 		"session_id": run.sessionID,
-		"message_id": agentAssistantMessageID(run.messageID),
+		"message_id": streamingMessageID(run),
 		"channel":    channel,
 		"delta":      text,
 	})
@@ -6887,4 +6913,38 @@ func agentAssistantMessageID(messageID string) string {
 		return messageID
 	}
 	return "assistant_" + messageID
+}
+
+// streamingMessageID returns the message_id that streaming events for the
+// CURRENT provider assistant turn should carry: the provider's native msg id
+// when known (one per turn → each turn is a distinct transcript message and
+// distinct structured events, matching the post-refresh native-log view),
+// falling back to the legacy run-derived id when the native id hasn't been
+// captured yet (or for providers/paths that don't emit it).
+func streamingMessageID(run agentAIRun) string {
+	if id := strings.TrimSpace(run.providerMsgID); id != "" {
+		return id
+	}
+	return agentAssistantMessageID(run.messageID)
+}
+
+// claudeStreamMessageID returns the provider native assistant message id from a
+// claude stream-json event — the finalized "assistant" event's message.id, or
+// the message_start stream_event's message.id (available before any
+// content_block_delta, so streaming events of the turn can carry it). Empty
+// when the event carries none.
+func claudeStreamMessageID(event map[string]interface{}) string {
+	switch remoteString(event, "type") {
+	case "stream_event":
+		if se := mapIf(event["event"]); se != nil && remoteString(se, "type") == "message_start" {
+			if m := mapIf(se["message"]); m != nil {
+				return strings.TrimSpace(remoteString(m, "id"))
+			}
+		}
+	case "assistant":
+		if m := mapIf(event["message"]); m != nil {
+			return strings.TrimSpace(remoteString(m, "id"))
+		}
+	}
+	return ""
 }

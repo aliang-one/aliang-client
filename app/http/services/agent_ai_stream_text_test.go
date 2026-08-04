@@ -152,6 +152,77 @@ func driveClaudeStreamEvents(t *testing.T, ndjson string) []map[string]interface
 	return got
 }
 
+// TestStreamClaudeMultiTurnPerMessageIdentity is the regression test for the
+// "whole run collapses into one assistant bubble + one growing thinking event"
+// bug. Two assistant turns, each: message_start(msg_N) → thinking block →
+// text → finalized. The agent MUST emit ai.delta under the provider's NATIVE
+// per-turn message_id (msg_1 / msg_2) so the live view matches the refreshed
+// native-log view (two bubbles), and each turn's thinking block is a distinct
+// event (distinct message_id → distinct event_id), not one merged blob.
+func TestStreamClaudeMultiTurnPerMessageIdentity(t *testing.T) {
+	const ndjson = `{"type":"stream_event","event":{"type":"message_start","message":{"id":"msg_1"}}}` + "\n" +
+		`{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking"}}}` + "\n" +
+		`{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"thinkA"}}}` + "\n" +
+		`{"type":"stream_event","event":{"type":"content_block_stop","index":0}}` + "\n" +
+		`{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"text"}}}` + "\n" +
+		`{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"answerA"}}}` + "\n" +
+		`{"type":"stream_event","event":{"type":"content_block_stop","index":1}}` + "\n" +
+		`{"type":"assistant","message":{"id":"msg_1","role":"assistant","model":"claude","content":[{"type":"text","text":"answerA"}]}}` + "\n" +
+		`{"type":"stream_event","event":{"type":"message_start","message":{"id":"msg_2"}}}` + "\n" +
+		`{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking"}}}` + "\n" +
+		`{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"thinkB"}}}` + "\n" +
+		`{"type":"stream_event","event":{"type":"content_block_stop","index":0}}` + "\n" +
+		`{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"text"}}}` + "\n" +
+		`{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"answerB"}}}` + "\n" +
+		`{"type":"stream_event","event":{"type":"content_block_stop","index":1}}` + "\n" +
+		`{"type":"assistant","message":{"id":"msg_2","role":"assistant","model":"claude","content":[{"type":"text","text":"answerB"}]}}` + "\n" +
+		`{"type":"result","result":"answerB","session_id":"sess_test","is_error":false}` + "\n"
+
+	events := driveClaudeStreamEvents(t, ndjson)
+
+	// ai.delta must carry the NATIVE per-turn message_id (msg_1, msg_2), two
+	// distinct values — not the legacy single "assistant_<run>" id.
+	deltaMsgIDs := map[string]bool{}
+	deltaText := strings.Builder{}
+	for _, ev := range events {
+		if remoteString(ev, "type") != "ai.delta" {
+			continue
+		}
+		deltaMsgIDs[remoteString(ev, "message_id")] = true
+		deltaText.WriteString(remoteString(ev, "delta"))
+	}
+	if !deltaMsgIDs["msg_1"] || !deltaMsgIDs["msg_2"] {
+		t.Fatalf("ai.delta message_ids = %v, want both msg_1 and msg_2 (per-turn native ids)", deltaMsgIDs)
+	}
+	if len(deltaMsgIDs) != 2 {
+		t.Fatalf("ai.delta distinct message_ids = %d (%v), want exactly 2", len(deltaMsgIDs), deltaMsgIDs)
+	}
+	if got := deltaText.String(); !strings.Contains(got, "answerA") || !strings.Contains(got, "answerB") {
+		t.Fatalf("ai.delta text = %q, want both answerA and answerB", got)
+	}
+
+	// thinking events: distinct (message_id,item_id) keys per block. With native
+	// per-turn message_id, msg_1/tb0 and msg_2/tb0 are two distinct events.
+	thinkingKeys := map[string]bool{}
+	activeFalse := 0
+	for _, ev := range events {
+		if remoteString(ev, "type") != "ai.thinking" {
+			continue
+		}
+		key := remoteString(ev, "message_id") + "/" + remoteString(ev, "item_id")
+		thinkingKeys[key] = true
+		if b, ok := ev["active"].(bool); ok && !b {
+			activeFalse++
+		}
+	}
+	if !thinkingKeys["msg_1/tb0"] || !thinkingKeys["msg_2/tb0"] {
+		t.Fatalf("thinking keys = %v, want msg_1/tb0 and msg_2/tb0 (per-turn, per-block distinct)", thinkingKeys)
+	}
+	if activeFalse != 2 {
+		t.Fatalf("active:false thinking events = %d, want 2 (one stop per block)", activeFalse)
+	}
+}
+
 // TestStreamClaudeThinkingStopsAtContentBlockStop: a thinking content_block
 // must emit an explicit ai.thinking active:false when it closes, giving the
 // thinking activity a reliable end boundary (not only the run-terminal
