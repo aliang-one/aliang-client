@@ -1,0 +1,354 @@
+name: Tag Build Release
+
+on:
+  push:
+    tags:
+      - '*'
+
+permissions:
+  contents: write
+
+env:
+  BINARY_NAME: aliang
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  VITE_MODE: prod
+
+jobs:
+  guard:
+    name: Verify tag commit is on master
+    runs-on: ubuntu-latest
+    outputs:
+      on_master: ${{ steps.check.outputs.on_master }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check whether tag points to master
+        id: check
+        shell: bash
+        run: |
+          git fetch origin master --depth=1
+          TAG_COMMIT="$(git rev-list -n 1 "${GITHUB_REF_NAME}")"
+          if git merge-base --is-ancestor "$TAG_COMMIT" origin/master; then
+            echo "on_master=true" >> "$GITHUB_OUTPUT"
+            echo "Tag ${GITHUB_REF_NAME} points to ${TAG_COMMIT} on master."
+          else
+            echo "on_master=false" >> "$GITHUB_OUTPUT"
+            echo "Tag ${GITHUB_REF_NAME} is not on master. Release build will be skipped."
+          fi
+
+  frontend:
+    name: Build frontend dist
+    needs: guard
+    if: needs.guard.outputs.on_master == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: app/website/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: app/website
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: app/website
+        run: npm run build
+
+      - name: Archive frontend dist
+        shell: bash
+        run: |
+          tar -C app/website -czf website-dist.tar.gz dist
+
+      - name: Upload frontend dist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: website-dist
+          path: website-dist.tar.gz
+          if-no-files-found: error
+
+  build:
+    name: Build ${{ matrix.asset_name }}
+    needs:
+      - guard
+      - frontend
+    if: needs.guard.outputs.on_master == 'true'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            goos: linux
+            goarch: amd64
+            cgo_enabled: '1'
+            extra_ldflags: ''
+            asset_name: aliang-linux-amd64
+            binary_ext: ''
+            archive_ext: tar.gz
+            package_type: deb
+          - runner: ubuntu-24.04-arm
+            goos: linux
+            goarch: arm64
+            cgo_enabled: '1'
+            extra_ldflags: ''
+            asset_name: aliang-linux-arm64
+            binary_ext: ''
+            archive_ext: tar.gz
+            package_type: deb
+          - runner: windows-2022
+            goos: windows
+            goarch: amd64
+            cgo_enabled: '1'
+            extra_ldflags: '-H=windowsgui'
+            asset_name: aliang-windows-amd64
+            binary_ext: .exe
+            archive_ext: zip
+            package_type: msi
+          - runner: macos-15-intel
+            goos: darwin
+            goarch: amd64
+            cgo_enabled: '1'
+            extra_ldflags: ''
+            asset_name: aliang-darwin-amd64
+            binary_ext: ''
+            archive_ext: tar.gz
+            package_type: pkg
+          - runner: macos-15
+            goos: darwin
+            goarch: arm64
+            cgo_enabled: '1'
+            extra_ldflags: ''
+            asset_name: aliang-darwin-arm64
+            binary_ext: ''
+            archive_ext: tar.gz
+            package_type: pkg
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download frontend dist artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: website-dist
+          path: .
+
+      - name: Restore frontend dist into repository
+        shell: bash
+        run: |
+          rm -rf app/website/dist
+          tar -C app/website -xzf website-dist.tar.gz
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Install Linux build dependencies
+        if: matrix.goos == 'linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libgtk-3-dev libayatana-appindicator3-dev ruby ruby-dev rubygems
+          sudo gem install fpm --no-document
+
+      - name: Install macOS build dependencies
+        if: matrix.goos == 'darwin'
+        shell: bash
+        run: |
+          # Ensure build tools are available
+          which pkgbuild || brew install pkg-config
+          which productbuild || brew install productbuild
+
+      - name: Prepare Go modules for CI
+        shell: bash
+        run: |
+          if grep -q 'replace github.com/elazarl/goproxy v1.7.2 => ../goproxy' go.mod && [ ! -d ../goproxy ]; then
+            go mod edit -dropreplace=github.com/elazarl/goproxy
+          fi
+          go mod download
+
+      - name: Build Go binary
+        shell: bash
+        env:
+          CGO_ENABLED: ${{ matrix.cgo_enabled }}
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.goos == 'darwin' && '10.15' || '' }}
+        run: |
+          mkdir -p dist release
+          VERSION="${GITHUB_REF_NAME}"
+          COMMIT="$(git rev-parse --short HEAD)"
+          go build \
+            -trimpath \
+            -ldflags="-s -w ${{ matrix.extra_ldflags }} -X aliang.one/nursorgate/common/version.Version=${VERSION} -X aliang.one/nursorgate/common/version.GitCommit=${COMMIT} -X aliang.one/nursorgate/common/version.BuildMode=prod" \
+            -o "dist/${BINARY_NAME}${{ matrix.binary_ext }}" \
+            ./cmd/aliang
+
+      - name: Package Unix release archive
+        if: matrix.goos != 'windows'
+        shell: bash
+        run: |
+          tar -C dist -czf "release/${{ matrix.asset_name }}.${{ matrix.archive_ext }}" "${BINARY_NAME}${{ matrix.binary_ext }}"
+
+      - name: Package Windows release archive
+        if: matrix.goos == 'windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          Compress-Archive -Path "dist/${env:BINARY_NAME}${{ matrix.binary_ext }}" -DestinationPath "release/${{ matrix.asset_name }}.${{ matrix.archive_ext }}" -Force
+
+      - name: Build DEB package
+        if: matrix.package_type == 'deb'
+        shell: bash
+        env:
+          VERSION: ${{ github.ref_name }}
+          ARCH: ${{ matrix.goarch == 'amd64' && 'amd64' || 'arm64' }}
+        run: |
+          cd scripts
+          chmod +x build-deb.sh
+          cp ../dist/$BINARY_NAME aliang
+          ./build-deb.sh
+          mv aliang_*.deb ../release/ || true
+
+      - name: Build PKG package
+        if: matrix.package_type == 'pkg'
+        shell: bash
+        env:
+          VERSION: ${{ github.ref_name }}
+          ARCH: ${{ matrix.goarch }}
+          MACOSX_DEPLOYMENT_TARGET: '10.15'
+        run: |
+          cd scripts
+          chmod +x build-pkg.sh
+          cp ../dist/$BINARY_NAME aliang
+          ./build-pkg.sh
+          generated_pkg="Aliang-${VERSION}-${ARCH}.pkg"
+          if [ ! -f "$generated_pkg" ]; then
+            echo "Expected PKG not found: $generated_pkg"
+            exit 1
+          fi
+          cp "$generated_pkg" "../release/${{ matrix.asset_name }}.pkg"
+
+      - name: Build MSI package
+        if: matrix.package_type == 'msi'
+        shell: pwsh
+        env:
+          VERSION: ${{ github.ref_name }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          # Strip 'v' prefix from version for WiX compatibility
+          $msiVersion = $env:VERSION -replace '^v', ''
+          Write-Host "Building MSI version: $msiVersion"
+
+          # Download nuget.exe if not present
+          $nugetExe = "$env:TEMP\nuget.exe"
+          if (!(Test-Path $nugetExe)) {
+            Invoke-WebRequest -Uri "https://dist.nuget.org/win-x86-commandline/latest/nuget.exe" -OutFile $nugetExe
+          }
+
+          # Download and install WiX
+          $wixPath = "$env:TEMP\wix"
+          if (!(Test-Path "$wixPath\WiX.3.11.2\bin\candle.exe")) {
+            New-Item -ItemType Directory -Force -Path $wixPath | Out-Null
+            & $nugetExe install WiX -Version 3.11.2 -OutputDirectory $wixPath -NoHttpCache -Verbosity quiet
+          }
+          # Find candle.exe and light.exe in the WiX installation
+          $wixBin = Get-ChildItem -Path "$wixPath" -Recurse -Filter "candle.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          $wixLight = Get-ChildItem -Path "$wixPath" -Recurse -Filter "light.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($wixBin -and $wixLight) {
+            $wixCandleExe = $wixBin.FullName
+            $wixLightExe = $wixLight.FullName
+            $wixPath = Split-Path $wixBin.DirectoryName
+          } else {
+            Write-Host "ERROR: WiX executables not found after installation"
+            Get-ChildItem -Path $wixPath -Recurse | Select-Object FullName
+            exit 1
+          }
+          Write-Host "WiX candle: $wixCandleExe"
+          Write-Host "WiX light: $wixLightExe"
+          Write-Host "WiX path: $wixPath"
+
+          # Run MSI build script with WiX paths
+          $releaseDir = Join-Path $PWD "release"
+          & scripts/build-msi.ps1 -Version $msiVersion -OutputDir $releaseDir -WiXPath $wixPath -CandleExe $wixCandleExe -LightExe $wixLightExe
+
+          # Normalize MSI filename so upload/release naming is predictable
+          $generatedMsi = Get-ChildItem -Path $releaseDir -Filter "aliang-*.msi" -File -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+          if (-not $generatedMsi) {
+            $fallbackMsi = Get-ChildItem -Path "$env:TEMP\aliang-msi-build" -Recurse -Filter "aliang-*.msi" -File -ErrorAction SilentlyContinue |
+              Sort-Object LastWriteTime -Descending |
+              Select-Object -First 1
+            if ($fallbackMsi) {
+              Copy-Item -Path $fallbackMsi.FullName -Destination $releaseDir -Force
+              $generatedMsi = Get-ChildItem -Path $releaseDir -Filter "aliang-*.msi" -File -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending |
+                Select-Object -First 1
+            }
+          }
+          if (-not $generatedMsi) {
+            throw "MSI build completed but no .msi file was found in $releaseDir"
+          }
+          $normalizedMsi = "release/${{ matrix.asset_name }}.msi"
+          Copy-Item -Path $generatedMsi.FullName -Destination $normalizedMsi -Force
+          Write-Host "Normalized MSI: $normalizedMsi"
+
+      - name: Upload packaged artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: release/${{ matrix.asset_name }}.${{ matrix.archive_ext }}
+          if-no-files-found: error
+
+      - name: Upload package artifact
+        if: matrix.package_type != 'msi'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}-package
+          path: release/${{ matrix.asset_name }}.${{ matrix.package_type }}
+          if-no-files-found: ignore
+
+      - name: Upload MSI package artifact
+        if: matrix.package_type == 'msi'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}-package
+          path: release/${{ matrix.asset_name }}.msi
+          if-no-files-found: error
+
+  release:
+    name: Publish release assets
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: aliang-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          cd release-assets
+          sha256sum * > SHA256SUMS
+
+      - name: Publish GitHub release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            release-assets/*

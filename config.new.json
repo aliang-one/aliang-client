@@ -1,0 +1,73 @@
+{
+  
+    "core": {
+        "engine": {
+            "mtu": 0,
+            "fwmark": 0,
+            "restapi": "",
+            "device": "utun0",
+            "loglevel": "info",
+            "interface": "en0",
+            "tcp-moderate-receive-buffer": false,
+            "tcp-send-buffer-size": "",
+            "tcp-receive-buffer-size": "",
+            "multicast-groups": "",
+            "tun-pre-up": "",
+            "tun-post-up": "",
+            "udp-timeout": "60s"
+        },
+        "aliangServer": {
+            "type": "aliang",
+            "core_server": "15.nat0.cn:16749"
+        },
+        "api_server": "https://backend.aliang.one",
+        "agent_server": "http://localhost:4000"
+    },
+    "customer": {
+        "proxy": {
+            "enable": false,
+            "type": "socks5",
+            "server": "127.0.0.1:1080",
+            "username": "",
+            "password": ""
+        },
+        "ai_rules":{
+            "anthropic": {
+              "enble": true,
+              "editable": true,
+              "include": [
+                "api.anthropic.com"
+                
+              ]
+            },
+            "openai": {
+              "enble": true,
+              "editable": true,
+              "include": [
+                "api.openai.com",
+                "cdn.openai.com"
+              ]
+            },
+            "vscode": {
+              "enble": true,
+              "editable": false,
+              "include": [
+                "api.githubcopilot.com",
+                "*.individual.githubcopilot.com"
+              ]
+            },
+            "cursor": {
+              "enble": true,
+              "editable": false,
+              "include": [
+                "*.cursor.sh"
+              ]
+            }
+        },
+        "proxy_rules": [
+            "domains,google.com",
+            "domains,discord.com",
+            "domains,github.com"
+        ]
+    }
+}

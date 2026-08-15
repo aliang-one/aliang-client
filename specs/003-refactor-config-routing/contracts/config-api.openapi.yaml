@@ -1,0 +1,425 @@
+openapi: 3.0.3
+info:
+  title: Configuration Management API
+  version: 1.0.0
+  description: |
+    API for managing routing configuration, including:
+    - Fetching current routing rules configuration
+    - Saving modified configuration (triggers auto_update=false)
+    - Managing auto-update synchronization with Nacos
+
+    **Phase**: Phase 1 Design
+    **Feature**: 003-refactor-config-routing
+    **Date**: 2025-12-17
+
+servers:
+  - url: http://127.0.0.1:56431/api/v1
+    description: Local development server
+  - url: http://0.0.0.0:56431/api/v1
+    description: Production server
+
+tags:
+  - name: Configuration
+    description: Routing configuration management endpoints
+  - name: Auto-Update
+    description: Nacos auto-update control endpoints
+
+paths:
+  /config/routing:
+    get:
+      tags:
+        - Configuration
+      summary: Get current routing configuration
+      description: |
+        Retrieves the complete routing configuration including:
+        - Three rule sets (to_door, black_list, none_lane)
+        - Global settings (none_lane_enabled, door_enabled, geoip_enabled, auto_update)
+        - Version and timestamp metadata
+      operationId: getRoutingConfig
+      responses:
+        '200':
+          description: Successfully retrieved routing configuration
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoutingRulesConfig'
+              examples:
+                example1:
+                  $ref: '#/components/examples/RoutingConfigExample'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+    post:
+      tags:
+        - Configuration
+      summary: Save modified routing configuration
+      description: |
+        Saves a modified routing configuration to local storage.
+
+        **Important Side Effects:**
+        - Automatically sets `settings.auto_update = false`
+        - Stops Nacos configuration synchronization
+        - Records modification timestamp
+
+        This endpoint is called when users modify configuration through the web UI.
+      operationId: saveRoutingConfig
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RoutingRulesConfig'
+            examples:
+              example1:
+                $ref: '#/components/examples/RoutingConfigExample'
+      responses:
+        '200':
+          description: Configuration saved successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: success
+                  auto_update:
+                    type: boolean
+                    example: false
+                    description: Auto-update flag automatically set to false
+                  saved_at:
+                    type: string
+                    format: date-time
+                    example: "2025-12-17T10:30:00Z"
+        '400':
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidationError'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /config/routing/auto-update:
+    put:
+      tags:
+        - Auto-Update
+      summary: Enable auto-update synchronization
+      description: |
+        Manually enables auto-update flag, triggering immediate Nacos synchronization.
+
+        **Behavior:**
+        1. Fetches latest configuration from Nacos
+        2. Overwrites local configuration with Nacos version
+        3. Sets `settings.auto_update = true`
+        4. Resumes Nacos listener (if not already running)
+
+        **Warning:** This will discard any unsaved local modifications.
+      operationId: enableAutoUpdate
+      responses:
+        '200':
+          description: Auto-update enabled successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: success
+                  auto_update:
+                    type: boolean
+                    example: true
+                  synced_at:
+                    type: string
+                    format: date-time
+                    example: "2025-12-17T10:35:00Z"
+                  config:
+                    $ref: '#/components/schemas/RoutingRulesConfig'
+        '500':
+          description: Nacos connection error or internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+    get:
+      tags:
+        - Auto-Update
+      summary: Get auto-update status
+      description: Returns current auto-update flag status and last Nacos sync timestamp
+      operationId: getAutoUpdateStatus
+      responses:
+        '200':
+          description: Auto-update status retrieved successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  auto_update:
+                    type: boolean
+                    example: true
+                    description: Current auto-update flag state
+                  last_nacos_sync:
+                    type: string
+                    format: date-time
+                    example: "2025-12-17T10:30:00Z"
+                    description: Last successful Nacos sync timestamp (null if never synced)
+                  nacos_connected:
+                    type: boolean
+                    example: true
+                    description: Nacos connection health status
+
+components:
+  schemas:
+    RoutingRulesConfig:
+      type: object
+      required:
+        - to_door
+        - black_list
+        - none_lane
+        - settings
+        - version
+        - created_at
+        - updated_at
+      properties:
+        to_door:
+          $ref: '#/components/schemas/RoutingRuleSet'
+        black_list:
+          $ref: '#/components/schemas/RoutingRuleSet'
+        none_lane:
+          $ref: '#/components/schemas/RoutingRuleSet'
+        settings:
+          $ref: '#/components/schemas/RulesSettings'
+        version:
+          type: integer
+          minimum: 1
+          example: 5
+          description: Configuration version number (increments on each update)
+        created_at:
+          type: string
+          format: date-time
+          example: "2025-12-17T08:00:00Z"
+        updated_at:
+          type: string
+          format: date-time
+          example: "2025-12-17T10:30:00Z"
+
+    RoutingRuleSet:
+      type: object
+      required:
+        - set_type
+        - rules
+        - count
+        - updated_at
+      properties:
+        set_type:
+          type: string
+          enum:
+            - to_door
+            - black_list
+            - none_lane
+          description: Rule set category
+        rules:
+          type: array
+          items:
+            $ref: '#/components/schemas/RoutingRule'
+          maxItems: 10000
+          description: Array of routing rules (max 10000 per set)
+        count:
+          type: integer
+          minimum: 0
+          maximum: 10000
+          example: 2
+          description: Number of rules in this set (auto-calculated)
+        updated_at:
+          type: string
+          format: date-time
+          example: "2025-12-17T10:30:00Z"
+
+    RoutingRule:
+      type: object
+      required:
+        - id
+        - type
+        - condition
+        - enabled
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          maxLength: 128
+          example: rule_domain_1703001234
+          description: Unique rule identifier (format: rule_{type}_{timestamp})
+        type:
+          type: string
+          enum:
+            - domain
+            - ip
+            - geoip
+          description: Rule type determining condition format
+        condition:
+          type: string
+          maxLength: 256
+          example: "*.google.com"
+          description: |
+            Matching condition (format depends on type):
+            - domain: *.google.com or example.com
+            - ip: 192.168.0.0/16 (CIDR format)
+            - geoip: US, CN (ISO 3166-1 alpha-2)
+        enabled:
+          type: boolean
+          default: true
+          example: true
+          description: Rule enabled flag (false = disabled but not deleted)
+        created_at:
+          type: string
+          format: date-time
+          example: "2025-12-17T10:00:00Z"
+        updated_at:
+          type: string
+          format: date-time
+          example: "2025-12-17T10:00:00Z"
+        description:
+          type: string
+          maxLength: 512
+          example: "Google services routing"
+          description: Optional rule description
+
+    RulesSettings:
+      type: object
+      required:
+        - none_lane_enabled
+        - door_enabled
+        - geoip_enabled
+        - auto_update
+        - updated_at
+      properties:
+        none_lane_enabled:
+          type: boolean
+          default: true
+          example: true
+          description: Global switch for NoneLane rules (false = skip all NoneLane checks)
+        door_enabled:
+          type: boolean
+          default: true
+          example: true
+          description: Global switch for Door rules (false = skip all Door checks)
+        geoip_enabled:
+          type: boolean
+          default: false
+          example: false
+          description: Global switch for GeoIP rules (false = skip GeoIP checks)
+        auto_update:
+          type: boolean
+          default: true
+          example: true
+          description: |
+            Auto-update flag controlling Nacos synchronization:
+            - true: Automatically sync from Nacos on configuration changes
+            - false: Ignore Nacos updates, preserve local configuration
+
+            **Automatically set to false when POST /config/routing is called.**
+        updated_at:
+          type: string
+          format: date-time
+          example: "2025-12-17T10:30:00Z"
+        last_nacos_sync:
+          type: string
+          format: date-time
+          example: "2025-12-17T10:30:00Z"
+          description: Last successful Nacos sync timestamp (null if never synced)
+
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+          example: "Internal server error"
+        code:
+          type: string
+          example: "INTERNAL_ERROR"
+        timestamp:
+          type: string
+          format: date-time
+          example: "2025-12-17T10:30:00Z"
+
+    ValidationError:
+      type: object
+      properties:
+        error:
+          type: string
+          example: "Validation failed"
+        code:
+          type: string
+          example: "VALIDATION_ERROR"
+        details:
+          type: array
+          items:
+            type: object
+            properties:
+              field:
+                type: string
+                example: "to_door.rules[0].condition"
+              message:
+                type: string
+                example: "invalid domain format"
+
+  examples:
+    RoutingConfigExample:
+      summary: Complete routing configuration example
+      value:
+        to_door:
+          set_type: to_door
+          rules:
+            - id: rule_domain_1703001234
+              type: domain
+              condition: "*.google.com"
+              enabled: true
+              created_at: "2025-12-17T10:00:00Z"
+              updated_at: "2025-12-17T10:00:00Z"
+              description: "Google services routing"
+            - id: rule_ip_1703001235
+              type: ip
+              condition: "192.168.0.0/16"
+              enabled: false
+              created_at: "2025-12-17T10:05:00Z"
+              updated_at: "2025-12-17T10:30:00Z"
+          count: 2
+          updated_at: "2025-12-17T10:30:00Z"
+        black_list:
+          set_type: black_list
+          rules: []
+          count: 0
+          updated_at: "2025-12-17T10:00:00Z"
+        none_lane:
+          set_type: none_lane
+          rules:
+            - id: rule_domain_1703001236
+              type: domain
+              condition: "api.internal.com"
+              enabled: true
+              created_at: "2025-12-17T10:10:00Z"
+              updated_at: "2025-12-17T10:10:00Z"
+          count: 1
+          updated_at: "2025-12-17T10:10:00Z"
+        settings:
+          none_lane_enabled: true
+          door_enabled: true
+          geoip_enabled: false
+          auto_update: true
+          updated_at: "2025-12-17T10:30:00Z"
+          last_nacos_sync: "2025-12-17T10:30:00Z"
+        version: 5
+        created_at: "2025-12-17T08:00:00Z"
+        updated_at: "2025-12-17T10:30:00Z"

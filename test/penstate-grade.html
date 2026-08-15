@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>View Unofficial Transcript - LionPATH</title>
+    <style>
+        body {
+            font-family: Arial, Helvetica, sans-serif;
+            margin: 0;
+            padding: 0;
+            background-color: #f3f3f3;
+            font-size: 12px;
+            color: #333;
+        }
+
+        /* Header / Navigation Bar mimicking LionPATH */
+        .header {
+            background-color: #1e407c; /* PSU Blue */
+            color: white;
+            padding: 10px 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 3px solid #ccc;
+        }
+
+        .header-logo {
+            font-size: 18px;
+            font-weight: bold;
+            letter-spacing: 1px;
+        }
+
+        .header-icons span {
+            margin-left: 15px;
+            cursor: pointer;
+        }
+
+        /* Main Container */
+        .container {
+            background-color: white;
+            margin: 20px auto;
+            padding: 20px 40px;
+            width: 900px;
+            box-shadow: 0 0 5px rgba(0,0,0,0.1);
+            min-height: 800px;
+        }
+
+        h1 {
+            color: #1e407c;
+            font-size: 18px;
+            border-bottom: 1px solid #ddd;
+            padding-bottom: 10px;
+            margin-bottom: 20px;
+        }
+
+        h2 {
+            font-size: 14px;
+            background-color: #e6ebf1;
+            padding: 8px;
+            border-top: 1px solid #ccc;
+            margin-top: 20px;
+            margin-bottom: 5px;
+            color: #444;
+        }
+
+        /* Info Tables */
+        .info-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-bottom: 15px;
+        }
+
+        .info-table td {
+            padding: 4px 8px;
+        }
+
+        .label {
+            font-weight: bold;
+            color: #555;
+            width: 180px;
+            vertical-align: top;
+        }
+
+        .value {
+            color: #000;
+        }
+
+        /* Academic Data Tables */
+        .transcript-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-bottom: 20px;
+            font-size: 11px;
+        }
+
+        .transcript-table th {
+            background-color: #cfe0f1; /* PeopleSoft Header Blue */
+            color: #1e407c;
+            text-align: left;
+            padding: 6px;
+            border: 1px solid #ccc;
+            font-weight: bold;
+        }
+
+        .transcript-table td {
+            border: 1px solid #ddd;
+            padding: 6px;
+        }
+
+        .term-header {
+            background-color: #555 !important;
+            color: white !important;
+            font-weight: bold;
+            padding: 8px !important;
+        }
+
+        .gpa-row {
+            background-color: #f9f9f9;
+            font-weight: bold;
+        }
+
+        .section-break {
+            margin-top: 30px;
+            border-top: 2px solid #1e407c;
+        }
+
+        .print-btn {
+            background-color: #1e407c;
+            color: white;
+            border: none;
+            padding: 8px 15px;
+            cursor: pointer;
+            float: right;
+            margin-bottom: 20px;
+        }
+
+        .logo-placeholder {
+            display: inline-block;
+            background-color: white;
+            color: #1e407c;
+            padding: 2px 5px;
+            font-weight: bold;
+            margin-right: 10px;
+            border-radius: 2px;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="header">
+        <div class="header-logo">
+            <span class="logo-placeholder">PSU</span> LionPATH
+        </div>
+        <div class="header-icons">
+            <span>Home</span>
+            <span>Add to Favorites</span>
+            <span>Sign Out</span>
+        </div>
+    </div>
+
+    <div class="container">
+        <button class="print-btn" onclick="window.print()">Print Transcript</button>
+        <h1>View Unofficial Transcript</h1>
+
+        <table class="info-table">
+            <tr>
+                <td class="label">Name:</td>
+                <td class="value">dehen anyee</td>
+                <td class="label">Penn State ID:</td>
+                <td class="value">937101866</td>
+            </tr>
+            <tr>
+                <td class="label">User ID (Access Account):</td>
+                <td class="value">dja6099</td>
+                <td class="label">Birth Date:</td>
+                <td class="value">1996-01-03</td>
+            </tr>
+            <tr>
+                <td class="label">Email Address:</td>
+                <td class="value">dja6099@psu.edu</td>
+                <td class="label">Print Date:</td>
+                <td class="value"><script>document.write(new Date().toLocaleDateString('en-US'));</script></td>
+            </tr>
+        </table>
+
+        <div class="section-break"></div>
+        <h2>Academic Program History</h2>
+        <table class="info-table">
+            <tr>
+                <td class="label">Program:</td>
+                <td class="value">Undergraduate Degree</td>
+            </tr>
+            <tr>
+                <td class="label">College:</td>
+                <td class="value">College of Engineering</td>
+            </tr>
+            <tr>
+                <td class="label">Major:</td>
+                <td class="value">Computer Science, B.S.</td>
+            </tr>
+            <tr>
+                <td class="label">Expected Graduation:</td>
+                <td class="value">Spring 2028</td>
+            </tr>
+        </table>
+
+        <table class="transcript-table">
+            <tr>
+                <td colspan="6" class="term-header">2026 Fall Semester | Undergraduate | Penn State University Park</td>
+            </tr>
+            <tr>
+                <th>Course</th>
+                <th>Description</th>
+                <th>Attempted</th>
+                <th>Earned</th>
+                <th>Grade</th>
+                <th>Points</th>
+            </tr>
+            <tr>
+                <td>CMPSC 131</td>
+                <td>Programming and Computation I</td>
+                <td>3.00</td>
+                <td>3.00</td>
+                <td>A</td>
+                <td>12.00</td>
+            </tr>
+            <tr>
+                <td>MATH 140</td>
+                <td>Calculus With Analytic Geom I</td>
+                <td>4.00</td>
+                <td>4.00</td>
+                <td>A-</td>
+                <td>14.68</td>
+            </tr>
+            <tr>
+                <td>ENGL 15</td>
+                <td>Rhetoric and Composition</td>
+                <td>3.00</td>
+                <td>3.00</td>
+                <td>A</td>
+                <td>12.00</td>
+            </tr>
+            <tr>
+                <td>PSU 6</td>
+                <td>First-Year Seminar Engineering</td>
+                <td>1.00</td>
+                <td>1.00</td>
+                <td>A</td>
+                <td>4.00</td>
+            </tr>
+            <tr>
+                <td>EDSGN 100</td>
+                <td>Intro to Engineering Design</td>
+                <td>3.00</td>
+                <td>3.00</td>
+                <td>B+</td>
+                <td>9.99</td>
+            </tr>
+            <tr class="gpa-row">
+                <td colspan="2" style="text-align: right;">Term Totals:</td>
+                <td>14.00</td>
+                <td>14.00</td>
+                <td>GPA: 3.76</td>
+                <td>52.67</td>
+            </tr>
+        </table>
+
+        <table class="transcript-table">
+            <tr>
+                <td colspan="6" class="term-header">2025 Spring Semester | Undergraduate | Penn State University Park</td>
+            </tr>
+            <tr>
+                <th>Course</th>
+                <th>Description</th>
+                <th>Attempted</th>
+                <th>Earned</th>
+                <th>Grade</th>
+                <th>Points</th>
+            </tr>
+            <tr>
+                <td>CMPSC 132</td>
+                <td>Programming and Computation II</td>
+                <td>3.00</td>
+                <td>3.00</td>
+                <td>A</td>
+                <td>12.00</td>
+            </tr>
+            <tr>
+                <td>MATH 141</td>
+                <td>Calculus with Analytic Geom II</td>
+                <td>4.00</td>
+                <td>4.00</td>
+                <td>B+</td>
+                <td>13.32</td>
+            </tr>
+            <tr>
+                <td>PHYS 211</td>
+                <td>General Physics: Mechanics</td>
+                <td>4.00</td>
+                <td>4.00</td>
+                <td>B</td>
+                <td>12.00</td>
+            </tr>
+            <tr>
+                <td>CAS 100A</td>
+                <td>Effective Speech</td>
+                <td>3.00</td>
+                <td>3.00</td>
+                <td>A-</td>
+                <td>11.01</td>
+            </tr>
+            <tr class="gpa-row">
+                <td colspan="2" style="text-align: right;">Term Totals:</td>
+                <td>14.00</td>
+                <td>14.00</td>
+                <td>GPA: 3.45</td>
+                <td>48.33</td>
+            </tr>
+        </table>
+
+        <table class="transcript-table">
+            <tr>
+                <td colspan="6" class="term-header">2025 Fall Semester | Undergraduate | Penn State University Park</td>
+            </tr>
+            <tr>
+                <th>Course</th>
+                <th>Description</th>
+                <th>Attempted</th>
+                <th>Earned</th>
+                <th>Grade</th>
+                <th>Points</th>
+            </tr>
+            <tr>
+                <td>CMPSC 221</td>
+                <td>Object Oriented Prog Web</td>
+                <td>3.00</td>
+                <td>3.00</td>
+                <td>A</td>
+                <td>12.00</td>
+            </tr>
+            <tr>
+                <td>CMPSC 360</td>
+                <td>Discrete Mathematics for CS</td>
+                <td>3.00</td>
+                <td>3.00</td>
+                <td>B+</td>
+                <td>9.99</td>
+            </tr>
+            <tr>
+                <td>MATH 230</td>
+                <td>Calculus and Vector Analysis</td>
+                <td>4.00</td>
+                <td>4.00</td>
+                <td>B</td>
+                <td>12.00</td>
+            </tr>
+            <tr>
+                <td>PHYS 212</td>
+                <td>General Physics: Electricity/Magnetism</td>
+                <td>4.00</td>
+                <td>4.00</td>
+                <td>B-</td>
+                <td>10.68</td>
+            </tr>
+             <tr>
+                <td>ECON 102</td>
+                <td>Introductory Microeconomics</td>
+                <td>3.00</td>
+                <td>3.00</td>
+                <td>A</td>
+                <td>12.00</td>
+            </tr>
+            <tr class="gpa-row">
+                <td colspan="2" style="text-align: right;">Term Totals:</td>
+                <td>17.00</td>
+                <td>17.00</td>
+                <td>GPA: 3.33</td>
+                <td>56.67</td>
+            </tr>
+        </table>
+
+        <table class="transcript-table">
+            <tr>
+                <td colspan="6" class="term-header">2026 Spring Semester | Undergraduate | Penn State University Park</td>
+            </tr>
+            <tr>
+                <th>Course</th>
+                <th>Description</th>
+                <th>Attempted</th>
+                <th>Earned</th>
+                <th>Grade</th>
+                <th>Points</th>
+            </tr>
+            <tr>
+                <td>CMPSC 311</td>
+                <td>Sys Prog and Op Sys Concepts</td>
+                <td>3.00</td>
+                <td>0.00</td>
+                <td>IP</td>
+                <td>0.00</td>
+            </tr>
+            <tr>
+                <td>CMPSC 465</td>
+                <td>Data Structures and Algorithms</td>
+                <td>3.00</td>
+                <td>0.00</td>
+                <td>IP</td>
+                <td>0.00</td>
+            </tr>
+            <tr>
+                <td>STAT 318</td>
+                <td>Elementary Probability</td>
+                <td>3.00</td>
+                <td>0.00</td>
+                <td>IP</td>
+                <td>0.00</td>
+            </tr>
+            <tr>
+                <td>CMPEN 331</td>
+                <td>Computer Organization and Design</td>
+                <td>3.00</td>
+                <td>0.00</td>
+                <td>IP</td>
+                <td>0.00</td>
+            </tr>
+             <tr>
+                <td>GEN ED</td>
+                <td>General Education: Arts (GA)</td>
+                <td>3.00</td>
+                <td>0.00</td>
+                <td>IP</td>
+                <td>0.00</td>
+            </tr>
+             <tr class="gpa-row">
+                <td colspan="2" style="text-align: right;">Term Totals:</td>
+                <td>15.00</td>
+                <td>0.00</td>
+                <td>GPA: 0.00</td>
+                <td>0.00</td>
+            </tr>
+        </table>
+
+        <div class="section-break"></div>
+        <h2>Cumulative Statistics</h2>
+        <table class="info-table" style="width: 50%; margin-top: 10px;">
+            <tr>
+                <td class="label">Total Cumulative Credits:</td>
+                <td class="value">45.00</td>
+            </tr>
+             <tr>
+                <td class="label">Cumulative GPA:</td>
+                <td class="value"><strong>3.50</strong></td>
+            </tr>
+             <tr>
+                <td class="label">Academic Standing:</td>
+                <td class="value">Good Standing</td>
+            </tr>
+        </table>
+
+        <div style="margin-top: 50px; font-size: 10px; color: #888; text-align: center; border-top: 1px solid #eee; padding-top: 10px;">
+            This is an unofficial transcript. Not valid for official certification. <br>
+            Use standard secure procedures to request an official document from the Office of the University Registrar.
+        </div>
+    </div>
+
+</body>
+</html>

@@ -1,0 +1,318 @@
+event: message_start
+data: {"type": "message_start", "message": {"id": "msg_202606200329095fbbce933d354aa4", "type": "message", "role": "assistant", "model": "glm-5.2", "content": [], "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": 0, "output_tokens": 0}}}
+
+event: ping
+data: {"type": "ping"}
+
+event: content_block_start
+data: {"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": "", "signature": "be4d6359ef494024a4e7b42b"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "The"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " user"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " wants"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " me"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " to"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " pull"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " the"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " latest"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " code"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "."}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " The"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " previous"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " attempts"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " were"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " blocked"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " on"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " permission"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " approval"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "."}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " Let"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " me"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " try"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " again"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " —"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " the"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " user"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " is"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " now"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " explicitly"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " asking"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " for"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " it"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " again"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": ","}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " so"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " they"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " should"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " approve"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " the"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " permission"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " prompt"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " this"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " time"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "."}}
+
+event: content_block_stop
+data: {"type": "content_block_stop", "index": 0}
+
+event: content_block_start
+data: {"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use", "id": "call_e507c3a9f77443e68cb57f57", "name": "Bash", "input": {}}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "{\"command\":\"git pull origin main\",\"description\":\"Pull latest changes from origin main\"}"}}
+
+event: content_block_stop
+data: {"type": "content_block_stop", "index": 1}
+
+event: message_delta
+data: {"type": "message_delta", "delta": {"stop_reason": "tool_use", "stop_sequence": null}, "usage": {"input_tokens": 108139, "output_tokens": 70, "cache_read_input_tokens": 20096, "server_tool_use": {"web_search_requests": 0}, "service_tier": "standard"}}
+
+event: message_stop
+data: {"type": "message_stop"}
+
+event: message_start
+data: {"type": "message_start", "message": {"id": "msg_202606200329095fbbce933d354aa4", "type": "message", "role": "assistant", "model": "glm-5.2", "content": [], "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": 0, "output_tokens": 0}}}
+
+event: ping
+data: {"type": "ping"}
+
+event: content_block_start
+data: {"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": "", "signature": "be4d6359ef494024a4e7b42b"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "The"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " user"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " wants"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " me"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " to"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " pull"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " the"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " latest"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " code"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "."}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " The"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " previous"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " attempts"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " were"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " blocked"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " on"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " permission"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " approval"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "."}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " Let"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " me"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " try"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " again"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " —"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " the"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " user"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " is"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " now"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " explicitly"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " asking"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " for"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " it"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " again"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": ","}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " so"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " they"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " should"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " approve"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " the"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " permission"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " prompt"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " this"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " time"}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "."}}
+
+event: content_block_stop
+data: {"type": "content_block_stop", "index": 0}
+
+event: content_block_start
+data: {"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use", "id": "call_e507c3a9f77443e68cb57f57", "name": "Bash", "input": {}}}
+
+event: content_block_delta
+data: {"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "{\"command\":\"git pull origin main\",\"description\":\"Pull latest changes from origin main\"}"}}
+
+event: content_block_stop
+data: {"type": "content_block_stop", "index": 1}
+
+event: message_delta
+data: {"type": "message_delta", "delta": {"stop_reason": "tool_use", "stop_sequence": null}, "usage": {"input_tokens": 108139, "output_tokens": 70, "cache_read_input_tokens": 20096, "server_tool_use": {"web_search_requests": 0}, "service_tier": "standard"}}
+
+event: message_stop
+data: {"type": "message_stop"}
+

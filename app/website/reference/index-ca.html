@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+
+<html class="light" lang="en"><head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>Certificate Management - ALiang Gateway</title>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<link href="https://fonts.googleapis.com/css2?family=Public+Sans:wght@300;400;500;600;700;800&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<script id="tailwind-config">
+        tailwind.config = {
+            darkMode: "class",
+            theme: {
+                extend: {
+                    colors: {},
+                    fontFamily: {
+                        "headline": ["Public Sans"],
+                        "body": ["Public Sans"],
+                        "label": ["Public Sans"]
+                    },
+                    borderRadius: { "DEFAULT": "0.25rem", "lg": "0.5rem", "xl": "0.75rem", "full": "9999px" },
+                },
+            },
+        }
+    </script>
+<style>
+        body { font-family: 'Public Sans', sans-serif; }
+        .material-symbols-outlined {
+            font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
+        }
+    </style>
+</head>
+<body class="bg-gray-50 text-gray-900 antialiased overflow-hidden">
+<!-- TopAppBar -->
+<header class="fixed top-0 w-full z-50 flex justify-between items-center px-6 h-16 bg-white dark:bg-gray-950 shadow-sm border-b border-gray-100 dark:border-gray-800">
+<div class="flex items-center gap-8">
+<span class="text-xl font-bold text-green-600 dark:text-green-400">ALiang Gateway</span>
+<nav class="hidden md:flex items-center gap-6">
+<a class="text-gray-600 dark:text-gray-400 hover:text-green-500 font-sans text-sm font-medium transition-colors cursor-pointer duration-200" href="#">Dashboard</a>
+<a class="text-gray-600 dark:text-gray-400 hover:text-green-500 font-sans text-sm font-medium transition-colors cursor-pointer duration-200" href="#">Certificates</a>
+<a class="text-green-600 dark:text-green-400 border-b-2 border-green-600 pb-2 font-sans text-sm font-medium transition-colors cursor-pointer duration-200" href="#">Network</a>
+<a class="text-gray-600 dark:text-gray-400 hover:text-green-500 font-sans text-sm font-medium transition-colors cursor-pointer duration-200" href="#">Settings</a>
+</nav>
+</div>
+<div class="flex items-center gap-4">
+<div class="flex items-center gap-2">
+<span class="material-symbols-outlined text-gray-500 cursor-pointer p-2 hover:bg-gray-50 rounded-full" data-icon="notifications">notifications</span>
+<span class="material-symbols-outlined text-gray-500 cursor-pointer p-2 hover:bg-gray-50 rounded-full" data-icon="help">help</span>
+</div>
+<img alt="User profile avatar" class="w-8 h-8 rounded-full border border-gray-200" data-alt="Close up of professional male user profile avatar" src="https://lh3.googleusercontent.com/aida-public/AB6AXuCietw-Qt7Mu7AXBkWJcMukr_12uIkubho0i4DWalowkSvj-FH2ZAGyv7yl3QCNq21dyUsHkw_fHUJYg3nHt40j8J8eo5ZFOlLdnkFnI7d6iLJSe6vRwLwVhkOg2oMi_Q5O27Nu2i6hhxSkulzh-V7ZBcjFkgtxK61kxTJVmlIOfyOkJXj9sywzStvO_5wMN2ZqiZXOZMeeHu6XtMDX7LBk0ukybvBVV5gmllHsUA3q9NsiyDffOybCBtGoo_72pOL05-r_EsnOR9A"/>
+</div>
+</header>
+<!-- SideNavBar -->
+<aside class="fixed left-0 top-16 h-[calc(100vh-64px)] w-64 flex flex-col p-4 bg-gray-50 dark:bg-gray-900 border-r border-gray-200 dark:border-gray-800">
+<div class="mb-8 px-2">
+<div class="flex items-center gap-3 mb-1">
+<div class="w-8 h-8 rounded-lg bg-green-100 dark:bg-green-900/30 flex items-center justify-center">
+<span class="material-symbols-outlined text-green-600 dark:text-green-400" data-icon="hub">hub</span>
+</div>
+<div>
+<h3 class="font-sans text-sm font-bold text-gray-900 dark:text-white">Gateway Admin</h3>
+<p class="text-[10px] text-green-600 font-medium">Active Session</p>
+</div>
+</div>
+</div>
+<nav class="flex-1 space-y-1">
+<a class="flex items-center gap-3 text-gray-600 dark:text-gray-400 px-4 py-3 hover:bg-gray-100 dark:hover:bg-gray-800 font-sans text-sm transition-all scale-95 active:scale-90" href="#">
+<span class="material-symbols-outlined" data-icon="dashboard">dashboard</span>
+<span>Overview</span>
+</a>
+<a class="flex items-center gap-3 text-gray-600 dark:text-gray-400 px-4 py-3 hover:bg-gray-100 dark:hover:bg-gray-800 font-sans text-sm transition-all scale-95 active:scale-90" href="#">
+<span class="material-symbols-outlined" data-icon="verified_user">verified_user</span>
+<span>Security</span>
+</a>
+<a class="flex items-center gap-3 bg-green-50 dark:bg-green-900/20 text-green-700 dark:text-green-400 font-semibold px-4 py-3 rounded-lg font-sans text-sm transition-all scale-95 active:scale-90" href="#">
+<span class="material-symbols-outlined" data-icon="card_membership">card_membership</span>
+<span>Certificates</span>
+</a>
+<a class="flex items-center gap-3 text-gray-600 dark:text-gray-400 px-4 py-3 hover:bg-gray-100 dark:hover:bg-gray-800 font-sans text-sm transition-all scale-95 active:scale-90" href="#">
+<span class="material-symbols-outlined" data-icon="router">router</span>
+<span>Traffic</span>
+</a>
+<a class="flex items-center gap-3 text-gray-600 dark:text-gray-400 px-4 py-3 hover:bg-gray-100 dark:hover:bg-gray-800 font-sans text-sm transition-all scale-95 active:scale-90" href="#">
+<span class="material-symbols-outlined" data-icon="list_alt">list_alt</span>
+<span>Logs</span>
+</a>
+</nav>
+<button class="mt-auto w-full py-3 px-4 bg-green-600 hover:bg-green-700 text-white rounded-lg font-semibold text-sm transition-colors flex items-center justify-center gap-2">
+<span class="material-symbols-outlined text-sm" data-icon="add">add</span>
+            Generate New Certificate
+        </button>
+</aside>
+<!-- Dashboard Content (Background) -->
+<main class="ml-64 mt-16 p-8 min-h-screen">
+<div class="max-w-6xl mx-auto opacity-40">
+<header class="flex justify-between items-end mb-8">
+<div>
+<h1 class="text-3xl font-extrabold text-gray-900 tracking-tight">Networking Dashboard</h1>
+<p class="text-gray-500 mt-1">Real-time status of your gateway infrastructure.</p>
+</div>
+<div class="flex gap-3">
+<div class="px-4 py-2 bg-white rounded-lg border border-gray-200 text-sm font-medium">Status: Operational</div>
+</div>
+</header>
+<div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+<div class="bg-white p-6 rounded-xl border border-gray-100 shadow-sm">
+<div class="text-gray-500 text-xs font-bold uppercase tracking-wider mb-2">Total Traffic</div>
+<div class="text-2xl font-bold">1.2 TB</div>
+</div>
+<div class="bg-white p-6 rounded-xl border border-gray-100 shadow-sm">
+<div class="text-gray-500 text-xs font-bold uppercase tracking-wider mb-2">Active Nodes</div>
+<div class="text-2xl font-bold">42</div>
+</div>
+<div class="bg-white p-6 rounded-xl border border-gray-100 shadow-sm">
+<div class="text-gray-500 text-xs font-bold uppercase tracking-wider mb-2">Security Alerts</div>
+<div class="text-2xl font-bold text-green-600">0</div>
+</div>
+</div>
+<div class="bg-white rounded-xl border border-gray-100 shadow-sm h-96 flex items-center justify-center overflow-hidden relative">
+<img alt="Networking dashboard analytics" class="absolute inset-0 w-full h-full object-cover" data-alt="Abstract network data visualization with glowing lines" src="https://lh3.googleusercontent.com/aida-public/AB6AXuCL33GvoOTVrHwnyUt0KlHaq2JdXybRaG2psh7ZkAH2Gzjx9I1DABsffRDKeBGGGxDjGflxSghRchtirNCSMs8x1VBPKqz7XCY-fTCrzypArhlddOUSS0Kl8ZhwtErCAomYXBM86EcW0af5fKnC4-xW3-MG1vydtc4iaEzmsBx6plY0yTAzbhnwvG7JnmaDZCieNDdXCceCecGzZyXrOde05nqnyful8TILSmMwgP1bRB73g5Gepll4oEtiuMIw6teOklGMT2gec1M"/>
+<div class="relative z-10 text-white font-bold text-xl drop-shadow-md">Network Map Overview</div>
+</div>
+</div>
+</main>
+<!-- MODAL OVERLAY -->
+<div class="fixed inset-0 z-[100] flex items-center justify-center p-4">
+<!-- Backdrop Blur -->
+<div class="absolute inset-0 bg-gray-900/40 backdrop-blur-sm"></div>
+<!-- Modal Container -->
+<div class="relative bg-white w-full max-w-lg rounded-xl shadow-2xl flex flex-col overflow-hidden animate-in fade-in zoom-in duration-300">
+<!-- Modal Header -->
+<div class="px-6 py-5 border-b border-gray-100 flex justify-between items-center">
+<h2 class="text-lg font-bold text-gray-900">Certificate Management</h2>
+<button class="p-2 hover:bg-gray-50 rounded-full text-gray-400 transition-colors">
+<span class="material-symbols-outlined" data-icon="close">close</span>
+</button>
+</div>
+<!-- Modal Content -->
+<div class="p-6 space-y-6">
+<!-- Status Indicators -->
+<div class="flex flex-wrap gap-2">
+<span class="inline-flex items-center gap-1 px-3 py-1 bg-green-50 text-green-700 text-xs font-bold rounded-full border border-green-100 uppercase tracking-tight">
+<span class="w-1.5 h-1.5 rounded-full bg-green-500"></span>
+                        Installed
+                    </span>
+<span class="inline-flex items-center gap-1 px-3 py-1 bg-green-50 text-green-700 text-xs font-bold rounded-full border border-green-100 uppercase tracking-tight">
+<span class="w-1.5 h-1.5 rounded-full bg-green-500"></span>
+                        Trusted
+                    </span>
+<span class="inline-flex items-center gap-1 px-3 py-1 bg-green-50 text-green-700 text-xs font-bold rounded-full border border-green-100 uppercase tracking-tight">
+<span class="w-1.5 h-1.5 rounded-full bg-green-500"></span>
+                        Secure
+                    </span>
+</div>
+<!-- Certificate Details Card -->
+<div class="bg-gray-50 rounded-lg p-5 border border-gray-100">
+<div class="flex justify-between items-start mb-4">
+<span class="material-symbols-outlined text-green-600 bg-white p-2 rounded shadow-sm" data-icon="shield" data-weight="fill" style="font-variation-settings: 'FILL' 1;">shield</span>
+<div class="text-right">
+<p class="text-[10px] font-bold text-gray-400 uppercase tracking-widest">Type</p>
+<p class="text-xs font-semibold text-gray-700">Root Authority</p>
+</div>
+</div>
+<div class="grid grid-cols-2 gap-y-4">
+<div>
+<p class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-1">Subject</p>
+<p class="text-sm font-medium text-gray-900">ALiang Gateway CA</p>
+</div>
+<div>
+<p class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-1">Issuer</p>
+<p class="text-sm font-medium text-gray-900">Self-Signed</p>
+</div>
+<div>
+<p class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-1">Valid Until</p>
+<p class="text-sm font-medium text-gray-900">Dec 31, 2026</p>
+</div>
+<div>
+<p class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-1">Status</p>
+<p class="text-sm font-medium text-green-600">Active</p>
+</div>
+</div>
+<div class="mt-5 pt-4 border-t border-gray-200">
+<p class="text-[10px] font-bold text-gray-400 uppercase tracking-widest mb-1">Fingerprint</p>
+<p class="text-[11px] font-mono bg-white p-2 rounded border border-gray-100 text-gray-600 break-all leading-relaxed">SHA-256: 4F:5E:6D:8B:22:90:3A:C1:7F:33:99:A2:01:BC:EE:D4</p>
+</div>
+</div>
+<!-- Actions Grid -->
+<div class="grid grid-cols-2 gap-3">
+<button class="flex items-center justify-start gap-3 p-3 rounded-lg border border-gray-100 hover:bg-gray-50 transition-all group">
+<span class="material-symbols-outlined text-gray-500 group-hover:text-green-600" data-icon="download">download</span>
+<span class="text-sm font-medium text-gray-700">Export Certificate</span>
+</button>
+<button class="flex items-center justify-start gap-3 p-3 rounded-lg border border-gray-100 hover:bg-gray-50 transition-all group">
+<span class="material-symbols-outlined text-gray-500 group-hover:text-green-600" data-icon="check_circle">check_circle</span>
+<span class="text-sm font-medium text-gray-700">Install to System</span>
+</button>
+<button class="flex items-center justify-start gap-3 p-3 rounded-lg border border-gray-100 hover:bg-gray-50 transition-all group">
+<span class="material-symbols-outlined text-gray-500 group-hover:text-green-600" data-icon="description">description</span>
+<span class="text-sm font-medium text-gray-700">Download PEM</span>
+</button>
+<button class="flex items-center justify-start gap-3 p-3 rounded-lg border border-red-50 hover:bg-red-50 transition-all group">
+<span class="material-symbols-outlined text-red-400 group-hover:text-red-600" data-icon="delete">delete</span>
+<span class="text-sm font-medium text-red-600">Remove Certificate</span>
+</button>
+</div>
+</div>
+<!-- Footer / Bottom Action -->
+<div class="p-6 pt-2">
+<button class="w-full py-4 bg-green-600 hover:bg-green-700 text-white rounded-lg font-bold text-sm shadow-md shadow-green-200 flex items-center justify-center gap-2 transition-transform active:scale-[0.98]">
+<span class="material-symbols-outlined" data-icon="add">add</span>
+                    Generate New Certificate
+                </button>
+<p class="text-center text-[10px] text-gray-400 mt-4 uppercase tracking-tighter">Last refreshed: today at 09:42 am</p>
+</div>
+</div>
+</div>
+</body></html>

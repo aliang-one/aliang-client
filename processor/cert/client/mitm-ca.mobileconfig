@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>PayloadContent</key>
+    <array>
+        <dict>
+            <key>PayloadCertificateFileName</key>
+            <string>mitm-ca.pem</string>
+            <key>PayloadContent</key>
+            <data>
+            MIIFezCCA2OgAwIBAgIUQ9BIhbm9Ic82l6nMer43HRywNOkwDQYJKoZIhvcNAQELBQAwXTELMAkGA1UEBhMCQ04xETAPBgNVBAgMCFNoYW5naGFpMREwDwYDVQQHDAhTaGFuZ2hhaTEPMA0GA1UECgwGTnVyc29yMRcwFQYDVQQDDA5OdXJzb3IgUm9vdCBDQTAeFw0yNTAzMjIwNjAwMTNaFw0zNTAzMjAwNjAwMTNaMGoxCzAJBgNVBAYTAkNOMREwDwYDVQQIDAhTaGFuZ2hhaTERMA8GA1UEBwwIU2hhbmdoYWkxDzANBgNVBAoMBk51cnNvcjEkMCIGA1UEAwwbTnVyc29yIE1JVE0gSW50ZXJtZWRpYXRlIENBMIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAllDeS6PhxAHFTtKr3t9UvXoPjj7eLA44n5F+S4lcO/LNLio0I4hZE/tYAK7I/FyNBrBzKYFIeoyNIp8W9SXJGDhCykReqswWkz3ur3562vkVPTj38nNdpSP5bStTWBJ822MkNJt2VhxkmX96fMH185EBvGn6RaqKOJMCz5DXxbuBQbypYPMrm7T5lqOigiiqAeyf4xQk0se8qX8b+KtkZrBKmFz9PtHYS010dQUhdNxtGmlockAQ4CoGdMJePd9t7vI92+Ml+fA1xIfPSb4GIiwEI0Nfli5wXB19xNa2eG+Jhafy7CDhTeIo/xEpYbzrAnp/PnmpkLzpnC0rv61xhL4PmJwazefnfYa+E+bLFRzR+22u6g5YuuikEAoB26SlAgwtcI3NSTlnrAVAoGopS/EK0o4EiAZIkcgA6r/15xkudYM2O+WtnYRc6uqaAZ2+BZuNVMXmLGcamXo9WlVTC33XWqb2NjRLjqC3r5OnxhysbexEStVzSWHzhLGoeqWUKmYovymz0KXHvOsDZwqyQAJc04qeUlg2NkODIHZXnsRitDa3MsXrn/vTtGUtCB4CijWbGezvcykYcr8MQY+6vBi44sIPiZM6+6JH7l/p1iMRDaI1qNnpxVMYNZrA3spwJPSasIaRtXL6rAzWhgg0DWM32eTrRoq69pD1kYAaTMMCAwEAAaMmMCQwEgYDVR0TAQH/BAgwBgEB/wIBADAOBgNVHQ8BAf8EBAMCAYYwDQYJKoZIhvcNAQELBQADggIBADXiph86bjk8G0YPFAoRTrpzy4uY36N4bUjK9LINtanjj9Hn0vHQetAY9Q/Ej0QeDE+CI4sqMs9RlHs47indmeRpJ8djq82dqFLG65ld94rKsh/dvpLWDwKEr1703iUIWcTt5jg8QioIM9MjiJY3XMoIbpofKARomYyO3fAzvJelBn0fw9CzOQ0BE2KofvWOPiYiF8sNcomFoTjmp2ZbgT7u+r4ShORiqkbs/jEuLfWKO70vs1kHlt89si9K8mKX4aNr2MnCjpwsOmxam+Z4Op35k3o98HaLuM+MolfCV5EYEubt9MaNOq3rT9jkypy7oTirYxUPu9aQDPOp/H0kncIufaTBaQsJLCaU5xALO/U7nQZHu19gjZlrX0qfGxk5vzb8yaDnustsfO16YRF3YvuceMYrKpP3dr0h8XqmvbOO3uCprTHFfhsQrEd5CRM8gI4CMIj5nxL0Li7vhvN3bKnkjMQelb2ap66YStUU4nyVr6+z99S4WXmf37UbvnzSIJN7BZjqIgEsXM4Ht3Cmvh8C0si4GKry62tIy9+EQs860MyUozv7Cv1xPYPhQQpN/vlSqgjyGFiI7T0hl9o9HCRz5IL75GVKUADepeutcn/HzvVpU+uHk11e/K7AzhmM0/f+Umpp4H+wdxdbr/X0AAHlGjVxVTvgmxRJgAjHW4gd
+            </data>
+            <key>PayloadDescription</key>
+            <string>Installs mitmproxy CA certificate</string>
+            <key>PayloadDisplayName</key>
+            <string>mitmproxy CA</string>
+            <key>PayloadIdentifier</key>
+            <string>com.example.mitmca</string>
+            <key>PayloadType</key>
+            <string>com.apple.security.root</string>
+            <key>PayloadUUID</key>
+            <string>12345678-1234-1234-1234-1234567890AB</string>
+            <key>PayloadVersion</key>
+            <integer>1</integer>
+        </dict>
+    </array>
+    <key>PayloadDescription</key>
+    <string>Adds mitmproxy CA to trusted roots</string>
+    <key>PayloadDisplayName</key>
+    <string>mitmproxy CA Profile</string>
+    <key>PayloadIdentifier</key>
+    <string>com.example.mitmprofile</string>
+    <key>PayloadType</key>
+    <string>Configuration</string>
+    <key>PayloadUUID</key>
+    <string>87654321-4321-4321-4321-0987654321BA</string>
+    <key>PayloadVersion</key>
+    <integer>1</integer>
+</dict>
+</plist>

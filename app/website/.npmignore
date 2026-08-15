@@ -1,0 +1,4 @@
+reference/
+.qa/
+dist/
+.DS_Store

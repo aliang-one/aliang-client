@@ -1,0 +1,40 @@
+<!doctype html>
+<html class="light" lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta content="width=device-width, initial-scale=1.0" name="viewport" />
+    <title>ALiang Gateway Dashboard</title>
+    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    <script src="tailwind3.4.js"></script>
+    <script>window.SB_BACKEND_URL = 'https://support.liang.home';</script>
+    <!-- <script src="https://support.liang.home/js/min/jquery.min.js"></script> -->
+    <!-- <script src="https://support.liang.home/js/main-chat.js"></script> -->
+     <script src="jquery.min.js"></script>
+    <script src="main-chat-ws.js"></script>
+    <link rel="preload" href="/fonts/material-symbols-outlined-400.ttf" as="font" type="font/ttf" crossorigin />
+    <link rel="stylesheet" href="/fonts.css" />
+    <link href="assets/styles.css" rel="stylesheet" />
+    <script id="tailwind-config">
+      tailwind.config = {
+        darkMode: "class",
+        theme: {
+          extend: {
+            colors: {
+              primary: "rgb(var(--color-primary-rgb) / <alpha-value>)",
+              "background-light": "rgb(var(--color-background-light-rgb) / <alpha-value>)",
+              "background-dark": "rgb(var(--color-background-dark-rgb) / <alpha-value>)",
+            },
+            fontFamily: {
+              display: ["Inter", "sans-serif"],
+            },
+            borderRadius: { DEFAULT: "0.125rem", lg: "0.25rem", xl: "0.5rem", full: "0.75rem" },
+          },
+        },
+      };
+    </script>
+  </head>
+  <body class="bg-background-light dark:bg-background-dark font-display text-slate-900 dark:text-slate-100 antialiased">
+    <div id="app"></div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

@@ -1,0 +1,141 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Shadowsocks with ShadowTLS Configuration",
+  "description": "JSON Schema for validating Shadowsocks proxy configuration with optional ShadowTLS plugin support",
+  "type": "object",
+  "required": ["type", "server_host", "server_port", "method", "password"],
+  "properties": {
+    "type": {
+      "type": "string",
+      "enum": ["ss", "shadowsocks"],
+      "description": "Proxy type identifier"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Display name for the proxy"
+    },
+    "server_host": {
+      "type": "string",
+      "description": "Shadowsocks server IP address or hostname"
+    },
+    "server_port": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535,
+      "description": "Shadowsocks server port number"
+    },
+    "method": {
+      "type": "string",
+      "enum": [
+        "aes-128-gcm",
+        "aes-192-gcm",
+        "aes-256-gcm",
+        "chacha20-poly1305",
+        "chacha20-ietf-poly1305",
+        "xchacha20-poly1305",
+        "aes-128-ctr",
+        "aes-192-ctr",
+        "aes-256-ctr"
+      ],
+      "description": "Shadowsocks encryption cipher method"
+    },
+    "password": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Shadowsocks encryption password"
+    },
+    "username": {
+      "type": "string",
+      "description": "Optional username for the Shadowsocks proxy"
+    },
+    "obfs_mode": {
+      "type": "string",
+      "enum": ["plain", "http", "tls"],
+      "description": "Obfuscation mode (optional, for standard Shadowsocks)"
+    },
+    "obfs_host": {
+      "type": "string",
+      "description": "Obfuscation host (optional, for standard Shadowsocks)"
+    },
+    "plugin": {
+      "type": "string",
+      "enum": ["shadow-tls"],
+      "description": "Shadowsocks plugin type. Currently supports 'shadow-tls' for TLS camouflage"
+    },
+    "plugin_opts": {
+      "type": "object",
+      "required": ["host", "password", "version"],
+      "additionalProperties": false,
+      "properties": {
+        "host": {
+          "type": "string",
+          "description": "TLS camouflage domain name (e.g., www.bing.com). Must be a valid FQDN that the client can establish TLS connection with"
+        },
+        "password": {
+          "type": "string",
+          "minLength": 8,
+          "description": "ShadowTLS authentication password (must be at least 8 characters)"
+        },
+        "version": {
+          "type": "integer",
+          "enum": [1, 2, 3],
+          "description": "ShadowTLS protocol version. Version 3 is recommended for best compatibility"
+        }
+      },
+      "description": "ShadowTLS plugin configuration parameters. Required when plugin='shadow-tls'"
+    }
+  },
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "plugin": {
+            "const": "shadow-tls"
+          }
+        }
+      },
+      "then": {
+        "required": ["plugin_opts"],
+        "properties": {
+          "plugin_opts": {
+            "type": "object"
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "plugin_opts": {
+            "type": ["null", "object"]
+          }
+        }
+      }
+    }
+  ],
+  "examples": [
+    {
+      "type": "ss",
+      "name": "HK-ShadowTLS-3",
+      "server_host": "151.242.165.151",
+      "server_port": 443,
+      "method": "chacha20-ietf-poly1305",
+      "password": "I8U3GD4pziEyIeQwTqd52CGLisU5boCwg6FBU9KpARs=",
+      "username": "6TVbtuTh",
+      "plugin": "shadow-tls",
+      "plugin_opts": {
+        "host": "www.bing.com",
+        "password": "I8U3GD4pziEyIeQwTqd52CGLisU5boCwg6FBU9KpARs=",
+        "version": 3
+      }
+    },
+    {
+      "type": "ss",
+      "name": "Standard-Shadowsocks",
+      "server_host": "192.168.1.100",
+      "server_port": 8388,
+      "method": "aes-256-gcm",
+      "password": "MySecurePassword123456"
+    }
+  ]
+}

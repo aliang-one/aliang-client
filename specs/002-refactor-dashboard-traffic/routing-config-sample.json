@@ -1,0 +1,62 @@
+{
+  "version": 1,
+  "ingress": {
+    "mode": "tun"
+  },
+  "egress": {
+    "direct": {
+      "enabled": true
+    },
+    "toSocks": {
+      "enabled": true,
+      "upstream": {
+        "type": "socks"
+      }
+    },
+    "toAliang": {
+      "enabled": false
+    }
+  },
+  "routing": {
+    "rules": [
+      {
+        "id": "rule_domain_1734428800",
+        "type": "domain",
+        "condition": "*.google.com",
+        "target": "toSocks",
+        "enabled": true
+      },
+      {
+        "id": "rule_geoip_1734428900",
+        "type": "geoip",
+        "condition": "US",
+        "target": "toSocks",
+        "enabled": true
+      },
+      {
+        "id": "rule_domain_1734429300",
+        "type": "domain",
+        "condition": "*.openai.com",
+        "target": "toSocks",
+        "enabled": true
+      },
+      {
+        "id": "rule_ip_1734429000",
+        "type": "ip",
+        "condition": "192.168.0.0/16",
+        "target": "direct",
+        "enabled": true
+      },
+      {
+        "id": "rule_domain_1734429200",
+        "type": "domain",
+        "condition": "*.nonelane.example.com",
+        "target": "toAliang",
+        "enabled": false
+      }
+    ]
+  },
+  "migration": {
+    "note": "Legacy route aliases were removed; use canonical targets direct, toSocks, and toAliang only."
+  }
+}

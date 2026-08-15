@@ -1,0 +1,28 @@
+{
+  "api_server": "https://api.nonelane.com",
+  "currentProxy": "direct",
+  "baseProxies": {
+    "nonelane": {
+      "type": "nonelane",
+      "core_server": "test-ai-gateway.aliang.one:18889"
+    }
+  },
+  "socksProxy": {
+    "server_host": "127.0.0.1",
+    "server_port": 1080
+  },
+  "sni_allowlist": [],
+  "dnsPreResolution": {
+    "enabled": true,
+    "timeout": "10s",
+    "concurrentLimit": 5,
+    "retryOnFailure": true,
+    "cacheResults": true,
+    "preferIPv4": true,
+    "forceResolve": false,
+    "maxCacheTTL": "1h",
+    "primaryDNS": "8.8.8.8:53",
+    "fallbackDNS": "223.5.5.5:53",
+    "systemDNSFallback": true
+  }
+}

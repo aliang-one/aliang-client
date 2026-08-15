@@ -1,0 +1,108 @@
+name: Cleanup Old Releases
+
+on:
+  schedule:
+    # GitHub Actions 的 schedule 使用 UTC。
+    # 19:00 UTC = 北京时间次日 03:00。
+    - cron: '0 19 * * *'
+  workflow_dispatch:
+    # 允许手动触发
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cleanup-old-releases
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    name: Cleanup old releases
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Collect stable releases
+        id: releases
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          releases_json="$(
+            gh api --paginate --slurp -X GET repos/{owner}/{repo}/releases -f per_page=100 \
+            | jq '
+                map(.[])
+                | map(select(.draft == false and .prerelease == false and .published_at != null))
+                | sort_by(.published_at)
+                | reverse
+              '
+          )"
+
+          release_count=$(jq 'length' <<<"$releases_json")
+          delete_count=$(( release_count > 0 ? release_count - 1 : 0 ))
+
+          echo "Found $release_count stable release(s)"
+
+          if [ "$release_count" -eq 0 ]; then
+            echo "No stable releases found, nothing to clean up"
+            {
+              echo "latest_tag="
+              echo "release_count=0"
+              echo "delete_count=0"
+              echo "delete_tags<<EOF"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          latest_tag=$(jq -r '.[0].tag_name' <<<"$releases_json")
+          echo "Keeping latest stable release: $latest_tag"
+
+          echo "Stable releases (newest first):"
+          jq -r '.[] | "- \(.tag_name) (\(.published_at))"' <<<"$releases_json"
+
+          {
+            echo "latest_tag=$latest_tag"
+            echo "release_count=$release_count"
+            echo "delete_count=$delete_count"
+            echo "delete_tags<<EOF"
+            jq -r '.[1:] | .[].tag_name' <<<"$releases_json"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Delete old releases
+        if: steps.releases.outputs.delete_count != '0'
+        shell: bash
+        env:
+          DELETE_TAGS: ${{ steps.releases.outputs.delete_tags }}
+        run: |
+          set -euo pipefail
+          echo "Releases to delete:"
+          printf '%s\n' "$DELETE_TAGS"
+
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            echo "Deleting release and tag: $tag"
+            gh release delete "$tag" --cleanup-tag --yes
+          done <<< "$DELETE_TAGS"
+
+      - name: Summary
+        shell: bash
+        env:
+          RELEASE_COUNT: ${{ steps.releases.outputs.release_count }}
+          DELETE_COUNT: ${{ steps.releases.outputs.delete_count }}
+          LATEST_TAG: ${{ steps.releases.outputs.latest_tag }}
+        run: |
+          {
+            echo "## 清理完成"
+            echo
+            echo "- 正式版本总数: ${RELEASE_COUNT:-0}"
+            echo "- 删除旧版本数: ${DELETE_COUNT:-0}"
+            if [ -n "${LATEST_TAG:-}" ]; then
+              echo "- 保留最新正式版本: $LATEST_TAG"
+            else
+              echo "- 保留最新正式版本: 无"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

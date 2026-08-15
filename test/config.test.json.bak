@@ -1,0 +1,95 @@
+{
+  "api_server": "https://api.nonelane.com",
+  "nacos_server": "http://nacos-config.aliang.one",
+  "currentProxy": "door",
+  "baseProxies": {
+    "nonelane": {
+      "type": "nonelane",
+      "core_server": "test-ai-gateway.aliang.one:18889"
+    }
+  },
+  "doorProxy": {
+    "type": "door",
+    "members": [
+      {
+        "showname": "Japan Node 01",
+        "type": "vless",
+        "latency": 45,
+        "config": {
+          "server_host": "node2.aliang.one",
+          "server_port": 443,
+          "uuid": "74cddcdd-6d48-41cf-8e62-902e7c943fe7",
+          "flow": "xtls-rprx-vision",
+          "tls_enabled": false,
+          "reality_enabled": true,
+          "sni": "www.microsoft.com",
+          "public_key": "sAtJcW2xLIUWRE-_7KHGEAtvHx-P1sDbjrrgrt4_XCo",
+          "short_ids": ["ef","b79e62","7d87a3","f4bfb2","ecdc"]
+        }
+      },
+
+      {
+        "showname": "HK ShadowTLS",
+        "type": "shadowsocks",
+        "latency": 48,
+        "config": {
+          "server_host": "node1.aliang.one",
+          "server_port": 443,
+          "method": "chacha20-ietf-poly1305",
+          "password": "ciLfKJczFXlhqABmWO6tFEMNkfMR9ZB6V/fFmjmIOBA=",
+          "shadowtls": {
+            "host": "www.bing.com",
+            "password": "ciLfKJczFXlhqABmWO6tFEMNkfMR9ZB6V/fFmjmIOBA=",
+            "version": 3
+          }
+        }
+      }
+    ]
+  },
+  "routingRules": {
+    "geoip": {
+      "enabled": true,
+      "databasePath": "~/.nonelane/GeoLite2-Country.mmdb",
+      "chinaDirect": true
+    },
+    "bypassRules": {
+      "enabled": true,
+      "domains": [
+        "*.apple.com",
+        "*.icloud.com",
+        "*.microsoft.com",
+        "*.windowsupdate.com"
+      ],
+      "domainSuffixes": [
+        ".cn",
+        ".gov.cn",
+        ".edu.cn"
+      ],
+      "ipRanges": [
+        "192.168.0.0/16",
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "127.0.0.0/8",
+        "169.254.0.0/16"
+      ]
+    },
+    "ipDomainCache": {
+      "enabled": true,
+      "maxEntries": 10000,
+      "ttl": "5m"
+    }
+  },
+  "dnsPreResolution": {
+    "enabled": true,
+    "timeout": "10s",
+    "concurrentLimit": 5,
+    "retryOnFailure": true,
+    "cacheResults": true,
+    "preferIPv4": true,
+    "forceResolve": false,
+    "maxCacheTTL": "1h",
+    "primaryDNS": "8.8.8.8:53",
+    "fallbackDNS": "223.5.5.5:53",
+    "systemDNSFallback": true
+  }
+}

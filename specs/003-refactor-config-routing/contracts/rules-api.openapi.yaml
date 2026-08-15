@@ -1,0 +1,582 @@
+openapi: 3.0.3
+info:
+  title: Rules Engine Management API
+  version: 1.0.0
+  description: |
+    API for managing routing rules engine, including:
+    - Engine enable/disable controls
+    - Individual rule enable/disable toggle
+    - GeoIP cache management
+    - Engine status and diagnostics
+
+    **Phase**: Phase 1 Design
+    **Feature**: 003-refactor-config-routing
+    **Date**: 2025-12-17
+
+servers:
+  - url: http://127.0.0.1:56431/api/v1
+    description: Local development server
+  - url: http://0.0.0.0:56431/api/v1
+    description: Production server
+
+tags:
+  - name: Rules Engine
+    description: Routing engine control endpoints
+  - name: Rule Management
+    description: Individual rule management endpoints
+  - name: GeoIP Cache
+    description: GeoIP caching and diagnostics endpoints
+
+paths:
+  /rules/engine/status:
+    get:
+      tags:
+        - Rules Engine
+      summary: Get rules engine status
+      description: |
+        Retrieves current status of the routing decision engine, including:
+        - Global switch states (none_lane_enabled, door_enabled, geoip_enabled)
+        - Engine health status
+        - GeoIP cache statistics
+        - Decision statistics
+      operationId: getEngineStatus
+      responses:
+        '200':
+          description: Engine status retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EngineStatus'
+              examples:
+                example1:
+                  $ref: '#/components/examples/EngineStatusExample'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /rules/engine/enable:
+    post:
+      tags:
+        - Rules Engine
+      summary: Enable rules engine
+      description: |
+        Enables the routing rules engine globally.
+        Sets all decision switches to true.
+
+        **Note:** This does NOT affect Nacos auto-update.
+        Use /config/routing/auto-update for Nacos synchronization control.
+      operationId: enableRulesEngine
+      responses:
+        '200':
+          description: Rules engine enabled successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: success
+                  engine_enabled:
+                    type: boolean
+                    example: true
+                  switches:
+                    type: object
+                    properties:
+                      none_lane_enabled:
+                        type: boolean
+                      door_enabled:
+                        type: boolean
+                      geoip_enabled:
+                        type: boolean
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /rules/engine/disable:
+    post:
+      tags:
+        - Rules Engine
+      summary: Disable rules engine
+      description: |
+        Disables the routing rules engine globally.
+        All traffic will route to Direct destination.
+
+        **Impact:** This immediately stops all NoneLane and Door routing,
+        bypassing all rules regardless of configuration.
+      operationId: disableRulesEngine
+      responses:
+        '200':
+          description: Rules engine disabled successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: success
+                  engine_enabled:
+                    type: boolean
+                    example: false
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /config/routing/rules/{ruleId}/toggle:
+    put:
+      tags:
+        - Rule Management
+      summary: Toggle single rule enabled state
+      description: |
+        Toggles the enabled state of a specific rule (enabled ↔ disabled).
+
+        **Behavior:**
+        - If enabled=true: Set to false (disable rule)
+        - If enabled=false: Set to true (enable rule)
+
+        The rule is NOT deleted, only disabled/enabled for matching.
+      operationId: toggleRuleEnabled
+      parameters:
+        - name: ruleId
+          in: path
+          required: true
+          description: Rule ID to toggle (format: rule_{type}_{timestamp})
+          schema:
+            type: string
+            example: rule_domain_1703001234
+      responses:
+        '200':
+          description: Rule toggled successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: success
+                  rule:
+                    $ref: '#/components/schemas/RoutingRule'
+        '404':
+          description: Rule not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /rules/cache/clear:
+    post:
+      tags:
+        - GeoIP Cache
+      summary: Clear GeoIP cache
+      description: |
+        Clears the in-memory GeoIP query result cache.
+
+        **Effect:** Next GeoIP lookup will query the database (slightly slower),
+        but ensures latest geographical data is used.
+
+        **Typical Use Case:** After GeoLite2 database update.
+      operationId: clearGeoIPCache
+      responses:
+        '200':
+          description: GeoIP cache cleared successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: success
+                  cache_size:
+                    type: integer
+                    example: 0
+                    description: New cache size after clearing
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /rules/geoip/lookup:
+    post:
+      tags:
+        - GeoIP Cache
+      summary: Query GeoIP location for IP address
+      description: |
+        Performs a GeoIP lookup for a given IP address.
+
+        **Query Flow:**
+        1. Check LRU cache (if hit, return immediately)
+        2. Query GeoLite2 database
+        3. Cache result for future queries
+
+        **Performance:**
+        - Cache hit: <0.1ms
+        - Cache miss: <1ms
+      operationId: lookupGeoIP
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - ip
+              properties:
+                ip:
+                  type: string
+                  format: ipv4
+                  example: "203.0.113.42"
+                  description: IPv4 address to look up
+      responses:
+        '200':
+          description: GeoIP lookup successful
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ip:
+                    type: string
+                    example: "203.0.113.42"
+                  country_code:
+                    type: string
+                    example: "US"
+                    description: ISO 3166-1 alpha-2 country code
+                  country_name:
+                    type: string
+                    example: "United States"
+                  continent:
+                    type: string
+                    example: "North America"
+                  cached:
+                    type: boolean
+                    example: false
+                    description: Whether result was from cache
+                  lookup_time_ms:
+                    type: number
+                    example: 0.5
+                    description: Query time in milliseconds
+        '400':
+          description: Invalid IP address format
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidationError'
+        '500':
+          description: GeoIP database error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /rules/geoip/update:
+    post:
+      tags:
+        - GeoIP Cache
+      summary: Update GeoLite2 database
+      description: |
+        Downloads and updates the MaxMind GeoLite2-Country database.
+
+        **Behavior:**
+        1. Downloads latest GeoLite2-Country.mmdb
+        2. Validates database integrity
+        3. Replaces existing database (atomic operation)
+        4. Clears GeoIP cache
+
+        **Duration:** Typically 30-60 seconds (network dependent)
+      operationId: updateGeoIPDatabase
+      responses:
+        '200':
+          description: GeoLite2 database updated successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: success
+                  database_size_mb:
+                    type: number
+                    example: 28.5
+                  updated_at:
+                    type: string
+                    format: date-time
+                    example: "2025-12-17T10:45:00Z"
+                  cache_cleared:
+                    type: boolean
+                    example: true
+        '500':
+          description: Database download or update failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /rules/geoip/cache-stats:
+    get:
+      tags:
+        - GeoIP Cache
+      summary: Get GeoIP cache statistics
+      description: |
+        Returns current LRU cache statistics for GeoIP queries.
+
+        **Metrics:**
+        - cache_size: Current number of entries
+        - max_size: Maximum entries (10,000)
+        - hit_count: Total cache hits since startup
+        - miss_count: Total cache misses since startup
+        - hit_rate: Hit rate percentage
+      operationId: getGeoIPCacheStats
+      responses:
+        '200':
+          description: Cache statistics retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GeoIPCacheStats'
+              examples:
+                example1:
+                  $ref: '#/components/examples/CacheStatsExample'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+components:
+  schemas:
+    EngineStatus:
+      type: object
+      properties:
+        engine_healthy:
+          type: boolean
+          example: true
+          description: Overall engine health status
+        switches:
+          type: object
+          required:
+            - none_lane_enabled
+            - door_enabled
+            - geoip_enabled
+          properties:
+            none_lane_enabled:
+              type: boolean
+              example: true
+              description: NoneLane rules active
+            door_enabled:
+              type: boolean
+              example: true
+              description: Door rules active
+            geoip_enabled:
+              type: boolean
+              example: false
+              description: GeoIP rules active
+        rules_summary:
+          type: object
+          properties:
+            to_door_count:
+              type: integer
+              example: 15
+            black_list_count:
+              type: integer
+              example: 0
+            none_lane_count:
+              type: integer
+              example: 8
+            total_rules:
+              type: integer
+              example: 23
+        geoip_cache:
+          type: object
+          properties:
+            cache_size:
+              type: integer
+              example: 1250
+            max_size:
+              type: integer
+              example: 10000
+            hit_rate:
+              type: number
+              format: double
+              example: 78.5
+              description: Cache hit rate percentage
+        performance:
+          type: object
+          properties:
+            avg_decision_time_ms:
+              type: number
+              example: 2.3
+              description: Average routing decision latency
+            p99_decision_time_ms:
+              type: number
+              example: 8.7
+              description: 99th percentile routing decision latency
+        last_update:
+          type: string
+          format: date-time
+          example: "2025-12-17T10:30:00Z"
+
+    RoutingRule:
+      type: object
+      required:
+        - id
+        - type
+        - condition
+        - enabled
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          maxLength: 128
+          example: rule_domain_1703001234
+        type:
+          type: string
+          enum:
+            - domain
+            - ip
+            - geoip
+        condition:
+          type: string
+          maxLength: 256
+          example: "*.google.com"
+        enabled:
+          type: boolean
+          example: true
+        created_at:
+          type: string
+          format: date-time
+          example: "2025-12-17T10:00:00Z"
+        updated_at:
+          type: string
+          format: date-time
+          example: "2025-12-17T10:00:00Z"
+        description:
+          type: string
+          maxLength: 512
+
+    GeoIPCacheStats:
+      type: object
+      properties:
+        cache_size:
+          type: integer
+          example: 1250
+          description: Current number of cached entries
+        max_size:
+          type: integer
+          example: 10000
+          description: Maximum cache size
+        available_size:
+          type: integer
+          example: 8750
+          description: Remaining cache capacity
+        hit_count:
+          type: integer
+          example: 5234
+          description: Total cache hits since startup
+        miss_count:
+          type: integer
+          example: 1456
+          description: Total cache misses since startup
+        hit_rate:
+          type: number
+          format: double
+          example: 78.2
+          description: Hit rate percentage (hit_count / (hit_count + miss_count))
+        total_queries:
+          type: integer
+          example: 6690
+          description: Total GeoIP queries since startup
+        uptime_seconds:
+          type: integer
+          example: 3600
+          description: Time since startup in seconds
+
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+          example: "Internal server error"
+        code:
+          type: string
+          example: "INTERNAL_ERROR"
+        timestamp:
+          type: string
+          format: date-time
+          example: "2025-12-17T10:30:00Z"
+
+    ValidationError:
+      type: object
+      properties:
+        error:
+          type: string
+          example: "Validation failed"
+        code:
+          type: string
+          example: "VALIDATION_ERROR"
+        details:
+          type: array
+          items:
+            type: object
+            properties:
+              field:
+                type: string
+              message:
+                type: string
+
+  examples:
+    EngineStatusExample:
+      summary: Rules engine status example
+      value:
+        engine_healthy: true
+        switches:
+          none_lane_enabled: true
+          door_enabled: true
+          geoip_enabled: false
+        rules_summary:
+          to_door_count: 15
+          black_list_count: 0
+          none_lane_count: 8
+          total_rules: 23
+        geoip_cache:
+          cache_size: 1250
+          max_size: 10000
+          hit_rate: 78.5
+        performance:
+          avg_decision_time_ms: 2.3
+          p99_decision_time_ms: 8.7
+        last_update: "2025-12-17T10:30:00Z"
+
+    CacheStatsExample:
+      summary: GeoIP cache statistics example
+      value:
+        cache_size: 1250
+        max_size: 10000
+        available_size: 8750
+        hit_count: 5234
+        miss_count: 1456
+        hit_rate: 78.2
+        total_queries: 6690
+        uptime_seconds: 3600

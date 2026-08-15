@@ -1,0 +1,713 @@
+openapi: 3.0.3
+info:
+  title: Nacos Integration API
+  version: 1.0.0
+  description: |
+    API for Nacos configuration center integration, including:
+    - Listener status monitoring
+    - Synchronization health checks
+    - Manual sync triggers
+    - Connection diagnostics
+
+    **Phase**: Phase 1 Design
+    **Feature**: 003-refactor-config-routing
+    **Date**: 2025-12-17
+
+    **Important**: These endpoints are primarily for internal monitoring
+    and diagnostics. Configuration modifications should use the
+    Configuration Management API (config-api).
+
+servers:
+  - url: http://127.0.0.1:56431/api/v1
+    description: Local development server
+  - url: http://0.0.0.0:56431/api/v1
+    description: Production server
+
+tags:
+  - name: Nacos Connection
+    description: Nacos server connection status and diagnostics
+  - name: Listener Management
+    description: Configuration listener status and control
+  - name: Synchronization
+    description: Configuration synchronization operations
+
+paths:
+  /nacos/health:
+    get:
+      tags:
+        - Nacos Connection
+      summary: Get Nacos connection health
+      description: |
+        Checks current Nacos server connection health status.
+
+        **Health Checks:**
+        - Network connectivity to Nacos server
+        - Authentication status
+        - Last heartbeat timestamp
+        - Response latency
+      operationId: getNacosHealth
+      responses:
+        '200':
+          description: Health check completed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NacosHealth'
+              examples:
+                healthy:
+                  $ref: '#/components/examples/HealthyExample'
+                unhealthy:
+                  $ref: '#/components/examples/UnhealthyExample'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /nacos/connection:
+    get:
+      tags:
+        - Nacos Connection
+      summary: Get Nacos connection details
+      description: |
+        Returns current Nacos server connection configuration and status.
+
+        **Returned Information:**
+        - Server host and port
+        - Namespace and group
+        - DataId being monitored
+        - Connection uptime
+      operationId: getNacosConnection
+      responses:
+        '200':
+          description: Connection details retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NacosConnection'
+              examples:
+                example1:
+                  $ref: '#/components/examples/ConnectionExample'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /nacos/listener/status:
+    get:
+      tags:
+        - Listener Management
+      summary: Get listener status
+      description: |
+        Returns current status of Nacos configuration change listener.
+
+        **Status Information:**
+        - Listener active/inactive state
+        - Last callback invocation time
+        - Total callbacks received
+        - Last configuration change details
+      operationId: getListenerStatus
+      responses:
+        '200':
+          description: Listener status retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListenerStatus'
+              examples:
+                active:
+                  $ref: '#/components/examples/ActiveListenerExample'
+                stopped:
+                  $ref: '#/components/examples/StoppedListenerExample'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /nacos/listener/start:
+    post:
+      tags:
+        - Listener Management
+      summary: Start Nacos listener
+      description: |
+        Manually starts the Nacos configuration change listener.
+
+        **Prerequisites:**
+        - Nacos connection healthy
+        - Listener not already running
+
+        **Effect:**
+        - Listener begins monitoring configuration changes
+        - Callbacks will be invoked on Nacos config updates
+        - auto_update flag determines if callbacks apply changes
+
+        **Note:** This does NOT change auto_update flag.
+        Use /config/routing/auto-update for that.
+      operationId: startListener
+      responses:
+        '200':
+          description: Listener started successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: success
+                  listener_active:
+                    type: boolean
+                    example: true
+                  started_at:
+                    type: string
+                    format: date-time
+                    example: "2025-12-17T10:50:00Z"
+        '400':
+          description: Listener already running
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Nacos connection error or internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /nacos/listener/stop:
+    post:
+      tags:
+        - Listener Management
+      summary: Stop Nacos listener
+      description: |
+        Manually stops the Nacos configuration change listener.
+
+        **Effect:**
+        - Listener stops monitoring configuration changes
+        - No callbacks will be invoked
+        - auto_update flag unchanged
+
+        **Use Case:** Temporarily pause monitoring without disabling auto_update
+      operationId: stopListener
+      responses:
+        '200':
+          description: Listener stopped successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: success
+                  listener_active:
+                    type: boolean
+                    example: false
+                  stopped_at:
+                    type: string
+                    format: date-time
+                    example: "2025-12-17T10:55:00Z"
+        '400':
+          description: Listener not running
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /nacos/sync/status:
+    get:
+      tags:
+        - Synchronization
+      summary: Get sync status
+      description: |
+        Returns current synchronization status between local and Nacos configuration.
+
+        **Comparison:**
+        - Local configuration version
+        - Nacos configuration version
+        - Last sync timestamp
+        - auto_update flag state
+        - Sync needed (version mismatch detection)
+      operationId: getSyncStatus
+      responses:
+        '200':
+          description: Sync status retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SyncStatus'
+              examples:
+                in_sync:
+                  $ref: '#/components/examples/InSyncExample'
+                out_of_sync:
+                  $ref: '#/components/examples/OutOfSyncExample'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /nacos/sync/manual:
+    post:
+      tags:
+        - Synchronization
+      summary: Trigger manual sync from Nacos
+      description: |
+        Manually fetches latest configuration from Nacos and updates local config.
+
+        **Behavior:**
+        1. Fetch latest config from Nacos
+        2. Overwrite local configuration
+        3. Update last_nacos_sync timestamp
+        4. Do NOT change auto_update flag
+
+        **Warning:** This will discard local unsaved modifications.
+
+        **Difference from /config/routing/auto-update:**
+        - This endpoint: One-time sync, auto_update unchanged
+        - auto-update endpoint: Enable auto_update + sync + resume listener
+      operationId: manualSync
+      responses:
+        '200':
+          description: Manual sync completed successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: success
+                  synced_at:
+                    type: string
+                    format: date-time
+                    example: "2025-12-17T11:00:00Z"
+                  version:
+                    type: integer
+                    example: 6
+                    description: New configuration version after sync
+                  changes_applied:
+                    type: boolean
+                    example: true
+                    description: Whether local config was actually changed
+        '500':
+          description: Nacos connection error or internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /nacos/config/compare:
+    get:
+      tags:
+        - Synchronization
+      summary: Compare local and Nacos configurations
+      description: |
+        Returns detailed comparison between current local configuration
+        and the configuration stored in Nacos.
+
+        **Comparison Details:**
+        - Version differences
+        - Rule count differences per set
+        - Settings differences
+        - Detailed diff (if requested)
+
+        **Use Case:** Debugging sync issues, verifying changes before manual sync
+      operationId: compareConfigs
+      parameters:
+        - name: include_diff
+          in: query
+          description: Include detailed field-by-field diff
+          required: false
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '200':
+          description: Comparison completed successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConfigComparison'
+              examples:
+                example1:
+                  $ref: '#/components/examples/ComparisonExample'
+        '500':
+          description: Nacos connection error or internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+components:
+  schemas:
+    NacosHealth:
+      type: object
+      properties:
+        healthy:
+          type: boolean
+          example: true
+          description: Overall health status
+        connected:
+          type: boolean
+          example: true
+          description: TCP connection established
+        authenticated:
+          type: boolean
+          example: true
+          description: Authentication successful
+        last_heartbeat:
+          type: string
+          format: date-time
+          example: "2025-12-17T10:59:55Z"
+          description: Last successful heartbeat
+        response_time_ms:
+          type: number
+          example: 12.5
+          description: Latest response latency
+        error_message:
+          type: string
+          example: null
+          description: Error message if unhealthy
+
+    NacosConnection:
+      type: object
+      properties:
+        server:
+          type: object
+          properties:
+            host:
+              type: string
+              example: "localhost"
+            port:
+              type: integer
+              example: 8848
+            url:
+              type: string
+              example: "http://localhost:8848"
+        config:
+          type: object
+          properties:
+            namespace:
+              type: string
+              example: ""
+              description: Nacos namespace (empty = default)
+            group:
+              type: string
+              example: "DEFAULT_GROUP"
+            data_id:
+              type: string
+              example: "routing-config"
+        status:
+          type: object
+          properties:
+            connected:
+              type: boolean
+              example: true
+            uptime_seconds:
+              type: integer
+              example: 7200
+              description: Connection uptime in seconds
+            established_at:
+              type: string
+              format: date-time
+              example: "2025-12-17T09:00:00Z"
+
+    ListenerStatus:
+      type: object
+      properties:
+        active:
+          type: boolean
+          example: true
+          description: Listener running status
+        started_at:
+          type: string
+          format: date-time
+          example: "2025-12-17T09:00:00Z"
+          description: Listener start time
+        last_callback:
+          type: string
+          format: date-time
+          example: "2025-12-17T10:30:00Z"
+          description: Last callback invocation time
+        total_callbacks:
+          type: integer
+          example: 5
+          description: Total callbacks received since startup
+        last_change:
+          type: object
+          description: Details of last configuration change
+          properties:
+            timestamp:
+              type: string
+              format: date-time
+              example: "2025-12-17T10:30:00Z"
+            version:
+              type: integer
+              example: 5
+            applied:
+              type: boolean
+              example: true
+              description: Whether change was applied (depends on auto_update)
+
+    SyncStatus:
+      type: object
+      properties:
+        auto_update_enabled:
+          type: boolean
+          example: true
+          description: Current auto_update flag state
+        local_version:
+          type: integer
+          example: 5
+          description: Local configuration version
+        nacos_version:
+          type: integer
+          example: 6
+          description: Nacos configuration version
+        in_sync:
+          type: boolean
+          example: false
+          description: Whether local and Nacos versions match
+        last_sync:
+          type: string
+          format: date-time
+          example: "2025-12-17T10:30:00Z"
+          description: Last successful sync timestamp
+        sync_needed:
+          type: boolean
+          example: true
+          description: Recommendation to sync (version mismatch detected)
+
+    ConfigComparison:
+      type: object
+      properties:
+        local_version:
+          type: integer
+          example: 5
+        nacos_version:
+          type: integer
+          example: 6
+        differences:
+          type: object
+          properties:
+            to_door_rules:
+              type: object
+              properties:
+                local_count:
+                  type: integer
+                  example: 2
+                nacos_count:
+                  type: integer
+                  example: 3
+                diff:
+                  type: integer
+                  example: 1
+                  description: Difference (nacos - local)
+            black_list_rules:
+              type: object
+              properties:
+                local_count:
+                  type: integer
+                  example: 0
+                nacos_count:
+                  type: integer
+                  example: 0
+                diff:
+                  type: integer
+                  example: 0
+            none_lane_rules:
+              type: object
+              properties:
+                local_count:
+                  type: integer
+                  example: 1
+                nacos_count:
+                  type: integer
+                  example: 1
+                diff:
+                  type: integer
+                  example: 0
+            settings:
+              type: object
+              properties:
+                local:
+                  type: object
+                  properties:
+                    none_lane_enabled:
+                      type: boolean
+                    door_enabled:
+                      type: boolean
+                    geoip_enabled:
+                      type: boolean
+                nacos:
+                  type: object
+                  properties:
+                    none_lane_enabled:
+                      type: boolean
+                    door_enabled:
+                      type: boolean
+                    geoip_enabled:
+                      type: boolean
+        detailed_diff:
+          type: array
+          description: Field-by-field diff (only if include_diff=true)
+          items:
+            type: object
+            properties:
+              path:
+                type: string
+                example: "to_door.rules[2]"
+              operation:
+                type: string
+                enum: [added, removed, modified]
+                example: added
+              local_value:
+                type: string
+              nacos_value:
+                type: string
+
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+          example: "Nacos connection failed"
+        code:
+          type: string
+          example: "NACOS_ERROR"
+        timestamp:
+          type: string
+          format: date-time
+          example: "2025-12-17T10:30:00Z"
+
+  examples:
+    HealthyExample:
+      summary: Healthy Nacos connection
+      value:
+        healthy: true
+        connected: true
+        authenticated: true
+        last_heartbeat: "2025-12-17T10:59:55Z"
+        response_time_ms: 12.5
+        error_message: null
+
+    UnhealthyExample:
+      summary: Unhealthy Nacos connection
+      value:
+        healthy: false
+        connected: false
+        authenticated: false
+        last_heartbeat: "2025-12-17T10:45:00Z"
+        response_time_ms: null
+        error_message: "Connection timeout after 5000ms"
+
+    ConnectionExample:
+      summary: Nacos connection details
+      value:
+        server:
+          host: "localhost"
+          port: 8848
+          url: "http://localhost:8848"
+        config:
+          namespace: ""
+          group: "DEFAULT_GROUP"
+          data_id: "routing-config"
+        status:
+          connected: true
+          uptime_seconds: 7200
+          established_at: "2025-12-17T09:00:00Z"
+
+    ActiveListenerExample:
+      summary: Active listener status
+      value:
+        active: true
+        started_at: "2025-12-17T09:00:00Z"
+        last_callback: "2025-12-17T10:30:00Z"
+        total_callbacks: 5
+        last_change:
+          timestamp: "2025-12-17T10:30:00Z"
+          version: 5
+          applied: true
+
+    StoppedListenerExample:
+      summary: Stopped listener status
+      value:
+        active: false
+        started_at: null
+        last_callback: "2025-12-17T10:30:00Z"
+        total_callbacks: 5
+        last_change:
+          timestamp: "2025-12-17T10:30:00Z"
+          version: 5
+          applied: false
+
+    InSyncExample:
+      summary: Local and Nacos in sync
+      value:
+        auto_update_enabled: true
+        local_version: 6
+        nacos_version: 6
+        in_sync: true
+        last_sync: "2025-12-17T10:30:00Z"
+        sync_needed: false
+
+    OutOfSyncExample:
+      summary: Local and Nacos out of sync
+      value:
+        auto_update_enabled: false
+        local_version: 5
+        nacos_version: 6
+        in_sync: false
+        last_sync: "2025-12-17T10:00:00Z"
+        sync_needed: true
+
+    ComparisonExample:
+      summary: Configuration comparison
+      value:
+        local_version: 5
+        nacos_version: 6
+        differences:
+          to_door_rules:
+            local_count: 2
+            nacos_count: 3
+            diff: 1
+          black_list_rules:
+            local_count: 0
+            nacos_count: 0
+            diff: 0
+          none_lane_rules:
+            local_count: 1
+            nacos_count: 1
+            diff: 0
+          settings:
+            local:
+              none_lane_enabled: true
+              door_enabled: true
+              geoip_enabled: false
+            nacos:
+              none_lane_enabled: true
+              door_enabled: true
+              geoip_enabled: true
+        detailed_diff:
+          - path: "to_door.rules[2]"
+            operation: "added"
+            local_value: null
+            nacos_value: '{"id":"rule_domain_1703002000","type":"domain","condition":"*.example.com","enabled":true}'
+          - path: "settings.geoip_enabled"
+            operation: "modified"
+            local_value: "false"
+            nacos_value: "true"
