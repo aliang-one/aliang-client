@@ -659,6 +659,7 @@ func collectClaudeVibeSessions(scanDirs []string) []models.AgentVibeSession {
 				SessionID    string `json:"sessionId"`
 				FirstPrompt  string `json:"firstPrompt"`
 				Summary      string `json:"summary"`
+				CustomTitle  string `json:"customTitle"`
 				MessageCount int    `json:"messageCount"`
 				Created      string `json:"created"`
 				Modified     string `json:"modified"`
@@ -687,8 +688,8 @@ func collectClaudeVibeSessions(scanDirs []string) []models.AgentVibeSession {
 				Provider:     "claude",
 				Tool:         "claude",
 				ProjectPath:  cleanAgentProjectPath(projectPath),
-				Title:        truncateAgentText(firstNonEmpty(entry.Summary, entry.FirstPrompt), 200),
-				Summary:      truncateAgentText(entry.Summary, 500),
+				Title:        truncateAgentText(firstNonEmpty(entry.CustomTitle, entry.Summary, entry.FirstPrompt), 200),
+				Summary:      truncateAgentText(firstNonEmpty(entry.Summary, entry.CustomTitle), 500),
 				Mode:         "vibe",
 				Status:       "closed",
 				MessageCount: entry.MessageCount,
@@ -711,13 +712,14 @@ func collectClaudeVibeSessions(scanDirs []string) []models.AgentVibeSession {
 		sessions = append(sessions, session)
 		seen[session.ID] = true
 	}
-	// Claude Code stores the conversation title the user set via /rename only in
-	// ~/.claude/sessions/<pid>.json ("name"), never in sessions-index.json or the
-	// *.jsonl transcripts. The pass above derives Title from summary/firstPrompt
-	// or the first user message, so without this overlay an explicitly renamed
-	// conversation surfaces an auto-derived (often command-preamble) title instead
-	// of the name the user chose. Rename names win outright — /rename is an
-	// explicit override of the auto title.
+	// Claude Code persists the conversation title the user set via /rename in two
+	// places: sessions-index.json entries ("customTitle", durable — observed
+	// retaining months-old renames, but only written for projects Claude Code has
+	// indexed) and ~/.claude/sessions/<pid>.json ("name", retained only for
+	// recent/active processes). The index pass above already prefers customTitle
+	// over summary/firstPrompt; this overlay runs last so the freshest rename of
+	// a live process still wins, and renamed conversations in projects without a
+	// sessions-index.json keep working.
 	applyClaudeRenameNames(sessions, loadClaudeRenameNames(home))
 	return sessions
 }
@@ -725,9 +727,10 @@ func collectClaudeVibeSessions(scanDirs []string) []models.AgentVibeSession {
 // loadClaudeRenameNames reads ~/.claude/sessions/*.json and returns a map from
 // native Claude Code sessionId to the conversation title the user set via
 // /rename (the "name" field of each per-process session record). Files are
-// named by PID and are only retained for recent/active processes, so rename
-// names naturally only overlay onto recent conversations — historical ones
-// keep falling back to the auto-derived title.
+// named by PID and are only retained for recent/active processes, so this
+// overlay covers the freshest renames; historical renamed conversations are
+// covered by the durable "customTitle" in sessions-index.json, which the index
+// pass already prefers over summary/firstPrompt.
 func loadClaudeRenameNames(home string) map[string]string {
 	out := map[string]string{}
 	if home = strings.TrimSpace(home); home == "" {

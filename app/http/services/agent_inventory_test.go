@@ -47,9 +47,10 @@ func TestIsSafeAgentProjectPath(t *testing.T) {
 }
 
 // TestCollectClaudeVibeSessionsAppliesRenameName verifies that the conversation
-// title the user set via Claude Code's /rename — stored only in
+// title the user set via Claude Code's /rename — the per-process record in
 // ~/.claude/sessions/<pid>.json — overrides the transcript-derived title for a
-// detected local Claude Code conversation.
+// detected local Claude Code conversation (this fixture has no
+// sessions-index.json, so the pid record is the only rename source).
 func TestCollectClaudeVibeSessionsAppliesRenameName(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -71,7 +72,7 @@ func TestCollectClaudeVibeSessionsAppliesRenameName(t *testing.T) {
 		`","sessionId":"` + sid + `","gitBranch":"main","message":{"role":"user","content":[{"type":"text","text":"<local-command-caveat>junk preamble that should not be the title</local-command-caveat>"}]}}` + "\n"
 	require.NoError(t, os.WriteFile(filepath.Join(claudeDir, sid+".jsonl"), []byte(transcript), 0o600))
 
-	// The /rename title lives ONLY in ~/.claude/sessions/<pid>.json.
+	// No sessions-index.json in this fixture — the pid record is the rename source.
 	require.NoError(t, os.MkdirAll(filepath.Join(home, ".claude", "sessions"), 0o700))
 	renameRecord := `{"pid":12345,"sessionId":"` + sid + `","cwd":"` + projectPath +
 		`","name":"我的重命名标题","status":"idle"}`
@@ -124,4 +125,95 @@ func TestCollectClaudeVibeSessionsKeepsDerivedTitleWithoutRename(t *testing.T) {
 	}
 	require.NotNil(t, found, "claude session %q was not collected", "claude_"+sid)
 	assert.Equal(t, "Fix the login bug", found.Title, "title should fall back to first user message when no rename name exists")
+}
+
+// TestCollectClaudeVibeSessionsPrefersIndexCustomTitle verifies that the
+// durable "customTitle" Claude Code writes into sessions-index.json (the
+// /rename title) wins over the auto-derived summary and firstPrompt, while
+// entries without customTitle keep the derived title.
+func TestCollectClaudeVibeSessionsPrefersIndexCustomTitle(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	cache.ResetCacheDirForTest()
+
+	projectPath := filepath.Join(home, "work", "indexed-project")
+	require.NoError(t, os.MkdirAll(projectPath, 0o700))
+
+	// Claude Code encodes the cwd into the projects dir name: "/" -> "-", leading "-".
+	encodedCwd := "-" + strings.ReplaceAll(strings.Trim(projectPath, string(filepath.Separator)), string(filepath.Separator), "-")
+	claudeDir := filepath.Join(home, ".claude", "projects", encodedCwd)
+	require.NoError(t, os.MkdirAll(claudeDir, 0o700))
+
+	const renamedSID = "claude-index-renamed-sid"
+	const derivedSID = "claude-index-derived-sid"
+	indexJSON := `{"version":1,"originalPath":"` + projectPath + `","entries":[` +
+		`{"sessionId":"` + renamedSID + `","fullPath":"` + filepath.Join(claudeDir, renamedSID+".jsonl") +
+		`","firstPrompt":"command preamble junk","summary":"Auto summary text","customTitle":"索引里的重命名",` +
+		`"messageCount":5,"created":"2026-06-18T00:00:00Z","modified":"2026-06-19T00:00:00Z","gitBranch":"main",` +
+		`"projectPath":"` + projectPath + `","isSidechain":false},` +
+		`{"sessionId":"` + derivedSID + `","fullPath":"` + filepath.Join(claudeDir, derivedSID+".jsonl") +
+		`","firstPrompt":"Fallback first prompt","summary":"",` +
+		`"messageCount":2,"created":"2026-06-18T00:00:00Z","modified":"2026-06-19T00:00:00Z","gitBranch":"main",` +
+		`"projectPath":"` + projectPath + `","isSidechain":false}]}`
+
+	require.NoError(t, os.WriteFile(filepath.Join(claudeDir, "sessions-index.json"), []byte(indexJSON), 0o600))
+
+	sessions := collectClaudeVibeSessions(nil)
+	byID := make(map[string]models.AgentVibeSession, len(sessions))
+	for _, session := range sessions {
+		byID[session.ID] = session
+	}
+
+	renamed, ok := byID["claude_"+renamedSID]
+	require.True(t, ok, "renamed claude session %q was not collected", "claude_"+renamedSID)
+	assert.Equal(t, "索引里的重命名", renamed.Title, "customTitle must beat summary/firstPrompt")
+	assert.Equal(t, "Auto summary text", renamed.Summary, "auto summary is preserved when present")
+
+	derived, ok := byID["claude_"+derivedSID]
+	require.True(t, ok, "derived claude session %q was not collected", "claude_"+derivedSID)
+	assert.Equal(t, "Fallback first prompt", derived.Title, "entries without customTitle keep the derived title")
+}
+
+// TestCollectClaudeVibeSessionsRenamePidRecordBeatsIndexCustomTitle verifies
+// precedence between the two /rename storage sites: the per-process record in
+// ~/.claude/sessions/<pid>.json reflects the newest rename of a live process
+// and must override the (possibly stale) customTitle from sessions-index.json.
+func TestCollectClaudeVibeSessionsRenamePidRecordBeatsIndexCustomTitle(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	cache.ResetCacheDirForTest()
+
+	projectPath := filepath.Join(home, "work", "stale-index-project")
+	require.NoError(t, os.MkdirAll(projectPath, 0o700))
+
+	encodedCwd := "-" + strings.ReplaceAll(strings.Trim(projectPath, string(filepath.Separator)), string(filepath.Separator), "-")
+	claudeDir := filepath.Join(home, ".claude", "projects", encodedCwd)
+	require.NoError(t, os.MkdirAll(claudeDir, 0o700))
+
+	const sid = "claude-stale-index-sid"
+	indexJSON := `{"version":1,"originalPath":"` + projectPath + `","entries":[` +
+		`{"sessionId":"` + sid + `","fullPath":"` + filepath.Join(claudeDir, sid+".jsonl") +
+		`","firstPrompt":"command preamble junk","summary":"","customTitle":"索引里的旧名字",` +
+		`"messageCount":5,"created":"2026-06-18T00:00:00Z","modified":"2026-06-19T00:00:00Z","gitBranch":"main",` +
+		`"projectPath":"` + projectPath + `","isSidechain":false}]}`
+	require.NoError(t, os.WriteFile(filepath.Join(claudeDir, "sessions-index.json"), []byte(indexJSON), 0o600))
+
+	require.NoError(t, os.MkdirAll(filepath.Join(home, ".claude", "sessions"), 0o700))
+	renameRecord := `{"pid":23456,"sessionId":"` + sid + `","cwd":"` + projectPath +
+		`","name":"进程里的新名字","status":"idle"}`
+	require.NoError(t, os.WriteFile(filepath.Join(home, ".claude", "sessions", "23456.json"), []byte(renameRecord), 0o600))
+
+	sessions := collectClaudeVibeSessions(nil)
+
+	var found *models.AgentVibeSession
+	for i := range sessions {
+		if sessions[i].ID == "claude_"+sid {
+			found = &sessions[i]
+			break
+		}
+	}
+	require.NotNil(t, found, "claude session %q was not collected", "claude_"+sid)
+	assert.Equal(t, "进程里的新名字", found.Title, "live pid rename must beat the index customTitle")
 }
