@@ -10,11 +10,16 @@ import (
 	"aliang.one/nursorgate/app/agentruntime"
 	httpServer "aliang.one/nursorgate/app/http"
 	"aliang.one/nursorgate/app/http/services"
+	"aliang.one/nursorgate/common/desktop"
 	"aliang.one/nursorgate/common/logger"
 	"aliang.one/nursorgate/common/version"
 	startupRuntime "aliang.one/nursorgate/processor/runtime"
 	"github.com/getlantern/systray"
 )
+
+// startProxyMenuTooltip is the Start item's normal (clickable) tooltip; it is
+// swapped for the login-gate message while the session blocks starting.
+const startProxyMenuTooltip = "Start the selected Deep Mode or Regular Mode proxy listener"
 
 // TrayApp manages the system tray application
 type TrayApp struct {
@@ -74,7 +79,7 @@ func onReady() {
 
 	systray.AddSeparator()
 
-	mStart := systray.AddMenuItem("Start Proxy", "Start the selected Deep Mode or Regular Mode proxy listener")
+	mStart := systray.AddMenuItem("Start Proxy", startProxyMenuTooltip)
 	mStop := systray.AddMenuItem("Stop Proxy", "Stop the active Deep Mode or Regular Mode proxy listener")
 	mStop.Disable()
 	mRestart := systray.AddMenuItem("Restart Proxy", "Restart the active Deep Mode or Regular Mode proxy listener")
@@ -192,7 +197,9 @@ func (t *TrayApp) startProxy() {
 	result := t.runService.StartService()
 	status := trayResultString(result, "status")
 	if status == "failed" {
-		logger.Error(fmt.Sprintf("Failed to start proxy from tray: %s", trayResultMessage(result)))
+		msg := trayResultMessage(result)
+		logger.Error(fmt.Sprintf("Failed to start proxy from tray: %s", msg))
+		notifyStartBlocked(result, msg)
 		t.syncProxyState()
 		return
 	}
@@ -385,18 +392,34 @@ func (t *TrayApp) syncProxyState() {
 	modeLabel := trayModeDisplayName(mode)
 	description := trayResultString(status, "status")
 
+	// 登录门槛：会话非 Active（未登录/恢复中/已失效）时提前禁用 Start，而不是
+	// 等用户点击后在 StartService 里失败。桌面通知兜底见 notifyStartBlocked。
+	var blockCode, blockMsg string
+	if !running {
+		blockCode, blockMsg = services.ProxyStartBlockedReason()
+	}
+
 	t.isRunning = running
 	t.syncModeMenu(mode)
 
 	if t.mProxyStatus != nil {
-		t.mProxyStatus.SetTitle(trayProxyStatusTitle(mode, running, description))
+		if title := trayStartBlockedStatusTitle(blockCode); title != "" {
+			t.mProxyStatus.SetTitle(title)
+		} else {
+			t.mProxyStatus.SetTitle(trayProxyStatusTitle(mode, running, description))
+		}
 	}
 
 	if t.mStart != nil {
-		if running {
+		switch {
+		case running:
 			t.mStart.Disable()
-		} else {
+		case blockMsg != "":
+			t.mStart.Disable()
+			t.mStart.SetTooltip(blockMsg)
+		default:
 			t.mStart.Enable()
+			t.mStart.SetTooltip(startProxyMenuTooltip)
 		}
 	}
 	if t.mStop != nil {
@@ -438,6 +461,32 @@ func trayResultString(result map[string]interface{}, key string) string {
 	}
 	value, _ := result[key].(string)
 	return value
+}
+
+// notifyStartBlocked surfaces login-gated start failures as a desktop
+// notification. syncProxyState normally disables the Start item before a click
+// can land; this covers the window before the next 2s sync tick (or a session
+// flip while the menu was open) so the user always learns why nothing started.
+func notifyStartBlocked(result map[string]interface{}, msg string) {
+	switch trayResultString(result, "error") {
+	case "session_invalid", "session_recovering", "activation_required":
+		desktop.Notify("aliang-gateway", msg)
+	}
+}
+
+// trayStartBlockedStatusTitle returns the Status menu title shown while the
+// login gate blocks the Start item, or "" when starting is permitted. macOS
+// tray menus ignore per-item tooltips, so this always-visible line is the
+// primary "需要登录" hint; the item tooltip carries it on Windows/Linux.
+func trayStartBlockedStatusTitle(blockCode string) string {
+	switch blockCode {
+	case "session_invalid":
+		return "Status: 未登录，请先打开 Dashboard 登录"
+	case "session_recovering":
+		return "Status: 登录恢复中，暂不能启动代理"
+	default:
+		return ""
+	}
 }
 
 func trayResultMessage(result map[string]interface{}) string {

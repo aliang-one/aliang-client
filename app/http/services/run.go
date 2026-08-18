@@ -269,6 +269,21 @@ func proxySessionStartFailure() map[string]interface{} {
 	}
 }
 
+// ProxyStartBlockedReason reports whether the current login/session state blocks
+// starting the proxy — the same gate StartService enforces on click. It returns
+// ("", "") when a start is permitted; otherwise the error code
+// ("session_invalid" / "session_recovering") plus the user-facing message.
+// The tray consults this to disable its Start item before a click can land.
+func ProxyStartBlockedReason() (string, string) {
+	result := proxySessionStartFailure()
+	if result == nil {
+		return "", ""
+	}
+	code, _ := result["error"].(string)
+	msg, _ := result["msg"].(string)
+	return code, msg
+}
+
 // startTUN handles TUN mode startup
 func (rs *RunService) startTUN() map[string]interface{} {
 	res := tunStartRunner()
