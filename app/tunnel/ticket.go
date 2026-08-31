@@ -13,6 +13,12 @@ import (
 const (
 	routeTicketIssuer   = "aliang-tunnel-gateway"
 	routeTicketAudience = "alianggate"
+	// routeTicketLeeway absorbs gateway↔agent clock skew. Tickets are minted
+	// per request with a short TTL; agent laptops commonly drift tens of
+	// seconds, and a rejected ticket only surfaces as opaque 401s, so prefer
+	// availability here. The residual replay window stays tiny because the
+	// attacker must already sit on the piko request path.
+	routeTicketLeeway = 30 * time.Second
 )
 
 type routeClaims struct {
@@ -50,7 +56,7 @@ func (v *routeVerifier) verify(raw string) (*routeClaims, error) {
 		jwt.WithIssuer(routeTicketIssuer),
 		jwt.WithAudience(routeTicketAudience),
 		jwt.WithExpirationRequired(),
-		jwt.WithLeeway(2*time.Second),
+		jwt.WithLeeway(routeTicketLeeway),
 	)
 	if err != nil || !token.Valid {
 		return nil, fmt.Errorf("verify route ticket: %w", err)

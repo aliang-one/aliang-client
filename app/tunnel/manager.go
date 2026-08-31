@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -22,6 +23,11 @@ type Config struct {
 	TunnelToken     string
 	RoutePublicKey  string
 	ExpiresAt       time.Time
+	// AllowPrivateTargets permits mapping RFC1918 hosts on the agent's LAN
+	// (NAS, router, printers) in addition to loopback. Loopback is always
+	// allowed. The server controls this via tunnel.configure
+	// allow_private_targets; defaults to true for backwards compatibility.
+	AllowPrivateTargets bool
 }
 
 type Status struct {
@@ -35,6 +41,10 @@ type runConfig struct {
 	pikoUpstreamURL *url.URL
 	tunnelToken     string
 	handler         http.Handler
+	// onState receives mid-session state transitions surfaced from the piko
+	// client (e.g. "reconnecting" while a dropped session retries). Nil for
+	// runners that do not support it.
+	onState func(state string)
 }
 
 type runFunc func(context.Context, runConfig, func()) error
@@ -178,6 +188,9 @@ func (m *Manager) WaitConnected(ctx context.Context, deviceID string) (Status, e
 
 func (m *Manager) runGeneration(ctx context.Context, done chan struct{}, generation uint64, config runConfig) {
 	defer close(done)
+	config.onState = func(state string) {
+		m.updateGeneration(generation, state, "")
+	}
 	err := m.run(ctx, config, func() {
 		m.updateGeneration(generation, "connected", "")
 	})
@@ -239,16 +252,22 @@ func validateConfig(config Config) (runConfig, [sha256.Size]byte, error) {
 	if err != nil {
 		return runConfig{}, [sha256.Size]byte{}, err
 	}
-	handler, err := newHandler(config.DeviceID, verifier)
+	handler, err := newHandler(config.DeviceID, verifier, config.AllowPrivateTargets)
 	if err != nil {
 		return runConfig{}, [sha256.Size]byte{}, err
 	}
+	// The fingerprint includes the token and expiry, so every renewal
+	// reconfigures the session. This drops in-flight streams once per renewal:
+	// piko reads Upstream.Token only at dial time and offers no token
+	// hot-swap, so keeping the session across renewals would let it reconnect
+	// with the stale token and die on the next flap (401 is non-retryable).
 	fingerprint := sha256.Sum256([]byte(strings.Join([]string{
 		config.DeviceID,
 		parsedURL.String(),
 		config.TunnelToken,
 		config.RoutePublicKey,
 		config.ExpiresAt.UTC().Format(time.RFC3339Nano),
+		strconv.FormatBool(config.AllowPrivateTargets),
 	}, "\x00")))
 	return runConfig{
 		deviceID:        config.DeviceID,
@@ -266,8 +285,21 @@ func isLoopbackHost(host string) bool {
 	return err == nil && addr.IsLoopback()
 }
 
+// pikoMaxStreamWindow raises the yamux receive window from piko's 256KiB
+// default. A single tunnelled stream can only have one window in flight, so
+// on high-RTT paths (e.g. cross-region 100ms) 256KiB caps throughput around
+// 20Mbit/s; 4MiB keeps ordinary LAN-to-VPS transfers far from that ceiling.
+const pikoMaxStreamWindow = 4 << 20 // 4MiB
+
 func runTunnel(ctx context.Context, config runConfig, ready func()) error {
-	upstream := &client.Upstream{URL: config.pikoUpstreamURL, Token: config.tunnelToken}
+	upstream := &client.Upstream{
+		URL:           config.pikoUpstreamURL,
+		Token:         config.tunnelToken,
+		MaxWindowSize: pikoMaxStreamWindow,
+	}
+	if config.onState != nil {
+		upstream.Logger = newPikoStateLogger(config.onState)
+	}
 	listener, err := upstream.Listen(ctx, config.deviceID)
 	if err != nil {
 		return fmt.Errorf("connect Piko upstream: %w", err)

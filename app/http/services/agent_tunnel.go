@@ -34,18 +34,21 @@ func (s *AgentService) configureTunnel(msg map[string]interface{}, writeJSON fun
 	}
 
 	status, changed, err := s.tunnel.Configure(tunnel.Config{
-		DeviceID:        deviceID,
-		PikoUpstreamURL: remoteString(msg, "piko_upstream_url"),
-		TunnelToken:     remoteString(msg, "tunnel_token"),
-		RoutePublicKey:  remoteString(msg, "route_public_key"),
-		ExpiresAt:       expiresAt,
+		DeviceID:            deviceID,
+		PikoUpstreamURL:     remoteString(msg, "piko_upstream_url"),
+		TunnelToken:         remoteString(msg, "tunnel_token"),
+		RoutePublicKey:      remoteString(msg, "route_public_key"),
+		ExpiresAt:           expiresAt,
+		AllowPrivateTargets: remoteBool(msg, "allow_private_targets", true),
 	})
 	if err != nil {
 		emitTunnelConfigureError(writeJSON, requestID, err)
 		return
 	}
 	if status.State != "connected" {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		// 30s: the WSS handshake traverses the public entry chain (VPS nginx →
+		// frps → ingress → piko); slow office networks can exceed 10s.
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		status, err = s.tunnel.WaitConnected(ctx, deviceID)
 		if err != nil {

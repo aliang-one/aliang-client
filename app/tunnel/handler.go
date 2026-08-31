@@ -11,21 +11,23 @@ import (
 )
 
 type handler struct {
-	deviceID  string
-	verifier  *routeVerifier
-	transport *http.Transport
+	deviceID     string
+	verifier     *routeVerifier
+	allowPrivate bool
+	transport    *http.Transport
 }
 
-func newHandler(deviceID string, verifier *routeVerifier) (*handler, error) {
+func newHandler(deviceID string, verifier *routeVerifier, allowPrivate bool) (*handler, error) {
 	if strings.TrimSpace(deviceID) == "" || verifier == nil {
 		return nil, errors.New("device ID and route verifier are required")
 	}
 	return &handler{
-		deviceID: deviceID,
-		verifier: verifier,
+		deviceID:     deviceID,
+		verifier:     verifier,
+		allowPrivate: allowPrivate,
 		transport: &http.Transport{
 			Proxy:                 nil,
-			DialContext:           secureDialContext(10 * time.Second),
+			DialContext:           secureDialContext(10*time.Second, allowPrivate),
 			ForceAttemptHTTP2:     false,
 			MaxIdleConns:          32,
 			MaxIdleConnsPerHost:   8,
@@ -59,7 +61,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeTunnelError(w, http.StatusBadRequest, "unsupported route policy")
 		return
 	}
-	if err := validateTarget(claims.TargetHost, claims.TargetPort); err != nil {
+	if err := validateTarget(claims.TargetHost, claims.TargetPort, h.allowPrivate); err != nil {
 		writeTunnelError(w, http.StatusForbidden, "target rejected")
 		return
 	}

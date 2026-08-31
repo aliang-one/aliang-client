@@ -253,7 +253,7 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				{Type: AgentEventGoalPlanAIResponse, Required: []string{"type", "request_id", "goal_id", "planning_attempt_id", "ai_session_id", "response"}, Emits: []string{AgentEventGoalPlanResult, AgentEventGoalPlanError}},
 				{Type: AgentEventGoalPlanAIError, Required: []string{"type", "request_id", "error"}, Emits: []string{AgentEventGoalPlanError}},
 				{Type: AgentEventGoalVerify, Required: []string{"type", "request_id", "goal_id", "verification_batch_id", "project_path", "checks"}, Emits: []string{AgentEventGoalVerifyResult, AgentEventGoalVerifyError}},
-				{Type: AgentEventTunnelConfigure, Required: []string{"type", "request_id", "device_id", "piko_upstream_url", "tunnel_token", "route_public_key", "expires_at"}, Emits: []string{AgentEventTunnelConfigured, AgentEventTunnelStatus, AgentEventTunnelError}},
+				{Type: AgentEventTunnelConfigure, Required: []string{"type", "request_id", "device_id", "piko_upstream_url", "tunnel_token", "route_public_key", "expires_at"}, Optional: []string{"allow_private_targets"}, Emits: []string{AgentEventTunnelConfigured, AgentEventTunnelStatus, AgentEventTunnelError}},
 				{Type: AgentEventAIOptionCancelled, Required: []string{"type", "session_id"}, Optional: []string{"option_ids", "reason"}},
 			},
 		},

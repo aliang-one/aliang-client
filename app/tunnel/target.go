@@ -17,7 +17,7 @@ var (
 	private192 = netip.MustParsePrefix("192.168.0.0/16")
 )
 
-func validateTarget(host string, port int) error {
+func validateTarget(host string, port int, allowPrivate bool) error {
 	host = strings.TrimSpace(host)
 	if host == "" {
 		return errors.New("target host is required")
@@ -37,6 +37,9 @@ func validateTarget(host string, port int) error {
 	if addr.IsLoopback() {
 		return nil
 	}
+	if !allowPrivate {
+		return errors.New("private network targets are disabled for this tunnel")
+	}
 	if addr.Is4() && (private10.Contains(addr) || private172.Contains(addr) || private192.Contains(addr)) {
 		return nil
 	}
@@ -47,7 +50,7 @@ func targetAddress(host string, port int) string {
 	return net.JoinHostPort(strings.TrimSpace(host), strconv.Itoa(port))
 }
 
-func secureDialContext(timeout time.Duration) func(context.Context, string, string) (net.Conn, error) {
+func secureDialContext(timeout time.Duration, allowPrivate bool) func(context.Context, string, string) (net.Conn, error) {
 	dialer := &net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}
 	return func(ctx context.Context, network, address string) (net.Conn, error) {
 		host, rawPort, err := net.SplitHostPort(address)
@@ -58,7 +61,7 @@ func secureDialContext(timeout time.Duration) func(context.Context, string, stri
 		if err != nil {
 			return nil, errors.New("invalid target port")
 		}
-		if err := validateTarget(host, port); err != nil {
+		if err := validateTarget(host, port, allowPrivate); err != nil {
 			return nil, err
 		}
 

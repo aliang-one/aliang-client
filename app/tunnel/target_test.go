@@ -24,9 +24,33 @@ func TestValidateTarget(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := validateTarget(tt.host, tt.port)
+			err := validateTarget(tt.host, tt.port, true)
 			if (err == nil) != tt.ok {
-				t.Fatalf("validateTarget(%q, %d) error = %v, want ok=%t", tt.host, tt.port, err, tt.ok)
+				t.Fatalf("validateTarget(%q, %d, true) error = %v, want ok=%t", tt.host, tt.port, err, tt.ok)
+			}
+		})
+	}
+}
+
+func TestValidateTargetPrivateDisabled(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		host string
+		port int
+		ok   bool
+	}{
+		{name: "loopback still allowed", host: "127.0.0.1", port: 8080, ok: true},
+		{name: "localhost still allowed", host: "localhost", port: 8080, ok: true},
+		{name: "private 10 rejected", host: "10.2.3.4", port: 443},
+		{name: "private 172 rejected", host: "172.16.10.3", port: 6379},
+		{name: "private 192 rejected", host: "192.168.1.8", port: 5000},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateTarget(tt.host, tt.port, false)
+			if (err == nil) != tt.ok {
+				t.Fatalf("validateTarget(%q, %d, false) error = %v, want ok=%t", tt.host, tt.port, err, tt.ok)
 			}
 		})
 	}
