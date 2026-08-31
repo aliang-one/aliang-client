@@ -666,10 +666,63 @@ func cloneAgentAIClaudeRemotePolicy(policy agentAIClaudeRemotePolicy) agentAICla
 	return policy
 }
 
-// applyClaudeTierVersionGuard downgrades non-isolated tiers on claude < 2.2
-// (spec §3 guard). Placeholder in this task; replaced in the guard task.
+type claudeCodeVersionProbe struct {
+	version claudeCodeVersion
+	ok      bool
+}
+
+var claudeCodeVersionProbeCache sync.Map
+
+// probeClaudeCodeVersion returns the parsed version of the claude executable,
+// cached per executable content. ok=false when the probe fails (missing or
+// non-claude binary) — callers treat that as fail-closed.
+func probeClaudeCodeVersion(toolPath string) (claudeCodeVersion, bool) {
+	toolPath = strings.TrimSpace(toolPath)
+	if toolPath == "" {
+		return claudeCodeVersion{}, false
+	}
+	cacheKey := executableProbeCacheKey(toolPath)
+	if cached, ok := claudeCodeVersionProbeCache.Load(cacheKey); ok {
+		probe, _ := cached.(claudeCodeVersionProbe)
+		return probe.version, probe.ok
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	out, err := newBackgroundCommandContext(ctx, toolPath, "--version").CombinedOutput()
+	version, ok := parseClaudeCodeVersion(string(out))
+	if err != nil || !ok {
+		claudeCodeVersionProbeCache.Store(cacheKey, claudeCodeVersionProbe{})
+		return claudeCodeVersion{}, false
+	}
+	claudeCodeVersionProbeCache.Store(cacheKey, claudeCodeVersionProbe{version: version, ok: true})
+	return version, true
+}
+
+// applyClaudeTierVersionGuard downgrades non-isolated tiers to isolated when
+// the installed claude predates 2.2.0: 2.1.x never fires PermissionRequest in
+// headless --print mode and user ask rules suppress PreToolUse approvals, so
+// loading user/project settings there would break the approval bridge
+// (spec §3 guard). The downgrade is tier-wide: sources back to "", no plugin.
+// Note: a full-tier policy downgraded here keeps its (intentionally empty)
+// ask list — the <2.2 PreToolUse strategy never injects permissions.ask, so
+// behavior matches legacy isolated runs without refilling the default list.
 func applyClaudeTierVersionGuard(tool *agentAITool, policy agentAIClaudeRemotePolicy) agentAIClaudeRemotePolicy {
-	return policy
+	if !policy.enabled || policy.trustTier == "" || policy.trustTier == "isolated" {
+		return policy
+	}
+	version, ok := probeClaudeCodeVersion(tool.path)
+	if ok && version.atLeast(2, 2, 0) {
+		return policy
+	}
+	logger.Warn(fmt.Sprintf("claude-policy: %s predates 2.2.0, downgrading trust tier %s to isolated", tool.path, policy.trustTier))
+	downgraded := policy
+	downgraded.trustTier = "isolated"
+	downgraded.policyNotice = map[string]interface{}{
+		"effective": "isolated",
+		"requested": policy.trustTier,
+		"reason":    "claude_version_below_2_2",
+	}
+	return downgraded
 }
 
 func normalizeClaudeCapabilityName(name string) string {
@@ -4692,7 +4745,7 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 		return agentAIRunDone
 	}
 
-	_ = writeJSON(map[string]interface{}{
+	started := map[string]interface{}{
 		"type":         models.AgentEventAIRunStarted,
 		"session_id":   run.sessionID,
 		"message_id":   agentAssistantMessageID(run.messageID),
@@ -4700,7 +4753,11 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 		"mode":         run.mode,
 		"project_path": run.projectPath,
 		"state":        "running",
-	})
+	}
+	if effectiveRun.claudePolicy.policyNotice != nil {
+		started["policy_notice"] = effectiveRun.claudePolicy.policyNotice
+	}
+	_ = writeJSON(started)
 
 	var wg sync.WaitGroup
 	var outMu sync.Mutex
