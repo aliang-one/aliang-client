@@ -653,6 +653,53 @@ func TestSanitizeDegradeEndsIsolatedAfterApprovalHook(t *testing.T) {
 	}
 }
 
+func TestClaudeRemotePolicyProjectMCPSurvivesComposition(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	project := t.TempDir()
+	if err := os.WriteFile(filepath.Join(project, ".mcp.json"), []byte(`{"mcpServers":{"p-only":{"command":"project-only"}}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run := agentAIRun{sessionID: "s-mcp", messageID: "m-mcp", approvalToken: "token", projectPath: project,
+		claudePolicy: parseAgentAIClaudeRemotePolicy(map[string]interface{}{"claude_remote_policy": map[string]interface{}{"trust_level": "sanitized", "project_mcp_trusted": true}})}
+	tool, cleanup, notice := withClaudeRemotePolicy(&agentAITool{args: []string{"--print", "prompt"}}, run)
+	if notice != nil {
+		t.Fatalf("unexpected notice: %v", notice)
+	}
+	pluginDir := argumentValue(tool.args, "--plugin-dir")
+	mcpConfig := argumentValue(tool.args, "--mcp-config")
+	if pluginDir == "" || mcpConfig == "" {
+		t.Fatalf("missing plugin/mcp flags: %v", tool.args)
+	}
+	if argumentValue(tool.args, "--strict-mcp-config") == "" && !agentAIStringSliceContains(tool.args, "--strict-mcp-config") {
+		t.Fatalf("missing --strict-mcp-config: %v", tool.args)
+	}
+	// Both artifacts must exist before cleanup and be gone after.
+	if _, err := os.Stat(pluginDir); err != nil {
+		t.Fatalf("plugin dir missing: %v", err)
+	}
+	if _, err := os.Stat(mcpConfig); err != nil {
+		t.Fatalf("mcp config missing: %v", err)
+	}
+	run.claudePolicy = applyClaudePolicyNotice(run.claudePolicy, notice)
+	tool = withClaudeApprovalHook(tool, run)
+	// Flags must survive the approval hook.
+	if argumentValue(tool.args, "--mcp-config") == "" || !agentAIStringSliceContains(tool.args, "--strict-mcp-config") {
+		t.Fatalf("mcp flags lost after hook: %v", tool.args)
+	}
+	if argumentValue(tool.args, "--setting-sources") != "user" {
+		t.Fatalf("sanitized sources = %q, want user", argumentValue(tool.args, "--setting-sources"))
+	}
+	cleanup()
+	if _, err := os.Stat(pluginDir); !os.IsNotExist(err) {
+		t.Fatalf("plugin dir not removed: %v", err)
+	}
+	if _, err := os.Stat(mcpConfig); !os.IsNotExist(err) {
+		t.Fatalf("mcp config not removed: %v", err)
+	}
+}
+
 func TestClaudeTierMCPArgsMergesUserAndProjectServers(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -722,6 +769,25 @@ func TestClaudeTierMCPArgsInactive(t *testing.T) {
 	defer cleanup2()
 	if err2 != nil || flags2 != nil {
 		t.Fatalf("empty project mcp must be a no-op: flags=%v err=%v", flags2, err2)
+	}
+}
+
+func TestClaudeTierMCPArgsCollisionOnlyProjectIsNoop(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	if err := os.WriteFile(filepath.Join(home, ".claude.json"), []byte(`{"mcpServers":{"shared":{"command":"user-cmd"}}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	project := t.TempDir()
+	if err := os.WriteFile(filepath.Join(project, ".mcp.json"), []byte(`{"mcpServers":{"shared":{"command":"project-cmd"}}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	policy := parseAgentAIClaudeRemotePolicy(map[string]interface{}{"claude_remote_policy": map[string]interface{}{"trust_level": "sanitized", "project_mcp_trusted": true}})
+	flags, cleanup, err := claudeTierMCPArgs(policy, project)
+	defer cleanup()
+	if err != nil || flags != nil {
+		t.Fatalf("collision-only project must be a no-op: flags=%v err=%v", flags, err)
 	}
 }
 

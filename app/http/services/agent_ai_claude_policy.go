@@ -102,37 +102,37 @@ func withClaudeRemotePolicy(tool *agentAITool, run agentAIRun) (*agentAITool, fu
 // — when the project contributes no servers. Callers invoke the returned
 // cleanup only on success; on error the implementation has already released
 // everything it created.
+// Note: a project .mcp.json that only redefines names already present in
+// user scope contributes no new names, so no merge happens and the
+// user-scope definitions win (direction: load fewer, never more).
 func claudeTierMCPArgs(policy agentAIClaudeRemotePolicy, projectPath string) ([]string, func(), error) {
 	if !policy.projectMCPTrusted {
 		return nil, func() {}, nil
 	}
 	merged := map[string]interface{}{}
-	projectCount := 0
-	if home := agentHome(); home != "" {
-		if raw, err := os.ReadFile(filepath.Join(home, ".claude.json")); err == nil {
-			var parsed struct {
-				MCPServers map[string]interface{} `json:"mcpServers"`
-			}
-			if json.Unmarshal(raw, &parsed) == nil {
-				for name, server := range parsed.MCPServers {
-					merged[name] = server
-				}
-			}
+	readMCPServers := func(path string, dst map[string]interface{}) error {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return err // absent/unreadable source is tolerated silently
 		}
-	}
-	if raw, err := os.ReadFile(filepath.Join(projectPath, ".mcp.json")); err == nil {
 		var parsed struct {
 			MCPServers map[string]interface{} `json:"mcpServers"`
 		}
-		if json.Unmarshal(raw, &parsed) == nil {
-			for name, server := range parsed.MCPServers {
-				if _, exists := merged[name]; !exists {
-					projectCount++
-				}
-				merged[name] = server
-			}
+		if err := json.Unmarshal(raw, &parsed); err != nil {
+			logger.Warn(fmt.Sprintf("claude-policy: unparseable MCP source %s: %v", path, err))
+			return err // tolerate, don't degrade: skip this source only
 		}
+		for name, server := range parsed.MCPServers {
+			dst[name] = server
+		}
+		return nil
 	}
+	if home := agentHome(); home != "" {
+		readMCPServers(filepath.Join(home, ".claude.json"), merged)
+	}
+	beforeProject := len(merged)
+	readMCPServers(filepath.Join(projectPath, ".mcp.json"), merged)
+	projectCount := len(merged) - beforeProject
 	if projectCount == 0 {
 		return nil, func() {}, nil
 	}
