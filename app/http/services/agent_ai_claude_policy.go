@@ -125,9 +125,6 @@ func prepareClaudeProjectCapabilityPlugin(projectPath string) (string, error) {
 		return fail(err)
 	}
 	agentsDir := filepath.Join(root, "agents")
-	if err := os.MkdirAll(agentsDir, 0o700); err != nil {
-		return fail(err)
-	}
 	if err := copySanitizedClaudeAgents(filepath.Join(dotClaude, "agents"), agentsDir); err != nil {
 		return fail(err)
 	}
@@ -191,7 +188,6 @@ func copySanitizedClaudeSkills(sourceRoot, targetRoot string) error {
 
 func copySanitizedClaudeCommands(sourceRoot, targetRoot string) error {
 	count := 0
-	warned := false
 	err := filepath.WalkDir(sourceRoot, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			if os.IsNotExist(walkErr) {
@@ -206,11 +202,8 @@ func copySanitizedClaudeCommands(sourceRoot, targetRoot string) error {
 			return nil
 		}
 		if count >= claudeProjectCapabilityLimit {
-			if !warned {
-				warned = true
-				logger.Warn(fmt.Sprintf("claude-policy: command cap %d reached at %s; further commands skipped", claudeProjectCapabilityLimit, sourceRoot))
-			}
-			return nil
+			logger.Warn(fmt.Sprintf("claude-policy: command cap %d reached at %s; further commands skipped", claudeProjectCapabilityLimit, sourceRoot))
+			return filepath.SkipAll
 		}
 		if !strings.HasSuffix(strings.ToLower(entry.Name()), ".md") {
 			return nil
@@ -267,6 +260,9 @@ func copySanitizedClaudeAgents(sourceRoot, targetRoot string) error {
 			logger.Warn(fmt.Sprintf("claude-policy: agent cap %d reached at %s; further agents skipped", claudeProjectCapabilityLimit, sourceRoot))
 			break
 		}
+		if entry.Type()&fs.ModeSymlink != 0 {
+			continue
+		}
 		if entry.IsDir() || strings.HasPrefix(entry.Name(), ".") || !strings.HasSuffix(strings.ToLower(entry.Name()), ".md") {
 			continue
 		}
@@ -308,10 +304,8 @@ func sanitizedClaudeMarkdown(path string, kind claudeSanitizeKind) ([]byte, erro
 		writeYAMLString("name", fm.name)
 		writeYAMLString("description", fm.description)
 		writeYAMLString("tools", fm.tools)
-	default:
-		if kind == claudeSanitizeSkill {
-			writeYAMLString("name", fm.name)
-		}
+	case claudeSanitizeSkill:
+		writeYAMLString("name", fm.name)
 		writeYAMLString("description", fm.description)
 		writeYAMLString("argument-hint", fm.argumentHint)
 		if !fm.isUserInvocable() {
@@ -322,6 +316,19 @@ func sanitizedClaudeMarkdown(path string, kind claudeSanitizeKind) ([]byte, erro
 		}
 		writeYAMLString("context", fm.context)
 		writeYAMLString("agent", fm.agent)
+	case claudeSanitizeCommand:
+		writeYAMLString("description", fm.description)
+		writeYAMLString("argument-hint", fm.argumentHint)
+		if !fm.isUserInvocable() {
+			out.WriteString("user-invocable: false\n")
+		}
+		if !fm.isModelInvocable() {
+			out.WriteString("disable-model-invocation: true\n")
+		}
+		writeYAMLString("context", fm.context)
+		writeYAMLString("agent", fm.agent)
+	default:
+		return nil, fmt.Errorf("unknown claude sanitize kind %q", kind)
 	}
 	out.WriteString("---\n")
 	out.WriteString(body)

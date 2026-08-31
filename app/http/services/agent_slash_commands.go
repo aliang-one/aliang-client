@@ -568,6 +568,11 @@ func parseSlashFrontmatter(path string) (slashFrontmatter, bool) {
 		case "agent":
 			fm.agent = value
 		case "tools":
+			// Only single-line `tools: a, b` is captured; block-style YAML
+			// lists (`tools:\n  - Bash`) are not, so they get dropped on the
+			// agent sanitize path. Dropping tools WIDENS the agent's toolset
+			// (absence inherits the full toolset); this is bounded downstream
+			// by session permission/approval gating and deemed acceptable.
 			fm.tools = value
 		}
 	}

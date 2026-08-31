@@ -137,7 +137,7 @@ func TestCopySanitizedClaudeAgents(t *testing.T) {
 	if err := os.MkdirAll(source, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	agent := "---\nname: reviewer\ndescription: Reviews code\ntools: Bash, Read\nhooks:\n  Stop: []\nmodel: opus\n---\nReview carefully.\n"
+	agent := "---\nname: reviewer\ndescription: Reviews code\ntools: Bash, Read\nallowed-tools: Bash\nhooks:\n  Stop: []\nmodel: opus\n---\nReview carefully.\n"
 	if err := os.WriteFile(filepath.Join(source, "reviewer.md"), []byte(agent), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -150,7 +150,7 @@ func TestCopySanitizedClaudeAgents(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(out)
-	for _, forbidden := range []string{"hooks:", "model:"} {
+	for _, forbidden := range []string{"allowed-tools", "hooks:", "model:"} {
 		if strings.Contains(text, forbidden) {
 			t.Fatalf("sanitized agent retained %q:\n%s", forbidden, text)
 		}
@@ -159,6 +159,40 @@ func TestCopySanitizedClaudeAgents(t *testing.T) {
 		if !strings.Contains(text, wanted) {
 			t.Fatalf("sanitized agent missing %q:\n%s", wanted, text)
 		}
+	}
+}
+
+func TestCopySanitizedClaudeAgentsSkipsSymlinkedAgentFiles(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "agents")
+	if err := os.MkdirAll(source, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	agent := "---\nname: reviewer\ndescription: Reviews code\n---\nReview carefully.\n"
+	if err := os.WriteFile(filepath.Join(source, "real.md"), []byte(agent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The symlink target lives outside the agents source dir: a naive copy
+	// that follows symlinks would pull this file's content into the plugin.
+	escaped := filepath.Join(t.TempDir(), "escaped.md")
+	if err := os.WriteFile(escaped, []byte("---\nname: leaked\n---\nescaped agent body\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(escaped, filepath.Join(source, "link.md")); err != nil {
+		t.Fatalf("symlink setup failed: %v", err)
+	}
+	target := filepath.Join(t.TempDir(), "out")
+	if err := copySanitizedClaudeAgents(source, target); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(target, "link.md")); !os.IsNotExist(err) {
+		t.Fatalf("symlinked agent leaked into sanitized plugin: err=%v", err)
+	}
+	out, err := os.ReadFile(filepath.Join(target, "real.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out), "Review carefully.") {
+		t.Fatalf("real agent missing body:\n%s", out)
 	}
 }
 
