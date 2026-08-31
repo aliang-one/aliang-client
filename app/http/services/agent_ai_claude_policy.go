@@ -94,10 +94,67 @@ func withClaudeRemotePolicy(tool *agentAITool, run agentAIRun) (*agentAITool, fu
 }
 
 // claudeTierMCPArgs builds --strict-mcp-config/--mcp-config flags for the
-// sanitized tier when the server marked the project MCP trusted (spec §5).
-// Placeholder implementation in this task; replaced in the MCP merge task.
+// sanitized tier when the server marked the project MCP trusted (spec §5):
+// user-scope servers (top-level "mcpServers" in <agentHome>/.claude.json —
+// NOT the per-project entries) merged with the project's .mcp.json, project
+// entries winning name collisions (mirrors the CLI's local > project > user
+// precedence at merge time). Returns nil flags — native user-scope discovery
+// — when the project contributes no servers. Callers invoke the returned
+// cleanup only on success; on error the implementation has already released
+// everything it created.
 func claudeTierMCPArgs(policy agentAIClaudeRemotePolicy, projectPath string) ([]string, func(), error) {
-	return nil, func() {}, nil
+	if !policy.projectMCPTrusted {
+		return nil, func() {}, nil
+	}
+	merged := map[string]interface{}{}
+	projectCount := 0
+	if home := agentHome(); home != "" {
+		if raw, err := os.ReadFile(filepath.Join(home, ".claude.json")); err == nil {
+			var parsed struct {
+				MCPServers map[string]interface{} `json:"mcpServers"`
+			}
+			if json.Unmarshal(raw, &parsed) == nil {
+				for name, server := range parsed.MCPServers {
+					merged[name] = server
+				}
+			}
+		}
+	}
+	if raw, err := os.ReadFile(filepath.Join(projectPath, ".mcp.json")); err == nil {
+		var parsed struct {
+			MCPServers map[string]interface{} `json:"mcpServers"`
+		}
+		if json.Unmarshal(raw, &parsed) == nil {
+			for name, server := range parsed.MCPServers {
+				if _, exists := merged[name]; !exists {
+					projectCount++
+				}
+				merged[name] = server
+			}
+		}
+	}
+	if projectCount == 0 {
+		return nil, func() {}, nil
+	}
+	payload, err := json.Marshal(map[string]interface{}{"mcpServers": merged})
+	if err != nil {
+		return nil, func() {}, err
+	}
+	tmp, err := os.CreateTemp("", "aliang-claude-mcp-*.json")
+	if err != nil {
+		return nil, func() {}, err
+	}
+	if _, err := tmp.Write(payload); err != nil {
+		tmp.Close()
+		os.Remove(tmp.Name())
+		return nil, func() {}, err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmp.Name())
+		return nil, func() {}, err
+	}
+	cleanup := func() { _ = os.Remove(tmp.Name()) }
+	return []string{"--strict-mcp-config", "--mcp-config", tmp.Name()}, cleanup, nil
 }
 
 func prepareClaudeProjectCapabilityPlugin(projectPath string) (string, error) {

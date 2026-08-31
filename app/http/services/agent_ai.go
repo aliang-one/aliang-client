@@ -4713,6 +4713,9 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 		effectiveRun.claudePolicy = applyClaudeTierVersionGuard(tool, effectiveRun.claudePolicy)
 		var policyNotice map[string]interface{}
 		tool, cleanupClaudePolicy, policyNotice = withClaudeRemotePolicy(tool, effectiveRun)
+		// Fold must precede withClaudeApprovalHook: the hook re-derives
+		// --setting-sources from trustTier, so a skipped fold would re-open
+		// the sources a degrade just closed.
 		effectiveRun.claudePolicy = applyClaudePolicyNotice(effectiveRun.claudePolicy, policyNotice)
 		defer cleanupClaudePolicy()
 		tool = withClaudeApprovalHook(tool, effectiveRun)

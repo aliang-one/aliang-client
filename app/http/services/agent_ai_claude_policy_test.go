@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -649,5 +650,85 @@ func TestSanitizeDegradeEndsIsolatedAfterApprovalHook(t *testing.T) {
 	tool = withClaudeApprovalHook(tool, run)
 	if got := argumentValue(tool.args, "--setting-sources"); got != "" {
 		t.Fatalf("degraded+hooked sources = %q, want empty", got)
+	}
+}
+
+func TestClaudeTierMCPArgsMergesUserAndProjectServers(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	userConfig := map[string]interface{}{
+		"mcpServers": map[string]interface{}{
+			"shared": map[string]interface{}{"command": "user-cmd"},
+			"u-only": map[string]interface{}{"command": "user-only"},
+		},
+	}
+	raw, _ := json.Marshal(userConfig)
+	if err := os.WriteFile(filepath.Join(home, ".claude.json"), raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	project := t.TempDir()
+	projectMCP := `{"mcpServers":{"shared":{"command":"project-cmd"},"p-only":{"command":"project-only"}}}`
+	if err := os.WriteFile(filepath.Join(project, ".mcp.json"), []byte(projectMCP), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	policy := parseAgentAIClaudeRemotePolicy(map[string]interface{}{"claude_remote_policy": map[string]interface{}{"trust_level": "sanitized", "project_mcp_trusted": true}})
+
+	flags, cleanup, err := claudeTierMCPArgs(policy, project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(flags) != 3 || flags[0] != "--strict-mcp-config" || flags[1] != "--mcp-config" {
+		t.Fatalf("flags = %v", flags)
+	}
+	configRaw, err := os.ReadFile(flags[2])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parsed struct {
+		MCPServers map[string]interface{} `json:"mcpServers"`
+	}
+	if err := json.Unmarshal(configRaw, &parsed); err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed.MCPServers) != 3 {
+		t.Fatalf("servers = %v", parsed.MCPServers)
+	}
+	if shared, _ := parsed.MCPServers["shared"].(map[string]interface{}); shared["command"] != "project-cmd" {
+		t.Fatalf("project must override user on collision: %v", shared)
+	}
+	if _, ok := parsed.MCPServers["u-only"]; !ok {
+		t.Fatal("user-only server missing")
+	}
+	// Explicit cleanup (not defer) so the removal assertion below sees the
+	// file already gone; os.Remove on a missing file is an ignored no-op.
+	cleanup()
+	if _, err := os.Stat(flags[2]); !os.IsNotExist(err) {
+		t.Fatalf("temp config not removed: %v", err)
+	}
+}
+
+func TestClaudeTierMCPArgsInactive(t *testing.T) {
+	policy := parseAgentAIClaudeRemotePolicy(map[string]interface{}{"claude_remote_policy": map[string]interface{}{"trust_level": "sanitized"}})
+	project := t.TempDir()
+	flags, cleanup, err := claudeTierMCPArgs(policy, project)
+	defer cleanup()
+	if err != nil || flags != nil {
+		t.Fatalf("untrusted project MCP must be a no-op: flags=%v err=%v", flags, err)
+	}
+	// Trusted but empty project .mcp.json → no flags either (user scope loads natively).
+	policy2 := parseAgentAIClaudeRemotePolicy(map[string]interface{}{"claude_remote_policy": map[string]interface{}{"trust_level": "sanitized", "project_mcp_trusted": true}})
+	flags2, cleanup2, err2 := claudeTierMCPArgs(policy2, project)
+	defer cleanup2()
+	if err2 != nil || flags2 != nil {
+		t.Fatalf("empty project mcp must be a no-op: flags=%v err=%v", flags2, err2)
+	}
+}
+
+func TestClaudePolicyNoticeMcpMergeFailsIsolated(t *testing.T) {
+	policy := parseAgentAIClaudeRemotePolicy(map[string]interface{}{"claude_remote_policy": map[string]interface{}{"trust_level": "sanitized"}})
+	updated := applyClaudePolicyNotice(policy, map[string]interface{}{"effective": "isolated", "requested": "sanitized", "reason": "mcp_merge_failed"})
+	if updated.trustTier != "isolated" || updated.policyNotice == nil || updated.policyNotice["reason"] != "mcp_merge_failed" {
+		t.Fatalf("mcp degrade fold = %+v", updated)
 	}
 }
