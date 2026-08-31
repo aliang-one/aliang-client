@@ -6841,7 +6841,9 @@ func claudeApprovalHookSettings(strategy claudeApprovalHookStrategy, run agentAI
 			},
 		}
 	}
-	if run.claudePolicy.enabled {
+	// Full tier runs at local parity: it keeps its own settings sources and
+	// must not carry the fail-closed shell disable or ask overlay (hooks stay).
+	if run.claudePolicy.enabled && run.claudePolicy.trustTier != "full" {
 		settings["disableSkillShellExecution"] = true
 		// Claude Code 2.1.x never invokes PermissionRequest hooks in headless
 		// --print mode. Its explicit ask rules also take precedence over an
@@ -6882,8 +6884,16 @@ func withClaudeApprovalHook(tool *agentAITool, run agentAIRun) *agentAITool {
 		return tool
 	}
 	copied := *tool
+	sources := ""
+	if run.claudePolicy.enabled {
+		// Carry the effective tier's sources instead of unconditionally
+		// clobbering to "" — the hook layer previously erased whatever tier
+		// withClaudeRemotePolicy had configured (spec §7). Policy-disabled
+		// runs keep the historical "" (isolated) behavior.
+		sources = claudeTierSettingSources(run.claudePolicy.trustTier)
+	}
 	copied.args = withoutCLIArgumentValue(tool.args, "--setting-sources")
-	copied.args = append([]string{"--setting-sources", "", "--permission-mode", "default", "--settings", string(settingsRaw)}, copied.args...)
+	copied.args = append([]string{"--setting-sources", sources, "--permission-mode", "default", "--settings", string(settingsRaw)}, copied.args...)
 	return &copied
 }
 

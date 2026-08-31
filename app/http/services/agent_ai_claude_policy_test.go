@@ -352,6 +352,49 @@ func TestClaudeApprovalHookDisablesFilesystemSettingsWithoutRemotePolicy(t *test
 	}
 }
 
+func TestClaudeApprovalHookCarriesTierSettingSources(t *testing.T) {
+	mk := func(raw map[string]interface{}) agentAIRun {
+		return agentAIRun{sessionID: "s-tier", messageID: "m-tier", runSeq: 1, approvalToken: "token",
+			claudePolicy: parseAgentAIClaudeRemotePolicy(map[string]interface{}{"claude_remote_policy": raw})}
+	}
+	cases := []struct {
+		name   string
+		raw    map[string]interface{}
+		wantSS string
+	}{
+		{"isolated", map[string]interface{}{"trust_level": "isolated"}, ""},
+		{"sanitized", map[string]interface{}{"trust_level": "sanitized"}, "user"},
+		{"full", map[string]interface{}{"trust_level": "full"}, "user,project"},
+	}
+	for _, tc := range cases {
+		tool := withClaudeApprovalHook(&agentAITool{path: "/bin/claude", args: []string{"--setting-sources", "stale", "--print", "prompt"}}, mk(tc.raw))
+		if got := argumentValue(tool.args, "--setting-sources"); got != tc.wantSS {
+			t.Fatalf("%s: final setting sources = %q, want %q", tc.name, got, tc.wantSS)
+		}
+		if n := strings.Count(strings.Join(tool.args, "\x00"), "--setting-sources"); n != 1 {
+			t.Fatalf("%s: flag not normalized (%d): %v", tc.name, n, tool.args)
+		}
+	}
+}
+
+func TestClaudeApprovalSettingsFullTierOmitsShellDisableAndAsk(t *testing.T) {
+	run := agentAIRun{sessionID: "s-full", messageID: "m-full", approvalToken: "token",
+		claudePolicy: parseAgentAIClaudeRemotePolicy(map[string]interface{}{"claude_remote_policy": map[string]interface{}{"trust_level": "full"}})}
+	settings, err := claudeApprovalHookSettings(claudeApprovalHookPermissionRequestHTTP, run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := settings["disableSkillShellExecution"]; exists {
+		t.Fatal("full tier must not disable skill shell execution")
+	}
+	if _, exists := settings["permissions"]; exists {
+		t.Fatal("full tier must not inject ask rules")
+	}
+	if _, exists := settings["hooks"]; !exists {
+		t.Fatal("approval bridge hooks must stay injected")
+	}
+}
+
 func TestClaudeSystemInitCreatesSessionCapabilitySnapshot(t *testing.T) {
 	manager := newAgentAIManager()
 	project := t.TempDir()
