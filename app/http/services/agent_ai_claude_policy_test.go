@@ -83,7 +83,7 @@ func TestClaudeRemotePolicyBuildsSanitizedProjectPlugin(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(sanitized)
-	for _, forbidden := range []string{"allowed-tools", "hooks:", "context:"} {
+	for _, forbidden := range []string{"allowed-tools", "hooks:"} {
 		if strings.Contains(text, forbidden) {
 			t.Fatalf("sanitized skill retained %q:\n%s", forbidden, text)
 		}
@@ -100,8 +100,65 @@ func TestClaudeRemotePolicyBuildsSanitizedProjectPlugin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(command), "allowed-tools") || strings.Contains(string(command), "context:") {
+	if strings.Contains(string(command), "allowed-tools") {
 		t.Fatalf("unsafe command frontmatter retained:\n%s", command)
+	}
+	if !strings.Contains(string(command), "context: \"fork\"") {
+		t.Fatalf("sanitized command lost context frontmatter:\n%s", command)
+	}
+}
+
+func TestSanitizedClaudeMarkdownPreservesContextAndAgent(t *testing.T) {
+	dir := t.TempDir()
+	skill := filepath.Join(dir, "SKILL.md")
+	body := "---\nname: deploy\ndescription: Deploy safely\ncontext: fork\nagent: reviewer\nallowed-tools: Bash\nmodel: opus\nhooks:\n  PreToolUse: []\n---\nRun it.\n"
+	if err := os.WriteFile(skill, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := sanitizedClaudeMarkdown(skill, claudeSanitizeSkill)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(out)
+	for _, forbidden := range []string{"allowed-tools", "hooks:", "model:"} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("sanitized skill retained %q:\n%s", forbidden, text)
+		}
+	}
+	for _, wanted := range []string{"context: \"fork\"", "agent: \"reviewer\"", "description: \"Deploy safely\"", "Run it."} {
+		if !strings.Contains(text, wanted) {
+			t.Fatalf("sanitized skill missing %q:\n%s", wanted, text)
+		}
+	}
+}
+
+func TestCopySanitizedClaudeAgents(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "agents")
+	if err := os.MkdirAll(source, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	agent := "---\nname: reviewer\ndescription: Reviews code\ntools: Bash, Read\nhooks:\n  Stop: []\nmodel: opus\n---\nReview carefully.\n"
+	if err := os.WriteFile(filepath.Join(source, "reviewer.md"), []byte(agent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(t.TempDir(), "out")
+	if err := copySanitizedClaudeAgents(source, target); err != nil {
+		t.Fatal(err)
+	}
+	out, err := os.ReadFile(filepath.Join(target, "reviewer.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(out)
+	for _, forbidden := range []string{"hooks:", "model:"} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("sanitized agent retained %q:\n%s", forbidden, text)
+		}
+	}
+	for _, wanted := range []string{"name: \"reviewer\"", "tools: \"Bash, Read\"", "Review carefully."} {
+		if !strings.Contains(text, wanted) {
+			t.Fatalf("sanitized agent missing %q:\n%s", wanted, text)
+		}
 	}
 }
 

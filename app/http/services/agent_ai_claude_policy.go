@@ -124,6 +124,13 @@ func prepareClaudeProjectCapabilityPlugin(projectPath string) (string, error) {
 	if err := copySanitizedClaudeCommands(filepath.Join(dotClaude, "commands"), filepath.Join(root, "commands")); err != nil {
 		return fail(err)
 	}
+	agentsDir := filepath.Join(root, "agents")
+	if err := os.MkdirAll(agentsDir, 0o700); err != nil {
+		return fail(err)
+	}
+	if err := copySanitizedClaudeAgents(filepath.Join(dotClaude, "agents"), agentsDir); err != nil {
+		return fail(err)
+	}
 	return root, nil
 }
 
@@ -137,7 +144,11 @@ func copySanitizedClaudeSkills(sourceRoot, targetRoot string) error {
 	}
 	count := 0
 	for _, entry := range entries {
-		if count >= claudeProjectCapabilityLimit || !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+		if count >= claudeProjectCapabilityLimit {
+			logger.Warn(fmt.Sprintf("claude-policy: skill cap %d reached at %s; further skills skipped", claudeProjectCapabilityLimit, sourceRoot))
+			break
+		}
+		if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
 			continue
 		}
 		sourceDir := filepath.Join(sourceRoot, entry.Name())
@@ -149,7 +160,7 @@ func copySanitizedClaudeSkills(sourceRoot, targetRoot string) error {
 		if err := os.MkdirAll(targetDir, 0o700); err != nil {
 			return err
 		}
-		markdown, err := sanitizedClaudeMarkdown(sourceMarkdown, true)
+		markdown, err := sanitizedClaudeMarkdown(sourceMarkdown, claudeSanitizeSkill)
 		if err != nil {
 			return err
 		}
@@ -180,6 +191,7 @@ func copySanitizedClaudeSkills(sourceRoot, targetRoot string) error {
 
 func copySanitizedClaudeCommands(sourceRoot, targetRoot string) error {
 	count := 0
+	warned := false
 	err := filepath.WalkDir(sourceRoot, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			if os.IsNotExist(walkErr) {
@@ -193,14 +205,21 @@ func copySanitizedClaudeCommands(sourceRoot, targetRoot string) error {
 			}
 			return nil
 		}
-		if count >= claudeProjectCapabilityLimit || !strings.HasSuffix(strings.ToLower(entry.Name()), ".md") {
+		if count >= claudeProjectCapabilityLimit {
+			if !warned {
+				warned = true
+				logger.Warn(fmt.Sprintf("claude-policy: command cap %d reached at %s; further commands skipped", claudeProjectCapabilityLimit, sourceRoot))
+			}
+			return nil
+		}
+		if !strings.HasSuffix(strings.ToLower(entry.Name()), ".md") {
 			return nil
 		}
 		rel, err := filepath.Rel(sourceRoot, path)
 		if err != nil || strings.HasPrefix(rel, "..") {
 			return fmt.Errorf("invalid Claude command path %q", path)
 		}
-		markdown, err := sanitizedClaudeMarkdown(path, false)
+		markdown, err := sanitizedClaudeMarkdown(path, claudeSanitizeCommand)
 		if err != nil {
 			return err
 		}
@@ -220,10 +239,55 @@ func copySanitizedClaudeCommands(sourceRoot, targetRoot string) error {
 	return err
 }
 
-// sanitizedClaudeMarkdown preserves the prompt body and safe discovery fields,
-// but deliberately drops hooks, allowed-tools, context, agent, and arbitrary
-// frontmatter that could alter the remote execution boundary.
-func sanitizedClaudeMarkdown(path string, skill bool) ([]byte, error) {
+// claudeSanitizeKind selects the frontmatter whitelist for a capability file.
+type claudeSanitizeKind string
+
+const (
+	claudeSanitizeSkill   claudeSanitizeKind = "skill"
+	claudeSanitizeCommand claudeSanitizeKind = "command"
+	claudeSanitizeAgent   claudeSanitizeKind = "agent"
+)
+
+// copySanitizedClaudeAgents copies project .claude/agents/*.md through the
+// agent whitelist so sanitized-tier `agent:` references resolve (spec §4.3).
+func copySanitizedClaudeAgents(sourceRoot, targetRoot string) error {
+	entries, err := os.ReadDir(sourceRoot)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(targetRoot, 0o700); err != nil {
+		return err
+	}
+	count := 0
+	for _, entry := range entries {
+		if count >= claudeProjectCapabilityLimit {
+			logger.Warn(fmt.Sprintf("claude-policy: agent cap %d reached at %s; further agents skipped", claudeProjectCapabilityLimit, sourceRoot))
+			break
+		}
+		if entry.IsDir() || strings.HasPrefix(entry.Name(), ".") || !strings.HasSuffix(strings.ToLower(entry.Name()), ".md") {
+			continue
+		}
+		markdown, err := sanitizedClaudeMarkdown(filepath.Join(sourceRoot, entry.Name()), claudeSanitizeAgent)
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(targetRoot, entry.Name()), markdown, 0o600); err != nil {
+			return err
+		}
+		count++
+	}
+	return nil
+}
+
+// sanitizedClaudeMarkdown preserves the prompt body and safe discovery fields
+// but deliberately drops hooks, allowed-tools, model, and arbitrary frontmatter
+// that could alter the remote execution boundary (spec §4.2). context/agent
+// carry no permission meaning and are preserved; agent files additionally keep
+// tools, which RESTRICTS the agent's tool set rather than granting permissions.
+func sanitizedClaudeMarkdown(path string, kind claudeSanitizeKind) ([]byte, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -239,16 +303,25 @@ func sanitizedClaudeMarkdown(path string, skill bool) ([]byte, error) {
 		quoted, _ := json.Marshal(value)
 		fmt.Fprintf(&out, "%s: %s\n", key, quoted)
 	}
-	if skill {
+	switch kind {
+	case claudeSanitizeAgent:
 		writeYAMLString("name", fm.name)
-	}
-	writeYAMLString("description", fm.description)
-	writeYAMLString("argument-hint", fm.argumentHint)
-	if !fm.isUserInvocable() {
-		out.WriteString("user-invocable: false\n")
-	}
-	if !fm.isModelInvocable() {
-		out.WriteString("disable-model-invocation: true\n")
+		writeYAMLString("description", fm.description)
+		writeYAMLString("tools", fm.tools)
+	default:
+		if kind == claudeSanitizeSkill {
+			writeYAMLString("name", fm.name)
+		}
+		writeYAMLString("description", fm.description)
+		writeYAMLString("argument-hint", fm.argumentHint)
+		if !fm.isUserInvocable() {
+			out.WriteString("user-invocable: false\n")
+		}
+		if !fm.isModelInvocable() {
+			out.WriteString("disable-model-invocation: true\n")
+		}
+		writeYAMLString("context", fm.context)
+		writeYAMLString("agent", fm.agent)
 	}
 	out.WriteString("---\n")
 	out.WriteString(body)

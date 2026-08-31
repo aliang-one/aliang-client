@@ -511,6 +511,9 @@ type slashFrontmatter struct {
 	name                   string
 	userInvocable          *bool
 	disableModelInvocation bool
+	context                string
+	agent                  string
+	tools                  string
 }
 
 func (fm slashFrontmatter) isUserInvocable() bool {
@@ -560,6 +563,12 @@ func parseSlashFrontmatter(path string) (slashFrontmatter, bool) {
 			if parsed, ok := parseSlashFrontmatterBool(value); ok {
 				fm.disableModelInvocation = parsed
 			}
+		case "context":
+			fm.context = value
+		case "agent":
+			fm.agent = value
+		case "tools":
+			fm.tools = value
 		}
 	}
 	return fm, true
