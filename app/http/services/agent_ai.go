@@ -674,8 +674,10 @@ type claudeCodeVersionProbe struct {
 var claudeCodeVersionProbeCache sync.Map
 
 // probeClaudeCodeVersion returns the parsed version of the claude executable,
-// cached per executable content. ok=false when the probe fails (missing or
-// non-claude binary) — callers treat that as fail-closed.
+// cached per executable content on success only. ok=false when the probe
+// fails (missing or non-claude binary) — callers treat that as fail-closed.
+// Failures are not cached: each pass re-probes (cost bounded by the 2s
+// timeout) so a transient timeout self-heals on the next pass.
 func probeClaudeCodeVersion(toolPath string) (claudeCodeVersion, bool) {
 	toolPath = strings.TrimSpace(toolPath)
 	if toolPath == "" {
@@ -691,7 +693,6 @@ func probeClaudeCodeVersion(toolPath string) (claudeCodeVersion, bool) {
 	out, err := newBackgroundCommandContext(ctx, toolPath, "--version").CombinedOutput()
 	version, ok := parseClaudeCodeVersion(string(out))
 	if err != nil || !ok {
-		claudeCodeVersionProbeCache.Store(cacheKey, claudeCodeVersionProbe{})
 		return claudeCodeVersion{}, false
 	}
 	claudeCodeVersionProbeCache.Store(cacheKey, claudeCodeVersionProbe{version: version, ok: true})
@@ -706,7 +707,7 @@ func probeClaudeCodeVersion(toolPath string) (claudeCodeVersion, bool) {
 // Note: a full-tier policy downgraded here keeps its (intentionally empty)
 // ask list — the <2.2 PreToolUse strategy never injects permissions.ask, so
 // behavior matches legacy isolated runs without refilling the default list.
-func applyClaudeTierVersionGuard(tool *agentAITool, policy agentAIClaudeRemotePolicy) agentAIClaudeRemotePolicy {
+func applyClaudeTierVersionGuard(tool *agentAITool, policy agentAIClaudeRemotePolicy, sessionID string) agentAIClaudeRemotePolicy {
 	if !policy.enabled || policy.trustTier == "" || policy.trustTier == "isolated" {
 		return policy
 	}
@@ -714,7 +715,7 @@ func applyClaudeTierVersionGuard(tool *agentAITool, policy agentAIClaudeRemotePo
 	if ok && version.atLeast(2, 2, 0) {
 		return policy
 	}
-	logger.Warn(fmt.Sprintf("claude-policy: %s predates 2.2.0, downgrading trust tier %s to isolated", tool.path, policy.trustTier))
+	logger.Warn(fmt.Sprintf("claude-policy: %s predates 2.2.0, downgrading trust tier %s to isolated session=%s", tool.path, policy.trustTier, sessionID))
 	downgraded := policy
 	downgraded.trustTier = "isolated"
 	downgraded.policyNotice = map[string]interface{}{
@@ -4710,7 +4711,7 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 	cleanupClaudePolicy := func() {}
 	effectiveRun := run
 	if tool.outputFormat == agentAIOutputClaudeStreamJSON && !run.readOnly {
-		effectiveRun.claudePolicy = applyClaudeTierVersionGuard(tool, effectiveRun.claudePolicy)
+		effectiveRun.claudePolicy = applyClaudeTierVersionGuard(tool, effectiveRun.claudePolicy, run.sessionID)
 		var policyNotice map[string]interface{}
 		tool, cleanupClaudePolicy, policyNotice = withClaudeRemotePolicy(tool, effectiveRun)
 		// Fold must precede withClaudeApprovalHook: the hook re-derives

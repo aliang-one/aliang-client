@@ -13,6 +13,12 @@ import (
 
 const claudeProjectCapabilityLimit = 500
 
+// claudeProjectPluginNamespace is the plugin name used for the sanitized-tier
+// temporary capability plugin. Slash-list entries (agent_slash_commands.go)
+// and the plugin manifest must stay in lockstep: the init event reports
+// "<namespace>:<name>" and the phone list must match (spec §6).
+const claudeProjectPluginNamespace = "aliang-project"
+
 // normalizeClaudeTrustTier maps a server-sent trust_level to the internal tier
 // constant. ok is false for empty/unknown values so callers can distinguish
 // "absent" (legacy field fallback) from "present but invalid" (fail-closed).
@@ -170,7 +176,7 @@ func prepareClaudeProjectCapabilityPlugin(projectPath string) (string, error) {
 	if err := os.MkdirAll(manifestDir, 0o700); err != nil {
 		return fail(err)
 	}
-	manifest := []byte(`{"name":"aliang-project","version":"1.0.0","description":"Sanitized remote project capabilities"}`)
+	manifest := []byte(fmt.Sprintf(`{"name":%q,"version":"1.0.0","description":"Sanitized remote project capabilities"}`, claudeProjectPluginNamespace))
 	if err := os.WriteFile(filepath.Join(manifestDir, "plugin.json"), manifest, 0o600); err != nil {
 		return fail(err)
 	}

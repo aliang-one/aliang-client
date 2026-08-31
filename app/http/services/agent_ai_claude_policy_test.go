@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -619,6 +620,9 @@ func argumentValue(args []string, key string) string {
 }
 
 func TestApplyClaudeTierVersionGuard(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("sh-script version probes are unix-only; windows coverage tracked separately")
+	}
 	newEnough := filepath.Join(t.TempDir(), "claude-new")
 	if err := os.WriteFile(newEnough, []byte("#!/bin/sh\necho \"2.2.5 (Claude Code)\"\n"), 0o700); err != nil {
 		t.Fatal(err)
@@ -629,24 +633,24 @@ func TestApplyClaudeTierVersionGuard(t *testing.T) {
 	}
 	policy := parseAgentAIClaudeRemotePolicy(map[string]interface{}{"claude_remote_policy": map[string]interface{}{"trust_level": "full"}})
 
-	kept := applyClaudeTierVersionGuard(&agentAITool{path: newEnough}, policy)
+	kept := applyClaudeTierVersionGuard(&agentAITool{path: newEnough}, policy, "s-guard")
 	if kept.trustTier != "full" || kept.policyNotice != nil {
 		t.Fatalf("2.2+ must keep tier: %+v", kept)
 	}
-	downgraded := applyClaudeTierVersionGuard(&agentAITool{path: tooOld}, policy)
+	downgraded := applyClaudeTierVersionGuard(&agentAITool{path: tooOld}, policy, "s-guard")
 	if downgraded.trustTier != "isolated" || downgraded.policyNotice == nil ||
 		downgraded.policyNotice["reason"] != "claude_version_below_2_2" ||
 		downgraded.policyNotice["requested"] != "full" {
 		t.Fatalf("2.1.x must downgrade: %+v", downgraded)
 	}
 	// Unprobeable binary → fail-closed downgrade.
-	unknown := applyClaudeTierVersionGuard(&agentAITool{path: filepath.Join(t.TempDir(), "missing")}, policy)
+	unknown := applyClaudeTierVersionGuard(&agentAITool{path: filepath.Join(t.TempDir(), "missing")}, policy, "s-guard")
 	if unknown.trustTier != "isolated" {
 		t.Fatalf("unprobeable binary must fail closed: %+v", unknown)
 	}
 	// Isolated tiers are never touched.
 	isolated := parseAgentAIClaudeRemotePolicy(map[string]interface{}{"claude_remote_policy": map[string]interface{}{"trust_level": "isolated"}})
-	if got := applyClaudeTierVersionGuard(&agentAITool{path: tooOld}, isolated); got.trustTier != "isolated" || got.policyNotice != nil {
+	if got := applyClaudeTierVersionGuard(&agentAITool{path: tooOld}, isolated, "s-guard"); got.trustTier != "isolated" || got.policyNotice != nil {
 		t.Fatalf("isolated must stay untouched: %+v", got)
 	}
 }

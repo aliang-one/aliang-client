@@ -51,7 +51,7 @@ func agentSlashCommandsListPayloadWithManager(msg map[string]interface{}, manage
 	remotePolicy := parseAgentAIClaudeRemotePolicy(msg)
 	projectPrefix := ""
 	if remotePolicy.enabled && remotePolicy.trustTier == "sanitized" {
-		projectPrefix = "aliang-project:"
+		projectPrefix = claudeProjectPluginNamespace + ":"
 	}
 	includeProjectClaude := !remotePolicy.enabled || remotePolicy.trustTier == "sanitized" || remotePolicy.trustTier == "full"
 
