@@ -725,6 +725,19 @@ func applyClaudeTierVersionGuard(tool *agentAITool, policy agentAIClaudeRemotePo
 	return downgraded
 }
 
+// applyClaudePolicyNotice folds a degrade notice back into the effective
+// policy: a degraded run IS an isolated run, so the tier must match the
+// notice — otherwise the approval hook would re-open the sources the
+// degrade just closed (spec §4.1 fail-closed).
+func applyClaudePolicyNotice(policy agentAIClaudeRemotePolicy, notice map[string]interface{}) agentAIClaudeRemotePolicy {
+	if notice == nil {
+		return policy
+	}
+	policy.policyNotice = notice
+	policy.trustTier = "isolated"
+	return policy
+}
+
 func normalizeClaudeCapabilityName(name string) string {
 	return strings.TrimPrefix(strings.TrimSpace(name), "/")
 }
@@ -4700,9 +4713,7 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 		effectiveRun.claudePolicy = applyClaudeTierVersionGuard(tool, effectiveRun.claudePolicy)
 		var policyNotice map[string]interface{}
 		tool, cleanupClaudePolicy, policyNotice = withClaudeRemotePolicy(tool, effectiveRun)
-		if policyNotice != nil {
-			effectiveRun.claudePolicy.policyNotice = policyNotice
-		}
+		effectiveRun.claudePolicy = applyClaudePolicyNotice(effectiveRun.claudePolicy, policyNotice)
 		defer cleanupClaudePolicy()
 		tool = withClaudeApprovalHook(tool, effectiveRun)
 	}

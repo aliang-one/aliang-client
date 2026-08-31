@@ -617,3 +617,37 @@ func TestApplyClaudeTierVersionGuard(t *testing.T) {
 		t.Fatalf("isolated must stay untouched: %+v", got)
 	}
 }
+
+func TestClaudePolicyNoticeForcesIsolatedTier(t *testing.T) {
+	policy := parseAgentAIClaudeRemotePolicy(map[string]interface{}{"claude_remote_policy": map[string]interface{}{"trust_level": "sanitized"}})
+	updated := applyClaudePolicyNotice(policy, map[string]interface{}{"effective": "isolated", "requested": "sanitized", "reason": "sanitize_failed"})
+	if updated.trustTier != "isolated" {
+		t.Fatalf("degraded tier = %q, want isolated", updated.trustTier)
+	}
+	if updated.policyNotice == nil || updated.policyNotice["reason"] != "sanitize_failed" {
+		t.Fatalf("notice lost: %v", updated.policyNotice)
+	}
+	if got := claudeTierSettingSources(updated.trustTier); got != "" {
+		t.Fatalf("degraded sources = %q, want empty", got)
+	}
+	unchanged := applyClaudePolicyNotice(policy, nil)
+	if unchanged.trustTier != "sanitized" || unchanged.policyNotice != nil {
+		t.Fatalf("nil notice must not touch policy: %+v", unchanged)
+	}
+}
+
+func TestSanitizeDegradeEndsIsolatedAfterApprovalHook(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(file, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run := agentAIRun{sessionID: "s-degrade", messageID: "m-degrade", approvalToken: "token", projectPath: file,
+		claudePolicy: parseAgentAIClaudeRemotePolicy(map[string]interface{}{"claude_remote_policy": map[string]interface{}{"trust_level": "sanitized"}})}
+	tool, cleanup, notice := withClaudeRemotePolicy(&agentAITool{args: []string{"--print", "prompt"}}, run)
+	defer cleanup()
+	run.claudePolicy = applyClaudePolicyNotice(run.claudePolicy, notice)
+	tool = withClaudeApprovalHook(tool, run)
+	if got := argumentValue(tool.args, "--setting-sources"); got != "" {
+		t.Fatalf("degraded+hooked sources = %q, want empty", got)
+	}
+}
