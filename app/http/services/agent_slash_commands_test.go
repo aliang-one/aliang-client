@@ -206,7 +206,7 @@ func TestCollectProjectSlashCommands(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	entries := collectProjectSlashCommands(root)
+	entries := collectProjectSlashCommands(root, "")
 	got := map[string]map[string]interface{}{}
 	for _, e := range entries {
 		got[e["name"].(string)] = e
@@ -233,7 +233,7 @@ func TestCollectProjectSlashCommands(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(sd, "SKILL.md"), []byte("---\ndescription: no name field\n---\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	es := collectProjectSlashCommands(root2)
+	es := collectProjectSlashCommands(root2, "")
 	if len(es) != 1 || es[0]["name"] != "fallback-skill" {
 		t.Errorf("expected fallback-skill, got %+v", es)
 	}
@@ -401,7 +401,7 @@ func TestCollectProjectSlashCommandsProviderTag(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(cmdDir, "demo.md"), []byte("---\ndescription: d\n---\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	for _, e := range collectProjectSlashCommands(root) {
+	for _, e := range collectProjectSlashCommands(root, "") {
 		if e["provider"] != "claude" {
 			t.Errorf("project command provider=%v want claude", e["provider"])
 		}

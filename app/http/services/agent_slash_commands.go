@@ -49,7 +49,11 @@ func agentSlashCommandsListPayloadWithManager(msg map[string]interface{}, manage
 	includeUser := remoteBool(msg, "include_user_level", true)
 	includePlugins := remoteBool(msg, "include_plugins", true)
 	remotePolicy := parseAgentAIClaudeRemotePolicy(msg)
-	includeProjectClaude := !remotePolicy.enabled || remotePolicy.projectSkillTrusted
+	projectPrefix := ""
+	if remotePolicy.enabled && remotePolicy.trustTier == "sanitized" {
+		projectPrefix = "aliang-project:"
+	}
+	includeProjectClaude := !remotePolicy.enabled || remotePolicy.trustTier == "sanitized" || remotePolicy.trustTier == "full"
 
 	wantClaude := provider == "" || provider == "claude"
 	wantCodex := provider == "" || provider == "codex"
@@ -58,7 +62,7 @@ func agentSlashCommandsListPayloadWithManager(msg map[string]interface{}, manage
 	var commands []map[string]interface{}
 	if wantClaude {
 		if includeProjectClaude {
-			commands = append(commands, collectProjectSlashCommands(projectPath)...)
+			commands = append(commands, collectProjectSlashCommands(projectPath, projectPrefix)...)
 		}
 		if includeUser {
 			commands = append(commands, collectUserSlashCommands()...)
@@ -152,11 +156,14 @@ func agentSlashCommandsErrorPayload(requestID string, err error) map[string]inte
 }
 
 // collectProjectSlashCommands scans <projectPath>/.claude/{commands,skills}.
-func collectProjectSlashCommands(projectPath string) []map[string]interface{} {
+// namePrefix is prepended to every entry name: sanitized-tier entries carry
+// "aliang-project:" so list names match the plugin-namespace invocation names
+// the claude init event reports (spec §6).
+func collectProjectSlashCommands(projectPath string, namePrefix string) []map[string]interface{} {
 	dotClaude := filepath.Join(projectPath, ".claude")
 	var out []map[string]interface{}
-	out = append(out, scanCommandMarkdowns(filepath.Join(dotClaude, "commands"), "project", "project", projectPath, "", "claude")...)
-	out = append(out, scanSkillMarkdowns(filepath.Join(dotClaude, "skills"), "project", "project", projectPath, "", "claude")...)
+	out = append(out, scanCommandMarkdowns(filepath.Join(dotClaude, "commands"), "project", "project", projectPath, namePrefix, "claude")...)
+	out = append(out, scanSkillMarkdowns(filepath.Join(dotClaude, "skills"), "project", "project", projectPath, namePrefix, "claude")...)
 	return out
 }
 
