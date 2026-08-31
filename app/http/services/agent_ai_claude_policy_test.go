@@ -325,6 +325,51 @@ func TestSlashCommandsRequireTrustAndSystemInitForProjectSkills(t *testing.T) {
 	}
 }
 
+func TestParseAgentAIClaudeRemotePolicyTrustLevels(t *testing.T) {
+	parse := func(raw map[string]interface{}) agentAIClaudeRemotePolicy {
+		return parseAgentAIClaudeRemotePolicy(map[string]interface{}{"claude_remote_policy": raw})
+	}
+	if p := parse(map[string]interface{}{"trust_level": "full"}); p.trustTier != "full" {
+		t.Fatalf("full tier = %q", p.trustTier)
+	}
+	if p := parse(map[string]interface{}{"trust_level": "full"}); len(p.permissionAsk) != 0 {
+		t.Fatalf("full tier must not fill default ask list: %v", p.permissionAsk)
+	}
+	if p := parse(map[string]interface{}{"trust_level": "Sanitized"}); p.trustTier != "sanitized" {
+		t.Fatalf("case-insensitive tier = %q", p.trustTier)
+	}
+	if p := parse(map[string]interface{}{"trust_level": "banana"}); p.trustTier != "isolated" {
+		t.Fatalf("invalid tier must fail closed, got %q", p.trustTier)
+	}
+	if p := parse(map[string]interface{}{}); p.trustTier != "isolated" {
+		t.Fatalf("absent tier must default isolated, got %q", p.trustTier)
+	}
+	if p := parse(map[string]interface{}{"trust_level": "sanitized", "project_mcp_trusted": true}); !p.projectMCPTrusted {
+		t.Fatal("project_mcp_trusted not parsed")
+	}
+	if p := parse(testClaudeRemotePolicy(true)); p.trustTier != "sanitized" {
+		t.Fatalf("legacy trusted mapping = %q, want sanitized", p.trustTier)
+	}
+	if p := parse(testClaudeRemotePolicy(false)); p.trustTier != "isolated" {
+		t.Fatalf("legacy untrusted mapping = %q, want isolated", p.trustTier)
+	}
+	if p := parse(map[string]interface{}{"project_skill_trusted": true, "project_capability_mode": "disabled"}); p.trustTier != "isolated" {
+		t.Fatalf("legacy trusted+bad mode = %q, want isolated", p.trustTier)
+	}
+	if p := parse(map[string]interface{}{"trust_level": "full", "project_skill_trusted": false, "project_capability_mode": "disabled"}); p.trustTier != "full" {
+		t.Fatalf("trust_level must supersede legacy fields, got %q", p.trustTier)
+	}
+}
+
+func TestClaudeTierSettingSources(t *testing.T) {
+	cases := map[string]string{"isolated": "", "sanitized": "user", "full": "user,project", "": "", "bogus": ""}
+	for tier, want := range cases {
+		if got := claudeTierSettingSources(tier); got != want {
+			t.Fatalf("claudeTierSettingSources(%q) = %q, want %q", tier, got, want)
+		}
+	}
+}
+
 func argumentValue(args []string, key string) string {
 	for i := 0; i+1 < len(args); i++ {
 		if args[i] == key {

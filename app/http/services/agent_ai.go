@@ -589,6 +589,16 @@ type agentAIClaudeRemotePolicy struct {
 	settingSources          []string
 	disableSkillShell       bool
 	permissionAsk           []string
+	// trustTier is the effective trust tier ("isolated"|"sanitized"|"full").
+	// It supersedes projectSkillTrusted/projectCapabilityMode when the server
+	// sends trust_level; legacy fields map onto it for old servers.
+	trustTier string
+	// projectMCPTrusted opts the project's .mcp.json into the sanitized-tier
+	// explicit MCP merge (spec §5).
+	projectMCPTrusted bool
+	// policyNotice carries a structured downgrade/fallback reason surfaced on
+	// ai.run.started as policy_notice. Nil when the tier applied as requested.
+	policyNotice map[string]interface{}
 }
 
 type agentAIClaudeCapabilities struct {
@@ -614,10 +624,27 @@ func parseAgentAIClaudeRemotePolicy(msg map[string]interface{}) agentAIClaudeRem
 	if policy.projectCapabilityMode != "sanitized_plugin" {
 		policy.projectCapabilityMode = "disabled"
 	}
-	// Remote mode never reads filesystem settings. User/project/local permission
-	// arrays merge across scopes in Claude Code, so even a higher-precedence empty
-	// list cannot neutralize a stale user permissions.ask rule. Trusted project
-	// capabilities are loaded separately through a sanitized temporary plugin.
+	// Tier resolution — spec §3 compat mapping, evaluated in order:
+	// 1) valid trust_level wins and supersedes the legacy fields;
+	// 2) present-but-invalid trust_level → isolated (fail-closed);
+	// 3) no trust_level → legacy trusted+sanitized_plugin maps to sanitized,
+	//    everything else (incl. legacy untrusted) maps to isolated so old
+	//    servers keep byte-identical behavior;
+	// 4) absent claude_remote_policy → mechanism off (early return above).
+	if level := strings.TrimSpace(remoteString(raw, "trust_level")); level != "" {
+		if tier, valid := normalizeClaudeTrustTier(level); valid {
+			policy.trustTier = tier
+		} else {
+			policy.trustTier = "isolated"
+		}
+	} else if policy.projectSkillTrusted && policy.projectCapabilityMode == "sanitized_plugin" {
+		policy.trustTier = "sanitized"
+	} else {
+		policy.trustTier = "isolated"
+	}
+	policy.projectMCPTrusted = remoteBool(raw, "project_mcp_trusted", false)
+	// The tier table owns --setting-sources (see claudeTierSettingSources);
+	// the message-level setting_sources field is legacy and dropped.
 	policy.settingSources = nil
 	if settings, ok := raw["settings"].(map[string]interface{}); ok {
 		policy.disableSkillShell = remoteBool(settings, "disableSkillShellExecution", true)
@@ -625,7 +652,9 @@ func parseAgentAIClaudeRemotePolicy(msg map[string]interface{}) agentAIClaudeRem
 			policy.permissionAsk = remoteStringSlice(permissions, "ask")
 		}
 	}
-	if len(policy.permissionAsk) == 0 {
+	// Full tier must not add ask rules: blanket ask outranks allow and would
+	// suppress the user's own allow rules (= local approval volume, spec §3).
+	if len(policy.permissionAsk) == 0 && policy.trustTier != "full" {
 		policy.permissionAsk = []string{"Bash", "Edit", "Write", "NotebookEdit", "mcp__*"}
 	}
 	return policy

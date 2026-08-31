@@ -11,6 +11,38 @@ import (
 
 const claudeProjectCapabilityLimit = 500
 
+// normalizeClaudeTrustTier maps a server-sent trust_level to the internal tier
+// constant. ok is false for empty/unknown values so callers can distinguish
+// "absent" (legacy field fallback) from "present but invalid" (fail-closed).
+func normalizeClaudeTrustTier(value string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "isolated":
+		return "isolated", true
+	case "sanitized":
+		return "sanitized", true
+	case "full":
+		return "full", true
+	default:
+		return "", false
+	}
+}
+
+// claudeTierSettingSources returns the --setting-sources value for a tier:
+// isolated loads no settings files; sanitized loads user scope (user settings,
+// user/plugin skills and commands, user-scope MCP); full loads user+project
+// (project scope additionally brings project settings, .mcp.json, project
+// capabilities and CLAUDE.md — i.e. local parity).
+func claudeTierSettingSources(tier string) string {
+	switch tier {
+	case "full":
+		return "user,project"
+	case "sanitized":
+		return "user"
+	default:
+		return ""
+	}
+}
+
 // withClaudeRemotePolicy isolates remote Claude runs from project/local
 // settings. Explicitly trusted project commands and Skills are re-exposed via a
 // temporary plugin containing sanitized markdown and no project hooks.
