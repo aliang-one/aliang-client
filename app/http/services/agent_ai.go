@@ -666,6 +666,12 @@ func cloneAgentAIClaudeRemotePolicy(policy agentAIClaudeRemotePolicy) agentAICla
 	return policy
 }
 
+// applyClaudeTierVersionGuard downgrades non-isolated tiers on claude < 2.2
+// (spec §3 guard). Placeholder in this task; replaced in the guard task.
+func applyClaudeTierVersionGuard(tool *agentAITool, policy agentAIClaudeRemotePolicy) agentAIClaudeRemotePolicy {
+	return policy
+}
+
 func normalizeClaudeCapabilityName(name string) string {
 	return strings.TrimPrefix(strings.TrimSpace(name), "/")
 }
@@ -4636,15 +4642,16 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 	}
 	tool = withAgentAIAttachments(tool, run.attachments)
 	cleanupClaudePolicy := func() {}
+	effectiveRun := run
 	if tool.outputFormat == agentAIOutputClaudeStreamJSON && !run.readOnly {
-		var policyErr error
-		tool, cleanupClaudePolicy, policyErr = withClaudeRemotePolicy(tool, run)
-		if policyErr != nil {
-			_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, policyErr))
-			return agentAIRunDone
+		effectiveRun.claudePolicy = applyClaudeTierVersionGuard(tool, effectiveRun.claudePolicy)
+		var policyNotice map[string]interface{}
+		tool, cleanupClaudePolicy, policyNotice = withClaudeRemotePolicy(tool, effectiveRun)
+		if policyNotice != nil {
+			effectiveRun.claudePolicy.policyNotice = policyNotice
 		}
 		defer cleanupClaudePolicy()
-		tool = withClaudeApprovalHook(tool, run)
+		tool = withClaudeApprovalHook(tool, effectiveRun)
 	}
 
 	cmd := newBackgroundCommandContext(ctx, tool.path, tool.args...)

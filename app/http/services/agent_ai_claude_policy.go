@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"aliang.one/nursorgate/common/logger"
 )
 
 const claudeProjectCapabilityLimit = 500
@@ -43,28 +45,59 @@ func claudeTierSettingSources(tier string) string {
 	}
 }
 
-// withClaudeRemotePolicy isolates remote Claude runs from project/local
-// settings. Explicitly trusted project commands and Skills are re-exposed via a
-// temporary plugin containing sanitized markdown and no project hooks.
-func withClaudeRemotePolicy(tool *agentAITool, run agentAIRun) (*agentAITool, func(), error) {
+// withClaudeRemotePolicy applies the remote trust tier to a claude tool:
+// per-tier --setting-sources, the sanitized capability plugin for the
+// sanitized tier, and the explicit MCP merge when the server marked project
+// MCP trusted. On plugin/MCP preparation failure it degrades the run to the
+// isolated tier (fail-closed) and returns a structured policy notice instead
+// of failing the run (spec §3/§4.1).
+func withClaudeRemotePolicy(tool *agentAITool, run agentAIRun) (*agentAITool, func(), map[string]interface{}) {
 	cleanup := func() {}
 	if tool == nil || !run.claudePolicy.enabled {
 		return tool, cleanup, nil
 	}
 	copied := *tool
 	copied.args = append([]string(nil), tool.args...)
-	sources := strings.Join(run.claudePolicy.settingSources, ",")
-	flags := []string{"--setting-sources", sources}
-	if run.claudePolicy.projectSkillTrusted && run.claudePolicy.projectCapabilityMode == "sanitized_plugin" {
+	flags := []string{"--setting-sources", claudeTierSettingSources(run.claudePolicy.trustTier)}
+	if run.claudePolicy.trustTier == "sanitized" {
 		pluginDir, err := prepareClaudeProjectCapabilityPlugin(run.projectPath)
 		if err != nil {
-			return nil, cleanup, err
+			logger.Warn(fmt.Sprintf("claude-policy: sanitize failed, degrading run to isolated tier session=%s project=%q err=%v", run.sessionID, run.projectPath, err))
+			copied.args = append([]string{"--setting-sources", ""}, copied.args...)
+			return &copied, cleanup, map[string]interface{}{
+				"effective": "isolated",
+				"requested": "sanitized",
+				"reason":    "sanitize_failed",
+			}
 		}
 		cleanup = func() { _ = os.RemoveAll(pluginDir) }
 		flags = append(flags, "--plugin-dir", pluginDir)
+		mcpFlags, mcpCleanup, mcpErr := claudeTierMCPArgs(run.claudePolicy, run.projectPath)
+		if mcpErr != nil {
+			logger.Warn(fmt.Sprintf("claude-policy: mcp merge failed, degrading run to isolated tier session=%s project=%q err=%v", run.sessionID, run.projectPath, mcpErr))
+			_ = os.RemoveAll(pluginDir)
+			copied.args = append([]string{"--setting-sources", ""}, copied.args...)
+			return &copied, cleanup, map[string]interface{}{
+				"effective": "isolated",
+				"requested": "sanitized",
+				"reason":    "mcp_merge_failed",
+			}
+		}
+		if len(mcpFlags) > 0 {
+			inner := cleanup
+			cleanup = func() { mcpCleanup(); inner() }
+			flags = append(flags, mcpFlags...)
+		}
 	}
 	copied.args = append(flags, copied.args...)
 	return &copied, cleanup, nil
+}
+
+// claudeTierMCPArgs builds --strict-mcp-config/--mcp-config flags for the
+// sanitized tier when the server marked the project MCP trusted (spec §5).
+// Placeholder implementation in this task; replaced in the MCP merge task.
+func claudeTierMCPArgs(policy agentAIClaudeRemotePolicy, projectPath string) ([]string, func(), error) {
+	return nil, func() {}, nil
 }
 
 func prepareClaudeProjectCapabilityPlugin(projectPath string) (string, error) {

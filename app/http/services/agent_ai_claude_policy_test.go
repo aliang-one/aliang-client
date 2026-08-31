@@ -66,17 +66,17 @@ func TestClaudeRemotePolicyBuildsSanitizedProjectPlugin(t *testing.T) {
 		projectPath:  project,
 		claudePolicy: parseAgentAIClaudeRemotePolicy(map[string]interface{}{"claude_remote_policy": testClaudeRemotePolicy(true)}),
 	}
-	tool, cleanup, err := withClaudeRemotePolicy(&agentAITool{args: []string{"--print", "prompt"}}, run)
-	if err != nil {
-		t.Fatal(err)
+	tool, cleanup, notice := withClaudeRemotePolicy(&agentAITool{args: []string{"--print", "prompt"}}, run)
+	if notice != nil {
+		t.Fatalf("tier notice = %v", notice)
 	}
 	defer cleanup()
 	pluginDir := argumentValue(tool.args, "--plugin-dir")
 	if pluginDir == "" {
 		t.Fatalf("missing --plugin-dir in %v", tool.args)
 	}
-	if got := argumentValue(tool.args, "--setting-sources"); got != "" {
-		t.Fatalf("setting sources = %q, want none", got)
+	if got := argumentValue(tool.args, "--setting-sources"); got != "user" {
+		t.Fatalf("setting sources = %q, want user", got)
 	}
 	sanitized, err := os.ReadFile(filepath.Join(pluginDir, "skills", "deploy", "SKILL.md"))
 	if err != nil {
@@ -367,6 +367,69 @@ func TestClaudeTierSettingSources(t *testing.T) {
 		if got := claudeTierSettingSources(tier); got != want {
 			t.Fatalf("claudeTierSettingSources(%q) = %q, want %q", tier, got, want)
 		}
+	}
+}
+
+func TestClaudeRemotePolicyTierFlags(t *testing.T) {
+	project := t.TempDir()
+	mkRun := func(raw map[string]interface{}) agentAIRun {
+		return agentAIRun{projectPath: project, claudePolicy: parseAgentAIClaudeRemotePolicy(map[string]interface{}{"claude_remote_policy": raw})}
+	}
+	base := &agentAITool{args: []string{"--print", "prompt"}}
+
+	tool, cleanup, notice := withClaudeRemotePolicy(base, mkRun(map[string]interface{}{"trust_level": "full"}))
+	defer cleanup()
+	if notice != nil {
+		t.Fatalf("full tier returned notice: %v", notice)
+	}
+	if got := argumentValue(tool.args, "--setting-sources"); got != "user,project" {
+		t.Fatalf("full setting sources = %q", got)
+	}
+	if argumentValue(tool.args, "--plugin-dir") != "" {
+		t.Fatalf("full tier must not build plugin: %v", tool.args)
+	}
+
+	tool, cleanup, notice = withClaudeRemotePolicy(base, mkRun(map[string]interface{}{"trust_level": "sanitized"}))
+	defer cleanup()
+	if got := argumentValue(tool.args, "--setting-sources"); got != "user" {
+		t.Fatalf("sanitized setting sources = %q", got)
+	}
+	if argumentValue(tool.args, "--plugin-dir") == "" {
+		t.Fatalf("sanitized tier missing --plugin-dir: %v", tool.args)
+	}
+
+	tool, cleanup, _ = withClaudeRemotePolicy(base, mkRun(map[string]interface{}{}))
+	defer cleanup()
+	if got := argumentValue(tool.args, "--setting-sources"); got != "" {
+		t.Fatalf("isolated setting sources = %q", got)
+	}
+	if argumentValue(tool.args, "--plugin-dir") != "" {
+		t.Fatalf("isolated tier must not build plugin: %v", tool.args)
+	}
+}
+
+func TestClaudeRemotePolicySanitizeFailureDegradesToIsolated(t *testing.T) {
+	// projectPath points at a regular FILE so plugin preparation fails.
+	file := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(file, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run := agentAIRun{
+		projectPath: file,
+		claudePolicy: parseAgentAIClaudeRemotePolicy(map[string]interface{}{
+			"claude_remote_policy": map[string]interface{}{"trust_level": "sanitized"},
+		}),
+	}
+	tool, cleanup, notice := withClaudeRemotePolicy(&agentAITool{args: []string{"--print", "prompt"}}, run)
+	defer cleanup()
+	if notice == nil || notice["reason"] != "sanitize_failed" || notice["effective"] != "isolated" {
+		t.Fatalf("notice = %v, want sanitize_failed/isolated", notice)
+	}
+	if got := argumentValue(tool.args, "--setting-sources"); got != "" {
+		t.Fatalf("degraded setting sources = %q, want empty", got)
+	}
+	if argumentValue(tool.args, "--plugin-dir") != "" {
+		t.Fatalf("degraded run must not carry plugin: %v", tool.args)
 	}
 }
 
