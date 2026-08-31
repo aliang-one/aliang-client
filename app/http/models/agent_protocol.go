@@ -46,6 +46,8 @@ const (
 	AgentEventAIRunProgress           = "ai.run.progress" // server→mobile: live per-run files_touched_count + git_changed_count
 	AgentEventAIRunEventAck           = "ai.run.event.ack"
 	AgentEventGoalRunEventAck         = "goal.run.event.ack"
+	AgentEventAIRename                = "ai.session.rename"      // server→agent: user renamed a conversation on the phone; the agent persists it into its durable rename cache
+	AgentEventAIRenameAck             = "ai.session.rename.ack" // agent→server: rename accepted/rejected; carries the agent-clock title_updated_at PhoneServer's latestOf guard compares against
 	AgentEventAIStop                  = "ai.stop"
 	AgentEventAIStatus                = "ai.status"
 	AgentEventAIError                 = "ai.error"
@@ -211,6 +213,7 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				{Type: AgentEventSlashCommandsListError, Required: []string{"type", "request_id", "error"}},
 				{Type: AgentEventFileError, Required: []string{"type", "request_id", "error"}},
 				{Type: AgentEventError, Required: []string{"type", "error"}},
+				{Type: AgentEventAIRenameAck, Required: []string{"type", "session_id", "accepted"}, Optional: []string{"title_updated_at", "error"}},
 				{Type: AgentEventAIOptionRequest, Required: []string{"type", "session_id", "option_id", "options", "run_id", "event_seq"}, Optional: []string{"message_id", "title", "allow_custom", "multi", "provider"}},
 				{Type: AgentEventGoalPlanAIRequest, Required: []string{"type", "request_id", "goal_id", "planning_attempt_id", "ai_session_id", "turn", "messages"}},
 				{Type: AgentEventGoalPlanResult, Required: []string{"type", "request_id", "workspace_fingerprint_before", "workspace_fingerprint_after", "proposal"}, Optional: []string{"provider_run_id"}},
@@ -240,6 +243,7 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				{Type: AgentEventAIApprovalResponse, Required: []string{"type", "session_id", "approval_id", "decision"}, Optional: []string{"message_id", "scope", "raw", "delivery_id", "attempt"}, Emits: []string{AgentEventAIApprovalAck, AgentEventAIStatus, AgentEventAIError}},
 				{Type: AgentEventAIApprovalState, Required: []string{"type", "approval_id", "status"}, Optional: []string{"session_id"}},
 				{Type: AgentEventAIStop, Required: []string{"type", "session_id"}, Emits: []string{AgentEventAIStatus}},
+				{Type: AgentEventAIRename, Required: []string{"type", "session_id", "title"}, Optional: []string{"project_path", "provider", "tool", "source_session_id", "resume_session_id"}, Emits: []string{AgentEventAIRenameAck}},
 				{Type: AgentEventAISessionClose, Required: []string{"type", "session_id"}, Emits: []string{AgentEventAISessionClosed}},
 				{Type: AgentEventFileList, Required: []string{"type", "request_id", "project_path", "path"}, Optional: []string{"max_entries"}, Emits: []string{AgentEventFileListResult, AgentEventFileError}},
 				{Type: AgentEventFileRead, Required: []string{"type", "request_id", "project_path", "path"}, Optional: []string{"max_bytes"}, Emits: []string{AgentEventFileReadResult, AgentEventFileError}},

@@ -352,6 +352,13 @@ func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn) error {
 		// and a dialogue-liveness heartbeat for the server.
 		approvalSyncTicker := time.NewTicker(time.Minute)
 		defer approvalSyncTicker.Stop()
+		// Change-driven inventory: re-hash the cheap session fingerprint every
+		// few seconds; on a change push a hello immediately instead of waiting
+		// for the minute backstop. Titles, running status and rename-cache
+		// mutations reach the phone in ~one tick instead of up to 60s.
+		digestTicker := time.NewTicker(agentVibeDigestInterval)
+		defer digestTicker.Stop()
+		var lastVibeDigest string
 		for {
 			select {
 			case <-heartbeatTicker.C:
@@ -361,6 +368,20 @@ func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn) error {
 					"ts":        time.Now().UnixMilli(),
 					"load":      collectAgentLoadSnapshot(),
 				})
+			case <-digestTicker.C:
+				// The first tick only records the baseline — the connect hello
+				// already carried that state. Log-only on failure (see the
+				// periodic hello case): a failed push must not kill the stream.
+				digest := agentVibeDigest(agentHome())
+				if digest == "" {
+					continue
+				}
+				if lastVibeDigest != "" && digest != lastVibeDigest {
+					if err := s.sendAgentHello(writeJSON, "vibe_digest_change"); err != nil {
+						logger.Warn(fmt.Sprintf("[AGENT-BOOT] remote_connection digest_hello_failed error=%v", err))
+					}
+				}
+				lastVibeDigest = digest
 			case <-inventoryTicker.C:
 				// Log-only on failure: a periodic hello failure must NOT tear down
 				// the heartbeat/liveness stream. Returning here (the old behavior)
@@ -488,6 +509,13 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 		s.applyRemoteDeviceSettings(msg)
 	case models.AgentEventProjectSettings:
 		s.applyRemoteProjectSettings(msg)
+	case models.AgentEventAIRename:
+		// Phone-side conversation rename (PhoneServer agentPublish.ts). This
+		// agent historically ignored the event, forcing PhoneServer to freeze
+		// titles server-side; persisting it into the durable rename cache
+		// closes the phone→agent direction.
+		s.setRemoteConnectionState(true, "online", "")
+		s.handleRemoteAIRename(msg, writeJSON)
 	case models.AgentEventTunnelConfigure:
 		s.setRemoteConnectionState(true, "online", "")
 		s.configureTunnel(msg, writeJSON)
@@ -628,6 +656,7 @@ func remoteAgentMessageRequiresEnabledDevice(msgType string) bool {
 		models.AgentEventAISteer,
 		models.AgentEventAIApprovalResponse,
 		models.AgentEventAIOptionResponse,
+		models.AgentEventAIRename,
 		models.AgentEventAIStop,
 		models.AgentEventAISessionClose:
 		return true

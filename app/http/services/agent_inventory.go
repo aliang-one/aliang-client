@@ -15,6 +15,7 @@ import (
 
 	"aliang.one/nursorgate/app/http/models"
 	"aliang.one/nursorgate/common/cache"
+	"aliang.one/nursorgate/common/logger"
 )
 
 const (
@@ -26,7 +27,6 @@ const (
 	agentVibeIndexMaxBytes             = 2 * 1024 * 1024
 	agentVibeSummaryMaxSessions        = 200
 	agentVibeSessionFileScanLimit      = 120
-	agentVibeIndexFileScanLimit        = 80
 	agentVibeDetailCandidateFileLimit  = 24
 	agentRecentFileWalkMaxEntries      = 6000
 	agentRecentFileWalkMaxDuration     = 500 * time.Millisecond
@@ -640,12 +640,20 @@ func inferAgentVibeRoleFromContent(value interface{}) string {
 }
 
 func collectClaudeVibeSessions(scanDirs []string) []models.AgentVibeSession {
+	sessions, _ := collectClaudeVibeSessionsWithStats(scanDirs)
+	return sessions
+}
+
+// collectClaudeVibeSessionsWithStats additionally reports how many transcript
+// files the recency cap dropped, so list truncation is observable instead of
+// silent.
+func collectClaudeVibeSessionsWithStats(scanDirs []string) ([]models.AgentVibeSession, int) {
 	home := agentHome()
 	if home == "" {
-		return nil
+		return nil, 0
 	}
 	root := filepath.Join(home, ".claude", "projects")
-	indexFiles := findRecentAgentFiles(root, "sessions-index.json", agentVibeIndexFileScanLimit)
+	indexFiles := listAllProjectIndexFiles(root)
 	var sessions []models.AgentVibeSession
 	seen := make(map[string]bool)
 	for _, indexPath := range indexFiles {
@@ -701,7 +709,11 @@ func collectClaudeVibeSessions(scanDirs []string) []models.AgentVibeSession {
 			seen[session.ID] = true
 		}
 	}
-	for _, path := range findRecentAgentFiles(root, "*.jsonl", agentVibeSessionFileScanLimit) {
+	transcriptFiles, transcriptDropped, walkTruncated := findRecentAgentFilesWithStats(root, "*.jsonl", agentVibeSessionFileScanLimit)
+	if transcriptDropped > 0 || walkTruncated {
+		logger.Debug(fmt.Sprintf("[AGENT-INVENTORY] claude_jsonl_scan_truncated dropped=%d walk_truncated=%t", transcriptDropped, walkTruncated))
+	}
+	for _, path := range transcriptFiles {
 		if strings.Contains(path, string(filepath.Separator)+"subagents"+string(filepath.Separator)) {
 			continue
 		}
@@ -712,27 +724,59 @@ func collectClaudeVibeSessions(scanDirs []string) []models.AgentVibeSession {
 		sessions = append(sessions, session)
 		seen[session.ID] = true
 	}
-	// Claude Code persists the conversation title the user set via /rename in two
-	// places: sessions-index.json entries ("customTitle", durable — observed
-	// retaining months-old renames, but only written for projects Claude Code has
-	// indexed) and ~/.claude/sessions/<pid>.json ("name", retained only for
-	// recent/active processes). The index pass above already prefers customTitle
-	// over summary/firstPrompt; this overlay runs last so the freshest rename of
-	// a live process still wins, and renamed conversations in projects without a
-	// sessions-index.json keep working.
-	applyClaudeRenameNames(sessions, loadClaudeRenameNames(home))
-	return sessions
+	// Claude Code persists the conversation title the user set via /rename in
+	// two volatile places: sessions-index.json entries ("customTitle" — only
+	// written for indexed projects and skippable on unclean exits) and
+	// ~/.claude/sessions/<pid>.json ("name" — pruned with old processes, not
+	// always promptly). The index pass already prefers customTitle over
+	// summary/firstPrompt; this overlay then competes live pid records against
+	// the agent's durable rename cache (last-writer-wins on the agent clock) so
+	// a rename, once observed, never reverts — even after Claude Code prunes
+	// the pid file.
+	applyClaudeRenameNames(sessions, loadClaudeRenameRecords(home))
+	return sessions, transcriptDropped
 }
 
-// loadClaudeRenameNames reads ~/.claude/sessions/*.json and returns a map from
-// native Claude Code sessionId to the conversation title the user set via
-// /rename (the "name" field of each per-process session record). Files are
-// named by PID and are only retained for recent/active processes, so this
-// overlay covers the freshest renames; historical renamed conversations are
-// covered by the durable "customTitle" in sessions-index.json, which the index
-// pass already prefers over summary/firstPrompt.
-func loadClaudeRenameNames(home string) map[string]string {
-	out := map[string]string{}
+// listAllProjectIndexFiles enumerates every project directory under the
+// Claude projects root and returns its sessions-index.json. Index files are
+// tiny and few, so reading all of them is deterministic and loss-free —
+// unlike the recency-capped transcript walk, no project's renamed
+// conversation can silently fall off the list because its directory is old.
+func listAllProjectIndexFiles(root string) []string {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil
+	}
+	out := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		path := filepath.Join(root, entry.Name(), "sessions-index.json")
+		if info, err := os.Stat(path); err == nil && !info.IsDir() {
+			out = append(out, path)
+		}
+	}
+	return out
+}
+
+// agentRenamePidRecord is a /rename title from one per-process Claude session
+// record (~/.claude/sessions/<pid>.json). PID and UpdatedAt drive the
+// liveness check and the last-writer-wins competition against the durable
+// rename cache.
+type agentRenamePidRecord struct {
+	Name      string
+	PID       int
+	UpdatedAt time.Time
+}
+
+// loadClaudeRenameRecords reads ~/.claude/sessions/*.json and returns a map
+// from native Claude Code sessionId to the rename record of the process that
+// last set it. Files are named by PID and pruned for old processes (not
+// always promptly), so a record may outlive its process — isPidAlive decides
+// whether it may still compete for the title.
+func loadClaudeRenameRecords(home string) map[string]agentRenamePidRecord {
+	out := map[string]agentRenamePidRecord{}
 	if home = strings.TrimSpace(home); home == "" {
 		return out
 	}
@@ -748,35 +792,114 @@ func loadClaudeRenameNames(home string) map[string]string {
 		var row struct {
 			SessionID string `json:"sessionId"`
 			Name      string `json:"name"`
+			PID       int    `json:"pid"`
+			UpdatedAt string `json:"updatedAt"`
 		}
 		if err := json.Unmarshal(raw, &row); err != nil {
 			continue
 		}
-		if name := strings.TrimSpace(row.Name); row.SessionID != "" && name != "" {
-			out[row.SessionID] = name
+		name := strings.TrimSpace(row.Name)
+		if row.SessionID == "" || name == "" {
+			continue
 		}
+		ts := renameTimestamp(row.UpdatedAt)
+		if ts.IsZero() {
+			// Fall back to the pid file's mtime — the freshest observable
+			// write time when the record carries no updatedAt.
+			if info, err := os.Stat(file); err == nil {
+				ts = info.ModTime()
+			}
+		}
+		out[row.SessionID] = agentRenamePidRecord{Name: name, PID: row.PID, UpdatedAt: ts}
 	}
 	return out
 }
 
 // applyClaudeRenameNames overlays user-set /rename titles onto the collected
-// Claude sessions, keyed by native sessionId (the "claude_"-stripped session ID).
-func applyClaudeRenameNames(sessions []models.AgentVibeSession, renameNames map[string]string) {
-	if len(renameNames) == 0 {
-		return
-	}
+// Claude sessions, keyed by native sessionId (the "claude_"-stripped session
+// ID). A live pid record competes with the durable rename cache by updatedAt;
+// a dead pid record may only seed the cache when no entry exists yet, so
+// zombie pid files can never shadow a newer rename (previously every pid file
+// overwrote unconditionally in glob order). Newly observed pid names are
+// merged into the cache so titles survive Claude Code's pid-file pruning.
+func applyClaudeRenameNames(sessions []models.AgentVibeSession, records map[string]agentRenamePidRecord) {
+	renameCache := loadAgentRenameCache()
+	observed := map[string]agentRenameCacheEntry{}
 	for index := range sessions {
 		if !strings.HasPrefix(sessions[index].ID, "claude_") {
 			continue
 		}
 		nativeID := strings.TrimPrefix(sessions[index].ID, "claude_")
-		name := strings.TrimSpace(renameNames[nativeID])
-		if name == "" {
+		record, hasRecord := records[nativeID]
+		cached, hasCached := renameCache[nativeID]
+
+		winner := agentRenameCacheEntry{}
+		winnerTS := time.Time{}
+		if hasCached {
+			winner = cached
+			winnerTS = renameTimestamp(cached.UpdatedAt)
+		}
+		alive := hasRecord && isPidAlive(record.PID)
+		if alive {
+			// A session backed by a live Claude process is running work; the
+			// disk transcript alone could never tell (these used to always
+			// report "closed").
+			sessions[index].Status = "running"
+		}
+		// A dead pid record may only seed an empty cache slot; a live record
+		// competes on timestamps like any other source.
+		if hasRecord && (alive || !hasCached) {
+			if !hasCached || record.UpdatedAt.After(winnerTS) {
+				winner = agentRenameCacheEntry{
+					Name:        record.Name,
+					Origin:      agentRenameOriginLocal,
+					UpdatedAt:   renameStamp(record.UpdatedAt),
+					ProjectPath: sessions[index].ProjectPath,
+				}
+				winnerTS = record.UpdatedAt
+			}
+		}
+		if winner.Name == "" {
 			continue
 		}
-		sessions[index].Title = truncateAgentText(name, 200)
+		sessions[index].Title = truncateAgentText(winner.Name, 200)
 		if sessions[index].Summary == "" {
-			sessions[index].Summary = truncateAgentText(name, 500)
+			sessions[index].Summary = truncateAgentText(winner.Name, 500)
+		}
+		sessions[index].TitleUpdatedAt = winner.UpdatedAt
+		if winner.Origin == agentRenameOriginLocal {
+			observed[nativeID] = winner
+		}
+	}
+	if len(observed) > 0 {
+		mergeObservedRenamesIntoCache(observed)
+	}
+}
+
+func renameStamp(ts time.Time) string {
+	if ts.IsZero() {
+		return ""
+	}
+	return ts.UTC().Format(time.RFC3339Nano)
+}
+
+// mergeObservedRenamesIntoCache persists locally observed renames.
+// mergeAgentRenameEntry's no-op-on-equal-timestamp rule keeps this idempotent,
+// so the periodic inventory scan only rewrites the file when something
+// actually changed.
+func mergeObservedRenamesIntoCache(observed map[string]agentRenameCacheEntry) {
+	entries := loadAgentRenameCache()
+	changed := false
+	for sid, entry := range observed {
+		before, existed := entries[sid]
+		mergeAgentRenameEntry(entries, sid, entry.Name, entry.Origin, entry.UpdatedAt, entry.ProjectPath)
+		if !existed || entries[sid] != before {
+			changed = true
+		}
+	}
+	if changed {
+		if err := saveAgentRenameCache(entries); err != nil {
+			logger.Warn("[AGENT-RENAME] cache_persist_failed error=" + err.Error())
 		}
 	}
 }
@@ -1090,6 +1213,14 @@ func isAgentPathInsideAppBundle(path string) bool {
 }
 
 func findRecentAgentFiles(root string, pattern string, limit int) []string {
+	files, _, _ := findRecentAgentFilesWithStats(root, pattern, limit)
+	return files
+}
+
+// findRecentAgentFilesWithStats is findRecentAgentFiles plus visibility into
+// what the recency cap and walk budget threw away, so silent truncation of
+// the phone-visible session list becomes observable.
+func findRecentAgentFilesWithStats(root string, pattern string, limit int) ([]string, int, bool) {
 	if limit <= 0 {
 		limit = agentVibeSessionFileScanLimit
 	}
@@ -1097,8 +1228,11 @@ func findRecentAgentFiles(root string, pattern string, limit int) []string {
 	stack := []string{root}
 	startedAt := time.Now()
 	visitedEntries := 0
+	totalMatched := 0
+	walkTruncated := false
 	for len(stack) > 0 {
 		if shouldStopAgentRecentFileWalk(startedAt, visitedEntries) {
+			walkTruncated = true
 			break
 		}
 		dir := stack[len(stack)-1]
@@ -1113,6 +1247,7 @@ func findRecentAgentFiles(root string, pattern string, limit int) []string {
 		for _, entry := range entries {
 			visitedEntries++
 			if shouldStopAgentRecentFileWalk(startedAt, visitedEntries) {
+				walkTruncated = true
 				break
 			}
 			path := filepath.Join(dir, entry.Name())
@@ -1131,6 +1266,7 @@ func findRecentAgentFiles(root string, pattern string, limit int) []string {
 			if err != nil {
 				continue
 			}
+			totalMatched++
 			addAgentRecentFileCandidate(&candidates, agentRecentFileCandidate{path: path, modTime: info.ModTime()}, limit)
 		}
 	}
@@ -1141,7 +1277,7 @@ func findRecentAgentFiles(root string, pattern string, limit int) []string {
 	for _, candidate := range candidates {
 		out = append(out, candidate.path)
 	}
-	return out
+	return out, totalMatched - len(out), walkTruncated
 }
 
 func addAgentRecentFileCandidate(candidates *[]agentRecentFileCandidate, next agentRecentFileCandidate, limit int) {
