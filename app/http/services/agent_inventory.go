@@ -774,6 +774,7 @@ func listAllProjectIndexFiles(root string) []string {
 type agentRenamePidRecord struct {
 	Name      string
 	PID       int
+	Status    string
 	UpdatedAt time.Time
 }
 
@@ -797,10 +798,11 @@ func loadClaudeRenameRecords(home string) map[string]agentRenamePidRecord {
 			continue
 		}
 		var row struct {
-			SessionID string `json:"sessionId"`
-			Name      string `json:"name"`
-			PID       int    `json:"pid"`
-			UpdatedAt string `json:"updatedAt"`
+			SessionID string      `json:"sessionId"`
+			Name      string      `json:"name"`
+			PID       int         `json:"pid"`
+			Status    string      `json:"status"`
+			UpdatedAt interface{} `json:"updatedAt"`
 		}
 		if err := json.Unmarshal(raw, &row); err != nil {
 			continue
@@ -809,17 +811,41 @@ func loadClaudeRenameRecords(home string) map[string]agentRenamePidRecord {
 		if row.SessionID == "" || name == "" {
 			continue
 		}
-		ts := renameTimestamp(row.UpdatedAt)
-		if ts.IsZero() {
-			// Fall back to the pid file's mtime — the freshest observable
-			// write time when the record carries no updatedAt.
-			if info, err := os.Stat(file); err == nil {
-				ts = info.ModTime()
-			}
+		out[row.SessionID] = agentRenamePidRecord{
+			Name:      name,
+			PID:       row.PID,
+			Status:    strings.TrimSpace(row.Status),
+			UpdatedAt: pidRecordTimestamp(row.UpdatedAt, file),
 		}
-		out[row.SessionID] = agentRenamePidRecord{Name: name, PID: row.PID, UpdatedAt: ts}
 	}
 	return out
+}
+
+// pidRecordTimestamp decodes the pid record's updatedAt. Claude Code writes it
+// as UNIX MILLISECONDS (a JSON number — verified in real
+// ~/.claude/sessions/<pid>.json files); seconds or RFC3339 strings are
+// tolerated for other CC versions. Decoding must never fail the record, so
+// anything unrecognizable falls back to the file's mtime (the freshest
+// observable write time).
+func pidRecordTimestamp(value interface{}, file string) time.Time {
+	switch v := value.(type) {
+	case float64:
+		ms := int64(v)
+		if ms > 0 {
+			if ms < 1_000_000_000_000 { // small enough to be seconds, not millis
+				return time.Unix(ms, 0)
+			}
+			return time.UnixMilli(ms)
+		}
+	case string:
+		if ts := renameTimestamp(v); !ts.IsZero() {
+			return ts
+		}
+	}
+	if info, err := os.Stat(file); err == nil {
+		return info.ModTime()
+	}
+	return time.Time{}
 }
 
 // applyClaudeRenameNames overlays user-set /rename titles onto the collected
@@ -848,10 +874,15 @@ func applyClaudeRenameNames(sessions []models.AgentVibeSession, records map[stri
 		}
 		alive := hasRecord && isPidAlive(record.PID)
 		if alive {
-			// A session backed by a live Claude process is running work; the
-			// disk transcript alone could never tell (these used to always
-			// report "closed").
-			sessions[index].Status = "running"
+			// Follow Claude Code's own busy/idle signal: "running" means a
+			// task is executing, not merely that a TUI window is open (an
+			// idle TUI at the prompt used to show as forever "in progress"
+			// on the phone).
+			if record.Status == "busy" {
+				sessions[index].Status = "running"
+			} else {
+				sessions[index].Status = "idle"
+			}
 		}
 		if hasRecord {
 			recordEntry := agentRenameCacheEntry{

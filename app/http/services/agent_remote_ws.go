@@ -17,6 +17,38 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// agentBootReconnectGrace is how long the user agent waits for a session-owner
+// push after boot before attempting the connection from persisted state.
+const agentBootReconnectGrace = 15 * time.Second
+
+// agentShouldBootFallbackReconnect decides the boot fallback: the session owner
+// only forwards authority TRANSITIONS, so an agent (re)started while the
+// owner's state is quiet — the normal case after an agent crash, upgrade, or
+// the owner simply having run for days — used to wait in "awaiting session
+// owner sync" forever and the device showed offline on the phone. With
+// enabled+registered persisted state and no session event seen, the agent must
+// attempt the connection itself; the server stays the judge of token validity.
+func agentShouldBootFallbackReconnect(enabled, registered, sessionEventSeen bool) bool {
+	return !sessionEventSeen && enabled && registered
+}
+
+// ScheduleBootReconnectFallback arms the boot fallback (user-agent runtime
+// only). Safe to call multiple times; the connection itself is idempotent.
+func (s *AgentService) ScheduleBootReconnectFallback() {
+	if !IsUserAgentRuntime() {
+		return
+	}
+	time.AfterFunc(agentBootReconnectGrace, func() {
+		if !agentShouldBootFallbackReconnect(s.state.Enabled, s.state.Registered, s.bootSessionEventSeen.Load()) {
+			return
+		}
+		logger.Info("[AGENT-BOOT] boot_reconnect_fallback firing (no session-owner sync received)")
+		if err := s.EnsureRemoteConnection(); err != nil {
+			logger.Warn(fmt.Sprintf("[AGENT-BOOT] boot_reconnect_fallback failed: %v", err))
+		}
+	})
+}
+
 func (s *AgentService) EnsureRemoteConnection() error {
 	s.mu.Lock()
 	s.ensureDeviceIdentityLocked()

@@ -119,6 +119,12 @@ type AgentService struct {
 	// recorded userTokenExp stays current. All WS writes stay within the loop.
 	sessionRefreshSig chan struct{}
 
+	// bootSessionEventSeen records whether the session owner has forwarded any
+	// authority transition since this process started. The boot reconnect
+	// fallback (ScheduleBootReconnectFallback) stands down once it is set —
+	// the owner is driving the connection lifecycle.
+	bootSessionEventSeen atomic.Bool
+
 	// remoteWriter holds the live remote-connection writer. AI (and terminal)
 	// events are emitted through currentRemoteWriter() rather than a closure
 	// captured at message-arrival time, so a reconnect reattaches in-flight AI
@@ -182,6 +188,15 @@ func NewAgentService() *AgentService {
 			currentAgentServerURL(),
 			IsUserAgentRuntime(),
 		))
+	}
+	if IsUserAgentRuntime() {
+		// The persisted RemoteConnected=true from a previous process is NOT
+		// live truth — this process has no connection yet. Report honestly
+		// until a real connection (owner push or boot fallback) exists, and
+		// arm the fallback so a quiet session owner cannot leave the device
+		// offline forever.
+		s.setRemoteConnectionState(false, "starting", "awaiting session owner sync")
+		s.ScheduleBootReconnectFallback()
 	}
 	return s
 }

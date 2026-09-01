@@ -107,18 +107,19 @@ func TestCollectClaudeVibeSessionsPidNameSurvivesPidCleanup(t *testing.T) {
 }
 
 // TestCollectClaudeVibeSessionsLivePidMarksRunning verifies liveness: a session
-// whose pid record references a live process is reported as running instead of
-// closed, so the phone can see TUI work in progress.
+// whose pid record references a live process busy at work is reported as
+// running instead of closed, so the phone can see TUI work in progress. An
+// open-but-idle TUI reports "idle" (see agent_status_semantics_test.go).
 func TestCollectClaudeVibeSessionsLivePidMarksRunning(t *testing.T) {
 	const sid = "live-pid-running"
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	renameCollectFixture(t, sid,
-		`{"pid":`+itoaTest(os.Getpid())+`,"sessionId":"`+sid+`","name":"运行中会话","updatedAt":"`+now+`","status":"idle"}`)
+		`{"pid":`+itoaTest(os.Getpid())+`,"sessionId":"`+sid+`","name":"运行中会话","updatedAt":"`+now+`","status":"busy"}`)
 
 	sessions := collectClaudeVibeSessions(nil)
 	found := findCollectedSession(sessions, sid)
 	require.NotNil(t, found)
-	assert.Equal(t, "running", found.Status, "a session backed by a live pid must be reported as running")
+	assert.Equal(t, "running", found.Status, "a busy live pid must be reported as running")
 }
 
 // TestCollectClaudeVibeSessionsNewerPidNameRetakesCache verifies the reverse

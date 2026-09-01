@@ -91,3 +91,6 @@ config.json
 
 # runtime state spill from test runs (GetCacheSubdir fallback resolves relative)
 app/http/services/agent/
+
+# local test build
+aliang-rename-test
