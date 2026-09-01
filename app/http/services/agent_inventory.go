@@ -466,7 +466,7 @@ func readCodexSessionMetaWithOptions(path string, options agentVibeSessionReadOp
 		}
 		if msg := parseCodexTranscriptMessage(line, session.MessageCount); msg.Content != "" {
 			session.MessageCount++
-			if session.Title == "" && msg.Role == "user" {
+			if session.Title == "" && msg.Role == "user" && !isJunkAgentTitle(msg.Content) {
 				session.Title = truncateAgentText(msg.Content, 200)
 			}
 			window.add(msg)
@@ -691,12 +691,19 @@ func collectClaudeVibeSessionsWithStats(scanDirs []string) ([]models.AgentVibeSe
 			if len(scanDirs) > 0 && !pathUnderAnyScanDir(cleanAgentProjectPath(projectPath), scanDirs) {
 				continue
 			}
+			titleSource := firstNonEmpty(entry.CustomTitle, entry.Summary)
+			if isJunkAgentTitle(titleSource) {
+				titleSource = ""
+			}
+			if strings.TrimSpace(titleSource) == "" && !isJunkAgentTitle(entry.FirstPrompt) {
+				titleSource = entry.FirstPrompt
+			}
 			session := models.AgentVibeSession{
 				ID:           "claude_" + entry.SessionID,
 				Provider:     "claude",
 				Tool:         "claude",
 				ProjectPath:  cleanAgentProjectPath(projectPath),
-				Title:        truncateAgentText(firstNonEmpty(entry.CustomTitle, entry.Summary, entry.FirstPrompt), 200),
+				Title:        truncateAgentText(titleSource, 200),
 				Summary:      truncateAgentText(firstNonEmpty(entry.Summary, entry.CustomTitle), 500),
 				Mode:         "vibe",
 				Status:       "closed",
@@ -846,17 +853,28 @@ func applyClaudeRenameNames(sessions []models.AgentVibeSession, records map[stri
 			// report "closed").
 			sessions[index].Status = "running"
 		}
-		// A dead pid record may only seed an empty cache slot; a live record
-		// competes on timestamps like any other source.
-		if hasRecord && (alive || !hasCached) {
-			if !hasCached || record.UpdatedAt.After(winnerTS) {
-				winner = agentRenameCacheEntry{
-					Name:        record.Name,
-					Origin:      agentRenameOriginLocal,
-					UpdatedAt:   renameStamp(record.UpdatedAt),
-					ProjectPath: sessions[index].ProjectPath,
-				}
-				winnerTS = record.UpdatedAt
+		if hasRecord {
+			recordEntry := agentRenameCacheEntry{
+				Name:        record.Name,
+				Origin:      agentRenameOriginLocal,
+				UpdatedAt:   renameStamp(record.UpdatedAt),
+				ProjectPath: sessions[index].ProjectPath,
+			}
+			switch {
+			case hasCached && cached.Name == record.Name:
+				// Same-name timestamp churn: Claude Code keeps rewriting a live
+				// pid record's updatedAt/status while the session is active.
+				// Nothing user-visible changed — keep the cache winner as-is so
+				// the cache file, title_updated_at and the digest all stay put.
+			case !hasCached:
+				// First sight: a pid record seeds the cache even when its
+				// process is already dead, making the rename durable.
+				winner, winnerTS = recordEntry, record.UpdatedAt
+			case alive && record.UpdatedAt.After(winnerTS):
+				// A live record with a different, strictly newer name competes
+				// like any other source (last-writer-wins). Dead pid records
+				// can never retake (zombie rule).
+				winner, winnerTS = recordEntry, record.UpdatedAt
 			}
 		}
 		if winner.Name == "" {
@@ -975,7 +993,9 @@ func readClaudeSessionMetaWithOptions(path string, options agentVibeSessionReadO
 			}
 		}
 		if session.Title == "" && row.Type == "user" {
-			session.Title = truncateAgentText(claudeMessageText(row.Message), 200)
+			if text := claudeMessageText(row.Message); text != "" && !isJunkAgentTitle(text) {
+				session.Title = truncateAgentText(text, 200)
+			}
 		}
 	}
 	if session.ID == "" {
@@ -1158,6 +1178,34 @@ func normalizeAgentVibeRole(value string) string {
 	default:
 		return ""
 	}
+}
+
+// isJunkAgentTitle reports whether text is a Claude Code meta wrapper rather
+// than user-authored content. Transcripts routinely open with injected
+// messages — local-command caveats, slash-command invocations, command
+// output, system reminders — and 37% of this machine's transcripts had one as
+// the first user turn. These must never become the conversation title (the
+// phone list used to show them verbatim); skipping them lets the title fall
+// to the first real user message, or stay empty so downstream placeholders
+// apply.
+func isJunkAgentTitle(text string) bool {
+	t := strings.TrimSpace(text)
+	if t == "" {
+		return true
+	}
+	for _, marker := range []string{
+		"<local-command-caveat>",
+		"<command-name>",
+		"<command-message>",
+		"<command-args>",
+		"<local-command-stdout>",
+		"<system-reminder>",
+	} {
+		if strings.Contains(t, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func truncateAgentText(value string, max int) string {

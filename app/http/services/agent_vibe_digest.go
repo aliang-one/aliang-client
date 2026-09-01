@@ -67,11 +67,13 @@ func agentVibeDigest(home string) string {
 	}
 
 	for sid, record := range loadClaudeRenameRecords(home) {
+		// No timestamp here on purpose: Claude Code rewrites live pid records
+		// (updatedAt/status) every few seconds during activity. Only the
+		// wire-visible state — name and liveness — may flip the digest.
 		alive := isPidAlive(record.PID)
 		tuples = append(tuples, tuple{
 			id:    "pid_" + sid,
 			title: record.Name,
-			ts:    renameStamp(record.UpdatedAt),
 			extra: aliveLiveMark(alive),
 		})
 	}

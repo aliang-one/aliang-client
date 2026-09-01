@@ -88,3 +88,6 @@ docs/context*.md
 
 # machine-local runtime config (use config.new.json as template)
 config.json
+
+# runtime state spill from test runs (GetCacheSubdir fallback resolves relative)
+app/http/services/agent/
