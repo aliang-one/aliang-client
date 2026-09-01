@@ -458,7 +458,7 @@ func TestSlashCommandsRequireTrustAndSystemInitForProjectSkills(t *testing.T) {
 	}
 	manager := newAgentAIManager()
 	manager.sessions["s1"] = &agentAISession{id: "s1", projectPath: project}
-	manager.recordClaudeCapabilities("s1", project, []string{"aliang-project:deploy"}, "2.1.17")
+	manager.recordClaudeCapabilities("s1", project, []string{"aliang-project:deploy"}, "2.2.5")
 
 	msg := map[string]interface{}{
 		"request_id":           "r1",
@@ -476,12 +476,21 @@ func TestSlashCommandsRequireTrustAndSystemInitForProjectSkills(t *testing.T) {
 
 	msg["claude_remote_policy"] = testClaudeRemotePolicy(true)
 	trusted := agentSlashCommandsListPayloadWithManager(msg, manager)
-	if trusted["verified"] != true || trusted["claude_version"] != "2.1.17" {
+	if trusted["verified"] != true || trusted["claude_version"] != "2.2.5" {
 		t.Fatalf("verification metadata = %+v", trusted)
 	}
 	commands := trusted["commands"].([]map[string]interface{})
 	if len(commands) != 1 || commands[0]["name"] != "aliang-project:deploy" || commands[0]["kind"] != "skill" {
 		t.Fatalf("trusted commands = %+v", commands)
+	}
+
+	// Spec §9.11 list-path guard: a pre-2.2 init snapshot downgrades the
+	// sanitized request to isolated for gating purposes, so the plugin-
+	// namespace entries disappear even though the tier was requested.
+	manager.recordClaudeCapabilities("s1", project, []string{"aliang-project:deploy"}, "2.1.17")
+	downgraded := agentSlashCommandsListPayloadWithManager(msg, manager)
+	if commands := downgraded["commands"].([]map[string]interface{}); len(commands) != 0 {
+		t.Fatalf("pre-2.2 snapshot leaked project commands into sanitized list: %+v", commands)
 	}
 }
 
@@ -514,6 +523,38 @@ func TestSlashCommandsFullTierListsProjectBareNames(t *testing.T) {
 	commands := payload["commands"].([]map[string]interface{})
 	if len(commands) != 1 || commands[0]["name"] != "deploy" {
 		t.Fatalf("full tier commands = %+v, want bare deploy", commands)
+	}
+}
+
+func TestSlashCommandsPre2_2SnapshotDowngradesToList(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	project := t.TempDir()
+	skillDir := filepath.Join(project, ".claude", "skills", "deploy")
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("---\nname: deploy\ndescription: Deploy\n---\nbody\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	manager := newAgentAIManager()
+	manager.sessions["s1"] = &agentAISession{id: "s1", projectPath: project}
+	manager.recordClaudeCapabilities("s1", project, []string{"aliang-project:deploy"}, "2.1.17")
+
+	msg := map[string]interface{}{
+		"request_id":           "r1",
+		"session_id":           "s1",
+		"project_path":         project,
+		"provider":             "claude",
+		"include_user_level":   false,
+		"include_plugins":      false,
+		"claude_remote_policy": map[string]interface{}{"trust_level": "sanitized"},
+	}
+	payload := agentSlashCommandsListPayloadWithManager(msg, manager)
+	commands := payload["commands"].([]map[string]interface{})
+	if len(commands) != 0 {
+		t.Fatalf("pre-2.2 snapshot must gate project commands out of the sanitized list: %+v", commands)
 	}
 }
 

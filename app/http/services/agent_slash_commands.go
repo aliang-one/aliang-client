@@ -49,11 +49,33 @@ func agentSlashCommandsListPayloadWithManager(msg map[string]interface{}, manage
 	includeUser := remoteBool(msg, "include_user_level", true)
 	includePlugins := remoteBool(msg, "include_plugins", true)
 	remotePolicy := parseAgentAIClaudeRemotePolicy(msg)
+	// Hoisted init-snapshot lookup (policy-independent, same conditions as the
+	// verified/version block below): spec §9.11 version guard — when the
+	// session's recorded claude predates 2.2.0 (or is unparsable), the
+	// EFFECTIVE tier for list gating is isolated even if the request asked for
+	// sanitized/full, so aliang-project:* entries are not exposed before the
+	// run-path guard downgrades the actual run. Residual window (spec §9.11):
+	// with no snapshot yet (pre-first-run, or nil manager) the REQUESTED tier
+	// gates the list (verified:false on the payload); the first run records
+	// the snapshot and the list self-corrects.
+	effectiveTier := remotePolicy.trustTier
+	var claudeCaps agentAIClaudeCapabilities
+	haveClaudeCaps := false
+	if provider == "claude" && manager != nil {
+		if caps, ok := manager.claudeCapabilities(remoteString(msg, "session_id"), projectPath); ok {
+			claudeCaps, haveClaudeCaps = caps, true
+			if remotePolicy.enabled {
+				if v, pok := parseClaudeCodeVersion(caps.version); !pok || !v.atLeast(2, 2, 0) {
+					effectiveTier = "isolated"
+				}
+			}
+		}
+	}
 	projectPrefix := ""
-	if remotePolicy.enabled && remotePolicy.trustTier == "sanitized" {
+	if remotePolicy.enabled && effectiveTier == "sanitized" {
 		projectPrefix = claudeProjectPluginNamespace + ":"
 	}
-	includeProjectClaude := !remotePolicy.enabled || remotePolicy.trustTier == "sanitized" || remotePolicy.trustTier == "full"
+	includeProjectClaude := !remotePolicy.enabled || effectiveTier == "sanitized" || effectiveTier == "full"
 
 	wantClaude := provider == "" || provider == "claude"
 	wantCodex := provider == "" || provider == "codex"
@@ -80,13 +102,11 @@ func agentSlashCommandsListPayloadWithManager(msg map[string]interface{}, manage
 	sortSlashCommands(commands)
 	verified := !wantClaude
 	var claudeVersion, capabilityGeneration string
-	if provider == "claude" && manager != nil {
-		if caps, ok := manager.claudeCapabilities(remoteString(msg, "session_id"), projectPath); ok {
-			verified = true
-			claudeVersion = caps.version
-			capabilityGeneration = caps.generation
-			commands = filterVerifiedClaudeCommands(commands, caps.commands)
-		}
+	if haveClaudeCaps {
+		verified = true
+		claudeVersion = claudeCaps.version
+		capabilityGeneration = claudeCaps.generation
+		commands = filterVerifiedClaudeCommands(commands, claudeCaps.commands)
 	}
 
 	payload := map[string]interface{}{
