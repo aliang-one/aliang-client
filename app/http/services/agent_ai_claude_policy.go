@@ -166,13 +166,55 @@ func claudeTierMCPArgs(policy agentAIClaudeRemotePolicy, projectPath string) ([]
 	return []string{"--strict-mcp-config", "--mcp-config", tmp.Name()}, cleanup, nil
 }
 
+// claudeEnabledPlugins reads the "enabledPlugins" map from
+// <agentHome>/.claude/settings.json. A missing file, a missing key, a
+// non-object value, or a parse error all yield an empty map — every plugin
+// disabled (fail-closed, matching readPluginMCPServers's tolerance posture:
+// load fewer, never more). Only an absent file stays silent; a file that
+// exists but cannot be parsed is logged like other tolerated sources.
+func claudeEnabledPlugins() map[string]interface{} {
+	home := agentHome()
+	if home == "" {
+		return nil
+	}
+	settingsPath := filepath.Join(home, ".claude", "settings.json")
+	raw, err := os.ReadFile(settingsPath)
+	if err != nil {
+		return nil // absent/unreadable settings: all plugins disabled (silent)
+	}
+	var settings map[string]interface{}
+	if err := json.Unmarshal(raw, &settings); err != nil {
+		logger.Warn(fmt.Sprintf("claude-policy: unparseable settings %s: %v", settingsPath, err))
+		return nil
+	}
+	enabled, _ := settings["enabledPlugins"].(map[string]interface{})
+	return enabled
+}
+
+// claudePluginEnabled reports whether enabledPlugins marks a plugin key
+// enabled: only an explicit true counts (spec §9.9 — load fewer, never more;
+// installed-but-unlisted plugins are treated as disabled).
+func claudePluginEnabled(enabledPlugins map[string]interface{}, key string) bool {
+	v, ok := enabledPlugins[key]
+	if !ok {
+		return false
+	}
+	enabled, ok := v.(bool)
+	return ok && enabled
+}
+
 // readPluginMCPServers adds MCP servers declared by user-scope plugins
 // (installed_plugins.json → <installPath>/.mcp.json) into dst under claude's
 // native composite names ("plugin:<plugin>:<server>"), so strict-mode merged
 // configs keep plugin servers that --strict-mcp-config would otherwise
-// suppress (spec §9.9). Plugin declarations come in two shapes — the wrapped
-// {"mcpServers":{...}} and the flat {"<server>":{...}} — both are handled.
-// Read/parse failures are logged and skipped (tolerate, never degrade).
+// suppress (spec §9.9). Only plugins explicitly enabled in
+// ~/.claude/settings.json "enabledPlugins" ("<plugin>@<market>": true) are
+// merged — a missing key, false, or any other value means DISABLED, so an
+// installed-but-unlisted plugin is treated as off (fail-closed: load fewer,
+// never more, mirroring native claude's own gate). Plugin declarations come
+// in two shapes — the wrapped {"mcpServers":{...}} and the flat
+// {"<server>":{...}} — both are handled. Read/parse failures are logged and
+// skipped (tolerate, never degrade).
 // Returns the number of servers added.
 func readPluginMCPServers(dst map[string]interface{}) int {
 	home := agentHome()
@@ -191,6 +233,7 @@ func readPluginMCPServers(dst map[string]interface{}) int {
 		logger.Warn(fmt.Sprintf("claude-policy: unparseable plugin registry %s: %v", registryPath, err))
 		return 0
 	}
+	enabledPlugins := claudeEnabledPlugins()
 	pluginKeys := make([]string, 0, len(registry.Plugins))
 	for key := range registry.Plugins {
 		pluginKeys = append(pluginKeys, key)
@@ -198,6 +241,9 @@ func readPluginMCPServers(dst map[string]interface{}) int {
 	sort.Strings(pluginKeys) // deterministic merged output
 	added := 0
 	for _, key := range pluginKeys {
+		if !claudePluginEnabled(enabledPlugins, key) {
+			continue
+		}
 		pluginName, _, _ := strings.Cut(key, "@")
 		if pluginName == "" {
 			continue
@@ -225,6 +271,9 @@ func readPluginMCPServers(dst map[string]interface{}) int {
 func readPluginMCPDeclaration(installPath, pluginName string, dst map[string]interface{}) int {
 	raw, err := os.ReadFile(filepath.Join(installPath, ".mcp.json"))
 	if err != nil {
+		if !os.IsNotExist(err) {
+			logger.Warn(fmt.Sprintf("claude-policy: unreadable plugin MCP declaration %s: %v", installPath, err))
+		}
 		return 0 // absent declaration: this plugin provides no MCP servers
 	}
 	var decoded map[string]interface{}
@@ -233,6 +282,8 @@ func readPluginMCPDeclaration(installPath, pluginName string, dst map[string]int
 		return 0
 	}
 	var servers map[string]interface{}
+	// Note: a flat server literally named "mcpServers" is interpreted as the
+	// wrapped shape here (mirrors native precedence).
 	if wrapped, ok := decoded["mcpServers"].(map[string]interface{}); ok {
 		servers = wrapped
 	} else {

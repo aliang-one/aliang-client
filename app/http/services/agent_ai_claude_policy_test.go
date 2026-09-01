@@ -847,6 +847,14 @@ func TestReadPluginMCPServersShapesAndNaming(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(pluginsDir, "installed_plugins.json"), raw, 0o644); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.MkdirAll(filepath.Join(home, ".claude"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// The enabledPlugins gate is fail-closed: user-scope plugins must be
+	// explicitly enabled in settings.json to merge.
+	if err := os.WriteFile(filepath.Join(home, ".claude", "settings.json"), []byte(`{"enabledPlugins":{"figma@market":true,"playwright@market":true}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	// wrapped shape
 	if err := os.MkdirAll(filepath.Join(pluginsDir, "figma"), 0o755); err != nil {
 		t.Fatal(err)
@@ -894,8 +902,9 @@ func TestReadPluginMCPServersToleratesBrokenSources(t *testing.T) {
 	}
 	// Missing installed_plugins.json entirely → silent no-op.
 	dst2 := map[string]interface{}{}
-	t.Setenv("HOME", t.TempDir())
-	t.Setenv("USERPROFILE", t.TempDir())
+	emptyHome := t.TempDir()
+	t.Setenv("HOME", emptyHome)
+	t.Setenv("USERPROFILE", emptyHome)
 	if added := readPluginMCPServers(dst2); added != 0 {
 		t.Fatalf("missing registry must add nothing: %d", added)
 	}
@@ -906,11 +915,25 @@ func TestClaudeTierMCPArgsIncludesPluginServers(t *testing.T) {
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
 	pluginsDir := filepath.Join(home, ".claude", "plugins")
-	os.MkdirAll(filepath.Join(pluginsDir, "playwright"), 0o755)
-	os.WriteFile(filepath.Join(pluginsDir, "installed_plugins.json"), []byte(`{"version":2,"plugins":{"playwright@market":[{"scope":"user","installPath":"`+filepath.Join(pluginsDir, "playwright")+`"}]}}`), 0o644)
-	os.WriteFile(filepath.Join(pluginsDir, "playwright", ".mcp.json"), []byte(`{"playwright":{"command":"npx"}}`), 0o644)
+	if err := os.MkdirAll(filepath.Join(pluginsDir, "playwright"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pluginsDir, "installed_plugins.json"), []byte(`{"version":2,"plugins":{"playwright@market":[{"scope":"user","installPath":"`+filepath.Join(pluginsDir, "playwright")+`"}]}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pluginsDir, "playwright", ".mcp.json"), []byte(`{"playwright":{"command":"npx"}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(home, ".claude"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".claude", "settings.json"), []byte(`{"enabledPlugins":{"playwright@market":true}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	project := t.TempDir()
-	os.WriteFile(filepath.Join(project, ".mcp.json"), []byte(`{"mcpServers":{"p-only":{"command":"project-only"}}}`), 0o644)
+	if err := os.WriteFile(filepath.Join(project, ".mcp.json"), []byte(`{"mcpServers":{"p-only":{"command":"project-only"}}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	policy := parseAgentAIClaudeRemotePolicy(map[string]interface{}{"claude_remote_policy": map[string]interface{}{"trust_level": "sanitized", "project_mcp_trusted": true}})
 	flags, cleanup, err := claudeTierMCPArgs(policy, project)
@@ -936,6 +959,75 @@ func TestClaudeTierMCPArgsIncludesPluginServers(t *testing.T) {
 	}
 	if _, ok := parsed.MCPServers["p-only"]; !ok {
 		t.Fatalf("project server missing: %v", parsed.MCPServers)
+	}
+}
+
+func TestClaudeTierMCPArgsPluginsAloneDoNotTriggerStrictMode(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	pluginsDir := filepath.Join(home, ".claude", "plugins")
+	if err := os.MkdirAll(filepath.Join(pluginsDir, "playwright"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pluginsDir, "installed_plugins.json"), []byte(`{"version":2,"plugins":{"playwright@market":[{"scope":"user","installPath":"`+filepath.Join(pluginsDir, "playwright")+`"}]}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pluginsDir, "playwright", ".mcp.json"), []byte(`{"playwright":{"command":"npx"}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// No project .mcp.json at all → no project contribution → nil flags even
+	// though plugin servers were found: native discovery loads them fine.
+	policy := parseAgentAIClaudeRemotePolicy(map[string]interface{}{"claude_remote_policy": map[string]interface{}{"trust_level": "sanitized", "project_mcp_trusted": true}})
+	flags, cleanup, err := claudeTierMCPArgs(policy, t.TempDir())
+	defer cleanup()
+	if err != nil || flags != nil {
+		t.Fatalf("plugin-only content must not trigger strict mode: flags=%v err=%v", flags, err)
+	}
+}
+
+func TestReadPluginMCPServersRespectsEnabledPlugins(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	pluginsDir := filepath.Join(home, ".claude", "plugins")
+	os.MkdirAll(filepath.Join(pluginsDir, "on"), 0o755)
+	os.MkdirAll(filepath.Join(pluginsDir, "off"), 0o755)
+	os.MkdirAll(filepath.Join(home, ".claude"), 0o755)
+	os.WriteFile(filepath.Join(pluginsDir, "installed_plugins.json"), []byte(`{"version":2,"plugins":{"on@market":[{"scope":"user","installPath":"`+filepath.Join(pluginsDir, "on")+`"}],"off@market":[{"scope":"user","installPath":"`+filepath.Join(pluginsDir, "off")+`"}]}}`), 0o644)
+	os.WriteFile(filepath.Join(pluginsDir, "on", ".mcp.json"), []byte(`{"on":{"command":"a"}}`), 0o644)
+	os.WriteFile(filepath.Join(pluginsDir, "off", ".mcp.json"), []byte(`{"off":{"command":"b"}}`), 0o644)
+	// settings.json: "on" explicitly true, "off" explicitly false.
+	os.WriteFile(filepath.Join(home, ".claude", "settings.json"), []byte(`{"enabledPlugins":{"on@market":true,"off@market":false}}`), 0o644)
+
+	dst := map[string]interface{}{}
+	readPluginMCPServers(dst)
+	if _, ok := dst["plugin:on:on"]; !ok {
+		t.Fatalf("enabled plugin missing: %v", dst)
+	}
+	if _, ok := dst["plugin:off:off"]; ok {
+		t.Fatalf("explicitly disabled plugin must not merge: %v", dst)
+	}
+	// Absent key → disabled (installed-but-unlisted is treated as off).
+	os.WriteFile(filepath.Join(home, ".claude", "settings.json"), []byte(`{"enabledPlugins":{}}`), 0o644)
+	dst2 := map[string]interface{}{}
+	if added := readPluginMCPServers(dst2); added != 0 || len(dst2) != 0 {
+		t.Fatalf("unlisted plugins must be treated as disabled: added=%d dst=%v", added, dst2)
+	}
+}
+
+func TestReadPluginMCPDeclarationWrappedWinsAndSkipsNonObjects(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, ".mcp.json"), []byte(`{"mcpServers":{"wrapped":{"command":"a"}},"flat":{"command":"b"},"$schema":"x"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dst := map[string]interface{}{}
+	readPluginMCPDeclaration(dir, "demo", dst)
+	if _, ok := dst["plugin:demo:wrapped"]; !ok {
+		t.Fatalf("wrapped server missing: %v", dst)
+	}
+	if _, ok := dst["plugin:demo:flat"]; ok {
+		t.Fatalf("flat key must be ignored when wrapped shape present: %v", dst)
 	}
 }
 
