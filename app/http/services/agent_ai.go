@@ -571,7 +571,6 @@ type agentAICodexInputAnswer struct {
 var (
 	agentAIApprovalHookBaseURLMu sync.RWMutex
 	agentAIApprovalHookBaseURL   = UserAgentBaseURL()
-	claudeApprovalHookCache      sync.Map // map[executable fingerprint]claudeApprovalHookStrategy
 )
 
 type claudeApprovalHookStrategy string
@@ -667,35 +666,51 @@ func cloneAgentAIClaudeRemotePolicy(policy agentAIClaudeRemotePolicy) agentAICla
 }
 
 type claudeCodeVersionProbe struct {
-	version claudeCodeVersion
-	ok      bool
+	raw string
+	ok  bool
 }
 
 var claudeCodeVersionProbeCache sync.Map
 
-// probeClaudeCodeVersion returns the parsed version of the claude executable,
-// cached per executable content on success only. ok=false when the probe
-// fails (missing or non-claude binary) — callers treat that as fail-closed.
-// Failures are not cached: each pass re-probes (cost bounded by the 2s
-// timeout) so a transient timeout self-heals on the next pass.
-func probeClaudeCodeVersion(toolPath string) (claudeCodeVersion, bool) {
+// probeClaudeRawVersion returns the raw `claude --version` output for the
+// executable, cached per executable content. ok=false when the probe fails
+// (missing or non-claude binary) — failures are NOT cached (retried each
+// pass, bounded by the 2s timeout); successes are cached until the binary
+// content changes. Both consumers (hook strategy + trust-tier guard) parse
+// their own derivatives from this single source.
+func probeClaudeRawVersion(toolPath string) (string, bool) {
 	toolPath = strings.TrimSpace(toolPath)
 	if toolPath == "" {
-		return claudeCodeVersion{}, false
+		return "", false
 	}
 	cacheKey := executableProbeCacheKey(toolPath)
 	if cached, ok := claudeCodeVersionProbeCache.Load(cacheKey); ok {
 		probe, _ := cached.(claudeCodeVersionProbe)
-		return probe.version, probe.ok
+		return probe.raw, probe.ok
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	out, err := newBackgroundCommandContext(ctx, toolPath, "--version").CombinedOutput()
-	version, ok := parseClaudeCodeVersion(string(out))
-	if err != nil || !ok {
+	if err != nil {
+		return "", false
+	}
+	claudeCodeVersionProbeCache.Store(cacheKey, claudeCodeVersionProbe{raw: string(out), ok: true})
+	return string(out), true
+}
+
+// probeClaudeCodeVersion returns the parsed version of the claude executable,
+// cached per executable content on success only (via probeClaudeRawVersion).
+// ok=false when the probe fails or the raw output is unparsable — callers
+// treat that as fail-closed.
+func probeClaudeCodeVersion(toolPath string) (claudeCodeVersion, bool) {
+	raw, ok := probeClaudeRawVersion(toolPath)
+	if !ok {
 		return claudeCodeVersion{}, false
 	}
-	claudeCodeVersionProbeCache.Store(cacheKey, claudeCodeVersionProbe{version: version, ok: true})
+	version, ok := parseClaudeCodeVersion(raw)
+	if !ok {
+		return claudeCodeVersion{}, false
+	}
 	return version, true
 }
 
@@ -6782,25 +6797,11 @@ func detectClaudeApprovalHookStrategy(toolPath string) claudeApprovalHookStrateg
 	if strategy, ok := claudeApprovalHookStrategyOverride(os.Getenv("ALIANG_CLAUDE_APPROVAL_HOOK")); ok {
 		return strategy
 	}
-	toolPath = strings.TrimSpace(toolPath)
-	if toolPath == "" {
+	raw, ok := probeClaudeRawVersion(toolPath)
+	if !ok {
 		return claudeApprovalHookPreToolUseCommand
 	}
-	cacheKey := executableProbeCacheKey(toolPath)
-	if cached, ok := claudeApprovalHookCache.Load(cacheKey); ok {
-		if strategy, ok := cached.(claudeApprovalHookStrategy); ok {
-			return strategy
-		}
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	out, err := newBackgroundCommandContext(ctx, toolPath, "--version").CombinedOutput()
-	strategy := claudeApprovalHookPreToolUseCommand
-	if err == nil {
-		strategy = claudeApprovalHookStrategyForVersion(string(out))
-	}
-	claudeApprovalHookCache.Store(cacheKey, strategy)
-	return strategy
+	return claudeApprovalHookStrategyForVersion(raw)
 }
 
 const claudeApprovalHookTimeoutGrace = 30 * time.Second

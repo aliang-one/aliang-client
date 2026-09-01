@@ -307,6 +307,30 @@ func TestExecutableProbeCacheKeyRefreshesAfterExecutableUpdate(t *testing.T) {
 	}
 }
 
+func TestClaudeVersionProbeSharedCache(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("sh-script version probes are unix-only; windows coverage tracked separately")
+	}
+	dir := t.TempDir()
+	script := filepath.Join(dir, "claude")
+	counter := filepath.Join(dir, "count")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\necho 1 >> "+counter+"\necho \"2.2.5 (Claude Code)\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	_ = detectClaudeApprovalHookStrategy(script)
+	_, _ = probeClaudeCodeVersion(script)
+	first, err1 := os.ReadFile(counter)
+	_, _ = probeClaudeCodeVersion(script)
+	_ = detectClaudeApprovalHookStrategy(script)
+	second, err2 := os.ReadFile(counter)
+	if err1 != nil || err2 != nil {
+		t.Fatalf("counter missing: %v %v", err1, err2)
+	}
+	if string(first) != "1\n" || string(second) != "1\n" {
+		t.Fatalf("probe executed more than once: first=%q second=%q", first, second)
+	}
+}
+
 func TestAgentAICapabilitiesOnlyAdvertiseApprovalCapableProviders(t *testing.T) {
 	caps := agentAICapabilitiesForTools(true, false, false, true, false)
 	for _, want := range []string{"ai_provider_claude", "ai_provider_claudecode", "ai_provider_opencode_basic"} {
