@@ -72,7 +72,7 @@ func (m *agentAIManager) activeVibeSessionsSnapshot() []models.AgentVibeSession 
 			if createdAt == now && !msg.CreatedAt.IsZero() {
 				createdAt = msg.CreatedAt.UTC().Format(time.RFC3339)
 			}
-			if title == "" && strings.EqualFold(msg.Role, "user") {
+			if title == "" && strings.EqualFold(msg.Role, "user") && !isJunkAgentTitle(msg.Content) {
 				title = msg.Content
 			}
 		}

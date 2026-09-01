@@ -40,6 +40,7 @@ func sessionEventAgentAction(to, reason string) string {
 // (user-agent-process) agent connection lifecycle. Called from the
 // /api/agent/session-event handler in the user-agent subprocess.
 func (s *AgentService) ApplySessionEvent(to, reason string) {
+	s.bootSessionEventSeen.Store(true)
 	switch sessionEventAgentAction(to, reason) {
 	case "reconnect":
 		if err := s.EnsureRemoteConnection(); err != nil {

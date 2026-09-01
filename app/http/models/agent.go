@@ -119,6 +119,12 @@ type AgentVibeSession struct {
 	BindingVersion        int                      `json:"binding_version,omitempty"`
 	ProjectPath           string                   `json:"project_path,omitempty"`
 	Title                 string                   `json:"title,omitempty"`
+	// TitleUpdatedAt is the agent-clock timestamp of the winning user rename
+	// (pid record or durable rename cache). Empty when the title is merely
+	// derived (summary/firstPrompt/index fallback). PhoneServer compares this
+	// against its own titleUpdatedAt to implement latest-of-writer semantics
+	// instead of freezing the first phone rename forever.
+	TitleUpdatedAt        string                   `json:"title_updated_at,omitempty"`
 	Summary               string                   `json:"summary,omitempty"`
 	Mode                  string                   `json:"mode,omitempty"`
 	Status                string                   `json:"status,omitempty"`
