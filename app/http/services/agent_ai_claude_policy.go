@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"aliang.one/nursorgate/common/logger"
@@ -102,12 +103,13 @@ func withClaudeRemotePolicy(tool *agentAITool, run agentAIRun) (*agentAITool, fu
 // claudeTierMCPArgs builds --strict-mcp-config/--mcp-config flags for the
 // sanitized tier when the server marked the project MCP trusted (spec §5):
 // user-scope servers (top-level "mcpServers" in <agentHome>/.claude.json —
-// NOT the per-project entries) merged with the project's .mcp.json, project
-// entries winning name collisions (mirrors the CLI's local > project > user
-// precedence at merge time). Returns nil flags — native user-scope discovery
-// — when the project contributes no servers. Callers invoke the returned
-// cleanup only on success; on error the implementation has already released
-// everything it created.
+// NOT the per-project entries) plus user-scope plugin servers
+// ("plugin:<name>:<server>", see readPluginMCPServers) merged with the
+// project's .mcp.json, project entries winning name collisions (mirrors the
+// CLI's local > project > user precedence at merge time). Returns nil flags —
+// native user-scope discovery — when the project contributes no servers.
+// Callers invoke the returned cleanup only on success; on error the
+// implementation has already released everything it created.
 // Note: a project .mcp.json that only redefines names already present in
 // user scope contributes no new names, so no merge happens and the
 // user-scope definitions win (direction: load fewer, never more).
@@ -136,6 +138,7 @@ func claudeTierMCPArgs(policy agentAIClaudeRemotePolicy, projectPath string) ([]
 	if home := agentHome(); home != "" {
 		readMCPServers(filepath.Join(home, ".claude.json"), merged)
 	}
+	readPluginMCPServers(merged)
 	beforeProject := len(merged)
 	readMCPServers(filepath.Join(projectPath, ".mcp.json"), merged)
 	projectCount := len(merged) - beforeProject
@@ -161,6 +164,100 @@ func claudeTierMCPArgs(policy agentAIClaudeRemotePolicy, projectPath string) ([]
 	}
 	cleanup := func() { _ = os.Remove(tmp.Name()) }
 	return []string{"--strict-mcp-config", "--mcp-config", tmp.Name()}, cleanup, nil
+}
+
+// readPluginMCPServers adds MCP servers declared by user-scope plugins
+// (installed_plugins.json → <installPath>/.mcp.json) into dst under claude's
+// native composite names ("plugin:<plugin>:<server>"), so strict-mode merged
+// configs keep plugin servers that --strict-mcp-config would otherwise
+// suppress (spec §9.9). Plugin declarations come in two shapes — the wrapped
+// {"mcpServers":{...}} and the flat {"<server>":{...}} — both are handled.
+// Read/parse failures are logged and skipped (tolerate, never degrade).
+// Returns the number of servers added.
+func readPluginMCPServers(dst map[string]interface{}) int {
+	home := agentHome()
+	if home == "" {
+		return 0
+	}
+	registryPath := filepath.Join(home, ".claude", "plugins", "installed_plugins.json")
+	raw, err := os.ReadFile(registryPath)
+	if err != nil {
+		return 0 // no plugin registry: nothing installed (silent no-op)
+	}
+	var registry struct {
+		Plugins map[string][]map[string]interface{} `json:"plugins"`
+	}
+	if err := json.Unmarshal(raw, &registry); err != nil {
+		logger.Warn(fmt.Sprintf("claude-policy: unparseable plugin registry %s: %v", registryPath, err))
+		return 0
+	}
+	pluginKeys := make([]string, 0, len(registry.Plugins))
+	for key := range registry.Plugins {
+		pluginKeys = append(pluginKeys, key)
+	}
+	sort.Strings(pluginKeys) // deterministic merged output
+	added := 0
+	for _, key := range pluginKeys {
+		pluginName, _, _ := strings.Cut(key, "@")
+		if pluginName == "" {
+			continue
+		}
+		for _, install := range registry.Plugins[key] {
+			// Per-install field tolerance: a non-string/missing scope or
+			// installPath skips that install only, never the whole registry.
+			scope, _ := install["scope"].(string)
+			installPath, _ := install["installPath"].(string)
+			if scope != "user" || installPath == "" {
+				continue
+			}
+			added += readPluginMCPDeclaration(installPath, pluginName, dst)
+		}
+	}
+	return added
+}
+
+// readPluginMCPDeclaration decodes one plugin's .mcp.json into dst under the
+// composite "plugin:<pluginName>:<server>" names. The wrapped
+// {"mcpServers":{...}} shape wins when present; otherwise every top-level key
+// with an object value is treated as a server (the flat/legacy shape skips
+// non-object entries such as "$schema"). Existing keys in dst are never
+// overwritten (first writer wins; call order gives user < plugin < project).
+func readPluginMCPDeclaration(installPath, pluginName string, dst map[string]interface{}) int {
+	raw, err := os.ReadFile(filepath.Join(installPath, ".mcp.json"))
+	if err != nil {
+		return 0 // absent declaration: this plugin provides no MCP servers
+	}
+	var decoded map[string]interface{}
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		logger.Warn(fmt.Sprintf("claude-policy: unparseable plugin MCP declaration %s: %v", installPath, err))
+		return 0
+	}
+	var servers map[string]interface{}
+	if wrapped, ok := decoded["mcpServers"].(map[string]interface{}); ok {
+		servers = wrapped
+	} else {
+		servers = map[string]interface{}{}
+		for name, value := range decoded {
+			if cfg, ok := value.(map[string]interface{}); ok {
+				servers[name] = cfg
+			}
+		}
+	}
+	names := make([]string, 0, len(servers))
+	for name := range servers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	added := 0
+	for _, name := range names {
+		key := "plugin:" + pluginName + ":" + name
+		if _, exists := dst[key]; exists {
+			continue
+		}
+		dst[key] = servers[name]
+		added++
+	}
+	return added
 }
 
 func prepareClaudeProjectCapabilityPlugin(projectPath string) (string, error) {
