@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"net/netip"
@@ -28,6 +29,12 @@ type Config struct {
 	// allowed. The server controls this via tunnel.configure
 	// allow_private_targets; defaults to true for backwards compatibility.
 	AllowPrivateTargets bool
+	// TCPEnabled starts the raw TCP bridge on the "<deviceID>.tcp" piko
+	// endpoint for SSH/RDP-style port mappings. Requires the tunnel token's
+	// endpoint whitelist to include that endpoint (the server includes it
+	// since it introduced kind=tcp mappings). Failure to start the bridge
+	// never takes down the HTTP tunnel.
+	TCPEnabled bool
 }
 
 type Status struct {
@@ -41,6 +48,8 @@ type runConfig struct {
 	pikoUpstreamURL *url.URL
 	tunnelToken     string
 	handler         http.Handler
+	// tcpBridge is nil unless TCP mappings are enabled for this session.
+	tcpBridge *tcpBridge
 	// onState receives mid-session state transitions surfaced from the piko
 	// client (e.g. "reconnecting" while a dropped session retries). Nil for
 	// runners that do not support it.
@@ -256,6 +265,10 @@ func validateConfig(config Config) (runConfig, [sha256.Size]byte, error) {
 	if err != nil {
 		return runConfig{}, [sha256.Size]byte{}, err
 	}
+	var bridge *tcpBridge
+	if config.TCPEnabled {
+		bridge = newTCPBridge(config.DeviceID, verifier, config.AllowPrivateTargets)
+	}
 	// The fingerprint includes the token and expiry, so every renewal
 	// reconfigures the session. This drops in-flight streams once per renewal:
 	// piko reads Upstream.Token only at dial time and offers no token
@@ -268,12 +281,14 @@ func validateConfig(config Config) (runConfig, [sha256.Size]byte, error) {
 		config.RoutePublicKey,
 		config.ExpiresAt.UTC().Format(time.RFC3339Nano),
 		strconv.FormatBool(config.AllowPrivateTargets),
+		strconv.FormatBool(config.TCPEnabled),
 	}, "\x00")))
 	return runConfig{
 		deviceID:        config.DeviceID,
 		pikoUpstreamURL: parsedURL,
 		tunnelToken:     config.TunnelToken,
 		handler:         handler,
+		tcpBridge:       bridge,
 	}, fingerprint, nil
 }
 
@@ -305,6 +320,29 @@ func runTunnel(ctx context.Context, config runConfig, ready func()) error {
 		return fmt.Errorf("connect Piko upstream: %w", err)
 	}
 	defer listener.Shutdown()
+
+	// The raw TCP bridge lives on a separate endpoint so its route-header
+	// framing never reaches the HTTP server. Best effort: an older token
+	// whose endpoint whitelist lacks "<device>.tcp" fails here, which must
+	// not take the HTTP tunnel down — the next renewal carries it.
+	if config.tcpBridge != nil {
+		tcpListener, tcpErr := upstream.Listen(ctx, TCPEndpointID(config.deviceID))
+		log.Printf("[AGENT-TUNNEL] tcp listen %s: err=%v addr=%v", TCPEndpointID(config.deviceID), tcpErr, func() any {
+			if tcpErr == nil {
+				return tcpListener.Addr().String()
+			}
+			return ""
+		}())
+		if tcpErr != nil {
+			reportTCPDisabled(config.onState, fmt.Sprintf("tcp bridge unavailable: %v", tcpErr))
+		} else {
+			go func() {
+				<-ctx.Done()
+				_ = tcpListener.Shutdown()
+			}()
+			go func() { _ = config.tcpBridge.Serve(tcpListener) }()
+		}
+	}
 	ready()
 
 	server := &http.Server{

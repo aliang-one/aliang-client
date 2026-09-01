@@ -40,6 +40,7 @@ func (s *AgentService) configureTunnel(msg map[string]interface{}, writeJSON fun
 		RoutePublicKey:      remoteString(msg, "route_public_key"),
 		ExpiresAt:           expiresAt,
 		AllowPrivateTargets: remoteBool(msg, "allow_private_targets", true),
+		TCPEnabled:          remoteBool(msg, "enable_tcp", false),
 	})
 	if err != nil {
 		emitTunnelConfigureError(writeJSON, requestID, err)

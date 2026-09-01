@@ -820,6 +820,7 @@ func agentCapabilities() []string {
 	caps = append(caps, agentAICapabilities()...)
 	caps = append(caps,
 		"http_tunnel_v1",
+		"tcp_tunnel_v1",
 		"websocket_tunnel_v1",
 		"goal_server_v1",
 		"goal_plan_service_v1",

@@ -1,6 +1,7 @@
 package tunnel
 
 import (
+	"log"
 	"strings"
 
 	"go.uber.org/zap"
@@ -41,6 +42,14 @@ func (l *pikoStateLogger) report(msg string) {
 	if state, ok := pikoStateFromLog(msg); ok {
 		l.onState(state)
 	}
+}
+
+// reportTCPDisabled surfaces a non-fatal TCP bridge startup failure without
+// touching the session state machine (the HTTP tunnel stays healthy). The
+// next configure renewal typically carries the "<device>.tcp" endpoint in the
+// token whitelist and succeeds.
+func reportTCPDisabled(_ func(state string), message string) {
+	log.Printf("[AGENT-TUNNEL] tcp bridge disabled: %s", message)
 }
 
 // pikoStateFromLog maps piko client log messages to tunnel states. The
