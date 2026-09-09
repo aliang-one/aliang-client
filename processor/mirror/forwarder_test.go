@@ -3,6 +3,7 @@ package mirror
 import (
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -79,14 +80,13 @@ func newTestForwarder(t *testing.T, capacity int, h http.HandlerFunc) (*Forwarde
 	t.Helper()
 	ts := httptest.NewServer(h)
 	t.Cleanup(ts.Close)
-	prev := GetGlobalForwarder()
-	t.Cleanup(func() { globalMu.Lock(); globalForwarder = prev; globalMu.Unlock() })
 	f := &Forwarder{
 		target: batchTarget(ts.URL),
 		client: &http.Client{Timeout: 2 * time.Second},
 		ch:     make(chan MirrorMessage, capacity),
 		done:   make(chan struct{}),
 	}
+	t.Cleanup(f.Stop) // Stop 幂等（sync.Once），测试失败路径不再泄漏 worker goroutine
 	go f.run()
 	return f, ts
 }
@@ -176,18 +176,21 @@ func TestForwarderCountsDroppedWhenBlocked(t *testing.T) {
 	store := new(capturedBatch)
 	gate := make(chan struct{})
 	f, _ := newTestForwarder(t, 16, func(w http.ResponseWriter, r *http.Request) {
-		<-gate // 首次 flush 时卡住 worker
+		<-gate // 第一次 flush 的 post() 卡在 gate 上，worker 停止消费 channel
 		b, _ := io.ReadAll(r.Body)
 		store.append(b)
 		w.WriteHeader(http.StatusOK)
 	})
-	// Enqueue 非阻塞：突发 100 条远超容量 16，入队瞬间即产生丢弃
-	//（worker 要等 200ms 定时器才首次 flush，入队期间必然有消息落不进 channel）
+	// 结构性上界：worker 最多消费 200 条进 pending（随后卡在 post 的 gate 上），
+	// channel 再缓冲 16 条；300 条入队必然溢出 ≥ 300-200-16 = 84 条，与调度时序无关。
+	for i := 0; i < batchMaxMessages; i++ {
+		f.Enqueue(chunkAt(uint64(i)))
+	}
 	for i := 0; i < 100; i++ {
 		f.Enqueue(chunkAt(uint64(i)))
 	}
-	if f.Dropped() == 0 {
-		t.Fatal("expected dropped counter > 0 when queue overflows")
+	if dropped := f.Dropped(); dropped < 84 {
+		t.Fatalf("expected at least 84 dropped messages (300 - 200 pending - 16 buffered), got %d", dropped)
 	}
 	close(gate)
 	f.Stop()
@@ -221,4 +224,49 @@ func TestForwarderFlushIntervalSurvivesIdle(t *testing.T) {
 	f.Enqueue(chunkAt(2))
 	waitFor(t, 2*time.Second, func() bool { return store.count() == 2 })
 	f.Stop()
+}
+
+func TestForwarderReusesConnections(t *testing.T) {
+	var connMu sync.Mutex
+	newConns := 0
+	ts := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		w.Write([]byte(`{"ok":true,"accepted":5,"failed":0}`))
+	}))
+	ts.Config.ConnState = func(_ net.Conn, s http.ConnState) {
+		if s == http.StateNew {
+			connMu.Lock()
+			newConns++
+			connMu.Unlock()
+		}
+	}
+	ts.Start()
+	t.Cleanup(ts.Close)
+
+	f := &Forwarder{
+		target: batchTarget(ts.URL),
+		client: &http.Client{Timeout: 2 * time.Second},
+		ch:     make(chan MirrorMessage, 1024),
+		done:   make(chan struct{}),
+	}
+	go f.run()
+	t.Cleanup(f.Stop)
+
+	// 三批消息（每批间隔超过 flush interval），全部完成后应复用同一连接
+	for round := 0; round < 3; round++ {
+		for i := 0; i < 5; i++ {
+			f.Enqueue(chunkAt(uint64(round*10 + i)))
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	f.Stop()
+
+	connMu.Lock()
+	defer connMu.Unlock()
+	if newConns == 0 {
+		t.Fatal("expected at least one connection")
+	}
+	if newConns > 2 {
+		t.Fatalf("drain should enable keep-alive reuse; got %d new connections, want <= 2", newConns)
+	}
 }

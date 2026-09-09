@@ -177,7 +177,9 @@ func (f *Forwarder) post(body []byte) {
 		logger.Debug("[Mirror] Failed to send batch: " + err.Error())
 		return
 	}
-	// Drain a bounded amount of the body so keep-alive connections are reused.
+	// Drain a bounded amount of the response body (the /mirror/batch ack is
+	// tiny) so the keep-alive connection is reused; larger bodies would force
+	// the connection closed, which is acceptable here.
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 	resp.Body.Close()
 }
