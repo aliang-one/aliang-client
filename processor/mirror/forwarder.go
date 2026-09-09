@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -31,6 +32,16 @@ var (
 	globalMu        sync.RWMutex
 )
 
+// batchTarget derives the batch ingest endpoint from the configured target.
+// Trailing "/" is trimmed first; "/batch" is appended unless already present.
+func batchTarget(target string) string {
+	t := strings.TrimRight(strings.TrimSpace(target), "/")
+	if strings.HasSuffix(t, "/batch") {
+		return t
+	}
+	return t + "/batch"
+}
+
 // InitGlobalForwarder creates or recreates the global forwarder based on current config.
 // It is safe to call this multiple times; each call stops the previous forwarder.
 func InitGlobalForwarder() {
@@ -49,7 +60,7 @@ func InitGlobalForwarder() {
 	}
 
 	f := &Forwarder{
-		target: cfg.Target,
+		target: batchTarget(cfg.Target),
 		client: &http.Client{
 			Timeout: forwarderHTTPTimeout,
 			Transport: &http.Transport{
