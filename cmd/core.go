@@ -190,6 +190,7 @@ func registerIPCHandlers(s *ipc.Server) {
 	s.Register(ipc.ActionStopProxy, handleStopProxy)
 	s.Register(ipc.ActionSwitchMode, handleSwitchMode)
 	s.Register(ipc.ActionShutdown, handleShutdown)
+	s.Register(ipc.ActionProxyStartBlockedReason, handleProxyStartBlockedReason)
 }
 
 var (
@@ -348,6 +349,14 @@ func handleStartProxy(_ json.RawMessage) (interface{}, error) {
 
 	logger.Info("[IPC] Proxy started")
 	return result, nil
+}
+
+// handleProxyStartBlockedReason reports whether the current login/session state
+// blocks starting the proxy, so the tray companion can disable the Start item
+// before the user clicks it — the same gate StartService enforces on click.
+func handleProxyStartBlockedReason(_ json.RawMessage) (interface{}, error) {
+	code, msg := services.ProxyStartBlockedReason()
+	return map[string]interface{}{"code": code, "msg": msg}, nil
 }
 
 func handleStopProxy(_ json.RawMessage) (interface{}, error) {

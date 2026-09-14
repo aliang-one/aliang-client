@@ -34,6 +34,10 @@ const (
 	ActionStopProxy     = "stop_proxy"
 	ActionSwitchMode    = "switch_mode"
 	ActionShutdown      = "shutdown"
+
+	// ActionProxyStartBlockedReason reports why the current login/session state
+	// blocks starting the proxy ("", "" when starting is permitted).
+	ActionProxyStartBlockedReason = "proxy_start_blocked_reason"
 )
 
 // StatusResponse represents the status returned by get_status.

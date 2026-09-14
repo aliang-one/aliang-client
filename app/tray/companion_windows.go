@@ -304,6 +304,13 @@ func (a *CompanionApp) syncState() {
 	running, _ := data["is_running"].(bool)
 	description := trayResultString(data, "status")
 
+	// 登录门槛：未运行时向 core 查询启动拦截原因（与点击 Start 后 StartService
+	// 的强制校验同源），未登录/恢复中提前置灰 Start，而不是等用户点击后失败。
+	startBlockCode, startBlockMsg := "", ""
+	if !running {
+		startBlockCode, startBlockMsg = a.proxyStartBlockedReason()
+	}
+
 	a.isRunning = running
 	a.syncModeMenu(mode)
 	aiStatus := BuildAIStatusFromIPCData(data)
@@ -315,20 +322,48 @@ func (a *CompanionApp) syncState() {
 		systray.SetTooltip(trayProxyTooltip(mode, false))
 	}
 
-	a.mProxyStatus.SetTitle(trayProxyStatusTitle(mode, running, description))
+	statusTitle := trayProxyStatusTitle(mode, running, description)
+	if blockedTitle := trayStartBlockedStatusTitle(startBlockCode); blockedTitle != "" {
+		statusTitle = blockedTitle
+	}
+	a.mProxyStatus.SetTitle(statusTitle)
 	a.mModeHTTP.Enable()
 	a.mModeTUN.Enable()
-	if running {
+
+	startDisabled, startTooltip := startMenuItemGate(running, startBlockMsg)
+	if startDisabled {
 		a.mStart.Disable()
+	} else {
+		a.mStart.Enable()
+	}
+	if startTooltip != "" {
+		a.mStart.SetTooltip(startTooltip)
+	}
+
+	if running {
 		a.mStop.Enable()
 		a.mRestart.Enable()
 		a.updateAIStatusMenu(aiStatus)
 	} else {
-		a.mStart.Enable()
 		a.mStop.Disable()
 		a.mRestart.Disable()
 		a.hideAIStatus()
 	}
+}
+
+// proxyStartBlockedReason queries the core's login gate for starting the proxy.
+// Returns empty strings when the query fails (old core, IPC error) so the menu
+// falls back to the enabled default — the click path still enforces the gate.
+func (a *CompanionApp) proxyStartBlockedReason() (string, string) {
+	result, err := a.ipcClient.Send(ipc.ActionProxyStartBlockedReason, nil)
+	if err != nil || result == nil || !result.OK {
+		return "", ""
+	}
+	data, ok := result.Data.(map[string]interface{})
+	if !ok {
+		return "", ""
+	}
+	return trayResultString(data, "code"), trayResultString(data, "msg")
 }
 
 func (a *CompanionApp) applyUnavailableState(reason string) {
@@ -429,6 +464,10 @@ func (a *CompanionApp) hideAIStatus() {
 }
 
 func RunCompanion() {
+	// 必须在 systray 创建任何窗口/菜单之前声明 DPI 感知：
+	// Win11 非 100% 缩放下，DPI-unaware 进程的托盘菜单会渲染成空白方块。
+	enableWindowsDPIAwareness()
+
 	guard, acquired, err := singleinstance.Acquire()
 	if err != nil {
 		logger.Error("Failed to acquire Windows companion single-instance guard", "error", err)

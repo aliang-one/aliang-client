@@ -21,3 +21,29 @@ func TestTrayStartBlockedStatusTitle(t *testing.T) {
 		}
 	}
 }
+
+// TestStartMenuItemGate covers the companion tray's three-state Start decision:
+// running disables the item; a login-gate blockMsg disables it with the reason
+// as tooltip; otherwise it is enabled with the default tooltip.
+func TestStartMenuItemGate(t *testing.T) {
+	testCases := []struct {
+		name         string
+		running      bool
+		blockMsg     string
+		wantDisabled bool
+		wantTooltip  string
+	}{
+		{name: "running keeps item disabled", running: true, blockMsg: "", wantDisabled: true, wantTooltip: ""},
+		{name: "login gate disables with reason", running: false, blockMsg: "login required", wantDisabled: true, wantTooltip: "login required"},
+		{name: "permitted enables with default tooltip", running: false, blockMsg: "", wantDisabled: false, wantTooltip: startProxyMenuTooltip},
+		{name: "whitespace-only blockMsg counts as permitted", running: false, blockMsg: "   ", wantDisabled: false, wantTooltip: startProxyMenuTooltip},
+	}
+
+	for _, tc := range testCases {
+		gotDisabled, gotTooltip := startMenuItemGate(tc.running, tc.blockMsg)
+		if gotDisabled != tc.wantDisabled || gotTooltip != tc.wantTooltip {
+			t.Fatalf("%s: startMenuItemGate(%v, %q) = (%v, %q), want (%v, %q)",
+				tc.name, tc.running, tc.blockMsg, gotDisabled, gotTooltip, tc.wantDisabled, tc.wantTooltip)
+		}
+	}
+}

@@ -489,6 +489,23 @@ func trayStartBlockedStatusTitle(blockCode string) string {
 	}
 }
 
+// startMenuItemGate decides the Start item's disabled state and tooltip for the
+// companion tray, mirroring the legacy TrayApp login gate: running keeps the
+// item disabled; a non-empty blockMsg (未登录/恢复中) disables it and surfaces
+// the reason as the tooltip; otherwise the item is enabled with its normal
+// tooltip. An empty tooltip result means "leave the current tooltip unchanged".
+func startMenuItemGate(running bool, blockMsg string) (disabled bool, tooltip string) {
+	msg := strings.TrimSpace(blockMsg)
+	switch {
+	case running:
+		return true, ""
+	case msg != "":
+		return true, msg
+	default:
+		return false, startProxyMenuTooltip
+	}
+}
+
 func trayResultMessage(result map[string]interface{}) string {
 	for _, key := range []string{"msg", "message", "details", "status"} {
 		if value := trayResultString(result, key); value != "" {
@@ -529,6 +546,9 @@ func (t *TrayApp) hideAIStatus() {
 // Run starts the system tray application
 // This is the main entry point for the tray application
 func Run() {
+	// Windows：在 systray 创建任何窗口/菜单之前声明 DPI 感知，
+	// 否则 Win11 非 100% 缩放下托盘菜单渲染为空白方块（非 Windows 为 no-op）。
+	enableWindowsDPIAwareness()
 	logger.Debug("Starting system tray...")
 	systray.Run(onReady, onExit)
 }
