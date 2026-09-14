@@ -529,6 +529,9 @@ func (t *TrayApp) hideAIStatus() {
 // Run starts the system tray application
 // This is the main entry point for the tray application
 func Run() {
+	// Windows：在 systray 创建任何窗口/菜单之前声明 DPI 感知，
+	// 否则 Win11 非 100% 缩放下托盘菜单渲染为空白方块（非 Windows 为 no-op）。
+	enableWindowsDPIAwareness()
 	logger.Debug("Starting system tray...")
 	systray.Run(onReady, onExit)
 }
