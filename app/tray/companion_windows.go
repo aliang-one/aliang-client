@@ -464,6 +464,10 @@ func (a *CompanionApp) hideAIStatus() {
 }
 
 func RunCompanion() {
+	// 必须在 systray 创建任何窗口/菜单之前声明 DPI 感知：
+	// Win11 非 100% 缩放下，DPI-unaware 进程的托盘菜单会渲染成空白方块。
+	enableWindowsDPIAwareness()
+
 	guard, acquired, err := singleinstance.Acquire()
 	if err != nil {
 		logger.Error("Failed to acquire Windows companion single-instance guard", "error", err)
