@@ -233,14 +233,14 @@ type agentAISession struct {
 	// isGoalFork marks a fork (re-planning exploration) session. #5: its runs are
 	// forced read-only (run.readOnly) so exploration can't mutate the workspace —
 	// real provider-level enforcement, not just a prompt.
-	isGoalFork              bool
-	cancel                  context.CancelFunc
-	activeWriter            agentTerminalWriter
-	approvalToken           string
-	activity                *agentAIActivity
-	runSeq                  int
-	activeRunID             string
-	goalIdentity            map[string]interface{}
+	isGoalFork          bool
+	cancel              context.CancelFunc
+	activeWriter        agentTerminalWriter
+	approvalToken       string
+	activity            *agentAIActivity
+	runSeq              int
+	activeRunID         string
+	goalIdentity        map[string]interface{}
 	goalAllowedRoots    []string
 	goalAllowedCommands []string
 	// lastActiveAt drives LRU eviction (evictOldestIdleAISessionLocked): the
@@ -294,9 +294,9 @@ type agentAIMessage struct {
 }
 
 type agentAIRun struct {
-	sessionID               string
-	runID                   string
-	messageID               string
+	sessionID string
+	runID     string
+	messageID string
 	// providerMsgID is the provider's native assistant message id for the
 	// CURRENT turn (claude msg_*, captured from message_start / finalized
 	// assistant events). Streaming events (ai.delta / ai.thinking /
@@ -335,8 +335,8 @@ type agentAIRun struct {
 	// goalAllowedRoots/Commands 来自 goal_context.task，approval hook 围栏校验用。
 	goalAllowedRoots    []string
 	goalAllowedCommands []string
-	nativeGoal             map[string]interface{}
-	readOnly               bool
+	nativeGoal          map[string]interface{}
+	readOnly            bool
 }
 
 type agentAIAttachment struct {
@@ -377,12 +377,12 @@ func newAgentAIRunEmitter(run agentAIRun, write agentTerminalWriter) *agentAIRun
 		runID = run.messageID
 	}
 	return &agentAIRunEmitter{
-		runID:                 runID,
-		write:                 write,
-		goalIdentity:          cloneGoalIdentity(run.goalIdentity),
+		runID:                  runID,
+		write:                  write,
+		goalIdentity:           cloneGoalIdentity(run.goalIdentity),
 		goalRequiredCheckCount: run.goalRequiredCheckCount,
-		goalAllowedRoots:    run.goalAllowedRoots,
-		goalAllowedCommands: run.goalAllowedCommands,
+		goalAllowedRoots:       run.goalAllowedRoots,
+		goalAllowedCommands:    run.goalAllowedCommands,
 	}
 }
 
@@ -926,7 +926,7 @@ func (m *agentAIManager) approvalService() *AgentService {
 // silent for longer than agentAIIdleWindow without one of those waits in flight;
 // agentAIHardCeiling is a runaway backstop. nil-safe so call sites need no guards.
 type agentAIActivity struct {
-	lastActivityAt   atomic.Int64
+	lastActivityAt atomic.Int64
 	// lastProgressAt tracks MEANINGFUL progress (assistant text/thinking via
 	// emitAIDelta, file changes via fileSink, a completed Codex work item) —
 	// NOT raw output. A degenerate model loop (e.g. filler `echo` tool calls
@@ -1302,8 +1302,8 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 		messageID:              messageID,
 		goalIdentity:           goalRunIdentityFromMessage(msg),
 		goalRequiredCheckCount: goalRequiredCheckCountFromContext(msg["goal_context"]),
-		goalAllowedRoots:    goalAllowedRootsFromContext(msg["goal_context"]),
-		goalAllowedCommands: goalAllowedCommandsFromContext(msg["goal_context"]),
+		goalAllowedRoots:       goalAllowedRootsFromContext(msg["goal_context"]),
+		goalAllowedCommands:    goalAllowedCommandsFromContext(msg["goal_context"]),
 		nativeGoal:             cloneAgentAIMap(mapIf(msg["native_goal"])),
 		readOnly:               messageIsGoalFork,
 	}
@@ -2093,13 +2093,13 @@ func (m *agentAIManager) runUserMessage(session *agentAISession, runID, messageI
 		activity:                activity,
 		claudePolicy:            cloneAgentAIClaudeRemotePolicy(session.claudePolicy),
 		goalIdentity:            cloneGoalIdentity(emitter.goalIdentity),
-		goalAllowedRoots:    emitter.goalAllowedRoots,
-		goalAllowedCommands: emitter.goalAllowedCommands,
+		goalAllowedRoots:        emitter.goalAllowedRoots,
+		goalAllowedCommands:     emitter.goalAllowedCommands,
 		nativeGoal:              cloneAgentAIMap(nativeGoal),
 		// #5 (v2): enforce read-only on the EXECUTION run for fork sessions.
 		// v1 set this only on the temporary messageRun, which is discarded before
 		// the real run is built here — so it never reached runCLIPass/codex.
-		readOnly:                session.isGoalFork,
+		readOnly: session.isGoalFork,
 	}
 	run.onClaudeInit = func(commands []string, version string) {
 		m.recordClaudeCapabilities(run.sessionID, run.projectPath, commands, version)
@@ -2829,17 +2829,17 @@ func (m *agentAIManager) handleClaudeApprovalHook(ctx context.Context, sessionID
 		return claudeApprovalHookDecision(hookEventName, false, "Aliang could not match this permission request to a running AI session."), fmt.Errorf("approval hook session mismatch: %s", sessionID)
 	}
 	run := agentAIRun{
-		sessionID:     session.id,
-		messageID:     firstNonEmpty(messageID, session.id),
-		runSeq:        session.runSeq,
-		mode:          session.mode,
-		projectPath:   session.projectPath,
-		provider:      session.provider,
-		model:         session.model,
-		cancel:        session.cancel,
-		approvalToken: session.approvalToken,
-		activity:      session.activity,
-		goalIdentity:  cloneGoalIdentity(session.goalIdentity),
+		sessionID:           session.id,
+		messageID:           firstNonEmpty(messageID, session.id),
+		runSeq:              session.runSeq,
+		mode:                session.mode,
+		projectPath:         session.projectPath,
+		provider:            session.provider,
+		model:               session.model,
+		cancel:              session.cancel,
+		approvalToken:       session.approvalToken,
+		activity:            session.activity,
+		goalIdentity:        cloneGoalIdentity(session.goalIdentity),
 		goalAllowedRoots:    session.goalAllowedRoots,
 		goalAllowedCommands: session.goalAllowedCommands,
 	}
@@ -4091,6 +4091,9 @@ func (m *agentAIManager) runCodexAppServer(ctx context.Context, run agentAIRun, 
 					}
 					if isCompleted {
 						payload["status"] = "completed"
+						// A finished Codex work item (command/file change) is
+						// real progress for the no-progress watchdog.
+						run.activity.markProgress()
 						if exitCode != nil {
 							payload["exit_code"] = *exitCode
 						}
@@ -4855,6 +4858,8 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 		filesMu.Lock()
 		filesTouched[fp] = struct{}{}
 		filesMu.Unlock()
+		// A file written/edited is real progress, not just activity.
+		run.activity.markProgress()
 	}
 	progressStop := make(chan struct{})
 	defer close(progressStop)
