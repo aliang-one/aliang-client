@@ -101,6 +101,19 @@ var (
 var (
 	agentAIApprovalTimeout = resolveEnvDuration("ALIANG_AI_APPROVAL_TIMEOUT", 24*time.Hour)
 	agentAIHardCeiling     = resolveEnvDuration("ALIANG_AI_HARD_CEILING", 48*time.Hour)
+
+	// agentAINoProgressWindow bounds how long a run may keep EMITTING output
+	// without producing meaningful progress (assistant text/thinking, a file
+	// change, or a completed Codex work item). Raw output keeps the idle
+	// watchdog fed, so a degenerate model loop (observed: a model emitting
+	// filler `echo xN` tool calls every ~40s for 11+ hours) is invisible to
+	// every other guard — only this progress-quality check stops it. Env:
+	//
+	//	ALIANG_AI_NO_PROGRESS_WINDOW  (time.ParseDuration, e.g. "45m"). Default 1h.
+	//
+	// Explicitly set it to "0s" to disable the check. Blank/unparseable/negative
+	// values fall back to the default (see resolveEnvDurationAllowZero).
+	agentAINoProgressWindow = resolveEnvDurationAllowZero("ALIANG_AI_NO_PROGRESS_WINDOW", 60*time.Minute)
 )
 
 // resolveEnvDuration parses a Go duration from the env key, returning def when
@@ -112,6 +125,21 @@ func resolveEnvDuration(key string, def time.Duration) time.Duration {
 	}
 	d, err := time.ParseDuration(raw)
 	if err != nil || d <= 0 {
+		return def
+	}
+	return d
+}
+
+// resolveEnvDurationAllowZero is resolveEnvDuration but accepts an explicit
+// zero ("0" / "0s") as a meaningful value — the documented way to disable a
+// window-based guard. Unset/blank/unparseable/negative still fall back to def.
+func resolveEnvDurationAllowZero(key string, def time.Duration) time.Duration {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return def
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d < 0 {
 		return def
 	}
 	return d

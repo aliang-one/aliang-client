@@ -60,6 +60,39 @@ func TestAgentAIActivityLifecycle(t *testing.T) {
 	}
 }
 
+func TestAgentAIActivityProgressTracking(t *testing.T) {
+	a := newAgentAIActivity()
+
+	// A fresh run starts with a full no-progress window.
+	if p := a.progressIdleFor(); p < 0 || p > time.Second {
+		t.Fatalf("fresh progressIdleFor = %v, want within 1s of 0", p)
+	}
+
+	// Raw output (bump) must NOT count as progress — that is exactly the
+	// degenerate-loop blind spot this tracking exists for (a model emitting
+	// filler `echo` tool calls every few seconds keeps bump() fed for hours
+	// while producing nothing).
+	time.Sleep(20 * time.Millisecond)
+	a.bump()
+	if p := a.progressIdleFor(); p < 15*time.Millisecond {
+		t.Fatalf("after bump progressIdleFor = %v, want unchanged (~>15ms)", p)
+	}
+
+	// markProgress (assistant text / file change) resets the progress clock.
+	a.markProgress()
+	if p := a.progressIdleFor(); p > 15*time.Millisecond {
+		t.Fatalf("after markProgress progressIdleFor = %v, want ~0", p)
+	}
+}
+
+func TestAgentAIActivityProgressNilSafe(t *testing.T) {
+	var a *agentAIActivity
+	a.markProgress()
+	if p := a.progressIdleFor(); p != 0 {
+		t.Fatalf("nil progressIdleFor = %v, want 0", p)
+	}
+}
+
 func TestAgentAIActivityNilSafe(t *testing.T) {
 	var a *agentAIActivity
 	// None of these must panic on a nil receiver.
@@ -82,6 +115,14 @@ func TestAgentAIRunStoppedStatus(t *testing.T) {
 	// No kill reason, no limiter -> plain stop.
 	if status, msg := agentAIRunStoppedStatus(a, nil); status != "stopped" || msg != "" {
 		t.Fatalf("plain stop = (%q,%q), want (stopped,\"\")", status, msg)
+	}
+
+	// No-progress kill reason maps to the server-recognized idle_timeout
+	// status (→ timed_out / error on the backend) with a distinct message.
+	progress := newAgentAIActivity()
+	progress.setKillReason("no_progress")
+	if status, msg := agentAIRunStoppedStatus(progress, nil); status != "idle_timeout" || msg == "" {
+		t.Fatalf("no_progress = (%q,%q), want (idle_timeout, non-empty)", status, msg)
 	}
 
 	// Idle kill reason.
@@ -111,7 +152,7 @@ func TestAgentAIRunStoppedStatus(t *testing.T) {
 
 // runWatchdogUntilCancelled runs the watchdog loop with the given windows and
 // returns whether ctx was cancelled within the timeout, plus the kill reason.
-func runWatchdogUntilCancelled(t *testing.T, idleWindow, hardCeiling, interval, wait time.Duration, configure func(*agentAIActivity)) (cancelled bool, reason string) {
+func runWatchdogUntilCancelled(t *testing.T, idleWindow, hardCeiling, noProgressWindow, interval, wait time.Duration, configure func(*agentAIActivity)) (cancelled bool, reason string) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -121,7 +162,7 @@ func runWatchdogUntilCancelled(t *testing.T, idleWindow, hardCeiling, interval, 
 	}
 	done := make(chan struct{})
 	go func() {
-		agentAIWatchdogLoop(ctx, activity, cancel, idleWindow, hardCeiling, interval)
+		agentAIWatchdogLoop(ctx, activity, cancel, idleWindow, hardCeiling, noProgressWindow, interval)
 		close(done)
 	}()
 	select {
@@ -138,6 +179,7 @@ func TestAgentAIWatchdogLoopIdleKills(t *testing.T) {
 	cancelled, reason := runWatchdogUntilCancelled(t,
 		50*time.Millisecond,  /* idleWindow */
 		0,                    /* hardCeiling disabled */
+		0,                    /* noProgressWindow disabled */
 		10*time.Millisecond,  /* interval */
 		500*time.Millisecond, /* wait */
 		nil)
@@ -154,6 +196,7 @@ func TestAgentAIWatchdogLoopAwaitingExempt(t *testing.T) {
 	cancelled, reason := runWatchdogUntilCancelled(t,
 		40*time.Millisecond,  /* idleWindow */
 		0,                    /* hardCeiling disabled */
+		0,                    /* noProgressWindow disabled */
 		10*time.Millisecond,  /* interval */
 		200*time.Millisecond, /* wait (5x idleWindow) */
 		func(a *agentAIActivity) { a.setAwaitingApproval(true) })
@@ -171,6 +214,7 @@ func TestAgentAIWatchdogLoopToolUseWaitExempt(t *testing.T) {
 	cancelled, reason := runWatchdogUntilCancelled(t,
 		40*time.Millisecond,  /* idleWindow */
 		0,                    /* hardCeiling disabled */
+		0,                    /* noProgressWindow disabled */
 		10*time.Millisecond,  /* interval */
 		200*time.Millisecond, /* wait (5x idleWindow) */
 		func(a *agentAIActivity) { a.beginToolUseWait() })
@@ -189,7 +233,7 @@ func TestAgentAIWatchdogLoopToolResultReenablesIdle(t *testing.T) {
 	activity.beginToolUseWait()
 	done := make(chan struct{})
 	go func() {
-		agentAIWatchdogLoop(ctx, activity, cancel, 40*time.Millisecond, 0, 10*time.Millisecond)
+		agentAIWatchdogLoop(ctx, activity, cancel, 40*time.Millisecond, 0, 0, 10*time.Millisecond)
 		close(done)
 	}()
 
@@ -218,7 +262,7 @@ func TestAgentAIWatchdogLoopActivityResetsIdle(t *testing.T) {
 	activity := newAgentAIActivity()
 	done := make(chan struct{})
 	go func() {
-		agentAIWatchdogLoop(ctx, activity, cancel, 40*time.Millisecond, 0, 10*time.Millisecond)
+		agentAIWatchdogLoop(ctx, activity, cancel, 40*time.Millisecond, 0, 0, 10*time.Millisecond)
 		close(done)
 	}()
 
@@ -258,6 +302,7 @@ func TestAgentAIWatchdogLoopHardCeilingKills(t *testing.T) {
 	cancelled, reason := runWatchdogUntilCancelled(t,
 		time.Hour,            /* idleWindow: never fires */
 		time.Millisecond,     /* hardCeiling */
+		0,                    /* noProgressWindow disabled */
 		5*time.Millisecond,   /* interval */
 		300*time.Millisecond, /* wait */
 		nil)
@@ -266,5 +311,96 @@ func TestAgentAIWatchdogLoopHardCeilingKills(t *testing.T) {
 	}
 	if reason != "hard_ceiling" {
 		t.Fatalf("kill reason = %q, want hard_ceiling", reason)
+	}
+}
+
+func TestAgentAIWatchdogLoopNoProgressKills(t *testing.T) {
+	// A run that keeps EMITTING output (bump every few ms — the degenerate
+	// `echo` filler-tool-call loop signature) but never markProgress must be
+	// killed by the no-progress window even though the idle watchdog sees
+	// constant activity.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	activity := newAgentAIActivity()
+	done := make(chan struct{})
+	go func() {
+		agentAIWatchdogLoop(ctx, activity, cancel, time.Hour /* idleWindow: never fires */, 0 /* hardCeiling disabled */, 50*time.Millisecond /* noProgressWindow */, 10*time.Millisecond /* interval */)
+		close(done)
+	}()
+
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			case <-time.After(5 * time.Millisecond):
+				activity.bump()
+			}
+		}
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("watchdog did not cancel a run that never made progress")
+	}
+	if reason := activity.killReasonOr(""); reason != "no_progress" {
+		t.Fatalf("kill reason = %q, want no_progress", reason)
+	}
+}
+
+func TestAgentAIWatchdogLoopProgressPreventsNoProgressKill(t *testing.T) {
+	// markProgress (assistant text / file change) must keep the run alive past
+	// several no-progress windows.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	activity := newAgentAIActivity()
+	done := make(chan struct{})
+	go func() {
+		agentAIWatchdogLoop(ctx, activity, cancel, time.Hour, 0, 60*time.Millisecond, 10*time.Millisecond)
+		close(done)
+	}()
+
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			case <-time.After(15 * time.Millisecond):
+				activity.markProgress()
+			}
+		}
+	}()
+
+	select {
+	case <-done:
+		t.Fatal("watchdog cancelled a run that kept making progress")
+	case <-time.After(250 * time.Millisecond):
+	}
+	if reason := activity.killReasonOr(""); reason != "" {
+		t.Fatalf("kill reason = %q, want empty (no kill)", reason)
+	}
+}
+
+func TestAgentAIWatchdogLoopNoProgressExemptDuringToolWait(t *testing.T) {
+	// A single long-lived tool/subagent wait (e.g. a Task tool running for an
+	// hour) must not be killed for no-progress: at check time a PENDING tool
+	// wait means work is in flight, not looping.
+	cancelled, reason := runWatchdogUntilCancelled(t,
+		time.Hour,            /* idleWindow: never fires */
+		0,                    /* hardCeiling disabled */
+		40*time.Millisecond,  /* noProgressWindow */
+		10*time.Millisecond,  /* interval */
+		200*time.Millisecond, /* wait (5x noProgressWindow) */
+		func(a *agentAIActivity) { a.beginToolUseWait() })
+	if cancelled {
+		t.Fatal("watchdog cancelled a run with a pending tool/subagent wait")
+	}
+	if reason != "" {
+		t.Fatalf("kill reason = %q, want empty (no kill)", reason)
 	}
 }
