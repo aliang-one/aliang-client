@@ -20,6 +20,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"aliang.one/nursorgate/app/http/models"
 	"aliang.one/nursorgate/common/logger"
@@ -926,6 +927,12 @@ func (m *agentAIManager) approvalService() *AgentService {
 // agentAIHardCeiling is a runaway backstop. nil-safe so call sites need no guards.
 type agentAIActivity struct {
 	lastActivityAt   atomic.Int64
+	// lastProgressAt tracks MEANINGFUL progress (assistant text/thinking via
+	// emitAIDelta, file changes via fileSink, a completed Codex work item) —
+	// NOT raw output. A degenerate model loop (e.g. filler `echo` tool calls
+	// every few seconds for hours) keeps lastActivityAt fresh, so only the
+	// progress clock can distinguish "alive" from "getting anywhere".
+	lastProgressAt   atomic.Int64
 	awaitingApproval atomic.Bool
 	pendingToolUses  atomic.Int64
 	runStart         time.Time
@@ -936,6 +943,7 @@ type agentAIActivity struct {
 func newAgentAIActivity() *agentAIActivity {
 	a := &agentAIActivity{runStart: time.Now()}
 	a.lastActivityAt.Store(a.runStart.UnixNano())
+	a.lastProgressAt.Store(a.runStart.UnixNano())
 	return a
 }
 
@@ -944,6 +952,32 @@ func (a *agentAIActivity) bump() {
 		return
 	}
 	a.lastActivityAt.Store(time.Now().UnixNano())
+}
+
+// markProgress records meaningful progress and counts as activity. Callers:
+// emitAIDelta (assistant text/thinking), the run's fileSink (file written or
+// edited), and the Codex item/completed handler (one work unit finished).
+func (a *agentAIActivity) markProgress() {
+	if a == nil {
+		return
+	}
+	now := time.Now().UnixNano()
+	a.lastActivityAt.Store(now)
+	a.lastProgressAt.Store(now)
+}
+
+// progressIdleFor is how long the run has produced NO meaningful progress.
+// Unlike idleFor it is NOT reset by raw output — a run can be loudly alive
+// while going nowhere.
+func (a *agentAIActivity) progressIdleFor() time.Duration {
+	if a == nil {
+		return 0
+	}
+	last := a.lastProgressAt.Load()
+	if last == 0 {
+		return 0
+	}
+	return time.Since(time.Unix(0, last))
 }
 
 // setAwaitingApproval marks the run as blocked on a human decision (which pauses
@@ -1040,12 +1074,12 @@ func (m *agentAIManager) startAIWatchdog(ctx context.Context, activity *agentAIA
 	if activity == nil || cancel == nil {
 		return
 	}
-	go agentAIWatchdogLoop(ctx, activity, cancel, agentAIIdleWindow, agentAIHardCeiling, agentAIIdleCheckInterval)
+	go agentAIWatchdogLoop(ctx, activity, cancel, agentAIIdleWindow, agentAIHardCeiling, agentAINoProgressWindow, agentAIIdleCheckInterval)
 }
 
 // agentAIWatchdogLoop is the parameterized watchdog body, split out so tests can
 // drive it with tiny windows instead of the multi-minute production defaults.
-func agentAIWatchdogLoop(ctx context.Context, activity *agentAIActivity, cancel context.CancelFunc, idleWindow, hardCeiling, interval time.Duration) {
+func agentAIWatchdogLoop(ctx context.Context, activity *agentAIActivity, cancel context.CancelFunc, idleWindow, hardCeiling, noProgressWindow, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -1055,6 +1089,17 @@ func agentAIWatchdogLoop(ctx context.Context, activity *agentAIActivity, cancel 
 		case <-ticker.C:
 			if !activity.idlePaused() && activity.idleFor() > idleWindow {
 				activity.setKillReason("idle_timeout")
+				cancel()
+				return
+			}
+			// No-progress kill: the run keeps emitting output (so the idle
+			// watchdog above never fires) but has produced no assistant text,
+			// no file changes, and no completed work item for the whole window
+			// — the observed degenerate-loop failure mode. Skipped while a
+			// tool/approval wait is pending: a single long-lived Task/subagent
+			// or human decision is work in flight, not looping.
+			if noProgressWindow > 0 && !activity.idlePaused() && activity.progressIdleFor() > noProgressWindow {
+				activity.setKillReason("no_progress")
 				cancel()
 				return
 			}
@@ -1074,6 +1119,11 @@ func agentAIRunStoppedStatus(activity *agentAIActivity, limiter *agentAIOutputLi
 	switch activity.killReasonOr("") {
 	case "idle_timeout":
 		return "idle_timeout", fmt.Sprintf("AI run went idle (no output for %s) and was stopped", agentAIIdleWindow)
+	case "no_progress":
+		// Same server-mapped status as idle_timeout (→ timed_out / error) so
+		// the backend treats the run as terminally dead; only the message
+		// differs, naming the real cause.
+		return "idle_timeout", fmt.Sprintf("AI run produced no meaningful progress (no text or file changes) for %s and was stopped", agentAINoProgressWindow)
 	case "hard_ceiling":
 		return "hard_timeout", fmt.Sprintf("AI run exceeded the maximum runtime %s", agentAIHardCeiling)
 	}
@@ -5223,6 +5273,10 @@ func streamStructuredAIDelta(reader io.Reader, format agentAIOutputFormat, run a
 		parts := extractStructuredAITexts(format, event)
 		for _, d := range parts.deltas {
 			if strings.TrimSpace(d) == "" {
+				// 空白 delta（段落间独立 "\n"）不上线，但必须计入已流式文本：
+				// 否则 currentStreamed 丢字节，suffixNotStreamed 判定分叉后会把
+				// 整段最终文本重发一遍，落库消息变成 "片段+全文" 双份。
+				currentStreamed += d
 				continue
 			}
 			if !emitAIDelta(d, run, "assistant", writeJSON, limiter, capture) {
@@ -5345,6 +5399,10 @@ func extractStructuredAITexts(format agentAIOutputFormat, event map[string]inter
 //   - final extends streamed ⇒ the un-streamed tail.
 //   - they diverge (neither is a prefix of the other) ⇒ final wholesale.
 //   - Empty streamed ⇒ all of final (recovers finalized-only messages).
+//
+// 前缀比较失败时先做一次空白容忍对齐（逐 rune，双侧空白等价）：发射循环会跳过
+// 空白 delta，result 事件与 finalized 文本的排版也可能有空白差异——这些都不该
+// 触发整段重发。真分叉（出现不同字符）仍保持旧行为整体重发，绝不静默丢字。
 func suffixNotStreamed(streamed, final string) string {
 	if final == "" {
 		return ""
@@ -5355,7 +5413,34 @@ func suffixNotStreamed(streamed, final string) string {
 	if strings.HasPrefix(final, streamed) {
 		return final[len(streamed):]
 	}
-	return final
+	streamedRunes := []rune(streamed)
+	finalRunes := []rune(final)
+	i, j := 0, 0
+	for i < len(streamedRunes) && j < len(finalRunes) {
+		switch {
+		case unicode.IsSpace(streamedRunes[i]) && unicode.IsSpace(finalRunes[j]):
+			for i < len(streamedRunes) && unicode.IsSpace(streamedRunes[i]) {
+				i++
+			}
+			for j < len(finalRunes) && unicode.IsSpace(finalRunes[j]) {
+				j++
+			}
+		case unicode.IsSpace(streamedRunes[i]):
+			i++
+		case unicode.IsSpace(finalRunes[j]):
+			j++
+		case streamedRunes[i] == finalRunes[j]:
+			i++
+			j++
+		default:
+			return final
+		}
+	}
+	if i < len(streamedRunes) {
+		// 流式侧还有最终文本没覆盖到的内容 → 真分叉，整体重发。
+		return final
+	}
+	return string(finalRunes[j:])
 }
 
 func extractOpenCodeJSONTexts(event map[string]interface{}) aiStreamTexts {
@@ -6166,6 +6251,8 @@ func emitAIDelta(text string, run agentAIRun, channel string, writeJSON agentTer
 	if text == "" {
 		return true
 	}
+	// Assistant text/thinking is real progress, not just activity.
+	run.activity.markProgress()
 	if limiter != nil {
 		allowed := limiter.Reserve(len(text))
 		if allowed <= 0 {

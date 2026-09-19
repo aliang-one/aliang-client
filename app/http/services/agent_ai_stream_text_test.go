@@ -116,18 +116,51 @@ func TestSuffixNotStreamed(t *testing.T) {
 	cases := []struct {
 		streamed, final, want string
 	}{
-		{"", "abc", "abc"},     // nothing streamed → emit all
-		{"abc", "abc", ""},     // fully streamed → nothing
+		{"", "abc", "abc"},       // nothing streamed → emit all
+		{"abc", "abc", ""},       // fully streamed → nothing
 		{"abc", "abcdef", "def"}, // partial → emit tail
-		{"abcdef", "abc", ""},  // streamed exceeded final → nothing
-		{"abc", "xyz", "xyz"},  // diverged → emit final wholesale
-		{"", "", ""},           // both empty
-		{"abc", "", ""},        // final empty
+		{"abcdef", "abc", ""},    // streamed exceeded final → nothing
+		{"abc", "xyz", "xyz"},    // diverged → emit final wholesale
+		{"", "", ""},             // both empty
+		{"abc", "", ""},          // final empty
+		// 空白容忍：被发射循环跳过的空白 delta 让流式侧缺空白，最终文本含同样的
+		// 空白。对齐后不应把整段 final 重发一遍（否则落库消息 = "X:X:" 双份）。
+		{"AB", "A\n\nB", ""},   // 流式侧丢了段落空行
+		{"A B", "A\n\nB", ""},  // 空白形态不同
+		{"ab c", "abc", ""},    // 反向：流式侧多空白
+		{"done", "done.", "."}, // 空白容忍不能吞掉真实新增内容
 	}
 	for _, c := range cases {
 		if got := suffixNotStreamed(c.streamed, c.final); got != c.want {
 			t.Errorf("suffixNotStreamed(%q,%q) = %q, want %q", c.streamed, c.final, got, c.want)
 		}
+	}
+}
+
+// TestStreamClaudeBlankDeltaNoDuplicateFinal is the regression test for the
+// "单条消息内容自我重复" bug ("全量门禁绿(TEST_EXIT=0)。提交 +构建前端产物:全量门禁绿…").
+// The emitter skips whitespace-only text_delta chunks but (before the fix) also
+// failed to accumulate them into `currentStreamed`, so the buffer lost bytes the
+// finalized text contains. suffixNotStreamed then saw diverged strings and
+// re-emitted the ENTIRE final text after the streamed fragment — the stored
+// message became streamed-fragment + full-text. Blank deltas must count as
+// streamed even when not emitted, so the finalized text dedups cleanly.
+func TestStreamClaudeBlankDeltaNoDuplicateFinal(t *testing.T) {
+	const ndjson = `{"type":"stream_event","event":{"type":"message_start","message":{"id":"msg_1"}}}` + "\n" +
+		`{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text"}}}` + "\n" +
+		`{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"全量门禁绿(TEST_EXIT=0)。"}}}` + "\n" +
+		`{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\n\n"}}}` + "\n" +
+		`{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"提交 + 构建前端产物:"}}}` + "\n" +
+		`{"type":"stream_event","event":{"type":"content_block_stop","index":0}}` + "\n" +
+		`{"type":"assistant","message":{"id":"msg_1","role":"assistant","model":"claude","content":[{"type":"text","text":"全量门禁绿(TEST_EXIT=0)。\n\n提交 + 构建前端产物: Done"}]}}` + "\n" +
+		`{"type":"result","result":"全量门禁绿(TEST_EXIT=0)。\n\n提交 + 构建前端产物: Done","session_id":"sess_test","is_error":false}` + "\n"
+
+	got := driveClaudeStream(t, ndjson)
+	if c := strings.Count(got, "全量门禁绿(TEST_EXIT=0)。"); c != 1 {
+		t.Fatalf("final text emitted %d times, want 1 (blank-delta divergence must not re-emit the whole final): %q", c, got)
+	}
+	if c := strings.Count(got, "提交 + 构建前端产物:"); c != 1 {
+		t.Fatalf("tail text emitted %d times, want 1: %q", c, got)
 	}
 }
 

@@ -4110,7 +4110,7 @@ func TestAgentRemoteDetailRequestsReturnProjectAndVibeSessionDetail(t *testing.T
 		return event["request_id"] == "req_session"
 	})
 	session, ok := sessionEvent["session"].(models.AgentVibeSession)
-	if !ok || session.ID != codexID || len(session.Transcript) != 5 {
+	if !ok || session.ID != codexID || len(session.Transcript) != 4 {
 		t.Fatalf("session detail event = %#v", sessionEvent)
 	}
 	if session.Transcript[0].Role != "user" || session.Transcript[0].Content != "Detail user prompt" {
@@ -4119,12 +4119,16 @@ func TestAgentRemoteDetailRequestsReturnProjectAndVibeSessionDetail(t *testing.T
 	if session.Transcript[3].Role != "assistant" || session.Transcript[3].Content != "Desktop assistant reply" {
 		t.Fatalf("desktop session detail message = %#v", session.Transcript[3])
 	}
-	if session.Transcript[4].Role != "system" || session.Transcript[4].Content != "Developer context" {
-		t.Fatalf("developer session detail message = %#v", session.Transcript[4])
+	// developer/system 工件（如 codex 的 Developer context）只占索引位，不进 transcript
+	// ——与 claude reader 及本地展示路径 summarizeVibeTranscriptForDisplay 的语义一致。
+	for _, msg := range session.Transcript {
+		if msg.Role == "system" {
+			t.Fatalf("system artifact leaked into transcript: %#v", msg)
+		}
 	}
 }
 
-func TestReadClaudeSessionMetaClassifiesToolResultsAsSystem(t *testing.T) {
+func TestReadClaudeSessionMetaExcludesToolResultArtifacts(t *testing.T) {
 	dir := t.TempDir()
 	projectPath := filepath.Join(dir, "project")
 	if err := os.MkdirAll(projectPath, 0o700); err != nil {
@@ -4135,17 +4139,34 @@ func TestReadClaudeSessionMetaClassifiesToolResultsAsSystem(t *testing.T) {
 		`{"timestamp":"2026-06-14T01:00:00Z","type":"user","cwd":"` + projectPath + `","sessionId":"claude-role-session","message":{"role":"user","content":[{"type":"text","text":"Claude user prompt"}]}}`,
 		`{"timestamp":"2026-06-14T01:01:00Z","type":"assistant","cwd":"` + projectPath + `","sessionId":"claude-role-session","message":{"role":"assistant","content":[{"type":"text","text":"Claude assistant reply"}]}}`,
 		`{"timestamp":"2026-06-14T01:02:00Z","type":"user","cwd":"` + projectPath + `","sessionId":"claude-role-session","message":{"role":"user","content":[{"type":"tool_result","content":"Tool output should not be user"}]}}`,
+		`{"timestamp":"2026-06-14T01:03:00Z","type":"assistant","cwd":"` + projectPath + `","sessionId":"claude-role-session","message":{"role":"assistant","content":[{"type":"text","text":"Claude assistant after tool"}]}}`,
 	}
 	if err := os.WriteFile(sessionPath, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
 		t.Fatalf("write claude fixture: %v", err)
 	}
 
 	session := readClaudeSessionMetaWithOptions(sessionPath, agentVibeSessionReadOptions{Limit: 10, IncludePageMeta: true})
+	// tool_result 工件不再进入 transcript（与直播视图一致：工具输出走结构化事件，
+	// 不进对话流——否则手机端历史渲染会变成一墙 "Updated task #N status" 状态行）。
 	if got := len(session.Transcript); got != 3 {
-		t.Fatalf("claude transcript length = %d, want 3", got)
+		t.Fatalf("claude transcript length = %d, want 3 (tool_result excluded)", got)
 	}
-	if session.Transcript[0].Role != "user" || session.Transcript[1].Role != "assistant" || session.Transcript[2].Role != "system" {
-		t.Fatalf("claude transcript roles = %#v", session.Transcript)
+	for _, msg := range session.Transcript {
+		if msg.Role == "system" {
+			t.Fatalf("tool_result artifact leaked into transcript: %#v", msg)
+		}
+	}
+	if session.Transcript[0].Role != "user" || session.Transcript[1].Role != "assistant" || session.Transcript[2].Content != "Claude assistant after tool" {
+		t.Fatalf("claude transcript = %#v", session.Transcript)
+	}
+	// 索引位保留：MessageCount 仍统计被排除的 tool_result 行，保证后续消息的
+	// stableAgentID（含 messageIndex）与旧解析/已入库消息完全一致——否则 server 端
+	// 按 id upsert 会把同一段对话再存一份，渲染成重复气泡。
+	if session.MessageCount != 4 {
+		t.Fatalf("MessageCount = %d, want 4 (tool_result row still counted for ID stability)", session.MessageCount)
+	}
+	if session.Transcript[2].ID != stableAgentID("msg", "2026-06-14T01:03:00Z:3:Claude assistant after tool") {
+		t.Fatalf("post-tool assistant message ID drifted: %s", session.Transcript[2].ID)
 	}
 }
 

@@ -469,7 +469,12 @@ func readCodexSessionMetaWithOptions(path string, options agentVibeSessionReadOp
 			if session.Title == "" && msg.Role == "user" && !isJunkAgentTitle(msg.Content) {
 				session.Title = truncateAgentText(msg.Content, 200)
 			}
-			window.add(msg)
+			// 与 claude reader 一致：system/developer 工件只占索引位（稳定后续消息
+			// ID），不进入 transcript。本地展示路径 summarizeVibeTranscriptForDisplay
+			// 早就丢弃 system 行，远端 detail 报告对齐同一语义。
+			if msg.Role != "system" {
+				window.add(msg)
+			}
 		}
 	}
 	if session.ID == "" {
@@ -1013,14 +1018,21 @@ func readClaudeSessionMetaWithOptions(path string, options agentVibeSessionReadO
 			if text := truncateAgentText(claudeMessageText(row.Message), agentVibeTranscriptMaxContentRunes); text != "" {
 				messageIndex := session.MessageCount
 				session.MessageCount++
-				msg := models.AgentVibeMessage{
-					ID:        stableAgentID("msg", fmt.Sprintf("%s:%d:%s", row.Timestamp, messageIndex, text)),
-					Role:      firstNonEmpty(inferAgentVibeRoleFromClaudeMessage(row.Message), normalizeAgentVibeRole(row.Type)),
-					Content:   text,
-					Timestamp: normalizeAgentTime(row.Timestamp),
-					Index:     messageIndex,
+				role := firstNonEmpty(inferAgentVibeRoleFromClaudeMessage(row.Message), normalizeAgentVibeRole(row.Type))
+				// tool_result/system 工件只占索引位、不再进入 transcript。直播视图里
+				// 工具输出走结构化事件（ai.command 等），从不进对话流；历史解析若把它们
+				// 摊平成 system 消息，手机端就会渲染出一墙 "Updated task #N status" /
+				// "[1]+ Done ..." 状态行。索引照旧自增，保证后续消息的 stableAgentID
+				// 与旧解析及已入库消息一致（否则 server 按 id upsert 会重复存储）。
+				if role != "system" {
+					window.add(models.AgentVibeMessage{
+						ID:        stableAgentID("msg", fmt.Sprintf("%s:%d:%s", row.Timestamp, messageIndex, text)),
+						Role:      role,
+						Content:   text,
+						Timestamp: normalizeAgentTime(row.Timestamp),
+						Index:     messageIndex,
+					})
 				}
-				window.add(msg)
 			}
 		}
 		if session.Title == "" && row.Type == "user" {
