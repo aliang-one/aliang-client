@@ -35,10 +35,19 @@ func (m *agentTerminalManager) sendReplay(sessionID string, ring *terminalRingBu
 
 	snap := ring.snapshot()
 	seq := 0
-	for off := 0; off < len(snap) || seq == 0; off += agentTerminalReplayChunkBytes {
+	for off := 0; off < len(snap) || seq == 0; {
 		end := off + agentTerminalReplayChunkBytes
 		if end > len(snap) {
 			end = len(snap)
+		} else if safe := off + utf8SafePrefix(snap[off:end]); safe > off {
+			// Align interior chunk ends to a rune boundary so json.Marshal
+			// cannot corrupt a straddling multi-byte rune into U+FFFD — the
+			// same invariant terminalOutputEncoder enforces on the live output
+			// path. safe == off is impossible here: the slice is a full
+			// agentTerminalReplayChunkBytes (>= 4 bytes), so progress holds.
+			// The final chunk is emitted as-is — a genuinely truncated
+			// snapshot tail has no continuation to align with.
+			end = safe
 		}
 		_ = writeJSON(map[string]interface{}{
 			"type":       models.AgentEventTerminalReplay,
@@ -51,5 +60,6 @@ func (m *agentTerminalManager) sendReplay(sessionID string, ring *terminalRingBu
 			"truncated":  false,
 		})
 		seq++
+		off = end
 	}
 }

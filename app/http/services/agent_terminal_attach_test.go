@@ -2,12 +2,14 @@ package services
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"aliang.one/nursorgate/app/http/models"
 )
@@ -419,6 +421,57 @@ func TestSendReplayChunksLargeRingAndEmitsFinalFrameForEmptyRing(t *testing.T) {
 	joined.WriteString(fmt.Sprint(bigFrames[1]["data"]))
 	if joined.Len() != len(big) {
 		t.Fatalf("chunked replay lost bytes: joined=%d want %d", joined.Len(), len(big))
+	}
+}
+
+// TestSendReplayDoesNotSplitMultiByteRuneAcrossChunks pins the same UTF-8
+// invariant the live output path enforces via terminalOutputEncoder: a replay
+// chunk boundary must never fall inside a multi-byte rune, otherwise
+// json.Marshal corrupts both halves into U+FFFD and the scrollback is garbage.
+func TestSendReplayDoesNotSplitMultiByteRuneAcrossChunks(t *testing.T) {
+	m := newAgentTerminalManager()
+	coll, write := newPayloadCollector()
+
+	// 你 straddles the fixed 64KiB cut: its first byte is the last byte of
+	// chunk 0, its remaining two bytes open chunk 1.
+	snap := append(bytes.Repeat([]byte("x"), agentTerminalReplayChunkBytes-1), []byte("你好 tail")...)
+	ring := newTerminalRingBuffer(4 << 20)
+	ring.push(snap)
+	m.sendReplay("t-utf8", ring, terminalReplayStatusLive, nil, write)
+
+	frames := coll.ofTypes(models.AgentEventTerminalReplay)
+	if len(frames) < 2 {
+		t.Fatalf("frames = %d, want at least 2 for an oversized ring", len(frames))
+	}
+	var joined strings.Builder
+	for i, f := range frames {
+		data, _ := f["data"].(string)
+		if !utf8.ValidString(data) {
+			t.Fatalf("frame %d data is not valid UTF-8 (chunk boundary split a multi-byte rune)", i)
+		}
+		encoded, err := json.Marshal(f)
+		if err != nil {
+			t.Fatalf("frame %d marshal: %v", i, err)
+		}
+		// json.Marshal coerces invalid UTF-8 to the literal escape "�".
+		if strings.Contains(string(encoded), `�`) {
+			t.Fatalf("frame %d split a multi-byte rune: json.Marshal emitted U+FFFD: %.64s", i, encoded)
+		}
+		joined.WriteString(data)
+	}
+	if joined.String() != string(snap) {
+		t.Fatalf("chunked replay corrupted bytes: joined %d bytes, want %d", joined.Len(), len(snap))
+	}
+	if joined.String() != string(snap) {
+		t.Fatalf("chunked replay corrupted bytes: joined %d bytes, want %d", joined.Len(), len(snap))
+	}
+	if frames[len(frames)-1]["final"] != true {
+		t.Fatalf("last frame final = %v, want true", frames[len(frames)-1]["final"])
+	}
+	for i, f := range frames[:len(frames)-1] {
+		if f["final"] != false {
+			t.Fatalf("frame %d final = %v, want false before the last frame", i, f["final"])
+		}
 	}
 }
 
