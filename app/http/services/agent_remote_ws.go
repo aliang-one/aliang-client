@@ -518,6 +518,11 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 		// keyed), so periodic re-hellos re-triggering them is safe.
 		s.markRegistrationReady()
 		s.ai.replayPendingTerminals(writeJSON)
+		// Tell the server which terminal sessions survived the disconnect (live
+		// set, tombstones excluded); an empty set still emits so the server can
+		// clear stale records. Idempotent on the server side, so re-hellos are
+		// harmless.
+		s.terminal.announceSessions(writeJSON)
 		s.ai.emitApprovalSync(writeJSON)
 	case models.AgentEventHeartbeatAck:
 		s.setRemoteConnectionState(true, "online", "")
@@ -878,7 +883,7 @@ func agentPlatform() string {
 }
 
 func agentCapabilities() []string {
-	caps := []string{"terminal", "terminal_stream", "file_read", "file_diff", "command_launch", "ai_run_protocol_v2", "ai_run_start_v3", "ai_provider_binding_v1"}
+	caps := []string{"terminal", "terminal_stream", "terminal_replay", "file_read", "file_diff", "command_launch", "ai_run_protocol_v2", "ai_run_start_v3", "ai_provider_binding_v1"}
 	if agentNativePTYSupported() {
 		caps = append(caps, "terminal_pty", "terminal_resize")
 	} else {

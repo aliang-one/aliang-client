@@ -466,6 +466,42 @@ func (m *agentTerminalManager) markAllDetached() {
 	}
 }
 
+// announceSessions broadcasts the current set of LIVE terminal sessions to the
+// server as one {type:"terminal.sessions", sessions:[...]} frame, right after
+// the registration ack (and again on any re-hello — the server reconciles
+// idempotently against this list, using it to converge its stale records).
+// Only m.sessions is announced: tombstoned (exited) sessions stay private so a
+// server-side reconciliation can never resurrect a dead session. An empty set
+// still emits the frame with an empty array — the convergence signal for
+// "agent has no terminals". Treated as advisory (errors swallowed) like every
+// other best-effort write on this connection.
+func (m *agentTerminalManager) announceSessions(writeJSON agentTerminalWriter) {
+	if writeJSON == nil {
+		return
+	}
+	m.mu.Lock()
+	sessions := make([]map[string]interface{}, 0, len(m.sessions))
+	for _, session := range m.sessions {
+		if session == nil {
+			continue
+		}
+		sessions = append(sessions, map[string]interface{}{
+			"session_id":     session.id,
+			"shell":          session.shell,
+			"cwd":            session.cwd,
+			"rows":           session.rows,
+			"cols":           session.cols,
+			"started_at":     session.startedAt.UTC().Format(time.RFC3339),
+			"last_active_at": session.lastActiveAt.UTC().Format(time.RFC3339),
+		})
+	}
+	m.mu.Unlock()
+	_ = writeJSON(map[string]interface{}{
+		"type":     models.AgentEventTerminalSessions,
+		"sessions": sessions,
+	})
+}
+
 // reapExpiredHistory drops tombstones whose exitedAt is older than
 // agentTerminalHistoryTTL, freeing their output rings, and reports how many
 // were dropped.
