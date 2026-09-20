@@ -9,7 +9,7 @@ import (
 
 func TestClassifyGitStatusCode(t *testing.T) {
 	cases := []struct{ code, want string }{
-		{"??", "added"},   // untracked
+		{"??", "added"},    // untracked
 		{" M", "modified"}, // unstaged modify
 		{"M ", "modified"}, // staged modify
 		{"MM", "modified"}, // staged + unstaged

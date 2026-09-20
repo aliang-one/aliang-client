@@ -85,8 +85,10 @@ func (s *AgentService) EnsureRemoteConnection() error {
 func (s *AgentService) remoteConnectionLoop() {
 	defer func() {
 		// The remote connection is being torn down for good (disabled / no
-		// authorization): clean up AI sessions deliberately kept alive across
-		// transient reconnects inside runRemoteAgentSession.
+		// authorization / process-level shutdown of the loop): clean up the AI
+		// sessions and terminal PTYs that runRemoteAgentSession deliberately
+		// keeps alive across transient reconnects.
+		s.terminal.closeAll()
 		s.ai.closeAll()
 		s.wsMu.Lock()
 		s.wsConnecting = false
@@ -342,12 +344,16 @@ func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn) error {
 		return err
 	}
 
-	defer s.terminal.closeAll()
-	// NOTE: AI sessions are intentionally NOT closed here. A transient WS
-	// disconnect (conn read error) must not kill locally-running AI CLIs; they
-	// survive and re-stream over the next connection via currentRemoteWriter().
-	// True shutdown paths (remoteConnectionLoop exit, forceDisconnectRemote)
-	// close AI sessions explicitly.
+	defer s.terminal.markAllDetached()
+	// NOTE: AI sessions AND terminal PTYs are intentionally NOT closed here. A
+	// transient WS disconnect (conn read error) must not kill locally-running
+	// processes: AI CLIs survive and re-stream over the next connection via
+	// currentRemoteWriter(); terminal shells stay alive detached and their
+	// scrollback is replayed from the output ring when the client re-attaches.
+	// A detached session is only reaped later if it goes input-idle (see
+	// watchTerminalIdle). True shutdown paths (remoteConnectionLoop exit,
+	// forceDisconnectRemote, remote_terminal_enabled turned off) still close
+	// AI sessions and kill terminals explicitly.
 	//
 	// terminal replay + approval sync used to run here, before the read loop.
 	// They are business writes that must wait for registration, so they now run
@@ -512,6 +518,11 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 		// keyed), so periodic re-hellos re-triggering them is safe.
 		s.markRegistrationReady()
 		s.ai.replayPendingTerminals(writeJSON)
+		// Tell the server which terminal sessions survived the disconnect (live
+		// set, tombstones excluded); an empty set still emits so the server can
+		// clear stale records. Idempotent on the server side, so re-hellos are
+		// harmless.
+		s.terminal.announceSessions(writeJSON)
 		s.ai.emitApprovalSync(writeJSON)
 	case models.AgentEventHeartbeatAck:
 		s.setRemoteConnectionState(true, "online", "")
@@ -872,7 +883,7 @@ func agentPlatform() string {
 }
 
 func agentCapabilities() []string {
-	caps := []string{"terminal", "terminal_stream", "file_read", "file_diff", "command_launch", "ai_run_protocol_v2", "ai_run_start_v3", "ai_provider_binding_v1"}
+	caps := []string{"terminal", "terminal_stream", "terminal_replay", "file_read", "file_diff", "command_launch", "ai_run_protocol_v2", "ai_run_start_v3", "ai_provider_binding_v1"}
 	if agentNativePTYSupported() {
 		caps = append(caps, "terminal_pty", "terminal_resize")
 	} else {

@@ -13,9 +13,9 @@ import (
 
 	"aliang.one/nursorgate/app/http/common"
 	"aliang.one/nursorgate/common/logger"
+	user "aliang.one/nursorgate/processor/auth"
 	clientcert "aliang.one/nursorgate/processor/cert/client"
 	"aliang.one/nursorgate/processor/config"
-	user "aliang.one/nursorgate/processor/auth"
 )
 
 type ChatHandler struct{}

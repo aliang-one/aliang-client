@@ -15,7 +15,7 @@ func TestSerializeGoalContextRendersFullEnvelope(t *testing.T) {
 	envelope := map[string]interface{}{
 		"version": float64(1),
 		"goal": map[string]interface{}{
-			"objective":     "Ship the foo feature",
+			"objective":      "Ship the foo feature",
 			"revisionNumber": float64(3),
 			"taskAttempt":    float64(1),
 			"constraints":    []interface{}{"must not break the public API", "stay under 5000 tokens"},
@@ -23,11 +23,11 @@ func TestSerializeGoalContextRendersFullEnvelope(t *testing.T) {
 			"driver":         "server",
 		},
 		"task": map[string]interface{}{
-			"key":              "T1",
-			"title":            "Implement foo endpoint",
-			"description":      "add POST /foo returning the widget",
-			"allowedRoots":     []interface{}{"src/foo"},
-			"allowedCommands":  []interface{}{"npm test"},
+			"key":             "T1",
+			"title":           "Implement foo endpoint",
+			"description":     "add POST /foo returning the widget",
+			"allowedRoots":    []interface{}{"src/foo"},
+			"allowedCommands": []interface{}{"npm test"},
 			"requiredChecks": []interface{}{
 				map[string]interface{}{"id": "c1", "key": "foo-unit-test", "type": "command", "command": "npm run test:foo"},
 				map[string]interface{}{"id": "c2", "key": "foo-banner", "type": "file_contains", "path": "src/foo/README.md", "contains": "foo is wired"},

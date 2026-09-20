@@ -109,32 +109,32 @@ type AgentProject struct {
 }
 
 type AgentVibeSession struct {
-	ID                    string                   `json:"id"`
-	Provider              string                   `json:"provider"`
-	Tool                  string                   `json:"tool,omitempty"`
-	SourceSessionID       string                   `json:"source_session_id,omitempty"`
-	Origin                string                   `json:"origin,omitempty"`
-	ManagedConversationID string                   `json:"managed_conversation_id,omitempty"`
-	BindingState          string                   `json:"binding_state,omitempty"`
-	BindingVersion        int                      `json:"binding_version,omitempty"`
-	ProjectPath           string                   `json:"project_path,omitempty"`
-	Title                 string                   `json:"title,omitempty"`
+	ID                    string `json:"id"`
+	Provider              string `json:"provider"`
+	Tool                  string `json:"tool,omitempty"`
+	SourceSessionID       string `json:"source_session_id,omitempty"`
+	Origin                string `json:"origin,omitempty"`
+	ManagedConversationID string `json:"managed_conversation_id,omitempty"`
+	BindingState          string `json:"binding_state,omitempty"`
+	BindingVersion        int    `json:"binding_version,omitempty"`
+	ProjectPath           string `json:"project_path,omitempty"`
+	Title                 string `json:"title,omitempty"`
 	// TitleUpdatedAt is the agent-clock timestamp of the winning user rename
 	// (pid record or durable rename cache). Empty when the title is merely
 	// derived (summary/firstPrompt/index fallback). PhoneServer compares this
 	// against its own titleUpdatedAt to implement latest-of-writer semantics
 	// instead of freezing the first phone rename forever.
-	TitleUpdatedAt        string                   `json:"title_updated_at,omitempty"`
-	Summary               string                   `json:"summary,omitempty"`
-	Mode                  string                   `json:"mode,omitempty"`
-	Status                string                   `json:"status,omitempty"`
-	MessageCount          int                      `json:"message_count,omitempty"`
-	Branch                string                   `json:"branch,omitempty"`
-	Model                 string                   `json:"model,omitempty"`
-	Transcript            []AgentVibeMessage       `json:"transcript,omitempty"`
-	TranscriptPage        *AgentVibeTranscriptPage `json:"transcript_page,omitempty"`
-	CreatedAt             string                   `json:"created_at,omitempty"`
-	UpdatedAt             string                   `json:"updated_at,omitempty"`
+	TitleUpdatedAt string                   `json:"title_updated_at,omitempty"`
+	Summary        string                   `json:"summary,omitempty"`
+	Mode           string                   `json:"mode,omitempty"`
+	Status         string                   `json:"status,omitempty"`
+	MessageCount   int                      `json:"message_count,omitempty"`
+	Branch         string                   `json:"branch,omitempty"`
+	Model          string                   `json:"model,omitempty"`
+	Transcript     []AgentVibeMessage       `json:"transcript,omitempty"`
+	TranscriptPage *AgentVibeTranscriptPage `json:"transcript_page,omitempty"`
+	CreatedAt      string                   `json:"created_at,omitempty"`
+	UpdatedAt      string                   `json:"updated_at,omitempty"`
 }
 
 type AgentVibeMessage struct {

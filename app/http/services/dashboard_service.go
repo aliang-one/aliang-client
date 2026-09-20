@@ -11,11 +11,11 @@ import (
 type DashboardService struct{}
 
 var (
-	getDashboardStatsFn   = auth.GetDashboardStats
-	getDashboardTrendFn   = auth.GetDashboardTrend
-	getDashboardModelsFn  = auth.GetDashboardModels
-	getUsageRecordsFn     = auth.GetUsageRecords
-	getHealthScoreFn      = auth.GetHealthScore
+	getDashboardStatsFn  = auth.GetDashboardStats
+	getDashboardTrendFn  = auth.GetDashboardTrend
+	getDashboardModelsFn = auth.GetDashboardModels
+	getUsageRecordsFn    = auth.GetUsageRecords
+	getHealthScoreFn     = auth.GetHealthScore
 )
 
 func NewDashboardService() *DashboardService {

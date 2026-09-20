@@ -30,6 +30,8 @@ const (
 	AgentEventTerminalClose           = "terminal.close"
 	AgentEventTerminalExit            = "terminal.exit"
 	AgentEventTerminalError           = "terminal.error"
+	AgentEventTerminalReplay          = "terminal.replay"
+	AgentEventTerminalSessions        = "terminal.sessions" // agent→server: full set of LIVE sessions, broadcast after registration ack so the server can converge its stale records
 	AgentEventAISessionCreate         = "ai.session.create"
 	AgentEventAISessionCreated        = "ai.session.created"
 	AgentEventAISessionClose          = "ai.session.close"
@@ -46,7 +48,7 @@ const (
 	AgentEventAIRunProgress           = "ai.run.progress" // server→mobile: live per-run files_touched_count + git_changed_count
 	AgentEventAIRunEventAck           = "ai.run.event.ack"
 	AgentEventGoalRunEventAck         = "goal.run.event.ack"
-	AgentEventAIRename                = "ai.session.rename"      // server→agent: user renamed a conversation on the phone; the agent persists it into its durable rename cache
+	AgentEventAIRename                = "ai.session.rename"     // server→agent: user renamed a conversation on the phone; the agent persists it into its durable rename cache
 	AgentEventAIRenameAck             = "ai.session.rename.ack" // agent→server: rename accepted/rejected; carries the agent-clock title_updated_at PhoneServer's latestOf guard compares against
 	AgentEventAIStop                  = "ai.stop"
 	AgentEventAIStatus                = "ai.status"
