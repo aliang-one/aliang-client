@@ -600,12 +600,31 @@ func (m *agentTerminalManager) copyTerminalOutput(sessionID string, reader io.Re
 				return
 			}
 			if chunk := enc.push(buf[:n]); len(chunk) > 0 {
-				_ = writeJSON(map[string]interface{}{
+				frame := map[string]interface{}{
 					"type":       models.AgentEventTerminalOutput,
 					"session_id": sessionID,
 					"encoding":   "text",
 					"data":       string(chunk),
-				})
+				}
+				// Dual write: the ring is the authoritative copy of the output
+				// stream, so a dead WebSocket no longer loses those bytes — the
+				// next attach replays them from the ring. The gate must cover
+				// push AND the live frame together (exactly what sendReplay
+				// holds across snapshot+send): a chunk then lands either fully
+				// in the replay snapshot or fully in the live stream, never in
+				// both (seam duplication) and never in neither (seam gap).
+				// Lock order: m.mu is taken and released inside m.get BEFORE
+				// outputGate — never the reverse, never nested.
+				if session := m.get(sessionID); session != nil && session.ring != nil {
+					session.outputGate.Lock()
+					session.ring.push(chunk)
+					_ = writeJSON(frame)
+					session.outputGate.Unlock()
+				} else {
+					// Session already reaped (or ring-less): keep the legacy
+					// best-effort live write.
+					_ = writeJSON(frame)
+				}
 			}
 		}
 		if err != nil {
