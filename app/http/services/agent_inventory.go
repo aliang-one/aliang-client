@@ -661,6 +661,10 @@ func collectClaudeVibeSessionsWithStats(scanDirs []string) ([]models.AgentVibeSe
 	indexFiles := listAllProjectIndexFiles(root)
 	var sessions []models.AgentVibeSession
 	seen := make(map[string]bool)
+	// native sessionId → jsonl mtime, captured during the transcript walk.
+	// Drives both the freshness-derived status overlay (records without a
+	// busy/idle status) and the updated_at freshness patch below.
+	transcriptFreshness := make(map[string]time.Time)
 	for _, indexPath := range indexFiles {
 		raw, err := os.ReadFile(indexPath)
 		if err != nil {
@@ -730,11 +734,36 @@ func collectClaudeVibeSessionsWithStats(scanDirs []string) ([]models.AgentVibeSe
 			continue
 		}
 		session := readClaudeSessionMetaWithOptions(path, agentVibeSessionReadOptions{Limit: agentVibeTranscriptMaxMessages, ScanDirs: scanDirs})
-		if session.ID == "" || seen[session.ID] {
+		if session.ID == "" {
+			continue
+		}
+		// Capture freshness for EVERY walked session — including ones already
+		// claimed by the index pass (a resumed conversation): the patch below
+		// needs their mtime to replace the stale index `modified`.
+		if info, err := os.Stat(path); err == nil {
+			transcriptFreshness[strings.TrimPrefix(session.ID, "claude_")] = info.ModTime()
+		}
+		if seen[session.ID] {
 			continue
 		}
 		sessions = append(sessions, session)
 		seen[session.ID] = true
+	}
+	// updated_at freshness patch: Claude Code writes sessions-index.json
+	// lazily, so a RESUMED conversation keeps its index `modified` from the
+	// previous turn while its jsonl is appended live. PhoneServer feeds
+	// lastActiveAt from updated_at — leaving it stale lets the server's
+	// stale-run sweeper (10 min quiet) flap a mid-turn session to "timed out"
+	// and back on every inventory push. Walk-sourced sessions already carry
+	// the same mtime here, so the max() is a no-op for them.
+	for index := range sessions {
+		mt, ok := transcriptFreshness[strings.TrimPrefix(sessions[index].ID, "claude_")]
+		if !ok {
+			continue
+		}
+		if mtRFC := mt.UTC().Format(time.RFC3339); compareRFC3339(sessions[index].UpdatedAt, mtRFC) < 0 {
+			sessions[index].UpdatedAt = mtRFC
+		}
 	}
 	// Claude Code persists the conversation title the user set via /rename in
 	// two volatile places: sessions-index.json entries ("customTitle" — only
@@ -745,7 +774,7 @@ func collectClaudeVibeSessionsWithStats(scanDirs []string) ([]models.AgentVibeSe
 	// the agent's durable rename cache (last-writer-wins on the agent clock) so
 	// a rename, once observed, never reverts — even after Claude Code prunes
 	// the pid file.
-	applyClaudeRenameNames(sessions, loadClaudeRenameRecords(home))
+	applyClaudeRenameNames(sessions, loadClaudeRenameRecords(home), transcriptFreshness)
 	return sessions, transcriptDropped
 }
 
@@ -784,10 +813,17 @@ type agentRenamePidRecord struct {
 }
 
 // loadClaudeRenameRecords reads ~/.claude/sessions/*.json and returns a map
-// from native Claude Code sessionId to the rename record of the process that
-// last set it. Files are named by PID and pruned for old processes (not
-// always promptly), so a record may outlive its process — isPidAlive decides
-// whether it may still compete for the title.
+// from native Claude Code sessionId to the record of the process that last
+// touched it. Files are named by PID and pruned for old processes (not always
+// promptly), so a record may outlive its process — isPidAlive decides whether
+// it may still compete for the title.
+//
+// Records WITHOUT a user-set name are kept on purpose: the live busy/idle
+// status overlay and the digest read them too. The previous `name == ""`
+// guard silently dropped them, which disabled the running signal for every
+// session the user never /rename'd (the overwhelmingly common case — the
+// same fixture-vs-production blindness as the ms-timestamp bug). The rename
+// competition itself still ignores empty names (applyClaudeRenameNames).
 func loadClaudeRenameRecords(home string) map[string]agentRenamePidRecord {
 	out := map[string]agentRenamePidRecord{}
 	if home = strings.TrimSpace(home); home == "" {
@@ -812,12 +848,11 @@ func loadClaudeRenameRecords(home string) map[string]agentRenamePidRecord {
 		if err := json.Unmarshal(raw, &row); err != nil {
 			continue
 		}
-		name := strings.TrimSpace(row.Name)
-		if row.SessionID == "" || name == "" {
+		if row.SessionID == "" {
 			continue
 		}
 		out[row.SessionID] = agentRenamePidRecord{
-			Name:      name,
+			Name:      strings.TrimSpace(row.Name),
 			PID:       row.PID,
 			Status:    strings.TrimSpace(row.Status),
 			UpdatedAt: pidRecordTimestamp(row.UpdatedAt, file),
@@ -853,14 +888,25 @@ func pidRecordTimestamp(value interface{}, file string) time.Time {
 	return time.Time{}
 }
 
-// applyClaudeRenameNames overlays user-set /rename titles onto the collected
-// Claude sessions, keyed by native sessionId (the "claude_"-stripped session
-// ID). A live pid record competes with the durable rename cache by updatedAt;
-// a dead pid record may only seed the cache when no entry exists yet, so
-// zombie pid files can never shadow a newer rename (previously every pid file
-// overwrote unconditionally in glob order). Newly observed pid names are
-// merged into the cache so titles survive Claude Code's pid-file pruning.
-func applyClaudeRenameNames(sessions []models.AgentVibeSession, records map[string]agentRenamePidRecord) {
+// claudeStatusFreshnessWindow bounds the freshness-derived "running" signal for
+// sessions whose pid record carries no usable status (older Claude Code builds
+// never write one; headless/sdk entrypoints never do either — verified on real
+// 2.1.x records). An actively appended transcript means work is in flight; the
+// signal decays on its own once writes stop, so an open-but-quiet session falls
+// back to idle. This decay is what keeps the branch from resurrecting the
+// pre-437bc99 "live process == forever running" bug.
+const claudeStatusFreshnessWindow = 3 * time.Minute
+
+// applyClaudeRenameNames overlays user-set /rename titles and the live-status
+// signal onto the collected Claude sessions, keyed by native sessionId (the
+// "claude_"-stripped session ID). A live pid record competes with the durable
+// rename cache by updatedAt; a dead pid record may only seed the cache when no
+// entry exists yet, so zombie pid files can never shadow a newer rename
+// (previously every pid file overwrote unconditionally in glob order). Newly
+// observed pid names are merged into the cache so titles survive Claude Code's
+// pid-file pruning. transcriptFreshness (native sessionId → jsonl mtime)
+// backs the status branch for records without a busy/idle status.
+func applyClaudeRenameNames(sessions []models.AgentVibeSession, records map[string]agentRenamePidRecord, transcriptFreshness map[string]time.Time) {
 	renameCache := loadAgentRenameCache()
 	observed := map[string]agentRenameCacheEntry{}
 	for index := range sessions {
@@ -879,17 +925,31 @@ func applyClaudeRenameNames(sessions []models.AgentVibeSession, records map[stri
 		}
 		alive := hasRecord && isPidAlive(record.PID)
 		if alive {
-			// Follow Claude Code's own busy/idle signal: "running" means a
-			// task is executing, not merely that a TUI window is open (an
-			// idle TUI at the prompt used to show as forever "in progress"
-			// on the phone).
-			if record.Status == "busy" {
+			// Follow Claude Code's own busy/idle signal when the record has
+			// one: "running" means a task is executing, not merely that a TUI
+			// window is open (an idle TUI at the prompt used to show as
+			// forever "in progress" on the phone).
+			//
+			// Records with no usable status (missing/null/empty/unknown — Go
+			// unmarshal collapses all of them to "") fall back to transcript
+			// freshness: an appended-within-the-window jsonl means a turn is
+			// in flight, and the signal decays so it can never stick as a
+			// permanent "running" on an idle session.
+			switch {
+			case record.Status == "busy":
 				sessions[index].Status = "running"
-			} else {
+			case record.Status == "idle":
+				sessions[index].Status = "idle"
+			case time.Since(transcriptFreshness[nativeID]) < claudeStatusFreshnessWindow:
+				sessions[index].Status = "running"
+			default:
 				sessions[index].Status = "idle"
 			}
 		}
-		if hasRecord {
+		// Only records that actually carry a user-set name compete for the
+		// title (see loadClaudeRenameRecords: nameless records are loaded for
+		// their liveness/status signal alone).
+		if hasRecord && record.Name != "" {
 			recordEntry := agentRenameCacheEntry{
 				Name:        record.Name,
 				Origin:      agentRenameOriginLocal,
