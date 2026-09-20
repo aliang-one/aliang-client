@@ -77,6 +77,7 @@ func TestAttachLiveRearmsAttachedState(t *testing.T) {
 	m.sessions["t-rearm"] = live
 	m.mu.Unlock()
 
+	rearm := time.Now()
 	m.markAllDetached()
 	m.create(map[string]interface{}{
 		"type":       models.AgentEventTerminalCreate,
@@ -89,12 +90,115 @@ func TestAttachLiveRearmsAttachedState(t *testing.T) {
 	if !live.detachedAt.IsZero() {
 		t.Fatalf("a successful live attach must re-arm attached state (zero detachedAt), got %v", live.detachedAt)
 	}
+	// Re-arming attached state must include the idle clocks, not just the
+	// detach stamp: a session that sat detached and fully silent carries
+	// stale lastActiveAt/lastInputAt, and without a refresh the very next
+	// watchTerminalIdle tick would kill the shell the user just attached to.
+	if live.lastActiveAt.Before(rearm) {
+		t.Fatalf("attach must re-arm the attached activity clock (lastActiveAt=%v predates the attach)", live.lastActiveAt)
+	}
+	if live.lastInputAt.Before(rearm) {
+		t.Fatalf("attach must re-arm the input clock for a future detach (lastInputAt=%v predates the attach)", live.lastInputAt)
+	}
 	created := coll.ofTypes(models.AgentEventTerminalCreated)
 	if len(created) != 1 || created[0]["resumed"] != true {
 		t.Fatalf("attach must confirm resume, created=%v", created)
 	}
 	if frames := coll.ofTypes(models.AgentEventTerminalReplay); len(frames) != 1 {
 		t.Fatalf("attach must replay the scrollback, frames=%d", len(frames))
+	}
+}
+
+// TestReattachedStaleSessionSurvivesIdleWatcher pins the clock half of the
+// reap race end-to-end: a session that sat detached and fully silent past
+// every idle budget still carries stale clocks when re-attached. The watcher
+// must not kill the shell the user just attached to — attachLive re-arms the
+// idle clocks, so every post-attach tick evaluates against a fresh budget.
+func TestReattachedStaleSessionSurvivesIdleWatcher(t *testing.T) {
+	shrinkDetachedWatch(t, 5*time.Millisecond, 30*time.Minute)
+	m := newAgentTerminalManager()
+	live := newAttachTestSession("t-survive", newTerminalRingBuffer(4096))
+	stale := time.Now().Add(-2 * time.Hour) // past every idle budget
+	live.lastActiveAt = stale
+	live.lastInputAt = stale
+	live.detachedAt = stale
+	kills := killRecorder(live)
+	m.mu.Lock()
+	m.sessions["t-survive"] = live
+	m.mu.Unlock()
+
+	if !m.attachLive("t-survive", 24, 80, func(interface{}) error { return nil }) {
+		t.Fatalf("attachLive must re-attach a live session")
+	}
+	go m.watchTerminalIdle("t-survive", live.token, func(interface{}) error { return nil })
+
+	// Several watcher ticks after the attach: the stale pre-attach idle state
+	// must not reap the freshly re-attached shell.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if got := atomic.LoadInt32(kills); got != 0 {
+			t.Fatalf("watchTerminalIdle killed the session %d time(s) right after re-attach: attach must re-arm the idle clocks", got)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if m.get("t-survive") == nil {
+		t.Fatalf("re-attached session must still be registered")
+	}
+}
+
+// TestAttachLiveRetractsCommittedReap pins the execution half of the reap
+// race: watchTerminalIdle decides a reap under m.mu but kills after
+// unlocking, so a re-attach landing in that window must retract the kill.
+// The error-frame write is the handshake point where the attach lands.
+func TestAttachLiveRetractsCommittedReap(t *testing.T) {
+	shrinkDetachedWatch(t, 5*time.Millisecond, 30*time.Minute)
+	m := newAgentTerminalManager()
+	live := newAttachTestSession("t-retract", newTerminalRingBuffer(4096))
+	stale := time.Now().Add(-2 * time.Hour) // past every idle budget
+	live.lastActiveAt = stale
+	live.lastInputAt = stale
+	live.detachedAt = stale
+	kills := killRecorder(live)
+	m.mu.Lock()
+	m.sessions["t-retract"] = live
+	m.mu.Unlock()
+
+	var committed, errorFrames int32
+	write := func(v interface{}) error {
+		if p, ok := v.(map[string]interface{}); ok && p["type"] == models.AgentEventTerminalError {
+			atomic.AddInt32(&errorFrames, 1)
+			// The reap has been decided but not yet executed: the user
+			// re-attaches exactly here.
+			if atomic.CompareAndSwapInt32(&committed, 0, 1) {
+				if !m.attachLive("t-retract", 24, 80, func(interface{}) error { return nil }) {
+					t.Error("attachLive must still find the live session")
+				}
+			}
+		}
+		return nil
+	}
+	go m.watchTerminalIdle("t-retract", live.token, write)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for atomic.LoadInt32(&committed) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("watcher never committed a reap decision for the long-silent detached session")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond) // let the committed decision run to its kill point
+
+	if got := atomic.LoadInt32(kills); got != 0 {
+		t.Fatalf("a committed reap must be retractable by a concurrent attach, kills=%d", got)
+	}
+	if m.get("t-retract") == nil {
+		t.Fatalf("a retracted reap must leave the session registered")
+	}
+	if !live.detachedAt.IsZero() {
+		t.Fatalf("the retracting attach must have re-armed attached state, detachedAt=%v", live.detachedAt)
+	}
+	if got := atomic.LoadInt32(&errorFrames); got != 1 {
+		t.Fatalf("terminal.error frames = %d, want exactly 1 (a retracted reap must not re-fire every tick)", got)
 	}
 }
 

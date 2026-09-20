@@ -243,8 +243,15 @@ func (m *agentTerminalManager) attachLive(sessionID string, rows, cols int, writ
 	session := m.sessions[sessionID]
 	if session != nil {
 		// Re-attached: clear the detach stamp so the detached-input reaper no
-		// longer applies and the legacy attached activity timer takes over.
+		// longer applies, and re-arm both idle clocks — the attach itself
+		// proves a live user. A session that sat detached and fully silent
+		// carries stale lastActiveAt/lastInputAt; without the refresh the very
+		// next watchTerminalIdle tick (≤1min) would kill the shell the user
+		// just attached to, defeating the reconnect-attach promise.
+		now := time.Now()
 		session.detachedAt = time.Time{}
+		session.lastActiveAt = now
+		session.lastInputAt = now
 	}
 	m.mu.Unlock()
 	if session == nil {
@@ -623,6 +630,21 @@ func (m *agentTerminalManager) watchTerminalIdle(sessionID string, token *struct
 			continue
 		}
 		_ = writeJSON(agentTerminalErrorPayload(sessionID, errors.New(reason)))
+		// The reap was decided but not yet executed. Re-verify under the lock
+		// immediately before killing: a concurrent attachLive re-arms the idle
+		// clocks under m.mu too, and must be able to retract a committed kill
+		// — never execute a stale reap against a shell the user just attached
+		// to. (The error frame may already be out in that case; it is harmless
+		// next to the fresh terminal.created it is racing, and the next tick
+		// sees a re-armed session.) Killing stays outside the lock, matching
+		// every other kill path in this file.
+		m.mu.Lock()
+		session = m.sessions[sessionID]
+		retracted := session == nil || session.token != token || terminalIdleReapReason(session) == ""
+		m.mu.Unlock()
+		if retracted {
+			continue
+		}
 		session.kill()
 		return
 	}
