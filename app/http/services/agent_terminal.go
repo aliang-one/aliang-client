@@ -33,6 +33,36 @@ const agentTerminalHistoryCap = 8
 // terminal session (overridable via ALIANG_TERMINAL_RING_BYTES, floor 64KiB).
 const agentTerminalRingDefaultBytes = 2 * 1024 * 1024
 
+// Terminal lifecycle knobs. Both durations resolve once at process start; an
+// unset/blank/unparseable/non-positive env value falls back to the default
+// (see resolveEnvDuration, which is unit-tested).
+//
+//	ALIANG_TERMINAL_DETACHED_IDLE  (time.ParseDuration form, e.g. "30m").
+//	                               How long a DETACHED session (its client
+//	                               disconnected, PTY deliberately kept alive)
+//	                               may sit without user input before it is
+//	                               reaped. Timed from the last INPUT only:
+//	                               output does not extend a detached
+//	                               session's life. Default 30m.
+//
+//	ALIANG_TERMINAL_HISTORY_TTL    (time.ParseDuration form, e.g. "24h").
+//	                               How long an exited session's tombstone
+//	                               (metadata + output ring, up to ~2 MiB per
+//	                               ring) stays replayable before the sweeper
+//	                               drops it. Default 24h.
+var (
+	agentTerminalDetachedIdle = resolveEnvDuration("ALIANG_TERMINAL_DETACHED_IDLE", 30*time.Minute)
+	agentTerminalHistoryTTL   = resolveEnvDuration("ALIANG_TERMINAL_HISTORY_TTL", 24*time.Hour)
+
+	// agentTerminalIdleWatchInterval is how often each session's idle watcher
+	// re-evaluates the reap rules. Package var so tests can shrink it.
+	agentTerminalIdleWatchInterval = time.Minute
+)
+
+// agentTerminalHistorySweepInterval is how often the manager-level sweeper
+// drops tombstones past agentTerminalHistoryTTL.
+const agentTerminalHistorySweepInterval = time.Minute
+
 // agentTerminalHistory is a tombstone of an exited terminal session: enough
 // metadata to describe the dead session and the output ring so a reconnecting
 // client can still be served a final replay without spawning a new shell.
@@ -103,11 +133,16 @@ type agentTerminalHandle struct {
 }
 
 func newAgentTerminalManager() *agentTerminalManager {
-	return &agentTerminalManager{
+	m := &agentTerminalManager{
 		sessions:     make(map[string]*agentTerminalSession),
 		history:      make(map[string]*agentTerminalHistory),
 		startProcess: startAgentTerminalProcess,
 	}
+	// Tombstone TTL sweeper: runs for the life of the process (there is no
+	// shutdown signal because the manager dies with it), freeing each expired
+	// tombstone's output ring (~2 MiB a piece).
+	go m.sweepHistoryLoop()
+	return m
 }
 
 func (m *agentTerminalManager) create(msg map[string]interface{}, writeJSON agentTerminalWriter) {
@@ -206,6 +241,11 @@ func (m *agentTerminalManager) create(msg map[string]interface{}, writeJSON agen
 func (m *agentTerminalManager) attachLive(sessionID string, rows, cols int, writeJSON agentTerminalWriter) bool {
 	m.mu.Lock()
 	session := m.sessions[sessionID]
+	if session != nil {
+		// Re-attached: clear the detach stamp so the detached-input reaper no
+		// longer applies and the legacy attached activity timer takes over.
+		session.detachedAt = time.Time{}
+	}
 	m.mu.Unlock()
 	if session == nil {
 		return false
@@ -318,7 +358,7 @@ func (m *agentTerminalManager) write(msg map[string]interface{}, writeJSON agent
 		_ = writeJSON(agentTerminalErrorPayload(sessionID, fmt.Errorf("terminal session not found: %s", sessionID)))
 		return
 	}
-	m.touch(sessionID)
+	m.touchInput(sessionID)
 	if _, err := io.WriteString(session.input, data); err != nil {
 		_ = writeJSON(agentTerminalErrorPayload(sessionID, err))
 	}
@@ -400,6 +440,72 @@ func (m *agentTerminalManager) closeAll() {
 	}
 }
 
+// markAllDetached stamps every live session as detached (zero = attached) at
+// the moment the WebSocket dropped, WITHOUT touching the PTY processes. A
+// transient agent↔server disconnect must not kill shells or AI-adjacent state:
+// the sessions survive detached and are replayed from their output ring on the
+// next attach. True shutdown paths (remoteConnectionLoop exit,
+// forceDisconnectRemote, the remote-terminal setting being disabled) still call
+// closeAll, which kills and tombstones everything.
+func (m *agentTerminalManager) markAllDetached() {
+	now := time.Now()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, session := range m.sessions {
+		if session == nil {
+			continue
+		}
+		session.detachedAt = now
+	}
+}
+
+// reapExpiredHistory drops tombstones whose exitedAt is older than
+// agentTerminalHistoryTTL, freeing their output rings, and reports how many
+// were dropped.
+func (m *agentTerminalManager) reapExpiredHistory(now time.Time) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	dropped := 0
+	for id, tomb := range m.history {
+		if now.Sub(tomb.exitedAt) >= agentTerminalHistoryTTL {
+			delete(m.history, id)
+			dropped++
+		}
+	}
+	return dropped
+}
+
+// sweepHistoryLoop runs the tombstone TTL sweep once a minute for the life of
+// the process.
+func (m *agentTerminalManager) sweepHistoryLoop() {
+	ticker := time.NewTicker(agentTerminalHistorySweepInterval)
+	defer ticker.Stop()
+	for range ticker.C {
+		m.reapExpiredHistory(time.Now())
+	}
+}
+
+// terminalIdleReapReason returns a non-empty human-readable reason when the
+// session should be reaped by its idle watcher, or "" while it may live.
+// Detached sessions are timed from the last USER INPUT only (Board semantics:
+// output does not extend a detached session's life); attached sessions keep
+// the legacy any-activity idle timer.
+func terminalIdleReapReason(session *agentTerminalSession) string {
+	if session == nil {
+		return ""
+	}
+	if !session.detachedAt.IsZero() {
+		if time.Since(session.lastInputAt) >= agentTerminalDetachedIdle {
+			return fmt.Sprintf("detached terminal session reaped after %s without input", agentTerminalDetachedIdle)
+		}
+		return ""
+	}
+	if time.Since(session.lastActiveAt) >= agentTerminalIdleTimeout {
+		return fmt.Sprintf("terminal session idle timeout after %s", agentTerminalIdleTimeout)
+	}
+	return ""
+}
+
 func (m *agentTerminalManager) activeSessionsSnapshot() []models.AgentTerminalRuntime {
 	if m == nil {
 		return []models.AgentTerminalRuntime{}
@@ -437,6 +543,19 @@ func (m *agentTerminalManager) touch(sessionID string) {
 	defer m.mu.Unlock()
 	if session := m.sessions[sessionID]; session != nil {
 		session.lastActiveAt = time.Now()
+	}
+}
+
+// touchInput records real user input (terminal.input). It refreshes the
+// attached activity timer like touch, and additionally the input clock that
+// governs a detached session's life — output and resizes do not count there.
+func (m *agentTerminalManager) touchInput(sessionID string) {
+	now := time.Now()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if session := m.sessions[sessionID]; session != nil {
+		session.lastActiveAt = now
+		session.lastInputAt = now
 	}
 }
 
@@ -489,7 +608,7 @@ func (m *agentTerminalManager) copyTerminalOutput(sessionID string, reader io.Re
 }
 
 func (m *agentTerminalManager) watchTerminalIdle(sessionID string, token *struct{}, writeJSON agentTerminalWriter) {
-	ticker := time.NewTicker(time.Minute)
+	ticker := time.NewTicker(agentTerminalIdleWatchInterval)
 	defer ticker.Stop()
 	for range ticker.C {
 		m.mu.Lock()
@@ -498,12 +617,12 @@ func (m *agentTerminalManager) watchTerminalIdle(sessionID string, token *struct
 			m.mu.Unlock()
 			return
 		}
-		expired := time.Since(session.lastActiveAt) >= agentTerminalIdleTimeout
+		reason := terminalIdleReapReason(session)
 		m.mu.Unlock()
-		if !expired {
+		if reason == "" {
 			continue
 		}
-		_ = writeJSON(agentTerminalErrorPayload(sessionID, fmt.Errorf("terminal session idle timeout after %s", agentTerminalIdleTimeout)))
+		_ = writeJSON(agentTerminalErrorPayload(sessionID, errors.New(reason)))
 		session.kill()
 		return
 	}
@@ -590,9 +709,13 @@ func newAgentTerminalSession(id string, shell string, cwd string, handle *agentT
 		token:        new(struct{}),
 		startedAt:    now,
 		lastActiveAt: now,
-		rows:         rows,
-		cols:         cols,
-		ring:         newTerminalRingBuffer(agentTerminalRingDefaultBytes),
+		// A session is born attached with a full input-idle budget: a detached
+		// session that never saw input is still reaped only after
+		// agentTerminalDetachedIdle from creation.
+		lastInputAt: now,
+		rows:        rows,
+		cols:        cols,
+		ring:        newTerminalRingBuffer(agentTerminalRingDefaultBytes),
 	}
 }
 
