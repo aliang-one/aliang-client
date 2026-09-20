@@ -38,11 +38,11 @@ func TestCollectClaudeVibeSessionsReadsEveryProjectIndex(t *testing.T) {
 		index := map[string]interface{}{
 			"originalPath": projectPath,
 			"entries": []map[string]interface{}{{
-				"sessionId":   sid,
-				"customTitle": fmt.Sprintf("项目%d的标题", i),
+				"sessionId":    sid,
+				"customTitle":  fmt.Sprintf("项目%d的标题", i),
 				"messageCount": 3,
-				"created":     "2026-07-01T00:00:00Z",
-				"modified":    "2026-07-01T01:00:00Z",
+				"created":      "2026-07-01T00:00:00Z",
+				"modified":     "2026-07-01T01:00:00Z",
 			}},
 		}
 		raw, err := json.Marshal(index)

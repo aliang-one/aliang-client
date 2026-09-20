@@ -64,7 +64,7 @@ func startAgentPTY(shell, cwd string, rows, cols int) (*agentTerminalHandle, err
 type conptyInputSink struct{ c *conpty.ConPty }
 
 func (s conptyInputSink) Write(p []byte) (int, error) { return s.c.Write(p) }
-func (s conptyInputSink) Close() error                 { return nil }
+func (s conptyInputSink) Close() error                { return nil }
 
 // terminateWindowsProcess forcibly terminates the shell process by PID. We avoid
 // conpty.Close() for the kill path because Close both terminates the process and

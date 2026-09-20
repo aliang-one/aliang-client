@@ -11,8 +11,8 @@ import (
 )
 
 var allowedTutorialLocales = map[string]struct{}{
-	"en":     {},
-	"zh_CN":  {},
+	"en":    {},
+	"zh_CN": {},
 }
 
 var allowedTutorialDocs = map[string]struct{}{
