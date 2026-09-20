@@ -25,9 +25,39 @@ var errPTYUnsupported = errors.New("pty not supported on this platform; falling 
 
 type agentTerminalWriter func(interface{}) error
 
+// agentTerminalHistoryCap bounds the tombstone history of exited sessions;
+// beyond the cap the oldest tombstone (by exitedAt) is evicted on insert.
+const agentTerminalHistoryCap = 8
+
+// agentTerminalRingDefaultBytes is the scrollback capacity allocated per live
+// terminal session (overridable via ALIANG_TERMINAL_RING_BYTES, floor 64KiB).
+const agentTerminalRingDefaultBytes = 2 * 1024 * 1024
+
+// agentTerminalHistory is a tombstone of an exited terminal session: enough
+// metadata to describe the dead session and the output ring so a reconnecting
+// client can still be served a final replay without spawning a new shell.
+type agentTerminalHistory struct {
+	shell     string
+	cwd       string
+	rows      int
+	cols      int
+	startedAt time.Time
+	exitedAt  time.Time
+	exitCode  int
+	ring      *terminalRingBuffer
+}
+
+// agentTerminalProcessStarter starts the shell process for a terminal session
+// and returns the session wiring plus its output readers. It is a manager field
+// (defaulting to startAgentTerminalProcess) so tests can fake shell startup.
+type agentTerminalProcessStarter func(sessionID string, shell string, cwd string, rows int, cols int) (*agentTerminalSession, []io.Reader, error)
+
 type agentTerminalManager struct {
 	mu       sync.Mutex
 	sessions map[string]*agentTerminalSession
+	history  map[string]*agentTerminalHistory
+
+	startProcess agentTerminalProcessStarter
 }
 
 type agentTerminalSession struct {
@@ -46,6 +76,18 @@ type agentTerminalSession struct {
 	token        *struct{}
 	startedAt    time.Time
 	lastActiveAt time.Time
+	lastInputAt  time.Time
+
+	rows int
+	cols int
+
+	// ring keeps the raw output scrollback for reconnect replay. outputGate
+	// must cover both ring pushes and live terminal.output writes so a replay
+	// never interleaves with fresh output frames. detachedAt != zero marks the
+	// moment the session lost its attached client (zero = attached).
+	ring       *terminalRingBuffer
+	outputGate sync.Mutex
+	detachedAt time.Time
 }
 
 // agentTerminalHandle is the platform-supplied wiring for a started shell. The
@@ -62,7 +104,9 @@ type agentTerminalHandle struct {
 
 func newAgentTerminalManager() *agentTerminalManager {
 	return &agentTerminalManager{
-		sessions: make(map[string]*agentTerminalSession),
+		sessions:     make(map[string]*agentTerminalSession),
+		history:      make(map[string]*agentTerminalHistory),
+		startProcess: startAgentTerminalProcess,
 	}
 }
 
@@ -74,6 +118,22 @@ func (m *agentTerminalManager) create(msg map[string]interface{}, writeJSON agen
 	if sessionID == "" {
 		_ = writeJSON(agentTerminalErrorPayload("", errors.New("terminal.create missing session_id")))
 		return
+	}
+
+	rows := normalizeTerminalDimension(remoteInt(msg, "rows", 24), 24)
+	cols := normalizeTerminalDimension(remoteInt(msg, "cols", 80), 80)
+
+	// attach:true prefers re-attaching to existing state (a live session, then
+	// a tombstone) over spawning a fresh shell. When neither exists the request
+	// falls through to the regular fresh-create path below, and a create
+	// without attach keeps the exact pre-attach behavior (already-exists error).
+	if remoteBool(msg, "attach", false) {
+		if m.attachLive(sessionID, rows, cols, writeJSON) {
+			return
+		}
+		if m.attachHistory(sessionID, writeJSON) {
+			return
+		}
 	}
 
 	shell, err := resolveAgentShell(remoteString(msg, "shell"))
@@ -100,9 +160,7 @@ func (m *agentTerminalManager) create(msg map[string]interface{}, writeJSON agen
 	}
 	m.mu.Unlock()
 
-	rows := normalizeTerminalDimension(remoteInt(msg, "rows", 24), 24)
-	cols := normalizeTerminalDimension(remoteInt(msg, "cols", 80), 80)
-	session, readers, err := startAgentTerminalProcess(sessionID, shell, cwd, rows, cols)
+	session, readers, err := m.startProcess(sessionID, shell, cwd, rows, cols)
 	if err != nil {
 		_ = writeJSON(agentTerminalErrorPayload(sessionID, err))
 		return
@@ -132,6 +190,7 @@ func (m *agentTerminalManager) create(msg map[string]interface{}, writeJSON agen
 		"pty":        session.isPTY,
 		"rows":       rows,
 		"cols":       cols,
+		"resumed":    false,
 	})
 
 	for _, reader := range readers {
@@ -139,6 +198,104 @@ func (m *agentTerminalManager) create(msg map[string]interface{}, writeJSON agen
 	}
 	go m.waitTerminal(sessionID, session.token, writeJSON)
 	go m.watchTerminalIdle(sessionID, session.token, writeJSON)
+}
+
+// attachLive re-attaches to a live session: resize first (so a TUI redraws via
+// SIGWINCH), then replay the scrollback, then confirm with
+// terminal.created{resumed:true}. It reports whether the attach happened.
+func (m *agentTerminalManager) attachLive(sessionID string, rows, cols int, writeJSON agentTerminalWriter) bool {
+	m.mu.Lock()
+	session := m.sessions[sessionID]
+	m.mu.Unlock()
+	if session == nil {
+		return false
+	}
+	if session.resizer != nil {
+		_ = session.resizer(rows, cols)
+	}
+	m.sendReplay(sessionID, session.ring, terminalReplayStatusLive, &session.outputGate, writeJSON)
+	_ = writeJSON(map[string]interface{}{
+		"type":       models.AgentEventTerminalCreated,
+		"session_id": sessionID,
+		"shell":      session.shell,
+		"cwd":        session.cwd,
+		"pty":        session.isPTY,
+		"rows":       rows,
+		"cols":       cols,
+		"resumed":    true,
+	})
+	return true
+}
+
+// attachHistory serves a tombstone of an exited session: replay its ring with
+// status "exited" and confirm with terminal.created{resumed:false, exited:true}
+// built from the tombstone metadata — without spawning a new shell. It reports
+// whether a tombstone was served.
+func (m *agentTerminalManager) attachHistory(sessionID string, writeJSON agentTerminalWriter) bool {
+	m.mu.Lock()
+	tomb := m.history[sessionID]
+	m.mu.Unlock()
+	if tomb == nil {
+		return false
+	}
+	// A tombstone ring has no live writers, so no output gate is needed.
+	m.sendReplay(sessionID, tomb.ring, terminalReplayStatusExited, nil, writeJSON)
+	_ = writeJSON(map[string]interface{}{
+		"type":       models.AgentEventTerminalCreated,
+		"session_id": sessionID,
+		"shell":      tomb.shell,
+		"cwd":        tomb.cwd,
+		"rows":       tomb.rows,
+		"cols":       tomb.cols,
+		"started_at": tomb.startedAt.UTC().Format(time.RFC3339),
+		"resumed":    false,
+		"exited":     true,
+	})
+	return true
+}
+
+// recordTerminalHistoryLocked stores a tombstone and evicts the oldest entries
+// (by exitedAt) beyond agentTerminalHistoryCap. Callers must hold m.mu.
+func (m *agentTerminalManager) recordTerminalHistoryLocked(sessionID string, tomb *agentTerminalHistory) {
+	if tomb == nil {
+		return
+	}
+	if m.history == nil {
+		m.history = make(map[string]*agentTerminalHistory)
+	}
+	m.history[sessionID] = tomb
+	for len(m.history) > agentTerminalHistoryCap {
+		oldestID := ""
+		var oldestAt time.Time
+		for id, h := range m.history {
+			if oldestID == "" || h.exitedAt.Before(oldestAt) {
+				oldestID, oldestAt = id, h.exitedAt
+			}
+		}
+		if oldestID == "" {
+			break
+		}
+		delete(m.history, oldestID)
+	}
+}
+
+// tombstoneSessionLocked converts an exiting session into a history tombstone.
+// Callers must hold m.mu and have removed (or be removing) the session from
+// m.sessions; exitCode is the process exit code, or -1 when unknown (killed).
+func (m *agentTerminalManager) tombstoneSessionLocked(sessionID string, session *agentTerminalSession, exitCode int) {
+	if session == nil {
+		return
+	}
+	m.recordTerminalHistoryLocked(sessionID, &agentTerminalHistory{
+		shell:     session.shell,
+		cwd:       session.cwd,
+		rows:      session.rows,
+		cols:      session.cols,
+		startedAt: session.startedAt,
+		exitedAt:  time.Now(),
+		exitCode:  exitCode,
+		ring:      session.ring,
+	})
 }
 
 func (m *agentTerminalManager) write(msg map[string]interface{}, writeJSON agentTerminalWriter) {
@@ -230,6 +387,12 @@ func (m *agentTerminalManager) closeAll() {
 		sessions = append(sessions, session)
 	}
 	m.sessions = make(map[string]*agentTerminalSession)
+	// Killed sessions never reach waitTerminal's active branch (the map is
+	// cleared under the same lock), so tombstone them here; the exit code of a
+	// killed process is unknown at this point (-1).
+	for _, session := range sessions {
+		m.tombstoneSessionLocked(session.id, session, -1)
+	}
 	m.mu.Unlock()
 
 	for _, session := range sessions {
@@ -358,6 +521,9 @@ func (m *agentTerminalManager) waitTerminal(sessionID string, token *struct{}, w
 	active := current != nil && current.token == token
 	if active {
 		delete(m.sessions, sessionID)
+		// A naturally exited session becomes a tombstone so a later attach can
+		// still replay its final scrollback.
+		m.tombstoneSessionLocked(sessionID, session, exitCode)
 	}
 	m.mu.Unlock()
 	if !active {
@@ -396,7 +562,7 @@ func (s *agentTerminalSession) kill() {
 // the platform has no PTY support, so terminals work everywhere.
 func startAgentTerminalProcess(sessionID string, shell string, cwd string, rows int, cols int) (*agentTerminalSession, []io.Reader, error) {
 	if handle, err := startAgentPTY(shell, cwd, rows, cols); err == nil {
-		return newAgentTerminalSession(sessionID, shell, cwd, handle, true), handle.readers, nil
+		return newAgentTerminalSession(sessionID, shell, cwd, handle, true, rows, cols), handle.readers, nil
 	} else if !errors.Is(err, errPTYUnsupported) {
 		return nil, nil, err
 	}
@@ -405,10 +571,10 @@ func startAgentTerminalProcess(sessionID string, shell string, cwd string, rows 
 	if err != nil {
 		return nil, nil, err
 	}
-	return newAgentTerminalSession(sessionID, shell, cwd, handle, false), handle.readers, nil
+	return newAgentTerminalSession(sessionID, shell, cwd, handle, false, rows, cols), handle.readers, nil
 }
 
-func newAgentTerminalSession(id string, shell string, cwd string, handle *agentTerminalHandle, isPTY bool) *agentTerminalSession {
+func newAgentTerminalSession(id string, shell string, cwd string, handle *agentTerminalHandle, isPTY bool, rows int, cols int) *agentTerminalSession {
 	now := time.Now()
 	return &agentTerminalSession{
 		id:           id,
@@ -424,6 +590,9 @@ func newAgentTerminalSession(id string, shell string, cwd string, handle *agentT
 		token:        new(struct{}),
 		startedAt:    now,
 		lastActiveAt: now,
+		rows:         rows,
+		cols:         cols,
+		ring:         newTerminalRingBuffer(agentTerminalRingDefaultBytes),
 	}
 }
 

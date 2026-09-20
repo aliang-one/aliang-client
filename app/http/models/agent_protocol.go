@@ -30,6 +30,7 @@ const (
 	AgentEventTerminalClose           = "terminal.close"
 	AgentEventTerminalExit            = "terminal.exit"
 	AgentEventTerminalError           = "terminal.error"
+	AgentEventTerminalReplay          = "terminal.replay"
 	AgentEventAISessionCreate         = "ai.session.create"
 	AgentEventAISessionCreated        = "ai.session.created"
 	AgentEventAISessionClose          = "ai.session.close"
