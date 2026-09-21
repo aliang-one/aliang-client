@@ -562,6 +562,16 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 	case models.AgentEventTunnelConfigure:
 		s.setRemoteConnectionState(true, "online", "")
 		s.configureTunnel(msg, writeJSON)
+	case models.AgentEventFileUpload:
+		// Upload runs its own single-flight goroutine inside the handler; the
+		// outer go keeps the read loop free while the inner one orchestrates.
+		s.setRemoteConnectionState(true, "online", "")
+		go handleAgentFileUpload(msg, writeJSON)
+	case models.AgentEventFileUploadCancel:
+		// Not behind the enabled-device gate: a device disabled mid-upload
+		// must still be able to wind the transfer down.
+		s.setRemoteConnectionState(true, "online", "")
+		handleAgentFileUploadCancel(msg)
 	case models.AgentEventProjectDetail, models.AgentEventAISessionDetail, models.AgentEventFileList, models.AgentEventFileRead, models.AgentEventSlashCommandsList, "file.working_tree_diff":
 		s.setRemoteConnectionState(true, "online", "")
 		go handleAgentDetailMessageWithAI(msg, writeJSON, s.ai)
@@ -683,6 +693,7 @@ func remoteAgentMessageRequiresEnabledDevice(msgType string) bool {
 		models.AgentEventAISessionDetail,
 		models.AgentEventFileList,
 		models.AgentEventFileRead,
+		models.AgentEventFileUpload,
 		"file.working_tree_diff",
 		models.AgentEventSlashCommandsList,
 		models.AgentEventGitStatus,
