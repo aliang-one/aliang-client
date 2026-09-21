@@ -13,8 +13,10 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -38,6 +40,19 @@ var (
 	agentFileUploadActive *agentFileUploadJob
 )
 
+// 上传 client：不设整体 Timeout（长上传是本意，靠 ctx cancel），但必须有
+// ResponseHeaderTimeout——body 发完后对端不回响应头（云 LB 挂死）若无限等待
+// 会永久占用设备级单飞槽。该超时从 body 写完起算，不误伤慢上传。
+// 注意 ResponseHeaderTimeout 是 Transport 的字段：克隆 DefaultTransport（保留
+// proxy/keepalive 等默认值）后在其上覆盖，勿裸 &http.Transport{}。
+func newAgentFileUploadHTTPClient(headerTimeout time.Duration) *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone() //nolint:gosec // 显式克隆默认传输，仅覆盖 ResponseHeaderTimeout
+	transport.ResponseHeaderTimeout = headerTimeout
+	return &http.Client{Transport: transport}
+}
+
+var agentFileUploadHTTPClient = newAgentFileUploadHTTPClient(60 * time.Second)
+
 // handleAgentFileUpload streams the resolved file to the presigned COS URL
 // with a streaming PUT (no full-buffer), emitting throttled progress and a
 // terminal result/error. Single-flight: one upload per device at a time.
@@ -60,6 +75,7 @@ func handleAgentFileUpload(msg map[string]interface{}, writeJSON func(interface{
 	agentFileUploadMu.Unlock()
 
 	go func() {
+		defer cancel() // 父 ctx 是 Background，防将来改动引入泄漏
 		defer func() {
 			agentFileUploadMu.Lock()
 			if agentFileUploadActive == job {
@@ -69,6 +85,15 @@ func handleAgentFileUpload(msg map[string]interface{}, writeJSON func(interface{
 		}()
 		handleAgentFileUploadRun(ctx, msg, writeJSON)
 	}()
+}
+
+// url.Error.Error() 会内嵌完整预签名 URL（含 q-signature），上行 server/日志前必须剥离
+func sanitizeUploadError(err error) error {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		return fmt.Errorf("upload %s failed: %v", strings.ToLower(ue.Op), ue.Err)
+	}
+	return err
 }
 
 func handleAgentFileUploadRun(ctx context.Context, msg map[string]interface{}, writeJSON func(interface{}) error) {
@@ -144,7 +169,7 @@ func handleAgentFileUploadRun(ctx context.Context, msg map[string]interface{}, w
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, uploadURL, body)
 	if err != nil {
-		emitErr(err)
+		emitErr(sanitizeUploadError(err))
 		return
 	}
 	req.ContentLength = info.Size()
@@ -153,9 +178,9 @@ func handleAgentFileUploadRun(ctx context.Context, msg map[string]interface{}, w
 		contentType = "application/octet-stream"
 	}
 	req.Header.Set("Content-Type", contentType)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := agentFileUploadHTTPClient.Do(req)
 	if err != nil {
-		emitErr(err) // 含 context canceled（file.upload.cancel 触发）
+		emitErr(sanitizeUploadError(err)) // 含 context canceled（file.upload.cancel 触发）
 		return
 	}
 	defer resp.Body.Close()

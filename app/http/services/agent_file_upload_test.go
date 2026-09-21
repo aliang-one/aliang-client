@@ -476,5 +476,87 @@ func TestAgentFileUploadCancelAbortsInFlightPUT(t *testing.T) {
 	}
 	if err := remoteString(terminal, "error"); !strings.Contains(err, "cancel") {
 		t.Fatalf("error = %q, want it to contain \"cancel\"", err)
+	} else if strings.Contains(err, cos.srv.URL) {
+		// 脱敏后的 Do 错误不得回嵌预签名 URL（含签名查询串）。
+		t.Fatalf("sanitized error = %q leaks the presigned upload URL", err)
+	}
+}
+
+// 8. Response-header hang: COS swallows the request after the body is fully
+// written and never answers (hung cloud LB). The client's
+// ResponseHeaderTimeout must fire, surface through file.error (with the
+// presigned URL stripped), and release the single-flight slot so a fresh
+// upload starts immediately instead of being told "in progress".
+func TestAgentFileUploadResponseHeaderHangReleasesSlot(t *testing.T) {
+	resetAgentFileUploadSlot(t)
+	project := t.TempDir()
+	writeAgentUploadFile(t, project, "hang.bin", 4096)
+
+	// Hang server: consumes the whole body, then never responds.
+	release := make(chan struct{})
+	hang := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		<-release
+	}))
+	t.Cleanup(hang.Close)
+	// LIFO: unblock the hung handler before Close waits on outstanding requests.
+	t.Cleanup(func() { close(release) })
+
+	// Shrink the header timeout so the test doesn't wait the production 60s.
+	// The client is a package var, so swap it for the duration of this test.
+	origClient := agentFileUploadHTTPClient
+	agentFileUploadHTTPClient = newAgentFileUploadHTTPClient(50 * time.Millisecond)
+	t.Cleanup(func() { agentFileUploadHTTPClient = origClient })
+
+	sink := newAgentFileUploadCapture()
+	handleAgentFileUpload(map[string]interface{}{
+		"type":         models.AgentEventFileUpload,
+		"request_id":   "req-hang",
+		"project_path": project,
+		"path":         "hang.bin",
+		"upload_url":   hang.URL,
+		"max_bytes":    1 << 20,
+	}, sink.writeJSON)
+
+	_, terminal := waitForAgentFileUploadTerminal(t, sink, "req-hang")
+	if remoteString(terminal, "type") != models.AgentEventFileError {
+		t.Fatalf("terminal message = %v, want file.error", terminal)
+	}
+	if err := remoteString(terminal, "error"); !strings.Contains(err, "timeout") {
+		t.Fatalf("error = %q, want it to contain \"timeout\"", err)
+	} else if strings.Contains(err, hang.URL) {
+		t.Fatalf("sanitized error = %q leaks the presigned upload URL", err)
+	}
+
+	// The terminal message is emitted just before the deferred slot release,
+	// so wait for the release itself before proving a new upload is admitted.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		agentFileUploadMu.Lock()
+		idle := agentFileUploadActive == nil
+		agentFileUploadMu.Unlock()
+		if idle {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for the single-flight slot to be released after the header timeout")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	cos := newFakeCOSUploadServer(t, 0, 0, 0)
+	sink2 := newAgentFileUploadCapture()
+	handleAgentFileUpload(map[string]interface{}{
+		"type":         models.AgentEventFileUpload,
+		"request_id":   "req-after-hang",
+		"project_path": project,
+		"path":         "hang.bin",
+		"upload_url":   cos.srv.URL,
+		"max_bytes":    1 << 20,
+	}, sink2.writeJSON)
+
+	_, terminal2 := waitForAgentFileUploadTerminal(t, sink2, "req-after-hang")
+	if remoteString(terminal2, "type") != models.AgentEventFileUploadResult {
+		t.Fatalf("post-hang upload terminal = %v, want file.upload.result (slot must be free, not \"in progress\")", terminal2)
 	}
 }
