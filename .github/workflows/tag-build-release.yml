@@ -357,7 +357,7 @@ jobs:
     name: Publish assets to Tencent COS
     needs: release
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 60
     permissions:
       contents: read
       actions: read
@@ -429,7 +429,8 @@ jobs:
 
       - name: Sync software prefix
         shell: bash
-        run: coscli -c "$COS_CFG" sync release-assets/ "cos://${COS_BUCKET}/software/" -r --force
+        # 跨洋链路单流仅数十 KB/s:8MB 分块×每块 5 线程×10 文件并发压满带宽
+        run: coscli -c "$COS_CFG" sync release-assets/ "cos://${COS_BUCKET}/software/" -r --force --part-size 8388608 --thread-num 5 --routines 10
 
       - name: Sync history prefix
         shell: bash
@@ -444,7 +445,7 @@ jobs:
             cp "release-assets/$name" "history/${base_name}-${TAG}.${ext}"
             echo "${hash}  ${base_name}-${TAG}.${ext}" >> "history/SHA256SUMS-${TAG}"
           done < release-assets/SHA256SUMS
-          coscli -c "$COS_CFG" sync history/ "cos://${COS_BUCKET}/software/history/" -r --force
+          coscli -c "$COS_CFG" sync history/ "cos://${COS_BUCKET}/software/history/" -r --force --part-size 8388608 --thread-num 5 --routines 10
 
       - name: Write software version marker
         shell: bash
