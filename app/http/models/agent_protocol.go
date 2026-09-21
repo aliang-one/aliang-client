@@ -73,6 +73,10 @@ const (
 	AgentEventFileRead                = "file.read"
 	AgentEventFileReadResult          = "file.read.result"
 	AgentEventFileError               = "file.error"
+	AgentEventFileUpload              = "file.upload"
+	AgentEventFileUploadProgress      = "file.upload.progress"
+	AgentEventFileUploadResult        = "file.upload.result"
+	AgentEventFileUploadCancel        = "file.upload.cancel"
 	AgentEventGitStatus               = "git.status"
 	AgentEventGitStatusResult         = "git.status.result"
 	AgentEventGitStatusError          = "git.status.error"
@@ -207,6 +211,7 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				{Type: AgentEventAISessionClosed, Required: []string{"type", "session_id"}, Optional: []string{"run_id", "event_seq"}},
 				{Type: AgentEventFileListResult, Required: []string{"type", "request_id", "path", "entries"}},
 				{Type: AgentEventFileReadResult, Required: []string{"type", "request_id", "path", "encoding", "content"}},
+				{Type: AgentEventFileUploadResult, Required: []string{"type", "request_id", "ok", "size_bytes", "http_status"}},
 				{Type: AgentEventGitStatusResult, Required: []string{"type", "request_id", "is_repo"}, Optional: []string{"branch", "status", "generated_at"}},
 				{Type: AgentEventEnvInfoResult, Required: []string{"type", "request_id", "os"}, Optional: []string{"arch", "shell", "user", "versions", "generated_at"}},
 				{Type: AgentEventGitStatusError, Required: []string{"type", "request_id", "error"}},
@@ -251,6 +256,7 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				{Type: AgentEventAISessionClose, Required: []string{"type", "session_id"}, Emits: []string{AgentEventAISessionClosed}},
 				{Type: AgentEventFileList, Required: []string{"type", "request_id", "project_path", "path"}, Optional: []string{"max_entries"}, Emits: []string{AgentEventFileListResult, AgentEventFileError}},
 				{Type: AgentEventFileRead, Required: []string{"type", "request_id", "project_path", "path"}, Optional: []string{"max_bytes"}, Emits: []string{AgentEventFileReadResult, AgentEventFileError}},
+				{Type: AgentEventFileUpload, Required: []string{"type", "request_id", "project_path", "path", "upload_url", "max_bytes"}, Emits: []string{AgentEventFileUploadResult, AgentEventFileError}},
 				{Type: AgentEventGitStatus, Required: []string{"type", "request_id", "cwd"}, Emits: []string{AgentEventGitStatusResult, AgentEventGitStatusError}},
 				{Type: AgentEventEnvInfo, Required: []string{"type", "request_id", "cwd"}, Emits: []string{AgentEventEnvInfoResult, AgentEventEnvInfoError}},
 				{Type: AgentEventProjectDetail, Required: []string{"type", "request_id", "project_id", "project_path"}, Emits: []string{AgentEventProjectDetailResult, AgentEventFileError}},
