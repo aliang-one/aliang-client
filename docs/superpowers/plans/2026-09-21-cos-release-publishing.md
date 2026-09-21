@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 打 tag 发布时,在 GitHub Release 之后把全部产物同步到腾讯云 COS(`releases/<tag>/` 永久归档 + `latest/` 固定路径)。
+**Goal:** 打 tag 发布时,在 GitHub Release 之后把全部产物同步到腾讯云 COS(`software/` 固定前缀,覆盖式)。
 
-**Architecture:** 在 `.github/workflows/tag-build-release.yml` 末尾追加独立 job `publish-cos`(needs: release):重新下载 `aliang-*` artifacts、重算 SHA256SUMS、安装固定版 coscli(sha256 校验)、secrets 渲染临时配置文件、两次 `sync -r` + version.txt、HTTP HEAD 全量核对并输出下载 URL 到 Step Summary。不引入第三方 Action,不改任何 Go/前端代码。
+**Architecture:** 在 `.github/workflows/tag-build-release.yml` 末尾追加独立 job `publish-cos`(needs: release):重新下载 `aliang-*` artifacts、重算 SHA256SUMS、安装固定版 coscli(sha256 校验)、secrets 渲染临时配置文件、一次 `sync -r` + version.txt 标记、HTTP HEAD 全量核对并输出下载 URL 到 Step Summary。不引入第三方 Action,不改任何 Go/前端代码。
 
 **Tech Stack:** GitHub Actions、腾讯云 coscli v1.0.9(linux-amd64,sha256 固定校验)、COS 桶 `aliang-1305838434`(ap-nanjing,公有读)。
 
@@ -273,19 +273,15 @@ Expected: rm 成功;curl 返回 `404`;本地目录已删。若 `rm` 的 `--force
           EOF
           echo "COS_CFG=$COS_CFG" >> "$GITHUB_ENV"
 
-      - name: Sync versioned prefix
+      - name: Sync software prefix
         shell: bash
-        run: coscli -c "$COS_CFG" sync release-assets/ "cos://${COS_BUCKET}/releases/${TAG}/" -r --force
+        run: coscli -c "$COS_CFG" sync release-assets/ "cos://${COS_BUCKET}/software/" -r --force
 
-      - name: Sync latest prefix
-        shell: bash
-        run: coscli -c "$COS_CFG" sync release-assets/ "cos://${COS_BUCKET}/latest/" -r --force
-
-      - name: Write latest version marker
+      - name: Write software version marker
         shell: bash
         run: |
           echo "${TAG}" > version.txt
-          coscli -c "$COS_CFG" cp version.txt "cos://${COS_BUCKET}/latest/version.txt"
+          coscli -c "$COS_CFG" cp version.txt "cos://${COS_BUCKET}/software/version.txt"
 
       - name: Verify public URLs and summarize
         shell: bash
@@ -295,25 +291,24 @@ Expected: rm 成功;curl 返回 `404`;本地目录已删。若 `rm` 的 `--force
           for f in release-assets/* version.txt; do
             name="$(basename "$f")"
             local_size="$(stat -c%s "$f")"
-            headers="$(curl -fsSI "${base}/latest/${name}")" || { echo "::error::HEAD failed: ${base}/latest/${name}(检查桶公有读)"; fail=1; continue; }
+            headers="$(curl -fsSI "${base}/software/${name}")" || { echo "::error::HEAD failed: ${base}/software/${name}(检查桶公有读)"; fail=1; continue; }
             remote_size="$(printf '%s\n' "$headers" | grep -i '^content-length:' | tail -1 | tr -dc '0-9' || true)"
             if [ "${remote_size}" != "${local_size}" ]; then
               echo "::error::size mismatch ${name}: local=${local_size} remote=${remote_size}"
               fail=1
             fi
           done
-          curl -fsSI "${base}/releases/${TAG}/SHA256SUMS" > /dev/null || { echo "::error::releases/${TAG}/SHA256SUMS 不可访问"; fail=1; }
           [ "$fail" -eq 0 ] || exit 1
           {
             echo "## COS 发布完成:${TAG}"
             echo
-            echo "固定最新版前缀:\`${base}/latest/\`"
+            echo "下载前缀:\`${base}/software/\`"
             echo
-            echo "| 产物 | latest URL |"
+            echo "| 产物 | URL |"
             echo "|---|---|"
             for f in release-assets/* version.txt; do
               name="$(basename "$f")"
-              echo "| ${name} | ${base}/latest/${name} |"
+              echo "| ${name} | ${base}/software/${name} |"
             done
           } >> "$GITHUB_STEP_SUMMARY"
 ```
@@ -405,31 +400,29 @@ Expected: secrets 列表含 `COS_SECRET_ID`/`COS_SECRET_KEY`(值不可见,只看
 
 本任务**无法在合并前执行**(依赖真实 tag 触发),执行计划时原样转交用户,作为下次发版的 checklist:
 
-- [ ] **Step 1: 观察 Actions run** — https://github.com/aliang-one/aliang-client/actions 中 tag 对应 run 的 `publish-cos` job 绿色,Summary 含「COS 发布完成:<tag>」与 12 行 URL 表(11 产物 + version.txt)。
+- [ ] **Step 1: 观察 Actions run** — https://github.com/aliang-one/aliang-client/actions 中 tag 对应 run 的 `publish-cos` job 绿色,Summary 含「COS 发布完成:<tag>」与 12 行 URL 表(10 产物 + SHA256SUMS + version.txt)。
 
-- [ ] **Step 2: 全量下载校验(latest/)**
+- [ ] **Step 2: 全量下载校验(software/)**
 
 ```bash
 mkdir -p /tmp/cos-verify && cd /tmp/cos-verify
 base="https://aliang-1305838434.cos.ap-nanjing.myqcloud.com"
-curl -fsSLO "${base}/latest/SHA256SUMS"
+curl -fsSLO "${base}/software/SHA256SUMS"
 for f in aliang-linux-amd64.tar.gz aliang-linux-amd64.deb \
          aliang-linux-arm64.tar.gz aliang-linux-arm64.deb \
          aliang-windows-amd64.zip aliang-windows-amd64.msi \
          aliang-darwin-amd64.tar.gz aliang-darwin-amd64.pkg \
          aliang-darwin-arm64.tar.gz aliang-darwin-arm64.pkg; do
-  curl -fsSLO "${base}/latest/${f}"
+  curl -fsSLO "${base}/software/${f}"
 done
 sha256sum -c SHA256SUMS
-curl -fsS "${base}/latest/version.txt"   # 期望输出:当前 tag
+curl -fsS "${base}/software/version.txt"   # 期望输出:当前 tag
 cd - && rm -rf /tmp/cos-verify
 ```
 
 Expected: `sha256sum -c` 输出 10 行 `OK`(SHA256SUMS 自身不在校验清单内——glob 在重定向创建文件之前展开,故 `sha256sum *` 不会把 SHA256SUMS 算进去);version.txt 输出当前 tag。
 
-- [ ] **Step 3: 版本归档抽查** — `curl -fsSI "${base}/releases/<tag>/aliang-darwin-arm64.pkg"` 返回 200,确认 `releases/<tag>/` 前缀同步成功。
-
-- [ ] **Step 4: 幂等验证(T3)** — 在 Actions 页对同一次 run 手动 **Re-run** `publish-cos` job,期望明显快于首次(crc64 命中全部跳过),Summary 重新生成,`latest/` 内容不变。
+- [ ] **Step 4: 幂等验证(T3)** — 在 Actions 页对同一次 run 手动 **Re-run** `publish-cos` job,期望明显快于首次(crc64 命中全部跳过),Summary 重新生成,`software/` 内容不变。
 
 ---
 
@@ -453,5 +446,4 @@ Expected: 2 个提交(文档 + workflow),工作区干净。
 ## 已知限制与后续(规格 §11)
 
 - 桶公有读 = 全网可匿名下载桶内所有对象(分发用途可接受,严禁放凭据类文件)
-- `releases/` 只增不删,无生命周期规则(量级:~165MB/版本;后续可用 COS 生命周期规则把 90 天前对象转低频存储)
-- 两个 tag 极短间隔并发发布时 `latest/` 终态为后完成者(规格 §7 已声明,不加并发控制)
+- 桶内仅保留最新一套 `software/` 产物,历史版本在 COS 侧不保留(用户决策);两个 tag 极短间隔并发发布时 `software/` 终态为后完成者(规格 §7 已声明,不加并发控制)

@@ -10,10 +10,7 @@
 
 问题:产物唯一存放点是 GitHub Release,国内下载慢且单点。
 
-目标:打 tag 发布时,在 GitHub Release 发布之后,**追加**把全部产物同步到腾讯云 COS 两个位置:
-
-- `releases/<tag>/` — 按版本永久归档,可回溯历史版本
-- `latest/` — 最新版固定路径(覆盖式),用户/脚本永远可用同一 URL 拿最新版
+目标:打 tag 发布时,在 GitHub Release 发布之后,**追加**把全部产物同步到腾讯云 COS 的固定前缀 `software/`(覆盖式,桶内始终只保留最新一套产物),下载 URL 形如 `https://aliang-1305838434.cos.ap-nanjing.myqcloud.com/software/aliang-linux-amd64.tar.gz`。
 
 GitHub 现有流程零改动,两边并存。
 
@@ -60,8 +57,7 @@ GitHub 现有流程零改动,两边并存。
 下载 URL 形态:
 
 ```
-https://aliang-1305838434.cos.ap-nanjing.myqcloud.com/latest/<asset>
-https://aliang-1305838434.cos.ap-nanjing.myqcloud.com/releases/v1.1.33/<asset>
+https://aliang-1305838434.cos.ap-nanjing.myqcloud.com/software/<asset>
 ```
 
 ## 5. GitHub 仓库配置(Settings → Secrets and variables → Actions)
@@ -79,26 +75,22 @@ https://aliang-1305838434.cos.ap-nanjing.myqcloud.com/releases/v1.1.33/<asset>
 
 ```
 cos://aliang-1305838434/
-├── releases/
-│   ├── v1.1.32/ …(历史版本,只增不删)
-│   └── v1.1.33/
-│       ├── aliang-linux-amd64.tar.gz
-│       ├── aliang-linux-amd64.deb
-│       ├── aliang-linux-arm64.tar.gz
-│       ├── aliang-linux-arm64.deb
-│       ├── aliang-windows-amd64.zip
-│       ├── aliang-windows-amd64.msi
-│       ├── aliang-darwin-amd64.tar.gz
-│       ├── aliang-darwin-amd64.pkg
-│       ├── aliang-darwin-arm64.tar.gz
-│       ├── aliang-darwin-arm64.pkg
-│       └── SHA256SUMS
-└── latest/               ← 内容与最新 releases/<tag>/ 完全一致(覆盖式)
-    ├── (同上 10 个产物)
+└── software/            ← 覆盖式,桶内始终只保留最新一套产物
+    ├── aliang-linux-amd64.tar.gz
+    ├── aliang-linux-amd64.deb
+    ├── aliang-linux-arm64.tar.gz
+    ├── aliang-linux-arm64.deb
+    ├── aliang-windows-amd64.zip
+    ├── aliang-windows-amd64.msi
+    ├── aliang-darwin-amd64.tar.gz
+    ├── aliang-darwin-amd64.pkg
+    ├── aliang-darwin-arm64.tar.gz
+    ├── aliang-darwin-arm64.pkg
+    ├── SHA256SUMS
     └── version.txt       ← 单行文本,内容为当前 tag(如 v1.1.33)
 ```
 
-每次发布共产出 10 个产物 + SHA256SUMS = 11 个对象,两个前缀各一份。`version.txt` 供自动化探测最新版本号与发布完整性核对。
+每次发布共产出 12 个对象(10 产物 + SHA256SUMS + version.txt)。`version.txt` 供自动化探测最新版本号与发布完整性核对。不保留历史版本(用户决策,2026-09-21);旧版本回溯依赖 GitHub Release 清理前的窗口期或另行归档。
 
 ## 7. Workflow 改动设计
 
@@ -123,10 +115,9 @@ cos://aliang-1305838434/
                                               # 含 disableencryption: "true";
                                               # 桶条目: name=aliang-1305838434, region=ap-nanjing,
                                               #          endpoint=cos.ap-nanjing.myqcloud.com(不配 alias)
-      - name: Sync to releases/<tag>/        # coscli -c $CFG sync release-assets/ cos://桶/releases/$TAG/ -r --force
-      - name: Sync to latest/                # coscli -c $CFG sync release-assets/ cos://桶/latest/ -r --force
-      - name: Write latest/version.txt       # echo $TAG > version.txt 后单文件 cp(默认覆盖,cp 无 --force)
-      - name: Verify and summarize           # coscli ls cos://桶/releases/$TAG/ 核对对象数(应为 11);
+      - name: Sync to software/              # coscli -c $CFG sync release-assets/ cos://桶/software/ -r --force
+      - name: Write software/version.txt     # echo $TAG > version.txt 后单文件 cp(默认覆盖,cp 无 --force)
+      - name: Verify and summarize           # coscli ls cos://桶/software/ 核对对象数(应为 12:10 产物+SHA256SUMS+version.txt);
                                               # 把全部公开下载 URL 写入 GITHUB_STEP_SUMMARY
 ```
 
@@ -134,8 +125,8 @@ cos://aliang-1305838434/
 
 - 所有 coscli 命令统一 `-c "$COS_CFG"` 指向临时配置(不写 `~/.cos.yaml`,避免 runner 状态依赖)
 - 密钥只进临时文件与进程内存,不进命令行参数、不出现在日志
-- `sync` 不带 `--delete`:`releases/` 前缀只增不删;`latest/` 依赖默认覆盖语义
-- 并发边界:短时间连续打两个 tag 时,两次 `publish-cos` 可能交错写 `latest/`,终态为后完成者,`releases/<tag>/` 各自独立不受影响;当前单人发布节奏下不构成实际问题,不为此加并发控制
+- `sync` 不带 `--delete`:同名对象按默认覆盖语义更新(产物文件名固定,无增量残留)
+- 并发边界:短时间连续打两个 tag 时,两次 `publish-cos` 可能交错写 `software/`,终态为后完成者;当前单人发布节奏下不构成实际问题,不为此加并发控制
 
 ## 8. 错误处理
 
@@ -145,7 +136,7 @@ cos://aliang-1305838434/
 | coscli 下载/sha256 校验失败 | 步骤失败,job 标红 |
 | 单文件上传失败 | coscli 内置重试 5 次;最终失败 → job 标红 |
 | COS 整体失败 | **GitHub Release 不受影响**(已先行发布);run 标红引人注意;修复后在 Actions 页单重跑 `publish-cos` job,sync 按 crc64 幂等续传 |
-| 重跑同版本 | 幂等:crc64 相同的对象跳过,`latest/` 覆盖为同内容 |
+| 重跑同版本 | 幂等:crc64 相同的对象跳过,`software/` 覆盖为同内容 |
 | 桶非公有读 | 上传仍成功,但下载 URL 返回 403 → 依赖 §10 验证清单暴露 |
 
 不做告警系统集成;job 红绿即状态。
@@ -167,16 +158,16 @@ cos://aliang-1305838434/
 
 **T2 首次真实发布后验证**
 
-1. curl 全部 11 个对象 URL:`releases/<tag>/` 与 `latest/` 各 11 个,断言 HTTP 200 且字节数与 GitHub Release 资产一致
-2. 下载 `latest/SHA256SUMS` 全量 `sha256sum -c`
-3. `curl latest/version.txt` 输出当前 tag
+1. curl 全部 12 个对象 URL(`software/` 前缀:10 产物 + SHA256SUMS + version.txt),断言 HTTP 200 且字节数与 GitHub Release 资产一致
+2. 下载 `software/SHA256SUMS` 全量 `sha256sum -c`
+3. `curl software/version.txt` 输出当前 tag
 
 **T3 幂等验证**
 
-在 Actions 页对 `publish-cos` 重跑一次,确认秒级完成(全部跳过)且 `latest/` 内容不变。
+在 Actions 页对 `publish-cos` 重跑一次,确认秒级完成(全部跳过)且 `software/` 内容不变。
 
 ## 11. 后续可选(不在本期)
 
-- CDN 加速域名绑定 `latest/` 与 `releases/`
-- COS 生命周期规则:90 天后 `releases/` 旧版本对象转低频存储(当前量级成本可忽略,暂不做)
-- 在 README/官网放固定 `latest/` 下载链接
+- CDN 加速域名绑定 `software/`
+- 若未来需要历史版本回溯,再增加 `releases/<tag>/` 归档前缀(当前按用户决策不保留)
+- 在 README/官网放固定 `software/` 下载链接

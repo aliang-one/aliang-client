@@ -427,19 +427,15 @@ jobs:
           EOF
           echo "COS_CFG=$COS_CFG" >> "$GITHUB_ENV"
 
-      - name: Sync versioned prefix
+      - name: Sync software prefix
         shell: bash
-        run: coscli -c "$COS_CFG" sync release-assets/ "cos://${COS_BUCKET}/releases/${TAG}/" -r --force
+        run: coscli -c "$COS_CFG" sync release-assets/ "cos://${COS_BUCKET}/software/" -r --force
 
-      - name: Sync latest prefix
-        shell: bash
-        run: coscli -c "$COS_CFG" sync release-assets/ "cos://${COS_BUCKET}/latest/" -r --force
-
-      - name: Write latest version marker
+      - name: Write software version marker
         shell: bash
         run: |
           echo "${TAG}" > version.txt
-          coscli -c "$COS_CFG" cp version.txt "cos://${COS_BUCKET}/latest/version.txt"
+          coscli -c "$COS_CFG" cp version.txt "cos://${COS_BUCKET}/software/version.txt"
 
       - name: Verify public URLs and summarize
         shell: bash
@@ -449,24 +445,23 @@ jobs:
           for f in release-assets/* version.txt; do
             name="$(basename "$f")"
             local_size="$(stat -c%s "$f")"
-            headers="$(curl -fsSI "${base}/latest/${name}")" || { echo "::error::HEAD failed: ${base}/latest/${name}(检查桶公有读)"; fail=1; continue; }
+            headers="$(curl -fsSI "${base}/software/${name}")" || { echo "::error::HEAD failed: ${base}/software/${name}(检查桶公有读)"; fail=1; continue; }
             remote_size="$(printf '%s\n' "$headers" | grep -i '^content-length:' | tail -1 | tr -dc '0-9' || true)"
             if [ "${remote_size}" != "${local_size}" ]; then
               echo "::error::size mismatch ${name}: local=${local_size} remote=${remote_size}"
               fail=1
             fi
           done
-          curl -fsSI "${base}/releases/${TAG}/SHA256SUMS" > /dev/null || { echo "::error::releases/${TAG}/SHA256SUMS 不可访问"; fail=1; }
           [ "$fail" -eq 0 ] || exit 1
           {
             echo "## COS 发布完成:${TAG}"
             echo
-            echo "固定最新版前缀:\`${base}/latest/\`"
+            echo "下载前缀:\`${base}/software/\`"
             echo
-            echo "| 产物 | latest URL |"
+            echo "| 产物 | URL |"
             echo "|---|---|"
             for f in release-assets/* version.txt; do
               name="$(basename "$f")"
-              echo "| ${name} | ${base}/latest/${name} |"
+              echo "| ${name} | ${base}/software/${name} |"
             done
           } >> "$GITHUB_STEP_SUMMARY"
