@@ -3,6 +3,7 @@ package services
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"aliang.one/nursorgate/app/http/models"
+	"aliang.one/nursorgate/common/cache"
 )
 
 // ---- harness -------------------------------------------------------------
@@ -558,5 +560,77 @@ func TestAgentFileUploadResponseHeaderHangReleasesSlot(t *testing.T) {
 	_, terminal2 := waitForAgentFileUploadTerminal(t, sink2, "req-after-hang")
 	if remoteString(terminal2, "type") != models.AgentEventFileUploadResult {
 		t.Fatalf("post-hang upload terminal = %v, want file.upload.result (slot must be free, not \"in progress\")", terminal2)
+	}
+}
+
+// ---- dispatch wiring + enabled-device gate ---------------------------------
+
+// TestRemoteAgentMessageRequiresEnabledDeviceUpload keeps file.upload behind
+// the enabled+registered gate (same tier as file.read), while file.upload.cancel
+// stays reachable so a device disabled mid-transfer can still wind it down.
+func TestRemoteAgentMessageRequiresEnabledDeviceUpload(t *testing.T) {
+	cases := []struct {
+		msgType string
+		want    bool
+	}{
+		{models.AgentEventFileUpload, true},
+		{models.AgentEventFileUploadCancel, false},
+	}
+	for _, tc := range cases {
+		if got := remoteAgentMessageRequiresEnabledDevice(tc.msgType); got != tc.want {
+			t.Fatalf("remoteAgentMessageRequiresEnabledDevice(%q) = %v, want %v", tc.msgType, got, tc.want)
+		}
+	}
+}
+
+// TestHandleRemoteAgentMessageUploadDisabledGate proves the wired dispatch
+// path rejects file.upload on a disabled device (guard → error + disconnect)
+// while file.upload.cancel passes through the same disabled state untouched.
+func TestHandleRemoteAgentMessageUploadDisabledGate(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	cache.ResetCacheDirForTest()
+	service := NewAgentService()
+	// Leave Enabled/Registered false: remoteControlAllowed() must trip the
+	// guard for file.upload but not for file.upload.cancel.
+	service.mu.Lock()
+	service.state.Enabled = false
+	service.state.Registered = false
+	service.mu.Unlock()
+
+	var written []map[string]interface{}
+	writeJSON := func(v interface{}) error {
+		if m, ok := v.(map[string]interface{}); ok {
+			written = append(written, m)
+		}
+		return nil
+	}
+
+	service.handleRemoteAgentMessage(map[string]interface{}{
+		"type":         models.AgentEventFileUpload,
+		"request_id":   "req-disabled",
+		"project_path": t.TempDir(),
+		"path":         "a.bin",
+		"upload_url":   "http://127.0.0.1:1/nowhere",
+	}, writeJSON)
+
+	if len(written) != 1 || written[0]["type"] != models.AgentEventError {
+		t.Fatalf("disabled-device file.upload must be rejected with exactly one error message, got %v", written)
+	}
+	if msg := fmt.Sprint(written[0]["error"]); !strings.Contains(msg, "disabled") {
+		t.Fatalf("error = %q, want it to mention the disabled gate", msg)
+	}
+
+	// Cancel must survive the same disabled state without an error reply.
+	before := len(written)
+	service.handleRemoteAgentMessage(map[string]interface{}{
+		"type":       models.AgentEventFileUploadCancel,
+		"request_id": "req-disabled",
+	}, writeJSON)
+	for _, m := range written[before:] {
+		if m["type"] == models.AgentEventError {
+			t.Fatalf("file.upload.cancel on a disabled device must not be rejected, got error %v", m)
+		}
 	}
 }
