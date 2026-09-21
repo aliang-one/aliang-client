@@ -148,7 +148,7 @@ Expected: 显示 yaml 其余行,缩进与计划 §「完整 YAML」中 job 内�
 ```bash
 echo "cos-t1-test $(date)" > /tmp/cos-test/hello.txt
 /tmp/cos-test/coscli -c /tmp/cos-test/.cos.yaml cp /tmp/cos-test/hello.txt \
-  "cos://aliang-1305838434/test/hello.txt" --force
+  "cos://aliang-1305838434/test/hello.txt"
 /tmp/cos-test/coscli -c /tmp/cos-test/.cos.yaml ls "cos://aliang-1305838434/test/"
 ```
 
@@ -166,7 +166,7 @@ Expected: 输出 hello.txt 内容,HTTP 200。**若 403** → 桶未开公有读:
 
 ```bash
 /tmp/cos-test/coscli -c /tmp/cos-test/.cos.yaml cp /tmp/cos-test/hello.txt \
-  "cos://aliang-1305838434/test/hello.txt" --force && echo "overwrite ok"
+  "cos://aliang-1305838434/test/hello.txt" && echo "overwrite ok"
 curl -fsS "https://aliang-1305838434.cos.ap-nanjing.myqcloud.com/test/hello.txt"
 ```
 
@@ -183,6 +183,8 @@ rm -rf /tmp/cos-test
 Expected: rm 成功;curl 返回 `404`;本地目录已删。若 `rm` 的 `--force` flag 不被识别,改用 `coscli rm "cos://aliang-1305838434/test/hello.txt"` 重试;仍失败则到控制台手动删除 `test/` 前缀(必须删净,桶是公有分发桶,不留垃圾对象)。
 
 **Gate:本 Task 全部通过前,禁止进入 Task 3。**
+
+(T1 实测结论:cp 无 `--force` flag,默认覆盖;sync 支持 `--force`/`-r`;rm 支持 `--force`。以上结论已回填至本计划与规格。)
 
 ---
 
@@ -280,7 +282,7 @@ Expected: rm 成功;curl 返回 `404`;本地目录已删。若 `rm` 的 `--force
         shell: bash
         run: |
           echo "${TAG}" > version.txt
-          coscli -c "$COS_CFG" cp version.txt "cos://${COS_BUCKET}/latest/version.txt" --force
+          coscli -c "$COS_CFG" cp version.txt "cos://${COS_BUCKET}/latest/version.txt"
 
       - name: Verify public URLs and summarize
         shell: bash
@@ -313,7 +315,7 @@ Expected: rm 成功;curl 返回 `404`;本地目录已删。若 `rm` 的 `--force
           } >> "$GITHUB_STEP_SUMMARY"
 ```
 
-设计要点(实现者勿"优化"掉):`-c` 全局 flag 在子命令前;`sync -r` 必须有(默认不递归);`--force` 必须有(CI 无 TTY,防交互确认挂死,与覆盖语义无关);secrets 只出现在 step `env` 与临时文件,不进命令行参数、不进 `if:`;`mktemp -d` 配置用完即弃(runner 销毁,无需清理步骤);`SHA256SUMS` 算法与 release job 逐字相同 → 输出一致;校验用 HTTP HEAD 而非 `coscli ls`(见计划头部说明)。
+设计要点(实现者勿"优化"掉):`-c` 全局 flag 在子命令前;`sync -r` 必须有(默认不递归);`sync` 加 `--force`(不提示确认,防 CI 挂死,与覆盖无关);`cp` 勿加 `--force`(无此 flag,同名覆盖即默认);secrets 只出现在 step `env` 与临时文件,不进命令行参数、不进 `if:`;`mktemp -d` 配置用完即弃(runner 销毁,无需清理步骤);`SHA256SUMS` 算法与 release job 逐字相同 → 输出一致;校验用 HTTP HEAD 而非 `coscli ls`(见计划头部说明)。
 
 - [ ] **Step 2: 安装 actionlint 并校验**
 

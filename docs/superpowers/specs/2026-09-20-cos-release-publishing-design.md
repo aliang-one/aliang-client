@@ -39,7 +39,7 @@ GitHub 现有流程零改动,两边并存。
 1. **`coscli` 不支持 `COS_SECRET_ID`/`COS_SECRET_KEY` 环境变量认证**。源码 `cmd/root.go` 无任何密钥环境变量读取(该写法属于 hadoop-cos/老 Python coscmd 生态)。认证只有两条路:命令行 flag(`-i`/`-k`/`-e`)或 YAML 配置文件(默认 `~/.cos.yaml`,或 `-c` 指定路径,必须 `.yaml` 结尾)。CI 选配置文件方案。
 2. **手写配置文件必须加 `disableencryption: "true"`**(cos.base 下,yaml key 全小写)。coscli 默认把配置文件里的密钥当 AES 密文解密(硬编码密钥 `coscli-secret`,仅为混淆),手写明文不加此字段会读出错值。
 3. **网上流传的 `tencentyun/cos-action` 仓库不存在(404,正确 org 是 `TencentCloud`)**;而真实存在的 `TencentCloud/cos-action` 用已废弃的 node12 运行时且停更,大概率跑不起来。不引入任何第三方 Action,直接调用官方 CLI。
-4. **`sync` 上传目录必须加 `-r`**(默认不递归,与 ossutil 不同);**CI 必须加 `--force`**(跳过交互确认,否则可能挂死)。`--force` 只是"不提示确认",与覆盖无关——上传本来就默认覆盖同名对象。
+4. **`sync` 上传目录必须加 `-r`**(默认不递归,与 ossutil 不同);**`sync` 须加 `--force`**(跳过交互确认,防 CI 挂死)。`cp` 没有 `--force` flag(T1 实测报 `unknown flag: --force`),同名覆盖即其默认行为(仅 `--forbid-overwrite` 能禁止),无需任何额外 flag。
 5. `sync` 幂等机制:按同名对象 crc64 比对,相同则跳过,重跑安全。
 6. **coscli 固定版本 v1.0.9**(2026-08-25 发布),sha256:`a07de5ba2800147a700ed29036b0c76a4229088cee68e1682d0eae19b638a915`,二进制约 14MB。从 GitHub releases 固定 URL 下载(勿用国内 CDN 固定链接,它始终指向最新版、不可复现;也从美国 runner 拉国内 CDN 慢)。
    下载地址:`https://github.com/tencentyun/coscli/releases/download/v1.0.9/coscli-v1.0.9-linux-amd64`
