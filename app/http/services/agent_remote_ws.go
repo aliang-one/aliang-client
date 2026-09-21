@@ -128,6 +128,11 @@ func (s *AgentService) remoteConnectionLoop() {
 				s.disableWithReasonMessage("auth_expired", "Agent server rejected the user authorization during websocket handshake.")
 				if !IsUserAgentRuntime() {
 					agentAuthRejectedHandler()
+				} else {
+					// agent 子进程不能自愈：把拒绝沿通知 session owner，由 owner
+					// 走 SoftExpired 恢复链刷新凭据后再重新下发。附加动作，不改
+					// 变本分支原有的终态禁用行为。
+					NotifyOwnerAuthRejected(agentAuthRejectedReasonWS)
 				}
 				return
 			}

@@ -17,6 +17,7 @@ import (
 	"aliang.one/nursorgate/app/http/services"
 	"aliang.one/nursorgate/common/logger"
 	"aliang.one/nursorgate/internal/runtimepath"
+	"aliang.one/nursorgate/processor/config"
 )
 
 const (
@@ -348,7 +349,7 @@ func userAgentEnv(env []string) []string {
 		"ALIANG_SOCKET_PATH": true,
 	}
 
-	next := make([]string, 0, len(env)+1)
+	next := make([]string, 0, len(env)+2)
 	for _, item := range env {
 		key := item
 		if idx := strings.Index(item, "="); idx >= 0 {
@@ -360,7 +361,24 @@ func userAgentEnv(env []string) []string {
 		next = append(next, item)
 	}
 	next = append(next, services.AgentRuntimeEnv+"=1")
+	next = append(next, services.SessionOwnerAddrEnv+"="+ownerBaseURL())
 	return next
+}
+
+// ownerBaseURL 返回 session owner 进程管理面板（dashboard）的基地址，注入
+// agent 子进程环境，供其上报"凭据被远端拒绝"（services.NotifyOwnerAuthRejected）。
+// 默认跟随管理面板的真实监听地址 config.ManagementListenAddr()（反映 --host
+// 实际配置，默认值下即 127.0.0.1:56431）；ALIANG_MANAGEMENT_ADDR 是部署级
+// 覆盖，用于管理监听与 agent 所见地址不一致的场景（如 0.0.0.0 监听、跨址
+// 部署），约定 host:port 形式，容错处理带 scheme 的写法（统一按 http 重组）。
+func ownerBaseURL() string {
+	addr := strings.TrimSpace(os.Getenv("ALIANG_MANAGEMENT_ADDR"))
+	addr = strings.TrimPrefix(addr, "http://")
+	addr = strings.TrimPrefix(addr, "https://")
+	if addr != "" {
+		return "http://" + addr
+	}
+	return "http://" + config.ManagementListenAddr()
 }
 
 func openAgentLogWriter() *rotatingLogWriter {
