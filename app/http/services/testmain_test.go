@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"aliang.one/nursorgate/internal/testisolate"
 	auth "aliang.one/nursorgate/processor/auth"
 	"aliang.one/nursorgate/processor/config"
 )
@@ -20,10 +21,13 @@ func TestMain(m *testing.M) {
 	// Package tests must never control a real desktop Agent that happens to be
 	// listening on the developer machine's default port.
 	config.DefaultUserAgentAddr = "127.0.0.1:0"
+	// Keep logger/cache/state writes out of the real ~/.aliang.
+	cleanupState := testisolate.RedirectUserStateDir()
 
 	code := m.Run()
 	auth.StopTokenRefresh()
 	auth.ResetAuthPersistenceForTest()
+	cleanupState()
 	_ = os.RemoveAll(baseDir)
 	os.Exit(code)
 }

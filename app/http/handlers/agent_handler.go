@@ -147,9 +147,13 @@ func (h *AgentHandler) HandleAuthRecover(w http.ResponseWriter, r *http.Request)
 // HandleReconnect (re)establishes the remote agent link. Idempotent: a no-op
 // when already connected/connecting, or when no device_token / agent disabled.
 // Proxied to the user-agent server when this process isn't the runtime that
-// owns the WS connection. Used to bring the link back after a user session is
-// restored (the session-expiry path no longer deregisters the device, only the
-// link drops).
+// owns the WS connection. Used to bring the link back once the user session is
+// restored (login or a successful token refresh). Note a session expiry does
+// deregister: a WS-handshake 401 terminally disables the agent
+// (disableWithReasonMessage clears Device/Registered), and registration only
+// comes back through the recovery chain — auth rejection is forwarded to the
+// session owner, whose refresh either re-enables and re-registers the device
+// (RecoverIfAuthExpired) or lands in the refresh_invalid terminal state.
 func (h *AgentHandler) HandleReconnect(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
