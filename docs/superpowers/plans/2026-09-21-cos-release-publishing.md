@@ -433,16 +433,18 @@ for f in aliang-linux-amd64.tar.gz aliang-linux-amd64.deb \
   curl -fsSLO "${base}/software/${f}"
 done
 sha256sum -c SHA256SUMS
-curl -fsSLO "${base}/software/history/SHA256SUMS-<tag>"   # 替换 <tag> 为实际 tag
-sha256sum -c "SHA256SUMS-<tag>"                            # 期望 10 行 OK
-curl -fsSI "${base}/software/history/aliang-linux-amd64-v<tag>.tar.gz" | head -1   # 期望 HTTP/2 200
+tag=v1.1.35   # ← 替换为实际 tag
+# 历史版本校验(替换 <tag> 为实际 tag,如 v1.1.35):
+curl -fsSLO "${base}/software/history/SHA256SUMS-${tag}"
+while read -r hash name; do curl -fsSLO "${base}/software/history/${name}"; done < "SHA256SUMS-${tag}"
+sha256sum -c "SHA256SUMS-${tag}"   # 期望 10 行 OK(校验的就是刚下载的带版本文件)
 curl -fsS "${base}/software/version.txt"   # 期望输出:当前 tag
 cd - && rm -rf /tmp/cos-verify
 ```
 
 Expected: `sha256sum -c` 输出 10 行 `OK`(SHA256SUMS 自身不在校验清单内——glob 在重定向创建文件之前展开,故 `sha256sum *` 不会把 SHA256SUMS 算进去);version.txt 输出当前 tag。
 
-- [ ] **Step 4: 幂等验证(T3)** — 在 Actions 页对同一次 run 手动 **Re-run** `publish-cos` job,期望明显快于首次(crc64 命中全部跳过),Summary 重新生成,`software/` 内容不变。
+- [ ] **Step 3: 幂等验证(T3)** — 在 Actions 页对同一次 run 手动 **Re-run** `publish-cos` job,期望明显快于首次(crc64 命中全部跳过),Summary 重新生成,`software/` 内容不变。
 
 ---
 
