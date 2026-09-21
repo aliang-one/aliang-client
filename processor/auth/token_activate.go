@@ -126,7 +126,8 @@ func LoginWithPassword(email, password, turnstileToken string) (*UserInfo, error
 		return nil, fmt.Errorf("login response missing refresh_token")
 	}
 
-	return finalizeAuthenticatedSessionWithOperation(operation, response.Data.AccessToken, response.Data.RefreshToken, response.Data.TokenType, response.Data.ExpiresIn)
+	return finalizeAuthenticatedSessionWithOperation(operation, response.Data.AccessToken, response.Data.RefreshToken, response.Data.TokenType,
+		effectiveRefreshExpiresIn(response.Data.ExpiresIn, response.Data.UpstreamExpiresIn))
 }
 
 // finalizeAuthenticatedSession 把已取得的 access/refresh token 落地为本地登录态：拉取个人资料、
@@ -387,7 +388,8 @@ func RefreshSession(refreshToken string) (*UserInfo, error) {
 		nextRefreshToken = strings.TrimSpace(response.Data.AccessToken)
 	}
 
-	userInfo := mergeRefreshedSessionWithCurrentUser(current, response.Data.AccessToken, nextRefreshToken, response.Data.TokenType, response.Data.ExpiresIn)
+	userInfo := mergeRefreshedSessionWithCurrentUser(current, response.Data.AccessToken, nextRefreshToken, response.Data.TokenType,
+		effectiveRefreshExpiresIn(response.Data.ExpiresIn, response.Data.UpstreamExpiresIn))
 
 	profile, err := GetUserProfileWithToken(response.Data.AccessToken)
 	if err != nil {
@@ -499,8 +501,21 @@ type authTokenEnvelope struct {
 		RefreshToken string `json:"refresh_token"`
 		ExpiresIn    int    `json:"expires_in"`
 		TokenType    string `json:"token_type"`
+		// UpstreamExpiresIn 上游 sub2api access JWT 的真实剩余秒数；旧服务端不下发，
+		// 缺失时为 0，由 effectiveRefreshExpiresIn 回退到本地会话的 ExpiresIn。
+		UpstreamExpiresIn int `json:"upstream_expires_in"`
 	} `json:"data"`
 	Message string `json:"message"`
+}
+
+// effectiveRefreshExpiresIn 返回刷新计时应采用的剩余秒数。账号服务在 data 里
+// 额外给出 upstream_expires_in（上游 sub2api access JWT 的真实剩余寿命）时优先采用——
+// expires_in 只是本地 st_ 会话的滚动 TTL，与上游凭据真实过期时间脱节（2026-09-20 事故根因）。
+func effectiveRefreshExpiresIn(expiresIn, upstreamExpiresIn int) int {
+	if upstreamExpiresIn > 0 {
+		return upstreamExpiresIn
+	}
+	return expiresIn
 }
 
 func buildUserInfoFromProfile(profile *UserProfile) *UserInfo {

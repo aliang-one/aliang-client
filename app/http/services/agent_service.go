@@ -45,6 +45,10 @@ const (
 	agentLogoutTimeout     = 2 * time.Second
 	agentStatusSyncPath    = "/api/agent/status"
 	AgentRuntimeEnv        = "ALIANG_USER_AGENT_RUNTIME"
+	// SessionOwnerAddrEnv 由 owner 进程在 spawn agent 子进程时注入
+	// （见 agentruntime.userAgentEnv），指向 owner dashboard 的基地址；
+	// agent 凭据被远端拒绝时沿此地址通知 owner 触发恢复链。
+	SessionOwnerAddrEnv = "ALIANG_SESSION_OWNER_ADDR"
 
 	AgentForwardedAuthorizationHeader = "X-Aliang-User-Authorization"
 	AgentForwardedUserKeyHeader       = "X-Aliang-User-Key"
@@ -73,7 +77,34 @@ var (
 	sharedAgentService   *AgentService
 
 	localUserAgentBaseURL = UserAgentBaseURL
+
+	// sessionOwnerAddrOverride 显式覆盖的 owner dashboard 基地址。管理面板
+	// 端口回退（默认端口被占用改听随机端口）时由 http server 回灌真实监听
+	// 地址（见 http/server.go，手法同 SetAgentAIApprovalHookBaseURL）；
+	// agentruntime.ownerBaseURL 以其为最高优先级，保证注入 agent 子进程的
+	// ALIANG_SESSION_OWNER_ADDR 指向实际可通知的地址。
+	sessionOwnerAddrOverrideMu sync.RWMutex
+	sessionOwnerAddrOverride   string
 )
+
+// SetSessionOwnerAddrOverride 设置（传空串即清除）owner dashboard 基地址的
+// 显式覆盖值。接受完整 URL 形式（http://host:port），仅做空白与尾部斜杠
+// 规整，不重组合 scheme。
+func SetSessionOwnerAddrOverride(raw string) {
+	raw = strings.TrimRight(strings.TrimSpace(raw), "/")
+	sessionOwnerAddrOverrideMu.Lock()
+	sessionOwnerAddrOverride = raw
+	sessionOwnerAddrOverrideMu.Unlock()
+}
+
+// SessionOwnerAddrOverride 返回显式覆盖的 owner dashboard 基地址；空串表示
+// 未设置，调用方（agentruntime.ownerBaseURL）应继续回退到部署级 env 与
+// 默认监听地址。
+func SessionOwnerAddrOverride() string {
+	sessionOwnerAddrOverrideMu.RLock()
+	defer sessionOwnerAddrOverrideMu.RUnlock()
+	return sessionOwnerAddrOverride
+}
 
 type agentState struct {
 	Enabled         bool                `json:"enabled"`
@@ -1482,6 +1513,8 @@ func (s *AgentService) registerAndSyncLockedWithUserContext(authHeader string, u
 	s.state.LastSyncAt = time.Now().UTC().Format(time.RFC3339)
 	s.state.LastSyncStatus = "connecting"
 	s.state.LastSyncMessage = ""
+	// 注册成功是 ok 转换沿：复位 owner 拒绝通知沿，使下一次凭据拒绝能再次上报。
+	resetOwnerAuthRejectedNotify()
 	logger.Info(fmt.Sprintf("[AGENT-BOOT] register_sync registered device_id=%s agent_server=%s register_url=%s auth=user_jwt",
 		s.state.DeviceID,
 		currentAgentServerURL(),
@@ -1620,9 +1653,150 @@ func (s *AgentService) recoverOrExpireAfterRegisterAuthRejection(err error) {
 	logger.Info(fmt.Sprintf("[AGENT-BOOT] register_auth_rejection recovery_begin status=%d", rejected.status))
 	if IsUserAgentRuntime() {
 		logger.Warn("[AGENT-BOOT] register_auth_rejection delegated_to_session_owner")
+		NotifyOwnerAuthRejected(agentAuthRejectedReasonRegister)
 		return
 	}
 	auth.RecoverOrExpireLocalSession("agent server rejected user authorization")
+}
+
+// agentOwnerNotifyTimeout bounds the credential-rejected notification POST to
+// the session owner. The notify path is an add-on to a call site that has
+// already decided to disable the agent — it must never block it for long.
+const agentOwnerNotifyTimeout = 2 * time.Second
+
+// 拒绝原因常量：register 路径与 WS 握手路径各一个，owner 侧仅用于日志区分。
+const (
+	agentAuthRejectedReasonRegister = "agent_register_rejected"
+	agentAuthRejectedReasonWS       = "agent_ws_rejected"
+)
+
+var (
+	ownerAuthRejectedNotifyMu    sync.Mutex
+	ownerAuthRejectedNotifyFired bool
+)
+
+// agentOwnerNotifyClient 使用独立的 2s 超时，不复用 agentHTTPTimeout（8s）的
+// 常规 client，避免 owner 短暂无响应时拖慢拒绝路径。
+var agentOwnerNotifyClient = &http.Client{Timeout: agentOwnerNotifyTimeout}
+
+// sessionOwnerAuthRejectedNotify 是 owner 侧 /api/auth/agent-auth-rejected
+// 端点的请求契约（见 auth_handler.go 的 agentAuthRejectedRequest）。
+type sessionOwnerAuthRejectedNotify struct {
+	Reason     string `json:"reason"`
+	DeviceID   string `json:"device_id"`
+	ObservedAt int64  `json:"observed_at"` // unix seconds
+	Generation int64  `json:"generation"`  // 0 = agent could not read a generation
+}
+
+// NotifyOwnerAuthRejected 把"凭据被远端拒绝"沿转换沿通知 session owner，
+// owner 走 SoftExpired 恢复链（POST {owner}/api/auth/agent-auth-rejected）。
+// 转换沿幂等，消耗语义是「已成功送达或已判定永久失败」：只有 POST 拿到
+// 2xx、或 4xx 永久性契约错误（400/404 等，重试无意义）才置位消耗；传输
+// 错误、5xx、408/429、body 序列化失败一律保留沿，留待下一次 401 重试通知
+// ——owner 短暂不可达不得造成永久静默。重试节奏有上界：受 register/WS 拒绝
+// 路径的重试周期与 owner 侧 60s 去重窗口约束。发送前的置位检查属尽力去重：
+// 检查与消耗之间存在窗口，最坏并发双发由 owner 60s 去重与恢复链幂等吸收；
+// 发送后按结果处置；注册成功后复位（见
+// registerAndSyncLockedWithUserContext）；owner 地址为空或非 agent 运行时
+// 静默跳过（降级为既有行为：agent 自禁，等 owner 侧自身判定）。错误只记
+// 日志不外抛——通知是附加动作，绝不改变被拒路径原有的自禁/return 行为。
+func NotifyOwnerAuthRejected(reason string) {
+	if !IsUserAgentRuntime() {
+		return
+	}
+	ownerBase := strings.TrimRight(strings.TrimSpace(os.Getenv(SessionOwnerAddrEnv)), "/")
+	if ownerBase == "" {
+		return
+	}
+	ownerAuthRejectedNotifyMu.Lock()
+	if ownerAuthRejectedNotifyFired {
+		ownerAuthRejectedNotifyMu.Unlock()
+		return
+	}
+	ownerAuthRejectedNotifyMu.Unlock()
+
+	payload := sessionOwnerAuthRejectedNotify{
+		Reason:     reason,
+		DeviceID:   currentAgentDeviceIDForNotify(),
+		ObservedAt: time.Now().Unix(),
+		Generation: currentSessionGenerationForNotify(),
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		// 序列化失败不消耗沿：下次 401 重试通知会重新构建并重试。
+		logger.Warn(fmt.Sprintf("[AGENT-BOOT] owner_notify_auth_rejected marshal_failed reason=%s edge=retained will_retry=true error=%v", reason, err))
+		return
+	}
+	resp, err := agentOwnerNotifyClient.Post(ownerBase+"/api/auth/agent-auth-rejected", "application/json", bytes.NewReader(raw))
+	if err != nil {
+		// 传输错误（owner 不可达/超时）不消耗沿：短暂不可达不应造成永久静默。
+		logger.Warn(fmt.Sprintf("[AGENT-BOOT] owner_notify_auth_rejected failed reason=%s owner=%s edge=retained will_retry=true error=%v", reason, ownerBase, err))
+		return
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+	switch {
+	case resp.StatusCode >= 200 && resp.StatusCode < 300:
+		consumeOwnerAuthRejectedNotifyEdge()
+		logger.Info(fmt.Sprintf("[AGENT-BOOT] owner_notify_auth_rejected sent reason=%s status=%d edge=consumed response=%s",
+			reason, resp.StatusCode, strings.TrimSpace(string(body))))
+	case resp.StatusCode >= 500:
+		// owner 端临时故障：保留沿，下次 401 重试通知再试。
+		logger.Warn(fmt.Sprintf("[AGENT-BOOT] owner_notify_auth_rejected server_error reason=%s owner=%s status=%d edge=retained will_retry=true",
+			reason, ownerBase, resp.StatusCode))
+	case resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode == http.StatusTooManyRequests:
+		// 408/429 是可重试的临时拒绝（owner 过载/限流）：保留沿，下次 401
+		// 重试通知再试。本端点承诺不引入 4xx 鉴权闸门；若未来引入，
+		// 401/403 必须加入保留分支。
+		logger.Warn(fmt.Sprintf("[AGENT-BOOT] owner_notify_auth_rejected retryable_rejection reason=%s owner=%s status=%d edge=retained will_retry=true",
+			reason, ownerBase, resp.StatusCode))
+	default:
+		// 其余非 2xx/5xx（400/404 等）：请求已送达但被按契约永久拒绝，
+		// 重试无意义——消耗沿。
+		consumeOwnerAuthRejectedNotifyEdge()
+		logger.Warn(fmt.Sprintf("[AGENT-BOOT] owner_notify_auth_rejected permanent_rejection reason=%s owner=%s status=%d edge=consumed response=%s",
+			reason, ownerBase, resp.StatusCode, strings.TrimSpace(string(body))))
+	}
+}
+
+// consumeOwnerAuthRejectedNotifyEdge 置位转换沿（消耗）：仅在通知已成功
+// 送达（2xx）或已判定为 4xx 永久性契约错误时调用。置位动作放在 POST 之
+// 后而非之前——首次尝试失败（owner 不可达/5xx）时沿保留，下一次 401 拒绝
+// 路径仍会重试通知。
+func consumeOwnerAuthRejectedNotifyEdge() {
+	ownerAuthRejectedNotifyMu.Lock()
+	defer ownerAuthRejectedNotifyMu.Unlock()
+	ownerAuthRejectedNotifyFired = true
+}
+
+// resetOwnerAuthRejectedNotify 复位转换沿：注册成功（ok 边沿）后由
+// registerAndSyncLockedWithUserContext 调用，使下一次凭据拒绝能再次上报。
+func resetOwnerAuthRejectedNotify() {
+	ownerAuthRejectedNotifyMu.Lock()
+	defer ownerAuthRejectedNotifyMu.Unlock()
+	ownerAuthRejectedNotifyFired = false
+}
+
+// currentAgentDeviceIDForNotify 尽力读取 agent 的 device_id 用于通知负载；
+// 读不到就传空串（owner 侧不依赖 device_id 做校验，仅用于日志）。只读、
+// 无副作用：此时 agent 已决定自禁，不再做 identity 补建等持久化动作。
+func currentAgentDeviceIDForNotify() string {
+	s := GetSharedAgentService()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.state.DeviceID
+}
+
+// currentSessionGenerationForNotify 带保护地读取本地会话代：agent 子进程
+// 的 session authority 可能尚未初始化，panic-safe 地退化为 0（owner 侧对
+// generation==0 的通知退化为状态+时间窗校验）。
+func currentSessionGenerationForNotify() (generation int64) {
+	defer func() {
+		if r := recover(); r != nil {
+			generation = 0
+		}
+	}()
+	return int64(auth.GetSessionAuthority().Snapshot().Generation)
 }
 
 func (s *AgentService) syncAgentInventoryLocked(reason string) error {

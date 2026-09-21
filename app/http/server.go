@@ -63,6 +63,8 @@ func StartHttpServer() error {
 	wrappedMux := middleware.Chain(mux, middlewares...)
 
 	// 尝试监听端口，如果被占用则尝试其他端口
+	// ownerFallbackHost 非空表示发生了端口回退，记录回退后真实可连的 host。
+	var ownerFallbackHost string
 	listener, err := net.Listen("tcp", port)
 	if err != nil {
 		if strings.Contains(err.Error(), "address already in use") {
@@ -78,6 +80,12 @@ func StartHttpServer() error {
 			}
 			actualAddr := listener.Addr().(*net.TCPAddr)
 			actualPort = fmt.Sprintf("%d", actualAddr.Port)
+			// 记录回退后真实可连的 host（绑定 0.0.0.0 等通配地址时本地回环即可达），
+			// 供下方回灌 owner 通知地址使用。
+			ownerFallbackHost = "127.0.0.1"
+			if actualAddr.IP != nil && !actualAddr.IP.IsUnspecified() {
+				ownerFallbackHost = actualAddr.IP.String()
+			}
 			logger.Info(fmt.Sprintf("HTTP server listening on alternative port: %s", actualAddr.String()))
 		} else {
 			return fmt.Errorf("http server failed: %w", err)
@@ -89,6 +97,12 @@ func StartHttpServer() error {
 	}
 	if actualPort != "" {
 		services.SetAgentAIApprovalHookBaseURL("http://127.0.0.1:" + actualPort)
+	}
+	// 端口回退时把真实监听地址回灌给 agent 通知链（agentruntime.ownerBaseURL
+	// 注入 ALIANG_SESSION_OWNER_ADDR 用，优先级最高的显式 override），否则
+	// agent 上报"凭据被远端拒绝"仍会打向已不可达的默认端口。
+	if ownerFallbackHost != "" && actualPort != "" {
+		services.SetSessionOwnerAddrOverride("http://" + net.JoinHostPort(ownerFallbackHost, actualPort))
 	}
 
 	// Create HTTP server
