@@ -431,6 +431,21 @@ jobs:
         shell: bash
         run: coscli -c "$COS_CFG" sync release-assets/ "cos://${COS_BUCKET}/software/" -r --force
 
+      - name: Sync history prefix
+        shell: bash
+        run: |
+          mkdir -p history
+          while read -r hash name; do
+            if [ "$name" = "SHA256SUMS" ]; then continue; fi
+            case "$name" in
+              *.tar.gz) base_name="${name%.tar.gz}"; ext="tar.gz" ;;
+              *) base_name="${name%.*}"; ext="${name##*.}" ;;
+            esac
+            cp "release-assets/$name" "history/${base_name}-${TAG}.${ext}"
+            echo "${hash}  ${base_name}-${TAG}.${ext}" >> "history/SHA256SUMS-${TAG}"
+          done < release-assets/SHA256SUMS
+          coscli -c "$COS_CFG" sync history/ "cos://${COS_BUCKET}/software/history/" -r --force
+
       - name: Write software version marker
         shell: bash
         run: |
@@ -452,6 +467,7 @@ jobs:
               fail=1
             fi
           done
+          curl -fsSI "${base}/software/history/SHA256SUMS-${TAG}" > /dev/null || { echo "::error::history/SHA256SUMS-${TAG} 不可访问"; fail=1; }
           [ "$fail" -eq 0 ] || exit 1
           {
             echo "## COS 发布完成:${TAG}"
@@ -464,4 +480,5 @@ jobs:
               name="$(basename "$f")"
               echo "| ${name} | ${base}/software/${name} |"
             done
+            echo "| SHA256SUMS-${TAG}(history) | ${base}/software/history/SHA256SUMS-${TAG} |"
           } >> "$GITHUB_STEP_SUMMARY"

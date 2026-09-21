@@ -10,7 +10,7 @@
 
 问题:产物唯一存放点是 GitHub Release,国内下载慢且单点。
 
-目标:打 tag 发布时,在 GitHub Release 发布之后,**追加**把全部产物同步到腾讯云 COS 的固定前缀 `software/`(覆盖式,桶内始终只保留最新一套产物),下载 URL 形如 `https://aliang-1305838434.cos.ap-nanjing.myqcloud.com/software/aliang-linux-amd64.tar.gz`。
+目标:打 tag 发布时,在 GitHub Release 发布之后,**追加**把全部产物同步到腾讯云 COS:固定前缀 `software/`(覆盖式,桶内始终只保留最新一套产物)+ 历史前缀 `software/history/`(带 tag 文件名,按发布累积保留历史版本),下载 URL 形如 `https://aliang-1305838434.cos.ap-nanjing.myqcloud.com/software/aliang-linux-amd64.tar.gz` 与 `https://aliang-1305838434.cos.ap-nanjing.myqcloud.com/software/history/aliang-linux-amd64-v1.1.35.tar.gz`。
 
 GitHub 现有流程零改动,两边并存。
 
@@ -75,22 +75,18 @@ https://aliang-1305838434.cos.ap-nanjing.myqcloud.com/software/<asset>
 
 ```
 cos://aliang-1305838434/
-└── software/            ← 覆盖式,桶内始终只保留最新一套产物
+└── software/
     ├── aliang-linux-amd64.tar.gz
-    ├── aliang-linux-amd64.deb
-    ├── aliang-linux-arm64.tar.gz
-    ├── aliang-linux-arm64.deb
-    ├── aliang-windows-amd64.zip
-    ├── aliang-windows-amd64.msi
-    ├── aliang-darwin-amd64.tar.gz
-    ├── aliang-darwin-amd64.pkg
-    ├── aliang-darwin-arm64.tar.gz
-    ├── aliang-darwin-arm64.pkg
+    ├── (其余 9 个产物,平铺,覆盖式)
     ├── SHA256SUMS
-    └── version.txt       ← 单行文本,内容为当前 tag(如 v1.1.33)
+    ├── version.txt
+    └── history/
+        ├── aliang-linux-amd64-v1.1.35.tar.gz
+        ├── (带 tag 文件名的产物,按发布累积)
+        └── SHA256SUMS-v1.1.35
 ```
 
-每次发布共产出 12 个对象(10 产物 + SHA256SUMS + version.txt)。`version.txt` 供自动化探测最新版本号与发布完整性核对。不保留历史版本(用户决策,2026-09-21);旧版本回溯依赖 GitHub Release 清理前的窗口期或另行归档。
+每次发布新增 12 个固定路径对象(10 产物+SHA256SUMS+version.txt,覆盖)+ 11 个历史对象(10 个带 tag 产物 + SHA256SUMS-<TAG>,累积)。`version.txt` 供自动化探测最新版本号与发布完整性核对。
 
 ## 7. Workflow 改动设计
 
@@ -116,8 +112,9 @@ cos://aliang-1305838434/
                                               # 桶条目: name=aliang-1305838434, region=ap-nanjing,
                                               #          endpoint=cos.ap-nanjing.myqcloud.com(不配 alias)
       - name: Sync to software/              # coscli -c $CFG sync release-assets/ cos://桶/software/ -r --force
+      - name: Sync history prefix            # 生成带 tag 文件名副本与 SHA256SUMS-<TAG> 并同步到 software/history/
       - name: Write software/version.txt     # echo $TAG > version.txt 后单文件 cp(默认覆盖,cp 无 --force)
-      - name: Verify and summarize           # coscli ls cos://桶/software/ 核对对象数(应为 12:10 产物+SHA256SUMS+version.txt);
+      - name: Verify and summarize           # 核对对象数:固定前缀应为 12(10 产物+SHA256SUMS+version.txt)+ history SHA256SUMS 可达性抽查;
                                               # 把全部公开下载 URL 写入 GITHUB_STEP_SUMMARY
 ```
 
@@ -136,7 +133,7 @@ cos://aliang-1305838434/
 | coscli 下载/sha256 校验失败 | 步骤失败,job 标红 |
 | 单文件上传失败 | coscli 内置重试 5 次;最终失败 → job 标红 |
 | COS 整体失败 | **GitHub Release 不受影响**(已先行发布);run 标红引人注意;修复后在 Actions 页单重跑 `publish-cos` job,sync 按 crc64 幂等续传 |
-| 重跑同版本 | 幂等:crc64 相同的对象跳过,`software/` 覆盖为同内容 |
+| 重跑同版本 | 幂等:crc64 相同的对象跳过,`software/` 覆盖为同内容;history/ 同名(同 tag)跳过,不同 tag 累积 |
 | 桶非公有读 | 上传仍成功,但下载 URL 返回 403 → 依赖 §10 验证清单暴露 |
 
 不做告警系统集成;job 红绿即状态。
@@ -169,5 +166,5 @@ cos://aliang-1305838434/
 ## 11. 后续可选(不在本期)
 
 - CDN 加速域名绑定 `software/`
-- 若未来需要历史版本回溯,再增加 `releases/<tag>/` 归档前缀(当前按用户决策不保留)
+- history/ 长期累积后可用 COS 生命周期规则控制成本(当前量级可忽略)
 - 在 README/官网放固定 `software/` 下载链接

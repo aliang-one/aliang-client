@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 打 tag 发布时,在 GitHub Release 之后把全部产物同步到腾讯云 COS(`software/` 固定前缀,覆盖式)。
+**Goal:** 打 tag 发布时,在 GitHub Release 之后把全部产物同步到腾讯云 COS(`software/` 固定前缀,覆盖式) + `software/history/`(带 tag 文件名,累积历史)。
 
-**Architecture:** 在 `.github/workflows/tag-build-release.yml` 末尾追加独立 job `publish-cos`(needs: release):重新下载 `aliang-*` artifacts、重算 SHA256SUMS、安装固定版 coscli(sha256 校验)、secrets 渲染临时配置文件、一次 `sync -r` + version.txt 标记、HTTP HEAD 全量核对并输出下载 URL 到 Step Summary。不引入第三方 Action,不改任何 Go/前端代码。
+**Architecture:** 在 `.github/workflows/tag-build-release.yml` 末尾追加独立 job `publish-cos`(needs: release):重新下载 `aliang-*` artifacts、重算 SHA256SUMS、安装固定版 coscli(sha256 校验)、secrets 渲染临时配置文件、固定前缀与历史前缀两次 `sync -r` + version.txt 标记、HTTP HEAD 全量核对并输出下载 URL 到 Step Summary。不引入第三方 Action,不改任何 Go/前端代码。
 
 **Tech Stack:** GitHub Actions、腾讯云 coscli v1.0.9(linux-amd64,sha256 固定校验)、COS 桶 `aliang-1305838434`(ap-nanjing,公有读)。
 
@@ -277,6 +277,21 @@ Expected: rm 成功;curl 返回 `404`;本地目录已删。若 `rm` 的 `--force
         shell: bash
         run: coscli -c "$COS_CFG" sync release-assets/ "cos://${COS_BUCKET}/software/" -r --force
 
+      - name: Sync history prefix
+        shell: bash
+        run: |
+          mkdir -p history
+          while read -r hash name; do
+            if [ "$name" = "SHA256SUMS" ]; then continue; fi
+            case "$name" in
+              *.tar.gz) base_name="${name%.tar.gz}"; ext="tar.gz" ;;
+              *) base_name="${name%.*}"; ext="${name##*.}" ;;
+            esac
+            cp "release-assets/$name" "history/${base_name}-${TAG}.${ext}"
+            echo "${hash}  ${base_name}-${TAG}.${ext}" >> "history/SHA256SUMS-${TAG}"
+          done < release-assets/SHA256SUMS
+          coscli -c "$COS_CFG" sync history/ "cos://${COS_BUCKET}/software/history/" -r --force
+
       - name: Write software version marker
         shell: bash
         run: |
@@ -298,6 +313,7 @@ Expected: rm 成功;curl 返回 `404`;本地目录已删。若 `rm` 的 `--force
               fail=1
             fi
           done
+          curl -fsSI "${base}/software/history/SHA256SUMS-${TAG}" > /dev/null || { echo "::error::history/SHA256SUMS-${TAG} 不可访问"; fail=1; }
           [ "$fail" -eq 0 ] || exit 1
           {
             echo "## COS 发布完成:${TAG}"
@@ -310,6 +326,7 @@ Expected: rm 成功;curl 返回 `404`;本地目录已删。若 `rm` 的 `--force
               name="$(basename "$f")"
               echo "| ${name} | ${base}/software/${name} |"
             done
+            echo "| SHA256SUMS-${TAG}(history) | ${base}/software/history/SHA256SUMS-${TAG} |"
           } >> "$GITHUB_STEP_SUMMARY"
 ```
 
@@ -400,7 +417,7 @@ Expected: secrets 列表含 `COS_SECRET_ID`/`COS_SECRET_KEY`(值不可见,只看
 
 本任务**无法在合并前执行**(依赖真实 tag 触发),执行计划时原样转交用户,作为下次发版的 checklist:
 
-- [ ] **Step 1: 观察 Actions run** — https://github.com/aliang-one/aliang-client/actions 中 tag 对应 run 的 `publish-cos` job 绿色,Summary 含「COS 发布完成:<tag>」与 12 行 URL 表(10 产物 + SHA256SUMS + version.txt)。
+- [ ] **Step 1: 观察 Actions run** — https://github.com/aliang-one/aliang-client/actions 中 tag 对应 run 的 `publish-cos` job 绿色,Summary 含「COS 发布完成:<tag>」与 13 行 URL 表(10 产物 + SHA256SUMS + version.txt + SHA256SUMS-<tag> history 行)。
 
 - [ ] **Step 2: 全量下载校验(software/)**
 
@@ -416,6 +433,9 @@ for f in aliang-linux-amd64.tar.gz aliang-linux-amd64.deb \
   curl -fsSLO "${base}/software/${f}"
 done
 sha256sum -c SHA256SUMS
+curl -fsSLO "${base}/software/history/SHA256SUMS-<tag>"   # 替换 <tag> 为实际 tag
+sha256sum -c "SHA256SUMS-<tag>"                            # 期望 10 行 OK
+curl -fsSI "${base}/software/history/aliang-linux-amd64-v<tag>.tar.gz" | head -1   # 期望 HTTP/2 200
 curl -fsS "${base}/software/version.txt"   # 期望输出:当前 tag
 cd - && rm -rf /tmp/cos-verify
 ```
@@ -435,7 +455,7 @@ git log --oneline master..HEAD
 git status --short
 ```
 
-Expected: 2 个提交(文档 + workflow),工作区干净。
+Expected: 5+ 个提交(文档、T1 修正、workflow、评审修复、software/ 路径调整、history 追加等),以 `git log --oneline master..HEAD` 实际输出为准,全部为 COS 相关;工作区干净。
 
 - [ ] **Step 2: 向用户汇报并等待决定(不得自行 push)**
 
@@ -446,4 +466,5 @@ Expected: 2 个提交(文档 + workflow),工作区干净。
 ## 已知限制与后续(规格 §11)
 
 - 桶公有读 = 全网可匿名下载桶内所有对象(分发用途可接受,严禁放凭据类文件)
-- 桶内仅保留最新一套 `software/` 产物,历史版本在 COS 侧不保留(用户决策);两个 tag 极短间隔并发发布时 `software/` 终态为后完成者(规格 §7 已声明,不加并发控制)
+- `software/` 固定前缀仅保留最新一套产物,历史版本留存于 `software/history/`(带 tag 文件名);两个 tag 极短间隔并发发布时 `software/` 终态为后完成者(规格 §7 已声明,不加并发控制)
+- software/history/ 随发布无限累积(约 165MB/版本),量大后可用 COS 生命周期规则治理
