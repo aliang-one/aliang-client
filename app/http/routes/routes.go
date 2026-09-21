@@ -140,6 +140,11 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	register("/api/auth/me", h.Auth.HandleMe, http.MethodGet)
 	register("/api/auth/logout", h.Auth.HandleLogout, http.MethodPost)
 
+	// Agent (non-owner) → owner notification: credentials rejected by the
+	// remote (PhoneServer 401). No dashboard-session gate: the agent subprocess
+	// holds no cookie; the loopback dashboard listener is the trust boundary.
+	register("/api/auth/agent-auth-rejected", h.Auth.HandleAgentAuthRejected, http.MethodPost)
+
 	// Scan-to-login routes (扫码登录) — init/status/activate 全部登录前可用
 	register("/api/auth/scan/init", h.Auth.HandleScanInit, http.MethodPost)
 	register("/api/auth/scan/status", h.Auth.HandleScanStatus, http.MethodGet)

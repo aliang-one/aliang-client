@@ -52,6 +52,7 @@ func isConfigurationAPI(path string) bool {
 		"/api/auth/refresh",
 		"/api/auth/me",
 		"/api/auth/logout",
+		"/api/auth/agent-auth-rejected",
 		"/api/auth/scan/init",
 		"/api/auth/scan/status",
 		"/api/auth/scan/activate",
