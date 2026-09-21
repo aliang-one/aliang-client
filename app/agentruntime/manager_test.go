@@ -123,3 +123,23 @@ func TestOwnerBaseURLHonorsManagementAddrOverride(t *testing.T) {
 		t.Fatalf("ownerBaseURL() with override = %q, want http://127.0.0.1:60000", got)
 	}
 }
+
+func TestOwnerBaseURLPrefersSessionOwnerAddrOverride(t *testing.T) {
+	// 显式 override（server 端口回退时回灌）优先于部署级 env 与默认监听地址。
+	services.SetSessionOwnerAddrOverride("http://127.0.0.1:49152")
+	t.Cleanup(func() { services.SetSessionOwnerAddrOverride("") })
+
+	if got := ownerBaseURL(); got != "http://127.0.0.1:49152" {
+		t.Fatalf("ownerBaseURL() = %q, want override http://127.0.0.1:49152", got)
+	}
+	// env 存在时 override 仍胜出。
+	t.Setenv("ALIANG_MANAGEMENT_ADDR", "127.0.0.1:60000")
+	if got := ownerBaseURL(); got != "http://127.0.0.1:49152" {
+		t.Fatalf("ownerBaseURL() with env = %q, want override http://127.0.0.1:49152", got)
+	}
+	// 清除 override 后回退到 env。
+	services.SetSessionOwnerAddrOverride("")
+	if got := ownerBaseURL(); got != "http://127.0.0.1:60000" {
+		t.Fatalf("ownerBaseURL() after clear = %q, want env http://127.0.0.1:60000", got)
+	}
+}

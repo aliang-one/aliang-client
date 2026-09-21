@@ -12,6 +12,9 @@
 1. 规格 §4.3"注入即刷新"缩减为一条回归测试（Task B1 Step 5），无独立代码任务——`RestoreSession` 本身就先刷新（`token_activate.go:207`）且成功路径自动获得锚点。
 2. 规格 §4.1 的字段名调整为 `upstream_expires_in` / `upstream_expires_at`——规格字面上的 `expires_in` 与既有字段冲突（该字段已有"本地 st_ 会话滚动 TTL"语义，web 前端在消费），改名才符合规格自己的兼容矩阵（§6）。规格新增字段的意图（客户端锚定上游真实 exp）不变。
 3. 规格 §4.1 所指"login/register 重写路径"具体为 `injectLocalSessionIntoAuthResponse`（`internal/httpapi/routes.go:3226`，经 `captureSub2APITokens` 调用），Task A1 一并覆盖。
+4. 服务端锚点解码用 `accessTokenExpiry` 直取（计划原写 `accessExpiryOrDefault`，初始值即 50min 兜底，行为等价）。
+5. owner 端新增计划外的 60s apply 最小间隔去重（增强，防无凭据端点被重放）。
+6. agent 侧通知沿消耗语义细化为「2xx/永久 4xx 消耗；传输错误/5xx/408/429 保留待重试」，`ownerBaseURL` 默认改用 `ManagementListenAddr()` 并支持 server 端口回退 override（均优于计划原表述）。
 
 **提交纪律：** 全部提交只在 feature 分支上做，中文标题（`新增：/修复：`），**一律不推送**、不合 master——由用户审阅后决定。
 

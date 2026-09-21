@@ -77,7 +77,34 @@ var (
 	sharedAgentService   *AgentService
 
 	localUserAgentBaseURL = UserAgentBaseURL
+
+	// sessionOwnerAddrOverride 显式覆盖的 owner dashboard 基地址。管理面板
+	// 端口回退（默认端口被占用改听随机端口）时由 http server 回灌真实监听
+	// 地址（见 http/server.go，手法同 SetAgentAIApprovalHookBaseURL）；
+	// agentruntime.ownerBaseURL 以其为最高优先级，保证注入 agent 子进程的
+	// ALIANG_SESSION_OWNER_ADDR 指向实际可通知的地址。
+	sessionOwnerAddrOverrideMu sync.RWMutex
+	sessionOwnerAddrOverride   string
 )
+
+// SetSessionOwnerAddrOverride 设置（传空串即清除）owner dashboard 基地址的
+// 显式覆盖值。接受完整 URL 形式（http://host:port），仅做空白与尾部斜杠
+// 规整，不重组合 scheme。
+func SetSessionOwnerAddrOverride(raw string) {
+	raw = strings.TrimRight(strings.TrimSpace(raw), "/")
+	sessionOwnerAddrOverrideMu.Lock()
+	sessionOwnerAddrOverride = raw
+	sessionOwnerAddrOverrideMu.Unlock()
+}
+
+// SessionOwnerAddrOverride 返回显式覆盖的 owner dashboard 基地址；空串表示
+// 未设置，调用方（agentruntime.ownerBaseURL）应继续回退到部署级 env 与
+// 默认监听地址。
+func SessionOwnerAddrOverride() string {
+	sessionOwnerAddrOverrideMu.RLock()
+	defer sessionOwnerAddrOverrideMu.RUnlock()
+	return sessionOwnerAddrOverride
+}
 
 type agentState struct {
 	Enabled         bool                `json:"enabled"`

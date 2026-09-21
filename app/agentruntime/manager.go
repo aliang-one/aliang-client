@@ -367,11 +367,16 @@ func userAgentEnv(env []string) []string {
 
 // ownerBaseURL 返回 session owner 进程管理面板（dashboard）的基地址，注入
 // agent 子进程环境，供其上报"凭据被远端拒绝"（services.NotifyOwnerAuthRejected）。
-// 默认跟随管理面板的真实监听地址 config.ManagementListenAddr()（反映 --host
-// 实际配置，默认值下即 127.0.0.1:56431）；ALIANG_MANAGEMENT_ADDR 是部署级
-// 覆盖，用于管理监听与 agent 所见地址不一致的场景（如 0.0.0.0 监听、跨址
-// 部署），约定 host:port 形式，容错处理带 scheme 的写法（统一按 http 重组）。
+// 优先级：显式 override（services.SessionOwnerAddrOverride，管理面板默认端口
+// 被占用回退随机端口时由 http server 回灌真实监听地址）> 部署级 env
+// ALIANG_MANAGEMENT_ADDR > 默认 config.ManagementListenAddr()（反映 --host
+// 实际配置，默认值下即 127.0.0.1:56431）。env 覆盖用于管理监听与 agent
+// 所见地址不一致的场景（如 0.0.0.0 监听、跨址部署），约定 host:port 形式，
+// 容错处理带 scheme 的写法（统一按 http 重组）。
 func ownerBaseURL() string {
+	if override := services.SessionOwnerAddrOverride(); override != "" {
+		return override
+	}
 	addr := strings.TrimSpace(os.Getenv("ALIANG_MANAGEMENT_ADDR"))
 	addr = strings.TrimPrefix(addr, "http://")
 	addr = strings.TrimPrefix(addr, "https://")
