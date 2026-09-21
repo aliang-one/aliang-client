@@ -125,7 +125,7 @@ cos://aliang-1305838434/
                                               #          endpoint=cos.ap-nanjing.myqcloud.com(不配 alias)
       - name: Sync to releases/<tag>/        # coscli -c $CFG sync release-assets/ cos://桶/releases/$TAG/ -r --force
       - name: Sync to latest/                # coscli -c $CFG sync release-assets/ cos://桶/latest/ -r --force
-      - name: Write latest/version.txt       # echo $TAG > version.txt 后单文件 cp --force
+      - name: Write latest/version.txt       # echo $TAG > version.txt 后单文件 cp(默认覆盖,cp 无 --force)
       - name: Verify and summarize           # coscli ls cos://桶/releases/$TAG/ 核对对象数(应为 11);
                                               # 把全部公开下载 URL 写入 GITHUB_STEP_SUMMARY
 ```

@@ -204,6 +204,9 @@ Expected: rm 成功;curl 返回 `404`;本地目录已删。若 `rm` 的 `--force
     needs: release
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
     env:
       COS_BUCKET: ${{ vars.COS_BUCKET }}
       COS_REGION: ${{ vars.COS_REGION }}
@@ -293,7 +296,7 @@ Expected: rm 成功;curl 返回 `404`;本地目录已删。若 `rm` 的 `--force
             name="$(basename "$f")"
             local_size="$(stat -c%s "$f")"
             headers="$(curl -fsSI "${base}/latest/${name}")" || { echo "::error::HEAD failed: ${base}/latest/${name}(检查桶公有读)"; fail=1; continue; }
-            remote_size="$(printf '%s\n' "$headers" | grep -i '^content-length:' | tail -1 | tr -dc '0-9')"
+            remote_size="$(printf '%s\n' "$headers" | grep -i '^content-length:' | tail -1 | tr -dc '0-9' || true)"
             if [ "${remote_size}" != "${local_size}" ]; then
               echo "::error::size mismatch ${name}: local=${local_size} remote=${remote_size}"
               fail=1
