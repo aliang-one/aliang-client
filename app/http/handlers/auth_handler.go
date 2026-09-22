@@ -224,7 +224,7 @@ func (h *AuthHandler) HandleScanActivate(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	result := h.authService.ActivateScanLogin(req.SessionToken, req.RefreshToken)
+	result := h.authService.ActivateScanLogin(req.SessionToken, req.RefreshToken, req.UpstreamExpiresIn)
 	writeAuthResult(w, r, result)
 }
 

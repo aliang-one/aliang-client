@@ -101,9 +101,15 @@ export async function scanStatus(deviceCode) {
   return request(`/api/auth/scan/status?${query}`, { method: 'GET' });
 }
 
-export async function activateScanLogin({ sessionToken, refreshToken }) {
+export async function activateScanLogin({ sessionToken, refreshToken, upstreamExpiresIn }) {
+  // upstream_expires_in：扫码 status 响应透传的上游 access JWT 剩余秒数，
+  // 服务端用它锚定刷新计时；缺省（旧后端/异常）时省略，客户端回退常量。
+  const body = { session_token: sessionToken, refresh_token: refreshToken };
+  if (Number.isFinite(upstreamExpiresIn) && upstreamExpiresIn > 0) {
+    body.upstream_expires_in = upstreamExpiresIn;
+  }
   return request('/api/auth/scan/activate', {
     method: 'POST',
-    body: JSON.stringify({ session_token: sessionToken, refresh_token: refreshToken })
+    body: JSON.stringify(body)
   });
 }

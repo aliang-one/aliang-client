@@ -44,6 +44,9 @@ type ScanStatusResult struct {
 	SessionToken string          `json:"session_token"` // authorized 时下发（st_）
 	RefreshToken string          `json:"refresh_token"` // authorized 时下发（本地 st_ 兼容字段）
 	User         *ScanStatusUser `json:"user"`
+	// UpstreamExpiresIn 上游 sub2api access JWT 的真实剩余秒数（authorized 时顶层下发），
+	// 供激活时锚定刷新计时；旧服务端缺省 → 0 → 激活时回退 scanAccessTokenTTLSeconds 常量。
+	UpstreamExpiresIn int `json:"upstream_expires_in"`
 }
 
 // ScanInit 向 official-website 发起扫码登录初始化，返回 PC 端 device_code 与二维码内容。

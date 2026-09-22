@@ -174,7 +174,9 @@ async function pollOnce() {
     clearTimers();
     const ok = await completeScanLogin({
       sessionToken: res.data.session_token,
-      refreshToken: res.data.refresh_token
+      refreshToken: res.data.refresh_token,
+      // 上游 access JWT 真实剩余秒数：随激活请求透传，锚定刷新计时（缺省回退常量）。
+      upstreamExpiresIn: res.data.upstream_expires_in
     });
     if (stopped) return;
     if (ok) {

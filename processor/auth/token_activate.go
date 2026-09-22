@@ -176,8 +176,11 @@ func finalizeAuthenticatedSessionWithOperation(operation *SessionOperation, acce
 // ActivateWithTokens 用扫码登录拿到的本地令牌完成登录收尾。
 // accessToken 和兼容字段 refreshToken 都由 official-website 签发；sub2api
 // token 始终留在服务端 broker 中。
+// upstreamExpiresIn 是扫码状态响应透传的上游 access JWT 真实剩余秒数；>0 时优先于
+// scanAccessTokenTTLSeconds 常量作刷新计时锚（旧服务端缺省 → 0 → 回退常量），
+// 与 LoginWithPassword/RefreshSession 的 effectiveRefreshExpiresIn 语义一致。
 // 与 LoginWithPassword 走同一条 finalizeAuthenticatedSession，故扫码后状态与密码登录等价。
-func ActivateWithTokens(accessToken, refreshToken string) (*UserInfo, error) {
+func ActivateWithTokens(accessToken, refreshToken string, upstreamExpiresIn int) (*UserInfo, error) {
 	accessToken = strings.TrimSpace(accessToken)
 	refreshToken = strings.TrimSpace(refreshToken)
 	if accessToken == "" {
@@ -186,10 +189,11 @@ func ActivateWithTokens(accessToken, refreshToken string) (*UserInfo, error) {
 	if refreshToken == "" {
 		return nil, fmt.Errorf("refresh token cannot be empty")
 	}
+	expiresIn := effectiveRefreshExpiresIn(scanAccessTokenTTLSeconds, upstreamExpiresIn)
 	authority := GetSessionAuthority()
 	operation := authority.BeginOperation()
 	defer operation.Close()
-	return finalizeAuthenticatedSessionWithOperation(operation, accessToken, refreshToken, "Bearer", scanAccessTokenTTLSeconds)
+	return finalizeAuthenticatedSessionWithOperation(operation, accessToken, refreshToken, "Bearer", expiresIn)
 }
 
 func RestoreSession() (*UserInfo, error) {
