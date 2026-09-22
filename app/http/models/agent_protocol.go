@@ -251,7 +251,7 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				{Type: AgentEventAISteer, Required: []string{"type", "session_id", "message_id", "content"}, Optional: []string{"mode"}, Emits: []string{AgentEventAISteerAck}},
 				{Type: AgentEventAIApprovalResponse, Required: []string{"type", "session_id", "approval_id", "decision"}, Optional: []string{"message_id", "scope", "raw", "delivery_id", "attempt"}, Emits: []string{AgentEventAIApprovalAck, AgentEventAIStatus, AgentEventAIError}},
 				{Type: AgentEventAIApprovalState, Required: []string{"type", "approval_id", "status"}, Optional: []string{"session_id"}},
-				{Type: AgentEventAIStop, Required: []string{"type", "session_id"}, Emits: []string{AgentEventAIStatus}},
+				{Type: AgentEventAIStop, Required: []string{"type", "session_id"}, Optional: []string{"run_id", "source_session_id"}, Emits: []string{AgentEventAIStatus}},
 				{Type: AgentEventAIRename, Required: []string{"type", "session_id", "title"}, Optional: []string{"project_path", "provider", "tool", "source_session_id", "resume_session_id"}, Emits: []string{AgentEventAIRenameAck}},
 				{Type: AgentEventAISessionClose, Required: []string{"type", "session_id"}, Emits: []string{AgentEventAISessionClosed}},
 				{Type: AgentEventFileList, Required: []string{"type", "request_id", "project_path", "path"}, Optional: []string{"max_entries"}, Emits: []string{AgentEventFileListResult, AgentEventFileError}},

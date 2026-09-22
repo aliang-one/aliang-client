@@ -2039,6 +2039,14 @@ func (m *agentAIManager) setCodexSteerControl(sessionID string, runSeq int, cont
 // runUserMessage 在 session 上派发一轮新的 AI run。message()（用户消息）与
 // optionResponse()（用户方案选择续接）共用。调用者须已确认 session 存在且当前未在跑。
 func (m *agentAIManager) runUserMessage(session *agentAISession, runID, messageID, content, provider string, attachments []agentAIAttachment, emitter *agentAIRunEmitter, nativeGoal map[string]interface{}) error {
+	// Spawn precheck (imported Claude sessions): refuse to --resume a native
+	// session whose interactive TUI is mid-turn — two writers on one native
+	// conversation would interleave transcripts. Earliest abortable point: no
+	// run state below has been mutated yet, so returning here surfaces as a
+	// plain ai.error and the server can retry after the TUI turn finishes.
+	if err := guardExternalTUIClaudeSpawn(externalTUIHome(), provider, session.resumeSessionID); err != nil {
+		return err
+	}
 	writeJSON := agentTerminalWriter(emitter.emit)
 	approvalToken, err := newAgentAIApprovalToken()
 	if err != nil {
@@ -2318,16 +2326,22 @@ func (m *agentAIManager) stop(msg map[string]interface{}, writeJSON agentTermina
 		_ = writeJSON(agentAIErrorPayload("", "", errors.New("ai.stop missing session_id")))
 		return
 	}
+	sourceSessionID := strings.TrimSpace(remoteString(msg, "source_session_id"))
 
 	m.mu.Lock()
 	session := m.sessions[sessionID]
 	if session == nil {
 		m.mu.Unlock()
-		_ = writeJSON(map[string]interface{}{
-			"type":       models.AgentEventAIStatus,
-			"session_id": sessionID,
-			"status":     "stopped",
-		})
+		// Imported sessions are conversations Claude Code spawned outside this
+		// agent (nothing in m.sessions, no cancel func). The turn may be
+		// running in a live TUI process on this machine: try the external
+		// interrupt (SIGINT = one Esc press) when the stop carries the native
+		// session id, and fall back to the legacy "stopped" reply otherwise.
+		interrupted := false
+		if sourceSessionID != "" {
+			_, interrupted = interruptExternalClaudeTurn(externalTUIHome(), sourceSessionID)
+		}
+		_ = writeJSON(externalStopReply(sessionID, interrupted))
 		return
 	}
 	requestedRunID := strings.TrimSpace(remoteString(msg, "run_id"))
@@ -2350,6 +2364,11 @@ func (m *agentAIManager) stop(msg map[string]interface{}, writeJSON agentTermina
 	}
 	if cancel != nil {
 		cancel()
+	} else if sourceSessionID != "" {
+		// Registered but idle: the previous agent-spawned turn already
+		// finished, so the turn being stopped may belong to the external TUI.
+		// Best-effort interrupt; the reply below is unchanged either way.
+		interruptExternalClaudeTurn(externalTUIHome(), sourceSessionID)
 	}
 	m.emitApprovalCancelled(runWrite, sessionID, cancelledApprovals, "run_cancelled")
 	_ = runWrite(map[string]interface{}{
@@ -7146,6 +7165,15 @@ func agentAIErrorPayload(sessionID string, messageID string, err error) map[stri
 	}
 	if messageID != "" {
 		payload["message_id"] = agentAssistantMessageID(messageID)
+	}
+	// Typed refusals carry a machine-readable code (e.g. tui_busy for a spawn
+	// refused by the external-TUI precheck) so the server can surface a
+	// precise reason instead of string-matching the message.
+	var coded interface{ ErrorCode() string }
+	if err != nil && errors.As(err, &coded) {
+		if code := coded.ErrorCode(); code != "" {
+			payload["error_code"] = code
+		}
 	}
 	return payload
 }
