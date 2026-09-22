@@ -25,7 +25,7 @@ func TestMergeQuickSetupJSON(t *testing.T) {
 	}
 	out, _ := json.Marshal(merged)
 	s := string(out)
-	for _, want := range []string{`"theme":"dark"`, `"fs"`, `"old"`, `"aliang/main"`, `"baseURL":"https://api.aliang.one/v1"`} {
+	for _, want := range []string{`"theme":"dark"`, `"fs"`, `"old"`, `"aliang/main"`, `"baseURL":"https://api.aliang.one/v1"`, `"https://opencode.ai/config.json"`, `"npm":"@g/aliang"`} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("missing %s in %s", want, s)
 		}
@@ -44,9 +44,12 @@ func TestMergeQuickSetupJSONPreservesAuthTokens(t *testing.T) {
 	if !strings.Contains(string(out), `"access_token":"at"`) {
 		t.Fatalf("tokens lost: %s", out)
 	}
+	if !strings.Contains(string(out), `"OPENAI_API_KEY":"sk-aliang"`) {
+		t.Fatalf("OPENAI_API_KEY not injected: %s", out)
+	}
 }
 
-func TestMergeQuickSetupJSONBrokenExisting(t *testing.T) {
+func TestMergeQuickSetupJSONNilExisting(t *testing.T) {
 	if _, ok := mergeQuickSetupJSONObjects(nil, mustJSON(t, `{"a":1}`)); !ok {
 		t.Fatal("nil existing should merge cleanly")
 	}
