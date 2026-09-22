@@ -67,7 +67,7 @@ func TestAuthHandlerBootstrapsLoopbackManagementSession(t *testing.T) {
 	}
 }
 
-func TestHandleAgentAuthRejectedGenerationRules(t *testing.T) {
+func TestHandleAgentAuthRejectedNotificationRules(t *testing.T) {
 	authority := auth.ResetSessionAuthorityForTest()
 	t.Cleanup(func() {
 		recoverOrExpireLocalSession = auth.RecoverOrExpireLocalSession
@@ -115,20 +115,71 @@ func TestHandleAgentAuthRejectedGenerationRules(t *testing.T) {
 		return envelope.Data.Applied, envelope.Data.Ignored
 	}
 
-	t.Run("stale generation ignored without recovery", func(t *testing.T) {
+	t.Run("cross-process generation mismatch applies despite stale copy", func(t *testing.T) {
+		// 跨进程语义回归（生产实证 2026-09-22 12:44 的反演）：agent 子进程的
+		// session authority 懒初始化把 generation 定格在 1 且 non-owner 从不
+		// publish；owner 每次登录/刷新 publish 时 +1。owner 若用 generation
+		// 等值门，agent 的 generation=1 通知被恒判 stale 丢弃，通知链
+		// dead-on-arrival。现契约：generation 仅是日志信息，Active 门+时间窗
+		// 承担防回退——陈旧代的真拒绝必须被应用。
 		recoverCalls = nil
+		resetApplyDedup()
 		loginActive()
-		staleGeneration := authority.Snapshot().Generation
-		loginActive() // bump generation: the agent's copy is now outdated
+		loginActive()
+		loginActive() // owner authority 已推到 generation ≥ 3
+		if gen := authority.Snapshot().Generation; gen < 3 {
+			t.Fatalf("owner generation = %d, want >= 3", gen)
+		}
 
-		rec := postNotification(fmt.Sprintf(`{"reason":"agent register 401","device_id":"dev-1","observed_at":%d,"generation":%d}`, time.Now().Unix(), staleGeneration))
+		rec := postNotification(fmt.Sprintf(`{"reason":"agent register 401","device_id":"dev-1","observed_at":%d,"generation":1}`, time.Now().Unix()))
 
 		if rec.Code != http.StatusOK {
 			t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
 		}
 		applied, ignored := decodeApplied(t, rec)
-		if applied || ignored != "stale_generation" {
-			t.Fatalf("applied=%v ignored=%q, want applied=false ignored=stale_generation; body=%s", applied, ignored, rec.Body.String())
+		if !applied || ignored != "" {
+			t.Fatalf("applied=%v ignored=%q, want applied=true without ignore reason; body=%s", applied, ignored, rec.Body.String())
+		}
+		if len(recoverCalls) != 1 || recoverCalls[0] != "agent register 401" {
+			t.Fatalf("recoverCalls = %v, want exactly [agent register 401]", recoverCalls)
+		}
+	})
+
+	t.Run("generation-carrying notification with inactive snapshot ignored", func(t *testing.T) {
+		recoverCalls = nil
+		// Fresh authority: StateRestoring — the owner never reached Active. The
+		// Active gate必须与通知是否携带 generation 无关地生效。
+		authority = auth.ResetSessionAuthorityForTest()
+
+		rec := postNotification(fmt.Sprintf(`{"reason":"agent register 401","device_id":"dev-1","observed_at":%d,"generation":1}`, time.Now().Unix()))
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+		}
+		applied, ignored := decodeApplied(t, rec)
+		if applied || ignored != "stale_notification" {
+			t.Fatalf("applied=%v ignored=%q, want applied=false ignored=stale_notification; body=%s", applied, ignored, rec.Body.String())
+		}
+		if len(recoverCalls) != 0 {
+			t.Fatalf("recoverCalls = %v, want none", recoverCalls)
+		}
+	})
+
+	t.Run("generation-carrying notification with stale observation ignored", func(t *testing.T) {
+		recoverCalls = nil
+		resetApplyDedup()
+		loginActive()
+		generation := authority.Snapshot().Generation
+		sixMinutesAgo := time.Now().Add(-6 * time.Minute).Unix()
+
+		rec := postNotification(fmt.Sprintf(`{"reason":"agent register 401","device_id":"dev-1","observed_at":%d,"generation":%d}`, sixMinutesAgo, generation))
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+		}
+		applied, ignored := decodeApplied(t, rec)
+		if applied || ignored != "stale_notification" {
+			t.Fatalf("applied=%v ignored=%q, want applied=false ignored=stale_notification; body=%s", applied, ignored, rec.Body.String())
 		}
 		if len(recoverCalls) != 0 {
 			t.Fatalf("recoverCalls = %v, want none", recoverCalls)

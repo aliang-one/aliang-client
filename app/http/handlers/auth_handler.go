@@ -71,11 +71,15 @@ type agentAuthRejectedRequest struct {
 	Reason     string `json:"reason"`
 	DeviceID   string `json:"device_id"`
 	ObservedAt int64  `json:"observed_at"` // unix seconds
-	Generation int64  `json:"generation"`  // 0 = agent could not read a generation
+	// Generation 是纯日志信息，不参与判定（跨进程语义不成立，见
+	// HandleAgentAuthRejected 的说明与 2026-09-22 生产实证）。
+	Generation int64 `json:"generation"` // 0 = agent could not read a generation
 }
 
-// agentAuthRejectedMaxObservationAge bounds how old a generation-less
-// notification may be before the owner discards it (design §4.4: ≤5 minutes).
+// agentAuthRejectedMaxObservationAge bounds how old a notification may be
+// before the owner discards it (design §4.4: ≤5 minutes; applies regardless
+// of the carried generation — that field is log-only, see
+// HandleAgentAuthRejected).
 const agentAuthRejectedMaxObservationAge = 5 * time.Minute
 
 // agentAuthRejectedApplyMinInterval is the minimum spacing between two
@@ -86,12 +90,29 @@ const agentAuthRejectedApplyMinInterval = 60 * time.Second
 
 // HandleAgentAuthRejected 接收 agent 进程上报的"凭据被远端拒绝"通知，
 // 触发 owner 侧 SoftExpired 恢复链（刷新成功→既有 handleAuthRefreshed 自动转发新会话；
-// 刷新 401 才落 refresh_invalid 真终态）。幂等/防回退规则见设计文档 §4.4：
-// 携带 generation（>0）的通知仅在仍是当前活跃代时应用；缺失 generation（==0）时
-// 仅在本地快照 Active 且观察时刻距今 ≤5 分钟时应用。迟到旧通知不得把新会话误标
-// SoftExpired。不设 dashboard 会话门槛：agent 子进程无 cookie，dashboard HTTP
-// 监听（loopback）即信任边界。但 `--host` 可将管理监听重绑到非 loopback 地址，
-// 届时本端点随整个 dashboard 暴露；60s 去重 + 恢复链单飞是仅有的滥用闸门。
+// 刷新 401 才落 refresh_invalid 真终态）。
+//
+// generation 字段自 2026-09 起是纯日志信息，不参与判定：跨进程语义不成立。
+// agent 子进程的 session authority 懒初始化把 Generation 定格在 1（见
+// processor/auth/session_authority.go 的 initialize），且 non-owner 从不
+// publish；owner 进程每次登录/刷新 publish 时 +1（≥2）。生产实证
+// 2026-09-22 12:44：owner 侧曾用 GenerationActive 等值门，把 agent 恒为 1 的
+// generation 通知一律判 stale_generation 丢弃，通知链 dead-on-arrival。
+//
+// 现行判定序（与携带 generation 与否无关）：
+//  1. 非法 body/时间戳 → 400；
+//  2. observed_at 为未来或距今 >5min → stale_notification（迟到通知）；
+//  3. owner 快照非 Active → stale_notification（恢复已在途/未登录）；
+//  4. 60s 去重窗口 → rate_limited；
+//  5. 应用恢复（applied=true）。
+//
+// 防回退论证：等值门移除后，跨进程迟到通知若在 owner 已刷新后才到达，代价
+// 只是一次经 arbiter 串行化的幂等恢复刷新（cache-hit 或 rotate 一次），换来
+// "转发凭据真被远端拒了"时的即时恢复——值得。Active 门+5min 时间窗+60s 去重
+// +恢复链幂等共同承担防回退。不设 dashboard 会话门槛：agent 子进程无
+// cookie，dashboard HTTP 监听（loopback）即信任边界。但 `--host` 可将管理
+// 监听重绑到非 loopback 地址，届时本端点随整个 dashboard 暴露；60s 去重 +
+// 恢复链单飞是仅有的滥用闸门。
 func (h *AuthHandler) HandleAgentAuthRejected(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
@@ -108,22 +129,19 @@ func (h *AuthHandler) HandleAgentAuthRejected(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	if req.Generation > 0 && !auth.GetSessionAuthority().GenerationActive(uint64(req.Generation)) {
-		logger.Warn(fmt.Sprintf("Ignored agent auth-rejected notification: stale generation %d (device %q)", req.Generation, req.DeviceID))
-		common.Success(w, map[string]interface{}{"applied": false, "ignored": "stale_generation"})
+	observedAge := time.Since(time.Unix(req.ObservedAt, 0))
+	// observedAge < 0（未来时间戳：时钟漂移或恶意构造）与超龄一样视为不
+	// 新鲜，不得绕过新鲜度门。
+	if observedAge < 0 || observedAge > agentAuthRejectedMaxObservationAge {
+		logger.Warn(fmt.Sprintf("Ignored agent auth-rejected notification: observed %.0fs ago (device %q, generation %d, reason %q)", observedAge.Seconds(), req.DeviceID, req.Generation, req.Reason))
+		common.Success(w, map[string]interface{}{"applied": false, "ignored": "stale_notification"})
 		return
 	}
 
-	if req.Generation == 0 {
-		snapshot := auth.GetSessionAuthority().Snapshot()
-		observedAge := time.Since(time.Unix(req.ObservedAt, 0))
-		// observedAge < 0（未来时间戳：时钟漂移或恶意构造）与超龄一样视为不
-		// 新鲜，不得绕过新鲜度门。
-		if snapshot.State != auth.StateActive || observedAge < 0 || observedAge > agentAuthRejectedMaxObservationAge {
-			logger.Warn(fmt.Sprintf("Ignored agent auth-rejected notification: state %s, observed %.0fs ago (device %q)", snapshot.State, observedAge.Seconds(), req.DeviceID))
-			common.Success(w, map[string]interface{}{"applied": false, "ignored": "stale_notification"})
-			return
-		}
+	if snapshot := auth.GetSessionAuthority().Snapshot(); snapshot.State != auth.StateActive {
+		logger.Warn(fmt.Sprintf("Ignored agent auth-rejected notification: state %s (device %q, generation %d, reason %q)", snapshot.State, req.DeviceID, req.Generation, req.Reason))
+		common.Success(w, map[string]interface{}{"applied": false, "ignored": "stale_notification"})
+		return
 	}
 
 	// 60s 最小间隔去重：通知风暴每个窗口最多放行一次恢复。刻意用先读后写而

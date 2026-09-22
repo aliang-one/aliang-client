@@ -18,7 +18,6 @@ import (
 	"aliang.one/nursorgate/app/http/services"
 	"aliang.one/nursorgate/common/logger"
 	"aliang.one/nursorgate/internal/runtimepath"
-	"aliang.one/nursorgate/processor/config"
 )
 
 const (
@@ -346,8 +345,8 @@ func userAgentEnv(env []string) []string {
 	// spawn 前确保本 owner 进程有自有的环回 notify 端点并回灌 override：
 	// 默认 dashboard 地址（56431）可能被其他进程占用，macOS/Windows 的
 	// tray/app owner 甚至不起 dashboard——届时 agent 的"凭据被拒"通知会打向
-	// 持有另一套会话权威的 dashboard（如 root core），被判 stale_generation
-	// 丢弃，恢复链永远不跑。见 ownernotify 包文档。
+	// 持有另一套会话权威的 dashboard（如 root core），恢复链操作的是别人的
+	// 会话，本 owner 的恢复链永远不跑。见 ownernotify 包文档。
 	ownernotify.EnsureServer()
 
 	blocked := map[string]bool{
@@ -377,10 +376,11 @@ func userAgentEnv(env []string) []string {
 // agent 子进程环境，供其上报"凭据被远端拒绝"（services.NotifyOwnerAuthRejected）。
 // 优先级：显式 override（services.SessionOwnerAddrOverride，管理面板默认端口
 // 被占用回退随机端口时由 http server 回灌真实监听地址）> 部署级 env
-// ALIANG_MANAGEMENT_ADDR > 默认 config.ManagementListenAddr()（反映 --host
-// 实际配置，默认值下即 127.0.0.1:56431）。env 覆盖用于管理监听与 agent
-// 所见地址不一致的场景（如 0.0.0.0 监听、跨址部署），约定 host:port 形式，
-// 容错处理带 scheme 的写法（统一按 http 重组）。
+// ALIANG_MANAGEMENT_ADDR > 默认 services.DefaultSessionOwnerAddr()（反映
+// --host 实际配置，默认值下即 127.0.0.1:56431；与 cmd.ensureUserAgentEnvironment
+// 的 agent 侧兜底共用）。env 覆盖用于管理监听与 agent 所见地址不一致的场景
+// （如 0.0.0.0 监听、跨址部署），约定 host:port 形式，容错处理带 scheme 的
+// 写法（统一按 http 重组）。
 func ownerBaseURL() string {
 	if override := services.SessionOwnerAddrOverride(); override != "" {
 		return override
@@ -391,7 +391,7 @@ func ownerBaseURL() string {
 	if addr != "" {
 		return "http://" + addr
 	}
-	return "http://" + config.ManagementListenAddr()
+	return services.DefaultSessionOwnerAddr()
 }
 
 func openAgentLogWriter() *rotatingLogWriter {

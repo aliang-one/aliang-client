@@ -5,9 +5,9 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"time"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
