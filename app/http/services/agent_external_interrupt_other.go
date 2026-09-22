@@ -10,3 +10,9 @@ import "errors"
 func defaultExternalInterrupt(pid int) error {
 	return errors.New("external interrupt is not supported on this platform")
 }
+
+// defaultExternalInterruptTargetMatches has no cheap identity probe on this
+// platform; permissive-by-default keeps the guard from degrading the feature.
+func defaultExternalInterruptTargetMatches(pid int) bool {
+	return true
+}

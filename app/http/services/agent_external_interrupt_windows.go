@@ -14,3 +14,10 @@ import "errors"
 func defaultExternalInterrupt(pid int) error {
 	return errors.New("external interrupt is not supported on this platform")
 }
+
+// defaultExternalInterruptTargetMatches cannot verify process identity
+// cheaply on Windows (no /proc, and the interrupt itself is unsupported
+// anyway); permissive-by-default keeps the guard from degrading the feature.
+func defaultExternalInterruptTargetMatches(pid int) bool {
+	return true
+}

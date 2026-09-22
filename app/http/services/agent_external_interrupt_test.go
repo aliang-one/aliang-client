@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 	"sync/atomic"
 	"testing"
 
@@ -31,17 +32,26 @@ func externalInterruptFixture(t *testing.T, sid string, pidRecord string) string
 }
 
 // stubExternalInterrupt swaps the injectable signal sender for a capturing
-// stub and restores the original on cleanup. Returns a pointer to the last
-// pid the stub saw (0 = never called); the stub responds with respondErr.
+// stub, forces the pid-identity check permissive, and resets the debounce
+// map — all restored on cleanup. Returns a pointer to the last pid the stub
+// saw (0 = never called); the stub responds with respondErr.
 func stubExternalInterrupt(t *testing.T, respondErr error) *atomic.Int64 {
 	t.Helper()
 	var lastPid atomic.Int64
-	previous := externalInterruptFunc
+	previousSignal := externalInterruptFunc
+	previousMatch := externalInterruptTargetMatches
 	externalInterruptFunc = func(pid int) error {
 		lastPid.Store(int64(pid))
 		return respondErr
 	}
-	t.Cleanup(func() { externalInterruptFunc = previous })
+	externalInterruptTargetMatches = func(pid int) bool { return true }
+	externalInterruptMu.Lock()
+	externalInterruptRecent = map[string]time.Time{}
+	externalInterruptMu.Unlock()
+	t.Cleanup(func() {
+		externalInterruptFunc = previousSignal
+		externalInterruptTargetMatches = previousMatch
+	})
 	return &lastPid
 }
 
@@ -53,8 +63,7 @@ func lastStubbedPid(ptr *atomic.Int64) int {
 }
 
 // statusReplies collects the ai.status payloads emitted through the capture
-// writer (mu may be nil — the capture writer's events are slice-appended under
-// its own mutex, and findAIEvents needs it).
+// writer (mu must be non-nil — findAIEvents locks it).
 func statusReplies(t *testing.T, mu *sync.Mutex, events *[]map[string]interface{}) []map[string]interface{} {
 	t.Helper()
 	return findAIEvents(mu, events, "ai.status")
@@ -139,6 +148,44 @@ func TestInterruptExternalClaudeTurnSignalError(t *testing.T) {
 	assert.Zero(t, pid)
 }
 
+// TestInterruptExternalClaudeTurnDebouncesRepeat: a second ai.stop for the
+// same native session inside the debounce window is idempotent success
+// WITHOUT re-signaling — two SIGINTs in quick succession are Claude Code's
+// double-Esc, which QUITS the whole TUI (contract: interrupt the turn, keep
+// the TUI open).
+func TestInterruptExternalClaudeTurnDebouncesRepeat(t *testing.T) {
+	const sid = "interrupt-debounce"
+	home := externalInterruptFixture(t, sid, livePidRecord(t, sid, `"status":"busy","entrypoint":"cli"`))
+	lastPid := stubExternalInterrupt(t, nil)
+
+	pid1, ok1 := interruptExternalClaudeTurn(home, sid)
+	pid2, ok2 := interruptExternalClaudeTurn(home, sid)
+
+	require.True(t, ok1)
+	require.True(t, ok2)
+	assert.Equal(t, os.Getpid(), lastStubbedPid(lastPid))
+	assert.Equal(t, os.Getpid(), pid1)
+	assert.Equal(t, os.Getpid(), pid2)
+}
+
+// TestInterruptExternalClaudeTurnTargetMismatch: the pid-reuse guard — when
+// the identity probe says the recycled pid is NOT a claude process, no signal
+// is delivered (an unrelated process must never be interrupted).
+func TestInterruptExternalClaudeTurnTargetMismatch(t *testing.T) {
+	const sid = "interrupt-mismatch"
+	home := externalInterruptFixture(t, sid, livePidRecord(t, sid, `"status":"busy"`))
+	lastPid := stubExternalInterrupt(t, nil)
+	previousMatch := externalInterruptTargetMatches
+	externalInterruptTargetMatches = func(pid int) bool { return false }
+	t.Cleanup(func() { externalInterruptTargetMatches = previousMatch })
+
+	pid, ok := interruptExternalClaudeTurn(home, sid)
+
+	assert.False(t, ok)
+	assert.Zero(t, lastStubbedPid(lastPid))
+	assert.Zero(t, pid)
+}
+
 // TestInterruptExternalClaudeTurnNoHome: empty home (agent cannot resolve the
 // desktop user's home) is a clean no-op.
 func TestInterruptExternalClaudeTurnNoHome(t *testing.T) {
@@ -207,8 +254,11 @@ func TestGuardExternalTUIClaudeSpawn(t *testing.T) {
 	t.Run("codex+busy→allowed", func(t *testing.T) {
 		assert.NoError(t, guardExternalTUIClaudeSpawn(home, "codex", sid))
 	})
-	t.Run("auto+busy→allowed", func(t *testing.T) {
-		assert.NoError(t, guardExternalTUIClaudeSpawn(home, "auto", sid))
+	t.Run("auto+busy→refused", func(t *testing.T) {
+		// "auto" is the default provider on ai.message and resolves to claude
+		// for imported sessions — the precheck must gate it too, or the race
+		// window stays open for provider-less messages.
+		assert.Error(t, guardExternalTUIClaudeSpawn(home, "auto", sid))
 	})
 	t.Run("empty resume→allowed", func(t *testing.T) {
 		assert.NoError(t, guardExternalTUIClaudeSpawn(home, "claude", ""))

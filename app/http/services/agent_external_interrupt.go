@@ -3,6 +3,8 @@ package services
 import (
 	"fmt"
 	"strings"
+	"sync"
+	"time"
 
 	"aliang.one/nursorgate/app/http/models"
 	"aliang.one/nursorgate/common/logger"
@@ -26,6 +28,31 @@ import (
 // install the default (unix: SIGINT via kill(2); windows/other: unsupported);
 // tests swap it to capture the pid and control the outcome.
 var externalInterruptFunc = defaultExternalInterrupt
+
+// externalInterruptTargetMatches is a best-effort identity check against pid
+// reuse: Claude Code prunes dead pid records "not always promptly", so a
+// stale record can name a pid the OS recycled for an unrelated process.
+// Platform files implement the default (unix: `ps -p <pid> -o comm=` must
+// mention "claude"; windows/other cannot verify cheaply and return true).
+// Verification failure is deliberately permissive (returns true) so a flaky
+// probe never degrades the feature; tests swap it to simulate a mismatch.
+var externalInterruptTargetMatches = defaultExternalInterruptTargetMatches
+
+// externalInterruptDebounce windows repeated SIGINTs for the same session:
+// Claude Code's double-Esc (two SIGINTs in quick succession) QUITS the whole
+// TUI, and this feature's contract is "interrupt the turn, keep the TUI
+// open". Repeated ai.stop deliveries (server retry after a lost reply, or a
+// second tap before the button greys out) must stay idempotent.
+const externalInterruptDebounce = 3 * time.Second
+
+// externalInterruptRecent caps the debounce map; entries are pruned
+// oldest-first once exceeded (native session ids are bounded in practice).
+const externalInterruptRecentCap = 256
+
+var (
+	externalInterruptMu     sync.Mutex
+	externalInterruptRecent = map[string]time.Time{}
+)
 
 // externalTUIBusyErrCode is the machine-readable code carried on the ai.error
 // payload when the spawn precheck refuses a run (see
@@ -74,6 +101,21 @@ func interruptExternalClaudeTurn(home, nativeSessionID string) (pid int, ok bool
 		logger.Info(fmt.Sprintf("ai.stop.external: pid record is stale home=%q native=%s pid=%d", home, nativeSessionID, record.PID))
 		return 0, false
 	}
+	// Best-effort identity check: a pruned-late pid record may name a recycled
+	// pid that now belongs to an unrelated process — never signal that.
+	if !externalInterruptTargetMatches(record.PID) {
+		logger.Info(fmt.Sprintf("ai.stop.external: pid identity mismatch, refusing to signal home=%q native=%s pid=%d", home, nativeSessionID, record.PID))
+		return 0, false
+	}
+	// Debounce: within the window a repeat delivery is treated as success
+	// without re-signaling (double-Esc would quit the whole TUI).
+	externalInterruptMu.Lock()
+	if last, seen := externalInterruptRecent[nativeSessionID]; seen && time.Since(last) < externalInterruptDebounce {
+		externalInterruptMu.Unlock()
+		logger.Info(fmt.Sprintf("ai.stop.external: debounced repeat within %s home=%q native=%s pid=%d", externalInterruptDebounce, home, nativeSessionID, record.PID))
+		return record.PID, true
+	}
+	externalInterruptMu.Unlock()
 	if externalInterruptFunc == nil {
 		return 0, false
 	}
@@ -81,6 +123,21 @@ func interruptExternalClaudeTurn(home, nativeSessionID string) (pid int, ok bool
 		logger.Info(fmt.Sprintf("ai.stop.external: signal failed home=%q native=%s pid=%d error=%v", home, nativeSessionID, record.PID, err))
 		return 0, false
 	}
+	externalInterruptMu.Lock()
+	if len(externalInterruptRecent) >= externalInterruptRecentCap {
+		oldestKey := ""
+		var oldest time.Time
+		for key, ts := range externalInterruptRecent {
+			if oldestKey == "" || ts.Before(oldest) {
+				oldestKey, oldest = key, ts
+			}
+		}
+		if oldestKey != "" {
+			delete(externalInterruptRecent, oldestKey)
+		}
+	}
+	externalInterruptRecent[nativeSessionID] = time.Now()
+	externalInterruptMu.Unlock()
 	logger.Info(fmt.Sprintf("ai.stop.external: SIGINT delivered (one Esc) home=%q native=%s pid=%d", home, nativeSessionID, record.PID))
 	return record.PID, true
 }
@@ -113,7 +170,11 @@ func externalTUIBusy(home, nativeSessionID string) bool {
 // spawns are never gated.
 func guardExternalTUIClaudeSpawn(home, provider, resumeSessionID string) error {
 	switch strings.TrimSpace(provider) {
-	case "claude", "claudecode":
+	// "auto" is included deliberately: it is the default provider on
+	// ai.message/ai.run.start and resolves to claude for imported sessions
+	// (which always carry a Claude resume id). A codex-resolving auto run
+	// never matches a ~/.claude/sessions pid record, so it is never gated.
+	case "claude", "claudecode", "auto":
 	default:
 		return nil
 	}
