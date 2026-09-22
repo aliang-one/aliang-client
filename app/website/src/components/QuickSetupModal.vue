@@ -240,7 +240,11 @@
             </div>
 
             <!-- 当前配置页签：磁盘实况查看器 + 一键恢复 -->
-            <QuickSetupStatePanel v-if="activeTab === 'state'" :software="selectedSoftware" />
+            <QuickSetupStatePanel
+              v-if="activeTab === 'state'"
+              :software="selectedSoftware"
+              @confirm-open-change="nestedDialogOpen = $event"
+            />
 
             <template v-else>
             <!-- Key selector -->
@@ -579,6 +583,8 @@ const statusMessage = ref('');
 // 右侧面板页签：'edit'=配置预览（key 选择 + 编辑/结果视图）| 'state'=当前配置（磁盘实况）。
 // 仅内置 software 显示页签（custom 无磁盘托管语义）；切 software 时重置为 edit。
 const activeTab = ref('edit');
+// StatePanel 嵌套确认弹窗打开或恢复进行中时为 true：外层 Esc 关闭被屏蔽，避免绕过确认守卫
+const nestedDialogOpen = ref(false);
 const softwares = ref([]);
 const apiKeys = ref([]);
 const selectedSoftware = ref('');
@@ -1061,6 +1067,10 @@ async function applyCurrentVariant() {
   }
 }
 function onModalKeydown(event) {
+  // 嵌套确认弹窗占用期（含恢复进行中）不响应外层 Esc，交由内层守卫处理
+  if (nestedDialogOpen.value) {
+    return;
+  }
   if (event.key === 'Escape' && props.open) {
     event.stopImmediatePropagation();
     emit('close');
@@ -1070,6 +1080,8 @@ watch(
   () => props.open,
   async (value) => {
     if (!value) {
+      // 双保险：StatePanel 卸载时会 emit false，这里确保弹窗关闭瞬间状态不残留
+      nestedDialogOpen.value = false;
       return;
     }
     await loadCatalog();

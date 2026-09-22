@@ -67,8 +67,9 @@
             >
               {{ t('qs_state_managed') }}
             </span>
+            <!-- absent 文件不渲染「未管理」徽标：不存在与未管理语义矛盾 -->
             <span
-              v-else
+              v-else-if="file.exists"
               class="inline-flex items-center rounded-md bg-slate-100 px-1.5 py-0.5 text-[10px] font-medium text-slate-500 dark:bg-slate-800 dark:text-slate-400"
             >
               {{ t('qs_state_unmanaged') }}
@@ -80,14 +81,21 @@
               v-if="file.exists && file.content"
               class="code-editor max-h-64 overflow-auto rounded-xl border border-slate-200 bg-slate-950 px-3.5 py-2.5 text-[12px] leading-6 text-slate-100 custom-scrollbar dark:border-slate-700"
             >{{ file.content }}</pre>
+            <!-- 后端语义：!exists=不存在；exists+size>0+无内容=超限或读失败（不再折叠成不存在）；exists+size=0=空文件 -->
             <p
-              v-else-if="file.exists && !Number(file.size)"
+              v-else-if="!file.exists"
               class="text-[12px] italic text-slate-400 dark:text-slate-500"
             >
-              {{ t('qs_state_empty_file') }}
+              {{ t('qs_state_absent') }}
+            </p>
+            <p
+              v-else-if="Number(file.size)"
+              class="text-[12px] italic text-slate-400 dark:text-slate-500"
+            >
+              {{ t('qs_state_too_large') }}
             </p>
             <p v-else class="text-[12px] italic text-slate-400 dark:text-slate-500">
-              {{ t('qs_state_absent') }}
+              {{ t('qs_state_empty_file') }}
             </p>
           </div>
         </div>
@@ -123,7 +131,7 @@
               {{ backup.original_path }}
             </code>
             <span class="inline-flex items-center rounded-md bg-slate-100 px-1.5 py-0.5 text-[10px] font-medium text-slate-500 dark:bg-slate-800 dark:text-slate-400">
-              {{ backup.kind }}
+              {{ formatBackupKind(backup.kind) }}
             </span>
             <span v-if="formatTime(backup.backed_up_at)" class="text-[11px] text-slate-400 dark:text-slate-500">
               {{ formatTime(backup.backed_up_at) }}
@@ -226,6 +234,8 @@ const props = defineProps({
     required: true,
   },
 });
+// 嵌套确认弹窗占用期（打开或恢复进行中）通知宿主 Modal，屏蔽外层 Esc 关闭
+const emit = defineEmits(['confirm-open-change']);
 const { t } = useI18n();
 
 // 后端 QuickSetupConfigStateResponse（snake_case）：
@@ -240,6 +250,8 @@ const restoreSuccess = ref(false);
 const restoreFailures = ref([]);
 const restoreError = ref('');
 
+// 卸载守卫：unmount 后确认/恢复流程不再写 ref（孤儿更新）；loadSeq 同步失效在途请求
+let disposed = false;
 // load 竞态守卫：software 快速切换时只允许最后一次请求提交结果
 let loadSeq = 0;
 async function load() {
@@ -295,6 +307,9 @@ async function confirmRestore() {
   try {
     // 单文件失败不抛错（HTTP 200 + failed 数组）；整体失败（如 manifest 损坏）才走 catch
     const result = await restoreConfig(props.software);
+    if (disposed) {
+      return;
+    }
     showConfirm.value = false;
     const failed = Array.isArray(result?.failed) ? result.failed : [];
     if (failed.length) {
@@ -305,10 +320,18 @@ async function confirmRestore() {
       restoreSuccess.value = true;
     }
     await load();
+    if (disposed) {
+      return;
+    }
   } catch (error) {
+    if (disposed) {
+      return;
+    }
     showConfirm.value = false;
     restoreSuccess.value = false;
-    restoreError.value = error instanceof Error && error.message ? error.message : t('qs_restore_failed');
+    // 优先展示具体错误信息（rawRequest 恒抛带 message 的 Error）；
+    // 无 message 才回落通用文案，避免「部分文件恢复失败」误用于整体失败语义
+    restoreError.value = error?.message || t('qs_restore_failed');
   } finally {
     restoring.value = false;
   }
@@ -361,6 +384,21 @@ function fileMeta(file) {
   return parts.join(' · ');
 }
 
+// 备份种类徽标：已知 kind 走 i18n，未知 kind 回落原值
+const backupKindLabelKeys = {
+  original: 'qs_backup_kind_original',
+};
+function formatBackupKind(kind) {
+  const key = backupKindLabelKeys[kind];
+  return key ? t(key) : kind;
+}
+
+// 确认弹窗打开或恢复进行中都视为嵌套弹窗占用期，宿主 Modal 据此屏蔽 Esc 关闭
+const confirmOverlayActive = computed(() => showConfirm.value || restoring.value);
+watch(confirmOverlayActive, (value) => {
+  emit('confirm-open-change', value);
+});
+
 watch(
   () => props.software,
   () => {
@@ -371,6 +409,8 @@ watch(
   { immediate: true },
 );
 onUnmounted(() => {
+  disposed = true;
   loadSeq += 1;
+  emit('confirm-open-change', false);
 });
 </script>
