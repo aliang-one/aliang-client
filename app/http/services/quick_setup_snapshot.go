@@ -101,6 +101,31 @@ func (s *QuickSetupService) ConfigState(softwareCode string) (models.QuickSetupC
 	return resp, nil
 }
 
+// Restore 按 software 整体还原原始配置（spec §6.3-3/§8）。
+// 与 Apply 互斥：全程持有 quickSetupApplyMu，防止与 apply 的备份/写入交错破坏 manifest。
+func (s *QuickSetupService) Restore(softwareCode string) (models.QuickSetupRestoreResponse, error) {
+	software := strings.ToLower(strings.TrimSpace(softwareCode))
+	if software == "" {
+		return models.QuickSetupRestoreResponse{}, errors.New("software is required")
+	}
+	softwareDef, ok := findQuickSetupSoftware(software)
+	if !ok {
+		return models.QuickSetupRestoreResponse{}, fmt.Errorf("software is not valid: %s", software)
+	}
+	if strings.TrimSpace(quickSetupAuthorizationHeaderFn()) == "" {
+		return models.QuickSetupRestoreResponse{}, ErrQuickSetupUnauthenticated
+	}
+	targetUser, err := quickSetupTargetUserFn()
+	if err != nil {
+		return models.QuickSetupRestoreResponse{}, fmt.Errorf("resolve quick setup user: %w", err)
+	}
+
+	quickSetupApplyMu.Lock()
+	defer quickSetupApplyMu.Unlock()
+
+	return restoreQuickSetupSoftware(targetUser, softwareDef.Code)
+}
+
 // quickSetupSnapshotFileContent 读取单个托管配置文件的内容快照（ConfigState 循环
 // 与 codex auth 跟随判定共用）：路径解析失败、非普通文件、超过
 // quickSetupMaxApplyFileBytes 或读盘失败一律返回空串——内容为空的 managed 判定走

@@ -117,6 +117,10 @@ type QuickSetupBackupInfo struct {
 	ExistedBefore bool   `json:"existed_before"`
 }
 
+type QuickSetupRestoreRequest struct {
+	Software string `json:"software"`
+}
+
 type QuickSetupRestoreFailure struct {
 	Path  string `json:"path"`
 	Error string `json:"error"`

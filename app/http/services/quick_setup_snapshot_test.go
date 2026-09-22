@@ -2,6 +2,7 @@ package services
 
 import (
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -206,6 +207,88 @@ func TestConfigStateManagedByAliangOpenCode(t *testing.T) {
 				t.Fatalf("managed = %v, want %v; file: %+v", got, tc.managed, state.Files[0])
 			}
 		})
+	}
+}
+
+// TestRestoreService 端到端服务层路径（spec §6.3-3）：apply 前备份 → 磁盘被我们覆写 →
+// Restore 整体还原（existed_before=true 复制回去；false 删除）并清空 manifest 条目。
+func TestRestoreService(t *testing.T) {
+	home := t.TempDir()
+	// 预置 ~/.codex/config.toml = "user original"，auth.json 不存在
+	writeBackupFixture(t, home, ".codex/config.toml", "user original")
+	// 构造 prepared 并调 backupQuickSetupFiles（Task 4 helper）生成 manifest + 备份文件
+	files := []quickSetupPreparedFile{
+		{code: "config", path: filepath.Join(home, ".codex/config.toml"), content: "aliang"},
+		{code: "auth", path: filepath.Join(home, ".codex/auth.json"), content: `{"aliang":true}`},
+	}
+	if _, err := backupQuickSetupFiles(quickSetupTargetUser{homeDir: home}, "codex", files); err != nil {
+		t.Fatal(err)
+	}
+	// 模拟「已被我们配置过」：config.toml 覆写为 aliang 内容，auth.json 由我们写入
+	writeBackupFixture(t, home, ".codex/config.toml", "[model_providers.aliang]\nname = \"Aliang Gateway\"\n")
+	writeBackupFixture(t, home, ".codex/auth.json", `{"OPENAI_API_KEY":"aliang"}`)
+	// 钩子注入 targetUser + auth header
+	stubConfigStateEnv(t, home)
+
+	res, err := (&QuickSetupService{}).Restore("codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// config.toml 回到 "user original"
+	got, readErr := os.ReadFile(filepath.Join(home, ".codex/config.toml"))
+	if readErr != nil || string(got) != "user original" {
+		t.Fatalf("config.toml = %q, err = %v; want user original", string(got), readErr)
+	}
+	// auth.json 不存在（existed_before=false → 删除）
+	if _, statErr := os.Stat(filepath.Join(home, ".codex/auth.json")); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("auth.json must be removed; stat err = %v", statErr)
+	}
+	// res.Restored 含 config、res.Deleted 含 auth（contract 路径形式）
+	if len(res.Restored) != 1 || res.Restored[0] != "~/.codex/config.toml" {
+		t.Fatalf("restored = %v, want [~/.codex/config.toml]", res.Restored)
+	}
+	if len(res.Deleted) != 1 || res.Deleted[0] != "~/.codex/auth.json" {
+		t.Fatalf("deleted = %v, want [~/.codex/auth.json]", res.Deleted)
+	}
+	if len(res.Failed) != 0 {
+		t.Fatalf("failed must be empty: %+v", res.Failed)
+	}
+	// manifest 条目已清（loadQuickSetupManifest → Backups 为空）
+	m, manifestErr := loadQuickSetupManifest(home)
+	if manifestErr != nil {
+		t.Fatal(manifestErr)
+	}
+	if len(m.Backups) != 0 {
+		t.Fatalf("manifest backups must be empty after restore: %+v", m.Backups)
+	}
+	// 备份文件本体已随之删除
+	entries, walkErr := os.ReadDir(filepath.Join(home, ".aliang", "quick-setup", "backups", "codex"))
+	if walkErr != nil || len(entries) != 0 {
+		t.Fatalf("backup files must be removed; entries = %v, err = %v", entries, walkErr)
+	}
+}
+
+func TestRestoreUnauthenticated(t *testing.T) {
+	previousAuth := quickSetupAuthorizationHeaderFn
+	quickSetupAuthorizationHeaderFn = func() string { return "" }
+	t.Cleanup(func() { quickSetupAuthorizationHeaderFn = previousAuth })
+
+	_, err := (&QuickSetupService{}).Restore("codex")
+	if !errors.Is(err, ErrQuickSetupUnauthenticated) {
+		t.Fatalf("err = %v, want ErrQuickSetupUnauthenticated", err)
+	}
+}
+
+func TestRestoreUnknownSoftware(t *testing.T) {
+	home := t.TempDir()
+	stubConfigStateEnv(t, home)
+
+	_, err := (&QuickSetupService{}).Restore("bogus")
+	if err == nil {
+		t.Fatal("unknown software must error")
+	}
+	if !strings.Contains(err.Error(), "bogus") {
+		t.Fatalf("error must name the software: %v", err)
 	}
 }
 

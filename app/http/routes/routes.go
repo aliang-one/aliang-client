@@ -251,6 +251,7 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	register("/api/quick-setup/render", h.QuickSetup.HandleRender, http.MethodPost)
 	register("/api/quick-setup/apply", h.QuickSetup.HandleApply, http.MethodPost)
 	register("/api/quick-setup/config-state", h.QuickSetup.HandleConfigState, http.MethodGet)
+	register("/api/quick-setup/restore", h.QuickSetup.HandleRestore, http.MethodPost)
 
 	// User agent routes (/api/agent/*)
 	register("/api/agent/status", h.Agent.HandleStatus, http.MethodGet)

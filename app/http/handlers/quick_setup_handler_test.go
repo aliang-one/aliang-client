@@ -49,6 +49,7 @@ func TestQuickSetupHandlerRequiresDashboardSessionForEveryEndpoint(t *testing.T)
 		{name: "render", method: http.MethodPost, path: "/api/quick-setup/render", handle: handler.HandleRender},
 		{name: "apply", method: http.MethodPost, path: "/api/quick-setup/apply", handle: handler.HandleApply},
 		{name: "config-state", method: http.MethodGet, path: "/api/quick-setup/config-state", handle: handler.HandleConfigState},
+		{name: "restore", method: http.MethodPost, path: "/api/quick-setup/restore", handle: handler.HandleRestore},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -59,6 +60,40 @@ func TestQuickSetupHandlerRequiresDashboardSessionForEveryEndpoint(t *testing.T)
 				t.Fatalf("status = %d, want 401; body=%s", rec.Code, rec.Body.String())
 			}
 		})
+	}
+}
+
+// TestQuickSetupHandlerRestoreRejectsOversizedRequestBeforeDecode 镜像 apply 的
+// 认证用例（镜像现有 handler 测试模式）：MaxBytesReader 必须在 decode 前生效。
+func TestQuickSetupHandlerRestoreRejectsOversizedRequestBeforeDecode(t *testing.T) {
+	body := `{"software":"` + strings.Repeat("a", quickSetupRequestMaxBytes) + `"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/quick-setup/restore", strings.NewReader(body))
+	req.AddCookie(issueQuickSetupTestSession(t))
+	rec := httptest.NewRecorder()
+
+	NewQuickSetupHandler().HandleRestore(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "request body too large") {
+		t.Fatalf("body = %s, want request size error", rec.Body.String())
+	}
+}
+
+// TestQuickSetupHandlerRestoreRequiresSoftware 认证会话下空 software → 400。
+func TestQuickSetupHandlerRestoreRequiresSoftware(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/api/quick-setup/restore", strings.NewReader(`{"software":"  "}`))
+	req.AddCookie(issueQuickSetupTestSession(t))
+	rec := httptest.NewRecorder()
+
+	NewQuickSetupHandler().HandleRestore(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "software is required") {
+		t.Fatalf("body = %s, want software required error", rec.Body.String())
 	}
 }
 
