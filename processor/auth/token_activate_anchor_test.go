@@ -37,3 +37,29 @@ func TestAuthTokenEnvelopeUpstreamExpiresInWire(t *testing.T) {
 		t.Fatalf("expires_in: got %d, want 86400", envelope.Data.ExpiresIn)
 	}
 }
+
+// TestScanStatusResultUpstreamExpiresInWire 扫码登录路径的同名防线：official-website 在
+// authorized 状态响应顶层下发 upstream_expires_in；tag 拼错则恒为 0，激活时静默回退 24h
+// 常量（2026-09-20 事故残余窗口照旧），故对 wire 格式反序列化直接断言。
+func TestScanStatusResultUpstreamExpiresInWire(t *testing.T) {
+	var res ScanStatusResult
+	body := []byte(`{"status":"authorized","expires_in":299,"interval":2,"session_token":"st_x","refresh_token":"st_x","upstream_expires_in":10800,"user":{"id":1,"email":"a@b.c","name":"A","role":"user"}}`)
+	if err := json.Unmarshal(body, &res); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if res.UpstreamExpiresIn != 10800 {
+		t.Fatalf("upstream_expires_in tag broken: got %d, want 10800", res.UpstreamExpiresIn)
+	}
+	if res.SessionToken != "st_x" || res.Status != "authorized" || res.User == nil || res.User.ID != 1 {
+		t.Fatalf("adjacent fields degraded: %+v", res)
+	}
+
+	// 旧服务端不下发该键：解析成功且为 0（→ 激活时回退常量，行为兼容）。
+	var legacy ScanStatusResult
+	if err := json.Unmarshal([]byte(`{"status":"pending","expires_in":299,"interval":2}`), &legacy); err != nil {
+		t.Fatalf("unmarshal legacy: %v", err)
+	}
+	if legacy.UpstreamExpiresIn != 0 {
+		t.Fatalf("legacy server must parse as 0, got %d", legacy.UpstreamExpiresIn)
+	}
+}

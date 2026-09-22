@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { AuthRequestError, restoreSession } from './authApi';
+import { activateScanLogin, AuthRequestError, restoreSession } from './authApi';
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -56,5 +56,60 @@ describe('auth API error classification', () => {
         code: 'session_invalid'
       });
     }
+  });
+});
+
+describe('activateScanLogin request body', () => {
+  function requestBody() {
+    const [, options] = fetch.mock.calls[0];
+    return JSON.parse(options.body);
+  }
+
+  it('includes upstream_expires_in when a finite positive value is provided', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(response(200, { code: 0 })));
+
+    await activateScanLogin({
+      sessionToken: 'session-token',
+      refreshToken: 'refresh-token',
+      upstreamExpiresIn: 10800
+    });
+
+    expect(requestBody()).toEqual({
+      session_token: 'session-token',
+      refresh_token: 'refresh-token',
+      upstream_expires_in: 10800
+    });
+  });
+
+  it('omits upstream_expires_in when it is undefined', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(response(200, { code: 0 })));
+
+    await activateScanLogin({
+      sessionToken: 'session-token',
+      refreshToken: 'refresh-token',
+      upstreamExpiresIn: undefined
+    });
+
+    expect(requestBody()).toEqual({
+      session_token: 'session-token',
+      refresh_token: 'refresh-token'
+    });
+    expect(requestBody()).not.toHaveProperty('upstream_expires_in');
+  });
+
+  it('omits upstream_expires_in when it is not a number', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(response(200, { code: 0 })));
+
+    await activateScanLogin({
+      sessionToken: 'session-token',
+      refreshToken: 'refresh-token',
+      upstreamExpiresIn: 'abc'
+    });
+
+    expect(requestBody()).toEqual({
+      session_token: 'session-token',
+      refresh_token: 'refresh-token'
+    });
+    expect(requestBody()).not.toHaveProperty('upstream_expires_in');
   });
 });

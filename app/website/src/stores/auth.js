@@ -167,13 +167,13 @@ export async function loginWithPassword(credentials) {
   }
 }
 
-export async function completeScanLogin({ sessionToken, refreshToken }) {
+export async function completeScanLogin({ sessionToken, refreshToken, upstreamExpiresIn }) {
   const { t } = useI18n();
   state.loginPending = true;
   state.loginError = '';
   state.lastActionMessage = '';
   try {
-    const result = await activateScanLoginRequest({ sessionToken, refreshToken });
+    const result = await activateScanLoginRequest({ sessionToken, refreshToken, upstreamExpiresIn });
     if (result.status !== 'success') throw new Error(result.message || t('auth_loginFailed'));
     await reconcileAfterAuthCommand();
     if (!state.isAuthenticated) throw new Error(t('auth_loginFailed'));

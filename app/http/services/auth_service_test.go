@@ -318,7 +318,7 @@ func TestAgentSyncResult_DoesNotBlockOnSync(t *testing.T) {
 }
 
 func TestAuthServiceActivateScanLogin_RejectsMissingRefreshToken(t *testing.T) {
-	result := NewAuthService().ActivateScanLogin("scan-session-token", " ")
+	result := NewAuthService().ActivateScanLogin("scan-session-token", " ", 0)
 
 	if got := result["status"]; got != "failed" {
 		t.Fatalf("status = %#v, want failed", got)

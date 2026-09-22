@@ -439,7 +439,7 @@ func TestRefreshSession_RenewsAccessTokenAndRetainsRefreshTokenWhenOmitted(t *te
 }
 
 func TestActivateWithTokensRejectsMissingRefreshToken(t *testing.T) {
-	userInfo, err := ActivateWithTokens("scan-access-token", " ")
+	userInfo, err := ActivateWithTokens("scan-access-token", " ", 0)
 	if err == nil {
 		t.Fatal("ActivateWithTokens() error = nil, want refresh token error")
 	}

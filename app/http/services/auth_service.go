@@ -260,7 +260,9 @@ func (s *AuthService) ScanStatus(deviceCode string) map[string]interface{} {
 
 // ActivateScanLogin 用扫码拿到的本地 session 兼容字段完成登录，
 // 返回结构与密码登录 Login 一致（data 为 UserInfoResponse、附带 agent_sync）。
-func (s *AuthService) ActivateScanLogin(sessionToken, refreshToken string) map[string]interface{} {
+// upstreamExpiresIn 由前端从扫码 status 响应原样透传（上游 access JWT 真实剩余秒数），
+// 用于锚定刷新计时；0/负值时回退客户端 24h 常量。
+func (s *AuthService) ActivateScanLogin(sessionToken, refreshToken string, upstreamExpiresIn int) map[string]interface{} {
 	sessionToken = strings.TrimSpace(sessionToken)
 	refreshToken = strings.TrimSpace(refreshToken)
 	if sessionToken == "" {
@@ -278,7 +280,7 @@ func (s *AuthService) ActivateScanLogin(sessionToken, refreshToken string) map[s
 		}
 	}
 
-	userInfo, err := auth.ActivateWithTokens(sessionToken, refreshToken)
+	userInfo, err := auth.ActivateWithTokens(sessionToken, refreshToken, upstreamExpiresIn)
 	if err != nil {
 		logger.Error(fmt.Sprintf("Scan login activation failed: %v", err))
 		return map[string]interface{}{

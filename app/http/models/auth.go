@@ -14,11 +14,14 @@ type LogoutRequest struct {
 	RefreshToken string `json:"refresh_token,omitempty"`
 }
 
-// ScanActivateRequest 扫码登录激活请求。两个字段都属于 official-website
-// 的本地 session 契约，不包含 sub2api 上游凭证。
+// ScanActivateRequest 扫码登录激活请求。token 两字段都属于 official-website
+// 的本地 session 契约，不包含 sub2api 上游凭证；upstream_expires_in 是扫码
+// status 响应原样透传的上游 access JWT 剩余秒数（旧前端不发送 → 0 → 回退常量）。
 type ScanActivateRequest struct {
 	SessionToken string `json:"session_token,omitempty"`
 	RefreshToken string `json:"refresh_token,omitempty"`
+	// UpstreamExpiresIn 上游 sub2api access JWT 真实剩余秒数，作刷新计时锚点。
+	UpstreamExpiresIn int `json:"upstream_expires_in,omitempty"`
 }
 
 // UserInfoResponse 用户信息响应
