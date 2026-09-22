@@ -2,45 +2,79 @@ package services
 
 import (
 	"encoding/json"
-	"path/filepath"
 	"testing"
+
+	"aliang.one/nursorgate/app/http/models"
 )
 
 func TestRenderClaudeSettingsEnv(t *testing.T) {
-	content := renderClaudeSettingsEnv("sk-aliang", "claude-sonnet-4-5-20250929", "https://api.aliang.one")
-	var parsed struct {
-		Env map[string]string `json:"env"`
+	payload := renderClaudeSettingsEnv("sk-aliang", "claude-sonnet-4-5-20250929", "https://api.aliang.one")
+	env, ok := payload["env"].(map[string]string)
+	if !ok {
+		t.Fatalf("env block missing: %#v", payload)
 	}
-	if err := json.Unmarshal([]byte(content), &parsed); err != nil {
-		t.Fatal(err)
+	if env["ANTHROPIC_BASE_URL"] != "https://api.aliang.one" {
+		t.Fatalf("base url: %v", env)
 	}
-	if parsed.Env["ANTHROPIC_BASE_URL"] != "https://api.aliang.one" {
-		t.Fatalf("base url: %v", parsed.Env)
-	}
-	if parsed.Env["ANTHROPIC_AUTH_TOKEN"] != "sk-aliang" {
+	if env["ANTHROPIC_AUTH_TOKEN"] != "sk-aliang" {
 		t.Fatal("auth token missing")
 	}
-	if _, has := parsed.Env["ANTHROPIC_API_KEY"]; has {
+	if _, has := env["ANTHROPIC_API_KEY"]; has {
 		t.Fatal("must use AUTH_TOKEN, not API_KEY")
 	}
-	if parsed.Env["ANTHROPIC_MODEL"] != "claude-sonnet-4-5-20250929" {
+	if env["ANTHROPIC_MODEL"] != "claude-sonnet-4-5-20250929" {
 		t.Fatal("model missing")
 	}
 }
 
-func TestQuickSetupSoftwares_ClaudeUsesSettingsJSON(t *testing.T) {
-	sw, ok := findQuickSetupSoftware("claude-code")
+func TestRenderClaudeCodeFiles(t *testing.T) {
+	softwareDef, ok := findQuickSetupSoftware("claude-code")
 	if !ok {
-		t.Fatal("claude-code missing")
+		t.Fatal("claude-code missing from catalog")
 	}
-	if len(sw.Files) != 1 || sw.Files[0].DefaultPath != "~/.claude/settings.json" || sw.Files[0].Format != "json" {
-		t.Fatalf("unexpected files %+v", sw.Files)
+	apiKey := models.QuickSetupAPIKey{Key: "sk-test", Provider: "anthropic"}
+
+	cases := []struct {
+		name    string
+		apiRoot string
+	}{
+		{name: "inference root", apiRoot: "https://api.aliang.one"},
+		{name: "api root with /v1 suffix", apiRoot: "https://api.aliang.one/v1"},
 	}
-	root, err := quickSetupAllowedRoot("claude-code", "/home/u")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if root != filepath.Join("/home/u", ".claude") {
-		t.Fatalf("allowed root: %s", root)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			files, notes, err := renderClaudeCodeFiles(softwareDef, apiKey, tc.apiRoot)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(files) != 1 {
+				t.Fatalf("want a single file, got %d", len(files))
+			}
+			file := files[0]
+			if file.Code != "settings" {
+				t.Fatalf("code: %s", file.Code)
+			}
+			if file.Format != "json" {
+				t.Fatalf("format: %s", file.Format)
+			}
+			if file.Path != "~/.claude/settings.json" {
+				t.Fatalf("path: %s", file.Path)
+			}
+			var parsed struct {
+				Env map[string]string `json:"env"`
+			}
+			if err := json.Unmarshal([]byte(file.Content), &parsed); err != nil {
+				t.Fatal(err)
+			}
+			if parsed.Env["ANTHROPIC_BASE_URL"] != "https://api.aliang.one" {
+				t.Fatalf("base url must not carry /v1: %v", parsed.Env)
+			}
+			if parsed.Env["ANTHROPIC_AUTH_TOKEN"] != "sk-test" {
+				t.Fatalf("auth token missing: %v", parsed.Env)
+			}
+			if len(notes) == 0 {
+				t.Fatal("notes must not be empty")
+			}
+		})
 	}
 }

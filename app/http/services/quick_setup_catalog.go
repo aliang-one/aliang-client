@@ -76,7 +76,7 @@ func quickSetupSoftwares() []models.QuickSetupSoftware {
 		{
 			Code:               "claude-code",
 			Name:               "Claude Code",
-			Description:        "Write the Aliang gateway into the env block of your Claude Code user settings, keeping other settings intact.",
+			Description:        "Writes the Aliang gateway into the Claude Code env settings block.",
 			SupportedProviders: []string{"anthropic"},
 			Files: []models.QuickSetupSoftwareFile{
 				{
@@ -86,7 +86,7 @@ func quickSetupSoftwares() []models.QuickSetupSoftware {
 					DefaultPath: "~/.claude/settings.json",
 					Format:      "json",
 					Kind:        "file",
-					Description: "Claude Code user settings; the gateway env block is merged in while other settings are preserved.",
+					Description: "Claude Code user settings; carries the gateway env block.",
 				},
 			},
 		},

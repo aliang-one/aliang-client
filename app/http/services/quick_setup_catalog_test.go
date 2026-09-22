@@ -55,6 +55,23 @@ func TestDetectQuickSetupInstalled(t *testing.T) {
 	})
 }
 
+func TestQuickSetupSoftwares_ClaudeUsesSettingsJSON(t *testing.T) {
+	sw, ok := findQuickSetupSoftware("claude-code")
+	if !ok {
+		t.Fatal("claude-code missing")
+	}
+	if len(sw.Files) != 1 || sw.Files[0].DefaultPath != "~/.claude/settings.json" || sw.Files[0].Format != "json" {
+		t.Fatalf("unexpected files %+v", sw.Files)
+	}
+	root, err := quickSetupAllowedRoot("claude-code", "/home/u")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if root != filepath.Join("/home/u", ".claude") {
+		t.Fatalf("allowed root: %s", root)
+	}
+}
+
 func TestCatalogMarksInstalled(t *testing.T) {
 	home := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(home, ".claude"), 0o700); err != nil {

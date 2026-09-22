@@ -705,36 +705,38 @@ func renderCodexFiles(software models.QuickSetupSoftware, apiKey models.QuickSet
 	return files, notes, nil
 }
 
-// renderClaudeSettingsEnv 生成 settings.json 的 env 块模板载荷（Task 9 将把它深合并进
-// 用户磁盘上的 settings.json）。用 ANTHROPIC_AUTH_TOKEN（Bearer 语义，与 agent 运行链路
-// 的 env 继承一致），不用 ANTHROPIC_API_KEY；baseURL 不带 /v1（Claude Code 自行追加
-// /v1/messages——相对旧 env.sh 渲染器是行为变更，spec §7.1）。
-func renderClaudeSettingsEnv(apiKey, model, baseURLNoV1 string) string {
-	payload := map[string]interface{}{
+// renderClaudeSettingsEnv 生成 settings.json 的 env 块载荷（Task 9 将把它深合并进
+// 用户磁盘上的 settings.json）。每次调用都新建 map 返回，深合并时子 map 不与其他
+// 调用共享引用（规避 mergeQuickSetupJSONInto 的子 map 引用共享契约）。
+// 用 ANTHROPIC_AUTH_TOKEN（Bearer 语义），不用 ANTHROPIC_API_KEY；baseURL 不带 /v1
+// （Claude Code 自行追加 /v1/messages——相对旧 env.sh 渲染器是行为变更，spec §7.1）。
+func renderClaudeSettingsEnv(apiKey, model, baseURLNoV1 string) map[string]interface{} {
+	return map[string]interface{}{
 		"env": map[string]string{
 			"ANTHROPIC_BASE_URL":   baseURLNoV1,
 			"ANTHROPIC_AUTH_TOKEN": apiKey,
 			"ANTHROPIC_MODEL":      model,
 		},
 	}
-	raw, err := json.MarshalIndent(payload, "", "  ")
-	if err != nil {
-		return "{}"
-	}
-	return string(raw)
 }
 
 func renderClaudeCodeFiles(software models.QuickSetupSoftware, apiKey models.QuickSetupAPIKey, apiRoot string) ([]models.QuickSetupPreviewFile, []string, error) {
 	fileDef := software.Files[0]
 	model := quickSetupDefaultModel(apiKey.Provider, false)
 	// apiRoot 已是推理面根（不带 /v1）；再过一次 resolve 保证即使上层传入控制面
-	// URL 也落在推理面。Claude Code 自行追加 /v1/messages，这里不能带 /v1。
-	baseURL := resolveQuickSetupInferenceBaseURL(apiRoot)
-	content := renderClaudeSettingsEnv(apiKey.Key, model, baseURL)
+	// URL 也落在推理面。Claude Code 自行追加 /v1/messages，这里不能带 /v1；
+	// TrimSuffix 兜底剥掉配置尾缀的 /v1（只剥一次且只剥结尾），避免 /v1/v1/messages。
+	baseURL := strings.TrimSuffix(resolveQuickSetupInferenceBaseURL(apiRoot), "/v1")
+	payload := renderClaudeSettingsEnv(apiKey.Key, model, baseURL)
+	raw, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		return nil, nil, err
+	}
+	content := string(raw)
 
 	notes := []string{
 		"The gateway env block is written into your Claude Code settings.json, taking effect on the next Claude Code start.",
-		"ANTHROPIC_AUTH_TOKEN carries Bearer-style auth, matching the agent runtime environment; other settings in settings.json are preserved.",
+		"Uses ANTHROPIC_AUTH_TOKEN (Bearer auth) rather than ANTHROPIC_API_KEY.",
 	}
 	if apiKey.Masked {
 		notes = append(notes, "This API key looks masked. Replace it with the plaintext value before applying.")
