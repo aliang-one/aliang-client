@@ -74,3 +74,16 @@ export async function applyQuickSetup(software, files) {
     }),
   });
 }
+
+export async function fetchConfigState(software) {
+  return rawRequest(`/api/quick-setup/config-state?software=${encodeURIComponent(software)}`, {
+    method: 'GET',
+  });
+}
+
+export async function restoreConfig(software) {
+  return rawRequest('/api/quick-setup/restore', {
+    method: 'POST',
+    body: JSON.stringify({ software }),
+  });
+}
