@@ -68,6 +68,11 @@ export default {
   qs_view_current: 'View current config',
   qs_result_back: 'Back to editing',
   qs_result_new_file: 'New file',
+  qs_written_files: 'Written files',
+  qs_no_backups: 'None (all files were newly created)',
+  qs_final_content: 'Final file contents',
+  qs_copyPath: 'Copy path',
+  qs_copied_short: 'Copied',
 
   // -- System Settings --
   sys_language: 'Language',

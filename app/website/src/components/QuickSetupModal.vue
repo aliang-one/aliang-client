@@ -371,8 +371,18 @@
               </div>
             </div>
 
+            <!-- 应用结果视图：apply 成功后替换文件编辑区；返回编辑保留 editableFiles 现状 -->
+            <QuickSetupResultPanel
+              v-if="applyResult"
+              :software-name="applyResult.softwareName"
+              :written="applyResult.written"
+              :backups="applyResult.backups"
+              :files="applyResult.files"
+              @back="applyResult = null"
+            />
+
             <!-- Config editor -->
-            <div v-if="currentVariant || selectedSoftwareDef?.isCustom" class="mt-6">
+            <div v-else-if="currentVariant || selectedSoftwareDef?.isCustom" class="mt-6">
               <!-- Notes -->
               <div v-if="currentVariant.notes?.length" class="mb-4 rounded-2xl border border-sky-200 bg-sky-50/70 px-4 py-3 dark:border-sky-900/40 dark:bg-sky-950/20">
                 <p class="text-[11px] font-semibold uppercase tracking-wide text-sky-700 dark:text-sky-300">{{ t('qs_notes') }}</p>
@@ -509,6 +519,7 @@
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 import { applyQuickSetup, getQuickSetupCatalog, getQuickSetupModels, renderQuickSetup } from '../services/quickSetupApi';
 import { useI18n } from '../i18n';
+import QuickSetupResultPanel from './QuickSetupResultPanel.vue';
 import { createLatestRenderGuard, createQuickSetupModeState, filterInstalledQuickSetupSoftwares, isBuiltInQuickSetupSoftware, snapshotQuickSetupFiles } from '../utils/quickSetupState';
 
 const { t } = useI18n();
@@ -542,6 +553,8 @@ const currentVariant = ref(null);
 const selectedFileCode = ref('');
 const editableFiles = ref([]);
 const filesDirty = ref(false);
+// apply 成功后的结果快照（softwareName/written/backups/files），非空时渲染结果视图
+const applyResult = ref(null);
 const customSoftwares = ref([]);
 const showAddSoftware = ref(false);
 const newSoftwareName = ref('');
@@ -762,6 +775,7 @@ function clearCurrentRender() {
   editableFiles.value = [];
   selectedFileCode.value = '';
   filesDirty.value = false;
+  applyResult.value = null;
 }
 function scheduleOpenCodeRender(delay = 450) {
   if (!isOpenCodeSelected.value || selectedSoftwareDef.value?.isCustom || filesDirty.value) {
@@ -830,6 +844,8 @@ async function renderSelectedKey() {
     }
     const variantList = Array.isArray(result?.variants) ? result.variants : [];
     if (variantList.length > 0) {
+      // 重新渲染（key/mode/model 变化）即失效上一次 apply 的结果视图，避免展示过期快照
+      applyResult.value = null;
       currentVariant.value = variantList[0];
       editableFiles.value = (variantList[0].files || []).map((f) => ({ ...f }));
       selectedFileCode.value = editableFiles.value[0]?.code || '';
@@ -980,11 +996,18 @@ async function applyCurrentVariant() {
     const filesToApply = snapshotQuickSetupFiles(editableFiles.value);
     const result = await applyQuickSetup(selectedSoftware.value, filesToApply);
     const writtenCount = Array.isArray(result?.written) ? result.written.length : 0;
-    statusMessage.value = writtenCount > 0
-      ? t('qs_appliedFiles', { count: writtenCount, name: selectedSoftwareDef.value?.name || selectedSoftware.value })
-      : t('qs_noFilesWritten');
     if (writtenCount > 0) {
       filesDirty.value = false;
+      statusMessage.value = '';
+      // 应用前的文件快照即写入磁盘的最终内容（path+content 窄快照，供结果面板展示）
+      applyResult.value = {
+        softwareName: selectedSoftwareDef.value?.name || selectedSoftware.value,
+        written: result.written,
+        backups: Array.isArray(result?.backups) ? result.backups : [],
+        files: filesToApply.map((file) => ({ path: file.path, content: file.content })),
+      };
+    } else {
+      statusMessage.value = t('qs_noFilesWritten');
     }
   } catch (error) {
     statusMessage.value = error instanceof Error ? error.message : t('qs_failedApply');

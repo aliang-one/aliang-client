@@ -68,6 +68,11 @@ export default {
   qs_view_current: '查看当前配置',
   qs_result_back: '返回编辑',
   qs_result_new_file: '新建文件',
+  qs_written_files: '已写入文件',
+  qs_no_backups: '无（全部为新建文件）',
+  qs_final_content: '最终写入内容',
+  qs_copyPath: '复制路径',
+  qs_copied_short: '已复制',
 
   // -- System Settings --
   sys_language: '语言',
