@@ -333,3 +333,47 @@ func quickSetupPathWithin(base string, target string) bool {
 	}
 	return rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator))
 }
+
+// quickSetupLookPathCLIFn 是 lookPathCLI 的钩子变量，供单测注入。
+var quickSetupLookPathCLIFn = lookPathCLI
+
+// quickSetupDetectionHomeFn 返回安装检测用的家目录（root 场景解析桌面用户）。
+var quickSetupDetectionHomeFn = func() string {
+	if h, err := runtimepath.EffectiveAgentHome(); err == nil {
+		if h = strings.TrimSpace(h); h != "" {
+			return h
+		}
+	}
+	h, _ := runtimepath.UserHomeDir()
+	return strings.TrimSpace(h)
+}
+
+type quickSetupDetectionRule struct {
+	cliNames []string
+	dirs     []string // 相对家目录，正斜杠书写
+}
+
+var quickSetupDetectionRules = map[string]quickSetupDetectionRule{
+	"claude-code": {cliNames: []string{"claude"}, dirs: []string{".claude"}},
+	"codex":       {cliNames: []string{"codex"}, dirs: []string{".codex"}},
+	"opencode":    {cliNames: []string{"opencode"}, dirs: []string{".config/opencode", ".local/share/opencode", ".opencode"}},
+}
+
+// detectQuickSetupInstalled：CLI 二进制或配置目录任一命中即视为已安装（spec §5）。
+func detectQuickSetupInstalled(softwareCode, homeDir string) bool {
+	rule, ok := quickSetupDetectionRules[softwareCode]
+	if !ok || strings.TrimSpace(homeDir) == "" {
+		return false
+	}
+	for _, name := range rule.cliNames {
+		if _, err := quickSetupLookPathCLIFn(name); err == nil {
+			return true
+		}
+	}
+	for _, dir := range rule.dirs {
+		if info, err := os.Stat(filepath.Join(homeDir, filepath.FromSlash(dir))); err == nil && info.IsDir() {
+			return true
+		}
+	}
+	return false
+}

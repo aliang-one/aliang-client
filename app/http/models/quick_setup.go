@@ -16,6 +16,7 @@ type QuickSetupSoftware struct {
 	Description        string                   `json:"description"`
 	SupportedProviders []string                 `json:"supported_providers"`
 	Files              []QuickSetupSoftwareFile `json:"files"`
+	Installed          bool                     `json:"installed"`
 }
 
 type QuickSetupAPIKey struct {

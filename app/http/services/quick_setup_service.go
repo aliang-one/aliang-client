@@ -94,10 +94,15 @@ func (s *QuickSetupService) Catalog() map[string]interface{} {
 			"msg":    fmt.Sprintf("Failed to load quick setup catalog: %v", err),
 		}
 	}
+	softwares := quickSetupSoftwares()
+	homeDir := quickSetupDetectionHomeFn()
+	for i := range softwares {
+		softwares[i].Installed = detectQuickSetupInstalled(softwares[i].Code, homeDir)
+	}
 	return map[string]interface{}{
 		"status": "success",
 		"data": models.QuickSetupCatalogResponse{
-			Softwares: quickSetupSoftwares(),
+			Softwares: softwares,
 			APIKeys:   toQuickSetupAPIKeys(apiKeys, baseRoot),
 		},
 	}
