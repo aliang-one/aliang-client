@@ -57,6 +57,17 @@ export default {
   qs_noFilesWritten: '未写入任何文件。请检查生成的路径并重试。',
   qs_failedApply: '应用文件失败。',
   qs_copyFailed: '复制失败。',
+  qs_mode_local: '本地加速',
+  qs_mode_public: '公网直连',
+  qs_mode_local_hint: '依赖本软件的本地推理代理（登录后自动启动）',
+  qs_merged_banner: '已合并你现有的配置，其余设置将保留',
+  qs_no_agents_detected: '未检测到已安装的 AI Agent',
+  qs_no_agents_desc: '安装 Claude Code / Codex / OpenCode 任一后，这里会出现对应的快速配置。',
+  qs_result_title: '配置已应用',
+  qs_backed_up: '已备份原始配置',
+  qs_view_current: '查看当前配置',
+  qs_result_back: '返回编辑',
+  qs_result_new_file: '新建文件',
 
   // -- System Settings --
   sys_language: '语言',

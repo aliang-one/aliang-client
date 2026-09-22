@@ -57,6 +57,17 @@ export default {
   qs_noFilesWritten: 'No file was written. Review the generated paths and try again.',
   qs_failedApply: 'Failed to apply files.',
   qs_copyFailed: 'Copy failed.',
+  qs_mode_local: 'Local acceleration',
+  qs_mode_public: 'Direct (public)',
+  qs_mode_local_hint: "Requires this app's local inference proxy (starts automatically after sign-in).",
+  qs_merged_banner: 'Merged with your existing configuration — your other settings are preserved.',
+  qs_no_agents_detected: 'No installed AI agents detected',
+  qs_no_agents_desc: 'Install Claude Code, Codex, or OpenCode and matching quick setups will appear here.',
+  qs_result_title: 'Configuration applied',
+  qs_backed_up: 'Original configuration backed up',
+  qs_view_current: 'View current config',
+  qs_result_back: 'Back to editing',
+  qs_result_new_file: 'New file',
 
   // -- System Settings --
   sys_language: 'Language',

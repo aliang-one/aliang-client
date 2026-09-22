@@ -64,6 +64,16 @@
             </div>
           </button>
 
+          <!-- 三内置均未安装且无 custom 模板时的侧栏空状态 -->
+          <div
+            v-if="catalogStatus === 'success' && !allSoftwares.length"
+            class="rounded-xl border border-dashed border-slate-200 bg-white/60 px-4 py-6 text-center dark:border-slate-700 dark:bg-slate-900/40"
+          >
+            <span class="material-symbols-outlined text-2xl text-slate-300 dark:text-slate-600">search_off</span>
+            <p class="mt-2 text-sm font-semibold text-slate-700 dark:text-slate-200">{{ t('qs_no_agents_detected') }}</p>
+            <p class="mt-1 text-[11px] leading-5 text-slate-500 dark:text-slate-400">{{ t('qs_no_agents_desc') }}</p>
+          </div>
+
           <button
             type="button"
             class="w-full rounded-xl border border-dashed border-slate-300 px-4 py-3 text-left text-sm text-slate-500 transition hover:border-primary/40 hover:text-primary dark:border-slate-700 dark:text-slate-400 dark:hover:border-primary/40 dark:hover:text-primary"
@@ -150,6 +160,39 @@
           </div>
 
           <template v-else>
+            <!-- 接入模式（custom 模板无 baseURL 语义，不显示） -->
+            <div v-if="selectedSoftwareDef && !selectedSoftwareDef.isCustom" class="mb-5">
+              <div class="inline-flex items-center gap-1 rounded-xl border border-slate-200 bg-slate-50 p-1 dark:border-slate-700 dark:bg-slate-900/60">
+                <button
+                  type="button"
+                  :class="[
+                    'min-h-8 rounded-lg px-3.5 text-xs font-semibold transition',
+                    quickSetupMode === 'local'
+                      ? 'bg-white text-primary shadow-sm dark:bg-slate-800 dark:text-primary'
+                      : 'text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200',
+                  ]"
+                  @click="setQuickSetupMode('local')"
+                >
+                  {{ t('qs_mode_local') }}
+                </button>
+                <button
+                  type="button"
+                  :class="[
+                    'min-h-8 rounded-lg px-3.5 text-xs font-semibold transition',
+                    quickSetupMode === 'public'
+                      ? 'bg-white text-primary shadow-sm dark:bg-slate-800 dark:text-primary'
+                      : 'text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200',
+                  ]"
+                  @click="setQuickSetupMode('public')"
+                >
+                  {{ t('qs_mode_public') }}
+                </button>
+              </div>
+              <p v-if="quickSetupMode === 'local'" class="mt-1.5 text-[11px] leading-5 text-slate-500 dark:text-slate-400">
+                {{ t('qs_mode_local_hint') }}
+              </p>
+            </div>
+
             <!-- Key selector -->
             <div v-if="isOpenCodeSelected" class="mb-4 space-y-4">
               <div>
@@ -364,6 +407,13 @@
 
               <!-- Editor -->
               <div v-if="currentFile" class="mt-4 space-y-4">
+                <!-- 当前 tab 文件由磁盘已有配置智能合并而来时提示（merged_from_disk 带 omitempty） -->
+                <div
+                  v-if="activeFileMergedFromDisk"
+                  class="rounded-xl border border-sky-200 bg-sky-50/60 px-3.5 py-2 text-[11px] leading-5 text-sky-700 dark:border-sky-900/40 dark:bg-sky-950/20 dark:text-sky-300"
+                >
+                  {{ t('qs_merged_banner') }}
+                </div>
                 <div>
                   <label class="mb-1 block text-[11px] font-semibold uppercase tracking-wide text-slate-500">{{ t('qs_targetPath') }}</label>
                   <input
@@ -445,7 +495,7 @@
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 import { applyQuickSetup, getQuickSetupCatalog, getQuickSetupModels, renderQuickSetup } from '../services/quickSetupApi';
 import { useI18n } from '../i18n';
-import { createLatestRenderGuard, isBuiltInQuickSetupSoftware, snapshotQuickSetupFiles } from '../utils/quickSetupState';
+import { createLatestRenderGuard, createQuickSetupModeState, filterInstalledQuickSetupSoftwares, isBuiltInQuickSetupSoftware, snapshotQuickSetupFiles } from '../utils/quickSetupState';
 
 const { t } = useI18n();
 
@@ -484,10 +534,13 @@ const newSoftwareName = ref('');
 const newSoftwareDesc = ref('');
 let fileCounter = 0;
 const renderGuard = createLatestRenderGuard();
-const allSoftwares = computed(() => [
+// 每 software 的接入模式记忆（local/public，缺省 public），modal 生命周期内保留。
+const modeState = createQuickSetupModeState();
+const quickSetupMode = ref('public');
+const allSoftwares = computed(() => filterInstalledQuickSetupSoftwares([
   ...softwares.value,
   ...customSoftwares.value,
-]);
+]));
 const selectedSoftwareDef = computed(() => allSoftwares.value.find((item) => item.code === selectedSoftware.value) || null);
 const isOpenCodeSelected = computed(() => selectedSoftwareDef.value?.code === 'opencode');
 const compatibleKeys = computed(() => {
@@ -533,6 +586,8 @@ const canApplyCurrentVariant = computed(() => {
 const currentFile = computed(() => {
   return editableFiles.value.find((item) => item.code === selectedFileCode.value) || editableFiles.value[0] || null;
 });
+// 后端 merged_from_disk 带 omitempty，false 时字段缺省，必须用 === true 判断。
+const activeFileMergedFromDisk = computed(() => currentFile.value?.merged_from_disk === true);
 let openCodeRenderTimer = null;
 function maskKey(key) {
   if (!key) return '';
@@ -719,8 +774,8 @@ async function loadCatalog() {
     }
     softwares.value = Array.isArray(result.data.softwares) ? result.data.softwares : [];
     apiKeys.value = Array.isArray(result.data.api_keys) ? result.data.api_keys : [];
-    if (!selectedSoftware.value || !softwares.value.some((item) => item.code === selectedSoftware.value)) {
-      selectedSoftware.value = softwares.value[0]?.code || '';
+    if (!selectedSoftware.value || !allSoftwares.value.some((item) => item.code === selectedSoftware.value)) {
+      selectedSoftware.value = allSoftwares.value[0]?.code || '';
     }
   } catch (error) {
     catalogStatus.value = 'failed';
@@ -749,6 +804,9 @@ async function renderSelectedKey() {
   rendering.value = true;
   try {
     const options = isOpenCodeSelected.value ? { opencode: buildOpenCodeSpec() } : {};
+    if (!selectedSoftwareDef.value?.isCustom) {
+      options.mode = quickSetupMode.value;
+    }
     const result = await renderQuickSetup(selectedSoftware.value, keyIds, options);
     if (!renderGuard.canCommit(requestId, filesDirty.value)) {
       return;
@@ -782,6 +840,23 @@ function selectSoftware(code) {
   }
   selectedSoftware.value = code;
 }
+// 接入模式切换：记忆到 modeState，并按 software 类型复用现有渲染路径重新生成预览。
+// custom 模板没有 baseURL 语义，入口在模板层隐藏，这里兜底忽略。
+function setQuickSetupMode(mode) {
+  if (!selectedSoftware.value || selectedSoftwareDef.value?.isCustom) {
+    return;
+  }
+  if (quickSetupMode.value === mode) {
+    return;
+  }
+  modeState.setMode(selectedSoftware.value, mode);
+  quickSetupMode.value = mode;
+  if (isOpenCodeSelected.value) {
+    scheduleOpenCodeRender(0);
+    return;
+  }
+  renderSelectedKey();
+}
 function confirmAddSoftware() {
   const name = newSoftwareName.value.trim();
   if (!name) return;
@@ -810,7 +885,7 @@ function confirmAddSoftware() {
 function removeCustomSoftware(code) {
   customSoftwares.value = customSoftwares.value.filter((s) => s.code !== code);
   if (selectedSoftware.value === code) {
-    selectedSoftware.value = softwares.value[0]?.code || '';
+    selectedSoftware.value = allSoftwares.value[0]?.code || '';
   }
 }
 function addNewFile() {
@@ -916,9 +991,12 @@ watch(
   },
   { immediate: true },
 );
-// Software switch -> auto-select first compatible key
+// Software switch -> auto-select first compatible key; 恢复该 software 记忆的接入模式
 watch(selectedSoftware, async () => {
   clearCurrentRender();
+  quickSetupMode.value = selectedSoftwareDef.value?.isCustom
+    ? 'public'
+    : modeState.modeOf(selectedSoftware.value);
   const keys = compatibleKeys.value;
   if (keys.length === 0) {
     selectedKeyId.value = '';
