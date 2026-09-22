@@ -208,3 +208,84 @@ func TestConfigStateManagedByAliangOpenCode(t *testing.T) {
 		})
 	}
 }
+
+// TestQuickSetupCodexTOMLManaged 直测 codex TOML 段表头判定（spec §8）：只认本网关
+// 写入的 [model_providers.aliang] 单表头形态——数组表头（[[）跳过、注释掉的表头不
+// 命中、后缀伪造段名（aliang_other）不误伤；CRLF 行尾正常命中。
+func TestQuickSetupCodexTOMLManaged(t *testing.T) {
+	cases := []struct {
+		name    string
+		content string
+		managed bool
+	}{
+		{
+			name:    "plain section header",
+			content: "model = \"gpt-5\"\n[model_providers.aliang]\nname = \"Aliang Gateway\"\n",
+			managed: true,
+		},
+		{
+			name:    "CRLF line endings",
+			content: "model = \"gpt-5\"\r\n[model_providers.aliang]\r\nname = \"Aliang Gateway\"\r\n",
+			managed: true,
+		},
+		{
+			name:    "array table header skipped",
+			content: "[[model_providers.aliang]]\nname = \"not our written shape\"\n",
+			managed: false,
+		},
+		{
+			name:    "commented header not matched",
+			content: "# [model_providers.aliang]\nmodel = \"gpt-5\"\n",
+			managed: false,
+		},
+		{
+			name:    "suffix forgery section not matched",
+			content: "[model_providers.aliang_other]\nname = \"someone else\"\n",
+			managed: false,
+		},
+		{
+			name:    "empty content",
+			content: "",
+			managed: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := quickSetupCodexTOMLManaged(tc.content); got != tc.managed {
+				t.Fatalf("quickSetupCodexTOMLManaged(%q) = %v, want %v", tc.content, got, tc.managed)
+			}
+		})
+	}
+}
+
+// TestQuickSetupURLHostManaged 直测 URL host 判定（spec §8）：两个公网域名带自定义
+// 端口（api.aliang.one:8443）也算指向本网关；域名大小写归一命中；loopback 保持精确
+// 匹配——用户本地 127.0.0.1:9999（ollama/LM Studio）与无端口形式都不误标；后缀
+// 伪造域名不命中。
+func TestQuickSetupURLHostManaged(t *testing.T) {
+	cases := []struct {
+		name    string
+		rawURL  string
+		managed bool
+	}{
+		{name: "bare inference domain", rawURL: "https://api.aliang.one", managed: true},
+		{name: "uppercase domain normalized", rawURL: "https://API.ALIANG.ONE/v1", managed: true},
+		{name: "inference domain custom port", rawURL: "https://api.aliang.one:8443/v1", managed: true},
+		{name: "control plane domain custom port", rawURL: "https://backend.aliang.one:9443", managed: true},
+		{name: "loopback proxy exact", rawURL: "http://127.0.0.1:56432", managed: true},
+		{name: "loopback alias exact", rawURL: "http://localhost:56432", managed: true},
+		{name: "loopback other port not managed", rawURL: "http://127.0.0.1:9999", managed: false},
+		{name: "loopback without port not managed", rawURL: "http://127.0.0.1", managed: false},
+		{name: "suffix forgery not managed", rawURL: "https://api.aliang.one.attacker.com/v1", managed: false},
+		{name: "third-party host", rawURL: "https://third-party.example.com/v1", managed: false},
+		{name: "invalid url", rawURL: ":", managed: false},
+		{name: "empty url", rawURL: "", managed: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := quickSetupURLHostManaged(tc.rawURL); got != tc.managed {
+				t.Fatalf("quickSetupURLHostManaged(%q) = %v, want %v", tc.rawURL, got, tc.managed)
+			}
+		})
+	}
+}

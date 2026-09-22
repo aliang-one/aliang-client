@@ -42,37 +42,42 @@ func (s *QuickSetupService) ConfigState(softwareCode string) (models.QuickSetupC
 	}
 
 	// codex auth.json 的 managed 判定跟随同 software 的 config.toml（整体托管语义，
-	// spec §8）；catalog 声明 config 在 auth 之前，循环内先算先记。
+	// spec §8）。进循环前独立算出 config 的判定结果——不复用循环内先算先记的
+	// 状态，消除对 catalog 声明顺序（config 必须排在 auth 之前）的隐式耦合。
 	codexConfigManaged := false
+	if softwareDef.Code == "codex" {
+		for _, fileDef := range softwareDef.Files {
+			if fileDef.Code != "config" {
+				continue
+			}
+			codexConfigManaged = quickSetupManagedByAliang(
+				softwareDef.Code,
+				fileDef.Format,
+				quickSetupSnapshotFileContent(softwareDef.Code, fileDef, targetUser.homeDir),
+			)
+			break
+		}
+	}
 	for _, fileDef := range softwareDef.Files {
 		entry := models.QuickSetupConfigStateFile{
 			Path:   fileDef.DefaultPath,
 			Format: fileDef.Format,
 		}
 		if resolved, resolveErr := resolveQuickSetupApplyPath(softwareDef.Code, fileDef.DefaultPath, targetUser.homeDir); resolveErr == nil {
+			// Stat 决定 Exists/Size/ModifiedAt；Content 单独被上限/读失败门控（超限或
+			// 读时变大只导致内容不回传，不再折叠成 Exists=false）。
 			if info, statErr := os.Stat(resolved); statErr == nil && info.Mode().IsRegular() {
-				readable := false
-				if info.Size() > quickSetupMaxApplyFileBytes {
-					readable = true // 超上限：文件确实存在，只是内容不回传（Content 留空）
-				} else if raw, readErr := os.ReadFile(resolved); readErr == nil && int64(len(raw)) <= quickSetupMaxApplyFileBytes {
-					entry.Content = string(raw)
-					readable = true
-				}
-				if readable {
-					entry.Exists = true
-					entry.Size = info.Size()
-					entry.ModifiedAt = info.ModTime().Format(time.RFC3339)
-				}
+				entry.Exists = true
+				entry.Size = info.Size()
+				entry.ModifiedAt = info.ModTime().Format(time.RFC3339)
+				entry.Content = quickSetupSnapshotFileContent(softwareDef.Code, fileDef, targetUser.homeDir)
 			}
+			// Stat 失败/非普通文件时按不存在展示：纯展示语义，无安全决策依赖此折叠。
 		}
-		switch {
-		case softwareDef.Code == "codex" && fileDef.Code == "auth":
+		if softwareDef.Code == "codex" && fileDef.Code == "auth" {
 			entry.ManagedByAliang = codexConfigManaged
-		default:
+		} else {
 			entry.ManagedByAliang = quickSetupManagedByAliang(softwareDef.Code, fileDef.Format, entry.Content)
-			if softwareDef.Code == "codex" && fileDef.Code == "config" {
-				codexConfigManaged = entry.ManagedByAliang
-			}
 		}
 		resp.Files = append(resp.Files, entry)
 	}
@@ -96,12 +101,33 @@ func (s *QuickSetupService) ConfigState(softwareCode string) (models.QuickSetupC
 	return resp, nil
 }
 
+// quickSetupSnapshotFileContent 读取单个托管配置文件的内容快照（ConfigState 循环
+// 与 codex auth 跟随判定共用）：路径解析失败、非普通文件、超过
+// quickSetupMaxApplyFileBytes 或读盘失败一律返回空串——内容为空的 managed 判定走
+// false 路径。Exists/Size/ModifiedAt 由调用方 Stat 决定，与此处读结果解耦。
+func quickSetupSnapshotFileContent(softwareCode string, fileDef models.QuickSetupSoftwareFile, homeDir string) string {
+	resolved, err := resolveQuickSetupApplyPath(softwareCode, fileDef.DefaultPath, homeDir)
+	if err != nil {
+		return ""
+	}
+	info, err := os.Stat(resolved)
+	if err != nil || !info.Mode().IsRegular() || info.Size() > quickSetupMaxApplyFileBytes {
+		return ""
+	}
+	raw, err := os.ReadFile(resolved)
+	if err != nil || int64(len(raw)) > quickSetupMaxApplyFileBytes {
+		return ""
+	}
+	return string(raw)
+}
+
 // quickSetupManagedByAliang 判断磁盘上的配置内容是否由本网关写入（spec §8 启发式）：
 //   - claude-code settings.json：env.ANTHROPIC_BASE_URL 指向本网关任一接入地址；
 //   - codex config.toml（format=toml）：含 [model_providers.aliang] 段表头；
 //   - opencode opencode.json：任一 provider 条目的 options.baseURL 指向本网关。
 //
-// codex auth.json 不在本函数判定（ConfigState 循环里复用 config.toml 的结果）。
+// codex auth.json 不在本函数判定（ConfigState 进循环前预先算出 config.toml 的结果
+// 供 auth 复用，不依赖 catalog 声明顺序）。
 // 内容为空或解析失败一律 false。
 func quickSetupManagedByAliang(softwareCode, format, content string) bool {
 	switch softwareCode {
@@ -138,13 +164,25 @@ func quickSetupGatewayHosts() map[string]struct{} {
 }
 
 // quickSetupURLHostManaged 判断 base URL 的 host（含端口形式）是否命中网关地址集合。
+// 精确匹配未命中且 URL 带端口时，对两个公网接入域名补「去端口后的裸域名」比较——
+// api.aliang.one:8443 这类自定义端口形式同样指向本网关。loopback 保持精确匹配不剥
+// 端口：剥了会把用户本地 127.0.0.1:xxxx 的 ollama/LM Studio 误标 managed。
 func quickSetupURLHostManaged(rawURL string) bool {
 	parsed, err := url.Parse(strings.TrimSpace(rawURL))
 	if err != nil || parsed.Host == "" {
 		return false
 	}
-	_, managed := quickSetupGatewayHosts()[strings.ToLower(parsed.Host)]
-	return managed
+	host := strings.ToLower(parsed.Host)
+	if _, managed := quickSetupGatewayHosts()[host]; managed {
+		return true
+	}
+	if parsed.Port() != "" {
+		bare := strings.ToLower(parsed.Hostname())
+		if bare == strings.ToLower(quickSetupInferenceHost) || bare == strings.ToLower(quickSetupControlPlaneHost) {
+			return true
+		}
+	}
+	return false
 }
 
 func quickSetupClaudeSettingsManaged(content string) bool {
