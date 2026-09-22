@@ -51,12 +51,13 @@ const agentTerminalRingDefaultBytes = 2 * 1024 * 1024
 //	                               ring) stays replayable before the sweeper
 //	                               drops it. Default 24h.
 var (
-	agentTerminalDetachedIdle = resolveEnvDuration("ALIANG_TERMINAL_DETACHED_IDLE", 30*time.Minute)
+	agentTerminalDetachedIdle = newDurationAtom(resolveEnvDuration("ALIANG_TERMINAL_DETACHED_IDLE", 30*time.Minute))
 	agentTerminalHistoryTTL   = resolveEnvDuration("ALIANG_TERMINAL_HISTORY_TTL", 24*time.Hour)
 
 	// agentTerminalIdleWatchInterval is how often each session's idle watcher
-	// re-evaluates the reap rules. Package var so tests can shrink it.
-	agentTerminalIdleWatchInterval = time.Minute
+	// re-evaluates the reap rules. Package var so tests can shrink it. Stored as
+	// an atomicDuration: tests rewrite it while live watchers still read it.
+	agentTerminalIdleWatchInterval = newDurationAtom(time.Minute)
 )
 
 // agentTerminalHistorySweepInterval is how often the manager-level sweeper
@@ -538,8 +539,9 @@ func terminalIdleReapReason(session *agentTerminalSession) string {
 		return ""
 	}
 	if !session.detachedAt.IsZero() {
-		if time.Since(session.lastInputAt) >= agentTerminalDetachedIdle {
-			return fmt.Sprintf("detached terminal session reaped after %s without input", agentTerminalDetachedIdle)
+		idle := agentTerminalDetachedIdle.Load()
+		if time.Since(session.lastInputAt) >= idle {
+			return fmt.Sprintf("detached terminal session reaped after %s without input", idle)
 		}
 		return ""
 	}
@@ -670,7 +672,7 @@ func (m *agentTerminalManager) copyTerminalOutput(sessionID string, reader io.Re
 }
 
 func (m *agentTerminalManager) watchTerminalIdle(sessionID string, token *struct{}, writeJSON agentTerminalWriter) {
-	ticker := time.NewTicker(agentTerminalIdleWatchInterval)
+	ticker := time.NewTicker(agentTerminalIdleWatchInterval.Load())
 	defer ticker.Stop()
 	for range ticker.C {
 		m.mu.Lock()

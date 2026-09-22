@@ -78,19 +78,19 @@ func TestAgentRemoteWriterIndirection(t *testing.T) {
 // socket (the old behavior, where the agent believed itself online while
 // PhoneServer saw no traffic).
 func TestRunRemoteAgentSession_EndsWhenPeerGoesSilent(t *testing.T) {
-	prevHeartbeat := agentRemoteHeartbeatInterval
-	prevPing := agentRemotePingInterval
-	prevRead := agentRemoteReadWindow
-	prevWrite := agentRemoteWriteTimeout
-	agentRemoteHeartbeatInterval = 200 * time.Millisecond
-	agentRemotePingInterval = 100 * time.Millisecond
-	agentRemoteReadWindow = 400 * time.Millisecond
-	agentRemoteWriteTimeout = 300 * time.Millisecond
+	prevHeartbeat := agentRemoteHeartbeatInterval.Load()
+	prevPing := agentRemotePingInterval.Load()
+	prevRead := agentRemoteReadWindow.Load()
+	prevWrite := agentRemoteWriteTimeout.Load()
+	agentRemoteHeartbeatInterval.Store(200 * time.Millisecond)
+	agentRemotePingInterval.Store(100 * time.Millisecond)
+	agentRemoteReadWindow.Store(400 * time.Millisecond)
+	agentRemoteWriteTimeout.Store(300 * time.Millisecond)
 	defer func() {
-		agentRemoteHeartbeatInterval = prevHeartbeat
-		agentRemotePingInterval = prevPing
-		agentRemoteReadWindow = prevRead
-		agentRemoteWriteTimeout = prevWrite
+		agentRemoteHeartbeatInterval.Store(prevHeartbeat)
+		agentRemotePingInterval.Store(prevPing)
+		agentRemoteReadWindow.Store(prevRead)
+		agentRemoteWriteTimeout.Store(prevWrite)
 	}()
 
 	upgrader := websocket.Upgrader{}

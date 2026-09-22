@@ -19,12 +19,40 @@ func TestHandleAuthRefreshedForwardsFreshAccessTokenToUserAgent(t *testing.T) {
 	})
 	t.Cleanup(func() { auth.SetCurrentUserInfo(nil) })
 
+	// handleAuthRefreshed only forwards while its captured session generation
+	// is Active. Establish a self-contained Active authority so the test no
+	// longer depends on whichever state earlier tests happened to leave behind
+	// (standalone -run runs previously timed out on a Restoring authority).
+	auth.ResetSessionAuthorityForTest().NotifyLoggedIn(&auth.UserInfo{ID: 42, Username: "refreshed-user"})
+	t.Cleanup(func() { auth.ResetSessionAuthorityForTest() })
+
+	// The /api/agent/sync response is held open until the test has reset the
+	// session authority below. handleAuthRefreshed's goroutine re-checks
+	// GenerationActive AFTER the sync returns; holding the response pins that
+	// second read to AFTER the reset, so the goroutine deterministically takes
+	// its stale path (/api/agent/disable) — whose arrival proves the goroutine
+	// (and its session-authority singleton reads) finished before this test
+	// ends. Without this handshake the leaked read races the authority resets
+	// in subsequent tests' setups under -race.
 	received := make(chan string, 1)
+	releaseSync := make(chan struct{})
+	disableSeen := make(chan struct{}, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/agent/sync" {
-			t.Errorf("path = %q, want /api/agent/sync", r.URL.Path)
+		switch r.URL.Path {
+		case "/api/agent/sync":
+			select {
+			case received <- r.Header.Get(AgentForwardedAuthorizationHeader):
+			default:
+			}
+			<-releaseSync
+		case "/api/agent/disable":
+			select {
+			case disableSeen <- struct{}{}:
+			default:
+			}
+		default:
+			t.Errorf("path = %q, want /api/agent/sync or /api/agent/disable", r.URL.Path)
 		}
-		received <- r.Header.Get(AgentForwardedAuthorizationHeader)
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer server.Close()
@@ -41,6 +69,17 @@ func TestHandleAuthRefreshedForwardsFreshAccessTokenToUserAgent(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for refreshed session to reach user agent")
+	}
+
+	// Invalidate the captured generation, then let the sync response through:
+	// the goroutine's follow-up check must now see a stale generation and
+	// notify the user agent of the dead session instead of staying silent.
+	auth.ResetSessionAuthorityForTest()
+	close(releaseSync)
+	select {
+	case <-disableSeen:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stale refreshed-session sync never triggered the user-agent disable")
 	}
 }
 

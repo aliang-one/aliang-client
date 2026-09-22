@@ -14,9 +14,9 @@ import (
 // a never-armed service is treated as already open so non-WS callers and tests
 // are never blocked.
 func TestRegistrationGate_BlocksUntilReady(t *testing.T) {
-	prev := agentRemoteRegistrationWait
-	agentRemoteRegistrationWait = 40 * time.Millisecond
-	defer func() { agentRemoteRegistrationWait = prev }()
+	prev := agentRemoteRegistrationWait.Load()
+	agentRemoteRegistrationWait.Store(40 * time.Millisecond)
+	defer func() { agentRemoteRegistrationWait.Store(prev) }()
 
 	// Never-armed service → gate open.
 	s := &AgentService{}
@@ -53,9 +53,9 @@ func TestRegistrationGate_BlocksUntilReady(t *testing.T) {
 // approval request was flushed immediately and silently rejected by the server
 // with agent_not_registered, leaving the approval waiter blocked up to 24h.
 func TestRemoteWriter_GatedUntilRegistration(t *testing.T) {
-	prev := agentRemoteRegistrationWait
-	agentRemoteRegistrationWait = 2 * time.Second // generous: the write must BLOCK, not fail
-	defer func() { agentRemoteRegistrationWait = prev }()
+	prev := agentRemoteRegistrationWait.Load()
+	agentRemoteRegistrationWait.Store(2 * time.Second) // generous: the write must BLOCK, not fail
+	defer func() { agentRemoteRegistrationWait.Store(prev) }()
 
 	s := &AgentService{}
 	s.armRegistrationGate()
@@ -67,7 +67,7 @@ func TestRemoteWriter_GatedUntilRegistration(t *testing.T) {
 	// publishedWriter mirrors runRemoteAgentSession: wait for registration,
 	// then record the payload (stands in for the real socket write).
 	published := agentTerminalWriter(func(payload interface{}) error {
-		if !s.waitForRegistration(agentRemoteRegistrationWait) {
+		if !s.waitForRegistration(agentRemoteRegistrationWait.Load()) {
 			return errors.New("remote agent not registered within deadline")
 		}
 		m, _ := payload.(map[string]interface{})
