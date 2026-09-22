@@ -48,6 +48,7 @@ func TestQuickSetupHandlerRequiresDashboardSessionForEveryEndpoint(t *testing.T)
 		{name: "models", method: http.MethodPost, path: "/api/quick-setup/models", handle: handler.HandleModels},
 		{name: "render", method: http.MethodPost, path: "/api/quick-setup/render", handle: handler.HandleRender},
 		{name: "apply", method: http.MethodPost, path: "/api/quick-setup/apply", handle: handler.HandleApply},
+		{name: "config-state", method: http.MethodGet, path: "/api/quick-setup/config-state", handle: handler.HandleConfigState},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

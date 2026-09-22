@@ -3,6 +3,7 @@ package handlers
 import (
 	"errors"
 	"net/http"
+	"strings"
 
 	"aliang.one/nursorgate/app/http/common"
 	"aliang.one/nursorgate/app/http/middleware"
@@ -96,6 +97,38 @@ func (h *QuickSetupHandler) HandleModels(w http.ResponseWriter, r *http.Request)
 	}
 
 	common.Success(w, resp)
+}
+
+func (h *QuickSetupHandler) HandleConfigState(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
+		return
+	}
+	if !middleware.RequireDashboardSession(w, r) {
+		return
+	}
+
+	software := strings.TrimSpace(r.URL.Query().Get("software"))
+	if software == "" {
+		common.ErrorBadRequest(w, "software query parameter is required", nil)
+		return
+	}
+
+	state, err := h.service.ConfigState(software)
+	if err != nil {
+		if errors.Is(err, services.ErrQuickSetupUnauthenticated) {
+			common.ErrorUnauthorized(w, err.Error())
+			return
+		}
+		if isBadRequestError(err) {
+			common.ErrorBadRequest(w, err.Error(), nil)
+			return
+		}
+		common.ErrorInternalServer(w, "Quick setup config state failed", map[string]interface{}{"error": err.Error()})
+		return
+	}
+
+	common.Success(w, state)
 }
 
 func (h *QuickSetupHandler) HandleApply(w http.ResponseWriter, r *http.Request) {

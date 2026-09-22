@@ -127,3 +127,27 @@ type QuickSetupRestoreResponse struct {
 	Deleted  []string                   `json:"deleted"`
 	Failed   []QuickSetupRestoreFailure `json:"failed"`
 }
+
+type QuickSetupConfigStateFile struct {
+	Path            string `json:"path"`
+	Exists          bool   `json:"exists"`
+	Size            int64  `json:"size,omitempty"`
+	ModifiedAt      string `json:"modified_at,omitempty"`
+	Format          string `json:"format"`
+	Content         string `json:"content,omitempty"`
+	ManagedByAliang bool   `json:"managed_by_aliang"`
+}
+
+type QuickSetupConfigStateBackup struct {
+	OriginalPath string `json:"original_path"`
+	BackupPath   string `json:"backup_path,omitempty"`
+	BackedUpAt   string `json:"backed_up_at"`
+	SHA256       string `json:"sha256,omitempty"`
+	Kind         string `json:"kind"`
+}
+
+type QuickSetupConfigStateResponse struct {
+	Software string                        `json:"software"`
+	Files    []QuickSetupConfigStateFile   `json:"files"`
+	Backups  []QuickSetupConfigStateBackup `json:"backups"`
+}
