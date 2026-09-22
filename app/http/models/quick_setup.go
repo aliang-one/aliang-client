@@ -106,8 +106,9 @@ type QuickSetupApplyRequest struct {
 }
 
 type QuickSetupApplyResponse struct {
-	Software string   `json:"software"`
-	Written  []string `json:"written"`
+	Software string                 `json:"software"`
+	Written  []string               `json:"written"`
+	Backups  []QuickSetupBackupInfo `json:"backups,omitempty"`
 }
 
 type QuickSetupBackupInfo struct {

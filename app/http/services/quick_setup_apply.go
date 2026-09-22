@@ -33,7 +33,6 @@ func (s *QuickSetupService) Apply(req models.QuickSetupApplyRequest) (*models.Qu
 
 	prepared := make([]quickSetupPreparedFile, 0, len(req.Files))
 	seenPaths := make(map[string]struct{}, len(req.Files))
-	softwareDef, hasSoftwareDef := findQuickSetupSoftware(software)
 	for _, file := range req.Files {
 		targetPath := strings.TrimSpace(file.Path)
 		if targetPath == "" {
@@ -47,20 +46,20 @@ func (s *QuickSetupService) Apply(req models.QuickSetupApplyRequest) (*models.Qu
 		if err != nil {
 			return nil, err
 		}
-		if err := validateQuickSetupApplyFile(software, file, resolvedPath, targetUser.homeDir); err != nil {
+		declared, err := validateQuickSetupApplyFile(software, file, resolvedPath, targetUser.homeDir)
+		if err != nil {
 			return nil, err
 		}
 		if _, exists := seenPaths[resolvedPath]; exists {
 			return nil, fmt.Errorf("file path is not valid: duplicate target %s", targetPath)
 		}
 		seenPaths[resolvedPath] = struct{}{}
-		// code 供备份 manifest 的 file_code 使用（Task 10）；内置软件取 catalog 声明，
-		// custom-*（无 catalog 定义）退化为文件名。
+		// code 供备份 manifest 的 file_code 使用（Task 10）；内置软件取 catalog 声明
+		// （validate 已完成查找并回传，避免二次多趟 EvalSymlinks），custom-*（无
+		// catalog 定义）退化为文件名。
 		fileCode := filepath.Base(resolvedPath)
-		if hasSoftwareDef {
-			if declared, ok, declErr := quickSetupDeclaredFileForPath(softwareDef, resolvedPath, targetUser.homeDir); declErr == nil && ok {
-				fileCode = declared.Code
-			}
+		if declared.Code != "" {
+			fileCode = declared.Code
 		}
 		prepared = append(prepared, quickSetupPreparedFile{code: fileCode, path: resolvedPath, content: file.Content})
 	}
@@ -83,6 +82,13 @@ func (s *QuickSetupService) Apply(req models.QuickSetupApplyRequest) (*models.Qu
 		}
 	}
 
+	// 落盘备份先于任何配置写入（spec §6.3-4）：备份失败 → 整个 Apply 失败且零写入。
+	// corrupt manifest 等异常在 backupQuickSetupFiles 内 fail-safe（spec §6.3-5）。
+	backupInfos, err := backupQuickSetupFiles(targetUser, software, prepared)
+	if err != nil {
+		return nil, err
+	}
+
 	written := make([]string, 0, len(prepared))
 	for i, file := range prepared {
 		writeErr := quickSetupWriteConfigFileFn(file.path, file.content)
@@ -101,56 +107,59 @@ func (s *QuickSetupService) Apply(req models.QuickSetupApplyRequest) (*models.Qu
 	return &models.QuickSetupApplyResponse{
 		Software: software,
 		Written:  written,
+		Backups:  backupInfos,
 	}, nil
 }
 
-func validateQuickSetupApplyFile(software string, file models.QuickSetupApplyFile, resolvedPath string, home string) error {
+// validateQuickSetupApplyFile 返回内置软件命中的 catalog 声明文件，供调用方复用
+// （备份 file_code）；custom-* 无 catalog 定义，返回零值。
+func validateQuickSetupApplyFile(software string, file models.QuickSetupApplyFile, resolvedPath string, home string) (models.QuickSetupSoftwareFile, error) {
 	content := strings.TrimSpace(file.Content)
 	if content == "" {
-		return errors.New("file content is not valid: content cannot be empty")
+		return models.QuickSetupSoftwareFile{}, errors.New("file content is not valid: content cannot be empty")
 	}
 
 	format := strings.ToLower(strings.TrimSpace(file.Format))
 	kind := strings.ToLower(strings.TrimSpace(file.Kind))
 	if strings.HasPrefix(software, "custom-") {
 		if kind != "" && kind != "file" {
-			return fmt.Errorf("file kind is not valid: %s", file.Kind)
+			return models.QuickSetupSoftwareFile{}, fmt.Errorf("file kind is not valid: %s", file.Kind)
 		}
 		if format == "json" {
-			return validateQuickSetupJSON(content)
+			return models.QuickSetupSoftwareFile{}, validateQuickSetupJSON(content)
 		}
-		return nil
+		return models.QuickSetupSoftwareFile{}, nil
 	}
 
 	definition, ok := findQuickSetupSoftware(software)
 	if !ok {
-		return fmt.Errorf("software is not valid: %s", software)
+		return models.QuickSetupSoftwareFile{}, fmt.Errorf("software is not valid: %s", software)
 	}
 	declared, ok, err := quickSetupDeclaredFileForPath(definition, resolvedPath, home)
 	if err != nil {
-		return err
+		return models.QuickSetupSoftwareFile{}, err
 	}
 	if !ok {
-		return errors.New("file path is not valid: target is not declared by the selected software")
+		return models.QuickSetupSoftwareFile{}, errors.New("file path is not valid: target is not declared by the selected software")
 	}
 	if format != "" && !strings.EqualFold(format, declared.Format) {
-		return fmt.Errorf("file format is not valid: expected %s", declared.Format)
+		return models.QuickSetupSoftwareFile{}, fmt.Errorf("file format is not valid: expected %s", declared.Format)
 	}
 	if kind != "" && !strings.EqualFold(kind, declared.Kind) {
-		return fmt.Errorf("file kind is not valid: expected %s", declared.Kind)
+		return models.QuickSetupSoftwareFile{}, fmt.Errorf("file kind is not valid: expected %s", declared.Kind)
 	}
 
 	if strings.EqualFold(declared.Format, "json") {
 		if err := validateQuickSetupJSON(content); err != nil {
-			return err
+			return models.QuickSetupSoftwareFile{}, err
 		}
 	}
 	if software == "opencode" {
 		if err := validateQuickSetupOpenCode(content); err != nil {
-			return fmt.Errorf("OpenCode config is not valid: %w", err)
+			return models.QuickSetupSoftwareFile{}, fmt.Errorf("OpenCode config is not valid: %w", err)
 		}
 	}
-	return nil
+	return declared, nil
 }
 
 func validateQuickSetupJSON(content string) error {
