@@ -164,7 +164,7 @@ func backupQuickSetupFiles(targetUser quickSetupTargetUser, software string, fil
 	}
 	if dirty {
 		if err := saveQuickSetupManifest(targetUser, m); err != nil {
-			return nil, fmt.Errorf("save backup manifest failed: %w", err)
+			return nil, fmt.Errorf("save backup manifest failed (%s): %w", quickSetupManifestPath(homeDir), err)
 		}
 	}
 	return infos, nil
