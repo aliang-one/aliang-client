@@ -5,9 +5,9 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"time"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -199,8 +199,15 @@ func TestInterruptExternalClaudeTurnNoHome(t *testing.T) {
 }
 
 // TestExternalTUIBusyPrecheck is the C3 truth table: record exists && pid
-// alive && status busy. Idle records must NOT block a resume spawn.
+// alive && identity matches && status busy. Idle records must NOT block a
+// resume spawn.
 func TestExternalTUIBusyPrecheck(t *testing.T) {
+	// The fixture pid is the test process itself — its comm is the test
+	// binary, not "claude", so the identity gate must be permissive here.
+	previousMatch := externalInterruptTargetMatches
+	externalInterruptTargetMatches = func(pid int) bool { return true }
+	t.Cleanup(func() { externalInterruptTargetMatches = previousMatch })
+
 	t.Run("busy+alive→true", func(t *testing.T) {
 		const sid = "precheck-busy"
 		home := externalInterruptFixture(t, sid, livePidRecord(t, sid, `"status":"busy","entrypoint":"cli"`))
@@ -265,6 +272,15 @@ func TestGuardExternalTUIClaudeSpawn(t *testing.T) {
 	})
 	t.Run("empty home→allowed", func(t *testing.T) {
 		assert.NoError(t, guardExternalTUIClaudeSpawn("", "claude", sid))
+	})
+	t.Run("identity mismatch→allowed", func(t *testing.T) {
+		// pid 复用防护的另一半:记录指向的 pid 已被回收给无关进程时,不得把
+		// 它当「TUI busy」拦下手机回合——否则一条迟清理的死记录能永久拒绝
+		// 派发(比罕见的首轮双写更伤)。
+		previousMatch := externalInterruptTargetMatches
+		externalInterruptTargetMatches = func(pid int) bool { return false }
+		t.Cleanup(func() { externalInterruptTargetMatches = previousMatch })
+		assert.NoError(t, guardExternalTUIClaudeSpawn(home, "claude", sid))
 	})
 }
 

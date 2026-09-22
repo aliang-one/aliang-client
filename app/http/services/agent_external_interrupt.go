@@ -83,28 +83,40 @@ func newAgentExternalTUIBusyError() error { return agentExternalTUIBusyError{} }
 // and the windows unsupported case) degrades to ok=false so the caller falls
 // back to the legacy "stopped" reply. Best-effort by design: the ai.stop
 // handler must never fail because the TUI could not be interrupted.
-func interruptExternalClaudeTurn(home, nativeSessionID string) (pid int, ok bool) {
+// liveClaudeTUIRecord is the SINGLE gate both external-stop and the spawn
+// precheck go through: it returns the pid record for nativeSessionID only
+// when the record names a LIVE process that verifiably (best-effort) is a
+// claude process. The identity check matters on BOTH consumers — signaling a
+// recycled pid would interrupt an unrelated process, and treating a recycled
+// pid as "TUI busy" would permanently block phone turns. Claude Code prunes
+// dead pid records "not always promptly", so stale records naming recycled
+// pids are expected in the wild.
+func liveClaudeTUIRecord(home, nativeSessionID string) (agentRenamePidRecord, bool) {
 	nativeSessionID = strings.TrimSpace(nativeSessionID)
-	if nativeSessionID == "" {
-		return 0, false
-	}
 	home = strings.TrimSpace(home)
-	if home == "" {
-		return 0, false
+	if nativeSessionID == "" || home == "" {
+		return agentRenamePidRecord{}, false
 	}
 	record, found := loadClaudeRenameRecords(home)[nativeSessionID]
 	if !found || record.PID <= 0 {
-		logger.Info(fmt.Sprintf("ai.stop.external: no live pid record home=%q native=%s", home, nativeSessionID))
-		return 0, false
+		return agentRenamePidRecord{}, false
 	}
 	if !isPidAlive(record.PID) {
-		logger.Info(fmt.Sprintf("ai.stop.external: pid record is stale home=%q native=%s pid=%d", home, nativeSessionID, record.PID))
-		return 0, false
+		return agentRenamePidRecord{}, false
 	}
-	// Best-effort identity check: a pruned-late pid record may name a recycled
-	// pid that now belongs to an unrelated process — never signal that.
 	if !externalInterruptTargetMatches(record.PID) {
-		logger.Info(fmt.Sprintf("ai.stop.external: pid identity mismatch, refusing to signal home=%q native=%s pid=%d", home, nativeSessionID, record.PID))
+		logger.Info(fmt.Sprintf("ai.external: pid identity mismatch, treating as not-a-TUI home=%q native=%s pid=%d", home, nativeSessionID, record.PID))
+		return agentRenamePidRecord{}, false
+	}
+	return record, true
+}
+
+func interruptExternalClaudeTurn(home, nativeSessionID string) (pid int, ok bool) {
+	nativeSessionID = strings.TrimSpace(nativeSessionID)
+	home = strings.TrimSpace(home)
+	record, live := liveClaudeTUIRecord(home, nativeSessionID)
+	if !live {
+		logger.Info(fmt.Sprintf("ai.stop.external: no live claude TUI process home=%q native=%s", home, nativeSessionID))
 		return 0, false
 	}
 	// Debounce: within the window a repeat delivery is treated as success
@@ -143,20 +155,12 @@ func interruptExternalClaudeTurn(home, nativeSessionID string) (pid int, ok bool
 }
 
 // externalTUIBusy reports whether the live TUI process that owns
-// nativeSessionID is currently executing a turn (record exists && pid alive
-// && status busy). Idle TUIs do NOT block: resuming an idle conversation is
+// nativeSessionID is currently executing a turn (verified-live record &&
+// status busy). Idle TUIs do NOT block: resuming an idle conversation is
 // exactly the normal imported-session flow.
 func externalTUIBusy(home, nativeSessionID string) bool {
-	nativeSessionID = strings.TrimSpace(nativeSessionID)
-	if nativeSessionID == "" {
-		return false
-	}
-	home = strings.TrimSpace(home)
-	if home == "" {
-		return false
-	}
-	record, found := loadClaudeRenameRecords(home)[nativeSessionID]
-	if !found || record.PID <= 0 || !isPidAlive(record.PID) {
+	record, live := liveClaudeTUIRecord(home, nativeSessionID)
+	if !live {
 		return false
 	}
 	return strings.EqualFold(strings.TrimSpace(record.Status), "busy")
