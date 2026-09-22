@@ -293,8 +293,80 @@ func TestRenderFallsBackOnBrokenDiskJSON(t *testing.T) {
 		t.Fatalf("fallback template missing provider:\n%s", file.Content)
 	}
 	notes := strings.Join(resp.Variants[0].Notes, "\n")
-	if !strings.Contains(notes, "Could not parse the existing file") {
+	if !strings.Contains(notes, "Could not parse your existing opencode.json") {
 		t.Fatalf("degraded merge warning missing from notes:\n%s", notes)
+	}
+}
+
+// 对抗检查（Task 9 评审三态）：磁盘 config.toml 存在但读不了（chmod 000）→ 模板
+// 形态、MergedFromDisk=false、notes 点名 config.toml 的读盘警告。root 下 chmod 000
+// 仍可读，改用目录占位命中同一「非普通文件」unreadable 分支。
+func TestRenderFallsBackOnUnreadableFileWithNote(t *testing.T) {
+	home := t.TempDir()
+	cfgPath := filepath.Join(home, ".codex", "config.toml")
+	if err := os.MkdirAll(filepath.Dir(cfgPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if os.Geteuid() == 0 {
+		if err := os.Mkdir(cfgPath, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		if err := os.WriteFile(cfgPath, []byte("model = \"gpt-4o\"\n"), 0o000); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(cfgPath, 0o600) })
+	}
+	stubQuickSetupRenderEnv(t, home, []auth.UserAPIKey{
+		{ID: 1, Key: "sk-openai-real", Name: "OpenAI Key", Status: "active", Provider: "openai", SecretAvailable: true},
+	})
+
+	resp, err := (&QuickSetupService{}).Render(models.QuickSetupRenderRequest{
+		Software: "codex", KeyIDs: []int64{1},
+	})
+	if err != nil {
+		t.Fatalf("unreadable disk file must not fail the render: %v", err)
+	}
+	file := resp.Variants[0].Files[0]
+	if file.MergedFromDisk {
+		t.Fatal("unreadable disk content must not be marked merged_from_disk")
+	}
+	if !strings.Contains(file.Content, "[model_providers.aliang]") {
+		t.Fatalf("unreadable disk content must fall back to the template form:\n%s", file.Content)
+	}
+	notes := strings.Join(resp.Variants[0].Notes, "\n")
+	if !strings.Contains(notes, "Could not read the existing config.toml on disk; showing a fresh template instead.") {
+		t.Fatalf("unreadable file warning missing from notes:\n%s", notes)
+	}
+}
+
+// 0 字节的已存在文件归 missing 语义（Task 9 评审）：无内容可保留，横幅不该说
+// 「已合并」，也不该触发解析失败警告（JSON 侧空串 unmarshal 必失败，走的是本语义）。
+func TestRenderZeroByteFileIsMissing(t *testing.T) {
+	home := t.TempDir()
+	writeBackupFixture(t, home, ".codex/config.toml", "")
+	writeBackupFixture(t, home, ".codex/auth.json", "")
+	stubQuickSetupRenderEnv(t, home, []auth.UserAPIKey{
+		{ID: 1, Key: "sk-openai-real", Name: "OpenAI Key", Status: "active", Provider: "openai", SecretAvailable: true},
+	})
+
+	resp, err := (&QuickSetupService{}).Render(models.QuickSetupRenderRequest{
+		Software: "codex", KeyIDs: []int64{1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if configFile := resp.Variants[0].Files[0]; configFile.MergedFromDisk {
+		t.Fatal("zero-byte config.toml must be treated as missing, not merged_from_disk")
+	}
+	if authFile := resp.Variants[0].Files[1]; authFile.MergedFromDisk {
+		t.Fatal("zero-byte auth.json must be treated as missing, not merged_from_disk")
+	}
+	notes := strings.Join(resp.Variants[0].Notes, "\n")
+	for _, unwanted := range []string{"Could not read the existing", "Could not parse your existing"} {
+		if strings.Contains(notes, unwanted) {
+			t.Fatalf("zero-byte files must not raise degradation warnings:\n%s", notes)
+		}
 	}
 }
 
@@ -418,7 +490,7 @@ func TestRenderOpenCodeFallsBackOnArrayTopLevelJSON(t *testing.T) {
 	if _, ok := cfg["provider"]; !ok {
 		t.Fatalf("fallback template missing provider:\n%s", file.Content)
 	}
-	if notes := strings.Join(resp.Variants[0].Notes, "\n"); !strings.Contains(notes, "Could not parse the existing file") {
+	if notes := strings.Join(resp.Variants[0].Notes, "\n"); !strings.Contains(notes, "Could not parse your existing opencode.json") {
 		t.Fatalf("degraded merge warning missing from notes:\n%s", notes)
 	}
 }

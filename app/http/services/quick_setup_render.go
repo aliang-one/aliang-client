@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -387,7 +388,7 @@ func renderOpenCodeFiles(software models.QuickSetupSoftware, apiKeys []models.Qu
 		ensureOpenCodeProviderModel(providers, modelProviderID, smallModelName)
 		config["small_model"] = fmt.Sprintf("%s/%s", modelProviderID, smallModelName)
 	}
-	merged, mergedFromDisk, degradedNote, err := quickSetupMergedJSONObject(software.Code, fileDef.DefaultPath, home, config)
+	merged, mergedFromDisk, degradedNote, err := quickSetupMergedJSONObject(software.Code, quickSetupLeafFileName(fileDef.DefaultPath), fileDef.DefaultPath, home, config)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -693,43 +694,104 @@ func quickSetupInt64Field(item map[string]interface{}, key string) int64 {
 	}
 }
 
+// quickSetupReadState 是读磁盘现有配置的三态结果（Task 9 代码评审）：
+// missing = 不存在（或路径不可达：家目录为空/策略拒绝）→ 模板形态、无警告；
+// unreadable = 存在但读不了（非普通文件/权限拒绝/超大小上限）→ 模板形态 + 点名警告；
+// ok = 成功读出内容 → 走合并。
+type quickSetupReadState int
+
+const (
+	quickSetupReadMissing quickSetupReadState = iota
+	quickSetupReadUnreadable
+	quickSetupReadOK
+)
+
 // quickSetupReadExistingFile 只读读取磁盘上 defaultPath 对应的现有配置文件内容，
-// 供 Render 预览合并（spec §7）。任何失败（家目录为空、路径不可解析、不存在、
-// 非普通文件、超大小上限、读取出错）都返回 ("", false)，由调用方走模板兜底——
-// Render 是只读操作，绝不因本机环境差异整体报错。
-func quickSetupReadExistingFile(software, defaultPath, home string) (string, bool) {
+// 供 Render 预览合并（spec §7）。任何失败都不报错——Render 是只读操作，绝不因
+// 本机环境差异整体报错，由调用方按三态走模板兜底或降级警告。
+// 特例：0 字节的已存在文件归 missing（评审）——空文件没有内容可保留，
+// MergedFromDisk 不该为 true，也不该触发解析失败警告。
+func quickSetupReadExistingFile(software, defaultPath, home string) (string, quickSetupReadState) {
 	home = strings.TrimSpace(home)
 	if home == "" {
-		return "", false
+		return "", quickSetupReadMissing
 	}
 	resolved, err := resolveQuickSetupApplyPath(software, defaultPath, home)
 	if err != nil {
-		return "", false
+		// 解析失败需区分实情：目标位置存在但非普通文件（resolve 的普通文件闸门
+		// 拒绝，如目录占位）属于「存在但读不了」→ unreadable；其余（家目录空已
+		// 前置、路径越界等策略拒绝）维持现行为 missing，避免对未知状态误报警告。
+		if quickSetupTargetIsNonRegular(defaultPath, home) {
+			return "", quickSetupReadUnreadable
+		}
+		return "", quickSetupReadMissing
 	}
 	info, err := os.Stat(resolved)
-	if err != nil || !info.Mode().IsRegular() || info.Size() > quickSetupMaxApplyFileBytes {
-		return "", false
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", quickSetupReadMissing
+		}
+		return "", quickSetupReadUnreadable
+	}
+	if !info.Mode().IsRegular() || info.Size() > quickSetupMaxApplyFileBytes {
+		return "", quickSetupReadUnreadable
 	}
 	raw, err := os.ReadFile(resolved)
-	if err != nil || len(raw) > quickSetupMaxApplyFileBytes {
-		return "", false
+	if err != nil {
+		return "", quickSetupReadUnreadable
 	}
-	return string(raw), true
+	if len(raw) > quickSetupMaxApplyFileBytes {
+		return "", quickSetupReadUnreadable
+	}
+	if len(raw) == 0 {
+		return "", quickSetupReadMissing
+	}
+	return string(raw), quickSetupReadOK
+}
+
+// quickSetupTargetIsNonRegular 判断 defaultPath 展开后目标位置是否为「存在但非
+// 普通文件」（目录/设备等），供 resolve 策略拒绝时区分 unreadable 与 missing。
+// stat 失败（含不存在）一律不算此情形。
+func quickSetupTargetIsNonRegular(defaultPath, home string) bool {
+	expanded := expandQuickSetupHomePath(defaultPath, home)
+	if !filepath.IsAbs(expanded) {
+		return false
+	}
+	info, err := os.Stat(expanded)
+	if err != nil {
+		return false
+	}
+	return !info.Mode().IsRegular()
+}
+
+// quickSetupLeafFileName 从 defaultPath 取降级警告里点名的文件名（如 auth.json，
+// 评审 Minor 3——与 TOML 侧点名 config.toml 对称）。取不到有效段时原样返回。
+func quickSetupLeafFileName(defaultPath string) string {
+	leaf := filepath.Base(strings.TrimSpace(defaultPath))
+	if leaf == "" || leaf == "." || leaf == string(filepath.Separator) || leaf == "~" {
+		return defaultPath
+	}
+	return leaf
 }
 
 // quickSetupMergedJSONObject 读磁盘 existing 并与 incoming 深合并（incoming 键胜出），
-// 返回合并后的对象与合并状态。磁盘无文件 → 返回 incoming 原样；existing 解析失败 →
-// 同样返回模板并给出降级警告（spec §7：损坏的磁盘内容不得让预览失败）。
+// 返回合并后的对象与合并状态。fileName 由调用方传入，用于降级警告点名具体文件
+// （评审 Minor 3）。磁盘无文件 → 返回 incoming 原样、无警告；存在但读不了 → 同样
+// 返回模板并给出点名读盘警告；existing 解析失败 → 返回模板并给出点名解析警告
+// （spec §7：损坏的磁盘内容不得让预览失败）。
 // 注意：返回值可能与 incoming 共享子 map 引用（mergeQuickSetupJSONInto 契约），
 // 调用方不得再修改 incoming 的子对象；各渲染器的载荷均为每次调用新建，满足该约束。
-func quickSetupMergedJSONObject(software, defaultPath, home string, incoming map[string]interface{}) (merged map[string]interface{}, mergedFromDisk bool, degradedNote string, err error) {
-	raw, onDisk := quickSetupReadExistingFile(software, defaultPath, home)
-	if !onDisk {
+func quickSetupMergedJSONObject(software, fileName, defaultPath, home string, incoming map[string]interface{}) (merged map[string]interface{}, mergedFromDisk bool, degradedNote string, err error) {
+	raw, state := quickSetupReadExistingFile(software, defaultPath, home)
+	switch state {
+	case quickSetupReadMissing:
 		return incoming, false, "", nil
+	case quickSetupReadUnreadable:
+		return incoming, false, "Could not read the existing " + fileName + " on disk; showing a fresh template instead. It will not be modified.", nil
 	}
 	var existing map[string]interface{}
 	if jsonErr := json.Unmarshal([]byte(raw), &existing); jsonErr != nil {
-		return incoming, false, "Could not parse the existing file on disk; showing a fresh template instead. Review carefully before applying — applying will replace the existing file.", nil
+		return incoming, false, "Could not parse your existing " + fileName + "; showing a fresh template instead. Review carefully before applying — applying will replace the existing file.", nil
 	}
 	merged, _ = mergeQuickSetupJSONObjects(existing, incoming)
 	return merged, true, "", nil
@@ -785,14 +847,23 @@ func renderCodexFiles(software models.QuickSetupSoftware, apiKey models.QuickSet
 }
 
 // renderCodexConfigPreview 产出 config.toml 预览：磁盘有文件走 mergeCodexTOML
-// 行级拼接；磁盘无文件/读取失败也走 mergeCodexTOML("") 的模板形态——保证全新安装
+// 行级拼接；磁盘无文件/读不了也走 mergeCodexTOML("") 的模板形态——保证全新安装
 // 同样产出统一 [model_providers.aliang] 段，而非旧版 openai/gateway 表（DoD #4 与
-// config-state 的 managed 判定都依赖这一点）。返回内容、是否合并自磁盘、降级警告。
+// config-state 的 managed 判定都依赖这一点）。读不了（评审三态）补点名警告。
+// 返回内容、是否合并自磁盘、降级警告。
 func renderCodexConfigPreview(model, baseURL, softwareCode, defaultPath, home string) (string, bool, string) {
-	existing, onDisk := quickSetupReadExistingFile(softwareCode, defaultPath, home)
+	fileName := quickSetupLeafFileName(defaultPath)
+	existing, state := quickSetupReadExistingFile(softwareCode, defaultPath, home)
+	if state != quickSetupReadOK {
+		existing = "" // missing/unreadable 一律模板形态（unreadable 在成功路径补警告）
+	}
 	merged, err := mergeCodexTOML(existing, model, baseURL)
 	if err == nil {
-		return merged, onDisk, ""
+		note := ""
+		if state == quickSetupReadUnreadable {
+			note = "Could not read the existing " + fileName + " on disk; showing a fresh template instead. It will not be modified."
+		}
+		return merged, state == quickSetupReadOK, note
 	}
 	// Task 6 审查红线：mergeCodexTOML 的错误必须显式处理，不得静默吞掉。
 	// 降级为「模板形态」（空 existing），并给出人话警告让用户应用前自查。
@@ -801,18 +872,19 @@ func renderCodexConfigPreview(model, baseURL, softwareCode, defaultPath, home st
 		// 理论不可达（空输入必产出合法 TOML）；仍按红线兜底为最小模板字符串。
 		merged = fallbackCodexTemplateTOML(model, baseURL)
 	}
-	return merged, false, "Your existing config.toml could not be merged safely, so the preview shows a fresh template. Review carefully before applying — applying will replace the existing file."
+	return merged, false, "Your existing " + fileName + " could not be merged safely, so the preview shows a fresh template. Review carefully before applying — applying will replace the existing file."
 }
 
 // fallbackCodexTemplateTOML 是 renderCodexConfigPreview 的最后兜底：与
 // mergeCodexTOML("", ...) 的模板形态等价的最小字符串（仅在我们键 + aliang 段）。
+// 末尾换行与 mergeCodexTOML 产物保持一致（评审 Minor 4）。
 func fallbackCodexTemplateTOML(model, baseURL string) string {
 	lines := append([]string{
 		"model = " + quickSetupTOMLQuote(model),
 		"model_provider = " + quickSetupTOMLQuote(quickSetupCodexProviderID),
 		"",
 	}, buildCodexAliangSection(baseURL, "")...)
-	return strings.Join(lines, "\n")
+	return strings.Join(lines, "\n") + "\n"
 }
 
 // renderCodexAuthPreview 产出 auth.json 预览：磁盘有文件走 JSON 深合并（保住
@@ -823,7 +895,7 @@ func renderCodexAuthPreview(apiKey models.QuickSetupAPIKey, softwareCode, defaul
 		value = ""
 	}
 	template := map[string]interface{}{"OPENAI_API_KEY": value}
-	merged, mergedFromDisk, degradedNote, err := quickSetupMergedJSONObject(softwareCode, defaultPath, home, template)
+	merged, mergedFromDisk, degradedNote, err := quickSetupMergedJSONObject(softwareCode, quickSetupLeafFileName(defaultPath), defaultPath, home, template)
 	if err != nil {
 		return "", false, "", err
 	}
@@ -861,7 +933,7 @@ func renderClaudeCodeFiles(software models.QuickSetupSoftware, apiKey models.Qui
 	baseURL := strings.TrimSuffix(resolveQuickSetupInferenceBaseURL(apiRoot), "/v1")
 	payload := renderClaudeSettingsEnv(apiKey.Key, model, baseURL)
 
-	merged, mergedFromDisk, degradedNote, err := quickSetupMergedJSONObject(software.Code, fileDef.DefaultPath, home, payload)
+	merged, mergedFromDisk, degradedNote, err := quickSetupMergedJSONObject(software.Code, quickSetupLeafFileName(fileDef.DefaultPath), fileDef.DefaultPath, home, payload)
 	if err != nil {
 		return nil, nil, err
 	}
