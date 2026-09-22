@@ -1230,6 +1230,52 @@ func TestSyncUserAgentAfterAuthWithRetryConvergesAfterAgentStarts(t *testing.T) 
 	}
 }
 
+func TestSyncUserAgentAfterAuthWithRetryAbortsOnPrePushRefreshFailure(t *testing.T) {
+	resetAgentAuthSyncCoordinatorForTest(t)
+	origFresh := ensureFreshRegisterAuthHeaderForPush
+	t.Cleanup(func() { ensureFreshRegisterAuthHeaderForPush = origFresh })
+	// 过期 token 且刷新失败：推送必须中止，绝不把死 token 递给注册路径。
+	ensureFreshRegisterAuthHeaderForPush = func() (string, error) {
+		return "", errors.New("pre-push token refresh failed: dial tcp: connection refused")
+	}
+
+	var attempts int
+	agentAuthSyncAttempt = func(string) error {
+		attempts++
+		return nil
+	}
+	agentAuthSyncSleep = func(time.Duration) {}
+
+	err := SyncUserAgentAfterAuthWithRetry("login")
+	if err == nil {
+		t.Fatalf("SyncUserAgentAfterAuthWithRetry() error = nil, want pre-push refresh failure")
+	}
+	if attempts != 0 {
+		t.Fatalf("sync attempts = %d, want 0 (push must not proceed with a stale token)", attempts)
+	}
+}
+
+func TestSyncUserAgentAfterAuthWithRetryInvokesFreshnessGuardBeforePush(t *testing.T) {
+	resetAgentAuthSyncCoordinatorForTest(t)
+	origFresh := ensureFreshRegisterAuthHeaderForPush
+	t.Cleanup(func() { ensureFreshRegisterAuthHeaderForPush = origFresh })
+	var guardCalls int
+	ensureFreshRegisterAuthHeaderForPush = func() (string, error) {
+		guardCalls++
+		return "Bearer access-guarded", nil
+	}
+
+	agentAuthSyncAttempt = func(string) error { return nil }
+	agentAuthSyncSleep = func(time.Duration) {}
+
+	if err := SyncUserAgentAfterAuthWithRetry("login"); err != nil {
+		t.Fatalf("SyncUserAgentAfterAuthWithRetry() error = %v", err)
+	}
+	if guardCalls != 1 {
+		t.Fatalf("freshness guard calls = %d, want 1", guardCalls)
+	}
+}
+
 func TestSyncUserAgentAfterAuthWithRetryCoalescesConcurrentRefreshAndRestore(t *testing.T) {
 	resetAgentAuthSyncCoordinatorForTest(t)
 	auth.SetSessionOwnerProcess(true)
