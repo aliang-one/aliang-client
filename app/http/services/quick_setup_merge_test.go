@@ -190,3 +190,68 @@ func TestMergeCodexTOML_CRLF(t *testing.T) {
 		t.Fatalf("output not valid TOML: %v\n%s", err, got)
 	}
 }
+
+// 对抗性检查：表头紧贴行尾注释（`[x]# c` 合法 TOML 写法）也必须识别为我们的段，
+// 否则旧段原样保留 + 新段追加会产生重复表，闸门直接报错。
+func TestMergeCodexTOML_TrailingCommentTableHeader(t *testing.T) {
+	existing := "[model_providers.aliang]# legacy\n" +
+		"custom = 1\n" +
+		"\n" +
+		"[mcp_servers.fs]\n" +
+		"command = \"uvx\"\n"
+	got, err := mergeCodexTOML(existing, "m", "http://x/v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	headers := 0
+	for _, ln := range strings.Split(got, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(strings.TrimRight(ln, "\r")), "[model_providers.aliang]") {
+			headers++
+		}
+	}
+	if headers != 1 {
+		t.Fatalf("want exactly 1 aliang table header, got %d:\n%s", headers, got)
+	}
+	if strings.Contains(got, "custom = 1") {
+		t.Fatalf("stale custom key survived (we own the section):\n%s", got)
+	}
+	if !strings.Contains(got, "[mcp_servers.fs]") || !strings.Contains(got, `command = "uvx"`) {
+		t.Fatalf("user's other section lost:\n%s", got)
+	}
+	if !strings.Contains(got, `base_url = "http://x/v1"`) {
+		t.Fatalf("our base_url missing:\n%s", got)
+	}
+	var v map[string]interface{}
+	if err := toml.Unmarshal([]byte(got), &v); err != nil {
+		t.Fatalf("output not valid TOML: %v\n%s", err, got)
+	}
+}
+
+// 闸门契约：合并产物不是合法 TOML 时必须报错且不产出任何输出（可能损坏用户
+// 配置的结果一个字节都不能给）。
+func TestMergeCodexTOMLGates(t *testing.T) {
+	cases := []struct {
+		name     string
+		existing string
+	}{
+		{
+			name:     "未闭合多行字符串",
+			existing: "instructions = \"\"\"\nsome retained text\n",
+		},
+		{
+			name:     "数组表与我们的段同名冲突",
+			existing: "[[model_providers.aliang]]\nname = \"array\"\n",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := mergeCodexTOML(tc.existing, "m", "http://x/v1")
+			if err == nil {
+				t.Fatalf("want error, got nil; output:\n%s", got)
+			}
+			if got != "" {
+				t.Fatalf("want empty output on gate failure, got:\n%s", got)
+			}
+		})
+	}
+}

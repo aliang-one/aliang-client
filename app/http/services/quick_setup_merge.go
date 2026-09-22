@@ -38,10 +38,11 @@ func mergeQuickSetupJSONInto(dst, src map[string]interface{}) {
 const quickSetupCodexProviderID = "aliang"
 
 // 表头行识别：TOML 表名（裸键或基础字符串键）不得含 `]` 与 `#`，
-// 因此 ^\[名字]$（可带行尾注释）足以区分真表头与数组续行/行内 table 值。
+// 因此 ^\[名字]$（可带行尾空白与注释，含紧贴 ] 的 #）足以区分真表头
+// 与数组续行/行内 table 值。注释前不强制空白——`[x]# c` 也是合法 TOML。
 var (
-	codexTableHeaderRe      = regexp.MustCompile(`^\[([^#\]]+)](\s+#.*)?$`)
-	codexArrayTableHeaderRe = regexp.MustCompile(`^\[\[([^#\]]+)]](\s+#.*)?$`)
+	codexTableHeaderRe      = regexp.MustCompile(`^\[([^#\]]+)]\s*(?:#.*)?$`)
+	codexArrayTableHeaderRe = regexp.MustCompile(`^\[\[([^#\]]+)]]\s*(?:#.*)?$`)
 )
 
 // mergeCodexTOML 把我们管理的顶层键（model / model_provider）与
@@ -109,10 +110,11 @@ func mergeCodexTOML(existing, model, baseURL string) (string, error) {
 				inAliang = true
 				continue // 表头行由段体替换逻辑重建
 			}
+			// 表头行不 toggle 多行状态：能走到这里（非多行态）的一定是真表头，
+			// 其非注释部分只是 [名字]，不可能开启多行字符串；行尾注释里的
+			// 奇数个 """ 是合法 TOML 但不构成定界符，在此 toggle 只会假进入
+			// 多行态，静默吞掉后续表头/顶层键的识别。
 			kept = append(kept, raw)
-			if codexQuoteToggle(line) {
-				inMultiline = true
-			}
 			continue
 		}
 
@@ -154,8 +156,9 @@ func mergeCodexTOML(existing, model, baseURL string) (string, error) {
 		}
 		kept = quickSetupInsertLines(kept, idx, sectionLines)
 	} else {
-		// 没有旧段：追加到文件尾，保证段前恰好一个空行
-		// （末尾两个空串=文件本就以空行结尾；单个空串=仅是行终止符的影子）
+		// 没有旧段：追加到文件尾。段前保证至少一个空行，但不保证恰好一个——
+		// 文件无尾换行时恰补一个；以换行结尾时行终止符的影子会多出一个，
+		// 尾部已有空行则进一步叠加（多出的空行仅影响版式，不影响 TOML 语义）。
 		needBlank := true
 		if n := len(kept); n > 0 && strings.TrimSpace(kept[n-1]) == "" {
 			needBlank = n < 2 || strings.TrimSpace(kept[n-2]) != ""
