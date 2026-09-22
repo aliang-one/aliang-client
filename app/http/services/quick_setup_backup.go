@@ -18,6 +18,9 @@ import (
 
 const quickSetupManifestKindOriginal = "original"
 
+// quickSetupManifestVersion 当前 manifest 格式版本；load 时严格门禁，未来升级需迁移。
+const quickSetupManifestVersion = 1
+
 type quickSetupManifestEntry struct {
 	Software      string `json:"software"`
 	FileCode      string `json:"file_code"`
@@ -48,10 +51,18 @@ func quickSetupContractPath(homeDir, absPath string) string {
 	return "~/" + filepath.ToSlash(rel)
 }
 
-// loadQuickSetupManifest：不存在返回空 manifest；存在但解析失败返回错误（fail-safe，
-// 上游必须拒绝 apply，防止把我们的配置当「原始配置」重新备份，spec §6.3-5）。
+// quickSetupBackupFileName 备份文件名 = <sha256(contract 路径) 前 12 hex>-<basename>。
+// 同一 software 下两个同 basename 的不同路径（custom-* 允许嵌套子路径）必须不互相覆盖。
+func quickSetupBackupFileName(contract, absPath string) string {
+	sum := sha256.Sum256([]byte(contract))
+	return hex.EncodeToString(sum[:])[:12] + "-" + filepath.Base(absPath)
+}
+
+// loadQuickSetupManifest：不存在返回空 manifest；存在但解析失败、缺失 version 字段
+// （含 JSON null）或版本不兼容均返回错误（fail-safe，上游必须拒绝 apply，防止把我们
+// 的配置当「原始配置」重新备份，spec §6.3-5）。
 func loadQuickSetupManifest(homeDir string) (quickSetupManifest, error) {
-	m := quickSetupManifest{Version: 1}
+	m := quickSetupManifest{Version: quickSetupManifestVersion}
 	raw, err := os.ReadFile(quickSetupManifestPath(homeDir))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -59,18 +70,26 @@ func loadQuickSetupManifest(homeDir string) (quickSetupManifest, error) {
 		}
 		return m, err
 	}
-	if err := json.Unmarshal(raw, &m); err != nil {
-		return quickSetupManifest{Version: 1}, fmt.Errorf("quick setup backup manifest is corrupt (%s): %w", quickSetupManifestPath(homeDir), err)
+	var loaded quickSetupManifest
+	if err := json.Unmarshal(raw, &loaded); err != nil {
+		return quickSetupManifest{Version: quickSetupManifestVersion}, fmt.Errorf("quick setup backup manifest is corrupt (%s): %w", quickSetupManifestPath(homeDir), err)
 	}
-	return m, nil
+	if loaded.Version != quickSetupManifestVersion {
+		return quickSetupManifest{Version: quickSetupManifestVersion}, fmt.Errorf("quick setup backup manifest version %d is not supported (%s): expected %d", loaded.Version, quickSetupManifestPath(homeDir), quickSetupManifestVersion)
+	}
+	return loaded, nil
 }
 
-func saveQuickSetupManifest(homeDir string, m quickSetupManifest) error {
+func saveQuickSetupManifest(targetUser quickSetupTargetUser, m quickSetupManifest) error {
 	raw, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
 		return err
 	}
-	return writeConfigFile(quickSetupManifestPath(homeDir), string(raw)+"\n")
+	path := quickSetupManifestPath(targetUser.homeDir)
+	if err := writeConfigFile(path, string(raw)+"\n"); err != nil {
+		return err
+	}
+	return quickSetupAdjustOwnershipFn(path, targetUser)
 }
 
 func findQuickSetupManifestEntry(m quickSetupManifest, originalPath string) (quickSetupManifestEntry, bool) {
@@ -85,7 +104,11 @@ func findQuickSetupManifestEntry(m quickSetupManifest, originalPath string) (qui
 // backupQuickSetupFiles 在写配置前落盘原始内容（first-backup-wins，spec §6.3-1）。
 // 任何失败都必须让调用方在写配置前中止。infos 描述本轮各文件在磁盘上的状态
 // （是否已存在），与是否新落了备份无关。
-func backupQuickSetupFiles(homeDir string, software string, files []quickSetupPreparedFile) ([]models.QuickSetupBackupInfo, error) {
+//
+// 隐式依赖：1MB 单文件上限由调用方保证——Apply 在 quickSetupMaxApplyFileBytes
+// 校验（含磁盘上已存在文件的读取）之后才调用本函数，本函数不重复检查。
+func backupQuickSetupFiles(targetUser quickSetupTargetUser, software string, files []quickSetupPreparedFile) ([]models.QuickSetupBackupInfo, error) {
+	homeDir := targetUser.homeDir
 	m, err := loadQuickSetupManifest(homeDir)
 	if err != nil {
 		return nil, err
@@ -103,7 +126,7 @@ func backupQuickSetupFiles(homeDir string, software string, files []quickSetupPr
 				infos = append(infos, models.QuickSetupBackupInfo{OriginalPath: contract, BackupPath: entry.BackupPath, ExistedBefore: true})
 				continue
 			}
-			backupRel := filepath.Join(".aliang", "quick-setup", "backups", software, filepath.Base(file.path))
+			backupRel := filepath.Join(".aliang", "quick-setup", "backups", software, quickSetupBackupFileName(contract, file.path))
 			backupAbs := filepath.Join(homeDir, backupRel)
 			sum := sha256.Sum256(existing)
 			entry := quickSetupManifestEntry{
@@ -116,6 +139,9 @@ func backupQuickSetupFiles(homeDir string, software string, files []quickSetupPr
 				entry.Mode = uint32(st.Mode().Perm())
 			}
 			if err := writeConfigFile(backupAbs, string(existing)); err != nil {
+				return nil, fmt.Errorf("backup %s failed: %w", contract, err)
+			}
+			if err := quickSetupAdjustOwnershipFn(backupAbs, targetUser); err != nil {
 				return nil, fmt.Errorf("backup %s failed: %w", contract, err)
 			}
 			m.Backups = append(m.Backups, entry)
@@ -137,7 +163,7 @@ func backupQuickSetupFiles(homeDir string, software string, files []quickSetupPr
 		}
 	}
 	if dirty {
-		if err := saveQuickSetupManifest(homeDir, m); err != nil {
+		if err := saveQuickSetupManifest(targetUser, m); err != nil {
 			return nil, fmt.Errorf("save backup manifest failed: %w", err)
 		}
 	}
@@ -146,13 +172,20 @@ func backupQuickSetupFiles(homeDir string, software string, files []quickSetupPr
 
 // restoreQuickSetupSoftware 按 software 整体还原（spec §6.3-3）：
 // existed_before=true 复制备份回原路径；false 删除文件；成功条目从 manifest 清除并删除备份文件。
-func restoreQuickSetupSoftware(homeDir, software string) (models.QuickSetupRestoreResponse, error) {
+//
+// 顺序契约：必须先把过滤后的 manifest 持久化成功，之后才删除备份文件。若先删文件
+// 而 save 失败，残留条目会以 first-backup-wins 阻断下次 apply 重新备份，导致用户
+// 原始配置永久丢失；反过来 save 失败时备份文件仍在、条目仍在，restore 可安全重试
+// （删除失败仅留下孤儿备份文件，无害）。
+func restoreQuickSetupSoftware(targetUser quickSetupTargetUser, software string) (models.QuickSetupRestoreResponse, error) {
+	homeDir := targetUser.homeDir
 	resp := models.QuickSetupRestoreResponse{}
 	m, err := loadQuickSetupManifest(homeDir)
 	if err != nil {
 		return resp, err
 	}
 	kept := m.Backups[:0]
+	succeeded := make([]quickSetupManifestEntry, 0, len(m.Backups))
 	for _, entry := range m.Backups {
 		if entry.Software != software {
 			kept = append(kept, entry)
@@ -176,6 +209,11 @@ func restoreQuickSetupSoftware(homeDir, software string) (models.QuickSetupResto
 				kept = append(kept, entry)
 				continue
 			}
+			if err := quickSetupAdjustOwnershipFn(originalAbs, targetUser); err != nil {
+				resp.Failed = append(resp.Failed, models.QuickSetupRestoreFailure{Path: entry.OriginalPath, Error: err.Error()})
+				kept = append(kept, entry)
+				continue
+			}
 			_ = os.Chmod(originalAbs, mode)
 			resp.Restored = append(resp.Restored, entry.OriginalPath)
 		default:
@@ -186,13 +224,16 @@ func restoreQuickSetupSoftware(homeDir, software string) (models.QuickSetupResto
 			}
 			resp.Deleted = append(resp.Deleted, entry.OriginalPath)
 		}
+		succeeded = append(succeeded, entry)
+	}
+	m.Backups = kept
+	if err := saveQuickSetupManifest(targetUser, m); err != nil {
+		return resp, err
+	}
+	for _, entry := range succeeded {
 		if entry.BackupPath != "" {
 			_ = os.Remove(expandQuickSetupHomePath(entry.BackupPath, homeDir))
 		}
-	}
-	m.Backups = kept
-	if err := saveQuickSetupManifest(homeDir, m); err != nil {
-		return resp, err
 	}
 	return resp, nil
 }
