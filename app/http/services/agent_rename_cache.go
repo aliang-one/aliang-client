@@ -2,6 +2,7 @@ package services
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"sort"
@@ -215,6 +216,20 @@ func (s *AgentService) handleRemoteAIRename(msg map[string]interface{}, writeJSO
 	if err := saveAgentRenameCache(entries); err != nil {
 		logger.Warn("[AGENT-RENAME] phone_rename_persist_failed sid=" + nativeID + " error=" + err.Error())
 	}
+	// Mirror the rename into Claude Code's own transcript so the desktop TUI
+	// /resume list shows the phone-chosen name too (its list builder takes the
+	// LAST custom-title line per session). Best-effort only: the rename cache
+	// above remains the phone-side source of truth, so a failure here is
+	// logged and never fails the rename or its ack.
+	if home := agentHome(); home != "" {
+		if err := appendClaudeCustomTitleLine(filepath.Join(home, ".claude", "projects"), nativeID, title); err != nil {
+			if errors.Is(err, errClaudeTranscriptNotFound) {
+				logger.Warn("[AGENT-RENAME] transcript_not_found sid=" + nativeID)
+			} else {
+				logger.Warn("[AGENT-RENAME] transcript_custom_title_failed sid=" + nativeID + " error=" + err.Error())
+			}
+		}
+	}
 	// Push the updated inventory immediately: the rename (and the resulting
 	// title_updated_at stamps) reach the phone in this round trip instead of
 	// waiting for the digest tick or the minute backstop. Log-only on failure.
@@ -227,4 +242,79 @@ func (s *AgentService) handleRemoteAIRename(msg map[string]interface{}, writeJSO
 		"accepted":         true,
 		"title_updated_at": now,
 	})
+}
+
+// errClaudeTranscriptNotFound reports that no Claude Code transcript file
+// exists on this machine for the renamed session (e.g. a conversation
+// imported from another device). It is log-only: the agent's rename cache
+// remains the phone-side source of truth either way.
+var errClaudeTranscriptNotFound = errors.New("claude transcript not found")
+
+// appendClaudeCustomTitleLine mirrors a conversation rename into Claude
+// Code's own transcript so the desktop TUI /resume list shows the same name
+// as the phone. Claude Code records /rename titles by appending one
+// {"type":"custom-title",...} line to the session's JSONL and its list
+// builder takes the LAST such line per session — so "updating the title" is
+// implemented strictly as an append, never a rewrite.
+//
+// Data-safety contract (the transcript is the user's conversation history):
+//   - the file is opened write-only with O_APPEND, never read-modify-written
+//     and never truncated — existing bytes cannot be altered;
+//   - O_CREATE is never set: a missing transcript is reported via
+//     errClaudeTranscriptNotFound instead of fabricating a bare custom-title
+//     file, which would surface as an empty ghost session in /resume;
+//   - if the file does not end in a newline (a torn write by some earlier
+//     process), a separator newline is prepended so the existing partial
+//     line is not glued to the new record;
+//   - json.Marshal escapes newlines/quotes, guaranteeing the record stays
+//     exactly ONE physical line so every line-oriented parser stays intact.
+func appendClaudeCustomTitleLine(root, nativeSessionID, title string) error {
+	nativeSessionID = strings.TrimSpace(nativeSessionID)
+	title = strings.TrimSpace(title)
+	if strings.TrimSpace(root) == "" || nativeSessionID == "" || title == "" {
+		return nil // nothing meaningful to mirror
+	}
+	matches := findRecentAgentFiles(root, nativeSessionID+".jsonl", agentVibeDetailCandidateFileLimit)
+	if len(matches) == 0 {
+		return errClaudeTranscriptNotFound
+	}
+	path := matches[0]
+	record, err := json.Marshal(map[string]string{
+		"type":        "custom-title",
+		"customTitle": title,
+		"sessionId":   nativeSessionID,
+	})
+	if err != nil {
+		return err
+	}
+	payload := append(record, '\n')
+	if info, err := os.Stat(path); err == nil && info.Size() > 0 {
+		if last, err := readLastByte(path); err == nil && last != '\n' {
+			payload = append([]byte{'\n'}, payload...)
+		}
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = f.Write(payload)
+	return err
+}
+
+func readLastByte(path string) (byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return 0, err
+	}
+	buf := make([]byte, 1)
+	if _, err := f.ReadAt(buf, info.Size()-1); err != nil {
+		return 0, err
+	}
+	return buf[0], nil
 }
