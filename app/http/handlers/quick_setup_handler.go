@@ -2,8 +2,11 @@ package handlers
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
+
+	"aliang.one/nursorgate/common/logger"
 
 	"aliang.one/nursorgate/app/http/common"
 	"aliang.one/nursorgate/app/http/middleware"
@@ -197,6 +200,9 @@ func (h *QuickSetupHandler) HandleRestore(w http.ResponseWriter, r *http.Request
 			common.ErrorBadRequest(w, err.Error(), nil)
 			return
 		}
+		// 可观测性：manifest 保存失败等场景下 Restore 会带着部分成功的结果返回
+		// 非 nil error，resp 随 500 被整体丢弃——留一条摘要日志便于事后排查。
+		logger.Error(fmt.Sprintf("[quick-setup] restore failed (software %q): %v; partial results before failure: restored=%d, deleted=%d, failed=%d", req.Software, err, len(resp.Restored), len(resp.Deleted), len(resp.Failed)))
 		common.ErrorInternalServer(w, "Quick setup restore failed", map[string]interface{}{"error": err.Error()})
 		return
 	}
