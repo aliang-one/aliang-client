@@ -877,6 +877,28 @@ func TestApplyRemoteProjectSettingsTriggersPolicyRefetch(t *testing.T) {
 	if h := svc.effectiveApprovalPolicyForPath("/proj/push").Hash; h != "sha256:remote-v2" {
 		t.Fatalf("policy not refetched after project push; hash=%q", h)
 	}
+
+	// The push spawns `go ensurePolicyBeforeRun`; its tail (persistPolicyCacheForPath)
+	// still resolves the cache-dir singleton AFTER the in-memory hash above becomes
+	// observable, while this test's cleanup resets that singleton unsynchronized
+	// (ResetCacheDirForTest). Wait for the goroutine's last cache-dir access — the
+	// on-disk approval_policy.json write — before returning so cleanup cannot race.
+	cachePath, err := approvalPolicyCachePath()
+	if err != nil {
+		t.Fatalf("approvalPolicyCachePath() error = %v", err)
+	}
+	persisted := false
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if raw, err := os.ReadFile(cachePath); err == nil && strings.Contains(string(raw), "sha256:remote-v2") {
+			persisted = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !persisted {
+		t.Fatalf("policy cache file %s never recorded the refetched policy", cachePath)
+	}
 }
 
 // ---- Task 8: approval request carries policy context (matched_rule_id / policy_version) ----

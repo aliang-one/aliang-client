@@ -962,6 +962,28 @@ func TestAgentServiceSyncReRegistersAfterLogoutWithForwardedJwt(t *testing.T) {
 	if !status.Enabled || !status.Registered {
 		t.Fatalf("agent not re-registered after re-login sync: %#v", status)
 	}
+
+	// The successful sync spawned the background remoteConnectionLoop
+	// (EnsureRemoteConnection), whose teardown keeps writing agent state
+	// (saveStateLocked -> GetCacheDir) while retrying the dial. This test's
+	// cleanup resets the cache-dir singleton unsynchronized
+	// (ResetCacheDirForTest), so stop the loop and WAIT for it to exit before
+	// returning. wsConnecting stays true for the loop's whole life and is
+	// cleared by its deferred teardown — it is the loop-exit signal.
+	service.DisableWithReason("logout")
+	loopExitDeadline := time.Now().Add(8 * time.Second)
+	for {
+		service.wsMu.Lock()
+		connecting := service.wsConnecting
+		service.wsMu.Unlock()
+		if !connecting {
+			break
+		}
+		if time.Now().After(loopExitDeadline) {
+			t.Fatal("remoteConnectionLoop did not exit after disable; would race the cache-dir reset in cleanup")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 func TestAgentServiceKeepsForwardedAccessTokenInMemory(t *testing.T) {
