@@ -15,6 +15,7 @@ import (
 type QuickSetupService struct{}
 
 type quickSetupPreparedFile struct {
+	code    string
 	path    string
 	content string
 }

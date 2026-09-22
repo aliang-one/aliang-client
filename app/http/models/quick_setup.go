@@ -107,3 +107,20 @@ type QuickSetupApplyResponse struct {
 	Software string   `json:"software"`
 	Written  []string `json:"written"`
 }
+
+type QuickSetupBackupInfo struct {
+	OriginalPath  string `json:"original_path"`
+	BackupPath    string `json:"backup_path,omitempty"`
+	ExistedBefore bool   `json:"existed_before"`
+}
+
+type QuickSetupRestoreFailure struct {
+	Path  string `json:"path"`
+	Error string `json:"error"`
+}
+
+type QuickSetupRestoreResponse struct {
+	Restored []string                   `json:"restored"`
+	Deleted  []string                   `json:"deleted"`
+	Failed   []QuickSetupRestoreFailure `json:"failed"`
+}
