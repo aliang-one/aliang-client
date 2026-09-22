@@ -33,6 +33,9 @@ func (s *QuickSetupService) Render(req models.QuickSetupRenderRequest) (*models.
 	if err != nil {
 		return nil, err
 	}
+	// 接入模式只换 host 根（spec §7.1）：local → 本地推理代理；public/未知/空 → 推理面
+	// 域名。非法 mode 值与空值一致回落 public 而不报错，旧前端不传 mode 时保持现行为。
+	modeRoot := quickSetupModeRoot(req.Mode, baseRoot)
 
 	apiKeys, err := quickSetupGetAPIKeysFn()
 	if err != nil {
@@ -50,9 +53,9 @@ func (s *QuickSetupService) Render(req models.QuickSetupRenderRequest) (*models.
 		selectedIDs[id] = struct{}{}
 	}
 
-	keys := toQuickSetupAPIKeys(apiKeys, baseRoot)
+	keys := toQuickSetupAPIKeys(apiKeys, modeRoot)
 	if softwareDef.Code == "opencode" {
-		variants, err := renderOpenCodeVariants(softwareDef, keys, selectedIDs, req.OpenCode, baseRoot)
+		variants, err := renderOpenCodeVariants(softwareDef, keys, selectedIDs, req.OpenCode, modeRoot)
 		if err != nil {
 			return nil, err
 		}
@@ -75,7 +78,7 @@ func (s *QuickSetupService) Render(req models.QuickSetupRenderRequest) (*models.
 			return nil, fmt.Errorf("plaintext secret is required for selected API key %q", key.Name)
 		}
 
-		files, notes, err := renderQuickSetupFiles(softwareDef, key, baseRoot)
+		files, notes, err := renderQuickSetupFiles(softwareDef, key, modeRoot)
 		if err != nil {
 			return nil, err
 		}
@@ -866,4 +869,13 @@ func resolveQuickSetupInferenceBaseURL(baseURL string) string {
 	}
 	parsed.Host = host
 	return strings.TrimRight(parsed.String(), "/")
+}
+
+// quickSetupModeRoot 把接入模式换算成 host 根（spec §7.1）：
+// local → 本地推理代理（引用 defaults 常量，禁止硬编码）；public/未知/空 → 推理面域名。
+func quickSetupModeRoot(mode, apiRoot string) string {
+	if strings.EqualFold(strings.TrimSpace(mode), "local") {
+		return "http://" + config.DefaultHTTPProxyAddr
+	}
+	return resolveQuickSetupInferenceBaseURL(apiRoot)
 }

@@ -56,6 +56,7 @@ type QuickSetupModelsResponse struct {
 
 type QuickSetupRenderRequest struct {
 	Software string              `json:"software"`
+	Mode     string              `json:"mode,omitempty"`
 	KeyIDs   []int64             `json:"key_ids,omitempty"`
 	OpenCode *OpenCodeRenderSpec `json:"opencode,omitempty"`
 }
@@ -68,12 +69,13 @@ type OpenCodeRenderSpec struct {
 }
 
 type QuickSetupPreviewFile struct {
-	Code    string `json:"code"`
-	Label   string `json:"label"`
-	Path    string `json:"path"`
-	Format  string `json:"format"`
-	Kind    string `json:"kind"`
-	Content string `json:"content"`
+	Code           string `json:"code"`
+	Label          string `json:"label"`
+	Path           string `json:"path"`
+	Format         string `json:"format"`
+	Kind           string `json:"kind"`
+	Content        string `json:"content"`
+	MergedFromDisk bool   `json:"merged_from_disk,omitempty"`
 }
 
 type QuickSetupVariant struct {
