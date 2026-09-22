@@ -62,12 +62,18 @@ const (
 )
 
 var (
-	agentAuthSyncGroup       singleflight.Group
-	agentAuthSyncStateMu     sync.Mutex
-	lastAgentSyncedAuth      string
-	agentAuthSyncAttempt     = RequestUserAgentSyncAfterAuth
-	agentAuthSyncSleep       = time.Sleep
-	agentAuthRejectedHandler = func() {
+	agentAuthSyncGroup   singleflight.Group
+	agentAuthSyncStateMu sync.Mutex
+	lastAgentSyncedAuth  string
+	agentAuthSyncAttempt = RequestUserAgentSyncAfterAuth
+	agentAuthSyncSleep   = time.Sleep
+	// ensureFreshRegisterAuthHeaderForPush 是推送前的 token 新鲜度守卫（见
+	// auth.EnsureFreshAccessTokenForPush）：owner 手里的 access token 已过期
+	// 或临近过期时先刷新再推，杜绝把死 token 推给 agent → 注册 401 → sticky
+	// 禁用的整条故障链。刷新失败必须中止推送（返回空 header + error），由
+	// 既有重试循环稍后再试。变量形式便于测试注入。
+	ensureFreshRegisterAuthHeaderForPush = auth.EnsureFreshAccessTokenForPush
+	agentAuthRejectedHandler             = func() {
 		auth.RecoverOrExpireLocalSession("user agent rejected forwarded authorization")
 	}
 )
@@ -694,7 +700,13 @@ func SyncUserAgentAfterAuthWithRetry(reason string) error {
 	}
 
 	_, err, _ := agentAuthSyncGroup.Do("session-owner-agent-sync", func() (interface{}, error) {
-		authHeader := effectiveAgentRegisterAuthHeader("")
+		// 推送前守卫：临近过期的 token 先刷新；刷新失败则本次推送直接中止
+		// （返回 error，重试循环稍后再试），绝不把已死 token 推给 agent。
+		authHeader, err := ensureFreshRegisterAuthHeaderForPush()
+		if err != nil {
+			logger.Warn(fmt.Sprintf("[AGENT-BOOT] auth_sync aborted reason=pre_push_refresh_failed error=%v", err))
+			return nil, err
+		}
 		if authHeader == "" {
 			return nil, errors.New("user authorization is not available for agent device registration")
 		}

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"aliang.one/nursorgate/app/http/models"
+	"aliang.one/nursorgate/app/http/ownernotify"
 	"aliang.one/nursorgate/app/http/services"
 	"aliang.one/nursorgate/common/logger"
 	"aliang.one/nursorgate/internal/runtimepath"
@@ -342,6 +343,13 @@ func newAgentProcessCommand() (*exec.Cmd, error) {
 }
 
 func userAgentEnv(env []string) []string {
+	// spawn 前确保本 owner 进程有自有的环回 notify 端点并回灌 override：
+	// 默认 dashboard 地址（56431）可能被其他进程占用，macOS/Windows 的
+	// tray/app owner 甚至不起 dashboard——届时 agent 的"凭据被拒"通知会打向
+	// 持有另一套会话权威的 dashboard（如 root core），被判 stale_generation
+	// 丢弃，恢复链永远不跑。见 ownernotify 包文档。
+	ownernotify.EnsureServer()
+
 	blocked := map[string]bool{
 		"ALIANG_DATA_DIR":    true,
 		"ALIANG_CACHE_DIR":   true,

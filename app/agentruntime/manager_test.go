@@ -10,9 +10,29 @@ import (
 	"time"
 
 	"aliang.one/nursorgate/app/http/models"
+	"aliang.one/nursorgate/app/http/ownernotify"
 	"aliang.one/nursorgate/app/http/services"
+	auth "aliang.one/nursorgate/processor/auth"
 	"aliang.one/nursorgate/processor/config"
 )
+
+// withOwnerNotifyDisabled 把测试进程置为"非 session owner"并清空 notify
+// 监听与 override：userAgentEnv 现在会在 owner 进程里启动自有 notify 微服务
+// 并回灌 override（ownernotify.EnsureServer），而 ownerBaseURL 优先级断言需
+// 要无 override 的基线。仅测试使用。
+func withOwnerNotifyDisabled(t *testing.T) {
+	t.Helper()
+	ownernotify.ResetForTest()
+	origOverride := services.SessionOwnerAddrOverride()
+	services.SetSessionOwnerAddrOverride("")
+	origOwner := auth.IsSessionOwnerProcess()
+	auth.SetSessionOwnerProcess(false)
+	t.Cleanup(func() {
+		auth.SetSessionOwnerProcess(origOwner)
+		services.SetSessionOwnerAddrOverride(origOverride)
+		ownernotify.ResetForTest()
+	})
+}
 
 func TestWaitForCurrentAgentAPIRetriesUntilProtocolIsReady(t *testing.T) {
 	var attempts int32
@@ -84,6 +104,7 @@ func TestNeedsAuthenticatedSyncOnlyForRecoverableDisabledStates(t *testing.T) {
 }
 
 func TestUserAgentEnvInjectsRuntimeAndOwnerAddr(t *testing.T) {
+	withOwnerNotifyDisabled(t)
 	// 钉死部署级覆盖 env：本测试断言默认注入值（对齐 notify 测试手法）。
 	t.Setenv("ALIANG_MANAGEMENT_ADDR", "")
 
@@ -113,6 +134,7 @@ func TestUserAgentEnvInjectsRuntimeAndOwnerAddr(t *testing.T) {
 }
 
 func TestOwnerBaseURLHonorsManagementAddrOverride(t *testing.T) {
+	withOwnerNotifyDisabled(t)
 	// 钉死部署级覆盖 env：先断言默认值再显式覆盖（对齐 notify 测试手法）。
 	t.Setenv("ALIANG_MANAGEMENT_ADDR", "")
 	if got := ownerBaseURL(); got != "http://"+config.DefaultManagementAddr {
@@ -121,6 +143,39 @@ func TestOwnerBaseURLHonorsManagementAddrOverride(t *testing.T) {
 	t.Setenv("ALIANG_MANAGEMENT_ADDR", "127.0.0.1:60000")
 	if got := ownerBaseURL(); got != "http://127.0.0.1:60000" {
 		t.Fatalf("ownerBaseURL() with override = %q, want http://127.0.0.1:60000", got)
+	}
+}
+
+func TestUserAgentEnvOwnerProcessInjectsNotifyServerAddr(t *testing.T) {
+	// owner 进程下，userAgentEnv 应启动自有 notify 微服务并把 agent 的上报
+	// 地址指向它（而非可能被其他进程占用的默认 dashboard 端口）。
+	ownernotify.ResetForTest()
+	origOwner := auth.IsSessionOwnerProcess()
+	origOverride := services.SessionOwnerAddrOverride()
+	auth.SetSessionOwnerProcess(true)
+	services.SetSessionOwnerAddrOverride("")
+	t.Cleanup(func() {
+		auth.SetSessionOwnerProcess(origOwner)
+		services.SetSessionOwnerAddrOverride(origOverride)
+		ownernotify.ResetForTest()
+	})
+	t.Setenv("ALIANG_MANAGEMENT_ADDR", "")
+
+	env := userAgentEnv([]string{"PATH=/usr/bin"})
+	var ownerAddr string
+	for _, item := range env {
+		if strings.HasPrefix(item, services.SessionOwnerAddrEnv+"=") {
+			ownerAddr = strings.TrimPrefix(item, services.SessionOwnerAddrEnv+"=")
+		}
+	}
+	if ownerAddr == "" {
+		t.Fatalf("%s missing in agent env", services.SessionOwnerAddrEnv)
+	}
+	if ownerAddr != ownernotify.Addr() {
+		t.Fatalf("%s = %q, want notify server addr %q", services.SessionOwnerAddrEnv, ownerAddr, ownernotify.Addr())
+	}
+	if ownerAddr == "http://"+config.DefaultManagementAddr {
+		t.Fatalf("owner addr = default dashboard %q, want ephemeral notify server", ownerAddr)
 	}
 }
 
