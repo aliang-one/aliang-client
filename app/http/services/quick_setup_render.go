@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"sort"
 	"strings"
 
@@ -54,8 +55,18 @@ func (s *QuickSetupService) Render(req models.QuickSetupRenderRequest) (*models.
 	}
 
 	keys := toQuickSetupAPIKeys(apiKeys, modeRoot)
+
+	// 合并发生在 Render（预览）阶段（spec §7）：先读磁盘现有内容，与我们的键合并后
+	// 作为预览返回。解析目标用户失败时不报错——Render 是只读预览，不应因本机环境
+	// 失败，此时全部文件走模板兜底（home 为空即触发兜底）。
+	targetUser, userErr := quickSetupTargetUserFn()
+	home := ""
+	if userErr == nil {
+		home = targetUser.homeDir
+	}
+
 	if softwareDef.Code == "opencode" {
-		variants, err := renderOpenCodeVariants(softwareDef, keys, selectedIDs, req.OpenCode, modeRoot)
+		variants, err := renderOpenCodeVariants(softwareDef, keys, selectedIDs, req.OpenCode, modeRoot, home)
 		if err != nil {
 			return nil, err
 		}
@@ -78,7 +89,7 @@ func (s *QuickSetupService) Render(req models.QuickSetupRenderRequest) (*models.
 			return nil, fmt.Errorf("plaintext secret is required for selected API key %q", key.Name)
 		}
 
-		files, notes, err := renderQuickSetupFiles(softwareDef, key, modeRoot)
+		files, notes, err := renderQuickSetupFiles(softwareDef, key, modeRoot, home)
 		if err != nil {
 			return nil, err
 		}
@@ -226,20 +237,20 @@ func quickSetupAPIKeyHasPlainSecret(apiKey models.QuickSetupAPIKey) bool {
 	return keyValue != "" && !quickSetupLooksMaskedAPIKey(keyValue)
 }
 
-func renderQuickSetupFiles(software models.QuickSetupSoftware, apiKey models.QuickSetupAPIKey, apiRoot string) ([]models.QuickSetupPreviewFile, []string, error) {
+func renderQuickSetupFiles(software models.QuickSetupSoftware, apiKey models.QuickSetupAPIKey, apiRoot string, home string) ([]models.QuickSetupPreviewFile, []string, error) {
 	switch software.Code {
 	case "opencode":
-		return renderOpenCodeFiles(software, []models.QuickSetupAPIKey{apiKey}, apiKey.ID, "", "", apiRoot)
+		return renderOpenCodeFiles(software, []models.QuickSetupAPIKey{apiKey}, apiKey.ID, "", "", apiRoot, home)
 	case "codex":
-		return renderCodexFiles(software, apiKey, apiRoot)
+		return renderCodexFiles(software, apiKey, apiRoot, home)
 	case "claude-code":
-		return renderClaudeCodeFiles(software, apiKey, apiRoot)
+		return renderClaudeCodeFiles(software, apiKey, apiRoot, home)
 	default:
 		return nil, nil, fmt.Errorf("unsupported software: %s", software.Code)
 	}
 }
 
-func renderOpenCodeVariants(software models.QuickSetupSoftware, keys []models.QuickSetupAPIKey, selectedIDs map[int64]struct{}, spec *models.OpenCodeRenderSpec, apiRoot string) ([]models.QuickSetupVariant, error) {
+func renderOpenCodeVariants(software models.QuickSetupSoftware, keys []models.QuickSetupAPIKey, selectedIDs map[int64]struct{}, spec *models.OpenCodeRenderSpec, apiRoot string, home string) ([]models.QuickSetupVariant, error) {
 	var selected []models.QuickSetupAPIKey
 	matchedIDs := make(map[int64]struct{}, len(selectedIDs))
 	for _, key := range keys {
@@ -275,7 +286,7 @@ func renderOpenCodeVariants(software models.QuickSetupSoftware, keys []models.Qu
 	if modelProvider != "" && modelKey.Provider != modelProvider {
 		return nil, errors.New("model_provider must reference a selected API key provider")
 	}
-	files, notes, err := renderOpenCodeFiles(software, selected, modelKey.ID, model, smallModel, apiRoot)
+	files, notes, err := renderOpenCodeFiles(software, selected, modelKey.ID, model, smallModel, apiRoot, home)
 	if err != nil {
 		return nil, err
 	}
@@ -319,7 +330,7 @@ func selectOpenCodeModelKey(keys []models.QuickSetupAPIKey, preferredID int64, p
 	return keys[0]
 }
 
-func renderOpenCodeFiles(software models.QuickSetupSoftware, apiKeys []models.QuickSetupAPIKey, modelKeyID int64, modelOverride string, smallModelOverride string, apiRoot string) ([]models.QuickSetupPreviewFile, []string, error) {
+func renderOpenCodeFiles(software models.QuickSetupSoftware, apiKeys []models.QuickSetupAPIKey, modelKeyID int64, modelOverride string, smallModelOverride string, apiRoot string, home string) ([]models.QuickSetupPreviewFile, []string, error) {
 	fileDef := software.Files[0]
 	if len(apiKeys) == 0 {
 		return nil, nil, errors.New("at least one API key is required for OpenCode")
@@ -376,19 +387,27 @@ func renderOpenCodeFiles(software models.QuickSetupSoftware, apiKeys []models.Qu
 		ensureOpenCodeProviderModel(providers, modelProviderID, smallModelName)
 		config["small_model"] = fmt.Sprintf("%s/%s", modelProviderID, smallModelName)
 	}
-	raw, err := json.MarshalIndent(config, "", "  ")
+	merged, mergedFromDisk, degradedNote, err := quickSetupMergedJSONObject(software.Code, fileDef.DefaultPath, home, config)
 	if err != nil {
 		return nil, nil, err
+	}
+	raw, err := json.MarshalIndent(merged, "", "  ")
+	if err != nil {
+		return nil, nil, err
+	}
+	if degradedNote != "" {
+		notes = append(notes, degradedNote)
 	}
 
 	return []models.QuickSetupPreviewFile{
 		{
-			Code:    fileDef.Code,
-			Label:   fileDef.Label,
-			Path:    fileDef.DefaultPath,
-			Format:  fileDef.Format,
-			Kind:    fileDef.Kind,
-			Content: string(raw),
+			Code:           fileDef.Code,
+			Label:          fileDef.Label,
+			Path:           fileDef.DefaultPath,
+			Format:         fileDef.Format,
+			Kind:           fileDef.Kind,
+			Content:        string(raw),
+			MergedFromDisk: mergedFromDisk,
 		},
 	}, notes, nil
 }
@@ -674,27 +693,55 @@ func quickSetupInt64Field(item map[string]interface{}, key string) int64 {
 	}
 }
 
-func renderCodexFiles(software models.QuickSetupSoftware, apiKey models.QuickSetupAPIKey, apiRoot string) ([]models.QuickSetupPreviewFile, []string, error) {
+// quickSetupReadExistingFile 只读读取磁盘上 defaultPath 对应的现有配置文件内容，
+// 供 Render 预览合并（spec §7）。任何失败（家目录为空、路径不可解析、不存在、
+// 非普通文件、超大小上限、读取出错）都返回 ("", false)，由调用方走模板兜底——
+// Render 是只读操作，绝不因本机环境差异整体报错。
+func quickSetupReadExistingFile(software, defaultPath, home string) (string, bool) {
+	home = strings.TrimSpace(home)
+	if home == "" {
+		return "", false
+	}
+	resolved, err := resolveQuickSetupApplyPath(software, defaultPath, home)
+	if err != nil {
+		return "", false
+	}
+	info, err := os.Stat(resolved)
+	if err != nil || !info.Mode().IsRegular() || info.Size() > quickSetupMaxApplyFileBytes {
+		return "", false
+	}
+	raw, err := os.ReadFile(resolved)
+	if err != nil || len(raw) > quickSetupMaxApplyFileBytes {
+		return "", false
+	}
+	return string(raw), true
+}
+
+// quickSetupMergedJSONObject 读磁盘 existing 并与 incoming 深合并（incoming 键胜出），
+// 返回合并后的对象与合并状态。磁盘无文件 → 返回 incoming 原样；existing 解析失败 →
+// 同样返回模板并给出降级警告（spec §7：损坏的磁盘内容不得让预览失败）。
+// 注意：返回值可能与 incoming 共享子 map 引用（mergeQuickSetupJSONInto 契约），
+// 调用方不得再修改 incoming 的子对象；各渲染器的载荷均为每次调用新建，满足该约束。
+func quickSetupMergedJSONObject(software, defaultPath, home string, incoming map[string]interface{}) (merged map[string]interface{}, mergedFromDisk bool, degradedNote string, err error) {
+	raw, onDisk := quickSetupReadExistingFile(software, defaultPath, home)
+	if !onDisk {
+		return incoming, false, "", nil
+	}
+	var existing map[string]interface{}
+	if jsonErr := json.Unmarshal([]byte(raw), &existing); jsonErr != nil {
+		return incoming, false, "Could not parse the existing file on disk; showing a fresh template instead. Review carefully before applying — applying will replace the existing file.", nil
+	}
+	merged, _ = mergeQuickSetupJSONObjects(existing, incoming)
+	return merged, true, "", nil
+}
+
+func renderCodexFiles(software models.QuickSetupSoftware, apiKey models.QuickSetupAPIKey, apiRoot string, home string) ([]models.QuickSetupPreviewFile, []string, error) {
 	files := make([]models.QuickSetupPreviewFile, 0, len(software.Files))
 	providerKey := apiKey.Provider
 	model := quickSetupDefaultModel(providerKey, true)
-	configBody := renderCodexConfigTOML(providerKey, model, apiRoot)
-	authBody := renderCodexAuthJSON(apiKey)
-
-	for _, fileDef := range software.Files {
-		content := configBody
-		if fileDef.Code == "auth" {
-			content = authBody
-		}
-		files = append(files, models.QuickSetupPreviewFile{
-			Code:    fileDef.Code,
-			Label:   fileDef.Label,
-			Path:    fileDef.DefaultPath,
-			Format:  fileDef.Format,
-			Kind:    fileDef.Kind,
-			Content: content,
-		})
-	}
+	// 统一 [model_providers.aliang] 段（spec §7）：段内走 OpenAI wire 语义
+	// （env_key = OPENAI_API_KEY），base_url 与旧 openai 表一致使用 /v1 根。
+	baseURL := quickSetupProviderBaseURL("openai", apiRoot)
 
 	notes := []string{
 		"Codex auth.json officially stores OPENAI_API_KEY for API-key sign-in.",
@@ -705,17 +752,99 @@ func renderCodexFiles(software models.QuickSetupSoftware, apiKey models.QuickSet
 	if apiKey.Masked {
 		notes = append(notes, "This API key looks masked. Replace it with the plaintext value before applying.")
 	}
+
+	for _, fileDef := range software.Files {
+		preview := models.QuickSetupPreviewFile{
+			Code:   fileDef.Code,
+			Label:  fileDef.Label,
+			Path:   fileDef.DefaultPath,
+			Format: fileDef.Format,
+			Kind:   fileDef.Kind,
+		}
+		if fileDef.Code == "auth" {
+			content, mergedFromDisk, degradedNote, err := renderCodexAuthPreview(apiKey, software.Code, fileDef.DefaultPath, home)
+			if err != nil {
+				return nil, nil, err
+			}
+			preview.Content = content
+			preview.MergedFromDisk = mergedFromDisk
+			if degradedNote != "" {
+				notes = append(notes, degradedNote)
+			}
+		} else {
+			content, mergedFromDisk, degradedNote := renderCodexConfigPreview(model, baseURL, software.Code, fileDef.DefaultPath, home)
+			preview.Content = content
+			preview.MergedFromDisk = mergedFromDisk
+			if degradedNote != "" {
+				notes = append(notes, degradedNote)
+			}
+		}
+		files = append(files, preview)
+	}
 	return files, notes, nil
 }
 
-// renderClaudeSettingsEnv 生成 settings.json 的 env 块载荷（Task 9 将把它深合并进
+// renderCodexConfigPreview 产出 config.toml 预览：磁盘有文件走 mergeCodexTOML
+// 行级拼接；磁盘无文件/读取失败也走 mergeCodexTOML("") 的模板形态——保证全新安装
+// 同样产出统一 [model_providers.aliang] 段，而非旧版 openai/gateway 表（DoD #4 与
+// config-state 的 managed 判定都依赖这一点）。返回内容、是否合并自磁盘、降级警告。
+func renderCodexConfigPreview(model, baseURL, softwareCode, defaultPath, home string) (string, bool, string) {
+	existing, onDisk := quickSetupReadExistingFile(softwareCode, defaultPath, home)
+	merged, err := mergeCodexTOML(existing, model, baseURL)
+	if err == nil {
+		return merged, onDisk, ""
+	}
+	// Task 6 审查红线：mergeCodexTOML 的错误必须显式处理，不得静默吞掉。
+	// 降级为「模板形态」（空 existing），并给出人话警告让用户应用前自查。
+	merged, err = mergeCodexTOML("", model, baseURL)
+	if err != nil {
+		// 理论不可达（空输入必产出合法 TOML）；仍按红线兜底为最小模板字符串。
+		merged = fallbackCodexTemplateTOML(model, baseURL)
+	}
+	return merged, false, "Your existing config.toml could not be merged safely, so the preview shows a fresh template. Review carefully before applying — applying will replace the existing file."
+}
+
+// fallbackCodexTemplateTOML 是 renderCodexConfigPreview 的最后兜底：与
+// mergeCodexTOML("", ...) 的模板形态等价的最小字符串（仅在我们键 + aliang 段）。
+func fallbackCodexTemplateTOML(model, baseURL string) string {
+	lines := append([]string{
+		"model = " + quickSetupTOMLQuote(model),
+		"model_provider = " + quickSetupTOMLQuote(quickSetupCodexProviderID),
+		"",
+	}, buildCodexAliangSection(baseURL, "")...)
+	return strings.Join(lines, "\n")
+}
+
+// renderCodexAuthPreview 产出 auth.json 预览：磁盘有文件走 JSON 深合并（保住
+// ChatGPT 登录态 tokens，Task 5 已锁）；磁盘无文件用模板。
+func renderCodexAuthPreview(apiKey models.QuickSetupAPIKey, softwareCode, defaultPath, home string) (string, bool, string, error) {
+	value := apiKey.Key
+	if apiKey.Provider != "openai" && apiKey.Masked {
+		value = ""
+	}
+	template := map[string]interface{}{"OPENAI_API_KEY": value}
+	merged, mergedFromDisk, degradedNote, err := quickSetupMergedJSONObject(softwareCode, defaultPath, home, template)
+	if err != nil {
+		return "", false, "", err
+	}
+	raw, err := json.MarshalIndent(merged, "", "  ")
+	if err != nil {
+		return "", false, "", err
+	}
+	return string(raw), mergedFromDisk, degradedNote, nil
+}
+
+// renderClaudeSettingsEnv 生成 settings.json 的 env 块载荷（Render 会把它深合并进
 // 用户磁盘上的 settings.json）。每次调用都新建 map 返回，深合并时子 map 不与其他
-// 调用共享引用（规避 mergeQuickSetupJSONInto 的子 map 引用共享契约）。
-// 用 ANTHROPIC_AUTH_TOKEN（Bearer 语义），不用 ANTHROPIC_API_KEY；baseURL 不带 /v1
-// （Claude Code 自行追加 /v1/messages——相对旧 env.sh 渲染器是行为变更，spec §7.1）。
+// 调用共享引用（规避 mergeQuickSetupJSONInto 的子 map 引用共享契约）。env 用
+// map[string]interface{} 而非 map[string]string：只有这样深合并才会逐键并入用户
+// 既有 env 块（json.Unmarshal 出的子对象是 map[string]interface{}），整块替换会丢
+// 用户自定义变量。用 ANTHROPIC_AUTH_TOKEN（Bearer 语义），不用 ANTHROPIC_API_KEY；
+// baseURL 不带 /v1（Claude Code 自行追加 /v1/messages——相对旧 env.sh 渲染器是行为
+// 变更，spec §7.1）。
 func renderClaudeSettingsEnv(apiKey, model, baseURLNoV1 string) map[string]interface{} {
 	return map[string]interface{}{
-		"env": map[string]string{
+		"env": map[string]interface{}{
 			"ANTHROPIC_BASE_URL":   baseURLNoV1,
 			"ANTHROPIC_AUTH_TOKEN": apiKey,
 			"ANTHROPIC_MODEL":      model,
@@ -723,7 +852,7 @@ func renderClaudeSettingsEnv(apiKey, model, baseURLNoV1 string) map[string]inter
 	}
 }
 
-func renderClaudeCodeFiles(software models.QuickSetupSoftware, apiKey models.QuickSetupAPIKey, apiRoot string) ([]models.QuickSetupPreviewFile, []string, error) {
+func renderClaudeCodeFiles(software models.QuickSetupSoftware, apiKey models.QuickSetupAPIKey, apiRoot string, home string) ([]models.QuickSetupPreviewFile, []string, error) {
 	fileDef := software.Files[0]
 	model := quickSetupDefaultModel(apiKey.Provider, false)
 	// apiRoot 已是推理面根（不带 /v1）；再过一次 resolve 保证即使上层传入控制面
@@ -731,74 +860,47 @@ func renderClaudeCodeFiles(software models.QuickSetupSoftware, apiKey models.Qui
 	// TrimSuffix 兜底剥掉配置尾缀的 /v1（只剥一次且只剥结尾），避免 /v1/v1/messages。
 	baseURL := strings.TrimSuffix(resolveQuickSetupInferenceBaseURL(apiRoot), "/v1")
 	payload := renderClaudeSettingsEnv(apiKey.Key, model, baseURL)
-	raw, err := json.MarshalIndent(payload, "", "  ")
+
+	merged, mergedFromDisk, degradedNote, err := quickSetupMergedJSONObject(software.Code, fileDef.DefaultPath, home, payload)
 	if err != nil {
 		return nil, nil, err
 	}
-	content := string(raw)
 
 	notes := []string{
 		"The gateway env block is written into your Claude Code settings.json, taking effect on the next Claude Code start.",
 		"Uses ANTHROPIC_AUTH_TOKEN (Bearer auth) rather than ANTHROPIC_API_KEY.",
 	}
+	if degradedNote != "" {
+		notes = append(notes, degradedNote)
+	}
+	// 单鉴权源（spec §7）：我们用 AUTH_TOKEN 接管鉴权，残留的 ANTHROPIC_API_KEY
+	// 会造成双鉴权源歧义，合并后必须清除。
+	if env, ok := merged["env"].(map[string]interface{}); ok {
+		if _, had := env["ANTHROPIC_API_KEY"]; had {
+			delete(env, "ANTHROPIC_API_KEY")
+			notes = append(notes, "Removed ANTHROPIC_API_KEY from your existing settings so the gateway authenticates only via ANTHROPIC_AUTH_TOKEN.")
+		}
+	}
+	raw, err := json.MarshalIndent(merged, "", "  ")
+	if err != nil {
+		return nil, nil, err
+	}
+
 	if apiKey.Masked {
 		notes = append(notes, "This API key looks masked. Replace it with the plaintext value before applying.")
 	}
 
 	return []models.QuickSetupPreviewFile{
 		{
-			Code:    fileDef.Code,
-			Label:   fileDef.Label,
-			Path:    fileDef.DefaultPath,
-			Format:  fileDef.Format,
-			Kind:    fileDef.Kind,
-			Content: content,
+			Code:           fileDef.Code,
+			Label:          fileDef.Label,
+			Path:           fileDef.DefaultPath,
+			Format:         fileDef.Format,
+			Kind:           fileDef.Kind,
+			Content:        string(raw),
+			MergedFromDisk: mergedFromDisk,
 		},
 	}, notes, nil
-}
-
-func renderCodexConfigTOML(provider string, model string, apiRoot string) string {
-	if provider == "openai" {
-		return strings.Join([]string{
-			fmt.Sprintf("model = %q", model),
-			`model_provider = "openai"`,
-			`approval_policy = "never"`,
-			``,
-			`[model_providers.openai]`,
-			`name = "OpenAI"`,
-			fmt.Sprintf("base_url = %q", quickSetupProviderBaseURL(provider, apiRoot)),
-			`wire_api = "responses"`,
-			``,
-		}, "\n")
-	}
-
-	return strings.Join([]string{
-		fmt.Sprintf("model = %q", model),
-		`model_provider = "anthropic_gateway"`,
-		`approval_policy = "never"`,
-		``,
-		`[model_providers.anthropic_gateway]`,
-		`name = "Anthropic Gateway"`,
-		fmt.Sprintf("base_url = %q", quickSetupProviderBaseURL("openai", apiRoot)),
-		`env_key = "OPENAI_API_KEY"`,
-		`wire_api = "responses"`,
-		``,
-	}, "\n")
-}
-
-func renderCodexAuthJSON(apiKey models.QuickSetupAPIKey) string {
-	value := apiKey.Key
-	if apiKey.Provider != "openai" && apiKey.Masked {
-		value = ""
-	}
-	body := map[string]interface{}{
-		"OPENAI_API_KEY": value,
-	}
-	raw, err := json.MarshalIndent(body, "", "  ")
-	if err != nil {
-		return "{\n  \"OPENAI_API_KEY\": \"\"\n}"
-	}
-	return string(raw)
 }
 
 func quickSetupProviderLabel(provider string) string {
@@ -873,6 +975,9 @@ func resolveQuickSetupInferenceBaseURL(baseURL string) string {
 
 // quickSetupModeRoot 把接入模式换算成 host 根（spec §7.1）：
 // local → 本地推理代理（引用 defaults 常量，禁止硬编码）；public/未知/空 → 推理面域名。
+// apiRoot 非空由调用方（Render 的 quickSetupBaseURL 校验）保证，本函数不重复校验。
+// local 用 loopback 常量在 --host 覆盖下是有意选择：客户端目标固定指向 loopback
+// 更安全，且本地推理代理的 listener 本身拒绝非 loopback Host 的请求。
 func quickSetupModeRoot(mode, apiRoot string) string {
 	if strings.EqualFold(strings.TrimSpace(mode), "local") {
 		return "http://" + config.DefaultHTTPProxyAddr

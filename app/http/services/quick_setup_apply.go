@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"aliang.one/nursorgate/app/http/models"
@@ -32,6 +33,7 @@ func (s *QuickSetupService) Apply(req models.QuickSetupApplyRequest) (*models.Qu
 
 	prepared := make([]quickSetupPreparedFile, 0, len(req.Files))
 	seenPaths := make(map[string]struct{}, len(req.Files))
+	softwareDef, hasSoftwareDef := findQuickSetupSoftware(software)
 	for _, file := range req.Files {
 		targetPath := strings.TrimSpace(file.Path)
 		if targetPath == "" {
@@ -52,7 +54,15 @@ func (s *QuickSetupService) Apply(req models.QuickSetupApplyRequest) (*models.Qu
 			return nil, fmt.Errorf("file path is not valid: duplicate target %s", targetPath)
 		}
 		seenPaths[resolvedPath] = struct{}{}
-		prepared = append(prepared, quickSetupPreparedFile{path: resolvedPath, content: file.Content})
+		// code 供备份 manifest 的 file_code 使用（Task 10）；内置软件取 catalog 声明，
+		// custom-*（无 catalog 定义）退化为文件名。
+		fileCode := filepath.Base(resolvedPath)
+		if hasSoftwareDef {
+			if declared, ok, declErr := quickSetupDeclaredFileForPath(softwareDef, resolvedPath, targetUser.homeDir); declErr == nil && ok {
+				fileCode = declared.Code
+			}
+		}
+		prepared = append(prepared, quickSetupPreparedFile{code: fileCode, path: resolvedPath, content: file.Content})
 	}
 
 	quickSetupApplyMu.Lock()
