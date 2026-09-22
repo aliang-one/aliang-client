@@ -76,17 +76,17 @@ func quickSetupSoftwares() []models.QuickSetupSoftware {
 		{
 			Code:               "claude-code",
 			Name:               "Claude Code",
-			Description:        "Generate a shell snippet for ANTHROPIC_* environment variables plus a local helper script.",
+			Description:        "Write the Aliang gateway into the env block of your Claude Code user settings, keeping other settings intact.",
 			SupportedProviders: []string{"anthropic"},
 			Files: []models.QuickSetupSoftwareFile{
 				{
-					Code:        "command",
-					Label:       "env.sh",
-					FileName:    "env.sh",
-					DefaultPath: "~/.claude-code/env.sh",
-					Format:      "shell",
+					Code:        "settings",
+					Label:       "settings.json",
+					FileName:    "settings.json",
+					DefaultPath: "~/.claude/settings.json",
+					Format:      "json",
 					Kind:        "file",
-					Description: "Shell snippet to export the gateway base URL and API key.",
+					Description: "Claude Code user settings; the gateway env block is merged in while other settings are preserved.",
 				},
 			},
 		},
@@ -204,7 +204,7 @@ func quickSetupAllowedRoot(software string, home string) (string, error) {
 	case "codex":
 		return filepath.Join(home, ".codex"), nil
 	case "claude-code":
-		return filepath.Join(home, ".claude-code"), nil
+		return filepath.Join(home, ".claude"), nil
 	default:
 		if !strings.HasPrefix(software, "custom-") || len(software) <= len("custom-") || len(software) > 72 {
 			return "", fmt.Errorf("software is not valid: %s", software)
