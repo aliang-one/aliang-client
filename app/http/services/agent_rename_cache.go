@@ -1,9 +1,12 @@
 package services
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -215,6 +218,27 @@ func (s *AgentService) handleRemoteAIRename(msg map[string]interface{}, writeJSO
 	if err := saveAgentRenameCache(entries); err != nil {
 		logger.Warn("[AGENT-RENAME] phone_rename_persist_failed sid=" + nativeID + " error=" + err.Error())
 	}
+	// Mirror the rename into Claude Code's own transcript so the desktop TUI
+	// /resume list shows the phone-chosen name too (its list builder takes the
+	// LAST custom-title line per session). Claude-only: codex/opencode
+	// transcripts live outside ~/.claude/projects, so mirroring them would be
+	// a wasted walk plus a guaranteed misleading transcript_not_found warning.
+	// Absent/auto still mirror for backward compatibility with servers that
+	// omit provider (same direction as guardExternalTUIClaudeSpawn).
+	// Best-effort only: the rename cache above remains the phone-side source
+	// of truth, so a failure here is logged and never fails the rename or its
+	// ack.
+	if agentRenameMirrorsClaude(remoteString(msg, "provider"), remoteString(msg, "tool")) {
+		if home := agentHome(); home != "" {
+			if err := appendClaudeCustomTitleLine(filepath.Join(home, ".claude", "projects"), nativeID, title); err != nil {
+				if errors.Is(err, errClaudeTranscriptNotFound) {
+					logger.Warn("[AGENT-RENAME] transcript_not_found sid=" + nativeID)
+				} else {
+					logger.Warn("[AGENT-RENAME] transcript_custom_title_failed sid=" + nativeID + " error=" + err.Error())
+				}
+			}
+		}
+	}
 	// Push the updated inventory immediately: the rename (and the resulting
 	// title_updated_at stamps) reach the phone in this round trip instead of
 	// waiting for the digest tick or the minute backstop. Log-only on failure.
@@ -227,4 +251,151 @@ func (s *AgentService) handleRemoteAIRename(msg map[string]interface{}, writeJSO
 		"accepted":         true,
 		"title_updated_at": now,
 	})
+}
+
+// errClaudeTranscriptNotFound reports that no Claude Code transcript file
+// exists on this machine for the renamed session (e.g. a conversation
+// imported from another device, or a session id this mirror refuses). It is
+// log-only: the agent's rename cache remains the phone-side source of truth
+// either way.
+var errClaudeTranscriptNotFound = errors.New("claude transcript not found")
+
+// claudeSessionIDPattern is Claude Code's own session-id guard: it refuses to
+// write a custom title for anything that is not a strict UUID. Mirroring a
+// non-UUID id could glob-match an unrelated transcript, so this mirror
+// refuses the same way.
+var claudeSessionIDPattern = regexp.MustCompile(
+	`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+
+// agentRenameMirrorsClaude reports whether a rename event refers to a
+// Claude-family session. The provider field is optional on the wire, so only
+// an explicit non-Claude provider/tool skips the transcript mirror; absent
+// and auto stay conservative and mirror anyway (a mirror failure is
+// log-only, so the conservative direction costs nothing).
+func agentRenameMirrorsClaude(provider, tool string) bool {
+	for _, raw := range []string{provider, tool} {
+		switch strings.ToLower(strings.TrimSpace(raw)) {
+		case "codex", "opencode":
+			return false
+		case "claude", "claudecode", "auto":
+			return true
+		}
+	}
+	return true // absent: conservative mirror
+}
+
+// claudeCustomTitleRecord is the exact record shape Claude Code writes for
+// /rename. Field order matches the native writer so the appended line is
+// byte-identical in shape (the parser itself is order-insensitive).
+type claudeCustomTitleRecord struct {
+	Type        string `json:"type"`
+	CustomTitle string `json:"customTitle"`
+	SessionID   string `json:"sessionId"`
+}
+
+// findAgentTranscriptFile locates <name> under the Claude projects root.
+// Claude Code stores transcripts at a fixed two-level layout
+// (<root>/<sanitized-project>/<name>), so a per-directory stat probe resolves
+// the typical case without a full walk; the bounded recency walk stays as the
+// fallback for unexpected nesting (on a huge projects tree a budget
+// truncation degrades to not-found rather than a wrong-file write).
+func findAgentTranscriptFile(root, name string) string {
+	if entries, err := os.ReadDir(root); err == nil {
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				continue
+			}
+			candidate := filepath.Join(root, entry.Name(), name)
+			if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+				return candidate
+			}
+		}
+	}
+	matches := findRecentAgentFiles(root, name, agentVibeDetailCandidateFileLimit)
+	if len(matches) == 0 {
+		return ""
+	}
+	return matches[0]
+}
+
+// appendClaudeCustomTitleLine mirrors a conversation rename into Claude
+// Code's own transcript so the desktop TUI /resume list shows the same name
+// as the phone. Claude Code records /rename titles by appending one
+// {"type":"custom-title",...} line to the session's JSONL and its list
+// builder takes the LAST such line per session — so "updating the title" is
+// implemented strictly as an append, never a rewrite.
+//
+// Data-safety contract (the transcript is the user's conversation history):
+//   - the file is opened write-only with O_APPEND, never read-modify-written
+//     and never truncated — existing bytes cannot be altered;
+//   - O_CREATE is never set: a missing transcript is reported via
+//     errClaudeTranscriptNotFound instead of fabricating a bare custom-title
+//     file, which would surface as an empty ghost session in /resume;
+//   - if the file does not end in a newline (a torn write by some earlier
+//     process), a separator newline is prepended so the existing partial
+//     line is not glued to the new record. With a concurrent writer (a live
+//     claude session) that check can be stale; the worst outcome is one
+//     blank line, which every line-oriented parser on both sides skips;
+//   - the record is serialized via json.Encoder with HTML escaping off, so
+//     it is byte-identical in shape to claude's own lines; newlines/quotes
+//     stay escaped, guaranteeing exactly ONE physical line;
+//   - a true I/O error mid-write can leave a torn partial record; this
+//     function deliberately does not roll back (truncating would itself be a
+//     rewrite) — claude's own /rename has no torn-tail protection either;
+//   - root follows the default ~/.claude/projects convention; a custom
+//     CLAUDE_CONFIG_DIR environment is not resolved (consistent with the
+//     rest of this agent) and shows up as transcript_not_found.
+func appendClaudeCustomTitleLine(root, nativeSessionID, title string) error {
+	nativeSessionID = strings.TrimSpace(nativeSessionID)
+	title = strings.TrimSpace(title)
+	if strings.TrimSpace(root) == "" || nativeSessionID == "" || title == "" {
+		return nil // nothing meaningful to mirror
+	}
+	if !claudeSessionIDPattern.MatchString(nativeSessionID) {
+		return errClaudeTranscriptNotFound
+	}
+	path := findAgentTranscriptFile(root, nativeSessionID+".jsonl")
+	if path == "" {
+		return errClaudeTranscriptNotFound
+	}
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(claudeCustomTitleRecord{
+		Type:        "custom-title",
+		CustomTitle: title,
+		SessionID:   nativeSessionID,
+	}); err != nil {
+		return err
+	}
+	payload := buf.Bytes() // Encoder already terminates the record with '\n'
+	if info, err := os.Stat(path); err == nil && info.Size() > 0 {
+		if last, err := readLastByte(path); err == nil && last != '\n' {
+			payload = append([]byte{'\n'}, payload...)
+		}
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = f.Write(payload)
+	return err
+}
+
+func readLastByte(path string) (byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return 0, err
+	}
+	buf := make([]byte, 1)
+	if _, err := f.ReadAt(buf, info.Size()-1); err != nil {
+		return 0, err
+	}
+	return buf[0], nil
 }
