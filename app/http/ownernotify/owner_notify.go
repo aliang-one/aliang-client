@@ -8,8 +8,11 @@
 //     Core daemon 兜底），dashboard 端口被 root core 抢占；
 //   - 即便 owner 起了 dashboard，56431 被别的进程先占时虽有随机端口回退，
 //     但依赖 StartHttpServer 被调用。
+//
 // 一旦通知打到一个持有**另一套会话权威**的 dashboard（如 root core 的），
-// generation 校验必然判 stale_generation 而丢弃，恢复链永远不跑，agent 被
+// 恢复链操作的就是别人的会话——生下该 agent 的 owner 自己的恢复链永远不跑
+// （该场景历史上表现为 generation 等值门判 stale；现判定门已改为 owner 自身
+// 快照 Active + 时间窗，但打错进程仍意味着别人的权威在恢复），agent 被
 // sticky 禁用后只能人工上线。
 //
 // 解法：owner 在 spawn agent 前调用 EnsureServer，于 127.0.0.1 随机端口起
@@ -27,8 +30,8 @@ import (
 
 	"aliang.one/nursorgate/app/http/handlers"
 	"aliang.one/nursorgate/app/http/services"
-	auth "aliang.one/nursorgate/processor/auth"
 	"aliang.one/nursorgate/common/logger"
+	auth "aliang.one/nursorgate/processor/auth"
 )
 
 var (
@@ -62,10 +65,17 @@ func EnsureServer() string {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/auth/agent-auth-rejected", handlers.NewAuthHandler().HandleAgentAuthRejected)
-	notifySrv = &http.Server{Handler: mux}
+	// goroutine 闭包捕获局部 srv 而非读全局 notifySrv：测试的 reset/RestoreForTest
+	// 会把全局置空，晚调度的 goroutine 读全局会拿到 nil 而 panic。
+	srv := &http.Server{Handler: mux}
+	notifySrv = srv
 	notifyAddr = fmt.Sprintf("http://%s", listener.Addr().String())
+	// serveHook 须在 go 之前捕获进局部变量：闭包直接读包级变量会与测试
+	// cleanup 对它的写（reset/RestoreForTest 还原钩子）竞态；go 语句本身对
+	// 捕获变量建立 happens-before。
+	serve := serveHook
 	go func() {
-		if serveErr := serveHook(notifySrv, listener); serveErr != nil && serveErr != http.ErrServerClosed {
+		if serveErr := serve(srv, listener); serveErr != nil && serveErr != http.ErrServerClosed {
 			logger.Warn(fmt.Sprintf("owner notify server stopped: %v", serveErr))
 		}
 	}()

@@ -86,13 +86,15 @@ func TestEnsureServerServesAgentAuthRejectedEndpoint(t *testing.T) {
 		t.Fatalf("EnsureServer() = empty, want listener address")
 	}
 
-	// Generation > 0 且非当前活跃代 → handler 判 stale_generation 丢弃并返回
-	// 200（不触发恢复链，测试无副作用）。此断言同时证明端点路由到了真正的
+	// 观察时刻超龄（>5min）→ handler 判 stale_notification 丢弃并返回 200
+	// （不触发恢复链，测试无副作用；与 authority 状态无关地确定性被拒。
+	// generation 自 2026-09 起是纯日志字段，不再参与判定，见
+	// HandleAgentAuthRejected）。此断言同时证明端点路由到了真正的
 	// HandleAgentAuthRejected。
 	payload := map[string]any{
 		"reason":      "agent_register_rejected",
 		"device_id":   "dev-test",
-		"observed_at": time.Now().Unix(),
+		"observed_at": time.Now().Add(-6 * time.Minute).Unix(),
 		"generation":  1 << 40,
 	}
 	raw, _ := json.Marshal(payload)
@@ -115,8 +117,8 @@ func TestEnsureServerServesAgentAuthRejectedEndpoint(t *testing.T) {
 	if err := json.Unmarshal(body, &decoded); err != nil {
 		t.Fatalf("decode response %s: %v", body, err)
 	}
-	if decoded.Data.Applied || decoded.Data.Ignored != "stale_generation" {
-		t.Fatalf("response = %+v, want applied=false ignored=stale_generation", decoded.Data)
+	if decoded.Data.Applied || decoded.Data.Ignored != "stale_notification" {
+		t.Fatalf("response = %+v, want applied=false ignored=stale_notification", decoded.Data)
 	}
 
 	// 错误方法 → 405（方法路由生效）。

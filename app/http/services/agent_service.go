@@ -112,6 +112,16 @@ func SessionOwnerAddrOverride() string {
 	return sessionOwnerAddrOverride
 }
 
+// DefaultSessionOwnerAddr 返回 session owner dashboard 的默认基地址（跟随
+// --host 配置的管理监听地址，默认 127.0.0.1:56431）。owner 进程注入
+// （agentruntime.ownerBaseURL 的默认分支）与 agent 进程自身兜底
+// （cmd.ensureUserAgentEnvironment，为无 manager spawn 的手动 `aliang agent`
+// 形态补 ALIANG_SESSION_OWNER_ADDR）共用本函数，保证两端对"默认情况下
+// owner 在哪"的答案一致。
+func DefaultSessionOwnerAddr() string {
+	return "http://" + config.ManagementListenAddr()
+}
+
 type agentState struct {
 	Enabled         bool                `json:"enabled"`
 	Device          *models.AgentDevice `json:"device,omitempty"`
@@ -1700,15 +1710,45 @@ type sessionOwnerAuthRejectedNotify struct {
 	Generation int64  `json:"generation"`  // 0 = agent could not read a generation
 }
 
+// ownerAuthRejectedNotifyResponse 是 owner 端应答的解析契约。owner 端真实
+// 应答是 common.Success 包裹的 envelope（data.applied/data.ignored）；顶层
+// applied/ignored 字段兼容无 envelope 的裸形应答 `{"applied":bool,...}`。
+type ownerAuthRejectedNotifyResponse struct {
+	Code int `json:"code"`
+	Data struct {
+		Applied bool   `json:"applied"`
+		Ignored string `json:"ignored"`
+	} `json:"data"`
+	Applied bool   `json:"applied"`
+	Ignored string `json:"ignored"`
+}
+
+// applied 返回通知是否被 owner 应用（envelope 优先，裸形回退）。
+func (r *ownerAuthRejectedNotifyResponse) applied() bool {
+	return r.Data.Applied || r.Applied
+}
+
+// ignored 返回未应用原因（envelope 优先，裸形回退）。
+func (r *ownerAuthRejectedNotifyResponse) ignored() string {
+	if r.Data.Ignored != "" {
+		return r.Data.Ignored
+	}
+	return r.Ignored
+}
+
 // NotifyOwnerAuthRejected 把"凭据被远端拒绝"沿转换沿通知 session owner，
 // owner 走 SoftExpired 恢复链（POST {owner}/api/auth/agent-auth-rejected）。
-// 转换沿幂等，消耗语义是「已成功送达或已判定永久失败」：只有 POST 拿到
-// 2xx、或 4xx 永久性契约错误（400/404 等，重试无意义）才置位消耗；传输
-// 错误、5xx、408/429、body 序列化失败一律保留沿，留待下一次 401 重试通知
-// ——owner 短暂不可达不得造成永久静默。重试节奏有上界：受 register/WS 拒绝
-// 路径的重试周期与 owner 侧 60s 去重窗口约束。发送前的置位检查属尽力去重：
-// 检查与消耗之间存在窗口，最坏并发双发由 owner 60s 去重与恢复链幂等吸收；
-// 发送后按结果处置；注册成功后复位（见
+// 转换沿幂等，消耗语义以 applied 为准：只有 owner 确认应用（2xx 且应答
+// data.applied=true）、或 4xx 永久性契约错误（400/404 等，重试无意义）才
+// 置位消耗；2xx 但 applied=false（stale_notification/rate_limited 等——
+// 通知已送达但 owner 未应用）、传输错误、5xx、408/429、body 序列化失败、
+// 应答不可解析一律保留沿，留待下一次 401 重试通知——owner 短暂不可达或
+// 暂不应用不得造成永久静默，也不得丢掉 60s 去重窗口内的新真问题（生产
+// 实证 2026-09-22 12:44：agent 把任何 2xx 都当成功消耗沿，而 owner 恒回
+// applied=false，通知链 dead-on-arrival）。重试节奏有上界：受 register/WS
+// 拒绝路径的重试周期与 owner 侧 60s 去重窗口约束。发送前的置位检查属尽力
+// 去重：检查与消耗之间存在窗口，最坏并发双发由 owner 60s 去重与恢复链幂等
+// 吸收；发送后按结果处置；注册成功后复位（见
 // registerAndSyncLockedWithUserContext）；owner 地址为空或非 agent 运行时
 // 静默跳过（降级为既有行为：agent 自禁，等 owner 侧自身判定）。错误只记
 // 日志不外抛——通知是附加动作，绝不改变被拒路径原有的自禁/return 行为。
@@ -1749,9 +1789,23 @@ func NotifyOwnerAuthRejected(reason string) {
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
 	switch {
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
-		consumeOwnerAuthRejectedNotifyEdge()
-		logger.Info(fmt.Sprintf("[AGENT-BOOT] owner_notify_auth_rejected sent reason=%s status=%d edge=consumed response=%s",
-			reason, resp.StatusCode, strings.TrimSpace(string(body))))
+		// 2xx 只说明通知送达；是否消耗沿以 applied 为准。
+		var parsed ownerAuthRejectedNotifyResponse
+		if err := json.Unmarshal(body, &parsed); err != nil || parsed.Code != 0 {
+			// 应答不可解析：无法确认 owner 已应用，保守保留沿（重复上报由
+			// owner 侧 60s 去重与恢复链幂等吸收）。
+			logger.Warn(fmt.Sprintf("[AGENT-BOOT] owner_notify_auth_rejected unreadable_response reason=%s owner=%s status=%d edge=retained will_retry=true response=%s",
+				reason, ownerBase, resp.StatusCode, strings.TrimSpace(string(body))))
+		} else if parsed.applied() {
+			consumeOwnerAuthRejectedNotifyEdge()
+			logger.Info(fmt.Sprintf("[AGENT-BOOT] owner_notify_auth_rejected sent reason=%s status=%d applied=true edge=consumed response=%s",
+				reason, resp.StatusCode, strings.TrimSpace(string(body))))
+		} else {
+			// applied=false（stale_notification/rate_limited 等）：通知已送达
+			// 但未被应用——保留沿，下一个 401 重试再上报。
+			logger.Warn(fmt.Sprintf("[AGENT-BOOT] owner_notify_auth_rejected not_applied reason=%s owner=%s status=%d applied=false ignored=%s edge=retained will_retry=true",
+				reason, ownerBase, resp.StatusCode, parsed.ignored()))
+		}
 	case resp.StatusCode >= 500:
 		// owner 端临时故障：保留沿，下次 401 重试通知再试。
 		logger.Warn(fmt.Sprintf("[AGENT-BOOT] owner_notify_auth_rejected server_error reason=%s owner=%s status=%d edge=retained will_retry=true",
@@ -1771,10 +1825,10 @@ func NotifyOwnerAuthRejected(reason string) {
 	}
 }
 
-// consumeOwnerAuthRejectedNotifyEdge 置位转换沿（消耗）：仅在通知已成功
-// 送达（2xx）或已判定为 4xx 永久性契约错误时调用。置位动作放在 POST 之
-// 后而非之前——首次尝试失败（owner 不可达/5xx）时沿保留，下一次 401 拒绝
-// 路径仍会重试通知。
+// consumeOwnerAuthRejectedNotifyEdge 置位转换沿（消耗）：仅在 owner 确认
+// 应用（2xx 且 data.applied=true）或已判定为 4xx 永久性契约错误时调用。
+// 置位动作放在 POST 之后而非之前——首次尝试失败（owner 不可达/5xx/
+// applied=false）时沿保留，下一次 401 拒绝路径仍会重试通知。
 func consumeOwnerAuthRejectedNotifyEdge() {
 	ownerAuthRejectedNotifyMu.Lock()
 	defer ownerAuthRejectedNotifyMu.Unlock()

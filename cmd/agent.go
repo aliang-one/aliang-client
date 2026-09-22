@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"aliang.one/nursorgate/app/agentruntime"
@@ -49,8 +50,19 @@ func runAgent(cmd *cobra.Command, args []string) error {
 	return agentruntime.RunForeground(ctx)
 }
 
+// ensureUserAgentEnvironment 为 agent 进程补齐最小运行环境。除 runtime 标记
+// 与路径隔离外，还为"凭据被拒→通知 owner"链兜底：正常形态下
+// ALIANG_SESSION_OWNER_ADDR 由 manager（owner 进程）spawn 时注入
+// （agentruntime.userAgentEnv）；但 Linux headless 上手动 `aliang agent`
+// （无 manager spawn）时无人注入，通知链（services.NotifyOwnerAuthRejected）
+// 因无地址而整体静默缺失——agent 只能自禁等 owner 自查。故仅在该 env 未设置
+// 时注入默认 owner 地址（与 manager 的 ownerBaseURL 默认分支共用
+// services.DefaultSessionOwnerAddr）；显式值（manager spawn 或运维注入）不覆盖。
 func ensureUserAgentEnvironment() {
 	_ = os.Setenv(services.AgentRuntimeEnv, "1")
+	if strings.TrimSpace(os.Getenv(services.SessionOwnerAddrEnv)) == "" {
+		_ = os.Setenv(services.SessionOwnerAddrEnv, services.DefaultSessionOwnerAddr())
+	}
 	_ = os.Unsetenv("ALIANG_DATA_DIR")
 	_ = os.Unsetenv("ALIANG_CACHE_DIR")
 	_ = os.Unsetenv("ALIANG_LOG_DIR")
