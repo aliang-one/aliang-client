@@ -159,14 +159,26 @@
             <p class="mt-2 text-sm leading-6 text-rose-700 dark:text-rose-300">{{ catalogMessage || t('qs_tryAgain') }}</p>
           </div>
 
+          <!-- 三内置均未安装且无 custom 模板：与侧栏空态一致，右侧不渲染任何配置控件 -->
+          <div
+            v-else-if="!selectedSoftwareDef"
+            class="flex min-h-full flex-col items-center justify-center px-5 py-10 text-center"
+          >
+            <span class="material-symbols-outlined text-3xl text-slate-300 dark:text-slate-600">search_off</span>
+            <p class="mt-3 text-sm font-semibold text-slate-700 dark:text-slate-200">{{ t('qs_no_agents_detected') }}</p>
+            <p class="mt-1 max-w-sm text-[11px] leading-5 text-slate-500 dark:text-slate-400">{{ t('qs_no_agents_desc') }}</p>
+          </div>
+
           <template v-else>
             <!-- 接入模式（custom 模板无 baseURL 语义，不显示） -->
-            <div v-if="selectedSoftwareDef && !selectedSoftwareDef.isCustom" class="mb-5">
+            <div v-if="!selectedSoftwareDef.isCustom" class="mb-5">
               <div class="inline-flex items-center gap-1 rounded-xl border border-slate-200 bg-slate-50 p-1 dark:border-slate-700 dark:bg-slate-900/60">
                 <button
                   type="button"
+                  :aria-pressed="quickSetupMode === 'local'"
+                  :disabled="filesDirty"
                   :class="[
-                    'min-h-8 rounded-lg px-3.5 text-xs font-semibold transition',
+                    'min-h-8 rounded-lg px-3.5 text-xs font-semibold transition disabled:cursor-not-allowed disabled:opacity-50',
                     quickSetupMode === 'local'
                       ? 'bg-white text-primary shadow-sm dark:bg-slate-800 dark:text-primary'
                       : 'text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200',
@@ -177,8 +189,10 @@
                 </button>
                 <button
                   type="button"
+                  :aria-pressed="quickSetupMode === 'public'"
+                  :disabled="filesDirty"
                   :class="[
-                    'min-h-8 rounded-lg px-3.5 text-xs font-semibold transition',
+                    'min-h-8 rounded-lg px-3.5 text-xs font-semibold transition disabled:cursor-not-allowed disabled:opacity-50',
                     quickSetupMode === 'public'
                       ? 'bg-white text-primary shadow-sm dark:bg-slate-800 dark:text-primary'
                       : 'text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200',
@@ -534,7 +548,8 @@ const newSoftwareName = ref('');
 const newSoftwareDesc = ref('');
 let fileCounter = 0;
 const renderGuard = createLatestRenderGuard();
-// 每 software 的接入模式记忆（local/public，缺省 public），modal 生命周期内保留。
+// 每 software 的接入模式记忆（local/public，缺省 public）。组件常挂载不随弹窗关闭卸载，
+// 实际为 app 会话级记忆；跨弹窗打开仍保留属有意设计。
 const modeState = createQuickSetupModeState();
 const quickSetupMode = ref('public');
 const allSoftwares = computed(() => filterInstalledQuickSetupSoftwares([
@@ -544,6 +559,8 @@ const allSoftwares = computed(() => filterInstalledQuickSetupSoftwares([
 const selectedSoftwareDef = computed(() => allSoftwares.value.find((item) => item.code === selectedSoftware.value) || null);
 const isOpenCodeSelected = computed(() => selectedSoftwareDef.value?.code === 'opencode');
 const compatibleKeys = computed(() => {
+  // 无选中 software（目录为空）时返回空，避免 software watcher 自动选中 key
+  if (!selectedSoftwareDef.value) return [];
   const supportedProviders = new Set(selectedSoftwareDef.value?.supported_providers || []);
   return apiKeys.value.filter((key) => supportedProviders.size === 0 || supportedProviders.has(key.provider));
 });
