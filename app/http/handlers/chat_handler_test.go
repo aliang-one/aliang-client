@@ -6,42 +6,80 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
+	"time"
+
+	"aliang.one/nursorgate/processor/config"
 )
 
-func TestChatHandler_Completions_NoAPIKeyReturnsFriendlyReply(t *testing.T) {
-	t.Setenv("OPENAI_API_KEY", "")
-	h := NewChatHandler()
+// injectChatMTLSClient pins the handler's singleton mTLS client to one backed
+// by rt, so tests can capture the gateway forward (URL, payload) and stub
+// replies without real client certificates. The returned func restores the
+// singleton. Same-package only: it fires the client's sync.Once directly.
+func injectChatMTLSClient(rt http.RoundTripper) func() {
+	ResetChatMTLSClient()
+	chatMTLSClientOnce.Do(func() {
+		chatMTLSClient = &http.Client{Transport: rt, Timeout: 5 * time.Second}
+		chatMTLSClientErr = nil
+	})
+	return ResetChatMTLSClient
+}
 
-	reqBody := map[string]interface{}{
-		"message": "hello",
-		"history": []map[string]string{{
-			"role":    "user",
-			"content": "hello",
-		}},
+// withGatewayConfig points core.api_server at apiServer for the duration of a
+// test. An empty apiServer clears the config (no gateway configured).
+func withGatewayConfig(apiServer string) func() {
+	prev := config.GetGlobalConfig()
+	if apiServer == "" {
+		config.ResetGlobalConfigForTest()
+	} else {
+		config.SetGlobalConfig(&config.Config{Core: &config.CoreConfig{APIServer: apiServer}})
 	}
-	raw, _ := json.Marshal(reqBody)
+	return func() {
+		if prev == nil {
+			config.ResetGlobalConfigForTest()
+		} else {
+			config.SetGlobalConfig(prev)
+		}
+	}
+}
+
+func postChat(t *testing.T, reqBody map[string]interface{}) *httptest.ResponseRecorder {
+	t.Helper()
+	raw, err := json.Marshal(reqBody)
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
 	req := httptest.NewRequest(http.MethodPost, "/api/chat/completions", bytes.NewReader(raw))
 	rec := httptest.NewRecorder()
+	NewChatHandler().HandleCompletions(rec, req)
+	return rec
+}
 
-	h.HandleCompletions(rec, req)
+// Since the 8c4f755 rewrite the handler is a pure mTLS gateway forwarder: it
+// has no local OPENAI_API_KEY branch. Without a configured gateway it must
+// fail with a server error instead of fabricating a friendly local reply.
+func TestChatHandler_Completions_NoGatewayReturnsServerError(t *testing.T) {
+	restoreCfg := withGatewayConfig("")
+	defer restoreCfg()
+	ResetChatMTLSClient()
+	defer ResetChatMTLSClient()
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200 got %d body=%s", rec.Code, rec.Body.String())
+	rec := postChat(t, map[string]interface{}{"message": "hello"})
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 without a configured gateway, got %d body=%s", rec.Code, rec.Body.String())
 	}
-	if !bytes.Contains(rec.Body.Bytes(), []byte("OPENAI_API_KEY")) {
-		t.Fatalf("expected friendly missing-key message, got: %s", rec.Body.String())
+	if strings.Contains(rec.Body.String(), "OPENAI_API_KEY") {
+		t.Fatalf("handler must not fabricate a local missing-key reply, got: %s", rec.Body.String())
 	}
 }
 
 func TestChatHandler_Completions_InvalidMethod(t *testing.T) {
-	h := NewChatHandler()
 	req := httptest.NewRequest(http.MethodGet, "/api/chat/completions", nil)
 	rec := httptest.NewRecorder()
 
-	h.HandleCompletions(rec, req)
+	NewChatHandler().HandleCompletions(rec, req)
 
 	if rec.Code == http.StatusOK {
 		t.Fatalf("expected non-200 for invalid method, got %d body=%s", rec.Code, rec.Body.String())
@@ -49,17 +87,7 @@ func TestChatHandler_Completions_InvalidMethod(t *testing.T) {
 }
 
 func TestChatHandler_Completions_EmptyMessage(t *testing.T) {
-	_ = os.Unsetenv("OPENAI_API_KEY")
-	h := NewChatHandler()
-
-	reqBody := map[string]interface{}{
-		"message": "   ",
-	}
-	raw, _ := json.Marshal(reqBody)
-	req := httptest.NewRequest(http.MethodPost, "/api/chat/completions", bytes.NewReader(raw))
-	rec := httptest.NewRecorder()
-
-	h.HandleCompletions(rec, req)
+	rec := postChat(t, map[string]interface{}{"message": "   "})
 
 	if rec.Code == http.StatusOK {
 		t.Fatalf("expected non-200 for empty message, got %d body=%s", rec.Code, rec.Body.String())
@@ -67,86 +95,37 @@ func TestChatHandler_Completions_EmptyMessage(t *testing.T) {
 }
 
 func TestChatHandler_Completions_RequestTooLarge(t *testing.T) {
-	t.Setenv("OPENAI_API_KEY", "")
-	h := NewChatHandler()
-
-	oversized := strings.Repeat("a", int(chatRequestMaxBytes)+1024)
-	reqBody := map[string]interface{}{
-		"message": oversized,
-	}
-	raw, _ := json.Marshal(reqBody)
-	req := httptest.NewRequest(http.MethodPost, "/api/chat/completions", bytes.NewReader(raw))
-	rec := httptest.NewRecorder()
-
-	h.HandleCompletions(rec, req)
+	rec := postChat(t, map[string]interface{}{
+		"message": strings.Repeat("a", int(chatRequestMaxBytes)+1024),
+	})
 
 	if rec.Code == http.StatusOK {
 		t.Fatalf("expected non-200 for oversized request, got %d body=%s", rec.Code, rec.Body.String())
 	}
 }
 
-func TestChatHandler_Completions_UpstreamErrorDoesNotLeakDetails(t *testing.T) {
-	oldTransport := http.DefaultTransport
-	defer func() {
-		http.DefaultTransport = oldTransport
-	}()
-
-	http.DefaultTransport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		if req.URL.String() != "https://api.openai.com/v1/chat/completions" {
-			t.Fatalf("unexpected upstream url: %s", req.URL.String())
-		}
-
-		return &http.Response{
-			StatusCode: http.StatusBadGateway,
-			Header:     make(http.Header),
-			Body:       io.NopCloser(strings.NewReader(`{"error":"secret upstream detail"}`)),
-		}, nil
-	})
-
-	t.Setenv("OPENAI_API_KEY", "test-key")
-	h := NewChatHandler()
-
-	reqBody := map[string]interface{}{
-		"message": "hello",
-	}
-	raw, _ := json.Marshal(reqBody)
-	req := httptest.NewRequest(http.MethodPost, "/api/chat/completions", bytes.NewReader(raw))
-	rec := httptest.NewRecorder()
-
-	h.HandleCompletions(rec, req)
-
-	if rec.Code == http.StatusOK {
-		t.Fatalf("expected non-200 for upstream failure, got %d body=%s", rec.Code, rec.Body.String())
-	}
-
-	body := rec.Body.String()
-	if strings.Contains(body, "secret upstream detail") {
-		t.Fatalf("unexpected upstream detail leak in response body: %s", body)
-	}
-}
-
-func TestChatHandler_Completions_HistoryIsCapped(t *testing.T) {
-	oldTransport := http.DefaultTransport
-	defer func() {
-		http.DefaultTransport = oldTransport
-	}()
-
+// The handler forwards the sanitized, capped history plus the current message
+// as an OpenAI-style payload to <core.api_server>/v1/chat/completions, and
+// relays the gateway's reply content back to the client.
+func TestChatHandler_Completions_ForwardsCappedHistoryToGateway(t *testing.T) {
+	const apiServer = "https://gateway.example.com"
 	var captured openAIChatPayload
-	http.DefaultTransport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+	var gotURL string
+	restoreClient := injectChatMTLSClient(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		gotURL = req.URL.String()
 		body, _ := io.ReadAll(req.Body)
 		if err := json.Unmarshal(body, &captured); err != nil {
-			t.Fatalf("failed to parse upstream payload: %v", err)
+			t.Errorf("failed to parse gateway payload: %v", err)
 		}
-
 		return &http.Response{
 			StatusCode: http.StatusOK,
 			Header:     make(http.Header),
 			Body:       io.NopCloser(strings.NewReader(`{"choices":[{"message":{"content":"ok"}}]}`)),
 		}, nil
-	})
-
-	t.Setenv("OPENAI_API_KEY", "test-key")
-	h := NewChatHandler()
+	}))
+	defer restoreClient()
+	restoreCfg := withGatewayConfig(apiServer)
+	defer restoreCfg()
 
 	history := make([]map[string]string, 0, 50)
 	for i := 0; i < 50; i++ {
@@ -155,23 +134,54 @@ func TestChatHandler_Completions_HistoryIsCapped(t *testing.T) {
 			"content": "m",
 		})
 	}
-
-	reqBody := map[string]interface{}{
+	rec := postChat(t, map[string]interface{}{
 		"message": "hello",
 		"history": history,
-	}
-	raw, _ := json.Marshal(reqBody)
-	req := httptest.NewRequest(http.MethodPost, "/api/chat/completions", bytes.NewReader(raw))
-	rec := httptest.NewRecorder()
-
-	h.HandleCompletions(rec, req)
+	})
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200 got %d body=%s", rec.Code, rec.Body.String())
 	}
+	if want := apiServer + "/v1/chat/completions"; gotURL != want {
+		t.Fatalf("forwarded to %q, want %q", gotURL, want)
+	}
+	if captured.Model != "gpt-4o-mini" {
+		t.Fatalf("forwarded model = %q, want gpt-4o-mini", captured.Model)
+	}
+	if len(captured.Messages) != chatHistoryMaxEntries+1 {
+		t.Fatalf("gateway payload carried %d messages, want %d (capped history + current message)",
+			len(captured.Messages), chatHistoryMaxEntries+1)
+	}
+	last := captured.Messages[len(captured.Messages)-1]
+	if last.Role != "user" || last.Content != "hello" {
+		t.Fatalf("last forwarded message = %+v, want the current user message", last)
+	}
+	if !bytes.Contains(rec.Body.Bytes(), []byte(`"reply":"ok"`)) {
+		t.Fatalf("gateway reply content must be relayed to the client, got: %s", rec.Body.String())
+	}
+}
 
-	if len(captured.Messages) > chatHistoryMaxEntries+1 {
-		t.Fatalf("expected capped history, got %d messages", len(captured.Messages))
+// A non-2xx gateway response must surface as a server error without leaking
+// the upstream response body.
+func TestChatHandler_Completions_UpstreamErrorDoesNotLeakDetails(t *testing.T) {
+	restoreClient := injectChatMTLSClient(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusBadGateway,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"error":"secret upstream detail"}`)),
+		}, nil
+	}))
+	defer restoreClient()
+	restoreCfg := withGatewayConfig("https://gateway.example.com")
+	defer restoreCfg()
+
+	rec := postChat(t, map[string]interface{}{"message": "hello"})
+
+	if rec.Code == http.StatusOK {
+		t.Fatalf("expected non-200 for upstream failure, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if body := rec.Body.String(); strings.Contains(body, "secret upstream detail") {
+		t.Fatalf("unexpected upstream detail leak in response body: %s", body)
 	}
 }
 

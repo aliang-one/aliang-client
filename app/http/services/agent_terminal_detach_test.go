@@ -11,16 +11,18 @@ import (
 )
 
 // shrinkDetachedWatch points the idle watcher and the detached-idle threshold
-// at tiny test values and restores both when the test ends. Callers must not
-// use t.Parallel (package vars are process-global).
+// at tiny test values and restores both when the test ends. Both knobs are
+// atomicDurations, so the writes stay race-free even against watchers leaked
+// from earlier tests still reading them. Callers must still not use t.Parallel
+// (the values are process-global).
 func shrinkDetachedWatch(t *testing.T, watchInterval, detachedIdle time.Duration) {
 	t.Helper()
-	origInterval, origIdle := agentTerminalIdleWatchInterval, agentTerminalDetachedIdle
-	agentTerminalIdleWatchInterval = watchInterval
-	agentTerminalDetachedIdle = detachedIdle
+	origInterval, origIdle := agentTerminalIdleWatchInterval.Load(), agentTerminalDetachedIdle.Load()
+	agentTerminalIdleWatchInterval.Store(watchInterval)
+	agentTerminalDetachedIdle.Store(detachedIdle)
 	t.Cleanup(func() {
-		agentTerminalIdleWatchInterval = origInterval
-		agentTerminalDetachedIdle = origIdle
+		agentTerminalIdleWatchInterval.Store(origInterval)
+		agentTerminalDetachedIdle.Store(origIdle)
 	})
 }
 

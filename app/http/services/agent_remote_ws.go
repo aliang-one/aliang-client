@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"aliang.one/nursorgate/app/http/models"
@@ -276,23 +277,38 @@ func (s *AgentService) shouldPreserveDisabledStatus() bool {
 	}
 }
 
+// atomicDuration is a race-safe time.Duration knob. Tests rewrite these
+// tuning package vars while the goroutines they configure (ping/heartbeat
+// loops, idle watchers) are still running and reading them — plain vars there
+// are a guaranteed -race report, atomics make the shrink/restore benign.
+type atomicDuration struct{ v atomic.Int64 }
+
+func (d *atomicDuration) Store(v time.Duration) { d.v.Store(int64(v)) }
+func (d *atomicDuration) Load() time.Duration   { return time.Duration(d.v.Load()) }
+
+func newDurationAtom(v time.Duration) *atomicDuration {
+	a := &atomicDuration{}
+	a.Store(v)
+	return a
+}
+
 // Remote-WS liveness tuning. The connection rides over a NAT tunnel, so a
 // dead/half-open socket can persist undetected: without an enforced deadline
 // the agent believes itself online while PhoneServer sees no traffic (and vice
 // versa). These keep the connection honest. Package vars so tests can shrink
 // them to exercise the dead-peer path quickly.
 var (
-	agentRemoteHeartbeatInterval = 10 * time.Second
-	agentRemotePingInterval      = 30 * time.Second
-	agentRemoteReadWindow        = 90 * time.Second
-	agentRemoteWriteTimeout      = 10 * time.Second
+	agentRemoteHeartbeatInterval = newDurationAtom(10 * time.Second)
+	agentRemotePingInterval      = newDurationAtom(30 * time.Second)
+	agentRemoteReadWindow        = newDurationAtom(90 * time.Second)
+	agentRemoteWriteTimeout      = newDurationAtom(10 * time.Second)
 	// agentRemoteRegistrationWait bounds how long a business write blocks for the
 	// server to ACK agent.registered before failing. Registration normally
 	// completes within a single RTT; this is a safety net for slow networks. On
 	// timeout the write fails and existing per-call retry (e.g.
 	// writeAgentAIApprovalRequest's 5×/1s loop) recovers once registration lands.
 	// Package var so tests can shrink it.
-	agentRemoteRegistrationWait = 5 * time.Second
+	agentRemoteRegistrationWait = newDurationAtom(5 * time.Second)
 )
 
 func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn) error {
@@ -302,7 +318,7 @@ func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn) error {
 	rawWriter := func(payload interface{}) error {
 		writeMu.Lock()
 		defer writeMu.Unlock()
-		_ = conn.SetWriteDeadline(time.Now().Add(agentRemoteWriteTimeout))
+		_ = conn.SetWriteDeadline(time.Now().Add(agentRemoteWriteTimeout.Load()))
 		return conn.WriteJSON(payload)
 	}
 	// Arm the registration gate, then publish a writer that waits for the gate
@@ -315,7 +331,7 @@ func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn) error {
 	// what triggers registration); the gate opens in the agent.registered handler.
 	s.armRegistrationGate()
 	publishedWriter := func(payload interface{}) error {
-		if !s.waitForRegistration(agentRemoteRegistrationWait) {
+		if !s.waitForRegistration(agentRemoteRegistrationWait.Load()) {
 			return errors.New("remote agent not registered within deadline")
 		}
 		return rawWriter(payload)
@@ -337,7 +353,7 @@ func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn) error {
 	// -> ReadJSON errors -> the session ends and remoteConnectionLoop reconnects,
 	// instead of hanging on a dead socket.
 	resetReadDeadline := func() {
-		_ = conn.SetReadDeadline(time.Now().Add(agentRemoteReadWindow))
+		_ = conn.SetReadDeadline(time.Now().Add(agentRemoteReadWindow.Load()))
 	}
 	resetReadDeadline()
 	conn.SetPongHandler(func(string) error {
@@ -372,12 +388,12 @@ func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn) error {
 	// WriteControl is safe to call concurrently with WriteJSON and carries its
 	// own deadline, so it does not contend on writeMu.
 	go func() {
-		pingTicker := time.NewTicker(agentRemotePingInterval)
+		pingTicker := time.NewTicker(agentRemotePingInterval.Load())
 		defer pingTicker.Stop()
 		for {
 			select {
 			case <-pingTicker.C:
-				if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(agentRemoteWriteTimeout)); err != nil {
+				if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(agentRemoteWriteTimeout.Load())); err != nil {
 					return
 				}
 			case <-done:
@@ -387,7 +403,7 @@ func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn) error {
 	}()
 
 	go func() {
-		heartbeatTicker := time.NewTicker(agentRemoteHeartbeatInterval)
+		heartbeatTicker := time.NewTicker(agentRemoteHeartbeatInterval.Load())
 		defer heartbeatTicker.Stop()
 		inventoryTicker := time.NewTicker(time.Minute)
 		defer inventoryTicker.Stop()
