@@ -26,12 +26,16 @@
           </code>
           <button
             type="button"
-            :aria-label="t('qs_copyPath')"
+            :aria-label="copyFailedKey === path ? t('qs_copyFailed') : t('qs_copyPath')"
+            :title="copyFailedKey === path ? t('qs_copyFailed') : undefined"
             class="inline-flex size-7 shrink-0 items-center justify-center rounded-lg text-slate-400 transition hover:bg-slate-200/70 hover:text-slate-600 dark:hover:bg-slate-800 dark:hover:text-slate-200"
             @click="copyValue(path, path)"
           >
-            <span class="material-symbols-outlined text-base">
-              {{ copiedKey === path ? 'check' : 'content_copy' }}
+            <span
+              class="material-symbols-outlined text-base"
+              :class="{ 'text-rose-500': copyFailedKey === path }"
+            >
+              {{ copiedKey === path ? 'check' : copyFailedKey === path ? 'close' : 'content_copy' }}
             </span>
           </button>
         </li>
@@ -88,10 +92,11 @@
           <div class="mb-1.5 flex justify-end">
             <button
               type="button"
+              :class="{ 'border-rose-300 text-rose-600 dark:border-rose-800 dark:text-rose-400': copyFailedKey === file.path }"
               class="inline-flex min-h-8 items-center justify-center rounded-lg border border-slate-200 px-3 text-[11px] font-semibold text-slate-700 transition hover:bg-slate-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
               @click="copyValue(file.content, file.path)"
             >
-              {{ copiedKey === file.path ? t('qs_copied_short') : t('qs_copyFile') }}
+              {{ copiedKey === file.path ? t('qs_copied_short') : copyFailedKey === file.path ? t('qs_copyFailed') : t('qs_copyFile') }}
             </button>
           </div>
           <pre class="code-editor max-h-64 overflow-auto rounded-xl border border-slate-200 bg-slate-950 px-3.5 py-2.5 text-[12px] leading-6 text-slate-100 custom-scrollbar dark:border-slate-700">{{ file.content }}</pre>
@@ -152,22 +157,28 @@ const writtenPaths = computed(() => (Array.isArray(props.written) ? props.writte
 const backupEntries = computed(() => (Array.isArray(props.backups) ? props.backups : []));
 const appliedFiles = computed(() => (Array.isArray(props.files) ? props.files : []));
 
-// 复制反馈：短暂高亮已复制项（面板独立于 Modal 的 statusMessage，用局部状态即可）
+// 复制反馈：短暂高亮已复制项；失败用 ✕ + 红色 + title 提示（面板独立于 Modal 的
+// statusMessage，用局部状态即可，不能静默吞掉失败）
 const copiedKey = ref('');
+const copyFailedKey = ref('');
 let copiedTimer = null;
 async function copyValue(value, key) {
   try {
     await navigator.clipboard.writeText(String(value ?? ''));
     copiedKey.value = key;
+    copyFailedKey.value = '';
+  } catch (error) {
+    copiedKey.value = '';
+    copyFailedKey.value = key;
+  } finally {
     if (copiedTimer) {
       window.clearTimeout(copiedTimer);
     }
     copiedTimer = window.setTimeout(() => {
       copiedTimer = null;
       copiedKey.value = '';
+      copyFailedKey.value = '';
     }, 1600);
-  } catch (error) {
-    copiedKey.value = '';
   }
 }
 onUnmounted(() => {

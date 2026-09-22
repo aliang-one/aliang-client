@@ -207,6 +207,42 @@
               </p>
             </div>
 
+            <!-- 页签：配置预览 | 当前配置（custom 模板无磁盘托管语义，不显示页签与 StatePanel） -->
+            <div v-if="!selectedSoftwareDef.isCustom" class="mb-5">
+              <div class="inline-flex items-center gap-1 rounded-xl border border-slate-200 bg-slate-50 p-1 dark:border-slate-700 dark:bg-slate-900/60">
+                <button
+                  type="button"
+                  :aria-pressed="activeTab === 'edit'"
+                  :class="[
+                    'min-h-8 rounded-lg px-3.5 text-xs font-semibold transition',
+                    activeTab === 'edit'
+                      ? 'bg-white text-primary shadow-sm dark:bg-slate-800 dark:text-primary'
+                      : 'text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200',
+                  ]"
+                  @click="activeTab = 'edit'"
+                >
+                  {{ t('qs_tab_preview') }}
+                </button>
+                <button
+                  type="button"
+                  :aria-pressed="activeTab === 'state'"
+                  :class="[
+                    'min-h-8 rounded-lg px-3.5 text-xs font-semibold transition',
+                    activeTab === 'state'
+                      ? 'bg-white text-primary shadow-sm dark:bg-slate-800 dark:text-primary'
+                      : 'text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200',
+                  ]"
+                  @click="activeTab = 'state'"
+                >
+                  {{ t('qs_state_title') }}
+                </button>
+              </div>
+            </div>
+
+            <!-- 当前配置页签：磁盘实况查看器 + 一键恢复 -->
+            <QuickSetupStatePanel v-if="activeTab === 'state'" :software="selectedSoftware" />
+
+            <template v-else>
             <!-- Key selector -->
             <div v-if="isOpenCodeSelected" class="mb-4 space-y-4">
               <div>
@@ -379,6 +415,7 @@
               :backups="applyResult.backups"
               :files="applyResult.files"
               @back="applyResult = null"
+              @view-current="activeTab = 'state'"
             />
 
             <!-- Config editor -->
@@ -504,6 +541,7 @@
               <template v-else-if="isOpenCodeSelected">{{ t('qs_selectOpenCodeKeys') }}</template>
               <template v-else>{{ t('qs_selectKeyAbove') }}</template>
             </div>
+            </template>
 
             <div v-if="statusMessage" class="mt-6 rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-600 dark:border-slate-800 dark:bg-slate-900/50 dark:text-slate-300">
               {{ statusMessage }}
@@ -520,6 +558,7 @@ import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 import { applyQuickSetup, getQuickSetupCatalog, getQuickSetupModels, renderQuickSetup } from '../services/quickSetupApi';
 import { useI18n } from '../i18n';
 import QuickSetupResultPanel from './QuickSetupResultPanel.vue';
+import QuickSetupStatePanel from './QuickSetupStatePanel.vue';
 import { createLatestRenderGuard, createQuickSetupModeState, filterInstalledQuickSetupSoftwares, isBuiltInQuickSetupSoftware, snapshotQuickSetupFiles } from '../utils/quickSetupState';
 
 const { t } = useI18n();
@@ -537,6 +576,9 @@ const applying = ref(false);
 const catalogStatus = ref('idle');
 const catalogMessage = ref('');
 const statusMessage = ref('');
+// 右侧面板页签：'edit'=配置预览（key 选择 + 编辑/结果视图）| 'state'=当前配置（磁盘实况）。
+// 仅内置 software 显示页签（custom 无磁盘托管语义）；切 software 时重置为 edit。
+const activeTab = ref('edit');
 const softwares = ref([]);
 const apiKeys = ref([]);
 const selectedSoftware = ref('');
@@ -999,6 +1041,9 @@ async function applyCurrentVariant() {
     if (writtenCount > 0) {
       filesDirty.value = false;
       statusMessage.value = '';
+      // 结果页渲染在 edit 页签内；apply 入口当前只在 edit 页签可达，这里防御性确保
+      // 结果视图可见（未来若新增其他触发点不会把结果渲染进隐藏页签）
+      activeTab.value = 'edit';
       // 应用前的文件快照即写入磁盘的最终内容（path+content 窄快照，供结果面板展示）
       applyResult.value = {
         softwareName: selectedSoftwareDef.value?.name || selectedSoftware.value,
@@ -1034,6 +1079,8 @@ watch(
 // Software switch -> auto-select first compatible key; 恢复该 software 记忆的接入模式
 watch(selectedSoftware, async () => {
   clearCurrentRender();
+  // custom 模板不渲染页签行，重置保证页签状态不跨 software 泄漏
+  activeTab.value = 'edit';
   quickSetupMode.value = selectedSoftwareDef.value?.isCustom
     ? 'public'
     : modeState.modeOf(selectedSoftware.value);
