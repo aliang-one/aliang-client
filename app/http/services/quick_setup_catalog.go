@@ -90,6 +90,32 @@ func quickSetupSoftwares() []models.QuickSetupSoftware {
 				},
 			},
 		},
+		{
+			Code:               "pi",
+			Name:               "Pi",
+			Description:        "Generate Pi models.json with a custom Aliang gateway provider plus settings.json defaults for provider and model.",
+			SupportedProviders: []string{"anthropic", "openai"},
+			Files: []models.QuickSetupSoftwareFile{
+				{
+					Code:        "models",
+					Label:       "models.json",
+					FileName:    "models.json",
+					DefaultPath: "~/.pi/agent/models.json",
+					Format:      "json",
+					Kind:        "file",
+					Description: "Pi custom provider definition (Aliang gateway).",
+				},
+				{
+					Code:        "settings",
+					Label:       "settings.json",
+					FileName:    "settings.json",
+					DefaultPath: "~/.pi/agent/settings.json",
+					Format:      "json",
+					Kind:        "file",
+					Description: "Pi global settings (default provider/model).",
+				},
+			},
+		},
 	}
 }
 
@@ -357,6 +383,7 @@ var quickSetupDetectionRules = map[string]quickSetupDetectionRule{
 	"claude-code": {cliNames: []string{"claude"}, dirs: []string{".claude"}},
 	"codex":       {cliNames: []string{"codex"}, dirs: []string{".codex"}},
 	"opencode":    {cliNames: []string{"opencode"}, dirs: []string{".config/opencode", ".local/share/opencode", ".opencode"}},
+	"pi":          {cliNames: []string{"pi"}, dirs: []string{".pi"}},
 }
 
 // detectQuickSetupInstalled：CLI 二进制或配置目录任一命中即视为已安装（spec §5）。

@@ -72,6 +72,39 @@ func TestQuickSetupSoftwares_ClaudeUsesSettingsJSON(t *testing.T) {
 	}
 }
 
+func TestQuickSetupSoftwares_PiDeclared(t *testing.T) {
+	sw, ok := findQuickSetupSoftware("pi")
+	if !ok {
+		t.Fatal("pi missing")
+	}
+	if len(sw.Files) != 2 {
+		t.Fatalf("pi files: %+v", sw.Files)
+	}
+	if sw.Files[0].DefaultPath != "~/.pi/agent/models.json" || sw.Files[1].DefaultPath != "~/.pi/agent/settings.json" {
+		t.Fatalf("pi paths: %+v", sw.Files)
+	}
+	// format 均 json；code 分别为 models/settings
+	if sw.Files[0].Format != "json" || sw.Files[1].Format != "json" || sw.Files[0].Code != "models" || sw.Files[1].Code != "settings" {
+		t.Fatalf("pi files meta: %+v", sw.Files)
+	}
+}
+
+func TestDetectQuickSetupInstalled_Pi(t *testing.T) {
+	home := t.TempDir()
+	orig := quickSetupLookPathCLIFn
+	quickSetupLookPathCLIFn = func(string) (string, error) { return "", os.ErrNotExist }
+	defer func() { quickSetupLookPathCLIFn = orig }()
+	if detectQuickSetupInstalled("pi", home) {
+		t.Fatal("must not detect without dir")
+	}
+	if err := os.MkdirAll(filepath.Join(home, ".pi"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if !detectQuickSetupInstalled("pi", home) {
+		t.Fatal("pi should be installed via ~/.pi")
+	}
+}
+
 func TestCatalogMarksInstalled(t *testing.T) {
 	home := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(home, ".claude"), 0o700); err != nil {
@@ -103,7 +136,7 @@ func TestCatalogMarksInstalled(t *testing.T) {
 	if !found["claude-code"] {
 		t.Fatal("claude-code should be marked installed")
 	}
-	if found["codex"] || found["opencode"] {
-		t.Fatal("codex/opencode must not be marked installed")
+	if found["codex"] || found["opencode"] || found["pi"] {
+		t.Fatal("codex/opencode/pi must not be marked installed")
 	}
 }
