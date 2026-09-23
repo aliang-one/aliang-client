@@ -236,6 +236,14 @@ func TestExternalTUIBusyPrecheck(t *testing.T) {
 // TestGuardExternalTUIClaudeSpawn: the spawn precheck only fires for the
 // claude tool path with a known resume id over a busy live TUI.
 func TestGuardExternalTUIClaudeSpawn(t *testing.T) {
+	// The fixture pid is the test process itself — its comm is the test
+	// binary, not "claude", so the identity gate must be permissive here
+	// (same reason as TestExternalTUIBusyPrecheck; c00e2ae added the gate
+	// after this test was written and left it deterministically red).
+	previousMatch := externalInterruptTargetMatches
+	externalInterruptTargetMatches = func(pid int) bool { return true }
+	t.Cleanup(func() { externalInterruptTargetMatches = previousMatch })
+
 	const sid = "guard-busy"
 	home := externalInterruptFixture(t, sid, livePidRecord(t, sid, `"status":"busy","entrypoint":"cli"`))
 
