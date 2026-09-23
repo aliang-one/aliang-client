@@ -97,14 +97,51 @@ func (s *QuickSetupService) Catalog() map[string]interface{} {
 	}
 	softwares := quickSetupSoftwares()
 	homeDir := quickSetupDetectionHomeFn()
+	comboSvc := NewQuickSetupComboService()
+	combos := make([]models.QuickSetupComboView, 0)
 	for i := range softwares {
-		softwares[i].Installed = detectQuickSetupInstalled(softwares[i].Code, homeDir)
+		code := softwares[i].Code
+		softwares[i].Installed = detectQuickSetupInstalled(code, homeDir)
+		// presets 按 software 下发（不依赖安装态，agent 装前展示也用到）。
+		local, public, err := quickSetupBaseURLPresets(code)
+		if err != nil {
+			return map[string]interface{}{
+				"status": "failed",
+				"error":  "quick_setup_catalog_failed",
+				"msg":    fmt.Sprintf("Failed to load quick setup catalog: %v", err),
+			}
+		}
+		softwares[i].Presets = &models.QuickSetupSoftwarePresets{
+			BaseURLLocal:  local,
+			BaseURLPublic: public,
+		}
+		if !softwares[i].Installed {
+			continue
+		}
+		// 已安装才种子默认组合并下发该 agent 的组合列表（幂等）。
+		if err := comboSvc.SeedIfEmpty(code); err != nil {
+			return map[string]interface{}{
+				"status": "failed",
+				"error":  "quick_setup_catalog_failed",
+				"msg":    fmt.Sprintf("Failed to load quick setup catalog: %v", err),
+			}
+		}
+		listed, err := comboSvc.ListBySoftware(code)
+		if err != nil {
+			return map[string]interface{}{
+				"status": "failed",
+				"error":  "quick_setup_catalog_failed",
+				"msg":    fmt.Sprintf("Failed to load quick setup catalog: %v", err),
+			}
+		}
+		combos = append(combos, listed...)
 	}
 	return map[string]interface{}{
 		"status": "success",
 		"data": models.QuickSetupCatalogResponse{
 			Softwares: softwares,
 			APIKeys:   toQuickSetupAPIKeys(apiKeys, baseRoot),
+			Combos:    combos,
 		},
 	}
 }

@@ -10,13 +10,22 @@ type QuickSetupSoftwareFile struct {
 	Description string `json:"description"`
 }
 
+// QuickSetupSoftwarePresets 是按 agent 下发的 base_url 预设：local 指向本机
+// HTTP 代理监听地址，public 指向推理网关公网入口。/v1 属变量值口径——
+// codex/opencode 的预设带 /v1，claude-code/pi 不带（客户端自行追加）。
+type QuickSetupSoftwarePresets struct {
+	BaseURLLocal  string `json:"base_url_local"`
+	BaseURLPublic string `json:"base_url_public"`
+}
+
 type QuickSetupSoftware struct {
-	Code               string                   `json:"code"`
-	Name               string                   `json:"name"`
-	Description        string                   `json:"description"`
-	SupportedProviders []string                 `json:"supported_providers"`
-	Files              []QuickSetupSoftwareFile `json:"files"`
-	Installed          bool                     `json:"installed"`
+	Code               string                     `json:"code"`
+	Name               string                     `json:"name"`
+	Description        string                     `json:"description"`
+	SupportedProviders []string                   `json:"supported_providers"`
+	Files              []QuickSetupSoftwareFile   `json:"files"`
+	Installed          bool                       `json:"installed"`
+	Presets            *QuickSetupSoftwarePresets `json:"presets,omitempty"`
 }
 
 type QuickSetupAPIKey struct {
@@ -32,8 +41,9 @@ type QuickSetupAPIKey struct {
 }
 
 type QuickSetupCatalogResponse struct {
-	Softwares []QuickSetupSoftware `json:"softwares"`
-	APIKeys   []QuickSetupAPIKey   `json:"api_keys"`
+	Softwares []QuickSetupSoftware  `json:"softwares"`
+	APIKeys   []QuickSetupAPIKey    `json:"api_keys"`
+	Combos    []QuickSetupComboView `json:"combos"`
 }
 
 type QuickSetupModelsRequest struct {

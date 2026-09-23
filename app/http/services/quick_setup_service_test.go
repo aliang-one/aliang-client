@@ -540,6 +540,88 @@ func TestQuickSetupService_Catalog_IncludesProviderAwareBaseURLs(t *testing.T) {
 	}
 }
 
+// TestQuickSetupService_CatalogCombosAndPresets 锁定 catalog 的组合接线（spec §4.0，
+// presets 按 software 下发的细化口径）：已安装 agent 触发默认组合种子并下发组合列表，
+// 未安装不种子；presets codex 带 /v1、claude-code 不带；种子幂等。
+func TestQuickSetupService_CatalogCombosAndPresets(t *testing.T) {
+	// stubComboServiceEnv：全局 config api_server=https://api.example.com +
+	// 临时路径组合 store（quickSetupComboStoreFn 钩子，绝不碰真实库）。
+	_, _ = stubComboServiceEnv(t)
+
+	previousKeys := quickSetupGetAPIKeysFn
+	quickSetupGetAPIKeysFn = func() ([]auth.UserAPIKey, error) {
+		return nil, nil
+	}
+	t.Cleanup(func() { quickSetupGetAPIKeysFn = previousKeys })
+
+	// CLI 检测只命中 claude；检测家目录隔离到临时目录防读到本机真实配置目录。
+	previousLook := quickSetupLookPathCLIFn
+	quickSetupLookPathCLIFn = func(name string) (string, error) {
+		if name == "claude" {
+			return "/usr/local/bin/claude", nil
+		}
+		return "", errors.New("cli not found")
+	}
+	t.Cleanup(func() { quickSetupLookPathCLIFn = previousLook })
+
+	previousHome := quickSetupDetectionHomeFn
+	detectHome := t.TempDir()
+	quickSetupDetectionHomeFn = func() string { return detectHome }
+	t.Cleanup(func() { quickSetupDetectionHomeFn = previousHome })
+
+	svc := NewQuickSetupService()
+	result := svc.Catalog()
+	if result["status"] != "success" {
+		t.Fatalf("catalog status = %#v, want success: %#v", result["status"], result)
+	}
+	data := result["data"].(models.QuickSetupCatalogResponse)
+
+	if len(data.Combos) != 1 {
+		t.Fatalf("combos len = %d, want 1: %+v", len(data.Combos), data.Combos)
+	}
+	if combo := data.Combos[0]; combo.Software != "claude-code" || combo.Name != "默认" || !combo.IsDefault {
+		t.Fatalf("seeded combo = %+v, want claude-code 默认 is_default=true", combo)
+	}
+
+	byCode := map[string]models.QuickSetupSoftware{}
+	for _, sw := range data.Softwares {
+		byCode[sw.Code] = sw
+	}
+	if !byCode["claude-code"].Installed {
+		t.Fatal("claude-code should be installed via CLI stub")
+	}
+	if byCode["codex"].Installed {
+		t.Fatal("codex should not be installed")
+	}
+	if got := byCode["claude-code"].Presets; got == nil || got.BaseURLLocal != "http://127.0.0.1:56432" {
+		t.Fatalf("claude-code presets = %+v, want base_url_local http://127.0.0.1:56432 (no /v1)", byCode["claude-code"].Presets)
+	}
+	if got := byCode["claude-code"].Presets; got.BaseURLPublic != "https://api.example.com" {
+		t.Fatalf("claude-code base_url_public = %q, want https://api.example.com", got.BaseURLPublic)
+	}
+	if got := byCode["codex"].Presets; got == nil || got.BaseURLLocal != "http://127.0.0.1:56432/v1" {
+		t.Fatalf("codex presets = %+v, want base_url_local http://127.0.0.1:56432/v1", byCode["codex"].Presets)
+	}
+	if got := byCode["codex"].Presets; got.BaseURLPublic != "https://api.example.com/v1" {
+		t.Fatalf("codex base_url_public = %q, want https://api.example.com/v1", got.BaseURLPublic)
+	}
+	for _, combo := range data.Combos {
+		if combo.Software == "codex" {
+			t.Fatal("codex must not seed combos while not installed")
+		}
+	}
+
+	// 二次 Catalog：种子幂等，组合数不变。
+	second := svc.Catalog()
+	if second["status"] != "success" {
+		t.Fatalf("second catalog status = %#v: %#v", second["status"], second)
+	}
+	secondData := second["data"].(models.QuickSetupCatalogResponse)
+	if len(secondData.Combos) != len(data.Combos) {
+		t.Fatalf("second catalog combos len = %d, want %d (seed idempotent)", len(secondData.Combos), len(data.Combos))
+	}
+}
+
 func TestQuickSetupProviderBaseURL_UsesSingleVersionPrefix(t *testing.T) {
 	for _, provider := range []string{"openai", "anthropic"} {
 		for _, root := range []string{"https://api.example.com", "https://api.example.com/v1"} {
