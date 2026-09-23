@@ -2896,7 +2896,9 @@ func (m *agentAIManager) handleClaudeApprovalHook(ctx context.Context, sessionID
 		return claudeApprovalHookDecision(hookEventName, true, "auto-approved: goal execution within pre-approved plan"), nil
 	}
 	if svc := m.approvalService(); svc != nil {
-		switch decision, matchedID := svc.evaluateApprovalDecision(toolName, toolInput, run.projectPath); decision {
+		// raw 传入边界判定:Claude auto-memory carve-out 需要 transcript_path
+		// 在 slug 编码漂移时精确锁定本会话的 memory 目录。
+		switch decision, matchedID := svc.evaluateApprovalDecisionForHook(toolName, toolInput, run.projectPath, raw); decision {
 		case decisionAutoApprove:
 			logger.Info(fmt.Sprintf("approval-hook: AUTO-APPROVE by policy rule=%s tool=%s session=%s (no cloud round-trip)", matchedID, toolName, sessionID))
 			return claudeApprovalHookDecision(hookEventName, true, "auto-approved by policy: "+matchedID), nil

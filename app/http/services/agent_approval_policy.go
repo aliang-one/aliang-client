@@ -149,7 +149,14 @@ func (s *AgentService) setEffectivePolicyForPathLocked(projectPath string, p App
 // evaluateApprovalDecision evaluates the effective policy for the given project
 // path for one tool call. Convenience used by the approval hooks.
 func (s *AgentService) evaluateApprovalDecision(toolName string, toolInput json.RawMessage, projectPath string) (policyDecision, string) {
-	if decision, ruleID, constrained := approvalProjectBoundaryDecision(toolName, toolInput, projectPath); constrained {
+	return s.evaluateApprovalDecisionForHook(toolName, toolInput, projectPath, nil)
+}
+
+// evaluateApprovalDecisionForHook is evaluateApprovalDecision with the raw hook
+// payload (may be nil) so the Claude auto-memory carve-out can additionally
+// resolve the memory root from the run's transcript_path.
+func (s *AgentService) evaluateApprovalDecisionForHook(toolName string, toolInput json.RawMessage, projectPath string, hookRaw map[string]interface{}) (policyDecision, string) {
+	if decision, ruleID, constrained := approvalProjectBoundaryDecisionForHook(toolName, toolInput, projectPath, hookRaw); constrained {
 		return decision, ruleID
 	}
 	return evaluateApprovalPolicy(s.effectiveApprovalPolicyForPath(projectPath), toolName, toolInput)
@@ -467,6 +474,19 @@ func commandFromToolInput(toolInput json.RawMessage) string {
 }
 
 func approvalProjectBoundaryDecision(toolName string, toolInput json.RawMessage, projectPath string) (policyDecision, string, bool) {
+	return approvalProjectBoundaryDecisionForHook(toolName, toolInput, projectPath, nil)
+}
+
+// claudeProjectMemoryRuleID is the matched-rule ID reported when a scoped-path
+// tool call is auto-approved because every target path resolves inside the
+// current project's Claude Code auto-memory directory
+// (~/.claude/projects/<slug>/memory). The carve-out exists because the Claude
+// Code harness instructs the model to persist memories THERE while the project
+// boundary below auto-denies any path outside the project cwd — without it the
+// model could never follow its own memory instructions.
+const claudeProjectMemoryRuleID = "memory-dir-carveout"
+
+func approvalProjectBoundaryDecisionForHook(toolName string, toolInput json.RawMessage, projectPath string, hookRaw map[string]interface{}) (policyDecision, string, bool) {
 	projectPath = strings.TrimSpace(projectPath)
 	if projectPath == "" {
 		return "", "", false
@@ -483,6 +503,14 @@ func approvalProjectBoundaryDecision(toolName string, toolInput json.RawMessage,
 	}
 	if !valid {
 		return decisionAutoDeny, "invalid-project-path", true
+	}
+	// Auto-memory carve-out, evaluated BEFORE the blanket outside-project deny:
+	// when every target path resolves inside this project's memory dir the call
+	// is approved regardless of the policy scheme — the memory dir is outside
+	// the project by construction, so no scheme (not even allow_all) could
+	// otherwise reach it past the containment check below.
+	if len(paths) > 0 && allPathsInsideClaudeMemoryDir(paths, projectPath, hookRaw) {
+		return decisionAutoApprove, claudeProjectMemoryRuleID, true
 	}
 	for _, path := range paths {
 		if !approvalPathWithinProject(projectPath, path) {
@@ -591,6 +619,153 @@ func evalSymlinksAllowMissing(path string) (string, error) {
 		missing = append(missing, filepath.Base(current))
 		current = parent
 	}
+}
+
+// agentHomeForMemoryHook is the home resolver injection point for tests; the
+// memory carve-out resolves ~/.claude/projects through it.
+var agentHomeForMemoryHook = agentHome
+
+// claudeProjectSlug mirrors Claude Code's encoding of a project cwd into its
+// transcript/memory directory name under ~/.claude/projects: every
+// non-alphanumeric rune becomes '-' (e.g. /Users/mac/my.app → -Users-mac-my-app).
+func claudeProjectSlug(projectPath string) string {
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+			return r
+		default:
+			return '-'
+		}
+	}, projectPath)
+}
+
+// claudeMemoryDirCandidates returns the candidate auto-memory roots for a run:
+// the slug-computed projects dir always, plus the transcript's own project dir
+// when the hook payload proves the run writes its transcript there (immune to
+// slug-encoding drift). Roots may coincide; duplicates are collapsed.
+func claudeMemoryDirCandidates(projectPath string, hookRaw map[string]interface{}) []string {
+	home := strings.TrimSpace(agentHomeForMemoryHook())
+	if home == "" {
+		return nil
+	}
+	projectsRoot := filepath.Join(home, ".claude", "projects")
+	var roots []string
+	if slug := claudeProjectSlug(projectPath); slug != "" {
+		roots = append(roots, filepath.Join(projectsRoot, slug, "memory"))
+	}
+	if dir := claudeTranscriptProjectDir(hookRaw, projectsRoot); dir != "" {
+		root := filepath.Join(dir, "memory")
+		duplicate := false
+		for _, existing := range roots {
+			if existing == root {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate {
+			roots = append(roots, root)
+		}
+	}
+	return roots
+}
+
+// claudeTranscriptProjectDir resolves the transcript's project directory when
+// hookRaw carries a transcript_path pointing at <projectsRoot>/<slug>/<session>.jsonl.
+// Location is the proof: anything not strictly inside the projects root
+// (relative paths, other trees, the root itself) is ignored.
+func claudeTranscriptProjectDir(hookRaw map[string]interface{}, projectsRoot string) string {
+	if hookRaw == nil {
+		return ""
+	}
+	transcript := strings.TrimSpace(remoteString(hookRaw, "transcript_path"))
+	if transcript == "" {
+		return ""
+	}
+	if strings.HasPrefix(transcript, "~") {
+		home := strings.TrimSpace(agentHomeForMemoryHook())
+		if home == "" {
+			return ""
+		}
+		transcript = filepath.Join(home, transcript[1:])
+	}
+	if !filepath.IsAbs(transcript) {
+		return ""
+	}
+	dir := filepath.Dir(filepath.Clean(transcript))
+	if dir == projectsRoot {
+		return ""
+	}
+	rel, err := filepath.Rel(projectsRoot, dir)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return ""
+	}
+	return dir
+}
+
+func allPathsInsideClaudeMemoryDir(paths []string, projectPath string, hookRaw map[string]interface{}) bool {
+	roots := claudeMemoryDirCandidates(projectPath, hookRaw)
+	if len(roots) == 0 {
+		return false
+	}
+	for _, path := range paths {
+		inside := false
+		for _, root := range roots {
+			if approvalPathWithinClaudeMemoryRoot(root, path) {
+				inside = true
+				break
+			}
+		}
+		if !inside {
+			return false
+		}
+	}
+	return true
+}
+
+// approvalPathWithinClaudeMemoryRoot reports whether candidate is inside
+// memoryRoot. Unlike the project boundary it tolerates a missing memory root
+// (the first-ever save creates it) but voids the grant when ANY component
+// strictly below the root is a symlink: a dangling link would otherwise pass
+// the missing-tail lexical resolution while escaping the root on write, and a
+// live inside-pointing link could be retargeted between check and write.
+func approvalPathWithinClaudeMemoryRoot(memoryRoot, candidate string) bool {
+	memoryRoot = strings.TrimSpace(memoryRoot)
+	candidate = strings.TrimSpace(candidate)
+	if memoryRoot == "" || candidate == "" {
+		return false
+	}
+	if strings.HasPrefix(candidate, "~") {
+		home := strings.TrimSpace(agentHomeForMemoryHook())
+		if home == "" {
+			return false
+		}
+		candidate = filepath.Join(home, candidate[1:])
+	}
+	if !filepath.IsAbs(candidate) {
+		// Relative tool paths resolve against the run cwd (= project root) and
+		// can never reach the memory dir, which lives under ~/.claude.
+		return false
+	}
+	if _, err := evalSymlinksAllowMissing(memoryRoot); err != nil {
+		return false
+	}
+	memoryRoot = filepath.Clean(memoryRoot)
+	candidate = filepath.Clean(candidate)
+	rel, err := filepath.Rel(memoryRoot, candidate)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return false
+	}
+	current := memoryRoot
+	for _, part := range strings.Split(rel, string(filepath.Separator)) {
+		if part == "." {
+			continue
+		}
+		current = filepath.Join(current, part)
+		if info, err := os.Lstat(current); err == nil && info.Mode()&os.ModeSymlink != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func safeBashSegmentsMatch(pattern *regexp.Regexp, command string) bool {
