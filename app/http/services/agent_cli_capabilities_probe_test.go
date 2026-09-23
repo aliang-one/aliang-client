@@ -23,6 +23,20 @@ func atoiPid(t *testing.T, raw string) int {
 	return pid
 }
 
+func waitForFile(t *testing.T, path string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("file %s never appeared within %v", path, timeout)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 func syscallSignalZero() syscall.Signal {
 	return syscall.Signal(0)
 }
@@ -71,26 +85,43 @@ func TestNewBackgroundCommandContextKillsProcessGroup(t *testing.T) {
 
 	dir := t.TempDir()
 	childPidFile := filepath.Join(dir, "child.pid")
+	readyMarker := filepath.Join(dir, "ready")
 	script := filepath.Join(dir, "spawner.sh")
 	require.NoError(t, os.WriteFile(script, []byte(
 		"#!/bin/bash\n"+
 			"sleep 30 &\n"+
 			"echo $! > "+childPidFile+"\n"+
+			"touch "+readyMarker+"\n"+
 			"wait\n",
 	), 0o755))
 
-	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	// Cancel manually only AFTER the spawner recorded the child pid — a ctx
+	// deadline could otherwise fire before the script wrote the pid file and
+	// race the test setup itself.
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	cmd := newBackgroundCommandContext(ctx, script)
+	done := make(chan struct{})
+	go func() {
+		_, _ = cmd.CombinedOutput()
+		close(done)
+	}()
+	waitForFile(t, readyMarker, 5*time.Second)
+
 	started := time.Now()
-	_, _ = cmd.CombinedOutput()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("CombinedOutput did not return within 10s of cancel")
+	}
 	elapsed := time.Since(started)
 
 	// The background child inherits stdout, so without a group kill Wait hangs
 	// on pipe EOF until the child exits naturally (the production probe hung
 	// 2m13s instead of returning at its 5s deadline). Group kill ⇒ prompt EOF.
-	assert.Less(t, elapsed, 10*time.Second,
-		"CombinedOutput must return promptly after the ctx deadline, got %v", elapsed)
+	assert.Less(t, elapsed, 5*time.Second,
+		"CombinedOutput must return promptly after cancel, got %v", elapsed)
 
 	raw, err := os.ReadFile(childPidFile)
 	require.NoError(t, err, "spawner must have recorded the background child pid")
