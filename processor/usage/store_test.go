@@ -56,8 +56,31 @@ func TestBucketAccumulateAndDirty(t *testing.T) {
 	if err != nil || len(dirty) != 1 {
 		t.Fatalf("DirtyBuckets = %v, %v; want 1 row", dirty, err)
 	}
-	if err := store.ClearDirty([]int64{dirty[0].ID}); err != nil {
-		t.Fatalf("ClearDirty: %v", err)
+	if dirty[0].Revision != 1 {
+		t.Fatalf("first save revision = %d, want 1", dirty[0].Revision)
+	}
+
+	// 再追加一轮：revision 递增，仍 dirty
+	b2.InputTokens += 50
+	if err := store.SaveBucket(b2); err != nil {
+		t.Fatalf("SaveBucket bump: %v", err)
+	}
+	dirty, _ = store.DirtyBuckets()
+	if len(dirty) != 1 || dirty[0].Revision != 2 {
+		t.Fatalf("after bump: dirty = %d rows, revision = %d; want 1 row, revision 2", len(dirty), dirty[0].Revision)
+	}
+
+	// 用过期 mark（revision=1）清除：应失效，dirty 保留
+	if err := store.ClearDirtyIfUnchanged([]BucketMark{{ID: dirty[0].ID, Revision: 1}}); err != nil {
+		t.Fatalf("ClearDirtyIfUnchanged stale: %v", err)
+	}
+	if dirty, _ = store.DirtyBuckets(); len(dirty) != 1 {
+		t.Fatalf("stale mark must not clear dirty, got %d rows", len(dirty))
+	}
+
+	// 用新鲜 mark（revision=2）清除：应成功
+	if err := store.ClearDirtyIfUnchanged([]BucketMark{{ID: dirty[0].ID, Revision: 2}}); err != nil {
+		t.Fatalf("ClearDirtyIfUnchanged fresh: %v", err)
 	}
 	if dirty, _ = store.DirtyBuckets(); len(dirty) != 0 {
 		t.Fatalf("after clear, dirty = %d rows", len(dirty))

@@ -39,6 +39,9 @@ type UsageBucket struct {
 	FirstSeen  int64  `gorm:"column:first_seen"`
 	LastSeen   int64  `gorm:"column:last_seen"`
 	Dirty      bool   `gorm:"column:dirty"`
+	// Revision 单调递增（SaveBucket 每次落库 +1），reporter 用它做条件清除：
+	// 快照后若桶又被追加过（revision 变化），清除失效，保持 dirty 等待下轮。
+	Revision int64 `gorm:"column:revision;default:0"`
 }
 
 func (UsageBucket) TableName() string { return "usage_buckets" }
@@ -118,9 +121,10 @@ func (s *Store) Bucket(hourStart int64, model string) (*UsageBucket, error) {
 }
 
 // SaveBucket 持久化桶并标记为脏：凡有累计数据落库即待上报，
-// 由 reporter 上报成功后 ClearDirty。
+// 由 reporter 上报成功后 ClearDirtyIfUnchanged。
 func (s *Store) SaveBucket(b *UsageBucket) error {
 	b.Dirty = true
+	b.Revision++
 	if err := s.db.Save(b).Error; err != nil {
 		return fmt.Errorf("usage: save bucket: %w", err)
 	}
@@ -143,12 +147,19 @@ func (s *Store) AllBuckets() ([]UsageBucket, error) {
 	return out, nil
 }
 
-func (s *Store) ClearDirty(ids []int64) error {
-	if len(ids) == 0 {
-		return nil
-	}
-	if err := s.db.Model(&UsageBucket{}).Where("id IN ?", ids).Update("dirty", false).Error; err != nil {
-		return fmt.Errorf("usage: clear dirty: %w", err)
+// BucketMark 是 reporter 快照某桶时记录的 (ID, Revision) 对。
+type BucketMark struct {
+	ID       int64
+	Revision int64
+}
+
+// ClearDirtyIfUnchanged 仅当桶的 revision 与快照一致时清除 dirty——快照与
+// 清除之间若 tracker 又追加过（revision 已变），dirty 保留，下轮重推新值。
+func (s *Store) ClearDirtyIfUnchanged(marks []BucketMark) error {
+	for _, m := range marks {
+		if err := s.db.Model(&UsageBucket{}).Where("id = ? AND revision = ?", m.ID, m.Revision).Update("dirty", false).Error; err != nil {
+			return fmt.Errorf("usage: clear dirty: %w", err)
+		}
 	}
 	return nil
 }
