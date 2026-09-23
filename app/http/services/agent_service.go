@@ -1355,14 +1355,24 @@ func resolveAgentLaunchSpec(req models.AgentLaunchRequest) (*agentLaunchSpec, er
 }
 
 func detectAgentTools() []models.AgentTool {
+	return detectAgentToolsWith(lookPathCLI)
+}
+
+// detectAgentToolsWith 是 detectAgentTools 的可注入变体(测试用 lookPath 替身)。
+// 对每个已安装的 CLI 追加探测 Version 与 Efforts——探测按二进制内容缓存,
+// 稳态零开销;失败留空,视为「未知,不设限」。
+func detectAgentToolsWith(lookPath func(string) (string, error)) []models.AgentTool {
 	defs := []models.AgentTool{
 		{ID: "codex", Name: "Codex", Command: "codex", Description: "OpenAI Codex CLI"},
 		{ID: "claude", Name: "Claude Code", Command: "claude", Description: "Claude Code CLI"},
 		{ID: "claudecode", Name: "Claude Code", Command: "claudecode", Description: "Claude Code CLI alias"},
 		{ID: "opencode", Name: "OpenCode", Command: "opencode", Description: "OpenCode CLI"},
+		// pi/gemini 目前仅检测+上报(尚无远程执行通道),供能力清单先行的设备画像。
+		{ID: "pi", Name: "Pi", Command: "pi", Description: "Pi coding CLI（仅检测上报，远程执行尚未支持）"},
+		{ID: "gemini", Name: "Gemini CLI", Command: "gemini", Description: "Gemini CLI（仅检测上报，远程执行尚未支持）"},
 	}
 	for i := range defs {
-		if path, err := lookPathCLI(defs[i].Command); err == nil {
+		if path, err := lookPath(defs[i].Command); err == nil {
 			defs[i].Path = path
 			defs[i].Available = true
 		}
@@ -1376,12 +1386,19 @@ func detectAgentTools() []models.AgentTool {
 		if defs[i].ID != "claudecode" || defs[i].Available {
 			continue
 		}
-		if path, err := lookPathCLI("claude"); err == nil {
+		if path, err := lookPath("claude"); err == nil {
 			defs[i].Command = "claude"
 			defs[i].Path = path
 			defs[i].Available = true
 			defs[i].Description = "Claude Code CLI via claude"
 		}
+	}
+	for i := range defs {
+		if !defs[i].Available {
+			continue
+		}
+		defs[i].Version = probeCLIVersion(defs[i].Path)
+		defs[i].Efforts = agentToolEffortLevels(defs[i].ID, defs[i].Path)
 	}
 	return defs
 }

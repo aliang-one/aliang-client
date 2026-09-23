@@ -3188,6 +3188,11 @@ const (
 	// project path than the run's cwd). The pass emitted no assistant output;
 	// the caller should retry the run fresh, without --resume.
 	agentAIRunResumeMissing
+	// agentAIRunEffortRejected means the CLI hard-rejected the requested
+	// --effort value at argument validation (older claude builds exit 1 and
+	// print the accepted levels). The pass emitted no assistant output; the
+	// caller should clamp the effort to a listed level and retry once.
+	agentAIRunEffortRejected
 )
 
 type agentAIRunOutcome int
@@ -3214,11 +3219,35 @@ func (m *agentAIManager) runCLI(ctx context.Context, run agentAIRun, writeJSON a
 	// under a different project path than this run's cwd), retry fresh so the
 	// conversation still streams instead of surfacing a hard error.
 	if strings.TrimSpace(run.resumeSessionID) != "" {
-		if m.runCLIPass(ctx, run, writeJSON, true) != agentAIRunResumeMissing {
+		outcome, levels := m.runCLIPass(ctx, run, writeJSON, true)
+		if outcome != agentAIRunResumeMissing {
+			m.retryAfterEffortRejected(ctx, run, writeJSON, outcome, levels, true)
 			return
 		}
 	}
-	_ = m.runCLIPass(ctx, run, writeJSON, false)
+	outcome, levels := m.runCLIPass(ctx, run, writeJSON, false)
+	m.retryAfterEffortRejected(ctx, run, writeJSON, outcome, levels, false)
+}
+
+// retryAfterEffortRejected 在 CLI 硬拒 effort 档时,按其声明的合法清单钳制后
+// 重试一次(与 agentAIRunResumeMissing 的自愈重试同构)。没有更合适的档位、或
+// 重试仍被拒时补发 ai.error,避免回合静默无响应。
+func (m *agentAIManager) retryAfterEffortRejected(ctx context.Context, run agentAIRun, writeJSON agentTerminalWriter, outcome agentAIRunOutcome, levels []string, allowResume bool) {
+	if outcome != agentAIRunEffortRejected || ctx.Err() != nil {
+		return
+	}
+	requested := strings.TrimSpace(run.effort)
+	plan := planAgentAIEffortRetry(requested, levels)
+	if !plan.retry {
+		_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID,
+			fmt.Errorf("claude CLI rejected effort %q (supported: %s)", requested, strings.Join(levels, ", "))))
+		return
+	}
+	run.effort = plan.retryEffort
+	if second, _ := m.runCLIPass(ctx, run, writeJSON, allowResume); second == agentAIRunEffortRejected {
+		_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID,
+			fmt.Errorf("claude CLI rejected effort %q even after clamping to %q", requested, plan.retryEffort)))
+	}
 }
 
 func agentAIUseCodexAppServer(provider string) bool {
@@ -4760,7 +4789,9 @@ func firstNonNil(values ...interface{}) interface{} {
 	return nil
 }
 
-func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJSON agentTerminalWriter, allowResume bool) agentAIRunOutcome {
+// runCLIPass 跑一遍 CLI。第二个返回值仅在 agentAIRunEffortRejected 时携带
+// CLI 声明的合法 effort 清单,供调用方钳制重试。
+func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJSON agentTerminalWriter, allowResume bool) (agentAIRunOutcome, []string) {
 	resumeID := run.resumeSessionID
 	newSessionID := run.reservedNativeSessionID
 	if !allowResume {
@@ -4779,13 +4810,13 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 	}
 	if err != nil {
 		_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, err))
-		return agentAIRunDone
+		return agentAIRunDone, nil
 	}
 	if run.readOnly {
 		tool = withAgentReadOnlyPolicy(tool)
 		if tool == nil {
 			_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, errors.New("provider does not support enforced read-only mode")))
-			return agentAIRunDone
+			return agentAIRunDone, nil
 		}
 	} else if len(run.goalIdentity) > 0 {
 		tool = withGoalExecutionPolicy(tool)
@@ -4835,16 +4866,16 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, err))
-		return agentAIRunDone
+		return agentAIRunDone, nil
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, err))
-		return agentAIRunDone
+		return agentAIRunDone, nil
 	}
 	if err := cmd.Start(); err != nil {
 		_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, err))
-		return agentAIRunDone
+		return agentAIRunDone, nil
 	}
 
 	started := map[string]interface{}{
@@ -4968,7 +4999,7 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 	// have buffered JSON events, which intermittently dropped final deltas.
 	waitErr := cmd.Wait()
 	if bindingErr != nil {
-		return agentAIRunDone
+		return agentAIRunDone, nil
 	}
 
 	if ctx.Err() != nil {
@@ -4982,27 +5013,36 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 			statusPayload["error"] = errMsg
 		}
 		_ = writeJSON(statusPayload)
-		return agentAIRunDone
+		return agentAIRunDone, nil
 	}
 	if waitErr != nil {
 		// The referenced --resume session is not resolvable in this cwd (e.g.
 		// an imported session, or one created under a different project path).
 		// Signal the caller to retry without --resume instead of erroring.
 		if allowResume && isAgentAIResumeMissing(stderrBuf.String()) {
-			return agentAIRunResumeMissing
+			return agentAIRunResumeMissing, nil
+		}
+		// 旧世代 CLI 在参数校验阶段硬拒 --effort 档(exit 1 + 合法清单)。
+		// 此时不可能有 assistant 输出,上报 agentAIRunEffortRejected 让调用方
+		// 按清单钳制后重试,而不是把这个可自愈的失败直接抛给用户。
+		outMu.Lock()
+		emittedAssistantOutput := output.Len() > 0
+		outMu.Unlock()
+		if rejected, levels := isAgentAIEffortRejected(stderrBuf.String()); rejected && !emittedAssistantOutput {
+			return agentAIRunEffortRejected, levels
 		}
 		// Surface WHY the CLI exited. Prefer the structured cause derived from
 		// the last api_retry (gateway status + retry count) when available; the
 		// bare waitErr ("exit status 1") carries no reason on its own. The stderr
 		// capture goes into "detail" (phone renders the structured cause, not the
 		// raw stderr). Mirrors the codex app-server path's stderr enrichment.
-		cause := claudeFailureCause(waitErr, lastRetry)
+		cause := claudeFailureCause(waitErr, lastRetry, stderrBuf.String())
 		payload := agentAIErrorPayloadWithRetry(run.sessionID, run.messageID, errors.New(cause), lastRetry)
 		if stderrText := strings.TrimSpace(stderrBuf.String()); stderrText != "" {
 			payload["detail"] = truncateForCloud(stderrText)
 		}
 		_ = writeJSON(payload)
-		return agentAIRunDone
+		return agentAIRunDone, nil
 	}
 	outMu.Lock()
 	assistantOutput := output.String()
@@ -5033,7 +5073,7 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 		done["source_session_id"] = sid
 	}
 	_ = writeJSON(done)
-	return agentAIRunDone
+	return agentAIRunDone, nil
 }
 
 func isAgentAIResumeMissing(stderr string) bool {
@@ -5276,7 +5316,7 @@ func streamStructuredAIDelta(reader io.Reader, format agentAIOutputFormat, run a
 				}
 				var cause, detail string
 				if ri.has && ri.errorStatus > 0 {
-					cause = claudeFailureCause(nil, ri)
+					cause = claudeFailureCause(nil, ri, "")
 					detail = reason
 				} else if reason != "" {
 					cause = reason
@@ -7112,7 +7152,15 @@ type claudeRetryInfo struct {
 // 10/10"); otherwise it falls back to the CLI exit error. Verbose diagnostics
 // (stderr, the raw result text) travel separately in the ai.error "detail"
 // field, which the phone does not render by default.
-func claudeFailureCause(waitErr error, ri claudeRetryInfo) string {
+// claudeFailureCause builds a concise, phone-friendly cause string for a failed
+// Claude turn. When retry info is present it describes the upstream error and
+// how many retries were spent (e.g. "gateway 502 (server_error); retried
+// 10/10"); otherwise it falls back to the CLI exit error, enriched with the
+// first meaningful stderr line when one exists (flag rejections, auth errors
+// etc. would otherwise surface as a bare "exit status 1"). Verbose
+// diagnostics (the raw stderr) travel separately in the ai.error "detail"
+// field, which the phone does not render by default.
+func claudeFailureCause(waitErr error, ri claudeRetryInfo, stderr string) string {
 	if ri.has && ri.errorStatus > 0 {
 		s := fmt.Sprintf("gateway %d", ri.errorStatus)
 		if ri.errorType != "" {
@@ -7124,9 +7172,29 @@ func claudeFailureCause(waitErr error, ri claudeRetryInfo) string {
 		return s
 	}
 	if waitErr != nil {
+		if essence := conciseCLIStderrCause(stderr); essence != "" {
+			return fmt.Sprintf("Claude CLI exited: %v — %s", waitErr, essence)
+		}
 		return fmt.Sprintf("Claude CLI exited: %v", waitErr)
 	}
 	return "claude run failed"
+}
+
+// conciseCLIStderrCause 提炼 stderr 首个非空行(截 200 字符),给手机端一个
+// 可读的失败原因;空白 stderr 返回空串,由调用方退回裸格式。
+func conciseCLIStderrCause(stderr string) string {
+	for _, line := range strings.Split(stderr, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		runes := []rune(line)
+		if len(runes) > 200 {
+			runes = runes[:200]
+		}
+		return string(runes)
+	}
+	return ""
 }
 
 // agentAIErrorPayloadWithRetry is agentAIErrorPayload + structured retry/error
