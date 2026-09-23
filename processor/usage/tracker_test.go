@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -160,5 +161,62 @@ func TestTrackerDisabledPredicateSkips(t *testing.T) {
 	all, _ := store.AllBuckets()
 	if len(all) != 0 {
 		t.Fatalf("disabled tracker must not collect, got %+v", all)
+	}
+}
+
+// TestTrackerMultiMegabyteLine 钉死「ReadBytes 而非 Scanner」的实现不变量：
+// Scanner 默认 64KB token 上限会在超长行上炸掉/丢行，ReadBytes 无上限。
+func TestTrackerMultiMegabyteLine(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "big.jsonl")
+	pad := strings.Repeat("A", 2<<20) // ~2MB 填充字段（伪造 content 文本）
+	bigLine := func(uuid, ts string, in, out int64) string {
+		return `{"type":"assistant","sessionId":"big-sess","uuid":"` + uuid +
+			`","timestamp":"` + ts + `","message":{"model":"m1","content":"` + pad +
+			`","usage":{"input_tokens":` + strconv.FormatInt(in, 10) +
+			`,"output_tokens":` + strconv.FormatInt(out, 10) + `}}}` + "\n"
+	}
+	first := jsonlLineAt("2026-09-23T10:05:29.545Z", "m1", 10, 5, "big-sess")
+	full2 := bigLine("u-big-2", "2026-09-23T10:10:00.000Z", 100, 50)
+	full3 := bigLine("u-big-3", "2026-09-23T10:15:00.000Z", 200, 80)
+	half3 := full3[:len(full3)/2] // 半写的超长行：无结尾换行
+
+	mustWrite(t, path, first+full2+half3)
+	size1, _ := os.Stat(path)
+
+	tr := newTestTracker(t, root)
+	if err := tr.ScanOnce(); err != nil {
+		t.Fatalf("ScanOnce: %v", err)
+	}
+	sum := func() (reqs, inTok, outTok int64) {
+		all, _ := tr.store.AllBuckets()
+		for _, b := range all {
+			reqs += b.Requests
+			inTok += b.InputTokens
+			outTok += b.OutputTokens
+		}
+		return
+	}
+	reqs, inTok, outTok := sum()
+	if reqs != 2 || inTok != 110 || outTok != 55 {
+		t.Fatalf("after first scan: reqs=%d in=%d out=%d, want 2/110/55", reqs, inTok, outTok)
+	}
+	if wm, _ := tr.store.GetWatermark(path); wm != size1.Size()-int64(len(half3)) {
+		t.Fatalf("watermark = %d, want %d (held back before half-written 2MB line)",
+			wm, size1.Size()-int64(len(half3)))
+	}
+
+	// 补全半行：下一轮恰好计一次，水位追平文件大小
+	f, _ := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	_, _ = f.WriteString(full3[len(full3)/2:])
+	_ = f.Close()
+	_ = tr.ScanOnce()
+	reqs, inTok, outTok = sum()
+	if reqs != 3 || inTok != 310 || outTok != 135 {
+		t.Fatalf("after completion: reqs=%d in=%d out=%d, want 3/310/135", reqs, inTok, outTok)
+	}
+	size2, _ := os.Stat(path)
+	if wm, _ := tr.store.GetWatermark(path); wm != size2.Size() {
+		t.Fatalf("watermark = %d, want file size %d", wm, size2.Size())
 	}
 }

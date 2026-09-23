@@ -47,6 +47,12 @@ func (t *Tracker) ScanOnce() error {
 			continue
 		}
 		err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+			// 预算检查放在回调最前：以非 jsonl 为主的目录树同样受 2s 上限
+			// 约束，不会无界空走过预算。
+			if time.Now().After(deadline) {
+				completePass = false
+				return fs.SkipAll
+			}
 			if err != nil {
 				return nil // 目录可能随时变动，跳过不可达子树
 			}
@@ -54,10 +60,6 @@ func (t *Tracker) ScanOnce() error {
 				return nil
 			}
 			seen = append(seen, path)
-			if time.Now().After(deadline) {
-				completePass = false
-				return fs.SkipAll
-			}
 			if err := t.processFile(path); err != nil {
 				logger.Debug("usage: scan " + path + ": " + err.Error())
 			}
@@ -88,8 +90,9 @@ func (t *Tracker) processFile(path string) error {
 	if err != nil {
 		return err
 	}
-	// 文件被截断/重建（备份恢复等）：水位归零重扫。可能轻微重复计入，
-	// 感性统计容忍（spec §7）。
+	// 文件被截断/重建（备份恢复等）：尺寸小于水位时归零重扫。两个方向的
+	// 偏差均为 spec §7 容忍的感性误差：截断 ⇒ 重扫重复计入；截断后又长回
+	// 更大 ⇒ 水位未复位，重新长出的 [0,offset) 区间被跳过造成有界少计。
 	if info.Size() < offset {
 		offset = 0
 	}
