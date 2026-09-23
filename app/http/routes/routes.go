@@ -247,8 +247,6 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	register("/api/dashboard/usage", h.Dashboard.HandleGetUsageRecords, http.MethodGet)
 	register("/api/health", h.Dashboard.HandleGetHealth, http.MethodGet)
 	register("/api/quick-setup/catalog", h.QuickSetup.HandleCatalog, http.MethodGet)
-	register("/api/quick-setup/models", h.QuickSetup.HandleModels, http.MethodPost)
-	register("/api/quick-setup/render", h.QuickSetup.HandleRender, http.MethodPost)
 	register("/api/quick-setup/apply", h.QuickSetup.HandleApply, http.MethodPost)
 	register("/api/quick-setup/config-state", h.QuickSetup.HandleConfigState, http.MethodGet)
 	register("/api/quick-setup/restore", h.QuickSetup.HandleRestore, http.MethodPost)

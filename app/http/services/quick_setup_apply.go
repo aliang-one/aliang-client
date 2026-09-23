@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -55,9 +56,8 @@ func (s *QuickSetupService) Apply(req models.QuickSetupApplyRequest) (*models.Qu
 			return nil, fmt.Errorf("file path is not valid: duplicate target %s", targetPath)
 		}
 		seenPaths[resolvedPath] = struct{}{}
-		// code 供备份 manifest 的 file_code 使用（Task 10）；内置软件取 catalog 声明
-		// （validate 已完成查找并回传，避免二次多趟 EvalSymlinks），custom-*（无
-		// catalog 定义）退化为文件名。
+		// code 供备份 manifest 的 file_code 使用（Task 10）；取 catalog 声明
+		// （validate 已完成查找并回传，避免二次多趟 EvalSymlinks）。
 		fileCode := filepath.Base(resolvedPath)
 		if declared.Code != "" {
 			fileCode = declared.Code
@@ -112,12 +112,12 @@ func (s *QuickSetupService) Apply(req models.QuickSetupApplyRequest) (*models.Qu
 	}, nil
 }
 
-// validateQuickSetupApplyFile 返回内置软件命中的 catalog 声明文件，供调用方复用
-// （备份 file_code）；custom-* 无 catalog 定义，返回零值。
+// quickSetupPlaceholderRe 匹配 {{...}} 形态的未替换占位符。
 var quickSetupPlaceholderRe = regexp.MustCompile(`\{\{\s*[a-zA-Z_][a-zA-Z0-9_]*\s*\}\}`)
 
-// 占位符未替换即拒绝（spec §5）：组合渲染在前端完成，此处兜底——
-// 带占位符的内容落盘会让 agent 拿到字面 {{...}}。
+// validateQuickSetupApplyFile 校验单个 apply 文件并返回命中的 catalog 声明文件，
+// 供调用方复用（备份 file_code）。占位符未替换即拒绝（spec §5）：组合渲染在前端
+// 完成，此处兜底——带占位符的内容落盘会让 agent 拿到字面 {{...}}。
 func validateQuickSetupApplyFile(software string, file models.QuickSetupApplyFile, resolvedPath string, home string) (models.QuickSetupSoftwareFile, error) {
 	content := strings.TrimSpace(file.Content)
 	if content == "" {
@@ -129,15 +129,6 @@ func validateQuickSetupApplyFile(software string, file models.QuickSetupApplyFil
 
 	format := strings.ToLower(strings.TrimSpace(file.Format))
 	kind := strings.ToLower(strings.TrimSpace(file.Kind))
-	if strings.HasPrefix(software, "custom-") {
-		if kind != "" && kind != "file" {
-			return models.QuickSetupSoftwareFile{}, fmt.Errorf("file kind is not valid: %s", file.Kind)
-		}
-		if format == "json" {
-			return models.QuickSetupSoftwareFile{}, validateQuickSetupJSON(content)
-		}
-		return models.QuickSetupSoftwareFile{}, nil
-	}
 
 	definition, ok := findQuickSetupSoftware(software)
 	if !ok {
@@ -179,6 +170,77 @@ func validateQuickSetupJSON(content string) error {
 	}
 	if err := decoder.Decode(&struct{}{}); err != io.EOF {
 		return errors.New("file content is not valid JSON: multiple JSON values are not allowed")
+	}
+	return nil
+}
+
+// validateQuickSetupOpenCode 校验 OpenCode 配置的 provider/model 引用一致性
+// （自 v2 render 链迁入；Apply 是唯一调用方）。依赖的 quickSetupOpenCodeConfig/
+// quickSetupOpenCodeProvider 结构体留守 quick_setup_service.go。
+func validateQuickSetupOpenCode(content string) error {
+	var cfg quickSetupOpenCodeConfig
+	if err := json.Unmarshal([]byte(content), &cfg); err != nil {
+		return err
+	}
+	if len(cfg.Providers) == 0 {
+		return errors.New("provider must contain at least one entry")
+	}
+
+	providers := make(map[string]quickSetupOpenCodeProvider, len(cfg.Providers))
+	for providerID, raw := range cfg.Providers {
+		providerID = strings.TrimSpace(providerID)
+		if providerID == "" {
+			return errors.New("provider id cannot be empty")
+		}
+		var provider quickSetupOpenCodeProvider
+		if err := json.Unmarshal(raw, &provider); err != nil {
+			return fmt.Errorf("provider %q must be an object", providerID)
+		}
+		if strings.TrimSpace(provider.NPM) == "" {
+			return fmt.Errorf("provider %q npm is required", providerID)
+		}
+		if strings.TrimSpace(provider.Options.APIKey) == "" || quickSetupLooksMaskedAPIKey(provider.Options.APIKey) {
+			return fmt.Errorf("provider %q requires a plaintext options.apiKey", providerID)
+		}
+		baseURL, err := url.Parse(strings.TrimSpace(provider.Options.BaseURL))
+		if err != nil || baseURL.Host == "" || (baseURL.Scheme != "http" && baseURL.Scheme != "https") {
+			return fmt.Errorf("provider %q options.baseURL must be an absolute HTTP(S) URL", providerID)
+		}
+		if len(provider.Models) == 0 {
+			return fmt.Errorf("provider %q models must contain at least one model", providerID)
+		}
+		providers[providerID] = provider
+	}
+
+	if err := validateQuickSetupOpenCodeModelRef("model", cfg.Model, providers, true); err != nil {
+		return err
+	}
+	if err := validateQuickSetupOpenCodeModelRef("small_model", cfg.SmallModel, providers, false); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateQuickSetupOpenCodeModelRef(field string, ref string, providers map[string]quickSetupOpenCodeProvider, required bool) error {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		if required {
+			return fmt.Errorf("%s is required", field)
+		}
+		return nil
+	}
+	providerID, modelID, ok := strings.Cut(ref, "/")
+	providerID = strings.TrimSpace(providerID)
+	modelID = strings.TrimSpace(modelID)
+	if !ok || providerID == "" || modelID == "" {
+		return fmt.Errorf("%s must use provider/model format", field)
+	}
+	provider, exists := providers[providerID]
+	if !exists {
+		return fmt.Errorf("%s references unknown provider %q", field, providerID)
+	}
+	if _, exists := provider.Models[modelID]; !exists {
+		return fmt.Errorf("%s references unknown model %q for provider %q", field, modelID, providerID)
 	}
 	return nil
 }

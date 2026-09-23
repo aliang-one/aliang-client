@@ -187,7 +187,8 @@ func TestQuickSetupComboBlankTemplates(t *testing.T) {
 
 // TestQuickSetupComboBlankTemplatesRoundTrip 自审兜底：JSON 模板必须经
 // json.Unmarshal 往返解析且占位符落在预期位置；codex config.toml 必须是合法
-// TOML，且与 v2 模板形态（fallbackCodexTemplateTOML）在共享键上语义一致。
+// TOML，且与 v2 模板形态在共享键上语义一致（v2 形态以字面量锁定——原
+// fallbackCodexTemplateTOML/buildCodexAliangSection 随 render 链退役）。
 func TestQuickSetupComboBlankTemplatesRoundTrip(t *testing.T) {
 	byCode := func(code string) map[string]string {
 		files := quickSetupComboBlankTemplates(code)
@@ -309,7 +310,17 @@ func TestQuickSetupComboBlankTemplatesRoundTrip(t *testing.T) {
 		}
 
 		var v2 map[string]interface{}
-		if err := toml.Unmarshal([]byte(fallbackCodexTemplateTOML("{{model}}", "{{base_url}}")), &v2); err != nil {
+		v2TOML := strings.Join([]string{
+			"model = \"{{model}}\"",
+			"model_provider = \"aliang\"",
+			"",
+			"[model_providers.aliang]",
+			"name = \"Aliang Gateway\"",
+			"base_url = \"{{base_url}}\"",
+			"env_key = \"OPENAI_API_KEY\"",
+			"wire_api = \"responses\"",
+		}, "\n") + "\n"
+		if err := toml.Unmarshal([]byte(v2TOML), &v2); err != nil {
 			t.Fatal(err)
 		}
 		if blank["model"] != v2["model"] || blank["model_provider"] != v2["model_provider"] {

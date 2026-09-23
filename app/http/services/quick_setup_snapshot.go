@@ -41,9 +41,10 @@ func (s *QuickSetupService) ConfigState(softwareCode string) (models.QuickSetupC
 		Backups:  []models.QuickSetupConfigStateBackup{},
 	}
 
-	// codex auth.json 的 managed 判定跟随同 software 的 config.toml（整体托管语义，
-	// spec §8）。进循环前独立算出 config 的判定结果——不复用循环内先算先记的
-	// 状态，消除对 catalog 声明顺序（config 必须排在 auth 之前）的隐式耦合。
+	// codex auth.json 与 pi settings.json 的 managed 判定跟随同 software 的主配置
+	// 文件（整体托管语义，spec §8）。进循环前独立算出主配置的判定结果——不复用
+	// 循环内先算先记的状态，消除对 catalog 声明顺序（主配置必须排在从文件之前）
+	// 的隐式耦合。
 	codexConfigManaged := false
 	if softwareDef.Code == "codex" {
 		for _, fileDef := range softwareDef.Files {
@@ -51,6 +52,20 @@ func (s *QuickSetupService) ConfigState(softwareCode string) (models.QuickSetupC
 				continue
 			}
 			codexConfigManaged = quickSetupManagedByAliang(
+				softwareDef.Code,
+				fileDef.Format,
+				quickSetupSnapshotFileContent(softwareDef.Code, fileDef, targetUser.homeDir),
+			)
+			break
+		}
+	}
+	piModelsManaged := false
+	if softwareDef.Code == "pi" {
+		for _, fileDef := range softwareDef.Files {
+			if fileDef.Code != "models" {
+				continue
+			}
+			piModelsManaged = quickSetupManagedByAliang(
 				softwareDef.Code,
 				fileDef.Format,
 				quickSetupSnapshotFileContent(softwareDef.Code, fileDef, targetUser.homeDir),
@@ -76,6 +91,8 @@ func (s *QuickSetupService) ConfigState(softwareCode string) (models.QuickSetupC
 		}
 		if softwareDef.Code == "codex" && fileDef.Code == "auth" {
 			entry.ManagedByAliang = codexConfigManaged
+		} else if softwareDef.Code == "pi" && fileDef.Code == "settings" {
+			entry.ManagedByAliang = piModelsManaged
 		} else {
 			entry.ManagedByAliang = quickSetupManagedByAliang(softwareDef.Code, fileDef.Format, entry.Content)
 		}
@@ -149,10 +166,11 @@ func quickSetupSnapshotFileContent(softwareCode string, fileDef models.QuickSetu
 // quickSetupManagedByAliang 判断磁盘上的配置内容是否由本网关写入（spec §8 启发式）：
 //   - claude-code settings.json：env.ANTHROPIC_BASE_URL 指向本网关任一接入地址；
 //   - codex config.toml（format=toml）：含 [model_providers.aliang] 段表头；
-//   - opencode opencode.json：任一 provider 条目的 options.baseURL 指向本网关。
+//   - opencode opencode.json：任一 provider 条目的 options.baseURL 指向本网关；
+//   - pi models.json：providers 键下存在 aliang（quickSetupCodexProviderID）条目。
 //
-// codex auth.json 不在本函数判定（ConfigState 进循环前预先算出 config.toml 的结果
-// 供 auth 复用，不依赖 catalog 声明顺序）。
+// codex auth.json 与 pi settings.json 不在本函数判定（整体托管语义：ConfigState
+// 进循环前预先算出主配置文件的结果供从文件复用，不依赖 catalog 声明顺序）。
 // 内容为空或解析失败一律 false。
 func quickSetupManagedByAliang(softwareCode, format, content string) bool {
 	switch softwareCode {
@@ -165,9 +183,26 @@ func quickSetupManagedByAliang(softwareCode, format, content string) bool {
 		return quickSetupCodexTOMLManaged(content)
 	case "opencode":
 		return quickSetupOpenCodeManaged(content)
+	case "pi":
+		return quickSetupPiModelsManaged(content)
 	default:
 		return false
 	}
+}
+
+// quickSetupPiModelsManaged 判断 pi models.json 是否由本网关写入：providers 键下
+// 存在 aliang（quickSetupCodexProviderID）条目即视为托管——条目值形态不限
+// （RawMessage），与我们写入的 provider 对象结构解耦。与 codex/opencode 不同，
+// pi 的判定不依赖网关地址匹配：pi 模板里 provider id 即唯一指纹。
+func quickSetupPiModelsManaged(content string) bool {
+	var parsed struct {
+		Providers map[string]json.RawMessage `json:"providers"`
+	}
+	if err := json.Unmarshal([]byte(content), &parsed); err != nil {
+		return false
+	}
+	_, ok := parsed.Providers[quickSetupCodexProviderID]
+	return ok
 }
 
 // quickSetupGatewayHosts 罗列本网关所有接入地址的 URL host 形式（spec §8）：本地推理

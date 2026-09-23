@@ -210,6 +210,116 @@ func TestConfigStateManagedByAliangOpenCode(t *testing.T) {
 	}
 }
 
+// TestConfigStateManagedByAliangPi 锁定 pi 分支（spec §8）：models.json 的
+// providers 键下存在 aliang 条目即 managed；settings.json 跟随 models.json 的
+// 判定（整体托管语义，同 codex auth 跟随 config）——即使 settings.json 自身
+// 内容不含任何指纹也判 true；models.json 无 aliang 条目/损坏时两者均 false。
+func TestConfigStateManagedByAliangPi(t *testing.T) {
+	cases := []struct {
+		name       string
+		modelsJSON string
+		settings   string
+		managed    bool
+	}{
+		{
+			name:       "gateway provider",
+			modelsJSON: `{"providers":{"aliang":{"name":"Aliang Gateway","baseUrl":"https://api.aliang.one","api":"anthropic-messages","models":[]}}}`,
+			settings:   `{"defaultProvider":"aliang","defaultModel":"gpt-5"}`,
+			managed:    true,
+		},
+		{
+			name:       "settings follow managed models even without own fingerprint",
+			modelsJSON: `{"providers":{"aliang":{"name":"Aliang Gateway"}}}`,
+			settings:   `{"theme":"dark"}`,
+			managed:    true,
+		},
+		{
+			name:       "third-party provider only",
+			modelsJSON: `{"providers":{"someone-else":{"name":"Other","baseUrl":"https://api.aliang.one"}}}`,
+			settings:   `{"defaultProvider":"someone-else"}`,
+			managed:    false,
+		},
+		{
+			name:       "no providers key",
+			modelsJSON: `{"models":[]}`,
+			settings:   `{}`,
+			managed:    false,
+		},
+		{
+			name:       "broken models.json",
+			modelsJSON: "{not json",
+			settings:   `{"defaultProvider":"aliang"}`,
+			managed:    false,
+		},
+		{
+			name:       "providers aliang not an object still counts",
+			modelsJSON: `{"providers":{"aliang":null}}`,
+			settings:   `{}`,
+			managed:    true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			writeBackupFixture(t, home, ".pi/agent/models.json", tc.modelsJSON)
+			writeBackupFixture(t, home, ".pi/agent/settings.json", tc.settings)
+			stubConfigStateEnv(t, home)
+
+			state, err := (&QuickSetupService{}).ConfigState("pi")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(state.Files) != 2 {
+				t.Fatalf("files: %+v", state.Files)
+			}
+			models := state.Files[0] // 顺序与软件定义一致：models.json 在前
+			settings := state.Files[1]
+			if got := models.ManagedByAliang; got != tc.managed {
+				t.Fatalf("models managed = %v, want %v; file: %+v", got, tc.managed, models)
+			}
+			if got := settings.ManagedByAliang; got != tc.managed {
+				t.Fatalf("settings must follow models (%v), got %v; file: %+v", tc.managed, got, settings)
+			}
+		})
+	}
+
+	// models.json 缺失 → models 与 settings 均 false（无内容可判，整体不托管）。
+	home := t.TempDir()
+	stubConfigStateEnv(t, home)
+	state, err := (&QuickSetupService{}).ConfigState("pi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Files[0].ManagedByAliang || state.Files[1].ManagedByAliang {
+		t.Fatalf("missing models.json must leave both unmanaged: %+v", state.Files)
+	}
+}
+
+// TestQuickSetupPiModelsManaged 直测 pi models.json 指纹判定：providers.aliang
+// 键存在即命中（值形态不限），其余 provider 名不误伤；坏 JSON/空内容 false。
+func TestQuickSetupPiModelsManaged(t *testing.T) {
+	cases := []struct {
+		name    string
+		content string
+		managed bool
+	}{
+		{name: "aliang provider", content: `{"providers":{"aliang":{"name":"Aliang Gateway","api":"anthropic-messages"}}}`, managed: true},
+		{name: "aliang among others", content: `{"providers":{"openai":{"name":"x"},"aliang":{"name":"Aliang Gateway"}}}`, managed: true},
+		{name: "third-party only", content: `{"providers":{"someone-else":{"name":"Other"}}}`, managed: false},
+		{name: "suffix forgery not matched", content: `{"providers":{"aliang_other":{"name":"fake"}}}`, managed: false},
+		{name: "top level array", content: `[1,2,3]`, managed: false},
+		{name: "broken json", content: "{broken", managed: false},
+		{name: "empty content", content: "", managed: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := quickSetupPiModelsManaged(tc.content); got != tc.managed {
+				t.Fatalf("quickSetupPiModelsManaged(%q) = %v, want %v", tc.content, got, tc.managed)
+			}
+		})
+	}
+}
+
 // TestRestoreService 端到端服务层路径（spec §6.3-3）：apply 前备份 → 磁盘被我们覆写 →
 // Restore 整体还原（existed_before=true 复制回去；false 删除）并清空 manifest 条目。
 func TestRestoreService(t *testing.T) {

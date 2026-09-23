@@ -121,8 +121,38 @@ func quickSetupSoftwares() []models.QuickSetupSoftware {
 }
 
 // quickSetupCodexProviderID 是快速配置组合统一切换到的 codex provider id（spec §7；
-// 自 quick_setup_merge.go 迁入，同包内 merge/render/snapshot 继续引用）。
+// 自 quick_setup_merge.go 迁入，同包内 snapshot/catalog 模板继续引用）。
 const quickSetupCodexProviderID = "aliang"
+
+// quickSetupTOMLQuote 把值编码为 TOML 基本字符串（转义引号/反斜杠/控制字符）。
+// 自 v2 merge 引擎迁入：catalog 的空白 codex 模板（quickSetupBlankCodexFiles）是
+// 唯一调用方。
+func quickSetupTOMLQuote(s string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, r := range s {
+		switch r {
+		case '"':
+			b.WriteString(`\"`)
+		case '\\':
+			b.WriteString(`\\`)
+		case '\t':
+			b.WriteString(`\t`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			b.WriteString(`\r`)
+		default:
+			if r < 0x20 {
+				fmt.Fprintf(&b, `\u%04X`, r)
+			} else {
+				b.WriteRune(r)
+			}
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
+}
 
 // quickSetupComboBlankTemplates 返回 software 的空白组合模板（含 {{base_url}}/
 // {{api_key}}/{{model}} 占位符，spec §6.3）。返回的文件顺序/Code 与该 software 的
@@ -162,8 +192,8 @@ func quickSetupBlankClaudeFiles() []models.QuickSetupComboFile {
 }
 
 // quickSetupBlankCodexFiles 生成 codex 的空白组合模板（config.toml + auth.json）。
-// config.toml 的 [model_providers.aliang] 段形态与 v2 mergeCodexTOML 的模板形态
-// （buildCodexAliangSection）语义一致；base_url 变量值由 configure 预设带 /v1。
+// config.toml 的 [model_providers.aliang] 段形态与 v2 merge 引擎（mergeCodexTOML，
+// 已随 render 链退役）的模板形态语义一致；base_url 变量值由 configure 预设带 /v1。
 func quickSetupBlankCodexFiles() []models.QuickSetupComboFile {
 	configTOML := strings.Join([]string{
 		"model = \"{{model}}\"",
@@ -314,14 +344,12 @@ func resolveQuickSetupApplyPath(software string, path string, home string) (stri
 	if !quickSetupPathWithin(canonicalHome, canonicalAllowedRoot) || !quickSetupPathWithin(canonicalAllowedRoot, canonicalTarget) {
 		return "", errors.New("file path is not valid: target must stay within the software config directory")
 	}
-	if !strings.HasPrefix(software, "custom-") {
-		allowed, err := quickSetupBuiltInPathAllowed(software, canonicalTarget, home)
-		if err != nil {
-			return "", err
-		}
-		if !allowed {
-			return "", errors.New("file path is not valid: target is not a declared config file for this software")
-		}
+	allowed, err := quickSetupBuiltInPathAllowed(software, canonicalTarget, home)
+	if err != nil {
+		return "", err
+	}
+	if !allowed {
+		return "", errors.New("file path is not valid: target is not a declared config file for this software")
 	}
 	if info, statErr := os.Stat(canonicalTarget); statErr == nil && !info.Mode().IsRegular() {
 		return "", errors.New("file path is not valid: target must be a regular file")
@@ -367,16 +395,10 @@ func quickSetupAllowedRoot(software string, home string) (string, error) {
 		return filepath.Join(home, ".codex"), nil
 	case "claude-code":
 		return filepath.Join(home, ".claude"), nil
+	case "pi":
+		return filepath.Join(home, ".pi", "agent"), nil
 	default:
-		if !strings.HasPrefix(software, "custom-") || len(software) <= len("custom-") || len(software) > 72 {
-			return "", fmt.Errorf("software is not valid: %s", software)
-		}
-		for _, r := range software {
-			if r != '-' && (r < 'a' || r > 'z') && (r < '0' || r > '9') {
-				return "", fmt.Errorf("software is not valid: %s", software)
-			}
-		}
-		return filepath.Join(home, ".aliang", "quick-setup", "custom", software), nil
+		return "", fmt.Errorf("quick setup software %q is not supported", software)
 	}
 }
 
