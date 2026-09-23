@@ -860,13 +860,12 @@ func loadClaudeRenameRecords(home string) map[string]agentRenamePidRecord {
 			continue
 		}
 		var row struct {
-			SessionID string      `json:"sessionId"`
-			Name      string      `json:"name"`
-			PID       int         `json:"pid"`
-			Status    string      `json:"status"`
-			UpdatedAt interface{} `json:"updatedAt"`
-
-			MessagingSocketPath string `json:"messagingSocketPath"`
+			SessionID           string      `json:"sessionId"`
+			Name                string      `json:"name"`
+			PID                 int         `json:"pid"`
+			Status              string      `json:"status"`
+			UpdatedAt           interface{} `json:"updatedAt"`
+			MessagingSocketPath string      `json:"messagingSocketPath"`
 		}
 		if err := json.Unmarshal(raw, &row); err != nil {
 			continue
@@ -875,11 +874,10 @@ func loadClaudeRenameRecords(home string) map[string]agentRenamePidRecord {
 			continue
 		}
 		out[row.SessionID] = agentRenamePidRecord{
-			Name:      strings.TrimSpace(row.Name),
-			PID:       row.PID,
-			Status:    strings.TrimSpace(row.Status),
-			UpdatedAt: pidRecordTimestamp(row.UpdatedAt, file),
-
+			Name:                strings.TrimSpace(row.Name),
+			PID:                 row.PID,
+			Status:              strings.TrimSpace(row.Status),
+			UpdatedAt:           pidRecordTimestamp(row.UpdatedAt, file),
 			MessagingSocketPath: strings.TrimSpace(row.MessagingSocketPath),
 		}
 	}
