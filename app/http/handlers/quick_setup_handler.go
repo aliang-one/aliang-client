@@ -2,7 +2,11 @@ package handlers
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
+	"strings"
+
+	"aliang.one/nursorgate/common/logger"
 
 	"aliang.one/nursorgate/app/http/common"
 	"aliang.one/nursorgate/app/http/middleware"
@@ -98,6 +102,38 @@ func (h *QuickSetupHandler) HandleModels(w http.ResponseWriter, r *http.Request)
 	common.Success(w, resp)
 }
 
+func (h *QuickSetupHandler) HandleConfigState(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
+		return
+	}
+	if !middleware.RequireDashboardSession(w, r) {
+		return
+	}
+
+	software := strings.TrimSpace(r.URL.Query().Get("software"))
+	if software == "" {
+		common.ErrorBadRequest(w, "software query parameter is required", nil)
+		return
+	}
+
+	state, err := h.service.ConfigState(software)
+	if err != nil {
+		if errors.Is(err, services.ErrQuickSetupUnauthenticated) {
+			common.ErrorUnauthorized(w, err.Error())
+			return
+		}
+		if isBadRequestError(err) {
+			common.ErrorBadRequest(w, err.Error(), nil)
+			return
+		}
+		common.ErrorInternalServer(w, "Quick setup config state failed", map[string]interface{}{"error": err.Error()})
+		return
+	}
+
+	common.Success(w, state)
+}
+
 func (h *QuickSetupHandler) HandleApply(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
@@ -125,6 +161,49 @@ func (h *QuickSetupHandler) HandleApply(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 		common.ErrorInternalServer(w, "Quick setup apply failed", map[string]interface{}{"error": err.Error()})
+		return
+	}
+
+	common.Success(w, resp)
+}
+
+// HandleRestore 一键还原原始配置。注意：Restore 在 manifest 保存失败等场景会返回
+// 部分成功的 resp + 非 nil error——err != nil 一律按整体失败处理（500），不得把
+// resp 的 Restored/Deleted 当成功结果返回给前端。
+func (h *QuickSetupHandler) HandleRestore(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
+		return
+	}
+	if !middleware.RequireDashboardSession(w, r) {
+		return
+	}
+
+	var req models.QuickSetupRestoreRequest
+	r.Body = http.MaxBytesReader(w, r.Body, quickSetupRequestMaxBytes)
+	if err := common.DecodeRequest(r, &req); err != nil {
+		common.ErrorBadRequest(w, "Invalid request body", map[string]interface{}{"error": err.Error()})
+		return
+	}
+	if strings.TrimSpace(req.Software) == "" {
+		common.ErrorBadRequest(w, "software is required", nil)
+		return
+	}
+
+	resp, err := h.service.Restore(req.Software)
+	if err != nil {
+		if errors.Is(err, services.ErrQuickSetupUnauthenticated) {
+			common.ErrorUnauthorized(w, err.Error())
+			return
+		}
+		if isBadRequestError(err) {
+			common.ErrorBadRequest(w, err.Error(), nil)
+			return
+		}
+		// 可观测性：manifest 保存失败等场景下 Restore 会带着部分成功的结果返回
+		// 非 nil error，resp 随 500 被整体丢弃——留一条摘要日志便于事后排查。
+		logger.Error(fmt.Sprintf("[quick-setup] restore failed (software %q): %v; partial results before failure: restored=%d, deleted=%d, failed=%d", req.Software, err, len(resp.Restored), len(resp.Deleted), len(resp.Failed)))
+		common.ErrorInternalServer(w, "Quick setup restore failed", map[string]interface{}{"error": err.Error()})
 		return
 	}
 

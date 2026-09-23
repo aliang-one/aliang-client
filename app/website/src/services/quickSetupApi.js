@@ -46,12 +46,15 @@ export async function getQuickSetupCatalog() {
 }
 
 export async function renderQuickSetup(software, keyIds = [], options = {}) {
+  const opts = options && typeof options === 'object' ? options : {};
   return rawRequest('/api/quick-setup/render', {
     method: 'POST',
     body: JSON.stringify({
+      ...opts,
       software,
       key_ids: Array.isArray(keyIds) ? keyIds : [],
-      ...(options && typeof options === 'object' ? options : {}),
+      // 接入模式只接受 local/public，其余一律归一为 public（与后端缺省一致）。
+      mode: opts.mode === 'local' ? 'local' : 'public',
     }),
   });
 }
@@ -72,5 +75,18 @@ export async function applyQuickSetup(software, files) {
       software,
       files: Array.isArray(files) ? files : [],
     }),
+  });
+}
+
+export async function fetchConfigState(software) {
+  return rawRequest(`/api/quick-setup/config-state?software=${encodeURIComponent(software)}`, {
+    method: 'GET',
+  });
+}
+
+export async function restoreConfig(software) {
+  return rawRequest('/api/quick-setup/restore', {
+    method: 'POST',
+    body: JSON.stringify({ software }),
   });
 }

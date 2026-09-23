@@ -191,6 +191,14 @@ func TestQuickSetupService_Render_OpenCodeCombinedProviders(t *testing.T) {
 		quickSetupGetAPIKeysFn = previous
 	})
 
+	// Render 会读磁盘现有配置：隔离到临时家目录，防止读到开发者本机真实配置。
+	stubHome := t.TempDir()
+	previousUser := quickSetupTargetUserFn
+	quickSetupTargetUserFn = func() (quickSetupTargetUser, error) {
+		return quickSetupTargetUser{homeDir: stubHome}, nil
+	}
+	t.Cleanup(func() { quickSetupTargetUserFn = previousUser })
+
 	svc := NewQuickSetupService()
 	resp, err := svc.Render(models.QuickSetupRenderRequest{
 		Software: "opencode",
@@ -269,6 +277,14 @@ func TestQuickSetupService_Render_OpenCodeUsesProductionInferenceBaseURL(t *test
 		quickSetupGetAPIKeysFn = previous
 	})
 
+	// Render 会读磁盘现有配置：隔离到临时家目录，防止读到开发者本机真实配置。
+	stubHome := t.TempDir()
+	previousUser := quickSetupTargetUserFn
+	quickSetupTargetUserFn = func() (quickSetupTargetUser, error) {
+		return quickSetupTargetUser{homeDir: stubHome}, nil
+	}
+	t.Cleanup(func() { quickSetupTargetUserFn = previousUser })
+
 	svc := NewQuickSetupService()
 	resp, err := svc.Render(models.QuickSetupRenderRequest{
 		Software: "opencode",
@@ -346,6 +362,20 @@ func TestQuickSetupService_Render_OpenCodeGeneratedConfigWorksWithCLI(t *testing
 		quickSetupGetAPIKeysFn = previous
 	})
 
+	// auth/targetUser 的 stub 必须先于 Render 装配：Render 现在会读磁盘现有配置，
+	// 且 Apply 与 Render 必须落在同一个临时家目录。
+	testHome := t.TempDir()
+	previousAuth := quickSetupAuthorizationHeaderFn
+	previousTargetUser := quickSetupTargetUserFn
+	quickSetupAuthorizationHeaderFn = func() string { return "Bearer cli-integration" }
+	quickSetupTargetUserFn = func() (quickSetupTargetUser, error) {
+		return quickSetupTargetUser{homeDir: testHome}, nil
+	}
+	t.Cleanup(func() {
+		quickSetupAuthorizationHeaderFn = previousAuth
+		quickSetupTargetUserFn = previousTargetUser
+	})
+
 	svc := NewQuickSetupService()
 	resp, err := svc.Render(models.QuickSetupRenderRequest{
 		Software: "opencode",
@@ -365,17 +395,6 @@ func TestQuickSetupService_Render_OpenCodeGeneratedConfigWorksWithCLI(t *testing
 		t.Fatal("rendered config has no default model")
 	}
 
-	testHome := t.TempDir()
-	previousAuth := quickSetupAuthorizationHeaderFn
-	previousTargetUser := quickSetupTargetUserFn
-	quickSetupAuthorizationHeaderFn = func() string { return "Bearer cli-integration" }
-	quickSetupTargetUserFn = func() (quickSetupTargetUser, error) {
-		return quickSetupTargetUser{homeDir: testHome}, nil
-	}
-	t.Cleanup(func() {
-		quickSetupAuthorizationHeaderFn = previousAuth
-		quickSetupTargetUserFn = previousTargetUser
-	})
 	applyResp, err := svc.Apply(models.QuickSetupApplyRequest{
 		Software: "opencode",
 		Files: []models.QuickSetupApplyFile{
@@ -427,6 +446,14 @@ func TestQuickSetupService_Render_OpenCodeDefaultsToProviderAwareGateway(t *test
 	t.Cleanup(func() {
 		quickSetupGetAPIKeysFn = previous
 	})
+
+	// Render 会读磁盘现有配置：隔离到临时家目录，防止读到开发者本机真实配置。
+	stubHome := t.TempDir()
+	previousUser := quickSetupTargetUserFn
+	quickSetupTargetUserFn = func() (quickSetupTargetUser, error) {
+		return quickSetupTargetUser{homeDir: stubHome}, nil
+	}
+	t.Cleanup(func() { quickSetupTargetUserFn = previousUser })
 
 	svc := NewQuickSetupService()
 	resp, err := svc.Render(models.QuickSetupRenderRequest{
@@ -635,6 +662,14 @@ func TestQuickSetupService_Render_MultiProvider(t *testing.T) {
 	t.Cleanup(func() {
 		quickSetupGetAPIKeysFn = previous
 	})
+
+	// Render 会读磁盘现有配置：隔离到临时家目录，防止读到开发者本机真实配置。
+	stubHome := t.TempDir()
+	previousUser := quickSetupTargetUserFn
+	quickSetupTargetUserFn = func() (quickSetupTargetUser, error) {
+		return quickSetupTargetUser{homeDir: stubHome}, nil
+	}
+	t.Cleanup(func() { quickSetupTargetUserFn = previousUser })
 
 	svc := NewQuickSetupService()
 	resp, err := svc.Render(models.QuickSetupRenderRequest{Software: "codex", KeyIDs: []int64{11, 22}})

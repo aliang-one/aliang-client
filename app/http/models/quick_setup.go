@@ -16,6 +16,7 @@ type QuickSetupSoftware struct {
 	Description        string                   `json:"description"`
 	SupportedProviders []string                 `json:"supported_providers"`
 	Files              []QuickSetupSoftwareFile `json:"files"`
+	Installed          bool                     `json:"installed"`
 }
 
 type QuickSetupAPIKey struct {
@@ -55,6 +56,7 @@ type QuickSetupModelsResponse struct {
 
 type QuickSetupRenderRequest struct {
 	Software string              `json:"software"`
+	Mode     string              `json:"mode,omitempty"`
 	KeyIDs   []int64             `json:"key_ids,omitempty"`
 	OpenCode *OpenCodeRenderSpec `json:"opencode,omitempty"`
 }
@@ -67,12 +69,13 @@ type OpenCodeRenderSpec struct {
 }
 
 type QuickSetupPreviewFile struct {
-	Code    string `json:"code"`
-	Label   string `json:"label"`
-	Path    string `json:"path"`
-	Format  string `json:"format"`
-	Kind    string `json:"kind"`
-	Content string `json:"content"`
+	Code           string `json:"code"`
+	Label          string `json:"label"`
+	Path           string `json:"path"`
+	Format         string `json:"format"`
+	Kind           string `json:"kind"`
+	Content        string `json:"content"`
+	MergedFromDisk bool   `json:"merged_from_disk,omitempty"`
 }
 
 type QuickSetupVariant struct {
@@ -103,6 +106,52 @@ type QuickSetupApplyRequest struct {
 }
 
 type QuickSetupApplyResponse struct {
-	Software string   `json:"software"`
-	Written  []string `json:"written"`
+	Software string                 `json:"software"`
+	Written  []string               `json:"written"`
+	Backups  []QuickSetupBackupInfo `json:"backups,omitempty"`
+}
+
+type QuickSetupBackupInfo struct {
+	OriginalPath  string `json:"original_path"`
+	BackupPath    string `json:"backup_path,omitempty"`
+	ExistedBefore bool   `json:"existed_before"`
+}
+
+type QuickSetupRestoreRequest struct {
+	Software string `json:"software"`
+}
+
+type QuickSetupRestoreFailure struct {
+	Path  string `json:"path"`
+	Error string `json:"error"`
+}
+
+type QuickSetupRestoreResponse struct {
+	Restored []string                   `json:"restored"`
+	Deleted  []string                   `json:"deleted"`
+	Failed   []QuickSetupRestoreFailure `json:"failed"`
+}
+
+type QuickSetupConfigStateFile struct {
+	Path            string `json:"path"`
+	Exists          bool   `json:"exists"`
+	Size            int64  `json:"size,omitempty"`
+	ModifiedAt      string `json:"modified_at,omitempty"`
+	Format          string `json:"format"`
+	Content         string `json:"content,omitempty"`
+	ManagedByAliang bool   `json:"managed_by_aliang"`
+}
+
+type QuickSetupConfigStateBackup struct {
+	OriginalPath string `json:"original_path"`
+	BackupPath   string `json:"backup_path,omitempty"`
+	BackedUpAt   string `json:"backed_up_at"`
+	SHA256       string `json:"sha256,omitempty"`
+	Kind         string `json:"kind"`
+}
+
+type QuickSetupConfigStateResponse struct {
+	Software string                        `json:"software"`
+	Files    []QuickSetupConfigStateFile   `json:"files"`
+	Backups  []QuickSetupConfigStateBackup `json:"backups"`
 }

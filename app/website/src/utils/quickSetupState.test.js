@@ -1,8 +1,10 @@
 import { readFileSync } from 'node:fs';
-import { expect, it } from 'vitest';
+import { describe, expect, it } from 'vitest';
 
 import {
   createLatestRenderGuard,
+  createQuickSetupModeState,
+  filterInstalledQuickSetupSoftwares,
   isBuiltInQuickSetupSoftware,
   snapshotQuickSetupFiles,
 } from './quickSetupState.js';
@@ -51,4 +53,30 @@ it('QuickSetupModal save path does not rerender or expose built-in paths', () =>
 	expect(applyBlock).toMatch(/snapshotQuickSetupFiles\(editableFiles\.value\)/);
 	expect(component).toMatch(/:readonly="isBuiltInQuickSetupSoftware\(selectedSoftwareDef\)"/);
 	expect(component).toMatch(/renderGuard\.canCommit\(requestId, filesDirty\.value\)/);
+});
+
+describe('filterInstalledQuickSetupSoftwares', () => {
+	it('keeps installed built-ins and all customs, drops uninstalled built-ins', () => {
+		const list = [
+			{ code: 'opencode', installed: true },
+			{ code: 'codex', installed: false },
+			{ code: 'claude-code', installed: true },
+			{ code: 'custom-abc', isCustom: true },
+		];
+		expect(filterInstalledQuickSetupSoftwares(list).map((s) => s.code))
+			.toEqual(['opencode', 'claude-code', 'custom-abc']);
+	});
+	it('returns customs even when nothing is installed', () => {
+		expect(filterInstalledQuickSetupSoftwares([{ code: 'codex', installed: false }, { code: 'custom-x', isCustom: true }]).map((s) => s.code)).toEqual(['custom-x']);
+	});
+});
+
+describe('quickSetupMode', () => {
+	it('defaults to public and toggles per software', () => {
+		const state = createQuickSetupModeState();
+		expect(state.modeOf('codex')).toBe('public');
+		state.setMode('codex', 'local');
+		expect(state.modeOf('codex')).toBe('local');
+		expect(state.modeOf('opencode')).toBe('public');
+	});
 });

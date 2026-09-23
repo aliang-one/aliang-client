@@ -64,6 +64,16 @@
             </div>
           </button>
 
+          <!-- 三内置均未安装且无 custom 模板时的侧栏空状态 -->
+          <div
+            v-if="catalogStatus === 'success' && !allSoftwares.length"
+            class="rounded-xl border border-dashed border-slate-200 bg-white/60 px-4 py-6 text-center dark:border-slate-700 dark:bg-slate-900/40"
+          >
+            <span class="material-symbols-outlined text-2xl text-slate-300 dark:text-slate-600">search_off</span>
+            <p class="mt-2 text-sm font-semibold text-slate-700 dark:text-slate-200">{{ t('qs_no_agents_detected') }}</p>
+            <p class="mt-1 text-[11px] leading-5 text-slate-500 dark:text-slate-400">{{ t('qs_no_agents_desc') }}</p>
+          </div>
+
           <button
             type="button"
             class="w-full rounded-xl border border-dashed border-slate-300 px-4 py-3 text-left text-sm text-slate-500 transition hover:border-primary/40 hover:text-primary dark:border-slate-700 dark:text-slate-400 dark:hover:border-primary/40 dark:hover:text-primary"
@@ -149,7 +159,94 @@
             <p class="mt-2 text-sm leading-6 text-rose-700 dark:text-rose-300">{{ catalogMessage || t('qs_tryAgain') }}</p>
           </div>
 
+          <!-- 三内置均未安装且无 custom 模板：与侧栏空态一致，右侧不渲染任何配置控件 -->
+          <div
+            v-else-if="!selectedSoftwareDef"
+            class="flex min-h-full flex-col items-center justify-center px-5 py-10 text-center"
+          >
+            <span class="material-symbols-outlined text-3xl text-slate-300 dark:text-slate-600">search_off</span>
+            <p class="mt-3 text-sm font-semibold text-slate-700 dark:text-slate-200">{{ t('qs_no_agents_detected') }}</p>
+            <p class="mt-1 max-w-sm text-[11px] leading-5 text-slate-500 dark:text-slate-400">{{ t('qs_no_agents_desc') }}</p>
+          </div>
+
           <template v-else>
+            <!-- 接入模式（custom 模板无 baseURL 语义，不显示） -->
+            <div v-if="!selectedSoftwareDef.isCustom" class="mb-5">
+              <div class="inline-flex items-center gap-1 rounded-xl border border-slate-200 bg-slate-50 p-1 dark:border-slate-700 dark:bg-slate-900/60">
+                <button
+                  type="button"
+                  :aria-pressed="quickSetupMode === 'local'"
+                  :disabled="filesDirty"
+                  :class="[
+                    'min-h-8 rounded-lg px-3.5 text-xs font-semibold transition disabled:cursor-not-allowed disabled:opacity-50',
+                    quickSetupMode === 'local'
+                      ? 'bg-white text-primary shadow-sm dark:bg-slate-800 dark:text-primary'
+                      : 'text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200',
+                  ]"
+                  @click="setQuickSetupMode('local')"
+                >
+                  {{ t('qs_mode_local') }}
+                </button>
+                <button
+                  type="button"
+                  :aria-pressed="quickSetupMode === 'public'"
+                  :disabled="filesDirty"
+                  :class="[
+                    'min-h-8 rounded-lg px-3.5 text-xs font-semibold transition disabled:cursor-not-allowed disabled:opacity-50',
+                    quickSetupMode === 'public'
+                      ? 'bg-white text-primary shadow-sm dark:bg-slate-800 dark:text-primary'
+                      : 'text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200',
+                  ]"
+                  @click="setQuickSetupMode('public')"
+                >
+                  {{ t('qs_mode_public') }}
+                </button>
+              </div>
+              <p v-if="quickSetupMode === 'local'" class="mt-1.5 text-[11px] leading-5 text-slate-500 dark:text-slate-400">
+                {{ t('qs_mode_local_hint') }}
+              </p>
+            </div>
+
+            <!-- 页签：配置预览 | 当前配置（custom 模板无磁盘托管语义，不显示页签与 StatePanel） -->
+            <div v-if="!selectedSoftwareDef.isCustom" class="mb-5">
+              <div class="inline-flex items-center gap-1 rounded-xl border border-slate-200 bg-slate-50 p-1 dark:border-slate-700 dark:bg-slate-900/60">
+                <button
+                  type="button"
+                  :aria-pressed="activeTab === 'edit'"
+                  :class="[
+                    'min-h-8 rounded-lg px-3.5 text-xs font-semibold transition',
+                    activeTab === 'edit'
+                      ? 'bg-white text-primary shadow-sm dark:bg-slate-800 dark:text-primary'
+                      : 'text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200',
+                  ]"
+                  @click="activeTab = 'edit'"
+                >
+                  {{ t('qs_tab_preview') }}
+                </button>
+                <button
+                  type="button"
+                  :aria-pressed="activeTab === 'state'"
+                  :class="[
+                    'min-h-8 rounded-lg px-3.5 text-xs font-semibold transition',
+                    activeTab === 'state'
+                      ? 'bg-white text-primary shadow-sm dark:bg-slate-800 dark:text-primary'
+                      : 'text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200',
+                  ]"
+                  @click="activeTab = 'state'"
+                >
+                  {{ t('qs_state_title') }}
+                </button>
+              </div>
+            </div>
+
+            <!-- 当前配置页签：磁盘实况查看器 + 一键恢复 -->
+            <QuickSetupStatePanel
+              v-if="activeTab === 'state'"
+              :software="selectedSoftware"
+              @confirm-open-change="nestedDialogOpen = $event"
+            />
+
+            <template v-else>
             <!-- Key selector -->
             <div v-if="isOpenCodeSelected" class="mb-4 space-y-4">
               <div>
@@ -314,8 +411,19 @@
               </div>
             </div>
 
+            <!-- 应用结果视图：apply 成功后替换文件编辑区；返回编辑保留 editableFiles 现状 -->
+            <QuickSetupResultPanel
+              v-if="applyResult"
+              :software-name="applyResult.softwareName"
+              :written="applyResult.written"
+              :backups="applyResult.backups"
+              :files="applyResult.files"
+              @back="applyResult = null"
+              @view-current="activeTab = 'state'"
+            />
+
             <!-- Config editor -->
-            <div v-if="currentVariant || selectedSoftwareDef?.isCustom" class="mt-6">
+            <div v-else-if="currentVariant || selectedSoftwareDef?.isCustom" class="mt-6">
               <!-- Notes -->
               <div v-if="currentVariant.notes?.length" class="mb-4 rounded-2xl border border-sky-200 bg-sky-50/70 px-4 py-3 dark:border-sky-900/40 dark:bg-sky-950/20">
                 <p class="text-[11px] font-semibold uppercase tracking-wide text-sky-700 dark:text-sky-300">{{ t('qs_notes') }}</p>
@@ -364,6 +472,13 @@
 
               <!-- Editor -->
               <div v-if="currentFile" class="mt-4 space-y-4">
+                <!-- 当前 tab 文件由磁盘已有配置智能合并而来时提示（merged_from_disk 带 omitempty） -->
+                <div
+                  v-if="activeFileMergedFromDisk"
+                  class="rounded-xl border border-sky-200 bg-sky-50/60 px-3.5 py-2 text-[11px] leading-5 text-sky-700 dark:border-sky-900/40 dark:bg-sky-950/20 dark:text-sky-300"
+                >
+                  {{ t('qs_merged_banner') }}
+                </div>
                 <div>
                   <label class="mb-1 block text-[11px] font-semibold uppercase tracking-wide text-slate-500">{{ t('qs_targetPath') }}</label>
                   <input
@@ -430,6 +545,7 @@
               <template v-else-if="isOpenCodeSelected">{{ t('qs_selectOpenCodeKeys') }}</template>
               <template v-else>{{ t('qs_selectKeyAbove') }}</template>
             </div>
+            </template>
 
             <div v-if="statusMessage" class="mt-6 rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-600 dark:border-slate-800 dark:bg-slate-900/50 dark:text-slate-300">
               {{ statusMessage }}
@@ -445,7 +561,9 @@
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 import { applyQuickSetup, getQuickSetupCatalog, getQuickSetupModels, renderQuickSetup } from '../services/quickSetupApi';
 import { useI18n } from '../i18n';
-import { createLatestRenderGuard, isBuiltInQuickSetupSoftware, snapshotQuickSetupFiles } from '../utils/quickSetupState';
+import QuickSetupResultPanel from './QuickSetupResultPanel.vue';
+import QuickSetupStatePanel from './QuickSetupStatePanel.vue';
+import { createLatestRenderGuard, createQuickSetupModeState, filterInstalledQuickSetupSoftwares, isBuiltInQuickSetupSoftware, snapshotQuickSetupFiles } from '../utils/quickSetupState';
 
 const { t } = useI18n();
 
@@ -462,6 +580,11 @@ const applying = ref(false);
 const catalogStatus = ref('idle');
 const catalogMessage = ref('');
 const statusMessage = ref('');
+// 右侧面板页签：'edit'=配置预览（key 选择 + 编辑/结果视图）| 'state'=当前配置（磁盘实况）。
+// 仅内置 software 显示页签（custom 无磁盘托管语义）；切 software 时重置为 edit。
+const activeTab = ref('edit');
+// StatePanel 嵌套确认弹窗打开或恢复进行中时为 true：外层 Esc 关闭被屏蔽，避免绕过确认守卫
+const nestedDialogOpen = ref(false);
 const softwares = ref([]);
 const apiKeys = ref([]);
 const selectedSoftware = ref('');
@@ -478,19 +601,27 @@ const currentVariant = ref(null);
 const selectedFileCode = ref('');
 const editableFiles = ref([]);
 const filesDirty = ref(false);
+// apply 成功后的结果快照（softwareName/written/backups/files），非空时渲染结果视图
+const applyResult = ref(null);
 const customSoftwares = ref([]);
 const showAddSoftware = ref(false);
 const newSoftwareName = ref('');
 const newSoftwareDesc = ref('');
 let fileCounter = 0;
 const renderGuard = createLatestRenderGuard();
-const allSoftwares = computed(() => [
+// 每 software 的接入模式记忆（local/public，缺省 public）。组件常挂载不随弹窗关闭卸载，
+// 实际为 app 会话级记忆；跨弹窗打开仍保留属有意设计。
+const modeState = createQuickSetupModeState();
+const quickSetupMode = ref('public');
+const allSoftwares = computed(() => filterInstalledQuickSetupSoftwares([
   ...softwares.value,
   ...customSoftwares.value,
-]);
+]));
 const selectedSoftwareDef = computed(() => allSoftwares.value.find((item) => item.code === selectedSoftware.value) || null);
 const isOpenCodeSelected = computed(() => selectedSoftwareDef.value?.code === 'opencode');
 const compatibleKeys = computed(() => {
+  // 无选中 software（目录为空）时返回空，避免 software watcher 自动选中 key
+  if (!selectedSoftwareDef.value) return [];
   const supportedProviders = new Set(selectedSoftwareDef.value?.supported_providers || []);
   return apiKeys.value.filter((key) => supportedProviders.size === 0 || supportedProviders.has(key.provider));
 });
@@ -533,6 +664,8 @@ const canApplyCurrentVariant = computed(() => {
 const currentFile = computed(() => {
   return editableFiles.value.find((item) => item.code === selectedFileCode.value) || editableFiles.value[0] || null;
 });
+// 后端 merged_from_disk 带 omitempty，false 时字段缺省，必须用 === true 判断。
+const activeFileMergedFromDisk = computed(() => currentFile.value?.merged_from_disk === true);
 let openCodeRenderTimer = null;
 function maskKey(key) {
   if (!key) return '';
@@ -690,6 +823,7 @@ function clearCurrentRender() {
   editableFiles.value = [];
   selectedFileCode.value = '';
   filesDirty.value = false;
+  applyResult.value = null;
 }
 function scheduleOpenCodeRender(delay = 450) {
   if (!isOpenCodeSelected.value || selectedSoftwareDef.value?.isCustom || filesDirty.value) {
@@ -719,8 +853,8 @@ async function loadCatalog() {
     }
     softwares.value = Array.isArray(result.data.softwares) ? result.data.softwares : [];
     apiKeys.value = Array.isArray(result.data.api_keys) ? result.data.api_keys : [];
-    if (!selectedSoftware.value || !softwares.value.some((item) => item.code === selectedSoftware.value)) {
-      selectedSoftware.value = softwares.value[0]?.code || '';
+    if (!selectedSoftware.value || !allSoftwares.value.some((item) => item.code === selectedSoftware.value)) {
+      selectedSoftware.value = allSoftwares.value[0]?.code || '';
     }
   } catch (error) {
     catalogStatus.value = 'failed';
@@ -749,12 +883,17 @@ async function renderSelectedKey() {
   rendering.value = true;
   try {
     const options = isOpenCodeSelected.value ? { opencode: buildOpenCodeSpec() } : {};
+    if (!selectedSoftwareDef.value?.isCustom) {
+      options.mode = quickSetupMode.value;
+    }
     const result = await renderQuickSetup(selectedSoftware.value, keyIds, options);
     if (!renderGuard.canCommit(requestId, filesDirty.value)) {
       return;
     }
     const variantList = Array.isArray(result?.variants) ? result.variants : [];
     if (variantList.length > 0) {
+      // 重新渲染（key/mode/model 变化）即失效上一次 apply 的结果视图，避免展示过期快照
+      applyResult.value = null;
       currentVariant.value = variantList[0];
       editableFiles.value = (variantList[0].files || []).map((f) => ({ ...f }));
       selectedFileCode.value = editableFiles.value[0]?.code || '';
@@ -781,6 +920,23 @@ function selectSoftware(code) {
     return;
   }
   selectedSoftware.value = code;
+}
+// 接入模式切换：记忆到 modeState，并按 software 类型复用现有渲染路径重新生成预览。
+// custom 模板没有 baseURL 语义，入口在模板层隐藏，这里兜底忽略。
+function setQuickSetupMode(mode) {
+  if (!selectedSoftware.value || selectedSoftwareDef.value?.isCustom) {
+    return;
+  }
+  if (quickSetupMode.value === mode) {
+    return;
+  }
+  modeState.setMode(selectedSoftware.value, mode);
+  quickSetupMode.value = mode;
+  if (isOpenCodeSelected.value) {
+    scheduleOpenCodeRender(0);
+    return;
+  }
+  renderSelectedKey();
 }
 function confirmAddSoftware() {
   const name = newSoftwareName.value.trim();
@@ -810,7 +966,7 @@ function confirmAddSoftware() {
 function removeCustomSoftware(code) {
   customSoftwares.value = customSoftwares.value.filter((s) => s.code !== code);
   if (selectedSoftware.value === code) {
-    selectedSoftware.value = softwares.value[0]?.code || '';
+    selectedSoftware.value = allSoftwares.value[0]?.code || '';
   }
 }
 function addNewFile() {
@@ -888,11 +1044,21 @@ async function applyCurrentVariant() {
     const filesToApply = snapshotQuickSetupFiles(editableFiles.value);
     const result = await applyQuickSetup(selectedSoftware.value, filesToApply);
     const writtenCount = Array.isArray(result?.written) ? result.written.length : 0;
-    statusMessage.value = writtenCount > 0
-      ? t('qs_appliedFiles', { count: writtenCount, name: selectedSoftwareDef.value?.name || selectedSoftware.value })
-      : t('qs_noFilesWritten');
     if (writtenCount > 0) {
       filesDirty.value = false;
+      statusMessage.value = '';
+      // 结果页渲染在 edit 页签内；apply 入口当前只在 edit 页签可达，这里防御性确保
+      // 结果视图可见（未来若新增其他触发点不会把结果渲染进隐藏页签）
+      activeTab.value = 'edit';
+      // 应用前的文件快照即写入磁盘的最终内容（path+content 窄快照，供结果面板展示）
+      applyResult.value = {
+        softwareName: selectedSoftwareDef.value?.name || selectedSoftware.value,
+        written: result.written,
+        backups: Array.isArray(result?.backups) ? result.backups : [],
+        files: filesToApply.map((file) => ({ path: file.path, content: file.content })),
+      };
+    } else {
+      statusMessage.value = t('qs_noFilesWritten');
     }
   } catch (error) {
     statusMessage.value = error instanceof Error ? error.message : t('qs_failedApply');
@@ -901,6 +1067,10 @@ async function applyCurrentVariant() {
   }
 }
 function onModalKeydown(event) {
+  // 嵌套确认弹窗占用期（含恢复进行中）不响应外层 Esc，交由内层守卫处理
+  if (nestedDialogOpen.value) {
+    return;
+  }
   if (event.key === 'Escape' && props.open) {
     event.stopImmediatePropagation();
     emit('close');
@@ -910,15 +1080,22 @@ watch(
   () => props.open,
   async (value) => {
     if (!value) {
+      // 双保险：StatePanel 卸载时会 emit false，这里确保弹窗关闭瞬间状态不残留
+      nestedDialogOpen.value = false;
       return;
     }
     await loadCatalog();
   },
   { immediate: true },
 );
-// Software switch -> auto-select first compatible key
+// Software switch -> auto-select first compatible key; 恢复该 software 记忆的接入模式
 watch(selectedSoftware, async () => {
   clearCurrentRender();
+  // custom 模板不渲染页签行，重置保证页签状态不跨 software 泄漏
+  activeTab.value = 'edit';
+  quickSetupMode.value = selectedSoftwareDef.value?.isCustom
+    ? 'public'
+    : modeState.modeOf(selectedSoftware.value);
   const keys = compatibleKeys.value;
   if (keys.length === 0) {
     selectedKeyId.value = '';
