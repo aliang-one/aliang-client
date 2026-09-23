@@ -148,6 +148,7 @@ func (s *Store) AllBuckets() ([]UsageBucket, error) {
 }
 
 // BucketMark 是 reporter 快照某桶时记录的 (ID, Revision) 对。
+// 不变式：桶行只增不删（无删除路径），ID 不会回收，revision 守卫因此可靠。
 type BucketMark struct {
 	ID       int64
 	Revision int64

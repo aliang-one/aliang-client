@@ -9,12 +9,18 @@ import (
 type fakeWriter struct {
 	messages []map[string]interface{}
 	failNext bool
+	// failAfter > 0 时：已成功写入 failAfter 条消息后，下一次 write 失败
+	// （模拟第 failAfter+1 批推送失败）。
+	failAfter int
 }
 
 func (w *fakeWriter) write(payload interface{}) error {
 	if w.failNext {
 		w.failNext = false
 		return errors.New("fake write failure")
+	}
+	if w.failAfter > 0 && len(w.messages) == w.failAfter {
+		return errors.New("fake write failure (failAfter)")
 	}
 	m, _ := payload.(map[string]interface{})
 	w.messages = append(w.messages, m)
@@ -95,6 +101,44 @@ func TestFlushFailureKeepsDirty(t *testing.T) {
 	}
 }
 
+// 部分失败：第二批（第 501 条）推送失败 → 仅已成功的前 500 桶按快照
+// revision 条件清除，未推送的尾桶保持 dirty 下轮重推。
+func TestFlushPartialFailureClearsOnlyPushedBatches(t *testing.T) {
+	store := openTestStore(t)
+	seedBuckets(t, store, 501)
+	w := &fakeWriter{failAfter: 1}
+	r := NewReporter(store, func() string { return "dev-1" }, "UTC")
+	if err := r.FlushAll(w.write); err == nil {
+		t.Fatal("expected error on second batch")
+	}
+	if len(w.messages) != 1 {
+		t.Fatalf("messages = %d, want 1 successful batch before failure", len(w.messages))
+	}
+	dirty, _ := store.DirtyBuckets()
+	if len(dirty) != 1 {
+		t.Fatalf("dirty = %d rows, want 1 (only the un-pushed tail bucket)", len(dirty))
+	}
+	if dirty[0].HourStart != int64(1727071200+500*3600) {
+		t.Fatalf("surviving dirty bucket hour_start = %d, want the 501st bucket", dirty[0].HourStart)
+	}
+}
+
+// write 为 nil（未连接）时全部 no-op：不推送、不触碰 dirty、不 panic。
+func TestNilWriteNoOp(t *testing.T) {
+	store := openTestStore(t)
+	seedBuckets(t, store, 1)
+	r := NewReporter(store, func() string { return "dev-1" }, "UTC")
+	if err := r.FlushDirty(nil); err != nil {
+		t.Fatalf("FlushDirty(nil): %v", err)
+	}
+	if err := r.FlushAll(nil); err != nil {
+		t.Fatalf("FlushAll(nil): %v", err)
+	}
+	if dirty, _ := store.DirtyBuckets(); len(dirty) != 1 {
+		t.Fatal("nil write must not touch dirty state")
+	}
+}
+
 // 竞态守卫：快照后桶又被追加（revision 变化）→ 本次清除失效，dirty 保留。
 func TestFlushSkipsClearWhenBucketChangedMidFlight(t *testing.T) {
 	store := openTestStore(t)
@@ -153,7 +197,7 @@ func TestRecordJSONShape(t *testing.T) {
 	if err := json.Unmarshal(raw, &probe); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if probe.DeviceID != "dev-1" || probe.Model != "claude-sonnet-4-5" || probe.Requests != 1 {
+	if probe.DeviceID != "dev-1" || probe.HourStart != 1727071200 || probe.Model != "claude-sonnet-4-5" || probe.Requests != 1 {
 		t.Fatalf("shape wrong: %+v", probe)
 	}
 }

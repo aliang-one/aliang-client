@@ -983,6 +983,8 @@ git commit -m "新增:用量采集tracker-增量水位扫描与本地小时桶�
 
 ### Task 4: 上报器（processor/usage/reporter.go）
 
+> 执行修正：实施时经质量审查升级为 revision 条件清除（ClearDirtyIfUnchanged + UsageBucket.Revision），替代本节示例中的裸 ClearDirty——堵住快照与清除之间并发追加丢尾增量的竞态。
+
 **Files:**
 - Create: `processor/usage/reporter.go`
 - Create: `processor/usage/reporter_test.go`
