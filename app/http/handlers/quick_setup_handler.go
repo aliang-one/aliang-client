@@ -17,11 +17,15 @@ import (
 const quickSetupRequestMaxBytes = 2 << 20
 
 type QuickSetupHandler struct {
-	service *services.QuickSetupService
+	service      *services.QuickSetupService
+	comboService *services.QuickSetupComboService
 }
 
 func NewQuickSetupHandler() *QuickSetupHandler {
-	return &QuickSetupHandler{service: services.NewQuickSetupService()}
+	return &QuickSetupHandler{
+		service:      services.NewQuickSetupService(),
+		comboService: services.NewQuickSetupComboService(),
+	}
 }
 
 func (h *QuickSetupHandler) HandleCatalog(w http.ResponseWriter, r *http.Request) {

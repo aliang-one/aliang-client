@@ -338,3 +338,36 @@ func TestComboService_SetDefault(t *testing.T) {
 		t.Fatalf("want ErrComboNotFound, got %v", err)
 	}
 }
+
+// TestComboService_SetDefaultAndList 锁定 handler set-default 端点依赖的组合
+// 方法：设默认后一次返回该 software 全部组合（默认在前，目标独占 default）。
+func TestComboService_SetDefaultAndList(t *testing.T) {
+	svc, _ := stubComboServiceEnv(t)
+	if _, err := svc.Create("codex", "a", "blank", 0, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	b, err := svc.Create("codex", "b", "blank", 0, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	combos, err := svc.SetDefaultAndList(b.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(combos) != 2 {
+		t.Fatalf("combos = %d, want 2: %+v", len(combos), combos)
+	}
+	if !combos[0].IsDefault || combos[0].ID != b.ID {
+		t.Fatalf("default not first: %+v", combos)
+	}
+	for _, c := range combos {
+		if c.ID != b.ID && c.IsDefault {
+			t.Fatalf("default not exclusive: %+v", combos)
+		}
+	}
+
+	if _, err := svc.SetDefaultAndList(999999); !errors.Is(err, storage.ErrComboNotFound) {
+		t.Fatalf("want ErrComboNotFound, got %v", err)
+	}
+}

@@ -131,6 +131,26 @@ type QuickSetupRestoreRequest struct {
 	Software string `json:"software"`
 }
 
+// QuickSetupComboCreateRequest 是组合创建（三入口）请求体：
+// source ∈ blank/copy/disk；copy 入口消费 copy_from_id；
+// variables 仅 blank 入口消费（逐键覆盖预填值）。
+type QuickSetupComboCreateRequest struct {
+	Software   string                `json:"software"`
+	Name       string                `json:"name"`
+	Source     string                `json:"source"`
+	CopyFromID int64                 `json:"copy_from_id,omitempty"`
+	Variables  map[string]string     `json:"variables,omitempty"`
+	Files      []QuickSetupComboFile `json:"files,omitempty"`
+}
+
+// QuickSetupComboUpdateRequest 是组合保存（部分更新）请求体：
+// name/variables/files 均可选，nil/缺省表示不动该字段。
+type QuickSetupComboUpdateRequest struct {
+	Name      *string               `json:"name"`
+	Variables map[string]string     `json:"variables"`
+	Files     []QuickSetupComboFile `json:"files"`
+}
+
 type QuickSetupRestoreFailure struct {
 	Path  string `json:"path"`
 	Error string `json:"error"`

@@ -50,6 +50,10 @@ func TestQuickSetupHandlerRequiresDashboardSessionForEveryEndpoint(t *testing.T)
 		{name: "apply", method: http.MethodPost, path: "/api/quick-setup/apply", handle: handler.HandleApply},
 		{name: "config-state", method: http.MethodGet, path: "/api/quick-setup/config-state", handle: handler.HandleConfigState},
 		{name: "restore", method: http.MethodPost, path: "/api/quick-setup/restore", handle: handler.HandleRestore},
+		{name: "combos-create", method: http.MethodPost, path: "/api/quick-setup/combos", handle: handler.HandleCombosCreate},
+		{name: "combos-update", method: http.MethodPut, path: "/api/quick-setup/combos/999", handle: handler.HandleCombosUpdate},
+		{name: "combos-delete", method: http.MethodDelete, path: "/api/quick-setup/combos/999", handle: handler.HandleCombosDelete},
+		{name: "combos-set-default", method: http.MethodPost, path: "/api/quick-setup/combos/999/default", handle: handler.HandleCombosSetDefault},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -94,6 +98,88 @@ func TestQuickSetupHandlerRestoreRequiresSoftware(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "software is required") {
 		t.Fatalf("body = %s, want software required error", rec.Body.String())
+	}
+}
+
+// TestQuickSetupHandlerCombosCreateRejectsUnsupportedSoftware 认证会话下非法
+// software → 400。service 在触库前完成 software 校验，本用例无需 store 注入。
+func TestQuickSetupHandlerCombosCreateRejectsUnsupportedSoftware(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/api/quick-setup/combos", strings.NewReader(`{"software":"nope","name":"套餐","source":"blank"}`))
+	req.AddCookie(issueQuickSetupTestSession(t))
+	rec := httptest.NewRecorder()
+
+	NewQuickSetupHandler().HandleCombosCreate(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "is not supported") {
+		t.Fatalf("body = %s, want unsupported software error", rec.Body.String())
+	}
+}
+
+// TestQuickSetupHandlerCombosCreateRequiresName 认证会话下空白组合名 → 400
+// （service 在触库前报 "combo name is required"，无需 store 注入）。
+func TestQuickSetupHandlerCombosCreateRequiresName(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/api/quick-setup/combos", strings.NewReader(`{"software":"codex","name":"   ","source":"blank"}`))
+	req.AddCookie(issueQuickSetupTestSession(t))
+	rec := httptest.NewRecorder()
+
+	NewQuickSetupHandler().HandleCombosCreate(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "combo name is required") {
+		t.Fatalf("body = %s, want combo name required error", rec.Body.String())
+	}
+}
+
+// TestQuickSetupHandlerCombosCreateRejectsEmptyBody 认证会话下空 body → 400
+// （decode 失败分支）。
+func TestQuickSetupHandlerCombosCreateRejectsEmptyBody(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/api/quick-setup/combos", strings.NewReader(""))
+	req.AddCookie(issueQuickSetupTestSession(t))
+	rec := httptest.NewRecorder()
+
+	NewQuickSetupHandler().HandleCombosCreate(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "Invalid request body") {
+		t.Fatalf("body = %s, want invalid body error", rec.Body.String())
+	}
+}
+
+// TestQuickSetupHandlerCombosRejectNonNumericID 认证会话下 {id} 非数字 → 400，
+// 覆盖 update/delete/set-default 三个带 {id} 路由的解析分支（无需触库）。
+func TestQuickSetupHandlerCombosRejectNonNumericID(t *testing.T) {
+	handler := NewQuickSetupHandler()
+	tests := []struct {
+		name   string
+		method string
+		path   string
+		handle http.HandlerFunc
+	}{
+		{name: "update", method: http.MethodPut, path: "/api/quick-setup/combos/abc", handle: handler.HandleCombosUpdate},
+		{name: "delete", method: http.MethodDelete, path: "/api/quick-setup/combos/abc", handle: handler.HandleCombosDelete},
+		{name: "set-default", method: http.MethodPost, path: "/api/quick-setup/combos/abc/default", handle: handler.HandleCombosSetDefault},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(tt.method, tt.path, strings.NewReader(`{}`))
+			req.SetPathValue("id", "abc")
+			req.AddCookie(issueQuickSetupTestSession(t))
+			rec := httptest.NewRecorder()
+			tt.handle(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), "id") {
+				t.Fatalf("body = %s, want invalid id error", rec.Body.String())
+			}
+		})
 	}
 }
 

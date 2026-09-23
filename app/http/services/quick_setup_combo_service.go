@@ -248,3 +248,16 @@ func (s *QuickSetupComboService) SetDefault(id int64) error {
 	}
 	return s.store.SetDefault(row.Software, id)
 }
+
+// SetDefaultAndList 置默认并返回该 software 的全部组合（set-default 端点契约：
+// 一次调用带回最新列表，省去前端二次拉取）。
+func (s *QuickSetupComboService) SetDefaultAndList(id int64) ([]models.QuickSetupComboView, error) {
+	row, err := s.getComboRow(id)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.store.SetDefault(row.Software, id); err != nil {
+		return nil, err
+	}
+	return s.ListBySoftware(row.Software)
+}
