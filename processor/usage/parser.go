@@ -4,6 +4,7 @@
 package usage
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"time"
@@ -26,11 +27,12 @@ type UsageSample struct {
 // message.content 等内容字段——未知字段被 encoding/json 忽略，内容永远
 // 不会进入本包。
 type jsonlLine struct {
-	Type        string `json:"type"`
-	SessionID   string `json:"sessionId"`
-	UUID        string `json:"uuid"`
-	Timestamp   string `json:"timestamp"`
-	IsSidechain bool   `json:"isSidechain"`
+	Type      string `json:"type"`
+	SessionID string `json:"sessionId"`
+	UUID      string `json:"uuid"`
+	Timestamp string `json:"timestamp"`
+	// 刻意不过滤 sidechain：子代理用量计入（见 TestParseLineSidechainCounted）。
+	IsSidechain bool `json:"isSidechain"`
 	Message     *struct {
 		Model string `json:"model"`
 		Usage *struct {
@@ -42,10 +44,16 @@ type jsonlLine struct {
 	} `json:"message"`
 }
 
-// ParseLine 解析一行 JSONL。返回 (nil, nil) 表示该行不携带用量（user 行、
-// 无 usage 的 assistant 行、summary 行、全零 usage），调用方直接跳过；
-// (nil, err) 表示行损坏，调用方同样跳过但可计数。
+// ParseLine 解析一行 JSONL。返回 (nil, nil) 表示该行不携带用量（空行、
+// user 行、无 usage 的 assistant 行、summary 行、全零 usage），调用方直接
+// 跳过；(nil, err) 表示行损坏，调用方同样跳过但可计数。
+// 所有用量的负值一律钳为 0——手工篡改/损坏的行不得污染聚合；时间戳统一
+// 归一化为 UTC。
 func ParseLine(line []byte) (*UsageSample, error) {
+	// 空行/纯空白行：JSONL 尾行常见，按无用量跳过而非报损坏。
+	if len(bytes.TrimSpace(line)) == 0 {
+		return nil, nil
+	}
 	var raw jsonlLine
 	if err := json.Unmarshal(line, &raw); err != nil {
 		return nil, fmt.Errorf("usage: malformed jsonl line: %w", err)
@@ -63,7 +71,7 @@ func ParseLine(line []byte) (*UsageSample, error) {
 		if err != nil {
 			return nil, fmt.Errorf("usage: bad timestamp %q: %w", raw.Timestamp, err)
 		}
-		ts = parsed
+		ts = parsed.UTC()
 	}
 	return &UsageSample{
 		SessionID:   raw.SessionID,
@@ -71,9 +79,9 @@ func ParseLine(line []byte) (*UsageSample, error) {
 		Timestamp:   ts,
 		Model:       raw.Message.Model,
 
-		InputTokens:         u.InputTokens,
-		OutputTokens:        u.OutputTokens,
-		CacheReadTokens:     u.CacheReadInputTokens,
-		CacheCreationTokens: u.CacheCreationInputTokens,
+		InputTokens:         max(0, u.InputTokens),
+		OutputTokens:        max(0, u.OutputTokens),
+		CacheReadTokens:     max(0, u.CacheReadInputTokens),
+		CacheCreationTokens: max(0, u.CacheCreationInputTokens),
 	}, nil
 }

@@ -66,3 +66,64 @@ func TestParseLineMalformed(t *testing.T) {
 		t.Fatal("expected error for malformed JSON")
 	}
 }
+
+func TestParseLineBlankSkipped(t *testing.T) {
+	cases := map[string]string{
+		"empty line":      "",
+		"whitespace only": " \t\r\n",
+	}
+	for name, line := range cases {
+		sample, err := ParseLine([]byte(line))
+		if err != nil {
+			t.Errorf("%s: unexpected error %v", name, err)
+		}
+		if sample != nil {
+			t.Errorf("%s: expected nil sample, got %+v", name, sample)
+		}
+	}
+}
+
+func TestParseLineNegativeTokensClamped(t *testing.T) {
+	line := `{"type":"assistant","sessionId":"s","uuid":"u","timestamp":"2026-09-23T10:05:29.545Z","message":{"model":"m","usage":{"input_tokens":-5,"output_tokens":7,"cache_read_input_tokens":-3,"cache_creation_input_tokens":9}}}`
+	sample, err := ParseLine([]byte(line))
+	if err != nil || sample == nil {
+		t.Fatalf("expected sample, got sample=%v err=%v", sample, err)
+	}
+	if sample.InputTokens != 0 {
+		t.Errorf("InputTokens = %d, want 0 (negative clamped)", sample.InputTokens)
+	}
+	if sample.CacheReadTokens != 0 {
+		t.Errorf("CacheReadTokens = %d, want 0 (negative clamped)", sample.CacheReadTokens)
+	}
+	if sample.OutputTokens != 7 || sample.CacheCreationTokens != 9 {
+		t.Errorf("positive fields must be kept: output=%d creation=%d", sample.OutputTokens, sample.CacheCreationTokens)
+	}
+}
+
+func TestParseLineMissingTimestampFallsBackToNow(t *testing.T) {
+	line := `{"type":"assistant","sessionId":"s","uuid":"u","message":{"model":"m","usage":{"input_tokens":1,"output_tokens":1}}}`
+	before := time.Now().UTC().Add(-time.Minute)
+	sample, err := ParseLine([]byte(line))
+	if err != nil || sample == nil {
+		t.Fatalf("expected sample, got sample=%v err=%v", sample, err)
+	}
+	after := time.Now().UTC().Add(time.Minute)
+	if sample.Timestamp.Before(before) || sample.Timestamp.After(after) {
+		t.Errorf("Timestamp = %v, want ~now between %v and %v", sample.Timestamp, before, after)
+	}
+}
+
+func TestParseLineTimestampNormalizedToUTC(t *testing.T) {
+	line := `{"type":"assistant","sessionId":"s","uuid":"u","timestamp":"2026-09-23T13:05:29.545+03:00","message":{"model":"m","usage":{"input_tokens":1,"output_tokens":1}}}`
+	sample, err := ParseLine([]byte(line))
+	if err != nil || sample == nil {
+		t.Fatalf("expected sample, got sample=%v err=%v", sample, err)
+	}
+	want := time.Date(2026, 9, 23, 10, 5, 29, 545000000, time.UTC)
+	if !sample.Timestamp.Equal(want) {
+		t.Errorf("Timestamp = %v, want %v (UTC-normalized)", sample.Timestamp, want)
+	}
+	if _, offset := sample.Timestamp.Zone(); offset != 0 {
+		t.Errorf("Timestamp zone offset = %ds, want 0 (UTC)", offset)
+	}
+}
