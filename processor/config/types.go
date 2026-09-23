@@ -269,6 +269,7 @@ type CoreConfig struct {
 	AliangServer *AliangServerConfig `json:"aliangServer,omitempty"`
 	APIServer    string              `json:"api_server,omitempty"`
 	AgentServer  string              `json:"agent_server,omitempty"`
+	UsageTracker *UsageTrackerConfig `json:"usage_tracker,omitempty"`
 }
 
 type CoreEngineConfig struct {
@@ -341,6 +342,16 @@ func (c *HTTP1DropConfig) Validate() error {
 		}
 	}
 	return nil
+}
+
+// UsageTrackerConfig 控制本地 Claude Code 用量采集上报（core.usage_tracker）。
+// 默认开启；关闭后 tracker 不扫描、reporter 不推送（spec §5.3）。
+type UsageTrackerConfig struct {
+	Enabled *bool `json:"enabled,omitempty"`
+}
+
+func (c *UsageTrackerConfig) IsEnabled() bool {
+	return c == nil || c.Enabled == nil || *c.Enabled
 }
 
 // ModelMappingConfig rewrites the top-level "model" field of forwarded HTTP/1
