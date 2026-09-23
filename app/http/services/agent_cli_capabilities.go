@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
@@ -172,9 +173,21 @@ func probeClaudeEffortLevels(path string) []string {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), claudeEffortProbeTimeout)
 	defer cancel()
-	out, _ := newBackgroundCommandContext(ctx, path,
+	// 探测隔离：哨兵参数只保证旧世代 CLI 秒退；新世代（2.1.280+）对非法
+	// effort/model 只警告并继续，会真的跑一个模型回合并把 jsonl 写进
+	// ~/.claude/projects，被 inventory 扫描上报成导入会话（2026-09-23
+	// vibe-on-phone-75 事故）。把 CLAUDE_CONFIG_DIR 指向一次性目录，探测进程的
+	// 一切会话痕迹都落在扫描树外，探测结束即清理。
+	probeHome, probeErr := os.MkdirTemp("", "aliang-cli-probe-")
+	if probeErr != nil {
+		return nil
+	}
+	defer os.RemoveAll(probeHome)
+	cmd := newBackgroundCommandContext(ctx, path,
 		"--print", "--model", claudeEffortProbeModel, "--effort", claudeEffortProbeSentinel, claudeEffortProbePrompt,
-	).CombinedOutput()
+	)
+	cmd.Env = append(os.Environ(), "CLAUDE_CONFIG_DIR="+probeHome)
+	out, _ := cmd.CombinedOutput()
 	levels := parseCLIEffortLevels(string(out))
 	if levels == nil {
 		// 失败不缓存:下次快照重试(受 timeout 约束)。

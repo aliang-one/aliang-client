@@ -692,6 +692,12 @@ func collectClaudeVibeSessionsWithStats(scanDirs []string) ([]models.AgentVibeSe
 			if entry.SessionID == "" || entry.IsSidechain {
 				continue
 			}
+			// 探针会话在 index 通道同样排除：firstPrompt 恰为探针哨兵且条目极小
+			// 的视为 CLI 能力探测残留（2026-09-23 vibe-on-phone-75 事故），不入
+			// 会话快照；真实会话条目不受影响。
+			if strings.TrimSpace(entry.FirstPrompt) == claudeEffortProbePrompt && entry.MessageCount <= 2 {
+				continue
+			}
 			projectPath := firstNonEmpty(entry.ProjectPath, index.OriginalPath)
 			if !isSafeAgentProjectPath(projectPath) {
 				continue
@@ -1040,6 +1046,8 @@ func readClaudeSessionMetaWithOptions(path string, options agentVibeSessionReadO
 	session.Tool = "claude"
 	session.Mode = "vibe"
 	session.Status = "closed"
+	var firstUserPrompt string
+	userPromptCount := 0
 	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for scanner.Scan() {
@@ -1085,6 +1093,12 @@ func readClaudeSessionMetaWithOptions(path string, options agentVibeSessionReadO
 				// "[1]+ Done ..." 状态行。索引照旧自增，保证后续消息的 stableAgentID
 				// 与旧解析及已入库消息一致（否则 server 按 id upsert 会重复存储）。
 				if role != "system" {
+					if row.Type == "user" {
+						userPromptCount++
+						if firstUserPrompt == "" {
+							firstUserPrompt = text
+						}
+					}
 					window.add(models.AgentVibeMessage{
 						ID:        stableAgentID("msg", fmt.Sprintf("%s:%d:%s", row.Timestamp, messageIndex, text)),
 						Role:      role,
@@ -1105,6 +1119,13 @@ func readClaudeSessionMetaWithOptions(path string, options agentVibeSessionReadO
 		return models.AgentVibeSession{}
 	}
 	if !isSafeAgentProjectPath(session.ProjectPath) {
+		return models.AgentVibeSession{}
+	}
+	// 探针会话排除：agent 自己的 CLI 能力探测以裸 "probe" 为唯一用户输入
+	// headless 起跑，曾被扫描当成普通 CLI 会话导入手机列表（2026-09-23
+	// vibe-on-phone-75 事故）。仅当首条用户输入恰为探针哨兵且没有后续用户
+	// 消息时跳过——真实会话一旦有追问即不受影响。
+	if firstUserPrompt == claudeEffortProbePrompt && userPromptCount <= 1 {
 		return models.AgentVibeSession{}
 	}
 	session.Transcript, session.TranscriptPage = window.page(session.MessageCount, options.IncludePageMeta)
