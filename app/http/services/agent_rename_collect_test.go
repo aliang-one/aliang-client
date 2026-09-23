@@ -15,6 +15,14 @@ import (
 	"aliang.one/nursorgate/common/cache"
 )
 
+// freshFixtureTimestamp is the "just now" real-message timestamp the shared
+// fixture encodes. Activity freshness is MESSAGE-derived (last real
+// user/assistant record), not file mtime — a fixture session only counts as
+// fresh when its last real message is recent.
+func freshFixtureTimestamp() string {
+	return time.Now().Add(-30 * time.Second).UTC().Format(time.RFC3339)
+}
+
 // renameCollectFixture writes a Claude transcript plus an optional pid session
 // record, mirroring the fixture style of the existing inventory tests.
 func renameCollectFixture(t *testing.T, sid string, pidRecord string) string {
@@ -29,7 +37,7 @@ func renameCollectFixture(t *testing.T, sid string, pidRecord string) string {
 	encodedCwd := "-" + strings.ReplaceAll(strings.Trim(projectPath, string(filepath.Separator)), string(filepath.Separator), "-")
 	claudeDir := filepath.Join(home, ".claude", "projects", encodedCwd)
 	require.NoError(t, os.MkdirAll(claudeDir, 0o700))
-	transcript := `{"timestamp":"2026-06-13T02:00:00Z","type":"user","cwd":"` + projectPath +
+	transcript := `{"timestamp":"` + freshFixtureTimestamp() + `","type":"user","cwd":"` + projectPath +
 		`","sessionId":"` + sid + `","gitBranch":"main","message":{"role":"user","content":[{"type":"text","text":"Fix the login bug"}]}}` + "\n"
 	require.NoError(t, os.WriteFile(filepath.Join(claudeDir, sid+".jsonl"), []byte(transcript), 0o600))
 	if pidRecord != "" {

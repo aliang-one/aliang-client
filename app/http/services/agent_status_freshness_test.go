@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -32,16 +33,24 @@ func livePidRecord(t *testing.T, sid string, fields string) string {
 	return record + "}"
 }
 
-// ageTranscript backdates the fixture transcript's mtime to simulate a session
-// whose jsonl stopped being appended (turn finished / CLI exited abnormally).
+// ageTranscript ages the fixture session past the freshness window: activity
+// freshness is MESSAGE-derived, so "aged" means the last real user/assistant
+// record's timestamp itself is old — a mere mtime rewind would only simulate
+// metadata-only writes, which no longer count as activity (that mtime churn is
+// exactly what the freshness fix removes).
 func ageTranscript(t *testing.T, sid string, age time.Duration) {
 	t.Helper()
 	home, err := os.UserHomeDir()
 	require.NoError(t, err)
 	encoded := "-" + strings.ReplaceAll(strings.Trim(filepath.Join(home, "work", "myproject"), string(filepath.Separator)), string(filepath.Separator), "-")
 	path := filepath.Join(home, ".claude", "projects", encoded, sid+".jsonl")
-	past := time.Now().Add(-age)
-	require.NoError(t, os.Chtimes(path, past, past))
+	past := time.Now().Add(-age).UTC().Format(time.RFC3339)
+	raw, err := os.ReadFile(path)
+	require.NoError(t, err)
+	aged := regexp.MustCompile(`"timestamp":"[^"]*"`).ReplaceAllString(string(raw), `"timestamp":"`+past+`"`)
+	require.NoError(t, os.WriteFile(path, []byte(aged), 0o600))
+	mtime := time.Now().Add(-age)
+	require.NoError(t, os.Chtimes(path, mtime, mtime))
 }
 
 // TestClaudeStatusBusyAliveIsRunning is the 437bc99 anchor: a live process
@@ -64,10 +73,11 @@ func TestClaudeStatusIdleAliveIsIdle(t *testing.T) {
 	assert.Equal(t, "idle", found.Status)
 }
 
-// TestClaudeStatusMissingUsableStatus follows the transcript-freshness branch:
+// TestClaudeStatusMissingUsableStatus follows the message-freshness branch:
 // records without a usable status (missing / null / empty / unknown value —
 // Go unmarshal collapses all of them to "") report running only while the
-// transcript was appended within the freshness window. These are the real
+// last REAL message is within the freshness window (metadata-only jsonl
+// writes no longer count as activity). These are the real
 // record shapes seen on 2.1.x: interactive builds before the status field
 // existed and headless/sdk entrypoints ("claude -p" never writes a status).
 func TestClaudeStatusMissingUsableStatus(t *testing.T) {
@@ -122,9 +132,9 @@ func TestClaudeStatusDeadPidBusyStaysClosed(t *testing.T) {
 // TestCollectClaudeUpdatedAtFreshnessPatch is the resumed-session fix: Claude
 // Code writes sessions-index.json lazily, so a resumed conversation's index
 // entry keeps the PREVIOUS turn's `modified` while the jsonl is appended live.
-// The collector must report the fresher jsonl mtime as updated_at, otherwise
-// PhoneServer's stale-run sweeper (10 min quiet) flaps the mid-turn session
-// to "timed out" and back on every inventory push.
+// The collector must report the live transcript's last REAL message time as
+// updated_at, otherwise PhoneServer's stale-run sweeper (10 min quiet) flaps
+// the mid-turn session to "timed out" and back on every inventory push.
 func TestCollectClaudeUpdatedAtFreshnessPatch(t *testing.T) {
 	const sid = "status-resumed-freshness"
 	home := renameCollectFixture(t, sid, "")
@@ -151,7 +161,7 @@ func TestCollectClaudeUpdatedAtFreshnessPatch(t *testing.T) {
 	require.NotNil(t, found)
 	assert.NotEqual(t, staleModified, found.UpdatedAt, "resumed session's updated_at must not stay at the stale index modified")
 	freshFloor := time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)
-	assert.Greater(t, compareRFC3339(found.UpdatedAt, freshFloor), 0, "updated_at must carry the fresh jsonl mtime")
+	assert.Greater(t, compareRFC3339(found.UpdatedAt, freshFloor), 0, "updated_at must carry the fresh last-message time")
 }
 
 // TestCollectClaudeScanDeterminism: the same on-disk state must produce the

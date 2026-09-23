@@ -745,9 +745,20 @@ func collectClaudeVibeSessionsWithStats(scanDirs []string) ([]models.AgentVibeSe
 		}
 		// Capture freshness for EVERY walked session — including ones already
 		// claimed by the index pass (a resumed conversation): the patch below
-		// needs their mtime to replace the stale index `modified`.
-		if info, err := os.Stat(path); err == nil {
-			transcriptFreshness[strings.TrimPrefix(session.ID, "claude_")] = info.ModTime()
+		// needs their activity time to replace the stale index `modified`.
+		// Freshness is the reader-derived LAST REAL MESSAGE time, not the file
+		// mtime: a TUI left open keeps appending metadata-only records (draft
+		// prompts, cost-state, mode switches) for hours after the conversation
+		// ended, and mtime freshness used to float those dead sessions to the
+		// top of the phone's list and read as an in-flight turn.
+		fresh := parseAgentRFC3339(session.UpdatedAt)
+		if fresh.IsZero() {
+			if info, err := os.Stat(path); err == nil {
+				fresh = info.ModTime()
+			}
+		}
+		if !fresh.IsZero() {
+			transcriptFreshness[strings.TrimPrefix(session.ID, "claude_")] = fresh
 		}
 		if seen[session.ID] {
 			continue
@@ -897,9 +908,11 @@ func pidRecordTimestamp(value interface{}, file string) time.Time {
 // claudeStatusFreshnessWindow bounds the freshness-derived "running" signal for
 // sessions whose pid record carries no usable status (older Claude Code builds
 // never write one; headless/sdk entrypoints never do either — verified on real
-// 2.1.x records). An actively appended transcript means work is in flight; the
-// signal decays on its own once writes stop, so an open-but-quiet session falls
-// back to idle. This decay is what keeps the branch from resurrecting the
+// 2.1.x records). A recent REAL message (user/assistant) means work is in
+// flight; the signal decays on its own once messages stop, so an
+// open-but-quiet session falls back to idle. Metadata-only writes (draft
+// prompts, cost-state) do not count — mtime freshness used to read them as an
+// in-flight turn. This decay is what keeps the branch from resurrecting the
 // pre-437bc99 "live process == forever running" bug.
 const claudeStatusFreshnessWindow = 3 * time.Minute
 
@@ -1048,6 +1061,7 @@ func readClaudeSessionMetaWithOptions(path string, options agentVibeSessionReadO
 	session.Status = "closed"
 	var firstUserPrompt string
 	userPromptCount := 0
+	var lastMessageAt time.Time
 	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for scanner.Scan() {
@@ -1082,8 +1096,11 @@ func readClaudeSessionMetaWithOptions(path string, options agentVibeSessionReadO
 		if session.CreatedAt == "" {
 			session.CreatedAt = normalizeAgentTime(row.Timestamp)
 		}
+		var commandRecord bool
 		if row.Type == "user" || row.Type == "assistant" {
-			if text := truncateAgentText(claudeMessageText(row.Message), agentVibeTranscriptMaxContentRunes); text != "" {
+			rawText := claudeMessageText(row.Message)
+			commandRecord = row.Type == "user" && isClaudeSlashCommandRecord(rawText)
+			if text := truncateAgentText(rawText, agentVibeTranscriptMaxContentRunes); text != "" {
 				messageIndex := session.MessageCount
 				session.MessageCount++
 				role := firstNonEmpty(inferAgentVibeRoleFromClaudeMessage(row.Message), normalizeAgentVibeRole(row.Type))
@@ -1092,7 +1109,9 @@ func readClaudeSessionMetaWithOptions(path string, options agentVibeSessionReadO
 				// 摊平成 system 消息，手机端就会渲染出一墙 "Updated task #N status" /
 				// "[1]+ Done ..." 状态行。索引照旧自增，保证后续消息的 stableAgentID
 				// 与旧解析及已入库消息一致（否则 server 按 id upsert 会重复存储）。
-				if role != "system" {
+				// slash 命令流水（/clear、local-command-caveat）同理：是 UI 工件而非
+				// 对话，走同一条跳过路径——不进气泡、不进标题、不推进活跃时间。
+				if role != "system" && !commandRecord {
 					if row.Type == "user" {
 						userPromptCount++
 						if firstUserPrompt == "" {
@@ -1107,9 +1126,19 @@ func readClaudeSessionMetaWithOptions(path string, options agentVibeSessionReadO
 						Index:     messageIndex,
 					})
 				}
+				if !commandRecord {
+					// 活跃时间取最后一条真实消息的时间戳：TUI 开在提示符时 jsonl 仍会被
+					// last-prompt 草稿 / cost-state / mode 切换等元数据持续写新（真机会话
+					// 在最后一条消息之后被续命数小时），mtime 不能再当活动时间用。
+					if ts := normalizeAgentTime(row.Timestamp); ts != "" {
+						if parsed, err := time.Parse(time.RFC3339, ts); err == nil && parsed.After(lastMessageAt) {
+							lastMessageAt = parsed
+						}
+					}
+				}
 			}
 		}
-		if session.Title == "" && row.Type == "user" {
+		if session.Title == "" && row.Type == "user" && !commandRecord {
 			if text := claudeMessageText(row.Message); text != "" && !isJunkAgentTitle(text) {
 				session.Title = truncateAgentText(text, 200)
 			}
@@ -1129,7 +1158,12 @@ func readClaudeSessionMetaWithOptions(path string, options agentVibeSessionReadO
 		return models.AgentVibeSession{}
 	}
 	session.Transcript, session.TranscriptPage = window.page(session.MessageCount, options.IncludePageMeta)
-	session.UpdatedAt = fileUpdatedAt(path)
+	if !lastMessageAt.IsZero() {
+		session.UpdatedAt = lastMessageAt.UTC().Format(time.RFC3339)
+	} else {
+		// transcript 没有可用的消息时间戳（旧版 Claude Code 不写）：保留 mtime 兜底。
+		session.UpdatedAt = fileUpdatedAt(path)
+	}
 	return session
 }
 
@@ -1312,6 +1346,26 @@ func normalizeAgentVibeRole(value string) string {
 // phone list used to show them verbatim); skipping them lets the title fall
 // to the first real user message, or stay empty so downstream placeholders
 // apply.
+// isClaudeSlashCommandRecord reports whether a user-type transcript record is
+// slash-command plumbing rather than conversation: the local-command-caveat
+// preamble and the <command-name>…</command-name> record Claude Code writes at
+// the start of a post-/clear session (the /clear record lands in the NEW
+// session file, so without this filter every cleared conversation opened with
+// a stray "/clear" bubble on the phone).
+func isClaudeSlashCommandRecord(text string) bool {
+	return strings.HasPrefix(text, "<command-name>") || strings.HasPrefix(text, "<local-command-caveat>")
+}
+
+// parseAgentRFC3339 decodes an RFC3339 timestamp into UTC time, zero on
+// failure — used where a time.Time (freshness map) is built from the
+// reader's string UpdatedAt.
+func parseAgentRFC3339(value string) time.Time {
+	if parsed, err := time.Parse(time.RFC3339, normalizeAgentTime(value)); err == nil {
+		return parsed
+	}
+	return time.Time{}
+}
+
 func isJunkAgentTitle(text string) bool {
 	t := strings.TrimSpace(text)
 	if t == "" {
