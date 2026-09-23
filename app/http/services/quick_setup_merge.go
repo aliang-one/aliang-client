@@ -34,9 +34,6 @@ func mergeQuickSetupJSONInto(dst, src map[string]interface{}) {
 	}
 }
 
-// quickSetupCodexProviderID 是快速配置 v2 统一切换到的 codex provider id（spec §7）。
-const quickSetupCodexProviderID = "aliang"
-
 // 表头行识别：TOML 表名（裸键或基础字符串键）不得含 `]` 与 `#`，
 // 因此 ^\[名字]$（可带行尾空白与注释，含紧贴 ] 的 #）足以区分真表头
 // 与数组续行/行内 table 值。注释前不强制空白——`[x]# c` 也是合法 TOML。

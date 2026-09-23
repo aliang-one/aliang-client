@@ -1,6 +1,7 @@
 package services
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -117,6 +118,141 @@ func quickSetupSoftwares() []models.QuickSetupSoftware {
 			},
 		},
 	}
+}
+
+// quickSetupCodexProviderID 是快速配置组合统一切换到的 codex provider id（spec §7；
+// 自 quick_setup_merge.go 迁入，同包内 merge/render/snapshot 继续引用）。
+const quickSetupCodexProviderID = "aliang"
+
+// quickSetupComboBlankTemplates 返回 software 的空白组合模板（含 {{base_url}}/
+// {{api_key}}/{{model}} 占位符，spec §6.3）。返回的文件顺序/Code 与该 software 的
+// Files 声明一一对应；未知 software 返回 nil。占位符按文件天然分布（如 codex 的
+// {{api_key}} 只在 auth.json）。全部模板统一只写 {{base_url}} 占位符，不内嵌 /v1
+// 拼接逻辑——变量值带不带 /v1（codex/opencode 带、claude/pi 不带）由 configure 表单
+// 的预设项写进 variables.base_url（spec §6，Task 6/12 落地），模板只负责引用。
+func quickSetupComboBlankTemplates(softwareCode string) []models.QuickSetupComboFile {
+	switch softwareCode {
+	case "claude-code":
+		return quickSetupBlankClaudeFiles()
+	case "codex":
+		return quickSetupBlankCodexFiles()
+	case "opencode":
+		return quickSetupBlankOpenCodeFiles()
+	case "pi":
+		return quickSetupBlankPiFiles()
+	default:
+		return nil
+	}
+}
+
+// quickSetupBlankClaudeFiles 生成 claude-code 的空白组合模板（settings.json）。
+// base_url 变量值不带 /v1（Claude Code 自行追加 /v1/messages）。
+func quickSetupBlankClaudeFiles() []models.QuickSetupComboFile {
+	env := struct {
+		BaseURL   string `json:"ANTHROPIC_BASE_URL"`
+		AuthToken string `json:"ANTHROPIC_AUTH_TOKEN"`
+		Model     string `json:"ANTHROPIC_MODEL"`
+	}{BaseURL: "{{base_url}}", AuthToken: "{{api_key}}", Model: "{{model}}"}
+	payload := struct {
+		Env interface{} `json:"env"`
+	}{Env: env}
+	return []models.QuickSetupComboFile{
+		{Code: "settings", Content: quickSetupBlankJSON(payload)},
+	}
+}
+
+// quickSetupBlankCodexFiles 生成 codex 的空白组合模板（config.toml + auth.json）。
+// config.toml 的 [model_providers.aliang] 段形态与 v2 mergeCodexTOML 的模板形态
+// （buildCodexAliangSection）语义一致；base_url 变量值由 configure 预设带 /v1。
+func quickSetupBlankCodexFiles() []models.QuickSetupComboFile {
+	configTOML := strings.Join([]string{
+		"model = \"{{model}}\"",
+		"model_provider = " + quickSetupTOMLQuote(quickSetupCodexProviderID),
+		"approval_policy = \"never\"",
+		"",
+		"[model_providers." + quickSetupCodexProviderID + "]",
+		"name = \"Aliang Gateway\"",
+		"base_url = \"{{base_url}}\"",
+		"env_key = \"OPENAI_API_KEY\"",
+		"wire_api = \"responses\"",
+	}, "\n") + "\n"
+	auth := struct {
+		OpenAIAPIKey string `json:"OPENAI_API_KEY"`
+	}{OpenAIAPIKey: "{{api_key}}"}
+	return []models.QuickSetupComboFile{
+		{Code: "config", Content: configTOML},
+		{Code: "auth", Content: quickSetupBlankJSON(auth)},
+	}
+}
+
+// quickSetupBlankOpenCodeFiles 生成 opencode 的空白组合模板（opencode.json）。
+// npm 写死 anthropic 的 SDK 包字面量（与 v2 quickSetupOpenCodeProviderNPM
+// 的 anthropic 分支一致；该函数 Task 9 随 render.go 删除，模板不得引用它）。
+func quickSetupBlankOpenCodeFiles() []models.QuickSetupComboFile {
+	options := struct {
+		BaseURL string `json:"baseURL"`
+		APIKey  string `json:"apiKey"`
+	}{BaseURL: "{{base_url}}", APIKey: "{{api_key}}"}
+	provider := struct {
+		NPM     string      `json:"npm"`
+		Options interface{} `json:"options"`
+	}{NPM: "@ai-sdk/anthropic", Options: options}
+	payload := struct {
+		Schema   string      `json:"$schema"`
+		Model    string      `json:"model"`
+		Provider interface{} `json:"provider"`
+	}{
+		Schema:   "https://opencode.ai/config.json",
+		Model:    quickSetupCodexProviderID + "/{{model}}",
+		Provider: map[string]interface{}{quickSetupCodexProviderID: provider},
+	}
+	return []models.QuickSetupComboFile{
+		{Code: "config", Content: quickSetupBlankJSON(payload)},
+	}
+}
+
+// quickSetupBlankPiFiles 生成 pi 的空白组合模板（models.json + settings.json）。
+// base_url 变量值不带 /v1——pi 的 anthropic-messages API 自行追加 /v1/messages。
+func quickSetupBlankPiFiles() []models.QuickSetupComboFile {
+	entry := struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	}{ID: "{{model}}", Name: "{{model}}"}
+	provider := struct {
+		Name    string      `json:"name"`
+		BaseURL string      `json:"baseUrl"`
+		APIKey  string      `json:"apiKey"`
+		API     string      `json:"api"`
+		Models  interface{} `json:"models"`
+	}{
+		Name:    "Aliang Gateway",
+		BaseURL: "{{base_url}}",
+		APIKey:  "{{api_key}}",
+		API:     "anthropic-messages",
+		Models:  []interface{}{entry},
+	}
+	modelsPayload := struct {
+		Providers interface{} `json:"providers"`
+	}{Providers: map[string]interface{}{quickSetupCodexProviderID: provider}}
+	settings := struct {
+		DefaultProvider string `json:"defaultProvider"`
+		DefaultModel    string `json:"defaultModel"`
+	}{DefaultProvider: quickSetupCodexProviderID, DefaultModel: "{{model}}"}
+	return []models.QuickSetupComboFile{
+		{Code: "models", Content: quickSetupBlankJSON(modelsPayload)},
+		{Code: "settings", Content: quickSetupBlankJSON(settings)},
+	}
+}
+
+// quickSetupBlankJSON 把静态模板结构体序列化为 2 空格缩进的 JSON 文本。
+// 输入只含字符串/数组/map 字面量，MarshalIndent 不可失败；兜底返回空串
+// 由模板测试立即暴露。
+func quickSetupBlankJSON(v interface{}) string {
+	raw, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return ""
+	}
+	return string(raw)
 }
 
 func findQuickSetupSoftware(code string) (models.QuickSetupSoftware, bool) {
