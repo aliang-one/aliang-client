@@ -44,14 +44,16 @@ type UsageBucket struct {
 func (UsageBucket) TableName() string { return "usage_buckets" }
 
 // Store 是用量模块的本地 sqlite 存储（统一库 aliang.data，独立连接，
-// 与 processor/auth 的连接并存——写频极低，秒级以下）。
+// 与 processor/auth 的连接并存——写频极低，秒级以下）。DSN 携带
+// _busy_timeout=5000：与共享库的另一连接偶发锁竞争时等待重试，而非
+// 立刻报 "database is locked"；DSN 形式对连接池内每条连接生效。
 type Store struct {
 	db *gorm.DB
 }
 
 // OpenStoreAt 在指定路径建/开库（测试注入用）。
 func OpenStoreAt(dbPath string) (*Store, error) {
-	db, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{
+	db, err := gorm.Open(sqlite.Open(dbPath+"?_busy_timeout=5000"), &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Silent),
 	})
 	if err != nil {
@@ -85,7 +87,10 @@ func (s *Store) GetWatermark(path string) (int64, error) {
 }
 
 func (s *Store) SetWatermark(path string, offset int64) error {
-	return s.db.Save(&UsageWatermark{FilePath: path, Offset: offset, UpdatedAt: time.Now()}).Error
+	if err := s.db.Save(&UsageWatermark{FilePath: path, Offset: offset, UpdatedAt: time.Now()}).Error; err != nil {
+		return fmt.Errorf("usage: save watermark: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) DeleteWatermarks(paths []string) error {
@@ -116,26 +121,36 @@ func (s *Store) Bucket(hourStart int64, model string) (*UsageBucket, error) {
 // 由 reporter 上报成功后 ClearDirty。
 func (s *Store) SaveBucket(b *UsageBucket) error {
 	b.Dirty = true
-	return s.db.Save(b).Error
+	if err := s.db.Save(b).Error; err != nil {
+		return fmt.Errorf("usage: save bucket: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) DirtyBuckets() ([]UsageBucket, error) {
 	var out []UsageBucket
-	err := s.db.Where("dirty = ?", true).Order("hour_start ASC").Find(&out).Error
-	return out, err
+	if err := s.db.Where("dirty = ?", true).Order("hour_start ASC").Find(&out).Error; err != nil {
+		return nil, fmt.Errorf("usage: dirty buckets: %w", err)
+	}
+	return out, nil
 }
 
 func (s *Store) AllBuckets() ([]UsageBucket, error) {
 	var out []UsageBucket
-	err := s.db.Order("hour_start ASC").Find(&out).Error
-	return out, err
+	if err := s.db.Order("hour_start ASC").Find(&out).Error; err != nil {
+		return nil, fmt.Errorf("usage: all buckets: %w", err)
+	}
+	return out, nil
 }
 
 func (s *Store) ClearDirty(ids []int64) error {
 	if len(ids) == 0 {
 		return nil
 	}
-	return s.db.Model(&UsageBucket{}).Where("id IN ?", ids).Update("dirty", false).Error
+	if err := s.db.Model(&UsageBucket{}).Where("id IN ?", ids).Update("dirty", false).Error; err != nil {
+		return fmt.Errorf("usage: clear dirty: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) allWatermarkPaths() ([]string, error) {
