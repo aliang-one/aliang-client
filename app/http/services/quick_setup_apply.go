@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"aliang.one/nursorgate/app/http/models"
@@ -113,10 +114,17 @@ func (s *QuickSetupService) Apply(req models.QuickSetupApplyRequest) (*models.Qu
 
 // validateQuickSetupApplyFile 返回内置软件命中的 catalog 声明文件，供调用方复用
 // （备份 file_code）；custom-* 无 catalog 定义，返回零值。
+var quickSetupPlaceholderRe = regexp.MustCompile(`\{\{\s*[a-zA-Z_][a-zA-Z0-9_]*\s*\}\}`)
+
+// 占位符未替换即拒绝（spec §5）：组合渲染在前端完成，此处兜底——
+// 带占位符的内容落盘会让 agent 拿到字面 {{...}}。
 func validateQuickSetupApplyFile(software string, file models.QuickSetupApplyFile, resolvedPath string, home string) (models.QuickSetupSoftwareFile, error) {
 	content := strings.TrimSpace(file.Content)
 	if content == "" {
 		return models.QuickSetupSoftwareFile{}, errors.New("file content is not valid: content cannot be empty")
+	}
+	if m := quickSetupPlaceholderRe.FindString(content); m != "" {
+		return models.QuickSetupSoftwareFile{}, fmt.Errorf("file content is not valid: unresolved variable placeholder %s", m)
 	}
 
 	format := strings.ToLower(strings.TrimSpace(file.Format))

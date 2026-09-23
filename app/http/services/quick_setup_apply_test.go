@@ -102,6 +102,56 @@ func TestApplyWritesDiskBackup(t *testing.T) {
 	}
 }
 
+// TestApplyRejectsUnresolvedPlaceholders 锁定占位符兜底契约（spec §5）：
+// 组合渲染在前端完成，后端 Apply 兜底拒绝未替换的 {{...}} 占位符——
+// 1. config.toml 含 {{base_url}} → Apply 报错且零写入；
+// 2. 全部替换为真实值后 → Apply 成功。
+func TestApplyRejectsUnresolvedPlaceholders(t *testing.T) {
+	home := t.TempDir()
+
+	previousAuth := quickSetupAuthorizationHeaderFn
+	previousTargetUser := quickSetupTargetUserFn
+	quickSetupAuthorizationHeaderFn = func() string { return "Bearer test-access" }
+	quickSetupTargetUserFn = func() (quickSetupTargetUser, error) {
+		return quickSetupTargetUser{homeDir: home}, nil
+	}
+	t.Cleanup(func() {
+		quickSetupAuthorizationHeaderFn = previousAuth
+		quickSetupTargetUserFn = previousTargetUser
+	})
+
+	req := models.QuickSetupApplyRequest{
+		Software: "codex",
+		Files: []models.QuickSetupApplyFile{
+			{Path: "~/.codex/config.toml", Content: "[model_providers.aliang]\nname = \"aliang gateway\"\nbase_url = \"{{base_url}}\"\n", Kind: "file"},
+			{Path: "~/.codex/auth.json", Content: `{"OPENAI_API_KEY":"sk-test"}`, Kind: "file"},
+		},
+	}
+
+	svc := NewQuickSetupService()
+	_, err := svc.Apply(req)
+	if err == nil {
+		t.Fatal("Apply() succeeded despite unresolved {{base_url}} placeholder")
+	}
+	if !strings.Contains(err.Error(), "{{base_url}}") || !strings.Contains(err.Error(), "placeholder") {
+		t.Fatalf("error = %q, want it to mention {{base_url}} and placeholder", err.Error())
+	}
+	for _, p := range []string{filepath.Join(home, ".codex", "config.toml"), filepath.Join(home, ".codex", "auth.json")} {
+		if _, statErr := os.Stat(p); !os.IsNotExist(statErr) {
+			t.Fatalf("rejected apply must not write %s: %v", p, statErr)
+		}
+	}
+
+	// 全部替换为真实值 → Apply 成功
+	req.Files[0].Content = "[model_providers.aliang]\nname = \"aliang gateway\"\nbase_url = \"https://api.aliang.one/v1\"\n"
+	if _, err := svc.Apply(req); err != nil {
+		t.Fatalf("Apply() with fully rendered content failed: %v", err)
+	}
+	if written, readErr := os.ReadFile(filepath.Join(home, ".codex", "config.toml")); readErr != nil || !strings.Contains(string(written), "https://api.aliang.one/v1") {
+		t.Fatalf("config.toml after successful apply = %q (err=%v), want rendered base_url", string(written), readErr)
+	}
+}
+
 // TestApplyRollbackPreservesOriginalBackupAndRestoreWorks 锁定「回滚 × 备份 × 恢复」
 // 组合不变量（spec §6.3）：写入失败回滚只还原磁盘文件，不得破坏备份先行的产物——
 // 1. 回滚成功后 manifest 仍有 codex 条目，config.toml 回到用户原文；
