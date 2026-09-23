@@ -51,6 +51,7 @@ const (
 	AgentEventAIRename                = "ai.session.rename"     // server→agent: user renamed a conversation on the phone; the agent persists it into its durable rename cache
 	AgentEventAIRenameAck             = "ai.session.rename.ack" // agent→server: rename accepted/rejected; carries the agent-clock title_updated_at PhoneServer's latestOf guard compares against
 	AgentEventAIStop                  = "ai.stop"
+	AgentEventAITuiSync               = "ai.tui.sync" // server→agent: best-effort "phone turn landed" digest for an imported session; agent gates + injects into the live TUI's messaging UDS, no reply by design
 	AgentEventAIStatus                = "ai.status"
 	AgentEventAIError                 = "ai.error"
 	AgentEventAIApprovalRequest       = "ai.approval.request"
@@ -254,6 +255,7 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				{Type: AgentEventAIApprovalResponse, Required: []string{"type", "session_id", "approval_id", "decision"}, Optional: []string{"message_id", "scope", "raw", "delivery_id", "attempt"}, Emits: []string{AgentEventAIApprovalAck, AgentEventAIStatus, AgentEventAIError}},
 				{Type: AgentEventAIApprovalState, Required: []string{"type", "approval_id", "status"}, Optional: []string{"session_id"}},
 				{Type: AgentEventAIStop, Required: []string{"type", "session_id"}, Optional: []string{"run_id", "source_session_id"}, Emits: []string{AgentEventAIStatus}},
+				{Type: AgentEventAITuiSync, Required: []string{"type", "session_id", "source_session_id", "digest"}, Optional: []string{"project_path"}, Emits: nil},
 				{Type: AgentEventAIRename, Required: []string{"type", "session_id", "title"}, Optional: []string{"project_path", "provider", "tool", "source_session_id", "resume_session_id"}, Emits: []string{AgentEventAIRenameAck}},
 				{Type: AgentEventAISessionClose, Required: []string{"type", "session_id"}, Emits: []string{AgentEventAISessionClosed}},
 				{Type: AgentEventFileList, Required: []string{"type", "request_id", "project_path", "path"}, Optional: []string{"max_entries"}, Emits: []string{AgentEventFileListResult, AgentEventFileError}},
