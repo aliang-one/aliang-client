@@ -99,9 +99,9 @@ func StopUsageTrackerRuntime() {
 	usageRuntime.started = false
 }
 
-// usageFlushAllNow 在 WS 注册成功后补推未确认桶（registered 钩子调用）。
+// usageFlushDirtyNow 在 WS 注册成功后补推未确认桶（registered 钩子调用）。
 // dirty 集合即未确认全集：推送成功即清除，离线累积保持 dirty。
-func usageFlushAllNow(write func(interface{}) error) {
+func usageFlushDirtyNow(write func(interface{}) error) {
 	usageRuntime.mu.Lock()
 	reporter := usageRuntime.reporter
 	usageRuntime.mu.Unlock()

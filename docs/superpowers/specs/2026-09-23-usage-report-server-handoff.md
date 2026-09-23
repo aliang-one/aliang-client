@@ -48,6 +48,10 @@ token/请求数，经现有 agent WebSocket 通道以 `usage.report` 消息上�
 2. 校验 `records` 为数组；非数组按现有 `AgentEventError` 错误应答约定回复。
 3. 逐条 upsert 入表，键 `(device_id, hour_start, model)`，**整行覆盖**（快照语义）；
    单条失败跳过，不影响批内其他消息。
+   ⚠️ 耦合约定：单条失败必须**静默跳过**，不要对失败行单独回 `AgentEventError`——
+   客户端在 WS 写入成功时即清除该桶的待重推标记（fire-and-forget 语义），
+   逐行错误应答不会被客户端处理，反而会形成"已应答失败但客户端不再重推"的缺口。
+   批级错误（如 records 非数组）才回错误应答。
 4. 第一期不做任何查询接口。
 
 ## 4. 表结构

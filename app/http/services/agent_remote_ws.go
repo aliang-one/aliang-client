@@ -545,8 +545,8 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 		// harmless.
 		s.terminal.announceSessions(writeJSON)
 		s.ai.emitApprovalSync(writeJSON)
-		// 用量桶全量补推：重连后把历史未确认桶一次补齐（服务端 upsert 幂等）。
-		usageFlushAllNow(writeJSON)
+		// 用量桶补推：重连后把未确认桶（dirty 集）补齐（服务端 upsert 幂等）。
+		usageFlushDirtyNow(writeJSON)
 	case models.AgentEventHeartbeatAck:
 		s.setRemoteConnectionState(true, "online", "")
 		// Retry durable terminals while the socket remains healthy. A prior
