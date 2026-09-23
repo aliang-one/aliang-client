@@ -177,6 +177,11 @@ func (s *QuickSetupComboStore) Update(c *models.QuickSetupCombo) error {
 		"files_json":     filesJSON,
 	})
 	if result.Error != nil {
+		// 唯一冲突（software+name 复合索引）与 Create 同款映射，handler 按
+		// errors.Is(err, ErrComboNameTaken) 分类 409。
+		if isSQLiteConstraintError(result.Error) {
+			return fmt.Errorf("%w: %s/%s", ErrComboNameTaken, c.Software, c.Name)
+		}
 		return result.Error
 	}
 	if result.RowsAffected == 0 {

@@ -230,3 +230,111 @@ func TestComboService_SeedIfEmpty(t *testing.T) {
 		t.Fatalf("re-seed after delete-all broken: %+v", rows)
 	}
 }
+
+// TestComboService_Update 锁定部分更新契约（spec §6.2）：name/vars/files 可选（nil 不动）、
+// files code 必须在声明内、撞名/不存在分别上抛 ErrComboNameTaken/ErrComboNotFound。
+func TestComboService_Update(t *testing.T) {
+	svc, _ := stubComboServiceEnv(t)
+
+	view, err := svc.Create("codex", "combo-a", "blank", 0, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Create("codex", "combo-b", "blank", 0, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	newName := "combo-a-renamed"
+	newVars := map[string]string{"base_url": "http://127.0.0.1:56432/v1", "api_key": "sk-new", "model": "gpt-x"}
+	newFiles := []models.QuickSetupComboFile{{Code: "config", Content: "new template {{model}}"}}
+	updated, err := svc.Update(view.ID, &newName, newVars, newFiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Name != "combo-a-renamed" || updated.Variables["api_key"] != "sk-new" || updated.Files[0].Content != "new template {{model}}" {
+		t.Fatalf("update lost: %+v", updated)
+	}
+
+	// 部分更新：只改名，vars/files 不被清掉
+	partialName := "combo-a-renamed-2"
+	if _, err := svc.Update(view.ID, &partialName, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	after, err := svc.Update(view.ID, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Name != partialName || after.Variables["api_key"] != "sk-new" || after.Files[0].Content != "new template {{model}}" {
+		t.Fatalf("partial update clobbered: %+v", after)
+	}
+
+	// 撞名
+	dup := "combo-b"
+	if _, err := svc.Update(view.ID, &dup, nil, nil); !errors.Is(err, storage.ErrComboNameTaken) {
+		t.Fatalf("want ErrComboNameTaken, got %v", err)
+	}
+
+	// files code 越界
+	badFiles := []models.QuickSetupComboFile{{Code: "nope", Content: "x"}}
+	if _, err := svc.Update(view.ID, nil, nil, badFiles); err == nil || !strings.Contains(err.Error(), "file code is not valid") {
+		t.Fatalf("want file code error, got %v", err)
+	}
+
+	// 不存在 id
+	missingID := int64(999999)
+	if _, err := svc.Update(missingID, nil, nil, nil); !errors.Is(err, storage.ErrComboNotFound) {
+		t.Fatalf("want ErrComboNotFound, got %v", err)
+	}
+}
+
+func TestComboService_Delete(t *testing.T) {
+	svc, _ := stubComboServiceEnv(t)
+	view, err := svc.Create("codex", "to-delete", "blank", 0, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Delete(view.ID); err != nil {
+		t.Fatal(err)
+	}
+	list, err := svc.ListBySoftware("codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range list {
+		if c.ID == view.ID {
+			t.Fatal("deleted combo still listed")
+		}
+	}
+	if err := svc.Delete(view.ID); !errors.Is(err, storage.ErrComboNotFound) {
+		t.Fatalf("want ErrComboNotFound on re-delete, got %v", err)
+	}
+}
+
+func TestComboService_SetDefault(t *testing.T) {
+	svc, _ := stubComboServiceEnv(t)
+	if _, err := svc.Create("codex", "a", "blank", 0, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	b, err := svc.Create("codex", "b", "blank", 0, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.SetDefault(b.ID); err != nil {
+		t.Fatal(err)
+	}
+	list, err := svc.ListBySoftware("codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) == 0 || !list[0].IsDefault || list[0].ID != b.ID {
+		t.Fatalf("default not first/exclusive: %+v", list)
+	}
+	for _, c := range list {
+		if c.ID != b.ID && c.IsDefault {
+			t.Fatalf("old default still set: %+v", list)
+		}
+	}
+	if err := svc.SetDefault(999999); !errors.Is(err, storage.ErrComboNotFound) {
+		t.Fatalf("want ErrComboNotFound, got %v", err)
+	}
+}

@@ -170,3 +170,81 @@ func (s *QuickSetupComboService) ListBySoftware(software string) ([]models.Quick
 	}
 	return views, nil
 }
+
+// getComboRow 取组合行并把「不存在」翻译为 storage.ErrComboNotFound
+// （store 的 GetByID 原样上抛 gorm.ErrRecordNotFound，哨兵翻译是 service 层职责）。
+func (s *QuickSetupComboService) getComboRow(id int64) (*models.QuickSetupCombo, error) {
+	row, err := s.store.GetByID(id)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, fmt.Errorf("%w: id %d", storage.ErrComboNotFound, id)
+		}
+		return nil, err
+	}
+	return row, nil
+}
+
+// Update 部分更新组合（spec §6.2）：name/vars/files 均为可选（nil 不动）。
+// files 提供时其 code 必须都在该 software 声明内；撞名上抛 store 的 ErrComboNameTaken。
+func (s *QuickSetupComboService) Update(id int64, name *string, vars map[string]string, files []models.QuickSetupComboFile) (models.QuickSetupComboView, error) {
+	row, err := s.getComboRow(id)
+	if err != nil {
+		return models.QuickSetupComboView{}, err
+	}
+	if name != nil {
+		normalizedName := normalizeQuickSetupComboName(*name)
+		if normalizedName == "" {
+			return models.QuickSetupComboView{}, errors.New("combo name is required")
+		}
+		row.Name = normalizedName
+	}
+	if vars != nil {
+		row.Variables = vars
+	}
+	if files != nil {
+		declared, ok := findQuickSetupSoftware(row.Software)
+		if !ok {
+			return models.QuickSetupComboView{}, fmt.Errorf("quick setup software %q is not supported", row.Software)
+		}
+		valid := make(map[string]struct{}, len(declared.Files))
+		for _, fileDef := range declared.Files {
+			valid[fileDef.Code] = struct{}{}
+		}
+		for _, file := range files {
+			if _, ok := valid[file.Code]; !ok {
+				return models.QuickSetupComboView{}, fmt.Errorf("file code is not valid: %s", file.Code)
+			}
+		}
+		row.Files = files
+	}
+	if err := s.store.Update(row); err != nil {
+		return models.QuickSetupComboView{}, err
+	}
+	latest, err := s.getComboRow(id)
+	if err != nil {
+		return models.QuickSetupComboView{}, err
+	}
+	view, err := storage.ComboToView(latest)
+	if err != nil {
+		return models.QuickSetupComboView{}, err
+	}
+	return *view, nil
+}
+
+// Delete 删除组合（不存在 → storage.ErrComboNotFound）。
+func (s *QuickSetupComboService) Delete(id int64) error {
+	if _, err := s.getComboRow(id); err != nil {
+		return err
+	}
+	return s.store.Delete(id)
+}
+
+// SetDefault 查出组合取 software 再交 store 事务置默认
+// （每 software 至多一个 default；跨 software 防护由 store 保证）。
+func (s *QuickSetupComboService) SetDefault(id int64) error {
+	row, err := s.getComboRow(id)
+	if err != nil {
+		return err
+	}
+	return s.store.SetDefault(row.Software, id)
+}
