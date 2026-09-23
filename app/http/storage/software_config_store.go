@@ -72,7 +72,8 @@ func openSoftwareConfigDB(dbPath string) (*gorm.DB, error) {
 		return nil, fmt.Errorf("failed to resolve db path: %w", err)
 	}
 
-	db, err := gorm.Open(sqlite.Open(absPath), &gorm.Config{})
+	// 与 usage/共享库一致，写锁等待防 SQLITE_BUSY。
+	db, err := gorm.Open(sqlite.Open(absPath+"?_busy_timeout=5000"), &gorm.Config{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to open sqlite database: %w", err)
 	}

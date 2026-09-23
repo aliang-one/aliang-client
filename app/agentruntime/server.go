@@ -67,6 +67,7 @@ func StartLocalServer() error {
 	server = srv
 	running = true
 
+	// 用量采集循环不受本地 HTTP 服务器影响，此处刻意不联动停止（远程 WS 独立拨号）。
 	go func() {
 		err := srv.Serve(listener)
 		if err != nil && err != http.ErrServerClosed {

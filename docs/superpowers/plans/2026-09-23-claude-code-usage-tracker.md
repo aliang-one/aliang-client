@@ -1286,6 +1286,8 @@ git commit -m "新增:core.usage_tracker配置开关-默认开启可关闭"
 
 ### Task 6: 协议常量 + 接线（services/agentruntime/registered 钩子）
 
+> 执行修正：registered 钩子由 FlushAll 改为 FlushDirty——dirty 集合即未确认全集（推送成功即清除），全量重推在读循环内同步执行且 registered 可周期性重触发，属无界渐增风险；spec §5.2 的「补推未成功推送的桶」语义本就是 dirty 口径。
+
 **Files:**
 - Modify: `app/http/models/agent_protocol.go`（事件常量区，`AgentEventAIUsage = "ai.usage"` 同段附近 + ClientSends 注册表）
 - Create: `app/http/services/usage_tracker_wiring.go`

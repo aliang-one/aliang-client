@@ -70,7 +70,9 @@ func StartUsageTrackerRuntime() {
 				if h := time.Now().Local().Hour(); h != lastHour {
 					lastHour = h
 					if usageCollectionAllowed() {
-						_ = reporter.FlushDirty(currentRemoteWriterFunc())
+						if err := reporter.FlushDirty(currentRemoteWriterFunc()); err != nil {
+							logger.Debug("[USAGE] hour-boundary flush: " + err.Error())
+						}
 					}
 				}
 			case <-flushTicker.C:
@@ -97,7 +99,8 @@ func StopUsageTrackerRuntime() {
 	usageRuntime.started = false
 }
 
-// usageFlushAllNow 在 WS 注册成功后全量补推（registered 钩子调用）。
+// usageFlushAllNow 在 WS 注册成功后补推未确认桶（registered 钩子调用）。
+// dirty 集合即未确认全集：推送成功即清除，离线累积保持 dirty。
 func usageFlushAllNow(write func(interface{}) error) {
 	usageRuntime.mu.Lock()
 	reporter := usageRuntime.reporter
@@ -105,8 +108,8 @@ func usageFlushAllNow(write func(interface{}) error) {
 	if reporter == nil || !usageCollectionAllowed() {
 		return
 	}
-	if err := reporter.FlushAll(write); err != nil {
-		logger.Debug("[USAGE] flush all after register: " + err.Error())
+	if err := reporter.FlushDirty(write); err != nil {
+		logger.Debug("[USAGE] flush dirty after register: " + err.Error())
 	}
 }
 
