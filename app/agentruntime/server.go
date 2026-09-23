@@ -83,6 +83,7 @@ func StartLocalServer() error {
 
 	logger.Info(fmt.Sprintf("User agent runtime listening on http://%s", config.DefaultUserAgentAddr))
 	logger.Info(fmt.Sprintf("[AGENT-BOOT] local_server listening url=http://%s routes_registered=true", config.DefaultUserAgentAddr))
+	services.StartUsageTrackerRuntime()
 	logger.Info("[AGENT-BOOT] local_server awaiting session owner sync")
 	return nil
 }
@@ -101,6 +102,7 @@ func StopLocalServer() error {
 	if err := srv.Shutdown(ctx); err != nil {
 		return err
 	}
+	services.StopUsageTrackerRuntime()
 	return nil
 }
 

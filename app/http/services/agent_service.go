@@ -1093,6 +1093,13 @@ func (s *AgentService) isEnabledLocked() bool {
 	return s.state.Enabled && s.isBoundLocked()
 }
 
+// agentEnabled 线程安全读取 enable 态（供用量采集判定）。
+func (s *AgentService) agentEnabled() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.state.Enabled
+}
+
 func (s *AgentService) syncRuntimeDeviceStatusLocked() {
 	if s.state.Device == nil && s.state.Registered {
 		s.state.Device = &models.AgentDevice{

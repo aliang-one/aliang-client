@@ -67,6 +67,7 @@ const (
 	AgentEventAIFileChange            = "ai.file_change"          // agent→cloud: structured file edit (Write/Edit/MultiEdit / codex fileChange) with ±lines + diff
 	AgentEventAIThinking              = "ai.thinking"             // agent→cloud: streamed model reasoning (claude thinking_delta / codex reasoning) kept off the prose channel
 	AgentEventAIUsage                 = "ai.usage"                // agent→cloud: per-turn token usage surfaced from the provider
+	AgentEventUsageReport             = "usage.report"            // agent→cloud: Claude Code 本地会话小时级用量聚合（后台材料，勿与逐轮 ai.usage 混淆）
 	AgentEventAITask                  = "ai.task"                 // agent→cloud: task/todo list snapshot (claude TodoWrite)
 	AgentEventFileList                = "file.list"
 	AgentEventFileListResult          = "file.list.result"
@@ -201,6 +202,7 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				{Type: AgentEventAIFileChange, Required: []string{"type", "session_id", "message_id", "item_id", "run_id", "event_seq"}, Optional: []string{"path", "kind", "added", "removed", "diff", "changes"}},
 				{Type: AgentEventAIThinking, Required: []string{"type", "session_id", "message_id", "delta", "run_id", "event_seq"}},
 				{Type: AgentEventAIUsage, Required: []string{"type", "session_id", "run_id", "event_seq"}, Optional: []string{"message_id", "input_tokens", "output_tokens", "cache_read_tokens", "model"}},
+				{Type: AgentEventUsageReport, Required: []string{"type", "records"}},
 				{Type: AgentEventAITask, Required: []string{"type", "session_id", "message_id", "tasks", "run_id", "event_seq"}},
 				{Type: AgentEventAIStatus, Required: []string{"type", "session_id", "status", "run_id", "event_seq"}},
 				{Type: AgentEventAIError, Required: []string{"type", "session_id", "error", "run_id", "event_seq"}, Optional: []string{"message_id", "error_status", "error_type", "retry_attempt", "retry_max", "detail"}},
