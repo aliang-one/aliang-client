@@ -4,23 +4,30 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sync"
 
-	"gorm.io/driver/sqlite"
+	sqlite3 "github.com/mattn/go-sqlite3"
 	"gorm.io/gorm"
 
 	"aliang.one/nursorgate/app/http/models"
-	"aliang.one/nursorgate/common/cache"
 )
 
 // quickSetupComboMaxPerSoftware 限制单个 software 下的组合数量（防御性上限，spec §4）。
 const quickSetupComboMaxPerSoftware = 50
 
+// 组合存储哨兵错误：handler 层按 errors.Is 分类（404/400/409）。
 var (
-	quickSetupComboDBOnce sync.Once
-	quickSetupComboDB     *gorm.DB
-	quickSetupComboDBErr  error
+	ErrComboNotFound    = errors.New("quick setup combo not found")
+	ErrComboCapExceeded = errors.New("quick setup combo cap exceeded")
+	ErrComboNameTaken   = errors.New("quick setup combo name already exists")
 )
+
+// isSQLiteConstraintError 判断驱动错误是否 sqlite 约束冲突（如唯一索引 idx_combo_sw_name）。
+// 本仓 gorm.Config 未开 TranslateError，mattn/go-sqlite3 以值类型 sqlite3.Error 原样上抛；
+// sqlite3_errcode 默认返回主码 19（SQLITE_CONSTRAINT），天然覆盖 extended 2067（unique）。
+func isSQLiteConstraintError(err error) bool {
+	var sqliteErr sqlite3.Error
+	return errors.As(err, &sqliteErr) && sqliteErr.Code == sqlite3.ErrConstraint
+}
 
 type QuickSetupComboStore struct {
 	db      *gorm.DB
@@ -28,58 +35,16 @@ type QuickSetupComboStore struct {
 }
 
 func NewQuickSetupComboStore() *QuickSetupComboStore {
-	db, err := getQuickSetupComboDB()
+	db, err := getSoftwareConfigDB()
 	return &QuickSetupComboStore{db: db, initErr: err}
 }
 
 func NewQuickSetupComboStoreWithDBPath(dbPath string) (*QuickSetupComboStore, error) {
-	db, err := openQuickSetupComboDB(dbPath)
+	db, err := openSoftwareConfigDB(dbPath)
 	if err != nil {
 		return nil, err
 	}
 	return &QuickSetupComboStore{db: db}, nil
-}
-
-func getQuickSetupComboDB() (*gorm.DB, error) {
-	quickSetupComboDBOnce.Do(func() {
-		dbPath, err := cache.GetUnifiedDataDBPath()
-		if err != nil {
-			quickSetupComboDBErr = err
-			return
-		}
-		quickSetupComboDB, quickSetupComboDBErr = openQuickSetupComboDB(dbPath)
-	})
-	return quickSetupComboDB, quickSetupComboDBErr
-}
-
-// ResetQuickSetupComboStoreForTest clears the package singleton so tests can isolate db path resolution.
-func ResetQuickSetupComboStoreForTest() {
-	quickSetupComboDB = nil
-	quickSetupComboDBErr = nil
-	quickSetupComboDBOnce = sync.Once{}
-	cache.ResetCacheDirForTest()
-}
-
-func openQuickSetupComboDB(dbPath string) (*gorm.DB, error) {
-	if dbPath == "" {
-		return nil, errors.New("quick setup combo db path is empty")
-	}
-
-	absPath, err := cache.ExpandHomePath(dbPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to resolve db path: %w", err)
-	}
-
-	db, err := gorm.Open(sqlite.Open(absPath), &gorm.Config{})
-	if err != nil {
-		return nil, fmt.Errorf("failed to open sqlite database: %w", err)
-	}
-
-	if err := db.AutoMigrate(&models.QuickSetupCombo{}); err != nil {
-		return nil, fmt.Errorf("failed to migrate quick_setup_combos table: %w", err)
-	}
-
-	return db, nil
 }
 
 func (s *QuickSetupComboStore) ensureReady() error {
@@ -116,22 +81,28 @@ func marshalComboPayload(variables map[string]string, files []models.QuickSetupC
 }
 
 // hydrateCombo deserializes the JSON text columns into the runtime fields.
+// 瞬态字段已填（非 nil）则保留原值，否则从 JSON 列 Unmarshal——
+// 有意为空的 map/slice 同样被尊重，不会被 JSON 列数据覆盖。
 // 空列/nil 语义：Variables 空 map / Files 空 slice。
 func hydrateCombo(row *models.QuickSetupCombo) error {
-	variables := map[string]string{}
-	if row.VariablesJSON != "" {
-		if err := json.Unmarshal([]byte(row.VariablesJSON), &variables); err != nil {
-			return fmt.Errorf("failed to unmarshal combo variables: %w", err)
+	if row.Variables == nil {
+		variables := map[string]string{}
+		if row.VariablesJSON != "" {
+			if err := json.Unmarshal([]byte(row.VariablesJSON), &variables); err != nil {
+				return fmt.Errorf("failed to unmarshal combo variables: %w", err)
+			}
 		}
+		row.Variables = variables
 	}
-	files := []models.QuickSetupComboFile{}
-	if row.FilesJSON != "" {
-		if err := json.Unmarshal([]byte(row.FilesJSON), &files); err != nil {
-			return fmt.Errorf("failed to unmarshal combo files: %w", err)
+	if row.Files == nil {
+		files := []models.QuickSetupComboFile{}
+		if row.FilesJSON != "" {
+			if err := json.Unmarshal([]byte(row.FilesJSON), &files); err != nil {
+				return fmt.Errorf("failed to unmarshal combo files: %w", err)
+			}
 		}
+		row.Files = files
 	}
-	row.Variables = variables
-	row.Files = files
 	return nil
 }
 
@@ -154,16 +125,23 @@ func (s *QuickSetupComboStore) Create(c *models.QuickSetupCombo) error {
 		return err
 	}
 	if count >= quickSetupComboMaxPerSoftware {
-		return fmt.Errorf("combo cap exceeded for software %s", c.Software)
+		return fmt.Errorf("%w for software %s", ErrComboCapExceeded, c.Software)
 	}
 
 	variablesJSON, filesJSON, err := marshalComboPayload(c.Variables, c.Files)
 	if err != nil {
 		return err
 	}
+	// 注意：就地写调用方结构体的 JSON 列字段（Create/Update 共用此约定），入参会被修改。
 	c.VariablesJSON = variablesJSON
 	c.FilesJSON = filesJSON
-	return s.db.Create(c).Error
+	if err := s.db.Create(c).Error; err != nil {
+		if isSQLiteConstraintError(err) {
+			return fmt.Errorf("%w: %s/%s", ErrComboNameTaken, c.Software, c.Name)
+		}
+		return err
+	}
+	return nil
 }
 
 func (s *QuickSetupComboStore) Update(c *models.QuickSetupCombo) error {
@@ -176,21 +154,35 @@ func (s *QuickSetupComboStore) Update(c *models.QuickSetupCombo) error {
 	if c.ID == 0 {
 		return errors.New("combo id is required")
 	}
+	if c.Software == "" {
+		return errors.New("software is required")
+	}
+	if c.Name == "" {
+		return errors.New("name is required")
+	}
 
 	variablesJSON, filesJSON, err := marshalComboPayload(c.Variables, c.Files)
 	if err != nil {
 		return err
 	}
+	// 注意：与 Create 一致，就地写调用方结构体的 JSON 列字段，入参会被修改。
 	c.VariablesJSON = variablesJSON
 	c.FilesJSON = filesJSON
 	// 用 map 更新，防 gorm 跳过零值字段（如 is_default=false）。
-	return s.db.Model(&models.QuickSetupCombo{ID: c.ID}).Updates(map[string]interface{}{
+	result := s.db.Model(&models.QuickSetupCombo{ID: c.ID}).Updates(map[string]interface{}{
 		"software":       c.Software,
 		"name":           c.Name,
 		"is_default":     c.IsDefault,
 		"variables_json": variablesJSON,
 		"files_json":     filesJSON,
-	}).Error
+	})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return fmt.Errorf("%w: id %d in software %s", ErrComboNotFound, c.ID, c.Software)
+	}
+	return nil
 }
 
 func (s *QuickSetupComboStore) Delete(id int64) error {
@@ -246,7 +238,7 @@ func (s *QuickSetupComboStore) CountBySoftware(software string) (int64, error) {
 }
 
 // SetDefault 保证同一 software 下默认组合互斥：先清全部 default，再设指定 id；
-// 指定 id 不属于该 software 时 UPDATE 影响 0 行 → 报错。
+// 指定 id 不属于该 software 时 UPDATE 影响 0 行 → 报错（事务回滚，原 default 保留）。
 func (s *QuickSetupComboStore) SetDefault(software string, id int64) error {
 	if err := s.ensureReady(); err != nil {
 		return err
@@ -268,7 +260,7 @@ func (s *QuickSetupComboStore) SetDefault(software string, id int64) error {
 			return result.Error
 		}
 		if result.RowsAffected == 0 {
-			return fmt.Errorf("combo %d not found in software %s", id, software)
+			return fmt.Errorf("%w: id %d in software %s", ErrComboNotFound, id, software)
 		}
 		return nil
 	})
@@ -276,7 +268,8 @@ func (s *QuickSetupComboStore) SetDefault(software string, id int64) error {
 
 // ComboToView 将存储行转换为 API 视图（Variables/Files 已反序列化；
 // nil 语义：Variables 空 map / Files 空 slice）。
-// 行内运行时字段为空时回退到反序列化 JSON 文本列。
+// 瞬态字段非 nil 则直接采用（有意为空的 map/slice 得到尊重），
+// 仅 nil 时才回退反序列化 JSON 文本列——否则陈旧 JSON 会被回退路径泄漏进视图。
 func ComboToView(row *models.QuickSetupCombo) (*models.QuickSetupComboView, error) {
 	if row == nil {
 		return nil, errors.New("combo row is nil")
@@ -285,14 +278,14 @@ func ComboToView(row *models.QuickSetupCombo) (*models.QuickSetupComboView, erro
 	for k, v := range row.Variables {
 		variables[k] = v
 	}
-	if len(variables) == 0 && row.VariablesJSON != "" {
+	if row.Variables == nil && row.VariablesJSON != "" {
 		if err := json.Unmarshal([]byte(row.VariablesJSON), &variables); err != nil {
 			return nil, fmt.Errorf("failed to unmarshal combo variables: %w", err)
 		}
 	}
 	files := make([]models.QuickSetupComboFile, len(row.Files))
 	copy(files, row.Files)
-	if len(files) == 0 && row.FilesJSON != "" {
+	if row.Files == nil && row.FilesJSON != "" {
 		if err := json.Unmarshal([]byte(row.FilesJSON), &files); err != nil {
 			return nil, fmt.Errorf("failed to unmarshal combo files: %w", err)
 		}
