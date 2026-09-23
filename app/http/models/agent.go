@@ -76,6 +76,11 @@ type AgentTool struct {
 	Path        string `json:"path,omitempty"`
 	Available   bool   `json:"available"`
 	Description string `json:"description,omitempty"`
+	// Version 是该 CLI 的 x.y.z 版本(探测自 `--version`),空=探不到。
+	Version string `json:"version,omitempty"`
+	// Efforts 是该 CLI 支持的 effort 档清单(claude 运行时探针,codex/opencode
+	// 静态表),nil=未知——消费方对未知不设限制。
+	Efforts []string `json:"efforts,omitempty"`
 }
 
 type AgentHistoryRoot struct {
