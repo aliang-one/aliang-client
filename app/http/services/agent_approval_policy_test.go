@@ -993,3 +993,210 @@ func TestBuiltinPatternsCoverWindows(t *testing.T) {
 		}
 	}
 }
+
+// ---- Claude Code auto-memory carve-out ----
+
+// setAgentHomeForMemoryHookForTest pins the home directory the memory carve-out
+// resolves ~/.claude/projects against, and restores the real resolver on cleanup.
+func setAgentHomeForMemoryHookForTest(t *testing.T, home string) {
+	t.Helper()
+	previous := agentHomeForMemoryHook
+	agentHomeForMemoryHook = func() string { return home }
+	t.Cleanup(func() { agentHomeForMemoryHook = previous })
+}
+
+func memoryCarveoutToolInput(t *testing.T, values map[string]interface{}) json.RawMessage {
+	t.Helper()
+	raw, err := json.Marshal(values)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
+// setupMemoryCarveoutProject creates a home + project pair whose Claude Code
+// projects dir exists, pins the home resolver, and returns (home, project, memoryDir).
+func setupMemoryCarveoutProject(t *testing.T) (string, string, string) {
+	t.Helper()
+	home := t.TempDir()
+	project := filepath.Join(home, "workspace", "demo")
+	memoryDir := filepath.Join(home, ".claude", "projects", claudeProjectSlug(project), "memory")
+	if err := os.MkdirAll(memoryDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	setAgentHomeForMemoryHookForTest(t, home)
+	return home, project, memoryDir
+}
+
+func TestClaudeProjectSlugEncodesNonAlphanumerics(t *testing.T) {
+	cases := map[string]string{
+		`/Users/mac/MyProgram/GoProgram/nursor/alianggate`: `-Users-mac-MyProgram-GoProgram-nursor-alianggate`,
+		`/Users/mac/dev/my.app_v2`:                         `-Users-mac-dev-my-app-v2`,
+		`/home/li bei/ Proj`:                               `-home-li-bei--Proj`,
+	}
+	for input, want := range cases {
+		if got := claudeProjectSlug(input); got != want {
+			t.Fatalf("claudeProjectSlug(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
+func TestBoundaryCarveoutAutoApprovesProjectMemoryAccess(t *testing.T) {
+	setupAgentPolicyTestEnv(t)
+	svc := NewAgentService()
+	_, project, memoryDir := setupMemoryCarveoutProject(t)
+
+	// Write into the memory root: the canonical MEMORY.md save (file may not exist yet).
+	if d, id := svc.evaluateApprovalDecision("Write", memoryCarveoutToolInput(t, map[string]interface{}{
+		"file_path": filepath.Join(memoryDir, "MEMORY.md"),
+	}), project); d != decisionAutoApprove || id != claudeProjectMemoryRuleID {
+		t.Fatalf("memory write -> (%s, %s), want auto_approve/%s", d, id, claudeProjectMemoryRuleID)
+	}
+	// Writes into memory subdirectories are inside the carve-out too.
+	if d, id := svc.evaluateApprovalDecision("Write", memoryCarveoutToolInput(t, map[string]interface{}{
+		"file_path": filepath.Join(memoryDir, "user-prefs", "tone.md"),
+	}), project); d != decisionAutoApprove || id != claudeProjectMemoryRuleID {
+		t.Fatalf("memory subdir write -> (%s, %s), want auto_approve/%s", d, id, claudeProjectMemoryRuleID)
+	}
+	// Reading back one's own memory files is part of the memory workflow.
+	if d, id := svc.evaluateApprovalDecision("Read", memoryCarveoutToolInput(t, map[string]interface{}{
+		"file_path": filepath.Join(memoryDir, "MEMORY.md"),
+	}), project); d != decisionAutoApprove || id != claudeProjectMemoryRuleID {
+		t.Fatalf("memory read -> (%s, %s), want auto_approve/%s", d, id, claudeProjectMemoryRuleID)
+	}
+	// Glob scoped to the memory dir.
+	if d, id := svc.evaluateApprovalDecision("Glob", memoryCarveoutToolInput(t, map[string]interface{}{
+		"path": memoryDir,
+	}), project); d != decisionAutoApprove || id != claudeProjectMemoryRuleID {
+		t.Fatalf("memory glob -> (%s, %s), want auto_approve/%s", d, id, claudeProjectMemoryRuleID)
+	}
+	// A ~-prefixed path that resolves into the same memory dir is approved as well.
+	tildePath := "~/.claude/projects/" + claudeProjectSlug(project) + "/memory/MEMORY.md"
+	if d, id := svc.evaluateApprovalDecision("Write", memoryCarveoutToolInput(t, map[string]interface{}{
+		"file_path": tildePath,
+	}), project); d != decisionAutoApprove || id != claudeProjectMemoryRuleID {
+		t.Fatalf("tilde memory write -> (%s, %s), want auto_approve/%s", d, id, claudeProjectMemoryRuleID)
+	}
+}
+
+func TestBoundaryCarveoutStillDeniesOutsideMemoryTargets(t *testing.T) {
+	setupAgentPolicyTestEnv(t)
+	svc := NewAgentService()
+	home, project, memoryDir := setupMemoryCarveoutProject(t)
+
+	// Another project's memory dir stays denied.
+	otherProject := filepath.Join(home, "workspace", "other")
+	otherMemory := filepath.Join(home, ".claude", "projects", claudeProjectSlug(otherProject), "memory")
+	if err := os.MkdirAll(otherMemory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if d, id := svc.evaluateApprovalDecision("Write", memoryCarveoutToolInput(t, map[string]interface{}{
+		"file_path": filepath.Join(otherMemory, "MEMORY.md"),
+	}), project); d != decisionAutoDeny || id != "outside-project-path" {
+		t.Fatalf("other project memory write -> (%s, %s), want auto_deny/outside-project-path", d, id)
+	}
+	// .. traversal out of the memory dir must not ride the carve-out.
+	traversal := memoryDir + `/MEMORY.md/../../../workspace/demo/evil.md`
+	if d, id := svc.evaluateApprovalDecision("Write", memoryCarveoutToolInput(t, map[string]interface{}{
+		"file_path": traversal,
+	}), project); d != decisionAutoDeny || id != "outside-project-path" {
+		t.Fatalf("traversal write -> (%s, %s), want auto_deny/outside-project-path", d, id)
+	}
+	// The carve-out covers the memory dir only, not the rest of ~/.claude.
+	settingsPath := filepath.Join(home, ".claude", "settings.json")
+	if d, id := svc.evaluateApprovalDecision("Write", memoryCarveoutToolInput(t, map[string]interface{}{
+		"file_path": settingsPath,
+	}), project); d != decisionAutoDeny || id != "outside-project-path" {
+		t.Fatalf("settings write -> (%s, %s), want auto_deny/outside-project-path", d, id)
+	}
+	// A symlink inside memory pointing outside resolves to its target and is denied.
+	existing := filepath.Join(home, "workspace", "other")
+	if err := os.MkdirAll(existing, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(memoryDir, "escape")
+	if err := os.Symlink(existing, link); err == nil {
+		if d, id := svc.evaluateApprovalDecision("Write", memoryCarveoutToolInput(t, map[string]interface{}{
+			"file_path": filepath.Join(link, "evil.md"),
+		}), project); d != decisionAutoDeny || id != "outside-project-path" {
+			t.Fatalf("symlink escape write -> (%s, %s), want auto_deny/outside-project-path", d, id)
+		}
+	}
+	// A DANGLING symlink inside memory must not slip through lexical resolution either.
+	dangling := filepath.Join(memoryDir, "dangling")
+	if err := os.Symlink(filepath.Join(home, "nowhere"), dangling); err == nil {
+		if d, id := svc.evaluateApprovalDecision("Write", memoryCarveoutToolInput(t, map[string]interface{}{
+			"file_path": filepath.Join(dangling, "evil.md"),
+		}), project); d != decisionAutoDeny || id != "outside-project-path" {
+			t.Fatalf("dangling symlink write -> (%s, %s), want auto_deny/outside-project-path", d, id)
+		}
+	}
+	// Any symlink below the memory root voids the grant — even one pointing back
+	// inside (it could be retargeted between check and write).
+	inner := filepath.Join(memoryDir, "sub")
+	if err := os.MkdirAll(inner, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	innerLink := filepath.Join(memoryDir, "inner-link")
+	if err := os.Symlink(inner, innerLink); err == nil {
+		if d, id := svc.evaluateApprovalDecision("Write", memoryCarveoutToolInput(t, map[string]interface{}{
+			"file_path": filepath.Join(innerLink, "note.md"),
+		}), project); d != decisionAutoDeny || id != "outside-project-path" {
+			t.Fatalf("inner symlink write -> (%s, %s), want auto_deny/outside-project-path", d, id)
+		}
+	}
+	// Bash stays outside the carve-out: touching memory via shell still escalates.
+	bashInput, _ := json.Marshal(map[string]interface{}{"command": "cat " + filepath.Join(memoryDir, "MEMORY.md")})
+	if d, id := svc.evaluateApprovalDecision("Bash", bashInput, project); d != decisionRequireApproval || id != "outside-project-bash" {
+		t.Fatalf("memory bash -> (%s, %s), want require_approval/outside-project-bash", d, id)
+	}
+}
+
+func TestBoundaryCarveoutAcceptsTranscriptPathFallback(t *testing.T) {
+	setupAgentPolicyTestEnv(t)
+	svc := NewAgentService()
+	home := t.TempDir()
+	project := filepath.Join(home, "workspace", "demo.app")
+	// Simulate slug-encoding drift: the transcript lives under a differently
+	// named project dir than claudeProjectSlug computes.
+	transcriptDir := filepath.Join(home, ".claude", "projects", "-Users-mac-workspace-drifted")
+	if err := os.MkdirAll(filepath.Join(transcriptDir, "memory"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	setAgentHomeForMemoryHookForTest(t, home)
+
+	hookRaw := map[string]interface{}{
+		"transcript_path": filepath.Join(transcriptDir, "sess-1.jsonl"),
+	}
+	if d, id := svc.evaluateApprovalDecisionForHook("Write", memoryCarveoutToolInput(t, map[string]interface{}{
+		"file_path": filepath.Join(transcriptDir, "memory", "MEMORY.md"),
+	}), project, hookRaw); d != decisionAutoApprove || id != claudeProjectMemoryRuleID {
+		t.Fatalf("transcript memory write -> (%s, %s), want auto_approve/%s", d, id, claudeProjectMemoryRuleID)
+	}
+	// Without the hook payload the drifted dir must NOT be approved (computed slug only).
+	if d, id := svc.evaluateApprovalDecision("Write", memoryCarveoutToolInput(t, map[string]interface{}{
+		"file_path": filepath.Join(transcriptDir, "memory", "MEMORY.md"),
+	}), project); d != decisionAutoDeny || id != "outside-project-path" {
+		t.Fatalf("drifted memory write w/o hook -> (%s, %s), want auto_deny/outside-project-path", d, id)
+	}
+	// Untrustworthy transcript_path values are ignored: not under the projects root.
+	for _, bad := range []string{"/etc/passwd", "sess-1.jsonl", home} {
+		hookRaw := map[string]interface{}{"transcript_path": bad}
+		if d, id := svc.evaluateApprovalDecisionForHook("Write", memoryCarveoutToolInput(t, map[string]interface{}{
+			"file_path": filepath.Join(home, "somewhere-else", "MEMORY.md"),
+		}), project, hookRaw); d != decisionAutoDeny || id != "outside-project-path" {
+			t.Fatalf("bad transcript %q write -> (%s, %s), want auto_deny/outside-project-path", bad, d, id)
+		}
+	}
+	// With a transcript present, paths outside BOTH memory roots are still denied —
+	// including the project's own dir under the projects root (memory is the only grant).
+	hookRaw = map[string]interface{}{
+		"transcript_path": filepath.Join(transcriptDir, "sess-1.jsonl"),
+	}
+	sibling := filepath.Join(home, ".claude", "projects", claudeProjectSlug(project), "sessions-index.json")
+	if d, id := svc.evaluateApprovalDecisionForHook("Write", memoryCarveoutToolInput(t, map[string]interface{}{
+		"file_path": sibling,
+	}), project, hookRaw); d != decisionAutoDeny || id != "outside-project-path" {
+		t.Fatalf("projects-root sibling write -> (%s, %s), want auto_deny/outside-project-path", d, id)
+	}
+}
