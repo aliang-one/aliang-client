@@ -632,7 +632,7 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 	case models.AgentEventTerminalClose:
 		s.setRemoteConnectionState(true, "online", "")
 		s.terminal.close(msg, writeJSON)
-	case models.AgentEventAISessionCreate, models.AgentEventAIMessage, models.AgentEventAIRunStart, models.AgentEventAISteer, models.AgentEventAIApprovalResponse, models.AgentEventAIOptionResponse, models.AgentEventAIStop, models.AgentEventAISessionClose:
+	case models.AgentEventAISessionCreate, models.AgentEventAIMessage, models.AgentEventAIRunStart, models.AgentEventAISteer, models.AgentEventAIApprovalResponse, models.AgentEventAIOptionResponse, models.AgentEventAIStop, models.AgentEventAISessionClose, models.AgentEventAITuiSync:
 		s.setRemoteConnectionState(true, "online", "")
 		switch msgType {
 		case models.AgentEventAISessionCreate:
@@ -673,6 +673,8 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 			s.ai.optionResponse(msg, writeJSON)
 		case models.AgentEventAIStop:
 			s.ai.stop(msg, writeJSON)
+		case models.AgentEventAITuiSync:
+			s.ai.tuiSync(msg, writeJSON)
 		case models.AgentEventAISessionClose:
 			s.ai.close(msg, writeJSON)
 		}

@@ -10,7 +10,10 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"aliang.one/nursorgate/common/logger"
 )
 
 // loadClaudePeerToken reads the peer auth token for a pid from
@@ -40,6 +43,46 @@ func loadClaudePeerToken(home string, pid int) string {
 		return ""
 	}
 	return strings.TrimSpace(row.PeerToken)
+}
+
+// claudePeerKeyModTime returns the mtime of the pid's session key file — the
+// closest cheap proxy for when that TUI process started (CC writes the .key
+// at startup), used as the "TUI opened after the last transcript write?" gate
+// input. Zero time when absent/unknown (callers treat zero as "no evidence").
+func claudePeerKeyModTime(home string, pid int) time.Time {
+	if home = strings.TrimSpace(home); home == "" || pid <= 0 {
+		return time.Time{}
+	}
+	files, err := filepath.Glob(filepath.Join(home, ".claude", "sessions", strconv.Itoa(pid)+".*.key"))
+	if err != nil || len(files) == 0 {
+		return time.Time{}
+	}
+	info, err := os.Stat(files[0])
+	if err != nil {
+		return time.Time{}
+	}
+	return info.ModTime()
+}
+
+// ccPeerSessionJSONL resolves the transcript jsonl for a native session id
+// under ~/.claude/projects/*/ (session ids are unique across project dirs; if
+// a stale copy lingers in two, the newest mtime wins). Empty when absent.
+func ccPeerSessionJSONL(home, nativeSessionID string) string {
+	nativeSessionID = strings.TrimSpace(nativeSessionID)
+	if home = strings.TrimSpace(home); home == "" || nativeSessionID == "" {
+		return ""
+	}
+	files, err := filepath.Glob(filepath.Join(home, ".claude", "projects", "*", nativeSessionID+".jsonl"))
+	if err != nil || len(files) == 0 {
+		return ""
+	}
+	best, bestMod := files[0], time.Time{}
+	for _, f := range files {
+		if info, err := os.Stat(f); err == nil && (bestMod.IsZero() || info.ModTime().After(bestMod)) {
+			best, bestMod = f, info.ModTime()
+		}
+	}
+	return best
 }
 
 // 帧形态经 Task 0 spike 实测校准(计划附录 A):auth 帧字段名是 peerToken(mac 实测可省);
@@ -89,6 +132,12 @@ func ccPeerUserLine(content string) string {
 	return string(b)
 }
 
+// Injection timeouts, named so tests can shorten them if ever needed.
+const (
+	ccPeerDialTimeout  = 3 * time.Second
+	ccPeerWriteTimeout = 5 * time.Second
+)
+
 // ccPeerInject dials the inbox UDS and writes the auth (when known) + user
 // frames, fire-and-forget. Spike-verified (Task 0, plan 附录 A): a normal
 // delivery produces NO receipt frame on the injecting socket, so there is
@@ -96,12 +145,12 @@ func ccPeerUserLine(content string) string {
 // surface elsewhere: a busy TUI queues the message (delivered after its
 // turn); a held/denied inbound gate shows its approval prompt inside the TUI.
 func ccPeerInject(socketPath, token, digest string) error {
-	conn, err := net.DialTimeout("unix", socketPath, 3*time.Second)
+	conn, err := net.DialTimeout("unix", socketPath, ccPeerDialTimeout)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	_ = conn.SetDeadline(time.Now().Add(ccPeerWriteTimeout))
 	w := bufio.NewWriter(conn)
 	if token != "" {
 		if _, err := w.WriteString(ccPeerAuthLine(token) + "\n"); err != nil {
@@ -112,4 +161,134 @@ func ccPeerInject(socketPath, token, digest string) error {
 		return err
 	}
 	return w.Flush()
+}
+
+// TUI sync coalescing (spec §3): repeated ai.tui.sync for the same native
+// session inside the window collapse into ONE injection, newest digest wins.
+// Injection fires ccPeerSyncCoalesceWindow after the FIRST sync of a burst,
+// so the injected summary covers what landed during the window.
+var ccPeerSyncCoalesceWindow = 60 * time.Second
+
+const ccPeerSyncPendingCap = 256
+
+// ccPeerDialInject is swapped in tests to capture frames / control outcomes.
+var ccPeerDialInject = ccPeerInject
+
+// ccPeerSyncPendingEntry is one coalescing burst awaiting its window to fire.
+// (Named *Entry because the package-level map below owns the plain name.)
+type ccPeerSyncPendingEntry struct {
+	digest string
+	timer  *time.Timer
+}
+
+var (
+	ccPeerSyncMu      sync.Mutex
+	ccPeerSyncPending = map[string]*ccPeerSyncPendingEntry{}
+	// ccPeerSyncBaseline: jsonl size at the last successful injection per
+	// native session; absent = unknown (agent restart) → gate injects.
+	ccPeerSyncBaseline = map[string]int64{}
+)
+
+type ccPeerSyncGateInput struct {
+	RecordLive    bool
+	RecordStatus  string
+	SocketPath    string
+	BaselineSize  int64
+	BaselineKnown bool
+	JSONLSize     int64
+	JSONLModTime  time.Time
+	TUIStartProxy time.Time
+}
+
+// ccPeerSyncShouldInject is the pure gate (spec §4). All four spec gates:
+// ① live TUI record ② idle (busy → skip, NEVER interrupt) ③ socket capability
+// (messagingSocketPath present and unix-style — Windows named pipe is v2) plus
+// ④ transcript-moved evidence: jsonl written after the TUI started (key-file
+// mtime proxy; handles "TUI opened after the phone turn" — it already loaded
+// the history) and grown since our last successful injection (baseline unknown
+// after agent restart → inject; worst case one redundant notice).
+func ccPeerSyncShouldInject(in ccPeerSyncGateInput) bool {
+	if !in.RecordLive {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(in.RecordStatus), "idle") {
+		return false
+	}
+	if strings.TrimSpace(in.SocketPath) == "" || !strings.HasPrefix(in.SocketPath, "/") {
+		return false
+	}
+	if in.JSONLSize <= 0 {
+		return false
+	}
+	if !in.TUIStartProxy.IsZero() && in.JSONLModTime.Before(in.TUIStartProxy) {
+		return false
+	}
+	if in.BaselineKnown && in.JSONLSize <= in.BaselineSize {
+		return false
+	}
+	return true
+}
+
+// ccPeerSyncFire runs after the coalesce window: gate, inject, log. No reply
+// is written anywhere — the contract is best-effort with agent-log evidence.
+func ccPeerSyncFire(home, nativeSessionID string) {
+	ccPeerSyncMu.Lock()
+	pending := ccPeerSyncPending[nativeSessionID]
+	delete(ccPeerSyncPending, nativeSessionID)
+	baseline, baselineKnown := ccPeerSyncBaseline[nativeSessionID]
+	ccPeerSyncMu.Unlock()
+	if pending == nil || strings.TrimSpace(pending.digest) == "" {
+		return
+	}
+	record, live := liveClaudeTUIRecord(home, nativeSessionID)
+	socketPath, tuiStart := "", time.Time{}
+	if live {
+		socketPath = record.MessagingSocketPath
+		tuiStart = claudePeerKeyModTime(home, record.PID)
+	}
+	size, mod := int64(0), time.Time{}
+	if jsonl := ccPeerSessionJSONL(home, nativeSessionID); jsonl != "" {
+		if info, err := os.Stat(jsonl); err == nil {
+			size, mod = info.Size(), info.ModTime()
+		}
+	}
+	if !ccPeerSyncShouldInject(ccPeerSyncGateInput{
+		RecordLive: live, RecordStatus: record.Status, SocketPath: socketPath,
+		BaselineSize: baseline, BaselineKnown: baselineKnown,
+		JSONLSize: size, JSONLModTime: mod, TUIStartProxy: tuiStart,
+	}) {
+		logger.Info(fmt.Sprintf("ai.tui.sync: gate dropped home=%q native=%s live=%v status=%q socket=%q", home, nativeSessionID, live, strings.TrimSpace(record.Status), socketPath))
+		return
+	}
+	if err := ccPeerDialInject(socketPath, loadClaudePeerToken(home, record.PID), pending.digest); err != nil {
+		logger.Info(fmt.Sprintf("ai.tui.sync: inject failed home=%q native=%s error=%v", home, nativeSessionID, err))
+		return
+	}
+	ccPeerSyncMu.Lock()
+	ccPeerSyncBaseline[nativeSessionID] = size
+	ccPeerSyncMu.Unlock()
+	logger.Info(fmt.Sprintf("ai.tui.sync: frames written home=%q native=%s bytes=%d (no receipt by design, see plan 附录 A)", home, nativeSessionID, size))
+}
+
+// tuiSync handles ai.tui.sync (server → agent, best-effort, no reply).
+func (m *agentAIManager) tuiSync(msg map[string]interface{}, _ agentTerminalWriter) {
+	sourceSessionID := strings.TrimSpace(remoteString(msg, "source_session_id"))
+	digest := strings.TrimSpace(remoteString(msg, "digest"))
+	if sourceSessionID == "" || digest == "" {
+		return
+	}
+	home := externalTUIHome()
+	ccPeerSyncMu.Lock()
+	defer ccPeerSyncMu.Unlock()
+	if pending := ccPeerSyncPending[sourceSessionID]; pending != nil {
+		pending.digest = digest // coalesce: newest wins
+		return
+	}
+	if len(ccPeerSyncPending) >= ccPeerSyncPendingCap {
+		logger.Info("ai.tui.sync: pending cap reached, dropping")
+		return
+	}
+	entry := &ccPeerSyncPendingEntry{digest: digest}
+	entry.timer = time.AfterFunc(ccPeerSyncCoalesceWindow, func() { ccPeerSyncFire(home, sourceSessionID) })
+	ccPeerSyncPending[sourceSessionID] = entry
 }
