@@ -75,11 +75,6 @@ func toQuickSetupAPIKeys(apiKeys []auth.UserAPIKey, apiRoot string) []models.Qui
 	return items
 }
 
-func quickSetupAPIKeyHasPlainSecret(apiKey models.QuickSetupAPIKey) bool {
-	keyValue := strings.TrimSpace(apiKey.Key)
-	return keyValue != "" && !quickSetupLooksMaskedAPIKey(keyValue)
-}
-
 func quickSetupProviderBaseURL(provider string, apiRoot string) string {
 	root := strings.TrimRight(strings.TrimSpace(apiRoot), "/")
 	switch provider {
