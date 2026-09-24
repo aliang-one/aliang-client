@@ -5,10 +5,10 @@ go 1.25.5
 replace github.com/elazarl/goproxy v1.7.2 => ../goproxy
 
 require (
+	github.com/BurntSushi/toml v1.4.0
 	github.com/Microsoft/go-winio v0.6.2
 	github.com/UserExistsError/conpty v0.1.4
 	github.com/andydunstall/piko v0.10.0
-	github.com/BurntSushi/toml v1.4.0
 	github.com/creack/pty v1.1.24
 	github.com/docker/go-units v0.5.0
 	github.com/gen2brain/beeep v0.11.2
@@ -20,6 +20,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/schema v1.4.1
 	github.com/gorilla/websocket v1.5.3
+	github.com/mattn/go-sqlite3 v1.14.22
 	github.com/miekg/dns v1.1.68
 	github.com/oschwald/geoip2-golang v1.9.0
 	github.com/sagernet/gvisor v0.0.0-20250325023245-7a9c0f5725fb
@@ -80,7 +81,6 @@ require (
 	github.com/logrusorgru/aurora v2.0.3+incompatible // indirect
 	github.com/lufia/plan9stats v0.0.0-20211012122336-39d0f177ccd0 // indirect
 	github.com/mailru/easyjson v0.7.7 // indirect
-	github.com/mattn/go-sqlite3 v1.14.22 // indirect
 	github.com/mdlayher/netlink v1.7.3-0.20250113171957-fbb4dce95f42 // indirect
 	github.com/mdlayher/socket v0.5.1 // indirect
 	github.com/metacubex/tfo-go v0.0.0-20250921095601-b102db4216c0 // indirect

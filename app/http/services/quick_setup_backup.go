@@ -52,7 +52,7 @@ func quickSetupContractPath(homeDir, absPath string) string {
 }
 
 // quickSetupBackupFileName 备份文件名 = <sha256(contract 路径) 前 12 hex>-<basename>。
-// 同一 software 下两个同 basename 的不同路径（custom-* 允许嵌套子路径）必须不互相覆盖。
+// 同一 software 下若出现两个同 basename 的不同路径，哈希前缀保证备份互不覆盖。
 func quickSetupBackupFileName(contract, absPath string) string {
 	sum := sha256.Sum256([]byte(contract))
 	return hex.EncodeToString(sum[:])[:12] + "-" + filepath.Base(absPath)

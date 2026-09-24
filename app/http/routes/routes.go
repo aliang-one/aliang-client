@@ -247,11 +247,15 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	register("/api/dashboard/usage", h.Dashboard.HandleGetUsageRecords, http.MethodGet)
 	register("/api/health", h.Dashboard.HandleGetHealth, http.MethodGet)
 	register("/api/quick-setup/catalog", h.QuickSetup.HandleCatalog, http.MethodGet)
-	register("/api/quick-setup/models", h.QuickSetup.HandleModels, http.MethodPost)
-	register("/api/quick-setup/render", h.QuickSetup.HandleRender, http.MethodPost)
 	register("/api/quick-setup/apply", h.QuickSetup.HandleApply, http.MethodPost)
 	register("/api/quick-setup/config-state", h.QuickSetup.HandleConfigState, http.MethodGet)
 	register("/api/quick-setup/restore", h.QuickSetup.HandleRestore, http.MethodPost)
+	register("/api/quick-setup/combos", h.QuickSetup.HandleCombosCreate, http.MethodPost)
+	// {id} 路由用方法前缀模式注册：同一 pattern 双注册会让 ServeMux panic，
+	// 且 mux 层先行 405 错误方法（handler 内 method 检查保留作纵深防御）。
+	register("PUT /api/quick-setup/combos/{id}", h.QuickSetup.HandleCombosUpdate, http.MethodPut)
+	register("DELETE /api/quick-setup/combos/{id}", h.QuickSetup.HandleCombosDelete, http.MethodDelete)
+	register("/api/quick-setup/combos/{id}/default", h.QuickSetup.HandleCombosSetDefault, http.MethodPost)
 
 	// User agent routes (/api/agent/*)
 	register("/api/agent/status", h.Agent.HandleStatus, http.MethodGet)

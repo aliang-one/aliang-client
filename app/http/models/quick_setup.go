@@ -10,13 +10,22 @@ type QuickSetupSoftwareFile struct {
 	Description string `json:"description"`
 }
 
+// QuickSetupSoftwarePresets 是按 agent 下发的 base_url 预设：local 指向本机
+// HTTP 代理监听地址，public 指向推理网关公网入口。/v1 属变量值口径——
+// codex/opencode 的预设带 /v1，claude-code/pi 不带（客户端自行追加）。
+type QuickSetupSoftwarePresets struct {
+	BaseURLLocal  string `json:"base_url_local"`
+	BaseURLPublic string `json:"base_url_public"`
+}
+
 type QuickSetupSoftware struct {
-	Code               string                   `json:"code"`
-	Name               string                   `json:"name"`
-	Description        string                   `json:"description"`
-	SupportedProviders []string                 `json:"supported_providers"`
-	Files              []QuickSetupSoftwareFile `json:"files"`
-	Installed          bool                     `json:"installed"`
+	Code               string                     `json:"code"`
+	Name               string                     `json:"name"`
+	Description        string                     `json:"description"`
+	SupportedProviders []string                   `json:"supported_providers"`
+	Files              []QuickSetupSoftwareFile   `json:"files"`
+	Installed          bool                       `json:"installed"`
+	Presets            *QuickSetupSoftwarePresets `json:"presets,omitempty"`
 }
 
 type QuickSetupAPIKey struct {
@@ -32,65 +41,9 @@ type QuickSetupAPIKey struct {
 }
 
 type QuickSetupCatalogResponse struct {
-	Softwares []QuickSetupSoftware `json:"softwares"`
-	APIKeys   []QuickSetupAPIKey   `json:"api_keys"`
-}
-
-type QuickSetupModelsRequest struct {
-	KeyID int64 `json:"key_id"`
-}
-
-type QuickSetupModel struct {
-	ID      string `json:"id"`
-	Name    string `json:"name,omitempty"`
-	OwnedBy string `json:"owned_by,omitempty"`
-	Created int64  `json:"created,omitempty"`
-}
-
-type QuickSetupModelsResponse struct {
-	KeyID    int64             `json:"key_id"`
-	Provider string            `json:"provider"`
-	BaseURL  string            `json:"base_url"`
-	Models   []QuickSetupModel `json:"models"`
-}
-
-type QuickSetupRenderRequest struct {
-	Software string              `json:"software"`
-	Mode     string              `json:"mode,omitempty"`
-	KeyIDs   []int64             `json:"key_ids,omitempty"`
-	OpenCode *OpenCodeRenderSpec `json:"opencode,omitempty"`
-}
-
-type OpenCodeRenderSpec struct {
-	ModelKeyID    int64  `json:"model_key_id,omitempty"`
-	ModelProvider string `json:"model_provider,omitempty"`
-	Model         string `json:"model,omitempty"`
-	SmallModel    string `json:"small_model,omitempty"`
-}
-
-type QuickSetupPreviewFile struct {
-	Code           string `json:"code"`
-	Label          string `json:"label"`
-	Path           string `json:"path"`
-	Format         string `json:"format"`
-	Kind           string `json:"kind"`
-	Content        string `json:"content"`
-	MergedFromDisk bool   `json:"merged_from_disk,omitempty"`
-}
-
-type QuickSetupVariant struct {
-	Software string                  `json:"software"`
-	Label    string                  `json:"label"`
-	Provider string                  `json:"provider"`
-	APIKey   QuickSetupAPIKey        `json:"api_key"`
-	APIKeys  []QuickSetupAPIKey      `json:"api_keys,omitempty"`
-	Files    []QuickSetupPreviewFile `json:"files"`
-	Notes    []string                `json:"notes,omitempty"`
-}
-
-type QuickSetupRenderResponse struct {
-	Software string              `json:"software"`
-	Variants []QuickSetupVariant `json:"variants"`
+	Softwares []QuickSetupSoftware  `json:"softwares"`
+	APIKeys   []QuickSetupAPIKey    `json:"api_keys"`
+	Combos    []QuickSetupComboView `json:"combos"`
 }
 
 type QuickSetupApplyFile struct {
@@ -119,6 +72,26 @@ type QuickSetupBackupInfo struct {
 
 type QuickSetupRestoreRequest struct {
 	Software string `json:"software"`
+}
+
+// QuickSetupComboCreateRequest 是组合创建（三入口）请求体：
+// source ∈ blank/copy/disk；copy 入口消费 copy_from_id；
+// variables 仅 blank 入口消费（逐键覆盖预填值）。
+type QuickSetupComboCreateRequest struct {
+	Software   string                `json:"software"`
+	Name       string                `json:"name"`
+	Source     string                `json:"source"`
+	CopyFromID int64                 `json:"copy_from_id,omitempty"`
+	Variables  map[string]string     `json:"variables,omitempty"`
+	Files      []QuickSetupComboFile `json:"files,omitempty"`
+}
+
+// QuickSetupComboUpdateRequest 是组合保存（部分更新）请求体：
+// name/variables/files 均可选，nil/缺省表示不动该字段。
+type QuickSetupComboUpdateRequest struct {
+	Name      *string               `json:"name"`
+	Variables map[string]string     `json:"variables"`
+	Files     []QuickSetupComboFile `json:"files"`
 }
 
 type QuickSetupRestoreFailure struct {

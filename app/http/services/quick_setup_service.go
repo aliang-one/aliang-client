@@ -4,9 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 	"sync"
-	"time"
 
 	"aliang.one/nursorgate/app/http/models"
 	auth "aliang.one/nursorgate/processor/auth"
@@ -60,7 +58,6 @@ var ErrQuickSetupUnauthenticated = errors.New("authenticated session is required
 
 var quickSetupGetAPIKeysFn = auth.GetUserAPIKeys
 var quickSetupAuthorizationHeaderFn = auth.GetCurrentAuthorizationHeader
-var quickSetupModelsHTTPClient = &http.Client{Timeout: 12 * time.Second}
 var quickSetupWriteConfigFileFn = writeConfigFile
 var quickSetupTargetUserFn = resolveQuickSetupTargetUser
 var quickSetupAdjustOwnershipFn = adjustQuickSetupOwnership
@@ -97,61 +94,51 @@ func (s *QuickSetupService) Catalog() map[string]interface{} {
 	}
 	softwares := quickSetupSoftwares()
 	homeDir := quickSetupDetectionHomeFn()
+	comboSvc := NewQuickSetupComboService()
+	combos := make([]models.QuickSetupComboView, 0)
 	for i := range softwares {
-		softwares[i].Installed = detectQuickSetupInstalled(softwares[i].Code, homeDir)
+		code := softwares[i].Code
+		softwares[i].Installed = detectQuickSetupInstalled(code, homeDir)
+		// presets 按 software 下发（不依赖安装态，agent 装前展示也用到）。
+		local, public, err := quickSetupBaseURLPresets(code)
+		if err != nil {
+			return map[string]interface{}{
+				"status": "failed",
+				"error":  "quick_setup_catalog_failed",
+				"msg":    fmt.Sprintf("Failed to load quick setup catalog: %v", err),
+			}
+		}
+		softwares[i].Presets = &models.QuickSetupSoftwarePresets{
+			BaseURLLocal:  local,
+			BaseURLPublic: public,
+		}
+		if !softwares[i].Installed {
+			continue
+		}
+		// 已安装才种子默认组合并下发该 agent 的组合列表（幂等）。
+		if err := comboSvc.SeedIfEmpty(code); err != nil {
+			return map[string]interface{}{
+				"status": "failed",
+				"error":  "quick_setup_catalog_failed",
+				"msg":    fmt.Sprintf("Failed to load quick setup catalog: %v", err),
+			}
+		}
+		listed, err := comboSvc.ListBySoftware(code)
+		if err != nil {
+			return map[string]interface{}{
+				"status": "failed",
+				"error":  "quick_setup_catalog_failed",
+				"msg":    fmt.Sprintf("Failed to load quick setup catalog: %v", err),
+			}
+		}
+		combos = append(combos, listed...)
 	}
 	return map[string]interface{}{
 		"status": "success",
 		"data": models.QuickSetupCatalogResponse{
 			Softwares: softwares,
 			APIKeys:   toQuickSetupAPIKeys(apiKeys, baseRoot),
+			Combos:    combos,
 		},
 	}
-}
-
-func (s *QuickSetupService) Models(req models.QuickSetupModelsRequest) (*models.QuickSetupModelsResponse, error) {
-	if req.KeyID == 0 {
-		return nil, errors.New("key_id is required")
-	}
-
-	baseRoot, err := quickSetupBaseURL()
-	if err != nil {
-		return nil, err
-	}
-
-	apiKeys, err := quickSetupGetAPIKeysFn()
-	if err != nil {
-		if isSessionMissingError(err) {
-			return nil, ErrQuickSetupUnauthenticated
-		}
-		return nil, err
-	}
-
-	keys := toQuickSetupAPIKeys(apiKeys, baseRoot)
-	var selected *models.QuickSetupAPIKey
-	for i := range keys {
-		if keys[i].ID == req.KeyID {
-			selected = &keys[i]
-			break
-		}
-	}
-	if selected == nil {
-		return nil, fmt.Errorf("selected API key id is not valid: %d", req.KeyID)
-	}
-	if !quickSetupAPIKeyHasPlainSecret(*selected) {
-		return nil, errors.New("plaintext secret is required for selected API key")
-	}
-
-	modelListBaseURL := quickSetupModelListBaseURL(baseRoot)
-	modelsList, err := fetchQuickSetupModels(modelListBaseURL, selected.Key)
-	if err != nil {
-		return nil, err
-	}
-
-	return &models.QuickSetupModelsResponse{
-		KeyID:    selected.ID,
-		Provider: selected.Provider,
-		BaseURL:  modelListBaseURL,
-		Models:   modelsList,
-	}, nil
 }
