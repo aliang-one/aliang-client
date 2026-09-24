@@ -48,13 +48,14 @@ export function createQuickSetupModeState() {
   };
 }
 
-// 组合模板渲染：顺序替换三占位符；替换后的值不再扫描（值含 {{ 也不会二次展开）。
+// 组合模板渲染：单次正则替换（与 findUnresolvedPlaceholders/后端校验同一空白容忍
+// 语义）；替换回调的返回值不会被再次扫描——变量值含 {{...}} 也不会二次展开。
 export function renderComboContent(content, variables) {
-  let out = String(content ?? '');
-  for (const [key, value] of Object.entries(variables || {})) {
-    out = out.split(`{{${key}}}`).join(String(value ?? ''));
-  }
-  return out;
+  const vars = variables || {};
+  return String(content ?? '').replace(
+    /\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}/g,
+    (m, key) => (Object.prototype.hasOwnProperty.call(vars, key) ? String(vars[key] ?? '') : m),
+  );
 }
 
 // 列出内容中未替换的占位符名（如 ['api_key']）——apply 前端预检用。

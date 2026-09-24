@@ -95,6 +95,16 @@ describe('renderComboContent', () => {
 	it('handles missing variables by leaving placeholders', () => {
 		expect(renderComboContent('{{base_url}}', {})).toBe('{{base_url}}');
 	});
+	it('tolerates whitespace inside placeholders (same as validator)', () => {
+		expect(renderComboContent('{{ api_key }}', { api_key: 'sk-1' })).toBe('sk-1');
+	});
+	it('does not rescan replacement values even if they contain a known key token', () => {
+		const out = renderComboContent('u={{base_url}}', {
+			base_url: 'http://h/{{model}}',
+			model: 'gpt-x',
+		});
+		expect(out).toBe('u=http://h/{{model}}');
+	});
 	it('treats nullish input and values defensively', () => {
 		expect(renderComboContent(null)).toBe('');
 		expect(renderComboContent('{{api_key}}', { api_key: null })).toBe('');
