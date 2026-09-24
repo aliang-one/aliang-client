@@ -46,15 +46,19 @@ it('apply snapshot preserves manual edits without sharing mutable objects', () =
 	expect(snapshot[0].content).toBe('{"manual":true}');
 });
 
-it('QuickSetupModal save path does not rerender or expose built-in paths', () => {
+it('QuickSetupModal combo flow renders locally and prechecks variable values before apply', () => {
   const component = readFileSync(new URL('../components/QuickSetupModal.vue', import.meta.url), 'utf8');
-  const applyBlock = component.match(/async function applyCurrentVariant\(\) \{[\s\S]*?\n\}/)?.[0] || '';
+  const applyBlock = component.match(/async function applyCombo\(\) \{[\s\S]*?\n\}/)?.[0] || '';
 
 	expect(applyBlock).not.toBe('');
-	expect(applyBlock).not.toMatch(/renderSelectedKey\s*\(/);
-	expect(applyBlock).toMatch(/snapshotQuickSetupFiles\(editableFiles\.value\)/);
-	expect(component).toMatch(/:readonly="isBuiltInQuickSetupSoftware\(selectedSoftwareDef\)"/);
-	expect(component).toMatch(/renderGuard\.canCommit\(requestId, filesDirty\.value\)/);
+	// v2 服务端渲染链（render/models）必须零引用
+	expect(component).not.toMatch(/renderQuickSetup|getQuickSetupModels/);
+	// apply 内容 = renderComboContent(模板, 变量) 逐文件产物，路径/格式/种类取自 software 声明
+	expect(applyBlock).toMatch(/renderComboContent\(file\.content, vars\)/);
+	expect(applyBlock).toMatch(/declared\.default_path/);
+	// 值感知预检：渲染残留占位符 + 变量空值双重拦截
+	expect(component).toMatch(/findUnresolvedPlaceholders\(renderComboContent\(content, vars\)\)/);
+	expect(component).toMatch(/String\(vars\[name\] \?\? ''\)\.trim\(\)/);
 });
 
 describe('filterInstalledQuickSetupSoftwares', () => {

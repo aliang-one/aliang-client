@@ -45,29 +45,6 @@ export async function getQuickSetupCatalog() {
   };
 }
 
-export async function renderQuickSetup(software, keyIds = [], options = {}) {
-  const opts = options && typeof options === 'object' ? options : {};
-  return rawRequest('/api/quick-setup/render', {
-    method: 'POST',
-    body: JSON.stringify({
-      ...opts,
-      software,
-      key_ids: Array.isArray(keyIds) ? keyIds : [],
-      // 接入模式只接受 local/public，其余一律归一为 public（与后端缺省一致）。
-      mode: opts.mode === 'local' ? 'local' : 'public',
-    }),
-  });
-}
-
-export async function getQuickSetupModels(keyId) {
-  return rawRequest('/api/quick-setup/models', {
-    method: 'POST',
-    body: JSON.stringify({
-      key_id: Number(keyId) || 0,
-    }),
-  });
-}
-
 export async function applyQuickSetup(software, files) {
   return rawRequest('/api/quick-setup/apply', {
     method: 'POST',

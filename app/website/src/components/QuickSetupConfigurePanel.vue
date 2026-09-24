@@ -194,8 +194,7 @@ function presetChipClass(active) {
   ];
 }
 
-// 镜像 QuickSetupModal.looksMaskedAPIKey 的脱敏判断（*** / ... / …），
-// 与既有 apiKeyHasPlainSecret 口径一致
+// 脱敏判断（*** / ... / …），与后端密钥脱敏展示口径一致
 function looksMaskedAPIKey(value) {
   const text = String(value || '').trim();
   if (!text) return false;

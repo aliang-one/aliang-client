@@ -228,7 +228,7 @@ import { fetchConfigState, restoreConfig } from '../services/quickSetupApi';
 import { useI18n } from '../i18n';
 
 const props = defineProps({
-  // software code（如 "codex"）；custom 模板无磁盘托管语义，Modal 侧保证不渲染本组件
+  // software code（如 "codex"）；仅对检测到已安装的内置 agent 渲染本组件（Modal 侧保证）
   software: {
     type: String,
     required: true,
