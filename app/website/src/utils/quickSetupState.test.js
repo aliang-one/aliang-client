@@ -5,7 +5,9 @@ import {
   createLatestRenderGuard,
   createQuickSetupModeState,
   filterInstalledQuickSetupSoftwares,
+  findUnresolvedPlaceholders,
   isBuiltInQuickSetupSoftware,
+  renderComboContent,
   snapshotQuickSetupFiles,
 } from './quickSetupState.js';
 
@@ -78,5 +80,36 @@ describe('quickSetupMode', () => {
 		state.setMode('codex', 'local');
 		expect(state.modeOf('codex')).toBe('local');
 		expect(state.modeOf('opencode')).toBe('public');
+	});
+});
+
+describe('renderComboContent', () => {
+	it('replaces all three placeholders and does not rescan values', () => {
+		const out = renderComboContent('u={{base_url}} k={{api_key}} m={{model}}', {
+			base_url: 'http://127.0.0.1:56432/v1',
+			api_key: 'sk-{{x}}',
+			model: 'm',
+		});
+		expect(out).toBe('u=http://127.0.0.1:56432/v1 k=sk-{{x}} m=m');
+	});
+	it('handles missing variables by leaving placeholders', () => {
+		expect(renderComboContent('{{base_url}}', {})).toBe('{{base_url}}');
+	});
+	it('treats nullish input and values defensively', () => {
+		expect(renderComboContent(null)).toBe('');
+		expect(renderComboContent('{{api_key}}', { api_key: null })).toBe('');
+	});
+});
+
+describe('findUnresolvedPlaceholders', () => {
+	it('lists remaining placeholders with whitespace tolerance', () => {
+		expect(findUnresolvedPlaceholders('a {{api_key}} b {{ model }} c {{model}'))
+			.toEqual(['api_key', 'model']);
+	});
+	it('returns empty for clean content', () => {
+		expect(findUnresolvedPlaceholders('clean')).toEqual([]);
+	});
+	it('returns empty for nullish content', () => {
+		expect(findUnresolvedPlaceholders(null)).toEqual([]);
 	});
 });

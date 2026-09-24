@@ -90,3 +90,29 @@ export async function restoreConfig(software) {
     body: JSON.stringify({ software }),
   });
 }
+
+export async function createCombo(payload) {
+  return rawRequest('/api/quick-setup/combos', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function updateCombo(id, payload) {
+  return rawRequest(`/api/quick-setup/combos/${encodeURIComponent(id)}`, {
+    method: 'PUT',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function deleteCombo(id) {
+  return rawRequest(`/api/quick-setup/combos/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+  });
+}
+
+export async function setComboDefault(id) {
+  return rawRequest(`/api/quick-setup/combos/${encodeURIComponent(id)}/default`, {
+    method: 'POST',
+  });
+}

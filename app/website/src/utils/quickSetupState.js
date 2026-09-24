@@ -47,3 +47,23 @@ export function createQuickSetupModeState() {
     },
   };
 }
+
+// 组合模板渲染：顺序替换三占位符；替换后的值不再扫描（值含 {{ 也不会二次展开）。
+export function renderComboContent(content, variables) {
+  let out = String(content ?? '');
+  for (const [key, value] of Object.entries(variables || {})) {
+    out = out.split(`{{${key}}}`).join(String(value ?? ''));
+  }
+  return out;
+}
+
+// 列出内容中未替换的占位符名（如 ['api_key']）——apply 前端预检用。
+export function findUnresolvedPlaceholders(content) {
+  const re = /\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}/g;
+  const names = [];
+  let m;
+  while ((m = re.exec(String(content ?? ''))) !== null) {
+    names.push(m[1]);
+  }
+  return names;
+}
