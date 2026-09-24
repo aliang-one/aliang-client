@@ -714,6 +714,10 @@ function switchFileTab(code) {
     return;
   }
   activeFileCode.value = code;
+  // 恒复位编辑态：文件页签切换永远退出模板编辑视图（渲染视图是默认视图）。
+  // 无改动路径若不复位，上一文件的草稿会残留 textarea，点保存即把 A 的内容写进 B（跨文件模板覆盖）
+  templateEditing.value = false;
+  templateDraft.value = '';
 }
 
 // 有未保存草稿时提示放弃；确认后才允许离开（返回 false = 留在原地）
