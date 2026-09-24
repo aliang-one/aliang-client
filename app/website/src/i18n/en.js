@@ -94,6 +94,14 @@ export default {
   qs_restore_success: 'Original configuration restored',
   qs_restore_failed: 'Some files failed to restore',
   qs_state_restoring: 'Restoring…',
+  qs_cfg_title: 'Configuration parameters',
+  qs_cfg_base_url: 'Base URL',
+  qs_cfg_base_url_custom: 'Custom',
+  qs_cfg_api_key: 'API key',
+  qs_cfg_pick_key: 'Pick from key list',
+  qs_cfg_key_masked_hint: 'This key is masked — paste the full value manually.',
+  qs_cfg_model: 'Model',
+  qs_cfg_confirm: 'OK',
 
   // -- System Settings --
   sys_language: 'Language',

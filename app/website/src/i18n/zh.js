@@ -94,6 +94,14 @@ export default {
   qs_restore_success: '已恢复原始配置',
   qs_restore_failed: '部分文件恢复失败',
   qs_state_restoring: '正在恢复…',
+  qs_cfg_title: '配置参数',
+  qs_cfg_base_url: '接入地址',
+  qs_cfg_base_url_custom: '自定义',
+  qs_cfg_api_key: 'API 密钥',
+  qs_cfg_pick_key: '从密钥列表选',
+  qs_cfg_key_masked_hint: '该密钥为掩码显示，请手动填入完整值',
+  qs_cfg_model: '模型',
+  qs_cfg_confirm: '确定',
 
   // -- System Settings --
   sys_language: '语言',
