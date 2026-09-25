@@ -114,6 +114,20 @@ var (
 	// Explicitly set it to "0s" to disable the check. Blank/unparseable/negative
 	// values fall back to the default (see resolveEnvDurationAllowZero).
 	agentAINoProgressWindow = resolveEnvDurationAllowZero("ALIANG_AI_NO_PROGRESS_WINDOW", 60*time.Minute)
+
+	// agentAIToolWaitCeiling bounds how long a CONTIGUOUS tool/subagent wait
+	// (approval-pending time excluded) may run before the run is cancelled as
+	// hung. It is the only guard that fires during such a wait: the idle and
+	// no-progress watchdogs pause while a tool result is pending, and the
+	// ai.run.progress heartbeat keeps feeding the server-side stale-run
+	// sweeper — without this bound a hung subagent keeps the phone showing
+	// "running" until the hard ceiling. Env:
+	//
+	//	ALIANG_AI_TOOL_WAIT_CEILING  (time.ParseDuration, e.g. "90m"). Default 1h.
+	//
+	// Explicitly set it to "0s" to disable. Blank/unparseable/negative values
+	// fall back to the default (see resolveEnvDurationAllowZero).
+	agentAIToolWaitCeiling = resolveEnvDurationAllowZero("ALIANG_AI_TOOL_WAIT_CEILING", time.Hour)
 )
 
 // resolveEnvDuration parses a Go duration from the env key, returning def when
