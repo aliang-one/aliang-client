@@ -670,10 +670,14 @@ const appliedAtLabel = computed(() => {
 // 两列 diff 视图：行数组 + 变更行标记（右列从未应用时渲染空态，flags 不参与展示）
 const diffView = computed(() => {
   const rightContent = appliedContent.value;
-  const { leftFlags, rightFlags } = diffChangedLines(renderedContent.value, rightContent ?? '');
+  // 无快照（从未应用）时跳过变更标记：相对空基线全是「新增」会把左列整体染黄，误导。
+  const noBaseline = rightContent === null;
+  const { leftFlags, rightFlags } = noBaseline
+    ? { leftFlags: [], rightFlags: [] }
+    : diffChangedLines(renderedContent.value, rightContent ?? '');
   return {
     leftLines: String(renderedContent.value ?? '').split('\n'),
-    rightLines: rightContent === null ? [] : rightContent.split('\n'),
+    rightLines: noBaseline ? [] : rightContent.split('\n'),
     leftFlags,
     rightFlags,
   };
