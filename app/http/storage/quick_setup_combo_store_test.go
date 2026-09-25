@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"aliang.one/nursorgate/app/http/models"
@@ -187,6 +188,83 @@ func TestComboStore_ViewFallbackPath(t *testing.T) {
 	}
 	if len(view.Files) != 1 || view.Files[0].Code != "config" || view.Files == nil {
 		t.Fatalf("bare row must fall back to json column with non-nil slice: %+v", view.Files)
+	}
+}
+
+// TestComboStore_SetAppliedSnapshot 锁定「上次应用快照」两列的写读契约（v3.1）：
+// 写入后经 GetByID+ComboToView 反序列化还原 applied/applied_at；
+// 不存在 id → ErrComboNotFound；空串 JSON → Applied 为空 slice（非 nil）；
+// 快照写入不动模板列（files_json/variables_json）。
+func TestComboStore_SetAppliedSnapshot(t *testing.T) {
+	s := newTestComboStore(t)
+	c := sampleCombo("codex", "snap")
+	if err := s.Create(c); err != nil {
+		t.Fatal(err)
+	}
+
+	// 未应用过的组合：视图 Applied 为空 slice（非 nil）、applied_at 空串。
+	row, err := s.GetByID(c.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := ComboToView(row)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Applied == nil || len(view.Applied) != 0 {
+		t.Fatalf("fresh combo Applied = %+v, want empty non-nil slice", view.Applied)
+	}
+	if view.AppliedAt != "" {
+		t.Fatalf("fresh combo AppliedAt = %q, want empty", view.AppliedAt)
+	}
+
+	// 写入快照 → 经 hydrate + ComboToView 还原。
+	appliedAt := "2026-09-25T10:00:00+08:00"
+	if err := s.SetAppliedSnapshot(c.ID, `[{"code":"config","content":"a"},{"code":"auth","content":"b"}]`, appliedAt); err != nil {
+		t.Fatal(err)
+	}
+	row, err = s.GetByID(c.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err = ComboToView(row)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []models.QuickSetupComboFile{{Code: "config", Content: "a"}, {Code: "auth", Content: "b"}}
+	if !reflect.DeepEqual(view.Applied, want) {
+		t.Fatalf("applied mismatch:\ngot  %+v\nwant %+v", view.Applied, want)
+	}
+	if view.AppliedAt != appliedAt {
+		t.Fatalf("applied_at = %q, want %q", view.AppliedAt, appliedAt)
+	}
+	// 快照写入不得改动模板列。
+	if !reflect.DeepEqual(view.Files, c.Files) || !reflect.DeepEqual(view.Variables, c.Variables) {
+		t.Fatalf("snapshot write must not touch template columns: files=%+v vars=%+v", view.Files, view.Variables)
+	}
+
+	// 空串 JSON → Applied 为空 slice（非 nil），applied_at 仍更新。
+	if err := s.SetAppliedSnapshot(c.ID, "", "2026-09-25T11:00:00+08:00"); err != nil {
+		t.Fatal(err)
+	}
+	row, err = s.GetByID(c.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err = ComboToView(row)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Applied == nil || len(view.Applied) != 0 {
+		t.Fatalf("cleared Applied = %+v, want empty non-nil slice", view.Applied)
+	}
+	if view.AppliedAt != "2026-09-25T11:00:00+08:00" {
+		t.Fatalf("applied_at after clear = %q", view.AppliedAt)
+	}
+
+	// 不存在 id → ErrComboNotFound。
+	if err := s.SetAppliedSnapshot(999999, "[]", "t"); !errors.Is(err, ErrComboNotFound) {
+		t.Fatalf("missing id must return ErrComboNotFound, got %v", err)
 	}
 }
 

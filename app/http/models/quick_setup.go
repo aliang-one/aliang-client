@@ -56,6 +56,9 @@ type QuickSetupApplyFile struct {
 type QuickSetupApplyRequest struct {
 	Software string                `json:"software"`
 	Files    []QuickSetupApplyFile `json:"files"`
+	// ComboID 可选：指向本次 apply 来源的配置组合；>0 时 apply 全部成功后
+	// 由后端把实际写入内容持久化为该组合的「上次应用快照」。0 = 非组合路径。
+	ComboID int64 `json:"combo_id"`
 }
 
 type QuickSetupApplyResponse struct {

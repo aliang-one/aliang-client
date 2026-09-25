@@ -4,10 +4,13 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"aliang.one/nursorgate/app/http/models"
+	"aliang.one/nursorgate/app/http/storage"
 )
 
 // TestApplyWritesDiskBackup 锁定 Apply 备份先行契约（spec §6.3）：
@@ -251,4 +254,98 @@ func TestApplyRollbackPreservesOriginalBackupAndRestoreWorks(t *testing.T) {
 	if _, statErr := os.Stat(filepath.Join(home, ".codex", "auth.json")); !os.IsNotExist(statErr) {
 		t.Fatalf("created auth.json must be deleted on restore: %v", statErr)
 	}
+}
+
+// TestApplyPersistsAppliedSnapshot 锁定「上次应用快照」契约（v3.1）：
+//  1. combo_id 指向 software 匹配的组合 → apply 全部成功后组合行持久化本次
+//     实际写入的每文件 {code, content}（后端权威）+ RFC3339 applied_at；
+//  2. combo_id=0（非组合路径）→ 组合快照不动；
+//  3. combo_id 指向他 software 组合 → apply 仍成功但该组合快照不动（仅记日志）；
+//  4. combo_id 指向不存在的组合 → apply 仍成功（快照旁路失败不连坐）。
+func TestApplyPersistsAppliedSnapshot(t *testing.T) {
+	comboSvc, store := stubComboServiceEnv(t)
+
+	home := t.TempDir()
+	stubComboTargetHome(t, home)
+	previousAuth := quickSetupAuthorizationHeaderFn
+	quickSetupAuthorizationHeaderFn = func() string { return "Bearer test-access" }
+	t.Cleanup(func() { quickSetupAuthorizationHeaderFn = previousAuth })
+
+	codexCombo, err := comboSvc.Create("codex", "套餐A", "blank", 0, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claudeCombo, err := comboSvc.Create("claude-code", "别的软件", "blank", 0, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const configContent = "[model_providers.aliang]\nname = \"aliang gateway\"\nbase_url = \"https://api.example.com/v1\"\n"
+	applyFiles := func(authKey string) []models.QuickSetupApplyFile {
+		return []models.QuickSetupApplyFile{
+			{Path: "~/.codex/config.toml", Content: configContent, Kind: "file"},
+			{Path: "~/.codex/auth.json", Content: `{"OPENAI_API_KEY":"` + authKey + `"}`, Kind: "file"},
+		}
+	}
+	svc := NewQuickSetupService()
+
+	// 1. combo_id 匹配 → 快照 = 实际落盘内容。
+	req := models.QuickSetupApplyRequest{Software: "codex", ComboID: codexCombo.ID, Files: applyFiles("sk-snap")}
+	if _, err := svc.Apply(req); err != nil {
+		t.Fatal(err)
+	}
+	view := comboViewByID(t, store, codexCombo.ID)
+	wantApplied := []models.QuickSetupComboFile{
+		{Code: "config", Content: configContent},
+		{Code: "auth", Content: `{"OPENAI_API_KEY":"sk-snap"}`},
+	}
+	if !reflect.DeepEqual(view.Applied, wantApplied) {
+		t.Fatalf("applied mismatch:\ngot  %+v\nwant %+v", view.Applied, wantApplied)
+	}
+	if _, err := time.Parse(time.RFC3339, view.AppliedAt); err != nil {
+		t.Fatalf("applied_at = %q, want RFC3339 timestamp: %v", view.AppliedAt, err)
+	}
+
+	// 2. combo_id=0（非组合路径）→ 组合快照不动。
+	req0 := models.QuickSetupApplyRequest{Software: "codex", Files: applyFiles("sk-other")}
+	if _, err := svc.Apply(req0); err != nil {
+		t.Fatal(err)
+	}
+	after := comboViewByID(t, store, codexCombo.ID)
+	if !reflect.DeepEqual(after.Applied, wantApplied) || after.AppliedAt != view.AppliedAt {
+		t.Fatalf("combo_id=0 must not touch snapshot: applied=%+v applied_at=%q", after.Applied, after.AppliedAt)
+	}
+
+	// 3. software 不匹配 → apply 仍成功，claude-code 组合快照保持为空。
+	reqMismatch := models.QuickSetupApplyRequest{Software: "codex", ComboID: claudeCombo.ID, Files: applyFiles("sk-cross")}
+	if _, err := svc.Apply(reqMismatch); err != nil {
+		t.Fatal(err)
+	}
+	claudeView := comboViewByID(t, store, claudeCombo.ID)
+	if len(claudeView.Applied) != 0 || claudeView.AppliedAt != "" {
+		t.Fatalf("cross-software combo snapshot must stay empty: applied=%+v applied_at=%q", claudeView.Applied, claudeView.AppliedAt)
+	}
+	final := comboViewByID(t, store, codexCombo.ID)
+	if !reflect.DeepEqual(final.Applied, wantApplied) || final.AppliedAt != view.AppliedAt {
+		t.Fatalf("cross-software apply must not touch codex snapshot: applied=%+v applied_at=%q", final.Applied, final.AppliedAt)
+	}
+
+	// 4. combo_id 指向不存在的组合 → apply 仍成功。
+	reqMissing := models.QuickSetupApplyRequest{Software: "codex", ComboID: codexCombo.ID + 9999, Files: applyFiles("sk-missing")}
+	if _, err := svc.Apply(reqMissing); err != nil {
+		t.Fatalf("apply must succeed even when combo is missing: %v", err)
+	}
+}
+
+func comboViewByID(t *testing.T, store *storage.QuickSetupComboStore, id int64) models.QuickSetupComboView {
+	t.Helper()
+	row, err := store.GetByID(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := storage.ComboToView(row)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return *view
 }
