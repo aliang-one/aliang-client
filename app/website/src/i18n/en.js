@@ -51,6 +51,7 @@ export default {
   qs_state_error: 'Failed to load the current configuration.',
   qs_backup_original: 'Original backups',
   qs_backup_kind_original: 'Original',
+  qs_backup_bar: 'Original configuration backed up automatically',
   qs_restore: 'Restore original',
   qs_restore_confirm_title: 'Restore original configuration?',
   qs_restore_confirm_desc: 'The files below will be restored to their pre-Aliang state; files created by Aliang will be removed.',

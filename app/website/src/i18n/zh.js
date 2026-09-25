@@ -51,6 +51,7 @@ export default {
   qs_state_error: '读取当前配置失败。',
   qs_backup_original: '原始备份',
   qs_backup_kind_original: '原始',
+  qs_backup_bar: '原始配置已自动备份',
   qs_restore: '恢复原始配置',
   qs_restore_confirm_title: '恢复原始配置？',
   qs_restore_confirm_desc: '将把以下文件还原为你应用 Aliang 配置之前的状态；由 Aliang 新建的文件会被删除。',

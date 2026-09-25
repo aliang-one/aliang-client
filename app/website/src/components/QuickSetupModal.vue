@@ -238,7 +238,7 @@
 
             <!-- apply 前置校验提示：渲染后仍有占位符或变量值为空 -->
             <p
-              v-if="activeCombo && applyReadiness.missing.length && activeTab === 'edit' && !applyResult"
+              v-if="activeCombo && applyReadiness.missing.length && !applyResult"
               class="mt-2 text-[11px] leading-5 text-amber-600 dark:text-amber-400"
             >
               {{ t('qs_apply_unresolved', { vars: applyReadiness.missing.join(', ') }) }}
@@ -246,7 +246,7 @@
 
             <!-- 文件 tabs：该组合的 files.code（声明 label 优先） -->
             <div
-              v-if="activeCombo && activeTab === 'edit' && !applyResult && !configureOpen"
+              v-if="activeCombo && !applyResult && !configureOpen"
               class="mt-3 flex flex-wrap gap-2"
             >
               <button
@@ -265,46 +265,7 @@
               </button>
             </div>
 
-            <!-- 页签：配置预览 | 当前配置 -->
-            <div class="mb-4 mt-3">
-              <div class="inline-flex items-center gap-1 rounded-xl border border-slate-200 bg-slate-50 p-1 dark:border-slate-700 dark:bg-slate-900/60">
-                <button
-                  type="button"
-                  :aria-pressed="activeTab === 'edit'"
-                  :class="[
-                    'min-h-8 rounded-lg px-3.5 text-xs font-semibold transition',
-                    activeTab === 'edit'
-                      ? 'bg-white text-primary shadow-sm dark:bg-slate-800 dark:text-primary'
-                      : 'text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200',
-                  ]"
-                  @click="activeTab = 'edit'"
-                >
-                  {{ t('qs_tab_preview') }}
-                </button>
-                <button
-                  type="button"
-                  :aria-pressed="activeTab === 'state'"
-                  :class="[
-                    'min-h-8 rounded-lg px-3.5 text-xs font-semibold transition',
-                    activeTab === 'state'
-                      ? 'bg-white text-primary shadow-sm dark:bg-slate-800 dark:text-primary'
-                      : 'text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200',
-                  ]"
-                  @click="activeTab = 'state'"
-                >
-                  {{ t('qs_tab_backup') }}
-                </button>
-              </div>
-            </div>
-
-            <!-- 当前配置页签：磁盘实况查看器 + 一键恢复 -->
-            <QuickSetupStatePanel
-              v-if="activeTab === 'state'"
-              :software="selectedSoftware"
-              @confirm-open-change="nestedDialogOpen = $event"
-            />
-
-            <template v-else>
+            <template>
               <!-- 应用结果视图：apply 成功后替换组合内容区；返回编辑回到渲染视图 -->
               <QuickSetupResultPanel
                 v-if="applyResult"
@@ -313,7 +274,7 @@
                 :backups="applyResult.backups"
                 :files="applyResult.files"
                 @back="applyResult = null"
-                @view-current="activeTab = 'state'"
+                @view-current="applyResult = null"
               />
 
               <!-- configure：变量表单（确定 = PUT 保存，渲染视图即时刷新） -->
@@ -493,6 +454,30 @@
                     </div>
                   </div>
                 </div>
+
+                <!-- 备份语境化：有自动备份（=至少成功应用过一次且当时有原配置）才出现的纤细恢复栏 -->
+                <div
+                  v-if="liveBackups.length"
+                  class="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-slate-200 bg-slate-50/70 px-3.5 py-2 dark:border-slate-800 dark:bg-slate-900/50"
+                >
+                  <p class="flex min-w-0 items-center gap-1.5 text-[11px] leading-5 text-slate-500 dark:text-slate-400">
+                    <span class="material-symbols-outlined text-base text-slate-400" aria-hidden="true">history</span>
+                    {{ t('qs_backup_bar') }}
+                    <span
+                      v-if="latestBackupLabel"
+                      class="font-mono text-[10px] text-slate-400 dark:text-slate-500"
+                    >{{ latestBackupLabel }}</span>
+                  </p>
+                  <button
+                    type="button"
+                    class="inline-flex min-h-7 shrink-0 items-center justify-center gap-1 rounded-lg border border-rose-200 px-2.5 text-[11px] font-semibold text-rose-600 transition hover:bg-rose-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-rose-900/50 dark:text-rose-400 dark:hover:bg-rose-950/30"
+                    :disabled="restoring"
+                    @click="openRestoreConfirm"
+                  >
+                    <span class="material-symbols-outlined text-sm" aria-hidden="true">restore</span>
+                    {{ t('qs_restore') }}
+                  </button>
+                </div>
               </div>
 
               <!-- 该 agent 暂无组合（理论上会被服务端种子兜底） -->
@@ -625,6 +610,57 @@
         </div>
       </div>
     </div>
+
+    <!-- 恢复原始配置确认弹窗（自 StatePanel 迁入，与 comboOverlayOpen 并联屏蔽外层 Esc） -->
+    <div
+      v-if="restoreConfirmOpen"
+      class="fixed inset-0 z-[140] flex items-center justify-center p-4"
+      role="dialog"
+      aria-modal="true"
+      :aria-label="t('qs_restore_confirm_title')"
+    >
+      <div class="absolute inset-0 bg-slate-900/45 backdrop-blur-sm" @click="closeRestoreConfirm"></div>
+      <div class="relative z-10 w-full max-w-md rounded-2xl border border-slate-200 bg-white p-5 shadow-2xl dark:border-slate-800 dark:bg-slate-900">
+        <h4 class="text-base font-semibold text-slate-900 dark:text-white">{{ t('qs_restore_confirm_title') }}</h4>
+        <p class="mt-2 text-[12px] leading-5 text-slate-500 dark:text-slate-400">{{ t('qs_restore_confirm_desc') }}</p>
+
+        <div v-if="restoreTargets.restore.length" class="mt-3">
+          <p class="text-[11px] font-semibold uppercase tracking-wide text-slate-500">{{ t('qs_restore_will_restore') }}</p>
+          <ul class="mt-1 space-y-1">
+            <li v-for="path in restoreTargets.restore" :key="`restore-${path}`">
+              <code class="block truncate font-mono text-[11px] text-slate-700 dark:text-slate-200" :title="path">{{ path }}</code>
+            </li>
+          </ul>
+        </div>
+        <div v-if="restoreTargets.remove.length" class="mt-3">
+          <p class="text-[11px] font-semibold uppercase tracking-wide text-slate-500">{{ t('qs_restore_will_delete') }}</p>
+          <ul class="mt-1 space-y-1">
+            <li v-for="path in restoreTargets.remove" :key="`remove-${path}`">
+              <code class="block truncate font-mono text-[11px] text-slate-700 dark:text-slate-200" :title="path">{{ path }}</code>
+            </li>
+          </ul>
+        </div>
+
+        <div class="mt-5 flex items-center justify-end gap-2">
+          <button
+            type="button"
+            class="inline-flex min-h-9 items-center justify-center rounded-lg border border-slate-200 px-4 text-xs font-semibold text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+            :disabled="restoring"
+            @click="closeRestoreConfirm"
+          >
+            {{ t('qs_cancel') }}
+          </button>
+          <button
+            type="button"
+            class="inline-flex min-h-9 items-center justify-center rounded-lg bg-rose-600 px-4 text-xs font-semibold text-white transition hover:bg-rose-500 disabled:cursor-not-allowed disabled:opacity-50"
+            :disabled="restoring"
+            @click="confirmRestore"
+          >
+            {{ restoring ? t('qs_state_restoring') : t('qs_restore_confirm') }}
+          </button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -642,7 +678,6 @@ import {
 import { useI18n } from '../i18n';
 import QuickSetupConfigurePanel from './QuickSetupConfigurePanel.vue';
 import QuickSetupResultPanel from './QuickSetupResultPanel.vue';
-import QuickSetupStatePanel from './QuickSetupStatePanel.vue';
 import { diffRowsAligned, findUnresolvedPlaceholders, renderComboContent } from '../utils/quickSetupState';
 
 const { t } = useI18n();
@@ -661,11 +696,6 @@ const comboSaving = ref(false);
 const catalogStatus = ref('idle');
 const catalogMessage = ref('');
 const statusMessage = ref('');
-// 右侧面板页签：'edit'=组合内容（渲染/模板/configure/结果视图）| 'state'=当前配置（磁盘实况）。
-// 切 software / 选组合时重置为 edit。
-const activeTab = ref('edit');
-// StatePanel 嵌套确认弹窗打开或恢复进行中时为 true：外层 Esc 关闭被屏蔽，避免绕过确认守卫
-const nestedDialogOpen = ref(false);
 const softwares = ref([]);
 const apiKeys = ref([]);
 const selectedSoftware = ref('');
@@ -702,14 +732,20 @@ const liveFiles = ref([]);
 const liveFilesLoading = ref(false);
 // config-state 拉取失败标记：右列空态显示错误文案而非「尚未生成」
 const liveFilesFailed = ref(false);
+// 备份语境化：config-state 的 backups（非空 = 至少成功应用过一次且当时有原配置）
+const liveBackups = ref([]);
+// 恢复原始配置（自 StatePanel 迁入）：确认弹窗 + 进行中标记
+const restoreConfirmOpen = ref(false);
+const restoring = ref(false);
 let liveFilesSeq = 0;
 let liveFilesRequested = '';
 
-// 取当前 agent 的在用配置；序号守卫拦截快速连切 agent 时的过期响应（镜像 StatePanel 模式）
+// 取当前 agent 的在用配置与备份清单；序号守卫拦截快速连切 agent 时的过期响应
 async function refreshLiveFiles() {
   const software = selectedSoftware.value;
   if (!software) {
     liveFiles.value = [];
+    liveBackups.value = [];
     liveFilesFailed.value = false;
     return;
   }
@@ -727,17 +763,53 @@ async function refreshLiveFiles() {
       return;
     }
     liveFiles.value = Array.isArray(result?.files) ? result.files : [];
+    liveBackups.value = Array.isArray(result?.backups) ? result.backups : [];
   } catch {
     if (seq !== liveFilesSeq) {
       return;
     }
     // 失败清空（旧数据可能属于上一个 agent，展示即误导）；刷新按钮可重试
     liveFiles.value = [];
+    liveBackups.value = [];
     liveFilesFailed.value = true;
   } finally {
     if (seq === liveFilesSeq) {
       liveFilesLoading.value = false;
     }
+  }
+}
+
+// 恢复确认弹窗（自 StatePanel 迁入）
+function openRestoreConfirm() {
+  restoreConfirmOpen.value = true;
+}
+function closeRestoreConfirm() {
+  if (!restoring.value) {
+    restoreConfirmOpen.value = false;
+  }
+}
+// 确认恢复：restoreConfig 成功后重取 config-state（备份栏随备份清空而消失）
+async function confirmRestore() {
+  if (restoring.value || !selectedSoftware.value) {
+    return;
+  }
+  restoring.value = true;
+  try {
+    // 单文件失败不抛错（HTTP 200 + failed 数组）；整体失败（如 manifest 损坏）才走 catch
+    const result = await restoreConfig(selectedSoftware.value);
+    restoreConfirmOpen.value = false;
+    const failed = Array.isArray(result?.failed) ? result.failed : [];
+    if (failed.length) {
+      statusMessage.value = `${t('qs_restore_failed')}：${failed.map((item) => `${item.path}: ${item.error}`).join('；')}`;
+    } else {
+      statusMessage.value = t('qs_restore_success');
+    }
+    await refreshLiveFiles();
+  } catch (error) {
+    restoreConfirmOpen.value = false;
+    statusMessage.value = (error instanceof Error && error.message) || t('qs_restore_failed');
+  } finally {
+    restoring.value = false;
   }
 }
 
@@ -797,6 +869,36 @@ const liveModifiedLabel = computed(() => {
   }
   const date = new Date(raw);
   return Number.isNaN(date.getTime()) ? raw : date.toLocaleString();
+});
+// 备份语境化：最近一次自动备份时间（备份栏展示用）
+const latestBackupLabel = computed(() => {
+  let latest = 0;
+  for (const backup of liveBackups.value) {
+    const time = new Date(String(backup?.backed_up_at || '')).getTime();
+    if (!Number.isNaN(time) && time > latest) {
+      latest = time;
+    }
+  }
+  return latest ? new Date(latest).toLocaleString() : '';
+});
+// 恢复目标清单（自 StatePanel 迁入）：按 original_path 去重；
+// manifest 里 backup_path 为空 ⟺ existed_before=false（由 Aliang 新建，恢复时删除）
+const restoreTargets = computed(() => {
+  const restore = [];
+  const remove = [];
+  const seen = new Set();
+  for (const backup of liveBackups.value) {
+    if (!backup?.original_path || seen.has(backup.original_path)) {
+      continue;
+    }
+    seen.add(backup.original_path);
+    if (backup.backup_path) {
+      restore.push(backup.original_path);
+    } else {
+      remove.push(backup.original_path);
+    }
+  }
+  return { restore, remove };
 });
 // git 风格 split diff：左=在用配置（旧），右=有效预览（新，含手动编辑）。
 // 无基线（在用文件未生成/读不到）→ null：相对空基线「全是新增」的染色只会误导，走空态展示。
@@ -893,9 +995,14 @@ const createReady = computed(() => {
   }
   return true;
 });
-// 组合自身的嵌套弹窗（新建/删除确认）占用期：与 StatePanel 的 nestedDialogOpen 并联，
-// 任一占用都屏蔽外层 Esc（两个来源互不覆盖）
-const comboOverlayOpen = computed(() => comboCreating.value || deleteConfirmOpen.value);
+// 模态内嵌套弹窗（新建/删除确认、恢复原始配置确认）或恢复进行中的占用期：
+// 任一占用都屏蔽外层 Esc 关闭，避免绕过确认守卫
+const comboOverlayOpen = computed(() => (
+  comboCreating.value
+  || deleteConfirmOpen.value
+  || restoreConfirmOpen.value
+  || restoring.value
+));
 
 function selectSoftware(code) {
   if (selectedSoftware.value === code) {
@@ -926,7 +1033,6 @@ function selectCombo(combo) {
   previewEditing.value = false;
   previewDraft.value = '';
   applyResult.value = null;
-  activeTab.value = 'edit';
   comboMenuOpen.value = false;
   renameOpen.value = false;
 }
@@ -938,6 +1044,7 @@ function pickDefaultCombo() {
   configureOpen.value = false;
   comboCreating.value = false;
   deleteConfirmOpen.value = false;
+  restoreConfirmOpen.value = false;
   createError.value = '';
   deleteError.value = '';
   statusMessage.value = '';
@@ -1356,8 +1463,6 @@ async function applyCombo() {
     const writtenCount = Array.isArray(result?.written) ? result.written.length : 0;
     if (writtenCount > 0) {
       statusMessage.value = '';
-      // 结果页渲染在 edit 页签内；apply 入口在 header，防御性确保结果视图可见
-      activeTab.value = 'edit';
       // 编辑内容已落盘：清空全部预览编辑，避免残留「预览已手动修改」假标记
       previewEdits.value = {};
       previewEditing.value = false;
@@ -1387,8 +1492,8 @@ function errorText(error) {
 }
 
 function onModalKeydown(event) {
-  // 嵌套确认弹窗占用期（StatePanel 恢复守卫 / 组合新建与删除确认）不响应外层 Esc
-  if (nestedDialogOpen.value || comboOverlayOpen.value) {
+  // 嵌套确认弹窗占用期（恢复守卫 / 组合新建与删除确认）不响应外层 Esc
+  if (comboOverlayOpen.value) {
     return;
   }
   if (event.key === 'Escape' && props.open) {
@@ -1433,8 +1538,8 @@ watch(
   () => props.open,
   async (value) => {
     if (!value) {
-      // 双保险：StatePanel 卸载时会 emit false，这里确保弹窗关闭瞬间状态不残留
-      nestedDialogOpen.value = false;
+      // 双保险：弹窗关闭瞬间嵌套弹窗/恢复流程状态不残留
+      restoreConfirmOpen.value = false;
       return;
     }
     await loadCatalog();
