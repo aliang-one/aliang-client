@@ -393,22 +393,19 @@
                 </div>
 
                 <div class="mt-2 overflow-hidden rounded-2xl border border-slate-200 dark:border-slate-700">
-                  <!-- 列头：左=在用配置（含修改时间），右=渲染预览 -->
-                  <div class="grid grid-cols-[2.5rem_1fr_2.5rem_1fr] border-b border-slate-200 bg-slate-100/70 text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-400">
-                    <div class="col-span-2 border-r border-slate-200 px-3 py-2 dark:border-slate-700">
-                      {{ t('qs_diff_left') }}
-                      <span
-                        v-if="liveModifiedLabel"
-                        class="ml-1 font-mono text-[10px] font-normal normal-case tracking-normal text-slate-400 dark:text-slate-500"
-                      >{{ liveModifiedLabel }}</span>
-                    </div>
-                    <div class="col-span-2 px-3 py-2">
-                      {{ t('qs_diff_right') }}
-                      <span
-                        v-if="previewModified"
-                        class="ml-1 rounded bg-amber-400/15 px-1.5 py-0.5 text-[10px] font-medium normal-case tracking-normal text-amber-600 dark:bg-amber-400/10 dark:text-amber-400"
-                      >{{ t('qs_diff_preview_modified') }}</span>
-                    </div>
+                  <!-- 单行说明头：旧=在用配置（含修改时间）→ 新=渲染预览（统一流式无双列） -->
+                  <div class="flex flex-wrap items-center gap-x-1.5 gap-y-1 border-b border-slate-200 bg-slate-100/70 px-3 py-2 text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-400">
+                    {{ t('qs_diff_left') }}
+                    <span
+                      v-if="liveModifiedLabel"
+                      class="font-mono text-[10px] font-normal normal-case tracking-normal text-slate-400 dark:text-slate-500"
+                    >{{ liveModifiedLabel }}</span>
+                    <span class="material-symbols-outlined text-sm text-slate-400 dark:text-slate-500" aria-hidden="true">arrow_forward</span>
+                    {{ t('qs_diff_right') }}
+                    <span
+                      v-if="previewModified"
+                      class="ml-1 rounded bg-amber-400/15 px-1.5 py-0.5 text-[10px] font-medium normal-case tracking-normal text-amber-600 dark:bg-amber-400/10 dark:text-amber-400"
+                    >{{ t('qs_diff_preview_modified') }}</span>
                   </div>
 
                   <!-- 预览编辑态：左列在用配置只读（染色暂停），右列 textarea 等宽等行高 -->
@@ -429,13 +426,13 @@
                     ></textarea>
                   </div>
 
-                  <!-- 无基线（在用文件未生成/超限/拉取失败）：左列空态，右列纯预览 -->
-                  <div v-else-if="liveContent === null" class="grid grid-cols-[2.5rem_1fr_2.5rem_1fr]">
-                    <div class="col-span-2 flex max-h-[420px] min-h-[240px] items-center justify-center border-r border-slate-800 bg-slate-950 px-4 text-center text-[12px] text-slate-500 dark:border-slate-700">
+                  <!-- 无基线（在用文件未生成/超限/拉取失败）：纤细状态条 + 全宽纯预览（无染色） -->
+                  <div v-else-if="liveContent === null">
+                    <div class="border-b border-slate-200 bg-slate-100/70 px-3 py-2 text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-400">
                       <!-- 拉取失败 > 文件存在但读不到 > 尚未生成，三层空态文案 -->
                       {{ liveFilesFailed ? t('qs_state_error') : (activeLiveFile?.exists ? t('qs_state_too_large') : t('qs_diff_never_applied')) }}
                     </div>
-                    <div class="code-editor custom-scrollbar col-span-2 max-h-[420px] min-h-[240px] overflow-auto bg-slate-950 py-3 text-[12px] text-slate-100">
+                    <div class="code-editor custom-scrollbar max-h-[420px] min-h-[240px] overflow-auto bg-slate-950 py-3 text-[12px] text-slate-100">
                       <div v-for="(line, index) in previewLines" :key="`preview-${index}`" class="flex min-h-6 leading-6">
                         <span class="w-10 shrink-0 select-none bg-slate-900/60 pr-2 text-right font-mono text-[11px] text-slate-600">{{ index + 1 }}</span>
                         <span class="min-w-0 flex-1 whitespace-pre px-3">{{ line }}</span>
@@ -443,13 +440,16 @@
                     </div>
                   </div>
 
-                  <!-- split diff 主体：单容器统一滚动保证左右行对齐；- 行=将被移除（红），+ 行=将写入（绿） -->
-                  <div v-else class="code-editor custom-scrollbar max-h-[420px] min-h-[240px] overflow-auto bg-slate-950 text-[12px] text-slate-100">
-                    <div v-for="row in diffGridRows" :key="`diff-row-${row.key}`" class="grid grid-cols-[2.5rem_1fr_2.5rem_1fr]">
-                      <span class="w-10 shrink-0 select-none bg-slate-900/60 pr-2 text-right font-mono text-[11px] leading-6 text-slate-600">{{ row.leftNo }}</span>
-                      <span class="min-w-0 whitespace-pre px-3 leading-6" :class="diffLeftCellClass(row.type)"><span v-if="row.leftMark" class="mr-1 select-none opacity-70">{{ row.leftMark }}</span>{{ row.left }}</span>
-                      <span class="w-10 shrink-0 select-none bg-slate-900/60 pr-2 text-right font-mono text-[11px] leading-6 text-slate-600">{{ row.rightNo }}</span>
-                      <span class="min-w-0 whitespace-pre px-3 leading-6" :class="diffRightCellClass(row.type)"><span v-if="row.rightMark" class="mr-1 select-none opacity-70">{{ row.rightMark }}</span>{{ row.right }}</span>
+                  <!-- 统一流式 diff 主体：same 中性一行 / removed 红 - 行 / added 绿 + 行 / changed 相邻 -+ 成对；
+                       行号双列取 git unified 惯例：旧侧（在用配置）与新侧（渲染预览）各自递增 -->
+                  <div v-else class="code-editor custom-scrollbar max-h-[420px] min-h-[240px] overflow-auto bg-slate-950 py-3 text-[12px] text-slate-100">
+                    <div v-for="line in diffUnifiedRows" :key="`diff-line-${line.key}`" class="flex min-h-6 leading-6">
+                      <span class="w-10 shrink-0 select-none bg-slate-900/60 pr-2 text-right font-mono text-[11px] text-slate-600">{{ line.oldNo }}</span>
+                      <span class="w-10 shrink-0 select-none bg-slate-900/60 pr-2 text-right font-mono text-[11px] text-slate-600">{{ line.newNo }}</span>
+                      <span class="flex min-w-0 flex-1" :class="line.cls">
+                        <span class="w-5 shrink-0 select-none text-center font-mono text-[11px] opacity-70">{{ line.sign }}</span>
+                        <span class="min-w-0 flex-1 whitespace-pre pr-4">{{ line.text }}</span>
+                      </span>
                     </div>
                   </div>
                 </div>
@@ -909,50 +909,48 @@ const diffRows = computed(() => {
 });
 // 编辑态左列：在用配置按行展示（只读、带行号，染色暂停）
 const inUseLines = computed(() => (liveContent.value === null ? [] : liveContent.value.split('\n')));
-// 渲染行：派生双列行号（removed 只计左，added 只计右）与 -/+ 前缀标记
-const diffGridRows = computed(() => {
+// 统一流式渲染行（git unified diff）：same 一行中性；removed 一行红 -；added 一行绿 +；
+// changed 拆为相邻 -/+ 成对行。行号双列：旧侧（在用配置）与新侧（渲染预览）各自递增
+const diffUnifiedRows = computed(() => {
   const rows = diffRows.value;
   if (!rows) {
     return [];
   }
-  let leftNo = 0;
-  let rightNo = 0;
-  return rows.map((row, index) => {
-    const hasLeft = row.left !== null;
-    const hasRight = row.right !== null;
-    if (hasLeft) {
-      leftNo += 1;
+  let oldNo = 0;
+  let newNo = 0;
+  const lines = [];
+  const emit = (kind, text) => {
+    if (kind !== 'new') {
+      oldNo += 1;
     }
-    if (hasRight) {
-      rightNo += 1;
+    if (kind !== 'old') {
+      newNo += 1;
     }
-    return {
-      key: index,
-      type: row.type,
-      left: hasLeft ? row.left : '',
-      right: hasRight ? row.right : '',
-      leftNo: hasLeft ? leftNo : '',
-      rightNo: hasRight ? rightNo : '',
-      leftMark: row.type === 'removed' || row.type === 'changed' ? '-' : '',
-      rightMark: row.type === 'added' || row.type === 'changed' ? '+' : '',
-    };
-  });
+    lines.push({
+      key: `${lines.length}-${kind}`,
+      sign: kind === 'old' ? '-' : kind === 'new' ? '+' : '',
+      text: text ?? '',
+      oldNo: kind === 'new' ? '' : String(oldNo),
+      newNo: kind === 'old' ? '' : String(newNo),
+      cls: kind === 'old' ? 'bg-rose-500/15 text-rose-200' : kind === 'new' ? 'bg-emerald-500/15 text-emerald-200' : '',
+    });
+  };
+  for (const row of rows) {
+    if (row.type === 'removed') {
+      emit('old', row.left);
+    } else if (row.type === 'added') {
+      emit('new', row.right);
+    } else if (row.type === 'changed') {
+      emit('old', row.left);
+      emit('new', row.right);
+    } else {
+      emit('same', row.left);
+    }
+  }
+  return lines;
 });
-// 无基线时右列纯预览行（无染色，含手动编辑）
+// 无基线时全宽纯预览行（无染色，含手动编辑）
 const previewLines = computed(() => String(effectivePreviewContent.value ?? '').split('\n'));
-// split 染色：removed/changed 左列红，added/changed 右列绿；对面空单元格淡色占位
-function diffLeftCellClass(type) {
-  if (type === 'removed' || type === 'changed') {
-    return 'bg-rose-500/15 text-rose-200';
-  }
-  return type === 'added' ? 'bg-emerald-500/5' : '';
-}
-function diffRightCellClass(type) {
-  if (type === 'added' || type === 'changed') {
-    return 'bg-emerald-500/15 text-emerald-200';
-  }
-  return type === 'removed' ? 'bg-rose-500/5' : '';
-}
 // apply 前置校验：渲染后不得残留占位符，且模板引用的变量值必须非空
 // （空白种子的 api_key/model 是 ""，仅查渲染标记拦不住空值）
 const applyReadiness = computed(() => {
