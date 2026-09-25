@@ -21,14 +21,19 @@ export function findUnresolvedPlaceholders(content) {
   return names;
 }
 
-// git 风格对齐行 diff：返回 [{ left, right, type }]。left=当前在用配置（旧），
-// right=渲染预览（新）。type 语义（供 split 视图染色）：
-//   same    — 两列同显相同行
+// git 风格对齐行 diff：返回 [{ left, right, type, leftIndex, rightIndex }]。
+// left=当前在用配置（旧），right=渲染预览（新）。type 语义（供统一流染色）：
+//   same    — 两侧同显相同行
 //   removed — 该行只在在用配置中（apply 后将被移除），right=null
 //   added   — 该行只在渲染预览中（apply 将写入），left=null
-//   changed — removed/added 相邻成对合并为一行（GitHub split 风格：左红右绿同排）
+//   changed — removed/added 相邻成对合并为一行（统一流中拆回相邻 -/+ 两行）
+// 行索引（供 diff 行点击采纳/剔除）：
+//   leftIndex  — 该行内容在 left 原文的行下标（same/removed/changed 的左行有）
+//   rightIndex — 在 right 原文的行下标；removed/changed 的右行 = 插入位语义
+//                （采纳该 left 内容时插到预览这一行之前）；added 不带 leftIndex
 // 算法：去公共前后缀 → 余部有界 LCS（任一侧超 800 行即退化，不做 DP）→
-// 退化分支按「余部左侧全 removed / 右侧全 added」输出，再做相邻 run 成对合并。
+// 退化分支按「余部左侧全 removed / 右侧全 added」输出，再做相邻 run 成对合并，
+// 最后按对齐序列保序回填行索引。
 // nullish 输入按空内容处理。
 export function diffRowsAligned(leftContent, rightContent) {
   const leftLines = String(leftContent ?? '').split('\n');
@@ -59,11 +64,33 @@ export function diffRowsAligned(leftContent, rightContent) {
           ...midRight.map((line) => ({ left: null, right: line, type: 'added' })),
         ]
       : pairAdjacentRuns(lcsAlignRows(midLeft, midRight));
-  return [
+  return withRowIndices([
     ...leftLines.slice(0, prefix).map(sameRow),
     ...midRows,
     ...leftLines.slice(leftLines.length - suffix).map(sameRow),
-  ];
+  ]);
+}
+
+// 对齐序列保序回填行索引：按序扫一遍，左右各自计数——same 同进、removed 只进左、
+// added 只进右、changed 成对同进。removed（与 changed 左行）的 rightIndex 取当时
+// 的 right 计数 = 该 left 内容若被采纳时应插入预览的位置（插到这行之前）。
+function withRowIndices(rows) {
+  let leftCount = 0;
+  let rightCount = 0;
+  for (const row of rows) {
+    if (row.type === 'added') {
+      row.rightIndex = rightCount;
+      rightCount += 1;
+    } else {
+      row.leftIndex = leftCount;
+      row.rightIndex = rightCount;
+      leftCount += 1;
+      if (row.type !== 'removed') {
+        rightCount += 1;
+      }
+    }
+  }
+  return rows;
 }
 
 // 余部 LCS 对齐：dp 自底向上（Uint16Array，800×800 约 1.3MB），回溯产出

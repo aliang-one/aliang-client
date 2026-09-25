@@ -38,6 +38,8 @@ export default {
   qs_diff_left: '正在使用的配置',
   qs_diff_right: '配置预览',
   qs_diff_never_applied: '该配置文件尚未生成',
+  qs_diff_adopt: '采纳到预览',
+  qs_diff_drop: '从预览移除',
   qs_state_refresh: '刷新',
   qs_state_too_large: '文件过大或暂不可读',
   qs_state_error: '读取当前配置失败。',

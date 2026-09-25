@@ -38,6 +38,8 @@ export default {
   qs_diff_left: 'Config in use',
   qs_diff_right: 'Rendered preview',
   qs_diff_never_applied: 'This config file does not exist yet',
+  qs_diff_adopt: 'Adopt into preview',
+  qs_diff_drop: 'Remove from preview',
   qs_state_refresh: 'Refresh',
   qs_state_too_large: 'File too large or temporarily unreadable',
   qs_state_error: 'Failed to load the current configuration.',

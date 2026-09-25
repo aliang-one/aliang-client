@@ -441,9 +441,17 @@
                   </div>
 
                   <!-- 统一流式 diff 主体：same 中性一行 / removed 红 - 行 / added 绿 + 行 / changed 相邻 -+ 成对；
-                       行号双列取 git unified 惯例：旧侧（在用配置）与新侧（渲染预览）各自递增 -->
+                       行号双列取 git unified 惯例：旧侧（在用配置）与新侧（渲染预览）各自递增。
+                       可点击行：- 行采纳进预览、+ 行从预览剔除（编辑态视图不渲染，天然禁用） -->
                   <div v-else class="code-editor custom-scrollbar max-h-[420px] min-h-[240px] overflow-auto bg-slate-950 py-3 text-[12px] text-slate-100">
-                    <div v-for="line in diffUnifiedRows" :key="`diff-line-${line.key}`" class="flex min-h-6 leading-6">
+                    <div
+                      v-for="line in diffUnifiedRows"
+                      :key="`diff-line-${line.key}`"
+                      class="flex min-h-6 leading-6"
+                      :class="line.action ? 'cursor-pointer transition-colors hover:brightness-125' : ''"
+                      :title="line.action === 'adopt' ? t('qs_diff_adopt') : line.action === 'drop' ? t('qs_diff_drop') : undefined"
+                      @click="line.action && applyDiffLineAction(line)"
+                    >
                       <span class="w-10 shrink-0 select-none bg-slate-900/60 pr-2 text-right font-mono text-[11px] text-slate-600">{{ line.oldNo }}</span>
                       <span class="w-10 shrink-0 select-none bg-slate-900/60 pr-2 text-right font-mono text-[11px] text-slate-600">{{ line.newNo }}</span>
                       <span class="flex min-w-0 flex-1" :class="line.cls">
@@ -898,7 +906,7 @@ const restoreTargets = computed(() => {
   }
   return { restore, remove };
 });
-// git 风格 split diff：左=在用配置（旧），右=有效预览（新，含手动编辑）。
+// 统一流式 diff：左=在用配置（旧），右=有效预览（新，含手动编辑）。
 // 无基线（在用文件未生成/读不到）→ null：相对空基线「全是新增」的染色只会误导，走空态展示。
 const diffRows = computed(() => {
   const inUse = liveContent.value;
@@ -910,7 +918,9 @@ const diffRows = computed(() => {
 // 编辑态左列：在用配置按行展示（只读、带行号，染色暂停）
 const inUseLines = computed(() => (liveContent.value === null ? [] : liveContent.value.split('\n')));
 // 统一流式渲染行（git unified diff）：same 一行中性；removed 一行红 -；added 一行绿 +；
-// changed 拆为相邻 -/+ 成对行。行号双列：旧侧（在用配置）与新侧（渲染预览）各自递增
+// changed 拆为相邻 -/+ 成对行。行号双列：旧侧（在用配置）与新侧（渲染预览）各自递增。
+// 可点击行携带 action：- 行=adopt（采纳 left 内容到预览）、+ 行=drop（从预览剔除），
+// rightIndex 取自对齐行索引（removed/changed 右行 = 插入位；added = 其预览行下标）
 const diffUnifiedRows = computed(() => {
   const rows = diffRows.value;
   if (!rows) {
@@ -919,7 +929,7 @@ const diffUnifiedRows = computed(() => {
   let oldNo = 0;
   let newNo = 0;
   const lines = [];
-  const emit = (kind, text) => {
+  const emit = (kind, text, row) => {
     if (kind !== 'new') {
       oldNo += 1;
     }
@@ -933,18 +943,20 @@ const diffUnifiedRows = computed(() => {
       oldNo: kind === 'new' ? '' : String(oldNo),
       newNo: kind === 'old' ? '' : String(newNo),
       cls: kind === 'old' ? 'bg-rose-500/15 text-rose-200' : kind === 'new' ? 'bg-emerald-500/15 text-emerald-200' : '',
+      action: kind === 'same' ? null : kind === 'old' ? 'adopt' : 'drop',
+      rightIndex: kind === 'same' ? null : row?.rightIndex,
     });
   };
   for (const row of rows) {
     if (row.type === 'removed') {
-      emit('old', row.left);
+      emit('old', row.left, row);
     } else if (row.type === 'added') {
-      emit('new', row.right);
+      emit('new', row.right, row);
     } else if (row.type === 'changed') {
-      emit('old', row.left);
-      emit('new', row.right);
+      emit('old', row.left, row);
+      emit('new', row.right, row);
     } else {
-      emit('same', row.left);
+      emit('same', row.left, row);
     }
   }
   return lines;
@@ -1138,6 +1150,37 @@ function revertPreview() {
   }
   previewEditing.value = false;
   previewDraft.value = '';
+}
+
+// diff 行点击（非编辑态）：- 行 = 采纳 left 内容到预览（按 rightIndex 插到该行之前），
+// + 行 = 从预览剔除 rightIndex 行。结果写回 previewEdits → diff 重算（索引每次取自
+// 最新行对象，连续块逐行点击天然正确）；与纯渲染一致时不留编辑记录（同「完成」语义）。
+// 编辑态不响应（统一流视图此时本就不渲染，守卫为双保险，避免与 previewDraft 双源冲突）
+function applyDiffLineAction(line) {
+  if (previewEditing.value || !line?.action) {
+    return;
+  }
+  const code = activeFileCode.value;
+  if (!code) {
+    return;
+  }
+  const lines = String(effectivePreviewContent.value ?? '').split('\n');
+  if (line.action === 'adopt') {
+    lines.splice(Math.min(Number.isInteger(line.rightIndex) ? line.rightIndex : lines.length, lines.length), 0, line.text);
+  } else if (line.action === 'drop') {
+    if (!Number.isInteger(line.rightIndex) || line.rightIndex < 0 || line.rightIndex >= lines.length) {
+      return;
+    }
+    lines.splice(line.rightIndex, 1);
+  } else {
+    return;
+  }
+  const next = lines.join('\n');
+  if (next === renderedContent.value) {
+    delete previewEdits.value[code];
+  } else {
+    previewEdits.value = { ...previewEdits.value, [code]: next };
+  }
 }
 
 // 「保存为模板」：冻结语义——占位符以当前变量值落定后写入模板，该文件此后不随变量变化
