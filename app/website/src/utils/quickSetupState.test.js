@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   diffChangedLines,
+  diffRowsAligned,
   findUnresolvedPlaceholders,
   renderComboContent,
 } from './quickSetupState.js';
@@ -79,6 +80,74 @@ describe('findUnresolvedPlaceholders', () => {
 	});
 	it('returns empty for nullish content', () => {
 		expect(findUnresolvedPlaceholders(null)).toEqual([]);
+	});
+});
+
+describe('diffRowsAligned', () => {
+	it('returns all-same rows for identical content', () => {
+		const rows = diffRowsAligned('a\nb\nc', 'a\nb\nc');
+		expect(rows).toEqual([
+			{ left: 'a', right: 'a', type: 'same' },
+			{ left: 'b', right: 'b', type: 'same' },
+			{ left: 'c', right: 'c', type: 'same' },
+		]);
+	});
+	it('marks pure additions with left=null rows after the shared prefix', () => {
+		expect(diffRowsAligned('a', 'a\nb\nc')).toEqual([
+			{ left: 'a', right: 'a', type: 'same' },
+			{ left: null, right: 'b', type: 'added' },
+			{ left: null, right: 'c', type: 'added' },
+		]);
+	});
+	it('marks pure deletions with right=null rows after the shared prefix', () => {
+		expect(diffRowsAligned('a\nb\nc', 'a')).toEqual([
+			{ left: 'a', right: 'a', type: 'same' },
+			{ left: 'b', right: null, type: 'removed' },
+			{ left: 'c', right: null, type: 'removed' },
+		]);
+	});
+	it('aligns a middle rewrite as one paired changed row between same rows', () => {
+		expect(diffRowsAligned('x=1\ny=2\nz=3', 'x=1\ny=9\nz=3')).toEqual([
+			{ left: 'x=1', right: 'x=1', type: 'same' },
+			{ left: 'y=2', right: 'y=9', type: 'changed' },
+			{ left: 'z=3', right: 'z=3', type: 'same' },
+		]);
+	});
+	it('aligns repeated lines without over-matching (trailing duplicate removed)', () => {
+		expect(diffRowsAligned('a\na', 'a')).toEqual([
+			{ left: 'a', right: 'a', type: 'same' },
+			{ left: 'a', right: null, type: 'removed' },
+		]);
+	});
+	it('pairs unequal removed/added runs and keeps the leftover unpaired', () => {
+		expect(diffRowsAligned('k1\nk2\nkeep', 'v1\nkeep')).toEqual([
+			{ left: 'k1', right: 'v1', type: 'changed' },
+			{ left: 'k2', right: null, type: 'removed' },
+			{ left: 'keep', right: 'keep', type: 'same' },
+		]);
+	});
+	it('degrades to all removed then all added beyond the 800-line LCS bound', () => {
+		const left = Array.from({ length: 801 }, (_, i) => `old-${i}`).join('\n');
+		const right = Array.from({ length: 801 }, (_, i) => `new-${i}`).join('\n');
+		const rows = diffRowsAligned(left, right);
+		expect(rows).toHaveLength(1602);
+		expect(rows[0]).toEqual({ left: 'old-0', right: null, type: 'removed' });
+		expect(rows[800]).toEqual({ left: 'old-800', right: null, type: 'removed' });
+		expect(rows[801]).toEqual({ left: null, right: 'new-0', type: 'added' });
+		expect(rows.every((row, i) => (i < 801 ? row.type === 'removed' : row.type === 'added'))).toBe(true);
+	});
+	it('still runs bounded LCS at exactly the 800-line limit', () => {
+		const left = Array.from({ length: 800 }, (_, i) => `old-${i}`).join('\n');
+		const right = Array.from({ length: 800 }, (_, i) => `new-${i}`).join('\n');
+		const rows = diffRowsAligned(left, right);
+		// 800 行全无交集：LCS 正常跑完（不退化），成对合并为 800 条 changed 行
+		expect(rows).toHaveLength(800);
+		expect(rows.every((row) => row.type === 'changed')).toBe(true);
+		expect(rows[0]).toEqual({ left: 'old-0', right: 'new-0', type: 'changed' });
+	});
+	it('defends nullish input as empty content', () => {
+		expect(diffRowsAligned(null, undefined)).toEqual([{ left: '', right: '', type: 'same' }]);
+		expect(diffRowsAligned(null, 'a')).toEqual([{ left: '', right: 'a', type: 'changed' }]);
 	});
 });
 
