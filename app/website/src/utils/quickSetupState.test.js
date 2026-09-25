@@ -22,17 +22,23 @@ it('QuickSetupModal combo flow renders locally and prechecks variable values bef
   expect(component).toMatch(/String\(vars\[name\] \?\? ''\)\.trim\(\)/);
 });
 
-it('QuickSetupModal diff view compares rendered preview with last-applied snapshot', () => {
+it('QuickSetupModal diff view compares rendered preview with live config from config-state', () => {
   const component = readFileSync(new URL('../components/QuickSetupModal.vue', import.meta.url), 'utf8');
   const applyBlock = component.match(/async function applyCombo\(\) \{[\s\S]*?\n\}/)?.[0] || '';
 
-  // 两列 diff：diffChangedLines 标记变更行；右列取 applied 快照中该 code 的 content
+  // 两列 diff：diffChangedLines 标记变更行；右列 = config-state 实时内容，按文件 code 对齐
   expect(component).toMatch(/diffChangedLines/);
-  expect(component).toMatch(/item\?\.code === activeFileCode\.value/);
-  // apply 携带 combo_id（后端持久化快照的锚点）
-  expect(applyBlock).toMatch(/combo_id: combo\.id/);
-  // apply 成功后乐观替换 applied/applied_at（整对象替换，不深改）
-  expect(applyBlock).toMatch(/applied:/);
+  expect(component).toMatch(/activeLiveFile/);
+  expect(component).toMatch(/file\?\.code === activeFileCode\.value/);
+  // Modal 自取 config-state（loadCatalog 后 / 切 agent / apply 成功 / 手动刷新按钮）
+  expect(component).toMatch(/fetchConfigState/);
+  expect(component).toMatch(/refreshLiveFiles/);
+  expect(component).toMatch(/qs_state_refresh/);
+  // apply 不再传 combo_id（快照特性已回退）；成功后重取 config-state 让右列对齐磁盘
+  expect(applyBlock).not.toMatch(/combo_id/);
+  expect(applyBlock).toMatch(/refreshLiveFiles\(\)/);
+  // 快照语义零残留（applied 快照 / applied_at 时间戳 / 乐观更新）
+  expect(component).not.toMatch(/appliedContent|applied_at|applied:|appliedSnapshot/);
 });
 
 describe('renderComboContent', () => {

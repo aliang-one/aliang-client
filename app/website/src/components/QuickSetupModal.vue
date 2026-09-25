@@ -370,7 +370,7 @@
                 </div>
               </div>
 
-              <!-- 两列 diff 视图：左=渲染预览（apply 所见），右=上次应用快照；变更行淡色标记 -->
+              <!-- 两列 diff 视图：左=渲染预览（apply 所见），右=正在使用的配置（磁盘实时）；变更行淡色标记 -->
               <div v-else-if="activeFile" class="mt-2">
                 <div class="flex flex-wrap items-center justify-between gap-2">
                   <div class="flex min-w-0 items-center gap-2">
@@ -380,6 +380,15 @@
                     </code>
                   </div>
                   <div class="flex items-center gap-2">
+                    <button
+                      type="button"
+                      class="inline-flex min-h-8 items-center justify-center gap-1 rounded-lg border border-slate-200 px-3 text-[11px] font-semibold text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+                      :disabled="liveFilesLoading"
+                      @click="refreshLiveFiles"
+                    >
+                      <span class="material-symbols-outlined text-base">refresh</span>
+                      {{ t('qs_state_refresh') }}
+                    </button>
                     <button
                       type="button"
                       class="inline-flex min-h-8 items-center justify-center rounded-lg border border-slate-200 px-3 text-[11px] font-semibold text-slate-700 transition hover:bg-slate-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
@@ -406,20 +415,21 @@
                     </div>
                   </section>
 
-                  <!-- 右列：上次应用（快照 + 本地时间） -->
+                  <!-- 右列：正在使用的配置（磁盘实时内容 + 修改时间） -->
                   <section class="min-w-0 overflow-hidden rounded-2xl border border-slate-200 dark:border-slate-700">
                     <p class="border-b border-slate-200 bg-slate-100/70 px-4 py-2 text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-400">
                       {{ t('qs_diff_right') }}
                       <span
-                        v-if="appliedAtLabel"
+                        v-if="liveModifiedLabel"
                         class="ml-1 font-mono text-[10px] font-normal normal-case tracking-normal text-slate-400 dark:text-slate-500"
-                      >{{ appliedAtLabel }}</span>
+                      >{{ liveModifiedLabel }}</span>
                     </p>
                     <div
-                      v-if="appliedContent === null"
-                      class="flex max-h-[420px] min-h-[240px] items-center justify-center bg-slate-950 px-4 text-[12px] text-slate-500"
+                      v-if="liveContent === null"
+                      class="flex max-h-[420px] min-h-[240px] items-center justify-center bg-slate-950 px-4 text-center text-[12px] text-slate-500"
                     >
-                      {{ t('qs_diff_never_applied') }}
+                      <!-- 拉取失败 > 文件存在但读不到 > 尚未生成，三层空态文案 -->
+                      {{ liveFilesFailed ? t('qs_state_error') : (activeLiveFile?.exists ? t('qs_state_too_large') : t('qs_diff_never_applied')) }}
                     </div>
                     <div v-else class="code-editor custom-scrollbar max-h-[420px] min-h-[240px] overflow-auto bg-slate-950 py-3 text-[12px] text-slate-100">
                       <div
@@ -572,6 +582,7 @@ import {
   applyQuickSetup,
   createCombo,
   deleteCombo,
+  fetchConfigState,
   getQuickSetupCatalog,
   setComboDefault,
   updateCombo,
@@ -628,6 +639,50 @@ const createCopyFromId = ref('');
 const createError = ref('');
 // 模板编辑 textarea 引用（插入变量定位光标）
 const templateTextareaEl = ref(null);
+// 右列数据源：config-state 的 files（磁盘实时内容，含 code/exists/content）。
+// 触发时机：loadCatalog 成功后 / 切 agent / apply 成功后 / diff 视图手动刷新按钮。
+const liveFiles = ref([]);
+const liveFilesLoading = ref(false);
+// config-state 拉取失败标记：右列空态显示错误文案而非「尚未生成」
+const liveFilesFailed = ref(false);
+let liveFilesSeq = 0;
+let liveFilesRequested = '';
+
+// 取当前 agent 的在用配置；序号守卫拦截快速连切 agent 时的过期响应（镜像 StatePanel 模式）
+async function refreshLiveFiles() {
+  const software = selectedSoftware.value;
+  if (!software) {
+    liveFiles.value = [];
+    liveFilesFailed.value = false;
+    return;
+  }
+  // 同一 software 的重复触发（loadCatalog 与 watch 并联）直接复用在途请求
+  if (liveFilesLoading.value && liveFilesRequested === software) {
+    return;
+  }
+  const seq = ++liveFilesSeq;
+  liveFilesRequested = software;
+  liveFilesLoading.value = true;
+  liveFilesFailed.value = false;
+  try {
+    const result = await fetchConfigState(software);
+    if (seq !== liveFilesSeq) {
+      return;
+    }
+    liveFiles.value = Array.isArray(result?.files) ? result.files : [];
+  } catch {
+    if (seq !== liveFilesSeq) {
+      return;
+    }
+    // 失败清空（旧数据可能属于上一个 agent，展示即误导）；刷新按钮可重试
+    liveFiles.value = [];
+    liveFilesFailed.value = true;
+  } finally {
+    if (seq === liveFilesSeq) {
+      liveFilesLoading.value = false;
+    }
+  }
+}
 
 // 「插入变量」三个标准变量（与后端变量集一致）
 const templateVariableNames = ['base_url', 'api_key', 'model'];
@@ -652,25 +707,29 @@ const activeFileDecl = computed(() => {
 });
 // 渲染视图 = apply 所见（同一 renderComboContent 产物）
 const renderedContent = computed(() => renderComboContent(activeFile.value?.content, activeCombo.value?.variables));
-// 右列内容：上次应用快照（applied）中该 code 的 content；null = 该组合从未应用过
-const appliedContent = computed(() => {
-  const applied = Array.isArray(activeCombo.value?.applied) ? activeCombo.value.applied : [];
-  const hit = applied.find((item) => item?.code === activeFileCode.value);
-  return hit ? String(hit.content ?? '') : null;
+// 右列数据源：config-state files 中该 code 的磁盘实时内容；未命中/未生成 → null（空态）
+const activeLiveFile = computed(() => liveFiles.value.find((file) => file?.code === activeFileCode.value) || null);
+// exists 但 content 缺失（超限/读失败）也归入空态，由模板按 exists 区分空态文案
+const liveContent = computed(() => {
+  const file = activeLiveFile.value;
+  if (!file || !file.exists || typeof file.content !== 'string') {
+    return null;
+  }
+  return file.content;
 });
-// applied_at（RFC3339）→ 本地时间展示；空串（从未应用）不出标签，解析失败原样透出
-const appliedAtLabel = computed(() => {
-  const raw = String(activeCombo.value?.applied_at || '');
+// modified_at（RFC3339）→ 本地时间展示；无值不出标签，解析失败原样透出
+const liveModifiedLabel = computed(() => {
+  const raw = String(activeLiveFile.value?.modified_at || '');
   if (!raw) {
     return '';
   }
   const date = new Date(raw);
   return Number.isNaN(date.getTime()) ? raw : date.toLocaleString();
 });
-// 两列 diff 视图：行数组 + 变更行标记（右列从未应用时渲染空态，flags 不参与展示）
+// 两列 diff 视图：行数组 + 变更行标记（右列未生成时渲染空态，flags 不参与展示）
 const diffView = computed(() => {
-  const rightContent = appliedContent.value;
-  // 无快照（从未应用）时跳过变更标记：相对空基线全是「新增」会把左列整体染黄，误导。
+  const rightContent = liveContent.value;
+  // 无基线（文件未生成/读不到）时跳过变更标记：相对空基线全是「新增」会把左列整体染黄，误导。
   const noBaseline = rightContent === null;
   const { leftFlags, rightFlags } = noBaseline
     ? { leftFlags: [], rightFlags: [] }
@@ -1072,29 +1131,20 @@ async function applyCombo() {
     statusMessage.value = t('qs_noFilesWritten');
     return;
   }
-  // 乐观快照源：与 filesToApply 同源（code + 本次渲染内容），apply 成功后整对象替换 activeCombo
-  const appliedSnapshot = (combo.files || [])
-    .filter((file) => declaredByCode.has(file.code))
-    .map((file) => ({ code: file.code, content: renderComboContent(file.content, vars) }));
   applying.value = true;
   try {
     const result = await applyQuickSetup({
       software: selectedSoftware.value,
       files: filesToApply,
-      combo_id: combo.id,
     });
     const writtenCount = Array.isArray(result?.written) ? result.written.length : 0;
     if (writtenCount > 0) {
       statusMessage.value = '';
       // 结果页渲染在 edit 页签内；apply 入口在 header，防御性确保结果视图可见
       activeTab.value = 'edit';
-      // 乐观更新上次应用快照：右列 diff 即时变干净（后端已持久化权威快照，重开弹窗自然对齐；
-      // 绝不深改原组合——展开为整对象新引用替换）
-      adoptCombo({
-        ...combo,
-        applied: appliedSnapshot,
-        applied_at: new Date().toISOString(),
-      });
+      // 重取 config-state：右列 diff 对齐刚写入的磁盘内容（失败由 refreshLiveFiles 自吞，
+      // 不影响已成功的 apply 结果展示）
+      refreshLiveFiles();
       // 应用前的渲染快照即写入磁盘的最终内容（path+content 窄快照，供结果面板展示）
       applyResult.value = {
         softwareName: `${def.name || selectedSoftware.value} · ${combo.name}`,
@@ -1148,6 +1198,9 @@ async function loadCatalog() {
     }
     // 组合列表整体替换后重选（含同 agent 重开弹窗刷新场景）
     pickDefaultCombo();
+    // 右列数据源：config-state 磁盘实时内容（与 watch(selectedSoftware) 并联，
+    // 同 software 在途请求会被 refreshLiveFiles 内部去重复用）
+    refreshLiveFiles();
   } catch (error) {
     catalogStatus.value = 'failed';
     catalogMessage.value = error instanceof Error ? error.message : t('qs_failedCatalog');
@@ -1169,9 +1222,10 @@ watch(
   { immediate: true },
 );
 // 切 agent：activeCombo 回预选（is_default 优先否则第一个），模板/弹窗态复位；
-// 纯同步复位，快速连切只按最新值收敛一次，无竞态
+// 纯同步复位，快速连切只按最新值收敛一次，无竞态；同时重取该 agent 的在用配置
 watch(selectedSoftware, () => {
   pickDefaultCombo();
+  refreshLiveFiles();
 });
 onMounted(() => {
   window.addEventListener('keydown', onModalKeydown, true);
