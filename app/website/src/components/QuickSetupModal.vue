@@ -265,8 +265,7 @@
               </button>
             </div>
 
-            <template>
-              <!-- 应用结果视图：apply 成功后替换组合内容区；返回编辑回到渲染视图 -->
+            <!-- 应用结果视图：apply 成功后替换组合内容区；返回编辑回到渲染视图 -->
               <QuickSetupResultPanel
                 v-if="applyResult"
                 :software-name="applyResult.softwareName"
@@ -487,8 +486,6 @@
               >
                 {{ t('qs_combo_empty') }}
               </div>
-            </template>
-
             <div v-if="statusMessage" class="mt-6 rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-600 dark:border-slate-800 dark:bg-slate-900/50 dark:text-slate-300">
               {{ statusMessage }}
             </div>
@@ -672,6 +669,7 @@ import {
   deleteCombo,
   fetchConfigState,
   getQuickSetupCatalog,
+  restoreConfig,
   setComboDefault,
   updateCombo,
 } from '../services/quickSetupApi';
@@ -1431,6 +1429,15 @@ function adoptCombo(combo) {
 
 // apply：组合每文件 → 声明的 DefaultPath/Format/Kind + 渲染后内容
 async function applyCombo() {
+  // 编辑中的草稿先按「完成」同一语义落定到 previewEdits（一致不留编辑记录），
+  // 使下方 readiness 预检与 filesToApply 取值均为 textarea 当前所见
+  if (previewEditing.value && activeFileCode.value && previewDraft.value) {
+    if (previewDraft.value === renderedContent.value) {
+      delete previewEdits.value[activeFileCode.value];
+    } else {
+      previewEdits.value = { ...previewEdits.value, [activeFileCode.value]: previewDraft.value };
+    }
+  }
   const combo = activeCombo.value;
   const def = selectedSoftwareDef.value;
   if (!combo || !def || !applyReadiness.value.ready) {

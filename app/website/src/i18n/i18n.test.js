@@ -33,7 +33,11 @@ describe('i18n locale parity', () => {
 
   it('has no unreferenced quick-setup key outside the locale files', () => {
     const source = collectSource(srcDir);
-    const dead = Object.keys(zh).filter((key) => key.startsWith('qs_') && !source.includes(key));
+    // 仅认带引号的引用形式（'key' / "key"），避免 qs_restore 被 qs_restore_confirm_title
+    // 这类前缀键的裸子串命中而永远判不死
+    const dead = Object.keys(zh).filter(
+      (key) => key.startsWith('qs_') && !source.includes(`'${key}'`) && !source.includes(`"${key}"`),
+    );
     expect(dead).toEqual([]);
   });
 });
