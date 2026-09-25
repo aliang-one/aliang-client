@@ -27,8 +27,9 @@ it('QuickSetupModal diff view compares rendered preview with live config from co
   const component = readFileSync(new URL('../components/QuickSetupModal.vue', import.meta.url), 'utf8');
   const applyBlock = component.match(/async function applyCombo\(\) \{[\s\S]*?\n\}/)?.[0] || '';
 
-  // 两列 diff：diffChangedLines 标记变更行；右列 = config-state 实时内容，按文件 code 对齐
-  expect(component).toMatch(/diffChangedLines/);
+  // git 风格 split diff：diffRowsAligned 对齐行（左=在用配置，右=渲染预览），按文件 code 对齐
+  expect(component).toMatch(/diffRowsAligned/);
+  expect(component).not.toMatch(/diffChangedLines/);
   expect(component).toMatch(/activeLiveFile/);
   expect(component).toMatch(/file\?\.code === activeFileCode\.value/);
   // Modal 自取 config-state（loadCatalog 后 / 切 agent / apply 成功 / 手动刷新按钮）
