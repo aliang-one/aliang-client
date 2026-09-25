@@ -204,6 +204,18 @@ func TestAgentAIRunStoppedStatus(t *testing.T) {
 	}
 }
 
+func TestAgentAIRunStoppedStatusToolWaitTimeout(t *testing.T) {
+	activity := newAgentAIActivity()
+	activity.setKillReason("tool_wait_timeout")
+	status, msg := agentAIRunStoppedStatus(activity, nil)
+	if status != "timeout" {
+		t.Fatalf("status = %q, want timeout (server terminal-status family)", status)
+	}
+	if msg == "" {
+		t.Fatal("expected a non-empty human-readable reason")
+	}
+}
+
 // runWatchdogUntilCancelled runs the watchdog loop with the given windows and
 // returns whether ctx was cancelled within the timeout, plus the kill reason.
 func runWatchdogUntilCancelled(t *testing.T, idleWindow, hardCeiling, noProgressWindow, interval, wait time.Duration, configure func(*agentAIActivity)) (cancelled bool, reason string) {
