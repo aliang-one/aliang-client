@@ -389,13 +389,46 @@
                       <span class="material-symbols-outlined text-base">refresh</span>
                       {{ t('qs_state_refresh') }}
                     </button>
-                    <button
-                      type="button"
-                      class="inline-flex min-h-8 items-center justify-center rounded-lg border border-slate-200 px-3 text-[11px] font-semibold text-slate-700 transition hover:bg-slate-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
-                      @click="startTemplateEditing"
-                    >
-                      {{ t('qs_tpl_edit') }}
-                    </button>
+                    <template v-if="previewEditing">
+                      <button
+                        type="button"
+                        class="inline-flex min-h-8 items-center justify-center rounded-lg border border-slate-200 px-3 text-[11px] font-semibold text-slate-700 transition hover:bg-slate-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+                        @click="finishPreviewEditing"
+                      >
+                        {{ t('qs_diff_done') }}
+                      </button>
+                      <button
+                        type="button"
+                        class="inline-flex min-h-8 items-center justify-center rounded-lg border border-slate-200 px-3 text-[11px] font-semibold text-slate-700 transition hover:bg-slate-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+                        @click="revertPreview"
+                      >
+                        {{ t('qs_diff_revert_preview') }}
+                      </button>
+                      <button
+                        type="button"
+                        class="inline-flex min-h-8 items-center justify-center rounded-lg bg-primary px-3 text-[11px] font-semibold text-white transition hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+                        :disabled="comboSaving"
+                        @click="savePreviewAsTemplate"
+                      >
+                        {{ t('qs_diff_save_as_template') }}
+                      </button>
+                    </template>
+                    <template v-else>
+                      <button
+                        type="button"
+                        class="inline-flex min-h-8 items-center justify-center rounded-lg border border-slate-200 px-3 text-[11px] font-semibold text-slate-700 transition hover:bg-slate-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+                        @click="startTemplateEditing"
+                      >
+                        {{ t('qs_tpl_edit') }}
+                      </button>
+                      <button
+                        type="button"
+                        class="inline-flex min-h-8 items-center justify-center rounded-lg border border-slate-200 px-3 text-[11px] font-semibold text-slate-700 transition hover:bg-slate-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+                        @click="startPreviewEditing"
+                      >
+                        {{ t('qs_diff_edit_preview') }}
+                      </button>
+                    </template>
                   </div>
                 </div>
 
@@ -409,11 +442,35 @@
                         class="ml-1 font-mono text-[10px] font-normal normal-case tracking-normal text-slate-400 dark:text-slate-500"
                       >{{ liveModifiedLabel }}</span>
                     </div>
-                    <div class="col-span-2 px-3 py-2">{{ t('qs_diff_right') }}</div>
+                    <div class="col-span-2 px-3 py-2">
+                      {{ t('qs_diff_right') }}
+                      <span
+                        v-if="previewModified"
+                        class="ml-1 rounded bg-amber-400/15 px-1.5 py-0.5 text-[10px] font-medium normal-case tracking-normal text-amber-600 dark:bg-amber-400/10 dark:text-amber-400"
+                      >{{ t('qs_diff_preview_modified') }}</span>
+                    </div>
+                  </div>
+
+                  <!-- 预览编辑态：左列在用配置只读（染色暂停），右列 textarea 等宽等行高 -->
+                  <div v-if="previewEditing" class="grid h-[420px] grid-cols-[2.5rem_1fr_2.5rem_1fr]">
+                    <div class="col-span-2 min-h-0 overflow-hidden border-r border-slate-800 bg-slate-950 dark:border-slate-700">
+                      <div class="code-editor custom-scrollbar h-full overflow-auto py-3 text-[12px] text-slate-100">
+                        <div v-for="(line, index) in inUseLines" :key="`inuse-${index}`" class="flex min-h-6 leading-6">
+                          <span class="w-10 shrink-0 select-none bg-slate-900/60 pr-2 text-right font-mono text-[11px] text-slate-600">{{ index + 1 }}</span>
+                          <span class="min-w-0 flex-1 whitespace-pre px-3">{{ line }}</span>
+                        </div>
+                      </div>
+                    </div>
+                    <textarea
+                      v-model="previewDraft"
+                      class="code-editor col-span-2 h-full min-h-0 w-full resize-none border-0 bg-slate-950 px-4 py-3 text-[12px] leading-6 text-slate-100 outline-none focus:ring-1 focus:ring-inset focus:ring-primary/40"
+                      :aria-label="t('qs_diff_edit_preview')"
+                      spellcheck="false"
+                    ></textarea>
                   </div>
 
                   <!-- 无基线（在用文件未生成/超限/拉取失败）：左列空态，右列纯预览 -->
-                  <div v-if="liveContent === null" class="grid grid-cols-[2.5rem_1fr_2.5rem_1fr]">
+                  <div v-else-if="liveContent === null" class="grid grid-cols-[2.5rem_1fr_2.5rem_1fr]">
                     <div class="col-span-2 flex max-h-[420px] min-h-[240px] items-center justify-center border-r border-slate-800 bg-slate-950 px-4 text-center text-[12px] text-slate-500 dark:border-slate-700">
                       <!-- 拉取失败 > 文件存在但读不到 > 尚未生成，三层空态文案 -->
                       {{ liveFilesFailed ? t('qs_state_error') : (activeLiveFile?.exists ? t('qs_state_too_large') : t('qs_diff_never_applied')) }}
@@ -618,6 +675,11 @@ const activeCombo = ref(null);
 const activeFileCode = ref('');
 const templateEditing = ref(false);
 const templateDraft = ref('');
+// 渲染预览手动编辑：previewEdits = Map fileCode → 编辑内容（combo 作用域，切组合清空）；
+// previewEditing/previewDraft 为当前文件的就编辑态。编辑期间行级染色暂停（textarea 无法逐行染色）
+const previewEdits = ref({});
+const previewEditing = ref(false);
+const previewDraft = ref('');
 const configureOpen = ref(false);
 const applyResult = ref(null);
 // 组合 tabs 操作区
@@ -702,6 +764,21 @@ const activeFileDecl = computed(() => {
 });
 // 渲染视图 = apply 所见（同一 renderComboContent 产物）
 const renderedContent = computed(() => renderComboContent(activeFile.value?.content, activeCombo.value?.variables));
+// 有效预览内容 = 手动编辑草稿优先，回落渲染产物（diff 与 applyReadiness 共用此优先级）
+const effectivePreviewContent = computed(() => (
+  previewEdits.value[activeFileCode.value] ?? renderedContent.value
+));
+// 「预览已手动修改」徽标：已保存的编辑，或编辑中草稿已偏离纯渲染产物
+const previewModified = computed(() => {
+  if (previewEdits.value[activeFileCode.value] !== undefined) {
+    return true;
+  }
+  return previewEditing.value && previewDraft.value !== renderedContent.value;
+});
+// 编辑中草稿是否偏离进入编辑时的内容（未保存离开守卫用）
+const previewDirty = computed(() => (
+  previewEditing.value && previewDraft.value !== effectivePreviewContent.value
+));
 // 右列数据源：config-state files 中该 code 的磁盘实时内容；未命中/未生成 → null（空态）
 const activeLiveFile = computed(() => liveFiles.value.find((file) => file?.code === activeFileCode.value) || null);
 // exists 但 content 缺失（超限/读失败）也归入空态，由模板按 exists 区分空态文案
@@ -721,15 +798,17 @@ const liveModifiedLabel = computed(() => {
   const date = new Date(raw);
   return Number.isNaN(date.getTime()) ? raw : date.toLocaleString();
 });
-// git 风格 split diff：左=在用配置（旧），右=渲染预览（新）。
+// git 风格 split diff：左=在用配置（旧），右=有效预览（新，含手动编辑）。
 // 无基线（在用文件未生成/读不到）→ null：相对空基线「全是新增」的染色只会误导，走空态展示。
 const diffRows = computed(() => {
   const inUse = liveContent.value;
   if (inUse === null) {
     return null;
   }
-  return diffRowsAligned(inUse, renderedContent.value);
+  return diffRowsAligned(inUse, effectivePreviewContent.value);
 });
+// 编辑态左列：在用配置按行展示（只读、带行号，染色暂停）
+const inUseLines = computed(() => (liveContent.value === null ? [] : liveContent.value.split('\n')));
 // 渲染行：派生双列行号（removed 只计左，added 只计右）与 -/+ 前缀标记
 const diffGridRows = computed(() => {
   const rows = diffRows.value;
@@ -759,8 +838,8 @@ const diffGridRows = computed(() => {
     };
   });
 });
-// 无基线时右列纯预览行（无染色）
-const previewLines = computed(() => String(renderedContent.value ?? '').split('\n'));
+// 无基线时右列纯预览行（无染色，含手动编辑）
+const previewLines = computed(() => String(effectivePreviewContent.value ?? '').split('\n'));
 // split 染色：removed/changed 左列红，added/changed 右列绿；对面空单元格淡色占位
 function diffLeftCellClass(type) {
   if (type === 'removed' || type === 'changed') {
@@ -782,7 +861,8 @@ const applyReadiness = computed(() => {
   const vars = combo?.variables || {};
   const missing = new Set();
   for (const file of files) {
-    const content = String(file?.content ?? '');
+    // 内容优先级与 applyCombo 一致：手动编辑的预览优先（可能仍含手打占位符，统一过渲染与空值预检）
+    const content = previewEdits.value[file.code] ?? file?.content;
     for (const name of findUnresolvedPlaceholders(renderComboContent(content, vars))) {
       missing.add(name);
     }
@@ -834,13 +914,17 @@ function placeholderToken(name) {
   return `{{${name}}}`;
 }
 
-// 选中组合：整对象替换 + 文件 tab 回到第一个 + 瞬态视图复位（绝不深改 .variables）
+// 选中组合：整对象替换 + 文件 tab 回到第一个 + 瞬态视图复位（绝不深改 .variables）。
+// previewEdits 按 fileCode 键控、combo 作用域：切组合/agent 必须整体清空，避免旧组合编辑串味
 function selectCombo(combo) {
   activeCombo.value = combo || null;
   const files = Array.isArray(combo?.files) ? combo.files : [];
   activeFileCode.value = files[0]?.code || '';
   templateEditing.value = false;
   templateDraft.value = '';
+  previewEdits.value = {};
+  previewEditing.value = false;
+  previewDraft.value = '';
   applyResult.value = null;
   activeTab.value = 'edit';
   comboMenuOpen.value = false;
@@ -866,6 +950,9 @@ function switchCombo(combo) {
   if (!confirmDiscardTemplateDraft()) {
     return;
   }
+  if (!confirmDiscardPreviewDraft()) {
+    return;
+  }
   selectCombo(combo);
 }
 
@@ -876,11 +963,16 @@ function switchFileTab(code) {
   if (!confirmDiscardTemplateDraft()) {
     return;
   }
+  if (!confirmDiscardPreviewDraft()) {
+    return;
+  }
   activeFileCode.value = code;
-  // 恒复位编辑态：文件页签切换永远退出模板编辑视图（渲染视图是默认视图）。
+  // 恒复位编辑态：文件页签切换永远退出模板/预览编辑视图（渲染视图是默认视图）。
   // 无改动路径若不复位，上一文件的草稿会残留 textarea，点保存即把 A 的内容写进 B（跨文件模板覆盖）
   templateEditing.value = false;
   templateDraft.value = '';
+  previewEditing.value = false;
+  previewDraft.value = '';
 }
 
 // 有未保存草稿时提示放弃；确认后才允许离开（返回 false = 留在原地）
@@ -896,10 +988,97 @@ function confirmDiscardTemplateDraft() {
   return false;
 }
 
+// 预览编辑草稿的离开守卫（镜像模板草稿守卫；已保存进 previewEdits 的内容不受影响）
+function confirmDiscardPreviewDraft() {
+  if (!previewDirty.value) {
+    return true;
+  }
+  if (window.confirm(t('qs_preview_dirty'))) {
+    previewEditing.value = false;
+    previewDraft.value = '';
+    return true;
+  }
+  return false;
+}
+
+// 预览编辑三入口之一：进入编辑（草稿起点 = 有效预览内容）
+function startPreviewEditing() {
+  if (!activeFile.value) {
+    return;
+  }
+  previewDraft.value = effectivePreviewContent.value;
+  previewEditing.value = true;
+}
+
+// 「完成」：退出编辑态；与纯渲染一致时不留编辑记录，否则内容保留在 previewEdits（不丢）
+function finishPreviewEditing() {
+  const code = activeFileCode.value;
+  if (!code) {
+    previewEditing.value = false;
+    previewDraft.value = '';
+    return;
+  }
+  if (previewDraft.value === renderedContent.value) {
+    delete previewEdits.value[code];
+  } else {
+    previewEdits.value = { ...previewEdits.value, [code]: previewDraft.value };
+  }
+  previewEditing.value = false;
+  previewDraft.value = '';
+}
+
+// 「还原预览」：清除该文件编辑内容，回到纯渲染
+function revertPreview() {
+  const code = activeFileCode.value;
+  if (code) {
+    delete previewEdits.value[code];
+  }
+  previewEditing.value = false;
+  previewDraft.value = '';
+}
+
+// 「保存为模板」：冻结语义——占位符以当前变量值落定后写入模板，该文件此后不随变量变化
+async function savePreviewAsTemplate() {
+  const combo = activeCombo.value;
+  const code = activeFileCode.value;
+  if (!combo || !code || !previewEditing.value) {
+    return;
+  }
+  if (!window.confirm(t('qs_diff_save_as_template_confirm'))) {
+    return;
+  }
+  const content = renderComboContent(previewDraft.value, combo.variables || {});
+  const files = (Array.isArray(combo.files) ? combo.files : []).map((file) => (
+    file.code === code ? { ...file, content } : file
+  ));
+  comboSaving.value = true;
+  try {
+    const result = await updateCombo(combo.id, { files });
+    const next = result?.combo;
+    if (next) {
+      adoptCombo(next);
+    }
+    delete previewEdits.value[code];
+    previewEditing.value = false;
+    previewDraft.value = '';
+    statusMessage.value = '';
+  } catch (error) {
+    statusMessage.value = errorText(error);
+  } finally {
+    comboSaving.value = false;
+  }
+}
+
 function startTemplateEditing() {
   if (!activeFile.value) {
     return;
   }
+  if (!confirmDiscardPreviewDraft()) {
+    return;
+  }
+  // 预览编辑态让位模板编辑（未偏离纯渲染时静默退出即可）
+  previewEditing.value = false;
+  previewDraft.value = '';
   templateDraft.value = String(activeFile.value.content ?? '');
   templateEditing.value = true;
 }
@@ -957,6 +1136,9 @@ function openConfigure() {
     return;
   }
   if (!confirmDiscardTemplateDraft()) {
+    return;
+  }
+  if (!confirmDiscardPreviewDraft()) {
     return;
   }
   comboMenuOpen.value = false;
@@ -1155,7 +1337,8 @@ async function applyCombo() {
       const declared = declaredByCode.get(file.code);
       return {
         path: declared.default_path,
-        content: renderComboContent(file.content, vars),
+        // 内容优先级 = applyReadiness 同款：手动编辑的预览优先，回落模板渲染产物（统一过渲染）
+        content: renderComboContent(previewEdits.value[file.code] ?? file.content, vars),
         format: declared.format,
         kind: declared.kind,
       };
@@ -1175,6 +1358,10 @@ async function applyCombo() {
       statusMessage.value = '';
       // 结果页渲染在 edit 页签内；apply 入口在 header，防御性确保结果视图可见
       activeTab.value = 'edit';
+      // 编辑内容已落盘：清空全部预览编辑，避免残留「预览已手动修改」假标记
+      previewEdits.value = {};
+      previewEditing.value = false;
+      previewDraft.value = '';
       // 重取 config-state：右列 diff 对齐刚写入的磁盘内容（失败由 refreshLiveFiles 自吞，
       // 不影响已成功的 apply 结果展示）
       refreshLiveFiles();

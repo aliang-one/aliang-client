@@ -92,6 +92,13 @@ export default {
   qs_tpl_insert_var: 'Insert variable',
   qs_apply_unresolved: 'Unresolved variables: {vars}',
   qs_combo_dirty: 'Unsaved template changes',
+  qs_diff_edit_preview: 'Edit preview',
+  qs_diff_preview_modified: 'Preview manually edited',
+  qs_diff_revert_preview: 'Revert preview',
+  qs_diff_save_as_template: 'Save as template',
+  qs_diff_save_as_template_confirm: 'Placeholders will be replaced by their current values, and this file will no longer follow variable changes. Save as template?',
+  qs_diff_done: 'Done',
+  qs_preview_dirty: 'Unsaved preview changes',
 
   // -- System Settings --
   sys_language: 'Language',

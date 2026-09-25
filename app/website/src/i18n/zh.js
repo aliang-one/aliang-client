@@ -92,6 +92,13 @@ export default {
   qs_tpl_insert_var: '插入变量',
   qs_apply_unresolved: '存在未填写的变量：{vars}',
   qs_combo_dirty: '有未保存的模板修改',
+  qs_diff_edit_preview: '编辑预览',
+  qs_diff_preview_modified: '预览已手动修改',
+  qs_diff_revert_preview: '还原预览',
+  qs_diff_save_as_template: '保存为模板',
+  qs_diff_save_as_template_confirm: '占位符将被当前值取代，该文件此后不随变量变化。确认保存为模板？',
+  qs_diff_done: '完成',
+  qs_preview_dirty: '有未保存的预览修改',
 
   // -- System Settings --
   sys_language: '语言',

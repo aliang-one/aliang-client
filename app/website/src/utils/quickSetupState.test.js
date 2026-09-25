@@ -2,7 +2,6 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
 import {
-  diffChangedLines,
   diffRowsAligned,
   findUnresolvedPlaceholders,
   renderComboContent,
@@ -15,8 +14,8 @@ it('QuickSetupModal combo flow renders locally and prechecks variable values bef
   expect(applyBlock).not.toBe('');
   // v2 服务端渲染链（render/models）必须零引用
   expect(component).not.toMatch(/renderQuickSetup|getQuickSetupModels/);
-  // apply 内容 = renderComboContent(模板, 变量) 逐文件产物，路径/格式/种类取自 software 声明
-  expect(applyBlock).toMatch(/renderComboContent\(file\.content, vars\)/);
+  // apply 内容 = renderComboContent(最终内容, 变量) 逐文件产物（手动编辑预览优先），路径/格式/种类取自 software 声明
+  expect(applyBlock).toMatch(/renderComboContent\(previewEdits\.value\[file\.code\] \?\? file\.content, vars\)/);
   expect(applyBlock).toMatch(/declared\.default_path/);
   // 值感知预检：渲染残留占位符 + 变量空值双重拦截
   expect(component).toMatch(/findUnresolvedPlaceholders\(renderComboContent\(content, vars\)\)/);
@@ -149,34 +148,5 @@ describe('diffRowsAligned', () => {
 	it('defends nullish input as empty content', () => {
 		expect(diffRowsAligned(null, undefined)).toEqual([{ left: '', right: '', type: 'same' }]);
 		expect(diffRowsAligned(null, 'a')).toEqual([{ left: '', right: 'a', type: 'changed' }]);
-	});
-});
-
-describe('diffChangedLines', () => {
-	it('marks nothing when contents are identical', () => {
-		const { leftFlags, rightFlags } = diffChangedLines('a\nb\nc', 'a\nb\nc');
-		expect(leftFlags).toEqual([false, false, false]);
-		expect(rightFlags).toEqual([false, false, false]);
-	});
-	it('flags lines that exist on only one side', () => {
-		const { leftFlags, rightFlags } = diffChangedLines('a\nb\nc', 'a\nb');
-		expect(leftFlags).toEqual([false, false, true]);
-		expect(rightFlags).toEqual([false, false]);
-	});
-	it('flags changed line content on both sides', () => {
-		const { leftFlags, rightFlags } = diffChangedLines('x=1\ny=2', 'x=1\ny=3');
-		expect(leftFlags).toEqual([false, true]);
-		expect(rightFlags).toEqual([false, true]);
-	});
-	it('treats duplicate lines as a multiset (one of two left "a" flagged)', () => {
-		const { leftFlags, rightFlags } = diffChangedLines('a\na', 'a');
-		expect(leftFlags.filter(Boolean)).toHaveLength(1);
-		expect(leftFlags).toHaveLength(2);
-		expect(rightFlags).toEqual([false]);
-	});
-	it('defends nullish input as empty content', () => {
-		const { leftFlags, rightFlags } = diffChangedLines(null, undefined);
-		expect(leftFlags).toEqual([false]);
-		expect(rightFlags).toEqual([false]);
 	});
 });
