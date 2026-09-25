@@ -13,15 +13,9 @@ type QuickSetupCombo struct {
 	// VariablesJSON/FilesJSON 为持久化 JSON 文本列。
 	VariablesJSON string `json:"-" gorm:"type:text;not null"`
 	FilesJSON     string `json:"-" gorm:"type:text;not null"`
-	// AppliedJSON/AppliedAt 是「上次应用快照」（v3.1，combo 级）：apply 全部成功后
-	// 由 service 写入本次实际落盘的每文件 [{code,content}] 与 RFC3339 时间戳。
-	// default:'' 兼容存量表 AutoMigrate（SQLite 加 NOT NULL 列必须有默认值）。
-	AppliedJSON string `json:"-" gorm:"type:text;not null;default:''"`
-	AppliedAt   string `json:"-" gorm:"type:varchar(64);not null;default:''"`
-	// Variables/Files/Applied 为运行时字段，不映射数据库列。
+	// Variables/Files 为运行时字段，不映射数据库列。
 	Variables map[string]string     `json:"variables" gorm:"-"`
 	Files     []QuickSetupComboFile `json:"files" gorm:"-"`
-	Applied   []QuickSetupComboFile `json:"applied" gorm:"-"`
 	CreatedAt time.Time             `json:"created_at" gorm:"autoCreateTime"`
 	UpdatedAt time.Time             `json:"updated_at" gorm:"autoUpdateTime"`
 }
@@ -36,7 +30,7 @@ type QuickSetupComboFile struct {
 	Content string `json:"content"` // 含 {{base_url}}/{{api_key}}/{{model}} 占位符
 }
 
-// QuickSetupComboView 是组合的 API 视图（Variables/Files/Applied 已反序列化）。
+// QuickSetupComboView 是组合的 API 视图（Variables/Files 已反序列化）。
 type QuickSetupComboView struct {
 	ID        int64                 `json:"id"`
 	Software  string                `json:"software"`
@@ -44,8 +38,4 @@ type QuickSetupComboView struct {
 	IsDefault bool                  `json:"is_default"`
 	Variables map[string]string     `json:"variables"`
 	Files     []QuickSetupComboFile `json:"files"`
-	// Applied/AppliedAt 是「上次应用快照」（v3.1）：从未应用过 → Applied 空 slice、
-	// AppliedAt 空串。
-	Applied   []QuickSetupComboFile `json:"applied"`
-	AppliedAt string                `json:"applied_at"`
 }

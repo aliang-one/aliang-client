@@ -10,10 +10,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
-	"time"
 
 	"aliang.one/nursorgate/app/http/models"
-	"aliang.one/nursorgate/common/logger"
 )
 
 func (s *QuickSetupService) Apply(req models.QuickSetupApplyRequest) (*models.QuickSetupApplyResponse, error) {
@@ -107,13 +105,6 @@ func (s *QuickSetupService) Apply(req models.QuickSetupApplyRequest) (*models.Qu
 		written = append(written, file.path)
 	}
 
-	// v3.1：apply 全部成功（写入+备份完成）后，把 prepared 的每文件内容（后端
-	// 权威——实际落盘的渲染结果）持久化为组合的「上次应用快照」。快照是尽力而为
-	// 的旁路数据，任何失败只记日志，绝不让已成功的 apply 报错。
-	if req.ComboID > 0 {
-		persistQuickSetupAppliedSnapshot(software, req.ComboID, prepared)
-	}
-
 	return &models.QuickSetupApplyResponse{
 		Software: software,
 		Written:  written,
@@ -123,35 +114,6 @@ func (s *QuickSetupService) Apply(req models.QuickSetupApplyRequest) (*models.Qu
 
 // quickSetupPlaceholderRe 匹配 {{...}} 形态的未替换占位符。
 var quickSetupPlaceholderRe = regexp.MustCompile(`\{\{\s*[a-zA-Z_][a-zA-Z0-9_]*\s*\}\}`)
-
-// persistQuickSetupAppliedSnapshot 把 prepared 的每文件 {code, content} + RFC3339
-// 时间戳写入指定组合行的 applied_json/applied_at（v3.1）。组合不存在、software 与
-// 本次 apply 不一致或写库失败 → 仅 logger.Warn 跳过：apply 已成功落盘，快照属
-// 尽力而为的旁路数据，不连坐、不回滚。
-func persistQuickSetupAppliedSnapshot(software string, comboID int64, prepared []quickSetupPreparedFile) {
-	store := quickSetupComboStoreFn()
-	row, err := store.GetByID(comboID)
-	if err != nil {
-		logger.Warn(fmt.Sprintf("[quick-setup.apply] skip applied snapshot: load combo %d failed: %v", comboID, err))
-		return
-	}
-	if row.Software != software {
-		logger.Warn(fmt.Sprintf("[quick-setup.apply] skip applied snapshot: combo %d software %q != applied software %q", comboID, row.Software, software))
-		return
-	}
-	applied := make([]models.QuickSetupComboFile, 0, len(prepared))
-	for _, file := range prepared {
-		applied = append(applied, models.QuickSetupComboFile{Code: file.code, Content: file.content})
-	}
-	appliedJSON, err := json.Marshal(applied)
-	if err != nil {
-		logger.Warn(fmt.Sprintf("[quick-setup.apply] skip applied snapshot: marshal combo %d failed: %v", comboID, err))
-		return
-	}
-	if err := store.SetAppliedSnapshot(comboID, string(appliedJSON), time.Now().Format(time.RFC3339)); err != nil {
-		logger.Warn(fmt.Sprintf("[quick-setup.apply] persist applied snapshot for combo %d failed: %v", comboID, err))
-	}
-}
 
 // validateQuickSetupApplyFile 校验单个 apply 文件并返回命中的 catalog 声明文件，
 // 供调用方复用（备份 file_code）。占位符未替换即拒绝（spec §5）：组合渲染在前端

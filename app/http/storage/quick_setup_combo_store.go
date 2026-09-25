@@ -103,16 +103,6 @@ func hydrateCombo(row *models.QuickSetupCombo) error {
 		}
 		row.Files = files
 	}
-	// 上次应用快照（v3.1）：空列语义 = 空 slice（从未应用过）。
-	if row.Applied == nil {
-		applied := []models.QuickSetupComboFile{}
-		if row.AppliedJSON != "" {
-			if err := json.Unmarshal([]byte(row.AppliedJSON), &applied); err != nil {
-				return fmt.Errorf("failed to unmarshal combo applied snapshot: %w", err)
-			}
-		}
-		row.Applied = applied
-	}
 	return nil
 }
 
@@ -281,8 +271,8 @@ func (s *QuickSetupComboStore) SetDefault(software string, id int64) error {
 	})
 }
 
-// ComboToView 将存储行转换为 API 视图（Variables/Files/Applied 已反序列化；
-// nil 语义：Variables 空 map / Files/Applied 空 slice）。
+// ComboToView 将存储行转换为 API 视图（Variables/Files 已反序列化；
+// nil 语义：Variables 空 map / Files 空 slice）。
 // 瞬态字段非 nil 则直接采用（有意为空的 map/slice 得到尊重），
 // 仅 nil 时才回退反序列化 JSON 文本列——否则陈旧 JSON 会被回退路径泄漏进视图。
 func ComboToView(row *models.QuickSetupCombo) (*models.QuickSetupComboView, error) {
@@ -305,13 +295,6 @@ func ComboToView(row *models.QuickSetupCombo) (*models.QuickSetupComboView, erro
 			return nil, fmt.Errorf("failed to unmarshal combo files: %w", err)
 		}
 	}
-	applied := make([]models.QuickSetupComboFile, len(row.Applied))
-	copy(applied, row.Applied)
-	if row.Applied == nil && row.AppliedJSON != "" {
-		if err := json.Unmarshal([]byte(row.AppliedJSON), &applied); err != nil {
-			return nil, fmt.Errorf("failed to unmarshal combo applied snapshot: %w", err)
-		}
-	}
 	return &models.QuickSetupComboView{
 		ID:        row.ID,
 		Software:  row.Software,
@@ -319,28 +302,5 @@ func ComboToView(row *models.QuickSetupCombo) (*models.QuickSetupComboView, erro
 		IsDefault: row.IsDefault,
 		Variables: variables,
 		Files:     files,
-		Applied:   applied,
-		AppliedAt: row.AppliedAt,
 	}, nil
-}
-
-// SetAppliedSnapshot 持久化组合的「上次应用快照」（v3.1，combo 级）：
-// appliedJSON 是 [{code,content}] JSON 文本（空串 = 无快照），appliedAt 为 RFC3339
-// 时间戳。仅更新快照两列，不动模板/变量列，也不 bump updated_at（快照不是模板编辑）；
-// RowsAffected==0 → ErrComboNotFound。
-func (s *QuickSetupComboStore) SetAppliedSnapshot(id int64, appliedJSON, appliedAt string) error {
-	if err := s.ensureReady(); err != nil {
-		return err
-	}
-	result := s.db.Model(&models.QuickSetupCombo{ID: id}).UpdateColumns(map[string]interface{}{
-		"applied_json": appliedJSON,
-		"applied_at":   appliedAt,
-	})
-	if result.Error != nil {
-		return result.Error
-	}
-	if result.RowsAffected == 0 {
-		return fmt.Errorf("%w: id %d", ErrComboNotFound, id)
-	}
-	return nil
 }
