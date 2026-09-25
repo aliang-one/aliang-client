@@ -127,8 +127,8 @@ var (
 	//
 	// Explicitly set it to "0s" to disable. Blank/unparseable/negative values
 	// fall back to the default (see resolveEnvDurationAllowZero).
-	// Keep it below agentAIHardCeiling — that backstop fires on total active
-	// time, so a value at or above it neutralizes this guard. Approval waits
+	// Keep it below agentAIHardCeiling — that backstop fires on total elapsed
+	// run time, so a value above it neutralizes this guard. Approval waits
 	// never count against this ceiling (the clock is paused while a human
 	// decision is pending) and remain bounded by agentAIApprovalTimeout.
 	agentAIToolWaitCeiling = resolveEnvDurationAllowZero("ALIANG_AI_TOOL_WAIT_CEILING", time.Hour)

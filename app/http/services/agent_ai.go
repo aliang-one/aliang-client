@@ -1102,8 +1102,9 @@ func (a *agentAIActivity) killReasonOr(fallback string) string {
 }
 
 // startAIWatchdog cancels ctx when the run goes idle (no output for
-// agentAIIdleWindow and not awaiting approval/tool results) or exceeds
-// agentAIHardCeiling.
+// agentAIIdleWindow and not awaiting approval/tool results), produces no
+// meaningful progress for agentAINoProgressWindow, a contiguous tool/subagent
+// wait outlives agentAIToolWaitCeiling, or the run exceeds agentAIHardCeiling.
 // It exits as soon as ctx is done, so it never outlives the run.
 func (m *agentAIManager) startAIWatchdog(ctx context.Context, activity *agentAIActivity, cancel context.CancelFunc) {
 	if activity == nil || cancel == nil {
