@@ -1109,12 +1109,12 @@ func (m *agentAIManager) startAIWatchdog(ctx context.Context, activity *agentAIA
 	if activity == nil || cancel == nil {
 		return
 	}
-	go agentAIWatchdogLoop(ctx, activity, cancel, agentAIIdleWindow, agentAIHardCeiling, agentAINoProgressWindow, agentAIIdleCheckInterval)
+	go agentAIWatchdogLoop(ctx, activity, cancel, agentAIIdleWindow, agentAIHardCeiling, agentAINoProgressWindow, agentAIToolWaitCeiling, agentAIIdleCheckInterval)
 }
 
 // agentAIWatchdogLoop is the parameterized watchdog body, split out so tests can
 // drive it with tiny windows instead of the multi-minute production defaults.
-func agentAIWatchdogLoop(ctx context.Context, activity *agentAIActivity, cancel context.CancelFunc, idleWindow, hardCeiling, noProgressWindow, interval time.Duration) {
+func agentAIWatchdogLoop(ctx context.Context, activity *agentAIActivity, cancel context.CancelFunc, idleWindow, hardCeiling, noProgressWindow, toolWaitCeiling, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -1135,6 +1135,24 @@ func agentAIWatchdogLoop(ctx context.Context, activity *agentAIActivity, cancel 
 			// or human decision is work in flight, not looping.
 			if noProgressWindow > 0 && !activity.idlePaused() && activity.progressIdleFor() > noProgressWindow {
 				activity.setKillReason("no_progress")
+				cancel()
+				return
+			}
+			// Tool-wait ceiling: a contiguous tool/subagent wait (approval
+			// time excluded — the clock is cleared while a human decision is
+			// pending) that outlives the ceiling means the tool or subagent
+			// is hung. Every other guard is paused during such a wait by
+			// design, and the ai.run.progress heartbeat keeps feeding the
+			// server-side stale-run sweeper, so without this bound a hung
+			// subagent pins the run until the hard ceiling while the phone
+			// shows "running". The awaiting() re-check hardens against a
+			// theoretical stale-armed clock (a scheduler preemption inside
+			// beginToolUseWait's Add→Store window landing exactly as an
+			// approval hook fires): approval waits are bounded separately by
+			// agentAIApprovalTimeout, so skipping the kill while a human
+			// decision is pending is always safe.
+			if toolWaitCeiling > 0 && !activity.awaiting() && activity.toolWaitFor() > toolWaitCeiling {
+				activity.setKillReason("tool_wait_timeout")
 				cancel()
 				return
 			}
