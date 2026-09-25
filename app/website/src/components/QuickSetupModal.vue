@@ -964,7 +964,7 @@ const applyReadiness = computed(() => {
   const missing = new Set();
   for (const file of files) {
     // 内容优先级与 applyCombo 一致：手动编辑的预览优先（可能仍含手打占位符，统一过渲染与空值预检）
-    const content = previewEdits.value[file.code] ?? file?.content;
+    const content = file ? (previewEdits.value[file.code] ?? file.content) : '';
     for (const name of findUnresolvedPlaceholders(renderComboContent(content, vars))) {
       missing.add(name);
     }
