@@ -935,9 +935,17 @@ type agentAIActivity struct {
 	lastProgressAt   atomic.Int64
 	awaitingApproval atomic.Bool
 	pendingToolUses  atomic.Int64
-	runStart         time.Time
-	killReasonMu     sync.RWMutex
-	killReason       string
+	// toolWaitStartedAt is the UnixNano instant the current CONTIGUOUS
+	// tool/subagent wait began (0 = not waiting). The tool-wait watchdog uses
+	// it to bound hung tools/subagents that would otherwise survive until the
+	// hard ceiling while the progress heartbeat keeps telling the server the
+	// run is alive. Cleared while a human approval is pending so approval
+	// time never counts against the ceiling (approvals are bounded separately
+	// by agentAIApprovalTimeout).
+	toolWaitStartedAt atomic.Int64
+	runStart          time.Time
+	killReasonMu      sync.RWMutex
+	killReason        string
 }
 
 func newAgentAIActivity() *agentAIActivity {
@@ -988,6 +996,15 @@ func (a *agentAIActivity) setAwaitingApproval(v bool) {
 		return
 	}
 	a.awaitingApproval.Store(v)
+	if v {
+		// Approval time is human time, not tool time: pause the tool-wait
+		// clock so a slow decision never trips the tool-wait ceiling.
+		a.toolWaitStartedAt.Store(0)
+	} else if a.pendingToolUses.Load() > 0 {
+		// Decision resolved but the tool is still in flight: re-arm with a
+		// fresh ceiling window for the remaining execution.
+		a.toolWaitStartedAt.Store(time.Now().UnixNano())
+	}
 	a.bump()
 }
 
@@ -998,6 +1015,19 @@ func (a *agentAIActivity) awaiting() bool {
 	return a.awaitingApproval.Load()
 }
 
+// toolWaitFor reports how long the current contiguous tool/subagent wait has
+// been in flight, excluding approval-pending time. 0 when not waiting.
+func (a *agentAIActivity) toolWaitFor() time.Duration {
+	if a == nil {
+		return 0
+	}
+	ts := a.toolWaitStartedAt.Load()
+	if ts == 0 {
+		return 0
+	}
+	return time.Since(time.Unix(0, ts))
+}
+
 // beginToolUseWait marks that Claude has emitted a tool_use (Task/subagent,
 // Bash, etc.) and the run is legitimately silent until a matching tool_result
 // arrives. It bumps activity so the run gets a fresh idle window once the tool
@@ -1006,7 +1036,9 @@ func (a *agentAIActivity) beginToolUseWait() {
 	if a == nil {
 		return
 	}
-	a.pendingToolUses.Add(1)
+	if a.pendingToolUses.Add(1) == 1 {
+		a.toolWaitStartedAt.Store(time.Now().UnixNano())
+	}
 	a.bump()
 }
 
@@ -1020,6 +1052,9 @@ func (a *agentAIActivity) endToolUseWait() {
 			break
 		}
 		if a.pendingToolUses.CompareAndSwap(current, current-1) {
+			if current-1 == 0 {
+				a.toolWaitStartedAt.Store(0)
+			}
 			break
 		}
 	}

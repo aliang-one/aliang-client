@@ -60,6 +60,60 @@ func TestAgentAIActivityLifecycle(t *testing.T) {
 	}
 }
 
+func TestAgentAIActivityToolWaitClock(t *testing.T) {
+	a := newAgentAIActivity()
+
+	// 未等待时时钟为 0。
+	if got := a.toolWaitFor(); got != 0 {
+		t.Fatalf("fresh activity toolWaitFor = %v, want 0", got)
+	}
+
+	// 首次 begin 起表。
+	a.beginToolUseWait()
+	time.Sleep(5 * time.Millisecond) // coarse wall-clock guard: the clock must tick
+	if got := a.toolWaitFor(); got <= 0 {
+		t.Fatalf("after beginToolUseWait toolWaitFor = %v, want > 0", got)
+	}
+
+	// 嵌套等待：第二个 begin 不得重置时钟（连续等待语义）。
+	first := a.toolWaitFor()
+	time.Sleep(5 * time.Millisecond)
+	a.beginToolUseWait()
+	if got := a.toolWaitFor(); got < first {
+		t.Fatalf("nested beginToolUseWait reset the clock: %v < %v", got, first)
+	}
+
+	// 审批挂起：时钟清零（人的决策时间不计入）。
+	a.setAwaitingApproval(true)
+	if got := a.toolWaitFor(); got != 0 {
+		t.Fatalf("approval should pause tool-wait clock, got %v", got)
+	}
+
+	// 审批解除且仍有 pending：重新起表。
+	a.setAwaitingApproval(false)
+	time.Sleep(5 * time.Millisecond) // coarse wall-clock guard: re-armed clock must tick
+	if got := a.toolWaitFor(); got <= 0 {
+		t.Fatalf("approval resolve with pending tools should re-arm clock, got %v", got)
+	}
+
+	// 归零清表：最后一个 tool_result 到达后时钟回 0。
+	a.endToolUseWait()
+	a.endToolUseWait()
+	if got := a.toolWaitFor(); got != 0 {
+		t.Fatalf("after all tools resolved toolWaitFor = %v, want 0", got)
+	}
+	if a.idlePaused() {
+		t.Fatal("idle watchdog should be unpaused once all tools resolved")
+	}
+
+	// 审批解除但无 pending 时不误起表。
+	a.setAwaitingApproval(true)
+	a.setAwaitingApproval(false)
+	if got := a.toolWaitFor(); got != 0 {
+		t.Fatalf("approval resolve with no pending tools should leave clock at 0, got %v", got)
+	}
+}
+
 func TestAgentAIActivityProgressTracking(t *testing.T) {
 	a := newAgentAIActivity()
 
