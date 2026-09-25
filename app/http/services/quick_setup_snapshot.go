@@ -75,6 +75,7 @@ func (s *QuickSetupService) ConfigState(softwareCode string) (models.QuickSetupC
 	}
 	for _, fileDef := range softwareDef.Files {
 		entry := models.QuickSetupConfigStateFile{
+			Code:   fileDef.Code,
 			Path:   fileDef.DefaultPath,
 			Format: fileDef.Format,
 		}

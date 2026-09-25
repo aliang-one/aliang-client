@@ -106,6 +106,7 @@ type QuickSetupRestoreResponse struct {
 }
 
 type QuickSetupConfigStateFile struct {
+	Code            string `json:"code"`
 	Path            string `json:"path"`
 	Exists          bool   `json:"exists"`
 	Size            int64  `json:"size,omitempty"`

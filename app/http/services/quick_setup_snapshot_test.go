@@ -41,6 +41,9 @@ func TestConfigState(t *testing.T) {
 		t.Fatalf("files: %+v", state.Files)
 	}
 	cfg := state.Files[0] // 顺序与软件定义一致：config.toml 在前
+	if cfg.Code != "config" {
+		t.Fatalf("config code: %+v", cfg)
+	}
 	if !cfg.Exists || !cfg.ManagedByAliang {
 		t.Fatalf("config state: %+v", cfg)
 	}
@@ -57,6 +60,9 @@ func TestConfigState(t *testing.T) {
 		t.Fatalf("config modified_at must be set: %+v", cfg)
 	}
 	auth := state.Files[1]
+	if auth.Code != "auth" {
+		t.Fatalf("auth code: %+v", auth)
+	}
 	if auth.Exists {
 		t.Fatal("auth.json should not exist")
 	}
