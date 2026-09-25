@@ -5,7 +5,7 @@
       <div class="flex items-start gap-3">
         <span class="material-symbols-outlined mt-0.5 text-2xl text-primary">fact_check</span>
         <div class="min-w-0">
-          <h3 class="text-xl font-semibold text-slate-900 dark:text-white">{{ t('qs_state_title') }}</h3>
+          <h3 class="text-xl font-semibold text-slate-900 dark:text-white">{{ t('qs_tab_backup') }}</h3>
           <p class="mt-0.5 truncate font-mono text-sm text-slate-500 dark:text-slate-400">{{ software }}</p>
         </div>
       </div>

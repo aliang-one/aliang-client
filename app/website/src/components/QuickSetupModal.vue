@@ -292,7 +292,7 @@
                   ]"
                   @click="activeTab = 'state'"
                 >
-                  {{ t('qs_state_title') }}
+                  {{ t('qs_tab_backup') }}
                 </button>
               </div>
             </div>
@@ -370,7 +370,7 @@
                 </div>
               </div>
 
-              <!-- 渲染视图：变量已替换 = apply 所见 -->
+              <!-- 两列 diff 视图：左=渲染预览（apply 所见），右=上次应用快照；变更行淡色标记 -->
               <div v-else-if="activeFile" class="mt-2">
                 <div class="flex flex-wrap items-center justify-between gap-2">
                   <div class="flex min-w-0 items-center gap-2">
@@ -389,7 +389,48 @@
                     </button>
                   </div>
                 </div>
-                <pre class="code-editor mt-2 max-h-[420px] min-h-[240px] overflow-auto rounded-2xl border border-slate-200 bg-slate-950 px-4 py-3 text-[12px] leading-6 text-slate-100 custom-scrollbar dark:border-slate-700">{{ renderedContent }}</pre>
+
+                <div class="mt-2 grid gap-3 xl:grid-cols-2">
+                  <!-- 左列：配置预览（渲染） -->
+                  <section class="min-w-0 overflow-hidden rounded-2xl border border-slate-200 dark:border-slate-700">
+                    <p class="border-b border-slate-200 bg-slate-100/70 px-4 py-2 text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-400">
+                      {{ t('qs_diff_left') }}
+                    </p>
+                    <div class="code-editor custom-scrollbar max-h-[420px] min-h-[240px] overflow-auto bg-slate-950 py-3 text-[12px] text-slate-100">
+                      <div
+                        v-for="(line, index) in diffView.leftLines"
+                        :key="`diff-left-${index}`"
+                        class="min-h-6 whitespace-pre px-4 leading-6"
+                        :class="diffView.leftFlags[index] ? 'bg-amber-400/15' : ''"
+                      >{{ line }}</div>
+                    </div>
+                  </section>
+
+                  <!-- 右列：上次应用（快照 + 本地时间） -->
+                  <section class="min-w-0 overflow-hidden rounded-2xl border border-slate-200 dark:border-slate-700">
+                    <p class="border-b border-slate-200 bg-slate-100/70 px-4 py-2 text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-400">
+                      {{ t('qs_diff_right') }}
+                      <span
+                        v-if="appliedAtLabel"
+                        class="ml-1 font-mono text-[10px] font-normal normal-case tracking-normal text-slate-400 dark:text-slate-500"
+                      >{{ appliedAtLabel }}</span>
+                    </p>
+                    <div
+                      v-if="appliedContent === null"
+                      class="flex max-h-[420px] min-h-[240px] items-center justify-center bg-slate-950 px-4 text-[12px] text-slate-500"
+                    >
+                      {{ t('qs_diff_never_applied') }}
+                    </div>
+                    <div v-else class="code-editor custom-scrollbar max-h-[420px] min-h-[240px] overflow-auto bg-slate-950 py-3 text-[12px] text-slate-100">
+                      <div
+                        v-for="(line, index) in diffView.rightLines"
+                        :key="`diff-right-${index}`"
+                        class="min-h-6 whitespace-pre px-4 leading-6"
+                        :class="diffView.rightFlags[index] ? 'bg-amber-400/15' : ''"
+                      >{{ line }}</div>
+                    </div>
+                  </section>
+                </div>
               </div>
 
               <!-- 该 agent 暂无组合（理论上会被服务端种子兜底） -->
@@ -539,7 +580,7 @@ import { useI18n } from '../i18n';
 import QuickSetupConfigurePanel from './QuickSetupConfigurePanel.vue';
 import QuickSetupResultPanel from './QuickSetupResultPanel.vue';
 import QuickSetupStatePanel from './QuickSetupStatePanel.vue';
-import { findUnresolvedPlaceholders, renderComboContent } from '../utils/quickSetupState';
+import { diffChangedLines, findUnresolvedPlaceholders, renderComboContent } from '../utils/quickSetupState';
 
 const { t } = useI18n();
 
@@ -611,6 +652,32 @@ const activeFileDecl = computed(() => {
 });
 // 渲染视图 = apply 所见（同一 renderComboContent 产物）
 const renderedContent = computed(() => renderComboContent(activeFile.value?.content, activeCombo.value?.variables));
+// 右列内容：上次应用快照（applied）中该 code 的 content；null = 该组合从未应用过
+const appliedContent = computed(() => {
+  const applied = Array.isArray(activeCombo.value?.applied) ? activeCombo.value.applied : [];
+  const hit = applied.find((item) => item?.code === activeFileCode.value);
+  return hit ? String(hit.content ?? '') : null;
+});
+// applied_at（RFC3339）→ 本地时间展示；空串（从未应用）不出标签，解析失败原样透出
+const appliedAtLabel = computed(() => {
+  const raw = String(activeCombo.value?.applied_at || '');
+  if (!raw) {
+    return '';
+  }
+  const date = new Date(raw);
+  return Number.isNaN(date.getTime()) ? raw : date.toLocaleString();
+});
+// 两列 diff 视图：行数组 + 变更行标记（右列从未应用时渲染空态，flags 不参与展示）
+const diffView = computed(() => {
+  const rightContent = appliedContent.value;
+  const { leftFlags, rightFlags } = diffChangedLines(renderedContent.value, rightContent ?? '');
+  return {
+    leftLines: String(renderedContent.value ?? '').split('\n'),
+    rightLines: rightContent === null ? [] : rightContent.split('\n'),
+    leftFlags,
+    rightFlags,
+  };
+});
 // apply 前置校验：渲染后不得残留占位符，且模板引用的变量值必须非空
 // （空白种子的 api_key/model 是 ""，仅查渲染标记拦不住空值）
 const applyReadiness = computed(() => {
@@ -1001,14 +1068,29 @@ async function applyCombo() {
     statusMessage.value = t('qs_noFilesWritten');
     return;
   }
+  // 乐观快照源：与 filesToApply 同源（code + 本次渲染内容），apply 成功后整对象替换 activeCombo
+  const appliedSnapshot = (combo.files || [])
+    .filter((file) => declaredByCode.has(file.code))
+    .map((file) => ({ code: file.code, content: renderComboContent(file.content, vars) }));
   applying.value = true;
   try {
-    const result = await applyQuickSetup(selectedSoftware.value, filesToApply);
+    const result = await applyQuickSetup({
+      software: selectedSoftware.value,
+      files: filesToApply,
+      combo_id: combo.id,
+    });
     const writtenCount = Array.isArray(result?.written) ? result.written.length : 0;
     if (writtenCount > 0) {
       statusMessage.value = '';
       // 结果页渲染在 edit 页签内；apply 入口在 header，防御性确保结果视图可见
       activeTab.value = 'edit';
+      // 乐观更新上次应用快照：右列 diff 即时变干净（后端已持久化权威快照，重开弹窗自然对齐；
+      // 绝不深改原组合——展开为整对象新引用替换）
+      adoptCombo({
+        ...combo,
+        applied: appliedSnapshot,
+        applied_at: new Date().toISOString(),
+      });
       // 应用前的渲染快照即写入磁盘的最终内容（path+content 窄快照，供结果面板展示）
       applyResult.value = {
         softwareName: `${def.name || selectedSoftware.value} · ${combo.name}`,

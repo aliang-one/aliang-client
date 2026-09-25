@@ -45,12 +45,16 @@ export async function getQuickSetupCatalog() {
   };
 }
 
-export async function applyQuickSetup(software, files) {
+// apply：{ software, files, combo_id }——combo_id 命中该 software 的组合时，
+// 后端在 apply 成功后自行持久化该组合的上次应用快照（applied/applied_at）
+export async function applyQuickSetup(payload) {
+  const body = payload && typeof payload === 'object' ? payload : {};
   return rawRequest('/api/quick-setup/apply', {
     method: 'POST',
     body: JSON.stringify({
-      software,
-      files: Array.isArray(files) ? files : [],
+      software: body.software,
+      files: Array.isArray(body.files) ? body.files : [],
+      combo_id: Number(body.combo_id) || 0,
     }),
   });
 }
