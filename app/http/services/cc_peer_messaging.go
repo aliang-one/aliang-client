@@ -2,12 +2,15 @@ package services
 
 import (
 	"bufio"
+	"bytes"
 	crand "crypto/rand"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -101,6 +104,10 @@ type ccPeerUserFrame struct {
 		Content string `json:"content"`
 	} `json:"message"`
 	Priority string `json:"priority"`
+	// FromMode 是 CC 2.1.280 入站 parity 门的佐证字段("bypass"/"prompting",
+	// sender 自报的 permission class——标签非证明)。缺省时 bypass 接收方按
+	// no-mode-asserted 扣住(实测:2026-09-26 b1f82c61 同步通知被 held)。
+	FromMode string `json:"fromMode,omitempty"`
 }
 
 // ccPeerMsgID mints a uuid4-shaped id for the user frame. Entropy failure
@@ -120,7 +127,7 @@ func ccPeerAuthLine(token string) string {
 	return string(b)
 }
 
-func ccPeerUserLine(content string) string {
+func ccPeerUserLine(content, fromMode string) string {
 	var f ccPeerUserFrame
 	f.MsgV = 1
 	f.MsgID = ccPeerMsgID()
@@ -128,6 +135,7 @@ func ccPeerUserLine(content string) string {
 	f.Message.Role = "user"
 	f.Message.Content = content
 	f.Priority = "next"
+	f.FromMode = fromMode
 	b, _ := json.Marshal(f)
 	return string(b)
 }
@@ -143,8 +151,9 @@ const (
 // delivery produces NO receipt frame on the injecting socket, so there is
 // nothing to read — success means the frames flushed. Non-delivery outcomes
 // surface elsewhere: a busy TUI queues the message (delivered after its
-// turn); a held/denied inbound gate shows its approval prompt inside the TUI.
-func ccPeerInject(socketPath, token, digest string) error {
+// turn); a held inbound gate is SILENT on the socket and shows no prompt in
+// bypass-permission sessions — ccPeerWatchHeld detects it via the transcript.
+func ccPeerInject(socketPath, token, digest, fromMode string) error {
 	conn, err := net.DialTimeout("unix", socketPath, ccPeerDialTimeout)
 	if err != nil {
 		return err
@@ -157,10 +166,91 @@ func ccPeerInject(socketPath, token, digest string) error {
 			return err
 		}
 	}
-	if _, err := w.WriteString(ccPeerUserLine(digest) + "\n"); err != nil {
+	if _, err := w.WriteString(ccPeerUserLine(digest, fromMode) + "\n"); err != nil {
 		return err
 	}
 	return w.Flush()
+}
+
+// ccPeerTUIPermissionClass reads the LAST "permissionMode" recorded in the
+// session transcript (every TUI-written line carries it) and maps it to CC's
+// inbound parity classes: bypassPermissions → "bypass", anything else →
+// "prompting". Empty when the transcript is missing/unreadable/mode-less — the
+// caller then omits fromMode, which restores pre-hardening behavior (prompting
+// receivers accept, bypass receivers hold).
+func ccPeerTUIPermissionClass(jsonlPath string) string {
+	jsonlPath = strings.TrimSpace(jsonlPath)
+	if jsonlPath == "" {
+		return ""
+	}
+	f, err := os.Open(jsonlPath)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || info.Size() <= 0 {
+		return ""
+	}
+	const tailCap = 64 * 1024
+	offset := int64(0)
+	if info.Size() > tailCap {
+		offset = info.Size() - tailCap
+	}
+	buf := make([]byte, info.Size()-offset)
+	if _, err := f.ReadAt(buf, offset); err != nil && err != io.EOF {
+		return ""
+	}
+	matches := ccPermissionModeRe.FindAllSubmatch(buf, -1)
+	if len(matches) == 0 {
+		return ""
+	}
+	if string(matches[len(matches)-1][1]) == "bypassPermissions" {
+		return "bypass"
+	}
+	return "prompting"
+}
+
+// ccPermissionModeRe matches the permissionMode field CC writes on every
+// transcript line; non-JSON lines in between are simply non-matches.
+var ccPermissionModeRe = regexp.MustCompile(`"permissionMode":"([a-zA-Z]+)"`)
+
+// ccPeerHeldWatchWindow is how long the injector watches the transcript for a
+// "Held peer message" entry after writing the frames. CC parks held messages
+// SILENTLY from the injector's perspective — bypass-permission sessions show
+// no approval prompt (2026-09-26 b1f82c61 实测) — so the transcript is the only
+// observable outcome.
+var ccPeerHeldWatchWindow = 3 * time.Second
+
+// ccPeerWatchHeld reports whether CC parked the injected message: it watches
+// jsonlPath beyond offset for the "Held peer message" system entry CC appends
+// on a hold. Best-effort — false (treated as delivered) on timeout.
+func ccPeerWatchHeld(jsonlPath string, offset int64, timeout time.Duration) bool {
+	jsonlPath = strings.TrimSpace(jsonlPath)
+	if jsonlPath == "" || offset < 0 {
+		return false
+	}
+	deadline := time.Now().Add(timeout)
+	seen := offset
+	for {
+		if f, err := os.Open(jsonlPath); err == nil {
+			if info, err := f.Stat(); err == nil && info.Size() > seen {
+				buf := make([]byte, info.Size()-seen)
+				if _, err := f.ReadAt(buf, seen); err == nil || err == io.EOF {
+					seen = info.Size()
+					if bytes.Contains(buf, []byte("Held peer message")) {
+						f.Close()
+						return true
+					}
+				}
+			}
+			f.Close()
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 // TUI sync coalescing (spec §3): repeated ai.tui.sync for the same native
@@ -247,11 +337,13 @@ func ccPeerSyncFire(home, nativeSessionID string) {
 		tuiStart = claudePeerKeyModTime(home, record.PID)
 	}
 	size, mod := int64(0), time.Time{}
-	if jsonl := ccPeerSessionJSONL(home, nativeSessionID); jsonl != "" {
-		if info, err := os.Stat(jsonl); err == nil {
+	jsonlPath := ccPeerSessionJSONL(home, nativeSessionID)
+	if jsonlPath != "" {
+		if info, err := os.Stat(jsonlPath); err == nil {
 			size, mod = info.Size(), info.ModTime()
 		}
 	}
+	fromMode := ccPeerTUIPermissionClass(jsonlPath)
 	if !ccPeerSyncShouldInject(ccPeerSyncGateInput{
 		RecordLive: live, RecordStatus: record.Status, SocketPath: socketPath,
 		BaselineSize: baseline, BaselineKnown: baselineKnown,
@@ -260,14 +352,18 @@ func ccPeerSyncFire(home, nativeSessionID string) {
 		logger.Info(fmt.Sprintf("ai.tui.sync: gate dropped home=%q native=%s live=%v status=%q socket=%q", home, nativeSessionID, live, strings.TrimSpace(record.Status), socketPath))
 		return
 	}
-	if err := ccPeerDialInject(socketPath, loadClaudePeerToken(home, record.PID), pending.digest); err != nil {
+	if err := ccPeerDialInject(socketPath, loadClaudePeerToken(home, record.PID), pending.digest, fromMode); err != nil {
 		logger.Info(fmt.Sprintf("ai.tui.sync: inject failed home=%q native=%s error=%v", home, nativeSessionID, err))
+		return
+	}
+	if ccPeerWatchHeld(jsonlPath, size, ccPeerHeldWatchWindow) {
+		logger.Info(fmt.Sprintf("ai.tui.sync: HELD by receiver home=%q native=%s fromMode=%q — baseline not updated", home, nativeSessionID, fromMode))
 		return
 	}
 	ccPeerSyncMu.Lock()
 	ccPeerSyncBaseline[nativeSessionID] = size
 	ccPeerSyncMu.Unlock()
-	logger.Info(fmt.Sprintf("ai.tui.sync: frames written home=%q native=%s bytes=%d (no receipt by design, see plan 附录 A)", home, nativeSessionID, size))
+	logger.Info(fmt.Sprintf("ai.tui.sync: frames written home=%q native=%s bytes=%d fromMode=%q (no receipt by design, see plan 附录 A)", home, nativeSessionID, size, fromMode))
 }
 
 // tuiSync handles ai.tui.sync (server → agent, best-effort, no reply).
