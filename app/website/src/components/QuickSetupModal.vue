@@ -330,8 +330,8 @@
                 </div>
               </div>
 
-              <!-- 合并编辑器（git merge 风格）：左=在用配置（只读，染色随预览编辑实时重算），
-                   中=变更块卡片（块级「← 采用在用」），右=渲染预览（常驻可编辑 textarea，apply 所见） -->
+              <!-- 合并编辑器（两列）：左=在用配置只读（git 染色，变更块整块红底 + 内联
+                   「采用此块 →」按钮），右=渲染预览（常驻可编辑 textarea，apply 所见） -->
               <div v-else-if="activeFile" class="mt-2">
                 <div class="flex flex-wrap items-center justify-between gap-2">
                   <div class="flex min-w-0 items-center gap-2">
@@ -376,7 +376,7 @@
                 </div>
 
                 <!-- 无基线（在用文件未生成/超限/拉取失败）：纤细状态条 + 全宽可编辑预览
-                     （textarea 常驻语义：无 diff 可算时预览本体仍是同一编辑入口，无染色无卡片） -->
+                     （textarea 常驻语义：无 diff 可算时预览本体仍是同一编辑入口，无染色无变更块） -->
                 <div v-if="liveContent === null" class="mt-2 overflow-hidden rounded-2xl border border-slate-200 dark:border-slate-700">
                   <div class="border-b border-slate-200 bg-slate-100/70 px-3 py-2 text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-400">
                     <!-- 拉取失败 > 文件存在但读不到 > 尚未生成，三层空态文案 -->
@@ -391,10 +391,11 @@
                   ></textarea>
                 </div>
 
-                <!-- 合并编辑器三栏主体：左在用只读（git 染色）/ 中变更块卡片 / 右预览 textarea -->
-                <div v-else class="mt-2 grid h-[440px] grid-cols-[minmax(0,1fr)_13rem_minmax(0,1fr)] overflow-hidden rounded-2xl border border-slate-200 dark:border-slate-700">
+                <!-- 合并编辑器两列主体：左在用只读（git 染色，变更块内联采用按钮）/ 右预览 textarea -->
+                <div v-else class="mt-2 grid h-[440px] grid-cols-[minmax(0,1fr)_minmax(0,1fr)] overflow-hidden rounded-2xl border border-slate-200 dark:border-slate-700">
                   <!-- 左列：在用配置只读。染色相对当前预览内容实时重算：与预览相比被移除/
-                       被替换的行染红（removed/changed），same 中性；added 行只在右列存在，不渲染 -->
+                       被替换的行聚成变更块（整块红底，块内行保持 git 染色与行号），same 中性走
+                       普通行；added 行只在右列存在，不渲染。块悬停浮现「采用此块 →」整块并入预览 -->
                   <div class="flex min-h-0 flex-col border-r border-slate-200 dark:border-slate-700">
                     <div class="flex shrink-0 flex-wrap items-center gap-x-1.5 border-b border-slate-200 bg-slate-100/70 px-3 py-2 text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-400">
                       {{ t('qs_diff_left') }}
@@ -404,69 +405,44 @@
                       >{{ liveModifiedLabel }}</span>
                     </div>
                     <div class="code-editor custom-scrollbar min-h-0 flex-1 overflow-auto bg-slate-950 py-3 text-[12px] text-slate-100">
-                      <div
-                        v-for="line in diffLeftRows"
-                        :key="`left-${line.key}`"
-                        class="flex min-h-6 leading-6"
-                        :class="line.changed ? 'bg-rose-500/15 text-rose-200' : ''"
-                      >
-                        <span class="w-10 shrink-0 select-none bg-slate-900/60 pr-2 text-right font-mono text-[11px] text-slate-600">{{ line.no }}</span>
-                        <span class="min-w-0 flex-1 whitespace-pre px-3">{{ line.text }}</span>
-                      </div>
-                    </div>
-                  </div>
-
-                  <!-- 中栏：变更块卡片（groupDiffHunks 每块一卡，「← 采用在用」把该块在用行整块并入预览） -->
-                  <div class="flex min-h-0 flex-col border-r border-slate-200 bg-slate-50/60 dark:border-slate-700 dark:bg-slate-900/60">
-                    <div class="shrink-0 border-b border-slate-200 bg-slate-100/70 px-3 py-2 text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-400">
-                      {{ t('qs_merge_hunk') }}
-                    </div>
-                    <div class="custom-scrollbar min-h-0 flex-1 space-y-2 overflow-y-auto p-2">
-                      <div
-                        v-if="!diffHunks.length"
-                        class="px-1 py-2 text-center text-[11px] leading-5 text-slate-400 dark:text-slate-500"
-                      >
-                        {{ t('qs_merge_no_changes') }}
-                      </div>
-                      <div
-                        v-for="(hunk, index) in diffHunks"
-                        :key="`hunk-${index}`"
-                        class="rounded-xl border border-slate-200 bg-white dark:border-slate-700 dark:bg-slate-900"
-                      >
-                        <div class="flex items-center justify-between gap-1 border-b border-slate-100 px-2 py-1.5 dark:border-slate-800">
-                          <span class="text-[10px] font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
-                            {{ t('qs_merge_hunk') }} {{ index + 1 }}
-                          </span>
-                          <button
-                            type="button"
-                            class="inline-flex min-h-6 shrink-0 items-center rounded-lg border border-slate-200 px-1.5 text-[10px] font-semibold text-slate-600 transition hover:border-primary/40 hover:text-primary dark:border-slate-600 dark:text-slate-300 dark:hover:border-primary/40 dark:hover:text-primary"
-                            @click="adoptHunk(hunk)"
+                      <template v-for="(segment, si) in diffLeftSegments" :key="`seg-${si}`">
+                        <!-- 中性段：与预览一致的行，无染色 -->
+                        <template v-if="segment.kind === 'plain'">
+                          <div
+                            v-for="(line, li) in segment.lines"
+                            :key="`p-${si}-${li}`"
+                            class="flex min-h-6 leading-6"
                           >
-                            {{ t('qs_merge_adopt_left') }}
+                            <span class="w-10 shrink-0 select-none bg-slate-900/60 pr-2 text-right font-mono text-[11px] text-slate-600">{{ line.no }}</span>
+                            <span class="min-w-0 flex-1 whitespace-pre px-3">{{ line.text }}</span>
+                          </div>
+                        </template>
+                        <!-- 变更块：整块红底包裹（块级 splice 采用的视觉锚点），块尾右上角悬停
+                             浮现「采用此块 →」按钮，点击把该块在用行整块并入右列预览 -->
+                        <div v-else class="group/hunk relative bg-rose-500/15">
+                          <button
+                            v-if="segment.hunk"
+                            type="button"
+                            class="absolute right-1.5 top-1 z-10 inline-flex min-h-6 shrink-0 items-center rounded-lg border border-rose-300/60 bg-slate-900/90 px-1.5 text-[10px] font-semibold text-rose-200 opacity-0 transition hover:border-rose-300 hover:text-rose-50 focus-visible:opacity-100 group-hover/hunk:opacity-100 dark:border-rose-500/50"
+                            @click="adoptHunk(segment.hunk)"
+                          >
+                            {{ t('qs_diff_adopt_block') }}
                           </button>
-                        </div>
-                        <div class="px-2 py-1.5 font-mono text-[10px] leading-4">
                           <div
-                            v-for="(text, i) in hunkLeftPreview(hunk)"
-                            :key="`hunk-${index}-l-${i}`"
-                            class="truncate text-rose-600 dark:text-rose-400"
-                            :title="text"
-                          >- {{ text }}</div>
-                          <div v-if="hunk.leftLines.length > hunkPreviewMax" class="text-slate-400 dark:text-slate-500">…</div>
-                          <div
-                            v-for="(text, i) in hunkRightPreview(hunk)"
-                            :key="`hunk-${index}-r-${i}`"
-                            class="truncate text-emerald-600 dark:text-emerald-400"
-                            :title="text"
-                          >+ {{ text }}</div>
-                          <div v-if="hunk.rightLines.length > hunkPreviewMax" class="text-slate-400 dark:text-slate-500">…</div>
+                            v-for="(line, li) in segment.lines"
+                            :key="`h-${si}-${li}`"
+                            class="flex min-h-6 leading-6 text-rose-200"
+                          >
+                            <span class="w-10 shrink-0 select-none bg-slate-900/60 pr-2 text-right font-mono text-[11px] text-slate-600">{{ line.no }}</span>
+                            <span class="min-w-0 flex-1 whitespace-pre px-3">{{ line.text }}</span>
+                          </div>
                         </div>
-                      </div>
+                      </template>
                     </div>
                   </div>
 
                   <!-- 右列：渲染预览 = apply 将写入的内容。textarea 常驻可编辑（input 即写
-                       previewEdits，左列染色/中栏卡片/预检全部响应式重算），等宽字体行高与左列一致 -->
+                       previewEdits，左列染色/变更块/预检全部响应式重算），等宽字体行高与左列一致 -->
                   <div class="flex min-h-0 flex-col">
                     <div class="flex shrink-0 flex-wrap items-center gap-x-1.5 border-b border-slate-200 bg-slate-100/70 px-3 py-2 text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-400">
                       {{ t('qs_diff_right') }}
@@ -927,35 +903,59 @@ const diffRows = computed(() => {
   }
   return diffRowsAligned(inUse, effectivePreviewContent.value);
 });
-// 合并编辑器左列：在用配置只读行（added 行只在右列存在，跳过）。染色相对当前预览内容
-// 实时重算——removed/changed（与预览相比被移除/被替换）标红，same 中性；
+// 变更块：groupDiffHunks 对当前 diff 分块（无基线 → 空数组，左列只出中性段）
+const diffHunks = computed(() => groupDiffHunks(diffRows.value || []));
+// 合并编辑器左列分块渲染：same 行走中性段（plain），连续变更行（removed/changed，
+// 与 groupDiffHunks 同款「连续非 same 即一块」语义；added 只在右列，归入当前块但不渲染行）
+// 聚成整块红底的变更块（hunk）。块 → hunk 按 leftStart 匹配：块首行的 leftIndex 恰为
+// 所属 hunk 的 leftStart（纯 added 开头的 hunk 由回落逻辑从后续左行取 leftStart；
+// 纯 added hunk leftStart=null 永不误配），避免「纯新增块不产生左列块」造成的序号错位。
 // 行号 = 在用配置行号（leftIndex+1，顺序渲染下与递增计数等价）
-const diffLeftRows = computed(() => {
+const diffLeftSegments = computed(() => {
   const rows = diffRows.value || [];
-  const lines = [];
+  const hunkByLeftStart = new Map();
+  for (const hunk of diffHunks.value) {
+    if (hunk && Number.isInteger(hunk.leftStart) && !hunkByLeftStart.has(hunk.leftStart)) {
+      hunkByLeftStart.set(hunk.leftStart, hunk);
+    }
+  }
+  const segments = [];
+  let plain = [];
+  let block = null;
+  let rendered = 0;
+  const flushPlain = () => {
+    if (plain.length) {
+      segments.push({ kind: 'plain', lines: plain });
+      plain = [];
+    }
+  };
+  const rowNo = (row) => (Number.isInteger(row.leftIndex) ? row.leftIndex : rendered) + 1;
   for (const row of rows) {
+    if (!row || row.type === 'same') {
+      if (block) {
+        segments.push(block);
+        block = null;
+      }
+      plain.push({ no: rowNo(row), text: row?.left ?? row?.right ?? '' });
+      rendered += 1;
+      continue;
+    }
     if (row.type === 'added') {
       continue;
     }
-    lines.push({
-      key: `${lines.length}-${row.type}`,
-      no: (Number.isInteger(row.leftIndex) ? row.leftIndex : lines.length) + 1,
-      text: row.left ?? '',
-      changed: row.type === 'removed' || row.type === 'changed',
-    });
+    if (!block) {
+      flushPlain();
+      block = { kind: 'hunk', hunk: hunkByLeftStart.get(row.leftIndex) || null, lines: [] };
+    }
+    block.lines.push({ no: rowNo(row), text: row.left ?? '' });
+    rendered += 1;
   }
-  return lines;
+  flushPlain();
+  if (block) {
+    segments.push(block);
+  }
+  return segments;
 });
-// 中栏变更块：groupDiffHunks 对当前 diff 分块（无基线 → 空数组，中栏不出卡片）
-const diffHunks = computed(() => groupDiffHunks(diffRows.value || []));
-// 变更块卡片行预览：左右各最多 3 行，超出折叠为「…」
-const hunkPreviewMax = 3;
-function hunkLeftPreview(hunk) {
-  return (hunk?.leftLines || []).slice(0, hunkPreviewMax);
-}
-function hunkRightPreview(hunk) {
-  return (hunk?.rightLines || []).slice(0, hunkPreviewMax);
-}
 // apply 前置校验：渲染后不得残留占位符，且模板引用的变量值必须非空
 // （空白种子的 api_key/model 是 ""，仅查渲染标记拦不住空值）
 const applyReadiness = computed(() => {
@@ -1095,9 +1095,9 @@ function revertPreview() {
   }
 }
 
-// 变更块卡片「← 采用在用」：取当前预览内容行数组，把 [rightStart, rightStart+rightLines.length)
+// 变更块「采用此块 →」：取当前预览内容行数组，把 [rightStart, rightStart+rightLines.length)
 // 区间整块替换为 leftLines（与行级采纳同款 splice 语义的块级版）写回 previewEdits →
-// 左列染色/中栏卡片/diff 全部响应式重算（索引每次取自最新分块，多块逐块采用天然正确）；
+// 左列染色/变更块/diff 全部响应式重算（索引每次取自最新分块，多块逐块采用天然正确）；
 // 与纯渲染一致时不留编辑记录（同「还原」语义收敛）
 function adoptHunk(hunk) {
   const code = activeFileCode.value;
@@ -1116,7 +1116,7 @@ function adoptHunk(hunk) {
   }
 }
 
-// 右列 textarea 常驻可编辑：input 即写 previewEdits（diff/左列染色/中栏卡片/applyReadiness
+// 右列 textarea 常驻可编辑：input 即写 previewEdits（diff/左列染色/变更块/applyReadiness
 // 预检即时重算）；与纯渲染一致时不留编辑记录（「预览已手动修改」徽标准确）
 function onPreviewInput(event) {
   const code = activeFileCode.value;

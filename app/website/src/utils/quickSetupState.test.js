@@ -43,7 +43,7 @@ it('QuickSetupModal diff view compares rendered preview with live config from co
   expect(component).not.toMatch(/appliedContent|applied_at|applied:|appliedSnapshot/);
 });
 
-it('QuickSetupModal merge editor keeps a persistent editable preview with hunk cards', () => {
+it('QuickSetupModal merge editor keeps a persistent editable preview with inline hunk adopt buttons', () => {
   const component = readFileSync(new URL('../components/QuickSetupModal.vue', import.meta.url), 'utf8');
 
   // 右列 textarea 常驻可编辑：:value = 有效预览（previewEdits 优先），input 即写 previewEdits
@@ -55,10 +55,14 @@ it('QuickSetupModal merge editor keeps a persistent editable preview with hunk c
   // 与纯渲染一致时不留编辑记录（「预览已手动修改」徽标准确）
   expect(inputBlock).toMatch(/delete previewEdits\.value\[code\]/);
 
-  // 中栏变更块卡片：groupDiffHunks 分块 + 「← 采用在用」块级并入预览
+  // 两列布局：左列按 hunk 分块渲染（连续变更行整块红底），「采用此块 →」按钮内联块上，
+  // 块级并入预览；无 13rem 中栏卡片列
   expect(component).toMatch(/groupDiffHunks/);
-  expect(component).toMatch(/qs_merge_adopt_left/);
-  expect(component).toMatch(/@click="adoptHunk\(hunk\)"/);
+  expect(component).toMatch(/diffLeftSegments/);
+  expect(component).toMatch(/qs_diff_adopt_block/);
+  expect(component).not.toMatch(/qs_merge_hunk|qs_merge_adopt_left|qs_merge_no_changes/);
+  expect(component).not.toMatch(/13rem/);
+  expect(component).toMatch(/@click="adoptHunk\(segment\.hunk\)"/);
   const hunkBlock = component.match(/function adoptHunk\(hunk\) \{[\s\S]*?\n\}/)?.[0] || '';
   expect(hunkBlock).not.toBe('');
   // 基于当前预览内容行数组，把 [rightStart, rightStart+rightLines.length) 整块替换为 leftLines
@@ -251,6 +255,19 @@ describe('groupDiffHunks', () => {
 		expect(groupDiffHunks(diffRowsAligned('a\nb\nc', 'a'))).toEqual([
 			{ leftStart: 1, leftLines: ['b', 'c'], rightStart: 1, rightLines: [] },
 		]);
+	});
+	it('keys pure-added hunks null so left-column blocks match by leftStart without shifting', () => {
+		// 左列内联「采用此块」按 leftStart 关联变更块：纯 added hunk（leftStart=null，
+		// 左列无块）不得让后续变更块错配到它（序号递增遍历会串位的场景）
+		const rows = diffRowsAligned('a\nc\nd', 'a\nb\nc');
+		const hunks = groupDiffHunks(rows);
+		expect(hunks).toEqual([
+			{ leftStart: null, leftLines: [], rightStart: 1, rightLines: ['b'] },
+			{ leftStart: 2, leftLines: ['d'], rightStart: 3, rightLines: [] },
+		]);
+		// 块首行 leftIndex === 所属 hunk.leftStart（diffLeftSegments 的匹配键）
+		const firstLeftChanged = rows.find((row) => row.type === 'removed' || row.type === 'changed');
+		expect(hunks.find((h) => h.leftLines.length).leftStart).toBe(firstLeftChanged.leftIndex);
 	});
 	it('adopts a hunk by splicing rightStart..rightStart+rightLines back to leftLines (diff converges)', () => {
 		// 块级「采用在用」对拍：按块索引替换后，diff 应收敛为全 same（多块逐块采用亦然）

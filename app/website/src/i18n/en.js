@@ -87,9 +87,7 @@ export default {
   qs_diff_revert_preview: 'Revert preview',
   qs_diff_save_as_template: 'Save as template',
   qs_diff_save_as_template_confirm: 'Placeholders will be replaced by their current values, and this file will no longer follow variable changes. Save as template?',
-  qs_merge_adopt_left: '← Use current',
-  qs_merge_hunk: 'Change block',
-  qs_merge_no_changes: 'No changes',
+  qs_diff_adopt_block: 'Adopt block →',
 
   // -- System Settings --
   sys_language: 'Language',

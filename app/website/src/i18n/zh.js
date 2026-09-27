@@ -87,9 +87,7 @@ export default {
   qs_diff_revert_preview: '还原预览',
   qs_diff_save_as_template: '保存为模板',
   qs_diff_save_as_template_confirm: '占位符将被当前值取代，该文件此后不随变量变化。确认保存为模板？',
-  qs_merge_adopt_left: '← 采用在用',
-  qs_merge_hunk: '变更块',
-  qs_merge_no_changes: '暂无差异',
+  qs_diff_adopt_block: '采用此块 →',
 
   // -- System Settings --
   sys_language: '语言',
