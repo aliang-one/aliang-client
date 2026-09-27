@@ -1,4 +1,41 @@
 // 组合模板渲染与占位符预检（quick-config v3）。
+import { json } from '@codemirror/lang-json';
+import { yaml } from '@codemirror/lang-yaml';
+import { StreamLanguage } from '@codemirror/language';
+import { shell } from '@codemirror/legacy-modes/mode/shell';
+import { toml } from '@codemirror/legacy-modes/mode/toml';
+import { properties } from '@codemirror/legacy-modes/mode/properties';
+
+// 按文件声明 format 与路径扩展名返回 CodeMirror 语言扩展（无匹配返回 null →
+// 编辑器走纯文本）。format 优先：json → @codemirror/lang-json、toml → legacy
+// toml StreamLanguage；未命中（空/未登记值均回落）按 default_path 扩展名补充：
+// yaml/yml → yaml、ini/conf/properties → properties 模式（ini 语法即 key=value
+// 属性集，legacy-modes 无独立 ini 模式，CM5 同款映射）、sh/env → shell。
+// 全部小写匹配。
+export function quickSetupLanguageExtension(format, defaultPath) {
+  const formatKey = String(format ?? '').trim().toLowerCase();
+  if (formatKey === 'json') {
+    return json();
+  }
+  if (formatKey === 'toml') {
+    return StreamLanguage.define(toml);
+  }
+  const extKey = String(defaultPath ?? '').split('.').pop().trim().toLowerCase();
+  switch (extKey) {
+    case 'yaml':
+    case 'yml':
+      return yaml();
+    case 'ini':
+    case 'conf':
+    case 'properties':
+      return StreamLanguage.define(properties);
+    case 'sh':
+    case 'env':
+      return StreamLanguage.define(shell);
+    default:
+      return null;
+  }
+}
 
 // 组合模板渲染：单次正则替换（与 findUnresolvedPlaceholders/后端校验同一空白容忍
 // 语义）；替换回调的返回值不会被再次扫描——变量值含 {{...}} 也不会二次展开。
