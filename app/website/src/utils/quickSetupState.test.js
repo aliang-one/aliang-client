@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest';
 import {
   diffRowsAligned,
   findUnresolvedPlaceholders,
+  groupDiffHunks,
   renderComboContent,
 } from './quickSetupState.js';
 
@@ -42,23 +43,34 @@ it('QuickSetupModal diff view compares rendered preview with live config from co
   expect(component).not.toMatch(/appliedContent|applied_at|applied:|appliedSnapshot/);
 });
 
-it('QuickSetupModal unified diff rows are clickable to adopt/drop into the preview', () => {
+it('QuickSetupModal merge editor keeps a persistent editable preview with hunk cards', () => {
   const component = readFileSync(new URL('../components/QuickSetupModal.vue', import.meta.url), 'utf8');
 
-  // removed(-) 行点击采纳 / added(+) 行点击剔除：统一落到 previewEdits（与「编辑预览」同源）
-  expect(component).toMatch(/@click="line\.action && applyDiffLineAction\(line\)"/);
-  expect(component).toMatch(/qs_diff_adopt/);
-  expect(component).toMatch(/qs_diff_drop/);
-  const actionBlock = component.match(/function applyDiffLineAction\(line\) \{[\s\S]*?\n\}/)?.[0] || '';
-  expect(actionBlock).not.toBe('');
-  // 编辑态不响应（避免与 previewDraft 双源冲突）
-  expect(actionBlock).toMatch(/previewEditing\.value/);
-  // 基于当前预览内容行数组按 rightIndex 插入/删除，写回 previewEdits
-  expect(actionBlock).toMatch(/effectivePreviewContent\.value/);
-  expect(actionBlock).toMatch(/splice\(line\.rightIndex/);
-  expect(actionBlock).toMatch(/previewEdits\.value = \{ \.\.\.previewEdits\.value, \[code\]/);
-  // 与纯渲染一致时不留编辑记录（同 finishPreviewEditing 语义）
-  expect(actionBlock).toMatch(/delete previewEdits\.value\[code\]/);
+  // 右列 textarea 常驻可编辑：:value = 有效预览（previewEdits 优先），input 即写 previewEdits
+  expect(component).toMatch(/:value="effectivePreviewContent"/);
+  expect(component).toMatch(/@input="onPreviewInput"/);
+  const inputBlock = component.match(/function onPreviewInput\(event\) \{[\s\S]*?\n\}/)?.[0] || '';
+  expect(inputBlock).not.toBe('');
+  expect(inputBlock).toMatch(/previewEdits\.value = \{ \.\.\.previewEdits\.value, \[code\]: value \}/);
+  // 与纯渲染一致时不留编辑记录（「预览已手动修改」徽标准确）
+  expect(inputBlock).toMatch(/delete previewEdits\.value\[code\]/);
+
+  // 中栏变更块卡片：groupDiffHunks 分块 + 「← 采用在用」块级并入预览
+  expect(component).toMatch(/groupDiffHunks/);
+  expect(component).toMatch(/qs_merge_adopt_left/);
+  expect(component).toMatch(/@click="adoptHunk\(hunk\)"/);
+  const hunkBlock = component.match(/function adoptHunk\(hunk\) \{[\s\S]*?\n\}/)?.[0] || '';
+  expect(hunkBlock).not.toBe('');
+  // 基于当前预览内容行数组，把 [rightStart, rightStart+rightLines.length) 整块替换为 leftLines
+  expect(hunkBlock).toMatch(/effectivePreviewContent\.value/);
+  expect(hunkBlock).toMatch(/hunk\.rightStart/);
+  expect(hunkBlock).toMatch(/hunk\.rightLines/);
+  expect(hunkBlock).toMatch(/hunk\.leftLines/);
+  expect(hunkBlock).toMatch(/previewEdits\.value = \{ \.\.\.previewEdits\.value, \[code\]: next \}/);
+  expect(hunkBlock).toMatch(/delete previewEdits\.value\[code\]/);
+
+  // 「编辑预览」切换退役：textarea 常驻，无 previewEditing/previewDraft 双态与离开守卫
+  expect(component).not.toMatch(/previewEditing|previewDraft|confirmDiscardPreviewDraft|applyDiffLineAction/);
 });
 
 describe('renderComboContent', () => {
@@ -206,5 +218,54 @@ describe('diffRowsAligned', () => {
 	it('omits leftIndex on added rows (only rightIndex is meaningful)', () => {
 		const rows = diffRowsAligned('a', 'a\nb');
 		expect(rows[1]).toEqual({ left: null, right: 'b', type: 'added', rightIndex: 1 });
+	});
+});
+
+describe('groupDiffHunks', () => {
+	it('returns empty array when there is no change', () => {
+		expect(groupDiffHunks(diffRowsAligned('a\nb\nc', 'a\nb\nc'))).toEqual([]);
+	});
+	it('returns empty array for nullish input', () => {
+		expect(groupDiffHunks(null)).toEqual([]);
+		expect(groupDiffHunks(undefined)).toEqual([]);
+	});
+	it('groups one mixed removed+added hunk with correct indices', () => {
+		// 对齐产物：same(a) changed(x→p) changed(y→q) removed(z) same(b)
+		expect(groupDiffHunks(diffRowsAligned('a\nx\ny\nz\nb', 'a\np\nq\nb'))).toEqual([
+			{ leftStart: 1, leftLines: ['x', 'y', 'z'], rightStart: 1, rightLines: ['p', 'q'] },
+		]);
+	});
+	it('splits multiple hunks separated by same rows', () => {
+		// 两个独立改动点被 same(h/mid/tail) 分隔，各成一块
+		expect(groupDiffHunks(diffRowsAligned('h\nA\nmid\nB\ntail', 'h\nA2\nmid\nB2\ntail'))).toEqual([
+			{ leftStart: 1, leftLines: ['A'], rightStart: 1, rightLines: ['A2'] },
+			{ leftStart: 3, leftLines: ['B'], rightStart: 3, rightLines: ['B2'] },
+		]);
+	});
+	it('marks a pure addition hunk with empty leftLines and null leftStart', () => {
+		expect(groupDiffHunks(diffRowsAligned('a', 'a\nb\nc'))).toEqual([
+			{ leftStart: null, leftLines: [], rightStart: 1, rightLines: ['b', 'c'] },
+		]);
+	});
+	it('marks a pure removal hunk with empty rightLines', () => {
+		expect(groupDiffHunks(diffRowsAligned('a\nb\nc', 'a'))).toEqual([
+			{ leftStart: 1, leftLines: ['b', 'c'], rightStart: 1, rightLines: [] },
+		]);
+	});
+	it('adopts a hunk by splicing rightStart..rightStart+rightLines back to leftLines (diff converges)', () => {
+		// 块级「采用在用」对拍：按块索引替换后，diff 应收敛为全 same（多块逐块采用亦然）
+		const left = 'h\nA\nmid\nB\ntail';
+		let preview = 'h\nA2\nmid\nB2\ntail';
+		for (let round = 0; round < 2; round += 1) {
+			const [hunk] = groupDiffHunks(diffRowsAligned(left, preview));
+			if (!hunk) {
+				break;
+			}
+			const lines = preview.split('\n');
+			lines.splice(hunk.rightStart, hunk.rightLines.length, ...hunk.leftLines);
+			preview = lines.join('\n');
+		}
+		expect(preview).toBe(left);
+		expect(diffRowsAligned(left, preview).every((row) => row.type === 'same')).toBe(true);
 	});
 });

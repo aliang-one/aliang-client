@@ -171,3 +171,41 @@ function pairAdjacentRuns(rows) {
   }
   return out;
 }
+
+// 把 diffRowsAligned 的行序列分组为变更块（hunk）：连续非 same 行为一个块
+// （removed/added/changed 混合皆入组），same 行（或无效行）分隔。
+// leftStart/rightStart 取块内首行的 leftIndex/rightIndex；首行无 leftIndex
+// （纯 added 开头的块）时回落到块内首个带 leftIndex 的行，仍无则 null
+// （纯新增块没有左侧内容）。leftLines/rightLines 按块内出现顺序收集
+// （changed 行两侧都收）。无变更或 nullish 输入 → 空数组。
+export function groupDiffHunks(rows) {
+  const input = Array.isArray(rows) ? rows : [];
+  const hunks = [];
+  let current = null;
+  for (const row of input) {
+    if (!row || (row.type !== 'removed' && row.type !== 'added' && row.type !== 'changed')) {
+      current = null;
+      continue;
+    }
+    if (!current) {
+      current = {
+        leftStart: Number.isInteger(row.leftIndex) ? row.leftIndex : null,
+        rightStart: Number.isInteger(row.rightIndex) ? row.rightIndex : null,
+        leftLines: [],
+        rightLines: [],
+      };
+      hunks.push(current);
+    } else if (current.leftStart === null && Number.isInteger(row.leftIndex)) {
+      current.leftStart = row.leftIndex;
+    }
+    if (row.type === 'added') {
+      current.rightLines.push(row.right ?? '');
+    } else if (row.type === 'removed') {
+      current.leftLines.push(row.left ?? '');
+    } else {
+      current.leftLines.push(row.left ?? '');
+      current.rightLines.push(row.right ?? '');
+    }
+  }
+  return hunks;
+}

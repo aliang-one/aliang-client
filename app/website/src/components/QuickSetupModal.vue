@@ -330,7 +330,8 @@
                 </div>
               </div>
 
-              <!-- git 风格 split diff：左=正在使用的配置（旧，apply 将被替换），右=渲染预览（新，apply 所见） -->
+              <!-- 合并编辑器（git merge 风格）：左=在用配置（只读，染色随预览编辑实时重算），
+                   中=变更块卡片（块级「← 采用在用」），右=渲染预览（常驻可编辑 textarea，apply 所见） -->
               <div v-else-if="activeFile" class="mt-2">
                 <div class="flex flex-wrap items-center justify-between gap-2">
                   <div class="flex min-w-0 items-center gap-2">
@@ -349,116 +350,138 @@
                       <span class="material-symbols-outlined text-base">refresh</span>
                       {{ t('qs_state_refresh') }}
                     </button>
-                    <template v-if="previewEditing">
-                      <button
-                        type="button"
-                        class="inline-flex min-h-8 items-center justify-center rounded-lg border border-slate-200 px-3 text-[11px] font-semibold text-slate-700 transition hover:bg-slate-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
-                        @click="finishPreviewEditing"
-                      >
-                        {{ t('qs_diff_done') }}
-                      </button>
-                      <button
-                        type="button"
-                        class="inline-flex min-h-8 items-center justify-center rounded-lg border border-slate-200 px-3 text-[11px] font-semibold text-slate-700 transition hover:bg-slate-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
-                        @click="revertPreview"
-                      >
-                        {{ t('qs_diff_revert_preview') }}
-                      </button>
-                      <button
-                        type="button"
-                        class="inline-flex min-h-8 items-center justify-center rounded-lg bg-primary px-3 text-[11px] font-semibold text-white transition hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
-                        :disabled="comboSaving"
-                        @click="savePreviewAsTemplate"
-                      >
-                        {{ t('qs_diff_save_as_template') }}
-                      </button>
-                    </template>
-                    <template v-else>
-                      <button
-                        type="button"
-                        class="inline-flex min-h-8 items-center justify-center rounded-lg border border-slate-200 px-3 text-[11px] font-semibold text-slate-700 transition hover:bg-slate-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
-                        @click="startTemplateEditing"
-                      >
-                        {{ t('qs_tpl_edit') }}
-                      </button>
-                      <button
-                        type="button"
-                        class="inline-flex min-h-8 items-center justify-center rounded-lg border border-slate-200 px-3 text-[11px] font-semibold text-slate-700 transition hover:bg-slate-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
-                        @click="startPreviewEditing"
-                      >
-                        {{ t('qs_diff_edit_preview') }}
-                      </button>
-                    </template>
+                    <button
+                      type="button"
+                      class="inline-flex min-h-8 items-center justify-center rounded-lg border border-slate-200 px-3 text-[11px] font-semibold text-slate-700 transition hover:bg-slate-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+                      @click="startTemplateEditing"
+                    >
+                      {{ t('qs_tpl_edit') }}
+                    </button>
+                    <button
+                      type="button"
+                      class="inline-flex min-h-8 items-center justify-center rounded-lg border border-slate-200 px-3 text-[11px] font-semibold text-slate-700 transition hover:bg-slate-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+                      @click="revertPreview"
+                    >
+                      {{ t('qs_diff_revert_preview') }}
+                    </button>
+                    <button
+                      type="button"
+                      class="inline-flex min-h-8 items-center justify-center rounded-lg bg-primary px-3 text-[11px] font-semibold text-white transition hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+                      :disabled="comboSaving"
+                      @click="savePreviewAsTemplate"
+                    >
+                      {{ t('qs_diff_save_as_template') }}
+                    </button>
                   </div>
                 </div>
 
-                <div class="mt-2 overflow-hidden rounded-2xl border border-slate-200 dark:border-slate-700">
-                  <!-- 单行说明头：旧=在用配置（含修改时间）→ 新=渲染预览（统一流式无双列） -->
-                  <div class="flex flex-wrap items-center gap-x-1.5 gap-y-1 border-b border-slate-200 bg-slate-100/70 px-3 py-2 text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-400">
-                    {{ t('qs_diff_left') }}
-                    <span
-                      v-if="liveModifiedLabel"
-                      class="font-mono text-[10px] font-normal normal-case tracking-normal text-slate-400 dark:text-slate-500"
-                    >{{ liveModifiedLabel }}</span>
-                    <span class="material-symbols-outlined text-sm text-slate-400 dark:text-slate-500" aria-hidden="true">arrow_forward</span>
-                    {{ t('qs_diff_right') }}
-                    <span
-                      v-if="previewModified"
-                      class="ml-1 rounded bg-amber-400/15 px-1.5 py-0.5 text-[10px] font-medium normal-case tracking-normal text-amber-600 dark:bg-amber-400/10 dark:text-amber-400"
-                    >{{ t('qs_diff_preview_modified') }}</span>
+                <!-- 无基线（在用文件未生成/超限/拉取失败）：纤细状态条 + 全宽可编辑预览
+                     （textarea 常驻语义：无 diff 可算时预览本体仍是同一编辑入口，无染色无卡片） -->
+                <div v-if="liveContent === null" class="mt-2 overflow-hidden rounded-2xl border border-slate-200 dark:border-slate-700">
+                  <div class="border-b border-slate-200 bg-slate-100/70 px-3 py-2 text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-400">
+                    <!-- 拉取失败 > 文件存在但读不到 > 尚未生成，三层空态文案 -->
+                    {{ liveFilesFailed ? t('qs_state_error') : (activeLiveFile?.exists ? t('qs_state_too_large') : t('qs_diff_never_applied')) }}
+                  </div>
+                  <textarea
+                    class="code-editor custom-scrollbar h-[320px] w-full resize-none border-0 bg-slate-950 px-4 py-3 text-[12px] leading-6 text-slate-100 outline-none focus:ring-1 focus:ring-inset focus:ring-primary/40"
+                    :value="effectivePreviewContent"
+                    :aria-label="t('qs_diff_right')"
+                    spellcheck="false"
+                    @input="onPreviewInput"
+                  ></textarea>
+                </div>
+
+                <!-- 合并编辑器三栏主体：左在用只读（git 染色）/ 中变更块卡片 / 右预览 textarea -->
+                <div v-else class="mt-2 grid h-[440px] grid-cols-[minmax(0,1fr)_13rem_minmax(0,1fr)] overflow-hidden rounded-2xl border border-slate-200 dark:border-slate-700">
+                  <!-- 左列：在用配置只读。染色相对当前预览内容实时重算：与预览相比被移除/
+                       被替换的行染红（removed/changed），same 中性；added 行只在右列存在，不渲染 -->
+                  <div class="flex min-h-0 flex-col border-r border-slate-200 dark:border-slate-700">
+                    <div class="flex shrink-0 flex-wrap items-center gap-x-1.5 border-b border-slate-200 bg-slate-100/70 px-3 py-2 text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-400">
+                      {{ t('qs_diff_left') }}
+                      <span
+                        v-if="liveModifiedLabel"
+                        class="font-mono text-[10px] font-normal normal-case tracking-normal text-slate-400 dark:text-slate-500"
+                      >{{ liveModifiedLabel }}</span>
+                    </div>
+                    <div class="code-editor custom-scrollbar min-h-0 flex-1 overflow-auto bg-slate-950 py-3 text-[12px] text-slate-100">
+                      <div
+                        v-for="line in diffLeftRows"
+                        :key="`left-${line.key}`"
+                        class="flex min-h-6 leading-6"
+                        :class="line.changed ? 'bg-rose-500/15 text-rose-200' : ''"
+                      >
+                        <span class="w-10 shrink-0 select-none bg-slate-900/60 pr-2 text-right font-mono text-[11px] text-slate-600">{{ line.no }}</span>
+                        <span class="min-w-0 flex-1 whitespace-pre px-3">{{ line.text }}</span>
+                      </div>
+                    </div>
                   </div>
 
-                  <!-- 预览编辑态：左列在用配置只读（染色暂停），右列 textarea 等宽等行高 -->
-                  <div v-if="previewEditing" class="grid h-[420px] grid-cols-[2.5rem_1fr_2.5rem_1fr]">
-                    <div class="col-span-2 min-h-0 overflow-hidden border-r border-slate-800 bg-slate-950 dark:border-slate-700">
-                      <div class="code-editor custom-scrollbar h-full overflow-auto py-3 text-[12px] text-slate-100">
-                        <div v-for="(line, index) in inUseLines" :key="`inuse-${index}`" class="flex min-h-6 leading-6">
-                          <span class="w-10 shrink-0 select-none bg-slate-900/60 pr-2 text-right font-mono text-[11px] text-slate-600">{{ index + 1 }}</span>
-                          <span class="min-w-0 flex-1 whitespace-pre px-3">{{ line }}</span>
+                  <!-- 中栏：变更块卡片（groupDiffHunks 每块一卡，「← 采用在用」把该块在用行整块并入预览） -->
+                  <div class="flex min-h-0 flex-col border-r border-slate-200 bg-slate-50/60 dark:border-slate-700 dark:bg-slate-900/60">
+                    <div class="shrink-0 border-b border-slate-200 bg-slate-100/70 px-3 py-2 text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-400">
+                      {{ t('qs_merge_hunk') }}
+                    </div>
+                    <div class="custom-scrollbar min-h-0 flex-1 space-y-2 overflow-y-auto p-2">
+                      <div
+                        v-if="!diffHunks.length"
+                        class="px-1 py-2 text-center text-[11px] leading-5 text-slate-400 dark:text-slate-500"
+                      >
+                        {{ t('qs_merge_no_changes') }}
+                      </div>
+                      <div
+                        v-for="(hunk, index) in diffHunks"
+                        :key="`hunk-${index}`"
+                        class="rounded-xl border border-slate-200 bg-white dark:border-slate-700 dark:bg-slate-900"
+                      >
+                        <div class="flex items-center justify-between gap-1 border-b border-slate-100 px-2 py-1.5 dark:border-slate-800">
+                          <span class="text-[10px] font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+                            {{ t('qs_merge_hunk') }} {{ index + 1 }}
+                          </span>
+                          <button
+                            type="button"
+                            class="inline-flex min-h-6 shrink-0 items-center rounded-lg border border-slate-200 px-1.5 text-[10px] font-semibold text-slate-600 transition hover:border-primary/40 hover:text-primary dark:border-slate-600 dark:text-slate-300 dark:hover:border-primary/40 dark:hover:text-primary"
+                            @click="adoptHunk(hunk)"
+                          >
+                            {{ t('qs_merge_adopt_left') }}
+                          </button>
+                        </div>
+                        <div class="px-2 py-1.5 font-mono text-[10px] leading-4">
+                          <div
+                            v-for="(text, i) in hunkLeftPreview(hunk)"
+                            :key="`hunk-${index}-l-${i}`"
+                            class="truncate text-rose-600 dark:text-rose-400"
+                            :title="text"
+                          >- {{ text }}</div>
+                          <div v-if="hunk.leftLines.length > hunkPreviewMax" class="text-slate-400 dark:text-slate-500">…</div>
+                          <div
+                            v-for="(text, i) in hunkRightPreview(hunk)"
+                            :key="`hunk-${index}-r-${i}`"
+                            class="truncate text-emerald-600 dark:text-emerald-400"
+                            :title="text"
+                          >+ {{ text }}</div>
+                          <div v-if="hunk.rightLines.length > hunkPreviewMax" class="text-slate-400 dark:text-slate-500">…</div>
                         </div>
                       </div>
                     </div>
+                  </div>
+
+                  <!-- 右列：渲染预览 = apply 将写入的内容。textarea 常驻可编辑（input 即写
+                       previewEdits，左列染色/中栏卡片/预检全部响应式重算），等宽字体行高与左列一致 -->
+                  <div class="flex min-h-0 flex-col">
+                    <div class="flex shrink-0 flex-wrap items-center gap-x-1.5 border-b border-slate-200 bg-slate-100/70 px-3 py-2 text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-400">
+                      {{ t('qs_diff_right') }}
+                      <span
+                        v-if="previewModified"
+                        class="rounded bg-amber-400/15 px-1.5 py-0.5 text-[10px] font-medium normal-case tracking-normal text-amber-600 dark:bg-amber-400/10 dark:text-amber-400"
+                      >{{ t('qs_diff_preview_modified') }}</span>
+                    </div>
                     <textarea
-                      v-model="previewDraft"
-                      class="code-editor col-span-2 h-full min-h-0 w-full resize-none border-0 bg-slate-950 px-4 py-3 text-[12px] leading-6 text-slate-100 outline-none focus:ring-1 focus:ring-inset focus:ring-primary/40"
-                      :aria-label="t('qs_diff_edit_preview')"
+                      class="code-editor custom-scrollbar h-full min-h-0 w-full flex-1 resize-none border-0 bg-slate-950 px-4 py-3 text-[12px] leading-6 text-slate-100 outline-none focus:ring-1 focus:ring-inset focus:ring-primary/40"
+                      :value="effectivePreviewContent"
+                      :aria-label="t('qs_diff_right')"
                       spellcheck="false"
+                      @input="onPreviewInput"
                     ></textarea>
-                  </div>
-
-                  <!-- 无基线（在用文件未生成/超限/拉取失败）：纤细状态条 + 全宽纯预览（无染色） -->
-                  <div v-else-if="liveContent === null">
-                    <div class="border-b border-slate-200 bg-slate-100/70 px-3 py-2 text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-400">
-                      <!-- 拉取失败 > 文件存在但读不到 > 尚未生成，三层空态文案 -->
-                      {{ liveFilesFailed ? t('qs_state_error') : (activeLiveFile?.exists ? t('qs_state_too_large') : t('qs_diff_never_applied')) }}
-                    </div>
-                    <div class="code-editor custom-scrollbar max-h-[420px] min-h-[240px] overflow-auto bg-slate-950 py-3 text-[12px] text-slate-100">
-                      <div v-for="(line, index) in previewLines" :key="`preview-${index}`" class="flex min-h-6 leading-6">
-                        <span class="w-10 shrink-0 select-none bg-slate-900/60 pr-2 text-right font-mono text-[11px] text-slate-600">{{ index + 1 }}</span>
-                        <span class="min-w-0 flex-1 whitespace-pre px-3">{{ line }}</span>
-                      </div>
-                    </div>
-                  </div>
-
-                  <!-- 统一流式 diff 主体：same 中性一行 / removed 红 - 行 / added 绿 + 行 / changed 相邻 -+ 成对；
-                       行号双列取 git unified 惯例：旧侧（在用配置）与新侧（渲染预览）各自递增。
-                       可点击行：- 行采纳进预览、+ 行从预览剔除（编辑态视图不渲染，天然禁用） -->
-                  <div v-else class="code-editor custom-scrollbar max-h-[420px] min-h-[240px] overflow-auto bg-slate-950 py-3 text-[12px] text-slate-100">
-                    <div
-                      v-for="line in diffUnifiedRows"
-                      :key="`diff-line-${line.key}`"
-                      class="flex min-h-6 leading-6"
-                      :class="line.action ? 'cursor-pointer transition-colors hover:brightness-125' : ''"
-                      :title="line.action === 'adopt' ? t('qs_diff_adopt') : line.action === 'drop' ? t('qs_diff_drop') : undefined"
-                      @click="line.action && applyDiffLineAction(line)"
-                    >
-                      <span class="w-10 shrink-0 select-none bg-slate-900/60 pr-2 text-right font-mono text-[11px] text-slate-600">{{ line.oldNo }}</span>
-                      <span class="w-10 shrink-0 select-none bg-slate-900/60 pr-2 text-right font-mono text-[11px] text-slate-600">{{ line.newNo }}</span>
-                      <span class="flex min-w-0 flex-1" :class="line.cls">
-                        <span class="w-5 shrink-0 select-none text-center font-mono text-[11px] opacity-70">{{ line.sign }}</span>
-                        <span class="min-w-0 flex-1 whitespace-pre pr-4">{{ line.text }}</span>
-                      </span>
-                    </div>
                   </div>
                 </div>
 
@@ -684,7 +707,7 @@ import {
 import { useI18n } from '../i18n';
 import QuickSetupConfigurePanel from './QuickSetupConfigurePanel.vue';
 import QuickSetupResultPanel from './QuickSetupResultPanel.vue';
-import { diffRowsAligned, findUnresolvedPlaceholders, renderComboContent } from '../utils/quickSetupState';
+import { diffRowsAligned, findUnresolvedPlaceholders, groupDiffHunks, renderComboContent } from '../utils/quickSetupState';
 
 const { t } = useI18n();
 
@@ -711,11 +734,9 @@ const activeCombo = ref(null);
 const activeFileCode = ref('');
 const templateEditing = ref(false);
 const templateDraft = ref('');
-// 渲染预览手动编辑：previewEdits = Map fileCode → 编辑内容（combo 作用域，切组合清空）；
-// previewEditing/previewDraft 为当前文件的就编辑态。编辑期间行级染色暂停（textarea 无法逐行染色）
+// 渲染预览手动编辑：previewEdits = Map fileCode → 编辑内容（combo 作用域，切组合清空）。
+// 合并编辑器布局下右列 textarea 常驻可编辑，input 即写此处（不再有编辑态/草稿双源）
 const previewEdits = ref({});
-const previewEditing = ref(false);
-const previewDraft = ref('');
 const configureOpen = ref(false);
 const applyResult = ref(null);
 // 组合 tabs 操作区
@@ -846,17 +867,8 @@ const renderedContent = computed(() => renderComboContent(activeFile.value?.cont
 const effectivePreviewContent = computed(() => (
   previewEdits.value[activeFileCode.value] ?? renderedContent.value
 ));
-// 「预览已手动修改」徽标：已保存的编辑，或编辑中草稿已偏离纯渲染产物
-const previewModified = computed(() => {
-  if (previewEdits.value[activeFileCode.value] !== undefined) {
-    return true;
-  }
-  return previewEditing.value && previewDraft.value !== renderedContent.value;
-});
-// 编辑中草稿是否偏离进入编辑时的内容（未保存离开守卫用）
-const previewDirty = computed(() => (
-  previewEditing.value && previewDraft.value !== effectivePreviewContent.value
-));
+// 「预览已手动修改」徽标：previewEdits 存在该文件的编辑（textarea input/块采用即写，无草稿态）
+const previewModified = computed(() => previewEdits.value[activeFileCode.value] !== undefined);
 // 右列数据源：config-state files 中该 code 的磁盘实时内容；未命中/未生成 → null（空态）
 const activeLiveFile = computed(() => liveFiles.value.find((file) => file?.code === activeFileCode.value) || null);
 // exists 但 content 缺失（超限/读失败）也归入空态，由模板按 exists 区分空态文案
@@ -906,7 +918,7 @@ const restoreTargets = computed(() => {
   }
   return { restore, remove };
 });
-// 统一流式 diff：左=在用配置（旧），右=有效预览（新，含手动编辑）。
+// 统一对齐 diff：左=在用配置（旧），右=有效预览（新，含手动编辑）。
 // 无基线（在用文件未生成/读不到）→ null：相对空基线「全是新增」的染色只会误导，走空态展示。
 const diffRows = computed(() => {
   const inUse = liveContent.value;
@@ -915,54 +927,35 @@ const diffRows = computed(() => {
   }
   return diffRowsAligned(inUse, effectivePreviewContent.value);
 });
-// 编辑态左列：在用配置按行展示（只读、带行号，染色暂停）
-const inUseLines = computed(() => (liveContent.value === null ? [] : liveContent.value.split('\n')));
-// 统一流式渲染行（git unified diff）：same 一行中性；removed 一行红 -；added 一行绿 +；
-// changed 拆为相邻 -/+ 成对行。行号双列：旧侧（在用配置）与新侧（渲染预览）各自递增。
-// 可点击行携带 action：- 行=adopt（采纳 left 内容到预览）、+ 行=drop（从预览剔除），
-// rightIndex 取自对齐行索引（removed/changed 右行 = 插入位；added = 其预览行下标）
-const diffUnifiedRows = computed(() => {
-  const rows = diffRows.value;
-  if (!rows) {
-    return [];
-  }
-  let oldNo = 0;
-  let newNo = 0;
+// 合并编辑器左列：在用配置只读行（added 行只在右列存在，跳过）。染色相对当前预览内容
+// 实时重算——removed/changed（与预览相比被移除/被替换）标红，same 中性；
+// 行号 = 在用配置行号（leftIndex+1，顺序渲染下与递增计数等价）
+const diffLeftRows = computed(() => {
+  const rows = diffRows.value || [];
   const lines = [];
-  const emit = (kind, text, row) => {
-    if (kind !== 'new') {
-      oldNo += 1;
-    }
-    if (kind !== 'old') {
-      newNo += 1;
+  for (const row of rows) {
+    if (row.type === 'added') {
+      continue;
     }
     lines.push({
-      key: `${lines.length}-${kind}`,
-      sign: kind === 'old' ? '-' : kind === 'new' ? '+' : '',
-      text: text ?? '',
-      oldNo: kind === 'new' ? '' : String(oldNo),
-      newNo: kind === 'old' ? '' : String(newNo),
-      cls: kind === 'old' ? 'bg-rose-500/15 text-rose-200' : kind === 'new' ? 'bg-emerald-500/15 text-emerald-200' : '',
-      action: kind === 'same' ? null : kind === 'old' ? 'adopt' : 'drop',
-      rightIndex: kind === 'same' ? null : row?.rightIndex,
+      key: `${lines.length}-${row.type}`,
+      no: (Number.isInteger(row.leftIndex) ? row.leftIndex : lines.length) + 1,
+      text: row.left ?? '',
+      changed: row.type === 'removed' || row.type === 'changed',
     });
-  };
-  for (const row of rows) {
-    if (row.type === 'removed') {
-      emit('old', row.left, row);
-    } else if (row.type === 'added') {
-      emit('new', row.right, row);
-    } else if (row.type === 'changed') {
-      emit('old', row.left, row);
-      emit('new', row.right, row);
-    } else {
-      emit('same', row.left, row);
-    }
   }
   return lines;
 });
-// 无基线时全宽纯预览行（无染色，含手动编辑）
-const previewLines = computed(() => String(effectivePreviewContent.value ?? '').split('\n'));
+// 中栏变更块：groupDiffHunks 对当前 diff 分块（无基线 → 空数组，中栏不出卡片）
+const diffHunks = computed(() => groupDiffHunks(diffRows.value || []));
+// 变更块卡片行预览：左右各最多 3 行，超出折叠为「…」
+const hunkPreviewMax = 3;
+function hunkLeftPreview(hunk) {
+  return (hunk?.leftLines || []).slice(0, hunkPreviewMax);
+}
+function hunkRightPreview(hunk) {
+  return (hunk?.rightLines || []).slice(0, hunkPreviewMax);
+}
 // apply 前置校验：渲染后不得残留占位符，且模板引用的变量值必须非空
 // （空白种子的 api_key/model 是 ""，仅查渲染标记拦不住空值）
 const applyReadiness = computed(() => {
@@ -1038,8 +1031,6 @@ function selectCombo(combo) {
   templateEditing.value = false;
   templateDraft.value = '';
   previewEdits.value = {};
-  previewEditing.value = false;
-  previewDraft.value = '';
   applyResult.value = null;
   comboMenuOpen.value = false;
   renameOpen.value = false;
@@ -1065,9 +1056,6 @@ function switchCombo(combo) {
   if (!confirmDiscardTemplateDraft()) {
     return;
   }
-  if (!confirmDiscardPreviewDraft()) {
-    return;
-  }
   selectCombo(combo);
 }
 
@@ -1078,16 +1066,12 @@ function switchFileTab(code) {
   if (!confirmDiscardTemplateDraft()) {
     return;
   }
-  if (!confirmDiscardPreviewDraft()) {
-    return;
-  }
   activeFileCode.value = code;
-  // 恒复位编辑态：文件页签切换永远退出模板/预览编辑视图（渲染视图是默认视图）。
-  // 无改动路径若不复位，上一文件的草稿会残留 textarea，点保存即把 A 的内容写进 B（跨文件模板覆盖）
+  // 恒复位模板编辑态：文件页签切换永远退出模板编辑视图（渲染视图是默认视图）。
+  // 无改动路径若不复位，上一文件的草稿会残留 textarea，点保存即把 A 的内容写进 B（跨文件模板覆盖）。
+  // 预览编辑无需复位：previewEdits 按 fileCode 键控且右列 textarea 常驻，各文件编辑天然独立
   templateEditing.value = false;
   templateDraft.value = '';
-  previewEditing.value = false;
-  previewDraft.value = '';
 }
 
 // 有未保存草稿时提示放弃；确认后才允许离开（返回 false = 留在原地）
@@ -1103,78 +1087,27 @@ function confirmDiscardTemplateDraft() {
   return false;
 }
 
-// 预览编辑草稿的离开守卫（镜像模板草稿守卫；已保存进 previewEdits 的内容不受影响）
-function confirmDiscardPreviewDraft() {
-  if (!previewDirty.value) {
-    return true;
-  }
-  if (window.confirm(t('qs_preview_dirty'))) {
-    previewEditing.value = false;
-    previewDraft.value = '';
-    return true;
-  }
-  return false;
-}
-
-// 预览编辑三入口之一：进入编辑（草稿起点 = 有效预览内容）
-function startPreviewEditing() {
-  if (!activeFile.value) {
-    return;
-  }
-  previewDraft.value = effectivePreviewContent.value;
-  previewEditing.value = true;
-}
-
-// 「完成」：退出编辑态；与纯渲染一致时不留编辑记录，否则内容保留在 previewEdits（不丢）
-function finishPreviewEditing() {
-  const code = activeFileCode.value;
-  if (!code) {
-    previewEditing.value = false;
-    previewDraft.value = '';
-    return;
-  }
-  if (previewDraft.value === renderedContent.value) {
-    delete previewEdits.value[code];
-  } else {
-    previewEdits.value = { ...previewEdits.value, [code]: previewDraft.value };
-  }
-  previewEditing.value = false;
-  previewDraft.value = '';
-}
-
 // 「还原预览」：清除该文件编辑内容，回到纯渲染
 function revertPreview() {
   const code = activeFileCode.value;
   if (code) {
     delete previewEdits.value[code];
   }
-  previewEditing.value = false;
-  previewDraft.value = '';
 }
 
-// diff 行点击（非编辑态）：- 行 = 采纳 left 内容到预览（按 rightIndex 插到该行之前），
-// + 行 = 从预览剔除 rightIndex 行。结果写回 previewEdits → diff 重算（索引每次取自
-// 最新行对象，连续块逐行点击天然正确）；与纯渲染一致时不留编辑记录（同「完成」语义）。
-// 编辑态不响应（统一流视图此时本就不渲染，守卫为双保险，避免与 previewDraft 双源冲突）
-function applyDiffLineAction(line) {
-  if (previewEditing.value || !line?.action) {
-    return;
-  }
+// 变更块卡片「← 采用在用」：取当前预览内容行数组，把 [rightStart, rightStart+rightLines.length)
+// 区间整块替换为 leftLines（与行级采纳同款 splice 语义的块级版）写回 previewEdits →
+// 左列染色/中栏卡片/diff 全部响应式重算（索引每次取自最新分块，多块逐块采用天然正确）；
+// 与纯渲染一致时不留编辑记录（同「还原」语义收敛）
+function adoptHunk(hunk) {
   const code = activeFileCode.value;
-  if (!code) {
+  if (!code || !hunk || !Number.isInteger(hunk.rightStart) || hunk.rightStart < 0) {
     return;
   }
   const lines = String(effectivePreviewContent.value ?? '').split('\n');
-  if (line.action === 'adopt') {
-    lines.splice(Math.min(Number.isInteger(line.rightIndex) ? line.rightIndex : lines.length, lines.length), 0, line.text);
-  } else if (line.action === 'drop') {
-    if (!Number.isInteger(line.rightIndex) || line.rightIndex < 0 || line.rightIndex >= lines.length) {
-      return;
-    }
-    lines.splice(line.rightIndex, 1);
-  } else {
-    return;
-  }
+  const start = Math.min(hunk.rightStart, lines.length);
+  const end = Math.min(hunk.rightStart + (hunk.rightLines || []).length, lines.length);
+  lines.splice(start, Math.max(0, end - start), ...(hunk.leftLines || []));
   const next = lines.join('\n');
   if (next === renderedContent.value) {
     delete previewEdits.value[code];
@@ -1183,17 +1116,33 @@ function applyDiffLineAction(line) {
   }
 }
 
-// 「保存为模板」：冻结语义——占位符以当前变量值落定后写入模板，该文件此后不随变量变化
+// 右列 textarea 常驻可编辑：input 即写 previewEdits（diff/左列染色/中栏卡片/applyReadiness
+// 预检即时重算）；与纯渲染一致时不留编辑记录（「预览已手动修改」徽标准确）
+function onPreviewInput(event) {
+  const code = activeFileCode.value;
+  if (!code) {
+    return;
+  }
+  const value = String(event?.target?.value ?? '');
+  if (value === renderedContent.value) {
+    delete previewEdits.value[code];
+  } else {
+    previewEdits.value = { ...previewEdits.value, [code]: value };
+  }
+}
+
+// 「保存为模板」：冻结语义——占位符以当前变量值落定后写入模板，该文件此后不随变量变化。
+// 内容 = 当前右列值（previewEdits 优先，回落纯渲染产物）
 async function savePreviewAsTemplate() {
   const combo = activeCombo.value;
   const code = activeFileCode.value;
-  if (!combo || !code || !previewEditing.value) {
+  if (!combo || !code) {
     return;
   }
   if (!window.confirm(t('qs_diff_save_as_template_confirm'))) {
     return;
   }
-  const content = renderComboContent(previewDraft.value, combo.variables || {});
+  const content = renderComboContent(effectivePreviewContent.value, combo.variables || {});
   const files = (Array.isArray(combo.files) ? combo.files : []).map((file) => (
     file.code === code ? { ...file, content } : file
   ));
@@ -1205,8 +1154,6 @@ async function savePreviewAsTemplate() {
       adoptCombo(next);
     }
     delete previewEdits.value[code];
-    previewEditing.value = false;
-    previewDraft.value = '';
     statusMessage.value = '';
   } catch (error) {
     statusMessage.value = errorText(error);
@@ -1219,12 +1166,6 @@ function startTemplateEditing() {
   if (!activeFile.value) {
     return;
   }
-  if (!confirmDiscardPreviewDraft()) {
-    return;
-  }
-  // 预览编辑态让位模板编辑（未偏离纯渲染时静默退出即可）
-  previewEditing.value = false;
-  previewDraft.value = '';
   templateDraft.value = String(activeFile.value.content ?? '');
   templateEditing.value = true;
 }
@@ -1282,9 +1223,6 @@ function openConfigure() {
     return;
   }
   if (!confirmDiscardTemplateDraft()) {
-    return;
-  }
-  if (!confirmDiscardPreviewDraft()) {
     return;
   }
   comboMenuOpen.value = false;
@@ -1470,15 +1408,8 @@ function adoptCombo(combo) {
 
 // apply：组合每文件 → 声明的 DefaultPath/Format/Kind + 渲染后内容
 async function applyCombo() {
-  // 编辑中的草稿先按「完成」同一语义落定到 previewEdits（一致不留编辑记录），
-  // 使下方 readiness 预检与 filesToApply 取值均为 textarea 当前所见
-  if (previewEditing.value && activeFileCode.value && previewDraft.value) {
-    if (previewDraft.value === renderedContent.value) {
-      delete previewEdits.value[activeFileCode.value];
-    } else {
-      previewEdits.value = { ...previewEdits.value, [activeFileCode.value]: previewDraft.value };
-    }
-  }
+  // 右列 textarea input 已即时写 previewEdits（常驻可编辑，无草稿态），
+  // 此处 readiness 预检与 filesToApply 取值天然等于右列当前所见
   const combo = activeCombo.value;
   const def = selectedSoftwareDef.value;
   if (!combo || !def || !applyReadiness.value.ready) {
@@ -1513,8 +1444,6 @@ async function applyCombo() {
       statusMessage.value = '';
       // 编辑内容已落盘：清空全部预览编辑，避免残留「预览已手动修改」假标记
       previewEdits.value = {};
-      previewEditing.value = false;
-      previewDraft.value = '';
       // 重取 config-state：右列 diff 对齐刚写入的磁盘内容（失败由 refreshLiveFiles 自吞，
       // 不影响已成功的 apply 结果展示）
       refreshLiveFiles();
