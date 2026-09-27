@@ -25,11 +25,16 @@ const (
 	agentVibeTranscriptMaxContentRunes = 4000
 	agentVibeIndexMaxLines             = 240
 	agentVibeIndexMaxBytes             = 2 * 1024 * 1024
-	agentVibeSummaryMaxSessions        = 200
-	agentVibeSessionFileScanLimit      = 120
-	agentVibeDetailCandidateFileLimit  = 24
-	agentRecentFileWalkMaxEntries      = 6000
-	agentRecentFileWalkMaxDuration     = 500 * time.Millisecond
+	// 16MB：单条 jsonl 行的解析上限。CC 会把超大 tool_result（读大文件/长命
+	// 令输出）写成单行 >1MB 的记录（2026-09-27 liang-dev 会话 3d06bb04 事故：
+	// 1.1MB 行让旧 Scanner 静默中止，其后 316 条真实消息永久不可见），正常
+	// 大小量级必须照常解析；这个上限只挡病态行——跳过并告警，绝不中断扫描。
+	agentVibeJSONLMaxLineBytes        = 16 * 1024 * 1024
+	agentVibeSummaryMaxSessions       = 200
+	agentVibeSessionFileScanLimit     = 120
+	agentVibeDetailCandidateFileLimit = 24
+	agentRecentFileWalkMaxEntries     = 6000
+	agentRecentFileWalkMaxDuration    = 500 * time.Millisecond
 )
 
 type agentRecentFileCandidate struct {
@@ -46,6 +51,10 @@ type agentVibeSessionReadOptions struct {
 	// path is not under any of these directories is dropped before its transcript
 	// is read. Empty/nil = no filtering (current behavior).
 	ScanDirs []string
+	// MaxLineBytes caps one jsonl line before it is skipped instead of parsed.
+	// 0 = agentVibeJSONLMaxLineBytes. Test hook: shrink it to exercise the
+	// skip path without multi-megabyte fixtures.
+	MaxLineBytes int
 }
 
 type agentVibeTranscriptWindow struct {
@@ -417,22 +426,21 @@ func readCodexSessionMetaWithLimit(path string, maxMessages int) models.AgentVib
 }
 
 func readCodexSessionMetaWithOptions(path string, options agentVibeSessionReadOptions) models.AgentVibeSession {
-	file, err := os.Open(path)
-	if err != nil {
-		return models.AgentVibeSession{}
-	}
-	defer file.Close()
-
 	options = normalizeAgentVibeSessionReadOptions(options)
 	window := newAgentVibeTranscriptWindow(options)
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	var session models.AgentVibeSession
 	session.Provider = "codex"
 	session.Tool = "codex"
 	session.Mode = "vibe"
 	session.Status = "closed"
-	for scanner.Scan() {
+	// 早退（ScanDirs 丢弃）必须整体返回空结构体：session.ID 在过滤点之前可能
+	// 已被 session_meta 赋值，不能让循环后处理把它当成有效会话放行。
+	discard := false
+	maxLineBytes := options.MaxLineBytes
+	if maxLineBytes <= 0 {
+		maxLineBytes = agentVibeJSONLMaxLineBytes
+	}
+	forEachAgentSessionJSONLLine(path, maxLineBytes, func(line []byte) bool {
 		var row struct {
 			Timestamp string `json:"timestamp"`
 			Type      string `json:"type"`
@@ -446,9 +454,8 @@ func readCodexSessionMetaWithOptions(path string, options agentVibeSessionReadOp
 				} `json:"git"`
 			} `json:"payload"`
 		}
-		line := scanner.Bytes()
 		if err := json.Unmarshal(line, &row); err != nil {
-			continue
+			return true
 		}
 		if row.Type == "session_meta" {
 			provider := firstNonEmpty(row.Payload.ModelProvider, "codex")
@@ -460,9 +467,10 @@ func readCodexSessionMetaWithOptions(path string, options agentVibeSessionReadOp
 			session.CreatedAt = firstNonEmpty(session.CreatedAt, normalizeAgentTime(row.Timestamp))
 			// 早过滤：扫描目录限制开启时，cwd 不在任一目录内则丢弃整个会话，不读 transcript
 			if len(options.ScanDirs) > 0 && session.ProjectPath != "" && !pathUnderAnyScanDir(session.ProjectPath, options.ScanDirs) {
-				return models.AgentVibeSession{}
+				discard = true
+				return false
 			}
-			continue
+			return true
 		}
 		if msg := parseCodexTranscriptMessage(line, session.MessageCount); msg.Content != "" {
 			session.MessageCount++
@@ -476,6 +484,10 @@ func readCodexSessionMetaWithOptions(path string, options agentVibeSessionReadOp
 				window.add(msg)
 			}
 		}
+		return true
+	})
+	if discard {
+		return models.AgentVibeSession{}
 	}
 	if session.ID == "" {
 		return models.AgentVibeSession{}
@@ -1052,12 +1064,6 @@ func readClaudeSessionMetaWithLimit(path string, maxMessages int) models.AgentVi
 }
 
 func readClaudeSessionMetaWithOptions(path string, options agentVibeSessionReadOptions) models.AgentVibeSession {
-	file, err := os.Open(path)
-	if err != nil {
-		return models.AgentVibeSession{}
-	}
-	defer file.Close()
-
 	options = normalizeAgentVibeSessionReadOptions(options)
 	window := newAgentVibeTranscriptWindow(options)
 	var session models.AgentVibeSession
@@ -1068,9 +1074,14 @@ func readClaudeSessionMetaWithOptions(path string, options agentVibeSessionReadO
 	var firstUserPrompt string
 	userPromptCount := 0
 	var lastMessageAt time.Time
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for scanner.Scan() {
+	// 早退（sidechain / ScanDirs 丢弃）必须整体返回空结构体：过滤点之后循环
+	// 后处理不能把已部分填充的 session 当有效会话放行。
+	discard := false
+	maxLineBytes := options.MaxLineBytes
+	if maxLineBytes <= 0 {
+		maxLineBytes = agentVibeJSONLMaxLineBytes
+	}
+	forEachAgentSessionJSONLLine(path, maxLineBytes, func(line []byte) bool {
 		var row struct {
 			Timestamp   string      `json:"timestamp"`
 			Type        string      `json:"type"`
@@ -1080,11 +1091,12 @@ func readClaudeSessionMetaWithOptions(path string, options agentVibeSessionReadO
 			IsSidechain bool        `json:"isSidechain"`
 			Message     interface{} `json:"message"`
 		}
-		if err := json.Unmarshal(scanner.Bytes(), &row); err != nil {
-			continue
+		if err := json.Unmarshal(line, &row); err != nil {
+			return true
 		}
 		if row.IsSidechain {
-			return models.AgentVibeSession{}
+			discard = true
+			return false
 		}
 		if session.ID == "" && strings.TrimSpace(row.SessionID) != "" {
 			session.ID = "claude_" + row.SessionID
@@ -1094,7 +1106,8 @@ func readClaudeSessionMetaWithOptions(path string, options agentVibeSessionReadO
 		}
 		// 早过滤：扫描目录限制开启时，cwd 不在任一目录内则丢弃整个会话，不读 transcript
 		if len(options.ScanDirs) > 0 && session.ProjectPath != "" && !pathUnderAnyScanDir(session.ProjectPath, options.ScanDirs) {
-			return models.AgentVibeSession{}
+			discard = true
+			return false
 		}
 		if session.Branch == "" {
 			session.Branch = row.GitBranch
@@ -1149,6 +1162,10 @@ func readClaudeSessionMetaWithOptions(path string, options agentVibeSessionReadO
 				session.Title = truncateAgentText(text, 200)
 			}
 		}
+		return true
+	})
+	if discard {
+		return models.AgentVibeSession{}
 	}
 	if session.ID == "" {
 		return models.AgentVibeSession{}
@@ -1592,6 +1609,75 @@ func readRecentAgentJSONLLines(path string, maxLines int, maxBytes int64) [][]by
 		lines[i], lines[j] = lines[j], lines[i]
 	}
 	return lines
+}
+
+// forEachAgentSessionJSONLLine 按行流式交付 path 的内容，替代两个 vibe session
+// 读取器里原先的 bufio.Scanner（1MB 行上限 + 从不检查 scanner.Err()，第一条
+// 超长行就静默终止整个扫描——2026-09-27 liang-dev 会话 3d06bb04 事故根因）。
+// 契约与 scanner.Scan()/Bytes() 对齐：
+//   - 行不带结尾 "\n"（CRLF 文件的 "\r" 也去掉）
+//   - 传给 visit 的切片只在下一次 visit 前有效（调用方立刻 json.Unmarshal，不留引用）
+//   - 末行无换行符照常交付
+//   - 超过 maxLineBytes 的行跳过：不解析、不占消息索引位（类型不可知）、每文件
+//     只 Warn 一次，后续行照常读取——绝不因单条病态行冻结整个会话
+//   - visit 返回 false 提前终止（sidechain / ScanDirs 早退路径）
+//
+// 返回跳过的超长行数（生产调用方忽略；测试用作告警断言代理——services 包没有
+// logger 测试钩子）。ReadSlice 累积的 happy path 与 Scanner 一样零新分配；
+// 病态行排水后释放大缓冲，峰值内存 ≈ 最大单行且被 maxLineBytes 强制封顶。
+func forEachAgentSessionJSONLLine(path string, maxLineBytes int, visit func(line []byte) bool) int {
+	if maxLineBytes <= 0 {
+		maxLineBytes = agentVibeJSONLMaxLineBytes
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return 0
+	}
+	defer file.Close()
+	reader := bufio.NewReaderSize(file, 64*1024)
+	var buf []byte // 当前累积行；排水超长行期间为 nil
+	over, warned, skipped, lineNo := false, false, 0, 0
+	for {
+		chunk, readErr := reader.ReadSlice('\n')
+		if len(chunk) > 0 && !over {
+			// 行内容 cap 字节 + "\n" = cap+1 原始字节，恰好允许交付；
+			// cap+1 内容 + "\n" 才触发跳过。
+			if len(buf)+len(chunk) > maxLineBytes+1 {
+				over = true
+				buf = nil
+			} else {
+				buf = append(buf, chunk...)
+			}
+		}
+		if readErr == bufio.ErrBufferFull {
+			continue // 行跨多个读缓冲，继续排水
+		}
+		if len(chunk) > 0 || over || len(buf) > 0 {
+			lineNo++
+		}
+		if over {
+			skipped++
+			if !warned {
+				warned = true
+				logger.Warn(fmt.Sprintf("[AGENT-INVENTORY] jsonl_line_skipped_too_long path=%s line=%d cap=%d", path, lineNo, maxLineBytes))
+			}
+		} else {
+			line := bytes.TrimSuffix(bytes.TrimSuffix(buf, []byte("\n")), []byte("\r"))
+			if len(line) > 0 && !visit(line) {
+				return skipped // 调用方早退；文件由 defer 关闭
+			}
+		}
+		over = false
+		if cap(buf) > 1<<20 {
+			buf = nil // monster 行之后释放，避免在 5.7MB 文件上长期占着大缓冲
+		} else {
+			buf = buf[:0]
+		}
+		if readErr != nil {
+			break // io.EOF 正常收尾；真实读错误与旧代码一致地静默结束
+		}
+	}
+	return skipped
 }
 
 func cleanAgentProjectPath(path string) string {
