@@ -7,6 +7,7 @@ import {
   diffRowsAligned,
   findUnresolvedPlaceholders,
   groupDiffHunks,
+  patchLines,
   quickSetupLanguageExtension,
   renderComboContent,
 } from './quickSetupState.js';
@@ -97,7 +98,11 @@ it('QuickSetupModal merge editor keeps a persistent editable preview with inline
   expect(editors).toMatch(/historyKeymap/);
   expect(editors).toMatch(/quickSetupLanguageExtension/);
   expect(editors).toMatch(/Transaction\.remote/);
+  // 外部全文替换必须双注解：history 只认 addToHistory=false（仅 remote 会复活陈旧文档）
+  expect(editors).toMatch(/Transaction\.addToHistory\.of\(false\)/);
   expect(editors).toMatch(/StateField\.define/);
+  // 行区间 → change-spec 映射走纯函数 patchLines（差分对拍固化在下方 describe）
+  expect(editors).toMatch(/patchLines\(/);
 });
 
 describe('renderComboContent', () => {
@@ -346,5 +351,101 @@ describe('groupDiffHunks', () => {
 		}
 		expect(preview).toBe(left);
 		expect(diffRowsAligned(left, preview).every((row) => row.type === 'same')).toBe(true);
+	});
+});
+
+describe('patchLines', () => {
+	// change-spec 应用到文本（CM dispatch 同语义：from 前 + insert + to 后）
+	const apply = (text, change) => (change
+		? text.slice(0, change.from) + (change.insert ?? '') + text.slice(change.to ?? change.from)
+		: text);
+	// Array.prototype.splice 语义的参考实现：对 lines 数组做区间替换后 join
+	const spliceRef = (docText, start, removeCount, insert) => {
+		const lines = docText.split('\n');
+		lines.splice(start, removeCount, ...insert);
+		return lines.join('\n');
+	};
+	// mulberry32：可复现随机源
+	const rng = (seed) => () => {
+		seed |= 0;
+		seed = (seed + 0x6d2b79f5) | 0;
+		let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+		t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+		return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+	};
+	const WORDS = ['a', 'key = 1', 'x', '', '  indent', 'tail-1', 'longer line content', ''];
+
+	// ≥200 组随机用例：合法区间直接与 splice 对拍（换行归属/行→offset 换算逐字节全等）
+	it('matches Array.prototype.splice on 250 random in-range cases', () => {
+		const rand = rng(20260927);
+		for (let i = 0; i < 250; i += 1) {
+			const lineCount = 1 + Math.floor(rand() * 8);
+			const docText = Array.from({ length: lineCount }, () => WORDS[Math.floor(rand() * WORDS.length)]).join('\n');
+			const start = Math.floor(rand() * (lineCount + 1));
+			const removeCount = Math.floor(rand() * (lineCount - start + 1));
+			const insert = Array.from({ length: Math.floor(rand() * 3) }, () => WORDS[Math.floor(rand() * WORDS.length)]);
+			const change = patchLines(docText, start, removeCount, insert);
+			const actual = apply(docText, change);
+			const expected = spliceRef(docText, start, removeCount, insert);
+			if (actual !== expected) {
+				throw new Error(`case #${i} doc=${JSON.stringify(docText)} start=${start} remove=${removeCount} insert=${JSON.stringify(insert)}: ${JSON.stringify(actual)} != ${JSON.stringify(expected)}`);
+			}
+			expect(actual).toBe(expected);
+		}
+	});
+
+	// 越界钳制用例：负 start/removeCount 归零、超界 start 钳到行数（末尾追加）、
+	// removeCount 钳到剩余行数——参考实现先钳制再 splice（即 splice 的钳制前语义）
+	it('clamps out-of-range start/removeCount and matches spliced reference (150 cases)', () => {
+		const rand = rng(42);
+		for (let i = 0; i < 150; i += 1) {
+			const lineCount = 1 + Math.floor(rand() * 6);
+			const docText = Array.from({ length: lineCount }, () => WORDS[Math.floor(rand() * WORDS.length)]).join('\n');
+			const start = [-3, -1, 0, 1, lineCount, lineCount + 2, lineCount + 9][Math.floor(rand() * 7)];
+			const removeCount = [-2, 0, 1, lineCount + 5][Math.floor(rand() * 4)];
+			const insert = Array.from({ length: Math.floor(rand() * 3) }, () => WORDS[Math.floor(rand() * WORDS.length)]);
+			const clampedStart = Math.min(Math.max(start, 0), lineCount);
+			const clampedRemove = Math.min(Math.max(removeCount, 0), lineCount - clampedStart);
+			const change = patchLines(docText, start, removeCount, insert);
+			const actual = apply(docText, change);
+			const expected = spliceRef(docText, clampedStart, clampedRemove, insert);
+			if (actual !== expected) {
+				throw new Error(`case #${i} doc=${JSON.stringify(docText)} start=${start} remove=${removeCount} insert=${JSON.stringify(insert)}: ${JSON.stringify(actual)} != ${JSON.stringify(expected)}`);
+			}
+			expect(actual).toBe(expected);
+		}
+	});
+
+	it('handles the required deterministic scenarios (tail delete / append / multi-line replace / empty insert / single line / trailing newline)', () => {
+		// 纯删尾：删到文档末尾连前导换行一起吞
+		expect(apply('a\nb\nc', patchLines('a\nb\nc', 2, 1, []))).toBe(spliceRef('a\nb\nc', 2, 1, []));
+		expect(apply('a\nb\nc', patchLines('a\nb\nc', 1, 2, []))).toBe('a');
+		// 末尾追加：start = 行数（含单行文档 1 行的追加）
+		expect(apply('a\nb', patchLines('a\nb', 2, 0, ['c']))).toBe('a\nb\nc');
+		expect(apply('a', patchLines('a', 1, 0, ['b', 'c']))).toBe('a\nb\nc');
+		expect(apply('', patchLines('', 0, 0, ['first']))).toBe('first\n');
+		// 多行替换（删多插多 / 删一插多 / 删多插一）
+		expect(apply('a\nb\nc\nd', patchLines('a\nb\nc\nd', 1, 2, ['x', 'y', 'z']))).toBe('a\nx\ny\nz\nd');
+		expect(apply('a\nb\nc', patchLines('a\nb\nc', 1, 1, ['B1', 'B2']))).toBe('a\nB1\nB2\nc');
+		expect(apply('a\nb\nc', patchLines('a\nb\nc', 0, 2, ['z']))).toBe('z\nc');
+		// 空插入：区间空且无删除 → null（无变更免派发）
+		expect(patchLines('a\nb', 0, 0, [])).toBeNull();
+		expect(patchLines('a\nb', 5, 0, [])).toBeNull();
+		// 行中空数组插入 = 纯删除语义
+		expect(apply('a\nb\nc', patchLines('a\nb\nc', 1, 1, []))).toBe('a\nc');
+		// 单行文档：整行替换 / 清空
+		expect(apply('only', patchLines('only', 0, 1, ['a', 'b']))).toBe('a\nb');
+		expect(apply('only', patchLines('only', 0, 1, []))).toBe('');
+		// 尾随换行文档（split 尾空行）
+		expect(apply('a\nb\n', patchLines('a\nb\n', 2, 1, ['c']))).toBe('a\nb\nc');
+		expect(apply('a\nb\n', patchLines('a\nb\n', 1, 2, []))).toBe('a');
+		// 越界钳制定点：start<0 → 0、start>行数 → 末尾追加、removeCount<0 → 0、removeCount 超界 → 剩余全删
+		expect(apply('a\nb\nc', patchLines('a\nb\nc', -5, 1, ['z']))).toBe('z\nb\nc');
+		expect(apply('a\nb\nc', patchLines('a\nb\nc', 99, 0, ['z']))).toBe('a\nb\nc\nz');
+		expect(apply('a\nb\nc', patchLines('a\nb\nc', 1, -7, ['z']))).toBe('a\nz\nb\nc');
+		expect(apply('a\nb\nc', patchLines('a\nb\nc', 1, 99, []))).toBe('a');
+		// nullish 容错（docText 按 '' 规范后应用）
+		expect(apply('', patchLines(null, 0, 1, ['b']))).toBe('b');
+		expect(apply('a\nb', patchLines('a\nb', 1, 1, [undefined, null]))).toBe('a\n\n');
 	});
 });

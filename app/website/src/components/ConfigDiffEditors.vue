@@ -46,7 +46,7 @@ import { syntaxHighlighting } from '@codemirror/language';
 import { Decoration, EditorView, WidgetType, drawSelection, keymap, lineNumbers } from '@codemirror/view';
 import { defaultKeymap, history, historyKeymap } from '@codemirror/commands';
 import { oneDarkHighlightStyle } from '@codemirror/theme-one-dark';
-import { diffRowsAligned, groupDiffHunks, quickSetupLanguageExtension } from '../utils/quickSetupState';
+import { diffRowsAligned, groupDiffHunks, patchLines, quickSetupLanguageExtension } from '../utils/quickSetupState';
 import { useI18n } from '../i18n';
 
 const props = defineProps({
@@ -227,8 +227,11 @@ function makeState({ editable }) {
 }
 
 // props.rightContent 外部变化（adopt/restore/刷新/切 agent/变量重渲染）：remote
-// 全文替换——不触发 right-change、不进撤销栈（Ctrl+Z 不会撤销回外部替换前的旧文档，
-// 用户自己的编辑仍可撤销）；光标按偏移就近钳制保留
+// 全文替换——不触发 right-change（remote 注解防回环）、不进撤销栈（须显式
+// addToHistory=false：@codemirror/commands 的 history 只认 addToHistory=false、
+// 不认 remote 注解，缺省注解会让外部替换成为独立历史事件，Ctrl+Z 复活替换前的
+// 陈旧文档；外部替换只会以映射方式并入既有历史，Ctrl+Z 永不回滚替换本身，
+// 用户先前的编辑仍可撤销）；光标按偏移就近钳制保留
 function replaceDocIfChanged(view, next) {
   const text = String(next ?? '');
   if (!view || view.state.doc.toString() === text) {
@@ -238,7 +241,7 @@ function replaceDocIfChanged(view, next) {
   view.dispatch({
     changes: { from: 0, to: view.state.doc.length, insert: text },
     selection: { anchor },
-    annotations: Transaction.remote.of(true),
+    annotations: [Transaction.remote.of(true), Transaction.addToHistory.of(false)],
   });
 }
 
@@ -353,52 +356,17 @@ watch(
 );
 
 // 块级采用：把右文档 [rightStartLine, rightStartLine+removeCount) 行区间按
-// split/join splice 语义替换为 insertLines（行→offset 换算与行尾/文档末尾对齐），
-// 派发为普通事务（可撤销、经 onRightUpdate 回报父级写 previewEdits）
+// split/join splice 语义替换为 insertLines——行→offset 的映射由纯函数 patchLines
+// 承载（差分对拍固化），这里拿 change-spec 派发为普通事务（可撤销、经
+// onRightUpdate 回报父级写 previewEdits）
 function patchRight(rightStartLine, removeCount, insertLines) {
   const view = rightView;
   if (!view) {
     return;
   }
-  const doc = view.state.doc;
-  const insert = (Array.isArray(insertLines) ? insertLines : []).map((line) => String(line ?? ''));
-  const start = Math.min(Math.max(Number(rightStartLine) || 0, 0), doc.lines);
-  const end = Math.min(start + Math.max(Number(removeCount) || 0, 0), doc.lines);
-  const lineStart = (lineNo) => (lineNo >= doc.lines ? doc.length : doc.line(lineNo + 1).from);
-  if (end > start) {
-    // 区间替换，与 split/join splice 逐字节对齐（351 例对拍验证）：
-    // 有插入内容时保留 end 行前的换行（to=lineStart(end)-1，删到文档末尾直达 length）；
-    // 纯删除（insert 空）时吞掉被删行的换行（end 行前的换行 / 末尾块连前导换行一起删）
-    let from;
-    let to;
-    let insertText;
-    if (insert.length) {
-      from = lineStart(start);
-      to = end < doc.lines ? lineStart(end) - 1 : doc.length;
-      insertText = insert.join('\n');
-    } else if (end < doc.lines) {
-      from = lineStart(start);
-      to = lineStart(end);
-      insertText = '';
-    } else if (start > 0) {
-      from = lineStart(start) - 1;
-      to = doc.length;
-      insertText = '';
-    } else {
-      from = 0;
-      to = doc.length;
-      insertText = '';
-    }
-    view.dispatch({ changes: { from, to, insert: insertText }, userEvent: 'input.adopt' });
-    return;
-  }
-  if (!insert.length) {
-    return;
-  }
-  if (start >= doc.lines) {
-    view.dispatch({ changes: { from: doc.length, insert: `\n${insert.join('\n')}` }, userEvent: 'input.adopt' });
-  } else {
-    view.dispatch({ changes: { from: lineStart(start), insert: `${insert.join('\n')}\n` }, userEvent: 'input.adopt' });
+  const change = patchLines(view.state.doc.toString(), rightStartLine, removeCount, insertLines);
+  if (change) {
+    view.dispatch({ changes: change, userEvent: 'input.adopt' });
   }
 }
 

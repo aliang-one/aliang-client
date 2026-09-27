@@ -246,3 +246,48 @@ export function groupDiffHunks(rows) {
   }
   return hunks;
 }
+
+// 把文档文本的 [rightStartLine, rightStartLine+removeCount) 行区间按 split/join
+// splice 语义替换为 insertLines，返回 CM change-spec { from, to, insert }；
+// 空插入且无删除（区间空）时返回 null（无变更，调用方免派发）。行号 0 起、
+// 越界钳制（start < 0 → 0 / > 行数 → 行数，removeCount 同理），与
+// Array.prototype.splice 的钳制前语义经随机对拍固化（见 quickSetupState.test.js
+// patchLines 差分用例）。换行对齐规则：
+//   有插入内容 — 保留 end 行前的换行（to = end 行起点 - 1；删到文档末尾直达
+//     length），insert 为 \n join；纯追加（start ≥ 行数）在文档末尾补 \n 前缀、
+//     行中追加补 \n 后缀
+//   纯删除（insert 空）— 吞掉被删行的换行（to = end 行起点；末尾块连前导换行
+//     一起删，from = start 行起点 - 1；start=0 的整文档删直达两端）
+export function patchLines(docText, rightStartLine, removeCount, insertLines) {
+  const text = String(docText ?? '');
+  const lineStarts = [0];
+  for (let i = 0; i < text.length; i += 1) {
+    if (text.charCodeAt(i) === 10) {
+      lineStarts.push(i + 1);
+    }
+  }
+  const lineCount = lineStarts.length;
+  const insert = (Array.isArray(insertLines) ? insertLines : []).map((line) => String(line ?? ''));
+  const start = Math.min(Math.max(Number(rightStartLine) || 0, 0), lineCount);
+  const end = Math.min(start + Math.max(Number(removeCount) || 0, 0), lineCount);
+  const at = (lineNo) => (lineNo >= lineCount ? text.length : lineStarts[lineNo]);
+  if (end > start) {
+    if (insert.length) {
+      return { from: at(start), to: end < lineCount ? at(end) - 1 : text.length, insert: insert.join('\n') };
+    }
+    if (end < lineCount) {
+      return { from: at(start), to: at(end), insert: '' };
+    }
+    if (start > 0) {
+      return { from: at(start) - 1, to: text.length, insert: '' };
+    }
+    return { from: 0, to: text.length, insert: '' };
+  }
+  if (!insert.length) {
+    return null;
+  }
+  if (start >= lineCount) {
+    return { from: text.length, to: text.length, insert: `\n${insert.join('\n')}` };
+  }
+  return { from: at(start), to: at(start), insert: `${insert.join('\n')}\n` };
+}
