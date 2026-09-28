@@ -5054,6 +5054,17 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 	filesMu.Unlock()
 	m.appendAssistantHistory(run.sessionID, run.runSeq, run.messageID, assistantOutput)
 	m.setAgentAIResumeSessionIDIfEmpty(run.sessionID, run.runSeq, capturedResumeSessionID)
+	// 谱系标记：手机回合（sdk-cli）若分叉于交互链，追加 cli 谱系标记让下次
+	// resume 直接可见（2026-09-28 3d06bb04 实测病灶；详见 cc_session_lineage.go）。
+	if tool.outputFormat == agentAIOutputClaudeStreamJSON {
+		if sid := strings.TrimSpace(capturedResumeSessionID); sid != "" {
+			if jsonl := ccPeerSessionJSONL(externalTUIHome(), sid); jsonl != "" {
+				if err := appendLineageMarker(jsonl, sid, run.projectPath, agentAILineageNotice); err != nil {
+					logger.Info(fmt.Sprintf("lineage marker: session=%s error=%v", sid, err))
+				}
+			}
+		}
+	}
 	if blocks := extractAgentAIOptionBlocks(assistantOutput); len(blocks) > 0 {
 		m.emitOptionRequest(run, writeJSON, blocks)
 	}
