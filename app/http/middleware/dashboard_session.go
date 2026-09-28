@@ -4,15 +4,20 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	"aliang.one/nursorgate/app/http/common"
+	"aliang.one/nursorgate/common/cache"
 	auth "aliang.one/nursorgate/processor/auth"
 )
 
@@ -25,6 +30,13 @@ const (
 var dashboardSessionState struct {
 	sync.Mutex
 	sessions map[[sha256.Size]byte]time.Time
+	// loaded 标记持久化文件是否已加载（惰性，首次访问时读入）。
+	loaded bool
+}
+
+// dashboardSessionFilePathFn 是持久化文件路径的钩子（测试注入临时目录）。
+var dashboardSessionFilePathFn = func() (string, error) {
+	return cache.GetCacheFile("dashboard_sessions.json")
 }
 
 // IssueDashboardSession rotates the request-bound local management credential.
@@ -44,6 +56,7 @@ func IssueDashboardSession(w http.ResponseWriter, r *http.Request) error {
 	token := base64.RawURLEncoding.EncodeToString(raw)
 	now := time.Now()
 	dashboardSessionState.Lock()
+	ensureDashboardSessionsLoadedLocked()
 	if dashboardSessionState.sessions == nil {
 		dashboardSessionState.sessions = make(map[[sha256.Size]byte]time.Time)
 	}
@@ -52,6 +65,7 @@ func IssueDashboardSession(w http.ResponseWriter, r *http.Request) error {
 		evictOldestDashboardSessionLocked()
 	}
 	dashboardSessionState.sessions[sha256.Sum256([]byte(token))] = now.Add(dashboardSessionTTL)
+	persistDashboardSessionsLocked()
 	dashboardSessionState.Unlock()
 
 	http.SetCookie(w, &http.Cookie{
@@ -70,7 +84,10 @@ func IssueDashboardSession(w http.ResponseWriter, r *http.Request) error {
 // Upstream logout does not call this: the local dashboard must remain able to
 // observe the Unauthenticated snapshot and initiate a new login.
 func RevokeDashboardSession(w http.ResponseWriter) {
-	clearDashboardSession()
+	dashboardSessionState.Lock()
+	clearDashboardSessionLocked()
+	persistDashboardSessionsLocked()
+	dashboardSessionState.Unlock()
 	if w == nil {
 		return
 	}
@@ -103,9 +120,11 @@ func ValidateDashboardSession(r *http.Request) bool {
 	key := sha256.Sum256([]byte(strings.TrimSpace(cookie.Value)))
 	now := time.Now()
 	dashboardSessionState.Lock()
+	ensureDashboardSessionsLoadedLocked()
 	expiresAt, ok := dashboardSessionState.sessions[key]
 	if ok && !now.Before(expiresAt) {
 		delete(dashboardSessionState.sessions, key)
+		persistDashboardSessionsLocked()
 		ok = false
 	}
 	dashboardSessionState.Unlock()
@@ -136,10 +155,8 @@ func isLoopbackRequest(r *http.Request) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-func clearDashboardSession() {
-	dashboardSessionState.Lock()
+func clearDashboardSessionLocked() {
 	dashboardSessionState.sessions = nil
-	dashboardSessionState.Unlock()
 }
 
 func pruneDashboardSessionsLocked(now time.Time) {
@@ -167,5 +184,85 @@ func evictOldestDashboardSessionLocked() {
 }
 
 func ResetDashboardSessionForTest() {
-	clearDashboardSession()
+	dashboardSessionState.Lock()
+	clearDashboardSessionLocked()
+	dashboardSessionState.loaded = false
+	dashboardSessionState.Unlock()
+}
+
+// ensureDashboardSessionsLoadedLocked 首次访问时从状态目录加载持久化会话
+//（dashboard_sessions.json，0600 凭据文件）。文件缺失/损坏/无法定位一律按空表
+// 启动——安全侧等价旧版「重启后需重新登录」，绝不因持久化层故障拒绝签发。
+// 调用方必须持有 dashboardSessionState.Lock。
+func ensureDashboardSessionsLoadedLocked() {
+	if dashboardSessionState.loaded {
+		return
+	}
+	dashboardSessionState.loaded = true
+	path, err := dashboardSessionFilePathFn()
+	if err != nil {
+		return
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil || len(raw) == 0 {
+		return
+	}
+	var persisted map[string]string
+	if json.Unmarshal(raw, &persisted) != nil {
+		return
+	}
+	if dashboardSessionState.sessions == nil {
+		dashboardSessionState.sessions = make(map[[sha256.Size]byte]time.Time)
+	}
+	now := time.Now()
+	for hexKey, expiry := range persisted {
+		rawKey, err := hex.DecodeString(hexKey)
+		if err != nil || len(rawKey) != sha256.Size {
+			continue
+		}
+		expiresAt, err := time.Parse(time.RFC3339, expiry)
+		if err != nil || !expiresAt.After(now) {
+			continue
+		}
+		var key [sha256.Size]byte
+		copy(key[:], rawKey)
+		dashboardSessionState.sessions[key] = expiresAt
+	}
+}
+
+// persistDashboardSessionsLocked 把会话表原子落盘（临时文件 0600 + rename）。
+// 尽力而为：失败仅意味着重启后需重新登录，不阻断签发/校验路径。
+// 调用方必须持有 dashboardSessionState.Lock。
+func persistDashboardSessionsLocked() {
+	path, err := dashboardSessionFilePathFn()
+	if err != nil {
+		return
+	}
+	export := make(map[string]string, len(dashboardSessionState.sessions))
+	for key, expiresAt := range dashboardSessionState.sessions {
+		export[hex.EncodeToString(key[:])] = expiresAt.Format(time.RFC3339)
+	}
+	raw, err := json.Marshal(export)
+	if err != nil {
+		return
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".dashboard_sessions-*")
+	if err != nil {
+		return
+	}
+	name := tmp.Name()
+	_, writeErr := tmp.Write(raw)
+	syncErr := tmp.Sync()
+	closeErr := tmp.Close()
+	if writeErr != nil || syncErr != nil || closeErr != nil {
+		os.Remove(name)
+		return
+	}
+	if err := os.Chmod(name, 0o600); err != nil {
+		os.Remove(name)
+		return
+	}
+	if err := os.Rename(name, path); err != nil {
+		os.Remove(name)
+	}
 }
