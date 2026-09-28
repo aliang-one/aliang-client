@@ -1,4 +1,41 @@
 // 组合模板渲染与占位符预检（quick-config v3）。
+import { json } from '@codemirror/lang-json';
+import { yaml } from '@codemirror/lang-yaml';
+import { StreamLanguage } from '@codemirror/language';
+import { shell } from '@codemirror/legacy-modes/mode/shell';
+import { toml } from '@codemirror/legacy-modes/mode/toml';
+import { properties } from '@codemirror/legacy-modes/mode/properties';
+
+// 按文件声明 format 与路径扩展名返回 CodeMirror 语言扩展（无匹配返回 null →
+// 编辑器走纯文本）。format 优先：json → @codemirror/lang-json、toml → legacy
+// toml StreamLanguage；未命中（空/未登记值均回落）按 default_path 扩展名补充：
+// yaml/yml → yaml、ini/conf/properties → properties 模式（ini 语法即 key=value
+// 属性集，legacy-modes 无独立 ini 模式，CM5 同款映射）、sh/env → shell。
+// 全部小写匹配。
+export function quickSetupLanguageExtension(format, defaultPath) {
+  const formatKey = String(format ?? '').trim().toLowerCase();
+  if (formatKey === 'json') {
+    return json();
+  }
+  if (formatKey === 'toml') {
+    return StreamLanguage.define(toml);
+  }
+  const extKey = String(defaultPath ?? '').split('.').pop().trim().toLowerCase();
+  switch (extKey) {
+    case 'yaml':
+    case 'yml':
+      return yaml();
+    case 'ini':
+    case 'conf':
+    case 'properties':
+      return StreamLanguage.define(properties);
+    case 'sh':
+    case 'env':
+      return StreamLanguage.define(shell);
+    default:
+      return null;
+  }
+}
 
 // 组合模板渲染：单次正则替换（与 findUnresolvedPlaceholders/后端校验同一空白容忍
 // 语义）；替换回调的返回值不会被再次扫描——变量值含 {{...}} 也不会二次展开。
@@ -208,4 +245,49 @@ export function groupDiffHunks(rows) {
     }
   }
   return hunks;
+}
+
+// 把文档文本的 [rightStartLine, rightStartLine+removeCount) 行区间按 split/join
+// splice 语义替换为 insertLines，返回 CM change-spec { from, to, insert }；
+// 空插入且无删除（区间空）时返回 null（无变更，调用方免派发）。行号 0 起、
+// 越界钳制（start < 0 → 0 / > 行数 → 行数，removeCount 同理），与
+// Array.prototype.splice 的钳制前语义经随机对拍固化（见 quickSetupState.test.js
+// patchLines 差分用例）。换行对齐规则：
+//   有插入内容 — 保留 end 行前的换行（to = end 行起点 - 1；删到文档末尾直达
+//     length），insert 为 \n join；纯追加（start ≥ 行数）在文档末尾补 \n 前缀、
+//     行中追加补 \n 后缀
+//   纯删除（insert 空）— 吞掉被删行的换行（to = end 行起点；末尾块连前导换行
+//     一起删，from = start 行起点 - 1；start=0 的整文档删直达两端）
+export function patchLines(docText, rightStartLine, removeCount, insertLines) {
+  const text = String(docText ?? '');
+  const lineStarts = [0];
+  for (let i = 0; i < text.length; i += 1) {
+    if (text.charCodeAt(i) === 10) {
+      lineStarts.push(i + 1);
+    }
+  }
+  const lineCount = lineStarts.length;
+  const insert = (Array.isArray(insertLines) ? insertLines : []).map((line) => String(line ?? ''));
+  const start = Math.min(Math.max(Number(rightStartLine) || 0, 0), lineCount);
+  const end = Math.min(start + Math.max(Number(removeCount) || 0, 0), lineCount);
+  const at = (lineNo) => (lineNo >= lineCount ? text.length : lineStarts[lineNo]);
+  if (end > start) {
+    if (insert.length) {
+      return { from: at(start), to: end < lineCount ? at(end) - 1 : text.length, insert: insert.join('\n') };
+    }
+    if (end < lineCount) {
+      return { from: at(start), to: at(end), insert: '' };
+    }
+    if (start > 0) {
+      return { from: at(start) - 1, to: text.length, insert: '' };
+    }
+    return { from: 0, to: text.length, insert: '' };
+  }
+  if (!insert.length) {
+    return null;
+  }
+  if (start >= lineCount) {
+    return { from: text.length, to: text.length, insert: `\n${insert.join('\n')}` };
+  }
+  return { from: at(start), to: at(start), insert: `${insert.join('\n')}\n` };
 }

@@ -387,79 +387,27 @@
                     :value="effectivePreviewContent"
                     :aria-label="t('qs_diff_right')"
                     spellcheck="false"
-                    @input="onPreviewInput"
+                    @input="onRightChange($event.target.value)"
                   ></textarea>
                 </div>
 
-                <!-- 合并编辑器两列主体：左在用只读（git 染色，变更块内联采用按钮）/ 右预览 textarea -->
-                <div v-else class="mt-2 grid h-[440px] grid-cols-[minmax(0,1fr)_minmax(0,1fr)] overflow-hidden rounded-2xl border border-slate-200 dark:border-slate-700">
-                  <!-- 左列：在用配置只读。染色相对当前预览内容实时重算：与预览相比被移除/
-                       被替换的行聚成变更块（整块红底，块内行保持 git 染色与行号），same 中性走
-                       普通行；added 行只在右列存在，不渲染。块悬停浮现「采用此块 →」整块并入预览 -->
-                  <div class="flex min-h-0 flex-col border-r border-slate-200 dark:border-slate-700">
-                    <div class="flex shrink-0 flex-wrap items-center gap-x-1.5 border-b border-slate-200 bg-slate-100/70 px-3 py-2 text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-400">
-                      {{ t('qs_diff_left') }}
-                      <span
-                        v-if="liveModifiedLabel"
-                        class="font-mono text-[10px] font-normal normal-case tracking-normal text-slate-400 dark:text-slate-500"
-                      >{{ liveModifiedLabel }}</span>
-                    </div>
-                    <div class="code-editor custom-scrollbar min-h-0 flex-1 overflow-auto bg-slate-950 py-3 text-[12px] text-slate-100">
-                      <template v-for="(segment, si) in diffLeftSegments" :key="`seg-${si}`">
-                        <!-- 中性段：与预览一致的行，无染色 -->
-                        <template v-if="segment.kind === 'plain'">
-                          <div
-                            v-for="(line, li) in segment.lines"
-                            :key="`p-${si}-${li}`"
-                            class="flex min-h-6 leading-6"
-                          >
-                            <span class="w-10 shrink-0 select-none bg-slate-900/60 pr-2 text-right font-mono text-[11px] text-slate-600">{{ line.no }}</span>
-                            <span class="min-w-0 flex-1 whitespace-pre px-3">{{ line.text }}</span>
-                          </div>
-                        </template>
-                        <!-- 变更块：整块红底包裹（块级 splice 采用的视觉锚点），块尾右上角悬停
-                             浮现「采用此块 →」按钮，点击把该块在用行整块并入右列预览 -->
-                        <div v-else class="group/hunk relative bg-rose-500/15">
-                          <button
-                            v-if="segment.hunk"
-                            type="button"
-                            class="absolute right-1.5 top-1 z-10 inline-flex min-h-6 shrink-0 items-center rounded-lg border border-rose-300/60 bg-slate-900/90 px-1.5 text-[10px] font-semibold text-rose-200 opacity-0 transition hover:border-rose-300 hover:text-rose-50 focus-visible:opacity-100 group-hover/hunk:opacity-100 dark:border-rose-500/50"
-                            @click="adoptHunk(segment.hunk)"
-                          >
-                            {{ t('qs_diff_adopt_block') }}
-                          </button>
-                          <div
-                            v-for="(line, li) in segment.lines"
-                            :key="`h-${si}-${li}`"
-                            class="flex min-h-6 leading-6 text-rose-200"
-                          >
-                            <span class="w-10 shrink-0 select-none bg-slate-900/60 pr-2 text-right font-mono text-[11px] text-slate-600">{{ line.no }}</span>
-                            <span class="min-w-0 flex-1 whitespace-pre px-3">{{ line.text }}</span>
-                          </div>
-                        </div>
-                      </template>
-                    </div>
-                  </div>
-
-                  <!-- 右列：渲染预览 = apply 将写入的内容。textarea 常驻可编辑（input 即写
-                       previewEdits，左列染色/变更块/预检全部响应式重算），等宽字体行高与左列一致 -->
-                  <div class="flex min-h-0 flex-col">
-                    <div class="flex shrink-0 flex-wrap items-center gap-x-1.5 border-b border-slate-200 bg-slate-100/70 px-3 py-2 text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-400">
-                      {{ t('qs_diff_right') }}
-                      <span
-                        v-if="previewModified"
-                        class="rounded bg-amber-400/15 px-1.5 py-0.5 text-[10px] font-medium normal-case tracking-normal text-amber-600 dark:bg-amber-400/10 dark:text-amber-400"
-                      >{{ t('qs_diff_preview_modified') }}</span>
-                    </div>
-                    <textarea
-                      class="code-editor custom-scrollbar h-full min-h-0 w-full flex-1 resize-none border-0 bg-slate-950 px-4 py-3 text-[12px] leading-6 text-slate-100 outline-none focus:ring-1 focus:ring-inset focus:ring-primary/40"
-                      :value="effectivePreviewContent"
-                      :aria-label="t('qs_diff_right')"
-                      spellcheck="false"
-                      @input="onPreviewInput"
-                    ></textarea>
-                  </div>
-                </div>
+                <!-- 合并编辑器两列主体：左在用只读（CodeMirror 语法高亮 + rose 变更行装饰 +
+                     悬停「采用此块」浮钮）/ 右预览可编辑（语法高亮 + emerald 变更行装饰 +
+                     撤销历史）。编辑输入/块采用经 @right-change 写 previewEdits（单向数据流，
+                     组件不回写自身文档源），apply 预检/值感知读 previewEdits 天然生效 -->
+                <ConfigDiffEditors
+                  v-else
+                  ref="diffEditorsRef"
+                  class="mt-2 h-[440px] overflow-hidden rounded-2xl border border-slate-200 dark:border-slate-700"
+                  :left-content="liveContent ?? ''"
+                  :right-content="effectivePreviewContent"
+                  :format="activeFileDecl?.format ?? ''"
+                  :default-path="activeFileDecl?.default_path ?? ''"
+                  :left-meta="liveModifiedLabel"
+                  :right-modified="previewModified"
+                  @right-change="onRightChange"
+                  @adopt-hunk="adoptHunk"
+                />
 
                 <!-- 备份语境化：有自动备份（=至少成功应用过一次且当时有原配置）才出现的纤细恢复栏 -->
                 <div
@@ -681,9 +629,10 @@ import {
   updateCombo,
 } from '../services/quickSetupApi';
 import { useI18n } from '../i18n';
+import ConfigDiffEditors from './ConfigDiffEditors.vue';
 import QuickSetupConfigurePanel from './QuickSetupConfigurePanel.vue';
 import QuickSetupResultPanel from './QuickSetupResultPanel.vue';
-import { diffRowsAligned, findUnresolvedPlaceholders, groupDiffHunks, renderComboContent } from '../utils/quickSetupState';
+import { findUnresolvedPlaceholders, renderComboContent } from '../utils/quickSetupState';
 
 const { t } = useI18n();
 
@@ -729,6 +678,8 @@ const createCopyFromId = ref('');
 const createError = ref('');
 // 模板编辑 textarea 引用（插入变量定位光标）
 const templateTextareaEl = ref(null);
+// diff 双列编辑器引用（块级采用 patchRight 走 imperative handle）
+const diffEditorsRef = ref(null);
 // 右列数据源：config-state 的 files（磁盘实时内容，含 code/exists/content）。
 // 触发时机：loadCatalog 成功后 / 切 agent / apply 成功后 / diff 视图手动刷新按钮。
 const liveFiles = ref([]);
@@ -894,68 +845,8 @@ const restoreTargets = computed(() => {
   }
   return { restore, remove };
 });
-// 统一对齐 diff：左=在用配置（旧），右=有效预览（新，含手动编辑）。
-// 无基线（在用文件未生成/读不到）→ null：相对空基线「全是新增」的染色只会误导，走空态展示。
-const diffRows = computed(() => {
-  const inUse = liveContent.value;
-  if (inUse === null) {
-    return null;
-  }
-  return diffRowsAligned(inUse, effectivePreviewContent.value);
-});
-// 变更块：groupDiffHunks 对当前 diff 分块（无基线 → 空数组，左列只出中性段）
-const diffHunks = computed(() => groupDiffHunks(diffRows.value || []));
-// 合并编辑器左列分块渲染：same 行走中性段（plain），连续变更行（removed/changed，
-// 与 groupDiffHunks 同款「连续非 same 即一块」语义；added 只在右列，归入当前块但不渲染行）
-// 聚成整块红底的变更块（hunk）。块 → hunk 按 leftStart 匹配：块首行的 leftIndex 恰为
-// 所属 hunk 的 leftStart（纯 added 开头的 hunk 由回落逻辑从后续左行取 leftStart；
-// 纯 added hunk leftStart=null 永不误配），避免「纯新增块不产生左列块」造成的序号错位。
-// 行号 = 在用配置行号（leftIndex+1，顺序渲染下与递增计数等价）
-const diffLeftSegments = computed(() => {
-  const rows = diffRows.value || [];
-  const hunkByLeftStart = new Map();
-  for (const hunk of diffHunks.value) {
-    if (hunk && Number.isInteger(hunk.leftStart) && !hunkByLeftStart.has(hunk.leftStart)) {
-      hunkByLeftStart.set(hunk.leftStart, hunk);
-    }
-  }
-  const segments = [];
-  let plain = [];
-  let block = null;
-  let rendered = 0;
-  const flushPlain = () => {
-    if (plain.length) {
-      segments.push({ kind: 'plain', lines: plain });
-      plain = [];
-    }
-  };
-  const rowNo = (row) => (Number.isInteger(row.leftIndex) ? row.leftIndex : rendered) + 1;
-  for (const row of rows) {
-    if (!row || row.type === 'same') {
-      if (block) {
-        segments.push(block);
-        block = null;
-      }
-      plain.push({ no: rowNo(row), text: row?.left ?? row?.right ?? '' });
-      rendered += 1;
-      continue;
-    }
-    if (row.type === 'added') {
-      continue;
-    }
-    if (!block) {
-      flushPlain();
-      block = { kind: 'hunk', hunk: hunkByLeftStart.get(row.leftIndex) || null, lines: [] };
-    }
-    block.lines.push({ no: rowNo(row), text: row.left ?? '' });
-    rendered += 1;
-  }
-  flushPlain();
-  if (block) {
-    segments.push(block);
-  }
-  return segments;
-});
+// diff 双列的对齐与染色全部内聚在 ConfigDiffEditors（diffRowsAligned → CM 行装饰）；
+// 无基线（在用文件未生成/读不到）不渲染编辑器，走上方空态展示。
 // apply 前置校验：渲染后不得残留占位符，且模板引用的变量值必须非空
 // （空白种子的 api_key/model 是 ""，仅查渲染标记拦不住空值）
 const applyReadiness = computed(() => {
@@ -1095,39 +986,30 @@ function revertPreview() {
   }
 }
 
-// 变更块「采用此块 →」：取当前预览内容行数组，把 [rightStart, rightStart+rightLines.length)
-// 区间整块替换为 leftLines（与行级采纳同款 splice 语义的块级版）写回 previewEdits →
-// 左列染色/变更块/diff 全部响应式重算（索引每次取自最新分块，多块逐块采用天然正确）；
-// 与纯渲染一致时不留编辑记录（同「还原」语义收敛）
+// 变更块「采用此块 →」：右编辑器内块级 splice（patchRight 保留光标与撤销栈），
+// 随后经组件 right-change 单向回报写 previewEdits → 染色/变更块/diff 响应式重算
+// （索引每次取自最新分块，多块逐块采用天然正确）；与纯渲染一致时 onRightChange
+// 删键收敛（同「还原」语义）
 function adoptHunk(hunk) {
-  const code = activeFileCode.value;
-  if (!code || !hunk || !Number.isInteger(hunk.rightStart) || hunk.rightStart < 0) {
+  if (!hunk || !Number.isInteger(hunk.rightStart) || hunk.rightStart < 0) {
     return;
   }
-  const lines = String(effectivePreviewContent.value ?? '').split('\n');
-  const start = Math.min(hunk.rightStart, lines.length);
-  const end = Math.min(hunk.rightStart + (hunk.rightLines || []).length, lines.length);
-  lines.splice(start, Math.max(0, end - start), ...(hunk.leftLines || []));
-  const next = lines.join('\n');
-  if (next === renderedContent.value) {
-    delete previewEdits.value[code];
-  } else {
-    previewEdits.value = { ...previewEdits.value, [code]: next };
-  }
+  diffEditorsRef.value?.patchRight(hunk.rightStart, (hunk.rightLines || []).length, hunk.leftLines || []);
 }
 
-// 右列 textarea 常驻可编辑：input 即写 previewEdits（diff/左列染色/变更块/applyReadiness
-// 预检即时重算）；与纯渲染一致时不留编辑记录（「预览已手动修改」徽标准确）
-function onPreviewInput(event) {
+// 右列编辑内容变化（CM 编辑器输入/块采用 + 空态 textarea input）：即写 previewEdits
+// （染色/变更块/applyReadiness 预检即时重算）；与纯渲染一致时不留编辑记录
+// （「预览已手动修改」徽标准确）
+function onRightChange(value) {
   const code = activeFileCode.value;
   if (!code) {
     return;
   }
-  const value = String(event?.target?.value ?? '');
-  if (value === renderedContent.value) {
+  const next = String(value ?? '');
+  if (next === renderedContent.value) {
     delete previewEdits.value[code];
   } else {
-    previewEdits.value = { ...previewEdits.value, [code]: value };
+    previewEdits.value = { ...previewEdits.value, [code]: next };
   }
 }
 
