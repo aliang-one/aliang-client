@@ -547,6 +547,15 @@
         </div>
 
         <div class="space-y-4 p-5">
+          <!-- 服务重启清空 dashboard 会话：提示远程用户必须重新登录 -->
+          <div
+            v-if="dashboardSessionRequired"
+            role="status"
+            class="rounded-xl border border-amber-300 bg-amber-50/80 p-3 text-xs font-medium text-amber-800 dark:border-amber-700 dark:bg-amber-950/40 dark:text-amber-200"
+          >
+            {{ t('qs_relogin_banner') }}
+          </div>
+
           <!-- 登录方式切换：密码 / 扫码 -->
           <div class="grid grid-cols-2 gap-1 rounded-lg border border-slate-200 bg-slate-50/80 p-1 dark:border-slate-700 dark:bg-slate-800/60">
             <button
@@ -814,7 +823,7 @@ const frontEndLogsFetchLimit = isProdBuild ? 200 : 800;
 
 const { certStatus, loading: certLoading, startPolling: startCertPolling, stopPolling: stopCertPolling } = useCertStatus();
 const { currentPage, showSettings } = useNavigation();
-const { isAuthenticated, user, userDisplayName, planLabel, authNotice, loginPending, loginError, loginWithPassword } = useAuthStore();
+const { isAuthenticated, user, userDisplayName, planLabel, authNotice, loginPending, loginError, dashboardSessionRequired, loginWithPassword } = useAuthStore();
 const {
   runMode,
   runIsRunning,

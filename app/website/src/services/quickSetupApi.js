@@ -1,4 +1,4 @@
-import { syncUnauthenticatedAuthState } from '../stores/auth';
+import { markDashboardSessionRequired, syncUnauthenticatedAuthState } from '../stores/auth';
 import { handleAuthenticationFailure } from './authFailure';
 
 function extractOuterEnvelope(json) {
@@ -8,6 +8,27 @@ function extractOuterEnvelope(json) {
     msg: typeof payload.msg === 'string' ? payload.msg : '',
     data: typeof payload.data !== 'undefined' ? payload.data : null,
   };
+}
+
+// HTTP 401 + {code:101, data:{error_code:'unauthorized'}} 是 dashboard 会话
+// 中间件的签名（区别于上游 token 过期的 401）：此时上游快照可能仍 active，
+// 通用恢复会被翻回 true 而让登录界面永远无法出现，必须强制停留在登录视图。
+function isDashboardSessionFailure(responseStatus, envelope) {
+  if (Number(responseStatus) !== 401) return false;
+  const data = envelope && typeof envelope.data === 'object' && envelope.data ? envelope.data : null;
+  return data?.error_code === 'unauthorized'
+    || Number(data?.code) === 101
+    || Number(envelope?.code) === 101;
+}
+
+function handleSessionFailure(responseStatus, envelope) {
+  handleAuthenticationFailure(responseStatus, envelope, (message) => {
+    if (isDashboardSessionFailure(responseStatus, envelope)) {
+      markDashboardSessionRequired(message);
+      return;
+    }
+    syncUnauthenticatedAuthState(message);
+  });
 }
 
 async function rawRequest(path, options = {}) {
@@ -23,7 +44,7 @@ async function rawRequest(path, options = {}) {
   const json = await response.json().catch(() => ({}));
   const envelope = extractOuterEnvelope(json);
 
-  handleAuthenticationFailure(response.status, envelope, syncUnauthenticatedAuthState);
+  handleSessionFailure(response.status, envelope);
 
   if (!response.ok || envelope.code !== 0) {
     throw new Error(envelope.msg || `Request failed with HTTP ${response.status}`);
