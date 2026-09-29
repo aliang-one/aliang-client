@@ -11,8 +11,9 @@ function extractOuterEnvelope(json) {
 }
 
 // HTTP 401 + {code:101, data:{error_code:'unauthorized'}} 是 dashboard 会话
-// 中间件的签名（区别于上游 token 过期的 401）：此时上游快照可能仍 active，
-// 通用恢复会被翻回 true 而让登录界面永远无法出现，必须强制停留在登录视图。
+// 中间件的签名。quick-setup 端面上「上游 token 过期」与「dashboard 会话失效」
+// 两种成因的 401 同形且用户动作相同（重新登录），故一律钉在登录视图：
+// 此时上游快照可能仍 active，通用恢复会被翻回 true 而让登录界面永远无法出现。
 function isDashboardSessionFailure(responseStatus, envelope) {
   if (Number(responseStatus) !== 401) return false;
   const data = envelope && typeof envelope.data === 'object' && envelope.data ? envelope.data : null;
