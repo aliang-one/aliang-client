@@ -2,10 +2,15 @@ package services
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 // ---- 解析:claude 对未知 --effort 的两种世代输出 ----
@@ -62,15 +67,40 @@ func TestParseCLIEffortLevelsCapsAndDedups(t *testing.T) {
 // ---- isAgentAIEffortRejected:仅硬拒世代视为"被拒"(警告世代 CLI 自己继续跑) ----
 
 func TestIsAgentAIEffortRejectedOnlyForHardReject(t *testing.T) {
-	rejected, levels := isAgentAIEffortRejected(effortProbeOldReject)
-	if !rejected || !reflect.DeepEqual(levels, []string{"low", "medium", "high", "xhigh", "max"}) {
-		t.Fatalf("old reject: rejected=%v levels=%v", rejected, levels)
+	rej := isAgentAIEffortRejected(effortProbeOldReject)
+	if !rej.rejected || rej.flagUnsupported ||
+		!reflect.DeepEqual(rej.levels, []string{"low", "medium", "high", "xhigh", "max"}) {
+		t.Fatalf("old reject: %+v", rej)
 	}
-	if rejected, _ := isAgentAIEffortRejected(effortProbeNewWarning); rejected {
-		t.Fatalf("new warning must not count as rejected")
+	if rej := isAgentAIEffortRejected(effortProbeNewWarning); rej.rejected {
+		t.Fatalf("new warning must not count as rejected: %+v", rej)
 	}
-	if rejected, _ := isAgentAIEffortRejected("API Error: 502\n"); rejected {
-		t.Fatalf("plain error must not count as rejected")
+	if rej := isAgentAIEffortRejected("API Error: 502\n"); rej.rejected {
+		t.Fatalf("plain error must not count as rejected: %+v", rej)
+	}
+}
+
+// 极老世代(2026-01 的 claude 2.1.17 一类)根本没注册 --effort 这个 flag:
+// commander 在参数解析阶段就报 "error: unknown option '--effort'" 并 exit 1。
+// 这不是"值被拒"(没有合法清单可钳),而是"flag 不存在"(重试应去掉 flag)。
+// 2026-09-29 事故:agent 解析到 ~/.local/bin claude 2.1.17,--effort max 秒挂
+// 且探测/重试两道防线都把它当"未知不设限"放行了。
+const effortFlagUnknownReject = "error: unknown option '--effort'\n"
+
+func TestIsAgentAIEffortRejectedFlagUnknown(t *testing.T) {
+	rej := isAgentAIEffortRejected(effortFlagUnknownReject)
+	if !rej.rejected {
+		t.Fatalf("flag-unknown reject must count as rejected: %+v", rej)
+	}
+	if !rej.flagUnsupported {
+		t.Fatalf("flag-unknown reject must set flagUnsupported: %+v", rej)
+	}
+	if len(rej.levels) != 0 {
+		t.Fatalf("flag-unknown reject has no level list: %+v", rej)
+	}
+	// 相近但不同的 flag 报错不能误伤。
+	if rej := isAgentAIEffortRejected("error: unknown option '--efforts'\n"); rej.rejected {
+		t.Fatalf("unrelated unknown option must not count: %+v", rej)
 	}
 }
 
@@ -153,6 +183,147 @@ func TestProbeClaudeEffortLevelsViaFakeCLI(t *testing.T) {
 	quiet := writeFakeCLI(t, dir, "fakeclaude3", "echo \"hello\"\n")
 	if got := probeClaudeEffortLevels(quiet); got != nil {
 		t.Fatalf("probeClaudeEffortLevels(quiet) = %v, want nil", got)
+	}
+}
+
+// ---- flag 级拒绝:探测归类 + 缓存学习 + spawn 前去档 ----
+
+func TestProbeClaudeEffortCapabilityFlagUnsupported(t *testing.T) {
+	dir := t.TempDir()
+	path := writeFakeCLI(t, dir, "fakeclaude-old",
+		"echo \""+strings.TrimSuffix(effortFlagUnknownReject, "\n")+"\"; exit 1\n")
+
+	probe, ok := probeClaudeEffortCapability(path)
+	if !ok || !probe.ok || !probe.flagUnsupported || len(probe.levels) != 0 {
+		t.Fatalf("probeClaudeEffortCapability = (ok=%v, %+v), want ok with flagUnsupported", ok, probe)
+	}
+	// 清单视角:flag 不存在 = 没有可钳清单(nil,而非"未知不设限"之外的含义丢失)。
+	if got := probeClaudeEffortLevels(path); got != nil {
+		t.Fatalf("probeClaudeEffortLevels(flag-unknown) = %v, want nil", got)
+	}
+	// 探测结论必须落缓存:spawn 路径凭缓存就能去档,不再现场探测。
+	if !claudeEffortFlagUnsupportedCached(path) {
+		t.Fatalf("flag-unsupported probe result must be cached for %s", path)
+	}
+	// 未探测过的路径:缓存只读查询必须返回 false,绝不阻塞 spawn。
+	if claudeEffortFlagUnsupportedCached(filepath.Join(dir, "never-probed")) {
+		t.Fatalf("unprobed path must not be flagged")
+	}
+}
+
+func TestRememberClaudeEffortFlagUnsupported(t *testing.T) {
+	dir := t.TempDir()
+	path := writeFakeCLI(t, dir, "fakeclaude-learn", "echo \"2.1.17 (Claude Code)\"\n")
+	if claudeEffortFlagUnsupportedCached(path) {
+		t.Fatalf("fresh path must not be flagged before learning")
+	}
+	rememberClaudeEffortFlagUnsupported(path)
+	if !claudeEffortFlagUnsupportedCached(path) {
+		t.Fatalf("runtime-learned flag rejection must be remembered for %s", path)
+	}
+	rememberClaudeEffortFlagUnsupported("")
+	if claudeEffortFlagUnsupportedCached("") {
+		t.Fatalf("empty path must not be flagged")
+	}
+}
+
+func TestEffortDropForBinary(t *testing.T) {
+	dir := t.TempDir()
+	stale := writeFakeCLI(t, dir, "fakeclaude-stale", "echo \"2.1.17 (Claude Code)\"\n")
+	rememberClaudeEffortFlagUnsupported(stale)
+
+	if got := effortDropForBinary("max", stale); got != "" {
+		t.Fatalf("effortDropForBinary(max, known-stale) = %q, want dropped", got)
+	}
+	fresh := writeFakeCLI(t, dir, "fakeclaude-fresh", "echo \"2.1.280 (Claude Code)\"\n")
+	if got := effortDropForBinary("max", fresh); got != "max" {
+		t.Fatalf("effortDropForBinary(max, unprobed) = %q, want passthrough", got)
+	}
+	if got := effortDropForBinary("  ", stale); got != "  " {
+		t.Fatalf("effortDropForBinary(blank, known-stale) = %q, want passthrough (nothing to send)", got)
+	}
+}
+
+// ---- 版本探针热路径安全:失败负缓存 + 只读窥视 ----
+
+// probeCLIVersion 失败必须负缓存(TTL 内不重复 spawn):它被放在了每回合的
+// fallback lookup 与日志路径上,持久失败的二进制若每调用都重探,每次最多阻塞 2s。
+func TestProbeCLIVersionNegativeCachesFailures(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fixture is unix-only")
+	}
+	_, err := exec.LookPath("bash")
+	require.NoError(t, err)
+
+	dir := t.TempDir()
+	counter := filepath.Join(dir, "count")
+	script := filepath.Join(t.TempDir(), "no-version-claude")
+	require.NoError(t, os.WriteFile(script, []byte(
+		"#!/bin/bash\n"+
+			"echo x >> "+counter+"\n"+
+			"echo \"Claude Code dev build\"\n"+
+			"exit 0\n",
+	), 0o755))
+
+	if got := probeCLIVersion(script); got != "" {
+		t.Fatalf("first probe = %q, want empty (no x.y.z in output)", got)
+	}
+	if got := probeCLIVersion(script); got != "" {
+		t.Fatalf("second probe = %q, want empty", got)
+	}
+	raw, err := os.ReadFile(counter)
+	require.NoError(t, err, "failing --version must have executed once")
+	if n := len(strings.Split(strings.TrimRight(string(raw), "\n"), "\n")); n != 1 {
+		t.Fatalf("failing probe executed %d times, want 1 (negative cache must suppress re-spawns within TTL)", n)
+	}
+}
+
+// cachedCLIVersion 只读窥视:命中成功缓存返回版本;未缓存绝不 spawn。
+func TestCachedCLIVersionPeekOnly(t *testing.T) {
+	dir := t.TempDir()
+	if got := cachedCLIVersion(filepath.Join(dir, "never-probed")); got != "" {
+		t.Fatalf("cachedCLIVersion(unprobed) = %q, want empty without spawning", got)
+	}
+	path := writeFakeCLI(t, dir, "peek-claude", "echo \"2.1.280 (Claude Code)\"\n")
+	if got := probeCLIVersion(path); got != "2.1.280" {
+		t.Fatalf("probeCLIVersion = %q", got)
+	}
+	if got := cachedCLIVersion(path); got != "2.1.280" {
+		t.Fatalf("cachedCLIVersion = %q, want warmed 2.1.280", got)
+	}
+}
+
+// 并发竞态:探测失败落地不得冲掉运行时学习到的 flagUnsupported 结论
+// (冲掉的代价=该二进制多死一次 spawn)。探测先起跑、学习落在飞行中。
+func TestProbeFailureDoesNotClobberLearnedFlagUnsupported(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fixture is unix-only")
+	}
+	_, err := exec.LookPath("bash")
+	require.NoError(t, err)
+
+	dir := t.TempDir()
+	path := writeFakeCLI(t, dir, "slow-garbage-claude", "sleep 0.5; echo \"garbage output\"\n")
+
+	type probeResult struct {
+		probe cliCapabilityProbe
+		ok    bool
+	}
+	done := make(chan probeResult, 1)
+	go func() {
+		probe, ok := probeClaudeEffortCapability(path)
+		done <- probeResult{probe, ok}
+	}()
+	// 脚本要睡 0.5s,此刻探测必然仍在飞行中,学习恰好落在探测前。
+	time.Sleep(100 * time.Millisecond)
+	rememberClaudeEffortFlagUnsupported(path)
+
+	res := <-done
+	if !res.ok || !res.probe.flagUnsupported {
+		t.Fatalf("probe result = (ok=%v, %+v), want preserved flagUnsupported", res.ok, res.probe)
+	}
+	if !claudeEffortFlagUnsupportedCached(path) {
+		t.Fatalf("learned flagUnsupported was clobbered by a failed probe for %s", path)
 	}
 }
 

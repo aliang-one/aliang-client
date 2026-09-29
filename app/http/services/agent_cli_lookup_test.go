@@ -3,6 +3,7 @@ package services
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -16,6 +17,7 @@ func TestUserBinCandidates(t *testing.T) {
 }
 
 func TestLookPathInHomesFindsLocalBin(t *testing.T) {
+	isolateDarwinSystemBins(t)
 	dir := t.TempDir()
 	binDir := filepath.Join(dir, ".local", "bin")
 	if err := os.MkdirAll(binDir, 0o755); err != nil {
@@ -35,6 +37,7 @@ func TestLookPathInHomesFindsLocalBin(t *testing.T) {
 }
 
 func TestLookPathInHomesFindsNvmNode(t *testing.T) {
+	isolateDarwinSystemBins(t)
 	dir := t.TempDir()
 	binDir := filepath.Join(dir, ".nvm", "versions", "node", "v20.0.0", "bin")
 	if err := os.MkdirAll(binDir, 0o755); err != nil {
@@ -54,6 +57,7 @@ func TestLookPathInHomesFindsNvmNode(t *testing.T) {
 }
 
 func TestLookPathInHomesFindsUserChatGPTCodexOnDarwin(t *testing.T) {
+	isolateDarwinSystemBins(t)
 	home := t.TempDir()
 	codex := filepath.Join(
 		home,
@@ -80,6 +84,7 @@ func TestLookPathInHomesFindsUserChatGPTCodexOnDarwin(t *testing.T) {
 }
 
 func TestLookPathInHomesPrefersStandaloneCodexOverChatGPTBundle(t *testing.T) {
+	isolateDarwinSystemBins(t)
 	home := t.TempDir()
 	standalone := filepath.Join(home, ".local", "bin", "codex")
 	bundled := filepath.Join(
@@ -307,5 +312,110 @@ func TestIsExecutableFileRejectsDirAndNonExec(t *testing.T) {
 	}
 	if isExecutableFile(plain) {
 		t.Errorf("无执行位的文件不应被判定为可执行文件: %s", plain)
+	}
+}
+
+// ---- 多候选并存时按版本取最新(2026-09-29 事故回归) ----
+// 事故:GUI 启动的 agent PATH 缺失,fallback 扫描里 ~/.local/bin 排在
+// /opt/homebrew/bin 之前,陈旧的 2.1.17 native 装机仅凭目录顺序压过了
+// 2.1.280 的 homebrew 装机。目录顺序不应决定生死,版本才是。
+
+func writeVersionedFakeCLI(t *testing.T, dir, name, version string) string {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir fake cli dir: %v", err)
+	}
+	body := "#!/bin/sh\n"
+	if version != "" {
+		body += "echo \"" + version + "\"\n"
+	}
+	if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
+		t.Fatalf("write fake cli: %v", err)
+	}
+	return path
+}
+
+func overrideDarwinSystemBins(t *testing.T, dir string) {
+	t.Helper()
+	orig := darwinSystemBinDirs
+	darwinSystemBinDirs = []string{dir}
+	t.Cleanup(func() { darwinSystemBinDirs = orig })
+}
+
+func TestLookPathInHomesForOSPrefersNewestAcrossInstallRoots(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fixture is unix-only")
+	}
+	home := t.TempDir()
+	stale := writeVersionedFakeCLI(t, filepath.Join(home, ".local", "bin"), "claude", "2.1.17 (Claude Code)")
+	sysDir := t.TempDir()
+	newest := writeVersionedFakeCLI(t, sysDir, "claude", "2.1.280 (Claude Code)")
+	overrideDarwinSystemBins(t, sysDir)
+
+	got, err := lookPathInHomesForOS([]string{home}, "claude", "darwin", "arm64")
+	if err != nil {
+		t.Fatalf("lookPathInHomesForOS: %v", err)
+	}
+	if got != newest {
+		t.Errorf("找到 %q,期望按版本选中新装机 %q(而非目录序先到的 %q)", got, newest, stale)
+	}
+}
+
+func TestLookPathInHomesForOSNewerHomeInstallBeatsOlderSystem(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fixture is unix-only")
+	}
+	home := t.TempDir()
+	newer := writeVersionedFakeCLI(t, filepath.Join(home, ".local", "bin"), "claude", "2.1.300 (Claude Code)")
+	sysDir := t.TempDir()
+	writeVersionedFakeCLI(t, sysDir, "claude", "2.1.280 (Claude Code)")
+	overrideDarwinSystemBins(t, sysDir)
+
+	got, err := lookPathInHomesForOS([]string{home}, "claude", "darwin", "arm64")
+	if err != nil {
+		t.Fatalf("lookPathInHomesForOS: %v", err)
+	}
+	if got != newer {
+		t.Errorf("找到 %q,期望家目录新装机 %q 胜出", got, newer)
+	}
+}
+
+func TestLookPathInHomesForOSKeepsOrderWhenVersionsUnknown(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fixture is unix-only")
+	}
+	home := t.TempDir()
+	first := writeVersionedFakeCLI(t, filepath.Join(home, ".local", "bin"), "claude", "")
+	sysDir := t.TempDir()
+	writeVersionedFakeCLI(t, sysDir, "claude", "")
+	overrideDarwinSystemBins(t, sysDir)
+
+	got, err := lookPathInHomesForOS([]string{home}, "claude", "darwin", "arm64")
+	if err != nil {
+		t.Fatalf("lookPathInHomesForOS: %v", err)
+	}
+	if got != first {
+		t.Errorf("版本全部探不到时应保持原顺序,期望 %q,得到 %q", first, got)
+	}
+}
+
+// 版本仲裁不得越过文档化的「独立安装优先于 ChatGPT.app 内置」偏好:
+// 应用捆绑版随 app 更新整体替换,即使版本号更高也不参与仲裁。
+func TestLookPathInHomesForOSStandaloneBeatsNewerAppBundle(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fixture is unix-only")
+	}
+	home := t.TempDir()
+	standalone := writeVersionedFakeCLI(t, filepath.Join(home, ".local", "bin"), "codex", "codex-cli 0.144.5")
+	bundled := writeVersionedFakeCLI(t, filepath.Join(home, "Applications", "ChatGPT.app", "Contents", "Resources"), "codex", "codex-cli 0.150.0")
+	overrideDarwinSystemBins(t, t.TempDir())
+
+	got, err := lookPathInHomesForOS([]string{home}, "codex", "darwin", "arm64")
+	if err != nil {
+		t.Fatalf("lookPathInHomesForOS: %v", err)
+	}
+	if got != standalone {
+		t.Errorf("找到 %q,期望独立安装 %q 胜出(尽管 app 内置版 %q 版本更高)", got, standalone, bundled)
 	}
 }

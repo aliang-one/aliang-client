@@ -82,14 +82,43 @@ func lookPathInHomes(homes []string, name string) (string, error) {
 }
 
 func lookPathInHomesForOS(homes []string, name, goos, goarch string) (string, error) {
+	var found []string
 	for _, home := range homes {
 		for _, candidate := range userBinCandidates(home, name) {
 			if isExecutableFile(candidate) {
-				return candidate, nil
+				found = append(found, candidate)
 			}
 		}
 	}
+	// 应用捆绑候选(ChatGPT.app 内置 codex 等)与包管理器装机分组:捆绑版随
+	// app 更新整体替换,文档化地排在包管理器装机之后,即使版本号更高也不参与
+	// 版本仲裁(评审确认 2026-09-29)。
+	sysDirs := make(map[string]bool, len(darwinSystemBinDirs))
+	for _, dir := range darwinSystemBinDirs {
+		sysDirs[dir] = true
+	}
+	var appBundle []string
 	for _, candidate := range platformBinCandidates(goos, homes, name) {
+		if !isExecutableFile(candidate) {
+			continue
+		}
+		if sysDirs[filepath.Dir(candidate)] {
+			found = append(found, candidate)
+		} else {
+			appBundle = append(appBundle, candidate)
+		}
+	}
+	// 多个独立候选并存时按 `--version` 数值取最新(探不到版本的排后;全部
+	// 探不到保持原顺序)。目录顺序不决定生死:GUI/服务场景 PATH 缺失时,家目录
+	// 里陈旧的装机(2026-09-29 事故:~/.local/bin claude 2.1.17)不得仅凭扫描
+	// 顺序压过更新的机器级安装。探测失败按 TTL 负缓存,窗口内选择确定性一致。
+	if len(found) > 1 {
+		found = newestCLIBinaries(found)
+	}
+	if len(found) > 0 {
+		return found[0], nil
+	}
+	for _, candidate := range appBundle {
 		if isExecutableFile(candidate) {
 			return candidate, nil
 		}
@@ -102,6 +131,33 @@ func lookPathInHomesForOS(homes []string, name, goos, goarch string) (string, er
 		}
 	}
 	return "", &exec.Error{Name: name, Err: exec.ErrNotFound}
+}
+
+// newestCLIBinaries 依 probeCLIVersion(带二进制内容缓存)挑出 x.y.z 最高的候选。
+// 探不到版本的候选视为最低;与最高版本并列的候选全部保留(首个按入参顺序胜出)。
+// 全部探不到时原样返回——此时退回既有的目录优先级,行为与改动前一致。
+func newestCLIBinaries(candidates []string) []string {
+	versions := make([][]int, len(candidates))
+	var best []int
+	bestKnown := false
+	for i, candidate := range candidates {
+		if v, ok := parseExtensionVersion(parseCLIVersion(probeCLIVersion(candidate))); ok {
+			versions[i] = v
+			if !bestKnown || compareExtensionVersions(v, best) > 0 {
+				bestKnown, best = true, v
+			}
+		}
+	}
+	if !bestKnown {
+		return candidates
+	}
+	out := make([]string, 0, len(candidates))
+	for i, candidate := range candidates {
+		if versions[i] != nil && compareExtensionVersions(versions[i], best) == 0 {
+			out = append(out, candidate)
+		}
+	}
+	return out
 }
 
 func userBinCandidates(home, name string) []string {

@@ -12,21 +12,22 @@ func TestPlanAgentAIEffortRetry(t *testing.T) {
 	cases := []struct {
 		name         string
 		requested    string
-		levels       []string
+		rej          agentAIEffortRejection
 		wantRetry    bool
 		wantRetryEff string
 	}{
-		{"ultracode 降 max", "ultracode", []string{"low", "medium", "high", "xhigh", "max"}, true, "max"},
-		{"无 max 档降 xhigh", "ultracode", []string{"low", "medium", "high", "xhigh"}, true, "xhigh"},
-		{"全不支持→去掉 --effort", "ultracode", []string{"turbo"}, true, ""},
-		{"清单缺失→不重试(交错误兜底)", "ultracode", nil, false, ""},
-		{"请求空→不重试", "", []string{"low"}, false, ""},
+		{"ultracode 降 max", "ultracode", agentAIEffortRejection{rejected: true, levels: []string{"low", "medium", "high", "xhigh", "max"}}, true, "max"},
+		{"无 max 档降 xhigh", "ultracode", agentAIEffortRejection{rejected: true, levels: []string{"low", "medium", "high", "xhigh"}}, true, "xhigh"},
+		{"全不支持→去掉 --effort", "ultracode", agentAIEffortRejection{rejected: true, levels: []string{"turbo"}}, true, ""},
+		{"flag 本身不认识→去 flag 重试", "max", agentAIEffortRejection{rejected: true, flagUnsupported: true}, true, ""},
+		{"未被拒→不重试", "max", agentAIEffortRejection{}, false, ""},
+		{"请求空→不重试", "", agentAIEffortRejection{rejected: true, levels: []string{"low"}}, false, ""},
 	}
 	for _, c := range cases {
-		plan := planAgentAIEffortRetry(c.requested, c.levels)
+		plan := planAgentAIEffortRetry(c.requested, c.rej)
 		if plan.retry != c.wantRetry || plan.retryEffort != c.wantRetryEff {
-			t.Fatalf("%s: planAgentAIEffortRetry(%q, %v) = %+v, want retry=%v effort=%q",
-				c.name, c.requested, c.levels, plan, c.wantRetry, c.wantRetryEff)
+			t.Fatalf("%s: planAgentAIEffortRetry(%q, %+v) = %+v, want retry=%v effort=%q",
+				c.name, c.requested, c.rej, plan, c.wantRetry, c.wantRetryEff)
 		}
 	}
 }

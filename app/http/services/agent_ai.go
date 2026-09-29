@@ -3221,34 +3221,53 @@ func (m *agentAIManager) runCLI(ctx context.Context, run agentAIRun, writeJSON a
 	// under a different project path than this run's cwd), retry fresh so the
 	// conversation still streams instead of surfacing a hard error.
 	if strings.TrimSpace(run.resumeSessionID) != "" {
-		outcome, levels := m.runCLIPass(ctx, run, writeJSON, true)
+		outcome, rej := m.runCLIPass(ctx, run, writeJSON, true)
 		if outcome != agentAIRunResumeMissing {
-			m.retryAfterEffortRejected(ctx, run, writeJSON, outcome, levels, true)
+			m.retryAfterEffortRejected(ctx, run, writeJSON, outcome, rej, true)
 			return
 		}
 	}
-	outcome, levels := m.runCLIPass(ctx, run, writeJSON, false)
-	m.retryAfterEffortRejected(ctx, run, writeJSON, outcome, levels, false)
+	outcome, rej := m.runCLIPass(ctx, run, writeJSON, false)
+	m.retryAfterEffortRejected(ctx, run, writeJSON, outcome, rej, false)
 }
 
-// retryAfterEffortRejected 在 CLI 硬拒 effort 档时,按其声明的合法清单钳制后
-// 重试一次(与 agentAIRunResumeMissing 的自愈重试同构)。没有更合适的档位、或
-// 重试仍被拒时补发 ai.error,避免回合静默无响应。
-func (m *agentAIManager) retryAfterEffortRejected(ctx context.Context, run agentAIRun, writeJSON agentTerminalWriter, outcome agentAIRunOutcome, levels []string, allowResume bool) {
+// retryAfterEffortRejected 在 CLI 拒绝 effort(flag 本身不存在,或硬拒值)时
+// 自愈重试一次:flag 级拒绝直接去掉 --effort,值级拒绝按声明的合法清单钳制
+// (与 agentAIRunResumeMissing 的自愈重试同构)。无法钳制、或重试仍被拒时补发
+// ai.error,避免回合静默无响应。
+func (m *agentAIManager) retryAfterEffortRejected(ctx context.Context, run agentAIRun, writeJSON agentTerminalWriter, outcome agentAIRunOutcome, rej agentAIEffortRejection, allowResume bool) {
 	if outcome != agentAIRunEffortRejected || ctx.Err() != nil {
 		return
 	}
 	requested := strings.TrimSpace(run.effort)
-	plan := planAgentAIEffortRetry(requested, levels)
+	plan := planAgentAIEffortRetry(requested, rej)
 	if !plan.retry {
+		detail := "no compatible effort level"
+		if rej.flagUnsupported {
+			detail = "CLI does not support --effort"
+		} else if len(rej.levels) > 0 {
+			detail = "supported: " + strings.Join(rej.levels, ", ")
+		}
 		_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID,
-			fmt.Errorf("claude CLI rejected effort %q (supported: %s)", requested, strings.Join(levels, ", "))))
+			fmt.Errorf("claude CLI rejected effort %q (%s)", requested, detail)))
 		return
 	}
 	run.effort = plan.retryEffort
-	if second, _ := m.runCLIPass(ctx, run, writeJSON, allowResume); second == agentAIRunEffortRejected {
+	second, _ := m.runCLIPass(ctx, run, writeJSON, allowResume)
+	if second == agentAIRunEffortRejected {
 		_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID,
 			fmt.Errorf("claude CLI rejected effort %q even after clamping to %q", requested, plan.retryEffort)))
+		return
+	}
+	// 去档/钳制重试撞上 resume 缺失(与 runCLI 的自愈同构):allowResume 路径
+	// 的第二次 pass 可能因陈旧 resume id 返回 ResumeMissing,直接返回会让回合
+	// 既无输出也无错误(2026-09-29 评审确认的静默回归)。清掉 resume 再补一发
+	// fresh pass;此时 effort 已处理完毕,fresh pass 不再带被拒的档。
+	if second == agentAIRunResumeMissing && allowResume && ctx.Err() == nil {
+		m.clearAgentAIResumeSessionID(run.sessionID, run.runSeq, run.resumeSessionID)
+		run.resumeSessionID = ""
+		run.prompt = firstNonEmpty(run.freshPrompt, run.prompt)
+		_, _ = m.runCLIPass(ctx, run, writeJSON, false)
 	}
 }
 
@@ -4792,8 +4811,8 @@ func firstNonNil(values ...interface{}) interface{} {
 }
 
 // runCLIPass 跑一遍 CLI。第二个返回值仅在 agentAIRunEffortRejected 时携带
-// CLI 声明的合法 effort 清单,供调用方钳制重试。
-func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJSON agentTerminalWriter, allowResume bool) (agentAIRunOutcome, []string) {
+// CLI 的 effort 拒绝分类(flag 本身不受支持 / 合法清单),供调用方自愈重试。
+func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJSON agentTerminalWriter, allowResume bool) (agentAIRunOutcome, agentAIEffortRejection) {
 	resumeID := run.resumeSessionID
 	newSessionID := run.reservedNativeSessionID
 	if !allowResume {
@@ -4812,13 +4831,34 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 	}
 	if err != nil {
 		_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, err))
-		return agentAIRunDone, nil
+		return agentAIRunDone, agentAIEffortRejection{}
+	}
+	// 该二进制已知不认 --effort(探针确证或上次运行学到):spawn 前直接去档
+	// 重解析,别让回合死在参数校验上(2026-09-29 事故:~/.local/bin claude 2.1.17)。
+	// 去档是静默降级,打一行日志让它可诊断(评审确认:探测抖动窗口内可能
+	// 选错二进制连带走档,日志是唯一可见痕迹)。
+	if err == nil {
+		if dropped := effortDropForBinary(run.effort, tool.path); dropped != run.effort {
+			logger.Info(fmt.Sprintf(
+				"ai.effort.dropped: session=%s runSeq=%d path=%q version=%q requested=%q (binary known to lack --effort)",
+				run.sessionID, run.runSeq, tool.path, cachedCLIVersion(tool.path), run.effort))
+			run.effort = dropped
+			if run.readOnly || len(run.goalIdentity) > 0 {
+				tool, err = resolveGoalAgentAITool(run.prompt, run.provider, run.model, dropped, resumeID, newSessionID)
+			} else {
+				tool, err = resolveAgentAITool(run.prompt, run.provider, run.model, dropped, resumeID, newSessionID)
+			}
+			if err != nil {
+				_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, err))
+				return agentAIRunDone, agentAIEffortRejection{}
+			}
+		}
 	}
 	if run.readOnly {
 		tool = withAgentReadOnlyPolicy(tool)
 		if tool == nil {
 			_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, errors.New("provider does not support enforced read-only mode")))
-			return agentAIRunDone, nil
+			return agentAIRunDone, agentAIEffortRejection{}
 		}
 	} else if len(run.goalIdentity) > 0 {
 		tool = withGoalExecutionPolicy(tool)
@@ -4849,11 +4889,12 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 		cmd.Env = append(cmd.Env, tool.env...)
 	}
 	logger.Info(fmt.Sprintf(
-		"ai.run.cli: session=%s runSeq=%d provider=%s path=%q cwd=%q allowResume=%t resume=%t model=%q effort=%q output=%s hook_base=%q args=%v env=%s",
+		"ai.run.cli: session=%s runSeq=%d provider=%s path=%q version=%q cwd=%q allowResume=%t resume=%t model=%q effort=%q output=%s hook_base=%q args=%v env=%s",
 		run.sessionID,
 		run.runSeq,
 		tool.id,
 		tool.path,
+		cachedCLIVersion(tool.path),
 		run.projectPath,
 		allowResume,
 		strings.TrimSpace(resumeID) != "",
@@ -4868,16 +4909,16 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, err))
-		return agentAIRunDone, nil
+		return agentAIRunDone, agentAIEffortRejection{}
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, err))
-		return agentAIRunDone, nil
+		return agentAIRunDone, agentAIEffortRejection{}
 	}
 	if err := cmd.Start(); err != nil {
 		_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, err))
-		return agentAIRunDone, nil
+		return agentAIRunDone, agentAIEffortRejection{}
 	}
 
 	started := map[string]interface{}{
@@ -5001,7 +5042,7 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 	// have buffered JSON events, which intermittently dropped final deltas.
 	waitErr := cmd.Wait()
 	if bindingErr != nil {
-		return agentAIRunDone, nil
+		return agentAIRunDone, agentAIEffortRejection{}
 	}
 
 	if ctx.Err() != nil {
@@ -5015,23 +5056,28 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 			statusPayload["error"] = errMsg
 		}
 		_ = writeJSON(statusPayload)
-		return agentAIRunDone, nil
+		return agentAIRunDone, agentAIEffortRejection{}
 	}
 	if waitErr != nil {
 		// The referenced --resume session is not resolvable in this cwd (e.g.
 		// an imported session, or one created under a different project path).
 		// Signal the caller to retry without --resume instead of erroring.
 		if allowResume && isAgentAIResumeMissing(stderrBuf.String()) {
-			return agentAIRunResumeMissing, nil
+			return agentAIRunResumeMissing, agentAIEffortRejection{}
 		}
-		// 旧世代 CLI 在参数校验阶段硬拒 --effort 档(exit 1 + 合法清单)。
-		// 此时不可能有 assistant 输出,上报 agentAIRunEffortRejected 让调用方
-		// 按清单钳制后重试,而不是把这个可自愈的失败直接抛给用户。
+		// CLI 在参数校验阶段拒绝了 --effort:极老世代连 flag 都没有(unknown
+		// option),旧世代硬拒值并枚举合法清单。此时不可能有 assistant 输出,
+		// 上报 agentAIRunEffortRejected 让调用方去 flag/按清单钳制后重试,而不是
+		// 把这个可自愈的失败直接抛给用户。
 		outMu.Lock()
 		emittedAssistantOutput := output.Len() > 0
 		outMu.Unlock()
-		if rejected, levels := isAgentAIEffortRejected(stderrBuf.String()); rejected && !emittedAssistantOutput {
-			return agentAIRunEffortRejected, levels
+		if rej := isAgentAIEffortRejected(stderrBuf.String()); rej.rejected && !emittedAssistantOutput {
+			// 学进探测缓存:后续回合 spawn 前直接去档,不再重演第一次死亡。
+			if rej.flagUnsupported {
+				rememberClaudeEffortFlagUnsupported(tool.path)
+			}
+			return agentAIRunEffortRejected, rej
 		}
 		// Surface WHY the CLI exited. Prefer the structured cause derived from
 		// the last api_retry (gateway status + retry count) when available; the
@@ -5044,7 +5090,7 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 			payload["detail"] = truncateForCloud(stderrText)
 		}
 		_ = writeJSON(payload)
-		return agentAIRunDone, nil
+		return agentAIRunDone, agentAIEffortRejection{}
 	}
 	outMu.Lock()
 	assistantOutput := output.String()
@@ -5086,7 +5132,7 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 		done["source_session_id"] = sid
 	}
 	_ = writeJSON(done)
-	return agentAIRunDone, nil
+	return agentAIRunDone, agentAIEffortRejection{}
 }
 
 func isAgentAIResumeMissing(stderr string) bool {
