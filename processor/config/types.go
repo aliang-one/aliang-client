@@ -704,6 +704,10 @@ func (c *Config) GetAgentDeviceRegisterURL() string {
 	return fmt.Sprintf("%s/api/devices/register", c.AgentBaseURL())
 }
 
+func (c *Config) GetAgentDeviceReleaseURL() string {
+	return fmt.Sprintf("%s/api/v1/agent/devices/release", c.AgentBaseURL())
+}
+
 func (c *Config) GetAgentDeviceSyncURL(deviceID string) string {
 	return fmt.Sprintf("%s/api/v1/agent/devices/%s/sync", c.AgentBaseURL(), url.PathEscape(strings.TrimSpace(deviceID)))
 }

@@ -155,6 +155,13 @@ type AgentService struct {
 	forwardedUserAuthorization string
 	forwardedUserKey           string
 
+	// releaseMu guards lastReleasedAuthHash — the fire-once guard for the
+	// logout device-release POST (logout reaches disableWithReasonMessage
+	// twice per logout: once via the forwarded session event, once via the
+	// explicit /api/agent/disable?reason=logout retry).
+	releaseMu            sync.Mutex
+	lastReleasedAuthHash string
+
 	wsMu         sync.Mutex
 	wsConnected  bool
 	wsConnecting bool
@@ -452,6 +459,14 @@ func (s *AgentService) disableWithReasonMessage(reason string, message string) m
 	reason = normalizeAgentDisableReason(reason)
 	s.mu.Lock()
 	s.ensureDeviceIdentityLocked()
+	// Capture the credential + device identity for the logout release BEFORE
+	// the clears below wipe the forwarded JWT (capture is lock-held, the POST
+	// itself fires outside the lock).
+	var releaseAuthHeader, releaseDeviceID string
+	if reason == "logout" {
+		releaseAuthHeader = s.effectiveUserAuthorizationLocked("")
+		releaseDeviceID = s.state.DeviceID
+	}
 	s.state.Enabled = false
 	s.state.Device = nil
 	s.state.RegisteredUser = ""
@@ -472,8 +487,68 @@ func (s *AgentService) disableWithReasonMessage(reason string, message string) m
 	status := s.statusLocked()
 	s.mu.Unlock()
 
+	if releaseAuthHeader != "" && releaseDeviceID != "" {
+		s.dispatchDeviceRelease(releaseAuthHeader, releaseDeviceID)
+	}
 	s.forceDisconnectRemote(reason)
 	return status
+}
+
+// agentReleaseTimeout bounds the logout device-release POST. Logout must never
+// block on it (dedicated short client, mirroring agentOwnerNotifyClient).
+const agentReleaseTimeout = 3 * time.Second
+
+var agentReleaseClient = &http.Client{Timeout: agentReleaseTimeout}
+
+// dispatchDeviceRelease tells the agent server to drop this device's binding
+// (POST /api/v1/agent/devices/release) when the user logs out. Best-effort by
+// design: every failure is logged and swallowed — never routed through
+// callAgentServer, whose 401 handling would trigger the auth-recovery chain
+// mid-teardown. A straggler binding (server down, token already expired) is
+// healed server-side by ownership transfer on the next register.
+func (s *AgentService) dispatchDeviceRelease(authHeader string, deviceID string) {
+	sum := sha256.Sum256([]byte(authHeader))
+	hash := fmt.Sprintf("%x", sum[:8])
+	s.releaseMu.Lock()
+	if s.lastReleasedAuthHash == hash {
+		// Same credential already dispatched for this logout (double delivery
+		// via session-event forward + disable retry) — fire once.
+		s.releaseMu.Unlock()
+		return
+	}
+	s.lastReleasedAuthHash = hash
+	s.releaseMu.Unlock()
+
+	cfg := config.GetGlobalConfig()
+	if cfg == nil {
+		return
+	}
+	endpoint := cfg.GetAgentDeviceReleaseURL()
+	body, err := json.Marshal(map[string]string{"reason": "logout"})
+	if err != nil {
+		return
+	}
+	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", authHeader)
+	req.Header.Set("X-Aliang-Device-ID", deviceID)
+	go func() {
+		resp, err := agentReleaseClient.Do(req)
+		if err != nil {
+			logger.Warn(fmt.Sprintf("[AGENT-BOOT] device_release_failed endpoint=%s error=%v (server-side rebind covers stragglers)", sanitizeAgentEndpoint(endpoint), err))
+			return
+		}
+		defer resp.Body.Close()
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
+		if resp.StatusCode >= 400 {
+			logger.Warn(fmt.Sprintf("[AGENT-BOOT] device_release_rejected endpoint=%s status=%d (best-effort; server-side rebind covers stragglers)", sanitizeAgentEndpoint(endpoint), resp.StatusCode))
+			return
+		}
+		logger.Info(fmt.Sprintf("[AGENT-BOOT] device_released endpoint=%s", sanitizeAgentEndpoint(endpoint)))
+	}()
 }
 
 func isSessionInvalidDisableReason(reason string) bool {
@@ -1531,7 +1606,7 @@ func (s *AgentService) registerAndSyncLockedWithUserContext(authHeader string, u
 			s.state.Registered = false
 			s.state.RemoteConnected = false
 			s.state.LastSyncStatus = "device_id_conflict"
-			s.state.LastSyncMessage = "Device id is already bound on the agent server."
+			s.state.LastSyncMessage = "Device is bound to a different account. Updated servers transfer ownership automatically on the next register; on older servers, unbind this device from the original account (phone → device → delete) first."
 			logger.Warn(fmt.Sprintf("[AGENT-BOOT] register_sync device_id_conflict keeping_device_id device_id=%s", s.state.DeviceID))
 			_ = s.saveStateLocked()
 			return err
