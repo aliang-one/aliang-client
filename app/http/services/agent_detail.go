@@ -249,11 +249,17 @@ func candidateAgentVibeSessionFiles(sourceSessionID string) []string {
 	if home == "" {
 		return nil
 	}
+	// Codex rollout 文件名是 rollout-<时间戳>-<sessionID>.jsonl —— session id 是
+	// 文件名中段,精确 <id>.jsonl 模式永不命中,每个详情请求都跌入 300 文件兜底
+	// 全量解析(数百 MB),目标一旦滑出各根 100-newest 窗口更是直接 not found。
+	// 包含匹配一次定位候选;Claude 的 <id>.jsonl 命名同样被包含模式覆盖。
+	// (session id 是 hex+连字符的 uuid,不含 glob 元字符,可直接拼进模式。)
+	pattern := "*" + sourceSessionID + "*.jsonl"
 	var out []string
 	for _, root := range []string{filepath.Join(home, ".codex", "sessions"), filepath.Join(home, ".codex", "archived_sessions")} {
-		out = append(out, findRecentAgentFiles(root, sourceSessionID+".jsonl", agentVibeDetailCandidateFileLimit)...)
+		out = append(out, findRecentAgentFiles(root, pattern, agentVibeDetailCandidateFileLimit)...)
 	}
-	out = append(out, findRecentAgentFiles(filepath.Join(home, ".claude", "projects"), sourceSessionID+".jsonl", agentVibeDetailCandidateFileLimit)...)
+	out = append(out, findRecentAgentFiles(filepath.Join(home, ".claude", "projects"), pattern, agentVibeDetailCandidateFileLimit)...)
 	return out
 }
 
