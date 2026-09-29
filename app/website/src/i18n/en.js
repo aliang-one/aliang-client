@@ -8,6 +8,7 @@ export default {
   qs_loading: 'Loading quick setup presets and your API keys...',
   qs_signInTitle: 'Sign in required',
   qs_signInDesc: 'Quick Setup needs your authenticated session so the backend can load your API keys and build the preset files locally.',
+  qs_relogin_banner: 'The service was restarted — sign in again to continue',
   qs_failedTitle: 'Failed to load quick setup',
   qs_tryAgain: 'Please try again.',
   qs_selectKeyPh: 'Select an API key...',

@@ -24,6 +24,7 @@ const state = reactive({
   sessionRevision: initialSession.revision,
   retiredSessionInstanceIds: initialSession.retiredInstanceIds,
   isAuthenticated: initialSession.isAuthenticated,
+  dashboardSessionRequired: false,
   isReady: false,
   loginPending: false,
   logoutPending: false,
@@ -67,6 +68,11 @@ export function applySessionSnapshot(payload, message = '') {
   if (result.state.sessionState === 'active') {
     state.loginError = '';
   }
+  if (state.dashboardSessionRequired) {
+    // Dashboard 会话缺失期间，上游 active 快照不得把 isAuthenticated 翻回
+    // true——那会让登录界面永远无法出现（远程重启死锁）。
+    state.isAuthenticated = false;
+  }
   if (message) state.lastActionMessage = message;
   return true;
 }
@@ -87,6 +93,16 @@ function applySessionReadFailure(error) {
 export function syncUnauthenticatedAuthState(message = '') {
   if (message) state.restoreError = message;
   void restoreAuthSession({ background: true });
+}
+
+// Dashboard 会话中间件的 401（功能 API 返回）意味着本地管理凭证已失效——
+// 典型是服务重启清空了内存会话表，而上游会话（持久化）仍可能 active。
+// 通用恢复只会被 active 快照翻回 true 并让登录界面永远无法出现；置位该
+// 标志把 UI 钉在登录视图，直到一次真正成功的登录重新签发 dashboard cookie。
+export function markDashboardSessionRequired(message = '') {
+  state.dashboardSessionRequired = true;
+  state.isAuthenticated = false;
+  state.restoreError = message;
 }
 
 export function syncAuthFromStartupStatus(data) {
@@ -142,6 +158,9 @@ async function ensureDashboardSession() {
 
 async function reconcileAfterAuthCommand() {
   await ensureDashboardSession();
+  // 登录/扫码/登出命令成功 = 服务端已重新签发 dashboard cookie，
+  // 解除强制登录态，让后续快照恢复权威。
+  state.dashboardSessionRequired = false;
   connectSessionEvents();
   return restoreAuthSession({ force: true });
 }

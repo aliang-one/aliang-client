@@ -8,6 +8,7 @@ export default {
   qs_loading: '正在加载预设和 API 密钥...',
   qs_signInTitle: '需要登录',
   qs_signInDesc: '快速配置需要您的认证会话，以便后端加载您的 API 密钥并在本地生成配置文件。',
+  qs_relogin_banner: '服务已重启，请重新登录以继续',
   qs_failedTitle: '加载失败',
   qs_tryAgain: '请重试。',
   qs_selectKeyPh: '选择 API 密钥...',
