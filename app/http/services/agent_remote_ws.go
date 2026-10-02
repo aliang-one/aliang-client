@@ -14,9 +14,16 @@ import (
 
 	"aliang.one/nursorgate/app/http/models"
 	"aliang.one/nursorgate/common/logger"
+	auth "aliang.one/nursorgate/processor/auth"
 	"aliang.one/nursorgate/processor/config"
 	"github.com/gorilla/websocket"
 )
+
+// remoteWSAuthRecovery 是握手 401 时的会话自愈入口（SoftExpired 单飞刷新：
+// transient 失败持续重试，刷新令牌被永久拒绝才升级 HardInvalid 清会话）。
+// 包变量仅为测试注入；注册路径(register_auth_rejection)早已是同款语义，
+// 握手路径 2026-10-02 起补齐 —— 此前"服务器滚动→握手401→永久离线"双实证。
+var remoteWSAuthRecovery = auth.RecoverOrExpireLocalSession
 
 // agentBootReconnectGrace is how long the user agent waits for a session-owner
 // push after boot before attempting the connection from persisted state.
@@ -122,18 +129,9 @@ func (s *AgentService) remoteConnectionLoop() {
 		conn, resp, err := websocket.DefaultDialer.Dial(wsURL, headers)
 		if err != nil {
 			if resp != nil && resp.StatusCode == http.StatusUnauthorized {
-				// The websocket is authenticated with the same user JWT as the
-				// register/status calls. A handshake 401 is therefore a real auth
-				// transition: stop the Agent immediately and let the session owner
-				// run refresh/hard-invalid handling instead of retrying forever.
-				s.disableWithReasonMessage("auth_expired", "Agent server rejected the user authorization during websocket handshake.")
-				if !IsUserAgentRuntime() {
-					agentAuthRejectedHandler()
-				} else {
-					// agent 子进程不能自愈：把拒绝沿通知 session owner，由 owner
-					// 走 SoftExpired 恢复链刷新凭据后再重新下发。附加动作，不改
-					// 变本分支原有的终态禁用行为。
-					NotifyOwnerAuthRejected(agentAuthRejectedReasonWS)
+				if s.handleHandshakeUnauthorized() {
+					time.Sleep(2 * time.Second)
+					continue
 				}
 				return
 			}
@@ -163,6 +161,24 @@ func (s *AgentService) remoteConnectionLoop() {
 		_ = conn.Close()
 		time.Sleep(2 * time.Second)
 	}
+}
+
+// handleHandshakeUnauthorized 处理远程 WS 握手 401：走会话自愈（SoftExpired
+// 单飞刷新）而非终态禁用+清凭据 —— 注册路径(register_auth_rejection)早已同款；
+// 此处此前先 disable+清凭据再依赖恢复链，刷新链一旦没跑成就永久离线
+// （2026-10-02 12:17/19:18 双实证）。返回 true 表示调用方应退避后重拨；
+// HardInvalid 清会话后 remoteConnectionSnapshot 的 shouldRun 变 false，循环
+// 自然退出。
+func (s *AgentService) handleHandshakeUnauthorized() bool {
+	logger.Warn("[AGENT-BOOT] remote_connection handshake_401 → session self-heal (SoftExpired refresh)")
+	if IsUserAgentRuntime() {
+		NotifyOwnerAuthRejected(agentAuthRejectedReasonWS)
+	} else {
+		agentAuthRejectedHandler()
+	}
+	remoteWSAuthRecovery("websocket handshake 401")
+	s.setRemoteConnectionState(false, "reauthenticating", "handshake 401; session refresh in flight")
+	return true
 }
 
 func (s *AgentService) setActiveRemoteConnection(conn *websocket.Conn) {
