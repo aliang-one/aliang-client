@@ -106,11 +106,13 @@ const (
 // Terminal output quota challenge protocol (spec §5.2). There is NO
 // pause/resume gate: after a challenge is emitted output keeps streaming; a
 // granted challenge only clears the pending state, and an unanswered one kills
-// the session at the hard cap (kill_at_bytes). Kept in its own block so the
-// long constant names do not force a whitespace realignment of the block above.
+// the session at the next checkpoint (kill_at_bytes); max_bytes is the
+// absolute cap that kills regardless of pending state. Kept in its own block
+// so the long constant names do not force a whitespace realignment of the
+// block above.
 const (
 	AgentEventTerminalQuotaChallengeRequired = "terminal.quota.challenge_required" // agent → server: cumulative output crossed a quota checkpoint; challenge now pending, output keeps streaming
-	AgentEventTerminalQuotaResolved          = "terminal.quota.resolved"           // server → agent: challenge granted; clears the pending challenge (an unanswered one kills the session at the hard cap)
+	AgentEventTerminalQuotaResolved          = "terminal.quota.resolved"           // server → agent: challenge granted; clears the pending challenge (an unanswered one kills the session at the next checkpoint)
 )
 
 type AgentProtocolContract struct {

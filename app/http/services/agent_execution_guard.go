@@ -125,14 +125,16 @@ var (
 // terminal.quota.challenge_required and output KEEPS STREAMING; the server's
 // terminal.quota.resolved (granted) reply only clears the pending challenge —
 // it does not resume anything. An unanswered challenge kills the session once
-// cumulative output reaches agentTerminalQuotaMaxBytes (kill_at_bytes).
+// output reaches the next checkpoint (kill_at_bytes, the checkpoint beyond
+// the challenge point); agentTerminalQuotaMaxBytes separately hard-kills
+// regardless of pending state.
 // agentTerminalQuotaMinInterval throttles how often a challenge may fire so a
 // noisy stream cannot spam the user. All three are package vars resolved once
 // at process start; tests shrink them by injecting policy values through the
 // quota-policy constructor rather than rewriting these vars.
 //
 //	ALIANG_TERMINAL_QUOTA_CHECKPOINT_MB           MiB per challenge checkpoint. Default 128.
-//	ALIANG_TERMINAL_QUOTA_MAX_MB                  hard cumulative cap in MiB (kill_at_bytes); explicit "0" disables the whole quota mechanism. Default 512.
+//	ALIANG_TERMINAL_QUOTA_MAX_MB                  hard cumulative cap in MiB; explicit "0" disables the whole quota mechanism. Default 512.
 //	ALIANG_TERMINAL_QUOTA_CHALLENGE_MIN_INTERVAL  minimum spacing between challenges (time.ParseDuration form). Default 30m.
 //
 // Invalid values fall back to the default (see envMiB / envMiBAllowZero /
