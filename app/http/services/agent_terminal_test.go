@@ -57,24 +57,18 @@ func TestTerminalOutputMeter_RateWindowSlides(t *testing.T) {
 func TestTerminalOutputMeter_LifetimeCapBackstop(t *testing.T) {
 	// The lifetime backstop moved into the quota state machine: with a tiny
 	// checkpoint/max and a huge rate window, only the quota path can report a
-	// stop. Crossing the checkpoint issues a challenge; after a grant, reaching
-	// maxBytes reports kill_hard_cap from consumeQuota (the caller — the output
-	// copy loop — performs the kill).
+	// stop. record issues a challenge at the checkpoint; after a grant,
+	// reaching maxBytes reports kill_hard_cap (the caller — the output copy
+	// loop — performs the kill).
 	meter := newTerminalOutputMeter(5*time.Second, 1<<30, newQuotaPolicy(10, 30, 30*time.Minute))
 	now := time.Date(2026, 6, 16, 12, 0, 0, 0, time.UTC)
-	if meter.add(20, now) {
-		t.Fatalf("20 bytes cannot trip the inert rate gate")
-	}
-	if act := meter.consumeQuota(20, now); act.kind != quotaActionIssue {
+	if act := recordQuiet(t, meter, 20, now); act.kind != quotaActionIssue {
 		t.Fatalf("crossing the 10-byte checkpoint must issue a challenge, got %q", act.kind)
 	}
 	if act := meter.resolveQuota(1, true); act.kind != "" {
 		t.Fatalf("grant must report no action, got %q", act.kind)
 	}
-	if meter.add(10, now) {
-		t.Fatalf("rate gate must stay inert")
-	}
-	act := meter.consumeQuota(10, now) // total 30 = hard cap, no pending challenge
+	act := recordQuiet(t, meter, 10, now) // total 30 = hard cap, no pending challenge
 	if act.kind != quotaActionKillHardCap {
 		t.Fatalf("expected kill_hard_cap at the 30-byte hard cap, got %q", act.kind)
 	}
@@ -86,19 +80,19 @@ func TestTerminalOutputMeter_LifetimeCapBackstop(t *testing.T) {
 func TestTerminalOutputMeter_LegacyCapGuardsQuotalessMeters(t *testing.T) {
 	// Meters without a quota state machine (the AI output limiter reuses
 	// outputMeter) keep the direct lifetime-cap backstop in add — only terminal
-	// meters delegate cumulative volume to the quota challenge machine. Quota
-	// calls on such a meter must stay no-ops.
+	// meters delegate cumulative volume to the quota challenge machine (via
+	// record). Quota evaluation on such a meter must stay a no-op.
 	meter := newOutputMeter(5*time.Second, 1<<30, 100)
 	now := time.Date(2026, 6, 16, 12, 0, 0, 0, time.UTC)
-	if meter.add(60, now) {
-		t.Fatalf("60 bytes is under the 100-byte cap")
-	}
-	if act := meter.consumeQuota(60, now); act.kind != "" {
-		t.Fatalf("quota-less meter must report no quota action, got %q", act.kind)
+	// First chunk through record: 60 bytes is under the 100-byte cap, and a
+	// quota-less meter must report no quota action.
+	if rate, act := meter.record(60, now); rate || act.kind != "" {
+		t.Fatalf("quota-less meter must report neither a trip nor a quota action, got rate=%v action=%q", rate, act.kind)
 	}
 	if act := meter.resolveQuota(1, true); act.kind != "" {
 		t.Fatalf("quota-less meter must report no resolve action, got %q", act.kind)
 	}
+	// The AI limiter keeps calling add directly — the legacy cap still trips.
 	if !meter.add(50, now) { // 110 > 100
 		t.Fatalf("expected the lifetime cap backstop to trip for a quota-less meter")
 	}

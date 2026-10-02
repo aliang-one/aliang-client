@@ -890,11 +890,17 @@ func newOutputMeter(window time.Duration, rateMax int, capMax int64) *outputMete
 
 // add records n bytes emitted at now and reports whether the session should be
 // killed because the sustained rate over the window was exceeded (or, for
-// quota-less meters only, the lifetime cap).
+// quota-less meters only, the lifetime cap). Terminal output flows through
+// record instead, which folds this evaluation and the quota state machine into
+// one locked call.
 func (m *outputMeter) add(n int, now time.Time) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.addLocked(n, now)
+}
 
+// addLocked is add without locking. The caller must hold m.mu.
+func (m *outputMeter) addLocked(n int, now time.Time) bool {
 	cutoff := now.Add(-m.window)
 	drop := 0
 	for drop < len(m.samples) && m.samples[drop].at.Before(cutoff) {
@@ -920,8 +926,8 @@ func (m *outputMeter) add(n int, now time.Time) bool {
 	}
 	// The lifetime cap backstop stays only for meters without a quota state
 	// machine (the AI output limiter). Terminal meters delegate cumulative
-	// volume to the quota machine (consumeQuota), whose maxBytes hard cap
-	// replaces this blind kill (spec §5.1/§5.2).
+	// volume to the quota machine (record), whose maxBytes hard cap replaces
+	// this blind kill (spec §5.1/§5.2).
 	if m.quota == nil && m.capMax > 0 && m.total > m.capMax {
 		return true
 	}
@@ -951,7 +957,7 @@ func newQuotaPolicy(checkpointBytes, maxBytes int64, minInterval time.Duration) 
 
 // outputQuota is the per-session runtime state of the quota challenge machine
 // (spec §5.1). It lives inside the meter so both share one lock and one
-// total. All transitions are evaluated on the byte-arrival path (consumeQuota)
+// total. All transitions are evaluated on the byte-arrival path (record)
 // — there is no timer.
 type outputQuota struct {
 	// policy
@@ -1009,15 +1015,34 @@ func newTerminalSessionMeter() *outputMeter {
 		newQuotaPolicy(agentTerminalQuotaCheckpointBytes, agentTerminalQuotaMaxBytes, agentTerminalQuotaMinInterval))
 }
 
-// consumeQuota evaluates the quota challenge state machine after the caller
-// recorded a chunk (spec §5.2). It must be called after add on the same chunk:
-// add owns the total, consumeQuota only evaluates it — n is the chunk size the
-// caller just added, accepted so the copy loop passes the same chunk to both.
+// record is the terminal output path: in one pass under the meter's own lock
+// it accumulates the chunk, evaluates the rate window, and evaluates the quota
+// challenge state machine (spec §5.2), returning (rateTripped, action). The
+// copy loop (B4) kills for the rate trip first and only processes the action
+// otherwise — that ordering contract is guaranteed by the single-call
+// structure rather than by documentation, and no interleaving can slip between
+// the two evaluations. The quota evaluation itself ignores the rate verdict:
+// when both fire, the caller kills for the rate (unredeemable, spec §5.3) and
+// drops the action; the state machine may have advanced, which is harmless on
+// a session that is about to die. On a quota-less meter (none is wired that
+// way today) the second result is always the zero action.
 //
-// Caller contract (copyTerminalOutput wiring): check add's result FIRST. When
-// add reports a rate trip the caller must kill for the rate trip and must NOT
-// additionally process the action returned here — a rate kill is unredeemable
-// (spec §5.3) and the session is dead either way.
+// B4 wiring notes:
+//   - A denied verdict (terminal.quota.resolved → resolveQuota → kill_denied)
+//     can land between this call and the kill the caller then performs; the
+//     copy loop must not emit a duplicate kill frame for a session it is
+//     already killing.
+//   - The terminal.quota.resolved handler goes m.get()-then-act (fetch the
+//     session, then act on it): never acquire the manager mutex while holding
+//     meter.mu.
+func (m *outputMeter) record(n int, now time.Time) (bool, quotaAction) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.addLocked(n, now), m.consumeQuotaLocked(now)
+}
+
+// consumeQuotaLocked evaluates the quota challenge state machine against the
+// accumulated total (spec §5.2). The caller must hold m.mu.
 //
 // Transitions, in evaluation order (spec §5.2):
 //
@@ -1032,10 +1057,7 @@ func newTerminalSessionMeter() *outputMeter {
 //     lastChallengeAt = now, pending = true. A challenge does NOT block
 //     output — the stream keeps going; only a kill point stops it.
 //  5. otherwise no action.
-func (m *outputMeter) consumeQuota(n int, now time.Time) quotaAction {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
+func (m *outputMeter) consumeQuotaLocked(now time.Time) quotaAction {
 	q := m.quota
 	if q == nil || q.maxBytes == 0 {
 		return quotaAction{}

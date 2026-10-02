@@ -8,8 +8,8 @@ import (
 // Quota state machine tests (spec §5.2). Meters are constructed directly with
 // policy values injected through newQuotaPolicy — the package env vars are
 // never rewritten. The rate window is inert (huge rateMax) so every case
-// exercises only the quota path; Quota_RateFirst builds its own meter with a
-// live rate window.
+// exercises only the quota path via record; Quota_RateFirst builds its own
+// meter with a live rate window.
 
 const (
 	quotaTestCheckpoint = 128 << 20 // 128 MiB — spec default scale
@@ -18,10 +18,21 @@ const (
 
 var quotaTestBase = time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
 
-// newTestQuotaMeter builds a terminal-shaped meter (pure rate gate + quota
-// state machine) with an inert rate window.
+// newTestQuotaMeter builds a terminal-shaped meter (rate gate + quota state
+// machine) with an inert rate window.
 func newTestQuotaMeter(checkpointBytes, maxBytes int64, minInterval time.Duration) *outputMeter {
 	return newTerminalOutputMeter(agentTerminalOutputRateWindow, 1<<30, newQuotaPolicy(checkpointBytes, maxBytes, minInterval))
+}
+
+// recordQuiet records a chunk on a meter whose rate gate is inert and returns
+// only the quota action, failing the test if the rate gate ever trips.
+func recordQuiet(t *testing.T, m *outputMeter, n int, now time.Time) quotaAction {
+	t.Helper()
+	rate, act := m.record(n, now)
+	if rate {
+		t.Fatalf("rate gate must stay inert in quota tests (%d bytes at %v)", n, now)
+	}
+	return act
 }
 
 func TestQuota_StateMachine(t *testing.T) {
@@ -36,10 +47,7 @@ func TestQuota_StateMachine(t *testing.T) {
 			m := newTestQuotaMeter(quotaTestCheckpoint, 0, 30*time.Minute)
 			now := quotaTestBase
 			for i := 0; i < 4; i++ {
-				if m.add(1<<30, now) { // 1 GiB chunks, far past every threshold
-					t.Fatalf("rate gate must stay inert in quota tests (chunk %d)", i)
-				}
-				if act := m.consumeQuota(1<<30, now); act.kind != "" {
+				if act := recordQuiet(t, m, 1<<30, now); act.kind != "" { // 1 GiB chunks, far past every threshold
 					t.Fatalf("disabled quota returned action %q at chunk %d", act.kind, i)
 				}
 				now = now.Add(time.Minute)
@@ -51,10 +59,7 @@ func TestQuota_StateMachine(t *testing.T) {
 
 		{"Quota_IssuesAtCheckpoint", func(t *testing.T) {
 			m := newTestQuotaMeter(quotaTestCheckpoint, quotaTestMax, 30*time.Minute)
-			if m.add(quotaTestCheckpoint, quotaTestBase) {
-				t.Fatal("rate gate must stay inert in quota tests")
-			}
-			act := m.consumeQuota(quotaTestCheckpoint, quotaTestBase)
+			act := recordQuiet(t, m, quotaTestCheckpoint, quotaTestBase)
 			if act.kind != quotaActionIssue {
 				t.Fatalf("action kind = %q, want %q", act.kind, quotaActionIssue)
 			}
@@ -85,22 +90,19 @@ func TestQuota_StateMachine(t *testing.T) {
 			// the last issue is suppressed and output keeps streaming (spec §3
 			// dual gate).
 			m := newTestQuotaMeter(quotaTestCheckpoint, quotaTestMax, 30*time.Minute)
-			m.add(quotaTestCheckpoint, quotaTestBase)
-			if act := m.consumeQuota(quotaTestCheckpoint, quotaTestBase); act.kind != quotaActionIssue {
+			if act := recordQuiet(t, m, quotaTestCheckpoint, quotaTestBase); act.kind != quotaActionIssue {
 				t.Fatalf("first challenge must issue, got %q", act.kind)
 			}
 			if act := m.resolveQuota(1, true); act.kind != "" {
 				t.Fatalf("grant must report no action, got %q", act.kind)
 			}
 			// Cross the next checkpoint only 10 minutes after the first issue.
-			later := quotaTestBase.Add(10 * time.Minute)
-			m.add(quotaTestCheckpoint, later)
-			act := m.consumeQuota(quotaTestCheckpoint, later)
+			act := recordQuiet(t, m, quotaTestCheckpoint, quotaTestBase.Add(10*time.Minute))
 			if act.kind != "" {
 				t.Fatalf("challenge within minInterval must be suppressed, got %q", act.kind)
 			}
 			if m.quota.pending {
-				t.Fatal("interval-gated consume must not set pending")
+				t.Fatal("interval-gated evaluation must not set pending")
 			}
 			if m.quota.seq != 1 || m.quota.nextChallengeBytes != 2*quotaTestCheckpoint {
 				t.Fatalf("state advanced despite interval gate: seq=%d next=%d",
@@ -113,11 +115,9 @@ func TestQuota_StateMachine(t *testing.T) {
 			// checkpoint (kill_at_bytes) — no matter how much time passed
 			// (spec §5.2 rule 3 has no time gate).
 			m := newTestQuotaMeter(quotaTestCheckpoint, quotaTestMax, 30*time.Minute)
-			m.add(quotaTestCheckpoint, quotaTestBase)
-			m.consumeQuota(quotaTestCheckpoint, quotaTestBase) // issue seq=1
+			recordQuiet(t, m, quotaTestCheckpoint, quotaTestBase) // issue seq=1
 			later := quotaTestBase.Add(time.Hour)
-			m.add(quotaTestCheckpoint, later) // total = 256 MiB
-			act := m.consumeQuota(quotaTestCheckpoint, later)
+			act := recordQuiet(t, m, quotaTestCheckpoint, later) // total = 256 MiB
 			if act.kind != quotaActionKillUnanswered {
 				t.Fatalf("action kind = %q, want %q", act.kind, quotaActionKillUnanswered)
 			}
@@ -134,8 +134,7 @@ func TestQuota_StateMachine(t *testing.T) {
 			// time and stays put, so the renewed challenge fires at the
 			// checkpoint after that (issue at 256 MiB → kill_at 384 MiB).
 			m := newTestQuotaMeter(quotaTestCheckpoint, quotaTestMax, 30*time.Minute)
-			m.add(quotaTestCheckpoint, quotaTestBase)
-			if act := m.consumeQuota(quotaTestCheckpoint, quotaTestBase); act.kind != quotaActionIssue || act.seq != 1 {
+			if act := recordQuiet(t, m, quotaTestCheckpoint, quotaTestBase); act.kind != quotaActionIssue || act.seq != 1 {
 				t.Fatalf("first issue missing: %+v", act)
 			}
 			if act := m.resolveQuota(1, true); act.kind != "" || m.quota.pending {
@@ -143,8 +142,7 @@ func TestQuota_StateMachine(t *testing.T) {
 			}
 			// Cross 256 MiB one full interval later → second challenge.
 			later := quotaTestBase.Add(31 * time.Minute)
-			m.add(quotaTestCheckpoint, later)
-			act := m.consumeQuota(quotaTestCheckpoint, later)
+			act := recordQuiet(t, m, quotaTestCheckpoint, later)
 			if act.kind != quotaActionIssue || act.seq != 2 {
 				t.Fatalf("renewed issue missing: %+v", act)
 			}
@@ -159,8 +157,7 @@ func TestQuota_StateMachine(t *testing.T) {
 
 		{"Quota_DeniedKills", func(t *testing.T) {
 			m := newTestQuotaMeter(quotaTestCheckpoint, quotaTestMax, 30*time.Minute)
-			m.add(quotaTestCheckpoint, quotaTestBase)
-			m.consumeQuota(quotaTestCheckpoint, quotaTestBase) // issue seq=1
+			recordQuiet(t, m, quotaTestCheckpoint, quotaTestBase) // issue seq=1
 			act := m.resolveQuota(1, false)
 			if act.kind != quotaActionKillDenied {
 				t.Fatalf("action kind = %q, want %q", act.kind, quotaActionKillDenied)
@@ -176,11 +173,9 @@ func TestQuota_StateMachine(t *testing.T) {
 			// challenge past the next checkpoint AND at the hard cap, the hard
 			// cap reason wins.
 			m := newTestQuotaMeter(quotaTestCheckpoint, quotaTestMax, 30*time.Minute)
-			m.add(quotaTestCheckpoint, quotaTestBase)
-			m.consumeQuota(quotaTestCheckpoint, quotaTestBase) // issue, pending=true
+			recordQuiet(t, m, quotaTestCheckpoint, quotaTestBase) // issue, pending=true
 			later := quotaTestBase.Add(time.Minute)
-			m.add(quotaTestMax-quotaTestCheckpoint, later) // total = 512 MiB
-			act := m.consumeQuota(quotaTestMax-quotaTestCheckpoint, later)
+			act := recordQuiet(t, m, quotaTestMax-quotaTestCheckpoint, later) // total = 512 MiB
 			if act.kind != quotaActionKillHardCap {
 				t.Fatalf("action kind = %q, want %q", act.kind, quotaActionKillHardCap)
 			}
@@ -191,8 +186,7 @@ func TestQuota_StateMachine(t *testing.T) {
 
 		{"Quota_StaleSeqIgnored", func(t *testing.T) {
 			m := newTestQuotaMeter(quotaTestCheckpoint, quotaTestMax, 30*time.Minute)
-			m.add(quotaTestCheckpoint, quotaTestBase)
-			m.consumeQuota(quotaTestCheckpoint, quotaTestBase) // issue seq=1
+			recordQuiet(t, m, quotaTestCheckpoint, quotaTestBase) // issue seq=1
 			// Both stale grant and stale deny are no-ops; state is untouched.
 			if act := m.resolveQuota(999, true); act.kind != "" {
 				t.Fatalf("stale grant must be a no-op, got %q", act.kind)
@@ -211,24 +205,26 @@ func TestQuota_StateMachine(t *testing.T) {
 
 		{"Quota_RateFirst", func(t *testing.T) {
 			// One chunk that both floods the rate window and crosses the
-			// checkpoint: add reports the rate trip, and consumeQuota evaluates
-			// the quota state independently — it never looks at the rate
-			// verdict. Caller contract (copyTerminalOutput wiring, B4): check
-			// add() FIRST; when it reports a rate trip, kill for the rate and
-			// do NOT additionally process the quota action's kill — a rate kill
-			// is unredeemable (spec §5.3). The meter layer cannot enforce call
-			// order, so the enforcement itself is pinned by the B4 wiring test;
-			// this test pins the independence the contract relies on.
+			// checkpoint: record returns both verdicts from a single locked
+			// evaluation, so the ordering contract is structural — the copy
+			// loop (B4) checks rateTripped FIRST, kills for the rate
+			// (unredeemable, spec §5.3), and never processes the action. The
+			// quota evaluation itself stays independent of the rate verdict:
+			// the state machine advanced to a pending seq=1 challenge all the
+			// same.
 			m := newTerminalOutputMeter(5*time.Second, 1000, newQuotaPolicy(100, 1<<30, 30*time.Minute))
-			if !m.add(5000, quotaTestBase) {
+			rateTripped, act := m.record(5000, quotaTestBase)
+			if !rateTripped {
 				t.Fatal("chunk must trip the rate window")
 			}
-			act := m.consumeQuota(5000, quotaTestBase)
 			if act.kind != quotaActionIssue {
 				t.Fatalf("quota evaluation must be independent of the rate verdict, got %q", act.kind)
 			}
 			if act.seq != 1 || act.killAtBytes != 200 {
 				t.Fatalf("issue fields after rate trip: %+v", act)
+			}
+			if !m.quota.pending {
+				t.Fatal("quota state must advance even when the rate gate trips")
 			}
 		}},
 	}
