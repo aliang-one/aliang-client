@@ -629,9 +629,11 @@ func (m *agentTerminalManager) copyTerminalOutput(sessionID string, reader io.Re
 		n, err := reader.Read(buf)
 		if n > 0 {
 			if m.acceptTerminalOutput(sessionID, n) {
+				// Rate-only reason: cumulative volume is no longer a blind
+				// kill — it is governed by the quota challenge machine.
 				_ = writeJSON(agentTerminalErrorPayload(sessionID, fmt.Errorf(
-					"terminal output flood limit exceeded (max %d bytes per %s, lifetime cap %d bytes)",
-					agentTerminalOutputRateBytes, agentTerminalOutputRateWindow, agentTerminalOutputCapBytes)))
+					"terminal output flood limit exceeded (max %d bytes per %s)",
+					agentTerminalOutputRateBytes, agentTerminalOutputRateWindow)))
 				if session := m.get(sessionID); session != nil {
 					session.kill()
 				}
@@ -784,7 +786,7 @@ func newAgentTerminalSession(id string, shell string, cwd string, handle *agentT
 		waiter:       handle.wait,
 		killer:       handle.kill,
 		closer:       handle.close,
-		meter:        newOutputMeter(agentTerminalOutputRateWindow, agentTerminalOutputRateBytes, int64(agentTerminalOutputCapBytes)),
+		meter:        newTerminalSessionMeter(),
 		token:        new(struct{}),
 		startedAt:    now,
 		lastActiveAt: now,
@@ -854,11 +856,19 @@ func newAgentShellCommand(shell string, cwd string) *exec.Cmd {
 // shared by terminal sessions and AI runs so both apply the same flood policy:
 // stop runaway bursts quickly (e.g. `yes`, `cat /dev/urandom`, or an AI dumping
 // megabytes per second) while letting continuous-but-slow streams run
-// indefinitely up to a high lifetime cap.
+// indefinitely. Cumulative volume is handled differently per consumer: terminal
+// meters attach a quota challenge state machine (quota field, spec §5.2) and
+// add is a pure rate gate for them; quota-less meters (the AI output limiter)
+// keep the direct capMax lifetime backstop in add.
 type outputMeter struct {
 	window  time.Duration
 	rateMax int
 	capMax  int64
+
+	// quota is the terminal quota challenge state machine, attached at
+	// construction (newTerminalOutputMeter). nil means no quota machine — add
+	// then keeps the legacy lifetime-cap backstop above.
+	quota *outputQuota
 
 	mu      sync.Mutex
 	samples []outputSample
@@ -879,8 +889,8 @@ func newOutputMeter(window time.Duration, rateMax int, capMax int64) *outputMete
 }
 
 // add records n bytes emitted at now and reports whether the session should be
-// killed because the sustained rate over the window or the lifetime cap was
-// exceeded.
+// killed because the sustained rate over the window was exceeded (or, for
+// quota-less meters only, the lifetime cap).
 func (m *outputMeter) add(n int, now time.Time) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -896,9 +906,9 @@ func (m *outputMeter) add(n int, now time.Time) bool {
 	m.samples = append(m.samples, outputSample{at: now, bytes: n})
 	m.total += int64(n)
 
-	if m.capMax > 0 && m.total > m.capMax {
-		return true
-	}
+	// Rate is evaluated first and cannot be redeemed by an ack (spec §5.3): an
+	// instantaneous flood kills the session no matter where the quota state
+	// machine stands.
 	if m.rateMax > 0 {
 		recent := 0
 		for _, s := range m.samples {
@@ -908,7 +918,163 @@ func (m *outputMeter) add(n int, now time.Time) bool {
 			return true
 		}
 	}
+	// The lifetime cap backstop stays only for meters without a quota state
+	// machine (the AI output limiter). Terminal meters delegate cumulative
+	// volume to the quota machine (consumeQuota), whose maxBytes hard cap
+	// replaces this blind kill (spec §5.1/§5.2).
+	if m.quota == nil && m.capMax > 0 && m.total > m.capMax {
+		return true
+	}
 	return false
+}
+
+// quotaPolicy carries the tunables of the terminal output quota challenge
+// state machine (spec §3; the agentTerminalQuota* package vars in
+// agent_execution_guard.go). checkpointBytes and minInterval must be positive;
+// maxBytes == 0 is the documented off switch that disables the whole
+// mechanism. Production values come from envMiB / resolveEnvDuration, which
+// guarantee those invariants; tests inject shrunk values through this
+// constructor instead of rewriting the package vars.
+type quotaPolicy struct {
+	checkpointBytes int64
+	maxBytes        int64
+	minInterval     time.Duration
+}
+
+func newQuotaPolicy(checkpointBytes, maxBytes int64, minInterval time.Duration) quotaPolicy {
+	return quotaPolicy{
+		checkpointBytes: checkpointBytes,
+		maxBytes:        maxBytes,
+		minInterval:     minInterval,
+	}
+}
+
+// outputQuota is the per-session runtime state of the quota challenge machine
+// (spec §5.1). It lives inside the meter so both share one lock and one
+// total. All transitions are evaluated on the byte-arrival path (consumeQuota)
+// — there is no timer.
+type outputQuota struct {
+	// policy
+	checkpointBytes int64         // challenge issue interval, in bytes
+	maxBytes        int64         // hard cap; 0 = whole mechanism disabled
+	minInterval     time.Duration // min spacing between issues (dual gate)
+
+	// runtime state
+	nextChallengeBytes int64     // next byte total at which a challenge is due; advances by checkpointBytes at each issue
+	lastChallengeAt    time.Time // last issue time; zero value = never issued (any now passes the interval gate)
+	pending            bool      // a challenge is awaiting a verdict
+	seq                uint64    // challenge sequence number, monotonic per session
+}
+
+// quotaAction kinds. The empty kind means "no action — output keeps
+// streaming": a challenge never blocks the stream, only a kill point stops it.
+const (
+	quotaActionIssue          = "issue"           // emit terminal.quota.challenge_required
+	quotaActionKillUnanswered = "kill_unanswered" // pending challenge, output reached kill_at_bytes
+	quotaActionKillHardCap    = "kill_hard_cap"   // cumulative output reached max_bytes regardless of pending
+	quotaActionKillDenied     = "kill_denied"     // human rejected the challenge
+)
+
+// quotaAction is the verdict of one quota evaluation. The caller (terminal
+// output copy loop) performs the kill / emits the challenge; the meter only
+// reports.
+type quotaAction struct {
+	kind        string
+	seq         uint64
+	usedBytes   int64
+	killAtBytes int64 // for issue: where an unanswered kill will fire; for byte-triggered kills: the threshold that fired
+}
+
+// newTerminalOutputMeter builds the terminal flavor of the meter: a pure rate
+// gate plus the quota challenge state machine. capMax does not apply here —
+// cumulative volume is governed by the quota machine, whose maxBytes hard cap
+// replaces the old blind lifetime kill (spec §5.1/§5.2).
+func newTerminalOutputMeter(window time.Duration, rateMax int, policy quotaPolicy) *outputMeter {
+	return &outputMeter{
+		window:  window,
+		rateMax: rateMax,
+		quota: &outputQuota{
+			checkpointBytes:    policy.checkpointBytes,
+			maxBytes:           policy.maxBytes,
+			minInterval:        policy.minInterval,
+			nextChallengeBytes: policy.checkpointBytes,
+		},
+	}
+}
+
+// newTerminalSessionMeter wires the env-tunable quota knobs (package vars in
+// agent_execution_guard.go) into a production terminal meter.
+func newTerminalSessionMeter() *outputMeter {
+	return newTerminalOutputMeter(agentTerminalOutputRateWindow, agentTerminalOutputRateBytes,
+		newQuotaPolicy(agentTerminalQuotaCheckpointBytes, agentTerminalQuotaMaxBytes, agentTerminalQuotaMinInterval))
+}
+
+// consumeQuota evaluates the quota challenge state machine after the caller
+// recorded a chunk (spec §5.2). It must be called after add on the same chunk:
+// add owns the total, consumeQuota only evaluates it — n is the chunk size the
+// caller just added, accepted so the copy loop passes the same chunk to both.
+//
+// Caller contract (copyTerminalOutput wiring): check add's result FIRST. When
+// add reports a rate trip the caller must kill for the rate trip and must NOT
+// additionally process the action returned here — a rate kill is unredeemable
+// (spec §5.3) and the session is dead either way.
+//
+// Transitions, in evaluation order (spec §5.2):
+//
+//  1. maxBytes == 0 → the quota mechanism is disabled entirely: never
+//     challenge, never kill (pure rate gate).
+//  2. total >= maxBytes → kill_hard_cap, regardless of pending state.
+//  3. pending && total >= nextChallengeBytes → kill_unanswered; the kill point
+//     is the checkpoint beyond the challenge point (kill_at_bytes), NOT
+//     maxBytes — the two are different thresholds.
+//  4. !pending && total >= nextChallengeBytes && now-lastChallengeAt >=
+//     minInterval → issue: seq++, nextChallengeBytes += checkpointBytes,
+//     lastChallengeAt = now, pending = true. A challenge does NOT block
+//     output — the stream keeps going; only a kill point stops it.
+//  5. otherwise no action.
+func (m *outputMeter) consumeQuota(n int, now time.Time) quotaAction {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	q := m.quota
+	if q == nil || q.maxBytes == 0 {
+		return quotaAction{}
+	}
+	if m.total >= q.maxBytes {
+		return quotaAction{kind: quotaActionKillHardCap, seq: q.seq, usedBytes: m.total, killAtBytes: q.maxBytes}
+	}
+	if q.pending && m.total >= q.nextChallengeBytes {
+		return quotaAction{kind: quotaActionKillUnanswered, seq: q.seq, usedBytes: m.total, killAtBytes: q.nextChallengeBytes}
+	}
+	if !q.pending && m.total >= q.nextChallengeBytes && now.Sub(q.lastChallengeAt) >= q.minInterval {
+		q.seq++
+		q.nextChallengeBytes += q.checkpointBytes
+		q.lastChallengeAt = now
+		q.pending = true
+		return quotaAction{kind: quotaActionIssue, seq: q.seq, usedBytes: m.total, killAtBytes: q.nextChallengeBytes}
+	}
+	return quotaAction{}
+}
+
+// resolveQuota applies a terminal.quota.resolved verdict (spec §5.2 rule 5).
+// A seq that does not match the pending challenge (an expired challenge) is
+// ignored — state unchanged — as is any resolution while nothing is pending.
+// granted only clears pending: nextChallengeBytes advanced at issue time and
+// grant does not move it. denied reports kill_denied; the caller performs the
+// kill.
+func (m *outputMeter) resolveQuota(seq uint64, granted bool) quotaAction {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	q := m.quota
+	if q == nil || !q.pending || seq != q.seq {
+		return quotaAction{}
+	}
+	if !granted {
+		return quotaAction{kind: quotaActionKillDenied, seq: seq, usedBytes: m.total}
+	}
+	q.pending = false
+	return quotaAction{}
 }
 
 // terminalOutputEncoder buffers an incomplete trailing UTF-8 sequence so that

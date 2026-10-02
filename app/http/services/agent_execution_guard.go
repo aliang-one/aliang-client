@@ -21,15 +21,16 @@ const (
 	agentMaxTerminalSessions     = 4
 	agentTerminalInputLimitBytes = 64 * 1024
 	// Terminal output flood protection. A hard cumulative cap killed legitimately
-	// long-running continuous commands (watch / top / tail -f). We now stop a
-	// stream only when its sustained rate over a sliding window exceeds the flood
-	// threshold (runaway commands such as `yes` or `cat /dev/urandom` are stopped
-	// within seconds), with a high lifetime cap as a backstop for slow leaks.
-	// watch-paced output (~1-5 KB/s) never trips either limit, so it streams
-	// indefinitely up to the idle timeout.
+	// long-running continuous commands (watch / top / tail -f), so the rate
+	// window is now the only blind kill: a stream stops when its sustained rate
+	// over the sliding window exceeds the flood threshold (runaway commands such
+	// as `yes` or `cat /dev/urandom` are stopped within seconds). Cumulative
+	// volume is governed by the quota challenge state machine instead
+	// (agentTerminalQuota* vars below), not by a blind kill. watch-paced output
+	// (~1-5 KB/s) never trips the rate limit, so it streams indefinitely up to
+	// the idle timeout.
 	agentTerminalOutputRateWindow = 5 * time.Second
 	agentTerminalOutputRateBytes  = 8 * 1024 * 1024
-	agentTerminalOutputCapBytes   = 256 * 1024 * 1024
 	agentTerminalIdleTimeout      = 30 * time.Minute
 
 	// agentAISessionResidentCap bounds how many AI session handles the agent
