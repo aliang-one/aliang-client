@@ -3,6 +3,7 @@ package services
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -118,21 +119,26 @@ var (
 )
 
 // Terminal output quota challenge knobs (terminal.quota.* protocol, see
-// agent_terminal.go for the state machine that consumes them). When a terminal
-// stream's cumulative output crosses agentTerminalQuotaCheckpointBytes the
-// agent pauses the stream and emits terminal.quota.challenge_required; the
-// server's terminal.quota.resolved reply resumes it. agentTerminalQuotaMaxBytes
-// is the hard cumulative stop, and agentTerminalQuotaMinInterval throttles how
-// often a challenge may fire so a noisy stream cannot spam the user. All three
-// are package vars resolved once at process start so tests can shrink them
-// (see agent_terminal_test.go for the convention):
+// agent_terminal.go for the state machine that consumes them). Per spec §5.2
+// there is NO pause/resume gate: when a terminal stream's cumulative output
+// crosses agentTerminalQuotaCheckpointBytes the agent emits
+// terminal.quota.challenge_required and output KEEPS STREAMING; the server's
+// terminal.quota.resolved (granted) reply only clears the pending challenge —
+// it does not resume anything. An unanswered challenge kills the session once
+// cumulative output reaches agentTerminalQuotaMaxBytes (kill_at_bytes).
+// agentTerminalQuotaMinInterval throttles how often a challenge may fire so a
+// noisy stream cannot spam the user. All three are package vars resolved once
+// at process start; tests shrink them by injecting policy values through the
+// quota-policy constructor rather than rewriting these vars.
 //
 //	ALIANG_TERMINAL_QUOTA_CHECKPOINT_MB           MiB per challenge checkpoint. Default 128.
-//	ALIANG_TERMINAL_QUOTA_MAX_MB                  hard cumulative cap in MiB; explicit "0" disables the whole quota mechanism. Default 512.
+//	ALIANG_TERMINAL_QUOTA_MAX_MB                  hard cumulative cap in MiB (kill_at_bytes); explicit "0" disables the whole quota mechanism. Default 512.
 //	ALIANG_TERMINAL_QUOTA_CHALLENGE_MIN_INTERVAL  minimum spacing between challenges (time.ParseDuration form). Default 30m.
 //
-// Blank/unparseable/non-positive values fall back to the default (see envMiB /
-// envMiBAllowZero / resolveEnvDuration).
+// Invalid values fall back to the default (see envMiB / envMiBAllowZero /
+// resolveEnvDuration). For MAX_MB an explicit "0" is the documented off
+// switch; every other invalid input (blank, unparseable, negative, or above
+// the overflow guard) falls back to the default.
 var (
 	agentTerminalQuotaCheckpointBytes = envMiB("ALIANG_TERMINAL_QUOTA_CHECKPOINT_MB", 128)
 	agentTerminalQuotaMaxBytes        = envMiBAllowZero("ALIANG_TERMINAL_QUOTA_MAX_MB", 512)
@@ -170,11 +176,13 @@ func resolveEnvDurationAllowZero(key string, def time.Duration) time.Duration {
 
 // envMiB reads an env key holding a MiB count and returns the corresponding
 // byte value (MiB × 1024 × 1024). def is the fallback, likewise expressed in
-// MiB. Unset, blank, unparseable, or non-positive values use def.
+// MiB. Unset, blank, unparseable, non-positive, or overflow-range values (a
+// MiB count whose byte conversion would not fit in int64, i.e. ≥ 8 TiB — a
+// silently negative cap would kill a session on its first byte) use def.
 func envMiB(key string, def int64) int64 {
 	mib := def
 	if raw := strings.TrimSpace(os.Getenv(key)); raw != "" {
-		if v, err := strconv.ParseInt(raw, 10, 64); err == nil && v > 0 {
+		if v, err := strconv.ParseInt(raw, 10, 64); err == nil && v > 0 && v <= math.MaxInt64/(1024*1024) {
 			mib = v
 		}
 	}
@@ -183,11 +191,12 @@ func envMiB(key string, def int64) int64 {
 
 // envMiBAllowZero is envMiB but accepts an explicit "0" as a meaningful value —
 // the documented way to disable a byte-quota guard entirely (0 bytes = no
-// cap). Unset, blank, unparseable, or negative values fall back to def (MiB).
+// cap). Any other invalid input — blank, unparseable, negative, or in the
+// overflow range — falls back to def (MiB).
 func envMiBAllowZero(key string, def int64) int64 {
 	mib := def
 	if raw := strings.TrimSpace(os.Getenv(key)); raw != "" {
-		if v, err := strconv.ParseInt(raw, 10, 64); err == nil && v >= 0 {
+		if v, err := strconv.ParseInt(raw, 10, 64); err == nil && v >= 0 && v <= math.MaxInt64/(1024*1024) {
 			mib = v
 		}
 	}
