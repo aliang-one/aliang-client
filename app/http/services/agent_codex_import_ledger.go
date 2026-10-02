@@ -78,3 +78,25 @@ func (l *codexExternalImportLedger) resolve(session models.AgentVibeSession) (bo
 	}
 	return false, ""
 }
+
+// applyCodexExternalImportLedger 对 Codex 扫描结果统一做导入副本过滤:
+// 原文件仍在的副本被剔除,原文件已丢的副本时间回落到台账记录的原始活跃时间。
+func applyCodexExternalImportLedger(sessions []models.AgentVibeSession, home string) []models.AgentVibeSession {
+	ledger := loadCodexExternalImportLedger(home)
+	if len(ledger.byThread) == 0 {
+		return sessions
+	}
+	out := make([]models.AgentVibeSession, 0, len(sessions))
+	for _, session := range sessions {
+		skip, restoredAt := ledger.resolve(session)
+		if skip {
+			continue
+		}
+		if restoredAt != "" {
+			session.CreatedAt = restoredAt
+			session.UpdatedAt = restoredAt
+		}
+		out = append(out, session)
+	}
+	return out
+}

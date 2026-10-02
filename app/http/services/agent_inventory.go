@@ -414,7 +414,7 @@ func collectCodexVibeSessions(scanDirs []string) []models.AgentVibeSession {
 		meta.Mode = "vibe"
 		sessions = append(sessions, meta)
 	}
-	return sessions
+	return applyCodexExternalImportLedger(sessions, home)
 }
 
 func readCodexSessionMeta(path string) models.AgentVibeSession {
