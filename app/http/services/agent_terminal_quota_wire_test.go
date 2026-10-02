@@ -297,6 +297,42 @@ func TestTerminalQuotaWire_ResolvedDispatch(t *testing.T) {
 			t.Fatalf("a verdict without session_id must error like terminal.create, got %v", errs)
 		}
 	})
+
+	t.Run("UnknownVerdictRejected", func(t *testing.T) {
+		// A verdict is only ever granted or denied (spec §6.2). An unknown
+		// verdict is a protocol deviation from a version-skewed server, NOT a
+		// human rejection: falling through to denied would accelerate the
+		// kill — the opposite of what this liveness mechanism exists for — so
+		// it must be rejected with an error frame and the pending challenge
+		// left untouched.
+		m := newAgentTerminalManager()
+		coll, write := newPayloadCollector()
+		session := newQuotaWireSession(m, "t-q-snooze")
+		kills := killRecorder(session)
+
+		m.copyTerminalOutput("t-q-snooze", &quotaChunkReader{chunks: []int{quotaWireCheckpoint}}, write) // issue seq=1
+		m.quotaResolved(map[string]interface{}{
+			"session_id": "t-q-snooze", "seq": 1, "verdict": "snooze",
+		}, write)
+
+		errs := coll.ofTypes(models.AgentEventTerminalError)
+		if len(errs) != 1 || !strings.Contains(fmt.Sprint(errs[0]["error"]), `unknown verdict "snooze"`) {
+			t.Fatalf("an unknown verdict must be rejected with an error frame, got %v", errs)
+		}
+		if got := atomic.LoadInt32(kills); got != 0 {
+			t.Fatalf("an unknown verdict must not kill, kills=%d", got)
+		}
+		// The pending challenge survived the garbage verdict: the kill point
+		// still fires as unanswered.
+		m.copyTerminalOutput("t-q-snooze", &quotaChunkReader{chunks: []int{quotaWireCheckpoint}}, write)
+		errs = coll.ofTypes(models.AgentEventTerminalError)
+		if len(errs) != 2 || !strings.HasPrefix(fmt.Sprint(errs[1]["error"]), "quota_unanswered") {
+			t.Fatalf("the challenge must still be pending after an unknown verdict, errors=%v", errs)
+		}
+		if got := atomic.LoadInt32(kills); got != 1 {
+			t.Fatalf("the surviving pending challenge must still kill, kills=%d", got)
+		}
+	})
 }
 
 // TestTerminalQuotaWire_RateTripKillsForFloodAndSkipsQuotaAction pins the
@@ -370,6 +406,37 @@ func TestTerminalQuotaWire_DuplicateKillSuppressed(t *testing.T) {
 		}
 		if got := atomic.LoadInt32(kills); got != 1 {
 			t.Fatalf("the copy loop must not double-kill, kills=%d", got)
+		}
+	})
+
+	t.Run("CopyLoopKillFirstSilencesLateDenied", func(t *testing.T) {
+		// The reverse race: the copy loop's unanswered kill claims first, and
+		// a denied verdict arrives late — the session is still in the map and
+		// still pending, so resolveQuota does report kill_denied, but the
+		// claim is gone: the denied frame must be suppressed.
+		m := newAgentTerminalManager()
+		coll, write := newPayloadCollector()
+		session := newQuotaWireSession(m, "t-q-dup2")
+		kills := killRecorder(session)
+
+		m.copyTerminalOutput("t-q-dup2", &quotaChunkReader{chunks: []int{quotaWireCheckpoint}}, write) // issue seq=1
+		// The copy loop reaches its kill point first: one frame, one kill.
+		m.copyTerminalOutput("t-q-dup2", &quotaChunkReader{chunks: []int{quotaWireCheckpoint}}, write) // kill_unanswered, claimed
+		if got := atomic.LoadInt32(kills); got != 1 {
+			t.Fatalf("the unanswered kill must fire, kills=%d", got)
+		}
+		// The late denied verdict: still a live pending seq match, so the
+		// meter reports kill_denied — and the handler must stay silent.
+		m.quotaResolved(map[string]interface{}{
+			"session_id": "t-q-dup2", "seq": 1, "verdict": "denied",
+		}, write)
+
+		errs := coll.ofTypes(models.AgentEventTerminalError)
+		if len(errs) != 1 || !strings.HasPrefix(fmt.Sprint(errs[0]["error"]), "quota_unanswered") {
+			t.Fatalf("exactly one kill frame (the unanswered one) expected, got %v", errs)
+		}
+		if got := atomic.LoadInt32(kills); got != 1 {
+			t.Fatalf("the late denied verdict must not double-kill, kills=%d", got)
 		}
 	})
 

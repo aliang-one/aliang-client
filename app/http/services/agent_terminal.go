@@ -440,7 +440,9 @@ func (m *agentTerminalManager) close(msg map[string]interface{}, writeJSON agent
 // granted clears pending silently (a challenge never blocked the stream, so
 // there is nothing to resume); denied kills with the quota_denied reason. A
 // seq that does not match the pending challenge is ignored, and a session that
-// is already gone swallows the verdict silently — its challenge is moot.
+// is already gone swallows the verdict silently — its challenge is moot. A
+// verdict that is neither granted nor denied is a protocol error: rejected
+// with an error frame, the pending challenge untouched.
 // Lock discipline: get-then-act — fetch the session under m.mu, touch the
 // meter with m.mu released; no path may hold meter.mu while taking m.mu.
 func (m *agentTerminalManager) quotaResolved(msg map[string]interface{}, writeJSON agentTerminalWriter) {
@@ -456,8 +458,19 @@ func (m *agentTerminalManager) quotaResolved(msg map[string]interface{}, writeJS
 	if session == nil || session.meter == nil {
 		return
 	}
-	granted := remoteString(msg, "verdict") == "granted"
-	if action := session.meter.resolveQuota(uint64(remoteInt(msg, "seq", 0)), granted); action.kind == quotaActionKillDenied {
+	// A verdict is only ever "granted" or "denied" (spec §6.2). Anything else
+	// is a protocol deviation from a version-skewed server, not a human
+	// rejection: mapping an unknown verdict to denied would accelerate the
+	// kill — the opposite of what this liveness mechanism exists for (keeping
+	// a human-attended session alive). Reject the frame and leave the pending
+	// challenge untouched.
+	verdict := remoteString(msg, "verdict")
+	if verdict != "granted" && verdict != "denied" {
+		_ = writeJSON(agentTerminalErrorPayload(sessionID,
+			fmt.Errorf("terminal.quota.resolved unknown verdict %q", verdict)))
+		return
+	}
+	if action := session.meter.resolveQuota(uint64(remoteInt(msg, "seq", 0)), verdict == "granted"); action.kind == quotaActionKillDenied {
 		m.killTerminalSession(sessionID, errTerminalQuotaDenied, writeJSON)
 	}
 }
