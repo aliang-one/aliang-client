@@ -103,6 +103,13 @@ const (
 	AgentEventGoalVerifyError         = "goal.verify.error"
 )
 
+// Terminal output quota challenge protocol. Kept in its own block so the long
+// constant names do not force a whitespace realignment of the block above.
+const (
+	AgentEventTerminalQuotaChallengeRequired = "terminal.quota.challenge_required" // agent → server: cumulative terminal output crossed a quota checkpoint; the agent pauses the stream until the user acknowledges the challenge
+	AgentEventTerminalQuotaResolved          = "terminal.quota.resolved"           // server → agent: user resolved the challenge; the paused terminal stream resumes
+)
+
 type AgentProtocolContract struct {
 	Version   string                   `json:"version"`
 	HTTP      []AgentProtocolHTTPRoute `json:"http"`
