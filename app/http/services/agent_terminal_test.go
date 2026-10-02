@@ -10,7 +10,7 @@ func TestTerminalOutputMeter_WatchPacedStreamNeverTrips(t *testing.T) {
 	// A continuous, human-paced command such as `watch` emits a few KB every
 	// couple of seconds. It must stream indefinitely (within the idle timeout)
 	// without tripping the flood limiter.
-	meter := newOutputMeter(agentTerminalOutputRateWindow, agentTerminalOutputRateBytes, int64(agentTerminalOutputCapBytes))
+	meter := newTerminalSessionMeter()
 	base := time.Date(2026, 6, 16, 12, 0, 0, 0, time.UTC)
 	for i := 0; i < 600; i++ { // ~20 minutes of `watch -n 2` at 4 KB/refresh
 		now := base.Add(time.Duration(i*2) * time.Second)
@@ -23,7 +23,7 @@ func TestTerminalOutputMeter_WatchPacedStreamNeverTrips(t *testing.T) {
 func TestTerminalOutputMeter_BurstFloodTripsWithinWindow(t *testing.T) {
 	// A runaway command dumping ~1 MB chunks back-to-back must be stopped once
 	// the sustained rate exceeds the per-window threshold.
-	meter := newOutputMeter(agentTerminalOutputRateWindow, agentTerminalOutputRateBytes, int64(agentTerminalOutputCapBytes))
+	meter := newTerminalSessionMeter()
 	now := time.Date(2026, 6, 16, 12, 0, 0, 0, time.UTC)
 	for i := 0; i < 8; i++ { // 8 MiB exactly == limit, not yet over
 		if meter.add(1<<20, now) {
@@ -36,7 +36,7 @@ func TestTerminalOutputMeter_BurstFloodTripsWithinWindow(t *testing.T) {
 }
 
 func TestTerminalOutputMeter_RateWindowSlides(t *testing.T) {
-	meter := newOutputMeter(agentTerminalOutputRateWindow, agentTerminalOutputRateBytes, int64(agentTerminalOutputCapBytes))
+	meter := newTerminalSessionMeter()
 	base := time.Date(2026, 6, 16, 12, 0, 0, 0, time.UTC)
 
 	// 7 MiB at t=0 stays under the 8 MiB window limit.
@@ -55,18 +55,46 @@ func TestTerminalOutputMeter_RateWindowSlides(t *testing.T) {
 }
 
 func TestTerminalOutputMeter_LifetimeCapBackstop(t *testing.T) {
-	// With a tiny lifetime cap and a huge rate, only the cap path can trip.
-	meter := &outputMeter{
-		window:  5 * time.Second,
-		rateMax: 1 << 30,
-		capMax:  100,
-	}
+	// The lifetime backstop moved into the quota state machine: with a tiny
+	// checkpoint/max and a huge rate window, only the quota path can report a
+	// stop. record issues a challenge at the checkpoint; after a grant,
+	// reaching maxBytes reports kill_hard_cap (the caller — the output copy
+	// loop — performs the kill).
+	meter := newTerminalOutputMeter(5*time.Second, 1<<30, newQuotaPolicy(10, 30, 30*time.Minute))
 	now := time.Date(2026, 6, 16, 12, 0, 0, 0, time.UTC)
-	if meter.add(60, now) {
-		t.Fatalf("60 bytes is under the 100-byte cap")
+	if act := recordQuiet(t, meter, 20, now); act.kind != quotaActionIssue {
+		t.Fatalf("crossing the 10-byte checkpoint must issue a challenge, got %q", act.kind)
 	}
+	if act := meter.resolveQuota(1, true); act.kind != "" {
+		t.Fatalf("grant must report no action, got %q", act.kind)
+	}
+	act := recordQuiet(t, meter, 10, now) // total 30 = hard cap, no pending challenge
+	if act.kind != quotaActionKillHardCap {
+		t.Fatalf("expected kill_hard_cap at the 30-byte hard cap, got %q", act.kind)
+	}
+	if act.killAtBytes != 30 {
+		t.Fatalf("killAtBytes = %d, want 30", act.killAtBytes)
+	}
+}
+
+func TestTerminalOutputMeter_LegacyCapGuardsQuotalessMeters(t *testing.T) {
+	// Meters without a quota state machine (the AI output limiter reuses
+	// outputMeter) keep the direct lifetime-cap backstop in add — only terminal
+	// meters delegate cumulative volume to the quota challenge machine (via
+	// record). Quota evaluation on such a meter must stay a no-op.
+	meter := newOutputMeter(5*time.Second, 1<<30, 100)
+	now := time.Date(2026, 6, 16, 12, 0, 0, 0, time.UTC)
+	// First chunk through record: 60 bytes is under the 100-byte cap, and a
+	// quota-less meter must report no quota action.
+	if rate, act := meter.record(60, now); rate || act.kind != "" {
+		t.Fatalf("quota-less meter must report neither a trip nor a quota action, got rate=%v action=%q", rate, act.kind)
+	}
+	if act := meter.resolveQuota(1, true); act.kind != "" {
+		t.Fatalf("quota-less meter must report no resolve action, got %q", act.kind)
+	}
+	// The AI limiter keeps calling add directly — the legacy cap still trips.
 	if !meter.add(50, now) { // 110 > 100
-		t.Fatalf("expected the lifetime cap backstop to trip")
+		t.Fatalf("expected the lifetime cap backstop to trip for a quota-less meter")
 	}
 }
 

@@ -113,7 +113,7 @@ func newAttachTestSession(id string, ring *terminalRingBuffer) *agentTerminalSes
 		waiter:       func() (int, error) { return 0, nil },
 		killer:       func() error { return nil },
 		closer:       func() error { return nil },
-		meter:        newOutputMeter(agentTerminalOutputRateWindow, agentTerminalOutputRateBytes, int64(agentTerminalOutputCapBytes)),
+		meter:        newTerminalSessionMeter(),
 		token:        new(struct{}),
 		startedAt:    now,
 		lastActiveAt: now,

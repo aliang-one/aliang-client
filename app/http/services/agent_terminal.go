@@ -109,6 +109,13 @@ type agentTerminalSession struct {
 	lastActiveAt time.Time
 	lastInputAt  time.Time
 
+	// killClaimed dedups kill frames across concurrent output-path kills
+	// (guarded by the manager mutex): a terminal.quota.resolved denied verdict
+	// can land between the copy loop's meter record and the kill it then
+	// performs, and exactly one of the racing paths may frame and kill. It is
+	// never reset — once a session is on its way out, later kills stay silent.
+	killClaimed bool
+
 	rows int
 	cols int
 
@@ -428,6 +435,46 @@ func (m *agentTerminalManager) close(msg map[string]interface{}, writeJSON agent
 	session.kill()
 }
 
+// quotaResolved applies a terminal.quota.resolved verdict (spec §5.2 rule 5,
+// §6.2): the human's answer is the only redemption for a pending challenge.
+// granted clears pending silently (a challenge never blocked the stream, so
+// there is nothing to resume); denied kills with the quota_denied reason. A
+// seq that does not match the pending challenge is ignored, and a session that
+// is already gone swallows the verdict silently — its challenge is moot. A
+// verdict that is neither granted nor denied is a protocol error: rejected
+// with an error frame, the pending challenge untouched.
+// Lock discipline: get-then-act — fetch the session under m.mu, touch the
+// meter with m.mu released; no path may hold meter.mu while taking m.mu.
+func (m *agentTerminalManager) quotaResolved(msg map[string]interface{}, writeJSON agentTerminalWriter) {
+	if writeJSON == nil {
+		return
+	}
+	sessionID := remoteString(msg, "session_id")
+	if sessionID == "" {
+		_ = writeJSON(agentTerminalErrorPayload("", errors.New("terminal.quota.resolved missing session_id")))
+		return
+	}
+	session := m.get(sessionID)
+	if session == nil || session.meter == nil {
+		return
+	}
+	// A verdict is only ever "granted" or "denied" (spec §6.2). Anything else
+	// is a protocol deviation from a version-skewed server, not a human
+	// rejection: mapping an unknown verdict to denied would accelerate the
+	// kill — the opposite of what this liveness mechanism exists for (keeping
+	// a human-attended session alive). Reject the frame and leave the pending
+	// challenge untouched.
+	verdict := remoteString(msg, "verdict")
+	if verdict != "granted" && verdict != "denied" {
+		_ = writeJSON(agentTerminalErrorPayload(sessionID,
+			fmt.Errorf("terminal.quota.resolved unknown verdict %q", verdict)))
+		return
+	}
+	if action := session.meter.resolveQuota(uint64(remoteInt(msg, "seq", 0)), verdict == "granted"); action.kind == quotaActionKillDenied {
+		m.killTerminalSession(sessionID, errTerminalQuotaDenied, writeJSON)
+	}
+}
+
 func (m *agentTerminalManager) closeAll() {
 	m.mu.Lock()
 	sessions := make([]*agentTerminalSession, 0, len(m.sessions))
@@ -604,22 +651,60 @@ func (m *agentTerminalManager) touchInput(sessionID string) {
 	}
 }
 
-// acceptTerminalOutput records n bytes of output for the session, refreshing its
-// idle timer, and reports whether the stream has tripped the flood limiter (in
-// which case the caller should terminate the session). Continuous, human-paced
-// output such as `watch` never trips it; only runaway floods do.
-func (m *agentTerminalManager) acceptTerminalOutput(sessionID string, n int) bool {
+// recordTerminalOutput records n bytes of output for the session, refreshing
+// its idle timer, and folds the rate window and the quota challenge state
+// machine into the meter's single locked evaluation (record, spec §5.2). It
+// reports the rate verdict first: a rate trip means the caller kills for the
+// flood — unredeemable by any ack (spec §5.3) — and must NOT perform the
+// returned action. Continuous, human-paced output such as `watch` never trips
+// the rate gate; only runaway floods do. Lock nesting mirrors the old
+// acceptTerminalOutput: m.mu outer, meter.mu inner — never the reverse (see
+// the B4 wiring notes on record).
+func (m *agentTerminalManager) recordTerminalOutput(sessionID string, n int) (bool, quotaAction) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	session := m.sessions[sessionID]
 	if session == nil {
-		return false
+		return false, quotaAction{}
 	}
 	session.lastActiveAt = time.Now()
 	if session.meter == nil {
+		return false, quotaAction{}
+	}
+	return session.meter.record(n, time.Now())
+}
+
+// claimTerminalKill atomically reserves the right to emit a terminal kill frame
+// for the session and execute the kill: the first caller wins, every racing
+// loser stays silent (a terminal.quota.resolved denied verdict landing between
+// the copy loop's meter record and its kill — or the reverse), so the user sees
+// exactly one kill frame per session. A session missing from the live map
+// (reaped by waitTerminal / close / closeAll) also loses. Mirrors the
+// watchTerminalIdle pattern: decide under m.mu, act outside it.
+func (m *agentTerminalManager) claimTerminalKill(sessionID string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	session := m.sessions[sessionID]
+	if session == nil || session.killClaimed {
 		return false
 	}
-	return session.meter.add(n, time.Now())
+	session.killClaimed = true
+	return true
+}
+
+// killTerminalSession is the shared shape of every output-path kill (flood,
+// the three quota reasons, a denied verdict): claim the kill, emit the reason
+// frame, then terminate the session. Losing the claim means a concurrent path
+// already framed and killed — return without a word. Killing stays outside the
+// lock, matching every other kill path in this file.
+func (m *agentTerminalManager) killTerminalSession(sessionID string, err error, writeJSON agentTerminalWriter) {
+	if !m.claimTerminalKill(sessionID) {
+		return
+	}
+	_ = writeJSON(agentTerminalErrorPayload(sessionID, err))
+	if session := m.get(sessionID); session != nil {
+		session.kill()
+	}
 }
 
 func (m *agentTerminalManager) copyTerminalOutput(sessionID string, reader io.Reader, writeJSON agentTerminalWriter) {
@@ -628,13 +713,49 @@ func (m *agentTerminalManager) copyTerminalOutput(sessionID string, reader io.Re
 	for {
 		n, err := reader.Read(buf)
 		if n > 0 {
-			if m.acceptTerminalOutput(sessionID, n) {
-				_ = writeJSON(agentTerminalErrorPayload(sessionID, fmt.Errorf(
-					"terminal output flood limit exceeded (max %d bytes per %s, lifetime cap %d bytes)",
-					agentTerminalOutputRateBytes, agentTerminalOutputRateWindow, agentTerminalOutputCapBytes)))
-				if session := m.get(sessionID); session != nil {
-					session.kill()
-				}
+			// One locked evaluation covers the rate window AND the quota
+			// challenge state machine. Rate wins (spec §5.3: a flood is not
+			// redeemable by an ack), so on a rate trip the quota action is
+			// dropped without being performed.
+			rateTripped, action := m.recordTerminalOutput(sessionID, n)
+			if rateTripped {
+				// Rate-only reason: cumulative volume is no longer a blind
+				// kill — it is governed by the quota challenge machine.
+				m.killTerminalSession(sessionID, fmt.Errorf(
+					"terminal output flood limit exceeded (max %d bytes per %s)",
+					agentTerminalOutputRateBytes, agentTerminalOutputRateWindow), writeJSON)
+				return
+			}
+			switch action.kind {
+			case quotaActionIssue:
+				// A challenge never blocks the stream (spec §5.2 rule 4):
+				// best-effort control-plane frame — not ringed, not held by
+				// the output gate — and the bytes below still flow to
+				// ring+live. A failed send does not roll the state machine
+				// back: output keeps accumulating and converges at the kill
+				// point.
+				_ = writeJSON(map[string]interface{}{
+					"type":          models.AgentEventTerminalQuotaChallengeRequired,
+					"session_id":    sessionID,
+					"seq":           action.seq,
+					"used_bytes":    action.usedBytes,
+					"kill_at_bytes": action.killAtBytes,
+					"max_bytes":     action.maxBytes,
+				})
+			case quotaActionKillUnanswered:
+				m.killTerminalSession(sessionID, fmt.Errorf(
+					"quota_unanswered: output quota exhausted (unanswered checkpoint %d bytes) — for long-running noisy commands use: <cmd> > log 2>&1",
+					action.killAtBytes), writeJSON)
+				return
+			case quotaActionKillHardCap:
+				m.killTerminalSession(sessionID, fmt.Errorf(
+					"quota_hard_cap: output quota exhausted (hard cap %d bytes) — for long-running noisy commands use: <cmd> > log 2>&1",
+					action.killAtBytes), writeJSON)
+				return
+			case quotaActionKillDenied:
+				// record never reports denied (only resolveQuota does); kept
+				// so a future meter change cannot silently fall through.
+				m.killTerminalSession(sessionID, errTerminalQuotaDenied, writeJSON)
 				return
 			}
 			if chunk := enc.push(buf[:n]); len(chunk) > 0 {
@@ -784,7 +905,7 @@ func newAgentTerminalSession(id string, shell string, cwd string, handle *agentT
 		waiter:       handle.wait,
 		killer:       handle.kill,
 		closer:       handle.close,
-		meter:        newOutputMeter(agentTerminalOutputRateWindow, agentTerminalOutputRateBytes, int64(agentTerminalOutputCapBytes)),
+		meter:        newTerminalSessionMeter(),
 		token:        new(struct{}),
 		startedAt:    now,
 		lastActiveAt: now,
@@ -854,11 +975,19 @@ func newAgentShellCommand(shell string, cwd string) *exec.Cmd {
 // shared by terminal sessions and AI runs so both apply the same flood policy:
 // stop runaway bursts quickly (e.g. `yes`, `cat /dev/urandom`, or an AI dumping
 // megabytes per second) while letting continuous-but-slow streams run
-// indefinitely up to a high lifetime cap.
+// indefinitely. Cumulative volume is handled differently per consumer: terminal
+// meters attach a quota challenge state machine (quota field, spec §5.2) and
+// add is a pure rate gate for them; quota-less meters (the AI output limiter)
+// keep the direct capMax lifetime backstop in add.
 type outputMeter struct {
 	window  time.Duration
 	rateMax int
 	capMax  int64
+
+	// quota is the terminal quota challenge state machine, attached at
+	// construction (newTerminalOutputMeter). nil means no quota machine — add
+	// then keeps the legacy lifetime-cap backstop above.
+	quota *outputQuota
 
 	mu      sync.Mutex
 	samples []outputSample
@@ -879,12 +1008,18 @@ func newOutputMeter(window time.Duration, rateMax int, capMax int64) *outputMete
 }
 
 // add records n bytes emitted at now and reports whether the session should be
-// killed because the sustained rate over the window or the lifetime cap was
-// exceeded.
+// killed because the sustained rate over the window was exceeded (or, for
+// quota-less meters only, the lifetime cap). Terminal output flows through
+// record instead, which folds this evaluation and the quota state machine into
+// one locked call.
 func (m *outputMeter) add(n int, now time.Time) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.addLocked(n, now)
+}
 
+// addLocked is add without locking. The caller must hold m.mu.
+func (m *outputMeter) addLocked(n int, now time.Time) bool {
 	cutoff := now.Add(-m.window)
 	drop := 0
 	for drop < len(m.samples) && m.samples[drop].at.Before(cutoff) {
@@ -896,9 +1031,9 @@ func (m *outputMeter) add(n int, now time.Time) bool {
 	m.samples = append(m.samples, outputSample{at: now, bytes: n})
 	m.total += int64(n)
 
-	if m.capMax > 0 && m.total > m.capMax {
-		return true
-	}
+	// Rate is evaluated first and cannot be redeemed by an ack (spec §5.3): an
+	// instantaneous flood kills the session no matter where the quota state
+	// machine stands.
 	if m.rateMax > 0 {
 		recent := 0
 		for _, s := range m.samples {
@@ -908,7 +1043,188 @@ func (m *outputMeter) add(n int, now time.Time) bool {
 			return true
 		}
 	}
+	// The lifetime cap backstop stays only for meters without a quota state
+	// machine (the AI output limiter). Terminal meters delegate cumulative
+	// volume to the quota machine (record), whose maxBytes hard cap replaces
+	// this blind kill (spec §5.1/§5.2).
+	if m.quota == nil && m.capMax > 0 && m.total > m.capMax {
+		return true
+	}
 	return false
+}
+
+// quotaPolicy carries the tunables of the terminal output quota challenge
+// state machine (spec §3; the agentTerminalQuota* package vars in
+// agent_execution_guard.go). checkpointBytes and minInterval must be positive;
+// maxBytes == 0 is the documented off switch that disables the whole
+// mechanism. Production values come from envMiB / resolveEnvDuration, which
+// guarantee those invariants; tests inject shrunk values through this
+// constructor instead of rewriting the package vars.
+type quotaPolicy struct {
+	checkpointBytes int64
+	maxBytes        int64
+	minInterval     time.Duration
+}
+
+func newQuotaPolicy(checkpointBytes, maxBytes int64, minInterval time.Duration) quotaPolicy {
+	return quotaPolicy{
+		checkpointBytes: checkpointBytes,
+		maxBytes:        maxBytes,
+		minInterval:     minInterval,
+	}
+}
+
+// outputQuota is the per-session runtime state of the quota challenge machine
+// (spec §5.1). It lives inside the meter so both share one lock and one
+// total. All transitions are evaluated on the byte-arrival path (record)
+// — there is no timer.
+type outputQuota struct {
+	// policy
+	checkpointBytes int64         // challenge issue interval, in bytes
+	maxBytes        int64         // hard cap; 0 = whole mechanism disabled
+	minInterval     time.Duration // min spacing between issues (dual gate)
+
+	// runtime state
+	nextChallengeBytes int64     // next byte total at which a challenge is due; advances by checkpointBytes at each issue
+	lastChallengeAt    time.Time // last issue time; zero value = never issued (any now passes the interval gate)
+	pending            bool      // a challenge is awaiting a verdict
+	seq                uint64    // challenge sequence number, monotonic per session
+}
+
+// quotaAction kinds. The empty kind means "no action — output keeps
+// streaming": a challenge never blocks the stream, only a kill point stops it.
+const (
+	quotaActionIssue          = "issue"           // emit terminal.quota.challenge_required
+	quotaActionKillUnanswered = "kill_unanswered" // pending challenge, output reached kill_at_bytes
+	quotaActionKillHardCap    = "kill_hard_cap"   // cumulative output reached max_bytes regardless of pending
+	quotaActionKillDenied     = "kill_denied"     // human rejected the challenge
+)
+
+// errTerminalQuotaDenied is the kill reason for a human-rejected challenge
+// (spec §5.2 rule 5). The reason prefixes — quota_unanswered / quota_denied /
+// quota_hard_cap — are a cross-repo contract: the phone humanizes terminal
+// errors by matching the "quota_" prefix, so they must stay verbatim.
+var errTerminalQuotaDenied = errors.New("quota_denied: output quota challenge denied by user")
+
+// quotaAction is the verdict of one quota evaluation. The caller (terminal
+// output copy loop) performs the kill / emits the challenge; the meter only
+// reports.
+type quotaAction struct {
+	kind        string
+	seq         uint64
+	usedBytes   int64
+	killAtBytes int64 // for issue: where an unanswered kill will fire; for byte-triggered kills: the threshold that fired
+	maxBytes    int64 // carried on issue for the challenge frame's max_bytes (spec §6.1); NOT a kill point — distinct from killAtBytes
+}
+
+// newTerminalOutputMeter builds the terminal flavor of the meter: a pure rate
+// gate plus the quota challenge state machine. capMax does not apply here —
+// cumulative volume is governed by the quota machine, whose maxBytes hard cap
+// replaces the old blind lifetime kill (spec §5.1/§5.2).
+func newTerminalOutputMeter(window time.Duration, rateMax int, policy quotaPolicy) *outputMeter {
+	return &outputMeter{
+		window:  window,
+		rateMax: rateMax,
+		quota: &outputQuota{
+			checkpointBytes:    policy.checkpointBytes,
+			maxBytes:           policy.maxBytes,
+			minInterval:        policy.minInterval,
+			nextChallengeBytes: policy.checkpointBytes,
+		},
+	}
+}
+
+// newTerminalSessionMeter wires the env-tunable quota knobs (package vars in
+// agent_execution_guard.go) into a production terminal meter.
+func newTerminalSessionMeter() *outputMeter {
+	return newTerminalOutputMeter(agentTerminalOutputRateWindow, agentTerminalOutputRateBytes,
+		newQuotaPolicy(agentTerminalQuotaCheckpointBytes, agentTerminalQuotaMaxBytes, agentTerminalQuotaMinInterval))
+}
+
+// record is the terminal output path: in one pass under the meter's own lock
+// it accumulates the chunk, evaluates the rate window, and evaluates the quota
+// challenge state machine (spec §5.2), returning (rateTripped, action). The
+// copy loop (B4) kills for the rate trip first and only processes the action
+// otherwise — that ordering contract is guaranteed by the single-call
+// structure rather than by documentation, and no interleaving can slip between
+// the two evaluations. The quota evaluation itself ignores the rate verdict:
+// when both fire, the caller kills for the rate (unredeemable, spec §5.3) and
+// drops the action; the state machine may have advanced, which is harmless on
+// a session that is about to die. On a quota-less meter (none is wired that
+// way today) the second result is always the zero action.
+//
+// B4 wiring notes:
+//   - A denied verdict (terminal.quota.resolved → resolveQuota → kill_denied)
+//     can land between this call and the kill the caller then performs; the
+//     copy loop must not emit a duplicate kill frame for a session it is
+//     already killing.
+//   - The terminal.quota.resolved handler goes m.get()-then-act (fetch the
+//     session, then act on it): never acquire the manager mutex while holding
+//     meter.mu.
+func (m *outputMeter) record(n int, now time.Time) (bool, quotaAction) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.addLocked(n, now), m.consumeQuotaLocked(now)
+}
+
+// consumeQuotaLocked evaluates the quota challenge state machine against the
+// accumulated total (spec §5.2). The caller must hold m.mu.
+//
+// Transitions, in evaluation order (spec §5.2):
+//
+//  1. maxBytes == 0 → the quota mechanism is disabled entirely: never
+//     challenge, never kill (pure rate gate).
+//  2. total >= maxBytes → kill_hard_cap, regardless of pending state.
+//  3. pending && total >= nextChallengeBytes → kill_unanswered; the kill point
+//     is the checkpoint beyond the challenge point (kill_at_bytes), NOT
+//     maxBytes — the two are different thresholds.
+//  4. !pending && total >= nextChallengeBytes && now-lastChallengeAt >=
+//     minInterval → issue: seq++, nextChallengeBytes += checkpointBytes,
+//     lastChallengeAt = now, pending = true. A challenge does NOT block
+//     output — the stream keeps going; only a kill point stops it. The action
+//     carries maxBytes so the caller can fill the challenge frame's max_bytes
+//     (spec §6.1) from the same locked evaluation.
+//  5. otherwise no action.
+func (m *outputMeter) consumeQuotaLocked(now time.Time) quotaAction {
+	q := m.quota
+	if q == nil || q.maxBytes == 0 {
+		return quotaAction{}
+	}
+	if m.total >= q.maxBytes {
+		return quotaAction{kind: quotaActionKillHardCap, seq: q.seq, usedBytes: m.total, killAtBytes: q.maxBytes}
+	}
+	if q.pending && m.total >= q.nextChallengeBytes {
+		return quotaAction{kind: quotaActionKillUnanswered, seq: q.seq, usedBytes: m.total, killAtBytes: q.nextChallengeBytes}
+	}
+	if !q.pending && m.total >= q.nextChallengeBytes && now.Sub(q.lastChallengeAt) >= q.minInterval {
+		q.seq++
+		q.nextChallengeBytes += q.checkpointBytes
+		q.lastChallengeAt = now
+		q.pending = true
+		return quotaAction{kind: quotaActionIssue, seq: q.seq, usedBytes: m.total, killAtBytes: q.nextChallengeBytes, maxBytes: q.maxBytes}
+	}
+	return quotaAction{}
+}
+
+// resolveQuota applies a terminal.quota.resolved verdict (spec §5.2 rule 5).
+// A seq that does not match the pending challenge (an expired challenge) is
+// ignored — state unchanged — as is any resolution while nothing is pending.
+// granted only clears pending: nextChallengeBytes advanced at issue time and
+// grant does not move it. denied reports kill_denied; the caller performs the
+// kill.
+func (m *outputMeter) resolveQuota(seq uint64, granted bool) quotaAction {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	q := m.quota
+	if q == nil || !q.pending || seq != q.seq {
+		return quotaAction{}
+	}
+	if !granted {
+		return quotaAction{kind: quotaActionKillDenied, seq: seq, usedBytes: m.total}
+	}
+	q.pending = false
+	return quotaAction{}
 }
 
 // terminalOutputEncoder buffers an incomplete trailing UTF-8 sequence so that

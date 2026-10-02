@@ -634,6 +634,12 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 	case models.AgentEventTerminalClose:
 		s.setRemoteConnectionState(true, "online", "")
 		s.terminal.close(msg, writeJSON)
+	case models.AgentEventTerminalQuotaResolved:
+		// Deliberately NOT behind the remote-terminal toggle: a challenge
+		// verdict must always be honored — dropping it would strand a pending
+		// challenge and eventually kill a session the user just approved.
+		s.setRemoteConnectionState(true, "online", "")
+		s.terminal.quotaResolved(msg, writeJSON)
 	case models.AgentEventAISessionCreate, models.AgentEventAIMessage, models.AgentEventAIRunStart, models.AgentEventAISteer, models.AgentEventAIApprovalResponse, models.AgentEventAIOptionResponse, models.AgentEventAIStop, models.AgentEventAISessionClose, models.AgentEventAITuiSync:
 		s.setRemoteConnectionState(true, "online", "")
 		switch msgType {

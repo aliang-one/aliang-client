@@ -3,11 +3,13 @@ package services
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -19,15 +21,16 @@ const (
 	agentMaxTerminalSessions     = 4
 	agentTerminalInputLimitBytes = 64 * 1024
 	// Terminal output flood protection. A hard cumulative cap killed legitimately
-	// long-running continuous commands (watch / top / tail -f). We now stop a
-	// stream only when its sustained rate over a sliding window exceeds the flood
-	// threshold (runaway commands such as `yes` or `cat /dev/urandom` are stopped
-	// within seconds), with a high lifetime cap as a backstop for slow leaks.
-	// watch-paced output (~1-5 KB/s) never trips either limit, so it streams
-	// indefinitely up to the idle timeout.
+	// long-running continuous commands (watch / top / tail -f), so the rate
+	// window is now the only blind kill: a stream stops when its sustained rate
+	// over the sliding window exceeds the flood threshold (runaway commands such
+	// as `yes` or `cat /dev/urandom` are stopped within seconds). Cumulative
+	// volume is governed by the quota challenge state machine instead
+	// (agentTerminalQuota* vars below), not by a blind kill. watch-paced output
+	// (~1-5 KB/s) never trips the rate limit, so it streams indefinitely up to
+	// the idle timeout.
 	agentTerminalOutputRateWindow = 5 * time.Second
 	agentTerminalOutputRateBytes  = 8 * 1024 * 1024
-	agentTerminalOutputCapBytes   = 256 * 1024 * 1024
 	agentTerminalIdleTimeout      = 30 * time.Minute
 
 	// agentAISessionResidentCap bounds how many AI session handles the agent
@@ -116,6 +119,35 @@ var (
 	agentAINoProgressWindow = resolveEnvDurationAllowZero("ALIANG_AI_NO_PROGRESS_WINDOW", 60*time.Minute)
 )
 
+// Terminal output quota challenge knobs (terminal.quota.* protocol, see
+// agent_terminal.go for the state machine that consumes them). Per spec §5.2
+// there is NO pause/resume gate: when a terminal stream's cumulative output
+// crosses agentTerminalQuotaCheckpointBytes the agent emits
+// terminal.quota.challenge_required and output KEEPS STREAMING; the server's
+// terminal.quota.resolved (granted) reply only clears the pending challenge —
+// it does not resume anything. An unanswered challenge kills the session once
+// output reaches the next checkpoint (kill_at_bytes, the checkpoint beyond
+// the challenge point); agentTerminalQuotaMaxBytes separately hard-kills
+// regardless of pending state.
+// agentTerminalQuotaMinInterval throttles how often a challenge may fire so a
+// noisy stream cannot spam the user. All three are package vars resolved once
+// at process start; tests shrink them by injecting policy values through the
+// quota-policy constructor rather than rewriting these vars.
+//
+//	ALIANG_TERMINAL_QUOTA_CHECKPOINT_MB           MiB per challenge checkpoint. Default 128.
+//	ALIANG_TERMINAL_QUOTA_MAX_MB                  hard cumulative cap in MiB; explicit "0" disables the whole quota mechanism. Default 512.
+//	ALIANG_TERMINAL_QUOTA_CHALLENGE_MIN_INTERVAL  minimum spacing between challenges (time.ParseDuration form). Default 30m.
+//
+// Invalid values fall back to the default (see envMiB / envMiBAllowZero /
+// resolveEnvDuration). For MAX_MB an explicit "0" is the documented off
+// switch; every other invalid input (blank, unparseable, negative, or above
+// the overflow guard) falls back to the default.
+var (
+	agentTerminalQuotaCheckpointBytes = envMiB("ALIANG_TERMINAL_QUOTA_CHECKPOINT_MB", 128)
+	agentTerminalQuotaMaxBytes        = envMiBAllowZero("ALIANG_TERMINAL_QUOTA_MAX_MB", 512)
+	agentTerminalQuotaMinInterval     = resolveEnvDuration("ALIANG_TERMINAL_QUOTA_CHALLENGE_MIN_INTERVAL", 30*time.Minute)
+)
+
 // resolveEnvDuration parses a Go duration from the env key, returning def when
 // the key is unset, blank, unparseable, or non-positive.
 func resolveEnvDuration(key string, def time.Duration) time.Duration {
@@ -143,6 +175,35 @@ func resolveEnvDurationAllowZero(key string, def time.Duration) time.Duration {
 		return def
 	}
 	return d
+}
+
+// envMiB reads an env key holding a MiB count and returns the corresponding
+// byte value (MiB × 1024 × 1024). def is the fallback, likewise expressed in
+// MiB. Unset, blank, unparseable, non-positive, or overflow-range values (a
+// MiB count whose byte conversion would not fit in int64, i.e. ≥ 8 TiB — a
+// silently negative cap would kill a session on its first byte) use def.
+func envMiB(key string, def int64) int64 {
+	mib := def
+	if raw := strings.TrimSpace(os.Getenv(key)); raw != "" {
+		if v, err := strconv.ParseInt(raw, 10, 64); err == nil && v > 0 && v <= math.MaxInt64/(1024*1024) {
+			mib = v
+		}
+	}
+	return mib * 1024 * 1024
+}
+
+// envMiBAllowZero is envMiB but accepts an explicit "0" as a meaningful value —
+// the documented way to disable a byte-quota guard entirely (0 bytes = no
+// cap). Any other invalid input — blank, unparseable, negative, or in the
+// overflow range — falls back to def (MiB).
+func envMiBAllowZero(key string, def int64) int64 {
+	mib := def
+	if raw := strings.TrimSpace(os.Getenv(key)); raw != "" {
+		if v, err := strconv.ParseInt(raw, 10, 64); err == nil && v >= 0 && v <= math.MaxInt64/(1024*1024) {
+			mib = v
+		}
+	}
+	return mib * 1024 * 1024
 }
 
 // resolveAgentAuthorizedCWD confines remote execution to project directories

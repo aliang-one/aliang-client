@@ -54,6 +54,68 @@ func TestAgentAITimeoutDefaults(t *testing.T) {
 	}
 }
 
+// TestEnvMiB covers the env-to-MiB byte resolution used by the terminal quota
+// knobs, including the int64 overflow guard: a MiB count whose byte conversion
+// would wrap negative must fall back to the default instead of producing a
+// negative cap that kills a session on its first byte.
+func TestEnvMiB(t *testing.T) {
+	const key = "ALIANG_TEST_ENV_MIB"
+	cases := []struct {
+		name string
+		env  string
+		def  int64
+		want int64
+	}{
+		{"unset returns default", "", 128, 128 << 20},
+		{"blank returns default", "   ", 128, 128 << 20},
+		{"valid value parsed to bytes", "64", 128, 64 << 20},
+		{"unparseable returns default", "garbage", 512, 512 << 20},
+		{"zero returns default", "0", 128, 128 << 20},
+		{"negative returns default", "-5", 128, 128 << 20},
+		{"max int64 overflows to default", "9223372036854775807", 512, 512 << 20},
+		{"one past the overflow guard", "8796093022208", 512, 512 << 20}, // 8 TiB
+		{"largest in-range value", "8796093022207", 512, 8796093022207 << 20},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv(key, test.env)
+			if got := envMiB(key, test.def); got != test.want {
+				t.Fatalf("envMiB(%q, %d) with env %q = %d, want %d", key, test.def, test.env, got, test.want)
+			}
+		})
+	}
+}
+
+// TestEnvMiBAllowZero is TestEnvMiB for the allow-zero variant: an explicit
+// "0" is the documented off switch (0 bytes = no cap) and must survive as a
+// real value; every other invalid input falls back to the default.
+func TestEnvMiBAllowZero(t *testing.T) {
+	const key = "ALIANG_TEST_ENV_MIB_ALLOW_ZERO"
+	cases := []struct {
+		name string
+		env  string
+		def  int64
+		want int64
+	}{
+		{"unset returns default", "", 512, 512 << 20},
+		{"blank returns default", " ", 512, 512 << 20},
+		{"explicit zero disables the cap", "0", 512, 0},
+		{"valid value parsed to bytes", "1", 512, 1 << 20},
+		{"unparseable returns default", "12ab", 512, 512 << 20},
+		{"negative returns default", "-1", 512, 512 << 20},
+		{"one past the overflow guard", "8796093022208", 512, 512 << 20}, // 8 TiB
+		{"max int64 overflows to default", "9223372036854775807", 512, 512 << 20},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv(key, test.env)
+			if got := envMiBAllowZero(key, test.def); got != test.want {
+				t.Fatalf("envMiBAllowZero(%q, %d) with env %q = %d, want %d", key, test.def, test.env, got, test.want)
+			}
+		})
+	}
+}
+
 func TestResolveAgentAuthorizedCWDConfinesExecution(t *testing.T) {
 	root := t.TempDir()
 	child := filepath.Join(root, "project")

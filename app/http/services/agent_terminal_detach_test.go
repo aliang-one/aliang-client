@@ -365,8 +365,8 @@ func TestDetachedOutputDoesNotExtendLife(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatalf("detached session must be reaped despite ongoing output (input timer rules)")
 		}
-		if m.acceptTerminalOutput("t-out", 16) {
-			t.Fatalf("16-byte paced output must not trip the flood limiter")
+		if rate, act := m.recordTerminalOutput("t-out", 16); rate || act.kind != "" {
+			t.Fatalf("16-byte paced output must not trip the rate gate or issue a challenge (rate=%t action=%q)", rate, act.kind)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
