@@ -109,6 +109,13 @@ type agentTerminalSession struct {
 	lastActiveAt time.Time
 	lastInputAt  time.Time
 
+	// killClaimed dedups kill frames across concurrent output-path kills
+	// (guarded by the manager mutex): a terminal.quota.resolved denied verdict
+	// can land between the copy loop's meter record and the kill it then
+	// performs, and exactly one of the racing paths may frame and kill. It is
+	// never reset — once a session is on its way out, later kills stay silent.
+	killClaimed bool
+
 	rows int
 	cols int
 
@@ -428,6 +435,33 @@ func (m *agentTerminalManager) close(msg map[string]interface{}, writeJSON agent
 	session.kill()
 }
 
+// quotaResolved applies a terminal.quota.resolved verdict (spec §5.2 rule 5,
+// §6.2): the human's answer is the only redemption for a pending challenge.
+// granted clears pending silently (a challenge never blocked the stream, so
+// there is nothing to resume); denied kills with the quota_denied reason. A
+// seq that does not match the pending challenge is ignored, and a session that
+// is already gone swallows the verdict silently — its challenge is moot.
+// Lock discipline: get-then-act — fetch the session under m.mu, touch the
+// meter with m.mu released; no path may hold meter.mu while taking m.mu.
+func (m *agentTerminalManager) quotaResolved(msg map[string]interface{}, writeJSON agentTerminalWriter) {
+	if writeJSON == nil {
+		return
+	}
+	sessionID := remoteString(msg, "session_id")
+	if sessionID == "" {
+		_ = writeJSON(agentTerminalErrorPayload("", errors.New("terminal.quota.resolved missing session_id")))
+		return
+	}
+	session := m.get(sessionID)
+	if session == nil || session.meter == nil {
+		return
+	}
+	granted := remoteString(msg, "verdict") == "granted"
+	if action := session.meter.resolveQuota(uint64(remoteInt(msg, "seq", 0)), granted); action.kind == quotaActionKillDenied {
+		m.killTerminalSession(sessionID, errTerminalQuotaDenied, writeJSON)
+	}
+}
+
 func (m *agentTerminalManager) closeAll() {
 	m.mu.Lock()
 	sessions := make([]*agentTerminalSession, 0, len(m.sessions))
@@ -604,22 +638,60 @@ func (m *agentTerminalManager) touchInput(sessionID string) {
 	}
 }
 
-// acceptTerminalOutput records n bytes of output for the session, refreshing its
-// idle timer, and reports whether the stream has tripped the flood limiter (in
-// which case the caller should terminate the session). Continuous, human-paced
-// output such as `watch` never trips it; only runaway floods do.
-func (m *agentTerminalManager) acceptTerminalOutput(sessionID string, n int) bool {
+// recordTerminalOutput records n bytes of output for the session, refreshing
+// its idle timer, and folds the rate window and the quota challenge state
+// machine into the meter's single locked evaluation (record, spec §5.2). It
+// reports the rate verdict first: a rate trip means the caller kills for the
+// flood — unredeemable by any ack (spec §5.3) — and must NOT perform the
+// returned action. Continuous, human-paced output such as `watch` never trips
+// the rate gate; only runaway floods do. Lock nesting mirrors the old
+// acceptTerminalOutput: m.mu outer, meter.mu inner — never the reverse (see
+// the B4 wiring notes on record).
+func (m *agentTerminalManager) recordTerminalOutput(sessionID string, n int) (bool, quotaAction) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	session := m.sessions[sessionID]
 	if session == nil {
-		return false
+		return false, quotaAction{}
 	}
 	session.lastActiveAt = time.Now()
 	if session.meter == nil {
+		return false, quotaAction{}
+	}
+	return session.meter.record(n, time.Now())
+}
+
+// claimTerminalKill atomically reserves the right to emit a terminal kill frame
+// for the session and execute the kill: the first caller wins, every racing
+// loser stays silent (a terminal.quota.resolved denied verdict landing between
+// the copy loop's meter record and its kill — or the reverse), so the user sees
+// exactly one kill frame per session. A session missing from the live map
+// (reaped by waitTerminal / close / closeAll) also loses. Mirrors the
+// watchTerminalIdle pattern: decide under m.mu, act outside it.
+func (m *agentTerminalManager) claimTerminalKill(sessionID string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	session := m.sessions[sessionID]
+	if session == nil || session.killClaimed {
 		return false
 	}
-	return session.meter.add(n, time.Now())
+	session.killClaimed = true
+	return true
+}
+
+// killTerminalSession is the shared shape of every output-path kill (flood,
+// the three quota reasons, a denied verdict): claim the kill, emit the reason
+// frame, then terminate the session. Losing the claim means a concurrent path
+// already framed and killed — return without a word. Killing stays outside the
+// lock, matching every other kill path in this file.
+func (m *agentTerminalManager) killTerminalSession(sessionID string, err error, writeJSON agentTerminalWriter) {
+	if !m.claimTerminalKill(sessionID) {
+		return
+	}
+	_ = writeJSON(agentTerminalErrorPayload(sessionID, err))
+	if session := m.get(sessionID); session != nil {
+		session.kill()
+	}
 }
 
 func (m *agentTerminalManager) copyTerminalOutput(sessionID string, reader io.Reader, writeJSON agentTerminalWriter) {
@@ -628,15 +700,49 @@ func (m *agentTerminalManager) copyTerminalOutput(sessionID string, reader io.Re
 	for {
 		n, err := reader.Read(buf)
 		if n > 0 {
-			if m.acceptTerminalOutput(sessionID, n) {
+			// One locked evaluation covers the rate window AND the quota
+			// challenge state machine. Rate wins (spec §5.3: a flood is not
+			// redeemable by an ack), so on a rate trip the quota action is
+			// dropped without being performed.
+			rateTripped, action := m.recordTerminalOutput(sessionID, n)
+			if rateTripped {
 				// Rate-only reason: cumulative volume is no longer a blind
 				// kill — it is governed by the quota challenge machine.
-				_ = writeJSON(agentTerminalErrorPayload(sessionID, fmt.Errorf(
+				m.killTerminalSession(sessionID, fmt.Errorf(
 					"terminal output flood limit exceeded (max %d bytes per %s)",
-					agentTerminalOutputRateBytes, agentTerminalOutputRateWindow)))
-				if session := m.get(sessionID); session != nil {
-					session.kill()
-				}
+					agentTerminalOutputRateBytes, agentTerminalOutputRateWindow), writeJSON)
+				return
+			}
+			switch action.kind {
+			case quotaActionIssue:
+				// A challenge never blocks the stream (spec §5.2 rule 4):
+				// best-effort control-plane frame — not ringed, not held by
+				// the output gate — and the bytes below still flow to
+				// ring+live. A failed send does not roll the state machine
+				// back: output keeps accumulating and converges at the kill
+				// point.
+				_ = writeJSON(map[string]interface{}{
+					"type":          models.AgentEventTerminalQuotaChallengeRequired,
+					"session_id":    sessionID,
+					"seq":           action.seq,
+					"used_bytes":    action.usedBytes,
+					"kill_at_bytes": action.killAtBytes,
+					"max_bytes":     action.maxBytes,
+				})
+			case quotaActionKillUnanswered:
+				m.killTerminalSession(sessionID, fmt.Errorf(
+					"quota_unanswered: output quota exhausted (unanswered checkpoint %d bytes) — for long-running noisy commands use: <cmd> > log 2>&1",
+					action.killAtBytes), writeJSON)
+				return
+			case quotaActionKillHardCap:
+				m.killTerminalSession(sessionID, fmt.Errorf(
+					"quota_hard_cap: output quota exhausted (hard cap %d bytes) — for long-running noisy commands use: <cmd> > log 2>&1",
+					action.killAtBytes), writeJSON)
+				return
+			case quotaActionKillDenied:
+				// record never reports denied (only resolveQuota does); kept
+				// so a future meter change cannot silently fall through.
+				m.killTerminalSession(sessionID, errTerminalQuotaDenied, writeJSON)
 				return
 			}
 			if chunk := enc.push(buf[:n]); len(chunk) > 0 {
@@ -981,6 +1087,12 @@ const (
 	quotaActionKillDenied     = "kill_denied"     // human rejected the challenge
 )
 
+// errTerminalQuotaDenied is the kill reason for a human-rejected challenge
+// (spec §5.2 rule 5). The reason prefixes — quota_unanswered / quota_denied /
+// quota_hard_cap — are a cross-repo contract: the phone humanizes terminal
+// errors by matching the "quota_" prefix, so they must stay verbatim.
+var errTerminalQuotaDenied = errors.New("quota_denied: output quota challenge denied by user")
+
 // quotaAction is the verdict of one quota evaluation. The caller (terminal
 // output copy loop) performs the kill / emits the challenge; the meter only
 // reports.
@@ -989,6 +1101,7 @@ type quotaAction struct {
 	seq         uint64
 	usedBytes   int64
 	killAtBytes int64 // for issue: where an unanswered kill will fire; for byte-triggered kills: the threshold that fired
+	maxBytes    int64 // carried on issue for the challenge frame's max_bytes (spec §6.1); NOT a kill point — distinct from killAtBytes
 }
 
 // newTerminalOutputMeter builds the terminal flavor of the meter: a pure rate
@@ -1055,7 +1168,9 @@ func (m *outputMeter) record(n int, now time.Time) (bool, quotaAction) {
 //  4. !pending && total >= nextChallengeBytes && now-lastChallengeAt >=
 //     minInterval → issue: seq++, nextChallengeBytes += checkpointBytes,
 //     lastChallengeAt = now, pending = true. A challenge does NOT block
-//     output — the stream keeps going; only a kill point stops it.
+//     output — the stream keeps going; only a kill point stops it. The action
+//     carries maxBytes so the caller can fill the challenge frame's max_bytes
+//     (spec §6.1) from the same locked evaluation.
 //  5. otherwise no action.
 func (m *outputMeter) consumeQuotaLocked(now time.Time) quotaAction {
 	q := m.quota
@@ -1073,7 +1188,7 @@ func (m *outputMeter) consumeQuotaLocked(now time.Time) quotaAction {
 		q.nextChallengeBytes += q.checkpointBytes
 		q.lastChallengeAt = now
 		q.pending = true
-		return quotaAction{kind: quotaActionIssue, seq: q.seq, usedBytes: m.total, killAtBytes: q.nextChallengeBytes}
+		return quotaAction{kind: quotaActionIssue, seq: q.seq, usedBytes: m.total, killAtBytes: q.nextChallengeBytes, maxBytes: q.maxBytes}
 	}
 	return quotaAction{}
 }
