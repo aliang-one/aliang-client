@@ -25,6 +25,24 @@ import (
 // 握手路径 2026-10-02 起补齐 —— 此前"服务器滚动→握手401→永久离线"双实证。
 var remoteWSAuthRecovery = auth.RecoverOrExpireLocalSession
 
+// handshakeRetryDelay 握手 401 连发时的重拨退避:2s 起步指数翻倍,60s 封顶。
+// 凭据刷新成功后下一次拨号即成功,连击自然归零;避免刷新持续失败期间固定
+// 2s 轮询高频打 auth 端点并刷屏日志。
+func handshakeRetryDelay(streak int) time.Duration {
+	if streak < 1 {
+		streak = 1
+	}
+	shift := streak - 1
+	if shift > 5 {
+		shift = 5
+	}
+	delay := 2 * time.Second << uint(shift)
+	if delay > 60*time.Second || delay <= 0 {
+		return 60 * time.Second
+	}
+	return delay
+}
+
 // agentBootReconnectGrace is how long the user agent waits for a session-owner
 // push after boot before attempting the connection from persisted state.
 const agentBootReconnectGrace = 15 * time.Second
@@ -103,6 +121,7 @@ func (s *AgentService) remoteConnectionLoop() {
 		s.wsMu.Unlock()
 	}()
 
+	handshake401Streak := 0
 	for {
 		identity, shouldRun := s.remoteConnectionSnapshot()
 		if !shouldRun {
@@ -130,7 +149,8 @@ func (s *AgentService) remoteConnectionLoop() {
 		if err != nil {
 			if resp != nil && resp.StatusCode == http.StatusUnauthorized {
 				if s.handleHandshakeUnauthorized() {
-					time.Sleep(2 * time.Second)
+					handshake401Streak += 1
+					time.Sleep(handshakeRetryDelay(handshake401Streak))
 					continue
 				}
 				return
@@ -143,6 +163,7 @@ func (s *AgentService) remoteConnectionLoop() {
 
 		s.setActiveRemoteConnection(conn)
 		s.setRemoteConnectionState(true, "online", "")
+		handshake401Streak = 0
 		logger.Info(fmt.Sprintf("[AGENT-BOOT] remote_connection connected endpoint=%s", sanitizeAgentEndpoint(wsURL)))
 
 		if err := s.runRemoteAgentSession(conn); err != nil {
