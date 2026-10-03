@@ -653,7 +653,20 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 			_ = writeJSON(agentTerminalErrorPayload(remoteString(msg, "session_id"), errors.New("remote terminal is disabled for this device")))
 			return
 		}
-		s.terminal.create(msg, writeJSON)
+		// create leaves the read loop entirely: an attach replay (up to
+		// 2MiB of scrollback as 64KiB frames, all sent under the session's
+		// outputGate) used to block every subsequent message on this
+		// connection — typing during a replay stalled, AI acks stalled, and
+		// the 10s write deadline amplified it. The creating registry is
+		// registered SYNCHRONOUSLY here (see beginCreate) so the very next
+		// inline terminal.input can wait for the create instead of erroring;
+		// terminal.input/resize/close themselves stay inline — input order
+		// is contractual.
+		release := s.terminal.beginCreate(remoteString(msg, "session_id"))
+		safeGo("terminal.create", func() {
+			defer release()
+			s.terminal.create(msg, writeJSON)
+		})
 	case models.AgentEventTerminalInput:
 		s.setRemoteConnectionState(true, "online", "")
 		if !s.remoteTerminalEnabled() {

@@ -151,7 +151,7 @@ func TestReplayGateExcludesLiveChunksDuringSnapshot(t *testing.T) {
 	replayDone := make(chan struct{})
 	go func() {
 		defer close(replayDone)
-		m.sendReplay("t-seam", ring, terminalReplayStatusLive, &live.outputGate, write)
+		m.sendReplay("t-seam", ring, terminalReplayStatusLive, &live.outputGate, "", write)
 	}()
 	<-firstReplayOut // snapshot taken, gate held, replay stalled mid-send
 

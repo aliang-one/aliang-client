@@ -15,7 +15,13 @@ import (
 	"unicode/utf8"
 
 	"aliang.one/nursorgate/app/http/models"
+	"aliang.one/nursorgate/common/logger"
 )
+
+// agentTerminalSlowWriteLogThreshold gates the content-free slow-path logs
+// (PTY input write, live output writeJSON wait): above it we log wait_ms and
+// byte count only — never the data itself.
+const agentTerminalSlowWriteLogThreshold = 20 * time.Millisecond
 
 // errPTYUnsupported is returned by startAgentPTY when the current platform cannot
 // allocate a real pseudo-terminal. The caller falls back to plain stdin/stdout
@@ -88,6 +94,14 @@ type agentTerminalManager struct {
 	sessions map[string]*agentTerminalSession
 	history  map[string]*agentTerminalHistory
 
+	// creating tracks in-flight terminal.create attempts so a terminal.input
+	// that races a create waits instead of erroring: the phone registers a
+	// placeholder and its keyboard is live BEFORE terminal.created comes back,
+	// and once create left the read loop its completion no longer serializes
+	// against the inline input handler. Keyed by session id; the channel closes
+	// when the attempt finishes (see beginCreate / waitForCreate).
+	creating map[string]chan struct{}
+
 	startProcess agentTerminalProcessStarter
 }
 
@@ -144,6 +158,7 @@ func newAgentTerminalManager() *agentTerminalManager {
 	m := &agentTerminalManager{
 		sessions:     make(map[string]*agentTerminalSession),
 		history:      make(map[string]*agentTerminalHistory),
+		creating:     make(map[string]chan struct{}),
 		startProcess: startAgentTerminalProcess,
 	}
 	// Tombstone TTL sweeper: runs for the life of the process (there is no
@@ -151,6 +166,56 @@ func newAgentTerminalManager() *agentTerminalManager {
 	// tombstone's output ring (~2 MiB a piece).
 	go m.sweepHistoryLoop()
 	return m
+}
+
+// agentTerminalCreateWaitTimeout bounds how long terminal.input waits for an
+// in-flight create. A var (not const) so tests can shorten it.
+var agentTerminalCreateWaitTimeout = 2 * time.Second
+
+// beginCreate marks sessionID as creating. The ws read loop calls this
+// SYNCHRONOUSLY before handing create to a goroutine — registering inside the
+// goroutine would leave a scheduling window where an immediately-following
+// terminal.input finds nothing to wait for. Returns the release func the
+// caller MUST invoke when the create attempt finishes. Idempotent: a duplicate
+// create shares the in-flight marker and its release is a no-op.
+func (m *agentTerminalManager) beginCreate(sessionID string) func() {
+	if sessionID == "" {
+		return func() {}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if ch, ok := m.creating[sessionID]; ok {
+		_ = ch
+		return func() {}
+	}
+	ch := make(chan struct{})
+	m.creating[sessionID] = ch
+	var closeOnce sync.Once
+	return func() {
+		m.mu.Lock()
+		if m.creating[sessionID] == ch {
+			delete(m.creating, sessionID)
+		}
+		m.mu.Unlock()
+		closeOnce.Do(func() { close(ch) })
+	}
+}
+
+// waitForCreate reports whether an in-flight create for sessionID settled
+// within the timeout. Bounded by design: the caller runs on the read loop.
+func (m *agentTerminalManager) waitForCreate(sessionID string, timeout time.Duration) bool {
+	m.mu.Lock()
+	ch, ok := m.creating[sessionID]
+	m.mu.Unlock()
+	if !ok {
+		return false
+	}
+	select {
+	case <-ch:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
 }
 
 func (m *agentTerminalManager) create(msg map[string]interface{}, writeJSON agentTerminalWriter) {
@@ -165,16 +230,20 @@ func (m *agentTerminalManager) create(msg map[string]interface{}, writeJSON agen
 
 	rows := normalizeTerminalDimension(remoteInt(msg, "rows", 24), 24)
 	cols := normalizeTerminalDimension(remoteInt(msg, "cols", 80), 80)
+	// attach_token(server 生成,server 原样回显消费):agent 不解释,只在
+	// 该次 attach 的每个 terminal.replay 帧上透传。空值 = 旧 server/REST
+	// 路径,帧保持字节级不变。
+	attachToken := remoteString(msg, "attach_token")
 
 	// attach:true prefers re-attaching to existing state (a live session, then
 	// a tombstone) over spawning a fresh shell. When neither exists the request
 	// falls through to the regular fresh-create path below, and a create
 	// without attach keeps the exact pre-attach behavior (already-exists error).
 	if remoteBool(msg, "attach", false) {
-		if m.attachLive(sessionID, rows, cols, writeJSON) {
+		if m.attachLive(sessionID, rows, cols, attachToken, writeJSON) {
 			return
 		}
-		if m.attachHistory(sessionID, writeJSON) {
+		if m.attachHistory(sessionID, attachToken, writeJSON) {
 			return
 		}
 	}
@@ -246,7 +315,7 @@ func (m *agentTerminalManager) create(msg map[string]interface{}, writeJSON agen
 // attachLive re-attaches to a live session: resize first (so a TUI redraws via
 // SIGWINCH), then replay the scrollback, then confirm with
 // terminal.created{resumed:true}. It reports whether the attach happened.
-func (m *agentTerminalManager) attachLive(sessionID string, rows, cols int, writeJSON agentTerminalWriter) bool {
+func (m *agentTerminalManager) attachLive(sessionID string, rows, cols int, attachToken string, writeJSON agentTerminalWriter) bool {
 	m.mu.Lock()
 	session := m.sessions[sessionID]
 	if session != nil {
@@ -268,7 +337,7 @@ func (m *agentTerminalManager) attachLive(sessionID string, rows, cols int, writ
 	if session.resizer != nil {
 		_ = session.resizer(rows, cols)
 	}
-	m.sendReplay(sessionID, session.ring, terminalReplayStatusLive, &session.outputGate, writeJSON)
+	m.sendReplay(sessionID, session.ring, terminalReplayStatusLive, &session.outputGate, attachToken, writeJSON)
 	_ = writeJSON(map[string]interface{}{
 		"type":       models.AgentEventTerminalCreated,
 		"session_id": sessionID,
@@ -286,7 +355,7 @@ func (m *agentTerminalManager) attachLive(sessionID string, rows, cols int, writ
 // status "exited" and confirm with terminal.created{resumed:false, exited:true}
 // built from the tombstone metadata — without spawning a new shell. It reports
 // whether a tombstone was served.
-func (m *agentTerminalManager) attachHistory(sessionID string, writeJSON agentTerminalWriter) bool {
+func (m *agentTerminalManager) attachHistory(sessionID string, attachToken string, writeJSON agentTerminalWriter) bool {
 	m.mu.Lock()
 	tomb := m.history[sessionID]
 	m.mu.Unlock()
@@ -294,7 +363,7 @@ func (m *agentTerminalManager) attachHistory(sessionID string, writeJSON agentTe
 		return false
 	}
 	// A tombstone ring has no live writers, so no output gate is needed.
-	m.sendReplay(sessionID, tomb.ring, terminalReplayStatusExited, nil, writeJSON)
+	m.sendReplay(sessionID, tomb.ring, terminalReplayStatusExited, nil, attachToken, writeJSON)
 	_ = writeJSON(map[string]interface{}{
 		"type":       models.AgentEventTerminalCreated,
 		"session_id": sessionID,
@@ -370,12 +439,29 @@ func (m *agentTerminalManager) write(msg map[string]interface{}, writeJSON agent
 
 	session := m.get(sessionID)
 	if session == nil {
-		_ = writeJSON(agentTerminalErrorPayload(sessionID, fmt.Errorf("terminal session not found: %s", sessionID)))
-		return
+		// Fresh-spawn race: the phone can type before terminal.created comes
+		// back (placeholder registered, keyboard live). With create now off
+		// the read loop, wait briefly for the in-flight attempt to settle;
+		// past the timeout fall through to the legacy not-found error so a
+		// genuinely dead session id never wedges the read loop.
+		if m.waitForCreate(sessionID, agentTerminalCreateWaitTimeout) {
+			session = m.get(sessionID)
+		}
+		if session == nil {
+			_ = writeJSON(agentTerminalErrorPayload(sessionID, fmt.Errorf("terminal session not found: %s", sessionID)))
+			return
+		}
 	}
 	m.touchInput(sessionID)
+	writeStart := time.Now()
 	if _, err := io.WriteString(session.input, data); err != nil {
 		_ = writeJSON(agentTerminalErrorPayload(sessionID, err))
+		return
+	}
+	// Content-free timing (bytes count only, never the data itself): a slow
+	// PTY write is exactly the kind of tail this instrumentation exists for.
+	if d := time.Since(writeStart); d > agentTerminalSlowWriteLogThreshold {
+		logger.Warn(fmt.Sprintf("[AGENT-BOOT] terminal_input slow_write wait_ms=%d bytes=%d", d.Milliseconds(), len(data)))
 	}
 }
 
@@ -777,7 +863,14 @@ func (m *agentTerminalManager) copyTerminalOutput(sessionID string, reader io.Re
 				if session := m.get(sessionID); session != nil && session.ring != nil {
 					session.outputGate.Lock()
 					session.ring.push(chunk)
+					liveWriteStart := time.Now()
 					_ = writeJSON(frame)
+					// The shared connection writer (writeMu, 10s deadline) is
+					// where AI streaming / heartbeats stall terminal echo —
+					// this wait is the agent-side half of the story.
+					if d := time.Since(liveWriteStart); d > agentTerminalSlowWriteLogThreshold {
+						logger.Warn(fmt.Sprintf("[AGENT-BOOT] terminal_output slow_writer wait_ms=%d bytes=%d", d.Milliseconds(), len(chunk)))
+					}
 					session.outputGate.Unlock()
 				} else {
 					// Session already reaped (or ring-less): keep the legacy

@@ -375,14 +375,14 @@ func TestSendReplayChunksLargeRingAndEmitsFinalFrameForEmptyRing(t *testing.T) {
 
 	// Empty ring: exactly one final:true frame with empty data (seq 0).
 	ring := newTerminalRingBuffer(1 << 20)
-	m.sendReplay("t-empty", ring, terminalReplayStatusLive, nil, write)
+	m.sendReplay("t-empty", ring, terminalReplayStatusLive, nil, "", write)
 
 	// Ring slightly over one 64KiB chunk: two frames, seq 0/1, only the last
 	// final, data concatenating back to the full snapshot.
 	big := bytes.Repeat([]byte("x"), agentTerminalReplayChunkBytes+7)
 	ringBig := newTerminalRingBuffer(4 << 20)
 	ringBig.push(big)
-	m.sendReplay("t-big", ringBig, terminalReplayStatusExited, nil, write)
+	m.sendReplay("t-big", ringBig, terminalReplayStatusExited, nil, "", write)
 
 	var emptyFrames, bigFrames []map[string]interface{}
 	for _, p := range coll.ofTypes(models.AgentEventTerminalReplay) {
@@ -437,7 +437,7 @@ func TestSendReplayDoesNotSplitMultiByteRuneAcrossChunks(t *testing.T) {
 	snap := append(bytes.Repeat([]byte("x"), agentTerminalReplayChunkBytes-1), []byte("你好 tail")...)
 	ring := newTerminalRingBuffer(4 << 20)
 	ring.push(snap)
-	m.sendReplay("t-utf8", ring, terminalReplayStatusLive, nil, write)
+	m.sendReplay("t-utf8", ring, terminalReplayStatusLive, nil, "", write)
 
 	frames := coll.ofTypes(models.AgentEventTerminalReplay)
 	if len(frames) < 2 {
@@ -486,7 +486,7 @@ func TestSendReplayHoldsOutputGateAcrossSend(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		m.sendReplay("t-gate", ring, terminalReplayStatusLive, &gate, write)
+		m.sendReplay("t-gate", ring, terminalReplayStatusLive, &gate, "", write)
 	}()
 
 	select {
