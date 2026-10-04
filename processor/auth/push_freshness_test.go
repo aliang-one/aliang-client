@@ -27,7 +27,7 @@ func stubPushFreshness(t *testing.T, info *UserInfo, owner bool, refresh func() 
 }
 
 func TestEnsureFreshAccessTokenForPushRefreshesNearExpiryToken(t *testing.T) {
-	// ExpiresIn 15min, lead 10min, now = 8min after update → inside lead window.
+	// ExpiresIn 15min, lead 2h, now = 8min after update → remaining 7min, inside lead window.
 	now := time.Date(2026, 9, 22, 12, 0, 0, 0, time.UTC)
 	updated := now.Add(-8 * time.Minute)
 	info := &UserInfo{AccessToken: "stale-token", TokenType: "Bearer", ExpiresIn: 15 * 60, UpdatedAt: updated}
@@ -52,9 +52,9 @@ func TestEnsureFreshAccessTokenForPushRefreshesNearExpiryToken(t *testing.T) {
 }
 
 func TestEnsureFreshAccessTokenForPushSkipsFreshToken(t *testing.T) {
-	// ExpiresIn 60min, now = 1min after update → far from expiry.
+	// ExpiresIn 4h (lead 2h), now = 1min after update → remaining ~3h59m, far from expiry.
 	now := time.Date(2026, 9, 22, 12, 0, 0, 0, time.UTC)
-	info := &UserInfo{AccessToken: "tok", TokenType: "Bearer", ExpiresIn: 60 * 60, UpdatedAt: now.Add(-time.Minute)}
+	info := &UserInfo{AccessToken: "tok", TokenType: "Bearer", ExpiresIn: 4 * 60 * 60, UpdatedAt: now.Add(-time.Minute)}
 	refreshed := 0
 	stubPushFreshness(t, info, true, func() (*UserInfo, error) {
 		refreshed++

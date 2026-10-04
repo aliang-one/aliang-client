@@ -22,8 +22,11 @@ type TokenRefresher struct {
 const (
 	// 默认刷新间隔（1分钟）
 	defaultRefreshDuration = 1 * time.Minute
-	// access token 剩余 10 分钟时开始刷新
-	tokenRefreshLeadTime = 10 * time.Minute
+	// access token 剩余 2 小时时开始刷新。旧值 10 分钟意味着每 24h 只有一个
+	// 10 分钟的续期窗口,一次网络抖动/进程不在线就错过,本地会话直接过期
+	// (2026-10-04 liang-dev refresh_invalid 事故的放大器);2h 窗口给 1 分钟
+	// tick 留出 ~120 次重试余量。
+	tokenRefreshLeadTime = 2 * time.Hour
 )
 
 // NewTokenRefresher 创建新的Token刷新器

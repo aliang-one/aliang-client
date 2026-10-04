@@ -176,8 +176,8 @@ func finalizeAuthenticatedSessionWithOperation(operation *SessionOperation, acce
 // ActivateWithTokens 用扫码登录拿到的本地令牌完成登录收尾。
 // accessToken 和兼容字段 refreshToken 都由 official-website 签发；sub2api
 // token 始终留在服务端 broker 中。
-// upstreamExpiresIn 是扫码状态响应透传的上游 access JWT 真实剩余秒数；>0 时优先于
-// scanAccessTokenTTLSeconds 常量作刷新计时锚（旧服务端缺省 → 0 → 回退常量），
+// upstreamExpiresIn 是扫码状态响应透传的上游 access JWT 真实剩余秒数；与
+// scanAccessTokenTTLSeconds 常量取较小者作刷新计时锚（旧服务端缺省 → 0 → 回退常量），
 // 与 LoginWithPassword/RefreshSession 的 effectiveRefreshExpiresIn 语义一致。
 // 与 LoginWithPassword 走同一条 finalizeAuthenticatedSession，故扫码后状态与密码登录等价。
 func ActivateWithTokens(accessToken, refreshToken string, upstreamExpiresIn int) (*UserInfo, error) {
@@ -512,14 +512,24 @@ type authTokenEnvelope struct {
 	Message string `json:"message"`
 }
 
-// effectiveRefreshExpiresIn 返回刷新计时应采用的剩余秒数。账号服务在 data 里
-// 额外给出 upstream_expires_in（上游 sub2api access JWT 的真实剩余寿命）时优先采用——
-// expires_in 只是本地 st_ 会话的滚动 TTL，与上游凭据真实过期时间脱节（2026-09-20 事故根因）。
+// effectiveRefreshExpiresIn 返回刷新计时应采用的剩余秒数：本地滚动会话 TTL 与
+// 上游真实剩余寿命两个正值中的较小者——例行刷新必须赶在两者中先死的那个之前。
+// 只看本地会退回 2026-09-20 事故（上游 ~7.5h 短票被当 24h 计时，全天零次刷新）；
+// 无条件优先上游则退回 2026-10-04 事故（liang-dev：服务端 v1.0.49+ 的本地 st_
+// 会话 24h 滚动过期，上游 6.7 天 TTL 被当成本地会话 TTL，例行续期永不发生，
+// 死凭据撞上第一个鉴权请求才落 refresh_invalid）。一方缺失（≤0）时用另一方；
+// 双双缺失返回 0，由调用方回退常量。
 func effectiveRefreshExpiresIn(expiresIn, upstreamExpiresIn int) int {
-	if upstreamExpiresIn > 0 {
+	switch {
+	case expiresIn <= 0:
 		return upstreamExpiresIn
+	case upstreamExpiresIn <= 0:
+		return expiresIn
+	case upstreamExpiresIn < expiresIn:
+		return upstreamExpiresIn
+	default:
+		return expiresIn
 	}
-	return expiresIn
 }
 
 func buildUserInfoFromProfile(profile *UserProfile) *UserInfo {

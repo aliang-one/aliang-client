@@ -5,17 +5,34 @@ import (
 	"testing"
 )
 
-// RestoreSession 成功路径直接返回 RefreshSession 的结果，
-// 故恢复/注入会话自动获得上游锚点；这是对 2026-09-20 事故（13:41 恢复后被错误计时）的回归防线。
-func TestEffectiveRefreshExpiresInPrefersUpstreamAnchor(t *testing.T) {
+// TestEffectiveRefreshExpiresInTakesMinimum 是两起事故的合并回归防线:
+//   - 2026-09-20:本地滚动 TTL 与上游真实寿命脱节,只看本地会把 ~7.5h 的上游
+//     短票当 24h 计时,全天零次刷新 → 刷新必须锚上游剩余寿命。
+//   - 2026-10-04(liang-dev):服务端 v1.0.49+ 改为「本地 st_ 滚动 24h 会话 +
+//     upstream_expires_in 信息性锚点」后,无条件优先上游把 6.7 天的上游 TTL
+//     当成本地会话 TTL——本地会话 24h 就死,例行续期永不发生,直到死凭据撞上
+//     第一个鉴权请求落 refresh_invalid。刷新必须赶在两者中先死的那个之前,
+//     即取两个正值中的较小者。
+func TestEffectiveRefreshExpiresInTakesMinimum(t *testing.T) {
 	if got := effectiveRefreshExpiresIn(86400, 27000); got != 27000 {
-		t.Fatalf("upstream anchor should win: got %d", got)
+		t.Fatalf("shorter upstream anchor should win: got %d", got)
+	}
+	// 2026-10-04 事故现场:本地 24h(86400) vs 上游 ~6.7 天(575999)——
+	// 旧实现返回 575999,客户端按 6.7 天计时,本地会话 24h 必死。
+	if got := effectiveRefreshExpiresIn(86400, 575999); got != 86400 {
+		t.Fatalf("shorter local session TTL must win over multi-day upstream TTL: got %d", got)
+	}
+	if got := effectiveRefreshExpiresIn(27000, 575999); got != 27000 {
+		t.Fatalf("shorter local TTL wins regardless of order: got %d", got)
 	}
 	if got := effectiveRefreshExpiresIn(86400, 0); got != 86400 {
 		t.Fatalf("missing anchor must fall back to server expires_in: got %d", got)
 	}
 	if got := effectiveRefreshExpiresIn(86400, -5); got != 86400 {
 		t.Fatalf("invalid anchor must fall back: got %d", got)
+	}
+	if got := effectiveRefreshExpiresIn(0, 27000); got != 27000 {
+		t.Fatalf("missing expires_in must use the anchor: got %d", got)
 	}
 	if got := effectiveRefreshExpiresIn(0, 0); got != 0 {
 		t.Fatalf("both absent stays zero (caller falls back to constant): got %d", got)
