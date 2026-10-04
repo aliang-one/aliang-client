@@ -20,7 +20,9 @@ var (
 	// for tests. Defaults to auth.StartSoftExpiryRecovery.
 	softExpiryRecoveryStarter = auth.StartSoftExpiryRecovery
 	userAgentDisableRequester = RequestUserAgentDisableForSessionEnd
-	authRuntimeMu             sync.Mutex
+	// desktopNotifier 是会话过期桌面提醒的注入口(测试替身)。默认系统通知。
+	desktopNotifier = desktop.Notify
+	authRuntimeMu   sync.Mutex
 	// proxyPausedForSoftExpiry records that WE paused the ingress proxy on
 	// entering SoftExpired, so →Active resumes only what we paused (not a proxy
 	// the user never started).
@@ -112,10 +114,14 @@ func handleAuthExpired(reason auth.SessionReason) {
 	// previously left the proxy serving a dead token (cloud returning 401).
 	if runService.StopIngressIfActive() {
 		logger.Warn("Authentication expired, stopping ingress proxy")
-		desktop.Notify("aliang-gateway", "认证已过期，代理服务已停止，请重新登录")
 	} else {
 		logger.Debug("Authentication expired; no active ingress proxy to stop")
 	}
+	// 桌面提醒无条件发出(登出走 handleLoggedOut,不会到这里)。旧实现只在
+	// 代理确实在跑时才提醒:用户没开代理时会话死亡全程静默,agent 落
+	// refresh_invalid 粘性禁用也无人知晓(2026-10-02 生产实证,卡 3 天)。
+	// 这条通知是把「静默卡死」变成「一次点击重登即恢复」的唯一用户可见链路。
+	desktopNotifier("aliang-gateway", "认证已过期，代理与远程访问已停止，请重新登录")
 }
 
 // handleAuthRefreshed fires after a successful token refresh. It forwards the

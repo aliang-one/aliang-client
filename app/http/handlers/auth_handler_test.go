@@ -145,11 +145,20 @@ func TestHandleAgentAuthRejectedNotificationRules(t *testing.T) {
 		}
 	})
 
-	t.Run("generation-carrying notification with inactive snapshot ignored", func(t *testing.T) {
+	t.Run("restoring snapshot applies a recovery kick", func(t *testing.T) {
+		// 2026-10-02 生产实证的反演:owner 卡在 Restoring 数日(恢复在途或
+		// 恢复循环静默卡死),agent 的凭据拒绝通知被 Active 门一刀切判
+		// stale_notification 拒绝,agent 落 refresh_invalid 粘性禁用 3 天、
+		// 全程无用户可见提示。恢复链幂等且被 arbiter 串行化,Restoring 下
+		// 放行是安全的「踢一脚」:刷新成功→Active→自动转发新会话;刷新
+		// 401→HardInvalid→禁用 agent+桌面提醒。无论哪个分支都比静默强。
 		recoverCalls = nil
-		// Fresh authority: StateRestoring — the owner never reached Active. The
-		// Active gate必须与通知是否携带 generation 无关地生效。
+		resetApplyDedup()
+		// Fresh authority: StateRestoring — the owner never reached Active.
 		authority = auth.ResetSessionAuthorityForTest()
+		if state := authority.Snapshot().State; state != auth.StateRestoring {
+			t.Fatalf("authority state = %v, want restoring", state)
+		}
 
 		rec := postNotification(fmt.Sprintf(`{"reason":"agent register 401","device_id":"dev-1","observed_at":%d,"generation":1}`, time.Now().Unix()))
 
@@ -157,11 +166,11 @@ func TestHandleAgentAuthRejectedNotificationRules(t *testing.T) {
 			t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
 		}
 		applied, ignored := decodeApplied(t, rec)
-		if applied || ignored != "stale_notification" {
-			t.Fatalf("applied=%v ignored=%q, want applied=false ignored=stale_notification; body=%s", applied, ignored, rec.Body.String())
+		if !applied || ignored != "" {
+			t.Fatalf("applied=%v ignored=%q, want applied=true without ignore reason; body=%s", applied, ignored, rec.Body.String())
 		}
-		if len(recoverCalls) != 0 {
-			t.Fatalf("recoverCalls = %v, want none", recoverCalls)
+		if len(recoverCalls) != 1 || recoverCalls[0] != "agent register 401" {
+			t.Fatalf("recoverCalls = %v, want exactly [agent register 401]", recoverCalls)
 		}
 	})
 
@@ -292,10 +301,40 @@ func TestHandleAgentAuthRejectedNotificationRules(t *testing.T) {
 		}
 	})
 
-	t.Run("missing generation with inactive snapshot ignored", func(t *testing.T) {
+	t.Run("soft-expired snapshot applies a recovery kick", func(t *testing.T) {
+		// SoftExpired 的恢复协调器可能已在退避等待;agent 的拒绝通知此刻到达
+		// 应立即触发一次恢复(幂等、单飞),而不是等下一个退避周期。
 		recoverCalls = nil
-		// Fresh authority: StateRestoring — the owner never reached Active.
+		resetApplyDedup()
+		loginActive()
+		authority.NotifyAccessRejected("probe access rejection")
+		if state := authority.Snapshot().State; state != auth.StateSoftExpired {
+			t.Fatalf("authority state = %v, want soft_expired", state)
+		}
+
+		rec := postNotification(fmt.Sprintf(`{"reason":"agent register 401","device_id":"dev-1","observed_at":%d,"generation":%d}`, time.Now().Unix(), authority.Snapshot().Generation))
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+		}
+		applied, ignored := decodeApplied(t, rec)
+		if !applied || ignored != "" {
+			t.Fatalf("applied=%v ignored=%q, want applied=true without ignore reason; body=%s", applied, ignored, rec.Body.String())
+		}
+		if len(recoverCalls) != 1 || recoverCalls[0] != "agent register 401" {
+			t.Fatalf("recoverCalls = %v, want exactly [agent register 401]", recoverCalls)
+		}
+	})
+
+	t.Run("unauthenticated snapshot ignored", func(t *testing.T) {
+		// 登出是用户的显式决定:Unauthenticated 无会话可恢复,agent 通知不得
+		// 把登出翻案成恢复(否则一次迟到的通知就能复活已注销的会话)。
+		recoverCalls = nil
 		authority = auth.ResetSessionAuthorityForTest()
+		authority.NotifyLoggedOut()
+		if state := authority.Snapshot().State; state != auth.StateUnauthenticated {
+			t.Fatalf("authority state = %v, want unauthenticated", state)
+		}
 
 		rec := postNotification(fmt.Sprintf(`{"reason":"agent register 401","device_id":"dev-1","observed_at":%d,"generation":0}`, time.Now().Unix()))
 
