@@ -89,6 +89,7 @@ func resetAuthHooksForTest() {
 	proxyPausedForSoftExpiry = false
 	softExpiryRecoveryStarter = auth.StartSoftExpiryRecovery
 	userAgentDisableRequester = RequestUserAgentDisableForSessionEnd
+	desktopNotifier = func(title, text string) {}
 }
 
 func TestOnSessionEventSoftExpiredPausesProxyAndStartsRecovery(t *testing.T) {
@@ -156,6 +157,8 @@ func TestOnSessionEventHardInvalidRunsTeardown(t *testing.T) {
 	httpStopRunner = func() { httpStops++ }
 	var disableReasons []string
 	userAgentDisableRequester = func(reason string) { disableReasons = append(disableReasons, reason) }
+	var notifications []string
+	desktopNotifier = func(title, text string) { notifications = append(notifications, title+"/"+text) }
 
 	rs := GetSharedRunService()
 	rs.SetCurrentMode("http")
@@ -175,6 +178,11 @@ func TestOnSessionEventHardInvalidRunsTeardown(t *testing.T) {
 	if len(disableReasons) != 1 || disableReasons[0] != "refresh_invalid" {
 		t.Fatalf("agent disable reasons = %v, want [refresh_invalid]", disableReasons)
 	}
+	// 2026-10-02 生产实证:代理未运行时旧实现只发 Debug 日志,会话死亡全程
+	// 无用户可见提示,agent 粘性禁用 3 天。桌面提醒必须无条件发出。
+	if len(notifications) != 1 {
+		t.Fatalf("expiry desktop notifications = %v, want exactly one", notifications)
+	}
 }
 
 func TestOnSessionEventHardInvalidLogoutStopsIngressWithoutExpiryNotification(t *testing.T) {
@@ -184,6 +192,8 @@ func TestOnSessionEventHardInvalidLogoutStopsIngressWithoutExpiryNotification(t 
 	httpProxyIsRunningProbe = func() bool { return false }
 	var httpStops int
 	httpStopRunner = func() { httpStops++ }
+	var notifications []string
+	desktopNotifier = func(title, text string) { notifications = append(notifications, title+"/"+text) }
 
 	rs := GetSharedRunService()
 	rs.SetCurrentMode("http")
@@ -202,5 +212,8 @@ func TestOnSessionEventHardInvalidLogoutStopsIngressWithoutExpiryNotification(t 
 	}
 	if startup.GetStatus() != runtime.UNCONFIGURED || startup.GetFetchSuccess() {
 		t.Fatalf("logout startup state = %v fetch=%t, want UNCONFIGURED/false", startup.GetStatus(), startup.GetFetchSuccess())
+	}
+	if len(notifications) != 0 {
+		t.Fatalf("logout must not fire the expiry desktop notification, got %v", notifications)
 	}
 }

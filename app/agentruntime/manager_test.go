@@ -92,6 +92,21 @@ func TestNeedsAuthenticatedSyncOnlyForRecoverableDisabledStates(t *testing.T) {
 	if !NeedsAuthenticatedSync(time.Second) {
 		t.Fatal("auth_expired state should request authenticated reconciliation")
 	}
+	// 2026-10-02 生产实证:refresh_invalid/soft_expiry_timeout/revoked 同样是
+	// 「会话死亡落下的粘性禁用」,只要 core 侧后来重获有效会话,watchdog 就该
+	// 推动 reconcile;否则 agent 卡在禁用态直到下一次登录事件。
+	status.SyncStatus = "refresh_invalid"
+	if !NeedsAuthenticatedSync(time.Second) {
+		t.Fatal("refresh_invalid state should request authenticated reconciliation")
+	}
+	status.SyncStatus = "soft_expiry_timeout"
+	if !NeedsAuthenticatedSync(time.Second) {
+		t.Fatal("soft_expiry_timeout state should request authenticated reconciliation")
+	}
+	status.SyncStatus = "revoked"
+	if !NeedsAuthenticatedSync(time.Second) {
+		t.Fatal("revoked state should request authenticated reconciliation")
+	}
 	status.SyncStatus = "disabled"
 	if NeedsAuthenticatedSync(time.Second) {
 		t.Fatal("manual disable must not request authenticated reconciliation")

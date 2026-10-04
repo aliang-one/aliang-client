@@ -88,6 +88,24 @@ const agentAuthRejectedMaxObservationAge = 5 * time.Minute
 // recovery run.
 const agentAuthRejectedApplyMinInterval = 60 * time.Second
 
+// applyAgentAuthRejectedInState 报告 owner 处于该会话状态时,agent 的凭据拒绝
+// 通知是否应触发恢复链。
+//   - Active:凭据真被远端拒了,立即恢复。
+//   - Restoring/SoftExpired:恢复在途,或恢复循环正在退避静默等待——通知是
+//     恢复链缺失的「踢一脚」。恢复链幂等且被 arbiter 串行化,重复触发安全。
+//     2026-10-02 生产实证:owner 卡 Restoring 数日,旧的 Active 一刀切门把
+//     通知全部判 stale,agent 落 refresh_invalid 粘性禁用 3 天无人知晓。
+//   - Unauthenticated/HardInvalid:拒绝。前者无会话可恢复(登出是用户的显式
+//     决定,不得被迟到通知翻案),后者已是终态、agent 应已被禁用。
+func applyAgentAuthRejectedInState(state auth.SessionState) bool {
+	switch state {
+	case auth.StateActive, auth.StateRestoring, auth.StateSoftExpired:
+		return true
+	default:
+		return false
+	}
+}
+
 // HandleAgentAuthRejected 接收 agent 进程上报的"凭据被远端拒绝"通知，
 // 触发 owner 侧 SoftExpired 恢复链（刷新成功→既有 handleAuthRefreshed 自动转发新会话；
 // 刷新 401 才落 refresh_invalid 真终态）。
@@ -102,17 +120,17 @@ const agentAuthRejectedApplyMinInterval = 60 * time.Second
 // 现行判定序（与携带 generation 与否无关）：
 //  1. 非法 body/时间戳 → 400；
 //  2. observed_at 为未来或距今 >5min → stale_notification（迟到通知）；
-//  3. owner 快照非 Active → stale_notification（恢复已在途/未登录）；
+//  3. owner 快照非 Active/Restoring/SoftExpired → stale_notification（登出无会话可恢复，不得被迟到通知翻案；HardInvalid 已是终态）；
 //  4. 60s 去重窗口 → rate_limited；
 //  5. 应用恢复（applied=true）。
 //
 // 防回退论证：等值门移除后，跨进程迟到通知若在 owner 已刷新后才到达，代价
 // 只是一次经 arbiter 串行化的幂等恢复刷新（cache-hit 或 rotate 一次），换来
-// "转发凭据真被远端拒了"时的即时恢复——值得。Active 门+5min 时间窗+60s 去重
-// +恢复链幂等共同承担防回退。不设 dashboard 会话门槛：agent 子进程无
-// cookie，dashboard HTTP 监听（loopback）即信任边界。但 `--host` 可将管理
-// 监听重绑到非 loopback 地址，届时本端点随整个 dashboard 暴露；60s 去重 +
-// 恢复链单飞是仅有的滥用闸门。
+// "转发凭据真被远端拒了"时的即时恢复——值得。状态门（见
+// applyAgentAuthRejectedInState）+5min 时间窗+60s 去重+恢复链幂等共同承担
+// 防回退。不设 dashboard 会话门槛：agent 子进程无 cookie，dashboard HTTP
+// 监听（loopback）即信任边界。但 `--host` 可将管理监听重绑到非 loopback 地
+// 址，届时本端点随整个 dashboard 暴露；60s 去重+恢复链单飞是仅有的滥用闸门。
 func (h *AuthHandler) HandleAgentAuthRejected(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
@@ -138,7 +156,7 @@ func (h *AuthHandler) HandleAgentAuthRejected(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	if snapshot := auth.GetSessionAuthority().Snapshot(); snapshot.State != auth.StateActive {
+	if snapshot := auth.GetSessionAuthority().Snapshot(); !applyAgentAuthRejectedInState(snapshot.State) {
 		logger.Warn(fmt.Sprintf("Ignored agent auth-rejected notification: state %s (device %q, generation %d, reason %q)", snapshot.State, req.DeviceID, req.Generation, req.Reason))
 		common.Success(w, map[string]interface{}{"applied": false, "ignored": "stale_notification"})
 		return

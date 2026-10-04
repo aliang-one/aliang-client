@@ -165,7 +165,13 @@ func NeedsAuthenticatedSync(timeout time.Duration) bool {
 		return false
 	}
 	switch strings.ToLower(strings.TrimSpace(envelope.Data.SyncStatus)) {
-	case "logout", "auth_expired":
+	// logout 之外,refresh_invalid/soft_expiry_timeout/revoked 同样是「会话死亡
+	// 落下的粘性禁用」:只要 core 侧后来重获有效会话,带 JWT 的 reconcile sync
+	// 就是合法的重启用信号(agent 侧显式 JWT sync 可越过粘性禁用),不该等到
+	// 下一次登录事件。core 自己也没有有效会话时 reconcile 只会失败退避,无害。
+	// 2026-10-02 生产实证:refresh_invalid 粘性禁用卡了 3 天,白名单遗漏是
+	// 原因之一。
+	case "logout", "auth_expired", "refresh_invalid", "soft_expiry_timeout", "revoked":
 		return true
 	default:
 		return false
