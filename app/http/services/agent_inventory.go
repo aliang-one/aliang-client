@@ -1083,13 +1083,15 @@ func readClaudeSessionMetaWithOptions(path string, options agentVibeSessionReadO
 	}
 	forEachAgentSessionJSONLLine(path, maxLineBytes, func(line []byte) bool {
 		var row struct {
-			Timestamp   string      `json:"timestamp"`
-			Type        string      `json:"type"`
-			CWD         string      `json:"cwd"`
-			SessionID   string      `json:"sessionId"`
-			GitBranch   string      `json:"gitBranch"`
-			IsSidechain bool        `json:"isSidechain"`
-			Message     interface{} `json:"message"`
+			Timestamp       string      `json:"timestamp"`
+			Type            string      `json:"type"`
+			CWD             string      `json:"cwd"`
+			SessionID       string      `json:"sessionId"`
+			GitBranch       string      `json:"gitBranch"`
+			IsSidechain     bool        `json:"isSidechain"`
+			IsMeta          bool        `json:"isMeta"`
+			SourceToolUseID string      `json:"sourceToolUseID"`
+			Message         interface{} `json:"message"`
 		}
 		if err := json.Unmarshal(line, &row); err != nil {
 			return true
@@ -1118,7 +1120,13 @@ func readClaudeSessionMetaWithOptions(path string, options agentVibeSessionReadO
 		var commandRecord bool
 		if row.Type == "user" || row.Type == "assistant" {
 			rawText := claudeMessageText(row.Message)
-			commandRecord = row.Type == "user" && isClaudeSlashCommandRecord(rawText)
+			// harness 工件 = slash 命令流水 ∪ CC 注入行。Claude Code 会把 Skill 工具
+			// 装载的 skill 全文以 user 行写回 jsonl（isMeta+sourceToolUseID 标记），
+			// 并把 /命令回显与系统提醒写成 <local-command-stdout>/<system-reminder>
+			// 前缀行（部分 CLI 版本这两类不带 isMeta）。不丢它们手机就会把几千字
+			// skill 文档渲染成用户气泡（2026-10-07 ai_import_c7e27e3a 实锤）。
+			commandRecord = row.Type == "user" && (isClaudeSlashCommandRecord(rawText) ||
+				row.IsMeta || row.SourceToolUseID != "" || isClaudeInjectedRecordText(rawText))
 			if text := truncateAgentText(rawText, agentVibeTranscriptMaxContentRunes); text != "" {
 				messageIndex := session.MessageCount
 				session.MessageCount++
@@ -1128,8 +1136,9 @@ func readClaudeSessionMetaWithOptions(path string, options agentVibeSessionReadO
 				// 摊平成 system 消息，手机端就会渲染出一墙 "Updated task #N status" /
 				// "[1]+ Done ..." 状态行。索引照旧自增，保证后续消息的 stableAgentID
 				// 与旧解析及已入库消息一致（否则 server 按 id upsert 会重复存储）。
-				// slash 命令流水（/clear、local-command-caveat）同理：是 UI 工件而非
-				// 对话，走同一条跳过路径——不进气泡、不进标题、不推进活跃时间。
+				// slash 命令流水与 CC 注入行（skill 全文、命令回显、系统提醒）同理：
+				// 是 UI 工件而非对话，走同一条跳过路径——不进气泡、不进标题、
+				// 不推进活跃时间。
 				if role != "system" && !commandRecord {
 					if row.Type == "user" {
 						userPromptCount++
@@ -1376,7 +1385,19 @@ func normalizeAgentVibeRole(value string) string {
 // session file, so without this filter every cleared conversation opened with
 // a stray "/clear" bubble on the phone).
 func isClaudeSlashCommandRecord(text string) bool {
-	return strings.HasPrefix(text, "<command-name>") || strings.HasPrefix(text, "<local-command-caveat>")
+	// <command-message> 开头的行：部分 CLI 版本（2.1.156/2.1.280）写 /命令行
+	// 以它开头且无 isMeta（评审语料 165 文件实锤 26 行），同属 slash 流水。
+	return strings.HasPrefix(text, "<command-name>") ||
+		strings.HasPrefix(text, "<command-message>") ||
+		strings.HasPrefix(text, "<local-command-caveat>")
+}
+
+// isClaudeInjectedRecordText reports Claude-Code-injected user rows that some
+// CLI builds write WITHOUT the isMeta flag: /command stdout echoes and
+// system-reminder notes. Prefix-only on purpose — a genuine message that merely
+// mentions these tags mid-sentence must survive.
+func isClaudeInjectedRecordText(text string) bool {
+	return strings.HasPrefix(text, "<local-command-stdout>") || strings.HasPrefix(text, "<system-reminder>")
 }
 
 // parseAgentRFC3339 decodes an RFC3339 timestamp into UTC time, zero on
