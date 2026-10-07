@@ -7027,6 +7027,58 @@ func claudeApprovalHookTimeoutSeconds(approvalTimeout time.Duration) int64 {
 	return seconds + int64(claudeApprovalHookTimeoutGrace/time.Second)
 }
 
+// claudeAuthEnvOverlay returns the gateway auth keys headless claude runs need
+// but did not inherit, sourced from the user's <agentHome>/.claude/settings.json
+// env block (the canonical token location since quick_setup fa84f42). Only keys
+// missing (or empty) in the effective child-process environment are returned —
+// an env-provided value always wins. Isolated-tier runs pass --setting-sources ""
+// so claude never loads that settings file itself; a GUI-spawned agent carries no
+// shell-profile exports, so without this overlay its headless children have zero
+// credentials and claude fails locally with "Please run /login". Missing or
+// unparseable settings yield no overlay (tolerated, matching claudeEnabledPlugins'
+// fail-closed posture); only the two auth keys are ever copied.
+func claudeAuthEnvOverlay() map[string]string {
+	authKeys := []string{"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"}
+	missing := make(map[string]bool, len(authKeys))
+	for _, key := range authKeys {
+		if value, ok := agentChildProcessEnvValue(key); !ok || value == "" {
+			missing[key] = true
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	home := agentHome()
+	if home == "" {
+		return nil
+	}
+	settingsPath := filepath.Join(home, ".claude", "settings.json")
+	raw, err := os.ReadFile(settingsPath)
+	if err != nil {
+		return nil // absent/unreadable settings: nothing to fall back to (silent)
+	}
+	var settings struct {
+		Env map[string]string `json:"env"`
+	}
+	if err := json.Unmarshal(raw, &settings); err != nil {
+		logger.Warn(fmt.Sprintf("claude-auth: unparseable settings %s: %v", settingsPath, err))
+		return nil
+	}
+	overlay := make(map[string]string, len(missing))
+	for _, key := range authKeys {
+		if !missing[key] {
+			continue
+		}
+		if value := strings.TrimSpace(settings.Env[key]); value != "" {
+			overlay[key] = value
+		}
+	}
+	if len(overlay) == 0 {
+		return nil
+	}
+	return overlay
+}
+
 func claudeApprovalHookSettings(strategy claudeApprovalHookStrategy, run agentAIRun) (map[string]interface{}, error) {
 	hookURL := agentAIApprovalHookURL(run.sessionID, agentAssistantMessageID(run.messageID), run.approvalToken)
 	hookTimeout := claudeApprovalHookTimeoutSeconds(agentAIApprovalTimeout)
@@ -7066,6 +7118,18 @@ func claudeApprovalHookSettings(strategy claudeApprovalHookStrategy, run agentAI
 				},
 			},
 		}
+	}
+	// Auth fallback: isolated-tier runs block settings-file loading, and a
+	// GUI-spawned agent has no shell exports, so the --settings blob carries the
+	// gateway auth keys whenever the child environment does not. Env always wins;
+	// the blob only fills gaps (see claudeAuthEnvOverlay). The blob stays masked
+	// as <json> in logs (sanitizeArgsForLog), which must keep covering these values.
+	if overlay := claudeAuthEnvOverlay(); len(overlay) > 0 {
+		envSettings := make(map[string]interface{}, len(overlay))
+		for key, value := range overlay {
+			envSettings[key] = value
+		}
+		settings["env"] = envSettings
 	}
 	// Full tier runs at local parity: it keeps its own settings sources and
 	// must not carry the fail-closed shell disable or ask overlay (hooks stay).
