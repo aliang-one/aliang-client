@@ -83,7 +83,9 @@ func TestClaudeAuthEnvOverlayToleratesMissingOrBrokenSettings(t *testing.T) {
 	}
 }
 
-func TestClaudeApprovalHookSettingsCarriesAuthEnvFallback(t *testing.T) {
+// The auth overlay must ride the child environment (cmd.Env), never argv:
+// a --settings JSON blob would expose the token in `ps`-visible command lines.
+func TestWithClaudeApprovalHookInjectsAuthEnvIntoChildEnv(t *testing.T) {
 	writeClaudeAuthEnvFixture(t, claudeAuthEnvSettingsFixture)
 	forceAuthEnvMissing(t)
 
@@ -93,30 +95,51 @@ func TestClaudeApprovalHookSettingsCarriesAuthEnvFallback(t *testing.T) {
 		approvalToken: "token",
 		claudePolicy:  parseAgentAIClaudeRemotePolicy(map[string]interface{}{"claude_remote_policy": testClaudeRemotePolicy(false)}),
 	}
-	settings, err := claudeApprovalHookSettings(claudeApprovalHookPreToolUseCommand, run)
-	if err != nil {
-		t.Fatal(err)
+	got := withClaudeApprovalHook(&agentAITool{path: "/bin/claude", args: []string{"--print", "prompt"}}, run)
+	if got == nil {
+		t.Fatal("withClaudeApprovalHook returned nil")
 	}
-	raw, err := json.Marshal(settings)
-	if err != nil {
-		t.Fatal(err)
+
+	env := envSliceToMap(t, got.env)
+	if env["ANTHROPIC_AUTH_TOKEN"] != "settings-token" {
+		t.Fatalf("child env ANTHROPIC_AUTH_TOKEN = %q, want the settings.json value", env["ANTHROPIC_AUTH_TOKEN"])
+	}
+	if env["ANTHROPIC_BASE_URL"] != "https://settings.example" {
+		t.Fatalf("child env ANTHROPIC_BASE_URL = %q, want the settings.json value", env["ANTHROPIC_BASE_URL"])
+	}
+	if n := countEnvKey(got.env, "ANTHROPIC_AUTH_TOKEN"); n != 1 {
+		t.Fatalf("ANTHROPIC_AUTH_TOKEN appears %d times in child env, want exactly 1", n)
+	}
+
+	// Isolation flags stay, and the --settings blob must remain auth-free.
+	settingsJSON := ""
+	for i, arg := range got.args {
+		if arg == "--settings" && i+1 < len(got.args) {
+			settingsJSON = got.args[i+1]
+		}
+	}
+	if settingsJSON == "" {
+		t.Fatal("--settings blob missing from args")
 	}
 	var decoded struct {
 		Env   map[string]string      `json:"env"`
 		Hooks map[string]interface{} `json:"hooks"`
 	}
-	if err := json.Unmarshal(raw, &decoded); err != nil {
-		t.Fatal(err)
+	if err := json.Unmarshal([]byte(settingsJSON), &decoded); err != nil {
+		t.Fatalf("unparseable --settings blob: %v (%s)", err, settingsJSON)
 	}
-	if decoded.Env["ANTHROPIC_AUTH_TOKEN"] != "settings-token" || decoded.Env["ANTHROPIC_BASE_URL"] != "https://settings.example" {
-		t.Fatalf("--settings blob lacks the auth env fallback: env=%s", decoded.Env)
+	if len(decoded.Env) != 0 {
+		t.Fatalf("auth keys must not travel in the --settings blob (argv leak): env=%v", decoded.Env)
 	}
 	if decoded.Hooks == nil {
-		t.Fatal("auth overlay must not displace the approval hooks")
+		t.Fatal("approval hooks missing from --settings blob")
+	}
+	if !hasArgPair(got.args, "--setting-sources", "") {
+		t.Fatalf("isolated --setting-sources flag lost: %v", got.args)
 	}
 }
 
-func TestClaudeApprovalHookSettingsOmitsAuthEnvWhenEnvCarriesIt(t *testing.T) {
+func TestWithClaudeApprovalHookOmitsAuthEnvWhenEnvCarriesIt(t *testing.T) {
 	writeClaudeAuthEnvFixture(t, claudeAuthEnvSettingsFixture)
 	t.Setenv("ANTHROPIC_AUTH_TOKEN", "env-token")
 	t.Setenv("ANTHROPIC_BASE_URL", "https://env.example")
@@ -126,11 +149,20 @@ func TestClaudeApprovalHookSettingsOmitsAuthEnvWhenEnvCarriesIt(t *testing.T) {
 		messageID:     "m-auth2",
 		approvalToken: "token",
 	}
-	settings, err := claudeApprovalHookSettings(claudeApprovalHookPreToolUseCommand, run)
-	if err != nil {
-		t.Fatal(err)
+	got := withClaudeApprovalHook(&agentAITool{path: "/bin/claude", args: []string{"--print", "prompt"}}, run)
+	if got == nil {
+		t.Fatal("withClaudeApprovalHook returned nil")
 	}
-	if _, exists := settings["env"]; exists {
-		t.Fatalf("child env already carries both auth keys; blob must not duplicate: %v", settings["env"])
+	if n := countEnvKey(got.env, "ANTHROPIC_AUTH_TOKEN"); n != 0 {
+		t.Fatalf("env already carries the token; overlay must not duplicate it (got %d entries)", n)
 	}
+}
+
+func hasArgPair(args []string, flag, value string) bool {
+	for i, arg := range args {
+		if arg == flag && i+1 < len(args) && args[i+1] == value {
+			return true
+		}
+	}
+	return false
 }

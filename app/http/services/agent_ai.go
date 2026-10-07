@@ -7119,18 +7119,6 @@ func claudeApprovalHookSettings(strategy claudeApprovalHookStrategy, run agentAI
 			},
 		}
 	}
-	// Auth fallback: isolated-tier runs block settings-file loading, and a
-	// GUI-spawned agent has no shell exports, so the --settings blob carries the
-	// gateway auth keys whenever the child environment does not. Env always wins;
-	// the blob only fills gaps (see claudeAuthEnvOverlay). The blob stays masked
-	// as <json> in logs (sanitizeArgsForLog), which must keep covering these values.
-	if overlay := claudeAuthEnvOverlay(); len(overlay) > 0 {
-		envSettings := make(map[string]interface{}, len(overlay))
-		for key, value := range overlay {
-			envSettings[key] = value
-		}
-		settings["env"] = envSettings
-	}
 	// Full tier runs at local parity: it keeps its own settings sources and
 	// must not carry the fail-closed shell disable or ask overlay (hooks stay).
 	if run.claudePolicy.enabled && run.claudePolicy.trustTier != "full" {
@@ -7174,6 +7162,20 @@ func withClaudeApprovalHook(tool *agentAITool, run agentAIRun) *agentAITool {
 		return tool
 	}
 	copied := *tool
+	// Auth fallback rides the child environment, never argv: claudeAuthEnvOverlay
+	// sources the gateway keys from <agentHome>/.claude/settings.json only for
+	// keys the effective child env is missing, so cmd.Env gains no duplicates and
+	// the token never appears in `ps`-visible command lines or the --settings
+	// blob (which stays hooks-only and log-masked). Isolation is untouched —
+	// --setting-sources still blocks all settings-file loading below.
+	if overlay := claudeAuthEnvOverlay(); len(overlay) > 0 {
+		keys := make([]string, 0, len(overlay))
+		for key, value := range overlay {
+			copied.env = append(copied.env, key+"="+value)
+			keys = append(keys, key)
+		}
+		logger.Info(fmt.Sprintf("claude-auth: env overlay applied keys=%v session=%s runSeq=%d (values stay out of argv and logs)", keys, run.sessionID, run.runSeq))
+	}
 	sources := ""
 	if run.claudePolicy.enabled {
 		// Carry the effective tier's sources instead of unconditionally
