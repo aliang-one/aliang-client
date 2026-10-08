@@ -9,20 +9,20 @@ import (
 // SafeCall runs a tool handler with panic recovery. A panic becomes the
 // family error payload (OnError) or the generic <event>.result error shape —
 // a panicking handler must never take down the WS read loop's goroutine pool
-// with an unrecovered panic or return nothing.
+// with an unrecovered panic or return nothing. A nil result map is converted
+// to a tool_returned_nil error payload so null never flows to the wire.
 func SafeCall(t *Tool, msg map[string]interface{}) (res map[string]interface{}) {
 	requestID := requestIDOf(msg)
 	defer func() {
 		if r := recover(); r != nil {
-			err := fmt.Errorf("%v", r)
-			if t.OnError != nil {
-				res = t.OnError(requestID, err)
-				return
-			}
-			res = genericErrorPayload(t, requestID, err.Error())
+			res = safeOnError(t, requestID, fmt.Errorf("%v", r))
 		}
 	}()
-	return t.Handler(msg)
+	res = t.Handler(msg)
+	if res == nil {
+		return genericErrorPayload(t, requestID, "tool_returned_nil")
+	}
+	return res
 }
 
 // RunWithGuards wraps SafeCall with the registry-level execution guards:
@@ -42,35 +42,51 @@ func RunWithGuards(t *Tool, msg map[string]interface{}, writeJSON func(interface
 	case res := <-done:
 		_ = writeJSON(enforceOutputCap(t, res, requestID))
 	case <-time.After(timeout):
-		if t.OnError != nil {
-			_ = writeJSON(t.OnError(requestID, fmt.Errorf("tool_timeout")))
-			return
-		}
-		_ = writeJSON(genericErrorPayload(t, requestID, "tool_timeout"))
+		_ = writeJSON(safeOnError(t, requestID, fmt.Errorf("tool_timeout")))
 	}
 }
 
 // enforceOutputCap replaces an oversized result with an error payload (flagged
 // truncated:true). The spec's "merge truncated into the top level" is realized
 // as replacement here: oversized payloads are single-blob fields where merging
-// would keep the oversized bytes — replacement is the only honest cap.
+// would keep the oversized bytes — replacement is the only honest cap. A
+// result that cannot be JSON-serialized at all is reported as
+// output_not_serializable without the truncated flag — it was not cut short,
+// it was never wire-shaped.
 func enforceOutputCap(t *Tool, res map[string]interface{}, requestID string) map[string]interface{} {
 	limit := t.Caps.MaxOutputBytes
 	if limit <= 0 {
 		limit = 32768
 	}
-	raw, err := json.Marshal(res)
-	if err == nil && len(raw) <= limit {
+	raw, mErr := json.Marshal(res)
+	if mErr == nil && len(raw) <= limit {
 		return res
 	}
-	var payload map[string]interface{}
-	if t.OnError != nil {
-		payload = t.OnError(requestID, fmt.Errorf("output_truncated"))
-	} else {
-		payload = genericErrorPayload(t, requestID, "output_truncated")
+	err := fmt.Errorf("output_truncated")
+	if mErr != nil {
+		err = fmt.Errorf("output_not_serializable")
 	}
-	payload["truncated"] = true
+	payload := safeOnError(t, requestID, err)
+	if mErr == nil {
+		payload["truncated"] = true
+	}
 	return payload
+}
+
+// safeOnError invokes the tool's family error payload builder with panic
+// recovery — a panicking OnError must degrade to the generic payload, never
+// take down the process (an unrecovered panic in the dispatch goroutine would
+// kill the whole agent).
+func safeOnError(t *Tool, requestID string, err error) (payload map[string]interface{}) {
+	if t.OnError == nil {
+		return genericErrorPayload(t, requestID, err.Error())
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			payload = genericErrorPayload(t, requestID, err.Error())
+		}
+	}()
+	return t.OnError(requestID, err)
 }
 
 func genericErrorPayload(t *Tool, requestID, errMsg string) map[string]interface{} {
@@ -85,5 +101,8 @@ func requestIDOf(msg map[string]interface{}) string {
 	if msg == nil {
 		return ""
 	}
-	return fmt.Sprint(msg["request_id"])
+	if s, ok := msg["request_id"].(string); ok {
+		return s
+	}
+	return ""
 }

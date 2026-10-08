@@ -80,3 +80,61 @@ func TestRunWithGuards_NormalPath(t *testing.T) {
 		t.Fatalf("normal path should pass through, got %v", wrote)
 	}
 }
+
+func TestDispatch_OnErrorPanicsFallsBackToGeneric(t *testing.T) {
+	tool := &Tool{ID: "y", Event: "x.y", Description: "d",
+		Handler: func(map[string]interface{}) map[string]interface{} { panic("kaboom") },
+		OnError: func(requestID string, err error) map[string]interface{} {
+			panic("OnError exploded")
+		}}
+	res := SafeCall(tool, map[string]interface{}{"request_id": "r6"})
+	if res["error"] != "kaboom" {
+		t.Fatalf("panicking OnError should fall back to generic payload, got %v", res)
+	}
+	if res["type"] != "x.y.result" || res["request_id"] != "r6" {
+		t.Fatalf("generic fallback shape wrong: %v", res)
+	}
+}
+
+func TestRequestIDOf_MissingKeyReturnsEmpty(t *testing.T) {
+	if got := requestIDOf(map[string]interface{}{}); got != "" {
+		t.Fatalf("missing request_id should be empty, got %q", got)
+	}
+	if got := requestIDOf(map[string]interface{}{"request_id": nil}); got != "" {
+		t.Fatalf("nil request_id should be empty, got %q", got)
+	}
+	if got := requestIDOf(map[string]interface{}{"request_id": 42}); got != "" {
+		t.Fatalf("non-string request_id should be empty, got %q", got)
+	}
+}
+
+func TestDispatch_NilResultBecomesErrorPayload(t *testing.T) {
+	tool := &Tool{ID: "n", Event: "x.n", Description: "d",
+		Handler: func(map[string]interface{}) map[string]interface{} { return nil }}
+	res := SafeCall(tool, map[string]interface{}{"request_id": "r7"})
+	if res["error"] != "tool_returned_nil" {
+		t.Fatalf("nil handler result should become error payload, got %v", res)
+	}
+	if res["request_id"] != "r7" {
+		t.Fatalf("request_id should be preserved, got %v", res)
+	}
+}
+
+func TestRunWithGuards_UnserializableOutputReportsError(t *testing.T) {
+	bad := &Tool{ID: "bad", Event: "x.bad", Description: "d",
+		Caps: Caps{TimeoutMs: 5000, MaxOutputBytes: 65536},
+		Handler: func(map[string]interface{}) map[string]interface{} {
+			return map[string]interface{}{"type": "x.bad.result", "ch": make(chan int)}
+		}}
+	var wrote map[string]interface{}
+	RunWithGuards(bad, map[string]interface{}{"request_id": "r8"}, func(p interface{}) error {
+		wrote = p.(map[string]interface{})
+		return nil
+	})
+	if wrote["error"] != "output_not_serializable" {
+		t.Fatalf("expected output_not_serializable, got %v", wrote)
+	}
+	if _, has := wrote["truncated"]; has {
+		t.Fatalf("marshal failure must not set truncated flag, got %v", wrote)
+	}
+}
