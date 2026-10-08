@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"aliang.one/nursorgate/app/http/models"
+	"aliang.one/nursorgate/app/tools"
 	"aliang.one/nursorgate/common/logger"
 	auth "aliang.one/nursorgate/processor/auth"
 	"aliang.one/nursorgate/processor/config"
@@ -463,6 +464,8 @@ func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn) error {
 					"device_id": s.currentDeviceID(),
 					"ts":        time.Now().UnixMilli(),
 					"load":      collectAgentLoadSnapshot(),
+					// 工具注册表 rev：服务端比对发现漂移即重拉 tools.list。
+					"agent_tools_rev": agentToolRegistryRev,
 				})
 			case <-digestTicker.C:
 				// The first tick only records the baseline — the connect hello
@@ -638,6 +641,18 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 	case models.AgentEventGitStatus, models.AgentEventEnvInfo:
 		s.setRemoteConnectionState(true, "online", "")
 		go handleAgentEnvToolsMessage(msg, writeJSON)
+	case models.AgentEventToolsList:
+		// 元 RPC：回显当前工具注册表（工具清单 + rev），服务端据此做能力
+		// 发现与 rev 漂移检测（heartbeat 带 agent_tools_rev）。
+		s.setRemoteConnectionState(true, "online", "")
+		reg := agentToolRegistry()
+		_ = writeJSON(map[string]interface{}{
+			"type":         models.AgentEventToolsListResult,
+			"request_id":   remoteString(msg, "request_id"),
+			"rev":          reg.Rev(),
+			"tools":        reg.Descriptors(),
+			"generated_at": time.Now().UTC().Format(time.RFC3339),
+		})
 	case models.AgentEventGoalPlan, models.AgentEventGoalVerify:
 		s.setRemoteConnectionState(true, "online", "")
 		if !s.aiControlEnabled() {
@@ -760,6 +775,13 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 		errCode := strings.TrimSpace(fmt.Sprint(msg["error"]))
 		logger.Warn(fmt.Sprintf("[AGENT-BOOT] remote_connection server_rejected error=%s detail=%v", errCode, msg["message"]))
 	default:
+		// 工具注册表：任何注册过的工具事件统一走通用 dispatch——新工具上注册
+		// 表即可，无需再动这个 switch。未注册的类型维持原有 unsupported 行为。
+		if t, ok := agentToolRegistry().Get(msgType); ok {
+			s.setRemoteConnectionState(true, "online", "")
+			go tools.RunWithGuards(t, msg, writeJSON)
+			return
+		}
 		_ = writeJSON(map[string]interface{}{
 			"type":  models.AgentEventError,
 			"error": fmt.Sprintf("unsupported remote agent event type: %s", msgType),
@@ -796,6 +818,14 @@ func remoteAgentMessageRequiresEnabledDevice(msgType string) bool {
 		models.AgentEventAISessionClose:
 		return true
 	default:
+		// tools.list 是元 RPC（非注册表工具项），显式门控；注册表命中的工具事件
+		// 一律视为需要 Enabled 设备（为 Phase-2 新工具兜底）。
+		if msgType == models.AgentEventToolsList {
+			return true
+		}
+		if _, ok := agentToolRegistry().Get(msgType); ok {
+			return true
+		}
 		return false
 	}
 }

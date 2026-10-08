@@ -92,6 +92,8 @@ const (
 	AgentEventSlashCommandsList       = "slash.commands.list"
 	AgentEventSlashCommandsListResult = "slash.commands.list.result"
 	AgentEventSlashCommandsListError  = "slash.commands.list.error"
+	AgentEventToolsList               = "tools.list"
+	AgentEventToolsListResult         = "tools.list.result"
 	AgentEventGoalPlan                = "goal.plan"
 	AgentEventGoalPlanAIRequest       = "goal.plan.ai.request"
 	AgentEventGoalPlanAIResponse      = "goal.plan.ai.response"
@@ -278,6 +280,7 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				{Type: AgentEventProjectDetail, Required: []string{"type", "request_id", "project_id", "project_path"}, Emits: []string{AgentEventProjectDetailResult, AgentEventFileError}},
 				{Type: AgentEventAISessionDetail, Required: []string{"type", "request_id"}, Optional: []string{"session_id", "source_session_id", "project_path", "limit", "before_message_id", "before_timestamp"}, Emits: []string{AgentEventAISessionDetailResult, AgentEventFileError}},
 				{Type: AgentEventSlashCommandsList, Required: []string{"type", "request_id", "project_path"}, Optional: []string{"session_id", "provider", "include_user_level", "include_plugins", "claude_remote_policy"}, Emits: []string{AgentEventSlashCommandsListResult, AgentEventSlashCommandsListError}},
+				{Type: AgentEventToolsList, Required: []string{"type", "request_id"}, Emits: []string{AgentEventToolsListResult}},
 				{Type: AgentEventAIOptionResponse, Required: []string{"type", "session_id", "option_id", "selected"}, Optional: []string{"message_id", "custom_text", "decision", "delivery_id"}, Emits: []string{AgentEventAIRunStarted, AgentEventAIDelta, AgentEventAIRunProgress, AgentEventAIDone, AgentEventAIError, AgentEventAIOptionRequest}},
 				{Type: AgentEventGoalPlan, Required: []string{"type", "request_id", "protocol_version", "goal_id", "planning_attempt_id", "ai_session_id", "project_path", "objective", "plan_skill", "planner_timeout_ms"}, Optional: []string{"conversation_context"}, Emits: []string{AgentEventGoalPlanAIRequest, AgentEventGoalPlanResult, AgentEventGoalPlanError}},
 				{Type: AgentEventGoalPlanAIResponse, Required: []string{"type", "request_id", "goal_id", "planning_attempt_id", "ai_session_id", "response"}, Emits: []string{AgentEventGoalPlanResult, AgentEventGoalPlanError}},
