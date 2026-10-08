@@ -63,7 +63,11 @@ func TestAgentToolRegistry_HelloCarriesTools(t *testing.T) {
 	// （EffectiveAgentHome 非 root 时直读 $HOME，无需给 agent_home.go 加注入点）。
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("ALIANG_DATA_DIR", t.TempDir())
+	// ResetCacheDirForTest 把包级 cache 目录单例重算到本测试的 temp 目录；
+	// t.Cleanup（LIFO，先于 t.Setenv 还原 env）再清一次，避免单例指着已被
+	// 删除的 temp 目录泄漏给同包后续测试（对齐 common/cache/cachedir_test.go 的写法）。
 	cache.ResetCacheDirForTest()
+	t.Cleanup(cache.ResetCacheDirForTest)
 	svc := &AgentService{}
 	payload := svc.agentHelloPayload()
 	if payload["agent_tools"] == nil {
