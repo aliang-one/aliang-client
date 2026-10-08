@@ -39,26 +39,62 @@ type Tool struct {
 	OnError     ErrorPayloadFunc
 }
 
+const (
+	toolIDMaxLen    = 64
+	toolEventMaxLen = 64
+	toolDescMaxLen  = 500
+)
+
 func (t *Tool) validate() error {
+	if t == nil {
+		return fmt.Errorf("tool entry is nil")
+	}
 	if t.ID == "" {
 		return fmt.Errorf("tool id is empty")
+	}
+	if len(t.ID) > toolIDMaxLen {
+		return fmt.Errorf("tool id %q exceeds %d chars", t.ID, toolIDMaxLen)
+	}
+	if !validToolIdent(t.ID, false) {
+		return fmt.Errorf("tool id %q must match ^[a-z][a-z0-9_]*$", t.ID)
 	}
 	if t.Event == "" {
 		return fmt.Errorf("tool %s event is empty", t.ID)
 	}
-	if t.Description == "" {
-		return fmt.Errorf("tool %s description is empty", t.ID)
+	if len(t.Event) > toolEventMaxLen {
+		return fmt.Errorf("tool %s event %q exceeds %d chars", t.ID, t.Event, toolEventMaxLen)
+	}
+	if !validToolIdent(t.Event, true) {
+		return fmt.Errorf("tool %s event %q must match ^[a-z][a-z0-9_.]*$", t.ID, t.Event)
+	}
+	if t.Description == "" || len(t.Description) > toolDescMaxLen {
+		return fmt.Errorf("tool %s description empty or exceeds %d chars", t.ID, toolDescMaxLen)
 	}
 	if t.Handler == nil {
 		return fmt.Errorf("tool %s handler is nil", t.ID)
 	}
-	for _, r := range t.Event {
-		valid := (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '.' || r == '_'
-		if !valid {
-			return fmt.Errorf("tool %s event %q has invalid charset", t.ID, t.Event)
-		}
-	}
 	return nil
+}
+
+// validToolIdent mirrors the server's §5.2 descriptor acceptance regexes so a
+// tool that passes construction cannot be silently dropped server-side.
+func validToolIdent(s string, allowDot bool) bool {
+	if len(s) == 0 {
+		return false
+	}
+	for i, r := range s {
+		if i == 0 {
+			if r < 'a' || r > 'z' {
+				return false
+			}
+			continue
+		}
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' || (allowDot && r == '.') {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // DescriptorJSON returns the advertisement shape carried by agent.hello and
@@ -76,17 +112,23 @@ func (t *Tool) DescriptorJSON() map[string]interface{} {
 	}
 }
 
-// Registry is an immutable, validated tool set. Construction panics on
+// Registry is a validated tool set, treated as immutable after construction;
+// Get returns the live *Tool — do not mutate. Construction panics on
 // programmer error (empty/duplicate/invalid entries) — fail fast at process
 // start, never at request time.
 type Registry struct {
 	rev     int
 	byEvent map[string]*Tool
+	byID    map[string]*Tool
 	list    []*Tool
 }
 
 func NewRegistry(rev int, tools ...*Tool) *Registry {
-	r := &Registry{rev: rev, byEvent: make(map[string]*Tool, len(tools))}
+	r := &Registry{
+		rev:     rev,
+		byEvent: make(map[string]*Tool, len(tools)),
+		byID:    make(map[string]*Tool, len(tools)),
+	}
 	for _, t := range tools {
 		if err := t.validate(); err != nil {
 			panic(fmt.Sprintf("tool registry: %v", err))
@@ -94,7 +136,11 @@ func NewRegistry(rev int, tools ...*Tool) *Registry {
 		if _, dup := r.byEvent[t.Event]; dup {
 			panic(fmt.Sprintf("tool registry: duplicate event %q", t.Event))
 		}
+		if _, dup := r.byID[t.ID]; dup {
+			panic(fmt.Sprintf("tool registry: duplicate id %q", t.ID))
+		}
 		r.byEvent[t.Event] = t
+		r.byID[t.ID] = t
 		r.list = append(r.list, t)
 	}
 	sort.Slice(r.list, func(i, j int) bool { return r.list[i].ID < r.list[j].ID })

@@ -2,19 +2,27 @@ package tools
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
+
+func ok(map[string]interface{}) map[string]interface{} { return nil }
 
 func TestNewRegistry_RejectsInvalidTool(t *testing.T) {
 	cases := []struct {
 		name string
 		tool *Tool
 	}{
-		{"empty id", &Tool{Event: "x.y", Description: "d"}},
-		{"empty event", &Tool{ID: "x", Description: "d"}},
-		{"empty description", &Tool{ID: "x", Event: "x.y"}},
+		{"nil tool", nil},
+		{"empty id", &Tool{Event: "x.y", Description: "d", Handler: ok}},
+		{"empty event", &Tool{ID: "x", Description: "d", Handler: ok}},
+		{"empty description", &Tool{ID: "x", Event: "x.y", Handler: ok}},
 		{"nil handler", &Tool{ID: "x", Event: "x.y", Description: "d"}},
-		{"bad event charset", &Tool{ID: "x", Event: "X Y", Description: "d", Handler: func(map[string]interface{}) map[string]interface{} { return nil }}},
+		{"bad event charset", &Tool{ID: "x", Event: "X Y", Description: "d", Handler: ok}},
+		{"id starts with digit", &Tool{ID: "1x", Event: "x.y", Description: "d", Handler: ok}},
+		{"event starts with digit", &Tool{ID: "x", Event: "1y", Description: "d", Handler: ok}},
+		{"id too long", &Tool{ID: strings.Repeat("a", 65), Event: "x.y", Description: "d", Handler: ok}},
+		{"description too long", &Tool{ID: "x", Event: "x.y", Description: strings.Repeat("a", 501), Handler: ok}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -41,11 +49,24 @@ func TestRegistry_DuplicateEventPanics(t *testing.T) {
 	)
 }
 
+func TestRegistry_DuplicateIDPanics(t *testing.T) {
+	h := func(map[string]interface{}) map[string]interface{} { return nil }
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected panic on duplicate id")
+		}
+	}()
+	NewRegistry(1,
+		&Tool{ID: "a", Event: "x.a", Description: "d", Handler: h},
+		&Tool{ID: "a", Event: "x.b", Description: "d", Handler: h},
+	)
+}
+
 func TestRegistry_GetAndList(t *testing.T) {
 	h := func(map[string]interface{}) map[string]interface{} { return nil }
 	reg := NewRegistry(7,
-		&Tool{ID: "a", Event: "x.a", Description: "da", Handler: h},
 		&Tool{ID: "b", Event: "x.b", Description: "db", Handler: h},
+		&Tool{ID: "a", Event: "x.a", Description: "da", Handler: h},
 	)
 	if reg.Rev() != 7 {
 		t.Fatalf("rev = %d, want 7", reg.Rev())
@@ -58,6 +79,9 @@ func TestRegistry_GetAndList(t *testing.T) {
 	}
 	if len(reg.List()) != 2 {
 		t.Fatalf("List len = %d, want 2", len(reg.List()))
+	}
+	if reg.List()[0].ID != "a" {
+		t.Fatalf("List should be sorted by ID, first = %s", reg.List()[0].ID)
 	}
 }
 
