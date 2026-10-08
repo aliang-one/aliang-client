@@ -63,6 +63,25 @@ func TestHandleRemoteAgentMessage_ToolsList(t *testing.T) {
 	}
 }
 
+func TestRegistryEventsDoNotCollideWithExplicitArms(t *testing.T) {
+	// 护栏不对称注释（agent_tool_registry.go）中禁令的机器化：注册表事件
+	// 与显式 switch 臂的交集必须恰好是四个旧事件（它们由旧臂直派、护栏
+	// 不生效）；注册表里出现交集之外的任何事件，即意味着该工具可能被
+	// 显式臂遮蔽、永不走护栏分发。
+	// 已知局限：本测试看不到 switch 本身，无法侦测"新显式臂遮蔽新注册表
+	// 事件"的方向；它的真实价值是把"注册表今天只含旧事件"钉死——Phase 2
+	// 新增工具若未处理该不变量，会在此失败并提示作者核对显式臂。
+	allowed := map[string]bool{
+		models.AgentEventFileList: true, models.AgentEventFileRead: true,
+		models.AgentEventGitStatus: true, models.AgentEventEnvInfo: true,
+	}
+	for _, tool := range agentToolRegistry().List() {
+		if !allowed[tool.Event] {
+			t.Fatalf("registry tool %s (event %s) collides with an explicit switch arm or is not one of the four legacy events", tool.ID, tool.Event)
+		}
+	}
+}
+
 func TestHandleRemoteAgentMessage_DefaultArmRegistryDispatch(t *testing.T) {
 	// 交换注册表为含假工具的实例，验证 default 臂的注册表分发端到端可达
 	// （当前四个旧事件被显式臂遮蔽，此路径在 Phase 2 前无生产流量）。

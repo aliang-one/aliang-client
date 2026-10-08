@@ -2,6 +2,7 @@ package tools
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -41,8 +42,14 @@ func TestRegistry_DuplicateEventPanics(t *testing.T) {
 	h := func(map[string]interface{}) map[string]interface{} { return nil }
 	p := map[string]interface{}{"type": "object"}
 	defer func() {
-		if r := recover(); r == nil {
+		r := recover()
+		if r == nil {
 			t.Fatal("expected panic on duplicate event")
+		}
+		// 只断言"发生 panic"会在 validate 整体收紧（任何非法输入都 panic）
+		// 时误判成通过；必须核对 panic 原因确实是重复 event。
+		if !strings.Contains(fmt.Sprint(r), "duplicate event") {
+			t.Fatalf("panic reason = %v, want it to mention duplicate event", r)
 		}
 	}()
 	NewRegistry(1,
@@ -55,8 +62,13 @@ func TestRegistry_DuplicateIDPanics(t *testing.T) {
 	h := func(map[string]interface{}) map[string]interface{} { return nil }
 	p := map[string]interface{}{"type": "object"}
 	defer func() {
-		if r := recover(); r == nil {
+		r := recover()
+		if r == nil {
 			t.Fatal("expected panic on duplicate id")
+		}
+		// 同上：核对 panic 原因确实是重复 id，防止断言被无关 panic 满足。
+		if !strings.Contains(fmt.Sprint(r), "duplicate id") {
+			t.Fatalf("panic reason = %v, want it to mention duplicate id", r)
 		}
 	}()
 	NewRegistry(1,

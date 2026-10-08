@@ -196,7 +196,7 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 			ClosePolicy: "Transient websocket disconnects detach terminal PTYs (kept alive, ring-buffered, replayed on re-attach) and never kill AI sessions. Terminal sessions are killed only by explicit terminal.close, device disable/unbind, remote_terminal_enabled=false, or agent process shutdown.",
 			HeartbeatMs: 10000,
 			ClientSends: []AgentProtocolEvent{
-				{Type: AgentEventHello, Required: []string{"type", "device_id", "protocol_version", "device_name", "platform", "agent_version", "capabilities", "tools", "history", "projects", "vibe_sessions", "started_at"}, Optional: []string{"host", "authorized_directories", "collected_at", "load"}},
+				{Type: AgentEventHello, Required: []string{"type", "device_id", "protocol_version", "device_name", "platform", "agent_version", "capabilities", "tools", "history", "projects", "vibe_sessions", "started_at"}, Optional: []string{"host", "authorized_directories", "collected_at", "load", "agent_tools", "agent_tools_rev"}},
 				{Type: AgentEventHeartbeat, Required: []string{"type", "device_id", "ts"}, Optional: []string{"load"}},
 				{Type: AgentEventSessionRefresh, Required: []string{"type", "access_token"}},
 				{Type: AgentEventTerminalCreated, Required: []string{"type", "session_id", "shell", "cwd", "rows", "cols"}, Optional: []string{"pty", "resumed", "exited", "started_at"}},

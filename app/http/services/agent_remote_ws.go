@@ -939,7 +939,7 @@ func (s *AgentService) agentHelloPayload() map[string]interface{} {
 		"capabilities":           snapshot.Capabilities,
 		"tools":                  snapshot.Tools,
 		"agent_tools":            agentToolRegistry().Descriptors(),
-		"agent_tools_rev":        agentToolRegistryRev,
+		"agent_tools_rev":        agentToolRegistry().Rev(),
 		"history":                snapshot.History,
 		"projects":               snapshot.Projects,
 		"vibe_sessions":          snapshot.VibeSessions,
