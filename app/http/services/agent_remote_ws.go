@@ -635,6 +635,11 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 		// must still be able to wind the transfer down.
 		s.setRemoteConnectionState(true, "online", "")
 		handleAgentFileUploadCancel(msg)
+	// 注意：这四个旧工具事件（file.list/file.read/git.status/env.info）由下面的
+	// 显式臂直派、有意绕过 default 臂的 tools.RunWithGuards 护栏（无超时看门狗/
+	// 输出上限/panic 恢复）——响应形状兼容优先。注册表里它们的 caps（TimeoutMs/
+	// MaxOutputBytes）暂不对这两个臂生效。严禁新增 Event 与任何显式臂冲突的
+	// 注册表工具项（会被广告但永远不会走护栏分发）。
 	case models.AgentEventProjectDetail, models.AgentEventAISessionDetail, models.AgentEventFileList, models.AgentEventFileRead, models.AgentEventSlashCommandsList, "file.working_tree_diff":
 		s.setRemoteConnectionState(true, "online", "")
 		go handleAgentDetailMessageWithAI(msg, writeJSON, s.ai)
@@ -933,6 +938,8 @@ func (s *AgentService) agentHelloPayload() map[string]interface{} {
 		"host":                   snapshot.Host,
 		"capabilities":           snapshot.Capabilities,
 		"tools":                  snapshot.Tools,
+		"agent_tools":            agentToolRegistry().Descriptors(),
+		"agent_tools_rev":        agentToolRegistryRev,
 		"history":                snapshot.History,
 		"projects":               snapshot.Projects,
 		"vibe_sessions":          snapshot.VibeSessions,

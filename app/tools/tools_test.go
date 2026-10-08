@@ -18,6 +18,7 @@ func TestNewRegistry_RejectsInvalidTool(t *testing.T) {
 		{"empty event", &Tool{ID: "x", Description: "d", Handler: ok}},
 		{"empty description", &Tool{ID: "x", Event: "x.y", Handler: ok}},
 		{"nil handler", &Tool{ID: "x", Event: "x.y", Description: "d"}},
+		{"nil parameters", &Tool{ID: "x", Event: "x.y", Description: "d", Handler: ok}},
 		{"bad event charset", &Tool{ID: "x", Event: "X Y", Description: "d", Handler: ok}},
 		{"id starts with digit", &Tool{ID: "1x", Event: "x.y", Description: "d", Handler: ok}},
 		{"event starts with digit", &Tool{ID: "x", Event: "1y", Description: "d", Handler: ok}},
@@ -38,35 +39,37 @@ func TestNewRegistry_RejectsInvalidTool(t *testing.T) {
 
 func TestRegistry_DuplicateEventPanics(t *testing.T) {
 	h := func(map[string]interface{}) map[string]interface{} { return nil }
+	p := map[string]interface{}{"type": "object"}
 	defer func() {
 		if r := recover(); r == nil {
 			t.Fatal("expected panic on duplicate event")
 		}
 	}()
 	NewRegistry(1,
-		&Tool{ID: "a", Event: "x.y", Description: "d", Handler: h},
-		&Tool{ID: "b", Event: "x.y", Description: "d", Handler: h},
+		&Tool{ID: "a", Event: "x.y", Description: "d", Parameters: p, Handler: h},
+		&Tool{ID: "b", Event: "x.y", Description: "d", Parameters: p, Handler: h},
 	)
 }
 
 func TestRegistry_DuplicateIDPanics(t *testing.T) {
 	h := func(map[string]interface{}) map[string]interface{} { return nil }
+	p := map[string]interface{}{"type": "object"}
 	defer func() {
 		if r := recover(); r == nil {
 			t.Fatal("expected panic on duplicate id")
 		}
 	}()
 	NewRegistry(1,
-		&Tool{ID: "a", Event: "x.a", Description: "d", Handler: h},
-		&Tool{ID: "a", Event: "x.b", Description: "d", Handler: h},
+		&Tool{ID: "a", Event: "x.a", Description: "d", Parameters: p, Handler: h},
+		&Tool{ID: "a", Event: "x.b", Description: "d", Parameters: p, Handler: h},
 	)
 }
 
 func TestRegistry_GetAndList(t *testing.T) {
 	h := func(map[string]interface{}) map[string]interface{} { return nil }
 	reg := NewRegistry(7,
-		&Tool{ID: "b", Event: "x.b", Description: "db", Handler: h},
-		&Tool{ID: "a", Event: "x.a", Description: "da", Handler: h},
+		&Tool{ID: "b", Event: "x.b", Description: "db", Parameters: map[string]interface{}{"type": "object"}, Handler: h},
+		&Tool{ID: "a", Event: "x.a", Description: "da", Parameters: map[string]interface{}{"type": "object"}, Handler: h},
 	)
 	if reg.Rev() != 7 {
 		t.Fatalf("rev = %d, want 7", reg.Rev())

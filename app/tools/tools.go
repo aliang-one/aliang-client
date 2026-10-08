@@ -70,6 +70,9 @@ func (t *Tool) validate() error {
 	if t.Description == "" || len(t.Description) > toolDescMaxLen {
 		return fmt.Errorf("tool %s description empty or exceeds %d chars", t.ID, toolDescMaxLen)
 	}
+	if t.Parameters == nil {
+		return fmt.Errorf("tool %s parameters is nil", t.ID)
+	}
 	if t.Handler == nil {
 		return fmt.Errorf("tool %s handler is nil", t.ID)
 	}

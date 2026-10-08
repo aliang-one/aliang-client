@@ -236,6 +236,7 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				{Type: AgentEventProjectDetailResult, Required: []string{"type", "request_id", "project"}},
 				{Type: AgentEventAISessionDetailResult, Required: []string{"type", "request_id", "session"}},
 				{Type: AgentEventSlashCommandsListResult, Required: []string{"type", "request_id", "project_path", "commands"}, Optional: []string{"generated_at", "verified", "claude_version", "capability_generation"}},
+				{Type: AgentEventToolsListResult, Required: []string{"type", "request_id"}, Optional: []string{"rev", "tools", "generated_at"}},
 				{Type: AgentEventSlashCommandsListError, Required: []string{"type", "request_id", "error"}},
 				{Type: AgentEventFileError, Required: []string{"type", "request_id", "error"}},
 				{Type: AgentEventError, Required: []string{"type", "error"}},

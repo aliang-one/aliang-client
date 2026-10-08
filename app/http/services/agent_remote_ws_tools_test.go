@@ -2,8 +2,10 @@ package services
 
 import (
 	"testing"
+	"time"
 
 	"aliang.one/nursorgate/app/http/models"
+	"aliang.one/nursorgate/app/tools"
 	"aliang.one/nursorgate/common/cache"
 )
 
@@ -55,5 +57,56 @@ func TestHandleRemoteAgentMessage_ToolsList(t *testing.T) {
 	}
 	if _, ok := m["tools"].([]map[string]interface{}); !ok {
 		t.Fatalf("tools missing or wrong shape: %T", m["tools"])
+	}
+	if m["rev"] != agentToolRegistryRev {
+		t.Fatalf("rev = %v, want %d", m["rev"], agentToolRegistryRev)
+	}
+}
+
+func TestHandleRemoteAgentMessage_DefaultArmRegistryDispatch(t *testing.T) {
+	// 交换注册表为含假工具的实例，验证 default 臂的注册表分发端到端可达
+	// （当前四个旧事件被显式臂遮蔽，此路径在 Phase 2 前无生产流量）。
+	// 密闭对齐 ToolsList：default 臂 setRemoteConnectionState → saveStateLocked
+	// 落 agent 状态文件，HOME / ALIANG_DATA_DIR 指临时目录 + 重算 cache 单例。
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("ALIANG_DATA_DIR", t.TempDir())
+	cache.ResetCacheDirForTest()
+	t.Cleanup(cache.ResetCacheDirForTest)
+
+	orig := agentToolsRegistry
+	fake := &tools.Tool{
+		ID: "fake_probe", Event: "fake.probe", Description: "test fake",
+		Parameters: map[string]interface{}{"type": "object", "properties": map[string]interface{}{}},
+		Caps:       tools.Caps{ReadOnly: true, TimeoutMs: 5000, MaxOutputBytes: 4096},
+		Handler: func(msg map[string]interface{}) map[string]interface{} {
+			return map[string]interface{}{"type": "fake.probe.result", "request_id": msg["request_id"], "ok": true}
+		},
+	}
+	agentToolsRegistry = tools.NewRegistry(99, fake)
+	t.Cleanup(func() { agentToolsRegistry = orig })
+
+	done := make(chan map[string]interface{}, 1)
+	writeJSON := func(p interface{}) error {
+		if m, ok := p.(map[string]interface{}); ok {
+			done <- m
+		}
+		return nil
+	}
+	svc := &AgentService{}
+	svc.mu.Lock()
+	svc.state.Enabled = true
+	svc.state.Registered = true
+	svc.mu.Unlock()
+	svc.handleRemoteAgentMessage(map[string]interface{}{
+		"type":       "fake.probe",
+		"request_id": "req_fake1",
+	}, writeJSON)
+	select {
+	case m := <-done:
+		if m["type"] != "fake.probe.result" || m["request_id"] != "req_fake1" || m["ok"] != true {
+			t.Fatalf("unexpected payload: %v", m)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("default-arm registry dispatch did not respond in time")
 	}
 }

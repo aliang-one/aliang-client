@@ -14,6 +14,7 @@ const agentToolRegistryRev = 1
 // future tools get appended here and light up server-side with zero server
 // code change. Handler wiring reuses the existing payload funcs verbatim, so
 // legacy response shapes are untouched.
+// 注意：本表四个工具的 Event 与 agent_remote_ws.go 的显式 switch 臂重合，当前由旧臂直派（护栏不生效）；收编见计划 Phase 2 遗留债务。
 func buildAgentToolRegistry() *tools.Registry {
 	return tools.NewRegistry(agentToolRegistryRev,
 		&tools.Tool{
