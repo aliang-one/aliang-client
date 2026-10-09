@@ -435,10 +435,13 @@ func TestTuiSyncFireUsesKnobsSnapshottedAtSchedule(t *testing.T) {
 	origWindow := ccPeerSyncCoalesceWindow
 	origHeld := ccPeerHeldWatchWindow
 	origDial := ccPeerDialInject
+	origMatches := externalInterruptTargetMatches
+	externalInterruptTargetMatches = func(int) bool { return true }
 	defer func() {
 		ccPeerSyncCoalesceWindow = origWindow
 		ccPeerHeldWatchWindow = origHeld
 		ccPeerDialInject = origDial
+		externalInterruptTargetMatches = origMatches
 		ccPeerSyncMu.Lock()
 		delete(ccPeerSyncBaseline, "ssnap")
 		ccPeerSyncMu.Unlock()

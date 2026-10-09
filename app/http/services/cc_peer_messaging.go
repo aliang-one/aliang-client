@@ -319,9 +319,18 @@ func ccPeerSyncShouldInject(in ccPeerSyncGateInput) bool {
 	return true
 }
 
-// ccPeerSyncFire runs after the coalesce window: gate, inject, log. No reply
-// is written anywhere — the contract is best-effort with agent-log evidence.
+// ccPeerSyncFire 用当前全局旋钮直呼——仅供同步调用方（测试）使用；
+// tuiSync 的定时器路径必须走 ccPeerSyncFireWith（调度时快照），否则定时器
+// goroutine 裸读全局旋钮，与测试的 defer 恢复构成 DATA RACE（-race 全包
+// 基线即败）。
 func ccPeerSyncFire(home, nativeSessionID string) {
+	ccPeerSyncFireWith(home, nativeSessionID, ccPeerDialInject, ccPeerHeldWatchWindow, externalInterruptTargetMatches)
+}
+
+// ccPeerSyncFireWith 是 fire 的实体：旋钮由调度方在安排定时器那一刻快照传入，
+// 定时器 goroutine 不再读任何全局可变量（含 liveClaudeTUIRecord 的身份门禁
+// targetMatches——它同样在 fire 路径上被读）。
+func ccPeerSyncFireWith(home, nativeSessionID string, dialInject func(socketPath, token, digest, fromMode string) error, heldWindow time.Duration, targetMatches func(int) bool) {
 	ccPeerSyncMu.Lock()
 	pending := ccPeerSyncPending[nativeSessionID]
 	delete(ccPeerSyncPending, nativeSessionID)
@@ -330,7 +339,7 @@ func ccPeerSyncFire(home, nativeSessionID string) {
 	if pending == nil || strings.TrimSpace(pending.digest) == "" {
 		return
 	}
-	record, live := liveClaudeTUIRecord(home, nativeSessionID)
+	record, live := liveClaudeTUIRecordWith(home, nativeSessionID, targetMatches)
 	socketPath, tuiStart := "", time.Time{}
 	if live {
 		socketPath = record.MessagingSocketPath
@@ -352,11 +361,11 @@ func ccPeerSyncFire(home, nativeSessionID string) {
 		logger.Info(fmt.Sprintf("ai.tui.sync: gate dropped home=%q native=%s live=%v status=%q socket=%q", home, nativeSessionID, live, strings.TrimSpace(record.Status), socketPath))
 		return
 	}
-	if err := ccPeerDialInject(socketPath, loadClaudePeerToken(home, record.PID), pending.digest, fromMode); err != nil {
+	if err := dialInject(socketPath, loadClaudePeerToken(home, record.PID), pending.digest, fromMode); err != nil {
 		logger.Info(fmt.Sprintf("ai.tui.sync: inject failed home=%q native=%s error=%v", home, nativeSessionID, err))
 		return
 	}
-	if ccPeerWatchHeld(jsonlPath, size, ccPeerHeldWatchWindow) {
+	if ccPeerWatchHeld(jsonlPath, size, heldWindow) {
 		logger.Info(fmt.Sprintf("ai.tui.sync: HELD by receiver home=%q native=%s fromMode=%q — baseline not updated", home, nativeSessionID, fromMode))
 		return
 	}
@@ -385,6 +394,12 @@ func (m *agentAIManager) tuiSync(msg map[string]interface{}, _ agentTerminalWrit
 		return
 	}
 	entry := &ccPeerSyncPendingEntry{digest: digest}
-	entry.timer = time.AfterFunc(ccPeerSyncCoalesceWindow, func() { ccPeerSyncFire(home, sourceSessionID) })
+	// 快照旋钮：此刻与调用方（测试/上游写旋钮）同 goroutine，读全局有先后序；
+	// AfterFunc 提供 happens-before，fire goroutine 只碰闭包副本——全局旋钮
+	// 从此不与任何在途定时器竞争。
+	dialInject, heldWindow, targetMatches := ccPeerDialInject, ccPeerHeldWatchWindow, externalInterruptTargetMatches
+	entry.timer = time.AfterFunc(ccPeerSyncCoalesceWindow, func() {
+		ccPeerSyncFireWith(home, sourceSessionID, dialInject, heldWindow, targetMatches)
+	})
 	ccPeerSyncPending[sourceSessionID] = entry
 }
