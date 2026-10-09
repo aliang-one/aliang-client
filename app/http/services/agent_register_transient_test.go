@@ -119,13 +119,15 @@ func TestRegisterTransportFailureKeepsRegistration(t *testing.T) {
 	dead.Close() // 立即关闭 → connection refused（传输层瞬态）
 
 	config.SetGlobalConfig(&config.Config{Core: &config.CoreConfig{AgentServer: deadURL}})
-	if err := service.SyncNow(); err == nil {
+	syncErr := service.SyncNow()
+	if syncErr == nil {
 		t.Fatal("SyncNow() error = nil, want transport failure")
 	}
 	service.mu.Lock()
 	defer service.mu.Unlock()
 	if !service.state.Registered {
-		t.Fatal("Registered was flipped to false by a transport failure — must keep registration")
+		t.Fatalf("Registered was flipped to false by a transport failure — must keep registration; classify=%t isRefusedSyscall=%v errType=%T err=%v",
+			classifyRegisterFailure(syncErr), errors.Is(syncErr, syscall.ECONNREFUSED), syncErr, syncErr)
 	}
 	if !service.state.Enabled {
 		t.Fatal("Enabled was flipped to false by a transport failure — must keep enablement")
