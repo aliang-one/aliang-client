@@ -312,6 +312,7 @@ export default {
   dash_details: '详情',
   dash_reinstall: '重新安装',
   dash_quickTools: '快捷工具',
+  dash_controlPanel: '控制面板',
   dash_quickSetup: '快速配置',
   dash_moreSettings: '更多设置',
   dash_accountBalance: '账户余额',

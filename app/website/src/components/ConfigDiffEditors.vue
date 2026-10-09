@@ -1,7 +1,7 @@
 <template>
-  <div class="grid min-h-0 flex-1 grid-cols-[minmax(0,1fr)_minmax(0,1fr)] overflow-hidden">
+  <div class="grid min-h-0 flex-1 grid-cols-1 overflow-hidden md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
     <!-- 左列：在用配置只读（rose 变更行装饰 + 悬停「采用此块」浮钮） -->
-    <div class="flex min-h-0 min-w-0 flex-col border-r border-slate-200 dark:border-slate-700">
+    <div class="flex min-h-0 min-w-0 flex-col border-b border-slate-200 md:border-b-0 md:border-r dark:border-slate-700">
       <div class="flex shrink-0 flex-wrap items-center gap-x-1.5 border-b border-slate-200 bg-slate-100/70 px-3 py-2 text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-400">
         {{ t('qs_diff_left') }}
         <span

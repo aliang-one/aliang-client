@@ -312,6 +312,7 @@ export default {
   dash_details: 'Details',
   dash_reinstall: 'Re-install',
   dash_quickTools: 'Quick Tools',
+  dash_controlPanel: 'Controls',
   dash_quickSetup: 'Quick Setup',
   dash_moreSettings: 'More Settings',
   dash_accountBalance: 'Account Balance',

@@ -10,7 +10,7 @@
       <div class="absolute inset-0 bg-slate-900/60" @click="emit('close')"></div>
 
       <div
-        class="relative z-10 flex h-[min(88vh,760px)] w-[min(96vw,900px)] flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-2xl dark:border-slate-700 dark:bg-slate-900"
+        class="relative z-10 flex h-[min(88vh,760px)] max-h-[88dvh] w-full sm:w-[min(96vw,900px)] flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-2xl dark:border-slate-700 dark:bg-slate-900"
       >
         <div class="flex items-start justify-between gap-4 border-b border-slate-100 px-5 py-4 dark:border-slate-800">
           <div>
@@ -19,7 +19,7 @@
           </div>
           <button
             type="button"
-            class="inline-flex size-8 shrink-0 items-center justify-center rounded-full text-slate-400 transition hover:bg-slate-100 hover:text-slate-600 dark:hover:bg-slate-800 dark:hover:text-slate-200"
+            class="inline-flex size-10 md:size-8 shrink-0 items-center justify-center rounded-full text-slate-400 transition hover:bg-slate-100 hover:text-slate-600 dark:hover:bg-slate-800 dark:hover:text-slate-200"
             :aria-label="t('guide_close')"
             @click="emit('close')"
           >
@@ -32,7 +32,7 @@
             v-for="doc in docs"
             :key="doc.id"
             type="button"
-            class="rounded-full px-3 py-1.5 text-xs font-semibold transition"
+            class="rounded-full px-3 py-2.5 md:py-1.5 text-xs font-semibold transition"
             :class="activeDoc === doc.id ? 'bg-primary text-white' : 'bg-slate-100 text-slate-600 hover:bg-slate-200 dark:bg-slate-800 dark:text-slate-300 dark:hover:bg-slate-700'"
             @click="selectDoc(doc.id)"
           >

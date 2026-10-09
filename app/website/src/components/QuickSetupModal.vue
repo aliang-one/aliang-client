@@ -9,11 +9,11 @@
     <div class="absolute inset-0 bg-slate-900/45 backdrop-blur-sm" @click="emit('close')"></div>
 
     <div
-      class="relative z-10 flex h-[720px] w-full max-w-6xl overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-2xl dark:border-slate-800 dark:bg-slate-900"
+      class="relative z-10 flex h-[720px] max-h-[92dvh] w-full max-w-6xl flex-col md:flex-row overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-2xl dark:border-slate-800 dark:bg-slate-900"
     >
       <!-- Left sidebar：installed 过滤后的 agent 列表 -->
-      <aside class="flex w-72 shrink-0 flex-col border-r border-slate-100 bg-slate-50/80 dark:border-slate-800 dark:bg-slate-800/30">
-        <div class="border-b border-slate-100 px-6 py-5 dark:border-slate-800">
+      <aside class="flex w-full shrink-0 flex-col border-b border-slate-100 bg-slate-50/80 md:w-72 md:border-b-0 md:border-r dark:border-slate-800 dark:bg-slate-800/30">
+        <div class="border-b border-slate-100 px-4 py-4 md:px-6 md:py-5 dark:border-slate-800">
           <p class="text-[11px] font-bold uppercase tracking-[0.28em] text-slate-400">{{ t('qs_title') }}</p>
           <h3 class="mt-2 text-lg font-semibold text-slate-900 dark:text-white">{{ t('qs_presetTemplates') }}</h3>
           <p class="mt-1 text-xs leading-5 text-slate-500 dark:text-slate-400">
@@ -21,7 +21,7 @@
           </p>
         </div>
 
-        <div class="flex-1 space-y-2 overflow-y-auto px-4 py-4 custom-scrollbar">
+        <div class="max-h-44 md:max-h-none flex-1 space-y-2 overflow-y-auto px-4 py-4 custom-scrollbar">
           <button
             v-for="software in installedSoftwares"
             :key="software.code"
@@ -66,8 +66,8 @@
       </aside>
 
       <!-- Right panel -->
-      <div class="flex min-w-0 flex-1 flex-col">
-        <header class="flex h-16 shrink-0 items-center justify-between border-b border-slate-100 px-6 dark:border-slate-800">
+      <div class="flex min-h-0 min-w-0 flex-1 flex-col">
+        <header class="flex h-16 shrink-0 items-center justify-between border-b border-slate-100 px-4 md:px-6 dark:border-slate-800">
           <div class="min-w-0">
             <p class="truncate text-base font-semibold text-slate-900 dark:text-white">
               {{ selectedSoftwareDef?.name || t('qs_title') }}
@@ -79,7 +79,7 @@
           <div class="flex items-center gap-2">
             <button
               type="button"
-              class="inline-flex min-h-9 items-center justify-center rounded-lg border border-slate-200 px-3 text-xs font-semibold text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+              class="inline-flex min-h-10 md:min-h-9 items-center justify-center rounded-lg border border-slate-200 px-3 text-xs font-semibold text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
               :disabled="!activeCombo || Boolean(applyResult) || applying"
               @click="openConfigure"
             >
@@ -87,7 +87,7 @@
             </button>
             <button
               type="button"
-              class="inline-flex min-h-9 items-center justify-center rounded-lg bg-primary px-4 text-xs font-semibold text-white transition hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+              class="inline-flex min-h-10 md:min-h-9 items-center justify-center rounded-lg bg-primary px-4 text-xs font-semibold text-white transition hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
               :disabled="!applyReadiness.ready || applying || Boolean(applyResult) || configureOpen"
               @click="applyCombo"
             >
@@ -104,7 +104,7 @@
           </div>
         </header>
 
-        <div class="flex-1 overflow-y-auto px-6 py-5 custom-scrollbar">
+        <div class="flex-1 overflow-y-auto px-4 py-4 md:px-6 md:py-5 custom-scrollbar">
           <div v-if="loadingCatalog" class="rounded-2xl border border-dashed border-slate-300 bg-slate-50 px-5 py-6 text-sm text-slate-500 dark:border-slate-700 dark:bg-slate-900/40 dark:text-slate-400">
             {{ t('qs_loading') }}
           </div>
@@ -147,7 +147,7 @@
                   type="button"
                   :aria-pressed="activeCombo?.id === combo.id"
                   :class="[
-                    'min-h-8 rounded-lg px-3 text-xs font-semibold transition',
+                    'min-h-9 md:min-h-8 rounded-lg px-3 text-xs font-semibold transition',
                     activeCombo?.id === combo.id
                       ? 'bg-white text-primary shadow-sm dark:bg-slate-800 dark:text-primary'
                       : 'text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200',
@@ -158,7 +158,7 @@
                 </button>
                 <button
                   type="button"
-                  class="inline-flex min-h-8 items-center justify-center gap-0.5 rounded-lg border border-dashed border-slate-300 px-2.5 text-xs font-semibold text-slate-500 transition hover:border-primary/40 hover:text-primary dark:border-slate-700 dark:text-slate-400 dark:hover:border-primary/40 dark:hover:text-primary"
+                  class="inline-flex min-h-9 md:min-h-8 items-center justify-center gap-0.5 rounded-lg border border-dashed border-slate-300 px-2.5 text-xs font-semibold text-slate-500 transition hover:border-primary/40 hover:text-primary dark:border-slate-700 dark:text-slate-400 dark:hover:border-primary/40 dark:hover:text-primary"
                   @click="openCreateDialog"
                 >
                   <span class="material-symbols-outlined text-sm">add</span>
@@ -184,14 +184,14 @@
             >
               <button
                 type="button"
-                class="inline-flex min-h-8 items-center justify-center rounded-lg border border-slate-200 px-3 text-[11px] font-semibold text-slate-700 transition hover:bg-slate-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+                class="inline-flex min-h-9 md:min-h-8 items-center justify-center rounded-lg border border-slate-200 px-3 text-[11px] font-semibold text-slate-700 transition hover:bg-slate-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
                 @click="openRename"
               >
                 {{ t('qs_combo_rename') }}
               </button>
               <button
                 type="button"
-                class="inline-flex min-h-8 items-center justify-center rounded-lg border border-slate-200 px-3 text-[11px] font-semibold text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+                class="inline-flex min-h-9 md:min-h-8 items-center justify-center rounded-lg border border-slate-200 px-3 text-[11px] font-semibold text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
                 :disabled="activeCombo.is_default"
                 @click="makeDefault"
               >
@@ -199,7 +199,7 @@
               </button>
               <button
                 type="button"
-                class="inline-flex min-h-8 items-center justify-center rounded-lg border border-rose-200 px-3 text-[11px] font-semibold text-rose-600 transition hover:bg-rose-50 dark:border-rose-900/50 dark:text-rose-400 dark:hover:bg-rose-950/30"
+                class="inline-flex min-h-9 md:min-h-8 items-center justify-center rounded-lg border border-rose-200 px-3 text-[11px] font-semibold text-rose-600 transition hover:bg-rose-50 dark:border-rose-900/50 dark:text-rose-400 dark:hover:bg-rose-950/30"
                 @click="deleteConfirmOpen = true; comboMenuOpen = false"
               >
                 {{ t('qs_combo_delete') }}
@@ -221,7 +221,7 @@
               />
               <button
                 type="button"
-                class="inline-flex min-h-8 items-center justify-center rounded-lg bg-primary px-3 text-[11px] font-semibold text-white transition hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+                class="inline-flex min-h-9 md:min-h-8 items-center justify-center rounded-lg bg-primary px-3 text-[11px] font-semibold text-white transition hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
                 :disabled="comboSaving || !renameDraft.trim()"
                 @click="confirmRename"
               >
@@ -229,7 +229,7 @@
               </button>
               <button
                 type="button"
-                class="inline-flex min-h-8 items-center justify-center rounded-lg border border-slate-200 px-3 text-[11px] font-semibold text-slate-600 transition hover:bg-slate-50 dark:border-slate-700 dark:text-slate-300"
+                class="inline-flex min-h-9 md:min-h-8 items-center justify-center rounded-lg border border-slate-200 px-3 text-[11px] font-semibold text-slate-600 transition hover:bg-slate-50 dark:border-slate-700 dark:text-slate-300"
                 @click="renameOpen = false"
               >
                 {{ t('qs_cancel') }}
@@ -254,7 +254,7 @@
                 :key="`file-tab-${file.code}`"
                 type="button"
                 :class="[
-                  'inline-flex min-h-9 items-center justify-center rounded-full border px-3 text-[11px] font-semibold transition',
+                  'inline-flex min-h-10 md:min-h-9 items-center justify-center rounded-full border px-3 text-[11px] font-semibold transition',
                   file.code === activeFileCode
                     ? 'border-primary/30 bg-primary/10 text-primary'
                     : 'border-slate-200 text-slate-600 hover:bg-slate-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800',
@@ -314,14 +314,14 @@
                 <div class="flex items-center justify-end gap-2">
                   <button
                     type="button"
-                    class="inline-flex min-h-9 items-center justify-center rounded-lg border border-slate-200 px-4 text-xs font-semibold text-slate-700 transition hover:bg-slate-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+                    class="inline-flex min-h-10 md:min-h-9 items-center justify-center rounded-lg border border-slate-200 px-4 text-xs font-semibold text-slate-700 transition hover:bg-slate-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
                     @click="cancelTemplateEditing"
                   >
                     {{ t('qs_tpl_cancel') }}
                   </button>
                   <button
                     type="button"
-                    class="inline-flex min-h-9 items-center justify-center rounded-lg bg-primary px-4 text-xs font-semibold text-white transition hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+                    class="inline-flex min-h-10 md:min-h-9 items-center justify-center rounded-lg bg-primary px-4 text-xs font-semibold text-white transition hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
                     :disabled="comboSaving"
                     @click="saveTemplate"
                   >
@@ -343,7 +343,7 @@
                   <div class="flex items-center gap-2">
                     <button
                       type="button"
-                      class="inline-flex min-h-8 items-center justify-center gap-1 rounded-lg border border-slate-200 px-3 text-[11px] font-semibold text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+                      class="inline-flex min-h-9 md:min-h-8 items-center justify-center gap-1 rounded-lg border border-slate-200 px-3 text-[11px] font-semibold text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
                       :disabled="liveFilesLoading"
                       @click="refreshLiveFiles"
                     >
@@ -352,21 +352,21 @@
                     </button>
                     <button
                       type="button"
-                      class="inline-flex min-h-8 items-center justify-center rounded-lg border border-slate-200 px-3 text-[11px] font-semibold text-slate-700 transition hover:bg-slate-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+                      class="inline-flex min-h-9 md:min-h-8 items-center justify-center rounded-lg border border-slate-200 px-3 text-[11px] font-semibold text-slate-700 transition hover:bg-slate-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
                       @click="startTemplateEditing"
                     >
                       {{ t('qs_tpl_edit') }}
                     </button>
                     <button
                       type="button"
-                      class="inline-flex min-h-8 items-center justify-center rounded-lg border border-slate-200 px-3 text-[11px] font-semibold text-slate-700 transition hover:bg-slate-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+                      class="inline-flex min-h-9 md:min-h-8 items-center justify-center rounded-lg border border-slate-200 px-3 text-[11px] font-semibold text-slate-700 transition hover:bg-slate-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
                       @click="revertPreview"
                     >
                       {{ t('qs_diff_revert_preview') }}
                     </button>
                     <button
                       type="button"
-                      class="inline-flex min-h-8 items-center justify-center rounded-lg bg-primary px-3 text-[11px] font-semibold text-white transition hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+                      class="inline-flex min-h-9 md:min-h-8 items-center justify-center rounded-lg bg-primary px-3 text-[11px] font-semibold text-white transition hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
                       :disabled="comboSaving"
                       @click="savePreviewAsTemplate"
                     >
@@ -398,7 +398,7 @@
                 <ConfigDiffEditors
                   v-else
                   ref="diffEditorsRef"
-                  class="mt-2 h-[440px] overflow-hidden rounded-2xl border border-slate-200 dark:border-slate-700"
+                  class="mt-2 h-[75dvh] md:h-[440px] overflow-hidden rounded-2xl border border-slate-200 dark:border-slate-700"
                   :left-content="liveContent ?? ''"
                   :right-content="effectivePreviewContent"
                   :format="activeFileDecl?.format ?? ''"
@@ -424,7 +424,7 @@
                   </p>
                   <button
                     type="button"
-                    class="inline-flex min-h-7 shrink-0 items-center justify-center gap-1 rounded-lg border border-rose-200 px-2.5 text-[11px] font-semibold text-rose-600 transition hover:bg-rose-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-rose-900/50 dark:text-rose-400 dark:hover:bg-rose-950/30"
+                    class="inline-flex min-h-9 md:min-h-7 shrink-0 items-center justify-center gap-1 rounded-lg border border-rose-200 px-2.5 text-[11px] font-semibold text-rose-600 transition hover:bg-rose-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-rose-900/50 dark:text-rose-400 dark:hover:bg-rose-950/30"
                     :disabled="restoring"
                     @click="openRestoreConfirm"
                   >
@@ -458,7 +458,7 @@
       :aria-label="t('qs_combo_source_title')"
     >
       <div class="absolute inset-0 bg-slate-900/45 backdrop-blur-sm" @click="closeCreateDialog"></div>
-      <div class="relative z-10 w-full max-w-md rounded-2xl border border-slate-200 bg-white p-5 shadow-2xl dark:border-slate-800 dark:bg-slate-900">
+      <div class="relative z-10 w-full max-h-[88dvh] overflow-y-auto max-w-md rounded-2xl border border-slate-200 bg-white p-5 shadow-2xl dark:border-slate-800 dark:bg-slate-900">
         <h4 class="text-base font-semibold text-slate-900 dark:text-white">{{ t('qs_combo_source_title') }}</h4>
 
         <div class="mt-3 grid gap-2">
@@ -511,14 +511,14 @@
         <div class="mt-5 flex items-center justify-end gap-2">
           <button
             type="button"
-            class="inline-flex min-h-9 items-center justify-center rounded-lg border border-slate-200 px-4 text-xs font-semibold text-slate-700 transition hover:bg-slate-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+            class="inline-flex min-h-10 md:min-h-9 items-center justify-center rounded-lg border border-slate-200 px-4 text-xs font-semibold text-slate-700 transition hover:bg-slate-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
             @click="closeCreateDialog"
           >
             {{ t('qs_cancel') }}
           </button>
           <button
             type="button"
-            class="inline-flex min-h-9 items-center justify-center rounded-lg bg-primary px-4 text-xs font-semibold text-white transition hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+            class="inline-flex min-h-10 md:min-h-9 items-center justify-center rounded-lg bg-primary px-4 text-xs font-semibold text-white transition hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
             :disabled="comboSaving || !createReady"
             @click="confirmCreateCombo"
           >
@@ -537,7 +537,7 @@
       :aria-label="t('qs_combo_delete')"
     >
       <div class="absolute inset-0 bg-slate-900/45 backdrop-blur-sm" @click="deleteConfirmOpen = false"></div>
-      <div class="relative z-10 w-full max-w-md rounded-2xl border border-slate-200 bg-white p-5 shadow-2xl dark:border-slate-800 dark:bg-slate-900">
+      <div class="relative z-10 w-full max-h-[88dvh] overflow-y-auto max-w-md rounded-2xl border border-slate-200 bg-white p-5 shadow-2xl dark:border-slate-800 dark:bg-slate-900">
         <h4 class="text-base font-semibold text-slate-900 dark:text-white">{{ t('qs_combo_delete') }}</h4>
         <p class="mt-2 text-[12px] leading-5 text-slate-500 dark:text-slate-400">
           {{ t('qs_combo_delete_confirm', { name: activeCombo.name }) }}
@@ -546,14 +546,14 @@
         <div class="mt-5 flex items-center justify-end gap-2">
           <button
             type="button"
-            class="inline-flex min-h-9 items-center justify-center rounded-lg border border-slate-200 px-4 text-xs font-semibold text-slate-700 transition hover:bg-slate-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+            class="inline-flex min-h-10 md:min-h-9 items-center justify-center rounded-lg border border-slate-200 px-4 text-xs font-semibold text-slate-700 transition hover:bg-slate-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
             @click="deleteConfirmOpen = false"
           >
             {{ t('qs_cancel') }}
           </button>
           <button
             type="button"
-            class="inline-flex min-h-9 items-center justify-center rounded-lg bg-rose-600 px-4 text-xs font-semibold text-white transition hover:bg-rose-500 disabled:cursor-not-allowed disabled:opacity-50"
+            class="inline-flex min-h-10 md:min-h-9 items-center justify-center rounded-lg bg-rose-600 px-4 text-xs font-semibold text-white transition hover:bg-rose-500 disabled:cursor-not-allowed disabled:opacity-50"
             :disabled="comboSaving"
             @click="confirmDeleteCombo"
           >
@@ -572,7 +572,7 @@
       :aria-label="t('qs_restore_confirm_title')"
     >
       <div class="absolute inset-0 bg-slate-900/45 backdrop-blur-sm" @click="closeRestoreConfirm"></div>
-      <div class="relative z-10 w-full max-w-md rounded-2xl border border-slate-200 bg-white p-5 shadow-2xl dark:border-slate-800 dark:bg-slate-900">
+      <div class="relative z-10 w-full max-h-[88dvh] overflow-y-auto max-w-md rounded-2xl border border-slate-200 bg-white p-5 shadow-2xl dark:border-slate-800 dark:bg-slate-900">
         <h4 class="text-base font-semibold text-slate-900 dark:text-white">{{ t('qs_restore_confirm_title') }}</h4>
         <p class="mt-2 text-[12px] leading-5 text-slate-500 dark:text-slate-400">{{ t('qs_restore_confirm_desc') }}</p>
 
@@ -596,7 +596,7 @@
         <div class="mt-5 flex items-center justify-end gap-2">
           <button
             type="button"
-            class="inline-flex min-h-9 items-center justify-center rounded-lg border border-slate-200 px-4 text-xs font-semibold text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+            class="inline-flex min-h-10 md:min-h-9 items-center justify-center rounded-lg border border-slate-200 px-4 text-xs font-semibold text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
             :disabled="restoring"
             @click="closeRestoreConfirm"
           >
@@ -604,7 +604,7 @@
           </button>
           <button
             type="button"
-            class="inline-flex min-h-9 items-center justify-center rounded-lg bg-rose-600 px-4 text-xs font-semibold text-white transition hover:bg-rose-500 disabled:cursor-not-allowed disabled:opacity-50"
+            class="inline-flex min-h-10 md:min-h-9 items-center justify-center rounded-lg bg-rose-600 px-4 text-xs font-semibold text-white transition hover:bg-rose-500 disabled:cursor-not-allowed disabled:opacity-50"
             :disabled="restoring"
             @click="confirmRestore"
           >

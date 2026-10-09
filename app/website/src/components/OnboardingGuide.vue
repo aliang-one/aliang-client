@@ -17,7 +17,7 @@
 
       <div
         ref="panelRef"
-        class="absolute z-10 w-[min(92vw,420px)] rounded-2xl border border-slate-200 bg-white p-5 shadow-2xl dark:border-slate-700 dark:bg-slate-900"
+        class="absolute z-10 max-h-[calc(100dvh-24px)] overflow-y-auto w-[min(92vw,420px)] rounded-2xl border border-slate-200 bg-white p-5 shadow-2xl dark:border-slate-700 dark:bg-slate-900"
         :style="panelStyle"
       >
         <div class="flex items-start justify-between gap-3">
@@ -27,7 +27,7 @@
           </div>
           <button
             type="button"
-            class="inline-flex size-8 shrink-0 items-center justify-center rounded-full text-slate-400 transition hover:bg-slate-100 hover:text-slate-600 dark:hover:bg-slate-800 dark:hover:text-slate-200"
+            class="inline-flex size-10 md:size-8 shrink-0 items-center justify-center rounded-full text-slate-400 transition hover:bg-slate-100 hover:text-slate-600 dark:hover:bg-slate-800 dark:hover:text-slate-200"
             :aria-label="t('guide_close')"
             @click="handleSkip"
           >
@@ -77,7 +77,7 @@
             <button
               v-if="currentStepIndex > 0"
               type="button"
-              class="inline-flex h-9 items-center justify-center rounded-lg border border-slate-200 px-3 text-xs font-semibold text-slate-700 transition hover:bg-slate-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
+              class="inline-flex h-10 md:h-9 items-center justify-center rounded-lg border border-slate-200 px-3 text-xs font-semibold text-slate-700 transition hover:bg-slate-50 dark:border-slate-700 dark:text-slate-200 dark:hover:bg-slate-800"
               @click="goPrevious"
             >
               {{ t('guide_prev') }}
@@ -85,14 +85,14 @@
             <button
               v-if="currentStep.actionLabel"
               type="button"
-              class="inline-flex h-9 items-center justify-center rounded-lg bg-primary/10 px-3 text-xs font-semibold text-primary transition hover:bg-primary/20"
+              class="inline-flex h-10 md:h-9 items-center justify-center rounded-lg bg-primary/10 px-3 text-xs font-semibold text-primary transition hover:bg-primary/20"
               @click="runCurrentAction"
             >
               {{ currentStep.actionLabel }}
             </button>
             <button
               type="button"
-              class="inline-flex h-9 items-center justify-center rounded-lg bg-primary px-3 text-xs font-semibold text-white transition hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-60"
+              class="inline-flex h-10 md:h-9 items-center justify-center rounded-lg bg-primary px-3 text-xs font-semibold text-white transition hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-60"
               :disabled="!canAdvance"
               @click="goNext"
             >

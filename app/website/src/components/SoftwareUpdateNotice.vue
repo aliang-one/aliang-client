@@ -1,5 +1,5 @@
 <template>
-  <div v-if="noticeVisible" class="pointer-events-none fixed right-5 top-5 z-[1050] flex flex-col items-end gap-3">
+  <div v-if="noticeVisible" class="pointer-events-none fixed right-3 top-3 z-[1050] flex max-w-[calc(100vw-1.5rem)] flex-col items-end gap-3 sm:right-5 sm:top-5">
     <button
       type="button"
       class="pointer-events-auto inline-flex items-center gap-3 rounded-2xl border px-4 py-3 shadow-xl backdrop-blur-md transition hover:-translate-y-0.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-slate-950"
@@ -23,7 +23,7 @@
       class="pointer-events-auto fixed inset-0 z-[1060] flex items-center justify-center bg-slate-950/72 p-4 backdrop-blur-sm"
       @click.self="handleOverlayClose"
     >
-      <div class="w-full max-w-2xl overflow-hidden rounded-[28px] border border-slate-200 bg-white shadow-2xl dark:border-slate-700 dark:bg-slate-900">
+      <div class="flex max-h-[90dvh] w-full max-w-2xl flex-col overflow-hidden rounded-[28px] border border-slate-200 bg-white shadow-2xl dark:border-slate-700 dark:bg-slate-900">
         <div class="relative overflow-hidden border-b border-slate-200 dark:border-slate-700">
           <div class="absolute inset-0 bg-[radial-gradient(circle_at_top_right,_rgba(248,113,113,0.22),_transparent_45%),radial-gradient(circle_at_left,_rgba(251,191,36,0.18),_transparent_38%)]"></div>
           <div class="relative px-6 py-6 sm:px-7">
@@ -62,7 +62,7 @@
           </div>
         </div>
 
-        <div class="space-y-5 px-6 py-6 sm:px-7">
+        <div class="min-h-0 flex-1 space-y-5 overflow-y-auto px-6 py-6 sm:px-7">
           <div class="grid gap-4 sm:grid-cols-2">
             <div class="rounded-2xl border border-slate-200 bg-slate-50/80 p-4 dark:border-slate-700 dark:bg-slate-800/60">
               <p class="text-[11px] font-bold uppercase tracking-[0.24em] text-slate-400">{{ t('update_statusTitle') }}</p>

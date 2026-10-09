@@ -137,7 +137,7 @@
                   <h4 class="font-semibold text-slate-900 dark:text-white">{{ providerLabel(provider, presetProviders) }}</h4>
                   <p class="text-xs text-slate-500">{{ provider }}</p>
                 </div>
-                <label class="inline-flex cursor-pointer items-center gap-2 text-xs font-semibold text-slate-600 dark:text-slate-200">
+                <label class="inline-flex min-h-9 cursor-pointer items-center gap-2 text-xs font-semibold text-slate-600 dark:text-slate-200 md:min-h-0">
                   <input v-model="form.ai_rules[provider].enble" class="peer sr-only" type="checkbox" />
                   <span class="relative h-6 w-11 rounded-full bg-slate-300 transition-colors after:absolute after:left-0.5 after:top-0.5 after:h-5 after:w-5 after:rounded-full after:bg-white after:transition-transform after:content-[''] peer-checked:bg-primary peer-checked:after:translate-x-5 peer-focus-visible:outline peer-focus-visible:outline-2 peer-focus-visible:outline-offset-2 peer-focus-visible:outline-primary dark:bg-slate-700"></span>
                   
@@ -159,7 +159,7 @@
 
                 <div
                   v-if="isProviderEditorOpen(provider)"
-                  class="absolute inset-x-0 top-full z-20 mt-2 rounded-2xl border border-slate-200 bg-white p-4 shadow-2xl dark:border-slate-700 dark:bg-slate-950"
+                  class="mt-2 rounded-2xl border border-slate-200 bg-white p-4 shadow-2xl md:absolute md:inset-x-0 md:top-full md:z-20 dark:border-slate-700 dark:bg-slate-950"
                   @click.stop
                 >
                   <div class="mb-3 flex items-start justify-between gap-3">
@@ -185,14 +185,14 @@
                   <div class="mt-4 flex items-center justify-end gap-2">
                     <button
                       type="button"
-                      class="rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs font-normal text-slate-500 transition hover:bg-slate-100 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
+                      class="rounded-lg border border-slate-200 px-3 py-2 text-xs md:px-2.5 md:py-1.5 font-normal text-slate-500 transition hover:bg-slate-100 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
                       @click="cancelProviderEditor"
                     >
                       {{ t('rules_includeDomainsCancel') }}
                     </button>
                     <button
                       type="button"
-                      class="rounded-lg bg-primary px-2.5 py-1.5 text-xs font-normal text-white transition hover:bg-primary/90"
+                      class="rounded-lg bg-primary px-3 py-2 text-xs md:px-2.5 md:py-1.5 font-normal text-white transition hover:bg-primary/90"
                       @click="saveProviderEditor"
                     >
                       {{ t('rules_includeDomainsSave') }}

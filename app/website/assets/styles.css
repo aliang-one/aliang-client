@@ -415,19 +415,9 @@ canvas#domainPieChart {
 }
 
 /* Responsive adjustments */
-@media (max-width: 768px) {
+@media (max-width: 767px) {
     .page-container.active {
         flex-direction: column;
-    }
-    
-    aside {
-        width: 100% !important;
-        max-height: 40vh;
-    }
-    
-    main {
-        flex: 1;
-        overflow-y: auto;
     }
 }
 

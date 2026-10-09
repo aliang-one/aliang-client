@@ -31,7 +31,7 @@
         <div class="mb-4 grid grid-cols-2 gap-1 rounded-lg border border-slate-200 bg-slate-50/80 p-1 dark:border-slate-800 dark:bg-slate-900/50">
           <button
             type="button"
-            class="rounded-md px-3 py-1.5 text-xs font-semibold transition"
+            class="rounded-md px-3 py-1.5 text-xs font-semibold transition min-h-10 md:min-h-0"
             :class="loginMode === 'password' ? 'bg-primary text-white shadow-sm' : 'text-slate-600 hover:text-slate-900 dark:text-slate-300 dark:hover:text-white'"
             @click="loginMode = 'password'"
           >
@@ -39,7 +39,7 @@
           </button>
           <button
             type="button"
-            class="rounded-md px-3 py-1.5 text-xs font-semibold transition"
+            class="rounded-md px-3 py-1.5 text-xs font-semibold transition min-h-10 md:min-h-0"
             :class="loginMode === 'scan' ? 'bg-primary text-white shadow-sm' : 'text-slate-600 hover:text-slate-900 dark:text-slate-300 dark:hover:text-white'"
             @click="loginMode = 'scan'"
           >
@@ -361,7 +361,7 @@
                     type="button"
                     :aria-label="t('user_apiKeyCopyAction')"
                     :title="t('user_apiKeyCopyAction')"
-                    class="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-slate-400 transition hover:bg-slate-100 hover:text-slate-700 dark:hover:bg-slate-800 dark:hover:text-slate-200"
+                    class="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-slate-400 transition hover:bg-slate-100 hover:text-slate-700 dark:hover:bg-slate-800 dark:hover:text-slate-200 md:h-8 md:w-8"
                     @click.stop="copyApiKey(item)"
                   >
                     <span class="material-symbols-outlined text-[18px]">content_copy</span>
