@@ -8,8 +8,11 @@ package services
 import (
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"syscall"
 	"testing"
 
 	"aliang.one/nursorgate/common/cache"
@@ -228,5 +231,24 @@ func TestAgentStatusExposesRawDeviceEnabled(t *testing.T) {
 	service.mu.Unlock()
 	if status.DeviceEnabled {
 		t.Fatal("DeviceEnabled must be false when the raw enabled flag is false")
+	}
+}
+
+// 跨平台：Windows 的连接拒绝错误文本是 "actively refused it"（无
+// "connection refused" 字样），字符串嗅探漏判会把瞬态当致命。分类器必须
+// 走 syscall.Errno 结构化判定（ECONNREFUSED 在各家 OS 的 syscall 包里同名）。
+func TestRegisterTransportSyscallRefusedIsTransient(t *testing.T) {
+	service := setupTransientRegisterTest(t)
+	okServer := registerServer(t, http.StatusOK)
+	defer okServer.Close()
+	registerOnce(t, service, okServer.URL)
+
+	opErr := &net.OpError{
+		Op:  "dial",
+		Net: "tcp",
+		Err: os.NewSyscallError("connect", syscall.ECONNREFUSED),
+	}
+	if !classifyRegisterFailure(opErr) {
+		t.Fatal("syscall ECONNREFUSED must classify as transient on every platform")
 	}
 }

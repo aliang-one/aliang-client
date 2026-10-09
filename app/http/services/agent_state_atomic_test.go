@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"aliang.one/nursorgate/common/cache"
@@ -66,7 +67,10 @@ func TestSaveStateProducesCleanAtomicArtifact(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Stat(%s) error = %v", statePath, err)
 	}
-	if perm := info.Mode().Perm(); perm != 0o600 {
-		t.Fatalf("file mode = %o, want 600", perm)
+	// 0600 是 POSIX 权限位语义，Windows 不适用（实测 Perm() 恒 0666）。
+	if runtime.GOOS != "windows" {
+		if perm := info.Mode().Perm(); perm != 0o600 {
+			t.Fatalf("file mode = %o, want 600", perm)
+		}
 	}
 }

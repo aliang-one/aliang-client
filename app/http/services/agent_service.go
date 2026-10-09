@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"aliang.one/nursorgate/app/http/models"
@@ -1736,6 +1737,12 @@ func classifyRegisterFailure(err error) bool {
 		return statusErr.status >= http.StatusInternalServerError ||
 			statusErr.status == http.StatusRequestTimeout ||
 			statusErr.status == http.StatusTooManyRequests
+	}
+	// 连接拒绝走结构化判定：Windows 错误文本是 "actively refused it"，不含
+	// "connection refused" 字样，字符串嗅探跨平台漏判（Windows 实测）。
+	// ECONNREFUSED 在各家 OS 的 syscall 包同名，Errno.Is 沿 Unwrap 链匹配。
+	if errors.Is(err, syscall.ECONNREFUSED) {
+		return true
 	}
 	return isRetryableAgentAuthSyncError(err)
 }
