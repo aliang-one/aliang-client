@@ -430,9 +430,12 @@ func (s *AgentService) enableWithUserContext(authHeader string, userKey string) 
 	if err := s.registerAndSyncLockedWithUserContext(authHeader, userKey); err != nil {
 		var authRejectedErr agentUserAuthRejectedError
 		isAuthRejectedErr := errors.As(err, &authRejectedErr)
-		s.state.LastSyncStatus = "enable_failed"
-		s.state.LastSyncMessage = err.Error()
-		_ = s.saveStateLocked()
+		// device_id_conflict 的专用标记不得被 enable_failed 覆盖（同 SyncNow）。
+		if !isDeviceIDAlreadyBoundError(err) {
+			s.state.LastSyncStatus = "enable_failed"
+			s.state.LastSyncMessage = err.Error()
+			_ = s.saveStateLocked()
+		}
 		status := s.statusLocked()
 		s.mu.Unlock()
 		// Register-path 401 during an explicit enable: still try a recovery
@@ -723,8 +726,11 @@ func (s *AgentService) SyncNowWithUserContext(authHeader string, userKey string)
 		var authRejectedErr agentUserAuthRejectedError
 		isAuthRejectedErr := errors.As(err, &authRejectedErr)
 		// A user-auth rejection has its own recovery path; do not flatten it into
-		// a generic server availability problem.
-		if !isAuthRejectedErr {
+		// a generic server availability problem. device_id_conflict likewise:
+		// the register call already recorded the conflict status and remedy —
+		// keepalive/recoverable exclusion keys off that marker, so the generic
+		// server_unavailable must not clobber it.
+		if !isAuthRejectedErr && !isDeviceIDAlreadyBoundError(err) {
 			s.state.LastSyncStatus = "server_unavailable"
 			s.state.LastSyncMessage = err.Error()
 			_ = s.saveStateLocked()

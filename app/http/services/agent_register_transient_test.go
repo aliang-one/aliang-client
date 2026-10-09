@@ -57,7 +57,13 @@ func registerServer(t *testing.T, registerStatus int) *httptest.Server {
 		case "/api/devices/register":
 			if registerStatus != http.StatusOK {
 				w.WriteHeader(registerStatus)
-				_, _ = w.Write([]byte(`{"code":1,"msg":"upstream down"}`))
+				// 409 必须带真实冲突标记（isDeviceIDAlreadyBoundError 靠它识别），
+				// 其余状态码用通用错误体。
+				if registerStatus == http.StatusConflict {
+					_, _ = w.Write([]byte(`{"code":1,"error":"device_id_already_bound"}`))
+				} else {
+					_, _ = w.Write([]byte(`{"code":1,"msg":"upstream down"}`))
+				}
 				return
 			}
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{
@@ -263,5 +269,45 @@ func TestRegisterTransportSyscallRefusedIsTransient(t *testing.T) {
 		if !classifyRegisterFailure(opErr) {
 			t.Fatalf("connection refused errno %d must classify as transient on every platform", refused)
 		}
+	}
+}
+
+// 【P1 回归复现】device_id_conflict 是服务端断言的绑定冲突，冲突标记必须在
+// 真实调用路径上存活：SyncNow/enable 的通用错误分支不得把它覆盖成
+// server_unavailable/enable_failed，否则 keepalive/recoverable 的冲突态
+// 排除（agent_registration_keepalive.go/agent_remote_ws.go）永远看不到标记，
+// 自动重试空转 + 误导性提醒（上一轮复查修复的回归）。
+func TestRegisterDeviceConflictStatusSurvivesRealCallers(t *testing.T) {
+	service := setupTransientRegisterTest(t)
+
+	conflict := registerServer(t, http.StatusConflict)
+	defer conflict.Close()
+	config.SetGlobalConfig(&config.Config{Core: &config.CoreConfig{AgentServer: conflict.URL}})
+
+	if err := service.SyncNow(); err == nil {
+		t.Fatal("SyncNow() error = nil, want device_id_conflict rejection")
+	}
+	service.mu.Lock()
+	status := service.state.LastSyncStatus
+	service.mu.Unlock()
+	if status != "device_id_conflict" {
+		t.Fatalf("LastSyncStatus = %q after SyncNow, want device_id_conflict (must survive the generic error branch)", status)
+	}
+	if service.registrationKeepaliveNeeded() {
+		t.Fatal("keepalive must not auto-retry a device_id_conflict device")
+	}
+	if service.registrationLostRecoverable() {
+		t.Fatal("WS loop must not treat a device_id_conflict device as recoverable")
+	}
+
+	// enable 路径同样不得覆盖冲突标记。
+	if _, err := service.EnableWithUserContext("", ""); err == nil {
+		t.Fatal("EnableWithUserContext() error = nil, want device_id_conflict rejection")
+	}
+	service.mu.Lock()
+	status = service.state.LastSyncStatus
+	service.mu.Unlock()
+	if status != "device_id_conflict" {
+		t.Fatalf("LastSyncStatus = %q after enable, want device_id_conflict to survive the enable_failed branch", status)
 	}
 }
