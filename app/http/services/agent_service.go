@@ -212,6 +212,19 @@ func (e agentUserAuthRejectedError) Error() string {
 	return fmt.Sprintf("agent server returned %d: %s", e.status, e.body)
 }
 
+// agentServerStatusError 是 agent server 返回非 2xx（且非带凭据的 401）时的
+// 类型化错误。Error() 文本必须与历史 fmt.Errorf 逐字节一致——
+// isDeviceIDAlreadyBoundError 与 isRetryableAgentAuthSyncError 依赖该文本做
+// 嗅探，不得改动。携带状态码供 classifyRegisterFailure 区分瞬态与致命。
+type agentServerStatusError struct {
+	status int
+	body   string
+}
+
+func (e agentServerStatusError) Error() string {
+	return fmt.Sprintf("agent server returned %d: %s", e.status, e.body)
+}
+
 func GetSharedAgentService() *AgentService {
 	sharedAgentServiceMu.Lock()
 	defer sharedAgentServiceMu.Unlock()
@@ -1131,6 +1144,7 @@ func (s *AgentService) statusLocked() models.AgentStatusResponse {
 
 	return models.AgentStatusResponse{
 		Status:          status,
+		DeviceEnabled:   s.state.Enabled,
 		Enabled:         s.isEnabledLocked(),
 		Bound:           s.isBoundLocked(),
 		Registered:      s.isRegisteredLocked(),
@@ -1293,7 +1307,13 @@ func (s *AgentService) saveStateLocked() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, raw, 0o600)
+	// 原子写（tmp+rename，同 saveAgentDeviceIdentity）：崩溃/掉电不再留下半截
+	// agent_state.json。所有调用方持 s.mu，tmp 文件名无并发冲突。
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 // agentDeviceIdentity is the installation-permanent device_id. It is generated
@@ -1613,6 +1633,16 @@ func (s *AgentService) registerAndSyncLockedWithUserContext(authHeader string, u
 		}
 	}
 	if err != nil {
+		if classifyRegisterFailure(err) {
+			// 瞬时链路故障（5xx/408/429/超时/DNS/连接拒绝）：不推翻内存注册态。
+			// Registered/Enabled/RemoteConnected 保持原值——合理的 Registered=false
+			// 写点只有"服务端明确拒绝"（401/409 等）与"凭据缺失"，网络抖动不是。
+			// 状态与消息由调用方落盘（enable 路径 enable_failed / sync 路径
+			// server_unavailable），此处不重复 save，避免双写竞写。
+			logger.Warn(fmt.Sprintf("[AGENT-BOOT] register_sync transient_failure keeping_registration device_id=%s registered=%t error=%v",
+				s.state.DeviceID, s.state.Registered, err))
+			return err
+		}
 		s.state.Registered = false
 		s.state.RemoteConnected = false
 		return err
@@ -1682,6 +1712,34 @@ func isDeviceIDAlreadyBoundError(err error) bool {
 		strings.Contains(text, "bound")
 }
 
+// classifyRegisterFailure 判定注册失败是否为瞬时类（不应推翻内存注册态）：
+//   - 5xx / 408 / 429：服务端故障或过载，与 NotifyOwnerAuthRejected 的
+//     "≥500 保留沿重试 / 408+429 保留" 语义一致；
+//   - 传输层错误（超时/DNS/连接拒绝/reset 等）：复用 isRetryableAgentAuthSyncError
+//     的标记集；
+//   - 类型化 401、其余 4xx（400/403/409…）、device_id 冲突：非瞬时，保持既有
+//     Registered=false 语义。
+//
+// 2026-10-08 生产事故：47 秒链路故障窗内 502/超时把内存 Registered 翻成
+// false，已成功的注册被后续超时回滚，WS 循环将 unregistered 当终态退出并
+// 落盘，造成 16 小时静默离线。网络抖动不是注销理由。
+func classifyRegisterFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	var rejected agentUserAuthRejectedError
+	if errors.As(err, &rejected) {
+		return false
+	}
+	var statusErr agentServerStatusError
+	if errors.As(err, &statusErr) {
+		return statusErr.status >= http.StatusInternalServerError ||
+			statusErr.status == http.StatusRequestTimeout ||
+			statusErr.status == http.StatusTooManyRequests
+	}
+	return isRetryableAgentAuthSyncError(err)
+}
+
 func (s *AgentService) callAgentServer(method string, endpoint string, payload interface{}, authHeader string) ([]byte, error) {
 	return s.callAgentServerWithAuthorization(method, endpoint, payload, effectiveAgentRegisterAuthHeader(authHeader))
 }
@@ -1741,7 +1799,7 @@ func (s *AgentService) callAgentServerWithAuthorization(method string, endpoint 
 				return nil, agentUserAuthRejectedError{status: resp.StatusCode, body: string(raw)}
 			}
 		}
-		return nil, fmt.Errorf("agent server returned %d: %s", resp.StatusCode, string(raw))
+		return nil, agentServerStatusError{status: resp.StatusCode, body: string(raw)}
 	}
 	logger.Info(fmt.Sprintf("[AGENT-BOOT] agent_server_call success method=%s endpoint=%s status=%d", method, sanitizeAgentEndpoint(endpoint), resp.StatusCode))
 	return unwrapAgentServerData(raw)

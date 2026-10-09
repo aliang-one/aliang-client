@@ -120,6 +120,13 @@ func (s *AgentService) remoteConnectionLoop() {
 		s.wsMu.Lock()
 		s.wsConnecting = false
 		s.wsMu.Unlock()
+		// 必须在 wsConnecting 清零之后 nudge：此刻 EnsureRemoteConnection 的幂等
+		// 守卫已放行，保活触发的注册成功能立刻重新拉起连接循环，不必等下一个
+		// tick（2026-10-08 事故形态：注册态丢失后循环终态退出，全仓无重试）。
+		if s.registrationLostRecoverable() {
+			logger.Info("[AGENT-BOOT] remote_connection loop_exit recoverable_registration_lost nudging_keepalive")
+			nudgeAgentRegistrationKeepalive("ws_loop_exit_registration_lost")
+		}
 	}()
 
 	handshake401Streak := 0
@@ -127,6 +134,12 @@ func (s *AgentService) remoteConnectionLoop() {
 		identity, shouldRun := s.remoteConnectionSnapshot()
 		if !shouldRun {
 			if s.shouldPreserveDisabledStatus() {
+				return
+			}
+			if s.registrationLostRecoverable() {
+				// 可恢复的注册态丢失：不写 offline（保留 server_unavailable/
+				// connect_failed 等真实状态），交由会话外注册保活定时器重注册。
+				logger.Info("[AGENT-BOOT] remote_connection loop_stop reason=registration_lost_recoverable (keepalive will re-register)")
 				return
 			}
 			logger.Info("[AGENT-BOOT] remote_connection loop_stop reason=disabled_unregistered_or_missing_auth")
@@ -313,6 +326,19 @@ func (s *AgentService) shouldPreserveDisabledStatus() bool {
 	default:
 		return false
 	}
+}
+
+// registrationLostRecoverable 是循环终态退出里的可恢复子场景：enabled、握有
+// 凭据、曾有 device_id（=曾注册过），但内存注册态已丢。这正是瞬时注册失败
+// 或 2026-10-08 事故残留（Registered=false 落盘）的形态；粘性禁用态
+// （logout/revoked/device_unbound 等，均 Enabled=false，由
+// shouldPreserveDisabledStatus 先行拦截）与凭据缺失态不在此列。
+func (s *AgentService) registrationLostRecoverable() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	authHeader := strings.TrimSpace(s.effectiveUserAuthorizationLocked(""))
+	return s.state.Enabled && authHeader != "" &&
+		strings.TrimSpace(s.state.DeviceID) != "" && !s.state.Registered
 }
 
 // atomicDuration is a race-safe time.Duration knob. Tests rewrite these

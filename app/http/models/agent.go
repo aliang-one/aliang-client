@@ -1,7 +1,12 @@
 package models
 
 type AgentStatusResponse struct {
-	Status          string             `json:"status"`
+	Status string `json:"status"`
+	// DeviceEnabled 是 raw enabled 标志。Enabled 复合了 Registered/Device
+	// （isEnabledLocked），注册态丢失时恒为 false——本机环回巡检（watchdog）
+	// 需要它区分"用户开着的设备掉注册"与"显式禁用/登出"。仅存在于响应模型，
+	// 不参与 agent_state.json 持久化。
+	DeviceEnabled   bool               `json:"device_enabled"`
 	Enabled         bool               `json:"enabled"`
 	Bound           bool               `json:"bound"`
 	Registered      bool               `json:"registered"`
