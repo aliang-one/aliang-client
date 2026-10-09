@@ -185,18 +185,22 @@ func NeedsAuthenticatedSync(timeout time.Duration) bool {
 // offline/server_unavailable 等瞬态值，2026-10-08 事故中双层门禁都进不去、
 // 静默 16 小时。调用方仍须走 core reconcile，core 依旧是会话权威；旧版 agent
 // 不上报 device_enabled 字段 → false → 保守不动作（向前兼容）。
-func NeedsRegistrationRecovery(timeout time.Duration) bool {
+// 返回 (recoveryNeeded, probeOK)。probeOK=false = 探针传输失败（agent 半死/
+// 锁被长持/环回异常）——观测为"未知"，调用方必须冻结坏态时钟而非当作健康
+// 清零：挂起型故障下 keepalive 持锁横跨 8s register POST，10s 探针有实质
+// 概率撞锁，若撞锁清零则 15min 阈值永不可达、第二层安全网自我失效。
+func NeedsRegistrationRecovery(timeout time.Duration) (bool, bool) {
 	var envelope struct {
 		Code int                        `json:"code"`
 		Data models.AgentStatusResponse `json:"data"`
 	}
 	if err := getLocalAgentJSON(timeout, capabilityPath, &envelope); err != nil || envelope.Code != 0 {
-		return false
+		return false, false
 	}
 	if !envelope.Data.DeviceEnabled {
-		return false // 显式禁用/登出/粘性禁用态：一律不归本巡检管
+		return false, true // 显式禁用/登出/粘性禁用态：确定性不归本巡检管
 	}
-	return !envelope.Data.Registered || !envelope.Data.RemoteConnected
+	return !envelope.Data.Registered || !envelope.Data.RemoteConnected, true
 }
 
 func waitForCurrentAgentAPI(maxWait time.Duration, probeTimeout time.Duration) (int, error) {

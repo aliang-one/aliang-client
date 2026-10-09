@@ -337,8 +337,11 @@ func (s *AgentService) registrationLostRecoverable() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	authHeader := strings.TrimSpace(s.effectiveUserAuthorizationLocked(""))
+	// device_id_conflict 是服务端断言的绑定冲突（换账号解绑才可解），
+	// 不属于"网络瞬态丢注册"，重试只会空转——留给 watchdog 提醒用户处理。
 	return s.state.Enabled && authHeader != "" &&
-		strings.TrimSpace(s.state.DeviceID) != "" && !s.state.Registered
+		strings.TrimSpace(s.state.DeviceID) != "" && !s.state.Registered &&
+		normalizeAgentDisableReason(s.state.LastSyncStatus) != "device_id_conflict"
 }
 
 // atomicDuration is a race-safe time.Duration knob. Tests rewrite these

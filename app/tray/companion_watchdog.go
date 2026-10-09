@@ -104,8 +104,18 @@ func (a *CompanionApp) agentWatchdogLoop() {
 				}
 				consecutiveFails = 0
 				needsSync := agentruntime.NeedsAuthenticatedSync(agentWatchdogProbeTimeout)
-				regReconcileDue, regNotifyDue := regRecovery.observe(
-					agentruntime.NeedsRegistrationRecovery(agentWatchdogProbeTimeout), time.Now())
+				regBad, regProbeOK := agentruntime.NeedsRegistrationRecovery(agentWatchdogProbeTimeout)
+				var regReconcileDue, regNotifyDue bool
+				if regProbeOK {
+					regReconcileDue, regNotifyDue = regRecovery.observe(regBad, time.Now())
+				}
+				// probeOK=false = 观测未知（agent 半死/锁被长持），本 tick 丢失：
+				// 坏态时钟冻结而非清零——否则挂起型故障下探针周期性撞 keepalive
+				// 的持锁窗，15min 阈值永不可达，第二层安全网自我失效。
+				if regNotifyDue {
+					logger.Warn("[AGENT-WATCHDOG] registration_stuck notifying_user")
+					registrationStuckNotifier("aliang-gateway", "远程设备已离线超过 15 分钟，自动恢复未成功，请检查网络或重启 aliang")
+				}
 				if !needsSync && !regReconcileDue {
 					// 两个巡检都不需要 reconcile：作废冷却，恢复后立即放行。
 					reconciles.reset()
@@ -137,17 +147,13 @@ func (a *CompanionApp) agentWatchdogLoop() {
 						}
 					}
 				}
-				if regNotifyDue {
-					logger.Warn("[AGENT-WATCHDOG] registration_stuck notifying_user")
-					registrationStuckNotifier("aliang-gateway", "远程设备已离线超过 15 分钟，自动恢复未成功，请检查网络或重启 aliang")
-				}
 				continue
 			}
 			// 探活失败说明 agent 进程本身出问题了;此前若刚做过 reconcile,
 			// 冷却作废——拉起后的首个健康 tick 应立即重新评估同步需求。
-			// 掉线计时同步清零：进程死了归 EnsureStarted 管，恢复后重新计满阈值。
+			// 掉线计时不喂 false（进程死了=观测未知）：冻结而非清零，恢复后
+			// 从冻结点继续计满阈值，短促进程重启不会归零已积累的坏态时长。
 			reconciles.reset()
-			regRecovery.observe(false, time.Now())
 			consecutiveFails++
 			logger.Warn(fmt.Sprintf("[AGENT-WATCHDOG] health_check failed (%d/%d)", consecutiveFails, agentWatchdogFailThreshold))
 			if consecutiveFails < agentWatchdogFailThreshold {

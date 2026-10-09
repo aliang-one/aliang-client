@@ -1713,9 +1713,24 @@ func isDeviceIDAlreadyBoundError(err error) bool {
 		strings.Contains(text, "bound")
 }
 
-// wsaEConnRefused 是 Windows 的 WSAECONNREFUSED(10061)。Go 的 windows
-// syscall 包没有把它别名为 ECONNREFUSED，只能按数值比对。
-const wsaEConnRefused syscall.Errno = 10061
+// Windows 的 winsock 真实错误码。Go 的 windows syscall 包没把 WSA* 别名为
+// ECONN* 占位常量（那些是 APPLICATION_ERROR 派生值，与真实错误码永不相等，
+// errors.Is 恒 false），只能按数值比对。
+const (
+	wsaEConnRefused syscall.Errno = 10061
+	wsaEConnReset   syscall.Errno = 10054
+	wsaEConnAborted syscall.Errno = 10053
+	wsaETimedOut    syscall.Errno = 10060
+)
+
+// isWindowsConnRefusedLike 报告 errno 是否为 Windows 的连接类瞬态错误。
+func isWindowsConnRefusedLike(errno syscall.Errno) bool {
+	switch errno {
+	case wsaEConnRefused, wsaEConnReset, wsaEConnAborted, wsaETimedOut:
+		return true
+	}
+	return false
+}
 
 // classifyRegisterFailure 判定注册失败是否为瞬时类（不应推翻内存注册态）：
 //   - 5xx / 408 / 429：服务端故障或过载，与 NotifyOwnerAuthRejected 的
@@ -1742,14 +1757,14 @@ func classifyRegisterFailure(err error) bool {
 			statusErr.status == http.StatusRequestTimeout ||
 			statusErr.status == http.StatusTooManyRequests
 	}
-	// 连接拒绝走结构化判定：Windows 错误文本是 "actively refused it"，不含
-	// "connection refused" 字样，字符串嗅探跨平台漏判。注意 Windows 的
-	// syscall.ECONNREFUSED 是 APPLICATION_ERROR 派生的占位常量，与真实
-	// winsock 错误码 WSAECONNREFUSED(10061) 不相等（Windows 实测
-	// errors.Is 恒 false），必须解出 Errno 按数值比对；Unix 侧 errors.Is
-	// 直配各自平台的 ECONNREFUSED。
+	// 连接类瞬态错误走结构化判定：Windows 错误文本不带 Unix 标记字样
+	// （拒绝="actively refused it"、重置="forcibly closed by the remote
+	// host"），字符串嗅探跨平台漏判；且 Windows 的 syscall.ECONNREFUSED 等
+	// 是 APPLICATION_ERROR 派生占位常量，errors.Is 恒 false——必须解出
+	// Errno 按数值比对 WSA 码；Unix 侧 errors.Is 直配各自平台的 ECONNREFUSED。
 	var errno syscall.Errno
-	if errors.As(err, &errno) && (errno == syscall.ECONNREFUSED || errno == wsaEConnRefused) {
+	if errors.As(err, &errno) &&
+		(errno == syscall.ECONNREFUSED || isWindowsConnRefusedLike(errno)) {
 		return true
 	}
 	return isRetryableAgentAuthSyncError(err)

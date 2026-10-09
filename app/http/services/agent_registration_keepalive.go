@@ -43,6 +43,9 @@ func (s *AgentService) registrationKeepaliveNeeded() bool {
 	defer s.mu.Unlock()
 	authHeader := strings.TrimSpace(s.effectiveUserAuthorizationLocked(""))
 	deviceID := s.state.DeviceID
+	if s.state.LastSyncStatus == "device_id_conflict" {
+		return false // 绑定冲突需用户处理（换账号/解绑），重试空转
+	}
 	return s.state.Enabled &&
 		authHeader != "" &&
 		deviceID != "" &&

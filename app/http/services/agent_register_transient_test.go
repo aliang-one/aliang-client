@@ -24,6 +24,12 @@ import (
 func setupTransientRegisterTest(t *testing.T) *AgentService {
 	t.Helper()
 	t.Setenv("ALIANG_DATA_DIR", t.TempDir())
+	// HOME 隔离：注册成功路径会做 inventory 同步（collectAgentSyncSnapshot
+	// 扫真实 HOME 全量目录，-race 下 ~50s/个，且把真实目录写进
+	// agentAuthorizedDirsCache 残留到后续测试）。隔离后只扫空临时目录。
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
 	cache.ResetCacheDirForTest()
 	auth.ResetAuthPersistenceForTest()
 	config.ResetGlobalConfigForTest()
@@ -248,7 +254,7 @@ func TestRegisterTransportSyscallRefusedIsTransient(t *testing.T) {
 	// Windows 实机错误链：url.Error → OpError → SyscallError("connectex",
 	// WSAECONNREFUSED=10061)；数值 10061 在任何平台都应判瞬态。
 	// Errno(10061) 与 syscall.ECONNREFUSED 两条路都要通。
-	for _, refused := range []syscall.Errno{10061, syscall.ECONNREFUSED} {
+	for _, refused := range []syscall.Errno{10061, 10054, 10053, 10060, syscall.ECONNREFUSED} {
 		opErr := &net.OpError{
 			Op:  "dial",
 			Net: "tcp",

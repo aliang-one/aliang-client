@@ -249,7 +249,11 @@ func TestNeedsRegistrationRecovery(t *testing.T) {
 			config.DefaultUserAgentAddr = strings.TrimPrefix(server.URL, "http://")
 			t.Cleanup(func() { config.DefaultUserAgentAddr = originalAddr })
 
-			if got := NeedsRegistrationRecovery(time.Second); got != tc.want {
+			got, probeOK := NeedsRegistrationRecovery(time.Second)
+			if !probeOK {
+				t.Fatal("probeOK = false, want deterministic answer for a live agent")
+			}
+			if got != tc.want {
 				t.Fatalf("NeedsRegistrationRecovery() = %t, want %t", got, tc.want)
 			}
 		})
@@ -264,7 +268,7 @@ func TestNeedsRegistrationRecoveryProbeFailureIsConservative(t *testing.T) {
 	config.DefaultUserAgentAddr = strings.TrimPrefix(deadURL, "http://")
 	t.Cleanup(func() { config.DefaultUserAgentAddr = originalAddr })
 
-	if NeedsRegistrationRecovery(time.Second) {
-		t.Fatal("probe failure must be conservative (no recovery request)")
+	if bad, probeOK := NeedsRegistrationRecovery(time.Second); bad || probeOK {
+		t.Fatalf("probe failure must be conservative unknown: bad=%t probeOK=%t", bad, probeOK)
 	}
 }

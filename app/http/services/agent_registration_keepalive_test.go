@@ -197,8 +197,8 @@ func TestKeepaliveBacksOffAfterFailures(t *testing.T) {
 	})
 
 	var (
-		mu       sync.Mutex
-		stamps   []time.Time
+		mu     sync.Mutex
+		stamps []time.Time
 	)
 	startAgentRegistrationKeepalive(service, 10*time.Millisecond,
 		func(s *AgentService) error {
