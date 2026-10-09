@@ -245,12 +245,17 @@ func TestRegisterTransportSyscallRefusedIsTransient(t *testing.T) {
 	defer okServer.Close()
 	registerOnce(t, service, okServer.URL)
 
-	opErr := &net.OpError{
-		Op:  "dial",
-		Net: "tcp",
-		Err: os.NewSyscallError("connect", syscall.ECONNREFUSED),
-	}
-	if !classifyRegisterFailure(opErr) {
-		t.Fatal("syscall ECONNREFUSED must classify as transient on every platform")
+	// Windows 实机错误链：url.Error → OpError → SyscallError("connectex",
+	// WSAECONNREFUSED=10061)；数值 10061 在任何平台都应判瞬态。
+	// Errno(10061) 与 syscall.ECONNREFUSED 两条路都要通。
+	for _, refused := range []syscall.Errno{10061, syscall.ECONNREFUSED} {
+		opErr := &net.OpError{
+			Op:  "dial",
+			Net: "tcp",
+			Err: os.NewSyscallError("connect", refused),
+		}
+		if !classifyRegisterFailure(opErr) {
+			t.Fatalf("connection refused errno %d must classify as transient on every platform", refused)
+		}
 	}
 }
