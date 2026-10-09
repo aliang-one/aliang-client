@@ -67,6 +67,13 @@ func TestWriteWaitsForInFlightCreate(t *testing.T) {
 	m := newAgentTerminalManager()
 	coll, write := newPayloadCollector()
 	spawner := &fakeTerminalSpawner{}
+	// fake 进程必须长活：默认 wait() 立即返回，waitTerminal 会在 create 返回
+	// 的瞬间把 sessions 清空，"输入竞速 create" 退化成 "对已死会话输入"——
+	// 后者按语义本就该报 not-found（Windows 实测 ~25% 假失败、spawned=1/
+	// sessions=0/createdEvents=1 铁证）。长活后本测试才真正守护等待机制。
+	blockExit := make(chan struct{})
+	spawner.blockExit = blockExit
+	t.Cleanup(func() { close(blockExit) })
 	m.startProcess = spawner.start
 	// 预置授权目录缓存:冷进程里 collectAgentSyncSnapshot 首扫要数秒
 	// (测试环境噪音,与被测语义无关)。
