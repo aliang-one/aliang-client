@@ -94,9 +94,10 @@ func TestWriteWaitsForInFlightCreate(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("create did not finish")
 	}
-	for _, e := range coll.ofTypes(models.AgentEventTerminalError) {
+	termErrs := coll.ofTypes(models.AgentEventTerminalError)
+	for _, e := range termErrs {
 		if strings.Contains(fmt.Sprintf("%v", e["error"]), "not found") {
-			t.Fatalf("input raced the create and errored: %v", e)
+			t.Fatalf("input raced the create and errored: %v (create-side errors: %v)", e, termErrs)
 		}
 	}
 	if spawner.spawned() != 1 {
