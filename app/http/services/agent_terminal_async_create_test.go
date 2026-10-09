@@ -97,7 +97,18 @@ func TestWriteWaitsForInFlightCreate(t *testing.T) {
 	termErrs := coll.ofTypes(models.AgentEventTerminalError)
 	for _, e := range termErrs {
 		if strings.Contains(fmt.Sprintf("%v", e["error"]), "not found") {
-			t.Fatalf("input raced the create and errored: %v (create-side errors: %v)", e, termErrs)
+			m.mu.Lock()
+			mk := len(m.sessions)
+			ck := len(m.creating)
+			m.mu.Unlock()
+			var createdSeen int
+			for _, p := range coll.snapshot() {
+				if p["type"] == models.AgentEventTerminalCreated {
+					createdSeen++
+				}
+			}
+			t.Fatalf("input raced the create and errored: %v (create-side errors: %v; spawned=%d sessions=%d creating=%d createdEvents=%d)",
+				e, termErrs, spawner.spawned(), mk, ck, createdSeen)
 		}
 	}
 	if spawner.spawned() != 1 {
