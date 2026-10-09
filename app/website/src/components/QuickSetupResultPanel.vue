@@ -28,7 +28,7 @@
             type="button"
             :aria-label="copyFailedKey === path ? t('qs_copyFailed') : t('qs_copyPath')"
             :title="copyFailedKey === path ? t('qs_copyFailed') : undefined"
-            class="inline-flex size-7 shrink-0 items-center justify-center rounded-lg text-slate-400 transition hover:bg-slate-200/70 hover:text-slate-600 dark:hover:bg-slate-800 dark:hover:text-slate-200"
+            class="inline-flex size-9 md:size-7 shrink-0 items-center justify-center rounded-lg text-slate-400 transition hover:bg-slate-200/70 hover:text-slate-600 dark:hover:bg-slate-800 dark:hover:text-slate-200"
             @click="copyValue(path, path)"
           >
             <span

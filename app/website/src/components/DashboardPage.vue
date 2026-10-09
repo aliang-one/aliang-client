@@ -5,7 +5,7 @@
     class="page-container content-section active flex flex-row flex-1 min-w-0 h-full overflow-hidden"
   >
     <aside
-      class="w-80 lg:w-96 bg-white dark:bg-slate-900 border-r border-slate-200 dark:border-slate-800 flex flex-col h-full overflow-y-auto custom-scrollbar"
+      class="hidden md:flex w-80 lg:w-96 bg-white dark:bg-slate-900 border-r border-slate-200 dark:border-slate-800 flex flex-col h-full overflow-y-auto custom-scrollbar"
     >
       <div
         data-guide="account"
@@ -186,20 +186,165 @@
       </div>
     </aside>
     <main class="flex-1 min-w-0 flex flex-col h-full bg-background-light dark:bg-background-dark overflow-hidden">
-      <header
-        class="h-16 bg-white dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between px-8 shrink-0"
+      <!-- 移动端：紧凑顶栏 + 可折叠控制面板（≥md 隐藏，桌面结构不受影响） -->
+      <div
+        data-mobile-topbar
+        class="md:hidden sticky top-0 z-40 shrink-0 border-b border-slate-200 bg-white/95 backdrop-blur dark:border-slate-800 dark:bg-slate-900/95"
       >
-        <div class="flex items-center gap-4">
+        <div class="flex items-center gap-3 px-4 py-2.5">
+          <button
+            type="button"
+            :disabled="powerButtonDisabled"
+            :title="powerButtonTitle"
+            class="relative flex size-11 shrink-0 items-center justify-center rounded-full border transition-all disabled:cursor-not-allowed"
+            :class="powerButtonClass"
+            @click="toggleProxyPower"
+          >
+            <span v-if="runActionLoading" class="inline-block size-5 border-2 border-white/30 border-t-white rounded-full animate-spin"></span>
+            <span v-else class="material-symbols-outlined text-xl font-bold">power_settings_new</span>
+          </button>
+          <div class="min-w-0 flex-1">
+            <p class="truncate text-sm font-semibold text-slate-600 dark:text-slate-400">{{ proxyStatusTitle }}</p>
+            <p class="truncate text-xs text-slate-400">{{ runActionLoading ? powerButtonBusyText : serverStateLabel }}</p>
+          </div>
+          <button
+            type="button"
+            data-mobile-account
+            class="flex size-11 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-primary to-emerald-500 text-white"
+            :title="userDisplayName"
+            @click="handleAccountCardClick"
+          >
+            <span class="text-sm font-bold uppercase tracking-wide">{{ userAvatarText }}</span>
+          </button>
+        </div>
+        <button
+          type="button"
+          data-mobile-panel-toggle
+          :aria-expanded="mobilePanelOpen"
+          class="flex w-full items-center gap-1.5 border-t border-slate-100 px-4 py-2.5 text-xs font-bold uppercase tracking-wider text-slate-400 dark:border-slate-800"
+          @click="mobilePanelOpen = !mobilePanelOpen"
+        >
+          <span class="material-symbols-outlined text-base transition-transform" :class="mobilePanelOpen ? 'rotate-180' : ''">expand_more</span>
+          {{ t('dash_controlPanel') }}
+        </button>
+        <div
+          v-show="mobilePanelOpen"
+          data-mobile-panel
+          class="max-h-[70dvh] space-y-4 overflow-y-auto border-t border-slate-100 px-4 py-4 dark:border-slate-800"
+        >
+          <!-- 账户块 -->
+          <button
+            type="button"
+            class="flex w-full items-center gap-3 rounded-lg border border-slate-200 bg-slate-50 p-3 text-left dark:border-slate-700 dark:bg-slate-800/50"
+            @click="handleAccountCardClick"
+          >
+            <span class="flex size-10 shrink-0 items-center justify-center rounded-lg bg-gradient-to-br from-primary to-emerald-500 text-white">
+              <span class="text-xs font-bold uppercase">{{ userAvatarText }}</span>
+            </span>
+            <span class="min-w-0 flex-1">
+              <span class="block truncate text-sm font-bold text-slate-900 dark:text-white">{{ userDisplayName }}</span>
+              <span class="mt-0.5 block truncate text-[11px] text-slate-400">{{ accountSubtitle }}</span>
+            </span>
+            <span class="shrink-0 rounded bg-primary/10 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-primary">{{ planLabel }}</span>
+          </button>
+          <div
+            v-if="!isAuthenticated"
+            class="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-300"
+          >
+            <div class="flex items-center justify-between gap-3">
+              <span class="min-w-0">{{ authNotice }}</span>
+              <button
+                type="button"
+                class="shrink-0 rounded-md bg-white/80 px-3 py-2 text-[11px] font-semibold text-amber-700 dark:bg-slate-900/70 dark:text-amber-200"
+                @click="openLoginModal"
+              >
+                {{ t('dash_loginNow') }}
+              </button>
+            </div>
+          </div>
+          <!-- 网络状态块 -->
+          <div class="rounded border border-slate-100 bg-slate-50 p-4 dark:border-slate-700 dark:bg-slate-800/50">
+            <div class="mb-3 flex items-center justify-between">
+              <p class="text-xs font-bold uppercase text-slate-500">{{ t('dash_networkStatus') }}</p>
+              <span v-if="certLoading" class="inline-block size-4 border-2 border-slate-200 border-t-slate-400 rounded-full animate-spin"></span>
+              <span v-else class="material-symbols-outlined text-sm" :class="networkStatusIconClass">{{ networkStatusIcon }}</span>
+            </div>
+            <div class="space-y-2">
+              <div class="flex justify-between text-sm">
+                <span class="text-slate-500">{{ t('dash_mode') }}</span>
+                <span class="font-medium text-slate-700 dark:text-slate-200">{{ runModeLabel }}</span>
+              </div>
+              <div class="flex justify-between text-sm">
+                <span class="text-slate-500">{{ t('dash_protocol') }}</span>
+                <span class="font-medium text-slate-700 dark:text-slate-200">SOCKS5</span>
+              </div>
+              <div class="flex justify-between text-sm">
+                <span class="text-slate-500">{{ t('dash_certificate') }}</span>
+                <span class="font-medium" :class="certBadgeClass">{{ certBadgeText }}</span>
+              </div>
+            </div>
+            <div class="mt-4 grid grid-cols-2 gap-2">
+              <button type="button" class="px-3 py-2.5 text-xs font-bold border border-slate-200 dark:border-slate-600 rounded" @click="openCertModal">
+                {{ t('dash_details') }}
+              </button>
+              <button type="button" class="px-3 py-2.5 text-xs font-bold bg-primary/10 text-primary rounded" @click="handleReinstall">
+                {{ t('dash_reinstall') }}
+              </button>
+            </div>
+          </div>
+          <!-- 快捷工具块 -->
+          <div class="space-y-3">
+            <p class="px-1 text-[10px] font-bold uppercase tracking-widest text-slate-400">{{ t('dash_quickTools') }}</p>
+            <button
+              type="button"
+              :disabled="!isAuthenticated"
+              class="flex w-full items-center gap-3 rounded border bg-white px-4 py-3 text-sm font-medium dark:bg-slate-900"
+              :class="!isAuthenticated ? 'cursor-not-allowed opacity-60 border-slate-200 dark:border-slate-700' : 'border-slate-200 hover:border-primary dark:border-slate-700'"
+              @click="openQuickSetup"
+            >
+              <span class="material-symbols-outlined text-lg text-slate-400">bolt</span>
+              {{ t('dash_quickSetup') }}
+            </button>
+            <button
+              type="button"
+              class="flex w-full items-center gap-3 rounded border border-slate-200 bg-white px-4 py-3 text-sm font-medium hover:border-primary dark:border-slate-700 dark:bg-slate-900"
+              @click="handleShowSettings"
+            >
+              <span class="material-symbols-outlined text-lg text-slate-400">settings</span>
+              {{ t('dash_moreSettings') }}
+            </button>
+          </div>
+          <!-- 余额块 -->
+          <div class="border-t border-slate-100 pt-4 dark:border-slate-800">
+            <div class="mb-3 flex items-center justify-between">
+              <span class="text-xs font-bold uppercase tracking-wider text-slate-500">{{ t('dash_accountBalance') }}</span>
+              <span class="text-lg font-bold text-slate-900 dark:text-white">{{ accountBalanceText }}</span>
+            </div>
+            <button
+              type="button"
+              class="w-full rounded bg-slate-900 py-2.5 text-xs font-bold text-white hover:opacity-90 dark:bg-primary"
+              @click="handleTopUp"
+            >
+              {{ t('dash_topUpFunds') }}
+            </button>
+            <p class="mt-2 text-center text-[10px] italic" :class="accountBalanceHintClass">{{ accountBalanceHint }}</p>
+          </div>
+        </div>
+      </div>
+      <header
+        class="h-16 bg-white dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between px-4 shrink-0 md:px-8"
+      >
+        <div class="flex items-center gap-2 md:gap-4">
           <div class="size-8 bg-primary rounded-lg flex items-center justify-center text-white shadow-sm">
             <span class="material-symbols-outlined">api</span>
           </div>
-          <h1 class="font-bold text-xl tracking-tight">
+          <h1 class="font-bold text-lg tracking-tight md:text-xl">
             ALiang
             <span class="text-primary font-medium">Gateway</span>
           </h1>
         </div>
         <div class="flex items-center gap-4">
-          <div class="rounded-xl border border-slate-200 bg-slate-50/90 px-3 py-2 dark:border-slate-700 dark:bg-slate-800/70">
+          <div class="hidden md:block rounded-xl border border-slate-200 bg-slate-50/90 px-3 py-2 dark:border-slate-700 dark:bg-slate-800/70">
             <div class="flex items-center gap-3">
               <div class="flex size-10 items-center justify-center rounded-lg" :class="serverLinkIconWrapClass">
                 <span class="material-symbols-outlined text-lg" :class="serverLinkIconClass">{{ serverLinkIcon }}</span>
@@ -231,7 +376,7 @@
               </div>
             </div>
           </div>
-          <div class="h-8 w-px bg-slate-200 dark:bg-slate-800 mx-2"></div>
+          <div class="hidden md:block h-8 w-px bg-slate-200 dark:bg-slate-800 mx-2"></div>
           <button
             type="button"
             class="inline-flex size-10 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-primary dark:hover:bg-slate-800 dark:hover:text-primary"
@@ -243,21 +388,21 @@
           </button>
           <button
             type="button"
-            class="px-4 py-1.5 bg-primary/10 text-primary text-xs font-bold rounded-lg hover:bg-primary/20 transition-colors"
+            class="px-3 py-2 md:px-4 md:py-1.5 bg-primary/10 text-primary text-xs font-bold rounded-lg hover:bg-primary/20 transition-colors"
             @click="refreshDashboardView"
           >
             {{ t('dash_refreshDashboard') }}
           </button>
         </div>
       </header>
-      <div class="flex-1 overflow-y-auto p-8 custom-scrollbar">
-        <div class="grid grid-cols-1 lg:grid-cols-2 gap-8 mb-8">
+      <div class="flex-1 overflow-y-auto p-4 custom-scrollbar md:p-8">
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-8 md:gap-8">
           <div
-            class="bg-white dark:bg-slate-900 p-6 rounded border border-slate-200 dark:border-slate-800 shadow-sm"
+            class="bg-white dark:bg-slate-900 p-4 rounded border md:p-6 border-slate-200 dark:border-slate-800 shadow-sm"
           >
             <div class="flex justify-between items-center mb-6">
               <h3 class="font-bold text-slate-700 dark:text-slate-300">{{ t('dash_modelUsageDistribution') }}</h3>
-              <button type="button" class="text-slate-400 hover:text-primary">
+              <button type="button" class="rounded p-2 -m-2 text-slate-400 hover:text-primary">
                 <span class="material-symbols-outlined">more_horiz</span>
               </button>
             </div>
@@ -270,8 +415,8 @@
             <div v-else-if="!modelDistribution.length" class="rounded-lg border border-dashed border-slate-300 bg-slate-50 px-4 py-10 text-sm text-slate-500 dark:border-slate-700 dark:bg-slate-900/40 dark:text-slate-400">
               {{ t('dash_noModelData') }}
             </div>
-            <div v-else class="flex items-center gap-8">
-              <div class="relative size-40 flex items-center justify-center">
+            <div v-else class="flex flex-col items-center gap-4 md:flex-row md:gap-8">
+              <div class="relative flex size-32 items-center justify-center md:size-40">
                 <svg class="size-full transform -rotate-90" viewBox="0 0 36 36">
                   <title>Model usage distribution donut chart</title>
                   <circle cx="18" cy="18" fill="transparent" r="15.9" stroke="#e2e8f0" stroke-width="3"></circle>
@@ -309,7 +454,7 @@
             </div>
           </div>
           <div
-            class="bg-white dark:bg-slate-900 p-6 rounded border border-slate-200 dark:border-slate-800 shadow-sm"
+            class="bg-white dark:bg-slate-900 p-4 rounded border md:p-6 border-slate-200 dark:border-slate-800 shadow-sm"
           >
             <div class="flex justify-between items-center mb-6">
               <h3 class="font-bold text-slate-700 dark:text-slate-300">{{ t('dash_usageTrend') }}</h3>
@@ -375,17 +520,17 @@
                   y2="15"
                 ></line>
               </svg>
-              <div class="absolute bottom-0 w-full flex justify-between text-[10px] text-slate-400 pt-2">
-                <span v-for="point in trendPoints" :key="point.label">{{ point.label }}</span>
+              <div class="absolute bottom-0 w-full flex justify-between overflow-hidden text-[10px] text-slate-400 pt-2">
+                <span v-for="point in trendPoints" :key="point.label" class="min-w-0 truncate">{{ point.label }}</span>
               </div>
-              <div class="absolute left-0 top-0 rounded bg-white/80 px-2 py-1 text-[10px] font-semibold text-slate-500 dark:bg-slate-900/80 dark:text-slate-300">
+              <div :title="trendSummaryText" class="absolute left-0 top-0 max-w-[75%] truncate rounded bg-white/80 px-2 py-1 text-[10px] font-semibold text-slate-500 dark:bg-slate-900/80 dark:text-slate-300">
                 {{ trendSummaryText }}
               </div>
             </div>
           </div>
         </div>
         <div class="bg-white dark:bg-slate-900 rounded border border-slate-200 dark:border-slate-800 shadow-sm">
-          <div class="p-6 border-b border-slate-100 dark:border-slate-800 flex justify-between items-center">
+          <div class="flex flex-col items-start gap-3 border-b border-slate-100 p-4 dark:border-slate-800 md:flex-row md:items-center md:justify-between md:p-6">
             <div class="flex items-center gap-3">
               <h3 class="font-bold text-slate-700 dark:text-slate-300">{{ t('dash_recentUsageRecords') }}</h3>
               <span class="bg-slate-100 dark:bg-slate-800 text-slate-500 px-2 py-0.5 rounded text-xs font-medium">
@@ -395,24 +540,24 @@
             <div class="flex items-center gap-4">
               <button
                 type="button"
-                class="text-xs font-bold text-slate-500 flex items-center gap-1 hover:text-slate-700 dark:text-slate-300 dark:hover:text-slate-100 disabled:cursor-not-allowed disabled:opacity-50"
+                class="text-xs font-bold text-slate-500 flex items-center gap-1 h-10 md:h-auto hover:text-slate-700 dark:text-slate-300 dark:hover:text-slate-100 disabled:cursor-not-allowed disabled:opacity-50"
                 :disabled="dashboardLoading"
                 @click="refreshUsageRecords"
               >
                 <span class="material-symbols-outlined text-sm">refresh</span>
                 {{ t('dash_refresh') }}
               </button>
-              <button type="button" class="text-xs font-bold text-primary flex items-center gap-1 hover:underline" @click="exportUsageRecords">
+              <button type="button" class="text-xs font-bold text-primary flex items-center gap-1 h-10 md:h-auto hover:underline" @click="exportUsageRecords">
                 <span class="material-symbols-outlined text-sm">download</span>
                 {{ t('dash_exportData') }}
               </button>
             </div>
           </div>
-          <div class="px-6 py-3 border-b border-slate-100 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-800/30">
+          <div class="px-4 py-3 border-b md:px-6 border-slate-100 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-800/30">
             <div class="flex flex-wrap items-center gap-2">
               <select
                 v-model="requestFilter"
-                class="h-9 rounded border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 text-xs text-slate-600 dark:text-slate-300"
+                class="h-10 rounded md:h-9 border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 text-xs text-slate-600 dark:text-slate-300"
                 @change="applyUsageFilters"
               >
                 <option value="all">{{ t('dash_filterAll') }}</option>
@@ -424,12 +569,12 @@
                 v-model="pathSearch"
                 type="text"
                 :placeholder="t('dash_searchPlaceholder')"
-                class="h-9 min-w-[260px] flex-1 rounded border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 text-xs text-slate-700 dark:text-slate-300 placeholder:text-slate-400"
+                class="h-10 min-w-0 flex-1 rounded border md:h-9 md:min-w-[260px] border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 text-xs text-slate-700 dark:text-slate-300 placeholder:text-slate-400"
                 @keydown.enter.prevent="applyUsageFilters"
               />
               <button
                 type="button"
-                class="h-9 rounded bg-slate-900 px-3 text-xs font-semibold text-white transition hover:bg-slate-700 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-slate-200"
+                class="h-10 rounded md:h-9 bg-slate-900 px-3 text-xs font-semibold text-white transition hover:bg-slate-700 dark:bg-slate-100 dark:text-slate-900 dark:hover:bg-slate-200"
                 :disabled="dashboardLoading"
                 @click="applyUsageFilters"
               >
@@ -437,7 +582,7 @@
               </button>
               <button
                 type="button"
-                class="h-9 rounded border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-600 transition hover:border-slate-300 hover:text-slate-800 disabled:cursor-not-allowed disabled:opacity-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300 dark:hover:border-slate-600 dark:hover:text-slate-100"
+                class="h-10 rounded md:h-9 border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-600 transition hover:border-slate-300 hover:text-slate-800 disabled:cursor-not-allowed disabled:opacity-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300 dark:hover:border-slate-600 dark:hover:text-slate-100"
                 :disabled="dashboardLoading || (requestFilter === 'all' && !pathSearch.trim())"
                 @click="resetUsageFilters"
               >
@@ -446,22 +591,22 @@
             </div>
           </div>
           <div class="overflow-x-auto">
-            <table class="w-full text-left">
+            <table class="w-full max-md:min-w-[880px] text-left">
               <thead
                 class="bg-slate-50 dark:bg-slate-800/50 text-slate-400 text-[10px] font-bold uppercase tracking-wider"
               >
                 <tr>
-                  <th class="px-6 py-3">{{ t('dash_type') }}</th>
-                  <th class="px-6 py-3">{{ t('dash_model') }}</th>
-                  <th class="px-6 py-3">{{ t('dash_endpoint') }}</th>
-                  <th class="px-6 py-3">{{ t('dash_apiKey') }}</th>
-                  <th class="px-6 py-3">{{ t('dash_group') }}</th>
-                  <th class="px-6 py-3 text-right">{{ t('dash_inputTokens') }}</th>
-                  <th class="px-6 py-3 text-right">{{ t('dash_outputTokens') }}</th>
-                  <th class="px-6 py-3 text-right">{{ t('dash_totalTokens') }}</th>
-                  <th class="px-6 py-3 text-right">{{ t('dash_actualCost') }}</th>
-                  <th class="px-6 py-3 text-right">{{ t('dash_duration') }}</th>
-                  <th class="px-6 py-3 text-right">{{ t('dash_timestamp') }}</th>
+                  <th class="px-3 py-2.5 md:px-6 md:py-3">{{ t('dash_type') }}</th>
+                  <th class="px-3 py-2.5 md:px-6 md:py-3">{{ t('dash_model') }}</th>
+                  <th class="px-3 py-2.5 md:px-6 md:py-3">{{ t('dash_endpoint') }}</th>
+                  <th class="px-3 py-2.5 md:px-6 md:py-3">{{ t('dash_apiKey') }}</th>
+                  <th class="px-3 py-2.5 md:px-6 md:py-3">{{ t('dash_group') }}</th>
+                  <th class="px-3 py-2.5 md:px-6 md:py-3 text-right">{{ t('dash_inputTokens') }}</th>
+                  <th class="px-3 py-2.5 md:px-6 md:py-3 text-right">{{ t('dash_outputTokens') }}</th>
+                  <th class="px-3 py-2.5 md:px-6 md:py-3 text-right">{{ t('dash_totalTokens') }}</th>
+                  <th class="px-3 py-2.5 md:px-6 md:py-3 text-right">{{ t('dash_actualCost') }}</th>
+                  <th class="px-3 py-2.5 md:px-6 md:py-3 text-right">{{ t('dash_duration') }}</th>
+                  <th class="px-3 py-2.5 md:px-6 md:py-3 text-right">{{ t('dash_timestamp') }}</th>
                 </tr>
               </thead>
               <tbody class="divide-y divide-slate-100 dark:divide-slate-800 text-sm">
@@ -470,17 +615,17 @@
                   :key="`${item.id}-${item.createdAt}-${item.endpoint}`"
                   class="hover:bg-slate-50 dark:hover:bg-slate-800/30"
                 >
-                  <td class="px-6 py-4 font-bold text-slate-700 dark:text-slate-300">{{ item.requestType }}</td>
-                  <td class="px-6 py-4 text-slate-500">{{ item.model }}</td>
-                  <td class="px-6 py-4 text-slate-500"><code>{{ item.endpoint }}</code></td>
-                  <td class="px-6 py-4 text-slate-500">{{ item.apiKeyName }}</td>
-                  <td class="px-6 py-4 text-slate-500">{{ item.groupName }}</td>
-                  <td class="px-6 py-4 text-right text-slate-500 tabular-nums">{{ formatCount(item.inputTokens) }}</td>
-                  <td class="px-6 py-4 text-right text-slate-500 tabular-nums">{{ formatCount(item.outputTokens) }}</td>
-                  <td class="px-6 py-4 text-right text-slate-500 tabular-nums">{{ formatCount(item.totalTokens) }}</td>
-                  <td class="px-6 py-4 text-right text-slate-500 tabular-nums">{{ formatCurrency(item.actualCost) }}</td>
-                  <td class="px-6 py-4 text-right text-slate-500 tabular-nums">{{ formatDuration(item.durationMs) }}</td>
-                  <td class="px-6 py-4 text-right text-slate-400 tabular-nums">{{ formatDateTime(item.createdAt) }}</td>
+                  <td class="px-3 py-3 md:px-6 md:py-4 font-bold text-slate-700 dark:text-slate-300">{{ item.requestType }}</td>
+                  <td class="px-3 py-3 md:px-6 md:py-4 text-slate-500">{{ item.model }}</td>
+                  <td class="px-3 py-3 md:px-6 md:py-4 text-slate-500"><code>{{ item.endpoint }}</code></td>
+                  <td class="px-3 py-3 md:px-6 md:py-4 text-slate-500">{{ item.apiKeyName }}</td>
+                  <td class="px-3 py-3 md:px-6 md:py-4 text-slate-500">{{ item.groupName }}</td>
+                  <td class="px-3 py-3 md:px-6 md:py-4 text-right text-slate-500 tabular-nums">{{ formatCount(item.inputTokens) }}</td>
+                  <td class="px-3 py-3 md:px-6 md:py-4 text-right text-slate-500 tabular-nums">{{ formatCount(item.outputTokens) }}</td>
+                  <td class="px-3 py-3 md:px-6 md:py-4 text-right text-slate-500 tabular-nums">{{ formatCount(item.totalTokens) }}</td>
+                  <td class="px-3 py-3 md:px-6 md:py-4 text-right text-slate-500 tabular-nums">{{ formatCurrency(item.actualCost) }}</td>
+                  <td class="px-3 py-3 md:px-6 md:py-4 text-right text-slate-500 tabular-nums">{{ formatDuration(item.durationMs) }}</td>
+                  <td class="px-3 py-3 md:px-6 md:py-4 text-right text-slate-400 tabular-nums">{{ formatDateTime(item.createdAt) }}</td>
                 </tr>
                 <tr v-if="filteredRequestRows.length === 0">
                   <td colspan="11" class="px-6 py-6 text-center text-xs text-slate-400">{{ t('dash_noMatchingRecords') }}</td>
@@ -497,7 +642,7 @@
             <div class="flex items-center justify-end gap-2">
               <button
                 type="button"
-                class="h-9 rounded border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-600 transition hover:border-slate-300 hover:text-slate-800 disabled:cursor-not-allowed disabled:opacity-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300 dark:hover:border-slate-600 dark:hover:text-slate-100"
+                class="h-10 rounded md:h-9 border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-600 transition hover:border-slate-300 hover:text-slate-800 disabled:cursor-not-allowed disabled:opacity-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300 dark:hover:border-slate-600 dark:hover:text-slate-100"
                 :disabled="dashboardLoading || usagePage <= 1"
                 @click="changeUsagePage(usagePage - 1)"
               >
@@ -508,7 +653,7 @@
               </div>
               <button
                 type="button"
-                class="h-9 rounded border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-600 transition hover:border-slate-300 hover:text-slate-800 disabled:cursor-not-allowed disabled:opacity-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300 dark:hover:border-slate-600 dark:hover:text-slate-100"
+                class="h-10 rounded md:h-9 border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-600 transition hover:border-slate-300 hover:text-slate-800 disabled:cursor-not-allowed disabled:opacity-50 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300 dark:hover:border-slate-600 dark:hover:text-slate-100"
                 :disabled="dashboardLoading || usagePage >= usageTotalPages"
                 @click="changeUsagePage(usagePage + 1)"
               >
@@ -525,7 +670,7 @@
       class="fixed inset-0 z-[1000] flex items-center justify-center bg-slate-950/60 p-4 backdrop-blur-sm"
       @click.self="closeLoginModal"
     >
-      <div class="w-full max-w-md overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-2xl dark:border-slate-700 dark:bg-slate-900">
+      <div class="flex max-h-[calc(100dvh-2rem)] w-full max-w-md flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-2xl dark:border-slate-700 dark:bg-slate-900">
         <div class="border-b border-slate-200 bg-slate-50/80 px-5 py-4 dark:border-slate-700 dark:bg-slate-800/60">
           <div class="flex items-start justify-between gap-4">
             <div>
@@ -537,7 +682,7 @@
             </div>
             <button
               type="button"
-              class="rounded-lg p-1.5 text-slate-500 transition hover:bg-slate-100 hover:text-slate-700 dark:hover:bg-slate-800 dark:hover:text-slate-200"
+              class="rounded-lg p-2.5 text-slate-500 transition md:p-1.5 hover:bg-slate-100 hover:text-slate-700 dark:hover:bg-slate-800 dark:hover:text-slate-200"
               :disabled="loginPending"
               @click="closeLoginModal"
             >
@@ -546,7 +691,7 @@
           </div>
         </div>
 
-        <div class="space-y-4 p-5">
+        <div class="min-h-0 flex-1 space-y-4 overflow-y-auto p-5">
           <!-- 服务重启清空 dashboard 会话：提示远程用户必须重新登录 -->
           <div
             v-if="dashboardSessionRequired"
@@ -560,7 +705,7 @@
           <div class="grid grid-cols-2 gap-1 rounded-lg border border-slate-200 bg-slate-50/80 p-1 dark:border-slate-700 dark:bg-slate-800/60">
             <button
               type="button"
-              class="rounded-md px-3 py-1.5 text-xs font-semibold transition"
+              class="rounded-md px-3 py-2.5 text-xs font-semibold transition md:py-1.5"
               :class="loginMode === 'password' ? 'bg-primary text-white shadow-sm' : 'text-slate-600 hover:text-slate-900 dark:text-slate-300 dark:hover:text-white'"
               :disabled="loginPending"
               @click="loginMode = 'password'"
@@ -569,7 +714,7 @@
             </button>
             <button
               type="button"
-              class="rounded-md px-3 py-1.5 text-xs font-semibold transition"
+              class="rounded-md px-3 py-2.5 text-xs font-semibold transition md:py-1.5"
               :class="loginMode === 'scan' ? 'bg-primary text-white shadow-sm' : 'text-slate-600 hover:text-slate-900 dark:text-slate-300 dark:hover:text-white'"
               @click="loginMode = 'scan'"
             >
@@ -637,7 +782,7 @@
       class="fixed inset-0 z-[1000] flex items-center justify-center bg-slate-950/70 p-4 backdrop-blur-sm"
       @click.self="closeTunStartModal"
     >
-      <div class="w-full max-w-3xl overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-2xl dark:border-slate-700 dark:bg-slate-900">
+      <div class="flex max-h-[calc(100dvh-2rem)] w-full max-w-3xl flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-2xl dark:border-slate-700 dark:bg-slate-900">
         <div class="border-b border-slate-200 bg-slate-50/80 px-5 py-4 dark:border-slate-700 dark:bg-slate-800/60">
           <div class="flex items-start justify-between gap-4">
             <div>
@@ -647,7 +792,7 @@
             </div>
             <button
               type="button"
-              class="rounded-lg p-1.5 text-slate-500 transition hover:bg-slate-100 hover:text-slate-700 disabled:cursor-not-allowed disabled:opacity-60 dark:hover:bg-slate-800 dark:hover:text-slate-200"
+              class="rounded-lg p-2.5 text-slate-500 transition md:p-1.5 hover:bg-slate-100 hover:text-slate-700 disabled:cursor-not-allowed disabled:opacity-60 dark:hover:bg-slate-800 dark:hover:text-slate-200"
               @click="closeTunStartModal"
             >
               <span class="material-symbols-outlined text-lg">close</span>
@@ -655,7 +800,7 @@
           </div>
         </div>
 
-        <div class="space-y-5 p-5">
+        <div class="min-h-0 flex-1 space-y-5 overflow-y-auto p-5">
           <div class="rounded-2xl border px-4 py-4"
             :class="tunStartModal.status === 'error'
               ? 'border-red-200 bg-red-50 dark:border-red-500/30 dark:bg-red-500/10'
@@ -850,6 +995,7 @@ const emit = defineEmits(['openQuickSetup', 'openCertModal', 'startCertReinstall
 const requestFilter = ref('all');
 const pathSearch = ref('');
 const isLoginModalOpen = ref(false);
+const mobilePanelOpen = ref(false);
 const loginMode = ref('password'); // 'password' | 'scan'
 const loginEmail = ref('');
 const loginPassword = ref('');

@@ -70,7 +70,7 @@
             <button
               type="button"
               id="backToDashboard"
-              class="flex h-8 w-8 items-center justify-center rounded-lg text-slate-500 transition-colors hover:bg-slate-100 dark:hover:bg-slate-800"
+              class="flex h-10 w-10 items-center justify-center rounded-lg text-slate-500 transition-colors hover:bg-slate-100 dark:hover:bg-slate-800 md:h-8 md:w-8"
               @click="goDashboard"
             >
               <span class="material-symbols-outlined">arrow_back</span>
@@ -85,7 +85,7 @@
         <div class="mb-6 grid grid-cols-2 gap-2 md:hidden">
           <button
             type="button"
-            class="rounded-lg border px-3 py-2 text-sm font-semibold transition"
+            class="min-h-10 rounded-lg border px-3 py-2 text-sm font-semibold transition"
             :class="currentPage === 'settings' ? 'border-primary bg-primary text-white' : 'border-slate-200 bg-white text-slate-700 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-100'"
             @click="showPage('settings')"
           >
@@ -93,7 +93,7 @@
           </button>
           <button
             type="button"
-            class="rounded-lg border px-3 py-2 text-sm font-semibold transition"
+            class="min-h-10 rounded-lg border px-3 py-2 text-sm font-semibold transition"
             :class="currentPage === 'user' ? 'border-primary bg-primary text-white' : 'border-slate-200 bg-white text-slate-700 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-100'"
             @click="showPage('user')"
           >
@@ -101,7 +101,7 @@
           </button>
           <button
             type="button"
-            class="rounded-lg border px-3 py-2 text-sm font-semibold transition"
+            class="min-h-10 rounded-lg border px-3 py-2 text-sm font-semibold transition"
             :class="currentPage === 'log' ? 'border-primary bg-primary text-white' : 'border-slate-200 bg-white text-slate-700 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-100'"
             @click="showPage('log')"
           >
@@ -109,7 +109,7 @@
           </button>
           <button
             type="button"
-            class="rounded-lg border px-3 py-2 text-sm font-semibold transition"
+            class="min-h-10 rounded-lg border px-3 py-2 text-sm font-semibold transition"
             :class="currentPage === 'agent' ? 'border-primary bg-primary text-white' : 'border-slate-200 bg-white text-slate-700 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-100'"
             @click="showPage('agent')"
           >
@@ -217,7 +217,7 @@
       </main>
 
       <footer class="border-t border-slate-100 py-6 dark:border-slate-800">
-        <div class="mx-auto flex max-w-7xl items-center justify-between px-4 text-[10px] font-medium text-slate-400 sm:px-6 lg:px-8">
+        <div class="mx-auto flex max-w-7xl flex-wrap items-center justify-between gap-x-4 gap-y-1.5 px-4 text-[10px] font-medium text-slate-400 sm:px-6 lg:px-8">
           <div>{{ t('settings_copyright') }}</div>
           <div class="flex gap-4 uppercase tracking-tighter">
             <a class="hover:text-primary" href="javascript:void(0)" @click.prevent="openTutorialDocs('usage-guide')">{{ t('settings_docs') }}</a>

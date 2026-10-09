@@ -1,13 +1,13 @@
 <template>
   <div class="settings-pane" data-pane="system">
-    <div class="rounded-xl border border-slate-200 bg-white p-5 dark:border-slate-800 dark:bg-background-dark">
+    <div class="rounded-xl border border-slate-200 bg-white p-4 md:p-5 dark:border-slate-800 dark:bg-background-dark">
       <h3 class="mb-4 flex items-center gap-2 font-bold">
         <span class="material-symbols-outlined text-primary">settings</span>
         {{ t('sys_systemSettings') }}
       </h3>
 
       <div class="space-y-6">
-        <div class="flex items-center justify-between" data-guide="run-mode">
+        <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between" data-guide="run-mode">
           <div>
             <p class="text-sm font-semibold">{{ t('sys_runMode') }}</p>
             <p class="text-[10px] text-slate-500">{{ t('sys_runModeDesc') }}</p>
@@ -17,7 +17,7 @@
               type="button"
               :disabled="loadingMode || switchingMode || wintunDependency.installing"
               :class="[
-                'rounded px-3 py-1 text-[10px] font-bold transition',
+                'rounded px-3 py-2 md:py-1 text-[10px] font-bold transition',
                 selectedMode === 'tun'
                   ? 'bg-primary text-white shadow-sm'
                   : 'text-slate-500 hover:bg-slate-200 dark:text-slate-300 dark:hover:bg-slate-700/70'
@@ -30,7 +30,7 @@
               type="button"
               :disabled="loadingMode || switchingMode || wintunDependency.installing"
               :class="[
-                'rounded px-3 py-1 text-[10px] font-bold transition',
+                'rounded px-3 py-2 md:py-1 text-[10px] font-bold transition',
                 selectedMode === 'http'
                   ? 'bg-primary text-white shadow-sm'
                   : 'text-slate-500 hover:bg-slate-200 dark:text-slate-300 dark:hover:bg-slate-700/70'
@@ -42,7 +42,7 @@
           </div>
         </div>
 
-        <div class="flex items-center justify-between">
+        <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <div>
             <p class="text-sm font-semibold">{{ t('sys_language') }}</p>
             <p class="text-[10px] text-slate-500">{{ t('sys_languageDesc') }}</p>
@@ -53,7 +53,7 @@
               :key="lang.value"
               type="button"
               :class="[
-                'rounded px-3 py-1 text-[10px] font-bold transition',
+                'rounded px-3 py-2 md:py-1 text-[10px] font-bold transition',
                 locale === lang.value
                   ? 'bg-primary text-white shadow-sm'
                   : 'text-slate-500 hover:bg-slate-200 dark:text-slate-300 dark:hover:bg-slate-700/70'
@@ -65,7 +65,7 @@
           </div>
         </div>
 
-        <div class="flex items-center justify-between gap-4">
+        <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
           <div>
             <p class="text-sm font-semibold">{{ t('sys_theme') }}</p>
             <p class="text-[10px] text-slate-500">{{ t('sys_themeDesc') }}</p>
@@ -77,7 +77,7 @@
               :key="option.value"
               type="button"
               :class="[
-                'rounded px-3 py-1 text-[10px] font-bold transition',
+                'rounded px-3 py-2 md:py-1 text-[10px] font-bold transition',
                 themeButtonClass(option.value)
               ]"
               @click="applyThemeMode(option.value)"
@@ -128,7 +128,7 @@
           class="fixed inset-0 z-[1000] flex items-center justify-center bg-slate-950/60 p-4 backdrop-blur-sm"
           @click.self="cancelTunSwitchConfirm"
         >
-          <div class="w-full max-w-md overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-2xl dark:border-slate-700 dark:bg-slate-900">
+          <div class="max-h-[85dvh] w-full max-w-md overflow-y-auto overflow-x-hidden rounded-2xl border border-slate-200 bg-white shadow-2xl dark:border-slate-700 dark:bg-slate-900">
             <div class="border-b border-slate-200 bg-slate-50/80 px-5 py-4 dark:border-slate-700 dark:bg-slate-800/60">
               <div class="flex items-start justify-between gap-4">
                 <div>
@@ -140,7 +140,7 @@
                 </div>
                 <button
                   type="button"
-                  class="rounded-lg p-1.5 text-slate-500 transition hover:bg-slate-100 hover:text-slate-700 dark:hover:bg-slate-800 dark:hover:text-slate-200"
+                  class="rounded-lg p-2.5 md:p-1.5 text-slate-500 transition hover:bg-slate-100 hover:text-slate-700 dark:hover:bg-slate-800 dark:hover:text-slate-200"
                   @click="cancelTunSwitchConfirm"
                 >
                   <span class="material-symbols-outlined text-lg">close</span>
@@ -235,7 +235,7 @@
           aria-modal="true"
           @click.self="closeSystemServiceConfirm"
         >
-          <div class="w-full max-w-lg overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-2xl dark:border-slate-700 dark:bg-slate-900">
+          <div class="max-h-[85dvh] w-full max-w-lg overflow-y-auto overflow-x-hidden rounded-3xl border border-slate-200 bg-white shadow-2xl dark:border-slate-700 dark:bg-slate-900">
             <div class="border-b border-slate-200 bg-slate-50/85 px-5 py-4 dark:border-slate-700 dark:bg-slate-800/65">
               <div class="flex items-start justify-between gap-4">
                 <div class="flex items-start gap-3">
@@ -268,7 +268,7 @@
                 </div>
                 <button
                   type="button"
-                  class="rounded-xl p-2 text-slate-500 transition hover:bg-slate-100 hover:text-slate-700 disabled:cursor-not-allowed disabled:opacity-50 dark:hover:bg-slate-800 dark:hover:text-slate-200"
+                  class="rounded-xl p-3 md:p-2 text-slate-500 transition hover:bg-slate-100 hover:text-slate-700 disabled:cursor-not-allowed disabled:opacity-50 dark:hover:bg-slate-800 dark:hover:text-slate-200"
                   :disabled="serviceActionLoading"
                   @click="closeSystemServiceConfirm"
                 >
@@ -376,7 +376,7 @@
             <div class="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-2">
               <button
                 type="button"
-                class="rounded bg-slate-900 py-1.5 text-[11px] font-bold text-white transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60 dark:bg-primary"
+                class="rounded bg-slate-900 py-2.5 md:py-1.5 text-[11px] font-bold text-white transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60 dark:bg-primary"
                 :disabled="serviceActionLoading || !systemServiceInfo.supported || systemServiceInfo.installed || showServicePrivilegeHint"
                 @click="openSystemServiceConfirm('install')"
               >
@@ -384,7 +384,7 @@
               </button>
               <button
                 type="button"
-                class="rounded border border-red-200 py-1.5 text-[11px] font-bold text-red-600 transition hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-red-500/30 dark:text-red-300 dark:hover:bg-red-500/10"
+                class="rounded border border-red-200 py-2.5 md:py-1.5 text-[11px] font-bold text-red-600 transition hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-red-500/30 dark:text-red-300 dark:hover:bg-red-500/10"
                 :disabled="serviceActionLoading || !systemServiceInfo.supported || !systemServiceInfo.installed"
                 @click="openSystemServiceConfirm('uninstall')"
               >
@@ -394,7 +394,7 @@
 
             <button
               type="button"
-              class="mt-2 w-full rounded border border-slate-200 py-1.5 text-[11px] font-bold text-slate-700 transition hover:bg-white disabled:cursor-not-allowed disabled:opacity-60 dark:border-slate-700 dark:text-slate-100 dark:hover:bg-slate-900/50"
+              class="mt-2 w-full rounded border border-slate-200 py-2.5 md:py-1.5 text-[11px] font-bold text-slate-700 transition hover:bg-white disabled:cursor-not-allowed disabled:opacity-60 dark:border-slate-700 dark:text-slate-100 dark:hover:bg-slate-900/50"
               :disabled="serviceActionLoading"
               @click="refreshSystemServiceStatus"
             >

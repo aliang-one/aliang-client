@@ -7,7 +7,7 @@
     <div
       class="relative z-10 w-full max-w-3xl bg-white dark:bg-slate-900 rounded-lg border border-slate-200 dark:border-slate-700 shadow-2xl overflow-hidden"
     >
-      <div class="px-6 py-4 border-b border-slate-200 dark:border-slate-700 flex items-center justify-between">
+      <div class="px-4 py-4 md:px-6 border-b border-slate-200 dark:border-slate-700 flex items-center justify-between">
         <div>
           <h3 class="text-lg font-bold text-slate-900 dark:text-slate-100">{{ t('cert_title') }}</h3>
           <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">{{ t('cert_subtitle') }}</p>
@@ -22,7 +22,7 @@
         </button>
       </div>
 
-      <div class="max-h-[calc(100vh-7rem)] space-y-5 overflow-y-auto p-6">
+      <div class="max-h-[calc(100vh-7rem)] space-y-5 overflow-y-auto p-4 md:p-6">
         <div class="flex items-center gap-2 flex-wrap">
           <span class="px-2.5 py-1.5 bg-slate-100 dark:bg-slate-800 rounded-md text-xs font-medium text-slate-700 dark:text-slate-300">
             {{ t('cert_localCert') }}
@@ -69,7 +69,7 @@
                 {{ certStatus.is_trusted ? t('cert_trusted') : t('cert_notTrusted') }}
               </span>
             </div>
-            <div class="text-xs text-slate-500 dark:text-slate-400 space-y-0.5 mt-2">
+            <div class="break-words text-xs text-slate-500 dark:text-slate-400 space-y-0.5 mt-2">
               <div><strong>{{ t('cert_subject') }}</strong> {{ certStatus.subject || '-' }}</div>
               <div><strong>{{ t('cert_issuer') }}</strong> {{ certStatus.issuer || '-' }}</div>
               <div><strong>{{ t('cert_validity') }}</strong> {{ certStatus.not_before || '-' }} ~ {{ certStatus.not_after || '-' }}</div>
@@ -87,7 +87,7 @@
           <button
             type="button"
             :disabled="operationBusy"
-            class="min-h-9 flex items-center justify-center gap-1.5 px-2.5 py-1.5 border border-slate-200 dark:border-slate-700 rounded-md text-xs hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            class="min-h-10 md:min-h-9 flex items-center justify-center gap-1.5 px-2.5 py-1.5 border border-slate-200 dark:border-slate-700 rounded-md text-xs hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
             @click="installCert"
           >
             <span class="material-symbols-outlined text-[16px] leading-none text-slate-500">check_circle</span>
@@ -96,7 +96,7 @@
           <button
             type="button"
             :disabled="downloading"
-            class="min-h-9 flex items-center justify-center gap-1.5 px-2.5 py-1.5 border border-slate-200 dark:border-slate-700 rounded-md text-xs hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            class="min-h-10 md:min-h-9 flex items-center justify-center gap-1.5 px-2.5 py-1.5 border border-slate-200 dark:border-slate-700 rounded-md text-xs hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
             @click="downloadCertFile"
           >
             <span
@@ -109,7 +109,7 @@
           <button
             type="button"
             :disabled="operationBusy"
-            class="min-h-9 flex items-center justify-center gap-1.5 px-2.5 py-1.5 border border-red-200 dark:border-red-500/40 rounded-md text-xs text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            class="min-h-10 md:min-h-9 flex items-center justify-center gap-1.5 px-2.5 py-1.5 border border-red-200 dark:border-red-500/40 rounded-md text-xs text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
             @click="removeCert"
           >
             <span class="material-symbols-outlined text-[16px] leading-none text-red-500">delete</span>
@@ -118,7 +118,7 @@
           <button
             type="button"
             :disabled="operationBusy"
-            class="min-h-9 flex items-center justify-center gap-1.5 px-2.5 py-1.5 border border-amber-200 dark:border-amber-500/40 rounded-md text-xs text-amber-700 dark:text-amber-300 hover:bg-amber-50 dark:hover:bg-amber-900/20 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            class="min-h-10 md:min-h-9 flex items-center justify-center gap-1.5 px-2.5 py-1.5 border border-amber-200 dark:border-amber-500/40 rounded-md text-xs text-amber-700 dark:text-amber-300 hover:bg-amber-50 dark:hover:bg-amber-900/20 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
             @click="generateCert"
           >
             <span class="material-symbols-outlined text-[16px] leading-none text-amber-500">autorenew</span>
@@ -258,7 +258,7 @@
 
         <!-- Reinstall Section -->
         <div class="p-4 rounded-lg bg-sky-50/70 dark:bg-sky-900/10 border border-sky-200 dark:border-sky-700/40 space-y-3">
-          <div class="flex items-center justify-between gap-3">
+          <div class="flex flex-col items-start gap-3 sm:flex-row sm:items-center sm:justify-between">
             <div>
               <div class="text-sm font-semibold text-sky-700 dark:text-sky-300">{{ t('cert_reinstall') }}</div>
               <div class="text-xs text-slate-600 dark:text-slate-400">{{ t('cert_reinstallDesc') }}</div>
@@ -266,7 +266,7 @@
             <button
               type="button"
               :disabled="operationBusy"
-              class="min-h-9 flex items-center justify-center gap-1.5 px-2.5 py-1.5 border border-sky-300 dark:border-sky-600 rounded-md text-xs text-sky-700 dark:text-sky-300 hover:bg-sky-100/70 dark:hover:bg-sky-900/20 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              class="min-h-10 md:min-h-9 flex items-center justify-center gap-1.5 px-2.5 py-1.5 border border-sky-300 dark:border-sky-600 rounded-md text-xs text-sky-700 dark:text-sky-300 hover:bg-sky-100/70 dark:hover:bg-sky-900/20 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
               @click="startReinstall"
             >
               <span class="material-symbols-outlined text-[16px] leading-none text-sky-500">restart_alt</span>

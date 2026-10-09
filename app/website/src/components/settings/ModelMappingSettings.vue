@@ -8,7 +8,7 @@
     <label class="flex cursor-pointer items-center gap-2 text-sm text-slate-700 dark:text-slate-200">
       <input
         type="checkbox"
-        class="h-4 w-4 rounded border-slate-300 text-primary focus:ring-primary/20 dark:border-slate-600 dark:bg-slate-900"
+        class="h-5 w-5 rounded md:h-4 md:w-4 border-slate-300 text-primary focus:ring-primary/20 dark:border-slate-600 dark:bg-slate-900"
         :checked="enabled"
         :disabled="loading || saving"
         @change="enabled = $event.target.checked"
@@ -21,7 +21,7 @@
     </p>
 
     <div class="flex flex-col gap-2">
-      <div class="grid grid-cols-[1fr_auto_1fr_auto] items-center gap-2 text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+      <div class="hidden text-[11px] font-semibold uppercase tracking-wide text-slate-400 sm:grid sm:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)_auto] sm:items-center sm:gap-2">
         <span>{{ t('modelMapping_original') }}</span>
         <span></span>
         <span>{{ t('modelMapping_replacement') }}</span>
@@ -31,7 +31,7 @@
       <div
         v-for="(row, index) in rows"
         :key="index"
-        class="grid grid-cols-[1fr_auto_1fr_auto] items-center gap-2"
+        class="grid grid-cols-1 items-center gap-2 sm:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)_auto]"
       >
         <input
           v-model="row.from"
@@ -40,7 +40,7 @@
           :disabled="loading || saving"
           class="w-full rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-sm text-slate-800 focus:border-primary focus:ring-primary/20 disabled:opacity-60 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
         />
-        <span class="text-slate-400">→</span>
+        <span class="hidden text-slate-400 sm:inline">→</span>
         <input
           v-model="row.to"
           type="text"
@@ -50,7 +50,7 @@
         />
         <button
           type="button"
-          class="rounded-md px-2 py-1 text-xs text-slate-400 hover:bg-red-50 hover:text-red-600 disabled:opacity-40 dark:hover:bg-red-900/20"
+          class="min-h-9 min-w-9 justify-self-end rounded-md px-2 py-1 text-xs text-slate-400 hover:bg-red-50 hover:text-red-600 disabled:opacity-40 dark:hover:bg-red-900/20 md:min-h-0 md:min-w-0"
           :disabled="loading || saving"
           :title="t('modelMapping_remove')"
           @click="removeRow(index)"
@@ -62,7 +62,7 @@
 
     <button
       type="button"
-      class="self-start rounded-md border border-dashed border-slate-300 px-3 py-1.5 text-xs font-medium text-slate-500 hover:border-primary hover:text-primary disabled:opacity-40 dark:border-slate-600 dark:text-slate-300"
+      class="min-h-10 self-start rounded-md border border-dashed border-slate-300 px-3 py-1.5 text-xs font-medium text-slate-500 hover:border-primary hover:text-primary disabled:opacity-40 dark:border-slate-600 dark:text-slate-300 md:min-h-0"
       :disabled="loading || saving"
       @click="addRow"
     >
@@ -74,7 +74,7 @@
 
     <button
       type="button"
-      class="self-end rounded-lg bg-primary px-4 py-2 text-sm font-semibold text-white shadow-sm hover:opacity-90 disabled:opacity-50"
+      class="min-h-10 self-end rounded-lg bg-primary px-4 py-2 text-sm font-semibold text-white shadow-sm hover:opacity-90 disabled:opacity-50 md:min-h-0"
       :disabled="loading || saving"
       @click="save"
     >

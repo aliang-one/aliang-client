@@ -57,7 +57,7 @@
       </div>
     </div>
 
-    <dl class="grid grid-cols-2 border-t border-slate-200 bg-slate-50/70 dark:border-slate-800 dark:bg-slate-900/35 lg:grid-cols-4">
+    <dl class="grid grid-cols-1 border-t border-slate-200 bg-slate-50/70 dark:border-slate-800 dark:bg-slate-900/35 sm:grid-cols-2 lg:grid-cols-4">
       <div class="border-b border-slate-200 p-4 dark:border-slate-800 lg:border-b-0 lg:border-r">
         <dt class="flex items-center gap-1.5 text-[10px] font-bold uppercase text-slate-400">
           <span class="material-symbols-outlined text-sm">memory</span>
@@ -67,21 +67,21 @@
           {{ runtimeLabel }}
         </dd>
       </div>
-      <div class="border-b border-l border-slate-200 p-4 dark:border-slate-800 lg:border-b-0 lg:border-l-0 lg:border-r">
+      <div class="border-b sm:border-l border-slate-200 p-4 dark:border-slate-800 lg:border-b-0 lg:border-l-0 lg:border-r">
         <dt class="flex items-center gap-1.5 text-[10px] font-bold uppercase text-slate-400">
           <span class="material-symbols-outlined text-sm">laptop_mac</span>
           {{ t('agent_deviceStatus') }}
         </dt>
         <dd class="mt-1.5 text-sm font-semibold" :class="deviceStatusClass">{{ deviceStatusLabel }}</dd>
       </div>
-      <div class="p-4 lg:border-r lg:border-slate-200 dark:lg:border-slate-800">
+      <div class="border-b border-slate-200 p-4 dark:border-slate-800 sm:border-b-0 lg:border-r lg:border-slate-200 dark:lg:border-slate-800">
         <dt class="flex items-center gap-1.5 text-[10px] font-bold uppercase text-slate-400">
           <span class="material-symbols-outlined text-sm">build</span>
           {{ t('agent_toolsFound') }}
         </dt>
         <dd class="mt-1.5 text-sm font-semibold text-slate-700 dark:text-slate-200">{{ toolAvailabilitySummary }}</dd>
       </div>
-      <div class="border-l border-slate-200 p-4 dark:border-slate-800 lg:border-l-0">
+      <div class="sm:border-l border-slate-200 p-4 dark:border-slate-800 lg:border-l-0">
         <dt class="flex items-center gap-1.5 text-[10px] font-bold uppercase text-slate-400">
           <span class="material-symbols-outlined text-sm">sync</span>
           {{ t('agent_sync') }}
@@ -188,7 +188,7 @@
         <p class="text-sm font-semibold">{{ t('agent_tools') }}</p>
         <button
           type="button"
-          class="rounded border border-slate-200 px-2 py-1 text-[10px] font-bold text-slate-600 transition hover:bg-slate-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
+          class="inline-flex min-h-9 items-center rounded border border-slate-200 px-2.5 py-1 text-[10px] font-bold text-slate-600 transition hover:bg-slate-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800 md:min-h-0 md:px-2"
           :disabled="loading"
           @click="refreshStatus"
         >

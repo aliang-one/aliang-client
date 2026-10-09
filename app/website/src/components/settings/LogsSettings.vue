@@ -119,7 +119,7 @@
                     {{ provider.badge }}
                   </span>
                 </div>
-                <div class="mt-4 flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
+                <div class="mt-4 flex flex-col gap-0.5 text-xs text-slate-500 dark:text-slate-400 sm:flex-row sm:items-center sm:justify-between">
                   <span>{{ provider.lastSeenText }}</span>
                   <span>{{ provider.detail }}</span>
                 </div>
@@ -172,7 +172,7 @@
               <select
                 id="logLevelSelect"
                 v-model="selectedLevel"
-                class="rounded-md border-0 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-600 shadow-sm ring-1 ring-slate-200 focus:outline-none focus:ring-2 focus:ring-primary/40 dark:bg-slate-900 dark:text-slate-200 dark:ring-slate-600"
+                class="min-h-10 rounded-md border-0 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-600 shadow-sm ring-1 ring-slate-200 focus:outline-none focus:ring-2 focus:ring-primary/40 dark:bg-slate-900 dark:text-slate-200 dark:ring-slate-600 md:min-h-0"
               >
                 <option v-for="option in filterLevelOptions" :key="option.value" :value="option.value">
                   {{ option.label }}

@@ -6,7 +6,7 @@
           <span class="material-symbols-outlined text-primary">cloud_sync</span>
           {{ t('sync_title') }}
         </h3>
-        <div class="flex items-center gap-2">
+        <div class="flex flex-wrap items-center gap-2">
           <button type="button" class="settings-btn-outline" @click="loadConfigs">{{ t('sync_refresh') }}</button>
           <button type="button" class="settings-btn-primary" :disabled="pushing" @click="pushSelectedToCloud">
             {{ pushing ? t('sync_pushing') : t('sync_pushSelected') }}
@@ -42,7 +42,7 @@
       </div>
 
       <div class="overflow-auto rounded-lg border border-slate-200 dark:border-slate-800">
-        <table class="w-full text-sm">
+        <table class="w-full max-md:min-w-[720px] text-sm">
           <thead class="bg-slate-50 dark:bg-slate-800/50">
             <tr>
               <th class="text-left p-2">{{ t('sync_colSelect') }}</th>
@@ -60,6 +60,7 @@
               <td class="p-2">
                 <input
                   type="checkbox"
+                  class="h-5 w-5 md:h-4 md:w-4"
                   :checked="!!item.selected"
                   @change="toggleSelect(item, $event.target.checked)"
                 />
@@ -79,9 +80,9 @@
               </td>
               <td class="p-2">
                 <div class="flex gap-2 flex-wrap">
-                  <button type="button" class="settings-btn-outline !py-1 !px-2" @click="applyItem(item)">{{ t('sync_apply') }}</button>
-                  <button type="button" class="settings-btn-outline !py-1 !px-2" @click="copyContent(item)">{{ t('sync_copy') }}</button>
-                  <button type="button" class="settings-btn-outline !py-1 !px-2" @click="removeConfig(item)">{{ t('sync_delete') }}</button>
+                  <button type="button" class="settings-btn-outline !py-1.5 !px-2.5 md:!py-1 md:!px-2" @click="applyItem(item)">{{ t('sync_apply') }}</button>
+                  <button type="button" class="settings-btn-outline !py-1.5 !px-2.5 md:!py-1 md:!px-2" @click="copyContent(item)">{{ t('sync_copy') }}</button>
+                  <button type="button" class="settings-btn-outline !py-1.5 !px-2.5 md:!py-1 md:!px-2" @click="removeConfig(item)">{{ t('sync_delete') }}</button>
                 </div>
               </td>
             </tr>
@@ -112,7 +113,7 @@
         </div>
       </div>
 
-      <div class="mt-3 flex justify-end gap-2">
+      <div class="mt-3 flex flex-wrap justify-end gap-2">
         <button type="button" class="settings-btn-secondary" @click="resetEditor">{{ t('sync_reset') }}</button>
         <button type="button" class="settings-btn-primary" :disabled="saving" @click="saveConfig">
           {{ saving ? t('sync_saving') : t('sync_saveConfig') }}
