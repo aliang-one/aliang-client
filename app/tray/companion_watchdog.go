@@ -116,8 +116,12 @@ func (a *CompanionApp) agentWatchdogLoop() {
 					logger.Warn("[AGENT-WATCHDOG] registration_stuck notifying_user")
 					registrationStuckNotifier("aliang-gateway", "远程设备已离线超过 15 分钟，自动恢复未成功，请检查网络或重启 aliang")
 				}
-				if !needsSync && !regReconcileDue {
-					// 两个巡检都不需要 reconcile：作废冷却，恢复后立即放行。
+				// 只在「确定性观测且两个巡检都不需要 reconcile」时作废冷却。
+				// probeOK=false（观测未知）不得参与 reset：黑洞型故障下未知与
+				// 已知坏交替出现，未知 tick 反复 reset 会把 5min 冷却击穿成
+				// ~20s 一次的 reconcile 风暴，且每次 reconcile 又是 core 侧
+				// 8s 持锁 POST，正反馈加剧锁竞争。
+				if !needsSync && regProbeOK && !regReconcileDue {
 					reconciles.reset()
 				}
 				if needsSync {
