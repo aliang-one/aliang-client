@@ -7253,7 +7253,7 @@ func agentAIStringSliceContains(values []string, target string) bool {
 }
 
 func resolveAgentAICWD(raw string) (string, error) {
-	return resolveAgentAuthorizedCWD(raw, "project path")
+	return resolveAgentCWDFallbackHome(raw, "project path")
 }
 
 // claudeRetryInfo captures the most-recent Claude stream-json

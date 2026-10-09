@@ -1401,7 +1401,7 @@ func agentTerminalErrorPayload(sessionID string, err error) map[string]interface
 }
 
 func resolveAgentTerminalCWD(raw string) (string, error) {
-	return resolveAgentAuthorizedCWD(raw, "working directory")
+	return resolveAgentCWDFallbackHome(raw, "working directory")
 }
 
 func defaultAgentShell() string {
