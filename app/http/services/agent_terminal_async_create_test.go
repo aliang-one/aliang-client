@@ -79,7 +79,10 @@ func TestWriteWaitsForInFlightCreate(t *testing.T) {
 	go func() {
 		defer close(created)
 		defer release()
-		m.create(map[string]interface{}{"session_id": "t-race", "shell": "/bin/zsh", "cwd": cwd}, write)
+		// shell 走平台默认（resolveAgentShell("")→defaultAgentShell）：
+		// "/bin/zsh" 在 Windows 不存在，create 会在 shell 校验处提前失败，
+		// 令本测试在 Windows 确定性假失败（实测 3/3）。
+		m.create(map[string]interface{}{"session_id": "t-race", "shell": "", "cwd": cwd}, write)
 	}()
 
 	// 紧随其后的 terminal.input(读循环内联):必须等到 create 落地,
