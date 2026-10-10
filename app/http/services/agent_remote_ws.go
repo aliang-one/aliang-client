@@ -110,24 +110,12 @@ func (s *AgentService) EnsureRemoteConnection() error {
 }
 
 func (s *AgentService) remoteConnectionLoop() {
-	defer func() {
-		// The remote connection is being torn down for good (disabled / no
-		// authorization / process-level shutdown of the loop): clean up the AI
-		// sessions and terminal PTYs that runRemoteAgentSession deliberately
-		// keeps alive across transient reconnects.
-		s.terminal.closeAll()
-		s.ai.closeAll()
-		s.wsMu.Lock()
-		s.wsConnecting = false
-		s.wsMu.Unlock()
-		// 必须在 wsConnecting 清零之后 nudge：此刻 EnsureRemoteConnection 的幂等
-		// 守卫已放行，保活触发的注册成功能立刻重新拉起连接循环，不必等下一个
-		// tick（2026-10-08 事故形态：注册态丢失后循环终态退出，全仓无重试）。
-		if s.registrationLostRecoverable() {
-			logger.Info("[AGENT-BOOT] remote_connection loop_exit recoverable_registration_lost nudging_keepalive")
-			nudgeAgentRegistrationKeepalive("ws_loop_exit_registration_lost")
-		}
-	}()
+	// loopExitRecoverable 在循环体内首次判定 recoverable 时置位，defer 直接
+	// 采用、cleanup 内不得二次求值：保活并发重注册会在窗口内把 Registered
+	// 翻回 true，二次求值会误走清场分支，恰好杀掉本要保留的会话且不再
+	// nudge（TOCTOU，评审 2026-10-11）。
+	loopExitRecoverable := false
+	defer func() { s.remoteLoopExitCleanup(loopExitRecoverable) }()
 
 	handshake401Streak := 0
 	for {
@@ -139,6 +127,7 @@ func (s *AgentService) remoteConnectionLoop() {
 			if s.registrationLostRecoverable() {
 				// 可恢复的注册态丢失：不写 offline（保留 server_unavailable/
 				// connect_failed 等真实状态），交由会话外注册保活定时器重注册。
+				loopExitRecoverable = true
 				logger.Info("[AGENT-BOOT] remote_connection loop_stop reason=registration_lost_recoverable (keepalive will re-register)")
 				return
 			}
@@ -328,6 +317,34 @@ func (s *AgentService) shouldPreserveDisabledStatus() bool {
 	}
 }
 
+// remoteLoopExitCleanup 在连接循环终态退出时执行。recoverable 必须传循环体
+// 内的首次判定结果（单一求值点，见 remoteConnectionLoop 注释）。不可恢复终态
+// （disabled / 无凭据 / 进程级关闭）按既有语义清空终端 PTY 与 AI 会话；可恢复
+// 的注册态丢失例外——keepalive 将重注册并由新循环接管，会话必须像瞬断一样
+// 存活（与 markAllDetached 的断线保留语义一致；2026-10-08 事故形态曾在此连带
+// 全杀终端与 AI 会话）。必须在 wsConnecting 清零之后 nudge：此刻
+// EnsureRemoteConnection 的幂等守卫已放行，保活触发的注册成功能立刻重新拉起
+// 连接循环。
+func (s *AgentService) remoteLoopExitCleanup(recoverable bool) {
+	if recoverable {
+		logger.Info("[AGENT-BOOT] remote_connection loop_exit recoverable_registration_lost skipping_session_teardown (keepalive will re-register)")
+	} else {
+		// The remote connection is being torn down for good (disabled / no
+		// authorization / process-level shutdown of the loop): clean up the AI
+		// sessions and terminal PTYs that runRemoteAgentSession deliberately
+		// keeps alive across transient reconnects.
+		s.terminal.closeAll()
+		s.ai.closeAll()
+	}
+	s.wsMu.Lock()
+	s.wsConnecting = false
+	s.wsMu.Unlock()
+	if recoverable {
+		logger.Info("[AGENT-BOOT] remote_connection loop_exit recoverable_registration_lost nudging_keepalive")
+		nudgeAgentRegistrationKeepalive("ws_loop_exit_registration_lost")
+	}
+}
+
 // registrationLostRecoverable 是循环终态退出里的可恢复子场景：enabled、握有
 // 凭据、曾有 device_id（=曾注册过），但内存注册态已丢。这正是瞬时注册失败
 // 或 2026-10-08 事故残留（Registered=false 落盘）的形态；粘性禁用态
@@ -441,7 +458,10 @@ func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn) error {
 	// A detached session is only reaped later if it goes input-idle (see
 	// watchTerminalIdle). True shutdown paths (remoteConnectionLoop exit,
 	// forceDisconnectRemote, remote_terminal_enabled turned off) still close
-	// AI sessions and kill terminals explicitly.
+	// AI sessions and kill terminals explicitly — except that a loop exit
+	// caused by a recoverable registration loss skips the teardown entirely:
+	// keepalive re-registers and a fresh loop takes over, so sessions survive
+	// like a transient disconnect (see remoteLoopExitCleanup).
 	//
 	// terminal replay + approval sync used to run here, before the read loop.
 	// They are business writes that must wait for registration, so they now run

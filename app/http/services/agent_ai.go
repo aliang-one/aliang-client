@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -7196,7 +7197,42 @@ func claudeApprovalHookSettings(strategy claudeApprovalHookStrategy, run agentAI
 }
 
 func claudeApprovalHookCurlCommand(hookURL string) string {
-	return fmt.Sprintf("curl -sS -X POST -H %q --data-binary @- %q", "Content-Type: application/json", hookURL)
+	curl := claudeHookCurlWordForOS(runtime.GOOS, exec.LookPath)
+	return fmt.Sprintf("%s -sS -X POST -H %q --data-binary @- %q", curl, "Content-Type: application/json", hookURL)
+}
+
+// claudeHookCurlWordForOS 把 curl 解析成 shell 安全的命令词。Windows 上钩子经
+// Git Bash 执行（无则回退 PowerShell），而 PowerShell 5.1 的裸 curl 是
+// Invoke-WebRequest 别名，-H/--data-binary 非法、钩子必败——System32 自带的
+// curl.exe（Win10 1803+）是稳出口，解析绝对路径绕开别名。含空格的路径
+// （Program Files 下的 Git Bash curl）在 bash 与 PowerShell 的引用/调用语义
+// 无法用单一字符串两全，保持裸 curl——Git Bash 场景本就正常。非 Windows 零变化。
+func claudeHookCurlWordForOS(goos string, lookPath func(string) (string, error)) string {
+	if goos != "windows" {
+		return "curl"
+	}
+	p, err := lookPath("curl")
+	if err != nil {
+		return "curl"
+	}
+	p = strings.TrimSpace(p)
+	if p == "" || strings.ContainsAny(p, " \t") {
+		return "curl"
+	}
+	// 正斜杠在 Git Bash 与 PowerShell 下都可执行；反斜杠在 bash 未引用时会
+	// 被当转义符吞掉。不用 filepath.ToSlash——它按构建平台的分隔符处理，
+	// darwin 上对反斜杠是 no-op，而此函数单测要在任意平台跑。
+	return strings.ReplaceAll(p, `\`, `/`)
+}
+
+// marshalClaudeApprovalHookSettings 是 --settings JSON 的唯一序列化出口
+// （withClaudeApprovalHook 与护栏测试共用）。必须保持 encoding/json 默认
+// escapeHTML=true——它把 & < > 转成 \uXXXX，是 Windows .cmd 链路上挡住
+// cmd.exe 元字符的关键防线之一（% ^ 无转义，靠内容自身约束，见
+// agent_approval_hook_guard_test.go 的护栏）。改成 Encoder+SetEscapeHTML(false)
+// 或手拼 JSON 会让字面 & 直达 cmd.exe；guard 测试会红，红时必须显式评审。
+func marshalClaudeApprovalHookSettings(settings map[string]interface{}) ([]byte, error) {
+	return json.Marshal(settings)
 }
 
 func withClaudeApprovalHook(tool *agentAITool, run agentAIRun) *agentAITool {
@@ -7214,7 +7250,7 @@ func withClaudeApprovalHook(tool *agentAITool, run agentAIRun) *agentAITool {
 	if err != nil {
 		return tool
 	}
-	settingsRaw, err := json.Marshal(settings)
+	settingsRaw, err := marshalClaudeApprovalHookSettings(settings)
 	if err != nil {
 		return tool
 	}

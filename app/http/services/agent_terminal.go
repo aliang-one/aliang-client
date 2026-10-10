@@ -587,7 +587,9 @@ func (m *agentTerminalManager) closeAll() {
 // the sessions survive detached and are replayed from their output ring on the
 // next attach. True shutdown paths (remoteConnectionLoop exit,
 // forceDisconnectRemote, the remote-terminal setting being disabled) still call
-// closeAll, which kills and tombstones everything.
+// closeAll, which kills and tombstones everything — except that a loop exit
+// caused by a recoverable registration loss skips the teardown (see
+// remoteLoopExitCleanup): keepalive re-registers and sessions must survive.
 func (m *agentTerminalManager) markAllDetached() {
 	now := time.Now()
 	m.mu.Lock()
