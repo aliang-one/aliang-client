@@ -1849,6 +1849,15 @@ func withAgentReadOnlyPolicy(tool *agentAITool) *agentAITool {
 	default:
 		return nil
 	}
+	// prompt 走 stdin 时 args 末位不是位置参数：flags 直接追加尾部；claude 的
+	// "--" 终止符用于分隔其后的位置 prompt，无位置参数时去掉。
+	if copied.stdinPrompt != "" {
+		if copied.id == "claude" || copied.id == "claudecode" {
+			flags = flags[:len(flags)-1]
+		}
+		copied.args = append(copied.args, flags...)
+		return &copied
+	}
 	copied.args = append(copied.args[:promptIndex], append(flags, copied.args[promptIndex])...)
 	return &copied
 }
