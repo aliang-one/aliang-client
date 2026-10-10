@@ -12,7 +12,8 @@ import (
 )
 
 // userBinSubdirs 是用户级 CLI（claude/codex/opencode 等）常见的安装子目录，
-// 相对家目录解析。覆盖 npm/volta/bun/yarn/cargo/deno 的全局安装位置。
+// 相对家目录解析。覆盖 npm/volta/bun/yarn/cargo/deno 的全局安装位置；
+// AppData/Roaming/npm 是 Windows npm 全局安装(%APPDATA%\npm)相对家目录的路径。
 var userBinSubdirs = []string{
 	".local/bin",
 	".npm-global/bin",
@@ -21,6 +22,7 @@ var userBinSubdirs = []string{
 	".yarn/bin",
 	".cargo/bin",
 	".deno/bin",
+	"AppData/Roaming/npm",
 }
 
 // extensionRootSubdirs 是 VSCode 系编辑器的扩展目录（相对家目录）。覆盖
@@ -84,8 +86,8 @@ func lookPathInHomes(homes []string, name string) (string, error) {
 func lookPathInHomesForOS(homes []string, name, goos, goarch string) (string, error) {
 	var found []string
 	for _, home := range homes {
-		for _, candidate := range userBinCandidates(home, name) {
-			if isExecutableFile(candidate) {
+		for _, candidate := range userBinCandidatesForOS(home, name, goos) {
+			if isExecutableFileForOS(candidate, goos) {
 				found = append(found, candidate)
 			}
 		}
@@ -99,7 +101,7 @@ func lookPathInHomesForOS(homes []string, name, goos, goarch string) (string, er
 	}
 	var appBundle []string
 	for _, candidate := range platformBinCandidates(goos, homes, name) {
-		if !isExecutableFile(candidate) {
+		if !isExecutableFileForOS(candidate, goos) {
 			continue
 		}
 		if sysDirs[filepath.Dir(candidate)] {
@@ -119,14 +121,14 @@ func lookPathInHomesForOS(homes []string, name, goos, goarch string) (string, er
 		return found[0], nil
 	}
 	for _, candidate := range appBundle {
-		if isExecutableFile(candidate) {
+		if isExecutableFileForOS(candidate, goos) {
 			return candidate, nil
 		}
 	}
 	// VSCode 系编辑器扩展内置的 CLI 排在最后兜底：独立安装生命周期独立且
 	// 稳定，扩展捆绑版可能是 alpha 且随扩展更新被整体替换。
 	for _, candidate := range extensionBinCandidatesForOS(goos, goarch, homes, name) {
-		if isExecutableFile(candidate) {
+		if isExecutableFileForOS(candidate, goos) {
 			return candidate, nil
 		}
 	}
@@ -161,16 +163,30 @@ func newestCLIBinaries(candidates []string) []string {
 }
 
 func userBinCandidates(home, name string) []string {
+	return userBinCandidatesForOS(home, name, runtime.GOOS)
+}
+
+// userBinCandidatesForOS 生成家目录下 name 的候选路径。Windows 上每个基础候选
+// 追加 .exe/.cmd 变体(npm shim 是 claude.cmd、原生安装器是 claude.exe)，变体
+// 排在裸名前：npm 目录里的裸 claude 是 sh 脚本，在 Windows 不可执行。
+func userBinCandidatesForOS(home, name, goos string) []string {
 	var out []string
+	appendCandidate := func(base string) {
+		if goos == "windows" {
+			out = append(out, base+".exe", base+".cmd", base)
+			return
+		}
+		out = append(out, base)
+	}
 	for _, sub := range userBinSubdirs {
-		out = append(out, filepath.Join(home, sub, name))
+		appendCandidate(filepath.Join(home, sub, name))
 	}
 	// nvm: ~/.nvm/versions/node/<ver>/bin/<name>，需展开版本子目录。
 	nvmNode := filepath.Join(home, ".nvm", "versions", "node")
 	if entries, err := os.ReadDir(nvmNode); err == nil {
 		for _, e := range entries {
 			if e.IsDir() {
-				out = append(out, filepath.Join(nvmNode, e.Name(), "bin", name))
+				appendCandidate(filepath.Join(nvmNode, e.Name(), "bin", name))
 			}
 		}
 	}
@@ -219,10 +235,18 @@ func platformBinCandidates(goos string, homes []string, name string) []string {
 
 // isExecutableFile 判断路径是否为可执行文件（非目录且带任意执行位）。
 // 与 exec.LookPath 在 root 下的判定语义一致：只要存在任一 x 位即可执行。
+// Windows 没有执行位语义（Go 普通文件 Mode 恒无 x 位），退化为"存在且非目录"。
 func isExecutableFile(path string) bool {
+	return isExecutableFileForOS(path, runtime.GOOS)
+}
+
+func isExecutableFileForOS(path, goos string) bool {
 	info, err := os.Stat(path)
 	if err != nil || info.IsDir() {
 		return false
+	}
+	if goos == "windows" {
+		return true
 	}
 	return info.Mode().Perm()&0o111 != 0
 }

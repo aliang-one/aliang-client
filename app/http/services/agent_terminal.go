@@ -1450,7 +1450,8 @@ func agentTerminalEnv(shell string) []string {
 	if home := agentHome(); home != "" {
 		env = append(env, "HOME="+home)
 	}
-	return env
+	// Windows 上合并注册表最新用户 PATH(agent 快照滞后于后装的 CLI)，其余平台原样返回。
+	return augmentAgentTerminalEnv(env)
 }
 
 func remoteString(msg map[string]interface{}, key string) string {
