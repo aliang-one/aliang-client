@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -118,8 +119,22 @@ func agentAIDiagnosticArgs(args []string) []string {
 			out = append(out, arg)
 		}
 	}
-	if len(out) > 0 {
-		out[len(out)-1] = fmt.Sprintf("<prompt:%d chars>", len(args[len(args)-1]))
+	return out
+}
+
+// agentAIToolDiagnosticArgs 渲染 ai.run.cli 日志的 argv 诊断串。prompt 走
+// stdin 时 args 末位是普通 flag 值，不得把它伪装成 prompt——改为在尾部追加
+// 一个 stdin prompt 长度标注；prompt 在 argv 时保持原掩码语义。
+func agentAIToolDiagnosticArgs(tool *agentAITool) []string {
+	if tool == nil {
+		return nil
+	}
+	out := agentAIDiagnosticArgs(tool.args)
+	if tool.stdinPrompt != "" {
+		return append(out, fmt.Sprintf("<prompt:%d chars via stdin>", len(tool.stdinPrompt)))
+	}
+	if len(out) > 0 && len(tool.args) > 0 {
+		out[len(out)-1] = fmt.Sprintf("<prompt:%d chars>", len(tool.args[len(tool.args)-1]))
 	}
 	return out
 }
@@ -194,7 +209,10 @@ func mergeEnvOverriding(base []string, overrides map[string]string) []string {
 // process environment (no os.Setenv), so goroutines spawning children concurrently
 // stay isolated. Callers may still append tool-specific vars afterwards.
 func agentChildProcessEnv() []string {
-	base := os.Environ()
+	// Windows 上合并注册表最新用户 PATH：agent 快照 PATH 缺后装 CLI 的目录，
+	// npm 的 claude.cmd shim 还要靠 PATH 解析 node——不合并则面板探测判定可用
+	// 而 spawn 必败（"node 不是内部或外部命令"）。非 Windows 原样返回。
+	base := augmentEnvWithWindowsUserPath(os.Environ())
 	cfg := config.GetGlobalConfig()
 	if cfg == nil {
 		return base
@@ -449,6 +467,10 @@ type agentAITool struct {
 	args         []string
 	env          []string
 	outputFormat agentAIOutputFormat
+	// stdinPrompt 非空时经子进程 stdin 传递而非 argv：Windows 批处理 shim
+	// (.cmd/.bat) 的命令行经 cmd.exe 解析，引号翻转重切分、%VAR% 展开、& | ^
+	// 元字符——prompt 是不可信自由文本，绝不走 argv（见 claudePromptViaStdinForOS）。
+	stdinPrompt string
 }
 
 type agentAIApprovalRequest struct {
@@ -4885,6 +4907,10 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 	cmd := newBackgroundCommandContext(ctx, tool.path, tool.args...)
 	cmd.Dir = run.projectPath
 	cmd.Env = agentChildProcessEnv()
+	if tool.stdinPrompt != "" {
+		// Windows 批处理 shim 的 prompt 走 stdin（claudePromptViaStdinForOS）。
+		cmd.Stdin = strings.NewReader(tool.stdinPrompt)
+	}
 	if len(tool.env) > 0 {
 		cmd.Env = append(cmd.Env, tool.env...)
 	}
@@ -4902,7 +4928,7 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 		strings.TrimSpace(run.effort),
 		tool.outputFormat,
 		currentAgentAIApprovalHookBaseURL(),
-		agentAIDiagnosticArgs(tool.args),
+		agentAIToolDiagnosticArgs(tool),
 		agentAIEnvDiagnostic(),
 	))
 
@@ -6810,6 +6836,10 @@ func endsWithKnownAgentEffortSuffix(model string) bool {
 }
 
 func newClaudeCodeAITool(id string, path string, prompt string, model string, effort string, resumeSessionID string, newSessionID ...string) *agentAITool {
+	return newClaudeCodeAIToolForOS(runtime.GOOS, id, path, prompt, model, effort, resumeSessionID, newSessionID...)
+}
+
+func newClaudeCodeAIToolForOS(goos string, id string, path string, prompt string, model string, effort string, resumeSessionID string, newSessionID ...string) *agentAITool {
 	args := claudeCodeHeadlessSlimArgs()
 	args = append(args, "--print", "--verbose", "--output-format", "stream-json", "--include-partial-messages")
 	args = append(args, "--append-system-prompt", agentAIOptionSystemPrompt)
@@ -6824,13 +6854,33 @@ func newClaudeCodeAITool(id string, path string, prompt string, model string, ef
 	if effort = strings.TrimSpace(effort); effort != "" {
 		args = append(args, "--effort", effort)
 	}
-	args = append(args, prompt)
-	return &agentAITool{
+	promptViaStdin := claudePromptViaStdinForOS(goos, path)
+	if !promptViaStdin {
+		args = append(args, prompt)
+	}
+	tool := &agentAITool{
 		id:           id,
 		path:         path,
 		args:         args,
 		outputFormat: agentAIOutputClaudeStreamJSON,
 	}
+	if promptViaStdin {
+		tool.stdinPrompt = prompt
+	}
+	return tool
+}
+
+// claudePromptViaStdinForOS 报告该平台/路径下 prompt 是否必须走 stdin 而非
+// argv。Windows 批处理 shim(.cmd/.bat)经 cmd.exe /c 调起：即使 Go 已按 cmd.exe
+// 规则转义，%VAR% 展开与引号/脱字符的边缘序列仍会重切或污染自由文本参数——
+// 用户 prompt 不可信，不允许进 argv。claude --print 原生支持从 stdin 读提示词，
+// 语义与位置参数完全一致。
+func claudePromptViaStdinForOS(goos, path string) bool {
+	if goos != "windows" {
+		return false
+	}
+	ext := strings.ToLower(filepath.Ext(path))
+	return ext == ".cmd" || ext == ".bat"
 }
 
 func newOpenCodeAITool(path string, prompt string, model string, effort string, resumeSessionID string) *agentAITool {
@@ -6882,6 +6932,13 @@ func withAgentAIAttachments(tool *agentAITool, attachments []agentAIAttachment) 
 		if _, attached := attachedPaths[attachment.Path]; !attached || attachment.URL != "" {
 			remaining = append(remaining, attachment)
 		}
+	}
+	// prompt 走 stdin 时附件清单必须拼进 stdinPrompt——拼到 args 末位会把
+	// 附件文本叠到最后一个 flag 值上（--resume id / --effort 等）。
+	if tool.stdinPrompt != "" {
+		copied.stdinPrompt = tool.stdinPrompt + agentAIAttachmentPromptSuffix(remaining, true)
+		copied.args = append(copied.args, extraArgs...)
+		return &copied
 	}
 	prompt += agentAIAttachmentPromptSuffix(remaining, true)
 	copied.args = append(copied.args[:promptIndex], append(extraArgs, prompt)...)
