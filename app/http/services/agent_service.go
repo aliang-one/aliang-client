@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"aliang.one/nursorgate/app/http/models"
@@ -209,6 +210,19 @@ type agentUserAuthRejectedError struct {
 }
 
 func (e agentUserAuthRejectedError) Error() string {
+	return fmt.Sprintf("agent server returned %d: %s", e.status, e.body)
+}
+
+// agentServerStatusError 是 agent server 返回非 2xx（且非带凭据的 401）时的
+// 类型化错误。Error() 文本必须与历史 fmt.Errorf 逐字节一致——
+// isDeviceIDAlreadyBoundError 与 isRetryableAgentAuthSyncError 依赖该文本做
+// 嗅探，不得改动。携带状态码供 classifyRegisterFailure 区分瞬态与致命。
+type agentServerStatusError struct {
+	status int
+	body   string
+}
+
+func (e agentServerStatusError) Error() string {
 	return fmt.Sprintf("agent server returned %d: %s", e.status, e.body)
 }
 
@@ -416,9 +430,12 @@ func (s *AgentService) enableWithUserContext(authHeader string, userKey string) 
 	if err := s.registerAndSyncLockedWithUserContext(authHeader, userKey); err != nil {
 		var authRejectedErr agentUserAuthRejectedError
 		isAuthRejectedErr := errors.As(err, &authRejectedErr)
-		s.state.LastSyncStatus = "enable_failed"
-		s.state.LastSyncMessage = err.Error()
-		_ = s.saveStateLocked()
+		// device_id_conflict 的专用标记不得被 enable_failed 覆盖（同 SyncNow）。
+		if !isDeviceIDAlreadyBoundError(err) {
+			s.state.LastSyncStatus = "enable_failed"
+			s.state.LastSyncMessage = err.Error()
+			_ = s.saveStateLocked()
+		}
 		status := s.statusLocked()
 		s.mu.Unlock()
 		// Register-path 401 during an explicit enable: still try a recovery
@@ -709,8 +726,11 @@ func (s *AgentService) SyncNowWithUserContext(authHeader string, userKey string)
 		var authRejectedErr agentUserAuthRejectedError
 		isAuthRejectedErr := errors.As(err, &authRejectedErr)
 		// A user-auth rejection has its own recovery path; do not flatten it into
-		// a generic server availability problem.
-		if !isAuthRejectedErr {
+		// a generic server availability problem. device_id_conflict likewise:
+		// the register call already recorded the conflict status and remedy —
+		// keepalive/recoverable exclusion keys off that marker, so the generic
+		// server_unavailable must not clobber it.
+		if !isAuthRejectedErr && !isDeviceIDAlreadyBoundError(err) {
 			s.state.LastSyncStatus = "server_unavailable"
 			s.state.LastSyncMessage = err.Error()
 			_ = s.saveStateLocked()
@@ -1131,6 +1151,7 @@ func (s *AgentService) statusLocked() models.AgentStatusResponse {
 
 	return models.AgentStatusResponse{
 		Status:          status,
+		DeviceEnabled:   s.state.Enabled,
 		Enabled:         s.isEnabledLocked(),
 		Bound:           s.isBoundLocked(),
 		Registered:      s.isRegisteredLocked(),
@@ -1293,7 +1314,13 @@ func (s *AgentService) saveStateLocked() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, raw, 0o600)
+	// 原子写（tmp+rename，同 saveAgentDeviceIdentity）：崩溃/掉电不再留下半截
+	// agent_state.json。所有调用方持 s.mu，tmp 文件名无并发冲突。
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 // agentDeviceIdentity is the installation-permanent device_id. It is generated
@@ -1613,6 +1640,16 @@ func (s *AgentService) registerAndSyncLockedWithUserContext(authHeader string, u
 		}
 	}
 	if err != nil {
+		if classifyRegisterFailure(err) {
+			// 瞬时链路故障（5xx/408/429/超时/DNS/连接拒绝）：不推翻内存注册态。
+			// Registered/Enabled/RemoteConnected 保持原值——合理的 Registered=false
+			// 写点只有"服务端明确拒绝"（401/409 等）与"凭据缺失"，网络抖动不是。
+			// 状态与消息由调用方落盘（enable 路径 enable_failed / sync 路径
+			// server_unavailable），此处不重复 save，避免双写竞写。
+			logger.Warn(fmt.Sprintf("[AGENT-BOOT] register_sync transient_failure keeping_registration device_id=%s registered=%t error=%v",
+				s.state.DeviceID, s.state.Registered, err))
+			return err
+		}
 		s.state.Registered = false
 		s.state.RemoteConnected = false
 		return err
@@ -1682,6 +1719,63 @@ func isDeviceIDAlreadyBoundError(err error) bool {
 		strings.Contains(text, "bound")
 }
 
+// Windows 的 winsock 真实错误码。Go 的 windows syscall 包没把 WSA* 别名为
+// ECONN* 占位常量（那些是 APPLICATION_ERROR 派生值，与真实错误码永不相等，
+// errors.Is 恒 false），只能按数值比对。
+const (
+	wsaEConnRefused syscall.Errno = 10061
+	wsaEConnReset   syscall.Errno = 10054
+	wsaEConnAborted syscall.Errno = 10053
+	wsaETimedOut    syscall.Errno = 10060
+)
+
+// isWindowsConnRefusedLike 报告 errno 是否为 Windows 的连接类瞬态错误。
+func isWindowsConnRefusedLike(errno syscall.Errno) bool {
+	switch errno {
+	case wsaEConnRefused, wsaEConnReset, wsaEConnAborted, wsaETimedOut:
+		return true
+	}
+	return false
+}
+
+// classifyRegisterFailure 判定注册失败是否为瞬时类（不应推翻内存注册态）：
+//   - 5xx / 408 / 429：服务端故障或过载，与 NotifyOwnerAuthRejected 的
+//     "≥500 保留沿重试 / 408+429 保留" 语义一致；
+//   - 传输层错误（超时/DNS/连接拒绝/reset 等）：复用 isRetryableAgentAuthSyncError
+//     的标记集；
+//   - 类型化 401、其余 4xx（400/403/409…）、device_id 冲突：非瞬时，保持既有
+//     Registered=false 语义。
+//
+// 2026-10-08 生产事故：47 秒链路故障窗内 502/超时把内存 Registered 翻成
+// false，已成功的注册被后续超时回滚，WS 循环将 unregistered 当终态退出并
+// 落盘，造成 16 小时静默离线。网络抖动不是注销理由。
+func classifyRegisterFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	var rejected agentUserAuthRejectedError
+	if errors.As(err, &rejected) {
+		return false
+	}
+	var statusErr agentServerStatusError
+	if errors.As(err, &statusErr) {
+		return statusErr.status >= http.StatusInternalServerError ||
+			statusErr.status == http.StatusRequestTimeout ||
+			statusErr.status == http.StatusTooManyRequests
+	}
+	// 连接类瞬态错误走结构化判定：Windows 错误文本不带 Unix 标记字样
+	// （拒绝="actively refused it"、重置="forcibly closed by the remote
+	// host"），字符串嗅探跨平台漏判；且 Windows 的 syscall.ECONNREFUSED 等
+	// 是 APPLICATION_ERROR 派生占位常量，errors.Is 恒 false——必须解出
+	// Errno 按数值比对 WSA 码；Unix 侧 errors.Is 直配各自平台的 ECONNREFUSED。
+	var errno syscall.Errno
+	if errors.As(err, &errno) &&
+		(errno == syscall.ECONNREFUSED || isWindowsConnRefusedLike(errno)) {
+		return true
+	}
+	return isRetryableAgentAuthSyncError(err)
+}
+
 func (s *AgentService) callAgentServer(method string, endpoint string, payload interface{}, authHeader string) ([]byte, error) {
 	return s.callAgentServerWithAuthorization(method, endpoint, payload, effectiveAgentRegisterAuthHeader(authHeader))
 }
@@ -1741,7 +1835,7 @@ func (s *AgentService) callAgentServerWithAuthorization(method string, endpoint 
 				return nil, agentUserAuthRejectedError{status: resp.StatusCode, body: string(raw)}
 			}
 		}
-		return nil, fmt.Errorf("agent server returned %d: %s", resp.StatusCode, string(raw))
+		return nil, agentServerStatusError{status: resp.StatusCode, body: string(raw)}
 	}
 	logger.Info(fmt.Sprintf("[AGENT-BOOT] agent_server_call success method=%s endpoint=%s status=%d", method, sanitizeAgentEndpoint(endpoint), resp.StatusCode))
 	return unwrapAgentServerData(raw)

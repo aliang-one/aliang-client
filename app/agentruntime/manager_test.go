@@ -213,3 +213,62 @@ func TestOwnerBaseURLPrefersSessionOwnerAddrOverride(t *testing.T) {
 		t.Fatalf("ownerBaseURL() after clear = %q, want env http://127.0.0.1:60000", got)
 	}
 }
+
+// NeedsRegistrationRecovery 覆盖 NeedsAuthenticatedSync 的盲区：用户开着的
+// 设备（raw enabled）掉注册/掉实时链路。2026-10-08 事故中
+// Enabled=true(派生)+Registered=false+SyncStatus=offline 双层门禁都进不去，
+// 静默 16 小时。显式禁用/登出（raw enabled=false）不归本巡检管。
+func TestNeedsRegistrationRecovery(t *testing.T) {
+	cases := []struct {
+		name   string
+		status models.AgentStatusResponse
+		want   bool
+	}{
+		{"incident residue: device enabled but lost registration",
+			models.AgentStatusResponse{DeviceEnabled: true, Registered: false, RemoteConnected: false, SyncStatus: "offline"}, true},
+		{"device enabled, registered but link down",
+			models.AgentStatusResponse{DeviceEnabled: true, Registered: true, RemoteConnected: false, SyncStatus: "connecting"}, true},
+		{"fully healthy",
+			models.AgentStatusResponse{DeviceEnabled: true, Registered: true, RemoteConnected: true, SyncStatus: "online"}, false},
+		{"explicitly disabled device",
+			models.AgentStatusResponse{DeviceEnabled: false, Registered: false, RemoteConnected: false, SyncStatus: "disabled"}, false},
+		{"sticky logout",
+			models.AgentStatusResponse{DeviceEnabled: false, Registered: false, RemoteConnected: false, SyncStatus: "logout"}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != capabilityPath {
+					http.NotFound(w, r)
+					return
+				}
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{"code": 0, "data": tc.status})
+			}))
+			defer server.Close()
+			originalAddr := config.DefaultUserAgentAddr
+			config.DefaultUserAgentAddr = strings.TrimPrefix(server.URL, "http://")
+			t.Cleanup(func() { config.DefaultUserAgentAddr = originalAddr })
+
+			got, probeOK := NeedsRegistrationRecovery(time.Second)
+			if !probeOK {
+				t.Fatal("probeOK = false, want deterministic answer for a live agent")
+			}
+			if got != tc.want {
+				t.Fatalf("NeedsRegistrationRecovery() = %t, want %t", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestNeedsRegistrationRecoveryProbeFailureIsConservative(t *testing.T) {
+	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	deadURL := dead.URL
+	dead.Close()
+	originalAddr := config.DefaultUserAgentAddr
+	config.DefaultUserAgentAddr = strings.TrimPrefix(deadURL, "http://")
+	t.Cleanup(func() { config.DefaultUserAgentAddr = originalAddr })
+
+	if bad, probeOK := NeedsRegistrationRecovery(time.Second); bad || probeOK {
+		t.Fatalf("probe failure must be conservative unknown: bad=%t probeOK=%t", bad, probeOK)
+	}
+}

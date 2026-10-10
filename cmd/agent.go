@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strings"
 	"syscall"
 
@@ -29,6 +30,11 @@ func init() {
 }
 
 func runAgent(cmd *cobra.Command, args []string) error {
+	// 取证埋点：SIGBUS/致命故障时保留全部 goroutine 栈并生成系统级崩溃报告
+	// （默认 single 模式不会转交信号给 CrashReporter，寄存器/线程态全部丢失
+	// ——2026-10-06/10-08 两次 SIGBUS 因此事后的寄存器级根因无法回溯）。
+	// 根因定案后可回退。
+	debug.SetTraceback("crash")
 	ensureUserAgentEnvironment()
 	auth.SetSessionOwnerProcess(false)
 
