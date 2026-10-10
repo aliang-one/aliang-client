@@ -67,6 +67,13 @@ func TestWriteWaitsForInFlightCreate(t *testing.T) {
 	m := newAgentTerminalManager()
 	coll, write := newPayloadCollector()
 	spawner := &fakeTerminalSpawner{}
+	// fake 进程必须长活：默认 wait() 立即返回，waitTerminal 会在 create 返回
+	// 的瞬间把 sessions 清空，"输入竞速 create" 退化成 "对已死会话输入"——
+	// 后者按语义本就该报 not-found（Windows 实测 ~25% 假失败、spawned=1/
+	// sessions=0/createdEvents=1 铁证）。长活后本测试才真正守护等待机制。
+	blockExit := make(chan struct{})
+	spawner.blockExit = blockExit
+	t.Cleanup(func() { close(blockExit) })
 	m.startProcess = spawner.start
 	// 预置授权目录缓存:冷进程里 collectAgentSyncSnapshot 首扫要数秒
 	// (测试环境噪音,与被测语义无关)。
@@ -79,7 +86,10 @@ func TestWriteWaitsForInFlightCreate(t *testing.T) {
 	go func() {
 		defer close(created)
 		defer release()
-		m.create(map[string]interface{}{"session_id": "t-race", "shell": "/bin/zsh", "cwd": cwd}, write)
+		// shell 走平台默认（resolveAgentShell("")→defaultAgentShell）：
+		// "/bin/zsh" 在 Windows 不存在，create 会在 shell 校验处提前失败，
+		// 令本测试在 Windows 确定性假失败（实测 3/3）。
+		m.create(map[string]interface{}{"session_id": "t-race", "shell": "", "cwd": cwd}, write)
 	}()
 
 	// 紧随其后的 terminal.input(读循环内联):必须等到 create 落地,
@@ -91,9 +101,21 @@ func TestWriteWaitsForInFlightCreate(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("create did not finish")
 	}
-	for _, e := range coll.ofTypes(models.AgentEventTerminalError) {
+	termErrs := coll.ofTypes(models.AgentEventTerminalError)
+	for _, e := range termErrs {
 		if strings.Contains(fmt.Sprintf("%v", e["error"]), "not found") {
-			t.Fatalf("input raced the create and errored: %v", e)
+			m.mu.Lock()
+			mk := len(m.sessions)
+			ck := len(m.creating)
+			m.mu.Unlock()
+			var createdSeen int
+			for _, p := range coll.snapshot() {
+				if p["type"] == models.AgentEventTerminalCreated {
+					createdSeen++
+				}
+			}
+			t.Fatalf("input raced the create and errored: %v (create-side errors: %v; spawned=%d sessions=%d creating=%d createdEvents=%d)",
+				e, termErrs, spawner.spawned(), mk, ck, createdSeen)
 		}
 	}
 	if spawner.spawned() != 1 {
