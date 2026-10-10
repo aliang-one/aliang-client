@@ -92,6 +92,12 @@ func newAgentExternalTUIBusyError() error { return agentExternalTUIBusyError{} }
 // dead pid records "not always promptly", so stale records naming recycled
 // pids are expected in the wild.
 func liveClaudeTUIRecord(home, nativeSessionID string) (agentRenamePidRecord, bool) {
+	return liveClaudeTUIRecordWith(home, nativeSessionID, externalInterruptTargetMatches)
+}
+
+// liveClaudeTUIRecordWith 允许调用方注入身份门禁（定时器路径传调度时快照，
+// 避免在后台 goroutine 裸读全局旋钮）。
+func liveClaudeTUIRecordWith(home, nativeSessionID string, targetMatches func(int) bool) (agentRenamePidRecord, bool) {
 	nativeSessionID = strings.TrimSpace(nativeSessionID)
 	home = strings.TrimSpace(home)
 	if nativeSessionID == "" || home == "" {
@@ -104,7 +110,7 @@ func liveClaudeTUIRecord(home, nativeSessionID string) (agentRenamePidRecord, bo
 	if !isPidAlive(record.PID) {
 		return agentRenamePidRecord{}, false
 	}
-	if !externalInterruptTargetMatches(record.PID) {
+	if !targetMatches(record.PID) {
 		logger.Info(fmt.Sprintf("ai.external: pid identity mismatch, treating as not-a-TUI home=%q native=%s pid=%d", home, nativeSessionID, record.PID))
 		return agentRenamePidRecord{}, false
 	}

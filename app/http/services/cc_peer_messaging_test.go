@@ -426,3 +426,86 @@ func TestCcPeerSyncFireFromModeAndHeldDetection(t *testing.T) {
 		t.Fatal("held delivery must not record the size baseline (retry chance on next sync)")
 	}
 }
+
+// 快照语义：tuiSync 调度定时器那一刻的旋钮值（dialInject/heldWatchWindow）
+// 决定 fire 行为；调度后全局变量被恢复/改写不得影响在途 fire。
+// 这是 DATA RACE 根修的语义钉：定时器 goroutine 不再裸读全局旋钮，
+// 测试 defer 恢复与 fire 的读写竞争从内存模型层面消除。
+func TestTuiSyncFireUsesKnobsSnapshottedAtSchedule(t *testing.T) {
+	// 会话 ID 每轮唯一：fire goroutine 在测试返回后仍可能存活并在 cleanup
+	// 之后晚写 baseline，固定 ID 会跨 -count 轮污染（实测第 11 轮 FAIL）。
+	native := "ssnap-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	origWindow := ccPeerSyncCoalesceWindow
+	origHeld := ccPeerHeldWatchWindow
+	origDial := ccPeerDialInject
+	origMatches := externalInterruptTargetMatches
+	externalInterruptTargetMatches = func(int) bool { return true }
+	defer func() {
+		ccPeerSyncCoalesceWindow = origWindow
+		ccPeerHeldWatchWindow = origHeld
+		ccPeerDialInject = origDial
+		externalInterruptTargetMatches = origMatches
+		ccPeerSyncMu.Lock()
+		delete(ccPeerSyncBaseline, native)
+		ccPeerSyncMu.Unlock()
+	}()
+
+	pid := os.Getpid()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	dir := filepath.Join(home, ".claude", "sessions")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	record := fmt.Sprintf(`{"sessionId":"%s","pid":%d,"status":"idle","messagingSocketPath":"/tmp/cc-socks/%s.sock"}`, native, pid, native)
+	if err := os.WriteFile(filepath.Join(dir, strconv.Itoa(pid)+".json"), []byte(record), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	proj := filepath.Join(home, ".claude", "projects", "p")
+	if err := os.MkdirAll(proj, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(proj, native+".jsonl"), []byte(`{"permissionMode":"bypassPermissions"}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var mu sync.Mutex
+	snapshotDialCalled := false
+	ccPeerDialInject = func(_ string, _, _, _ string) error {
+		mu.Lock()
+		snapshotDialCalled = true
+		mu.Unlock()
+		return nil
+	}
+	// 合并窗设长到"恢复全局旋钮"必然先于 fire 触发；held 窗给小值让 fire
+	// 快速落账 baseline（快照语义钉的是 dialInject，held 只求 fire 不拖尾）。
+	ccPeerSyncCoalesceWindow = 300 * time.Millisecond
+	ccPeerHeldWatchWindow = 50 * time.Millisecond
+
+	m := &agentAIManager{}
+	m.tuiSync(map[string]interface{}{"session_id": "s", "source_session_id": native, "digest": "d1"}, nil)
+
+	// 同 goroutine 同步恢复：此后的 fire 读到的若是全局而非快照，即判定失败。
+	ccPeerDialInject = origDial
+	ccPeerHeldWatchWindow = origHeld
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		called := snapshotDialCalled
+		mu.Unlock()
+		if called {
+			// 等 fire 完整落账（watchHeld→baseline 写入）再返回，让 defer 的
+			// delete 严格晚于 fire goroutine 的晚写，cleanup 才真正完整。
+			ccPeerSyncMu.Lock()
+			_, settled := ccPeerSyncBaseline[native]
+			ccPeerSyncMu.Unlock()
+			if settled {
+				return
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("fire did not use the dial inject snapshotted at schedule time — it read the restored global instead")
+}
