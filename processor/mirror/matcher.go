@@ -47,9 +47,11 @@ func parseHostPort(hostPort string) (string, string, error) {
 //   - "exact.domain.com" — exact match
 //   - "*.domain.com" — matches any subdomain of domain.com (not domain.com itself)
 //   - "suffix.domain.com" — suffix match (matches foo.suffix.domain.com and suffix.domain.com)
+//   - "cdn*.com" — '*' any position, each '*' matches ≥1 char (may cross dots)
 //
 // 已委托共享内核 processor/match（语义唯一定义点：spec 第 3 节；
-// 旧语义精确/后缀/"*." 保持不变，'*' 通配扩展为任意位置 glob）。
+// 旧语义精确/后缀/"*." 保持不变；唯一输入侧差异：host 尾点由内核剥离（旧实现视为不匹配）；
+// '*' 通配扩展为任意位置 glob）。
 func hostMatches(pattern, host string) bool {
 	return match.MatchDomain(pattern, host)
 }

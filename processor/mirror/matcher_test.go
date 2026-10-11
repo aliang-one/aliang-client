@@ -31,6 +31,7 @@ func TestMatchesAnyDomain(t *testing.T) {
 		{"multi-pattern-miss", "example.com", []string{"other.com", "*.other.com"}, false},
 		{"empty-domain-list", "example.com", nil, false},
 		{"empty-host", "", []string{"example.com"}, false},
+		{"empty-pattern-in-list", "example.com", []string{""}, false},
 
 		// —— glob 新能力（委托共享内核 processor/match 后）：
 		// '*' 可出现在任意位置，每个 '*' 匹配 ≥1 个任意字符（可跨点号）——
@@ -39,6 +40,8 @@ func TestMatchesAnyDomain(t *testing.T) {
 		{"glob-mid", "cdn.epic.com", []string{"cdn*.com"}, true},
 		// 共享内核语义：host 侧另去尾点（normalizeHost 不处理，MatchDomain 剥离）
 		{"host-trailing-dot", "example.com.", []string{"example.com"}, true},
+		// 不对称：pattern 侧尾点运行时不剥离（上游结构校验拒绝），故永不匹配
+		{"pattern-trailing-dot-never-matches", "example.com", []string{"example.com."}, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
