@@ -2,7 +2,7 @@ package rules
 
 import "aliang.one/nursorgate/processor/match"
 
-// MatchDomain 委托共享内核（该包当前无生产调用者，同步语义防止将来复活时漂移）。
+// MatchDomain 委托共享内核（该函数（EvaluateRoute 匹配路径）当前无生产调用者，同步语义防止将来复活时漂移）。
 func MatchDomain(pattern, domain string) bool {
 	return match.MatchDomain(pattern, domain)
 }
