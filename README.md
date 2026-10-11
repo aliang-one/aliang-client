@@ -136,11 +136,41 @@ See [`config.new.json`](./config.new.json) for a full example. Key sections:
 - `core.engine` — TUN/HTTP mode, device, log level, …
 - `core.aliangServer` — Aliang upstream (mTLS relay) address
 - `customer.proxy` — optional outbound proxy (enable, type, server, credentials)
-- `customer.ai_rules` — domain allowlists for AI services (routed via MITM)
+- `customer.ai_rules` — domain/IP allowlists for AI services (routed via MITM)
 - `customer.proxy_rules` — custom domain/IP routing rules
 - `customer.traffic_mirror` — TCP stream mirroring (below)
 
 > `config.json` is machine-local and git-ignored; never commit real credentials.
+
+### Rule Syntax
+
+The same rule syntax applies to `customer.ai_rules` include lists,
+`customer.proxy_rules`, and `customer.traffic_mirror.domains`:
+
+```
+# Domains — exact + subdomains, or '*' globs
+# ('*' matches one or more characters and may cross dots)
+example.com                example.com and all of its subdomains
+*.epic.com                 subdomains only (cdn.epic.com), never the bare domain
+aliang.*                   any TLD (aliang.com, aliang.co.uk)
+*epic.com                  prefix match (cdnepic.com, cdn.epic.com)
+
+# IP conditions — IPv4 and IPv6, bare or keyword-prefixed
+1.2.3.4                    single IP
+121.32.12.0/24             CIDR (0.0.0.0/0 matches IPv4 only, ::/0 IPv6 only)
+1.2.3.1-1.2.3.254          closed range
+ip-cidr:121.32.12.0/24     explicit keyword (also ip-range:, ip-from:…,ip-to:…)
+ip-cidr,121.32.12.0/24,proxy   Clash style with trailing action (proxy_rules)
+```
+
+- IP conditions match the real destination IP of TCP connections on the TUN
+  path. TLS traffic without SNI, UDP traffic, and local HTTP-proxy inbound
+  traffic bypass the rules engine, so IP conditions have no effect there.
+- Malformed entries (invalid IPs, empty labels like `a..b`) are rejected on
+  save.
+- `traffic_mirror.domains` is matched by domain (SNI/host): a bare single IP
+  can still match literally, but CIDR/range entries never match in the mirror
+  path — use AI rules or `proxy_rules` for IP-based routing.
 
 ### Traffic Mirror
 
@@ -165,7 +195,7 @@ failures never affect the live flow.
 | --- | --- | --- |
 | `enabled` | bool | Off switch — `false` costs nothing |
 | `target` | string | HTTP POST endpoint receiving StreamChunks |
-| `domains` | string[] | Exact, `*.wildcard`, and suffix matching |
+| `domains` | string[] | Domain patterns, see [Rule Syntax](#rule-syntax); matched by SNI/host |
 
 **StreamChunk (HTTP POST JSON body):**
 
