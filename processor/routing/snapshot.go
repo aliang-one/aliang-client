@@ -309,7 +309,8 @@ func compileCanonicalRoutingFromRuntimeInputs(cfg *config.Config, switches model
 	// - 域名/IP 由 match.ClassifyEntry 统一判定（ip-cidr 等条目编译为 Type=ip，不再误编译为域名）；
 	// - 去重按 (kind, cond) 全局进行——与 ai_allowlist 同条件的 proxy 规则本就排在后面永不可达，提前剪除；
 	// - ID 按前缀独立连续编号（ai_allowlist_0.. / proxy_rule_0..），与既有产物保持一致。
-	// 编译函数每条连接都会被调用：非法条目在此静默跳过兜底（可观测性由配置保存校验承担），
+	// 编译函数每条连接都会被调用：非法条目在此静默跳过——旧代码会把此类条目编译为
+	// 永不命中的死规则，现改为直接跳过；保存期校验由配置校验层（Task 10）承担。
 	// 不打日志、不报错，避免每连接日志风暴。
 	rules := make([]config.CanonicalRoutingRule, 0, len(aiEntries)+len(proxyEntries))
 	seen := make(map[string]struct{}, len(aiEntries)+len(proxyEntries))

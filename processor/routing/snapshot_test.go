@@ -245,7 +245,7 @@ func TestRuntimeSnapshot_CompileMixedEntriesIDNumberingAndDedupe(t *testing.T) {
 			ProxyRules: []string{
 				"ip-cidr,121.32.12.0/24,proxy",
 				"domains,google.com,proxy",
-				"domains,claude.ai,proxy", // 跨列表重复：被 ai_allowlist 同条件规则遮蔽，应剪除
+				"domains,claude.ai,proxy",      // 跨列表重复：被 ai_allowlist 同条件规则遮蔽，应剪除
 				"ip-cidr,121.32.12.0/24,proxy", // 列表内重复：按 (kind, cond) 去重
 			},
 		},
@@ -318,5 +318,37 @@ func TestRuntimeSnapshot_ProxyIPRuleDecidesRouteByIP(t *testing.T) {
 	}
 	if decision != RouteDirect {
 		t.Fatalf("decision for out-of-range IP = %s, want %s", decision, RouteDirect)
+	}
+}
+
+func TestRuntimeSnapshot_InvalidEntrySilentlySkipped(t *testing.T) {
+	cfg := &config.Config{
+		Customer: &config.CustomerConfig{
+			Proxy: &config.CustomerProxyConfig{
+				Type:   "socks5",
+				Server: "127.0.0.1:1080",
+			},
+			ProxyRules: []string{
+				"my_server.com",      // 下划线字符集非法：静默跳过，不产出规则
+				"domains,google.com", // 合法条目：正常产出
+			},
+		},
+	}
+
+	canonical, err := CompileCanonicalRoutingFromRuntimeInputs(cfg, model.RulesSettings{
+		AliangEnabled: false,
+		SocksEnabled:  true,
+	})
+	if err != nil {
+		t.Fatalf("CompileCanonicalRoutingFromRuntimeInputs() error = %v", err)
+	}
+
+	rules := canonical.Routing.Rules
+	if len(rules) != 1 {
+		t.Fatalf("rules len = %d, want 1 (非法条目应被静默跳过), rules = %+v", len(rules), rules)
+	}
+	if rules[0].Condition != "google.com" || rules[0].Type != string(model.RuleTypeDomain) {
+		t.Fatalf("rules[0] = {Type: %s, Condition: %s}, want {Type: %s, Condition: google.com}",
+			rules[0].Type, rules[0].Condition, model.RuleTypeDomain)
 	}
 }
