@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"aliang.one/nursorgate/processor/match"
 )
 
 // BaseProxyConfig represents a proxy configuration
@@ -305,6 +307,11 @@ func (c *TrafficMirrorConfig) Validate() error {
 	}
 	if len(c.Domains) == 0 {
 		return fmt.Errorf("traffic_mirror.domains must not be empty when enabled")
+	}
+	for i, domain := range c.Domains {
+		if _, _, err := match.ClassifyEntry(domain); err != nil {
+			return fmt.Errorf("traffic_mirror.domains[%d] invalid %q: %v", i, domain, err)
+		}
 	}
 	return nil
 }
@@ -802,6 +809,9 @@ func (c *Config) validateCustomerEditableSurface() error {
 			if rule.Include[i] == "" {
 				return fmt.Errorf("customer.ai_rules.%s.include[%d] cannot be empty", provider, i)
 			}
+			if _, _, err := match.ClassifyEntry(rule.Include[i]); err != nil {
+				return fmt.Errorf("customer.ai_rules.%s.include[%d] invalid %q: %v", provider, i, rule.Include[i], err)
+			}
 		}
 	}
 
@@ -809,6 +819,9 @@ func (c *Config) validateCustomerEditableSurface() error {
 		c.Customer.ProxyRules[i] = strings.TrimSpace(c.Customer.ProxyRules[i])
 		if c.Customer.ProxyRules[i] == "" {
 			return fmt.Errorf("customer.proxy_rules[%d] cannot be empty", i)
+		}
+		if _, _, err := match.ClassifyEntry(c.Customer.ProxyRules[i]); err != nil {
+			return fmt.Errorf("customer.proxy_rules[%d] invalid %q: %v", i, c.Customer.ProxyRules[i], err)
 		}
 	}
 

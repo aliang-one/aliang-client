@@ -1013,3 +1013,160 @@ func TestConfigValidateAllowsMinimalAgentConfigWithoutCustomer(t *testing.T) {
 		t.Fatalf("Validate() error = %v, want nil for minimal agent config", err)
 	}
 }
+
+func TestConfigValidate_AIRulesIncludeRejectsInvalidIPEntry(t *testing.T) {
+	payload := []byte(`{
+		"core": {"api_server": "https://api.aliang.one"},
+		"customer": {
+			"ai_rules": {
+				"openai": {
+					"enble": true,
+					"include": ["api.openai.com", "ip-cidr:abc"]
+				}
+			}
+		}
+	}`)
+
+	var cfg Config
+	if err := json.Unmarshal(payload, &cfg); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate() error = nil, want invalid include entry error")
+	}
+	if !strings.Contains(err.Error(), `customer.ai_rules.openai.include[1] invalid "ip-cidr:abc"`) {
+		t.Fatalf("error should carry entry index and raw text: %v", err)
+	}
+	if !strings.Contains(err.Error(), "非法 IP 条件") {
+		t.Fatalf("error should carry the underlying reason: %v", err)
+	}
+}
+
+func TestConfigValidate_ProxyRulesRejectMalformedDomain(t *testing.T) {
+	payload := []byte(`{
+		"core": {"api_server": "https://api.aliang.one"},
+		"customer": {
+			"proxy_rules": ["domains,google.com", "a..b"]
+		}
+	}`)
+
+	var cfg Config
+	if err := json.Unmarshal(payload, &cfg); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate() error = nil, want malformed proxy_rules entry error")
+	}
+	if !strings.Contains(err.Error(), `customer.proxy_rules[1] invalid "a..b"`) {
+		t.Fatalf("error should carry entry index and raw text: %v", err)
+	}
+	if !strings.Contains(err.Error(), "空标签") {
+		t.Fatalf("error should carry the underlying reason: %v", err)
+	}
+}
+
+func TestConfigValidate_ProxyRulesRejectReversedIPRange(t *testing.T) {
+	payload := []byte(`{
+		"core": {"api_server": "https://api.aliang.one"},
+		"customer": {
+			"proxy_rules": ["ip-from:1.2.3.254,ip-to:1.2.3.1"]
+		}
+	}`)
+
+	var cfg Config
+	if err := json.Unmarshal(payload, &cfg); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate() error = nil, want reversed ip range error")
+	}
+	if !strings.Contains(err.Error(), `customer.proxy_rules[0] invalid "ip-from:1.2.3.254,ip-to:1.2.3.1"`) {
+		t.Fatalf("error should carry entry index and raw text: %v", err)
+	}
+	if !strings.Contains(err.Error(), "起点大于终点") {
+		t.Fatalf("error should carry the underlying reason: %v", err)
+	}
+}
+
+func TestConfigValidate_ProxyRulesAcceptMixedLegacyAndNewSyntax(t *testing.T) {
+	payload := []byte(`{
+		"core": {"api_server": "https://api.aliang.one"},
+		"customer": {
+			"proxy_rules": ["domains,google.com", "aliang.*", "ip-cidr,121.32.12.0/24,proxy"],
+			"ai_rules": {
+				"openai": {
+					"enble": true,
+					"include": ["api.openai.com", "*.cursor.sh", "ip-cidr:121.32.12.0/24", "1.2.3.4"]
+				}
+			}
+		}
+	}`)
+
+	var cfg Config
+	if err := json.Unmarshal(payload, &cfg); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v, want nil for mixed legal entries", err)
+	}
+}
+
+func TestTrafficMirrorConfigValidate_RejectsMalformedDomain(t *testing.T) {
+	cfg := &TrafficMirrorConfig{
+		Enabled: true,
+		Target:  "http://127.0.0.1:1/mirror",
+		Domains: []string{"*.cursor.sh", "a..b"},
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate() error = nil, want malformed mirror domain error")
+	}
+	if !strings.Contains(err.Error(), `traffic_mirror.domains[1] invalid "a..b"`) {
+		t.Fatalf("error should carry entry index and raw text: %v", err)
+	}
+	if !strings.Contains(err.Error(), "空标签") {
+		t.Fatalf("error should carry the underlying reason: %v", err)
+	}
+}
+
+func TestTrafficMirrorConfigValidate_AcceptsGlobAndIPEntries(t *testing.T) {
+	cfg := &TrafficMirrorConfig{
+		Enabled: true,
+		Target:  "http://127.0.0.1:1/mirror",
+		Domains: []string{"*.cursor.sh", "api.cursor.com", "121.32.12.0/24"},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v, want nil for legal glob/IP domains", err)
+	}
+}
+
+func TestConfigValidate_TrafficMirrorDomainsValidatedThroughChain(t *testing.T) {
+	payload := []byte(`{
+		"core": {"api_server": "https://api.aliang.one"},
+		"customer": {
+			"traffic_mirror": {
+				"enabled": true,
+				"target": "http://127.0.0.1:1/mirror",
+				"domains": ["a..b"]
+			}
+		}
+	}`)
+
+	var cfg Config
+	if err := json.Unmarshal(payload, &cfg); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate() error = nil, want traffic_mirror domain error surfaced through Config.Validate")
+	}
+	if !strings.Contains(err.Error(), "invalid traffic_mirror configuration") {
+		t.Fatalf("error should be wrapped by the traffic_mirror chain: %v", err)
+	}
+	if !strings.Contains(err.Error(), `traffic_mirror.domains[0] invalid "a..b"`) {
+		t.Fatalf("error should carry entry index and raw text: %v", err)
+	}
+}
