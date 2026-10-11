@@ -18,10 +18,14 @@ const (
 
 // String 返回 CanonicalRoutingRule.Type 使用的字符串。
 func (k EntryKind) String() string {
-	if k == EntryIP {
+	switch k {
+	case EntryDomain:
+		return "domain"
+	case EntryIP:
 		return "ip"
+	default:
+		return "unknown"
 	}
-	return "domain"
 }
 
 // ClassifyEntry 将原始规则条目分类为 domain/ip 并返回归一化 condition。
@@ -68,11 +72,13 @@ func ClassifyEntry(raw string) (EntryKind, string, error) {
 			cond := strings.TrimSpace(parts[1])
 			return EntryIP, cond, validateIPCond(cond)
 		}
-		// 既有兜底：尾段 proxy → 取倒数第二段
-		last := strings.ToLower(strings.TrimSpace(parts[len(parts)-1]))
-		if last == "proxy" && len(parts) >= 2 {
-			return classifyAny(strings.Join(parts[:len(parts)-1], ","))
+		// 既有兜底（parseProxyRuleDomain 语义）：取尾段；尾段为 proxy 时取倒数第二段。
+		// 完整保留旧解释，保证 DOMAIN-SUFFIX,x,proxy / a.com,b.com,proxy 等存量形态按旧值通过。
+		fallback := strings.TrimSpace(parts[len(parts)-1])
+		if strings.EqualFold(fallback, "proxy") && len(parts) >= 2 {
+			fallback = strings.TrimSpace(parts[len(parts)-2])
 		}
+		return classifyAny(fallback)
 	}
 
 	return classifyAny(s)
@@ -164,6 +170,11 @@ func classifyDomainEntry(v string) (EntryKind, string, error) {
 	// 匹配时的 host 尾点由 MatchDomain 内部剥离，互不影响
 	if s == "" {
 		return EntryDomain, "", fmt.Errorf("域名为空")
+	}
+	// 提取后的 host 若为 IP 形态（含 host:port / [v6]:port 提取产物），归类为 IP 条件，
+	// 避免编译成永不命中的死规则域名（spec §3.3）
+	if lower := strings.ToLower(s); !strings.Contains(lower, "*") && isIPCond(lower) {
+		return EntryIP, lower, validateIPCond(lower)
 	}
 	lower := strings.ToLower(s)
 	for _, r := range lower {

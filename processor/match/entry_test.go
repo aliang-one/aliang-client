@@ -18,6 +18,10 @@ func TestClassifyEntry(t *testing.T) {
 		{"url-form", "//cdn.Epic.com/path", EntryDomain, "cdn.epic.com", false},
 		{"scheme-form", "https://a.com/x", EntryDomain, "a.com", false},
 		{"host-port", "example.com:8443", EntryDomain, "example.com", false},
+		// 旧版兜底语义（parseProxyRuleDomain 复刻）
+		{"legacy-clash-suffix", "DOMAIN-SUFFIX,example.com,proxy", EntryDomain, "example.com", false},
+		{"legacy-multi-segment", "a.com,b.com,proxy", EntryDomain, "b.com", false},
+		{"legacy-no-proxy-tail", "foo,bar", EntryDomain, "bar", false},
 		// IP
 		{"bare-ip", "1.2.3.4", EntryIP, "1.2.3.4", false},
 		{"bare-cidr", "121.32.12.0/24", EntryIP, "121.32.12.0/24", false},
@@ -29,6 +33,8 @@ func TestClassifyEntry(t *testing.T) {
 		{"from-to", "ip-from:1.2.3.1,IP-TO:1.2.3.254", EntryIP, "1.2.3.1-1.2.3.254", false},
 		{"from-to-target", "ip-from:1.2.3.1,ip-to:1.2.3.254,proxy", EntryIP, "1.2.3.1-1.2.3.254", false},
 		{"v6-cidr", "2001:db8::/32", EntryIP, "2001:db8::/32", false},
+		{"ip-port-entry", "1.2.3.4:99", EntryIP, "1.2.3.4", false},
+		{"bracketed-v6-port", "[2001:db8::1]:443", EntryIP, "2001:db8::1", false},
 		// 非法
 		{"empty", "   ", EntryDomain, "", true},
 		{"bad-ip-cidr", "ip-cidr:abc", EntryIP, "", true},
