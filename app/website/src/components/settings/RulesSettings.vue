@@ -383,8 +383,9 @@ function isValidIPCond(cond) {
   }
   if (cond.includes('-')) {
     const dash = cond.indexOf('-');
-    const f = parseIPFamily(cond.slice(0, dash));
-    return f > 0 && f === parseIPFamily(cond.slice(dash + 1));
+    // 对齐后端 validateIPCond：区间两端 TrimSpace（"a - b" 合法）
+    const from = parseIPFamily(cond.slice(0, dash).trim());
+    return from > 0 && from === parseIPFamily(cond.slice(dash + 1).trim());
   }
   return parseIPFamily(cond) > 0;
 }
@@ -401,16 +402,16 @@ function validateRuleEntry(raw, t) {
     const to = /ip-to:\s*([0-9a-fA-F:.]+)\s*(?:,|$)/.exec(lower);
     return from && to && parseIPFamily(from[1]) > 0 && parseIPFamily(to[1]) > 0 ? '' : t('rules_ipInvalid');
   }
-  if (lower.startsWith('ip-cidr,') || lower.startsWith('ip-range,')) {
-    const second = s.split(',')[1];
-    return second && isValidIPCond(second.trim()) ? '' : t('rules_ipInvalid');
-  }
   if (parseIPFamily(lower) > 0 || isValidIPCond(lower)) return '';
   if (lower.includes(',')) {
     const parts = lower.split(',');
     const first = parts[0].trim();
     if (first === 'domain' || first === 'domains') s = parts[1] || '';
-    else if (parts[parts.length - 1].trim() === 'proxy') s = parts[parts.length - 2] || '';
+    else if (first === 'ip-cidr' || first === 'ip-range') {
+      // 对齐后端：关键字与逗号之间允许空白（first 已 trim，分派取代原 startsWith('ip-cidr,') 特判）
+      const second = parts[1];
+      return second && isValidIPCond(second.trim()) ? '' : t('rules_ipInvalid');
+    } else if (parts[parts.length - 1].trim() === 'proxy') s = parts[parts.length - 2] || '';
     else s = parts[parts.length - 1];
   }
   if (s.includes('://') || s.startsWith('//')) {
