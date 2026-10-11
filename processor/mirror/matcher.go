@@ -1,6 +1,10 @@
 package mirror
 
-import "strings"
+import (
+	"strings"
+
+	"aliang.one/nursorgate/processor/match"
+)
 
 // normalizeHost strips the port and lowercases the host.
 func normalizeHost(raw string) string {
@@ -43,38 +47,11 @@ func parseHostPort(hostPort string) (string, string, error) {
 //   - "exact.domain.com" — exact match
 //   - "*.domain.com" — matches any subdomain of domain.com (not domain.com itself)
 //   - "suffix.domain.com" — suffix match (matches foo.suffix.domain.com and suffix.domain.com)
+//
+// 已委托共享内核 processor/match（语义唯一定义点：spec 第 3 节；
+// 旧语义精确/后缀/"*." 保持不变，'*' 通配扩展为任意位置 glob）。
 func hostMatches(pattern, host string) bool {
-	pattern = strings.ToLower(strings.TrimSpace(pattern))
-	host = strings.ToLower(strings.TrimSpace(host))
-
-	if pattern == "" || host == "" {
-		return false
-	}
-
-	// Exact match
-	if pattern == host {
-		return true
-	}
-
-	// Wildcard match: *.domain.com
-	if strings.HasPrefix(pattern, "*.") {
-		suffix := pattern[2:] // "domain.com"
-		// Host must be a subdomain: "sub.domain.com" matches, "domain.com" does not
-		if host == suffix {
-			return false
-		}
-		if strings.HasSuffix(host, "."+suffix) {
-			return true
-		}
-		return false
-	}
-
-	// Suffix match: pattern "domain.com" matches "sub.domain.com"
-	if strings.HasSuffix(host, "."+pattern) {
-		return true
-	}
-
-	return false
+	return match.MatchDomain(pattern, host)
 }
 
 // MatchesAnyDomain checks whether host matches any of the provided domain patterns.
