@@ -1,37 +1,10 @@
 package rules
 
-import "strings"
+import "aliang.one/nursorgate/processor/match"
 
-// MatchDomain checks if a domain matches a pattern.
-// Supports:
-// - Exact match: example.com
-// - Plain suffix: example.com matches www.example.com
-// - Wildcard subdomain: *.example.com (matches a.b.example.com, not example.com)
+// MatchDomain 委托共享内核（该包当前无生产调用者，同步语义防止将来复活时漂移）。
 func MatchDomain(pattern, domain string) bool {
-	if pattern == "" || domain == "" {
-		return false
-	}
-
-	pattern = strings.ToLower(strings.TrimSpace(pattern))
-	domain = strings.ToLower(strings.TrimSpace(domain))
-
-	if pattern == domain {
-		return true
-	}
-
-	if strings.HasSuffix(domain, "."+pattern) {
-		return true
-	}
-
-	if strings.HasPrefix(pattern, "*.") {
-		suffix := strings.TrimPrefix(pattern, "*.")
-		if suffix == "" {
-			return false
-		}
-		return strings.HasSuffix(domain, "."+suffix)
-	}
-
-	return false
+	return match.MatchDomain(pattern, domain)
 }
 
 // IsDomainAllowed returns true if domain matches any pattern in allowlist.
