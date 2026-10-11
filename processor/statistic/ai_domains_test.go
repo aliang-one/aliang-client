@@ -43,6 +43,8 @@ func TestAIDomainPatternNormalization(t *testing.T) {
 		{"ip range kept intact", "1.2.3.1-1.2.3.254", "1.2.3.1-1.2.3.254"},
 		{"ip from/to collapsed to range", "ip-from:1.2.3.1,ip-to:1.2.3.2", "1.2.3.1-1.2.3.2"},
 		{"ip cidr keyword prefix stripped", "ip-cidr:10.0.0.0/8", "10.0.0.0/8"},
+		// 大小写关键字：依赖 ai_domains.go:224 先小写化的顺序，锁住
+		{"uppercase-cidr-keyword", "IP-CIDR:10.0.0.0/8", "10.0.0.0/8"},
 		{"clash ip cidr entry", "ip-cidr,121.32.12.0/24,proxy", "121.32.12.0/24"},
 		{"bare ip unchanged", "1.2.3.4", "1.2.3.4"},
 		{"bare v6 ip unchanged", "2001:db8::1", "2001:db8::1"},
@@ -65,6 +67,27 @@ func TestAIDomainPatternNormalization(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := normalizeAIDomainPattern(tt.raw); got != tt.want {
 				t.Fatalf("normalizeAIDomainPattern(%q) = %q, want %q", tt.raw, got, tt.want)
+			}
+		})
+	}
+
+	// 幂等性：ai_activity.go:234 生产路径会对已归一化 pattern 再归一化一次，属性必须锁定
+	idempotent := []struct {
+		name string
+		raw  string
+	}{
+		{"ip-entry-idempotent", "121.32.12.0/24"},           // normalize 两次结果一致
+		{"clash-ip-idempotent", "ip-cidr,10.0.0.0/8,proxy"}, // 同上
+	}
+	for _, tt := range idempotent {
+		t.Run(tt.name, func(t *testing.T) {
+			first := normalizeAIDomainPattern(tt.raw)
+			second := normalizeAIDomainPattern(first)
+			if first == "" {
+				t.Fatalf("normalizeAIDomainPattern(%q) 首次归一化结果为空", tt.raw)
+			}
+			if second != first {
+				t.Fatalf("normalizeAIDomainPattern 二次归一化不幂等：%q → %q → %q", tt.raw, first, second)
 			}
 		})
 	}
