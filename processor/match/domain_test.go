@@ -29,6 +29,9 @@ func TestMatchDomain(t *testing.T) {
 		{"mid-label", "cdn*.com", "cdnabc.com", true},
 		{"mid-cross-dot", "cdn*.com", "cdn.epic.com", true},
 		{"mid-miss", "cdn*.com", "ab.com", false},
+		{"multi-star-hit", "a*b*c", "aXbYc", true},
+		{"multi-star-miss", "a*b*c", "aXbYd", false},
+		{"glob-case-insensitive", "*.EPIC.com", "CDN.epic.COM", true},
 		// —— 边界 ——
 		{"empty-pattern", "", "example.com", false},
 		{"empty-host", "example.com", "", false},
