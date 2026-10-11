@@ -1043,6 +1043,38 @@ func TestConfigValidate_AIRulesIncludeRejectsInvalidIPEntry(t *testing.T) {
 	}
 }
 
+func TestConfigValidate_AIRulesExcludeAliasFoldsIntoIncludeValidation(t *testing.T) {
+	// legacy "exclude" key is folded into Include when include is absent
+	// (CustomerAIRuleSetting.UnmarshalJSON), so its entries must go through
+	// the same include-entry validation.
+	payload := []byte(`{
+		"core": {"api_server": "https://api.aliang.one"},
+		"customer": {
+			"ai_rules": {
+				"openai": {
+					"enble": true,
+					"exclude": ["a..b"]
+				}
+			}
+		}
+	}`)
+
+	var cfg Config
+	if err := json.Unmarshal(payload, &cfg); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate() error = nil, want invalid exclude-alias entry error")
+	}
+	if !strings.Contains(err.Error(), `customer.ai_rules.openai.include[0] invalid "a..b"`) {
+		t.Fatalf("error should carry entry index and raw text: %v", err)
+	}
+	if !strings.Contains(err.Error(), "空标签") {
+		t.Fatalf("error should carry the underlying reason: %v", err)
+	}
+}
+
 func TestConfigValidate_ProxyRulesRejectMalformedDomain(t *testing.T) {
 	payload := []byte(`{
 		"core": {"api_server": "https://api.aliang.one"},
