@@ -32,6 +32,11 @@ func TestMatchIPCond(t *testing.T) {
 		{"empty-ip", "1.2.3.4", "", false},
 		{"bad-ip", "1.2.3.4", "not-an-ip", false},
 		{"bad-cond", "abc", "1.2.3.4", false},
+		{"m4in6-single-no-match", "1.2.3.4", "::ffff:1.2.3.4", false},
+		{"cidr-host-bits-masked", "1.2.3.4/24", "1.2.3.99", true},
+		{"keyword-mixed-case", "Ip-CiDr:121.32.12.0/24", "121.32.12.7", true},
+		{"from-to-inner-spaces", "ip-from: 1.2.3.1 , ip-to: 1.2.3.254", "1.2.3.100", true},
+		{"ip-to-only-no-match", "ip-to:1.2.3.254", "1.2.3.254", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
