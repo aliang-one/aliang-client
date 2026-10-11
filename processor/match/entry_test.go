@@ -49,6 +49,12 @@ func TestClassifyEntry(t *testing.T) {
 		{"from-missing-to", "ip-from:1.2.3.1", EntryIP, "", true},
 		// 【加固】zone 端点（本行是计划外新增，来自 Task 2 质量审查的发现）
 		{"zoned-range", "ip-range:fe80::1%eth0-fe80::ff", EntryIP, "", true},
+		// 边界路径锁定（复审补充）
+		{"domains-ip-value", "domains,1.2.3.4", EntryIP, "1.2.3.4", false},
+		{"domain-v6-value", "domain,2001:db8::1", EntryIP, "2001:db8::1", false},
+		{"empty-value-after-prefix", "domains,,proxy", EntryDomain, "", true},
+		{"hostile-query-url", "http://a.com/x?y=<script>", EntryDomain, "a.com", false},
+		{"uppercase-prefix", "DOMAINS,Google.COM", EntryDomain, "google.com", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
