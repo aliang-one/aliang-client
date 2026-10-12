@@ -2829,14 +2829,9 @@ func TestAgentServiceDispatchLocalAIStreamsClaudeDeltas(t *testing.T) {
 	}
 
 	projectPath := setupAgentExecutionProjectForTest(t)
-	// resolveAgentAICWD populates the package-level authorized-dirs cache; reset
-	// it on exit so this test cannot leak a stale entry that flips a later test's
-	// "unauthorized path" rejection.
-	defer func() {
-		agentAuthorizedDirsMu.Lock()
-		agentAuthorizedDirsCache = nil
-		agentAuthorizedDirsMu.Unlock()
-	}()
+	// resolveAgentAICWD no longer touches the authorized-dirs cache (display
+	// cache, not an execution ACL); setupAgentExecutionProjectForTest clears it
+	// on cleanup for the paths that still read it.
 	binDir := t.TempDir()
 	script := `#!/bin/sh
 printf '{"type":"system","subtype":"init","cwd":"ignored"}\n'

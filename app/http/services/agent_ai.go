@@ -7345,8 +7345,26 @@ func agentAIStringSliceContains(values []string, target string) bool {
 	return false
 }
 
+// resolveAgentAICWD resolves the vibecoding create/lazy-create project path.
+// Operator policy: the discovery snapshot is a display cache, NOT an execution
+// ACL — "discovered" and "authorized" are different concerns (2026-10-12 RCA:
+// a project whose only transcript fell out of the agentVibeSessionFileScanLimit
+// window could never start a session from the phone, and cold projects could
+// never re-enter the list without manual CLI activity). Any existing directory
+// the user names is creatable; existence + symlink resolution stay enforced
+// via cleanExistingAgentDirectory, and an empty path falls back to the user's
+// home (bc961e5 semantics). The terminal cwd keeps its own confinement
+// (resolveAgentAuthorizedCWD) — that surface is a separate decision.
 func resolveAgentAICWD(raw string) (string, error) {
-	return resolveAgentAuthorizedCWD(raw, "project path")
+	cwd := strings.TrimSpace(raw)
+	if cwd == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		cwd = home
+	}
+	return cleanExistingAgentDirectory(cwd)
 }
 
 // claudeRetryInfo captures the most-recent Claude stream-json
