@@ -1578,7 +1578,13 @@ func shouldSkipAgentRecentFileDir(name string) bool {
 	case ".git", "node_modules", ".next", "dist", "build", "target", ".cache", ".venv", "vendor",
 		"coverage", ".turbo", ".parcel-cache", ".pytest_cache", ".mypy_cache", ".ruff_cache",
 		".gradle", ".idea", ".dart_tool", ".serverless", ".terraform", ".pnpm-store", ".yarn",
-		"deriveddata", "tmp", "temp":
+		"deriveddata", "tmp", "temp",
+		// Claude stores subagent transcripts under <project>/subagents/; they are
+		// not project sessions and must be skipped BEFORE the top-N selection, not
+		// filtered after (2026-10-12 liang-dev RCA: 1263 of 1333 jsonl were
+		// subagents, crowding a real project transcript (#542 by mtime) out of the
+		// 120-slot window so its directory never entered the discovered list).
+		"subagents":
 		return true
 	default:
 		return false
