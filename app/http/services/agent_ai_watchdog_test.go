@@ -60,6 +60,60 @@ func TestAgentAIActivityLifecycle(t *testing.T) {
 	}
 }
 
+func TestAgentAIActivityToolWaitClock(t *testing.T) {
+	a := newAgentAIActivity()
+
+	// 未等待时时钟为 0。
+	if got := a.toolWaitFor(); got != 0 {
+		t.Fatalf("fresh activity toolWaitFor = %v, want 0", got)
+	}
+
+	// 首次 begin 起表。
+	a.beginToolUseWait()
+	time.Sleep(5 * time.Millisecond) // coarse wall-clock guard: the clock must tick
+	if got := a.toolWaitFor(); got <= 0 {
+		t.Fatalf("after beginToolUseWait toolWaitFor = %v, want > 0", got)
+	}
+
+	// 嵌套等待：第二个 begin 不得重置时钟（连续等待语义）。
+	first := a.toolWaitFor()
+	time.Sleep(5 * time.Millisecond)
+	a.beginToolUseWait()
+	if got := a.toolWaitFor(); got < first {
+		t.Fatalf("nested beginToolUseWait reset the clock: %v < %v", got, first)
+	}
+
+	// 审批挂起：时钟清零（人的决策时间不计入）。
+	a.setAwaitingApproval(true)
+	if got := a.toolWaitFor(); got != 0 {
+		t.Fatalf("approval should pause tool-wait clock, got %v", got)
+	}
+
+	// 审批解除且仍有 pending：重新起表。
+	a.setAwaitingApproval(false)
+	time.Sleep(5 * time.Millisecond) // coarse wall-clock guard: re-armed clock must tick
+	if got := a.toolWaitFor(); got <= 0 {
+		t.Fatalf("approval resolve with pending tools should re-arm clock, got %v", got)
+	}
+
+	// 归零清表：最后一个 tool_result 到达后时钟回 0。
+	a.endToolUseWait()
+	a.endToolUseWait()
+	if got := a.toolWaitFor(); got != 0 {
+		t.Fatalf("after all tools resolved toolWaitFor = %v, want 0", got)
+	}
+	if a.idlePaused() {
+		t.Fatal("idle watchdog should be unpaused once all tools resolved")
+	}
+
+	// 审批解除但无 pending 时不误起表。
+	a.setAwaitingApproval(true)
+	a.setAwaitingApproval(false)
+	if got := a.toolWaitFor(); got != 0 {
+		t.Fatalf("approval resolve with no pending tools should leave clock at 0, got %v", got)
+	}
+}
+
 func TestAgentAIActivityProgressTracking(t *testing.T) {
 	a := newAgentAIActivity()
 
@@ -150,6 +204,18 @@ func TestAgentAIRunStoppedStatus(t *testing.T) {
 	}
 }
 
+func TestAgentAIRunStoppedStatusToolWaitTimeout(t *testing.T) {
+	activity := newAgentAIActivity()
+	activity.setKillReason("tool_wait_timeout")
+	status, msg := agentAIRunStoppedStatus(activity, nil)
+	if status != "timeout" {
+		t.Fatalf("status = %q, want timeout (server terminal-status family)", status)
+	}
+	if msg == "" {
+		t.Fatal("expected a non-empty human-readable reason")
+	}
+}
+
 // runWatchdogUntilCancelled runs the watchdog loop with the given windows and
 // returns whether ctx was cancelled within the timeout, plus the kill reason.
 func runWatchdogUntilCancelled(t *testing.T, idleWindow, hardCeiling, noProgressWindow, interval, wait time.Duration, configure func(*agentAIActivity)) (cancelled bool, reason string) {
@@ -162,7 +228,7 @@ func runWatchdogUntilCancelled(t *testing.T, idleWindow, hardCeiling, noProgress
 	}
 	done := make(chan struct{})
 	go func() {
-		agentAIWatchdogLoop(ctx, activity, cancel, idleWindow, hardCeiling, noProgressWindow, interval)
+		agentAIWatchdogLoop(ctx, activity, cancel, idleWindow, hardCeiling, noProgressWindow, 0, interval)
 		close(done)
 	}()
 	select {
@@ -233,7 +299,7 @@ func TestAgentAIWatchdogLoopToolResultReenablesIdle(t *testing.T) {
 	activity.beginToolUseWait()
 	done := make(chan struct{})
 	go func() {
-		agentAIWatchdogLoop(ctx, activity, cancel, 40*time.Millisecond, 0, 0, 10*time.Millisecond)
+		agentAIWatchdogLoop(ctx, activity, cancel, 40*time.Millisecond, 0, 0, 0, 10*time.Millisecond)
 		close(done)
 	}()
 
@@ -262,7 +328,7 @@ func TestAgentAIWatchdogLoopActivityResetsIdle(t *testing.T) {
 	activity := newAgentAIActivity()
 	done := make(chan struct{})
 	go func() {
-		agentAIWatchdogLoop(ctx, activity, cancel, 40*time.Millisecond, 0, 0, 10*time.Millisecond)
+		agentAIWatchdogLoop(ctx, activity, cancel, 40*time.Millisecond, 0, 0, 0, 10*time.Millisecond)
 		close(done)
 	}()
 
@@ -324,7 +390,7 @@ func TestAgentAIWatchdogLoopNoProgressKills(t *testing.T) {
 	activity := newAgentAIActivity()
 	done := make(chan struct{})
 	go func() {
-		agentAIWatchdogLoop(ctx, activity, cancel, time.Hour /* idleWindow: never fires */, 0 /* hardCeiling disabled */, 50*time.Millisecond /* noProgressWindow */, 10*time.Millisecond /* interval */)
+		agentAIWatchdogLoop(ctx, activity, cancel, time.Hour /* idleWindow: never fires */, 0 /* hardCeiling disabled */, 50*time.Millisecond /* noProgressWindow */, 0 /* toolWaitCeiling disabled */, 10*time.Millisecond /* interval */)
 		close(done)
 	}()
 
@@ -359,7 +425,7 @@ func TestAgentAIWatchdogLoopProgressPreventsNoProgressKill(t *testing.T) {
 	activity := newAgentAIActivity()
 	done := make(chan struct{})
 	go func() {
-		agentAIWatchdogLoop(ctx, activity, cancel, time.Hour, 0, 60*time.Millisecond, 10*time.Millisecond)
+		agentAIWatchdogLoop(ctx, activity, cancel, time.Hour, 0, 60*time.Millisecond, 0, 10*time.Millisecond)
 		close(done)
 	}()
 
@@ -402,5 +468,70 @@ func TestAgentAIWatchdogLoopNoProgressExemptDuringToolWait(t *testing.T) {
 	}
 	if reason != "" {
 		t.Fatalf("kill reason = %q, want empty (no kill)", reason)
+	}
+}
+
+func TestAgentAIWatchdogLoopToolWaitCeilingKills(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	activity := newAgentAIActivity()
+	activity.beginToolUseWait()
+	done := make(chan struct{})
+	go func() {
+		// idle 窗口巨大：确保唯一可能触发的是 tool-wait 上限。
+		agentAIWatchdogLoop(ctx, activity, cancel, time.Hour, 0, 0, 40*time.Millisecond, 5*time.Millisecond)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		if reason := activity.killReasonOr(""); reason != "tool_wait_timeout" {
+			t.Fatalf("kill reason = %q, want tool_wait_timeout", reason)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("watchdog did not cancel a hung tool wait past the ceiling")
+	}
+}
+
+func TestAgentAIWatchdogLoopApprovalPausesToolWaitClock(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	activity := newAgentAIActivity()
+	activity.beginToolUseWait()
+	activity.setAwaitingApproval(true) // 时钟清零 → 上限不得触发
+	done := make(chan struct{})
+	go func() {
+		agentAIWatchdogLoop(ctx, activity, cancel, time.Hour, 0, 0, 40*time.Millisecond, 5*time.Millisecond)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		t.Fatalf("watchdog cancelled during approval wait, reason=%q", activity.killReasonOr(""))
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+func TestAgentAIWatchdogLoopApprovalResolveRearmsToolWaitClock(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	activity := newAgentAIActivity()
+	activity.beginToolUseWait()
+	activity.setAwaitingApproval(true)
+	done := make(chan struct{})
+	go func() {
+		agentAIWatchdogLoop(ctx, activity, cancel, time.Hour, 0, 0, 40*time.Millisecond, 5*time.Millisecond)
+		close(done)
+	}()
+	time.Sleep(80 * time.Millisecond)   // 在审批中度过整个上限窗口
+	activity.setAwaitingApproval(false) // 重新起表 → 一个新窗口后必须触发
+
+	select {
+	case <-done:
+		if reason := activity.killReasonOr(""); reason != "tool_wait_timeout" {
+			t.Fatalf("kill reason = %q, want tool_wait_timeout", reason)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("watchdog did not cancel after approval resolved and tool stayed pending")
 	}
 }

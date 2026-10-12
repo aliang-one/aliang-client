@@ -958,9 +958,17 @@ type agentAIActivity struct {
 	lastProgressAt   atomic.Int64
 	awaitingApproval atomic.Bool
 	pendingToolUses  atomic.Int64
-	runStart         time.Time
-	killReasonMu     sync.RWMutex
-	killReason       string
+	// toolWaitStartedAt is the UnixNano instant the current CONTIGUOUS
+	// tool/subagent wait began (0 = not waiting). The tool-wait watchdog uses
+	// it to bound hung tools/subagents that would otherwise survive until the
+	// hard ceiling while the progress heartbeat keeps telling the server the
+	// run is alive. Cleared while a human approval is pending so approval
+	// time never counts against the ceiling (approvals are bounded separately
+	// by agentAIApprovalTimeout).
+	toolWaitStartedAt atomic.Int64
+	runStart          time.Time
+	killReasonMu      sync.RWMutex
+	killReason        string
 }
 
 func newAgentAIActivity() *agentAIActivity {
@@ -1011,6 +1019,15 @@ func (a *agentAIActivity) setAwaitingApproval(v bool) {
 		return
 	}
 	a.awaitingApproval.Store(v)
+	if v {
+		// Approval time is human time, not tool time: pause the tool-wait
+		// clock so a slow decision never trips the tool-wait ceiling.
+		a.toolWaitStartedAt.Store(0)
+	} else if a.pendingToolUses.Load() > 0 {
+		// Decision resolved but the tool is still in flight: re-arm with a
+		// fresh ceiling window for the remaining execution.
+		a.toolWaitStartedAt.Store(time.Now().UnixNano())
+	}
 	a.bump()
 }
 
@@ -1021,6 +1038,19 @@ func (a *agentAIActivity) awaiting() bool {
 	return a.awaitingApproval.Load()
 }
 
+// toolWaitFor reports how long the current contiguous tool/subagent wait has
+// been in flight, excluding approval-pending time. 0 when not waiting.
+func (a *agentAIActivity) toolWaitFor() time.Duration {
+	if a == nil {
+		return 0
+	}
+	ts := a.toolWaitStartedAt.Load()
+	if ts == 0 {
+		return 0
+	}
+	return time.Since(time.Unix(0, ts))
+}
+
 // beginToolUseWait marks that Claude has emitted a tool_use (Task/subagent,
 // Bash, etc.) and the run is legitimately silent until a matching tool_result
 // arrives. It bumps activity so the run gets a fresh idle window once the tool
@@ -1029,7 +1059,9 @@ func (a *agentAIActivity) beginToolUseWait() {
 	if a == nil {
 		return
 	}
-	a.pendingToolUses.Add(1)
+	if a.pendingToolUses.Add(1) == 1 {
+		a.toolWaitStartedAt.Store(time.Now().UnixNano())
+	}
 	a.bump()
 }
 
@@ -1043,6 +1075,9 @@ func (a *agentAIActivity) endToolUseWait() {
 			break
 		}
 		if a.pendingToolUses.CompareAndSwap(current, current-1) {
+			if current-1 == 0 {
+				a.toolWaitStartedAt.Store(0)
+			}
 			break
 		}
 	}
@@ -1090,19 +1125,20 @@ func (a *agentAIActivity) killReasonOr(fallback string) string {
 }
 
 // startAIWatchdog cancels ctx when the run goes idle (no output for
-// agentAIIdleWindow and not awaiting approval/tool results) or exceeds
-// agentAIHardCeiling.
+// agentAIIdleWindow and not awaiting approval/tool results), produces no
+// meaningful progress for agentAINoProgressWindow, a contiguous tool/subagent
+// wait outlives agentAIToolWaitCeiling, or the run exceeds agentAIHardCeiling.
 // It exits as soon as ctx is done, so it never outlives the run.
 func (m *agentAIManager) startAIWatchdog(ctx context.Context, activity *agentAIActivity, cancel context.CancelFunc) {
 	if activity == nil || cancel == nil {
 		return
 	}
-	go agentAIWatchdogLoop(ctx, activity, cancel, agentAIIdleWindow, agentAIHardCeiling, agentAINoProgressWindow, agentAIIdleCheckInterval)
+	go agentAIWatchdogLoop(ctx, activity, cancel, agentAIIdleWindow, agentAIHardCeiling, agentAINoProgressWindow, agentAIToolWaitCeiling, agentAIIdleCheckInterval)
 }
 
 // agentAIWatchdogLoop is the parameterized watchdog body, split out so tests can
 // drive it with tiny windows instead of the multi-minute production defaults.
-func agentAIWatchdogLoop(ctx context.Context, activity *agentAIActivity, cancel context.CancelFunc, idleWindow, hardCeiling, noProgressWindow, interval time.Duration) {
+func agentAIWatchdogLoop(ctx context.Context, activity *agentAIActivity, cancel context.CancelFunc, idleWindow, hardCeiling, noProgressWindow, toolWaitCeiling, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -1123,6 +1159,24 @@ func agentAIWatchdogLoop(ctx context.Context, activity *agentAIActivity, cancel 
 			// or human decision is work in flight, not looping.
 			if noProgressWindow > 0 && !activity.idlePaused() && activity.progressIdleFor() > noProgressWindow {
 				activity.setKillReason("no_progress")
+				cancel()
+				return
+			}
+			// Tool-wait ceiling: a contiguous tool/subagent wait (approval
+			// time excluded — the clock is cleared while a human decision is
+			// pending) that outlives the ceiling means the tool or subagent
+			// is hung. Every other guard is paused during such a wait by
+			// design, and the ai.run.progress heartbeat keeps feeding the
+			// server-side stale-run sweeper, so without this bound a hung
+			// subagent pins the run until the hard ceiling while the phone
+			// shows "running". The awaiting() re-check hardens against a
+			// theoretical stale-armed clock (a scheduler preemption inside
+			// beginToolUseWait's Add→Store window landing exactly as an
+			// approval hook fires): approval waits are bounded separately by
+			// agentAIApprovalTimeout, so skipping the kill while a human
+			// decision is pending is always safe.
+			if toolWaitCeiling > 0 && !activity.awaiting() && activity.toolWaitFor() > toolWaitCeiling {
+				activity.setKillReason("tool_wait_timeout")
 				cancel()
 				return
 			}
@@ -1147,6 +1201,8 @@ func agentAIRunStoppedStatus(activity *agentAIActivity, limiter *agentAIOutputLi
 		// the backend treats the run as terminally dead; only the message
 		// differs, naming the real cause.
 		return "idle_timeout", fmt.Sprintf("AI run produced no meaningful progress (no text or file changes) for %s and was stopped", agentAINoProgressWindow)
+	case "tool_wait_timeout":
+		return "timeout", fmt.Sprintf("AI run tool/subagent wait exceeded %s without a tool result (suspected hung tool) and was stopped", agentAIToolWaitCeiling)
 	case "hard_ceiling":
 		return "hard_timeout", fmt.Sprintf("AI run exceeded the maximum runtime %s", agentAIHardCeiling)
 	}

@@ -43,6 +43,9 @@ func TestAgentAITimeoutDefaults(t *testing.T) {
 	if value := os.Getenv("ALIANG_AI_HARD_CEILING"); value != "" {
 		t.Skipf("ALIANG_AI_HARD_CEILING=%s set at start; skipping default assertion", value)
 	}
+	if value := os.Getenv("ALIANG_AI_TOOL_WAIT_CEILING"); value != "" {
+		t.Skipf("ALIANG_AI_TOOL_WAIT_CEILING=%s set at start; skipping default assertion", value)
+	}
 	if agentAIApprovalTimeout != 24*time.Hour {
 		t.Fatalf("default agentAIApprovalTimeout = %s, want 24h", agentAIApprovalTimeout)
 	}
@@ -51,6 +54,12 @@ func TestAgentAITimeoutDefaults(t *testing.T) {
 	}
 	if agentAIHardCeiling <= agentAIApprovalTimeout {
 		t.Fatalf("agentAIHardCeiling (%s) must exceed agentAIApprovalTimeout (%s)", agentAIHardCeiling, agentAIApprovalTimeout)
+	}
+	if agentAIToolWaitCeiling != time.Hour {
+		t.Fatalf("default agentAIToolWaitCeiling = %s, want 1h", agentAIToolWaitCeiling)
+	}
+	if agentAIToolWaitCeiling >= agentAIHardCeiling {
+		t.Fatalf("agentAIToolWaitCeiling (%s) must be less than agentAIHardCeiling (%s) to fire first", agentAIToolWaitCeiling, agentAIHardCeiling)
 	}
 }
 
