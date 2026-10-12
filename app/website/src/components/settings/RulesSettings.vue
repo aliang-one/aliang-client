@@ -17,11 +17,11 @@
       </div>
 
       <div
-        v-if="error"
+        v-if="error || submitError"
         class="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700 dark:border-red-500/30 dark:bg-red-500/10 dark:text-red-200"
         role="alert"
       >
-        {{ error }}
+        {{ error || submitError }}
       </div>
 
       <div v-if="loading" class="rounded-lg border border-dashed border-slate-300 bg-slate-50 px-4 py-8 text-sm text-slate-500 dark:border-slate-700 dark:bg-slate-900/40 dark:text-slate-400">
@@ -176,9 +176,14 @@
                   <textarea
                     :ref="`providerEditor-${provider}`"
                     v-model="providerEditor.draft"
-                    class="min-h-32 w-full rounded-xl border border-slate-300 bg-white px-3 py-2 font-mono text-sm text-slate-700 shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                    class="min-h-32 w-full rounded-xl border px-3 py-2 font-mono text-sm text-slate-700 shadow-sm transition focus:outline-none focus:ring-2 dark:text-slate-100"
+                    :class="providerEditorError
+                      ? 'border-red-400 bg-red-50 focus:border-red-500 focus:ring-red-500/20 dark:border-red-500/50 dark:bg-red-900/10'
+                      : 'border-slate-300 bg-white focus:border-primary focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900'"
                     :placeholder="t('rules_includeDomainsPlaceholder')"
                   ></textarea>
+
+                  <p v-if="providerEditorError" class="mt-2 text-xs text-red-500">{{ providerEditorError }}</p>
 
                   <p class="mt-2 text-xs text-slate-500">{{ t('rules_includeDomainsDialogHint') }}</p>
 
@@ -218,10 +223,14 @@
             <span class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('rules_rulesList') }}</span>
             <textarea
               :value="_proxyRulesText"
-              class="min-h-40 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 font-mono text-sm text-slate-700 shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+              class="min-h-40 w-full rounded-lg border px-3 py-2 font-mono text-sm text-slate-700 shadow-sm transition focus:outline-none focus:ring-2 dark:text-slate-100"
+              :class="proxyRulesError
+                ? 'border-red-400 bg-red-50 focus:border-red-500 focus:ring-red-500/20 dark:border-red-500/50 dark:bg-red-900/10'
+                : 'border-slate-300 bg-white focus:border-primary focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900'"
               placeholder="domain,example.com,proxy&#10;api.aliang.one"
               @input="_proxyRulesText = $event.target.value"
             ></textarea>
+            <p v-if="proxyRulesError" class="text-xs text-red-500">{{ proxyRulesError }}</p>
           </label>
         </section>
 
@@ -231,7 +240,7 @@
           </div>
           <button
             id="rulesConfigSaveBtn"
-            :disabled="saving || !!serverError"
+            :disabled="saving || !!serverError || !!proxyRulesError"
             class="inline-flex min-h-11 items-center justify-center gap-2 rounded bg-primary px-4 py-2 text-sm font-medium text-white transition hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-60"
             type="submit"
           >
@@ -349,6 +358,98 @@ function sanitizeLines(value) {
     .split('\n')
     .map((entry) => entry.trim())
     .filter(Boolean);
+}
+
+// —— 与后端 processor/match ClassifyEntry 对齐的前端校验（提示层，后端保存时仍是权威）——
+// 已知刻意放宽：区间数值顺序（from ≤ to）由后端强校验，此处不比对。
+const ENTRY_CHARS_RE = /^[a-z0-9.*-]+$/;
+const IPV4_RE = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
+
+function parseIPFamily(s) {
+  const m = String(s).match(IPV4_RE);
+  if (m && m.slice(1).every((o) => Number(o) <= 255)) return 4;
+  if (String(s).includes(':') && /^[0-9a-fA-F:.]+$/.test(s)) return 6;
+  return 0;
+}
+
+function isValidIPCond(cond) {
+  if (cond.includes('/')) {
+    const slash = cond.indexOf('/');
+    const fam = parseIPFamily(cond.slice(0, slash));
+    const bits = cond.slice(slash + 1);
+    if (!/^\d{1,3}$/.test(bits)) return false;
+    const max = fam === 4 ? 32 : 128;
+    return fam > 0 && Number(bits) <= max;
+  }
+  if (cond.includes('-')) {
+    const dash = cond.indexOf('-');
+    // 对齐后端 validateIPCond：区间两端 TrimSpace（"a - b" 合法）
+    const from = parseIPFamily(cond.slice(0, dash).trim());
+    return from > 0 && from === parseIPFamily(cond.slice(dash + 1).trim());
+  }
+  return parseIPFamily(cond) > 0;
+}
+
+// 返回 '' 表示合法，否则返回 i18n 错误文案。
+function validateRuleEntry(raw, t) {
+  let s = String(raw || '').trim();
+  if (!s) return '';
+  const lower = s.toLowerCase();
+  if (lower.startsWith('ip-cidr:')) return isValidIPCond(s.slice(8).trim()) ? '' : t('rules_ipInvalid');
+  if (lower.startsWith('ip-range:')) return isValidIPCond(s.slice(9).trim()) ? '' : t('rules_ipInvalid');
+  if (lower.startsWith('ip-from:')) {
+    const from = /ip-from:\s*([0-9a-fA-F:.]+)\s*(?:,|$)/.exec(lower);
+    const to = /ip-to:\s*([0-9a-fA-F:.]+)\s*(?:,|$)/.exec(lower);
+    return from && to && parseIPFamily(from[1]) > 0 && parseIPFamily(to[1]) > 0 ? '' : t('rules_ipInvalid');
+  }
+  if (parseIPFamily(lower) > 0 || isValidIPCond(lower)) return '';
+  if (lower.includes(',')) {
+    const parts = lower.split(',');
+    const first = parts[0].trim();
+    if (first === 'domain' || first === 'domains') s = parts[1] || '';
+    else if (first === 'ip-cidr' || first === 'ip-range') {
+      // 对齐后端：关键字与逗号之间允许空白（first 已 trim，分派取代原 startsWith('ip-cidr,') 特判）
+      const second = parts[1];
+      return second && isValidIPCond(second.trim()) ? '' : t('rules_ipInvalid');
+    } else if (parts[parts.length - 1].trim() === 'proxy') s = parts[parts.length - 2] || '';
+    else s = parts[parts.length - 1];
+  }
+  if (s.includes('://') || s.startsWith('//')) {
+    try {
+      s = new URL(s.includes('://') ? s : `https:${s}`).hostname || s;
+    } catch {
+      // URL 解析失败时保留原串，交给字符校验报错（与后端一致）
+    }
+  } else {
+    // host:port 宽容提取（对齐后端 net.SplitHostPort；端口可空、不做数字校验）
+    const hostPort = /^(\[[^\]]+\]|[^:]+):([^:]*)$/.exec(s);
+    if (hostPort) {
+      s = hostPort[1];
+    }
+  }
+  // 与后端一致：剥 [] 包裹；提取产物若为 IP 形态则按 IP 合法处理；
+  // 结构校验前归一大小写；尾点不剥离——尾点属结构非法，交由空标签检查拒绝
+  s = String(s).trim().replace(/^\[(.+)\]$/, '$1');
+  if (parseIPFamily(s) > 0) return '';
+  s = s.toLowerCase();
+  if (!ENTRY_CHARS_RE.test(s)) return t('rules_entryInvalidChars');
+  if (s.split('.').some((label) => !label)) return t('rules_entryEmptyLabel');
+  return '';
+}
+
+// 返回第一个非法条目（index 从 0 起），全部合法返回 null。
+function firstEntryIssue(entries, t) {
+  for (let i = 0; i < entries.length; i++) {
+    const message = validateRuleEntry(entries[i], t);
+    if (message) {
+      return { index: i, entry: entries[i], message };
+    }
+  }
+  return null;
+}
+
+function formatEntryIssue(issue, t) {
+  return issue ? t('rules_entryErrorItem', { entry: issue.entry, message: issue.message }) : '';
 }
 
 function normalizeAiRules(aiRules = {}) {
@@ -549,6 +650,23 @@ export default {
       if (!this.form.proxy.enable) return '';
       return isValidServer(this.form.proxy.server, this.t);
     },
+    proxyRulesError() {
+      return formatEntryIssue(firstEntryIssue(sanitizeLines(this._proxyRulesText), this.t), this.t);
+    },
+    providerEditorError() {
+      if (!this.providerEditor.provider) return '';
+      return formatEntryIssue(firstEntryIssue(sanitizeList(this.providerEditor.draft), this.t), this.t);
+    },
+    // 已存 include 文本的实时校验（草稿在弹窗内另有提示）；条目非法时阻止整表提交。
+    submitError() {
+      for (const [key, text] of Object.entries(this._providerIncludeTexts)) {
+        const issue = firstEntryIssue(sanitizeList(text), this.t);
+        if (issue) {
+          return `${this.providerLabel(key, this.presetProviders)}: ${formatEntryIssue(issue, this.t)}`;
+        }
+      }
+      return '';
+    },
     serverFieldClass() {
       if (!this.form.proxy.server) return 'border-slate-300 bg-white focus:border-primary focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900';
       return this.serverError
@@ -681,6 +799,10 @@ export default {
         this.cancelProviderEditor();
         return;
       }
+      if (this.providerEditorError) {
+        // 条目非法时保持弹窗打开，错误文案已展示在输入框下方
+        return;
+      }
 
       const include = sanitizeList(this.providerEditor.draft);
       this._providerIncludeTexts[provider] = include.join('\n');
@@ -697,6 +819,11 @@ export default {
           normalized.ai_rules[key].include = sanitizeList(text);
         }
       }
+
+      // 保存前逐条校验：任一非法则不提交（错误文案已在对应输入处实时展示）
+      if (firstEntryIssue(normalized.proxy_rules, this.t)) return;
+      if (this.submitError) return;
+
       this.$emit('save', normalized);
     }
   }

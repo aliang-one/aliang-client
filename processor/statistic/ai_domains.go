@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"aliang.one/nursorgate/processor/config"
+	"aliang.one/nursorgate/processor/match"
 )
 
 type trackedAIProvider struct {
@@ -237,6 +238,17 @@ func normalizeAIDomainPattern(raw string) string {
 		}
 	}
 
+	// IP 条目（单 IP / CIDR / 区间 / ip-from 形态）直接采用共享内核的归一化 condition，
+	// 跳过下方「首个 / 截断」与端口剥离，避免 CIDR/区间被截断变形
+	// （如 121.32.12.0/24 → 121.32.12.0），保证统计侧与编译侧看到同一形态。
+	// *. wildcard 条目不可能是 IP 形态，走既有归一化路径不受影响；
+	// 非法条目（err 非空）同样落回既有路径。
+	if !wildcard {
+		if kind, cond, err := match.ClassifyEntry(value); err == nil && kind == match.EntryIP {
+			return cond
+		}
+	}
+
 	if cut := strings.IndexRune(value, '/'); cut >= 0 {
 		value = value[:cut]
 	}
@@ -260,19 +272,7 @@ func normalizeAIDomainPattern(raw string) string {
 }
 
 func aiDomainMatches(pattern, host string) bool {
-	if pattern == "" || host == "" {
-		return false
-	}
-
-	if strings.HasPrefix(pattern, "*.") {
-		suffix := strings.TrimPrefix(pattern, "*.")
-		if suffix == "" {
-			return false
-		}
-		return strings.HasSuffix(host, "."+suffix)
-	}
-
-	return host == pattern || strings.HasSuffix(host, "."+pattern)
+	return match.MatchDomain(pattern, host)
 }
 
 func sortTrackedAIDomains(values map[string]struct{}) []string {

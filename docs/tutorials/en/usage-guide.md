@@ -319,6 +319,10 @@ claude.ai
 # System automatically extracts domain portion
 ```
 
+Domain entries also support `*` wildcards, and IP conditions (single IP /
+CIDR / range) are accepted as well — see [Section 8: Proxy Rules
+Configuration](#8-proxy-rules-configuration) for the full syntax.
+
 ### Privacy Notice
 
 **Putting third-party APIs into AI Rules does NOT leak your privacy.**
@@ -333,11 +337,11 @@ Why:
 
 ## 8. Proxy Rules Configuration
 
-Proxy Rules let you customize traffic routing for specific domains.
+Proxy Rules let you customize traffic routing for specific domains or IP addresses.
 
 ### Function
 
-You can specify that certain domains:
+You can specify that certain domains or IP addresses:
 
 - **Use proxy** - Traffic goes through your configured proxy server
 - **Direct connect** - Traffic connects directly without proxy
@@ -353,9 +357,55 @@ domain,example.com,proxy
 ```
 
 1. Rule explanation:
-  - Part 1: Fixed as `domain`
-  - Part 2: Domain to match
+  - Part 1: Fixed as `domain` (or `domains`); IP conditions may use the `ip-cidr` / `ip-range` prefix instead
+  - Part 2: Domain to match (`*` wildcards supported) or an IP condition
   - Part 3: `proxy` (use proxy) or `direct` (direct connect)
+
+### Domain Wildcards
+
+Domain entries support `*` wildcards: `*` matches **one or more arbitrary
+characters** and may cross dots. Entries without `*` keep the existing
+"exact + subdomain suffix" behavior. Only `*` is supported — not `?` or any
+other wildcard.
+
+| Pattern | Matches | Does not match |
+| --- | --- | --- |
+| `example.com` (no `*`) | `example.com`, `www.example.com`, `a.b.example.com` | `badexample.com` |
+| `*.epic.com` | `cdn.epic.com`, `a.b.epic.com` | `epic.com` (bare domain) |
+| `aliang.*` | `aliang.com`, `aliang.co.uk` | `aliang` (`*` needs at least 1 character) |
+| `*epic.com` | `cdn.epic.com`, `cdnepic.com` | `epic.com` (`*` needs at least 1 character) |
+
+### IP Conditions
+
+IP conditions support both IPv4 and IPv6 (keywords are case-insensitive):
+
+```
+1.2.3.4                             single IP
+121.32.12.0/24                      CIDR block
+1.2.3.1-1.2.3.254                   closed range (from ≤ to)
+2001:db8::/32                       IPv6 CIDR
+2001:db8::1-2001:db8::ff            IPv6 range
+ip-cidr:121.32.12.0/24              explicit keyword prefix
+ip-range:1.2.3.1-1.2.3.254
+ip-from:1.2.3.1,ip-to:1.2.3.254     keyword pair (optional trailing action, e.g. …,proxy)
+ip-cidr,121.32.12.0/24,proxy        Clash style (third part is the action)
+ip-range,1.2.3.1-1.2.3.254,direct
+```
+
+> **Where IP rules apply**: IP conditions are matched against the real
+> destination IP of TCP connections on the deep-mode (TUN) path. TLS traffic
+> without SNI, UDP traffic, and local HTTP-proxy inbound traffic never reach
+> the rules engine, so IP conditions have no effect there. `0.0.0.0/0` matches
+> IPv4 destinations only; `::/0` matches IPv6 destinations only.
+
+> **Validation**: malformed entries (invalid IPs, reversed ranges, empty
+> labels such as `a..b`) are rejected when you save, with an inline error
+> shown in the UI.
+
+> **Traffic mirror**: the mirror `domains` list is matched by domain
+> (SNI/host). Of IP entries, only a bare single IP can ever match (literal
+> SNI/host comparison); CIDR blocks and ranges never match in the mirror path.
+> Use AI Rules or Proxy Rules for IP-based routing.
 
 ### Examples
 
@@ -365,8 +415,17 @@ domain,openai.com,proxy
 domain,anthropic.com,proxy
 domain,github.com,proxy
 
+# Domain wildcards
+domains,*.epic.com
+domains,aliang.*
+
 # These domains connect directly
 domain,google.com,direct
+
+# IP conditions
+ip-cidr,121.32.12.0/24,proxy
+ip-range,1.2.3.1-1.2.3.254,direct
+ip-from:1.2.3.1,ip-to:1.2.3.254
 ```
 
 ---

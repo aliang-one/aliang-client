@@ -95,8 +95,7 @@ export const Badge = ({ children, variant = "default" }) => {
   - [3.2 打开管理面板](#32-打开管理面板)
   - [3.3 界面布局介绍](#33-界面布局介绍)
 4. [安装并信任证书（macOS）](#4-安装并信任证书macos)
-  - [4.0 为什么需要证书](#40-为什么需要证书)
-  - [4.1 证书的工作原理](#41-证书的工作原理)
+  - [4.1 为什么需要证书](#41-为什么需要证书)
   - [4.2 安装证书](#42-安装证书)
   - [4.3 信任证书（钥匙串操作）](#43-信任证书钥匙串操作)
   - [4.4 确认证书已信任](#44-确认证书已信任)
@@ -822,7 +821,7 @@ Quick Setup 可以为你自动生成上述 CLI 工具的配置文件。
 ## 11. AI 规则配置
 
 
-AI 规则决定了哪些 AI 服务的域名流量走 ALiang 加速通道。
+AI 规则决定了哪些 AI 服务的流量走 ALiang 加速通道（匹配条件为域名或 IP）。
 
 
 ### 11.1 预设 AI 提供商
@@ -871,6 +870,8 @@ claude.ai
 
 系统会自动从 URL 中提取域名部分。
 
+域名条目支持 `*` 通配符，也支持 IP 条件（单 IP / CIDR / 区间），完整语法见 [12.1 规则格式](#121-规则格式)。
+
 1. 点击 **「保存」**
 2. 最后点击页面底部的 **「保存配置」** 提交到后端
 
@@ -886,7 +887,7 @@ claude.ai
 ## 12. 自定义代理规则
 
 
-代理规则让你可以为指定域名设置路由策略。
+代理规则让你可以为指定域名或 IP 设置路由策略。
 
 
 ### 12.1 规则格式
@@ -895,12 +896,56 @@ claude.ai
 每行一条规则，格式为：
 
 ```
-domain,<域名>[,<动作>]
+domain,<域名或 IP 条件>[,<动作>]
 ```
 
-- **第一部分**：固定为 `domain`（或简写为 `domains`）
-- **第二部分**：要匹配的域名
+- **第一部分**：固定为 `domain`（或简写为 `domains`）；写 IP 条件时也可以用 `ip-cidr` / `ip-range` 前缀（见下方 IP 条件）
+- **第二部分**：要匹配的域名（支持 `*` 通配符）或 IP 条件
 - **第三部分**（可选）：`proxy`（走代理）或 `direct`（直连），省略时默认为 `proxy`
+
+**域名通配符**
+
+域名条目支持 `*` 通配符：`*` 匹配 **≥1 个任意字符**，可以跨点号。不含 `*` 的条目仍按「精确匹配 + 子域名后缀匹配」处理。只支持 `*`，不支持 `?` 等其他通配符。
+
+<div className="my-4 overflow-x-auto rounded-xl border border-slate-200 dark:border-slate-700">
+  <table className="w-full min-w-[320px] text-sm">
+    <thead className="bg-slate-50 text-slate-700 dark:bg-slate-800/80 dark:text-slate-200"><tr><th className="px-3 py-2 text-left font-semibold">写法</th><th className="px-3 py-2 text-left font-semibold">命中</th><th className="px-3 py-2 text-left font-semibold">不命中</th></tr></thead>
+    <tbody><tr className="border-t border-slate-100 dark:border-slate-800"><td className="px-3 py-2 align-top">`example.com`（不含 `*`）</td><td className="px-3 py-2 align-top">`example.com`、`www.example.com`、`a.b.example.com`</td><td className="px-3 py-2 align-top">`badexample.com`</td></tr><tr className="border-t border-slate-100 dark:border-slate-800"><td className="px-3 py-2 align-top">`*.epic.com`</td><td className="px-3 py-2 align-top">`cdn.epic.com`、`a.b.epic.com`</td><td className="px-3 py-2 align-top">`epic.com`（裸域）</td></tr><tr className="border-t border-slate-100 dark:border-slate-800"><td className="px-3 py-2 align-top">`aliang.*`</td><td className="px-3 py-2 align-top">`aliang.com`、`aliang.co.uk`</td><td className="px-3 py-2 align-top">`aliang`（`*` 至少要匹配 1 个字符）</td></tr><tr className="border-t border-slate-100 dark:border-slate-800"><td className="px-3 py-2 align-top">`*epic.com`</td><td className="px-3 py-2 align-top">`cdn.epic.com`、`cdnepic.com`</td><td className="px-3 py-2 align-top">`epic.com`（`*` 至少要匹配 1 个字符）</td></tr></tbody>
+  </table>
+</div>
+
+
+**IP 条件**
+
+IP 条件支持 IPv4 / IPv6，以下写法均可（关键字大小写不敏感）：
+
+```
+1.2.3.4                             单 IP
+121.32.12.0/24                      CIDR 网段
+1.2.3.1-1.2.3.254                   闭区间（起点 ≤ 终点）
+2001:db8::/32                       IPv6 网段
+2001:db8::1-2001:db8::ff            IPv6 区间
+ip-cidr:121.32.12.0/24              显式关键字前缀
+ip-range:1.2.3.1-1.2.3.254
+ip-from:1.2.3.1,ip-to:1.2.3.254     关键字对（可再尾随动作，如 …,proxy）
+ip-cidr,121.32.12.0/24,proxy        Clash 风格（第三段为动作）
+ip-range,1.2.3.1-1.2.3.254,direct
+```
+
+<Callout type="info">
+  **生效范围**：IP 条件在深度模式（TUN）的 TCP 链路上按连接的真实目的 IP 匹配；无 SNI 的 TLS 流量、UDP 流量与本地 HTTP 代理入站不经过规则引擎，IP 条件在这些链路上不生效。`0.0.0.0/0` 只匹配 IPv4 目的地址，`::/0` 只匹配 IPv6 目的地址。
+</Callout>
+
+
+<Callout type="info">
+  **保存校验**：非法条目（坏 IP、区间起点大于终点、域名空标签如 `a..b` 等）在保存时会被明确拒绝，页面会实时提示错误原因。
+</Callout>
+
+
+<Callout type="info">
+  **流量镜像说明**：流量镜像的 `domains` 列表按域名（SNI/Host）匹配；在镜像列表里写 IP 条件时，仅裸单 IP 可能按字面命中，CIDR / 区间在镜像链路不生效。需要按 IP 分流请使用 AI 规则或代理规则。
+</Callout>
+
 
 
 ### 12.2 配置示例
@@ -917,9 +962,22 @@ domains,discord.com
 domains,github.com
 
 
+# 域名通配符
+
+domains,*.epic.com
+domains,aliang.*
+
+
 # 指定直连
 
 domain,example.com,direct
+
+
+# IP 条件
+
+ip-cidr,121.32.12.0/24,proxy
+ip-range,1.2.3.1-1.2.3.254,direct
+ip-from:1.2.3.1,ip-to:1.2.3.254
 ```
 
 点击页面底部的 **「保存配置」** 提交。
@@ -1177,7 +1235,7 @@ domain,example.com,direct
 <div className="my-4 overflow-x-auto rounded-xl border border-slate-200 dark:border-slate-700">
   <table className="w-full min-w-[320px] text-sm">
     <thead className="bg-slate-50 text-slate-700 dark:bg-slate-800/80 dark:text-slate-200"><tr><th className="px-3 py-2 text-left font-semibold">字段</th><th className="px-3 py-2 text-left font-semibold">类型</th><th className="px-3 py-2 text-left font-semibold">说明</th></tr></thead>
-    <tbody><tr className="border-t border-slate-100 dark:border-slate-800"><td className="px-3 py-2 align-top">`enabled`</td><td className="px-3 py-2 align-top">bool</td><td className="px-3 py-2 align-top">开关，`false` 时不产生任何开销</td></tr><tr className="border-t border-slate-100 dark:border-slate-800"><td className="px-3 py-2 align-top">`target`</td><td className="px-3 py-2 align-top">string</td><td className="px-3 py-2 align-top">接收镜像数据的 HTTP POST 端点</td></tr><tr className="border-t border-slate-100 dark:border-slate-800"><td className="px-3 py-2 align-top">`domains`</td><td className="px-3 py-2 align-top">string[]</td><td className="px-3 py-2 align-top">匹配域名列表</td></tr></tbody>
+    <tbody><tr className="border-t border-slate-100 dark:border-slate-800"><td className="px-3 py-2 align-top">`enabled`</td><td className="px-3 py-2 align-top">bool</td><td className="px-3 py-2 align-top">开关，`false` 时不产生任何开销</td></tr><tr className="border-t border-slate-100 dark:border-slate-800"><td className="px-3 py-2 align-top">`target`</td><td className="px-3 py-2 align-top">string</td><td className="px-3 py-2 align-top">接收镜像数据的 HTTP POST 端点</td></tr><tr className="border-t border-slate-100 dark:border-slate-800"><td className="px-3 py-2 align-top">`domains`</td><td className="px-3 py-2 align-top">string[]</td><td className="px-3 py-2 align-top">域名匹配列表，语法见 12.1 规则格式</td></tr></tbody>
   </table>
 </div>
 
@@ -1191,9 +1249,14 @@ domain,example.com,direct
 <div className="my-4 overflow-x-auto rounded-xl border border-slate-200 dark:border-slate-700">
   <table className="w-full min-w-[320px] text-sm">
     <thead className="bg-slate-50 text-slate-700 dark:bg-slate-800/80 dark:text-slate-200"><tr><th className="px-3 py-2 text-left font-semibold">模式</th><th className="px-3 py-2 text-left font-semibold">示例</th><th className="px-3 py-2 text-left font-semibold">匹配范围</th></tr></thead>
-    <tbody><tr className="border-t border-slate-100 dark:border-slate-800"><td className="px-3 py-2 align-top">精确匹配</td><td className="px-3 py-2 align-top">`api.openai.com`</td><td className="px-3 py-2 align-top">仅匹配 `api.openai.com`</td></tr><tr className="border-t border-slate-100 dark:border-slate-800"><td className="px-3 py-2 align-top">通配符</td><td className="px-3 py-2 align-top">`*.cursor.sh`</td><td className="px-3 py-2 align-top">匹配 `api2.cursor.sh` 等，不匹配 `cursor.sh` 本身</td></tr><tr className="border-t border-slate-100 dark:border-slate-800"><td className="px-3 py-2 align-top">后缀匹配</td><td className="px-3 py-2 align-top">`openai.com`</td><td className="px-3 py-2 align-top">匹配 `api.openai.com`、`cdn.openai.com` 等所有子域名</td></tr></tbody>
+    <tbody><tr className="border-t border-slate-100 dark:border-slate-800"><td className="px-3 py-2 align-top">精确 + 子域</td><td className="px-3 py-2 align-top">`openai.com`</td><td className="px-3 py-2 align-top">`openai.com` 本身及其所有子域名（`api.openai.com`、`cdn.openai.com` 等）</td></tr><tr className="border-t border-slate-100 dark:border-slate-800"><td className="px-3 py-2 align-top">子域通配</td><td className="px-3 py-2 align-top">`*.cursor.sh`</td><td className="px-3 py-2 align-top">匹配 `api2.cursor.sh` 等子域名，不匹配 `cursor.sh` 本身</td></tr><tr className="border-t border-slate-100 dark:border-slate-800"><td className="px-3 py-2 align-top">任意位置通配</td><td className="px-3 py-2 align-top">`aliang.*`、`*epic.com`</td><td className="px-3 py-2 align-top">`*` 匹配 ≥1 个任意字符、可跨点号；`aliang.*` 命中 `aliang.co.uk`，`*epic.com` 命中 `cdnepic.com`</td></tr></tbody>
   </table>
 </div>
+
+
+<Callout type="warning" title="注意">
+  镜像列表按域名（SNI/Host）匹配。完整语法（含 `*` 通配符与 IP 条件）见 [12.1 规则格式](#121-规则格式)；在镜像列表里写 IP 条件时，仅裸单 IP 可能按字面命中，CIDR / 区间在镜像链路不生效——按 IP 分流请使用 AI 规则或代理规则。
+</Callout>
 
 
 

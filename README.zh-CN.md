@@ -133,11 +133,39 @@ sudo ./aliang service install --system-wide --config /etc/aliang/config.json
 - `core.engine` — TUN/HTTP 模式、设备、日志级别等
 - `core.aliangServer` — Aliang 上游（mTLS relay）地址
 - `customer.proxy` — 可选出站代理（开关、类型、服务器、凭据）
-- `customer.ai_rules` — AI 服务域名白名单（走 MITM 路由）
+- `customer.ai_rules` — AI 服务域名/IP 白名单（走 MITM 路由）
 - `customer.proxy_rules` — 自定义域名/IP 路由规则
 - `customer.traffic_mirror` — TCP 流量镜像（见下）
 
 > `config.json` 是机器本地配置，已被 git 忽略；切勿提交真实凭据。
+
+### 规则语法
+
+`customer.ai_rules` 的包含域名列表、`customer.proxy_rules` 与
+`customer.traffic_mirror.domains` 使用同一套规则语法：
+
+```
+# 域名——精确 + 子域后缀，或含 '*' 的通配
+#（'*' 匹配 ≥1 个任意字符，可跨点号）
+example.com                example.com 及其所有子域名
+*.epic.com                 仅子域名（cdn.epic.com），不含裸域 epic.com
+aliang.*                   任意 TLD（aliang.com、aliang.co.uk）
+*epic.com                  前缀匹配（cdnepic.com、cdn.epic.com）
+
+# IP 条件——IPv4 / IPv6，裸形态或关键字前缀
+1.2.3.4                    单 IP
+121.32.12.0/24             CIDR（0.0.0.0/0 仅 IPv4，::/0 仅 IPv6）
+1.2.3.1-1.2.3.254          闭区间
+ip-cidr:121.32.12.0/24     显式关键字（另有 ip-range:、ip-from:…,ip-to:…）
+ip-cidr,121.32.12.0/24,proxy   Clash 风格，尾段为动作（proxy_rules）
+```
+
+- IP 条件在 TUN（深度模式）TCP 链路上按真实目的 IP 匹配；无 SNI 的 TLS
+  流量、UDP 流量与本地 HTTP 代理入站不经过规则引擎，IP 条件在这些链路
+  不生效。
+- 非法条目（坏 IP、空标签如 `a..b` 等）保存时会被明确拒绝。
+- `traffic_mirror.domains` 按域名（SNI/Host）匹配：裸单 IP 可按字面命中，
+  CIDR / 区间在镜像链路不生效——按 IP 分流请用 AI 规则或 `proxy_rules`。
 
 ### 流量镜像
 
@@ -160,7 +188,7 @@ sudo ./aliang service install --system-wide --config /etc/aliang/config.json
 | --- | --- | --- |
 | `enabled` | bool | 开关，`false` 时不产生任何开销 |
 | `target` | string | 接收 StreamChunk 的 HTTP POST 端点 |
-| `domains` | string[] | 精确匹配、`*.wildcard`、后缀匹配 |
+| `domains` | string[] | 域名匹配模式，语法见[规则语法](#规则语法)；按 SNI/Host 匹配 |
 
 **StreamChunk（HTTP POST JSON body）：**
 

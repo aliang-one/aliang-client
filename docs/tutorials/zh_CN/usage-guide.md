@@ -596,7 +596,7 @@ Quick Setup 可以为你自动生成上述 CLI 工具的配置文件。
 
 ## 11. AI 规则配置
 
-AI 规则决定了哪些 AI 服务的域名流量走 ALiang 加速通道。
+AI 规则决定了哪些 AI 服务的流量走 ALiang 加速通道（匹配条件为域名或 IP）。
 
 ### 11.1 预设 AI 提供商
 
@@ -636,6 +636,8 @@ claude.ai
 
 系统会自动从 URL 中提取域名部分。
 
+域名条目支持 `*` 通配符，也支持 IP 条件（单 IP / CIDR / 区间），完整语法见 [12.1 规则格式](#121-规则格式)。
+
 1. 点击 **「保存」**
 2. 最后点击页面底部的 **「保存配置」** 提交到后端
 
@@ -645,19 +647,53 @@ claude.ai
 
 ## 12. 自定义代理规则
 
-代理规则让你可以为指定域名设置路由策略。
+代理规则让你可以为指定域名或 IP 设置路由策略。
 
 ### 12.1 规则格式
 
 每行一条规则，格式为：
 
 ```
-domain,<域名>[,<动作>]
+domain,<域名或 IP 条件>[,<动作>]
 ```
 
-- **第一部分**：固定为 `domain`（或简写为 `domains`）
-- **第二部分**：要匹配的域名
+- **第一部分**：固定为 `domain`（或简写为 `domains`）；写 IP 条件时也可以用 `ip-cidr` / `ip-range` 前缀（见下方 IP 条件）
+- **第二部分**：要匹配的域名（支持 `*` 通配符）或 IP 条件
 - **第三部分**（可选）：`proxy`（走代理）或 `direct`（直连），省略时默认为 `proxy`
+
+**域名通配符**
+
+域名条目支持 `*` 通配符：`*` 匹配 **≥1 个任意字符**，可以跨点号。不含 `*` 的条目仍按「精确匹配 + 子域名后缀匹配」处理。只支持 `*`，不支持 `?` 等其他通配符。
+
+| 写法 | 命中 | 不命中 |
+| --- | --- | --- |
+| `example.com`（不含 `*`） | `example.com`、`www.example.com`、`a.b.example.com` | `badexample.com` |
+| `*.epic.com` | `cdn.epic.com`、`a.b.epic.com` | `epic.com`（裸域） |
+| `aliang.*` | `aliang.com`、`aliang.co.uk` | `aliang`（`*` 至少要匹配 1 个字符） |
+| `*epic.com` | `cdn.epic.com`、`cdnepic.com` | `epic.com`（`*` 至少要匹配 1 个字符） |
+
+**IP 条件**
+
+IP 条件支持 IPv4 / IPv6，以下写法均可（关键字大小写不敏感）：
+
+```
+1.2.3.4                             单 IP
+121.32.12.0/24                      CIDR 网段
+1.2.3.1-1.2.3.254                   闭区间（起点 ≤ 终点）
+2001:db8::/32                       IPv6 网段
+2001:db8::1-2001:db8::ff            IPv6 区间
+ip-cidr:121.32.12.0/24              显式关键字前缀
+ip-range:1.2.3.1-1.2.3.254
+ip-from:1.2.3.1,ip-to:1.2.3.254     关键字对（可再尾随动作，如 …,proxy）
+ip-cidr,121.32.12.0/24,proxy        Clash 风格（第三段为动作）
+ip-range,1.2.3.1-1.2.3.254,direct
+```
+
+> **生效范围**：IP 条件在深度模式（TUN）的 TCP 链路上按连接的真实目的 IP 匹配；无 SNI 的 TLS 流量、UDP 流量与本地 HTTP 代理入站不经过规则引擎，IP 条件在这些链路上不生效。`0.0.0.0/0` 只匹配 IPv4 目的地址，`::/0` 只匹配 IPv6 目的地址。
+
+> **保存校验**：非法条目（坏 IP、区间起点大于终点、域名空标签如 `a..b` 等）在保存时会被明确拒绝，页面会实时提示错误原因。
+
+> **流量镜像说明**：流量镜像的 `domains` 列表按域名（SNI/Host）匹配；在镜像列表里写 IP 条件时，仅裸单 IP 可能按字面命中，CIDR / 区间在镜像链路不生效。需要按 IP 分流请使用 AI 规则或代理规则。
 
 ### 12.2 配置示例
 
@@ -669,8 +705,17 @@ domains,google.com
 domains,discord.com
 domains,github.com
 
+# 域名通配符
+domains,*.epic.com
+domains,aliang.*
+
 # 指定直连
 domain,example.com,direct
+
+# IP 条件
+ip-cidr,121.32.12.0/24,proxy
+ip-range,1.2.3.1-1.2.3.254,direct
+ip-from:1.2.3.1,ip-to:1.2.3.254
 ```
 
 点击页面底部的 **「保存配置」** 提交。
@@ -872,17 +917,19 @@ domain,example.com,direct
 | --------- | -------- | -------------------- |
 | `enabled` | bool     | 开关，`false` 时不产生任何开销  |
 | `target`  | string   | 接收镜像数据的 HTTP POST 端点 |
-| `domains` | string[] | 匹配域名列表               |
+| `domains` | string[] | 域名匹配列表，语法见 12.1 规则格式  |
 
 
 ### 17.3 域名匹配规则
 
 
-| 模式   | 示例               | 匹配范围                                        |
-| ---- | ---------------- | ------------------------------------------- |
-| 精确匹配 | `api.openai.com` | 仅匹配 `api.openai.com`                        |
-| 通配符  | `*.cursor.sh`    | 匹配 `api2.cursor.sh` 等，不匹配 `cursor.sh` 本身    |
-| 后缀匹配 | `openai.com`     | 匹配 `api.openai.com`、`cdn.openai.com` 等所有子域名 |
+| 模式 | 示例 | 匹配范围 |
+| --- | --- | --- |
+| 精确 + 子域 | `openai.com` | `openai.com` 本身及其所有子域名（`api.openai.com`、`cdn.openai.com` 等） |
+| 子域通配 | `*.cursor.sh` | 匹配 `api2.cursor.sh` 等子域名，不匹配 `cursor.sh` 本身 |
+| 任意位置通配 | `aliang.*`、`*epic.com` | `*` 匹配 ≥1 个任意字符、可跨点号；`aliang.*` 命中 `aliang.co.uk`，`*epic.com` 命中 `cdnepic.com` |
+
+> **注意**：镜像列表按域名（SNI/Host）匹配。完整语法（含 `*` 通配符与 IP 条件）见 [12.1 规则格式](#121-规则格式)；在镜像列表里写 IP 条件时，仅裸单 IP 可能按字面命中，CIDR / 区间在镜像链路不生效——按 IP 分流请使用 AI 规则或代理规则。
 
 
 **镜像数据格式：**

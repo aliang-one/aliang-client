@@ -8,6 +8,7 @@ import (
 
 	"aliang.one/nursorgate/common/logger"
 	"aliang.one/nursorgate/processor/config"
+	"aliang.one/nursorgate/processor/match"
 	"golang.org/x/net/http2/hpack"
 )
 
@@ -117,22 +118,14 @@ func requestHostForRewrite(req *http.Request) string {
 	return ""
 }
 
-func aliangHTTPHostMatches(pattern, host string) bool {
-	normalizedPattern := normalizedAliangHTTPHost(pattern)
-	normalizedHost := normalizedAliangHTTPHost(host)
-	if normalizedPattern == "" || normalizedHost == "" {
-		return false
-	}
-
-	if strings.HasPrefix(normalizedPattern, "*.") {
-		suffix := strings.TrimPrefix(normalizedPattern, "*.")
-		if suffix == "" {
-			return false
-		}
-		return strings.HasSuffix(normalizedHost, "."+suffix)
-	}
-
-	return normalizedHost == normalizedPattern || strings.HasSuffix(normalizedHost, "."+normalizedPattern)
+// aliangHTTPHostMatches 判定已归一化的 host 是否命中 pattern。
+// pattern 侧保留 normalizedAliangHTTPHost 归一化：调用点传入的是 rule.Include
+// 原始条目，可能为 URL / host:port 形态。
+//
+// 已委托共享内核 processor/match（语义唯一定义点：spec 第 3 节；
+// 旧语义精确/后缀/"*." 保持不变，'*' 通配扩展为任意位置 glob）。
+func aliangHTTPHostMatches(pattern, normalizedHost string) bool {
+	return match.MatchDomain(normalizedAliangHTTPHost(pattern), normalizedHost)
 }
 
 func normalizedAliangHTTPHost(raw string) string {

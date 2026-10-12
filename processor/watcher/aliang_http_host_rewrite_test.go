@@ -107,6 +107,8 @@ func TestAliangHTTPHostMatches_SupportsExactSuffixAndWildcard(t *testing.T) {
 		{name: "suffix", pattern: "openai.com", host: "api.openai.com", want: true},
 		{name: "wildcard", pattern: "*.githubcopilot.com", host: "api.githubcopilot.com", want: true},
 		{name: "wildcard no root", pattern: "*.githubcopilot.com", host: "githubcopilot.com", want: false},
+		{name: "url form", pattern: "https://api.openai.com", host: "api.openai.com", want: true},
+		{name: "any position glob", pattern: "api.*.com", host: "api.githubcopilot.com", want: true},
 	}
 
 	for _, tt := range tests {
