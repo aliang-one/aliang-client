@@ -157,21 +157,25 @@ func stampAgentMCPFile(path string) agentMCPFileStamp {
 // claudeMCPServerInventoryIn 采集 <home> 下的 Claude 设备级 MCP 清单:
 // <home>/.claude.json 顶层 mcpServers(source=user)+ 已启用插件 MCP
 // (source=plugin)。项目级 .mcp.json 不采集(随 cwd 变化,非设备能力)。
-// 所有读取以传入 home 为根,不回落 agentHome()。返回值同时给出本次实际
-// 读取的全部文件 stamp(供缓存失效判定——复合源任一变更即失效)。
+// 所有读取以传入 home 为根,不回落 agentHome()。
+//
+// 两态返回契约:stamps 恒非 nil(= 本次读过/统计过的全部文件指纹,
+// 任一文件从缺失变存在或内容变更即缓存失效);清单为空时 out 为 nil
+// 但 stamps 照交——否则新机器(检测到 claude 却从未跑过)会把空清单
+// 永久缓存,用户后来创建 ~/.claude.json 也刷不出来。nil stamps 仅可能
+// 出现在上游拦截路径(home 为空时本函数不应被调用)。
 func claudeMCPServerInventoryIn(home string) ([]models.AgentMCPServer, []agentMCPFileStamp) {
 	claudeJSON := filepath.Join(home, ".claude.json")
 	settingsJSON := filepath.Join(home, ".claude", "settings.json")
 	registryJSON := filepath.Join(home, ".claude", "plugins", "installed_plugins.json")
-	if _, err := os.Stat(claudeJSON); err != nil {
-		if _, err2 := os.Stat(registryJSON); err2 != nil {
-			return nil, nil // 无任何 claude 配置:无事发生
-		}
-	}
-	stamps := []agentMCPFileStamp{
-		stampAgentMCPFile(claudeJSON),
-		stampAgentMCPFile(settingsJSON),
-		stampAgentMCPFile(registryJSON),
+	claudeStamp := stampAgentMCPFile(claudeJSON)
+	settingsStamp := stampAgentMCPFile(settingsJSON)
+	registryStamp := stampAgentMCPFile(registryJSON)
+	stamps := []agentMCPFileStamp{claudeStamp, settingsStamp, registryStamp}
+	// 无任何 claude 配置:清单为空,但 stamps 必须照交——缓存据此感知
+	// 「配置后来出现」(任一文件从缺失变存在即失效)。
+	if !claudeStamp.exists && !registryStamp.exists {
+		return nil, stamps
 	}
 	userRaw := map[string]interface{}{}
 	_ = readMCPServersFile(claudeJSON, userRaw)

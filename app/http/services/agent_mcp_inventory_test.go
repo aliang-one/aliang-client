@@ -2,6 +2,7 @@ package services
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -175,8 +176,9 @@ func TestAgentMCPServersFromClaudeRaw(t *testing.T) {
 
 func TestClaudeMCPServerInventoryIn(t *testing.T) {
 	home := t.TempDir()
+	// "   "(全空白名)条目必须被丢弃:截断后空名跳过,不得产出条目
 	if err := os.WriteFile(filepath.Join(home, ".claude.json"), []byte(
-		`{"mcpServers":{"context7":{"type":"http","url":"https://mcp.context7/mcp"}}}`), 0o644); err != nil {
+		`{"mcpServers":{"context7":{"type":"http","url":"https://mcp.context7/mcp"},"   ":{"command":"ghost"}}}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	// 启用一个插件 + 禁用一个插件(装了但 enabledPlugins 没开 → 不采)
@@ -221,9 +223,50 @@ func TestClaudeMCPServerInventoryIn(t *testing.T) {
 	}
 }
 
+// 两态契约:即使 home 下无任何 claude 配置,stamps 也必须照交(全缺失指纹),
+// 否则 Task 6 的缓存会把空清单永久缓存,「配置后来出现」永远感知不到。
 func TestClaudeMCPServerInventoryInMissingHome(t *testing.T) {
-	out, _ := claudeMCPServerInventoryIn(filepath.Join(t.TempDir(), "nonexistent"))
+	out, stamps := claudeMCPServerInventoryIn(filepath.Join(t.TempDir(), "nonexistent"))
 	if out != nil {
 		t.Fatalf("empty home must yield nil, got %+v", out)
+	}
+	if len(stamps) != 3 {
+		t.Fatalf("missing config must still yield 3 stamps, got %d: %+v", len(stamps), stamps)
+	}
+	for _, s := range stamps {
+		if s.exists {
+			t.Fatalf("all stamps must be exists=false, got %+v", s)
+		}
+	}
+}
+
+// 存在但空的配置 → 空清单(nil)但仍有指纹(stamps 覆盖被统计的文件)。
+func TestClaudeMCPServerInventoryInEmptyConfig(t *testing.T) {
+	home := t.TempDir()
+	if err := os.WriteFile(filepath.Join(home, ".claude.json"), []byte(`{"mcpServers":{}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, stamps := claudeMCPServerInventoryIn(home)
+	if out != nil {
+		t.Fatalf("empty mcpServers must yield nil, got %+v", out)
+	}
+	if len(stamps) != 3 {
+		t.Fatalf("want 3 stamps, got %d: %+v", len(stamps), stamps)
+	}
+}
+
+// spec §6 数量上限:超过 mcpServerMaxCount 的合法条目恰截到 24。
+func TestAgentMCPServersFromClaudeRawCountCap(t *testing.T) {
+	raw := map[string]interface{}{}
+	for i := 0; i < 30; i++ {
+		raw[fmt.Sprintf("srv-%02d", i)] = map[string]interface{}{"command": "npx"}
+	}
+	out := agentMCPServersFromClaudeRaw(raw, "user")
+	if len(out) != 24 {
+		t.Fatalf("want exactly 24 entries, got %d", len(out))
+	}
+	// 截断保留字典序前 24 个:srv-00..srv-23
+	if out[0].Name != "srv-00" || out[23].Name != "srv-23" {
+		t.Fatalf("cap must keep lexicographically first 24, got %s..%s", out[0].Name, out[23].Name)
 	}
 }
