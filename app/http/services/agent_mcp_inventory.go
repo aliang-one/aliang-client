@@ -29,49 +29,44 @@ func redactMCPToken(token string) string {
 	return token
 }
 
-// redactMCPCommand 把 argv join 成命令行,逐 token 脱敏,整体截 512。
+// redactMCPCommand 把 argv join 成命令行,逐 token 脱敏,整体截 512(按字符)。
 func redactMCPCommand(argv []string) string {
 	parts := make([]string, 0, len(argv))
 	for _, arg := range argv {
 		parts = append(parts, redactMCPToken(arg))
 	}
-	joined := strings.Join(parts, " ")
-	if len(joined) > mcpCommandMaxLen {
-		joined = joined[:mcpCommandMaxLen]
-	}
-	return joined
+	return truncateAgentText(strings.Join(parts, " "), mcpCommandMaxLen)
 }
 
-// redactMCPURL 打码 query 中超过阈值长度的值(键保留),整体截 512。
+// redactMCPURL 打码 query 中超过阈值长度的值(键保留);userinfo 一律打码、
+// fragment 一律丢弃——非 query 形态的凭据同样不得外泄;整体截 512(按字符)。
 func redactMCPURL(raw string) string {
 	raw = strings.TrimSpace(raw)
 	u, err := url.Parse(raw)
-	if err != nil || u.RawQuery == "" {
-		if len(raw) > mcpURLMaxLen {
-			raw = raw[:mcpURLMaxLen]
-		}
-		return raw
+	if err != nil || (u.RawQuery == "" && u.User == nil && u.Fragment == "") {
+		return truncateAgentText(raw, mcpURLMaxLen)
 	}
-	q := u.Query()
-	for key, vals := range q {
-		for i, v := range vals {
-			if len(v) > mcpURLQueryRedactMinLen {
-				vals[i] = "<redacted>"
+	if u.RawQuery != "" {
+		q := u.Query()
+		for key, vals := range q {
+			for i, v := range vals {
+				if len(v) > mcpURLQueryRedactMinLen {
+					vals[i] = "<redacted>"
+				}
 			}
+			q[key] = vals
 		}
-		q[key] = vals
+		u.RawQuery = q.Encode()
 	}
-	u.RawQuery = q.Encode()
-	out := u.String()
-	if len(out) > mcpURLMaxLen {
-		out = out[:mcpURLMaxLen]
+	if u.User != nil {
+		u.User = url.User("<redacted>")
 	}
-	return out
+	u.Fragment = ""
+	u.RawFragment = ""
+	return truncateAgentText(u.String(), mcpURLMaxLen)
 }
 
+// truncateMCPName 把 MCP 服务器名称截到 64 字符(rune 安全,复用 truncateAgentText)。
 func truncateMCPName(name string) string {
-	if len(name) > mcpNameMaxLen {
-		return name[:mcpNameMaxLen]
-	}
-	return name
+	return truncateAgentText(name, mcpNameMaxLen)
 }
