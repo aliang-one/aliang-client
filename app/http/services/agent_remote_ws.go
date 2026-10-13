@@ -996,6 +996,7 @@ func (s *AgentService) agentHelloPayload() map[string]interface{} {
 		"host":                   snapshot.Host,
 		"capabilities":           snapshot.Capabilities,
 		"tools":                  snapshot.Tools,
+		"subagents":              collectUserSubagents(),
 		"agent_tools":            agentToolRegistry().Descriptors(),
 		"agent_tools_rev":        agentToolRegistry().Rev(),
 		"history":                snapshot.History,

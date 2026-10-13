@@ -88,6 +88,15 @@ type AgentTool struct {
 	Efforts []string `json:"efforts,omitempty"`
 }
 
+// AgentSubagent 是设备上用户域(~/.claude/agents)的一个自定义 subagent 定义
+// 摘要(name/description 截断后随 hello `subagents` 上报)。description 为
+// frontmatter 首行截断,free text 不可信——消费方按展示文本对待。
+type AgentSubagent struct {
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	Source      string `json:"source,omitempty"`
+}
+
 type AgentHistoryRoot struct {
 	Tool      string `json:"tool"`
 	Path      string `json:"path"`
