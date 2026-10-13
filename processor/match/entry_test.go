@@ -69,8 +69,9 @@ func TestClassifyEntry(t *testing.T) {
 		{"geoip-bare-keyword-rejected", "geoip", EntryGeoIP, "", true},
 		{"geoip-empty", "geoip:", EntryGeoIP, "", true},
 		{"geoip-empty-plus", "geoip:CN++HK", EntryGeoIP, "", true},
+		{"geoip-colon-trailing-plus", "geoip:CN+", EntryGeoIP, "", true},
 		{"geoip-bad-code", "geoip:CHN", EntryGeoIP, "", true},
-		{"geoip-lowercase-code-rejected", "geoip:cn,HK", EntryGeoIP, "", true},
+		{"geoip-colon-comma-rejected-mixed-case", "geoip:cn,HK", EntryGeoIP, "", true},
 		{"geoip-clash-empty", "geoip,", EntryGeoIP, "", true},
 	}
 	for _, tc := range cases {

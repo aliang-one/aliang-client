@@ -224,13 +224,13 @@ func classifyGeoIPColon(rem string) (EntryKind, string, error) {
 	}
 	seen := map[string]struct{}{}
 	norm := make([]string, 0, 4)
-	for _, c := range strings.Split(rem, "+") {
-		c = strings.ToUpper(strings.TrimSpace(c))
+	for _, seg := range strings.Split(rem, "+") {
+		c := strings.ToUpper(strings.TrimSpace(seg))
 		if c == "" {
 			return EntryGeoIP, "", fmt.Errorf("geoip 条目含空国家码 %q", rem)
 		}
 		if !isValidCountryCode(c) {
-			return EntryGeoIP, "", fmt.Errorf("非法国家码 %q（ISO 3166-1 两位大写字母）", c)
+			return EntryGeoIP, "", fmt.Errorf("非法国家码 %q（ISO 3166-1 两位大写字母）", seg)
 		}
 		if _, dup := seen[c]; dup {
 			continue
