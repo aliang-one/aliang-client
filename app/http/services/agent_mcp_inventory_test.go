@@ -370,6 +370,17 @@ func TestCachedAgentMCPServersInvalidation(t *testing.T) {
 	if third[0].Name != "b" {
 		t.Fatalf("fresh parse result wrong: %+v", third)
 	}
+	// 命中返回副本:改写返回值不得污染缓存
+	if len(third) > 0 {
+		third[0].Name = "mutated"
+		fourth := cachedAgentMCPServers(home, "codex", parse)
+		if fourth[0].Name != "b" {
+			t.Fatalf("cache must be isolated from returned slice, got %+v", fourth[0])
+		}
+		if parseCalls != 2 {
+			t.Fatalf("mutation must not trigger reparse, parseCalls=%d", parseCalls)
+		}
+	}
 }
 
 func TestAgentMCPServersForDispatch(t *testing.T) {
@@ -468,5 +479,83 @@ func TestClaudeMCPServerInventoryInOuterTruncation(t *testing.T) {
 	}
 	if out[0].Name != "a00" || out[23].Name != "a23" {
 		t.Fatalf("outer truncation must keep a00..a23, got %s..%s", out[0].Name, out[23].Name)
+	}
+}
+
+func TestDetectAgentToolsWithFillsMCPServers(t *testing.T) {
+	fake := map[string][]models.AgentMCPServer{
+		// claudecode 单独映射:接线循环按 defs[i].ID 原样调 mcpInventoryFor,
+		// 「别名同源」的归属在 agentMCPServersFor 的 switch 里,fake 绕过它。
+		"claude":     {{Name: "ctx", Transport: "http", URL: "https://x"}},
+		"claudecode": {{Name: "ctx", Transport: "http", URL: "https://x"}},
+		"codex":      {{Name: "serena", Transport: "stdio", Command: "uvx"}},
+	}
+	orig := mcpInventoryFor
+	mcpInventoryFor = func(toolID string) []models.AgentMCPServer { return fake[toolID] }
+	t.Cleanup(func() { mcpInventoryFor = orig })
+
+	tools := detectAgentToolsWith(func(cmd string) (string, error) {
+		return "/fake/bin/" + cmd, nil
+	})
+	byID := map[string]models.AgentTool{}
+	for _, tool := range tools {
+		byID[tool.ID] = tool
+	}
+	if len(byID["claude"].MCPServers) != 1 {
+		t.Fatalf("claude must carry mcp list")
+	}
+	if len(byID["claudecode"].MCPServers) != 1 {
+		t.Fatalf("claudecode alias must share claude list")
+	}
+	if len(byID["codex"].MCPServers) != 1 {
+		t.Fatalf("codex must carry mcp list")
+	}
+	for _, id := range []string{"opencode", "pi", "gemini"} {
+		if byID[id].MCPServers != nil {
+			t.Fatalf("%s must not carry mcp list", id)
+		}
+	}
+}
+
+func TestDetectAgentToolsWithSkipsUnavailableMCPServers(t *testing.T) {
+	orig := mcpInventoryFor
+	mcpInventoryFor = func(toolID string) []models.AgentMCPServer {
+		return []models.AgentMCPServer{{Name: "x", Transport: "stdio", Command: "x"}}
+	}
+	t.Cleanup(func() { mcpInventoryFor = orig })
+
+	// 无任何 CLI 可用 → 不采集 MCP(能力=CLI 存在才有意义)
+	tools := detectAgentToolsWith(func(cmd string) (string, error) {
+		return "", fmt.Errorf("not found")
+	})
+	for _, tool := range tools {
+		if tool.MCPServers != nil {
+			t.Fatalf("unavailable tool %s must not carry mcp list", tool.ID)
+		}
+	}
+}
+
+func TestAgentMCPServersForAliasSharesClaudeSlot(t *testing.T) {
+	origHome := mcpInventoryHome
+	origInv := mcpInventoryFor
+	t.Cleanup(func() { mcpInventoryHome = origHome; mcpInventoryFor = origInv })
+
+	// 注意:agentMCPServersFor 内部直接调 cachedAgentMCPServers+InventoryIn,
+	// 不经 mcpInventoryFor;此处用 mcpInventoryHome 指到临时 home,
+	// 让 claude/claudecode 真实走同一个 claude 缓存槽。
+	home := t.TempDir()
+	if err := os.WriteFile(filepath.Join(home, ".claude.json"), []byte(
+		`{"mcpServers":{"ctx":{"type":"http","url":"https://x"}}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mcpInventoryHome = func() string { return home }
+
+	viaClaude := agentMCPServersFor("claude")
+	viaAlias := agentMCPServersFor("claudecode")
+	if len(viaClaude) != 1 || len(viaAlias) != 1 {
+		t.Fatalf("claude & claudecode must both resolve, got %+v / %+v", viaClaude, viaAlias)
+	}
+	if viaAlias[0].Name != "ctx" {
+		t.Fatalf("alias must read same claude config, got %+v", viaAlias[0])
 	}
 }

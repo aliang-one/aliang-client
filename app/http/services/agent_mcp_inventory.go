@@ -297,6 +297,8 @@ func agentMCPStampsUnchanged(stamps []agentMCPFileStamp) bool {
 
 // cachedAgentMCPServers 以「home+toolID」为槽缓存解析结果;命中时返回副本
 // (防调用方改写缓存)。parse 只在缓存失效时被调。
+// parse 契约:返回的 stamps 必须非 nil(空配置也要交指纹)——nil stamps 会被
+// agentMCPStampsUnchanged 视为恒未变,导致空结果永驻缓存。
 func cachedAgentMCPServers(home, toolID string, parse func(home string) ([]models.AgentMCPServer, []agentMCPFileStamp)) []models.AgentMCPServer {
 	agentMCPInventoryMu.Lock()
 	defer agentMCPInventoryMu.Unlock()
@@ -317,7 +319,7 @@ func cachedAgentMCPServers(home, toolID string, parse func(home string) ([]model
 // agentMCPServersFor 是 detectAgentToolsWith 的 MCP 采集入口:仅 claude/
 // claudecode/codex 采集(其余 CLI 返回 nil);agentHome 不可得返回 nil。
 func agentMCPServersFor(toolID string) []models.AgentMCPServer {
-	home := agentHome()
+	home := mcpInventoryHome()
 	if home == "" {
 		return nil
 	}
@@ -330,3 +332,9 @@ func agentMCPServersFor(toolID string) []models.AgentMCPServer {
 		return nil
 	}
 }
+
+// mcpInventoryFor 是 detectAgentToolsWith 的 MCP 采集注入点(测试替换)。
+var mcpInventoryFor = agentMCPServersFor
+
+// mcpInventoryHome 是 agentMCPServersFor 取 home 的注入点(测试替换)。
+var mcpInventoryHome = agentHome
