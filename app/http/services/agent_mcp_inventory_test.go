@@ -255,6 +255,66 @@ func TestClaudeMCPServerInventoryInEmptyConfig(t *testing.T) {
 	}
 }
 
+func TestCodexMCPServerInventoryIn(t *testing.T) {
+	home := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, ".codex"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	configTOML := `
+[mcp_servers.serena]
+command = "uvx"
+args = ["--from", "git+https://example/serena", "serena", "start-mcp-server"]
+env = { SECRET_TOKEN = "` + strings.Repeat("x", 40) + `" }
+
+[mcp_servers.webmcp]
+url = "https://mcp.example/stream"
+
+[mcp_servers.broken]
+url = ""
+`
+	if err := os.WriteFile(filepath.Join(home, ".codex", "config.toml"), []byte(configTOML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, stamps := codexMCPServerInventoryIn(home)
+	if len(out) != 2 {
+		t.Fatalf("want serena+webmcp, got %+v", out)
+	}
+	if out[0].Name != "serena" || out[0].Transport != "stdio" {
+		t.Fatalf("serena wrong: %+v", out[0])
+	}
+	if !strings.HasPrefix(out[0].Command, "uvx --from") {
+		t.Fatalf("serena command wrong: %q", out[0].Command)
+	}
+	if strings.Contains(out[0].Command, strings.Repeat("x", 40)) {
+		t.Fatalf("env 值绝不能出现在 command: %q", out[0].Command)
+	}
+	if out[1].Name != "webmcp" || out[1].Transport != "http" || out[1].URL != "https://mcp.example/stream" {
+		t.Fatalf("webmcp wrong: %+v", out[1])
+	}
+	if len(stamps) != 1 {
+		t.Fatalf("want 1 stamp, got %d", len(stamps))
+	}
+	// 缺文件也要交指纹(out==nil 且 stamps len==1),否则缓存永驻空结果
+	missingOut, missingStamps := codexMCPServerInventoryIn(t.TempDir())
+	if missingOut != nil || len(missingStamps) != 1 {
+		t.Fatalf("missing config must yield nil + 1 stamp, got %+v %+v", missingOut, missingStamps)
+	}
+}
+
+func TestCodexMCPServerInventoryInMalformed(t *testing.T) {
+	home := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, ".codex"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".codex", "config.toml"), []byte("not [ valid toml"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, _ := codexMCPServerInventoryIn(home)
+	if out != nil {
+		t.Fatalf("malformed toml must fail soft, got %+v", out)
+	}
+}
+
 // spec §6 数量上限:超过 mcpServerMaxCount 的合法条目恰截到 24。
 func TestAgentMCPServersFromClaudeRawCountCap(t *testing.T) {
 	raw := map[string]interface{}{}

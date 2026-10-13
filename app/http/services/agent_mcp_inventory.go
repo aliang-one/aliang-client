@@ -14,7 +14,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/BurntSushi/toml"
+
 	"aliang.one/nursorgate/app/http/models"
+	"aliang.one/nursorgate/common/logger"
 )
 
 const (
@@ -194,4 +197,73 @@ func claudeMCPServerInventoryIn(home string) ([]models.AgentMCPServer, []agentMC
 		return nil, stamps
 	}
 	return out, stamps
+}
+
+// codexMCPConfig 对应 ~/.codex/config.toml 的 [mcp_servers.<name>] 表。
+// Env 读取即弃:字段只是把 env 消化掉,值永不进入输出。
+type codexMCPConfig struct {
+	Command string                 `toml:"command"`
+	Args    []string               `toml:"args"`
+	URL     string                 `toml:"url"`
+	Env     map[string]interface{} `toml:"env"`
+}
+
+type codexConfigFile struct {
+	MCPServers map[string]codexMCPConfig `toml:"mcp_servers"`
+}
+
+// codexMCPServerInventoryIn 采集 ~/.codex/config.toml 的 MCP 清单。
+// command(+args)→ stdio;url → 统一归类 http(codex 配置不区分 sse/http);
+// 两者皆无的条目丢弃;畸形 TOML fail-soft 返回 nil。
+// 两态契约与 claude 侧一致:stamps 恒非 nil(缺文件/空清单也照交指纹),
+// 否则缓存会把空清单永久缓存,「配置后来出现」永远感知不到。
+func codexMCPServerInventoryIn(home string) ([]models.AgentMCPServer, []agentMCPFileStamp) {
+	configPath := filepath.Join(home, ".codex", "config.toml")
+	stamp := stampAgentMCPFile(configPath)
+	if !stamp.exists {
+		// 缺失也要交指纹,否则缓存永驻空结果(配置后来出现感知不到)
+		return nil, []agentMCPFileStamp{stamp}
+	}
+	var cfg codexConfigFile
+	if _, err := toml.DecodeFile(configPath, &cfg); err != nil {
+		logger.Warn(fmt.Sprintf("mcp-inventory: unparseable codex config %s: %v", configPath, err))
+		return nil, []agentMCPFileStamp{stamp}
+	}
+	names := make([]string, 0, len(cfg.MCPServers))
+	for name := range cfg.MCPServers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	out := make([]models.AgentMCPServer, 0, len(names))
+	for _, name := range names {
+		if len(out) >= mcpServerMaxCount {
+			break
+		}
+		srv := cfg.MCPServers[name]
+		// 与 claude 解析器对齐:截断后空名(全空白键)跳过,
+		// 否则服务端 schema min(1) 会拒掉整个工具条目。
+		nm := truncateMCPName(name)
+		if nm == "" {
+			continue
+		}
+		switch {
+		case srv.URL != "":
+			out = append(out, models.AgentMCPServer{
+				Name: nm, Transport: "http",
+				URL: redactMCPURL(srv.URL), Source: "config",
+			})
+		case srv.Command != "":
+			out = append(out, models.AgentMCPServer{
+				Name: nm, Transport: "stdio",
+				Command: redactMCPCommand(append([]string{srv.Command}, srv.Args...)),
+				Source:  "config",
+			})
+		default:
+			continue
+		}
+	}
+	if len(out) == 0 {
+		return nil, []agentMCPFileStamp{stamp}
+	}
+	return out, []agentMCPFileStamp{stamp}
 }
