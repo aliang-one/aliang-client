@@ -69,7 +69,7 @@
   2. `trust_level` 为其他值 → `isolated`（fail-closed）；
   3. 无 `trust_level`：`project_skill_trusted=true && project_capability_mode=sanitized_plugin` → `sanitized`；**其余一律 `isolated`**（含旧 `project_skill_trusted=false`、字段缺失、空 policy——保持旧版行为逐字节不变：旧的非受信项目升级后不会突然暴露项目能力）。
   4. `claude_remote_policy` 缺失（policy 未启用）→ 不走本机制，行为同现状。
-- 2.1.x 守门：claude < 2.2.0 且档位非 `isolated` 时，**整档降级为 `isolated`**（setting-sources 回 `""`、清洗插件不构建——不是只换旗子），并通知：本地 `logger.Warn` + 在该 run 的 `ai.run.started` 事件 payload 增加扩展字段 `policy_notice`，**固定为结构化对象** `{"effective":"isolated","requested":"<原档位>","reason":"<见下>"}`。`reason` 枚举：`claude_version_below_2_2`（版本守门）、`sanitize_failed`（清洗拷贝失败）、`mcp_merge_failed`（MCP 合并失败）——**服务端解析须接受全部三个枚举值**。服务端按此结构解析。复用 `detectClaudeApprovalHookStrategy` 的**版本探测机制与缓存**（注意其返回值是 hook 策略而非版本号，降级判定需独立解析版本）。ask 列表例外：被降级的 full 档 `permissionAsk` 为空且**不重新填充默认列表**——<2.2 走 PreToolUse 策略本就不注入 `permissions.ask`，重新填充不可观测。
+- 2.1.x 守门：claude < 2.2.0 且档位非 `isolated` 时，**整档降级为 `isolated`**（setting-sources 回 `""`、清洗插件不构建——不是只换旗子），并通知：本地 `logger.Warn` + 在该 run 的 `ai.run.started` 事件 payload 增加扩展字段 `policy_notice`，**固定为结构化对象** `{"effective":"isolated","requested":"<原档位>","reason":"<见下>"}`。`reason` 枚举：`claude_version_below_2_2`（版本守门）、`sanitize_failed`（清洗拷贝失败）、`mcp_merge_failed`（MCP 合并失败）、`platform_provider_missing`（平台 env 缺失的 isolated→sanitized 回退，见 promoteIsolatedTierForPlatformFallback，2026-10-13）——**服务端解析须接受全部四个枚举值**；`effective` 亦可为 `sanitized`（回退是升级而非降级）。服务端按此结构解析。复用 `detectClaudeApprovalHookStrategy` 的**版本探测机制与缓存**（注意其返回值是 hook 策略而非版本号，降级判定需独立解析版本）。ask 列表例外：被降级的 full 档 `permissionAsk` 为空且**不重新填充默认列表**——<2.2 走 PreToolUse 策略本就不注入 `permissions.ask`，重新填充不可观测。
 
 ## 4. 清洗插件（sanitized 档）细则
 

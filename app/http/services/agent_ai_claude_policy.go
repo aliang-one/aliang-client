@@ -52,12 +52,27 @@ func claudeTierSettingSources(tier string) string {
 	}
 }
 
+// platformProviderEnvProbe 返回平台通道注入 env 的 (baseURL, token, 齐全)。
+// var 是单测注入点：hermetic，不依赖测试机的真实环境。
+var platformProviderEnvProbe = func() (string, string, bool) {
+	base, _ := agentChildProcessEnvValue("ANTHROPIC_BASE_URL")
+	token, _ := agentChildProcessEnvValue("ANTHROPIC_AUTH_TOKEN")
+	base, token = strings.TrimSpace(base), strings.TrimSpace(token)
+	return base, token, base != "" && token != ""
+}
+
 // withClaudeRemotePolicy applies the remote trust tier to a claude tool:
 // per-tier --setting-sources, the sanitized capability plugin for the
 // sanitized tier, and the explicit MCP merge when the server marked project
 // MCP trusted. On plugin/MCP preparation failure it degrades the run to the
 // isolated tier (fail-closed) and returns a structured policy notice instead
 // of failing the run (spec §3/§4.1).
+//
+// 平台 env 在位时注入 CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1：settings env
+// 块会覆盖进程 env（官方语义，code.claude.com/docs/en/env-vars#precedence），
+// 不钉死则 sanitized/full 档被用户 settings.json 个人通道反杀。平台缺失的
+// isolated→sanitized 回退不在此处（会撤销版本守卫的降级），见
+// promoteIsolatedTierForPlatformFallback——必须发生在版本守卫之前。
 func withClaudeRemotePolicy(tool *agentAITool, run agentAIRun) (*agentAITool, func(), map[string]interface{}) {
 	cleanup := func() {}
 	if tool == nil || !run.claudePolicy.enabled {
@@ -65,6 +80,9 @@ func withClaudeRemotePolicy(tool *agentAITool, run agentAIRun) (*agentAITool, fu
 	}
 	copied := *tool
 	copied.args = append([]string(nil), tool.args...)
+	if _, _, present := platformProviderEnvProbe(); present {
+		copied.env = append(copied.env, "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1")
+	}
 	flags := []string{"--setting-sources", claudeTierSettingSources(run.claudePolicy.trustTier)}
 	if run.claudePolicy.trustTier == "sanitized" {
 		pluginDir, err := prepareClaudeProjectCapabilityPlugin(run.projectPath)
@@ -98,6 +116,33 @@ func withClaudeRemotePolicy(tool *agentAITool, run agentAIRun) (*agentAITool, fu
 	}
 	copied.args = append(flags, copied.args...)
 	return &copied, cleanup, nil
+}
+
+// promoteIsolatedTierForPlatformFallback 平台通道（env 注入的
+// ANTHROPIC_BASE_URL/AUTH_TOKEN）缺失且档位为 isolated 时，自动升为
+// sanitized 让用户 settings.json 提供上游——否则 claude 没有任何 provider，
+// 直接 "Not logged in" 秒败（2026-10-13 产品决策 A「仅兜底式」）。
+//
+// 必须在 applyClaudeTierVersionGuard 之前调用：claude<2.2.0 的 fail-closed
+// 版本守卫要对提升后的档位继续行使职权（提升不得撤销守卫的降级——否则
+// 2.1.x 上用户 ask 规则会压死审批桥，评审 2026-10-13 实验复现）。notice 里的
+// requested 保留原档位，升级事实经 policy_notice 对服务端/手机可见。
+func promoteIsolatedTierForPlatformFallback(policy agentAIClaudeRemotePolicy, sessionID string) agentAIClaudeRemotePolicy {
+	if !policy.enabled || policy.trustTier != "isolated" {
+		return policy
+	}
+	if _, _, present := platformProviderEnvProbe(); present {
+		return policy
+	}
+	promoted := policy
+	promoted.trustTier = "sanitized"
+	promoted.policyNotice = map[string]interface{}{
+		"effective": "sanitized",
+		"requested": policy.trustTier,
+		"reason":    "platform_provider_missing",
+	}
+	logger.Info(fmt.Sprintf("claude-policy: platform provider env missing, promoting isolated->sanitized (user settings.json provides upstream) session=%s", sessionID))
+	return promoted
 }
 
 // claudeTierMCPArgs builds --strict-mcp-config/--mcp-config flags for the
