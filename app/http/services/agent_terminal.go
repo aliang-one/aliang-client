@@ -335,7 +335,14 @@ func (m *agentTerminalManager) attachLive(sessionID string, rows, cols int, atta
 		return false
 	}
 	if session.resizer != nil {
-		_ = session.resizer(rows, cols)
+		// re-attach 的几何以本次 attach 为准:成功后写回记录几何,后续同值
+		// resize 才能被去重(2026-10-13 P0-B)。
+		if err := session.resizer(rows, cols); err == nil {
+			m.mu.Lock()
+			session.rows = rows
+			session.cols = cols
+			m.mu.Unlock()
+		}
 	}
 	m.sendReplay(sessionID, session.ring, terminalReplayStatusLive, &session.outputGate, attachToken, writeJSON)
 	_ = writeJSON(map[string]interface{}{
@@ -483,20 +490,36 @@ func (m *agentTerminalManager) resize(msg map[string]interface{}, writeJSON agen
 
 	cols := normalizeTerminalDimension(remoteInt(msg, "cols", 80), 80)
 	rows := normalizeTerminalDimension(remoteInt(msg, "rows", 24), 24)
+	// 同值去重(2026-10-13 卡顿定位 P0-B):server 侧 resize 合并闸之后仍可能
+	// 送来与当前几何一致的 resize(竞态/旧帧);再打 PTY ioctl 就是白送的
+	// SIGWINCH→TUI 全屏重绘放大器。同值只回执,不碰 PTY。
+	m.mu.Lock()
+	unchanged := session.cols == cols && session.rows == rows
+	m.mu.Unlock()
+	ack := func() {
+		_ = writeJSON(map[string]interface{}{
+			"type":       models.AgentEventTerminalResized,
+			"session_id": sessionID,
+			"rows":       rows,
+			"cols":       cols,
+			"pty":        session.isPTY,
+		})
+	}
+	if unchanged {
+		ack()
+		return
+	}
 	if session.resizer != nil {
 		if err := session.resizer(rows, cols); err != nil {
 			_ = writeJSON(agentTerminalErrorPayload(sessionID, err))
 			return
 		}
 	}
-
-	_ = writeJSON(map[string]interface{}{
-		"type":       models.AgentEventTerminalResized,
-		"session_id": sessionID,
-		"rows":       rows,
-		"cols":       cols,
-		"pty":        session.isPTY,
-	})
+	m.mu.Lock()
+	session.rows = rows
+	session.cols = cols
+	m.mu.Unlock()
+	ack()
 }
 
 func (m *agentTerminalManager) close(msg map[string]interface{}, writeJSON agentTerminalWriter) {
