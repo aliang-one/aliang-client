@@ -271,6 +271,8 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	register("/api/agent/ai/approval-hook", h.Agent.HandleAIApprovalHook, http.MethodPost)
 	register("/api/agent/sessions", h.Agent.HandleVibeSessions, http.MethodGet)
 	register("/api/agent/runtime-sessions", h.Agent.HandleRuntimeSessions, http.MethodGet)
+	// {sessionId} 路由用方法前缀模式注册（同 quick-setup combos 约定，避免 ServeMux panic）
+	register("GET /api/agent/terminal/{sessionId}/scrollback", h.Agent.HandleTerminalScrollback, http.MethodGet)
 	register("/api/agent/session", h.Agent.HandleVibeSession, http.MethodGet)
 	register("/api/agent/scan-directories", h.Agent.HandleScanDirectories, http.MethodGet, http.MethodPost)
 	register("/api/docs/tutorials", h.Tutorial.HandleGetTutorial, http.MethodGet)
