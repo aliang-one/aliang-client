@@ -188,6 +188,15 @@ type AgentTerminalRuntime struct {
 	LastActiveAt string `json:"last_active_at"`
 }
 
+type AgentTerminalScrollback struct {
+	SessionID  string `json:"session_id"`
+	Encoding   string `json:"encoding"`
+	Status     string `json:"status"` // "live" | "exited"
+	Data       string `json:"data"`
+	Truncated  bool   `json:"truncated"`
+	CapturedAt string `json:"captured_at"`
+}
+
 type AgentLaunchRequest struct {
 	Tool        string   `json:"tool"`
 	CommandLine string   `json:"command_line"`
