@@ -17,6 +17,9 @@ func TestNormalizeAgentTerminalScrollbackLimit(t *testing.T) {
 	if got := normalizeAgentTerminalScrollbackLimit(1024); got != 1024 {
 		t.Fatalf("normalize(1024) = %d, want 1024", got)
 	}
+	if got := normalizeAgentTerminalScrollbackLimit(agentTerminalScrollbackMaxBytes); got != agentTerminalScrollbackMaxBytes {
+		t.Fatalf("normalize(cap) = %d, want the cap itself %d", got, agentTerminalScrollbackMaxBytes)
+	}
 	if got := normalizeAgentTerminalScrollbackLimit(1 << 30); got != agentTerminalScrollbackMaxBytes {
 		t.Fatalf("normalize(huge) = %d, want cap %d", got, agentTerminalScrollbackMaxBytes)
 	}
@@ -64,7 +67,7 @@ func TestAgentTerminalScrollbackMissing(t *testing.T) {
 
 func TestAgentTerminalScrollbackTruncatesTailAndKeepsUTF8(t *testing.T) {
 	ring := newTerminalRingBuffer(8192)
-	payload := "你好，世界" + strings.Repeat("x", 100)
+	payload := strings.Repeat("你", 40) // 120 bytes of 3-byte runes
 	ring.push([]byte(payload))
 
 	m := newAgentTerminalManager()
@@ -77,8 +80,10 @@ func TestAgentTerminalScrollbackTruncatesTailAndKeepsUTF8(t *testing.T) {
 	if !got.Truncated {
 		t.Fatalf("expected truncated=true, got %+v", got)
 	}
-	if len(got.Data) > 50 {
-		t.Fatalf("data len %d exceeds limit 50", len(got.Data))
+	// The tail-keep cut lands at offset 70 — mid-rune (rune boundaries sit at
+	// 0 mod 3) — so the trim loop must drop the 2 partial bytes: 50-2 == 48.
+	if len(got.Data) != 48 {
+		t.Fatalf("data len %d, want 48 (limit 50 minus 2 partial rune bytes)", len(got.Data))
 	}
 	if !utf8.ValidString(got.Data) {
 		t.Fatalf("data must be valid UTF-8, got %q", got.Data)
@@ -91,12 +96,18 @@ func TestAgentTerminalScrollbackTruncatesTailAndKeepsUTF8(t *testing.T) {
 func TestAgentTerminalScrollbackConcurrentWithOutput(t *testing.T) {
 	m := newAgentTerminalManager()
 	ring := newTerminalRingBuffer(1 << 16)
-	m.sessions["s4"] = &agentTerminalSession{id: "s4", ring: ring}
+	session := &agentTerminalSession{id: "s4", ring: ring}
+	m.sessions["s4"] = session
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		for i := 0; i < 200; i++ {
-			ring.push([]byte("0123456789"))
+			// Mirror the production writer (copy loop): outputGate held
+			// across each ring push, so the snapshot path genuinely
+			// contends the gate instead of racing around it.
+			session.outputGate.Lock()
+			session.ring.push([]byte("0123456789"))
+			session.outputGate.Unlock()
 		}
 	}()
 	for i := 0; i < 50; i++ {

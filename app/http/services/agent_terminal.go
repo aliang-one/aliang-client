@@ -406,8 +406,11 @@ func normalizeAgentTerminalScrollbackLimit(limit int) int {
 // session: the live ring for a running session, or the tombstone ring for an
 // exited one. ok is false when neither exists (unknown or reaped session).
 // Lock order follows the documented one-way rule: m.mu is released BEFORE
-// outputGate is taken for a live session; a tombstone ring has no live
-// writers and is read under m.mu alone.
+// outputGate is taken for a live session. A tombstone ring has no
+// gate-serialized writers — the tombstone reuses the live ring object, so the
+// copy loop's final push can still race this read; the ring's own mutex keeps
+// it memory-safe and the worst case is a snapshot missing the last frame, the
+// same assumption attachHistory already makes.
 func (m *agentTerminalManager) scrollbackSnapshot(sessionID string, maxBytes int) (models.AgentTerminalScrollback, bool) {
 	if m == nil {
 		return models.AgentTerminalScrollback{}, false
@@ -418,6 +421,11 @@ func (m *agentTerminalManager) scrollbackSnapshot(sessionID string, maxBytes int
 	m.mu.Lock()
 	if session := m.sessions[sessionID]; session != nil {
 		m.mu.Unlock()
+		if session.ring == nil {
+			// Ring-less session; sendReplay skips nil rings the same way.
+			// The lookup still succeeds with an empty scrollback.
+			return newAgentTerminalScrollback(sessionID, nil, terminalReplayStatusLive, maxBytes, capturedAt), true
+		}
 		session.outputGate.Lock()
 		data := session.ring.snapshot()
 		session.outputGate.Unlock()
@@ -425,7 +433,10 @@ func (m *agentTerminalManager) scrollbackSnapshot(sessionID string, maxBytes int
 	}
 	tomb := m.history[sessionID]
 	if tomb != nil {
-		data := tomb.ring.snapshot()
+		var data []byte
+		if tomb.ring != nil {
+			data = tomb.ring.snapshot()
+		}
 		m.mu.Unlock()
 		return newAgentTerminalScrollback(sessionID, data, terminalReplayStatusExited, maxBytes, capturedAt), true
 	}
