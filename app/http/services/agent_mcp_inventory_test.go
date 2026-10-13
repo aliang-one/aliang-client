@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"aliang.one/nursorgate/app/http/models"
@@ -328,5 +329,144 @@ func TestAgentMCPServersFromClaudeRawCountCap(t *testing.T) {
 	// 截断保留字典序前 24 个:srv-00..srv-23
 	if out[0].Name != "srv-00" || out[23].Name != "srv-23" {
 		t.Fatalf("cap must keep lexicographically first 24, got %s..%s", out[0].Name, out[23].Name)
+	}
+}
+
+func TestCachedAgentMCPServersInvalidation(t *testing.T) {
+	home := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, ".codex"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(home, ".codex", "config.toml")
+	if err := os.WriteFile(configPath, []byte("[mcp_servers.a]\ncommand = \"x\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	parseCalls := 0
+	parse := func(h string) ([]models.AgentMCPServer, []agentMCPFileStamp) {
+		parseCalls++
+		return codexMCPServerInventoryIn(h)
+	}
+	first := cachedAgentMCPServers(home, "codex", parse)
+	second := cachedAgentMCPServers(home, "codex", parse)
+	if parseCalls != 1 {
+		t.Fatalf("unchanged files must hit cache, parseCalls=%d", parseCalls)
+	}
+	if len(first) != 1 || len(second) != 1 || first[0].Name != "a" {
+		t.Fatalf("cached results wrong: %+v %+v", first, second)
+	}
+	// 文件变更 → 缓存失效重解析
+	if err := os.WriteFile(configPath, []byte("[mcp_servers.b]\ncommand = \"y\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// mtime 粒度问题:确保 mtime 变化
+	future := time.Now().Add(2 * time.Second)
+	if err := os.Chtimes(configPath, future, future); err != nil {
+		t.Fatal(err)
+	}
+	third := cachedAgentMCPServers(home, "codex", parse)
+	if parseCalls != 2 {
+		t.Fatalf("changed file must invalidate cache, parseCalls=%d", parseCalls)
+	}
+	if third[0].Name != "b" {
+		t.Fatalf("fresh parse result wrong: %+v", third)
+	}
+}
+
+func TestAgentMCPServersForDispatch(t *testing.T) {
+	// 非采集对象一律 nil(不触达文件系统)
+	for _, id := range []string{"opencode", "pi", "gemini", "", "  "} {
+		if got := agentMCPServersFor(id); got != nil {
+			t.Fatalf("tool %q must yield nil, got %+v", id, got)
+		}
+	}
+}
+
+// carry-forward(Task 5 评审):锁定 codex 解码语义。
+func TestCodexMCPServerInventoryInDecodeSemantics(t *testing.T) {
+	home := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, ".codex"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// (a) 单条目类型不匹配(args 混入数字)→ 整文件不可解码 → 归零 + stamp 照交
+	//     (codex 自身 serde 强类型同样无法加载,语义对齐)
+	bad := "[mcp_servers.good]\ncommand = \"x\"\n\n[mcp_servers.bad]\ncommand = \"y\"\nargs = [\"--flag\", 42]\n"
+	if err := os.WriteFile(filepath.Join(home, ".codex", "config.toml"), []byte(bad), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, stamps := codexMCPServerInventoryIn(home)
+	if out != nil || len(stamps) != 1 {
+		t.Fatalf("mixed-type args must zero the file but keep stamp, got %+v %+v", out, stamps)
+	}
+	// (b) env 值为数组等非字符串形态 → 容忍,条目正常上报
+	good := "[mcp_servers.k]\ncommand = \"x\"\nenv = { K = [1, 2] }\n"
+	if err := os.WriteFile(filepath.Join(home, ".codex", "config.toml"), []byte(good), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out2, _ := codexMCPServerInventoryIn(home)
+	if len(out2) != 1 || out2[0].Name != "k" {
+		t.Fatalf("tolerant env must keep entry, got %+v", out2)
+	}
+	// (c) 24 上限(codex 侧)
+	var sb strings.Builder
+	for i := 0; i < 30; i++ {
+		fmt.Fprintf(&sb, "[mcp_servers.s%02d]\ncommand = \"c\"\n", i)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".codex", "config.toml"), []byte(sb.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out3, _ := codexMCPServerInventoryIn(home)
+	if len(out3) != 24 || out3[0].Name != "s00" {
+		t.Fatalf("codex cap wrong: %d entries, first=%+v", len(out3), out3[0])
+	}
+}
+
+// carry-forward(Task 4 评审):user-first 溢出时插件条目被外层截断——
+// 验证 claudeMCPServerInventoryIn 的外层 out[:mcpServerMaxCount] 分支:
+// user 恰 24 条合法 + 插件 2 条 → 恰 24 条且全是 user 源。
+func TestClaudeMCPServerInventoryInOuterTruncation(t *testing.T) {
+	home := t.TempDir()
+	var sb strings.Builder
+	sb.WriteString(`{"mcpServers":{`)
+	for i := 0; i < 24; i++ {
+		if i > 0 {
+			sb.WriteString(",")
+		}
+		fmt.Fprintf(&sb, `"a%02d":{"command":"npx"}`, i)
+	}
+	sb.WriteString(`}}`)
+	if err := os.WriteFile(filepath.Join(home, ".claude.json"), []byte(sb.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// 启用一个插件(其 .mcp.json 含 2 个条目)
+	pluginsDir := filepath.Join(home, ".claude", "plugins")
+	if err := os.MkdirAll(pluginsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pluginsDir, "installed_plugins.json"), []byte(`{
+	"plugins":{"capplugin@market":[{"scope":"user","installPath":"`+filepath.Join(home, "plug-cap")+`"}]}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".claude", "settings.json"), []byte(
+		`{"enabledPlugins":{"capplugin@market":true}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(home, "plug-cap"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "plug-cap", ".mcp.json"), []byte(
+		`{"mcpServers":{"cap-one":{"command":"npx"},"cap-two":{"command":"npx"}}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, _ := claudeMCPServerInventoryIn(home)
+	if len(out) != 24 {
+		t.Fatalf("want exactly 24 entries after outer truncation, got %d", len(out))
+	}
+	for _, s := range out {
+		if s.Source != "user" {
+			t.Fatalf("plugin entries must be truncated away by user-first overflow, got %+v", s)
+		}
+	}
+	if out[0].Name != "a00" || out[23].Name != "a23" {
+		t.Fatalf("outer truncation must keep a00..a23, got %s..%s", out[0].Name, out[23].Name)
 	}
 }

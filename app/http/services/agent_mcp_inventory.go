@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/BurntSushi/toml"
@@ -214,7 +215,10 @@ type codexConfigFile struct {
 
 // codexMCPServerInventoryIn 采集 ~/.codex/config.toml 的 MCP 清单。
 // command(+args)→ stdio;url → 统一归类 http(codex 配置不区分 sse/http);
-// 两者皆无的条目丢弃;畸形 TOML fail-soft 返回 nil。
+// 两者皆无的条目丢弃;url 与 command 并存时 url 优先(报 http);
+// 单条目类型不匹配(如 args 混入数字)会使整文件不可解码→归零——
+// codex 自身(serde 强类型)同样无法加载此类配置,语义对齐;
+// 畸形 TOML fail-soft 返回 nil。
 // 两态契约与 claude 侧一致:stamps 恒非 nil(缺文件/空清单也照交指纹),
 // 否则缓存会把空清单永久缓存,「配置后来出现」永远感知不到。
 func codexMCPServerInventoryIn(home string) ([]models.AgentMCPServer, []agentMCPFileStamp) {
@@ -266,4 +270,63 @@ func codexMCPServerInventoryIn(home string) ([]models.AgentMCPServer, []agentMCP
 		return nil, []agentMCPFileStamp{stamp}
 	}
 	return out, []agentMCPFileStamp{stamp}
+}
+
+// agentMCPInventoryCacheEntry 是单个「home+toolID」槽的缓存条目:
+// 上次解析的文件指纹 + 解析结果。
+type agentMCPInventoryCacheEntry struct {
+	stamps []agentMCPFileStamp
+	result []models.AgentMCPServer
+}
+
+var (
+	agentMCPInventoryMu     sync.Mutex
+	agentMCPInventoryByHome = map[string]map[string]agentMCPInventoryCacheEntry{} // home -> toolID -> entry
+)
+
+// agentMCPStampsUnchanged 对 stamp 清单逐项重 stat;任一指纹变化(出现/
+// 消失/mtime/size)即失效。复合源(claude 多文件)任一变更都会触发重解析。
+func agentMCPStampsUnchanged(stamps []agentMCPFileStamp) bool {
+	for _, s := range stamps {
+		if stampAgentMCPFile(s.path) != s {
+			return false
+		}
+	}
+	return true
+}
+
+// cachedAgentMCPServers 以「home+toolID」为槽缓存解析结果;命中时返回副本
+// (防调用方改写缓存)。parse 只在缓存失效时被调。
+func cachedAgentMCPServers(home, toolID string, parse func(home string) ([]models.AgentMCPServer, []agentMCPFileStamp)) []models.AgentMCPServer {
+	agentMCPInventoryMu.Lock()
+	defer agentMCPInventoryMu.Unlock()
+	byTool := agentMCPInventoryByHome[home]
+	if byTool == nil {
+		byTool = map[string]agentMCPInventoryCacheEntry{}
+		agentMCPInventoryByHome[home] = byTool
+	}
+	entry, ok := byTool[toolID]
+	if ok && agentMCPStampsUnchanged(entry.stamps) {
+		return append([]models.AgentMCPServer(nil), entry.result...)
+	}
+	result, stamps := parse(home)
+	byTool[toolID] = agentMCPInventoryCacheEntry{stamps: stamps, result: result}
+	return append([]models.AgentMCPServer(nil), result...)
+}
+
+// agentMCPServersFor 是 detectAgentToolsWith 的 MCP 采集入口:仅 claude/
+// claudecode/codex 采集(其余 CLI 返回 nil);agentHome 不可得返回 nil。
+func agentMCPServersFor(toolID string) []models.AgentMCPServer {
+	home := agentHome()
+	if home == "" {
+		return nil
+	}
+	switch strings.ToLower(strings.TrimSpace(toolID)) {
+	case "claude", "claudecode":
+		return cachedAgentMCPServers(home, "claude", claudeMCPServerInventoryIn)
+	case "codex":
+		return cachedAgentMCPServers(home, "codex", codexMCPServerInventoryIn)
+	default:
+		return nil
+	}
 }
