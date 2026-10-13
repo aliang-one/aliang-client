@@ -7,7 +7,10 @@ import (
 
 // agentToolRegistryRev bumps whenever the tool set changes so the server can
 // detect drift via the heartbeat rev and re-pull tools.list.
-const agentToolRegistryRev = 1
+// rev 2: read_file 描述符改说真话(移除无实现的 "may be refused" 声明,如实
+// 标注 operator policy 的无围栏语义)——描述符内容变了,服务端须靠 rev 漂移
+// 重拉 tools.list。
+const agentToolRegistryRev = 2
 
 // buildAgentToolRegistry is THE single source of truth for remotely-invokable
 // read-only tools. Legacy four first (events unchanged = old-server compat);
@@ -39,7 +42,8 @@ func buildAgentToolRegistry() *tools.Registry {
 			ID:    "read_file",
 			Event: models.AgentEventFileRead,
 			Description: "Read a text file (relative to the project path). Binary files " +
-				"return base64. Sensitive or secret-bearing files may be refused.",
+				"return base64. Paths are not confined: any file the agent OS user " +
+				"can read may be returned (operator policy).",
 			Parameters: map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
