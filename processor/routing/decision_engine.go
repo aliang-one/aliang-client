@@ -230,6 +230,7 @@ func matchIP(cidr, ip string) bool {
 	return match.MatchIPCond(cidr, ip)
 }
 
+// 本 seam 为包级 var，非并行安全：测试子串行执行，勿在覆盖它的测试里加 t.Parallel。
 // geoipLookup 可被测试替换；默认委托 processor/geoip 单例
 // （服务未启用/未加载时返回错误 → 不命中，热路径零日志）。
 var geoipLookup = func(ip net.IP) (string, error) {

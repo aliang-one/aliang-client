@@ -49,4 +49,10 @@ func TestMatchGeoIP(t *testing.T) {
 			t.Fatal("expected miss on empty/invalid inputs")
 		}
 	})
+	t.Run("plus-only-condition", func(t *testing.T) {
+		geoipLookup = func(ip net.IP) (string, error) { return "CN", nil }
+		if matchGeoIP("+", "1.2.3.4") || matchGeoIP(",", "1.2.3.4") {
+			t.Fatal("expected miss for separator-only conditions")
+		}
+	})
 }
