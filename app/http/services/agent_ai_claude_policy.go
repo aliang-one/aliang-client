@@ -147,6 +147,8 @@ func promoteIsolatedTierForPlatformFallback(policy agentAIClaudeRemotePolicy, se
 
 // readMCPServersFile 读一个 claude 形态 {"mcpServers":{...}} JSON 文件并入
 // dst。文件缺失/不可读静默容忍;解析失败记日志且仅跳过该源(容忍,不降级)。
+// 返回非 nil error 时 dst 保持不变(错误路径在合并前返回);文件缺失是常态,
+// 调用方应忽略此 error(参见 claudeTierMCPArgs 两处调用)。
 // 原 claudeTierMCPArgs 内闭包,收编为包级以便 MCP 清单采集复用同一数据源。
 func readMCPServersFile(path string, dst map[string]interface{}) error {
 	raw, err := os.ReadFile(path)
@@ -215,14 +217,14 @@ func claudeTierMCPArgs(policy agentAIClaudeRemotePolicy, projectPath string) ([]
 	return []string{"--strict-mcp-config", "--mcp-config", tmp.Name()}, cleanup, nil
 }
 
-// claudeEnabledPlugins reads the "enabledPlugins" map from
-// <agentHome>/.claude/settings.json. A missing file, a missing key, a
-// non-object value, or a parse error all yield an empty map — every plugin
-// disabled (fail-closed, matching readPluginMCPServers's tolerance posture:
-// load fewer, never more). Only an absent file stays silent; a file that
-// exists but cannot be parsed is logged like other tolerated sources.
-func claudeEnabledPlugins() map[string]interface{} {
-	home := agentHome()
+// claudeEnabledPluginsIn 同 claudeEnabledPlugins,但 home 由调用方给定
+// (MCP 清单采集的可测试入口);所有读取以传入 home 为根,不回落 agentHome()。
+// A missing file, a missing key, a non-object value, or a parse error all
+// yield an empty map — every plugin disabled (fail-closed, matching
+// readPluginMCPServers's tolerance posture: load fewer, never more). Only an
+// absent file stays silent; a file that exists but cannot be parsed is logged
+// like other tolerated sources.
+func claudeEnabledPluginsIn(home string) map[string]interface{} {
 	if home == "" {
 		return nil
 	}
@@ -240,6 +242,12 @@ func claudeEnabledPlugins() map[string]interface{} {
 	return enabled
 }
 
+// claudeEnabledPlugins reads the "enabledPlugins" map from
+// <agentHome>/.claude/settings.json.
+func claudeEnabledPlugins() map[string]interface{} {
+	return claudeEnabledPluginsIn(agentHome())
+}
+
 // claudePluginEnabled reports whether enabledPlugins marks a plugin key
 // enabled: only an explicit true counts (spec §9.9 — load fewer, never more;
 // installed-but-unlisted plugins are treated as disabled).
@@ -252,43 +260,42 @@ func claudePluginEnabled(enabledPlugins map[string]interface{}, key string) bool
 	return ok && enabled
 }
 
-// readPluginMCPServers adds MCP servers declared by user-scope plugins
-// (installed_plugins.json → <installPath>/.mcp.json) into dst under claude's
-// native composite names ("plugin:<plugin>:<server>"), so strict-mode merged
-// configs keep plugin servers that --strict-mcp-config would otherwise
-// suppress (spec §9.9). Only plugins explicitly enabled in
-// ~/.claude/settings.json "enabledPlugins" ("<plugin>@<market>": true) are
-// merged — a missing key, false, or any other value means DISABLED, so an
-// installed-but-unlisted plugin is treated as off (fail-closed: load fewer,
-// never more, mirroring native claude's own gate). Plugin declarations come
-// in two shapes — the wrapped {"mcpServers":{...}} and the flat
-// {"<server>":{...}} — both are handled. Read/parse failures are logged and
-// skipped (tolerate, never degrade).
-// Returns the number of servers added.
-func readPluginMCPServers(dst map[string]interface{}) int {
-	home := agentHome()
+// claudePluginInstall 是一个已启用 user scope 插件安装项。
+type claudePluginInstall struct {
+	key         string // "<plugin>@<market>"
+	pluginName  string
+	installPath string
+}
+
+// enabledUserScopePluginInstallsIn 按 <home> 下 installed_plugins.json(键
+// 排序)× settings.json enabledPlugins 显式启用,枚举 user scope 安装项。
+// 所有读取以传入 home 为根(可测试,不回落 agentHome());容忍姿态与
+// readPluginMCPServers 一致:注册表缺失/畸形返回 nil(无事发生)。逐项门槛:
+// 仅 enabledPlugins 显式 true 的插件入选,非 user scope/缺 installPath 的
+// 安装项跳过(fail-closed:load fewer, never more)。
+func enabledUserScopePluginInstallsIn(home string) []claudePluginInstall {
 	if home == "" {
-		return 0
+		return nil
 	}
 	registryPath := filepath.Join(home, ".claude", "plugins", "installed_plugins.json")
 	raw, err := os.ReadFile(registryPath)
 	if err != nil {
-		return 0 // no plugin registry: nothing installed (silent no-op)
+		return nil // no plugin registry: nothing installed (silent no-op)
 	}
 	var registry struct {
 		Plugins map[string][]map[string]interface{} `json:"plugins"`
 	}
 	if err := json.Unmarshal(raw, &registry); err != nil {
 		logger.Warn(fmt.Sprintf("claude-policy: unparseable plugin registry %s: %v", registryPath, err))
-		return 0
+		return nil
 	}
-	enabledPlugins := claudeEnabledPlugins()
+	enabledPlugins := claudeEnabledPluginsIn(home)
 	pluginKeys := make([]string, 0, len(registry.Plugins))
 	for key := range registry.Plugins {
 		pluginKeys = append(pluginKeys, key)
 	}
 	sort.Strings(pluginKeys) // deterministic merged output
-	added := 0
+	var installs []claudePluginInstall
 	for _, key := range pluginKeys {
 		if !claudePluginEnabled(enabledPlugins, key) {
 			continue
@@ -305,8 +312,34 @@ func readPluginMCPServers(dst map[string]interface{}) int {
 			if scope != "user" || installPath == "" {
 				continue
 			}
-			added += readPluginMCPDeclaration(installPath, pluginName, dst)
+			installs = append(installs, claudePluginInstall{key: key, pluginName: pluginName, installPath: installPath})
 		}
+	}
+	return installs
+}
+
+// enabledUserScopePluginInstalls 是无参包装(readPluginMCPServers 消费)。
+func enabledUserScopePluginInstalls() []claudePluginInstall {
+	return enabledUserScopePluginInstallsIn(agentHome())
+}
+
+// readPluginMCPServers adds MCP servers declared by user-scope plugins
+// (installed_plugins.json → <installPath>/.mcp.json) into dst under claude's
+// native composite names ("plugin:<plugin>:<server>"), so strict-mode merged
+// configs keep plugin servers that --strict-mcp-config would otherwise
+// suppress (spec §9.9). Only plugins explicitly enabled in
+// ~/.claude/settings.json "enabledPlugins" ("<plugin>@<market>": true) are
+// merged — a missing key, false, or any other value means DISABLED, so an
+// installed-but-unlisted plugin is treated as off (fail-closed: load fewer,
+// never more, mirroring native claude's own gate). Plugin declarations come
+// in two shapes — the wrapped {"mcpServers":{...}} and the flat
+// {"<server>":{...}} — both are handled. Read/parse failures are logged and
+// skipped (tolerate, never degrade).
+// Returns the number of servers added.
+func readPluginMCPServers(dst map[string]interface{}) int {
+	added := 0
+	for _, inst := range enabledUserScopePluginInstalls() {
+		added += readPluginMCPDeclaration(inst.installPath, inst.pluginName, dst)
 	}
 	return added
 }

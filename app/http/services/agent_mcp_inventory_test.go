@@ -2,6 +2,8 @@ package services
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -121,5 +123,107 @@ func TestTruncateMCPName(t *testing.T) {
 	}
 	if !utf8.ValidString(name) {
 		t.Fatalf("truncated name must be valid utf8: %q", name)
+	}
+	// 上限必须真实触发:70 个「中」恰好截到 64 runes,仍为有效 UTF-8
+	long := truncateMCPName(strings.Repeat("中", 70))
+	if n := utf8.RuneCountInString(long); n != 64 {
+		t.Fatalf("name must be capped at exactly 64 runes, got %d", n)
+	}
+	if !utf8.ValidString(long) {
+		t.Fatalf("truncated name must be valid utf8: %q", long)
+	}
+}
+
+func TestAgentMCPServersFromClaudeRaw(t *testing.T) {
+	raw := map[string]interface{}{
+		"b-http": map[string]interface{}{"type": "http", "url": "https://x.example/mcp?token=" + strings.Repeat("t", 30)},
+		"a-stdio": map[string]interface{}{
+			"type":    "stdio",
+			"command": "uvx",
+			"args":    []interface{}{"--from", "git+https://example/serena", strings.Repeat("s", 40)},
+		},
+		"no-cmd":  map[string]interface{}{"type": "stdio"},
+		"weird":   map[string]interface{}{"type": "websocket", "url": "wss://x"},
+		"not-map": "oops",
+	}
+	out := agentMCPServersFromClaudeRaw(raw, "user")
+	if len(out) != 2 {
+		t.Fatalf("want 2 valid entries (sorted a-stdio,b-http), got %d: %+v", len(out), out)
+	}
+	// 名字按字典序,保证输出确定
+	if out[0].Name != "a-stdio" || out[1].Name != "b-http" {
+		t.Fatalf("want sorted names, got %+v", out)
+	}
+	if out[0].Transport != "stdio" || !strings.HasPrefix(out[0].Command, "uvx --from") {
+		t.Fatalf("stdio entry wrong: %+v", out[0])
+	}
+	if strings.Contains(out[0].Command, strings.Repeat("s", 40)) {
+		t.Fatalf("long arg token must be redacted: %q", out[0].Command)
+	}
+	if out[1].Transport != "http" || !strings.HasPrefix(out[1].URL, "https://x.example/mcp") {
+		t.Fatalf("http entry wrong: %+v", out[1])
+	}
+	if strings.Contains(out[1].URL, strings.Repeat("t", 30)) {
+		t.Fatalf("url query must be redacted: %q", out[1].URL)
+	}
+	for _, s := range out {
+		if s.Source != "user" {
+			t.Fatalf("source tag wrong: %+v", s)
+		}
+	}
+}
+
+func TestClaudeMCPServerInventoryIn(t *testing.T) {
+	home := t.TempDir()
+	if err := os.WriteFile(filepath.Join(home, ".claude.json"), []byte(
+		`{"mcpServers":{"context7":{"type":"http","url":"https://mcp.context7/mcp"}}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// 启用一个插件 + 禁用一个插件(装了但 enabledPlugins 没开 → 不采)
+	pluginsDir := filepath.Join(home, ".claude", "plugins")
+	if err := os.MkdirAll(pluginsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pluginsDir, "installed_plugins.json"), []byte(`{
+		"plugins":{"superplugin@market":[{"scope":"user","installPath":"`+filepath.Join(home, "plug-super")+`"}],
+		           "sleepyplugin@market":[{"scope":"user","installPath":"`+filepath.Join(home, "plug-sleepy")+`"}]}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".claude", "settings.json"), []byte(
+		`{"enabledPlugins":{"superplugin@market":true}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for dir, body := range map[string]string{
+		"plug-super":  `{"mcpServers":{"super-srv":{"command":"npx","args":["-y","super-mcp"]}}}`,
+		"plug-sleepy": `{"mcpServers":{"sleepy-srv":{"command":"npx","args":["sleepy"]}}}`,
+	} {
+		if err := os.MkdirAll(filepath.Join(home, dir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(home, dir, ".mcp.json"), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	out, stamps := claudeMCPServerInventoryIn(home)
+	if len(out) != 2 {
+		t.Fatalf("want user context7 + plugin super-srv, got %+v", out)
+	}
+	if out[0].Name != "context7" || out[0].Source != "user" {
+		t.Fatalf("user entry wrong: %+v", out[0])
+	}
+	if out[1].Name != "plugin:superplugin:super-srv" || out[1].Source != "plugin" {
+		t.Fatalf("plugin entry wrong: %+v", out[1])
+	}
+	// stamps 必须覆盖全部被读文件:settings/registry/claude.json + 已启用插件 .mcp.json
+	if len(stamps) != 4 {
+		t.Fatalf("want 4 stamps (claude.json+settings+registry+enabled plugin decl), got %d", len(stamps))
+	}
+}
+
+func TestClaudeMCPServerInventoryInMissingHome(t *testing.T) {
+	out, _ := claudeMCPServerInventoryIn(filepath.Join(t.TempDir(), "nonexistent"))
+	if out != nil {
+		t.Fatalf("empty home must yield nil, got %+v", out)
 	}
 }

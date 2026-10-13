@@ -8,7 +8,13 @@ package services
 import (
 	"fmt"
 	"net/url"
+	"os"
+	"path/filepath"
+	"sort"
 	"strings"
+	"time"
+
+	"aliang.one/nursorgate/app/http/models"
 )
 
 const (
@@ -69,4 +75,119 @@ func redactMCPURL(raw string) string {
 // truncateMCPName 把 MCP 服务器名称截到 64 字符(rune 安全,复用 truncateAgentText)。
 func truncateMCPName(name string) string {
 	return truncateAgentText(name, mcpNameMaxLen)
+}
+
+// agentMCPServersFromClaudeRaw 把 claude 形态的原始 mcpServers 条目转成
+// 脱敏摘要。名字按字典序输出(确定性);非法/缺字段的条目逐条丢弃;
+// 未知 transport 丢弃(fail-closed);数量截 mcpServerMaxCount。
+func agentMCPServersFromClaudeRaw(named map[string]interface{}, source string) []models.AgentMCPServer {
+	names := make([]string, 0, len(named))
+	for name := range named {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	out := make([]models.AgentMCPServer, 0, len(names))
+	for _, name := range names {
+		if len(out) >= mcpServerMaxCount {
+			break
+		}
+		v, ok := named[name].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		nm := truncateMCPName(name)
+		if nm == "" {
+			continue // 全空白长名经 TrimSpace 截断后为空:跳过(服务端 schema min(1) 会拒掉整个条目)
+		}
+		typ, _ := v["type"].(string)
+		if typ == "" {
+			typ = "stdio"
+		}
+		switch typ {
+		case "stdio":
+			command, _ := v["command"].(string)
+			if command == "" {
+				continue
+			}
+			argv := []string{command}
+			if rawArgs, ok := v["args"].([]interface{}); ok {
+				for _, a := range rawArgs {
+					if s, ok := a.(string); ok {
+						argv = append(argv, s)
+					}
+				}
+			}
+			out = append(out, models.AgentMCPServer{
+				Name: nm, Transport: "stdio",
+				Command: redactMCPCommand(argv), Source: source,
+			})
+		case "http", "sse":
+			u, _ := v["url"].(string)
+			if u == "" {
+				continue
+			}
+			out = append(out, models.AgentMCPServer{
+				Name: nm, Transport: typ,
+				URL: redactMCPURL(u), Source: source,
+			})
+		default:
+			continue // 未知 transport:宁可少报(fail-closed)
+		}
+	}
+	return out
+}
+
+// agentMCPFileStamp 是缓存失效判定的文件指纹。零值 comparable,直接 == 比较。
+// (Task 6 将在其上扩展清单缓存;此处先落地最小形态。)
+type agentMCPFileStamp struct {
+	path    string
+	exists  bool
+	modTime time.Time
+	size    int64
+}
+
+// stampAgentMCPFile 采集单个文件的指纹;缺失文件的 stamp 仅含 path(exists=false)。
+func stampAgentMCPFile(path string) agentMCPFileStamp {
+	if st, err := os.Stat(path); err == nil {
+		return agentMCPFileStamp{path: path, exists: true, modTime: st.ModTime(), size: st.Size()}
+	}
+	return agentMCPFileStamp{path: path}
+}
+
+// claudeMCPServerInventoryIn 采集 <home> 下的 Claude 设备级 MCP 清单:
+// <home>/.claude.json 顶层 mcpServers(source=user)+ 已启用插件 MCP
+// (source=plugin)。项目级 .mcp.json 不采集(随 cwd 变化,非设备能力)。
+// 所有读取以传入 home 为根,不回落 agentHome()。返回值同时给出本次实际
+// 读取的全部文件 stamp(供缓存失效判定——复合源任一变更即失效)。
+func claudeMCPServerInventoryIn(home string) ([]models.AgentMCPServer, []agentMCPFileStamp) {
+	claudeJSON := filepath.Join(home, ".claude.json")
+	settingsJSON := filepath.Join(home, ".claude", "settings.json")
+	registryJSON := filepath.Join(home, ".claude", "plugins", "installed_plugins.json")
+	if _, err := os.Stat(claudeJSON); err != nil {
+		if _, err2 := os.Stat(registryJSON); err2 != nil {
+			return nil, nil // 无任何 claude 配置:无事发生
+		}
+	}
+	stamps := []agentMCPFileStamp{
+		stampAgentMCPFile(claudeJSON),
+		stampAgentMCPFile(settingsJSON),
+		stampAgentMCPFile(registryJSON),
+	}
+	userRaw := map[string]interface{}{}
+	_ = readMCPServersFile(claudeJSON, userRaw)
+	pluginRaw := map[string]interface{}{}
+	for _, inst := range enabledUserScopePluginInstallsIn(home) {
+		declPath := filepath.Join(inst.installPath, ".mcp.json")
+		stamps = append(stamps, stampAgentMCPFile(declPath))
+		readPluginMCPDeclaration(inst.installPath, inst.pluginName, pluginRaw)
+	}
+	out := agentMCPServersFromClaudeRaw(userRaw, "user")
+	out = append(out, agentMCPServersFromClaudeRaw(pluginRaw, "plugin")...)
+	if len(out) > mcpServerMaxCount {
+		out = out[:mcpServerMaxCount]
+	}
+	if len(out) == 0 {
+		return nil, stamps
+	}
+	return out, stamps
 }
