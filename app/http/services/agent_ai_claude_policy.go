@@ -145,6 +145,27 @@ func promoteIsolatedTierForPlatformFallback(policy agentAIClaudeRemotePolicy, se
 	return promoted
 }
 
+// readMCPServersFile 读一个 claude 形态 {"mcpServers":{...}} JSON 文件并入
+// dst。文件缺失/不可读静默容忍;解析失败记日志且仅跳过该源(容忍,不降级)。
+// 原 claudeTierMCPArgs 内闭包,收编为包级以便 MCP 清单采集复用同一数据源。
+func readMCPServersFile(path string, dst map[string]interface{}) error {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return err // absent/unreadable source is tolerated silently
+	}
+	var parsed struct {
+		MCPServers map[string]interface{} `json:"mcpServers"`
+	}
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		logger.Warn(fmt.Sprintf("claude-policy: unparseable MCP source %s: %v", path, err))
+		return err // tolerate, don't degrade: skip this source only
+	}
+	for name, server := range parsed.MCPServers {
+		dst[name] = server
+	}
+	return nil
+}
+
 // claudeTierMCPArgs builds --strict-mcp-config/--mcp-config flags for the
 // sanitized tier when the server marked the project MCP trusted (spec §5):
 // user-scope servers (top-level "mcpServers" in <agentHome>/.claude.json —
@@ -163,29 +184,12 @@ func claudeTierMCPArgs(policy agentAIClaudeRemotePolicy, projectPath string) ([]
 		return nil, func() {}, nil
 	}
 	merged := map[string]interface{}{}
-	readMCPServers := func(path string, dst map[string]interface{}) error {
-		raw, err := os.ReadFile(path)
-		if err != nil {
-			return err // absent/unreadable source is tolerated silently
-		}
-		var parsed struct {
-			MCPServers map[string]interface{} `json:"mcpServers"`
-		}
-		if err := json.Unmarshal(raw, &parsed); err != nil {
-			logger.Warn(fmt.Sprintf("claude-policy: unparseable MCP source %s: %v", path, err))
-			return err // tolerate, don't degrade: skip this source only
-		}
-		for name, server := range parsed.MCPServers {
-			dst[name] = server
-		}
-		return nil
-	}
 	if home := agentHome(); home != "" {
-		readMCPServers(filepath.Join(home, ".claude.json"), merged)
+		readMCPServersFile(filepath.Join(home, ".claude.json"), merged)
 	}
 	readPluginMCPServers(merged)
 	beforeProject := len(merged)
-	readMCPServers(filepath.Join(projectPath, ".mcp.json"), merged)
+	readMCPServersFile(filepath.Join(projectPath, ".mcp.json"), merged)
 	projectCount := len(merged) - beforeProject
 	if projectCount == 0 {
 		return nil, func() {}, nil
