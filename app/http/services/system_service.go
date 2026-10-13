@@ -49,9 +49,14 @@ func (s *SystemServiceService) GetStatus() (SystemServiceStatus, error) {
 		return meta, nil
 	}
 
-	status, err := setup.GetServiceStatus(meta.ServiceName, true)
+	status, scope, err := s.detectInstalledStatus()
 	if err != nil {
-		return meta, fmt.Errorf("failed to inspect system service status: %w", err)
+		return meta, err
+	}
+	if scope == serviceScopeNone {
+		meta.InstallScope = s.defaultInstallScope(meta.HasPrivileges)
+	} else {
+		meta.InstallScope = scope
 	}
 
 	meta.Installed = status.IsInstalled
@@ -59,16 +64,98 @@ func (s *SystemServiceService) GetStatus() (SystemServiceStatus, error) {
 	meta.Status = status.Status
 	meta.PID = status.PID
 
+	scopeLabel := systemServiceScopeLabel(meta.InstallScope)
 	if !meta.Installed {
 		meta.Message = fmt.Sprintf("%s is not registered yet.", meta.DisplayName)
 	} else if meta.Running {
-		meta.Message = fmt.Sprintf("%s is installed and currently running.", meta.DisplayName)
+		meta.Message = fmt.Sprintf("%s (%s) is installed and currently running.", meta.DisplayName, scopeLabel)
 	} else {
-		meta.Message = fmt.Sprintf("%s is installed but not running.", meta.DisplayName)
+		meta.Message = fmt.Sprintf("%s (%s) is installed but not running.", meta.DisplayName, scopeLabel)
+	}
+
+	if meta.Installed && meta.InstallScope == serviceScopeSystem && !meta.HasPrivileges {
+		meta.Warning = appendSystemServiceWarning(meta.Warning,
+			"Administrator privileges are required to modify this system-wide service; register a user-level service instead if you do not have root access.")
 	}
 
 	applyMacOSTrayCompanionAdvisory(&meta)
 	return meta, nil
+}
+
+// Service scopes reported through SystemServiceStatus.InstallScope.
+const (
+	serviceScopeSystem = "system"
+	serviceScopeUser   = "user"
+	serviceScopeNone   = "none"
+)
+
+// userScopeServiceSupported reports whether the platform supports user-level
+// (non-root) service registration. Only Linux systemd user units are wired up;
+// Windows SCM and macOS LaunchDaemons always require administrator privileges.
+func userScopeServiceSupported() bool {
+	return runtime.GOOS == "linux"
+}
+
+// chooseReportedScope decides which registered scope the status report should
+// describe: system-level wins when both scopes are registered.
+func chooseReportedScope(systemInstalled bool, userInstalled bool) string {
+	switch {
+	case systemInstalled:
+		return serviceScopeSystem
+	case userInstalled:
+		return serviceScopeUser
+	default:
+		return serviceScopeNone
+	}
+}
+
+// defaultInstallScope returns the scope a subsequent install would target when
+// nothing is registered yet.
+func (s *SystemServiceService) defaultInstallScope(hasPrivileges bool) string {
+	if hasPrivileges || !userScopeServiceSupported() {
+		return serviceScopeSystem
+	}
+	return serviceScopeUser
+}
+
+func systemServiceScopeLabel(scope string) string {
+	switch scope {
+	case serviceScopeUser:
+		return "user-level"
+	case serviceScopeNone:
+		return "not registered"
+	default:
+		return "system-wide"
+	}
+}
+
+// detectInstalledStatus probes the registered scopes (system first, then
+// user-level where supported) and returns the hit status together with its
+// scope. When neither scope is registered the system-level probe result is
+// returned with serviceScopeNone.
+func (s *SystemServiceService) detectInstalledStatus() (*setup.ServiceStatus, string, error) {
+	name := setup.GetServiceName()
+
+	systemStatus, err := setup.GetServiceStatus(name, true)
+	if err != nil {
+		return nil, serviceScopeNone, fmt.Errorf("failed to inspect system service status: %w", err)
+	}
+
+	var userStatus *setup.ServiceStatus
+	if userScopeServiceSupported() {
+		status, userErr := setup.GetServiceStatus(name, false)
+		if userErr != nil {
+			return nil, serviceScopeNone, fmt.Errorf("failed to inspect user-level service status: %w", userErr)
+		}
+		userStatus = status
+	}
+	userInstalled := userStatus != nil && userStatus.IsInstalled
+
+	scope := chooseReportedScope(systemStatus.IsInstalled, userInstalled)
+	if scope == serviceScopeUser {
+		return userStatus, scope, nil
+	}
+	return systemStatus, scope, nil
 }
 
 func (s *SystemServiceService) Install() (SystemServiceStatus, error) {
@@ -78,16 +165,37 @@ func (s *SystemServiceService) Install() (SystemServiceStatus, error) {
 		meta.Message = "System service registration is not supported on this platform."
 		return meta, nil
 	}
-	if !meta.HasPrivileges {
+
+	// 无特权且平台支持用户级注册时降级为用户级安装(Linux systemd user unit),
+	// 其余平台保持原行为:系统级注册必须管理员特权。
+	useUserScope := !meta.HasPrivileges && userScopeServiceSupported()
+	if useUserScope && setup.IsServiceInstalled(meta.ServiceName, true) {
+		// 系统级注册已存在且无特权:既不能覆盖它,也不应再注册一个用户级影子服务
 		return meta, setup.ErrNotRoot
 	}
 
-	options, err := buildSystemServiceInstallOptions()
+	var options setup.InstallOptions
+	var err error
+	if useUserScope {
+		configPath, _ := resolveSystemServiceConfigPath()
+		options, err = BuildCLIServiceInstallOptions(configPath, false)
+	} else {
+		if !meta.HasPrivileges {
+			return meta, setup.ErrNotRoot
+		}
+		options, err = buildSystemServiceInstallOptions()
+	}
 	if err != nil {
 		return meta, err
 	}
 
-	if setup.IsServiceInstalled(options.Name, true) {
+	if useUserScope {
+		if setup.IsServiceInstalled(options.Name, false) {
+			if err := setup.UninstallService(options.Name, false); err != nil {
+				return meta, fmt.Errorf("failed to uninstall existing user-level service before reinstall: %w", err)
+			}
+		}
+	} else if setup.IsServiceInstalled(options.Name, true) {
 		if err := setup.UninstallService(options.Name, true); err != nil {
 			return meta, fmt.Errorf("failed to uninstall existing service before reinstall: %w", err)
 		}
@@ -100,7 +208,7 @@ func (s *SystemServiceService) Install() (SystemServiceStatus, error) {
 		return meta, err
 	}
 
-	if runtime.GOOS == "darwin" {
+	if runtime.GOOS == "darwin" && !useUserScope {
 		if err := setup.InstallMacOSTrayAgent(options.ExecutablePath); err != nil {
 			meta.Warning = appendSystemServiceWarning(meta.Warning, fmt.Sprintf("System service was registered, but the macOS menu bar companion could not be installed: %v", err))
 		}
@@ -111,7 +219,7 @@ func (s *SystemServiceService) Install() (SystemServiceStatus, error) {
 		return meta, statusErr
 	}
 	status.Message = fmt.Sprintf("%s was registered successfully.", status.DisplayName)
-	if runtime.GOOS == "darwin" && status.Warning == "" {
+	if runtime.GOOS == "darwin" && !useUserScope && status.Warning == "" {
 		status.Message = fmt.Sprintf("%s was registered successfully. The macOS menu bar companion is configured and should show its icon in your login session.", status.DisplayName)
 	}
 	if meta.Warning != "" {
@@ -127,25 +235,40 @@ func (s *SystemServiceService) Uninstall() (SystemServiceStatus, error) {
 		meta.Message = "System service registration is not supported on this platform."
 		return meta, nil
 	}
-	if !meta.HasPrivileges {
-		return meta, setup.ErrNotRoot
+
+	// 系统级注册优先卸载(需要管理员特权);仅存在用户级注册时直接卸载用户级(无需特权)。
+	useSystemScope, scopeErr := chooseUninstallScope(
+		setup.IsServiceInstalled(meta.ServiceName, true),
+		setup.IsServiceInstalled(meta.ServiceName, false),
+		meta.HasPrivileges,
+	)
+	if scopeErr != nil {
+		return meta, scopeErr
 	}
 
-	if err := setup.UninstallService(meta.ServiceName, true); err != nil {
+	if err := setup.UninstallService(meta.ServiceName, useSystemScope); err != nil {
 		return meta, err
 	}
-	if runtime.GOOS == "darwin" {
-		if err := setup.UninstallMacOSTrayAgent(); err != nil {
-			meta.Warning = appendSystemServiceWarning(meta.Warning, fmt.Sprintf("System service was removed, but the macOS menu bar companion could not be removed automatically: %v", err))
+
+	if useSystemScope {
+		if runtime.GOOS == "darwin" {
+			if err := setup.UninstallMacOSTrayAgent(); err != nil {
+				meta.Warning = appendSystemServiceWarning(meta.Warning, fmt.Sprintf("System service was removed, but the macOS menu bar companion could not be removed automatically: %v", err))
+			}
 		}
-	}
-	if err := removeManagedExecutable(); err != nil {
-		return meta, fmt.Errorf("service registration was removed, but failed to remove managed executable: %w", err)
+		if err := removeManagedExecutable(); err != nil {
+			return meta, fmt.Errorf("service registration was removed, but failed to remove managed executable: %w", err)
+		}
 	}
 
 	status := buildSystemServiceStatusSkeleton()
 	status.Status = "not_installed"
-	status.Message = fmt.Sprintf("%s was uninstalled successfully. Managed executable removed, configuration file preserved.", status.DisplayName)
+	status.InstallScope = s.defaultInstallScope(status.HasPrivileges)
+	if useSystemScope {
+		status.Message = fmt.Sprintf("%s was uninstalled successfully. Managed executable removed, configuration file preserved.", status.DisplayName)
+	} else {
+		status.Message = fmt.Sprintf("%s (user-level) was uninstalled successfully. Configuration file preserved.", status.DisplayName)
+	}
 	if runtime.GOOS == "darwin" && meta.Warning == "" {
 		status.Message = fmt.Sprintf("%s was uninstalled successfully. Managed executable removed, configuration file preserved, and the macOS menu bar companion was removed.", status.DisplayName)
 	}
@@ -153,6 +276,22 @@ func (s *SystemServiceService) Uninstall() (SystemServiceStatus, error) {
 		status.Warning = appendSystemServiceWarning(status.Warning, meta.Warning)
 	}
 	return status, nil
+}
+
+// chooseUninstallScope decides which registered scope to uninstall: system-level
+// wins (and requires administrator privileges); a user-level registration is
+// removed without privileges. ErrServiceNotInstalled when neither is registered.
+func chooseUninstallScope(systemInstalled bool, userInstalled bool, hasPrivileges bool) (bool, error) {
+	if systemInstalled {
+		if !hasPrivileges {
+			return true, setup.ErrNotRoot
+		}
+		return true, nil
+	}
+	if userInstalled {
+		return false, nil
+	}
+	return false, setup.ErrServiceNotInstalled
 }
 
 func buildSystemServiceStatusSkeleton() SystemServiceStatus {
@@ -183,6 +322,12 @@ func buildSystemServiceStatusSkeleton() SystemServiceStatus {
 		serviceLabel = "Unsupported"
 	}
 
+	// Linux 支持用户级注册:无特权时注册动作自动降级为用户级,不需要管理员;其余平台需要。
+	requiresAdmin := supported
+	if runtime.GOOS == "linux" {
+		requiresAdmin = false
+	}
+
 	meta := SystemServiceStatus{
 		Supported:     supported,
 		Platform:      runtime.GOOS,
@@ -192,7 +337,7 @@ func buildSystemServiceStatusSkeleton() SystemServiceStatus {
 		DisplayName:   displayName,
 		ServiceName:   serviceName,
 		Status:        "unknown",
-		RequiresAdmin: supported,
+		RequiresAdmin: requiresAdmin,
 		HasPrivileges: setup.IsRoot(),
 		InstallScope:  "system",
 	}
@@ -231,6 +376,7 @@ func BuildCLIServiceInstallOptions(requestedConfigPath string, systemWide bool) 
 			ConfigPath:       strings.TrimSpace(requestedConfigPath),
 			SystemWide:       false,
 			StartType:        setup.StartAutomatic,
+			Args:             []string{"core"},
 			WorkingDirectory: filepath.Dir(currentExecPath),
 		}, nil
 	}

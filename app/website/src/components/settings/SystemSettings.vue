@@ -368,6 +368,10 @@
                 <p class="text-slate-400">{{ t('sys_kind') }}</p>
                 <p class="mt-1 font-semibold text-slate-700 dark:text-slate-100">{{ friendlyServiceLabel }}</p>
               </div>
+              <div>
+                <p class="text-slate-400">{{ t('sys_scope') }}</p>
+                <p class="mt-1 font-semibold text-slate-700 dark:text-slate-100">{{ systemServiceScopeLabel }}</p>
+              </div>
             </div>
 
             <p v-if="systemServiceError" class="mt-3 text-[11px] text-red-500">{{ systemServiceError }}</p>
@@ -385,7 +389,7 @@
               <button
                 type="button"
                 class="rounded border border-red-200 py-2.5 md:py-1.5 text-[11px] font-bold text-red-600 transition hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-red-500/30 dark:text-red-300 dark:hover:bg-red-500/10"
-                :disabled="serviceActionLoading || !systemServiceInfo.supported || !systemServiceInfo.installed"
+                :disabled="serviceActionLoading || !systemServiceInfo.supported || !systemServiceInfo.installed || systemScopeServiceBlocked"
                 @click="openSystemServiceConfirm('uninstall')"
               >
                 {{ serviceActionLoading && serviceAction === 'uninstall' ? t('sys_uninstalling') : t('sys_uninstallServiceBtn') }}
@@ -559,6 +563,10 @@ export default {
       serviceAction: '',
       systemServiceError: '',
       systemServiceMessage: '',
+      showSystemServiceConfirm: false,
+      systemServiceConfirmAction: '',
+      showTunSwitchConfirm: false,
+      switchingMode: false,
       wintunInstallPollTimer: null,
       wintunInstallPollInFlight: false
     };
@@ -649,7 +657,27 @@ export default {
       return this.wintunDependency.installing;
     },
     showServicePrivilegeHint() {
-      return this.systemServiceInfo.supported && this.systemServiceInfo.requires_admin && !this.systemServiceInfo.has_privileges;
+      if (!this.systemServiceInfo.supported) {
+        return false;
+      }
+      if (this.systemServiceInfo.requires_admin && !this.systemServiceInfo.has_privileges) {
+        return true;
+      }
+      return this.systemScopeServiceBlocked;
+    },
+    systemScopeServiceBlocked() {
+      const info = this.systemServiceInfo;
+      return Boolean(info.supported && info.installed && info.install_scope === 'system' && !info.has_privileges);
+    },
+    systemServiceScopeLabel() {
+      switch (this.systemServiceInfo.install_scope) {
+        case 'system':
+          return this.t('sys_scopeSystem');
+        case 'user':
+          return this.t('sys_scopeUser');
+        default:
+          return this.t('sys_scopeNone');
+      }
     },
     systemServiceTitle() {
       if (!this.systemServiceInfo.supported) {
