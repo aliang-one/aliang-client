@@ -774,7 +774,14 @@ func applyClaudePolicyNotice(policy agentAIClaudeRemotePolicy, notice map[string
 		return policy
 	}
 	policy.policyNotice = notice
-	policy.trustTier = "isolated"
+	// notice.effective 是权威终态：既有降级路径为 isolated（sanitize/mcp 失败），
+	// 平台 env 缺失回退路径为 sanitized（见 withClaudeRemotePolicy）。缺省保持
+	// 旧行为（按 isolated 处理），approval hook 会按折叠后的 tier 重写 sources。
+	if tier, valid := normalizeClaudeTrustTier(remoteString(notice, "effective")); valid {
+		policy.trustTier = tier
+	} else {
+		policy.trustTier = "isolated"
+	}
 	return policy
 }
 
@@ -4950,6 +4957,9 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 	cleanupClaudePolicy := func() {}
 	effectiveRun := run
 	if tool.outputFormat == agentAIOutputClaudeStreamJSON && !run.readOnly {
+		// 平台通道缺失的 isolated→sanitized 回退必须在版本守卫之前：守卫要对
+		// 提升后的档位继续行使职权（提升不得撤销 2.2.0 守门的降级）。
+		effectiveRun.claudePolicy = promoteIsolatedTierForPlatformFallback(effectiveRun.claudePolicy, run.sessionID)
 		effectiveRun.claudePolicy = applyClaudeTierVersionGuard(tool, effectiveRun.claudePolicy, run.sessionID)
 		var policyNotice map[string]interface{}
 		tool, cleanupClaudePolicy, policyNotice = withClaudeRemotePolicy(tool, effectiveRun)

@@ -613,6 +613,9 @@ func TestClaudeTierSettingSources(t *testing.T) {
 }
 
 func TestClaudeRemotePolicyTierFlags(t *testing.T) {
+	// 平台探针钉在「在位」：本测试锁的是 tier→flags 映射本身，不能随测试机
+	// 的 ANTHROPIC_* 环境变量漂移（否则 isolated 分支会被平台回退提升）。
+	overridePlatformProbe(t, true)
 	project := t.TempDir()
 	mkRun := func(raw map[string]interface{}) agentAIRun {
 		return agentAIRun{projectPath: project, claudePolicy: parseAgentAIClaudeRemotePolicy(map[string]interface{}{"claude_remote_policy": raw})}
