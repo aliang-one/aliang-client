@@ -8,11 +8,6 @@
         <div class="min-w-0">
           <div class="flex flex-wrap items-center gap-2">
             <h3 class="text-base font-bold text-slate-900 dark:text-white">{{ t('agent_activity_title') }}</h3>
-            <span
-              v-if="status"
-              class="shrink-0 rounded-full px-2 py-0.5 text-[10px] font-bold"
-              :class="statusBadgeClass"
-            >{{ statusLabel }}</span>
           </div>
           <p class="mt-1 text-xs leading-5 text-slate-500 dark:text-slate-400">
             {{ t('agent_activity_desc') }}
@@ -30,50 +25,6 @@
       </button>
     </div>
 
-    <!-- 注册 / 连接健康度 -->
-    <div
-      v-if="status && healthVisible"
-      class="mt-5 grid grid-cols-1 overflow-hidden rounded-lg border border-slate-200 bg-slate-50/60 sm:grid-cols-2 sm:divide-x sm:divide-slate-200 dark:border-slate-700 dark:bg-slate-900/40 dark:sm:divide-slate-700"
-    >
-      <div class="px-3 py-2.5">
-        <div class="flex items-center gap-2">
-          <span class="text-[10px] font-bold uppercase tracking-wide text-slate-400">{{ t('agent_registration_label') }}</span>
-          <span
-            class="shrink-0 rounded-full px-2 py-0.5 text-[10px] font-bold"
-            :class="registrationBadgeClass"
-          >{{ registrationLabel }}</span>
-        </div>
-        <p
-          v-if="status.registration_message"
-          class="mt-1 break-words text-[10px] leading-4 text-slate-500 dark:text-slate-400"
-        >{{ status.registration_message }}</p>
-      </div>
-      <div class="border-t border-slate-200 px-3 py-2.5 sm:border-t-0 dark:border-slate-700">
-        <div class="flex items-center gap-2">
-          <span class="text-[10px] font-bold uppercase tracking-wide text-slate-400">{{ t('agent_connection_label') }}</span>
-          <span
-            class="shrink-0 rounded-full px-2 py-0.5 text-[10px] font-bold"
-            :class="connectionBadgeClass"
-          >{{ connectionLabel }}</span>
-        </div>
-        <p
-          v-if="status.connection_message"
-          class="mt-1 break-words text-[10px] leading-4 text-slate-500 dark:text-slate-400"
-        >{{ status.connection_message }}</p>
-      </div>
-      <div v-if="canRetry" class="border-t border-slate-200 px-3 py-2 sm:col-span-2 dark:border-slate-700">
-        <button
-          type="button"
-          class="inline-flex min-h-11 items-center gap-1 rounded-lg px-2 text-[11px] font-semibold text-primary transition-colors hover:bg-primary/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/20 disabled:opacity-60"
-          :disabled="retrying"
-          @click="retryRegistration"
-        >
-          <span class="material-symbols-outlined text-sm">{{ retrying ? 'progress_activity' : 'sync' }}</span>
-          {{ retrying ? t('agent_health_retrying') : t('agent_health_retry') }}
-        </button>
-      </div>
-    </div>
-
     <div v-if="loading" class="mt-5 flex min-h-28 items-center justify-center text-xs text-slate-500 dark:text-slate-400">
       <span class="material-symbols-outlined mr-2 text-base motion-safe:animate-spin">progress_activity</span>
       {{ t('agent_activity_loading') }}
@@ -82,7 +33,7 @@
       v-else-if="error"
       class="mt-5 rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-xs text-rose-700 dark:border-rose-500/30 dark:bg-rose-500/10 dark:text-rose-300"
     >{{ error }}</div>
-    <div v-else-if="!sessions.length" class="mt-5 flex min-h-28 flex-col items-center justify-center text-center text-slate-400">
+    <div v-else-if="!mergedSessions.length" class="mt-5 flex min-h-28 flex-col items-center justify-center text-center text-slate-400">
       <span class="material-symbols-outlined text-2xl text-slate-300 dark:text-slate-600">history</span>
       <p class="mt-2 text-xs">{{ offline ? t('agent_activity_runtimeOffline') : t('agent_activity_noSessions') }}</p>
     </div>
@@ -91,7 +42,7 @@
       <div class="mt-5 flex flex-wrap items-end justify-between gap-2 border-t border-slate-100 pt-5 dark:border-slate-800">
         <div>
           <h4 class="text-sm font-bold text-slate-900 dark:text-white">{{ t('agent_activity_recentTitle') }}</h4>
-          <p class="mt-0.5 text-[10px] text-slate-400">{{ t('agent_activity_recentCount', { count: sessions.length }) }}</p>
+          <p class="mt-0.5 text-[10px] text-slate-400">{{ t('agent_activity_recentCount', { count: mergedSessions.length }) }}</p>
         </div>
         <span class="text-[10px] text-slate-400">{{ t('agent_activity_pageCompact', { page: currentPage, total: totalPages }) }}</span>
       </div>
@@ -106,7 +57,7 @@
             <li
               v-for="s in group.sessions"
               :key="s.id"
-              v-memo="[s.id, s.updated_at, s.message_count, expandedId === s.id]"
+              v-memo="[s.id, s.updated_at, s.message_count, s.__running, expandedId === s.id]"
             >
               <button
                 type="button"
@@ -127,6 +78,13 @@
                   </span>
                 </span>
                 <span class="hidden shrink-0 text-[10px] tabular-nums text-slate-400 sm:block">{{ formatSessionTime(s.updated_at) }}</span>
+                <span
+                  v-if="s.__running"
+                  class="inline-flex shrink-0 items-center gap-1 rounded-full bg-emerald-100 px-2 py-0.5 text-[9px] font-bold text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300"
+                >
+                  <span class="h-1 w-1 rounded-full bg-emerald-500 motion-safe:animate-pulse"></span>
+                  {{ t('agent_activity_running') }}
+                </span>
                 <span
                   class="material-symbols-outlined shrink-0 text-base text-slate-400 transition-transform duration-200 motion-reduce:transition-none"
                   :class="{ 'rotate-180': expandedId === s.id }"
@@ -183,7 +141,7 @@
     </template>
 
     <nav
-      v-if="!loading && !error && sessions.length && totalPages > 1"
+      v-if="!loading && !error && mergedSessions.length && totalPages > 1"
       class="mt-4 flex flex-wrap items-center justify-center gap-1.5 text-[11px]"
       :aria-label="t('agent_activity_paginationLabel')"
     >
@@ -218,14 +176,14 @@
         <span class="material-symbols-outlined text-sm">chevron_right</span>
       </button>
       <span class="w-full pt-1 text-center text-slate-400 sm:ml-1 sm:w-auto sm:pt-0">
-        {{ t('agent_activity_pageInfo', { page: currentPage, total: totalPages, count: sessions.length }) }}
+        {{ t('agent_activity_pageInfo', { page: currentPage, total: totalPages, count: mergedSessions.length }) }}
       </span>
     </nav>
   </div>
 </template>
 
 <script>
-import { getAgentStatus, getAgentSessions, getAgentSessionDetail, enableAgent } from '../../services/agentApi';
+import { getAgentRuntimeSessions, getAgentSessions, getAgentSessionDetail } from '../../services/agentApi';
 import { useI18n } from '../../i18n';
 
 export default {
@@ -236,14 +194,14 @@ export default {
   },
   data() {
     return {
-      status: null,
       sessions: [],
+      runtimeAi: [],
+      pollTimer: null,
       currentPage: 1,
       pageSize: 20,
       loading: false,
       error: '',
       offline: false,
-      retrying: false,
       expandedId: '',
       detailMessages: [],
       detailLoading: false,
@@ -252,77 +210,37 @@ export default {
     };
   },
   computed: {
-    runtimeOnline() {
-      if (!this.status?.runtime) return true;
-      return Boolean(this.status.runtime.online);
+    runningIds() {
+      return new Set(this.runtimeAi.map((session) => session.id));
     },
-    agentEnabled() {
-      return this.runtimeOnline && Boolean(this.status?.enabled && this.status?.bound);
+    decoratedSessions() {
+      const historyIds = new Set(this.sessions.map((session) => session.id));
+      const runtimeOnly = this.runtimeAi
+        .filter((session) => !historyIds.has(session.id))
+        .map((session) => ({ ...session, __running: true }));
+      return [
+        ...runtimeOnly,
+        ...this.sessions.map((session) => ({
+          ...session,
+          __running: this.runningIds.has(session.id),
+        })),
+      ];
     },
-    statusLabel() {
-      if (!this.runtimeOnline) return this.t('agent_runtimeOffline');
-      if (this.agentEnabled) return this.t('agent_enabled');
-      return this.t('agent_disabled');
-    },
-    statusBadgeClass() {
-      if (!this.runtimeOnline) return 'bg-amber-100 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300';
-      if (this.agentEnabled) return 'bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300';
-      return 'bg-slate-200 text-slate-600 dark:bg-slate-700 dark:text-slate-300';
-    },
-    // —— 注册 / 连接健康度（来自后端派生的 registration_state / connection_state）——
-    healthVisible() {
-      return Boolean(this.status?.registration_state || this.status?.connection_state);
-    },
-    registrationLabel() {
-      const map = {
-        registered: 'agent_reg_registered',
-        rejected: 'agent_reg_rejected',
-        login_required: 'agent_reg_login_required',
-        unregistered: 'agent_reg_unregistered',
-        not_configured: 'agent_reg_not_configured',
-      };
-      const key = map[this.status?.registration_state];
-      return key ? this.t(key) : '';
-    },
-    registrationBadgeClass() {
-      switch (this.status?.registration_state) {
-        case 'registered': return 'bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300';
-        case 'rejected': return 'bg-rose-100 text-rose-700 dark:bg-rose-500/15 dark:text-rose-300';
-        case 'login_required': return 'bg-amber-100 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300';
-        default: return 'bg-slate-200 text-slate-600 dark:bg-slate-700 dark:text-slate-300';
+    // 单一列表：运行中会话置顶，其余按 updated_at 原序
+    mergedSessions() {
+      const running = [];
+      const rest = [];
+      for (const session of this.decoratedSessions) {
+        (session.__running ? running : rest).push(session);
       }
-    },
-    connectionLabel() {
-      const map = {
-        connected: 'agent_conn_connected',
-        connecting: 'agent_conn_connecting',
-        error: 'agent_conn_error',
-        disconnected: 'agent_conn_disconnected',
-      };
-      const key = map[this.status?.connection_state];
-      return key ? this.t(key) : '';
-    },
-    connectionBadgeClass() {
-      switch (this.status?.connection_state) {
-        case 'connected': return 'bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300';
-        case 'connecting': return 'bg-amber-100 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300';
-        case 'error': return 'bg-rose-100 text-rose-700 dark:bg-rose-500/15 dark:text-rose-300';
-        default: return 'bg-slate-200 text-slate-600 dark:bg-slate-700 dark:text-slate-300';
-      }
-    },
-    canRetry() {
-      const r = this.status?.registration_state;
-      const c = this.status?.connection_state;
-      // login_required / not_configured need user action (login / config), not an API retry.
-      if (r === 'login_required' || r === 'not_configured') return false;
-      return r !== 'registered' || c !== 'connected';
+      return [...running, ...rest];
     },
     totalPages() {
-      return Math.max(1, Math.ceil(this.sessions.length / this.pageSize));
+      return Math.max(1, Math.ceil(this.mergedSessions.length / this.pageSize));
     },
     pagedSessions() {
       const start = (this.currentPage - 1) * this.pageSize;
-      return this.sessions.slice(start, start + this.pageSize);
+      return this.mergedSessions.slice(start, start + this.pageSize);
     },
     groupedPagedSessions() {
       const groups = [];
@@ -366,27 +284,23 @@ export default {
     },
   },
   mounted() {
-    this.loadStatus();
     this.loadSessions();
+    this.loadRuntimeAi();
+    this.pollTimer = window.setInterval(() => {
+      if (document.visibilityState === 'visible') this.loadRuntimeAi();
+    }, 5000);
+  },
+  beforeUnmount() {
+    if (this.pollTimer) window.clearInterval(this.pollTimer);
   },
   methods: {
-    async loadStatus() {
+    // runtime-sessions 仅服务于「进行中」徽章的时效性；失败不阻塞历史列表
+    async loadRuntimeAi() {
       try {
-        this.status = await getAgentStatus();
+        const data = await getAgentRuntimeSessions();
+        this.runtimeAi = Array.isArray(data?.ai_conversations) ? data.ai_conversations : [];
       } catch (_) {
-        // 状态读取失败不影响会话列表展示
-      }
-    },
-    // 重新注册 + 重连：触发后端 Enable（registerAndSync + 远程连接），再刷新健康度。
-    async retryRegistration() {
-      this.retrying = true;
-      try {
-        await enableAgent();
-        await this.loadStatus();
-      } catch (_) {
-        // 忽略：刷新后的 registration/connection_state 会反映结果
-      } finally {
-        this.retrying = false;
+        // 徽章缺失可接受
       }
     },
     async loadSessions() {
