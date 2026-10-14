@@ -309,6 +309,39 @@ func (h *AgentHandler) HandleVibeSession(w http.ResponseWriter, r *http.Request)
 	common.Success(w, session)
 }
 
+// HandleTerminalScrollback returns a terminal session's recent output
+// (?limit= bytes, default 64KiB, cap 512KiB). Mirrors HandleRuntimeSessions:
+// the terminal manager lives in the user-agent runtime, so non-runtime
+// processes proxy there via proxyIfNeeded.
+func (h *AgentHandler) HandleTerminalScrollback(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		// common.Error 收业务码（100-299），直传 http.StatusMethodNotAllowed 会被
+		// 映射成 500；此处须真实 405，参照 session_event_broker 的 http.Error 惯例。
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	sessionID := strings.TrimSpace(r.PathValue("sessionId"))
+	if sessionID == "" {
+		common.ErrorBadRequest(w, "sessionId is required", nil)
+		return
+	}
+	if h.proxyIfNeeded(w, r) {
+		return
+	}
+	limit := 0
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			limit = n
+		}
+	}
+	resp, ok := h.service.TerminalScrollback(sessionID, limit)
+	if !ok {
+		common.ErrorNotFound(w, "terminal session not found")
+		return
+	}
+	common.Success(w, resp)
+}
+
 // HandleScanDirectories GET 读取 / POST 设置扫描目录过滤（经 proxyIfNeeded 代理到 runtime，
 // runtime 直接读写本地 state 并持久化）。
 func (h *AgentHandler) HandleScanDirectories(w http.ResponseWriter, r *http.Request) {

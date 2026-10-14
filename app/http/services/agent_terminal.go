@@ -39,6 +39,11 @@ const agentTerminalHistoryCap = 8
 // terminal session (overridable via ALIANG_TERMINAL_RING_BYTES, floor 64KiB).
 const agentTerminalRingDefaultBytes = 2 * 1024 * 1024
 
+const (
+	agentTerminalScrollbackDefaultBytes = 64 * 1024
+	agentTerminalScrollbackMaxBytes     = 512 * 1024
+)
+
 // Terminal lifecycle knobs. Both durations resolve once at process start; an
 // unset/blank/unparseable/non-positive env value falls back to the default
 // (see resolveEnvDuration, which is unit-tested).
@@ -383,6 +388,83 @@ func (m *agentTerminalManager) attachHistory(sessionID string, attachToken strin
 		"exited":     true,
 	})
 	return true
+}
+
+// normalizeAgentTerminalScrollbackLimit clamps a client-provided byte limit:
+// non-positive falls back to the default; anything above the cap is clamped.
+func normalizeAgentTerminalScrollbackLimit(limit int) int {
+	if limit <= 0 {
+		return agentTerminalScrollbackDefaultBytes
+	}
+	if limit > agentTerminalScrollbackMaxBytes {
+		return agentTerminalScrollbackMaxBytes
+	}
+	return limit
+}
+
+// scrollbackSnapshot returns the recent output (scrollback) of a terminal
+// session: the live ring for a running session, or the tombstone ring for an
+// exited one. ok is false when neither exists (unknown or reaped session).
+// Lock order follows the documented one-way rule: m.mu is released BEFORE
+// outputGate is taken for a live session. A tombstone ring has no
+// gate-serialized writers — the tombstone reuses the live ring object, so the
+// copy loop's final push can still race this read; the ring's own mutex keeps
+// it memory-safe and the worst case is a snapshot missing the last frame, the
+// same assumption attachHistory already makes.
+func (m *agentTerminalManager) scrollbackSnapshot(sessionID string, maxBytes int) (models.AgentTerminalScrollback, bool) {
+	if m == nil {
+		return models.AgentTerminalScrollback{}, false
+	}
+	capturedAt := time.Now().UTC().Format(time.RFC3339)
+	maxBytes = normalizeAgentTerminalScrollbackLimit(maxBytes)
+
+	m.mu.Lock()
+	if session := m.sessions[sessionID]; session != nil {
+		m.mu.Unlock()
+		if session.ring == nil {
+			// Ring-less session; sendReplay skips nil rings the same way.
+			// The lookup still succeeds with an empty scrollback.
+			return newAgentTerminalScrollback(sessionID, nil, terminalReplayStatusLive, maxBytes, capturedAt), true
+		}
+		session.outputGate.Lock()
+		data := session.ring.snapshot()
+		session.outputGate.Unlock()
+		return newAgentTerminalScrollback(sessionID, data, terminalReplayStatusLive, maxBytes, capturedAt), true
+	}
+	tomb := m.history[sessionID]
+	if tomb != nil {
+		var data []byte
+		if tomb.ring != nil {
+			data = tomb.ring.snapshot()
+		}
+		m.mu.Unlock()
+		return newAgentTerminalScrollback(sessionID, data, terminalReplayStatusExited, maxBytes, capturedAt), true
+	}
+	m.mu.Unlock()
+	return models.AgentTerminalScrollback{}, false
+}
+
+// newAgentTerminalScrollback keeps the last maxBytes bytes of data, marking
+// truncated when the head was dropped. The head is advanced past any partial
+// multi-byte rune so the payload stays valid UTF-8 (interior chunk ends are
+// already rune-aligned by the ring feed).
+func newAgentTerminalScrollback(sessionID string, data []byte, status string, maxBytes int, capturedAt string) models.AgentTerminalScrollback {
+	truncated := false
+	if len(data) > maxBytes {
+		data = data[len(data)-maxBytes:]
+		truncated = true
+		for len(data) > 0 && !utf8.RuneStart(data[0]) {
+			data = data[1:]
+		}
+	}
+	return models.AgentTerminalScrollback{
+		SessionID:  sessionID,
+		Encoding:   "text",
+		Status:     status,
+		Data:       string(data),
+		Truncated:  truncated,
+		CapturedAt: capturedAt,
+	}
 }
 
 // recordTerminalHistoryLocked stores a tombstone and evicts the oldest entries

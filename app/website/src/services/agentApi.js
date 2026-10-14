@@ -83,3 +83,13 @@ export async function setAgentScanDirectories({ enabled, directories }) {
     body: JSON.stringify({ enabled, directories }),
   });
 }
+
+export async function getAgentTerminalScrollback(sessionId, { limit } = {}) {
+  const params = new URLSearchParams();
+  if (limit) params.set('limit', String(limit));
+  const query = params.toString();
+  return request(
+    `/api/agent/terminal/${encodeURIComponent(sessionId)}/scrollback${query ? `?${query}` : ''}`,
+    { method: 'GET' }
+  );
+}
