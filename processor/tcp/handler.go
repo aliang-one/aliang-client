@@ -517,8 +517,10 @@ func (h *TCPConnectionHandler) handleNonTLS(
 
 // handleTLS processes TLS connections (port 443).
 // Transparent TLS interception only trusts identifiers observed on the current
-// connection. If we can't read an explicit hostname or SNI, we bypass MITM and
-// route direct to avoid certificate and HTTP/2 mismatches on shared IPs.
+// connection. If we can't read an explicit hostname or SNI, we bypass MITM
+// (certificate/HTTP-2 mismatch protection on shared IPs) but still consult the
+// routing engine with the destination IP so ip/geoip rules can steer the flow;
+// toAliang hits are downgraded to direct (empty-name MITM would break).
 func (h *TCPConnectionHandler) handleTLS(
 	sessionCtx context.Context,
 	connectCtx context.Context,
@@ -633,7 +635,11 @@ func (h *TCPConnectionHandler) handleTLS(
 			))
 		}
 		if metadata.HostName == "" {
-			return h.resolveTLSRoute(sessionCtx, connectCtx, originConn, metadata, RouteDirect, wrapped, "")
+			// 无 SNI：不做 MITM（证书错配防护不变），但携带 IP 咨询规则引擎
+			// 让 IP/geoip 规则生效（spec §3.1）；toAliang 命中降级 direct。
+			route, _ := h.tlsHandler.DetermineRouteWithContext(metadata) // (ProxyRoute, requiresSNI bool)；引擎失败内部已回退 default direct（tls.go:307-322）
+			route = downgradeNoSNIAliangRoute(route)
+			return h.resolveTLSRoute(sessionCtx, connectCtx, originConn, metadata, route, wrapped, "")
 		}
 	}
 
