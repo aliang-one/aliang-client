@@ -25,6 +25,7 @@ async function ensureLoaded() {
       loaded = true;
       return status.value;
     } catch (err) {
+      if (seq !== requestSeq) return status.value; // 过期请求的失败不写共享 error
       error.value = err instanceof Error ? err.message : String(err);
       return null;
     } finally {
