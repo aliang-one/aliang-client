@@ -62,7 +62,7 @@
             </p>
             <button
               type="button"
-              class="mt-2 inline-flex min-h-9 items-center gap-1 rounded-lg border border-slate-200 px-2.5 text-[10px] font-bold text-slate-600 transition-colors hover:border-primary/40 hover:bg-primary/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/20 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-primary/10"
+              class="mt-2 inline-flex min-h-10 md:min-h-9 items-center gap-1 rounded-lg border border-slate-200 px-2.5 text-[10px] font-bold text-slate-600 transition-colors hover:border-primary/40 hover:bg-primary/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/20 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-primary/10"
               @click.stop="openScrollback(terminal)"
             >
               <span class="material-symbols-outlined text-sm">visibility</span>
@@ -83,7 +83,7 @@
       :aria-label="t('agent_live_outputTitle')"
       @click.self="closeScrollback"
     >
-      <div class="flex h-[85dvh] w-full max-w-3xl flex-col overflow-hidden rounded-t-2xl border border-slate-200 bg-white shadow-2xl dark:border-slate-700 dark:bg-slate-900 sm:h-[80dvh] sm:rounded-2xl">
+      <div class="flex h-[85vh] max-h-[85dvh] w-full max-w-3xl flex-col overflow-hidden rounded-t-2xl border border-slate-200 bg-white shadow-2xl dark:border-slate-700 dark:bg-slate-900 sm:h-[80vh] sm:max-h-[80dvh] sm:rounded-2xl">
         <div class="flex shrink-0 items-center justify-between gap-3 border-b border-slate-200 bg-slate-50/85 px-4 py-3 dark:border-slate-700 dark:bg-slate-800/65">
           <div class="flex min-w-0 items-center gap-2">
             <h3 class="truncate text-sm font-bold text-slate-900 dark:text-slate-100">{{ t('agent_live_outputTitle') }}</h3>
@@ -197,18 +197,21 @@ export default {
       await this.fetchScrollback();
     },
     async fetchScrollback() {
-      if (!this.scrollbackSessionId || this.scrollbackLoading) return;
+      const requested = this.scrollbackSessionId;
+      if (!requested) return;
       this.scrollbackLoading = true;
       try {
-        const data = await getAgentTerminalScrollback(this.scrollbackSessionId);
+        const data = await getAgentTerminalScrollback(requested);
+        if (requested !== this.scrollbackSessionId) return;
         this.scrollbackData = data?.data || '';
         this.scrollbackStatus = data?.status || '';
         this.scrollbackTruncated = Boolean(data?.truncated);
         this.scrollbackError = '';
       } catch (_) {
+        if (requested !== this.scrollbackSessionId) return;
         this.scrollbackError = this.t('agent_live_outputLoadFailed');
       } finally {
-        this.scrollbackLoading = false;
+        if (requested === this.scrollbackSessionId) this.scrollbackLoading = false;
       }
     },
     closeScrollback() {
