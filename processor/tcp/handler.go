@@ -517,8 +517,10 @@ func (h *TCPConnectionHandler) handleNonTLS(
 
 // handleTLS processes TLS connections (port 443).
 // Transparent TLS interception only trusts identifiers observed on the current
-// connection. If we can't read an explicit hostname or SNI, we bypass MITM and
-// route direct to avoid certificate and HTTP/2 mismatches on shared IPs.
+// connection. If we can't read an explicit hostname or SNI, we bypass MITM
+// (certificate/HTTP-2 mismatch protection on shared IPs) but still consult the
+// routing engine with the destination IP so ip/geoip rules can steer the flow;
+// toAliang hits are downgraded to direct (empty-name MITM would break).
 func (h *TCPConnectionHandler) handleTLS(
 	sessionCtx context.Context,
 	connectCtx context.Context,
@@ -585,7 +587,7 @@ func (h *TCPConnectionHandler) handleTLS(
 		cache := rules.GetCache()
 		if cache == nil {
 			logger.Warn(fmt.Sprintf(
-				"TLS: No SNI observed for %s:%d and DNS cache is unavailable; bypassing MITM and routing direct",
+				"TLS: No SNI observed for %s:%d and DNS cache is unavailable; bypassing MITM and consulting routing engine by IP",
 				metadata.DstIP,
 				metadata.DstPort,
 			))
@@ -613,27 +615,31 @@ func (h *TCPConnectionHandler) handleTLS(
 				logObservedTLSServerName(metadata, "cache")
 			} else if uniqueDomainCount > 1 {
 				logger.Warn(fmt.Sprintf(
-					"TLS: No SNI observed for %s:%d; shared IP has %d cached domains, bypassing MITM and routing direct",
+					"TLS: No SNI observed for %s:%d; shared IP has %d cached domains, bypassing MITM and consulting routing engine by IP",
 					metadata.DstIP,
 					metadata.DstPort,
 					uniqueDomainCount,
 				))
 			} else {
 				logger.Warn(fmt.Sprintf(
-					"TLS: No SNI observed for %s:%d and no reliable cached hostname exists; bypassing MITM and routing direct",
+					"TLS: No SNI observed for %s:%d and no reliable cached hostname exists; bypassing MITM and consulting routing engine by IP",
 					metadata.DstIP,
 					metadata.DstPort,
 				))
 			}
 		} else {
 			logger.Warn(fmt.Sprintf(
-				"TLS: No SNI observed for destination %s:%d; bypassing MITM and routing direct",
+				"TLS: No SNI observed for destination %s:%d; bypassing MITM and consulting routing engine by IP",
 				metadata.DstIP,
 				metadata.DstPort,
 			))
 		}
 		if metadata.HostName == "" {
-			return h.resolveTLSRoute(sessionCtx, connectCtx, originConn, metadata, RouteDirect, wrapped, "")
+			// 无 SNI：不做 MITM（证书错配防护不变），但携带 IP 咨询规则引擎
+			// 让 IP/geoip 规则生效（spec §3.1）；toAliang 命中降级 direct。
+			route, _ := h.tlsHandler.DetermineRouteWithContext(metadata) // (ProxyRoute, requiresSNI bool)；引擎失败内部已回退 default direct（tls.go:307-322）
+			route = downgradeNoSNIAliangRoute(route)
+			return h.resolveTLSRoute(sessionCtx, connectCtx, originConn, metadata, route, wrapped, "")
 		}
 	}
 
@@ -694,6 +700,18 @@ func (h *TCPConnectionHandler) dialByRoute(ctx context.Context, metadata *M.Meta
 		metadata.Route = "RouteDirect"
 		return h.dialDirect(ctx, metadata)
 	}
+}
+
+// downgradeNoSNIAliangRoute 无 SNI 连接命中 toAliang 时硬排除降级 direct：
+// 空 HostName 会使 mitmedSNI 为空串，PerformMITM 给空名签证书必断链
+// （spec: docs/superpowers/specs/2026-10-14-nosni-tls-routing-design.md §3.1）。
+// shouldForceAliangRoute 特判（本地代理端口+回环）来源的命中同样经此降级并打日志。
+func downgradeNoSNIAliangRoute(route ProxyRoute) ProxyRoute {
+	if route == RouteToALiang {
+		logger.Debug("[TLS] no-SNI connection hit toAliang rule; downgraded to direct (empty-name MITM would break)")
+		return RouteDirect
+	}
+	return route
 }
 
 func (h *TCPConnectionHandler) resolveTLSRoute(
