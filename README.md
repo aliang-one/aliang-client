@@ -164,8 +164,13 @@ ip-cidr,121.32.12.0/24,proxy   Clash style with trailing action (proxy_rules)
 ```
 
 - IP conditions match the real destination IP of TCP connections on the TUN
-  path. TLS traffic without SNI, UDP traffic, and local HTTP-proxy inbound
-  traffic bypass the rules engine, so IP conditions have no effect there.
+  path. SNI-less TLS traffic also consults the rules engine with its
+  destination IP: IP/GeoIP rules apply there, while domain rules can never
+  match (no name available, so the default direct route applies). SNI-less
+  connections never enter the MITM path — AI-rule (MITM) hits are
+  downgraded to direct, and deny-type decisions degrade to direct as well.
+  UDP traffic and local HTTP-proxy inbound traffic bypass the rules engine,
+  so IP conditions have no effect on those two paths.
 - Malformed entries (invalid IPs, empty labels like `a..b`) are rejected on
   save.
 - `traffic_mirror.domains` is matched by domain (SNI/host): a bare single IP

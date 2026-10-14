@@ -394,9 +394,17 @@ ip-range,1.2.3.1-1.2.3.254,direct
 
 > **Where IP rules apply**: IP conditions are matched against the real
 > destination IP of TCP connections on the deep-mode (TUN) path. TLS traffic
-> without SNI, UDP traffic, and local HTTP-proxy inbound traffic never reach
-> the rules engine, so IP conditions have no effect there. `0.0.0.0/0` matches
-> IPv4 destinations only; `::/0` matches IPv6 destinations only.
+> without SNI also consults the rules engine with its destination IP — IP
+> conditions and GeoIP country-based routing apply there, so once such rules
+> are configured, SNI-less traffic starts routing by them (previously it
+> always went direct). Domain rules can never match SNI-less traffic (no
+> name to match), which falls back to the default direct route; connections
+> hitting AI rules (MITM routing) are automatically downgraded to direct,
+> and deny-type decisions degrade to direct as well — SNI-less connections
+> never enter the MITM/mirror path and are never blocked. UDP traffic and
+> local HTTP-proxy inbound traffic never reach the rules engine, so IP
+> conditions have no effect on those two paths. `0.0.0.0/0` matches IPv4
+> destinations only; `::/0` matches IPv6 destinations only.
 
 > **Validation**: malformed entries (invalid IPs, reversed ranges, empty
 > labels such as `a..b`) are rejected when you save, with an inline error

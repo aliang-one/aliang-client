@@ -160,9 +160,11 @@ ip-cidr:121.32.12.0/24     显式关键字（另有 ip-range:、ip-from:…,ip-t
 ip-cidr,121.32.12.0/24,proxy   Clash 风格，尾段为动作（proxy_rules）
 ```
 
-- IP 条件在 TUN（深度模式）TCP 链路上按真实目的 IP 匹配；无 SNI 的 TLS
-  流量、UDP 流量与本地 HTTP 代理入站不经过规则引擎，IP 条件在这些链路
-  不生效。
+- IP 条件在 TUN（深度模式）TCP 链路上按真实目的 IP 匹配。无 SNI 的 TLS
+  流量同样会携带目的 IP 咨询规则引擎：IP/GeoIP 规则对其生效，域名规则
+  无名可匹配、落默认直连；无 SNI 连接不会进入 MITM 路径——命中 AI 规则
+  （MITM 路由）自动降级直连，deny 类决策同样退化为直连。UDP 流量与本
+  地 HTTP 代理入站不经过规则引擎，IP 条件在这两条链路不生效。
 - 非法条目（坏 IP、空标签如 `a..b` 等）保存时会被明确拒绝。
 - `traffic_mirror.domains` 按域名（SNI/Host）匹配：裸单 IP 可按字面命中，
   CIDR / 区间在镜像链路不生效——按 IP 分流请用 AI 规则或 `proxy_rules`。
