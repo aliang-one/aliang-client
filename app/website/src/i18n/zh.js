@@ -946,7 +946,6 @@ export default {
   agent_featureAIOff: 'AI 控制已关闭',
   agent_toolsSummary: '{available}/{total} 可用',
   agent_server: 'Agent 服务端',
-  agent_runtimeOnline: '在线',
   agent_runtimeOffline: '离线',
   agent_offlineTitle: '用户态 Agent 未运行',
   agent_offlineDesc: '请从桌面图标或托盘启动 Aliang，用户态 Agent 会随之启动。',

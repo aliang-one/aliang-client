@@ -946,7 +946,6 @@ export default {
   agent_featureAIOff: 'AI control disabled',
   agent_toolsSummary: '{available}/{total} available',
   agent_server: 'Agent server',
-  agent_runtimeOnline: 'Online',
   agent_runtimeOffline: 'Offline',
   agent_offlineTitle: 'User agent is not running',
   agent_offlineDesc: 'Open Aliang from the desktop icon or tray so the user-mode agent can start.',
