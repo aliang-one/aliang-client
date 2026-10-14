@@ -49,46 +49,55 @@
         <div class="min-w-0">
           <p class="text-sm font-semibold text-slate-900 dark:text-slate-100">{{ statusTitle }}</p>
           <p class="mt-1 text-xs leading-5 text-slate-500 dark:text-slate-400">{{ statusMessage }}</p>
-          <p v-if="deviceSummary" class="mt-2 flex items-center gap-1.5 text-[11px] font-medium text-slate-600 dark:text-slate-300">
-            <span class="material-symbols-outlined text-sm text-slate-400">devices</span>
-            <span class="truncate">{{ deviceSummary }}</span>
-          </p>
         </div>
       </div>
     </div>
 
-    <dl class="grid grid-cols-1 border-t border-slate-200 bg-slate-50/70 dark:border-slate-800 dark:bg-slate-900/35 sm:grid-cols-2 lg:grid-cols-4">
-      <div class="border-b border-slate-200 p-4 dark:border-slate-800 lg:border-b-0 lg:border-r">
-        <dt class="flex items-center gap-1.5 text-[10px] font-bold uppercase text-slate-400">
-          <span class="material-symbols-outlined text-sm">memory</span>
-          {{ t('agent_runtime') }}
-        </dt>
-        <dd class="mt-1.5 text-sm font-semibold" :class="runtimeOnline ? 'text-emerald-600 dark:text-emerald-300' : 'text-amber-600 dark:text-amber-300'" :title="runtimeTitle">
-          {{ runtimeLabel }}
-        </dd>
-      </div>
-      <div class="border-b sm:border-l border-slate-200 p-4 dark:border-slate-800 lg:border-b-0 lg:border-l-0 lg:border-r">
-        <dt class="flex items-center gap-1.5 text-[10px] font-bold uppercase text-slate-400">
-          <span class="material-symbols-outlined text-sm">laptop_mac</span>
-          {{ t('agent_deviceStatus') }}
-        </dt>
-        <dd class="mt-1.5 text-sm font-semibold" :class="deviceStatusClass">{{ deviceStatusLabel }}</dd>
-      </div>
-      <div class="border-b border-slate-200 p-4 dark:border-slate-800 sm:border-b-0 lg:border-r lg:border-slate-200 dark:lg:border-slate-800">
-        <dt class="flex items-center gap-1.5 text-[10px] font-bold uppercase text-slate-400">
-          <span class="material-symbols-outlined text-sm">build</span>
-          {{ t('agent_toolsFound') }}
-        </dt>
-        <dd class="mt-1.5 text-sm font-semibold text-slate-700 dark:text-slate-200">{{ toolAvailabilitySummary }}</dd>
-      </div>
-      <div class="sm:border-l border-slate-200 p-4 dark:border-slate-800 lg:border-l-0">
-        <dt class="flex items-center gap-1.5 text-[10px] font-bold uppercase text-slate-400">
-          <span class="material-symbols-outlined text-sm">sync</span>
-          {{ t('agent_sync') }}
-        </dt>
-        <dd class="mt-1.5 truncate text-sm font-semibold text-slate-700 dark:text-slate-200" :title="syncTitle">{{ syncLabel }}</dd>
-      </div>
-    </dl>
+    <div class="mt-5 flex flex-wrap items-center gap-x-4 gap-y-1.5 border-t border-slate-100 px-5 py-4 text-[11px] font-medium text-slate-600 dark:border-slate-800 dark:text-slate-300 sm:px-6">
+      <span v-if="deviceSummary" class="flex min-w-0 items-center gap-1.5">
+        <span class="material-symbols-outlined text-sm text-slate-400">devices</span>
+        <span class="truncate">{{ deviceSummary }}</span>
+      </span>
+      <span class="flex items-center gap-1.5">
+        <span class="material-symbols-outlined text-sm text-slate-400">build</span>
+        {{ toolAvailabilitySummary }}
+      </span>
+      <span class="flex items-center gap-1.5" :title="syncTitle">
+        <span class="material-symbols-outlined text-sm text-slate-400">sync</span>
+        {{ syncLabel }}
+      </span>
+    </div>
+
+    <!-- 注册 / 连接健康度：正常一行摘要，出错才展开 -->
+    <div v-if="healthVisible" class="border-t border-slate-100 px-5 py-4 dark:border-slate-800 sm:px-6">
+      <template v-if="healthHasProblem">
+        <div class="space-y-1.5">
+          <div class="flex flex-wrap items-center gap-2">
+            <span class="text-[10px] font-bold uppercase tracking-wide text-slate-400">{{ t('agent_registration_label') }}</span>
+            <span class="shrink-0 rounded-full px-2 py-0.5 text-[10px] font-bold" :class="registrationBadgeClass">{{ registrationLabel }}</span>
+            <span v-if="status?.registration_message" class="min-w-0 flex-1 truncate text-[10px] text-rose-600 dark:text-rose-300" :title="status.registration_message">{{ status.registration_message }}</span>
+          </div>
+          <div class="flex flex-wrap items-center gap-2">
+            <span class="text-[10px] font-bold uppercase tracking-wide text-slate-400">{{ t('agent_connection_label') }}</span>
+            <span class="shrink-0 rounded-full px-2 py-0.5 text-[10px] font-bold" :class="connectionBadgeClass">{{ connectionLabel }}</span>
+            <span v-if="status?.connection_message" class="min-w-0 flex-1 truncate text-[10px] text-rose-600 dark:text-rose-300" :title="status.connection_message">{{ status.connection_message }}</span>
+          </div>
+        </div>
+        <button
+          v-if="canRetry"
+          type="button"
+          class="mt-2 inline-flex min-h-11 items-center gap-1 rounded-lg px-2 text-[11px] font-semibold text-primary transition-colors hover:bg-primary/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/20 disabled:opacity-60"
+          :disabled="retrying"
+          @click="retryRegistration"
+        >
+          <span class="material-symbols-outlined text-sm">{{ retrying ? 'progress_activity' : 'sync' }}</span>
+          {{ retrying ? t('agent_health_retrying') : t('agent_health_retry') }}
+        </button>
+      </template>
+      <p v-else class="text-[11px] text-slate-500 dark:text-slate-400">
+        {{ t('agent_registration_label') }} {{ registrationLabel }} · {{ t('agent_connection_label') }} {{ connectionLabel }}
+      </p>
+    </div>
 
     <div
       v-if="settingsModalOpen"
@@ -143,16 +152,15 @@
       </div>
     </div>
 
-    <div class="rounded-lg border border-slate-200 bg-white px-3 py-3 dark:border-slate-700 dark:bg-slate-900/40">
-      <p class="text-[11px] font-bold uppercase tracking-[0.18em] text-slate-500 dark:text-slate-400">{{ t('agent_prerequisites') }}</p>
+    <div v-if="failedPrerequisites.length" class="rounded-lg border border-amber-200 bg-amber-50/70 px-3 py-3 dark:border-amber-500/30 dark:bg-amber-500/10">
+      <p class="text-[11px] font-bold uppercase tracking-[0.18em] text-amber-700 dark:text-amber-300">{{ t('agent_prerequisites') }}</p>
       <div class="mt-3 space-y-2">
         <div
-          v-for="item in prerequisites"
+          v-for="item in failedPrerequisites"
           :key="item.key"
-          class="flex items-start gap-2 text-[11px]"
-          :class="item.ok ? 'text-emerald-700 dark:text-emerald-300' : 'text-slate-500 dark:text-slate-400'"
+          class="flex items-start gap-2 text-[11px] text-amber-700 dark:text-amber-200"
         >
-          <span class="material-symbols-outlined mt-0.5 text-sm">{{ item.ok ? 'check_circle' : 'radio_button_unchecked' }}</span>
+          <span class="material-symbols-outlined mt-0.5 text-sm">radio_button_unchecked</span>
           <span class="leading-5">{{ item.label }}</span>
         </div>
       </div>
@@ -163,6 +171,7 @@
         <p class="text-[11px] font-bold uppercase tracking-[0.18em] text-slate-500 dark:text-slate-400">{{ t('agent_history') }}</p>
         <span class="text-[10px] text-slate-400">{{ historySummary }}</span>
       </div>
+      <p class="mt-1.5 text-[10px] leading-4 text-slate-400 dark:text-slate-500">{{ t('agent_historyMetaHint') }}</p>
       <div class="mt-3 space-y-2">
         <div
           v-for="item in historyRoots"
@@ -273,22 +282,20 @@
 <script>
 import {
   disableAgent,
-  getAgentStatus,
   launchAgentTool,
   enableAgent,
 } from '../../services/agentApi';
 import { useI18n } from '../../i18n';
+import { useAgentStatus } from '../../composables/useAgentStatus';
 
 export default {
   name: 'AgentSettings',
   setup() {
     const { t } = useI18n();
-    return { t };
+    return { t, ...useAgentStatus() };
   },
   data() {
     return {
-      status: null,
-      loading: false,
       binding: false,
       settingsModalOpen: false,
       launchLoading: false,
@@ -297,21 +304,10 @@ export default {
       lastLaunch: null,
       feedback: '',
       feedbackType: 'info',
+      retrying: false,
     };
   },
   computed: {
-    runtimeOnline() {
-      if (!this.status?.runtime) return true;
-      return Boolean(this.status.runtime.online);
-    },
-    agentEnabled() {
-      return this.runtimeOnline && Boolean(this.status?.enabled && this.status?.bound);
-    },
-    statusLabel() {
-      if (!this.runtimeOnline) return this.t('agent_runtimeOffline');
-      if (this.agentEnabled) return this.t('agent_enabled');
-      return this.t('agent_disabled');
-    },
     statusTitle() {
       if (!this.runtimeOnline) return this.t('agent_offlineTitle');
       if (this.agentEnabled) return this.t('agent_readyTitle');
@@ -320,11 +316,6 @@ export default {
     statusMessage() {
       if (!this.runtimeOnline) return this.status?.message || this.t('agent_offlineDesc');
       return this.status?.message || this.t('agent_disabledDesc');
-    },
-    statusBadgeClass() {
-      if (!this.runtimeOnline) return 'bg-amber-100 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300';
-      if (this.agentEnabled) return 'bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300';
-      return 'bg-slate-200 text-slate-600 dark:bg-slate-700 dark:text-slate-300';
     },
     statusIcon() {
       if (!this.runtimeOnline) return 'cloud_off';
@@ -348,9 +339,6 @@ export default {
       if (status === 'online') return this.t('agent_deviceOnline');
       if (status === 'offline') return this.t('agent_deviceOffline');
       return this.status?.device ? status : '-';
-    },
-    deviceStatusClass() {
-      return this.status?.device?.status === 'online' ? 'text-emerald-600 dark:text-emerald-300' : 'text-slate-600 dark:text-slate-300';
     },
     deviceStatusPillClass() {
       return this.status?.device?.status === 'online'
@@ -392,65 +380,69 @@ export default {
     canLaunchCommands() {
       return this.agentEnabled && this.remoteTerminalFeatureEnabled;
     },
-    primaryTools() {
-      const tools = Array.isArray(this.status?.tools) ? this.status.tools : [];
-      return tools.filter(tool => ['codex', 'claude', 'claudecode'].includes(tool.id));
-    },
-    availablePrimaryTools() {
-      return this.primaryTools.filter(tool => tool.available);
-    },
-    runtimeLabel() {
-      if (!this.status?.runtime) return '-';
-      return this.runtimeOnline ? this.t('agent_runtimeOnline') : this.t('agent_runtimeOffline');
-    },
-    runtimeTitle() {
-      const runtime = this.status?.runtime;
-      if (!runtime) return '';
-      const parts = [runtime.kind, runtime.url, runtime.pid ? `pid ${runtime.pid}` : ''].filter(Boolean);
-      return parts.join(' · ');
-    },
-    toolAvailabilitySummary() {
-      return this.t('agent_toolsSummary', {
-        available: this.availablePrimaryTools.length,
-        total: this.primaryTools.length,
-      });
-    },
-    prerequisites() {
+    failedPrerequisites() {
       return [
-        {
-          key: 'runtime',
-          ok: this.runtimeOnline,
-          label: this.runtimeOnline ? this.t('agent_preRuntimeOk') : this.t('agent_preRuntimeMissing'),
-        },
-        {
-          key: 'registered',
-          ok: Boolean(this.status?.registered),
-          label: this.status?.registered ? this.t('agent_preRegisteredOk') : this.t('agent_preRegisteredMissing'),
-        },
-        {
-          key: 'bound',
-          ok: this.agentEnabled,
-          label: this.agentEnabled ? this.t('agent_preBoundOk') : this.t('agent_preBoundMissing'),
-        },
-        {
-          key: 'tool',
-          ok: this.availablePrimaryTools.length > 0,
-          label: this.availablePrimaryTools.length > 0 ? this.t('agent_preToolOk') : this.t('agent_preToolMissing'),
-        },
-        {
-          key: 'terminal',
-          ok: this.remoteTerminalFeatureEnabled,
-          label: this.remoteTerminalFeatureEnabled ? this.t('agent_preTerminalOk') : this.t('agent_preTerminalDisabled'),
-        },
-        {
-          key: 'ai',
-          ok: this.aiControlFeatureEnabled,
-          label: this.aiControlFeatureEnabled ? this.t('agent_preAIOk') : this.t('agent_preAIDisabled'),
-        },
-      ];
+        { key: 'runtime', ok: this.runtimeOnline, label: this.t('agent_preRuntimeMissing') },
+        { key: 'registered', ok: Boolean(this.status?.registered), label: this.t('agent_preRegisteredMissing') },
+        { key: 'bound', ok: this.agentEnabled, label: this.t('agent_preBoundMissing') },
+        { key: 'tool', ok: this.primaryTools.some((tool) => tool.available), label: this.t('agent_preToolMissing') },
+        { key: 'terminal', ok: this.remoteTerminalFeatureEnabled, label: this.t('agent_preTerminalDisabled') },
+        { key: 'ai', ok: this.aiControlFeatureEnabled, label: this.t('agent_preAIDisabled') },
+      ].filter((item) => !item.ok);
     },
-    syncLabel() {
-      return this.status?.sync_status || (this.status?.registered ? this.t('agent_syncRegistered') : this.t('agent_syncNotRegistered'));
+    // —— 注册 / 连接健康度（自 AgentActivitySettings 迁入，唯一呈现处）——
+    healthVisible() {
+      return Boolean(this.status?.registration_state || this.status?.connection_state);
+    },
+    registrationLabel() {
+      const map = {
+        registered: 'agent_reg_registered',
+        rejected: 'agent_reg_rejected',
+        login_required: 'agent_reg_login_required',
+        unregistered: 'agent_reg_unregistered',
+        not_configured: 'agent_reg_not_configured',
+      };
+      const key = map[this.status?.registration_state];
+      return key ? this.t(key) : '';
+    },
+    registrationBadgeClass() {
+      switch (this.status?.registration_state) {
+        case 'registered': return 'bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300';
+        case 'rejected': return 'bg-rose-100 text-rose-700 dark:bg-rose-500/15 dark:text-rose-300';
+        case 'login_required': return 'bg-amber-100 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300';
+        default: return 'bg-slate-200 text-slate-600 dark:bg-slate-700 dark:text-slate-300';
+      }
+    },
+    connectionLabel() {
+      const map = {
+        connected: 'agent_conn_connected',
+        connecting: 'agent_conn_connecting',
+        error: 'agent_conn_error',
+        disconnected: 'agent_conn_disconnected',
+      };
+      const key = map[this.status?.connection_state];
+      return key ? this.t(key) : '';
+    },
+    connectionBadgeClass() {
+      switch (this.status?.connection_state) {
+        case 'connected': return 'bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300';
+        case 'connecting': return 'bg-amber-100 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300';
+        case 'error': return 'bg-rose-100 text-rose-700 dark:bg-rose-500/15 dark:text-rose-300';
+        default: return 'bg-slate-200 text-slate-600 dark:bg-slate-700 dark:text-slate-300';
+      }
+    },
+    canRetry() {
+      const r = this.status?.registration_state;
+      const c = this.status?.connection_state;
+      // login_required / not_configured 需要用户操作（登录/配置），不是重试能解决的
+      if (r === 'login_required' || r === 'not_configured') return false;
+      return r !== 'registered' || c !== 'connected';
+    },
+    healthHasProblem() {
+      if (!this.healthVisible) return false;
+      return this.canRetry
+        || this.status?.registration_state !== 'registered'
+        || this.status?.connection_state !== 'connected';
     },
     syncTitle() {
       return this.status?.sync_message || this.syncLabel;
@@ -477,19 +469,15 @@ export default {
       this.feedbackType = type;
     },
     async refreshStatus() {
-      this.loading = true;
-      try {
-        this.status = await getAgentStatus();
-      } catch (err) {
-        this.setFeedback(err instanceof Error ? err.message : this.t('agent_statusFailed'), 'error');
-      } finally {
-        this.loading = false;
+      const result = await this.refresh();
+      if (!result) {
+        this.setFeedback(this.error || this.t('agent_statusFailed'), 'error');
       }
     },
     async turnOnAgent() {
       this.binding = true;
       try {
-        this.status = await enableAgent();
+        this.applyStatus(await enableAgent());
         this.setFeedback(this.t('agent_enableSuccess'), 'success');
       } catch (err) {
         this.setFeedback(err instanceof Error ? err.message : this.t('agent_enableFailed'), 'error');
@@ -498,14 +486,25 @@ export default {
       }
     },
     async turnOffAgent() {
-      this.loading = true;
+      this.binding = true;
       try {
-        this.status = await disableAgent();
+        this.applyStatus(await disableAgent());
         this.setFeedback(this.t('agent_disabledFeedback'), 'success');
       } catch (err) {
         this.setFeedback(err instanceof Error ? err.message : this.t('agent_disableFailed'), 'error');
       } finally {
-        this.loading = false;
+        this.binding = false;
+      }
+    },
+    // 重试注册与「开启」同一接口（POST /api/agent/enable），仅出错态可见
+    async retryRegistration() {
+      this.retrying = true;
+      try {
+        this.applyStatus(await enableAgent());
+      } catch (_) {
+        // 刷新后的 registration/connection 状态会反映结果
+      } finally {
+        this.retrying = false;
       }
     },
     async launchTool(tool) {
