@@ -587,7 +587,7 @@ func (h *TCPConnectionHandler) handleTLS(
 		cache := rules.GetCache()
 		if cache == nil {
 			logger.Warn(fmt.Sprintf(
-				"TLS: No SNI observed for %s:%d and DNS cache is unavailable; bypassing MITM and routing direct",
+				"TLS: No SNI observed for %s:%d and DNS cache is unavailable; bypassing MITM and consulting routing engine by IP",
 				metadata.DstIP,
 				metadata.DstPort,
 			))
@@ -615,21 +615,21 @@ func (h *TCPConnectionHandler) handleTLS(
 				logObservedTLSServerName(metadata, "cache")
 			} else if uniqueDomainCount > 1 {
 				logger.Warn(fmt.Sprintf(
-					"TLS: No SNI observed for %s:%d; shared IP has %d cached domains, bypassing MITM and routing direct",
+					"TLS: No SNI observed for %s:%d; shared IP has %d cached domains, bypassing MITM and consulting routing engine by IP",
 					metadata.DstIP,
 					metadata.DstPort,
 					uniqueDomainCount,
 				))
 			} else {
 				logger.Warn(fmt.Sprintf(
-					"TLS: No SNI observed for %s:%d and no reliable cached hostname exists; bypassing MITM and routing direct",
+					"TLS: No SNI observed for %s:%d and no reliable cached hostname exists; bypassing MITM and consulting routing engine by IP",
 					metadata.DstIP,
 					metadata.DstPort,
 				))
 			}
 		} else {
 			logger.Warn(fmt.Sprintf(
-				"TLS: No SNI observed for destination %s:%d; bypassing MITM and routing direct",
+				"TLS: No SNI observed for destination %s:%d; bypassing MITM and consulting routing engine by IP",
 				metadata.DstIP,
 				metadata.DstPort,
 			))
