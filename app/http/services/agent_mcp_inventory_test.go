@@ -136,6 +136,51 @@ func TestTruncateMCPName(t *testing.T) {
 	}
 }
 
+func TestTruncateMCPUTF16Semantics(t *testing.T) {
+	// 星面字符:1 rune = 2 UTF-16 码元。服务端 zod max 按 JS length(码元)计,
+	// 客户端截断必须按同一计量,否则贴限的 emoji 名字/命令会被服务端整条拒绝。
+	emojiName := strings.Repeat("🎉", 40) // 40 runes = 80 码元
+	got := truncateMCPName(emojiName)
+	if n := utf8.RuneCountInString(got); n > 32 { // 64 码元 ÷ 2
+		t.Fatalf("emoji name must fit 64 UTF-16 units, got %d runes", n)
+	}
+	if !utf8.ValidString(got) {
+		t.Fatalf("truncated name must stay valid UTF-8")
+	}
+	// ASCII 行为不变(码元==rune==字节)
+	if got := truncateMCPName(strings.Repeat("a", 70)); len(got) != 64 {
+		t.Fatalf("ascii cap unchanged, got %d", len(got))
+	}
+	// 命令行同理:512 码元上限。无空白长 token 会先被打码(<redacted:N>,
+	// 天然短)——再补一条含空白的长参数(不打码)真实触达整体截断路径。
+	emojiArg := strings.Repeat("🎉", 300) // 300 runes = 600 码元
+	cmd := redactMCPCommand([]string{"x", emojiArg})
+	if units := utf16Length(cmd); units > 512 {
+		t.Fatalf("command must fit 512 UTF-16 units, got %d", units)
+	}
+	spacy := strings.Repeat("🎉 ", 300) // 600 码元 emoji + 300 空白,不打码
+	cmd2 := redactMCPCommand([]string{"x", spacy})
+	if units := utf16Length(cmd2); units > 512 {
+		t.Fatalf("spacy emoji command must fit 512 UTF-16 units, got %d", units)
+	}
+	if !utf8.ValidString(cmd2) {
+		t.Fatalf("truncated command must stay valid UTF-8")
+	}
+}
+
+// utf16Length 与服务端 JS string length 同计量:星面字符按 2 计。
+func utf16Length(s string) int {
+	n := 0
+	for _, r := range s {
+		if r > 0xFFFF {
+			n += 2
+		} else {
+			n++
+		}
+	}
+	return n
+}
+
 func TestAgentMCPServersFromClaudeRaw(t *testing.T) {
 	raw := map[string]interface{}{
 		"b-http": map[string]interface{}{"type": "http", "url": "https://x.example/mcp?token=" + strings.Repeat("t", 30)},
@@ -253,6 +298,22 @@ func TestClaudeMCPServerInventoryInEmptyConfig(t *testing.T) {
 	}
 	if len(stamps) != 3 {
 		t.Fatalf("want 3 stamps, got %d: %+v", len(stamps), stamps)
+	}
+}
+
+// 畸形 .claude.json fail-soft:清单归 nil,但 stamps 照交(缓存据此感知
+// 文件后来被修好)。
+func TestClaudeMCPServerInventoryInMalformedJSON(t *testing.T) {
+	home := t.TempDir()
+	if err := os.WriteFile(filepath.Join(home, ".claude.json"), []byte("{not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, stamps := claudeMCPServerInventoryIn(home)
+	if out != nil {
+		t.Fatalf("malformed claude.json must fail soft, got %+v", out)
+	}
+	if len(stamps) != 3 {
+		t.Fatalf("stamps must still be reported, got %d", len(stamps))
 	}
 }
 

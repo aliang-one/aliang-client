@@ -39,22 +39,43 @@ func redactMCPToken(token string) string {
 	return token
 }
 
-// redactMCPCommand 把 argv join 成命令行,逐 token 脱敏,整体截 512(按字符)。
+// utf16Truncate 按 UTF-16 码元截断并保证不劈开代理对。服务端 zod max() 按
+// JS string length(码元)计长,星面字符(如 emoji)1 rune=2 码元——客户端
+// 若按 rune 计,贴限载荷会被服务端整条拒绝(HTTP 同步 400)。
+func utf16Truncate(s string, max int) string {
+	runes := []rune(s)
+	units := 0
+	for i, r := range runes {
+		u := 1
+		if r > 0xFFFF {
+			u = 2
+		}
+		if units+u > max {
+			return string(runes[:i])
+		}
+		units += u
+	}
+	return s
+}
+
+// redactMCPCommand 把 argv join 成命令行,逐 token 脱敏,整体按 UTF-16
+// 码元截 512(对齐服务端 zod 长度语义;先过 truncateAgentText 保 TrimSpace)。
 func redactMCPCommand(argv []string) string {
 	parts := make([]string, 0, len(argv))
 	for _, arg := range argv {
 		parts = append(parts, redactMCPToken(arg))
 	}
-	return truncateAgentText(strings.Join(parts, " "), mcpCommandMaxLen)
+	return utf16Truncate(truncateAgentText(strings.Join(parts, " "), mcpCommandMaxLen), mcpCommandMaxLen)
 }
 
 // redactMCPURL 打码 query 中超过阈值长度的值(键保留);userinfo 一律打码、
-// fragment 一律丢弃——非 query 形态的凭据同样不得外泄;整体截 512(按字符)。
+// fragment 一律丢弃——非 query 形态的凭据同样不得外泄;整体按 UTF-16 码元
+// 截 512(对齐服务端 zod 长度语义)。
 func redactMCPURL(raw string) string {
 	raw = strings.TrimSpace(raw)
 	u, err := url.Parse(raw)
 	if err != nil || (u.RawQuery == "" && u.User == nil && u.Fragment == "") {
-		return truncateAgentText(raw, mcpURLMaxLen)
+		return utf16Truncate(truncateAgentText(raw, mcpURLMaxLen), mcpURLMaxLen)
 	}
 	if u.RawQuery != "" {
 		q := u.Query()
@@ -73,12 +94,13 @@ func redactMCPURL(raw string) string {
 	}
 	u.Fragment = ""
 	u.RawFragment = ""
-	return truncateAgentText(u.String(), mcpURLMaxLen)
+	return utf16Truncate(truncateAgentText(u.String(), mcpURLMaxLen), mcpURLMaxLen)
 }
 
-// truncateMCPName 把 MCP 服务器名称截到 64 字符(rune 安全,复用 truncateAgentText)。
+// truncateMCPName 把 MCP 服务器名称截到 64(先复用 truncateAgentText 做
+// rune 安全截断+TrimSpace,再按 UTF-16 码元收紧,对齐服务端 zod 语义)。
 func truncateMCPName(name string) string {
-	return truncateAgentText(name, mcpNameMaxLen)
+	return utf16Truncate(truncateAgentText(name, mcpNameMaxLen), mcpNameMaxLen)
 }
 
 // agentMCPServersFromClaudeRaw 把 claude 形态的原始 mcpServers 条目转成
@@ -334,7 +356,11 @@ func agentMCPServersFor(toolID string) []models.AgentMCPServer {
 }
 
 // mcpInventoryFor 是 detectAgentToolsWith 的 MCP 采集注入点(测试替换)。
+// 测试 swap 期间不得有后台 detectAgentTools 调用方;包内测试禁 t.Parallel
+// (见 agent_terminal_detach_test.go 说明)。
 var mcpInventoryFor = agentMCPServersFor
 
 // mcpInventoryHome 是 agentMCPServersFor 取 home 的注入点(测试替换)。
+// 测试 swap 期间不得有后台 detectAgentTools 调用方;包内测试禁 t.Parallel
+// (见 agent_terminal_detach_test.go 说明)。
 var mcpInventoryHome = agentHome
