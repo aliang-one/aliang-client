@@ -696,6 +696,18 @@ func (h *TCPConnectionHandler) dialByRoute(ctx context.Context, metadata *M.Meta
 	}
 }
 
+// downgradeNoSNIAliangRoute 无 SNI 连接命中 toAliang 时硬排除降级 direct：
+// 空 HostName 会使 mitmedSNI 为空串，PerformMITM 给空名签证书必断链
+// （spec: docs/superpowers/specs/2026-10-14-nosni-tls-routing-design.md §3.1）。
+// shouldForceAliangRoute 特判（本地代理端口+回环）来源的命中同样经此降级并打日志。
+func downgradeNoSNIAliangRoute(route ProxyRoute) ProxyRoute {
+	if route == RouteToALiang {
+		logger.Debug("[TLS] no-SNI connection hit toAliang rule; downgraded to direct (empty-name MITM would break)")
+		return RouteDirect
+	}
+	return route
+}
+
 func (h *TCPConnectionHandler) resolveTLSRoute(
 	sessionCtx context.Context,
 	connectCtx context.Context,
