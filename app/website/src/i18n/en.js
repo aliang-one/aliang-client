@@ -1008,6 +1008,14 @@ export default {
   agent_live_messages: '{count} messages',
   agent_live_pty: 'PTY',
   agent_live_pipe: 'Pipe mode',
+  agent_live_output: 'View output',
+  agent_live_outputTitle: 'Terminal output',
+  agent_live_outputEmpty: 'No output yet',
+  agent_live_outputLive: 'Live',
+  agent_live_outputExited: 'Exited',
+  agent_live_outputTruncated: 'Showing most recent output only',
+  agent_live_outputLoadFailed: 'Failed to load terminal output',
+  agent_live_outputRefresh: 'Refresh',
 
   // -- AgentActivitySettings --
   agent_activity_title: 'Agent Activity',

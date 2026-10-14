@@ -1008,6 +1008,14 @@ export default {
   agent_live_messages: '{count} 条消息',
   agent_live_pty: 'PTY',
   agent_live_pipe: '管道模式',
+  agent_live_output: '查看输出',
+  agent_live_outputTitle: '终端输出',
+  agent_live_outputEmpty: '暂无输出',
+  agent_live_outputLive: '输出中',
+  agent_live_outputExited: '已退出',
+  agent_live_outputTruncated: '仅显示最近部分输出',
+  agent_live_outputLoadFailed: '终端输出读取失败',
+  agent_live_outputRefresh: '刷新',
 
   // -- AgentActivitySettings --
   agent_activity_title: 'Agent 活动',
