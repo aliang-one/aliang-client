@@ -9,15 +9,19 @@ const loading = ref(false);
 const error = ref('');
 let loaded = false;
 let inFlight = null;
+let requestSeq = 0;
 
 async function ensureLoaded() {
   if (loaded && status.value) return status.value;
   if (inFlight) return inFlight;
   inFlight = (async () => {
+    const seq = ++requestSeq;
     loading.value = true;
     error.value = '';
     try {
-      status.value = await getAgentStatus();
+      const data = await getAgentStatus();
+      if (seq !== requestSeq) return status.value; // 已有更新的写入（applyStatus/refresh），丢弃过期快照
+      status.value = data;
       loaded = true;
       return status.value;
     } catch (err) {
@@ -39,6 +43,7 @@ async function refresh() {
 // enable/disable 等变更接口返回同一 AgentStatusResponse，直接写入共享状态
 function applyStatus(next) {
   if (!next) return;
+  requestSeq += 1; // 使在途请求作废
   status.value = next;
   loaded = true;
 }
@@ -49,6 +54,7 @@ function resetForTests() {
   error.value = '';
   loaded = false;
   inFlight = null;
+  requestSeq = 0;
 }
 
 export function useAgentStatus() {
@@ -77,6 +83,7 @@ export function useAgentStatus() {
   const syncLabel = computed(() => status.value?.sync_status
     || (status.value?.registered ? t('agent_syncRegistered') : t('agent_syncNotRegistered')));
 
+  // 共享单例：写状态一律走 applyStatus/refresh，禁止组件侧直接赋值（Options API 的 this.status = x 会静默改写全局状态）
   return {
     status, loading, error,
     runtimeOnline, agentEnabled, statusLabel, statusBadgeClass,

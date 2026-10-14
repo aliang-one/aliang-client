@@ -12,10 +12,14 @@ vi.mock('../services/agentApi', () => ({
   getAgentStatus: vi.fn(),
 }));
 
+import { getAgentStatus } from '../services/agentApi';
 import { resetForTests, useAgentStatus } from './useAgentStatus';
 
 describe('useAgentStatus', () => {
-  beforeEach(() => resetForTests());
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetForTests();
+  });
 
   it('shares one module-level state across consumers', () => {
     const a = useAgentStatus();
@@ -48,6 +52,26 @@ describe('useAgentStatus', () => {
       ],
     });
     expect(s.primaryTools.value).toHaveLength(2);
-    expect(s.toolAvailabilitySummary.value).toContain('1');
+    expect(s.toolAvailabilitySummary.value).toBe('agent_toolsSummary:1/2');
+  });
+
+  it('dedups concurrent ensureLoaded calls into one request', async () => {
+    getAgentStatus.mockResolvedValue({ runtime: { online: true }, enabled: true, bound: true });
+    const a = useAgentStatus();
+    const [ra, rb] = await Promise.all([a.ensureLoaded(), a.ensureLoaded()]);
+    expect(getAgentStatus).toHaveBeenCalledTimes(1);
+    expect(ra).toEqual(rb);
+    await a.ensureLoaded(); // 已 loaded → 缓存命中
+    expect(getAgentStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it('surfaces errors without losing previous state', async () => {
+    const s = useAgentStatus();
+    getAgentStatus.mockRejectedValueOnce(new Error('boom'));
+    const result = await s.ensureLoaded();
+    expect(result).toBe(null);
+    expect(s.error.value).toBe('boom');
+    expect(s.status.value).toBe(null);
+    expect(s.loading.value).toBe(false);
   });
 });
