@@ -74,12 +74,12 @@
         <div class="space-y-1.5">
           <div class="flex flex-wrap items-center gap-2">
             <span class="text-[10px] font-bold uppercase tracking-wide text-slate-400">{{ t('agent_registration_label') }}</span>
-            <span class="shrink-0 rounded-full px-2 py-0.5 text-[10px] font-bold" :class="registrationBadgeClass">{{ registrationLabel }}</span>
+            <span v-if="registrationLabel" class="shrink-0 rounded-full px-2 py-0.5 text-[10px] font-bold" :class="registrationBadgeClass">{{ registrationLabel }}</span>
             <span v-if="status?.registration_message" class="min-w-0 flex-1 truncate text-[10px] text-rose-600 dark:text-rose-300" :title="status.registration_message">{{ status.registration_message }}</span>
           </div>
           <div class="flex flex-wrap items-center gap-2">
             <span class="text-[10px] font-bold uppercase tracking-wide text-slate-400">{{ t('agent_connection_label') }}</span>
-            <span class="shrink-0 rounded-full px-2 py-0.5 text-[10px] font-bold" :class="connectionBadgeClass">{{ connectionLabel }}</span>
+            <span v-if="connectionLabel" class="shrink-0 rounded-full px-2 py-0.5 text-[10px] font-bold" :class="connectionBadgeClass">{{ connectionLabel }}</span>
             <span v-if="status?.connection_message" class="min-w-0 flex-1 truncate text-[10px] text-rose-600 dark:text-rose-300" :title="status.connection_message">{{ status.connection_message }}</span>
           </div>
         </div>
@@ -436,7 +436,8 @@ export default {
       const c = this.status?.connection_state;
       // login_required / not_configured 需要用户操作（登录/配置），不是重试能解决的
       if (r === 'login_required' || r === 'not_configured') return false;
-      return r !== 'registered' || c !== 'connected';
+      // connection_state 缺失时不据此判定可重试（契约漂移防护）
+      return Boolean(c) ? (r !== 'registered' || c !== 'connected') : r !== 'registered';
     },
     healthHasProblem() {
       if (!this.healthVisible) return false;
@@ -501,8 +502,8 @@ export default {
       this.retrying = true;
       try {
         this.applyStatus(await enableAgent());
-      } catch (_) {
-        // 刷新后的 registration/connection 状态会反映结果
+      } catch (err) {
+        this.setFeedback(err instanceof Error ? err.message : this.t('agent_enableFailed'), 'error');
       } finally {
         this.retrying = false;
       }
