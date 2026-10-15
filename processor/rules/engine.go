@@ -2,7 +2,6 @@ package rules
 
 import (
 	"fmt"
-	"net"
 	"sync"
 	"time"
 
@@ -19,7 +18,6 @@ type RuleEngine struct {
 	mu            sync.RWMutex
 	geoipService  *geoip.Service
 	ipDomainCache *cache.IPDomainCache
-	chinaDirect   bool // Whether Chinese IPs should route directly
 	enabled       bool // Whether rule engine is enabled
 }
 
@@ -74,7 +72,6 @@ func (e *RuleEngine) Initialize(cfg *config.Config) error {
 // Priority order:
 // 1. IP-Domain cache (previously evaluated routes)
 // 2. SNI allowlist (MITM to Aliang)
-// 3. GeoIP rules (optional)
 // 4. Default (SOCKS if configured, otherwise direct)
 func (e *RuleEngine) EvaluateRoute(ctx *EvaluationContext) (*RuleResult, error) {
 	if !e.enabled {
@@ -103,12 +100,6 @@ func (e *RuleEngine) EvaluateRoute(ctx *EvaluationContext) (*RuleResult, error) 
 			e.cacheResult(ctx, result)
 			return result, nil
 		}
-	}
-
-	// Priority 4: Check GeoIP (country-based routing, optional)
-	if result := e.checkGeoIP(ctx); result != nil {
-		e.cacheResult(ctx, result)
-		return result, nil
 	}
 
 	result := e.evaluateWithSnapshot(snapshot, ctx)
@@ -200,49 +191,6 @@ func (e *RuleEngine) checkAllowlist(ctx *EvaluationContext) *RuleResult {
 	}
 
 	return nil
-}
-
-// checkGeoIP checks country-based routing using GeoIP database
-func (e *RuleEngine) checkGeoIP(ctx *EvaluationContext) *RuleResult {
-	if e.geoipService == nil || !e.geoipService.IsEnabled() {
-		return nil
-	}
-
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-
-	// Convert netip.Addr to net.IP
-	ip := net.IP(ctx.DstIP.AsSlice())
-
-	// Check if IP is in China
-	isChina := e.geoipService.IsChina(ip)
-
-	if isChina {
-		// Chinese IP handling
-		if e.chinaDirect {
-			return &RuleResult{
-				Route:       cache.RouteDirect,
-				MatchedRule: "geoip_china",
-				RequiresSNI: false,
-				Reason:      fmt.Sprintf("IP %s is in China (direct route)", ctx.DstIP),
-			}
-		} else {
-			return &RuleResult{
-				Route:       cache.RouteToSocks,
-				MatchedRule: "geoip_china",
-				RequiresSNI: false,
-				Reason:      fmt.Sprintf("IP %s is in China (accelerated route)", ctx.DstIP),
-			}
-		}
-	}
-
-	// Foreign IP - accelerate via SOCKS proxy
-	return &RuleResult{
-		Route:       cache.RouteToSocks,
-		MatchedRule: "geoip_foreign",
-		RequiresSNI: false,
-		Reason:      fmt.Sprintf("IP %s is outside China (accelerated)", ctx.DstIP),
-	}
 }
 
 // defaultRoute provides fallback routing decision
