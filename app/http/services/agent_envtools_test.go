@@ -198,3 +198,87 @@ func TestVersionProbe_MissingBinary(t *testing.T) {
 		t.Fatalf("versionProbe on missing binary = %q, want empty string", got)
 	}
 }
+
+func TestAgentGitLogPayload_OnRepo(t *testing.T) {
+	skipIfNoGit(t)
+	dir := t.TempDir()
+	authorizeEnvToolDir(t, dir)
+
+	if out, err := exec.Command("git", "-C", dir, "init", "--initial-branch=main").CombinedOutput(); err != nil {
+		t.Fatalf("git init failed: %v\n%s", err, out)
+	}
+	if err := os.WriteFile(dir+"/a.txt", []byte("a"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if out, err := exec.Command("git", "-C", dir, "config", "user.email", "test@example.com").CombinedOutput(); err != nil {
+		t.Fatalf("git config email: %v\n%s", err, out)
+	}
+	if out, err := exec.Command("git", "-C", dir, "config", "user.name", "Test").CombinedOutput(); err != nil {
+		t.Fatalf("git config name: %v\n%s", err, out)
+	}
+	if out, err := exec.Command("git", "-C", dir, "add", "a.txt").CombinedOutput(); err != nil {
+		t.Fatalf("git add: %v\n%s", err, out)
+	}
+	if out, err := exec.Command("git", "-C", dir, "commit", "-m", "first subject").CombinedOutput(); err != nil {
+		t.Fatalf("commit1: %v\n%s", err, out)
+	}
+	if err := os.WriteFile(dir+"/b.txt", []byte("b"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if out, err := exec.Command("git", "-C", dir, "add", "b.txt").CombinedOutput(); err != nil {
+		t.Fatalf("git add: %v\n%s", err, out)
+	}
+	if out, err := exec.Command("git", "-C", dir, "commit", "-m", "second subject").CombinedOutput(); err != nil {
+		t.Fatalf("commit2: %v\n%s", err, out)
+	}
+
+	// 默认 limit:两笔全部返回,最新在前
+	out := agentGitLogPayload(map[string]interface{}{"cwd": dir, "request_id": "r1"})
+	if out["type"] != models.AgentEventGitLogResult {
+		t.Fatalf("type = %v", out["type"])
+	}
+	entries, ok := out["entries"].([]map[string]string)
+	if !ok {
+		t.Fatalf("entries shape = %T", out["entries"])
+	}
+	if len(entries) != 2 {
+		t.Fatalf("want 2 entries, got %d: %+v", len(entries), entries)
+	}
+	if entries[0]["subject"] != "second subject" || entries[1]["subject"] != "first subject" {
+		t.Fatalf("order wrong: %+v", entries)
+	}
+	if len(entries[0]["hash"]) != 40 || entries[0]["author"] != "Test" || entries[0]["date"] == "" {
+		t.Fatalf("entry fields incomplete: %+v", entries[0])
+	}
+
+	// limit=1 + offset=1:跳过最新,只剩最旧一笔
+	out = agentGitLogPayload(map[string]interface{}{"cwd": dir, "request_id": "r2", "limit": float64(1), "offset": float64(1)})
+	entries, _ = out["entries"].([]map[string]string)
+	if len(entries) != 1 || entries[0]["subject"] != "first subject" {
+		t.Fatalf("limit/offset paging wrong: %+v", entries)
+	}
+
+	// limit 越界钳制
+	out = agentGitLogPayload(map[string]interface{}{"cwd": dir, "request_id": "r3", "limit": float64(100000)})
+	entries, _ = out["entries"].([]map[string]string)
+	if len(entries) != 2 {
+		t.Fatalf("clamped limit should return all 2, got %d", len(entries))
+	}
+}
+
+func TestAgentGitLogPayload_NonRepo(t *testing.T) {
+	skipIfNoGit(t)
+	dir := t.TempDir()
+	authorizeEnvToolDir(t, dir)
+
+	out := agentGitLogPayload(map[string]interface{}{"cwd": dir, "request_id": "r1"})
+	if out["type"] != models.AgentEventGitLogResult {
+		t.Fatalf("type = %v", out["type"])
+	}
+	if out["is_repo"] != false {
+		t.Fatalf("is_repo = %v, want false", out["is_repo"])
+	}
+	if entries, ok := out["entries"].([]map[string]string); ok && len(entries) != 0 {
+		t.Fatalf("non-repo should have empty entries, got %+v", entries)
+	}
+}

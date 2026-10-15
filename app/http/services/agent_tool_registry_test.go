@@ -95,3 +95,26 @@ func TestAgentToolRegistry_ReadFileDescriptorIsTruthful(t *testing.T) {
 		t.Fatalf("read_file descriptor must state the no-confinement policy truthfully: %q", tool.Description)
 	}
 }
+
+func TestAgentToolRegistry_ContainsGitLog(t *testing.T) {
+	// git_log(rev 3): 提交历史能力。必须经注册表(default 臂 RunWithGuards
+	// 护栏)分发——event git.log 不与任何显式臂冲突。
+	reg := agentToolRegistry()
+	tool, ok := reg.Get(models.AgentEventGitLog)
+	if !ok {
+		t.Fatal("git_log not registered")
+	}
+	if tool.ID != "git_log" {
+		t.Fatalf("id = %q, want git_log", tool.ID)
+	}
+	if !tool.Caps.ReadOnly || !tool.Caps.NeedsProject {
+		t.Fatalf("caps = %+v, want read_only+needs_project", tool.Caps)
+	}
+	if tool.Handler == nil {
+		t.Fatal("handler nil")
+	}
+	// rev 必须已随新工具 bump——心跳漂移检测靠它重拉 tools.list。
+	if agentToolRegistryRev < 3 {
+		t.Fatalf("rev = %d, want >= 3 after git_log addition", agentToolRegistryRev)
+	}
+}
