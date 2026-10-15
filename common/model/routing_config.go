@@ -135,7 +135,7 @@ func (rs *RoutingRuleSet) Validate() error {
 type RulesSettings struct {
 	AliangEnabled bool `json:"aliang_enabled" default:"true"`
 	SocksEnabled  bool `json:"socks_enabled" default:"true"`
-	// GeoIPEnabled 为兼容保留的内存态字段：geoip 规则生效与否由「规则存在 + 数据库已加载」
+	// GeoIPEnabled 为兼容保留的序列化字段：geoip 规则生效与否由「规则存在 + 数据库已加载」
 	// 决定，本字段不参与任何行为分支（历史遗留，勿新增读取）。
 	GeoIPEnabled  bool      `json:"geoip_enabled" default:"false"`
 	AutoUpdate    bool      `json:"auto_update" default:"true"`
