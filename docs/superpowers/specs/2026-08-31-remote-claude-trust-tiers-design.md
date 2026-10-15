@@ -151,6 +151,7 @@ $TMPDIR/aliang-claude-project-*/
 4. **跨轮后台状态丢失**（进程模型硬伤）：不在本设计范围。
 5. **`disableSkillShellExecution` 全局开关**：sanitized 档用户自己的 `` !`cmd` `` skill 同被降级（模型改用 Bash 过桥），接受。
 6. **env 优先级（2026-08-31 已实证）**：`--settings`/settings 文件的 `env` 块**压过进程继承 env**（nc 监听实测：请求打到 settings 指定端点而非进程 env 端点）。即 sanitized/full 档下用户 settings env 将决定模型路由 = 本地一致（可接受）；但服务端**不能**依赖进程 env 强制路由，需通过档位说明向用户暴露这一点。
+   - **2026-10-16 重申为产品决策（用户多次提出「跟 TUI 一致、settings 优先」）**：此即最终语义——sanitized/full 档用户 settings.json 的 provider 配置优先，注入 env 仅在 settings 未提供时兜底。曾短暂实现的 `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1` 钉死方案（2026-10-13 事故后为保平台计费引入）**已回退**：它与本结论冲突，撤销了「本地一致」行为。平台通道单点问题（56432 未监听）由启动自愈/健康检查解决，不得以牺牲用户配置优先级为代价。
 7. **sanitized 档显式合并只覆盖 user + project 两源**：local scope（`~/.claude.json` 按 project 的 `mcpServers`）在 `--strict-mcp-config` 注入下不会加载，属接受的能力收缩（非遗漏）。
 8. untrusted 项目需要 CLAUDE.md 的场景：暂以 `full` 档覆盖；`--append-system-prompt` 注入补丁留待真实需求。
 9. ~~**插件 MCP 合并缺口**~~（已关闭，2026-09-01）：`claudeTierMCPArgs` 现枚举已启用插件（`enabledPlugins` 门控）并入合并 config，冒烟实证 15/15 对等（§5）。
