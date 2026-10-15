@@ -1,10 +1,14 @@
 package geoip
 
 import (
+	"bytes"
 	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -188,4 +192,123 @@ func TestLookupDuringDownloadMissesImmediately(t *testing.T) {
 	}
 	close(release)
 	<-finished // 等后台 goroutine 退出后再返回，避免 t.Cleanup 恢复 downloadFunc 与其竞争
+}
+
+// minimalMMDB 构造可被 geoip2.Open 接受的最小 MaxMind DB 字节：
+// 16 字节数据段分隔零 + 元数据标记 + {database_type, record_size} 元数据 map
+// （node_count 缺省为 0 → 空 SearchTree；maxminddb 校验 marker 存在、metadata
+// 可解、searchTreeSize+16 ≤ marker 起点、record_size ∈ {24,28,32}；geoip2
+// 另要求 database_type 在其支持清单内）。
+func minimalMMDB() []byte {
+	var buf bytes.Buffer
+	buf.Write(make([]byte, 16))                      // data section separator（16 零字节）
+	buf.Write([]byte{0xAB, 0xCD, 0xEF})              // metadata marker 前缀
+	buf.WriteString("MaxMind.com")                   // metadata marker 余段
+	buf.WriteByte(0xE2)                              // map，2 个键值对
+	buf.WriteByte(0x40 | byte(len("database_type"))) // utf8 string，长度 13
+	buf.WriteString("database_type")
+	buf.WriteByte(0x40 | byte(len("GeoLite2-Country"))) // utf8 string，长度 16
+	buf.WriteString("GeoLite2-Country")
+	buf.WriteByte(0x40 | byte(len("record_size"))) // utf8 string，长度 12
+	buf.WriteString("record_size")
+	buf.WriteByte(0xA1) // uint16，1 字节载荷
+	buf.WriteByte(24)   // record_size = 24
+	return buf.Bytes()
+}
+
+// TestDownloadRedirectPolicy 缺陷猎捕 important#2：零配置 http.Client 会跟随
+// 任意重定向。策略修复后：非 https 的重定向目标一律拒绝（统一 scheme 闸门，
+// 同时覆盖跨主机 http→http 与 https→http 降级两类），跳数 ≤3。
+// 注意：恶意目标必须可达——否则"连接拒绝"会让无修复的实现也假性通过。
+func TestDownloadRedirectPolicy(t *testing.T) {
+	evil := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("evil-content"))
+	}))
+	defer evil.Close()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 重定向到另一主机（端口不同即不同 authority），且目标可达
+		http.Redirect(w, r, evil.URL+"/evil.mmdb", http.StatusFound)
+	}))
+	defer srv.Close()
+
+	t.Setenv("ALIANG_GEOIP_DOWNLOAD_URL", srv.URL)
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "db.mmdb")
+	err := EnsureDownloaded(dest)
+	if err == nil {
+		t.Fatal("expected cross-host/insecure redirect to be rejected")
+	}
+	if !strings.Contains(err.Error(), "refusing insecure redirect") {
+		t.Fatalf("expected redirect policy rejection, got: %v", err)
+	}
+	if _, statErr := os.Stat(dest); statErr == nil {
+		t.Fatal("nothing should be written to dest on rejected redirect")
+	}
+}
+
+// TestDownloadSizeLimit 缺陷猎捕 minor#3：io.Copy 无上限可写满磁盘。
+// 修复后：超过 64MiB 上限即失败并清理临时文件，不留 *.tmp 垃圾。
+func TestDownloadSizeLimit(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		chunk := make([]byte, 1024*1024) // 1MB × 128 次写出 → 128MB，chunked 无 Content-Length
+		for i := 0; i < 128; i++ {
+			_, _ = w.Write(chunk)
+		}
+	}))
+	defer srv.Close()
+
+	t.Setenv("ALIANG_GEOIP_DOWNLOAD_URL", srv.URL)
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "db.mmdb")
+	err := EnsureDownloaded(dest)
+	if err == nil {
+		t.Fatal("expected oversized download to be rejected")
+	}
+	if !strings.Contains(err.Error(), "exceeds maximum size") {
+		t.Fatalf("expected size-limit rejection, got: %v", err)
+	}
+	if _, statErr := os.Stat(dest); statErr == nil {
+		t.Fatal("oversized download must not land at dest")
+	}
+	leftovers, _ := filepath.Glob(filepath.Join(dir, "*.tmp"))
+	if len(leftovers) > 0 {
+		t.Fatalf("temp files must be cleaned up on rejection, found: %v", leftovers)
+	}
+}
+
+// TestTmpIsNotSymlinkFollowing 缺陷猎捕 minor#4：固定 .tmp 名 + os.Create 跟随
+// 符号链接。修复后：随机临时文件（O_EXCL）→ 预置符号链接失效，victim 不被写，
+// 落地文件为常规文件而非符号链接。下载载荷须是合法 mmdb（落地校验通过）。
+func TestTmpIsNotSymlinkFollowing(t *testing.T) {
+	dir := t.TempDir()
+	victim := filepath.Join(dir, "victim.txt")
+	if err := os.WriteFile(victim, []byte("ORIGINAL"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(victim, filepath.Join(dir, "db.mmdb.tmp")); err != nil {
+		t.Fatal(err)
+	}
+
+	payload := minimalMMDB()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(payload)
+	}))
+	defer srv.Close()
+
+	t.Setenv("ALIANG_GEOIP_DOWNLOAD_URL", srv.URL)
+	if err := EnsureDownloaded(filepath.Join(dir, "db.mmdb")); err != nil {
+		t.Fatalf("EnsureDownloaded: %v", err)
+	}
+	got, err := os.ReadFile(victim)
+	if err != nil || string(got) != "ORIGINAL" {
+		t.Fatalf("symlink .tmp was followed — victim content = %q (err=%v)", got, err)
+	}
+	fi, err := os.Lstat(filepath.Join(dir, "db.mmdb"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fi.Mode().IsRegular() {
+		t.Fatalf("dest must be a regular file, got mode %v", fi.Mode())
+	}
 }
