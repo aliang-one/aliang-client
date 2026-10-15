@@ -239,7 +239,10 @@ func initializeGeoIPDatabase() error {
 	// Load database
 	logger.Info(fmt.Sprintf("Loading GeoIP database from: %s", geoipPath))
 	geoipService := geoip.GetService()
-	if err := geoipService.LoadDatabase(geoipPath); err != nil {
+	if err := geoip.EnsureDownloaded(geoipPath); err != nil {
+		return fmt.Errorf("failed to download GeoIP database: %w", err)
+	}
+	if err := geoipService.LoadLocal(geoipPath); err != nil {
 		return fmt.Errorf("failed to load GeoIP database: %w", err)
 	}
 
