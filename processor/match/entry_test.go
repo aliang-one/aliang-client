@@ -73,6 +73,22 @@ func TestClassifyEntry(t *testing.T) {
 		{"geoip-bad-code", "geoip:CHN", EntryGeoIP, "", true},
 		{"geoip-colon-comma-rejected-mixed-case", "geoip:cn,HK", EntryGeoIP, "", true},
 		{"geoip-clash-empty", "geoip,", EntryGeoIP, "", true},
+		// —— 【加固】IPv4-mapped IPv6 归一（minor#11）——
+		// 4-in-6 单 IP / 区间端点 Unmap 归一为 v4（TUN 目的地址恒纯形，
+		// 16 字节 4-in-6 形态因 netip 族序永不命中纯 v4 目的，属「校验过但死规则」）；
+		// CIDR 前缀含 4-in-6 直接报错（前缀位数落在 128 位空间，如 /120，
+		// 无法无歧义映射到 32 位空间，请写 IPv4 形态）
+		{"m4in6-single-unmapped", "::ffff:1.2.3.4", EntryIP, "1.2.3.4", false},
+		{"m4in6-cidr-rejected", "ip-cidr:::ffff:1.2.3.0/120", EntryIP, "", true},
+		{"m4in6-cidr-bare-rejected", "::ffff:1.2.3.0/120", EntryIP, "", true},
+		{"m4in6-range-normalized", "ip-range:::ffff:1.2.3.1-::ffff:1.2.3.254", EntryIP, "1.2.3.1-1.2.3.254", false},
+		{"m4in6-range-mixed-normalized", "ip-from:::ffff:1.2.3.1,ip-to:1.2.3.254", EntryIP, "1.2.3.1-1.2.3.254", false},
+		// —— 【加固】condition 规范形（minor#12）：快照去重键（kind|cond）——
+		// 对语义等价的条目（大小写/零压缩写法不同）必须产出同一 condition
+		{"uppercase-v6-canonicalized", "IP-CIDR:2001:DB8::/32", EntryIP, "2001:db8::/32", false},
+		{"v6-zero-compression-canonicalized", "2001:0db8:0000::1", EntryIP, "2001:db8::1", false},
+		// —— 【加固】geoip 多国排序归一（minor#12 伴随）——
+		{"geoip-colon-multi-sorted", "geoip:HK+CN", EntryGeoIP, "CN+HK", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

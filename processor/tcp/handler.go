@@ -262,11 +262,24 @@ func selectUniqueCachedDomainEntry(entries []*cachepkg.CacheEntry) (*cachepkg.Ca
 	return nil, 0
 }
 
+// setMetadataHostFromObservedSNI 将观察到的 TLS SNI 落入 metadata.HostName。
+// 【加固】与 HTTP Host 路径同标准校验（normalizeRoutingHost：空标签/超长/连字符边界/
+// IP 字面量等判非法）：畸形 SNI（如 "www.example.com.."）不再按原样落入 HostName——
+// 畸形串永不命中域名规则，等于绕过（含镜像/AI 归因）。非法 → HostName 保持空，
+// 视同无 SNI（IP/geoip 规则仍可命中），与无 SNI 特性语义自然衔接。
 func setMetadataHostFromObservedSNI(metadata *M.Metadata, sni string) {
 	if metadata == nil || sni == "" {
 		return
 	}
-	metadata.SetHostName(sni, M.BindingSourceSNI, M.DefaultSNITTL)
+	host := normalizeRoutingHost(sni)
+	if host == "" {
+		logger.Warn(fmt.Sprintf(
+			"[TUN TLS] conn_id=%s dropped malformed SNI %q; treating as no-SNI connection",
+			ensureTCPConnID(metadata), sni,
+		))
+		return
+	}
+	metadata.SetHostName(host, M.BindingSourceSNI, M.DefaultSNITTL)
 	logObservedTLSServerName(metadata, "sni")
 }
 
@@ -546,10 +559,15 @@ func (h *TCPConnectionHandler) handleTLS(
 			logger.Warn(fmt.Sprintf("[TLS] SNI extraction error: %v", err))
 			sni = ""
 		} else if sni != "" {
-			// Set hostname with SNI binding source
+			// Set hostname with SNI binding source；畸形 SNI 被同标准校验拦截时
+			// HostName 保持空——此处同步置空 sni，防止下方 mitmedSNI/日志继续使用畸形串
+			// （视同无 SNI：走无 SNI 路径，IP/geoip 规则仍可命中）
 			setMetadataHostFromObservedSNI(metadata, sni)
-
-			logger.Info(fmt.Sprintf("[TLS] Successfully extracted SNI: %s", sni))
+			if metadata.HostName == "" {
+				sni = ""
+			} else {
+				logger.Info(fmt.Sprintf("[TLS] Successfully extracted SNI: %s", sni))
+			}
 		}
 	}
 
