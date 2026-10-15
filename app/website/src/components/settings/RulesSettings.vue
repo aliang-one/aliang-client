@@ -321,7 +321,8 @@ function normalizeStringList(items) {
     : [];
 }
 
-function sanitizeList(value) {
+// 具名导出仅供同目录 RulesSettings.test.js 做分词器回归测试使用
+export function sanitizeList(value) {
   return value
     .split(/[\n,;]+/)
     .map((entry) => normalizeIncludeEntry(entry))
