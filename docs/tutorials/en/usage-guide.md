@@ -359,7 +359,10 @@ domain,example.com,proxy
 1. Rule explanation:
   - Part 1: Fixed as `domain` (or `domains`); IP conditions may use the `ip-cidr` / `ip-range` prefix instead
   - Part 2: Domain to match (`*` wildcards supported) or an IP / GeoIP condition
-  - Part 3: `proxy` (use proxy) or `direct` (direct connect)
+  - Part 3 (optional): `proxy` or `direct` — kept only for Clash-style
+    compatibility and **not used in routing**: all proxy-rule matches egress
+    uniformly per the customer upstream-proxy switch (Section 6) — through
+    the customer proxy when enabled, direct otherwise
 
 ### Domain Wildcards
 
@@ -388,7 +391,7 @@ IP conditions support both IPv4 and IPv6 (keywords are case-insensitive):
 ip-cidr:121.32.12.0/24              explicit keyword prefix
 ip-range:1.2.3.1-1.2.3.254
 ip-from:1.2.3.1,ip-to:1.2.3.254     keyword pair (optional trailing action, e.g. …,proxy)
-ip-cidr,121.32.12.0/24,proxy        Clash style (third part is the action)
+ip-cidr,121.32.12.0/24,proxy        Clash style (third part is ignored)
 ip-range,1.2.3.1-1.2.3.254,direct
 ```
 
@@ -401,9 +404,14 @@ ip-range,1.2.3.1-1.2.3.254,direct
 > name to match), which falls back to the default direct route; connections
 > hitting AI rules (MITM routing) are automatically downgraded to direct,
 > and deny-type decisions degrade to direct as well — SNI-less connections
-> never enter the MITM/mirror path and are never blocked. UDP traffic and
-> local HTTP-proxy inbound traffic never reach the rules engine, so IP
-> conditions have no effect on those two paths. `0.0.0.0/0` matches IPv4
+> never enter the MITM/mirror path and are never blocked. The only blind spot
+> is UDP traffic: it bypasses the rules engine and always goes direct, so IP
+> conditions have no effect on it. TCP connections inbound through the local
+> HTTP proxy (CONNECT) do go through the rules engine as well — the
+> destination IP is filled in by a DNS lookup at inbound time, so
+> geoip/IP/domain rules all apply there (if that lookup fails, the
+> destination IP stays empty: IP/geoip rules miss, while domain rules still
+> apply). `0.0.0.0/0` matches IPv4
 > destinations only; `::/0` matches IPv6 destinations only.
 
 > **Validation**: malformed entries (invalid IPs, reversed ranges, empty
@@ -437,9 +445,10 @@ use `+`, not commas), `geoip:CN+` (empty segment), or a bare `geoip`.
 
 > **Where GeoIP rules apply**: exactly the same scope as the IP conditions
 > above — TCP connections on the deep-mode (TUN) path, matched by the country
-> of the real destination IP; SNI-less TLS traffic is included (see the note
-> above). UDP traffic and local HTTP-proxy inbound traffic never reach the
-> rules engine, so geoip has no effect there. Until the country database is
+> of the real destination IP; SNI-less TLS traffic and TCP connections inbound
+> through the local HTTP proxy (CONNECT) are included (see the note above).
+> The only blind spot is likewise UDP traffic, which never reaches the rules
+> engine, so geoip has no effect on it. Until the country database is
 > ready, geoip rules simply never match (no error, no impact on other rules).
 
 > **Data acquisition**: the GeoLite2 country database
@@ -469,7 +478,7 @@ domain,github.com,proxy
 domains,*.epic.com
 domains,aliang.*
 
-# These domains connect directly
+# Clash-style form (trailing action is ignored — see the Part 3 note above)
 domain,google.com,direct
 
 # IP conditions
@@ -480,7 +489,7 @@ ip-from:1.2.3.1,ip-to:1.2.3.254
 # GeoIP conditions (country-based routing)
 geoip:CN
 geoip:CN+HK+US
-geoip,US,direct
+geoip,US,proxy
 ```
 
 ---

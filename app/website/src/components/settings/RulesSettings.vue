@@ -392,7 +392,8 @@ function isValidIPCond(cond) {
 }
 
 // 返回 '' 表示合法，否则返回 i18n 错误文案。
-function validateRuleEntry(raw, t) {
+// 具名导出仅供同目录 RulesSettings.test.js 做 geoip 形态回归测试使用（与 sanitizeList 同例）。
+export function validateRuleEntry(raw, t) {
   let s = String(raw || '').trim();
   if (!s) return '';
   const lower = s.toLowerCase();
@@ -406,6 +407,8 @@ function validateRuleEntry(raw, t) {
     if (!codes.length || !codes.every((c) => /^[A-Z]{2}$/.test(c))) return t('rules_geoipInvalid');
     return '';
   }
+  // 裸 geoip 关键字：后端 ClassifyEntry 专门拒绝（当域名放行无意义），前端对齐
+  if (lower === 'geoip') return t('rules_geoipInvalid');
   if (lower.startsWith('ip-cidr:')) return isValidIPCond(s.slice(8).trim()) ? '' : t('rules_ipInvalid');
   if (lower.startsWith('ip-range:')) return isValidIPCond(s.slice(9).trim()) ? '' : t('rules_ipInvalid');
   if (lower.startsWith('ip-from:')) {
@@ -422,6 +425,16 @@ function validateRuleEntry(raw, t) {
       // 对齐后端：关键字与逗号之间允许空白（first 已 trim，分派取代原 startsWith('ip-cidr,') 特判）
       const second = parts[1];
       return second && isValidIPCond(second.trim()) ? '' : t('rules_ipInvalid');
+    } else if (first === 'geoip') {
+      // 对齐后端 Clash geoip 分支：单国 + 可选 proxy 尾段合法；
+      // 其余段再出现两位国家码 = 逗号多国尝试（后端拒绝，include 面也会被拆坏）→ 提示 + 分隔
+      if (parts.length < 2 || !parts[1].trim()) return t('rules_geoipInvalid');
+      const second = parts[1].trim().toUpperCase();
+      if (!/^[A-Z]{2}$/.test(second)) return t('rules_geoipInvalid');
+      for (let i = 2; i < parts.length; i++) {
+        if (/^[A-Za-z]{2}$/.test(parts[i].trim())) return t('rules_geoipCommaMulti');
+      }
+      return '';
     } else if (parts[parts.length - 1].trim() === 'proxy') s = parts[parts.length - 2] || '';
     else s = parts[parts.length - 1];
   }

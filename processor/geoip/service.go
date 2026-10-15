@@ -1,6 +1,7 @@
 package geoip
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -62,7 +63,8 @@ func DefaultDatabasePath() (string, error) {
 }
 
 // downloadMu 是下载互斥（single-flight）：EnsureDownloaded 已导出为编排积木，
-// 并发调用会因共享 .tmp 临时文件互相碰撞并可能持久化损坏文件。
+// 并发调用会重复触发完整下载（随机临时文件名虽不再互相碰撞，但重复下载
+// 浪费带宽且装载窗口拉长）。
 var downloadMu sync.Mutex
 
 // EnsureDownloaded 确保本地存在数据库文件；缺失则下载（绝不持 s.mu）。
@@ -189,11 +191,31 @@ func (s *Service) EnsureLoadedAsync() error {
 // downloadFunc 是下载 seam，测试可替换以避免真实网络。
 var downloadFunc = downloadDatabase
 
-// downloadDatabase 从指定 URL 下载 GeoIP 数据库到目标路径
+// maxDownloadBytes 是单次下载数据库的体积上限（64MiB）。GeoLite2-Country
+// 当前约 10MB，留足余量；防止恶意/误配的下载源以无限流写满磁盘分区。
+const maxDownloadBytes = 64 << 20
+
+// downloadDatabase 从指定 URL 下载 GeoIP 数据库到目标路径。
+// 安全约束：重定向目标必须 https 且至多 3 跳；体积超过 maxDownloadBytes
+// 拒绝；临时文件随机名创建（O_EXCL，预置 .tmp 符号链接/同名抢占失效）；
+// rename 前用 geoip2.Open 试开校验，损坏内容（如 HTTP 200 的 HTML 错误页）
+// 不落地。
 func downloadDatabase(url, destPath string) error {
-	// 创建 HTTP 客户端，设置超时
+	// 创建 HTTP 客户端，设置超时与重定向策略
 	client := &http.Client{
 		Timeout: 5 * time.Minute, // 5 分钟超时，数据库文件可能比较大
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 3 {
+				return fmt.Errorf("too many redirects")
+			}
+			// 初始 URL 可由 env 覆盖（operator 控制），scheme 校验只约束
+			// 重定向链：非 https 目标一律拒绝，同时阻断跨主机明文跳转
+			// 与 https→http 降级。
+			if req.URL.Scheme != "https" {
+				return fmt.Errorf("refusing insecure redirect to %s", req.URL)
+			}
+			return nil
+		},
 	}
 
 	// 发送 GET 请求
@@ -208,29 +230,54 @@ func downloadDatabase(url, destPath string) error {
 		return fmt.Errorf("download failed with status code %d", resp.StatusCode)
 	}
 
-	// 创建临时文件
-	tempFile := destPath + ".tmp"
-	out, err := os.Create(tempFile)
-	if err != nil {
-		return fmt.Errorf("failed to create temp file %s: %w", tempFile, err)
+	// 服务端已声明体积超限则提前失败，不必拉取
+	if resp.ContentLength > maxDownloadBytes {
+		return fmt.Errorf("declared download size %d exceeds maximum size of %d bytes",
+			resp.ContentLength, maxDownloadBytes)
 	}
-	defer out.Close()
 
-	// 写入数据，显示下载进度
-	written, err := io.Copy(out, resp.Body)
+	// 随机名临时文件（O_EXCL）：不触碰任何已存在路径，预置 .tmp 符号链接
+	// 或同名合法 mmdb 的抢占攻击失效（原实现固定名 + os.Create 会跟随符号链接）
+	tmp, err := os.CreateTemp(filepath.Dir(destPath), filepath.Base(destPath)+"-*.tmp")
 	if err != nil {
-		os.Remove(tempFile) // 清理临时文件
+		return fmt.Errorf("failed to create temp file for %s: %w", destPath, err)
+	}
+	tmpPath := tmp.Name()
+
+	// 写入数据并施加体积上限：请求 maxDownloadBytes+1 字节——读满仍未 EOF
+	// 即实际体积超限（CopyN 对更短的 body 返回 io.EOF 表示正常收尾）
+	written, err := io.CopyN(tmp, resp.Body, maxDownloadBytes+1)
+	if err == nil {
+		tmp.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("download exceeds maximum size of %d bytes", maxDownloadBytes)
+	}
+	if !errors.Is(err, io.EOF) {
+		tmp.Close()
+		os.Remove(tmpPath)
 		return fmt.Errorf("failed to save database: %w", err)
 	}
 
 	logger.Debug(fmt.Sprintf("Downloaded %d bytes", written))
 
 	// 关闭文件句柄
-	out.Close()
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("failed to close temp file: %w", err)
+	}
+
+	// 落地校验：rename 前试开一次，坏内容不落地（顺带修复「损坏文件无自愈」
+	// 缺陷家族的主症状：HTTP-200-HTML 不再砖化）
+	validate, err := geoip2.Open(tmpPath)
+	if err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("downloaded database failed validation: %w", err)
+	}
+	_ = validate.Close()
 
 	// 重命名临时文件为最终文件
-	if err := os.Rename(tempFile, destPath); err != nil {
-		os.Remove(tempFile) // 清理临时文件
+	if err := os.Rename(tmpPath, destPath); err != nil {
+		os.Remove(tmpPath) // 清理临时文件
 		return fmt.Errorf("failed to rename temp file: %w", err)
 	}
 
