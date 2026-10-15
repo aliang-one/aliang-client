@@ -24,10 +24,18 @@ type Service struct {
 }
 
 const (
-	// DefaultGeoIPDownloadURL 默认的 GeoIP 数据库下载地址
-	DefaultGeoIPDownloadURL  = "https://git.io/GeoLite2-Country.mmdb"
+	// DefaultGeoIPDownloadURL 用户自有 COS 分发（git.io 短链已失效）。
+	DefaultGeoIPDownloadURL  = "https://aliang-1305838434.cos.ap-nanjing.myqcloud.com/static/GeoLite2-Country.mmdb"
 	DefaultGeoIPDatabaseFile = "GeoLite2-Country.mmdb"
 )
+
+// geoipDownloadURL 返回生效下载地址（env 可覆盖）。
+func geoipDownloadURL() string {
+	if u := os.Getenv("ALIANG_GEOIP_DOWNLOAD_URL"); u != "" {
+		return u
+	}
+	return DefaultGeoIPDownloadURL
+}
 
 var (
 	defaultService *Service
@@ -53,10 +61,60 @@ func DefaultDatabasePath() (string, error) {
 	return filepath.Join(geoipDir, DefaultGeoIPDatabaseFile), nil
 }
 
-// LoadDatabase loads the MaxMind GeoLite2 database from the specified path
-// If the database file doesn't exist, it will automatically download from DefaultGeoIPDownloadURL
-// Supports ~ expansion (e.g., ~/.aliang/GeoLite2-Country.mmdb)
-func (s *Service) LoadDatabase(path string) error {
+// downloadMu 是下载互斥（single-flight）：EnsureDownloaded 已导出为编排积木，
+// 并发调用会因共享 .tmp 临时文件互相碰撞并可能持久化损坏文件。
+var downloadMu sync.Mutex
+
+// EnsureDownloaded 确保本地存在数据库文件；缺失则下载（绝不持 s.mu）。
+// 支持 ~ 展开；path 为空时使用 DefaultDatabasePath；并发调用 single-flight。
+func EnsureDownloaded(path string) error {
+	if path == "" {
+		defaultPath, err := DefaultDatabasePath()
+		if err != nil {
+			return err
+		}
+		path = defaultPath
+	}
+
+	// 展开 ~ 路径（例如 ~/.aliang/GeoLite2-Country.mmdb）
+	expandedPath, err := cache.ExpandHomePath(path)
+	if err != nil {
+		return fmt.Errorf("failed to expand path %s: %w", path, err)
+	}
+
+	// 已存在则零网络直接返回（无锁快路径）
+	if _, err := os.Stat(expandedPath); err == nil {
+		return nil
+	}
+
+	downloadMu.Lock()
+	defer downloadMu.Unlock()
+
+	// double-check：拿到锁后再查一次（可能别的调用者已下载完）
+	if _, err := os.Stat(expandedPath); err == nil {
+		return nil
+	}
+
+	logger.Info(fmt.Sprintf("GeoIP database not found at %s, downloading from %s", expandedPath, geoipDownloadURL()))
+
+	// 确保目标目录存在
+	dir := filepath.Dir(expandedPath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("failed to create directory %s: %w", dir, err)
+	}
+
+	// 下载数据库文件
+	if err := downloadFunc(geoipDownloadURL(), expandedPath); err != nil {
+		return fmt.Errorf("failed to download GeoIP database: %w", err)
+	}
+
+	logger.Info(fmt.Sprintf("GeoIP database downloaded successfully to %s", expandedPath))
+	return nil
+}
+
+// LoadLocal 仅打开本地数据库并原子替换 reader；缺失即错、不下载。
+// 持 s.mu 只做本地 IO 与 reader 原子 swap。path 为空时使用 DefaultDatabasePath。
+func (s *Service) LoadLocal(path string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -76,22 +134,9 @@ func (s *Service) LoadDatabase(path string) error {
 
 	logger.Debug(fmt.Sprintf("Loading GeoIP database from: %s (expanded from: %s)", expandedPath, path))
 
-	// 检查数据库文件是否存在
+	// 缺失即错，不触发下载
 	if _, err := os.Stat(expandedPath); os.IsNotExist(err) {
-		logger.Info(fmt.Sprintf("GeoIP database not found at %s, downloading from %s", expandedPath, DefaultGeoIPDownloadURL))
-
-		// 确保目标目录存在
-		dir := filepath.Dir(expandedPath)
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			return fmt.Errorf("failed to create directory %s: %w", dir, err)
-		}
-
-		// 下载数据库文件
-		if err := downloadDatabase(DefaultGeoIPDownloadURL, expandedPath); err != nil {
-			return fmt.Errorf("failed to download GeoIP database: %w", err)
-		}
-
-		logger.Info(fmt.Sprintf("GeoIP database downloaded successfully to %s", expandedPath))
+		return fmt.Errorf("GeoIP database not found at %s", expandedPath)
 	}
 
 	// 打开数据库
@@ -111,6 +156,38 @@ func (s *Service) LoadDatabase(path string) error {
 
 	return nil
 }
+
+// EnsureLoadedAsync 本地已有数据库则同步装载；缺失则后台下载后装载（不阻塞调用方）。
+// start/tray/core 三条启动路径共用。返回 nil 仅代表编排已启动。
+func (s *Service) EnsureLoadedAsync() error {
+	path, err := DefaultDatabasePath()
+	if err != nil {
+		return err
+	}
+	expanded, err := cache.ExpandHomePath(path)
+	if err != nil {
+		return err
+	}
+	if _, statErr := os.Stat(expanded); statErr == nil {
+		return s.LoadLocal(path) // 本地 IO，同步完成
+	}
+	logger.Info("GeoIP database not found, downloading in background: " + geoipDownloadURL())
+	go func() {
+		if err := EnsureDownloaded(path); err != nil {
+			logger.Warn(fmt.Sprintf("GeoIP database background download failed (will retry next startup): %v", err))
+			return
+		}
+		if err := s.LoadLocal(path); err != nil {
+			logger.Warn(fmt.Sprintf("GeoIP database load failed after download: %v", err))
+			return
+		}
+		logger.Info("GeoIP database ready; geoip rules now active")
+	}()
+	return nil
+}
+
+// downloadFunc 是下载 seam，测试可替换以避免真实网络。
+var downloadFunc = downloadDatabase
 
 // downloadDatabase 从指定 URL 下载 GeoIP 数据库到目标路径
 func downloadDatabase(url, destPath string) error {

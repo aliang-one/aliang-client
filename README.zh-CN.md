@@ -158,6 +158,13 @@ aliang.*                   任意 TLD（aliang.com、aliang.co.uk）
 1.2.3.1-1.2.3.254          闭区间
 ip-cidr:121.32.12.0/24     显式关键字（另有 ip-range:、ip-from:…,ip-to:…）
 ip-cidr,121.32.12.0/24,proxy   Clash 风格，尾段为动作（proxy_rules）
+
+# GeoIP 条件——按目的 IP 的归属国分流
+#（两位大写 ISO 3166-1 国家码）
+geoip:CN                   单国
+geoip:CN+HK+US             多国任一命中（多国用 + 分隔）
+GEOIP,CN,proxy             Clash 风格，单国（仅 proxy_rules 与配置文件；
+                           AI 规则输入框按逗号拆分，该形态会被拒绝）
 ```
 
 - IP 条件在 TUN（深度模式）TCP 链路上按真实目的 IP 匹配。无 SNI 的 TLS
@@ -165,9 +172,17 @@ ip-cidr,121.32.12.0/24,proxy   Clash 风格，尾段为动作（proxy_rules）
   无名可匹配、落默认直连；无 SNI 连接不会进入 MITM 路径——命中 AI 规则
   （MITM 路由）自动降级直连，deny 类决策同样退化为直连。UDP 流量与本
   地 HTTP 代理入站不经过规则引擎，IP 条件在这两条链路不生效。
+- GeoIP 条目的生效范围与上面的 IP 条件完全相同。GeoLite2 国家库
+  （`GeoLite2-Country.mmdb`）在启动时本地缺失则自动后台下载（默认源为
+  项目 COS 镜像，可用环境变量 `ALIANG_GEOIP_DOWNLOAD_URL` 覆盖）；库
+  就绪前 geoip 规则一律不命中。数据库不做自动刷新，建议每月刷新一次。
+  非法条目（如 `geoip:CHN`、`geoip:CN,HK`——多国须用 `+` 分隔、
+  `geoip:CN+`——空段）保存时会被明确拒绝；geoip 流量按国家分流，
+  但不计入 AI 提供商活动统计（统计按域名归类）。
 - 非法条目（坏 IP、空标签如 `a..b` 等）保存时会被明确拒绝。
 - `traffic_mirror.domains` 按域名（SNI/Host）匹配：裸单 IP 可按字面命中，
-  CIDR / 区间在镜像链路不生效——按 IP 分流请用 AI 规则或 `proxy_rules`。
+  CIDR / 区间在镜像链路不生效——按 IP 分流请用 AI 规则或 `proxy_rules`；
+  geoip 条目在镜像列表中会被直接拒绝（按域名匹配永不可能命中）。
 
 ### 流量镜像
 
@@ -264,8 +279,10 @@ curl -X DELETE http://localhost:56431/api/dns/cache
   不当会破坏部分站点（如 Cursor）的加载。
 - **MITM CA**：拦截需要系统显式信任 `mitm-ca.pem`；证书固定的应用可能
   无法拦截。
-- **GeoIP**：路由使用 GeoLite2（`data/GeoLite2-Country.mmdb`）；需定期
-  更新数据库。
+- **GeoIP**：路由使用 GeoLite2；国家库存于
+  `~/.aliang/geoip/GeoLite2-Country.mmdb`，首次启动缺失时自动后台下载
+  （COS 镜像，`ALIANG_GEOIP_DOWNLOAD_URL` 可覆盖）。不做自动刷新——
+  建议每月刷新一次副本。
 
 ## 安全
 

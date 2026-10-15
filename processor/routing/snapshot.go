@@ -327,8 +327,11 @@ func compileCanonicalRoutingFromRuntimeInputs(cfg *config.Config, switches model
 			}
 			seen[key] = struct{}{}
 			ruleType := model.RuleTypeDomain
-			if kind == match.EntryIP {
+			switch kind {
+			case match.EntryIP:
 				ruleType = model.RuleTypeIP
+			case match.EntryGeoIP:
+				ruleType = model.RuleTypeGeoIP
 			}
 			rules = append(rules, config.CanonicalRoutingRule{
 				ID:        fmt.Sprintf("%s_%d", idPrefix, index),

@@ -14,6 +14,7 @@ type EntryKind int
 const (
 	EntryDomain EntryKind = iota
 	EntryIP
+	EntryGeoIP
 )
 
 // String 返回 CanonicalRoutingRule.Type 使用的字符串。
@@ -23,6 +24,8 @@ func (k EntryKind) String() string {
 		return "domain"
 	case EntryIP:
 		return "ip"
+	case EntryGeoIP:
+		return "geoip"
 	default:
 		return "unknown"
 	}
@@ -54,6 +57,12 @@ func ClassifyEntry(raw string) (EntryKind, string, error) {
 		}
 		return EntryIP, cond, validateIPCond(cond)
 	}
+	if lower == "geoip" {
+		return EntryGeoIP, "", fmt.Errorf("裸 geoip 条目无意义；请使用 geoip:CN 或 geoip:CN+HK+US")
+	}
+	if strings.HasPrefix(lower, "geoip:") {
+		return classifyGeoIPColon(s[len("geoip:"):])
+	}
 
 	// —— Clash 风格逗号条目 ——
 	if strings.Contains(s, ",") {
@@ -71,6 +80,20 @@ func ClassifyEntry(raw string) (EntryKind, string, error) {
 			}
 			cond := strings.TrimSpace(parts[1])
 			return EntryIP, cond, validateIPCond(cond)
+		case "geoip":
+			if len(parts) < 2 || strings.TrimSpace(parts[1]) == "" {
+				return EntryGeoIP, "", fmt.Errorf("geoip 前缀条目缺少国家码")
+			}
+			code := strings.ToUpper(strings.TrimSpace(parts[1]))
+			if !isValidCountryCode(code) {
+				return EntryGeoIP, "", fmt.Errorf("非法国家码 %q（ISO 3166-1 两位大写字母）", parts[1])
+			}
+			for _, extra := range parts[2:] {
+				if isValidCountryCode(strings.ToUpper(strings.TrimSpace(extra))) {
+					return EntryGeoIP, "", fmt.Errorf("geoip 多国请用 + 分隔（如 geoip:CN+HK），得到 %q", s)
+				}
+			}
+			return EntryGeoIP, code, nil
 		}
 		// 既有兜底（parseProxyRuleDomain 语义）：取尾段；尾段为 proxy 时取倒数第二段。
 		// 完整保留旧解释，保证 DOMAIN-SUFFIX,x,proxy / a.com,b.com,proxy 等存量形态按旧值通过。
@@ -188,4 +211,37 @@ func classifyDomainEntry(v string) (EntryKind, string, error) {
 		}
 	}
 	return EntryDomain, lower, nil
+}
+
+// classifyGeoIPColon 解析冒号风格 geoip 条目（多国 + 分隔）。
+func classifyGeoIPColon(rem string) (EntryKind, string, error) {
+	rem = strings.TrimSpace(rem)
+	if rem == "" {
+		return EntryGeoIP, "", fmt.Errorf("geoip 条件为空")
+	}
+	if strings.Contains(rem, ",") {
+		return EntryGeoIP, "", fmt.Errorf("geoip 多国请用 + 分隔（如 geoip:CN+HK），得到 %q", rem)
+	}
+	seen := map[string]struct{}{}
+	norm := make([]string, 0, 4)
+	for _, seg := range strings.Split(rem, "+") {
+		c := strings.ToUpper(strings.TrimSpace(seg))
+		if c == "" {
+			return EntryGeoIP, "", fmt.Errorf("geoip 条目含空国家码 %q", rem)
+		}
+		if !isValidCountryCode(c) {
+			return EntryGeoIP, "", fmt.Errorf("非法国家码 %q（ISO 3166-1 两位大写字母）", seg)
+		}
+		if _, dup := seen[c]; dup {
+			continue
+		}
+		seen[c] = struct{}{}
+		norm = append(norm, c)
+	}
+	return EntryGeoIP, strings.Join(norm, "+"), nil
+}
+
+// isValidCountryCode 判断两位大写 ISO 3166-1 alpha-2 国家码。
+func isValidCountryCode(c string) bool {
+	return len(c) == 2 && c[0] >= 'A' && c[0] <= 'Z' && c[1] >= 'A' && c[1] <= 'Z'
 }

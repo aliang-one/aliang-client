@@ -55,6 +55,24 @@ func TestClassifyEntry(t *testing.T) {
 		{"empty-value-after-prefix", "domains,,proxy", EntryDomain, "", true},
 		{"hostile-query-url", "http://a.com/x?y=<script>", EntryDomain, "a.com", false},
 		{"uppercase-prefix", "DOMAINS,Google.COM", EntryDomain, "google.com", false},
+		// —— geoip（Task 1）——
+		{"geoip-colon-single", "geoip:CN", EntryGeoIP, "CN", false},
+		{"geoip-colon-multi", "geoip:CN+HK+US", EntryGeoIP, "CN+HK+US", false},
+		{"geoip-colon-case", "GEOIP:cn", EntryGeoIP, "CN", false},
+		{"geoip-colon-spaces", " geoip: CN + HK ", EntryGeoIP, "CN+HK", false},
+		{"geoip-colon-dedupe", "geoip:CN+CN", EntryGeoIP, "CN", false},
+		{"geoip-clash-single", "GEOIP,CN,proxy", EntryGeoIP, "CN", false},
+		{"geoip-clash-no-tail", "geoip,JP", EntryGeoIP, "JP", false},
+		{"geoip-clash-noise-tail", "geoip,CN,proxy,extra", EntryGeoIP, "CN", false},
+		{"geoip-colon-comma-multi-rejected", "geoip:CN,HK", EntryGeoIP, "", true},
+		{"geoip-clash-comma-multi-rejected", "geoip,CN,HK", EntryGeoIP, "", true},
+		{"geoip-bare-keyword-rejected", "geoip", EntryGeoIP, "", true},
+		{"geoip-empty", "geoip:", EntryGeoIP, "", true},
+		{"geoip-empty-plus", "geoip:CN++HK", EntryGeoIP, "", true},
+		{"geoip-colon-trailing-plus", "geoip:CN+", EntryGeoIP, "", true},
+		{"geoip-bad-code", "geoip:CHN", EntryGeoIP, "", true},
+		{"geoip-colon-comma-rejected-mixed-case", "geoip:cn,HK", EntryGeoIP, "", true},
+		{"geoip-clash-empty", "geoip,", EntryGeoIP, "", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
