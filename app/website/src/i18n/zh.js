@@ -644,6 +644,8 @@ export default {
   rules_entryInvalidChars: '条目含非法字符（域名仅允许字母数字、点、连字符与 *；IP 条件请检查格式）',
   rules_entryEmptyLabel: '域名不能包含空标签（如 a..b、首尾点号）',
   rules_ipInvalid: 'IP 条件无效（支持 单IP / CIDR(如 121.32.12.0/24) / 区间(如 1.2.3.1-1.2.3.254)）',
+  rules_geoipInvalid: 'geoip 条目无效（国家码为两位大写字母 ISO 3166-1，多国用 + 分隔，如 geoip:CN+HK）',
+  rules_geoipCommaMulti: 'geoip 多国请用 + 分隔（如 geoip:CN+HK）；逗号写法在当前输入框会被拆坏',
   rules_entryErrorItem: '条目“{entry}”：{message}',
   rules_proxyUsername: '用户名',
   rules_proxyUsernamePlaceholder: '可选',
