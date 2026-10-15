@@ -186,9 +186,10 @@ GEOIP,CN,proxy              Clash style, single country (proxy_rules and
   `ALIANG_GEOIP_DOWNLOAD_URL` environment variable). Until the database is
   ready, geoip rules simply never match. The database is never refreshed
   automatically — refresh it about once a month. Invalid entries
-  (`geoip:CHN`, `geoip:CN,HK` — multiple countries must use `+`, empty
-  segments) are rejected on save, and geoip-routed traffic is not attributed
-  to AI provider statistics (statistics match by domain).
+  (`geoip:CHN`, `geoip:CN,HK` — multiple countries must use `+`,
+  `geoip:CN+` — empty segment) are rejected on save, and geoip-routed
+  traffic is not attributed to AI provider statistics (statistics match by
+  domain).
 - Malformed entries (invalid IPs, empty labels like `a..b`) are rejected on
   save.
 - `traffic_mirror.domains` is matched by domain (SNI/host): a bare single IP

@@ -966,7 +966,7 @@ GEOIP,CN,proxy                Clash 风格，单国（仅代理规则 / 配置�
 
 
 <Callout type="info">
-  **数据获取**：GeoLite2 国家数据库（`GeoLite2-Country.mmdb`）在启动时若本地缺失，会自动从 COS 镜像后台下载到本地数据目录（默认 `~/.aliang/geoip/`），不阻塞启动；下载失败仅记录日志、下次启动重试。环境变量 `ALIANG_GEOIP_DOWNLOAD_URL` 可覆盖下载地址。数据库不做自动刷新，建议每月手动刷新一次（删除本地文件后重启触发重新下载，或直接覆盖该文件）。
+  **数据获取**：GeoLite2 国家数据库（`GeoLite2-Country.mmdb`）在启动时若本地缺失，会自动从 COS 镜像后台下载到本地数据目录（默认 `~/.aliang/geoip/`），不阻塞启动；下载失败仅记录日志、下次启动重试。环境变量 `ALIANG_GEOIP_DOWNLOAD_URL` 可覆盖下载地址。数据库不做自动刷新，建议每月手动刷新一次：删除本地文件后重启会触发重新下载，或直接覆盖该文件——覆盖后需重启 agent 才会装载新库（装载只在启动时进行，无热重载）。
 </Callout>
 
 

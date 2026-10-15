@@ -176,9 +176,9 @@ GEOIP,CN,proxy             Clash 风格，单国（仅 proxy_rules 与配置文�
   （`GeoLite2-Country.mmdb`）在启动时本地缺失则自动后台下载（默认源为
   项目 COS 镜像，可用环境变量 `ALIANG_GEOIP_DOWNLOAD_URL` 覆盖）；库
   就绪前 geoip 规则一律不命中。数据库不做自动刷新，建议每月刷新一次。
-  非法条目（如 `geoip:CHN`、`geoip:CN,HK`——多国须用 `+` 分隔、空段）
-  保存时会被明确拒绝；geoip 流量按国家分流，但不计入 AI 提供商活动
-  统计（统计按域名归类）。
+  非法条目（如 `geoip:CHN`、`geoip:CN,HK`——多国须用 `+` 分隔、
+  `geoip:CN+`——空段）保存时会被明确拒绝；geoip 流量按国家分流，
+  但不计入 AI 提供商活动统计（统计按域名归类）。
 - 非法条目（坏 IP、空标签如 `a..b` 等）保存时会被明确拒绝。
 - `traffic_mirror.domains` 按域名（SNI/Host）匹配：裸单 IP 可按字面命中，
   CIDR / 区间在镜像链路不生效——按 IP 分流请用 AI 规则或 `proxy_rules`；

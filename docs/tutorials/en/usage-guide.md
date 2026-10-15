@@ -449,8 +449,9 @@ use `+`, not commas), `geoip:CN+` (empty segment), or a bare `geoip`.
 > failure it only logs a warning and retries on the next startup. Set the
 > `ALIANG_GEOIP_DOWNLOAD_URL` environment variable to override the download
 > URL. The database is never refreshed automatically — refresh it about once
-> a month (delete the local file and restart to re-download, or overwrite the
-> file in place).
+> a month: delete the local file and restart to re-download, or overwrite
+> the file in place. After overwriting, restart the agent to load the new
+> database (loading happens only at startup; there is no hot reload).
 
 > **Statistics attribution**: geoip entries are excluded from AI statistics —
 > AI activity statistics match by domain, so country-routed traffic is not
