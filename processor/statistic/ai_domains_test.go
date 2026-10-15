@@ -49,6 +49,10 @@ func TestAIDomainPatternNormalization(t *testing.T) {
 		{"bare ip unchanged", "1.2.3.4", "1.2.3.4"},
 		{"bare v6 ip unchanged", "2001:db8::1", "2001:db8::1"},
 		{"v6 cidr kept intact", "2001:db8::/32", "2001:db8::/32"},
+		// geoip 条目（展示形态与编译侧 condition 一致；现状被端口剥离/原样透传变形）
+		{"geoip colon single", "geoip:CN", "CN"},
+		{"geoip colon multi-country", "geoip:CN+HK", "CN+HK"},
+		{"clash geoip entry", "GEOIP,CN,proxy", "CN"},
 		// 域名 / wildcard / URL / 端口回归（行为与现状一致）
 		{"wildcard preserved", "*.epic.com", "*.epic.com"},
 		{"wildcard ip-ish suffix untouched", "*.1.2.3.4", "*.1.2.3.4"},
@@ -78,6 +82,11 @@ func TestAIDomainPatternNormalization(t *testing.T) {
 	}{
 		{"ip-entry-idempotent", "121.32.12.0/24"},           // normalize 两次结果一致
 		{"clash-ip-idempotent", "ip-cidr,10.0.0.0/8,proxy"}, // 同上
+		// geoip 多国 condition 含 '+'（域名字符集外），再入可被识别补前缀归一，幂等可锁。
+		// 单国码（如 GEOIP,CN,proxy → CN）再入折叠为域名 cn，与 .cn 顶级域不可区分，
+		// 幂等不可锁也不须锁：geoip 条目永不命中域名主机，不进入再归一化链路。
+		{"geoip-multi-idempotent", "geoip:CN+HK"},
+		{"geoip-multi-raw-case-idempotent", "GEOIP:US+HK"}, // 同上（原始大小写无关）
 	}
 	for _, tt := range idempotent {
 		t.Run(tt.name, func(t *testing.T) {

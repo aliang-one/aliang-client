@@ -238,14 +238,25 @@ func normalizeAIDomainPattern(raw string) string {
 		}
 	}
 
-	// IP 条目（单 IP / CIDR / 区间 / ip-from 形态）直接采用共享内核的归一化 condition，
-	// 跳过下方「首个 / 截断」与端口剥离，避免 CIDR/区间被截断变形
-	// （如 121.32.12.0/24 → 121.32.12.0），保证统计侧与编译侧看到同一形态。
-	// *. wildcard 条目不可能是 IP 形态，走既有归一化路径不受影响；
+	// IP / geoip 条目（单 IP / CIDR / 区间 / ip-from / geoip 国家码）直接采用共享内核的
+	// 归一化 condition，跳过下方「首个 / 截断」与端口剥离，避免 CIDR/区间被截断变形
+	// （如 121.32.12.0/24 → 121.32.12.0）、geoip 条目被端口剥离/截断变形
+	// （如 GEOIP,CN,proxy → GEOIP,CN），保证统计侧与编译侧看到同一形态。
+	// *. wildcard 条目不可能是 IP/geoip 形态，走既有归一化路径不受影响；
 	// 非法条目（err 非空）同样落回既有路径。
 	if !wildcard {
-		if kind, cond, err := match.ClassifyEntry(value); err == nil && kind == match.EntryIP {
+		if kind, cond, err := match.ClassifyEntry(value); err == nil && (kind == match.EntryIP || kind == match.EntryGeoIP) {
 			return cond
+		}
+		// 已归一化的多国 geoip condition（如 CN+HK）再入时不带 geoip: 前缀，而 '+' 不在
+		// 域名字符集内（与域名空间零重叠）；补 geoip: 前缀复用内核分类恢复大写形态，
+		// 保证 normalize(normalize(x)) == normalize(x)——ai_activity.go 双次归一化依赖此性质。
+		// 单国码（CN）再入会折叠为域名 cn（.cn 顶级域），不可区分故不在此恢复；
+		// geoip 条目永不命中域名主机，不会进入再归一化链路，无生产影响。
+		if strings.Contains(value, "+") {
+			if kind, cond, err := match.ClassifyEntry("geoip:" + value); err == nil && kind == match.EntryGeoIP {
+				return cond
+			}
 		}
 	}
 
