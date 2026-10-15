@@ -68,9 +68,11 @@ var platformProviderEnvProbe = func() (string, string, bool) {
 // isolated tier (fail-closed) and returns a structured policy notice instead
 // of failing the run (spec §3/§4.1).
 //
-// 平台 env 在位时注入 CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1：settings env
-// 块会覆盖进程 env（官方语义，code.claude.com/docs/en/env-vars#precedence），
-// 不钉死则 sanitized/full 档被用户 settings.json 个人通道反杀。平台缺失的
+// provider 通道语义（2026-10-16 产品决策，重申 2026-08-31 spec §6 的既定结论）：
+// agent 起的 claude 与 TUI 一致——用户 settings.json 的 env 块优先（它本就会
+// 覆盖进程继承 env），注入的平台 env 只在 settings 未提供 provider 时兜底。
+// 因此不得注入 CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST（那会让 claude 无视
+// settings 的 provider 变量，撤销「本地一致」行为）。平台缺失的
 // isolated→sanitized 回退不在此处（会撤销版本守卫的降级），见
 // promoteIsolatedTierForPlatformFallback——必须发生在版本守卫之前。
 func withClaudeRemotePolicy(tool *agentAITool, run agentAIRun) (*agentAITool, func(), map[string]interface{}) {
@@ -80,9 +82,6 @@ func withClaudeRemotePolicy(tool *agentAITool, run agentAIRun) (*agentAITool, fu
 	}
 	copied := *tool
 	copied.args = append([]string(nil), tool.args...)
-	if _, _, present := platformProviderEnvProbe(); present {
-		copied.env = append(copied.env, "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1")
-	}
 	flags := []string{"--setting-sources", claudeTierSettingSources(run.claudePolicy.trustTier)}
 	if run.claudePolicy.trustTier == "sanitized" {
 		pluginDir, err := prepareClaudeProjectCapabilityPlugin(run.projectPath)
