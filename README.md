@@ -177,8 +177,11 @@ GEOIP,CN,proxy              Clash style, single country (proxy_rules and
   match (no name available, so the default direct route applies). SNI-less
   connections never enter the MITM path — AI-rule (MITM) hits are
   downgraded to direct, and deny-type decisions degrade to direct as well.
-  UDP traffic and local HTTP-proxy inbound traffic bypass the rules engine,
-  so IP conditions have no effect on those two paths.
+  The only blind spot is UDP traffic, which bypasses the rules engine and
+  always goes direct. TCP connections inbound through the local HTTP proxy
+  (CONNECT) do go through the rules engine as well — the destination IP is
+  filled in by a DNS lookup at inbound time, so geoip/IP/domain rules all
+  apply there.
 - GeoIP entries take effect on exactly the same paths as IP conditions
   above. The GeoLite2 country database (`GeoLite2-Country.mmdb`) is
   downloaded automatically in the background on startup when missing locally

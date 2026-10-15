@@ -170,8 +170,10 @@ GEOIP,CN,proxy             Clash 风格，单国（仅 proxy_rules 与配置文�
 - IP 条件在 TUN（深度模式）TCP 链路上按真实目的 IP 匹配。无 SNI 的 TLS
   流量同样会携带目的 IP 咨询规则引擎：IP/GeoIP 规则对其生效，域名规则
   无名可匹配、落默认直连；无 SNI 连接不会进入 MITM 路径——命中 AI 规则
-  （MITM 路由）自动降级直连，deny 类决策同样退化为直连。UDP 流量与本
-  地 HTTP 代理入站不经过规则引擎，IP 条件在这两条链路不生效。
+  （MITM 路由）自动降级直连，deny 类决策同样退化为直连。唯一的盲区是
+  UDP 流量——不经过规则引擎、恒直连；本地 HTTP 代理入站的 TCP
+  （CONNECT）链路同样经过规则引擎（入站时目的 IP 已由 DNS 解析填充），
+  geoip/IP/域名规则均生效。
 - GeoIP 条目的生效范围与上面的 IP 条件完全相同。GeoLite2 国家库
   （`GeoLite2-Country.mmdb`）在启动时本地缺失则自动后台下载（默认源为
   项目 COS 镜像，可用环境变量 `ALIANG_GEOIP_DOWNLOAD_URL` 覆盖）；库
