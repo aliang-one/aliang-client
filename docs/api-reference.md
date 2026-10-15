@@ -8,7 +8,7 @@
 |------|----------|----------|------|
 | Aliang API | `{core.api_server}` | Bearer Token / mTLS | 认证、用户、订阅、Key、兑换 |
 | Software Update | `https://www.aliang.one` | 无 | 版本检查 |
-| GeoIP Database | `https://git.io` | 无 | MaxMind 数据库下载 |
+| GeoIP Database | `https://aliang-1305838434.cos.ap-nanjing.myqcloud.com` | 无 | GeoLite2 国家数据库下载（env `ALIANG_GEOIP_DOWNLOAD_URL` 可覆盖） |
 
 `core.api_server` 来自配置文件，典型值：`https://api.aliang.one`
 
@@ -393,11 +393,11 @@ Authorization-Inner: Bearer {current_user_access_token}
 
 ## 11. GeoIP Database Download
 
-**URL:** `https://git.io/GeoLite2-Country.mmdb`
+**URL:** `https://aliang-1305838434.cos.ap-nanjing.myqcloud.com/static/GeoLite2-Country.mmdb`（用户 COS 分发；环境变量 `ALIANG_GEOIP_DOWNLOAD_URL` 可覆盖）
 **Method:** GET
 **Auth:** 无
 **Source:** `processor/geoip/service.go`
 
-下载 MaxMind GeoLite2 Country 数据库（二进制 MMDB 文件）。客户端超时 5 分钟。
+下载 MaxMind GeoLite2 Country 数据库（二进制 MMDB 文件，约 3.3 MB）。启动时（start / tray / core 三条路径）本地缺失则后台异步下载（不阻塞启动；客户端超时 5 分钟，先写 `.tmp` 临时文件、成功后原子重命名）；下载失败仅记日志、下次启动重试。下载完成装载后 geoip 规则自动生效；就绪前 geoip 条目一律不命中。数据库不做自动刷新，COS 副本建议每月刷新一次。
 
 ---

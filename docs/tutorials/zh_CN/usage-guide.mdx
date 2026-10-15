@@ -900,7 +900,7 @@ domain,<域名或 IP 条件>[,<动作>]
 ```
 
 - **第一部分**：固定为 `domain`（或简写为 `domains`）；写 IP 条件时也可以用 `ip-cidr` / `ip-range` 前缀（见下方 IP 条件）
-- **第二部分**：要匹配的域名（支持 `*` 通配符）或 IP 条件
+- **第二部分**：要匹配的域名（支持 `*` 通配符）或 IP / GeoIP 条件
 - **第三部分**（可选）：`proxy`（走代理）或 `direct`（直连），省略时默认为 `proxy`
 
 **域名通配符**
@@ -943,7 +943,35 @@ ip-range,1.2.3.1-1.2.3.254,direct
 
 
 <Callout type="info">
-  **流量镜像说明**：流量镜像的 `domains` 列表按域名（SNI/Host）匹配；在镜像列表里写 IP 条件时，仅裸单 IP 可能按字面命中，CIDR / 区间在镜像链路不生效。需要按 IP 分流请使用 AI 规则或代理规则。
+  **流量镜像说明**：流量镜像的 `domains` 列表按域名（SNI/Host）匹配；在镜像列表里写 IP 条件时，仅裸单 IP 可能按字面命中，CIDR / 区间在镜像链路不生效；geoip 条目则会在保存时被直接拒绝（按域名匹配永不可能命中）。需要按 IP 分流请使用 AI 规则或代理规则。
+</Callout>
+
+
+**GeoIP 条件（按国家分流）**
+
+GeoIP 条目按连接**目的 IP 的归属国**分流，国家码为两位 ISO 3166-1 字母（关键字与国家码大小写不敏感，保存时统一归一为大写）：
+
+```
+geoip:CN                      单国
+geoip:CN+HK+US                多国任一命中（多国用 + 分隔，不能用逗号）
+GEOIP,CN,proxy                Clash 风格，单国（仅代理规则 / 配置文件；
+                              AI 规则输入框按逗号拆分，不支持该形态）
+```
+
+非法写法在保存时会被明确拒绝，例如：`geoip:CHN`（国家码须为两位）、`geoip:CN,HK`（多国误用逗号，请改用 `+` 分隔）、`geoip:CN+`（空段）、裸 `geoip`。
+
+<Callout type="info">
+  **生效范围**：GeoIP 条目与上面的 IP 条件完全一致——在深度模式（TUN）的 TCP 链路上按真实目的 IP 的归属国匹配，无 SNI 的 TLS 流量同样生效（见上方「生效范围」说明）；UDP 流量与本地 HTTP 代理入站不经过规则引擎，不生效。国家数据库未就绪时 geoip 规则一律不命中（不报错、不影响其他规则）。
+</Callout>
+
+
+<Callout type="info">
+  **数据获取**：GeoLite2 国家数据库（`GeoLite2-Country.mmdb`）在启动时若本地缺失，会自动从 COS 镜像后台下载到本地数据目录（默认 `~/.aliang/geoip/`），不阻塞启动；下载失败仅记录日志、下次启动重试。环境变量 `ALIANG_GEOIP_DOWNLOAD_URL` 可覆盖下载地址。数据库不做自动刷新，建议每月手动刷新一次（删除本地文件后重启触发重新下载，或直接覆盖该文件）。
+</Callout>
+
+
+<Callout type="info">
+  **统计归类**：geoip 条目不参与 AI 统计归类——AI 活动统计按域名匹配，按国家分流的流量不会计入任何 AI 提供商的活动统计。
 </Callout>
 
 
@@ -978,6 +1006,13 @@ domain,example.com,direct
 ip-cidr,121.32.12.0/24,proxy
 ip-range,1.2.3.1-1.2.3.254,direct
 ip-from:1.2.3.1,ip-to:1.2.3.254
+
+
+# GeoIP 条件（按国家分流）
+
+geoip:CN
+geoip:CN+HK+US
+geoip,US,direct
 ```
 
 点击页面底部的 **「保存配置」** 提交。

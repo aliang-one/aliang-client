@@ -358,7 +358,7 @@ domain,example.com,proxy
 
 1. Rule explanation:
   - Part 1: Fixed as `domain` (or `domains`); IP conditions may use the `ip-cidr` / `ip-range` prefix instead
-  - Part 2: Domain to match (`*` wildcards supported) or an IP condition
+  - Part 2: Domain to match (`*` wildcards supported) or an IP / GeoIP condition
   - Part 3: `proxy` (use proxy) or `direct` (direct connect)
 
 ### Domain Wildcards
@@ -413,7 +413,48 @@ ip-range,1.2.3.1-1.2.3.254,direct
 > **Traffic mirror**: the mirror `domains` list is matched by domain
 > (SNI/host). Of IP entries, only a bare single IP can ever match (literal
 > SNI/host comparison); CIDR blocks and ranges never match in the mirror path.
-> Use AI Rules or Proxy Rules for IP-based routing.
+> GeoIP entries are rejected outright in the mirror list (they can never match
+> by domain). Use AI Rules or Proxy Rules for IP-based routing.
+
+### GeoIP Conditions
+
+GeoIP entries route traffic by the **country of the connection's destination
+IP**, using two-letter ISO 3166-1 country codes (keywords and codes are
+case-insensitive; codes are normalized to uppercase on save):
+
+```
+geoip:CN                      single country
+geoip:CN+HK+US                multiple countries, '+'-separated (any match;
+                              commas are not allowed for multiple countries)
+GEOIP,CN,proxy                Clash style, single country (Proxy Rules and
+                              config files only — the AI-rules input is split
+                              on commas, so this form is rejected there)
+```
+
+Malformed entries are rejected when you save, for example: `geoip:CHN`
+(country codes must be two letters), `geoip:CN,HK` (multiple countries must
+use `+`, not commas), `geoip:CN+` (empty segment), or a bare `geoip`.
+
+> **Where GeoIP rules apply**: exactly the same scope as the IP conditions
+> above — TCP connections on the deep-mode (TUN) path, matched by the country
+> of the real destination IP; SNI-less TLS traffic is included (see the note
+> above). UDP traffic and local HTTP-proxy inbound traffic never reach the
+> rules engine, so geoip has no effect there. Until the country database is
+> ready, geoip rules simply never match (no error, no impact on other rules).
+
+> **Data acquisition**: the GeoLite2 country database
+> (`GeoLite2-Country.mmdb`) is downloaded automatically in the background on
+> startup when missing locally, from a COS mirror into the local data
+> directory (`~/.aliang/geoip/` by default). It never blocks startup; on
+> failure it only logs a warning and retries on the next startup. Set the
+> `ALIANG_GEOIP_DOWNLOAD_URL` environment variable to override the download
+> URL. The database is never refreshed automatically — refresh it about once
+> a month (delete the local file and restart to re-download, or overwrite the
+> file in place).
+
+> **Statistics attribution**: geoip entries are excluded from AI statistics —
+> AI activity statistics match by domain, so country-routed traffic is not
+> counted toward any AI provider's activity.
 
 ### Examples
 
@@ -434,6 +475,11 @@ domain,google.com,direct
 ip-cidr,121.32.12.0/24,proxy
 ip-range,1.2.3.1-1.2.3.254,direct
 ip-from:1.2.3.1,ip-to:1.2.3.254
+
+# GeoIP conditions (country-based routing)
+geoip:CN
+geoip:CN+HK+US
+geoip,US,direct
 ```
 
 ---

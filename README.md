@@ -161,6 +161,14 @@ aliang.*                   any TLD (aliang.com, aliang.co.uk)
 1.2.3.1-1.2.3.254          closed range
 ip-cidr:121.32.12.0/24     explicit keyword (also ip-range:, ip-from:…,ip-to:…)
 ip-cidr,121.32.12.0/24,proxy   Clash style with trailing action (proxy_rules)
+
+# GeoIP conditions — route by the destination IP's country
+# (two-letter uppercase ISO 3166-1 codes)
+geoip:CN                    single country
+geoip:CN+HK+US              multiple countries, '+'-separated (any match)
+GEOIP,CN,proxy              Clash style, single country (proxy_rules and
+                            config files only — AI-rule include inputs are
+                            split on commas, so this form is rejected there)
 ```
 
 - IP conditions match the real destination IP of TCP connections on the TUN
@@ -171,11 +179,22 @@ ip-cidr,121.32.12.0/24,proxy   Clash style with trailing action (proxy_rules)
   downgraded to direct, and deny-type decisions degrade to direct as well.
   UDP traffic and local HTTP-proxy inbound traffic bypass the rules engine,
   so IP conditions have no effect on those two paths.
+- GeoIP entries take effect on exactly the same paths as IP conditions
+  above. The GeoLite2 country database (`GeoLite2-Country.mmdb`) is
+  downloaded automatically in the background on startup when missing locally
+  (default source: the project's COS mirror; override with the
+  `ALIANG_GEOIP_DOWNLOAD_URL` environment variable). Until the database is
+  ready, geoip rules simply never match. The database is never refreshed
+  automatically — refresh it about once a month. Invalid entries
+  (`geoip:CHN`, `geoip:CN,HK` — multiple countries must use `+`, empty
+  segments) are rejected on save, and geoip-routed traffic is not attributed
+  to AI provider statistics (statistics match by domain).
 - Malformed entries (invalid IPs, empty labels like `a..b`) are rejected on
   save.
 - `traffic_mirror.domains` is matched by domain (SNI/host): a bare single IP
   can still match literally, but CIDR/range entries never match in the mirror
-  path — use AI rules or `proxy_rules` for IP-based routing.
+  path — use AI rules or `proxy_rules` for IP-based routing. GeoIP entries
+  are rejected outright in the mirror list (they can never match by domain).
 
 ### Traffic Mirror
 
@@ -276,8 +295,11 @@ More docs (API references, service management, certificate trust, …) live in
   HTTP→H2 upgrade, and broken priority handling breaks some sites (e.g. Cursor).
 - **MITM CA**: interception requires explicitly trusting `mitm-ca.pem`;
   certificate-pinned apps may resist interception.
-- **GeoIP**: routing uses GeoLite2 (`data/GeoLite2-Country.mmdb`); refresh the
-  database periodically.
+- **GeoIP**: routing uses GeoLite2; the country database lives at
+  `~/.aliang/geoip/GeoLite2-Country.mmdb` and is auto-downloaded in the
+  background on first start (COS mirror; `ALIANG_GEOIP_DOWNLOAD_URL`
+  overrides). It is not auto-refreshed — refresh the copy about once a
+  month.
 
 ## Security
 
