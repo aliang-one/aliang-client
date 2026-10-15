@@ -81,7 +81,10 @@ func currentTrackedAIProvidersOrdered() []trackedAIProvider {
 		if created {
 			order = append(order, provider.Key)
 		}
-		provider.Patterns = append(provider.Patterns, normalizeAIDomainPatterns(patterns)...)
+		// geoip 条目不参与 AI 统计归类（路由侧由快照编译器独立处理 geoip）：
+		// 若混入域名 pattern 存储，国家码（如 CN）会被 MatchDomain 后缀命中
+		// 所有 *.cn 主机，把非 AI 流量误归因到该 provider。
+		provider.Patterns = append(provider.Patterns, normalizeAIDomainPatterns(dropGeoIPEntries(patterns))...)
 	}
 
 	cfg := config.GetGlobalConfig()
@@ -153,6 +156,20 @@ func ensureTrackedAIProviderWithState(values map[string]*trackedAIProvider, key,
 		provider.Label = defaultProviderLabel(normalizedKey, label)
 	}
 	return provider, !exists
+}
+
+// dropGeoIPEntries 过滤 geoip 条目（geoip:CN / GEOIP,CN,proxy 等），geoip 不参与
+// 域名 pattern 存储与匹配。分类失败（err 非空）的条目不在此拒收，
+// 交由 normalize / 既有路径宽容处理，保持对存量脏数据的兼容。
+func dropGeoIPEntries(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if kind, _, err := match.ClassifyEntry(strings.TrimSpace(value)); err == nil && kind == match.EntryGeoIP {
+			continue
+		}
+		out = append(out, value)
+	}
+	return out
 }
 
 func normalizeAIDomainPatterns(values []string) []string {
@@ -244,6 +261,9 @@ func normalizeAIDomainPattern(raw string) string {
 	// （如 GEOIP,CN,proxy → GEOIP,CN），保证统计侧与编译侧看到同一形态。
 	// *. wildcard 条目不可能是 IP/geoip 形态，走既有归一化路径不受影响；
 	// 非法条目（err 非空）同样落回既有路径。
+	// 注意：provider 构建处（appendProvider → dropGeoIPEntries）已过滤 geoip 条目，
+	// geoip 不进入域名 pattern 存储；此处的 geoip 分支是防御层，仅对直接调用
+	// normalize 的输入生效。
 	if !wildcard {
 		if kind, cond, err := match.ClassifyEntry(value); err == nil && (kind == match.EntryIP || kind == match.EntryGeoIP) {
 			return cond
@@ -251,8 +271,7 @@ func normalizeAIDomainPattern(raw string) string {
 		// 已归一化的多国 geoip condition（如 CN+HK）再入时不带 geoip: 前缀，而 '+' 不在
 		// 域名字符集内（与域名空间零重叠）；补 geoip: 前缀复用内核分类恢复大写形态，
 		// 保证 normalize(normalize(x)) == normalize(x)——ai_activity.go 双次归一化依赖此性质。
-		// 单国码（CN）再入会折叠为域名 cn（.cn 顶级域），不可区分故不在此恢复；
-		// geoip 条目永不命中域名主机，不会进入再归一化链路，无生产影响。
+		// 单国码（CN）再入会折叠为域名 cn（.cn 顶级域），与域名不可区分故不在此恢复。
 		if strings.Contains(value, "+") {
 			if kind, cond, err := match.ClassifyEntry("geoip:" + value); err == nil && kind == match.EntryGeoIP {
 				return cond
