@@ -61,8 +61,12 @@ func DefaultDatabasePath() (string, error) {
 	return filepath.Join(geoipDir, DefaultGeoIPDatabaseFile), nil
 }
 
-// EnsureDownloaded 确保本地存在数据库文件；缺失则下载（无锁——下载绝不持 s.mu）。
-// 支持 ~ 展开；path 为空时使用 DefaultDatabasePath。
+// downloadMu 是下载互斥（single-flight）：EnsureDownloaded 已导出为编排积木，
+// 并发调用会因共享 .tmp 临时文件互相碰撞并可能持久化损坏文件。
+var downloadMu sync.Mutex
+
+// EnsureDownloaded 确保本地存在数据库文件；缺失则下载（绝不持 s.mu）。
+// 支持 ~ 展开；path 为空时使用 DefaultDatabasePath；并发调用 single-flight。
 func EnsureDownloaded(path string) error {
 	if path == "" {
 		defaultPath, err := DefaultDatabasePath()
@@ -78,7 +82,15 @@ func EnsureDownloaded(path string) error {
 		return fmt.Errorf("failed to expand path %s: %w", path, err)
 	}
 
-	// 已存在则零网络直接返回
+	// 已存在则零网络直接返回（无锁快路径）
+	if _, err := os.Stat(expandedPath); err == nil {
+		return nil
+	}
+
+	downloadMu.Lock()
+	defer downloadMu.Unlock()
+
+	// double-check：拿到锁后再查一次（可能别的调用者已下载完）
 	if _, err := os.Stat(expandedPath); err == nil {
 		return nil
 	}
@@ -142,6 +154,35 @@ func (s *Service) LoadLocal(path string) error {
 	s.dbPath = expandedPath
 	s.enabled = true
 
+	return nil
+}
+
+// EnsureLoadedAsync 本地已有数据库则同步装载；缺失则后台下载后装载（不阻塞调用方）。
+// start/tray/core 三条启动路径共用。返回 nil 仅代表编排已启动。
+func (s *Service) EnsureLoadedAsync() error {
+	path, err := DefaultDatabasePath()
+	if err != nil {
+		return err
+	}
+	expanded, err := cache.ExpandHomePath(path)
+	if err != nil {
+		return err
+	}
+	if _, statErr := os.Stat(expanded); statErr == nil {
+		return s.LoadLocal(path) // 本地 IO，同步完成
+	}
+	logger.Info("GeoIP database not found, downloading in background: " + geoipDownloadURL())
+	go func() {
+		if err := EnsureDownloaded(path); err != nil {
+			logger.Warn(fmt.Sprintf("GeoIP database background download failed (will retry next startup): %v", err))
+			return
+		}
+		if err := s.LoadLocal(path); err != nil {
+			logger.Warn(fmt.Sprintf("GeoIP database load failed after download: %v", err))
+			return
+		}
+		logger.Info("GeoIP database ready; geoip rules now active")
+	}()
 	return nil
 }
 

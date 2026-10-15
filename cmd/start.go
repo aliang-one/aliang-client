@@ -109,7 +109,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 	// This should be done once at startup, NOT separately in HTTP and TUN modes
 	// InitializeGlobalRuleEngine handles:
 	// 1. Rule engine initialization (singleton)
-	// 2. GeoIP database loading (if enabled in config)
+	// 2. GeoIP database loading (local-first, background download if missing)
 	if err := InitializeGlobalRuleEngine(); err != nil {
 		logger.Error(fmt.Sprintf("Failed to initialize global rule engine: %v", err))
 		// Don't fail startup - system can run with default configuration
@@ -217,9 +217,14 @@ func InitializeGlobalRuleEngine() error {
 	}
 	logger.Info("✓ Rule engine initialized")
 
-	// Step 2: GeoIP routing is disabled in simplified mode
-	logger.Info("Step 2: GeoIP routing disabled")
-	geoip.GetService().Disable()
+	// Step 2: GeoIP database (local-first; background download when missing)
+	logger.Info("Step 2: GeoIP database loading (local-first, background download if missing)")
+	if err := geoip.GetService().EnsureLoadedAsync(); err != nil {
+		// 编排启动失败（如 state 目录不可解析）不阻断启动，geoip 规则本次不生效
+		logger.Warn(fmt.Sprintf("GeoIP database orchestration failed (geoip rules inactive this run): %v", err))
+	} else {
+		remindGeoIPRulesPendingDownload()
+	}
 
 	logger.Info("========================================")
 	logger.Info("✅ Global Rule Engine Initialization Complete")
@@ -228,24 +233,50 @@ func InitializeGlobalRuleEngine() error {
 	return nil
 }
 
-// initializeGeoIPDatabase loads the GeoIP database from default location
-// Default path: <state-dir>/geoip/GeoLite2-Country.mmdb
-func initializeGeoIPDatabase() error {
-	geoipPath, err := geoip.DefaultDatabasePath()
-	if err != nil {
-		return fmt.Errorf("failed to resolve GeoIP database path: %w", err)
+// remindGeoIPRulesPendingDownload 在配置引用了 geoip 规则而数据库仍在后台下载时
+// 打一条一次性提醒（启动冷路径，每次启动至多一条）。
+func remindGeoIPRulesPendingDownload() {
+	if geoip.GetService().IsEnabled() {
+		return // 本地已有库并同步装载完成，无需提醒
 	}
+	if geoipRulesPresent(config.GetGlobalConfig()) {
+		logger.Info("geoip 数据库后台下载中，geoip 规则就绪后自动生效")
+	}
+}
 
-	// Load database
-	logger.Info(fmt.Sprintf("Loading GeoIP database from: %s", geoipPath))
-	geoipService := geoip.GetService()
-	if err := geoip.EnsureDownloaded(geoipPath); err != nil {
-		return fmt.Errorf("failed to download GeoIP database: %w", err)
+// geoipRulesPresent 检测配置是否引用 geoip 条目（大小写不敏感）：
+// 冒号风格 geoip:CN 前缀，或 Clash 风格逗号条目的首段 geoip（geoip,CN）。
+func geoipRulesPresent(cfg *config.Config) bool {
+	if cfg == nil || cfg.Customer == nil {
+		return false
 	}
-	if err := geoipService.LoadLocal(geoipPath); err != nil {
-		return fmt.Errorf("failed to load GeoIP database: %w", err)
+	isGeoIPEntry := func(entry string) bool {
+		e := strings.TrimSpace(entry)
+		if e == "" {
+			return false
+		}
+		if strings.HasPrefix(strings.ToLower(e), "geoip:") {
+			return true
+		}
+		if i := strings.IndexByte(e, ','); i > 0 {
+			return strings.EqualFold(strings.TrimSpace(e[:i]), "geoip")
+		}
+		return false
 	}
-
-	logger.Info(fmt.Sprintf("✓ GeoIP database loaded from %s", geoipPath))
-	return nil
+	for _, rule := range cfg.Customer.ProxyRules {
+		if isGeoIPEntry(rule) {
+			return true
+		}
+	}
+	for _, setting := range cfg.Customer.AIRules {
+		if setting == nil {
+			continue
+		}
+		for _, entry := range setting.Include {
+			if isGeoIPEntry(entry) {
+				return true
+			}
+		}
+	}
+	return false
 }
