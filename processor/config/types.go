@@ -309,8 +309,10 @@ func (c *TrafficMirrorConfig) Validate() error {
 		return fmt.Errorf("traffic_mirror.domains must not be empty when enabled")
 	}
 	for i, domain := range c.Domains {
-		if _, _, err := match.ClassifyEntry(domain); err != nil {
+		if kind, _, err := match.ClassifyEntry(domain); err != nil {
 			return fmt.Errorf("traffic_mirror.domains[%d] invalid %q: %v", i, domain, err)
+		} else if kind == match.EntryGeoIP {
+			return fmt.Errorf("traffic_mirror.domains[%d] invalid %q: 镜像列表不支持 geoip 条目", i, domain)
 		}
 	}
 	return nil
