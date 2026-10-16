@@ -76,7 +76,7 @@ func TestClaudeSessionMetaParsesPastOverlongToolResultLine(t *testing.T) {
 	}
 	path := writeClaudeTranscriptFixture(t, claudeDir, sid, lines, time.Now())
 
-	session := readClaudeSessionMetaWithOptions(path, agentVibeSessionReadOptions{})
+	session, _ := readClaudeSessionMetaWithOptions(path, agentVibeSessionReadOptions{})
 	require.NotEmpty(t, session.ID, "session must survive the overlong line")
 	assert.Equal(t, 5, session.MessageCount,
 		"every user/assistant record keeps its index slot, including the huge tool_result")
@@ -116,7 +116,7 @@ func TestClaudeSessionMetaMatchesUnlimitedParseOracle(t *testing.T) {
 	}
 	path := writeClaudeTranscriptFixture(t, claudeDir, sid, lines, time.Now())
 
-	session := readClaudeSessionMetaWithOptions(path, agentVibeSessionReadOptions{})
+	session, _ := readClaudeSessionMetaWithOptions(path, agentVibeSessionReadOptions{})
 	require.NotEmpty(t, session.ID)
 	assert.Equal(t, "claude_"+sid, session.ID)
 	assert.Equal(t, 4, session.MessageCount)
@@ -159,7 +159,7 @@ func TestClaudeSessionMetaLastLineWithoutTrailingNewline(t *testing.T) {
 	path := filepath.Join(claudeDir, sid+".jsonl")
 	writeRawJSONL(t, path, lines, false)
 
-	session := readClaudeSessionMetaWithOptions(path, agentVibeSessionReadOptions{})
+	session, _ := readClaudeSessionMetaWithOptions(path, agentVibeSessionReadOptions{})
 	require.NotEmpty(t, session.ID)
 	assert.Equal(t, 2, session.MessageCount)
 	require.Len(t, session.Transcript, 2)
@@ -207,7 +207,7 @@ func TestClaudeSessionMetaSkipsPathologicalOverCapLine(t *testing.T) {
 
 	// cap=1024：普通行（含 tempdir 长路径，约 300 字节）必须照常解析，
 	// monster 行（2000 填充 + 行开销 ≈ 2200 字节）必须被跳过。
-	session := readClaudeSessionMetaWithOptions(path, agentVibeSessionReadOptions{MaxLineBytes: 1024})
+	session, _ := readClaudeSessionMetaWithOptions(path, agentVibeSessionReadOptions{MaxLineBytes: 1024})
 	require.NotEmpty(t, session.ID)
 	assert.Equal(t, 2, session.MessageCount, "the skipped monster line must not consume an index slot")
 	require.Len(t, session.Transcript, 2)

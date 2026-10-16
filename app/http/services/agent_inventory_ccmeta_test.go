@@ -50,7 +50,7 @@ func writeCCMetaFixture(t *testing.T, lines []string) string {
 
 func ccMetaTranscript(t *testing.T, path string) (roles []string, contents []string, indices []int) {
 	t.Helper()
-	session := readClaudeSessionMetaWithOptions(path, agentVibeSessionReadOptions{})
+	session, _ := readClaudeSessionMetaWithOptions(path, agentVibeSessionReadOptions{})
 	require.NotEmpty(t, session.ID)
 	for _, m := range session.Transcript {
 		roles = append(roles, m.Role)

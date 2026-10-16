@@ -60,7 +60,7 @@ func TestClaudeSessionMetaUpdatedAtUsesLastMessageNotMtime(t *testing.T) {
 	}
 	path := writeClaudeTranscriptFixture(t, claudeDir, sid, lines, time.Now())
 
-	session := readClaudeSessionMetaWithOptions(path, agentVibeSessionReadOptions{})
+	session, _ := readClaudeSessionMetaWithOptions(path, agentVibeSessionReadOptions{})
 	require.NotEmpty(t, session.ID)
 	assert.Equal(t, "2026-06-13T02:05:00Z", normalizeAgentTime(session.UpdatedAt),
 		"UpdatedAt must be the last real message time, not the metadata-bumped mtime")
@@ -89,7 +89,7 @@ func TestClaudeSessionMetaUpdatedAtFallsBackToMtimeWithoutTimestamps(t *testing.
 	modTime := time.Now().Add(-2 * time.Hour)
 	path := writeClaudeTranscriptFixture(t, claudeDir, sid, lines, modTime)
 
-	session := readClaudeSessionMetaWithOptions(path, agentVibeSessionReadOptions{})
+	session, _ := readClaudeSessionMetaWithOptions(path, agentVibeSessionReadOptions{})
 	require.NotEmpty(t, session.ID)
 	want, err := os.Stat(path)
 	require.NoError(t, err)
@@ -168,7 +168,7 @@ func TestClaudeTranscriptSkipsSlashCommandRecords(t *testing.T) {
 	}
 	path := writeClaudeTranscriptFixture(t, claudeDir, sid, lines, time.Now())
 
-	session := readClaudeSessionMetaWithOptions(path, agentVibeSessionReadOptions{IncludePageMeta: true})
+	session, _ := readClaudeSessionMetaWithOptions(path, agentVibeSessionReadOptions{IncludePageMeta: true})
 	require.NotEmpty(t, session.ID)
 	require.Len(t, session.Transcript, 2, "caveat and /clear records must not become chat bubbles")
 	assert.Equal(t, "Now start the real task", session.Transcript[0].Content)
@@ -221,4 +221,94 @@ func TestClaudeStatusOverlayIgnoresMetadataOnlyFreshness(t *testing.T) {
 	require.NotNil(t, found, "claude session was not collected")
 	assert.Equal(t, "idle", found.Status,
 		"metadata-only mtime movement must not read as an in-flight turn")
+}
+
+// TestClaudeSessionMetaSkipsAPIErrorRecords pins the 2026-10-15 incident: when
+// a turn fails at the transport layer (dead local proxy), Claude Code appends
+// assistant records whose entire content is "API Error: ..." text. Those are
+// CLI artifacts, not conversation — they must not become chat bubbles and must
+// NOT advance UpdatedAt, or a months-dead session floats back to the top of
+// the phone's list with a fresh activity stamp.
+func TestClaudeSessionMetaSkipsAPIErrorRecords(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	cache.ResetCacheDirForTest()
+
+	projectPath := filepath.Join(home, "work", "myproject")
+	require.NoError(t, os.MkdirAll(projectPath, 0o700))
+	encodedCwd := "-" + strings.ReplaceAll(strings.Trim(projectPath, string(filepath.Separator)), string(filepath.Separator), "-")
+	claudeDir := filepath.Join(home, ".claude", "projects", encodedCwd)
+	require.NoError(t, os.MkdirAll(claudeDir, 0o700))
+
+	const sid = "api-error-sid"
+	cwd := `"cwd":"` + projectPath + `","sessionId":"` + sid + `","gitBranch":"main"`
+	lines := []string{
+		`{"timestamp":"2026-10-15T05:12:37Z","type":"user",` + cwd + `,"message":{"role":"user","content":[{"type":"text","text":"现在我已经在真实的集群数据里边了"}]}}`,
+		`{"timestamp":"2026-10-15T05:12:38Z","type":"system","subtype":"api_error","content":"API Error: 500","isMeta":true}`,
+		// The kill shot: a final assistant record that is pure CLI error text,
+		// stamped ~3 minutes after the real user message.
+		`{"timestamp":"2026-10-15T05:15:34Z","type":"assistant",` + cwd + `,"message":{"role":"assistant","content":[{"type":"text","text":"API Error: Connection refused — a firewall or proxy may be blocking it"}]}}`,
+	}
+	path := writeClaudeTranscriptFixture(t, claudeDir, sid, lines, time.Now())
+
+	session, updatedAtFromMtime := readClaudeSessionMetaWithOptions(path, agentVibeSessionReadOptions{})
+	require.NotEmpty(t, session.ID)
+	require.False(t, updatedAtFromMtime)
+	assert.Equal(t, "2026-10-15T05:12:37Z", normalizeAgentTime(session.UpdatedAt),
+		"the API-error assistant line must not advance UpdatedAt")
+	// 评审折中:错误行照常进 transcript(内容不丢——模型真实回答也可能以
+	// "API Error" 开头,本机运维语境高频),只排除出活跃钟。
+	found := false
+	for _, message := range session.Transcript {
+		if strings.Contains(message.Content, "API Error") {
+			found = true
+		}
+	}
+	assert.True(t, found, "the CLI error line stays in the transcript (no content loss)")
+	assert.Equal(t, 2, session.MessageCount,
+		"message indexes keep counting error records for stable-ID parity")
+}
+
+// TestCollectClaudeVibeSessionsFreshnessPatchSkipsMtimeFallback pins the
+// provenance gate: a timestamp-less jsonl (older Claude Code) yields
+// UpdatedAt=file-mtime from the reader, and that mtime must NOT flow through
+// the updated_at freshness patch — otherwise any file touch (CLI rewrite, sync
+// tool, index refresh) floats a dead session's activity time to "touched at".
+func TestCollectClaudeVibeSessionsFreshnessPatchSkipsMtimeFallback(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	cache.ResetCacheDirForTest()
+
+	projectPath := filepath.Join(home, "work", "myproject")
+	require.NoError(t, os.MkdirAll(projectPath, 0o700))
+	encodedCwd := "-" + strings.ReplaceAll(strings.Trim(projectPath, string(filepath.Separator)), string(filepath.Separator), "-")
+	claudeDir := filepath.Join(home, ".claude", "projects", encodedCwd)
+	require.NoError(t, os.MkdirAll(claudeDir, 0o700))
+
+	const sid = "mtime-fallback-patch-sid"
+	// No timestamps anywhere in the transcript → reader falls back to mtime
+	// (kept fresh so the fallback would obviously win the max() without the
+	// provenance gate).
+	lines := []string{
+		`{"type":"user","cwd":"` + projectPath + `","sessionId":"` + sid + `","message":{"role":"user","content":[{"type":"text","text":"Ancient session"}]}}`,
+		`{"type":"assistant","cwd":"` + projectPath + `","sessionId":"` + sid + `","message":{"role":"assistant","content":[{"type":"text","text":"Old reply"}]}}`,
+	}
+	writeClaudeTranscriptFixture(t, claudeDir, sid, lines, time.Now())
+
+	index := `{"originalPath":"` + projectPath + `","entries":[{"sessionId":"` + sid + `","firstPrompt":"Ancient session","messageCount":2,"created":"2026-06-13T01:29:00Z","modified":"2026-06-13T01:30:00Z","gitBranch":"main","projectPath":"` + projectPath + `","isSidechain":false}]}`
+	require.NoError(t, os.WriteFile(filepath.Join(claudeDir, "sessions-index.json"), []byte(index), 0o600))
+
+	sessions := collectClaudeVibeSessions(nil)
+	var found *models.AgentVibeSession
+	for i := range sessions {
+		if sessions[i].ID == "claude_"+sid {
+			found = &sessions[i]
+			break
+		}
+	}
+	require.NotNil(t, found, "claude session was not collected")
+	assert.Equal(t, "2026-06-13T01:30:00Z", normalizeAgentTime(found.UpdatedAt),
+		"mtime-backed freshness must not float the index modified time — a file touch is not conversation activity")
 }

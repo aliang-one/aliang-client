@@ -282,7 +282,8 @@ func readAgentVibeSessionDetailFile(path string, options agentVibeSessionReadOpt
 		return readCodexSessionMetaWithOptions(path, options)
 	}
 	if strings.Contains(path, string(filepath.Separator)+".claude"+string(filepath.Separator)) {
-		return readClaudeSessionMetaWithOptions(path, options)
+		session, _ := readClaudeSessionMetaWithOptions(path, options)
+		return session
 	}
 	return models.AgentVibeSession{}
 }
