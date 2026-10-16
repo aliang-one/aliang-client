@@ -378,8 +378,8 @@ func collectCodexVibeSessions(scanDirs []string) []models.AgentVibeSession {
 	}
 
 	sessionFiles := append(
-		findRecentAgentFiles(filepath.Join(home, ".codex", "sessions"), "*.jsonl", agentVibeSessionFileScanLimit),
-		findRecentAgentFiles(filepath.Join(home, ".codex", "archived_sessions"), "*.jsonl", agentVibeSessionFileScanLimit)...,
+		findRecentCodexSessionFiles(filepath.Join(home, ".codex", "sessions"), agentVibeSessionFileScanLimit),
+		findRecentCodexSessionFiles(filepath.Join(home, ".codex", "archived_sessions"), agentVibeSessionFileScanLimit)...,
 	)
 	metaByID := make(map[string]models.AgentVibeSession)
 	for _, path := range sessionFiles {
@@ -415,6 +415,61 @@ func collectCodexVibeSessions(scanDirs []string) []models.AgentVibeSession {
 		sessions = append(sessions, meta)
 	}
 	return applyCodexExternalImportLedger(sessions, home)
+}
+
+func findRecentCodexSessionFiles(root string, limit int) []string {
+	if limit <= 0 {
+		limit = agentVibeSessionFileScanLimit
+	}
+	candidates := make([]agentRecentFileCandidate, 0, limit)
+	_ = filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil || entry == nil {
+			return nil
+		}
+		if entry.IsDir() {
+			if path != root && shouldSkipAgentRecentFileDir(entry.Name()) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(entry.Name(), ".jsonl") {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return nil
+		}
+		logicalTime := codexRolloutFilenameTime(entry.Name())
+		if logicalTime.IsZero() {
+			logicalTime = info.ModTime()
+		}
+		addAgentRecentFileCandidate(&candidates, agentRecentFileCandidate{path: path, modTime: logicalTime}, limit)
+		return nil
+	})
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].modTime.After(candidates[j].modTime)
+	})
+	files := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		files = append(files, candidate.path)
+	}
+	return files
+}
+
+func codexRolloutFilenameTime(name string) time.Time {
+	const prefix = "rollout-"
+	name = strings.TrimPrefix(name, prefix)
+	if len(name) < len("2006-01-02T15-04-05") || !strings.HasPrefix(name, "20") {
+		return time.Time{}
+	}
+	stamp := name[:len("2006-01-02T15-04-05")]
+	stamp = stamp[:13] + ":" + stamp[14:]
+	stamp = stamp[:16] + ":" + stamp[17:]
+	parsed, err := time.ParseInLocation("2006-01-02T15:04:05", stamp, time.UTC)
+	if err != nil {
+		return time.Time{}
+	}
+	return parsed
 }
 
 func readCodexSessionMeta(path string) models.AgentVibeSession {

@@ -7,12 +7,28 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"aliang.one/nursorgate/common/cache"
 )
+
+func TestFindRecentCodexSessionFilesUsesRolloutTimestamp(t *testing.T) {
+	root := t.TempDir()
+	old := filepath.Join(root, "rollout-2026-10-04T23-00-00-old.jsonl")
+	new := filepath.Join(root, "rollout-2026-10-05T01-00-00-new.jsonl")
+	require.NoError(t, os.WriteFile(old, []byte("{}\n"), 0o600))
+	require.NoError(t, os.WriteFile(new, []byte("{}\n"), 0o600))
+	importedAt := time.Date(2026, 10, 5, 11, 4, 0, 0, time.UTC)
+	require.NoError(t, os.Chtimes(old, importedAt, importedAt))
+	require.NoError(t, os.Chtimes(new, importedAt, importedAt))
+
+	files := findRecentCodexSessionFiles(root, 1)
+	require.Len(t, files, 1)
+	assert.Equal(t, new, files[0])
+}
 
 // TestCollectClaudeVibeSessionsReadsEveryProjectIndex is the deterministic
 // collection regression: the index pass used to reuse findRecentAgentFiles
