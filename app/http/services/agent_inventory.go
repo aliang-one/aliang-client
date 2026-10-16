@@ -1152,7 +1152,11 @@ func readClaudeSessionMetaWithOptions(path string, options agentVibeSessionReadO
 			// jsonl 追加整条 "API Error: ..." 的 assistant 记录(liang-dev 本地
 			// 代理死亡后 12 连 api_error,最后一条把死会话的 UpdatedAt 顶到
 			// 05:15:34,inventory 上报后服务端把死了两个月的会话顶上列表顶部)。
-			// 它们是工具工件而非对话——不进气泡、不推进活跃时间;索引照旧自增。
+			// 评审(2026-10-16)指出的吞真回复风险:模型真实回答也可能以
+			// "API Error" 开头(本机高频运维语境,用户就在问 API 错误)。
+			// 折中:errorRecord 只把该行排除出【活跃钟】,照常进 transcript
+			// 气泡(CLI 本就把它写成 assistant 记录,TUI --resume 也可见)
+			// ——内容不丢,时钟不被污染。索引照旧自增。
 			errorRecord := row.Type == "assistant" && isClaudeAPIErrorRecord(rawText)
 			if text := truncateAgentText(rawText, agentVibeTranscriptMaxContentRunes); text != "" {
 				messageIndex := session.MessageCount
@@ -1166,7 +1170,7 @@ func readClaudeSessionMetaWithOptions(path string, options agentVibeSessionReadO
 				// slash 命令流水与 CC 注入行（skill 全文、命令回显、系统提醒）同理：
 				// 是 UI 工件而非对话，走同一条跳过路径——不进气泡、不进标题、
 				// 不推进活跃时间。
-				if role != "system" && !commandRecord && !errorRecord {
+				if role != "system" && !commandRecord {
 					if row.Type == "user" {
 						userPromptCount++
 						if firstUserPrompt == "" {

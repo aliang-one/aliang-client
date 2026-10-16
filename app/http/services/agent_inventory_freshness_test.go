@@ -257,10 +257,15 @@ func TestClaudeSessionMetaSkipsAPIErrorRecords(t *testing.T) {
 	require.False(t, updatedAtFromMtime)
 	assert.Equal(t, "2026-10-15T05:12:37Z", normalizeAgentTime(session.UpdatedAt),
 		"the API-error assistant line must not advance UpdatedAt")
+	// 评审折中:错误行照常进 transcript(内容不丢——模型真实回答也可能以
+	// "API Error" 开头,本机运维语境高频),只排除出活跃钟。
+	found := false
 	for _, message := range session.Transcript {
-		assert.NotContains(t, message.Content, "API Error",
-			"CLI error placeholders must not become chat bubbles")
+		if strings.Contains(message.Content, "API Error") {
+			found = true
+		}
 	}
+	assert.True(t, found, "the CLI error line stays in the transcript (no content loss)")
 	assert.Equal(t, 2, session.MessageCount,
 		"message indexes keep counting error records for stable-ID parity")
 }
