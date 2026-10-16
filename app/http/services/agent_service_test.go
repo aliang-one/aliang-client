@@ -4208,7 +4208,7 @@ func TestReadClaudeSessionMetaExcludesToolResultArtifacts(t *testing.T) {
 		t.Fatalf("write claude fixture: %v", err)
 	}
 
-	session := readClaudeSessionMetaWithOptions(sessionPath, agentVibeSessionReadOptions{Limit: 10, IncludePageMeta: true})
+	session, _ := readClaudeSessionMetaWithOptions(sessionPath, agentVibeSessionReadOptions{Limit: 10, IncludePageMeta: true})
 	// tool_result 工件不再进入 transcript（与直播视图一致：工具输出走结构化事件，
 	// 不进对话流——否则手机端历史渲染会变成一墙 "Updated task #N status" 状态行）。
 	if got := len(session.Transcript); got != 3 {

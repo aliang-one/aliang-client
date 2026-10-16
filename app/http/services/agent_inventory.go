@@ -677,6 +677,12 @@ func collectClaudeVibeSessionsWithStats(scanDirs []string) ([]models.AgentVibeSe
 	// Drives both the freshness-derived status overlay (records without a
 	// busy/idle status) and the updated_at freshness patch below.
 	transcriptFreshness := make(map[string]time.Time)
+	// Provenance: entries whose freshness fell back to the file mtime (the
+	// jsonl carried no parseable message timestamps). mtime means "the file was
+	// touched", not "the conversation was active" — those entries are excluded
+	// from the updated_at freshness patch below so a mere touch cannot float a
+	// dead session (2026-10-15 incident family).
+	transcriptFreshnessFromMtime := make(map[string]bool)
 	for _, indexPath := range indexFiles {
 		raw, err := os.ReadFile(indexPath)
 		if err != nil {
@@ -751,7 +757,7 @@ func collectClaudeVibeSessionsWithStats(scanDirs []string) ([]models.AgentVibeSe
 		if strings.Contains(path, string(filepath.Separator)+"subagents"+string(filepath.Separator)) {
 			continue
 		}
-		session := readClaudeSessionMetaWithOptions(path, agentVibeSessionReadOptions{Limit: agentVibeTranscriptMaxMessages, ScanDirs: scanDirs})
+		session, updatedAtFromMtime := readClaudeSessionMetaWithOptions(path, agentVibeSessionReadOptions{Limit: agentVibeTranscriptMaxMessages, ScanDirs: scanDirs})
 		if session.ID == "" {
 			continue
 		}
@@ -764,9 +770,15 @@ func collectClaudeVibeSessionsWithStats(scanDirs []string) ([]models.AgentVibeSe
 		// ended, and mtime freshness used to float those dead sessions to the
 		// top of the phone's list and read as an in-flight turn.
 		fresh := parseAgentRFC3339(session.UpdatedAt)
+		if updatedAtFromMtime {
+			// reader 兜底:UpdatedAt 本身就是 mtime——标记 provenance,
+			// 不配参与下方 freshness patch(文件被摸 ≠ 对话活跃)。
+			transcriptFreshnessFromMtime[strings.TrimPrefix(session.ID, "claude_")] = true
+		}
 		if fresh.IsZero() {
 			if info, err := os.Stat(path); err == nil {
 				fresh = info.ModTime()
+				transcriptFreshnessFromMtime[strings.TrimPrefix(session.ID, "claude_")] = true
 			}
 		}
 		if !fresh.IsZero() {
@@ -786,8 +798,16 @@ func collectClaudeVibeSessionsWithStats(scanDirs []string) ([]models.AgentVibeSe
 	// and back on every inventory push. Walk-sourced sessions already carry
 	// the same mtime here, so the max() is a no-op for them.
 	for index := range sessions {
-		mt, ok := transcriptFreshness[strings.TrimPrefix(sessions[index].ID, "claude_")]
+		nativeID := strings.TrimPrefix(sessions[index].ID, "claude_")
+		mt, ok := transcriptFreshness[nativeID]
 		if !ok {
+			continue
+		}
+		// mtime 兜底的 freshness 不参与推进:它只证明"文件被摸过",不证明
+		// "对话活跃"——任何触碰(jsonl 被 CLI 重写、同步工具、索引刷新)都会
+		// 把死了几个月的会话顶新,正是 2026-10-15 事故的机制家族。只有
+		// reader 推导的最后真消息时间才配当活跃钟。
+		if transcriptFreshnessFromMtime[nativeID] {
 			continue
 		}
 		if mtRFC := mt.UTC().Format(time.RFC3339); compareRFC3339(sessions[index].UpdatedAt, mtRFC) < 0 {
@@ -1060,10 +1080,11 @@ func readClaudeSessionMeta(path string) models.AgentVibeSession {
 }
 
 func readClaudeSessionMetaWithLimit(path string, maxMessages int) models.AgentVibeSession {
-	return readClaudeSessionMetaWithOptions(path, agentVibeSessionReadOptions{Limit: maxMessages})
+	session, _ := readClaudeSessionMetaWithOptions(path, agentVibeSessionReadOptions{Limit: maxMessages})
+	return session
 }
 
-func readClaudeSessionMetaWithOptions(path string, options agentVibeSessionReadOptions) models.AgentVibeSession {
+func readClaudeSessionMetaWithOptions(path string, options agentVibeSessionReadOptions) (models.AgentVibeSession, bool) {
 	options = normalizeAgentVibeSessionReadOptions(options)
 	window := newAgentVibeTranscriptWindow(options)
 	var session models.AgentVibeSession
@@ -1127,6 +1148,12 @@ func readClaudeSessionMetaWithOptions(path string, options agentVibeSessionReadO
 			// skill 文档渲染成用户气泡（2026-10-07 ai_import_c7e27e3a 实锤）。
 			commandRecord = row.Type == "user" && (isClaudeSlashCommandRecord(rawText) ||
 				row.IsMeta || row.SourceToolUseID != "" || isClaudeInjectedRecordText(rawText))
+			// CLI 错误占位(2026-10-15 事故实锤):回合失败时 Claude Code 会往
+			// jsonl 追加整条 "API Error: ..." 的 assistant 记录(liang-dev 本地
+			// 代理死亡后 12 连 api_error,最后一条把死会话的 UpdatedAt 顶到
+			// 05:15:34,inventory 上报后服务端把死了两个月的会话顶上列表顶部)。
+			// 它们是工具工件而非对话——不进气泡、不推进活跃时间;索引照旧自增。
+			errorRecord := row.Type == "assistant" && isClaudeAPIErrorRecord(rawText)
 			if text := truncateAgentText(rawText, agentVibeTranscriptMaxContentRunes); text != "" {
 				messageIndex := session.MessageCount
 				session.MessageCount++
@@ -1139,7 +1166,7 @@ func readClaudeSessionMetaWithOptions(path string, options agentVibeSessionReadO
 				// slash 命令流水与 CC 注入行（skill 全文、命令回显、系统提醒）同理：
 				// 是 UI 工件而非对话，走同一条跳过路径——不进气泡、不进标题、
 				// 不推进活跃时间。
-				if role != "system" && !commandRecord {
+				if role != "system" && !commandRecord && !errorRecord {
 					if row.Type == "user" {
 						userPromptCount++
 						if firstUserPrompt == "" {
@@ -1154,7 +1181,7 @@ func readClaudeSessionMetaWithOptions(path string, options agentVibeSessionReadO
 						Index:     messageIndex,
 					})
 				}
-				if !commandRecord {
+				if !commandRecord && !errorRecord {
 					// 活跃时间取最后一条真实消息的时间戳：TUI 开在提示符时 jsonl 仍会被
 					// last-prompt 草稿 / cost-state / mode 切换等元数据持续写新（真机会话
 					// 在最后一条消息之后被续命数小时），mtime 不能再当活动时间用。
@@ -1174,29 +1201,32 @@ func readClaudeSessionMetaWithOptions(path string, options agentVibeSessionReadO
 		return true
 	})
 	if discard {
-		return models.AgentVibeSession{}
+		return models.AgentVibeSession{}, false
 	}
 	if session.ID == "" {
-		return models.AgentVibeSession{}
+		return models.AgentVibeSession{}, false
 	}
 	if !isSafeAgentProjectPath(session.ProjectPath) {
-		return models.AgentVibeSession{}
+		return models.AgentVibeSession{}, false
 	}
 	// 探针会话排除：agent 自己的 CLI 能力探测以裸 "probe" 为唯一用户输入
 	// headless 起跑，曾被扫描当成普通 CLI 会话导入手机列表（2026-09-23
 	// vibe-on-phone-75 事故）。仅当首条用户输入恰为探针哨兵且没有后续用户
 	// 消息时跳过——真实会话一旦有追问即不受影响。
 	if firstUserPrompt == claudeEffortProbePrompt && userPromptCount <= 1 {
-		return models.AgentVibeSession{}
+		return models.AgentVibeSession{}, false
 	}
+	// 第二返回值:UpdatedAt 是否来自 mtime 兜底(transcript 没有可用的消息
+	// 时间戳,旧版 Claude Code 不写)。调用方用它给 freshness 打 provenance——
+	// mtime 只证明"文件被摸过",不配参与活跃推进(2026-10-15 事故家族)。
 	session.Transcript, session.TranscriptPage = window.page(session.MessageCount, options.IncludePageMeta)
 	if !lastMessageAt.IsZero() {
 		session.UpdatedAt = lastMessageAt.UTC().Format(time.RFC3339)
-	} else {
-		// transcript 没有可用的消息时间戳（旧版 Claude Code 不写）：保留 mtime 兜底。
-		session.UpdatedAt = fileUpdatedAt(path)
+		return session, false
 	}
-	return session
+	// transcript 没有可用的消息时间戳（旧版 Claude Code 不写）：保留 mtime 兜底。
+	session.UpdatedAt = fileUpdatedAt(path)
+	return session, true
 }
 
 func normalizeAgentVibeSessionReadOptions(options agentVibeSessionReadOptions) agentVibeSessionReadOptions {
@@ -1398,6 +1428,24 @@ func isClaudeSlashCommandRecord(text string) bool {
 // mentions these tags mid-sentence must survive.
 func isClaudeInjectedRecordText(text string) bool {
 	return strings.HasPrefix(text, "<local-command-stdout>") || strings.HasPrefix(text, "<system-reminder>")
+}
+
+// isClaudeAPIErrorRecord reports the assistant placeholder Claude Code writes
+// into the jsonl when a turn FAILS at the transport layer (dead proxy /
+// network refused / 5xx): the entire assistant record is CLI-generated error
+// text, not model output. Prefix-only on purpose — a genuine reply that quotes
+// "API Error" mid-sentence survives. These records are tool artifacts, not
+// conversation: they must not become chat bubbles and must not advance the
+// session's activity time (2026-10-15 incident: after liang-dev's local proxy
+// died, a failed resume appended 12 api_error records + one final "API Error:
+// Connection refused ..." assistant line whose timestamp floated a
+// two-months-dead session back to the top of the phone's list).
+func isClaudeAPIErrorRecord(text string) bool {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return false
+	}
+	return strings.HasPrefix(strings.ToLower(trimmed), "api error")
 }
 
 // parseAgentRFC3339 decodes an RFC3339 timestamp into UTC time, zero on

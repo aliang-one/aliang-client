@@ -4904,6 +4904,15 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 	if !allowResume {
 		if newSessionID == "" {
 			newSessionID = resumeID
+			// 身份续接是有意设计(绑定/下一轮 --resume 依赖同一 native id),
+			// 但副作用是一份新 jsonl 会顶着旧身份落盘——旧文件若日后回流,
+			// 扫描会把两份历史折在同一个 UUID 下。这里留一行日志让该形态
+			// 可诊断(2026-10-15 事故里正是这条路径造出了 28 行 stub)。
+			if resumeID != "" {
+				logger.Info(fmt.Sprintf(
+					"ai.run.resume.weld: session=%s runSeq=%d fresh pass reuses native id %q (resume unresolvable or fresh retry)",
+					run.sessionID, run.runSeq, resumeID))
+			}
 		}
 		resumeID = ""
 	}
