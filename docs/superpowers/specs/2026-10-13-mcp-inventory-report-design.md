@@ -56,6 +56,7 @@ MCPServers []AgentMCPServer `json:"mcp_servers,omitempty"`
 **Codex**(`~/.codex/config.toml`,BurntSushi/toml v1.4.0 已在 go.mod):
 
 - 解析 `[mcp_servers.<name>]` 表:`command`(+`args`)→ stdio;`url` → 一律归类 `http`(codex 配置不区分 sse/http,统一按 http 上报;无 url 且无 command 的条目丢弃)
+- `enabled = false` 的条目跳过,不占用 24 条上限额度(2026-10-16 增补:官方语义「临时停用而不删配置」,codex 自身不会启动停用的服务器,上报它会让能力清单虚增;`nil`/缺省/`true` 均视为启用)
 - env 键读取后立即丢弃,不进任何结构体
 
 **填充规则**(`detectAgentToolsWith`,agent_service.go:1473):
@@ -69,8 +70,10 @@ MCPServers []AgentMCPServer `json:"mcp_servers,omitempty"`
 
 - env 值永不进入 `AgentMCPServer`(解析层直接丢弃)
 - argv join 前逐项检查:长度 >32 且不含空白的 token → 替换为 `<redacted:N>`(N=原长度)
+- **凭据形态 header 参数定向打码(2026-10-16 增补)**:argv 元素内含 `authorization`(同时覆盖 `Proxy-Authorization`)或 `api-key`(同时覆盖 `X-Api-Key`)锚点——ASCII 大小写折叠匹配,header 名与冒号之间容忍空白与引号(`Authorization :`、`--header={"Authorization": "…"}` 形态同样拦截;名字后跟其他字符如 `authorizations:` 不构成锚点)——时,保留「锚点前前缀(如 `--header=`)+ header 名 + 已知 scheme 词(Bearer/Basic/Token/Digest)」,凭据主体替换为 `<redacted:N>`(N=原字节长)——不受长度阈值与空白豁免约束。动机:`--header "Authorization: Bearer ntn_…"` 恰是「单元素含空白」形态,通用规则的白名单豁免挡不住它;未知 scheme 词视为凭据整体打码(宁可错杀,自然语言里出现锚点字样会被误伤,可接受)。锚点定位不得用 `strings.ToLower` 的下标切原串(个别 Unicode rune 会让 ToLower 改变字节长度 → 下标错位/越界 panic),须做 ASCII 折叠扫描
 - URL 的 query 参数值长度 >24 → 值替换为 `<redacted>`
 - URL userinfo 一律打码(`<redacted>`),fragment 一律丢弃——非 query 形态的凭据同样不得外泄
+- **URL 解析失败 fail-closed(2026-10-16 增补)**:`url.Parse` 失败的畸形 URL(未转义空白/百分号、控制字符等)无法可靠定位 userinfo/query/fragment 边界,整串替换为固定 `<redacted-url>`,宁可少报也不泄漏
 - 名称截 64 字符,command/URL 截 512 字符,每工具上限 24 条(超出截断并丢弃,不做分页)
 - 截断按字符(rune 安全,复用 `truncateAgentText`),避免劈开多字节字符产生无效 UTF-8
 

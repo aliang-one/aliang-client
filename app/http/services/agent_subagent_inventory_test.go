@@ -50,12 +50,42 @@ func TestCollectSubagentsFromDir(t *testing.T) {
 	}
 }
 
-func TestCollectSubagentsFromDir_MissingDirIsNil(t *testing.T) {
+func TestCollectSubagentsFromDir_EmptySemantics(t *testing.T) {
+	// 目录缺失 = 采集面不可得(home 解析失败/目录从未存在):nil → hello 载荷
+	// subagents:null → 服务端保持旧值(非权威状态,不得清空)。
 	if out := collectSubagentsFromDir(filepath.Join(t.TempDir(), "does-not-exist")); out != nil {
 		t.Fatalf("missing dir must be nil, got %+v", out)
 	}
-	if out := collectSubagentsFromDir(t.TempDir()); out != nil {
-		t.Fatalf("empty dir must be nil, got %+v", out)
+	// 目录存在但无有效定义 = 权威的空清单:非 nil 空切片 → hello 发
+	// subagents:[] → 服务端清空。此前此处返回 nil(载荷 null),「删光最后
+	// 一个定义」永远无法同步到云端(cross-repo 契约,服务端 normalizeAgent-
+	// Subagents 同步改为显式空清单→[]、非空全被拒→undefined)。
+	if out := collectSubagentsFromDir(t.TempDir()); out == nil || len(out) != 0 {
+		t.Fatalf("existing empty dir must be non-nil empty slice, got %+v", out)
+	}
+	// 目录存在但只有非 .md 文件/子目录:同样是权威空清单(解析器对 .md 有
+	// 文件名兜底,「有 .md 却全部被拒」实际不可达,空清单唯一来源是无 .md)。
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "nested"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if out := collectSubagentsFromDir(dir); out == nil || len(out) != 0 {
+		t.Fatalf("dir with no .md files must be non-nil empty slice, got %+v", out)
+	}
+}
+
+// home 解析失败(agentHome()=="")必须返回 nil:否则 filepath.Join("",
+// ".claude","agents") 退化为 cwd 相对路径,进程 cwd 里恰有空 .claude/agents
+// 目录时,非权威的空清单会被当「显式清空」上报、抹掉云端既有数据。
+func TestCollectUserSubagentsHomeUnavailable(t *testing.T) {
+	prev := subagentInventoryHome
+	subagentInventoryHome = func() string { return "" }
+	defer func() { subagentInventoryHome = prev }()
+	if out := collectUserSubagents(); out != nil {
+		t.Fatalf("home unavailable must yield nil, got %+v", out)
 	}
 }
 

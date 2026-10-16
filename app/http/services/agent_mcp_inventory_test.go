@@ -117,6 +117,98 @@ func TestRedactMCPURL(t *testing.T) {
 	}
 }
 
+// url.Parse 失败(userinfo 非法转义、fragment 非法转义、userinfo 未转义空白
+// 等形态)时必须 fail-closed:无法可靠定位 userinfo/query/fragment 边界的 URL
+// 整串替换为固定 <redacted-url>,凭据不得借畸形 URL 绕过脱敏原样上报。
+func TestRedactMCPURLParseFailure(t *testing.T) {
+	for _, in := range []string{
+		"https://alice:s3cret%zz@host/mcp",   // userinfo 非法转义
+		"https://host/m#access_token=abc%zz", // fragment 非法转义
+		"https://user:my pass@host/mcp",      // userinfo 未转义空白
+	} {
+		if got := redactMCPURL(in); got != "<redacted-url>" {
+			t.Fatalf("parse-failure url %q must collapse to <redacted-url>, got %q", in, got)
+		}
+	}
+}
+
+// 凭据形态的 Authorization/api-key header 参数必须定向打码:保留「header 名 +
+// 已知 scheme 词」前缀,凭据主体替换为 <redacted:N>——不受「含空白豁免」与
+// 32 长度阈值约束(含空白的 Bearer 参数正是真实泄漏形态)。
+func TestRedactMCPAuthHeaderForms(t *testing.T) {
+	tok34 := strings.Repeat("t", 34)
+	cases := []struct{ name, in, want string }{
+		{"bearer 形态", "Authorization: Bearer " + tok34, "Authorization: Bearer <redacted:34>"},
+		{"--header= 单元素形态", "--header=Authorization: Bearer " + tok34, "--header=Authorization: Bearer <redacted:34>"},
+		{"大小写不敏感", "authorization: bearer " + tok34, "authorization: bearer <redacted:34>"},
+		{"Proxy-Authorization", "Proxy-Authorization: Basic " + tok34, "Proxy-Authorization: Basic <redacted:34>"},
+		{"短凭据也打码(不受 32 阈值约束)", "Authorization: Bearer shortkey9", "Authorization: Bearer <redacted:9>"},
+		{"api-key 无 scheme 语义:冒号后整体打码", "X-Api-Key: sk-live-0123456789abcdef", "X-Api-Key: <redacted:24>"},
+		{"未知 scheme 视为凭据整体打码", "Authorization: ntn_" + tok34, "Authorization: <redacted:38>"},
+		{"冒号后无内容:原样", "Authorization:", "Authorization:"},
+		{"自然语句仍放行", "this is a natural language sentence for humans", "this is a natural language sentence for humans"},
+	}
+	for _, c := range cases {
+		if got := redactMCPToken(c.in); got != c.want {
+			t.Fatalf("%s: redactMCPToken(%q) = %q, want %q", c.name, c.in, got, c.want)
+		}
+	}
+	// 端到端:mcp-remote 认证配置形态(bearer 在独立 argv 元素里)不得泄漏
+	cmd := redactMCPCommand([]string{"npx", "-y", "mcp-remote", "--header", "Authorization: Bearer " + tok34})
+	if strings.Contains(cmd, tok34) {
+		t.Fatalf("bearer credential must not survive redactMCPCommand: %q", cmd)
+	}
+	if !strings.Contains(cmd, "Authorization: Bearer <redacted:34>") {
+		t.Fatalf("header shape must be preserved with redacted body: %q", cmd)
+	}
+}
+
+// Unicode 安全:锚点定位不得拿 strings.ToLower 结果的字节下标切原串——
+// ToLower 对个别 rune 会改变字节长度(Ⱥ U+023A 2→3 字节扩张、İ 2→1 收缩),
+// 下标错位轻则劈烂前缀、重则切片越界 panic 打死 hello 链路(无 recover)。
+func TestRedactMCPAuthHeaderUnicodeSafety(t *testing.T) {
+	tok34 := strings.Repeat("t", 34)
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("must not panic: %v", r)
+		}
+	}()
+	// ToLower 扩张形态:lower 里的锚点下标 > 原串对应位置
+	growing := strings.Repeat("Ⱥ", 9) + "Authorization: Bearer " + tok34
+	if got := redactMCPToken(growing); strings.Contains(got, tok34) {
+		t.Fatalf("growing-rune prefix must still redact: %q", got)
+	}
+	// ToLower 收缩形态:下标前移,前缀被劈烂
+	shrinking := strings.Repeat("İ", 3) + "Authorization: Bearer " + tok34
+	got := redactMCPToken(shrinking)
+	if strings.Contains(got, tok34) {
+		t.Fatalf("shrinking-rune prefix must still redact: %q", got)
+	}
+	if !strings.Contains(got, "Authorization: Bearer <redacted:34>") {
+		t.Fatalf("header prefix must stay intact, got %q", got)
+	}
+}
+
+// 名字与冒号之间的空白/引号形态同样拦截:「Authorization :」「Authorization\t:」
+// 与 --header={"Authorization": "…"} JSON 形态都是形似凭据 header,不得因
+// 冒号未紧跟名字而漏网;名字后跟其他字符(authorizations:)不构成锚点。
+func TestRedactMCPAuthHeaderLooseColon(t *testing.T) {
+	tok34 := strings.Repeat("t", 34)
+	if got := redactMCPToken("Authorization : Bearer " + tok34); strings.Contains(got, tok34) {
+		t.Fatalf("space-before-colon must be caught: %q", got)
+	}
+	if got := redactMCPToken("Authorization\t: Bearer " + tok34); strings.Contains(got, tok34) {
+		t.Fatalf("tab-before-colon must be caught: %q", got)
+	}
+	jsonForm := `--header={"Authorization": "Bearer ` + tok34 + `"}`
+	if got := redactMCPToken(jsonForm); strings.Contains(got, tok34) {
+		t.Fatalf("json header form must be caught: %q", got)
+	}
+	if got := redactMCPToken("authorizations are: " + tok34); !strings.Contains(got, tok34) {
+		t.Fatalf("non-header word must pass through generic rule: %q", got)
+	}
+}
+
 func TestTruncateMCPName(t *testing.T) {
 	// 多字节截断必须 rune 安全:35 个「中」=105 字节,按字节切会劈出无效 UTF-8
 	name := truncateMCPName(strings.Repeat("中", 35))
@@ -374,6 +466,69 @@ func TestCodexMCPServerInventoryInMalformed(t *testing.T) {
 	out, _ := codexMCPServerInventoryIn(home)
 	if out != nil {
 		t.Fatalf("malformed toml must fail soft, got %+v", out)
+	}
+}
+
+// codex 官方 enabled 布尔(enabled=false = 临时停用而不删配置,codex 自身
+// 不会启动该服务器):停用条目不是可用设备能力,不得上报。
+func TestCodexMCPServerInventoryInEnabled(t *testing.T) {
+	home := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, ".codex"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	configTOML := `
+[mcp_servers.aaa-disabled]
+command = "x"
+enabled = false
+
+[mcp_servers.bbb-default-on]
+command = "y"
+
+[mcp_servers.ccc-disabled-url]
+url = "https://h/m"
+enabled = false
+
+[mcp_servers.ddd-explicit-on]
+command = "z"
+enabled = true
+`
+	if err := os.WriteFile(filepath.Join(home, ".codex", "config.toml"), []byte(configTOML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, _ := codexMCPServerInventoryIn(home)
+	if len(out) != 2 {
+		t.Fatalf("want only enabled entries, got %+v", out)
+	}
+	if out[0].Name != "bbb-default-on" || out[1].Name != "ddd-explicit-on" {
+		t.Fatalf("enabled entries wrong: %+v", out)
+	}
+}
+
+// 停用条目不得占用 mcpServerMaxCount 额度:5 个字典序在前的停用条目 + 24 个
+// 启用条目,正确行为是 24 个启用条目全部上报(停用项在额度判断前跳过)。
+func TestCodexMCPServerInventoryInEnabledDoesNotConsumeCap(t *testing.T) {
+	home := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, ".codex"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var b strings.Builder
+	for i := 0; i < 5; i++ {
+		fmt.Fprintf(&b, "[mcp_servers.a-disabled-%d]\ncommand = \"x\"\nenabled = false\n\n", i)
+	}
+	for i := 0; i < 24; i++ {
+		fmt.Fprintf(&b, "[mcp_servers.b-on-%02d]\ncommand = \"y\"\n\n", i)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".codex", "config.toml"), []byte(b.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, _ := codexMCPServerInventoryIn(home)
+	if len(out) != 24 {
+		t.Fatalf("24 enabled entries must all survive, got %d", len(out))
+	}
+	for _, srv := range out {
+		if strings.Contains(srv.Name, "disabled") {
+			t.Fatalf("disabled entry leaked into report: %+v", srv)
+		}
 	}
 }
 
