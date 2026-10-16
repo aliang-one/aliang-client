@@ -610,7 +610,6 @@ type agentAIClaudeRemotePolicy struct {
 	projectSkillTrusted     bool
 	projectCapabilityMode   string
 	settingSources          []string
-	disableSkillShell       bool
 	permissionAsk           []string
 	// trustTier is the effective trust tier ("isolated"|"sanitized"|"full").
 	// It supersedes projectSkillTrusted/projectCapabilityMode when the server
@@ -647,30 +646,35 @@ func parseAgentAIClaudeRemotePolicy(msg map[string]interface{}) agentAIClaudeRem
 	if policy.projectCapabilityMode != "sanitized_plugin" {
 		policy.projectCapabilityMode = "disabled"
 	}
-	// Tier resolution — spec §3 compat mapping, evaluated in order:
-	// 1) valid trust_level wins and supersedes the legacy fields;
-	// 2) present-but-invalid trust_level → isolated (fail-closed);
-	// 3) no trust_level → legacy trusted+sanitized_plugin maps to sanitized,
-	//    everything else (incl. legacy untrusted) maps to isolated so old
-	//    servers keep byte-identical behavior;
-	// 4) absent claude_remote_policy → mechanism off (early return above).
+	// Tier resolution (2026-10-16 默认档 sanitized——产品语义「settings.json
+	// 优先,平台 env 兜底」的最严实现):
+	// 1) valid trust_level wins(服务端显式下发仍可 isolated/full);
+	// 2) present-but-invalid trust_level → isolated (fail-closed, 服务端明
+	//    显发了无法识别的值属配置事故);
+	// 3) no trust_level(含全部 legacy 字段形态) → sanitized:加载 user
+	//    scope(用户 settings.json 的 provider/skills/ask 规则生效,与 TUI
+	//    一致),但**不加载 project scope**——项目 .claude/settings.json 的
+	//    hooks/env/allow 在 -p 模式零审批执行且可被远程克隆的仓库投毒
+	//    (R1,实验复现),user scope 的同名内容是设备主人自己的文件,无此面;
+	// 4) absent claude_remote_policy → 机制关闭:withClaudeApprovalHook 保
+	//    持历史行为 --setting-sources "",settings 全不加载(旧服务端设备的
+	//    provider 仍只能走平台 env 或 claudeAuthEnvOverlay 兜底)。
 	if level := strings.TrimSpace(remoteString(raw, "trust_level")); level != "" {
 		if tier, valid := normalizeClaudeTrustTier(level); valid {
 			policy.trustTier = tier
 		} else {
 			policy.trustTier = "isolated"
 		}
-	} else if policy.projectSkillTrusted && policy.projectCapabilityMode == "sanitized_plugin" {
-		policy.trustTier = "sanitized"
 	} else {
-		policy.trustTier = "isolated"
+		policy.trustTier = "sanitized"
 	}
 	policy.projectMCPTrusted = remoteBool(raw, "project_mcp_trusted", false)
 	// The tier table owns --setting-sources (see claudeTierSettingSources);
 	// the message-level setting_sources field is legacy and dropped.
 	policy.settingSources = nil
+	// settings.disableSkillShellExecution 为 write-only 遗留死字段:agent 侧
+	// 从未消费(写入端恒 true),服务端继续下发以兼容旧版本,此处不再解析。
 	if settings, ok := raw["settings"].(map[string]interface{}); ok {
-		policy.disableSkillShell = remoteBool(settings, "disableSkillShellExecution", true)
 		if permissions, ok := settings["permissions"].(map[string]interface{}); ok {
 			policy.permissionAsk = remoteStringSlice(permissions, "ask")
 		}
@@ -739,24 +743,29 @@ func probeClaudeCodeVersion(toolPath string) (claudeCodeVersion, bool) {
 }
 
 // applyClaudeTierVersionGuard downgrades non-isolated tiers to isolated when
-// the installed claude predates 2.2.0: 2.1.x never fires PermissionRequest in
-// headless --print mode and user ask rules suppress PreToolUse approvals, so
+// the installed claude predates 2.1.268: those builds never fire
+// PermissionRequest hooks in headless --print mode (fixed upstream in
+// 2.1.268, CHANGELOG), and user ask rules suppress PreToolUse approvals, so
 // loading user/project settings there would break the approval bridge
 // (spec §3 guard). The downgrade is tier-wide: sources back to "", no plugin.
 // Note: a full-tier policy downgraded here keeps its (intentionally empty)
-// ask list — the <2.2 PreToolUse strategy never injects permissions.ask, so
+// ask list — the <2.1.268 PreToolUse strategy never injects permissions.ask, so
 // behavior matches legacy isolated runs without refilling the default list.
 func applyClaudeTierVersionGuard(tool *agentAITool, policy agentAIClaudeRemotePolicy, sessionID string) agentAIClaudeRemotePolicy {
 	if !policy.enabled || policy.trustTier == "" || policy.trustTier == "isolated" {
 		return policy
 	}
 	version, ok := probeClaudeCodeVersion(tool.path)
-	if ok && version.atLeast(2, 2, 0) {
+	if ok && version.atLeast(claudeTierMinMajor, claudeTierMinMinor, claudeTierMinPatch) {
+		if !version.atLeast(claudeKnownGoodMajor, claudeKnownGoodMinor, claudeKnownGoodPatch) {
+			logger.Warn(fmt.Sprintf("claude-policy: %s is in the 2.1.268-2.1.288 band with known approval-bypass defects fixed in 2.1.289; upgrading claude is recommended session=%s", tool.path, sessionID))
+		}
 		return policy
 	}
-	logger.Warn(fmt.Sprintf("claude-policy: %s predates 2.2.0, downgrading trust tier %s to isolated session=%s", tool.path, policy.trustTier, sessionID))
+	logger.Warn(fmt.Sprintf("claude-policy: %s predates the tier minimum 2.1.268, downgrading trust tier %s to isolated session=%s", tool.path, policy.trustTier, sessionID))
 	downgraded := policy
 	downgraded.trustTier = "isolated"
+	// reason 字面量为历史契约(实际阈值已是 2.1.268),服务端存储透传不改名。
 	downgraded.policyNotice = map[string]interface{}{
 		"effective": "isolated",
 		"requested": policy.trustTier,
@@ -4958,7 +4967,7 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 	effectiveRun := run
 	if tool.outputFormat == agentAIOutputClaudeStreamJSON && !run.readOnly {
 		// 平台通道缺失的 isolated→sanitized 回退必须在版本守卫之前：守卫要对
-		// 提升后的档位继续行使职权（提升不得撤销 2.2.0 守门的降级）。
+		// 提升后的档位继续行使职权（提升不得撤销版本守门的降级）。
 		effectiveRun.claudePolicy = promoteIsolatedTierForPlatformFallback(effectiveRun.claudePolicy, run.sessionID)
 		effectiveRun.claudePolicy = applyClaudeTierVersionGuard(tool, effectiveRun.claudePolicy, run.sessionID)
 		var policyNotice map[string]interface{}
@@ -7105,12 +7114,28 @@ func parseClaudeCodeVersion(raw string) (claudeCodeVersion, bool) {
 	return claudeCodeVersion{major: major, minor: minor, patch: patch}, true
 }
 
+// 信任档位(sanitized/full)放行的最低 claude 版本:官方在 2.1.268 修复
+// headless --print 不触发 PermissionRequest 的缺陷(CHANGELOG 2.1.268)。
+// 档位守卫(applyClaudeTierVersionGuard)、审批钩子策略选择(本文件)与
+// slash 列表门(agent_slash_commands.go)三处必须共用此常量——2026-10-16
+// 评审曾发现守卫放宽而钩子策略仍卡旧阈值的三门漂移(full 档加载用户 ask
+// 规则却接 PreToolUse 桥,手机批准后仍被拒)。旧值 2.2.0 从未发布,是永假门。
+const (
+	claudeTierMinMajor = 2
+	claudeTierMinMinor = 1
+	claudeTierMinPatch = 268
+	// claudeKnownGood* 及以上修复了 <2.1.289 的审批绕过缺口(复合命令嵌套/
+	// env 前缀展开等),更早版本放行信任档时告警建议升级。
+	claudeKnownGoodMajor = 2
+	claudeKnownGoodMinor = 1
+	claudeKnownGoodPatch = 289
+)
+
 func claudeApprovalHookStrategyForVersion(raw string) claudeApprovalHookStrategy {
 	version, ok := parseClaudeCodeVersion(raw)
-	// Claude Code 2.1.x (verified with 2.1.17) does not invoke PermissionRequest
-	// for --print Bash permission denials, but it does invoke PreToolUse command
-	// hooks. Newer builds follow the current PermissionRequest/http contract.
-	if ok && version.atLeast(2, 2, 0) {
+	// 2.1.268 前的构建不触发 PermissionRequest(2.1.17 验证),只响应
+	// PreToolUse 命令钩子;2.1.268 起遵循现行 PermissionRequest/http 契约。
+	if ok && version.atLeast(claudeTierMinMajor, claudeTierMinMinor, claudeTierMinPatch) {
 		return claudeApprovalHookPermissionRequestHTTP
 	}
 	return claudeApprovalHookPreToolUseCommand

@@ -76,6 +76,9 @@ func TestClaudeApprovalHookStrategyByVersion(t *testing.T) {
 	}{
 		{name: "old claude 2.1 uses pretool command bridge", raw: "2.1.17 (Claude Code)", want: claudeApprovalHookPreToolUseCommand},
 		{name: "newer claude uses permission request http", raw: "2.2.0 (Claude Code)", want: claudeApprovalHookPermissionRequestHTTP},
+		{name: "2.1.268 (PermissionRequest headless fix) uses permission request http", raw: "2.1.268 (Claude Code)", want: claudeApprovalHookPermissionRequestHTTP},
+		{name: "liang-dev 2.1.286 uses permission request http", raw: "2.1.286 (Claude Code)", want: claudeApprovalHookPermissionRequestHTTP},
+		{name: "2.1.267 predates the headless fix, stays on pretool bridge", raw: "2.1.267 (Claude Code)", want: claudeApprovalHookPreToolUseCommand},
 		{name: "future claude stays on permission request http", raw: "3.0.1 (Claude Code)", want: claudeApprovalHookPermissionRequestHTTP},
 		{name: "unknown version falls back to proven legacy bridge", raw: "Claude Code dev build", want: claudeApprovalHookPreToolUseCommand},
 	}
