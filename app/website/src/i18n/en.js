@@ -648,6 +648,9 @@ export default {
   // Include-panel only (that input box tokenizes on commas and breaks the entry); see rules_geoipCommaMultiProxy for the proxy_rules panel
   rules_geoipCommaMulti: 'Use + to separate multiple geoip countries (e.g. geoip:CN+HK); comma syntax gets broken by this input box',
   rules_geoipCommaMultiProxy: 'Use + to separate multiple geoip countries (e.g. geoip:CN+HK); comma-separated multi-country form is not supported',
+  // Soft warnings (amber hints, never block saving): AI-vs-proxy rule overlap and comma-collapse semantics
+  rules_overlapWarning: 'The following entries appear in both AI rules and proxy rules; they will be routed to Aliang as AI rules take precedence, and the proxy rules will not apply to them: {entries}',
+  rules_commaCollapseHint: 'This line contains multiple comma-separated domains; only the last segment {kept} is kept under legacy compatibility semantics — put each domain on its own line',
   rules_entryErrorItem: 'Entry "{entry}": {message}',
   rules_proxyUsername: 'Username',
   rules_proxyUsernamePlaceholder: 'Optional',
@@ -669,6 +672,9 @@ export default {
   rules_includeDomainsSave: 'Save',
   rules_proxyRules: 'Proxy Rules',
   rules_proxyRulesDesc: 'Edit customer.proxy_rules, one rule per line.',
+  rules_proxyRulesDescExt: 'Supports exact/suffix domains, *. wildcards (subdomains only, not the bare domain), IP ranges, and country codes (geoip).',
+  rules_proxyRulesPlaceholder: 'One rule per line, e.g.:\nopenai.com\n*.api.example.com\nip-cidr:1.2.3.0/24\nip-range:1.2.3.1-1.2.3.254\ngeoip:CN+HK\nGEOIP,US,proxy',
+  rules_docsLink: 'View rule syntax docs',
   rules_rulesList: 'Rules list',
   rules_formHint: 'This form submits a payload shaped as { customer: ... } with no core settings.',
   rules_saving: 'Saving\u2026',

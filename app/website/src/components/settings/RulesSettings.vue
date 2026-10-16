@@ -24,6 +24,15 @@
         {{ error || submitError }}
       </div>
 
+      <!-- 软警告（不阻断保存）：AI 规则与代理规则条件重叠，AI 恒优先（HIGH#3） -->
+      <div
+        v-if="!loading && overlapWarning"
+        class="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-200"
+        role="status"
+      >
+        {{ overlapWarning }}
+      </div>
+
       <div v-if="loading" class="rounded-lg border border-dashed border-slate-300 bg-slate-50 px-4 py-8 text-sm text-slate-500 dark:border-slate-700 dark:bg-slate-900/40 dark:text-slate-400">
         {{ t('rules_loadingConfig') }}
       </div>
@@ -216,7 +225,15 @@
             <div>
               <h3 class="font-semibold text-slate-900 dark:text-white">{{ t('rules_proxyRules') }}</h3>
               <p class="text-xs text-slate-500">{{ t('rules_proxyRulesDesc') }}</p>
+              <!-- HIGH#5：语法摘要句——glob「只命中子域不命中裸域」等反直觉语义在 UI 上可发现 -->
+              <p class="text-xs text-slate-500">{{ t('rules_proxyRulesDescExt') }}</p>
             </div>
+            <!-- 复用 SettingsPage 页脚 openTutorialDocs('usage-guide') 先例：模块级共享状态，App.vue 挂载弹窗 -->
+            <a
+              class="ml-auto min-h-11 whitespace-nowrap text-xs font-medium text-primary hover:underline"
+              href="javascript:void(0)"
+              @click.prevent="openRulesSyntaxDocs"
+            >{{ t('rules_docsLink') }}</a>
           </div>
 
           <label class="space-y-2">
@@ -227,10 +244,13 @@
               :class="proxyRulesError
                 ? 'border-red-400 bg-red-50 focus:border-red-500 focus:ring-red-500/20 dark:border-red-500/50 dark:bg-red-900/10'
                 : 'border-slate-300 bg-white focus:border-primary focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900'"
-              placeholder="domain,example.com,proxy&#10;api.aliang.one"
+              :placeholder="t('rules_proxyRulesPlaceholder')"
               @input="_proxyRulesText = $event.target.value"
             ></textarea>
             <p v-if="proxyRulesError" class="text-xs text-red-500">{{ proxyRulesError }}</p>
+            <!-- 软提示（不阻断保存）：非关键字首段的逗号多域名行按兼容语义仅保留末段（HIGH#4）；
+                 红色错误优先展示（先修错误，塌缩提示随后顶上） -->
+            <p v-if="!proxyRulesError && proxyRulesCollapseHint" class="text-xs text-amber-600 dark:text-amber-400">{{ proxyRulesCollapseHint }}</p>
           </label>
         </section>
 
@@ -300,6 +320,7 @@
 
 <script>
 import { useI18n } from '../../i18n';
+import { openTutorialDocs } from '../../composables/useTutorialDocs';
 
 function defaultConfig() {
   return {
@@ -395,6 +416,37 @@ function isValidIPCond(cond) {
   return parseIPFamily(cond) > 0;
 }
 
+// 逗号兜底段提取（非关键字首段）：取尾段；尾段为动作词（ACTION_TAIL_WORDS）时取
+// 倒数第二段（仅剥一层，中间段动作词不参与）——与后端 ClassifyEntry 兜底分支一致。
+// validateRuleEntry 的结构校验与 extractProxyRuleDomain 的条件提取共用，避免两套逻辑漂移。
+function commaFallbackPart(parts) {
+  return ACTION_TAIL_WORDS.has(parts[parts.length - 1].trim())
+    ? (parts[parts.length - 2] || '')
+    : parts[parts.length - 1];
+}
+
+// URL/host:port 的宽容归一提取 + 剥 [] 包裹（对齐后端 classifyDomainEntry 提取段；
+// host:port 对齐 net.SplitHostPort，端口可空、不做数字校验；URL 解析失败时保留原串
+// 交由字符校验报错）。尾点不剥离——尾点属结构非法，交由空标签检查拒绝。
+// validateRuleEntry 与 extractProxyRuleDomain 共用，保证提取语义单一来源。
+function normalizeConditionHost(s) {
+  if (s.includes('://') || s.startsWith('//')) {
+    try {
+      s = new URL(s.includes('://') ? s : `https:${s}`).hostname || s;
+    } catch {
+      // URL 解析失败时保留原串，交给字符校验报错（与后端一致）
+    }
+  } else {
+    // host:port 宽容提取（对齐后端 net.SplitHostPort；端口可空、不做数字校验）
+    const hostPort = /^(\[[^\]]+\]|[^:]+):([^:]*)$/.exec(s);
+    if (hostPort) {
+      s = hostPort[1];
+    }
+  }
+  // 与后端一致：剥 [] 包裹
+  return String(s).trim().replace(/^\[(.+)\]$/, '$1');
+}
+
 // 返回 '' 表示合法，否则返回 i18n 错误文案。
 // 调用面：proxy_rules 文本域按行拆分（逗号原样保留）逐条调用；include 面 sanitizeList
 // 先按逗号拆分再调用（条目必无逗号，且 geoip 逗号形态已被 detectGeoipCommaIssue 拆分前拦截）。
@@ -443,29 +495,101 @@ export function validateRuleEntry(raw, t) {
         if (/^[A-Za-z]{2}$/.test(parts[i].trim())) return t('rules_geoipCommaMultiProxy');
       }
       return '';
-    } else if (ACTION_TAIL_WORDS.has(parts[parts.length - 1].trim())) s = parts[parts.length - 2] || '';
-    else s = parts[parts.length - 1];
-  }
-  if (s.includes('://') || s.startsWith('//')) {
-    try {
-      s = new URL(s.includes('://') ? s : `https:${s}`).hostname || s;
-    } catch {
-      // URL 解析失败时保留原串，交给字符校验报错（与后端一致）
-    }
-  } else {
-    // host:port 宽容提取（对齐后端 net.SplitHostPort；端口可空、不做数字校验）
-    const hostPort = /^(\[[^\]]+\]|[^:]+):([^:]*)$/.exec(s);
-    if (hostPort) {
-      s = hostPort[1];
+    } else {
+      s = commaFallbackPart(parts);
     }
   }
-  // 与后端一致：剥 [] 包裹；提取产物若为 IP 形态则按 IP 合法处理；
+  // 与后端一致：URL/host:port 宽容提取 + 剥 [] 包裹（normalizeConditionHost 与
+  // extractProxyRuleDomain 共用同一实现）；提取产物若为 IP 形态则按 IP 合法处理；
   // 结构校验前归一大小写；尾点不剥离——尾点属结构非法，交由空标签检查拒绝
-  s = String(s).trim().replace(/^\[(.+)\]$/, '$1');
+  s = normalizeConditionHost(s);
   if (parseIPFamily(s) > 0) return '';
   s = s.toLowerCase();
   if (!ENTRY_CHARS_RE.test(s)) return t('rules_entryInvalidChars');
   if (s.split('.').some((label) => !label)) return t('rules_entryEmptyLabel');
+  return '';
+}
+
+// —— proxy_rules 条件提取（供重叠比对共用；与 validateRuleEntry / 后端
+// processor/match ClassifyEntry 同一兼容语义：冒号关键字取冒号后条件段、
+// domain/domains 与 ip-cidr/ip-range 逗号前缀取第二段、兜底取尾段（动作词
+// 尾段剥一层）、URL/host:port/[] 提取——提取子步骤与 validateRuleEntry 共用
+// commaFallbackPart / normalizeConditionHost，单一来源防漂移）。
+// geoip 行（冒号/逗号形）归一为 geoip:code 冒号形，与 include 面条目（sanitizeList
+// 产物保留 geoip:CN+HK 原形）同形可比；ip-from 冒号对整行返回（include 面经
+// sanitizeList 拆逗号后不存在可比形态，永不误报）。其余产物小写化。
+// 返回 '' 表示空条目；本函数不做合法性校验（合法性仍归 validateRuleEntry），
+// 非法行照常参与比对无害——红色错误提示已在优先位置展示。
+// 具名导出仅供同目录 RulesSettings.test.js 做提取语义回归测试使用。
+export function extractProxyRuleDomain(raw) {
+  let s = String(raw || '').trim();
+  if (!s) return '';
+  const lower = s.toLowerCase();
+  if (lower.startsWith('geoip:')) return `geoip:${lower.slice(6).trim()}`;
+  if (lower.startsWith('ip-cidr:')) return lower.slice(8).trim();
+  if (lower.startsWith('ip-range:')) return lower.slice(9).trim();
+  if (lower.startsWith('ip-from:')) return lower;
+  if (parseIPFamily(lower) > 0 || isValidIPCond(lower)) return lower;
+  if (lower.includes(',')) {
+    const parts = lower.split(',');
+    const first = parts[0].trim();
+    if (first === 'domain' || first === 'domains') s = parts[1] || '';
+    else if (first === 'ip-cidr' || first === 'ip-range') return (parts[1] || '').trim();
+    else if (first === 'geoip') return `geoip:${(parts[1] || '').trim()}`;
+    else s = commaFallbackPart(parts);
+  }
+  return normalizeConditionHost(s).toLowerCase();
+}
+
+// 重叠比对键归一：小写 + 去尾点（比对口径与后端快照去重键 (kind,cond) 的 cond 域
+// 一致——域名/IP 条件按字面小写可比，geoip 冒号形两侧同形）。
+function normalizeOverlapKey(value) {
+  return String(value || '').trim().toLowerCase().replace(/\.+$/, '');
+}
+
+// AI include 与 proxy_rules 的条件重叠比对（HIGH#3）：后端快照编译时 ai_allowlist
+// 先入 (kind,cond) 共享 seen 表，proxy_rules 同键条目被剪除——AI 恒优先，用户的
+// 代理意图被静默反转。includeEntries = 启用 provider 的 include 条目（sanitizeList
+// 产物），proxyLines = proxy_rules 各行；返回重叠条目（归一形，排序去重），
+// 空数组 = 无重叠。具名导出仅供同目录 RulesSettings.test.js 做比对回归测试使用。
+export function findRuleOverlaps(includeEntries, proxyLines) {
+  const includeKeys = new Set();
+  for (const entry of includeEntries || []) {
+    const key = normalizeOverlapKey(entry);
+    if (key) includeKeys.add(key);
+  }
+  const overlaps = new Set();
+  for (const line of proxyLines || []) {
+    const key = normalizeOverlapKey(extractProxyRuleDomain(line));
+    if (key && includeKeys.has(key)) overlaps.add(key);
+  }
+  return [...overlaps].sort();
+}
+
+// —— 逗号塌缩软提示（HIGH#4）——
+// 逗号条目首段已知关键字清单（封闭集合，大小写不敏感）：复制自后端 processor/match
+// ClassifyEntry 的 switch 分支（ip-from 为口径补入，其逗号形同样不走兜底塌缩）；
+// 两边必须同步维护。冒号风格前缀行（geoip:/ip-cidr:/ip-range:/ip-from:）由前缀
+// 分支整行处理、不进入逗号兜底（如 ip-from:a,ip-to:b 合法整行），先于首段判定排除。
+const COMMA_KEYWORD_HEADS = new Set(['domain', 'domains', 'ip-cidr', 'ip-range', 'geoip', 'ip-from']);
+const COLON_KEYWORD_PREFIXES = ['geoip:', 'ip-cidr:', 'ip-range:', 'ip-from:'];
+
+// 逗号多域名行按兼容语义仅保留末段（尾段为动作词时剥一层取倒数第二段），其余段
+// 静默忽略——保存合法但少存规则（HIGH#4）。返回首个触发行的软提示文案，'' = 无触发。
+// 不阻断保存（合法的兼容语义），仅黄色提示；kept 保留原大小写（所见即所得）。
+// 具名导出仅供同目录 RulesSettings.test.js 做塌缩语义回归测试使用。
+export function detectCommaCollapseIssue(rawText, t) {
+  for (const line of sanitizeLines(rawText)) {
+    const lower = line.toLowerCase();
+    if (COLON_KEYWORD_PREFIXES.some((prefix) => lower.startsWith(prefix))) continue;
+    if (!line.includes(',')) continue;
+    const parts = line.split(',');
+    if (COMMA_KEYWORD_HEADS.has(parts[0].trim().toLowerCase())) continue;
+    const tail = parts[parts.length - 1].trim().toLowerCase();
+    const kept = (ACTION_TAIL_WORDS.has(tail) ? parts[parts.length - 2] : parts[parts.length - 1]).trim();
+    if (!kept) continue; // 空保留段 = 条目本身非法，红色错误已在优先位置提示
+    return t('rules_commaCollapseHint', { kept });
+  }
   return '';
 }
 
@@ -611,7 +735,10 @@ export default {
   name: 'RulesSettings',
   setup() {
     const { t } = useI18n();
-    return { t };
+    // HIGH#5：打开语法文档（usage-guide 12.1 规则格式）。openTutorialDocs 是模块级
+    // 共享状态（App.vue 渲染 TutorialDocsModal），无需经父组件 emit 链转发。
+    const openRulesSyntaxDocs = () => openTutorialDocs('usage-guide');
+    return { t, openRulesSyntaxDocs };
   },
   props: {
     config: {
@@ -700,6 +827,23 @@ export default {
     },
     proxyRulesError() {
       return formatEntryIssue(firstEntryIssue(sanitizeLines(this._proxyRulesText), this.t), this.t);
+    },
+    // —— 软警告（amber，绝不阻断保存；红线：与红色 error 分流——保存按钮 disabled
+    // 与 handleSubmit 均只看错误、不看警告）——
+    // HIGH#3：启用 provider 的 include 与 proxy_rules 条件重叠（AI 规则恒优先，
+    // 后端允许共存仅是代理规则对该条目不生效——警告让用户知情即可）。
+    overlapWarning() {
+      const includeEntries = [];
+      for (const [key, text] of Object.entries(this._providerIncludeTexts)) {
+        if (!this.form.ai_rules[key]?.enble) continue;
+        includeEntries.push(...sanitizeList(text));
+      }
+      const overlaps = findRuleOverlaps(includeEntries, sanitizeLines(this._proxyRulesText));
+      return overlaps.length ? this.t('rules_overlapWarning', { entries: overlaps.join(', ') }) : '';
+    },
+    // HIGH#4：proxy_rules 逗号多域名行的兼容塌缩提示（仅保留末段，其余段被忽略）。
+    proxyRulesCollapseHint() {
+      return detectCommaCollapseIssue(this._proxyRulesText, this.t);
     },
     providerEditorError() {
       if (!this.providerEditor.provider) return '';

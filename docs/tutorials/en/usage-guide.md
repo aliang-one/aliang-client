@@ -12,7 +12,8 @@
 8. [Customer Proxy Configuration](#6-customer-proxy-configuration)
 9. [AI Rules Configuration](#7-ai-rules-configuration)
 10. [Proxy Rules Configuration](#8-proxy-rules-configuration)
-11. [FAQ](#9-faq)
+11. [Traffic Mirror](#9-traffic-mirror-advanced)
+12. [FAQ](#10-faq)
 
 ---
 
@@ -422,7 +423,9 @@ ip-range,1.2.3.1-1.2.3.254,direct
 > (SNI/host). Of IP entries, only a bare single IP can ever match (literal
 > SNI/host comparison); CIDR blocks and ranges never match in the mirror path.
 > GeoIP entries are rejected outright in the mirror list (they can never match
-> by domain). Use AI Rules or Proxy Rules for IP-based routing.
+> by domain). Use AI Rules or Proxy Rules for IP-based routing. See
+> [Section 9: Traffic Mirror](#9-traffic-mirror-advanced) for the full mirror
+> configuration.
 
 ### GeoIP Conditions
 
@@ -529,7 +532,64 @@ behavior changes — reviewing your existing rules is recommended:
 
 ---
 
-## 9. FAQ
+## 9. Traffic Mirror (Advanced)
+
+Traffic Mirror can replicate TCP-level traffic whose domain matches a configured list and forward the copy to a designated HTTP endpoint. It is a pure side channel — the original traffic keeps flowing exactly as before, and normal proxying is unaffected.
+
+### Highlights
+
+- A connection is mirrored **as soon as its domain matches, regardless of the final route** — Aliang, direct, or any other path. Mirroring only copies bytes aside; it never changes how the original traffic is routed
+- Mirror failures never affect normal traffic
+- When not configured, the entire overhead is a single `nil` check — no goroutines or channels are ever created
+
+### Configuration
+
+Add a `traffic_mirror` block under `customer` in the configuration file:
+
+```json
+{
+    "customer": {
+        "traffic_mirror": {
+            "enabled": true,
+            "target": "http://172.16.159.219:443/mirror",
+            "domains": ["api.openai.com", "api.anthropic.com", "*.cursor.sh"]
+        }
+    }
+}
+```
+
+
+| Field     | Type     | Description                                                    |
+| --------- | -------- | -------------------------------------------------------------- |
+| `enabled` | bool     | Switch; when `false` there is no overhead at all               |
+| `target`  | string   | HTTP POST endpoint that receives the mirrored data             |
+| `domains` | string[] | Domain match list; syntax follows Section 8 (Domain Wildcards) |
+
+
+### Domain Matching
+
+
+| Pattern            | Example                 | Scope                                                                                                                                 |
+| ------------------ | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| Exact + subdomains | `openai.com`            | `openai.com` itself and all of its subdomains (`api.openai.com`, `cdn.openai.com`, etc.)                                              |
+| Subdomain wildcard | `*.cursor.sh`           | Matches subdomains such as `api2.cursor.sh`; does not match `cursor.sh` itself                                                        |
+| Anywhere wildcard  | `aliang.*`, `*epic.com` | `*` matches one or more arbitrary characters and may cross dots; `aliang.*` matches `aliang.co.uk`, `*epic.com` matches `cdnepic.com` |
+
+> **Note**: the mirror list is matched by domain (SNI/Host). For the full entry
+> syntax (including `*` wildcards and IP conditions), see
+> [Section 8: Proxy Rules Configuration](#8-proxy-rules-configuration); of IP
+> entries, only a bare single IP can ever match (literal SNI/Host comparison) —
+> CIDR blocks and ranges never match in the mirror path, and GeoIP entries are
+> rejected outright when saving (they can never match by domain). For IP-based
+> routing, use AI Rules or Proxy Rules.
+
+**Mirrored data format:**
+
+The mirror endpoint receives HTTP POST requests in JSON, containing fields such as `flow_id`, `direction` (request/response), `payload` (base64-encoded plaintext data), and `timestamp`.
+
+---
+
+## 10. FAQ
 
 ### Q: Nothing happens when I click Start Proxy?
 
@@ -600,4 +660,4 @@ behavior changes — reviewing your existing rules is recommended:
 
 ---
 
-*Document version: 2026-04-14*
+*Document version: 2026-10-16*

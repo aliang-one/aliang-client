@@ -648,6 +648,10 @@ export default {
   // include 面专用（该输入框 sanitizeList 按逗号拆分会拆坏）；proxy_rules 面见 rules_geoipCommaMultiProxy
   rules_geoipCommaMulti: 'geoip 多国请用 + 分隔（如 geoip:CN+HK）；逗号写法在当前输入框会被拆坏',
   rules_geoipCommaMultiProxy: 'geoip 多国请用 + 分隔（如 geoip:CN+HK）；逗号多国写法不受支持',
+  // 软警告（黄色提示，不阻断保存）：AI 规则与代理规则 (kind,cond) 重叠，快照编译时 AI 恒优先
+  rules_overlapWarning: '以下条目同时出现在 AI 规则与代理规则中，将优先按 AI 规则分流到 Aliang，代理规则对其不生效：{entries}',
+  // 软警告（黄色提示，不阻断保存）：逗号多域名行按兼容语义仅保留末段（合法但其余段被静默忽略）
+  rules_commaCollapseHint: '该行包含多个逗号分隔的域名，将按兼容语义仅保留末段 {kept}，其余被忽略；多个域名请分多行写入',
   rules_entryErrorItem: '条目“{entry}”：{message}',
   rules_proxyUsername: '用户名',
   rules_proxyUsernamePlaceholder: '可选',
@@ -669,6 +673,9 @@ export default {
   rules_includeDomainsSave: '保存',
   rules_proxyRules: '代理规则',
   rules_proxyRulesDesc: '编辑 customer.proxy_rules，每行一条规则。',
+  rules_proxyRulesDescExt: '支持精确/后缀域名、*. 通配（只命中子域，不命中裸域）、IP 段与国家码（geoip）。',
+  rules_proxyRulesPlaceholder: '每行一条，例如：\nopenai.com\n*.api.example.com\nip-cidr:1.2.3.0/24\nip-range:1.2.3.1-1.2.3.254\ngeoip:CN+HK\nGEOIP,US,proxy',
+  rules_docsLink: '查看规则语法文档',
   rules_rulesList: '规则列表',
   rules_formHint: '此表单提交格式为 { customer: ... } 的载荷，不包含核心设置。',
   rules_saving: '保存中\u2026',
