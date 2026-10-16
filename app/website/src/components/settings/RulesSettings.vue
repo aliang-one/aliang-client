@@ -365,6 +365,10 @@ function sanitizeLines(value) {
 // 已知刻意放宽：区间数值顺序（from ≤ to）由后端强校验，此处不比对。
 const ENTRY_CHARS_RE = /^[a-z0-9.*-]+$/;
 const IPV4_RE = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
+// 逗号兜底分支的尾段动作词集合——与后端 processor/match legacyActionTail 严格一致
+// （大小写不敏感：parts 已统一 toLowerCase；仅剥一层尾段）。
+// 红线：前端从不拒绝后端接受的输入，两边集合必须同步维护。
+const ACTION_TAIL_WORDS = new Set(['proxy', 'direct', 'reject', 'no-resolve']);
 
 function parseIPFamily(s) {
   const m = String(s).match(IPV4_RE);
@@ -435,7 +439,7 @@ export function validateRuleEntry(raw, t) {
         if (/^[A-Za-z]{2}$/.test(parts[i].trim())) return t('rules_geoipCommaMulti');
       }
       return '';
-    } else if (parts[parts.length - 1].trim() === 'proxy') s = parts[parts.length - 2] || '';
+    } else if (ACTION_TAIL_WORDS.has(parts[parts.length - 1].trim())) s = parts[parts.length - 2] || '';
     else s = parts[parts.length - 1];
   }
   if (s.includes('://') || s.startsWith('//')) {

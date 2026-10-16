@@ -32,8 +32,26 @@ func (k EntryKind) String() string {
 	}
 }
 
+// legacyActionTail 逗号兜底分支的尾段动作词集合（Clash target/policy 噪声）。
+// 大小写不敏感（ToLower 后精确匹配）；仅剥一层尾段——中间段动作词不参与，
+// 与既有 proxy 单次剥离语义同构。前端 RulesSettings.vue 逗号分支保持同一集合
+// （红线：前端从不拒绝后端接受的输入，两边集合必须同步维护）。
+var legacyActionTail = map[string]struct{}{
+	"proxy":      {},
+	"direct":     {},
+	"reject":     {},
+	"no-resolve": {},
+}
+
+// isLegacyActionTail 判断逗号条目尾段是否为动作词噪声（大小写不敏感）。
+func isLegacyActionTail(seg string) bool {
+	_, ok := legacyActionTail[strings.ToLower(seg)]
+	return ok
+}
+
 // ClassifyEntry 将原始规则条目分类为 domain/ip 并返回归一化 condition。
-// 关键字前缀识别先于逗号切分；尾段 ",proxy" 为 target 噪声（剥离忽略）。
+// 关键字前缀识别先于逗号切分；尾段为动作词（proxy/direct/reject/no-resolve）时
+// 视为 target 噪声剥离忽略（见 legacyActionTail）。
 // err 非空 = 条目非法，校验层直接报错。
 func ClassifyEntry(raw string) (EntryKind, string, error) {
 	s := strings.TrimSpace(raw)
@@ -93,10 +111,12 @@ func ClassifyEntry(raw string) (EntryKind, string, error) {
 			}
 			return EntryGeoIP, code, nil
 		}
-		// 既有兜底（parseProxyRuleDomain 语义）：取尾段；尾段为 proxy 时取倒数第二段。
-		// 完整保留旧解释，保证 DOMAIN-SUFFIX,x,proxy / a.com,b.com,proxy 等存量形态按旧值通过。
+		// 既有兜底（parseProxyRuleDomain 语义）：取尾段；尾段为动作词（legacyActionTail：
+		// proxy/direct/reject/no-resolve）时取倒数第二段，剥离后照常走完整校验。
+		// 完整保留旧解释（仅扩展动作词集合），保证 DOMAIN-SUFFIX,x,proxy / a.com,b.com,proxy
+		// / example.com,DIRECT 等存量形态按旧值通过。
 		fallback := strings.TrimSpace(parts[len(parts)-1])
-		if strings.EqualFold(fallback, "proxy") && len(parts) >= 2 {
+		if len(parts) >= 2 && isLegacyActionTail(fallback) {
 			fallback = strings.TrimSpace(parts[len(parts)-2])
 		}
 		return classifyAny(fallback)

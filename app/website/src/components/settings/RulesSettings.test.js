@@ -52,3 +52,34 @@ describe('RulesSettings validateRuleEntry geoip', () => {
     expect(probe('DOMAIN-SUFFIX,example.com,proxy')).toBe('');
   });
 });
+
+// —— 逗号兜底分支尾段动作词集合（对齐后端 processor/match legacyActionTail）——
+// 集合 = {proxy, direct, reject, no-resolve}（大小写不敏感，仅剥一层尾段）。
+// 红线：前端从不拒绝后端接受的输入，两边集合必须同步维护。
+describe('RulesSettings validateRuleEntry action tail', () => {
+  it('accepts direct/reject/no-resolve tails like proxy', () => {
+    expect(probe('example.com,direct')).toBe('');
+    expect(probe('example.com,REJECT')).toBe('');
+    expect(probe('example.com,no-resolve')).toBe('');
+    expect(probe('DOMAIN-SUFFIX,example.com,DIRECT')).toBe('');
+  });
+
+  it('validates the stripped segment, not the tail action word', () => {
+    // 剥离出 example..com（空标签）→ 报错；后端 ClassifyEntry("example..com,direct") 同样拒绝
+    expect(probe('example..com,direct')).toBe('rules_entryEmptyLabel');
+    // 单次剥离语义：尾段 extra 非动作词 → 校验尾段（中间段 direct 不参与）
+    expect(probe('example.com,direct,extra!')).toBe('rules_entryInvalidChars');
+  });
+
+  it('keeps geoip branch behavior unchanged (action tails are noise there)', () => {
+    expect(probe('geoip,CN,direct')).toBe('');
+    expect(probe('geoip,CN,no-resolve,extra')).toBe('');
+    expect(probe('geoip,CN,HK,direct')).toBe('rules_geoipCommaMulti');
+  });
+
+  it('keeps legacy proxy and non-action tail semantics intact', () => {
+    expect(probe('a.com,b.com,proxy')).toBe('');
+    expect(probe('foo,bar')).toBe('');
+    expect(probe('example.com,proxy-server')).toBe('');
+  });
+});
