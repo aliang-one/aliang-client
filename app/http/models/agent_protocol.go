@@ -64,6 +64,9 @@ const (
 	AgentEventAIOptionRequest         = "ai.option.request"       // agent→server: 请求用户在多个方案中选择
 	AgentEventAIOptionResponse        = "ai.option.response"      // server→agent: 用户的选择结果
 	AgentEventAIOptionCancelled       = "ai.option.cancelled"     // 双向: 选择对话失活，作废待选
+	AgentEventToolAskRequest          = "tool_ask.request"        // agent→server: 自有 MCP 交互工具调用,等手机作答(阻塞 CC 的 tool_use→tool_result 间隙)
+	AgentEventToolAskResponse         = "tool_ask.response"       // server→agent: 手机作答/过期,按 interaction_id(=CC tool_use_id)幂等回填
+	AgentEventToolAskCancel           = "tool_ask.cancel"         // agent→server: 超时/run 终结/CC 报错,主动翻卡终态
 	AgentEventAICommand               = "ai.command"              // agent→cloud: structured command execution (Bash / codex commandExecution) for activity-feed rendering
 	AgentEventAIFileChange            = "ai.file_change"          // agent→cloud: structured file edit (Write/Edit/MultiEdit / codex fileChange) with ±lines + diff
 	AgentEventAIThinking              = "ai.thinking"             // agent→cloud: streamed model reasoning (claude thinking_delta / codex reasoning) kept off the prose channel
