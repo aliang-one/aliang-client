@@ -73,6 +73,12 @@ func (h *AgentHandler) HandleAIStream(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// HandleToolAskMCP 自有交互工具 MCP 端点(tool_ask bridge):协议层交官方
+// SDK,鉴权/关联由 bridge 的 per-run token 把关(见 services.agentToolAskBridge)。
+func (h *AgentHandler) HandleToolAskMCP(w http.ResponseWriter, r *http.Request) {
+	h.service.HandleToolAskMCP(w, r)
+}
+
 func (h *AgentHandler) HandleAIApprovalHook(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)

@@ -40,6 +40,9 @@ type agentAIManager struct {
 	runJournalEnabled  bool
 	bindings           map[string]agentAIBindingRecord
 	processedRuns      map[string]agentAIProcessedRun
+	// toolAsk 自有 MCP 交互工具桥(2026-10-16 方案):one-shot --print 下承载
+	// 手机阻塞交互,懒初始化见 ensureToolAskBridge。
+	toolAsk *agentToolAskBridge
 	// service is the owning AgentService (set when the service creates this
 	// manager), used to evaluate the device approval policy. nil for standalone
 	// test managers, which fall back to GetSharedAgentService().
@@ -2960,6 +2963,15 @@ func (m *agentAIManager) handleClaudeApprovalHook(ctx context.Context, sessionID
 	writeJSON := session.activeWriter
 	m.mu.Unlock()
 
+	// 自有交互工具短路:ask_user 等白名单工具就是"审批"本身,再弹审批卡等于
+	// 双重交互(非 full 档注入的 permissions.ask 含 mcp__* 会把它压进 ask 路径)。
+	// 白名单是精确名集合——未知 mcp__aliang__*(项目 .mcp.json 同名 server 注入)
+	// 落回原路径。
+	if toolName := firstNonEmpty(remoteString(raw, "tool_name"), remoteString(raw, "toolName")); models.IsAgentToolAskTool(toolName) {
+		logger.Info(fmt.Sprintf("approval-hook: AUTO-APPROVE (aliang interaction tool) tool=%s session=%s", toolName, sessionID))
+		return claudeApprovalHookDecision(hookEventName, true, "auto-approved: aliang interaction tool"), nil
+	}
+
 	// Policy short-circuit: evaluate the device approval policy locally before
 	// hitting the cloud. Auto-approved/denied tools resolve here with no
 	// round-trip; only require_approval falls through to requestApproval.
@@ -4996,6 +5008,16 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 		effectiveRun.claudePolicy = applyClaudePolicyNotice(effectiveRun.claudePolicy, policyNotice)
 		defer cleanupClaudePolicy()
 		tool = withClaudeApprovalHook(tool, effectiveRun)
+		// 自有交互 MCP server(tool_ask bridge):per-run token + 合并 --mcp-config。
+		// 注入失败只降级不阻断回合——aliang-options 围栏兜底仍在;readOnly/goal
+		// fork 不注入(无交互)。
+		if toolAskInjected, cleanupToolAsk, toolAskErr := m.withAgentToolAskBridge(tool, effectiveRun, writeJSON); toolAskErr == nil {
+			tool = toolAskInjected
+			innerCleanup := cleanupClaudePolicy
+			cleanupClaudePolicy = func() { cleanupToolAsk(); innerCleanup() }
+		} else {
+			logger.Warn(fmt.Sprintf("tool-ask: bridge injection failed, falling back to fence-only interactions session=%s err=%v", run.sessionID, toolAskErr))
+		}
 	}
 
 	cmd := newBackgroundCommandContext(ctx, tool.path, tool.args...)

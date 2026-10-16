@@ -39,8 +39,10 @@ const (
 	AgentToolAskReasonClaudeErr = "claude_error" // CC 进程异常退出
 )
 
-// AgentToolAskRequest agent→server:tool_ask.request。interaction_id 即 CC
-// tool_use_id,是全链幂等键;expires_at 为 agent 计算的作答 SLA(ms epoch)。
+// AgentToolAskRequest agent→server:tool_ask.request。interaction_id 由 agent
+// bridge 生成(MCP tools/call 拿不到 CC 的 tool_use_id),是全链幂等键;
+// expires_at 为 agent 计算的作答 SLA(ms epoch);device_id 仅信息性(server
+// 从 WS 连接即知设备),可为空。
 type AgentToolAskRequest struct {
 	Type          string          `json:"type"`
 	RunID         string          `json:"run_id"`
