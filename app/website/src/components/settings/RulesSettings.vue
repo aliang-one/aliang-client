@@ -147,8 +147,9 @@
                   <p class="text-xs text-slate-500">{{ provider }}</p>
                 </div>
                 <label class="inline-flex min-h-9 cursor-pointer items-center gap-2 text-xs font-semibold text-slate-600 dark:text-slate-200 md:min-h-0">
-                  <input v-model="form.ai_rules[provider].enble" class="peer sr-only" type="checkbox" :aria-label="t('rules_enableAiRule')" />
-                  <span class="sr-only">{{ t('rules_enableAiRule') }}</span>
+                  <!-- LOW#17：可访问名组入 provider 名，避免 N 个开关同名（aria-label 优先于包裹 label 文本） -->
+                  <input v-model="form.ai_rules[provider].enble" class="peer sr-only" type="checkbox" :aria-label="t('rules_enableAiRule') + '：' + providerLabel(provider, presetProviders)" />
+                  <span class="sr-only">{{ t('rules_enableAiRule') }}：{{ providerLabel(provider, presetProviders) }}</span>
                   <span class="relative h-6 w-11 rounded-full bg-slate-300 transition-colors after:absolute after:left-0.5 after:top-0.5 after:h-5 after:w-5 after:rounded-full after:bg-white after:transition-transform after:content-[''] peer-checked:bg-primary peer-checked:after:translate-x-5 peer-focus-visible:outline peer-focus-visible:outline-2 peer-focus-visible:outline-offset-2 peer-focus-visible:outline-primary dark:bg-slate-700"></span>
                 </label>
               </div>
