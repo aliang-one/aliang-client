@@ -16,6 +16,7 @@ import (
 	"aliang.one/nursorgate/common/version"
 	auth "aliang.one/nursorgate/processor/auth"
 	"aliang.one/nursorgate/processor/config"
+	"aliang.one/nursorgate/processor/geoip"
 	"aliang.one/nursorgate/processor/rules"
 	"aliang.one/nursorgate/processor/runtime"
 	"aliang.one/nursorgate/processor/setup"
@@ -176,6 +177,12 @@ func initializeCoreRuleEngine() error {
 		return fmt.Errorf("failed to initialize rule engine: %w", err)
 	}
 	logger.Info("Core rule engine initialized")
+
+	// GeoIP 数据库：本地优先装载，缺失后台下载；失败由调用方按既有
+	// writeStartupTrace 警告模式处理，不阻断 core 启动
+	if err := geoip.GetService().EnsureLoadedAsync(); err != nil {
+		return fmt.Errorf("failed to orchestrate GeoIP database: %w", err)
+	}
 	return nil
 }
 

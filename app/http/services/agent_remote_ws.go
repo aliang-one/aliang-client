@@ -386,6 +386,12 @@ var (
 	agentRemotePingInterval      = newDurationAtom(30 * time.Second)
 	agentRemoteReadWindow        = newDurationAtom(90 * time.Second)
 	agentRemoteWriteTimeout      = newDurationAtom(10 * time.Second)
+	// 旧工具臂(file.list/file.read/git.status/env.info)分发入口。包级变量
+	// 便于测试注入 panic 假实现(agentToolsRegistry 同款注入模式),钉"旧臂
+	// panic 不得杀进程"——两臂绕过 default 臂的 RunWithGuards,进程内存活
+	// 只能靠分发处自身的 recover 护栏。
+	dispatchDetailWithAI = handleAgentDetailMessageWithAI
+	dispatchEnvTools     = handleAgentEnvToolsMessage
 	// agentRemoteRegistrationWait bounds how long a business write blocks for the
 	// server to ACK agent.registered before failing. Registration normally
 	// completes within a single RTT; this is a safety net for slow networks. On
@@ -691,10 +697,13 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 	// 注册表工具项（会被广告但永远不会走护栏分发）。
 	case models.AgentEventProjectDetail, models.AgentEventAISessionDetail, models.AgentEventFileList, models.AgentEventFileRead, models.AgentEventSlashCommandsList, "file.working_tree_diff":
 		s.setRemoteConnectionState(true, "online", "")
-		go handleAgentDetailMessageWithAI(msg, writeJSON, s.ai)
+		// 旧臂仍绕过 RunWithGuards(响应形状兼容优先,caps 暂不生效),但 panic
+		// 恢复必须兜住:裸 go 的 panic 顺 Go 语义杀全进程——read_file 是云端
+		// 每回合必调的高频工具,一次 payload 解析 panic 就带走所有活 PTY。
+		safeGo("agent_detail", func() { dispatchDetailWithAI(msg, writeJSON, s.ai) })
 	case models.AgentEventGitStatus, models.AgentEventEnvInfo:
 		s.setRemoteConnectionState(true, "online", "")
-		go handleAgentEnvToolsMessage(msg, writeJSON)
+		safeGo("agent_envtools", func() { dispatchEnvTools(msg, writeJSON) })
 	case models.AgentEventToolsList:
 		// 元 RPC：回显当前工具注册表（工具清单 + rev），服务端据此做能力
 		// 发现与 rev 漂移检测（heartbeat 带 agent_tools_rev）。
@@ -987,6 +996,7 @@ func (s *AgentService) agentHelloPayload() map[string]interface{} {
 		"host":                   snapshot.Host,
 		"capabilities":           snapshot.Capabilities,
 		"tools":                  snapshot.Tools,
+		"subagents":              collectUserSubagents(),
 		"agent_tools":            agentToolRegistry().Descriptors(),
 		"agent_tools_rev":        agentToolRegistry().Rev(),
 		"history":                snapshot.History,

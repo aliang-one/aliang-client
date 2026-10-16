@@ -1146,6 +1146,53 @@ func TestConfigValidate_ProxyRulesAcceptMixedLegacyAndNewSyntax(t *testing.T) {
 	}
 }
 
+func TestConfigValidate_CustomerRulesAcceptGeoIPEntries(t *testing.T) {
+	payload := []byte(`{
+		"core": {"api_server": "https://api.aliang.one"},
+		"customer": {
+			"proxy_rules": ["geoip:CN+HK+US", "GEOIP,CN,proxy"],
+			"ai_rules": {
+				"openai": {
+					"enble": true,
+					"include": ["geoip:JP"]
+				}
+			}
+		}
+	}`)
+
+	var cfg Config
+	if err := json.Unmarshal(payload, &cfg); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v, want nil for legal geoip entries on customer surface", err)
+	}
+}
+
+func TestConfigValidate_CustomerRulesRejectInvalidCountryCode(t *testing.T) {
+	payload := []byte(`{
+		"core": {"api_server": "https://api.aliang.one"},
+		"customer": {
+			"proxy_rules": ["geoip:CHN"]
+		}
+	}`)
+
+	var cfg Config
+	if err := json.Unmarshal(payload, &cfg); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate() error = nil, want invalid country code error")
+	}
+	if !strings.Contains(err.Error(), `customer.proxy_rules[0] invalid "geoip:CHN"`) {
+		t.Fatalf("error should carry entry index and raw text: %v", err)
+	}
+	if !strings.Contains(err.Error(), "非法国家码") {
+		t.Fatalf("error should carry the underlying reason: %v", err)
+	}
+}
+
 func TestTrafficMirrorConfigValidate_RejectsMalformedDomain(t *testing.T) {
 	cfg := &TrafficMirrorConfig{
 		Enabled: true,
@@ -1172,6 +1219,27 @@ func TestTrafficMirrorConfigValidate_AcceptsGlobAndIPEntries(t *testing.T) {
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("Validate() error = %v, want nil for legal glob/IP domains", err)
+	}
+}
+
+func TestTrafficMirrorConfigValidate_RejectsGeoIPEntry(t *testing.T) {
+	// 冒号形态与 Clash 逗号形态都必须真正走到拒绝分支（各自独立构造，防止前一形态提前返回掩盖后者）。
+	for _, entry := range []string{"geoip:CN", "GEOIP,CN,proxy"} {
+		cfg := &TrafficMirrorConfig{
+			Enabled: true,
+			Target:  "http://127.0.0.1:1/mirror",
+			Domains: []string{"*.cursor.sh", entry},
+		}
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatalf("Validate() error = nil for %q, want geoip mirror entry rejection", entry)
+		}
+		if !strings.Contains(err.Error(), `traffic_mirror.domains[1] invalid "`+entry+`"`) {
+			t.Fatalf("error should carry entry index and raw text: %v", err)
+		}
+		if !strings.Contains(err.Error(), "镜像列表不支持 geoip 条目") {
+			t.Fatalf("error should state mirror list does not support geoip entries: %v", err)
+		}
 	}
 }
 

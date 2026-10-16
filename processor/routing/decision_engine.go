@@ -2,9 +2,12 @@ package routing
 
 import (
 	"fmt"
+	"net"
+	"strings"
 
 	"aliang.one/nursorgate/common/logger"
 	"aliang.one/nursorgate/common/model"
+	"aliang.one/nursorgate/processor/geoip"
 	"aliang.one/nursorgate/processor/match"
 )
 
@@ -227,19 +230,44 @@ func matchIP(cidr, ip string) bool {
 	return match.MatchIPCond(cidr, ip)
 }
 
+// 本 seam 为包级 var，非并行安全：测试子串行执行，勿在覆盖它的测试里加 t.Parallel。
+// geoipLookup 可被测试替换；默认委托 processor/geoip 单例
+// （服务未启用/未加载时返回错误 → 不命中，热路径零日志）。
+var geoipLookup = func(ip net.IP) (string, error) {
+	info, err := geoip.GetService().LookupCountry(ip)
+	if err != nil || info == nil {
+		return "", err
+	}
+	return info.ISOCode, nil
+}
+
 // matchGeoIP checks if an IP's country code matches the rule condition
-// This is a placeholder for now - actual implementation will use GeoIP service
 // Examples:
 // - Rule condition "US" matches IPs from United States
 // - Rule condition "CN" matches IPs from China
-func matchGeoIP(countryCode, ip string) bool {
-	if countryCode == "" || ip == "" {
+//
+// 已委托 processor/geoip 单例查找（geoipLookup seam）。
+// 判定 IP 归属国是否命中 condition（多国 `+`/`,` 分隔任一命中）；
+// 快照层 condition 已小写化（snapshot.go:185），统一大写后 EqualFold 适配；
+// `,` 分隔仅来自结构化注入路径，归一为 `+` 后统一处理。
+func matchGeoIP(condition, ip string) bool {
+	if condition == "" || ip == "" {
 		return false
 	}
-
-	// TODO(US2-Phase4): Integrate with GeoIP service
-	// For now, this is a stub that will be fully implemented when GeoIP service is integrated
-	logger.Debug(fmt.Sprintf("GeoIP matching not yet implemented for %s (country: %s)", ip, countryCode))
+	addr := net.ParseIP(ip)
+	if addr == nil {
+		return false
+	}
+	code, err := geoipLookup(addr)
+	if err != nil || code == "" {
+		return false
+	}
+	norm := strings.ToUpper(strings.ReplaceAll(condition, ",", "+"))
+	for _, c := range strings.Split(norm, "+") {
+		if c != "" && strings.EqualFold(c, code) {
+			return true
+		}
+	}
 	return false
 }
 

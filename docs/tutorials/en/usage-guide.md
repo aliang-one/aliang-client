@@ -358,8 +358,11 @@ domain,example.com,proxy
 
 1. Rule explanation:
   - Part 1: Fixed as `domain` (or `domains`); IP conditions may use the `ip-cidr` / `ip-range` prefix instead
-  - Part 2: Domain to match (`*` wildcards supported) or an IP condition
-  - Part 3: `proxy` (use proxy) or `direct` (direct connect)
+  - Part 2: Domain to match (`*` wildcards supported) or an IP / GeoIP condition
+  - Part 3 (optional): `proxy` or `direct` — kept only for Clash-style
+    compatibility and **not used in routing**: all proxy-rule matches egress
+    uniformly per the customer upstream-proxy switch (Section 6) — through
+    the customer proxy when enabled, direct otherwise
 
 ### Domain Wildcards
 
@@ -388,15 +391,28 @@ IP conditions support both IPv4 and IPv6 (keywords are case-insensitive):
 ip-cidr:121.32.12.0/24              explicit keyword prefix
 ip-range:1.2.3.1-1.2.3.254
 ip-from:1.2.3.1,ip-to:1.2.3.254     keyword pair (optional trailing action, e.g. …,proxy)
-ip-cidr,121.32.12.0/24,proxy        Clash style (third part is the action)
+ip-cidr,121.32.12.0/24,proxy        Clash style (third part is ignored)
 ip-range,1.2.3.1-1.2.3.254,direct
 ```
 
 > **Where IP rules apply**: IP conditions are matched against the real
 > destination IP of TCP connections on the deep-mode (TUN) path. TLS traffic
-> without SNI, UDP traffic, and local HTTP-proxy inbound traffic never reach
-> the rules engine, so IP conditions have no effect there. `0.0.0.0/0` matches
-> IPv4 destinations only; `::/0` matches IPv6 destinations only.
+> without SNI also consults the rules engine with its destination IP — IP
+> conditions and GeoIP country-based routing apply there, so once such rules
+> are configured, SNI-less traffic starts routing by them (previously it
+> always went direct). Domain rules can never match SNI-less traffic (no
+> name to match), which falls back to the default direct route; connections
+> hitting AI rules (MITM routing) are automatically downgraded to direct,
+> and deny-type decisions degrade to direct as well — SNI-less connections
+> never enter the MITM/mirror path and are never blocked. The only blind spot
+> is UDP traffic: it bypasses the rules engine and always goes direct, so IP
+> conditions have no effect on it. TCP connections inbound through the local
+> HTTP proxy (CONNECT) do go through the rules engine as well — the
+> destination IP is filled in by a DNS lookup at inbound time, so
+> geoip/IP/domain rules all apply there (if that lookup fails, the
+> destination IP stays empty: IP/geoip rules miss, while domain rules still
+> apply). `0.0.0.0/0` matches IPv4
+> destinations only; `::/0` matches IPv6 destinations only.
 
 > **Validation**: malformed entries (invalid IPs, reversed ranges, empty
 > labels such as `a..b`) are rejected when you save, with an inline error
@@ -405,7 +421,50 @@ ip-range,1.2.3.1-1.2.3.254,direct
 > **Traffic mirror**: the mirror `domains` list is matched by domain
 > (SNI/host). Of IP entries, only a bare single IP can ever match (literal
 > SNI/host comparison); CIDR blocks and ranges never match in the mirror path.
-> Use AI Rules or Proxy Rules for IP-based routing.
+> GeoIP entries are rejected outright in the mirror list (they can never match
+> by domain). Use AI Rules or Proxy Rules for IP-based routing.
+
+### GeoIP Conditions
+
+GeoIP entries route traffic by the **country of the connection's destination
+IP**, using two-letter ISO 3166-1 country codes (keywords and codes are
+case-insensitive; codes are normalized to uppercase on save):
+
+```
+geoip:CN                      single country
+geoip:CN+HK+US                multiple countries, '+'-separated (any match;
+                              commas are not allowed for multiple countries)
+GEOIP,CN,proxy                Clash style, single country (Proxy Rules and
+                              config files only — the AI-rules input is split
+                              on commas, so this form is rejected there)
+```
+
+Malformed entries are rejected when you save, for example: `geoip:CHN`
+(country codes must be two letters), `geoip:CN,HK` (multiple countries must
+use `+`, not commas), `geoip:CN+` (empty segment), or a bare `geoip`.
+
+> **Where GeoIP rules apply**: exactly the same scope as the IP conditions
+> above — TCP connections on the deep-mode (TUN) path, matched by the country
+> of the real destination IP; SNI-less TLS traffic and TCP connections inbound
+> through the local HTTP proxy (CONNECT) are included (see the note above).
+> The only blind spot is likewise UDP traffic, which never reaches the rules
+> engine, so geoip has no effect on it. Until the country database is
+> ready, geoip rules simply never match (no error, no impact on other rules).
+
+> **Data acquisition**: the GeoLite2 country database
+> (`GeoLite2-Country.mmdb`) is downloaded automatically in the background on
+> startup when missing locally, from a COS mirror into the local data
+> directory (`~/.aliang/geoip/` by default). It never blocks startup; on
+> failure it only logs a warning and retries on the next startup. Set the
+> `ALIANG_GEOIP_DOWNLOAD_URL` environment variable to override the download
+> URL. The database is never refreshed automatically — refresh it about once
+> a month: delete the local file and restart to re-download, or overwrite
+> the file in place. After overwriting, restart the agent to load the new
+> database (loading happens only at startup; there is no hot reload).
+
+> **Statistics attribution**: geoip entries are excluded from AI statistics —
+> AI activity statistics match by domain, so country-routed traffic is not
+> counted toward any AI provider's activity.
 
 ### Examples
 
@@ -419,13 +478,18 @@ domain,github.com,proxy
 domains,*.epic.com
 domains,aliang.*
 
-# These domains connect directly
+# Clash-style form (trailing action is ignored — see the Part 3 note above)
 domain,google.com,direct
 
 # IP conditions
 ip-cidr,121.32.12.0/24,proxy
 ip-range,1.2.3.1-1.2.3.254,direct
 ip-from:1.2.3.1,ip-to:1.2.3.254
+
+# GeoIP conditions (country-based routing)
+geoip:CN
+geoip:CN+HK+US
+geoip,US,proxy
 ```
 
 ---

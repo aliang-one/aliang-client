@@ -6,12 +6,13 @@ package match
 import "strings"
 
 // MatchDomain 判定 host 是否命中 pattern。
-// 均先小写、去空白后比较；host 侧另去尾点（pattern 侧尾点由上游结构校验拒绝，运行时不剥离）。
+// 均先小写、去空白后比较；host 侧另剥全部尾点（【加固】双尾点 SNI 不再绕过域名规则；
+// pattern 侧尾点由上游结构校验拒绝，运行时不剥离）。
 //   - pattern 不含 '*'：精确匹配，或后缀匹配（"example.com" 命中 "www.example.com"）
 //   - pattern 含 '*'：glob 匹配，每个 '*' 匹配 ≥1 个任意字符（可跨点号）
 func MatchDomain(pattern, host string) bool {
 	pattern = strings.ToLower(strings.TrimSpace(pattern))
-	host = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	host = strings.TrimRight(strings.ToLower(strings.TrimSpace(host)), ".")
 	if pattern == "" || host == "" {
 		return false
 	}

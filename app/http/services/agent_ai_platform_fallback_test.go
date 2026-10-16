@@ -130,19 +130,19 @@ func TestPlatformPromotionRespectsVersionGuard(t *testing.T) {
 	}
 }
 
-func TestWithClaudeRemotePolicyPlatformPresentPinsManagedByHost(t *testing.T) {
+// 产品决策（2026-10-16 重申，用户多次提出）：agent 起的 claude 必须跟 TUI 一致——
+// 用户 settings.json 的 provider 配置优先，注入 env 只在 settings 未提供时兜底。
+// 因此任何档位都不得注入 CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST（它会无视 settings
+// 的 provider 变量，撤销 2026-08-31 spec 既定的「本地一致（可接受）」行为）。
+func TestWithClaudeRemotePolicyNeverPinsManagedByHost(t *testing.T) {
 	overridePlatformProbe(t, true)
 	for _, tier := range []string{"isolated", "sanitized", "full"} {
 		tool := newClaudeCodeAIToolForOS("darwin", "claude", "/bin/claude", "hi", "", "", "")
 		got, _, notice := withClaudeRemotePolicy(tool, policyRun(tier))
-		found := false
 		for _, kv := range got.env {
-			if kv == "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=1" {
-				found = true
+			if strings.HasPrefix(kv, "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST=") {
+				t.Errorf("tier=%s 不得注入 MANAGED_BY_HOST（settings.json 必须优先）: %v", tier, got.env)
 			}
-		}
-		if !found {
-			t.Errorf("tier=%s 平台通道在位应注入 MANAGED_BY_HOST=1: %v", tier, got.env)
 		}
 		if notice != nil {
 			t.Errorf("tier=%s 平台在位不应产生 notice: %v", tier, notice)

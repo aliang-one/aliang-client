@@ -321,7 +321,8 @@ function normalizeStringList(items) {
     : [];
 }
 
-function sanitizeList(value) {
+// 具名导出仅供同目录 RulesSettings.test.js 做分词器回归测试使用
+export function sanitizeList(value) {
   return value
     .split(/[\n,;]+/)
     .map((entry) => normalizeIncludeEntry(entry))
@@ -391,10 +392,23 @@ function isValidIPCond(cond) {
 }
 
 // 返回 '' 表示合法，否则返回 i18n 错误文案。
-function validateRuleEntry(raw, t) {
+// 具名导出仅供同目录 RulesSettings.test.js 做 geoip 形态回归测试使用（与 sanitizeList 同例）。
+export function validateRuleEntry(raw, t) {
   let s = String(raw || '').trim();
   if (!s) return '';
   const lower = s.toLowerCase();
+  // geoip：冒号风格（多国 + 分隔）——必须先于下方 IP/域名分支短路：
+  // geoip 条目含 ':'/'+'（不在 ENTRY_CHARS_RE 字符集），且逗号分支与 host:port 提取都会把它拆坏
+  if (lower.startsWith('geoip:')) {
+    const rem = s.slice(6).trim();
+    if (!rem) return t('rules_geoipInvalid');
+    if (rem.includes(',')) return t('rules_geoipCommaMulti');
+    const codes = rem.split('+').map((c) => c.trim().toUpperCase()).filter(Boolean);
+    if (!codes.length || !codes.every((c) => /^[A-Z]{2}$/.test(c))) return t('rules_geoipInvalid');
+    return '';
+  }
+  // 裸 geoip 关键字：后端 ClassifyEntry 专门拒绝（当域名放行无意义），前端对齐
+  if (lower === 'geoip') return t('rules_geoipInvalid');
   if (lower.startsWith('ip-cidr:')) return isValidIPCond(s.slice(8).trim()) ? '' : t('rules_ipInvalid');
   if (lower.startsWith('ip-range:')) return isValidIPCond(s.slice(9).trim()) ? '' : t('rules_ipInvalid');
   if (lower.startsWith('ip-from:')) {
@@ -411,6 +425,16 @@ function validateRuleEntry(raw, t) {
       // 对齐后端：关键字与逗号之间允许空白（first 已 trim，分派取代原 startsWith('ip-cidr,') 特判）
       const second = parts[1];
       return second && isValidIPCond(second.trim()) ? '' : t('rules_ipInvalid');
+    } else if (first === 'geoip') {
+      // 对齐后端 Clash geoip 分支：单国 + 可选 proxy 尾段合法；
+      // 其余段再出现两位国家码 = 逗号多国尝试（后端拒绝，include 面也会被拆坏）→ 提示 + 分隔
+      if (parts.length < 2 || !parts[1].trim()) return t('rules_geoipInvalid');
+      const second = parts[1].trim().toUpperCase();
+      if (!/^[A-Z]{2}$/.test(second)) return t('rules_geoipInvalid');
+      for (let i = 2; i < parts.length; i++) {
+        if (/^[A-Za-z]{2}$/.test(parts[i].trim())) return t('rules_geoipCommaMulti');
+      }
+      return '';
     } else if (parts[parts.length - 1].trim() === 'proxy') s = parts[parts.length - 2] || '';
     else s = parts[parts.length - 1];
   }
@@ -450,6 +474,19 @@ function firstEntryIssue(entries, t) {
 
 function formatEntryIssue(issue, t) {
   return issue ? t('rules_entryErrorItem', { entry: issue.entry, message: issue.message }) : '';
+}
+
+// 拆分前扫描：include 面任何 geoip 逗号形态都会被 sanitizeList 的逗号 tokenizer 拆坏
+// （无例外——Clash 形态 GEOIP,CN,proxy 属 proxy_rules 专属，include 面同样非法）。
+// 只挂 include 输入；proxy_rules 文本域按行拆分，GEOIP,CN,proxy 在那里合法，不挂。
+function detectGeoipCommaIssue(rawText, t) {
+  const lines = String(rawText || '').split('\n');
+  for (const line of lines) {
+    if (/geoip[:,][^\n]*,[^\n]*/i.test(line)) {
+      return t('rules_geoipCommaMulti');
+    }
+  }
+  return '';
 }
 
 function normalizeAiRules(aiRules = {}) {
@@ -655,11 +692,18 @@ export default {
     },
     providerEditorError() {
       if (!this.providerEditor.provider) return '';
+      // include 面：先做 geoip 逗号形态的拆分前扫描，再走逐条校验
+      const commaIssue = detectGeoipCommaIssue(this.providerEditor.draft, this.t);
+      if (commaIssue) return commaIssue;
       return formatEntryIssue(firstEntryIssue(sanitizeList(this.providerEditor.draft), this.t), this.t);
     },
     // 已存 include 文本的实时校验（草稿在弹窗内另有提示）；条目非法时阻止整表提交。
     submitError() {
       for (const [key, text] of Object.entries(this._providerIncludeTexts)) {
+        const commaIssue = detectGeoipCommaIssue(text, this.t);
+        if (commaIssue) {
+          return `${this.providerLabel(key, this.presetProviders)}: ${commaIssue}`;
+        }
         const issue = firstEntryIssue(sanitizeList(text), this.t);
         if (issue) {
           return `${this.providerLabel(key, this.presetProviders)}: ${formatEntryIssue(issue, this.t)}`;

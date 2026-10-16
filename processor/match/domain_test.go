@@ -36,6 +36,10 @@ func TestMatchDomain(t *testing.T) {
 		{"empty-pattern", "", "example.com", false},
 		{"empty-host", "example.com", "", false},
 		{"host-trailing-dot", "example.com", "example.com.", true},
+		// 【加固】host 侧剥全部尾点：双尾点 SNI/Host 不再绕过域名规则
+		{"double-trailing-dot", "example.com", "www.example.com..", true},
+		{"double-trailing-dot-exact", "example.com", "example.com..", true},
+		{"all-dots-host", "example.com", "..", false},
 		{"star-needs-one-char", "a*", "a", false},
 		{"star-consumes-one", "a*", "ab", true},
 		{"whole-host-star", "*", "anything.example", true},

@@ -77,3 +77,44 @@ func TestAgentToolRegistry_HelloCarriesTools(t *testing.T) {
 		t.Fatal("hello payload missing agent_tools_rev")
 	}
 }
+
+func TestAgentToolRegistry_ReadFileDescriptorIsTruthful(t *testing.T) {
+	// 审计二轮:read_file 描述符宣称 "Sensitive or secret-bearing files may be
+	// refused",但全仓无任何拒绝实现;路径围栏已被 operator policy 有意移除
+	// (agent_detail.go: confinement REMOVED)。描述符必须说真话——上游 LLM 与
+	// 服务端据此建立调用预期,不存在的防线不能写进广告。
+	reg := agentToolRegistry()
+	tool, ok := reg.Get(models.AgentEventFileRead)
+	if !ok {
+		t.Fatal("read_file not registered")
+	}
+	if strings.Contains(strings.ToLower(tool.Description), "refused") {
+		t.Fatalf("read_file descriptor still advertises a refusal that has no implementation: %q", tool.Description)
+	}
+	if !strings.Contains(strings.ToLower(tool.Description), "not confined") {
+		t.Fatalf("read_file descriptor must state the no-confinement policy truthfully: %q", tool.Description)
+	}
+}
+
+func TestAgentToolRegistry_ContainsGitLog(t *testing.T) {
+	// git_log(rev 3): 提交历史能力。必须经注册表(default 臂 RunWithGuards
+	// 护栏)分发——event git.log 不与任何显式臂冲突。
+	reg := agentToolRegistry()
+	tool, ok := reg.Get(models.AgentEventGitLog)
+	if !ok {
+		t.Fatal("git_log not registered")
+	}
+	if tool.ID != "git_log" {
+		t.Fatalf("id = %q, want git_log", tool.ID)
+	}
+	if !tool.Caps.ReadOnly || !tool.Caps.NeedsProject {
+		t.Fatalf("caps = %+v, want read_only+needs_project", tool.Caps)
+	}
+	if tool.Handler == nil {
+		t.Fatal("handler nil")
+	}
+	// rev 必须已随新工具 bump——心跳漂移检测靠它重拉 tools.list。
+	if agentToolRegistryRev < 3 {
+		t.Fatalf("rev = %d, want >= 3 after git_log addition", agentToolRegistryRev)
+	}
+}

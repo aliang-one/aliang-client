@@ -1,6 +1,11 @@
 package statistic
 
-import "testing"
+import (
+	"strings"
+	"testing"
+
+	"aliang.one/nursorgate/processor/config"
+)
 
 func TestAIDomainMatches(t *testing.T) {
 	tests := []struct {
@@ -49,6 +54,10 @@ func TestAIDomainPatternNormalization(t *testing.T) {
 		{"bare ip unchanged", "1.2.3.4", "1.2.3.4"},
 		{"bare v6 ip unchanged", "2001:db8::1", "2001:db8::1"},
 		{"v6 cidr kept intact", "2001:db8::/32", "2001:db8::/32"},
+		// geoip 条目（展示形态与编译侧 condition 一致；现状被端口剥离/原样透传变形）
+		{"geoip colon single", "geoip:CN", "CN"},
+		{"geoip colon multi-country", "geoip:CN+HK", "CN+HK"},
+		{"clash geoip entry", "GEOIP,CN,proxy", "CN"},
 		// 域名 / wildcard / URL / 端口回归（行为与现状一致）
 		{"wildcard preserved", "*.epic.com", "*.epic.com"},
 		{"wildcard ip-ish suffix untouched", "*.1.2.3.4", "*.1.2.3.4"},
@@ -78,6 +87,12 @@ func TestAIDomainPatternNormalization(t *testing.T) {
 	}{
 		{"ip-entry-idempotent", "121.32.12.0/24"},           // normalize 两次结果一致
 		{"clash-ip-idempotent", "ip-cidr,10.0.0.0/8,proxy"}, // 同上
+		// geoip 多国 condition 含 '+'（域名字符集外），再入可被识别补前缀归一，幂等可锁。
+		// 单国码（如 GEOIP,CN,proxy → CN）再入折叠为域名 cn，与 .cn 顶级域不可区分，
+		// 幂等不可锁；provider 构建处已过滤 geoip 条目（见 TestTrackedAIProvidersSkipGeoIPEntries），
+		// 此处 normalize 的 geoip 行为仅作直接调用的防御层锁定。
+		{"geoip-multi-idempotent", "geoip:CN+HK"},
+		{"geoip-multi-raw-case-idempotent", "GEOIP:US+HK"}, // 同上（原始大小写无关）
 	}
 	for _, tt := range idempotent {
 		t.Run(tt.name, func(t *testing.T) {
@@ -90,5 +105,42 @@ func TestAIDomainPatternNormalization(t *testing.T) {
 				t.Fatalf("normalizeAIDomainPattern 二次归一化不幂等：%q → %q → %q", tt.raw, first, second)
 			}
 		})
+	}
+}
+
+// geoip 条目不得进入域名 pattern 存储：国家码（如 CN）会被 MatchDomain 后缀命中
+// 所有 *.cn 主机，把非 AI 流量误归因到该 provider（HitCount++ / detection.Domain 折叠）。
+// 路由侧 geoip 由快照编译器独立处理，与统计归类无关。
+func TestTrackedAIProvidersSkipGeoIPEntries(t *testing.T) {
+	config.ResetGlobalConfigForTest()
+	defer config.ResetGlobalConfigForTest()
+
+	enabled := true
+	config.SetGlobalConfig(&config.Config{
+		Customer: &config.CustomerConfig{
+			AIRules: map[string]*config.CustomerAIRuleSetting{
+				"geo-only": {
+					Enble:   &enabled,
+					Label:   "Geo Only",
+					Include: []string{"GEOIP,CN,proxy", "geoip:HK"},
+				},
+			},
+		},
+	})
+
+	if provider, pattern, ok := matchTrackedAIProvider("www.example.cn"); ok {
+		t.Fatalf("matchTrackedAIProvider(\"www.example.cn\") 命中 provider %q pattern %q，geoip 国家码不得后缀命中 .cn 主机", provider.Key, pattern)
+	}
+
+	for _, provider := range currentTrackedAIProviders() {
+		if provider.Key == "geo-only" {
+			t.Fatalf("仅含 geoip 条目的 provider 应被过滤（len(Patterns)==0），得到 Patterns=%v", provider.Patterns)
+		}
+	}
+
+	for _, domain := range currentTrackedAIDomains() {
+		if strings.EqualFold(domain, "cn") || strings.EqualFold(domain, "hk") || strings.Contains(domain, "+") {
+			t.Fatalf("currentTrackedAIDomains 含 geoip 国家码 %q", domain)
+		}
 	}
 }

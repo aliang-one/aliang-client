@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"os/user"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -74,6 +75,75 @@ func agentGitStatusPayload(msg map[string]interface{}) map[string]interface{} {
 		"is_repo":      isRepo,
 		"branch":       branch,
 		"status":       status,
+		"generated_at": time.Now().UTC().Format(time.RFC3339),
+	}
+}
+
+// agentGitLogEnvToolLimits 钳制 git.log 的分页参数(注册表 caps 之外的第二道
+// 防——git log 在大仓库上不受限会拖垮 WS 回写)。
+const (
+	agentGitLogDefaultLimit = 20
+	agentGitLogMaxLimit     = 100
+	agentGitLogMaxOffset    = 100000
+)
+
+// agentGitLogPayload 返回项目仓库最近提交历史(新→旧)。分页 limit/offset 由
+// 调用方给;输出结构化五字段(hash/short/author/date/subject,tab 解析),
+// 供云端能力消费直接取用。非 repo → is_repo=false + 空 entries。
+func agentGitLogPayload(msg map[string]interface{}) map[string]interface{} {
+	requestID := remoteString(msg, "request_id")
+	cwd, errPayload, ok := resolveEnvToolCwd(msg, requestID, models.AgentEventGitLogError)
+	if !ok {
+		return errPayload
+	}
+	limit := remoteInt(msg, "limit", agentGitLogDefaultLimit)
+	if limit < 1 {
+		limit = 1
+	}
+	if limit > agentGitLogMaxLimit {
+		limit = agentGitLogMaxLimit
+	}
+	offset := remoteInt(msg, "offset", 0)
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > agentGitLogMaxOffset {
+		offset = agentGitLogMaxOffset
+	}
+	isRepo := strings.TrimSpace(gitStdoutCmd(cwd, "rev-parse", "--is-inside-work-tree")) == "true"
+	entries := []map[string]string{}
+	if isRepo {
+		raw := gitStdoutCmd(cwd,
+			"log",
+			"--pretty=format:%H%x09%h%x09%an%x09%ad%x09%s",
+			"--date=iso-strict",
+			"--max-count="+strconv.Itoa(limit),
+			"--skip="+strconv.Itoa(offset),
+		)
+		for _, line := range strings.Split(raw, "\n") {
+			if strings.TrimSpace(line) == "" {
+				continue
+			}
+			parts := strings.SplitN(line, "\t", 5)
+			if len(parts) != 5 {
+				continue // 畸形行丢弃,不拖垮整份历史
+			}
+			entries = append(entries, map[string]string{
+				"hash":    parts[0],
+				"short":   parts[1],
+				"author":  parts[2],
+				"date":    parts[3],
+				"subject": parts[4],
+			})
+		}
+	}
+	return map[string]interface{}{
+		"type":         models.AgentEventGitLogResult,
+		"request_id":   requestID,
+		"is_repo":      isRepo,
+		"limit":        limit,
+		"offset":       offset,
+		"entries":      entries,
 		"generated_at": time.Now().UTC().Format(time.RFC3339),
 	}
 }

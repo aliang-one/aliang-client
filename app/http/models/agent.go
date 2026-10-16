@@ -74,6 +74,20 @@ type AgentUserIdentity struct {
 	Role  string `json:"role,omitempty"`
 }
 
+// AgentMCPServer 是设备上某 CLI 配置的一个 MCP 服务器摘要(脱敏后,设备级
+// 能力清单)。env 值永不进入本结构;长 token/URL query 由采集层打码。
+type AgentMCPServer struct {
+	Name string `json:"name"`
+	// Transport 是传输形态:stdio | http | sse(codex url 条目统一归 http)。
+	Transport string `json:"transport"`
+	// Command 是 stdio 形态的 argv join 命令行;http/sse 形态省略。
+	Command string `json:"command,omitempty"`
+	// URL 是 http/sse 形态的端点(可疑 query 值已打码);stdio 形态省略。
+	URL string `json:"url,omitempty"`
+	// Source 标记来源:claude 为 user|plugin,codex 为 config。
+	Source string `json:"source,omitempty"`
+}
+
 type AgentTool struct {
 	ID          string `json:"id"`
 	Name        string `json:"name"`
@@ -86,6 +100,18 @@ type AgentTool struct {
 	// Efforts 是该 CLI 支持的 effort 档清单(claude 运行时探针,codex/opencode
 	// 静态表),nil=未知——消费方对未知不设限制。
 	Efforts []string `json:"efforts,omitempty"`
+	// MCPServers 是该 CLI 配置的 MCP 服务器清单(设备级,脱敏后)。nil=未
+	// 采集、无配置或不适用(opencode/pi/gemini 不采集);消费方对 nil 不设限。
+	MCPServers []AgentMCPServer `json:"mcp_servers,omitempty"`
+}
+
+// AgentSubagent 是设备上用户域(~/.claude/agents)的一个自定义 subagent 定义
+// 摘要(name/description 截断后随 hello `subagents` 上报)。description 为
+// frontmatter 首行截断,free text 不可信——消费方按展示文本对待。
+type AgentSubagent struct {
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	Source      string `json:"source,omitempty"`
 }
 
 type AgentHistoryRoot struct {
@@ -177,6 +203,15 @@ type AgentTerminalRuntime struct {
 	PTY          bool   `json:"pty"`
 	StartedAt    string `json:"started_at"`
 	LastActiveAt string `json:"last_active_at"`
+}
+
+type AgentTerminalScrollback struct {
+	SessionID  string `json:"session_id"`
+	Encoding   string `json:"encoding"`
+	Status     string `json:"status"` // "live" | "exited"
+	Data       string `json:"data"`
+	Truncated  bool   `json:"truncated"`
+	CapturedAt string `json:"captured_at"`
 }
 
 type AgentLaunchRequest struct {

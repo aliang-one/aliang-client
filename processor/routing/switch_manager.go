@@ -12,6 +12,8 @@ type SwitchManager struct {
 	mu            sync.RWMutex
 	aliangEnabled bool
 	socksEnabled  bool
+	// geoIPEnabled 为兼容保留的内存态字段：geoip 规则生效与否由「规则存在 + 数据库已加载」
+	// 决定，本字段不参与任何行为分支（历史遗留，勿新增读取）。
 	geoIPEnabled  bool
 	lastUpdatedAt int64
 	enabledAt     map[string]int64 // Track when each switch was last changed

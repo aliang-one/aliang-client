@@ -69,11 +69,14 @@ func TestRegistryEventsDoNotCollideWithExplicitArms(t *testing.T) {
 	// 不生效）；注册表里出现交集之外的任何事件，即意味着该工具可能被
 	// 显式臂遮蔽、永不走护栏分发。
 	// 已知局限：本测试看不到 switch 本身，无法侦测"新显式臂遮蔽新注册表
-	// 事件"的方向；它的真实价值是把"注册表今天只含旧事件"钉死——Phase 2
-	// 新增工具若未处理该不变量，会在此失败并提示作者核对显式臂。
+	// 事件"的方向；它的真实价值是把"注册表只含已核对事件"钉死——新增
+	// 工具若未处理该不变量，会在此失败并提示作者核对显式臂。
+	// git.log（rev 3 新增）已人工核对：switch 无该 case，经 default 臂
+	// RunWithGuards 分发，不受旧臂遮蔽影响。
 	allowed := map[string]bool{
 		models.AgentEventFileList: true, models.AgentEventFileRead: true,
 		models.AgentEventGitStatus: true, models.AgentEventEnvInfo: true,
+		models.AgentEventGitLog: true,
 	}
 	for _, tool := range agentToolRegistry().List() {
 		if !allowed[tool.Event] {

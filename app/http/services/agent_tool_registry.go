@@ -7,7 +7,12 @@ import (
 
 // agentToolRegistryRev bumps whenever the tool set changes so the server can
 // detect drift via the heartbeat rev and re-pull tools.list.
-const agentToolRegistryRev = 1
+// rev 2: read_file 描述符改说真话(移除无实现的 "may be refused" 声明,如实
+// 标注 operator policy 的无围栏语义)——描述符内容变了,服务端须靠 rev 漂移
+// 重拉 tools.list。
+// rev 3: 新增 git_log(项目提交历史,默认臂护栏分发——event git.log 不与
+// 任何显式臂冲突,是首个完整走 RunWithGuards 的非 legacy 工具)。
+const agentToolRegistryRev = 3
 
 // buildAgentToolRegistry is THE single source of truth for remotely-invokable
 // read-only tools. Legacy four first (events unchanged = old-server compat);
@@ -39,7 +44,8 @@ func buildAgentToolRegistry() *tools.Registry {
 			ID:    "read_file",
 			Event: models.AgentEventFileRead,
 			Description: "Read a text file (relative to the project path). Binary files " +
-				"return base64. Sensitive or secret-bearing files may be refused.",
+				"return base64. Paths are not confined: any file the agent OS user " +
+				"can read may be returned (operator policy).",
 			Parameters: map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
@@ -65,6 +71,24 @@ func buildAgentToolRegistry() *tools.Registry {
 			Handler: agentGitStatusPayload,
 			OnError: func(requestID string, err error) map[string]interface{} {
 				return agentEnvToolErrorPayload(models.AgentEventGitStatusError, requestID, err)
+			},
+		},
+		&tools.Tool{
+			ID:    "git_log",
+			Event: models.AgentEventGitLog,
+			Description: "Show recent commit history for the project's git repository " +
+				"(newest first). Returns structured entries (hash, author, date, subject). Read-only.",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"limit":  map[string]interface{}{"type": "integer", "description": "Max commits to return (1-100, default 20)"},
+					"offset": map[string]interface{}{"type": "integer", "description": "Skip N newest commits for paging (default 0)"},
+				},
+			},
+			Caps:    tools.Caps{ReadOnly: true, NeedsProject: true, TimeoutMs: 10000, MaxOutputBytes: 32768},
+			Handler: agentGitLogPayload,
+			OnError: func(requestID string, err error) map[string]interface{} {
+				return agentEnvToolErrorPayload(models.AgentEventGitLogError, requestID, err)
 			},
 		},
 		&tools.Tool{

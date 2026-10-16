@@ -353,6 +353,16 @@ func (s *AgentService) RuntimeSessions() models.AgentRuntimeSnapshot {
 	return snapshot
 }
 
+// TerminalScrollback returns a snapshot of a terminal session's recent output
+// for the dashboard read-only view. ok is false when no live session or
+// history tombstone matches sessionID.
+func (s *AgentService) TerminalScrollback(sessionID string, maxBytes int) (models.AgentTerminalScrollback, bool) {
+	if s == nil || s.terminal == nil {
+		return models.AgentTerminalScrollback{}, false
+	}
+	return s.terminal.scrollbackSnapshot(sessionID, maxBytes)
+}
+
 // VibeSessionDetail returns a single session's transcript page for the
 // read-only activity view. Assistant messages are capped to a one-line summary;
 // system/tool messages are filtered. Cursor pagination via beforeMessageID.
@@ -1508,6 +1518,16 @@ func detectAgentToolsWith(lookPath func(string) (string, error)) []models.AgentT
 		}
 		defs[i].Version = probeCLIVersion(defs[i].Path)
 		defs[i].Efforts = agentToolEffortLevels(defs[i].ID, defs[i].Path)
+	}
+	// MCP 能力清单:仅在 CLI 可用时采集(配置挂在不存在的 CLI 上没有意义);
+	// claudecode 别名与 claude 同源同清单;opencode/pi/gemini 不采集。
+	for i := range defs {
+		if !defs[i].Available {
+			continue
+		}
+		if mcp := mcpInventoryFor(defs[i].ID); len(mcp) > 0 {
+			defs[i].MCPServers = mcp
+		}
 	}
 	return defs
 }
