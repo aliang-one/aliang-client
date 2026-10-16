@@ -101,8 +101,8 @@ func TestWithClaudeRemotePolicyPlatformMissingNoManagedByHost(t *testing.T) {
 	}
 }
 
-// 提升必须发生在版本守卫之前：claude<2.2.0 的 fail-closed 降级要压过提升
-// （否则 2.1.x 上用户 ask 规则压死审批桥），≥2.2.0 则提升存活。
+// 提升必须发生在版本守卫之前：claude<2.1.268 的 fail-closed 降级要压过提升
+// （否则 <2.1.268 上用户 ask 规则压死审批桥），≥2.1.268 则提升存活。
 func TestPlatformPromotionRespectsVersionGuard(t *testing.T) {
 	overridePlatformProbe(t, false)
 	dir := t.TempDir()
@@ -124,9 +124,9 @@ func TestPlatformPromotionRespectsVersionGuard(t *testing.T) {
 	}
 
 	fresh := promoteIsolatedTierForPlatformFallback(policyRun("isolated").claudePolicy, "s2")
-	kept := applyClaudeTierVersionGuard(writeFake("claude-new", "2.2.5"), fresh, "s2")
+	kept := applyClaudeTierVersionGuard(writeFake("claude-new", "2.1.286"), fresh, "s2")
 	if kept.trustTier != "sanitized" || kept.policyNotice == nil || kept.policyNotice["reason"] != "platform_provider_missing" {
-		t.Errorf("2.2+ 上提升应存活且保留升级 notice: %+v", kept)
+		t.Errorf("≥2.1.268 上提升应存活且保留升级 notice: %+v", kept)
 	}
 }
 

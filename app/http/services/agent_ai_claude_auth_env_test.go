@@ -93,7 +93,7 @@ func TestWithClaudeApprovalHookInjectsAuthEnvIntoChildEnv(t *testing.T) {
 		sessionID:     "s-auth",
 		messageID:     "m-auth",
 		approvalToken: "token",
-		claudePolicy:  parseAgentAIClaudeRemotePolicy(map[string]interface{}{"claude_remote_policy": testClaudeRemotePolicy(false)}),
+		claudePolicy:  parseAgentAIClaudeRemotePolicy(map[string]interface{}{"claude_remote_policy": map[string]interface{}{"project_skill_trusted": false, "project_capability_mode": "disabled", "trust_level": "isolated"}}),
 	}
 	got := withClaudeApprovalHook(&agentAITool{path: "/bin/claude", args: []string{"--print", "prompt"}}, run)
 	if got == nil {

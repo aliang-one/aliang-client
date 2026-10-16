@@ -51,7 +51,7 @@ func agentSlashCommandsListPayloadWithManager(msg map[string]interface{}, manage
 	remotePolicy := parseAgentAIClaudeRemotePolicy(msg)
 	// Hoisted init-snapshot lookup (policy-independent, same conditions as the
 	// verified/version block below): spec §9.11 version guard — when the
-	// session's recorded claude predates 2.2.0 (or is unparsable), the
+	// session's recorded claude predates 2.1.268 (or is unparsable), the
 	// EFFECTIVE tier for list gating is isolated even if the request asked for
 	// sanitized/full, so aliang-project:* entries are not exposed before the
 	// run-path guard downgrades the actual run. Residual window (spec §9.11):
@@ -65,7 +65,7 @@ func agentSlashCommandsListPayloadWithManager(msg map[string]interface{}, manage
 		if caps, ok := manager.claudeCapabilities(remoteString(msg, "session_id"), projectPath); ok {
 			claudeCaps, haveClaudeCaps = caps, true
 			if remotePolicy.enabled {
-				if v, pok := parseClaudeCodeVersion(caps.version); !pok || !v.atLeast(2, 2, 0) {
+				if v, pok := parseClaudeCodeVersion(caps.version); !pok || !v.atLeast(2, 1, 268) {
 					effectiveTier = "isolated"
 				}
 			}

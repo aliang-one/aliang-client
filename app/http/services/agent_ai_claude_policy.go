@@ -122,7 +122,7 @@ func withClaudeRemotePolicy(tool *agentAITool, run agentAIRun) (*agentAITool, fu
 // sanitized 让用户 settings.json 提供上游——否则 claude 没有任何 provider，
 // 直接 "Not logged in" 秒败（2026-10-13 产品决策 A「仅兜底式」）。
 //
-// 必须在 applyClaudeTierVersionGuard 之前调用：claude<2.2.0 的 fail-closed
+// 必须在 applyClaudeTierVersionGuard 之前调用：claude<2.1.268 的 fail-closed
 // 版本守卫要对提升后的档位继续行使职权（提升不得撤销守卫的降级——否则
 // 2.1.x 上用户 ask 规则会压死审批桥，评审 2026-10-13 实验复现）。notice 里的
 // requested 保留原档位，升级事实经 policy_notice 对服务端/手机可见。

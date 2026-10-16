@@ -66,7 +66,7 @@ func TestClaudeRemotePolicyBuildsSanitizedProjectPlugin(t *testing.T) {
 
 	run := agentAIRun{
 		projectPath:  project,
-		claudePolicy: parseAgentAIClaudeRemotePolicy(map[string]interface{}{"claude_remote_policy": testClaudeRemotePolicy(true)}),
+		claudePolicy: parseAgentAIClaudeRemotePolicy(map[string]interface{}{"claude_remote_policy": map[string]interface{}{"project_skill_trusted": true, "project_capability_mode": "sanitized_plugin", "trust_level": "sanitized"}}),
 	}
 	tool, cleanup, notice := withClaudeRemotePolicy(&agentAITool{args: []string{"--print", "prompt"}}, run)
 	if notice != nil {
@@ -203,7 +203,10 @@ func TestClaudeApprovalSettingsPreserveRemoteAskRules(t *testing.T) {
 		sessionID:     "s1",
 		messageID:     "m1",
 		approvalToken: "token",
-		claudePolicy:  parseAgentAIClaudeRemotePolicy(map[string]interface{}{"claude_remote_policy": testClaudeRemotePolicy(false)}),
+		claudePolicy: parseAgentAIClaudeRemotePolicy(map[string]interface{}{"claude_remote_policy": map[string]interface{}{
+			"project_skill_trusted": false, "project_capability_mode": "disabled", "trust_level": "sanitized",
+			"settings": map[string]interface{}{"disableSkillShellExecution": true, "permissions": map[string]interface{}{"ask": []interface{}{"Bash", "Edit", "mcp__*"}}},
+		}}),
 	}
 	settings, err := claudeApprovalHookSettings(claudeApprovalHookPermissionRequestHTTP, run)
 	if err != nil {
@@ -227,7 +230,7 @@ func TestClaudeApprovalSettingsLegacyOmitsRemoteAskRules(t *testing.T) {
 		sessionID:     "s1",
 		messageID:     "m1",
 		approvalToken: "token",
-		claudePolicy:  parseAgentAIClaudeRemotePolicy(map[string]interface{}{"claude_remote_policy": testClaudeRemotePolicy(false)}),
+		claudePolicy:  parseAgentAIClaudeRemotePolicy(map[string]interface{}{"claude_remote_policy": map[string]interface{}{"project_skill_trusted": false, "project_capability_mode": "disabled", "trust_level": "isolated"}}),
 	}
 	settings, err := claudeApprovalHookSettings(claudeApprovalHookPreToolUseCommand, run)
 	if err != nil {
@@ -467,7 +470,7 @@ func TestSlashCommandsRequireTrustAndSystemInitForProjectSkills(t *testing.T) {
 		"provider":             "claude",
 		"include_user_level":   false,
 		"include_plugins":      false,
-		"claude_remote_policy": testClaudeRemotePolicy(false),
+		"claude_remote_policy": map[string]interface{}{"project_skill_trusted": false, "project_capability_mode": "disabled", "trust_level": "isolated"},
 	}
 	untrusted := agentSlashCommandsListPayloadWithManager(msg, manager)
 	if commands := untrusted["commands"].([]map[string]interface{}); len(commands) != 0 {
@@ -480,6 +483,7 @@ func TestSlashCommandsRequireTrustAndSystemInitForProjectSkills(t *testing.T) {
 		t.Fatalf("verification metadata = %+v", trusted)
 	}
 	commands := trusted["commands"].([]map[string]interface{})
+	// sanitized 档:项目命令经清洗插件命名空间呈现
 	if len(commands) != 1 || commands[0]["name"] != "aliang-project:deploy" || commands[0]["kind"] != "skill" {
 		t.Fatalf("trusted commands = %+v", commands)
 	}
@@ -574,20 +578,20 @@ func TestParseAgentAIClaudeRemotePolicyTrustLevels(t *testing.T) {
 	if p := parse(map[string]interface{}{"trust_level": "banana"}); p.trustTier != "isolated" {
 		t.Fatalf("invalid tier must fail closed, got %q", p.trustTier)
 	}
-	if p := parse(map[string]interface{}{}); p.trustTier != "isolated" {
-		t.Fatalf("absent tier must default isolated, got %q", p.trustTier)
+	if p := parse(map[string]interface{}{}); p.trustTier != "sanitized" {
+		t.Fatalf("absent tier must default sanitized (2026-10-16 settings 优先), got %q", p.trustTier)
 	}
 	if p := parse(map[string]interface{}{"trust_level": "sanitized", "project_mcp_trusted": true}); !p.projectMCPTrusted {
 		t.Fatal("project_mcp_trusted not parsed")
 	}
 	if p := parse(testClaudeRemotePolicy(true)); p.trustTier != "sanitized" {
-		t.Fatalf("legacy trusted mapping = %q, want sanitized", p.trustTier)
+		t.Fatalf("legacy trusted mapping = %q, want sanitized (默认档)", p.trustTier)
 	}
-	if p := parse(testClaudeRemotePolicy(false)); p.trustTier != "isolated" {
-		t.Fatalf("legacy untrusted mapping = %q, want isolated", p.trustTier)
+	if p := parse(testClaudeRemotePolicy(false)); p.trustTier != "sanitized" {
+		t.Fatalf("legacy untrusted mapping = %q, want sanitized (默认档)", p.trustTier)
 	}
-	if p := parse(map[string]interface{}{"project_skill_trusted": true, "project_capability_mode": "disabled"}); p.trustTier != "isolated" {
-		t.Fatalf("legacy trusted+bad mode = %q, want isolated", p.trustTier)
+	if p := parse(map[string]interface{}{"project_skill_trusted": true, "project_capability_mode": "disabled"}); p.trustTier != "sanitized" {
+		t.Fatalf("legacy trusted+bad mode = %q, want sanitized (默认档)", p.trustTier)
 	}
 	if p := parse(map[string]interface{}{"trust_level": "full", "project_skill_trusted": false, "project_capability_mode": "disabled"}); p.trustTier != "full" {
 		t.Fatalf("trust_level must supersede legacy fields, got %q", p.trustTier)
@@ -595,8 +599,8 @@ func TestParseAgentAIClaudeRemotePolicyTrustLevels(t *testing.T) {
 	if p := parse(map[string]interface{}{"project_skill_trusted": true, "project_capability_mode": "sanitized_plugin", "trust_level": "isolated"}); p.trustTier != "isolated" {
 		t.Fatalf("trust_level must supersede legacy trusted mapping downward, got %q", p.trustTier)
 	}
-	if p := parse(map[string]interface{}{"trust_level": "   "}); p.trustTier != "isolated" {
-		t.Fatalf("whitespace-only trust_level must take legacy route → isolated, got %q", p.trustTier)
+	if p := parse(map[string]interface{}{"trust_level": "   "}); p.trustTier != "sanitized" {
+		t.Fatalf("whitespace-only trust_level must take legacy route → sanitized (默认档), got %q", p.trustTier)
 	}
 	if p := parse(map[string]interface{}{}); p.projectMCPTrusted {
 		t.Fatal("project_mcp_trusted must default false")
@@ -643,7 +647,7 @@ func TestClaudeRemotePolicyTierFlags(t *testing.T) {
 		t.Fatalf("sanitized tier missing --plugin-dir: %v", tool.args)
 	}
 
-	tool, cleanup, _ = withClaudeRemotePolicy(base, mkRun(map[string]interface{}{}))
+	tool, cleanup, _ = withClaudeRemotePolicy(base, mkRun(map[string]interface{}{"trust_level": "isolated"}))
 	defer cleanup()
 	if got := argumentValue(tool.args, "--setting-sources"); got != "" {
 		t.Fatalf("isolated setting sources = %q", got)
@@ -704,6 +708,17 @@ func TestApplyClaudeTierVersionGuard(t *testing.T) {
 	kept := applyClaudeTierVersionGuard(&agentAITool{path: newEnough}, policy, "s-guard")
 	if kept.trustTier != "full" || kept.policyNotice != nil {
 		t.Fatalf("2.2+ must keep tier: %+v", kept)
+	}
+	// 2026-10-16 守卫阈值修正:2.1.268 起 PermissionRequest 在 headless 已修
+	// (CHANGELOG),liang-dev 实测版本 2.1.286 必须保留 full——旧阈值 2.2.0
+	// 从未发布,守卫对所有现存版本永降级,是档位机制死代码的根源。
+	realistic := filepath.Join(t.TempDir(), "claude-real")
+	if err := os.WriteFile(realistic, []byte("#!/bin/sh\necho \"2.1.286 (Claude Code)\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	keptReal := applyClaudeTierVersionGuard(&agentAITool{path: realistic}, policy, "s-guard")
+	if keptReal.trustTier != "full" || keptReal.policyNotice != nil {
+		t.Fatalf("2.1.286 (>=2.1.268) must keep full tier: %+v", keptReal)
 	}
 	downgraded := applyClaudeTierVersionGuard(&agentAITool{path: tooOld}, policy, "s-guard")
 	if downgraded.trustTier != "isolated" || downgraded.policyNotice == nil ||

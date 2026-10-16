@@ -69,7 +69,7 @@
   2. `trust_level` 为其他值 → `isolated`（fail-closed）；
   3. 无 `trust_level`：`project_skill_trusted=true && project_capability_mode=sanitized_plugin` → `sanitized`；**其余一律 `isolated`**（含旧 `project_skill_trusted=false`、字段缺失、空 policy——保持旧版行为逐字节不变：旧的非受信项目升级后不会突然暴露项目能力）。
   4. `claude_remote_policy` 缺失（policy 未启用）→ 不走本机制，行为同现状。
-- 2.1.x 守门：claude < 2.2.0 且档位非 `isolated` 时，**整档降级为 `isolated`**（setting-sources 回 `""`、清洗插件不构建——不是只换旗子），并通知：本地 `logger.Warn` + 在该 run 的 `ai.run.started` 事件 payload 增加扩展字段 `policy_notice`，**固定为结构化对象** `{"effective":"isolated","requested":"<原档位>","reason":"<见下>"}`。`reason` 枚举：`claude_version_below_2_2`（版本守门）、`sanitize_failed`（清洗拷贝失败）、`mcp_merge_failed`（MCP 合并失败）、`platform_provider_missing`（平台 env 缺失的 isolated→sanitized 回退，见 promoteIsolatedTierForPlatformFallback，2026-10-13）——**服务端解析须接受全部四个枚举值**；`effective` 亦可为 `sanitized`（回退是升级而非降级）。服务端按此结构解析。复用 `detectClaudeApprovalHookStrategy` 的**版本探测机制与缓存**（注意其返回值是 hook 策略而非版本号，降级判定需独立解析版本）。ask 列表例外：被降级的 full 档 `permissionAsk` 为空且**不重新填充默认列表**——<2.2 走 PreToolUse 策略本就不注入 `permissions.ask`，重新填充不可观测。
+- 2.1.x 守门：claude < 2.1.268 且档位非 `isolated` 时（阈值 2026-10-16 修正——2.2.0 从未发布,旧阈值是永假门;守卫要防的 PermissionRequest 缺陷官方 2.1.268 修复），**整档降级为 `isolated`**（setting-sources 回 `""`、清洗插件不构建——不是只换旗子），并通知：本地 `logger.Warn` + 在该 run 的 `ai.run.started` 事件 payload 增加扩展字段 `policy_notice`，**固定为结构化对象** `{"effective":"isolated","requested":"<原档位>","reason":"<见下>"}`。`reason` 枚举：`claude_version_below_2_2`（版本守门;字面量为历史契约保留,实际阈值为 2.1.268）、`sanitize_failed`（清洗拷贝失败）、`mcp_merge_failed`（MCP 合并失败）、`platform_provider_missing`（平台 env 缺失的 isolated→sanitized 回退，见 promoteIsolatedTierForPlatformFallback，2026-10-13）——**服务端解析须接受全部四个枚举值**；`effective` 亦可为 `sanitized`（回退是升级而非降级）。服务端按此结构解析。复用 `detectClaudeApprovalHookStrategy` 的**版本探测机制与缓存**（注意其返回值是 hook 策略而非版本号，降级判定需独立解析版本）。ask 列表例外：被降级的 full 档 `permissionAsk` 为空且**不重新填充默认列表**——<2.2 走 PreToolUse 策略本就不注入 `permissions.ask`，重新填充不可观测。
 
 ## 4. 清洗插件（sanitized 档）细则
 
@@ -162,9 +162,9 @@ $TMPDIR/aliang-claude-project-*/
 
 **单元测试**（Go，现有 `_test.go` 风格）
 - 三档旗子矩阵：`--setting-sources` / `--plugin-dir` / `--strict-mcp-config` / `permissions` / `disableSkillShellExecution` 组合断言——**必须覆盖 `withClaudeApprovalHook` 之后的最终 args**（而非仅 `withClaudeRemotePolicy` 输出），防止 hook 层再次改写 setting-sources；更新固化旧行为的 `TestClaudeApprovalHookDisablesFilesystemSettingsWithoutRemotePolicy`。
-- 兼容映射：旧字段 `trusted=true && mode=sanitized_plugin` → sanitized；**旧 `trusted=false`（含 mode 缺失/未知）→ isolated**；`trust_level: full` → full（且旧字段不再参与）；未知 `trust_level` 值 → isolated；三者皆缺 → isolated；`claude_remote_policy` 缺失 → 机制整体不启用。
+- 兼容映射（2026-10-16 默认档 sanitized——「settings.json 优先,平台 env 兜底」+R1 处置）：旧字段一律不再参与,**三者皆缺/legacy 任意形态 → sanitized**（加载 user scope:用户 settings.json 的 provider/skills 生效;**project scope 永不默认加载**——项目 .claude/settings.json 的 hooks/env/allow 在 -p 模式零审批执行且可被远程克隆仓库投毒,实验复现）;显式 `trust_level` 合法值仍采纳（含 full,须产品显式下发）;未知 `trust_level` 值 → isolated（fail-closed）；`claude_remote_policy` 缺失 → 机制整体不启用（保持历史 --setting-sources "" 行为）。
 - 白名单：`context`/`agent` 保留，`allowed-tools`/`hooks`/`model` 剥离；agents/ 拷贝与剥离。
-- 2.1.x 守门：版本 < 2.2.0 降级 `""` + warning。
+- 2.1.x 守门：版本 < 2.1.268 降级 `""` + warning（2.1.268=官方修复 headless PermissionRequest 的版本；已知 2.1.268-2.1.288 仍有审批绕过缺口于 2.1.289 修复,放行时 agent 侧 WARN 建议升级）。 full 档已知边界（接受并记录,2026-10-16）:①项目级 `.claude/settings.json` 的 `permissions.allow` 随 `--setting-sources user,project` 生效,远程 run 无 TUI 的「信任此目录」确认,且 settings 文件本身可被会话写入(自我扩权链:宽 Edit allow → 改写项目 settings 加 Bash allow → 静默执行);②`--setting-sources user,project` 不含 local(settings.local.json 不加载);③`--permission-mode default` 由 agent 强制。缓解:服务端可按项目/设备以 `trust_level` 下调。
 - MCP 合并：同名 project 覆盖 user；受信标记缺失不注入。
 
 **冒烟验证**（真实 claude CLI，临时项目，沿用本轮实证脚本）——2026-08-31 已全部执行，结果如下：
