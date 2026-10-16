@@ -312,3 +312,51 @@ func TestTmpIsNotSymlinkFollowing(t *testing.T) {
 		t.Fatalf("dest must be a regular file, got mode %v", fi.Mode())
 	}
 }
+
+// —— 下载源三级优先级（#20）：env（部署面）> config 注入（用户）> 默认 COS ——
+// env 层在 geoipDownloadURL 内实时读取（env 存在时 config 注入被忽略），
+// config 层经 SetDownloadURLOverride 注入（config 包在 Validate/Apply 成功后调用）。
+func TestGeoIPDownloadURLPriority(t *testing.T) {
+	t.Setenv("ALIANG_GEOIP_DOWNLOAD_URL", "")
+	t.Cleanup(func() { SetDownloadURLOverride("") })
+
+	// 默认层：env 与 config 均未设置
+	SetDownloadURLOverride("")
+	if got := geoipDownloadURL(); got != DefaultGeoIPDownloadURL {
+		t.Fatalf("geoipDownloadURL() = %q, want default %q", got, DefaultGeoIPDownloadURL)
+	}
+	if got := EffectiveDownloadURL(); got != DefaultGeoIPDownloadURL {
+		t.Fatalf("EffectiveDownloadURL() = %q, want default %q", got, DefaultGeoIPDownloadURL)
+	}
+
+	// config 层：注入即生效
+	SetDownloadURLOverride("https://cfg.example.com/GeoLite2-Country.mmdb")
+	if got := geoipDownloadURL(); got != "https://cfg.example.com/GeoLite2-Country.mmdb" {
+		t.Fatalf("geoipDownloadURL() = %q, want config override", got)
+	}
+
+	// env 层：env 存在时忽略 config（部署面覆盖最高）
+	t.Setenv("ALIANG_GEOIP_DOWNLOAD_URL", "https://env.example.com/GeoLite2-Country.mmdb")
+	if got := geoipDownloadURL(); got != "https://env.example.com/GeoLite2-Country.mmdb" {
+		t.Fatalf("geoipDownloadURL() = %q, want env override", got)
+	}
+
+	// env 在前与注入顺序无关：清除 config 注入后 env 仍生效
+	SetDownloadURLOverride("")
+	if got := geoipDownloadURL(); got != "https://env.example.com/GeoLite2-Country.mmdb" {
+		t.Fatalf("geoipDownloadURL() = %q, want env after config cleared", got)
+	}
+
+	// env 为空串视同未设置 → 回落 config 层
+	SetDownloadURLOverride("https://cfg.example.com/GeoLite2-Country.mmdb")
+	t.Setenv("ALIANG_GEOIP_DOWNLOAD_URL", "")
+	if got := geoipDownloadURL(); got != "https://cfg.example.com/GeoLite2-Country.mmdb" {
+		t.Fatalf("geoipDownloadURL() = %q, want config override when env empty", got)
+	}
+
+	// 注入值两侧空白被归一
+	SetDownloadURLOverride("  https://cfg.example.com/GeoLite2-Country.mmdb  ")
+	if got := geoipDownloadURL(); got != "https://cfg.example.com/GeoLite2-Country.mmdb" {
+		t.Fatalf("geoipDownloadURL() = %q, want trimmed config override", got)
+	}
+}

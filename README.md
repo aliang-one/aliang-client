@@ -190,7 +190,10 @@ GEOIP,CN,proxy              Clash style, single country (proxy_rules and
   (default source: the project's COS mirror; override with the
   `ALIANG_GEOIP_DOWNLOAD_URL` environment variable). Until the database is
   ready, geoip rules simply never match. The database is never refreshed
-  automatically — refresh it about once a month. Invalid entries
+  automatically — refresh it about once a month. Manual refresh: delete
+  `~/.aliang/geoip/GeoLite2-Country.mmdb` and restart the agent to
+  re-download it; replacing the file while the agent is running has no
+  effect (the database loads only at startup). Invalid entries
   (`geoip:CHN`, `geoip:CN,HK` — multiple countries must use `+`,
   `geoip:CN+` — empty segment) are rejected on save, and geoip-routed
   traffic is not attributed to AI provider statistics (statistics match by

@@ -8,7 +8,9 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"aliang.one/nursorgate/common/cache"
@@ -30,9 +32,28 @@ const (
 	DefaultGeoIPDatabaseFile = "GeoLite2-Country.mmdb"
 )
 
-// geoipDownloadURL 返回生效下载地址（env 可覆盖）。
+// downloadURLOverride 保存配置层（customer.geoip.download_url）注入的下载源。
+// 本包不 import config（依赖方向：config → geoip），注入由 config 包在
+// Validate/Apply 成功后经 SetDownloadURLOverride 完成。
+var downloadURLOverride atomic.Value // string
+
+// SetDownloadURLOverride 注入配置层下载源（空串 = 清除注入，回落默认 COS 源）。
+// env（ALIANG_GEOIP_DOWNLOAD_URL，部署面覆盖）优先级仍最高——env 存在时本值被忽略。
+func SetDownloadURLOverride(u string) {
+	downloadURLOverride.Store(strings.TrimSpace(u))
+}
+
+// EffectiveDownloadURL 返回当前生效下载源（env > config 注入 > 默认），供诊断观测。
+func EffectiveDownloadURL() string {
+	return geoipDownloadURL()
+}
+
+// geoipDownloadURL 返回生效下载地址（env > config 注入 > 默认）。
 func geoipDownloadURL() string {
 	if u := os.Getenv("ALIANG_GEOIP_DOWNLOAD_URL"); u != "" {
+		return u
+	}
+	if u, _ := downloadURLOverride.Load().(string); u != "" {
 		return u
 	}
 	return DefaultGeoIPDownloadURL

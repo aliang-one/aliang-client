@@ -179,6 +179,8 @@ GEOIP,CN,proxy             Clash 风格，单国（仅 proxy_rules 与配置文�
   （`GeoLite2-Country.mmdb`）在启动时本地缺失则自动后台下载（默认源为
   项目 COS 镜像，可用环境变量 `ALIANG_GEOIP_DOWNLOAD_URL` 覆盖）；库
   就绪前 geoip 规则一律不命中。数据库不做自动刷新，建议每月刷新一次。
+  手动更新：删除 `~/.aliang/geoip/GeoLite2-Country.mmdb` 后重启 agent
+  即重新下载；运行中替换文件不会生效（数据库仅在启动时装载）。
   非法条目（如 `geoip:CHN`、`geoip:CN,HK`——多国须用 `+` 分隔、
   `geoip:CN+`——空段）保存时会被明确拒绝；geoip 流量按国家分流，
   但不计入 AI 提供商活动统计（统计按域名归类）。

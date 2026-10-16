@@ -944,6 +944,11 @@ ip-range,1.2.3.1-1.2.3.254,direct
 
 
 <Callout type="info">
+  **写法归一化**：保存时后端会自动归一条目写法：URL / host:port 条目自动提取主机部分（`https://a.com/x` 与 `a.com:443` 均按 `a.com` 处理）；写在域名位置的裸 IP（含 URL / host:port 提取产物）会自动归类为 IP 规则（如 `[2001:db8::1]:443`）；单 IP 与区间端点的 IPv4-mapped IPv6 形态自动归一为 IPv4 形态（`::ffff:1.2.3.4` → `1.2.3.4`），但 CIDR 的该形态（如 `::ffff:1.2.3.0/120`）无法无歧义映射、保存时报错，请改写为 IPv4 形态（如 `1.2.3.0/24`）；国际化域名（IDN）不接受 Unicode 原文，请使用 punycode（`xn--` 形式）；geoip 多国条目对顺序与重复不敏感——保存时国家码统一大写、去重并按字典序排列（`geoip:HK+CN` 与 `geoip:CN+HK` 保存为同一条规则）。
+</Callout>
+
+
+<Callout type="info">
   **流量镜像说明**：流量镜像的 `domains` 列表按域名（SNI/Host）匹配；在镜像列表里写 IP 条件时，仅裸单 IP 可能按字面命中，CIDR / 区间在镜像链路不生效；geoip 条目则会在保存时被直接拒绝（按域名匹配永不可能命中）。需要按 IP 分流请使用 AI 规则或代理规则。
 </Callout>
 

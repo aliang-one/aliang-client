@@ -9,6 +9,8 @@ import {
   detectGeoipCommaIssue,
   extractProxyRuleDomain,
   findRuleOverlaps,
+  formatEntryIssue,
+  includeSummaryText,
   sanitizeList,
   validateRuleEntry
 } from './RulesSettings.vue';
@@ -206,5 +208,54 @@ describe('RulesSettings detectCommaCollapseIssue', () => {
 
   it('reports only the first offending line', () => {
     expect(hint('domain,ok.com\nbad.com,worse.com')).toBe('rules_commaCollapseHint|worse.com');
+  });
+});
+
+// —— 错误文案组装（LOW#18）：firstEntryIssue 的 index 透传为「第 N 行」前缀 ——
+// 前缀 N 从 1 起（index 0 → 第 1 行）；nil issue 返回空串（无错误不渲染）。
+describe('RulesSettings formatEntryIssue', () => {
+  const t = (k, params) => {
+    if (k === 'rules_linePrefix') return `第 ${params.line} 行：`;
+    if (k === 'rules_entryErrorItem') return `条目“${params.entry}”：${params.message}`;
+    return k;
+  };
+
+  it('prepends the 1-based line number to the concrete message', () => {
+    const issue = { index: 2, entry: 'geoip:CHN', message: 'rules_geoipInvalid' };
+    expect(formatEntryIssue(issue, t)).toBe('条目“geoip:CHN”：第 3 行：rules_geoipInvalid');
+  });
+
+  it('numbers the first entry as line 1', () => {
+    const issue = { index: 0, entry: 'a..b', message: 'rules_entryEmptyLabel' };
+    expect(formatEntryIssue(issue, t)).toBe('条目“a..b”：第 1 行：rules_entryEmptyLabel');
+  });
+
+  it('returns empty string for a null issue', () => {
+    expect(formatEntryIssue(null, t)).toBe('');
+  });
+});
+
+// —— include 收起态副文案（LOW#16）：空 → Empty 键；单条 → 条目本身；≥2 → first+N more ——
+describe('RulesSettings includeSummaryText', () => {
+  const t = (k, params) => {
+    if (k === 'rules_includeDomainsEmpty') return 'rules_includeDomainsEmpty';
+    if (k === 'rules_includeDomainsPreview') return `rules_includeDomainsPreview|${params.first}|${params.count}`;
+    return k;
+  };
+
+  it('shows the empty hint when nothing is configured', () => {
+    expect(includeSummaryText([], t)).toBe('rules_includeDomainsEmpty');
+    expect(includeSummaryText(undefined, t)).toBe('rules_includeDomainsEmpty');
+  });
+
+  it('shows the single entry itself', () => {
+    expect(includeSummaryText(['openai.com'], t)).toBe('openai.com');
+  });
+
+  it('shows first + N more for multiple entries (count excludes the first)', () => {
+    expect(includeSummaryText(['chatgpt.com', 'openai.com'], t))
+      .toBe('rules_includeDomainsPreview|chatgpt.com|1');
+    expect(includeSummaryText(['a.com', 'b.com', 'c.com', 'd.com'], t))
+      .toBe('rules_includeDomainsPreview|a.com|3');
   });
 });

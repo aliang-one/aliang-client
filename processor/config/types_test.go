@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"aliang.one/nursorgate/processor/geoip"
 )
 
 // TestShadowTLSPluginOptsValidate tests ShadowTLSPluginOpts.Validate()
@@ -1268,5 +1270,115 @@ func TestConfigValidate_TrafficMirrorDomainsValidatedThroughChain(t *testing.T) 
 	}
 	if !strings.Contains(err.Error(), `traffic_mirror.domains[0] invalid "a..b"`) {
 		t.Fatalf("error should carry entry index and raw text: %v", err)
+	}
+}
+
+func TestConfigValidate_CustomerGeoIPDownloadURL(t *testing.T) {
+	cases := []struct {
+		name    string
+		url     string
+		wantErr string // 空 = 期望通过
+	}{
+		{name: "https accepted", url: "https://mirrors.example.com/GeoLite2-Country.mmdb"},
+		{name: "empty accepted", url: ""},
+		{name: "blank accepted", url: "   "},
+		{name: "http rejected with original url", url: "http://mirrors.example.com/x.mmdb", wantErr: "http://mirrors.example.com/x.mmdb"},
+		{name: "ftp rejected", url: "ftp://mirrors.example.com/x.mmdb", wantErr: "ftp://mirrors.example.com/x.mmdb"},
+		{name: "schemeless rejected", url: "mirrors.example.com/x.mmdb", wantErr: "mirrors.example.com/x.mmdb"},
+		{name: "hostless rejected", url: "https:///x.mmdb", wantErr: "https:///x.mmdb"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := []byte(`{
+				"core": {"api_server": "https://api.aliang.one"},
+				"customer": {"geoip": {"download_url": "` + tc.url + `"}}
+			}`)
+			var cfg Config
+			if err := json.Unmarshal(payload, &cfg); err != nil {
+				t.Fatalf("json.Unmarshal() error = %v", err)
+			}
+			err := cfg.Validate()
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Validate() error = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("Validate() error = nil, want geoip download_url error")
+			}
+			if !strings.Contains(err.Error(), "geoip") || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestConfigValidate_CustomerGeoIPAcceptedAsEditableField(t *testing.T) {
+	// geoip 此前属 customer 未知键（被白名单拒绝）；加入白名单后整段通过校验
+	payload := []byte(`{
+		"core": {"api_server": "https://api.aliang.one"},
+		"customer": {"geoip": {"download_url": "https://mirrors.example.com/GeoLite2-Country.mmdb"}}
+	}`)
+
+	var cfg Config
+	if err := json.Unmarshal(payload, &cfg); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v, want nil", err)
+	}
+	if got := cfg.EffectiveGeoIPDownloadURL(); got != "https://mirrors.example.com/GeoLite2-Country.mmdb" {
+		t.Fatalf("EffectiveGeoIPDownloadURL() = %q", got)
+	}
+}
+
+func TestConfigEffectiveGeoIPDownloadURL(t *testing.T) {
+	var nilCfg *Config
+	if got := nilCfg.EffectiveGeoIPDownloadURL(); got != "" {
+		t.Fatalf("nil config EffectiveGeoIPDownloadURL() = %q, want empty", got)
+	}
+
+	cfg := &Config{}
+	if got := cfg.EffectiveGeoIPDownloadURL(); got != "" {
+		t.Fatalf("empty config EffectiveGeoIPDownloadURL() = %q, want empty", got)
+	}
+
+	cfg.Customer = &CustomerConfig{}
+	if got := cfg.EffectiveGeoIPDownloadURL(); got != "" {
+		t.Fatalf("nil geoip EffectiveGeoIPDownloadURL() = %q, want empty", got)
+	}
+
+	cfg.Customer.GeoIP = &CustomerGeoIPSettings{DownloadURL: "  https://mirrors.example.com/x.mmdb  "}
+	if got := cfg.EffectiveGeoIPDownloadURL(); got != "https://mirrors.example.com/x.mmdb" {
+		t.Fatalf("EffectiveGeoIPDownloadURL() = %q, want trimmed url", got)
+	}
+}
+
+func TestSetGlobalConfigAppliesGeoIPDownloadURLOverride(t *testing.T) {
+	t.Setenv("ALIANG_GEOIP_DOWNLOAD_URL", "") // 中和 env 层，锁定 config→geoip 接线
+	t.Cleanup(func() { geoip.SetDownloadURLOverride("") })
+
+	cfg := &Config{Customer: &CustomerConfig{
+		GeoIP: &CustomerGeoIPSettings{DownloadURL: "https://mirrors.example.com/GeoLite2-Country.mmdb"},
+	}}
+	SetGlobalConfig(cfg)
+	if got := geoip.EffectiveDownloadURL(); got != "https://mirrors.example.com/GeoLite2-Country.mmdb" {
+		t.Fatalf("geoip.EffectiveDownloadURL() = %q, want config url", got)
+	}
+
+	// env 存在时 config 被忽略（env 层最高）
+	t.Setenv("ALIANG_GEOIP_DOWNLOAD_URL", "https://env.example.com/x.mmdb")
+	SetGlobalConfig(cfg)
+	if got := geoip.EffectiveDownloadURL(); got != "https://env.example.com/x.mmdb" {
+		t.Fatalf("geoip.EffectiveDownloadURL() = %q, want env url", got)
+	}
+
+	// 置空全局配置 = 清除注入，回落默认
+	t.Setenv("ALIANG_GEOIP_DOWNLOAD_URL", "")
+	SetGlobalConfig(nil)
+	if got := geoip.EffectiveDownloadURL(); got != geoip.DefaultGeoIPDownloadURL {
+		t.Fatalf("geoip.EffectiveDownloadURL() = %q, want default", got)
 	}
 }
