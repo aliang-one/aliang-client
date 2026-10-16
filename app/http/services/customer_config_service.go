@@ -200,9 +200,13 @@ func refreshRoutingRuntimeAfterCustomerConfigCommit(committedCfg *config.Config)
 
 	activeCanonical := config.GetRoutingApplyStore().ActiveCanonicalSchema()
 	aliangEnabled := true
+	socksEnabled := true
 	ingressMode := "tun"
 	if activeCanonical != nil {
 		aliangEnabled = activeCanonical.Egress.ToAliang.Enabled
+		// 保留 store 已有的 toSocks 开关状态：customer 配置保存不重置用户开关
+		// （store 为空时用默认 true，与既有行为一致）。
+		socksEnabled = activeCanonical.Egress.ToSocks.Enabled
 		if activeCanonical.Ingress.Mode == "http" || activeCanonical.Ingress.Mode == "tun" {
 			ingressMode = activeCanonical.Ingress.Mode
 		}
@@ -210,7 +214,7 @@ func refreshRoutingRuntimeAfterCustomerConfigCommit(committedCfg *config.Config)
 
 	canonical, err := routing.CompileCanonicalRoutingFromRuntimeInputs(committedCfg, model.RulesSettings{
 		AliangEnabled: aliangEnabled,
-		SocksEnabled:  true,
+		SocksEnabled:  socksEnabled,
 	})
 	if err != nil {
 		return err

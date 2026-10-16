@@ -208,7 +208,9 @@ func (e *RuleEngine) defaultRoute(ctx *EvaluationContext) *RuleResult {
 }
 
 func (e *RuleEngine) compileRuntimeSnapshot() (*routing.RuntimeSnapshot, error) {
-	switchStatus := routing.GetSwitchManager().GetStatus()
+	// 决策层开关状态从 apply store（ActiveCanonicalSchema egress 段）派生，
+	// 与执行层同源；store 为空时回落既有 SwitchManager 默认（见 EffectiveSwitchStatus）。
+	switchStatus := routing.EffectiveSwitchStatus()
 	snapshot, err := routing.CompileRuntimeSnapshotFromRuntimeInputs(config.GetGlobalConfig(), switchStatus)
 	if err != nil {
 		return nil, fmt.Errorf("compile runtime snapshot failed: %w", err)

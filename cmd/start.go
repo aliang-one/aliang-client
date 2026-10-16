@@ -15,6 +15,7 @@ import (
 	auth "aliang.one/nursorgate/processor/auth"
 	"aliang.one/nursorgate/processor/config"
 	"aliang.one/nursorgate/processor/geoip"
+	"aliang.one/nursorgate/processor/routing"
 	"aliang.one/nursorgate/processor/rules"
 	"aliang.one/nursorgate/processor/runtime"
 	"aliang.one/nursorgate/processor/setup"
@@ -199,6 +200,16 @@ func DetermineInitialStartupStatusForTest(tokenFlag string) runtime.StartupStatu
 	return determineInitialStartupStatus(tokenFlag)
 }
 
+// loadPersistedRoutingSwitches 把 <state>/routing.json 装载进 routing apply
+// store（core/start/tray 三条启动路径共用）。snapshot builder 由 cmd 层注入，
+// 避免 processor/config 反向依赖 processor/routing。返回 error 仅供调用方
+// 记录；函数内部已 Warn，不得作为启动失败依据。
+func loadPersistedRoutingSwitches() error {
+	return config.LoadPersistedIntoStore(func(canonical *config.CanonicalRoutingSchema) (any, error) {
+		return routing.CompileRuntimeSnapshot(canonical)
+	})
+}
+
 // InitializeGlobalRuleEngine initializes the global rule engine once at startup
 // This is the ONLY place where rule engine should be initialized
 // Replaces duplicate initialization in:
@@ -208,6 +219,12 @@ func InitializeGlobalRuleEngine() error {
 	logger.Info("========================================")
 	logger.Info("Global Rule Engine Initialization")
 	logger.Info("========================================")
+
+	// Step 0: 持久化路由开关装载必须早于任何连接处理：从 <state>/routing.json
+	// 恢复用户上次 egress 开关；无文件 → 走既有 bootstrap 推导；失败仅 Warn 不阻断。
+	if err := loadPersistedRoutingSwitches(); err != nil {
+		logger.Warn(fmt.Sprintf("Load persisted routing switches failed (bootstrap derivation applies this run): %v", err))
+	}
 
 	// Step 1: Initialize Rule Engine (singleton)
 	logger.Info("Step 1: Initializing rule engine...")

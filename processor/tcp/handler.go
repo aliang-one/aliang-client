@@ -956,6 +956,13 @@ func (h *TCPConnectionHandler) dialViaSocksOrDirect(ctx context.Context, metadat
 
 	socksProxy, upstreamType, err := h.getToSocksProxyForExecution()
 	if err != nil {
+		// toSocks 分支被用户关闭：拒绝走 socks 但不断链，降级 direct
+		// （defaultFallbackRoute 语义）。其余 deny 原因（上游缺失/不可用）维持报错断链。
+		if BranchDenyReason(err) == DenyReasonToSocksDisabled {
+			logger.Debug(fmt.Sprintf("toSocks branch disabled by user, degrading to direct for %s", metadata.DestinationAddress()))
+			metadata.Route = "RouteDirect"
+			return h.dialDirect(ctx, metadata)
+		}
 		return nil, err
 	}
 	logger.Debug(fmt.Sprintf("toSocks execution using upstream type: %s", upstreamType))
@@ -1235,7 +1242,10 @@ func (h *TCPConnectionHandler) getToSocksProxyForExecution() (outboundproxy.Prox
 	upstreamType, upstreamConfigured := currentCustomerProxyUpstreamType()
 
 	if canonical != nil {
-		if !canonical.Egress.ToSocks.Enabled && !upstreamConfigured {
+		// 用户显式关闭 toSocks（egress.toSocks.enabled=false）即拒绝走 socks 分支，
+		// 与上游是否仍配置无关——上游配置存在不构成重新启用开关的理由。
+		// 拒绝后由调用方降级 direct（见 dialViaSocksOrDirect），不再断链。
+		if !canonical.Egress.ToSocks.Enabled {
 			return nil, "", newBranchDenyError(toSocksBranchName, DenyReasonToSocksDisabled, nil)
 		}
 

@@ -186,6 +186,12 @@ func determineCoreInitialStatus() runtime.StartupStatus {
 }
 
 func initializeCoreRuleEngine() error {
+	// 持久化路由开关装载必须早于任何连接处理：从 <state>/routing.json 恢复
+	// 用户上次 egress 开关；无文件 → 走既有 bootstrap 推导；失败仅 Warn 不阻断。
+	if err := loadPersistedRoutingSwitches(); err != nil {
+		writeStartupTrace("initializeCoreRuleEngine routing persisted load failed: %v", err)
+	}
+
 	ruleEngine := rules.GetEngine()
 	if err := ruleEngine.Initialize(config.GetGlobalConfig()); err != nil {
 		return fmt.Errorf("failed to initialize rule engine: %w", err)

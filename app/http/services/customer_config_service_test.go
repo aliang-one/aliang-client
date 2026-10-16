@@ -495,6 +495,92 @@ func routingSwitches(aliangEnabled, socksEnabled bool) model.RulesSettings {
 	}
 }
 
+// customer 配置保存不得重置 store 已有的 toSocks 开关：用户关闭的开关在
+// customer 提交后必须保持关闭（即使上游代理仍配置且可用）。
+func TestRefreshRoutingRuntimeAfterCustomerConfigCommit_PreservesDisabledToSocksSwitch(t *testing.T) {
+	config.ResetGlobalConfigForTest()
+	config.ResetRoutingApplyStoreForTest()
+	t.Cleanup(func() {
+		config.ResetGlobalConfigForTest()
+		config.ResetRoutingApplyStoreForTest()
+	})
+
+	committedCfg := &config.Config{
+		Core: &config.CoreConfig{APIServer: "https://api.aliang.one"},
+		Customer: &config.CustomerConfig{
+			Proxy: &config.CustomerProxyConfig{
+				Enable: customerBoolPtr(true),
+				Type:   "socks5",
+				Server: "127.0.0.1:1080",
+			},
+			ProxyRules: []string{"domains,google.com"},
+		},
+	}
+
+	// 种子：store 已是 toSocks 关闭状态（用户上一次提交 /api/config/routing）
+	seedCanonical, err := routing.CompileCanonicalRoutingFromRuntimeInputs(committedCfg, routingSwitches(true, false))
+	if err != nil {
+		t.Fatalf("CompileCanonicalRoutingFromRuntimeInputs(seed) error = %v", err)
+	}
+	// 编译器会把 SocksEnabled && hasToSocks 收敛成 egress 开关；显式关掉再落种子，
+	// 确保种子状态就是「toSocks 关闭 + 上游已配」
+	seedCanonical.Egress.ToSocks.Enabled = false
+	seedRaw, err := json.Marshal(seedCanonical)
+	if err != nil {
+		t.Fatalf("marshal seed canonical error = %v", err)
+	}
+	if _, err := config.GetRoutingApplyStore().Apply(seedRaw, func(canonical *config.CanonicalRoutingSchema) (any, error) {
+		return routing.CompileRuntimeSnapshot(canonical)
+	}); err != nil {
+		t.Fatalf("seed routing apply error = %v", err)
+	}
+
+	if err := refreshRoutingRuntimeAfterCustomerConfigCommit(committedCfg); err != nil {
+		t.Fatalf("refreshRoutingRuntimeAfterCustomerConfigCommit() error = %v", err)
+	}
+
+	activeCanonical := config.GetRoutingApplyStore().ActiveCanonicalSchema()
+	if activeCanonical == nil {
+		t.Fatal("active canonical routing schema is nil")
+	}
+	if activeCanonical.Egress.ToSocks.Enabled {
+		t.Fatal("toSocks.enabled = true after customer commit, want preserved false")
+	}
+}
+
+// store 为空（首次保存）时沿用默认 true——与既有行为一致。
+func TestRefreshRoutingRuntimeAfterCustomerConfigCommit_EmptyStoreDefaultsToSocksOn(t *testing.T) {
+	config.ResetGlobalConfigForTest()
+	config.ResetRoutingApplyStoreForTest()
+	t.Cleanup(func() {
+		config.ResetGlobalConfigForTest()
+		config.ResetRoutingApplyStoreForTest()
+	})
+
+	committedCfg := &config.Config{
+		Core: &config.CoreConfig{APIServer: "https://api.aliang.one"},
+		Customer: &config.CustomerConfig{
+			Proxy: &config.CustomerProxyConfig{
+				Enable: customerBoolPtr(true),
+				Type:   "socks5",
+				Server: "127.0.0.1:1080",
+			},
+		},
+	}
+
+	if err := refreshRoutingRuntimeAfterCustomerConfigCommit(committedCfg); err != nil {
+		t.Fatalf("refreshRoutingRuntimeAfterCustomerConfigCommit() error = %v", err)
+	}
+
+	activeCanonical := config.GetRoutingApplyStore().ActiveCanonicalSchema()
+	if activeCanonical == nil {
+		t.Fatal("active canonical routing schema is nil")
+	}
+	if !activeCanonical.Egress.ToSocks.Enabled {
+		t.Fatal("toSocks.enabled = false for empty store, want default true")
+	}
+}
+
 func customerBoolPtr(v bool) *bool {
 	return &v
 }

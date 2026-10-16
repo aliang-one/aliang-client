@@ -302,7 +302,9 @@ func (h *DefaultTLSHandler) decideRouteWithRoutingEngine(metadata *M.Metadata) P
 		return h.defaultFallbackRoute()
 	}
 
-	switchStatus := routing.GetSwitchManager().GetStatus()
+	// 决策层开关状态从 apply store（ActiveCanonicalSchema egress 段）派生，
+	// 与执行层同源；store 为空时回落既有 SwitchManager 默认（见 EffectiveSwitchStatus）。
+	switchStatus := routing.EffectiveSwitchStatus()
 	snapshot, err := routing.CompileRuntimeSnapshotFromRuntimeInputs(cfg, switchStatus)
 	if err != nil {
 		logger.Warn(fmt.Sprintf("CompileRuntimeSnapshotFromRuntimeInputs failed, fallback route used: %v", err))
@@ -334,7 +336,7 @@ func (h *DefaultTLSHandler) decideRouteWithRoutingEngine(metadata *M.Metadata) P
 
 func (h *DefaultTLSHandler) defaultFallbackRoute() ProxyRoute {
 	cfg := config.GetGlobalConfig()
-	switchStatus := routing.GetSwitchManager().GetStatus()
+	switchStatus := routing.EffectiveSwitchStatus()
 	if cfg != nil && cfg.EffectiveDefaultProxy() == "socks" && switchStatus.SocksEnabled {
 		return RouteToLocalProxy
 	}

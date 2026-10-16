@@ -401,3 +401,69 @@ Authorization-Inner: Bearer {current_user_access_token}
 下载 MaxMind GeoLite2 Country 数据库（二进制 MMDB 文件，约 3.3 MB）。启动时（start / tray / core 三条路径）本地缺失则后台异步下载（不阻塞启动；客户端超时 5 分钟，随机名临时文件写入、rename 前 geoip2 试开校验、成功后原子重命名；重定向仅允许 https 且至多 3 跳，体积上限 64MiB）；下载失败仅记日志、下次启动重试。下载完成装载后 geoip 规则自动生效；就绪前 geoip 条目一律不命中。数据库不做自动刷新，COS 副本建议每月刷新一次。
 
 ---
+
+## 12. Local Gateway Routing Config API（本机 API）
+
+**Base URL:** `http://127.0.0.1:56432`（本机网关自身 API；本节为本机契约，非上游外部 API）
+**Source:** `app/http/handlers/config_handler.go`、`processor/config/routing_apply_state.go`
+
+### GET /api/config/routing
+
+返回当前生效的 canonical 路由配置（routing apply store 的活跃 canonical）。store 为空时返回全 direct 的空壳默认视图（`toAliang/toSocks` 均 false），不代表用户开关已关闭——以 POST 提交后的回读为准。
+
+**Response：**
+
+```json
+{
+  "data": {
+    "version": 1,
+    "ingress": {"mode": "tun"},
+    "egress": {
+      "direct": {"enabled": true},
+      "toAliang": {"enabled": true},
+      "toSocks": {"enabled": false, "upstream": {"type": "socks"}}
+    },
+    "routing": {
+      "rules": [
+        {"id": "ai_allowlist_0", "type": "domain", "condition": "api.openai.com", "enabled": true, "target": "toAliang"}
+      ],
+      "default_egress": "direct"
+    }
+  }
+}
+```
+
+### POST /api/config/routing
+
+提交完整 canonical 路由配置（整体替换，非增量 patch）。三段形态：
+
+| 段 | 字段 | 约束 |
+|----|------|------|
+| `ingress` | `mode` | `tun` \| `http`（缺省补 `tun`） |
+| `egress.direct` | `enabled` | 必须为 `true`（direct 分支不可关闭） |
+| `egress.toAliang` | `enabled` | AI 加速总开关 |
+| `egress.toSocks` | `enabled` + `upstream.type` | 客户代理开关；`enabled=true` 时 `upstream.type` 必须为 `socks` \| `http` |
+| `routing.rules[]` | `id/type/condition/enabled/target` | `target` ∈ `direct` \| `toAliang` \| `toSocks`；target 指向已关闭分支会被拒绝 |
+| `routing.default_egress` | 可选 | 同 target 枚举；不可指向已关闭分支 |
+
+未知字段拒绝（`DisallowUnknownFields`）；仅接受 canonical 三段形态，legacy 键一律报错并提示迁移。
+
+**Response（成功）：**
+
+```json
+{
+  "data": {
+    "message": "Configuration updated successfully",
+    "source": "canonical",
+    "version": 3,
+    "hash": "sha256:..."
+  }
+}
+```
+
+**Response（校验失败，400）：** `Configuration validation failed` + 具体字段错误；内存态保持上次成功配置（LKG）不变。
+
+**开关重启保持语义：** Apply 成功后 canonical JSON 原子落盘 `<state>/routing.json`（tmp+rename；`<state>` 即 geoip 数据库所在状态目录）。进程启动时（start / tray / core 三条路径，早于任何连接处理）文件存在则装载恢复用户 egress 开关状态；文件缺失/损坏则回退空 store，由既有 bootstrap 推导（客户代理已配置时 toSocks 默认开启）。`egress.toSocks.enabled=false` 时即使客户代理仍配置，toSocks 分支也被拒绝并降级 direct 直连（不断链）；customer 配置保存（POST `/api/config/customer`）不会重置该开关。
+
+---
+

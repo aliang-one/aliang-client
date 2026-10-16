@@ -5,9 +5,16 @@ import (
 
 	"aliang.one/nursorgate/common/logger"
 	"aliang.one/nursorgate/common/model"
+	"aliang.one/nursorgate/processor/config"
 )
 
 // SwitchManager manages the global routing switches
+//
+// Deprecated: 本结构体已不再是路由开关的事实源。运行时唯一事实源是
+// config.GetRoutingApplyStore() 的 ActiveCanonicalSchema（egress 三段开关，
+// 由 /api/config/routing 提交并持久化到 <state>/routing.json）。字段与
+// setter 仅为源码兼容保留（当前零生产调用者）；读取开关状态请用
+// EffectiveSwitchStatus。
 type SwitchManager struct {
 	mu            sync.RWMutex
 	aliangEnabled bool
@@ -38,6 +45,9 @@ func GetSwitchManager() *SwitchManager {
 }
 
 // UpdateSwitches updates the global switches based on configuration
+//
+// Deprecated: 开关事实源已迁移至 routing apply store（canonical egress 段），
+// 本方法不再有生产调用者；开关变更请提交 /api/config/routing。
 func (sm *SwitchManager) UpdateSwitches(config *model.RoutingRulesConfig) {
 	if config == nil {
 		logger.Warn("Cannot update switches: config is nil")
@@ -99,6 +109,9 @@ func (sm *SwitchManager) IsGeoIPEnabled() bool {
 }
 
 // SetAliangEnabled sets the Aliang switch
+//
+// Deprecated: 只改本结构体内存态，不影响 ActiveCanonicalSchema 派生的真实
+// 开关状态（当前零生产调用者）。开关变更请提交 /api/config/routing。
 func (sm *SwitchManager) SetAliangEnabled(enabled bool) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
@@ -114,6 +127,9 @@ func (sm *SwitchManager) SetAliangEnabled(enabled bool) {
 }
 
 // SetSocksEnabled sets the SOCKS switch
+//
+// Deprecated: 只改本结构体内存态，不影响 ActiveCanonicalSchema 派生的真实
+// 开关状态（当前零生产调用者）。开关变更请提交 /api/config/routing。
 func (sm *SwitchManager) SetSocksEnabled(enabled bool) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
@@ -129,6 +145,8 @@ func (sm *SwitchManager) SetSocksEnabled(enabled bool) {
 }
 
 // SetGeoIPEnabled sets the GeoIP switch
+//
+// Deprecated: geoip 生效与否由「规则存在 + 数据库已加载」决定，本 setter 无行为影响。
 func (sm *SwitchManager) SetGeoIPEnabled(enabled bool) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
@@ -143,11 +161,33 @@ func (sm *SwitchManager) SetGeoIPEnabled(enabled bool) {
 	}
 }
 
-// GetStatus returns current switch status as a model struct
+// GetStatus returns current switch status as a model struct.
+// 回显不撒谎：store 存在 canonical 时返回从 egress 段派生的真实状态
+// （与决策层/执行层同一事实源）；store 为空时回落内存默认值。
 func (sm *SwitchManager) GetStatus() model.RulesSettings {
+	return EffectiveSwitchStatus()
+}
+
+// EffectiveSwitchStatus 返回决策层编译运行时快照应使用的开关状态——从单一
+// 事实源派生：
+//   - store 有 canonical：AliangEnabled/SocksEnabled 取自 egress.toAliang /
+//     egress.toSocks（无拷贝读，适合每连接调用）；
+//   - store 为空：回落 SwitchManager 内存态（即既有默认行为 true/true）。
+//
+// GeoIPEnabled 为历史兼容序列化字段，不参与行为分支，恒取内存值。
+func EffectiveSwitchStatus() model.RulesSettings {
+	sm := GetSwitchManager()
+	aliangEnabled, socksEnabled, ok := config.GetRoutingApplyStore().ActiveEgressSwitches()
+	if ok {
+		return model.RulesSettings{
+			AliangEnabled: aliangEnabled,
+			SocksEnabled:  socksEnabled,
+			GeoIPEnabled:  sm.IsGeoIPEnabled(),
+		}
+	}
+
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
-
 	return model.RulesSettings{
 		AliangEnabled: sm.aliangEnabled,
 		SocksEnabled:  sm.socksEnabled,
@@ -156,6 +196,8 @@ func (sm *SwitchManager) GetStatus() model.RulesSettings {
 }
 
 // DisableAll disables all switches
+//
+// Deprecated: 只改本结构体内存态（当前零生产调用者）。
 func (sm *SwitchManager) DisableAll() {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
@@ -167,6 +209,8 @@ func (sm *SwitchManager) DisableAll() {
 }
 
 // EnableAll enables all switches
+//
+// Deprecated: 只改本结构体内存态（当前零生产调用者）。
 func (sm *SwitchManager) EnableAll() {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
@@ -178,6 +222,8 @@ func (sm *SwitchManager) EnableAll() {
 }
 
 // ResetToDefaults resets switches to default state
+//
+// Deprecated: 只改本结构体内存态（当前零生产调用者）。
 func (sm *SwitchManager) ResetToDefaults() {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
