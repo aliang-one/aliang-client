@@ -768,7 +768,7 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 		// challenge and eventually kill a session the user just approved.
 		s.setRemoteConnectionState(true, "online", "")
 		s.terminal.quotaResolved(msg, writeJSON)
-	case models.AgentEventAISessionCreate, models.AgentEventAIMessage, models.AgentEventAIRunStart, models.AgentEventAISteer, models.AgentEventAIApprovalResponse, models.AgentEventAIOptionResponse, models.AgentEventAIStop, models.AgentEventAISessionClose, models.AgentEventAITuiSync:
+	case models.AgentEventAISessionCreate, models.AgentEventAIMessage, models.AgentEventAIRunStart, models.AgentEventAISteer, models.AgentEventAIApprovalResponse, models.AgentEventAIOptionResponse, models.AgentEventAIStop, models.AgentEventAISessionClose, models.AgentEventAITuiSync, models.AgentEventToolAskResponse:
 		s.setRemoteConnectionState(true, "online", "")
 		switch msgType {
 		case models.AgentEventAISessionCreate:
@@ -807,6 +807,10 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 				return
 			}
 			s.ai.optionResponse(msg, writeJSON)
+		case models.AgentEventToolAskResponse:
+			// 自有交互工具作答:不受 aiControlEnabled 门——run 在跑时桥必须活着
+			// (关掉控制开关不该掐死一个已阻塞在 ask_user 上的回合)。
+			s.ai.toolAskResponse(msg, writeJSON)
 		case models.AgentEventAIStop:
 			s.ai.stop(msg, writeJSON)
 		case models.AgentEventAITuiSync:

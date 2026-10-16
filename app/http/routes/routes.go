@@ -269,6 +269,9 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	register("/api/agent/tools/launch", h.Agent.HandleLaunch, http.MethodPost)
 	register("/api/agent/ai/stream", h.Agent.HandleAIStream, http.MethodGet)
 	register("/api/agent/ai/approval-hook", h.Agent.HandleAIApprovalHook, http.MethodPost)
+	// 自有交互工具 MCP 端点(tool_ask bridge):路径含 per-run token,方法由
+	// MCP Streamable HTTP 协议决定(POST 消息/GET SSE/DELETE 关会话)。
+	register("/mcp/aliang/", h.Agent.HandleToolAskMCP, http.MethodPost, http.MethodGet, http.MethodDelete)
 	register("/api/agent/sessions", h.Agent.HandleVibeSessions, http.MethodGet)
 	register("/api/agent/runtime-sessions", h.Agent.HandleRuntimeSessions, http.MethodGet)
 	// {sessionId} 路由用方法前缀模式注册（同 quick-setup combos 约定，避免 ServeMux panic）
