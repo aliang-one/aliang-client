@@ -225,7 +225,15 @@
             <div>
               <h3 class="font-semibold text-slate-900 dark:text-white">{{ t('rules_proxyRules') }}</h3>
               <p class="text-xs text-slate-500">{{ t('rules_proxyRulesDesc') }}</p>
+              <!-- HIGH#5：语法摘要句——glob「只命中子域不命中裸域」等反直觉语义在 UI 上可发现 -->
+              <p class="text-xs text-slate-500">{{ t('rules_proxyRulesDescExt') }}</p>
             </div>
+            <!-- 复用 SettingsPage 页脚 openTutorialDocs('usage-guide') 先例：模块级共享状态，App.vue 挂载弹窗 -->
+            <a
+              class="ml-auto min-h-11 whitespace-nowrap text-xs font-medium text-primary hover:underline"
+              href="javascript:void(0)"
+              @click.prevent="openRulesSyntaxDocs"
+            >{{ t('rules_docsLink') }}</a>
           </div>
 
           <label class="space-y-2">
@@ -236,7 +244,7 @@
               :class="proxyRulesError
                 ? 'border-red-400 bg-red-50 focus:border-red-500 focus:ring-red-500/20 dark:border-red-500/50 dark:bg-red-900/10'
                 : 'border-slate-300 bg-white focus:border-primary focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900'"
-              placeholder="domain,example.com,proxy&#10;api.aliang.one"
+              :placeholder="t('rules_proxyRulesPlaceholder')"
               @input="_proxyRulesText = $event.target.value"
             ></textarea>
             <p v-if="proxyRulesError" class="text-xs text-red-500">{{ proxyRulesError }}</p>
@@ -312,6 +320,7 @@
 
 <script>
 import { useI18n } from '../../i18n';
+import { openTutorialDocs } from '../../composables/useTutorialDocs';
 
 function defaultConfig() {
   return {
@@ -726,7 +735,10 @@ export default {
   name: 'RulesSettings',
   setup() {
     const { t } = useI18n();
-    return { t };
+    // HIGH#5：打开语法文档（usage-guide 12.1 规则格式）。openTutorialDocs 是模块级
+    // 共享状态（App.vue 渲染 TutorialDocsModal），无需经父组件 emit 链转发。
+    const openRulesSyntaxDocs = () => openTutorialDocs('usage-guide');
+    return { t, openRulesSyntaxDocs };
   },
   props: {
     config: {
