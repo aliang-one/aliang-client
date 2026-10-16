@@ -32,7 +32,7 @@ description: 从安装到高级用法的完整使用指南，涵盖证书、登�
 slug: usage-guide
 locale: zh_CN
 docId: usage-guide
-version: "2026-05-22"
+version: "2026-10-16"
 category: tutorial
 tags:
   - aliang-gate
@@ -179,7 +179,7 @@ def main() -> None:
   <div className="mb-3 flex flex-wrap items-center gap-2">
     <Badge variant="primary">完整教程</Badge>
     <Badge>zh_CN</Badge>
-    <Badge variant="success">2026-05-22</Badge>
+    <Badge variant="success">2026-10-16</Badge>
   </div>
   <p className="max-w-2xl text-sm leading-7 text-slate-600 dark:text-slate-300">
     覆盖安装、证书信任、登录、运行模式、CLI 工具、AI 规则与故障排查。适合作为后台帮助中心主文档发布。
@@ -251,7 +251,7 @@ def main() -> None:
         "slug": "usage-guide",
         "locale": "zh_CN",
         "docId": "usage-guide",
-        "version": "2026-05-22",
+        "version": "2026-10-16",
         "category": "tutorial",
         "status": "published",
         "format": "mdx",
