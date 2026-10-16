@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	httpServer "aliang.one/nursorgate/app/http"
 	"aliang.one/nursorgate/app/http/services"
@@ -81,6 +82,19 @@ func runCoreWithContext(ctx context.Context) error {
 	// dashboard over IPC, so the Core daemon brings up the HTTP dashboard itself
 	// to keep the deployment self-contained. macOS/Windows rely on the tray.
 	startCoreDashboardIfHeadless()
+
+	// 平台代理自愈：56432 run service 运行态不持久化，core 重启后若无人手动
+	// run/start，所有手机 AI run 会 Connection refused（10-13/10-15 两次事故）。
+	// 认证就绪（CanProxy）后自动拉起一次；仅 boot 后首次就绪的边沿触发，
+	// 此后用户显式 stop 不被对抗。
+	go services.StartProxyWhenSessionReady(ctx, time.Second,
+		auth.GetSessionAuthority().CanProxy,
+		func() {
+			result := services.GetSharedRunService().StartService()
+			if status, ok := result["status"].(string); ok {
+				logger.Info("proxy auto-started on session ready: status=" + status)
+			}
+		})
 
 	// 4. Wait for shutdown signal/context cancellation
 	<-ctx.Done()
