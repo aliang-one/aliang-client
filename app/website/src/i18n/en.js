@@ -645,7 +645,9 @@ export default {
   rules_entryEmptyLabel: 'Domain cannot contain empty labels (e.g. a..b, leading/trailing dots)',
   rules_ipInvalid: 'Invalid IP condition (supported: single IP / CIDR e.g. 121.32.12.0/24 / range e.g. 1.2.3.1-1.2.3.254)',
   rules_geoipInvalid: 'Invalid geoip entry (country code must be a two-letter uppercase ISO 3166-1 code; separate multiple countries with +, e.g. geoip:CN+HK)',
+  // Include-panel only (that input box tokenizes on commas and breaks the entry); see rules_geoipCommaMultiProxy for the proxy_rules panel
   rules_geoipCommaMulti: 'Use + to separate multiple geoip countries (e.g. geoip:CN+HK); comma syntax gets broken by this input box',
+  rules_geoipCommaMultiProxy: 'Use + to separate multiple geoip countries (e.g. geoip:CN+HK); comma-separated multi-country form is not supported',
   rules_entryErrorItem: 'Entry "{entry}": {message}',
   rules_proxyUsername: 'Username',
   rules_proxyUsernamePlaceholder: 'Optional',
