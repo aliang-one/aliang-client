@@ -523,6 +523,37 @@ type CustomerConfig struct {
 	HTTP1Drop     *HTTP1DropConfig                  `json:"http1_drop,omitempty"`
 	ModelMapping  *ModelMappingConfig               `json:"model_mapping,omitempty"`
 	CustomEnvVars *CustomEnvVarsConfig              `json:"custom_env_vars,omitempty"`
+	GeoIP         *CustomerGeoIPSettings            `json:"geoip,omitempty"`
+}
+
+// CustomerGeoIPSettings 自定义 GeoIP 国家库下载源（customer.geoip）。
+// DownloadURL 非空时必须为 https URL；运行时优先级 env
+// ALIANG_GEOIP_DOWNLOAD_URL（部署面覆盖）> 此处配置 > 默认 COS 源。
+type CustomerGeoIPSettings struct {
+	DownloadURL string `json:"download_url,omitempty"`
+}
+
+// EffectiveDownloadURL 返回 trim 后的下载源；空串表示未配置（用默认源）。
+func (c *CustomerGeoIPSettings) EffectiveDownloadURL() string {
+	if c == nil {
+		return ""
+	}
+	return strings.TrimSpace(c.DownloadURL)
+}
+
+func (c *CustomerGeoIPSettings) Validate() error {
+	if c == nil {
+		return nil
+	}
+	u := c.EffectiveDownloadURL()
+	if u == "" {
+		return nil
+	}
+	parsed, err := url.Parse(u)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+		return fmt.Errorf("geoip.download_url must be an https URL, got %q", c.DownloadURL)
+	}
+	return nil
 }
 
 type AliangServerConfig struct {
@@ -778,6 +809,11 @@ func (c *Config) Validate() error {
 				return fmt.Errorf("invalid custom_env_vars configuration: %w", err)
 			}
 		}
+		if geoipSettings := c.Customer.GeoIP; geoipSettings != nil {
+			if err := geoipSettings.Validate(); err != nil {
+				return fmt.Errorf("invalid geoip configuration: %w", err)
+			}
+		}
 	}
 
 	return nil
@@ -838,7 +874,7 @@ func (c *Config) customerUnknownKeyErrors() error {
 	if len(c.customerUnknownFields) > 0 {
 		sorted := append([]string(nil), c.customerUnknownFields...)
 		sort.Strings(sorted)
-		return fmt.Errorf("customer.%s is forbidden: editable customer fields are [proxy ai_rules proxy_rules traffic_mirror http1_drop model_mapping custom_env_vars]", sorted[0])
+		return fmt.Errorf("customer.%s is forbidden: editable customer fields are [proxy ai_rules proxy_rules traffic_mirror http1_drop model_mapping custom_env_vars geoip]", sorted[0])
 	}
 
 	providers := make([]string, 0, len(c.aiRuleUnknownFields))
@@ -875,7 +911,7 @@ func extractCustomerUnknownFields(root map[string]json.RawMessage) ([]string, ma
 
 	for key := range customerRoot {
 		switch key {
-		case "proxy", "ai_rules", "proxy_rules", "traffic_mirror", "http1_drop", "model_mapping", "custom_env_vars":
+		case "proxy", "ai_rules", "proxy_rules", "traffic_mirror", "http1_drop", "model_mapping", "custom_env_vars", "geoip":
 		default:
 			unknownCustomer = append(unknownCustomer, key)
 		}
@@ -1206,6 +1242,16 @@ func (c *Config) EffectiveCustomEnvVars() map[string]string {
 		return nil
 	}
 	return c.Customer.CustomEnvVars.EffectiveVars()
+}
+
+// EffectiveGeoIPDownloadURL returns the configured GeoIP database download URL
+// (customer.geoip.download_url, trimmed), or "" when unset. The env override
+// ALIANG_GEOIP_DOWNLOAD_URL keeps higher priority at consumption time.
+func (c *Config) EffectiveGeoIPDownloadURL() string {
+	if c == nil || c.Customer == nil || c.Customer.GeoIP == nil {
+		return ""
+	}
+	return c.Customer.GeoIP.EffectiveDownloadURL()
 }
 
 func sortedMapKeys(values map[string]*CustomerAIRuleSetting) []string {

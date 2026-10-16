@@ -147,9 +147,9 @@
                   <p class="text-xs text-slate-500">{{ provider }}</p>
                 </div>
                 <label class="inline-flex min-h-9 cursor-pointer items-center gap-2 text-xs font-semibold text-slate-600 dark:text-slate-200 md:min-h-0">
-                  <input v-model="form.ai_rules[provider].enble" class="peer sr-only" type="checkbox" />
+                  <input v-model="form.ai_rules[provider].enble" class="peer sr-only" type="checkbox" :aria-label="t('rules_enableAiRule')" />
+                  <span class="sr-only">{{ t('rules_enableAiRule') }}</span>
                   <span class="relative h-6 w-11 rounded-full bg-slate-300 transition-colors after:absolute after:left-0.5 after:top-0.5 after:h-5 after:w-5 after:rounded-full after:bg-white after:transition-transform after:content-[''] peer-checked:bg-primary peer-checked:after:translate-x-5 peer-focus-visible:outline peer-focus-visible:outline-2 peer-focus-visible:outline-offset-2 peer-focus-visible:outline-primary dark:bg-slate-700"></span>
-                  
                 </label>
               </div>
 
@@ -160,8 +160,14 @@
                   :aria-expanded="isProviderEditorOpen(provider)"
                   @click.stop="toggleProviderEditor(provider)"
                 >
-                  <span class="text-xs font-normal text-slate-500 dark:text-slate-400">{{ t('rules_includeDomains') }}</span>
-                  <span class="inline-flex items-center rounded-full bg-white px-2 py-0.5 text-[11px] font-medium text-slate-500 shadow-sm ring-1 ring-slate-200 dark:bg-slate-950 dark:text-slate-400 dark:ring-slate-800">
+                  <span class="flex min-w-0 flex-col items-start gap-0.5">
+                    <span class="text-xs font-normal text-slate-500 dark:text-slate-400">{{ t('rules_includeDomains') }}</span>
+                    <!-- LOW#16：收起态副文案——空配置提示 / 单条目预览 / first+N more -->
+                    <span v-if="!isProviderEditorOpen(provider)" class="max-w-full truncate text-xs text-slate-400 dark:text-slate-500">
+                      {{ providerIncludeSummary(provider) }}
+                    </span>
+                  </span>
+                  <span class="inline-flex shrink-0 items-center rounded-full bg-white px-2 py-0.5 text-[11px] font-medium text-slate-500 shadow-sm ring-1 ring-slate-200 dark:bg-slate-950 dark:text-slate-400 dark:ring-slate-800">
                     {{ isProviderEditorOpen(provider) ? t('rules_includeDomainsClose') : t('rules_includeDomainsEdit') }}
                   </span>
                 </button>
@@ -172,7 +178,11 @@
                   @click.stop
                 >
                   <div class="mb-3 flex items-start justify-between gap-3">
-                    <h5 class="text-xs font-medium text-slate-600 dark:text-slate-300">{{ t('rules_includeDomainsDialogTitle', { provider: providerLabel(provider, presetProviders) }) }}</h5>
+                    <h5 class="text-xs font-medium text-slate-600 dark:text-slate-300">
+                      {{ t('rules_includeDomainsDialogTitle', { provider: providerLabel(provider, presetProviders) }) }}
+                      <!-- LOW#16：草稿实时条目数（与保存按钮同口径的 sanitizeList 计数） -->
+                      <span class="ml-2 font-normal text-slate-400">{{ t('rules_includeDomainsCount', { count: providerDraftCount() }) }}</span>
+                    </h5>
                     <button
                       type="button"
                       class="rounded-lg p-1 text-slate-400 transition hover:bg-slate-100 hover:text-slate-600 dark:hover:bg-slate-800 dark:hover:text-slate-300"
@@ -604,8 +614,25 @@ function firstEntryIssue(entries, t) {
   return null;
 }
 
-function formatEntryIssue(issue, t) {
-  return issue ? t('rules_entryErrorItem', { entry: issue.entry, message: issue.message }) : '';
+// 错误文案组装（LOW#18）：firstEntryIssue 的 index 透传为「第 N 行」前缀（N 从 1 起），
+// 套入 rules_entryErrorItem 包装；proxy_rules 与 include 两个输入面的报错共用本组装。
+// 具名导出仅供同目录 RulesSettings.test.js 做前缀回归测试使用。
+export function formatEntryIssue(issue, t) {
+  if (!issue) return '';
+  return t('rules_entryErrorItem', {
+    entry: issue.entry,
+    message: t('rules_linePrefix', { line: issue.index + 1 }) + issue.message
+  });
+}
+
+// include 收起态副文案（LOW#16）：0 条 → Empty；1 条 → 条目本身；≥2 条 →
+// 「{first} 等另外 {count} 项」预览（count = 其余条数）。entries 为 sanitizeList
+// 产物（已做 URL 域名提取归一）。具名导出仅供同目录测试做副文案回归使用。
+export function includeSummaryText(entries, t) {
+  const list = entries || [];
+  if (!list.length) return t('rules_includeDomainsEmpty');
+  if (list.length === 1) return list[0];
+  return t('rules_includeDomainsPreview', { first: list[0], count: list.length - 1 });
 }
 
 // 拆分前扫描：include 面任何 geoip 逗号形态都会被 sanitizeList 的逗号 tokenizer 拆坏
@@ -948,6 +975,14 @@ export default {
     providerLabel(key, presetProviders) {
       const preset = presetProviders.find(p => p.key === key);
       return preset ? preset.label : key;
+    },
+    // LOW#16：include 收起态副文案（空/单条目/first+N more）
+    providerIncludeSummary(provider) {
+      return includeSummaryText(normalizeStringList(this.form.ai_rules[provider]?.include), this.t);
+    },
+    // LOW#16：include 编辑弹窗标题的草稿实时条目数（与保存同口径的 sanitizeList 计数）
+    providerDraftCount() {
+      return sanitizeList(this.providerEditor.draft).length;
     },
     providerEditable(provider) {
       const rule = this.form.ai_rules[provider];

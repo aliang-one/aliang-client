@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"aliang.one/nursorgate/common/logger"
+	"aliang.one/nursorgate/processor/geoip"
 )
 
 var (
@@ -16,11 +17,17 @@ var (
 	configMutex  sync.RWMutex
 )
 
-// SetGlobalConfig sets the global configuration instance
+// SetGlobalConfig sets the global configuration instance.
+// 该函数是配置生效（Apply 成功）的唯一咽喉：启动加载、客户配置提交、核心配置
+// 提交三条路径都在 Validate 通过后到达这里——customer.geoip.download_url 的
+// 注入挂在此处，保证任意路径生效的配置同步到 geoip 下载源（env 层仍最高）。
 func SetGlobalConfig(cfg *Config) {
 	configMutex.Lock()
-	defer configMutex.Unlock()
 	globalConfig = cfg
+	url := cfg.EffectiveGeoIPDownloadURL()
+	configMutex.Unlock()
+
+	geoip.SetDownloadURLOverride(url)
 }
 
 // GetGlobalConfig returns the global configuration instance
@@ -58,8 +65,10 @@ func SaveConfigToFile(cfg *Config, filePath string) error {
 // This allows tests to run in isolation without state pollution
 func ResetGlobalConfigForTest() {
 	configMutex.Lock()
-	defer configMutex.Unlock()
 	globalConfig = nil
+	configMutex.Unlock()
+
+	geoip.SetDownloadURLOverride("")
 
 	// Also reset the config state
 	state := GetConfigState()

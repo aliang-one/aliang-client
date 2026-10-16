@@ -419,6 +419,20 @@ ip-range,1.2.3.1-1.2.3.254,direct
 > labels such as `a..b`) are rejected when you save, with an inline error
 > shown in the UI.
 
+> **Writing normalization**: entries are normalized when you save. URL and
+> host:port entries have their host extracted automatically (`https://a.com/x`
+> and `a.com:443` both take effect as `a.com`); a bare IP written in a domain
+> position (including hosts extracted from URLs or host:port) is classified
+> as an IP rule automatically (e.g. `[2001:db8::1]:443`). IPv4-mapped IPv6
+> forms of single IPs and range endpoints are normalized to plain IPv4
+> (`::ffff:1.2.3.4` → `1.2.3.4`), but that form in a CIDR (e.g.
+> `::ffff:1.2.3.0/120`) cannot be mapped unambiguously and is rejected on
+> save — write it in IPv4 form instead (e.g. `1.2.3.0/24`). Internationalized
+> domains (IDN) are not accepted as raw Unicode; use punycode (`xn--` form).
+> Multi-country geoip entries are insensitive to order and duplicates:
+> country codes are uppercased, deduped, and sorted on save (`geoip:HK+CN`
+> and `geoip:CN+HK` become the same rule).
+
 > **Traffic mirror**: the mirror `domains` list is matched by domain
 > (SNI/host). Of IP entries, only a bare single IP can ever match (literal
 > SNI/host comparison); CIDR blocks and ranges never match in the mirror path.
