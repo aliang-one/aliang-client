@@ -160,7 +160,9 @@ aliang.*                   any TLD (aliang.com, aliang.co.uk)
 121.32.12.0/24             CIDR (0.0.0.0/0 matches IPv4 only, ::/0 IPv6 only)
 1.2.3.1-1.2.3.254          closed range
 ip-cidr:121.32.12.0/24     explicit keyword (also ip-range:, ip-from:…,ip-to:…)
-ip-cidr,121.32.12.0/24,proxy   Clash style with trailing action (proxy_rules)
+ip-cidr,121.32.12.0/24,proxy   Clash style (proxy_rules) — the trailing
+                               action is ignored; egress follows the
+                               customer proxy switch
 
 # GeoIP conditions — route by the destination IP's country
 # (two-letter uppercase ISO 3166-1 codes)

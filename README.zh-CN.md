@@ -157,7 +157,8 @@ aliang.*                   任意 TLD（aliang.com、aliang.co.uk）
 121.32.12.0/24             CIDR（0.0.0.0/0 仅 IPv4，::/0 仅 IPv6）
 1.2.3.1-1.2.3.254          闭区间
 ip-cidr:121.32.12.0/24     显式关键字（另有 ip-range:、ip-from:…,ip-to:…）
-ip-cidr,121.32.12.0/24,proxy   Clash 风格，尾段为动作（proxy_rules）
+ip-cidr,121.32.12.0/24,proxy   Clash 风格（proxy_rules）——尾段动作会被忽略，
+                               实际出口由客户代理（customer.proxy）开关统一决定
 
 # GeoIP 条件——按目的 IP 的归属国分流
 #（两位大写 ISO 3166-1 国家码）
