@@ -492,6 +492,41 @@ geoip:CN+HK+US
 geoip,US,proxy
 ```
 
+### Upgrade Notes
+
+After upgrading from an older version, the rules engine has the following
+behavior changes — reviewing your existing rules is recommended:
+
+1. **Historical wildcard entries now match for real.** Older versions
+   supported only three forms: exact match, subdomain-suffix match, and the
+   `*.example.com` subdomain wildcard; with `*` in any other position (e.g.
+   `aliang.*`, `*epic.com`) the entry never matched any domain. After the
+   upgrade, `*` in any position performs real glob matching (each `*`
+   matches one or more characters and may cross dots). Existing rules using
+   such entries will start matching — that is the intended feature, but it
+   is a behavior change: double-check what those entries were meant to do.
+
+2. **Old `GEOIP,xx` entries flip from a domain miscompilation to real
+   country-based routing.** Older versions miscompiled Clash-style entries
+   like `GEOIP,CN,proxy` into the literal domain `CN` (which real traffic
+   essentially never hit — a dead rule); after the upgrade they route by
+   the country of the destination IP. Invalid geoip forms are now rejected
+   on save — multiple countries written with commas (e.g. `geoip:CN,HK`)
+   are no longer accepted; separate countries with `+` (e.g.
+   `geoip:CN+HK`).
+
+3. **Malformed entries in config.json now fail startup validation.**
+   Startup validates the configuration in full (fail-fast): a malformed
+   entry aborts startup and is written to the log, e.g.
+
+   ```
+   failed to apply config: configuration validation failed: customer.proxy_rules[0] invalid "geoip:CHN": ...
+   ```
+
+   **Self-recovery**: open the config.json at the path shown in the startup
+   log, delete or rewrite the malformed entry named in the error, save, and
+   restart the agent.
+
 ---
 
 ## 9. FAQ

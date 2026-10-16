@@ -398,6 +398,6 @@ Authorization-Inner: Bearer {current_user_access_token}
 **Auth:** 无
 **Source:** `processor/geoip/service.go`
 
-下载 MaxMind GeoLite2 Country 数据库（二进制 MMDB 文件，约 3.3 MB）。启动时（start / tray / core 三条路径）本地缺失则后台异步下载（不阻塞启动；客户端超时 5 分钟，先写 `.tmp` 临时文件、成功后原子重命名）；下载失败仅记日志、下次启动重试。下载完成装载后 geoip 规则自动生效；就绪前 geoip 条目一律不命中。数据库不做自动刷新，COS 副本建议每月刷新一次。
+下载 MaxMind GeoLite2 Country 数据库（二进制 MMDB 文件，约 3.3 MB）。启动时（start / tray / core 三条路径）本地缺失则后台异步下载（不阻塞启动；客户端超时 5 分钟，随机名临时文件写入、rename 前 geoip2 试开校验、成功后原子重命名；重定向仅允许 https 且至多 3 跳，体积上限 64MiB）；下载失败仅记日志、下次启动重试。下载完成装载后 geoip 规则自动生效；就绪前 geoip 条目一律不命中。数据库不做自动刷新，COS 副本建议每月刷新一次。
 
 ---

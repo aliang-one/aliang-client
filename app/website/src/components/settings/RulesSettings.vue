@@ -365,6 +365,10 @@ function sanitizeLines(value) {
 // 已知刻意放宽：区间数值顺序（from ≤ to）由后端强校验，此处不比对。
 const ENTRY_CHARS_RE = /^[a-z0-9.*-]+$/;
 const IPV4_RE = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
+// 逗号兜底分支的尾段动作词集合——与后端 processor/match legacyActionTail 严格一致
+// （大小写不敏感：parts 已统一 toLowerCase；仅剥一层尾段）。
+// 红线：前端从不拒绝后端接受的输入，两边集合必须同步维护。
+const ACTION_TAIL_WORDS = new Set(['proxy', 'direct', 'reject', 'no-resolve']);
 
 function parseIPFamily(s) {
   const m = String(s).match(IPV4_RE);
@@ -392,6 +396,10 @@ function isValidIPCond(cond) {
 }
 
 // 返回 '' 表示合法，否则返回 i18n 错误文案。
+// 调用面：proxy_rules 文本域按行拆分（逗号原样保留）逐条调用；include 面 sanitizeList
+// 先按逗号拆分再调用（条目必无逗号，且 geoip 逗号形态已被 detectGeoipCommaIssue 拆分前拦截）。
+// 因此本函数内的 geoip 逗号多国文案只会在 proxy_rules 面露出 → 用不带「拆坏」表述的
+// rules_geoipCommaMultiProxy（后端按格式拒绝，非拆坏）；include 面「会被拆坏」文案归 detectGeoipCommaIssue。
 // 具名导出仅供同目录 RulesSettings.test.js 做 geoip 形态回归测试使用（与 sanitizeList 同例）。
 export function validateRuleEntry(raw, t) {
   let s = String(raw || '').trim();
@@ -402,7 +410,7 @@ export function validateRuleEntry(raw, t) {
   if (lower.startsWith('geoip:')) {
     const rem = s.slice(6).trim();
     if (!rem) return t('rules_geoipInvalid');
-    if (rem.includes(',')) return t('rules_geoipCommaMulti');
+    if (rem.includes(',')) return t('rules_geoipCommaMultiProxy');
     const codes = rem.split('+').map((c) => c.trim().toUpperCase()).filter(Boolean);
     if (!codes.length || !codes.every((c) => /^[A-Z]{2}$/.test(c))) return t('rules_geoipInvalid');
     return '';
@@ -427,15 +435,15 @@ export function validateRuleEntry(raw, t) {
       return second && isValidIPCond(second.trim()) ? '' : t('rules_ipInvalid');
     } else if (first === 'geoip') {
       // 对齐后端 Clash geoip 分支：单国 + 可选 proxy 尾段合法；
-      // 其余段再出现两位国家码 = 逗号多国尝试（后端拒绝，include 面也会被拆坏）→ 提示 + 分隔
+      // 其余段再出现两位国家码 = 逗号多国尝试（后端按格式拒绝）→ 提示 + 分隔（proxy 面文案）
       if (parts.length < 2 || !parts[1].trim()) return t('rules_geoipInvalid');
       const second = parts[1].trim().toUpperCase();
       if (!/^[A-Z]{2}$/.test(second)) return t('rules_geoipInvalid');
       for (let i = 2; i < parts.length; i++) {
-        if (/^[A-Za-z]{2}$/.test(parts[i].trim())) return t('rules_geoipCommaMulti');
+        if (/^[A-Za-z]{2}$/.test(parts[i].trim())) return t('rules_geoipCommaMultiProxy');
       }
       return '';
-    } else if (parts[parts.length - 1].trim() === 'proxy') s = parts[parts.length - 2] || '';
+    } else if (ACTION_TAIL_WORDS.has(parts[parts.length - 1].trim())) s = parts[parts.length - 2] || '';
     else s = parts[parts.length - 1];
   }
   if (s.includes('://') || s.startsWith('//')) {
@@ -479,7 +487,10 @@ function formatEntryIssue(issue, t) {
 // 拆分前扫描：include 面任何 geoip 逗号形态都会被 sanitizeList 的逗号 tokenizer 拆坏
 // （无例外——Clash 形态 GEOIP,CN,proxy 属 proxy_rules 专属，include 面同样非法）。
 // 只挂 include 输入；proxy_rules 文本域按行拆分，GEOIP,CN,proxy 在那里合法，不挂。
-function detectGeoipCommaIssue(rawText, t) {
+// 文案 rules_geoipCommaMulti 的「会被拆坏」表述仅对该输入框成立（与 proxy 面的
+// rules_geoipCommaMultiProxy 按输入面分派）。
+// 具名导出仅供同目录 RulesSettings.test.js 做文案分派回归测试使用。
+export function detectGeoipCommaIssue(rawText, t) {
   const lines = String(rawText || '').split('\n');
   for (const line of lines) {
     if (/geoip[:,][^\n]*,[^\n]*/i.test(line)) {

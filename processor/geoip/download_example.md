@@ -17,9 +17,9 @@ https://aliang-1305838434.cos.ap-nanjing.myqcloud.com/static/GeoLite2-Country.mm
 ## 下载流程（`EnsureDownloaded`，锁外执行）
 
 1. **检查文件是否存在**——已存在则零网络直接返回（无锁快路径）
-2. **并发 single-flight**——并发调用共享 `.tmp` 临时文件会互相碰撞，互斥锁内 double-check 后再查一次文件是否已被其他调用者下载完成
+2. **并发 single-flight**——下载互斥锁防止并发调用重复触发完整下载（重复下载浪费带宽且拉长装载窗口）；拿到锁后 double-check，再查一次文件是否已被其他调用者下载完成。临时文件本身已是随机名，不存在并发碰撞问题
 3. **自动创建目录**——目标目录不存在时 `os.MkdirAll` 递归创建
-4. **下载数据库**——5 分钟超时；先写入 `.tmp` 临时文件，成功后原子重命名为最终文件；失败自动清理临时文件
+4. **下载数据库**——5 分钟超时；体积上限 64MiB；重定向仅允许 https 且至多 3 跳；先写入随机名临时文件（`O_EXCL` 创建，不触碰任何已存在路径），rename 前用 geoip2 试开校验，校验通过后原子重命名为最终文件；失败自动清理临时文件
 
 装载（`LoadLocal`）只做本地 IO：打开数据库、原子替换内存 reader 并启用服务。下载绝不持有服务锁——下载进行期间查询立即返回未命中，装载完成后立即可查。
 
@@ -47,6 +47,12 @@ https://aliang-1305838434.cos.ap-nanjing.myqcloud.com/static/GeoLite2-Country.mm
 [WARN] GeoIP database load failed after download: failed to load GeoIP database from ~/.aliang/geoip/GeoLite2-Country.mmdb: ...
 ```
 
+下载链内置三条安全约束，触发时同样走上述 `background download failed` 日志（错误尾部可分辨原因）：
+
+- **体积上限 64MiB**——服务端已声明体积超限提前失败（`declared download size ... exceeds maximum size of ... bytes`）；未声明或虚报时流式读取读满即断（`download exceeds maximum size of ... bytes`）
+- **重定向仅 https 且 ≤3 跳**——非 https 重定向目标被拒（`refusing insecure redirect to ...`）；超过 3 跳被拒（`too many redirects`）
+- **落地前试开校验**——rename 前用 geoip2 试开一次，损坏内容不落地（`downloaded database failed validation: ...`，如下载源误配返回 HTTP 200 的 HTML 错误页时）
+
 ## 手动下载 / 刷新
 
 数据库不做自动刷新，建议每月刷新一次——删除本地文件后重启（触发重新下载），或直接覆盖该文件：
@@ -71,12 +77,15 @@ wget https://aliang-1305838434.cos.ap-nanjing.myqcloud.com/static/GeoLite2-Count
 - `EnsureLoadedAsync()` - 启动编排入口：本地优先同步装载，缺失转后台异步（start / tray / core 三路径共用）
 - `EnsureDownloaded(path)` - 确保本地存在数据库文件，缺失则下载（锁外、single-flight）
 - `LoadLocal(path)` - 仅加载本地数据库并原子替换 reader（缺失即错、不下载）
-- `downloadDatabase(url, destPath)` - 实际下载（`.tmp` 临时文件 + 原子重命名）
+- `downloadDatabase(url, destPath)` - 实际下载（随机名临时文件 + 重定向仅 https ≤3 跳 + 64MiB 体积上限 + 落地前试开校验 + 原子重命名）
 
 ## 技术细节
 
-1. **锁纪律**：下载在服务锁外执行（独立的下载互斥），装载仅持锁做本地 IO 与 reader 原子替换
-2. **原子落盘**：先写临时文件再重命名，避免半截文件被当成有效数据库
+1. **锁纪律**：下载在服务锁外执行（独立的下载互斥，防并发重复下载），装载仅持锁做本地 IO 与 reader 原子替换
+2. **原子落盘**：先写随机名临时文件（`O_EXCL` 创建，不触碰任何已存在路径，预置 `.tmp` 符号链接/同名抢占失效）再重命名，避免半截文件被当成有效数据库
 3. **超时控制**：5 分钟下载超时，避免无限等待
 4. **错误清理**：下载失败自动清理临时文件
 5. **目录自动创建**：`os.MkdirAll` 递归创建
+6. **体积上限**：单次下载上限 64MiB（`maxDownloadBytes`）——Content-Length 预检 + 流式读满即断双保险，防止恶意/误配下载源写满磁盘
+7. **重定向策略**：重定向目标必须 https（阻断跨主机明文跳转与 https→http 降级），至多 3 跳
+8. **落地校验**：rename 前用 `geoip2.Open` 试开一次，坏内容（HTTP 200 的 HTML 错误页等）不落地

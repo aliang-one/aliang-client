@@ -89,6 +89,21 @@ func TestClassifyEntry(t *testing.T) {
 		{"v6-zero-compression-canonicalized", "2001:0db8:0000::1", EntryIP, "2001:db8::1", false},
 		// —— 【加固】geoip 多国排序归一（minor#12 伴随）——
 		{"geoip-colon-multi-sorted", "geoip:HK+CN", EntryGeoIP, "CN+HK", false},
+		// —— 尾段动作词噪声剥离（HIGH#1）：集合 {proxy, direct, reject, no-resolve}，大小写不敏感 ——
+		// 尾段动作词不再落成匹配字面主机 direct/reject/no-resolve 的死域名规则；
+		// 前端 RulesSettings.vue 逗号分支保持同一集合（红线：两边集合必须一致）。
+		{"action-tail-direct", "example.com,direct", EntryDomain, "example.com", false},
+		{"action-tail-direct-clash-form", "DOMAIN-SUFFIX,example.com,DIRECT", EntryDomain, "example.com", false},
+		{"action-tail-reject", "example.com,REJECT", EntryDomain, "example.com", false},
+		{"action-tail-no-resolve", "example.com,no-resolve", EntryDomain, "example.com", false},
+		{"action-tail-mixed-case", "example.com,Direct", EntryDomain, "example.com", false},
+		// 剥离后对目标段做完整校验（非「先剥离后免检」）：剥离出的段非法照样报错
+		{"action-tail-stripped-segment-validated", "example..com,direct", EntryDomain, "", true},
+		// 单次剥离语义锁定：尾段非动作词 → 取尾段（中间段动作词不参与，与 a.com,b.com,proxy 旧语义同构）
+		{"action-tail-middle-ignored", "example.com,direct,extra", EntryDomain, "extra", false},
+		// geoip 分支互涉锁定：direct/no-resolve 非两位国家码 → 噪声段 → 单国合法（行为与修复前一致）
+		{"geoip-clash-direct-tail", "geoip,CN,direct", EntryGeoIP, "CN", false},
+		{"geoip-clash-action-noise-multi", "geoip,cn,no-resolve,extra", EntryGeoIP, "CN", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

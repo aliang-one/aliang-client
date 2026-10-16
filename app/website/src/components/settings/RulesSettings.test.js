@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from 'vitest';
 // node 测试环境无 DOM）；本测试只测 sanitizeList 纯函数，mock 掉该依赖即可导入 SFC。
 vi.mock('../../i18n', () => ({ useI18n: () => ({ t: (k) => k }) }));
 
-import { sanitizeList, validateRuleEntry } from './RulesSettings.vue';
+import { detectGeoipCommaIssue, sanitizeList, validateRuleEntry } from './RulesSettings.vue';
 
 // 分词器以逗号/分号/换行切分 include 文本；geoip 多国条目（+ 分隔）必须原样穿过，
 // 否则 geoip:CN+HK+US 会被误拆（geoip 条目校验见 RulesSettings.vue validateRuleEntry）。
@@ -17,6 +17,8 @@ describe('RulesSettings sanitizeList', () => {
 // —— validateRuleEntry geoip 形态矩阵（对齐后端 processor/match ClassifyEntry）——
 // 红线：前端从不拒绝后端会接受的输入（geoip,CN,proxy 后端接受 → 必须过）；
 //      后端拒绝的逗号多国形态（geoip,CN,HK,proxy）→ 前端给出本地提示。
+// 文案分派：含逗号的整行只有 proxy_rules 面会走到本函数（include 面 sanitizeList
+// 先拆逗号、detectGeoipCommaIssue 拆分前拦截）→ 逗号多国断言用 proxy 面文案 key。
 const probe = (v) => validateRuleEntry(v, (k) => k);
 
 describe('RulesSettings validateRuleEntry geoip', () => {
@@ -27,9 +29,9 @@ describe('RulesSettings validateRuleEntry geoip', () => {
   });
 
   it('rejects comma multi-country form with + separator hint', () => {
-    expect(probe('geoip,CN,HK,proxy')).toBe('rules_geoipCommaMulti');
-    expect(probe('geoip,CN,HK')).toBe('rules_geoipCommaMulti');
-    expect(probe('geoip,CN,hk')).toBe('rules_geoipCommaMulti');
+    expect(probe('geoip,CN,HK,proxy')).toBe('rules_geoipCommaMultiProxy');
+    expect(probe('geoip,CN,HK')).toBe('rules_geoipCommaMultiProxy');
+    expect(probe('geoip,CN,hk')).toBe('rules_geoipCommaMultiProxy');
   });
 
   it('rejects bare geoip keyword and missing/invalid country code', () => {
@@ -41,7 +43,7 @@ describe('RulesSettings validateRuleEntry geoip', () => {
   it('keeps colon-style geoip matrix intact', () => {
     expect(probe('geoip:CN+HK+US')).toBe('');
     expect(probe('geoip:cn')).toBe('');
-    expect(probe('geoip:CN,HK')).toBe('rules_geoipCommaMulti');
+    expect(probe('geoip:CN,HK')).toBe('rules_geoipCommaMultiProxy');
     expect(probe('geoip:')).toBe('rules_geoipInvalid');
   });
 
@@ -50,5 +52,55 @@ describe('RulesSettings validateRuleEntry geoip', () => {
     expect(probe('ip-range,1.1.1.1-1.1.1.5')).toBe('');
     expect(probe('domain,example.com')).toBe('');
     expect(probe('DOMAIN-SUFFIX,example.com,proxy')).toBe('');
+  });
+});
+
+// —— 逗号兜底分支尾段动作词集合（对齐后端 processor/match legacyActionTail）——
+// 集合 = {proxy, direct, reject, no-resolve}（大小写不敏感，仅剥一层尾段）。
+// 红线：前端从不拒绝后端接受的输入，两边集合必须同步维护。
+describe('RulesSettings validateRuleEntry action tail', () => {
+  it('accepts direct/reject/no-resolve tails like proxy', () => {
+    expect(probe('example.com,direct')).toBe('');
+    expect(probe('example.com,REJECT')).toBe('');
+    expect(probe('example.com,no-resolve')).toBe('');
+    expect(probe('DOMAIN-SUFFIX,example.com,DIRECT')).toBe('');
+  });
+
+  it('validates the stripped segment, not the tail action word', () => {
+    // 剥离出 example..com（空标签）→ 报错；后端 ClassifyEntry("example..com,direct") 同样拒绝
+    expect(probe('example..com,direct')).toBe('rules_entryEmptyLabel');
+    // 单次剥离语义：尾段 extra 非动作词 → 校验尾段（中间段 direct 不参与）
+    expect(probe('example.com,direct,extra!')).toBe('rules_entryInvalidChars');
+  });
+
+  it('keeps geoip branch behavior unchanged (action tails are noise there)', () => {
+    expect(probe('geoip,CN,direct')).toBe('');
+    expect(probe('geoip,CN,no-resolve,extra')).toBe('');
+    expect(probe('geoip,CN,HK,direct')).toBe('rules_geoipCommaMultiProxy');
+  });
+
+  it('keeps legacy proxy and non-action tail semantics intact', () => {
+    expect(probe('a.com,b.com,proxy')).toBe('');
+    expect(probe('foo,bar')).toBe('');
+    expect(probe('example.com,proxy-server')).toBe('');
+  });
+});
+
+// —— geoip 逗号多国文案按输入面分派 ——
+// include 面（sanitizeList 按逗号拆分，真会拆坏）→ 拆分前扫描 detectGeoipCommaIssue
+// 用 rules_geoipCommaMulti；proxy_rules 面（按行拆分不拆坏，后端按格式拒绝）→
+// validateRuleEntry 逗号分支用 rules_geoipCommaMultiProxy（不带「拆坏」表述）。
+describe('RulesSettings geoip comma message facets', () => {
+  const t = (k) => k;
+
+  it('include-side pre-split scan keeps the broken-by-tokenizer wording', () => {
+    expect(detectGeoipCommaIssue('geoip:CN,HK', t)).toBe('rules_geoipCommaMulti');
+    expect(detectGeoipCommaIssue('geoip,CN,HK\na.com', t)).toBe('rules_geoipCommaMulti');
+    expect(detectGeoipCommaIssue('geoip:CN+HK\na.com', t)).toBe('');
+  });
+
+  it('proxy_rules-side entry validation uses the format-rejection wording', () => {
+    expect(probe('geoip,CN,HK,proxy')).toBe('rules_geoipCommaMultiProxy');
+    expect(probe('geoip:CN,HK')).toBe('rules_geoipCommaMultiProxy');
   });
 });
