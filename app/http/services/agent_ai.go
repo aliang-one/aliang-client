@@ -4928,6 +4928,15 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 		_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, err))
 		return agentAIRunDone, agentAIEffortRejection{}
 	}
+	// spawn 前探测上游可达性:56432 run service 运行态不持久化,core/owner
+	// 重启后可能无人拉起——不可达先自愈,仍失败则人话快速失败,替代 CLI 侧
+	// 10 次重试 3 分钟后的 error_during_execution(10-13/10-15 两次事故)。
+	if (tool.id == "claude" || tool.id == "claudecode") && !run.readOnly {
+		if err := ensureAIUpstreamReachableForRun(ctx); err != nil {
+			_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, err))
+			return agentAIRunDone, agentAIEffortRejection{}
+		}
+	}
 	// 该二进制已知不认 --effort(探针确证或上次运行学到):spawn 前直接去档
 	// 重解析,别让回合死在参数校验上(2026-09-29 事故:~/.local/bin claude 2.1.17)。
 	// 去档是静默降级,打一行日志让它可诊断(评审确认:探测抖动窗口内可能
