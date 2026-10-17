@@ -59,7 +59,10 @@ func parseSubagentFrontmatter(path, content string) (models.AgentSubagent, bool)
 }
 
 // collectSubagentsFromDir 枚举目录下 *.md(不递归),文件名字母序确定性排序,
-// 上限 subagentMaxCount 截断;目录缺失/为空返回 nil(载荷键省略语义)。
+// 上限 subagentMaxCount 截断。三态契约:目录缺失/不可读 → nil(hello 载荷
+// subagents:null,服务端视为未上报、保持旧值——非权威状态不得清空);目录
+// 存在但无有效定义 → 非 nil 空切片(载荷 [],服务端清空——「清空」与
+// 「未上报」由此区分,2026-10-16 服务端 normalizeAgentSubagents 同步定约)。
 func collectSubagentsFromDir(dir string) []models.AgentSubagent {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -89,13 +92,23 @@ func collectSubagentsFromDir(dir string) []models.AgentSubagent {
 		}
 		out = append(out, sub)
 	}
-	if len(out) == 0 {
-		return nil
-	}
 	return out
 }
 
-// collectUserSubagents 解析 ~/.claude/agents(用户域,fail-soft)。
+// subagentInventoryHome 是 collectUserSubagents 取 home 的注入点(测试替换)。
+// 测试 swap 期间不得有后台 hello 调用方;包内测试禁 t.Parallel(同
+// mcpInventoryHome 约定,见 agent_terminal_detach_test.go 说明)。
+var subagentInventoryHome = agentHome
+
+// collectUserSubagents 解析 ~/.claude/agents(用户域,fail-soft);home 不可得
+// 返回 nil(载荷 null→服务端保持旧值)——否则 filepath.Join("", …) 退化为
+// cwd 相对路径,进程 cwd 里恰有空 .claude/agents 目录时,非权威空清单会被
+// 当「显式清空」上报、抹掉云端既有数据(对齐 MCP 侧 agentMCPServersFor 的
+// 同款设防)。
 func collectUserSubagents() []models.AgentSubagent {
-	return collectSubagentsFromDir(filepath.Join(agentHome(), ".claude", "agents"))
+	home := subagentInventoryHome()
+	if home == "" {
+		return nil
+	}
+	return collectSubagentsFromDir(filepath.Join(home, ".claude", "agents"))
 }

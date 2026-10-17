@@ -30,9 +30,109 @@ const (
 	mcpURLQueryRedactMinLen = 24 // URL query 值超过此长度 → 打码
 )
 
+// mcpAuthHeaderNames 是凭据形态 header 参数的定向打码锚点名(纯 ASCII 小写:
+// "authorization" 同时覆盖 Proxy-Authorization,"api-key" 覆盖 X-Api-Key)。
+// mcp-remote 等认证配置的标准形态 `--header "Authorization: Bearer ntn_..."`
+// 恰好是「单元素含空白」——通用规则的白名单豁免挡不住它,必须定向拦截。
+var mcpAuthHeaderNames = []string{"authorization", "api-key"}
+
+// mcpKnownAuthSchemes 是打码时保留的已知 scheme 词(凭据主体前的认证方案名)。
+// 未知 scheme 一律视为凭据的一部分整体打码(宁可错杀)。
+var mcpKnownAuthSchemes = map[string]bool{
+	"bearer": true, "basic": true, "token": true, "digest": true,
+}
+
+// indexASCIIFold 返回 ASCII 子串 substr(须为小写)在 s 中的首个出现位置,
+// 比较仅对 ASCII 字母做大小写折叠。锚点定位不得用 strings.ToLower 的下标切
+// 原串:ToLower 对个别 Unicode rune 会改变字节长度(Ⱥ U+023A 2→3 字节扩张、
+// İ 2→1 收缩),下标错位轻则劈烂前缀、重则切片越界 panic 打死 hello 链路。
+func indexASCIIFold(s, substr string) int {
+	if substr == "" {
+		return 0
+	}
+	for i := 0; i+len(substr) <= len(s); i++ {
+		match := true
+		for j := 0; j < len(substr); j++ {
+			c := s[i+j]
+			if 'A' <= c && c <= 'Z' {
+				c += 'a' - 'A'
+			}
+			if c != substr[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return i
+		}
+	}
+	return -1
+}
+
+// findMCPAuthHeader 定位凭据 header 锚点:header 名之后允许空白与引号再接
+// 冒号(容忍 "Authorization :"、--header={"Authorization": "…"} 形态——形似
+// 凭据 header 即可疑);名字后跟其他字符(如 authorizations:)不构成锚点。
+// 返回冒号结束位置与是否 authorization 族(api-key 族无 scheme 语义)。
+func findMCPAuthHeader(token string) (colonEnd int, authorization bool, ok bool) {
+	for _, name := range mcpAuthHeaderNames {
+		for start := 0; start+len(name) <= len(token); {
+			i := indexASCIIFold(token[start:], name)
+			if i < 0 {
+				break
+			}
+			i += start
+			j := i + len(name)
+			for j < len(token) && (token[j] == ' ' || token[j] == '\t' || token[j] == '"') {
+				j++
+			}
+			if j < len(token) && token[j] == ':' {
+				return j + 1, name == "authorization", true
+			}
+			start = i + 1
+		}
+	}
+	return 0, false, false
+}
+
+// redactMCPAuthHeader 对含凭据 header 锚点的 argv 元素定向打码:保留「锚点前
+// 前缀(如 --header=)+ header 名 + 已知 scheme 词」,凭据主体替换为
+// <redacted:N>(N=原字节长)。不受长度阈值与空白豁免约束;自然语言里恰好出现
+// 锚点字样的参数会被误伤,可接受(形似凭据 header 即可疑)。
+// 第二返回值 false 表示该元素不含锚点,交由通用规则处理。
+func redactMCPAuthHeader(token string) (string, bool) {
+	colonEnd, authorization, ok := findMCPAuthHeader(token)
+	if !ok {
+		return "", false
+	}
+	prefix := token[:colonEnd]
+	rest := strings.TrimLeft(token[colonEnd:], " \t")
+	if rest == "" {
+		return prefix, true
+	}
+	scheme, cred := "", rest
+	if authorization {
+		if end := strings.IndexAny(rest, " \t"); end > 0 && mcpKnownAuthSchemes[strings.ToLower(rest[:end])] {
+			scheme = rest[:end]
+			cred = strings.TrimLeft(rest[end:], " \t")
+		}
+	}
+	masked := prefix
+	if scheme != "" {
+		masked += " " + scheme
+	}
+	if cred == "" {
+		return masked, true // 冒号/scheme 后无凭据:无内容可打码
+	}
+	return masked + " " + fmt.Sprintf("<redacted:%d>", len(cred)), true
+}
+
 // redactMCPToken 把疑似密钥形态的 argv token 打码——宁可错杀:MCP args 里
-// 带 API key 是常态,只有「短」或「含空白(自然语句)」才放行。
+// 带 API key 是常态,只有「短」或「不含凭据 header 锚点且含空白(自然语句)」
+// 才放行。
 func redactMCPToken(token string) string {
+	if masked, ok := redactMCPAuthHeader(token); ok {
+		return masked
+	}
 	if len(token) > mcpTokenRedactMinLen && !strings.ContainsAny(token, " \t") {
 		return fmt.Sprintf("<redacted:%d>", len(token))
 	}
@@ -71,10 +171,16 @@ func redactMCPCommand(argv []string) string {
 // redactMCPURL 打码 query 中超过阈值长度的值(键保留);userinfo 一律打码、
 // fragment 一律丢弃——非 query 形态的凭据同样不得外泄;整体按 UTF-16 码元
 // 截 512(对齐服务端 zod 长度语义)。
+// url.Parse 失败的畸形 URL fail-closed:无法可靠定位 userinfo/query/fragment
+// 边界(未转义空白/百分号、控制字符等形态),凭据可能藏在任何位置——整串
+// 替换为固定 <redacted-url>,宁可少报也不泄漏。
 func redactMCPURL(raw string) string {
 	raw = strings.TrimSpace(raw)
 	u, err := url.Parse(raw)
-	if err != nil || (u.RawQuery == "" && u.User == nil && u.Fragment == "") {
+	if err != nil {
+		return "<redacted-url>"
+	}
+	if u.RawQuery == "" && u.User == nil && u.Fragment == "" {
 		return utf16Truncate(truncateAgentText(raw, mcpURLMaxLen), mcpURLMaxLen)
 	}
 	if u.RawQuery != "" {
@@ -224,11 +330,13 @@ func claudeMCPServerInventoryIn(home string) ([]models.AgentMCPServer, []agentMC
 
 // codexMCPConfig 对应 ~/.codex/config.toml 的 [mcp_servers.<name>] 表。
 // Env 读取即弃:字段只是把 env 消化掉,值永不进入输出。
+// Enabled 对应官方 enabled 布尔「临时停用而不删配置」;nil=缺省=启用。
 type codexMCPConfig struct {
 	Command string                 `toml:"command"`
 	Args    []string               `toml:"args"`
 	URL     string                 `toml:"url"`
 	Env     map[string]interface{} `toml:"env"`
+	Enabled *bool                  `toml:"enabled"`
 }
 
 type codexConfigFile struct {
@@ -238,6 +346,8 @@ type codexConfigFile struct {
 // codexMCPServerInventoryIn 采集 ~/.codex/config.toml 的 MCP 清单。
 // command(+args)→ stdio;url → 统一归类 http(codex 配置不区分 sse/http);
 // 两者皆无的条目丢弃;url 与 command 并存时 url 优先(报 http);
+// enabled=false 的停用条目跳过(不占用数量上限额度——codex 自身不会启动
+// 停用的服务器,它不是可用设备能力);
 // 单条目类型不匹配(如 args 混入数字)会使整文件不可解码→归零——
 // codex 自身(serde 强类型)同样无法加载此类配置,语义对齐;
 // 畸形 TOML fail-soft 返回 nil。
@@ -266,6 +376,11 @@ func codexMCPServerInventoryIn(home string) ([]models.AgentMCPServer, []agentMCP
 			break
 		}
 		srv := cfg.MCPServers[name]
+		// 官方 enabled=false = 临时停用:codex 不会启动该服务器,
+		// 上报它会让云端能力清单虚增。额度判断前跳过,不占 24 条额度。
+		if srv.Enabled != nil && !*srv.Enabled {
+			continue
+		}
 		// 与 claude 解析器对齐:截断后空名(全空白键)跳过,
 		// 否则服务端 schema min(1) 会拒掉整个工具条目。
 		nm := truncateMCPName(name)
