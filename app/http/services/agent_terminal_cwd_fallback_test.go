@@ -172,15 +172,19 @@ func TestResolveAgentAICWDFallsBackToHomeWithoutProjects(t *testing.T) {
 	}
 }
 
-// ai.run keeps the guard on devices WITH projects, exactly like the terminal.
-func TestResolveAgentAICWDKeepsGuardWithProjects(t *testing.T) {
+// ai.run deliberately does NOT keep the terminal's authorized-list guard on
+// devices WITH projects: the discovery snapshot is a display cache, NOT an
+// execution ACL (2026-10-12 RCA — a project outside the scanned list could
+// never start a session from the phone). Any existing directory the user
+// names is accepted; only existence is enforced.
+func TestResolveAgentAICWDAcceptsOutsideListEvenWithProjects(t *testing.T) {
 	home := t.TempDir()
 	setAgentHomeDir(t, home)
 	root := t.TempDir()
 	setAgentAuthorizedExecutionDirectoriesCache([]string{root})
 	t.Cleanup(func() { setAgentAuthorizedExecutionDirectoriesCache(nil) })
 
-	if _, err := resolveAgentAICWD("~"); err == nil {
+	if _, err := resolveAgentAICWD("~"); err != nil {
 		t.Fatal("project path ~ outside authorized roots should still be rejected when projects exist")
 	}
 

@@ -7485,9 +7485,23 @@ func agentAIStringSliceContains(values []string, target string) bool {
 // the user names is creatable; existence + symlink resolution stay enforced
 // via cleanExistingAgentDirectory, and an empty path falls back to the user's
 // home (bc961e5 semantics). The terminal cwd keeps its own confinement
-// (resolveAgentAuthorizedCWD) — that surface is a separate decision.
+// (resolveAgentAuthorizedCWD) — that surface is a separate decision, which is
+// why this function deliberately does NOT route through
+// resolveAgentCWDFallbackHome: that helper degrades to an existence check only
+// when zero projects are synchronized and otherwise enforces the authorized
+// list — the exact ACL semantics this surface rejects (2026-10-16 merge fix:
+// the terminal-cwd branch briefly routed this through the guard, breaking
+// TestResolveAgentAICWDAcceptsExistingDirOutsideAuthorizedList).
 func resolveAgentAICWD(raw string) (string, error) {
-	return resolveAgentCWDFallbackHome(raw, "project path")
+	cwd := strings.TrimSpace(raw)
+	if cwd == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		cwd = home
+	}
+	return cleanExistingAgentDirectory(cwd)
 }
 
 // claudeRetryInfo captures the most-recent Claude stream-json
