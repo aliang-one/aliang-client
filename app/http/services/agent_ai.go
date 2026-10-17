@@ -7487,15 +7487,7 @@ func agentAIStringSliceContains(values []string, target string) bool {
 // home (bc961e5 semantics). The terminal cwd keeps its own confinement
 // (resolveAgentAuthorizedCWD) — that surface is a separate decision.
 func resolveAgentAICWD(raw string) (string, error) {
-	cwd := strings.TrimSpace(raw)
-	if cwd == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return "", err
-		}
-		cwd = home
-	}
-	return cleanExistingAgentDirectory(cwd)
+	return resolveAgentCWDFallbackHome(raw, "project path")
 }
 
 // claudeRetryInfo captures the most-recent Claude stream-json

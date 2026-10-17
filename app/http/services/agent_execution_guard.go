@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"aliang.one/nursorgate/common/cache"
+	"aliang.one/nursorgate/common/logger"
 )
 
 const (
@@ -255,6 +256,41 @@ func agentAuthorizedExecutionDirectories() []string {
 	}
 	agentAuthorizedDirsMu.Unlock()
 	return refreshAgentAuthorizedExecutionDirectories()
+}
+
+// resolveAgentCWDFallbackHome resolves a remote-execution working directory like
+// resolveAgentAuthorizedCWD, except that a device reporting zero synchronized
+// project directories degrades the guard to an existence check instead of
+// rejecting every request: the list is purely derived from session-transcript
+// scans, so a genuinely fresh machine is indistinguishable from one whose
+// transcripts were cleaned up (cleanupPeriodDays) or whose home drifted — on
+// those the old deny-all turned every remote terminal/AI create into a
+// millisecond rejection (2026-10-09 VM002 incident). Empty and ~-family cwds
+// fall back to agentHome() so "~" and "~/x" land in the same tree the spawned
+// shell's own ~ resolves to (agentTerminalEnv sets HOME=agentHome()).
+func resolveAgentCWDFallbackHome(raw string, label string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	authorized := agentAuthorizedExecutionDirectories()
+	if len(authorized) == 0 {
+		logger.Warn(fmt.Sprintf("[AGENT-BOOT] %s: no authorized project directories, guard degraded to existence-check", label))
+		home := agentHome()
+		if raw == "" || strings.HasPrefix(raw, "~") {
+			if home == "" {
+				return "", fmt.Errorf("%s is not authorized: no synchronized project directories and no resolvable home", label)
+			}
+			if raw == "" {
+				raw = home
+			} else {
+				// Same Join formula as runtimepath.ExpandHome, but anchored at
+				// agentHome(): under root/systemd $HOME is /root, so letting "~"
+				// use agentHome() while "~/x" expanded $HOME would split one
+				// input family across two trees.
+				raw = filepath.Join(home, raw[1:])
+			}
+		}
+		return cleanExistingAgentDirectory(raw)
+	}
+	return resolveAgentAuthorizedCWD(raw, label)
 }
 
 func refreshAgentAuthorizedExecutionDirectories() []string {
