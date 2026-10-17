@@ -3,6 +3,7 @@ package tcp
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -325,12 +326,22 @@ func TestHandle_MirrorsConfiguredTrafficEvenWhenRouteIsDirect(t *testing.T) {
 		gotStart := false
 		gotChunk := false
 		for _, body := range bodies {
-			s := string(body)
-			if strings.Contains(s, `"event_type":"flow_start"`) {
-				gotStart = true
+			var env struct {
+				Messages []struct {
+					EventType string `json:"event_type"`
+					Direction string `json:"direction"`
+				} `json:"messages"`
 			}
-			if strings.Contains(s, `"direction":"request"`) {
-				gotChunk = true
+			if err := json.Unmarshal(body, &env); err != nil {
+				continue
+			}
+			for _, m := range env.Messages {
+				if m.EventType == "flow_start" {
+					gotStart = true
+				}
+				if m.Direction == "request" {
+					gotChunk = true
+				}
 			}
 		}
 		mu.Unlock()
@@ -341,7 +352,10 @@ func TestHandle_MirrorsConfiguredTrafficEvenWhenRouteIsDirect(t *testing.T) {
 		case body := <-recvCh:
 			_ = body
 		case <-deadline:
-			t.Fatalf("expected mirrored flow_start and request chunk to be forwarded, got bodies=%d", len(bodies))
+			mu.Lock()
+			n := len(bodies)
+			mu.Unlock()
+			t.Fatalf("expected mirrored flow_start and request chunk to be forwarded, got bodies=%d", n)
 		}
 	}
 }
