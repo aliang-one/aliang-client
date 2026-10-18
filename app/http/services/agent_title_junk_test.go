@@ -86,6 +86,9 @@ func TestCollectClaudeVibeSessionsIndexJunkFirstPromptNotTitle(t *testing.T) {
 	raw, err := json.Marshal(index)
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(filepath.Join(projectDir, "sessions-index.json"), raw, 0o600))
+	// 索引通道存在性校验契约(2026-10-18):条目须有转录文件支撑。
+	writeIndexSupportTranscript(t, projectDir, "junk-fp-sid", projectPath)
+	writeIndexSupportTranscript(t, projectDir, "clean-sid", projectPath)
 
 	sessions := collectClaudeVibeSessions(nil)
 	junk := findCollectedSession(sessions, "junk-fp-sid")

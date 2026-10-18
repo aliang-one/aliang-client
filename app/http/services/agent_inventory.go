@@ -788,6 +788,14 @@ func collectClaudeVibeSessionsWithStats(scanDirs []string) ([]models.AgentVibeSe
 			if strings.TrimSpace(titleSource) == "" && !isJunkAgentTitle(entry.FirstPrompt) {
 				titleSource = entry.FirstPrompt
 			}
+			// 幽灵校验:CC 懒更新索引且 30 天清理会删光旧转录,残留条目的
+			// jsonl 可能早已不存在——上报这种幽灵会在手机端变成详情永远
+			// not found 的死卡片(2026-10-18 审计:本机 226/226 条目无 jsonl,
+			// 每次 hello 携带 ~35 个死会话)。转录文件与索引同目录,Stat 一次
+			// 即可拦截。
+			if _, err := os.Stat(filepath.Join(filepath.Dir(indexPath), entry.SessionID+".jsonl")); err != nil {
+				continue
+			}
 			session := models.AgentVibeSession{
 				ID:           "claude_" + entry.SessionID,
 				Provider:     "claude",
@@ -816,6 +824,13 @@ func collectClaudeVibeSessionsWithStats(scanDirs []string) ([]models.AgentVibeSe
 		}
 		session, updatedAtFromMtime := readClaudeSessionMetaWithOptions(path, agentVibeSessionReadOptions{Limit: agentVibeTranscriptMaxMessages, ScanDirs: scanDirs})
 		if session.ID == "" {
+			continue
+		}
+		// 残壳过滤:全程无可渲染消息的 jsonl(仅 harness 工件行,如 /clear
+		// 残留)Transcript 热窗为空——上报它们只会在手机上制造"计数非零但
+		// 点开无内容"的空会话(2026-10-18 审计实测 15 个 husk)。热窗虽只
+		// 保留尾部,但这类文件总共只有几行工件,空窗即全文件空。
+		if len(session.Transcript) == 0 {
 			continue
 		}
 		// Capture freshness for EVERY walked session — including ones already

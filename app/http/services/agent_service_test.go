@@ -3846,6 +3846,8 @@ func TestAgentHelloPayloadIncludesProjectsAndVibeSessionSummaries(t *testing.T) 
 	if err := os.WriteFile(filepath.Join(claudeDir, "sessions-index.json"), []byte(claudeIndex), 0o600); err != nil {
 		t.Fatalf("write claude index: %v", err)
 	}
+	// 索引通道存在性校验契约(2026-10-18):条目须有转录文件支撑。
+	writeIndexSupportTranscript(t, claudeDir, "claude-session-1", claudeProject)
 
 	service := NewAgentService()
 	payload := service.agentHelloPayload()
@@ -4312,6 +4314,9 @@ func TestAgentHelloPayloadSanitizesReportedVibeSessions(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(claudeDir, "sessions-index.json"), []byte(claudeIndex), 0o600); err != nil {
 		t.Fatalf("write claude index: %v", err)
 	}
+	// 索引通道存在性校验契约(2026-10-18):条目须有转录文件支撑
+	// (claude-root 走 isSafeAgentProjectPath 过滤,无需支撑)。
+	writeIndexSupportTranscript(t, claudeDir, "claude-long", projectPath)
 
 	service := NewAgentService()
 	payload := service.agentHelloPayload()

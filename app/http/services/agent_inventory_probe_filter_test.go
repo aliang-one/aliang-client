@@ -84,6 +84,9 @@ func TestCollectClaudeVibeSessionsSkipsProbeIndexEntry(t *testing.T) {
 		{"sessionId":"real-index-sid","firstPrompt":"修复tui","messageCount":9,"projectPath":"` + projectPath + `"}
 	]}`
 	require.NoError(t, os.WriteFile(filepath.Join(claudeDir, "sessions-index.json"), []byte(index), 0o600))
+	// 2026-10-18 起索引通道校验 <sid>.jsonl 存在性(幽灵拦截):真实条目
+	// 必须有转录文件支撑才会被采集。
+	writeClaudeTranscript(t, home, "real-index-sid", []string{"修复tui"})
 
 	sessions := collectClaudeVibeSessions(nil)
 	var ids []string

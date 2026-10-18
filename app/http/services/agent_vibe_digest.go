@@ -109,6 +109,27 @@ func agentVibeDigest(home string) string {
 		}
 	}
 
+	// Claude 索引由 CC 懒更新(生产曾 2026-08-24 起停更),索引指纹盖不住
+	// jsonl 追加——TUI 新消息若无 pid 状态翻转,原只能等 60s 周期兜底。
+	// 对采集范围内(与游走通道同 top-N)的转录文件做 path+mtime+size 指纹,
+	// 让 10s tick 直接感知正文落地(2026-10-18 审计 S1 延迟缺口)。
+	claudeFiles, _, _ := findRecentAgentFilesWithStats(
+		filepath.Join(home, ".claude", "projects"), "*.jsonl", agentVibeSessionFileScanLimit)
+	for _, sessionPath := range claudeFiles {
+		if strings.Contains(sessionPath, string(filepath.Separator)+"subagents"+string(filepath.Separator)) {
+			continue
+		}
+		info, err := os.Stat(sessionPath)
+		if err != nil {
+			continue
+		}
+		tuples = append(tuples, tuple{
+			id:    "claude_file_" + sessionPath,
+			ts:    info.ModTime().UTC().Format(time.RFC3339Nano),
+			extra: strconv.FormatInt(info.Size(), 10),
+		})
+	}
+
 	if len(tuples) == 0 {
 		return ""
 	}

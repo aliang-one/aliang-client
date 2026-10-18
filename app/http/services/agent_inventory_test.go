@@ -67,9 +67,12 @@ func TestCollectClaudeVibeSessionsAppliesRenameName(t *testing.T) {
 
 	const sid = "claude-rename-sid"
 	// Transcript whose first user message is a command preamble — the kind of
-	// junk title the previous derivation would surface.
+	// junk title the previous derivation would surface. 2026-10-18 起零可渲染
+	// 消息的残壳不再被采集,补一行真实消息让会话成立。
 	transcript := `{"timestamp":"2026-06-13T02:00:00Z","type":"user","cwd":"` + projectPath +
-		`","sessionId":"` + sid + `","gitBranch":"main","message":{"role":"user","content":[{"type":"text","text":"<local-command-caveat>junk preamble that should not be the title</local-command-caveat>"}]}}` + "\n"
+		`","sessionId":"` + sid + `","gitBranch":"main","message":{"role":"user","content":[{"type":"text","text":"<local-command-caveat>junk preamble that should not be the title</local-command-caveat>"}]}}` + "\n" +
+		`{"timestamp":"2026-06-13T02:01:00Z","type":"user","cwd":"` + projectPath +
+		`","sessionId":"` + sid + `","gitBranch":"main","message":{"role":"user","content":[{"type":"text","text":"real opening question"}]}}` + "\n"
 	require.NoError(t, os.WriteFile(filepath.Join(claudeDir, sid+".jsonl"), []byte(transcript), 0o600))
 
 	// No sessions-index.json in this fixture — the pid record is the rename source.
@@ -158,6 +161,9 @@ func TestCollectClaudeVibeSessionsPrefersIndexCustomTitle(t *testing.T) {
 		`"projectPath":"` + projectPath + `","isSidechain":false}]}`
 
 	require.NoError(t, os.WriteFile(filepath.Join(claudeDir, "sessions-index.json"), []byte(indexJSON), 0o600))
+	// 索引通道存在性校验契约:条目须有转录文件支撑。
+	writeIndexSupportTranscript(t, claudeDir, renamedSID, projectPath)
+	writeIndexSupportTranscript(t, claudeDir, derivedSID, projectPath)
 
 	sessions := collectClaudeVibeSessions(nil)
 	byID := make(map[string]models.AgentVibeSession, len(sessions))
@@ -199,6 +205,8 @@ func TestCollectClaudeVibeSessionsRenamePidRecordBeatsIndexCustomTitle(t *testin
 		`"messageCount":5,"created":"2026-06-18T00:00:00Z","modified":"2026-06-19T00:00:00Z","gitBranch":"main",` +
 		`"projectPath":"` + projectPath + `","isSidechain":false}]}`
 	require.NoError(t, os.WriteFile(filepath.Join(claudeDir, "sessions-index.json"), []byte(indexJSON), 0o600))
+	// 索引通道存在性校验契约:条目须有转录文件支撑。
+	writeIndexSupportTranscript(t, claudeDir, sid, projectPath)
 
 	require.NoError(t, os.MkdirAll(filepath.Join(home, ".claude", "sessions"), 0o700))
 	renameRecord := `{"pid":23456,"sessionId":"` + sid + `","cwd":"` + projectPath +

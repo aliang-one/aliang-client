@@ -93,3 +93,34 @@ func TestAgentVibeDigestDetectsChanges(t *testing.T) {
 		assert.Empty(t, agentVibeDigest(""))
 	})
 }
+
+// TestAgentVibeDigestDetectsJSONLAppend: Claude 索引由 CC 懒更新(生产曾
+// 2026-08-24 起停更),索引指纹盖不住 jsonl 追加——TUI 新消息若无 pid 状态
+// 翻转,原只能等 60s 周期兜底。jsonl 文件指纹(path+mtime+size)让 10s 指纹
+// tick 直接感知正文落地(2026-10-18 审计 S1 延迟缺口)。
+func TestAgentVibeDigestDetectsJSONLAppend(t *testing.T) {
+	home := digestFixtureHome(t)
+	dir := filepath.Join(home, ".claude", "projects")
+	// fixture 只建了 sessions-index.json;补一个真实转录文件。
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	require.NotEmpty(t, entries)
+	var projectDir string
+	for _, e := range entries {
+		if e.IsDir() {
+			projectDir = filepath.Join(dir, e.Name())
+			break
+		}
+	}
+	require.NotEmpty(t, projectDir, "digest fixture 必须含工程目录")
+	jsonlPath := filepath.Join(projectDir, "digest-jsonl-sid.jsonl")
+	require.NoError(t, os.WriteFile(jsonlPath, []byte(`{"timestamp":"2026-10-18T00:00:01Z","type":"user","message":{"role":"user","content":"first"}}
+`), 0o600))
+
+	before := agentVibeDigest(home)
+	require.NotEmpty(t, before)
+	require.NoError(t, os.WriteFile(jsonlPath, []byte(`{"timestamp":"2026-10-18T00:00:01Z","type":"user","message":{"role":"user","content":"first"}}
+{"timestamp":"2026-10-18T00:00:02Z","type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"reply"}]}}
+`), 0o600))
+	assert.NotEqual(t, before, agentVibeDigest(home), "jsonl 追加(mtime/size 变化)必须翻转指纹")
+}
