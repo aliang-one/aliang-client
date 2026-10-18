@@ -164,7 +164,14 @@ type AgentVibeSession struct {
 	Summary        string                   `json:"summary,omitempty"`
 	Mode           string                   `json:"mode,omitempty"`
 	Status         string                   `json:"status,omitempty"`
-	MessageCount   int                      `json:"message_count,omitempty"`
+	MessageCount int `json:"message_count,omitempty"`
+	// DisplayMessageCount is the number of messages a client can actually
+	// render. MessageCount remains the STABLE-ID index allocator (command and
+	// artifact rows consume index slots even though they are excluded from the
+	// transcript), so it is not a display count. Nil means "this path does not
+	// compute it" (e.g. the index-only channel) and the server falls back to
+	// MessageCount; a non-nil 0 is a KNOWN zero (command/artifact husk).
+	DisplayMessageCount *int `json:"display_message_count,omitempty"`
 	Branch         string                   `json:"branch,omitempty"`
 	Model          string                   `json:"model,omitempty"`
 	Transcript     []AgentVibeMessage       `json:"transcript,omitempty"`

@@ -177,7 +177,29 @@ func mergeActiveAgentVibeSession(existing models.AgentVibeSession, active models
 	if active.MessageCount == 0 {
 		active.MessageCount = existing.MessageCount
 	}
+	// 显示计数是"可渲染消息数",活跃快照通常不携带,回落到既有值,避免一次
+	// 活跃合并把已知的 0(残壳)抹成 nil(未知)。
+	if active.DisplayMessageCount == nil {
+		active.DisplayMessageCount = existing.DisplayMessageCount
+	}
 	return active
+}
+
+// propagateDisplayMessageCount copies a walked transcript reader's renderable-
+// message count onto the index-built entry with the same ID. The index pass
+// only knows MessageCount (command/artifact rows included) and leaves the
+// display field nil; without this backfill the server would still mistake a
+// husk for a session with history.
+func propagateDisplayMessageCount(sessions []models.AgentVibeSession, walked models.AgentVibeSession) {
+	if walked.DisplayMessageCount == nil {
+		return
+	}
+	for i := range sessions {
+		if sessions[i].ID == walked.ID {
+			sessions[i].DisplayMessageCount = walked.DisplayMessageCount
+			return
+		}
+	}
 }
 
 func upsertActiveAgentProject(projects []models.AgentProject, session models.AgentVibeSession) []models.AgentProject {
@@ -403,6 +425,9 @@ func collectCodexVibeSessions(scanDirs []string) []models.AgentVibeSession {
 		// hot window; otherwise every periodic summary reports 24 forever and
 		// PhoneServer never learns that the TUI appended more messages.
 		sessions[i].MessageCount = meta.MessageCount
+		// 索引行只有含工件行的 MessageCount;meta 由 transcript reader 产出,
+		// 其 DisplayMessageCount 才是手机可渲染数(残壳为 0)。
+		sessions[i].DisplayMessageCount = meta.DisplayMessageCount
 		if len(meta.Transcript) > 0 {
 			sessions[i].Transcript = meta.Transcript
 		}
@@ -497,6 +522,9 @@ func readCodexSessionMetaWithOptions(path string, options agentVibeSessionReadOp
 	if maxLineBytes <= 0 {
 		maxLineBytes = agentVibeJSONLMaxLineBytes
 	}
+	// 可渲染消息数:MessageCount 同时是稳定 ID 索引分配器,命令/工件行也占位,
+	// 不能直接当展示计数(system/developer 行恒被排除出 transcript)。
+	displayCount := 0
 	forEachAgentSessionJSONLLine(path, maxLineBytes, func(line []byte) bool {
 		var row struct {
 			Timestamp string `json:"timestamp"`
@@ -539,6 +567,7 @@ func readCodexSessionMetaWithOptions(path string, options agentVibeSessionReadOp
 			// 早就丢弃 system 行，远端 detail 报告对齐同一语义。
 			if msg.Role != "system" {
 				window.add(msg)
+				displayCount++
 			}
 		}
 		return true
@@ -549,6 +578,7 @@ func readCodexSessionMetaWithOptions(path string, options agentVibeSessionReadOp
 	if session.ID == "" {
 		return models.AgentVibeSession{}
 	}
+	session.DisplayMessageCount = &displayCount
 	session.Transcript, session.TranscriptPage = window.page(session.MessageCount, options.IncludePageMeta)
 	if !isSafeAgentProjectPath(session.ProjectPath) {
 		session.ProjectPath = ""
@@ -831,6 +861,10 @@ func collectClaudeVibeSessionsWithStats(scanDirs []string) ([]models.AgentVibeSe
 		// 点开无内容"的空会话(2026-10-18 审计实测 15 个 husk)。热窗虽只
 		// 保留尾部,但这类文件总共只有几行工件,空窗即全文件空。
 		if len(session.Transcript) == 0 {
+			// 即便是残壳,也要把 reader 的"已知 0"回灌给索引通道已入列的同一
+			// 会话——索引只知道 MessageCount(含命令行),否则服务端仍会把残壳
+			// 当成有历史的会话(2026-10-18 事故)。
+			propagateDisplayMessageCount(sessions, session)
 			continue
 		}
 		// Capture freshness for EVERY walked session — including ones already
@@ -857,6 +891,9 @@ func collectClaudeVibeSessionsWithStats(scanDirs []string) ([]models.AgentVibeSe
 			transcriptFreshness[strings.TrimPrefix(session.ID, "claude_")] = fresh
 		}
 		if seen[session.ID] {
+			// 索引通道已入列:reader 的显示计数比索引的 MessageCount 更准,
+			// 先回灌再跳过,避免同一会话被重复上报。
+			propagateDisplayMessageCount(sessions, session)
 			continue
 		}
 		sessions = append(sessions, session)
@@ -1166,6 +1203,9 @@ func readClaudeSessionMetaWithOptions(path string, options agentVibeSessionReadO
 	session.Status = "closed"
 	var firstUserPrompt string
 	userPromptCount := 0
+	// 可渲染消息数:MessageCount 同时承担稳定 ID 索引分配,命令/工件行也占位,
+	// 不是展示计数(见 Claude reader 内 "索引照旧自增" 注释)。
+	displayCount := 0
 	var lastMessageAt time.Time
 	// 早退（sidechain / ScanDirs 丢弃）必须整体返回空结构体：过滤点之后循环
 	// 后处理不能把已部分填充的 session 当有效会话放行。
@@ -1256,6 +1296,7 @@ func readClaudeSessionMetaWithOptions(path string, options agentVibeSessionReadO
 						Timestamp: normalizeAgentTime(row.Timestamp),
 						Index:     messageIndex,
 					})
+					displayCount++
 				}
 				if !commandRecord && !errorRecord {
 					// 活跃时间取最后一条真实消息的时间戳：TUI 开在提示符时 jsonl 仍会被
@@ -1295,6 +1336,7 @@ func readClaudeSessionMetaWithOptions(path string, options agentVibeSessionReadO
 	// 第二返回值:UpdatedAt 是否来自 mtime 兜底(transcript 没有可用的消息
 	// 时间戳,旧版 Claude Code 不写)。调用方用它给 freshness 打 provenance——
 	// mtime 只证明"文件被摸过",不配参与活跃推进(2026-10-15 事故家族)。
+	session.DisplayMessageCount = &displayCount
 	session.Transcript, session.TranscriptPage = window.page(session.MessageCount, options.IncludePageMeta)
 	if !lastMessageAt.IsZero() {
 		session.UpdatedAt = lastMessageAt.UTC().Format(time.RFC3339)

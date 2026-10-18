@@ -4230,6 +4230,12 @@ func TestReadClaudeSessionMetaExcludesToolResultArtifacts(t *testing.T) {
 	if session.MessageCount != 4 {
 		t.Fatalf("MessageCount = %d, want 4 (tool_result row still counted for ID stability)", session.MessageCount)
 	}
+	// MessageCount 是稳定 ID 索引分配器,不是展示计数。手机能渲染的只有 3 条;
+	// 若把 MessageCount 当展示数上报,页面就会"计数非零但点开只有 3 条"
+	// (2026-10-18 事故:服务端以为有历史,刷新成功却拿到空页)。
+	if session.DisplayMessageCount == nil || *session.DisplayMessageCount != 3 {
+		t.Fatalf("DisplayMessageCount = %v, want 3 (tool_result artifact not displayable)", session.DisplayMessageCount)
+	}
 	if session.Transcript[2].ID != stableAgentID("msg", "2026-06-14T01:03:00Z:3:Claude assistant after tool") {
 		t.Fatalf("post-tool assistant message ID drifted: %s", session.Transcript[2].ID)
 	}
@@ -4259,6 +4265,9 @@ func TestReadCodexSessionMetaWithOptionsPaginatesTranscript(t *testing.T) {
 	latest := readCodexSessionMetaWithOptions(sessionPath, agentVibeSessionReadOptions{Limit: 40, IncludePageMeta: true})
 	if latest.MessageCount != 60 {
 		t.Fatalf("latest MessageCount = %d, want 60", latest.MessageCount)
+	}
+	if latest.DisplayMessageCount == nil || *latest.DisplayMessageCount != 60 {
+		t.Fatalf("latest DisplayMessageCount = %v, want 60 (no artifacts in fixture)", latest.DisplayMessageCount)
 	}
 	if got := len(latest.Transcript); got != 40 {
 		t.Fatalf("latest transcript length = %d, want 40", got)
@@ -4457,6 +4466,38 @@ func TestSessionInvalidAgentStatesBlockBackgroundSync(t *testing.T) {
 
 func modelsAgentLaunchRequestForTest(commandLine string) models.AgentLaunchRequest {
 	return models.AgentLaunchRequest{CommandLine: commandLine}
+}
+
+func TestReadCodexSessionMetaSeparatesDisplayCountFromIndexCount(t *testing.T) {
+	dir := t.TempDir()
+	sessionPath := filepath.Join(dir, "codex-artifacts.jsonl")
+	codexID := "codex-artifact-session"
+	lines := []string{
+		`{"timestamp":"2026-06-13T00:00:00Z","type":"session_meta","payload":{"id":"` + codexID + `","cwd":"` + strings.ReplaceAll(dir, `\`, `\\`) + `","model":"gpt-5-codex","model_provider":"codex","git":{}}}`,
+		`{"timestamp":"2026-06-13T00:01:00Z","type":"message","payload":{"role":"user","content":[{"type":"text","text":"codex real question"}]}}`,
+		// developer 工件(codex 的 Developer context):只占索引位,不进 transcript。
+		`{"timestamp":"2026-06-13T00:02:00Z","type":"message","payload":{"role":"developer","content":[{"type":"text","text":"<permissions instructions>"}]}}`,
+		`{"timestamp":"2026-06-13T00:03:00Z","type":"message","payload":{"role":"assistant","content":[{"type":"text","text":"codex real answer"}]}}`,
+	}
+	if err := os.WriteFile(sessionPath, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatalf("write codex fixture: %v", err)
+	}
+
+	session := readCodexSessionMetaWithOptions(sessionPath, agentVibeSessionReadOptions{Limit: 10, IncludePageMeta: true})
+	if session.MessageCount != 3 {
+		t.Fatalf("MessageCount = %d, want 3 (developer row still counted for ID stability)", session.MessageCount)
+	}
+	if got := len(session.Transcript); got != 2 {
+		t.Fatalf("transcript length = %d, want 2 (developer excluded)", got)
+	}
+	for _, msg := range session.Transcript {
+		if msg.Role == "system" {
+			t.Fatalf("developer artifact leaked into transcript: %#v", msg)
+		}
+	}
+	if session.DisplayMessageCount == nil || *session.DisplayMessageCount != 2 {
+		t.Fatalf("DisplayMessageCount = %v, want 2 (developer artifact not displayable)", session.DisplayMessageCount)
+	}
 }
 
 func waitForAgentEvent(t *testing.T, mu *sync.Mutex, events *[]map[string]interface{}, eventType string, match func(map[string]interface{}) bool) map[string]interface{} {

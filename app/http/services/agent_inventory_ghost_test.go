@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"aliang.one/nursorgate/app/http/models"
 	"aliang.one/nursorgate/common/cache"
 )
 
@@ -143,4 +144,105 @@ func TestCollectClaudeVibeSessionsSkipsHuskWithoutRenderableMessages(t *testing.
 	ids := collectedClaudeIDs(t)
 	assert.NotContains(t, ids, "claude_husk-sid", "零可渲染消息的残壳会话不得进入上报快照")
 	assert.Contains(t, ids, "claude_real-sid", "正常会话不受残壳过滤影响")
+}
+
+func findCollectedClaudeSession(t *testing.T, id string) *models.AgentVibeSession {
+	t.Helper()
+	sessions, _ := collectClaudeVibeSessionsWithStats(nil)
+	for i := range sessions {
+		if sessions[i].ID == id {
+			return &sessions[i]
+		}
+	}
+	return nil
+}
+
+// 2026-10-18 事故回归:索引通道只知道 MessageCount(命令行/工件行也占位),
+// reader 才知道"手机可渲染几条"。残壳在索引里 messageCount 非零,若 reader
+// 的已知 0 不回灌,服务端会把残壳当有历史的会话——刷新成功却只有空页
+// (b6d5e509 / b9abc112 实锤)。
+func TestCollectClaudeVibeSessionsPropagatesKnownZeroDisplayCountForHusk(t *testing.T) {
+	dir, projectPath := ghostHuskFixtureHome(t)
+	index := map[string]interface{}{
+		"originalPath": projectPath,
+		"entries": []map[string]interface{}{
+			{
+				"sessionId":    "husk-sid",
+				"firstPrompt":  "husk conversation",
+				"messageCount": 5,
+				"modified":     "2026-10-18T00:00:00Z",
+			},
+		},
+	}
+	raw, err := json.Marshal(index)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "sessions-index.json"), raw, 0o600))
+
+	// 残壳:仅 harness 工件行,无可渲染消息。
+	ghostHuskWriteLines(t, filepath.Join(dir, "husk-sid.jsonl"), []string{
+		ghostHuskRow(t, "husk-sid", projectPath, "2026-10-18T00:00:01Z", "user",
+			[]map[string]interface{}{{"type": "text", "text": "<local-command-caveat>This command loads a skill.</local-command-caveat>"}},
+			map[string]interface{}{"isMeta": true}),
+		ghostHuskRow(t, "husk-sid", projectPath, "2026-10-18T00:00:02Z", "user",
+			[]map[string]interface{}{{"type": "text", "text": "<command-name>/clear</command-name>"}}, nil),
+	})
+
+	got := findCollectedClaudeSession(t, "claude_husk-sid")
+	require.NotNil(t, got, "索引通道已入列的残壳会话仍在上报快照里(本测试钉显示计数回灌)")
+	assert.Equal(t, 5, got.MessageCount, "MessageCount 保持索引口径(含工件行),不得被改写")
+	require.NotNil(t, got.DisplayMessageCount, "reader 的已知 0 必须回灌;nil 会让服务端回落到 MessageCount")
+	assert.Equal(t, 0, *got.DisplayMessageCount)
+}
+
+// 索引条目 + 真实转录:MessageCount 保持索引值,DisplayMessageCount 由 reader
+// 回灌(排除 tool_result 工件)。
+func TestCollectClaudeVibeSessionsBackfillsDisplayCountOnIndexEntry(t *testing.T) {
+	dir, projectPath := ghostHuskFixtureHome(t)
+	index := map[string]interface{}{
+		"originalPath": projectPath,
+		"entries": []map[string]interface{}{
+			{
+				"sessionId":    "sid-real",
+				"firstPrompt":  "real conversation",
+				"messageCount": 4,
+				"modified":     "2026-10-18T00:00:00Z",
+			},
+		},
+	}
+	raw, err := json.Marshal(index)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "sessions-index.json"), raw, 0o600))
+	ghostHuskWriteLines(t, filepath.Join(dir, "sid-real.jsonl"), []string{
+		ghostHuskRow(t, "sid-real", projectPath, "2026-10-18T00:00:01Z", "user", "real question", nil),
+		ghostHuskRow(t, "sid-real", projectPath, "2026-10-18T00:00:02Z", "assistant",
+			[]map[string]interface{}{{"type": "text", "text": "real answer"}}, nil),
+		ghostHuskRow(t, "sid-real", projectPath, "2026-10-18T00:00:03Z", "user",
+			[]map[string]interface{}{{"type": "tool_result", "content": "tool output"}}, nil),
+		ghostHuskRow(t, "sid-real", projectPath, "2026-10-18T00:00:04Z", "assistant",
+			[]map[string]interface{}{{"type": "text", "text": "after tool"}}, nil),
+	})
+
+	got := findCollectedClaudeSession(t, "claude_sid-real")
+	require.NotNil(t, got)
+	assert.Equal(t, 4, got.MessageCount)
+	require.NotNil(t, got.DisplayMessageCount)
+	assert.Equal(t, 3, *got.DisplayMessageCount, "tool_result 工件占索引位但不计入展示数")
+}
+
+// 活跃快照合并不得把已知 0 抹成 nil(未知)——否则一次转弯就会让残壳重新
+// "看起来有历史"。
+func TestMergeActiveAgentVibeSessionPreservesKnownZeroDisplayCount(t *testing.T) {
+	zero := 0
+	existing := models.AgentVibeSession{ID: "claude_sid", MessageCount: 5, DisplayMessageCount: &zero}
+	active := models.AgentVibeSession{ID: "claude_sid"}
+	merged := mergeActiveAgentVibeSession(existing, active)
+	require.NotNil(t, merged.DisplayMessageCount)
+	assert.Equal(t, 0, *merged.DisplayMessageCount)
+
+	// active 自带计数时不被 existing 覆盖。
+	two := 2
+	active.DisplayMessageCount = &two
+	merged = mergeActiveAgentVibeSession(existing, active)
+	require.NotNil(t, merged.DisplayMessageCount)
+	assert.Equal(t, 2, *merged.DisplayMessageCount)
 }
