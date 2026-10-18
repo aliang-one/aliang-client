@@ -398,11 +398,13 @@ func collectCodexVibeSessions(scanDirs []string) []models.AgentVibeSession {
 		sessions[i].ProjectPath = firstNonEmpty(sessions[i].ProjectPath, meta.ProjectPath)
 		sessions[i].Branch = firstNonEmpty(sessions[i].Branch, meta.Branch)
 		sessions[i].Model = firstNonEmpty(sessions[i].Model, meta.Model)
+		// The session index carries title/time only. Preserve the reader's
+		// cumulative count even though the transcript itself is capped to the
+		// hot window; otherwise every periodic summary reports 24 forever and
+		// PhoneServer never learns that the TUI appended more messages.
+		sessions[i].MessageCount = meta.MessageCount
 		if len(meta.Transcript) > 0 {
 			sessions[i].Transcript = meta.Transcript
-			if sessions[i].MessageCount == 0 {
-				sessions[i].MessageCount = len(meta.Transcript)
-			}
 		}
 		sessions[i].CreatedAt = firstNonEmpty(sessions[i].CreatedAt, meta.CreatedAt)
 		sessions[i].UpdatedAt = firstNonEmpty(sessions[i].UpdatedAt, meta.UpdatedAt)

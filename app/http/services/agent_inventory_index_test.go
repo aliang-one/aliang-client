@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"aliang.one/nursorgate/app/http/models"
 	"aliang.one/nursorgate/common/cache"
 )
 
@@ -28,6 +29,33 @@ func TestFindRecentCodexSessionFilesUsesRolloutTimestamp(t *testing.T) {
 	files := findRecentCodexSessionFiles(root, 1)
 	require.Len(t, files, 1)
 	assert.Equal(t, new, files[0])
+}
+
+func TestCollectCodexVibeSessionsPreservesCumulativeMessageCount(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	cache.ResetCacheDirForTest()
+
+	sessionsDir := filepath.Join(home, ".codex", "sessions", "2026", "10", "18")
+	require.NoError(t, os.MkdirAll(sessionsDir, 0o700))
+	path := filepath.Join(sessionsDir, "rollout-2026-10-18T00-00-00-sid-count.jsonl")
+	lines := []string{`{"timestamp":"2026-10-18T00:00:00Z","type":"session_meta","payload":{"id":"sid-count","cwd":"/tmp/project"}}`}
+	for i := 0; i < agentVibeTranscriptMaxMessages+6; i++ {
+		lines = append(lines, fmt.Sprintf(`{"timestamp":"2026-10-18T00:00:%02dZ","type":"message","payload":{"role":"user","content":"message-%d"}}`, i+1, i))
+	}
+	require.NoError(t, os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600))
+
+	sessions := collectCodexVibeSessions(nil)
+	var found *models.AgentVibeSession
+	for i := range sessions {
+		if sessions[i].ID == "codex_sid-count" {
+			found = &sessions[i]
+			break
+		}
+	}
+	require.NotNil(t, found)
+	assert.Equal(t, agentVibeTranscriptMaxMessages+6, found.MessageCount)
 }
 
 // TestCollectClaudeVibeSessionsReadsEveryProjectIndex is the deterministic

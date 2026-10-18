@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -86,6 +87,26 @@ func agentVibeDigest(home string) string {
 			title: entry.Name,
 			ts:    entry.UpdatedAt,
 		})
+	}
+
+	// Codex TUI conversations do not update the Claude indexes above. Fingerprint
+	// the recent rollout files by path, mtime, and size so an append from the
+	// desktop TUI triggers the same near-real-time hello refresh.
+	for _, root := range []string{
+		filepath.Join(home, ".codex", "sessions"),
+		filepath.Join(home, ".codex", "archived_sessions"),
+	} {
+		for _, sessionPath := range findRecentCodexSessionFiles(root, agentVibeSessionFileScanLimit) {
+			info, err := os.Stat(sessionPath)
+			if err != nil {
+				continue
+			}
+			tuples = append(tuples, tuple{
+				id:    "codex_file_" + sessionPath,
+				ts:    info.ModTime().UTC().Format(time.RFC3339Nano),
+				extra: strconv.FormatInt(info.Size(), 10),
+			})
+		}
 	}
 
 	if len(tuples) == 0 {
