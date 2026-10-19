@@ -382,7 +382,11 @@ func (m *agentAIManager) runTUITurn(ctx context.Context, session *agentAISession
 		return
 	}
 	if runCtx.Err() != nil {
-		return // 注入期间被 stop
+		// 注入期间（含上面 held 观测窗口内）被 stop。停止信号由 defer 发，但
+		// ai.status(stopping) 必须在这里补——裸 return 会让手机只看到信号、
+		// 看不到状态，UI 卡在「执行中」。
+		_ = write(map[string]any{"type": models.AgentEventAIStatus, "session_id": session.id, "status": "stopping"})
+		return
 	}
 
 	// 4) tail 桥 + 完成判定。

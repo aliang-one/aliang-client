@@ -453,3 +453,180 @@ func waitFor(t *testing.T, cond func() bool) {
 	}
 	t.Fatal("condition not met within 5s")
 }
+
+// TestRunUserMessageRoutesToTUIWhenIdle 锁死接线：TUI 空闲时 runUserMessage 必须
+// 改走注入，而不是 spawn。注入被观测为「往 socket 写了帧」+「发出 executor=tui 的
+// ai.run.started」。
+func TestRunUserMessageRoutesToTUIWhenIdle(t *testing.T) {
+	_ = stubExternalInterrupt(t, nil)
+	pid := os.Getpid()
+	origPoll := tuiTurnPollInterval
+	tuiTurnPollInterval = 20 * time.Millisecond
+	defer func() { tuiTurnPollInterval = origPoll }()
+
+	home := t.TempDir()
+	sock := ccPeerShortSocketPath(t)
+	frames := make(chan string, 8)
+	startFakeTUI(t, sock, frames, func(content string) {
+		path := transcriptFixturePath(home, "sess-1")
+		appendTranscriptLine(t, path, `{"type":"user","uuid":"echo","isMeta":false,"message":{"role":"user","content":`+jsonString(content)+`}}`)
+		appendTranscriptLine(t, path, `{"type":"assistant","uuid":"a1","apiBlockIndex":0,"message":{"content":[{"type":"text","text":`+jsonString("收到："+content)+`}]}}`)
+	})
+	writeClaudePidRecord(t, home, "sess-1", pid, "idle", sock)
+	writeTranscriptFixture(t, home, "sess-1")
+
+	t.Setenv("HOME", home) // agentHome()/externalTUIHome() 读 HOME
+
+	m := newAgentAIManager()
+	var mu sync.Mutex
+	var events []map[string]any
+	write := func(v any) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if p, ok := v.(map[string]any); ok {
+			events = append(events, p)
+		}
+		return nil
+	}
+	session := &agentAISession{
+		id: "sess-1", projectPath: t.TempDir(), provider: "claude",
+		resumeSessionID: "sess-1", mode: "vibe",
+	}
+	m.registerAISessionLocked(session)
+	emitter := m.runEmitter(agentAIRun{runID: "run-route", sessionID: "sess-1", messageID: "m-route"}, write)
+
+	// 直接走 runUserMessage（message()/runStart() 都汇入这里，一处接线全覆盖）。
+	if err := m.runUserMessage(session, "run-route", "m-route", "手机消息", "claude", nil, emitter, nil); err != nil {
+		t.Fatalf("runUserMessage error = %v", err)
+	}
+
+	// 注入了帧
+	select {
+	case frame := <-frames:
+		if !strings.Contains(frame, "手机消息") {
+			t.Fatalf("注入帧缺少用户内容: %s", frame)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("未注入任何帧——路由没走到 TUI 执行器")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(events) == 0 {
+		t.Fatal("未发出任何事件")
+	}
+	if events[0]["type"] != "ai.run.started" || events[0]["executor"] != "tui" {
+		t.Fatalf("首个事件 = %v, want ai.run.started/executor=tui", events[0])
+	}
+}
+
+// TestRunUserMessageFallsBackToSpawnWithoutTUI 锁死反向：没有 TUI 记录时路由必须
+// 返回 nil，runUserMessage 仍走 spawn 路径（这里以必然失败的 spawn 观测——错误
+// 来自 spawn 层，而非 tui_* 错误码）。
+func TestRunUserMessageFallsBackToSpawnWithoutTUI(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home) // 无 pid record → 路由必然不命中
+
+	m := newAgentAIManager()
+	var events []map[string]any
+	write := func(v any) error {
+		if p, ok := v.(map[string]any); ok {
+			events = append(events, p)
+		}
+		return nil
+	}
+	session := &agentAISession{
+		id: "sess-1", projectPath: t.TempDir(), provider: "claude",
+		resumeSessionID: "sess-1", mode: "vibe",
+	}
+	m.registerAISessionLocked(session)
+	emitter := m.runEmitter(agentAIRun{runID: "run-spawn", sessionID: "sess-1", messageID: "m-spawn"}, write)
+
+	// provider=claude 但 PATH 里没有 claude CLI（测试环境）→ spawn 层报错。
+	err := m.runUserMessage(session, "run-spawn", "m-spawn", "hello", "claude", nil, emitter, nil)
+	if err != nil {
+		t.Fatalf("runUserMessage error = %v", err)
+	}
+	for _, e := range events {
+		if code, ok := e["error_code"].(string); ok && strings.HasPrefix(code, "tui_") {
+			t.Fatalf("无 TUI 时却走了 TUI 路径（error_code=%s）", code)
+		}
+		if e["executor"] == "tui" {
+			t.Fatal("无 TUI 时却标了 executor=tui")
+		}
+	}
+}
+
+// TestRunTUITurnStopSignalsTUIOnce 锁死停止语义：ai.stop 取消 ctx 时必须
+// ① 对 TUI pid 恰好发一次 SIGINT（=一次 Esc，TUI 保持打开）
+// ② 发出 ai.status(stopping) ③ 清理 session 占用，后续回合可跑。
+func TestRunTUITurnStopSignalsTUIOnce(t *testing.T) {
+	// stub 同时替换信号与身份门，并清空去抖表；lastStubbedPid 记录被信号的 pid。
+	lastPid := stubExternalInterrupt(t, nil)
+	pid := os.Getpid() // ⚠️ lastStubbedPid 不是 pid 来源（信号未调用时恒 0）
+
+	home := t.TempDir()
+	sock := ccPeerShortSocketPath(t)
+	startFakeTUI(t, sock, make(chan string, 4), func(string) {}) // 只收帧，不写 transcript
+	writeClaudePidRecord(t, home, "sess-1", pid, "idle", sock)
+	jsonl := writeTranscriptFixture(t, home, "sess-1")
+
+	m := newAgentAIManager()
+	var mu sync.Mutex
+	var events []map[string]any
+	write := func(v any) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if p, ok := v.(map[string]any); ok {
+			events = append(events, p)
+		}
+		return nil
+	}
+	session := &agentAISession{id: "sess-1", projectPath: t.TempDir(), provider: "claude", resumeSessionID: "sess-1"}
+	m.registerAISessionLocked(session)
+	emitter := m.runEmitter(agentAIRun{runID: "r", sessionID: "sess-1", messageID: "m"}, write)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		m.runTUITurn(ctx, session, agentAIRun{
+			runID: "r", sessionID: "sess-1", messageID: "m",
+			projectPath: session.projectPath, provider: "claude", resumeSessionID: "sess-1",
+		}, "x", &tuiTurnPlan{
+			Home: home, NativeSessionID: "sess-1", SocketPath: sock, PID: pid,
+			JSONLPath: jsonl, JSONLOffset: mustSize(t, jsonl),
+		}, emitter)
+	}()
+	// 等到 started 发出后停止（events 有 mutex 保护，安全跨 goroutine 读）
+	waitFor(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(events) > 0
+	})
+	cancel()
+	<-done
+
+	// 恰好一次 SIGINT，且打在我们记录的 TUI pid 上
+	if got := lastStubbedPid(lastPid); got != pid {
+		t.Fatalf("SIGINT pid = %d, want %d（恰好一次，且是 TUI 的 pid）", got, pid)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	sawStopping := false
+	for _, e := range events {
+		if e["type"] == "ai.status" && e["status"] == "stopping" {
+			sawStopping = true
+		}
+	}
+	if !sawStopping {
+		t.Fatal("未发出 ai.status(stopping)")
+	}
+	// session 占用已清理，后续回合可跑
+	m.mu.Lock()
+	busy := session.cancel != nil
+	m.mu.Unlock()
+	if busy {
+		t.Fatal("session.cancel 未清理")
+	}
+}

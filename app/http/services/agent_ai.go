@@ -2212,6 +2212,33 @@ func (m *agentAIManager) runUserMessage(session *agentAISession, runID, messageI
 	}
 	m.mu.Unlock()
 
+	// TUI 执行路由（spec §4.1）：原生 TUI 开着且空闲时，把这一回合送进那个 TUI
+	// 执行——TUI 与手机天然共享上下文、同看一次对话，TUI 自动更新。
+	//
+	// 三个不变量：
+	//   ① 判定发生在任何 provider 进程/spawn 状态之前；
+	//   ② 注入失败不回退 spawn（spec §4.5）——一次回合只走一条路；
+	//   ③ 释放本函数前段为 spawn 准备的 ctx，避免悬挂 goroutine。
+	//
+	// 位置刻意选在 ensurePolicyBeforeRun / startAIWatchdog / runCLI 之前：前者是
+	// spawn 路径的策略同步（注入回合用 TUI 自己的权限模式），中者的 watchdog 会因
+	// TUI 回合没有子进程 stdout 而误判 idle 超时。
+	if plan := tuiTurnDecide(tuiTurnInput{
+		Home:            externalTUIHome(),
+		Provider:        provider,
+		NativeSessionID: run.resumeSessionID,
+		ReadOnly:        run.readOnly,
+		HasGoalIdentity: len(run.goalIdentity) > 0,
+		JSONLPath:       ccPeerSessionJSONL(externalTUIHome(), run.resumeSessionID),
+	}); plan != nil {
+		// 释放 spawn 路径预建的 ctx（执行器自建 runCtx，不再用这个）。
+		cancel()
+		// 传原始 content 而非 run.prompt（后者被 buildAgentAIPrompt 包装过）；
+		// 附件走 run.attachments，由执行器拼进注入文本。
+		go m.runTUITurn(context.Background(), session, run, content, plan, emitter)
+		return nil
+	}
+
 	// Best-effort sync of the device approval policy before the run starts, so a
 	// just-changed policy (or a fresh process with only the built-in default)
 	// picks up the current rules. Never blocks beyond a short timeout or errors
