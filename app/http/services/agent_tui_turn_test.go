@@ -1,6 +1,15 @@
 package services
 
-import "testing"
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"testing"
+
+	"aliang.one/nursorgate/common/logger"
+)
 
 func TestTUITurnErrorCodes(t *testing.T) {
 	cases := []struct {
@@ -36,5 +45,134 @@ func TestAgentAIErrorPayloadCarriesTUITurnCode(t *testing.T) {
 	}
 	if payload["error_code"] != agentTUIErrInjectFailed {
 		t.Fatalf("error_code = %v, want %q", payload["error_code"], agentTUIErrInjectFailed)
+	}
+}
+
+func TestTUITurnDecideGates(t *testing.T) {
+	// 身份门 stub（真实 ps 探测在测试环境不可控）；信号 stub 顺带清空去抖表。
+	// ⚠️ lastStubbedPid 只在信号真被调用后才非零——它不是 pid 来源！
+	// pid 必须取 os.Getpid()：isPidAlive 不可覆写，死 pid 会让所有用例恒 not-live。
+	_ = stubExternalInterrupt(t, nil)
+	pid := os.Getpid()
+
+	// freshHome 为每个 case 造一份独立 home。共用 home 会被后续 case 的
+	// writeClaudePidRecord 覆写同一个 <pid>.json，让早先的断言读到被污染的状态。
+	freshHome := func(t *testing.T, status, socket string) (tuiTurnInput, string) {
+		t.Helper()
+		home := t.TempDir()
+		writeClaudePidRecord(t, home, "sess-1", pid, status, socket)
+		return tuiTurnInput{
+			Home: home, Provider: "claude", NativeSessionID: "sess-1",
+			JSONLPath: writeTranscriptFixture(t, home, "sess-1"),
+		}, home
+	}
+
+	// 全部满足 → 有 plan
+	base, _ := freshHome(t, "idle", "/tmp/fake-inbox.sock")
+	if plan := tuiTurnDecide(base); plan == nil {
+		t.Fatal("全部条件满足时应返回 plan")
+	}
+
+	// provider 非 claude
+	p := base
+	p.Provider = "codex"
+	if plan := tuiTurnDecide(p); plan != nil {
+		t.Fatal("codex 不应注入")
+	}
+	// auto 允许（imported session 默认值）
+	p = base
+	p.Provider = "auto"
+	if plan := tuiTurnDecide(p); plan == nil {
+		t.Fatal("auto 应允许")
+	}
+	// 无 native id
+	p = base
+	p.NativeSessionID = ""
+	if plan := tuiTurnDecide(p); plan != nil {
+		t.Fatal("fresh spawn 不应注入")
+	}
+	// readOnly
+	p = base
+	p.ReadOnly = true
+	if plan := tuiTurnDecide(p); plan != nil {
+		t.Fatal("readOnly 不应注入")
+	}
+	// goal 回合
+	p = base
+	p.HasGoalIdentity = true
+	if plan := tuiTurnDecide(p); plan != nil {
+		t.Fatal("goal 回合不应注入")
+	}
+	// busy
+	busy, _ := freshHome(t, "busy", "/tmp/fake-inbox.sock")
+	if plan := tuiTurnDecide(busy); plan != nil {
+		t.Fatal("busy 不应注入")
+	}
+	// 无 socket
+	noSock, _ := freshHome(t, "idle", "")
+	if plan := tuiTurnDecide(noSock); plan != nil {
+		t.Fatal("无 socket 不应注入")
+	}
+	// record 不存在
+	if plan := tuiTurnDecide(tuiTurnInput{Home: base.Home, Provider: "claude", NativeSessionID: "nope", JSONLPath: base.JSONLPath}); plan != nil {
+		t.Fatal("无记录不应注入")
+	}
+}
+
+// writeClaudePidRecord 写 ~/.claude/sessions/<pid>.json，形状对齐真实 CC 记录
+// （loadClaudeRenameRecords 只 glob "*.json"，键名必须与之一致）。
+func writeClaudePidRecord(t *testing.T, home, sessionID string, pid int, status, socket string) {
+	t.Helper()
+	dir := filepath.Join(home, ".claude", "sessions")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	row := map[string]any{"sessionId": sessionID, "pid": pid, "status": status, "messagingSocketPath": socket}
+	b, err := json.Marshal(row)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, strconv.Itoa(pid)+".json"), b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// transcriptFixtureDir 是 fixture 统一使用的 project 目录名。fake TUI 追加行时
+// 必须用同一个目录，否则会写进一个不存在的目录。
+const transcriptFixtureDir = "-tmp-proj"
+
+// transcriptFixturePath 返回 ~/.claude/projects/<transcriptFixtureDir>/<id>.jsonl。
+func transcriptFixturePath(home, sessionID string) string {
+	return filepath.Join(home, ".claude", "projects", transcriptFixtureDir, sessionID+".jsonl")
+}
+
+// writeTranscriptFixture 写 fixture transcript，含一条 user 行让 tail 桥有起点
+// （ccPeerSessionJSONL 依赖该布局）。
+func writeTranscriptFixture(t *testing.T, home, sessionID string) string {
+	t.Helper()
+	path := transcriptFixturePath(home, sessionID)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	row := `{"type":"user","uuid":"u-1","isSidechain":false,"isMeta":false,"message":{"role":"user","content":"hi"}}` + "\n"
+	if err := os.WriteFile(path, []byte(row), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// appendTranscriptLine 追加一行到 fixture transcript。**禁止 t.Fatal**：它会被
+// fake TUI 的 accept goroutine 调用，在非测试 goroutine 里 Fatal 是 Go testing
+// 违规（直接让整个进程退出，且不报告是哪个用例失败）。错误只记日志。
+func appendTranscriptLine(t *testing.T, path, line string) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0o600)
+	if err != nil {
+		logger.Info(fmt.Sprintf("test fixture append failed path=%s error=%v", path, err))
+		return
+	}
+	defer f.Close()
+	if _, err := f.WriteString(line + "\n"); err != nil {
+		logger.Info(fmt.Sprintf("test fixture write failed path=%s error=%v", path, err))
 	}
 }
