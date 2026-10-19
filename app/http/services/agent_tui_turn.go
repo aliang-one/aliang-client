@@ -2,9 +2,17 @@ package services
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"os"
+	"strconv"
 	"strings"
+	"time"
+
+	"aliang.one/nursorgate/app/http/models"
+	"aliang.one/nursorgate/common/logger"
 )
 
 // TUI 执行回合的机器可读错误码。与 agentExternalTUIBusyError 同构：实现
@@ -299,4 +307,317 @@ func toolUseTouchedPaths(blocks []transcriptBlock) []string {
 		out = append(out, fp)
 	}
 	return out
+}
+
+// tuiTurnPollInterval 是 tail 桥的轮询间隔。可经测试覆写。
+var tuiTurnPollInterval = 200 * time.Millisecond
+
+// tuiTurnQuietRounds 是判定「回合已安静结束」所需的连续无新 assistant 行的
+// 轮询次数。CC 写完最后一个块到把 pid record 翻成 idle 之间有短暂窗口。
+var tuiTurnQuietRounds = 3
+
+// tuiTurnCeiling 是注入回合的全局上限。没有它，一个永不回显也永不结束的注入
+// （TUI 卡死 / transcript 不写 / 判定条件永不满足）会让这个 goroutine 永久占着
+// session.cancel，该会话此后再也无法发起回合。兜底必须有。
+var tuiTurnCeiling = 30 * time.Minute
+
+// runTUITurn 把一个手机回合注入目标 TUI 执行，并 tail transcript 合成 run
+// 生命周期回传手机（spec §4.3）。ctx 取消 = ai.stop。
+//
+// content 是用户的原始文本——不是 run.prompt（那是 buildAgentAIPrompt 包装过
+// 的，带会话前缀与全量历史）。附件从 run.attachments 取：spawn 路径由
+// withAgentAIAttachments 拼进 prompt，注入路径必须在这里自己拼。
+//
+// 失败不回退 spawn：一次回合只走一条路（spec §4.5）。注入失败以 ai.error 收尾，
+// 由服务端决定重试。
+func (m *agentAIManager) runTUITurn(ctx context.Context, session *agentAISession, run agentAIRun, content string, plan *tuiTurnPlan, emitter *agentAIRunEmitter) {
+	write := agentTerminalWriter(emitter.emit)
+	fail := func(code, msg string) {
+		logger.Info(fmt.Sprintf("ai.tui.turn: %s session=%s native=%s", code, session.id, plan.NativeSessionID))
+		_ = write(agentAIErrorPayload(session.id, run.messageID, newAgentTUITurnError(code, msg)))
+	}
+	assistantMsgID := agentAssistantMessageID(run.messageID)
+
+	// 1) 登记：与 spawn 路径同一组字段，使 stop()/审批通道/LRU 无需改动即可工作。
+	runCtx, cancel := context.WithCancel(ctx)
+	activity := newAgentAIActivity()
+	m.mu.Lock()
+	session.cancel = cancel
+	session.activeWriter = write
+	session.activity = activity
+	session.runSeq++
+	session.activeRunID = run.runID
+	run.runSeq = session.runSeq
+	session.history = append(session.history, agentAIMessage{
+		Role: "user", MessageID: run.messageID, Content: content, CreatedAt: time.Now().UTC(),
+	})
+	m.mu.Unlock()
+	defer m.clearTUITurnSessionState(session)
+	// 停止语义：ctx 取消时对 TUI pid 发一次 SIGINT（=一次 Esc，TUI 保持打开）。
+	defer func() {
+		if runCtx.Err() != nil {
+			interruptExternalClaudeTurn(plan.Home, plan.NativeSessionID)
+		}
+	}()
+
+	// 2) ai.run.started。executor=tui 让手机 UI 区分执行通道（该回合的审批在
+	// 终端内完成、账号模型用 TUI 自己的）。
+	_ = write(map[string]any{
+		"type": models.AgentEventAIRunStarted, "session_id": session.id,
+		"message_id": assistantMsgID, "provider": run.provider,
+		"mode": run.mode, "project_path": run.projectPath,
+		"state": "running", "executor": "tui",
+	})
+
+	// 3) 注入。内容 = 原始用户文本 + 附件清单（与 spawn 路径等价）。
+	// 走 ccPeerDialInject 旋钮（与 tuiSync 一致），测试才能拦截注入动作。
+	injectText := content + agentAIAttachmentPromptSuffix(run.attachments, true)
+	if err := ccPeerDialInject(plan.SocketPath, plan.PeerToken, injectText, plan.FromMode); err != nil {
+		fail(agentTUIErrInjectFailed, "无法把消息送进终端会话")
+		return
+	}
+	// held 检测：bypass 门会静默扣留且不弹任何提示，transcript 是唯一观测点。
+	if ccPeerWatchHeld(plan.JSONLPath, plan.JSONLOffset, ccPeerHeldWatchWindow) {
+		fail(agentTUIErrHeld, "终端会话拒绝了这条消息，请在终端中处理")
+		return
+	}
+	if runCtx.Err() != nil {
+		return // 注入期间被 stop
+	}
+
+	// 4) tail 桥 + 完成判定。
+	m.startAIWatchdog(runCtx, activity, cancel)
+	// 进度心跳：TUI 长时间思考时手机需要「仍活着」的信号，否则服务端 10 分钟
+	// 安静 sweeper 会把回合打翻成 timed out（与 spawn 两条路径同间隔）。
+	progressStop := make(chan struct{})
+	defer close(progressStop)
+	go func() {
+		ticker := time.NewTicker(agentAIRunProgressInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-progressStop:
+				return
+			case <-ticker.C:
+				_ = write(map[string]any{
+					"type":              models.AgentEventAIRunProgress,
+					"session_id":        session.id,
+					"message_id":        assistantMsgID,
+					"git_changed_count": countGitChanged(session.projectPath),
+				})
+			}
+		}
+	}()
+
+	emitted := make(map[string]struct{}) // 已发过的行 uuid，防重
+	touched := make(map[string]struct{})
+	quiet := 0
+	sawUserEcho := false
+	offset := plan.JSONLOffset
+	ceiling := time.After(tuiTurnCeiling)
+tail:
+	for {
+		select {
+		case <-runCtx.Done():
+			_ = write(map[string]any{"type": models.AgentEventAIStatus, "session_id": session.id, "status": "stopping"})
+			return
+		case <-ceiling:
+			// 兜底：注入回合超上限。按 error 收尾（不是 done）——手机必须知道
+			// 这一回合没有正常完成，而不是拿到一个假的成功。
+			fail(agentTUIErrUnavailable, "终端会话执行超时")
+			return
+		default:
+		}
+		lines, newOffset, err := readTranscriptFrom(plan.JSONLPath, offset)
+		if err != nil {
+			fail(agentTUIErrTranscriptLost, "终端会话记录消失")
+			return
+		}
+		offset = newOffset
+		grew := false
+		for _, line := range lines {
+			switch classifyTranscriptLine(line) {
+			case transcriptUserEcho:
+				// 回显注入的消息（含 TUI 侧真实用户输入），手机确认「已进终端」。
+				// channel 用 "user" 区分于 spawn 路径的 "assistant"。
+				sawUserEcho = true
+				if text := transcriptUserText(line); text != "" {
+					_ = write(map[string]any{
+						"type": models.AgentEventAIDelta, "session_id": session.id,
+						"message_id": assistantMsgID,
+						"channel":    "user", "delta": text,
+					})
+				}
+				quiet = 0
+			case transcriptAssistant:
+				uuid := transcriptLineUUID(line)
+				if _, dup := emitted[uuid]; dup {
+					continue
+				}
+				emitted[uuid] = struct{}{}
+				grew = true
+				itemID := "tb" + transcriptBlockIndex(line) // ai.command/ai.thinking 的 item_id
+				for _, b := range extractTranscriptBlocks(line) {
+					switch b.Kind {
+					case "text":
+						_ = write(map[string]any{
+							"type": models.AgentEventAIDelta, "session_id": session.id,
+							"message_id": assistantMsgID,
+							"channel":    "assistant", "delta": b.Text,
+						})
+					case "thinking":
+						// claude 路径的 thinking 走独立事件，不进正文通道。
+						_ = write(map[string]any{
+							"type": models.AgentEventAIThinking, "session_id": session.id,
+							"message_id": assistantMsgID, "item_id": itemID, "delta": b.Text,
+						})
+					case "tool_use":
+						for _, fp := range toolUseTouchedPaths([]transcriptBlock{b}) {
+							touched[fp] = struct{}{}
+						}
+						// ai.command 必填 item_id + status，缺了服务端判畸形。
+						payload := map[string]any{
+							"type": models.AgentEventAICommand, "session_id": session.id,
+							"message_id": assistantMsgID, "item_id": itemID,
+							"status": "started", "command": b.ToolName,
+						}
+						if cwd := toolUseCwd(b.ToolInput); cwd != "" {
+							payload["cwd"] = cwd
+						}
+						_ = write(payload)
+					}
+				}
+			}
+		}
+		if grew {
+			quiet = 0
+		} else if sawUserEcho {
+			quiet++
+		}
+		// 完成：注入已回显 + 连续安静 + TUI 不再 busy（或记录消失）。
+		if sawUserEcho && quiet >= tuiTurnQuietRounds {
+			if rec, live := liveClaudeTUIRecord(plan.Home, plan.NativeSessionID); !live ||
+				strings.EqualFold(strings.TrimSpace(rec.Status), "idle") {
+				break tail
+			}
+		}
+		select {
+		case <-runCtx.Done():
+			_ = write(map[string]any{"type": models.AgentEventAIStatus, "session_id": session.id, "status": "stopping"})
+			return
+		case <-time.After(tuiTurnPollInterval):
+		}
+	}
+
+	// 5) ai.done（经 emitter → 自动 run_id/event_seq + 终态落盘 + 断线补推）。
+	_ = write(map[string]any{
+		"type": models.AgentEventAIDone, "session_id": session.id,
+		"message_id":          assistantMsgID,
+		"files_touched_count": len(touched),
+		"git_changed_count":   countGitChanged(session.projectPath),
+		"executor":            "tui",
+	})
+}
+
+// readTranscriptFrom 从 offset 读完整新行。只消费以 \n 结尾的部分——半行留在
+// 文件里等下一轮，故不会解析到半个 JSON。
+func readTranscriptFrom(path string, offset int64) ([][]byte, int64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, offset, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, offset, err
+	}
+	if info.Size() <= offset {
+		return nil, offset, nil
+	}
+	if _, err := f.Seek(offset, io.SeekStart); err != nil {
+		return nil, offset, err
+	}
+	buf := make([]byte, info.Size()-offset)
+	if _, err := io.ReadFull(f, buf); err != nil && err != io.ErrUnexpectedEOF {
+		return nil, offset, err
+	}
+	end := int64(len(buf))
+	if idx := bytes.LastIndexByte(buf, '\n'); idx >= 0 {
+		end = int64(idx) + 1 // 只消费完整行
+	}
+	if end <= 0 {
+		return nil, offset, nil
+	}
+	lines := bytes.Split(bytes.TrimRight(buf[:end], "\n"), []byte("\n"))
+	return lines, offset + end, nil
+}
+
+func transcriptLineUUID(line []byte) string {
+	var row struct {
+		UUID string `json:"uuid"`
+	}
+	_ = json.Unmarshal(line, &row)
+	return strings.TrimSpace(row.UUID)
+}
+
+// transcriptBlockIndex 取行的 apiBlockIndex（transcript 块级写入的序号），用作
+// ai.command / ai.thinking 的 item_id。缺失时退化为 "b"。
+func transcriptBlockIndex(line []byte) string {
+	var row struct {
+		APIBlockIndex *int `json:"apiBlockIndex"`
+	}
+	if json.Unmarshal(line, &row) == nil && row.APIBlockIndex != nil {
+		return strconv.Itoa(*row.APIBlockIndex)
+	}
+	return "b"
+}
+
+// toolUseCwd 从 tool_use 的 input 里取 cwd（Bash 类工具有），供 ai.command 的
+// 可选 cwd 字段使用。
+func toolUseCwd(input json.RawMessage) string {
+	var in struct {
+		Cwd string `json:"cwd"`
+	}
+	if json.Unmarshal(input, &in) != nil {
+		return ""
+	}
+	return strings.TrimSpace(in.Cwd)
+}
+
+func transcriptUserText(line []byte) string {
+	var row struct {
+		Message struct {
+			Content json.RawMessage `json:"content"`
+		} `json:"message"`
+	}
+	if json.Unmarshal(line, &row) != nil {
+		return ""
+	}
+	var text string
+	if json.Unmarshal(row.Message.Content, &text) == nil {
+		return text
+	}
+	var blocks []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(row.Message.Content, &blocks) != nil {
+		return ""
+	}
+	for _, b := range blocks {
+		if b.Type == "text" {
+			return b.Text
+		}
+	}
+	return ""
+}
+
+// clearTUITurnSessionState 清掉本回合在 session 上的占用标记，让后续回合可跑。
+func (m *agentAIManager) clearTUITurnSessionState(session *agentAISession) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	session.cancel = nil
+	session.activeWriter = nil
+	session.activity = nil
+	session.activeRunID = ""
 }

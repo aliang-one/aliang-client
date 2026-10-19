@@ -1,12 +1,18 @@
 package services
 
 import (
+	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"aliang.one/nursorgate/common/logger"
 )
@@ -241,4 +247,209 @@ func TestToolUseTouchedPaths(t *testing.T) {
 	if len(paths) != 2 || paths[0] != "/a/b.go" || paths[1] != "/a/c.go" {
 		t.Fatalf("paths = %v, want [/a/b.go /a/c.go]", paths)
 	}
+}
+
+func TestRunTUITurnHappyPath(t *testing.T) {
+	// 身份门 stub（真实 ps 探测不可控）。pid 用 os.Getpid()：isPidAlive 不可覆写。
+	_ = stubExternalInterrupt(t, nil)
+	pid := os.Getpid()
+	// 心跳是 10s 间隔，测试里不必等它；把轮询间隔压到最短加快用例。
+	origPoll := tuiTurnPollInterval
+	tuiTurnPollInterval = 20 * time.Millisecond
+	defer func() { tuiTurnPollInterval = origPoll }()
+
+	home := t.TempDir()
+	sock := ccPeerShortSocketPath(t) // macOS sun_path 103 字节上限
+	// fake TUI：收帧后向 transcript 追加 user 回显 + text 块 + tool_use 块
+	frames := make(chan string, 8)
+	startFakeTUI(t, sock, frames, func(content string) {
+		path := transcriptFixturePath(home, "sess-1")
+		appendTranscriptLine(t, path, `{"type":"user","uuid":"echo","isMeta":false,"message":{"role":"user","content":`+jsonString(content)+`}}`)
+		// text 的值直接用 jsonString 的输出（它自带引号），不要再包一层引号——
+		// 否则拼出 ""手机消息"" 让整行 JSON 损坏、被分类器静默忽略。
+		appendTranscriptLine(t, path, `{"type":"assistant","uuid":"a1","apiBlockIndex":0,"message":{"content":[{"type":"text","text":`+jsonString("收到："+content)+`}]}}`)
+		appendTranscriptLine(t, path, `{"type":"assistant","uuid":"a2","apiBlockIndex":1,"message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"echo hi","cwd":"/tmp"}}]}}`)
+	})
+	writeClaudePidRecord(t, home, "sess-1", pid, "idle", sock)
+	jsonl := writeTranscriptFixture(t, home, "sess-1")
+
+	m := newAgentAIManager() // agent_ai.go:879。⚠️ 不能用 &agentAIManager{}：其 m.sessions 是 nil map，registerAISessionLocked 会 panic
+	var mu sync.Mutex
+	var events []map[string]any
+	write := func(v any) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if p, ok := v.(map[string]any); ok {
+			events = append(events, p)
+		}
+		return nil
+	}
+	session := &agentAISession{id: "sess-1", projectPath: t.TempDir(), provider: "claude", resumeSessionID: "sess-1"}
+	m.registerAISessionLocked(session)
+	emitter := m.runEmitter(agentAIRun{runID: "run-1", sessionID: "sess-1", messageID: "m-1"}, write)
+
+	m.runTUITurn(context.Background(), session, agentAIRun{
+		runID: "run-1", sessionID: "sess-1", messageID: "m-1",
+		projectPath: session.projectPath, provider: "claude",
+		resumeSessionID: "sess-1",
+	}, "手机消息", &tuiTurnPlan{
+		Home: home, NativeSessionID: "sess-1", SocketPath: sock, PID: pid,
+		JSONLPath: jsonl, JSONLOffset: mustSize(t, jsonl),
+	}, emitter)
+
+	mu.Lock()
+	defer mu.Unlock()
+	// 帧内容：注入的是原始 content，不是 buildAgentAIPrompt 包装文本
+	if len(frames) == 0 {
+		t.Fatal("未注入任何帧")
+	}
+	frame := <-frames
+	if !strings.Contains(frame, "手机消息") {
+		t.Fatalf("注入帧缺少用户内容: %s", frame)
+	}
+	if strings.Contains(frame, "You are continuing an Aliang") {
+		t.Fatalf("注入帧被 buildAgentAIPrompt 污染: %s", frame)
+	}
+	// 事件序列
+	var seq []string
+	for _, e := range events {
+		seq = append(seq, fmt.Sprint(e["type"]))
+		if e["run_id"] != "run-1" {
+			t.Errorf("事件缺 run_id: %v", e)
+		}
+	}
+	// ⚠️ 该期望序列依赖 fake TUI 的写入顺序：user 回显 → text 块 → tool_use 块。
+	// 顺序写成 text→tool_use→text 会让断言失败（块按 transcript 出现顺序派发），
+	// 那是 fixture 写错了，不是实现错了。
+	want := []string{"ai.run.started", "ai.delta", "ai.delta", "ai.command", "ai.done"}
+	if strings.Join(seq, ",") != strings.Join(want, ",") {
+		t.Fatalf("事件序列 = %v, want %v", seq, want)
+	}
+	// user 回显的 delta 走 channel=user；assistant 走 channel=assistant
+	if events[1]["channel"] != "user" {
+		t.Errorf("user 回显 channel = %v, want user", events[1]["channel"])
+	}
+	if events[2]["channel"] != "assistant" {
+		t.Errorf("assistant channel = %v, want assistant", events[2]["channel"])
+	}
+	// ai.command 必填 item_id + status
+	if events[3]["item_id"] == nil || events[3]["status"] != "started" {
+		t.Errorf("ai.command 缺 item_id/status: %v", events[3])
+	}
+	if events[3]["command"] != "Bash" {
+		t.Errorf("ai.command command = %v", events[3]["command"])
+	}
+	// 终态带 executor 标记与统计
+	done := events[len(events)-1]
+	if done["executor"] != "tui" {
+		t.Errorf("ai.done 缺 executor=tui: %v", done)
+	}
+	if done["files_touched_count"] == nil {
+		t.Errorf("ai.done 缺 files_touched_count")
+	}
+}
+
+// TestRunTUITurnInjectsAttachmentSuffix 锁死：附件清单必须拼进注入文本。
+func TestRunTUITurnInjectsAttachmentSuffix(t *testing.T) {
+	_ = stubExternalInterrupt(t, nil)
+	pid := os.Getpid()
+	origPoll := tuiTurnPollInterval
+	tuiTurnPollInterval = 20 * time.Millisecond
+	defer func() { tuiTurnPollInterval = origPoll }()
+
+	home := t.TempDir()
+	sock := ccPeerShortSocketPath(t)
+	frames := make(chan string, 4)
+	startFakeTUI(t, sock, frames, func(string) {
+		path := transcriptFixturePath(home, "sess-1")
+		appendTranscriptLine(t, path, `{"type":"user","uuid":"echo","isMeta":false,"message":{"role":"user","content":"看图"}}`)
+		appendTranscriptLine(t, path, `{"type":"assistant","uuid":"a1","apiBlockIndex":0,"message":{"content":[{"type":"text","text":"好"}]}}`)
+	})
+	writeClaudePidRecord(t, home, "sess-1", pid, "idle", sock)
+	jsonl := writeTranscriptFixture(t, home, "sess-1")
+
+	m := newAgentAIManager()
+	session := &agentAISession{id: "sess-1", projectPath: t.TempDir(), provider: "claude", resumeSessionID: "sess-1"}
+	m.registerAISessionLocked(session)
+	emitter := m.runEmitter(agentAIRun{runID: "r", sessionID: "sess-1", messageID: "m"}, func(any) error { return nil })
+
+	m.runTUITurn(context.Background(), session, agentAIRun{
+		runID: "r", sessionID: "sess-1", messageID: "m",
+		projectPath: session.projectPath, provider: "claude", resumeSessionID: "sess-1",
+		attachments: []agentAIAttachment{{Type: "image", Path: "/tmp/pic.png", Name: "pic.png"}},
+	}, "看图", &tuiTurnPlan{
+		Home: home, NativeSessionID: "sess-1", SocketPath: sock, PID: pid,
+		JSONLPath: jsonl, JSONLOffset: mustSize(t, jsonl),
+	}, emitter)
+
+	frame := <-frames
+	if !strings.Contains(frame, "看图") || !strings.Contains(frame, "/tmp/pic.png") {
+		t.Fatalf("注入帧缺附件清单: %s", frame)
+	}
+}
+
+// startFakeTUI 起一个 unix listener，收到帧后回调 onContent(content)。
+func startFakeTUI(t *testing.T, sock string, frames chan<- string, onContent func(string)) {
+	t.Helper()
+	_ = os.Remove(sock)
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				sc := bufio.NewScanner(c)
+				for sc.Scan() {
+					line := sc.Text()
+					frames <- line
+					var f struct {
+						Type    string `json:"type"`
+						Message struct {
+							Content string `json:"content"`
+						} `json:"message"`
+					}
+					if json.Unmarshal([]byte(line), &f) == nil && f.Type == "user" {
+						onContent(f.Message.Content)
+					}
+				}
+			}(c)
+		}
+	}()
+}
+
+// jsonString 把字符串安全编码为 JSON 字符串字面量（含引号），供测试手工拼
+// transcript 行。
+func jsonString(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
+}
+
+// mustSize 返回文件当前字节数，用于构造 tail 起点。
+func mustSize(t *testing.T, path string) int64 {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return info.Size()
+}
+
+// waitFor 轮询等待条件成立（测试里替代裸 sleep）。
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("condition not met within 5s")
 }
