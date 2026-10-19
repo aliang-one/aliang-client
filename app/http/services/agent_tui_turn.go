@@ -1,6 +1,8 @@
 package services
 
 import (
+	"bytes"
+	"encoding/json"
 	"os"
 	"strings"
 )
@@ -127,5 +129,87 @@ func tuiTurnDecide(in tuiTurnInput) *tuiTurnPlan {
 		PeerToken:       loadClaudePeerToken(home, record.PID),
 		FromMode:        ccPeerTUIPermissionClass(jsonlPath),
 		JSONLOffset:     info.Size(),
+	}
+}
+
+// transcriptLineKind 是 tail 桥对 transcript 一行的分类。
+type transcriptLineKind int
+
+const (
+	transcriptIgnore    transcriptLineKind = iota // 元数据/噪声/空/坏行
+	transcriptUserEcho                            // 真实用户消息（含我们注入的那条）
+	transcriptAssistant                           // 主链 assistant 块
+)
+
+// transcriptLocalPrefixes 是 CC 写进 transcript 的本地命令回显前缀。它们不是
+// 用户对话内容，回显到手机只会制造噪声（2026-10-20 在本机 transcript 实测：
+// <local-command-caveat>/<command-name>/<local-command-stdout> 三类都存在）。
+var transcriptLocalPrefixes = []string{
+	"<command-name>",
+	"<local-command-caveat>",
+	"<local-command-stdout>",
+}
+
+// classifyTranscriptLine 把一行 transcript 分类。transcript 的 user 行有三类
+// 噪声必须过滤：isMeta 本地命令回显、本地命令前缀内容、tool_result block——
+// 不过滤就会把 TUI 的本地命令当成对话回显到手机。
+func classifyTranscriptLine(line []byte) transcriptLineKind {
+	if len(bytes.TrimSpace(line)) == 0 {
+		return transcriptIgnore
+	}
+	var row struct {
+		Type        string `json:"type"`
+		UUID        string `json:"uuid"`
+		IsSidechain bool   `json:"isSidechain"`
+		IsMeta      bool   `json:"isMeta"`
+		Message     struct {
+			Role    string          `json:"role"`
+			Content json.RawMessage `json:"content"`
+		} `json:"message"`
+	}
+	if err := json.Unmarshal(line, &row); err != nil {
+		return transcriptIgnore
+	}
+	switch row.Type {
+	case "user":
+		if row.IsMeta || row.IsSidechain {
+			return transcriptIgnore
+		}
+		// content 为字符串：按前缀过滤本地命令回显，其余算真实用户消息。
+		var text string
+		if err := json.Unmarshal(row.Message.Content, &text); err == nil {
+			trimmed := strings.TrimSpace(text)
+			for _, prefix := range transcriptLocalPrefixes {
+				if strings.HasPrefix(trimmed, prefix) {
+					return transcriptIgnore
+				}
+			}
+			return transcriptUserEcho
+		}
+		// content 为数组：tool_result 是工具回填，不是用户消息。
+		var blocks []struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(row.Message.Content, &blocks); err != nil {
+			return transcriptIgnore
+		}
+		for _, b := range blocks {
+			if b.Type == "tool_result" {
+				return transcriptIgnore
+			}
+		}
+		// 非 tool_result 的数组内容（罕见）按真实用户消息处理。
+		return transcriptUserEcho
+	case "assistant":
+		if row.IsSidechain {
+			return transcriptIgnore
+		}
+		// 无 uuid 的行无法去重，宁可不发也不重发。
+		if strings.TrimSpace(row.UUID) == "" {
+			return transcriptIgnore
+		}
+		return transcriptAssistant
+	default:
+		return transcriptIgnore
 	}
 }

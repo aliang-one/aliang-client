@@ -176,3 +176,30 @@ func appendTranscriptLine(t *testing.T, path, line string) {
 		logger.Info(fmt.Sprintf("test fixture write failed path=%s error=%v", path, err))
 	}
 }
+
+func TestClassifyTranscriptLine(t *testing.T) {
+	cases := []struct {
+		name string
+		line string
+		want transcriptLineKind
+	}{
+		{"assistant text", `{"type":"assistant","uuid":"a1","isSidechain":false,"apiBlockIndex":1,"message":{"role":"assistant","content":[{"type":"text","text":"你好"}]}}`, transcriptAssistant},
+		{"assistant thinking", `{"type":"assistant","uuid":"a2","isSidechain":false,"message":{"content":[{"type":"thinking","thinking":"想"}]}}`, transcriptAssistant},
+		{"assistant tool_use", `{"type":"assistant","uuid":"a3","isSidechain":false,"message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}}`, transcriptAssistant},
+		{"sidechain 忽略", `{"type":"assistant","uuid":"a4","isSidechain":true,"message":{"content":[{"type":"text","text":"子代理"}]}}`, transcriptIgnore},
+		{"真实 user 回显", `{"type":"user","uuid":"u1","isMeta":false,"message":{"role":"user","content":"问题"}}`, transcriptUserEcho},
+		{"tool_result 忽略", `{"type":"user","uuid":"u2","message":{"role":"user","content":[{"type":"tool_result","content":"ok"}]}}`, transcriptIgnore},
+		{"isMeta 忽略", `{"type":"user","uuid":"u3","isMeta":true,"message":{"role":"user","content":"<command-name>x</command-name>"}}`, transcriptIgnore},
+		{"本地命令回显忽略", `{"type":"user","uuid":"u4","message":{"role":"user","content":"<command-name>/effort</command-name>"}}`, transcriptIgnore},
+		{"local-command-caveat 忽略", `{"type":"user","uuid":"u5","message":{"role":"user","content":"<local-command-caveat>x</local-command-caveat>"}}`, transcriptIgnore},
+		{"local-command-stdout 忽略", `{"type":"user","uuid":"u6","message":{"role":"user","content":"<local-command-stdout>x</local-command-stdout>"}}`, transcriptIgnore},
+		{"空行", ``, transcriptIgnore},
+		{"坏 JSON", `{not json`, transcriptIgnore},
+		{"metadata 行", `{"type":"mode","mode":"normal","sessionId":"s"}`, transcriptIgnore},
+	}
+	for _, c := range cases {
+		if got := classifyTranscriptLine([]byte(c.line)); got != c.want {
+			t.Errorf("%s: got %v, want %v", c.name, got, c.want)
+		}
+	}
+}
