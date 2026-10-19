@@ -970,11 +970,17 @@ type agentRenamePidRecord struct {
 	// Only deliberate sources may outrank an existing explicit title —
 	// CC rewrites the auto/derived record's updatedAt on every status
 	// write while keeping the old name, which used to silently revert
-	// phone renames (see agentRenameSourceExplicit).
+	// phone renames (see agentRenameSourceExplicit). Generated names also
+	// never stamp title_updated_at: that stamp is PhoneServer's
+	// "already explicitly named" guard for Auto Session Title.
 	NameSource string
-	PID        int
-	Status     string
-	UpdatedAt  time.Time
+	// NameSince is when the current Name was set (UNIX ms in real records).
+	// It is STABLE, unlike UpdatedAt which churns on every busy/idle rewrite;
+	// rename ordering/stamps must use NameSince when present.
+	NameSince time.Time
+	PID       int
+	Status    string
+	UpdatedAt time.Time
 	// MessagingSocketPath is the cross-session messaging UDS socket written by
 	// CC >= 2.1.224 (~/.claude/sessions/<pid>.json). Empty on older versions,
 	// which is exactly the capability gate for the TUI sync injector.
@@ -1011,6 +1017,7 @@ func loadClaudeRenameRecords(home string) map[string]agentRenamePidRecord {
 			SessionID           string      `json:"sessionId"`
 			Name                string      `json:"name"`
 			NameSource          string      `json:"nameSource"`
+			NameSince           interface{} `json:"nameSince"`
 			PID                 int         `json:"pid"`
 			Status              string      `json:"status"`
 			UpdatedAt           interface{} `json:"updatedAt"`
@@ -1025,6 +1032,7 @@ func loadClaudeRenameRecords(home string) map[string]agentRenamePidRecord {
 		out[row.SessionID] = agentRenamePidRecord{
 			Name:                strings.TrimSpace(row.Name),
 			NameSource:          strings.TrimSpace(row.NameSource),
+			NameSince:           pidRecordTimeValue(row.NameSince),
 			PID:                 row.PID,
 			Status:              strings.TrimSpace(row.Status),
 			UpdatedAt:           pidRecordTimestamp(row.UpdatedAt, file),
@@ -1041,6 +1049,20 @@ func loadClaudeRenameRecords(home string) map[string]agentRenamePidRecord {
 // anything unrecognizable falls back to the file's mtime (the freshest
 // observable write time).
 func pidRecordTimestamp(value interface{}, file string) time.Time {
+	if ts := pidRecordTimeValue(value); !ts.IsZero() {
+		return ts
+	}
+	if info, err := os.Stat(file); err == nil {
+		return info.ModTime()
+	}
+	return time.Time{}
+}
+
+// pidRecordTimeValue decodes an optional pid-record timestamp (UNIX ms, UNIX
+// seconds or RFC3339). Unlike pidRecordTimestamp it never falls back to the
+// file mtime: callers use it for fields whose ABSENCE is meaningful (e.g.
+// nameSince before any user rename) and must get the zero time back.
+func pidRecordTimeValue(value interface{}) time.Time {
 	switch v := value.(type) {
 	case float64:
 		ms := int64(v)
@@ -1055,10 +1077,21 @@ func pidRecordTimestamp(value interface{}, file string) time.Time {
 			return ts
 		}
 	}
-	if info, err := os.Stat(file); err == nil {
-		return info.ModTime()
-	}
 	return time.Time{}
+}
+
+// wireAgentRenameSource maps a winning cache entry's provenance onto the
+// PhoneServer wire value. Phone renames and legacy entries are user intent;
+// Claude Code's generated labels (derived/auto/collision) are forwarded
+// verbatim so the server can keep them from claiming title ownership.
+func wireAgentRenameSource(entry agentRenameCacheEntry) string {
+	if entry.Origin == agentRenameOriginPhone {
+		return "user"
+	}
+	if s := strings.ToLower(strings.TrimSpace(entry.Source)); s != "" {
+		return s
+	}
+	return "user"
 }
 
 // claudeStatusFreshnessWindow bounds the freshness-derived "running" signal for
@@ -1084,6 +1117,7 @@ const claudeStatusFreshnessWindow = 3 * time.Minute
 func applyClaudeRenameNames(sessions []models.AgentVibeSession, records map[string]agentRenamePidRecord, transcriptFreshness map[string]time.Time) {
 	renameCache := loadAgentRenameCache()
 	observed := map[string]agentRenameCacheEntry{}
+	purged := map[string]bool{}
 	for index := range sessions {
 		if !strings.HasPrefix(sessions[index].ID, "claude_") {
 			continue
@@ -1121,18 +1155,42 @@ func applyClaudeRenameNames(sessions []models.AgentVibeSession, records map[stri
 				sessions[index].Status = "idle"
 			}
 		}
-		// Only records that actually carry a name compete for the title (see
-		// loadClaudeRenameRecords: nameless records are loaded for their
-		// liveness/status signal alone).
-		if hasRecord && record.Name != "" {
+
+		recordHasName := hasRecord && record.Name != ""
+		recordExplicit := recordHasName && agentRenameSourceExplicit(record.NameSource)
+		// Claude Code bumps updatedAt on every status write while the name
+		// stays put, so ordering/stamps must use the stable nameSince when the
+		// record carries one (older builds omit it).
+		recordStamp := record.NameSince
+		if recordStamp.IsZero() {
+			recordStamp = record.UpdatedAt
+		}
+
+		// Legacy reconciliation: before provenance existed the overlay cached
+		// CC-generated names as if they were user renames (origin=local, no
+		// Source). When a live record proves the same name was generated, drop
+		// the poisoned entry so it stops stamping and blocking auto-title.
+		// Entries with an explicit Source (including the parallel fix's new
+		// entries) are never purged here.
+		if recordHasName && !recordExplicit && hasCached &&
+			cached.Name == record.Name && cached.Origin == agentRenameOriginLocal &&
+			strings.TrimSpace(cached.Source) == "" {
+			delete(renameCache, nativeID)
+			purged[nativeID] = true
+			hasCached = false
+			cached = agentRenameCacheEntry{}
+			winner = agentRenameCacheEntry{}
+			winnerTS = time.Time{}
+		}
+
+		if recordHasName {
 			recordEntry := agentRenameCacheEntry{
 				Name:        record.Name,
 				Origin:      agentRenameOriginLocal,
 				Source:      record.NameSource,
-				UpdatedAt:   renameStamp(record.UpdatedAt),
+				UpdatedAt:   renameStamp(recordStamp),
 				ProjectPath: sessions[index].ProjectPath,
 			}
-			recordExplicit := agentRenameSourceExplicit(record.NameSource)
 			cachedExplicit := hasCached && agentRenameEntryExplicit(cached)
 			switch {
 			case hasCached && cached.Name == record.Name:
@@ -1142,36 +1200,79 @@ func applyClaudeRenameNames(sessions []models.AgentVibeSession, records map[stri
 				// the cache file, title_updated_at and the digest all stay put.
 			case !hasCached:
 				// First sight: a pid record seeds the cache even when its
-				// process is already dead, making the rename durable.
-				winner, winnerTS = recordEntry, record.UpdatedAt
+				// process is already dead, making the name durable.
+				winner, winnerTS = recordEntry, recordStamp
 			case recordExplicit && !cachedExplicit:
 				// A deliberate local rename outranks an automatic label no
 				// matter how fresh the label's updatedAt is.
-				winner, winnerTS = recordEntry, record.UpdatedAt
-			case alive && record.UpdatedAt.After(winnerTS) && (recordExplicit || !cachedExplicit):
+				winner, winnerTS = recordEntry, recordStamp
+			case alive && recordStamp.After(winnerTS) && (recordExplicit || !cachedExplicit):
 				// A live record with a different, strictly newer name competes
 				// last-writer-wins WITHIN a class. A non-explicit (auto/
 				// derived/collision) label never overtakes a deliberate cached
 				// title: Claude Code bumps those labels' updatedAt on ordinary
 				// status writes, which used to silently revert phone renames.
 				// Dead pid records can never retake (zombie rule).
-				winner, winnerTS = recordEntry, record.UpdatedAt
+				winner, winnerTS = recordEntry, recordStamp
 			}
 		}
 		if winner.Name == "" {
 			continue
 		}
-		sessions[index].Title = truncateAgentText(winner.Name, 200)
-		if sessions[index].Summary == "" {
-			sessions[index].Summary = truncateAgentText(winner.Name, 500)
+		if agentRenameEntryExplicit(winner) {
+			sessions[index].Title = truncateAgentText(winner.Name, 200)
+			if sessions[index].Summary == "" {
+				sessions[index].Summary = truncateAgentText(winner.Name, 500)
+			}
+			sessions[index].TitleUpdatedAt = winner.UpdatedAt
+			sessions[index].TitleSource = wireAgentRenameSource(winner)
+			if winner.Origin == agentRenameOriginLocal {
+				observed[nativeID] = winner
+			}
+			continue
 		}
-		sessions[index].TitleUpdatedAt = winner.UpdatedAt
+		// A generated label is a display fallback only: never Summary
+		// (PhoneServer maps it onto objective) and never title_updated_at
+		// (that stamp is Auto Session Title's "already explicitly named"
+		// guard). It is still cached so the label survives pid-file pruning.
+		// A bare "derived" label is a project slug and must not replace a
+		// better indexed title; CC's own LLM titles ("auto") and collision
+		// variants may.
+		source := strings.ToLower(strings.TrimSpace(winner.Source))
+		if strings.TrimSpace(sessions[index].Title) == "" || source == "auto" || source == "collision" {
+			sessions[index].Title = truncateAgentText(winner.Name, 200)
+			sessions[index].TitleSource = wireAgentRenameSource(winner)
+		}
 		if winner.Origin == agentRenameOriginLocal {
 			observed[nativeID] = winner
 		}
 	}
-	if len(observed) > 0 {
-		mergeObservedRenamesIntoCache(observed)
+	// Apply BOTH mutations in one fresh read-modify-write. Saving the snapshot
+	// loaded at the top of this pass would clobber a rename observed in this
+	// scan (or a phone rename written concurrently between load and save) with
+	// stale data — the cache is durable precisely so an observed rename
+	// survives pid-file pruning, so losing that write is permanent.
+	if len(observed) > 0 || len(purged) > 0 {
+		entries := loadAgentRenameCache()
+		changed := false
+		for sid := range purged {
+			if _, ok := entries[sid]; ok {
+				delete(entries, sid)
+				changed = true
+			}
+		}
+		for sid, entry := range observed {
+			before, existed := entries[sid]
+			mergeAgentRenameEntry(entries, sid, entry)
+			if !existed || entries[sid] != before {
+				changed = true
+			}
+		}
+		if changed {
+			if err := saveAgentRenameCache(entries); err != nil {
+				logger.Warn("[AGENT-RENAME] cache_persist_failed error=" + err.Error())
+			}
+		}
 	}
 }
 
@@ -1180,27 +1281,6 @@ func renameStamp(ts time.Time) string {
 		return ""
 	}
 	return ts.UTC().Format(time.RFC3339Nano)
-}
-
-// mergeObservedRenamesIntoCache persists locally observed renames.
-// mergeAgentRenameEntry's no-op-on-equal-timestamp rule keeps this idempotent,
-// so the periodic inventory scan only rewrites the file when something
-// actually changed.
-func mergeObservedRenamesIntoCache(observed map[string]agentRenameCacheEntry) {
-	entries := loadAgentRenameCache()
-	changed := false
-	for sid, entry := range observed {
-		before, existed := entries[sid]
-		mergeAgentRenameEntry(entries, sid, entry)
-		if !existed || entries[sid] != before {
-			changed = true
-		}
-	}
-	if changed {
-		if err := saveAgentRenameCache(entries); err != nil {
-			logger.Warn("[AGENT-RENAME] cache_persist_failed error=" + err.Error())
-		}
-	}
 }
 
 func readClaudeSessionMeta(path string) models.AgentVibeSession {

@@ -160,24 +160,30 @@ type AgentVibeSession struct {
 	// derived (summary/firstPrompt/index fallback). PhoneServer compares this
 	// against its own titleUpdatedAt to implement latest-of-writer semantics
 	// instead of freezing the first phone rename forever.
-	TitleUpdatedAt string                   `json:"title_updated_at,omitempty"`
-	Summary        string                   `json:"summary,omitempty"`
-	Mode           string                   `json:"mode,omitempty"`
-	Status         string                   `json:"status,omitempty"`
-	MessageCount int `json:"message_count,omitempty"`
+	TitleUpdatedAt string `json:"title_updated_at,omitempty"`
+	// TitleSource carries Claude Code's pid-record nameSource for the title
+	// above: user|peer|hook (an explicit rename) or derived|auto|collision
+	// (Claude Code generated it). PhoneServer uses it as defence in depth: a
+	// generated name must never be stamped into title_updated_at. Empty on
+	// older agents/CC builds, which PhoneServer treats as user intent.
+	TitleSource  string `json:"title_source,omitempty"`
+	Summary      string `json:"summary,omitempty"`
+	Mode         string `json:"mode,omitempty"`
+	Status       string `json:"status,omitempty"`
+	MessageCount int    `json:"message_count,omitempty"`
 	// DisplayMessageCount is the number of messages a client can actually
 	// render. MessageCount remains the STABLE-ID index allocator (command and
 	// artifact rows consume index slots even though they are excluded from the
 	// transcript), so it is not a display count. Nil means "this path does not
 	// compute it" (e.g. the index-only channel) and the server falls back to
 	// MessageCount; a non-nil 0 is a KNOWN zero (command/artifact husk).
-	DisplayMessageCount *int `json:"display_message_count,omitempty"`
-	Branch         string                   `json:"branch,omitempty"`
-	Model          string                   `json:"model,omitempty"`
-	Transcript     []AgentVibeMessage       `json:"transcript,omitempty"`
-	TranscriptPage *AgentVibeTranscriptPage `json:"transcript_page,omitempty"`
-	CreatedAt      string                   `json:"created_at,omitempty"`
-	UpdatedAt      string                   `json:"updated_at,omitempty"`
+	DisplayMessageCount *int                     `json:"display_message_count,omitempty"`
+	Branch              string                   `json:"branch,omitempty"`
+	Model               string                   `json:"model,omitempty"`
+	Transcript          []AgentVibeMessage       `json:"transcript,omitempty"`
+	TranscriptPage      *AgentVibeTranscriptPage `json:"transcript_page,omitempty"`
+	CreatedAt           string                   `json:"created_at,omitempty"`
+	UpdatedAt           string                   `json:"updated_at,omitempty"`
 }
 
 type AgentVibeMessage struct {
