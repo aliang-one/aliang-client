@@ -28,11 +28,14 @@
    - `ai.thinking` 必填 `type/session_id/message_id/delta`；claude 路径的 thinking 走**独立事件 `ai.thinking`**（带 `item_id`，见 agent_ai.go:6282），**不走 ai.delta**
    - `ai.delta` 必填 `type/session_id/message_id/channel/delta`——字段名是 **`channel`**（spawn 路径用字面量 `"assistant"`，agent_ai.go:5355），**没有 `role` 字段**
    - `ai.error` 的错误码字段名是 `error_code`（`agentAIErrorPayload` 用 `errors.As` 拾取 `ErrorCode()`，agent_ai.go:7613-7617）
-8. **⚠️ 测试构造三坑（已实测确认）**：
+8. **⚠️ `lastStubbedPid` 不是 pid 来源**（实现 Task 2 时实测踩中）：`stubExternalInterrupt` 只 stub 旋钮，`lastStubbedPid` 在信号真被调用前恒返回 0。测试里的 pid 一律直接取 `os.Getpid()`。
+9. **⚠️ `ccPeerWatchHeld` 同步阻塞 3 秒**：注入后要观测 held 窗口，期间收到的 stop 会在窗口结束后才生效（实现 Task 7 时实测：3.01s）。这是 v1 已知限制，见用户文档。
+10. **⚠️ 注入后若 ctx 已取消，必须补发 `ai.status(stopping)`**：裸 return 会让手机只看到信号、看不到状态，UI 卡在「执行中」。
+11. **⚠️ 测试构造三坑（已实测确认）**：
    - manager 必须用 `newAgentAIManager()`（`agent_ai.go:879`）。`&agentAIManager{}` 的 `m.sessions` 是 nil map，`registerAISessionLocked`（`agent_ai.go:919`）直接 panic「assignment to entry in nil map」。
    - unix socket 路径必须用现成的 `ccPeerShortSocketPath(t)`（`cc_peer_messaging_test.go:95`）：macOS `sun_path` 上限 103 字节，`t.TempDir()` 嵌了完整测试名，长测试名必爆 `bind: invalid argument`。
    - tail 循环必须有全局上限（`tuiTurnCeiling`），否则注入永不回显时 goroutine 永久占住 `session.cancel`，该会话再无法发起回合。
-9. **⚠️ 必须补 `ai.run.progress` 心跳**：spawn 两条路径都有 10 秒心跳（`agentAIRunProgressInterval = 10s`，agent_execution_guard.go:75；codex 侧 agent_ai.go:4068、claude 侧 agent_ai.go:5102），否则 TUI 长时间思考时服务端的 10 分钟安静 sweeper 会把回合打翻成 timed out。注入回合在 tail 循环里必须同步起同间隔心跳。
+12. **⚠️ 必须补 `ai.run.progress` 心跳**：spawn 两条路径都有 10 秒心跳（`agentAIRunProgressInterval = 10s`，agent_execution_guard.go:75；codex 侧 agent_ai.go:4068、claude 侧 agent_ai.go:5102），否则 TUI 长时间思考时服务端的 10 分钟安静 sweeper 会把回合打翻成 timed out。注入回合在 tail 循环里必须同步起同间隔心跳。
 
 ---
 

@@ -117,6 +117,13 @@ runUserMessage
 
 **关键安全属性：一次手机回合，要么注入要么 spawn，永不双跑。** 这是路由判定必须发生在任何 run 状态变更之前、且注入失败不回退 spawn 的原因。
 
+**已知限制（v1，实现期实测确认）：**
+
+1. **流式粒度是块级**，非 token 级（transcript 块级整行写入，见 §4.3 粒度说明）。
+2. **provider=auto 且存在空闲 claude TUI 时回合固定走 TUI**；用户显式选 codex 则不注入。
+3. **停止响应最多延迟约 3 秒**：注入后 `ccPeerWatchHeld` 同步观测 held 窗口，期间收到的 stop 在窗口结束后才生效。且该提前 return 必须补发 `ai.status(stopping)`，否则手机 UI 卡在「执行中」。
+4. **Windows named pipe 注入未实现**（v2），Windows 上自动回退 spawn。
+
 ### 4.6 与既有机制的交互
 
 - **`guardExternalTUIClaudeSpawn`**：注入回合结束时 TUI 已 idle，下一个手机回合会再次被路由到注入（而非 spawn）——这是期望行为。若用户同时手动在 TUI 发起回合使其 busy，则后续手机回合被 `tui_busy` 拒绝，与今天一致。

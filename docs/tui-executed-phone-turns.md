@@ -39,7 +39,7 @@
 2. **provider=auto 且存在空闲 claude 终端时，回合固定走终端。** 若用户显式选了
    codex，则不会走注入（provider 不匹配）。
 3. **停止响应最多延迟约 3 秒**：注入后要观测 held 窗口（`ccPeerWatchHeld`），期间
-   收到的 stop 会在窗口结束后才生效。
+   收到的 stop 会在窗口结束后才生效（状态仍会正确变为「已停止」）。
 4. Windows 的 named pipe 注入尚未实现（v2），Windows 上自动回退原有方式。
 
 ## 回滚
