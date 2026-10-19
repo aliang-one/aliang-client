@@ -59,19 +59,19 @@ func TestMergeAgentRenameEntryKeepsNewer(t *testing.T) {
 	newTS := time.Now().UTC().Format(time.RFC3339Nano)
 
 	entries := map[string]agentRenameCacheEntry{}
-	mergeAgentRenameEntry(entries, "sid", "手机新名", "phone", newTS, "")
-	mergeAgentRenameEntry(entries, "sid", "本地旧名", "local", old, "")
+	mergeAgentRenameEntry(entries, "sid", agentRenameCacheEntry{Name: "手机新名", Origin: "phone", UpdatedAt: newTS})
+	mergeAgentRenameEntry(entries, "sid", agentRenameCacheEntry{Name: "本地旧名", Origin: "local", UpdatedAt: old})
 	assert.Equal(t, "手机新名", entries["sid"].Name, "newer phone rename must beat older local rename")
 
 	entries = map[string]agentRenameCacheEntry{}
-	mergeAgentRenameEntry(entries, "sid", "本地新名", "local", newTS, "")
-	mergeAgentRenameEntry(entries, "sid", "手机旧名", "phone", old, "")
+	mergeAgentRenameEntry(entries, "sid", agentRenameCacheEntry{Name: "本地新名", Origin: "local", UpdatedAt: newTS})
+	mergeAgentRenameEntry(entries, "sid", agentRenameCacheEntry{Name: "手机旧名", Origin: "phone", UpdatedAt: old})
 	assert.Equal(t, "本地新名", entries["sid"].Name, "newer local rename must beat older phone rename")
 
 	// Same timestamp: keep the existing entry (no churn on equal ts).
 	entries = map[string]agentRenameCacheEntry{}
-	mergeAgentRenameEntry(entries, "sid", "first", "local", newTS, "")
-	mergeAgentRenameEntry(entries, "sid", "second", "phone", newTS, "")
+	mergeAgentRenameEntry(entries, "sid", agentRenameCacheEntry{Name: "first", Origin: "local", UpdatedAt: newTS})
+	mergeAgentRenameEntry(entries, "sid", agentRenameCacheEntry{Name: "second", Origin: "phone", UpdatedAt: newTS})
 	assert.Equal(t, "first", entries["sid"].Name)
 }
 
@@ -82,8 +82,11 @@ func TestAgentRenameCacheCapDropsOldest(t *testing.T) {
 	entries := map[string]agentRenameCacheEntry{}
 	base := time.Now().UTC().Add(-24 * time.Hour)
 	for i := 0; i < agentRenameCacheMaxEntries+50; i++ {
-		mergeAgentRenameEntry(entries, sidKey(i), "name", "local",
-			base.Add(time.Duration(i)*time.Second).Format(time.RFC3339Nano), "")
+		mergeAgentRenameEntry(entries, sidKey(i), agentRenameCacheEntry{
+			Name:      "name",
+			Origin:    "local",
+			UpdatedAt: base.Add(time.Duration(i) * time.Second).Format(time.RFC3339Nano),
+		})
 	}
 	require.NoError(t, saveAgentRenameCacheFile(path, entries))
 

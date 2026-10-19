@@ -27,7 +27,12 @@ import (
 // reverts.
 //
 // Competition between sources is last-writer-wins on the agent clock (never a
-// wall clock from another device):
+// wall clock from another device), with one precedence rule on top: a
+// DELIBERATE title (phone rename, /rename by the user, peer or hook) always
+// outranks an automatic one (Claude Code's nameSource auto/derived/collision
+// labels), regardless of timestamps. CC rewrites a live pid record's updatedAt
+// on every status/classifier write while keeping the old automatic name, so a
+// pure timestamp race would let an open TUI silently revert a phone rename.
 //   - a live pid record participates with its updatedAt;
 //   - a dead (zombie) pid record may only seed a cache entry the first time —
 //     once a cache entry exists the zombie can never override it, no matter
@@ -42,6 +47,11 @@ const (
 	agentRenameOriginLocal = "local"
 	agentRenameOriginPhone = "phone"
 
+	// agentRenameSourcePhone is the cache-entry Source recorded for renames
+	// accepted over the wire. Locally observed entries carry Claude Code's own
+	// pid-record nameSource instead (user/peer/hook/auto/derived/collision).
+	agentRenameSourcePhone = "phone"
+
 	// agentRenameCacheMaxEntries bounds the cache file; evictions are
 	// oldest-first by updated_at.
 	agentRenameCacheMaxEntries = 5000
@@ -50,10 +60,40 @@ const (
 )
 
 type agentRenameCacheEntry struct {
-	Name        string `json:"name"`
-	Origin      string `json:"origin"`
+	Name   string `json:"name"`
+	Origin string `json:"origin"`
+	// Source is the origin's name provenance: Claude Code's pid-record
+	// nameSource (user/peer/hook/auto/derived/collision) for observed local
+	// names, or "phone" for wire renames. Empty on entries written before the
+	// field existed; agentRenameEntryExplicit treats those conservatively as
+	// deliberate so an upgrade never lets an auto label revert a title.
+	Source      string `json:"source,omitempty"`
 	UpdatedAt   string `json:"updated_at"`
 	ProjectPath string `json:"project_path,omitempty"`
+}
+
+// agentRenameSourceExplicit reports whether a name provenance is a deliberate
+// title. Claude Code's full nameSource enum is
+// user|peer|hook|derived|collision|auto: only the first three are human or
+// peer intent. An EMPTY source counts as explicit for backward compatibility —
+// Claude Code builds before the nameSource field only wrote a pid-record name
+// when the user renamed the session, and cache entries written before this
+// field have no better information.
+func agentRenameSourceExplicit(source string) bool {
+	switch strings.ToLower(strings.TrimSpace(source)) {
+	case "", "user", "peer", "hook", agentRenameSourcePhone:
+		return true
+	}
+	return false
+}
+
+// agentRenameEntryExplicit classifies a whole cache entry: a phone rename is
+// always deliberate, otherwise the recorded provenance decides.
+func agentRenameEntryExplicit(entry agentRenameCacheEntry) bool {
+	if entry.Origin == agentRenameOriginPhone {
+		return true
+	}
+	return agentRenameSourceExplicit(entry.Source)
 }
 
 // agentRenameCachePath mirrors agentStatePath's dual-runtime layout so the
@@ -142,28 +182,37 @@ func saveAgentRenameCacheFile(path string, entries map[string]agentRenameCacheEn
 	return os.Rename(tmp, path)
 }
 
-// mergeAgentRenameEntry applies last-writer-wins: a strictly newer updatedAt
-// replaces the incumbent; on equal timestamps the incumbent stays so repeated
-// scans never churn the file.
-func mergeAgentRenameEntry(entries map[string]agentRenameCacheEntry, sid, name, origin, updatedAt, projectPath string) {
+// mergeAgentRenameEntry applies the precedence described at the top of the
+// file: a deliberate title beats an automatic one regardless of timestamps;
+// within the same class the strictly newer updatedAt wins, and on equal
+// timestamps the incumbent stays so repeated scans never churn the file.
+func mergeAgentRenameEntry(entries map[string]agentRenameCacheEntry, sid string, incoming agentRenameCacheEntry) {
 	sid = strings.TrimSpace(sid)
-	name = strings.TrimSpace(name)
-	if sid == "" || name == "" {
+	incoming.Name = strings.TrimSpace(incoming.Name)
+	incoming.ProjectPath = strings.TrimSpace(incoming.ProjectPath)
+	if sid == "" || incoming.Name == "" {
 		return
 	}
 	if existing, ok := entries[sid]; ok {
-		existingTS := renameTimestamp(existing.UpdatedAt)
-		incomingTS := renameTimestamp(updatedAt)
-		if existingTS.After(incomingTS) || existing.UpdatedAt == updatedAt {
+		existingExplicit := agentRenameEntryExplicit(existing)
+		incomingExplicit := agentRenameEntryExplicit(incoming)
+		switch {
+		case !incomingExplicit && existingExplicit:
+			// An auto/derived/collision label may never overwrite a deliberate
+			// title — CC bumps those labels' updatedAt on every status write.
 			return
+		case incomingExplicit && !existingExplicit:
+			// A deliberate rename always wins over a previously cached
+			// automatic label, even with an older clock stamp.
+		default:
+			existingTS := renameTimestamp(existing.UpdatedAt)
+			incomingTS := renameTimestamp(incoming.UpdatedAt)
+			if existingTS.After(incomingTS) || existing.UpdatedAt == incoming.UpdatedAt {
+				return
+			}
 		}
 	}
-	entries[sid] = agentRenameCacheEntry{
-		Name:        name,
-		Origin:      origin,
-		UpdatedAt:   updatedAt,
-		ProjectPath: strings.TrimSpace(projectPath),
-	}
+	entries[sid] = incoming
 }
 
 func renameTimestamp(value string) time.Time {
@@ -214,7 +263,13 @@ func (s *AgentService) handleRemoteAIRename(msg map[string]interface{}, writeJSO
 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	entries := loadAgentRenameCache()
-	mergeAgentRenameEntry(entries, nativeID, title, agentRenameOriginPhone, now, remoteString(msg, "project_path"))
+	mergeAgentRenameEntry(entries, nativeID, agentRenameCacheEntry{
+		Name:        title,
+		Origin:      agentRenameOriginPhone,
+		Source:      agentRenameSourcePhone,
+		UpdatedAt:   now,
+		ProjectPath: strings.TrimSpace(remoteString(msg, "project_path")),
+	})
 	if err := saveAgentRenameCache(entries); err != nil {
 		logger.Warn("[AGENT-RENAME] phone_rename_persist_failed sid=" + nativeID + " error=" + err.Error())
 	}

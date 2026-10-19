@@ -964,10 +964,17 @@ func listAllProjectIndexFiles(root string) []string {
 // liveness check and the last-writer-wins competition against the durable
 // rename cache.
 type agentRenamePidRecord struct {
-	Name      string
-	PID       int
-	Status    string
-	UpdatedAt time.Time
+	Name string
+	// NameSource is Claude Code's provenance for Name:
+	// user|peer|hook|derived|collision|auto (empty on older builds).
+	// Only deliberate sources may outrank an existing explicit title —
+	// CC rewrites the auto/derived record's updatedAt on every status
+	// write while keeping the old name, which used to silently revert
+	// phone renames (see agentRenameSourceExplicit).
+	NameSource string
+	PID        int
+	Status     string
+	UpdatedAt  time.Time
 	// MessagingSocketPath is the cross-session messaging UDS socket written by
 	// CC >= 2.1.224 (~/.claude/sessions/<pid>.json). Empty on older versions,
 	// which is exactly the capability gate for the TUI sync injector.
@@ -1003,6 +1010,7 @@ func loadClaudeRenameRecords(home string) map[string]agentRenamePidRecord {
 		var row struct {
 			SessionID           string      `json:"sessionId"`
 			Name                string      `json:"name"`
+			NameSource          string      `json:"nameSource"`
 			PID                 int         `json:"pid"`
 			Status              string      `json:"status"`
 			UpdatedAt           interface{} `json:"updatedAt"`
@@ -1016,6 +1024,7 @@ func loadClaudeRenameRecords(home string) map[string]agentRenamePidRecord {
 		}
 		out[row.SessionID] = agentRenamePidRecord{
 			Name:                strings.TrimSpace(row.Name),
+			NameSource:          strings.TrimSpace(row.NameSource),
 			PID:                 row.PID,
 			Status:              strings.TrimSpace(row.Status),
 			UpdatedAt:           pidRecordTimestamp(row.UpdatedAt, file),
@@ -1112,16 +1121,19 @@ func applyClaudeRenameNames(sessions []models.AgentVibeSession, records map[stri
 				sessions[index].Status = "idle"
 			}
 		}
-		// Only records that actually carry a user-set name compete for the
-		// title (see loadClaudeRenameRecords: nameless records are loaded for
-		// their liveness/status signal alone).
+		// Only records that actually carry a name compete for the title (see
+		// loadClaudeRenameRecords: nameless records are loaded for their
+		// liveness/status signal alone).
 		if hasRecord && record.Name != "" {
 			recordEntry := agentRenameCacheEntry{
 				Name:        record.Name,
 				Origin:      agentRenameOriginLocal,
+				Source:      record.NameSource,
 				UpdatedAt:   renameStamp(record.UpdatedAt),
 				ProjectPath: sessions[index].ProjectPath,
 			}
+			recordExplicit := agentRenameSourceExplicit(record.NameSource)
+			cachedExplicit := hasCached && agentRenameEntryExplicit(cached)
 			switch {
 			case hasCached && cached.Name == record.Name:
 				// Same-name timestamp churn: Claude Code keeps rewriting a live
@@ -1132,10 +1144,17 @@ func applyClaudeRenameNames(sessions []models.AgentVibeSession, records map[stri
 				// First sight: a pid record seeds the cache even when its
 				// process is already dead, making the rename durable.
 				winner, winnerTS = recordEntry, record.UpdatedAt
-			case alive && record.UpdatedAt.After(winnerTS):
+			case recordExplicit && !cachedExplicit:
+				// A deliberate local rename outranks an automatic label no
+				// matter how fresh the label's updatedAt is.
+				winner, winnerTS = recordEntry, record.UpdatedAt
+			case alive && record.UpdatedAt.After(winnerTS) && (recordExplicit || !cachedExplicit):
 				// A live record with a different, strictly newer name competes
-				// like any other source (last-writer-wins). Dead pid records
-				// can never retake (zombie rule).
+				// last-writer-wins WITHIN a class. A non-explicit (auto/
+				// derived/collision) label never overtakes a deliberate cached
+				// title: Claude Code bumps those labels' updatedAt on ordinary
+				// status writes, which used to silently revert phone renames.
+				// Dead pid records can never retake (zombie rule).
 				winner, winnerTS = recordEntry, record.UpdatedAt
 			}
 		}
@@ -1172,7 +1191,7 @@ func mergeObservedRenamesIntoCache(observed map[string]agentRenameCacheEntry) {
 	changed := false
 	for sid, entry := range observed {
 		before, existed := entries[sid]
-		mergeAgentRenameEntry(entries, sid, entry.Name, entry.Origin, entry.UpdatedAt, entry.ProjectPath)
+		mergeAgentRenameEntry(entries, sid, entry)
 		if !existed || entries[sid] != before {
 			changed = true
 		}
