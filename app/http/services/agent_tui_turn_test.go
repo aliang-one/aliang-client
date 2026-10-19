@@ -203,3 +203,42 @@ func TestClassifyTranscriptLine(t *testing.T) {
 		}
 	}
 }
+
+func TestExtractTranscriptBlocks(t *testing.T) {
+	line := []byte(`{"type":"assistant","uuid":"a1","apiBlockIndex":2,"message":{"role":"assistant","content":[{"type":"thinking","thinking":"思考"},{"type":"text","text":"答案"},{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}}`)
+	blocks := extractTranscriptBlocks(line)
+	if len(blocks) != 3 {
+		t.Fatalf("got %d blocks, want 3", len(blocks))
+	}
+	if blocks[0].Kind != "thinking" || blocks[0].Text != "思考" {
+		t.Errorf("block0 = %+v", blocks[0])
+	}
+	if blocks[1].Kind != "text" || blocks[1].Text != "答案" {
+		t.Errorf("block1 = %+v", blocks[1])
+	}
+	if blocks[2].Kind != "tool_use" || blocks[2].ToolName != "Bash" {
+		t.Errorf("block2 = %+v", blocks[2])
+	}
+	// 非 assistant 行 → 无块
+	if got := extractTranscriptBlocks([]byte(`{"type":"user","message":{"content":"x"}}`)); got != nil {
+		t.Errorf("user 行应无块, got %+v", got)
+	}
+}
+
+// TestToolUseTouchedPaths 对齐 spawn 路径的 claudeMessageToolUseFilePaths：
+// 只认 Write/Edit/MultiEdit、只取 file_path。多取键名或放宽工具名会让手机端
+// 的 files_touched_count 与 spawn 路径不一致。
+func TestToolUseTouchedPaths(t *testing.T) {
+	blocks := []transcriptBlock{
+		{Kind: "tool_use", ToolName: "Write", ToolInput: json.RawMessage(`{"file_path":"/a/b.go"}`)},
+		{Kind: "tool_use", ToolName: "Edit", ToolInput: json.RawMessage(`{"file_path":"/a/b.go"}`)},
+		{Kind: "tool_use", ToolName: "MultiEdit", ToolInput: json.RawMessage(`{"file_path":"/a/c.go"}`)},
+		{Kind: "tool_use", ToolName: "Bash", ToolInput: json.RawMessage(`{"command":"ls","file_path":"/a/ignored.go"}`)},
+		{Kind: "tool_use", ToolName: "Read", ToolInput: json.RawMessage(`{"file_path":"/a/read.go"}`)},
+		{Kind: "text", Text: "不是工具"},
+	}
+	paths := toolUseTouchedPaths(blocks)
+	if len(paths) != 2 || paths[0] != "/a/b.go" || paths[1] != "/a/c.go" {
+		t.Fatalf("paths = %v, want [/a/b.go /a/c.go]", paths)
+	}
+}

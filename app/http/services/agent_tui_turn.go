@@ -213,3 +213,90 @@ func classifyTranscriptLine(line []byte) transcriptLineKind {
 		return transcriptIgnore
 	}
 }
+
+// transcriptBlock 是一条 assistant 行解出的一个内容块。transcript 是块级整行
+// 写入（spec §4.3 已核实：apiBlockIndex 递增、uuid 唯一不重写），故块是
+// delta 的天然粒度——v1 不做 token 级流式。
+type transcriptBlock struct {
+	Kind      string // "thinking" | "text" | "tool_use"
+	Text      string
+	ToolName  string
+	ToolInput json.RawMessage
+}
+
+// transcriptFileTools 是会改动工作区的工具名，与 spawn 路径的
+// claudeMessageToolUseFilePaths（agent_ai.go）完全一致——files_touched_count
+// 在两条执行路径上必须同口径，否则手机端统计会随路由漂移。
+var transcriptFileTools = map[string]struct{}{
+	"Write":     {},
+	"Edit":      {},
+	"MultiEdit": {},
+}
+
+func extractTranscriptBlocks(line []byte) []transcriptBlock {
+	if classifyTranscriptLine(line) != transcriptAssistant {
+		return nil
+	}
+	var row struct {
+		Message struct {
+			Content json.RawMessage `json:"content"`
+		} `json:"message"`
+	}
+	if err := json.Unmarshal(line, &row); err != nil {
+		return nil
+	}
+	var raw []struct {
+		Type     string          `json:"type"`
+		Text     string          `json:"text"`
+		Thinking string          `json:"thinking"`
+		Name     string          `json:"name"`
+		Input    json.RawMessage `json:"input"`
+	}
+	if err := json.Unmarshal(row.Message.Content, &raw); err != nil {
+		return nil
+	}
+	out := make([]transcriptBlock, 0, len(raw))
+	for _, b := range raw {
+		switch b.Type {
+		case "thinking":
+			out = append(out, transcriptBlock{Kind: "thinking", Text: b.Thinking})
+		case "text":
+			out = append(out, transcriptBlock{Kind: "text", Text: b.Text})
+		case "tool_use":
+			out = append(out, transcriptBlock{Kind: "tool_use", ToolName: b.Name, ToolInput: b.Input})
+		}
+	}
+	return out
+}
+
+// toolUseTouchedPaths 从 tool_use 块提取被改文件路径（保序去重），供 ai.done 的
+// files_touched_count 使用。只认 transcriptFileTools 里的工具、只取 file_path
+// 键——与 spawn 路径同口径。
+func toolUseTouchedPaths(blocks []transcriptBlock) []string {
+	seen := make(map[string]struct{}, len(blocks))
+	out := make([]string, 0, len(blocks))
+	for _, b := range blocks {
+		if b.Kind != "tool_use" {
+			continue
+		}
+		if _, ok := transcriptFileTools[b.ToolName]; !ok {
+			continue
+		}
+		var in struct {
+			FilePath string `json:"file_path"`
+		}
+		if err := json.Unmarshal(b.ToolInput, &in); err != nil {
+			continue
+		}
+		fp := strings.TrimSpace(in.FilePath)
+		if fp == "" {
+			continue
+		}
+		if _, dup := seen[fp]; dup {
+			continue
+		}
+		seen[fp] = struct{}{}
+		out = append(out, fp)
+	}
+	return out
+}
