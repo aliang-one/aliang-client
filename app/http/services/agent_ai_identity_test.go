@@ -40,6 +40,13 @@ if [ "$1" = "--version" ]; then
   printf '%s\n' '2.1.17 (Claude Code)'
   exit 0
 fi
+if [ "$1" = "--help" ]; then
+  # 2.1.17 一代没有 --input-format：能力探测据此判定不支持 Claude steer。
+  printf '%s\n' 'Usage: claude [options] [prompt]'
+  printf '%s\n' '  --print                        Print response and exit'
+  printf '%s\n' '  --output-format <format>       text | json | stream-json'
+  exit 0
+fi
 printf x >> "$COUNTER_FILE"
 printf '%s\n' '{"type":"system","subtype":"init","session_id":"native-claude-1"}'
 printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"ok"}]}}'
