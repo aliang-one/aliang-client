@@ -1096,6 +1096,12 @@ func wireAgentRenameSource(entry agentRenameCacheEntry) string {
 	if s := strings.ToLower(strings.TrimSpace(entry.Source)); s != "" {
 		return s
 	}
+	// 空 source 的历史条目：名字若是 CC 的派生占位名，必须如实上报 derived。
+	// 回落成 "user" 会让 PhoneServer 当成用户改名并盖上 title_updated_at，
+	// 从而永久短路 Auto Session Title。
+	if agentRenameLooksLikeDerivedSlug(entry.Name, entry.ProjectPath) {
+		return "derived"
+	}
 	return "user"
 }
 
@@ -1246,6 +1252,10 @@ func applyClaudeRenameNames(sessions []models.AgentVibeSession, records map[stri
 		source := strings.ToLower(strings.TrimSpace(winner.Source))
 		if strings.TrimSpace(sessions[index].Title) == "" || source == "auto" || source == "collision" {
 			sessions[index].Title = truncateAgentText(winner.Name, 200)
+			sessions[index].TitleSource = wireAgentRenameSource(winner)
+		} else if agentRenameLooksLikeDerivedSlug(winner.Name, winner.ProjectPath) {
+			// 索引里有更好的标题，本条缓存只是 CC 的派生占位名：标题不覆盖，
+			// 但来源仍要标注。留空会被服务端当成用户改名并盖上 title_updated_at。
 			sessions[index].TitleSource = wireAgentRenameSource(winner)
 		}
 		if winner.Origin == agentRenameOriginLocal {

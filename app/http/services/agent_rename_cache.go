@@ -93,13 +93,68 @@ func agentRenameSourceExplicit(source string) bool {
 	return false
 }
 
+// agentRenameSlugSanitizer mirrors Claude Code's cwd→slug normalization.
+var agentRenameSlugSanitizer = regexp.MustCompile(`[^a-z0-9]+`)
+
+// agentRenameLooksLikeDerivedSlug reports whether name is Claude Code's
+// placeholder "<project-dir-slug>-<2 alnum>" (observed: plan-maker-96,
+// alianggate-99, aliangboard-5e, tmp-4f).
+//
+// These are CC's own fallback labels for sessions it has no real title for
+// (nameSource=derived). The shape check deliberately does NOT require a live
+// pid record: cache entries written before the Source field existed carry no
+// provenance and their CC process is long gone, yet the old "empty source =
+// deliberate" rule kept reporting them as user renames — which stamped
+// title_updated_at on PhoneServer and permanently disabled Auto Session Title.
+// The predicate is intentionally isomorphic to the server's
+// looksLikeClaudeDerivedSessionName so both sides reach the same verdict.
+func agentRenameLooksLikeDerivedSlug(name, projectPath string) bool {
+	name = strings.TrimSpace(name)
+	projectPath = strings.TrimSpace(projectPath)
+	if name == "" || projectPath == "" {
+		return false
+	}
+	// 与服务端一致：先剥掉尾部分隔符，否则 "/x/aliangboard/" 会切出空 basename。
+	base := strings.TrimRight(projectPath, `/\`)
+	if i := strings.LastIndexAny(base, `/\`); i >= 0 {
+		base = base[i+1:]
+	}
+	slug := strings.Trim(agentRenameSlugSanitizer.ReplaceAllString(strings.ToLower(base), "-"), "-")
+	if slug == "" {
+		return false
+	}
+	lower := strings.ToLower(name)
+	prefix := slug + "-"
+	if !strings.HasPrefix(lower, prefix) {
+		return false
+	}
+	tail := lower[len(prefix):]
+	if len(tail) != 2 {
+		return false
+	}
+	for _, r := range tail {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'z') {
+			return false
+		}
+	}
+	return true
+}
+
 // agentRenameEntryExplicit classifies a whole cache entry: a phone rename is
-// always deliberate, otherwise the recorded provenance decides.
+// always deliberate, otherwise the recorded provenance decides. Legacy entries
+// with no provenance fall back to the slug shape check above before assuming
+// the name was a deliberate rename.
 func agentRenameEntryExplicit(entry agentRenameCacheEntry) bool {
 	if entry.Origin == agentRenameOriginPhone {
 		return true
 	}
-	return agentRenameSourceExplicit(entry.Source)
+	if source := strings.TrimSpace(entry.Source); source != "" {
+		return agentRenameSourceExplicit(source)
+	}
+	if agentRenameLooksLikeDerivedSlug(entry.Name, entry.ProjectPath) {
+		return false
+	}
+	return agentRenameSourceExplicit("")
 }
 
 // agentRenameCachePath mirrors agentStatePath's dual-runtime layout so the
