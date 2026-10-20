@@ -9,7 +9,9 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
+	"unicode"
 
 	"aliang.one/nursorgate/app/http/models"
 	"aliang.one/nursorgate/common/cache"
@@ -236,11 +238,51 @@ func saveAgentRenameCacheFile(path string, entries map[string]agentRenameCacheEn
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+	// A UNIQUE temp file per save: two concurrent writers sharing a fixed
+	// "<path>.tmp" can truncate each other's partial write and rename the
+	// interleaved result into place (the mutex below narrows but does not
+	// remove stray direct-save callers such as tests).
+	tmpFile, err := os.CreateTemp(filepath.Dir(path), ".rename_cache-*")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	tmp := tmpFile.Name()
+	if _, err := tmpFile.Write(raw); err != nil {
+		tmpFile.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := tmpFile.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+// agentRenameCacheMu serializes every read-modify-write cycle on the rename
+// cache. Writers live on different goroutines — handleRemoteAIRename on the
+// WS read loop, applyClaudeRenameNames' observed/purged merge on the inventory
+// ticker and HTTP handlers — and each save rewrites the WHOLE file, so two
+// unsynchronized cycles interleave as load{A}/load{B}/save{A}/save{B}: the
+// loser's entry (typically the phone rename, which has no local re-source) is
+// lost permanently.
+var agentRenameCacheMu sync.Mutex
+
+// updateAgentRenameCache runs one whole read-modify-write cycle under
+// agentRenameCacheMu and persists only when mutate reports a change, so
+// steady-state scans never rewrite the file.
+func updateAgentRenameCache(mutate func(entries map[string]agentRenameCacheEntry) bool) error {
+	agentRenameCacheMu.Lock()
+	defer agentRenameCacheMu.Unlock()
+	entries := loadAgentRenameCache()
+	if !mutate(entries) {
+		return nil
+	}
+	return saveAgentRenameCache(entries)
 }
 
 // mergeAgentRenameEntry applies the precedence described at the top of the
@@ -285,6 +327,40 @@ func renameTimestamp(value string) time.Time {
 	return time.Time{}
 }
 
+// normalizeAgentRenameTitle mirrors Claude Code's own /rename normalization
+// (pi(): strip [\x00-\x1f\x7f-\x9f]; whitespace runs fold to one space like
+// CC's fork-title path; cap at 200 code points). PhoneServer has normalized
+// PATCH titles since 2026-10, but older servers and other wire sources may
+// still send raw titles — without this the SAME title lands in different
+// shapes depending on whether it was renamed in the TUI or on the phone, and
+// a title containing \n/ESC renders as multi-line/escape garbage in the
+// /resume list, which CC's own renames never produce.
+func normalizeAgentRenameTitle(raw string) string {
+	var out strings.Builder
+	pendingSpace := false
+	written := 0
+	for _, r := range raw {
+		if r < 0x20 || (r >= 0x7f && r <= 0x9f) {
+			continue // control chars are stripped outright, like CC's T1
+		}
+		if unicode.IsSpace(r) {
+			pendingSpace = true
+			continue
+		}
+		if written >= 200 {
+			break
+		}
+		if pendingSpace && out.Len() > 0 {
+			out.WriteRune(' ')
+			written++
+		}
+		pendingSpace = false
+		out.WriteRune(r)
+		written++
+	}
+	return strings.TrimSpace(out.String())
+}
+
 // handleRemoteAIRename persists a phone-initiated rename. PhoneServer
 // publishes ai.session.rename; this agent historically ignored it, so phone
 // renames never reached local storage and PhoneServer had to freeze titles
@@ -295,7 +371,7 @@ func renameTimestamp(value string) time.Time {
 // latest-of-writer guard will compare against.
 func (s *AgentService) handleRemoteAIRename(msg map[string]interface{}, writeJSON func(interface{}) error) {
 	sessionID := remoteString(msg, "session_id")
-	title := strings.TrimSpace(remoteString(msg, "title"))
+	title := normalizeAgentRenameTitle(remoteString(msg, "title"))
 	reject := func(reason string) {
 		_ = writeJSON(map[string]interface{}{
 			"type":       models.AgentEventAIRenameAck,
@@ -324,17 +400,23 @@ func (s *AgentService) handleRemoteAIRename(msg map[string]interface{}, writeJSO
 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	mirrorsClaude := agentRenameMirrorsClaude(remoteString(msg, "provider"), remoteString(msg, "tool"))
-	entries := loadAgentRenameCache()
-	mergeAgentRenameEntry(entries, nativeID, agentRenameCacheEntry{
-		Name:        title,
-		Origin:      agentRenameOriginPhone,
-		Source:      agentRenameSourcePhone,
-		UpdatedAt:   now,
-		ProjectPath: strings.TrimSpace(remoteString(msg, "project_path")),
-		SkipMirror:  !mirrorsClaude,
+	// One serialized read-modify-write: the inventory ticker and HTTP handlers
+	// merge observed renames on other goroutines, and an interleaved whole-file
+	// save here used to drop this phone entry permanently (no local re-source).
+	persistErr := updateAgentRenameCache(func(entries map[string]agentRenameCacheEntry) bool {
+		before, existed := entries[nativeID]
+		mergeAgentRenameEntry(entries, nativeID, agentRenameCacheEntry{
+			Name:        title,
+			Origin:      agentRenameOriginPhone,
+			Source:      agentRenameSourcePhone,
+			UpdatedAt:   now,
+			ProjectPath: strings.TrimSpace(remoteString(msg, "project_path")),
+			SkipMirror:  !mirrorsClaude,
+		})
+		return !existed || entries[nativeID] != before
 	})
-	if err := saveAgentRenameCache(entries); err != nil {
-		logger.Warn("[AGENT-RENAME] phone_rename_persist_failed sid=" + nativeID + " error=" + err.Error())
+	if persistErr != nil {
+		logger.Warn("[AGENT-RENAME] phone_rename_persist_failed sid=" + nativeID + " error=" + persistErr.Error())
 	}
 	// Mirror the rename into Claude Code's own transcript so the desktop TUI
 	// /resume list shows the phone-chosen name too (its list builder takes the
@@ -473,7 +555,10 @@ func findAgentTranscriptFile(root, name string) string {
 //     rest of this agent) and shows up as transcript_not_found.
 func appendClaudeCustomTitleLine(root, nativeSessionID, title string) error {
 	nativeSessionID = strings.TrimSpace(nativeSessionID)
-	title = strings.TrimSpace(title)
+	// Normalize on write too (not just at wire ingest): cache entries written
+	// before normalization existed, and any non-PATCH wire source, must not
+	// leak raw control characters into the transcript mirror.
+	title = normalizeAgentRenameTitle(title)
 	if strings.TrimSpace(root) == "" || nativeSessionID == "" || title == "" {
 		return nil // nothing meaningful to mirror
 	}
@@ -623,7 +708,7 @@ func convergePhoneRenameMirrors(home string, records map[string]agentRenamePidRe
 		if transcript == "" {
 			continue
 		}
-		if tail, ok := lastClaudeCustomTitleInTail(transcript); ok && tail == strings.TrimSpace(entry.Name) {
+		if tail, ok := lastClaudeCustomTitleInTail(transcript); ok && tail == normalizeAgentRenameTitle(entry.Name) {
 			continue
 		}
 		if err := appendClaudeCustomTitleLine(root, sid, entry.Name); err != nil {

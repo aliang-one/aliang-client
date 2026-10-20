@@ -1266,27 +1266,29 @@ func applyClaudeRenameNames(sessions []models.AgentVibeSession, records map[stri
 	// loaded at the top of this pass would clobber a rename observed in this
 	// scan (or a phone rename written concurrently between load and save) with
 	// stale data — the cache is durable precisely so an observed rename
-	// survives pid-file pruning, so losing that write is permanent.
+	// survives pid-file pruning, so losing that write is permanent. The cycle
+	// runs under agentRenameCacheMu so it cannot interleave with
+	// handleRemoteAIRename's write on the WS read-loop goroutine.
 	if len(observed) > 0 || len(purged) > 0 {
-		entries := loadAgentRenameCache()
-		changed := false
-		for sid := range purged {
-			if _, ok := entries[sid]; ok {
-				delete(entries, sid)
-				changed = true
+		persistErr := updateAgentRenameCache(func(entries map[string]agentRenameCacheEntry) bool {
+			changed := false
+			for sid := range purged {
+				if _, ok := entries[sid]; ok {
+					delete(entries, sid)
+					changed = true
+				}
 			}
-		}
-		for sid, entry := range observed {
-			before, existed := entries[sid]
-			mergeAgentRenameEntry(entries, sid, entry)
-			if !existed || entries[sid] != before {
-				changed = true
+			for sid, entry := range observed {
+				before, existed := entries[sid]
+				mergeAgentRenameEntry(entries, sid, entry)
+				if !existed || entries[sid] != before {
+					changed = true
+				}
 			}
-		}
-		if changed {
-			if err := saveAgentRenameCache(entries); err != nil {
-				logger.Warn("[AGENT-RENAME] cache_persist_failed error=" + err.Error())
-			}
+			return changed
+		})
+		if persistErr != nil {
+			logger.Warn("[AGENT-RENAME] cache_persist_failed error=" + persistErr.Error())
 		}
 	}
 }

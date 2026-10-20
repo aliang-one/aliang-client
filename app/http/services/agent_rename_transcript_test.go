@@ -169,16 +169,20 @@ func TestHandleRemoteAIRenameWithoutTranscriptDoesNotCreateFile(t *testing.T) {
 
 // TestHandleRemoteAIRenameTitleWithSpecialCharsStaysSingleLine guards the
 // data format: a JSONL transcript is line-delimited, so the appended record
-// must remain exactly ONE physical line with an exact round-trip value even
-// when the title contains newlines, JSON structural characters, or emoji.
+// must remain exactly ONE physical line even when the title contains
+// newlines, JSON structural characters, or emoji. Since the 2026-10 R7
+// normalization the stored value is the CC-parity SANITIZED title (control
+// chars stripped, whitespace folded): the raw title no longer round-trips —
+// CC's own /rename never stores a raw \n either.
 func TestHandleRemoteAIRenameTitleWithSpecialCharsStaysSingleLine(t *testing.T) {
 	cases := []struct {
-		name  string
-		title string
+		name     string
+		title    string
+		expected string
 	}{
-		{name: "newline", title: "第一行\n第二行"},
-		{name: "quote_and_backslash", title: `他说"你好"\结束`},
-		{name: "emoji", title: "🚀 好名字 ✨"},
+		{name: "newline", title: "第一行\n第二行", expected: "第一行第二行"},
+		{name: "quote_and_backslash", title: `他说"你好"\结束`, expected: `他说"你好"\结束`},
+		{name: "emoji", title: "🚀 好名字 ✨", expected: "🚀 好名字 ✨"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -202,7 +206,8 @@ func TestHandleRemoteAIRenameTitleWithSpecialCharsStaysSingleLine(t *testing.T) 
 			require.Len(t, lines, 2, "appended title must occupy exactly one physical line")
 			var appended map[string]string
 			require.NoError(t, json.Unmarshal([]byte(lines[1]), &appended))
-			assert.Equal(t, tc.title, appended["customTitle"], "title must round-trip exactly")
+			assert.Equal(t, tc.expected, appended["customTitle"],
+				"the sanitized title must round-trip exactly (CC pi() parity)")
 		})
 	}
 }
