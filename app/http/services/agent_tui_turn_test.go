@@ -559,7 +559,9 @@ func TestRunUserMessageFallsBackToSpawnWithoutTUI(t *testing.T) {
 
 // TestRunTUITurnStopSignalsTUIOnce 锁死停止语义：ai.stop 取消 ctx 时必须
 // ① 对 TUI pid 恰好发一次 SIGINT（=一次 Esc，TUI 保持打开）
-// ② 发出 ai.status(stopping) ③ 清理 session 占用，后续回合可跑。
+// ② 发出**终态** ai.status(stopped)——非终态的 stopping 会让服务端把 run 挂到
+// 10 分钟 stale sweeper 才收尾，卡片被标成失败（2026-10-20 事故）
+// ③ 清理 session 占用，后续回合可跑。
 func TestRunTUITurnStopSignalsTUIOnce(t *testing.T) {
 	// stub 同时替换信号与身份门，并清空去抖表；lastStubbedPid 记录被信号的 pid。
 	lastPid := stubExternalInterrupt(t, nil)
@@ -613,14 +615,14 @@ func TestRunTUITurnStopSignalsTUIOnce(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	sawStopping := false
+	sawStopped := false
 	for _, e := range events {
-		if e["type"] == "ai.status" && e["status"] == "stopping" {
-			sawStopping = true
+		if e["type"] == "ai.status" && e["status"] == "stopped" {
+			sawStopped = true
 		}
 	}
-	if !sawStopping {
-		t.Fatal("未发出 ai.status(stopping)")
+	if !sawStopped {
+		t.Fatal("未发出终态 ai.status(stopped)")
 	}
 	// session 占用已清理，后续回合可跑
 	m.mu.Lock()
@@ -808,4 +810,59 @@ func TestReadTranscriptFromHalfLine(t *testing.T) {
 	if _, _, err := readTranscriptFrom(filepath.Join(t.TempDir(), "missing.jsonl"), 0); err == nil {
 		t.Fatal("文件不存在应报错")
 	}
+}
+
+// TestFeedTUITurnActivity 锁死「tail 桥必须喂活跃度」——2026-10-20 事故的根因：
+// activity 创建后从不 bump，idle 看门狗只看到 run 起点，10 分钟就把合法的长
+// 回合当卡死杀掉。
+func TestFeedTUITurnActivity(t *testing.T) {
+	stale := time.Now().Add(-time.Hour).UnixNano()
+	fresh := func() *agentAIActivity {
+		a := newAgentAIActivity()
+		a.lastActivityAt.Store(stale)
+		a.lastProgressAt.Store(stale)
+		return a
+	}
+	t.Run("assistant text 块同时刷新活跃与进展", func(t *testing.T) {
+		a := fresh()
+		feedTUITurnActivity(a, []byte(`{"type":"assistant","uuid":"a1","message":{"content":[{"type":"text","text":"hi"}]}}`))
+		if a.idleFor() > time.Minute {
+			t.Fatalf("text 块未刷新活跃度: idleFor=%s", a.idleFor())
+		}
+		if a.progressIdleFor() > time.Minute {
+			t.Fatalf("text 块未刷新进展: progressIdleFor=%s", a.progressIdleFor())
+		}
+	})
+	t.Run("tool_use 暂停 idle 判定，tool_result 恢复", func(t *testing.T) {
+		a := fresh()
+		feedTUITurnActivity(a, []byte(`{"type":"assistant","uuid":"a2","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}}]}}`))
+		if !a.idlePaused() {
+			t.Fatal("tool_use 后应暂停 idle 判定（工具在跑不是卡死）")
+		}
+		if got := a.pendingToolUses.Load(); got != 1 {
+			t.Fatalf("pendingToolUses = %d, want 1", got)
+		}
+		// tool_result 行被 classifyTranscriptLine 判成 ignore，但活跃度仍必须喂。
+		feedTUITurnActivity(a, []byte(`{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}`))
+		if a.idlePaused() {
+			t.Fatal("tool_result 后应恢复 idle 判定")
+		}
+		if got := a.pendingToolUses.Load(); got != 0 {
+			t.Fatalf("pendingToolUses = %d, want 0", got)
+		}
+		if a.idleFor() > time.Minute {
+			t.Fatalf("tool_result 未刷新活跃度: idleFor=%s", a.idleFor())
+		}
+	})
+	t.Run("坏行不 panic、不改工具计数", func(t *testing.T) {
+		a := fresh()
+		feedTUITurnActivity(a, nil)
+		feedTUITurnActivity(a, []byte("   "))
+		feedTUITurnActivity(a, []byte("{not json"))
+		if got := a.pendingToolUses.Load(); got != 0 {
+			t.Fatalf("坏行改了工具计数: %d", got)
+		}
+		// nil activity 必须安全（spawn 路径可能没有 activity）
+		feedTUITurnActivity(nil, []byte(`{"type":"assistant"}`))
+	})
 }

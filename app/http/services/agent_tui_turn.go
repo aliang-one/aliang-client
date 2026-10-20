@@ -277,6 +277,54 @@ func extractTranscriptBlocks(line []byte) []transcriptBlock {
 	return out
 }
 
+// feedTUITurnActivity 把 transcript 的新行喂给 activity，让看门狗看到真实进展。
+//
+// 不喂的后果（2026-10-20 事故）：activity.lastActivityAt 永远停在 run 起点，
+// 10 分钟 idle 看门狗把合法的长回合当卡死杀掉；更糟的是当时收尾只发非终态的
+// ai.status(stopping)，服务端只能等 10 分钟 stale sweeper 把卡片打翻成失败。
+//
+// 判据与 spawn 路径的流式回调同口径：
+//   - 任何新行 → bump（证明 TUI 还在写）
+//   - text / thinking 块 → markProgress（有产出）
+//   - tool_use 块 → beginToolUseWait（工具执行期暂停 idle 判定）
+//   - tool_result 块 → endToolUseWait（工具已回填）
+//
+// 注意：含 tool_result 的 user 行会被 classifyTranscriptLine 判成 ignore，
+// 所以这里必须自己解 content 块，不能复用分类结果。
+func feedTUITurnActivity(activity *agentAIActivity, line []byte) {
+	if activity == nil || len(bytes.TrimSpace(line)) == 0 {
+		return
+	}
+	activity.bump()
+	var row struct {
+		Message struct {
+			Content json.RawMessage `json:"content"`
+		} `json:"message"`
+	}
+	if err := json.Unmarshal(line, &row); err != nil {
+		return
+	}
+	// content 为字符串（普通用户消息）时解成数组会失败，bump 已足够。
+	var blocks []struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(row.Message.Content, &blocks); err != nil {
+		return
+	}
+	for _, b := range blocks {
+		switch b.Type {
+		case "text", "thinking":
+			activity.markProgress()
+		case "tool_use":
+			// 工具发起也算进展：模型已经想完并动了手。
+			activity.markProgress()
+			activity.beginToolUseWait()
+		case "tool_result":
+			activity.endToolUseWait()
+		}
+	}
+}
+
 // toolUseTouchedPaths 从 tool_use 块提取被改文件路径（保序去重），供 ai.done 的
 // files_touched_count 使用。只认 transcriptFileTools 里的工具、只取 file_path
 // 键——与 spawn 路径同口径。
@@ -319,7 +367,12 @@ var tuiTurnQuietRounds = 3
 // tuiTurnCeiling 是注入回合的全局上限。没有它，一个永不回显也永不结束的注入
 // （TUI 卡死 / transcript 不写 / 判定条件永不满足）会让这个 goroutine 永久占着
 // session.cancel，该会话此后再也无法发起回合。兜底必须有。
-var tuiTurnCeiling = 30 * time.Minute
+//
+// 「卡死」的主判据是 idle 看门狗（transcript 10 分钟没有新行 → kill），所以这里
+// 只兜「一直在写、永远不结束」的病态回合，窗口必须远大于合法长回合：2026-10-20
+// 实测一个正常的 TUI 回合连续跑了 78 分钟，旧的 30 分钟上限会把它误杀成失败。
+// 可经 ALIANG_TUI_TURN_CEILING（time.ParseDuration，如 "6h"）覆写。
+var tuiTurnCeiling = resolveEnvDuration("ALIANG_TUI_TURN_CEILING", 4*time.Hour)
 
 // runTUITurn 把一个手机回合注入目标 TUI 执行，并 tail transcript 合成 run
 // 生命周期回传手机（spec §4.3）。ctx 取消 = ai.stop。
@@ -341,6 +394,22 @@ func (m *agentAIManager) runTUITurn(ctx context.Context, session *agentAISession
 	// 1) 登记：与 spawn 路径同一组字段，使 stop()/审批通道/LRU 无需改动即可工作。
 	runCtx, cancel := context.WithCancel(ctx)
 	activity := newAgentAIActivity()
+	// emitStopStatus 是 ctx 取消（用户 stop / 看门狗 kill / 硬上限）的唯一收尾。
+	// 必须发**终态** ai.status：只发 stopping（非终态）会让服务端把 run 一直挂在
+	// running 上，直到 10 分钟 stale sweeper 打翻成 timed_out/error——手机上一张
+	// 已经停下的卡片被标成失败（2026-10-20 事故）。状态名与 spawn 路径同源
+	// （agentAIRunStoppedStatus），看门狗 kill 的原因才能如实上报。
+	emitStopStatus := func() {
+		status, errMsg := agentAIRunStoppedStatus(activity, nil)
+		payload := map[string]any{
+			"type": models.AgentEventAIStatus, "session_id": session.id, "status": status,
+		}
+		if errMsg != "" {
+			payload["error"] = errMsg
+		}
+		_ = write(payload)
+	}
+
 	m.mu.Lock()
 	session.cancel = cancel
 	session.activeWriter = write
@@ -383,9 +452,9 @@ func (m *agentAIManager) runTUITurn(ctx context.Context, session *agentAISession
 	}
 	if runCtx.Err() != nil {
 		// 注入期间（含上面 held 观测窗口内）被 stop。停止信号由 defer 发，但
-		// ai.status(stopping) 必须在这里补——裸 return 会让手机只看到信号、
+		// 终态 ai.status 必须在这里补——裸 return 会让手机只看到信号、
 		// 看不到状态，UI 卡在「执行中」。
-		_ = write(map[string]any{"type": models.AgentEventAIStatus, "session_id": session.id, "status": "stopping"})
+		emitStopStatus()
 		return
 	}
 
@@ -423,7 +492,9 @@ tail:
 	for {
 		select {
 		case <-runCtx.Done():
-			_ = write(map[string]any{"type": models.AgentEventAIStatus, "session_id": session.id, "status": "stopping"})
+			// 用户 stop 或看门狗 kill：发终态（stopped / idle_timeout / ...），
+			// 服务端据此立刻关闭 run，而不是等 10 分钟 stale sweeper 猜。
+			emitStopStatus()
 			return
 		case <-ceiling:
 			// 兜底：注入回合超上限。按 error 收尾（不是 done）——手机必须知道
@@ -440,6 +511,9 @@ tail:
 		offset = newOffset
 		grew := false
 		for _, line := range lines {
+			// 先喂活跃度，再分类：不喂的话看门狗只看到 run 起点，10 分钟就误杀
+			// 合法长回合（2026-10-20 事故）。
+			feedTUITurnActivity(activity, line)
 			switch classifyTranscriptLine(line) {
 			case transcriptUserEcho:
 				// 回显注入的消息（含 TUI 侧真实用户输入），手机确认「已进终端」。
@@ -507,7 +581,7 @@ tail:
 		}
 		select {
 		case <-runCtx.Done():
-			_ = write(map[string]any{"type": models.AgentEventAIStatus, "session_id": session.id, "status": "stopping"})
+			emitStopStatus()
 			return
 		case <-time.After(tuiTurnPollInterval):
 		}
