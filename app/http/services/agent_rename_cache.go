@@ -70,6 +70,12 @@ type agentRenameCacheEntry struct {
 	Source      string `json:"source,omitempty"`
 	UpdatedAt   string `json:"updated_at"`
 	ProjectPath string `json:"project_path,omitempty"`
+	// SkipMirror records that the rename-time transcript mirror was
+	// deliberately skipped (codex/opencode sessions live outside
+	// ~/.claude/projects), so convergePhoneRenameMirrors leaves them alone
+	// too. Absent (legacy entries) = false = conservative mirror, matching
+	// agentRenameMirrorsClaude's default direction.
+	SkipMirror bool `json:"skip_mirror,omitempty"`
 }
 
 // agentRenameSourceExplicit reports whether a name provenance is a deliberate
@@ -262,6 +268,7 @@ func (s *AgentService) handleRemoteAIRename(msg map[string]interface{}, writeJSO
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
+	mirrorsClaude := agentRenameMirrorsClaude(remoteString(msg, "provider"), remoteString(msg, "tool"))
 	entries := loadAgentRenameCache()
 	mergeAgentRenameEntry(entries, nativeID, agentRenameCacheEntry{
 		Name:        title,
@@ -269,6 +276,7 @@ func (s *AgentService) handleRemoteAIRename(msg map[string]interface{}, writeJSO
 		Source:      agentRenameSourcePhone,
 		UpdatedAt:   now,
 		ProjectPath: strings.TrimSpace(remoteString(msg, "project_path")),
+		SkipMirror:  !mirrorsClaude,
 	})
 	if err := saveAgentRenameCache(entries); err != nil {
 		logger.Warn("[AGENT-RENAME] phone_rename_persist_failed sid=" + nativeID + " error=" + err.Error())
@@ -283,7 +291,7 @@ func (s *AgentService) handleRemoteAIRename(msg map[string]interface{}, writeJSO
 	// Best-effort only: the rename cache above remains the phone-side source
 	// of truth, so a failure here is logged and never fails the rename or its
 	// ack.
-	if agentRenameMirrorsClaude(remoteString(msg, "provider"), remoteString(msg, "tool")) {
+	if mirrorsClaude {
 		if home := agentHome(); home != "" {
 			if err := appendClaudeCustomTitleLine(filepath.Join(home, ".claude", "projects"), nativeID, title); err != nil {
 				if errors.Is(err, errClaudeTranscriptNotFound) {
@@ -374,18 +382,26 @@ func findAgentTranscriptFile(root, name string) string {
 }
 
 // appendClaudeCustomTitleLine mirrors a conversation rename into Claude
-// Code's own transcript so the desktop TUI /resume list shows the same name
-// as the phone. Claude Code records /rename titles by appending one
-// {"type":"custom-title",...} line to the session's JSONL and its list
-// builder takes the LAST such line per session — so "updating the title" is
-// implemented strictly as an append, never a rewrite.
+// Code's own storage so the desktop TUI /resume list shows the same name as
+// the phone. Claude Code records /rename titles in TWO places: one
+// {"type":"custom-title",...} line appended to the session's JSONL (its list
+// builder takes the LAST such line per session, so "updating the title" is
+// implemented strictly as an append, never a rewrite) and a per-session
+// sidecar file <transcript dir>/<sessionId>/custom-title.json. The sidecar
+// matters because the list builder resolves titles from the transcript's
+// first/last 64KB only: once a long turn pushes the custom-title line out of
+// the tail window, the sidecar is the only thing keeping the phone title
+// visible — Claude Code's own /rename writes both (gB → writeSessionTitleSidecar),
+// so the mirror writes both too.
 //
 // Data-safety contract (the transcript is the user's conversation history):
 //   - the file is opened write-only with O_APPEND, never read-modify-written
 //     and never truncated — existing bytes cannot be altered;
-//   - O_CREATE is never set: a missing transcript is reported via
-//     errClaudeTranscriptNotFound instead of fabricating a bare custom-title
-//     file, which would surface as an empty ghost session in /resume;
+//   - O_CREATE is never set on the transcript: a missing transcript is
+//     reported via errClaudeTranscriptNotFound instead of fabricating a bare
+//     custom-title file, which would surface as an empty ghost session in
+//     /resume. The sidecar (a separate file Claude Code owns the shape of)
+//     IS created when missing, but only after a transcript was found;
 //   - if the file does not end in a newline (a torn write by some earlier
 //     process), a separator newline is prepended so the existing partial
 //     line is not glued to the new record. With a concurrent writer (a live
@@ -433,9 +449,132 @@ func appendClaudeCustomTitleLine(root, nativeSessionID, title string) error {
 	if err != nil {
 		return err
 	}
+	if _, err := f.Write(payload); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := writeClaudeTitleSidecar(path, nativeSessionID, title); err != nil {
+		return err
+	}
+	return nil
+}
+
+// writeClaudeTitleSidecar writes Claude Code's own per-session title sidecar
+// (<transcript dir>/<sessionId>/custom-title.json, content {"customTitle":...}
+// with no trailing newline, dir 0700 / file 0600 — byte-shaped after CC's
+// writeSessionTitleSidecar). CC's /resume title resolution is
+// tail-64KB → sidecar → head-64KB, so this file is what keeps the title
+// visible after the custom-title JSONL line is evicted from the tail window.
+func writeClaudeTitleSidecar(transcriptPath, nativeSessionID, title string) error {
+	nativeSessionID = strings.TrimSpace(nativeSessionID)
+	title = strings.TrimSpace(title)
+	if nativeSessionID == "" || title == "" {
+		return nil
+	}
+	dir := filepath.Join(filepath.Dir(transcriptPath), nativeSessionID)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	raw, err := json.Marshal(claudeTitleSidecarRecord{CustomTitle: title})
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, "custom-title.json"), raw, 0o600)
+}
+
+// claudeTitleSidecarRecord is the sidecar's exact on-disk shape.
+type claudeTitleSidecarRecord struct {
+	CustomTitle string `json:"customTitle"`
+}
+
+// claudeTitleTailWindow mirrors Claude Code's transcript read window (pS=65536):
+// the /resume list builder only considers custom-title lines inside the
+// transcript's last 64KB, so convergence must judge "what will the desktop
+// show" over the same window, not over the whole file.
+const claudeTitleTailWindow = 64 * 1024
+
+// lastClaudeCustomTitleInTail returns the customTitle of the LAST
+// custom-title line inside the transcript's trailing 64KB window — exactly
+// what Claude Code's list builder will resolve for this session. ok=false
+// means the window holds no custom-title line (evicted, or never renamed).
+func lastClaudeCustomTitleInTail(path string) (string, bool) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", false
+	}
 	defer f.Close()
-	_, err = f.Write(payload)
-	return err
+	info, err := f.Stat()
+	if err != nil || info.Size() == 0 {
+		return "", false
+	}
+	window := int64(claudeTitleTailWindow)
+	if window > info.Size() {
+		window = info.Size()
+	}
+	buf := make([]byte, window)
+	if _, err := f.ReadAt(buf, info.Size()-window); err != nil {
+		return "", false
+	}
+	last, found := "", false
+	for _, line := range bytes.Split(buf, []byte("\n")) {
+		if !bytes.Contains(line, []byte(`"type":"custom-title"`)) {
+			continue
+		}
+		var record claudeCustomTitleRecord
+		if err := json.Unmarshal(line, &record); err == nil && record.CustomTitle != "" {
+			last, found = record.CustomTitle, true
+		}
+	}
+	return last, found
+}
+
+// convergePhoneRenameMirrors repairs the DESKTOP mirror of phone renames.
+// handleRemoteAIRename appends the custom-title line + sidecar once, but a
+// live Claude Code process keeps re-appending ITS in-memory (old) title every
+// ~32KB of writes, and on exit re-appends whatever old title still sits in
+// the tail window — so after the phone line is evicted from the last 64KB,
+// the desktop list can settle back on the old title indefinitely. This pass
+// walks the phone-origin entries of the durable cache and, once no live
+// process owns the session's tail, re-appends the phone title (and refreshes
+// the sidecar) whenever the tail window no longer resolves to it. Local
+// /rename titles need no such repair: they originate from Claude Code itself
+// and it keeps mirroring them.
+func convergePhoneRenameMirrors(home string, records map[string]agentRenamePidRecord) {
+	home = strings.TrimSpace(home)
+	if home == "" {
+		return
+	}
+	root := filepath.Join(home, ".claude", "projects")
+	for sid, entry := range loadAgentRenameCache() {
+		if entry.Origin != agentRenameOriginPhone || strings.TrimSpace(entry.Name) == "" {
+			continue
+		}
+		if entry.SkipMirror {
+			continue // codex/opencode sessions: the mirror was skipped at rename time
+		}
+		// A live TUI owns the tail right now (it re-appends its in-memory
+		// title on every ~32KB); re-appending under it would start a ping-pong
+		// of alternating title lines. Wait for the process to exit.
+		if record, ok := records[sid]; ok && isPidAlive(record.PID) {
+			continue
+		}
+		if !claudeSessionIDPattern.MatchString(sid) {
+			continue
+		}
+		transcript := findAgentTranscriptFile(root, sid+".jsonl")
+		if transcript == "" {
+			continue
+		}
+		if tail, ok := lastClaudeCustomTitleInTail(transcript); ok && tail == strings.TrimSpace(entry.Name) {
+			continue
+		}
+		if err := appendClaudeCustomTitleLine(root, sid, entry.Name); err != nil {
+			logger.Warn("[AGENT-RENAME] converge_mirror_failed sid=" + sid + " error=" + err.Error())
+		}
+	}
 }
 
 func readLastByte(path string) (byte, error) {

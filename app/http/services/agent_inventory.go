@@ -932,7 +932,12 @@ func collectClaudeVibeSessionsWithStats(scanDirs []string) ([]models.AgentVibeSe
 	// the agent's durable rename cache (last-writer-wins on the agent clock) so
 	// a rename, once observed, never reverts — even after Claude Code prunes
 	// the pid file.
-	applyClaudeRenameNames(sessions, loadClaudeRenameRecords(home), transcriptFreshness)
+	renameRecords := loadClaudeRenameRecords(home)
+	applyClaudeRenameNames(sessions, renameRecords, transcriptFreshness)
+	// After the overlay has settled the cache, repair the desktop-side mirror
+	// (transcript custom-title line + sidecar) for phone renames that a live
+	// Claude Code process has since buried under newer writes.
+	convergePhoneRenameMirrors(home, renameRecords)
 	return sessions, transcriptDropped
 }
 
