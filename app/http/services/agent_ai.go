@@ -912,6 +912,11 @@ func (m *agentAIManager) runEmitter(run agentAIRun, write agentTerminalWriter) *
 				payload["source_session_id"] = binding.NativeSessionID
 				payload["binding_version"] = binding.BindingVersion
 			}
+			// One line per run terminal. Its absence is how the 2026-10-21
+			// incident stayed invisible: the run died with no trace of whether a
+			// terminal was ever produced, journaled, or merely failed to send.
+			logger.Info(fmt.Sprintf("[ai.run.terminal] status=%s type=%s session=%s run=%s seq=%v",
+				remoteString(payload, "status"), remoteString(payload, "type"), run.sessionID, run.runID, payload["event_seq"]))
 			if err := m.rememberPendingTerminal(payload); err != nil {
 				return err
 			}
@@ -2797,12 +2802,57 @@ func (m *agentAIManager) close(msg map[string]interface{}, writeJSON agentTermin
 	}
 }
 
+// agentAITeardownStatus 是「run 的所有者被拆掉」时发布的终态。服务端把
+// stopped|cancelled|interrupted 映射成 run_state=cancelled（生命周期收敛），
+// 这才是「回合被打断」的诚实结论。什么都不发则会留下一个 live run，被服务端
+// 的 stale sweeper 打翻成 timed_out —— 手机上一张红色失败卡片（2026-10-21 事故）。
+const agentAITeardownStatus = "cancelled"
+
+func agentAITeardownMessage(reason string) string {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "agent_shutdown"
+	}
+	return fmt.Sprintf("AI run cancelled by the agent (%s); the local process may keep running, but its result is no longer reported", reason)
+}
+
+// closeAll 拆掉本机所有常驻 AI 会话（进程内调用点没有具体原因时的默认入口）。
 func (m *agentAIManager) closeAll() {
+	m.closeAllWithReason("agent_shutdown")
+}
+
+// closeAllWithReason 拆掉本机所有常驻 AI 会话。在途 run **先收敛后取消**：通过该
+// run 自己的 emitter 发布终态 ai.status —— emitter 会先把终态写进持久 journal
+// (rememberPendingTerminal) 并关闭 terminal 屏障，之后才 cancel ctx。
+//
+// 顺序在这里有两重意义：
+//  1. journal 必须在 run 身份还在手上时落盘，进程随后崩掉也还能在下次
+//     agent.registered 时由 replayPendingTerminals 重放；
+//  2. terminal 屏障让 run goroutine 的 ctx.Err() 分支无法再塞一个自相矛盾的终态。
+//
+// 旧实现先把 m.sessions 整个换掉再 cancel，run goroutine 醒来时既找不到 session
+// 也没有终态可发，服务端就一直挂着一个 live run，直到 sweeper 把它画成
+// timed_out/失败（2026-10-21 事故：回合其实已经跑完，卡片却是红的）。
+func (m *agentAIManager) closeAllWithReason(reason string) {
+	type inflightRun struct {
+		sessionID string
+		runID     string
+		write     agentTerminalWriter
+	}
+
 	m.mu.Lock()
 	cancels := make([]context.CancelFunc, 0, len(m.sessions))
+	runs := make([]inflightRun, 0, len(m.sessions))
 	for _, session := range m.sessions {
 		if session.cancel != nil {
 			cancels = append(cancels, session.cancel)
+			if session.activeWriter != nil {
+				runs = append(runs, inflightRun{
+					sessionID: session.id,
+					runID:     session.activeRunID,
+					write:     session.activeWriter,
+				})
+			}
 		}
 		// Drop pendingOption on shutdown (no writer -> rely on server offline-grace).
 		session.pendingOption = nil
@@ -2811,6 +2861,22 @@ func (m *agentAIManager) closeAll() {
 	m.sessions = make(map[string]*agentAISession)
 	m.mu.Unlock()
 
+	message := agentAITeardownMessage(reason)
+	for _, run := range runs {
+		err := run.write(map[string]interface{}{
+			"type":       models.AgentEventAIStatus,
+			"session_id": run.sessionID,
+			"status":     agentAITeardownStatus,
+			"error":      message,
+		})
+		// emitter 先 journal 后写线，所以这里报错只代表「还没上线路」，终态本身
+		// 已经持久化，重连后会被 replayPendingTerminals 补发。
+		logger.Info(fmt.Sprintf("[ai.run.terminal] status=%s session=%s run=%s reason=%s delivered=%t",
+			agentAITeardownStatus, run.sessionID, run.runID, reason, err == nil))
+		if err != nil {
+			logger.Warn(fmt.Sprintf("[ai.run.terminal] teardown delivery deferred session=%s run=%s error=%v", run.sessionID, run.runID, err))
+		}
+	}
 	for _, cancel := range cancels {
 		cancel()
 	}

@@ -303,7 +303,11 @@ func (s *AgentService) forceDisconnectRemote(reason string) {
 		s.tunnel.Stop()
 	}
 	s.terminal.closeAll()
-	s.ai.closeAll()
+	// Converge in-flight runs to a terminal BEFORE the sessions are dropped: the
+	// terminal is journaled first, so it survives this teardown (and even a crash)
+	// and is replayed on the next agent.registered. Without it the server keeps
+	// the run live and its stale sweeper later paints a false timed_out card.
+	s.ai.closeAllWithReason("connection_force_closed:" + normalizeAgentDisableReason(reason))
 }
 
 func (s *AgentService) shouldPreserveDisabledStatus() bool {
@@ -334,7 +338,7 @@ func (s *AgentService) remoteLoopExitCleanup(recoverable bool) {
 		// sessions and terminal PTYs that runRemoteAgentSession deliberately
 		// keeps alive across transient reconnects.
 		s.terminal.closeAll()
-		s.ai.closeAll()
+		s.ai.closeAllWithReason("connection_loop_exit")
 	}
 	s.wsMu.Lock()
 	s.wsConnecting = false
@@ -399,6 +403,11 @@ var (
 	// writeAgentAIApprovalRequest's 5×/1s loop) recovers once registration lands.
 	// Package var so tests can shrink it.
 	agentRemoteRegistrationWait = newDurationAtom(5 * time.Second)
+	// agentRemoteTeardownGrace bounds how long runRemoteAgentSession waits for its
+	// ping/heartbeat goroutines to leave the stack before returning. They only
+	// need to observe close(done); the grace exists so a goroutine parked inside a
+	// socket write can never delay loop exit indefinitely.
+	agentRemoteTeardownGrace = newDurationAtom(2 * time.Second)
 )
 
 func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn) error {
@@ -474,13 +483,35 @@ func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn) error {
 	// in the agent.registered handler below once the gate opens.
 
 	done := make(chan struct{})
-	defer close(done)
+	// background tracks the ping/heartbeat goroutines. close(done) only *signals*
+	// them; a goroutine already parked inside a socket write (or inside
+	// waitForRegistration) keeps running after this function returns — straight
+	// into a connection the caller is closing. That is the use-after-teardown
+	// shape which surfaced as an unexplained SIGBUS with a garbage PC inside the
+	// heartbeat select below (2026-10-21). Wait for them, bounded by a grace so a
+	// stuck write can never block loop exit.
+	var background sync.WaitGroup
+	defer func() {
+		close(done)
+		finished := make(chan struct{})
+		go func() {
+			background.Wait()
+			close(finished)
+		}()
+		select {
+		case <-finished:
+		case <-time.After(agentRemoteTeardownGrace.Load()):
+			logger.Warn("[AGENT-BOOT] remote_connection teardown_grace_expired waiting for ping/heartbeat goroutines")
+		}
+	}()
 
 	// Ping goroutine, independent of the application ticker below: liveness
 	// probes must never be starved by (or starve) heartbeats/inventory writes.
 	// WriteControl is safe to call concurrently with WriteJSON and carries its
 	// own deadline, so it does not contend on writeMu.
+	background.Add(1)
 	go func() {
+		defer background.Done()
 		pingTicker := time.NewTicker(agentRemotePingInterval.Load())
 		defer pingTicker.Stop()
 		for {
@@ -495,7 +526,9 @@ func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn) error {
 		}
 	}()
 
+	background.Add(1)
 	go func() {
+		defer background.Done()
 		heartbeatTicker := time.NewTicker(agentRemoteHeartbeatInterval.Load())
 		defer heartbeatTicker.Stop()
 		inventoryTicker := time.NewTicker(time.Minute)

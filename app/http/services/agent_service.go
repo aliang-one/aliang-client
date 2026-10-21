@@ -2403,7 +2403,7 @@ func (s *AgentService) applyRemoteDeviceSettings(msg map[string]interface{}) {
 		s.terminal.closeAll()
 	}
 	if aiDisabled {
-		s.ai.closeAll()
+		s.ai.closeAllWithReason("ai_control_disabled")
 	}
 }
 
