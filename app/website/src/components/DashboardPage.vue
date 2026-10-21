@@ -59,6 +59,23 @@
           </div>
         </div>
       </div>
+      <div class="px-8 pb-2">
+        <button
+          type="button"
+          data-testid="agent-entry-sidebar"
+          class="flex w-full items-center gap-3 rounded-lg border border-primary/20 bg-primary/5 px-4 py-2.5 text-left transition hover:border-primary/40 hover:bg-primary/10 dark:border-primary/30 dark:bg-primary/10 dark:hover:bg-primary/20"
+          :title="agentEntryTitle"
+          @click="handleShowAgent"
+        >
+          <span class="relative flex size-2 shrink-0">
+            <span class="absolute inline-flex h-full w-full rounded-full opacity-50 motion-safe:animate-ping" :class="agentDotClass"></span>
+            <span class="relative inline-flex size-2 rounded-full" :class="agentDotClass"></span>
+          </span>
+          <span class="material-symbols-outlined text-lg text-primary">terminal</span>
+          <span class="min-w-0 flex-1 truncate text-sm font-bold text-slate-800 dark:text-slate-100">{{ t('settings_tabAgent') }}</span>
+          <span class="shrink-0 text-[10px] font-bold uppercase tracking-wider text-primary">{{ statusLabel }}</span>
+        </button>
+      </div>
       <div class="p-8 flex flex-col items-center justify-center gap-6" data-guide="power">
         <div class="relative">
           <div class="absolute -inset-4 rounded-full scale-110 transition-all" :class="powerButtonHaloClass"></div>
@@ -209,6 +226,16 @@
           </div>
           <button
             type="button"
+            data-testid="agent-entry-topbar"
+            class="relative flex size-11 shrink-0 items-center justify-center rounded-xl border border-primary/20 bg-primary/10 text-primary"
+            :title="agentEntryTitle"
+            @click="handleShowAgent"
+          >
+            <span class="material-symbols-outlined text-lg">terminal</span>
+            <span class="absolute right-1.5 top-1.5 size-2 rounded-full" :class="agentDotClass"></span>
+          </button>
+          <button
+            type="button"
             data-mobile-account
             class="flex size-11 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-primary to-emerald-500 text-white"
             :title="userDisplayName"
@@ -246,6 +273,21 @@
               <span class="mt-0.5 block truncate text-[11px] text-slate-400">{{ accountSubtitle }}</span>
             </span>
             <span class="shrink-0 rounded bg-primary/10 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-primary">{{ planLabel }}</span>
+          </button>
+          <button
+            type="button"
+            data-testid="agent-entry-panel"
+            class="flex w-full items-center gap-3 rounded-lg border border-primary/20 bg-primary/5 px-3 py-3 text-left transition hover:border-primary/40 hover:bg-primary/10 dark:border-primary/30 dark:bg-primary/10 dark:hover:bg-primary/20"
+            @click="handleShowAgent"
+          >
+            <span class="flex size-10 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
+              <span class="material-symbols-outlined">terminal</span>
+            </span>
+            <span class="min-w-0 flex-1">
+              <span class="block truncate text-sm font-bold text-slate-900 dark:text-white">{{ t('settings_tabAgent') }}</span>
+              <span class="mt-0.5 block truncate text-[11px] text-slate-400">{{ statusLabel }}</span>
+            </span>
+            <span class="size-2 shrink-0 rounded-full" :class="agentDotClass"></span>
           </button>
           <div
             v-if="!isAuthenticated"
@@ -377,6 +419,20 @@
             </div>
           </div>
           <div class="hidden md:block h-8 w-px bg-slate-200 dark:bg-slate-800 mx-2"></div>
+          <button
+            type="button"
+            data-testid="agent-entry-header"
+            class="hidden md:inline-flex h-10 items-center gap-1.5 rounded-lg border border-primary/20 bg-primary/5 px-3 text-xs font-bold text-primary transition hover:border-primary/40 hover:bg-primary/10 dark:border-primary/30 dark:bg-primary/10 dark:hover:bg-primary/20"
+            :title="agentEntryTitle"
+            @click="handleShowAgent"
+          >
+            <span class="relative flex size-2 shrink-0">
+              <span class="absolute inline-flex h-full w-full rounded-full opacity-50 motion-safe:animate-ping" :class="agentDotClass"></span>
+              <span class="relative inline-flex size-2 rounded-full" :class="agentDotClass"></span>
+            </span>
+            <span class="material-symbols-outlined text-base">terminal</span>
+            {{ t('settings_tabAgent') }}
+          </button>
           <button
             type="button"
             class="inline-flex size-10 items-center justify-center rounded-lg text-slate-500 transition hover:bg-slate-100 hover:text-primary dark:hover:bg-slate-800 dark:hover:text-primary"
@@ -948,6 +1004,7 @@ import { openTutorialDocs } from '../composables/useTutorialDocs';
 import { useI18n } from '../i18n';
 import { useCertStatus } from '../composables/useCertStatus';
 import { useNavigation } from '../composables/useNavigation';
+import { useAgentStatus } from '../composables/useAgentStatus';
 import { useRunStatus } from '../composables/useRunStatus';
 import { useSoftwareUpdate } from '../composables/useSoftwareUpdate';
 import { useAuthStore } from '../stores/auth';
@@ -967,7 +1024,10 @@ const isProdBuild = import.meta.env.PROD || ['prod', 'production'].includes(Stri
 const frontEndLogsFetchLimit = isProdBuild ? 200 : 800;
 
 const { certStatus, loading: certLoading, startPolling: startCertPolling, stopPolling: stopCertPolling } = useCertStatus();
-const { currentPage, showSettings } = useNavigation();
+const { currentPage, showSettings, showAgent } = useNavigation();
+// Agent 入口的状态点：与 Agent 页共享同一份 /api/agent/status 单例，
+// 仪表盘加载时预热一次，进 Agent 页不再重复拉取。
+const { runtimeOnline, agentEnabled, statusLabel, ensureLoaded } = useAgentStatus();
 const { isAuthenticated, user, userDisplayName, planLabel, authNotice, loginPending, loginError, dashboardSessionRequired, loginWithPassword } = useAuthStore();
 const {
   runMode,
@@ -1712,6 +1772,10 @@ function handleShowSettings() {
   showSettings();
 }
 
+function handleShowAgent() {
+  showAgent();
+}
+
 const runModeLabel = computed(() => {
   if (runMode.value === 'tun') return t('dash_tunMode');
   if (runMode.value === 'http') return t('dash_httpMode');
@@ -2118,7 +2182,18 @@ const certBadgeClass = computed(() => {
   }
 });
 
+// Agent 入口状态点：在线=绿、runtime 离线=琥珀、已关闭=灰。与状态徽章
+// 同一套判定（runtimeOnline + enabled），文案复用 Agent 页的 statusLabel。
+const agentDotClass = computed(() => {
+  if (!runtimeOnline.value) return 'bg-amber-500';
+  if (agentEnabled.value) return 'bg-emerald-500';
+  return 'bg-slate-400';
+});
+
+const agentEntryTitle = computed(() => `${t('settings_tabAgent')} · ${statusLabel.value}`);
+
 onMounted(() => {
+  ensureLoaded().catch(() => {});
   startCertPolling();
   startRunStatusPolling();
   refreshSoftwareUpdateStatus().catch(() => {});

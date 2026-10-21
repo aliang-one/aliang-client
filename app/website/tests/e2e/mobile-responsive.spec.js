@@ -90,6 +90,27 @@ test.describe('mobile 390x844', () => {
     }
   });
 
+  test('dashboard: Agent 入口（顶栏/折叠面板）可进入 Agent 页', async ({ page }) => {
+    await page.goto('/');
+    await expect(page.locator('h1').first()).toContainText('ALiang');
+
+    // 顶栏图标入口（44px 触控目标）
+    const topbarEntry = page.locator('[data-testid="agent-entry-topbar"]');
+    await expect(topbarEntry).toBeVisible();
+    await topbarEntry.click();
+    await expect(page.locator('#settings-page')).toBeVisible();
+    await expect(page.locator('#settings-page h1').first()).toContainText(/Agent/);
+
+    // 回到仪表板，走折叠面板整行入口
+    await page.locator('#backToDashboard').click();
+    await expect(page.locator('h1').first()).toContainText('ALiang');
+    await page.locator('[data-mobile-panel-toggle]').click();
+    const panelEntry = page.locator('[data-testid="agent-entry-panel"]');
+    await expect(panelEntry).toBeVisible();
+    await panelEntry.click();
+    await expect(page.locator('#settings-page h1').first()).toContainText(/Agent/);
+  });
+
   test('登录弹窗在视口内且可滚动到底部按钮', async ({ page }) => {
     // 未登录态：拦掉 session 快照
     await page.route('**/api/auth/session', (route) =>
@@ -138,6 +159,25 @@ test.describe('desktop 1280x800 控制组（桌面零变化）', () => {
     await expect(page.locator('aside').first()).toBeVisible();
     await expect(page.getByText(/服务器连接|服务器链路|Server Link/i).first()).toBeVisible();
     await expect(page.locator('[data-mobile-topbar]')).toBeHidden(); // md:hidden 下元素仍在 DOM，仅 display:none
+  });
+
+  test('桌面: Agent 入口（顶栏/侧栏账户区）可见且可进入 Agent 页', async ({ page }) => {
+    await page.goto('/');
+    await expect(page.locator('h1').first()).toContainText('ALiang');
+
+    const headerEntry = page.locator('[data-testid="agent-entry-header"]');
+    const sidebarEntry = page.locator('[data-testid="agent-entry-sidebar"]');
+    await expect(headerEntry).toBeVisible();
+    await expect(sidebarEntry).toBeVisible();
+
+    await sidebarEntry.click();
+    await expect(page.locator('#settings-page')).toBeVisible();
+    await expect(page.locator('#settings-page h1').first()).toContainText(/Agent/);
+
+    await page.locator('#backToDashboard').click();
+    await expect(page.locator('h1').first()).toContainText('ALiang');
+    await headerEntry.click();
+    await expect(page.locator('#settings-page h1').first()).toContainText(/Agent/);
   });
 });
 

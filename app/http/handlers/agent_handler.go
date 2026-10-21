@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,9 +18,17 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// agentProxyDataTimeout 是仪表盘数据面代理（会话列表/转录/终端回放）的期限。
+// 这些读取在 runtime 侧可能触发冷转录扫描（liang-dev 实测 30s+），走 12s
+// 控制面 client 会被掐断并退化成「空列表 + 200」（2026-10-21 事故），所以
+// 单独走无硬超时的 client，由这里的 context 期限兜底。
+const agentProxyDataTimeout = 45 * time.Second
+
 type AgentHandler struct {
 	service *services.AgentService
 	client  *http.Client
+	// dataClient 不设 Timeout：期限由 agentProxyDataTimeout 的 context 控制。
+	dataClient *http.Client
 }
 
 func NewAgentHandler(service *services.AgentService) *AgentHandler {
@@ -27,8 +36,9 @@ func NewAgentHandler(service *services.AgentService) *AgentHandler {
 		service = services.GetSharedAgentService()
 	}
 	return &AgentHandler{
-		service: service,
-		client:  &http.Client{Timeout: 12 * time.Second},
+		service:    service,
+		client:     &http.Client{Timeout: 12 * time.Second},
+		dataClient: &http.Client{},
 	}
 }
 
@@ -261,7 +271,12 @@ func (h *AgentHandler) HandleVibeSessions(w http.ResponseWriter, r *http.Request
 		common.Success(w, map[string]interface{}{"sessions": h.service.VibeSessions()})
 		return
 	}
-	if err := h.proxyToUserAgent(w, r); err != nil {
+	// 数据面代理：runtime 侧冷扫描可能远超 12s 控制面超时，12s 掐断后这里的
+	// 兜底空列表会把「运行中的 agent」误报成离线（2026-10-21 liang-dev 实测）。
+	// 改走 dataClient + agentProxyDataTimeout 期限，兜底语义保持不变。
+	ctx, cancel := context.WithTimeout(r.Context(), agentProxyDataTimeout)
+	defer cancel()
+	if err := h.proxyToUserAgentClient(ctx, w, r, h.dataClient); err != nil {
 		common.Success(w, map[string]interface{}{"sessions": []interface{}{}})
 		return
 	}
@@ -278,7 +293,10 @@ func (h *AgentHandler) HandleRuntimeSessions(w http.ResponseWriter, r *http.Requ
 		common.Success(w, h.service.RuntimeSessions())
 		return
 	}
-	if err := h.proxyToUserAgent(w, r); err != nil {
+	// 数据面代理：与 HandleVibeSessions 同理，走 dataClient + 更长期限。
+	ctx, cancel := context.WithTimeout(r.Context(), agentProxyDataTimeout)
+	defer cancel()
+	if err := h.proxyToUserAgentClient(ctx, w, r, h.dataClient); err != nil {
 		common.Success(w, models.AgentRuntimeSnapshot{
 			AIConversations: []models.AgentVibeSession{},
 			Terminals:       []models.AgentTerminalRuntime{},
@@ -293,7 +311,7 @@ func (h *AgentHandler) HandleVibeSession(w http.ResponseWriter, r *http.Request)
 		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
 		return
 	}
-	if h.proxyIfNeeded(w, r) {
+	if h.proxyDataIfNeeded(w, r) {
 		return
 	}
 	id := strings.TrimSpace(r.URL.Query().Get("id"))
@@ -318,7 +336,7 @@ func (h *AgentHandler) HandleVibeSession(w http.ResponseWriter, r *http.Request)
 // HandleTerminalScrollback returns a terminal session's recent output
 // (?limit= bytes, default 64KiB, cap 512KiB). Mirrors HandleRuntimeSessions:
 // the terminal manager lives in the user-agent runtime, so non-runtime
-// processes proxy there via proxyIfNeeded.
+// processes proxy there via proxyDataIfNeeded（数据面期限，见 agentProxyDataTimeout）.
 func (h *AgentHandler) HandleTerminalScrollback(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		// common.Error 收业务码（100-299），直传 http.StatusMethodNotAllowed 会被
@@ -331,7 +349,7 @@ func (h *AgentHandler) HandleTerminalScrollback(w http.ResponseWriter, r *http.R
 		common.ErrorBadRequest(w, "sessionId is required", nil)
 		return
 	}
-	if h.proxyIfNeeded(w, r) {
+	if h.proxyDataIfNeeded(w, r) {
 		return
 	}
 	limit := 0
@@ -397,9 +415,33 @@ func (h *AgentHandler) proxyIfNeeded(w http.ResponseWriter, r *http.Request) boo
 	return true
 }
 
+// proxyDataIfNeeded 是数据面端点（会话列表/转录/终端回放）专用的代理入口：
+// 与 proxyIfNeeded 行为一致，但走无硬超时的 dataClient 并施加
+// agentProxyDataTimeout 期限，避免 12s 控制面 client 把冷扫描掐成空列表。
+func (h *AgentHandler) proxyDataIfNeeded(w http.ResponseWriter, r *http.Request) bool {
+	if services.IsUserAgentRuntime() {
+		return false
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), agentProxyDataTimeout)
+	defer cancel()
+	if err := h.proxyToUserAgentClient(ctx, w, r, h.dataClient); err != nil {
+		common.Error(w, common.CodeServiceUnavailable, "User agent process is not running", map[string]interface{}{
+			"error": err.Error(),
+			"url":   services.UserAgentBaseURL(),
+		})
+		return true
+	}
+	return true
+}
+
 func (h *AgentHandler) proxyToUserAgent(w http.ResponseWriter, r *http.Request) error {
+	return h.proxyToUserAgentClient(r.Context(), w, r, h.client)
+}
+
+func (h *AgentHandler) proxyToUserAgentClient(ctx context.Context, w http.ResponseWriter, r *http.Request, client *http.Client) error {
 	target := services.UserAgentBaseURL() + r.URL.RequestURI()
-	req, err := http.NewRequestWithContext(r.Context(), r.Method, target, r.Body)
+	req, err := http.NewRequestWithContext(ctx, r.Method, target, r.Body)
 	if err != nil {
 		return err
 	}
@@ -414,7 +456,7 @@ func (h *AgentHandler) proxyToUserAgent(w http.ResponseWriter, r *http.Request) 
 		req.Header.Set(services.AgentForwardedUserKeyHeader, userKey)
 	}
 
-	resp, err := h.client.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
