@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"aliang.one/nursorgate/app/http/models"
 	"aliang.one/nursorgate/common/cache"
@@ -563,12 +564,20 @@ func agentMimeType(path string, raw []byte, binary bool) string {
 	}
 }
 
+// isLikelyAgentBinary 判断读到的文件头是否二进制。中文等多字节 UTF-8 文本
+// 的每个字节都 >126，旧的「不可打印字节 >1/3」按字节统计会把整篇中文判成
+// 二进制、走 base64 通道，手机端只能显示「base64 content returned by
+// Agent」占位（2026-10-22 事故）。改为：含 NUL → 二进制；合法 UTF-8（容忍
+// 缓冲区尾部截断的半个多字节字符）→ 文本；其余按可打印比例兜底。
 func isLikelyAgentBinary(raw []byte) bool {
 	if len(raw) == 0 {
 		return false
 	}
 	if bytes.IndexByte(raw, 0) >= 0 {
 		return true
+	}
+	if isAgentUTF8TextWithTruncatedTail(raw) {
+		return false
 	}
 	nonPrintable := 0
 	for _, b := range raw {
@@ -580,6 +589,22 @@ func isLikelyAgentBinary(raw []byte) bool {
 		}
 	}
 	return nonPrintable > len(raw)/3
+}
+
+// isAgentUTF8TextWithTruncatedTail 报告 raw 是否 UTF-8 文本。raw 是按
+// maxBytes 截断的文件头，末尾可能恰好切开一个多字节字符——utf8.Valid 对
+// 这种截断会误报，因此允许剥掉末尾最多 3 个不完整字节再验；中段任何非法
+// 序列仍会如实判否。
+func isAgentUTF8TextWithTruncatedTail(raw []byte) bool {
+	if utf8.Valid(raw) {
+		return true
+	}
+	for trim := 1; trim <= 3 && trim < len(raw); trim++ {
+		if utf8.Valid(raw[:len(raw)-trim]) {
+			return true
+		}
+	}
+	return false
 }
 
 func minInt(a int, b int) int {
