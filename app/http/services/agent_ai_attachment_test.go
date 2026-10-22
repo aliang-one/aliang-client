@@ -1,6 +1,8 @@
 package services
 
 import (
+	"context"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -157,4 +159,67 @@ func TestAgentAIAttachmentPromptSuffixFenceEscapesBackticks(t *testing.T) {
 	if !strings.Contains(suffix, "````") {
 		t.Fatalf("fence should grow past the longest backtick run: %q", suffix)
 	}
+}
+
+// TestDownloadedAttachmentsReachProviderArgsAsRealFiles 是 T11+T13 的接缝测试：
+// 下载器把 URL 换成临时文件后，codex --image / opencode --file 拿到的必须是
+// 磁盘上真实存在、内容正确的路径，而不是一条已经清空的 URL。
+func TestDownloadedAttachmentsReachProviderArgsAsRealFiles(t *testing.T) {
+	payload := []byte("\x89PNG\r\n\x1a\nfake")
+	server := newAttachmentTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(payload)
+	})
+	withTestTransport(t, server)
+
+	downloaded, cleanup, err := downloadAgentAIAttachments(context.Background(), []agentAIAttachment{
+		{Type: "image", Name: "shot.png", URL: server.URL + "/shot.png"},
+	}, []string{hostOf(t, server.URL)})
+	if err != nil {
+		t.Fatalf("download: %v", err)
+	}
+	defer cleanup()
+	if downloaded[0].URL != "" {
+		t.Fatalf("下载后 URL 应清空（否则下游会重复投递）: %#v", downloaded[0])
+	}
+
+	// codex：--image 后跟的路径必须能读到原始字节
+	codex := withAgentAIAttachments(&agentAITool{
+		outputFormat: agentAIOutputCodexJSON, args: []string{"exec", "--json", "prompt"},
+	}, downloaded)
+	codexImage := argValueAfter(codex.args, "--image")
+	if codexImage == "" {
+		t.Fatalf("codex 缺少 --image: %#v", codex.args)
+	}
+	if body, err := os.ReadFile(codexImage); err != nil || string(body) != string(payload) {
+		t.Fatalf("--image 指向的文件不可用: %v %q", err, body)
+	}
+	if strings.Contains(strings.Join(codex.args, " "), "shot.png") && codexImage == "" {
+		t.Fatalf("不应只列名字不传路径: %#v", codex.args)
+	}
+
+	// opencode：--file 同理
+	opencode := withAgentAIAttachments(&agentAITool{
+		outputFormat: agentAIOutputOpenCodeJSON, args: []string{"run", "--format", "json", "prompt"},
+	}, downloaded)
+	opencodeFile := argValueAfter(opencode.args, "--file")
+	if body, err := os.ReadFile(opencodeFile); err != nil || string(body) != string(payload) {
+		t.Fatalf("--file 指向的文件不可用: %v %q", err, body)
+	}
+
+	// claude stream-json：图片走 block，不再进 prompt 附件清单
+	claude := newClaudeCodeAIToolForOSWithInput("darwin", "claude", "/usr/local/bin/claude", "prompt", "", "", "", true)
+	claudeWrapped := withAgentAIAttachments(claude, downloaded)
+	if strings.Contains(claudeWrapped.stdinPrompt, "shot.png") {
+		t.Fatalf("claude 图片不该再列进 prompt 清单（会重复解读）: %q", claudeWrapped.stdinPrompt)
+	}
+}
+
+// argValueAfter 返回 flag 后面的那个参数。
+func argValueAfter(args []string, flag string) string {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == flag {
+			return args[i+1]
+		}
+	}
+	return ""
 }

@@ -285,6 +285,10 @@ type agentAISteerMessage struct {
 	MessageID string
 	Content   string
 	CreatedAt time.Time
+	// ImageBlocks 是随插话一起发过去的图片（已 base64 编码成 provider block）。
+	// 刻意在 steer 入口就编码完：steer 可能排队到 control.started 之后才写出，
+	// 若携带临时文件路径，排队期间清理就会把文件删掉。
+	ImageBlocks []map[string]interface{}
 }
 
 type agentAICodexSteerControl struct {
@@ -344,6 +348,8 @@ type agentAIRun struct {
 	prompt                  string
 	freshPrompt             string
 	attachments             []agentAIAttachment
+	// 服务端下发的附件下载白名单（SSRF 围栏），空则回落到环境变量。
+	attachmentAllowedHosts  []string
 	cancel                  context.CancelFunc
 	approvalToken           string
 	activity                *agentAIActivity
@@ -1576,7 +1582,7 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 		return
 	}
 
-	if err := m.runUserMessage(session, remoteString(msg, "run_id"), messageID, content, provider, attachments, emitter, messageRun.nativeGoal); err != nil {
+	if err := m.runUserMessage(session, remoteString(msg, "run_id"), messageID, content, provider, attachments, remoteStringSlice(msg, "attachment_allowed_hosts"), emitter, messageRun.nativeGoal); err != nil {
 		_ = runWrite(agentAIErrorPayload(sessionID, messageID, err))
 	}
 }
@@ -1958,22 +1964,47 @@ func (m *agentAIManager) steer(msg map[string]interface{}, writeJSON agentTermin
 		emitAgentAISteerAck(writeJSON, sessionID, messageID, "unsupported", "ai.steer is only supported by active Codex app-server or Claude stream-json runs", "unsupported_provider")
 		return
 	}
-	now := time.Now().UTC()
+	projectPath := session.projectPath
+	m.mu.Unlock()
+
+	// 附件在写 history 之前物化：校验失败不该留下一条「用户说过但没发出去」
+	// 的历史（下一轮 prompt 会把它当上下文带上）。
+	attachments, err := resolveAgentAIAttachments(msg["attachments"], projectPath)
+	if err != nil {
+		emitAgentAISteerAck(writeJSON, sessionID, messageID, "error", err.Error(), "bad_request")
+		return
+	}
+	steer := agentAISteerMessage{
+		MessageID: messageID,
+		Content:   content,
+		CreatedAt: time.Now().UTC(),
+	}
+	if len(attachments) > 0 {
+		// 文本素材并入正文；图片编码成 block（base64 内联，不落临时文件，
+		// 因此可以安全排队——见 agentAISteerMessage.ImageBlocks 注释）。
+		if suffix := agentAIAttachmentPromptSuffix(textOnlyAttachments(attachments), false); suffix != "" {
+			steer.Content += suffix
+		}
+		if hasImageAttachments(attachments) {
+			blocks, buildErr := buildSteerImageBlocks(context.Background(), attachments, remoteStringSlice(msg, "attachment_allowed_hosts"))
+			if buildErr != nil {
+				emitAgentAISteerAck(writeJSON, sessionID, messageID, "error", buildErr.Error(), "send_failed")
+				return
+			}
+			steer.ImageBlocks = blocks
+		}
+	}
+
+	m.mu.Lock()
 	session.history = append(session.history, agentAIMessage{
 		Role:      "user",
 		MessageID: messageID,
 		Content:   content,
-		CreatedAt: now,
+		CreatedAt: steer.CreatedAt,
 	})
 	m.mu.Unlock()
 
-	steer := agentAISteerMessage{
-		MessageID: messageID,
-		Content:   content,
-		CreatedAt: now,
-	}
 	var result string
-	var err error
 	if control != nil {
 		result, err = control.enqueue(steer)
 	} else {
@@ -2086,9 +2117,7 @@ func (c *agentAICodexSteerControl) nextSteerPayloadLocked(msg agentAISteerMessag
 			"threadId":            c.threadID,
 			"expectedTurnId":      c.turnID,
 			"clientUserMessageId": msg.MessageID,
-			"input": []map[string]interface{}{
-				{"type": "text", "text": msg.Content, "text_elements": []interface{}{}},
-			},
+			"input": codexSteerInput(msg),
 		},
 	}
 }
@@ -2173,7 +2202,7 @@ func (m *agentAIManager) setCodexSteerControl(sessionID string, runSeq int, cont
 
 // runUserMessage 在 session 上派发一轮新的 AI run。message()（用户消息）与
 // optionResponse()（用户方案选择续接）共用。调用者须已确认 session 存在且当前未在跑。
-func (m *agentAIManager) runUserMessage(session *agentAISession, runID, messageID, content, provider string, attachments []agentAIAttachment, emitter *agentAIRunEmitter, nativeGoal map[string]interface{}) error {
+func (m *agentAIManager) runUserMessage(session *agentAISession, runID, messageID, content, provider string, attachments []agentAIAttachment, attachmentAllowedHosts []string, emitter *agentAIRunEmitter, nativeGoal map[string]interface{}) error {
 	// Spawn precheck (imported Claude sessions): refuse to --resume a native
 	// session whose interactive TUI is mid-turn — two writers on one native
 	// conversation would interleave transcripts. Earliest abortable point: no
@@ -2231,6 +2260,7 @@ func (m *agentAIManager) runUserMessage(session *agentAISession, runID, messageI
 		prompt:                  prompt,
 		freshPrompt:             freshPrompt,
 		attachments:             append([]agentAIAttachment(nil), attachments...),
+		attachmentAllowedHosts:  append([]string(nil), attachmentAllowedHosts...),
 		cancel:                  cancel,
 		approvalToken:           approvalToken,
 		activity:                activity,
@@ -2334,7 +2364,7 @@ func (m *agentAIManager) optionResponse(msg map[string]interface{}, writeJSON ag
 
 	run := agentAIRun{sessionID: sessionID, runID: remoteString(msg, "run_id"), messageID: messageID}
 	emitter := m.runEmitter(run, writeJSON)
-	if err := m.runUserMessage(session, remoteString(msg, "run_id"), messageID, content, provider, nil, emitter, nil); err != nil {
+	if err := m.runUserMessage(session, remoteString(msg, "run_id"), messageID, content, provider, nil, nil, emitter, nil); err != nil {
 		_ = emitter.emit(agentAIErrorPayload(sessionID, messageID, err))
 	}
 }
@@ -3483,6 +3513,18 @@ func (m *agentAIManager) runCLI(ctx context.Context, run agentAIRun, writeJSON a
 	if run.cancel != nil {
 		defer run.cancel()
 	}
+
+	// 附件下载放在 run 的最外层：一次 run 内可能重试多个 pass（resume-missing
+	// / effort-rejected），下载一次、整轮复用，退出时统一删临时目录。失败按
+	// 硬错误处理——宁可不跑，也不让模型拿到一个「有附件清单但没有文件」的
+	// prompt（那会变成一轮看似正常、实则瞎猜的回复）。
+	attachments, cleanupAttachments, err := downloadAgentAIAttachments(ctx, run.attachments, run.attachmentAllowedHosts)
+	if err != nil {
+		_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, err))
+		return
+	}
+	defer cleanupAttachments()
+	run.attachments = attachments
 
 	if agentAIUseCodexAppServer(run.provider) {
 		outcome := m.runCodexAppServer(ctx, run, writeJSON)
@@ -4709,6 +4751,31 @@ done:
 	return agentAIRunDone
 }
 
+// codexSteerInput 是 turn/steer 的 input 数组：文本 + 随插话一起发的图片。
+// Codex app-server 接受与 turn 相同的 input 形状，所以图片直接用 localImage
+// block（steer 路径的图片在入口就落成本地临时文件，见 steer()）。
+func codexSteerInput(msg agentAISteerMessage) []map[string]interface{} {
+	input := []map[string]interface{}{
+		{"type": "text", "text": msg.Content, "text_elements": []interface{}{}},
+	}
+	for _, block := range msg.ImageBlocks {
+		// ImageBlocks 在 steer 入口按 Claude 形状编码（base64 source）。Codex
+		// app-server 的 input 认 data:image URL，所以这里转成 data URL——两边
+		// 都不需要临时文件，也就没有「排队期间临时文件被清理」的生命周期问题。
+		source, _ := block["source"].(map[string]interface{})
+		mediaType, _ := source["media_type"].(string)
+		data, _ := source["data"].(string)
+		if mediaType == "" || data == "" {
+			continue
+		}
+		input = append(input, map[string]interface{}{
+			"type": "image",
+			"url":  "data:" + mediaType + ";base64," + data,
+		})
+	}
+	return input
+}
+
 func codexTurnInput(run agentAIRun) []map[string]interface{} {
 	text := run.prompt + agentAIAttachmentPromptSuffix(run.attachments, false)
 	input := []map[string]interface{}{{"type": "text", "text": text, "text_elements": []interface{}{}}}
@@ -5165,6 +5232,23 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 		tool = withGoalTaskReportSystemPrompt(tool)
 	}
 	tool = withAgentAIAttachments(tool, run.attachments)
+	// Claude 的图片只能走 stream-json 的 image block。老版本 CLI 没有
+	// --input-format（stdinStreamJSON=false）时没有降级通道：明确报错，
+	// 而不是把图片悄悄降级成「prompt 里一行 URL」（模型读不到，用户以为发了）。
+	var claudeImageBlocks []map[string]interface{}
+	if tool.outputFormat == agentAIOutputClaudeStreamJSON && hasImageAttachments(run.attachments) {
+		if !tool.stdinStreamJSON {
+			_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID,
+				errors.New("this claude CLI does not support --input-format stream-json, which is required to send images; please upgrade claude")))
+			return agentAIRunDone, agentAIEffortRejection{}
+		}
+		blocks, err := buildClaudeImageBlocks(run.attachments)
+		if err != nil {
+			_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, err))
+			return agentAIRunDone, agentAIEffortRejection{}
+		}
+		claudeImageBlocks = blocks
+	}
 	cleanupClaudePolicy := func() {}
 	effectiveRun := run
 	if tool.outputFormat == agentAIOutputClaudeStreamJSON && !run.readOnly {
@@ -5252,7 +5336,7 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 	}
 	if claudeSteer != nil {
 		// 首条 prompt 必须以 stream-json user 行写入；写完才放行排队中的 steer。
-		claudeSteer.start(tool.stdinPrompt)
+		claudeSteer.start(tool.stdinPrompt, claudeImageBlocks)
 		// 本次 pass 结束时兜底关闸：resume-missing/effort-rejected 会在同一
 		// run 里再起一次 runCLIPass，若不在返回时关闭，旧管道的写端会一直
 		// 挂着，且旧通道在重试挂载新通道前仍可被 ai.steer 命中。
@@ -7263,11 +7347,17 @@ func withAgentAIAttachments(tool *agentAITool, attachments []agentAIAttachment) 
 				extraArgs = append(extraArgs, "--file", attachment.Path)
 				attachedPaths[attachment.Path] = struct{}{}
 			}
+		case agentAIOutputClaudeStreamJSON:
+			// 图片走 stdin 的 image block（buildClaudeImageBlocks），不再列进
+			// prompt 的附件清单——同一张图既给 block 又给路径会让模型重复解读。
+			if attachment.Type == "image" && attachment.Path != "" && tool.stdinStreamJSON {
+				attachedPaths[attachment.Path] = struct{}{}
+			}
 		}
 	}
 	remaining := make([]agentAIAttachment, 0, len(attachments))
 	for _, attachment := range attachments {
-		if _, attached := attachedPaths[attachment.Path]; !attached || attachment.URL != "" {
+		if _, attached := attachedPaths[attachment.Path]; !attached {
 			remaining = append(remaining, attachment)
 		}
 	}

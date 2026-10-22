@@ -496,7 +496,7 @@ func TestRunUserMessageRoutesToTUIWhenIdle(t *testing.T) {
 	emitter := m.runEmitter(agentAIRun{runID: "run-route", sessionID: "sess-1", messageID: "m-route"}, write)
 
 	// 直接走 runUserMessage（message()/runStart() 都汇入这里，一处接线全覆盖）。
-	if err := m.runUserMessage(session, "run-route", "m-route", "手机消息", "claude", nil, emitter, nil); err != nil {
+	if err := m.runUserMessage(session, "run-route", "m-route", "手机消息", "claude", nil, nil, emitter, nil); err != nil {
 		t.Fatalf("runUserMessage error = %v", err)
 	}
 
@@ -543,7 +543,7 @@ func TestRunUserMessageFallsBackToSpawnWithoutTUI(t *testing.T) {
 	emitter := m.runEmitter(agentAIRun{runID: "run-spawn", sessionID: "sess-1", messageID: "m-spawn"}, write)
 
 	// provider=claude 但 PATH 里没有 claude CLI（测试环境）→ spawn 层报错。
-	err := m.runUserMessage(session, "run-spawn", "m-spawn", "hello", "claude", nil, emitter, nil)
+	err := m.runUserMessage(session, "run-spawn", "m-spawn", "hello", "claude", nil, nil, emitter, nil)
 	if err != nil {
 		t.Fatalf("runUserMessage error = %v", err)
 	}

@@ -51,7 +51,10 @@ func newAgentAIClaudeSteerControl(run agentAIRun, stdin io.WriteCloser, write ag
 
 // start 写入首条 prompt（stream-json 输入下 prompt 不再走 argv），随后把
 // 启动前排队的 steer 一次性冲刷。必须在 cmd.Start() 之后调用。
-func (c *agentAIClaudeSteerControl) start(prompt string) {
+//
+// images 是随首条消息一起发的图片 block（已 base64 编码）；为空时行为与
+// 纯文本完全一致，不会给老版本 CLI 带来任何额外字段。
+func (c *agentAIClaudeSteerControl) start(prompt string, images []map[string]interface{}) {
 	if c == nil {
 		return
 	}
@@ -60,7 +63,7 @@ func (c *agentAIClaudeSteerControl) start(prompt string) {
 		c.mu.Unlock()
 		return
 	}
-	if err := c.writeUserLineLocked(prompt); err != nil {
+	if err := c.writeUserLineLocked(prompt, images); err != nil {
 		c.closed = true
 		queued := c.queue
 		c.queue = nil
@@ -86,18 +89,21 @@ func (c *agentAIClaudeSteerControl) start(prompt string) {
 }
 
 // writeUserLineLocked 把一条用户消息编码成 stream-json 输入行。
+// images 追加在 text block 之后（Claude 要求 text 在前、image 在后时
+// 图片才会被当成本轮的输入而不是历史引用）。
 // 调用方必须持有 c.mu。
-func (c *agentAIClaudeSteerControl) writeUserLineLocked(text string) error {
+func (c *agentAIClaudeSteerControl) writeUserLineLocked(text string, images []map[string]interface{}) error {
 	if c.stdin == nil {
 		return errors.New("claude stdin is unavailable")
 	}
+	content := make([]map[string]interface{}, 0, 1+len(images))
+	content = append(content, map[string]interface{}{"type": "text", "text": text})
+	content = append(content, images...)
 	payload := map[string]interface{}{
 		"type": "user",
 		"message": map[string]interface{}{
-			"role": "user",
-			"content": []map[string]interface{}{
-				{"type": "text", "text": text},
-			},
+			"role":    "user",
+			"content": content,
 		},
 	}
 	raw, err := json.Marshal(payload)
@@ -124,7 +130,7 @@ func (c *agentAIClaudeSteerControl) deliver(msg agentAISteerMessage) (string, er
 		c.queue = append(c.queue, msg)
 		return "queued", nil
 	}
-	if err := c.writeUserLineLocked(msg.Content); err != nil {
+	if err := c.writeUserLineLocked(msg.Content, msg.ImageBlocks); err != nil {
 		// 管道已断（CLI 已退出 / 被 kill）：关闸，后续 steer 直接走 not_running。
 		c.closed = true
 		return "error", err

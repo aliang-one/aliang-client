@@ -85,7 +85,7 @@ func TestClaudeSteerQueuesBeforeStartThenFlushes(t *testing.T) {
 		t.Fatalf("start 之前不应写 stdin，got %v", got)
 	}
 
-	control.start("原始 prompt")
+	control.start("原始 prompt", nil)
 
 	lines := stdin.snapshot()
 	if len(lines) != 2 {
@@ -128,7 +128,7 @@ func TestClaudeSteerDeliversAfterStart(t *testing.T) {
 		return nil
 	}
 	control := newAgentAIClaudeSteerControl(newSteerTestRun(), stdin, write)
-	control.start("p")
+	control.start("p", nil)
 
 	result, err := control.deliver(agentAISteerMessage{MessageID: "s2", Content: "插话", CreatedAt: time.Now()})
 	if err != nil || result != "applied" {
@@ -148,7 +148,7 @@ func TestClaudeSteerDeliversAfterStart(t *testing.T) {
 func TestClaudeSteerRejectsAfterCloseInput(t *testing.T) {
 	stdin := &fakeSteerStdin{}
 	control := newAgentAIClaudeSteerControl(newSteerTestRun(), stdin, func(interface{}) error { return nil })
-	control.start("p")
+	control.start("p", nil)
 	control.closeInput()
 
 	if !stdin.closed {
