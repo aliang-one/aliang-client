@@ -117,3 +117,43 @@ func TestAgentTerminalScrollbackConcurrentWithOutput(t *testing.T) {
 	}
 	<-done
 }
+
+// 仪表盘 scrollback 是纯文本视图，ANSI 颜色/光标控制码必须滤成可读文本
+// （2026-10-22 用户实测「[0m」字面量糊满输出）。手机端 replay 不走这里。
+func TestAgentTerminalScrollbackStripsANSI(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"sgr颜色", "\x1b[32mgreen\x1b[0m plain", "green plain"},
+		{"CSI光标与清屏", "\x1b[2J\x1b[Hready", "ready"},
+		{"OSC标题-BEL", "\x1b]0;my title\x07after", "after"},
+		{"OSC标题-ST", "\x1b]2;my title\x1b\\after", "after"},
+		{"字符集声明", "\x1b(Bok", "ok"},
+		{"CRLF归一", "a\r\nb", "a\nb"},
+		{"裸CR丢弃", "25%\r50%\r75%\n", "25%50%75%\n"},
+		{"孤立ESC丢弃", "ok\x1b", "ok"},
+		{"无转义原样", "plain output\n", "plain output\n"},
+		{"真实提示符", "liang@dev:~$ \x1b[0m\x1b[?2004h", "liang@dev:~$ "},
+	}
+	m := newAgentTerminalManager()
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ring := newTerminalRingBuffer(1 << 16)
+			ring.push([]byte(tc.in))
+			m.sessions["s-ansi"] = &agentTerminalSession{id: "s-ansi", ring: ring}
+			got, ok := m.scrollbackSnapshot("s-ansi", 0)
+			if !ok {
+				t.Fatalf("snapshot failed")
+			}
+			if got.Data != tc.want {
+				t.Fatalf("data = %q, want %q", got.Data, tc.want)
+			}
+			if got.Encoding != "text" {
+				t.Fatalf("encoding = %q, want text", got.Encoding)
+			}
+			delete(m.sessions, "s-ansi")
+		})
+	}
+}

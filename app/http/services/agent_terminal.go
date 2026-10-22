@@ -1,6 +1,8 @@
 package services
 
 import (
+	"bytes"
+
 	"errors"
 	"fmt"
 	"io"
@@ -448,7 +450,95 @@ func (m *agentTerminalManager) scrollbackSnapshot(sessionID string, maxBytes int
 // truncated when the head was dropped. The head is advanced past any partial
 // multi-byte rune so the payload stays valid UTF-8 (interior chunk ends are
 // already rune-aligned by the ring feed).
+// stripAgentTerminalANSI 清除终端输出里的 ANSI 转义序列（CSI/OSC/字符集
+// 与单字符转义），并把 CRLF 归一为 LF、丢弃残余裸 CR（重绘型进度条在纯
+// 文本视图里没有重绘语义）。不成形的残序列（ring 裁头留下的半截）与其后
+// 字节原样保留——激进的正则清洗可能误吃正文里的「[0m」式字面量。
+func stripAgentTerminalANSI(data []byte) []byte {
+	if !bytes.Contains(data, []byte{0x1B}) && !bytes.Contains(data, []byte{'\r'}) {
+		return data
+	}
+	noEsc := data
+	if bytes.Contains(data, []byte{0x1B}) {
+		out := make([]byte, 0, len(data))
+		for i := 0; i < len(noEsc); {
+			if noEsc[i] != 0x1B {
+				out = append(out, noEsc[i])
+				i++
+				continue
+			}
+			consumed := agentEscapeSequenceLen(noEsc[i:])
+			if consumed == 0 {
+				i++ // 孤立 ESC：丢控制符本身，其余字节照走
+				continue
+			}
+			i += consumed
+		}
+		noEsc = out
+	}
+	return normalizeAgentTerminalLineBreaks(noEsc)
+}
+
+// agentEscapeSequenceLen 返回 buf 从头开始的完整 ANSI 转义序列字节长度；
+// 序列不完整（被截断）返回 0。
+func agentEscapeSequenceLen(buf []byte) int {
+	if len(buf) < 2 || buf[0] != 0x1B {
+		return 0
+	}
+	switch buf[1] {
+	case '[': // CSI：参数 0x30-0x3F、中间字节 0x20-0x2F、终字节 0x40-0x7E（ECMA-48）
+		i := 2
+		for i < len(buf) && buf[i] >= 0x30 && buf[i] <= 0x3F {
+			i++
+		}
+		for i < len(buf) && buf[i] >= 0x20 && buf[i] <= 0x2F {
+			i++
+		}
+		if i < len(buf) && buf[i] >= 0x40 && buf[i] <= 0x7E {
+			return i + 1
+		}
+		return 0
+	case ']': // OSC：终止于 BEL 或 ST(ESC \)
+		for i := 2; i < len(buf); i++ {
+			if buf[i] == 0x07 {
+				return i + 1
+			}
+			if buf[i] == 0x1B && i+1 < len(buf) && buf[i+1] == '\\' {
+				return i + 2
+			}
+		}
+		return 0
+	case '(', ')', '#': // 字符集/行距声明：三字节转义
+		if len(buf) >= 3 {
+			return 3
+		}
+		return 0
+	default: // 单字符转义（ESC 7/8/=/>/M…）
+		return 2
+	}
+}
+
+// normalizeAgentTerminalLineBreaks 把 CRLF 归一为 LF 并丢弃残余裸 CR。
+func normalizeAgentTerminalLineBreaks(data []byte) []byte {
+	if !bytes.Contains(data, []byte{'\r'}) {
+		return data
+	}
+	out := make([]byte, 0, len(data))
+	for i := 0; i < len(data); i++ {
+		if data[i] == '\r' {
+			continue // CRLF 留下后续 \n；裸 CR 无重绘语义，丢弃
+		}
+		out = append(out, data[i])
+	}
+	return out
+}
+
 func newAgentTerminalScrollback(sessionID string, data []byte, status string, maxBytes int, capturedAt string) models.AgentTerminalScrollback {
+	// 仪表盘 scrollback 是只读纯文本视图（encoding:"text"），不是终端仿真器：
+	// ANSI 颜色/光标控制码不滤的话会以「[0m」等字面量糊满输出（2026-10-22
+	// 用户实测）。手机端重连 replay 不走这里——它有仿真器，原样字节流保色。
+	// 先滤后截断：避免把转义序列从中间裁断，留下半截「[1;3」碎片。
+	data = stripAgentTerminalANSI(data)
 	truncated := false
 	if len(data) > maxBytes {
 		data = data[len(data)-maxBytes:]
