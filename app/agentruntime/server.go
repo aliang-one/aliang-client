@@ -86,6 +86,7 @@ func StartLocalServer() error {
 	logger.Info(fmt.Sprintf("[AGENT-BOOT] local_server listening url=http://%s routes_registered=true", config.DefaultUserAgentAddr))
 	services.StartUsageTrackerRuntime()
 	services.StartAgentRegistrationKeepalive()
+	services.WarmAgentAuthorizedExecutionDirectories()
 	logger.Info("[AGENT-BOOT] local_server awaiting session owner sync")
 	return nil
 }
