@@ -23,6 +23,7 @@ import (
 	"sync/atomic"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"aliang.one/nursorgate/app/http/models"
 	"aliang.one/nursorgate/common/logger"
@@ -368,11 +369,18 @@ type agentAIRun struct {
 	claudeSteer *agentAIClaudeSteerControl
 }
 
+// agentAIAttachment 是一条随消息下发的素材。线上是 JSON，但解析走 remoteString
+// 手工取值（历史原因，结构体没有 json tag），所以加字段必须同时改
+// resolveAgentAIAttachments，光加字段不会生效。
+//
+// Type: "image" | "text"。text 用于手绘/ASCII 这类纯文本素材——它们不需要下载、
+// 不占视觉 token，直接内联进 prompt 即可。
 type agentAIAttachment struct {
 	Type string
 	Name string
 	Path string
 	URL  string
+	Text string // 仅 Type=="text"
 }
 
 // agentAIRunEmitter serializes every event emitted by one run. Besides adding
@@ -2389,6 +2397,10 @@ func resolveAgentAIAttachments(raw interface{}, projectPath string) ([]agentAIAt
 	const maxAttachments = 8
 	const maxAttachmentBytes = 20 * 1024 * 1024
 	const maxTotalBytes = 50 * 1024 * 1024
+	// 文本素材的上限按 rune 计（不是字节）：中文/emoji 的字节数是 rune 的数倍，
+	// 按字节卡会把一幅正常大小的 ASCII 图误杀。服务端 schema 按字符卡同一上限，
+	// 这里只做防线，放宽方向是安全的（不会拒掉服务端放行的载荷）。
+	const maxAttachmentTextRunes = 32 * 1024
 	if len(items) > maxAttachments {
 		return nil, fmt.Errorf("ai.message attachments exceed %d files", maxAttachments)
 	}
@@ -2404,6 +2416,30 @@ func resolveAgentAIAttachments(raw interface{}, projectPath string) ([]agentAIAt
 			Name: strings.TrimSpace(remoteString(item, "name")),
 			Path: strings.TrimSpace(firstNonEmpty(remoteString(item, "path"), remoteString(item, "local_path"))),
 			URL:  strings.TrimSpace(remoteString(item, "url")),
+			// 正文不 TrimSpace：ASCII 图的缩进就是语义，首尾空格删掉图就错位了。
+			Text: remoteString(item, "text"),
+		}
+		if attachment.Type == "" && attachment.Text != "" {
+			attachment.Type = "text"
+		}
+		if attachment.Type == "text" && attachment.Text != "" {
+			// 内联文本素材：既没有文件也没有 URL，不走下面任何下载/围栏分支。
+			// 注意 Type=="text" 还有另一种历史含义——「一个文本文件」，那种
+			// 带 Path 但没有 Text，继续走下面的文件校验。
+			if strings.TrimSpace(attachment.Text) == "" {
+				return nil, errors.New("text attachment requires non-empty text")
+			}
+			if utf8.RuneCountInString(attachment.Text) > maxAttachmentTextRunes {
+				return nil, fmt.Errorf("text attachment exceeds %d characters", maxAttachmentTextRunes)
+			}
+			if attachment.Name == "" {
+				attachment.Name = "attachment.txt"
+			}
+			attachments = append(attachments, attachment)
+			continue
+		}
+		if attachment.Type == "text" && attachment.Path == "" && attachment.URL == "" {
+			return nil, errors.New("text attachment requires non-empty text")
 		}
 		if attachment.Path != "" {
 			path := attachment.Path
@@ -7252,7 +7288,16 @@ func agentAIAttachmentPromptSuffix(attachments []agentAIAttachment, includeImage
 		return ""
 	}
 	var lines []string
+	var texts []agentAIAttachment
 	for _, attachment := range attachments {
+		// 内联文本素材没有位置可列，正文直接内联（见下）。带 Path 的
+		// Type=="text" 是「文本文件」，仍然走位置清单。
+		if attachment.Text != "" {
+			if strings.TrimSpace(attachment.Text) != "" {
+				texts = append(texts, attachment)
+			}
+			continue
+		}
 		if !includeImages && attachment.Type == "image" {
 			continue
 		}
@@ -7263,10 +7308,46 @@ func agentAIAttachmentPromptSuffix(attachments []agentAIAttachment, includeImage
 		name := firstNonEmpty(attachment.Name, filepath.Base(attachment.Path), "attachment")
 		lines = append(lines, fmt.Sprintf("- %s: %s", name, location))
 	}
-	if len(lines) == 0 {
-		return ""
+	var b strings.Builder
+	if len(lines) > 0 {
+		b.WriteString("\n\nAttachments available for this request:\n")
+		b.WriteString(strings.Join(lines, "\n"))
 	}
-	return "\n\nAttachments available for this request:\n" + strings.Join(lines, "\n")
+	for _, attachment := range texts {
+		name := firstNonEmpty(attachment.Name, "attachment.txt")
+		// 用围栏包住正文：模型按等宽读，ASCII 图的列对齐才不会被当成普通段落
+		// 重排。围栏长度取正文里最长反引号串 +1，避免正文自带 ``` 提前闭合。
+		fence := strings.Repeat("`", longestBacktickRun(attachment.Text)+1)
+		b.WriteString("\n\nAttachment ")
+		b.WriteString(strconv.Quote(name))
+		b.WriteString(" (text):\n")
+		b.WriteString(fence)
+		b.WriteString("\n")
+		b.WriteString(attachment.Text)
+		b.WriteString("\n")
+		b.WriteString(fence)
+	}
+	return b.String()
+}
+
+// longestBacktickRun 返回 s 中最长的连续反引号长度（用于挑一个不会提前闭合的
+// Markdown 围栏）。至少为 2，保证围栏永远是 ``` 起。
+func longestBacktickRun(s string) int {
+	longest, current := 0, 0
+	for _, r := range s {
+		if r == '`' {
+			current++
+			if current > longest {
+				longest = current
+			}
+			continue
+		}
+		current = 0
+	}
+	if longest < 2 {
+		return 2
+	}
+	return longest
 }
 
 const (

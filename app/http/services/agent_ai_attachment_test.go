@@ -83,3 +83,78 @@ done
 		t.Fatalf("compactCodexThread: %v", err)
 	}
 }
+
+func TestResolveAgentAIAttachmentsAcceptsTextVariant(t *testing.T) {
+	project := t.TempDir()
+	// 缩进与首尾空行是 ASCII 图的一部分，必须原样保留。
+	body := "\n   +--+\n   |  |\n   +--+\n"
+	attachments, err := resolveAgentAIAttachments([]interface{}{
+		map[string]interface{}{"type": "text", "name": "diagram.txt", "text": body},
+		// 未标 type 但有 text：按文本素材处理，而不是当成缺 path/url 报错。
+		map[string]interface{}{"name": "flow.txt", "text": "a -> b"},
+	}, project)
+	if err != nil {
+		t.Fatalf("resolve text attachments: %v", err)
+	}
+	if len(attachments) != 2 {
+		t.Fatalf("attachments = %#v", attachments)
+	}
+	if attachments[0].Type != "text" || attachments[0].Text != body {
+		t.Fatalf("text body was altered: %#v", attachments[0])
+	}
+	if attachments[1].Type != "text" || attachments[1].Name != "flow.txt" {
+		t.Fatalf("inferred text attachment = %#v", attachments[1])
+	}
+}
+
+func TestResolveAgentAIAttachmentsRejectsInvalidText(t *testing.T) {
+	project := t.TempDir()
+	if _, err := resolveAgentAIAttachments([]interface{}{
+		map[string]interface{}{"type": "text", "text": "   \n\t "},
+	}, project); err == nil {
+		t.Fatal("blank text attachment should be rejected")
+	}
+	// 上限按 rune 计：32768 个中文字符通过，32769 个拒绝。
+	ok := strings.Repeat("图", 32*1024)
+	if _, err := resolveAgentAIAttachments([]interface{}{
+		map[string]interface{}{"type": "text", "text": ok},
+	}, project); err != nil {
+		t.Fatalf("32Ki runes of CJK should pass: %v", err)
+	}
+	tooLong := strings.Repeat("图", 32*1024+1)
+	if _, err := resolveAgentAIAttachments([]interface{}{
+		map[string]interface{}{"type": "text", "text": tooLong},
+	}, project); err == nil {
+		t.Fatal("over-limit text attachment should be rejected")
+	}
+}
+
+func TestAgentAIAttachmentPromptSuffixInlinesText(t *testing.T) {
+	suffix := agentAIAttachmentPromptSuffix([]agentAIAttachment{
+		{Type: "image", Path: "/tmp/shot.png", Name: "shot.png"},
+		{Type: "text", Name: "ascii.txt", Text: "+--+\n|  |\n+--+"},
+	}, true)
+	if !strings.Contains(suffix, "- shot.png: /tmp/shot.png") {
+		t.Fatalf("image line missing: %q", suffix)
+	}
+	if !strings.Contains(suffix, "\"ascii.txt\" (text)") || !strings.Contains(suffix, "|  |") {
+		t.Fatalf("text body not inlined: %q", suffix)
+	}
+	// includeImages=false（codex 走原生 image block）时仍要保留文本素材。
+	codex := agentAIAttachmentPromptSuffix([]agentAIAttachment{
+		{Type: "image", URL: "https://example.com/a.png", Name: "a.png"},
+		{Type: "text", Name: "ascii.txt", Text: "x"},
+	}, false)
+	if strings.Contains(codex, "a.png") || !strings.Contains(codex, "ascii.txt") {
+		t.Fatalf("codex suffix = %q", codex)
+	}
+}
+
+func TestAgentAIAttachmentPromptSuffixFenceEscapesBackticks(t *testing.T) {
+	suffix := agentAIAttachmentPromptSuffix([]agentAIAttachment{
+		{Type: "text", Name: "code.txt", Text: "a\n```\nb"},
+	}, true)
+	if !strings.Contains(suffix, "````") {
+		t.Fatalf("fence should grow past the longest backtick run: %q", suffix)
+	}
+}
