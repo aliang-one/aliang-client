@@ -3,6 +3,7 @@ package services
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -26,6 +27,7 @@ func TestTUITurnErrorCodes(t *testing.T) {
 		{newAgentTUITurnError(agentTUIErrInjectFailed, "dial"), "tui_inject_failed"},
 		{newAgentTUITurnError(agentTUIErrHeld, "held"), "tui_held"},
 		{newAgentTUITurnError(agentTUIErrTranscriptLost, "gone"), "tui_transcript_lost"},
+		{newAgentTUITurnError(agentTUIErrAttachment, "download"), "tui_attachment_failed"},
 	}
 	for _, c := range cases {
 		coder, ok := c.err.(interface{ ErrorCode() string })
@@ -865,4 +867,167 @@ func TestFeedTUITurnActivity(t *testing.T) {
 		// nil activity 必须安全（spawn 路径可能没有 activity）
 		feedTUITurnActivity(nil, []byte(`{"type":"assistant"}`))
 	})
+}
+
+// TestRunTUITurnDownloadsImageAttachments（2026-10-23 方案 A）：TUI 注入通道是
+// 纯文本，图片附件必须先下载成本地文件、以本地路径注入（TUI 侧的 claude 用
+// Read 工具读图）。锁死三件事：①注入帧列本地路径而非 URL/data URL；②帧里带
+// Read 指示；③临时文件随回合结束删除。
+func TestRunTUITurnDownloadsImageAttachments(t *testing.T) {
+	_ = stubExternalInterrupt(t, nil)
+	pid := os.Getpid()
+	origPoll := tuiTurnPollInterval
+	tuiTurnPollInterval = 20 * time.Millisecond
+	defer func() { tuiTurnPollInterval = origPoll }()
+
+	home := t.TempDir()
+	sock := ccPeerShortSocketPath(t)
+	// 1×1 PNG；data URL 直接解码，不联网，host 白名单仅作为「已配置」占位。
+	const pngB64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+	wantBytes, err := base64.StdEncoding.DecodeString(pngB64)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var mu sync.Mutex
+	injectedPath := ""
+	fileDuringTurn := false
+	frames := make(chan string, 8)
+	startFakeTUI(t, sock, frames, func(content string) {
+		mu.Lock()
+		defer mu.Unlock()
+		if !strings.Contains(content, "shot.png") {
+			return
+		}
+		if strings.Contains(content, "data:image") {
+			t.Errorf("注入帧包含原始 data URL，应替换为本地路径")
+			return
+		}
+		if !strings.Contains(content, "Read tool") {
+			t.Errorf("带图片附件的注入帧缺 Read 指示: %s", content)
+		}
+		line := ""
+		for _, l := range strings.Split(content, "\n") {
+			if strings.HasPrefix(l, "- shot.png: ") {
+				line = l
+				break
+			}
+		}
+		if line == "" {
+			t.Errorf("注入帧缺附件路径清单: %s", content)
+			return
+		}
+		p := strings.TrimSpace(strings.TrimPrefix(line, "- shot.png: "))
+		raw, err := os.ReadFile(p)
+		if err != nil {
+			t.Errorf("回合中读取下载文件失败: %v", err)
+			return
+		}
+		if string(raw) != string(wantBytes) {
+			t.Errorf("下载文件内容不符: got %d bytes", len(raw))
+			return
+		}
+		injectedPath = p
+		fileDuringTurn = true
+		// 回写 transcript 让 tail 桥看到回显并安静收尾（否则本用例会一直空转到天上限）。
+		path := transcriptFixturePath(home, "sess-1")
+		appendTranscriptLine(t, path, `{"type":"user","uuid":"echo","isMeta":false,"message":{"role":"user","content":`+jsonString(content)+`}}`)
+		appendTranscriptLine(t, path, `{"type":"assistant","uuid":"a1","apiBlockIndex":0,"message":{"content":[{"type":"text","text":"看到了"}]}}`)
+	})
+	writeClaudePidRecord(t, home, "sess-1", pid, "idle", sock)
+	jsonl := writeTranscriptFixture(t, home, "sess-1")
+
+	m := newAgentAIManager()
+	var events []map[string]any
+	write := func(v any) error {
+		if p, ok := v.(map[string]any); ok {
+			mu.Lock()
+			events = append(events, p)
+			mu.Unlock()
+		}
+		return nil
+	}
+	session := &agentAISession{id: "sess-1", projectPath: t.TempDir(), provider: "claude", resumeSessionID: "sess-1"}
+	m.registerAISessionLocked(session)
+	emitter := m.runEmitter(agentAIRun{runID: "run-1", sessionID: "sess-1", messageID: "m-1"}, write)
+
+	m.runTUITurn(context.Background(), session, agentAIRun{
+		runID: "run-1", sessionID: "sess-1", messageID: "m-1",
+		projectPath: session.projectPath, provider: "claude",
+		resumeSessionID: "sess-1",
+		attachments: []agentAIAttachment{{
+			Type: "image", Name: "shot.png",
+			URL: "data:image/png;base64," + pngB64,
+		}},
+		attachmentAllowedHosts: []string{"cos.example.com"},
+	}, "看这张图", &tuiTurnPlan{
+		Home: home, NativeSessionID: "sess-1", SocketPath: sock, PID: pid,
+		JSONLPath: jsonl, JSONLOffset: mustSize(t, jsonl),
+	}, emitter)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !fileDuringTurn || injectedPath == "" {
+		t.Fatal("回合中未能确认下载文件（注入帧未带本地路径或文件不可读）")
+	}
+	if _, err := os.Stat(injectedPath); !os.IsNotExist(err) {
+		t.Fatalf("回合结束后临时文件应被清理: %s", injectedPath)
+	}
+}
+
+// TestRunTUITurnAttachmentDownloadFails：下载失败 → ai.error(error_code=
+// tui_attachment_failed)，不注入、不发 ai.done。http 明文 URL 在白名单已配置
+// 的前提下必被 https 门拒绝，环境无关、结果确定。
+func TestRunTUITurnAttachmentDownloadFails(t *testing.T) {
+	_ = stubExternalInterrupt(t, nil)
+	pid := os.Getpid()
+	origPoll := tuiTurnPollInterval
+	tuiTurnPollInterval = 20 * time.Millisecond
+	defer func() { tuiTurnPollInterval = origPoll }()
+
+	home := t.TempDir()
+	sock := ccPeerShortSocketPath(t)
+	writeClaudePidRecord(t, home, "sess-1", pid, "idle", sock)
+	jsonl := writeTranscriptFixture(t, home, "sess-1")
+
+	m := newAgentAIManager()
+	var events []map[string]any
+	write := func(v any) error {
+		if p, ok := v.(map[string]any); ok {
+			events = append(events, p)
+		}
+		return nil
+	}
+	session := &agentAISession{id: "sess-1", projectPath: t.TempDir(), provider: "claude", resumeSessionID: "sess-1"}
+	m.registerAISessionLocked(session)
+	emitter := m.runEmitter(agentAIRun{runID: "run-1", sessionID: "sess-1", messageID: "m-1"}, write)
+
+	m.runTUITurn(context.Background(), session, agentAIRun{
+		runID: "run-1", sessionID: "sess-1", messageID: "m-1",
+		projectPath: session.projectPath, provider: "claude",
+		resumeSessionID: "sess-1",
+		attachments: []agentAIAttachment{{
+			Type: "image", Name: "shot.png",
+			URL: "http://insecure.example/shot.png",
+		}},
+		attachmentAllowedHosts: []string{"cos.example.com"},
+	}, "看这张图", &tuiTurnPlan{
+		Home: home, NativeSessionID: "sess-1", SocketPath: sock, PID: pid,
+		JSONLPath: jsonl, JSONLOffset: mustSize(t, jsonl),
+	}, emitter)
+
+	var seq []string
+	var errCode string
+	for _, e := range events {
+		seq = append(seq, fmt.Sprint(e["type"]))
+		if e["type"] == "ai.error" {
+			errCode, _ = e["error_code"].(string)
+		}
+	}
+	if strings.Join(seq, ",") != "ai.run.started,ai.error" {
+		t.Fatalf("事件序列 = %v, want [ai.run.started ai.error]", seq)
+	}
+	if errCode != agentTUIErrAttachment {
+		t.Fatalf("error_code = %q, want %q", errCode, agentTUIErrAttachment)
+	}
 }

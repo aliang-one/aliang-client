@@ -24,6 +24,7 @@ const (
 	agentTUIErrInjectFailed   = "tui_inject_failed"   // 拨号或写入 UDS 失败
 	agentTUIErrHeld           = "tui_held"            // 接收方（bypass 门）静默扣留注入消息
 	agentTUIErrTranscriptLost = "tui_transcript_lost" // tail 期间 transcript 消失
+	agentTUIErrAttachment     = "tui_attachment_failed" // 附件下载失败（注入前）
 )
 
 // agentTUITurnError 是注入 TUI 回合的结构化失败。msg 面向人（日志/手机提示），
@@ -378,8 +379,9 @@ var tuiTurnCeiling = resolveEnvDuration("ALIANG_TUI_TURN_CEILING", 4*time.Hour)
 // 生命周期回传手机（spec §4.3）。ctx 取消 = ai.stop。
 //
 // content 是用户的原始文本——不是 run.prompt（那是 buildAgentAIPrompt 包装过
-// 的，带会话前缀与全量历史）。附件从 run.attachments 取：spawn 路径由
-// withAgentAIAttachments 拼进 prompt，注入路径必须在这里自己拼。
+// 的，带会话前缀与全量历史）。附件从 run.attachments 取，注入前先下载到临时
+// 文件（与 spawn 的 runCLI 同款）：注入通道是纯文本，图片只有落成本地文件、
+// 让 TUI 侧的 claude 用 Read 读，才能成为视觉输入；临时目录随回合结束删除。
 //
 // 失败不回退 spawn：一次回合只走一条路（spec §4.5）。注入失败以 ai.error 收尾，
 // 由服务端决定重试。
@@ -450,9 +452,33 @@ func (m *agentAIManager) runTUITurn(ctx context.Context, session *agentAISession
 		"state": "running", "executor": "tui",
 	})
 
+	// 2.5) 附件下载（与 spawn 路径的 runCLI 同款）：注入通道是纯文本，图片唯一
+	// 的视觉载体是本地文件——TUI 侧的 claude 用 Read 工具读图（CC 原生支持）。
+	// 直接列预签名 URL 有三个坑：10 分钟过期、模型无法把 URL 变成视觉输入、
+	// 几百字符签名串回显进 transcript。下载后 Path 就位、URL 清空，
+	// agentAIAttachmentPromptSuffix 自然列本地路径；临时目录随回合结束删除。
+	localAttachments, cleanupAttachments, err := downloadAgentAIAttachments(runCtx, run.attachments, run.attachmentAllowedHosts)
+	if err != nil {
+		if runCtx.Err() != nil {
+			// 下载期间被 stop：按停止收尾，不算回合失败。
+			emitStopStatus()
+			return
+		}
+		fail(agentTUIErrAttachment, "附件下载失败："+err.Error())
+		return
+	}
+	defer cleanupAttachments()
+	run.attachments = localAttachments
+
 	// 3) 注入。内容 = 原始用户文本 + 附件清单（与 spawn 路径等价）。
 	// 走 ccPeerDialInject 旋钮（与 tuiSync 一致），测试才能拦截注入动作。
 	injectText := content + agentAIAttachmentPromptSuffix(run.attachments, true)
+	if hasImageAttachments(run.attachments) {
+		// TUI 没有 image block 通道：图片以本地路径列出后，必须点名让 TUI 侧的
+		// claude 主动 Read——不写这句，模型大概率把路径当普通文本略过，回一句
+		// 「我看不到图」。
+		injectText += "\n\n(The image attachments listed above are local files. Use the Read tool on each image path to actually view it before answering.)"
+	}
 	if err := ccPeerDialInject(plan.SocketPath, plan.PeerToken, injectText, plan.FromMode); err != nil {
 		fail(agentTUIErrInjectFailed, "无法把消息送进终端会话")
 		return
