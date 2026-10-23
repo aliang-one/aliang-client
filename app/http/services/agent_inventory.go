@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"aliang.one/nursorgate/app/http/models"
@@ -55,6 +56,110 @@ type agentVibeSessionReadOptions struct {
 	// 0 = agentVibeJSONLMaxLineBytes. Test hook: shrink it to exercise the
 	// skip path without multi-megabyte fixtures.
 	MaxLineBytes int
+}
+
+// agentVibeParseCacheMaxEntries bounds the per-file parse cache; on overflow it
+// is cleared wholesale（下一次扫描只回填当前候选集，自愈）。
+const agentVibeParseCacheMaxEntries = 1024
+
+type agentVibeParseCacheEntry struct {
+	size               int64
+	modTime            time.Time
+	session            models.AgentVibeSession
+	updatedAtFromMtime bool
+}
+
+// agentVibeParseCache 按 (path, scanDirs, limit) → (size, mtime) 缓存摘要级
+// 解析结果。转录 jsonl 只追加不回写，同 size+mtime 即视为同内容。仪表盘
+// 请求、周期 hello、执行守卫会并发反复触发同一份全量扫描（liang-dev 实测
+// 冷扫描 30s+、agent 进程 CPU 常驻 ~120%），缓存让稳态下只有真正变化的
+// 文件付出解析成本。读取一律返回深拷贝：调用方（rename 叠加、
+// DisplayMessageCount 回灌、freshness patch）会原地改写 session，绝不能污染
+// 缓存。
+var agentVibeParseCache = struct {
+	mu      sync.Mutex
+	entries map[string]agentVibeParseCacheEntry
+}{entries: make(map[string]agentVibeParseCacheEntry)}
+
+func agentVibeParseCacheKey(path string, scanDirs []string, limit int) string {
+	if len(scanDirs) == 0 {
+		return fmt.Sprintf("%s|%d", path, limit)
+	}
+	return fmt.Sprintf("%s|%d|%s", path, limit, strings.Join(scanDirs, "\x00"))
+}
+
+func agentVibeParseCacheLookup(key string, size int64, modTime time.Time) (agentVibeParseCacheEntry, bool) {
+	agentVibeParseCache.mu.Lock()
+	defer agentVibeParseCache.mu.Unlock()
+	entry, ok := agentVibeParseCache.entries[key]
+	if !ok || entry.size != size || !entry.modTime.Equal(modTime) {
+		return agentVibeParseCacheEntry{}, false
+	}
+	entry.session = cloneAgentVibeSessionSummary(entry.session)
+	return entry, true
+}
+
+func agentVibeParseCacheStore(key string, size int64, modTime time.Time, session models.AgentVibeSession, updatedAtFromMtime bool) {
+	agentVibeParseCache.mu.Lock()
+	defer agentVibeParseCache.mu.Unlock()
+	if len(agentVibeParseCache.entries) >= agentVibeParseCacheMaxEntries {
+		agentVibeParseCache.entries = make(map[string]agentVibeParseCacheEntry)
+	}
+	agentVibeParseCache.entries[key] = agentVibeParseCacheEntry{
+		size:               size,
+		modTime:            modTime,
+		session:            cloneAgentVibeSessionSummary(session),
+		updatedAtFromMtime: updatedAtFromMtime,
+	}
+}
+
+// cloneAgentVibeSessionSummary 深拷贝摘要里所有可变引用字段
+// （DisplayMessageCount 指针、Transcript/TranscriptPage 切片）。
+func cloneAgentVibeSessionSummary(session models.AgentVibeSession) models.AgentVibeSession {
+	out := session
+	if session.DisplayMessageCount != nil {
+		count := *session.DisplayMessageCount
+		out.DisplayMessageCount = &count
+	}
+	if session.Transcript != nil {
+		out.Transcript = append([]models.AgentVibeMessage(nil), session.Transcript...)
+	}
+	if session.TranscriptPage != nil {
+		page := *session.TranscriptPage
+		out.TranscriptPage = &page
+	}
+	return out
+}
+
+// readAgentVibeClaudeSummary 供摘要扫描读取单个 Claude 转录；
+// (size, mtime) 未变时直接命中缓存，跳过整文件解析。
+func readAgentVibeClaudeSummary(path string, scanDirs []string) (models.AgentVibeSession, bool) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return models.AgentVibeSession{}, false
+	}
+	key := agentVibeParseCacheKey(path, scanDirs, agentVibeTranscriptMaxMessages)
+	if entry, ok := agentVibeParseCacheLookup(key, info.Size(), info.ModTime()); ok {
+		return entry.session, entry.updatedAtFromMtime
+	}
+	session, updatedAtFromMtime := readClaudeSessionMetaWithOptions(path, agentVibeSessionReadOptions{Limit: agentVibeTranscriptMaxMessages, ScanDirs: scanDirs})
+	agentVibeParseCacheStore(key, info.Size(), info.ModTime(), session, updatedAtFromMtime)
+	return session, updatedAtFromMtime
+}
+
+// readAgentVibeCodexSummary 同上，服务 Codex rollout 的摘要扫描。
+func readAgentVibeCodexSummary(path string, scanDirs []string) models.AgentVibeSession {
+	info, err := os.Stat(path)
+	if err != nil {
+		return models.AgentVibeSession{}
+	}
+	key := agentVibeParseCacheKey(path, scanDirs, agentVibeTranscriptMaxMessages)
+	if entry, ok := agentVibeParseCacheLookup(key, info.Size(), info.ModTime()); ok {
+		return entry.session
+	}
+	session := readCodexSessionMetaWithOptions(path, agentVibeSessionReadOptions{Limit: agentVibeTranscriptMaxMessages, ScanDirs: scanDirs})
+	agentVibeParseCacheStore(key, info.Size(), info.ModTime(), session, false)
+	return session
 }
 
 type agentVibeTranscriptWindow struct {
@@ -405,7 +510,7 @@ func collectCodexVibeSessions(scanDirs []string) []models.AgentVibeSession {
 	)
 	metaByID := make(map[string]models.AgentVibeSession)
 	for _, path := range sessionFiles {
-		meta := readCodexSessionMetaWithOptions(path, agentVibeSessionReadOptions{Limit: agentVibeTranscriptMaxMessages, ScanDirs: scanDirs})
+		meta := readAgentVibeCodexSummary(path, scanDirs)
 		if meta.ID == "" {
 			continue
 		}
@@ -852,7 +957,7 @@ func collectClaudeVibeSessionsWithStats(scanDirs []string) ([]models.AgentVibeSe
 		if strings.Contains(path, string(filepath.Separator)+"subagents"+string(filepath.Separator)) {
 			continue
 		}
-		session, updatedAtFromMtime := readClaudeSessionMetaWithOptions(path, agentVibeSessionReadOptions{Limit: agentVibeTranscriptMaxMessages, ScanDirs: scanDirs})
+		session, updatedAtFromMtime := readAgentVibeClaudeSummary(path, scanDirs)
 		if session.ID == "" {
 			continue
 		}
@@ -1332,15 +1437,20 @@ func readClaudeSessionMetaWithOptions(path string, options agentVibeSessionReadO
 	}
 	forEachAgentSessionJSONLLine(path, maxLineBytes, func(line []byte) bool {
 		var row struct {
-			Timestamp       string      `json:"timestamp"`
-			Type            string      `json:"type"`
-			CWD             string      `json:"cwd"`
-			SessionID       string      `json:"sessionId"`
-			GitBranch       string      `json:"gitBranch"`
-			IsSidechain     bool        `json:"isSidechain"`
-			IsMeta          bool        `json:"isMeta"`
-			SourceToolUseID string      `json:"sourceToolUseID"`
-			Message         interface{} `json:"message"`
+			Timestamp       string `json:"timestamp"`
+			Type            string `json:"type"`
+			CWD             string `json:"cwd"`
+			SessionID       string `json:"sessionId"`
+			GitBranch       string `json:"gitBranch"`
+			IsSidechain     bool   `json:"isSidechain"`
+			IsMeta          bool   `json:"isMeta"`
+			SourceToolUseID string `json:"sourceToolUseID"`
+			// Message 用 RawMessage：非 user/assistant 行（进度、summary、元数据）
+			// 完全跳过深解析；user/assistant 行也只把 content 反序列化一次——
+			// 历史上 Message interface{} 让每一行的整棵消息树都被深解析，再经
+			// claudeMessageText / inferAgentVibeRoleFromClaudeMessage 各做一次
+			// Marshal→Unmarshal 往返，liang-dev 实测冷扫描 32s 里 ~40% 耗在这。
+			Message json.RawMessage `json:"message"`
 		}
 		if err := json.Unmarshal(line, &row); err != nil {
 			return true
@@ -1367,8 +1477,10 @@ func readClaudeSessionMetaWithOptions(path string, options agentVibeSessionReadO
 			session.CreatedAt = normalizeAgentTime(row.Timestamp)
 		}
 		var commandRecord bool
+		var rawText string
 		if row.Type == "user" || row.Type == "assistant" {
-			rawText := claudeMessageText(row.Message)
+			msgView, _ := parseAgentClaudeMessageView(row.Message)
+			rawText = claudeMessageTextFromView(msgView)
 			// harness 工件 = slash 命令流水 ∪ CC 注入行。Claude Code 会把 Skill 工具
 			// 装载的 skill 全文以 user 行写回 jsonl（isMeta+sourceToolUseID 标记），
 			// 并把 /命令回显与系统提醒写成 <local-command-stdout>/<system-reminder>
@@ -1389,7 +1501,7 @@ func readClaudeSessionMetaWithOptions(path string, options agentVibeSessionReadO
 			if text := truncateAgentText(rawText, agentVibeTranscriptMaxContentRunes); text != "" {
 				messageIndex := session.MessageCount
 				session.MessageCount++
-				role := firstNonEmpty(inferAgentVibeRoleFromClaudeMessage(row.Message), normalizeAgentVibeRole(row.Type))
+				role := firstNonEmpty(inferAgentVibeRoleFromClaudeMessageView(msgView), normalizeAgentVibeRole(row.Type))
 				// tool_result/system 工件只占索引位、不再进入 transcript。直播视图里
 				// 工具输出走结构化事件（ai.command 等），从不进对话流；历史解析若把它们
 				// 摊平成 system 消息，手机端就会渲染出一墙 "Updated task #N status" /
@@ -1427,8 +1539,8 @@ func readClaudeSessionMetaWithOptions(path string, options agentVibeSessionReadO
 			}
 		}
 		if session.Title == "" && row.Type == "user" && !commandRecord {
-			if text := claudeMessageText(row.Message); text != "" && !isJunkAgentTitle(text) {
-				session.Title = truncateAgentText(text, 200)
+			if rawText != "" && !isJunkAgentTitle(rawText) {
+				session.Title = truncateAgentText(rawText, 200)
 			}
 		}
 		return true
@@ -1534,29 +1646,43 @@ func (window *agentVibeTranscriptWindow) page(totalCount int, includeMeta bool) 
 	return out, page
 }
 
-func claudeMessageText(value interface{}) string {
-	raw, _ := json.Marshal(value)
-	var msg struct {
-		Content interface{} `json:"content"`
-	}
-	if err := json.Unmarshal(raw, &msg); err != nil {
-		return ""
-	}
-	return agentContentText(msg.Content)
+// agentClaudeMessageView 是一行 jsonl 的 message 对象解析一次后的视图。
+// content 只反序列化一次，文本提取与角色推导都从同一份结果取——替代历史上
+// 每条消息各做一次 json.Marshal→Unmarshal 往返的实现（liang-dev 实测该往返
+// 占冷扫描 32s 里的 ~40%，见 agentClaudeMessageView 行注释）。
+type agentClaudeMessageView struct {
+	Role    string
+	Content interface{}
 }
 
-func inferAgentVibeRoleFromClaudeMessage(value interface{}) string {
-	raw, _ := json.Marshal(value)
-	var msg struct {
-		Role    string      `json:"role"`
-		Content interface{} `json:"content"`
+func parseAgentClaudeMessageView(raw json.RawMessage) (agentClaudeMessageView, bool) {
+	if len(raw) == 0 {
+		return agentClaudeMessageView{}, false
 	}
-	if err := json.Unmarshal(raw, &msg); err != nil {
-		return ""
+	var payload struct {
+		Role    string          `json:"role"`
+		Content json.RawMessage `json:"content"`
 	}
-	explicitRole := normalizeAgentVibeRole(msg.Role)
-	contentRole := inferAgentVibeRoleFromContent(msg.Content)
-	if explicitRole == "assistant" && contentRole == "system" && agentContentHasPlainText(msg.Content) {
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return agentClaudeMessageView{}, false
+	}
+	var content interface{}
+	if len(payload.Content) > 0 {
+		if err := json.Unmarshal(payload.Content, &content); err != nil {
+			content = nil
+		}
+	}
+	return agentClaudeMessageView{Role: payload.Role, Content: content}, true
+}
+
+func claudeMessageTextFromView(view agentClaudeMessageView) string {
+	return agentContentText(view.Content)
+}
+
+func inferAgentVibeRoleFromClaudeMessageView(view agentClaudeMessageView) string {
+	explicitRole := normalizeAgentVibeRole(view.Role)
+	contentRole := inferAgentVibeRoleFromContent(view.Content)
+	if explicitRole == "assistant" && contentRole == "system" && agentContentHasPlainText(view.Content) {
 		return "assistant"
 	}
 	return firstNonEmpty(contentRole, explicitRole)

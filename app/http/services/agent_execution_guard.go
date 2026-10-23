@@ -14,6 +14,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sync/singleflight"
+
 	"aliang.one/nursorgate/common/cache"
 	"aliang.one/nursorgate/common/logger"
 )
@@ -309,8 +311,25 @@ func resolveAgentCWDFallbackHome(raw string, label string) (string, error) {
 }
 
 func refreshAgentAuthorizedExecutionDirectories() []string {
-	snapshot := collectAgentSyncSnapshot(nil)
-	return setAgentAuthorizedExecutionDirectoriesCache(snapshot.AuthorizedDirectories)
+	// singleflight 合并并发刷新：启动预热与首个请求（如 terminal.create 的
+	// CWD 解析）同时撞上冷缓存时，共享同一次扫描而不是各扫一遍。
+	v, _, _ := agentAuthorizedDirsRefreshGroup.Do("authorized_dirs", func() (interface{}, error) {
+		snapshot := collectAgentSyncSnapshot(nil)
+		return setAgentAuthorizedExecutionDirectoriesCache(snapshot.AuthorizedDirectories), nil
+	})
+	dirs, _ := v.([]string)
+	return dirs
+}
+
+var agentAuthorizedDirsRefreshGroup singleflight.Group
+
+// WarmAgentAuthorizedExecutionDirectories 预热授权目录缓存。authorized 列表
+// 派生自会话转录扫描，缓存冷时 terminal.create 的 CWD 解析会同步跑一遍
+// 全量扫描（2026-10-22 实测 Mac 冷 10.5s；旧二进制 liang-dev 30s+），期间
+// shell 未 spawn、手机端建终端转圈、仪表盘 scrollback 空窗口。agent 启动时
+// 调用一次，把扫描与出站连接并行掉，首个手机操作不再撞上冷窗口。
+func WarmAgentAuthorizedExecutionDirectories() {
+	go refreshAgentAuthorizedExecutionDirectories()
 }
 
 func setAgentAuthorizedExecutionDirectoriesCache(rawDirs []string) []string {

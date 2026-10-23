@@ -86,6 +86,7 @@ func StartLocalServer() error {
 	logger.Info(fmt.Sprintf("[AGENT-BOOT] local_server listening url=http://%s routes_registered=true", config.DefaultUserAgentAddr))
 	services.StartUsageTrackerRuntime()
 	services.StartAgentRegistrationKeepalive()
+	services.WarmAgentAuthorizedExecutionDirectories()
 	logger.Info("[AGENT-BOOT] local_server awaiting session owner sync")
 	return nil
 }
@@ -126,6 +127,11 @@ func registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/agent/sessions", agentHandler.HandleVibeSessions)
 	mux.HandleFunc("/api/agent/session", agentHandler.HandleVibeSession)
 	mux.HandleFunc("/api/agent/scan-directories", agentHandler.HandleScanDirectories)
+	// 仪表盘数据面端点：核心进程会把这两个请求代理到本 runtime，缺注册会让
+	// 仪表盘 Agent 页的「远程终端」列表和「进行中」徽章永远拿不到数据
+	// （2026-10-21 liang-dev 实测 404 透传）。
+	mux.HandleFunc("/api/agent/runtime-sessions", agentHandler.HandleRuntimeSessions)
+	mux.HandleFunc("/api/agent/terminal/{sessionId}/scrollback", agentHandler.HandleTerminalScrollback)
 }
 
 func loopbackOnly(next http.Handler) http.Handler {

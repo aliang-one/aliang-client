@@ -11,6 +11,10 @@ export function useNavigation() {
     showPage('settings');
   }
 
+  function showAgent() {
+    showPage('agent');
+  }
+
   function showUserCenter() {
     showPage('user');
   }
@@ -31,6 +35,7 @@ export function useNavigation() {
     currentPage,
     showPage,
     showSettings,
+    showAgent,
     showUserCenter,
     showLogs,
     showDashboard,
