@@ -6,8 +6,10 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // newAttachmentTestServer 起一个 https 测试服务器。白名单按 host 匹配，所以
@@ -166,14 +168,88 @@ func TestDownloadAgentAIAttachmentsDataURL(t *testing.T) {
 	}
 }
 
+func TestDownloadAgentAIAttachmentsToCachePersistsAndReuses(t *testing.T) {
+	cacheDir := t.TempDir()
+	t.Setenv("ALIANG_ATTACHMENT_CACHE_DIR", cacheDir)
+	server := newAttachmentTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("png-bytes"))
+	})
+	withTestTransport(t, server)
+
+	attachments, cleanup, err := downloadAgentAIAttachmentsToCache(context.Background(), []agentAIAttachment{
+		{Type: "image", Name: "shot.png", URL: server.URL + "/shot.png"},
+	}, []string{hostOf(t, server.URL)})
+	if err != nil {
+		t.Fatalf("download attachments: %v", err)
+	}
+	cleanup()
+
+	if !strings.HasPrefix(attachments[0].Path, cacheDir+string(os.PathSeparator)) {
+		t.Fatalf("expected cache path under %s, got %s", cacheDir, attachments[0].Path)
+	}
+	body, err := os.ReadFile(attachments[0].Path)
+	if err != nil || string(body) != "png-bytes" {
+		t.Fatalf("cached body = %q, err = %v", body, err)
+	}
+	// cleanup 是 no-op：回合结束后文件必须还在。
+	if _, err := os.Stat(attachments[0].Path); err != nil {
+		t.Fatalf("cache file should survive cleanup: %v", err)
+	}
+
+	again, cleanupAgain, err := downloadAgentAIAttachmentsToCache(context.Background(), []agentAIAttachment{
+		{Type: "image", Name: "shot.png", URL: server.URL + "/shot.png"},
+	}, []string{hostOf(t, server.URL)})
+	if err != nil {
+		t.Fatalf("download again: %v", err)
+	}
+	cleanupAgain()
+	if again[0].Path != attachments[0].Path {
+		t.Fatalf("same content should reuse cache path: %s vs %s", again[0].Path, attachments[0].Path)
+	}
+	entries, err := os.ReadDir(cacheDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("cache should hold exactly one file, got %d", len(entries))
+	}
+}
+
+func TestDownloadAgentAIAttachmentsToCacheExpiresOldFiles(t *testing.T) {
+	cacheDir := t.TempDir()
+	t.Setenv("ALIANG_ATTACHMENT_CACHE_DIR", cacheDir)
+	old := filepath.Join(cacheDir, "old.png")
+	if err := os.WriteFile(old, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	eightDaysAgo := time.Now().Add(-8 * 24 * time.Hour)
+	if err := os.Chtimes(old, eightDaysAgo, eightDaysAgo); err != nil {
+		t.Fatal(err)
+	}
+
+	attachments, cleanup, err := downloadAgentAIAttachmentsToCache(context.Background(), []agentAIAttachment{
+		{Type: "image", Name: "inline.png", URL: "data:image/png;base64,cG5n"},
+	}, []string{"cos.example.com"})
+	if err != nil {
+		t.Fatalf("download data URL: %v", err)
+	}
+	cleanup()
+	if _, err := os.Stat(old); !os.IsNotExist(err) {
+		t.Fatalf("expired cache file should be removed, stat err = %v", err)
+	}
+	if _, err := os.Stat(attachments[0].Path); err != nil {
+		t.Fatalf("new cache file missing: %v", err)
+	}
+}
+
 func TestSafeAttachmentFileName(t *testing.T) {
 	cases := map[string]string{
-		"shot.png":            "shot.png",
-		"../../etc/passwd":    "passwd",
-		".bashrc":             "bashrc",
+		"shot.png":          "shot.png",
+		"../../etc/passwd":  "passwd",
+		".bashrc":           "bashrc",
 		"截图 2026-10-22.png": "___2026-10-22.png",
-		"":                    "attachment",
-		"..":                  "attachment",
+		"":                  "attachment",
+		"..":                "attachment",
 	}
 	for input, want := range cases {
 		if got := safeAttachmentFileName(input); got != want {

@@ -869,10 +869,11 @@ func TestFeedTUITurnActivity(t *testing.T) {
 	})
 }
 
-// TestRunTUITurnDownloadsImageAttachments（2026-10-23 方案 A）：TUI 注入通道是
-// 纯文本，图片附件必须先下载成本地文件、以本地路径注入（TUI 侧的 claude 用
-// Read 工具读图）。锁死三件事：①注入帧列本地路径而非 URL/data URL；②帧里带
-// Read 指示；③临时文件随回合结束删除。
+// TestRunTUITurnDownloadsImageAttachments（2026-10-23 方案 A + 持久缓存）：
+// TUI 注入通道是纯文本，图片附件必须先下载成本地文件、以本地路径注入（TUI
+// 侧的 claude 用 Read 工具读图）。锁死三件事：①注入帧列本地路径而非
+// URL/data URL；②帧里带 Read 指示；③缓存文件在回合结束后保留，供同一会话
+// 后续回合再次 Read。
 func TestRunTUITurnDownloadsImageAttachments(t *testing.T) {
 	_ = stubExternalInterrupt(t, nil)
 	pid := os.Getpid()
@@ -881,6 +882,8 @@ func TestRunTUITurnDownloadsImageAttachments(t *testing.T) {
 	defer func() { tuiTurnPollInterval = origPoll }()
 
 	home := t.TempDir()
+	cacheDir := t.TempDir()
+	t.Setenv("ALIANG_ATTACHMENT_CACHE_DIR", cacheDir)
 	sock := ccPeerShortSocketPath(t)
 	// 1×1 PNG；data URL 直接解码，不联网，host 白名单仅作为「已配置」占位。
 	const pngB64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
@@ -903,7 +906,7 @@ func TestRunTUITurnDownloadsImageAttachments(t *testing.T) {
 			t.Errorf("注入帧包含原始 data URL，应替换为本地路径")
 			return
 		}
-		if !strings.Contains(content, "Read tool") {
+		if !strings.Contains(content, "请使用 Read 工具") {
 			t.Errorf("带图片附件的注入帧缺 Read 指示: %s", content)
 		}
 		line := ""
@@ -970,8 +973,11 @@ func TestRunTUITurnDownloadsImageAttachments(t *testing.T) {
 	if !fileDuringTurn || injectedPath == "" {
 		t.Fatal("回合中未能确认下载文件（注入帧未带本地路径或文件不可读）")
 	}
-	if _, err := os.Stat(injectedPath); !os.IsNotExist(err) {
-		t.Fatalf("回合结束后临时文件应被清理: %s", injectedPath)
+	if !strings.HasPrefix(injectedPath, cacheDir+string(os.PathSeparator)) {
+		t.Fatalf("附件应落在持久缓存目录 %s，实际 %s", cacheDir, injectedPath)
+	}
+	if _, err := os.Stat(injectedPath); err != nil {
+		t.Fatalf("回合结束后缓存文件应保留（后续回合还要 Read）: %v", err)
 	}
 }
 
