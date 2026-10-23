@@ -37,8 +37,9 @@ func TestTerminalOutputAlwaysFeedsRingEvenWhenWriterDead(t *testing.T) {
 }
 
 // TestInputRefreshesLastInputAt pins that terminal.input refreshes both activity
-// clocks: lastActiveAt (attached idle semantics) and lastInputAt (the input-only
-// clock that governs a detached session's life).
+// clocks: lastActiveAt (the clock both reap rules gate on) and lastInputAt
+// (the diagnostic input clock — no reap rule reads it since the 2026-10-22
+// detached-idle fix).
 func TestInputRefreshesLastInputAt(t *testing.T) {
 	dir := t.TempDir()
 	setAgentAuthorizedExecutionDirectoriesCache([]string{dir})

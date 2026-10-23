@@ -29,10 +29,10 @@ const (
 	// volume is governed by the quota challenge state machine instead
 	// (agentTerminalQuota* vars below), not by a blind kill. watch-paced output
 	// (~1-5 KB/s) never trips the rate limit, so it streams indefinitely up to
-	// the idle timeout.
+	// the idle timeout (agentTerminalAttachedIdle / agentTerminalDetachedIdle in
+	// agent_terminal.go — both ACTIVITY clocks as of the 2026-10-22 fix).
 	agentTerminalOutputRateWindow = 5 * time.Second
 	agentTerminalOutputRateBytes  = 8 * 1024 * 1024
-	agentTerminalIdleTimeout      = 30 * time.Minute
 
 	// agentAISessionResidentCap bounds how many AI session handles the agent
 	// keeps resident at once. This is NOT a gate that blocks new conversations
@@ -156,6 +156,8 @@ var (
 //	ALIANG_TERMINAL_QUOTA_CHECKPOINT_MB           MiB per challenge checkpoint. Default 128.
 //	ALIANG_TERMINAL_QUOTA_MAX_MB                  hard cumulative cap in MiB; explicit "0" disables the whole quota mechanism. Default 512.
 //	ALIANG_TERMINAL_QUOTA_CHALLENGE_MIN_INTERVAL  minimum spacing between challenges (time.ParseDuration form). Default 30m.
+//	ALIANG_TERMINAL_ATTACHED_IDLE                 attached-session activity idle before reap (time.ParseDuration form). Default 24h. See agent_terminal.go.
+//	ALIANG_TERMINAL_DETACHED_IDLE                 detached-session activity idle before reap (time.ParseDuration form). Default 30m. See agent_terminal.go.
 //
 // Invalid values fall back to the default (see envMiB / envMiBAllowZero /
 // resolveEnvDuration). For MAX_MB an explicit "0" is the documented off

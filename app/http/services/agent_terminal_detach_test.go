@@ -26,6 +26,18 @@ func shrinkDetachedWatch(t *testing.T, watchInterval, detachedIdle time.Duration
 	})
 }
 
+// shrinkAttachedIdle points the attached-idle threshold at a tiny test value
+// and restores it when the test ends (same atomicDuration discipline as
+// shrinkDetachedWatch; no t.Parallel — process-global).
+func shrinkAttachedIdle(t *testing.T, attachedIdle time.Duration) {
+	t.Helper()
+	orig := agentTerminalAttachedIdle.Load()
+	agentTerminalAttachedIdle.Store(attachedIdle)
+	t.Cleanup(func() {
+		agentTerminalAttachedIdle.Store(orig)
+	})
+}
+
 // killRecorder replaces a session's killer with one that records kills in an
 // atomic counter so tests can assert whether the PTY process was touched.
 func killRecorder(s *agentTerminalSession) *int32 {
@@ -206,6 +218,7 @@ func TestAttachLiveRetractsCommittedReap(t *testing.T) {
 
 func TestDetachedIdleReapRules(t *testing.T) {
 	shrinkDetachedWatch(t, time.Minute, 30*time.Minute)
+	shrinkAttachedIdle(t, 30*time.Minute)
 	now := time.Now()
 	cases := []struct {
 		name    string
@@ -218,7 +231,7 @@ func TestDetachedIdleReapRules(t *testing.T) {
 			want:    "",
 		},
 		{
-			name:    "attached past the activity timeout is reaped (legacy behavior)",
+			name:    "attached past the activity timeout is reaped",
 			session: makeDetachRuleSession(false, now.Add(-time.Hour), now.Add(-time.Hour)),
 			want:    "idle timeout",
 		},
@@ -228,19 +241,19 @@ func TestDetachedIdleReapRules(t *testing.T) {
 			want:    "",
 		},
 		{
-			name:    "detached with recent input survives",
+			name:    "detached with recent activity survives",
 			session: makeDetachRuleSession(true, now, now),
 			want:    "",
 		},
 		{
-			name:    "detached past the input timeout is reaped",
+			name:    "detached fully silent past the threshold is reaped",
 			session: makeDetachRuleSession(true, now.Add(-time.Hour), now.Add(-time.Hour)),
-			want:    "without input",
+			want:    "without activity",
 		},
 		{
-			name:    "detached with recent OUTPUT but stale input is reaped (output does not extend life)",
+			name:    "detached with recent OUTPUT but stale input survives (activity clock rules)",
 			session: makeDetachRuleSession(true, now, now.Add(-time.Hour)),
-			want:    "without input",
+			want:    "",
 		},
 	}
 	for _, test := range cases {
@@ -272,13 +285,15 @@ func makeDetachRuleSession(detached bool, lastActiveAt, lastInputAt time.Time) *
 	return s
 }
 
-func TestDetachedIdleReapKillsAfterInputIdle(t *testing.T) {
+func TestDetachedIdleReapKillsAfterSilence(t *testing.T) {
 	shrinkDetachedWatch(t, 5*time.Millisecond, 40*time.Millisecond)
 	m := newAgentTerminalManager()
 	coll, write := newPayloadCollector()
 	live := newAttachTestSession("t-reap", newTerminalRingBuffer(4096))
-	live.lastInputAt = time.Now().Add(-time.Second) // input idle far past the 40ms threshold
-	live.lastActiveAt = time.Now()
+	// Fully silent past the threshold: no input AND no output for far longer
+	// than the 40ms budget — exactly what the detached rule exists to bound.
+	live.lastInputAt = time.Now().Add(-time.Second)
+	live.lastActiveAt = time.Now().Add(-time.Second)
 	live.detachedAt = time.Now()
 	var kills int32
 	killed := make(chan struct{})
@@ -316,8 +331,8 @@ func TestDetachedIdleReapKillsAfterInputIdle(t *testing.T) {
 	if len(errs) == 0 {
 		t.Fatalf("reap must emit a terminal.error explaining the kill")
 	}
-	if !strings.Contains(fmt.Sprint(errs[0]["error"]), "without input") {
-		t.Fatalf("reap error = %v, want a without-input reason", errs[0]["error"])
+	if !strings.Contains(fmt.Sprint(errs[0]["error"]), "without activity") {
+		t.Fatalf("reap error = %v, want a without-activity reason", errs[0]["error"])
 	}
 
 	// waitTerminal settles after the kill: live map entry dropped, tombstone left.
@@ -343,11 +358,17 @@ func TestDetachedIdleReapKillsAfterInputIdle(t *testing.T) {
 	}
 }
 
-func TestDetachedOutputDoesNotExtendLife(t *testing.T) {
+// TestDetachedOutputKeepsDetachedSessionAlive pins the 2026-10-22 incident fix:
+// a DETACHED session that keeps producing output must NOT be reaped, even
+// though its input clock ran out long ago — a transient agent↔server
+// disconnect must never murder a long build that is still streaming. The
+// silence half of the rule is still enforced: once the output stops, the
+// session is reaped after the detached-idle budget.
+func TestDetachedOutputKeepsDetachedSessionAlive(t *testing.T) {
 	shrinkDetachedWatch(t, 5*time.Millisecond, 60*time.Millisecond)
 	m := newAgentTerminalManager()
 	live := newAttachTestSession("t-out", newTerminalRingBuffer(4096))
-	live.lastInputAt = time.Now().Add(-time.Second)
+	live.lastInputAt = time.Now().Add(-time.Second) // input idle far past the 60ms threshold
 	live.lastActiveAt = time.Now()
 	live.detachedAt = time.Now()
 	kills := killRecorder(live)
@@ -357,13 +378,12 @@ func TestDetachedOutputDoesNotExtendLife(t *testing.T) {
 
 	go m.watchTerminalIdle("t-out", live.token, func(v interface{}) error { return nil })
 
-	// Keep the session visibly "active" with fresh output while its input idle
-	// clock runs out: output must refresh lastActiveAt (attached semantics) but
-	// must NOT save a detached session.
-	deadline := time.Now().Add(5 * time.Second)
-	for atomic.LoadInt32(kills) == 0 {
-		if time.Now().After(deadline) {
-			t.Fatalf("detached session must be reaped despite ongoing output (input timer rules)")
+	// Keep the session visibly active with paced output for several times the
+	// idle budget: the watcher must never reap it while output keeps flowing.
+	aliveDeadline := time.Now().Add(250 * time.Millisecond)
+	for time.Now().Before(aliveDeadline) {
+		if got := atomic.LoadInt32(kills); got != 0 {
+			t.Fatalf("detached session must survive while output keeps flowing, kills=%d (2026-10-22 regression)", got)
 		}
 		if rate, act := m.recordTerminalOutput("t-out", 16); rate || act.kind != "" {
 			t.Fatalf("16-byte paced output must not trip the rate gate or issue a challenge (rate=%t action=%q)", rate, act.kind)
@@ -372,6 +392,16 @@ func TestDetachedOutputDoesNotExtendLife(t *testing.T) {
 	}
 	if live.lastActiveAt.IsZero() || !live.lastActiveAt.After(time.Now().Add(-time.Second)) {
 		t.Fatalf("output must have kept refreshing lastActiveAt, got %v", live.lastActiveAt)
+	}
+
+	// Now go silent: the same watcher must reap the session once the activity
+	// clock runs past the detached-idle budget — the resource bound is intact.
+	silenceDeadline := time.Now().Add(5 * time.Second)
+	for atomic.LoadInt32(kills) == 0 {
+		if time.Now().After(silenceDeadline) {
+			t.Fatalf("fully silent detached session must still be reaped after the idle budget")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 

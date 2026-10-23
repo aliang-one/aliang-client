@@ -51,10 +51,27 @@ const (
 //	ALIANG_TERMINAL_DETACHED_IDLE  (time.ParseDuration form, e.g. "30m").
 //	                               How long a DETACHED session (its client
 //	                               disconnected, PTY deliberately kept alive)
-//	                               may sit without user input before it is
-//	                               reaped. Timed from the last INPUT only:
-//	                               output does not extend a detached
-//	                               session's life. Default 30m.
+//	                               may sit without ACTIVITY (neither input
+//	                               nor output) before it is reaped. Output
+//	                               keeps a detached session alive — a
+//	                               transient agent↔server disconnect must
+//	                               never murder a long build that is still
+//	                               streaming (2026-10-22 incident: sessions
+//	                               died ~30min after their last keystroke
+//	                               because the old rule timed from the last
+//	                               input alone). Default 30m.
+//
+//	ALIANG_TERMINAL_ATTACHED_IDLE  (time.ParseDuration form, e.g. "24h").
+//	                               How long an ATTACHED session may sit
+//	                               without any activity before it is
+//	                               reaped. Default 24h — the phone closing
+//	                               the terminal view never detaches the
+//	                               session agent-side, so a short all-quiet
+//	                               kill murders a shell the user may still
+//	                               be looking at; 24h also aligns this
+//	                               local bound with the server-side TTL
+//	                               window (which kills the PTY itself on
+//	                               expiry).
 //
 //	ALIANG_TERMINAL_HISTORY_TTL    (time.ParseDuration form, e.g. "24h").
 //	                               How long an exited session's tombstone
@@ -63,6 +80,7 @@ const (
 //	                               drops it. Default 24h.
 var (
 	agentTerminalDetachedIdle = newDurationAtom(resolveEnvDuration("ALIANG_TERMINAL_DETACHED_IDLE", 30*time.Minute))
+	agentTerminalAttachedIdle = newDurationAtom(resolveEnvDuration("ALIANG_TERMINAL_ATTACHED_IDLE", 24*time.Hour))
 	agentTerminalHistoryTTL   = resolveEnvDuration("ALIANG_TERMINAL_HISTORY_TTL", 24*time.Hour)
 
 	// agentTerminalIdleWatchInterval is how often each session's idle watcher
@@ -771,22 +789,31 @@ func (m *agentTerminalManager) sweepHistoryLoop() {
 
 // terminalIdleReapReason returns a non-empty human-readable reason when the
 // session should be reaped by its idle watcher, or "" while it may live.
-// Detached sessions are timed from the last USER INPUT only (Board semantics:
-// output does not extend a detached session's life); attached sessions keep
-// the legacy any-activity idle timer.
+// BOTH rules are activity clocks refreshed by input AND output (touchInput /
+// recordTerminalOutput). The detached rule formerly timed from the last user
+// input alone — output did not extend a detached session's life — which let a
+// transient agent↔server disconnect murder a session that was still streaming
+// output (2026-10-22 incident: builds died ~30min after the last keystroke,
+// with the death masked server-side as agent_restart). Detached now reaps on
+// total silence only; the attached timeout defaults to 24h (see the env doc
+// above for why the old 30m attached default was wrong too).
+//
+// lastInputAt is still maintained by touchInput but no longer gates any reap
+// rule — it stays as a per-session diagnostic clock.
 func terminalIdleReapReason(session *agentTerminalSession) string {
 	if session == nil {
 		return ""
 	}
 	if !session.detachedAt.IsZero() {
 		idle := agentTerminalDetachedIdle.Load()
-		if time.Since(session.lastInputAt) >= idle {
-			return fmt.Sprintf("detached terminal session reaped after %s without input", idle)
+		if time.Since(session.lastActiveAt) >= idle {
+			return fmt.Sprintf("detached terminal session reaped after %s without activity", idle)
 		}
 		return ""
 	}
-	if time.Since(session.lastActiveAt) >= agentTerminalIdleTimeout {
-		return fmt.Sprintf("terminal session idle timeout after %s", agentTerminalIdleTimeout)
+	idle := agentTerminalAttachedIdle.Load()
+	if time.Since(session.lastActiveAt) >= idle {
+		return fmt.Sprintf("terminal session idle timeout after %s", idle)
 	}
 	return ""
 }
