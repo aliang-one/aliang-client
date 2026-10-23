@@ -390,10 +390,21 @@ func (m *agentAIManager) runTUITurn(ctx context.Context, session *agentAISession
 		_ = write(agentAIErrorPayload(session.id, run.messageID, newAgentTUITurnError(code, msg)))
 	}
 	assistantMsgID := agentAssistantMessageID(run.messageID)
+	// 子 agent 感知：TUI 回合的 sidechain 落在 <jsonl 同目录>/subagents/，
+	// tail 轮询顺带 watch（见 tuiSubagentWatcher）。
+	subWatch := newTUISubagentWatcher(plan.JSONLPath)
 
 	// 1) 登记：与 spawn 路径同一组字段，使 stop()/审批通道/LRU 无需改动即可工作。
 	runCtx, cancel := context.WithCancel(ctx)
 	activity := newAgentAIActivity()
+	// finalizeSubs 必须先于任何终态写——emitter 是终态屏障，之后的 interrupted
+	// 会被丢弃。
+	finalizeSubs := func() {
+		for _, record := range run.subagents.finalize(time.Now()) {
+			activity.endSubagent()
+			_ = write(agentAISubagentPayload(session.id, record))
+		}
+	}
 	// emitStopStatus 是 ctx 取消（用户 stop / 看门狗 kill / 硬上限）的唯一收尾。
 	// 必须发**终态** ai.status：只发 stopping（非终态）会让服务端把 run 一直挂在
 	// running 上，直到 10 分钟 stale sweeper 打翻成 timed_out/error——手机上一张
@@ -401,6 +412,7 @@ func (m *agentAIManager) runTUITurn(ctx context.Context, session *agentAISession
 	// （agentAIRunStoppedStatus），看门狗 kill 的原因才能如实上报。
 	emitStopStatus := func() {
 		status, errMsg := agentAIRunStoppedStatus(activity, nil)
+		finalizeSubs()
 		payload := map[string]any{
 			"type": models.AgentEventAIStatus, "session_id": session.id, "status": status,
 		}
@@ -572,6 +584,8 @@ tail:
 		} else if sawUserEcho {
 			quiet++
 		}
+		// sidechain 目录 watch：新子 agent→started、增长→progress、静默→completed
+		subWatch.poll(run.subagents, activity, session.id, assistantMsgID, write)
 		// 完成：注入已回显 + 连续安静 + TUI 不再 busy（或记录消失）。
 		if sawUserEcho && quiet >= tuiTurnQuietRounds {
 			if rec, live := liveClaudeTUIRecord(plan.Home, plan.NativeSessionID); !live ||
@@ -588,6 +602,8 @@ tail:
 	}
 
 	// 5) ai.done（经 emitter → 自动 run_id/event_seq + 终态落盘 + 断线补推）。
+	// 先收敛仍存活的子 agent（后台 async 子 agent 在 done 时可能还在跑）。
+	finalizeSubs()
 	_ = write(map[string]any{
 		"type": models.AgentEventAIDone, "session_id": session.id,
 		"message_id":          assistantMsgID,

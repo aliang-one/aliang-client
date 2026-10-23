@@ -228,7 +228,7 @@ func runWatchdogUntilCancelled(t *testing.T, idleWindow, hardCeiling, noProgress
 	}
 	done := make(chan struct{})
 	go func() {
-		agentAIWatchdogLoop(ctx, activity, cancel, idleWindow, hardCeiling, noProgressWindow, 0, interval)
+		agentAIWatchdogLoop(ctx, activity, cancel, idleWindow, hardCeiling, noProgressWindow, 0, 0, interval)
 		close(done)
 	}()
 	select {
@@ -299,7 +299,7 @@ func TestAgentAIWatchdogLoopToolResultReenablesIdle(t *testing.T) {
 	activity.beginToolUseWait()
 	done := make(chan struct{})
 	go func() {
-		agentAIWatchdogLoop(ctx, activity, cancel, 40*time.Millisecond, 0, 0, 0, 10*time.Millisecond)
+		agentAIWatchdogLoop(ctx, activity, cancel, 40*time.Millisecond, 0, 0, 0, 0, 10*time.Millisecond)
 		close(done)
 	}()
 
@@ -328,7 +328,7 @@ func TestAgentAIWatchdogLoopActivityResetsIdle(t *testing.T) {
 	activity := newAgentAIActivity()
 	done := make(chan struct{})
 	go func() {
-		agentAIWatchdogLoop(ctx, activity, cancel, 40*time.Millisecond, 0, 0, 0, 10*time.Millisecond)
+		agentAIWatchdogLoop(ctx, activity, cancel, 40*time.Millisecond, 0, 0, 0, 0, 10*time.Millisecond)
 		close(done)
 	}()
 
@@ -390,7 +390,7 @@ func TestAgentAIWatchdogLoopNoProgressKills(t *testing.T) {
 	activity := newAgentAIActivity()
 	done := make(chan struct{})
 	go func() {
-		agentAIWatchdogLoop(ctx, activity, cancel, time.Hour /* idleWindow: never fires */, 0 /* hardCeiling disabled */, 50*time.Millisecond /* noProgressWindow */, 0 /* toolWaitCeiling disabled */, 10*time.Millisecond /* interval */)
+		agentAIWatchdogLoop(ctx, activity, cancel, time.Hour /* idleWindow: never fires */, 0 /* hardCeiling disabled */, 50*time.Millisecond /* noProgressWindow */, 0 /* toolWaitCeiling disabled */, 0 /* subagentCeiling disabled */, 10*time.Millisecond /* interval */)
 		close(done)
 	}()
 
@@ -425,7 +425,7 @@ func TestAgentAIWatchdogLoopProgressPreventsNoProgressKill(t *testing.T) {
 	activity := newAgentAIActivity()
 	done := make(chan struct{})
 	go func() {
-		agentAIWatchdogLoop(ctx, activity, cancel, time.Hour, 0, 60*time.Millisecond, 0, 10*time.Millisecond)
+		agentAIWatchdogLoop(ctx, activity, cancel, time.Hour, 0, 60*time.Millisecond, 0, 0, 10*time.Millisecond)
 		close(done)
 	}()
 
@@ -479,7 +479,7 @@ func TestAgentAIWatchdogLoopToolWaitCeilingKills(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		// idle 窗口巨大：确保唯一可能触发的是 tool-wait 上限。
-		agentAIWatchdogLoop(ctx, activity, cancel, time.Hour, 0, 0, 40*time.Millisecond, 5*time.Millisecond)
+		agentAIWatchdogLoop(ctx, activity, cancel, time.Hour, 0, 0, 40*time.Millisecond, 0, 5*time.Millisecond)
 		close(done)
 	}()
 
@@ -501,7 +501,7 @@ func TestAgentAIWatchdogLoopApprovalPausesToolWaitClock(t *testing.T) {
 	activity.setAwaitingApproval(true) // 时钟清零 → 上限不得触发
 	done := make(chan struct{})
 	go func() {
-		agentAIWatchdogLoop(ctx, activity, cancel, time.Hour, 0, 0, 40*time.Millisecond, 5*time.Millisecond)
+		agentAIWatchdogLoop(ctx, activity, cancel, time.Hour, 0, 0, 40*time.Millisecond, 0, 5*time.Millisecond)
 		close(done)
 	}()
 
@@ -520,7 +520,7 @@ func TestAgentAIWatchdogLoopApprovalResolveRearmsToolWaitClock(t *testing.T) {
 	activity.setAwaitingApproval(true)
 	done := make(chan struct{})
 	go func() {
-		agentAIWatchdogLoop(ctx, activity, cancel, time.Hour, 0, 0, 40*time.Millisecond, 5*time.Millisecond)
+		agentAIWatchdogLoop(ctx, activity, cancel, time.Hour, 0, 0, 40*time.Millisecond, 0, 5*time.Millisecond)
 		close(done)
 	}()
 	time.Sleep(80 * time.Millisecond)   // 在审批中度过整个上限窗口

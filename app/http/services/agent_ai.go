@@ -278,7 +278,7 @@ type agentAISession struct {
 	// steer 通道；与 codexSteer 二选一，同一条 run 上不会同时存在。
 	claudeSteer  *agentAIClaudeSteerControl
 	claudePolicy agentAIClaudeRemotePolicy
-	claudeCaps    agentAIClaudeCapabilities
+	claudeCaps   agentAIClaudeCapabilities
 }
 
 type agentAISteerMessage struct {
@@ -349,12 +349,15 @@ type agentAIRun struct {
 	freshPrompt             string
 	attachments             []agentAIAttachment
 	// 服务端下发的附件下载白名单（SSRF 围栏），空则回落到环境变量。
-	attachmentAllowedHosts  []string
-	cancel                  context.CancelFunc
-	approvalToken           string
-	activity                *agentAIActivity
-	claudePolicy            agentAIClaudeRemotePolicy
-	onClaudeInit            func([]string, string)
+	attachmentAllowedHosts []string
+	cancel                 context.CancelFunc
+	approvalToken          string
+	activity               *agentAIActivity
+	// subagents 跟踪本 run 的子 agent 生命周期（claude task_* 帧 / 兜底登记 /
+	// TUI 桥的 sidechain 目录 watch）。nil 安全（codex 路径不建）。
+	subagents    *agentAISubagentRegistry
+	claudePolicy agentAIClaudeRemotePolicy
+	onClaudeInit func([]string, string)
 	// Policy context for an escalated approval: which rule triggered it and the
 	// policy version that decided. Set by the approval hooks before escalation.
 	matchedRuleID string
@@ -1016,9 +1019,16 @@ type agentAIActivity struct {
 	// time never counts against the ceiling (approvals are bounded separately
 	// by agentAIApprovalTimeout).
 	toolWaitStartedAt atomic.Int64
-	runStart          time.Time
-	killReasonMu      sync.RWMutex
-	killReason        string
+	// activeSubagents counts in-flight subagent records (task_started …
+	// terminal frame / teardown). While >0 the idle and no-progress guards are
+	// paused (idlePaused) and agentAISubagentWaitCeiling bounds the contiguous
+	// stretch instead — subagent work is legitimately silent on the parent's
+	// stdout (sync mode: no frames between launch and completion).
+	activeSubagents       atomic.Int64
+	subagentWaitStartedAt atomic.Int64
+	runStart              time.Time
+	killReasonMu          sync.RWMutex
+	killReason            string
 }
 
 func newAgentAIActivity() *agentAIActivity {
@@ -1138,7 +1148,72 @@ func (a *agentAIActivity) idlePaused() bool {
 	if a == nil {
 		return false
 	}
-	return a.awaitingApproval.Load() || a.pendingToolUses.Load() > 0
+	return a.awaitingApproval.Load() || a.pendingToolUses.Load() > 0 || a.activeSubagents.Load() > 0
+}
+
+// beginSubagent marks that a subagent record went active (task_started). While
+// the count is >0 the idle/no-progress guards are paused and the subagent-wait
+// ceiling clock is armed.
+func (a *agentAIActivity) beginSubagent() {
+	if a == nil {
+		return
+	}
+	if a.activeSubagents.Add(1) == 1 {
+		a.subagentWaitStartedAt.Store(time.Now().UnixNano())
+	}
+	a.bump()
+}
+
+// endSubagent marks a subagent record terminal. The wait clock clears when the
+// last active record closes.
+func (a *agentAIActivity) endSubagent() {
+	if a == nil {
+		return
+	}
+	for {
+		current := a.activeSubagents.Load()
+		if current <= 0 {
+			break
+		}
+		if a.activeSubagents.CompareAndSwap(current, current-1) {
+			if current-1 == 0 {
+				a.subagentWaitStartedAt.Store(0)
+			}
+			break
+		}
+	}
+	a.bump()
+}
+
+// subagentWaitFor reports how long >=1 subagent has been continuously active.
+func (a *agentAIActivity) subagentWaitFor() time.Duration {
+	if a == nil {
+		return 0
+	}
+	ts := a.subagentWaitStartedAt.Load()
+	if ts == 0 {
+		return 0
+	}
+	return time.Since(time.Unix(0, ts))
+}
+
+// subagentProgress feeds every watchdog clock from a task_progress frame: raw
+// activity (idle guard), meaningful progress (no-progress guard), and — the
+// mis-kill fix — a RESET of the contiguous tool-wait clock while a tool wait is
+// pending. On the sync phone path the parent Agent tool_result only arrives at
+// completion, so pendingToolUses stays armed for the whole subagent run and
+// without this reset a >1h subagent dies as "suspected hung tool" despite
+// emitting regular progress.
+func (a *agentAIActivity) subagentProgress() {
+	if a == nil {
+		return
+	}
+	now := time.Now().UnixNano()
+	a.lastActivityAt.Store(now)
+	a.lastProgressAt.Store(now)
+	if a.pendingToolUses.Load() > 0 {
+		a.toolWaitStartedAt.Store(now)
+	}
 }
 
 func (a *agentAIActivity) idleFor() time.Duration {
@@ -1183,12 +1258,12 @@ func (m *agentAIManager) startAIWatchdog(ctx context.Context, activity *agentAIA
 	if activity == nil || cancel == nil {
 		return
 	}
-	go agentAIWatchdogLoop(ctx, activity, cancel, agentAIIdleWindow, agentAIHardCeiling, agentAINoProgressWindow, agentAIToolWaitCeiling, agentAIIdleCheckInterval)
+	go agentAIWatchdogLoop(ctx, activity, cancel, agentAIIdleWindow, agentAIHardCeiling, agentAINoProgressWindow, agentAIToolWaitCeiling, agentAISubagentWaitCeiling, agentAIIdleCheckInterval)
 }
 
 // agentAIWatchdogLoop is the parameterized watchdog body, split out so tests can
 // drive it with tiny windows instead of the multi-minute production defaults.
-func agentAIWatchdogLoop(ctx context.Context, activity *agentAIActivity, cancel context.CancelFunc, idleWindow, hardCeiling, noProgressWindow, toolWaitCeiling, interval time.Duration) {
+func agentAIWatchdogLoop(ctx context.Context, activity *agentAIActivity, cancel context.CancelFunc, idleWindow, hardCeiling, noProgressWindow, toolWaitCeiling, subagentCeiling, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -1230,6 +1305,17 @@ func agentAIWatchdogLoop(ctx context.Context, activity *agentAIActivity, cancel 
 				cancel()
 				return
 			}
+			// Subagent-wait ceiling: a contiguous stretch with >=1 active
+			// subagent that outlives this bound means runaway subagent work.
+			// task_progress resets the tool-wait clock above (progress = not
+			// hung) but never this one, so an endlessly-progressing subagent is
+			// still bounded. Old CC (no task_* frames) leaves the count at zero
+			// and this guard stays inert.
+			if subagentCeiling > 0 && activity.subagentWaitFor() > subagentCeiling {
+				activity.setKillReason("subagent_wait_timeout")
+				cancel()
+				return
+			}
 			if hardCeiling > 0 && time.Since(activity.runStart) > hardCeiling {
 				activity.setKillReason("hard_ceiling")
 				cancel()
@@ -1253,6 +1339,8 @@ func agentAIRunStoppedStatus(activity *agentAIActivity, limiter *agentAIOutputLi
 		return "idle_timeout", fmt.Sprintf("AI run produced no meaningful progress (no text or file changes) for %s and was stopped", agentAINoProgressWindow)
 	case "tool_wait_timeout":
 		return "timeout", fmt.Sprintf("AI run tool/subagent wait exceeded %s without a tool result (suspected hung tool) and was stopped", agentAIToolWaitCeiling)
+	case "subagent_wait_timeout":
+		return "timeout", fmt.Sprintf("AI run subagent work exceeded %s without completing (suspected runaway subagent) and was stopped", agentAISubagentWaitCeiling)
 	case "hard_ceiling":
 		return "hard_timeout", fmt.Sprintf("AI run exceeded the maximum runtime %s", agentAIHardCeiling)
 	}
@@ -2117,7 +2205,7 @@ func (c *agentAICodexSteerControl) nextSteerPayloadLocked(msg agentAISteerMessag
 			"threadId":            c.threadID,
 			"expectedTurnId":      c.turnID,
 			"clientUserMessageId": msg.MessageID,
-			"input": codexSteerInput(msg),
+			"input":               codexSteerInput(msg),
 		},
 	}
 }
@@ -2264,6 +2352,7 @@ func (m *agentAIManager) runUserMessage(session *agentAISession, runID, messageI
 		cancel:                  cancel,
 		approvalToken:           approvalToken,
 		activity:                activity,
+		subagents:               newAgentAISubagentRegistry(),
 		claudePolicy:            cloneAgentAIClaudeRemotePolicy(session.claudePolicy),
 		goalIdentity:            cloneGoalIdentity(emitter.goalIdentity),
 		goalAllowedRoots:        emitter.goalAllowedRoots,
@@ -5469,6 +5558,9 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 
 	if ctx.Err() != nil {
 		status, errMsg := agentAIRunStoppedStatus(run.activity, limiter)
+		// 先收敛存活的子 agent 再发终态：emitter 是终态屏障，ai.status 之后再
+		// 发的 interrupted 会被静默丢弃。
+		finalizeRunSubagents(run, writeJSON)
 		statusPayload := map[string]interface{}{
 			"type":       models.AgentEventAIStatus,
 			"session_id": run.sessionID,
@@ -5511,6 +5603,7 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 		if stderrText := strings.TrimSpace(stderrBuf.String()); stderrText != "" {
 			payload["detail"] = truncateForCloud(stderrText)
 		}
+		finalizeRunSubagents(run, writeJSON)
 		_ = writeJSON(payload)
 		return agentAIRunDone, agentAIEffortRejection{}
 	}
@@ -5553,6 +5646,9 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 		done["opencode_session_id"] = sid
 		done["source_session_id"] = sid
 	}
+	// 正常完成也要收敛：后台子 agent（async）在 ai.done 时可能仍在跑，按
+	// interrupted 终结（服务端 finalizeTurnActivity 同语义兜底）。
+	finalizeRunSubagents(run, writeJSON)
 	_ = writeJSON(done)
 	return agentAIRunDone, agentAIEffortRejection{}
 }
@@ -5712,6 +5808,10 @@ func streamStructuredAIDelta(reader io.Reader, format agentAIOutputFormat, run a
 		}
 		if format == agentAIOutputClaudeStreamJSON {
 			updateClaudeToolUseActivity(event, run.activity, pendingClaudeToolUseIDs)
+			// 子 agent 生命周期帧（system/task_*）→ 注册表 + ai.subagent 事件
+			// + 看门狗喂食。放在 activity 配对之后、结构化发射之前，保证同一
+			// 帧上 activity 状态先于 wire 事件就绪。
+			handleClaudeTaskEvents(event, run, writeJSON)
 		}
 		emitClaudeStructuredEvents(format, event, run, writeJSON, pendingCommands, claudeBlockTypes)
 		emitOpenCodeStructuredEvents(format, event, run, writeJSON)
@@ -5865,6 +5965,13 @@ func streamStructuredAIDelta(reader io.Reader, format agentAIOutputFormat, run a
 
 func updateClaudeToolUseActivity(event map[string]interface{}, activity *agentAIActivity, pending map[string]struct{}) {
 	if activity == nil || pending == nil {
+		return
+	}
+	// 子 agent 内部的 tool_use/tool_result 带 parent_tool_use_id（实测 --print
+	// stream-json 默认全量下发）。它们必须在这里止步：否则内部配对会双计
+	// pendingToolUses、掩盖父 Agent 等待的真实边界。子 agent 活跃度由
+	// handleClaudeTaskEvents 经 beginSubagent/subagentProgress 单独喂。
+	if remoteString(event, "parent_tool_use_id") != "" {
 		return
 	}
 	message := mapIf(event["message"])
@@ -6158,6 +6265,12 @@ func openCodeEventError(event map[string]interface{}) (string, bool) {
 
 func extractClaudeStreamTexts(event map[string]interface{}) aiStreamTexts {
 	var out aiStreamTexts
+	// 子 agent 的内部文本（parented assistant / stream_event delta）不得混进
+	// 父会话的 ai.delta——它们是子 agent 的自言自语，混进来会让用户看到两路
+	// 交织的半截回复。父会话自身的帧 parent_tool_use_id 为 null，不受影响。
+	if remoteString(event, "parent_tool_use_id") != "" {
+		return out
+	}
 	if remoteString(event, "type") == "stream_event" {
 		if streamEvent, ok := event["event"].(map[string]interface{}); ok && remoteString(streamEvent, "type") == "content_block_delta" {
 			if delta, ok := streamEvent["delta"].(map[string]interface{}); ok && remoteString(delta, "type") == "text_delta" {
@@ -6382,6 +6495,14 @@ func claudeToolUseEvents(content []interface{}, run agentAIRun, pending map[stri
 				"item_id":    id,
 				"tasks":      claudeTodosToTasks(input["todos"]),
 			})
+		case "Agent", "Task":
+			// 老 CC（无 task_started 帧）兜底：仅登记不发射——实测新 CC 的
+			// task_started 紧随 assistant 帧到达，此刻发射必然与真 started
+			// 撞出重复行。登记后看门狗照常知情；终态由 claudeToolResultEvents
+			// 在无父标记 tool_result 到达时补发，run 拆除时 finalize 兜底。
+			if run.subagents != nil && id != "" {
+				run.subagents.startLegacy(id, msgID, remoteString(input, "description"), remoteString(input, "subagent_type"), time.Now())
+			}
 		}
 	}
 	return out
@@ -6418,7 +6539,9 @@ func claudeTodosToTasks(raw interface{}) []map[string]interface{} {
 // entry is consumed. Unknown ids are ignored.
 func claudeToolResultEvents(content []interface{}, run agentAIRun, pending map[string]string) []map[string]interface{} {
 	items := content
-	if len(pending) == 0 {
+	// pendingCommands 为空也不能早退：老 CC 兜底登记的子 agent 终态走这里
+	// （无父标记 tool_result），与 Bash pending 无关。
+	if len(pending) == 0 && run.subagents == nil {
 		return nil
 	}
 	msgID := streamingMessageID(run)
@@ -6429,6 +6552,20 @@ func claudeToolResultEvents(content []interface{}, run agentAIRun, pending map[s
 			continue
 		}
 		id := remoteString(row, "tool_use_id")
+		// 老 CC 兜底登记的子 agent：无父标记的 tool_result（"[Subagent
+		// hand-back]" 或 async_launched）就是它的终态信号——此刻补发
+		// completed/failed，摘要用返回文本（截断）。
+		if run.subagents != nil && run.subagents.legacyStarted(id) {
+			phase := "completed"
+			if isErr, ok := row["is_error"].(bool); ok && isErr {
+				phase = "failed"
+			}
+			if record, ok := run.subagents.finish(id, phase, claudeToolResultText(row["content"]), time.Now()); ok {
+				run.activity.endSubagent()
+				out = append(out, agentAISubagentPayload(run.sessionID, record))
+			}
+			continue
+		}
 		command, matched := pending[id]
 		if !matched {
 			continue
@@ -6523,6 +6660,13 @@ func streamFloatIndex(raw interface{}) (int, bool) {
 
 func emitClaudeStructuredEvents(format agentAIOutputFormat, event map[string]interface{}, run agentAIRun, writeJSON agentTerminalWriter, pending map[string]string, blockTypes map[int]string) {
 	if format != agentAIOutputClaudeStreamJSON {
+		return
+	}
+	// 子 agent 内部帧（parented）的全部结构化内容——thinking delta、tool_use、
+	// usage、tool_result——都不得以父会话名义上 wire。子 agent 生命周期走
+	// handleClaudeTaskEvents 的 ai.subagent 专用通道。父会话帧
+	// parent_tool_use_id 为 null，不受影响。
+	if remoteString(event, "parent_tool_use_id") != "" {
 		return
 	}
 	msgID := streamingMessageID(run)

@@ -136,6 +136,19 @@ var (
 	// never count against this ceiling (the clock is paused while a human
 	// decision is pending) and remain bounded by agentAIApprovalTimeout.
 	agentAIToolWaitCeiling = resolveEnvDurationAllowZero("ALIANG_AI_TOOL_WAIT_CEILING", time.Hour)
+
+	// agentAISubagentWaitCeiling bounds one CONTIGUOUS stretch with >=1 active
+	// subagent, regardless of progress. task_progress resets the 1h tool-wait
+	// clock above (progress = not hung), but not this one — so a subagent that
+	// keeps emitting progress forever is still bounded. Env:
+	//
+	//	ALIANG_AI_SUBAGENT_WAIT_CEILING  (time.ParseDuration, e.g. "90m"). Default 6h.
+	//
+	// Explicitly "0s" disables. Keep below agentAIHardCeiling (48h) — same
+	// reasoning as the tool-wait ceiling. Active-subagent time also pauses the
+	// idle/no-progress guards (idlePaused), so without this bound a marquee
+	// subagent would pin the run until the hard ceiling.
+	agentAISubagentWaitCeiling = resolveEnvDurationAllowZero("ALIANG_AI_SUBAGENT_WAIT_CEILING", 6*time.Hour)
 )
 
 // Terminal output quota challenge knobs (terminal.quota.* protocol, see

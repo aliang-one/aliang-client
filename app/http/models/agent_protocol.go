@@ -73,6 +73,7 @@ const (
 	AgentEventAIUsage                 = "ai.usage"                // agent→cloud: per-turn token usage surfaced from the provider
 	AgentEventUsageReport             = "usage.report"            // agent→cloud: Claude Code 本地会话小时级用量聚合（后台材料，勿与逐轮 ai.usage 混淆）
 	AgentEventAITask                  = "ai.task"                 // agent→cloud: task/todo list snapshot (claude TodoWrite)
+	AgentEventAISubagent              = "ai.subagent"             // agent→cloud: 子 agent(Task/Agent 工具)生命周期,phase=started|progress|completed|failed|interrupted,task_id 为事件键
 	AgentEventFileList                = "file.list"
 	AgentEventFileListResult          = "file.list.result"
 	AgentEventFileRead                = "file.read"
