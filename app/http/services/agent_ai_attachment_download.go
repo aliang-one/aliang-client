@@ -1,6 +1,6 @@
 package services
 
-// 附件下载：把服务端下发的短时效预签名 URL 落成临时文件，供 provider CLI 读。
+// 附件下载：把服务端下发的短时效预签名 URL 落成本地文件，供 provider CLI 读。
 //
 // 为什么 agent 要自己下载：claude/codex/opencode 三个 CLI 都只认本地路径
 // （codex 的 --image、opencode 的 --file、claude 的 image block 都要磁盘文件），
@@ -12,11 +12,15 @@ package services
 //     ALIANG_ATTACHMENT_ALLOWED_HOSTS；两者都空 → 直接拒绝，不做「无白名单放行」
 //   - 每次重定向都重新校验 host（预签名 URL 的 host 是可信的，但重定向不是）
 //   - 单文件 ≤ 20MiB，边下边数，超限立即中断而不是下完再判
-//   - 临时目录 MkdirTemp 一次性创建，cleanup 整目录删除
+//   - spawn/steer 路径用 MkdirTemp 一次性目录，cleanup 整目录删除；
+//     TUI 注入路径用持久缓存目录（downloadAgentAIAttachmentsToCache），
+//     同一会话后续回合还能再次 Read 同一张图
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -32,6 +36,9 @@ import (
 const (
 	attachmentDownloadMaxBytes = 20 * 1024 * 1024
 	attachmentDownloadTimeout  = 2 * time.Minute
+	// TUI 附件缓存保留时长。缓存里的图片可能被同一会话后续回合再次 Read，
+	// 但不能无限增长；下载前机会式清理超期文件。
+	attachmentCacheTTL = 7 * 24 * time.Hour
 )
 
 // downloadAgentAIAttachments 把带 URL 的附件下载到临时目录，返回替换过 Path 的
@@ -89,6 +96,62 @@ func downloadAgentAIAttachments(
 	return out, cleanup, nil
 }
 
+// downloadAgentAIAttachmentsToCache 把附件下载到持久缓存目录，供 TUI 注入路径
+// 把本地路径交给终端里的模型 Read。与 downloadAgentAIAttachments 的区别：
+//   - 目录固定（默认 ~/.aliang/attachments，可用 ALIANG_ATTACHMENT_CACHE_DIR 覆盖）
+//   - cleanup 是 no-op：回合结束不删文件，同一会话后续回合还能再次 Read
+//   - 文件名带内容哈希前缀，同一张图重复下发只占一份
+//   - 每次下载前机会式清理超过 attachmentCacheTTL 的旧文件
+func downloadAgentAIAttachmentsToCache(
+	ctx context.Context,
+	attachments []agentAIAttachment,
+	allowedHosts []string,
+) ([]agentAIAttachment, func(), error) {
+	noop := func() {}
+	if len(attachments) == 0 {
+		return attachments, noop, nil
+	}
+	pending := make([]int, 0, len(attachments))
+	for i, attachment := range attachments {
+		if attachment.Text != "" || attachment.Path != "" {
+			continue
+		}
+		if attachment.URL != "" {
+			pending = append(pending, i)
+		}
+	}
+	if len(pending) == 0 {
+		return attachments, noop, nil
+	}
+
+	hosts := normalizeAttachmentAllowedHosts(allowedHosts)
+	if len(hosts) == 0 {
+		return nil, noop, errors.New("attachment download refused: no allowed hosts configured")
+	}
+
+	dir, err := agentAIAttachmentCacheDir()
+	if err != nil {
+		return nil, noop, fmt.Errorf("resolve attachment cache dir: %w", err)
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, noop, fmt.Errorf("create attachment cache dir: %w", err)
+	}
+	cleanupAgentAIAttachmentCache(dir, time.Now())
+
+	out := append([]agentAIAttachment(nil), attachments...)
+	for _, index := range pending {
+		attachment := out[index]
+		path, err := downloadAgentAIAttachmentToCache(ctx, attachment, dir, hosts)
+		if err != nil {
+			return nil, noop, err
+		}
+		attachment.Path = path
+		attachment.URL = ""
+		out[index] = attachment
+	}
+	return out, noop, nil
+}
+
 func downloadAgentAIAttachmentToFile(
 	ctx context.Context,
 	attachment agentAIAttachment,
@@ -102,21 +165,92 @@ func downloadAgentAIAttachmentToFile(
 	name := safeAttachmentFileName(firstNonEmpty(attachment.Name, filepath.Base(parsed.Path), "attachment"))
 	target := filepath.Join(dir, name)
 
+	file, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return "", fmt.Errorf("create attachment file: %w", err)
+	}
+	writeErr := writeAttachmentPayload(ctx, attachment, allowedHosts, file)
+	closeErr := file.Close()
+	if writeErr != nil {
+		_ = os.Remove(target)
+		return "", writeErr
+	}
+	if closeErr != nil {
+		_ = os.Remove(target)
+		return "", fmt.Errorf("save attachment: %w", closeErr)
+	}
+	return target, nil
+}
+
+// downloadAgentAIAttachmentToCache 先写 .partial-* 临时文件，边写边算内容哈希，
+// 成功后改名为 <hash12>-<原名>。同一内容重复下载会命中已有文件，只保留一份。
+func downloadAgentAIAttachmentToCache(
+	ctx context.Context,
+	attachment agentAIAttachment,
+	dir string,
+	allowedHosts map[string]struct{},
+) (string, error) {
+	parsed, err := url.Parse(attachment.URL)
+	if err != nil {
+		return "", fmt.Errorf("parse attachment url: %w", err)
+	}
+	name := safeAttachmentFileName(firstNonEmpty(attachment.Name, filepath.Base(parsed.Path), "attachment"))
+
+	tmp, err := os.CreateTemp(dir, ".partial-*")
+	if err != nil {
+		return "", fmt.Errorf("create attachment cache file: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer func() { _ = os.Remove(tmpPath) }()
+
+	hasher := sha256.New()
+	if err := writeAttachmentPayload(ctx, attachment, allowedHosts, io.MultiWriter(tmp, hasher)); err != nil {
+		_ = tmp.Close()
+		return "", err
+	}
+	if err := tmp.Close(); err != nil {
+		return "", fmt.Errorf("close attachment cache file: %w", err)
+	}
+
+	sum := hex.EncodeToString(hasher.Sum(nil))
+	target := filepath.Join(dir, sum[:12]+"-"+name)
+	if _, err := os.Stat(target); err == nil {
+		return target, nil
+	}
+	if err := os.Rename(tmpPath, target); err != nil {
+		return "", fmt.Errorf("cache attachment: %w", err)
+	}
+	tmpPath = "" // 已改名，defer 不能再删目标
+	return target, nil
+}
+
+// writeAttachmentPayload 把附件内容写到 w。https 走白名单 + 重定向校验 + 20MiB
+// 上限；data URL 直接 base64 解码。临时路径与缓存路径共用这一份安全边界。
+func writeAttachmentPayload(
+	ctx context.Context,
+	attachment agentAIAttachment,
+	allowedHosts map[string]struct{},
+	w io.Writer,
+) error {
+	parsed, err := url.Parse(attachment.URL)
+	if err != nil {
+		return fmt.Errorf("parse attachment url: %w", err)
+	}
 	if parsed.Scheme == "data" {
-		return target, writeDataURLAttachment(attachment.URL, target)
+		return writeDataURLAttachmentTo(attachment.URL, w)
 	}
 	if parsed.Scheme != "https" {
-		return "", fmt.Errorf("attachment url must use https: %s", parsed.Scheme)
+		return fmt.Errorf("attachment url must use https: %s", parsed.Scheme)
 	}
 	if _, ok := allowedHosts[strings.ToLower(parsed.Hostname())]; !ok {
-		return "", fmt.Errorf("attachment host is not allowed: %s", parsed.Hostname())
+		return fmt.Errorf("attachment host is not allowed: %s", parsed.Hostname())
 	}
 
 	reqCtx, cancel := context.WithTimeout(ctx, attachmentDownloadTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, attachment.URL, nil)
 	if err != nil {
-		return "", fmt.Errorf("build attachment request: %w", err)
+		return fmt.Errorf("build attachment request: %w", err)
 	}
 	client := &http.Client{
 		// 每一跳都过白名单：预签名 URL 本身可信，但 302 目标是对方说了算。
@@ -135,37 +269,71 @@ func downloadAgentAIAttachmentToFile(
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("download attachment: %w", err)
+		return fmt.Errorf("download attachment: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("download attachment: http %d", resp.StatusCode)
+		return fmt.Errorf("download attachment: http %d", resp.StatusCode)
 	}
 
-	file, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
-	if err != nil {
-		return "", fmt.Errorf("create attachment file: %w", err)
-	}
 	// 多读 1 字节用来区分「刚好等于上限」和「超限」，避免信任 Content-Length
 	// （服务端可以撒谎，chunked 更是没有）。
-	written, copyErr := io.Copy(file, io.LimitReader(resp.Body, attachmentDownloadMaxBytes+1))
-	closeErr := file.Close()
+	written, copyErr := io.Copy(w, io.LimitReader(resp.Body, attachmentDownloadMaxBytes+1))
 	if copyErr != nil {
-		_ = os.Remove(target)
-		return "", fmt.Errorf("save attachment: %w", copyErr)
-	}
-	if closeErr != nil {
-		_ = os.Remove(target)
-		return "", fmt.Errorf("save attachment: %w", closeErr)
+		return fmt.Errorf("save attachment: %w", copyErr)
 	}
 	if written > attachmentDownloadMaxBytes {
-		_ = os.Remove(target)
-		return "", fmt.Errorf("attachment exceeds %d MiB: %s", attachmentDownloadMaxBytes/(1024*1024), attachment.Name)
+		return fmt.Errorf("attachment exceeds %d MiB: %s", attachmentDownloadMaxBytes/(1024*1024), attachment.Name)
 	}
-	return target, nil
+	return nil
 }
 
-func writeDataURLAttachment(raw, target string) error {
+// agentAIAttachmentCacheDir 返回 TUI 附件缓存目录。默认 ~/.aliang/attachments，
+// ALIANG_ATTACHMENT_CACHE_DIR 可覆盖（测试/运维）。放在持久目录而不是 MkdirTemp：
+// 同一会话的后续回合可能再次 Read 同一张图，回合结束就删会让第二次 Read 失败。
+func agentAIAttachmentCacheDir() (string, error) {
+	if dir := strings.TrimSpace(os.Getenv("ALIANG_ATTACHMENT_CACHE_DIR")); dir != "" {
+		// 相对路径按 agent 进程 cwd 解析不可预测；显式转绝对路径，日志里也能直接看出位置。
+		if abs, err := filepath.Abs(dir); err == nil {
+			return abs, nil
+		}
+		return dir, nil
+	}
+	if home, err := os.UserHomeDir(); err == nil && strings.TrimSpace(home) != "" {
+		return filepath.Join(home, ".aliang", "attachments"), nil
+	}
+	if cache, err := os.UserCacheDir(); err == nil && strings.TrimSpace(cache) != "" {
+		return filepath.Join(cache, "aliang", "attachments"), nil
+	}
+	return filepath.Join(os.TempDir(), "aliang-attachments"), nil
+}
+
+// cleanupAgentAIAttachmentCache 机会式清理过期缓存。下载前调用一次，成本只有
+// 一次 ReadDir；失败不影响下载。.partial-* 是中断的下载，1 小时后清掉。
+func cleanupAgentAIAttachmentCache(dir string, now time.Time) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		ttl := attachmentCacheTTL
+		if strings.HasPrefix(entry.Name(), ".partial-") {
+			ttl = time.Hour
+		}
+		if now.Sub(info.ModTime()) > ttl {
+			_ = os.Remove(filepath.Join(dir, entry.Name()))
+		}
+	}
+}
+
+func writeDataURLAttachmentTo(raw string, w io.Writer) error {
 	comma := strings.IndexByte(raw, ',')
 	if comma < 0 {
 		return errors.New("malformed data URL attachment")
@@ -182,7 +350,7 @@ func writeDataURLAttachment(raw, target string) error {
 	if len(decoded) > attachmentDownloadMaxBytes {
 		return fmt.Errorf("attachment exceeds %d MiB", attachmentDownloadMaxBytes/(1024*1024))
 	}
-	if err := os.WriteFile(target, decoded, 0o600); err != nil {
+	if _, err := w.Write(decoded); err != nil {
 		return fmt.Errorf("save data URL attachment: %w", err)
 	}
 	return nil

@@ -20,10 +20,10 @@ import (
 // ai.error 的 error_code 字段上（agent_ai.go:7613-7617）——服务端与手机据此
 // 分支，无需对错误字符串做脆弱匹配。
 const (
-	agentTUIErrUnavailable    = "tui_unavailable"     // 注入前判定中途失效（TUI 退出/记录消失）或回合超上限
-	agentTUIErrInjectFailed   = "tui_inject_failed"   // 拨号或写入 UDS 失败
-	agentTUIErrHeld           = "tui_held"            // 接收方（bypass 门）静默扣留注入消息
-	agentTUIErrTranscriptLost = "tui_transcript_lost" // tail 期间 transcript 消失
+	agentTUIErrUnavailable    = "tui_unavailable"       // 注入前判定中途失效（TUI 退出/记录消失）或回合超上限
+	agentTUIErrInjectFailed   = "tui_inject_failed"     // 拨号或写入 UDS 失败
+	agentTUIErrHeld           = "tui_held"              // 接收方（bypass 门）静默扣留注入消息
+	agentTUIErrTranscriptLost = "tui_transcript_lost"   // tail 期间 transcript 消失
 	agentTUIErrAttachment     = "tui_attachment_failed" // 附件下载失败（注入前）
 )
 
@@ -379,9 +379,9 @@ var tuiTurnCeiling = resolveEnvDuration("ALIANG_TUI_TURN_CEILING", 4*time.Hour)
 // 生命周期回传手机（spec §4.3）。ctx 取消 = ai.stop。
 //
 // content 是用户的原始文本——不是 run.prompt（那是 buildAgentAIPrompt 包装过
-// 的，带会话前缀与全量历史）。附件从 run.attachments 取，注入前先下载到临时
-// 文件（与 spawn 的 runCLI 同款）：注入通道是纯文本，图片只有落成本地文件、
-// 让 TUI 侧的 claude 用 Read 读，才能成为视觉输入；临时目录随回合结束删除。
+// 的，带会话前缀与全量历史）。附件从 run.attachments 取，注入前先下载到持久
+// 缓存文件：注入通道是纯文本，图片只有落成本地文件、让 TUI 侧的 claude 用
+// Read 读，才能成为视觉输入；缓存保留供同一会话后续回合再次 Read。
 //
 // 失败不回退 spawn：一次回合只走一条路（spec §4.5）。注入失败以 ai.error 收尾，
 // 由服务端决定重试。
@@ -452,12 +452,13 @@ func (m *agentAIManager) runTUITurn(ctx context.Context, session *agentAISession
 		"state": "running", "executor": "tui",
 	})
 
-	// 2.5) 附件下载（与 spawn 路径的 runCLI 同款）：注入通道是纯文本，图片唯一
-	// 的视觉载体是本地文件——TUI 侧的 claude 用 Read 工具读图（CC 原生支持）。
-	// 直接列预签名 URL 有三个坑：10 分钟过期、模型无法把 URL 变成视觉输入、
-	// 几百字符签名串回显进 transcript。下载后 Path 就位、URL 清空，
-	// agentAIAttachmentPromptSuffix 自然列本地路径；临时目录随回合结束删除。
-	localAttachments, cleanupAttachments, err := downloadAgentAIAttachments(runCtx, run.attachments, run.attachmentAllowedHosts)
+	// 2.5) 附件落地。TUI 注入帧只有文本：图片必须先由 agent 下载成本地文件，
+	// 再把路径交给终端里的 Claude Code 用 Read 打开。spawn 路径在
+	// buildClaudeImageBlocks 里做同样的事；这里若只拼预签名 URL，模型不会
+	// 主动去读，图片实际从未进入回合（2026-10-23 事故）。
+	// 用持久缓存目录：同一会话后续回合可能再次 Read 同一张图，回合结束就删
+	// 会让第二次 Read 失败；过期文件由下载器按 TTL 机会式清理。
+	attachments, cleanupAttachments, err := downloadAgentAIAttachmentsToCache(runCtx, run.attachments, run.attachmentAllowedHosts)
 	if err != nil {
 		if runCtx.Err() != nil {
 			// 下载期间被 stop：按停止收尾，不算回合失败。
@@ -467,18 +468,11 @@ func (m *agentAIManager) runTUITurn(ctx context.Context, session *agentAISession
 		fail(agentTUIErrAttachment, "附件下载失败："+err.Error())
 		return
 	}
-	defer cleanupAttachments()
-	run.attachments = localAttachments
+	defer cleanupAttachments() // 缓存路径是 no-op，保留文件供后续回合 Read
 
-	// 3) 注入。内容 = 原始用户文本 + 附件清单（与 spawn 路径等价）。
+	// 3) 注入。内容 = 原始用户文本 + 本地附件清单 + 明确的 Read 指令。
 	// 走 ccPeerDialInject 旋钮（与 tuiSync 一致），测试才能拦截注入动作。
-	injectText := content + agentAIAttachmentPromptSuffix(run.attachments, true)
-	if hasImageAttachments(run.attachments) {
-		// TUI 没有 image block 通道：图片以本地路径列出后，必须点名让 TUI 侧的
-		// claude 主动 Read——不写这句，模型大概率把路径当普通文本略过，回一句
-		// 「我看不到图」。
-		injectText += "\n\n(The image attachments listed above are local files. Use the Read tool on each image path to actually view it before answering.)"
-	}
+	injectText := content + agentAITUIAttachmentPromptSuffix(attachments)
 	if err := ccPeerDialInject(plan.SocketPath, plan.PeerToken, injectText, plan.FromMode); err != nil {
 		fail(agentTUIErrInjectFailed, "无法把消息送进终端会话")
 		return
@@ -730,6 +724,28 @@ func transcriptUserText(line []byte) string {
 		}
 	}
 	return ""
+}
+
+// agentAITUIAttachmentPromptSuffix 在通用附件清单后补一条 Read 指令。
+// TUI 注入只能传文本，图片必须由 agent 先下载成本地文件；不明确要求 Read，
+// 模型只会看到一串路径，不会主动打开图片（2026-10-23 事故）。
+func agentAITUIAttachmentPromptSuffix(attachments []agentAIAttachment) string {
+	suffix := agentAIAttachmentPromptSuffix(attachments, true)
+	if suffix == "" {
+		return ""
+	}
+	// 只有落成本地文件的附件才需要 Read；纯内联文本没有路径可读。
+	hasLocalFile := false
+	for _, attachment := range attachments {
+		if attachment.Path != "" {
+			hasLocalFile = true
+			break
+		}
+	}
+	if !hasLocalFile {
+		return suffix
+	}
+	return suffix + "\n\n请使用 Read 工具读取上面列出的本地附件文件（图片必须用 Read 打开），它们是本次用户消息的附件，不是远程链接。"
 }
 
 // clearTUITurnSessionState 清掉本回合在 session 上的占用标记，让后续回合可跑。
