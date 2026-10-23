@@ -457,8 +457,9 @@ func (m *agentAIManager) runTUITurn(ctx context.Context, session *agentAISession
 	// buildClaudeImageBlocks 里做同样的事；这里若只拼预签名 URL，模型不会
 	// 主动去读，图片实际从未进入回合（2026-10-23 事故）。
 	// 用持久缓存目录：同一会话后续回合可能再次 Read 同一张图，回合结束就删
-	// 会让第二次 Read 失败；过期文件由下载器按 TTL 机会式清理。
-	attachments, cleanupAttachments, err := downloadAgentAIAttachmentsToCache(runCtx, run.attachments, run.attachmentAllowedHosts)
+	// 会让第二次 Read 失败；过期文件由下载器按 TTL 机会式清理。home 传 TUI
+	// 用户 home，root 运行的 Core 才不会把文件写进 /var/root。
+	attachments, cleanupAttachments, err := downloadAgentAIAttachmentsToCache(runCtx, run.attachments, run.attachmentAllowedHosts, plan.Home)
 	if err != nil {
 		if runCtx.Err() != nil {
 			// 下载期间被 stop：按停止收尾，不算回合失败。

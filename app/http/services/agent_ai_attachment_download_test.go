@@ -178,7 +178,7 @@ func TestDownloadAgentAIAttachmentsToCachePersistsAndReuses(t *testing.T) {
 
 	attachments, cleanup, err := downloadAgentAIAttachmentsToCache(context.Background(), []agentAIAttachment{
 		{Type: "image", Name: "shot.png", URL: server.URL + "/shot.png"},
-	}, []string{hostOf(t, server.URL)})
+	}, []string{hostOf(t, server.URL)}, "")
 	if err != nil {
 		t.Fatalf("download attachments: %v", err)
 	}
@@ -198,7 +198,7 @@ func TestDownloadAgentAIAttachmentsToCachePersistsAndReuses(t *testing.T) {
 
 	again, cleanupAgain, err := downloadAgentAIAttachmentsToCache(context.Background(), []agentAIAttachment{
 		{Type: "image", Name: "shot.png", URL: server.URL + "/shot.png"},
-	}, []string{hostOf(t, server.URL)})
+	}, []string{hostOf(t, server.URL)}, "")
 	if err != nil {
 		t.Fatalf("download again: %v", err)
 	}
@@ -229,7 +229,7 @@ func TestDownloadAgentAIAttachmentsToCacheExpiresOldFiles(t *testing.T) {
 
 	attachments, cleanup, err := downloadAgentAIAttachmentsToCache(context.Background(), []agentAIAttachment{
 		{Type: "image", Name: "inline.png", URL: "data:image/png;base64,cG5n"},
-	}, []string{"cos.example.com"})
+	}, []string{"cos.example.com"}, "")
 	if err != nil {
 		t.Fatalf("download data URL: %v", err)
 	}
@@ -239,6 +239,64 @@ func TestDownloadAgentAIAttachmentsToCacheExpiresOldFiles(t *testing.T) {
 	}
 	if _, err := os.Stat(attachments[0].Path); err != nil {
 		t.Fatalf("new cache file missing: %v", err)
+	}
+}
+
+func TestAgentAIAttachmentCacheDirPrefersTUIHome(t *testing.T) {
+	// env 覆盖优先级最高：测试与运维都靠它把缓存钉到固定目录。
+	override := filepath.Join(t.TempDir(), "override")
+	t.Setenv("ALIANG_ATTACHMENT_CACHE_DIR", override)
+	got, err := agentAIAttachmentCacheDir("/Users/alice")
+	if err != nil {
+		t.Fatalf("resolve cache dir: %v", err)
+	}
+	if got != override {
+		t.Fatalf("cache dir = %s, want env override %s", got, override)
+	}
+
+	// 未设 env 时必须用 TUI 用户 home，而不是 agent 进程的 os.UserHomeDir()：
+	// macOS Core 以 root 运行，后者会落到 /var/root，桌面用户读不到。
+	t.Setenv("ALIANG_ATTACHMENT_CACHE_DIR", "")
+	home := t.TempDir()
+	got, err = agentAIAttachmentCacheDir(home)
+	if err != nil {
+		t.Fatalf("resolve cache dir: %v", err)
+	}
+	want := filepath.Join(home, ".aliang", "attachments")
+	if got != want {
+		t.Fatalf("cache dir = %s, want %s", got, want)
+	}
+}
+
+func TestDownloadAgentAIAttachmentsToCacheUsesReadablePermissions(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("ALIANG_ATTACHMENT_CACHE_DIR", "")
+	server := newAttachmentTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("png-bytes"))
+	})
+	withTestTransport(t, server)
+
+	attachments, cleanup, err := downloadAgentAIAttachmentsToCache(context.Background(), []agentAIAttachment{
+		{Type: "image", Name: "shot.png", URL: server.URL + "/shot.png"},
+	}, []string{hostOf(t, server.URL)}, home)
+	if err != nil {
+		t.Fatalf("download attachments: %v", err)
+	}
+	cleanup()
+
+	dirInfo, err := os.Stat(filepath.Join(home, ".aliang", "attachments"))
+	if err != nil {
+		t.Fatalf("stat cache dir: %v", err)
+	}
+	if perm := dirInfo.Mode().Perm(); perm != 0o755 {
+		t.Fatalf("cache dir perm = %o, want 755", perm)
+	}
+	fileInfo, err := os.Stat(attachments[0].Path)
+	if err != nil {
+		t.Fatalf("stat cache file: %v", err)
+	}
+	if perm := fileInfo.Mode().Perm(); perm != 0o644 {
+		t.Fatalf("cache file perm = %o, want 644", perm)
 	}
 }
 
