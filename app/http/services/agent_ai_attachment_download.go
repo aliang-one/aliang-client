@@ -98,14 +98,20 @@ func downloadAgentAIAttachments(
 
 // downloadAgentAIAttachmentsToCache 把附件下载到持久缓存目录，供 TUI 注入路径
 // 把本地路径交给终端里的模型 Read。与 downloadAgentAIAttachments 的区别：
-//   - 目录固定（默认 ~/.aliang/attachments，可用 ALIANG_ATTACHMENT_CACHE_DIR 覆盖）
+//   - 目录固定（默认 <TUI 用户 home>/.aliang/attachments，可用
+//     ALIANG_ATTACHMENT_CACHE_DIR 覆盖）
 //   - cleanup 是 no-op：回合结束不删文件，同一会话后续回合还能再次 Read
 //   - 文件名带内容哈希前缀，同一张图重复下发只占一份
 //   - 每次下载前机会式清理超过 attachmentCacheTTL 的旧文件
+//
+// home 必须传 TUI 会话所属用户的 home（plan.Home）。macOS 的 Core 守护进程
+// 以 root 运行，而 Claude Code TUI 是桌面用户进程；若用 os.UserHomeDir()
+// 会落到 /var/root，注入给 TUI 的路径对桌面用户不可读。
 func downloadAgentAIAttachmentsToCache(
 	ctx context.Context,
 	attachments []agentAIAttachment,
 	allowedHosts []string,
+	home string,
 ) ([]agentAIAttachment, func(), error) {
 	noop := func() {}
 	if len(attachments) == 0 {
@@ -129,12 +135,18 @@ func downloadAgentAIAttachmentsToCache(
 		return nil, noop, errors.New("attachment download refused: no allowed hosts configured")
 	}
 
-	dir, err := agentAIAttachmentCacheDir()
+	dir, err := agentAIAttachmentCacheDir(home)
 	if err != nil {
 		return nil, noop, fmt.Errorf("resolve attachment cache dir: %w", err)
 	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	// 0755 而不是 0700：agent 可能以 root 运行，目录下的文件要能被桌面用户的
+	// Claude Code 进程 Read。home 本身通常是 0700/0750，外部用户仍进不来。
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, noop, fmt.Errorf("create attachment cache dir: %w", err)
+	}
+	// MkdirAll 不会修正已存在目录的权限：旧版本或 root 早期运行可能留下 0700。
+	if err := os.Chmod(dir, 0o755); err != nil {
+		return nil, noop, fmt.Errorf("make attachment cache dir readable: %w", err)
 	}
 	cleanupAgentAIAttachmentCache(dir, time.Now())
 
@@ -215,12 +227,20 @@ func downloadAgentAIAttachmentToCache(
 	sum := hex.EncodeToString(hasher.Sum(nil))
 	target := filepath.Join(dir, sum[:12]+"-"+name)
 	if _, err := os.Stat(target); err == nil {
+		// 旧版本可能留下 0600 的缓存；统一放宽到 0644，保证桌面用户的 TUI 能 Read。
+		if err := os.Chmod(target, 0o644); err != nil {
+			return "", fmt.Errorf("make cached attachment readable: %w", err)
+		}
 		return target, nil
 	}
 	if err := os.Rename(tmpPath, target); err != nil {
 		return "", fmt.Errorf("cache attachment: %w", err)
 	}
 	tmpPath = "" // 已改名，defer 不能再删目标
+	if err := os.Chmod(target, 0o644); err != nil {
+		_ = os.Remove(target)
+		return "", fmt.Errorf("make cached attachment readable: %w", err)
+	}
 	return target, nil
 }
 
@@ -288,10 +308,11 @@ func writeAttachmentPayload(
 	return nil
 }
 
-// agentAIAttachmentCacheDir 返回 TUI 附件缓存目录。默认 ~/.aliang/attachments，
-// ALIANG_ATTACHMENT_CACHE_DIR 可覆盖（测试/运维）。放在持久目录而不是 MkdirTemp：
-// 同一会话的后续回合可能再次 Read 同一张图，回合结束就删会让第二次 Read 失败。
-func agentAIAttachmentCacheDir() (string, error) {
+// agentAIAttachmentCacheDir 返回 TUI 附件缓存目录。优先使用 TUI 用户 home
+// （plan.Home），默认 <home>/.aliang/attachments；ALIANG_ATTACHMENT_CACHE_DIR
+// 可覆盖（测试/运维）。放在持久目录而不是 MkdirTemp：同一会话的后续回合可能
+// 再次 Read 同一张图，回合结束就删会让第二次 Read 失败。
+func agentAIAttachmentCacheDir(home string) (string, error) {
 	if dir := strings.TrimSpace(os.Getenv("ALIANG_ATTACHMENT_CACHE_DIR")); dir != "" {
 		// 相对路径按 agent 进程 cwd 解析不可预测；显式转绝对路径，日志里也能直接看出位置。
 		if abs, err := filepath.Abs(dir); err == nil {
@@ -299,8 +320,11 @@ func agentAIAttachmentCacheDir() (string, error) {
 		}
 		return dir, nil
 	}
-	if home, err := os.UserHomeDir(); err == nil && strings.TrimSpace(home) != "" {
+	if home = strings.TrimSpace(home); home != "" {
 		return filepath.Join(home, ".aliang", "attachments"), nil
+	}
+	if userHome, err := os.UserHomeDir(); err == nil && strings.TrimSpace(userHome) != "" {
+		return filepath.Join(userHome, ".aliang", "attachments"), nil
 	}
 	if cache, err := os.UserCacheDir(); err == nil && strings.TrimSpace(cache) != "" {
 		return filepath.Join(cache, "aliang", "attachments"), nil
