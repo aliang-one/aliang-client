@@ -148,6 +148,7 @@ const (
 	transcriptIgnore    transcriptLineKind = iota // 元数据/噪声/空/坏行
 	transcriptUserEcho                            // 真实用户消息（含我们注入的那条）
 	transcriptAssistant                           // 主链 assistant 块
+	transcriptTurnEnd                             // CC 亲写的回合结束标记（turn_duration / stop_hook_summary）
 )
 
 // transcriptLocalPrefixes 是 CC 写进 transcript 的本地命令回显前缀。它们不是
@@ -162,12 +163,19 @@ var transcriptLocalPrefixes = []string{
 // classifyTranscriptLine 把一行 transcript 分类。transcript 的 user 行有三类
 // 噪声必须过滤：isMeta 本地命令回显、本地命令前缀内容、tool_result block——
 // 不过滤就会把 TUI 的本地命令当成对话回显到手机。
+//
+// system 行里的 turn_duration / stop_hook_summary 是 CC 在**每个回合结束时**
+// 亲写的结束标记（2026-10-24 在本机 2.1.286 实测：与真实回合 1:1 对齐，成对
+// 出现、间隔 <5ms）。它们是 TUI 回合完成判定的最权威信号——比「quiet 轮 +
+// pid 记录 idle」的启发式强得多；分类器此前把它们丢进 default 忽略，正是
+// 「回合早结束、手机却挂到超时失败」的根因之一。
 func classifyTranscriptLine(line []byte) transcriptLineKind {
 	if len(bytes.TrimSpace(line)) == 0 {
 		return transcriptIgnore
 	}
 	var row struct {
 		Type        string `json:"type"`
+		Subtype     string `json:"subtype"`
 		UUID        string `json:"uuid"`
 		IsSidechain bool   `json:"isSidechain"`
 		IsMeta      bool   `json:"isMeta"`
@@ -218,9 +226,35 @@ func classifyTranscriptLine(line []byte) transcriptLineKind {
 			return transcriptIgnore
 		}
 		return transcriptAssistant
+	case "system":
+		if row.IsSidechain {
+			return transcriptIgnore
+		}
+		switch strings.TrimSpace(row.Subtype) {
+		case "turn_duration", "stop_hook_summary":
+			return transcriptTurnEnd
+		}
+		return transcriptIgnore
 	default:
 		return transcriptIgnore
 	}
+}
+
+// transcriptTurnDurationMs 从 turn_duration 行提取回合真实耗时（毫秒）。
+// 非 turn_duration 行返回 0。
+func transcriptTurnDurationMs(line []byte) int64 {
+	var row struct {
+		Type       string `json:"type"`
+		Subtype    string `json:"subtype"`
+		DurationMs int64  `json:"durationMs"`
+	}
+	if json.Unmarshal(line, &row) != nil {
+		return 0
+	}
+	if row.Type != "system" || row.Subtype != "turn_duration" {
+		return 0
+	}
+	return row.DurationMs
 }
 
 // transcriptBlock 是一条 assistant 行解出的一个内容块。transcript 是块级整行
@@ -519,6 +553,10 @@ func (m *agentAIManager) runTUITurn(ctx context.Context, session *agentAISession
 	touched := make(map[string]struct{})
 	quiet := 0
 	sawUserEcho := false
+	// 回合结束的权威信号与辅助信号（见下方完成判定的分层注释）。
+	sawTurnEnd := false        // CC 亲写的 turn_duration/stop_hook_summary 行
+	sawBusyTransition := false // pid 记录出现过 busy——回显分类失配时证明回合真实跑过
+	turnDurationMs := int64(0)
 	offset := plan.JSONLOffset
 	ceiling := time.After(tuiTurnCeiling)
 tail:
@@ -598,20 +636,55 @@ tail:
 						_ = write(payload)
 					}
 				}
+			case transcriptTurnEnd:
+				// CC 亲写的回合结束标记。turn_duration 的 durationMs 是回合
+				// 真实耗时，透传给手机展示；stop_hook_summary 与其成对出现，
+				// 任一见到都算回合结束（老版本 CC 两者皆无 → 落到下层信号）。
+				sawTurnEnd = true
+				if ms := transcriptTurnDurationMs(line); ms > 0 {
+					turnDurationMs = ms
+				}
 			}
 		}
 		if grew {
 			quiet = 0
-		} else if sawUserEcho {
+		} else if sawUserEcho || sawBusyTransition {
+			// quiet 只在「回合确实动过」后才有意义累加：注入从未被 TUI 处理时
+			// transcript 全静默、记录仍是 idle——此时累加 quiet 会把「没跑」
+			// 误判成「跑完了」。
 			quiet++
 		}
 		// sidechain 目录 watch：新子 agent→started、增长→progress、静默→completed
 		subWatch.poll(run.subagents, activity, session.id, assistantMsgID, write)
-		// 完成：注入已回显 + 连续安静 + TUI 不再 busy（或记录消失）。
-		if sawUserEcho && quiet >= tuiTurnQuietRounds {
-			if rec, live := liveClaudeTUIRecord(plan.Home, plan.NativeSessionID); !live ||
-				strings.EqualFold(strings.TrimSpace(rec.Status), "idle") {
-				break tail
+		// 回合进行中轮询 pid 记录，捕捉 busy→idle 转变（②的信号源）。busy 一旦
+		// 见到就不再轮询，长回合不会为此持续读文件。
+		if !sawTurnEnd && !sawBusyTransition {
+			if rec, live := liveClaudeTUIRecord(plan.Home, plan.NativeSessionID); live &&
+				strings.EqualFold(strings.TrimSpace(rec.Status), "busy") {
+				sawBusyTransition = true
+			}
+		}
+		// 完成判定，按权威度分层（任一满足即完成）：
+		// ① turn end 标记：CC 亲自宣告回合结束——最权威，见到即完成，不等
+		//    安静轮也不再看 pid 记录（记录可能因 CC 版本/崩溃滞留 busy）。
+		// ② busy→idle 转变 + 安静轮：回显分类失配（CC 版本差异改了回显形态）
+		//    时，记录先 busy 后 idle 仍证明回合真实跑完。
+		// ③ 回显 + 安静轮 + 记录 idle/消失：老 CC 无结束标记时的原有路径。
+		// 极小竞态（用户恰在注入瞬间自己在 TUI 发言、其回合先结束）会提前完成
+		// 一次；该场景 tuiSync 会把后续内容补进会话，可接受。
+		if sawTurnEnd {
+			break tail
+		}
+		if quiet >= tuiTurnQuietRounds {
+			rec, live := liveClaudeTUIRecord(plan.Home, plan.NativeSessionID)
+			if !live {
+				if sawUserEcho {
+					break tail
+				}
+			} else if strings.EqualFold(strings.TrimSpace(rec.Status), "idle") {
+				if sawUserEcho || sawBusyTransition {
+					break tail
+				}
 			}
 		}
 		select {
@@ -625,13 +698,17 @@ tail:
 	// 5) ai.done（经 emitter → 自动 run_id/event_seq + 终态落盘 + 断线补推）。
 	// 先收敛仍存活的子 agent（后台 async 子 agent 在 done 时可能还在跑）。
 	finalizeSubs()
-	_ = write(map[string]any{
+	donePayload := map[string]any{
 		"type": models.AgentEventAIDone, "session_id": session.id,
 		"message_id":          assistantMsgID,
 		"files_touched_count": len(touched),
 		"git_changed_count":   countGitChanged(session.projectPath),
 		"executor":            "tui",
-	})
+	}
+	if turnDurationMs > 0 {
+		donePayload["turn_duration_ms"] = turnDurationMs
+	}
+	_ = write(donePayload)
 }
 
 // readTranscriptFrom 从 offset 读完整新行。只消费以 \n 结尾的部分——半行留在

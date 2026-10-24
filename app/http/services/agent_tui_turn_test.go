@@ -204,6 +204,11 @@ func TestClassifyTranscriptLine(t *testing.T) {
 		{"空行", ``, transcriptIgnore},
 		{"坏 JSON", `{not json`, transcriptIgnore},
 		{"metadata 行", `{"type":"mode","mode":"normal","sessionId":"s"}`, transcriptIgnore},
+		{"turn_duration 结束标记", `{"type":"system","subtype":"turn_duration","uuid":"t1","isSidechain":false,"isMeta":false,"durationMs":1682807,"timestamp":"2026-10-24T00:30:11.922Z"}`, transcriptTurnEnd},
+		{"stop_hook_summary 结束标记", `{"type":"system","subtype":"stop_hook_summary","uuid":"t2","isSidechain":false,"timestamp":"2026-10-24T00:30:11.919Z"}`, transcriptTurnEnd},
+		{"compact_boundary 忽略", `{"type":"system","subtype":"compact_boundary","uuid":"t3","timestamp":"2026-10-24T00:08:08.963Z"}`, transcriptIgnore},
+		{"away_summary 忽略", `{"type":"system","subtype":"away_summary","uuid":"t5"}`, transcriptIgnore},
+		{"sidechain system 忽略", `{"type":"system","subtype":"turn_duration","uuid":"t4","isSidechain":true,"durationMs":5}`, transcriptIgnore},
 	}
 	for _, c := range cases {
 		if got := classifyTranscriptLine([]byte(c.line)); got != c.want {
@@ -1035,5 +1040,169 @@ func TestRunTUITurnAttachmentDownloadFails(t *testing.T) {
 	}
 	if errCode != agentTUIErrAttachment {
 		t.Fatalf("error_code = %q, want %q", errCode, agentTUIErrAttachment)
+	}
+}
+
+// TestRunTUITurnCompletesOnTurnEnd 锁死第①层完成信号：CC 亲写的
+// turn_duration/stop_hook_summary 行 = 回合结束，必须立即完成——不再要求用户
+// 回显、安静轮与 pid 记录 idle（记录滞留 busy 也要完成）。
+// 回归背景（2026-10-24）：旧完成门三条件缺一不可，任一失配（回显分类变化 /
+// 记录滞留 busy）回合就挂到看门狗或上限，手机永远「运行中」最后标失败。
+func TestRunTUITurnCompletesOnTurnEnd(t *testing.T) {
+	_ = stubExternalInterrupt(t, nil)
+	pid := os.Getpid()
+	origPoll := tuiTurnPollInterval
+	tuiTurnPollInterval = 20 * time.Millisecond
+	defer func() { tuiTurnPollInterval = origPoll }()
+	// 上限压到 2s：若回归（完成信号失效），用例在 2s 内按 error 收尾失败，
+	// 而不是挂满默认 4h。
+	origCeiling := tuiTurnCeiling
+	tuiTurnCeiling = 2 * time.Second
+	defer func() { tuiTurnCeiling = origCeiling }()
+
+	home := t.TempDir()
+	sock := ccPeerShortSocketPath(t)
+	// pid 记录全程 busy：证明完成不依赖记录翻 idle（CC 崩溃/滞留场景）。
+	writeClaudePidRecord(t, home, "sess-1", pid, "busy", sock)
+	// fake TUI：注入后只写 assistant 文本 + 回合结束标记，不写 user 回显——
+	// 证明完成也不依赖回显（回显分类失配场景）。
+	frames := make(chan string, 8)
+	startFakeTUI(t, sock, frames, func(content string) {
+		path := transcriptFixturePath(home, "sess-1")
+		appendTranscriptLine(t, path, `{"type":"assistant","uuid":"a1","apiBlockIndex":0,"message":{"content":[{"type":"text","text":`+jsonString("完成："+content)+`}]}}`)
+		appendTranscriptLine(t, path, `{"type":"system","subtype":"stop_hook_summary","uuid":"t-1","isSidechain":false,"timestamp":"2026-10-24T00:30:11.919Z"}`)
+		appendTranscriptLine(t, path, `{"type":"system","subtype":"turn_duration","uuid":"t-2","isSidechain":false,"isMeta":false,"durationMs":86228,"timestamp":"2026-10-24T00:30:11.922Z"}`)
+	})
+	jsonl := writeTranscriptFixture(t, home, "sess-1")
+
+	m := newAgentAIManager()
+	var mu sync.Mutex
+	var events []map[string]any
+	write := func(v any) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if p, ok := v.(map[string]any); ok {
+			events = append(events, p)
+		}
+		return nil
+	}
+	session := &agentAISession{id: "sess-1", projectPath: t.TempDir(), provider: "claude", resumeSessionID: "sess-1"}
+	m.registerAISessionLocked(session)
+	emitter := m.runEmitter(agentAIRun{runID: "run-1", sessionID: "sess-1", messageID: "m-1"}, write)
+
+	m.runTUITurn(context.Background(), session, agentAIRun{
+		runID: "run-1", sessionID: "sess-1", messageID: "m-1",
+		projectPath: session.projectPath, provider: "claude",
+		resumeSessionID: "sess-1",
+	}, "手机消息", &tuiTurnPlan{
+		Home: home, NativeSessionID: "sess-1", SocketPath: sock, PID: pid,
+		JSONLPath: jsonl, JSONLOffset: mustSize(t, jsonl),
+	}, emitter)
+
+	mu.Lock()
+	defer mu.Unlock()
+	var seq []string
+	var done map[string]any
+	for _, e := range events {
+		seq = append(seq, fmt.Sprint(e["type"]))
+		if e["type"] == "ai.done" {
+			done = e
+		}
+	}
+	if strings.Join(seq, ",") != "ai.run.started,ai.delta,ai.done" {
+		t.Fatalf("事件序列 = %v, want [ai.run.started ai.delta ai.done]", seq)
+	}
+	if done == nil {
+		t.Fatal("缺 ai.done")
+	}
+	if got := fmt.Sprint(done["turn_duration_ms"]); got != "86228" {
+		t.Errorf("turn_duration_ms = %v, want 86228", done["turn_duration_ms"])
+	}
+}
+
+// TestRunTUITurnCompletesOnBusyToIdle 锁死第②层完成信号：老 CC 不写回合结束
+// 标记、回显分类失配（无 user 回显）时，pid 记录 busy→idle 转变 + 安静轮仍
+// 必须完成回合——不能回退成「没回显就永不完成」。
+func TestRunTUITurnCompletesOnBusyToIdle(t *testing.T) {
+	_ = stubExternalInterrupt(t, nil)
+	pid := os.Getpid()
+	origPoll := tuiTurnPollInterval
+	tuiTurnPollInterval = 20 * time.Millisecond
+	defer func() { tuiTurnPollInterval = origPoll }()
+	origCeiling := tuiTurnCeiling
+	tuiTurnCeiling = 2 * time.Second
+	defer func() { tuiTurnCeiling = origCeiling }()
+
+	home := t.TempDir()
+	sock := ccPeerShortSocketPath(t)
+	// events/mu 先于 fake TUI 声明：idle 翻转协程要观察 tail 是否已消费 delta。
+	var mu sync.Mutex
+	var events []map[string]any
+	recordPath := filepath.Join(home, ".claude", "sessions", strconv.Itoa(pid)+".json")
+	if err := os.MkdirAll(filepath.Dir(recordPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeRecord := func(status string) {
+		b, _ := json.Marshal(map[string]any{"sessionId": "sess-1", "pid": pid, "status": status, "messagingSocketPath": sock})
+		if err := os.WriteFile(recordPath, b, 0o600); err != nil {
+			t.Errorf("write pid record: %v", err)
+		}
+	}
+	writeRecord("busy")
+	// fake TUI：只写 assistant 文本、不写回显。注入后 held 观测窗（3s）内 tail
+	// 不会启动，所以 idle 翻转必须等 tail 真正消费过 delta 再做——否则记录在
+	// busy-poll 之前就变 idle，busy→idle 转变根本不会被观察到。
+	frames := make(chan string, 8)
+	startFakeTUI(t, sock, frames, func(content string) {
+		path := transcriptFixturePath(home, "sess-1")
+		appendTranscriptLine(t, path, `{"type":"assistant","uuid":"a1","apiBlockIndex":0,"message":{"content":[{"type":"text","text":`+jsonString("完成")+"}]}}")
+		go func() {
+			deadline := time.Now().Add(10 * time.Second)
+			for time.Now().Before(deadline) {
+				mu.Lock()
+				seen := len(events)
+				mu.Unlock()
+				// started + delta = tail 已跑完第一轮（含 busy-poll）。
+				if seen >= 2 {
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			time.Sleep(60 * time.Millisecond) // 留足一轮 busy-poll 观察窗
+			writeRecord("idle")
+		}()
+	})
+	jsonl := writeTranscriptFixture(t, home, "sess-1")
+
+	m := newAgentAIManager()
+	write := func(v any) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if p, ok := v.(map[string]any); ok {
+			events = append(events, p)
+		}
+		return nil
+	}
+	session := &agentAISession{id: "sess-1", projectPath: t.TempDir(), provider: "claude", resumeSessionID: "sess-1"}
+	m.registerAISessionLocked(session)
+	emitter := m.runEmitter(agentAIRun{runID: "run-1", sessionID: "sess-1", messageID: "m-1"}, write)
+
+	m.runTUITurn(context.Background(), session, agentAIRun{
+		runID: "run-1", sessionID: "sess-1", messageID: "m-1",
+		projectPath: session.projectPath, provider: "claude",
+		resumeSessionID: "sess-1",
+	}, "手机消息", &tuiTurnPlan{
+		Home: home, NativeSessionID: "sess-1", SocketPath: sock, PID: pid,
+		JSONLPath: jsonl, JSONLOffset: mustSize(t, jsonl),
+	}, emitter)
+
+	mu.Lock()
+	defer mu.Unlock()
+	var seq []string
+	for _, e := range events {
+		seq = append(seq, fmt.Sprint(e["type"]))
+	}
+	if strings.Join(seq, ",") != "ai.run.started,ai.delta,ai.done" {
+		t.Fatalf("事件序列 = %v, want [ai.run.started ai.delta ai.done]", seq)
 	}
 }
