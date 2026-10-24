@@ -462,6 +462,7 @@ func (m *agentAIManager) runTUITurn(ctx context.Context, session *agentAISession
 	session.cancel = cancel
 	session.activeWriter = write
 	session.activity = activity
+	session.tuiTurn = plan
 	session.runSeq++
 	session.activeRunID = run.runID
 	run.runSeq = session.runSeq
@@ -833,5 +834,6 @@ func (m *agentAIManager) clearTUITurnSessionState(session *agentAISession) {
 	session.cancel = nil
 	session.activeWriter = nil
 	session.activity = nil
+	session.tuiTurn = nil
 	session.activeRunID = ""
 }

@@ -1206,3 +1206,161 @@ func TestRunTUITurnCompletesOnBusyToIdle(t *testing.T) {
 		t.Fatalf("事件序列 = %v, want [ai.run.started ai.delta ai.done]", seq)
 	}
 }
+
+// TestSteerTUITurnQueuesIntoSocket 锁死 TUI 回合的 steer 通道：插话经 UDS 注入
+// 同一个 TUI（CC 排队语义），ack=queued，内容入会话历史。回归背景：此前 TUI
+// 回合的 steer 一律 unsupported，消息被静默丢弃，只剩一条「Steer failed」事件。
+// 注：held 观测窗 3s 内无 held 标记才放行，用例整体 ~3s。
+func TestSteerTUITurnQueuesIntoSocket(t *testing.T) {
+	pid := os.Getpid()
+	home := t.TempDir()
+	sock := ccPeerShortSocketPath(t)
+	frames := make(chan string, 8)
+	startFakeTUI(t, sock, frames, func(string) {})
+	jsonl := writeTranscriptFixture(t, home, "sess-1")
+
+	m := newAgentAIManager()
+	var mu sync.Mutex
+	var acks []map[string]any
+	session := &agentAISession{id: "sess-1", projectPath: t.TempDir(), provider: "claude", resumeSessionID: "sess-1"}
+	m.registerAISessionLocked(session)
+	m.mu.Lock()
+	session.cancel = func() {}
+	session.tuiTurn = &tuiTurnPlan{
+		Home: home, NativeSessionID: "sess-1", SocketPath: sock, PID: pid,
+		JSONLPath: jsonl, JSONLOffset: mustSize(t, jsonl),
+	}
+	m.mu.Unlock()
+
+	m.steer(map[string]interface{}{
+		"session_id": "sess-1", "message_id": "m-1", "content": "插话",
+	}, func(v any) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if p, ok := v.(map[string]any); ok {
+			acks = append(acks, p)
+		}
+		return nil
+	})
+
+	mu.Lock()
+	if len(acks) != 1 || acks[0]["result"] != "queued" {
+		t.Fatalf("ack = %v, want result=queued", acks)
+	}
+	mu.Unlock()
+	select {
+	case frame := <-frames:
+		if !strings.Contains(frame, "插话") {
+			t.Fatalf("注入帧缺少内容: %s", frame)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("未注入任何帧")
+	}
+	m.mu.Lock()
+	n := len(session.history)
+	m.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("history = %d, want 1", n)
+	}
+}
+
+// TestSteerTUITurnHeldReported 锁死 held 上报：TUI 扣留注入时 steer 必须 ack
+// error/held，不能假装已送达。
+func TestSteerTUITurnHeldReported(t *testing.T) {
+	pid := os.Getpid()
+	home := t.TempDir()
+	sock := ccPeerShortSocketPath(t)
+	frames := make(chan string, 8)
+	startFakeTUI(t, sock, frames, func(content string) {
+		// ccPeerWatchHeld 以字节匹配「Held peer message」，原样写一行。
+		appendTranscriptLine(t, transcriptFixturePath(home, "sess-1"), `{"note":"Held peer message"}`)
+	})
+	jsonl := writeTranscriptFixture(t, home, "sess-1")
+
+	m := newAgentAIManager()
+	var mu sync.Mutex
+	var acks []map[string]any
+	session := &agentAISession{id: "sess-1", projectPath: t.TempDir(), provider: "claude", resumeSessionID: "sess-1"}
+	m.registerAISessionLocked(session)
+	m.mu.Lock()
+	session.cancel = func() {}
+	session.tuiTurn = &tuiTurnPlan{
+		Home: home, NativeSessionID: "sess-1", SocketPath: sock, PID: pid,
+		JSONLPath: jsonl, JSONLOffset: mustSize(t, jsonl),
+	}
+	m.mu.Unlock()
+
+	m.steer(map[string]interface{}{
+		"session_id": "sess-1", "message_id": "m-1", "content": "插话",
+	}, func(v any) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if p, ok := v.(map[string]any); ok {
+			acks = append(acks, p)
+		}
+		return nil
+	})
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(acks) != 1 {
+		t.Fatalf("ack 数 = %d", len(acks))
+	}
+	if acks[0]["result"] != "error" || acks[0]["code"] != "held" {
+		t.Fatalf("ack = %v, want result=error code=held", acks[0])
+	}
+	// held 的插话不得入历史（它没进对话）。
+	m.mu.Lock()
+	n := len(session.history)
+	m.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("history = %d, want 0", n)
+	}
+}
+
+// TestSteerTUITurnAttachmentRejected 锁死 v1 边界：带附件的 TUI 插话明确拒绝
+// （注入帧是纯文本），不静默丢附件也不静默放行。
+func TestSteerTUITurnAttachmentRejected(t *testing.T) {
+	pid := os.Getpid()
+	home := t.TempDir()
+	sock := ccPeerShortSocketPath(t)
+	frames := make(chan string, 8)
+	startFakeTUI(t, sock, frames, func(string) {})
+	jsonl := writeTranscriptFixture(t, home, "sess-1")
+
+	m := newAgentAIManager()
+	var mu sync.Mutex
+	var acks []map[string]any
+	session := &agentAISession{id: "sess-1", projectPath: t.TempDir(), provider: "claude", resumeSessionID: "sess-1"}
+	m.registerAISessionLocked(session)
+	m.mu.Lock()
+	session.cancel = func() {}
+	session.tuiTurn = &tuiTurnPlan{
+		Home: home, NativeSessionID: "sess-1", SocketPath: sock, PID: pid,
+		JSONLPath: jsonl, JSONLOffset: mustSize(t, jsonl),
+	}
+	m.mu.Unlock()
+
+	m.steer(map[string]interface{}{
+		"session_id": "sess-1", "message_id": "m-1", "content": "看图",
+		"attachments": []interface{}{map[string]interface{}{"type": "image", "url": "http://x/y.png"}},
+	}, func(v any) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if p, ok := v.(map[string]any); ok {
+			acks = append(acks, p)
+		}
+		return nil
+	})
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(acks) != 1 || acks[0]["result"] != "error" || acks[0]["code"] != "unsupported_attachment" {
+		t.Fatalf("ack = %v, want result=error code=unsupported_attachment", acks)
+	}
+	select {
+	case frame := <-frames:
+		t.Fatalf("拒绝路径不得注入帧: %s", frame)
+	case <-time.After(200 * time.Millisecond):
+	}
+}

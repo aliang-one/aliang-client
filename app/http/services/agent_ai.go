@@ -276,7 +276,14 @@ type agentAISession struct {
 	codexSteer    *agentAICodexSteerControl
 	// claudeSteer 是 Claude headless（--input-format stream-json）run 的
 	// steer 通道；与 codexSteer 二选一，同一条 run 上不会同时存在。
-	claudeSteer  *agentAIClaudeSteerControl
+	claudeSteer *agentAIClaudeSteerControl
+	// tuiTurn 是当前 TUI 注入回合的路由计划（UDS socket / transcript 路径 /
+	// 权限类）。TUI 回合没有 stdin 可写（claudeSteer 恒 nil），UDS 注入是唯一
+	// 插话通道——CC 把回合中收到的注入按「排队消息」处理，当前回合结束后自动
+	// 接续执行，正是 steer 的语义。runTUITurn 置位、clearTUITurnSessionState
+	// 清除；steer() 据此分流（2026-10-24 前 TUI 回合的 steer 一律 unsupported，
+	// 内容被静默丢弃）。
+	tuiTurn      *tuiTurnPlan
 	claudePolicy agentAIClaudeRemotePolicy
 	claudeCaps   agentAIClaudeCapabilities
 }
@@ -2045,6 +2052,14 @@ func (m *agentAIManager) steer(msg map[string]interface{}, writeJSON agentTermin
 		emitAgentAISteerAck(writeJSON, sessionID, messageID, "not_running", fmt.Sprintf("ai session is not running: %s", sessionID), "")
 		return
 	}
+	// TUI 注入回合：没有 stdin 可写，但 UDS 注入通道就是插话通道——CC 把回合中
+	// 收到的注入按排队消息处理，当前回合结束后自动接续（与 codex enqueue 的
+	// "queued" 语义一致）。分流给专用执行器，不走下面的 stdin 路径。
+	if tuiPlan := session.tuiTurn; tuiPlan != nil {
+		m.mu.Unlock()
+		m.steerTUITurn(session, *tuiPlan, msg, sessionID, messageID, content, writeJSON)
+		return
+	}
 	control := session.codexSteer
 	claudeControl := session.claudeSteer
 	if control == nil && claudeControl == nil {
@@ -2127,6 +2142,42 @@ func emitAgentAISteerAck(writeJSON agentTerminalWriter, sessionID, messageID, re
 		payload["code"] = code
 	}
 	_ = writeJSON(payload)
+}
+
+// steerTUITurn 把插话注入执行中的 TUI。TUI 回合没有 stdin（claudeSteer 恒
+// nil），UDS 注入是唯一通道：CC 把回合中收到的注入按排队消息处理，当前回合
+// 结束后自动接续执行——正是 steer 的语义（ccPeerInject 注释已实证 busy TUI
+// 对注入排队）。插话回显由进行中的 tail 桥送回手机（transcriptUserEcho →
+// ai.delta channel=user），不在这里重复推流。
+//
+// v1 只支持文本：注入帧是纯文本，附件要先落 TUI 侧本地缓存并让模型 Read，
+// 排队场景下缓存生命周期复杂（回合可能随时结束），先明确拒绝而不是静默丢弃。
+func (m *agentAIManager) steerTUITurn(session *agentAISession, plan tuiTurnPlan, msg map[string]interface{}, sessionID, messageID, content string, writeJSON agentTerminalWriter) {
+	if arr, ok := msg["attachments"].([]interface{}); ok && len(arr) > 0 {
+		emitAgentAISteerAck(writeJSON, sessionID, messageID, "error", "TUI 执行中的插话暂不支持附件，请等回合结束后再发", "unsupported_attachment")
+		return
+	}
+	// held 观测以「当前 transcript 末尾」为起点：只盯注入之后新写的字节，
+	// held 标记（若有）一定落在其中；从回合起点的旧偏移开始会把历史字节
+	// 重复扫一遍。
+	offset := int64(0)
+	if info, err := os.Stat(plan.JSONLPath); err == nil {
+		offset = info.Size()
+	}
+	if err := ccPeerDialInject(plan.SocketPath, plan.PeerToken, content, plan.FromMode); err != nil {
+		emitAgentAISteerAck(writeJSON, sessionID, messageID, "error", "无法把插话送进终端会话", "send_failed")
+		return
+	}
+	if ccPeerWatchHeld(plan.JSONLPath, offset, ccPeerHeldWatchWindow) {
+		emitAgentAISteerAck(writeJSON, sessionID, messageID, "error", "终端会话拒绝了这条插话，请在终端中处理", "held")
+		return
+	}
+	m.mu.Lock()
+	session.history = append(session.history, agentAIMessage{
+		Role: "user", MessageID: messageID, Content: content, CreatedAt: time.Now().UTC(),
+	})
+	m.mu.Unlock()
+	emitAgentAISteerAck(writeJSON, sessionID, messageID, "queued", "", "")
 }
 
 func (c *agentAICodexSteerControl) enqueue(msg agentAISteerMessage) (string, error) {
