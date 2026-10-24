@@ -2044,11 +2044,46 @@ func (m *agentAIManager) steer(msg map[string]interface{}, writeJSON agentTermin
 	session := m.sessions[sessionID]
 	if session == nil {
 		m.mu.Unlock()
+		// 导入/外部 TUI 会话不在注册表(手机侧 tuiDrivenRunning)。若 server
+		// 随 ai.steer 附了 source_session_id,且该 native 会话有 live 的 busy
+		// pid 记录并带跨会话 messaging UDS socket(CC >= 2.1.224),插话经
+		// CC 收件箱排队——与 stop 的外部 SIGINT 同一份注册表、与 TUI 注入
+		// 回合(steerTUITurn)同语义。TUI 插话只有文本帧,附件先拒。
+		if sourceSessionID := strings.TrimSpace(remoteString(msg, "source_session_id")); sourceSessionID != "" {
+			if arr, ok := msg["attachments"].([]interface{}); ok && len(arr) > 0 {
+				emitAgentAISteerAck(writeJSON, sessionID, messageID, "error", "外部 TUI 执行中的插话暂不支持附件，请等回合结束后再发", "unsupported_attachment")
+				return
+			}
+			if result, errMsg := externalSteerAttempt(externalTUIHome(), sourceSessionID, content); result != "not_running" {
+				code := ""
+				if result == "error" {
+					code = "send_failed"
+				}
+				emitAgentAISteerAck(writeJSON, sessionID, messageID, result, errMsg, code)
+				return
+			}
+		}
 		emitAgentAISteerAck(writeJSON, sessionID, messageID, "not_running", fmt.Sprintf("ai session not found: %s", sessionID), "")
 		return
 	}
 	if session.cancel == nil {
 		m.mu.Unlock()
+		// 注册表里在、但当前没有活跃回合:该会话的回合可能正由外部 TUI 驱动
+		// (与 stop 的 idle 分支对称的 best-effort)。尝试同一外部通道。
+		if sourceSessionID := strings.TrimSpace(remoteString(msg, "source_session_id")); sourceSessionID != "" {
+			if arr, ok := msg["attachments"].([]interface{}); ok && len(arr) > 0 {
+				emitAgentAISteerAck(writeJSON, sessionID, messageID, "error", "外部 TUI 执行中的插话暂不支持附件，请等回合结束后再发", "unsupported_attachment")
+				return
+			}
+			if result, errMsg := externalSteerAttempt(externalTUIHome(), sourceSessionID, content); result != "not_running" {
+				code := ""
+				if result == "error" {
+					code = "send_failed"
+				}
+				emitAgentAISteerAck(writeJSON, sessionID, messageID, result, errMsg, code)
+				return
+			}
+		}
 		emitAgentAISteerAck(writeJSON, sessionID, messageID, "not_running", fmt.Sprintf("ai session is not running: %s", sessionID), "")
 		return
 	}
@@ -7997,15 +8032,41 @@ func agentAICapabilities() []string {
 	// 探测失败即不宣称能力，服务端/手机会退回「运行中不可发消息」的旧行为。
 	hasClaudeSteer := (hasClaude == nil && claudeStreamJSONInputAvailable(claudePath)) ||
 		(hasClaudeCode == nil && claudeStreamJSONInputAvailable(claudeCodePath))
-	return agentAICapabilitiesForTools(hasClaude == nil, hasClaudeCode == nil, codexAppServerAvailable(), hasOpenCode == nil, codexNativeGoalAvailable(), hasClaudeSteer)
+	// 外部 TUI 插话依赖 CC >= 2.1.224 写进 ~/.claude/sessions/<pid>.json 的
+	// 跨会话 messaging UDS socket(MessagingSocketPath)。按 CLI 版本探测,与
+	// stream-json 探测同模式(缓存随二进制内容失效)。
+	hasClaudeExternalSteer := false
+	if probePath := externalSteerProbePath(hasClaude == nil, claudePath, hasClaudeCode == nil, claudeCodePath); probePath != "" {
+		if v, ok := probeClaudeCodeVersion(probePath); ok {
+			hasClaudeExternalSteer = v.atLeast(2, 1, 224)
+		}
+	}
+	return agentAICapabilitiesForTools(hasClaude == nil, hasClaudeCode == nil, codexAppServerAvailable(), hasOpenCode == nil, codexNativeGoalAvailable(), hasClaudeSteer, hasClaudeExternalSteer)
 }
 
-func agentAICapabilitiesForTools(hasClaude, hasClaudeCode, hasCodexAppServer, hasOpenCode, hasCodexNativeGoal, hasClaudeSteer bool) []string {
+// externalSteerProbePath 挑做版本探测的 claude 二进制:优先 claude,退 claudecode。
+func externalSteerProbePath(hasClaude bool, claudePath string, hasClaudeCode bool, claudeCodePath string) string {
+	if hasClaude {
+		return claudePath
+	}
+	if hasClaudeCode {
+		return claudeCodePath
+	}
+	return ""
+}
+
+func agentAICapabilitiesForTools(hasClaude, hasClaudeCode, hasCodexAppServer, hasOpenCode, hasCodexNativeGoal, hasClaudeSteer, hasClaudeExternalSteer bool) []string {
 	caps := []string{"ai_chat", "ai_chat_context", "ai_stream", "ai_approval", "ai_steer", "vibe_session"}
 	if hasClaudeSteer {
 		// 与 ai_steer（Codex app-server 通道）区分：老 agent 也会无条件宣称
 		// ai_steer，但只有新 agent 才能真正对 Claude run 注入。
 		caps = append(caps, "ai_steer_claude")
+	}
+	if hasClaudeExternalSteer {
+		// 外部 TUI 会话(导入/桌面终端自发生长)的插话通道:经 CC 跨会话
+		// messaging UDS 收件箱排队。与 ai_steer_claude(stream-json stdin,
+		// 只覆盖 agent 自 spawn 的回合)互补。
+		caps = append(caps, "ai_steer_external")
 	}
 	if hasClaude {
 		caps = append(caps, "ai_provider_claude")

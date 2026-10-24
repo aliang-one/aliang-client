@@ -335,7 +335,7 @@ func TestClaudeVersionProbeSharedCache(t *testing.T) {
 }
 
 func TestAgentAICapabilitiesOnlyAdvertiseApprovalCapableProviders(t *testing.T) {
-	caps := agentAICapabilitiesForTools(true, false, false, true, false, true)
+	caps := agentAICapabilitiesForTools(true, false, false, true, false, true, false)
 	for _, want := range []string{"ai_provider_claude", "ai_provider_claudecode", "ai_provider_opencode_basic"} {
 		if !agentAIStringSliceContains(caps, want) {
 			t.Fatalf("capabilities %v missing %s", caps, want)
@@ -346,7 +346,7 @@ func TestAgentAICapabilitiesOnlyAdvertiseApprovalCapableProviders(t *testing.T) 
 			t.Fatalf("capabilities %v unexpectedly contain %s", caps, forbidden)
 		}
 	}
-	withCodex := agentAICapabilitiesForTools(false, false, true, false, true, false)
+	withCodex := agentAICapabilitiesForTools(false, false, true, false, true, false, false)
 	for _, want := range []string{"ai_provider_codex", "ai_provider_codex_app_server"} {
 		if !agentAIStringSliceContains(withCodex, want) {
 			t.Fatalf("capabilities %v missing %s", withCodex, want)

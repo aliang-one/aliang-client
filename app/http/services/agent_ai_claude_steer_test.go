@@ -247,11 +247,11 @@ func TestClaudeToolWithoutStreamJSONKeepsArgvPrompt(t *testing.T) {
 
 // 能力位：只有探测到 stream-json 输入支持时才宣称 ai_steer_claude。
 func TestAgentAICapabilitiesAdvertiseClaudeSteerOnlyWhenSupported(t *testing.T) {
-	withSteer := agentAICapabilitiesForTools(true, false, false, false, false, true)
+	withSteer := agentAICapabilitiesForTools(true, false, false, false, false, true, false)
 	if !agentAIStringSliceContains(withSteer, "ai_steer_claude") {
 		t.Fatalf("capabilities %v missing ai_steer_claude", withSteer)
 	}
-	withoutSteer := agentAICapabilitiesForTools(true, false, false, false, false, false)
+	withoutSteer := agentAICapabilitiesForTools(true, false, false, false, false, false, false)
 	if agentAIStringSliceContains(withoutSteer, "ai_steer_claude") {
 		t.Fatalf("capabilities %v unexpectedly contain ai_steer_claude", withoutSteer)
 	}
