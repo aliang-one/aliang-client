@@ -37,9 +37,16 @@ import (
 // 由 relay 层注入 Authorization-Inner。走这条路不需要我们自己管凭据。
 const agentCoreDefaultBaseURL = "http://127.0.0.1:56432"
 
-// agentCoreDefaultModel 是没指定模型时的兜底。真实 Anthropic 模型 id，
-// 网关侧会按 key-group 做 model mapping。
-const agentCoreDefaultModel = "claude-sonnet-4-5"
+// agentCoreDefaultModel 是手机没显式传模型时的兜底。
+//
+// 必须是一个**本账号组真能路由**的 id。曾经写的是 claude-sonnet-4-5（真实
+// Anthropic id，指望网关做 model mapping），但实测该组对 claude-* 一律返回
+// model_not_found，只有 glm-* 通。手机每次建会话都会显式传 model（那是权威
+// 来源），这里只是「传空」时的保命值——保命值本身不能是必然失败的。
+//
+// 与 PhoneServer 的 SEED_PROVIDER_CATALOG、手机 MODEL_PRESETS_BY_PROVIDER
+// 的 agentcore 条目保持同一套 id。
+const agentCoreDefaultModel = "glm-5.2"
 
 // agentCoreSettingsEnv 从 ~/.claude/settings.json 的 env 块里取一个值。
 // 与 claudeAuthEnvOverlay（agent_ai.go）同一套查找口径：先看子进程 env，
@@ -77,11 +84,22 @@ func agentCoreEnvOrSettings(key string) string {
 
 // agentCoreBaseURL 解析出网地址。
 //
-// 与 CLI provider 保持同一口径（env → settings.json），只是多了 56432 这个
-// 兜底：CLI 没有 base URL 会自己报错，我们的内核必须有个能跑的默认值。
+// **与 CLI provider 的口径不同**：CLI 子进程拿得到 ANTHROPIC_AUTH_TOKEN，可以
+// 直连 https://api.aliang.one；内核刻意零凭据（不发 Authorization），直连这种
+// 端点必然 401。所以这里只接受**回环**地址——回环:56432 会被
+// shouldForceAliangRoute 强制走 aliang 隧道，由 relay 层注入 Authorization-Inner。
+//
+// 用户把 ANTHROPIC_BASE_URL 配成远端直连地址时（本机 settings.json 就是
+// https://api.aliang.one），照抄会让内核一上来就 401。宁可退回 56432 走隧道，
+// 也不要让「装了客户端却连不上」这种最难自查的失败发生。
 func agentCoreBaseURL() string {
 	if v := agentCoreEnvOrSettings("ANTHROPIC_BASE_URL"); v != "" {
-		return v
+		if agentCoreIsLoopbackBase(v) {
+			return v
+		}
+		logger.Warn(fmt.Sprintf(
+			"agentcore: ANTHROPIC_BASE_URL=%s 非回环地址，内核无凭据无法直连，改用 %s 走平台代理",
+			v, agentCoreDefaultBaseURL))
 	}
 	return agentCoreDefaultBaseURL
 }
@@ -95,20 +113,39 @@ func agentCoreIsLoopbackBase(base string) bool {
 	return isLoopbackHost(u.Hostname())
 }
 
-// agentCoreModel 解析模型名：本轮指定 → env/settings 的 ANTHROPIC_MODEL → 兜底。
+// agentCoreModel 解析模型名：本轮指定 → env/settings → 兜底。
+//
+// 手机每次建会话都会显式传 model，那是权威来源；本函数只负责「传空时也要
+// 有东西能发出去」，且发出去的东西必须网关认。
 //
 // 首期**不传达 effort**。两条现成通道都用不了：模型名后缀是 codex 专用约定，
 // applyCodexEffortSuffix 的注释写明网关不解析带后缀的 claude 模型名、上游调用
-// 会直接坏掉，而内核默认模型正是 claude-sonnet-4-5；`--effort` 是 claude CLI
-// 的 flag，进程内内核没有 argv 可传。宁可不设，也不能把模型名拼坏。
+// 会直接坏掉；`--effort` 是 claude CLI 的 flag，进程内内核没有 argv 可传。
+// 宁可不设，也不能把模型名拼坏。
 func agentCoreModel(run agentAIRun) string {
-	if m := strings.TrimSpace(run.model); m != "" {
+	// 手机显式传的模型是权威来源，直接采用。
+	if m := strings.TrimSpace(run.model); m != "" && !agentCoreModelUnusable(m) {
 		return m
 	}
-	if m := agentCoreEnvOrSettings("ANTHROPIC_MODEL"); m != "" {
-		return m
+	// 没传才看本机配置。ANTHROPIC_MODEL 是显式覆盖；
+	// ANTHROPIC_DEFAULT_SONNET_MODEL 是 quick-setup 写的「默认档位映射」，
+	// 本机就落在 glm-5.3[1m]——比硬编码兜底更贴近这台机器真实在用的模型。
+	for _, key := range []string{"ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL"} {
+		if m := agentCoreEnvOrSettings(key); m != "" && !agentCoreModelUnusable(m) {
+			return m
+		}
 	}
 	return agentCoreDefaultModel
+}
+
+// agentCoreModelUnusable 挡掉不能当模型名用的值。
+//
+// "<synthetic>" 是 claude CLI 自己造出来的占位名，网关不认识；空串会被网关
+// 以 "model is required" 拒绝（agent_ai.go 也把 synthetic 当失败吞掉）。
+// 解析到这种值时必须继续往下走兜底，而不是把它发出去。
+func agentCoreModelUnusable(model string) bool {
+	m := strings.TrimSpace(model)
+	return m == "" || strings.EqualFold(m, "<synthetic>")
 }
 
 // agentCoreEnsureUpstream 探测并必要时自愈平台 AI 代理。
