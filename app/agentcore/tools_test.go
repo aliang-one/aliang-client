@@ -253,11 +253,11 @@ func TestGlobMatch(t *testing.T) {
 		want          bool
 	}{
 		{"*.go", "main.go", true},
-		{"*.go", "pkg/main.go", true},   // 基名匹配
-		{"**/*.go", "a/b/c.go", true},   // ** 剥层
+		{"*.go", "pkg/main.go", true}, // 基名匹配
+		{"**/*.go", "a/b/c.go", true}, // ** 剥层
 		{"**/*.go", "c.go", true},
 		{"a/*.go", "a/b.go", true},
-		{"a/*.go", "a/b/c.go", false},   // 单层不跨目录
+		{"a/*.go", "a/b/c.go", false}, // 单层不跨目录
 		{"*.go", "main.ts", false},
 	}
 	for _, c := range cases {

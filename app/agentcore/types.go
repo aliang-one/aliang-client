@@ -120,10 +120,10 @@ type sseEvent struct {
 
 // streamMessage 是 message_start 事件里的 message 对象。
 type streamMessage struct {
-	ID    string      `json:"id"`
-	Model string      `json:"model"`
-	Role  string      `json:"role"`
-	Usage *Usage      `json:"usage,omitempty"`
+	ID    string `json:"id"`
+	Model string `json:"model"`
+	Role  string `json:"role"`
+	Usage *Usage `json:"usage,omitempty"`
 }
 
 // streamDelta 是各类 delta 的并集。
