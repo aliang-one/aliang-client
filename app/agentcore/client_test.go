@@ -332,3 +332,110 @@ func TestParseRetryAfter(t *testing.T) {
 		}
 	}
 }
+
+// 真实网关限流时回的是 HTTP 200 + 裸 JSON，既不是非 2xx 也不是 SSE。
+// 不识别它，用户就只会看到一句笼统的空回复。
+func TestParseSSEDetectsUpstreamErrorBody(t *testing.T) {
+	const compact = `{"error":{"message":"Upstream rate limit exceeded, please retry later","type":"rate_limit_error"},"type":"error"}`
+
+	cases := map[string]string{
+		"单行":     compact,
+		"pretty": "{\n  \"error\": {\n    \"message\": \"Upstream rate limit exceeded, please retry later\",\n    \"type\": \"rate_limit_error\"\n  },\n  \"type\": \"error\"\n}",
+		"心跳在前":   ": ping\n\n" + compact,
+		"前后空白":   "  " + compact + "  ",
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			var events []StreamEvent
+			err := parseSSE(context.Background(), strings.NewReader(body), func(ev StreamEvent) error {
+				events = append(events, ev)
+				return nil
+			})
+			if err == nil {
+				t.Fatalf("裸 JSON 错误体应返回错误，实际 nil（事件 %+v）", events)
+			}
+			var upErr *upstreamError
+			if !errors.As(err, &upErr) {
+				t.Fatalf("err = %T %v, want *upstreamError", err, err)
+			}
+			if upErr.kind != "rate_limit_error" {
+				t.Errorf("kind = %q, want rate_limit_error", upErr.kind)
+			}
+			if !strings.Contains(err.Error(), "Upstream rate limit exceeded") {
+				t.Errorf("错误信息应带上游原文，实际 %q", err.Error())
+			}
+			if len(events) != 0 {
+				t.Errorf("不应产出任何事件，实际 %+v", events)
+			}
+		})
+	}
+}
+
+// 非错误形状的 JSON（比如网关塞了别的东西）不能被当成错误，也不能吞掉后续 SSE。
+func TestParseSSEIgnoresNonErrorJSON(t *testing.T) {
+	body := "{\"ok\":true}\n\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"glm-5.2\"}}\n\n"
+	var events []StreamEvent
+	if err := parseSSE(context.Background(), strings.NewReader(body), func(ev StreamEvent) error {
+		events = append(events, ev)
+		return nil
+	}); err != nil {
+		t.Fatalf("不应报错: %v", err)
+	}
+	if len(events) != 1 || events[0].Kind != EventStart {
+		t.Fatalf("events = %+v, want 一个 start", events)
+	}
+}
+
+// 限流是可重试的：第一次回 200+错误信封，第二次回正常流，用户不该看到失败。
+func TestStreamRetriesUpstreamRateLimit(t *testing.T) {
+	var attempts int32
+	srv := sseServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&attempts, 1) == 1 {
+			w.Header().Set("content-type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, `{"error":{"message":"Upstream rate limit exceeded, please retry later","type":"rate_limit_error"},"type":"error"}`)
+			return
+		}
+		writeSSE(w,
+			`{"type":"message_start","message":{"id":"msg_retry","model":"glm-5.2"}}`,
+			`{"type":"message_delta","delta":{"stop_reason":"end_turn"}}`,
+		)
+	})
+
+	got, err := collect(t, NewClient(srv.URL), &MessagesRequest{Model: "glm-5.2"})
+	if err != nil {
+		t.Fatalf("限流后应重试成功: %v", err)
+	}
+	if n := atomic.LoadInt32(&attempts); n != 2 {
+		t.Errorf("attempts = %d, want 2", n)
+	}
+	if len(got) == 0 || got[0].Kind != EventStart {
+		t.Errorf("重试后应拿到正常事件流，实际 %+v", got)
+	}
+}
+
+// 参数类错误重试也没用，必须一次就失败，并且把上游原因原样带给用户。
+func TestStreamNoRetryOnUpstreamInvalidRequest(t *testing.T) {
+	var attempts int32
+	srv := sseServer(t, func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&attempts, 1)
+		w.Header().Set("content-type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{"error":{"message":"model not found","type":"invalid_request_error"},"type":"error"}`)
+	})
+
+	_, err := collect(t, NewClient(srv.URL), &MessagesRequest{Model: "claude-x"})
+	if err == nil {
+		t.Fatal("应返回错误")
+	}
+	if n := atomic.LoadInt32(&attempts); n != 1 {
+		t.Errorf("invalid_request_error 不应重试，attempts = %d", n)
+	}
+	var upErr *upstreamError
+	if !errors.As(err, &upErr) || upErr.kind != "invalid_request_error" {
+		t.Errorf("err = %v, want invalid_request_error upstreamError", err)
+	}
+	if !strings.Contains(err.Error(), "model not found") {
+		t.Errorf("错误信息应带上游原文，实际 %q", err.Error())
+	}
+}

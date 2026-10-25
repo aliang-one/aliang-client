@@ -643,3 +643,57 @@ func TestDrainAgentCoreSteeringRejectsStaleRunSeq(t *testing.T) {
 		t.Fatalf("当前 runSeq 取到 %d 条，want 1", len(got))
 	}
 }
+
+// TestRunAgentCoreSurfacesUpstreamErrorBody 锁死「网关把错误塞进 200 响应体」
+// 时用户看到什么。
+//
+// 实测（2026-10-25，56432 本地代理）：限流回的是 HTTP 200 + 裸 JSON，不是
+// 非 2xx、也不是 SSE。修复前这条错误在 parseSSE 里被整段忽略，内核当成
+// 「空回合」正常收尾，手机上是一条空回复气泡，用户完全看不到真实原因。
+// 这里断言的是**手机收到的 ai.error 文本**：必须带上游原文。
+func TestRunAgentCoreSurfacesUpstreamErrorBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{"error":{"message":"model not found","type":"invalid_request_error"},"type":"error"}`)
+	}))
+	t.Cleanup(srv.Close)
+	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
+	t.Setenv("ANTHROPIC_MODEL", "")
+
+	m := newAgentAIManager()
+	const sessionID = "conv-agentcore-upstream-error"
+	const runSeq = 1
+	m.registerAISessionLocked(&agentAISession{
+		id:      sessionID,
+		runSeq:  runSeq,
+		history: []agentAIMessage{{Role: "user", Content: "你好"}},
+	})
+
+	log := &agentCoreEventLog{}
+	run := agentAIRun{
+		sessionID:   sessionID,
+		runSeq:      runSeq,
+		messageID:   "msg-upstream-err",
+		provider:    "agentcore",
+		model:       "glm-5.2",
+		projectPath: t.TempDir(),
+		activity:    newAgentAIActivity(),
+	}
+	m.runAgentCore(context.Background(), run, log.write)
+
+	if got := log.count(models.AgentEventAIDone); got != 0 {
+		t.Fatalf("失败回合不该发 ai.done，实际 %d 条（序列 %v）", got, log.types())
+	}
+	errs := log.filter(models.AgentEventAIError)
+	if len(errs) != 1 {
+		t.Fatalf("ai.error 数量 = %d, want 1（序列 %v）", len(errs), log.types())
+	}
+	msg, _ := errs[0]["error"].(string)
+	if !strings.Contains(msg, "model not found") {
+		t.Errorf("ai.error 应带上游原文，实际 %q", msg)
+	}
+	if !strings.Contains(msg, "invalid_request_error") {
+		t.Errorf("ai.error 应带上游错误类型，实际 %q", msg)
+	}
+}

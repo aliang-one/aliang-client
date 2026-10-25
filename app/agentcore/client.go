@@ -38,6 +38,10 @@ const (
 	// sseMaxLineBytes 是单行 SSE 的上限。上游的 input_json_delta 可能很长
 	// （大文件的 tool_use 参数），给足余量。
 	sseMaxLineBytes = 8 << 20
+
+	// jsonErrorBodyMaxBytes 是「裸 JSON 错误体」的识别上限。真实网关的错误
+	// 信封只有一两百字节；设上限只是为了别把一段异常的巨型响应攒进内存。
+	jsonErrorBodyMaxBytes = 4096
 )
 
 // Client 是 Messages API 的流式客户端。零值不可用，用 NewClient 构造。
@@ -185,11 +189,79 @@ func (e *httpStatusError) Error() string {
 	return fmt.Sprintf("agentcore: 上游返回 HTTP %d: %s", e.status, body)
 }
 
-// isRetryable 判定错误是否值得重试：连接类错误、429、5xx。
+// upstreamError 是上游把错误塞进 2xx 响应体里返回的情况。
+//
+// 实测（2026-10-25，经 56432 本地代理，model=glm-5.3-flash[1m]）：网关限流时
+// 回的是 **HTTP 200 + 裸 JSON**：
+//
+//	{"error":{"message":"Upstream rate limit exceeded, please retry later",
+//	          "type":"rate_limit_error"},"type":"error"}
+//
+// 它既不是非 2xx（状态码检查抓不到），也不是 SSE（每一行都没有 data: 前缀，
+// parseSSE 会把整段忽略掉）。不单独识别的话，这条错误就退化成「空流」，
+// 用户只拿到一句笼统的空回复，真正的原因（限流）根本传不到手机上。
+type upstreamError struct {
+	kind    string // 上游 error.type，如 rate_limit_error
+	message string
+	body    string
+}
+
+func (e *upstreamError) Error() string {
+	if msg := strings.TrimSpace(e.message); msg != "" {
+		if kind := strings.TrimSpace(e.kind); kind != "" {
+			return fmt.Sprintf("agentcore: 上游错误(%s): %s", kind, msg)
+		}
+		return "agentcore: 上游错误: " + msg
+	}
+	body := strings.TrimSpace(e.body)
+	if len(body) > 512 {
+		body = body[:512] + "…"
+	}
+	return "agentcore: 上游返回错误响应: " + body
+}
+
+// retryable 判定这个 2xx 内错误值不值得重试。限流与过载是容量问题，
+// 退避后重试有意义；其余（如 invalid_request_error）重试只会重复失败。
+func (e *upstreamError) retryable() bool {
+	switch strings.TrimSpace(e.kind) {
+	case "rate_limit_error", "overloaded_error", "api_error":
+		return true
+	}
+	return false
+}
+
+// jsonErrorEnvelope 是裸 JSON 错误响应的外壳。
+type jsonErrorEnvelope struct {
+	Type  string       `json:"type"`
+	Error *streamError `json:"error"`
+}
+
+// upstreamErrorFromJSON 尝试把一段裸 JSON 响应体解析成 upstreamError。
+// 返回 nil 表示「这段还不是完整的错误信封」——可能只是 pretty-print 的中间
+// 片段，调用方应继续累积。
+func upstreamErrorFromJSON(body string) *upstreamError {
+	var env jsonErrorEnvelope
+	if err := json.Unmarshal([]byte(body), &env); err != nil {
+		return nil
+	}
+	if env.Error == nil {
+		return nil
+	}
+	if strings.TrimSpace(env.Error.Message) == "" && strings.TrimSpace(env.Error.Type) == "" {
+		return nil
+	}
+	return &upstreamError{kind: env.Error.Type, message: env.Error.Message, body: body}
+}
+
+// isRetryable 判定错误是否值得重试：连接类错误、429、5xx、2xx 内的限流/过载。
 func isRetryable(err error) bool {
 	var statusErr *httpStatusError
 	if errors.As(err, &statusErr) {
 		return statusErr.status == http.StatusTooManyRequests || statusErr.status >= 500
+	}
+	var upErr *upstreamError
+	if errors.As(err, &upErr) {
+		return upErr.retryable()
 	}
 	// 连接重置 / EOF / 超时都属于瞬态。
 	return true
@@ -261,9 +333,17 @@ func parseRetryAfter(raw string) time.Duration {
 }
 
 // parseSSE 逐行读 SSE，把 data 负载解析成 sseEvent 再翻译成 StreamEvent。
+//
+// 除了正常 SSE，这里还负责识别一种真实网关会返回的异常形状：HTTP 200 +
+// 一段裸 JSON 错误信封（见 upstreamError）。SSE 的合法行只有 event: / data: /
+// id: / retry: / 注释，绝不会以 '{' 开头，所以按这个特征做判别不会误伤正常流。
 func parseSSE(ctx context.Context, r io.Reader, onEvent func(StreamEvent) error) error {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 64*1024), sseMaxLineBytes)
+
+	// 裸 JSON 体的累积缓冲（pretty-print 的 JSON 会跨多行）。
+	var jsonBuf strings.Builder
+	jsonOverflow := false
 
 	for scanner.Scan() {
 		if err := ctx.Err(); err != nil {
@@ -275,28 +355,53 @@ func parseSSE(ctx context.Context, r io.Reader, onEvent func(StreamEvent) error)
 		if line == "" || strings.HasPrefix(line, ":") {
 			continue
 		}
-		if !strings.HasPrefix(line, "data:") {
-			continue
-		}
-		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if payload == "" || payload == "[DONE]" {
-			continue
-		}
 
-		var ev sseEvent
-		if err := json.Unmarshal([]byte(payload), &ev); err != nil {
-			// 单帧解析失败不该整轮失败：上游偶发会插入非 JSON 保活帧。
-			continue
-		}
+		trimmed := strings.TrimSpace(line)
 
-		events, err := translateEvent(&ev)
-		if err != nil {
-			return err
-		}
-		for _, out := range events {
-			if err := onEvent(out); err != nil {
-				return &eventAbortError{cause: err}
+		// data: 行优先判定。裸 JSON 缓冲里可能还留着上一段内容（例如网关先
+		// 回了一个非错误的 JSON 对象），若让它抢在 data: 前面，正常帧会被
+		// 拼进缓冲里一起丢掉。
+		if strings.HasPrefix(line, "data:") {
+			jsonBuf.Reset()
+			payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			if payload == "" || payload == "[DONE]" {
+				continue
 			}
+
+			var ev sseEvent
+			if err := json.Unmarshal([]byte(payload), &ev); err != nil {
+				// 单帧解析失败不该整轮失败：上游偶发会插入非 JSON 保活帧。
+				continue
+			}
+
+			events, err := translateEvent(&ev)
+			if err != nil {
+				return err
+			}
+			for _, out := range events {
+				if err := onEvent(out); err != nil {
+					return &eventAbortError{cause: err}
+				}
+			}
+			continue
+		}
+
+		// 裸 JSON 错误体：以 '{' 开头，后续行是它的续行。
+		if jsonBuf.Len() > 0 || strings.HasPrefix(trimmed, "{") {
+			if jsonOverflow {
+				continue
+			}
+			if jsonBuf.Len()+len(trimmed) > jsonErrorBodyMaxBytes {
+				// 不像一个错误信封，放弃识别，退回「忽略未知行」。
+				jsonOverflow = true
+				jsonBuf.Reset()
+				continue
+			}
+			jsonBuf.WriteString(trimmed)
+			if upErr := upstreamErrorFromJSON(jsonBuf.String()); upErr != nil {
+				return upErr
+			}
+			continue
 		}
 	}
 	if err := scanner.Err(); err != nil {
