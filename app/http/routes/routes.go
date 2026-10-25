@@ -267,6 +267,8 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	register("/api/agent/tools", h.Agent.HandleTools, http.MethodGet)
 	register("/api/agent/protocol", h.Agent.HandleProtocol, http.MethodGet)
 	register("/api/agent/tools/launch", h.Agent.HandleLaunch, http.MethodPost)
+	// 设备互传本地触发（D13）：转发 PhoneServer POST /api/transfers
+	register("/api/agent/transfers", h.Agent.HandleTransferCreate, http.MethodPost)
 	register("/api/agent/ai/stream", h.Agent.HandleAIStream, http.MethodGet)
 	register("/api/agent/ai/approval-hook", h.Agent.HandleAIApprovalHook, http.MethodPost)
 	// 自有交互工具 MCP 端点(tool_ask bridge):路径含 per-run token,方法由

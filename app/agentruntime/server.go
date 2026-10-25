@@ -122,6 +122,9 @@ func registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/agent/tools", agentHandler.HandleTools)
 	mux.HandleFunc("/api/agent/protocol", agentHandler.HandleProtocol)
 	mux.HandleFunc("/api/agent/tools/launch", agentHandler.HandleLaunch)
+	// 设备互传本地触发（D13）：核心侧 routes.go 已有同名注册，缺这里会 404
+	//（双注册教训，2026-10-21 liang-dev 实测）。
+	mux.HandleFunc("/api/agent/transfers", agentHandler.HandleTransferCreate)
 	mux.HandleFunc("/api/agent/ai/approval-hook", agentHandler.HandleAIApprovalHook)
 	mux.HandleFunc("/mcp/aliang/", agentHandler.HandleToolAskMCP)
 	mux.HandleFunc("/api/agent/sessions", agentHandler.HandleVibeSessions)
