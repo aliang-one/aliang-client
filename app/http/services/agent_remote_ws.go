@@ -701,6 +701,15 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 	case models.AgentEventDeviceSettings:
 		logger.Info("[AGENT-BOOT] remote_connection settings_updated")
 		s.applyRemoteDeviceSettings(msg)
+	case models.AgentEventInventoryRefresh:
+		// Server 端「重扫电脑」轻推(手机项目会话列表下拉/按钮触发):立即
+		// 收集并推送一次全量 hello,不等 10s digest tick / 60s 周期兜底。
+		// 只读动作,不进 enabled-device 门控名单(与 hello 类流量一致)。
+		// 失败仅记日志:一次失败的推送不得撕断读循环(与 digest 变更分支同语义)。
+		s.setRemoteConnectionState(true, "online", "")
+		if err := s.sendAgentHello(writeJSON, "server_requested"); err != nil {
+			logger.Warn(fmt.Sprintf("[AGENT-BOOT] remote_connection requested_rescan_hello_failed error=%v", err))
+		}
 	case models.AgentEventProjectSettings:
 		s.applyRemoteProjectSettings(msg)
 	case models.AgentEventAIRename:
