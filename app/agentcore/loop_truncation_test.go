@@ -2,7 +2,9 @@ package agentcore
 
 import (
 	"context"
+	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 )
@@ -132,6 +134,47 @@ func TestRunGivesUpAfterRepeatedTruncation(t *testing.T) {
 	}
 	if text, _ := rf["result"].(string); !strings.Contains(text, "连续") {
 		t.Errorf("result 文本 = %q，应说明是连续截断", text)
+	}
+}
+
+// TestRunTruncationLogsDecision 钉住截断这件事**可观测**：截断没有自己的
+// 事件帧（回填只是一条 tool_result），不打日志的话事后只能靠模型回复反推。
+// 真机排查过一次，代价很高。
+func TestRunTruncationLogsDecision(t *testing.T) {
+	rec := &requestRecorder{}
+	srv := sseServer(t, rec.handler(t, []string{
+		truncatedTurn("toolu_log"),
+		recoveredTurn("ok"),
+	}))
+
+	registry := NewRegistry()
+	registry.Register(&stubTool{name: "Stub", result: ToolResult{Content: "ok"}})
+
+	var mu sync.Mutex
+	var logs []string
+	cfg := &Config{
+		Client:    NewClient(srv.URL),
+		Model:     "claude-x",
+		SessionID: "sess-trunc-log",
+		Tools:     registry,
+		Logf: func(format string, args ...interface{}) {
+			mu.Lock()
+			logs = append(logs, fmt.Sprintf(format, args...))
+			mu.Unlock()
+		},
+	}
+	if _, err := Run(context.Background(), cfg, []Message{TextMessage("user", "写大文件")}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(logs) == 0 {
+		t.Fatal("截断没有打日志：事后无法从日志还原发生过什么")
+	}
+	joined := strings.Join(logs, "\n")
+	if !strings.Contains(joined, "max_tokens") || !strings.Contains(joined, "sess-trunc-log") {
+		t.Errorf("日志缺少关键信息（max_tokens / session id），实际：%q", joined)
 	}
 }
 

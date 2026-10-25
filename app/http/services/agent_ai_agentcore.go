@@ -647,6 +647,12 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 			ShellPolicy: &agentCoreShellPolicy{run: run},
 		},
 		Approve: m.agentCoreApprove(run, writeJSON),
+		// 内核不 import 日志包，这里把宿主 logger 包一层递进去（签名不同：
+		// logger.Warn 是 variadic interface{}）。目前只承载截断这类无事件帧的
+		// 内部决策。
+		Logf: func(format string, args ...interface{}) {
+			logger.Warn(fmt.Sprintf(format, args...))
+		},
 		Emit: func(frame []byte) error {
 			_, err := pipeWriter.Write(frame)
 			return err

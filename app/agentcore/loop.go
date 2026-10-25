@@ -94,6 +94,12 @@ type Config struct {
 	//
 	// 走 services 的 m.requestApproval；内核不做审批 UI，只等结果。
 	Approve func(ctx context.Context, call ApprovalRequest) (ApprovalResponse, error)
+	// Logf 是可选日志出口，nil 表示不打日志（单测、嵌入场景）。
+	//
+	// 内核刻意不依赖宿主的日志包（也不该反向绑死某个实现），宿主把
+	// logger.Warn 包一层传进来即可。目前只用于记录 max_tokens 截断这类
+	// **没有对应事件帧**的内部决策——否则事后只能靠模型的回复反推发生过什么。
+	Logf func(format string, args ...interface{})
 	// SessionID 是本会话的稳定 id，写进每一帧的 session_id。
 	// 为空时内核自己生成一个。
 	SessionID string
@@ -186,6 +192,13 @@ type runner struct {
 	truncStreak int
 }
 
+// logf 走宿主的日志出口；没配就静默。
+func (r *runner) logf(format string, args ...interface{}) {
+	if r.cfg.Logf != nil {
+		r.cfg.Logf(format, args...)
+	}
+}
+
 // loop 是主循环本体。
 func (r *runner) loop(ctx context.Context) (*RunResult, error) {
 	writer := r.writer
@@ -257,6 +270,10 @@ func (r *runner) loop(ctx context.Context) (*RunResult, error) {
 				})
 			}
 			r.truncStreak++
+			// 截断是**没有对应事件帧**的内部决策（失败回填是 tool_result，手机
+			// 只看到一次工具活动），不打日志的话事后只能靠模型的回复反推。
+			r.logf("[agentcore] max_tokens 截断：%d 个工具调用未执行（连续第 %d/%d 次），已回填让模型拆小重试 session=%s",
+				len(toolUses), r.truncStreak, maxTruncationRetries, r.writer.sessionID)
 			if r.truncStreak > maxTruncationRetries {
 				r.fireFinishTurn(stopReason)
 				return r.finish(ctx, ResultSubtypeErrorMaxTurns,

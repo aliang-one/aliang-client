@@ -475,7 +475,10 @@ var claudeSessionIDPattern = regexp.MustCompile(
 func agentRenameMirrorsClaude(provider, tool string) bool {
 	for _, raw := range []string{provider, tool} {
 		switch strings.ToLower(strings.TrimSpace(raw)) {
-		case "codex", "opencode":
+		case "codex", "opencode", "agentcore":
+			// agentcore 的 native id 形如 agentcore-1792954925284702588-1，
+			// 不是 UUID，claudeSessionIDPattern 那一关永远过不了——照 Claude
+			// 镜像只会稳定产出一条 transcript_not_found 噪音日志。
 			return false
 		case "claude", "claudecode", "auto":
 			return true
