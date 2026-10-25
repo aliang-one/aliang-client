@@ -245,6 +245,12 @@ const (
 	ResultSubtypeSuccess       = "success"
 	ResultSubtypeErrorMaxTurns = "error_max_turns"
 	ResultSubtypeErrorRun      = "error_during_execution"
+	// ResultSubtypeInterrupted 是「用户/宿主主动停止」。
+	//
+	// 它刻意不带 error_ 前缀、也不置 is_error：宿主的 claudeResultError 只把
+	// is_error==true 或 error_* 子类型当失败并转成 ai.error。用户点停止不该
+	// 变成一条错误气泡——宿主会另发 ai.status(stopped)，那才是正确的收敛。
+	ResultSubtypeInterrupted = "interrupted"
 )
 
 // Result 发终止帧。一次 run 只能发一次。

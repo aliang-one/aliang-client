@@ -477,6 +477,9 @@ func normalizeAgentAIProvider(raw string) (string, error) {
 	switch provider {
 	case "auto", "codex", "claude", "claudecode":
 		return provider, nil
+	case "agentcore", "agent-core", "agent_core":
+		// 内置内核：不依赖任何外部 CLI，恒可用。
+		return "agentcore", nil
 	case "claude-code", "claude_code":
 		return "claudecode", nil
 	case "opencode", "open-code", "open_code":

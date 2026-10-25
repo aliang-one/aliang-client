@@ -152,6 +152,11 @@ type RunResult struct {
 	StopReason string
 	// Usage 是累计 token 用量。
 	Usage Usage
+	// IsError 表示终止帧已经以 is_error=true 发过。
+	//
+	// 宿主据此决定收尾：为 true 时流式管道已把 ai.error 发出去了，宿主只需
+	// 收敛状态，不能再补一条错误；为 false 才轮到宿主自己判「是不是被取消」。
+	IsError bool
 }
 
 // runner 持有一次 run 的可变状态。
@@ -181,7 +186,7 @@ func (r *runner) loop(ctx context.Context) (*RunResult, error) {
 	for turn := 0; turn < maxIterations; turn++ {
 		// 进程内内核没有子进程可杀，取消只能靠自己轮询。
 		if err := ctx.Err(); err != nil {
-			return r.finish(ctx, ResultSubtypeErrorRun, "运行被取消", true, err)
+			return r.finishWithErr(ctx, "", err)
 		}
 
 		r.turns = turn + 1
@@ -202,7 +207,9 @@ func (r *runner) loop(ctx context.Context) (*RunResult, error) {
 
 		assistantBlocks, stopReason, err := r.streamTurn(ctx, req, writer)
 		if err != nil {
-			return r.finish(ctx, ResultSubtypeErrorRun, err.Error(), true, err)
+			// 流式失败同样可能是取消导致的（SSE 读循环被 ctx 打断），
+			// 交给 finishWithErr 分辨。
+			return r.finishWithErr(ctx, "", err)
 		}
 		r.stopLast = stopReason
 
@@ -497,12 +504,37 @@ func (r *runner) fireFinishTurn(stopReason string) {
 	})
 }
 
+// finishWithErr 按 ctx 状态选终止语义：被取消 → interrupted（非错误），
+// 其余 → error_during_execution（错误）。
+//
+// 两者必须分开：claudeResultError（宿主 agent_ai.go:6399）只把 is_error 或
+// error_* 子类型转成 ai.error。用户在手机上点「停止」时 ctx 被取消，若走错误
+// 分支，手机会收到一条红色错误气泡——而正确表现是安静收敛到 stopped。
+func (r *runner) finishWithErr(ctx context.Context, prefix string, runErr error) (*RunResult, error) {
+	if ctx.Err() != nil {
+		return r.finish(ctx, ResultSubtypeInterrupted, "", false, runErr)
+	}
+	msg := strings.TrimSpace(prefix)
+	if msg == "" && runErr != nil {
+		msg = runErr.Error()
+	}
+	return r.finish(ctx, ResultSubtypeErrorRun, msg, true, runErr)
+}
+
 // finish 发终止帧并返回结果。
 //
 // 一次 run 只能发一次 result 帧 —— 重复会让手机出现重复气泡或状态错乱。
+//
+// result 帧的 result 字段只放**最后一个回合**的文本，不是整轮累计。宿主
+// streamStructuredAIDelta 的收尾去重（agent_ai.go suffixNotStreamed）把
+// result 当「最后一条 assistant 消息的文本」，拿去和已流式发出的 delta 比对
+// 后缀。若这里给整轮累计，多回合 run 的 result 会以第 1 回合文本开头，
+// 与只含末回合的已流式文本比对必然分叉，宿主遂判定「整段没发过」并重发
+// 全文 —— 手机上表现为整轮回复再刷一遍、落库消息双份。与 fireFinishTurn
+// 的「只传本回合」是同一个理由。
 func (r *runner) finish(_ context.Context, subtype, errText string, isError bool, runErr error) (*RunResult, error) {
 	if r.writer != nil {
-		text := r.textAll.String()
+		text := r.turnText.String()
 		if isError && errText != "" {
 			if text != "" {
 				text += "\n\n"
@@ -518,6 +550,7 @@ func (r *runner) finish(_ context.Context, subtype, errText string, isError bool
 		ToolCalls:  r.toolCalls,
 		StopReason: r.stopLast,
 		Usage:      r.usage,
+		IsError:    isError,
 	}
 	return res, runErr
 }

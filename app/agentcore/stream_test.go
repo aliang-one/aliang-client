@@ -409,6 +409,64 @@ func TestRunToolLoopFrameSequence(t *testing.T) {
 	}
 }
 
+// TestRunMultiTurnResultCarriesLastTurnOnly 锁死 result 帧只带**末回合**文本。
+//
+// 宿主 streamStructuredAIDelta 的收尾去重（agent_ai.go suffixNotStreamed）
+// 把 result 当「最后一条 assistant 消息的文本」，与已流式发出的 delta 做
+// 后缀比对。若 result 给整轮累计，多回合 run 会以第 1 回合文本开头，与
+// 只含末回合的已流式文本必然分叉，宿主遂判定「整段没发过」并重发全文 ——
+// 手机上表现为整轮回复再刷一遍、落库消息双份。
+//
+// 这个用例的两个回合**都产出文本**，才能暴露差异：只让第 1 回合调工具
+// 不说话时，整轮累计恰好等于末回合，测不出问题。
+func TestRunMultiTurnResultCarriesLastTurnOnly(t *testing.T) {
+	turn1 := `{"type":"message_start","message":{"id":"msg_a","model":"claude-x"}}` + "\n\n" +
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}` + "\n\n" +
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"我先看一下"}}` + "\n\n" +
+		`data: {"type":"content_block_stop","index":0}` + "\n\n" +
+		`data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_m","name":"Stub"}}` + "\n\n" +
+		`data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"x\":\"hi\"}"}}` + "\n\n" +
+		`data: {"type":"content_block_stop","index":1}` + "\n\n" +
+		`data: {"type":"message_delta","delta":{"stop_reason":"tool_use"}}`
+	turn2 := `{"type":"message_start","message":{"id":"msg_b","model":"claude-x"}}` + "\n\n" +
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}` + "\n\n" +
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"改好了"}}` + "\n\n" +
+		`data: {"type":"content_block_stop","index":0}` + "\n\n" +
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}`
+
+	srv := sseServer(t, (&turnScript{turns: []string{turn1, turn2}}).handler(t))
+
+	registry := NewRegistry()
+	registry.Register(&stubTool{name: "Stub", result: ToolResult{Content: "ok"}})
+
+	rec := &frameRecorder{}
+	cfg := &Config{
+		Client:    NewClient(srv.URL),
+		Model:     "claude-x",
+		Tools:     registry,
+		Emit:      rec.emit,
+		SessionID: "sess-multi",
+	}
+	res, err := Run(context.Background(), cfg, []Message{TextMessage("user", "干活")})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// 整轮累计：两回合文本都在。
+	if res.Text != "我先看一下改好了" {
+		t.Errorf("RunResult.Text = %q, want 我先看一下改好了（整轮累计）", res.Text)
+	}
+
+	// result 帧：只带末回合。给整轮会让宿主 suffixNotStreamed 判分叉并重发全文。
+	res1 := resultFrame(t, rec.frames(t))
+	if txt, _ := res1["result"].(string); txt != "改好了" {
+		t.Errorf("result.result = %q, want 改好了（只含末回合，不含第 1 回合）", txt)
+	}
+	if n, _ := res1["num_turns"].(float64); int(n) != 2 {
+		t.Errorf("result.num_turns = %v, want 2", res1["num_turns"])
+	}
+}
+
 // ---------------------------------------------------------------------------
 // 截断守卫
 // ---------------------------------------------------------------------------
@@ -624,6 +682,10 @@ func TestRunMalformedToolInputNotExecuted(t *testing.T) {
 func TestRunContextCancelledBeforeStart(t *testing.T) {
 	// 进程内内核没有子进程可杀，取消只能靠自己轮询。取消后必须仍然发出
 	// result 帧，否则手机会永远停在「进行中」。
+	//
+	// 终止语义是 interrupted 而不是 error_during_execution：用户在手机上点
+	// 「停止」不是故障，宿主的 claudeResultError 只把 is_error / error_* 转成
+	// ai.error，走错误分支会让正常停止变成一条红色错误气泡。
 	rec := &frameRecorder{}
 	cfg := &Config{
 		Client:    NewClient("http://127.0.0.1:1"), // 不会被访问
@@ -634,18 +696,24 @@ func TestRunContextCancelledBeforeStart(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	_, err := Run(ctx, cfg, []Message{TextMessage("user", "x")})
+	res, err := Run(ctx, cfg, []Message{TextMessage("user", "x")})
 	if err == nil {
 		t.Fatal("取消后 Run 应返回错误")
+	}
+	if res == nil {
+		t.Fatal("取消后 Run 仍应返回结果，宿主据此收敛状态")
+	}
+	if res.IsError {
+		t.Error("取消不应被标记为 IsError —— 否则宿主会再补一条 ai.error")
 	}
 
 	frames := rec.frames(t)
 	rf := resultFrame(t, frames)
-	if sub, _ := rf["subtype"].(string); sub != ResultSubtypeErrorRun {
-		t.Errorf("result.subtype = %q, want %s", sub, ResultSubtypeErrorRun)
+	if sub, _ := rf["subtype"].(string); sub != ResultSubtypeInterrupted {
+		t.Errorf("result.subtype = %q, want %s", sub, ResultSubtypeInterrupted)
 	}
-	if isErr, _ := rf["is_error"].(bool); !isErr {
-		t.Error("取消时 is_error 必须为 true")
+	if isErr, _ := rf["is_error"].(bool); isErr {
+		t.Error("取消时 is_error 必须为 false —— 用户停止不是错误")
 	}
 	assertSessionIDOnEveryFrame(t, frames, "sess-cancel")
 }
