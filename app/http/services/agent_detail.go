@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -448,8 +450,32 @@ func agentFileReadPayload(msg map[string]interface{}) map[string]interface{} {
 // resolveAgentProjectPath resolves the project/base directory for a request.
 // Operator policy: authorized-directory confinement REMOVED — only validates the
 // path is a real directory.
+//
+// 目录不存在时错误必须带手机端已识别的语义码 project_path_missing（手机
+// humanizeFileError 按码匹配渲染「路径不存在」错误卡）：会话历史扫描出的
+// 幽灵项目（目录已被移动/删除）打开时，裸 os.Stat 文案只会落到通用错误卡。
 func resolveAgentProjectPath(raw string) (string, error) {
-	return cleanExistingAgentDirectory(raw)
+	resolved, err := cleanExistingAgentDirectory(raw)
+	if err == nil {
+		return resolved, nil
+	}
+	if errors.Is(err, fs.ErrNotExist) {
+		return "", fmt.Errorf("project_path_missing: %s", agentPathDisplayForError(raw))
+	}
+	return "", err
+}
+
+// agentPathDisplayForError 尽力还原请求路径的绝对形态用于错误提示；
+// 展开/取绝对路径失败时退回原始输入，不影响错误主流程。
+func agentPathDisplayForError(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if expanded, err := cache.ExpandHomePath(trimmed); err == nil {
+		trimmed = expanded
+	}
+	if abs, err := filepath.Abs(trimmed); err == nil {
+		return filepath.ToSlash(abs)
+	}
+	return filepath.ToSlash(trimmed)
 }
 
 func resolveAgentProjectContentPath(projectPath string, raw string) (string, error) {
