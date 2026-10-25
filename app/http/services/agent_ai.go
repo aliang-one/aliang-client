@@ -277,6 +277,10 @@ type agentAISession struct {
 	// claudeSteer 是 Claude headless（--input-format stream-json）run 的
 	// steer 通道；与 codexSteer 二选一，同一条 run 上不会同时存在。
 	claudeSteer *agentAIClaudeSteerControl
+	// coreSteer 是内置内核（provider=="agentcore"）run 的 steer 通道。内核
+	// 没有 stdin 可写，插话只能排队、由下一轮 LLM 调用前取走，所以它与
+	// claudeSteer 的 deliver 语义不同（永远 queued，drain 时才 applied）。
+	coreSteer *agentAICoreSteerControl
 	// tuiTurn 是当前 TUI 注入回合的路由计划（UDS socket / transcript 路径 /
 	// 权限类）。TUI 回合没有 stdin 可写（claudeSteer 恒 nil），UDS 注入是唯一
 	// 插话通道——CC 把回合中收到的注入按「排队消息」处理，当前回合结束后自动
@@ -2097,9 +2101,10 @@ func (m *agentAIManager) steer(msg map[string]interface{}, writeJSON agentTermin
 	}
 	control := session.codexSteer
 	claudeControl := session.claudeSteer
-	if control == nil && claudeControl == nil {
+	coreControl := session.coreSteer
+	if control == nil && claudeControl == nil && coreControl == nil {
 		m.mu.Unlock()
-		emitAgentAISteerAck(writeJSON, sessionID, messageID, "unsupported", "ai.steer is only supported by active Codex app-server or Claude stream-json runs", "unsupported_provider")
+		emitAgentAISteerAck(writeJSON, sessionID, messageID, "unsupported", "ai.steer is only supported by active Codex app-server, Claude stream-json or Aliang Agent runs", "unsupported_provider")
 		return
 	}
 	projectPath := session.projectPath
@@ -2143,10 +2148,13 @@ func (m *agentAIManager) steer(msg map[string]interface{}, writeJSON agentTermin
 	m.mu.Unlock()
 
 	var result string
-	if control != nil {
+	switch {
+	case control != nil:
 		result, err = control.enqueue(steer)
-	} else {
+	case claudeControl != nil:
 		result, err = claudeControl.deliver(steer)
+	default:
+		result, err = coreControl.deliver(steer)
 	}
 	if err != nil {
 		code := "send_failed"
@@ -3570,15 +3578,18 @@ func (m *agentAIManager) clearRunning(sessionID string, runSeq int, writeJSON ag
 	session := m.sessions[sessionID]
 	var steerControl *agentAICodexSteerControl
 	var claudeSteerControl *agentAIClaudeSteerControl
+	var coreSteerControl *agentAICoreSteerControl
 	if session != nil && session.runSeq == runSeq {
 		steerControl = session.codexSteer
 		claudeSteerControl = session.claudeSteer
+		coreSteerControl = session.coreSteer
 		session.cancel = nil
 		session.activeWriter = nil
 		session.approvalToken = ""
 		session.activity = nil
 		session.codexSteer = nil
 		session.claudeSteer = nil
+		session.coreSteer = nil
 		session.activeRunID = ""
 		session.goalIdentity = nil
 		session.history = trimAgentAIHistory(session.history)
@@ -3590,6 +3601,9 @@ func (m *agentAIManager) clearRunning(sessionID string, runSeq int, writeJSON ag
 	}
 	if claudeSteerControl != nil {
 		claudeSteerControl.close("not_running", "claude turn ended before steer was applied", "turn_ended")
+	}
+	if coreSteerControl != nil {
+		coreSteerControl.close("not_running", "agentcore turn ended before steer was applied", "turn_ended")
 	}
 	m.emitApprovalCancelled(writeJSON, sessionID, cancelled, "run_ended")
 }
@@ -3712,6 +3726,20 @@ func (m *agentAIManager) runCLI(ctx context.Context, run agentAIRun, writeJSON a
 		return
 	}
 
+	// 内置内核：进程内跑 agent loop，不 spawn 任何外部 CLI，因此没有
+	// resume-missing / effort-rejected 这两类自愈重试——内核自己就是权威，
+	// 会话 id 由我们自己发。
+	//
+	// fallback 命中时把 run.provider 改写为 "agentcore"：auto 只是「由你决定」
+	// 的解析指令，不是真实 provider。CLI 路径也是这么做的——confirmBinding 落
+	// 的是 tool.id（解析结果）而不是 "auto"，否则绑定记录的 provider 会和实际
+	// 跑的 provider 对不上，providersEquivalent 一比对就分叉。
+	if agentAIUseAgentCore(run.provider) || agentAIUseAgentCoreFallback(run) {
+		run.provider = "agentcore"
+		m.runAgentCore(ctx, run, writeJSON)
+		return
+	}
+
 	// Try to resume the prior CLI session when one is referenced. If that
 	// session does not exist locally (an imported/foreign session, or one filed
 	// under a different project path than this run's cwd), retry fresh so the
@@ -3770,6 +3798,69 @@ func (m *agentAIManager) retryAfterEffortRejected(ctx context.Context, run agent
 func agentAIUseCodexAppServer(provider string) bool {
 	provider = strings.ToLower(strings.TrimSpace(provider))
 	return (provider == "codex" || provider == "auto") && codexAppServerAvailable()
+}
+
+// agentAIUseAgentCore 判断这一轮是否走内置内核。
+//
+// 只认显式的 "agentcore"，**不匹配 "auto"** —— 与 agentAIUseCodexAppServer 的
+// 判断刻意不同：codex 是「装了就用」，内置内核一旦纳入 auto 就会顶掉用户装了
+// 的 claude/codex，那是行为倒退。用户明确选了自有入口才走这里。
+func agentAIUseAgentCore(provider string) bool {
+	return strings.ToLower(strings.TrimSpace(provider)) == "agentcore"
+}
+
+// agentAIUseAgentCoreFallback 是 auto 的兜底：一个外部 CLI 都没有时走内置内核。
+//
+// 为什么需要它：产品的核心承诺是「装好 alianggate 就能用 AI」。auto 的候选集
+// 只有 codex/claude/claudecode，三者都不在 PATH 时 resolveAgentAITool 直接报
+// "no approval-capable AI CLI found in PATH"，用户什么都没得用——这条兜底正是
+// 那个承诺的落点。
+//
+// 为什么不放进 resolveAgentAITool 的候选集：那里返回的是 *agentAITool（外部
+// 进程句柄：path/args/outputFormat），内核根本不消费它。让 runCLI 在解析之前
+// 分流，比伪造一个假 tool 干净。
+//
+// 三条刻意排除：
+//   - 只认 "auto"：显式选了 claude/codex 就照旧报错，不静默换 provider。
+//   - goal 相关 run（readOnly / goalIdentity）不走：内核首期不注入 goal 的
+//     ALIANG_GOAL_REPORT 强制段（withGoalTaskReportSystemPrompt 只能改
+//     agentAITool），跑起来会让 goal 永远拿不到报告行。这类 run 继续用 CLI。
+//   - codex app-server 可用时不会走到这里（runCLI 里那个分支在前）。
+func agentAIUseAgentCoreFallback(run agentAIRun) bool {
+	if strings.ToLower(strings.TrimSpace(run.provider)) != "auto" {
+		return false
+	}
+	if run.readOnly || len(run.goalIdentity) > 0 {
+		return false
+	}
+	return !agentAIExternalCLIAvailable()
+}
+
+// agentAIExternalCLIProbe 报告 auto 的候选集里是否有可用的外部 CLI。
+//
+// var 是单测注入点：hermetic，不依赖测试机上真的装没装 claude/codex（与
+// platformProviderEnvProbe 同一手法）。
+//
+// 口径必须与 resolveAgentAITool 的 auto 分支一致：codex 需 app-server 才算
+// 可用；claudecode 在 resolveNamedAgentAITool 里会回退去找 claude，所以任一
+// 命中即算。
+var agentAIExternalCLIProbe = func() bool {
+	if codexAppServerAvailable() {
+		return true
+	}
+	if _, err := lookPathCLI("claude"); err == nil {
+		return true
+	}
+	if _, err := lookPathCLI("claudecode"); err == nil {
+		return true
+	}
+	return false
+}
+
+// agentAIExternalCLIAvailable 是 probe 的读取入口，保留函数形状便于将来
+// 加缓存而不改调用方。
+func agentAIExternalCLIAvailable() bool {
+	return agentAIExternalCLIProbe()
 }
 
 var codexAppServerProbeCache sync.Map
@@ -8086,6 +8177,10 @@ func agentAICapabilitiesForTools(hasClaude, hasClaudeCode, hasCodexAppServer, ha
 	if hasOpenCode {
 		caps = append(caps, "ai_provider_opencode_basic")
 	}
+	// 内置内核恒可用：它跑在本进程里，不依赖任何外部 CLI，也没有版本探测
+	// 可言。所以不设 has* 参数——加一个恒为 true 的形参只会让 7 个调用点
+	// 白改一遍。
+	caps = append(caps, "ai_provider_agentcore")
 	return caps
 }
 

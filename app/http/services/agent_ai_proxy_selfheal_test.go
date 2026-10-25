@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -98,11 +99,13 @@ func TestEnsureAIUpstreamReachableToleratesUnparsableAndEmpty(t *testing.T) {
 
 func TestStartProxyWhenSessionReady(t *testing.T) {
 	t.Run("认证就绪即拉起且只拉一次", func(t *testing.T) {
-		ready := false
+		// ready 被后台 goroutine 写、被轮询闭包读，必须原子化：普通 bool 会让
+		// `go test -race` 稳定报 DATA RACE（本用例自 2026-10 起就这样，与业务无关）。
+		var ready atomic.Bool
 		starts := 0
 		ctx, cancel := context.WithCancel(context.Background())
-		go func() { time.Sleep(20 * time.Millisecond); ready = true }()
-		StartProxyWhenSessionReady(ctx, time.Millisecond, func() bool { return ready }, func() { starts++ })
+		go func() { time.Sleep(20 * time.Millisecond); ready.Store(true) }()
+		StartProxyWhenSessionReady(ctx, time.Millisecond, func() bool { return ready.Load() }, func() { starts++ })
 		cancel()
 		if starts != 1 {
 			t.Errorf("应恰好拉起一次, got %d", starts)

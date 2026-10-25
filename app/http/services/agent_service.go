@@ -1529,6 +1529,19 @@ func detectAgentToolsWith(lookPath func(string) (string, error)) []models.AgentT
 			defs[i].MCPServers = mcp
 		}
 	}
+	// 内置内核：跑在本进程里，不依赖任何外部 CLI，所以恒可用。必须放在
+	// lookPath 循环之后——放进去会因找不到二进制而 Available=false；也不能进
+	// 版本/effort 探测循环，probeCLIVersion("") 会白跑一次。
+	//
+	// Efforts 留空：内核首期不传达 effort（模型名后缀是 codex 专用约定，网关
+	// 不解析带后缀的 claude 模型名；--effort 是 claude CLI 的 argv，进程内内核
+	// 没有）。上报一份用不上的档位只会让手机上的 effort 选择器骗人。
+	defs = append(defs, models.AgentTool{
+		ID:          "agentcore",
+		Name:        "Aliang Agent",
+		Description: "内置 AI Agent（无需安装外部 CLI）",
+		Available:   true,
+	})
 	return defs
 }
 
