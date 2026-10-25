@@ -16,8 +16,17 @@ import (
 
 // 客户端对 /v1/messages 的一次流式调用。
 //
-// 不发 Authorization：56432 平台代理在 relay 层注入 Authorization-Inner。这与
-// claude-code / pi 走同一条路径，凭据永远不经过本进程。
+// 两条头都要，各管各的：
+//   - Authorization-Inner 由 56432 relay 注入，用来标识「哪个用户/设备」；
+//   - Authorization 由调用方通过 WithAPIKey 显式带上，是用户自己的 API key，
+//     网关据此走 user-api-key 通道，不做分组门禁。
+//
+// 第二点是实测结论：网关的 key 解析（group_api_key_resolver.ResolveAPIKeyForRequest）
+// 先看请求自带的 candidate key，命中用户的 key 就直接用；没有 candidate 才落到
+// anthropic-duration 分组的兜底 key——不在该组的新账号会收到
+// `group "anthropic-duration" not available for platform "anthropic"`。
+// CLI provider 一直自带 key（quick-setup 把 ANTHROPIC_AUTH_TOKEN 写成用户自己的
+// {{api_key}}），所以从不出这个问题。
 
 const (
 	// anthropicVersion 是 Messages API 的版本头。上游要求必填。
@@ -48,9 +57,9 @@ const (
 type Client struct {
 	baseURL string
 	http    *http.Client
-	// apiKey 仅用于自配远端端点（非 56432 代理）的直连场景。走平台代理时
-	// 必须留空——代理会注入自己的凭据，多带一个 Authorization 反而会让
-	// 上游拒绝。
+	// apiKey 是用户自己的平台 API key（sk-...）。走 56432 平台代理时同样要带：
+	// 网关用它识别「用哪把 key」，不带就会落到分组兜底、对非该组的账号 403。
+	// 留空只在没有可用 key 时发生——此时行为退回到「由代理决定用哪把」。
 	apiKey string
 }
 
@@ -71,7 +80,9 @@ func NewClient(baseURL string) *Client {
 	}
 }
 
-// WithAPIKey 给自配远端端点用。走平台代理时不要调用。
+// WithAPIKey 设置用户自己的平台 API key。走 56432 平台代理时也要调用——
+// 网关靠这个 candidate key 走 user-api-key 通道，不做分组门禁。
+// 传空串等于不带，行为退回「由代理按分组兜底决定用哪把 key」。
 func (c *Client) WithAPIKey(key string) *Client {
 	c.apiKey = strings.TrimSpace(key)
 	return c

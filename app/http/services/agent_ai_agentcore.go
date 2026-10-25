@@ -22,6 +22,7 @@ import (
 	"aliang.one/nursorgate/app/agentcore"
 	"aliang.one/nursorgate/app/http/models"
 	"aliang.one/nursorgate/common/logger"
+	auth "aliang.one/nursorgate/processor/auth"
 	"aliang.one/nursorgate/processor/config"
 )
 
@@ -82,23 +83,124 @@ func agentCoreEnvOrSettings(key string) string {
 	return agentCoreSettingsEnv(key)
 }
 
+// agentCoreGetUserAPIKeysFn 是取用户 API key 列表的入口（测试可替换）。
+var agentCoreGetUserAPIKeysFn = auth.GetUserAPIKeys
+
+// 内核 key 缓存。user-center 是网络调用（分页拉全量），不能每轮 run 都打。
+// 成功缓存 30 分钟；失败只缓存 1 分钟——既不让一次网络抖动把用户钉在无 key
+// 状态半小时，也不让每轮 run 都去重打。
+var (
+	agentCoreTokenMu     sync.Mutex
+	agentCoreTokenCache  string
+	agentCoreTokenExpiry time.Time
+)
+
+const (
+	agentCoreTokenCacheTTL     = 30 * time.Minute
+	agentCoreTokenFailCacheTTL = time.Minute
+)
+
+// agentCoreAuthToken 解析内核出网要带的用户 API key。
+//
+// 为什么必须带：网关 /v1/messages 的 key 解析有两条路——请求自带用户的 key 就
+// 直接用它（source=user-api-key，不做分组门禁）；不带才落到 anthropic-duration
+// 分组的兜底 key。实测新账号（allowed_groups 只有 default）在兜底路径上必得
+//
+//	group "anthropic-duration" not available for platform "anthropic"
+//
+// 而 CLI provider 因为 quick-setup 把 ANTHROPIC_AUTH_TOKEN 写成了用户自己的
+// {{api_key}}，一直走的是第一条路。内核要与 CLI 同口径，否则「装了客户端就能
+// 直接对话」这个承诺对新用户不成立。
+//
+// 取值顺序：
+//  1. ANTHROPIC_AUTH_TOKEN（子进程 env → ~/.claude/settings.json）——零网络，
+//     与 CLI 用的是同一个值，quick-setup 用户恒命中；
+//  2. user-center 的 key 列表（带缓存）——没跑过 quick-setup 的新装用户兜底。
+//
+// 两条都拿不到就返回空串：内核照旧出网，行为退回「由代理按分组兜底」，不因为
+// 拿不到 key 就把这一轮判死。
+func agentCoreAuthToken() string {
+	if v := agentCoreEnvOrSettings("ANTHROPIC_AUTH_TOKEN"); v != "" {
+		return v
+	}
+	return agentCoreCachedUserAPIKey()
+}
+
+func agentCoreCachedUserAPIKey() string {
+	agentCoreTokenMu.Lock()
+	defer agentCoreTokenMu.Unlock()
+	if time.Now().Before(agentCoreTokenExpiry) {
+		return agentCoreTokenCache
+	}
+
+	key, err := agentCoreFetchUserAPIKey()
+	ttl := agentCoreTokenCacheTTL
+	if err != nil {
+		logger.Warn(fmt.Sprintf("agentcore: 取用户 API key 失败，本轮不带凭据: %v", err))
+	}
+	if err != nil || key == "" {
+		// 没有可用 key 与失败同价：都用短 TTL，等环境变化后尽快重试。
+		ttl = agentCoreTokenFailCacheTTL
+	}
+	agentCoreTokenCache = key
+	agentCoreTokenExpiry = time.Now().Add(ttl)
+	return key
+}
+
+// agentCoreFetchUserAPIKey 从 user-center 的 key 列表里挑一把能用的。
+//
+// 优先 anthropic 平台的 key：命中 candidate 之后网关会拿这把 key 去请求上游，
+// 平台不对的 key 在上游那一步仍然会失败。没有 anthropic key 才退回任意可用
+// key——总比不带强（不带是必然的分组门禁）。一把都没有返回空串。
+func agentCoreFetchUserAPIKey() (string, error) {
+	keys, err := agentCoreGetUserAPIKeysFn()
+	if err != nil {
+		return "", err
+	}
+	fallback := ""
+	for _, k := range keys {
+		if !k.SecretAvailable || strings.EqualFold(strings.TrimSpace(k.Status), "inactive") {
+			continue
+		}
+		key := strings.TrimSpace(k.Key)
+		if key == "" {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(k.Provider), "anthropic") {
+			return key, nil
+		}
+		if fallback == "" {
+			fallback = key
+		}
+	}
+	return fallback, nil
+}
+
+// agentCoreResetTokenCache 仅供测试：清掉进程内缓存。
+func agentCoreResetTokenCache() {
+	agentCoreTokenMu.Lock()
+	agentCoreTokenCache = ""
+	agentCoreTokenExpiry = time.Time{}
+	agentCoreTokenMu.Unlock()
+}
+
 // agentCoreBaseURL 解析出网地址。
 //
-// **与 CLI provider 的口径不同**：CLI 子进程拿得到 ANTHROPIC_AUTH_TOKEN，可以
-// 直连 https://api.aliang.one；内核刻意零凭据（不发 Authorization），直连这种
-// 端点必然 401。所以这里只接受**回环**地址——回环:56432 会被
-// shouldForceAliangRoute 强制走 aliang 隧道，由 relay 层注入 Authorization-Inner。
+// 与 CLI provider 同口径：都走**回环**:56432，由 shouldForceAliangRoute 强制
+// 路由到 aliang 隧道，relay 层注入 Authorization-Inner（标识用户/设备）。用户
+// 自己的 API key 另由 agentCoreAuthToken 作为 Authorization 显式带上，两者不是
+// 一回事（见 agentCoreAuthToken 注释）。
 //
 // 用户把 ANTHROPIC_BASE_URL 配成远端直连地址时（本机 settings.json 就是
-// https://api.aliang.one），照抄会让内核一上来就 401。宁可退回 56432 走隧道，
-// 也不要让「装了客户端却连不上」这种最难自查的失败发生。
+// https://api.aliang.one），不照抄：那条路要完整的 mTLS 客户端凭据，内核没有。
+// 宁可退回 56432 走隧道，也不要让「装了客户端却连不上」这种最难自查的失败发生。
 func agentCoreBaseURL() string {
 	if v := agentCoreEnvOrSettings("ANTHROPIC_BASE_URL"); v != "" {
 		if agentCoreIsLoopbackBase(v) {
 			return v
 		}
 		logger.Warn(fmt.Sprintf(
-			"agentcore: ANTHROPIC_BASE_URL=%s 非回环地址，内核无凭据无法直连，改用 %s 走平台代理",
+			"agentcore: ANTHROPIC_BASE_URL=%s 非回环地址，内核改走 %s 平台代理",
 			v, agentCoreDefaultBaseURL))
 	}
 	return agentCoreDefaultBaseURL
@@ -530,7 +632,11 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 	m.attachCoreSteer(run.sessionID, run.runSeq, coreSteer)
 
 	cfg := &agentcore.Config{
-		Client:    agentcore.NewClient(agentCoreBaseURL()),
+		// 带上用户自己的 API key：网关靠它走 user-api-key 通道，不做分组门禁。
+		// 不带的话，不在 anthropic-duration 组里的账号会被 403 挡下（见
+		// agentCoreAuthToken 注释）。拿不到 key 时 WithAPIKey("") 等价于不带，
+		// 行为退回「由代理按分组兜底」。
+		Client:    agentcore.NewClient(agentCoreBaseURL()).WithAPIKey(agentCoreAuthToken()),
 		Model:     agentCoreModel(run),
 		System:    agentCoreSystemPrompt(),
 		Tools:     agentcore.DefaultRegistry(),
