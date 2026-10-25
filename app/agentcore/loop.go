@@ -26,6 +26,14 @@ import (
 // 的死循环，那会把 token 烧穿。
 const maxIterations = 50
 
+// maxTruncationRetries 是**连续**被 max_tokens 截断后允许重试的次数。
+//
+// 为什么不是一截断就终止：截断只说明「这一次的工具参数不完整」，不说明任务
+// 做不了。把失败回填进历史后继续循环，模型看到「请拆小后重试」就会分块写，
+// 这是 pi 的行为，也是唯一能自愈的路。但如果连续几轮还在截断，说明它在原地
+// 打转（或模型输出上限本就小于它的意图），再试只是烧 token，此时才终止。
+const maxTruncationRetries = 2
+
 // LoopHooks 是主循环的外部钩子。所有字段都可以为 nil。
 type LoopHooks struct {
 	// GetSteeringMessages 在**每次** LLM 调用前调用，返回用户在运行中插的话。
@@ -172,6 +180,10 @@ type runner struct {
 	toolCalls []ToolCallRecord
 	usage     Usage
 	stopLast  string
+
+	// truncStreak 是连续被 max_tokens 截断的轮数。只要有一轮没截断就清零——
+	// 要防的是「原地打转」，不是累计次数。
+	truncStreak int
 }
 
 // loop 是主循环本体。
@@ -226,10 +238,15 @@ func (r *runner) loop(ctx context.Context) (*RunResult, error) {
 		// 截断守卫：stop_reason == max_tokens 时，这批 tool_use 的参数是
 		// 不完整的（JSON 可能只写了一半），执行会写坏文件。pi 的做法是整批
 		// 失败、一个都不执行。必须照做。
+		//
+		// 但「这批不执行」不等于「这一轮 run 结束」：把失败回填进历史后继续
+		// 循环，模型看到「请拆小后重试」就会分块写。一截断就终止的话，回填的
+		// 那句恢复提示永远没人读——它就成了死代码，用户只拿到一句「被截断」。
+		// 连续 maxTruncationRetries 次仍在截断才终止，避免原地打转烧 token。
 		if stopReason == StopReasonMaxTokens {
 			results := failTruncatedToolUses(toolUses)
 			if writer != nil {
-				// 失败帧写不出去也不影响终止收敛，别把 run 拖成悬空。
+				// 失败帧写不出去也不影响后续收敛，别把 run 拖成悬空。
 				_ = writer.ToolResults(results)
 			}
 			r.history = append(r.history, BlocksMessage("user", results))
@@ -239,10 +256,15 @@ func (r *runner) loop(ctx context.Context) (*RunResult, error) {
 					Result: ErrorResult("上一条回复被 max_tokens 截断，工具参数不完整，未执行"),
 				})
 			}
-			r.fireFinishTurn(stopReason)
-			return r.finish(ctx, ResultSubtypeErrorMaxTurns,
-				"模型输出被 max_tokens 截断，工具调用未执行", true, nil)
+			r.truncStreak++
+			if r.truncStreak > maxTruncationRetries {
+				r.fireFinishTurn(stopReason)
+				return r.finish(ctx, ResultSubtypeErrorMaxTurns,
+					fmt.Sprintf("模型连续 %d 次输出被 max_tokens 截断，工具调用未执行", r.truncStreak), true, nil)
+			}
+			continue
 		}
+		r.truncStreak = 0
 
 		// 执行工具。
 		results := r.executeTools(ctx, toolUses, writer)
