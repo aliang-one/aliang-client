@@ -17,6 +17,7 @@ const (
 	AgentEventDeviceUnbound           = "device.unbound"
 	AgentEventDeviceSettings          = "device.settings.updated"
 	AgentEventProjectSettings         = "project.settings.updated"
+	AgentEventInventoryRefresh        = "agent.inventory.refresh"
 	AgentEventTunnelConfigure         = "tunnel.configure"
 	AgentEventTunnelConfigured        = "tunnel.configured"
 	AgentEventTunnelStatus            = "tunnel.status"
