@@ -675,6 +675,10 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 		s.ai.emitApprovalSync(writeJSON)
 		// 用量桶补推：重连后把未确认桶（dirty 集）补齐（服务端 upsert 幂等）。
 		usageFlushDirtyNow(writeJSON)
+		// 互传收件兜底：重连后拉一次 inbox（离线补投的主通道），顺带确保
+		// 小时级定时器在跑；首次触发时清一遍陈旧 .partial（7 天对齐服务端）。
+		s.kickAgentTransferInbox()
+		sweepAgentTransferPartials()
 	case models.AgentEventHeartbeatAck:
 		s.setRemoteConnectionState(true, "online", "")
 		// Retry durable terminals while the socket remains healthy. A prior
@@ -732,6 +736,22 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 		// must still be able to wind the transfer down.
 		s.setRemoteConnectionState(true, "online", "")
 		handleAgentFileUploadCancel(msg)
+	case models.AgentEventTransferUpload:
+		// 设备间互传·发送：独立并发槽在 handler 内部（不动 file.upload 单飞）；
+		// safeGo 保持 read loop 畅通，长传输绝不能堵在消息循环上，panic 也不许
+		// 顺 Go 语义带走全进程（照 agent_detail 旧臂的教训）。
+		s.setRemoteConnectionState(true, "online", "")
+		safeGo("transfer_upload", func() { s.handleAgentTransferUpload(msg, writeJSON) })
+	case models.AgentEventTransferReceive:
+		// 设备间互传·接收：Range 续传 + sha256 校验 + 收件目录围栏，同样离线化处理。
+		s.setRemoteConnectionState(true, "online", "")
+		safeGo("transfer_receive", func() { s.handleAgentTransferReceive(msg, writeJSON) })
+	case models.AgentEventTransferCancel:
+		// Not behind the enabled-device gate（照 file.upload.cancel 先例）：设备
+		// 中途被禁用仍必须能把在飞传输收尾、清 .partial。按 transfer_id 匹配，
+		// 不匹配为 no-op。
+		s.setRemoteConnectionState(true, "online", "")
+		safeGo("transfer_cancel", func() { s.handleAgentTransferCancel(msg, writeJSON) })
 	// 注意：这四个旧工具事件（file.list/file.read/git.status/env.info）由下面的
 	// 显式臂直派、有意绕过 default 臂的 tools.RunWithGuards 护栏（无超时看门狗/
 	// 输出上限/panic 恢复）——响应形状兼容优先。注册表里它们的 caps（TimeoutMs/
@@ -906,6 +926,8 @@ func remoteAgentMessageRequiresEnabledDevice(msgType string) bool {
 		models.AgentEventFileList,
 		models.AgentEventFileRead,
 		models.AgentEventFileUpload,
+		models.AgentEventTransferUpload,
+		models.AgentEventTransferReceive,
 		"file.working_tree_diff",
 		models.AgentEventSlashCommandsList,
 		models.AgentEventGitStatus,
@@ -1133,6 +1155,7 @@ func agentCapabilities() []string {
 		"goal_report_v1",
 		"goal_verify_v1",
 		"workspace_fingerprint_v1",
+		"file_transfer_v1",
 	)
 	return caps
 }

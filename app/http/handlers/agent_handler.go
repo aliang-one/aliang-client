@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -516,4 +518,69 @@ func (h *AgentHandler) HandleSessionEvent(w http.ResponseWriter, r *http.Request
 	}
 	h.service.ApplySessionEvent(req.To, req.Reason)
 	common.Success(w, map[string]interface{}{"status": "ok"})
+}
+
+// HandleTransferCreate 本地触发设备互传（D13）：仪表盘/脚本 POST 本端点，
+// 本 handler 只做「字段透视 + 转发 PhoneServer POST /api/transfers」。路径
+// 解析、类型校验、能力位门禁（file_transfer_v1）都在服务端与两端 agent，
+// 这里不重复做——重复实现必然漂移。
+// POST /api/agent/transfers {source_path, target_device_id, filename?, is_directory_archive?}
+func (h *AgentHandler) HandleTransferCreate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
+		return
+	}
+	// 本地入口加固（审计 P2）：①强制 loopback——source_path 直读能力等于
+	// agent 进程权限（运营已移除读围栏），默认绑定 127.0.0.1 之外必须再兜
+	// 一层，--host 改绑时也拦得住；②拒绝跨源 Origin——浏览器对跨源 POST
+	// 恒带 Origin，text/plain 免预检的 CSRF 盲触发在此断掉；curl/脚本不带
+	// Origin 不受影响。
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err != nil ||
+		(host != "127.0.0.1" && host != "::1") {
+		common.Error(w, common.CodeForbidden, "Loopback only", nil)
+		return
+	}
+	if origin := r.Header.Get("Origin"); origin != "" {
+		u, err := url.Parse(origin)
+		if err != nil {
+			common.Error(w, common.CodeForbidden, "Invalid origin", nil)
+			return
+		}
+		switch u.Hostname() {
+		case "127.0.0.1", "localhost", "::1":
+			// 本机仪表盘页面，放行
+		default:
+			common.Error(w, common.CodeForbidden, "Cross-origin requests are not allowed", nil)
+			return
+		}
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 64<<10))
+	if err != nil {
+		common.ErrorBadRequest(w, "Invalid request body", nil)
+		return
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		common.ErrorBadRequest(w, "Invalid JSON body", nil)
+		return
+	}
+	// 必填字段本地先拦一道，错误信息比服务端 404/400 更可读。
+	for _, field := range []string{"source_path", "target_device_id"} {
+		if v, _ := payload[field].(string); strings.TrimSpace(v) == "" {
+			common.ErrorBadRequest(w, "Missing required field: "+field, nil)
+			return
+		}
+	}
+	raw, err := h.service.CreateTransferViaServer(payload)
+	if err != nil {
+		writeAgentServiceError(w, "Create transfer failed", err)
+		return
+	}
+	// PhoneServer 成功响应已按 {data:...} 信封解包：原样透传 transfer 对象。
+	var transfer json.RawMessage
+	if err := json.Unmarshal(raw, &transfer); err != nil {
+		common.ErrorInternalServer(w, "Malformed transfer response", map[string]interface{}{"error": err.Error()})
+		return
+	}
+	common.Success(w, map[string]interface{}{"transfer": transfer})
 }
