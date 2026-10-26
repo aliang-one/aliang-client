@@ -92,8 +92,8 @@ func (c *Client) WithAPIKey(key string) *Client {
 //
 // 内核只关心这几类，其余（ping 等）直接丢弃。
 type StreamEvent struct {
-	// Kind: "start" | "text" | "tool_use_start" | "tool_input" | "block_stop"
-	//       | "stop" | "error"
+	// Kind: "start" | "text" | "image" | "tool_use_start" | "tool_input"
+	//       | "block_stop" | "stop" | "error"
 	Kind string
 
 	// start
@@ -102,6 +102,9 @@ type StreamEvent struct {
 
 	// text
 	Text string
+
+	// image
+	Image *ImageSource
 
 	// tool_use_start / tool_input / block_stop
 	Index int
@@ -123,6 +126,7 @@ type StreamEvent struct {
 const (
 	EventStart        = "start"
 	EventText         = "text"
+	EventImage        = "image"
 	EventToolUseStart = "tool_use_start"
 	EventToolInput    = "tool_input"
 	EventBlockStop    = "block_stop"
@@ -447,6 +451,17 @@ func translateEvent(ev *sseEvent) ([]StreamEvent, error) {
 		case BlockTypeText, BlockTypeThinking:
 			// 文本块起始本身不带内容，等 delta。
 			return nil, nil
+		case BlockTypeImage:
+			// 图片块是**完整**的（source 在 start 里一次给全，没有 delta），
+			// 与文本相反：这里就是它唯一的内容来源，丢掉就没了。
+			if ev.ContentBlock.Source == nil {
+				return nil, nil
+			}
+			return []StreamEvent{{
+				Kind:  EventImage,
+				Index: ev.Index,
+				Image: ev.ContentBlock.Source,
+			}}, nil
 		case BlockTypeToolUse:
 			return []StreamEvent{{
 				Kind:  EventToolUseStart,

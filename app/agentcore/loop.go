@@ -362,6 +362,29 @@ func (r *runner) streamTurn(ctx context.Context, req *MessagesRequest, writer *s
 				}
 			}
 
+		case EventImage:
+			ensureIndex(ev.Index)
+			blocks[ev.Index] = ContentBlock{Type: BlockTypeImage, Source: ev.Image}
+			if writer != nil {
+				// 图片块在 start 里一次给全，所以这里既发 start 也发 stop，
+				// 让宿主的块序号与真实 claude-code 帧序一致。不发 delta——
+				// 上游的 image 块本来就没有 delta。
+				started[ev.Index] = true
+				src := map[string]interface{}{"type": ev.Image.Type}
+				if ev.Image.MediaType != "" {
+					src["media_type"] = ev.Image.MediaType
+				}
+				if err := writer.ContentBlockStart(ev.Index, map[string]interface{}{
+					"type":   BlockTypeImage,
+					"source": src,
+				}); err != nil {
+					return err
+				}
+				if err := writer.ContentBlockStop(ev.Index); err != nil {
+					return err
+				}
+			}
+
 		case EventToolUseStart:
 			ensureIndex(ev.Index)
 			blocks[ev.Index] = ContentBlock{
@@ -472,7 +495,7 @@ func (r *runner) executeTools(ctx context.Context, toolUses []ContentBlock, writ
 		results = append(results, ContentBlock{
 			Type:      BlockTypeToolResult,
 			ToolUseID: tu.ID,
-			Content:   result.Content,
+			Content:   result.ContentForModel(),
 			IsError:   result.IsError,
 		})
 	}

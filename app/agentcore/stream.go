@@ -289,6 +289,26 @@ func blockToMap(b ContentBlock) map[string]interface{} {
 	switch b.Type {
 	case BlockTypeText:
 		out["text"] = b.Text
+	case BlockTypeImage:
+		// 图片块没有 delta，source 就是全部内容。assistant 帧里几乎不会出现
+		// （模型不产图），但 blockToMap 是通用映射，漏掉会写出 {"type":"image"}
+		// 这种宿主无法识别的残块。
+		//
+		// 只写该 source 类型有意义的字段：base64 带 data 不带 url，url 反之。
+		// 空字符串照样会被序列化出去，上游对多余字段的容忍度不一致。
+		if b.Source != nil {
+			src := map[string]interface{}{"type": b.Source.Type}
+			if b.Source.MediaType != "" {
+				src["media_type"] = b.Source.MediaType
+			}
+			if b.Source.Data != "" {
+				src["data"] = b.Source.Data
+			}
+			if b.Source.URL != "" {
+				src["url"] = b.Source.URL
+			}
+			out["source"] = src
+		}
 	case BlockTypeToolUse:
 		out["id"] = b.ID
 		out["name"] = b.Name

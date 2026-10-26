@@ -312,6 +312,14 @@ func agentCoreSystemPrompt() string {
 //
 // 快照必须在 m.mu 内完成并校验 runSeq：run 是异步跑的，期间用户可能又发了
 // 新消息（session.history 变了），拿脏历史会让这一轮凭空多出后续对话。
+//
+// 附件分两类落位：
+//   - 图片 → 真正的 image 内容块（与 Claude 走同一条 buildClaudeImageBlocks，
+//     形状完全一致），附在最后一条 user 消息上；
+//   - 文本/其它 → 位置清单 + 内联正文（agentAIAttachmentPromptSuffix）。
+//
+// 图片为什么不能只靠清单里的路径：内核的 read 工具是**文本**工具，模型照着
+// 路径读回来的是「看起来是二进制文件，拒绝读取」。清单对图片等于没给。
 func (m *agentAIManager) agentCoreMessages(run agentAIRun) []agentcore.Message {
 	m.mu.Lock()
 	session := m.sessions[run.sessionID]
@@ -339,9 +347,32 @@ func (m *agentAIManager) agentCoreMessages(run agentAIRun) []agentcore.Message {
 		texts = append(texts, item.Content)
 	}
 
-	// 附件位置清单附在最后一条 user 消息上。首期 includeImages=false：内核
-	// 还没有多模态输入通道，图片只能靠清单里的路径让模型自己去读。
-	if suffix := agentAIAttachmentPromptSuffix(run.attachments, false); suffix != "" {
+	// 图片附件 → image 块。这里的 run.attachments 在 runCLI 里已经下载过
+	// （downloadAgentAIAttachments 设了 Path 并清掉 URL），所以不再下载一次。
+	//
+	// 上限沿用 buildClaudeImageBlocks 的 7.5MiB（而非内核 Read 工具的 5MiB）：
+	// 上游是网关后面的任意 Messages 兼容模型，真实限制本地无法验证。这里选宽
+	// 闸的理由是失败形态——超限会被上游明确拒绝（ai.error 可见），而本地先挡
+	// 会把它降级成「路径清单」，模型还得自己 Read，而 Read 同样有 5MiB 闸，
+	// 等于彻底看不到。宁可让上游判，也不要静默丢掉。
+	//
+	// 编码失败不能把整轮 run 拖死：附件是辅助信息，模型至少该拿到文字。降级
+	// 成清单里的一行路径 + 一句说明，并把原因写进日志（用户看不到这个错误，
+	// 只有日志能还原）。
+	imageBlocks, err := buildClaudeImageBlocks(run.attachments)
+	if err != nil {
+		logger.Warn(fmt.Sprintf("agentcore: 图片附件编码失败，本轮退化为文本清单 session=%s: %v", run.sessionID, err))
+		imageBlocks = nil
+	}
+
+	// 文本类附件（含内联正文）照旧走清单。
+	//
+	// 图片是否进清单取决于上一步编码成不成功：成功时 includeImages=false，
+	// 图片已由 image 块承载，清单里再列一遍路径只会诱导模型去 read 它；失败
+	// 时 includeImages=true，让模型至少知道「有一张图，在这个路径」，还能自己
+	// 用 Read 工具去取（Read 已支持图片），而不是彻底看不见。
+	includeImages := len(imageBlocks) == 0
+	if suffix := agentAIAttachmentPromptSuffix(run.attachments, includeImages); suffix != "" {
 		if n := len(msgs); n > 0 && msgs[n-1].Role == "user" {
 			texts[n-1] += suffix
 			msgs[n-1] = agentcore.TextMessage("user", texts[n-1])
@@ -349,7 +380,54 @@ func (m *agentAIManager) agentCoreMessages(run agentAIRun) []agentcore.Message {
 			msgs = append(msgs, agentcore.TextMessage("user", strings.TrimSpace(suffix)))
 		}
 	}
+
+	if len(imageBlocks) > 0 {
+		msgs = attachAgentCoreImageBlocks(msgs, imageBlocks)
+	}
 	return msgs
+}
+
+// attachAgentCoreImageBlocks 把 image 块挂到最后一条 user 消息上。
+//
+// 为什么必须是最后一条 user：图片描述的是「这一轮用户说了什么」。挂到别的
+// 位置，模型会把图当成历史上下文的一部分，答非所问。
+//
+// 最后一条是 assistant（历史以 assistant 收尾，用户还没说话）时不能硬塞进
+// assistant 消息——Anthropic 不接受 assistant 消息里的 image 块。此时补一条
+// 只含图片的 user 消息。
+func attachAgentCoreImageBlocks(msgs []agentcore.Message, blocks []map[string]interface{}) []agentcore.Message {
+	converted := make([]agentcore.ContentBlock, 0, len(blocks))
+	for _, block := range blocks {
+		source, _ := block["source"].(map[string]interface{})
+		if source == nil {
+			continue
+		}
+		src := &agentcore.ImageSource{}
+		src.Type, _ = source["type"].(string)
+		src.MediaType, _ = source["media_type"].(string)
+		src.Data, _ = source["data"].(string)
+		src.URL, _ = source["url"].(string)
+		if src.Data == "" && src.URL == "" {
+			continue
+		}
+		converted = append(converted, agentcore.ContentBlock{Type: agentcore.BlockTypeImage, Source: src})
+	}
+	if len(converted) == 0 {
+		return msgs
+	}
+
+	if n := len(msgs); n > 0 && msgs[n-1].Role == "user" {
+		// 把纯文本 user 消息升级成块消息：文字块在前，图片在后（与 Claude 的
+		// 排列一致，模型先读指令再看图）。
+		blocksOut := make([]agentcore.ContentBlock, 0, len(converted)+1)
+		if text, ok := msgs[n-1].Content.(string); ok && strings.TrimSpace(text) != "" {
+			blocksOut = append(blocksOut, agentcore.ContentBlock{Type: agentcore.BlockTypeText, Text: text})
+		}
+		blocksOut = append(blocksOut, converted...)
+		msgs[n-1] = agentcore.BlocksMessage("user", blocksOut)
+		return msgs
+	}
+	return append(msgs, agentcore.BlocksMessage("user", converted))
 }
 
 // ---------------------------------------------------------------------------
@@ -775,9 +853,9 @@ func newAgentAICoreSteerControl(run agentAIRun, write agentTerminalWriter) *agen
 
 // deliver 把一条 steer 排进队列。closed 之后拒绝（run 已结束）。
 //
-// ImageBlocks 被忽略：内核首期没有多模态输入通道（与 agentCoreMessages 的
-// includeImages=false 同因）。文本附件已在 ai.steer 入口并进 Content，所以
-// 只有纯图片插话会退化成「图片丢失」，不会丢文字。
+// ImageBlocks 与 Content 一起入队，由 drain 转成「text 块 + image 块」。
+// 注意 ImageBlocks 在 ai.steer 入口就已经是 base64（见 agentAISteerMessage
+// 的注释），排队期间不依赖任何临时文件。
 func (c *agentAICoreSteerControl) deliver(msg agentAISteerMessage) (string, error) {
 	if c == nil {
 		return "not_running", errors.New("agentcore steer control is unavailable")
@@ -795,6 +873,9 @@ func (c *agentAICoreSteerControl) deliver(msg agentAISteerMessage) (string, erro
 //
 // 由内核在每次 LLM 调用前调用（run goroutine）。取走即视为「已进入上下文」：
 // 返回的消息会被 loop.go 立刻 append 进 history，紧接着就是请求组装。
+//
+// 带图插话发成块消息（text 块 + image 块），纯文字仍发纯字符串——单块文本
+// 用字符串能让上游少一层解析，也更贴近真实 claude-code 的请求形状。
 func (c *agentAICoreSteerControl) drain() []agentcore.Message {
 	if c == nil {
 		return nil
@@ -808,10 +889,42 @@ func (c *agentAICoreSteerControl) drain() []agentcore.Message {
 
 	out := make([]agentcore.Message, 0, len(queued))
 	for _, item := range queued {
-		out = append(out, agentcore.TextMessage("user", item.Content))
+		out = append(out, agentCoreSteerMessage(item))
 		emitAgentAISteerAck(write, sessionID, item.MessageID, "applied", "", "")
 	}
 	return out
+}
+
+// agentCoreSteerMessage 把一条排队插话转成内核消息。
+//
+// item.ImageBlocks 是 ai.steer 入口就编好的 base64（不是路径）：插话可能排队
+// 很久才被 drain，路径指向的临时文件早被清理了。这里只做形状转换。
+func agentCoreSteerMessage(item agentAISteerMessage) agentcore.Message {
+	images := make([]agentcore.ContentBlock, 0, len(item.ImageBlocks))
+	for _, block := range item.ImageBlocks {
+		source, _ := block["source"].(map[string]interface{})
+		if source == nil {
+			continue
+		}
+		src := &agentcore.ImageSource{}
+		src.Type, _ = source["type"].(string)
+		src.MediaType, _ = source["media_type"].(string)
+		src.Data, _ = source["data"].(string)
+		src.URL, _ = source["url"].(string)
+		if src.Data == "" && src.URL == "" {
+			continue
+		}
+		images = append(images, agentcore.ContentBlock{Type: agentcore.BlockTypeImage, Source: src})
+	}
+	if len(images) == 0 {
+		return agentcore.TextMessage("user", item.Content)
+	}
+	blocks := make([]agentcore.ContentBlock, 0, len(images)+1)
+	if strings.TrimSpace(item.Content) != "" {
+		blocks = append(blocks, agentcore.ContentBlock{Type: agentcore.BlockTypeText, Text: item.Content})
+	}
+	blocks = append(blocks, images...)
+	return agentcore.BlocksMessage("user", blocks)
 }
 
 // close 是 run 结束时的兜底：把仍未取走的插话逐个 ack 成 not_running，
