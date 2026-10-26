@@ -743,12 +743,17 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 
 	// MCP 工具注入（spec §3）：采集→建连→包桥→注册。全部失败也只是空桥，
 	// run 照常（纯内置 8 工具）。内核 Registry 后注册者胜，桥与内置工具
-	// 名空间不重叠（mcp__ 前缀），互不遮蔽。
+	// 名空间不重叠（mcp__ 前缀），互不遮蔽。建连是逐 server 串行同步 dial、
+	// 10s 超时/个、条目上限 24——最坏给 run 起跑加约 4 分钟。关停已解耦，
+	// 建连未并行是 v1 取舍（spec §5 未承诺并行）。
 	raws := agentCoreMCPRawServersIn(agentHome())
 	if run.readOnly {
-		// readOnly（goal fork/plan 语义）对齐 claude 路径 withAgentReadOnlyPolicy
-		// 的 --strict-mcp-config {}：只读 run 不注入任何 MCP 工具。执行态 goal
-		// run（goalIdentity 非 nil）保留 MCP，与 claude 路径同口径。
+		// readOnly run 不注入任何 MCP 工具，对齐 claude 路径同一判据
+		// （agent_ai.go runCLIPass 的 readOnly 分支，withAgentReadOnlyPolicy
+		// 的 --strict-mcp-config {}）。判据唯一是 run.readOnly：非 fork 的
+		// goal run（readOnly=false）保留 MCP；fork 会话的执行 run 也因
+		// readOnly=true 被剥离（其 goalIdentity 非 nil，但 goalIdentity 不
+		// 参与判定）。
 		// 只 gate raws 不 gate 整个调用：closeMCP 恒非 nil，下面 defer 的
 		// go closeMCP() 不会因 nil func panic。
 		raws = nil
@@ -765,7 +770,8 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		// 10-15s/个（关 stdin→5s 等退出→SIGTERM→再 5s→SIGKILL），串行会
 		// 拖住 clearRunning 与下一轮 run。SDK ClientSession.Close 幂等、
 		// 进程退出兜底，堆积面受人类 run 节奏约束——fire-and-forget 是
-		// v1 的合理取舍。
+		// v1 的合理取舍。安全前提还有一条：agentcore.Run 同步返回后已无
+		// Execute 在飞、桥 per-run 不复用，关停不会撕正在调用的 session。
 		go closeMCP()
 	}()
 
