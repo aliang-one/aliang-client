@@ -421,3 +421,37 @@ func TestRunAgentCoreSendsImageAttachmentUpstream(t *testing.T) {
 		t.Fatalf("ai.error 数量 = %d, want 0（事件 %v）", got, log.filter(models.AgentEventAIError))
 	}
 }
+
+// TestAgentCoreLoopHooksFollowUpDrainsSameQueue 锁宿主侧的钩子接线：
+// steering 与收尾追补必须共用同一个 drain——插话无论被哪个钩子取走都算
+// 「已进入上下文」，并且要发 applied ack（deliver 只报 queued）。两个钩子
+// 先到先得、drain 排空队列，同一条插话绝不能被投递两次。
+func TestAgentCoreLoopHooksFollowUpDrainsSameQueue(t *testing.T) {
+	log := &agentCoreEventLog{}
+	run := agentAIRun{sessionID: "conv-followup-wiring", runSeq: 1}
+	m := newAgentAIManager()
+	m.registerAISessionLocked(&agentAISession{id: run.sessionID, runSeq: run.runSeq})
+	control := newAgentAICoreSteerControl(run, log.write)
+	m.attachCoreSteer(run.sessionID, run.runSeq, control)
+
+	hooks := agentCoreLoopHooks(m, run)
+
+	if _, err := control.deliver(agentAISteerMessage{
+		MessageID: "tail-steer",
+		Content:   "尾声才排队的插话",
+	}); err != nil {
+		t.Fatalf("deliver: %v", err)
+	}
+
+	// GetSteeringMessages 先到先得，取走并 applied。
+	if got := hooks.GetSteeringMessages(); len(got) != 1 {
+		t.Fatalf("GetSteeringMessages 取到 %d 条, want 1", len(got))
+	}
+	// 追补钩子随后只能拿到空——绝不能把同一条插话再投递一次。
+	if got := hooks.GetFollowUpMessages(); len(got) != 0 {
+		t.Fatalf("GetFollowUpMessages 不该重复投递, 取到 %d 条", len(got))
+	}
+	if got := log.count("ai.steer.ack"); got != 1 {
+		t.Fatalf("steer.ack 数量 = %d, want 1（applied 恰好一次）, 事件 %v", got, log.types())
+	}
+}

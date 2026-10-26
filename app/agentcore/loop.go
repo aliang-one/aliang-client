@@ -47,6 +47,17 @@ type LoopHooks struct {
 
 	// FinishTurn 在一个回合正常收尾（无 tool_use）时调用。
 	FinishTurn func(TurnResult)
+
+	// GetFollowUpMessages 在回合收尾（无 tool_use、FinishTurn 已发）后调用，
+	// 追问宿主「还有没有必须本 run 内处理的消息」。返回非空则追加进 history
+	// 再跑一轮；空则真正收工。
+	//
+	// 真实用例（2026-10-26 实测）：steering 在「最后一轮流式收尾」的尾声才排进
+	// 队列时，已经没有任何「下一次 LLM 调用」能取走它——run 结束，插话悬在
+	// 队列里，用户看到的是一条没有回复的消息。收尾追补把「来不及插进去」变成
+	// 「再答一轮」。与 GetSteeringMessages 共用宿主侧的同一个 drain：先到先得，
+	// 队列排空，不会重复投递。
+	GetFollowUpMessages func() []Message
 }
 
 // TurnResult 是一个回合的结果。
@@ -246,6 +257,15 @@ func (r *runner) loop(ctx context.Context) (*RunResult, error) {
 		if len(toolUses) == 0 {
 			// 无工具调用 = 回合收尾。
 			r.fireFinishTurn(stopReason)
+			// 收尾追补：steering 排进队列却没赶上任何一次下一轮调用时
+			// （典型：插话在最后一轮流式尾声才到），再跑一轮把它答掉，
+			// 别让用户的插话悬在队列里没有回复。上限仍是 maxIterations。
+			if r.cfg.Hooks.GetFollowUpMessages != nil {
+				if followUps := r.cfg.Hooks.GetFollowUpMessages(); len(followUps) > 0 {
+					r.history = append(r.history, followUps...)
+					continue
+				}
+			}
 			return r.finish(ctx, ResultSubtypeSuccess, "", false, nil)
 		}
 

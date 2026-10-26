@@ -816,12 +816,18 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 
 // agentCoreLoopHooks 组装内核的循环钩子。
 //
-// 首期只接 steering：用户在运行中插的话必须在**下一次** LLM 调用前进入上下文，
-// 这正是 GetSteeringMessages 的时机。PrepareRequest / FinishTurn 留空——前者
-// 的诉求（改 system / max_tokens）已在 Config 里静态给定，后者没有消费方。
+// steering 与收尾追补共用同一个 drain：前者在**每次** LLM 调用前取走运行中
+// 插话（这正是插话生效的时机）；后者兜住「插话在最后一轮流式尾声才排进队列、
+// 已经没有下一次调用」的情形——不追补的话插话会悬在队列里没有回复，直到用户
+// 下一条消息才被看到（2026-10-26 实测）。两个钩子先到先得，drain 排空队列，
+// 不会重复投递。PrepareRequest / FinishTurn 留空——前者的诉求（改 system /
+// max_tokens）已在 Config 里静态给定，后者没有消费方。
 func agentCoreLoopHooks(m *agentAIManager, run agentAIRun) agentcore.LoopHooks {
 	return agentcore.LoopHooks{
 		GetSteeringMessages: func() []agentcore.Message {
+			return m.drainAgentCoreSteering(run)
+		},
+		GetFollowUpMessages: func() []agentcore.Message {
 			return m.drainAgentCoreSteering(run)
 		},
 	}
