@@ -221,6 +221,9 @@ func agentChildProcessEnv() []string {
 	// npm 的 claude.cmd shim 还要靠 PATH 解析 node——不合并则面板探测判定可用
 	// 而 spawn 必败（"node 不是内部或外部命令"）。非 Windows 原样返回。
 	base := augmentEnvWithWindowsUserPath(os.Environ())
+	// macOS/Linux：注入登录 shell PATH 快照，让 AI 子进程看到用户终端同款
+	// 工具链（node/npm 等）。Windows 探针恒失败，走上面的注册表合并通道。
+	base = augmentEnvWithLoginShellPath(base)
 	cfg := config.GetGlobalConfig()
 	if cfg == nil {
 		return base
