@@ -558,6 +558,12 @@ func agentCoreScopeCheck(run agentAIRun) func(string, map[string]interface{}) (b
 			case "write", "edit", "multiedit", "notebookedit", "bash", "powershell":
 				return false, "只读模式不允许修改文件或执行命令"
 			}
+			// 纵深保险：readOnly run 的 MCP 注入已在 runAgentCore 接入点剥离
+			//（raws=nil），这里再挡一道 mcp__ 前缀，防将来注入条件与围栏
+			// 条件漂移时露出执行面。
+			if strings.HasPrefix(lower, "mcp__") {
+				return false, "只读模式不允许调用 MCP 工具"
+			}
 		}
 
 		// PowerShell 与 Bash 同语义，但 goalScopeAllowsToolCall 只对 "bash"
@@ -738,7 +744,16 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 	// MCP 工具注入（spec §3）：采集→建连→包桥→注册。全部失败也只是空桥，
 	// run 照常（纯内置 8 工具）。内核 Registry 后注册者胜，桥与内置工具
 	// 名空间不重叠（mcp__ 前缀），互不遮蔽。
-	mcpTools, closeMCP := m.agentCoreMCPServerToolDefs(ctx, agentCoreMCPRawServersIn(agentHome()), func(tool, summary string, isErr bool) {
+	raws := agentCoreMCPRawServersIn(agentHome())
+	if run.readOnly {
+		// readOnly（goal fork/plan 语义）对齐 claude 路径 withAgentReadOnlyPolicy
+		// 的 --strict-mcp-config {}：只读 run 不注入任何 MCP 工具。执行态 goal
+		// run（goalIdentity 非 nil）保留 MCP，与 claude 路径同口径。
+		// 只 gate raws 不 gate 整个调用：closeMCP 恒非 nil，下面 defer 的
+		// go closeMCP() 不会因 nil func panic。
+		raws = nil
+	}
+	mcpTools, closeMCP := m.agentCoreMCPServerToolDefs(ctx, raws, func(tool, summary string, isErr bool) {
 		m.coreJournal.appendTool(run.sessionID, tool, summary, isErr)
 	})
 	registry := agentcore.DefaultRegistry()

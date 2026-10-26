@@ -799,3 +799,78 @@ func TestRunAgentCoreMCPEndToEnd(t *testing.T) {
 		t.Fatalf("closeAll 调用次数 = %d, want 1（MCP 会话必须被关停）", got)
 	}
 }
+
+// TestRunAgentCoreReadOnlySkipsMCPInjection 锁死「只读 run 不注入 MCP」：
+// home 里真实存在 server 条目 + dial 注入计数，readOnly run 全程 0 次 dial、
+// 上游工具表零 mcp__ 条目，run 本身照常收敛。对齐 claude 只读 fork 的
+// --strict-mcp-config {} 先例（withAgentReadOnlyPolicy）；执行态 goal run
+// （goalIdentity 非 nil、readOnly=false）不受影响——非 readOnly 的注入路径
+// 由 TestRunAgentCoreMCPEndToEnd 覆盖。
+func TestRunAgentCoreReadOnlySkipsMCPInjection(t *testing.T) {
+	session := startTestMCPSession(t, "echo", func(map[string]interface{}) (string, bool) {
+		return "echo:hi", false
+	})
+	setTestAgentHome(t)
+	writeTestHomeFile(t, os.Getenv("HOME"), ".claude.json",
+		`{"mcpServers":{"srv":{"command":"injected-for-test"}}}`)
+	up, srv := newAgentCoreUpstream(t, agentCoreTextTurn("好的", ""))
+	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
+	t.Setenv("ANTHROPIC_MODEL", "")
+
+	m := newAgentAIManager()
+	var dialCount int32
+	m.coreMCPDialForTest = func(context.Context, agentCoreMCPRawServer) (*mcp.ClientSession, func(), error) {
+		atomic.AddInt32(&dialCount, 1)
+		return session, func() {}, nil
+	}
+
+	const sessionID = "conv-agentcore-mcp-readonly"
+	registerTestAISession(t, m, &agentAISession{
+		id:      sessionID,
+		runSeq:  1,
+		history: []agentAIMessage{{Role: "user", Content: "只读问一句"}},
+	})
+	log := &agentCoreEventLog{}
+	run := agentAIRun{
+		sessionID:   sessionID,
+		runSeq:      1,
+		messageID:   "msg-mcp-readonly",
+		provider:    "agentcore",
+		model:       "glm-5.2",
+		projectPath: t.TempDir(),
+		activity:    newAgentAIActivity(),
+		readOnly:    true,
+	}
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		m.runAgentCore(context.Background(), run, log.write)
+	}()
+	select {
+	case <-finished:
+	case <-time.After(30 * time.Second):
+		t.Fatalf("runAgentCore 没有收敛（事件 %v）", log.types())
+	}
+
+	// run 照常收敛：只读剥离 MCP 不是失败。
+	if got := log.count(models.AgentEventAIDone); got != 1 {
+		t.Fatalf("ai.done = %d, want 1（事件 %v）", got, log.types())
+	}
+	if got := log.count(models.AgentEventAIError); got != 0 {
+		t.Fatalf("ai.error = %d, want 0（%v）", got, log.filter(models.AgentEventAIError))
+	}
+	// 行为级锁死：home 里有 server 条目也一次都不 dial（只读不建连）。
+	if got := atomic.LoadInt32(&dialCount); got != 0 {
+		t.Fatalf("readOnly run 的 MCP dial 次数 = %d, want 0", got)
+	}
+	// 上游工具表零 mcp__ 条目：没注册就没 advertised。
+	reqs := up.requests()
+	if len(reqs) != 1 {
+		t.Fatalf("上游请求次数 = %d, want 1", len(reqs))
+	}
+	for _, def := range reqs[0].Tools {
+		if strings.HasPrefix(def.Name, "mcp__") {
+			t.Fatalf("readOnly run 的上游工具表含 MCP 工具: %s", def.Name)
+		}
+	}
+}

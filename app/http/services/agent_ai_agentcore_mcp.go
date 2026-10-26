@@ -323,7 +323,8 @@ func (m *agentAIManager) agentCoreMCPServerToolDefs(ctx context.Context, raws []
 	closeAll := func() {
 		// ⚠️ 串行关停的代价：stdio server 的 pipeRWC.Close 最坏 10-15s/个
 		// （关 stdin→5s 等退出→SIGTERM→再 5s→SIGKILL），多 server 串行最坏
-		// 分钟级。Task 5 接线时须显式决策：是否 goroutine 化关停/加看门狗。
+		// 分钟级。该代价已由 runAgentCore 接入点解耦吸收（detached goroutine
+		// 调用，决策注释见彼处）；本函数保留串行实现。
 		for _, c := range closes {
 			c()
 		}
