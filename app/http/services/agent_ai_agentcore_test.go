@@ -222,3 +222,32 @@ func TestAgentCoreTokenCachesUserAPIKeys(t *testing.T) {
 		t.Errorf("user-center 被调用 %d 次，应为 1（命中缓存）", *calls)
 	}
 }
+
+// 内核工具子进程必须有 TERM/LANG 兜底：GUI/systemd 启动的 agent 进程两者皆缺，
+// 无 TERM 部分命令行工具降级，无 LANG 按 C locale 跑（中文/排序失真）。
+// 顺序敏感：先断言兜底（TERM/LANG 空），再改值断言不覆盖（t.Setenv 逐层还原）。
+func TestAgentCoreToolEnvTTYDefaults(t *testing.T) {
+	t.Setenv("LC_ALL", "")
+	t.Setenv("TERM", "")
+	t.Setenv("LANG", "")
+	env := agentCoreToolEnv()
+	if v, ok := scanEnvValue(env, "TERM"); !ok || v != "xterm-256color" {
+		t.Fatalf("TERM 兜底缺失: %q", v)
+	}
+	if v, ok := scanEnvValue(env, "LANG"); !ok || v != "en_US.UTF-8" {
+		t.Fatalf("LANG 兜底缺失: %q", v)
+	}
+
+	t.Setenv("TERM", "screen")
+	env = agentCoreToolEnv()
+	if v, _ := scanEnvValue(env, "TERM"); v != "screen" {
+		t.Fatalf("TERM 不应被覆盖: %q", v)
+	}
+
+	// LC_ALL 有值（非空）时 LANG 兜底让位：setlocale 以 LC_ALL 为准，再补 LANG 无意义。
+	t.Setenv("LC_ALL", "C")
+	env = agentCoreToolEnv()
+	if _, ok := scanEnvValue(env, "LANG"); ok {
+		t.Fatalf("LC_ALL=C 在场时不应再补 LANG")
+	}
+}

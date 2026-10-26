@@ -287,6 +287,37 @@ func agentCoreEnsureUpstream(ctx context.Context) error {
 	})
 }
 
+// scanEnvValue 从 env 键值对里取变量（存在且非空才算命中）。
+// 与 agentChildProcessEnvValue 不同：后者空值也算命中且每次重建 env；
+// 判 TERM/LANG 这类兜底必须用本函数（TERM= 会被后者误判为已配置）。
+func scanEnvValue(env []string, key string) (string, bool) {
+	for _, kv := range env {
+		if index := strings.IndexByte(kv, '='); index > 0 && kv[:index] == key {
+			if value := kv[index+1:]; value != "" {
+				return value, true
+			}
+		}
+	}
+	return "", false
+}
+
+// agentCoreToolEnv 组装内核工具（Bash/PowerShell）子进程环境：登录 shell
+// PATH 快照 + TERM/LANG 兜底。GUI/systemd 启动的 agent 进程没有这两样，
+// 不兜底则子进程里部分 CLI 降级、locale 失真（对照 agent_terminal.go 手机
+// 终端已补 TERM 的先例）。
+func agentCoreToolEnv() []string {
+	env := agentChildProcessEnv()
+	if _, ok := scanEnvValue(env, "TERM"); !ok {
+		env = append(env, "TERM=xterm-256color")
+	}
+	if _, ok := scanEnvValue(env, "LANG"); !ok {
+		if _, ok := scanEnvValue(env, "LC_ALL"); !ok {
+			env = append(env, "LANG=en_US.UTF-8")
+		}
+	}
+	return env
+}
+
 // agentCoreSystemPrompt 组装 system prompt。
 //
 // 必须带上 agentAIOptionSystemPrompt：手机端的「方案选择」卡片靠 assistant
@@ -750,6 +781,7 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		Effort:    run.effort,
 		Env: &agentcore.ToolEnv{
 			ProjectPath: run.projectPath,
+			Env:         agentCoreToolEnv(),
 			ScopeCheck:  agentCoreScopeCheck(run),
 			ShellPolicy: &agentCoreShellPolicy{run: run},
 		},
