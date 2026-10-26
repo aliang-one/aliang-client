@@ -7,14 +7,19 @@ package services
 // 日志/journal/审批卡。
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
+	"aliang.one/nursorgate/app/agentcore"
 	"aliang.one/nursorgate/common/logger"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 const (
@@ -120,4 +125,207 @@ func agentCoreMCPRawServersIn(home string) []agentCoreMCPRawServer {
 		})
 	}
 	return out
+}
+
+// agentCoreMCPBridge 把一个 MCP 工具包成内核 agentcore.Tool。
+type agentCoreMCPBridge struct {
+	session     *mcp.ClientSession
+	rawTool     string // server 侧原始工具名
+	name        string // mcp__<server>__<tool>，段已白名单清洗
+	description string
+	schema      map[string]interface{}
+	// onCall：journal v2 工具行回调（宿主注入；nil=不记）。
+	onCall func(tool, summary string, isErr bool)
+}
+
+func (b *agentCoreMCPBridge) Name() string                        { return b.name }
+func (b *agentCoreMCPBridge) Description() string                 { return b.description }
+func (b *agentCoreMCPBridge) InputSchema() map[string]interface{} { return b.schema }
+
+// Execute：CallTool + journal 回调。内核 executeOne 已有全量 recover（loop.go
+// d2da2b5 修复），这里的 recover 是纵深防御——journal 回调在宿主层，不允许
+// 它把工具结果搅了。
+func (b *agentCoreMCPBridge) Execute(ctx context.Context, input map[string]interface{}, _ *agentcore.ToolEnv) (result agentcore.ToolResult) {
+	summary := summarizeAgentCoreMCPInput(input)
+	panicked := true
+	defer func() {
+		if panicked {
+			result = agentcore.ToolResult{Content: "MCP 工具执行崩溃（已兜底）", IsError: true}
+			if b.onCall != nil {
+				func() {
+					defer func() { _ = recover() }() // journal 回调的 panic 不许二次炸
+					b.onCall(b.name, summary, true)
+				}()
+			}
+		}
+	}()
+	res, err := b.session.CallTool(ctx, &mcp.CallToolParams{Name: b.rawTool, Arguments: input})
+	var text string
+	isErr := false
+	if err != nil {
+		isErr, text = true, "MCP 调用失败: "+err.Error()
+	} else {
+		text, isErr = agentCoreMCPResultText(res)
+	}
+	text = truncateAgentCoreMCPOutput(text)
+	panicked = false
+	if b.onCall != nil {
+		func() {
+			defer func() { _ = recover() }()
+			b.onCall(b.name, summary, isErr)
+		}()
+	}
+	return agentcore.ToolResult{Content: text, IsError: isErr}
+}
+
+// agentCoreMCPResultText 拼接 content blocks 的文本（非 Text 块跳过）。
+// CallToolResult.IsError=true 是「工具报错但协议成功」，语义上等价工具失败。
+func agentCoreMCPResultText(res *mcp.CallToolResult) (string, bool) {
+	if res == nil {
+		return "", false
+	}
+	var b strings.Builder
+	for _, block := range res.Content {
+		if tc, ok := block.(*mcp.TextContent); ok {
+			b.WriteString(tc.Text)
+			b.WriteString("\n")
+		}
+	}
+	return strings.TrimRight(b.String(), "\n"), res.IsError
+}
+
+// truncateAgentCoreMCPOutput 桥自实现 64KB 字节上限。⚠️ 内核的
+// truncateToolOutput 未导出、且只在各内置工具 Execute 内部自调（loop.go 无
+// 集中截断）——MCP 桥必须自截，否则异常 server 的巨量输出直接打进模型上下文。
+func truncateAgentCoreMCPOutput(s string) string {
+	const capBytes = 64 * 1024
+	if len(s) <= capBytes {
+		return s
+	}
+	cut := s[:capBytes]
+	if i := strings.LastIndexByte(cut, '\n'); i > 0 {
+		cut = cut[:i]
+	}
+	return fmt.Sprintf("%s\n…[原始 %d 字节，仅显示前 %d 字节]", cut, len(s), len(cut))
+}
+
+// summarizeAgentCoreMCPInput 稳定摘要：key=value 按 key 排序拼接，截 200。
+func summarizeAgentCoreMCPInput(input map[string]interface{}) string {
+	keys := make([]string, 0, len(input))
+	for k := range input {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	for _, k := range keys {
+		if b.Len() > 0 {
+			b.WriteString(" ")
+		}
+		v, _ := json.Marshal(input[k])
+		b.WriteString(k + "=" + string(v))
+		if b.Len() >= 200 {
+			break
+		}
+	}
+	out := b.String()
+	if len(out) > 200 {
+		out = out[:200]
+	}
+	return out
+}
+
+// listAgentCoreMCPTools 跟随 nextCursor 分页取尽工具（部分 server 启用分页，
+// 只取第一页会静默丢工具）。
+func listAgentCoreMCPTools(ctx context.Context, session *mcp.ClientSession) ([]*mcp.Tool, error) {
+	var out []*mcp.Tool
+	cursor := ""
+	for {
+		res, err := session.ListTools(ctx, &mcp.ListToolsParams{Cursor: cursor})
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, res.Tools...)
+		if res.NextCursor == "" || len(out) >= agentCoreMCPToolCap {
+			break
+		}
+		cursor = res.NextCursor
+	}
+	return out, nil
+}
+
+// agentCoreMCPDial 按 raw 配置建一条连接。transport 选择：stdio→CommandTransport；
+// type=http→Streamable；type=sse→SSE。返回 session 与关闭函数。
+// ⚠️ raw.Headers 暂未注入：go-sdk v1.8.0 两个 HTTP transport 均无 Headers
+// 字段（需自 RoundTripper），本任务只做「能连能包能调」，带鉴权的 HTTP
+// server 留待后续任务补。
+func agentCoreMCPDial(ctx context.Context, raw agentCoreMCPRawServer) (*mcp.ClientSession, func(), error) {
+	var transport mcp.Transport
+	switch {
+	case strings.EqualFold(raw.Type, "http"):
+		transport = &mcp.StreamableClientTransport{Endpoint: raw.URL}
+	case strings.EqualFold(raw.Type, "sse"):
+		transport = &mcp.SSEClientTransport{Endpoint: raw.URL}
+	default:
+		cmd := exec.Command(raw.Command, raw.Args...)
+		cmd.Env = os.Environ()
+		for k, v := range raw.Env {
+			cmd.Env = append(cmd.Env, k+"="+v)
+		}
+		transport = &mcp.CommandTransport{Command: cmd}
+	}
+	client := mcp.NewClient(&mcp.Implementation{Name: "aliang-agentcore", Version: agentVersion()}, nil)
+	session, err := client.Connect(ctx, transport, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	return session, func() { _ = session.Close() }, nil
+}
+
+// agentCoreMCPServerToolDefs 连接全部 raw server、拉工具清单并包成桥。
+// 返回桥列表（已截 128）与统一关闭函数。单个 server 失败跳过 + Warn；
+// 全部失败返回空桥列表（run 照常，纯内置工具）。
+func (m *agentAIManager) agentCoreMCPServerToolDefs(ctx context.Context, raws []agentCoreMCPRawServer, onCall func(tool, summary string, isErr bool)) ([]agentcore.Tool, func()) {
+	ctx, cancel := context.WithTimeout(ctx, agentCoreMCPInitTimeout)
+	defer cancel() // 防 go vet lostcancel
+	var closes []func()
+	bridges := make([]agentcore.Tool, 0, agentCoreMCPToolCap)
+	closeAll := func() {
+		for _, c := range closes {
+			c()
+		}
+	}
+	fail := func(server string, err error) {
+		logger.Warn(fmt.Sprintf("agentcore-mcp: server 跳过 server=%s err=%v", sanitizeAgentCoreMCPSegment(server), err))
+	}
+	for _, raw := range raws {
+		session, closeFn, err := agentCoreMCPDial(ctx, raw)
+		if err != nil {
+			fail(raw.Name, err)
+			continue
+		}
+		closes = append(closes, closeFn)
+		tools, err := listAgentCoreMCPTools(ctx, session)
+		if err != nil {
+			fail(raw.Name, err)
+			continue
+		}
+		serverSeg := sanitizeAgentCoreMCPSegment(raw.Name)
+		for _, tool := range tools {
+			if len(bridges) >= agentCoreMCPToolCap {
+				logger.Warn(fmt.Sprintf("agentcore-mcp: 工具超上限截断 cap=%d", agentCoreMCPToolCap))
+				return bridges, closeAll
+			}
+			schema, _ := tool.InputSchema.(map[string]interface{})
+			desc := tool.Description
+			if len(desc) > agentCoreMCPDescCap {
+				desc = desc[:agentCoreMCPDescCap]
+			}
+			bridges = append(bridges, &agentCoreMCPBridge{
+				session: session, rawTool: tool.Name,
+				name:        "mcp__" + serverSeg + "__" + sanitizeAgentCoreMCPSegment(tool.Name),
+				description: desc, schema: schema, onCall: onCall,
+			})
+		}
+	}
+	return bridges, closeAll
 }
