@@ -41,6 +41,9 @@ type agentAIManager struct {
 	runJournalEnabled  bool
 	bindings           map[string]agentAIBindingRecord
 	processedRuns      map[string]agentAIProcessedRun
+	// coreJournal 是 agentcore（AliangCode）调用记录落盘器；dir 为空时内部
+	// 全 no-op。构造时解析一次 agentHome()。
+	coreJournal *agentCoreJournal
 	// toolAsk 自有 MCP 交互工具桥(2026-10-16 方案):one-shot --print 下承载
 	// 手机阻塞交互,懒初始化见 ensureToolAskBridge。
 	toolAsk *agentToolAskBridge
@@ -925,6 +928,7 @@ func newAgentAIManager() *agentAIManager {
 		pendingTerminals:   make(map[string]map[string]interface{}),
 		bindings:           make(map[string]agentAIBindingRecord),
 		processedRuns:      make(map[string]agentAIProcessedRun),
+		coreJournal:        newAgentCoreJournal(agentCoreJournalDir()),
 	}
 	return m
 }
@@ -2155,6 +2159,10 @@ func (m *agentAIManager) steer(msg map[string]interface{}, writeJSON agentTermin
 		result, err = claudeControl.deliver(steer)
 	default:
 		result, err = coreControl.deliver(steer)
+		if err == nil {
+			// agentcore 专属：插话投递成功才留痕（deliver 失败时消息没进内核）。
+			m.journalSteerUserMessage(sessionID, steer)
+		}
 	}
 	if err != nil {
 		code := "send_failed"
@@ -3639,6 +3647,39 @@ func (m *agentAIManager) appendAssistantHistory(sessionID string, runSeq int, me
 		CreatedAt: time.Now().UTC(),
 	})
 	session.history = trimAgentAIHistory(session.history)
+}
+
+// lastUserHistoryMessage 返回会话 history 里最后一条 user 消息（m.mu 内读取）。
+// journal 用它拿「触发本轮的真实用户 content」——不取 run.prompt（拼接产物）。
+func (m *agentAIManager) lastUserHistoryMessage(sessionID string) (agentAIMessage, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	session := m.sessions[sessionID]
+	if session == nil {
+		return agentAIMessage{}, false
+	}
+	for i := len(session.history) - 1; i >= 0; i-- {
+		if strings.EqualFold(session.history[i].Role, "user") {
+			return session.history[i], true
+		}
+	}
+	return agentAIMessage{}, false
+}
+
+// journalSteerUserMessage 把一条运行中插话落成 journal 的 user 行。
+// steer 可能先于 run 的任何写入到达（目录/文件都还没有）——appendLineLocked
+// 内部有目录懒创建，这里只管追加。steer 先建的文件无头行：ProjectPath/Model
+// 留空是该会话的既定降级（reader ID 兜底取文件名），不要试图补写头行
+// （ensureSessionHeader 见文件存在即跳过，永远轮不到补）。
+func (m *agentAIManager) journalSteerUserMessage(sessionID string, msg agentAISteerMessage) {
+	if m == nil || m.coreJournal == nil {
+		return
+	}
+	ts := time.Now().UTC().Format(time.RFC3339)
+	if !msg.CreatedAt.IsZero() {
+		ts = msg.CreatedAt.UTC().Format(time.RFC3339)
+	}
+	m.coreJournal.appendUser(sessionID, msg.MessageID, msg.Content, ts)
 }
 
 // setAgentAIResumeSessionIDIfEmpty pins a CLI-assigned session id so the NEXT

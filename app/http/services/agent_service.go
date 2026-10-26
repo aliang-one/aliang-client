@@ -2603,6 +2603,8 @@ func agentVersion() string {
 	return version.BuildString()
 }
 
+// collectAgentHistoryRoots 有意不含 ~/.aliang/ai-sessions（agentcore
+// journal，100 文件上限的独立存储）——纯诊断显示面，加不加不影响功能。
 func collectAgentHistoryRoots() []models.AgentHistoryRoot {
 	roots := []struct {
 		tool string

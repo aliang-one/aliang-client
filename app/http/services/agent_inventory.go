@@ -464,6 +464,7 @@ func enrichAgentProject(project *models.AgentProject) {
 
 func collectAgentVibeSessions(scanDirs []string) []models.AgentVibeSession {
 	sessions := append(collectCodexVibeSessions(scanDirs), collectClaudeVibeSessions(scanDirs)...)
+	sessions = append(sessions, collectAgentCoreVibeSessions(scanDirs)...)
 	sort.Slice(sessions, func(i, j int) bool {
 		return sessions[i].UpdatedAt > sessions[j].UpdatedAt
 	})
