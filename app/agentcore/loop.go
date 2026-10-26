@@ -115,6 +115,41 @@ type Config struct {
 	// SessionID 是本会话的稳定 id，写进每一帧的 session_id。
 	// 为空时内核自己生成一个。
 	SessionID string
+	// Effort 是推理努力档位（low/medium/high/xhigh/max/ultracode，随
+	// ai.session.create 透传）。经 output_config.effort 下发给上游——与
+	// claude CLI 的 --effort 走的是同一个网关字段；无法识别的档位静默
+	// 丢弃（见 NormalizeEffortLevel），绝不为它多付一次 400 往返。
+	// 空串 = 不下发。
+	Effort string
+}
+
+// NormalizeEffortLevel 把会话层的 effort 档位归一成上游认识的 Messages API
+// 档位；无法识别的返回空串（调用方据此选择不下发，而不是赌上游宽容）。
+//
+// 映射规则：
+//   - low/medium/high/xhigh/max 原样通过（Messages API output_config.effort
+//     的合法集）；
+//   - ultracode 是手机端 effort 阶梯的最高档（Claude Code 语义），上游没有
+//     这个档位，映射到 max；
+//   - minimal/none 视作 low；
+//   - 其余（含空串）一律丢弃。
+func NormalizeEffortLevel(effort string) string {
+	switch strings.ToLower(strings.TrimSpace(effort)) {
+	case "low":
+		return "low"
+	case "medium":
+		return "medium"
+	case "high":
+		return "high"
+	case "xhigh":
+		return "xhigh"
+	case "max", "ultracode":
+		return "max"
+	case "minimal", "none":
+		return "low"
+	default:
+		return ""
+	}
 }
 
 // ApprovalRequest 是一次工具审批请求。
@@ -327,6 +362,9 @@ func (r *runner) buildRequest() *MessagesRequest {
 		MaxTokens: r.cfg.MaxTokens,
 		System:    r.cfg.System,
 		Messages:  r.history,
+	}
+	if effort := NormalizeEffortLevel(r.cfg.Effort); effort != "" {
+		req.OutputConfig = &OutputConfig{Effort: effort}
 	}
 	if r.cfg.Tools != nil {
 		req.Tools = r.cfg.Tools.Defs()

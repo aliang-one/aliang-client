@@ -27,9 +27,20 @@ type MessagesRequest struct {
 	Messages  []Message `json:"messages"`
 	Tools     []ToolDef `json:"tools,omitempty"`
 	Stream    bool      `json:"stream"`
+	// OutputConfig 承载 output_config 请求参数（Claude Messages API 语义：
+	// effort 挂在 output_config 里，不是顶层字段）。nil = 不下发。
+	OutputConfig *OutputConfig `json:"output_config,omitempty"`
 
 	// Temperature 等采样参数首期不下发：不同上游模型对取值范围的容忍度不
 	// 一致，交给服务端默认值更稳。
+}
+
+// OutputConfig 是 Messages API 的 output_config 参数。目前只下发 effort：
+// 推理努力档位，与 claude CLI 的 --effort、codex 的模型名后缀殊途同归——
+// 上游网关对同一字段消费（claude_code 路径即由 CLI 把 effort 放进
+// output_config 下发，网关/GLM 侧已验证接受）。
+type OutputConfig struct {
+	Effort string `json:"effort,omitempty"`
 }
 
 // Message 是一条对话消息。Content 既可以是纯字符串，也可以是内容块数组；

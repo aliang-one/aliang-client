@@ -226,10 +226,12 @@ func agentCoreIsLoopbackBase(base string) bool {
 // 手机每次建会话都会显式传 model，那是权威来源；本函数只负责「传空时也要
 // 有东西能发出去」，且发出去的东西必须网关认。
 //
-// 首期**不传达 effort**。两条现成通道都用不了：模型名后缀是 codex 专用约定，
-// applyCodexEffortSuffix 的注释写明网关不解析带后缀的 claude 模型名、上游调用
-// 会直接坏掉；`--effort` 是 claude CLI 的 flag，进程内内核没有 argv 可传。
-// 宁可不设，也不能把模型名拼坏。
+// effort 走第三条通道：请求体的 output_config.effort（Claude Messages API
+// 语义）。模型名后缀是 codex 专用约定——applyCodexEffortSuffix 的注释写明
+// 网关不解析带后缀的 claude 模型名；`--effort` 是 claude CLI 的 flag，进程内
+// 内核没有 argv。而 output_config.effort 正是 claude CLI 收到 --effort 后往
+// 上游发的同一个字段，claude_code 路径已验证网关/GLM 接受，内核复用同一
+// 通道即可。档位归一在内核侧 NormalizeEffortLevel（无法识别的静默丢弃）。
 func agentCoreModel(run agentAIRun) string {
 	// 手机显式传的模型是权威来源，直接采用。
 	if m := strings.TrimSpace(run.model); m != "" && !agentCoreModelUnusable(m) {
@@ -725,6 +727,9 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		System:    agentCoreSystemPrompt(),
 		Tools:     agentcore.DefaultRegistry(),
 		SessionID: kernelSessionID,
+		// 会话的 effort 档位（手机选档 → server 透传 → 这里进请求体）。
+		// 空串/无法识别的档位在内核侧被丢弃，不下发。
+		Effort:    run.effort,
 		Env: &agentcore.ToolEnv{
 			ProjectPath: run.projectPath,
 			ScopeCheck:  agentCoreScopeCheck(run),
