@@ -101,6 +101,40 @@ func TestAgentCoreJournalNilSafeAndNoDir(t *testing.T) {
 	empty.appendUser("x", "m1", "t", "now")
 }
 
+func TestAgentCoreManagerJournalSteerUserMessage(t *testing.T) {
+	setTestAgentHome(t)
+	m := newAgentAIManager()
+	created := time.Date(2026, 10, 26, 12, 0, 0, 0, time.UTC)
+	m.journalSteerUserMessage("conv-steer", agentAISteerMessage{
+		MessageID: "steer-1",
+		Content:   "先停一下",
+		CreatedAt: created,
+	})
+	m.journalSteerUserMessage("conv-steer", agentAISteerMessage{
+		MessageID: "steer-1",
+		Content:   "先停一下",
+		CreatedAt: created,
+	})
+	m.journalSteerUserMessage("conv-steer", agentAISteerMessage{
+		MessageID: "steer-2",
+		Content:   "再看看日志",
+		CreatedAt: created,
+	})
+	lines := readJournalLines(t, agentCoreJournalDir(), "conv-steer")
+	if len(lines) != 2 {
+		t.Fatalf("lines = %d, want 2（同 id 去重）: %v", len(lines), lines)
+	}
+	if lines[0]["role"] != "user" || lines[0]["text"] != "先停一下" {
+		t.Errorf("第一条 = %v", lines[0])
+	}
+	if lines[1]["text"] != "再看看日志" {
+		t.Errorf("第二条 = %v", lines[1])
+	}
+	if lines[0]["ts"] != "2026-10-26T12:00:00Z" {
+		t.Errorf("ts = %v, want 消息自身 CreatedAt", lines[0]["ts"])
+	}
+}
+
 func TestAgentCoreJournalPruneKeepsNewest(t *testing.T) {
 	dir := t.TempDir()
 	j := newAgentCoreJournal(dir)

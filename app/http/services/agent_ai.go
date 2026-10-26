@@ -2159,6 +2159,10 @@ func (m *agentAIManager) steer(msg map[string]interface{}, writeJSON agentTermin
 		result, err = claudeControl.deliver(steer)
 	default:
 		result, err = coreControl.deliver(steer)
+		if err == nil {
+			// agentcore 专属：插话投递成功才留痕（deliver 失败时消息没进内核）。
+			m.journalSteerUserMessage(sessionID, steer)
+		}
 	}
 	if err != nil {
 		code := "send_failed"
@@ -3660,6 +3664,22 @@ func (m *agentAIManager) lastUserHistoryMessage(sessionID string) (agentAIMessag
 		}
 	}
 	return agentAIMessage{}, false
+}
+
+// journalSteerUserMessage 把一条运行中插话落成 journal 的 user 行。
+// steer 可能先于 run 的任何写入到达（目录/文件都还没有）——appendLineLocked
+// 内部有目录懒创建，这里只管追加。steer 先建的文件无头行：ProjectPath/Model
+// 留空是该会话的既定降级（reader ID 兜底取文件名），不要试图补写头行
+// （ensureSessionHeader 见文件存在即跳过，永远轮不到补）。
+func (m *agentAIManager) journalSteerUserMessage(sessionID string, msg agentAISteerMessage) {
+	if m == nil || m.coreJournal == nil {
+		return
+	}
+	ts := time.Now().UTC().Format(time.RFC3339)
+	if !msg.CreatedAt.IsZero() {
+		ts = msg.CreatedAt.UTC().Format(time.RFC3339)
+	}
+	m.coreJournal.appendUser(sessionID, msg.MessageID, msg.Content, ts)
 }
 
 // setAgentAIResumeSessionIDIfEmpty pins a CLI-assigned session id so the NEXT
