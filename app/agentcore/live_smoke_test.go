@@ -2,6 +2,7 @@ package agentcore
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,6 +10,33 @@ import (
 	"testing"
 	"time"
 )
+
+// liveAuthToken 取本机用户的平台 API key，口径与宿主侧 agentCoreAuthToken
+// 的第一顺位一致：进程 env → ~/.claude/settings.json 的 env 块。
+//
+// 冒烟测试必须带上它，否则测的就不是生产那条路：网关对**不带** candidate key
+// 的请求会落到 anthropic-duration 分组兜底，不在该组的账号直接 403。测试包
+// 不能 import services（依赖方向反过来），所以这里就地读一遍。
+func liveAuthToken() string {
+	if v := strings.TrimSpace(os.Getenv("ANTHROPIC_AUTH_TOKEN")); v != "" {
+		return v
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return ""
+	}
+	data, err := os.ReadFile(filepath.Join(home, ".claude", "settings.json"))
+	if err != nil {
+		return ""
+	}
+	var settings struct {
+		Env map[string]string `json:"env"`
+	}
+	if err := json.Unmarshal(data, &settings); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(settings.Env["ANTHROPIC_AUTH_TOKEN"])
+}
 
 // 这一组是**真出网**的冒烟测试，默认跳过：它要求本机 56432 本地代理在跑，
 // 并且会真的花一次模型调用。用 AGENTCORE_LIVE=1 打开。
@@ -34,8 +62,13 @@ func TestLiveSmokeThroughLocalProxy(t *testing.T) {
 
 	var mu sync.Mutex
 	var frames []string
+	// 与生产接线同一条路：带上用户自己的 key 走 user-api-key 通道。
+	apiKey := liveAuthToken()
+	if apiKey == "" {
+		t.Log("未找到 ANTHROPIC_AUTH_TOKEN，本次不带 candidate key（会走分组兜底）")
+	}
 	cfg := &Config{
-		Client:    NewClient("http://127.0.0.1:56432"),
+		Client:    NewClient("http://127.0.0.1:56432").WithAPIKey(apiKey),
 		Model:     model,
 		System:    "你是一个只会用工具办事的助手。",
 		Tools:     DefaultRegistry(),

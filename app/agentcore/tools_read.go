@@ -24,6 +24,31 @@ const defaultReadLines = 2000
 // readBinaryProbeBytes 是二进制探测的采样窗口。
 const readBinaryProbeBytes = 8192
 
+// readImageRawMaxBytes 是 Read 以图片方式回填时的原始字节上限。
+//
+// 取 5MiB：Anthropic Messages API 对单张图片的原始大小上限就是 5MB，base64
+// 之后约 6.7MB。超限的图不是「读不到」，而是读进来会被上游直接 400，连整轮
+// 对话一起拖死——所以必须在本地先挡住并给出可执行的提示（缩图/截图）。
+const readImageRawMaxBytes = 5 * 1024 * 1024
+
+// readImageMediaType 按扩展名判定图片媒体类型。
+//
+// 只认 Anthropic 明确支持的四种。不认识的一律当普通文件走文本路径（而不是
+// 猜一个 media_type 发出去让上游拒掉）。
+func readImageMediaType(name string) (string, bool) {
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".png":
+		return "image/png", true
+	case ".jpg", ".jpeg":
+		return "image/jpeg", true
+	case ".gif":
+		return "image/gif", true
+	case ".webp":
+		return "image/webp", true
+	}
+	return "", false
+}
+
 // ---------------------------------------------------------------------------
 // Read
 // ---------------------------------------------------------------------------
@@ -33,8 +58,9 @@ type readTool struct{}
 func (t *readTool) Name() string { return "Read" }
 
 func (t *readTool) Description() string {
-	return "读取一个文本文件，返回带行号的内容。大文件请用 offset/limit 分段读取；" +
-		"二进制文件会被拒绝。"
+	return "读取一个文件。文本文件返回带行号的内容（大文件请用 offset/limit 分段读取）；" +
+		"图片（.png/.jpg/.jpeg/.gif/.webp）直接以图片形式返回，可以看到内容；" +
+		"其它二进制文件会被拒绝。"
 }
 
 func (t *readTool) InputSchema() map[string]interface{} {
@@ -64,6 +90,31 @@ func (t *readTool) Execute(ctx context.Context, input map[string]interface{}, en
 	}
 	if info.IsDir() {
 		return ErrorResult("%s 是目录，请改用 LS 工具", raw)
+	}
+
+	// 图片：不能走下面的文本路径。图片文件的前 8KB 里几乎必然有 NUL，会被
+	// 二进制探测拒掉——模型就永远看不到图。这里按扩展名先行分流，直接把字节
+	// 内联成 image 块回填。
+	//
+	// offset/limit 对图片没有意义，忽略即可（不报错：模型偶尔会把两个参数
+	// 一起带上，报错只会让它白跑一轮）。
+	if mediaType, ok := readImageMediaType(path); ok {
+		if info.Size() > readImageRawMaxBytes {
+			return ErrorResult("%s 是图片但太大（%.1f MiB，上限 %d MiB），无法读取。"+
+				"请先缩小尺寸或改用更小的截图。",
+				raw, float64(info.Size())/(1024*1024), readImageRawMaxBytes/(1024*1024))
+		}
+		if err := ctx.Err(); err != nil {
+			return ErrorResult("读取被取消: %v", err)
+		}
+		data, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return ErrorResult("无法读取 %s: %v", raw, readErr)
+		}
+		return ToolResult{
+			Content: fmt.Sprintf("%s（%s，%d 字节）", raw, mediaType, len(data)),
+			Images:  []ContentBlock{ImageBlock(mediaType, data)},
+		}
 	}
 
 	f, err := os.Open(path)

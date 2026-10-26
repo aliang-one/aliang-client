@@ -12,6 +12,8 @@
 // 因此本包不做任何凭据管理。
 package agentcore
 
+import "encoding/base64"
+
 // Anthropic Messages API 的请求/响应形状。
 //
 // 只覆盖内核实际用到的字段：流式、工具调用、多轮 tool_result。刻意不追求
@@ -25,9 +27,20 @@ type MessagesRequest struct {
 	Messages  []Message `json:"messages"`
 	Tools     []ToolDef `json:"tools,omitempty"`
 	Stream    bool      `json:"stream"`
+	// OutputConfig 承载 output_config 请求参数（Claude Messages API 语义：
+	// effort 挂在 output_config 里，不是顶层字段）。nil = 不下发。
+	OutputConfig *OutputConfig `json:"output_config,omitempty"`
 
 	// Temperature 等采样参数首期不下发：不同上游模型对取值范围的容忍度不
 	// 一致，交给服务端默认值更稳。
+}
+
+// OutputConfig 是 Messages API 的 output_config 参数。目前只下发 effort：
+// 推理努力档位，与 claude CLI 的 --effort、codex 的模型名后缀殊途同归——
+// 上游网关对同一字段消费（claude_code 路径即由 CLI 把 effort 放进
+// output_config 下发，网关/GLM 侧已验证接受）。
+type OutputConfig struct {
+	Effort string `json:"effort,omitempty"`
 }
 
 // Message 是一条对话消息。Content 既可以是纯字符串，也可以是内容块数组；
@@ -50,6 +63,7 @@ func BlocksMessage(role string, blocks []ContentBlock) Message {
 // ContentBlock 是内容块。Type 决定哪些字段有效：
 //
 //	"text"        → Text
+//	"image"       → Source
 //	"tool_use"    → ID, Name, Input
 //	"tool_result" → ToolUseID, Content, IsError
 type ContentBlock struct {
@@ -57,6 +71,9 @@ type ContentBlock struct {
 
 	// text
 	Text string `json:"text,omitempty"`
+
+	// image
+	Source *ImageSource `json:"source,omitempty"`
 
 	// tool_use
 	ID    string                 `json:"id,omitempty"`
@@ -67,6 +84,41 @@ type ContentBlock struct {
 	ToolUseID string      `json:"tool_use_id,omitempty"`
 	Content   interface{} `json:"content,omitempty"`
 	IsError   bool        `json:"is_error,omitempty"`
+}
+
+// ImageSource 是 image 块的来源。
+//
+// 只支持 base64 与 url 两种。base64 是主路径：手机上传的附件在宿主侧已经落
+// 到本地临时文件，读成字节后直接内联，不依赖上游能不能回连我们的 COS 预签名
+// URL（预签名 600 秒就过期，而历史消息可能活很久）。
+//
+//	Type == "base64" → MediaType + Data
+//	Type == "url"    → URL
+type ImageSource struct {
+	Type      string `json:"type"`
+	MediaType string `json:"media_type,omitempty"`
+	Data      string `json:"data,omitempty"`
+	URL       string `json:"url,omitempty"`
+}
+
+// ImageBlock 构造一个 base64 image 块。
+func ImageBlock(mediaType string, data []byte) ContentBlock {
+	return ContentBlock{
+		Type: BlockTypeImage,
+		Source: &ImageSource{
+			Type:      "base64",
+			MediaType: mediaType,
+			Data:      base64.StdEncoding.EncodeToString(data),
+		},
+	}
+}
+
+// ImageURLBlock 构造一个 url image 块（上游自行拉取）。
+func ImageURLBlock(url, mediaType string) ContentBlock {
+	return ContentBlock{
+		Type:   BlockTypeImage,
+		Source: &ImageSource{Type: "url", URL: url, MediaType: mediaType},
+	}
 }
 
 // ToolDef 是下发给模型的一个工具定义。
@@ -86,6 +138,7 @@ const (
 // 内容块类型常量。
 const (
 	BlockTypeText       = "text"
+	BlockTypeImage      = "image"
 	BlockTypeToolUse    = "tool_use"
 	BlockTypeToolResult = "tool_result"
 	BlockTypeThinking   = "thinking"

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"runtime/debug"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -26,6 +27,14 @@ import (
 // 的死循环，那会把 token 烧穿。
 const maxIterations = 50
 
+// maxTruncationRetries 是**连续**被 max_tokens 截断后允许重试的次数。
+//
+// 为什么不是一截断就终止：截断只说明「这一次的工具参数不完整」，不说明任务
+// 做不了。把失败回填进历史后继续循环，模型看到「请拆小后重试」就会分块写，
+// 这是 pi 的行为，也是唯一能自愈的路。但如果连续几轮还在截断，说明它在原地
+// 打转（或模型输出上限本就小于它的意图），再试只是烧 token，此时才终止。
+const maxTruncationRetries = 2
+
 // LoopHooks 是主循环的外部钩子。所有字段都可以为 nil。
 type LoopHooks struct {
 	// GetSteeringMessages 在**每次** LLM 调用前调用，返回用户在运行中插的话。
@@ -38,6 +47,17 @@ type LoopHooks struct {
 
 	// FinishTurn 在一个回合正常收尾（无 tool_use）时调用。
 	FinishTurn func(TurnResult)
+
+	// GetFollowUpMessages 在回合收尾（无 tool_use、FinishTurn 已发）后调用，
+	// 追问宿主「还有没有必须本 run 内处理的消息」。返回非空则追加进 history
+	// 再跑一轮；空则真正收工。
+	//
+	// 真实用例（2026-10-26 实测）：steering 在「最后一轮流式收尾」的尾声才排进
+	// 队列时，已经没有任何「下一次 LLM 调用」能取走它——run 结束，插话悬在
+	// 队列里，用户看到的是一条没有回复的消息。收尾追补把「来不及插进去」变成
+	// 「再答一轮」。与 GetSteeringMessages 共用宿主侧的同一个 drain：先到先得，
+	// 队列排空，不会重复投递。
+	GetFollowUpMessages func() []Message
 }
 
 // TurnResult 是一个回合的结果。
@@ -86,9 +106,50 @@ type Config struct {
 	//
 	// 走 services 的 m.requestApproval；内核不做审批 UI，只等结果。
 	Approve func(ctx context.Context, call ApprovalRequest) (ApprovalResponse, error)
+	// Logf 是可选日志出口，nil 表示不打日志（单测、嵌入场景）。
+	//
+	// 内核刻意不依赖宿主的日志包（也不该反向绑死某个实现），宿主把
+	// logger.Warn 包一层传进来即可。目前只用于记录 max_tokens 截断这类
+	// **没有对应事件帧**的内部决策——否则事后只能靠模型的回复反推发生过什么。
+	Logf func(format string, args ...interface{})
 	// SessionID 是本会话的稳定 id，写进每一帧的 session_id。
 	// 为空时内核自己生成一个。
 	SessionID string
+	// Effort 是推理努力档位（low/medium/high/xhigh/max/ultracode，随
+	// ai.session.create 透传）。经 output_config.effort 下发给上游——与
+	// claude CLI 的 --effort 走的是同一个网关字段；无法识别的档位静默
+	// 丢弃（见 NormalizeEffortLevel），绝不为它多付一次 400 往返。
+	// 空串 = 不下发。
+	Effort string
+}
+
+// NormalizeEffortLevel 把会话层的 effort 档位归一成上游认识的 Messages API
+// 档位；无法识别的返回空串（调用方据此选择不下发，而不是赌上游宽容）。
+//
+// 映射规则：
+//   - low/medium/high/xhigh/max 原样通过（Messages API output_config.effort
+//     的合法集）；
+//   - ultracode 是手机端 effort 阶梯的最高档（Claude Code 语义），上游没有
+//     这个档位，映射到 max；
+//   - minimal/none 视作 low；
+//   - 其余（含空串）一律丢弃。
+func NormalizeEffortLevel(effort string) string {
+	switch strings.ToLower(strings.TrimSpace(effort)) {
+	case "low":
+		return "low"
+	case "medium":
+		return "medium"
+	case "high":
+		return "high"
+	case "xhigh":
+		return "xhigh"
+	case "max", "ultracode":
+		return "max"
+	case "minimal", "none":
+		return "low"
+	default:
+		return ""
+	}
 }
 
 // ApprovalRequest 是一次工具审批请求。
@@ -165,6 +226,15 @@ type runner struct {
 	writer  *streamWriter
 	history []Message
 
+	// effortLatched:上游按模型拒绝过 output_config.effort(HTTP 400/invalid_request
+	// 且错误体点名 effort/output_config)。锁存后本 run 后续轮次不再下发——
+	// 与 claude CLI 的 effort-rejected 自愈同语义(那个是 flag 级拒绝去
+	// --effort,这里是字段级拒绝去 output_config),不然该会话每轮 run 都带
+	// 同一档重发、持续 ai.error,直到用户手动改回「默认」。
+	effortLatched bool
+	// effortDropLogged:无法识别的档位被丢弃时只打一次日志,别每轮刷屏。
+	effortDropLogged bool
+
 	// 累计
 	textAll   strings.Builder
 	turnText  strings.Builder
@@ -172,6 +242,17 @@ type runner struct {
 	toolCalls []ToolCallRecord
 	usage     Usage
 	stopLast  string
+
+	// truncStreak 是连续被 max_tokens 截断的轮数。只要有一轮没截断就清零——
+	// 要防的是「原地打转」，不是累计次数。
+	truncStreak int
+}
+
+// logf 走宿主的日志出口；没配就静默。
+func (r *runner) logf(format string, args ...interface{}) {
+	if r.cfg.Logf != nil {
+		r.cfg.Logf(format, args...)
+	}
 }
 
 // loop 是主循环本体。
@@ -206,6 +287,12 @@ func (r *runner) loop(ctx context.Context) (*RunResult, error) {
 		}
 
 		assistantBlocks, stopReason, err := r.streamTurn(ctx, req, writer)
+		if err != nil && r.noteEffortRejection(err, req) {
+			// 上游按模型拒绝 effort:锁存后去掉 output_config 重试本回合
+			// 一次。此时还没发过任何事件帧(400 在响应检查阶段抛出),writer
+			// 状态干净,重跑安全。
+			assistantBlocks, stopReason, err = r.streamTurn(ctx, r.buildRequest(), writer)
+		}
 		if err != nil {
 			// 流式失败同样可能是取消导致的（SSE 读循环被 ctx 打断），
 			// 交给 finishWithErr 分辨。
@@ -220,16 +307,30 @@ func (r *runner) loop(ctx context.Context) (*RunResult, error) {
 		if len(toolUses) == 0 {
 			// 无工具调用 = 回合收尾。
 			r.fireFinishTurn(stopReason)
+			// 收尾追补：steering 排进队列却没赶上任何一次下一轮调用时
+			// （典型：插话在最后一轮流式尾声才到），再跑一轮把它答掉，
+			// 别让用户的插话悬在队列里没有回复。上限仍是 maxIterations。
+			if r.cfg.Hooks.GetFollowUpMessages != nil {
+				if followUps := r.cfg.Hooks.GetFollowUpMessages(); len(followUps) > 0 {
+					r.history = append(r.history, followUps...)
+					continue
+				}
+			}
 			return r.finish(ctx, ResultSubtypeSuccess, "", false, nil)
 		}
 
 		// 截断守卫：stop_reason == max_tokens 时，这批 tool_use 的参数是
 		// 不完整的（JSON 可能只写了一半），执行会写坏文件。pi 的做法是整批
 		// 失败、一个都不执行。必须照做。
+		//
+		// 但「这批不执行」不等于「这一轮 run 结束」：把失败回填进历史后继续
+		// 循环，模型看到「请拆小后重试」就会分块写。一截断就终止的话，回填的
+		// 那句恢复提示永远没人读——它就成了死代码，用户只拿到一句「被截断」。
+		// 连续 maxTruncationRetries 次仍在截断才终止，避免原地打转烧 token。
 		if stopReason == StopReasonMaxTokens {
 			results := failTruncatedToolUses(toolUses)
 			if writer != nil {
-				// 失败帧写不出去也不影响终止收敛，别把 run 拖成悬空。
+				// 失败帧写不出去也不影响后续收敛，别把 run 拖成悬空。
 				_ = writer.ToolResults(results)
 			}
 			r.history = append(r.history, BlocksMessage("user", results))
@@ -239,10 +340,19 @@ func (r *runner) loop(ctx context.Context) (*RunResult, error) {
 					Result: ErrorResult("上一条回复被 max_tokens 截断，工具参数不完整，未执行"),
 				})
 			}
-			r.fireFinishTurn(stopReason)
-			return r.finish(ctx, ResultSubtypeErrorMaxTurns,
-				"模型输出被 max_tokens 截断，工具调用未执行", true, nil)
+			r.truncStreak++
+			// 截断是**没有对应事件帧**的内部决策（失败回填是 tool_result，手机
+			// 只看到一次工具活动），不打日志的话事后只能靠模型的回复反推。
+			r.logf("[agentcore] max_tokens 截断：%d 个工具调用未执行（连续第 %d/%d 次），已回填让模型拆小重试 session=%s",
+				len(toolUses), r.truncStreak, maxTruncationRetries, r.writer.sessionID)
+			if r.truncStreak > maxTruncationRetries {
+				r.fireFinishTurn(stopReason)
+				return r.finish(ctx, ResultSubtypeErrorMaxTurns,
+					fmt.Sprintf("模型连续 %d 次输出被 max_tokens 截断，工具调用未执行", r.truncStreak), true, nil)
+			}
+			continue
 		}
+		r.truncStreak = 0
 
 		// 执行工具。
 		results := r.executeTools(ctx, toolUses, writer)
@@ -268,10 +378,62 @@ func (r *runner) buildRequest() *MessagesRequest {
 		System:    r.cfg.System,
 		Messages:  r.history,
 	}
+	if !r.effortLatched {
+		if effort := NormalizeEffortLevel(r.cfg.Effort); effort != "" {
+			req.OutputConfig = &OutputConfig{Effort: effort}
+		} else if strings.TrimSpace(r.cfg.Effort) != "" && !r.effortDropLogged {
+			// 档位无法识别被丢弃:留一条观测痕,否则 UI 永远显示已选档而
+			// 实际从未下发,错配无从查起。
+			r.effortDropLogged = true
+			r.logf("agentcore: effort 档位 %q 无法识别,本轮请求不下发 output_config", r.cfg.Effort)
+		}
+	}
 	if r.cfg.Tools != nil {
 		req.Tools = r.cfg.Tools.Defs()
 	}
 	return req
+}
+
+// noteEffortRejection 判定这次流式失败是不是「上游按模型拒绝 effort」。
+// 命中则锁存(r.effortLatched)并返回 true,调用方据此去 output_config 重试。
+// 只认 400/invalid_request_error 且错误体点名 effort/output_config 的形态,
+// 避免把无关 400 误伤成 effort 问题。
+func (r *runner) noteEffortRejection(err error, req *MessagesRequest) bool {
+	if r.effortLatched || req == nil || req.OutputConfig == nil {
+		return false
+	}
+	if !isEffortRejection(err) {
+		return false
+	}
+	r.effortLatched = true
+	r.logf("agentcore: 上游拒绝 effort(output_config),本 run 后续轮次不再下发: %v", err)
+	return true
+}
+
+// isEffortRejection 识别两类错误面:HTTP 4xx 携带错误体(httpStatusError),
+// 与 2xx 体内嵌错误信封(upstreamError,invalid_request_error 族)。
+func isEffortRejection(err error) bool {
+	var httpErr *httpStatusError
+	if errors.As(err, &httpErr) {
+		if httpErr.status < 400 || httpErr.status >= 500 {
+			return false
+		}
+		return mentionsEffort(httpErr.body)
+	}
+	var upErr *upstreamError
+	if errors.As(err, &upErr) {
+		if !strings.Contains(strings.ToLower(upErr.kind), "invalid_request") {
+			return false
+		}
+		return mentionsEffort(upErr.body + " " + upErr.message)
+	}
+	return false
+}
+
+// mentionsEffort 判定错误文本是否点名 effort/output_config。
+func mentionsEffort(text string) bool {
+	t := strings.ToLower(text)
+	return strings.Contains(t, "output_config") || strings.Contains(t, "effort")
 }
 
 // streamTurn 跑一次 LLM 调用，边流边写帧，返回本回合的完整内容块。
@@ -319,6 +481,29 @@ func (r *runner) streamTurn(ctx context.Context, req *MessagesRequest, writer *s
 					}
 				}
 				if err := writer.TextDelta(ev.Index, ev.Text); err != nil {
+					return err
+				}
+			}
+
+		case EventImage:
+			ensureIndex(ev.Index)
+			blocks[ev.Index] = ContentBlock{Type: BlockTypeImage, Source: ev.Image}
+			if writer != nil {
+				// 图片块在 start 里一次给全，所以这里既发 start 也发 stop，
+				// 让宿主的块序号与真实 claude-code 帧序一致。不发 delta——
+				// 上游的 image 块本来就没有 delta。
+				started[ev.Index] = true
+				src := map[string]interface{}{"type": ev.Image.Type}
+				if ev.Image.MediaType != "" {
+					src["media_type"] = ev.Image.MediaType
+				}
+				if err := writer.ContentBlockStart(ev.Index, map[string]interface{}{
+					"type":   BlockTypeImage,
+					"source": src,
+				}); err != nil {
+					return err
+				}
+				if err := writer.ContentBlockStop(ev.Index); err != nil {
 					return err
 				}
 			}
@@ -433,7 +618,7 @@ func (r *runner) executeTools(ctx context.Context, toolUses []ContentBlock, writ
 		results = append(results, ContentBlock{
 			Type:      BlockTypeToolResult,
 			ToolUseID: tu.ID,
-			Content:   result.Content,
+			Content:   result.ContentForModel(),
 			IsError:   result.IsError,
 		})
 	}
@@ -441,7 +626,26 @@ func (r *runner) executeTools(ctx context.Context, toolUses []ContentBlock, writ
 }
 
 // executeOne 执行单个工具调用，串起审批 → 围栏 → 执行。
-func (r *runner) executeOne(ctx context.Context, tu ContentBlock) ToolResult {
+//
+// 内核跑在宿主进程内：审批桥、围栏、工具实现里任何一个 panic 都等于整台
+// 设备下线（CLI provider 的同类崩溃只死子进程，这里死的是整个 core——
+// 2026-10-26 实测：宿主审批策略对一条带注释尾段的 bash 命令 slice 越界，
+// 容器整个退出）。所以这里统一 recover，把 panic 降级成失败的 tool_result：
+// 模型能看到错误继续走，进程活着。堆栈进日志，摘要进工具结果。
+func (r *runner) executeOne(ctx context.Context, tu ContentBlock) (result ToolResult) {
+	defer func() {
+		rec := recover()
+		if rec == nil {
+			return
+		}
+		r.cfg.Logf("agentcore: 工具执行 panic 已拦截 tool=%s id=%s: %v\n%s", tu.Name, tu.ID, rec, debug.Stack())
+		result = ErrorResult("工具执行发生内部错误（进程已拦截，未受影响），本轮工具未执行: %v", rec)
+	}()
+	return r.executeOneInner(ctx, tu)
+}
+
+// executeOneInner 是 executeOne 的本体（见其注释里的 recover 兜底）。
+func (r *runner) executeOneInner(ctx context.Context, tu ContentBlock) ToolResult {
 	// 参数解析失败的调用直接回填错误，别拿坏参数去执行。
 	if parseErr, ok := tu.Input["__parse_error__"]; ok {
 		return ErrorResult("工具参数不是合法 JSON，未执行: %v", parseErr)

@@ -22,6 +22,7 @@ import (
 	"aliang.one/nursorgate/app/agentcore"
 	"aliang.one/nursorgate/app/http/models"
 	"aliang.one/nursorgate/common/logger"
+	auth "aliang.one/nursorgate/processor/auth"
 	"aliang.one/nursorgate/processor/config"
 )
 
@@ -46,7 +47,13 @@ const agentCoreDefaultBaseURL = "http://127.0.0.1:56432"
 //
 // 与 PhoneServer 的 SEED_PROVIDER_CATALOG、手机 MODEL_PRESETS_BY_PROVIDER
 // 的 agentcore 条目保持同一套 id。
-const agentCoreDefaultModel = "glm-5.2"
+//
+// 选 glm-5.3 而不是 glm-5.2/5.1：2026-10-26 实测（容器内真出网，四象限四色
+// 图按 左上/右上/左下/右下 提问）glm-5.3 与 glm-5.3-flash[1m] 是真视觉
+// （4/4 全对，5.3 甚至自己读出了 PNG 的 8×8 尺寸），而 glm-5.2 全盲——
+// 洋红纯色图答「棕色」，损坏图它自己说「只提供了一个图片的URL链接」。
+// 图片附件走 image 块直达模型，默认模型必须挑看得见图的那个。
+const agentCoreDefaultModel = "glm-5.3"
 
 // agentCoreSettingsEnv 从 ~/.claude/settings.json 的 env 块里取一个值。
 // 与 claudeAuthEnvOverlay（agent_ai.go）同一套查找口径：先看子进程 env，
@@ -82,23 +89,124 @@ func agentCoreEnvOrSettings(key string) string {
 	return agentCoreSettingsEnv(key)
 }
 
+// agentCoreGetUserAPIKeysFn 是取用户 API key 列表的入口（测试可替换）。
+var agentCoreGetUserAPIKeysFn = auth.GetUserAPIKeys
+
+// 内核 key 缓存。user-center 是网络调用（分页拉全量），不能每轮 run 都打。
+// 成功缓存 30 分钟；失败只缓存 1 分钟——既不让一次网络抖动把用户钉在无 key
+// 状态半小时，也不让每轮 run 都去重打。
+var (
+	agentCoreTokenMu     sync.Mutex
+	agentCoreTokenCache  string
+	agentCoreTokenExpiry time.Time
+)
+
+const (
+	agentCoreTokenCacheTTL     = 30 * time.Minute
+	agentCoreTokenFailCacheTTL = time.Minute
+)
+
+// agentCoreAuthToken 解析内核出网要带的用户 API key。
+//
+// 为什么必须带：网关 /v1/messages 的 key 解析有两条路——请求自带用户的 key 就
+// 直接用它（source=user-api-key，不做分组门禁）；不带才落到 anthropic-duration
+// 分组的兜底 key。实测新账号（allowed_groups 只有 default）在兜底路径上必得
+//
+//	group "anthropic-duration" not available for platform "anthropic"
+//
+// 而 CLI provider 因为 quick-setup 把 ANTHROPIC_AUTH_TOKEN 写成了用户自己的
+// {{api_key}}，一直走的是第一条路。内核要与 CLI 同口径，否则「装了客户端就能
+// 直接对话」这个承诺对新用户不成立。
+//
+// 取值顺序：
+//  1. ANTHROPIC_AUTH_TOKEN（子进程 env → ~/.claude/settings.json）——零网络，
+//     与 CLI 用的是同一个值，quick-setup 用户恒命中；
+//  2. user-center 的 key 列表（带缓存）——没跑过 quick-setup 的新装用户兜底。
+//
+// 两条都拿不到就返回空串：内核照旧出网，行为退回「由代理按分组兜底」，不因为
+// 拿不到 key 就把这一轮判死。
+func agentCoreAuthToken() string {
+	if v := agentCoreEnvOrSettings("ANTHROPIC_AUTH_TOKEN"); v != "" {
+		return v
+	}
+	return agentCoreCachedUserAPIKey()
+}
+
+func agentCoreCachedUserAPIKey() string {
+	agentCoreTokenMu.Lock()
+	defer agentCoreTokenMu.Unlock()
+	if time.Now().Before(agentCoreTokenExpiry) {
+		return agentCoreTokenCache
+	}
+
+	key, err := agentCoreFetchUserAPIKey()
+	ttl := agentCoreTokenCacheTTL
+	if err != nil {
+		logger.Warn(fmt.Sprintf("agentcore: 取用户 API key 失败，本轮不带凭据: %v", err))
+	}
+	if err != nil || key == "" {
+		// 没有可用 key 与失败同价：都用短 TTL，等环境变化后尽快重试。
+		ttl = agentCoreTokenFailCacheTTL
+	}
+	agentCoreTokenCache = key
+	agentCoreTokenExpiry = time.Now().Add(ttl)
+	return key
+}
+
+// agentCoreFetchUserAPIKey 从 user-center 的 key 列表里挑一把能用的。
+//
+// 优先 anthropic 平台的 key：命中 candidate 之后网关会拿这把 key 去请求上游，
+// 平台不对的 key 在上游那一步仍然会失败。没有 anthropic key 才退回任意可用
+// key——总比不带强（不带是必然的分组门禁）。一把都没有返回空串。
+func agentCoreFetchUserAPIKey() (string, error) {
+	keys, err := agentCoreGetUserAPIKeysFn()
+	if err != nil {
+		return "", err
+	}
+	fallback := ""
+	for _, k := range keys {
+		if !k.SecretAvailable || strings.EqualFold(strings.TrimSpace(k.Status), "inactive") {
+			continue
+		}
+		key := strings.TrimSpace(k.Key)
+		if key == "" {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(k.Provider), "anthropic") {
+			return key, nil
+		}
+		if fallback == "" {
+			fallback = key
+		}
+	}
+	return fallback, nil
+}
+
+// agentCoreResetTokenCache 仅供测试：清掉进程内缓存。
+func agentCoreResetTokenCache() {
+	agentCoreTokenMu.Lock()
+	agentCoreTokenCache = ""
+	agentCoreTokenExpiry = time.Time{}
+	agentCoreTokenMu.Unlock()
+}
+
 // agentCoreBaseURL 解析出网地址。
 //
-// **与 CLI provider 的口径不同**：CLI 子进程拿得到 ANTHROPIC_AUTH_TOKEN，可以
-// 直连 https://api.aliang.one；内核刻意零凭据（不发 Authorization），直连这种
-// 端点必然 401。所以这里只接受**回环**地址——回环:56432 会被
-// shouldForceAliangRoute 强制走 aliang 隧道，由 relay 层注入 Authorization-Inner。
+// 与 CLI provider 同口径：都走**回环**:56432，由 shouldForceAliangRoute 强制
+// 路由到 aliang 隧道，relay 层注入 Authorization-Inner（标识用户/设备）。用户
+// 自己的 API key 另由 agentCoreAuthToken 作为 Authorization 显式带上，两者不是
+// 一回事（见 agentCoreAuthToken 注释）。
 //
 // 用户把 ANTHROPIC_BASE_URL 配成远端直连地址时（本机 settings.json 就是
-// https://api.aliang.one），照抄会让内核一上来就 401。宁可退回 56432 走隧道，
-// 也不要让「装了客户端却连不上」这种最难自查的失败发生。
+// https://api.aliang.one），不照抄：那条路要完整的 mTLS 客户端凭据，内核没有。
+// 宁可退回 56432 走隧道，也不要让「装了客户端却连不上」这种最难自查的失败发生。
 func agentCoreBaseURL() string {
 	if v := agentCoreEnvOrSettings("ANTHROPIC_BASE_URL"); v != "" {
 		if agentCoreIsLoopbackBase(v) {
 			return v
 		}
 		logger.Warn(fmt.Sprintf(
-			"agentcore: ANTHROPIC_BASE_URL=%s 非回环地址，内核无凭据无法直连，改用 %s 走平台代理",
+			"agentcore: ANTHROPIC_BASE_URL=%s 非回环地址，内核改走 %s 平台代理",
 			v, agentCoreDefaultBaseURL))
 	}
 	return agentCoreDefaultBaseURL
@@ -118,10 +226,12 @@ func agentCoreIsLoopbackBase(base string) bool {
 // 手机每次建会话都会显式传 model，那是权威来源；本函数只负责「传空时也要
 // 有东西能发出去」，且发出去的东西必须网关认。
 //
-// 首期**不传达 effort**。两条现成通道都用不了：模型名后缀是 codex 专用约定，
-// applyCodexEffortSuffix 的注释写明网关不解析带后缀的 claude 模型名、上游调用
-// 会直接坏掉；`--effort` 是 claude CLI 的 flag，进程内内核没有 argv 可传。
-// 宁可不设，也不能把模型名拼坏。
+// effort 走第三条通道：请求体的 output_config.effort（Claude Messages API
+// 语义）。模型名后缀是 codex 专用约定——applyCodexEffortSuffix 的注释写明
+// 网关不解析带后缀的 claude 模型名；`--effort` 是 claude CLI 的 flag，进程内
+// 内核没有 argv。而 output_config.effort 正是 claude CLI 收到 --effort 后往
+// 上游发的同一个字段，claude_code 路径已验证网关/GLM 接受，内核复用同一
+// 通道即可。档位归一在内核侧 NormalizeEffortLevel（无法识别的静默丢弃）。
 func agentCoreModel(run agentAIRun) string {
 	// 手机显式传的模型是权威来源，直接采用。
 	if m := strings.TrimSpace(run.model); m != "" && !agentCoreModelUnusable(m) {
@@ -210,6 +320,14 @@ func agentCoreSystemPrompt() string {
 //
 // 快照必须在 m.mu 内完成并校验 runSeq：run 是异步跑的，期间用户可能又发了
 // 新消息（session.history 变了），拿脏历史会让这一轮凭空多出后续对话。
+//
+// 附件分两类落位：
+//   - 图片 → 真正的 image 内容块（与 Claude 走同一条 buildClaudeImageBlocks，
+//     形状完全一致），附在最后一条 user 消息上；
+//   - 文本/其它 → 位置清单 + 内联正文（agentAIAttachmentPromptSuffix）。
+//
+// 图片为什么不能只靠清单里的路径：内核的 read 工具是**文本**工具，模型照着
+// 路径读回来的是「看起来是二进制文件，拒绝读取」。清单对图片等于没给。
 func (m *agentAIManager) agentCoreMessages(run agentAIRun) []agentcore.Message {
 	m.mu.Lock()
 	session := m.sessions[run.sessionID]
@@ -237,9 +355,32 @@ func (m *agentAIManager) agentCoreMessages(run agentAIRun) []agentcore.Message {
 		texts = append(texts, item.Content)
 	}
 
-	// 附件位置清单附在最后一条 user 消息上。首期 includeImages=false：内核
-	// 还没有多模态输入通道，图片只能靠清单里的路径让模型自己去读。
-	if suffix := agentAIAttachmentPromptSuffix(run.attachments, false); suffix != "" {
+	// 图片附件 → image 块。这里的 run.attachments 在 runCLI 里已经下载过
+	// （downloadAgentAIAttachments 设了 Path 并清掉 URL），所以不再下载一次。
+	//
+	// 上限沿用 buildClaudeImageBlocks 的 7.5MiB（而非内核 Read 工具的 5MiB）：
+	// 上游是网关后面的任意 Messages 兼容模型，真实限制本地无法验证。这里选宽
+	// 闸的理由是失败形态——超限会被上游明确拒绝（ai.error 可见），而本地先挡
+	// 会把它降级成「路径清单」，模型还得自己 Read，而 Read 同样有 5MiB 闸，
+	// 等于彻底看不到。宁可让上游判，也不要静默丢掉。
+	//
+	// 编码失败不能把整轮 run 拖死：附件是辅助信息，模型至少该拿到文字。降级
+	// 成清单里的一行路径 + 一句说明，并把原因写进日志（用户看不到这个错误，
+	// 只有日志能还原）。
+	imageBlocks, err := buildClaudeImageBlocks(run.attachments)
+	if err != nil {
+		logger.Warn(fmt.Sprintf("agentcore: 图片附件编码失败，本轮退化为文本清单 session=%s: %v", run.sessionID, err))
+		imageBlocks = nil
+	}
+
+	// 文本类附件（含内联正文）照旧走清单。
+	//
+	// 图片是否进清单取决于上一步编码成不成功：成功时 includeImages=false，
+	// 图片已由 image 块承载，清单里再列一遍路径只会诱导模型去 read 它；失败
+	// 时 includeImages=true，让模型至少知道「有一张图，在这个路径」，还能自己
+	// 用 Read 工具去取（Read 已支持图片），而不是彻底看不见。
+	includeImages := len(imageBlocks) == 0
+	if suffix := agentAIAttachmentPromptSuffix(run.attachments, includeImages); suffix != "" {
 		if n := len(msgs); n > 0 && msgs[n-1].Role == "user" {
 			texts[n-1] += suffix
 			msgs[n-1] = agentcore.TextMessage("user", texts[n-1])
@@ -247,7 +388,54 @@ func (m *agentAIManager) agentCoreMessages(run agentAIRun) []agentcore.Message {
 			msgs = append(msgs, agentcore.TextMessage("user", strings.TrimSpace(suffix)))
 		}
 	}
+
+	if len(imageBlocks) > 0 {
+		msgs = attachAgentCoreImageBlocks(msgs, imageBlocks)
+	}
 	return msgs
+}
+
+// attachAgentCoreImageBlocks 把 image 块挂到最后一条 user 消息上。
+//
+// 为什么必须是最后一条 user：图片描述的是「这一轮用户说了什么」。挂到别的
+// 位置，模型会把图当成历史上下文的一部分，答非所问。
+//
+// 最后一条是 assistant（历史以 assistant 收尾，用户还没说话）时不能硬塞进
+// assistant 消息——Anthropic 不接受 assistant 消息里的 image 块。此时补一条
+// 只含图片的 user 消息。
+func attachAgentCoreImageBlocks(msgs []agentcore.Message, blocks []map[string]interface{}) []agentcore.Message {
+	converted := make([]agentcore.ContentBlock, 0, len(blocks))
+	for _, block := range blocks {
+		source, _ := block["source"].(map[string]interface{})
+		if source == nil {
+			continue
+		}
+		src := &agentcore.ImageSource{}
+		src.Type, _ = source["type"].(string)
+		src.MediaType, _ = source["media_type"].(string)
+		src.Data, _ = source["data"].(string)
+		src.URL, _ = source["url"].(string)
+		if src.Data == "" && src.URL == "" {
+			continue
+		}
+		converted = append(converted, agentcore.ContentBlock{Type: agentcore.BlockTypeImage, Source: src})
+	}
+	if len(converted) == 0 {
+		return msgs
+	}
+
+	if n := len(msgs); n > 0 && msgs[n-1].Role == "user" {
+		// 把纯文本 user 消息升级成块消息：文字块在前，图片在后（与 Claude 的
+		// 排列一致，模型先读指令再看图）。
+		blocksOut := make([]agentcore.ContentBlock, 0, len(converted)+1)
+		if text, ok := msgs[n-1].Content.(string); ok && strings.TrimSpace(text) != "" {
+			blocksOut = append(blocksOut, agentcore.ContentBlock{Type: agentcore.BlockTypeText, Text: text})
+		}
+		blocksOut = append(blocksOut, converted...)
+		msgs[n-1] = agentcore.BlocksMessage("user", blocksOut)
+		return msgs
+	}
+	return append(msgs, agentcore.BlocksMessage("user", converted))
 }
 
 // ---------------------------------------------------------------------------
@@ -530,17 +718,30 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 	m.attachCoreSteer(run.sessionID, run.runSeq, coreSteer)
 
 	cfg := &agentcore.Config{
-		Client:    agentcore.NewClient(agentCoreBaseURL()),
+		// 带上用户自己的 API key：网关靠它走 user-api-key 通道，不做分组门禁。
+		// 不带的话，不在 anthropic-duration 组里的账号会被 403 挡下（见
+		// agentCoreAuthToken 注释）。拿不到 key 时 WithAPIKey("") 等价于不带，
+		// 行为退回「由代理按分组兜底」。
+		Client:    agentcore.NewClient(agentCoreBaseURL()).WithAPIKey(agentCoreAuthToken()),
 		Model:     agentCoreModel(run),
 		System:    agentCoreSystemPrompt(),
 		Tools:     agentcore.DefaultRegistry(),
 		SessionID: kernelSessionID,
+		// 会话的 effort 档位（手机选档 → server 透传 → 这里进请求体）。
+		// 空串/无法识别的档位在内核侧被丢弃，不下发。
+		Effort:    run.effort,
 		Env: &agentcore.ToolEnv{
 			ProjectPath: run.projectPath,
 			ScopeCheck:  agentCoreScopeCheck(run),
 			ShellPolicy: &agentCoreShellPolicy{run: run},
 		},
 		Approve: m.agentCoreApprove(run, writeJSON),
+		// 内核不 import 日志包，这里把宿主 logger 包一层递进去（签名不同：
+		// logger.Warn 是 variadic interface{}）。目前只承载截断这类无事件帧的
+		// 内部决策。
+		Logf: func(format string, args ...interface{}) {
+			logger.Warn(fmt.Sprintf(format, args...))
+		},
 		Emit: func(frame []byte) error {
 			_, err := pipeWriter.Write(frame)
 			return err
@@ -620,12 +821,18 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 
 // agentCoreLoopHooks 组装内核的循环钩子。
 //
-// 首期只接 steering：用户在运行中插的话必须在**下一次** LLM 调用前进入上下文，
-// 这正是 GetSteeringMessages 的时机。PrepareRequest / FinishTurn 留空——前者
-// 的诉求（改 system / max_tokens）已在 Config 里静态给定，后者没有消费方。
+// steering 与收尾追补共用同一个 drain：前者在**每次** LLM 调用前取走运行中
+// 插话（这正是插话生效的时机）；后者兜住「插话在最后一轮流式尾声才排进队列、
+// 已经没有下一次调用」的情形——不追补的话插话会悬在队列里没有回复，直到用户
+// 下一条消息才被看到（2026-10-26 实测）。两个钩子先到先得，drain 排空队列，
+// 不会重复投递。PrepareRequest / FinishTurn 留空——前者的诉求（改 system /
+// max_tokens）已在 Config 里静态给定，后者没有消费方。
 func agentCoreLoopHooks(m *agentAIManager, run agentAIRun) agentcore.LoopHooks {
 	return agentcore.LoopHooks{
 		GetSteeringMessages: func() []agentcore.Message {
+			return m.drainAgentCoreSteering(run)
+		},
+		GetFollowUpMessages: func() []agentcore.Message {
 			return m.drainAgentCoreSteering(run)
 		},
 	}
@@ -663,9 +870,9 @@ func newAgentAICoreSteerControl(run agentAIRun, write agentTerminalWriter) *agen
 
 // deliver 把一条 steer 排进队列。closed 之后拒绝（run 已结束）。
 //
-// ImageBlocks 被忽略：内核首期没有多模态输入通道（与 agentCoreMessages 的
-// includeImages=false 同因）。文本附件已在 ai.steer 入口并进 Content，所以
-// 只有纯图片插话会退化成「图片丢失」，不会丢文字。
+// ImageBlocks 与 Content 一起入队，由 drain 转成「text 块 + image 块」。
+// 注意 ImageBlocks 在 ai.steer 入口就已经是 base64（见 agentAISteerMessage
+// 的注释），排队期间不依赖任何临时文件。
 func (c *agentAICoreSteerControl) deliver(msg agentAISteerMessage) (string, error) {
 	if c == nil {
 		return "not_running", errors.New("agentcore steer control is unavailable")
@@ -683,6 +890,9 @@ func (c *agentAICoreSteerControl) deliver(msg agentAISteerMessage) (string, erro
 //
 // 由内核在每次 LLM 调用前调用（run goroutine）。取走即视为「已进入上下文」：
 // 返回的消息会被 loop.go 立刻 append 进 history，紧接着就是请求组装。
+//
+// 带图插话发成块消息（text 块 + image 块），纯文字仍发纯字符串——单块文本
+// 用字符串能让上游少一层解析，也更贴近真实 claude-code 的请求形状。
 func (c *agentAICoreSteerControl) drain() []agentcore.Message {
 	if c == nil {
 		return nil
@@ -696,10 +906,42 @@ func (c *agentAICoreSteerControl) drain() []agentcore.Message {
 
 	out := make([]agentcore.Message, 0, len(queued))
 	for _, item := range queued {
-		out = append(out, agentcore.TextMessage("user", item.Content))
+		out = append(out, agentCoreSteerMessage(item))
 		emitAgentAISteerAck(write, sessionID, item.MessageID, "applied", "", "")
 	}
 	return out
+}
+
+// agentCoreSteerMessage 把一条排队插话转成内核消息。
+//
+// item.ImageBlocks 是 ai.steer 入口就编好的 base64（不是路径）：插话可能排队
+// 很久才被 drain，路径指向的临时文件早被清理了。这里只做形状转换。
+func agentCoreSteerMessage(item agentAISteerMessage) agentcore.Message {
+	images := make([]agentcore.ContentBlock, 0, len(item.ImageBlocks))
+	for _, block := range item.ImageBlocks {
+		source, _ := block["source"].(map[string]interface{})
+		if source == nil {
+			continue
+		}
+		src := &agentcore.ImageSource{}
+		src.Type, _ = source["type"].(string)
+		src.MediaType, _ = source["media_type"].(string)
+		src.Data, _ = source["data"].(string)
+		src.URL, _ = source["url"].(string)
+		if src.Data == "" && src.URL == "" {
+			continue
+		}
+		images = append(images, agentcore.ContentBlock{Type: agentcore.BlockTypeImage, Source: src})
+	}
+	if len(images) == 0 {
+		return agentcore.TextMessage("user", item.Content)
+	}
+	blocks := make([]agentcore.ContentBlock, 0, len(images)+1)
+	if strings.TrimSpace(item.Content) != "" {
+		blocks = append(blocks, agentcore.ContentBlock{Type: agentcore.BlockTypeText, Text: item.Content})
+	}
+	blocks = append(blocks, images...)
+	return agentcore.BlocksMessage("user", blocks)
 }
 
 // close 是 run 结束时的兜底：把仍未取走的插话逐个 ack 成 not_running，

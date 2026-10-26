@@ -21,8 +21,34 @@ import (
 type ToolResult struct {
 	// Content 是回填给模型的文本。
 	Content string
+	// Images 是随结果一起回填的图片块（Read 读图片时用）。
+	//
+	// 为什么工具结果要能带图：Read 是模型接触文件的唯一通道，只回一句「这是
+	// 图片」等于告诉模型「你看不到」。把字节真的内联进 tool_result，模型才能
+	// 描述截图、读图表数字。
+	//
+	// 为空时 tool_result 的 content 仍是纯字符串（形状与之前完全一致，不影响
+	// 任何现有工具）；非空时变成「文本块 + 图片块」数组。
+	Images []ContentBlock
 	// IsError 为 true 时以 is_error 回填，模型会据此自行纠错。
 	IsError bool
+}
+
+// ContentForModel 返回回填给模型的 tool_result content。
+//
+// Anthropic 的 tool_result.content 既可以是字符串也可以是内容块数组，这里按
+// 有没有图片选形状：无图走字符串（少一层解析，也更贴近真实 claude-code 的
+// 请求形状），有图才升级成数组。
+func (r ToolResult) ContentForModel() interface{} {
+	if len(r.Images) == 0 {
+		return r.Content
+	}
+	blocks := make([]ContentBlock, 0, len(r.Images)+1)
+	if strings.TrimSpace(r.Content) != "" {
+		blocks = append(blocks, ContentBlock{Type: BlockTypeText, Text: r.Content})
+	}
+	blocks = append(blocks, r.Images...)
+	return blocks
 }
 
 // ErrorResult 构造一个失败结果。

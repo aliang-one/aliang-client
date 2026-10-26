@@ -263,3 +263,55 @@ func messageTexts(t *testing.T, msgs []Message) []string {
 	}
 	return out
 }
+
+// TestRunFollowUpAnswersSteeringQueuedAtTail 锁的是收尾追补：插话在**最后一
+// 轮流式尾声**才排进队列时，已经没有任何「下一次 LLM 调用」能取走它——没有
+// 追补的话 run 结束、插话悬在队列里没有回复（2026-10-26 容器实测：flash 模型
+// 第一轮纯 tool_use 不吐文本 delta，烟测在第二轮总结文本出来才发 steer）。
+// 契约：GetFollowUpMessages 取走残余插话后再答一轮。
+func TestRunFollowUpAnswersSteeringQueuedAtTail(t *testing.T) {
+	rec := &requestRecorder{}
+	srv := sseServer(t, rec.handler(t, []string{steerTurn2(), steerTurn2()}))
+
+	registry := NewRegistry()
+	registry.Register(&stubTool{name: "Stub", result: ToolResult{Content: "ok"}})
+
+	const tailText = "尾声才排队的插话"
+	var followUpCalls int32
+	cfg := &Config{
+		Client:    NewClient(srv.URL),
+		Model:     "claude-x",
+		SessionID: "sess-followup",
+		Tools:     registry,
+		Hooks: LoopHooks{
+			// GetSteeringMessages 恒空——插话错过了每一次「下一次调用」。
+			GetSteeringMessages: func() []Message { return nil },
+			// 收尾追补：第一次收尾时给出残余插话，之后为空。
+			GetFollowUpMessages: func() []Message {
+				if atomic.AddInt32(&followUpCalls, 1) == 1 {
+					return []Message{TextMessage("user", tailText)}
+				}
+				return nil
+			},
+		},
+	}
+	res, err := Run(context.Background(), cfg, []Message{TextMessage("user", "跑个任务")})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Turns != 2 {
+		t.Fatalf("Turns = %d, want 2（追补应再答一轮）", res.Turns)
+	}
+
+	reqs := rec.snapshot()
+	if len(reqs) != 2 {
+		t.Fatalf("请求次数 = %d, want 2", len(reqs))
+	}
+	second := reqs[1].Messages
+	if got := messageText(t, second[len(second)-1]); got != tailText {
+		t.Errorf("第二轮末条 = %q, want 追补插话 %q", got, tailText)
+	}
+	if atomic.LoadInt32(&followUpCalls) < 2 {
+		t.Errorf("追补钩子只在收尾时调用，实际 %d 次（第二轮收尾应再次询问并得空）", followUpCalls)
+	}
+}

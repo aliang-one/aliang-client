@@ -474,13 +474,20 @@ func TestRunMultiTurnResultCarriesLastTurnOnly(t *testing.T) {
 func TestRunTruncatedToolCallsNotExecuted(t *testing.T) {
 	// stop_reason == max_tokens 时，tool_use 的 JSON 参数是不完整的，
 	// 执行会写坏文件。pi 的做法是整批失败、一个都不执行。
+	//
+	// 注意这里只钉「这批工具不执行 + 回填失败结果」——**整轮是否终止**是另一条
+	// 语义（见 loop_truncation_test.go）：截断后循环继续，模型拿到「请拆小后
+	// 重试」再收尾，所以这里给一个恢复回合，避免误把「继续」测成「终止」。
 	turn := `{"type":"message_start","message":{"id":"msg_trunc","model":"claude-x"}}` + "\n\n" +
 		`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_x","name":"Stub"}}` + "\n\n" +
 		`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"x\":\"unfin"}}` + "\n\n" +
 		`data: {"type":"content_block_stop","index":0}` + "\n\n" +
 		`data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"}}`
+	recover := `data: {"type":"message_start","message":{"id":"msg_rec","model":"claude-x"}}` + "\n\n" +
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"已拆小"}}` + "\n\n" +
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}`
 
-	srv := sseServer(t, (&turnScript{turns: []string{turn}}).handler(t))
+	srv := sseServer(t, (&turnScript{turns: []string{turn, recover}}).handler(t))
 
 	tool := &stubTool{name: "Stub", result: ToolResult{Content: "不该被调用"}}
 	registry := NewRegistry()
@@ -501,23 +508,11 @@ func TestRunTruncatedToolCallsNotExecuted(t *testing.T) {
 	if n := atomic.LoadInt32(&tool.calls); n != 0 {
 		t.Fatalf("截断时工具不应执行，实际调用 %d 次", n)
 	}
-	if res.Turns != 1 {
-		t.Errorf("Turns = %d, want 1", res.Turns)
+	if res.Turns != 2 {
+		t.Errorf("Turns = %d, want 2（截断轮 + 恢复轮）", res.Turns)
 	}
 
 	frames := rec.frames(t)
-	rf := resultFrame(t, frames)
-	if sub, _ := rf["subtype"].(string); sub != ResultSubtypeErrorMaxTurns {
-		t.Errorf("result.subtype = %q, want %s", sub, ResultSubtypeErrorMaxTurns)
-	}
-	if isErr, _ := rf["is_error"].(bool); !isErr {
-		t.Error("截断失败时 is_error 必须为 true，否则宿主不会转成 ai.error")
-	}
-	// subtype 必须以 error_ 开头：claudeResultError（agent_ai.go:6399）靠这个前缀
-	// 判定失败，否则手机会把失败当成功收尾。
-	if sub, _ := rf["subtype"].(string); !strings.HasPrefix(sub, "error_") {
-		t.Errorf("失败 subtype 必须以 error_ 开头，实际 %q", sub)
-	}
 
 	// 必须给每个 tool_use 回填一条失败 tool_result，否则模型下一轮会认为
 	// 工具还在执行。
@@ -531,6 +526,16 @@ func TestRunTruncatedToolCallsNotExecuted(t *testing.T) {
 	}
 	if id, _ := tr["tool_use_id"].(string); id != "toolu_x" {
 		t.Errorf("tool_result.tool_use_id = %q, want toolu_x", id)
+	}
+
+	// 恢复轮正常收尾：最终 result 帧不该是错误，否则宿主会把「模型已自行
+	// 拆小重写成功」的一轮报成失败。
+	rf := resultFrame(t, frames)
+	if isErr, _ := rf["is_error"].(bool); isErr {
+		t.Error("恢复轮收尾时 is_error 必须为 false")
+	}
+	if sub, _ := rf["subtype"].(string); strings.HasPrefix(sub, "error_") {
+		t.Errorf("恢复轮 subtype = %q，不应以 error_ 开头", sub)
 	}
 }
 
