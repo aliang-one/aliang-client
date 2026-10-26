@@ -3,6 +3,7 @@ package services
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -20,6 +21,47 @@ func writeAgentCoreJournalFixture(t *testing.T, dir, sessionID, projectPath stri
 	j.appendUser(sessionID, "m2", "第二句", base.Add(2*time.Minute).Format(time.RFC3339))
 	j.appendAssistant(sessionID, "m2-assistant", "第二答", base.Add(3*time.Minute).Format(time.RFC3339))
 	j.appendEnd(sessionID, "success", "")
+}
+
+// writeCoreJournalRawFixture 自写原始 JSONL 行（既有 writeAgentCoreJournalFixture
+// 内容固定不支持自定义行，这里新建一个小 helper）。
+func writeCoreJournalRawFixture(t *testing.T, sessionID string, lines ...string) string {
+	t.Helper()
+	dir := agentCoreJournalDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir 失败: %v", err)
+	}
+	path := filepath.Join(dir, sessionID+".jsonl")
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatalf("写 fixture 失败: %v", err)
+	}
+	return path
+}
+
+func TestReadAgentCoreSessionMetaToolRows(t *testing.T) {
+	setTestAgentHome(t)
+	path := writeCoreJournalRawFixture(t, "sess-tools",
+		`{"kind":"session","session_id":"sess-tools","project_path":"/tmp/p","model":"m","created_at":"2026-10-26T01:00:00Z"}`,
+		`{"kind":"msg","role":"user","message_id":"u1","text":"查一下","ts":"2026-10-26T01:00:05Z"}`,
+		`{"kind":"tool","tool":"mcp__s__lookup","summary":"q=hi","is_error":false,"ts":"2026-10-26T01:00:06Z"}`,
+		`{"kind":"msg","role":"assistant","message_id":"a1","text":"结果","ts":"2026-10-26T01:00:09Z"}`,
+	)
+	session := readAgentCoreSessionMetaWithOptions(path, agentVibeSessionReadOptions{Limit: agentVibeTranscriptMaxMessages, IncludePageMeta: true})
+	if session.MessageCount != 2 || session.DisplayMessageCount == nil || *session.DisplayMessageCount != 2 {
+		t.Fatalf("tool 行不得计入对话计数: %d %v", session.MessageCount, session.DisplayMessageCount)
+	}
+	toolRows := 0
+	for _, msg := range session.Transcript {
+		if msg.Role == "tool" {
+			toolRows++
+			if msg.Content != "mcp__s__lookup q=hi" {
+				t.Fatalf("tool 行渲染错误: %+v", msg)
+			}
+		}
+	}
+	if toolRows != 1 {
+		t.Fatalf("Transcript 应含 1 条 tool 行, got %d", toolRows)
+	}
 }
 
 func TestReadAgentCoreSessionMetaSummary(t *testing.T) {

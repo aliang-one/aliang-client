@@ -157,6 +157,24 @@ func (j *agentCoreJournal) appendEnd(sessionID, status, errMsg string) {
 	j.appendLineLocked(sessionID, row)
 }
 
+// appendTool 落 journal v2 工具行（kind=tool）。不参与 message_id 去重：
+// 每次调用一行，是轨迹不是消息。写失败 Warn 吞掉。守卫与 appendEnd 家族
+// 同款（nil/dir 空/sessionID 空直接返回）。
+func (j *agentCoreJournal) appendTool(sessionID, tool, summary string, isError bool) {
+	if j == nil || j.dir == "" || strings.TrimSpace(sessionID) == "" {
+		return
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.appendLineLocked(sessionID, map[string]interface{}{
+		"kind":     "tool",
+		"tool":     tool,
+		"summary":  summary,
+		"is_error": isError,
+		"ts":       time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
 // appendLineLocked 追加一行；调用方必须持有 j.mu。写失败 Warn 后吞掉，
 // 返回是否写成功（mkdir/open/write 任一失败即 false）——appendMsg 靠它
 // 决定去重键只记「已落盘」。目录懒创建在此处（O_CREATE 建不了缺失的父
