@@ -318,6 +318,34 @@ func agentCoreToolEnv() []string {
 	return env
 }
 
+// cachedOSVersion 取一次 "Darwin 25.2.0" 式内核版本，缓存进程生命周期。
+// uname 失败（如 windows）退回 runtime.GOOS，不阻塞会话。
+var (
+	osVersionOnce sync.Once
+	osVersionStr  string
+)
+
+func cachedOSVersion() string {
+	osVersionOnce.Do(func() {
+		out, err := exec.Command("uname", "-sr").Output()
+		if err != nil {
+			osVersionStr = runtime.GOOS
+			return
+		}
+		osVersionStr = strings.TrimSpace(string(out))
+	})
+	return osVersionStr
+}
+
+func agentCoreIsGitRepo(projectPath string) bool {
+	if strings.TrimSpace(projectPath) == "" {
+		return false
+	}
+	info, err := os.Stat(filepath.Join(projectPath, ".git"))
+	// .git 是目录（普通仓库）或文件（worktree）都算。
+	return err == nil && (info.IsDir() || info.Mode().IsRegular())
+}
+
 // agentCoreSystemPrompt 组装 system prompt。
 //
 // 必须带上 agentAIOptionSystemPrompt：手机端的「方案选择」卡片靠 assistant
@@ -327,13 +355,33 @@ func agentCoreToolEnv() []string {
 //
 // 首期不接 goal 的 task-report prompt（withGoalTaskReportSystemPrompt 只能
 // 改 agentAITool，不适用于进程内内核）；goal 任务请继续用 CLI provider。
-func agentCoreSystemPrompt() string {
+func agentCoreSystemPrompt(projectPath string) string {
 	var b strings.Builder
 	b.WriteString("You are Aliang Agent, a coding assistant running inside the Aliang remote agent. ")
 	b.WriteString("You work directly in the user's project directory and can read, write and edit files, ")
 	b.WriteString("search the codebase, and run shell commands through the provided tools. ")
 	b.WriteString("Prefer doing the work over describing it: inspect the relevant files first, then make ")
 	b.WriteString("the smallest change that solves the problem. Reply in the user's language.\n\n")
+
+	// 环境块：CLI provider 场景由 claude CLI 自动注入（cwd/git/平台/OS 版本/
+	// 日期），内核没有 CLI，没人注入 → 模型对环境全盲，只能靠可能失真的 Bash
+	// 探测猜环境（曾误报「没有 nodejs」）。这里对齐 CLI 的注入行为。
+	gitMark := "no"
+	if agentCoreIsGitRepo(projectPath) {
+		gitMark = "yes"
+	}
+	b.WriteString("\n<env>\n")
+	if strings.TrimSpace(projectPath) == "" {
+		b.WriteString("Working directory: (not provided)\n")
+	} else {
+		fmt.Fprintf(&b, "Working directory: %s\n", projectPath)
+	}
+	fmt.Fprintf(&b, "Is a git repository: %s\n", gitMark)
+	fmt.Fprintf(&b, "Platform: %s\n", runtime.GOOS)
+	fmt.Fprintf(&b, "OS Version: %s\n", cachedOSVersion())
+	fmt.Fprintf(&b, "Today's date: %s\n", time.Now().Format("2006-01-02"))
+	b.WriteString("</env>\n\n")
+
 	b.WriteString(agentAIOptionSystemPrompt)
 	return b.String()
 }
@@ -773,7 +821,7 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		// 行为退回「由代理按分组兜底」。
 		Client:    agentcore.NewClient(agentCoreBaseURL()).WithAPIKey(agentCoreAuthToken()),
 		Model:     agentCoreModel(run),
-		System:    agentCoreSystemPrompt(),
+		System:    agentCoreSystemPrompt(run.projectPath),
 		Tools:     agentcore.DefaultRegistry(),
 		SessionID: kernelSessionID,
 		// 会话的 effort 档位（手机选档 → server 透传 → 这里进请求体）。

@@ -2,7 +2,12 @@ package services
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
+	"time"
 
 	auth "aliang.one/nursorgate/processor/auth"
 )
@@ -249,5 +254,39 @@ func TestAgentCoreToolEnvTTYDefaults(t *testing.T) {
 	env = agentCoreToolEnv()
 	if _, ok := scanEnvValue(env, "LANG"); ok {
 		t.Fatalf("LC_ALL=C 在场时不应再补 LANG")
+	}
+}
+
+// 系统提示必须带环境块：CLI provider 由 claude CLI 自动注入，内核没有 CLI，
+// 不补齐则模型对平台/cwd/日期全盲，只能靠（可能失真的）Bash 探测猜环境。
+func TestAgentCoreSystemPromptIncludesEnvBlock(t *testing.T) {
+	dir := t.TempDir()
+	prompt := agentCoreSystemPrompt(dir)
+	if !strings.Contains(prompt, "Working directory: "+dir) {
+		t.Fatalf("缺 cwd: %s", prompt)
+	}
+	if !strings.Contains(prompt, "Is a git repository: no") {
+		t.Fatalf("临时目录应判非 git: %s", prompt)
+	}
+	if !strings.Contains(prompt, "Platform: "+runtime.GOOS) {
+		t.Fatalf("缺平台: %s", prompt)
+	}
+	if !strings.Contains(prompt, "Today's date: "+time.Now().Format("2006-01-02")) {
+		t.Fatalf("缺日期: %s", prompt)
+	}
+	if !strings.Contains(prompt, "OS Version: ") {
+		t.Fatalf("缺 OS 版本: %s", prompt)
+	}
+	// aliang-options 卡片协议必须保留（手机方案选择依赖）。
+	if !strings.Contains(prompt, agentAIOptionSystemPrompt) {
+		t.Fatalf("options 协议丢失")
+	}
+
+	gitDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(gitDir, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(agentCoreSystemPrompt(gitDir), "Is a git repository: yes") {
+		t.Fatalf("git 目录应判 yes")
 	}
 }
