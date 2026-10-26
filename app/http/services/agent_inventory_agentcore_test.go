@@ -178,6 +178,27 @@ func TestCollectAgentVibeSessionsIncludesAgentCore(t *testing.T) {
 	}
 }
 
+func TestFindAgentVibeSessionDetailAgentCoreEndToEnd(t *testing.T) {
+	setTestAgentHome(t)
+	writeAgentCoreJournalFixture(t, agentCoreJournalDir(), "conv-detail", "/tmp/pd")
+
+	session := findAgentVibeSessionDetail("conv-detail", "", "/tmp/pd", agentVibeSessionReadOptions{Limit: 24, IncludePageMeta: true})
+	if session.ID != "conv-detail" {
+		t.Fatalf("详情未命中: %+v（枚举根或分发分支漏配）", session)
+	}
+	if len(session.Transcript) != 4 || session.Transcript[0].Content != "第一句" {
+		t.Errorf("转录 = %+v", session.Transcript)
+	}
+	if session.TranscriptPage == nil || session.TranscriptPage.TotalCount != 4 {
+		t.Errorf("分页元数据 = %v", session.TranscriptPage)
+	}
+	// 未命中路径不误报。
+	missing := findAgentVibeSessionDetail("conv-nope", "", "", agentVibeSessionReadOptions{Limit: 24})
+	if missing.ID != "" {
+		t.Errorf("不存在的会话应返回空: %+v", missing)
+	}
+}
+
 func TestOverlayMergesAgentCoreActiveWithFileEntry(t *testing.T) {
 	// 运行中：活跃覆盖层与文件条目同裸 ID → 合成一条，不出双卡。
 	setTestAgentHome(t)

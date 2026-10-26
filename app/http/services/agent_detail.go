@@ -263,6 +263,7 @@ func candidateAgentVibeSessionFiles(sourceSessionID string) []string {
 		out = append(out, findRecentAgentFiles(root, pattern, agentVibeDetailCandidateFileLimit)...)
 	}
 	out = append(out, findRecentAgentFiles(filepath.Join(home, ".claude", "projects"), pattern, agentVibeDetailCandidateFileLimit)...)
+	out = append(out, findRecentAgentFiles(filepath.Join(home, ".aliang", "ai-sessions"), pattern, agentVibeDetailCandidateFileLimit)...)
 	return out
 }
 
@@ -276,11 +277,15 @@ func allAgentVibeSessionDetailFiles() []string {
 		findRecentAgentFiles(filepath.Join(home, ".codex", "archived_sessions"), "*.jsonl", 100)...,
 	)
 	files = append(files, findRecentAgentFiles(filepath.Join(home, ".claude", "projects"), "*.jsonl", 100)...)
+	files = append(files, findRecentAgentFiles(filepath.Join(home, ".aliang", "ai-sessions"), "*.jsonl", 100)...)
 	return files
 }
 
 func readAgentVibeSessionDetailFile(path string, options agentVibeSessionReadOptions) models.AgentVibeSession {
 	options.IncludePageMeta = true
+	if strings.Contains(path, string(filepath.Separator)+".aliang"+string(filepath.Separator)) {
+		return readAgentCoreSessionMetaWithOptions(path, options)
+	}
 	if strings.Contains(path, string(filepath.Separator)+".codex"+string(filepath.Separator)) {
 		return readCodexSessionMetaWithOptions(path, options)
 	}
