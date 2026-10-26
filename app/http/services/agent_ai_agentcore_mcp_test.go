@@ -3,8 +3,11 @@ package services
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -151,7 +154,10 @@ func TestAgentCoreMCPBridgeRecoversPanic(t *testing.T) {
 	}
 }
 
-func TestAgentCoreMCPListToolsFollowsCursor(t *testing.T) {
+// 注：in-memory server 不分页，这里测的是单页路径。多页 cursor 跟随
+// （listAgentCoreMCPTools 的 nextCursor 循环）未覆盖——需手写分页
+// JSON-RPC transport，已记账。
+func TestAgentCoreMCPListToolsSinglePage(t *testing.T) {
 	session := startTestMCPSession(t, "t1", func(map[string]interface{}) (string, bool) { return "ok", false })
 	tools, err := listAgentCoreMCPTools(context.Background(), session)
 	if err != nil {
@@ -215,5 +221,113 @@ func TestAgentCoreMCPServerToolDefsSkipsHeaders(t *testing.T) {
 	defer closeAll()
 	if len(bridges) != 0 {
 		t.Fatalf("带 headers 的 http server 应预判跳过（不 dial）: %+v", bridges)
+	}
+}
+
+func TestAgentCoreMCPBridgeRecoversOuterPanic(t *testing.T) {
+	var journaled []bool
+	// session 置 nil：CallTool 里解引用 nil 必 panic，打的是外层兜底路径。
+	bridge := &agentCoreMCPBridge{session: nil, rawTool: "x", name: "mcp__s__x",
+		onCall: func(tool, summary string, isErr bool) { journaled = append(journaled, isErr) }}
+	res := bridge.Execute(context.Background(), map[string]interface{}{}, nil)
+	if !res.IsError || !strings.Contains(res.Content, "MCP 工具执行崩溃") {
+		t.Fatalf("外层 panic 应定向报错: %+v", res)
+	}
+	if strings.Contains(res.Content, "goroutine") {
+		t.Fatalf("报错文案不得泄漏 panic 栈: %q", res.Content)
+	}
+	if len(journaled) != 1 || !journaled[0] {
+		t.Fatalf("journal 应记 isErr=true: %v", journaled)
+	}
+}
+
+func TestAgentCoreMCPServerToolDefsSkipsDeadServer(t *testing.T) {
+	m := &agentAIManager{}
+	bridges, closeAll := m.agentCoreMCPServerToolDefs(context.Background(), []agentCoreMCPRawServer{
+		{Name: "ghost", Command: "definitely-not-a-real-binary"},
+	}, nil)
+	defer closeAll()
+	if len(bridges) != 0 {
+		t.Fatalf("dial 失败的 server 应跳过: %+v", bridges)
+	}
+}
+
+// startHTTPTestMCPServer 起一个真 streamable HTTP MCP server（SDK 现成
+// handler），返回其 /mcp 端点。用于打通 dial→list→bridge 全链真 transport。
+func startHTTPTestMCPServer(t *testing.T, toolNames []string, handler func(args map[string]interface{}) (string, bool)) string {
+	t.Helper()
+	server := mcp.NewServer(&mcp.Implementation{Name: "http-srv", Version: "0"}, nil)
+	for _, name := range toolNames {
+		server.AddTool(&mcp.Tool{Name: name, Description: "测试工具", InputSchema: map[string]any{
+			"type": "object", "properties": map[string]any{"q": map[string]any{"type": "string"}},
+		}}, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			args := map[string]interface{}{}
+			_ = json.Unmarshal(req.Params.Arguments, &args)
+			text, isErr := handler(args)
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: text}}, IsError: isErr}, nil
+		})
+	}
+	mux := http.NewServeMux()
+	mux.Handle("/mcp", mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, nil))
+	ts := httptest.NewServer(mux)
+	t.Cleanup(ts.Close)
+	return ts.URL + "/mcp"
+}
+
+func TestAgentCoreMCPServerToolDefsHTTPDial(t *testing.T) {
+	endpoint := startHTTPTestMCPServer(t, []string{"echo"}, func(args map[string]interface{}) (string, bool) {
+		return "回显:" + args["q"].(string), false
+	})
+	m := &agentAIManager{}
+	bridges, closeAll := m.agentCoreMCPServerToolDefs(context.Background(), []agentCoreMCPRawServer{
+		{Name: "remote", Type: "http", URL: endpoint},
+	}, nil)
+	defer closeAll()
+	if len(bridges) != 1 {
+		t.Fatalf("http dial 应产出 1 桥: %+v", bridges)
+	}
+	res := bridges[0].Execute(context.Background(), map[string]interface{}{"q": "hi"}, nil)
+	if res.IsError || !strings.Contains(res.Content, "回显:hi") {
+		t.Fatalf("全链执行失败: %+v", res)
+	}
+}
+
+func TestAgentCoreMCPServerToolDefsToolCap(t *testing.T) {
+	names := make([]string, 130)
+	for i := range names {
+		names[i] = "t" + strconv.Itoa(i)
+	}
+	endpoint := startHTTPTestMCPServer(t, names, func(map[string]interface{}) (string, bool) { return "ok", false })
+	m := &agentAIManager{}
+	bridges, closeAll := m.agentCoreMCPServerToolDefs(context.Background(), []agentCoreMCPRawServer{
+		{Name: "big", Type: "http", URL: endpoint},
+	}, nil)
+	defer closeAll()
+	if len(bridges) != agentCoreMCPToolCap {
+		t.Fatalf("130 工具应熔断在 cap=%d, got %d", agentCoreMCPToolCap, len(bridges))
+	}
+	uniq := map[string]bool{}
+	for _, b := range bridges {
+		uniq[b.Name()] = true
+	}
+	if len(uniq) != len(bridges) {
+		t.Fatalf("熔断后不得重名: %d/%d", len(uniq), len(bridges))
+	}
+}
+
+func TestAgentCoreMCPBridgeTransportError(t *testing.T) {
+	var isErrs []bool
+	session := startTestMCPSession(t, "t", func(map[string]interface{}) (string, bool) { return "ok", false })
+	bridge := &agentCoreMCPBridge{session: session, rawTool: "t", name: "mcp__s__t",
+		onCall: func(tool, summary string, isErr bool) { isErrs = append(isErrs, isErr) }}
+	if err := session.Close(); err != nil {
+		t.Fatalf("Close 失败: %v", err)
+	}
+	res := bridge.Execute(context.Background(), map[string]interface{}{}, nil)
+	if !res.IsError || !strings.Contains(res.Content, "MCP 调用失败") {
+		t.Fatalf("关停后调用应走错误路径（非 panic）: %+v", res)
+	}
+	if len(isErrs) != 1 || !isErrs[0] {
+		t.Fatalf("onCall 应收到 isErr=true: %v", isErrs)
 	}
 }

@@ -144,20 +144,14 @@ func (b *agentCoreMCPBridge) Description() string                 { return b.des
 func (b *agentCoreMCPBridge) InputSchema() map[string]interface{} { return b.schema }
 
 // Execute：CallTool + journal 回调。内核 executeOne 已有全量 recover（loop.go
-// d2da2b5 修复），这里的 recover 是纵深防御——journal 回调在宿主层，不允许
-// 它把工具结果搅了。
+// d2da2b5 修复），这里的 recover 是纵深防御——panic 转成定向报错文案 +
+// journal isErr，不许裸穿（曾因 defer 里漏调 recover() 变死代码，评审实证）。
 func (b *agentCoreMCPBridge) Execute(ctx context.Context, input map[string]interface{}, _ *agentcore.ToolEnv) (result agentcore.ToolResult) {
 	summary := summarizeAgentCoreMCPInput(input)
-	panicked := true
 	defer func() {
-		if panicked {
-			result = agentcore.ToolResult{Content: "MCP 工具执行崩溃（已兜底）", IsError: true}
-			if b.onCall != nil {
-				func() {
-					defer func() { _ = recover() }() // journal 回调的 panic 不许二次炸
-					b.onCall(b.name, summary, true)
-				}()
-			}
+		if rec := recover(); rec != nil {
+			result = agentcore.ToolResult{Content: fmt.Sprintf("MCP 工具执行崩溃（已兜底）: %v", rec), IsError: true}
+			b.safeOnCall(summary, true)
 		}
 	}()
 	res, err := b.session.CallTool(ctx, &mcp.CallToolParams{Name: b.rawTool, Arguments: input})
@@ -169,14 +163,17 @@ func (b *agentCoreMCPBridge) Execute(ctx context.Context, input map[string]inter
 		text, isErr = agentCoreMCPResultText(res)
 	}
 	text = truncateAgentCoreMCPOutput(text)
-	panicked = false
-	if b.onCall != nil {
-		func() {
-			defer func() { _ = recover() }()
-			b.onCall(b.name, summary, isErr)
-		}()
-	}
+	b.safeOnCall(summary, isErr)
 	return agentcore.ToolResult{Content: text, IsError: isErr}
+}
+
+// safeOnCall journal 回调的 panic 不许二次炸、也不许搅了已定的工具结果。
+func (b *agentCoreMCPBridge) safeOnCall(summary string, isErr bool) {
+	if b.onCall == nil {
+		return
+	}
+	defer func() { _ = recover() }()
+	b.onCall(b.name, summary, isErr)
 }
 
 // agentCoreMCPResultText 拼接 content blocks 的文本（非 Text 块跳过）。
@@ -324,6 +321,9 @@ func (m *agentAIManager) agentCoreMCPServerToolDefs(ctx context.Context, raws []
 	bridges := make([]agentcore.Tool, 0, agentCoreMCPToolCap)
 	seen := map[string]bool{}
 	closeAll := func() {
+		// ⚠️ 串行关停的代价：stdio server 的 pipeRWC.Close 最坏 10-15s/个
+		// （关 stdin→5s 等退出→SIGTERM→再 5s→SIGKILL），多 server 串行最坏
+		// 分钟级。Task 5 接线时须显式决策：是否 goroutine 化关停/加看门狗。
 		for _, c := range closes {
 			c()
 		}
@@ -358,6 +358,11 @@ func (m *agentAIManager) agentCoreMCPServerToolDefs(ctx context.Context, raws []
 				return bridges, closeAll
 			}
 			schema, _ := tool.InputSchema.(map[string]interface{})
+			if schema == nil {
+				// 断言失败兜底：null schema 序列化成 "input_schema": null，
+				// Anthropic 端必填对象——一个畸形工具会让该 run 每次请求 400。
+				schema = map[string]interface{}{"type": "object"}
+			}
 			desc := tool.Description
 			if len(desc) > agentCoreMCPDescCap {
 				desc = desc[:agentCoreMCPDescCap]
