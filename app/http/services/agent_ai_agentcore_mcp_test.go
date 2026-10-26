@@ -10,8 +10,10 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"aliang.one/nursorgate/app/agentcore"
+	"aliang.one/nursorgate/app/http/models"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -330,4 +332,286 @@ func TestAgentCoreMCPBridgeTransportError(t *testing.T) {
 	if len(isErrs) != 1 || !isErrs[0] {
 		t.Fatalf("onCall 应收到 isErr=true: %v", isErrs)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// MCP 默认审批门（spec §7）
+//
+// matchedID 为空（无显式设备规则命中、落到策略 DefaultDecision）的 mcp__*
+// 工具一律强制手机审批；显式规则（含放行）优先于该默认。全部走真
+// runAgentCore：内核在注册表派发**之前**先过 Approve（loop.go executeOne），
+// 所以即便 MCP 桥接线（入注册表）尚未落地，脚本的 mcp__ tool_use 也真实地
+// 穿过审批门。
+// ---------------------------------------------------------------------------
+
+// agentCoreMCPApprovalHarness 聚合一次 run 的manager/事件日志/上游/结束信号。
+type agentCoreMCPApprovalHarness struct {
+	m         *agentAIManager
+	log       *agentCoreEventLog
+	up        *agentCoreUpstream
+	finished  chan struct{}
+	sessionID string
+}
+
+// setAgentCoreMCPTestPolicy 把策略注进 service 的内存 per-path 表。
+// effectiveApprovalPolicyForPath 内存优先于磁盘缓存，因此每个用例看到的
+// 策略完全由这里决定——互不渗漏，也不受真实磁盘缓存影响。
+func setAgentCoreMCPTestPolicy(t *testing.T, svc *AgentService, projectPath string, p ApprovalPolicy) {
+	t.Helper()
+	if err := compileApprovalRules(&p); err != nil {
+		t.Fatalf("测试策略 CommandRegex 编译失败: %v", err)
+	}
+	svc.mu.Lock()
+	svc.setEffectivePolicyForPathLocked(projectPath, p)
+	svc.mu.Unlock()
+}
+
+// startAgentCoreMCPApprovalRun 与 Decline 用例同一套骨架：真 runAgentCore +
+// 事件收集器 + 上游记录器。策略在 run 启动前注入（审批只发生在 run 内，
+// 先注后跑即确定）。
+func startAgentCoreMCPApprovalRun(t *testing.T, policy ApprovalPolicy, turns ...string) *agentCoreMCPApprovalHarness {
+	t.Helper()
+	setTestAgentHome(t) // journal 根在 newAgentAIManager 构造时解析
+	up, srv := newAgentCoreUpstream(t, turns...)
+	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
+	t.Setenv("ANTHROPIC_MODEL", "")
+
+	m := newAgentAIManager()
+	// 空 service：approvalService() 不落 GetSharedAgentService()（测试进程里
+	// 那个可能带真实云端配置）；策略经内存表注入。
+	svc := &AgentService{}
+	m.service = svc
+
+	project := t.TempDir()
+	setAgentCoreMCPTestPolicy(t, svc, project, policy)
+
+	const sessionID = "conv-agentcore-mcp-approval"
+	const runSeq = 1
+	m.registerAISessionLocked(&agentAISession{
+		id:      sessionID,
+		runSeq:  runSeq,
+		history: []agentAIMessage{{Role: "user", Content: "调一下工具"}},
+	})
+
+	log := &agentCoreEventLog{}
+	run := agentAIRun{
+		sessionID:   sessionID,
+		runSeq:      runSeq,
+		messageID:   "msg-mcp-approval",
+		provider:    "agentcore",
+		model:       "glm-5.2",
+		projectPath: project,
+		activity:    newAgentAIActivity(),
+	}
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		m.runAgentCore(context.Background(), run, log.write)
+	}()
+	return &agentCoreMCPApprovalHarness{m: m, log: log, up: up, finished: finished, sessionID: sessionID}
+}
+
+// decline 等到手机审批卡并模拟点「拒绝」。respond 带缓冲(1)，发送不阻塞。
+func (h *agentCoreMCPApprovalHarness) decline(t *testing.T) {
+	t.Helper()
+	waiter := waitForAgentCoreApproval(t, h.m, h.sessionID, h.log)
+	waiter.request.respond <- agentAIApprovalResponse{Decision: models.AgentAIApprovalDecisionDecline}
+}
+
+// waitFinished 等 run 收敛——「审批拒绝后回合继续存活」的存活断言入口。
+func (h *agentCoreMCPApprovalHarness) waitFinished(t *testing.T) {
+	t.Helper()
+	select {
+	case <-h.finished:
+	case <-time.After(30 * time.Second):
+		t.Fatalf("runAgentCore 没有收敛（事件 %v）", h.log.types())
+	}
+}
+
+// lastToolResult 取第二轮上游请求里的 tool_result（内容 + is_error）。
+// 第二轮存在本身即证明工具回合后模型还在继续对话（未被审批掐死）。
+func (h *agentCoreMCPApprovalHarness) lastToolResult(t *testing.T) (string, bool) {
+	t.Helper()
+	reqs := h.up.requests()
+	if len(reqs) != 2 {
+		t.Fatalf("上游请求次数 = %d, want 2（工具回合后应带 tool_result 继续下一轮，事件 %v）", len(reqs), h.log.types())
+	}
+	second := reqs[1]
+	if len(second.Messages) < 3 {
+		t.Fatalf("第二轮 messages 只有 %d 条, want ≥3（user/assistant(tool_use)/user(tool_result)）", len(second.Messages))
+	}
+	last := second.Messages[len(second.Messages)-1]
+	blocks, _ := last.Content.([]interface{})
+	for _, raw := range blocks {
+		block, _ := raw.(map[string]interface{})
+		if block == nil {
+			continue
+		}
+		if bt, _ := block["type"].(string); bt == agentcore.BlockTypeToolResult {
+			content, _ := block["content"].(string)
+			isErr, _ := block["is_error"].(bool)
+			return content, isErr
+		}
+	}
+	t.Fatalf("第二轮最后一条消息没有 tool_result: %+v", last)
+	return "", false
+}
+
+// TestAgentCoreMCPApprovalDefaultGate 锁死 MCP 默认审批门的三个口径：
+//
+//  1. 无显式规则命中（规则不命中/零规则）+ mcp__ 前缀 → 强制手机审批，
+//     审批拒绝后回合继续存活（照抄 Decline 用例的存活断言）；
+//  2. 显式设备规则优先于默认门——精确匹配的 auto_approve 规则照常短路，
+//     手机不收卡、内核照常派发执行；
+//  3. allow_all 策略（DefaultDecision=auto_approve、零规则）下 mcp__* 仍需
+//     批，而同策略的非 mcp 工具维持原行为（默认放行，不被门拦截）。
+//
+// 场景 1/3 的策略默认全是放行：没有默认门时这些调用会被本地短路、手机
+// 收不到任何审批卡——「waitForAgentCoreApproval 等得到等待项」就是门生效
+// 的判据，等不到即红。
+func TestAgentCoreMCPApprovalDefaultGate(t *testing.T) {
+	const mcpTool = "mcp__srv__tool"
+
+	t.Run("NoRuleMatchRequiresApproval", func(t *testing.T) {
+		policy := ApprovalPolicy{
+			Scheme:          "custom",
+			DefaultDecision: decisionAutoApprove,
+			// 唯一规则只碰别的工具：证明「规则不命中」时门仍然生效。
+			Rules: []approvalRule{{
+				ID:       "unrelated-tool",
+				Match:    approvalRuleMatch{Tool: []string{"Other"}},
+				Decision: decisionAutoApprove,
+			}},
+		}
+		h := startAgentCoreMCPApprovalRun(t, policy,
+			agentCoreToolTurn("toolu_mcp1", mcpTool, `{"q":"ping"}`),
+			agentCoreTextTurn("好", "的"),
+		)
+		h.decline(t)
+		h.waitFinished(t)
+
+		// 手机审批路径真的走了：pending + resolved/decline 两条，工具名原样上卡。
+		requests := h.log.filter(models.AgentEventAIApprovalRequest)
+		if len(requests) != 2 {
+			t.Fatalf("ai.approval.request 数量 = %d, want 2（pending + resolved，事件 %v）", len(requests), h.log.types())
+		}
+		if status, _ := requests[0]["status"].(string); status != "pending" {
+			t.Errorf("首条审批状态 = %q, want pending", status)
+		}
+		if status, _ := requests[1]["status"].(string); status != "resolved" {
+			t.Errorf("次条审批状态 = %q, want resolved", status)
+		}
+		if decision, _ := requests[1]["decision"].(string); decision != models.AgentAIApprovalDecisionDecline {
+			t.Errorf("审批决定 = %q, want %q", decision, models.AgentAIApprovalDecisionDecline)
+		}
+		if tool, _ := requests[0]["tool_name"].(string); tool != mcpTool {
+			t.Errorf("审批 tool_name = %q, want %q", tool, mcpTool)
+		}
+
+		// 回合存活：恰好一个 ai.done、零 ai.error（拒绝一次工具不是失败）。
+		if got := h.log.count(models.AgentEventAIDone); got != 1 {
+			t.Fatalf("ai.done 数量 = %d, want 1（事件 %v）", got, h.log.types())
+		}
+		if got := h.log.count(models.AgentEventAIError); got != 0 {
+			t.Fatalf("ai.error 数量 = %d, want 0（%v）", got, h.log.filter(models.AgentEventAIError))
+		}
+
+		// 内核收到的是拒绝理由，不是放行后的执行结果。
+		content, isErr := h.lastToolResult(t)
+		if !isErr || !strings.Contains(content, "用户拒绝") {
+			t.Fatalf("tool_result = (%q, is_error=%v), want 含「用户拒绝」的错误回填", content, isErr)
+		}
+	})
+
+	t.Run("ExplicitRuleOverridesDefaultGate", func(t *testing.T) {
+		// 默认 require_approval：放行只能来自显式规则本身（matchedID 非空），
+		// 默认门不得越权改判。
+		policy := ApprovalPolicy{
+			Scheme:          "custom",
+			DefaultDecision: decisionRequireApproval,
+			Rules: []approvalRule{{
+				ID:       "mcp-explicit-allow",
+				Match:    approvalRuleMatch{Tool: []string{mcpTool}},
+				Decision: decisionAutoApprove,
+			}},
+		}
+		h := startAgentCoreMCPApprovalRun(t, policy,
+			agentCoreToolTurn("toolu_mcp2", mcpTool, `{"q":"ping"}`),
+			agentCoreTextTurn("好", "的"),
+		)
+		// 不 decline：若误走云端审批，run 会吊在等手机上，waitFinished 超时即红。
+		h.waitFinished(t)
+
+		// 短路放行：零审批事件、零 ai.error、恰好一个 ai.done。
+		if got := h.log.count(models.AgentEventAIApprovalRequest); got != 0 {
+			t.Fatalf("ai.approval.request 数量 = %d, want 0（显式放行不问手机，事件 %v）", got, h.log.types())
+		}
+		if got := h.log.count(models.AgentEventAIDone); got != 1 {
+			t.Fatalf("ai.done 数量 = %d, want 1（事件 %v）", got, h.log.types())
+		}
+		if got := h.log.count(models.AgentEventAIError); got != 0 {
+			t.Fatalf("ai.error 数量 = %d, want 0（%v）", got, h.log.filter(models.AgentEventAIError))
+		}
+
+		// 审批通过、内核真的派发了执行：回填不是「用户拒绝」。MCP 桥接入
+		// 注册表是后续接线（Task 5），此刻内核回报「未知工具」——恰恰证明
+		// 已越过审批门到达派发；接线落地后此处应改为断言真实执行结果。
+		content, _ := h.lastToolResult(t)
+		if strings.Contains(content, "用户拒绝") || strings.Contains(content, "审批") {
+			t.Fatalf("tool_result = %q, want 非拒绝（显式规则应放行到执行派发）", content)
+		}
+		if !strings.Contains(content, "未知工具") {
+			t.Fatalf("tool_result = %q, want 含「未知工具」（接线前的派发证据）", content)
+		}
+	})
+
+	t.Run("AllowAllStillGatesMCP", func(t *testing.T) {
+		// allow_all（DefaultDecision=auto_approve、零规则）：别的工具全放行，
+		// mcp__* 也不能豁免默认门。
+		h := startAgentCoreMCPApprovalRun(t, builtinAllowAllPolicy(),
+			agentCoreToolTurn("toolu_mcp3", "mcp__db__query", `{"sql":"select 1"}`),
+			agentCoreTextTurn("好", "的"),
+		)
+		h.decline(t)
+		h.waitFinished(t)
+
+		if got := h.log.count(models.AgentEventAIApprovalRequest); got != 2 {
+			t.Fatalf("ai.approval.request 数量 = %d, want 2（allow_all 不豁免 mcp__*，事件 %v）", got, h.log.types())
+		}
+		if got := h.log.count(models.AgentEventAIDone); got != 1 {
+			t.Fatalf("ai.done 数量 = %d, want 1（事件 %v）", got, h.log.types())
+		}
+		if got := h.log.count(models.AgentEventAIError); got != 0 {
+			t.Fatalf("ai.error 数量 = %d, want 0（%v）", got, h.log.filter(models.AgentEventAIError))
+		}
+		content, isErr := h.lastToolResult(t)
+		if !isErr || !strings.Contains(content, "用户拒绝") {
+			t.Fatalf("tool_result = (%q, is_error=%v), want 含「用户拒绝」的错误回填", content, isErr)
+		}
+	})
+
+	t.Run("AllowAllDoesNotGateNonMCP", func(t *testing.T) {
+		// 同为 allow_all、同样无显式规则：非 mcp 工具维持原行为——默认放行，
+		// 不因默认门被拦去问手机。"Zap" 既不是路径围栏工具也不是 Bash，
+		// 边界钩子不约束它，判定点干净。
+		h := startAgentCoreMCPApprovalRun(t, builtinAllowAllPolicy(),
+			agentCoreToolTurn("toolu_zap", "Zap", `{"x":1}`),
+			agentCoreTextTurn("好", "的"),
+		)
+		h.waitFinished(t)
+
+		if got := h.log.count(models.AgentEventAIApprovalRequest); got != 0 {
+			t.Fatalf("ai.approval.request 数量 = %d, want 0（非 mcp 工具不得被门拦截，事件 %v）", got, h.log.types())
+		}
+		if got := h.log.count(models.AgentEventAIDone); got != 1 {
+			t.Fatalf("ai.done 数量 = %d, want 1（事件 %v）", got, h.log.types())
+		}
+		if got := h.log.count(models.AgentEventAIError); got != 0 {
+			t.Fatalf("ai.error 数量 = %d, want 0（%v）", got, h.log.filter(models.AgentEventAIError))
+		}
+		content, _ := h.lastToolResult(t)
+		if strings.Contains(content, "用户拒绝") || strings.Contains(content, "审批") {
+			t.Fatalf("tool_result = %q, want 非拒绝（allow_all 默认放行非 mcp 工具）", content)
+		}
+	})
 }

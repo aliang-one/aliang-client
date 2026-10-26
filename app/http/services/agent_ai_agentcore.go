@@ -1029,7 +1029,14 @@ func (m *agentAIManager) agentCoreApprove(run agentAIRun, writeJSON agentTermina
 	return func(ctx context.Context, call agentcore.ApprovalRequest) (agentcore.ApprovalResponse, error) {
 		toolInput := marshalAgentAIRaw(call.Input)
 		if svc := m.approvalService(); svc != nil {
-			switch decision, matchedID := svc.evaluateApprovalDecision(call.ToolName, toolInput, run.projectPath); decision {
+			decision, matchedID := svc.evaluateApprovalDecision(call.ToolName, toolInput, run.projectPath)
+			// MCP 默认门（spec §7）：没有显式设备规则命中（matchedID 为空 =
+			// 落到策略 DefaultDecision）的 mcp__* 工具一律要求手机审批——
+			// 显式规则（含放行）优先于本默认。
+			if matchedID == "" && strings.HasPrefix(call.ToolName, "mcp__") {
+				decision = decisionRequireApproval
+			}
+			switch decision {
 			case decisionAutoApprove:
 				logger.Info(fmt.Sprintf("approval-hook: AUTO-APPROVE by policy rule=%s tool=%s session=%s (agentcore, no cloud round-trip)", matchedID, call.ToolName, run.sessionID))
 				return agentcore.ApprovalResponse{Approved: true}, nil
