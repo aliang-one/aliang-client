@@ -151,7 +151,9 @@ func readAgentCoreSessionMetaWithOptions(path string, options agentVibeSessionRe
 	if session.ID == "" {
 		// 无头行（steer 先到）：ID 兜底取文件名。此时 ProjectPath 恒空,
 		// scanDirs 过滤会穿透（空 path 永不触发 discard）——这与 codex reader
-		// 对缺 cwd 元数据行的行为同构,是有意为之。
+		// 对缺 cwd 元数据行的行为同构,是有意为之。兜底 ID 是净化后文件名,
+		// 含非法字符的 sessionID 会与活跃覆盖层原始 ID 分叉（接受：sessionID
+		// 由服务端下发,现实为 UUID 形态,净化为恒等映射）。
 		base := strings.TrimSuffix(filepath.Base(path), ".jsonl")
 		if base == "" || base == ".jsonl" {
 			return models.AgentVibeSession{}

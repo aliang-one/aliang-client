@@ -161,7 +161,9 @@ func (j *agentCoreJournal) appendEnd(sessionID, status, errMsg string) {
 // 返回是否写成功（mkdir/open/write 任一失败即 false）——appendMsg 靠它
 // 决定去重键只记「已落盘」。目录懒创建在此处（O_CREATE 建不了缺失的父
 // 目录）——steer 先于 run 到达时 appendUser 是第一个写者，不能依赖
-// ensureSessionHeader 先建目录。
+// ensureSessionHeader 先建目录。dirReady 置位后目录被运行期删除不会自愈
+// （持续 Warn 失败），仅下次 run 的 ensureSessionHeader 走 Stat 缺失分支
+// 时重建——尽力而为语义下的既定取舍。
 func (j *agentCoreJournal) appendLineLocked(sessionID string, row map[string]interface{}) bool {
 	if !j.dirReady {
 		if err := os.MkdirAll(j.dir, 0o700); err != nil {
