@@ -130,6 +130,24 @@ func agentVibeDigest(home string) string {
 		})
 	}
 
+	// agentcore 会话 journal 不落上面任何指纹面(codex/claude 的索引与转录
+	// 都不含 .aliang/ai-sessions),run/steer 追加原本只能等 60s 周期兜底。
+	// 同样做 path+mtime+size 指纹,让 10s 指纹 tick 即时感知会话落地/推进。
+	if journalRoot := agentCoreJournalDir(); journalRoot != "" {
+		agentCoreFiles, _, _ := findRecentAgentFilesWithStats(journalRoot, "*.jsonl", agentVibeSessionFileScanLimit)
+		for _, sessionPath := range agentCoreFiles {
+			info, err := os.Stat(sessionPath)
+			if err != nil {
+				continue
+			}
+			tuples = append(tuples, tuple{
+				id:    "agentcore_file_" + sessionPath,
+				ts:    info.ModTime().UTC().Format(time.RFC3339Nano),
+				extra: strconv.FormatInt(info.Size(), 10),
+			})
+		}
+	}
+
 	if len(tuples) == 0 {
 		return ""
 	}

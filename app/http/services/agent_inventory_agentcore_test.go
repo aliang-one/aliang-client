@@ -197,6 +197,11 @@ func TestFindAgentVibeSessionDetailAgentCoreEndToEnd(t *testing.T) {
 	if missing.ID != "" {
 		t.Errorf("不存在的会话应返回空: %+v", missing)
 	}
+	// candidate 枚举路(带 sourceSessionID)也要命中——上面裸 ID 走的是兜底路。
+	hit := findAgentVibeSessionDetail("", "conv-detail", "/tmp/pd", agentVibeSessionReadOptions{Limit: 24})
+	if hit.ID != "conv-detail" {
+		t.Errorf("candidate 枚举路未命中: %+v", hit)
+	}
 }
 
 func TestOverlayMergesAgentCoreActiveWithFileEntry(t *testing.T) {

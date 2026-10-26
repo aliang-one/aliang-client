@@ -124,3 +124,20 @@ func TestAgentVibeDigestDetectsJSONLAppend(t *testing.T) {
 `), 0o600))
 	assert.NotEqual(t, before, agentVibeDigest(home), "jsonl 追加(mtime/size 变化)必须翻转指纹")
 }
+
+// TestAgentVibeDigestDetectsAgentCoreJournalAppend: agentcore 会话 journal
+// (~/.aliang/ai-sessions)不落 codex/claude 任何指纹面,run/steer 追加原本
+// 只能等 60s 周期兜底。journal 文件指纹(path+mtime+size)让 10s 指纹 tick
+// 即时感知会话落地/推进。
+func TestAgentVibeDigestDetectsAgentCoreJournalAppend(t *testing.T) {
+	home := digestFixtureHome(t)
+	writeAgentCoreJournalFixture(t, agentCoreJournalDir(), "digest-agentcore", "/tmp/pd")
+
+	before := agentVibeDigest(home)
+	require.NotEmpty(t, before)
+
+	j := newAgentCoreJournal(agentCoreJournalDir())
+	j.appendUser("digest-agentcore", "m3", "追加的一句", "2026-10-26T09:00:00Z")
+
+	assert.NotEqual(t, before, agentVibeDigest(home), "journal 追加(mtime/size 变化)必须翻转指纹")
+}
