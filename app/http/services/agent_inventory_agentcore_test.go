@@ -62,6 +62,70 @@ func TestReadAgentCoreSessionMetaToolRows(t *testing.T) {
 	if toolRows != 1 {
 		t.Fatalf("Transcript 应含 1 条 tool 行, got %d", toolRows)
 	}
+	// 全序断言：锁死「单一转录行计数器」Index 口径——user(0) → tool(tool-000001,1)
+	// → assistant(2)。若将来退回 MessageCount-1 口径,tool 行与第二条 msg 会
+	// 撞出相同 Index,本断言照红。
+	if len(session.Transcript) != 3 {
+		t.Fatalf("Transcript = %d 行, want 3: %+v", len(session.Transcript), session.Transcript)
+	}
+	wantOrder := []struct {
+		role  string
+		id    string
+		index int
+	}{
+		{"user", "u1", 0},
+		{"tool", "tool-000001", 1},
+		{"assistant", "a1", 2},
+	}
+	for i, w := range wantOrder {
+		msg := session.Transcript[i]
+		if msg.Role != w.role || msg.ID != w.id || msg.Index != w.index {
+			t.Fatalf("Transcript[%d] = %+v, want role=%s id=%s index=%d", i, msg, w.role, w.id, w.index)
+		}
+	}
+	// tool 行作 before 游标：热窗分页的 NextBeforeMessageID 指向 tool 行（工具
+	// 行 ID 与 msg ID 同空间,分页原语对二者一视同仁）,以它为游标重读只剩其
+	// 前的 [user]。
+	paged := readAgentCoreSessionMetaWithOptions(path, agentVibeSessionReadOptions{Limit: 2, IncludePageMeta: true})
+	if paged.TranscriptPage == nil || !paged.TranscriptPage.HasMore || paged.TranscriptPage.NextBeforeMessageID != "tool-000001" {
+		t.Fatalf("Limit=2 首读分页 = %+v, want HasMore+NextBefore=tool-000001", paged.TranscriptPage)
+	}
+	if len(paged.Transcript) != 2 || paged.Transcript[0].Role != "tool" || paged.Transcript[1].Role != "assistant" {
+		t.Fatalf("Limit=2 首读转录 = %+v, want 尾窗 [tool,assistant]", paged.Transcript)
+	}
+	before := readAgentCoreSessionMetaWithOptions(path, agentVibeSessionReadOptions{Limit: 2, BeforeMessageID: "tool-000001", IncludePageMeta: true})
+	if len(before.Transcript) != 1 || before.Transcript[0].Role != "user" {
+		t.Fatalf("tool 游标重读 = %+v, want 仅 [user]", before.Transcript)
+	}
+	if before.TranscriptPage == nil || before.TranscriptPage.HasMore {
+		t.Fatalf("tool 游标重读分页 = %+v, want HasMore=false", before.TranscriptPage)
+	}
+}
+
+func TestReadAgentCoreToolRowContentTruncated(t *testing.T) {
+	setTestAgentHome(t)
+	long := strings.Repeat("x", agentVibeTranscriptMaxContentRunes+10)
+	path := writeCoreJournalRawFixture(t, "sess-tool-long",
+		`{"kind":"session","session_id":"sess-tool-long","project_path":"/tmp/p","model":"m","created_at":"2026-10-26T01:00:00Z"}`,
+		`{"kind":"tool","tool":"t","summary":"`+long+`","ts":"2026-10-26T01:00:06Z"}`,
+	)
+	session := readAgentCoreSessionMetaWithOptions(path, agentVibeSessionReadOptions{Limit: 24})
+	var toolContent string
+	for _, msg := range session.Transcript {
+		if msg.Role == "tool" {
+			toolContent = msg.Content
+		}
+	}
+	if toolContent == "" {
+		t.Fatal("tool 行未渲染")
+	}
+	// reader 不信任写侧的家规:超长 summary 与 msg 行同规截断到 max runes。
+	if got := len([]rune(toolContent)); got != agentVibeTranscriptMaxContentRunes {
+		t.Fatalf("tool Content = %d runes, want %d", got, agentVibeTranscriptMaxContentRunes)
+	}
+	if !strings.HasPrefix(toolContent, "t ") {
+		t.Fatalf("截断应保留前缀 \"t \": %q...", toolContent[:4])
+	}
 }
 
 func TestReadAgentCoreSessionMetaSummary(t *testing.T) {

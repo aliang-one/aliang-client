@@ -148,7 +148,10 @@ func readAgentCoreSessionMetaWithOptions(path string, options agentVibeSessionRe
 			}
 		case "tool":
 			// 工具轨迹行：渲染进 Transcript 但不计 MessageCount/displayCount。
-			// 无头行文件（steer 先到）里的 tool 行没有会话归属,跳过。
+			// 无头行文件（steer 先到）里 session.ID 尚空,tool 行没有会话归属,跳过。
+			// 损失模式落账:steer 先到→无头行→run 追加后头行永远补不上（写侧
+			// ensureSessionHeader 只在文件不存在时写头行）→该场景 tool 轨迹静默
+			// 丢失,与 msg 行的文件名兜底不一致——有意接受,损失面窄。
 			if session.ID == "" {
 				return true
 			}
@@ -158,10 +161,12 @@ func readAgentCoreSessionMetaWithOptions(path string, options agentVibeSessionRe
 			}
 			toolCount++
 			transcriptRow++
+			// reader 不信任写侧:超长 summary 与 msg 行同规截断（家规）。
+			content := truncateAgentText(strings.TrimSpace(row.Tool+" "+row.Summary), agentVibeTranscriptMaxContentRunes)
 			window.add(models.AgentVibeMessage{
 				ID:        fmt.Sprintf("tool-%06d", toolCount),
 				Role:      "tool",
-				Content:   strings.TrimSpace(row.Tool + " " + row.Summary),
+				Content:   content,
 				Timestamp: normalizeAgentTime(row.Ts),
 				Index:     transcriptRow - 1,
 			})
