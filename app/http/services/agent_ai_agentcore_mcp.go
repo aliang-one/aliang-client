@@ -195,6 +195,10 @@ func agentCoreMCPResultText(res *mcp.CallToolResult) (string, bool) {
 // truncateAgentCoreMCPOutput 桥自实现 64KB 字节上限。⚠️ 内核的
 // truncateToolOutput 未导出、且只在各内置工具 Execute 内部自调（loop.go 无
 // 集中截断）——MCP 桥必须自截，否则异常 server 的巨量输出直接打进模型上下文。
+//
+// 已知限制：字节级截断（本包 desc/summary/output/工具名段及其重截共 5 处）
+// 可能在切点劈开多字节 rune，经 encoding/json 净化为 U+FFFD——纯观感降级，
+// 不炸请求。
 func truncateAgentCoreMCPOutput(s string) string {
 	const capBytes = 64 * 1024
 	if len(s) <= capBytes {
@@ -329,12 +333,20 @@ func (m *agentAIManager) agentCoreMCPServerToolDefs(ctx context.Context, raws []
 			c()
 		}
 	}
+	connected, skipped := 0, 0
 	fail := func(server string, err error) {
+		skipped++
 		logger.Warn(fmt.Sprintf("agentcore-mcp: server 跳过 server=%s err=%v", sanitizeAgentCoreMCPSegment(server), err))
+	}
+	// 注入数量观测（spec §11）：正常返回与工具熔断早退两条出口都要能回答
+	// 「该 run 注入了几个 MCP 工具」。
+	logInjected := func() {
+		logger.Info(fmt.Sprintf("agentcore-mcp: 注入 %d 个 MCP 工具（cap %d）", len(bridges), agentCoreMCPToolCap))
 	}
 	for _, raw := range raws {
 		isHTTP := strings.EqualFold(raw.Type, "http") || strings.EqualFold(raw.Type, "sse")
 		if isHTTP && len(raw.Headers) > 0 {
+			skipped++
 			logger.Warn(fmt.Sprintf("agentcore-mcp: server 跳过 server=%s reason=headers 暂不支持（v1 限制）", sanitizeAgentCoreMCPSegment(raw.Name)))
 			continue
 		}
@@ -357,10 +369,12 @@ func (m *agentAIManager) agentCoreMCPServerToolDefs(ctx context.Context, raws []
 			cancel()
 			continue
 		}
+		connected++
 		cancel() // 该 server 处理完（成功路径）；session 交给 closeAll 关
 		for _, tool := range tools {
 			if len(bridges) >= agentCoreMCPToolCap {
 				logger.Warn(fmt.Sprintf("agentcore-mcp: 工具超上限截断 cap=%d", agentCoreMCPToolCap))
+				logInjected()
 				return bridges, closeAll
 			}
 			schema, _ := tool.InputSchema.(map[string]interface{})
@@ -380,5 +394,7 @@ func (m *agentAIManager) agentCoreMCPServerToolDefs(ctx context.Context, raws []
 			})
 		}
 	}
+	logger.Info(fmt.Sprintf("agentcore-mcp: 已连接 %d/%d 个 server（跳过 %d）", connected, len(raws), skipped))
+	logInjected()
 	return bridges, closeAll
 }
