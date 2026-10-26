@@ -293,6 +293,9 @@ type agentAISession struct {
 	tuiTurn      *tuiTurnPlan
 	claudePolicy agentAIClaudeRemotePolicy
 	claudeCaps   agentAIClaudeCapabilities
+	// surface 是本会话最近一个手机回合的驱动面标记（"phone" 或 ""）。
+	// 只增不降：ai.session.create 等旧通道不带该字段时不清掉已置的 phone。
+	surface string
 }
 
 type agentAISteerMessage struct {
@@ -341,6 +344,9 @@ type agentAIRun struct {
 	sessionID string
 	runID     string
 	messageID string
+	// surface 是本回合的驱动面标记（agentAISurfacePhone 或 ""），来自会话
+	// 状态；claudeApprovalHookSettings 据此决定是否硬禁终端交互构件。
+	surface string
 	// providerMsgID is the provider's native assistant message id for the
 	// CURRENT turn (claude msg_*, captured from message_start / finalized
 	// assistant events). Streaming events (ai.delta / ai.thinking /
@@ -1442,6 +1448,7 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 	bindingVersion := remoteInt(msg, "binding_version", 0)
 	initialContext := strings.TrimSpace(remoteString(msg, "initial_context"))
 	isGoalFork, _ := msg["is_goal_fork"].(bool) // #5: server flags fork sessions
+	surface := normalizeAgentAISurface(remoteString(msg, "surface"))
 	claudePolicy := parseAgentAIClaudeRemotePolicy(msg)
 	history := remoteAgentAIHistory(msg)
 	if initialContext != "" {
@@ -1465,6 +1472,9 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 		existing.bindingVersion = bindingVersion
 		existing.initialContext = initialContext
 		existing.isGoalFork = isGoalFork
+		if surface != "" {
+			existing.surface = surface
+		}
 		if claudePolicy.enabled {
 			existing.claudePolicy = cloneAgentAIClaudeRemotePolicy(claudePolicy)
 			existing.claudeCaps = agentAIClaudeCapabilities{}
@@ -1492,6 +1502,7 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 		bindingVersion:          bindingVersion,
 		initialContext:          initialContext,
 		isGoalFork:              isGoalFork,
+		surface:                 surface,
 		claudePolicy:            cloneAgentAIClaudeRemotePolicy(claudePolicy),
 		history:                 trimAgentAIHistory(history),
 		lastActiveAt:            time.Now().UTC(),
@@ -1633,6 +1644,7 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 			claudePolicy:            cloneAgentAIClaudeRemotePolicy(parseAgentAIClaudeRemotePolicy(msg)),
 			initialContext:          lazyInitialContext,
 			isGoalFork:              lazyIsGoalFork,
+			surface:                 normalizeAgentAISurface(remoteString(msg, "surface")),
 			history:                 trimAgentAIHistory(lazyHistory),
 			lastActiveAt:            time.Now().UTC(),
 		}
@@ -1648,6 +1660,9 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 	if policy := parseAgentAIClaudeRemotePolicy(msg); policy.enabled {
 		session.claudePolicy = cloneAgentAIClaudeRemotePolicy(policy)
 		session.claudeCaps = agentAIClaudeCapabilities{}
+	}
+	if surface := normalizeAgentAISurface(remoteString(msg, "surface")); surface != "" {
+		session.surface = surface
 	}
 	session.lastActiveAt = time.Now().UTC() // LRU recency: this conversation is active
 	if session.cancel != nil {
@@ -2047,6 +2062,13 @@ func (m *agentAIManager) steer(msg map[string]interface{}, writeJSON agentTermin
 		emitAgentAISteerAck(writeJSON, sessionID, messageID, "error", fmt.Sprintf("ai.steer exceeds %d bytes", agentAIMessageLimitBytes), "bad_request")
 		return
 	}
+	// 手机驱动插话:契约随文本走。外部 TUI 活进程分支(下面两处)唯一能影响
+	// 其 CC 行为的通道就是注入文本本身,必须在这里备好;注册表内路径按
+	// session.surface 再包一次(幂等)。
+	steerContent := content
+	if normalizeAgentAISurface(remoteString(msg, "surface")) == agentAISurfacePhone {
+		steerContent = wrapAgentAIPhoneContract(content)
+	}
 
 	m.mu.Lock()
 	session := m.sessions[sessionID]
@@ -2062,7 +2084,7 @@ func (m *agentAIManager) steer(msg map[string]interface{}, writeJSON agentTermin
 				emitAgentAISteerAck(writeJSON, sessionID, messageID, "error", "外部 TUI 执行中的插话暂不支持附件，请等回合结束后再发", "unsupported_attachment")
 				return
 			}
-			if result, errMsg := externalSteerAttempt(externalTUIHome(), sourceSessionID, content); result != "not_running" {
+			if result, errMsg := externalSteerAttempt(externalTUIHome(), sourceSessionID, steerContent); result != "not_running" {
 				code := ""
 				if result == "error" {
 					code = "send_failed"
@@ -2083,7 +2105,7 @@ func (m *agentAIManager) steer(msg map[string]interface{}, writeJSON agentTermin
 				emitAgentAISteerAck(writeJSON, sessionID, messageID, "error", "外部 TUI 执行中的插话暂不支持附件，请等回合结束后再发", "unsupported_attachment")
 				return
 			}
-			if result, errMsg := externalSteerAttempt(externalTUIHome(), sourceSessionID, content); result != "not_running" {
+			if result, errMsg := externalSteerAttempt(externalTUIHome(), sourceSessionID, steerContent); result != "not_running" {
 				code := ""
 				if result == "error" {
 					code = "send_failed"
@@ -2143,6 +2165,9 @@ func (m *agentAIManager) steer(msg map[string]interface{}, writeJSON agentTermin
 	}
 
 	m.mu.Lock()
+	if surface := normalizeAgentAISurface(remoteString(msg, "surface")); surface != "" {
+		session.surface = surface
+	}
 	session.history = append(session.history, agentAIMessage{
 		Role:      "user",
 		MessageID: messageID,
@@ -2150,6 +2175,11 @@ func (m *agentAIManager) steer(msg map[string]interface{}, writeJSON agentTermin
 		CreatedAt: steer.CreatedAt,
 	})
 	m.mu.Unlock()
+
+	if session.surface == agentAISurfacePhone {
+		// 手机驱动插话:契约随投递内容下发;history 仍存原文(上一条 append)。
+		steer.Content = wrapAgentAIPhoneContract(steer.Content)
+	}
 
 	var result string
 	switch {
@@ -2430,9 +2460,17 @@ func (m *agentAIManager) runUserMessage(session *agentAISession, runID, messageI
 		CreatedAt: now,
 	})
 	freshPrompt := buildAgentAIPrompt(session, content)
+	phoneSurface := session.surface == agentAISurfacePhone
+	if phoneSurface {
+		// 手机驱动回合:行为契约随首条用户内容进上下文(幂等,见 wrap 实现)。
+		freshPrompt = wrapAgentAIPhoneContract(freshPrompt)
+	}
 	prompt := freshPrompt
 	if resumeSessionID != "" {
 		prompt = content
+		if phoneSurface {
+			prompt = wrapAgentAIPhoneContract(content)
+		}
 	}
 	run := agentAIRun{
 		sessionID:               session.id,
@@ -2464,6 +2502,7 @@ func (m *agentAIManager) runUserMessage(session *agentAISession, runID, messageI
 		// v1 set this only on the temporary messageRun, which is discarded before
 		// the real run is built here — so it never reached runCLIPass/codex.
 		readOnly: session.isGoalFork,
+		surface:  session.surface,
 	}
 	run.onClaudeInit = func(commands []string, version string) {
 		m.recordClaudeCapabilities(run.sessionID, run.projectPath, commands, version)
@@ -2492,8 +2531,13 @@ func (m *agentAIManager) runUserMessage(session *agentAISession, runID, messageI
 		// 释放 spawn 路径预建的 ctx（执行器自建 runCtx，不再用这个）。
 		cancel()
 		// 传原始 content 而非 run.prompt（后者被 buildAgentAIPrompt 包装过）；
-		// 附件走 run.attachments，由执行器拼进注入文本。
-		go m.runTUITurn(context.Background(), session, run, content, plan, emitter)
+		// 附件走 run.attachments，由执行器拼进注入文本。手机驱动回合把行为
+		// 契约随 content 带进 TUI 内 CC——注入文本是唯一能影响其行为的通道。
+		tuiContent := content
+		if run.surface == agentAISurfacePhone {
+			tuiContent = wrapAgentAIPhoneContract(content)
+		}
+		go m.runTUITurn(context.Background(), session, run, tuiContent, plan, emitter)
 		return nil
 	}
 
@@ -8039,6 +8083,19 @@ func claudeApprovalHookSettings(strategy claudeApprovalHookStrategy, run agentAI
 				"ask": append([]string(nil), run.claudePolicy.permissionAsk...),
 			}
 		}
+	}
+	// 手机驱动回合(surface=phone):硬禁终端交互构件,与档位无关——本地 full
+	// 档的"不打扰"约束针对本地用户;手机回合不存在本地旁观者。deny 让 CC
+	// 直接拒绝 AskUserQuestion 并把原因回执给模型,模型自纠(配合 surface
+	// 契约文本),无头模式不再静默悬死。
+	if run.surface == agentAISurfacePhone {
+		permissions, _ := settings["permissions"].(map[string]interface{})
+		if permissions == nil {
+			permissions = map[string]interface{}{}
+			settings["permissions"] = permissions
+		}
+		deny, _ := permissions["deny"].([]string)
+		permissions["deny"] = append(deny, "AskUserQuestion")
 	}
 	return settings, nil
 }
