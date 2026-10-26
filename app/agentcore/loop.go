@@ -226,6 +226,15 @@ type runner struct {
 	writer  *streamWriter
 	history []Message
 
+	// effortLatched:上游按模型拒绝过 output_config.effort(HTTP 400/invalid_request
+	// 且错误体点名 effort/output_config)。锁存后本 run 后续轮次不再下发——
+	// 与 claude CLI 的 effort-rejected 自愈同语义(那个是 flag 级拒绝去
+	// --effort,这里是字段级拒绝去 output_config),不然该会话每轮 run 都带
+	// 同一档重发、持续 ai.error,直到用户手动改回「默认」。
+	effortLatched bool
+	// effortDropLogged:无法识别的档位被丢弃时只打一次日志,别每轮刷屏。
+	effortDropLogged bool
+
 	// 累计
 	textAll   strings.Builder
 	turnText  strings.Builder
@@ -278,6 +287,12 @@ func (r *runner) loop(ctx context.Context) (*RunResult, error) {
 		}
 
 		assistantBlocks, stopReason, err := r.streamTurn(ctx, req, writer)
+		if err != nil && r.noteEffortRejection(err, req) {
+			// 上游按模型拒绝 effort:锁存后去掉 output_config 重试本回合
+			// 一次。此时还没发过任何事件帧(400 在响应检查阶段抛出),writer
+			// 状态干净,重跑安全。
+			assistantBlocks, stopReason, err = r.streamTurn(ctx, r.buildRequest(), writer)
+		}
 		if err != nil {
 			// 流式失败同样可能是取消导致的（SSE 读循环被 ctx 打断），
 			// 交给 finishWithErr 分辨。
@@ -363,13 +378,62 @@ func (r *runner) buildRequest() *MessagesRequest {
 		System:    r.cfg.System,
 		Messages:  r.history,
 	}
-	if effort := NormalizeEffortLevel(r.cfg.Effort); effort != "" {
-		req.OutputConfig = &OutputConfig{Effort: effort}
+	if !r.effortLatched {
+		if effort := NormalizeEffortLevel(r.cfg.Effort); effort != "" {
+			req.OutputConfig = &OutputConfig{Effort: effort}
+		} else if strings.TrimSpace(r.cfg.Effort) != "" && !r.effortDropLogged {
+			// 档位无法识别被丢弃:留一条观测痕,否则 UI 永远显示已选档而
+			// 实际从未下发,错配无从查起。
+			r.effortDropLogged = true
+			r.logf("agentcore: effort 档位 %q 无法识别,本轮请求不下发 output_config", r.cfg.Effort)
+		}
 	}
 	if r.cfg.Tools != nil {
 		req.Tools = r.cfg.Tools.Defs()
 	}
 	return req
+}
+
+// noteEffortRejection 判定这次流式失败是不是「上游按模型拒绝 effort」。
+// 命中则锁存(r.effortLatched)并返回 true,调用方据此去 output_config 重试。
+// 只认 400/invalid_request_error 且错误体点名 effort/output_config 的形态,
+// 避免把无关 400 误伤成 effort 问题。
+func (r *runner) noteEffortRejection(err error, req *MessagesRequest) bool {
+	if r.effortLatched || req == nil || req.OutputConfig == nil {
+		return false
+	}
+	if !isEffortRejection(err) {
+		return false
+	}
+	r.effortLatched = true
+	r.logf("agentcore: 上游拒绝 effort(output_config),本 run 后续轮次不再下发: %v", err)
+	return true
+}
+
+// isEffortRejection 识别两类错误面:HTTP 4xx 携带错误体(httpStatusError),
+// 与 2xx 体内嵌错误信封(upstreamError,invalid_request_error 族)。
+func isEffortRejection(err error) bool {
+	var httpErr *httpStatusError
+	if errors.As(err, &httpErr) {
+		if httpErr.status < 400 || httpErr.status >= 500 {
+			return false
+		}
+		return mentionsEffort(httpErr.body)
+	}
+	var upErr *upstreamError
+	if errors.As(err, &upErr) {
+		if !strings.Contains(strings.ToLower(upErr.kind), "invalid_request") {
+			return false
+		}
+		return mentionsEffort(upErr.body + " " + upErr.message)
+	}
+	return false
+}
+
+// mentionsEffort 判定错误文本是否点名 effort/output_config。
+func mentionsEffort(text string) bool {
+	t := strings.ToLower(text)
+	return strings.Contains(t, "output_config") || strings.Contains(t, "effort")
 }
 
 // streamTurn 跑一次 LLM 调用，边流边写帧，返回本回合的完整内容块。

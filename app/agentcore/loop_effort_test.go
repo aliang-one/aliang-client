@@ -2,8 +2,11 @@ package agentcore
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
 )
 
@@ -94,5 +97,118 @@ func TestStreamSendsOutputConfigEffort(t *testing.T) {
 	}
 	if _, exists := captured["effort"]; exists {
 		t.Fatalf("effort 不允许出现在顶层字段")
+	}
+}
+
+// TestStreamEffortRejectionSelfHeal 锁死自愈语义(经 Run 全路径):上游按模型
+// 拒绝 effort(400 且错误体点名 output_config)→ 锁存 → 去掉 output_config
+// 重试本回合成功。不锁存的话该会话每轮 run 都带同一档重发、持续 ai.error
+// (CLI 路径 effort-rejected 自愈的内核同款;锁存是 per-run 的——每 run 至多
+// 付一次透明重试,不做跨 run 的宿主级缓存)。
+func TestStreamEffortRejectionSelfHeal(t *testing.T) {
+	var mu sync.Mutex
+	attempts := 0
+	var firstOutputConfig, secondOutputConfig map[string]interface{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		dec := json.NewDecoder(r.Body)
+		body := map[string]interface{}{}
+		_ = dec.Decode(&body)
+		mu.Lock()
+		attempts++
+		n := attempts
+		if n == 1 {
+			firstOutputConfig, _ = body["output_config"].(map[string]interface{})
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"type":"error","error":{"type":"invalid_request_error","message":"output_config.effort is not supported by this model"}}`))
+			mu.Unlock()
+			return
+		}
+		secondOutputConfig, _ = body["output_config"].(map[string]interface{})
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"message_start\",\"message\":{\"id\":\"m2\",\"model\":\"glm-5.3\"}}\n\n" +
+			"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"}}}\n\n" +
+			"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n" +
+			"data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" +
+			"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n" +
+			"data: [DONE]\n\n"))
+	}))
+	defer srv.Close()
+
+	logs := []string{}
+	result, err := Run(t.Context(), &Config{
+		Model:  "glm-5.3",
+		Effort: "xhigh",
+		Client: NewClient(srv.URL),
+		Logf: func(format string, args ...interface{}) {
+			logs = append(logs, fmt.Sprintf(format, args...))
+		},
+	}, []Message{TextMessage("user", "hi")})
+	if err != nil {
+		t.Fatalf("自愈后 run 仍失败: %v", err)
+	}
+	if result == nil || result.Text != "ok" {
+		t.Fatalf("result = %+v, want text ok", result)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2(首发被拒+去 effort 重试)", attempts)
+	}
+	if firstOutputConfig == nil || firstOutputConfig["effort"] != "xhigh" {
+		t.Fatalf("首次请求应带 output_config.effort=xhigh, got %v", firstOutputConfig)
+	}
+	if secondOutputConfig != nil {
+		t.Fatalf("重试请求不应带 output_config, got %v", secondOutputConfig)
+	}
+	joined := strings.Join(logs, "\n")
+	if !strings.Contains(joined, "拒绝 effort") {
+		t.Fatalf("应有观测日志, got %v", logs)
+	}
+}
+
+// TestStreamUnrelated400NotLatched 无关 400(错误体不点名 effort)不触发锁存,
+// 原样上抛——别把普通参数错误误伤成 effort 问题。
+func TestStreamUnrelated400NotLatched(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"type":"error","error":{"type":"invalid_request_error","message":"model not found"}}`))
+	}))
+	defer srv.Close()
+
+	r := &runner{
+		cfg: &Config{
+			Model:  "no-such-model",
+			Effort: "high",
+			Client: NewClient(srv.URL),
+		},
+	}
+	_, _, err := r.streamTurn(t.Context(), r.buildRequest(), nil)
+	if err == nil {
+		t.Fatal("无关 400 应原样上抛")
+	}
+	if r.effortLatched {
+		t.Fatal("无关 400 不应锁存 effort")
+	}
+}
+
+// TestNormalizeEffortDropLogged 无法识别的档位被丢弃时留观测痕(只一次)。
+func TestNormalizeEffortDropLogged(t *testing.T) {
+	logs := []string{}
+	r := &runner{
+		cfg: &Config{
+			Model:  "glm-5.3",
+			Effort: "bogus-tier",
+			Logf: func(format string, args ...interface{}) {
+				logs = append(logs, fmt.Sprintf(format, args...))
+			},
+		},
+	}
+	_ = r.buildRequest()
+	_ = r.buildRequest()
+	if len(logs) != 1 {
+		t.Fatalf("丢弃日志应只打一次, got %d: %v", len(logs), logs)
 	}
 }
