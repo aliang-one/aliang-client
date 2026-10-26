@@ -176,6 +176,7 @@ func agentCoreToolTurn(toolUseID, name, inputJSON string) string {
 // 它跑的是真正的 runAgentCore：内核 → io.Pipe → streamAgentAIStdout →
 // writeJSON。因此断言的就是手机收到的东西，而不是某个中间态。
 func TestRunAgentCoreEmitsSingleDone(t *testing.T) {
+	setTestAgentHome(t) // journal 根在 newAgentAIManager 构造时解析
 	up, srv := newAgentCoreUpstream(t, agentCoreTextTurn("你好", "，世界"))
 	// agentCoreBaseURL 只接受回环地址；httptest 正好是 127.0.0.1:PORT。
 	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
@@ -282,6 +283,7 @@ func TestRunAgentCoreEmitsSingleDone(t *testing.T) {
 //
 // 没有它，用户会看到一个 ai.run.started 之后什么都没有的气泡。
 func TestRunAgentCoreRejectsEmptyHistory(t *testing.T) {
+	setTestAgentHome(t) // journal 根在 newAgentAIManager 构造时解析
 	// 上游不该被访问；指到一个必然连不上的回环端口也不影响（这里先判空）。
 	t.Setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:1")
 
@@ -415,6 +417,7 @@ func TestRunAgentCoreApprovalDeclineKeepsTurnAlive(t *testing.T) {
 		agentCoreToolTurn("toolu_pwsh1", "PowerShell", `{"command":`+strconv.Quote(command)+`}`),
 		agentCoreTextTurn("好的", "，那我换个方式"),
 	)
+	setTestAgentHome(t) // journal 根在 newAgentAIManager 构造时解析
 	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
 	t.Setenv("ANTHROPIC_MODEL", "")
 
@@ -641,5 +644,210 @@ func TestDrainAgentCoreSteeringRejectsStaleRunSeq(t *testing.T) {
 	got := m.drainAgentCoreSteering(agentAIRun{sessionID: sessionID, runSeq: 2})
 	if len(got) != 1 {
 		t.Fatalf("当前 runSeq 取到 %d 条，want 1", len(got))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 调用记录 journal（runAgentCore 挂点）
+// ---------------------------------------------------------------------------
+
+// setTestAgentHome 同时隔离 HOME/USERPROFILE——Windows 上 UserHomeDir 优先读
+// USERPROFILE，只设 HOME 会让 journal 落进真实 profile（2026-10 计划评审）。
+func setTestAgentHome(t *testing.T) {
+	t.Helper()
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	t.Setenv("USERPROFILE", dir)
+}
+
+// registerTestAISession 是 registerAISessionLocked 的取锁包装（文档要求
+// 持 m.mu 调用）。
+func registerTestAISession(t *testing.T, m *agentAIManager, session *agentAISession) {
+	t.Helper()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.registerAISessionLocked(session)
+}
+
+// readAgentCoreJournalRows 读测试会话的 journal 文件并解析成行列表。
+func readAgentCoreJournalRows(t *testing.T, sessionID string) []map[string]interface{} {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(agentCoreJournalDir(), agentCoreJournalFileName(sessionID)))
+	if err != nil {
+		t.Fatalf("读取 journal: %v", err)
+	}
+	var out []map[string]interface{}
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		var row map[string]interface{}
+		if err := json.Unmarshal([]byte(line), &row); err != nil {
+			t.Fatalf("行解析失败 %q: %v", line, err)
+		}
+		out = append(out, row)
+	}
+	return out
+}
+
+// TestRunAgentCoreJournalsTranscript 端到端：一次成功 run 必须留下
+// 头行 + user 行 + assistant 行 + end(success)，顺序固定。
+func TestRunAgentCoreJournalsTranscript(t *testing.T) {
+	setTestAgentHome(t)
+	up, srv := newAgentCoreUpstream(t, agentCoreTextTurn("你好", "，世界"))
+	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
+	t.Setenv("ANTHROPIC_MODEL", "")
+
+	m := newAgentAIManager()
+	const sessionID = "conv-journal-ok"
+	registerTestAISession(t, m, &agentAISession{
+		id:      sessionID,
+		runSeq:  1,
+		history: []agentAIMessage{{Role: "user", Content: "打个招呼"}},
+	})
+
+	log := &agentCoreEventLog{}
+	run := agentAIRun{
+		sessionID:   sessionID,
+		runSeq:      1,
+		messageID:   "msg-host-j1",
+		provider:    "agentcore",
+		model:       "glm-5.2",
+		projectPath: t.TempDir(),
+		activity:    newAgentAIActivity(),
+	}
+	m.runAgentCore(context.Background(), run, log.write)
+
+	lines := readAgentCoreJournalRows(t, sessionID)
+	if len(lines) != 4 {
+		t.Fatalf("journal 行数 = %d, want 4: %v", len(lines), lines)
+	}
+	if lines[0]["kind"] != "session" || lines[0]["model"] != "glm-5.2" {
+		t.Errorf("头行 = %v", lines[0])
+	}
+	if lines[1]["role"] != "user" || lines[1]["text"] != "打个招呼" {
+		t.Errorf("user 行 = %v（必须是 history 里的真实用户 content）", lines[1])
+	}
+	if lines[2]["role"] != "assistant" || lines[2]["text"] != "你好，世界" {
+		t.Errorf("assistant 行 = %v", lines[2])
+	}
+	if lines[3]["kind"] != "end" || lines[3]["status"] != "success" {
+		t.Errorf("end 行 = %v", lines[3])
+	}
+	_ = up
+}
+
+// TestRunAgentCoreJournalsAutoProviderFirstUserLine 防回归：fallback 用户
+// （provider=auto）的 run 同样必须留下首条 user 行——这正是挂点收进
+// runAgentCore 入口的原因（派发前 provider 还是 auto）。
+func TestRunAgentCoreJournalsAutoProviderFirstUserLine(t *testing.T) {
+	setTestAgentHome(t)
+	_, srv := newAgentCoreUpstream(t, agentCoreTextTurn("好", ""))
+	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
+	t.Setenv("ANTHROPIC_MODEL", "")
+
+	m := newAgentAIManager()
+	const sessionID = "conv-journal-auto"
+	registerTestAISession(t, m, &agentAISession{
+		id:      sessionID,
+		runSeq:  1,
+		history: []agentAIMessage{{Role: "user", Content: "自动档"}},
+	})
+	log := &agentCoreEventLog{}
+	run := agentAIRun{
+		sessionID:   sessionID,
+		runSeq:      1,
+		messageID:   "msg-host-j2",
+		provider:    "auto",
+		projectPath: t.TempDir(),
+		activity:    newAgentAIActivity(),
+	}
+	m.runAgentCore(context.Background(), run, log.write)
+
+	lines := readAgentCoreJournalRows(t, sessionID)
+	if len(lines) < 2 || lines[1]["role"] != "user" || lines[1]["text"] != "自动档" {
+		t.Fatalf("fallback 用户的首条 user 行缺失: %v", lines)
+	}
+}
+
+// TestRunAgentCoreJournalsWriteFailureDoesNotAffectRun journal 写失败绝不影响
+// run（spec §10）：把 journal 指到一个「文件冒充的目录」上，MkdirAll 必败，
+// run 仍须正常完成（恰好一个 done、无 error）。
+func TestRunAgentCoreJournalsWriteFailureDoesNotAffectRun(t *testing.T) {
+	home := t.TempDir()
+	blocker := filepath.Join(home, "blocker")
+	if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	setTestAgentHome(t)
+	up, srv := newAgentCoreUpstream(t, agentCoreTextTurn("好", ""))
+	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
+	t.Setenv("ANTHROPIC_MODEL", "")
+
+	m := newAgentAIManager()
+	m.coreJournal = newAgentCoreJournal(blocker) // 文件冒充目录 → 所有写失败
+	const sessionID = "conv-journal-iofail"
+	registerTestAISession(t, m, &agentAISession{
+		id:      sessionID,
+		runSeq:  1,
+		history: []agentAIMessage{{Role: "user", Content: "照常跑"}},
+	})
+	log := &agentCoreEventLog{}
+	run := agentAIRun{
+		sessionID:   sessionID,
+		runSeq:      1,
+		messageID:   "msg-host-j4",
+		provider:    "agentcore",
+		projectPath: t.TempDir(),
+		activity:    newAgentAIActivity(),
+	}
+	m.runAgentCore(context.Background(), run, log.write)
+
+	if got := log.count(models.AgentEventAIDone); got != 1 {
+		t.Fatalf("ai.done = %d, want 1（写失败不得影响 run）: %v", got, log.types())
+	}
+	if got := log.count(models.AgentEventAIError); got != 0 {
+		t.Fatalf("ai.error = %d, want 0: %v", got, log.filter(models.AgentEventAIError))
+	}
+	_ = up
+}
+
+// TestRunAgentCoreJournalsErrorEnd 错误出口也要落 end 行，但绝不落 assistant 行。
+func TestRunAgentCoreJournalsErrorEnd(t *testing.T) {
+	setTestAgentHome(t)
+	// 不配可用上游（BASE_URL 指向必然连不上的回环端口）→ agentCoreEnsureUpstream
+	// 或内核请求失败。若发现该测试因自愈逻辑产生重副作用，参考现有
+	// TestRunAgentCoreRejectsEmptyHistory 的处理方式调整，但断言不变：
+	// journal 末行必须是 end/status=error，且全程无 assistant 行。
+	t.Setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:1")
+	t.Setenv("ANTHROPIC_MODEL", "")
+
+	m := newAgentAIManager()
+	const sessionID = "conv-journal-err"
+	registerTestAISession(t, m, &agentAISession{
+		id:      sessionID,
+		runSeq:  1,
+		history: []agentAIMessage{{Role: "user", Content: "会失败"}},
+	})
+	log := &agentCoreEventLog{}
+	run := agentAIRun{
+		sessionID:   sessionID,
+		runSeq:      1,
+		messageID:   "msg-host-j3",
+		provider:    "agentcore",
+		projectPath: t.TempDir(),
+		activity:    newAgentAIActivity(),
+	}
+	m.runAgentCore(context.Background(), run, log.write)
+
+	lines := readAgentCoreJournalRows(t, sessionID)
+	if len(lines) < 3 {
+		t.Fatalf("journal 行数 = %d, want >=3: %v", len(lines), lines)
+	}
+	last := lines[len(lines)-1]
+	if last["kind"] != "end" || last["status"] != "error" {
+		t.Errorf("end 行 = %v, want status=error", last)
+	}
+	for _, l := range lines {
+		if l["role"] == "assistant" {
+			t.Errorf("错误出口不应有 assistant 行: %v", l)
+		}
 	}
 }

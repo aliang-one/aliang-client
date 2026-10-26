@@ -406,6 +406,22 @@ func agentCoreScopeCheck(run agentAIRun) func(string, map[string]interface{}) (b
 // ai.command 配对全部由那条既有管线免费提供。
 func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, writeJSON agentTerminalWriter) {
 	defer m.clearRunning(run.sessionID, run.runSeq, writeJSON)
+
+	// 调用记录落盘（AliangCode 留痕，spec §6）：入口写头行 + 首条 user 行，
+	// 成功出口写 assistant 行，所有出口经 defer 落 end 行。写失败只 Warn。
+	journal := m.coreJournal
+	endStatus, endErrMsg := "error", ""
+	defer func() { journal.appendEnd(run.sessionID, endStatus, endErrMsg) }()
+	now := time.Now().UTC().Format(time.RFC3339)
+	journal.ensureSessionHeader(run.sessionID, run.projectPath, agentCoreModel(run), now)
+	if lastUser, ok := m.lastUserHistoryMessage(run.sessionID); ok {
+		ts := now
+		if !lastUser.CreatedAt.IsZero() {
+			ts = lastUser.CreatedAt.UTC().Format(time.RFC3339)
+		}
+		journal.appendUser(run.sessionID, run.messageID, lastUser.Content, ts)
+	}
+
 	if run.cancel != nil {
 		defer run.cancel()
 	}
@@ -422,12 +438,14 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 
 	// 平台代理没起时先自愈一次，否则用户看到的是裸的 Connection refused。
 	if err := agentCoreEnsureUpstream(ctx); err != nil {
+		endErrMsg = err.Error()
 		_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, err))
 		return
 	}
 
 	messages := m.agentCoreMessages(run)
 	if len(messages) == 0 {
+		endErrMsg = "会话没有可发送的消息"
 		_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, fmt.Errorf("会话没有可发送的消息")))
 		return
 	}
@@ -555,6 +573,7 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 	wg.Wait()
 
 	if bindingErr != nil {
+		endErrMsg = bindingErr.Error()
 		return
 	}
 
@@ -571,6 +590,10 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 			statusPayload["error"] = errMsg
 		}
 		_ = writeJSON(statusPayload)
+		endStatus = "stopped"
+		if errMsg != "" {
+			endErrMsg = errMsg
+		}
 		return
 	}
 
@@ -578,10 +601,12 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 	// runErr 非空但 IsError 为 false 的情形（理论上只有「内核内部报错但没走到
 	// 终止帧」）才需要宿主兜底。
 	if result != nil && result.IsError {
+		endErrMsg = "agentcore run failed"
 		finalizeRunSubagents(run, writeJSON)
 		return
 	}
 	if runErr != nil {
+		endErrMsg = runErr.Error()
 		finalizeRunSubagents(run, writeJSON)
 		_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, runErr))
 		return
@@ -595,6 +620,8 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 	filesMu.Unlock()
 
 	m.appendAssistantHistory(run.sessionID, run.runSeq, run.messageID, assistantOutput)
+	journal.appendAssistant(run.sessionID, agentAssistantMessageID(run.messageID), assistantOutput, time.Now().UTC().Format(time.RFC3339))
+	endStatus = "success"
 	m.setAgentAIResumeSessionIDIfEmpty(run.sessionID, run.runSeq, capturedResumeSessionID)
 	// 刻意跳过 ccPeerSessionJSONL / appendLineageMarker：那是 Claude CLI 的
 	// transcript 谱系修补，内核没有对应的 JSONL 文件。

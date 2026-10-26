@@ -41,6 +41,9 @@ type agentAIManager struct {
 	runJournalEnabled  bool
 	bindings           map[string]agentAIBindingRecord
 	processedRuns      map[string]agentAIProcessedRun
+	// coreJournal 是 agentcore（AliangCode）调用记录落盘器；dir 为空时内部
+	// 全 no-op。构造时解析一次 agentHome()。
+	coreJournal *agentCoreJournal
 	// toolAsk 自有 MCP 交互工具桥(2026-10-16 方案):one-shot --print 下承载
 	// 手机阻塞交互,懒初始化见 ensureToolAskBridge。
 	toolAsk *agentToolAskBridge
@@ -925,6 +928,7 @@ func newAgentAIManager() *agentAIManager {
 		pendingTerminals:   make(map[string]map[string]interface{}),
 		bindings:           make(map[string]agentAIBindingRecord),
 		processedRuns:      make(map[string]agentAIProcessedRun),
+		coreJournal:        newAgentCoreJournal(agentCoreJournalDir()),
 	}
 	return m
 }
@@ -3639,6 +3643,23 @@ func (m *agentAIManager) appendAssistantHistory(sessionID string, runSeq int, me
 		CreatedAt: time.Now().UTC(),
 	})
 	session.history = trimAgentAIHistory(session.history)
+}
+
+// lastUserHistoryMessage 返回会话 history 里最后一条 user 消息（m.mu 内读取）。
+// journal 用它拿「触发本轮的真实用户 content」——不取 run.prompt（拼接产物）。
+func (m *agentAIManager) lastUserHistoryMessage(sessionID string) (agentAIMessage, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	session := m.sessions[sessionID]
+	if session == nil {
+		return agentAIMessage{}, false
+	}
+	for i := len(session.history) - 1; i >= 0; i-- {
+		if strings.EqualFold(session.history[i].Role, "user") {
+			return session.history[i], true
+		}
+	}
+	return agentAIMessage{}, false
 }
 
 // setAgentAIResumeSessionIDIfEmpty pins a CLI-assigned session id so the NEXT
