@@ -27,7 +27,7 @@ const (
 
 // agentCoreMCPRawServer 是一条未脱敏的 server 配置（连接用）。
 type agentCoreMCPRawServer struct {
-	Name    string // 配置原始键（user 域为 server 名；插件域为 plugin:<p>:<s>）
+	Name    string            // 配置原始键（user 域为 server 名；插件域为 plugin:<p>:<s>）
 	Command string            `json:"command"`
 	Args    []string          `json:"args"`
 	Env     map[string]string `json:"env"`

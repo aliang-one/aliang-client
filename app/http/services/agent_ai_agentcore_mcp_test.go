@@ -25,7 +25,8 @@ func TestAgentCoreMCPRawServersIn(t *testing.T) {
 			"github": {"command": "npx", "args": ["-y", "gh-mcp"], "env": {"GH_TOKEN": "secret"}},
 			"docs": {"type": "http", "url": "https://mcp.example.com/sse"},
 			"off": {"command": "nope", "disabled": true},
-			"broken": {"args": ["no-command"]}
+			"broken": {"args": ["no-command"]},
+			"badtype": {"env": {"A": 1}}
 		}
 	}`)
 	got := agentCoreMCPRawServersIn(home)
