@@ -735,6 +735,25 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 	coreSteer := newAgentAICoreSteerControl(run, writeJSON)
 	m.attachCoreSteer(run.sessionID, run.runSeq, coreSteer)
 
+	// MCP 工具注入（spec §3）：采集→建连→包桥→注册。全部失败也只是空桥，
+	// run 照常（纯内置 8 工具）。内核 Registry 后注册者胜，桥与内置工具
+	// 名空间不重叠（mcp__ 前缀），互不遮蔽。
+	mcpTools, closeMCP := m.agentCoreMCPServerToolDefs(ctx, agentCoreMCPRawServersIn(agentHome()), func(tool, summary string, isErr bool) {
+		m.coreJournal.appendTool(run.sessionID, tool, summary, isErr)
+	})
+	registry := agentcore.DefaultRegistry()
+	for _, tool := range mcpTools {
+		registry.Register(tool)
+	}
+	defer func() {
+		// 慢关停与 run 收尾解耦（Task 2 评审挂账决策）：stdio 关停最坏
+		// 10-15s/个（关 stdin→5s 等退出→SIGTERM→再 5s→SIGKILL），串行会
+		// 拖住 clearRunning 与下一轮 run。SDK ClientSession.Close 幂等、
+		// 进程退出兜底，堆积面受人类 run 节奏约束——fire-and-forget 是
+		// v1 的合理取舍。
+		go closeMCP()
+	}()
+
 	cfg := &agentcore.Config{
 		// 带上用户自己的 API key：网关靠它走 user-api-key 通道，不做分组门禁。
 		// 不带的话，不在 anthropic-duration 组里的账号会被 403 挡下（见
@@ -743,11 +762,11 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		Client:    agentcore.NewClient(agentCoreBaseURL()).WithAPIKey(agentCoreAuthToken()),
 		Model:     agentCoreModel(run),
 		System:    agentCoreSystemPrompt(),
-		Tools:     agentcore.DefaultRegistry(),
+		Tools:     registry,
 		SessionID: kernelSessionID,
 		// 会话的 effort 档位（手机选档 → server 透传 → 这里进请求体）。
 		// 空串/无法识别的档位在内核侧被丢弃，不下发。
-		Effort:    run.effort,
+		Effort: run.effort,
 		Env: &agentcore.ToolEnv{
 			ProjectPath: run.projectPath,
 			ScopeCheck:  agentCoreScopeCheck(run),
@@ -1032,8 +1051,11 @@ func (m *agentAIManager) agentCoreApprove(run agentAIRun, writeJSON agentTermina
 			decision, matchedID := svc.evaluateApprovalDecision(call.ToolName, toolInput, run.projectPath)
 			// MCP 默认门（spec §7）：没有显式设备规则命中（matchedID 为空 =
 			// 落到策略 DefaultDecision）的 mcp__* 工具一律要求手机审批——
-			// 显式规则（含放行）优先于本默认。
+			// 显式规则（含放行）优先于本默认。已知例外：服务端若下发空 id
+			// 规则（现无生产方），显式放行会被本门改判 require（fail-safe
+			// 方向，宁可多问一次手机）。
 			if matchedID == "" && strings.HasPrefix(call.ToolName, "mcp__") {
+				logger.Info(fmt.Sprintf("approval-hook: MCP default gate require_approval tool=%s session=%s matched=none", call.ToolName, run.sessionID))
 				decision = decisionRequireApproval
 			}
 			switch decision {

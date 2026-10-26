@@ -338,7 +338,12 @@ func (m *agentAIManager) agentCoreMCPServerToolDefs(ctx context.Context, raws []
 			continue
 		}
 		sctx, cancel := context.WithTimeout(ctx, agentCoreMCPInitTimeout)
-		session, closeFn, err := agentCoreMCPDial(sctx, raw)
+		// 测试注入优先：内存 session 替真 dial（忽略 raw）；nil 走真实路径。
+		dial := agentCoreMCPDial
+		if m != nil && m.coreMCPDialForTest != nil {
+			dial = m.coreMCPDialForTest
+		}
+		session, closeFn, err := dial(sctx, raw)
 		if err != nil {
 			fail(raw.Name, err)
 			cancel()

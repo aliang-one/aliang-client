@@ -338,6 +338,7 @@ func TestAgentCoreSteerMessageDropsBlockWithoutSource(t *testing.T) {
 // 事件流看起来正常、历史也正常，但请求体里没有图片块——模型照样「看不到图」。
 // 只有在这里断言上游收到的 MessagesRequest 才能钉住。
 func TestRunAgentCoreSendsImageAttachmentUpstream(t *testing.T) {
+	setTestAgentHome(t) // MCP 采集也从 HOME 解析：不隔离会去 dial 真实 ~/.claude.json 的 server
 	up, srv := newAgentCoreUpstream(t, agentCoreTextTurn("图里是", "一个报错"))
 	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
 	t.Setenv("ANTHROPIC_MODEL", "")

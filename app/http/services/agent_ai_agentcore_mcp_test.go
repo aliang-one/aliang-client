@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -371,12 +372,32 @@ func setAgentCoreMCPTestPolicy(t *testing.T, svc *AgentService, projectPath stri
 // 先注后跑即确定）。
 func startAgentCoreMCPApprovalRun(t *testing.T, policy ApprovalPolicy, turns ...string) *agentCoreMCPApprovalHarness {
 	t.Helper()
-	setTestAgentHome(t) // journal 根在 newAgentAIManager 构造时解析
+	return startAgentCoreMCPApprovalRunWithMCP(t, policy, "", nil, turns...)
+}
+
+// startAgentCoreMCPApprovalRunWithMCP 在骨架之上再注入一条 MCP server：把
+// server 条目写进测试 home 的 .claude.json（走真实采集路径
+// agentCoreMCPRawServersIn），dial 替换成直接返回内存 session（忽略 raw，
+// closeFn 置空——session 由 startTestMCPSession 的 t.Cleanup 关）。
+// 需要 mcp__ 工具「真实执行到 handler」的场景（显式放行后的派发、端到端
+// 桥接）用它；mcpServerName 留空即退回无 MCP 的原骨架。
+func startAgentCoreMCPApprovalRunWithMCP(t *testing.T, policy ApprovalPolicy, mcpServerName string, mcpSession *mcp.ClientSession, turns ...string) *agentCoreMCPApprovalHarness {
+	t.Helper()
+	setTestAgentHome(t) // journal 根与 MCP 采集都从 HOME 解析，双隔离
+	if mcpServerName != "" && mcpSession != nil {
+		writeTestHomeFile(t, os.Getenv("HOME"), ".claude.json",
+			`{"mcpServers":{"`+mcpServerName+`":{"command":"injected-for-test"}}}`)
+	}
 	up, srv := newAgentCoreUpstream(t, turns...)
 	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
 	t.Setenv("ANTHROPIC_MODEL", "")
 
 	m := newAgentAIManager()
+	if mcpServerName != "" && mcpSession != nil {
+		m.coreMCPDialForTest = func(context.Context, agentCoreMCPRawServer) (*mcp.ClientSession, func(), error) {
+			return mcpSession, func() {}, nil
+		}
+	}
 	// 空 service：approvalService() 不落 GetSharedAgentService()（测试进程里
 	// 那个可能带真实云端配置）；策略经内存表注入。
 	svc := &AgentService{}
@@ -387,7 +408,7 @@ func startAgentCoreMCPApprovalRun(t *testing.T, policy ApprovalPolicy, turns ...
 
 	const sessionID = "conv-agentcore-mcp-approval"
 	const runSeq = 1
-	m.registerAISessionLocked(&agentAISession{
+	registerTestAISession(t, m, &agentAISession{
 		id:      sessionID,
 		runSeq:  runSeq,
 		history: []agentAIMessage{{Role: "user", Content: "调一下工具"}},
@@ -535,7 +556,14 @@ func TestAgentCoreMCPApprovalDefaultGate(t *testing.T) {
 				Decision: decisionAutoApprove,
 			}},
 		}
-		h := startAgentCoreMCPApprovalRun(t, policy,
+		// 注入同名 MCP 工具（server=srv + tool=tool → 桥名恰为 mcpTool）：
+		// 显式放行后内核必须真实执行到 handler——桥已接入注册表，
+		// 「未知工具」不允许再出现。
+		session := startTestMCPSession(t, "tool", func(args map[string]interface{}) (string, bool) {
+			q, _ := args["q"].(string)
+			return "pong:" + q, false
+		})
+		h := startAgentCoreMCPApprovalRunWithMCP(t, policy, "srv", session,
 			agentCoreToolTurn("toolu_mcp2", mcpTool, `{"q":"ping"}`),
 			agentCoreTextTurn("好", "的"),
 		)
@@ -553,15 +581,14 @@ func TestAgentCoreMCPApprovalDefaultGate(t *testing.T) {
 			t.Fatalf("ai.error 数量 = %d, want 0（%v）", got, h.log.filter(models.AgentEventAIError))
 		}
 
-		// 审批通过、内核真的派发了执行：回填不是「用户拒绝」。MCP 桥接入
-		// 注册表是后续接线（Task 5），此刻内核回报「未知工具」——恰恰证明
-		// 已越过审批门到达派发；接线落地后此处应改为断言真实执行结果。
-		content, _ := h.lastToolResult(t)
-		if strings.Contains(content, "用户拒绝") || strings.Contains(content, "审批") {
-			t.Fatalf("tool_result = %q, want 非拒绝（显式规则应放行到执行派发）", content)
+		// 审批放行 + 桥注册 + 内核派发全链穿透：tool_result 是 handler 的
+		// 真实返回，非「未知工具」、非拒绝、非错误。
+		content, isErr := h.lastToolResult(t)
+		if isErr {
+			t.Fatalf("tool_result is_error=true, want 真实执行（%q）", content)
 		}
-		if !strings.Contains(content, "未知工具") {
-			t.Fatalf("tool_result = %q, want 含「未知工具」（接线前的派发证据）", content)
+		if !strings.Contains(content, "pong:ping") {
+			t.Fatalf("tool_result = %q, want 含 pong:ping（显式放行→桥→内核全链真实执行）", content)
 		}
 	})
 
@@ -614,4 +641,161 @@ func TestAgentCoreMCPApprovalDefaultGate(t *testing.T) {
 			t.Fatalf("tool_result = %q, want 非拒绝（allow_all 默认放行非 mcp 工具）", content)
 		}
 	})
+}
+
+// ---------------------------------------------------------------------------
+// 端到端：runAgentCore 的 MCP 工具注入全链（spec §3）
+// ---------------------------------------------------------------------------
+
+// TestRunAgentCoreMCPEndToEnd 锁死 MCP 注入在真 run 里的完整链路：
+//
+//	采集（home 的 .claude.json）→ 建连（dial 注入的内存 session）→ 包桥注册
+//	（Registry）→ 审批（显式放行，全程无卡）→ 真实执行（tool_result 回填
+//	handler 输出）→ journal v2 工具行 → run 收尾后 closeAll 被调用。
+//
+// 任何一环断裂都有独立断言可见：桥不在注册表 → tool_result 变「未知工具」；
+// 审批没放行 → ai.approval.request 出现；journal 回调没接 → tool 行缺失；
+// closeAll 没被 defer → closeCount 恒 0。
+func TestRunAgentCoreMCPEndToEnd(t *testing.T) {
+	session := startTestMCPSession(t, "echo", func(args map[string]interface{}) (string, bool) {
+		q, _ := args["q"].(string)
+		return "echo:" + q, false
+	})
+
+	setTestAgentHome(t) // journal 根与 MCP 采集都从 HOME 解析，一并隔离
+	writeTestHomeFile(t, os.Getenv("HOME"), ".claude.json",
+		`{"mcpServers":{"srv":{"command":"injected-for-test"}}}`)
+	up, srv := newAgentCoreUpstream(t,
+		agentCoreToolTurn("toolu_e2e", "mcp__srv__echo", `{"q":"hi"}`),
+		agentCoreTextTurn("好", "的"),
+	)
+	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
+	t.Setenv("ANTHROPIC_MODEL", "")
+
+	m := newAgentAIManager()
+	// dial 注入：忽略 raw、直接给内存 session；closeFn 计数供收尾断言。
+	var closeCount int32
+	m.coreMCPDialForTest = func(context.Context, agentCoreMCPRawServer) (*mcp.ClientSession, func(), error) {
+		return session, func() { atomic.AddInt32(&closeCount, 1) }, nil
+	}
+	// 空 service + 设备策略显式放行该 mcp 工具：全程不得出现审批卡。
+	svc := &AgentService{}
+	m.service = svc
+	project := t.TempDir()
+	setAgentCoreMCPTestPolicy(t, svc, project, ApprovalPolicy{
+		Scheme:          "custom",
+		DefaultDecision: decisionRequireApproval,
+		Rules: []approvalRule{{
+			ID:       "mcp-e2e-allow",
+			Match:    approvalRuleMatch{Tool: []string{"mcp__srv__echo"}},
+			Decision: decisionAutoApprove,
+		}},
+	})
+
+	const sessionID = "conv-agentcore-mcp-e2e"
+	registerTestAISession(t, m, &agentAISession{
+		id:      sessionID,
+		runSeq:  1,
+		history: []agentAIMessage{{Role: "user", Content: "调一下 echo"}},
+	})
+
+	log := &agentCoreEventLog{}
+	run := agentAIRun{
+		sessionID:   sessionID,
+		runSeq:      1,
+		messageID:   "msg-mcp-e2e",
+		provider:    "agentcore",
+		model:       "glm-5.2",
+		projectPath: project,
+		activity:    newAgentAIActivity(),
+	}
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		m.runAgentCore(context.Background(), run, log.write)
+	}()
+	select {
+	case <-finished:
+	case <-time.After(30 * time.Second):
+		t.Fatalf("runAgentCore 没有收敛（事件 %v）", log.types())
+	}
+
+	// 1) 终止事件契约：恰 1 ai.done、0 ai.error、0 审批卡（显式放行短路）。
+	if got := log.count(models.AgentEventAIDone); got != 1 {
+		t.Fatalf("ai.done 数量 = %d, want 1（事件 %v）", got, log.types())
+	}
+	if got := log.count(models.AgentEventAIError); got != 0 {
+		t.Fatalf("ai.error 数量 = %d, want 0（%v）", got, log.filter(models.AgentEventAIError))
+	}
+	if got := log.count(models.AgentEventAIApprovalRequest); got != 0 {
+		t.Fatalf("ai.approval.request 数量 = %d, want 0（显式放行不得问手机，事件 %v）", got, log.types())
+	}
+
+	// 2) 真实执行穿透审批+桥+内核：第二轮上游请求带 tool_result=handler 输出。
+	reqs := up.requests()
+	if len(reqs) != 2 {
+		t.Fatalf("上游请求次数 = %d, want 2（工具回合后应带 tool_result 继续，事件 %v）", len(reqs), log.types())
+	}
+	second := reqs[1]
+	if len(second.Messages) < 3 {
+		t.Fatalf("第二轮 messages 只有 %d 条, want ≥3（user/assistant(tool_use)/user(tool_result)）", len(second.Messages))
+	}
+	var toolContent string
+	var toolIsErr bool
+	foundResult := false
+	last := second.Messages[len(second.Messages)-1]
+	blocks, _ := last.Content.([]interface{})
+	for _, raw := range blocks {
+		block, _ := raw.(map[string]interface{})
+		if block == nil {
+			continue
+		}
+		if bt, _ := block["type"].(string); bt == agentcore.BlockTypeToolResult {
+			toolContent, _ = block["content"].(string)
+			toolIsErr, _ = block["is_error"].(bool)
+			foundResult = true
+			break
+		}
+	}
+	if !foundResult {
+		t.Fatalf("第二轮最后一条消息没有 tool_result: %+v", last)
+	}
+	if toolIsErr {
+		t.Fatalf("tool_result is_error=true, want 真实执行（%q）", toolContent)
+	}
+	if !strings.Contains(toolContent, "echo:hi") {
+		t.Fatalf("tool_result = %q, want 含 echo:hi（审批+桥+内核全链穿透）", toolContent)
+	}
+
+	// 3) journal v2 四类行齐且顺序固定：session / user / tool / assistant / end。
+	lines := readJournalLines(t, agentCoreJournalDir(), sessionID)
+	if len(lines) != 5 {
+		t.Fatalf("journal 行数 = %d, want 5: %v", len(lines), lines)
+	}
+	if lines[0]["kind"] != "session" {
+		t.Errorf("头行 = %v", lines[0])
+	}
+	if lines[1]["role"] != "user" || lines[1]["text"] != "调一下 echo" {
+		t.Errorf("user 行 = %v", lines[1])
+	}
+	if lines[2]["kind"] != "tool" || lines[2]["tool"] != "mcp__srv__echo" ||
+		lines[2]["summary"] != `q="hi"` || lines[2]["is_error"] != false {
+		t.Errorf("tool 行 = %v, want kind=tool tool=mcp__srv__echo summary=q=\"hi\" is_error=false", lines[2])
+	}
+	if lines[3]["role"] != "assistant" || lines[3]["text"] != "好的" {
+		t.Errorf("assistant 行 = %v", lines[3])
+	}
+	if lines[4]["kind"] != "end" || lines[4]["status"] != "success" {
+		t.Errorf("end 行 = %v, want status=success", lines[4])
+	}
+
+	// 4) run 收尾后 closeAll 被调用恰好一次（defer 走 detached goroutine，
+	// closeFn 可能在 waitFinished 之后才执行——轮询等，不许竞断）。
+	deadline := time.Now().Add(5 * time.Second)
+	for atomic.LoadInt32(&closeCount) == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := atomic.LoadInt32(&closeCount); got != 1 {
+		t.Fatalf("closeAll 调用次数 = %d, want 1（MCP 会话必须被关停）", got)
+	}
 }
