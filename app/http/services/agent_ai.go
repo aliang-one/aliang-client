@@ -6143,13 +6143,10 @@ func streamStructuredAIDelta(reader io.Reader, format agentAIOutputFormat, run a
 		}
 		parts := extractStructuredAITexts(format, event)
 		for _, d := range parts.deltas {
-			if strings.TrimSpace(d) == "" {
-				// 空白 delta（段落间独立 "\n"）不上线，但必须计入已流式文本：
-				// 否则 currentStreamed 丢字节，suffixNotStreamed 判定分叉后会把
-				// 整段最终文本重发一遍，落库消息变成 "片段+全文" 双份。
-				currentStreamed += d
-				continue
-			}
+			// 空白 delta（独立的 "\n"、独立空格）也必须原样上线：丢掉它们会让
+			// 落库文本缺字节——```aliang-options 围栏标签后的换行被吃（围栏
+			// 残废）、token 边界随机吃空格（2026-10-26 RCA）。emitAIDelta 对
+			// 真空串自行短路；currentStreamed 继续记账，suffix 去重不受影响。
 			if !emitAIDelta(d, run, "assistant", writeJSON, limiter, capture) {
 				return
 			}
@@ -6166,7 +6163,7 @@ func streamStructuredAIDelta(reader io.Reader, format agentAIOutputFormat, run a
 			if parts.isResult && currentStreamed == "" {
 				reference = lastFinalText
 			}
-			if suffix := suffixNotStreamed(reference, parts.finalText); strings.TrimSpace(suffix) != "" {
+			if suffix := suffixNotStreamed(reference, parts.finalText); suffix != "" {
 				if !emitAIDelta(suffix, run, "assistant", writeJSON, limiter, capture) {
 					return
 				}
@@ -6278,9 +6275,9 @@ func extractStructuredAITexts(format agentAIOutputFormat, event map[string]inter
 //   - they diverge (neither is a prefix of the other) ⇒ final wholesale.
 //   - Empty streamed ⇒ all of final (recovers finalized-only messages).
 //
-// 前缀比较失败时先做一次空白容忍对齐（逐 rune，双侧空白等价）：发射循环会跳过
-// 空白 delta，result 事件与 finalized 文本的排版也可能有空白差异——这些都不该
-// 触发整段重发。真分叉（出现不同字符）仍保持旧行为整体重发，绝不静默丢字。
+// 前缀比较失败时先做一次空白容忍对齐（逐 rune，双侧空白等价）：result 事件与
+// finalized 文本的排版可能有空白差异——这些都不该触发整段重发。真分叉（出现
+// 不同字符）仍保持旧行为整体重发，绝不静默丢字。
 func suffixNotStreamed(streamed, final string) string {
 	if final == "" {
 		return ""
