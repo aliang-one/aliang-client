@@ -31,10 +31,11 @@ var (
 	loginShellPathRefreshing atomic.Bool
 )
 
-// parseLoginShellPathOutput 从探针输出里切出 PATH。取标记之后到首个换行
-// （或结尾）的段落：.zshrc 的欢迎语/回显噪声只会出现在标记前，不会污染。
+// parseLoginShellPathOutput 从探针输出里切出 PATH。取末次标记之后到首个
+// 换行（或结尾）的段落：printf 是 shell 最后一次 stdout 写入，取末次出现严格
+// 更稳；.zshrc 的欢迎语/回显噪声只会出现在标记前，不会污染。
 func parseLoginShellPathOutput(output string) (string, bool) {
-	idx := strings.Index(output, loginShellPathMarker)
+	idx := strings.LastIndex(output, loginShellPathMarker)
 	if idx < 0 {
 		return "", false
 	}

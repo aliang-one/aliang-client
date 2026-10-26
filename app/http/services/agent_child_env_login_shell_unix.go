@@ -5,7 +5,6 @@ package services
 import (
 	"context"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -17,6 +16,11 @@ import (
 //
 // fish 的 $PATH 是空格连接的 list，printf "$PATH" 出来无冒号会解析失败
 // （fail-open，无害）；fish 用户走 `string join` 分支拿到冒号形 PATH。
+//
+// 必须用 newBackgroundCommandContext 而非裸 exec.CommandContext：.zshrc 可能
+// 派生后台子进程，孤儿继承并持有 stdout 管道时 Output() 会被拖过超时甚至挂
+// 死，cachedLoginShellPath 的 CAS flag 也随之卡死。封装自带进程组 SIGKILL +
+// WaitDelay 兜底（见 command_nonwindows.go 的事故记录）。
 func loginShellPathSnapshot(timeout time.Duration) (string, bool) {
 	shell := strings.TrimSpace(os.Getenv("SHELL"))
 	if shell == "" || !isRegularFilePath(shell) {
@@ -36,7 +40,7 @@ func loginShellPathSnapshot(timeout time.Duration) (string, bool) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, shell, "-l", "-i", "-c", probe)
+	cmd := newBackgroundCommandContext(ctx, shell, "-l", "-i", "-c", probe)
 	output, err := cmd.Output()
 	if err != nil {
 		// 交互 shell 可能因 job control 警告等返回非零，但 stdout 仍有效；

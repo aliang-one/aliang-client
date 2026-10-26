@@ -14,6 +14,7 @@ func TestParseLoginShellPathOutput(t *testing.T) {
 		{"干净输出", "__ALIANG_PATH__/usr/bin:/bin", "/usr/bin:/bin", true},
 		{"前噪声", "loading profile...\n__ALIANG_PATH__/a:/b", "/a:/b", true},
 		{"后换行", "__ALIANG_PATH__/a:/b\n", "/a:/b", true},
+		{"中间空格", "__ALIANG_PATH__/a b:/c", "/a b:/c", true},
 		{"无标记", "/a:/b", "", false},
 		{"标记后为空", "__ALIANG_PATH__", "", false},
 		{"标记后无冒号", "__ALIANG_PATH__/single", "", false},
