@@ -173,3 +173,47 @@ func TestTruncateAgentCoreMCPOutput(t *testing.T) {
 		t.Fatalf("超限应截断并注明: len=%d", len(got))
 	}
 }
+
+func TestAgentCoreMCPBridgeName(t *testing.T) {
+	seen := map[string]bool{}
+	names := []string{
+		agentCoreMCPBridgeName(strings.Repeat("s", 100), strings.Repeat("t", 100), seen), // 极端长 server+tool：5+64+2+64=135 必须钳回 128
+		agentCoreMCPBridgeName(strings.Repeat("s", 100), strings.Repeat("t", 100), seen), // 同名再注册：序号消解且仍 ≤128
+		agentCoreMCPBridgeName("a.b", "lookup", seen),                                    // 清洗后 a_b
+		agentCoreMCPBridgeName("a:b", "lookup", seen),                                    // 清洗后同段：不许静默遮蔽
+	}
+	dup := map[string]bool{}
+	for _, n := range names {
+		if len(n) > 128 {
+			t.Fatalf("工具名超 128: len=%d %q", len(n), n)
+		}
+		for _, r := range n {
+			switch {
+			case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '-':
+			default:
+				t.Fatalf("工具名含非法字符 %q: %q", r, n)
+			}
+		}
+		if dup[n] {
+			t.Fatalf("工具名重复: %q", n)
+		}
+		dup[n] = true
+	}
+	if names[2] == names[3] {
+		t.Fatalf("清洗后同段的两个 server 不得同名: %q", names[2])
+	}
+	if !strings.HasPrefix(names[2], "mcp__a_b__lookup") || !strings.HasPrefix(names[3], "mcp__a_b__lookup") {
+		t.Fatalf("base 拼装错误: %q %q", names[2], names[3])
+	}
+}
+
+func TestAgentCoreMCPServerToolDefsSkipsHeaders(t *testing.T) {
+	m := &agentAIManager{}
+	bridges, closeAll := m.agentCoreMCPServerToolDefs(context.Background(), []agentCoreMCPRawServer{
+		{Name: "authed", Type: "http", URL: "https://mcp.example.com/mcp", Headers: map[string]string{"Authorization": "Bearer x"}},
+	}, nil)
+	defer closeAll()
+	if len(bridges) != 0 {
+		t.Fatalf("带 headers 的 http server 应预判跳过（不 dial）: %+v", bridges)
+	}
+}

@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -256,8 +257,8 @@ func listAgentCoreMCPTools(ctx context.Context, session *mcp.ClientSession) ([]*
 // agentCoreMCPDial 按 raw 配置建一条连接。transport 选择：stdio→CommandTransport；
 // type=http→Streamable；type=sse→SSE。返回 session 与关闭函数。
 // ⚠️ raw.Headers 暂未注入：go-sdk v1.8.0 两个 HTTP transport 均无 Headers
-// 字段（需自 RoundTripper），本任务只做「能连能包能调」，带鉴权的 HTTP
-// server 留待后续任务补。
+// 字段（需自 RoundTripper）；带非空 Headers 的条目由 agentCoreMCPServerToolDefs
+// 预判跳过，别白烧超时预算 dial 一个注定 401 的连接。
 func agentCoreMCPDial(ctx context.Context, raw agentCoreMCPRawServer) (*mcp.ClientSession, func(), error) {
 	var transport mcp.Transport
 	switch {
@@ -281,14 +282,47 @@ func agentCoreMCPDial(ctx context.Context, raw agentCoreMCPRawServer) (*mcp.Clie
 	return session, func() { _ = session.Close() }, nil
 }
 
+// agentCoreMCPBridgeName 组装桥工具名，锁两条硬约束：
+//  1. 总长 ≤128：Anthropic API 工具名 ^[a-zA-Z0-9_-]{1,128}$，理论最长
+//     5+64+2+64=135 会整轮请求 400——server 段按 tool 段剩余预算收缩。
+//  2. 全局唯一：清洗把 a.b/a:b 压成同段，Registry.Register 后注册者胜，
+//     重名会静默遮蔽——冲突追加 -2/-3 序号，序号占长前先重截 base。
+//
+// seen 由调用方跨 server 持有（整个 run 一张表）。
+func agentCoreMCPBridgeName(serverName, toolName string, seen map[string]bool) string {
+	toolSeg := sanitizeAgentCoreMCPSegment(toolName)
+	serverMax := 128 - len("mcp__") - len("__") - len(toolSeg)
+	if serverMax < 1 {
+		serverMax = 1 // 防御：tool 段 64 封顶下实际到不了这里
+	}
+	serverSeg := sanitizeAgentCoreMCPSegment(serverName)
+	if len(serverSeg) > serverMax {
+		serverSeg = serverSeg[:serverMax]
+	}
+	base := "mcp__" + serverSeg + "__" + toolSeg
+	name := base
+	for n := 2; seen[name]; n++ {
+		suffix := "-" + strconv.Itoa(n)
+		room := 128 - len(suffix)
+		if len(base) > room {
+			base = base[:room] // 序号占用长度，重截后再拼
+		}
+		name = base + suffix
+	}
+	seen[name] = true
+	return name
+}
+
 // agentCoreMCPServerToolDefs 连接全部 raw server、拉工具清单并包成桥。
 // 返回桥列表（已截 128）与统一关闭函数。单个 server 失败跳过 + Warn；
 // 全部失败返回空桥列表（run 照常，纯内置工具）。
+// 超时按 server 计（agentCoreMCPInitTimeout 各自一份）——共享预算会让排后
+// 的 server 趋零被误杀；connect ctx 只裁握手（transport 连接不绑 ctx，
+// cancel 后 session 仍可 CallTool）。
 func (m *agentAIManager) agentCoreMCPServerToolDefs(ctx context.Context, raws []agentCoreMCPRawServer, onCall func(tool, summary string, isErr bool)) ([]agentcore.Tool, func()) {
-	ctx, cancel := context.WithTimeout(ctx, agentCoreMCPInitTimeout)
-	defer cancel() // 防 go vet lostcancel
 	var closes []func()
 	bridges := make([]agentcore.Tool, 0, agentCoreMCPToolCap)
+	seen := map[string]bool{}
 	closeAll := func() {
 		for _, c := range closes {
 			c()
@@ -298,18 +332,26 @@ func (m *agentAIManager) agentCoreMCPServerToolDefs(ctx context.Context, raws []
 		logger.Warn(fmt.Sprintf("agentcore-mcp: server 跳过 server=%s err=%v", sanitizeAgentCoreMCPSegment(server), err))
 	}
 	for _, raw := range raws {
-		session, closeFn, err := agentCoreMCPDial(ctx, raw)
+		isHTTP := strings.EqualFold(raw.Type, "http") || strings.EqualFold(raw.Type, "sse")
+		if isHTTP && len(raw.Headers) > 0 {
+			logger.Warn(fmt.Sprintf("agentcore-mcp: server 跳过 server=%s reason=headers 暂不支持（v1 限制）", sanitizeAgentCoreMCPSegment(raw.Name)))
+			continue
+		}
+		sctx, cancel := context.WithTimeout(ctx, agentCoreMCPInitTimeout)
+		session, closeFn, err := agentCoreMCPDial(sctx, raw)
 		if err != nil {
 			fail(raw.Name, err)
+			cancel()
 			continue
 		}
 		closes = append(closes, closeFn)
-		tools, err := listAgentCoreMCPTools(ctx, session)
+		tools, err := listAgentCoreMCPTools(sctx, session)
 		if err != nil {
 			fail(raw.Name, err)
+			cancel()
 			continue
 		}
-		serverSeg := sanitizeAgentCoreMCPSegment(raw.Name)
+		cancel() // 该 server 处理完（成功路径）；session 交给 closeAll 关
 		for _, tool := range tools {
 			if len(bridges) >= agentCoreMCPToolCap {
 				logger.Warn(fmt.Sprintf("agentcore-mcp: 工具超上限截断 cap=%d", agentCoreMCPToolCap))
@@ -322,7 +364,7 @@ func (m *agentAIManager) agentCoreMCPServerToolDefs(ctx context.Context, raws []
 			}
 			bridges = append(bridges, &agentCoreMCPBridge{
 				session: session, rawTool: tool.Name,
-				name:        "mcp__" + serverSeg + "__" + sanitizeAgentCoreMCPSegment(tool.Name),
+				name:        agentCoreMCPBridgeName(raw.Name, tool.Name, seen),
 				description: desc, schema: schema, onCall: onCall,
 			})
 		}
