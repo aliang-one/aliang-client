@@ -1,0 +1,201 @@
+package services
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"aliang.one/nursorgate/app/http/models"
+)
+
+// writeAgentCoreJournalFixture 用真实 journal 写侧造测试文件（保证格式一致）。
+func writeAgentCoreJournalFixture(t *testing.T, dir, sessionID, projectPath string) {
+	t.Helper()
+	j := newAgentCoreJournal(dir)
+	j.ensureSessionHeader(sessionID, projectPath, "glm-5.2", "2026-10-26T08:00:00Z")
+	base := time.Date(2026, 10, 26, 8, 0, 0, 0, time.UTC)
+	j.appendUser(sessionID, "m1", "第一句", base.Format(time.RFC3339))
+	j.appendAssistant(sessionID, "m1-assistant", "第一答", base.Add(time.Minute).Format(time.RFC3339))
+	j.appendUser(sessionID, "m2", "第二句", base.Add(2*time.Minute).Format(time.RFC3339))
+	j.appendAssistant(sessionID, "m2-assistant", "第二答", base.Add(3*time.Minute).Format(time.RFC3339))
+	j.appendEnd(sessionID, "success", "")
+}
+
+func TestReadAgentCoreSessionMetaSummary(t *testing.T) {
+	dir := t.TempDir()
+	writeAgentCoreJournalFixture(t, dir, "conv-a", "/tmp/proj-a")
+	path := filepath.Join(dir, agentCoreJournalFileName("conv-a"))
+
+	session := readAgentCoreSessionMetaWithOptions(path, agentVibeSessionReadOptions{Limit: 24})
+	if session.ID != "conv-a" {
+		t.Fatalf("ID = %q, want conv-a（裸会话 ID,与活跃覆盖层同空间）", session.ID)
+	}
+	if session.Provider != "agentcore" || session.Tool != "agentcore" || session.Status != "closed" || session.Mode != "vibe" {
+		t.Errorf("摘要字段 = %+v", session)
+	}
+	if session.ProjectPath != "/tmp/proj-a" || session.Model != "glm-5.2" {
+		t.Errorf("project/model = %q/%q", session.ProjectPath, session.Model)
+	}
+	if session.Title != "第一句" {
+		t.Errorf("Title = %q, want 首条 user", session.Title)
+	}
+	if session.MessageCount != 4 {
+		t.Errorf("MessageCount = %d, want 4（end 行不计）", session.MessageCount)
+	}
+	if session.DisplayMessageCount == nil || *session.DisplayMessageCount != 4 {
+		t.Errorf("DisplayMessageCount = %v, want 4", session.DisplayMessageCount)
+	}
+	if session.UpdatedAt != "2026-10-26T08:03:00Z" {
+		t.Errorf("UpdatedAt = %q, want 最后一条真实消息 ts（不是 mtime/end 行）", session.UpdatedAt)
+	}
+	if len(session.Transcript) != 4 || session.Transcript[0].Role != "user" {
+		t.Errorf("Transcript = %+v", session.Transcript)
+	}
+}
+
+func TestReadAgentCoreSessionMetaHotWindow(t *testing.T) {
+	dir := t.TempDir()
+	writeAgentCoreJournalFixture(t, dir, "conv-w", "/p")
+	path := filepath.Join(dir, agentCoreJournalFileName("conv-w"))
+	session := readAgentCoreSessionMetaWithOptions(path, agentVibeSessionReadOptions{Limit: 2})
+	if session.MessageCount != 4 || len(session.Transcript) != 2 {
+		t.Fatalf("count=%d transcript=%d, want 4/2（热窗只留尾部）", session.MessageCount, len(session.Transcript))
+	}
+	if session.Transcript[0].Content != "第二句" {
+		t.Errorf("热窗首条 = %q, want 第二句", session.Transcript[0].Content)
+	}
+}
+
+func TestReadAgentCoreSessionMetaScanDirsDrop(t *testing.T) {
+	dir := t.TempDir()
+	writeAgentCoreJournalFixture(t, dir, "conv-f", "/tmp/other-proj")
+	path := filepath.Join(dir, agentCoreJournalFileName("conv-f"))
+	session := readAgentCoreSessionMetaWithOptions(path, agentVibeSessionReadOptions{Limit: 24, ScanDirs: []string{"/tmp/allowed"}})
+	if session.ID != "" {
+		t.Fatalf("scanDirs 外的会话应整体丢弃, got %+v", session)
+	}
+}
+
+func TestReadAgentCoreSessionMetaHeadlessFile(t *testing.T) {
+	// 无头行（steer 先于 run 到达的文件）:ID 兜底取文件名,其余字段空。
+	dir := t.TempDir()
+	j := newAgentCoreJournal(dir)
+	j.appendUser("conv-headless", "s1", "插话", "2026-10-26T08:00:00Z")
+	path := filepath.Join(dir, agentCoreJournalFileName("conv-headless"))
+	session := readAgentCoreSessionMetaWithOptions(path, agentVibeSessionReadOptions{Limit: 24})
+	if session.ID != "conv-headless" || session.MessageCount != 1 {
+		t.Fatalf("无头行文件解析 = %+v", session)
+	}
+	if session.CreatedAt == "" || session.UpdatedAt == "" {
+		t.Errorf("无头行时 CreatedAt/UpdatedAt 应回落到首条消息 ts: %+v", session)
+	}
+}
+
+func TestReadAgentCoreSessionMetaHalfLineTolerance(t *testing.T) {
+	dir := t.TempDir()
+	writeAgentCoreJournalFixture(t, dir, "conv-h", "/p")
+	path := filepath.Join(dir, agentCoreJournalFileName("conv-h"))
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("追加打开 journal: %v", err)
+	}
+	if _, err := f.WriteString(`{"kind":"msg","role":"user","tex`); err != nil { // 崩溃残行
+		t.Fatalf("写入残行: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("关闭 journal: %v", err)
+	}
+	session := readAgentCoreSessionMetaWithOptions(path, agentVibeSessionReadOptions{Limit: 24})
+	if session.MessageCount != 4 {
+		t.Fatalf("残行应被跳过, MessageCount = %d, want 4", session.MessageCount)
+	}
+}
+
+func TestReadAgentCoreSessionMetaFullyCorruptFileSkipped(t *testing.T) {
+	// 整文件损坏（每行都是垃圾字节）：文件名兜底不得凭空造出
+	// MessageCount=0 的幽灵卡,reader/collect 都要整体跳过。
+	// 对照：headless 文件有合法 msg 行,仍必须能解析（见上方测试）。
+	dir := t.TempDir()
+	path := filepath.Join(dir, agentCoreJournalFileName("conv-corrupt"))
+	garbage := []byte("\x00\x01binary junk\nnot json at all\n{\"kind\":\"msg\",\"role\":\"user\",\"tex\n]]]garbage[[[\n")
+	if err := os.WriteFile(path, garbage, 0o600); err != nil {
+		t.Fatalf("写入损坏文件: %v", err)
+	}
+	if session := readAgentCoreSessionMetaWithOptions(path, agentVibeSessionReadOptions{Limit: 24}); session.ID != "" {
+		t.Fatalf("整文件损坏应返回空结构体, got %+v", session)
+	}
+
+	setTestAgentHome(t)
+	if err := os.MkdirAll(agentCoreJournalDir(), 0o700); err != nil {
+		t.Fatalf("建 journal 目录: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(agentCoreJournalDir(), agentCoreJournalFileName("conv-corrupt")), garbage, 0o600); err != nil {
+		t.Fatalf("写入损坏文件: %v", err)
+	}
+	for _, session := range collectAgentCoreVibeSessions(nil) {
+		if session.ID == "conv-corrupt" {
+			t.Fatalf("collect 不得产出整文件损坏的幽灵卡: %+v", session)
+		}
+	}
+}
+
+func TestCollectAgentCoreVibeSessionsMergeAndCache(t *testing.T) {
+	setTestAgentHome(t)
+	dir := agentCoreJournalDir()
+	writeAgentCoreJournalFixture(t, dir, "conv-1", "/tmp/p1")
+	writeAgentCoreJournalFixture(t, dir, "conv-2", "/tmp/p2")
+
+	sessions := collectAgentCoreVibeSessions(nil)
+	if len(sessions) != 2 {
+		t.Fatalf("collect = %d, want 2", len(sessions))
+	}
+	// 缓存不投毒：第二次扫描（可能命中 (size,mtime) 缓存）结果与首次一致。
+	// 缓存命中语义本身由 agent_inventory_parse_cache_test.go 覆盖。
+	again := collectAgentCoreVibeSessions(nil)
+	if len(again) != 2 || again[0].ID != sessions[0].ID {
+		t.Fatalf("缓存扫描不一致: %v vs %v", again, sessions)
+	}
+	// scanDirs 过滤。
+	filtered := collectAgentCoreVibeSessions([]string{"/tmp/p1"})
+	if len(filtered) != 1 || filtered[0].ID != "conv-1" {
+		t.Fatalf("scanDirs 过滤 = %v", filtered)
+	}
+}
+
+func TestCollectAgentVibeSessionsIncludesAgentCore(t *testing.T) {
+	setTestAgentHome(t)
+	writeAgentCoreJournalFixture(t, agentCoreJournalDir(), "conv-merge", "/tmp/pm")
+	sessions := collectAgentVibeSessions(nil)
+	found := false
+	for _, s := range sessions {
+		if s.ID == "conv-merge" && s.Provider == "agentcore" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("collectAgentVibeSessions 三路合并未包含 agentcore 条目")
+	}
+}
+
+func TestOverlayMergesAgentCoreActiveWithFileEntry(t *testing.T) {
+	// 运行中：活跃覆盖层与文件条目同裸 ID → 合成一条，不出双卡。
+	setTestAgentHome(t)
+	writeAgentCoreJournalFixture(t, agentCoreJournalDir(), "conv-live", "/tmp/pl")
+	fileEntries := collectAgentCoreVibeSessions(nil)
+	if len(fileEntries) != 1 {
+		t.Fatalf("fixture = %v", fileEntries)
+	}
+	active := []models.AgentVibeSession{{
+		ID:       "conv-live",
+		Provider: "agentcore",
+		Status:   "running",
+	}}
+	merged := overlayActiveAgentVibeSessions(agentSyncSnapshot{VibeSessions: fileEntries}, active, nil)
+	if len(merged.VibeSessions) != 1 {
+		t.Fatalf("合并后 = %d 条, want 1（同 ID 不得双卡）", len(merged.VibeSessions))
+	}
+	if merged.VibeSessions[0].Status != "running" {
+		t.Errorf("合并后 status = %q, want running", merged.VibeSessions[0].Status)
+	}
+}
