@@ -119,6 +119,9 @@ func runShell(ctx context.Context, kind string, input map[string]interface{}, en
 	if env.ProjectPath != "" {
 		cmd.Dir = env.ProjectPath
 	}
+	if env.Env != nil {
+		cmd.Env = env.Env
+	}
 
 	var stdout, stderr strings.Builder
 	// 各自独立封顶，避免 stderr 刷屏挤掉 stdout。

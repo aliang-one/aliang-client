@@ -738,6 +738,38 @@ func TestShellRunsAndCapturesStdout(t *testing.T) {
 	}
 }
 
+// runShell 必须把 ToolEnv.Env 传给子进程：这是「用户终端环境对齐」的落地点。
+// env.Env 为 nil 时保持旧行为（继承宿主进程），保证兼容。
+func TestRunShellAppliesToolEnv(t *testing.T) {
+	toolEnv := &ToolEnv{
+		ShellPolicy: shPolicy(),
+		Env:         []string{"PATH=/usr/bin:/bin", "AGENTCORE_ENV_PROBE=hello"},
+	}
+	out := runShell(context.Background(), "bash",
+		map[string]interface{}{"command": `printf 'PROBE=%s' "$AGENTCORE_ENV_PROBE"`}, toolEnv)
+	if out.IsError || !strings.Contains(out.Content, "PROBE=hello") {
+		t.Fatalf("env 未传入子进程: %+v", out)
+	}
+
+	// 完整替换语义：Env 不是与宿主环境 append 合并。往测试进程注入一个
+	// Env 里没有的变量，子进程必须看不到——cmd.Env 显式设置后 os/exec 不再
+	// 继承宿主进程任何变量（否则宿主私有的 PATH/凭据会漏进子进程）。
+	t.Setenv("AGENTCORE_REPLACE_PROBE", "leaked")
+	out = runShell(context.Background(), "bash",
+		map[string]interface{}{"command": `printf 'REPLACE=%s' "$AGENTCORE_REPLACE_PROBE"`}, toolEnv)
+	if out.IsError || !strings.Contains(out.Content, "REPLACE=") || strings.Contains(out.Content, "leaked") {
+		t.Fatalf("Env 应是完整替换而非与宿主合并: %+v", out)
+	}
+
+	// nil Env：继承宿主（测试进程没有该变量），不应报错。
+	out = runShell(context.Background(), "bash",
+		map[string]interface{}{"command": `printf 'PROBE=%s' "$AGENTCORE_ENV_PROBE"`},
+		&ToolEnv{ShellPolicy: shPolicy()})
+	if out.IsError || strings.Contains(out.Content, "PROBE=hello") {
+		t.Fatalf("nil Env 应继承宿主进程，不应看到探针变量: %+v", out)
+	}
+}
+
 func TestShellExitCode(t *testing.T) {
 	env, _ := projectEnv(t)
 	env.ShellPolicy = shPolicy()

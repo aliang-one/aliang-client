@@ -70,6 +70,11 @@ type ToolEnv struct {
 	// 禁止 import services。所以把策略做成窄接口，宿主实现、内核调用。
 	// nil 时 fail closed —— 没配策略就不给执行，而不是默认放行。
 	ShellPolicy ShellPolicy
+	// Env 是子进程（Bash/PowerShell）的完整环境。nil = 继承宿主进程环境
+	// （旧行为）。宿主通过这里下发「用户登录 shell 快照 + TERM/LANG 兜底」，
+	// 否则 GUI/systemd 启动的 agent 只有系统四件套 PATH，node/npm 等用户级
+	// 工具全部不可见——aliangcode「没有 nodejs」误报的执行层根因。
+	Env []string
 }
 
 // ShellPolicy 是宿主注入的 shell 执行策略。
