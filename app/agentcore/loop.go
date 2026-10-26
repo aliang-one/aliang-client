@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"runtime/debug"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -503,7 +504,26 @@ func (r *runner) executeTools(ctx context.Context, toolUses []ContentBlock, writ
 }
 
 // executeOne 执行单个工具调用，串起审批 → 围栏 → 执行。
-func (r *runner) executeOne(ctx context.Context, tu ContentBlock) ToolResult {
+//
+// 内核跑在宿主进程内：审批桥、围栏、工具实现里任何一个 panic 都等于整台
+// 设备下线（CLI provider 的同类崩溃只死子进程，这里死的是整个 core——
+// 2026-10-26 实测：宿主审批策略对一条带注释尾段的 bash 命令 slice 越界，
+// 容器整个退出）。所以这里统一 recover，把 panic 降级成失败的 tool_result：
+// 模型能看到错误继续走，进程活着。堆栈进日志，摘要进工具结果。
+func (r *runner) executeOne(ctx context.Context, tu ContentBlock) (result ToolResult) {
+	defer func() {
+		rec := recover()
+		if rec == nil {
+			return
+		}
+		r.cfg.Logf("agentcore: 工具执行 panic 已拦截 tool=%s id=%s: %v\n%s", tu.Name, tu.ID, rec, debug.Stack())
+		result = ErrorResult("工具执行发生内部错误（进程已拦截，未受影响），本轮工具未执行: %v", rec)
+	}()
+	return r.executeOneInner(ctx, tu)
+}
+
+// executeOneInner 是 executeOne 的本体（见其注释里的 recover 兜底）。
+func (r *runner) executeOneInner(ctx context.Context, tu ContentBlock) ToolResult {
 	// 参数解析失败的调用直接回填错误，别拿坏参数去执行。
 	if parseErr, ok := tu.Input["__parse_error__"]; ok {
 		return ErrorResult("工具参数不是合法 JSON，未执行: %v", parseErr)

@@ -1200,3 +1200,41 @@ func TestBoundaryCarveoutAcceptsTranscriptPathFallback(t *testing.T) {
 		t.Fatalf("projects-root sibling write -> (%s, %s), want auto_deny/outside-project-path", d, id)
 	}
 }
+
+// TestBashReferencesOutsideProjectToleratesEmptyShlexSegments 是线上崩溃的
+// 回归测试（2026-10-26 实锤）。
+//
+// 模型完全可能发出带注释尾段/纯引号参数的命令：`ls -la; # 查看状态`、
+// `echo ""`。这类段经 splitShellCommandSegments 后非空（过滤的是字面空段），
+// 但经 shlex 切完是 0 个词——旧代码 `words[1:]` 对空切片取下标直接 panic。
+// 内核跑在宿主进程内，这个 panic 把整个 core 进程带死（容器退出、设备下线），
+// 直到 2026-10-26 才在 glm-5.1 的一轮回合里踩中。
+func TestBashReferencesOutsideProjectToleratesEmptyShlexSegments(t *testing.T) {
+	project := t.TempDir()
+
+	// 曾经直接 panic 的两种形状：注释尾段、纯引号段。
+	for _, command := range []string{
+		"ls -la; # 查看状态",
+		"ls -la && echo done; # note",
+		"echo ''",
+		`echo ""`,
+		"# 只有一行注释",
+	} {
+		got := bashReferencesOutsideProject(command, project)
+		if got {
+			t.Errorf("命令 %q 无外部路径引用，却返回 true", command)
+		}
+	}
+
+	// 正向对照不回归：真引到项目外的路径仍要被识别。
+	if got := bashReferencesOutsideProject("cat /etc/passwd", project); !got {
+		t.Error("cat /etc/passwd 应判定为引用项目外路径")
+	}
+
+	// 宿主审批入口整链不 panic、且对这类命令保持放行语义（不升级）。
+	input := json.RawMessage(`{"command":"ls -la; # 查看状态"}`)
+	d, id, handled := approvalProjectBoundaryDecision("Bash", input, project)
+	if handled {
+		t.Fatalf("注释尾段命令不该触发项目边界判定，得到 (%s, %s)", d, id)
+	}
+}

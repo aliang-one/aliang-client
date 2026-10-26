@@ -891,6 +891,13 @@ func bashReferencesOutsideProject(command, projectPath string) bool {
 		if err != nil {
 			return false
 		}
+		// 注释段（"# ..."）或纯引号段经 shlex 切完是 0 个词；对空切片取
+		// words[1:] 会直接 panic——2026-10-26 线上实测：内核一轮回合里模型
+		// 发了带注释尾段的命令，这里崩掉把整个 core 进程带死（内置内核跑在
+		// 宿主进程内，没有子进程隔离）。空段/单命令词没有参数，无路径可查。
+		if len(words) < 2 {
+			continue
+		}
 		for _, word := range words[1:] {
 			for _, candidate := range shellWordPathCandidates(word) {
 				if !approvalPathWithinProject(projectPath, candidate) {

@@ -47,7 +47,13 @@ const agentCoreDefaultBaseURL = "http://127.0.0.1:56432"
 //
 // 与 PhoneServer 的 SEED_PROVIDER_CATALOG、手机 MODEL_PRESETS_BY_PROVIDER
 // 的 agentcore 条目保持同一套 id。
-const agentCoreDefaultModel = "glm-5.2"
+//
+// 选 glm-5.3 而不是 glm-5.2/5.1：2026-10-26 实测（容器内真出网，四象限四色
+// 图按 左上/右上/左下/右下 提问）glm-5.3 与 glm-5.3-flash[1m] 是真视觉
+// （4/4 全对，5.3 甚至自己读出了 PNG 的 8×8 尺寸），而 glm-5.2 全盲——
+// 洋红纯色图答「棕色」，损坏图它自己说「只提供了一个图片的URL链接」。
+// 图片附件走 image 块直达模型，默认模型必须挑看得见图的那个。
+const agentCoreDefaultModel = "glm-5.3"
 
 // agentCoreSettingsEnv 从 ~/.claude/settings.json 的 env 块里取一个值。
 // 与 claudeAuthEnvOverlay（agent_ai.go）同一套查找口径：先看子进程 env，
