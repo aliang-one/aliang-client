@@ -706,6 +706,9 @@ func newAgentCoreEmit(ctx context.Context, writer *io.PipeWriter) (emit func([]b
 // ai.command 配对全部由那条既有管线免费提供。
 func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, writeJSON agentTerminalWriter) {
 	defer m.clearRunning(run.sessionID, run.runSeq, writeJSON)
+	// LIFO：本行后注册，先于 clearRunning 执行——guard 必须在会话复位前把自己
+	// 标记为「已正常返回」，否则宽限计时器会误判成僵尸。
+	defer m.markRunGuardDone(run.sessionID, run.runSeq)
 
 	// 调用记录落盘（AliangCode 留痕，spec §6）：入口写头行 + 首条 user 行，
 	// 成功出口写 assistant 行，所有出口经 defer 落 end 行。写失败只 Warn。

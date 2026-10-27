@@ -266,11 +266,19 @@ type agentAISession struct {
 	// isGoalFork marks a fork (re-planning exploration) session. #5: its runs are
 	// forced read-only (run.readOnly) so exploration can't mutate the workspace —
 	// real provider-level enforcement, not just a prompt.
-	isGoalFork          bool
-	cancel              context.CancelFunc
-	activeWriter        agentTerminalWriter
-	approvalToken       string
-	activity            *agentAIActivity
+	isGoalFork    bool
+	cancel        context.CancelFunc
+	activeWriter  agentTerminalWriter
+	approvalToken string
+	activity      *agentAIActivity
+	// guard 是本回合的收尾守卫（kill 观测 + 宽限强拆）。clearRunning 清空。
+	guard *agentAIRunGuard
+	// finalizedRunSeq 是「该 runSeq 已被强拆收尾」的显式标记（0 = 无）。
+	// 非帧副作用守卫靠它识别僵尸迟返回；不用 cancel == nil 判别，是因为
+	// 单测/TUI 路径注册的会话本来就没有 cancel，会把合法回合一起挡掉
+	// （会打红 6 个既有用例）。按 runSeq 记账，下一回合 runSeq 推进后自然失效，
+	// 不需要在起跑路径手工清零。
+	finalizedRunSeq     int
 	runSeq              int
 	activeRunID         string
 	goalIdentity        map[string]interface{}
@@ -1286,7 +1294,7 @@ func (m *agentAIManager) startAIWatchdog(ctx context.Context, activity *agentAIA
 	if activity == nil || cancel == nil {
 		return
 	}
-	go agentAIWatchdogLoop(ctx, activity, cancel, agentAIIdleWindow, agentAIHardCeiling, agentAINoProgressWindow, agentAIToolWaitCeiling, agentAISubagentWaitCeiling, agentAIIdleCheckInterval)
+	go agentAIWatchdogLoop(ctx, activity, m.wrapKillCancel(activity, cancel), agentAIIdleWindow, agentAIHardCeiling, agentAINoProgressWindow, agentAIToolWaitCeiling, agentAISubagentWaitCeiling, agentAIIdleCheckInterval)
 }
 
 // agentAIWatchdogLoop is the parameterized watchdog body, split out so tests can
@@ -1887,6 +1895,7 @@ func (m *agentAIManager) applyLocalSlashCommand(session *agentAISession, name, a
 		session.resumeSessionID = ""
 		session.history = nil
 		session.runSeq = 0
+		session.finalizedRunSeq = 0
 		m.mu.Unlock()
 		return fmt.Sprintf("✓ /clear 已清空。下一轮将开启全新的 %s 会话。", agentAIProviderDisplayName(provider))
 	case "model":
@@ -2555,6 +2564,8 @@ func (m *agentAIManager) runUserMessage(session *agentAISession, runID, messageI
 	if svc := m.approvalService(); svc != nil {
 		svc.ensurePolicyBeforeRun(ctx, session.projectPath)
 	}
+	guard := m.attachRunGuard(run, emitter.emit)
+	_ = guard
 	m.startAIWatchdog(ctx, activity, cancel)
 	m.mu.Lock()
 	if current := m.sessions[run.sessionID]; current != nil && current.runSeq == run.runSeq {
@@ -3646,6 +3657,14 @@ func (m *agentAIManager) clearRunning(sessionID string, runSeq int, writeJSON ag
 		session.activeWriter = nil
 		session.approvalToken = ""
 		session.activity = nil
+		if session.guard != nil {
+			// 正常收尾也必须关闭 done。guard 挂在所有 provider 的回合上，而
+			// markRunGuardDone 只有 agentcore 路径调用；缺了这一步，codex/claude
+			// 回合被合法 kill 后 30s 还会再跑一次多余的强拆（终态被 emitter 闸
+			// 丢弃，但会多一条 force_finalize 日志 + 一个多余 goroutine）。
+			session.guard.markDone()
+			session.guard = nil
+		}
 		session.codexSteer = nil
 		session.claudeSteer = nil
 		session.coreSteer = nil
