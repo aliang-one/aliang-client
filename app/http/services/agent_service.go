@@ -1864,6 +1864,8 @@ func (s *AgentService) callAgentServerWithAuthorization(method string, endpoint 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		logger.Warn(fmt.Sprintf("[AGENT-BOOT] agent_server_call non_2xx method=%s endpoint=%s status=%d", method, sanitizeAgentEndpoint(endpoint), resp.StatusCode))
 		if resp.StatusCode == http.StatusUnauthorized {
+			logger.Warn(fmt.Sprintf("[AGENT-CHANNEL] 401 endpoint=%s has_auth=%t method=%s",
+				sanitizeAgentEndpoint(endpoint), authHeader != "", method))
 			if authHeader != "" {
 				return nil, agentUserAuthRejectedError{status: resp.StatusCode, body: string(raw)}
 			}
