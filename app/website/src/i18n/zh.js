@@ -238,6 +238,17 @@ export default {
   chat_approvalDecline: '拒绝',
   chat_approvalCancel: '取消',
   chat_approvalSendFailed: '授权响应发送失败，请重试。',
+  chat_settingsDirectory: '工作目录',
+  chat_settingsModel: '模型',
+  chat_settingsEffort: '推理力度',
+  chat_modelDefault: '默认',
+  chat_pathDefault: '默认（home）',
+  chat_recentProjects: '最近项目',
+  chat_noRecentProjects: '暂无最近项目',
+  chat_customModel: '自定义…',
+  chat_customPathPlaceholder: '输入 agent 机器上的绝对路径',
+  chat_pathConfirm: '确定',
+  chat_createFailed: '会话创建失败',
 
   // -- App --
   app_restoringSession: '正在恢复会话...',

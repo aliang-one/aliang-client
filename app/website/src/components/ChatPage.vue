@@ -215,6 +215,107 @@
         </button>
       </div>
 
+      <!-- Session settings bar: directory / model / effort -->
+      <div v-if="activeConversation" class="relative border-b border-slate-200 dark:border-slate-800">
+        <!-- 内层滚动行：overflow-x-auto 会连 y 轴一起裁剪（CSS 规范行为），
+             absolute 浮层若放行内会被整个裁掉，必须挂到外层包裹容器上。 -->
+        <div class="flex items-center gap-2 overflow-x-auto px-4 py-1.5 text-xs">
+          <span class="hidden shrink-0 text-slate-400 md:inline">{{ t('chat_settingsDirectory') }}</span>
+          <span
+            v-if="directoryLocked"
+            data-testid="chat-settings-directory"
+            class="flex min-h-[40px] max-w-[16rem] shrink-0 items-center gap-1 text-slate-400 md:min-h-0"
+            :title="directoryLabel"
+          >
+            <span class="material-symbols-outlined text-sm">folder</span>
+            <span class="truncate">{{ directoryLabel }}</span>
+          </span>
+          <button
+            v-else
+            type="button"
+            data-testid="chat-settings-directory"
+            class="flex min-h-[40px] max-w-[16rem] shrink-0 items-center gap-1 rounded border border-slate-200 px-2 text-slate-600 transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-60 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800 md:min-h-0"
+            :disabled="activeRunning"
+            :title="directoryLabel"
+            :aria-label="t('chat_settingsDirectory')"
+            @click="toggleDirectoryPanel"
+          >
+            <span class="material-symbols-outlined text-sm">folder</span>
+            <span class="truncate">{{ directoryLabel }}</span>
+          </button>
+          <span class="ml-2 hidden shrink-0 text-slate-400 md:inline">{{ t('chat_settingsModel') }}</span>
+          <select
+            v-model="activeModel"
+            data-testid="chat-settings-model"
+            class="min-h-[40px] shrink-0 rounded border border-slate-200 bg-white px-1 text-slate-600 outline-none disabled:cursor-not-allowed disabled:opacity-60 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300 md:min-h-0"
+            :disabled="activeRunning"
+            :aria-label="t('chat_settingsModel')"
+          >
+            <option v-for="opt in modelOptions" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
+          </select>
+          <input
+            v-if="modelCustomActive"
+            v-model="modelCustomDraft"
+            type="text"
+            class="h-9 w-36 shrink-0 rounded border border-slate-200 bg-white px-2 text-xs outline-none focus:border-primary dark:border-slate-600 dark:bg-slate-800"
+            :placeholder="t('chat_customModel')"
+            @keydown.enter="onCustomModelEnter"
+            @blur="commitCustomModel"
+          />
+          <span class="ml-2 hidden shrink-0 text-slate-400 md:inline">{{ t('chat_settingsEffort') }}</span>
+          <select
+            v-model="activeEffort"
+            data-testid="chat-settings-effort"
+            class="min-h-[40px] shrink-0 rounded border border-slate-200 bg-white px-1 text-slate-600 outline-none disabled:cursor-not-allowed disabled:opacity-60 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300 md:min-h-0"
+            :disabled="activeRunning"
+            :aria-label="t('chat_settingsEffort')"
+          >
+            <option v-for="opt in EFFORT_OPTIONS" :key="opt.value" :value="opt.value">{{ opt.value || t('chat_modelDefault') }}</option>
+          </select>
+          <div
+            v-if="createError"
+            data-testid="chat-settings-error"
+            class="ml-2 shrink-0 truncate text-rose-500"
+            :title="createError"
+          >{{ createError }}</div>
+        </div>
+
+        <!-- 遮罩与浮层是滚动行的兄弟节点（外层容器的直接子级）：不再被裁剪；
+             Esc 在浮层上拦截（.stop），不冒泡到文档级 handleKeydown 的 close()。 -->
+        <div v-if="directoryPanelOpen" class="fixed inset-0 z-20" @click="directoryPanelOpen = false"></div>
+        <div
+          v-if="directoryPanelOpen"
+          class="absolute left-2 top-full z-30 mt-1 w-80 rounded-lg border border-slate-200 bg-white p-3 shadow-lg dark:border-slate-600 dark:bg-slate-800"
+          @keydown.esc.stop="directoryPanelOpen = false"
+        >
+          <div class="mb-1 text-xs font-semibold text-slate-400">{{ t('chat_recentProjects') }}</div>
+          <div v-if="recentProjects.length === 0" class="px-1 py-1 text-xs text-slate-400">{{ t('chat_noRecentProjects') }}</div>
+          <button
+            v-for="p in recentProjects"
+            :key="p"
+            type="button"
+            class="flex min-h-[40px] w-full items-center rounded px-1 text-left text-xs text-slate-700 transition hover:bg-primary/10 dark:text-slate-200"
+            :title="p"
+            @click="pickDirectory(p)"
+          ><span class="truncate">{{ p }}</span></button>
+          <div class="mt-2 flex gap-1">
+            <input
+              v-model="customPathDraft"
+              type="text"
+              :placeholder="t('chat_customPathPlaceholder')"
+              class="h-10 min-w-0 flex-1 rounded border border-slate-200 bg-white px-2 text-xs outline-none focus:border-primary dark:border-slate-600 dark:bg-slate-800"
+              @keydown.enter="onCustomPathEnter"
+              @keydown.esc.stop="directoryPanelOpen = false"
+            />
+            <button
+              type="button"
+              class="h-10 shrink-0 rounded bg-primary px-3 text-xs font-semibold text-white transition hover:bg-primary/90"
+              @click="commitCustomPath"
+            >{{ t('chat_pathConfirm') }}</button>
+          </div>
+        </div>
+      </div>
+
       <!-- Messages -->
       <div ref="messagesContainer" class="flex-1 overflow-y-auto bg-slate-50 p-4 dark:bg-slate-800/40">
         <div v-if="!activeId" class="flex h-full items-center justify-center">
@@ -370,12 +471,21 @@
 </template>
 
 <script setup>
-import { ref, computed, nextTick, onMounted, onUnmounted } from 'vue';
+import { ref, computed, nextTick, onMounted, onUnmounted, watch } from 'vue';
 import { useI18n } from '../i18n';
 import { useNavigation } from '../composables/useNavigation';
 import { slashProviderFor } from '../utils/chatProvider';
 import { normalizeConversationTitle } from '../utils/chatTitle';
 import { useAuthStore } from '../stores/auth';
+import { getAgentSessions } from '../services/agentApi';
+import {
+  AGENTCORE_MODEL_OPTIONS,
+  EFFORT_OPTIONS,
+  MODEL_CUSTOM_VALUE,
+  isDirectoryLocked,
+  recentProjectsFromSessions,
+  sessionCreatePayload,
+} from '../utils/chatSettings';
 
 const STORAGE_KEY = 'aliang-chat-data';
 
@@ -390,6 +500,15 @@ const sending = ref(false);
 const messagesContainer = ref(null);
 const inputRef = ref(null);
 const showMobileSidebar = ref(false);
+
+// --- 会话设置条（工作目录/模型/effort）状态 ---
+const directoryPanelOpen = ref(false);
+const customPathDraft = ref('');
+const recentProjects = ref([]);
+const recentProjectsLoaded = ref(false);
+const modelCustomActive = ref(false);
+const modelCustomDraft = ref('');
+const createError = ref('');
 
 // Local agent AI WebSocket: streams the local Claude Code / Codex headless run
 // token-by-token and carries the running -> done status transitions.
@@ -417,6 +536,164 @@ const activeRunning = computed(() => {
   }
   return false;
 });
+
+// --- 会话设置条逻辑 ---
+
+const directoryLocked = computed(() => isDirectoryLocked(activeConversation.value));
+
+const directoryLabel = computed(() => activeConversation.value?.projectPath || t('chat_pathDefault'));
+
+const modelOptions = computed(() => AGENTCORE_MODEL_OPTIONS.map(o => ({
+  ...o,
+  label: o.value === '' ? t('chat_modelDefault')
+    : o.value === MODEL_CUSTOM_VALUE ? t('chat_customModel')
+    : o.label,
+})));
+
+// select 当前值：预设模型→自身；非预设自定义值→哨兵（输入框承接显示）。
+const modelSelectValue = computed(() => {
+  const m = activeConversation.value?.model || '';
+  if (!m) return '';
+  return isPresetModel(m) ? m : MODEL_CUSTOM_VALUE;
+});
+
+function isPresetModel(m) {
+  return AGENTCORE_MODEL_OPTIONS.some(o => o.value === m && o.value !== MODEL_CUSTOM_VALUE);
+}
+
+// 统一写入口：落字段 → 持久化 → 清错误 → 服务端原位同步（掉线时下条消息兜底）。
+function applySessionSettings(conv, patch) {
+  if (activeRunning.value) return;
+  Object.assign(conv, patch);
+  conv.updatedAt = now();
+  saveToStorage();
+  createError.value = '';
+  resendCreate(conv);
+}
+
+// 已建会话的设置变更要立即让服务端知道；socket 不在线就放弃本轮——
+// sendMessage 现在每条消息前都重发 create，天然兜底，无需脏标记。
+function resendCreate(conv) {
+  if (!conv.aiSessionCreated) return;
+  if (!aiSocket || aiSocket.readyState !== WebSocket.OPEN) return;
+  sendAI(sessionCreatePayload(conv));
+}
+
+async function toggleDirectoryPanel() {
+  const conv = activeConversation.value;
+  if (!conv || directoryLocked.value || activeRunning.value) return;
+  directoryPanelOpen.value = !directoryPanelOpen.value;
+  if (directoryPanelOpen.value && !recentProjectsLoaded.value) {
+    recentProjectsLoaded.value = true;
+    try {
+      const data = await getAgentSessions();
+      recentProjects.value = recentProjectsFromSessions(data?.sessions);
+    } catch (_) {
+      recentProjects.value = []; // 拉取失败静默，手输路径不受影响
+    }
+  }
+}
+
+function pickDirectory(path) {
+  const conv = activeConversation.value;
+  if (!conv) return;
+  customPathDraft.value = '';
+  directoryPanelOpen.value = false;
+  applySessionSettings(conv, { projectPath: path });
+}
+
+function commitCustomPath() {
+  const conv = activeConversation.value;
+  if (!conv) return;
+  const path = customPathDraft.value.trim();
+  if (!path) return;
+  pickDirectory(path);
+}
+
+// IME 组合期的 Enter 是「确认候选词」，不是提交。preventDefault 必须放在
+// 组合判定之后（模板 .prevent 会先于 handler 执行，把输入法自己的按键处理
+// 一起吃掉）——与 onRenameEnter 同一套路。
+function onCustomPathEnter(e) {
+  if (isComposingEvent(e)) return;
+  e.preventDefault();
+  commitCustomPath();
+}
+
+function onModelSelect(value) {
+  const conv = activeConversation.value;
+  if (!conv || activeRunning.value) return;
+  if (value === MODEL_CUSTOM_VALUE) {
+    modelCustomDraft.value = conv.model && !isPresetModel(conv.model) ? conv.model : '';
+    modelCustomActive.value = true;
+    return;
+  }
+  modelCustomActive.value = false;
+  applySessionSettings(conv, { model: value });
+}
+
+function commitCustomModel() {
+  const conv = activeConversation.value;
+  if (!conv) return;
+  const model = modelCustomDraft.value.trim();
+  modelCustomActive.value = false;
+  if (!model) return; // 空输入视作取消，保持原值
+  applySessionSettings(conv, { model });
+}
+
+function onCustomModelEnter(e) {
+  if (isComposingEvent(e)) return;
+  e.preventDefault();
+  commitCustomModel();
+}
+
+// v-model 写法让 select 每次渲染都回写 el.value：取消自定义输入后选择框
+// 立即弹回当前值，不会停留在已被丢弃的哨兵选项上（与 activeEffort 同构）。
+const activeModel = computed({
+  get: () => modelSelectValue.value,
+  set: (v) => onModelSelect(v),
+});
+
+const activeEffort = computed({
+  get: () => activeConversation.value?.effort || '',
+  set(value) {
+    const conv = activeConversation.value;
+    if (!conv || activeRunning.value) return;
+    applySessionSettings(conv, { effort: value });
+  },
+});
+
+// 切会话收起面板、清一次性错误。
+watch(activeId, () => {
+  directoryPanelOpen.value = false;
+  modelCustomActive.value = false;
+  createError.value = '';
+});
+
+// create 确认门：sendMessage 发出 create 后等回执再发 ai.message——目录无效
+// 时服务端拒绝建会话，绝不能让消息经 ai.message 的 lazy-create 落到 home 跑。
+// 回执来源：ai.session.created → 'created'；create 期 ai.error（无 message_id）
+// → 'error'（错误文本已由该分支渲染）；超时 → 'timeout'（socket 死亡等）。
+const pendingCreates = new Map(); // session_id -> settle(status)
+
+function waitForCreateAck(conv, timeoutMs = 5000) {
+  return new Promise((resolve) => {
+    const sid = conv.aiSessionId;
+    let done = false;
+    const settle = (status) => {
+      if (done) return;
+      done = true;
+      pendingCreates.delete(sid);
+      clearTimeout(timer);
+      resolve(status);
+    };
+    const timer = setTimeout(() => settle('timeout'), timeoutMs);
+    pendingCreates.set(sid, settle);
+    conv.aiSessionCreated = true;
+    // ensureAISocket 之后 socket 仍可能已死：sendAI 返回 false 就立刻按超时
+    // 结算，不白等 5 秒死钟。
+    if (!sendAI(sessionCreatePayload(conv))) settle('timeout');
+  });
+}
 
 // --- Slash command autocomplete (provider-aware) ---
 // The `/` popup is backed by slash.commands.list over the same AI stream socket
@@ -1004,6 +1281,10 @@ function handleAIEvent(e) {
   }
 
   let conv = e.session_id ? conversations.value.find(c => c.aiSessionId === e.session_id) : null;
+  // session_id 是否命中决定事件归属；matchedById=false 的事件走 fallback 仅为
+  // 让流仍能渲染，绝不能成为回显/dirLocked 的写入目标（会话已删或他页会话的
+  // 迟到 create 回执会污染当前活跃会话）。
+  const matchedById = !!conv;
   // Fallback: a run started from this page always targets the active
   // conversation's live assistant bubble. If the session id didn't match
   // (e.g. reloaded localStorage holding a stale id, or an id mismatch), route
@@ -1024,10 +1305,25 @@ function handleAIEvent(e) {
 
   let persist = false;
   switch (e.type) {
-    case 'ai.session.created':
+    case 'ai.session.created': {
+      const pending = pendingCreates.get(e.session_id);
+      if (!matchedById) {
+        // 未按 session_id 命中（会话已删/他页会话的迟到回执）：只结算确认门，
+        // 不做任何 conv 写入——fallback 命中的活跃会话不能被污染。
+        if (pending) pending('created');
+        return;
+      }
       conv.aiReady = true;
+      // 目录锁定以服务端确认为准：create 成功后不可再改（create 失败保持可改）。
+      conv.dirLocked = true;
+      // 回显是服务端清洗后的权威值：project_path 已是解析后的绝对路径。
+      if (typeof e.project_path === 'string' && e.project_path) conv.projectPath = e.project_path;
+      if (typeof e.model === 'string') conv.model = e.model;
+      if (typeof e.effort === 'string') conv.effort = e.effort;
+      if (pending) pending('created');
       persist = true;
       break;
+    }
     case 'ai.run.started': {
       const asst = ensureAssistantBubble(conv);
       if (asst) asst.status = 'running';
@@ -1061,6 +1357,18 @@ function handleAIEvent(e) {
     }
     case 'ai.error': {
       const asst = findRunningAssistant(conv);
+      if (!e.message_id) {
+        // create 阶段失败（典型：手输目录不存在）。亮在设置条上、结算确认门；
+        // 不进消息流。目录未锁定（dirLocked 只在回显成功时置位），纠正路径后
+        // 下一条消息重发 create 即成功。判定只用 message_id 单条件：运行期
+        // 所有 ai.error 出口都带 message_id，create 期全不带；「无 running 气泡」
+        // 不可作条件——sendMessage 在发 create 前已推入占位气泡。
+        if (matchedById && conv.id === activeId.value) createError.value = e.error || t('chat_createFailed');
+        const pending = pendingCreates.get(e.session_id);
+        if (pending) pending('error');
+        saveToStorage();
+        return;
+      }
       if (asst) {
         asst.status = 'error';
         if (!asst.content) asst.content = e.error || t('chat_aiError');
@@ -1110,15 +1418,18 @@ async function sendMessage() {
 
   try {
     await ensureAISocket();
-    if (!conv.aiSessionCreated) {
-      sendAI({
-        type: 'ai.session.create',
-        session_id: conv.aiSessionId,
-        project_path: conv.projectPath || '',
-        provider: conv.provider || 'claudecode',
-        mode: 'vibe',
-      });
-      conv.aiSessionCreated = true;
+    createError.value = '';
+    const ack = await waitForCreateAck(conv);
+    if (ack !== 'created') {
+      // create 被拒或无回执：内联错误已由 ai.error 分支渲染（timeout 无帧，
+      // 这里兜底提示）；撤掉空占位气泡防空转；不发 ai.message。
+      const asst = findRunningAssistant(conv);
+      if (asst && !asst.content) conv.messages = conv.messages.filter(m => m !== asst);
+      // 与 ai.error 分支同约定：只在发送会话仍是当前会话时落兜底提示。
+      if (conv.id === activeId.value && !createError.value) createError.value = t('chat_serviceUnavailable');
+      sending.value = false; // 本函数的 sending=false 在 catch 尾部，早退须自理
+      saveToStorage();
+      return;
     }
     const ok = sendAI({
       type: 'ai.message',

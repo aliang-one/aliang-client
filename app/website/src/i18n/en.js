@@ -238,6 +238,17 @@ export default {
   chat_approvalDecline: 'Decline',
   chat_approvalCancel: 'Cancel',
   chat_approvalSendFailed: 'Failed to send approval response. Please retry.',
+  chat_settingsDirectory: 'Directory',
+  chat_settingsModel: 'Model',
+  chat_settingsEffort: 'Effort',
+  chat_modelDefault: 'Default',
+  chat_pathDefault: 'Default (home)',
+  chat_recentProjects: 'Recent projects',
+  chat_noRecentProjects: 'No recent projects',
+  chat_customModel: 'Custom…',
+  chat_customPathPlaceholder: 'Absolute path on the agent machine',
+  chat_pathConfirm: 'Confirm',
+  chat_createFailed: 'Failed to create session',
 
   // -- App --
   app_restoringSession: 'Restoring saved session...',
