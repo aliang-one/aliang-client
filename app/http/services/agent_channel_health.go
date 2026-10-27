@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"aliang.one/nursorgate/app/http/models"
 	"aliang.one/nursorgate/common/logger"
 )
 
@@ -194,7 +195,7 @@ func init() {
 // 不重试——设备离线时本来也送不到，等它上线自然会重试到新的 401 计数。
 func agentChannelAlert(since time.Time, total int) {
 	payload := map[string]interface{}{
-		"type":            "agent.channel.alert",
+		"type":            models.AgentEventChannelAlert,
 		"code":            "platform_credential_expired",
 		"message":         "设备在线但平台凭据过期，文件传输等功能暂不可用",
 		"consecutive_401": total,

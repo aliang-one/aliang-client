@@ -55,6 +55,7 @@ const (
 	AgentEventAITuiSync               = "ai.tui.sync" // server→agent: best-effort "phone turn landed" digest for an imported session; agent gates + injects into the live TUI's messaging UDS, no reply by design
 	AgentEventAIStatus                = "ai.status"
 	AgentEventAIError                 = "ai.error"
+	AgentEventChannelAlert            = "agent.channel.alert" // agent→cloud: 设备级通道告警(平台凭据过期等),30min 限频;与 ai.* 无关,手机不得据此判设备离线
 	AgentEventAIApprovalRequest       = "ai.approval.request"
 	AgentEventAIApprovalResponse      = "ai.approval.response"
 	AgentEventAIApprovalRequestAck    = "ai.approval.request.ack" // server→client: request received/stored
@@ -233,7 +234,8 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				{Type: AgentEventUsageReport, Required: []string{"type", "records"}},
 				{Type: AgentEventAITask, Required: []string{"type", "session_id", "message_id", "tasks", "run_id", "event_seq"}},
 				{Type: AgentEventAIStatus, Required: []string{"type", "session_id", "status", "run_id", "event_seq"}},
-				{Type: AgentEventAIError, Required: []string{"type", "session_id", "error", "run_id", "event_seq"}, Optional: []string{"message_id", "error_status", "error_type", "retry_attempt", "retry_max", "detail"}},
+				{Type: AgentEventAIError, Required: []string{"type", "session_id", "error", "run_id", "event_seq"}, Optional: []string{"message_id", "error_status", "error_type", "error_code", "retry_attempt", "retry_max", "detail"}},
+				{Type: AgentEventChannelAlert, Required: []string{"type", "code", "message", "since"}, Optional: []string{"consecutive_401"}},
 				{Type: AgentEventAIApprovalRequest, Required: []string{"type", "session_id", "message_id", "approval_id", "provider", "kind", "status", "run_id", "event_seq"}, Optional: []string{"title", "reason", "command", "cwd", "tool_name", "tool_input", "file_changes", "available_decisions", "decision", "raw", "matched_rule_id", "policy_version"}},
 				{Type: AgentEventAIApprovalAck, Required: []string{"type", "session_id", "approval_id", "result"}, Optional: []string{"delivery_id"}},
 				{Type: AgentEventAIApprovalSync, Required: []string{"type"}, Optional: []string{"pending"}},

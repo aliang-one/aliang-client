@@ -6,6 +6,9 @@ import (
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
+	"time"
+
+	"aliang.one/nursorgate/app/http/models"
 )
 
 func TestCallAgentServerRetriesOnceWithRefreshedHeader(t *testing.T) {
@@ -110,5 +113,125 @@ func TestAgentChannelBackoffBypassedAfterCredentialRotation(t *testing.T) {
 	}
 	if !agentChannelHealthInstance.allow(endpoint, "Bearer stale") {
 		t.Fatalf("放行后应清掉该端点退避")
+	}
+}
+
+func TestAgentChannelAlertIsRateLimited(t *testing.T) {
+	agentChannelHealthInstance.reset()
+
+	oldWriter := agentChannelAlertWriter
+	var alerts int32
+	var lastPayload map[string]interface{}
+	agentChannelAlertWriter = func(payload map[string]interface{}) error {
+		atomic.AddInt32(&alerts, 1)
+		lastPayload = payload
+		return nil
+	}
+	t.Cleanup(func() {
+		agentChannelAlertWriter = oldWriter
+		agentChannelHealthInstance.reset()
+	})
+
+	endpoint := "https://api.example.com/x"
+	// 阈值 = 3：前两次不得告警。阈值被误改成 1 或 2 时这里就红。
+	agentChannelHealthInstance.record401(endpoint, "Bearer stale")
+	agentChannelHealthInstance.record401(endpoint, "Bearer stale")
+	if got := atomic.LoadInt32(&alerts); got != 0 {
+		t.Fatalf("alerts after 2×401 = %d, want 0 (threshold=3)", got)
+	}
+
+	// 第 3 次必须告警：阈值被改成 4 或更大时这里红。
+	agentChannelHealthInstance.record401(endpoint, "Bearer stale")
+	if got := atomic.LoadInt32(&alerts); got != 1 {
+		t.Fatalf("alerts after 3×401 = %d, want 1 (threshold=3)", got)
+	}
+
+	// 继续打到 20 次仍只有 1 条：30min 限频必须持续生效。
+	for i := 0; i < 17; i++ {
+		agentChannelHealthInstance.record401(endpoint, "Bearer stale")
+	}
+	if got := atomic.LoadInt32(&alerts); got != 1 {
+		t.Fatalf("alerts after 20×401 = %d, want 1 (30min throttle)", got)
+	}
+
+	// payload 必须与协议表登记（models.AgentEventChannelAlert）逐字段一致。
+	if lastPayload["type"] != models.AgentEventChannelAlert {
+		t.Fatalf("payload type = %v, want %s", lastPayload["type"], models.AgentEventChannelAlert)
+	}
+	if lastPayload["code"] != "platform_credential_expired" {
+		t.Fatalf("payload code = %v", lastPayload["code"])
+	}
+	if _, ok := lastPayload["consecutive_401"]; !ok {
+		t.Fatal("payload missing consecutive_401")
+	}
+	since, _ := lastPayload["since"].(string)
+	if _, err := time.Parse(time.RFC3339, since); err != nil {
+		t.Fatalf("payload since = %q, not RFC3339: %v", since, err)
+	}
+	if msg, _ := lastPayload["message"].(string); msg == "" {
+		t.Fatal("payload message 为空")
+	}
+
+	// schema 与 payload 逐键对齐：协议表改名而发送侧没跟上时这里红。
+	contract := models.DefaultAgentProtocolContract()
+	var schema *models.AgentProtocolEvent
+	for i := range contract.WebSocket.ClientSends {
+		if contract.WebSocket.ClientSends[i].Type == models.AgentEventChannelAlert {
+			schema = &contract.WebSocket.ClientSends[i]
+			break
+		}
+	}
+	if schema == nil {
+		t.Fatalf("%s 未登记进协议表", models.AgentEventChannelAlert)
+	}
+	want := map[string]bool{}
+	for _, k := range schema.Required {
+		want[k] = true
+	}
+	for _, k := range schema.Optional {
+		want[k] = true
+	}
+	if len(lastPayload) != len(want) {
+		t.Fatalf("payload 字段数 = %d (%v), 协议表登记 = %d (%v)", len(lastPayload), lastPayload, len(want), want)
+	}
+	for k := range want {
+		if _, ok := lastPayload[k]; !ok {
+			t.Fatalf("payload 缺少协议表登记的字段 %q", k)
+		}
+	}
+}
+
+// 限频窗口过后必须能再次告警（re-arm）：否则一次风暴之后，30min 内真的
+// 再次过期会被永久静音。
+func TestAgentChannelAlertRearmsAfterInterval(t *testing.T) {
+	agentChannelHealthInstance.reset()
+
+	oldWriter := agentChannelAlertWriter
+	var alerts int32
+	agentChannelAlertWriter = func(map[string]interface{}) error {
+		atomic.AddInt32(&alerts, 1)
+		return nil
+	}
+	t.Cleanup(func() {
+		agentChannelAlertWriter = oldWriter
+		agentChannelHealthInstance.reset()
+	})
+
+	endpoint := "https://api.example.com/x"
+	for i := 0; i < 3; i++ {
+		agentChannelHealthInstance.record401(endpoint, "Bearer stale")
+	}
+	if got := atomic.LoadInt32(&alerts); got != 1 {
+		t.Fatalf("first alert = %d, want 1", got)
+	}
+
+	// 把限频窗口回拨，模拟 30min 已过。
+	agentChannelHealthInstance.mu.Lock()
+	agentChannelHealthInstance.lastAlertAt = time.Now().Add(-agentChannelAlertInterval - time.Minute)
+	agentChannelHealthInstance.mu.Unlock()
+
+	agentChannelHealthInstance.record401(endpoint, "Bearer stale")
+	if got := atomic.LoadInt32(&alerts); got != 2 {
+		t.Fatalf("alerts after window = %d, want 2 (re-arm)", got)
 	}
 }
