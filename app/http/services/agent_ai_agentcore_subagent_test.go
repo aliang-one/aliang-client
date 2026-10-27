@@ -181,7 +181,8 @@ func TestAgentCoreSubagentModelPolicy(t *testing.T) {
 	cases := []struct{ defModel, mainModel, want string }{
 		{"", "glm-5.2", "glm-5.2"},
 		{"glm-5.3", "glm-5.2", "glm-5.3"},
-		{"sonnet", "glm-5.2", "glm-5.2"}, // claude 系忽略回落
+		{"GLM-5.2", "glm-5.2", "glm-5.2"}, // 大写不是网关认识的小写字面 glm-*，回落
+		{"sonnet", "glm-5.2", "glm-5.2"},  // claude 系忽略回落
 	}
 	for _, c := range cases {
 		if got := agentCoreSubagentModel(c.defModel, c.mainModel); got != c.want {

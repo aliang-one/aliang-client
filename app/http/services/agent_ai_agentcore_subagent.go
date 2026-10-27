@@ -189,12 +189,16 @@ func (b *agentCoreSubagentBridge) InputSchema() map[string]interface{} {
 
 // agentCoreSubagentModel 模型策略（spec §6）：定义 model 空/等于主模型 → 沿用；
 // glm-* → 采用；其余（claude 系）→ Warn 并回落主模型（网关只路由 glm-*）。
+//
+// 前缀判断用精确小写字面：网关只认小写 glm-*，"GLM-5.2" 原样发上游只会换来
+// model_not_found，不如回落主模型。Warn 频次=每次 Task 调用一条（模型策略在
+// Execute 里逐次求值），非每 run 一次。
 func agentCoreSubagentModel(defModel, mainModel string) string {
 	defModel = strings.TrimSpace(defModel)
 	if defModel == "" || defModel == mainModel {
 		return mainModel
 	}
-	if strings.HasPrefix(strings.ToLower(defModel), "glm-") {
+	if strings.HasPrefix(defModel, "glm-") {
 		return defModel
 	}
 	logger.Warn(fmt.Sprintf("agentcore-subagent: 定义 model %q 非 glm-*，忽略回落主模型 %s", defModel, mainModel))
@@ -249,16 +253,22 @@ func (d *agentCoreJournalToolDecorator) Execute(ctx context.Context, input map[s
 	defer func() {
 		if rec := recover(); rec != nil {
 			result = agentcore.ToolResult{Content: fmt.Sprintf("工具执行崩溃（已兜底）: %v", rec), IsError: true}
-			if d.onCall != nil {
-				d.onCall(d.inner.Name(), summary, true)
-			}
+			safeOnToolCall(d.onCall, d.inner.Name(), summary, true)
 		}
 	}()
 	res := d.inner.Execute(ctx, input, env)
-	if d.onCall != nil {
-		d.onCall(d.inner.Name(), summary, res.IsError)
-	}
+	safeOnToolCall(d.onCall, d.inner.Name(), summary, res.IsError)
 	return res
+}
+
+// safeOnToolCall journal 回调的 panic 不许二次炸、也不许搅了已定的工具结果
+// （与 MCP 桥 safeOnCall 同款兜底）；Task 行与装饰器路径统一走它。
+func safeOnToolCall(onCall func(tool, summary string, isErr bool), tool, summary string, isErr bool) {
+	if onCall == nil {
+		return
+	}
+	defer func() { _ = recover() }()
+	onCall(tool, summary, isErr)
 }
 
 // Execute：递归子 run。ctx 继承（内核单工具 10 分钟上限罩住整个子循环）。
@@ -294,8 +304,8 @@ func (b *agentCoreSubagentBridge) Execute(ctx context.Context, input map[string]
 		text = res.Text
 	}
 	// Task 调用本身也记 tool 行（spec §7：Task 调用与子 run 内部调用都记）。
-	if b.onToolCall != nil {
-		b.onToolCall(b.name, summarizeAgentCoreMCPInput(map[string]interface{}{"task": task}), isErr)
-	}
+	// 时序：这行在子 run 结束后才落（完成时刻），子 run 内部工具行（装饰器）
+	// 在先——与 MCP 桥同一机制，journal 里父行永远后于子行。
+	safeOnToolCall(b.onToolCall, b.name, summarizeAgentCoreMCPInput(map[string]interface{}{"task": task}), isErr)
 	return agentcore.ToolResult{Content: truncateAgentCoreMCPOutput(text), IsError: isErr}
 }
