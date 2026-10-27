@@ -27,6 +27,7 @@ import (
 
 	"aliang.one/nursorgate/app/http/models"
 	"aliang.one/nursorgate/common/logger"
+	"aliang.one/nursorgate/internal/tccguard"
 	"aliang.one/nursorgate/processor/config"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -1727,6 +1728,18 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 	}
 	m.mu.Unlock()
 
+	// Phone-driven runs can arrive while the Mac is unattended. The project may
+	// live under a macOS privacy-protected folder (Desktop/Documents/Downloads/
+	// iCloud/external volume): touching it would raise a "Files & Folders" (TCC)
+	// prompt nobody is there to answer. tccguard refuses with an actionable
+	// consent error before the first disk access (goal capture, attachments and
+	// provider spawn all touch the project), and probes the category once when a
+	// human IS at the Mac, remembering the grant.
+	if guardErr := tccguard.GuardPath(session.projectPath); guardErr != nil {
+		_ = runWrite(agentAIErrorPayload(sessionID, messageID, guardErr))
+		return
+	}
+
 	provider, err := normalizeAgentAIProvider(firstNonEmpty(strings.TrimSpace(remoteString(msg, "provider")), strings.TrimSpace(remoteString(msg, "tool")), session.provider))
 	if err != nil {
 		_ = runWrite(agentAIErrorPayload(sessionID, messageID, err))
@@ -2801,9 +2814,18 @@ func resolveAgentAIAttachments(raw interface{}, projectPath string) ([]agentAIAt
 	if len(items) == 0 {
 		return nil, nil
 	}
+	// Attachment validation is the first place a message touches the project
+	// directory. Behind tccguard, an unattended Mac refuses protected folders
+	// instead of leaving an unanswerable "Files & Folders" prompt on screen.
+	if err := tccguard.GuardPath(projectPath); err != nil {
+		return nil, err
+	}
 	projectRoot, err := cleanExistingAgentDirectory(projectPath)
 	if err != nil {
 		return nil, fmt.Errorf("resolve attachment project directory: %w", err)
+	}
+	if err := tccguard.GuardPath(projectRoot); err != nil {
+		return nil, err
 	}
 	const maxAttachments = 8
 	const maxAttachmentBytes = 20 * 1024 * 1024
@@ -2861,8 +2883,17 @@ func resolveAgentAIAttachments(raw interface{}, projectPath string) ([]agentAIAt
 			if err != nil {
 				return nil, err
 			}
+			// Absolute attachment paths may point at another account's home or a
+			// different privacy category than the project; guard before resolving
+			// symlinks (EvalSymlinks itself stats every component).
+			if err := tccguard.GuardPath(absolute); err != nil {
+				return nil, err
+			}
 			if resolved, resolveErr := filepath.EvalSymlinks(absolute); resolveErr == nil {
 				absolute = resolved
+				if err := tccguard.GuardPath(absolute); err != nil {
+					return nil, err
+				}
 			}
 			if !agentPathInsideDirectory(absolute, projectRoot) {
 				return nil, fmt.Errorf("attachment path is outside the project directory: %s", absolute)
@@ -7371,7 +7402,9 @@ func emitOpenCodeToolEvent(part map[string]interface{}, run agentAIRun, writeJSO
 
 // countGitChanged returns the number of working-tree entries reported by
 // `git -C dir status --porcelain` (modified/added/deleted/untracked). Returns 0
-// for a non-git directory or any git error. Cheap enough to run on a ~10s tick.
+// for a non-git directory or any git error. Only called from the user-initiated
+// project probe — never from a background tick (folder access must stay tied
+// to a user action so macOS does not raise Files & Folders prompts on its own).
 func countGitChanged(dir string) int {
 	out, err := newBackgroundCommand("git", "-C", dir, "status", "--porcelain").Output()
 	if err != nil {
@@ -7387,7 +7420,8 @@ func countGitChanged(dir string) int {
 // countGitTrackedFiles returns the number of tracked files reported by
 // `git -C dir ls-files` (committed + staged). A fast, stable proxy for "project
 // file count" used by the mobile dashboard's Files metric; returns 0 for a
-// non-git directory or any git error. Run on the ~1/min inventory tick.
+// non-git directory or any git error. Only called from the user-initiated
+// project probe — never from a background tick.
 func countGitTrackedFiles(dir string) int {
 	out, err := newBackgroundCommand("git", "-C", dir, "ls-files").Output()
 	if err != nil {
@@ -8673,7 +8707,10 @@ func resolveAgentAICWD(raw string) (string, error) {
 		}
 		cwd = home
 	}
-	return cleanExistingAgentDirectory(cwd)
+	// Same confinement as the other phone-driven surfaces (see
+	// resolveAgentCWDWithConsent), but still without the authorized-list ACL:
+	// existence + symlink resolution + TCC consent only.
+	return resolveAgentCWDWithConsent(cwd)
 }
 
 // claudeRetryInfo captures the most-recent Claude stream-json

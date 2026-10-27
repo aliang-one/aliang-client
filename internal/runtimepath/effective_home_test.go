@@ -2,6 +2,7 @@ package runtimepath
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -25,9 +26,69 @@ func TestEffectiveAgentHome_NonRoot(t *testing.T) {
 	}
 }
 
-func TestNewestSessionHome_MissingDir(t *testing.T) {
-	if home, ok := newestSessionHome("/this/path/should/not/exist/aliang-test", true); ok || home != "" {
-		t.Errorf("newestSessionHome on missing dir = (%q, %v), want (\"\", false)", home, ok)
+func TestSoleDesktopUserHome_MissingDir(t *testing.T) {
+	if home, ok := soleDesktopUserHome("/this/path/should/not/exist/aliang-test", true); ok || home != "" {
+		t.Errorf("soleDesktopUserHome on missing dir = (%q, %v), want (\"\", false)", home, ok)
+	}
+}
+
+// Privacy regression: with two candidate accounts the resolver must refuse to
+// pick one. A root daemon that guesses can end up scanning another user's
+// private folders.
+func TestSoleDesktopUserHome_Ambiguous(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"alice", "bob"} {
+		if err := os.Mkdir(filepath.Join(dir, name), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	resolve := func(name string) string { return "/Users/" + name }
+	if home, ok := soleDesktopUserHomeWithResolver(dir, resolve); ok || home != "" {
+		t.Errorf("soleDesktopUserHome with two accounts = (%q, %v), want (\"\", false)", home, ok)
+	}
+}
+
+func TestSoleDesktopUserHome_SingleCandidate(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "alice"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	resolve := func(name string) string { return "/Users/" + name }
+	home, ok := soleDesktopUserHomeWithResolver(dir, resolve)
+	if !ok {
+		t.Fatal("soleDesktopUserHome with one account = ok false, want true")
+	}
+	if home != "/Users/alice" {
+		t.Errorf("soleDesktopUserHome = %q, want %q", home, "/Users/alice")
+	}
+}
+
+func TestIsPlausibleUserHome(t *testing.T) {
+	plausible := []string{"/Users/alice", "/home/alice", "/Volumes/Data/alice"}
+	for _, home := range plausible {
+		if !isPlausibleUserHome(home) {
+			t.Errorf("isPlausibleUserHome(%q) = false, want true", home)
+		}
+	}
+	system := []string{"", "/", "/root", "/var/root", "/var/empty", "/nonexistent", "/var/lib/lightdm", "/run/user/501", "/usr/share/foo"}
+	for _, home := range system {
+		if isPlausibleUserHome(home) {
+			t.Errorf("isPlausibleUserHome(%q) = true, want false", home)
+		}
+	}
+}
+
+func TestParseSystemdSessionFields(t *testing.T) {
+	raw := "# This is private data. Do not parse.\nUID=501\nUSER=alice\nACTIVE=1\nSTATE=active\nREMOTE=0\nSEAT=seat0\n\nbadline\n"
+	fields := parseSystemdSessionFields(raw)
+	want := map[string]string{"UID": "501", "USER": "alice", "ACTIVE": "1", "STATE": "active", "REMOTE": "0", "SEAT": "seat0"}
+	for key, value := range want {
+		if fields[key] != value {
+			t.Errorf("fields[%q] = %q, want %q", key, fields[key], value)
+		}
+	}
+	if _, ok := fields["badline"]; ok {
+		t.Error("malformed line should be ignored")
 	}
 }
 
