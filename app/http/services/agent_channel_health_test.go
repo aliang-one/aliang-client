@@ -102,6 +102,9 @@ func TestAgentChannelBackoffBypassedAfterCredentialRotation(t *testing.T) {
 	if agentChannelHealthInstance.allow(endpoint, "Bearer stale") {
 		t.Fatalf("同凭据仍应被退避挡住")
 	}
+	if agentChannelHealthInstance.allow(endpoint, "") {
+		t.Fatal("空凭据不得清掉退避")
+	}
 	if !agentChannelHealthInstance.allow(endpoint, "Bearer fresh") {
 		t.Fatalf("凭据轮转后应放行")
 	}

@@ -72,7 +72,9 @@ func (h *agentChannelHealth) allow(endpoint string, authHeader string) bool {
 	if state == nil || state.nextAt.IsZero() {
 		return true
 	}
-	if agentChannelAuthFingerprint(authHeader) != state.authFingerprint {
+	// 指纹为空表示这次调用根本没带凭据，不能据此认定「凭据已轮转」：
+	// 否则一次未认证调用就会把指数进度重置回 30s。
+	if fp := agentChannelAuthFingerprint(authHeader); fp != "" && fp != state.authFingerprint {
 		delete(h.endpoints, endpoint)
 		return true
 	}
