@@ -55,6 +55,8 @@ type agentAIManager struct {
 	// manager), used to evaluate the device approval policy. nil for standalone
 	// test managers, which fall back to GetSharedAgentService().
 	service *AgentService
+	// scanOnce 保证 stale 扫描器每个 manager 只启动一条。
+	scanOnce sync.Once
 }
 
 func (m *agentAIManager) activeVibeSessionsSnapshot() []models.AgentVibeSession {
@@ -1047,6 +1049,10 @@ type agentAIActivity struct {
 	lastProgressAt   atomic.Int64
 	awaitingApproval atomic.Bool
 	pendingToolUses  atomic.Int64
+	// approvalWaitStartedAt 是当前这段「等人工决策」的开始时刻（0=不在等）。
+	// 与 toolWaitStartedAt 互斥：审批期间工具时钟清零，反之亦然。审批等待
+	// 由 agentAIApprovalTimeout 单独约束，stale 扫描器也要能读到它。
+	approvalWaitStartedAt atomic.Int64
 	// toolWaitStartedAt is the UnixNano instant the current CONTIGUOUS
 	// tool/subagent wait began (0 = not waiting). The tool-wait watchdog uses
 	// it to bound hung tools/subagents that would otherwise pin the run
@@ -1119,13 +1125,29 @@ func (a *agentAIActivity) setAwaitingApproval(v bool) {
 	if v {
 		// Approval time is human time, not tool time: pause the tool-wait
 		// clock so a slow decision never trips the tool-wait ceiling.
+		a.approvalWaitStartedAt.Store(time.Now().UnixNano())
 		a.toolWaitStartedAt.Store(0)
-	} else if a.pendingToolUses.Load() > 0 {
-		// Decision resolved but the tool is still in flight: re-arm with a
-		// fresh ceiling window for the remaining execution.
-		a.toolWaitStartedAt.Store(time.Now().UnixNano())
+	} else {
+		a.approvalWaitStartedAt.Store(0)
+		if a.pendingToolUses.Load() > 0 {
+			// Decision resolved but the tool is still in flight: re-arm with a
+			// fresh ceiling window for the remaining execution.
+			a.toolWaitStartedAt.Store(time.Now().UnixNano())
+		}
 	}
 	a.bump()
+}
+
+// approvalWaitFor 报告当前这段审批等待已持续多久，0 = 不在等待。
+func (a *agentAIActivity) approvalWaitFor() time.Duration {
+	if a == nil {
+		return 0
+	}
+	ts := a.approvalWaitStartedAt.Load()
+	if ts == 0 {
+		return 0
+	}
+	return time.Since(time.Unix(0, ts))
 }
 
 func (a *agentAIActivity) awaiting() bool {
@@ -1186,6 +1208,39 @@ func (a *agentAIActivity) idlePaused() bool {
 		return false
 	}
 	return a.awaitingApproval.Load() || a.pendingToolUses.Load() > 0 || a.activeSubagents.Load() > 0
+}
+
+// staleDeathReason 判定这个 run 是否已经「无响应死」，返回原因码与结论。
+//
+// 口径（spec §3.3.1/§3.3.2）：
+//   - 非等待态：lastActivityAt 距今超过 staleThreshold → stalled。activity 只由
+//     真实事件帧/审批帧/steer ack 刷新，ai.run.progress 心跳不参与（否则心跳
+//     会把一切判死判据击穿）。
+//   - 等待态：不按 stale 阈值判死，只服各自的既有天花板——审批
+//     approvalTimeout、工具 toolCeiling、子代理 subagentCeiling。
+func (a *agentAIActivity) staleDeathReason(staleThreshold, approvalTimeout, toolCeiling, subagentCeiling time.Duration) (string, bool) {
+	if a == nil {
+		return "", false
+	}
+	if a.awaiting() {
+		if approvalTimeout > 0 && a.approvalWaitFor() > approvalTimeout {
+			return "approval_timeout", true
+		}
+		return "", false
+	}
+	if a.pendingToolUses.Load() > 0 || a.activeSubagents.Load() > 0 {
+		if toolCeiling > 0 && a.toolWaitFor() > toolCeiling {
+			return "tool_wait_timeout", true
+		}
+		if subagentCeiling > 0 && a.subagentWaitFor() > subagentCeiling {
+			return "subagent_wait_timeout", true
+		}
+		return "", false
+	}
+	if staleThreshold > 0 && a.idleFor() > staleThreshold {
+		return "stalled", true
+	}
+	return "", false
 }
 
 // beginSubagent marks that a subagent record went active (task_started). While

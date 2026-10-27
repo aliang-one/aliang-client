@@ -206,3 +206,64 @@ func TestClearResetsFinalizedRunSeq(t *testing.T) {
 		t.Fatal("a run after /clear must not inherit the previous fence")
 	}
 }
+
+func TestStaleScannerKillsNonWaitingRunEvenWithHeartbeat(t *testing.T) {
+	oldThreshold := agentAIStaleRunThreshold
+	agentAIStaleRunThreshold = 5 * time.Minute
+	t.Cleanup(func() { agentAIStaleRunThreshold = oldThreshold })
+
+	m, session, guard, rec := newGuardTestManager(t)
+	oldGrace := agentAIKillGrace
+	agentAIKillGrace = 20 * time.Millisecond
+	t.Cleanup(func() { agentAIKillGrace = oldGrace })
+
+	// 只让「进度心跳」在流：心跳不经 activity，lastActivityAt 仍是旧的。
+	guard.activity.lastActivityAt.Store(time.Now().Add(-10 * time.Minute).UnixNano())
+	guard.activity.lastProgressAt.Store(time.Now().Add(-10 * time.Minute).UnixNano())
+
+	m.scanStaleRuns()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(rec.snapshot()) == 1 {
+			if got := rec.snapshot()[0]["error_code"]; got != "turn_stalled" {
+				t.Fatalf("error_code = %v, want turn_stalled", got)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("scanner did not converge the stale run (session=%s)", session.id)
+}
+
+func TestStaleScannerSparesHealthyToolWait(t *testing.T) {
+	m, _, guard, rec := newGuardTestManager(t)
+	guard.activity.beginToolUseWait()
+	guard.activity.lastActivityAt.Store(time.Now().Add(-30 * time.Minute).UnixNano())
+
+	m.scanStaleRuns()
+
+	time.Sleep(100 * time.Millisecond)
+	if got := len(rec.snapshot()); got != 0 {
+		t.Fatalf("healthy tool wait was killed (payloads=%d)", got)
+	}
+}
+
+func TestStaleDeathReasonApprovalOverflow(t *testing.T) {
+	a := newAgentAIActivity()
+	a.setAwaitingApproval(true)
+	a.approvalWaitStartedAt.Store(time.Now().Add(-25 * time.Hour).UnixNano())
+
+	reason, dead := a.staleDeathReason(5*time.Minute, 24*time.Hour, time.Hour, 6*time.Hour)
+	if !dead || reason != "approval_timeout" {
+		t.Fatalf("staleDeathReason = (%q, %t), want (approval_timeout, true)", reason, dead)
+	}
+
+	// 3h 审批（> 2h 硬顶）既不该被 stale 判死，也不该被审批天花板判死。
+	b := newAgentAIActivity()
+	b.setAwaitingApproval(true)
+	b.approvalWaitStartedAt.Store(time.Now().Add(-3 * time.Hour).UnixNano())
+	if reason, dead := b.staleDeathReason(5*time.Minute, 24*time.Hour, time.Hour, 6*time.Hour); dead {
+		t.Fatalf("3h approval was judged dead (reason=%q)", reason)
+	}
+}

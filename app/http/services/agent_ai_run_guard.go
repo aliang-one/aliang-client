@@ -59,6 +59,9 @@ func (m *agentAIManager) attachRunGuard(run agentAIRun, emit agentTerminalWriter
 	if m == nil || run.activity == nil || run.cancel == nil {
 		return nil
 	}
+	// 进程级 stale 扫描器与单回合成败无关：无论本次是否挂载成功（attach 竞态
+	// 跳过也一样），都要保证 manager 上有且仅有一条扫描 goroutine 在跑。
+	defer m.startStaleRunScanner()
 	guard := newAgentAIRunGuard(m, run, emit)
 	m.mu.Lock()
 	session := m.sessions[run.sessionID]
@@ -277,5 +280,73 @@ func (m *agentAIManager) markRunFinalized(sessionID string, runSeq int) {
 	defer m.mu.Unlock()
 	if session := m.sessions[sessionID]; session != nil && session.runSeq == runSeq {
 		session.finalizedRunSeq = runSeq
+	}
+}
+
+// agentAIStaleRunThreshold 是「非等待态下多久没有任何活性事件就判死」。
+//
+//	ALIANG_AI_STALE_RUN  (time.ParseDuration). Default 5min.
+var agentAIStaleRunThreshold = resolveEnvDuration("ALIANG_AI_STALE_RUN", 5*time.Minute)
+
+// agentAIStaleScanInterval 是 stale running 自检的扫描周期。
+var agentAIStaleScanInterval = time.Minute
+
+// startStaleRunScanner 为这个 manager 启动唯一一条扫描 goroutine。
+//
+// 只在第一次注册 guard 时启动（sync.Once），扫到进程退出为止：进程级兜底，
+// 不绑定任何单回合的 ctx。
+//
+// 生命周期取舍：goroutine 不随 manager 回收，测试里新建的 manager 会各留一条
+// 常驻扫描（ticker 1min 一次，空转开销可忽略）。这是刻意接受的——生产只有
+// 一个全局 manager；扫描周期已是 package 级 var，测试需要时可以调大。
+func (m *agentAIManager) startStaleRunScanner() {
+	if m == nil {
+		return
+	}
+	m.scanOnce.Do(func() {
+		go func() {
+			ticker := time.NewTicker(agentAIStaleScanInterval)
+			defer ticker.Stop()
+			for range ticker.C {
+				m.scanStaleRuns()
+			}
+		}()
+	})
+}
+
+// scanStaleRuns 扫描所有运行中会话，把已判死的交给同一个 guardian kill 通道。
+//
+// 不自己发终态：终态唯一性由 emitter 终态闸保证，扫描器只是「发现者」。
+func (m *agentAIManager) scanStaleRuns() {
+	if m == nil {
+		return
+	}
+	type victim struct {
+		guard  *agentAIRunGuard
+		reason string
+	}
+	var victims []victim
+	m.mu.Lock()
+	for _, session := range m.sessions {
+		guard := session.guard
+		// guard != nil 才是「这是个在跑的真回合」的真正判据（Task 4 起所有
+		// provider 回合都会挂 guard）。session.cancel == nil 是历史遗留的
+		// 廉价前置条件，只为跳过从未起跑的会话，不要把它当成僵尸判据去「优化」。
+		if guard == nil || session.cancel == nil || guard.activity == nil {
+			continue
+		}
+		reason, dead := guard.activity.staleDeathReason(
+			agentAIStaleRunThreshold,
+			agentAIApprovalTimeout,
+			agentAIToolWaitCeiling,
+			agentAISubagentWaitCeiling,
+		)
+		if dead {
+			victims = append(victims, victim{guard: guard, reason: reason})
+		}
+	}
+	m.mu.Unlock()
+	for _, v := range victims {
+		v.guard.kill(v.reason)
 	}
 }
