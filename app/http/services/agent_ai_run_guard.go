@@ -209,10 +209,19 @@ func (g *agentAIRunGuard) forceFinalize(reason string) {
 		// 迟返回都必须被非帧副作用守卫挡住（Task 8）。
 		// 身份校验与复位在同一个临界区内完成（finalizeStalledGuard）：/clear
 		// 复用 runSeq 后，迟到的强拆绝不能拆掉新的合法回合。
-		if !g.m.finalizeStalledGuard(g, g.emit) {
+		if code, ok := g.m.finalizeStalledGuard(g, g.emit); !ok {
+			detail := "该回合已不是会话当前回合"
+			switch code {
+			case "session_missing":
+				detail = "会话已不存在"
+			case "guard_replaced":
+				detail = "guard 已被新回合顶替"
+			case "run_seq_moved":
+				detail = "runSeq 已推进"
+			}
 			logger.Warn(fmt.Sprintf(
-				"[ai.run.force_finalize] guard_not_current session=%s runSeq=%d run=%s reason=%s（该回合已被 /clear 后的新回合取代，跳过复位）",
-				g.sessionID, g.runSeq, g.runID, reason,
+				"[ai.run.force_finalize] guard_not_current session=%s runSeq=%d run=%s reason=%s code=%s（%s，跳过复位）",
+				g.sessionID, g.runSeq, g.runID, reason, code, detail,
 			))
 		}
 	})
@@ -293,21 +302,33 @@ func (m *agentAIManager) markRunFinalized(sessionID string, runSeq int) {
 
 // finalizeStalledGuard 校验 guard 仍是该会话当前回合后，打终结标记并复位运行态。
 // /clear 会把 runSeq 归零后被新回合复用，只比 runSeq 会把迟到的强拆打到新回合上，
-// 所以这里以 guard 身份为判据。
-func (m *agentAIManager) finalizeStalledGuard(g *agentAIRunGuard, writeJSON agentTerminalWriter) bool {
+// 所以这里以 guard 身份为判据，并合取 runSeq：/clear 归零 runSeq 但不摘 guard，
+// 若将来放开「运行中 /clear」，只比 guard 指针会把 finalizedRunSeq 写成旧 runSeq，
+// 从而挡住复用该 runSeq 的新回合的 history/journal/resume 写入；一个合取条件即可闭合。
+//
+// 返回原因码（"" 表示成功复位），供调用方如实记日志。
+func (m *agentAIManager) finalizeStalledGuard(g *agentAIRunGuard, writeJSON agentTerminalWriter) (string, bool) {
 	if m == nil || g == nil {
-		return false
+		return "session_missing", false
 	}
 	m.mu.Lock()
 	session := m.sessions[g.sessionID]
-	if session == nil || session.guard != g {
+	if session == nil {
 		m.mu.Unlock()
-		return false
+		return "session_missing", false
+	}
+	if session.guard != g {
+		m.mu.Unlock()
+		return "guard_replaced", false
+	}
+	if session.runSeq != g.runSeq {
+		m.mu.Unlock()
+		return "run_seq_moved", false
 	}
 	session.finalizedRunSeq = g.runSeq
 	m.mu.Unlock()
 	m.clearRunning(g.sessionID, g.runSeq, writeJSON, g)
-	return true
+	return "", true
 }
 
 // agentAIStaleRunThreshold 是「非等待态下多久没有任何活性事件就判死」。

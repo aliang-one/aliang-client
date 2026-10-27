@@ -213,9 +213,13 @@ func TestStaleScannerKillsNonWaitingRunEvenWithHeartbeat(t *testing.T) {
 	agentAIKillGrace = 20 * time.Millisecond
 	t.Cleanup(func() { agentAIKillGrace = oldGrace })
 
-	// 依赖默认 stale 阈值 5min：lastActivityAt 回拨 10min 有 2 倍余量。
-	// 不要再改写包级 agentAIStaleRunThreshold——常驻扫描器的读与这里的写
-	// 会构成 -race 竞争，而默认值本就足够。
+	// 常驻扫描器已在 TestMain 关闭（agentAIStaleScannerEnabled=false），这里写
+	// 包级 var 不构成竞争；显式设置是为了不受 ambient ALIANG_AI_STALE_RUN 影响。
+	oldThreshold := agentAIStaleRunThreshold
+	agentAIStaleRunThreshold = 5 * time.Minute
+	t.Cleanup(func() { agentAIStaleRunThreshold = oldThreshold })
+
+	// lastActivityAt 回拨 10min，相对 5min 阈值有 2 倍余量。
 	// 只让「进度心跳」在流：心跳不经 activity，lastActivityAt 仍是旧的。
 	guard.activity.lastActivityAt.Store(time.Now().Add(-10 * time.Minute).UnixNano())
 	guard.activity.lastProgressAt.Store(time.Now().Add(-10 * time.Minute).UnixNano())
@@ -236,8 +240,13 @@ func TestStaleScannerKillsNonWaitingRunEvenWithHeartbeat(t *testing.T) {
 }
 
 func TestStaleScannerSparesHealthyToolWait(t *testing.T) {
-	// 依赖默认 stale 阈值 5min：lastActivityAt 回拨 30min 有 6 倍余量，
-	// 无需改写包级 var。
+	// 常驻扫描器已在 TestMain 关闭（agentAIStaleScannerEnabled=false），这里写
+	// 包级 var 不构成竞争；显式设置是为了不受 ambient ALIANG_AI_STALE_RUN 影响。
+	oldThreshold := agentAIStaleRunThreshold
+	agentAIStaleRunThreshold = 5 * time.Minute
+	t.Cleanup(func() { agentAIStaleRunThreshold = oldThreshold })
+
+	// lastActivityAt 回拨 30min，相对 5min 阈值有 6 倍余量。
 	m, _, guard, rec := newGuardTestManager(t)
 	guard.activity.beginToolUseWait()
 	guard.activity.lastActivityAt.Store(time.Now().Add(-30 * time.Minute).UnixNano())
@@ -369,28 +378,27 @@ func TestSetAwaitingApprovalDrivesApprovalClock(t *testing.T) {
 // 新回合复用 runSeq=1」这一最可能发生的剧本：旧回合迟到的强拆必须按 guard
 // 身份识别出自己已不是当前回合，绝不能再复位会话。
 //
-// 旧实现（只比 runSeq）下 finalize 会命中新回合，本用例的断言会全红。
+// 旧实现（只比 runSeq）下 finalize 会命中新回合：finalizedRunSeq 被写成 1、
+// session.guard 与 session.cancel 被清空，本用例必红。
 func TestForceFinalizeDoesNotTouchReusedRunSeq(t *testing.T) {
-	oldGrace := agentAIKillGrace
-	agentAIKillGrace = 200 * time.Millisecond
-	t.Cleanup(func() { agentAIKillGrace = oldGrace })
+	m, session, guard1, rec1 := newGuardTestManager(t)
 
-	m, session, guard1, _ := newGuardTestManager(t)
-	guard1.kill("stalled") // 200ms 后强拆
-
-	// 模拟 /clear：runSeq 归零，随后新回合起跑又复用 runSeq=1。
-	activity2 := newAgentAIActivity()
-	var cancelled2 int32
-	_, cancelFn2 := context.WithCancel(context.Background())
-	t.Cleanup(cancelFn2)
-	cancel2 := func() { atomic.AddInt32(&cancelled2, 1); cancelFn2() }
-
+	// 模拟 /clear：runSeq 归零。真实 /clear（agent_ai.go 约 1990）会同时清零
+	// finalizedRunSeq——漏掉这一步，旧回合若在停顿后才强拆就会把标记留在
+	// runSeq=1 上，新回合便被误挡（假红）。
 	m.mu.Lock()
 	session.runSeq = 0
+	session.finalizedRunSeq = 0
 	m.mu.Unlock()
+
+	// 新回合起跑，又复用 runSeq=1。
+	activity2 := newAgentAIActivity()
+	_, cancelFn2 := context.WithCancel(context.Background())
+	t.Cleanup(cancelFn2)
+
 	m.mu.Lock()
 	session.runSeq = 1
-	session.cancel = cancel2
+	session.cancel = cancelFn2
 	session.activity = activity2
 	m.mu.Unlock()
 
@@ -400,7 +408,7 @@ func TestForceFinalizeDoesNotTouchReusedRunSeq(t *testing.T) {
 		messageID: "msg-2",
 		runSeq:    1,
 		activity:  activity2,
-		cancel:    cancel2,
+		cancel:    cancelFn2,
 	}
 	rec2 := &recordingWriter{}
 	guard2 := m.attachRunGuard(run2, rec2.write)
@@ -408,25 +416,38 @@ func TestForceFinalizeDoesNotTouchReusedRunSeq(t *testing.T) {
 		t.Fatal("guard2 was not attached to the fresh run")
 	}
 
-	// 睡过 guard1 的宽限期（200ms），让迟到的 forceFinalize 真的跑起来。
-	time.Sleep(500 * time.Millisecond)
+	// 新回合挂好之后同步驱动迟到的强拆。定时器→宽限→强拆这条链由
+	// TestRunGuardKillLogsAndForceFinalizesAfterGrace 覆盖；这里只验证迟到
+	// 强拆的身份校验，因此同步驱动，finalizeOnce 保证与真实定时器幂等合一。
+	guard1.forceFinalize("stalled")
+
+	// 正向证据：被测代码真的执行过——旧回合的 recorder 恰好收到一帧
+	// turn_stalled（emit 在 goroutine 里，用有界轮询等它落地）。
+	deadline := time.Now().Add(2 * time.Second)
+	for len(rec1.snapshot()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	payloads1 := rec1.snapshot()
+	if len(payloads1) != 1 {
+		t.Fatalf("old guard emitted %d terminal payloads, want exactly 1 (forceFinalize did not run)", len(payloads1))
+	}
+	if got := payloads1[0]["error_code"]; got != "turn_stalled" {
+		t.Fatalf("old guard error_code = %v, want turn_stalled", got)
+	}
 
 	m.mu.Lock()
 	curGuard := session.guard
 	curCancel := session.cancel
 	finalized2 := session.finalizedRunSeq
 	m.mu.Unlock()
-	if got := atomic.LoadInt32(&cancelled2); got != 0 {
-		t.Fatalf("new run cancel called %d times, want 0", got)
-	}
 	if got := len(rec2.snapshot()); got != 0 {
 		t.Fatalf("new run received %d terminal payloads, want 0", got)
 	}
 	if curGuard != guard2 {
 		t.Fatal("late forceFinalize detached the current run's guard")
 	}
-	if finalized2 == 1 {
-		t.Fatal("late forceFinalize fenced the reused runSeq=1 of the fresh run")
+	if finalized2 != 0 {
+		t.Fatalf("finalizedRunSeq = %d, want 0 (late forceFinalize fenced the reused runSeq=1)", finalized2)
 	}
 	if curCancel == nil {
 		t.Fatal("late forceFinalize cleared the fresh run's cancel")

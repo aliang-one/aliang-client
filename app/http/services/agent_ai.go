@@ -1054,8 +1054,10 @@ type agentAIActivity struct {
 	pendingApprovals atomic.Int64
 	pendingToolUses  atomic.Int64
 	// approvalWaitStartedAt 是当前这段「等人工决策」的开始时刻（0=不在等）。
-	// 与 toolWaitStartedAt 互斥：审批期间工具时钟清零，反之亦然。审批等待
-	// 由 agentAIApprovalTimeout 单独约束，stale 扫描器也要能读到它。
+	// 计数版下它不保证与 toolWaitStartedAt 互斥：第一个审批开启时清工具钟，
+	// 但期间若工具重新臂起（或第二个重叠审批不清工具钟），两钟可同时非零；
+	// 这不误判，因为 staleDeathReason 的 awaiting 分支优先于工具钟分支。
+	// 审批等待由 agentAIApprovalTimeout 单独约束，stale 扫描器也要能读到它。
 	approvalWaitStartedAt atomic.Int64
 	// toolWaitStartedAt is the UnixNano instant the current CONTIGUOUS
 	// tool/subagent wait began (0 = not waiting). The tool-wait watchdog uses
@@ -1140,6 +1142,10 @@ func (a *agentAIActivity) setAwaitingApproval(v bool) {
 		for {
 			current := a.pendingApprovals.Load()
 			if current <= 0 {
+				// 多余 false 本身无害，但计数失衡（例如漏了 true 却发 false）
+				// 会让 awaiting() 长期为真，把该 run 拖到 24h 审批天花板，
+				// 所以要留痕。agentAIActivity 无会话身份，日志不带 id。
+				logger.Warn("[ai.activity] approval_release_without_pending")
 				break
 			}
 			if a.pendingApprovals.CompareAndSwap(current, current-1) {
