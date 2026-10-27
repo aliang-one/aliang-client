@@ -62,7 +62,7 @@ type Client struct {
 	// 留空只在没有可用 key 时发生——此时行为退回到「由代理决定用哪把」。
 	apiKey string
 	// streamIdle 是 SSE 块间空闲窗口；0 = 禁用（测试用）。由 NewClient 从
-	// streamIdleTimeout 环境变量解析结果播种。
+	// streamIdleEnvKey 环境变量解析结果每次播种（见 currentStreamIdleWindow）。
 	streamIdle time.Duration
 }
 
@@ -70,7 +70,7 @@ type Client struct {
 func NewClient(baseURL string) *Client {
 	return &Client{
 		baseURL:    strings.TrimRight(strings.TrimSpace(baseURL), "/"),
-		streamIdle: streamIdleTimeout,
+		streamIdle: currentStreamIdleWindow(),
 		http: &http.Client{
 			// 不设整体 Timeout：流式响应会持续很久，整体超时会误杀长回合。
 			// 连接建立与首字节由 Transport 的 dial/response header 超时兜住。

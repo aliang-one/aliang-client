@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1556,5 +1557,93 @@ func TestZombieSuccessDoesNotEmitOptionRequestWhenGuardReplaced(t *testing.T) {
 				t.Fatalf("session.pendingOption 存在 = %v, want %v（pending=%+v）", gotPending, tc.wantPending, pending)
 			}
 		})
+	}
+}
+
+// 【本轮应修-4】L1 半开流必须变成一条 ai.error。
+//
+// 2026-10-27 事故形态：上游发了半帧就静默，连接既不断也不再有字节，Read 永久
+// 阻塞，整轮 run 卡在内核里，手机永远停在「进行中」，而事件流里一条错误都没有。
+// idleTimeoutReader 就是为这个形态加的（stream_idle.go），本用例锁死它一路
+// 走到手机的效果。
+//
+// 构造要点（改动前先读完再动）：
+//   - 上游只写**一帧**合法 SSE 后保持连接 OPEN。绝不能写完就 return：handler
+//     返回会让 transport 收到 FIN，parseSSE 把 EOF 当**正常结束**，用例会退化
+//     成"上游优雅收尾"，永远绿。
+//   - 窗口用环境变量压到 200ms。默认 90s，真等就是把整包测试拖死；而这条路径
+//     之外的任何断言都替代不了它（半开 ≠ EOF ≠ 4xx）。
+func TestRunAgentCoreReportsStalledStreamAsError(t *testing.T) {
+	setTestAgentHome(t)
+
+	release := make(chan struct{})
+	var requests int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requests, 1)
+		_, _ = io.ReadAll(r.Body)
+		w.Header().Set("content-type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		// 一帧合法 SSE：证明"确实收到了上游的字节"，随后的静默才是停滞，
+		// 而不是握手失败。
+		_, _ = fmt.Fprintf(w, "data: %s\n\n", `{"type":"message_start","message":{"id":"msg_stall","model":"glm-5.2"}}`)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-release // 半开：不再写一个字节，也不关连接
+	}))
+	t.Cleanup(func() {
+		close(release)
+		srv.Close()
+	})
+	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
+	t.Setenv("ANTHROPIC_MODEL", "")
+	t.Setenv("ALIANG_AGENTCORE_STREAM_IDLE_TIMEOUT", "200ms")
+
+	m := newAgentAIManager()
+	const sessionID = "conv-agentcore-stream-stall"
+	const runSeq = 1
+	m.registerAISessionLocked(&agentAISession{
+		id:      sessionID,
+		runSeq:  runSeq,
+		history: []agentAIMessage{{Role: "user", Content: "你好"}},
+	})
+
+	log := &agentCoreEventLog{}
+	run := agentAIRun{
+		sessionID:   sessionID,
+		runSeq:      runSeq,
+		messageID:   "msg-stream-stall",
+		provider:    "agentcore",
+		model:       "glm-5.2",
+		projectPath: t.TempDir(),
+		activity:    newAgentAIActivity(),
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		m.runAgentCore(context.Background(), run, log.write)
+	}()
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatalf("runAgentCore 未在停滞窗口后返回：半开流把整轮 run 卡死了（事件 %v）", log.types())
+	}
+
+	// 恰好一条 ai.error：少一条手机一直「进行中」，多一条手机看到重复错误气泡。
+	errs := log.filter(models.AgentEventAIError)
+	if len(errs) != 1 {
+		t.Fatalf("ai.error 数量 = %d, want 1（序列 %v）", len(errs), log.types())
+	}
+	msg, _ := errs[0]["error"].(string)
+	if strings.TrimSpace(msg) == "" {
+		t.Fatalf("ai.error 的 error 为空：手机只会看到一条没有原因的失败 %v", errs[0])
+	}
+	if got := log.count(models.AgentEventAIDone); got != 0 {
+		t.Fatalf("停滞回合不该发 ai.done，实际 %d 条（序列 %v）", got, log.types())
+	}
+	// 停滞不可重试：重试会让本尝试已下发的 start/text 帧变成重复内容。
+	if got := atomic.LoadInt32(&requests); got != 1 {
+		t.Fatalf("上游请求次数 = %d, want 1（停滞必须不可重试）", got)
 	}
 }

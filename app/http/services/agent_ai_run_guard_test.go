@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -530,5 +531,118 @@ func TestZombieLateCleanupDoesNotTouchReusedRunSeq(t *testing.T) {
 	}
 	if got := len(rec2.snapshot()); got != 0 {
 		t.Fatalf("新回合收到 %d 帧终态，want 0", got)
+	}
+}
+
+// 【本轮应修-2】强拆终态的投递必须有时间上界。
+//
+// 病态现场：僵尸 run 正卡在 emitter 互斥锁或底层网络写侧，强拆发终态帧的
+// goroutine 会跟着无限期挂住——会话状态已复位、手机却永远等不到终态帧，而
+// 日志里一个字都没有。上界 + 哨兵错误把「没送到」变成可观测事实。
+func TestEmitTerminalBoundedTimesOutOnBlockedEmitter(t *testing.T) {
+	block := make(chan struct{})
+	defer close(block)
+
+	started := time.Now()
+	err := emitTerminalBounded(func(map[string]interface{}) error {
+		<-block
+		return nil
+	}, map[string]interface{}{"type": models.AgentEventAIError}, 50*time.Millisecond)
+	elapsed := time.Since(started)
+
+	if !errors.Is(err, errAgentAITerminalBlocked) {
+		t.Fatalf("error = %v, want errAgentAITerminalBlocked", err)
+	}
+	if elapsed < 40*time.Millisecond {
+		t.Fatalf("elapsed = %s：早于超时就返回，说明根本没等 emit", elapsed)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("elapsed = %s：超时上界没生效", elapsed)
+	}
+}
+
+func TestEmitTerminalBoundedPropagatesEmitterError(t *testing.T) {
+	writeErr := errors.New("write side closed")
+	err := emitTerminalBounded(func(map[string]interface{}) error {
+		return writeErr
+	}, map[string]interface{}{"type": models.AgentEventAIError}, 50*time.Millisecond)
+	if !errors.Is(err, writeErr) {
+		t.Fatalf("error = %v, want 原样透传的写侧错误", err)
+	}
+	if errors.Is(err, errAgentAITerminalBlocked) {
+		t.Fatal("写侧错误被误判成超时哨兵：两条失败路径必须可区分")
+	}
+}
+
+func TestEmitTerminalBoundedPassesThroughSuccess(t *testing.T) {
+	calls := int32(0)
+	err := emitTerminalBounded(func(map[string]interface{}) error {
+		atomic.AddInt32(&calls, 1)
+		return nil
+	}, map[string]interface{}{"type": models.AgentEventAIError}, 50*time.Millisecond)
+	if err != nil {
+		t.Fatalf("error = %v, want nil", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("emit 调用次数 = %d, want 1", got)
+	}
+}
+
+// forceFinalize 自己绝不能被卡死的写侧拖住：会话复位（手机回到 idle）是
+// 强拆的第一目的，投递只是尽力而为。
+// 刻意不覆盖 agentAIKillGrace：写侧永久阻塞，投递 goroutine 会一直停在
+// emitTerminalBounded 里读 agentAIKillGrace；此时若用 t.Cleanup 回写这个
+// 包级 var，就与那个读构成真实数据竞争（-race 已实测报出）。用生产默认
+// 30s 判据更强：同步投递的话 forceFinalize 会卡 30s，异步则立刻返回。
+func TestForceFinalizeReturnsImmediatelyWithBlockedEmitter(t *testing.T) {
+	m := newAgentAIManager()
+	activity := newAgentAIActivity()
+	_, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	session := &agentAISession{
+		id:       "sess-blocked",
+		runSeq:   1,
+		cancel:   cancel,
+		activity: activity,
+	}
+	m.sessions[session.id] = session
+	run := agentAIRun{
+		sessionID: session.id,
+		runID:     "run-blocked",
+		messageID: "msg-blocked",
+		runSeq:    1,
+		activity:  activity,
+		cancel:    cancel,
+	}
+	block := make(chan struct{})
+	defer close(block)
+	guard := m.attachRunGuard(run, func(interface{}) error {
+		<-block
+		return nil
+	})
+	if guard == nil {
+		t.Fatal("guard 挂载失败")
+	}
+
+	started := time.Now()
+	guard.forceFinalize("stalled")
+	elapsed := time.Since(started)
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("forceFinalize 耗时 %s：被卡死的写侧拖住了", elapsed)
+	}
+
+	m.mu.Lock()
+	stillRunning := m.sessions[session.id].cancel != nil
+	attached := m.sessions[session.id].guard != nil
+	finalized := m.sessions[session.id].finalizedRunSeq
+	m.mu.Unlock()
+	if stillRunning {
+		t.Fatal("强拆后 session.cancel 仍在：手机不会回到 idle")
+	}
+	if attached {
+		t.Fatal("强拆后 guard 未摘除")
+	}
+	if finalized != 1 {
+		t.Fatalf("finalizedRunSeq = %d, want 1", finalized)
 	}
 }

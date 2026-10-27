@@ -9,14 +9,23 @@ import (
 	"time"
 )
 
-// streamIdleTimeout 是 SSE 两次字节到达之间的最长静默时间。
+// streamIdleDefault 是 SSE 两次字节到达之间的最长静默时间默认值。
 //
 // 上游协议带 ping 保活，正常的长时间回合不会静默这么久；一旦窗口内一个字节
 // 都没到，说明连接已半开或上游停滞，必须中断读取——否则 Read 会永久阻塞，
 // 整轮 run 卡死在 agentcore.Run 内部（2026-10-27 事故形态）。
-//
-//	ALIANG_AGENTCORE_STREAM_IDLE_TIMEOUT  (time.ParseDuration). Default 90s. 0=禁用（仅测试用）。
-var streamIdleTimeout = agentcoreEnvDuration("ALIANG_AGENTCORE_STREAM_IDLE_TIMEOUT", 90*time.Second)
+const streamIdleDefault = 90 * time.Second
+
+// streamIdleEnvKey 是覆盖上面默认值的环境变量（time.ParseDuration 语法）。
+// 0=禁用（仅测试用）。
+const streamIdleEnvKey = "ALIANG_AGENTCORE_STREAM_IDLE_TIMEOUT"
+
+// currentStreamIdleWindow 在每次构造 Client 时解析窗口，而不是在包初始化时
+// 求值一次：值同样是环境变量，但初始化时读死会让同进程内的用例无法用
+// t.Setenv 缩短窗口（只能真等 90s），端到端回归就此不可写。
+func currentStreamIdleWindow() time.Duration {
+	return agentcoreEnvDuration(streamIdleEnvKey, streamIdleDefault)
+}
 
 func agentcoreEnvDuration(key string, def time.Duration) time.Duration {
 	raw := strings.TrimSpace(os.Getenv(key))

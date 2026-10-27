@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -192,8 +193,49 @@ func (g *agentAIRunGuard) armForceFinalize(reason string) {
 	})
 }
 
+// errAgentAITerminalBlocked 表示终态帧的发送在宽限期内没有返回：僵尸正卡在
+// emitter 的互斥锁或底层写侧，这一帧确实没送到。与「发送返回了错误」是两种
+// 不同的失败，日志标签也不同，别合并。
+var errAgentAITerminalBlocked = errors.New("terminal frame emit blocked")
+
+// emitTerminalBounded 在 timeout 内等待 emit(payload) 返回，把「发送可能永不
+// 返回」变成有上界的可观测事实。
+//
+// 为什么不能只靠 emit 返回 error：强拆要面对的僵尸形态正是「卡在 emitter 写侧」，
+// 此时 emit 阻塞在 Lock() 上永不返回，错误分支永不执行——兜底日志永远是假的。
+//
+// 返回值三种：emit 的成功/失败原样透出（失败可能是任何 error），或超时返回
+// ErrAgentAITerminalBlocked。timeout <= 0 时退化为同步调用（无人看护的宽限
+// 窗口意味着强拆本身没被 arm，保持旧行为）。
+//
+// 内层 goroutine 无法回收：Go 没有解除阻塞 IO 的手段。它只泄漏到阻塞解除或
+// 进程退出，且 finalizeOnce 保证每回合最多一条。
+func emitTerminalBounded(emit func(map[string]interface{}) error, payload map[string]interface{}, timeout time.Duration) error {
+	if timeout <= 0 {
+		return emit(payload)
+	}
+	done := make(chan error, 1)
+	go func() { done <- emit(payload) }()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-timer.C:
+		return errAgentAITerminalBlocked
+	}
+}
+
 // forceFinalize 在宽限期内 run 仍未返回时强制收尾：发恰好一个终态错误帧，
 // 并把会话复位到 idle（cancel/steer/approval 全部清掉）。
+//
+// 投递路径有三条，都能在日志里分辨（finalizeOnce 保证每回合只走一条）：
+//   - 发成功：静默（只有上面那条 force_finalize 主日志）；
+//   - 发出去但报错：`terminal_not_delivered`（Warn，带 err）；
+//   - 超过宽限期仍未返回：`terminal_blocked`（Error，带 timeout）。
+//
+// 三条路径下状态侧都已经收敛——下面 finalizeStalledGuard 是同步执行的，
+// 与投递结果无关：手机即使收不到终态帧，本地也会回到 idle。
 //
 // emit 放在 goroutine 里：僵尸可能正卡在 emitter 互斥锁或底层写侧，强拆本身
 // 绝不能被它拖住——会话复位才是「手机不再显示运行中」的关键。
@@ -203,10 +245,6 @@ func (g *agentAIRunGuard) armForceFinalize(reason string) {
 // 帧先赢，客户端只会看到回到 idle、看不到错误文案——判死原因仍可从
 // [ai.run.force_finalize] 日志与 killReason 追溯。要消掉这个不确定性，得让
 // clearRunning 接受「本次复位的原因」并合并进同一帧，属于后续增强。
-//
-// 另一条残余风险：若僵尸正卡在 emitter 写侧（e.write 持锁阻塞），这条终态
-// 根本发不出去——本地的会话复位仍然完成（手机本地回到 idle），但服务端侧
-// 只能靠 stale 扫描器收敛，且会留下 terminal_not_delivered 日志。
 func (g *agentAIRunGuard) forceFinalize(reason string) {
 	if g == nil {
 		return
@@ -224,10 +262,23 @@ func (g *agentAIRunGuard) forceFinalize(reason string) {
 		payload["error_code"] = "turn_stalled"
 		payload["status"] = "stalled"
 		go func() {
-			if err := g.emit(payload); err != nil {
-				// 强拆终态送不出去（僵尸一般正卡在 emitter 写侧）时，手机收不到
-				// 终态、服务端只能等 stale 扫描器兜底。错误绝不能吞——否则事后
-				// 只能靠「本该出现的日志没出现」逆推。
+			started := time.Now()
+			err := emitTerminalBounded(func(p map[string]interface{}) error { return g.emit(p) }, payload, agentAIKillGrace)
+			switch {
+			case err == nil:
+				// 终态已送出。
+			case errors.Is(err, errAgentAITerminalBlocked):
+				// 僵尸卡在 emitter 写侧：这一帧确实没送到，服务端侧只能等
+				// stale 扫描器收敛。Error 级——这不是"可能"，是已发生。
+				logger.Error(fmt.Sprintf(
+					"[ai.run.force_finalize] terminal_blocked session=%s runSeq=%d run=%s reason=%s timeout=%s waited=%s",
+					g.sessionID, g.runSeq, g.runID, reason,
+					agentAIKillGrace, time.Since(started).Truncate(time.Second),
+				))
+			default:
+				// 强拆终态送不出去（发送返回了错误）时，手机收不到终态、服务端
+				// 只能等 stale 扫描器兜底。错误绝不能吞——否则事后只能靠
+				// 「本该出现的日志没出现」逆推。
 				logger.Warn(fmt.Sprintf(
 					"[ai.run.force_finalize] terminal_not_delivered session=%s runSeq=%d run=%s err=%v",
 					g.sessionID, g.runSeq, g.runID, err,
