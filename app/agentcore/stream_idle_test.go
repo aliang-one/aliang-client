@@ -99,6 +99,7 @@ func TestStreamDoesNotRetryOnStreamStall(t *testing.T) {
 	select {
 	case err = <-done:
 	case <-time.After(5 * time.Second):
+		srv.CloseClientConnections()
 		t.Fatal("Stream did not return on a stalled upstream; idle guard missing or ineffective")
 	}
 
@@ -144,6 +145,7 @@ func TestStreamCompletesWhenConnectionStaysOpenAfterMessageStop(t *testing.T) {
 			t.Fatalf("Stream error = %v, want nil (turn already complete at message_stop)", err)
 		}
 	case <-time.After(5 * time.Second):
+		srv.CloseClientConnections()
 		t.Fatal("Stream did not return after message_stop; idle guard must not be the exit path")
 	}
 }
