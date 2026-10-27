@@ -16,6 +16,14 @@ import (
 //	ALIANG_AI_KILL_GRACE  (time.ParseDuration). Default 30s.
 var agentAIKillGrace = resolveEnvDuration("ALIANG_AI_KILL_GRACE", 30*time.Second)
 
+// steerLivenessWindow 是一条插话从「排队成功」到「被 drain 取走」的最长等待。
+//
+// 必须大于 agentcore 的 ResponseHeaderTimeout（120s）：建流期头部停滞 + 既有
+// 瞬态重试成功的那一轮都是合法静默，不能据此判死。
+//
+//	ALIANG_AGENTCORE_STEER_LIVENESS  (time.ParseDuration). Default 180s.
+var steerLivenessWindow = resolveEnvDuration("ALIANG_AGENTCORE_STEER_LIVENESS", 180*time.Second)
+
 // agentAIRunGuard 是一个运行中回合的收尾守卫。它把「kill → 宽限 → 强拆」
 // 串成一条带观测的链路，并给 stale 扫描器提供同一入口。
 //

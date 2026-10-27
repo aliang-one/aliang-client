@@ -49,3 +49,143 @@ func TestCoreSteerDeliverDoesNotBumpActivity(t *testing.T) {
 		t.Fatalf("deliver 不应刷新 lastActivityAt（now-stale=%s）", time.Duration(got-stale))
 	}
 }
+
+// queueLenOf 读队列长度（同包测试用，走同一把锁）。
+func queueLenOf(c *agentAICoreSteerControl) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.queue)
+}
+
+func TestCoreSteerLivenessWindowEmitsTurnStalled(t *testing.T) {
+	oldWindow := steerLivenessWindow
+	steerLivenessWindow = 40 * time.Millisecond
+	t.Cleanup(func() { steerLivenessWindow = oldWindow })
+
+	activity := newAgentAIActivity()
+	rec := &recordingWriter{}
+	run := agentAIRun{sessionID: "sess-1", runSeq: 1, messageID: "msg-1", activity: activity}
+	control := newAgentAICoreSteerControl(run, rec.write)
+	control.activity = activity
+	stalled := make(chan string, 1)
+	control.onStalled = func(reason string) { stalled <- reason }
+
+	if _, err := control.deliver(agentAISteerMessage{MessageID: "steer-9", Content: "hi"}); err != nil {
+		t.Fatalf("deliver: %v", err)
+	}
+
+	select {
+	case <-stalled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("liveness window did not fire")
+	}
+
+	payloads := rec.snapshot()
+	if len(payloads) != 1 {
+		t.Fatalf("acks = %d, want 1", len(payloads))
+	}
+	if payloads[0]["result"] != "error" || payloads[0]["code"] != "turn_stalled" {
+		t.Fatalf("ack = %v, want result=error code=turn_stalled", payloads[0])
+	}
+}
+
+func TestCoreSteerLivenessWindowSparesToolWait(t *testing.T) {
+	oldWindow := steerLivenessWindow
+	steerLivenessWindow = 40 * time.Millisecond
+	t.Cleanup(func() { steerLivenessWindow = oldWindow })
+
+	activity := newAgentAIActivity()
+	activity.beginToolUseWait()
+
+	rec := &recordingWriter{}
+	run := agentAIRun{sessionID: "sess-1", runSeq: 1, messageID: "msg-1", activity: activity}
+	control := newAgentAICoreSteerControl(run, rec.write)
+	control.activity = activity
+	control.onStalled = func(string) { t.Error("must not judge dead during a legal waiting state") }
+
+	_, _ = control.deliver(agentAISteerMessage{MessageID: "steer-10", Content: "hi"})
+	time.Sleep(150 * time.Millisecond)
+	if got := len(rec.snapshot()); got != 0 {
+		t.Fatalf("stall ack emitted during tool wait: %d", got)
+	}
+	// 等待态也不许从队列里摘掉消息：解冻后它必须还能被 drain 取走。
+	if queueLenOf(control) != 1 {
+		t.Fatalf("queued = %d, want 1 (message must survive a legal wait)", queueLenOf(control))
+	}
+}
+
+// spec §5 #11：等审批期间是无响应还是合法静默，必须靠 idlePaused 区分，
+// 不能只看「多久没动静」——人可能一晚上没点那个卡片。
+func TestCoreSteerLivenessWindowSparesApprovalWait(t *testing.T) {
+	oldWindow := steerLivenessWindow
+	steerLivenessWindow = 40 * time.Millisecond
+	t.Cleanup(func() { steerLivenessWindow = oldWindow })
+
+	activity := newAgentAIActivity()
+	activity.setAwaitingApproval(true)
+	defer activity.setAwaitingApproval(false)
+
+	rec := &recordingWriter{}
+	run := agentAIRun{sessionID: "sess-1", runSeq: 1, messageID: "msg-1", activity: activity}
+	control := newAgentAICoreSteerControl(run, rec.write)
+	control.activity = activity
+	control.onStalled = func(string) { t.Error("must not judge dead while an approval is pending") }
+
+	_, _ = control.deliver(agentAISteerMessage{MessageID: "steer-12", Content: "hi"})
+	time.Sleep(150 * time.Millisecond)
+	if got := len(rec.snapshot()); got != 0 {
+		t.Fatalf("stall ack emitted during approval wait: %d", got)
+	}
+	if queueLenOf(control) != 1 {
+		t.Fatalf("queued = %d, want 1 (message must survive approval wait)", queueLenOf(control))
+	}
+}
+
+// spec §5 #12 的对应面：子代理在跑时同样属于合法等待，不能被活性窗判死。
+func TestCoreSteerLivenessWindowSparesSubagentWait(t *testing.T) {
+	oldWindow := steerLivenessWindow
+	steerLivenessWindow = 40 * time.Millisecond
+	t.Cleanup(func() { steerLivenessWindow = oldWindow })
+
+	activity := newAgentAIActivity()
+	activity.activeSubagents.Store(1)
+	defer activity.activeSubagents.Store(0)
+
+	rec := &recordingWriter{}
+	run := agentAIRun{sessionID: "sess-1", runSeq: 1, messageID: "msg-1", activity: activity}
+	control := newAgentAICoreSteerControl(run, rec.write)
+	control.activity = activity
+	control.onStalled = func(string) { t.Error("must not judge dead while a subagent is running") }
+
+	_, _ = control.deliver(agentAISteerMessage{MessageID: "steer-13", Content: "hi"})
+	time.Sleep(150 * time.Millisecond)
+	if got := len(rec.snapshot()); got != 0 {
+		t.Fatalf("stall ack emitted during subagent wait: %d", got)
+	}
+	if queueLenOf(control) != 1 {
+		t.Fatalf("queued = %d, want 1 (message must survive subagent wait)", queueLenOf(control))
+	}
+}
+
+func TestCoreSteerDrainStopsLivenessTimer(t *testing.T) {
+	oldWindow := steerLivenessWindow
+	steerLivenessWindow = 60 * time.Millisecond
+	t.Cleanup(func() { steerLivenessWindow = oldWindow })
+
+	activity := newAgentAIActivity()
+	rec := &recordingWriter{}
+	run := agentAIRun{sessionID: "sess-1", runSeq: 1, messageID: "msg-1", activity: activity}
+	control := newAgentAICoreSteerControl(run, rec.write)
+	control.activity = activity
+	control.onStalled = func(string) { t.Error("drained steer must not be reported stalled") }
+
+	_, _ = control.deliver(agentAISteerMessage{MessageID: "steer-11", Content: "hi"})
+	_ = control.drain()
+	time.Sleep(150 * time.Millisecond)
+
+	for _, p := range rec.snapshot() {
+		if p["code"] == "turn_stalled" {
+			t.Fatalf("unexpected turn_stalled ack: %v", p)
+		}
+	}
+}

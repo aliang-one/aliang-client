@@ -878,6 +878,16 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 	// 通过 coreSteerFor 拿到 control 并使用它，晚赋值会有「已挂载但 activity
 	// 还是 nil」的窗口（nil 安全但丢活性信号）。
 	coreSteer.activity = run.activity
+	coreSteer.onStalled = func(reason string) {
+		if guard := m.runGuardForActivity(run.activity); guard != nil {
+			guard.kill(reason)
+			return
+		}
+		if run.cancel != nil {
+			run.activity.setKillReason(reason)
+			run.cancel()
+		}
+	}
 	m.attachCoreSteer(run.sessionID, run.runSeq, coreSteer)
 
 	// MCP 工具注入（spec §3）：采集→建连→包桥→注册。全部失败也只是空桥，
@@ -1117,6 +1127,11 @@ type agentAICoreSteerControl struct {
 	// activity 用于把「插话被取走」计入 run 活性（spec §3.3.1）：内核 drain 发生
 	// 在下一次 LLM 调用前，那一瞬间说明回合确实活着。
 	activity *agentAIActivity
+	// onStalled 在活性窗超时且回合处于非等待态时被调用（参数是判死原因），
+	// 由 runAgentCore 接到 guardian.kill。nil = 只发失败 ack，不判死。
+	onStalled func(reason string)
+	// pending 记每条排队插话的活性窗计时器，drain/close 时停掉。
+	pending map[string]*time.Timer
 }
 
 func newAgentAICoreSteerControl(run agentAIRun, write agentTerminalWriter) *agentAICoreSteerControl {
@@ -1142,7 +1157,81 @@ func (c *agentAICoreSteerControl) deliver(msg agentAISteerMessage) (string, erro
 		return "not_running", errors.New("agentcore turn ended before steer was applied")
 	}
 	c.queue = append(c.queue, msg)
+	c.armLivenessLocked(msg.MessageID)
 	return "queued", nil
+}
+
+// armLivenessLocked 给一条刚入队的插话起活性窗。调用方必须持有 c.mu。
+//
+// activity 为 nil 时直接不起窗（fail-safe）：没有活性就分不清「死」和「在等
+// 审批」，宁可不判死也不误杀合法等待。生产路径在 attachCoreSteer 之前一定
+// 赋好 activity，所以这只在接线错误时退化。
+func (c *agentAICoreSteerControl) armLivenessLocked(messageID string) {
+	if steerLivenessWindow <= 0 || c.onStalled == nil || c.activity == nil {
+		return
+	}
+	if c.pending == nil {
+		c.pending = make(map[string]*time.Timer)
+	}
+	if timer := c.pending[messageID]; timer != nil {
+		timer.Stop()
+	}
+	c.pending[messageID] = time.AfterFunc(steerLivenessWindow, func() { c.expire(messageID) })
+}
+
+// expire 在活性窗到期时检查插话是否仍未被取走。
+//
+// 仍在队列且回合处于非等待态 → 判死：给手机一条失败 ack（code=turn_stalled），
+// 再触发 guardian 收尾。等待态（工具/子代理/审批）是合法静默，插话继续排队，
+// 由各自天花板 + stale 扫描器收敛，这里不误报（spec §3.3.4）。
+func (c *agentAICoreSteerControl) expire(messageID string) {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
+	// 合法等待态（审批/工具/子代理）是静默，不是死亡：消息必须留在队列里等着
+	// 被 drain 取走，只把这条窗口作废（不重置，避免无限续期）。
+	if c.activity != nil && c.activity.idlePaused() {
+		delete(c.pending, messageID)
+		c.mu.Unlock()
+		return
+	}
+	// 判死即消费：在持锁段把它从队列里摘掉，否则解锁后 drain 可能同一瞬间
+	// 取走它并发一条 applied ack，造成同一 messageID 先 applied 后 error 双帧。
+	stillQueued := false
+	kept := c.queue[:0]
+	for _, item := range c.queue {
+		if item.MessageID == messageID {
+			stillQueued = true
+			continue
+		}
+		kept = append(kept, item)
+	}
+	c.queue = kept
+	delete(c.pending, messageID)
+	write := c.write
+	sessionID := c.sessionID
+	onStalled := c.onStalled
+	c.mu.Unlock()
+
+	if !stillQueued {
+		return
+	}
+	emitAgentAISteerAck(write, sessionID, messageID, "error", "回合无响应已判死，请重试", "turn_stalled")
+	if onStalled != nil {
+		onStalled("steer_stalled")
+	}
+}
+
+// stopLivenessLocked 停掉若干条插话的活性窗。调用方必须持有 c.mu。
+func (c *agentAICoreSteerControl) stopLivenessLocked(ids []string) {
+	for _, id := range ids {
+		if timer := c.pending[id]; timer != nil {
+			timer.Stop()
+			delete(c.pending, id)
+		}
+	}
 }
 
 // drain 取走全部排队插话，转成内核消息，并逐条发 applied ack。
@@ -1161,6 +1250,11 @@ func (c *agentAICoreSteerControl) drain() []agentcore.Message {
 	c.queue = nil
 	write := c.write
 	sessionID := c.sessionID
+	ids := make([]string, 0, len(queued))
+	for _, item := range queued {
+		ids = append(ids, item.MessageID)
+	}
+	c.stopLivenessLocked(ids)
 	c.mu.Unlock()
 
 	out := make([]agentcore.Message, 0, len(queued))
@@ -1218,6 +1312,12 @@ func (c *agentAICoreSteerControl) close(result, errMsg, code string) {
 	queued := c.queue
 	c.queue = nil
 	c.closed = true
+	// 关通道时把所有未到期的活性窗一并停掉：否则已 close 的通道上还会有
+	// AfterFunc 在 180s 后醒来读 c.activity，造成无谓的判定与日志。
+	for id, timer := range c.pending {
+		timer.Stop()
+		delete(c.pending, id)
+	}
 	c.mu.Unlock()
 	for _, item := range queued {
 		emitAgentAISteerAck(c.write, c.sessionID, item.MessageID, result, errMsg, code)
