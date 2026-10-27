@@ -1818,7 +1818,7 @@ func (s *AgentService) callAgentServerWithAuthorization(method string, endpoint 
 	if endpoint == "" {
 		return nil, errors.New("agent server endpoint is empty")
 	}
-	if !agentChannelHealthInstance.allow(endpoint) {
+	if !agentChannelHealthInstance.allow(endpoint, authHeader) {
 		return nil, agentChannelBackoffError{endpoint: sanitizeAgentEndpoint(endpoint)}
 	}
 
@@ -1833,19 +1833,32 @@ func (s *AgentService) callAgentServerWithAuthorization(method string, endpoint 
 	}
 
 	// 401：本地续期一次再重试一次（spec §3.4.1）。
-	//
-	// 刻意不用 RequestUserAgentSyncAfterAuth：那条路自己会走
-	// callAgentServer 的注册路径，同步调用会在这里递归。本地刷新 token
-	// 不经过 server 调用，安全。
+	// 刻意不用 RequestUserAgentSyncAfterAuth：那条路自己会走 callAgentServer 的
+	// 注册路径，同步调用会在这里递归。本地刷新 token 不经过 server 调用，安全。
+	rejectedAuth := authHeader
 	fresh, refreshErr := agentChannelRefreshHeader()
 	if refreshErr == nil && strings.TrimSpace(fresh) != "" && strings.TrimSpace(fresh) != strings.TrimSpace(authHeader) {
-		if raw2, err2 := s.doCallAgentServer(method, endpoint, payload, fresh); err2 == nil {
+		raw2, err2 := s.doCallAgentServer(method, endpoint, payload, fresh)
+		if err2 == nil {
 			agentChannelHealthInstance.recordSuccess(endpoint)
 			logger.Info(fmt.Sprintf("[AGENT-CHANNEL] 401 recovered after refresh endpoint=%s", sanitizeAgentEndpoint(endpoint)))
 			return raw2, nil
 		}
+		var rejected2 agentUserAuthRejectedError
+		if !errors.As(err2, &rejected2) {
+			// 第二次失败不是凭据问题（网络/服务端异常），不能记成 401：
+			// 否则会把网络抖动算进凭据退避，还会触发误导性的「凭据过期」告警。
+			return nil, err2
+		}
+		rejectedAuth = fresh
+	} else if refreshErr != nil {
+		logger.Warn(fmt.Sprintf("[AGENT-CHANNEL] 401 本地续期失败，不重试 endpoint=%s: %v",
+			sanitizeAgentEndpoint(endpoint), refreshErr))
+	} else {
+		logger.Warn(fmt.Sprintf("[AGENT-CHANNEL] 401 续期未轮转凭据（token 未临近过期，或被服务端吊销但未过期），不重试 endpoint=%s",
+			sanitizeAgentEndpoint(endpoint)))
 	}
-	agentChannelHealthInstance.record401(endpoint)
+	agentChannelHealthInstance.record401(endpoint, rejectedAuth)
 	return nil, err
 }
 

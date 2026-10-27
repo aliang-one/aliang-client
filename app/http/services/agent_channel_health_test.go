@@ -1,6 +1,7 @@
 package services
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -9,6 +10,12 @@ import (
 
 func TestCallAgentServerRetriesOnceWithRefreshedHeader(t *testing.T) {
 	agentChannelHealthInstance.reset()
+	oldWriter := agentChannelAlertWriter
+	agentChannelAlertWriter = func(map[string]interface{}) error { return nil }
+	t.Cleanup(func() {
+		agentChannelAlertWriter = oldWriter
+		agentChannelHealthInstance.reset()
+	})
 
 	var calls int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -40,8 +47,16 @@ func TestCallAgentServerRetriesOnceWithRefreshedHeader(t *testing.T) {
 
 func TestCallAgentServerSetsEndpointBackoffAfterRepeated401(t *testing.T) {
 	agentChannelHealthInstance.reset()
+	oldWriter := agentChannelAlertWriter
+	agentChannelAlertWriter = func(map[string]interface{}) error { return nil }
+	t.Cleanup(func() {
+		agentChannelAlertWriter = oldWriter
+		agentChannelHealthInstance.reset()
+	})
 
+	var calls int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
 		w.WriteHeader(http.StatusUnauthorized)
 	}))
 	defer srv.Close()
@@ -54,7 +69,43 @@ func TestCallAgentServerSetsEndpointBackoffAfterRepeated401(t *testing.T) {
 	for i := 0; i < agentChannelAlertThreshold; i++ {
 		_, _ = svc.callAgentServerWithAuthorization(http.MethodPost, srv.URL, nil, "Bearer stale")
 	}
-	if agentChannelHealthInstance.allow(srv.URL) {
+	if agentChannelHealthInstance.allow(srv.URL, "Bearer stale") {
 		t.Fatal("endpoint must be in backoff after repeated 401")
+	}
+	// 门面的 allow 闸门必须承重：首个 401 落退避后，循环内第 2、3 次已被闸门
+	// 挡下（上游只收到 1 次请求），此处再经门面调用必须被 typed 退避错误直接
+	// 拒绝，且上游计数不得增加。
+	hitsAfterLoop := atomic.LoadInt32(&calls)
+	_, err := svc.callAgentServerWithAuthorization(http.MethodGet, srv.URL, nil, "Bearer stale")
+	var backoff agentChannelBackoffError
+	if !errors.As(err, &backoff) {
+		t.Fatalf("err = %v, want agentChannelBackoffError", err)
+	}
+	if hits := atomic.LoadInt32(&calls); hits != hitsAfterLoop {
+		t.Fatalf("upstream calls = %d, want %d（退避期内不得再发请求）", hits, hitsAfterLoop)
+	}
+}
+
+func TestAgentChannelBackoffBypassedAfterCredentialRotation(t *testing.T) {
+	agentChannelHealthInstance.reset()
+	oldWriter := agentChannelAlertWriter
+	agentChannelAlertWriter = func(map[string]interface{}) error { return nil }
+	t.Cleanup(func() {
+		agentChannelAlertWriter = oldWriter
+		agentChannelHealthInstance.reset()
+	})
+
+	const endpoint = "https://api.example.com/rotated"
+	for i := 0; i < agentChannelAlertThreshold; i++ {
+		agentChannelHealthInstance.record401(endpoint, "Bearer stale")
+	}
+	if agentChannelHealthInstance.allow(endpoint, "Bearer stale") {
+		t.Fatalf("同凭据仍应被退避挡住")
+	}
+	if !agentChannelHealthInstance.allow(endpoint, "Bearer fresh") {
+		t.Fatalf("凭据轮转后应放行")
+	}
+	if !agentChannelHealthInstance.allow(endpoint, "Bearer stale") {
+		t.Fatalf("放行后应清掉该端点退避")
 	}
 }

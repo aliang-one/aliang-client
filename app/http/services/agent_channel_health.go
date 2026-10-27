@@ -1,8 +1,11 @@
 package services
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -38,6 +41,9 @@ var agentChannelRefreshHeader = func() (string, error) {
 type agentChannelEndpointState struct {
 	consecutive int
 	nextAt      time.Time
+	// authFingerprint 是触发退避时所用 Authorization 头的指纹（不是原文）。
+	// 只用于识别「凭据已轮转，旧退避作废」，不足以还原凭据。
+	authFingerprint string
 }
 
 // agentChannelHealth 汇总平台 REST 通道的健康状态：连续 401 计数、端点退避、
@@ -53,7 +59,10 @@ type agentChannelHealth struct {
 var agentChannelHealthInstance = &agentChannelHealth{}
 
 // allow 判断这个 endpoint 当前是否允许发请求（处于退避窗口内则拒绝）。
-func (h *agentChannelHealth) allow(endpoint string) bool {
+//
+// 若当前凭据与触发退避时的凭据不同，说明用户已重新登录/续期，退避立即
+// 作废：否则告警引导用户重新登录后，注册仍会被残余退避挡住最多一个窗口。
+func (h *agentChannelHealth) allow(endpoint string, authHeader string) bool {
 	if h == nil {
 		return true
 	}
@@ -63,12 +72,26 @@ func (h *agentChannelHealth) allow(endpoint string) bool {
 	if state == nil || state.nextAt.IsZero() {
 		return true
 	}
+	if agentChannelAuthFingerprint(authHeader) != state.authFingerprint {
+		delete(h.endpoints, endpoint)
+		return true
+	}
 	return !time.Now().Before(state.nextAt)
+}
+
+// agentChannelAuthFingerprint 取 Authorization 头的短指纹（8 字节），只做相等比较。
+func agentChannelAuthFingerprint(header string) string {
+	header = strings.TrimSpace(header)
+	if header == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(header))
+	return hex.EncodeToString(sum[:8])
 }
 
 // record401 记一次 401：推进端点指数退避，并在「连续 ≥3 次」或「持续 >5min」
 // 时发一条限频告警。
-func (h *agentChannelHealth) record401(endpoint string) {
+func (h *agentChannelHealth) record401(endpoint string, authHeader string) {
 	if h == nil {
 		return
 	}
@@ -87,6 +110,7 @@ func (h *agentChannelHealth) record401(endpoint string) {
 		h.endpoints[endpoint] = state
 	}
 	state.consecutive++
+	state.authFingerprint = agentChannelAuthFingerprint(authHeader)
 	backoff := agentChannelBackoffBase << (state.consecutive - 1)
 	if backoff > agentChannelBackoffMax || backoff <= 0 {
 		backoff = agentChannelBackoffMax
