@@ -417,6 +417,13 @@ func parseSSE(ctx context.Context, r io.Reader, onEvent func(StreamEvent) error)
 					return &eventAbortError{cause: err}
 				}
 			}
+			// message_stop 是协议的终止帧。此时整轮内容已经收全，若上游把数据
+			// 发完却不关连接（半开最常见的一种形态），继续读只会被块间空闲闸
+			// 判成停滞，把一个成功的回合误报成失败；而上游若一直补 ping 保活，
+			// ping 会不断续命、永远等不到 EOF。收到终点帧即视为流结束。
+			if ev.Type == "message_stop" {
+				return nil
+			}
 			continue
 		}
 

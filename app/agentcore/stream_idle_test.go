@@ -85,11 +85,22 @@ func TestStreamDoesNotRetryOnStreamStall(t *testing.T) {
 	defer srv.Close()
 
 	c := NewClient(srv.URL).WithStreamIdleTimeout(60 * time.Millisecond)
-	err := c.Stream(context.Background(), &MessagesRequest{
-		Model:     "x",
-		MaxTokens: 16,
-		Messages:  []Message{{Role: "user", Content: "hi"}},
-	}, func(StreamEvent) error { return nil })
+
+	done := make(chan error, 1)
+	go func() {
+		done <- c.Stream(context.Background(), &MessagesRequest{
+			Model:     "x",
+			MaxTokens: 16,
+			Messages:  []Message{{Role: "user", Content: "hi"}},
+		}, func(StreamEvent) error { return nil })
+	}()
+
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stream did not return on a stalled upstream; idle guard missing or ineffective")
+	}
 
 	var idleErr *streamIdleError
 	if !errors.As(err, &idleErr) {
@@ -97,5 +108,42 @@ func TestStreamDoesNotRetryOnStreamStall(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&hits); got != 1 {
 		t.Fatalf("upstream hits = %d, want 1 (stream stall must not retry)", got)
+	}
+}
+
+func TestStreamCompletesWhenConnectionStaysOpenAfterMessageStop(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		f, _ := w.(http.Flusher)
+		_, _ = w.Write([]byte("data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"x\"}}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"message_stop\"}\n\n"))
+		if f != nil {
+			f.Flush()
+		}
+		// 数据发完但连接不关：半开。
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL).WithStreamIdleTimeout(60 * time.Millisecond)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- c.Stream(context.Background(), &MessagesRequest{
+			Model:     "x",
+			MaxTokens: 16,
+			Messages:  []Message{{Role: "user", Content: "hi"}},
+		}, func(StreamEvent) error { return nil })
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Stream error = %v, want nil (turn already complete at message_stop)", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stream did not return after message_stop; idle guard must not be the exit path")
 	}
 }
