@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"aliang.one/nursorgate/app/agentcore"
@@ -32,6 +33,14 @@ const (
 	// 建连超时后等待迟到 dial 返回的宽限窗：返回的会话就地关闭（收尸），
 	// 防止孤儿 stdio 进程/连接泄漏。
 	agentCoreMCPDialDrainGrace = 2 * time.Second
+
+	// agentCoreMCPDialConcurrency 是并发建连的并发度。
+	//
+	// 串行 dial 的尾延迟是乘法：单个 server 卡满 10s 超时，24 个就是 4 分钟
+	// 的 run 启动空窗（用户看到的是「消息发出去了，几分钟没反应」）。并发后
+	// 每个 server 仍各自拿满 10s，墙钟只按批算。并发度有界，避免一次性炸开
+	// 一堆子进程把机器拖住。
+	agentCoreMCPDialConcurrency = 8
 )
 
 // agentCoreMCPRawServer 是一条未脱敏的 server 配置（连接用）。
@@ -390,43 +399,96 @@ func (m *agentAIManager) agentCoreMCPServerToolDefs(ctx context.Context, raws []
 	logInjected := func() {
 		logger.Info(fmt.Sprintf("agentcore-mcp: 注入 %d 个 MCP 工具（cap %d）", len(bridges), agentCoreMCPToolCap))
 	}
-	for _, raw := range raws {
+
+	// 预筛：带自定义 headers 的 http/sse 条目 v1 不支持，直接跳过（不 dial）。
+	targets := make([]int, 0, len(raws))
+	for i, raw := range raws {
 		isHTTP := strings.EqualFold(raw.Type, "http") || strings.EqualFold(raw.Type, "sse")
 		if isHTTP && len(raw.Headers) > 0 {
 			skipped++
 			logger.Warn(fmt.Sprintf("agentcore-mcp: server 跳过 server=%s reason=headers 暂不支持（v1 限制）", sanitizeAgentCoreMCPSegment(raw.Name)))
 			continue
 		}
-		sctx, cancel := context.WithCancel(ctx)
-		// 测试注入优先：内存 session 替真 dial（忽略 raw）；nil 走真实路径。
-		dial := agentCoreMCPDial
-		if m != nil && m.coreMCPDialForTest != nil {
-			dial = m.coreMCPDialForTest
-		}
-		session, closeFn, err := agentCoreMCPDialWithTimeout(dial, sctx, raw, agentCoreMCPInitTimeout)
-		if err != nil {
-			fail(raw.Name, err)
-			cancel()
+		targets = append(targets, i)
+	}
+
+	// 测试注入优先：内存 session 替真 dial（忽略 raw）；nil 走真实路径。
+	dial := agentCoreMCPDial
+	if m != nil && m.coreMCPDialForTest != nil {
+		dial = m.coreMCPDialForTest
+	}
+
+	// ---- 阶段一：并发建连 + 枚举工具清单 ----
+	//
+	// 每个 server 仍拿满自己的 agentCoreMCPInitTimeout（不共享预算——共享预算
+	// 会把排后的 server 压到趋零，见上方超时口径注记），并发只把 24 份 10s
+	// 从「相加」变成「按批」：全挂死时 run 启动从最坏 4 分钟降到半分钟级。
+	type dialOutcome struct {
+		raw     agentCoreMCPRawServer
+		session *mcp.ClientSession
+		closeFn func()
+		tools   []*mcp.Tool
+		err     error
+	}
+	outcomes := make([]dialOutcome, len(targets))
+	sem := make(chan struct{}, agentCoreMCPDialConcurrency)
+	var wg sync.WaitGroup
+	for k, idx := range targets {
+		wg.Add(1)
+		go func(k, idx int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			raw := raws[idx]
+			sctx, cancel := context.WithCancel(ctx)
+			session, closeFn, err := agentCoreMCPDialWithTimeout(dial, sctx, raw, agentCoreMCPInitTimeout)
+			if err != nil {
+				cancel()
+				outcomes[k] = dialOutcome{raw: raw, err: err}
+				return
+			}
+			// ListTools 用独立短 ctx：只裁这一次 RPC（SSE 的请求走独立 POST，
+			// 取消它不影响 GET 长流），不触碰会话 ctx。
+			lctx, lcancel := context.WithTimeout(ctx, agentCoreMCPInitTimeout)
+			tools, terr := listAgentCoreMCPTools(lctx, session)
+			lcancel()
+			outcomes[k] = dialOutcome{
+				raw: raw, session: session, tools: tools, err: terr,
+				closeFn: func() {
+					closeFn()
+					cancel()
+				},
+			}
+		}(k, idx)
+	}
+	wg.Wait()
+
+	// ---- 阶段二：按原始顺序装配工具 ----
+	// 并发建连不改变工具表顺序：顺序变了上游 prompt 缓存全部失效。
+	capped := false
+	for _, out := range outcomes {
+		if out.err != nil {
+			fail(out.raw.Name, out.err)
+			if out.closeFn != nil {
+				// 会话已建好但枚举失败：就地连开关停，不必等 run 结束。
+				out.closeFn()
+			}
 			continue
 		}
-		closes = append(closes, func() { closeFn(); cancel() })
-		// ListTools 用独立短 ctx：只裁这一次 RPC（SSE 的请求走独立 POST，
-		// 取消它不影响 GET 长流），不触碰会话 ctx。
-		lctx, lcancel := context.WithTimeout(ctx, agentCoreMCPInitTimeout)
-		tools, err := listAgentCoreMCPTools(lctx, session)
-		lcancel()
-		if err != nil {
-			fail(raw.Name, err)
-			continue
+		if out.closeFn != nil {
+			// 成功路径不 cancel：session 生命周期交给 closeAll（closeFn 内一并
+			// cancel，见上）。先登记，保证工具截断提前结束时也不泄漏会话。
+			closes = append(closes, out.closeFn)
 		}
 		connected++
-		// 成功路径不 cancel：session 生命周期交给 closeAll（closeFn 内一并
-		// cancel，见上）。
-		for _, tool := range tools {
+		if capped {
+			continue
+		}
+		for _, tool := range out.tools {
 			if len(bridges) >= agentCoreMCPToolCap {
+				capped = true
 				logger.Warn(fmt.Sprintf("agentcore-mcp: 工具超上限截断 cap=%d", agentCoreMCPToolCap))
-				logInjected()
-				return bridges, closeAll
+				break
 			}
 			schema, _ := tool.InputSchema.(map[string]interface{})
 			if schema == nil {
@@ -439,8 +501,8 @@ func (m *agentAIManager) agentCoreMCPServerToolDefs(ctx context.Context, raws []
 				desc = desc[:agentCoreMCPDescCap]
 			}
 			bridges = append(bridges, &agentCoreMCPBridge{
-				session: session, rawTool: tool.Name,
-				name:        agentCoreMCPBridgeName(raw.Name, tool.Name, seen),
+				session: out.session, rawTool: tool.Name,
+				name:        agentCoreMCPBridgeName(out.raw.Name, tool.Name, seen),
 				description: desc, schema: schema, onCall: onCall,
 			})
 		}

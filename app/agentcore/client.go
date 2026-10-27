@@ -41,8 +41,18 @@ const (
 	// maxRetryDelay 是退避上限（同时兜住 Retry-After 的离谱值）。
 	maxRetryDelay = 30 * time.Second
 
-	// defaultMaxTokens 是请求体没指定时的上限。
-	defaultMaxTokens = 8192
+	// defaultMaxTokens 是请求体没指定时的输出上限。
+	//
+	// 宿主从不设置 MaxTokens，所以这个默认值就是线上真实生效的值。曾经是
+	// 8192：一次写大文件（几百行）的 tool_use 会被 in-band 截断成
+	// stop_reason=max_tokens，而内核见到被截断的 tool_use 会把**整批**工具
+	// 调用丢掉（宁可重试也不执行半个参数），用户看到的是「AI 说写好了」但
+	// 文件没变、或者干脆一轮白跑。32000 覆盖主流模型的输出上限，仍低于最
+	// 保守的 4k/8k 档，后者由 maxTokensFallback 兜底降级。
+	defaultMaxTokens = 32000
+
+	// minMaxTokens 是降级重试的下限：老模型/小模型常见的输出上限。
+	minMaxTokens = 8192
 
 	// sseMaxLineBytes 是单行 SSE 的上限。上游的 input_json_delta 可能很长
 	// （大文件的 tool_use 参数），给足余量。
@@ -172,6 +182,14 @@ func (c *Client) Stream(ctx context.Context, req *MessagesRequest, onEvent func(
 		if errors.As(err, &abort) {
 			return abort.cause
 		}
+		// 各模型的输出上限不同：defaultMaxTokens（32000）遇到只支持 8k/16k
+		// 的模型会被直接 400。与其整轮失败，不如降到保守值重试——线上用户
+		// 要的是回复，不关心单次输出上限的具体数字。
+		if reduced, ok := reduceMaxTokens(err, req.MaxTokens); ok {
+			req.MaxTokens = reduced
+			lastErr = err
+			continue
+		}
 		if !isRetryable(err) {
 			return err
 		}
@@ -280,6 +298,66 @@ func isRetryable(err error) bool {
 	}
 	// 连接重置 / EOF / 超时都属于瞬态。
 	return true
+}
+
+// reduceMaxTokens 判断这次失败是否为「max_tokens 超出模型输出上限」，是则
+// 返回下一个可试的保守值。逐次减半、不低于 minMaxTokens，降到下限后不再
+// 提供新的值（ok=false，让上层的失败路径收尾，避免死循环重试同一个 400）。
+func reduceMaxTokens(err error, current int) (int, bool) {
+	if current <= minMaxTokens {
+		return 0, false
+	}
+	// 限流 / 过载也会提到 token，但那是容量问题，降上限没用。
+	if !mentionsMaxTokens(err) {
+		return 0, false
+	}
+	next := current / 2
+	if next < minMaxTokens {
+		next = minMaxTokens
+	}
+	return next, true
+}
+
+// mentionsMaxTokens 只看 4xx（以及 2xx 内信封）里明确指向输出上限的错误文本。
+func mentionsMaxTokens(err error) bool {
+	var statusErr *httpStatusError
+	if errors.As(err, &statusErr) {
+		if statusErr.status != http.StatusBadRequest &&
+			statusErr.status != http.StatusUnprocessableEntity {
+			return false
+		}
+		return maxTokensPhrase(statusErr.body)
+	}
+	var upErr *upstreamError
+	if errors.As(err, &upErr) {
+		switch strings.TrimSpace(upErr.kind) {
+		case "rate_limit_error", "overloaded_error":
+			return false
+		}
+		return maxTokensPhrase(upErr.message + " " + upErr.body)
+	}
+	return false
+}
+
+func maxTokensPhrase(s string) bool {
+	m := strings.ToLower(s)
+	for _, needle := range []string{
+		"max_tokens",
+		"max tokens",
+		"max output",
+		"max_output",
+		"maximum output",
+		"output token",
+		"output len",
+		"最大输出",
+		"输出上限",
+		"输出长度",
+	} {
+		if strings.Contains(m, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 // retryDelay 计算退避时长，优先尊重上游的 Retry-After。

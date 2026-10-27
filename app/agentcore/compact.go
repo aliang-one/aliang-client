@@ -40,12 +40,17 @@ const (
 	// （剩下一半留给摘要输出与 system prompt）。
 	compactTranscriptRatioDen = 2
 
-	// compactSummaryMaxTokens 是摘要回复的输出上限。
-	compactSummaryMaxTokens = 4096
+	// compactSummaryMaxTokens 是摘要回复的输出上限。4096 对长会话太紧：早
+	// 期上下文（文件路径、已排除的方案、用户明确要求）一多，摘要在中途就
+	// 被截断，丢掉的正是压缩最该保住的部分。8192 覆盖正常摘要长度；遇到
+	// 输出上限更低的模型，客户端会按上游 400 自动降级重试。
+	compactSummaryMaxTokens = 8192
 
 	// maxAutoCompactsPerRun 防止「刚压完又超限」的抖动在单次 run 里反复烧
-	// 摘要请求。
-	maxAutoCompactsPerRun = 4
+	// 摘要请求。4 次对 200 回合的长任务太少了：一次压缩只腾出约 3/4 窗口，
+	// 长任务很快又填满，撞到上限后就不再压缩、直到被上游拒绝。10 次仍能
+	// 兜住抖动，同时让长任务走完全程。
+	maxAutoCompactsPerRun = 10
 
 	// compactRenderEntryMaxChars 限制单条消息进摘要请求的长度：一条巨大的
 	// 工具输出不该吃掉整个摘要预算。

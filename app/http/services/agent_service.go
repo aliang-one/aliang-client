@@ -83,7 +83,10 @@ var (
 	sharedAgentServiceMu sync.Mutex
 	sharedAgentService   *AgentService
 
-	localUserAgentBaseURL = UserAgentBaseURL
+	// localUserAgentBaseURL 是本进程所有 user-agent 出站请求的基地址。
+	// 惰性求值：测试二进制要等包 init 之后才注册 testing 标志，init 期间判定
+	// 会漏掉，必须在调用时判断（见 resolveLocalUserAgentBaseURL）。
+	localUserAgentBaseURL = func() string { return resolveLocalUserAgentBaseURL(runningUnderGoTest()) }
 
 	// sessionOwnerAddrOverride 显式覆盖的 owner dashboard 基地址。管理面板
 	// 端口回退（默认端口被占用改听随机端口）时由 http server 回灌真实监听
@@ -1533,14 +1536,15 @@ func detectAgentToolsWith(lookPath func(string) (string, error)) []models.AgentT
 	// lookPath 循环之后——放进去会因找不到二进制而 Available=false；也不能进
 	// 版本/effort 探测循环，probeCLIVersion("") 会白跑一次。
 	//
-	// Efforts 留空：内核首期不传达 effort（模型名后缀是 codex 专用约定，网关
-	// 不解析带后缀的 claude 模型名；--effort 是 claude CLI 的 argv，进程内内核
-	// 没有）。上报一份用不上的档位只会让手机上的 effort 选择器骗人。
+	// Efforts 必须上报：内核从 2026-10-26 起经请求体 output_config.effort 传达
+	// 档位（low/medium/high/xhigh/max，ultracode 归一为 max）。留空的话手机端
+	// clampEffortToSupported 会把用户选的档静默降成默认，选择器又变成装饰。
 	defs = append(defs, models.AgentTool{
 		ID:          "agentcore",
 		Name:        "Aliang Agent",
 		Description: "内置 AI Agent（无需安装外部 CLI）",
 		Available:   true,
+		Efforts:     agentToolEffortLevels("agentcore", ""),
 	})
 	return defs
 }

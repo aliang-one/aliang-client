@@ -44,10 +44,13 @@ var globalEffortLadder = []string{"ultracode", "max", "xhigh", "high", "medium",
 // staticEffortLevelsByCLI 无运行时探针的 CLI 用静态清单:
 //   - codex:effort 经 <base>-<effort> 模型名后缀传达(见 applyCodexEffortSuffix),
 //     传输层合法集即 endsWithKnownAgentEffortSuffix 的后缀表;
-//   - opencode:effort 映射 --variant,沿用服务端目录三档。
+//   - opencode:effort 映射 --variant,沿用服务端目录三档;
+//   - agentcore:进程内内核,effort 经请求体 output_config.effort 下发。
+//     ultracode 是手机端阶梯的最高档,内核归一为 max 后再发(上游没这个档)。
 var staticEffortLevelsByCLI = map[string][]string{
-	"codex":    {"none", "minimal", "low", "medium", "high", "xhigh", "extrahigh", "max"},
-	"opencode": {"low", "medium", "high"},
+	"codex":     {"none", "minimal", "low", "medium", "high", "xhigh", "extrahigh", "max"},
+	"opencode":  {"low", "medium", "high"},
+	"agentcore": {"low", "medium", "high", "xhigh", "max", "ultracode"},
 }
 
 var (
@@ -353,6 +356,8 @@ func agentToolEffortLevels(id, path string) []string {
 		return append([]string(nil), staticEffortLevelsByCLI["codex"]...)
 	case "opencode":
 		return append([]string(nil), staticEffortLevelsByCLI["opencode"]...)
+	case "agentcore":
+		return append([]string(nil), staticEffortLevelsByCLI["agentcore"]...)
 	default:
 		return nil
 	}

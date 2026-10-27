@@ -356,6 +356,13 @@ func agentCoreIsGitRepo(projectPath string) bool {
 // 首期不接 goal 的 task-report prompt（withGoalTaskReportSystemPrompt 只能
 // 改 agentAITool，不适用于进程内内核）；goal 任务请继续用 CLI provider。
 func agentCoreSystemPrompt(projectPath string) string {
+	return agentCoreSystemPromptWithContext(projectPath, "")
+}
+
+// agentCoreSystemPromptWithContext 在基础 system prompt 后追加会话级上下文
+// （system 角色历史，如 initial_context）。子 agent 调 agentCoreSystemPrompt：
+// 它继承主 run 的身份与环境说明，但不该继承会话初始上下文。
+func agentCoreSystemPromptWithContext(projectPath, sessionContext string) string {
 	var b strings.Builder
 	b.WriteString("You are Aliang Agent, a coding assistant running inside the Aliang remote agent. ")
 	b.WriteString("You work directly in the user's project directory and can read, write and edit files, ")
@@ -382,6 +389,16 @@ func agentCoreSystemPrompt(projectPath string) string {
 	fmt.Fprintf(&b, "Today's date: %s\n", time.Now().Format("2006-01-02"))
 	b.WriteString("</env>\n\n")
 
+	// 会话初始上下文（fork 快照 / goal 上下文 / 其它 system 角色历史）。
+	// CLI 通道由 buildAgentAIPrompt 以 "System: ..." 留在对话里；内核的
+	// messages 收不了 system 角色，只能挂到 system prompt 上，否则这一通道
+	// 上初始上下文等于不存在。
+	if ctx := strings.TrimSpace(sessionContext); ctx != "" {
+		b.WriteString("<session-context>\n")
+		b.WriteString(ctx)
+		b.WriteString("\n</session-context>\n\n")
+	}
+
 	b.WriteString(agentAIOptionSystemPrompt)
 	return b.String()
 }
@@ -407,7 +424,7 @@ func agentCoreSystemPrompt(projectPath string) string {
 //
 // 图片为什么不能只靠清单里的路径：内核的 read 工具是**文本**工具，模型照着
 // 路径读回来的是「看起来是二进制文件，拒绝读取」。清单对图片等于没给。
-func (m *agentAIManager) agentCoreMessages(run agentAIRun) []agentcore.Message {
+func (m *agentAIManager) agentCoreMessages(run agentAIRun) ([]agentcore.Message, string) {
 	m.mu.Lock()
 	session := m.sessions[run.sessionID]
 	var history []agentAIMessage
@@ -417,6 +434,9 @@ func (m *agentAIManager) agentCoreMessages(run agentAIRun) []agentcore.Message {
 	m.mu.Unlock()
 
 	msgs, texts := agentCoreMessagesFromHistory(history)
+	// 与 messages 用同一份快照：system 角色历史（initial_context）走 System
+	// 字段，见 agentCoreSystemContextFromHistory。
+	sessionContext := agentCoreSystemContextFromHistory(history)
 
 	// 图片附件 → image 块。这里的 run.attachments 在 runCLI 里已经下载过
 	// （downloadAgentAIAttachments 设了 Path 并清掉 URL），所以不再下载一次。
@@ -455,7 +475,7 @@ func (m *agentAIManager) agentCoreMessages(run agentAIRun) []agentcore.Message {
 	if len(imageBlocks) > 0 {
 		msgs = attachAgentCoreImageBlocks(msgs, imageBlocks)
 	}
-	return msgs
+	return msgs, sessionContext
 }
 
 // agentCoreMessagesFromHistory 把宿主历史条目转成内核消息。
@@ -472,16 +492,42 @@ func agentCoreMessagesFromHistory(history []agentAIMessage) ([]agentcore.Message
 		role := strings.ToLower(strings.TrimSpace(item.Role))
 		if role != "user" && role != "assistant" {
 			// 内核只认 user/assistant；其它角色（system 之类）由 System 字段
-			// 承载，塞进 messages 会被上游拒绝。
+			// 承载（见 agentCoreSystemContextFromHistory）。
 			continue
 		}
-		if strings.TrimSpace(item.Content) == "" {
+		// 剥掉回灌进来的手机契约块：它只该在注入帧里出现一次，跟着历史进
+		// messages 会变成模型自己给自己重复下指令。
+		content := stripAgentAIPhoneContract(item.Content)
+		if strings.TrimSpace(content) == "" {
 			continue
 		}
-		msgs = append(msgs, agentcore.TextMessage(role, item.Content))
-		texts = append(texts, item.Content)
+		msgs = append(msgs, agentcore.TextMessage(role, content))
+		texts = append(texts, content)
 	}
 	return msgs, texts
+}
+
+// agentCoreSystemContextFromHistory 收集 system 角色的历史内容，交给内核的
+// Config.System 承载。
+//
+// 内核的 messages 只收 user/assistant（上游会拒绝 system 角色），但 system
+// 角色的历史不是噪音：ai.session.create / ai.run.start 的 initial_context
+// （fork 快照、goal 重规划上下文）就以 role=system 存在历史首部。CLI 通道
+// 靠 buildAgentAIPrompt 把它渲染成 "System: ..." 留在对话里，内核通道此前
+// 直接丢弃 —— 手机新建会话的初始上下文在 AgentCore 上等于不存在。
+func agentCoreSystemContextFromHistory(history []agentAIMessage) string {
+	var parts []string
+	for _, item := range history {
+		if strings.ToLower(strings.TrimSpace(item.Role)) != "system" {
+			continue
+		}
+		content := stripAgentAIPhoneContract(item.Content)
+		if strings.TrimSpace(content) == "" {
+			continue
+		}
+		parts = append(parts, content)
+	}
+	return strings.Join(parts, "\n\n")
 }
 
 // agentCoreHistoryFromMessages 是 agentCoreMessagesFromHistory 的逆变换：
@@ -890,7 +936,7 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		return
 	}
 
-	messages := m.agentCoreMessages(run)
+	messages, sessionContext := m.agentCoreMessages(run)
 	if len(messages) == 0 {
 		endErrMsg = "会话没有可发送的消息"
 		_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, fmt.Errorf("会话没有可发送的消息")))
@@ -1065,7 +1111,7 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 	cfg := &agentcore.Config{
 		Client:    kernelClient,
 		Model:     agentCoreModel(run),
-		System:    agentCoreSystemPrompt(run.projectPath),
+		System:    agentCoreSystemPromptWithContext(run.projectPath, sessionContext),
 		Tools:     registry,
 		SessionID: kernelSessionID,
 		// 会话的 effort 档位（手机选档 → server 透传 → 这里进请求体）。

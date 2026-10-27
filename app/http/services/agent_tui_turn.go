@@ -508,7 +508,9 @@ func (m *agentAIManager) runTUITurn(ctx context.Context, session *agentAISession
 
 	// 3) 注入。内容 = 原始用户文本 + 本地附件清单 + 明确的 Read 指令。
 	// 走 ccPeerDialInject 旋钮（与 tuiSync 一致），测试才能拦截注入动作。
-	injectText := content + agentAITUIAttachmentPromptSuffix(attachments)
+	// 手机行为契约只加在注入帧上（TUI 里的 CC 看不到宿主设置，这是唯一能
+	// 影响它的通道）；上面 history 落的是原文，不回放契约。
+	injectText := wrapAgentAIPhoneContractForSurface(run.surface, content) + agentAITUIAttachmentPromptSuffix(attachments)
 	if err := ccPeerDialInject(plan.SocketPath, plan.PeerToken, injectText, plan.FromMode); err != nil {
 		fail(agentTUIErrInjectFailed, "无法把消息送进终端会话")
 		return

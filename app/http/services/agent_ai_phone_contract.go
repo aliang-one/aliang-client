@@ -2,20 +2,30 @@ package services
 
 import "strings"
 
-// 手机驱动回合的行为契约（2026-10-26 手机行为契约设计）。
+// 手机驱动回合的行为契约（2026-10-26 手机行为契约设计；2026-10-27 收窄为
+// TUI 注入专用）。
 //
 // server 随 ai.run.start / ai.message / ai.steer 下发 surface:"phone"（字段
-// 缺省 = TUI 通道，零变化）。phone 回合在最后一公里把契约包进 prompt/插话：
+// 缺省 = TUI 通道，零变化）。契约只在「手机消息跨进程注入正在运行的 TUI」
+// 这一条通道上随文本下发，共三处：
 //
-//   - 新回合：runUserMessage 里包 freshPrompt / resume content / TUI 路由
-//     的原始 content（三路 provider 共用这一个闸口）；
-//   - 插话：steer() 里包 steer.Content（claude/codex/agentcore 三个 control
-//     共用）；外部 TUI 活进程插话（externalSteerAttempt）同样包——那是唯一
-//     能影响 TUI 内 CC 行为的通道；
-//   - 硬拦：claudeApprovalHookSettings 给 settings.permissions.deny 追加
-//     AskUserQuestion，CC 直接拒绝并回执原因，模型自纠，不再静默悬死。
+//   - 新回合注入 TUI：runUserMessage 的 TUI 路由 → runTUITurn；
+//   - 回合中插话注册表内 TUI：steer() 的 session.tuiTurn 分支 → steerTUITurn；
+//   - 外部活 TUI 插话：externalSteerAttempt（会话不在注册表）。
 //
-// 契约只走文本不落盘：TUI 自己打字的回合不带 surface，提示永远不会出现。
+// 这三处的共性是 TUI 里的 CC 是另一个进程，看不见宿主 agent 的权限配置，
+// 注入文本是唯一能影响它行为的通道。
+//
+// headless 通道（claude -p / codex / agentcore）一律不注入本契约：它们由宿主
+// 自己拉起，行为约束走 settings.permissions.deny（硬拦 AskUserQuestion）与
+// --append-system-prompt 的 agentAIOptionSystemPrompt。往用户内容前面塞
+// system-reminder 会把提示写进原生 transcript（--resume 后还翻得出来），
+// 且 2026-10-27 明确这不是期望行为。
+//
+// 契约只走注入帧不落盘：TUI 自己打字的回合不带 surface，提示永远不会出现。
+// 回程有闸：上游回传的 transcript 若带回这份契约（注入行会被 TUI 记进原生
+// 转录），摄入历史时由 stripAgentAIPhoneContract 剥掉，不让它变成下一轮的
+// 对话内容。
 
 // agentAISurfacePhone 是目前唯一的远端驱动面标记。normalizeAgentAISurface
 // 白名单式收敛：未来新增 surface 值时同步扩这里。
@@ -52,4 +62,55 @@ func wrapAgentAIPhoneContract(content string) string {
 		return content
 	}
 	return agentAIPhoneContractReminder() + content
+}
+
+// wrapAgentAIPhoneContractForSurface 是「注入正在运行的 TUI」这条通道的统一
+// 闸口：surface=phone 才包，其余原样返回。headless 通道不得调用它（见文件头
+// 注释：-p / codex / agentcore 的约束不走文本注入）。
+func wrapAgentAIPhoneContractForSurface(surface, content string) string {
+	if surface != agentAISurfacePhone {
+		return content
+	}
+	return wrapAgentAIPhoneContract(content)
+}
+
+// stripAgentAIPhoneContract 从文本里剥掉本宿主注入的手机契约块，还原用户原文。
+//
+// 为什么需要：契约是给「正在运行的 TUI」的一次性提示，而那条通道的 tran-
+// script 会被上游回传（ai.message / ai.run.start 的 transcript 字段），宿主
+// 再把它当历史吃进来 —— 契约于是变成对话内容的一部分，随 --resume 的扁平化
+// 提示与内核 messages 一轮轮回灌，等于自己给自己重复下指令。
+//
+// 只剥自己的块：以 agentAIPhoneContractMarker 为锚点，且该锚点必须落在
+// <system-reminder> … </system-reminder> 之内。CC 自己写进转录的其它
+// system-reminder 是合法上下文，删了会丢信息 —— 所以形状认不出时宁可原样返回。
+func stripAgentAIPhoneContract(content string) string {
+	if !strings.Contains(content, agentAIPhoneContractMarker) {
+		return content
+	}
+	for strings.Contains(content, agentAIPhoneContractMarker) {
+		start := strings.Index(content, "<system-reminder>")
+		if start < 0 {
+			break
+		}
+		// 连同包装时补的分隔空行一起切：agentAIPhoneContractReminder 以
+		// "</system-reminder>\n\n" 收尾，只切标签会留下多余空行（重复注入时
+		// 会越积越多）。兼容上游可能做过的换行归一化。
+		rest, endLen := content[start:], 0
+		for _, tail := range []string{"</system-reminder>\n\n", "</system-reminder>\r\n\r\n", "</system-reminder>"} {
+			if idx := strings.Index(rest, tail); idx >= 0 {
+				endLen = idx + len(tail)
+				break
+			}
+		}
+		if endLen == 0 {
+			break
+		}
+		if !strings.Contains(content[start:start+endLen], agentAIPhoneContractMarker) {
+			// 第一个提醒块不是我们的：不猜位置，原样保留。
+			break
+		}
+		content = content[:start] + content[start+endLen:]
+	}
+	return content
 }

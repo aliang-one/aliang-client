@@ -2206,9 +2206,9 @@ func (m *agentAIManager) steer(msg map[string]interface{}, writeJSON agentTermin
 		emitAgentAISteerAck(writeJSON, sessionID, messageID, "error", fmt.Sprintf("ai.steer exceeds %d bytes", agentAIMessageLimitBytes), "bad_request")
 		return
 	}
-	// 手机驱动插话:契约随文本走。外部 TUI 活进程分支(下面两处)唯一能影响
-	// 其 CC 行为的通道就是注入文本本身,必须在这里备好;注册表内路径按
-	// session.surface 再包一次(幂等)。
+	// 手机驱动插话的契约只在「注入正在运行的 TUI」时随文本走（下面两处外部
+	// TUI 分支与 session.tuiTurn 分支）。headless 通道（claude stream-json /
+	// codex / agentcore）不注入文本契约，见 agent_ai_phone_contract.go 头注释。
 	steerContent := content
 	if normalizeAgentAISurface(remoteString(msg, "surface")) == agentAISurfacePhone {
 		steerContent = wrapAgentAIPhoneContract(content)
@@ -2240,6 +2240,10 @@ func (m *agentAIManager) steer(msg map[string]interface{}, writeJSON agentTermin
 		emitAgentAISteerAck(writeJSON, sessionID, messageID, "not_running", fmt.Sprintf("ai session not found: %s", sessionID), "")
 		return
 	}
+	// surface 先落到会话上：下面 TUI 分支按 session.surface 决定是否注入契约。
+	if surface := normalizeAgentAISurface(remoteString(msg, "surface")); surface != "" {
+		session.surface = surface
+	}
 	if session.cancel == nil {
 		m.mu.Unlock()
 		// 注册表里在、但当前没有活跃回合:该会话的回合可能正由外部 TUI 驱动
@@ -2266,6 +2270,7 @@ func (m *agentAIManager) steer(msg map[string]interface{}, writeJSON agentTermin
 	// "queued" 语义一致）。分流给专用执行器，不走下面的 stdin 路径。
 	if tuiPlan := session.tuiTurn; tuiPlan != nil {
 		m.mu.Unlock()
+		// 契约由 steerTUITurn 按 session.surface 追加到注入帧；history 存原文。
 		m.steerTUITurn(session, *tuiPlan, msg, sessionID, messageID, content, writeJSON)
 		return
 	}
@@ -2309,9 +2314,6 @@ func (m *agentAIManager) steer(msg map[string]interface{}, writeJSON agentTermin
 	}
 
 	m.mu.Lock()
-	if surface := normalizeAgentAISurface(remoteString(msg, "surface")); surface != "" {
-		session.surface = surface
-	}
 	session.history = append(session.history, agentAIMessage{
 		Role:      "user",
 		MessageID: messageID,
@@ -2319,11 +2321,6 @@ func (m *agentAIManager) steer(msg map[string]interface{}, writeJSON agentTermin
 		CreatedAt: steer.CreatedAt,
 	})
 	m.mu.Unlock()
-
-	if session.surface == agentAISurfacePhone {
-		// 手机驱动插话:契约随投递内容下发;history 仍存原文(上一条 append)。
-		steer.Content = wrapAgentAIPhoneContract(steer.Content)
-	}
 
 	var result string
 	switch {
@@ -2335,8 +2332,8 @@ func (m *agentAIManager) steer(msg map[string]interface{}, writeJSON agentTermin
 		result, err = coreControl.deliver(steer)
 		if err == nil {
 			// agentcore 专属：插话投递成功才留痕（deliver 失败时消息没进内核）。
-			// 落 content（原文）而非 steer.Content——后者此时已拼上附件后缀与
-			// 手机契约包装，journal 按 spec §5 只存真实用户 content。
+			// 落 content（原文）而非 steer.Content——后者此时已拼上附件后缀，
+			// journal 按 spec §5 只存真实用户 content。
 			m.journalSteerUserMessage(sessionID, steer, content)
 		}
 	}
@@ -2391,7 +2388,9 @@ func (m *agentAIManager) steerTUITurn(session *agentAISession, plan tuiTurnPlan,
 	if info, err := os.Stat(plan.JSONLPath); err == nil {
 		offset = info.Size()
 	}
-	if err := ccPeerDialInject(plan.SocketPath, plan.PeerToken, content, plan.FromMode); err != nil {
+	// 手机行为契约只加在注入帧上；下面 history 仍落原文（契约不进上下文）。
+	injectText := wrapAgentAIPhoneContractForSurface(session.surface, content)
+	if err := ccPeerDialInject(plan.SocketPath, plan.PeerToken, injectText, plan.FromMode); err != nil {
 		emitAgentAISteerAck(writeJSON, sessionID, messageID, "error", "无法把插话送进终端会话", "send_failed")
 		return
 	}
@@ -2615,17 +2614,12 @@ func (m *agentAIManager) runUserMessage(session *agentAISession, runID, messageI
 	if !nativeCompact {
 		freshPrompt = buildAgentAIPrompt(session, content)
 	}
-	phoneSurface := session.surface == agentAISurfacePhone
-	if phoneSurface && !nativeCompact {
-		// 手机驱动回合:行为契约随首条用户内容进上下文(幂等,见 wrap 实现)。
-		freshPrompt = wrapAgentAIPhoneContract(freshPrompt)
-	}
+	// headless 通道（claude -p / codex / agentcore）不带手机行为契约：那是
+	// 宿主拉起的进程，约束走 settings/permissions 与 append-system-prompt，
+	// 见 agent_ai_phone_contract.go 头注释。契约只在 TUI 注入路由里加。
 	prompt := freshPrompt
 	if resumeSessionID != "" {
 		prompt = content
-		if phoneSurface && !nativeCompact {
-			prompt = wrapAgentAIPhoneContract(content)
-		}
 	}
 	run := agentAIRun{
 		sessionID:               session.id,
@@ -2687,13 +2681,10 @@ func (m *agentAIManager) runUserMessage(session *agentAISession, runID, messageI
 		// 释放 spawn 路径预建的 ctx（执行器自建 runCtx，不再用这个）。
 		cancel()
 		// 传原始 content 而非 run.prompt（后者被 buildAgentAIPrompt 包装过）；
-		// 附件走 run.attachments，由执行器拼进注入文本。手机驱动回合把行为
-		// 契约随 content 带进 TUI 内 CC——注入文本是唯一能影响其行为的通道。
-		tuiContent := content
-		if run.surface == agentAISurfacePhone {
-			tuiContent = wrapAgentAIPhoneContract(content)
-		}
-		go m.runTUITurn(context.Background(), session, run, tuiContent, plan, emitter)
+		// 附件走 run.attachments，由执行器拼进注入文本。手机行为契约也在执行器
+		// 里按 run.surface 追加到注入文本——history 与注入文本因此各归各位：
+		// 历史只存原文，契约只存在于 TUI 收到的那一帧。
+		go m.runTUITurn(context.Background(), session, run, content, plan, emitter)
 		return nil
 	}
 
@@ -2795,7 +2786,7 @@ func remoteAgentAIHistory(msg map[string]interface{}) []agentAIMessage {
 		if !ok {
 			continue
 		}
-		content := strings.TrimSpace(remoteString(row, "content"))
+		content := stripAgentAIPhoneContract(strings.TrimSpace(remoteString(row, "content")))
 		if content == "" {
 			continue
 		}
@@ -7193,6 +7184,11 @@ func emitClaudeStructuredEvents(format agentAIOutputFormat, event map[string]int
 			case "content_block_delta":
 				if delta := mapIf(streamEvent["delta"]); delta != nil && remoteString(delta, "type") == "thinking_delta" {
 					if text := remoteString(delta, "thinking"); strings.TrimSpace(text) != "" {
+						// 思考流也算实打实的进展（与 TUI 路径同一口径）。不算
+						// 的话，一段超过 idle 窗口（10 分钟）的纯推理在宿主看来
+						// 就是「没有任何动静」，会被当卡死杀掉——模型明明在
+						// 正常思考，用户却收到中断。
+						run.activity.markProgress()
 						idx, _ := streamFloatIndex(streamEvent["index"])
 						_ = writeJSON(map[string]interface{}{
 							"type":       models.AgentEventAIThinking,

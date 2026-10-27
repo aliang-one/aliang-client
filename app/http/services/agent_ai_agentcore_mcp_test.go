@@ -3,12 +3,14 @@ package services
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -224,6 +226,40 @@ func TestAgentCoreMCPServerToolDefsSkipsHeaders(t *testing.T) {
 	defer closeAll()
 	if len(bridges) != 0 {
 		t.Fatalf("带 headers 的 http server 应预判跳过（不 dial）: %+v", bridges)
+	}
+}
+
+// 串行 dial 的尾延迟是乘法：单 server 卡满 10s，24 个就是 4 分钟启动空窗。
+// 这里钉死「两个 server 同时在飞」——用屏障代替计时，串行实现会在第一个
+// dial 上等满超时而失败。
+func TestAgentCoreMCPServerToolDefsDialsConcurrently(t *testing.T) {
+	session := startTestMCPSession(t, "echo", func(map[string]interface{}) (string, bool) { return "ok", false })
+	var arrived int32
+	release := make(chan struct{})
+	var once sync.Once
+	m := &agentAIManager{}
+	m.coreMCPDialForTest = func(ctx context.Context, _ agentCoreMCPRawServer) (*mcp.ClientSession, func(), error) {
+		if atomic.AddInt32(&arrived, 1) == 2 {
+			once.Do(func() { close(release) })
+		}
+		select {
+		case <-release:
+		case <-time.After(3 * time.Second):
+			return nil, nil, errors.New("dial 未并发：第二个 server 等不到同时建连")
+		}
+		return session, func() {}, nil
+	}
+	bridges, closeAll := m.agentCoreMCPServerToolDefs(context.Background(), []agentCoreMCPRawServer{
+		{Name: "alpha", Command: "x"},
+		{Name: "beta", Command: "y"},
+	}, nil)
+	defer closeAll()
+	if len(bridges) != 2 {
+		t.Fatalf("两个 server 应各产出 1 桥（并发建连）: %+v", bridges)
+	}
+	// 工具顺序必须与配置顺序一致：顺序变了上游 prompt 缓存全部失效。
+	if !strings.HasPrefix(bridges[0].Name(), "mcp__alpha__") || !strings.HasPrefix(bridges[1].Name(), "mcp__beta__") {
+		t.Fatalf("桥顺序应与 server 配置顺序一致: %q %q", bridges[0].Name(), bridges[1].Name())
 	}
 }
 

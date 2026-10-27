@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"runtime/debug"
 	"strings"
 	"sync/atomic"
@@ -31,6 +32,18 @@ import (
 // （2026-10-27 实锤：83 条命令后撞上限，用户侧只看到「对话莫名停了」）。
 // 死循环仍会被这道上限兜住，只是允许的正常工作量更贴近真实场景。
 const maxIterations = 200
+
+// maxContextOverflowRetries 是「上游说上下文超长」后自动压缩并重试的轮数
+// 上限。每次压缩都会把历史砍到窗口一半以下，两三次足够落进任何真实窗口；
+// 再多说明不是上下文问题（或模型窗口小到正常对话都装不下），继续重试只是
+// 反复烧摘要 token，此时把错误如实报给用户更诚实。
+const maxContextOverflowRetries = 3
+
+// minContextOverflowWindow 是降级窗口的下限。降级是按「实测 token 的一半」
+// 算的，历史很小时会算到很小，窗口太小会让压缩把正常对话也折叠掉；32000
+// 已经小于任何主流模型窗口，再低就没有意义了。
+const minContextOverflowWindow = 32000
+
 
 // maxTruncationRetries 是**连续**被 max_tokens 截断后允许重试的次数。
 //
@@ -268,6 +281,14 @@ type runner struct {
 	contextTokens int
 	// autoCompacts 是本 run 内已执行的自动压缩次数，见 maxAutoCompactsPerRun。
 	autoCompacts int
+
+	// ctxOverflowWindow 是「上游实测拒绝了当前上下文」后降级出的有效窗口。
+	// 配置窗口来自用户的上下文滑杆（100k~1M），它不知道模型真实上限：给
+	// 200k 的模型选 1M，压缩阈值按 1M 算会一路拖到 750k，请求直接被上游拒。
+	// 一旦被拒，就按实测 token 的一半重设有效窗口并在本 run 内沿用。
+	ctxOverflowWindow int
+	// ctxOverflows 是本 run 内为上下文超限执行的压缩重试次数。
+	ctxOverflows int
 }
 
 // logf 走宿主的日志出口；没配就静默。
@@ -317,6 +338,12 @@ func (r *runner) loop(ctx context.Context) (*RunResult, error) {
 			// 上游按模型拒绝 effort:锁存后去掉 output_config 重试本回合
 			// 一次。此时还没发过任何事件帧(400 在响应检查阶段抛出),writer
 			// 状态干净,重跑安全。
+			assistantBlocks, stopReason, err = r.streamTurn(ctx, r.buildRequest(), writer)
+		}
+		if err != nil && r.noteContextOverflow(ctx, err) {
+			// 上游说上下文超长：多半是用户选的窗口大于模型真实窗口。把有效
+			// 窗口降到实测规模以下、就地压缩历史，然后重试本回合——压缩后
+			// 请求才装得进去。（同样是响应检查阶段的 4xx，writer 干净。）
 			assistantBlocks, stopReason, err = r.streamTurn(ctx, r.buildRequest(), writer)
 		}
 		if err != nil {
@@ -403,7 +430,7 @@ func (r *runner) loop(ctx context.Context) (*RunResult, error) {
 // 留出余量给本轮输出与工具结果。压缩失败不终止 run：宁可带着长上下文继续
 // 跑，也不要因为摘要请求偶发失败而中断用户的对话。
 func (r *runner) maybeAutoCompact(ctx context.Context) {
-	window := r.cfg.ContextWindow
+	window := r.effectiveContextWindow()
 	if window <= 0 {
 		return
 	}
@@ -419,7 +446,7 @@ func (r *runner) maybeAutoCompact(ctx context.Context) {
 		return
 	}
 
-	compacted, info, err := Compact(ctx, r.cfg, r.history, "auto")
+	compacted, info, err := Compact(ctx, r.compactConfig(), r.history, "auto")
 	if err != nil {
 		if errors.Is(err, ErrNothingToCompact) {
 			return
@@ -439,6 +466,115 @@ func (r *runner) maybeAutoCompact(ctx context.Context) {
 	if r.cfg.Hooks.OnCompact != nil {
 		r.cfg.Hooks.OnCompact(compacted, info)
 	}
+}
+
+// effectiveContextWindow 返回本 run 实际可用的上下文窗口：配置值与「上游
+// 实测拒绝后降级出的值」取小。手机端的滑杆不知道模型真实上限，配得再大也
+// 只是让压缩阈值失效；被拒一次之后以实测为准。
+func (r *runner) effectiveContextWindow() int {
+	w := r.cfg.ContextWindow
+	if r.ctxOverflowWindow > 0 && (w <= 0 || r.ctxOverflowWindow < w) {
+		return r.ctxOverflowWindow
+	}
+	return w
+}
+
+// compactConfig 返回把窗口换成有效窗口的配置副本，供 Compact 计算摘要预算。
+func (r *runner) compactConfig() *Config {
+	cfg := *r.cfg
+	cfg.ContextWindow = r.effectiveContextWindow()
+	return &cfg
+}
+
+// noteContextOverflow 判定失败是否因为上下文超出模型窗口；命中就把有效
+// 窗口降到实测规模以下、压缩历史并返回 true，调用方重试本回合。
+//
+// 只认 4xx（且是响应检查阶段抛出的 httpStatusError）——那种失败发生在任何
+// 事件帧之前，writer 状态干净，重跑一整回合是安全的。2xx 信封里的错误多
+// 半是限流，不能拿去压缩。
+func (r *runner) noteContextOverflow(ctx context.Context, err error) bool {
+	if r.ctxOverflows >= maxContextOverflowRetries {
+		return false
+	}
+	if !isContextOverflowError(err) {
+		return false
+	}
+	measured := EstimateTokens(r.history)
+	if r.contextTokens > measured {
+		measured = r.contextTokens
+	}
+	if measured <= 0 {
+		return false
+	}
+	eff := measured / 2
+	if eff < minContextOverflowWindow {
+		eff = minContextOverflowWindow
+	}
+	// 每次都让窗口严格变小，避免「压缩后估算仍高于窗口 → 又一次超限 →
+	// 同样大小重试」的原地打转。
+	if prev := r.effectiveContextWindow(); prev > 0 && eff >= prev {
+		eff = prev / 2
+		if eff < minContextOverflowWindow {
+			eff = minContextOverflowWindow
+		}
+	}
+	r.ctxOverflowWindow = eff
+
+	compacted, info, cerr := Compact(ctx, r.compactConfig(), r.history, "auto")
+	if cerr != nil {
+		if errors.Is(cerr, ErrNothingToCompact) {
+			r.logf("agentcore: 上下文超出模型窗口，但历史已无早期消息可压缩 session=%s", r.writer.sessionID)
+			return false
+		}
+		r.logf("agentcore: 上下文超限后压缩失败，无法自动恢复: %v session=%s", cerr, r.writer.sessionID)
+		return false
+	}
+	r.ctxOverflows++
+	r.history = compacted
+	r.contextTokens = info.PostTokens
+	r.logf("agentcore: 上游拒绝上下文（实测约 %d tokens），有效窗口降至 %d，压缩 %d→%d tokens 后重试（本 run 第 %d 次）session=%s",
+		measured, eff, info.PreTokens, info.PostTokens, r.ctxOverflows, r.writer.sessionID)
+	if r.writer != nil {
+		_ = r.writer.CompactBoundary(info.Trigger, info.PreTokens, info.PostTokens)
+	}
+	if r.cfg.Hooks.OnCompact != nil {
+		r.cfg.Hooks.OnCompact(compacted, info)
+	}
+	return true
+}
+
+// isContextOverflowError 判定是否为「上下文超出模型窗口」类 4xx。各家措辞
+// 不同（Anthropic: prompt is too long；OpenAI 兼容: context length /
+// maximum context length；GLM: input is too long），只认明确指向上下文/输入
+// 的短语，避免把 max_tokens 之类的错误误判成上下文问题。
+func isContextOverflowError(err error) bool {
+	var statusErr *httpStatusError
+	if !errors.As(err, &statusErr) {
+		return false
+	}
+	switch statusErr.status {
+	case http.StatusBadRequest, http.StatusRequestEntityTooLarge, http.StatusUnprocessableEntity:
+	default:
+		return false
+	}
+	m := strings.ToLower(statusErr.body)
+	for _, needle := range []string{
+		"prompt is too long",
+		"context length",
+		"context window",
+		"maximum context",
+		"too many tokens",
+		"input is too long",
+		"input too long",
+		"exceeds the maximum context",
+		"exceed context",
+		"上下文",
+	} {
+		if strings.Contains(m, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 // buildRequest 组装一次 Messages API 请求。
