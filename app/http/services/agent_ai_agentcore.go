@@ -893,6 +893,67 @@ func agentCoreScopeCheck(run agentAIRun) func(string, map[string]interface{}) (b
 // run 入口
 // ---------------------------------------------------------------------------
 
+// newAgentCoreEmit 返回一个可被 ctx 解除的 Emit 函数。
+//
+// 内核的每一帧都经 io.Pipe 交给流式管线；pipeWriter.Write 会一直阻塞到读端
+// 消费（读端还有限流器与网络写出）。若读端卡住，写侧就永久阻塞，agentcore.Run
+// 再也返回不了——看门狗的 cancel 也就形同虚设（2026-10-27 事故的候选卡点）。
+//
+// 这里用一条守护 goroutine 把 ctx.Done 翻译成 pipe 关闭，让阻塞中的 Write
+// 立刻返回 io.ErrClosedPipe（读端侧收到的才是 ctx 的取消错误），Run 得以退出。
+// stop 必须 defer 调用，否则 ctx 永不取消的路径（正常完成）会泄漏这条 goroutine。
+func newAgentCoreEmit(ctx context.Context, writer *io.PipeWriter) (emit func([]byte) error, stop func()) {
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = writer.CloseWithError(ctx.Err())
+		case <-done:
+		}
+	}()
+	var once sync.Once
+	stop = func() { once.Do(func() { close(done) }) }
+	emit = func(frame []byte) error {
+		_, err := writer.Write(frame)
+		return err
+	}
+	return emit, stop
+}
+
+// bindAgentCoreNativeSession 把内核发来的 native session id 落成绑定并发
+// ai.session.bound。返回的 bool 为 true 表示本回合已被判死或被新回合顶替，
+// 这次绑定是僵尸迟到的产物，必须整帧丢弃（既不落库也不发帧）。
+//
+// 围栏必须在写入之前：一个忽略取消、卡住很久的僵尸完全可能在强拆撤销之后才
+// 吐出 system/init，把 m.bindings 与 session.resumeSessionID 重新写回去——
+// runStart 下一回合正是从 confirmed 绑定取 resumeID，污染照样成立。
+//
+// 单次语义由调用方的 bindingOnce 保证：一个回合只确认一次。
+func (m *agentAIManager) bindAgentCoreNativeSession(run agentAIRun, writeJSON agentTerminalWriter, nativeSessionID string) (agentAIBindingRecord, bool, error) {
+	if !m.agentAIRunSideEffectsAllowed(run.sessionID, run.runSeq, run.guard) {
+		logger.Warn(fmt.Sprintf(
+			"[ai.run.zombie_bind] session=%s runSeq=%d run=%s native=%s reason=stale_side_effects",
+			run.sessionID, run.runSeq, run.runID, strings.TrimSpace(nativeSessionID),
+		))
+		return agentAIBindingRecord{}, true, nil
+	}
+	record, err := m.confirmBinding(run.sessionID, run.provider, nativeSessionID, run.bindingVersion)
+	if err != nil {
+		return agentAIBindingRecord{}, false, err
+	}
+	_ = writeJSON(map[string]interface{}{
+		"type":              models.AgentEventAISessionBound,
+		"session_id":        run.sessionID,
+		"message_id":        run.messageID,
+		"provider":          run.provider,
+		"native_session_id": record.NativeSessionID,
+		"source_session_id": record.NativeSessionID,
+		"binding_version":   record.BindingVersion,
+		"binding_state":     record.State,
+	})
+	return record, false, nil
+}
+
 // runAgentCore 跑一次内置内核的 run。
 //
 // 与 runCLIPass 的关系：spawn 换成了进程内调用，但**对外的事件契约完全一样**
@@ -903,7 +964,13 @@ func agentCoreScopeCheck(run agentAIRun) func(string, map[string]interface{}) (b
 // （format=claude_stream_json）。delta 去重、工具活动追踪、session_id 捕获、
 // ai.command 配对全部由那条既有管线免费提供。
 func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, writeJSON agentTerminalWriter) {
-	defer m.clearRunning(run.sessionID, run.runSeq, writeJSON)
+	defer m.clearRunning(run.sessionID, run.runSeq, writeJSON, run.guard)
+	// LIFO：本行后注册，先于 clearRunning 执行——guard 必须在会话复位前把自己
+	// 标记为「已正常返回」，否则宽限计时器会误判成僵尸。
+	//
+	// 两处都必须带 guard：/clear 会把 runSeq 归零、下一回合复用同一个值，僵尸
+	// 迟返回时若只比 runSeq，会把新回合的 cancel/activity/guard/done 一并清掉。
+	defer m.markRunGuardDone(run.sessionID, run.runSeq, run.guard)
 
 	// 调用记录落盘（AliangCode 留痕，spec §6）：入口写头行 + 首条 user 行，
 	// 成功出口写 assistant 行，所有出口经 defer 落 end 行。写失败只 Warn。
@@ -1011,29 +1078,18 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 
 	// 会话绑定：内核的 session id 由我们自己发（system/init 就带），第一次拿到
 	// 时落库并发 ai.session.bound。与 CLI 路径同一个 confirmBinding 口径。
+	// 围栏与落库整段收在 bindAgentCoreNativeSession 里，便于单独覆盖僵尸形态。
 	var bindingOnce sync.Once
 	var bindingErr error
 	onNativeSessionID := func(nativeSessionID string) {
 		bindingOnce.Do(func() {
-			record, err := m.confirmBinding(run.sessionID, run.provider, nativeSessionID, run.bindingVersion)
-			if err != nil {
+			if _, _, err := m.bindAgentCoreNativeSession(run, writeJSON, nativeSessionID); err != nil {
 				bindingErr = err
 				_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, err))
 				if run.cancel != nil {
 					run.cancel()
 				}
-				return
 			}
-			_ = writeJSON(map[string]interface{}{
-				"type":              models.AgentEventAISessionBound,
-				"session_id":        run.sessionID,
-				"message_id":        run.messageID,
-				"provider":          run.provider,
-				"native_session_id": record.NativeSessionID,
-				"source_session_id": record.NativeSessionID,
-				"binding_version":   record.BindingVersion,
-				"binding_state":     record.State,
-			})
 		})
 	}
 
@@ -1054,6 +1110,20 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 	// steer 通道必须在 agentcore.Run 之前挂上：用户可能在第一帧之前就插话，
 	// 那批消息要能排进队列被第一次 GetSteeringMessages 取走。
 	coreSteer := newAgentAICoreSteerControl(run, writeJSON)
+	// activity 必须在 attachCoreSteer 之前赋值：attach 之后其他 goroutine 就能
+	// 通过 coreSteerFor 拿到 control 并使用它，晚赋值会有「已挂载但 activity
+	// 还是 nil」的窗口（nil 安全但丢活性信号）。
+	coreSteer.activity = run.activity
+	coreSteer.onStalled = func(reason string) {
+		if guard := m.runGuardForActivity(run.activity); guard != nil {
+			guard.kill(reason)
+			return
+		}
+		if run.cancel != nil {
+			run.activity.setKillReason(reason)
+			run.cancel()
+		}
+	}
 	m.attachCoreSteer(run.sessionID, run.runSeq, coreSteer)
 
 	// MCP 工具注入（spec §3）：采集→建连→包桥→注册。全部失败也只是空桥，
@@ -1124,6 +1194,9 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		}
 	}
 
+	emitFrame, stopEmit := newAgentCoreEmit(ctx, pipeWriter)
+	defer stopEmit()
+
 	cfg := &agentcore.Config{
 		Client:    kernelClient,
 		Model:     model,
@@ -1138,10 +1211,9 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		Env:           kernelEnv,
 		Approve:       kernelApprove,
 		Logf:          kernelLogf,
-		Emit: func(frame []byte) error {
-			_, err := pipeWriter.Write(frame)
-			return err
-		},
+		// 经 newAgentCoreEmit 包装：ctx 取消时关写端解除阻塞，僵尸写侧不再
+		// 挂死消费侧（AI run 韧性 L2）。
+		Emit:  emitFrame,
 		Hooks: agentCoreLoopHooks(m, run),
 	}
 
@@ -1157,7 +1229,8 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 	}
 
 	if ctx.Err() != nil {
-		// 被停止：内核已经发过 interrupted 终止帧（非错误），这里只收敛状态。
+		// 被停止：内核可能已发过 interrupted 终止帧；若 pipe 已随 cancel 关闭，
+		// 该帧会被丢弃（内核忽略这处写错误）。这里统一收敛状态。
 		status, errMsg := agentAIRunStoppedStatus(run.activity, limiter)
 		finalizeRunSubagents(run, writeJSON)
 		statusPayload := map[string]interface{}{
@@ -1198,14 +1271,42 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 	filesTouchedCount := len(filesTouched)
 	filesMu.Unlock()
 
-	m.appendAssistantHistory(run.sessionID, run.runSeq, run.messageID, assistantOutput)
-	journal.appendAssistant(run.sessionID, agentAssistantMessageID(run.messageID), assistantOutput, time.Now().UTC().Format(time.RFC3339))
-	endStatus = "success"
-	m.setAgentAIResumeSessionIDIfEmpty(run.sessionID, run.runSeq, capturedResumeSessionID)
-	// 刻意跳过 ccPeerSessionJSONL / appendLineageMarker：那是 Claude CLI 的
-	// transcript 谱系修补，内核没有对应的 JSONL 文件。
-	if blocks := extractAgentAIOptionBlocks(assistantOutput); len(blocks) > 0 {
-		m.emitOptionRequest(run, writeJSON, blocks)
+	if m.agentAIRunSideEffectsAllowed(run.sessionID, run.runSeq, run.guard) {
+		m.appendAssistantHistory(run.sessionID, run.runSeq, run.messageID, assistantOutput)
+		journal.appendAssistant(run.sessionID, agentAssistantMessageID(run.messageID), assistantOutput, time.Now().UTC().Format(time.RFC3339))
+		endStatus = "success"
+		m.setAgentAIResumeSessionIDIfEmpty(run.sessionID, run.runSeq, capturedResumeSessionID)
+		// 刻意跳过 ccPeerSessionJSONL / appendLineageMarker：那是 Claude CLI 的
+		// transcript 谱系修补，内核没有对应的 JSONL 文件。
+		//
+		// 方案请求必须一起关在围栏内：emitOptionRequest 只看 runSeq，而 /clear
+		// 归零后新回合复用同一个值。僵尸迟返回若照样写 session.pendingOption，
+		// 新回合正在等用户选择的那张卡会被顶掉，用户点下去 option_id 对不上，
+		// 选择被静默丢弃。
+		if blocks := extractAgentAIOptionBlocks(assistantOutput); len(blocks) > 0 {
+			m.emitOptionRequest(run, writeJSON, blocks)
+		}
+	} else {
+		// 僵尸迟返回：强拆之后 runSeq 未变但已打 finalizedRunSeq 标记（或该回合
+		// 早已被新回合顶替），这些非帧副作用会污染 Retry 新回合的历史/恢复点，
+		// 必须丢弃（spec §2.4 / §3.2.2）。
+		// endStatus 保持默认 "error"：deferred journal.appendEnd 必须体现
+		// 「这一轮没有落库的成功结果」，否则 journal 会出现 end(success) 却查无
+		// assistant 行的自相矛盾记录。
+		//
+		// 恢复点与绑定的撤销**不在这里**：判死路径必先 kill() → cancel()，僵尸
+		// 迟返回一定先在上面 ctx.Err() != nil 的 stopped 早退处 return，走不到本段
+		// （本段只在取消被忽略、run 正常返回等边缘形态才可达）。撤销已经由
+		// finalizeStalledGuard 在身份校验的同一临界区内做掉，这里只兜历史/日志
+		// 这类非帧写入。
+		guardMounted := run.guard != nil
+		m.mu.Lock()
+		session := m.sessions[run.sessionID]
+		runSeqSame := session != nil && session.runSeq == run.runSeq
+		finalized := session != nil && session.finalizedRunSeq == run.runSeq
+		m.mu.Unlock()
+		logger.Warn(fmt.Sprintf("[ai.run.zombie_discard] session=%s runSeq=%d run=%s guard_mounted=%t runseq_same=%t finalized=%t reason=stale_side_effects",
+			run.sessionID, run.runSeq, run.runID, guardMounted, runSeqSame, finalized))
 	}
 
 	done := map[string]interface{}{
@@ -1268,6 +1369,14 @@ type agentAICoreSteerControl struct {
 	write     agentTerminalWriter
 	closed    bool
 	queue     []agentAISteerMessage
+	// activity 用于把「插话被取走」计入 run 活性（spec §3.3.1）：内核 drain 发生
+	// 在下一次 LLM 调用前，那一瞬间说明回合确实活着。
+	activity *agentAIActivity
+	// onStalled 在活性窗到期且判定回合无响应时回调（生产接线 = guardian kill）。
+	// nil = 完全不起活性窗（既不发失败 ack 也不判死），仅供测试使用。
+	onStalled func(reason string)
+	// pending 记每条排队插话的活性窗计时器，drain/close 时停掉。
+	pending map[string]*time.Timer
 }
 
 func newAgentAICoreSteerControl(run agentAIRun, write agentTerminalWriter) *agentAICoreSteerControl {
@@ -1293,7 +1402,95 @@ func (c *agentAICoreSteerControl) deliver(msg agentAISteerMessage) (string, erro
 		return "not_running", errors.New("agentcore turn ended before steer was applied")
 	}
 	c.queue = append(c.queue, msg)
+	c.armLivenessLocked(msg.MessageID)
 	return "queued", nil
+}
+
+// armLivenessLocked 给一条刚入队的插话起活性窗。调用方必须持有 c.mu。
+//
+// activity 为 nil 时直接不起窗（fail-safe）：没有活性就分不清「死」和「在等
+// 审批」，宁可不判死也不误杀合法等待。生产路径在 attachCoreSteer 之前一定
+// 赋好 activity，所以这只在接线错误时退化。
+//
+// onStalled 为 nil 时同样不起窗（同义 fail-safe）：没有收尾回调就只剩一条
+// 失败 ack，判死也无从收敛，不如不判。仅供测试使用。
+func (c *agentAICoreSteerControl) armLivenessLocked(messageID string) {
+	if steerLivenessWindow <= 0 || c.onStalled == nil || c.activity == nil {
+		return
+	}
+	if c.pending == nil {
+		c.pending = make(map[string]*time.Timer)
+	}
+	if timer := c.pending[messageID]; timer != nil {
+		timer.Stop()
+	}
+	c.pending[messageID] = time.AfterFunc(steerLivenessWindow, func() { c.expire(messageID) })
+}
+
+// expire 在活性窗到期时检查插话是否仍未被取走。
+//
+// 仍在队列且回合处于非等待态、且已静默满一个完整窗口 → 判死：给手机一条失败
+// ack（code=turn_stalled），再触发 guardian 收尾。等待态（工具/子代理/审批）
+// 与仍在出字的回合都是合法静默，插话继续排队，由各自天花板 + stale 扫描器
+// 收敛，这里不误报（spec §3.3.4）。
+func (c *agentAICoreSteerControl) expire(messageID string) {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
+	// 合法静默有两种，都不能判死：
+	//   1) 等待态（审批/工具/子代理）——各自有天花板兜底；
+	//   2) 回合仍在出字——delta 会 bump lastActivityAt，距今还没满一个窗口。
+	// 只有「非等待态 且 已静默 ≥ 一个完整窗口」才判死（与 stale 扫描器同一口径）。
+	// 到期即作废本窗、不动队列：不重置，避免静默等待被无限续期。
+	if c.activity != nil && (c.activity.idlePaused() || c.activity.idleFor() < steerLivenessWindow) {
+		delete(c.pending, messageID)
+		c.mu.Unlock()
+		return
+	}
+	// 判死即消费：在持锁段把它从队列里摘掉，否则解锁后 drain 可能同一瞬间
+	// 取走它并发一条 applied ack，造成同一 messageID 先 applied 后 error 双帧。
+	stillQueued := false
+	kept := c.queue[:0]
+	for _, item := range c.queue {
+		if item.MessageID == messageID {
+			stillQueued = true
+			continue
+		}
+		kept = append(kept, item)
+	}
+	c.queue = kept
+	delete(c.pending, messageID)
+	write := c.write
+	sessionID := c.sessionID
+	runSeq := c.runSeq
+	onStalled := c.onStalled
+	var idle time.Duration
+	if c.activity != nil {
+		idle = c.activity.idleFor()
+	}
+	c.mu.Unlock()
+
+	if !stillQueued {
+		return
+	}
+	logger.Warn(fmt.Sprintf("[ai.steer.stalled] session=%s runSeq=%d message_id=%s idle=%s stall_cb_wired=%t",
+		sessionID, runSeq, messageID, idle, onStalled != nil))
+	emitAgentAISteerAck(write, sessionID, messageID, "error", "回合无响应已判死，请重试", "turn_stalled")
+	if onStalled != nil {
+		onStalled("steer_stalled")
+	}
+}
+
+// stopLivenessLocked 停掉若干条插话的活性窗。调用方必须持有 c.mu。
+func (c *agentAICoreSteerControl) stopLivenessLocked(ids []string) {
+	for _, id := range ids {
+		if timer := c.pending[id]; timer != nil {
+			timer.Stop()
+			delete(c.pending, id)
+		}
+	}
 }
 
 // drain 取走全部排队插话，转成内核消息，并逐条发 applied ack。
@@ -1312,11 +1509,21 @@ func (c *agentAICoreSteerControl) drain() []agentcore.Message {
 	c.queue = nil
 	write := c.write
 	sessionID := c.sessionID
+	ids := make([]string, 0, len(queued))
+	for _, item := range queued {
+		ids = append(ids, item.MessageID)
+	}
+	c.stopLivenessLocked(ids)
 	c.mu.Unlock()
 
 	out := make([]agentcore.Message, 0, len(queued))
 	for _, item := range queued {
 		out = append(out, agentCoreSteerMessage(item))
+		// drain 发生在下一次 LLM 调用前，是回合活着的直接证据；bump 是原子的，
+		// 不需要持锁（此处已在锁外）。
+		if c.activity != nil {
+			c.activity.bump()
+		}
 		emitAgentAISteerAck(write, sessionID, item.MessageID, "applied", "", "")
 	}
 	return out
@@ -1364,6 +1571,12 @@ func (c *agentAICoreSteerControl) close(result, errMsg, code string) {
 	queued := c.queue
 	c.queue = nil
 	c.closed = true
+	// 关通道时把所有未到期的活性窗一并停掉：否则已 close 的通道上还会有
+	// AfterFunc 在活性窗到期后醒来读 c.activity，造成无谓的判定与日志。
+	for id, timer := range c.pending {
+		timer.Stop()
+		delete(c.pending, id)
+	}
 	c.mu.Unlock()
 	for _, item := range queued {
 		emitAgentAISteerAck(c.write, c.sessionID, item.MessageID, result, errMsg, code)

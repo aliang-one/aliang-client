@@ -49,12 +49,11 @@ func TestAgentAITimeoutDefaults(t *testing.T) {
 	if agentAIApprovalTimeout != 24*time.Hour {
 		t.Fatalf("default agentAIApprovalTimeout = %s, want 24h", agentAIApprovalTimeout)
 	}
-	if agentAIHardCeiling != 48*time.Hour {
-		t.Fatalf("default agentAIHardCeiling = %s, want 48h", agentAIHardCeiling)
+	if agentAIHardCeiling != 2*time.Hour {
+		t.Fatalf("default agentAIHardCeiling = %s, want 2h", agentAIHardCeiling)
 	}
-	if agentAIHardCeiling <= agentAIApprovalTimeout {
-		t.Fatalf("agentAIHardCeiling (%s) must exceed agentAIApprovalTimeout (%s)", agentAIHardCeiling, agentAIApprovalTimeout)
-	}
+	// 不再断言 agentAIHardCeiling > agentAIApprovalTimeout：硬顶只累加引擎
+	// 活跃时长，审批挂起的拍被排除，审批窗口由 agentAIApprovalTimeout 独立管辖。
 	if agentAIToolWaitCeiling != time.Hour {
 		t.Fatalf("default agentAIToolWaitCeiling = %s, want 1h", agentAIToolWaitCeiling)
 	}

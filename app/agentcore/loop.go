@@ -216,6 +216,7 @@ type ApprovalResponse struct {
 //
 // 返回终止结果。ctx 取消时返回 ctx.Err()，但仍会先发 result 帧，
 // 让宿主能把会话正确收敛（否则手机会永远停在「进行中」）。
+// 注意：若调用方的 Emit 已随 ctx 关闭而失效，该帧会被丢弃。
 func Run(ctx context.Context, cfg *Config, messages []Message) (*RunResult, error) {
 	if cfg == nil || cfg.Client == nil {
 		return nil, errors.New("agentcore: 未配置 Client")

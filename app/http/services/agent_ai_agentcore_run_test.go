@@ -12,11 +12,13 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"aliang.one/nursorgate/app/agentcore"
 	"aliang.one/nursorgate/app/http/models"
+	"aliang.one/nursorgate/common/cache"
 )
 
 // 这一组测试锁死**宿主侧**的内置内核接线，与 app/agentcore 的内核测试互补：
@@ -906,5 +908,744 @@ func TestRunAgentCoreJournalsErrorEnd(t *testing.T) {
 		if l["role"] == "assistant" {
 			t.Errorf("错误出口不应有 assistant 行: %v", l)
 		}
+	}
+}
+
+// TestZombieStoppedRunRevokesResumePoint 是僵尸收尾的**真实路径**用例。
+//
+// 生产里判死的每条路径都先 kill() → cancel()，所以僵尸迟返回必然先在
+// ctx.Err() != nil 的 stopped 早退处 return，永远走不到成功收尾段。撤销因此
+// 必须发生在强拆链路（finalizeStalledGuard）里。本用例完整复现该形态：
+//
+//	上游卡在流中途 → system/init 已消费、绑定已落库 → kill + forceFinalize
+//	→ 放行上游，让 run goroutine 迟返回。
+//
+// 断言里最关键的一条是 journal end 记 "stopped"：它证明用例走的确实是真实
+// stopped 早退，而不是被测试人工造出来、生产中到不了的收尾分支。
+func TestZombieStoppedRunRevokesResumePoint(t *testing.T) {
+	setTestAgentHome(t)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	entered := make(chan struct{}, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		// 不回任何帧：run 卡在流式中途，正是僵尸的形态。
+		<-release
+	}))
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(release) })
+		srv.Close()
+	})
+	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
+	t.Setenv("ANTHROPIC_MODEL", "")
+
+	m := newAgentAIManager()
+	const sessionID = "conv-agentcore-zombie-stopped"
+	const runSeq = 9
+	activity := newAgentAIActivity()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	registerTestAISession(t, m, &agentAISession{
+		id:       sessionID,
+		runSeq:   runSeq,
+		cancel:   cancel,
+		activity: activity,
+		history:  []agentAIMessage{{Role: "user", Content: "跑到一半被强拆"}},
+	})
+
+	log := &agentCoreEventLog{}
+	run := agentAIRun{
+		sessionID:   sessionID,
+		runSeq:      runSeq,
+		messageID:   "msg-zombie-stopped",
+		provider:    "agentcore",
+		model:       "glm-5.2",
+		projectPath: t.TempDir(),
+		activity:    activity,
+		cancel:      cancel,
+	}
+	// 与生产一致：走 attachRunGuard 挂载，起跑快照才会被采集。
+	run.guard = m.attachRunGuard(run, log.write)
+	if run.guard == nil {
+		t.Fatal("guard 未挂载，用例覆盖不到强拆链路")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		m.runAgentCore(ctx, run, log.write)
+	}()
+
+	// 1) 等 system/init 被消费：绑定落库即僵尸已在流式途中钉下恢复点。
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		m.mu.Lock()
+		bound := m.bindings[sessionID].NativeSessionID
+		resume := m.sessions[sessionID].resumeSessionID
+		m.mu.Unlock()
+		if bound != "" && resume != "" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("等不到绑定落库（binding=%q resume=%q）", bound, resume)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("上游没收到请求，run 未真正卡在流式中途")
+	}
+
+	// 2) 判死：kill 负责 cancel，宽限到期强拆。这里同步驱动 finalize
+	// （定时器那条链由既有 run_guard 用例覆盖），避免用例空等 30s。
+	run.guard.kill("stalled")
+	run.guard.forceFinalize("stalled")
+
+	// 3) 放行上游，让僵尸迟返回。
+	releaseOnce.Do(func() { close(release) })
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("run goroutine 未返回")
+	}
+
+	// 4) 证明走的是真实 stopped 早退：被 cancel 的僵尸写不出 success。
+	rows := readAgentCoreJournalRows(t, sessionID)
+	last := rows[len(rows)-1]
+	if status, _ := last["status"].(string); status != "stopped" {
+		t.Fatalf("journal end status = %q, want stopped（僵尸必经 ctx.Err() 早退，事件 %v）", status, log.types())
+	}
+	for _, row := range rows {
+		if role, _ := row["role"].(string); role == "assistant" {
+			t.Fatalf("journal 出现僵尸 assistant 行：%v", row)
+		}
+	}
+
+	m.mu.Lock()
+	resume := m.sessions[sessionID].resumeSessionID
+	binding := m.bindings[sessionID]
+	history := append([]agentAIMessage(nil), m.sessions[sessionID].history...)
+	m.mu.Unlock()
+
+	if resume != "" {
+		t.Fatalf("resumeSessionID = %q, want 空（僵尸不得为 Retry 留恢复点）", resume)
+	}
+	if binding.NativeSessionID != "" {
+		t.Fatalf("bindings 仍指向僵尸会话 %q（runStart 会从 confirmed 绑定取 resumeID）", binding.NativeSessionID)
+	}
+	if len(history) != 1 {
+		t.Fatalf("history len = %d, want 1（僵尸的 assistant 输出必须被丢弃）", len(history))
+	}
+}
+
+// TestZombieLateNativeSessionIDDoesNotRebind 锁死 onNativeSessionID 的围栏。
+//
+// 被 cancel 却忽略取消、卡住很久的僵尸，完全可能在强拆撤销之后才吐出
+// system/init。没有围栏时它会把 m.bindings 与 session.resumeSessionID 重新
+// 写回去，污染照样成立。围栏必须挡在 confirmBinding 之前，且不发
+// ai.session.bound（手机不该看到一个已判死回合的绑定帧）。
+func TestZombieLateNativeSessionIDDoesNotRebind(t *testing.T) {
+	setTestAgentHome(t)
+	// identity 状态走全局 cache 单例，必须重置才能隔离到临时目录。
+	t.Setenv("ALIANG_CACHE_DIR", t.TempDir())
+	cache.ResetCacheDirForTest()
+	t.Cleanup(cache.ResetCacheDirForTest)
+
+	m := newAgentAIManager()
+	const sessionID = "conv-agentcore-late-bind"
+	const runSeq = 4
+	activity := newAgentAIActivity()
+	_, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	registerTestAISession(t, m, &agentAISession{
+		id:       sessionID,
+		runSeq:   runSeq,
+		cancel:   cancel,
+		activity: activity,
+	})
+
+	log := &agentCoreEventLog{}
+	run := agentAIRun{
+		sessionID: sessionID,
+		runSeq:    runSeq,
+		runID:     "run-late-bind",
+		messageID: "msg-late-bind",
+		provider:  "agentcore",
+		activity:  activity,
+		cancel:    cancel,
+	}
+	run.guard = m.attachRunGuard(run, log.write)
+	if run.guard == nil {
+		t.Fatal("guard 未挂载")
+	}
+
+	// 先走一遍真实强拆链路，撤销已经发生。
+	run.guard.kill("stalled")
+	run.guard.forceFinalize("stalled")
+
+	// 僵尸迟到的 system/init。
+	_, fenced, err := m.bindAgentCoreNativeSession(run, log.write, "agentcore-late-1")
+	if err != nil {
+		t.Fatalf("围栏丢弃不该报错: %v", err)
+	}
+	if !fenced {
+		t.Fatal("强拆之后到达的绑定必须被围栏丢弃")
+	}
+
+	m.mu.Lock()
+	binding := m.bindings[sessionID]
+	resume := m.sessions[sessionID].resumeSessionID
+	m.mu.Unlock()
+	if binding.NativeSessionID != "" {
+		t.Fatalf("迟到绑定写回 m.bindings：%q", binding.NativeSessionID)
+	}
+	if resume != "" {
+		t.Fatalf("迟到绑定写回 resumeSessionID：%q", resume)
+	}
+	if got := log.count(models.AgentEventAISessionBound); got != 0 {
+		t.Fatalf("僵尸迟到绑定不得发 ai.session.bound，实际 %d 帧", got)
+	}
+}
+
+// TestFinalizeStalledGuardRevokesMidRunResumePoint 锁死撤销的判据边界。
+//
+// 撤销只在「起跑时没有恢复点」时动手，且绑定还必须与起跑快照不同——否则可能
+// 把上一轮合法恢复点误清。guard 身份不匹配时一律不碰会话。
+func TestFinalizeStalledGuardRevokesMidRunResumePoint(t *testing.T) {
+	type testCase struct {
+		name           string
+		resumeAtStart  string
+		bindingAtStart string
+		midRunResume   string
+		midRunBinding  string
+		guardMismatch  bool
+		wantResume     string
+		wantBinding    string
+		wantCode       string
+		wantOK         bool
+	}
+	cases := []testCase{
+		{
+			name:           "起跑已有恢复点不撤销",
+			resumeAtStart:  "agentcore-prev",
+			bindingAtStart: "agentcore-prev",
+			midRunResume:   "agentcore-new",
+			midRunBinding:  "agentcore-new",
+			wantResume:     "agentcore-new",
+			wantBinding:    "agentcore-new",
+			wantOK:         true,
+		},
+		{
+			// 可达形态：绑定由云端预分配（reserveBinding 写 State:"reserved"，
+			// 只占住 native id，run.resumeSessionID 仍为空）。此时起跑快照
+			// bindingAtStart 非空、resumeAtStart 为空，撤销必须忍住不动——这个
+			// 绑定在起跑前就存在，不属于本回合。已确认（confirmed）的形态在起跑
+			// 路径就会填 run.resumeSessionID，resumeAtStart 非空、更早命中另一条
+			// 判据退出，走不到这里。
+			name:           "起跑已有绑定不撤销",
+			bindingAtStart: "agentcore-prev",
+			midRunBinding:  "agentcore-prev",
+			wantResume:     "",
+			wantBinding:    "agentcore-prev",
+			wantOK:         true,
+		},
+		{
+			name:          "guard 身份不匹配不碰会话",
+			midRunResume:  "agentcore-new",
+			midRunBinding: "agentcore-new",
+			guardMismatch: true,
+			wantResume:    "agentcore-new",
+			wantBinding:   "agentcore-new",
+			wantCode:      "guard_replaced",
+			wantOK:        false,
+		},
+		{
+			name:          "起跑无恢复点且中途钉入则撤销",
+			midRunResume:  "agentcore-new",
+			midRunBinding: "agentcore-new",
+			wantResume:    "",
+			wantBinding:   "",
+			wantOK:        true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("ALIANG_CACHE_DIR", t.TempDir())
+			cache.ResetCacheDirForTest()
+			t.Cleanup(cache.ResetCacheDirForTest)
+
+			m := newAgentAIManager()
+			const sessionID = "conv-finalize-revoke"
+			activity := newAgentAIActivity()
+			_, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			session := &agentAISession{
+				id:       sessionID,
+				runSeq:   2,
+				cancel:   cancel,
+				activity: activity,
+			}
+			m.mu.Lock()
+			m.sessions[sessionID] = session
+			if tc.bindingAtStart != "" {
+				m.bindings[sessionID] = agentAIBindingRecord{
+					ConversationID:  sessionID,
+					NativeSessionID: tc.bindingAtStart,
+					State:           "confirmed",
+				}
+			}
+			m.mu.Unlock()
+
+			run := agentAIRun{
+				sessionID:       sessionID,
+				runID:           "run-revoke",
+				messageID:       "msg-revoke",
+				runSeq:          session.runSeq,
+				resumeSessionID: tc.resumeAtStart,
+				activity:        activity,
+				cancel:          cancel,
+			}
+			rec := &recordingWriter{}
+			guard := m.attachRunGuard(run, rec.write)
+			if guard == nil {
+				t.Fatal("guard 未挂载")
+			}
+
+			// 模拟流式途中 confirmBinding 的钉入。
+			m.mu.Lock()
+			session.resumeSessionID = tc.midRunResume
+			if tc.midRunBinding != "" {
+				m.bindings[sessionID] = agentAIBindingRecord{
+					ConversationID:  sessionID,
+					NativeSessionID: tc.midRunBinding,
+					State:           "confirmed",
+				}
+			}
+			if tc.guardMismatch {
+				session.guard = newAgentAIRunGuard(m, run, rec.write)
+			}
+			m.mu.Unlock()
+
+			code, ok := m.finalizeStalledGuard(guard, rec.write)
+			if code != tc.wantCode || ok != tc.wantOK {
+				t.Fatalf("finalizeStalledGuard = (%q, %t), want (%q, %t)", code, ok, tc.wantCode, tc.wantOK)
+			}
+
+			m.mu.Lock()
+			gotResume := session.resumeSessionID
+			gotBinding := m.bindings[sessionID].NativeSessionID
+			m.mu.Unlock()
+			if gotResume != tc.wantResume {
+				t.Fatalf("resumeSessionID = %q, want %q", gotResume, tc.wantResume)
+			}
+			if gotBinding != tc.wantBinding {
+				t.Fatalf("binding = %q, want %q", gotBinding, tc.wantBinding)
+			}
+			if tc.wantOK && tc.wantBinding == "" && tc.midRunBinding != "" {
+				// 撤销必须落盘：重启后 loadIdentityState 不能把僵尸绑定读回来。
+				path, err := agentAIIdentityPath()
+				if err != nil {
+					t.Fatalf("identity path: %v", err)
+				}
+				raw, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatalf("persistIdentityState 未被触达: %v", err)
+				}
+				if strings.Contains(string(raw), tc.midRunBinding) {
+					t.Fatalf("identity 文件仍含僵尸绑定 %q: %s", tc.midRunBinding, raw)
+				}
+			}
+		})
+	}
+}
+
+// TestZombieSuccessWritesFencedWhenGuardReplaced 锁死成功收尾段的纵深防御：
+// /clear 把 runSeq 归零后，下一回合会复用同一个 runSeq，只比 runSeq 挡不住
+// 旧回合的僵尸迟返回；guard 指针不同即判为非本回合。
+//
+// 这里只断言 history/journal——恢复点与绑定的撤销是 finalizeStalledGuard 的
+// 职责（判死路径必经 ctx.Err() 早退，走不到这段成功收尾）。
+func TestZombieSuccessWritesFencedWhenGuardReplaced(t *testing.T) {
+	setTestAgentHome(t)
+	_, srv := newAgentCoreUpstream(t, agentCoreTextTurn("你好", "，世界"))
+	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
+	t.Setenv("ANTHROPIC_MODEL", "")
+
+	m := newAgentAIManager()
+	const sessionID = "conv-agentcore-reuse"
+	const runSeq = 1
+	registerTestAISession(t, m, &agentAISession{
+		id:      sessionID,
+		runSeq:  runSeq,
+		cancel:  func() {},
+		history: []agentAIMessage{{Role: "user", Content: "旧回合的提问"}},
+	})
+
+	log := &agentCoreEventLog{}
+
+	// 必须用 newAgentAIRunGuard 构造：markRunGuardDone 会对 session.guard
+	// 调 markDone()（close(g.done)），裸字面量的 nil done 会 panic。
+	currentRun := agentAIRun{sessionID: sessionID, runSeq: runSeq, activity: newAgentAIActivity(), cancel: func() {}}
+	currentGuard := newAgentAIRunGuard(m, currentRun, log.write)
+
+	run := agentAIRun{
+		sessionID:   sessionID,
+		runSeq:      runSeq,
+		messageID:   "msg-zombie",
+		provider:    "agentcore",
+		model:       "glm-5.2",
+		projectPath: t.TempDir(),
+		activity:    newAgentAIActivity(),
+	}
+	run.guard = newAgentAIRunGuard(m, run, log.write) // 僵尸自己的 guard
+
+	// 会话当前挂的是「新回合」的 guard，runSeq 却与僵尸相同（/clear 复用）。
+	m.mu.Lock()
+	m.sessions[sessionID].guard = currentGuard
+	m.mu.Unlock()
+
+	m.runAgentCore(context.Background(), run, log.write)
+
+	m.mu.Lock()
+	history := append([]agentAIMessage(nil), m.sessions[sessionID].history...)
+	m.mu.Unlock()
+	if len(history) != 1 {
+		t.Fatalf("history len = %d, want 1（guard 不同即非本回合，不得写入）", len(history))
+	}
+	rows := readAgentCoreJournalRows(t, sessionID)
+	if len(rows) == 0 {
+		t.Fatal("journal 为空，缺 end 行")
+	}
+	for _, row := range rows {
+		if role, _ := row["role"].(string); role == "assistant" {
+			t.Fatalf("journal 出现僵尸 assistant 行：%v", row)
+		}
+	}
+	// endStatus 必须保持默认的 "error"：收尾被守卫拒绝时若记 success，
+	// journal 就会出现 end(success) 却查无 assistant 行的自相矛盾。
+	last := rows[len(rows)-1]
+	if status, _ := last["status"].(string); status != "error" {
+		t.Fatalf("journal end status = %q, want error（收尾被守卫拒绝，不得记 success）", status)
+	}
+	if got := log.count(models.AgentEventAIDone); got != 1 {
+		t.Fatalf("ai.done 数量 = %d, want 1", got)
+	}
+
+	// 收尾 defer 的 guard 接线必须承重：僵尸退出时不得碰新回合的
+	// cancel / guard / done。三条断言各锁一处（clearRunning 的 guard、
+	// markRunGuardDone 的 guard、会话复位），删任一处都会让本用例变红。
+	m.mu.Lock()
+	session := m.sessions[sessionID]
+	currentGuardAfter := session.guard
+	cancelAfter := session.cancel
+	m.mu.Unlock()
+
+	if currentGuardAfter != currentGuard {
+		t.Fatalf("session.guard = %p, want 新回合的 guard %p（僵尸收尾不得摘掉新回合的 guard）",
+			currentGuardAfter, currentGuard)
+	}
+	select {
+	case <-currentGuard.done:
+		t.Fatal("新回合 guard 的 done 被关闭：宽限期强拆保护被僵尸收尾禁用")
+	default:
+	}
+	if cancelAfter == nil {
+		t.Fatal("session.cancel 被僵尸收尾清空：新回合的 stop 能力被拆掉")
+	}
+}
+
+// TestZombieLateRunCLICleanupKeepsNewTurn 锁死 runCLI 收尾 defer 的 guard 身份。
+//
+// runCLI 在 m.runAgentCore(...) 返回之后还要跑自己的 clearRunning——内核路径
+// 是同一 goroutine 内联调用，所以僵尸迟返回时，agentcore 内部那两个带 guard
+// 的 defer 会正确跳过，控制权却回到 runCLI 的 defer。若那里只比 runSeq，
+// /clear 归零后新回合复用同一个 runSeq，guardOwns 恒真，僵尸就会把新回合的
+// cancel / activity / guard / steer 通道一并拆掉。
+func TestZombieLateRunCLICleanupKeepsNewTurn(t *testing.T) {
+	setTestAgentHome(t)
+
+	m := newAgentAIManager()
+	const sessionID = "conv-agentcore-runcli-late"
+	const runSeq = 1
+	registerTestAISession(t, m, &agentAISession{
+		id:      sessionID,
+		runSeq:  runSeq,
+		cancel:  func() {},
+		history: []agentAIMessage{{Role: "user", Content: "旧回合的提问"}},
+	})
+
+	log := &agentCoreEventLog{}
+
+	// 新回合（/clear 之后）挂在会话上的 guard A。
+	newTurnRun := agentAIRun{sessionID: sessionID, runSeq: runSeq, activity: newAgentAIActivity(), cancel: func() {}}
+	newTurnGuard := newAgentAIRunGuard(m, newTurnRun, log.write)
+	// 新回合的 steer 通道 C：真实时序里它在僵尸仍在中途时就已挂上（attachCoreSteer
+	// 只比 runSeq），所以僵尸收尾时抓到的正是它。
+	newTurnSteer := newAgentAICoreSteerControl(newTurnRun, log.write)
+
+	m.mu.Lock()
+	m.sessions[sessionID].guard = newTurnGuard
+	m.sessions[sessionID].coreSteer = newTurnSteer
+	m.mu.Unlock()
+
+	// 上游在**请求到达时**才挂 C——此时内核的attachCoreSteer 已经跑过，
+	// 等价于「僵尸在飞、新回合接管会话」的真实交错，且不依赖 sleep。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		m.mu.Lock()
+		if session := m.sessions[sessionID]; session != nil {
+			session.guard = newTurnGuard
+			session.coreSteer = newTurnSteer
+		}
+		m.mu.Unlock()
+
+		if _, err := io.ReadAll(r.Body); err != nil {
+			t.Errorf("读取请求体失败: %v", err)
+		}
+		w.Header().Set("content-type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "data: %s\n\n", agentCoreTextTurn("你好", "，世界"))
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+	}))
+	t.Cleanup(srv.Close)
+	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
+	t.Setenv("ANTHROPIC_MODEL", "")
+
+	run := agentAIRun{
+		sessionID:   sessionID,
+		runSeq:      runSeq,
+		messageID:   "msg-runcli-zombie",
+		provider:    "agentcore",
+		model:       "glm-5.2",
+		projectPath: t.TempDir(),
+		activity:    newAgentAIActivity(),
+	}
+	run.guard = newAgentAIRunGuard(m, run, log.write) // 僵尸自己的 guard B
+
+	m.runCLI(context.Background(), run, log.write)
+
+	m.mu.Lock()
+	session := m.sessions[sessionID]
+	cancel := session.cancel
+	curGuard := session.guard
+	curSteer := session.coreSteer
+	m.mu.Unlock()
+
+	if cancel == nil {
+		t.Fatal("session.cancel 被僵尸的 runCLI 收尾清空：新回合的 stop 能力被拆掉")
+	}
+	if curGuard != newTurnGuard {
+		t.Fatalf("session.guard = %p, want 新回合的 guard %p（僵尸收尾不得摘掉新回合的 guard）", curGuard, newTurnGuard)
+	}
+	select {
+	case <-newTurnGuard.done:
+		t.Fatal("新回合 guard 的 done 被关闭：宽限期强拆保护被僵尸收尾禁用")
+	default:
+	}
+	if curSteer != newTurnSteer {
+		t.Fatalf("session.coreSteer = %p, want 新回合的通道 %p（僵尸收尾不得关闭/摘掉新回合的 steer）", curSteer, newTurnSteer)
+	}
+	if code, err := curSteer.deliver(agentAISteerMessage{MessageID: "late-steer", Content: "还在吗"}); err != nil || code != "queued" {
+		t.Fatalf("新回合 steer deliver = (%q, %v), want (queued, nil)：通道已被关闭", code, err)
+	}
+}
+
+// agentCoreSingleTextTurn 与 agentCoreTextTurn 同形，但把整段文本用
+// strconv.Quote 转义后塞进一个 delta——需要换行（aliang-options 围栏）时用它。
+func agentCoreSingleTextTurn(text string) string {
+	return `{"type":"message_start","message":{"id":"msg_opt","model":"glm-5.2"}}` + "\n\n" +
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}` + "\n\n" +
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":` + strconv.Quote(text) + `}}` + "\n\n" +
+		`data: {"type":"content_block_stop","index":0}` + "\n\n" +
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}`
+}
+
+// TestZombieSuccessDoesNotEmitOptionRequestWhenGuardReplaced 锁死方案请求的
+// guard 围栏。
+//
+// emitOptionRequest 原本只校验 session.runSeq != run.runSeq——那正是本任务
+// 废除的不稳定身份（/clear 归零后新回合复用同一个值）。僵尸迟返回时若它仍
+// 写 session.pendingOption，新回合正在等用户选择的那张卡就会被顶掉：用户点
+// 下去 option_id 对不上，选择被静默丢弃。
+//
+// 「本回合」子用例是阳性对照：它证明这段 assistant 文本确实能被提取成方案块，
+// 免得围栏测试因为文本写错而假绿。
+func TestZombieSuccessDoesNotEmitOptionRequestWhenGuardReplaced(t *testing.T) {
+	const optionText = "给你两个方案：\n\n```aliang-options\n" +
+		`{"title":"选择方案","options":[{"id":"a","label":"方案A"},{"id":"b","label":"方案B"}],"allow_custom":true}` +
+		"\n```\n"
+
+	cases := []struct {
+		name        string
+		zombie      bool
+		wantFrames  int
+		wantPending bool
+	}{
+		{name: "本回合照常发方案请求", zombie: false, wantFrames: 1, wantPending: true},
+		{name: "僵尸迟返回不发方案请求", zombie: true, wantFrames: 0, wantPending: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			setTestAgentHome(t)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if _, err := io.ReadAll(r.Body); err != nil {
+					t.Errorf("读取请求体失败: %v", err)
+				}
+				w.Header().Set("content-type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				fmt.Fprintf(w, "data: %s\n\n", agentCoreSingleTextTurn(optionText))
+				if flusher, ok := w.(http.Flusher); ok {
+					flusher.Flush()
+				}
+			}))
+			t.Cleanup(srv.Close)
+			t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
+			t.Setenv("ANTHROPIC_MODEL", "")
+
+			m := newAgentAIManager()
+			const sessionID = "conv-agentcore-option-fence"
+			const runSeq = 1
+			registerTestAISession(t, m, &agentAISession{
+				id:      sessionID,
+				runSeq:  runSeq,
+				cancel:  func() {},
+				history: []agentAIMessage{{Role: "user", Content: "旧回合的提问"}},
+			})
+
+			log := &agentCoreEventLog{}
+			currentRun := agentAIRun{sessionID: sessionID, runSeq: runSeq, activity: newAgentAIActivity(), cancel: func() {}}
+			currentGuard := newAgentAIRunGuard(m, currentRun, log.write)
+
+			run := agentAIRun{
+				sessionID:   sessionID,
+				runSeq:      runSeq,
+				messageID:   "msg-option-zombie",
+				provider:    "agentcore",
+				model:       "glm-5.2",
+				projectPath: t.TempDir(),
+				activity:    newAgentAIActivity(),
+			}
+			run.guard = newAgentAIRunGuard(m, run, log.write)
+
+			// 两种形态都让会话挂 currentGuard；本回合把 run.guard 也换成它
+			// （身份一致），僵尸则保留自己那个不同的 guard B。
+			m.mu.Lock()
+			m.sessions[sessionID].guard = currentGuard
+			m.mu.Unlock()
+			if !tc.zombie {
+				run.guard = currentGuard
+			}
+
+			m.runAgentCore(context.Background(), run, log.write)
+
+			m.mu.Lock()
+			pending := m.sessions[sessionID].pendingOption
+			m.mu.Unlock()
+
+			if got := log.count(models.AgentEventAIOptionRequest); got != tc.wantFrames {
+				t.Fatalf("ai.option.request 数量 = %d, want %d", got, tc.wantFrames)
+			}
+			if gotPending := pending != nil; gotPending != tc.wantPending {
+				t.Fatalf("session.pendingOption 存在 = %v, want %v（pending=%+v）", gotPending, tc.wantPending, pending)
+			}
+		})
+	}
+}
+
+// 【本轮应修-4】L1 半开流必须变成一条 ai.error。
+//
+// 2026-10-27 事故形态：上游发了半帧就静默，连接既不断也不再有字节，Read 永久
+// 阻塞，整轮 run 卡在内核里，手机永远停在「进行中」，而事件流里一条错误都没有。
+// idleTimeoutReader 就是为这个形态加的（stream_idle.go），本用例锁死它一路
+// 走到手机的效果。
+//
+// 构造要点（改动前先读完再动）：
+//   - 上游只写**一帧**合法 SSE 后保持连接 OPEN。绝不能写完就 return：handler
+//     返回会让 transport 收到 FIN，parseSSE 把 EOF 当**正常结束**，用例会退化
+//     成"上游优雅收尾"，永远绿。
+//   - 窗口用环境变量压到 200ms。默认 90s，真等就是把整包测试拖死；而这条路径
+//     之外的任何断言都替代不了它（半开 ≠ EOF ≠ 4xx）。
+func TestRunAgentCoreReportsStalledStreamAsError(t *testing.T) {
+	setTestAgentHome(t)
+
+	release := make(chan struct{})
+	var requests int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requests, 1)
+		_, _ = io.ReadAll(r.Body)
+		w.Header().Set("content-type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		// 一帧合法 SSE：证明"确实收到了上游的字节"，随后的静默才是停滞，
+		// 而不是握手失败。
+		_, _ = fmt.Fprintf(w, "data: %s\n\n", `{"type":"message_start","message":{"id":"msg_stall","model":"glm-5.2"}}`)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-release // 半开：不再写一个字节，也不关连接
+	}))
+	t.Cleanup(func() {
+		close(release)
+		srv.Close()
+	})
+	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
+	t.Setenv("ANTHROPIC_MODEL", "")
+	t.Setenv("ALIANG_AGENTCORE_STREAM_IDLE_TIMEOUT", "200ms")
+
+	m := newAgentAIManager()
+	const sessionID = "conv-agentcore-stream-stall"
+	const runSeq = 1
+	m.registerAISessionLocked(&agentAISession{
+		id:      sessionID,
+		runSeq:  runSeq,
+		history: []agentAIMessage{{Role: "user", Content: "你好"}},
+	})
+
+	log := &agentCoreEventLog{}
+	run := agentAIRun{
+		sessionID:   sessionID,
+		runSeq:      runSeq,
+		messageID:   "msg-stream-stall",
+		provider:    "agentcore",
+		model:       "glm-5.2",
+		projectPath: t.TempDir(),
+		activity:    newAgentAIActivity(),
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		m.runAgentCore(context.Background(), run, log.write)
+	}()
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatalf("runAgentCore 未在停滞窗口后返回：半开流把整轮 run 卡死了（事件 %v）", log.types())
+	}
+
+	// 恰好一条 ai.error：少一条手机一直「进行中」，多一条手机看到重复错误气泡。
+	errs := log.filter(models.AgentEventAIError)
+	if len(errs) != 1 {
+		t.Fatalf("ai.error 数量 = %d, want 1（序列 %v）", len(errs), log.types())
+	}
+	msg, _ := errs[0]["error"].(string)
+	if strings.TrimSpace(msg) == "" {
+		t.Fatalf("ai.error 的 error 为空：手机只会看到一条没有原因的失败 %v", errs[0])
+	}
+	if got := log.count(models.AgentEventAIDone); got != 0 {
+		t.Fatalf("停滞回合不该发 ai.done，实际 %d 条（序列 %v）", got, log.types())
+	}
+	// 停滞不可重试：重试会让本尝试已下发的 start/text 帧变成重复内容。
+	if got := atomic.LoadInt32(&requests); got != 1 {
+		t.Fatalf("上游请求次数 = %d, want 1（停滞必须不可重试）", got)
 	}
 }

@@ -56,6 +56,8 @@ type agentAIManager struct {
 	// manager), used to evaluate the device approval policy. nil for standalone
 	// test managers, which fall back to GetSharedAgentService().
 	service *AgentService
+	// scanOnce 保证 stale 扫描器每个 manager 只启动一条。
+	scanOnce sync.Once
 }
 
 func (m *agentAIManager) activeVibeSessionsSnapshot() []models.AgentVibeSession {
@@ -300,11 +302,19 @@ type agentAISession struct {
 	// isGoalFork marks a fork (re-planning exploration) session. #5: its runs are
 	// forced read-only (run.readOnly) so exploration can't mutate the workspace —
 	// real provider-level enforcement, not just a prompt.
-	isGoalFork          bool
-	cancel              context.CancelFunc
-	activeWriter        agentTerminalWriter
-	approvalToken       string
-	activity            *agentAIActivity
+	isGoalFork    bool
+	cancel        context.CancelFunc
+	activeWriter  agentTerminalWriter
+	approvalToken string
+	activity      *agentAIActivity
+	// guard 是本回合的收尾守卫（kill 观测 + 宽限强拆）。clearRunning 清空。
+	guard *agentAIRunGuard
+	// finalizedRunSeq 是「该 runSeq 已被强拆收尾」的显式标记（0 = 无）。
+	// 非帧副作用守卫靠它识别僵尸迟返回；不用 cancel == nil 判别，是因为
+	// 单测/TUI 路径注册的会话本来就没有 cancel，会把合法回合一起挡掉
+	// （会打红 6 个既有用例）。按 runSeq 记账，下一回合 runSeq 推进后自然失效，
+	// 不需要在起跑路径手工清零。
+	finalizedRunSeq     int
 	runSeq              int
 	activeRunID         string
 	goalIdentity        map[string]interface{}
@@ -417,6 +427,10 @@ type agentAIRun struct {
 	cancel                 context.CancelFunc
 	approvalToken          string
 	activity               *agentAIActivity
+	// guard 是本回合的收尾守卫指针，也是跨 /clear 唯一可靠的回合身份：
+	// /clear 把 runSeq 归零后会被新回合复用，只比 runSeq 无法区分「同一个
+	// runSeq 的不同回合」。未挂载（TUI / 单测路径）时为 nil。
+	guard *agentAIRunGuard
 	// subagents 跟踪本 run 的子 agent 生命周期（claude task_* 帧 / 兜底登记 /
 	// TUI 桥的 sidechain 目录 watch）。nil 安全（codex 路径不建）。
 	subagents    *agentAISubagentRegistry
@@ -1073,16 +1087,27 @@ type agentAIActivity struct {
 	// NOT raw output. A degenerate model loop (e.g. filler `echo` tool calls
 	// every few seconds for hours) keeps lastActivityAt fresh, so only the
 	// progress clock can distinguish "alive" from "getting anywhere".
-	lastProgressAt   atomic.Int64
-	awaitingApproval atomic.Bool
+	lastProgressAt atomic.Int64
+	// pendingApprovals 是并发的审批请求数（0=无人在等）。用计数而不是 bool，
+	// 是因为一个回合可能有多个审批重叠：A、B 同时在等时 A 先结束，B 仍需要
+	// 保住审批钟与 idlePaused——bool 会被 A 的 false 提前清掉，随后
+	// pendingToolUses>0 又把工具钟臂起，合法的人工等待会被工具天花板误杀。
+	pendingApprovals atomic.Int64
 	pendingToolUses  atomic.Int64
+	// approvalWaitStartedAt 是当前这段「等人工决策」的开始时刻（0=不在等）。
+	// 计数版下它不保证与 toolWaitStartedAt 互斥：第一个审批开启时清工具钟，
+	// 但期间若工具重新臂起（或第二个重叠审批不清工具钟），两钟可同时非零；
+	// 这不误判，因为 staleDeathReason 的 awaiting 分支优先于工具钟分支。
+	// 审批等待由 agentAIApprovalTimeout 单独约束，stale 扫描器也要能读到它。
+	approvalWaitStartedAt atomic.Int64
 	// toolWaitStartedAt is the UnixNano instant the current CONTIGUOUS
 	// tool/subagent wait began (0 = not waiting). The tool-wait watchdog uses
-	// it to bound hung tools/subagents that would otherwise survive until the
-	// hard ceiling while the progress heartbeat keeps telling the server the
-	// run is alive. Cleared while a human approval is pending so approval
-	// time never counts against the ceiling (approvals are bounded separately
-	// by agentAIApprovalTimeout).
+	// it to bound hung tools/subagents that would otherwise pin the run
+	// indefinitely (the hard ceiling no longer counts wait ticks) while the
+	// progress heartbeat keeps telling the server the run is alive. Cleared
+	// while a human approval is pending so approval time never counts against
+	// the ceiling (approvals are bounded separately by
+	// agentAIApprovalTimeout).
 	toolWaitStartedAt atomic.Int64
 	// activeSubagents counts in-flight subagent records (task_started …
 	// terminal frame / teardown). While >0 the idle and no-progress guards are
@@ -1136,31 +1161,68 @@ func (a *agentAIActivity) progressIdleFor() time.Duration {
 	return time.Since(time.Unix(0, last))
 }
 
-// setAwaitingApproval marks the run as blocked on a human decision (which pauses
-// the idle watchdog) and bumps activity so resolving a decision grants a fresh
-// idle window before the next output arrives.
+// setAwaitingApproval 登记/解除一个审批等待，并 bump 活动时间，让审批结束时
+// 拿到一个新的 idle 窗口。
+//
+// 用计数而非 bool：一个回合可能同时有多个审批（A、B 重叠）。只有第一个审批
+// 才起审批钟/清工具钟（后续重叠审批不能把人工等待上限往后推）；只有最后一个
+// 审批结束才清钟，并在工具仍在飞时重新臂起工具钟。
 func (a *agentAIActivity) setAwaitingApproval(v bool) {
 	if a == nil {
 		return
 	}
-	a.awaitingApproval.Store(v)
 	if v {
-		// Approval time is human time, not tool time: pause the tool-wait
-		// clock so a slow decision never trips the tool-wait ceiling.
-		a.toolWaitStartedAt.Store(0)
-	} else if a.pendingToolUses.Load() > 0 {
-		// Decision resolved but the tool is still in flight: re-arm with a
-		// fresh ceiling window for the remaining execution.
-		a.toolWaitStartedAt.Store(time.Now().UnixNano())
+		if a.pendingApprovals.Add(1) == 1 {
+			// Approval time is human time, not tool time: pause the tool-wait
+			// clock so a slow decision never trips the tool-wait ceiling.
+			a.approvalWaitStartedAt.Store(time.Now().UnixNano())
+			a.toolWaitStartedAt.Store(0)
+		}
+	} else {
+		// CAS 递减且不允许减到负数：多余的 false（重复解除）在 0 处直接 break。
+		for {
+			current := a.pendingApprovals.Load()
+			if current <= 0 {
+				// 多余 false 本身无害，但计数失衡（例如漏了 true 却发 false）
+				// 会让 awaiting() 长期为真，把该 run 拖到 24h 审批天花板，
+				// 所以要留痕。agentAIActivity 无会话身份，日志不带 id。
+				logger.Warn("[ai.activity] approval_release_without_pending")
+				break
+			}
+			if a.pendingApprovals.CompareAndSwap(current, current-1) {
+				if current-1 == 0 {
+					a.approvalWaitStartedAt.Store(0)
+					if a.pendingToolUses.Load() > 0 {
+						// Decision resolved but the tool is still in flight:
+						// re-arm with a fresh ceiling window for the remaining
+						// execution.
+						a.toolWaitStartedAt.Store(time.Now().UnixNano())
+					}
+				}
+				break
+			}
+		}
 	}
 	a.bump()
+}
+
+// approvalWaitFor 报告当前这段审批等待已持续多久，0 = 不在等待。
+func (a *agentAIActivity) approvalWaitFor() time.Duration {
+	if a == nil {
+		return 0
+	}
+	ts := a.approvalWaitStartedAt.Load()
+	if ts == 0 {
+		return 0
+	}
+	return time.Since(time.Unix(0, ts))
 }
 
 func (a *agentAIActivity) awaiting() bool {
 	if a == nil {
 		return false
 	}
-	return a.awaitingApproval.Load()
+	return a.pendingApprovals.Load() > 0
 }
 
 // toolWaitFor reports how long the current contiguous tool/subagent wait has
@@ -1213,7 +1275,43 @@ func (a *agentAIActivity) idlePaused() bool {
 	if a == nil {
 		return false
 	}
-	return a.awaitingApproval.Load() || a.pendingToolUses.Load() > 0 || a.activeSubagents.Load() > 0
+	return a.awaiting() || a.pendingToolUses.Load() > 0 || a.activeSubagents.Load() > 0
+}
+
+// staleDeathReason 判定这个 run 是否已经「无响应死」，返回原因码与结论。
+//
+// 口径（spec §3.3.1/§3.3.2）：
+//   - 审批等待态：只服 approvalTimeout，超过即判死。工具/子代理天花板在这里
+//     不参与评估——进入审批时工具钟已被清零（审批是人的时间，不是工具时间），
+//     所以「审批 + 子代理同时活跃」的收敛上界是 approvalTimeout。
+//   - 工具/子代理等待态（非审批）：不按 stale 阈值判死，只服各自天花板——
+//     toolCeiling、subagentCeiling。
+//   - 非等待态：lastActivityAt 距今超过 staleThreshold → stalled。activity 只由
+//     真实事件帧/审批帧/steer ack 刷新，ai.run.progress 心跳不参与（否则心跳
+//     会把一切判死判据击穿）。
+func (a *agentAIActivity) staleDeathReason(staleThreshold, approvalTimeout, toolCeiling, subagentCeiling time.Duration) (string, bool) {
+	if a == nil {
+		return "", false
+	}
+	if a.awaiting() {
+		if approvalTimeout > 0 && a.approvalWaitFor() > approvalTimeout {
+			return "approval_timeout", true
+		}
+		return "", false
+	}
+	if a.pendingToolUses.Load() > 0 || a.activeSubagents.Load() > 0 {
+		if toolCeiling > 0 && a.toolWaitFor() > toolCeiling {
+			return "tool_wait_timeout", true
+		}
+		if subagentCeiling > 0 && a.subagentWaitFor() > subagentCeiling {
+			return "subagent_wait_timeout", true
+		}
+		return "", false
+	}
+	if staleThreshold > 0 && a.idleFor() > staleThreshold {
+		return "stalled", true
+	}
+	return "", false
 }
 
 // beginSubagent marks that a subagent record went active (task_started). While
@@ -1317,13 +1415,14 @@ func (a *agentAIActivity) killReasonOr(fallback string) string {
 // startAIWatchdog cancels ctx when the run goes idle (no output for
 // agentAIIdleWindow and not awaiting approval/tool results), produces no
 // meaningful progress for agentAINoProgressWindow, a contiguous tool/subagent
-// wait outlives agentAIToolWaitCeiling, or the run exceeds agentAIHardCeiling.
-// It exits as soon as ctx is done, so it never outlives the run.
+// wait outlives agentAIToolWaitCeiling, or its engine-active time exceeds
+// agentAIHardCeiling. It exits as soon as ctx is done, so it never outlives
+// the run.
 func (m *agentAIManager) startAIWatchdog(ctx context.Context, activity *agentAIActivity, cancel context.CancelFunc) {
 	if activity == nil || cancel == nil {
 		return
 	}
-	go agentAIWatchdogLoop(ctx, activity, cancel, agentAIIdleWindow, agentAIHardCeiling, agentAINoProgressWindow, agentAIToolWaitCeiling, agentAISubagentWaitCeiling, agentAIIdleCheckInterval)
+	go agentAIWatchdogLoop(ctx, activity, m.wrapKillCancel(activity, cancel), agentAIIdleWindow, agentAIHardCeiling, agentAINoProgressWindow, agentAIToolWaitCeiling, agentAISubagentWaitCeiling, agentAIIdleCheckInterval)
 }
 
 // agentAIWatchdogLoop is the parameterized watchdog body, split out so tests can
@@ -1331,11 +1430,22 @@ func (m *agentAIManager) startAIWatchdog(ctx context.Context, activity *agentAIA
 func agentAIWatchdogLoop(ctx context.Context, activity *agentAIActivity, cancel context.CancelFunc, idleWindow, hardCeiling, noProgressWindow, toolWaitCeiling, subagentCeiling, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	// 引擎活跃时钟：逐拍累加，但处于任一合法等待态（审批/工具/子代理）的拍
+	// 不计入。口径见 spec §3.2 第 4 条——等待态各自有独立天花板，硬顶只管真实
+	// 干活时长，否则 3h 的子代理批处理会被 2h 硬顶误杀。按 ticker 粒度采样，
+	// 误差以一拍为界（生产 agentAIIdleCheckInterval 为 30s）。
+	lastTick := time.Now()
+	var engineActive time.Duration
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case now := <-ticker.C:
+			delta := now.Sub(lastTick)
+			lastTick = now
+			if !activity.idlePaused() {
+				engineActive += delta
+			}
 			if !activity.idlePaused() && activity.idleFor() > idleWindow {
 				activity.setKillReason("idle_timeout")
 				cancel()
@@ -1358,7 +1468,7 @@ func agentAIWatchdogLoop(ctx context.Context, activity *agentAIActivity, cancel 
 			// is hung. Every other guard is paused during such a wait by
 			// design, and the ai.run.progress heartbeat keeps feeding the
 			// server-side stale-run sweeper, so without this bound a hung
-			// subagent pins the run until the hard ceiling while the phone
+			// subagent pins the run indefinitely while the phone
 			// shows "running". The awaiting() re-check hardens against a
 			// theoretical stale-armed clock (a scheduler preemption inside
 			// beginToolUseWait's Add→Store window landing exactly as an
@@ -1381,7 +1491,7 @@ func agentAIWatchdogLoop(ctx context.Context, activity *agentAIActivity, cancel 
 				cancel()
 				return
 			}
-			if hardCeiling > 0 && time.Since(activity.runStart) > hardCeiling {
+			if hardCeiling > 0 && engineActive > hardCeiling {
 				activity.setKillReason("hard_ceiling")
 				cancel()
 				return
@@ -1407,7 +1517,7 @@ func agentAIRunStoppedStatus(activity *agentAIActivity, limiter *agentAIOutputLi
 	case "subagent_wait_timeout":
 		return "timeout", fmt.Sprintf("AI run subagent work exceeded %s without completing (suspected runaway subagent) and was stopped", agentAISubagentWaitCeiling)
 	case "hard_ceiling":
-		return "hard_timeout", fmt.Sprintf("AI run exceeded the maximum runtime %s", agentAIHardCeiling)
+		return "hard_timeout", fmt.Sprintf("AI run exceeded the maximum engine-active runtime %s (approval, tool and subagent waits are excluded)", agentAIHardCeiling)
 	}
 	if limiter != nil && limiter.Exceeded() {
 		return "output_limited", fmt.Sprintf("AI output exceeded rate limit (%d bytes per %s) or lifetime cap (%d bytes)", agentAIOutputRateBytes, agentAIOutputRateWindow, agentAIOutputCapBytes)
@@ -2001,6 +2111,7 @@ func (m *agentAIManager) applyLocalSlashCommand(session *agentAISession, name, a
 		session.resumeSessionID = ""
 		session.history = nil
 		session.runSeq = 0
+		session.finalizedRunSeq = 0
 		m.mu.Unlock()
 		return fmt.Sprintf("✓ /clear 已清空。下一轮将开启全新的 %s 会话。", agentAIProviderDisplayName(provider))
 	case "model":
@@ -2695,6 +2806,7 @@ func (m *agentAIManager) runUserMessage(session *agentAISession, runID, messageI
 	if svc := m.approvalService(); svc != nil {
 		svc.ensurePolicyBeforeRun(ctx, session.projectPath)
 	}
+	run.guard = m.attachRunGuard(run, emitter.emit)
 	m.startAIWatchdog(ctx, activity, cancel)
 	m.mu.Lock()
 	if current := m.sessions[run.sessionID]; current != nil && current.runSeq == run.runSeq {
@@ -2985,6 +3097,9 @@ func (m *agentAIManager) stop(msg map[string]interface{}, writeJSON agentTermina
 	if runWrite == nil {
 		runWrite = writeJSON
 	}
+	// TODO(ai-run-resilience): 此处的 cancel 不经过 agentAIRunGuard——卡死回合
+	// 上用户主动停止时没有 [ai.run.kill] 轨迹、也没有 30s 强拆兜底。见
+	// docs/superpowers/plans/2026-10-27-ai-run-resilience.md（计划未覆盖）。
 	if cancel != nil {
 		cancel()
 	} else if sourceSessionID != "" {
@@ -3034,6 +3149,9 @@ func (m *agentAIManager) preemptForGoalRun(
 	)
 	m.mu.Unlock()
 
+	// TODO(ai-run-resilience): 此处的 cancel 不经过 agentAIRunGuard——卡死回合
+	// 上用户主动停止时没有 [ai.run.kill] 轨迹、也没有 30s 强拆兜底。见
+	// docs/superpowers/plans/2026-10-27-ai-run-resilience.md（计划未覆盖）。
 	cancel()
 	m.emitApprovalCancelled(runWrite, sessionID, cancelledApprovals, "goal_run_preempted")
 
@@ -3793,13 +3911,21 @@ func agentAIApprovalMapKey(sessionID string, approvalID string) string {
 	return sessionID + "\x00" + approvalID
 }
 
-func (m *agentAIManager) clearRunning(sessionID string, runSeq int, writeJSON agentTerminalWriter) {
+// clearRunning 复位会话运行态。expectGuard 是可选的 guard 身份校验：给了就
+// 必须仍是该会话当前的 guard 才执行复位——/clear 会把 runSeq 归零后被新回合
+// 复用，只比 runSeq 会让迟到的强拆拆掉新回合（见 finalizeStalledGuard）。
+// 不传 expectGuard 的调用方行为与旧版逐字等价（guardOwns 恒真）。
+func (m *agentAIManager) clearRunning(sessionID string, runSeq int, writeJSON agentTerminalWriter, expectGuard ...*agentAIRunGuard) {
 	m.mu.Lock()
 	session := m.sessions[sessionID]
+	// 身份校验必须与复位在同一个临界区：独立的事前检查会留下「检查通过 →
+	// 新回合挂上 guard → 复位」的窗口，正是要消灭的竞态。
+	guardOwns := len(expectGuard) == 0 || expectGuard[0] == nil ||
+		(session != nil && session.guard == expectGuard[0])
 	var steerControl *agentAICodexSteerControl
 	var claudeSteerControl *agentAIClaudeSteerControl
 	var coreSteerControl *agentAICoreSteerControl
-	if session != nil && session.runSeq == runSeq {
+	if guardOwns && session != nil && session.runSeq == runSeq {
 		steerControl = session.codexSteer
 		claudeSteerControl = session.claudeSteer
 		coreSteerControl = session.coreSteer
@@ -3807,6 +3933,14 @@ func (m *agentAIManager) clearRunning(sessionID string, runSeq int, writeJSON ag
 		session.activeWriter = nil
 		session.approvalToken = ""
 		session.activity = nil
+		if session.guard != nil {
+			// 正常收尾也必须关闭 done。guard 挂在所有 provider 的回合上，而
+			// markRunGuardDone 只有 agentcore 路径调用；缺了这一步，codex/claude
+			// 回合被合法 kill 后 30s 还会再跑一次多余的强拆（终态被 emitter 闸
+			// 丢弃，但会多一条 force_finalize 日志 + 一个多余 goroutine）。
+			session.guard.markDone()
+			session.guard = nil
+		}
 		session.codexSteer = nil
 		session.claudeSteer = nil
 		session.coreSteer = nil
@@ -3814,7 +3948,10 @@ func (m *agentAIManager) clearRunning(sessionID string, runSeq int, writeJSON ag
 		session.goalIdentity = nil
 		session.history = trimAgentAIHistoryForSession(session, session.history)
 	}
-	cancelled := m.clearPendingApprovalsLocked(sessionID, runSeq, models.AgentAIApprovalDecisionCancel)
+	var cancelled []string
+	if guardOwns {
+		cancelled = m.clearPendingApprovalsLocked(sessionID, runSeq, models.AgentAIApprovalDecisionCancel)
+	}
 	m.mu.Unlock()
 	if steerControl != nil {
 		steerControl.close("not_running", "codex turn ended before steer was applied", "turn_ended")
@@ -3954,7 +4091,12 @@ const (
 type agentAIRunOutcome int
 
 func (m *agentAIManager) runCLI(ctx context.Context, run agentAIRun, writeJSON agentTerminalWriter) {
-	defer m.clearRunning(run.sessionID, run.runSeq, writeJSON)
+	// 必须带 guard：内核路径是在同一 goroutine 内联调用 runAgentCore 的，僵尸
+	// 迟返回时 agentcore 内部两个带 guard 的 defer 会正确跳过，控制权却回到这里。
+	// 若只比 runSeq，/clear 归零后新回合复用同一个值，就会把新回合的
+	// cancel/activity/guard/steer 与待审批一并拆掉。正常路径 session.guard
+	// 就是 run.guard，行为不变。
+	defer m.clearRunning(run.sessionID, run.runSeq, writeJSON, run.guard)
 	if run.cancel != nil {
 		defer run.cancel()
 	}
