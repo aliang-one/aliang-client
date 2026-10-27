@@ -372,7 +372,7 @@ func setAgentCoreMCPTestPolicy(t *testing.T, svc *AgentService, projectPath stri
 // 先注后跑即确定）。
 func startAgentCoreMCPApprovalRun(t *testing.T, policy ApprovalPolicy, turns ...string) *agentCoreMCPApprovalHarness {
 	t.Helper()
-	return startAgentCoreMCPApprovalRunWithMCP(t, policy, "", nil, turns...)
+	return startAgentCoreApprovalHarness(t, policy, turns)
 }
 
 // startAgentCoreMCPApprovalRunWithMCP 在骨架之上再注入一条 MCP server：把
@@ -383,19 +383,78 @@ func startAgentCoreMCPApprovalRun(t *testing.T, policy ApprovalPolicy, turns ...
 // 桥接）用它；mcpServerName 留空即退回无 MCP 的原骨架。
 func startAgentCoreMCPApprovalRunWithMCP(t *testing.T, policy ApprovalPolicy, mcpServerName string, mcpSession *mcp.ClientSession, turns ...string) *agentCoreMCPApprovalHarness {
 	t.Helper()
+	return startAgentCoreApprovalHarness(t, policy, turns, harnessMCP(mcpServerName, mcpSession))
+}
+
+// agentCoreHarnessOptions 是 startAgentCoreApprovalHarness 的可参数化项
+// （零值=原骨架常量，见 default 字段填充）。既有用例经上面两个薄包装以
+// 默认值进入；新用例（子 agent e2e 系）用 options 覆写 session/messageID/
+// 首条 user 消息/readOnly/子 agent 定义文件。
+type agentCoreHarnessOptions struct {
+	sessionID     string
+	messageID     string
+	firstUser     string
+	readOnly      bool
+	mcpServerName string
+	mcpSession    *mcp.ClientSession
+	// subagentFiles 是 .claude/agents/ 下的 文件名→内容。必须在
+	// setTestAgentHome **之后**由 harness 代写——调用方预写会被 harness
+	// 换 HOME 掉（T3 偏差③的顺序坑，收敛时一并修掉）。
+	subagentFiles map[string]string
+}
+
+type agentCoreHarnessOption func(*agentCoreHarnessOptions)
+
+func harnessSession(sessionID, messageID string) agentCoreHarnessOption {
+	return func(o *agentCoreHarnessOptions) { o.sessionID = sessionID; o.messageID = messageID }
+}
+
+func harnessFirstUser(text string) agentCoreHarnessOption {
+	return func(o *agentCoreHarnessOptions) { o.firstUser = text }
+}
+
+func harnessReadOnly() agentCoreHarnessOption {
+	return func(o *agentCoreHarnessOptions) { o.readOnly = true }
+}
+
+func harnessMCP(serverName string, session *mcp.ClientSession) agentCoreHarnessOption {
+	return func(o *agentCoreHarnessOptions) { o.mcpServerName = serverName; o.mcpSession = session }
+}
+
+func harnessSubagentDefs(files map[string]string) agentCoreHarnessOption {
+	return func(o *agentCoreHarnessOptions) { o.subagentFiles = files }
+}
+
+// startAgentCoreApprovalHarness 是参数化的组装核心：真 runAgentCore + 事件
+// 收集器 + 上游记录器 + 空内存 service 策略注入。options 未覆写的字段取
+// 原骨架默认（session/messageID 常量、首条 user 消息「调一下工具」）。
+func startAgentCoreApprovalHarness(t *testing.T, policy ApprovalPolicy, turns []string, opts ...agentCoreHarnessOption) *agentCoreMCPApprovalHarness {
+	t.Helper()
+	cfgOptions := agentCoreHarnessOptions{
+		sessionID: "conv-agentcore-mcp-approval",
+		messageID: "msg-mcp-approval",
+		firstUser: "调一下工具",
+	}
+	for _, opt := range opts {
+		opt(&cfgOptions)
+	}
+
 	setTestAgentHome(t) // journal 根与 MCP 采集都从 HOME 解析，双隔离
-	if mcpServerName != "" && mcpSession != nil {
+	for name, body := range cfgOptions.subagentFiles {
+		writeTestHomeFile(t, os.Getenv("HOME"), filepath.Join(".claude", "agents", name), body)
+	}
+	if cfgOptions.mcpServerName != "" && cfgOptions.mcpSession != nil {
 		writeTestHomeFile(t, os.Getenv("HOME"), ".claude.json",
-			`{"mcpServers":{"`+mcpServerName+`":{"command":"injected-for-test"}}}`)
+			`{"mcpServers":{"`+cfgOptions.mcpServerName+`":{"command":"injected-for-test"}}}`)
 	}
 	up, srv := newAgentCoreUpstream(t, turns...)
 	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
 	t.Setenv("ANTHROPIC_MODEL", "")
 
 	m := newAgentAIManager()
-	if mcpServerName != "" && mcpSession != nil {
+	if cfgOptions.mcpServerName != "" && cfgOptions.mcpSession != nil {
 		m.coreMCPDialForTest = func(context.Context, agentCoreMCPRawServer) (*mcp.ClientSession, func(), error) {
-			return mcpSession, func() {}, nil
+			return cfgOptions.mcpSession, func() {}, nil
 		}
 	}
 	// 空 service：approvalService() 不落 GetSharedAgentService()（测试进程里
@@ -406,30 +465,30 @@ func startAgentCoreMCPApprovalRunWithMCP(t *testing.T, policy ApprovalPolicy, mc
 	project := t.TempDir()
 	setAgentCoreMCPTestPolicy(t, svc, project, policy)
 
-	const sessionID = "conv-agentcore-mcp-approval"
-	const runSeq = 1
+	runSeq := 1
 	registerTestAISession(t, m, &agentAISession{
-		id:      sessionID,
+		id:      cfgOptions.sessionID,
 		runSeq:  runSeq,
-		history: []agentAIMessage{{Role: "user", Content: "调一下工具"}},
+		history: []agentAIMessage{{Role: "user", Content: cfgOptions.firstUser}},
 	})
 
 	log := &agentCoreEventLog{}
 	run := agentAIRun{
-		sessionID:   sessionID,
+		sessionID:   cfgOptions.sessionID,
 		runSeq:      runSeq,
-		messageID:   "msg-mcp-approval",
+		messageID:   cfgOptions.messageID,
 		provider:    "agentcore",
 		model:       "glm-5.2",
 		projectPath: project,
 		activity:    newAgentAIActivity(),
+		readOnly:    cfgOptions.readOnly,
 	}
 	finished := make(chan struct{})
 	go func() {
 		defer close(finished)
 		m.runAgentCore(context.Background(), run, log.write)
 	}()
-	return &agentCoreMCPApprovalHarness{m: m, log: log, up: up, finished: finished, sessionID: sessionID}
+	return &agentCoreMCPApprovalHarness{m: m, log: log, up: up, finished: finished, sessionID: cfgOptions.sessionID}
 }
 
 // decline 等到手机审批卡并模拟点「拒绝」。respond 带缓冲(1)，发送不阻塞。
@@ -845,52 +904,21 @@ func lastRequestToolResult(t *testing.T, reqs []agentcore.MessagesRequest, idx i
 // 红阶段锚点：未接线时主 run 的 tool_use 得「未知工具: reviewer」，上游停在
 // 2 条请求、tool_result 无「评审完成」——下方断言即红。
 func TestRunAgentCoreSubagentEndToEnd(t *testing.T) {
-	setTestAgentHome(t)
-	writeTestHomeFile(t, os.Getenv("HOME"), ".claude/agents/reviewer.md",
-		"---\nname: reviewer\ndescription: 代码评审\ntools: Read\n---\n你是评审员。")
-	up, srv := newAgentCoreUpstream(t,
+	// allow_all（DefaultDecision=auto_approve、零规则）：reviewer 非 mcp__
+	// 前缀不走默认门，全程短路放行、零审批卡。
+	h := startAgentCoreApprovalHarness(t, builtinAllowAllPolicy(), []string{
 		agentCoreToolTurn("toolu_sub1", "reviewer", `{"task":"评审 main.go"}`),
 		agentCoreTextTurn("评审完成：无问题", ""),
 		agentCoreTextTurn("好", "的"),
+	},
+		harnessSession("conv-agentcore-subagent-e2e", "msg-subagent-e2e"),
+		harnessFirstUser("评审一下 main.go"),
+		harnessSubagentDefs(map[string]string{
+			"reviewer.md": "---\nname: reviewer\ndescription: 代码评审\ntools: Read\n---\n你是评审员。",
+		}),
 	)
-	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
-	t.Setenv("ANTHROPIC_MODEL", "")
-
-	m := newAgentAIManager()
-	// 空 service + allow_all（DefaultDecision=auto_approve、零规则）：reviewer
-	// 非 mcp__ 前缀不走默认门，全程短路放行、零审批卡。
-	svc := &AgentService{}
-	m.service = svc
-	project := t.TempDir()
-	setAgentCoreMCPTestPolicy(t, svc, project, builtinAllowAllPolicy())
-
-	const sessionID = "conv-agentcore-subagent-e2e"
-	registerTestAISession(t, m, &agentAISession{
-		id:      sessionID,
-		runSeq:  1,
-		history: []agentAIMessage{{Role: "user", Content: "评审一下 main.go"}},
-	})
-
-	log := &agentCoreEventLog{}
-	run := agentAIRun{
-		sessionID:   sessionID,
-		runSeq:      1,
-		messageID:   "msg-subagent-e2e",
-		provider:    "agentcore",
-		model:       "glm-5.2",
-		projectPath: project,
-		activity:    newAgentAIActivity(),
-	}
-	finished := make(chan struct{})
-	go func() {
-		defer close(finished)
-		m.runAgentCore(context.Background(), run, log.write)
-	}()
-	select {
-	case <-finished:
-	case <-time.After(30 * time.Second):
-		t.Fatalf("runAgentCore 没有收敛（事件 %v）", log.types())
-	}
+	h.waitFinished(t)
+	log := h.log
 
 	// 1) 终止事件契约：恰 1 ai.done、0 ai.error、0 审批卡（reviewer 非 mcp__）。
 	if got := log.count(models.AgentEventAIDone); got != 1 {
@@ -906,7 +934,7 @@ func TestRunAgentCoreSubagentEndToEnd(t *testing.T) {
 	// 2) 请求链形状：主 run 第 1 回合 → 子 run（第 2 条）→ 主 run 第 2 回合
 	// （第 3 条，带 Task 的 tool_result）。未接线时「未知工具: reviewer」直接
 	// 回填、run 停在 2 条——本断言与下方 tool_result 内容断言共同构成红锚。
-	reqs := up.requests()
+	reqs := h.up.requests()
 	if len(reqs) != 3 {
 		t.Fatalf("上游请求次数 = %d, want 3（主1+子1+主2，事件 %v）", len(reqs), log.types())
 	}
@@ -951,12 +979,16 @@ func TestRunAgentCoreSubagentEndToEnd(t *testing.T) {
 		t.Fatalf("tool_result = %q, want 含「评审完成：无问题」（子 run 结果穿透递归回主 run）", content)
 	}
 
-	// 4) journal：恰好一行 Task 行（kind=tool tool=reviewer，非错误）。
-	lines := readJournalLines(t, agentCoreJournalDir(), sessionID)
+	// 4) journal：恰好一行 Task 行（kind=tool tool=reviewer，非错误，summary
+	// 形态与 MCP e2e 的 q="hi" 口径看齐）。
+	lines := readJournalLines(t, agentCoreJournalDir(), h.sessionID)
 	taskRows := 0
 	for _, row := range lines {
 		if row["kind"] == "tool" && row["tool"] == "reviewer" {
 			taskRows++
+			if row["summary"] != `task="评审 main.go"` {
+				t.Errorf("Task 行 summary = %v, want task=\"评审 main.go\"", row["summary"])
+			}
 			if row["is_error"] != false {
 				t.Errorf("Task 行 is_error = %v, want false: %v", row["is_error"], row)
 			}
@@ -981,31 +1013,10 @@ func TestRunAgentCoreSubagentApprovalPropagation(t *testing.T) {
 		q, _ := args["q"].(string)
 		return "echo:" + q, false
 	})
-	setTestAgentHome(t)
-	writeTestHomeFile(t, os.Getenv("HOME"), ".claude/agents/reviewer.md",
-		"---\nname: reviewer\ndescription: 代码评审\ntools: Read\n---\n你是评审员。")
-	writeTestHomeFile(t, os.Getenv("HOME"), ".claude.json",
-		`{"mcpServers":{"srv":{"command":"injected-for-test"}}}`)
-	up, srv := newAgentCoreUpstream(t,
-		agentCoreToolTurn("toolu_sub_ap", "reviewer", `{"task":"用 echo 查一下"}`),
-		agentCoreToolTurn("toolu_sub_mcp", "mcp__srv__echo", `{"q":"hi"}`),
-		agentCoreTextTurn("子收尾", ""),
-		agentCoreTextTurn("好", "的"),
-	)
-	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
-	t.Setenv("ANTHROPIC_MODEL", "")
-
-	m := newAgentAIManager()
-	m.coreMCPDialForTest = func(context.Context, agentCoreMCPRawServer) (*mcp.ClientSession, func(), error) {
-		return session, func() {}, nil
-	}
 	// 零命中规则 + DefaultDecision=auto_approve（镜像 NoRuleMatch 用例）：
 	// reviewer（非 mcp__）短路放行；子 run 的 mcp__srv__echo 无显式规则命中
 	// → 默认门强制手机审批。
-	svc := &AgentService{}
-	m.service = svc
-	project := t.TempDir()
-	setAgentCoreMCPTestPolicy(t, svc, project, ApprovalPolicy{
+	h := startAgentCoreApprovalHarness(t, ApprovalPolicy{
 		Scheme:          "custom",
 		DefaultDecision: decisionAutoApprove,
 		Rules: []approvalRule{{
@@ -1013,40 +1024,23 @@ func TestRunAgentCoreSubagentApprovalPropagation(t *testing.T) {
 			Match:    approvalRuleMatch{Tool: []string{"Other"}},
 			Decision: decisionAutoApprove,
 		}},
-	})
-
-	const sessionID = "conv-agentcore-subagent-approval"
-	registerTestAISession(t, m, &agentAISession{
-		id:      sessionID,
-		runSeq:  1,
-		history: []agentAIMessage{{Role: "user", Content: "评审并查询"}},
-	})
-
-	log := &agentCoreEventLog{}
-	run := agentAIRun{
-		sessionID:   sessionID,
-		runSeq:      1,
-		messageID:   "msg-subagent-approval",
-		provider:    "agentcore",
-		model:       "glm-5.2",
-		projectPath: project,
-		activity:    newAgentAIActivity(),
-	}
-	finished := make(chan struct{})
-	go func() {
-		defer close(finished)
-		m.runAgentCore(context.Background(), run, log.write)
-	}()
-
-	// 等子 run 的 mcp__ 审批卡并拒绝（镜像 Decline 用例的交互路径）。
-	waiter := waitForAgentCoreApproval(t, m, sessionID, log)
-	waiter.request.respond <- agentAIApprovalResponse{Decision: models.AgentAIApprovalDecisionDecline}
-
-	select {
-	case <-finished:
-	case <-time.After(30 * time.Second):
-		t.Fatalf("runAgentCore 没有收敛（事件 %v）", log.types())
-	}
+	}, []string{
+		agentCoreToolTurn("toolu_sub_ap", "reviewer", `{"task":"用 echo 查一下"}`),
+		agentCoreToolTurn("toolu_sub_mcp", "mcp__srv__echo", `{"q":"hi"}`),
+		agentCoreTextTurn("子收尾", ""),
+		agentCoreTextTurn("好", "的"),
+	},
+		harnessSession("conv-agentcore-subagent-approval", "msg-subagent-approval"),
+		harnessFirstUser("评审并查询"),
+		harnessSubagentDefs(map[string]string{
+			"reviewer.md": "---\nname: reviewer\ndescription: 代码评审\ntools: Read\n---\n你是评审员。",
+		}),
+		harnessMCP("srv", session),
+	)
+	// 等子 run 的 mcp__ 审批卡并拒绝（复用 harness 的交互路径）。
+	h.decline(t)
+	h.waitFinished(t)
+	log := h.log
 
 	// 审批事件：pending + resolved/decline 两条，工具名原样上卡。
 	requests := log.filter(models.AgentEventAIApprovalRequest)
@@ -1076,7 +1070,7 @@ func TestRunAgentCoreSubagentApprovalPropagation(t *testing.T) {
 
 	// 穿透验证：子 run 带着拒绝回填继续（第 3 条请求的 tool_result 含
 	// 「用户拒绝」），收尾文本穿透回主 run 第 4 条请求的 Task tool_result。
-	reqs := up.requests()
+	reqs := h.up.requests()
 	if len(reqs) != 4 {
 		t.Fatalf("上游请求次数 = %d, want 4（主1+子2+主2，事件 %v）", len(reqs), log.types())
 	}
@@ -1092,42 +1086,20 @@ func TestRunAgentCoreSubagentApprovalPropagation(t *testing.T) {
 // run 不注入子 agent 桥（mirror MCP 的只读决策——同一判据 run.readOnly）。
 // 防将来回归（如注入点挪到只读判定之前/之外）。
 func TestRunAgentCoreSubagentReadOnlyNotInjected(t *testing.T) {
-	setTestAgentHome(t)
-	writeTestHomeFile(t, os.Getenv("HOME"), ".claude/agents/reviewer.md",
-		"---\nname: reviewer\ndescription: 代码评审\ntools: Read\n---\n你是评审员。")
-	up, srv := newAgentCoreUpstream(t, agentCoreTextTurn("好的", ""))
-	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
-	t.Setenv("ANTHROPIC_MODEL", "")
-
-	m := newAgentAIManager()
-
-	const sessionID = "conv-agentcore-subagent-readonly"
-	registerTestAISession(t, m, &agentAISession{
-		id:      sessionID,
-		runSeq:  1,
-		history: []agentAIMessage{{Role: "user", Content: "只读问一句"}},
-	})
-	log := &agentCoreEventLog{}
-	run := agentAIRun{
-		sessionID:   sessionID,
-		runSeq:      1,
-		messageID:   "msg-subagent-readonly",
-		provider:    "agentcore",
-		model:       "glm-5.2",
-		projectPath: t.TempDir(),
-		activity:    newAgentAIActivity(),
-		readOnly:    true,
-	}
-	finished := make(chan struct{})
-	go func() {
-		defer close(finished)
-		m.runAgentCore(context.Background(), run, log.write)
-	}()
-	select {
-	case <-finished:
-	case <-time.After(30 * time.Second):
-		t.Fatalf("runAgentCore 没有收敛（事件 %v）", log.types())
-	}
+	// 与兄弟测试对齐：同样注入空 service + 显式策略（而非靠纯文本脚本绕开
+	// 审批面），readOnly 剥离子 agent 不依赖「恰好没调工具」的偶然性。
+	h := startAgentCoreApprovalHarness(t, builtinAllowAllPolicy(), []string{
+		agentCoreTextTurn("好的", ""),
+	},
+		harnessSession("conv-agentcore-subagent-readonly", "msg-subagent-readonly"),
+		harnessFirstUser("只读问一句"),
+		harnessSubagentDefs(map[string]string{
+			"reviewer.md": "---\nname: reviewer\ndescription: 代码评审\ntools: Read\n---\n你是评审员。",
+		}),
+		harnessReadOnly(),
+	)
+	h.waitFinished(t)
+	log := h.log
 
 	// run 照常收敛：只读剥离不是失败。
 	if got := log.count(models.AgentEventAIDone); got != 1 {
@@ -1137,7 +1109,7 @@ func TestRunAgentCoreSubagentReadOnlyNotInjected(t *testing.T) {
 		t.Fatalf("ai.error = %d, want 0（%v）", got, log.filter(models.AgentEventAIError))
 	}
 	// 行为级锁死：上游工具表零 reviewer 桥（没注册就没 advertised）。
-	reqs := up.requests()
+	reqs := h.up.requests()
 	if len(reqs) != 1 {
 		t.Fatalf("上游请求次数 = %d, want 1", len(reqs))
 	}
@@ -1147,7 +1119,7 @@ func TestRunAgentCoreSubagentReadOnlyNotInjected(t *testing.T) {
 		}
 	}
 	// journal 无 Task 行：没注入就没调用轨迹。
-	for _, row := range readJournalLines(t, agentCoreJournalDir(), sessionID) {
+	for _, row := range readJournalLines(t, agentCoreJournalDir(), h.sessionID) {
 		if row["kind"] == "tool" {
 			t.Fatalf("readOnly run 的 journal 不该有 tool 行: %v", row)
 		}

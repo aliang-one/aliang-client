@@ -209,19 +209,22 @@ func agentCoreSubagentModel(defModel, mainModel string) string {
 	return mainModel
 }
 
-// subRegistry 组装子 run 工具表：内置 8（frontmatter 白名单生效，大写规范名
+// subRegistry 组装子 run 工具表：内置工具（遍历 agentcore.DefaultRegistry
+// 的 Defs() 派生——内核加新工具自动跟进，frontmatter 白名单生效，规范名
 // 精确匹配，白名单未知名忽略+Warn）+ MCP 桥（自带 onCall 无需装饰）；
 // **不含任何子 agent 桥（depth=1 结构保证）**。
 func (b *agentCoreSubagentBridge) subRegistry(mcpTools []agentcore.Tool, journal bool) *agentcore.Registry {
 	base := agentcore.DefaultRegistry()
 	registry := agentcore.NewRegistry()
-	kernelNames := []string{"Read", "Write", "Edit", "Bash", "PowerShell", "Grep", "Glob", "LS"}
-	for _, name := range kernelNames {
-		tool, ok := base.Get(name)
+	kernelDefs := base.Defs()
+	kernelNames := make([]string, 0, len(kernelDefs))
+	for _, def := range kernelDefs {
+		kernelNames = append(kernelNames, def.Name)
+		tool, ok := base.Get(def.Name)
 		if !ok {
-			continue
+			continue // 防御：Defs/Get 同源理论上不可达
 		}
-		if len(b.toolsWhitelist) > 0 && !containsString(b.toolsWhitelist, name) {
+		if len(b.toolsWhitelist) > 0 && !containsString(b.toolsWhitelist, def.Name) {
 			continue
 		}
 		if journal && b.onToolCall != nil {
@@ -314,12 +317,19 @@ func (b *agentCoreSubagentBridge) Execute(ctx context.Context, input map[string]
 	return agentcore.ToolResult{Content: truncateAgentCoreMCPOutput(text), IsError: isErr}
 }
 
-// agentCoreSubagentReservedNames 是子 agent 桥名必须避开的内核规范名
-// （DefaultRegistry 的 8 个）。reserved+seen 双表传入 agentCoreSubagentBridgeName。
-var agentCoreSubagentReservedNames = map[string]bool{
-	"Read": true, "Write": true, "Edit": true, "Bash": true,
-	"PowerShell": true, "Grep": true, "Glob": true, "LS": true,
-}
+// agentCoreSubagentReservedNames 是子 agent 桥名必须避开的内核规范名，
+// 从 agentcore.DefaultRegistry().Defs() 派生（包初始化时构建一次）——内核
+// 未来加第 9 个工具自动跟进，不会留下「手抄清单=旧 8 个」的漂移缺口，也就
+// 不会让子 agent 定义悄悄遮蔽新内核工具。测试
+// TestAgentCoreSubagentBridgeDepthOne 里的独立硬编码清单是有意的锁死
+// （独立清单恰能发现派生源漂移），勿「顺手」统一。
+var agentCoreSubagentReservedNames = func() map[string]bool {
+	names := map[string]bool{}
+	for _, def := range agentcore.DefaultRegistry().Defs() {
+		names[def.Name] = true
+	}
+	return names
+}()
 
 // agentCoreSubagentTools 采集 user 域子 agent 定义并包成桥——runAgentCore 的
 // 注入口（spec：2026-10-27-agentcore-subagents §3）。
@@ -358,15 +368,18 @@ func (m *agentAIManager) agentCoreSubagentTools(run agentAIRun,
 		for strings.HasPrefix(raw, "mcp__") {
 			raw = strings.TrimPrefix(raw, "mcp__")
 		}
+		name := agentCoreSubagentBridgeName(raw, agentCoreSubagentReservedNames, seen)
 		desc := def.Description
 		if strings.TrimSpace(desc) == "" {
-			desc = "子 agent " + def.Name + "（定义未写 description）"
+			// 占位引用消解后的工具名（非 def.Name）：原名以 mcp__ 开头的定义
+			// 经剥除后可调用名已变，占位若引原名会诱导模型调错工具。
+			desc = "子 agent " + name + "（定义未写 description）"
 		}
 		out = append(out, &agentCoreSubagentBridge{
 			client:         client,
 			mainModel:      mainModel,
 			defModel:       def.Model,
-			name:           agentCoreSubagentBridgeName(raw, agentCoreSubagentReservedNames, seen),
+			name:           name,
 			description:    desc,
 			body:           def.Body,
 			projectPath:    run.projectPath,
