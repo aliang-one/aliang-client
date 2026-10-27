@@ -800,6 +800,360 @@ func TestRunAgentCoreMCPEndToEnd(t *testing.T) {
 	}
 }
 
+// agentCoreToolDefNames 把请求工具表压成名字列表（失败信息可读用）。
+func agentCoreToolDefNames(defs []agentcore.ToolDef) []string {
+	names := make([]string, 0, len(defs))
+	for _, d := range defs {
+		names = append(names, d.Name)
+	}
+	return names
+}
+
+// lastRequestToolResult 取第 idx 条上游请求最后一条消息里的 tool_result
+// （内容 + is_error）。找不到即 fatal——脚本以工具回合开头时它必须存在。
+func lastRequestToolResult(t *testing.T, reqs []agentcore.MessagesRequest, idx int) (string, bool) {
+	t.Helper()
+	last := reqs[idx].Messages[len(reqs[idx].Messages)-1]
+	blocks, _ := last.Content.([]interface{})
+	for _, raw := range blocks {
+		block, _ := raw.(map[string]interface{})
+		if block == nil {
+			continue
+		}
+		if bt, _ := block["type"].(string); bt == agentcore.BlockTypeToolResult {
+			content, _ := block["content"].(string)
+			isErr, _ := block["is_error"].(bool)
+			return content, isErr
+		}
+	}
+	t.Fatalf("第 %d 条请求最后一条消息没有 tool_result: %+v", idx, last)
+	return "", false
+}
+
+// ---------------------------------------------------------------------------
+// 端到端：runAgentCore 的子 agent 注入（spec 2026-10-27-agentcore-subagents）
+// ---------------------------------------------------------------------------
+
+// TestRunAgentCoreSubagentEndToEnd 锁死子 agent 注入在真 run 里的完整链路：
+//
+//	采集（home 的 .claude/agents/reviewer.md）→ 包桥注册（主 run 第 1 回合
+//	工具表含 reviewer）→ 主 run tool_use 调 reviewer → 桥递归子 run（复用
+//	主 run 的 client/围栏/审批）→ 子 run 按 frontmatter 白名单只见 Read →
+//	子 run 文本结果穿透回主 run 第 2 回合的 tool_result → journal 记 Task 行
+//	→ run 收敛。
+//
+// 红阶段锚点：未接线时主 run 的 tool_use 得「未知工具: reviewer」，上游停在
+// 2 条请求、tool_result 无「评审完成」——下方断言即红。
+func TestRunAgentCoreSubagentEndToEnd(t *testing.T) {
+	setTestAgentHome(t)
+	writeTestHomeFile(t, os.Getenv("HOME"), ".claude/agents/reviewer.md",
+		"---\nname: reviewer\ndescription: 代码评审\ntools: Read\n---\n你是评审员。")
+	up, srv := newAgentCoreUpstream(t,
+		agentCoreToolTurn("toolu_sub1", "reviewer", `{"task":"评审 main.go"}`),
+		agentCoreTextTurn("评审完成：无问题", ""),
+		agentCoreTextTurn("好", "的"),
+	)
+	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
+	t.Setenv("ANTHROPIC_MODEL", "")
+
+	m := newAgentAIManager()
+	// 空 service + allow_all（DefaultDecision=auto_approve、零规则）：reviewer
+	// 非 mcp__ 前缀不走默认门，全程短路放行、零审批卡。
+	svc := &AgentService{}
+	m.service = svc
+	project := t.TempDir()
+	setAgentCoreMCPTestPolicy(t, svc, project, builtinAllowAllPolicy())
+
+	const sessionID = "conv-agentcore-subagent-e2e"
+	registerTestAISession(t, m, &agentAISession{
+		id:      sessionID,
+		runSeq:  1,
+		history: []agentAIMessage{{Role: "user", Content: "评审一下 main.go"}},
+	})
+
+	log := &agentCoreEventLog{}
+	run := agentAIRun{
+		sessionID:   sessionID,
+		runSeq:      1,
+		messageID:   "msg-subagent-e2e",
+		provider:    "agentcore",
+		model:       "glm-5.2",
+		projectPath: project,
+		activity:    newAgentAIActivity(),
+	}
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		m.runAgentCore(context.Background(), run, log.write)
+	}()
+	select {
+	case <-finished:
+	case <-time.After(30 * time.Second):
+		t.Fatalf("runAgentCore 没有收敛（事件 %v）", log.types())
+	}
+
+	// 1) 终止事件契约：恰 1 ai.done、0 ai.error、0 审批卡（reviewer 非 mcp__）。
+	if got := log.count(models.AgentEventAIDone); got != 1 {
+		t.Fatalf("ai.done 数量 = %d, want 1（事件 %v）", got, log.types())
+	}
+	if got := log.count(models.AgentEventAIError); got != 0 {
+		t.Fatalf("ai.error 数量 = %d, want 0（%v）", got, log.filter(models.AgentEventAIError))
+	}
+	if got := log.count(models.AgentEventAIApprovalRequest); got != 0 {
+		t.Fatalf("ai.approval.request 数量 = %d, want 0（事件 %v）", got, log.types())
+	}
+
+	// 2) 请求链形状：主 run 第 1 回合 → 子 run（第 2 条）→ 主 run 第 2 回合
+	// （第 3 条，带 Task 的 tool_result）。未接线时「未知工具: reviewer」直接
+	// 回填、run 停在 2 条——本断言与下方 tool_result 内容断言共同构成红锚。
+	reqs := up.requests()
+	if len(reqs) != 3 {
+		t.Fatalf("上游请求次数 = %d, want 3（主1+子1+主2，事件 %v）", len(reqs), log.types())
+	}
+	hasReviewer := false
+	for _, def := range reqs[0].Tools {
+		if def.Name == "reviewer" {
+			hasReviewer = true
+		}
+	}
+	if !hasReviewer {
+		t.Fatalf("主 run 第 1 回合工具表缺 reviewer: %v", agentCoreToolDefNames(reqs[0].Tools))
+	}
+
+	// 子 run 请求（第 2 条）的白名单：只见 Read 不见 Write，也不得再见
+	// reviewer（depth=1：子 registry 不含子 agent 桥）。
+	subHasRead, subHasWrite, subHasReviewer := false, false, false
+	for _, def := range reqs[1].Tools {
+		switch def.Name {
+		case "Read":
+			subHasRead = true
+		case "Write":
+			subHasWrite = true
+		case "reviewer":
+			subHasReviewer = true
+		}
+	}
+	if !subHasRead || subHasWrite {
+		t.Fatalf("子 run 工具表白名单失效: read=%v write=%v tools=%v",
+			subHasRead, subHasWrite, agentCoreToolDefNames(reqs[1].Tools))
+	}
+	if subHasReviewer {
+		t.Fatalf("子 run 工具表不得含子 agent 桥（depth=1）: %v", agentCoreToolDefNames(reqs[1].Tools))
+	}
+
+	// 3) 子 run 真实执行穿透递归：主 run 第 2 回合（第 3 条请求）的
+	// tool_result 是子 run 的收尾文本，非「未知工具」、非错误。
+	content, isErr := lastRequestToolResult(t, reqs, 2)
+	if isErr {
+		t.Fatalf("tool_result is_error=true, want 真实执行（%q）", content)
+	}
+	if !strings.Contains(content, "评审完成：无问题") {
+		t.Fatalf("tool_result = %q, want 含「评审完成：无问题」（子 run 结果穿透递归回主 run）", content)
+	}
+
+	// 4) journal：恰好一行 Task 行（kind=tool tool=reviewer，非错误）。
+	lines := readJournalLines(t, agentCoreJournalDir(), sessionID)
+	taskRows := 0
+	for _, row := range lines {
+		if row["kind"] == "tool" && row["tool"] == "reviewer" {
+			taskRows++
+			if row["is_error"] != false {
+				t.Errorf("Task 行 is_error = %v, want false: %v", row["is_error"], row)
+			}
+		}
+	}
+	if taskRows != 1 {
+		t.Fatalf("journal Task 行（tool=reviewer）数量 = %d, want 1: %v", taskRows, lines)
+	}
+}
+
+// TestRunAgentCoreSubagentApprovalPropagation 护栏（写完即绿）：子 run 内的
+// mcp__ 调用必须过主 run 同一道审批门（默认门：无显式规则命中的 mcp__*
+// 强制手机审批）。Task 4 默认门已合入 master，接线让子 Config 复用主 run 的
+// Approve 闭包后本测试即绿——它防的是将来有人给子 Config 换独立 Approve
+// 闭包（或置 nil）绕过审批门。
+//
+// 脚本四回合：主 run 调 reviewer → 子 run 调 mcp__srv__echo（触发审批卡，
+// 测试侧拒绝）→ 子 run 收尾 → 主 run 收尾。拒绝后子 run 与主 run 都必须
+// 继续存活（恰 1 ai.done、0 ai.error）。
+func TestRunAgentCoreSubagentApprovalPropagation(t *testing.T) {
+	session := startTestMCPSession(t, "echo", func(args map[string]interface{}) (string, bool) {
+		q, _ := args["q"].(string)
+		return "echo:" + q, false
+	})
+	setTestAgentHome(t)
+	writeTestHomeFile(t, os.Getenv("HOME"), ".claude/agents/reviewer.md",
+		"---\nname: reviewer\ndescription: 代码评审\ntools: Read\n---\n你是评审员。")
+	writeTestHomeFile(t, os.Getenv("HOME"), ".claude.json",
+		`{"mcpServers":{"srv":{"command":"injected-for-test"}}}`)
+	up, srv := newAgentCoreUpstream(t,
+		agentCoreToolTurn("toolu_sub_ap", "reviewer", `{"task":"用 echo 查一下"}`),
+		agentCoreToolTurn("toolu_sub_mcp", "mcp__srv__echo", `{"q":"hi"}`),
+		agentCoreTextTurn("子收尾", ""),
+		agentCoreTextTurn("好", "的"),
+	)
+	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
+	t.Setenv("ANTHROPIC_MODEL", "")
+
+	m := newAgentAIManager()
+	m.coreMCPDialForTest = func(context.Context, agentCoreMCPRawServer) (*mcp.ClientSession, func(), error) {
+		return session, func() {}, nil
+	}
+	// 零命中规则 + DefaultDecision=auto_approve（镜像 NoRuleMatch 用例）：
+	// reviewer（非 mcp__）短路放行；子 run 的 mcp__srv__echo 无显式规则命中
+	// → 默认门强制手机审批。
+	svc := &AgentService{}
+	m.service = svc
+	project := t.TempDir()
+	setAgentCoreMCPTestPolicy(t, svc, project, ApprovalPolicy{
+		Scheme:          "custom",
+		DefaultDecision: decisionAutoApprove,
+		Rules: []approvalRule{{
+			ID:       "unrelated-tool",
+			Match:    approvalRuleMatch{Tool: []string{"Other"}},
+			Decision: decisionAutoApprove,
+		}},
+	})
+
+	const sessionID = "conv-agentcore-subagent-approval"
+	registerTestAISession(t, m, &agentAISession{
+		id:      sessionID,
+		runSeq:  1,
+		history: []agentAIMessage{{Role: "user", Content: "评审并查询"}},
+	})
+
+	log := &agentCoreEventLog{}
+	run := agentAIRun{
+		sessionID:   sessionID,
+		runSeq:      1,
+		messageID:   "msg-subagent-approval",
+		provider:    "agentcore",
+		model:       "glm-5.2",
+		projectPath: project,
+		activity:    newAgentAIActivity(),
+	}
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		m.runAgentCore(context.Background(), run, log.write)
+	}()
+
+	// 等子 run 的 mcp__ 审批卡并拒绝（镜像 Decline 用例的交互路径）。
+	waiter := waitForAgentCoreApproval(t, m, sessionID, log)
+	waiter.request.respond <- agentAIApprovalResponse{Decision: models.AgentAIApprovalDecisionDecline}
+
+	select {
+	case <-finished:
+	case <-time.After(30 * time.Second):
+		t.Fatalf("runAgentCore 没有收敛（事件 %v）", log.types())
+	}
+
+	// 审批事件：pending + resolved/decline 两条，工具名原样上卡。
+	requests := log.filter(models.AgentEventAIApprovalRequest)
+	if len(requests) != 2 {
+		t.Fatalf("ai.approval.request 数量 = %d, want 2（pending + resolved，事件 %v）", len(requests), log.types())
+	}
+	if status, _ := requests[0]["status"].(string); status != "pending" {
+		t.Errorf("首条审批状态 = %q, want pending", status)
+	}
+	if status, _ := requests[1]["status"].(string); status != "resolved" {
+		t.Errorf("次条审批状态 = %q, want resolved", status)
+	}
+	if decision, _ := requests[1]["decision"].(string); decision != models.AgentAIApprovalDecisionDecline {
+		t.Errorf("审批决定 = %q, want %q", decision, models.AgentAIApprovalDecisionDecline)
+	}
+	if tool, _ := requests[0]["tool_name"].(string); tool != "mcp__srv__echo" {
+		t.Errorf("审批 tool_name = %q, want mcp__srv__echo", tool)
+	}
+
+	// 拒绝后流程继续：恰 1 ai.done、0 ai.error。
+	if got := log.count(models.AgentEventAIDone); got != 1 {
+		t.Fatalf("ai.done 数量 = %d, want 1（事件 %v）", got, log.types())
+	}
+	if got := log.count(models.AgentEventAIError); got != 0 {
+		t.Fatalf("ai.error 数量 = %d, want 0（%v）", got, log.filter(models.AgentEventAIError))
+	}
+
+	// 穿透验证：子 run 带着拒绝回填继续（第 3 条请求的 tool_result 含
+	// 「用户拒绝」），收尾文本穿透回主 run 第 4 条请求的 Task tool_result。
+	reqs := up.requests()
+	if len(reqs) != 4 {
+		t.Fatalf("上游请求次数 = %d, want 4（主1+子2+主2，事件 %v）", len(reqs), log.types())
+	}
+	if content, isErr := lastRequestToolResult(t, reqs, 2); !isErr || !strings.Contains(content, "用户拒绝") {
+		t.Fatalf("子 run tool_result = (%q, is_error=%v), want 含「用户拒绝」的错误回填", content, isErr)
+	}
+	if content, isErr := lastRequestToolResult(t, reqs, 3); isErr || !strings.Contains(content, "子收尾") {
+		t.Fatalf("主 run Task tool_result = (%q, is_error=%v), want 含「子收尾」（拒绝后子 run 照常完成）", content, isErr)
+	}
+}
+
+// TestRunAgentCoreSubagentReadOnlyNotInjected 护栏（接线后写完即绿）：readOnly
+// run 不注入子 agent 桥（mirror MCP 的只读决策——同一判据 run.readOnly）。
+// 防将来回归（如注入点挪到只读判定之前/之外）。
+func TestRunAgentCoreSubagentReadOnlyNotInjected(t *testing.T) {
+	setTestAgentHome(t)
+	writeTestHomeFile(t, os.Getenv("HOME"), ".claude/agents/reviewer.md",
+		"---\nname: reviewer\ndescription: 代码评审\ntools: Read\n---\n你是评审员。")
+	up, srv := newAgentCoreUpstream(t, agentCoreTextTurn("好的", ""))
+	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
+	t.Setenv("ANTHROPIC_MODEL", "")
+
+	m := newAgentAIManager()
+
+	const sessionID = "conv-agentcore-subagent-readonly"
+	registerTestAISession(t, m, &agentAISession{
+		id:      sessionID,
+		runSeq:  1,
+		history: []agentAIMessage{{Role: "user", Content: "只读问一句"}},
+	})
+	log := &agentCoreEventLog{}
+	run := agentAIRun{
+		sessionID:   sessionID,
+		runSeq:      1,
+		messageID:   "msg-subagent-readonly",
+		provider:    "agentcore",
+		model:       "glm-5.2",
+		projectPath: t.TempDir(),
+		activity:    newAgentAIActivity(),
+		readOnly:    true,
+	}
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		m.runAgentCore(context.Background(), run, log.write)
+	}()
+	select {
+	case <-finished:
+	case <-time.After(30 * time.Second):
+		t.Fatalf("runAgentCore 没有收敛（事件 %v）", log.types())
+	}
+
+	// run 照常收敛：只读剥离不是失败。
+	if got := log.count(models.AgentEventAIDone); got != 1 {
+		t.Fatalf("ai.done = %d, want 1（事件 %v）", got, log.types())
+	}
+	if got := log.count(models.AgentEventAIError); got != 0 {
+		t.Fatalf("ai.error = %d, want 0（%v）", got, log.filter(models.AgentEventAIError))
+	}
+	// 行为级锁死：上游工具表零 reviewer 桥（没注册就没 advertised）。
+	reqs := up.requests()
+	if len(reqs) != 1 {
+		t.Fatalf("上游请求次数 = %d, want 1", len(reqs))
+	}
+	for _, def := range reqs[0].Tools {
+		if def.Name == "reviewer" {
+			t.Fatalf("readOnly run 的上游工具表含子 agent 桥: %s", def.Name)
+		}
+	}
+	// journal 无 Task 行：没注入就没调用轨迹。
+	for _, row := range readJournalLines(t, agentCoreJournalDir(), sessionID) {
+		if row["kind"] == "tool" {
+			t.Fatalf("readOnly run 的 journal 不该有 tool 行: %v", row)
+		}
+	}
+}
+
 // TestRunAgentCoreReadOnlySkipsMCPInjection 锁死「只读 run 不注入 MCP」：
 // home 里真实存在 server 条目 + dial 注入计数，readOnly run 全程 0 次 dial、
 // 上游工具表零 mcp__ 条目，run 本身照常收敛。对齐 claude 只读 fork 的

@@ -142,8 +142,12 @@ func agentCoreSubagentDefsIn(home string) []agentCoreSubagentDef {
 // seen（已用名），重名追加 -2/-3。字符清洗复用 MCP 段白名单。
 //
 // 长度预算：段白名单截 64 + 序号后缀最多 3 字符（"-99"）= 67 < 128（API
-// 工具名上限），无需再截。seen 表必须与 MCP 桥命名共用同一张：否则子
-// agent 桥名可能遮蔽/撞上 mcp__xxx 桥名，T2 接线时注意传同一 map。
+// 工具名上限），无需再截。
+//
+// 与 MCP 桥名空间的隔离：T1 曾设想 seen 表与 MCP 桥命名共用一张，接线时
+// 证实不可行——agentCoreMCPServerToolDefs 在自己内部建 seen 且签名不外露。
+// 实际防线是「mcp__ 前缀剥除」（见 agentCoreSubagentTools）：MCP 桥名恒为
+// mcp__ 前缀，子 agent 原名剥掉 mcp__ 前缀后再消解，两个名空间不可能相交。
 func agentCoreSubagentBridgeName(raw string, reserved, seen map[string]bool) string {
 	base := sanitizeAgentCoreMCPSegment(raw)
 	candidate := base
@@ -308,4 +312,72 @@ func (b *agentCoreSubagentBridge) Execute(ctx context.Context, input map[string]
 	// 在先——与 MCP 桥同一机制，journal 里父行永远后于子行。
 	safeOnToolCall(b.onToolCall, b.name, summarizeAgentCoreMCPInput(map[string]interface{}{"task": task}), isErr)
 	return agentcore.ToolResult{Content: truncateAgentCoreMCPOutput(text), IsError: isErr}
+}
+
+// agentCoreSubagentReservedNames 是子 agent 桥名必须避开的内核规范名
+// （DefaultRegistry 的 8 个）。reserved+seen 双表传入 agentCoreSubagentBridgeName。
+var agentCoreSubagentReservedNames = map[string]bool{
+	"Read": true, "Write": true, "Edit": true, "Bash": true,
+	"PowerShell": true, "Grep": true, "Glob": true, "LS": true,
+}
+
+// agentCoreSubagentTools 采集 user 域子 agent 定义并包成桥——runAgentCore 的
+// 注入口（spec：2026-10-27-agentcore-subagents §3）。
+//
+// client/env/approve/logf 全部复用主 run 构造好的同一份（调用方 hoist，
+// 见 runAgentCore）：子 run 与主 run 同一凭据出网、同一道围栏、同一个审批
+// 闭包——审批因此贯穿（子 run 里的 mcp__ 调用同样过默认门）。
+// mcpTools 是主 run 已建连的 MCP 桥，交给桥工厂做子 run 继承（同一批
+// session，零重复 dial）。readOnly 判定在调用方（mirror MCP 决策）；
+// 定义集为空返回 nil（不注入）。
+func (m *agentAIManager) agentCoreSubagentTools(run agentAIRun,
+	client *agentcore.Client, env *agentcore.ToolEnv,
+	approve func(context.Context, agentcore.ApprovalRequest) (agentcore.ApprovalResponse, error),
+	logf func(string, ...interface{}),
+	mcpTools []agentcore.Tool) []agentcore.Tool {
+
+	defs := agentCoreSubagentDefsIn(agentHome())
+	if len(defs) == 0 {
+		return nil
+	}
+	onToolCall := func(tool, summary string, isErr bool) {
+		m.coreJournal.appendTool(run.sessionID, tool, summary, isErr)
+	}
+	var mcpFactory func() []agentcore.Tool
+	if len(mcpTools) > 0 {
+		mcpFactory = func() []agentcore.Tool { return mcpTools }
+	}
+	mainModel := agentCoreModel(run)
+	seen := map[string]bool{}
+	out := make([]agentcore.Tool, 0, len(defs))
+	for _, def := range defs {
+		// mcp__ 前缀剥除（名空间隔离，见 agentCoreSubagentBridgeName 注释）：
+		// 剥到不含前缀为止（"mcp__mcp__x" 也压干净），剥空则由段白名单回落
+		// "srv"——绝不产出可能撞 MCP 桥名的名字。
+		raw := def.Name
+		for strings.HasPrefix(raw, "mcp__") {
+			raw = strings.TrimPrefix(raw, "mcp__")
+		}
+		desc := def.Description
+		if strings.TrimSpace(desc) == "" {
+			desc = "子 agent " + def.Name + "（定义未写 description）"
+		}
+		out = append(out, &agentCoreSubagentBridge{
+			client:         client,
+			mainModel:      mainModel,
+			defModel:       def.Model,
+			name:           agentCoreSubagentBridgeName(raw, agentCoreSubagentReservedNames, seen),
+			description:    desc,
+			body:           def.Body,
+			projectPath:    run.projectPath,
+			toolsWhitelist: def.ToolsWhitelist,
+			env:            env,
+			approve:        approve,
+			logf:           logf,
+			mcpTools:       mcpFactory,
+			onToolCall:     onToolCall,
+		})
+	}
+	logger.Info(fmt.Sprintf("agentcore-subagent: 注入 %d 个子 agent 桥", len(out)))
+	return out
 }

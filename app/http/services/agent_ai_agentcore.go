@@ -854,32 +854,52 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		go closeMCP()
 	}()
 
+	// client/env/approve/logf 构造一次、主 run cfg 与子 agent 桥两处共用：
+	// 子 run 必须与主 run 用同一份出网凭据、同一道围栏/shell 策略、同一个
+	// 审批闭包（审批贯穿，spec §7）——构造两份就会出两套语义。
+	// 带上用户自己的 API key：网关靠它走 user-api-key 通道，不做分组门禁。
+	// 不带的话，不在 anthropic-duration 组里的账号会被 403 挡下（见
+	// agentCoreAuthToken 注释）。拿不到 key 时 WithAPIKey("") 等价于不带，
+	// 行为退回「由代理按分组兜底」。
+	kernelClient := agentcore.NewClient(agentCoreBaseURL()).WithAPIKey(agentCoreAuthToken())
+	kernelEnv := &agentcore.ToolEnv{
+		ProjectPath: run.projectPath,
+		Env:         agentCoreToolEnv(),
+		ScopeCheck:  agentCoreScopeCheck(run),
+		ShellPolicy: &agentCoreShellPolicy{run: run},
+	}
+	kernelApprove := m.agentCoreApprove(run, writeJSON)
+	// 内核不 import 日志包，这里把宿主 logger 包一层递进去（签名不同：
+	// logger.Warn 是 variadic interface{}）。目前只承载截断这类无事件帧的
+	// 内部决策。
+	kernelLogf := func(format string, args ...interface{}) {
+		logger.Warn(fmt.Sprintf(format, args...))
+	}
+
+	// 子 agent 注入（spec：docs/superpowers/specs/2026-10-27-agentcore-subagents-design.md）：
+	// readOnly run 不注入（mirror MCP 只读决策——上方 raws=nil 同一判据）；
+	// 定义集为空不注入。桥递归子 run（depth=1），MCP 桥/审批/journal/围栏
+	// 全部复用主 run 的这一份。
+	if !run.readOnly {
+		if subTools := m.agentCoreSubagentTools(run, kernelClient, kernelEnv, kernelApprove, kernelLogf, mcpTools); len(subTools) > 0 {
+			for _, tool := range subTools {
+				registry.Register(tool)
+			}
+		}
+	}
+
 	cfg := &agentcore.Config{
-		// 带上用户自己的 API key：网关靠它走 user-api-key 通道，不做分组门禁。
-		// 不带的话，不在 anthropic-duration 组里的账号会被 403 挡下（见
-		// agentCoreAuthToken 注释）。拿不到 key 时 WithAPIKey("") 等价于不带，
-		// 行为退回「由代理按分组兜底」。
-		Client:    agentcore.NewClient(agentCoreBaseURL()).WithAPIKey(agentCoreAuthToken()),
+		Client:    kernelClient,
 		Model:     agentCoreModel(run),
 		System:    agentCoreSystemPrompt(run.projectPath),
 		Tools:     registry,
 		SessionID: kernelSessionID,
 		// 会话的 effort 档位（手机选档 → server 透传 → 这里进请求体）。
 		// 空串/无法识别的档位在内核侧被丢弃，不下发。
-		Effort: run.effort,
-		Env: &agentcore.ToolEnv{
-			ProjectPath: run.projectPath,
-			Env:         agentCoreToolEnv(),
-			ScopeCheck:  agentCoreScopeCheck(run),
-			ShellPolicy: &agentCoreShellPolicy{run: run},
-		},
-		Approve: m.agentCoreApprove(run, writeJSON),
-		// 内核不 import 日志包，这里把宿主 logger 包一层递进去（签名不同：
-		// logger.Warn 是 variadic interface{}）。目前只承载截断这类无事件帧的
-		// 内部决策。
-		Logf: func(format string, args ...interface{}) {
-			logger.Warn(fmt.Sprintf(format, args...))
-		},
+		Effort:  run.effort,
+		Env:     kernelEnv,
+		Approve: kernelApprove,
+		Logf:    kernelLogf,
 		Emit: func(frame []byte) error {
 			_, err := pipeWriter.Write(frame)
 			return err
