@@ -1026,6 +1026,16 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		journal.appendAssistant(run.sessionID, agentAssistantMessageID(run.messageID), assistantOutput, time.Now().UTC().Format(time.RFC3339))
 		endStatus = "success"
 		m.setAgentAIResumeSessionIDIfEmpty(run.sessionID, run.runSeq, capturedResumeSessionID)
+		// 刻意跳过 ccPeerSessionJSONL / appendLineageMarker：那是 Claude CLI 的
+		// transcript 谱系修补，内核没有对应的 JSONL 文件。
+		//
+		// 方案请求必须一起关在围栏内：emitOptionRequest 只看 runSeq，而 /clear
+		// 归零后新回合复用同一个值。僵尸迟返回若照样写 session.pendingOption，
+		// 新回合正在等用户选择的那张卡会被顶掉，用户点下去 option_id 对不上，
+		// 选择被静默丢弃。
+		if blocks := extractAgentAIOptionBlocks(assistantOutput); len(blocks) > 0 {
+			m.emitOptionRequest(run, writeJSON, blocks)
+		}
 	} else {
 		// 僵尸迟返回：强拆之后 runSeq 未变但已打 finalizedRunSeq 标记（或该回合
 		// 早已被新回合顶替），这些非帧副作用会污染 Retry 新回合的历史/恢复点，
@@ -1039,13 +1049,14 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		// （本段只在取消被忽略、run 正常返回等边缘形态才可达）。撤销已经由
 		// finalizeStalledGuard 在身份校验的同一临界区内做掉，这里只兜历史/日志
 		// 这类非帧写入。
-		logger.Warn(fmt.Sprintf("[ai.run.zombie_discard] session=%s runSeq=%d run=%s guard_fenced=%t reason=stale_side_effects",
-			run.sessionID, run.runSeq, run.runID, run.guard != nil))
-	}
-	// 刻意跳过 ccPeerSessionJSONL / appendLineageMarker：那是 Claude CLI 的
-	// transcript 谱系修补，内核没有对应的 JSONL 文件。
-	if blocks := extractAgentAIOptionBlocks(assistantOutput); len(blocks) > 0 {
-		m.emitOptionRequest(run, writeJSON, blocks)
+		guardMounted := run.guard != nil
+		m.mu.Lock()
+		session := m.sessions[run.sessionID]
+		runSeqSame := session != nil && session.runSeq == run.runSeq
+		finalized := session != nil && session.finalizedRunSeq == run.runSeq
+		m.mu.Unlock()
+		logger.Warn(fmt.Sprintf("[ai.run.zombie_discard] session=%s runSeq=%d run=%s guard_mounted=%t runseq_same=%t finalized=%t reason=stale_side_effects",
+			run.sessionID, run.runSeq, run.runID, guardMounted, runSeqSame, finalized))
 	}
 
 	done := map[string]interface{}{

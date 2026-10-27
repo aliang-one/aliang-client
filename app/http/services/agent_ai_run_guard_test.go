@@ -158,8 +158,11 @@ func TestRunSideEffectsFencedAfterForceFinalize(t *testing.T) {
 	if !m.agentAIRunSideEffectsAllowed("sess-2", 2) {
 		t.Fatal("live run must be allowed")
 	}
-	// 强拆打标：只对本 runSeq 生效。
-	m.markRunFinalized("sess-2", 2)
+	// 强拆打标：只对本 runSeq 生效。生产端唯一的写入点是 finalizeStalledGuard
+	// 身份校验临界区内的内联赋值，这里直接构造同一个标记。
+	m.mu.Lock()
+	session.finalizedRunSeq = 2
+	m.mu.Unlock()
 	if m.agentAIRunSideEffectsAllowed("sess-2", 2) {
 		t.Fatal("force-finalized run must be fenced")
 	}
@@ -187,7 +190,11 @@ func TestClearResetsFinalizedRunSeq(t *testing.T) {
 	m := newAgentAIManager()
 	session := &agentAISession{id: "sess-clear", runSeq: 1, cancel: func() {}}
 	m.sessions[session.id] = session
-	m.markRunFinalized("sess-clear", 1)
+	// 直接构造「已被强拆收尾」的标记（生产端写入点在 finalizeStalledGuard
+	// 身份校验的同一临界区）。
+	m.mu.Lock()
+	session.finalizedRunSeq = 1
+	m.mu.Unlock()
 	if m.agentAIRunSideEffectsAllowed("sess-clear", 1) {
 		t.Fatal("precondition: force-finalized run must be fenced")
 	}

@@ -287,6 +287,12 @@ func (m *agentAIManager) wrapKillCancel(activity *agentAIActivity, cancel contex
 // 归零后会被新回合复用），只比 runSeq 时旧回合的僵尸迟返回可能撞上新回合的
 // runSeq 并通过守卫。调用方传 run.guard 后，guard 指针不同即判为非本回合。
 // 不传或传 nil 时退化为纯 runSeq 判定（单测/TUI 路径）。
+//
+// finalizedRunSeq 不随 clearRunning 清零：标记按 runSeq 记账，Retry 起新回合
+// （runSeq 推进）后旧标记自动不再命中，无需在起跑路径手工复位。唯一例外是
+// /clear——它把 runSeq 归零，下一回合可能复用同一个值，旧标记会误命中、把合法
+// 回合的 history/journal/resume 写一起丢掉，所以 /clear 分支必须同时把
+// finalizedRunSeq 清零。
 func (m *agentAIManager) agentAIRunSideEffectsAllowed(sessionID string, runSeq int, expectGuard ...*agentAIRunGuard) bool {
 	if m == nil {
 		return true
@@ -304,25 +310,6 @@ func (m *agentAIManager) agentAIRunSideEffectsAllowed(sessionID string, runSeq i
 		return false
 	}
 	return session.finalizedRunSeq != runSeq
-}
-
-// markRunFinalized 登记「本 runSeq 已被强拆收尾」，供非帧副作用守卫判定。
-//
-// 不随 clearRunning 清零：标记按 runSeq 记账，Retry 起新回合（runSeq 推进）
-// 后旧标记自动不再命中，无需在起跑路径手工复位。
-//
-// 唯一例外是 /clear：它把 runSeq 归零，下一回合可能复用同一个 runSeq，此时
-// 旧标记会误命中、把合法回合的 history/journal/resume 写一起丢掉。所以
-// /clear 分支必须同时把 finalizedRunSeq 清零（见 Step 8）。
-func (m *agentAIManager) markRunFinalized(sessionID string, runSeq int) {
-	if m == nil {
-		return
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if session := m.sessions[sessionID]; session != nil && session.runSeq == runSeq {
-		session.finalizedRunSeq = runSeq
-	}
 }
 
 // finalizeStalledGuard 校验 guard 仍是该会话当前回合后，打终结标记并复位运行态。
@@ -356,6 +343,11 @@ func (m *agentAIManager) finalizeStalledGuard(g *agentAIRunGuard, writeJSON agen
 	if droppedBinding != "" {
 		// 绑定是持久化状态：不落盘的话，进程重启后 loadIdentityState 会把僵尸
 		// 绑定读回来，下一回合照样从它取 resumeID。
+		//
+		// 落盘失败只 Warn 是刻意的「最佳努力」取舍：内存里的僵尸绑定已经删掉，
+		// 此时回滚内存反而会把它留下；磁盘可能暂时仍是旧值，进程重启会把僵尸
+		// 绑定读回来——但下一次成功的 persistIdentityState 会用当前内存状态覆盖
+		// 它，即自愈。不为此阻断强拆（强拆的首要目标是终止回合、放开 busy 闸）。
 		if err := m.persistIdentityState(); err != nil {
 			logger.Warn(fmt.Sprintf(
 				"[ai.run.zombie_revoke] persist_failed session=%s runSeq=%d err=%v",

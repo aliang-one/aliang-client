@@ -3927,7 +3927,12 @@ const (
 type agentAIRunOutcome int
 
 func (m *agentAIManager) runCLI(ctx context.Context, run agentAIRun, writeJSON agentTerminalWriter) {
-	defer m.clearRunning(run.sessionID, run.runSeq, writeJSON)
+	// 必须带 guard：内核路径是在同一 goroutine 内联调用 runAgentCore 的，僵尸
+	// 迟返回时 agentcore 内部两个带 guard 的 defer 会正确跳过，控制权却回到这里。
+	// 若只比 runSeq，/clear 归零后新回合复用同一个值，就会把新回合的
+	// cancel/activity/guard/steer 与待审批一并拆掉。正常路径 session.guard
+	// 就是 run.guard，行为不变。
+	defer m.clearRunning(run.sessionID, run.runSeq, writeJSON, run.guard)
 	if run.cancel != nil {
 		defer run.cancel()
 	}

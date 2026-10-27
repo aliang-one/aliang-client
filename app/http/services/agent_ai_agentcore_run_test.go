@@ -1142,6 +1142,12 @@ func TestFinalizeStalledGuardRevokesMidRunResumePoint(t *testing.T) {
 			wantOK:         true,
 		},
 		{
+			// 可达形态：绑定由云端预分配（reserveBinding 写 State:"reserved"，
+			// 只占住 native id，run.resumeSessionID 仍为空）。此时起跑快照
+			// bindingAtStart 非空、resumeAtStart 为空，撤销必须忍住不动——这个
+			// 绑定在起跑前就存在，不属于本回合。已确认（confirmed）的形态在起跑
+			// 路径就会填 run.resumeSessionID，resumeAtStart 非空、更早命中另一条
+			// 判据退出，走不到这里。
 			name:           "起跑已有绑定不撤销",
 			bindingAtStart: "agentcore-prev",
 			midRunBinding:  "agentcore-prev",
@@ -1329,5 +1335,226 @@ func TestZombieSuccessWritesFencedWhenGuardReplaced(t *testing.T) {
 	}
 	if got := log.count(models.AgentEventAIDone); got != 1 {
 		t.Fatalf("ai.done 数量 = %d, want 1", got)
+	}
+
+	// 收尾 defer 的 guard 接线必须承重：僵尸退出时不得碰新回合的
+	// cancel / guard / done。三条断言各锁一处（clearRunning 的 guard、
+	// markRunGuardDone 的 guard、会话复位），删任一处都会让本用例变红。
+	m.mu.Lock()
+	session := m.sessions[sessionID]
+	currentGuardAfter := session.guard
+	cancelAfter := session.cancel
+	m.mu.Unlock()
+
+	if currentGuardAfter != currentGuard {
+		t.Fatalf("session.guard = %p, want 新回合的 guard %p（僵尸收尾不得摘掉新回合的 guard）",
+			currentGuardAfter, currentGuard)
+	}
+	select {
+	case <-currentGuard.done:
+		t.Fatal("新回合 guard 的 done 被关闭：宽限期强拆保护被僵尸收尾禁用")
+	default:
+	}
+	if cancelAfter == nil {
+		t.Fatal("session.cancel 被僵尸收尾清空：新回合的 stop 能力被拆掉")
+	}
+}
+
+// TestZombieLateRunCLICleanupKeepsNewTurn 锁死 runCLI 收尾 defer 的 guard 身份。
+//
+// runCLI 在 m.runAgentCore(...) 返回之后还要跑自己的 clearRunning——内核路径
+// 是同一 goroutine 内联调用，所以僵尸迟返回时，agentcore 内部那两个带 guard
+// 的 defer 会正确跳过，控制权却回到 runCLI 的 defer。若那里只比 runSeq，
+// /clear 归零后新回合复用同一个 runSeq，guardOwns 恒真，僵尸就会把新回合的
+// cancel / activity / guard / steer 通道一并拆掉。
+func TestZombieLateRunCLICleanupKeepsNewTurn(t *testing.T) {
+	setTestAgentHome(t)
+
+	m := newAgentAIManager()
+	const sessionID = "conv-agentcore-runcli-late"
+	const runSeq = 1
+	registerTestAISession(t, m, &agentAISession{
+		id:      sessionID,
+		runSeq:  runSeq,
+		cancel:  func() {},
+		history: []agentAIMessage{{Role: "user", Content: "旧回合的提问"}},
+	})
+
+	log := &agentCoreEventLog{}
+
+	// 新回合（/clear 之后）挂在会话上的 guard A。
+	newTurnRun := agentAIRun{sessionID: sessionID, runSeq: runSeq, activity: newAgentAIActivity(), cancel: func() {}}
+	newTurnGuard := newAgentAIRunGuard(m, newTurnRun, log.write)
+	// 新回合的 steer 通道 C：真实时序里它在僵尸仍在中途时就已挂上（attachCoreSteer
+	// 只比 runSeq），所以僵尸收尾时抓到的正是它。
+	newTurnSteer := newAgentAICoreSteerControl(newTurnRun, log.write)
+
+	m.mu.Lock()
+	m.sessions[sessionID].guard = newTurnGuard
+	m.sessions[sessionID].coreSteer = newTurnSteer
+	m.mu.Unlock()
+
+	// 上游在**请求到达时**才挂 C——此时内核的attachCoreSteer 已经跑过，
+	// 等价于「僵尸在飞、新回合接管会话」的真实交错，且不依赖 sleep。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		m.mu.Lock()
+		if session := m.sessions[sessionID]; session != nil {
+			session.guard = newTurnGuard
+			session.coreSteer = newTurnSteer
+		}
+		m.mu.Unlock()
+
+		if _, err := io.ReadAll(r.Body); err != nil {
+			t.Errorf("读取请求体失败: %v", err)
+		}
+		w.Header().Set("content-type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "data: %s\n\n", agentCoreTextTurn("你好", "，世界"))
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+	}))
+	t.Cleanup(srv.Close)
+	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
+	t.Setenv("ANTHROPIC_MODEL", "")
+
+	run := agentAIRun{
+		sessionID:   sessionID,
+		runSeq:      runSeq,
+		messageID:   "msg-runcli-zombie",
+		provider:    "agentcore",
+		model:       "glm-5.2",
+		projectPath: t.TempDir(),
+		activity:    newAgentAIActivity(),
+	}
+	run.guard = newAgentAIRunGuard(m, run, log.write) // 僵尸自己的 guard B
+
+	m.runCLI(context.Background(), run, log.write)
+
+	m.mu.Lock()
+	session := m.sessions[sessionID]
+	cancel := session.cancel
+	curGuard := session.guard
+	curSteer := session.coreSteer
+	m.mu.Unlock()
+
+	if cancel == nil {
+		t.Fatal("session.cancel 被僵尸的 runCLI 收尾清空：新回合的 stop 能力被拆掉")
+	}
+	if curGuard != newTurnGuard {
+		t.Fatalf("session.guard = %p, want 新回合的 guard %p（僵尸收尾不得摘掉新回合的 guard）", curGuard, newTurnGuard)
+	}
+	select {
+	case <-newTurnGuard.done:
+		t.Fatal("新回合 guard 的 done 被关闭：宽限期强拆保护被僵尸收尾禁用")
+	default:
+	}
+	if curSteer != newTurnSteer {
+		t.Fatalf("session.coreSteer = %p, want 新回合的通道 %p（僵尸收尾不得关闭/摘掉新回合的 steer）", curSteer, newTurnSteer)
+	}
+	if code, err := curSteer.deliver(agentAISteerMessage{MessageID: "late-steer", Content: "还在吗"}); err != nil || code != "queued" {
+		t.Fatalf("新回合 steer deliver = (%q, %v), want (queued, nil)：通道已被关闭", code, err)
+	}
+}
+
+// agentCoreSingleTextTurn 与 agentCoreTextTurn 同形，但把整段文本用
+// strconv.Quote 转义后塞进一个 delta——需要换行（aliang-options 围栏）时用它。
+func agentCoreSingleTextTurn(text string) string {
+	return `{"type":"message_start","message":{"id":"msg_opt","model":"glm-5.2"}}` + "\n\n" +
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}` + "\n\n" +
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":` + strconv.Quote(text) + `}}` + "\n\n" +
+		`data: {"type":"content_block_stop","index":0}` + "\n\n" +
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}`
+}
+
+// TestZombieSuccessDoesNotEmitOptionRequestWhenGuardReplaced 锁死方案请求的
+// guard 围栏。
+//
+// emitOptionRequest 原本只校验 session.runSeq != run.runSeq——那正是本任务
+// 废除的不稳定身份（/clear 归零后新回合复用同一个值）。僵尸迟返回时若它仍
+// 写 session.pendingOption，新回合正在等用户选择的那张卡就会被顶掉：用户点
+// 下去 option_id 对不上，选择被静默丢弃。
+//
+// 「本回合」子用例是阳性对照：它证明这段 assistant 文本确实能被提取成方案块，
+// 免得围栏测试因为文本写错而假绿。
+func TestZombieSuccessDoesNotEmitOptionRequestWhenGuardReplaced(t *testing.T) {
+	const optionText = "给你两个方案：\n\n```aliang-options\n" +
+		`{"title":"选择方案","options":[{"id":"a","label":"方案A"},{"id":"b","label":"方案B"}],"allow_custom":true}` +
+		"\n```\n"
+
+	cases := []struct {
+		name        string
+		zombie      bool
+		wantFrames  int
+		wantPending bool
+	}{
+		{name: "本回合照常发方案请求", zombie: false, wantFrames: 1, wantPending: true},
+		{name: "僵尸迟返回不发方案请求", zombie: true, wantFrames: 0, wantPending: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			setTestAgentHome(t)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if _, err := io.ReadAll(r.Body); err != nil {
+					t.Errorf("读取请求体失败: %v", err)
+				}
+				w.Header().Set("content-type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				fmt.Fprintf(w, "data: %s\n\n", agentCoreSingleTextTurn(optionText))
+				if flusher, ok := w.(http.Flusher); ok {
+					flusher.Flush()
+				}
+			}))
+			t.Cleanup(srv.Close)
+			t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
+			t.Setenv("ANTHROPIC_MODEL", "")
+
+			m := newAgentAIManager()
+			const sessionID = "conv-agentcore-option-fence"
+			const runSeq = 1
+			registerTestAISession(t, m, &agentAISession{
+				id:      sessionID,
+				runSeq:  runSeq,
+				cancel:  func() {},
+				history: []agentAIMessage{{Role: "user", Content: "旧回合的提问"}},
+			})
+
+			log := &agentCoreEventLog{}
+			currentRun := agentAIRun{sessionID: sessionID, runSeq: runSeq, activity: newAgentAIActivity(), cancel: func() {}}
+			currentGuard := newAgentAIRunGuard(m, currentRun, log.write)
+
+			run := agentAIRun{
+				sessionID:   sessionID,
+				runSeq:      runSeq,
+				messageID:   "msg-option-zombie",
+				provider:    "agentcore",
+				model:       "glm-5.2",
+				projectPath: t.TempDir(),
+				activity:    newAgentAIActivity(),
+			}
+			run.guard = newAgentAIRunGuard(m, run, log.write)
+
+			// 两种形态都让会话挂 currentGuard；本回合把 run.guard 也换成它
+			// （身份一致），僵尸则保留自己那个不同的 guard B。
+			m.mu.Lock()
+			m.sessions[sessionID].guard = currentGuard
+			m.mu.Unlock()
+			if !tc.zombie {
+				run.guard = currentGuard
+			}
+
+			m.runAgentCore(context.Background(), run, log.write)
+
+			m.mu.Lock()
+			pending := m.sessions[sessionID].pendingOption
+			m.mu.Unlock()
+
+			if got := log.count(models.AgentEventAIOptionRequest); got != tc.wantFrames {
+				t.Fatalf("ai.option.request 数量 = %d, want %d", got, tc.wantFrames)
+			}
+			if gotPending := pending != nil; gotPending != tc.wantPending {
+				t.Fatalf("session.pendingOption 存在 = %v, want %v（pending=%+v）", gotPending, tc.wantPending, pending)
+			}
+		})
 	}
 }
