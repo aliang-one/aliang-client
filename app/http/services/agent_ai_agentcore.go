@@ -1230,7 +1230,7 @@ func (c *agentAICoreSteerControl) expire(messageID string) {
 	if !stillQueued {
 		return
 	}
-	logger.Warn(fmt.Sprintf("[ai.steer.stalled] session=%s run_seq=%d message_id=%s idle=%s guard_mounted=%t",
+	logger.Warn(fmt.Sprintf("[ai.steer.stalled] session=%s runSeq=%d message_id=%s idle=%s stall_cb_wired=%t",
 		sessionID, runSeq, messageID, idle, onStalled != nil))
 	emitAgentAISteerAck(write, sessionID, messageID, "error", "回合无响应已判死，请重试", "turn_stalled")
 	if onStalled != nil {
@@ -1327,7 +1327,7 @@ func (c *agentAICoreSteerControl) close(result, errMsg, code string) {
 	c.queue = nil
 	c.closed = true
 	// 关通道时把所有未到期的活性窗一并停掉：否则已 close 的通道上还会有
-	// AfterFunc 在 180s 后醒来读 c.activity，造成无谓的判定与日志。
+	// AfterFunc 在活性窗到期后醒来读 c.activity，造成无谓的判定与日志。
 	for id, timer := range c.pending {
 		timer.Stop()
 		delete(c.pending, id)
