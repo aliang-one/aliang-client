@@ -637,6 +637,12 @@ func agentCoreScopeCheck(run agentAIRun) func(string, map[string]interface{}) (b
 			case "write", "edit", "multiedit", "notebookedit", "bash", "powershell":
 				return false, "只读模式不允许修改文件或执行命令"
 			}
+			// 纵深保险：readOnly run 的 MCP 注入已在 runAgentCore 接入点剥离
+			//（raws=nil），这里再挡一道 mcp__ 前缀，防将来注入条件与围栏
+			// 条件漂移时露出执行面。
+			if strings.HasPrefix(lower, "mcp__") {
+				return false, "只读模式不允许调用 MCP 工具"
+			}
 		}
 
 		// PowerShell 与 Bash 同语义，但 goalScopeAllowsToolCall 只对 "bash"
@@ -814,6 +820,40 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 	coreSteer := newAgentAICoreSteerControl(run, writeJSON)
 	m.attachCoreSteer(run.sessionID, run.runSeq, coreSteer)
 
+	// MCP 工具注入（spec §3）：采集→建连→包桥→注册。全部失败也只是空桥，
+	// run 照常（纯内置 8 工具）。内核 Registry 后注册者胜，桥与内置工具
+	// 名空间不重叠（mcp__ 前缀），互不遮蔽。建连是逐 server 串行同步 dial、
+	// 10s 超时/个、条目上限 24——最坏给 run 起跑加约 4 分钟。关停已解耦，
+	// 建连未并行是 v1 取舍（spec §5 未承诺并行）。
+	raws := agentCoreMCPRawServersIn(agentHome())
+	if run.readOnly {
+		// readOnly run 不注入任何 MCP 工具，对齐 claude 路径同一判据
+		// （agent_ai.go runCLIPass 的 readOnly 分支，withAgentReadOnlyPolicy
+		// 的 --strict-mcp-config {}）。判据唯一是 run.readOnly：非 fork 的
+		// goal run（readOnly=false）保留 MCP；fork 会话的执行 run 也因
+		// readOnly=true 被剥离（其 goalIdentity 非 nil，但 goalIdentity 不
+		// 参与判定）。
+		// 只 gate raws 不 gate 整个调用：closeMCP 恒非 nil，下面 defer 的
+		// go closeMCP() 不会因 nil func panic。
+		raws = nil
+	}
+	mcpTools, closeMCP := m.agentCoreMCPServerToolDefs(ctx, raws, func(tool, summary string, isErr bool) {
+		m.coreJournal.appendTool(run.sessionID, tool, summary, isErr)
+	})
+	registry := agentcore.DefaultRegistry()
+	for _, tool := range mcpTools {
+		registry.Register(tool)
+	}
+	defer func() {
+		// 慢关停与 run 收尾解耦（Task 2 评审挂账决策）：stdio 关停最坏
+		// 10-15s/个（关 stdin→5s 等退出→SIGTERM→再 5s→SIGKILL），串行会
+		// 拖住 clearRunning 与下一轮 run。SDK ClientSession.Close 幂等、
+		// 进程退出兜底，堆积面受人类 run 节奏约束——fire-and-forget 是
+		// v1 的合理取舍。安全前提还有一条：agentcore.Run 同步返回后已无
+		// Execute 在飞、桥 per-run 不复用，关停不会撕正在调用的 session。
+		go closeMCP()
+	}()
+
 	cfg := &agentcore.Config{
 		// 带上用户自己的 API key：网关靠它走 user-api-key 通道，不做分组门禁。
 		// 不带的话，不在 anthropic-duration 组里的账号会被 403 挡下（见
@@ -822,11 +862,11 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		Client:    agentcore.NewClient(agentCoreBaseURL()).WithAPIKey(agentCoreAuthToken()),
 		Model:     agentCoreModel(run),
 		System:    agentCoreSystemPrompt(run.projectPath),
-		Tools:     agentcore.DefaultRegistry(),
+		Tools:     registry,
 		SessionID: kernelSessionID,
 		// 会话的 effort 档位（手机选档 → server 透传 → 这里进请求体）。
 		// 空串/无法识别的档位在内核侧被丢弃，不下发。
-		Effort:    run.effort,
+		Effort: run.effort,
 		Env: &agentcore.ToolEnv{
 			ProjectPath: run.projectPath,
 			Env:         agentCoreToolEnv(),
@@ -1109,7 +1149,17 @@ func (m *agentAIManager) agentCoreApprove(run agentAIRun, writeJSON agentTermina
 	return func(ctx context.Context, call agentcore.ApprovalRequest) (agentcore.ApprovalResponse, error) {
 		toolInput := marshalAgentAIRaw(call.Input)
 		if svc := m.approvalService(); svc != nil {
-			switch decision, matchedID := svc.evaluateApprovalDecision(call.ToolName, toolInput, run.projectPath); decision {
+			decision, matchedID := svc.evaluateApprovalDecision(call.ToolName, toolInput, run.projectPath)
+			// MCP 默认门（spec §7）：没有显式设备规则命中（matchedID 为空 =
+			// 落到策略 DefaultDecision）的 mcp__* 工具一律要求手机审批——
+			// 显式规则（含放行）优先于本默认。已知例外：服务端若下发空 id
+			// 规则（现无生产方），显式放行会被本门改判 require（fail-safe
+			// 方向，宁可多问一次手机）。
+			if matchedID == "" && strings.HasPrefix(call.ToolName, "mcp__") {
+				logger.Info(fmt.Sprintf("approval-hook: MCP default gate require_approval tool=%s session=%s matched=none", call.ToolName, run.sessionID))
+				decision = decisionRequireApproval
+			}
+			switch decision {
 			case decisionAutoApprove:
 				logger.Info(fmt.Sprintf("approval-hook: AUTO-APPROVE by policy rule=%s tool=%s session=%s (agentcore, no cloud round-trip)", matchedID, call.ToolName, run.sessionID))
 				return agentcore.ApprovalResponse{Approved: true}, nil

@@ -139,6 +139,28 @@ func TestAgentCoreManagerJournalSteerUserMessage(t *testing.T) {
 	}
 }
 
+func TestAgentCoreJournalAppendTool(t *testing.T) {
+	dir := t.TempDir()
+	j := newAgentCoreJournal(dir)
+	j.ensureSessionHeader("conv-tool", "/tmp/p", "glm-5.2", "2026-10-26T01:00:00Z")
+	j.appendTool("conv-tool", "mcp__s__lookup", "q=hi", false)
+	j.appendTool("conv-tool", "mcp__s__lookup", "q=hi", false) // 完全相同实参:行为级证明 tool 行不去重
+	rows := readJournalLines(t, dir, "conv-tool")
+	if len(rows) != 3 { // 头 + 2 tool 行（相同实参仍两行、无 message_id）
+		t.Fatalf("行数 = %d, want 3: %v", len(rows), rows)
+	}
+	if rows[1]["kind"] != "tool" || rows[1]["tool"] != "mcp__s__lookup" || rows[1]["is_error"] != false {
+		t.Fatalf("tool 行错误: %v", rows[1])
+	}
+	if rows[2]["kind"] != "tool" || rows[2]["summary"] != "q=hi" || rows[2]["is_error"] != false {
+		t.Fatalf("相同实参的第二次调用应独立落第二行(不去重): %v", rows[2])
+	}
+	// nil 接收者与空 sessionID 安全（与 appendMsg 家族守卫同款）。
+	var nilJ *agentCoreJournal
+	nilJ.appendTool("conv-x", "mcp__s__lookup", "q", false)
+	j.appendTool("", "mcp__s__lookup", "q", false)
+}
+
 func TestAgentCoreJournalPruneKeepsNewest(t *testing.T) {
 	dir := t.TempDir()
 	j := newAgentCoreJournal(dir)

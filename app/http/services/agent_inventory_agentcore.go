@@ -71,9 +71,15 @@ func readAgentCoreSessionMetaWithOptions(path string, options agentVibeSessionRe
 	if maxLineBytes <= 0 {
 		maxLineBytes = agentVibeJSONLMaxLineBytes
 	}
-	// agentcore journal 只落 user/assistant 行,MessageCount 即可渲染数;仍单独
-	// 维护 displayCount 保持与 codex/claude reader 相同的字段语义（残壳=0）。
+	// agentcore journal 落 user/assistant/tool 三种行,MessageCount/displayCount
+	// 只数 msg 行（tool 行是轨迹不计对话计数）;仍单独维护 displayCount 保持与
+	// codex/claude reader 相同的字段语义（残壳=0）。
 	displayCount := 0
+	// toolCount 给 tool 行造稳定唯一 ID;transcriptRow 是全转录行序号（msg+tool
+	// 共用）,作 Index——msg 与 tool 交错时若各用各的计数会撞号,统一计数器对
+	// 无 tool 行的旧文件与原 messageCount-1 口径数值恒等（向后兼容）。
+	toolCount := 0
+	transcriptRow := 0
 	// parsedAny：是否有任何一行真正解析成功（session 头行被识别,或 msg 行
 	// 通过角色+内容校验）。整文件损坏时一行都不成立——文件名兜底会凭空造出
 	// 一张 MessageCount=0 的幽灵卡（claude 通道 2026-10-18 husk 审计防御的同
@@ -89,6 +95,8 @@ func readAgentCoreSessionMetaWithOptions(path string, options agentVibeSessionRe
 			Role        string `json:"role"`
 			MessageID   string `json:"message_id"`
 			Text        string `json:"text"`
+			Tool        string `json:"tool"`
+			Summary     string `json:"summary"`
 			Ts          string `json:"ts"`
 		}
 		if err := json.Unmarshal(line, &row); err != nil {
@@ -120,6 +128,7 @@ func readAgentCoreSessionMetaWithOptions(path string, options agentVibeSessionRe
 			parsedAny = true
 			ts := normalizeAgentTime(row.Ts)
 			session.MessageCount++
+			transcriptRow++
 			if session.Title == "" && row.Role == "user" && !isJunkAgentTitle(content) {
 				session.Title = truncateAgentText(content, 200)
 			}
@@ -128,7 +137,7 @@ func readAgentCoreSessionMetaWithOptions(path string, options agentVibeSessionRe
 				Role:      row.Role,
 				Content:   content,
 				Timestamp: ts,
-				Index:     session.MessageCount - 1,
+				Index:     transcriptRow - 1,
 			})
 			displayCount++
 			if ts != "" { // 空 ts 不赋值:防损坏行抹掉前一行已落下的有效值
@@ -137,6 +146,30 @@ func readAgentCoreSessionMetaWithOptions(path string, options agentVibeSessionRe
 			if session.CreatedAt == "" {
 				session.CreatedAt = ts
 			}
+		case "tool":
+			// 工具轨迹行：渲染进 Transcript 但不计 MessageCount/displayCount。
+			// 无头行文件（steer 先到）里 session.ID 尚空,tool 行没有会话归属,跳过。
+			// 损失模式落账:steer 先到→无头行→run 追加后头行永远补不上（写侧
+			// ensureSessionHeader 只在文件不存在时写头行）→该场景 tool 轨迹静默
+			// 丢失,与 msg 行的文件名兜底不一致——有意接受,损失面窄。
+			if session.ID == "" {
+				return true
+			}
+			// 防损坏行：tool/summary 双空渲染不出任何内容,跳过（同 msg 空 text 守卫）。
+			if row.Tool == "" && row.Summary == "" {
+				return true
+			}
+			toolCount++
+			transcriptRow++
+			// reader 不信任写侧:超长 summary 与 msg 行同规截断（家规）。
+			content := truncateAgentText(strings.TrimSpace(row.Tool+" "+row.Summary), agentVibeTranscriptMaxContentRunes)
+			window.add(models.AgentVibeMessage{
+				ID:        fmt.Sprintf("tool-%06d", toolCount),
+				Role:      "tool",
+				Content:   content,
+				Timestamp: normalizeAgentTime(row.Ts),
+				Index:     transcriptRow - 1,
+			})
 		}
 		return true
 	})

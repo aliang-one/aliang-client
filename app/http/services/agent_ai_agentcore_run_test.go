@@ -655,6 +655,7 @@ func TestDrainAgentCoreSteeringRejectsStaleRunSeq(t *testing.T) {
 // 「空回合」正常收尾，手机上是一条空回复气泡，用户完全看不到真实原因。
 // 这里断言的是**手机收到的 ai.error 文本**：必须带上游原文。
 func TestRunAgentCoreSurfacesUpstreamErrorBody(t *testing.T) {
+	setTestAgentHome(t) // MCP 采集也从 HOME 解析：不隔离会去 dial 真实 ~/.claude.json 的 server
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("content-type", "application/json")
 		w.WriteHeader(http.StatusOK)
