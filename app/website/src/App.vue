@@ -26,9 +26,7 @@
       :initial-doc="tutorialDocId"
       @close="closeTutorialDocs"
     />
-    <!-- Chat feature hidden temporarily
     <ChatPage v-if="currentPage === 'chat'" />
-    -->
     </template>
   </div>
 </template>

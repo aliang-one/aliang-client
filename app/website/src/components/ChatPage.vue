@@ -26,42 +26,129 @@
       <div class="flex-1 overflow-y-auto py-1">
         <template v-if="groupedConversations.today.length">
           <div class="px-3 pt-3 pb-1 text-xs font-semibold text-slate-400 uppercase tracking-wider">{{ t('chat_today') }}</div>
-          <button
+          <div
             v-for="c in groupedConversations.today"
             :key="c.id"
-            type="button"
-            class="w-full text-left px-4 py-2.5 text-sm transition-colors"
+            role="button"
+            tabindex="0"
+            class="group w-full cursor-pointer px-4 py-2.5 text-left text-sm transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
             :class="c.id === activeId ? 'bg-primary/10 text-primary font-medium' : 'text-slate-700 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800'"
             @click="selectConversation(c.id)"
+            @keydown.enter.prevent="selectConversation(c.id)"
+            @keydown.space.prevent="selectConversation(c.id)"
           >
-            <div class="truncate">{{ c.title || t('chat_emptyTitle') }}</div>
-          </button>
+            <input
+              v-if="renamingId === c.id && renameSurface === 'list'"
+              v-model="renameDraft"
+              :ref="(el) => { if (el) renameInputEl = el; }"
+              type="text"
+              maxlength="60"
+              :placeholder="t('chat_renamePlaceholder')"
+              class="w-full rounded border border-primary/40 bg-white px-2 py-1 text-sm outline-none dark:bg-slate-800"
+              @click.stop
+              @keydown.enter="onRenameEnter"
+              @keydown.esc="onRenameEscape"
+              @keydown.space.stop
+              @blur="commitRename"
+            />
+            <div v-else class="flex items-center gap-2">
+              <div class="min-w-0 flex-1 truncate">{{ c.title || t('chat_emptyTitle') }}</div>
+              <button
+                type="button"
+                class="relative shrink-0 rounded p-1 text-slate-400 opacity-100 transition-opacity hover:bg-slate-200 hover:text-slate-600 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 md:opacity-0 md:group-hover:opacity-100 md:focus-visible:opacity-100 dark:hover:bg-slate-700 before:absolute before:-inset-2 before:content-['']"
+                :aria-label="`${t('chat_rename')} ${c.title || t('chat_emptyTitle')}`"
+                @click.stop="startRename(c, 'list')"
+                @keydown.enter.stop
+                @keydown.space.stop
+              >
+                <span class="material-symbols-outlined text-base">edit</span>
+              </button>
+            </div>
+          </div>
         </template>
         <template v-if="groupedConversations.yesterday.length">
           <div class="px-3 pt-3 pb-1 text-xs font-semibold text-slate-400 uppercase tracking-wider">{{ t('chat_yesterday') }}</div>
-          <button
+          <div
             v-for="c in groupedConversations.yesterday"
             :key="c.id"
-            type="button"
-            class="w-full text-left px-4 py-2.5 text-sm transition-colors"
+            role="button"
+            tabindex="0"
+            class="group w-full cursor-pointer px-4 py-2.5 text-left text-sm transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
             :class="c.id === activeId ? 'bg-primary/10 text-primary font-medium' : 'text-slate-700 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800'"
             @click="selectConversation(c.id)"
+            @keydown.enter.prevent="selectConversation(c.id)"
+            @keydown.space.prevent="selectConversation(c.id)"
           >
-            <div class="truncate">{{ c.title || t('chat_emptyTitle') }}</div>
-          </button>
+            <input
+              v-if="renamingId === c.id && renameSurface === 'list'"
+              v-model="renameDraft"
+              :ref="(el) => { if (el) renameInputEl = el; }"
+              type="text"
+              maxlength="60"
+              :placeholder="t('chat_renamePlaceholder')"
+              class="w-full rounded border border-primary/40 bg-white px-2 py-1 text-sm outline-none dark:bg-slate-800"
+              @click.stop
+              @keydown.enter="onRenameEnter"
+              @keydown.esc="onRenameEscape"
+              @keydown.space.stop
+              @blur="commitRename"
+            />
+            <div v-else class="flex items-center gap-2">
+              <div class="min-w-0 flex-1 truncate">{{ c.title || t('chat_emptyTitle') }}</div>
+              <button
+                type="button"
+                class="relative shrink-0 rounded p-1 text-slate-400 opacity-100 transition-opacity hover:bg-slate-200 hover:text-slate-600 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 md:opacity-0 md:group-hover:opacity-100 md:focus-visible:opacity-100 dark:hover:bg-slate-700 before:absolute before:-inset-2 before:content-['']"
+                :aria-label="`${t('chat_rename')} ${c.title || t('chat_emptyTitle')}`"
+                @click.stop="startRename(c, 'list')"
+                @keydown.enter.stop
+                @keydown.space.stop
+              >
+                <span class="material-symbols-outlined text-base">edit</span>
+              </button>
+            </div>
+          </div>
         </template>
         <template v-if="groupedConversations.older.length">
           <div class="px-3 pt-3 pb-1 text-xs font-semibold text-slate-400 uppercase tracking-wider">{{ t('chat_older') }}</div>
-          <button
+          <div
             v-for="c in groupedConversations.older"
             :key="c.id"
-            type="button"
-            class="w-full text-left px-4 py-2.5 text-sm transition-colors"
+            role="button"
+            tabindex="0"
+            class="group w-full cursor-pointer px-4 py-2.5 text-left text-sm transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
             :class="c.id === activeId ? 'bg-primary/10 text-primary font-medium' : 'text-slate-700 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800'"
             @click="selectConversation(c.id)"
+            @keydown.enter.prevent="selectConversation(c.id)"
+            @keydown.space.prevent="selectConversation(c.id)"
           >
-            <div class="truncate">{{ c.title || t('chat_emptyTitle') }}</div>
-          </button>
+            <input
+              v-if="renamingId === c.id && renameSurface === 'list'"
+              v-model="renameDraft"
+              :ref="(el) => { if (el) renameInputEl = el; }"
+              type="text"
+              maxlength="60"
+              :placeholder="t('chat_renamePlaceholder')"
+              class="w-full rounded border border-primary/40 bg-white px-2 py-1 text-sm outline-none dark:bg-slate-800"
+              @click.stop
+              @keydown.enter="onRenameEnter"
+              @keydown.esc="onRenameEscape"
+              @keydown.space.stop
+              @blur="commitRename"
+            />
+            <div v-else class="flex items-center gap-2">
+              <div class="min-w-0 flex-1 truncate">{{ c.title || t('chat_emptyTitle') }}</div>
+              <button
+                type="button"
+                class="relative shrink-0 rounded p-1 text-slate-400 opacity-100 transition-opacity hover:bg-slate-200 hover:text-slate-600 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 md:opacity-0 md:group-hover:opacity-100 md:focus-visible:opacity-100 dark:hover:bg-slate-700 before:absolute before:-inset-2 before:content-['']"
+                :aria-label="`${t('chat_rename')} ${c.title || t('chat_emptyTitle')}`"
+                @click.stop="startRename(c, 'list')"
+                @keydown.enter.stop
+                @keydown.space.stop
+              >
+                <span class="material-symbols-outlined text-base">edit</span>
+              </button>
+            </div>
+          </div>
         </template>
         <div v-if="conversations.length === 0" class="px-4 py-8 text-center text-sm text-slate-400">
           {{ t('chat_noConversations') }}
@@ -80,9 +167,31 @@
         >
           <span class="material-symbols-outlined text-lg">menu</span>
         </button>
-        <h3 class="flex-1 truncate text-sm font-semibold text-slate-900 dark:text-white">
+        <input
+          v-if="activeId && renamingId === activeId && renameSurface === 'header'"
+          v-model="renameDraft"
+          :ref="(el) => { if (el) renameInputEl = el; }"
+          type="text"
+          maxlength="60"
+          :placeholder="t('chat_renamePlaceholder')"
+          class="min-w-0 flex-1 rounded border border-primary/40 bg-white px-2 py-1 text-sm outline-none dark:bg-slate-800"
+          @click.stop
+          @keydown.enter="onRenameEnter"
+          @keydown.esc="onRenameEscape"
+          @blur="commitRename"
+        />
+        <h3 v-else class="flex-1 truncate text-sm font-semibold text-slate-900 dark:text-white">
           {{ activeConversation?.title || t('chat_emptyTitle') }}
         </h3>
+        <button
+          v-if="activeId && renamingId !== activeId"
+          type="button"
+          class="relative rounded p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-600 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 dark:hover:bg-slate-800 before:absolute before:-inset-2 before:content-['']"
+          :aria-label="t('chat_rename')"
+          @click="startRename(activeConversation, 'header')"
+        >
+          <span class="material-symbols-outlined text-lg">edit</span>
+        </button>
         <span
           v-if="activeId && activeRunning"
           class="inline-flex items-center gap-1 rounded-full bg-primary/10 px-2 py-0.5 text-xs font-medium text-primary"
@@ -264,12 +373,14 @@
 import { ref, computed, nextTick, onMounted, onUnmounted } from 'vue';
 import { useI18n } from '../i18n';
 import { useNavigation } from '../composables/useNavigation';
+import { slashProviderFor } from '../utils/chatProvider';
+import { normalizeConversationTitle } from '../utils/chatTitle';
 import { useAuthStore } from '../stores/auth';
 
 const STORAGE_KEY = 'aliang-chat-data';
 
 const { t } = useI18n();
-const { showDashboard } = useNavigation();
+const { showDashboard, chatProviderPreset } = useNavigation();
 const { isAuthenticated } = useAuthStore();
 
 const conversations = ref([]);
@@ -317,8 +428,7 @@ const slashIndex = ref(0);
 const slashPending = {};
 
 function slashProviderOf(conv) {
-  const p = String(conv?.provider || 'claudecode').toLowerCase();
-  return p === 'codex' ? 'codex' : 'claude';
+  return slashProviderFor(conv?.provider);
 }
 
 const slashActiveProvider = computed(() => slashProviderOf(activeConversation.value));
@@ -413,6 +523,7 @@ function createConversation() {
     title: '',
     messages: [],
     approvals: [],
+    provider: chatProviderPreset.value || 'claudecode',
     createdAt: now(),
     updatedAt: now()
   };
@@ -430,7 +541,78 @@ function selectConversation(id) {
   nextTick(() => scrollToBottom());
 }
 
+// --- 会话重命名（仅本地标题，不同步 native / 服务端） ---
+const renamingId = ref('');
+// 'list' | 'header'：同一会话在列表与顶栏各有一个可编辑位点，
+// 必须靠它保证**同一时刻只渲染一个输入框**，否则键盘焦点会落到 DOM 里靠后的那个。
+const renameSurface = ref('');
+const renameDraft = ref('');
+// v-for 内的 ref 会收集成数组，故用函数 ref 只记住当前那一个输入框。
+let renameInputEl = null;
+
+function startRename(conv, surface = 'list') {
+  if (!conv?.id) return;
+  // iOS Safari 点 <button> 不移动焦点，输入框收不到 blur，「失焦提交」不会触发；
+  // 进新编辑位点前先主动提交上一个，避免共享的 renameDraft 冲掉在编文字。
+  if (renamingId.value) commitRename();
+  renamingId.value = conv.id;
+  renameSurface.value = surface;
+  renameDraft.value = conv.title || '';
+  nextTick(() => {
+    renameInputEl?.focus();
+    renameInputEl?.select();
+  });
+}
+
+function commitRename() {
+  if (!renamingId.value) return;
+  const conv = conversations.value.find(c => c.id === renamingId.value);
+  if (conv) {
+    conv.title = normalizeConversationTitle(renameDraft.value);
+    saveToStorage(); // 刻意不动 updatedAt：改名不是内容更新，不该把会话顶到分组首位
+  }
+  cancelRename();
+}
+
+function cancelRename() {
+  renamingId.value = '';
+  renameSurface.value = '';
+  renameDraft.value = '';
+  renameInputEl = null;
+}
+
+// IME 组合期（中文/日文输入法）的 Enter/Esc 属于「确认候选词 / 取消组合」，
+// Firefox/Safari 会如实上报 key，模板修饰符拦不住，必须自己判。
+// 也不能靠模板 `.prevent`：withModifiers 会先 preventDefault 再进 handler，
+// 那样会把输入法自己的按键处理一起吃掉。
+function isComposingEvent(e) {
+  return e.isComposing || e.keyCode === 229;
+}
+
+function onRenameEnter(e) {
+  // 组合期既不 preventDefault（会吃掉输入法的确认候选词），
+  // 也不能省 stopPropagation（会冒泡到行级 selectConversation / 文档级 close）。
+  if (isComposingEvent(e)) {
+    e.stopPropagation();
+    return;
+  }
+  e.preventDefault();
+  e.stopPropagation();
+  commitRename();
+}
+
+function onRenameEscape(e) {
+  if (isComposingEvent(e)) {
+    e.stopPropagation();
+    return;
+  }
+  e.preventDefault();
+  e.stopPropagation();
+  cancelRename();
+}
+
 function deleteConversation() {
+  commitRename();
   if (!activeId.value) return;
   if (!confirm(t('chat_deleteConfirm'))) return;
   conversations.value = conversations.value.filter(c => c.id !== activeId.value);
@@ -512,6 +694,10 @@ function sendAI(payload) {
 // provider so we only round-trip once; a second call while pending is a no-op.
 async function ensureSlashCommands() {
   const provider = slashActiveProvider.value;
+  // agentcore 内核没有 claude/codex 的插件命令面。绝不发空 provider 请求：
+  // 后端 normalizeSlashProvider 把空值当「未指定」并返回全部 provider 的命令，
+  // 正是要避免的误导。
+  if (!provider) return;
   if (slashCommandsByProvider.value[provider] || slashPending[provider]) return;
   slashPending[provider] = true;
   try {
@@ -530,7 +716,8 @@ async function ensureSlashCommands() {
 
 function onSlashInput() {
   const token = slashToken(inputText.value);
-  if (token === null) {
+  // 无命令面（agentcore）：`/` 按普通文本发送，不弹补全。
+  if (token === null || !slashActiveProvider.value) {
     slashOpen.value = false;
     return;
   }
@@ -952,6 +1139,8 @@ async function sendMessage() {
 }
 
 function close() {
+  // iOS Safari 上点关闭不会触发输入框 blur，先把在编的标题落地再卸载页面。
+  commitRename();
   showDashboard();
 }
 
