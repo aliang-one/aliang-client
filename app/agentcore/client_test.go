@@ -319,6 +319,85 @@ func TestStreamDefaultMaxTokens(t *testing.T) {
 	}
 }
 
+// 32000 的默认输出上限遇到只支持 16k 的模型会被 400。此时必须降级重试，
+// 而不是把「max_tokens 太大」甩给用户整轮失败。
+func TestStreamReducesMaxTokensOnRejection(t *testing.T) {
+	var seen []int
+	srv := sseServer(t, func(w http.ResponseWriter, r *http.Request) {
+		var req MessagesRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		seen = append(seen, req.MaxTokens)
+		if req.MaxTokens > 16000 {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens: 32000 > 16000, which is the maximum allowed number of output tokens for claude-x"}}`))
+			return
+		}
+		writeSSE(w, `{"type":"message_delta","delta":{"stop_reason":"end_turn"}}`)
+	})
+
+	if _, err := collect(t, NewClient(srv.URL), &MessagesRequest{Model: "claude-x"}); err != nil {
+		t.Fatalf("降级后应成功，实际: %v", err)
+	}
+	if len(seen) < 2 || seen[0] != defaultMaxTokens || seen[1] != 16000 {
+		t.Fatalf("max_tokens 序列 = %v，期望以 [%d 16000 ...] 开头", seen, defaultMaxTokens)
+	}
+}
+
+func TestReduceMaxTokens(t *testing.T) {
+	badRequest := func(body string) error {
+		return &httpStatusError{status: http.StatusBadRequest, body: body}
+	}
+	cases := []struct {
+		name    string
+		err     error
+		current int
+		want    int
+		ok      bool
+	}{
+		{
+			name:    "输出上限被拒——减半",
+			err:     badRequest(`{"error":{"message":"max_tokens: 32000 > 16000"}}`),
+			current: 32000,
+			want:    16000,
+			ok:      true,
+		},
+		{
+			name:    "减半低于下限——钳到 8192",
+			err:     badRequest(`{"error":{"message":"maximum output tokens is 8192"}}`),
+			current: 12000,
+			want:    minMaxTokens,
+			ok:      true,
+		},
+		{
+			name:    "已在下限——不再降级",
+			err:     badRequest(`{"error":{"message":"max_tokens too large"}}`),
+			current: minMaxTokens,
+			ok:      false,
+		},
+		{
+			name:    "与输出上限无关的 400——不降级",
+			err:     badRequest(`{"error":{"message":"messages: roles must alternate"}}`),
+			current: 32000,
+			ok:      false,
+		},
+		{
+			name:    "429 限流——不降级（降上限没用）",
+			err:     &httpStatusError{status: http.StatusTooManyRequests, body: "max_tokens ..."},
+			current: 32000,
+			ok:      false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := reduceMaxTokens(tc.err, tc.current)
+			if ok != tc.ok || (ok && got != tc.want) {
+				t.Fatalf("reduceMaxTokens = (%d, %v)，期望 (%d, %v)", got, ok, tc.want, tc.ok)
+			}
+		})
+	}
+}
+
 func TestParseRetryAfter(t *testing.T) {
 	cases := map[string]time.Duration{
 		"":    0,
