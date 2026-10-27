@@ -2,7 +2,6 @@ package services
 
 import (
 	"context"
-	"errors"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -91,6 +90,18 @@ func TestRunGuardKillLogsAndForceFinalizesAfterGrace(t *testing.T) {
 			if !idle {
 				t.Fatal("session still has cancel set after force finalize")
 			}
+			// 「恰好一个终态」是不变量：再 settle 一段时间确认没有第二帧。
+			time.Sleep(80 * time.Millisecond)
+			if got := len(rec.snapshot()); got != 1 {
+				t.Fatalf("terminal emitted %d times, want exactly 1", got)
+			}
+			// 强拆必须真的把本 runSeq 记账，否则僵尸非帧副作用守卫形同虚设。
+			m.mu.Lock()
+			finalized := m.sessions[session.id].finalizedRunSeq
+			m.mu.Unlock()
+			if finalized != guard.runSeq {
+				t.Fatalf("finalizedRunSeq = %d, want %d", finalized, guard.runSeq)
+			}
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -132,6 +143,11 @@ func TestRunGuardKillIsIdempotent(t *testing.T) {
 	if got := len(rec.snapshot()); got != 0 {
 		t.Fatalf("terminal = %d, want 0 (done already closed)", got)
 	}
+	// 睡过宽限期再断言：证明 done 已关闭确实抑制了强拆，而不只是「还没到点」。
+	time.Sleep(80 * time.Millisecond)
+	if got := len(rec.snapshot()); got != 0 {
+		t.Fatalf("terminal emitted %d times after grace despite markDone, want 0", got)
+	}
 }
 
 func TestRunSideEffectsFencedAfterForceFinalize(t *testing.T) {
@@ -165,7 +181,6 @@ func TestRunSideEffectsFencedAfterForceFinalize(t *testing.T) {
 	if !m.agentAIRunSideEffectsAllowed("missing-session", 9) {
 		t.Fatal("unregistered session (tests/TUI) must keep legacy behaviour")
 	}
-	_ = errors.Is
 }
 
 func TestClearResetsFinalizedRunSeq(t *testing.T) {

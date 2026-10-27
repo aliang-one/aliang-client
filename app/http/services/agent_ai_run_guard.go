@@ -51,15 +51,30 @@ func newAgentAIRunGuard(m *agentAIManager, run agentAIRun, emit agentTerminalWri
 }
 
 // attachRunGuard 把 guard 挂到会话上（runSeq 校验后才挂，防止窜号）。
+//
+// 不匹配（会话已不在 / 本回合已被新回合顶替）时返回 nil 并留痕：调用方必须
+// 能区分「守卫已装」与「守卫没装上」。静默返回一个未挂载的空壳，会让该回合
+// 的看门狗永远走 legacy 分支且事后无从排查。
 func (m *agentAIManager) attachRunGuard(run agentAIRun, emit agentTerminalWriter) *agentAIRunGuard {
 	if m == nil || run.activity == nil || run.cancel == nil {
 		return nil
 	}
 	guard := newAgentAIRunGuard(m, run, emit)
 	m.mu.Lock()
-	if session := m.sessions[run.sessionID]; session != nil && session.runSeq == run.runSeq {
-		session.guard = guard
+	session := m.sessions[run.sessionID]
+	if session == nil || session.runSeq != run.runSeq {
+		actual := -1
+		if session != nil {
+			actual = session.runSeq
+		}
+		m.mu.Unlock()
+		logger.Warn(fmt.Sprintf(
+			"[ai.run.guard] attach_skipped session=%s runSeq=%d actualRunSeq=%d",
+			run.sessionID, run.runSeq, actual,
+		))
+		return nil
 	}
+	session.guard = guard
 	m.mu.Unlock()
 	return guard
 }
@@ -154,6 +169,10 @@ func (g *agentAIRunGuard) armForceFinalize(reason string) {
 // 帧先赢，客户端只会看到回到 idle、看不到错误文案——判死原因仍可从
 // [ai.run.force_finalize] 日志与 killReason 追溯。要消掉这个不确定性，得让
 // clearRunning 接受「本次复位的原因」并合并进同一帧，属于后续增强。
+//
+// 另一条残余风险：若僵尸正卡在 emitter 写侧（e.write 持锁阻塞），这条终态
+// 根本发不出去——本地的会话复位仍然完成（手机本地回到 idle），但服务端侧
+// 只能靠 stale 扫描器收敛，且会留下 terminal_not_delivered 日志。
 func (g *agentAIRunGuard) forceFinalize(reason string) {
 	if g == nil {
 		return
@@ -170,7 +189,17 @@ func (g *agentAIRunGuard) forceFinalize(reason string) {
 			fmt.Errorf("回合已停止响应（%s），已判死，请重试", reason))
 		payload["error_code"] = "turn_stalled"
 		payload["status"] = "stalled"
-		go func() { _ = g.emit(payload) }()
+		go func() {
+			if err := g.emit(payload); err != nil {
+				// 强拆终态送不出去（僵尸一般正卡在 emitter 写侧）时，手机收不到
+				// 终态、服务端只能等 stale 扫描器兜底。错误绝不能吞——否则事后
+				// 只能靠「本该出现的日志没出现」逆推。
+				logger.Warn(fmt.Sprintf(
+					"[ai.run.force_finalize] terminal_not_delivered session=%s runSeq=%d run=%s err=%v",
+					g.sessionID, g.runSeq, g.runID, err,
+				))
+			}
+		}()
 		// 先打标记再复位：复位对外意味着「手机已回到 idle」，此后僵尸的任何
 		// 迟返回都必须被非帧副作用守卫挡住（Task 8）。
 		g.m.markRunFinalized(g.sessionID, g.runSeq)
@@ -181,7 +210,7 @@ func (g *agentAIRunGuard) forceFinalize(reason string) {
 // wrapKillCancel 把看门狗的裸 cancel 换成带观测与强拆升级的版本。
 //
 // 刻意保持 agentAIWatchdogLoop 的签名不变（9 处测试直接调它），改在这里注入。
-// 非 agentcore 回合（TUI）没有 guard，退化为「只打日志 + cancel」。
+// 查不到本回合的 guard 时退化为「只打日志 + cancel」（见下方 no_guard 分支）。
 func (m *agentAIManager) wrapKillCancel(activity *agentAIActivity, cancel context.CancelFunc) context.CancelFunc {
 	return func() {
 		if activity == nil {
@@ -193,8 +222,11 @@ func (m *agentAIManager) wrapKillCancel(activity *agentAIActivity, cancel contex
 			guard.kill(reason)
 			return
 		}
+		// 走到这里只有两种可能：本回合的 guard 未挂载（并发起跑的 TOCTOU，
+		// 见 attachRunGuard 的 attach_skipped 日志），或已被新回合顶替。
+		// TUI 回合不会到这里——它在 startAIWatchdog 之前就 cancel 并 return 了。
 		logger.Warn(fmt.Sprintf(
-			"[ai.run.kill] reason=%s (no guard: TUI/legacy path) runFor=%s idleFor=%s progressIdleFor=%s awaiting=%t pendingToolUses=%d activeSubagents=%d",
+			"[ai.run.kill] reason=%s no_guard=1 runFor=%s idleFor=%s progressIdleFor=%s awaiting=%t pendingToolUses=%d activeSubagents=%d",
 			reason,
 			time.Since(activity.runStart).Truncate(time.Second),
 			activity.idleFor().Truncate(time.Second),

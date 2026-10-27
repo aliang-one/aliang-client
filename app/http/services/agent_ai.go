@@ -2835,6 +2835,9 @@ func (m *agentAIManager) stop(msg map[string]interface{}, writeJSON agentTermina
 	if runWrite == nil {
 		runWrite = writeJSON
 	}
+	// TODO(ai-run-resilience): 此处的 cancel 不经过 agentAIRunGuard——卡死回合
+	// 上用户主动停止时没有 [ai.run.kill] 轨迹、也没有 30s 强拆兜底。见
+	// docs/superpowers/plans/2026-10-27-ai-run-resilience.md（计划未覆盖）。
 	if cancel != nil {
 		cancel()
 	} else if sourceSessionID != "" {
@@ -2884,6 +2887,9 @@ func (m *agentAIManager) preemptForGoalRun(
 	)
 	m.mu.Unlock()
 
+	// TODO(ai-run-resilience): 此处的 cancel 不经过 agentAIRunGuard——卡死回合
+	// 上用户主动停止时没有 [ai.run.kill] 轨迹、也没有 30s 强拆兜底。见
+	// docs/superpowers/plans/2026-10-27-ai-run-resilience.md（计划未覆盖）。
 	cancel()
 	m.emitApprovalCancelled(runWrite, sessionID, cancelledApprovals, "goal_run_preempted")
 
