@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sync/atomic"
 	"syscall"
 	"testing"
 
@@ -309,5 +310,109 @@ func TestRegisterDeviceConflictStatusSurvivesRealCallers(t *testing.T) {
 	service.mu.Unlock()
 	if status != "device_id_conflict" {
 		t.Fatalf("LastSyncStatus = %q after enable, want device_id_conflict to survive the enable_failed branch", status)
+	}
+}
+
+// 【本轮应修-1 的端到端回归】退避窗口内的注册失败不是"服务端明确拒绝"。
+//
+// 退避是本地限流：这段时间我们**一个请求都没发**，因此没有任何新证据。三条
+// 不变量必须同时成立：
+//  1. Registered 不许被翻成 false（否则触发 2026-10-08 那类静默离线）；
+//  2. LastSyncStatus/Message 保留上一次的真实结论（凭据过期就是凭据过期，
+//     不许改写成"服务器不可达"——那正是这轮要消灭的误导）；
+//  3. 退避期内真的一次请求都不发（否则限流本身就是假的）。
+func TestRegisterBackoffKeepsRegistrationAndLastSyncStatus(t *testing.T) {
+	service := setupTransientRegisterTest(t)
+	okServer := registerServer(t, http.StatusOK)
+	defer okServer.Close()
+	registerOnce(t, service, okServer.URL)
+
+	agentChannelHealthInstance.reset()
+	oldWriter := agentChannelAlertWriter
+	agentChannelAlertWriter = func(map[string]interface{}) error { return nil }
+	// 凭据不轮转 → 首次 401 直接落退避（生产上"token 被吊销但未过期"的形态）。
+	oldRefresher := agentChannelRefreshHeader
+	agentChannelRefreshHeader = func() (string, error) { return "", nil }
+	t.Cleanup(func() {
+		agentChannelAlertWriter = oldWriter
+		agentChannelRefreshHeader = oldRefresher
+		agentChannelHealthInstance.reset()
+	})
+
+	var hits int32
+	unauth := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"code":1,"msg":"token revoked"}`))
+	}))
+	defer unauth.Close()
+	config.SetGlobalConfig(&config.Config{Core: &config.CoreConfig{AgentServer: unauth.URL}})
+
+	// 前置态：已注册，且上一次真实结论是"凭据过期"。
+	service.mu.Lock()
+	if !service.state.Registered {
+		service.mu.Unlock()
+		t.Fatal("前置注册态未建立")
+	}
+	service.state.LastSyncStatus = "auth_expired"
+	service.state.LastSyncMessage = "token revoked"
+	service.mu.Unlock()
+
+	endpoint := config.GetGlobalConfig().GetAgentDeviceRegisterURL()
+	authHeader := effectiveAgentRegisterAuthHeader("")
+	// 打满阈值次真 401：首次落退避，后续被本地闸门挡下（不重复打上游）。
+	for i := 0; i < agentChannelAlertThreshold; i++ {
+		_, _ = service.callAgentServer(http.MethodPost, endpoint, nil, "")
+	}
+	if agentChannelHealthInstance.allow(endpoint, authHeader) {
+		t.Fatal("前置失败：endpoint 未进入退避窗口")
+	}
+	hitsBefore := atomic.LoadInt32(&hits)
+
+	// 走真实的 sync 路径（带显式 JWT，绕过 sticky 禁用的早期返回）。
+	err := service.SyncNowWithUserContext(authHeader, "")
+	if err == nil {
+		t.Fatal("SyncNowWithUserContext() error = nil, want 退避错误")
+	}
+	if !isAgentChannelBackoffError(err) {
+		t.Fatalf("error = %v (%T), want agentChannelBackoffError", err, err)
+	}
+	if got := atomic.LoadInt32(&hits); got != hitsBefore {
+		t.Fatalf("上游命中 = %d → %d：退避窗口内不得再发请求", hitsBefore, got)
+	}
+
+	service.mu.Lock()
+	registered := service.state.Registered
+	enabled := service.state.Enabled
+	status := service.state.LastSyncStatus
+	message := service.state.LastSyncMessage
+	service.mu.Unlock()
+	if !registered {
+		t.Fatal("Registered 被退避翻成 false —— 没发出去的请求不构成注销理由")
+	}
+	if !enabled {
+		t.Fatal("Enabled 被退避翻成 false")
+	}
+	if status != "auth_expired" {
+		t.Fatalf("LastSyncStatus = %q, want auth_expired（退避不得改写成 server_unavailable）", status)
+	}
+	if message != "token revoked" {
+		t.Fatalf("LastSyncMessage = %q, want 保留上一次的真实消息", message)
+	}
+
+	// enable 路径同理：显式启用失败要如实返回错误，但不得覆盖真实状态。
+	if _, err := service.EnableWithUserContext(authHeader, ""); err == nil {
+		t.Fatal("EnableWithUserContext() error = nil, want 退避错误")
+	}
+	service.mu.Lock()
+	status = service.state.LastSyncStatus
+	registered = service.state.Registered
+	service.mu.Unlock()
+	if status != "auth_expired" {
+		t.Fatalf("enable 后 LastSyncStatus = %q, want auth_expired（退避不得改写成 enable_failed）", status)
+	}
+	if !registered {
+		t.Fatal("enable 后 Registered 被退避翻成 false")
 	}
 }

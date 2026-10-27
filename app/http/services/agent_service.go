@@ -440,11 +440,20 @@ func (s *AgentService) enableWithUserContext(authHeader string, userKey string) 
 	if err := s.registerAndSyncLockedWithUserContext(authHeader, userKey); err != nil {
 		var authRejectedErr agentUserAuthRejectedError
 		isAuthRejectedErr := errors.As(err, &authRejectedErr)
+		// 本地 401 退避：请求没发出去，没有任何新证据。这里同样不覆盖
+		// LastSyncStatus——把上一次真实的 auth_expired 改写成 enable_failed
+		// 同样是误导（用户看到的是"启用失败"，真相是"凭据过期、这次没重试"）。
+		// 本次 enable 确实没成功：错误照常返回给调用方，用户看得到。
+		isChannelBackoff := isAgentChannelBackoffError(err)
 		// device_id_conflict 的专用标记不得被 enable_failed 覆盖（同 SyncNow）。
-		if !isDeviceIDAlreadyBoundError(err) {
+		if !isDeviceIDAlreadyBoundError(err) && !isChannelBackoff {
 			s.state.LastSyncStatus = "enable_failed"
 			s.state.LastSyncMessage = err.Error()
 			_ = s.saveStateLocked()
+		}
+		if isChannelBackoff {
+			logger.Warn(fmt.Sprintf("[AGENT-BOOT] enable skipped reason=channel_backoff message=退避窗口内未发请求，保留上次同步状态 state=%s device_id=%s",
+				s.state.LastSyncStatus, s.state.DeviceID))
 		}
 		status := s.statusLocked()
 		s.mu.Unlock()
@@ -740,10 +749,19 @@ func (s *AgentService) SyncNowWithUserContext(authHeader string, userKey string)
 		// the register call already recorded the conflict status and remedy —
 		// keepalive/recoverable exclusion keys off that marker, so the generic
 		// server_unavailable must not clobber it.
-		if !isAuthRejectedErr && !isDeviceIDAlreadyBoundError(err) {
+		//
+		// 本地 401 退避同样不覆盖：退避意味着这次请求根本没发出去，我们手上
+		// 没有任何新证据。把上一次真实的 auth_expired 改写成 server_unavailable
+		// 是在编造「服务器不可达」，正是这轮要消灭的那类误导。
+		isChannelBackoff := isAgentChannelBackoffError(err)
+		if !isAuthRejectedErr && !isDeviceIDAlreadyBoundError(err) && !isChannelBackoff {
 			s.state.LastSyncStatus = "server_unavailable"
 			s.state.LastSyncMessage = err.Error()
 			_ = s.saveStateLocked()
+		}
+		if isChannelBackoff {
+			logger.Warn(fmt.Sprintf("[AGENT-BOOT] sync_now skipped reason=channel_backoff message=退避窗口内未发请求，保留上次同步状态 state=%s device_id=%s",
+				s.state.LastSyncStatus, s.state.DeviceID))
 		}
 		s.mu.Unlock()
 		// Register-path 401: try a recovery refresh before letting the session
@@ -1776,6 +1794,7 @@ func isWindowsConnRefusedLike(errno syscall.Errno) bool {
 //     "≥500 保留沿重试 / 408+429 保留" 语义一致；
 //   - 传输层错误（超时/DNS/连接拒绝/reset 等）：复用 isRetryableAgentAuthSyncError
 //     的标记集；
+//   - 本地 401 退避（agentChannelBackoffError）：请求没发出去，等价瞬时；
 //   - 类型化 401、其余 4xx（400/403/409…）、device_id 冲突：非瞬时，保持既有
 //     Registered=false 语义。
 //
@@ -1789,6 +1808,12 @@ func classifyRegisterFailure(err error) bool {
 	var rejected agentUserAuthRejectedError
 	if errors.As(err, &rejected) {
 		return false
+	}
+	// 本地 401 退避 = 这次调用根本没发出去（allow() 在发请求前就拦下了），
+	// 等价于瞬时链路故障，不构成注销理由。必须在上面 typed 401 判定**之后**：
+	// 退避是 401 的后果，不是 401 本身，顺序反了会把真凭据拒绝也当瞬时。
+	if isAgentChannelBackoffError(err) {
+		return true
 	}
 	var statusErr agentServerStatusError
 	if errors.As(err, &statusErr) {
@@ -1819,6 +1844,13 @@ func (s *AgentService) callAgentServerWithAuthorization(method string, endpoint 
 		return nil, errors.New("agent server endpoint is empty")
 	}
 	if !agentChannelHealthInstance.allow(endpoint, authHeader) {
+		// 退避窗口内直接返回，不发请求。
+		//
+		// 边界（别"修"成自愈）：进入退避之前，下面的 401 分支已经做过一次
+		// refresh-once，所以这个错误**不是**新的凭据过期证据。任何自愈链
+		// （recoverOrExpireAfterRegisterAuthRejection）都不能拿它再触发一次
+		// 刷新——那会把每次退避命中都变成一次刷新风暴。它只按瞬时故障处理：
+		// 不推翻注册态、不覆盖上一次的同步状态、只留一条可查的日志。
 		return nil, agentChannelBackoffError{endpoint: sanitizeAgentEndpoint(endpoint)}
 	}
 

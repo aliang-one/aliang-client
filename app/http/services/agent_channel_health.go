@@ -220,3 +220,15 @@ type agentChannelBackoffError struct {
 func (e agentChannelBackoffError) Error() string {
 	return fmt.Sprintf("agent server endpoint %s is backing off after repeated 401", e.endpoint)
 }
+// isAgentChannelBackoffError 报告 err 是否为「本地 401 退避窗口内没有发请求」。
+//
+// 语义定位：退避是**本地限流**，等价于「这次我们压根没发请求」，必须按瞬时
+// 链路故障处理（保留注册态、保留上一次的同步状态），绝不能按「服务端明确
+// 拒绝」处理——那样会把一次未发生的请求记成注销理由（2026-10-08 静默离线
+// 事故的同型病灶）。
+//
+// 判定函数放在错误类型的归属地（本文件），不属于任何一层的调用方。
+func isAgentChannelBackoffError(err error) bool {
+	var backoff agentChannelBackoffError
+	return errors.As(err, &backoff)
+}

@@ -2,6 +2,7 @@ package services
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -233,5 +234,29 @@ func TestAgentChannelAlertRearmsAfterInterval(t *testing.T) {
 	agentChannelHealthInstance.record401(endpoint, "Bearer stale")
 	if got := atomic.LoadInt32(&alerts); got != 2 {
 		t.Fatalf("alerts after window = %d, want 2 (re-arm)", got)
+	}
+}
+
+// TestClassifyRegisterFailureTreatsChannelBackoffAsTransient 钉死本轮的应修点：
+// 退避窗口内我们**没发请求**，这是本地限流，不是服务端明确拒绝。被判成非瞬时
+// 就会走 Registered=false 分支，把一次未发生的请求记成注销理由（2026-10-08
+// 静默离线事故的同型病灶）。
+func TestClassifyRegisterFailureTreatsChannelBackoffAsTransient(t *testing.T) {
+	err := agentChannelBackoffError{endpoint: "api.example.com/api/devices/register"}
+	if !classifyRegisterFailure(err) {
+		t.Fatalf("classifyRegisterFailure(%v) = false，退避必须算瞬时故障", err)
+	}
+	// 包装一层也必须认得出来：调用链上任何地方 wrap 都不该改变语义。
+	if !classifyRegisterFailure(fmt.Errorf("register failed: %w", err)) {
+		t.Fatal("被 wrap 的退避错误仍必须算瞬时故障")
+	}
+}
+
+// TestClassifyRegisterFailureKeepsTyped401Fatal 是上一条的反向守卫：
+// 退避的早返回不能插到 typed 401 判定前面，否则真凭据拒绝会被当成瞬时，
+// 注销与自愈链双双失效。
+func TestClassifyRegisterFailureKeepsTyped401Fatal(t *testing.T) {
+	if classifyRegisterFailure(agentUserAuthRejectedError{status: http.StatusUnauthorized}) {
+		t.Fatal("typed 401 必须仍是非瞬时（退避判定不得抢在它前面）")
 	}
 }
