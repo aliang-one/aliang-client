@@ -1312,10 +1312,20 @@ func TestZombieSuccessWritesFencedWhenGuardReplaced(t *testing.T) {
 	if len(history) != 1 {
 		t.Fatalf("history len = %d, want 1（guard 不同即非本回合，不得写入）", len(history))
 	}
-	for _, row := range readAgentCoreJournalRows(t, sessionID) {
+	rows := readAgentCoreJournalRows(t, sessionID)
+	if len(rows) == 0 {
+		t.Fatal("journal 为空，缺 end 行")
+	}
+	for _, row := range rows {
 		if role, _ := row["role"].(string); role == "assistant" {
 			t.Fatalf("journal 出现僵尸 assistant 行：%v", row)
 		}
+	}
+	// endStatus 必须保持默认的 "error"：收尾被守卫拒绝时若记 success，
+	// journal 就会出现 end(success) 却查无 assistant 行的自相矛盾。
+	last := rows[len(rows)-1]
+	if status, _ := last["status"].(string); status != "error" {
+		t.Fatalf("journal end status = %q, want error（收尾被守卫拒绝，不得记 success）", status)
 	}
 	if got := log.count(models.AgentEventAIDone); got != 1 {
 		t.Fatalf("ai.done 数量 = %d, want 1", got)
