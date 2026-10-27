@@ -57,6 +57,13 @@ func queueLenOf(c *agentAICoreSteerControl) int {
 	return len(c.queue)
 }
 
+// pendingLenOf 读待触发活性窗数量（同包测试用，走同一把锁）。
+func pendingLenOf(c *agentAICoreSteerControl) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.pending)
+}
+
 func TestCoreSteerLivenessWindowEmitsTurnStalled(t *testing.T) {
 	oldWindow := steerLivenessWindow
 	steerLivenessWindow = 40 * time.Millisecond
@@ -102,6 +109,8 @@ func TestCoreSteerLivenessWindowSparesToolWait(t *testing.T) {
 	control := newAgentAICoreSteerControl(run, rec.write)
 	control.activity = activity
 	control.onStalled = func(string) { t.Error("must not judge dead during a legal waiting state") }
+	// 定时器可能在测试返回之后才触发，届时 t.Error 会 panic；收尾关掉它。
+	t.Cleanup(func() { control.close("not_running", "", "") })
 
 	_, _ = control.deliver(agentAISteerMessage{MessageID: "steer-10", Content: "hi"})
 	time.Sleep(150 * time.Millisecond)
@@ -130,6 +139,7 @@ func TestCoreSteerLivenessWindowSparesApprovalWait(t *testing.T) {
 	control := newAgentAICoreSteerControl(run, rec.write)
 	control.activity = activity
 	control.onStalled = func(string) { t.Error("must not judge dead while an approval is pending") }
+	t.Cleanup(func() { control.close("not_running", "", "") })
 
 	_, _ = control.deliver(agentAISteerMessage{MessageID: "steer-12", Content: "hi"})
 	time.Sleep(150 * time.Millisecond)
@@ -156,6 +166,7 @@ func TestCoreSteerLivenessWindowSparesSubagentWait(t *testing.T) {
 	control := newAgentAICoreSteerControl(run, rec.write)
 	control.activity = activity
 	control.onStalled = func(string) { t.Error("must not judge dead while a subagent is running") }
+	t.Cleanup(func() { control.close("not_running", "", "") })
 
 	_, _ = control.deliver(agentAISteerMessage{MessageID: "steer-13", Content: "hi"})
 	time.Sleep(150 * time.Millisecond)
@@ -181,11 +192,52 @@ func TestCoreSteerDrainStopsLivenessTimer(t *testing.T) {
 
 	_, _ = control.deliver(agentAISteerMessage{MessageID: "steer-11", Content: "hi"})
 	_ = control.drain()
+	// drain 必须真的把计时器停掉：否则 expire 见到空队列会静默返回，
+	// 这个用例就算抽掉 stopLivenessLocked 也照样全绿，不承重。
+	if got := pendingLenOf(control); got != 0 {
+		t.Fatalf("pending timers = %d, want 0 after drain", got)
+	}
 	time.Sleep(150 * time.Millisecond)
 
 	for _, p := range rec.snapshot() {
 		if p["code"] == "turn_stalled" {
 			t.Fatalf("unexpected turn_stalled ack: %v", p)
 		}
+	}
+}
+
+func TestCoreSteerLivenessWindowSparesActiveRun(t *testing.T) {
+	// 回合仍在出字（delta 会 bump lastActivityAt）时，即便插话还没被 drain，
+	// 也不能判死：否则一次超过窗口时长的大模型调用就会杀掉健康回合。
+	// 这里把窗口调到 1 小时再直接调 expire，做到零 sleep、零竞态。
+	oldWindow := steerLivenessWindow
+	steerLivenessWindow = time.Hour
+	t.Cleanup(func() { steerLivenessWindow = oldWindow })
+
+	rec := &recordingWriter{}
+	activity := newAgentAIActivity()
+	run := agentAIRun{sessionID: "sess-active", runSeq: 1, messageID: "msg-active", activity: activity}
+	control := newAgentAICoreSteerControl(run, rec.write)
+	control.activity = activity
+	stalled := false
+	control.onStalled = func(string) { stalled = true }
+	t.Cleanup(func() { control.close("not_running", "", "") })
+
+	// 模拟「刚出过字」：lastActivityAt 就在此刻。
+	activity.bump()
+	if _, err := control.deliver(agentAISteerMessage{MessageID: "a", Content: "插话"}); err != nil {
+		t.Fatalf("deliver: %v", err)
+	}
+
+	control.expire("a")
+
+	if got := queueLenOf(control); got != 1 {
+		t.Fatalf("queued = %d, want 1 (active run must keep the steer)", got)
+	}
+	if got := len(rec.snapshot()); got != 0 {
+		t.Fatalf("acks = %d, want 0 (active run must not be reported stalled)", got)
+	}
+	if stalled {
+		t.Fatal("onStalled called for an actively generating run")
 	}
 }

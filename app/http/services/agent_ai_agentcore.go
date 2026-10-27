@@ -1127,8 +1127,8 @@ type agentAICoreSteerControl struct {
 	// activity 用于把「插话被取走」计入 run 活性（spec §3.3.1）：内核 drain 发生
 	// 在下一次 LLM 调用前，那一瞬间说明回合确实活着。
 	activity *agentAIActivity
-	// onStalled 在活性窗超时且回合处于非等待态时被调用（参数是判死原因），
-	// 由 runAgentCore 接到 guardian.kill。nil = 只发失败 ack，不判死。
+	// onStalled 在活性窗到期且判定回合无响应时回调（生产接线 = guardian kill）。
+	// nil = 完全不起活性窗（既不发失败 ack 也不判死），仅供测试使用。
 	onStalled func(reason string)
 	// pending 记每条排队插话的活性窗计时器，drain/close 时停掉。
 	pending map[string]*time.Timer
@@ -1166,6 +1166,9 @@ func (c *agentAICoreSteerControl) deliver(msg agentAISteerMessage) (string, erro
 // activity 为 nil 时直接不起窗（fail-safe）：没有活性就分不清「死」和「在等
 // 审批」，宁可不判死也不误杀合法等待。生产路径在 attachCoreSteer 之前一定
 // 赋好 activity，所以这只在接线错误时退化。
+//
+// onStalled 为 nil 时同样不起窗（同义 fail-safe）：没有收尾回调就只剩一条
+// 失败 ack，判死也无从收敛，不如不判。仅供测试使用。
 func (c *agentAICoreSteerControl) armLivenessLocked(messageID string) {
 	if steerLivenessWindow <= 0 || c.onStalled == nil || c.activity == nil {
 		return
@@ -1181,18 +1184,22 @@ func (c *agentAICoreSteerControl) armLivenessLocked(messageID string) {
 
 // expire 在活性窗到期时检查插话是否仍未被取走。
 //
-// 仍在队列且回合处于非等待态 → 判死：给手机一条失败 ack（code=turn_stalled），
-// 再触发 guardian 收尾。等待态（工具/子代理/审批）是合法静默，插话继续排队，
-// 由各自天花板 + stale 扫描器收敛，这里不误报（spec §3.3.4）。
+// 仍在队列且回合处于非等待态、且已静默满一个完整窗口 → 判死：给手机一条失败
+// ack（code=turn_stalled），再触发 guardian 收尾。等待态（工具/子代理/审批）
+// 与仍在出字的回合都是合法静默，插话继续排队，由各自天花板 + stale 扫描器
+// 收敛，这里不误报（spec §3.3.4）。
 func (c *agentAICoreSteerControl) expire(messageID string) {
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
 		return
 	}
-	// 合法等待态（审批/工具/子代理）是静默，不是死亡：消息必须留在队列里等着
-	// 被 drain 取走，只把这条窗口作废（不重置，避免无限续期）。
-	if c.activity != nil && c.activity.idlePaused() {
+	// 合法静默有两种，都不能判死：
+	//   1) 等待态（审批/工具/子代理）——各自有天花板兜底；
+	//   2) 回合仍在出字——delta 会 bump lastActivityAt，距今还没满一个窗口。
+	// 只有「非等待态 且 已静默 ≥ 一个完整窗口」才判死（与 stale 扫描器同一口径）。
+	// 到期即作废本窗、不动队列：不重置，避免静默等待被无限续期。
+	if c.activity != nil && (c.activity.idlePaused() || c.activity.idleFor() < steerLivenessWindow) {
 		delete(c.pending, messageID)
 		c.mu.Unlock()
 		return
@@ -1212,12 +1219,19 @@ func (c *agentAICoreSteerControl) expire(messageID string) {
 	delete(c.pending, messageID)
 	write := c.write
 	sessionID := c.sessionID
+	runSeq := c.runSeq
 	onStalled := c.onStalled
+	var idle time.Duration
+	if c.activity != nil {
+		idle = c.activity.idleFor()
+	}
 	c.mu.Unlock()
 
 	if !stillQueued {
 		return
 	}
+	logger.Warn(fmt.Sprintf("[ai.steer.stalled] session=%s run_seq=%d message_id=%s idle=%s guard_mounted=%t",
+		sessionID, runSeq, messageID, idle, onStalled != nil))
 	emitAgentAISteerAck(write, sessionID, messageID, "error", "回合无响应已判死，请重试", "turn_stalled")
 	if onStalled != nil {
 		onStalled("steer_stalled")
