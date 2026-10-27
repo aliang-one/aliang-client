@@ -535,3 +535,45 @@ func TestAgentAIWatchdogLoopApprovalResolveRearmsToolWaitClock(t *testing.T) {
 		t.Fatal("watchdog did not cancel after approval resolved and tool stayed pending")
 	}
 }
+
+func TestAgentAIWatchdogHardCeilingExcludesWaitingStates(t *testing.T) {
+	// 硬顶只看引擎活跃时长：整段处于工具等待态的回合不应被硬顶杀掉。
+	activity := newAgentAIActivity()
+	activity.beginToolUseWait()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	killed := make(chan string, 1)
+	loopCancel := func() { killed <- activity.killReasonOr("") }
+
+	go agentAIWatchdogLoop(ctx, activity, loopCancel,
+		// idle 分支是唯一没有 `>0` 禁用开关的（条件为
+		// `!idlePaused() && idleFor() > idleWindow`），传 0 反而「一 tick 就杀」。
+		// 所以用 time.Hour 让它永不触发，与既有 TestAgentAIWatchdogLoopHardCeilingKills 写法一致。
+		time.Hour,           // idleWindow: 实际关闭
+		20*time.Millisecond, // hardCeiling: 引擎活跃 20ms
+		0,                   // noProgressWindow: 关
+		0,                   // toolWaitCeiling: 关（本用例只验硬顶口径）
+		0,                   // subagentCeiling: 关
+		5*time.Millisecond,
+	)
+
+	select {
+	case reason := <-killed:
+		t.Fatalf("hard ceiling killed a pure tool-wait run (reason=%q)", reason)
+	case <-time.After(120 * time.Millisecond):
+		// 期望：等待态不计入引擎时钟，硬顶不触发
+	}
+
+	activity.endToolUseWait()
+
+	select {
+	case reason := <-killed:
+		if reason != "hard_ceiling" {
+			t.Fatalf("kill reason = %q, want hard_ceiling", reason)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("hard ceiling did not fire after the run left the waiting state")
+	}
+}

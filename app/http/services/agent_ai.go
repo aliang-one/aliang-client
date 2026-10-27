@@ -1302,11 +1302,21 @@ func (m *agentAIManager) startAIWatchdog(ctx context.Context, activity *agentAIA
 func agentAIWatchdogLoop(ctx context.Context, activity *agentAIActivity, cancel context.CancelFunc, idleWindow, hardCeiling, noProgressWindow, toolWaitCeiling, subagentCeiling, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	// 引擎活跃时钟：逐拍累加，但处于任一合法等待态（审批/工具/子代理）的拍
+	// 不计入。口径见 spec §3.2.4——等待态各自有独立天花板，硬顶只管真实
+	// 干活时长，否则 3h 的子代理批处理会被 2h 硬顶误杀。
+	lastTick := time.Now()
+	var engineActive time.Duration
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case now := <-ticker.C:
+			delta := now.Sub(lastTick)
+			lastTick = now
+			if !activity.idlePaused() {
+				engineActive += delta
+			}
 			if !activity.idlePaused() && activity.idleFor() > idleWindow {
 				activity.setKillReason("idle_timeout")
 				cancel()
@@ -1329,7 +1339,7 @@ func agentAIWatchdogLoop(ctx context.Context, activity *agentAIActivity, cancel 
 			// is hung. Every other guard is paused during such a wait by
 			// design, and the ai.run.progress heartbeat keeps feeding the
 			// server-side stale-run sweeper, so without this bound a hung
-			// subagent pins the run until the hard ceiling while the phone
+			// subagent pins the run indefinitely while the phone
 			// shows "running". The awaiting() re-check hardens against a
 			// theoretical stale-armed clock (a scheduler preemption inside
 			// beginToolUseWait's Add→Store window landing exactly as an
@@ -1352,7 +1362,7 @@ func agentAIWatchdogLoop(ctx context.Context, activity *agentAIActivity, cancel 
 				cancel()
 				return
 			}
-			if hardCeiling > 0 && time.Since(activity.runStart) > hardCeiling {
+			if hardCeiling > 0 && engineActive > hardCeiling {
 				activity.setKillReason("hard_ceiling")
 				cancel()
 				return

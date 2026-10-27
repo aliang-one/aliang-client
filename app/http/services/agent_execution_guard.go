@@ -63,9 +63,10 @@ const (
 	// paused, but the approval wait itself is bounded by agentAIApprovalTimeout
 	// (the env-configured var below): on expiry the request is cancelled (resolved
 	// as denied) so a forgotten approval cannot pin a headless CLI forever. The
-	// hard ceiling (agentAIHardCeiling) is a runaway backstop that fires from run
-	// start regardless of activity; it MUST exceed agentAIApprovalTimeout or a
-	// long approval wait is clipped by the ceiling first. A run/session ending or
+	// hard ceiling (agentAIHardCeiling) is a runaway backstop for ENGINE-ACTIVE
+	// time: ticks spent awaiting a human decision, a tool result, or a subagent
+	// are excluded (each has its own bound), so it carries no ordering
+	// constraint against agentAIApprovalTimeout. A run/session ending or
 	// the agent going offline also cancels pending approvals
 	// (see agent_ai.go startAIWatchdog / clearPendingApprovalsLocked).
 	agentAIIdleWindow        = 10 * time.Minute
@@ -90,23 +91,26 @@ var (
 )
 
 // agentAIApprovalTimeout bounds how long a single approval request waits for a
-// human decision before being cancelled (→ denied). Env-configurable so the max
-// confirmation window is tunable without a recompile:
+// human decision before being cancelled (→ denied). Env-configurable:
 //
 //	ALIANG_AI_APPROVAL_TIMEOUT  (time.ParseDuration form, e.g. "24h", "30m"). Default 24h.
 //
-// agentAIHardCeiling is the runaway backstop: a run is cancelled once its total
-// active time exceeds this, regardless of approval state. It MUST be greater
-// than agentAIApprovalTimeout, otherwise a long approval wait is clipped by the
-// ceiling first. Env-configurable:
+// agentAIHardCeiling is the runaway backstop for ENGINE-ACTIVE time: the
+// watchdog accumulates elapsed time tick by tick and deliberately does NOT
+// count ticks spent in a legitimate waiting state (awaiting a human approval,
+// a pending tool result, or an active subagent). Each waiting state has its
+// own bound (agentAIApprovalTimeout / agentAIToolWaitCeiling /
+// agentAISubagentWaitCeiling), so a long approval, a 3h subagent batch or a
+// 10min tool call can never be clipped by this ceiling — only time actually
+// spent running the engine counts. Env-configurable:
 //
-//	ALIANG_AI_HARD_CEILING  (time.ParseDuration form). Default 48h (> 24h approval).
+//	ALIANG_AI_HARD_CEILING  (time.ParseDuration form). Default 2h.
 //
 // Both resolve once at process start; blank/unparseable/non-positive values
 // fall back to the default (see resolveEnvDuration, which is unit-tested).
 var (
 	agentAIApprovalTimeout = resolveEnvDuration("ALIANG_AI_APPROVAL_TIMEOUT", 24*time.Hour)
-	agentAIHardCeiling     = resolveEnvDuration("ALIANG_AI_HARD_CEILING", 48*time.Hour)
+	agentAIHardCeiling     = resolveEnvDuration("ALIANG_AI_HARD_CEILING", 2*time.Hour)
 
 	// agentAINoProgressWindow bounds how long a run may keep EMITTING output
 	// without producing meaningful progress (assistant text/thinking, a file
@@ -127,16 +131,16 @@ var (
 	// no-progress watchdogs pause while a tool result is pending, and the
 	// ai.run.progress heartbeat keeps feeding the server-side stale-run
 	// sweeper — without this bound a hung subagent keeps the phone showing
-	// "running" until the hard ceiling. Env:
+	// "running" until the stale-run sweeper reclaims it. Env:
 	//
 	//	ALIANG_AI_TOOL_WAIT_CEILING  (time.ParseDuration, e.g. "90m"). Default 1h.
 	//
 	// Explicitly set it to "0s" to disable. Blank/unparseable/negative values
 	// fall back to the default (see resolveEnvDurationAllowZero).
-	// Keep it below agentAIHardCeiling — that backstop fires on total elapsed
-	// run time, so a value above it neutralizes this guard. Approval waits
-	// never count against this ceiling (the clock is paused while a human
-	// decision is pending) and remain bounded by agentAIApprovalTimeout.
+	// 无需再与 agentAIHardCeiling 比较大小：硬顶只累加引擎活跃时长，工具等待
+	// 的拍不计入，2h 硬顶永远不会在这条等待里先触发（它会由本上限或 stale
+	// 扫描器收敛）。审批等待的拍同样不计入本计时（挂起即停表），由
+	// agentAIApprovalTimeout 管辖。
 	agentAIToolWaitCeiling = resolveEnvDurationAllowZero("ALIANG_AI_TOOL_WAIT_CEILING", time.Hour)
 
 	// agentAISubagentWaitCeiling bounds one CONTIGUOUS stretch with >=1 active
@@ -146,10 +150,11 @@ var (
 	//
 	//	ALIANG_AI_SUBAGENT_WAIT_CEILING  (time.ParseDuration, e.g. "90m"). Default 6h.
 	//
-	// Explicitly "0s" disables. Keep below agentAIHardCeiling (48h) — same
-	// reasoning as the tool-wait ceiling. Active-subagent time also pauses the
-	// idle/no-progress guards (idlePaused), so without this bound a marquee
-	// subagent would pin the run until the hard ceiling.
+	// Explicitly "0s" disables. No ordering constraint against
+	// agentAIHardCeiling any more — the hard ceiling counts only engine-active
+	// ticks, so subagent-wait time is never clipped by it. Active-subagent
+	// time also pauses the idle/no-progress guards (idlePaused), so without
+	// this bound a marquee subagent would pin the run indefinitely.
 	agentAISubagentWaitCeiling = resolveEnvDurationAllowZero("ALIANG_AI_SUBAGENT_WAIT_CEILING", 6*time.Hour)
 )
 
