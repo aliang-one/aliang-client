@@ -7162,6 +7162,11 @@ func emitClaudeStructuredEvents(format agentAIOutputFormat, event map[string]int
 			case "content_block_delta":
 				if delta := mapIf(streamEvent["delta"]); delta != nil && remoteString(delta, "type") == "thinking_delta" {
 					if text := remoteString(delta, "thinking"); strings.TrimSpace(text) != "" {
+						// 思考流也算实打实的进展（与 TUI 路径同一口径）。不算
+						// 的话，一段超过 idle 窗口（10 分钟）的纯推理在宿主看来
+						// 就是「没有任何动静」，会被当卡死杀掉——模型明明在
+						// 正常思考，用户却收到中断。
+						run.activity.markProgress()
 						idx, _ := streamFloatIndex(streamEvent["index"])
 						_ = writeJSON(map[string]interface{}{
 							"type":       models.AgentEventAIThinking,
