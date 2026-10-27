@@ -17,6 +17,7 @@ import (
 
 	"aliang.one/nursorgate/app/agentcore"
 	"aliang.one/nursorgate/app/http/models"
+	"aliang.one/nursorgate/common/cache"
 )
 
 // 这一组测试锁死**宿主侧**的内置内核接线，与 app/agentcore 的内核测试互补：
@@ -907,101 +908,364 @@ func TestRunAgentCoreJournalsErrorEnd(t *testing.T) {
 	}
 }
 
-// TestZombieSuccessWritesAreDiscarded 锁死 Task 8 的接线本身。
+// TestZombieStoppedRunRevokesResumePoint 是僵尸收尾的**真实路径**用例。
 //
-// 只断言谓词（agentAIRunSideEffectsAllowed）是空转的：真正会回归的是
-// 「守卫忘了包住成功收尾段」。所以这里跑完整的一轮 run，在流式途中打上强拆
-// 标记，再检查 history / resume / journal 三处都没被僵尸污染。
-// 删掉 Task 8 加的守卫后，本用例必然变红。
-func TestZombieSuccessWritesAreDiscarded(t *testing.T) {
+// 生产里判死的每条路径都先 kill() → cancel()，所以僵尸迟返回必然先在
+// ctx.Err() != nil 的 stopped 早退处 return，永远走不到成功收尾段。撤销因此
+// 必须发生在强拆链路（finalizeStalledGuard）里。本用例完整复现该形态：
+//
+//	上游卡在流中途 → system/init 已消费、绑定已落库 → kill + forceFinalize
+//	→ 放行上游，让 run goroutine 迟返回。
+//
+// 断言里最关键的一条是 journal end 记 "stopped"：它证明用例走的确实是真实
+// stopped 早退，而不是被测试人工造出来、生产中到不了的收尾分支。
+func TestZombieStoppedRunRevokesResumePoint(t *testing.T) {
 	setTestAgentHome(t)
-	_, srv := newAgentCoreUpstream(t, agentCoreTextTurn("你好", "，世界"))
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	entered := make(chan struct{}, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		// 不回任何帧：run 卡在流式中途，正是僵尸的形态。
+		<-release
+	}))
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(release) })
+		srv.Close()
+	})
 	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
 	t.Setenv("ANTHROPIC_MODEL", "")
 
 	m := newAgentAIManager()
-	const sessionID = "conv-agentcore-zombie"
-	const runSeq = 7
+	const sessionID = "conv-agentcore-zombie-stopped"
+	const runSeq = 9
+	activity := newAgentAIActivity()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
 	registerTestAISession(t, m, &agentAISession{
-		id:      sessionID,
-		runSeq:  runSeq,
-		cancel:  func() {},
-		history: []agentAIMessage{{Role: "user", Content: "跑一半被强拆"}},
+		id:       sessionID,
+		runSeq:   runSeq,
+		cancel:   cancel,
+		activity: activity,
+		history:  []agentAIMessage{{Role: "user", Content: "跑到一半被强拆"}},
 	})
 
 	log := &agentCoreEventLog{}
-	fenced := false
-	write := func(v interface{}) error {
-		if !fenced {
-			if frame, ok := v.(map[string]interface{}); ok {
-				if typ, _ := frame["type"].(string); typ == models.AgentEventAIDelta {
-					// 强拆发生在僵尸仍在输出之后：这正是迟返回写污染的窗口。
-					m.markRunFinalized(sessionID, runSeq)
-					fenced = true
-				}
-			}
-		}
-		return log.write(v)
-	}
-
 	run := agentAIRun{
 		sessionID:   sessionID,
 		runSeq:      runSeq,
-		messageID:   "msg-zombie",
+		messageID:   "msg-zombie-stopped",
 		provider:    "agentcore",
 		model:       "glm-5.2",
 		projectPath: t.TempDir(),
-		activity:    newAgentAIActivity(),
+		activity:    activity,
+		cancel:      cancel,
 	}
-	m.runAgentCore(context.Background(), run, write)
-
-	if !fenced {
-		t.Fatal("用例没触发强拆标记（没收到 ai.delta），断言无效")
-	}
-
-	// 1) 历史不得追加 assistant：否则 Retry 新回合会把僵尸的产出当成自己的上文。
-	m.mu.Lock()
-	history := append([]agentAIMessage(nil), m.sessions[sessionID].history...)
-	resume := m.sessions[sessionID].resumeSessionID
-	m.mu.Unlock()
-	if len(history) != 1 {
-		t.Fatalf("history len = %d, want 1（僵尸的 assistant 输出必须被丢弃）", len(history))
-	}
-	if resume != "" {
-		t.Fatalf("resumeSessionID = %q, want 空（僵尸不得为下一回合留恢复点）", resume)
+	// 与生产一致：走 attachRunGuard 挂载，起跑快照才会被采集。
+	run.guard = m.attachRunGuard(run, log.write)
+	if run.guard == nil {
+		t.Fatal("guard 未挂载，用例覆盖不到强拆链路")
 	}
 
-	// 1b) 绑定是下一回合 resumeID 的来源（runStart 会用 confirmed 绑定覆盖
-	// resumeID），僵尸的 confirmed 绑定不撤掉，Retry 照样 resume 到含半截
-	// assistant 输出的 native session —— 只清 session.resumeSessionID 是假修。
-	m.mu.Lock()
-	binding := m.bindings[sessionID]
-	m.mu.Unlock()
-	if binding.NativeSessionID != "" {
-		t.Fatalf("bindings 仍指向僵尸会话 %q（Retry 会从 confirmed 绑定续接）", binding.NativeSessionID)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		m.runAgentCore(ctx, run, log.write)
+	}()
+
+	// 1) 等 system/init 被消费：绑定落库即僵尸已在流式途中钉下恢复点。
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		m.mu.Lock()
+		bound := m.bindings[sessionID].NativeSessionID
+		resume := m.sessions[sessionID].resumeSessionID
+		m.mu.Unlock()
+		if bound != "" && resume != "" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("等不到绑定落库（binding=%q resume=%q）", bound, resume)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("上游没收到请求，run 未真正卡在流式中途")
 	}
 
-	// 2) journal 不得出现 assistant 行，end 行必须如实记 error。
+	// 2) 判死：kill 负责 cancel，宽限到期强拆。这里同步驱动 finalize
+	// （定时器那条链由既有 run_guard 用例覆盖），避免用例空等 30s。
+	run.guard.kill("stalled")
+	run.guard.forceFinalize("stalled")
+
+	// 3) 放行上游，让僵尸迟返回。
+	releaseOnce.Do(func() { close(release) })
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("run goroutine 未返回")
+	}
+
+	// 4) 证明走的是真实 stopped 早退：被 cancel 的僵尸写不出 success。
 	rows := readAgentCoreJournalRows(t, sessionID)
+	last := rows[len(rows)-1]
+	if status, _ := last["status"].(string); status != "stopped" {
+		t.Fatalf("journal end status = %q, want stopped（僵尸必经 ctx.Err() 早退，事件 %v）", status, log.types())
+	}
 	for _, row := range rows {
 		if role, _ := row["role"].(string); role == "assistant" {
 			t.Fatalf("journal 出现僵尸 assistant 行：%v", row)
 		}
 	}
-	last := rows[len(rows)-1]
-	if status, _ := last["status"].(string); status != "error" {
-		t.Fatalf("journal end status = %q, want error（被丢弃的回合不能记成功）", status)
+
+	m.mu.Lock()
+	resume := m.sessions[sessionID].resumeSessionID
+	binding := m.bindings[sessionID]
+	history := append([]agentAIMessage(nil), m.sessions[sessionID].history...)
+	m.mu.Unlock()
+
+	if resume != "" {
+		t.Fatalf("resumeSessionID = %q, want 空（僵尸不得为 Retry 留恢复点）", resume)
 	}
-	// 3) 终态不受影响：守的是非帧副作用，不是帧流水。
-	if got := log.count(models.AgentEventAIDone); got != 1 {
-		t.Fatalf("ai.done 数量 = %d, want 1（事件 %v）", got, log.types())
+	if binding.NativeSessionID != "" {
+		t.Fatalf("bindings 仍指向僵尸会话 %q（runStart 会从 confirmed 绑定取 resumeID）", binding.NativeSessionID)
+	}
+	if len(history) != 1 {
+		t.Fatalf("history len = %d, want 1（僵尸的 assistant 输出必须被丢弃）", len(history))
 	}
 }
 
-// TestZombieSideEffectsFencedWhenGuardReplaced 锁死 guard 身份判据：
-// /clear 会把 runSeq 归零，下一回合复用同一个 runSeq，此时只比 runSeq
-// 挡不住旧回合的僵尸迟返回。
-func TestZombieSideEffectsFencedWhenGuardReplaced(t *testing.T) {
+// TestZombieLateNativeSessionIDDoesNotRebind 锁死 onNativeSessionID 的围栏。
+//
+// 被 cancel 却忽略取消、卡住很久的僵尸，完全可能在强拆撤销之后才吐出
+// system/init。没有围栏时它会把 m.bindings 与 session.resumeSessionID 重新
+// 写回去，污染照样成立。围栏必须挡在 confirmBinding 之前，且不发
+// ai.session.bound（手机不该看到一个已判死回合的绑定帧）。
+func TestZombieLateNativeSessionIDDoesNotRebind(t *testing.T) {
+	setTestAgentHome(t)
+	// identity 状态走全局 cache 单例，必须重置才能隔离到临时目录。
+	t.Setenv("ALIANG_CACHE_DIR", t.TempDir())
+	cache.ResetCacheDirForTest()
+	t.Cleanup(cache.ResetCacheDirForTest)
+
+	m := newAgentAIManager()
+	const sessionID = "conv-agentcore-late-bind"
+	const runSeq = 4
+	activity := newAgentAIActivity()
+	_, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	registerTestAISession(t, m, &agentAISession{
+		id:       sessionID,
+		runSeq:   runSeq,
+		cancel:   cancel,
+		activity: activity,
+	})
+
+	log := &agentCoreEventLog{}
+	run := agentAIRun{
+		sessionID: sessionID,
+		runSeq:    runSeq,
+		runID:     "run-late-bind",
+		messageID: "msg-late-bind",
+		provider:  "agentcore",
+		activity:  activity,
+		cancel:    cancel,
+	}
+	run.guard = m.attachRunGuard(run, log.write)
+	if run.guard == nil {
+		t.Fatal("guard 未挂载")
+	}
+
+	// 先走一遍真实强拆链路，撤销已经发生。
+	run.guard.kill("stalled")
+	run.guard.forceFinalize("stalled")
+
+	// 僵尸迟到的 system/init。
+	_, fenced, err := m.bindAgentCoreNativeSession(run, log.write, "agentcore-late-1")
+	if err != nil {
+		t.Fatalf("围栏丢弃不该报错: %v", err)
+	}
+	if !fenced {
+		t.Fatal("强拆之后到达的绑定必须被围栏丢弃")
+	}
+
+	m.mu.Lock()
+	binding := m.bindings[sessionID]
+	resume := m.sessions[sessionID].resumeSessionID
+	m.mu.Unlock()
+	if binding.NativeSessionID != "" {
+		t.Fatalf("迟到绑定写回 m.bindings：%q", binding.NativeSessionID)
+	}
+	if resume != "" {
+		t.Fatalf("迟到绑定写回 resumeSessionID：%q", resume)
+	}
+	if got := log.count(models.AgentEventAISessionBound); got != 0 {
+		t.Fatalf("僵尸迟到绑定不得发 ai.session.bound，实际 %d 帧", got)
+	}
+}
+
+// TestFinalizeStalledGuardRevokesMidRunResumePoint 锁死撤销的判据边界。
+//
+// 撤销只在「起跑时没有恢复点」时动手，且绑定还必须与起跑快照不同——否则可能
+// 把上一轮合法恢复点误清。guard 身份不匹配时一律不碰会话。
+func TestFinalizeStalledGuardRevokesMidRunResumePoint(t *testing.T) {
+	type testCase struct {
+		name           string
+		resumeAtStart  string
+		bindingAtStart string
+		midRunResume   string
+		midRunBinding  string
+		guardMismatch  bool
+		wantResume     string
+		wantBinding    string
+		wantCode       string
+		wantOK         bool
+	}
+	cases := []testCase{
+		{
+			name:           "起跑已有恢复点不撤销",
+			resumeAtStart:  "agentcore-prev",
+			bindingAtStart: "agentcore-prev",
+			midRunResume:   "agentcore-new",
+			midRunBinding:  "agentcore-new",
+			wantResume:     "agentcore-new",
+			wantBinding:    "agentcore-new",
+			wantOK:         true,
+		},
+		{
+			name:           "起跑已有绑定不撤销",
+			bindingAtStart: "agentcore-prev",
+			midRunBinding:  "agentcore-prev",
+			wantResume:     "",
+			wantBinding:    "agentcore-prev",
+			wantOK:         true,
+		},
+		{
+			name:          "guard 身份不匹配不碰会话",
+			midRunResume:  "agentcore-new",
+			midRunBinding: "agentcore-new",
+			guardMismatch: true,
+			wantResume:    "agentcore-new",
+			wantBinding:   "agentcore-new",
+			wantCode:      "guard_replaced",
+			wantOK:        false,
+		},
+		{
+			name:          "起跑无恢复点且中途钉入则撤销",
+			midRunResume:  "agentcore-new",
+			midRunBinding: "agentcore-new",
+			wantResume:    "",
+			wantBinding:   "",
+			wantOK:        true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("ALIANG_CACHE_DIR", t.TempDir())
+			cache.ResetCacheDirForTest()
+			t.Cleanup(cache.ResetCacheDirForTest)
+
+			m := newAgentAIManager()
+			const sessionID = "conv-finalize-revoke"
+			activity := newAgentAIActivity()
+			_, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			session := &agentAISession{
+				id:       sessionID,
+				runSeq:   2,
+				cancel:   cancel,
+				activity: activity,
+			}
+			m.mu.Lock()
+			m.sessions[sessionID] = session
+			if tc.bindingAtStart != "" {
+				m.bindings[sessionID] = agentAIBindingRecord{
+					ConversationID:  sessionID,
+					NativeSessionID: tc.bindingAtStart,
+					State:           "confirmed",
+				}
+			}
+			m.mu.Unlock()
+
+			run := agentAIRun{
+				sessionID:       sessionID,
+				runID:           "run-revoke",
+				messageID:       "msg-revoke",
+				runSeq:          session.runSeq,
+				resumeSessionID: tc.resumeAtStart,
+				activity:        activity,
+				cancel:          cancel,
+			}
+			rec := &recordingWriter{}
+			guard := m.attachRunGuard(run, rec.write)
+			if guard == nil {
+				t.Fatal("guard 未挂载")
+			}
+
+			// 模拟流式途中 confirmBinding 的钉入。
+			m.mu.Lock()
+			session.resumeSessionID = tc.midRunResume
+			if tc.midRunBinding != "" {
+				m.bindings[sessionID] = agentAIBindingRecord{
+					ConversationID:  sessionID,
+					NativeSessionID: tc.midRunBinding,
+					State:           "confirmed",
+				}
+			}
+			if tc.guardMismatch {
+				session.guard = newAgentAIRunGuard(m, run, rec.write)
+			}
+			m.mu.Unlock()
+
+			code, ok := m.finalizeStalledGuard(guard, rec.write)
+			if code != tc.wantCode || ok != tc.wantOK {
+				t.Fatalf("finalizeStalledGuard = (%q, %t), want (%q, %t)", code, ok, tc.wantCode, tc.wantOK)
+			}
+
+			m.mu.Lock()
+			gotResume := session.resumeSessionID
+			gotBinding := m.bindings[sessionID].NativeSessionID
+			m.mu.Unlock()
+			if gotResume != tc.wantResume {
+				t.Fatalf("resumeSessionID = %q, want %q", gotResume, tc.wantResume)
+			}
+			if gotBinding != tc.wantBinding {
+				t.Fatalf("binding = %q, want %q", gotBinding, tc.wantBinding)
+			}
+			if tc.wantOK && tc.wantBinding == "" && tc.midRunBinding != "" {
+				// 撤销必须落盘：重启后 loadIdentityState 不能把僵尸绑定读回来。
+				path, err := agentAIIdentityPath()
+				if err != nil {
+					t.Fatalf("identity path: %v", err)
+				}
+				raw, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatalf("persistIdentityState 未被触达: %v", err)
+				}
+				if strings.Contains(string(raw), tc.midRunBinding) {
+					t.Fatalf("identity 文件仍含僵尸绑定 %q: %s", tc.midRunBinding, raw)
+				}
+			}
+		})
+	}
+}
+
+// TestZombieSuccessWritesFencedWhenGuardReplaced 锁死成功收尾段的纵深防御：
+// /clear 把 runSeq 归零后，下一回合会复用同一个 runSeq，只比 runSeq 挡不住
+// 旧回合的僵尸迟返回；guard 指针不同即判为非本回合。
+//
+// 这里只断言 history/journal——恢复点与绑定的撤销是 finalizeStalledGuard 的
+// 职责（判死路径必经 ctx.Err() 早退，走不到这段成功收尾）。
+func TestZombieSuccessWritesFencedWhenGuardReplaced(t *testing.T) {
 	setTestAgentHome(t)
 	_, srv := newAgentCoreUpstream(t, agentCoreTextTurn("你好", "，世界"))
 	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
@@ -1044,20 +1308,9 @@ func TestZombieSideEffectsFencedWhenGuardReplaced(t *testing.T) {
 
 	m.mu.Lock()
 	history := append([]agentAIMessage(nil), m.sessions[sessionID].history...)
-	resume := m.sessions[sessionID].resumeSessionID
 	m.mu.Unlock()
 	if len(history) != 1 {
 		t.Fatalf("history len = %d, want 1（guard 不同即非本回合，不得写入）", len(history))
-	}
-	if resume != "" {
-		t.Fatalf("resumeSessionID = %q, want 空", resume)
-	}
-	// 绑定是下一回合 resumeID 的真正来源，同样不得留下僵尸的 confirmed 绑定。
-	m.mu.Lock()
-	binding := m.bindings[sessionID]
-	m.mu.Unlock()
-	if binding.NativeSessionID != "" {
-		t.Fatalf("bindings 仍指向僵尸会话 %q（Retry 会从 confirmed 绑定续接）", binding.NativeSessionID)
 	}
 	for _, row := range readAgentCoreJournalRows(t, sessionID) {
 		if role, _ := row["role"].(string); role == "assistant" {
@@ -1066,42 +1319,5 @@ func TestZombieSideEffectsFencedWhenGuardReplaced(t *testing.T) {
 	}
 	if got := log.count(models.AgentEventAIDone); got != 1 {
 		t.Fatalf("ai.done 数量 = %d, want 1", got)
-	}
-}
-
-// TestDiscardAgentAIBindingForRunBoundaries 锁死撤绑定的三个边界：
-// 只在本回合捕获的 native id 与当前绑定一致时才删。
-func TestDiscardAgentAIBindingForRunBoundaries(t *testing.T) {
-	setTestAgentHome(t)
-	m := newAgentAIManager()
-	const sessionID = "conv-agentcore-binding"
-
-	m.mu.Lock()
-	m.bindings[sessionID] = agentAIBindingRecord{
-		ConversationID:  sessionID,
-		NativeSessionID: "native-current",
-		State:           "confirmed",
-	}
-	m.mu.Unlock()
-
-	// 空 id：无从校验，不动（capturedNativeID == "" 提前返回）。
-	m.discardAgentAIBindingForRun(sessionID, "   ")
-	// 不匹配：新回合已确认自己的绑定，不得误删。
-	m.discardAgentAIBindingForRun(sessionID, "native-other")
-
-	m.mu.Lock()
-	got := m.bindings[sessionID].NativeSessionID
-	m.mu.Unlock()
-	if got != "native-current" {
-		t.Fatalf("绑定被误删：NativeSessionID = %q, want native-current", got)
-	}
-
-	// 命中本回合捕获的 id：撤掉。
-	m.discardAgentAIBindingForRun(sessionID, "native-current")
-	m.mu.Lock()
-	_, ok := m.bindings[sessionID]
-	m.mu.Unlock()
-	if ok {
-		t.Fatal("命中本回合捕获的 id 时绑定必须被撤掉")
 	}
 }

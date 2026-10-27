@@ -695,6 +695,40 @@ func newAgentCoreEmit(ctx context.Context, writer *io.PipeWriter) (emit func([]b
 	return emit, stop
 }
 
+// bindAgentCoreNativeSession 把内核发来的 native session id 落成绑定并发
+// ai.session.bound。返回的 bool 为 true 表示本回合已被判死或被新回合顶替，
+// 这次绑定是僵尸迟到的产物，必须整帧丢弃（既不落库也不发帧）。
+//
+// 围栏必须在写入之前：一个忽略取消、卡住很久的僵尸完全可能在强拆撤销之后才
+// 吐出 system/init，把 m.bindings 与 session.resumeSessionID 重新写回去——
+// runStart 下一回合正是从 confirmed 绑定取 resumeID，污染照样成立。
+//
+// 单次语义由调用方的 bindingOnce 保证：一个回合只确认一次。
+func (m *agentAIManager) bindAgentCoreNativeSession(run agentAIRun, writeJSON agentTerminalWriter, nativeSessionID string) (agentAIBindingRecord, bool, error) {
+	if !m.agentAIRunSideEffectsAllowed(run.sessionID, run.runSeq, run.guard) {
+		logger.Warn(fmt.Sprintf(
+			"[ai.run.zombie_bind] session=%s runSeq=%d run=%s native=%s reason=stale_side_effects",
+			run.sessionID, run.runSeq, run.runID, strings.TrimSpace(nativeSessionID),
+		))
+		return agentAIBindingRecord{}, true, nil
+	}
+	record, err := m.confirmBinding(run.sessionID, run.provider, nativeSessionID, run.bindingVersion)
+	if err != nil {
+		return agentAIBindingRecord{}, false, err
+	}
+	_ = writeJSON(map[string]interface{}{
+		"type":              models.AgentEventAISessionBound,
+		"session_id":        run.sessionID,
+		"message_id":        run.messageID,
+		"provider":          run.provider,
+		"native_session_id": record.NativeSessionID,
+		"source_session_id": record.NativeSessionID,
+		"binding_version":   record.BindingVersion,
+		"binding_state":     record.State,
+	})
+	return record, false, nil
+}
+
 // runAgentCore 跑一次内置内核的 run。
 //
 // 与 runCLIPass 的关系：spawn 换成了进程内调用，但**对外的事件契约完全一样**
@@ -705,10 +739,13 @@ func newAgentCoreEmit(ctx context.Context, writer *io.PipeWriter) (emit func([]b
 // （format=claude_stream_json）。delta 去重、工具活动追踪、session_id 捕获、
 // ai.command 配对全部由那条既有管线免费提供。
 func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, writeJSON agentTerminalWriter) {
-	defer m.clearRunning(run.sessionID, run.runSeq, writeJSON)
+	defer m.clearRunning(run.sessionID, run.runSeq, writeJSON, run.guard)
 	// LIFO：本行后注册，先于 clearRunning 执行——guard 必须在会话复位前把自己
 	// 标记为「已正常返回」，否则宽限计时器会误判成僵尸。
-	defer m.markRunGuardDone(run.sessionID, run.runSeq)
+	//
+	// 两处都必须带 guard：/clear 会把 runSeq 归零、下一回合复用同一个值，僵尸
+	// 迟返回时若只比 runSeq，会把新回合的 cancel/activity/guard/done 一并清掉。
+	defer m.markRunGuardDone(run.sessionID, run.runSeq, run.guard)
 
 	// 调用记录落盘（AliangCode 留痕，spec §6）：入口写头行 + 首条 user 行，
 	// 成功出口写 assistant 行，所有出口经 defer 落 end 行。写失败只 Warn。
@@ -805,29 +842,18 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 
 	// 会话绑定：内核的 session id 由我们自己发（system/init 就带），第一次拿到
 	// 时落库并发 ai.session.bound。与 CLI 路径同一个 confirmBinding 口径。
+	// 围栏与落库整段收在 bindAgentCoreNativeSession 里，便于单独覆盖僵尸形态。
 	var bindingOnce sync.Once
 	var bindingErr error
 	onNativeSessionID := func(nativeSessionID string) {
 		bindingOnce.Do(func() {
-			record, err := m.confirmBinding(run.sessionID, run.provider, nativeSessionID, run.bindingVersion)
-			if err != nil {
+			if _, _, err := m.bindAgentCoreNativeSession(run, writeJSON, nativeSessionID); err != nil {
 				bindingErr = err
 				_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, err))
 				if run.cancel != nil {
 					run.cancel()
 				}
-				return
 			}
-			_ = writeJSON(map[string]interface{}{
-				"type":              models.AgentEventAISessionBound,
-				"session_id":        run.sessionID,
-				"message_id":        run.messageID,
-				"provider":          run.provider,
-				"native_session_id": record.NativeSessionID,
-				"source_session_id": record.NativeSessionID,
-				"binding_version":   record.BindingVersion,
-				"binding_state":     record.State,
-			})
 		})
 	}
 
@@ -1008,16 +1034,11 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		// 「这一轮没有落库的成功结果」，否则 journal 会出现 end(success) 却查无
 		// assistant 行的自相矛盾记录。
 		//
-		// 恢复点还有第二个写入源：confirmBinding 在流式途中（早于强拆标记）就把
-		// 内核新发的 session id 钉进了 session.resumeSessionID，上面跳过的
-		// setAgentAIResumeSessionIDIfEmpty 并不是唯一入口。仅当本回合起跑时
-		// 本来没有恢复点（run.resumeSessionID 为空）时才撤——此时当前值必由本
-		// 回合钉入；否则可能把上一轮合法恢复点误清。
-		if strings.TrimSpace(run.resumeSessionID) == "" {
-			m.clearAgentAIResumeSessionID(run.sessionID, run.runSeq, capturedResumeSessionID)
-			// 绑定是下一回合 resumeID 的真正来源，必须一并撤掉。
-			m.discardAgentAIBindingForRun(run.sessionID, capturedResumeSessionID)
-		}
+		// 恢复点与绑定的撤销**不在这里**：判死路径必先 kill() → cancel()，僵尸
+		// 迟返回一定先在上面 ctx.Err() != nil 的 stopped 早退处 return，走不到本段
+		// （本段只在取消被忽略、run 正常返回等边缘形态才可达）。撤销已经由
+		// finalizeStalledGuard 在身份校验的同一临界区内做掉，这里只兜历史/日志
+		// 这类非帧写入。
 		logger.Warn(fmt.Sprintf("[ai.run.zombie_discard] session=%s runSeq=%d run=%s guard_fenced=%t reason=stale_side_effects",
 			run.sessionID, run.runSeq, run.runID, run.guard != nil))
 	}

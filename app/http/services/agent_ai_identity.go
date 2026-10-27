@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"aliang.one/nursorgate/app/http/models"
-	"aliang.one/nursorgate/common/logger"
 )
 
 const (
@@ -265,37 +264,6 @@ func (m *agentAIManager) confirmBinding(
 		return agentAIBindingRecord{}, err
 	}
 	return record, nil
-}
-
-// discardAgentAIBindingForRun 撤掉一个被判定为僵尸的回合在流式途中确认的绑定。
-//
-// confirmBinding 在 message_start 时就把它写成 State="confirmed" 并落盘，而
-// runStart 下一回合又是从 bindings 取 resumeID（见 agent_ai.go 的
-// persisted.State == "confirmed" 分支），所以只清 session.resumeSessionID
-// 挡不住污染：Retry 仍会 resume 到僵尸那个含半截 assistant 输出的 native
-// session。
-//
-// 仅在绑定仍指向本回合捕获的 native id 时才删：新回合若已确认自己的绑定，
-// 这里必然不匹配，不会被误删。capturedNativeID 为空时无从校验，直接不动。
-func (m *agentAIManager) discardAgentAIBindingForRun(sessionID, capturedNativeID string) {
-	capturedNativeID = strings.TrimSpace(capturedNativeID)
-	if m == nil || capturedNativeID == "" {
-		return
-	}
-	m.mu.Lock()
-	binding, ok := m.bindings[sessionID]
-	if !ok || binding.NativeSessionID != capturedNativeID {
-		m.mu.Unlock()
-		return
-	}
-	delete(m.bindings, sessionID)
-	m.mu.Unlock()
-	if err := m.persistIdentityState(); err != nil {
-		logger.Warn(fmt.Sprintf(
-			"[ai.run.zombie_discard] binding_persist_failed session=%s native=%s err=%v",
-			sessionID, capturedNativeID, err,
-		))
-	}
 }
 
 func (m *agentAIManager) reserveBinding(

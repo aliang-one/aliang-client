@@ -453,3 +453,75 @@ func TestForceFinalizeDoesNotTouchReusedRunSeq(t *testing.T) {
 		t.Fatal("late forceFinalize cleared the fresh run's cancel")
 	}
 }
+
+// TestZombieLateCleanupDoesNotTouchReusedRunSeq 锁死 runAgentCore 的两个 defer
+// 必须带上「自己回合的 guard」。
+//
+// /clear 把 runSeq 归零，下一回合又复用同一个 runSeq；只比 runSeq 的收尾会
+// 把新回合的 cancel/activity/guard/done 通道一起清掉——新回合从此既停不下来
+// （cancel=nil），宽限计时器也被提前关掉（done 已 close），真僵尸无人强拆。
+func TestZombieLateCleanupDoesNotTouchReusedRunSeq(t *testing.T) {
+	m, session, guard1, rec1 := newGuardTestManager(t)
+
+	// 模拟 /clear：runSeq 归零，finalizedRunSeq 一并清零（真实 /clear 同款）。
+	m.mu.Lock()
+	session.runSeq = 0
+	session.finalizedRunSeq = 0
+	m.mu.Unlock()
+
+	// 新回合起跑，复用 runSeq=1。
+	activity2 := newAgentAIActivity()
+	_, cancelFn2 := context.WithCancel(context.Background())
+	t.Cleanup(cancelFn2)
+	m.mu.Lock()
+	session.runSeq = 1
+	session.cancel = cancelFn2
+	session.activity = activity2
+	m.mu.Unlock()
+
+	run2 := agentAIRun{
+		sessionID: session.id,
+		runID:     "run-2",
+		messageID: "msg-2",
+		runSeq:    1,
+		activity:  activity2,
+		cancel:    cancelFn2,
+	}
+	rec2 := &recordingWriter{}
+	guard2 := m.attachRunGuard(run2, rec2.write)
+	if guard2 == nil {
+		t.Fatal("guard2 was not attached to the fresh run")
+	}
+
+	// 僵尸（旧回合）迟返回，执行自己的两个 defer。
+	m.markRunGuardDone(session.id, 1, guard1)
+	m.clearRunning(session.id, 1, rec1.write, guard1)
+
+	m.mu.Lock()
+	curGuard := session.guard
+	curCancel := session.cancel
+	curActivity := session.activity
+	curFinalized := session.finalizedRunSeq
+	m.mu.Unlock()
+
+	if curGuard != guard2 {
+		t.Fatal("僵尸的收尾把新回合的 guard 摘掉了")
+	}
+	if curCancel == nil {
+		t.Fatal("僵尸的收尾把新回合的 cancel 清空了（新回合将停不下来）")
+	}
+	if curActivity != activity2 {
+		t.Fatal("僵尸的收尾把新回合的 activity 清空了（看门狗失去线索）")
+	}
+	if curFinalized != 0 {
+		t.Fatalf("finalizedRunSeq = %d, want 0", curFinalized)
+	}
+	select {
+	case <-guard2.done:
+		t.Fatal("僵尸的 markRunGuardDone 关掉了新回合的 done（宽限计时器被提前关死）")
+	default:
+	}
+	if got := len(rec2.snapshot()); got != 0 {
+		t.Fatalf("新回合收到 %d 帧终态，want 0", got)
+	}
+}

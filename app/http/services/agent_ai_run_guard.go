@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -31,6 +32,12 @@ type agentAIRunGuard struct {
 	emit agentTerminalWriter
 	done chan struct{}
 
+	// 起跑快照：判死强拆时用来判定「恢复点是不是本回合自己钉进来的」。
+	// resumeAtStart 为空 ⟹ 现在任何非空的 resumeSessionID 必由本回合中途写入；
+	// bindingAtStart 是起跑时已确认的绑定（可能是上一轮留下的合法值）。
+	resumeAtStart  string
+	bindingAtStart string
+
 	doneOnce     sync.Once
 	killOnce     sync.Once
 	finalizeOnce sync.Once
@@ -38,15 +45,16 @@ type agentAIRunGuard struct {
 
 func newAgentAIRunGuard(m *agentAIManager, run agentAIRun, emit agentTerminalWriter) *agentAIRunGuard {
 	return &agentAIRunGuard{
-		m:         m,
-		sessionID: run.sessionID,
-		runSeq:    run.runSeq,
-		runID:     run.runID,
-		messageID: run.messageID,
-		activity:  run.activity,
-		cancel:    run.cancel,
-		emit:      emit,
-		done:      make(chan struct{}),
+		m:             m,
+		sessionID:     run.sessionID,
+		runSeq:        run.runSeq,
+		runID:         run.runID,
+		messageID:     run.messageID,
+		activity:      run.activity,
+		cancel:        run.cancel,
+		emit:          emit,
+		done:          make(chan struct{}),
+		resumeAtStart: strings.TrimSpace(run.resumeSessionID),
 	}
 }
 
@@ -80,6 +88,9 @@ func (m *agentAIManager) attachRunGuard(run agentAIRun, emit agentTerminalWriter
 		return nil
 	}
 	session.guard = guard
+	// 起跑快照必须与挂载在同一临界区：起跑前已确认的绑定是上一轮的合法值，
+	// 判死撤销不能把它当成「本回合钉入」误删。
+	guard.bindingAtStart = strings.TrimSpace(m.bindings[run.sessionID].NativeSessionID)
 	m.mu.Unlock()
 	return guard
 }
@@ -98,8 +109,12 @@ func (m *agentAIManager) runGuardForActivity(activity *agentAIActivity) *agentAI
 	return nil
 }
 
-// markRunGuardDone 标记该回合的 goroutine 已返回。强拆宽限据此判断要不要动手。
-func (m *agentAIManager) markRunGuardDone(sessionID string, runSeq int) {
+// markRunGuardDone 标记「本回合已正常返回」，让宽限计时器不再强拆。
+//
+// expectGuard 与 clearRunning 同一口径：/clear 后 runSeq 会被复用，只比 runSeq
+// 会让僵尸的 defer 关掉新回合的 done 通道——新回合的宽限计时器随之失效，真
+// 僵尸再没人强拆。传了 guard 就必须是会话当前挂着的那一个。
+func (m *agentAIManager) markRunGuardDone(sessionID string, runSeq int, expectGuard ...*agentAIRunGuard) {
 	if m == nil {
 		return
 	}
@@ -107,7 +122,9 @@ func (m *agentAIManager) markRunGuardDone(sessionID string, runSeq int) {
 	session := m.sessions[sessionID]
 	var guard *agentAIRunGuard
 	if session != nil && session.runSeq == runSeq {
-		guard = session.guard
+		if len(expectGuard) == 0 || expectGuard[0] == nil || session.guard == expectGuard[0] {
+			guard = session.guard
+		}
 	}
 	m.mu.Unlock()
 	if guard != nil {
@@ -334,9 +351,61 @@ func (m *agentAIManager) finalizeStalledGuard(g *agentAIRunGuard, writeJSON agen
 		return "run_seq_moved", false
 	}
 	session.finalizedRunSeq = g.runSeq
+	revokedResume, droppedBinding := m.revokeRunResumePointLocked(g)
 	m.mu.Unlock()
+	if droppedBinding != "" {
+		// 绑定是持久化状态：不落盘的话，进程重启后 loadIdentityState 会把僵尸
+		// 绑定读回来，下一回合照样从它取 resumeID。
+		if err := m.persistIdentityState(); err != nil {
+			logger.Warn(fmt.Sprintf(
+				"[ai.run.zombie_revoke] persist_failed session=%s runSeq=%d err=%v",
+				g.sessionID, g.runSeq, err,
+			))
+		}
+	}
+	if revokedResume != "" || droppedBinding != "" {
+		logger.Warn(fmt.Sprintf(
+			"[ai.run.zombie_revoke] session=%s runSeq=%d run=%s revoked_resume=%q dropped_binding=%q reason=stalled",
+			g.sessionID, g.runSeq, g.runID, revokedResume, droppedBinding,
+		))
+	}
 	m.clearRunning(g.sessionID, g.runSeq, writeJSON, g)
 	return "", true
+}
+
+// revokeRunResumePointLocked 撤销本回合在流式途中钉下的恢复点与绑定。
+//
+// 为什么在这里而不是 run 返回之后：判死路径必先 kill() → cancel()，僵尸迟返回
+// 会先在 ctx.Err() != nil 的 stopped 早退处 return，永远走不到成功收尾段；而
+// confirmBinding 在流式途中（早于判死）就已把内核新 id 钉进
+// session.resumeSessionID 与 m.bindings。撤销因此只能在强拆链路里做。
+//
+// 判据只用起跑快照，不做时间猜测：
+//   - resumeAtStart 非空 ⟹ 本回合起跑时已有已确认的恢复点，现在的值可能仍是
+//     上一轮的合法值，一律不撤；
+//   - resumeAtStart 为空 ⟹ 现在任何非空的 resumeSessionID 都必然是 confirmBinding
+//     在本回合中途写进来的，撤掉；
+//   - 绑定只有与起跑快照不同（即本回合新钉的那个）才删。
+//
+// 调用方必须持有 m.mu，且已在同一临界区内通过 guard 身份校验——此时会话仍被
+// 本回合占着（busy 闸挡着新回合），不存在「撤掉的是新回合恢复点」的归属问题。
+func (m *agentAIManager) revokeRunResumePointLocked(g *agentAIRunGuard) (revokedResume, droppedBinding string) {
+	if g == nil || g.resumeAtStart != "" {
+		return "", ""
+	}
+	session := m.sessions[g.sessionID]
+	if session == nil {
+		return "", ""
+	}
+	if session.resumeSessionID != "" {
+		revokedResume = session.resumeSessionID
+		session.resumeSessionID = ""
+	}
+	if binding, ok := m.bindings[g.sessionID]; ok && binding.NativeSessionID != "" && binding.NativeSessionID != g.bindingAtStart {
+		droppedBinding = binding.NativeSessionID
+		delete(m.bindings, g.sessionID)
+	}
+	return revokedResume, droppedBinding
 }
 
 // agentAIStaleRunThreshold 是「非等待态下多久没有任何活性事件就判死」。
