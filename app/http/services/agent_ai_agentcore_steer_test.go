@@ -241,3 +241,38 @@ func TestCoreSteerLivenessWindowSparesActiveRun(t *testing.T) {
 		t.Fatal("onStalled called for an actively generating run")
 	}
 }
+
+func TestCoreSteerFollowUpShareLivenessWindow(t *testing.T) {
+	// follow-up 与 steer 共用 coreSteer.drain()，因此回合边的活性窗天然覆盖
+	// follow-up：入队即起窗，drain 即停窗。这里验证「一批 drain 取完、第二次
+	// 为空」的语义未被窗口改动破坏（窗口只在 expire 时才动队列）。
+	rec := &recordingWriter{}
+	activity := newAgentAIActivity()
+	run := agentAIRun{sessionID: "sess-1", runSeq: 1, messageID: "msg-1", activity: activity}
+	control := newAgentAICoreSteerControl(run, rec.write)
+	t.Cleanup(func() { control.close("not_running", "", "") })
+	control.activity = activity
+	control.onStalled = func(string) { t.Error("drained steer must not be reported stalled") }
+
+	if _, err := control.deliver(agentAISteerMessage{MessageID: "a", Content: "1"}); err != nil {
+		t.Fatalf("deliver a: %v", err)
+	}
+	if _, err := control.deliver(agentAISteerMessage{MessageID: "b", Content: "2"}); err != nil {
+		t.Fatalf("deliver b: %v", err)
+	}
+	if got := control.drain(); len(got) != 2 {
+		t.Fatalf("drain = %d, want 2", len(got))
+	}
+	if got := pendingLenOf(control); got != 0 {
+		t.Fatalf("pending timers = %d, want 0 after drain", got)
+	}
+	if got := control.drain(); len(got) != 0 {
+		t.Fatalf("second drain = %d, want 0", len(got))
+	}
+	if got := queueLenOf(control); got != 0 {
+		t.Fatalf("queued = %d, want 0 after drain", got)
+	}
+	if got := rec.snapshot(); len(got) != 2 {
+		t.Fatalf("applied acks = %d, want 2", len(got))
+	}
+}
