@@ -61,12 +61,16 @@ type Client struct {
 	// 网关用它识别「用哪把 key」，不带就会落到分组兜底、对非该组的账号 403。
 	// 留空只在没有可用 key 时发生——此时行为退回到「由代理决定用哪把」。
 	apiKey string
+	// streamIdle 是 SSE 块间空闲窗口；0 = 禁用（测试用）。由 NewClient 从
+	// streamIdleTimeout 环境变量解析结果播种。
+	streamIdle time.Duration
 }
 
 // NewClient 构造客户端。baseURL 形如 http://127.0.0.1:56432（不带 /v1）。
 func NewClient(baseURL string) *Client {
 	return &Client{
-		baseURL: strings.TrimRight(strings.TrimSpace(baseURL), "/"),
+		baseURL:    strings.TrimRight(strings.TrimSpace(baseURL), "/"),
+		streamIdle: streamIdleTimeout,
 		http: &http.Client{
 			// 不设整体 Timeout：流式响应会持续很久，整体超时会误杀长回合。
 			// 连接建立与首字节由 Transport 的 dial/response header 超时兜住。
@@ -85,6 +89,12 @@ func NewClient(baseURL string) *Client {
 // 传空串等于不带，行为退回「由代理按分组兜底决定用哪把 key」。
 func (c *Client) WithAPIKey(key string) *Client {
 	c.apiKey = strings.TrimSpace(key)
+	return c
+}
+
+// WithStreamIdleTimeout 覆盖 SSE 块间空闲窗口（0=禁用）。测试用。
+func (c *Client) WithStreamIdleTimeout(d time.Duration) *Client {
+	c.streamIdle = d
 	return c
 }
 
@@ -270,6 +280,12 @@ func upstreamErrorFromJSON(body string) *upstreamError {
 
 // isRetryable 判定错误是否值得重试：连接类错误、429、5xx、2xx 内的限流/过载。
 func isRetryable(err error) bool {
+	// 块间停滞不是瞬态：整条流已经断在半开状态，重试只会把本尝试已经下发的
+	// start/text 事件帧重复推给手机。
+	var idleErr *streamIdleError
+	if errors.As(err, &idleErr) {
+		return false
+	}
 	var statusErr *httpStatusError
 	if errors.As(err, &statusErr) {
 		return statusErr.status == http.StatusTooManyRequests || statusErr.status >= 500
@@ -320,9 +336,9 @@ func (c *Client) streamOnce(ctx context.Context, req *MessagesRequest, onEvent f
 	if err != nil {
 		return fmt.Errorf("agentcore: 请求上游失败: %w", err)
 	}
-	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		defer resp.Body.Close()
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return &httpStatusError{
 			status:     resp.StatusCode,
@@ -331,7 +347,10 @@ func (c *Client) streamOnce(ctx context.Context, req *MessagesRequest, onEvent f
 		}
 	}
 
-	return parseSSE(ctx, resp.Body, onEvent)
+	// 成功响应才装块间空闲闸：错误体是一次性读完的，不需要。
+	reader := newIdleTimeoutReader(resp.Body, c.streamIdle)
+	defer reader.Close()
+	return parseSSE(ctx, reader, onEvent)
 }
 
 // parseRetryAfter 解析 Retry-After 头（秒数形式；HTTP-date 形式忽略）。
@@ -422,6 +441,12 @@ func parseSSE(ctx context.Context, r io.Reader, onEvent func(StreamEvent) error)
 	if err := scanner.Err(); err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
+		}
+		// 停滞错误原样上抛：包一层会让 isRetryable 的 errors.As 之外的多处
+		// 判定多绕一环，且错误文案会变成「读取流失败: ...」掩盖真因。
+		var idleErr *streamIdleError
+		if errors.As(err, &idleErr) {
+			return idleErr
 		}
 		return fmt.Errorf("agentcore: 读取流失败: %w", err)
 	}

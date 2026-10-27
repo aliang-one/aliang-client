@@ -1,9 +1,13 @@
 package agentcore
 
 import (
+	"context"
 	"errors"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -59,5 +63,39 @@ func TestStreamIdleErrorIsNotRetryable(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "停滞") {
 		t.Fatalf("error message = %q, want it to mention 停滞", err.Error())
+	}
+}
+
+func TestStreamDoesNotRetryOnStreamStall(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.Header().Set("content-type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		// 头部与一帧之后永久静默：半开流。
+		_, _ = w.Write([]byte("data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"x\"}}\n\n"))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL).WithStreamIdleTimeout(60 * time.Millisecond)
+	err := c.Stream(context.Background(), &MessagesRequest{
+		Model:     "x",
+		MaxTokens: 16,
+		Messages:  []Message{{Role: "user", Content: "hi"}},
+	}, func(StreamEvent) error { return nil })
+
+	var idleErr *streamIdleError
+	if !errors.As(err, &idleErr) {
+		t.Fatalf("Stream error = %v (%T), want *streamIdleError", err, err)
+	}
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Fatalf("upstream hits = %d, want 1 (stream stall must not retry)", got)
 	}
 }
