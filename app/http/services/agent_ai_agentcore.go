@@ -848,6 +848,10 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 	// steer 通道必须在 agentcore.Run 之前挂上：用户可能在第一帧之前就插话，
 	// 那批消息要能排进队列被第一次 GetSteeringMessages 取走。
 	coreSteer := newAgentAICoreSteerControl(run, writeJSON)
+	// activity 必须在 attachCoreSteer 之前赋值：attach 之后其他 goroutine 就能
+	// 通过 coreSteerFor 拿到 control 并使用它，晚赋值会有「已挂载但 activity
+	// 还是 nil」的窗口（nil 安全但丢活性信号）。
+	coreSteer.activity = run.activity
 	m.attachCoreSteer(run.sessionID, run.runSeq, coreSteer)
 
 	// MCP 工具注入（spec §3）：采集→建连→包桥→注册。全部失败也只是空桥，
@@ -1056,6 +1060,9 @@ type agentAICoreSteerControl struct {
 	write     agentTerminalWriter
 	closed    bool
 	queue     []agentAISteerMessage
+	// activity 用于把「插话被取走」计入 run 活性（spec §3.3.1）：内核 drain 发生
+	// 在下一次 LLM 调用前，那一瞬间说明回合确实活着。
+	activity *agentAIActivity
 }
 
 func newAgentAICoreSteerControl(run agentAIRun, write agentTerminalWriter) *agentAICoreSteerControl {
@@ -1105,6 +1112,11 @@ func (c *agentAICoreSteerControl) drain() []agentcore.Message {
 	out := make([]agentcore.Message, 0, len(queued))
 	for _, item := range queued {
 		out = append(out, agentCoreSteerMessage(item))
+		// drain 发生在下一次 LLM 调用前，是回合活着的直接证据；bump 是原子的，
+		// 不需要持锁（此处已在锁外）。
+		if c.activity != nil {
+			c.activity.bump()
+		}
 		emitAgentAISteerAck(write, sessionID, item.MessageID, "applied", "", "")
 	}
 	return out
