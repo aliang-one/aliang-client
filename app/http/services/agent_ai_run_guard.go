@@ -61,6 +61,8 @@ func (m *agentAIManager) attachRunGuard(run agentAIRun, emit agentTerminalWriter
 	}
 	// 进程级 stale 扫描器与单回合成败无关：无论本次是否挂载成功（attach 竞态
 	// 跳过也一样），都要保证 manager 上有且仅有一条扫描 goroutine 在跑。
+	// 注意 TUI 回合在 agent_ai.go 的 TUI 分支提前返回、不挂 guard，因此不在
+	// L3 扫描覆盖范围内。
 	defer m.startStaleRunScanner()
 	guard := newAgentAIRunGuard(m, run, emit)
 	m.mu.Lock()
@@ -205,8 +207,14 @@ func (g *agentAIRunGuard) forceFinalize(reason string) {
 		}()
 		// 先打标记再复位：复位对外意味着「手机已回到 idle」，此后僵尸的任何
 		// 迟返回都必须被非帧副作用守卫挡住（Task 8）。
-		g.m.markRunFinalized(g.sessionID, g.runSeq)
-		g.m.clearRunning(g.sessionID, g.runSeq, g.emit)
+		// 身份校验与复位在同一个临界区内完成（finalizeStalledGuard）：/clear
+		// 复用 runSeq 后，迟到的强拆绝不能拆掉新的合法回合。
+		if !g.m.finalizeStalledGuard(g, g.emit) {
+			logger.Warn(fmt.Sprintf(
+				"[ai.run.force_finalize] guard_not_current session=%s runSeq=%d run=%s reason=%s（该回合已被 /clear 后的新回合取代，跳过复位）",
+				g.sessionID, g.runSeq, g.runID, reason,
+			))
+		}
 	})
 }
 
@@ -283,24 +291,54 @@ func (m *agentAIManager) markRunFinalized(sessionID string, runSeq int) {
 	}
 }
 
+// finalizeStalledGuard 校验 guard 仍是该会话当前回合后，打终结标记并复位运行态。
+// /clear 会把 runSeq 归零后被新回合复用，只比 runSeq 会把迟到的强拆打到新回合上，
+// 所以这里以 guard 身份为判据。
+func (m *agentAIManager) finalizeStalledGuard(g *agentAIRunGuard, writeJSON agentTerminalWriter) bool {
+	if m == nil || g == nil {
+		return false
+	}
+	m.mu.Lock()
+	session := m.sessions[g.sessionID]
+	if session == nil || session.guard != g {
+		m.mu.Unlock()
+		return false
+	}
+	session.finalizedRunSeq = g.runSeq
+	m.mu.Unlock()
+	m.clearRunning(g.sessionID, g.runSeq, writeJSON, g)
+	return true
+}
+
 // agentAIStaleRunThreshold 是「非等待态下多久没有任何活性事件就判死」。
 //
 //	ALIANG_AI_STALE_RUN  (time.ParseDuration). Default 5min.
+//
+// 注：ALIANG_AI_STALE_RUN=0/负值会被 resolveEnvDuration 回落默认值，即 stale
+// 检测不可关闭（刻意 fail-safe）。
 var agentAIStaleRunThreshold = resolveEnvDuration("ALIANG_AI_STALE_RUN", 5*time.Minute)
 
 // agentAIStaleScanInterval 是 stale running 自检的扫描周期。
 var agentAIStaleScanInterval = time.Minute
+
+// agentAIStaleScannerEnabled 是常驻扫描的总开关。测试在 TestMain 里关掉它：
+// 扫描逻辑由用例直接调 scanStaleRuns 覆盖，常驻 ticker 只会泄漏 goroutine、
+// 并让 1min 一次的读与用例对包级 var 的写构成 -race 竞争。
+var agentAIStaleScannerEnabled = true
 
 // startStaleRunScanner 为这个 manager 启动唯一一条扫描 goroutine。
 //
 // 只在第一次注册 guard 时启动（sync.Once），扫到进程退出为止：进程级兜底，
 // 不绑定任何单回合的 ctx。
 //
-// 生命周期取舍：goroutine 不随 manager 回收，测试里新建的 manager 会各留一条
-// 常驻扫描（ticker 1min 一次，空转开销可忽略）。这是刻意接受的——生产只有
-// 一个全局 manager；扫描周期已是 package 级 var，测试需要时可以调大。
+// 生命周期取舍：goroutine 不随 manager 回收（生产只有一个全局 manager，空转
+// 开销可忽略）。测试里由 agentAIStaleScannerEnabled 在 TestMain 统一关闭，
+// 不要再指望调大 agentAIStaleScanInterval——对已创建的 ticker 无效。
 func (m *agentAIManager) startStaleRunScanner() {
 	if m == nil {
+		return
+	}
+	if !agentAIStaleScannerEnabled {
 		return
 	}
 	m.scanOnce.Do(func() {

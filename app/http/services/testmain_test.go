@@ -23,6 +23,9 @@ func TestMain(m *testing.M) {
 	config.DefaultUserAgentAddr = "127.0.0.1:0"
 	// Keep logger/cache/state writes out of the real ~/.aliang.
 	cleanupState := testisolate.RedirectUserStateDir()
+	// 关掉常驻 stale 扫描：用例直接调 scanStaleRuns 覆盖扫描逻辑，常驻 ticker
+	// 只会泄漏 goroutine，并与用例对包级 var 的写构成 -race 竞争。
+	agentAIStaleScannerEnabled = false
 
 	code := m.Run()
 	auth.StopTokenRefresh()

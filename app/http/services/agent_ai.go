@@ -1046,8 +1046,12 @@ type agentAIActivity struct {
 	// NOT raw output. A degenerate model loop (e.g. filler `echo` tool calls
 	// every few seconds for hours) keeps lastActivityAt fresh, so only the
 	// progress clock can distinguish "alive" from "getting anywhere".
-	lastProgressAt   atomic.Int64
-	awaitingApproval atomic.Bool
+	lastProgressAt atomic.Int64
+	// pendingApprovals 是并发的审批请求数（0=无人在等）。用计数而不是 bool，
+	// 是因为一个回合可能有多个审批重叠：A、B 同时在等时 A 先结束，B 仍需要
+	// 保住审批钟与 idlePaused——bool 会被 A 的 false 提前清掉，随后
+	// pendingToolUses>0 又把工具钟臂起，合法的人工等待会被工具天花板误杀。
+	pendingApprovals atomic.Int64
 	pendingToolUses  atomic.Int64
 	// approvalWaitStartedAt 是当前这段「等人工决策」的开始时刻（0=不在等）。
 	// 与 toolWaitStartedAt 互斥：审批期间工具时钟清零，反之亦然。审批等待
@@ -1114,25 +1118,42 @@ func (a *agentAIActivity) progressIdleFor() time.Duration {
 	return time.Since(time.Unix(0, last))
 }
 
-// setAwaitingApproval marks the run as blocked on a human decision (which pauses
-// the idle watchdog) and bumps activity so resolving a decision grants a fresh
-// idle window before the next output arrives.
+// setAwaitingApproval 登记/解除一个审批等待，并 bump 活动时间，让审批结束时
+// 拿到一个新的 idle 窗口。
+//
+// 用计数而非 bool：一个回合可能同时有多个审批（A、B 重叠）。只有第一个审批
+// 才起审批钟/清工具钟（后续重叠审批不能把人工等待上限往后推）；只有最后一个
+// 审批结束才清钟，并在工具仍在飞时重新臂起工具钟。
 func (a *agentAIActivity) setAwaitingApproval(v bool) {
 	if a == nil {
 		return
 	}
-	a.awaitingApproval.Store(v)
 	if v {
-		// Approval time is human time, not tool time: pause the tool-wait
-		// clock so a slow decision never trips the tool-wait ceiling.
-		a.approvalWaitStartedAt.Store(time.Now().UnixNano())
-		a.toolWaitStartedAt.Store(0)
+		if a.pendingApprovals.Add(1) == 1 {
+			// Approval time is human time, not tool time: pause the tool-wait
+			// clock so a slow decision never trips the tool-wait ceiling.
+			a.approvalWaitStartedAt.Store(time.Now().UnixNano())
+			a.toolWaitStartedAt.Store(0)
+		}
 	} else {
-		a.approvalWaitStartedAt.Store(0)
-		if a.pendingToolUses.Load() > 0 {
-			// Decision resolved but the tool is still in flight: re-arm with a
-			// fresh ceiling window for the remaining execution.
-			a.toolWaitStartedAt.Store(time.Now().UnixNano())
+		// CAS 递减且不允许减到负数：多余的 false（重复解除）在 0 处直接 break。
+		for {
+			current := a.pendingApprovals.Load()
+			if current <= 0 {
+				break
+			}
+			if a.pendingApprovals.CompareAndSwap(current, current-1) {
+				if current-1 == 0 {
+					a.approvalWaitStartedAt.Store(0)
+					if a.pendingToolUses.Load() > 0 {
+						// Decision resolved but the tool is still in flight:
+						// re-arm with a fresh ceiling window for the remaining
+						// execution.
+						a.toolWaitStartedAt.Store(time.Now().UnixNano())
+					}
+				}
+				break
+			}
 		}
 	}
 	a.bump()
@@ -1154,7 +1175,7 @@ func (a *agentAIActivity) awaiting() bool {
 	if a == nil {
 		return false
 	}
-	return a.awaitingApproval.Load()
+	return a.pendingApprovals.Load() > 0
 }
 
 // toolWaitFor reports how long the current contiguous tool/subagent wait has
@@ -1207,17 +1228,20 @@ func (a *agentAIActivity) idlePaused() bool {
 	if a == nil {
 		return false
 	}
-	return a.awaitingApproval.Load() || a.pendingToolUses.Load() > 0 || a.activeSubagents.Load() > 0
+	return a.awaiting() || a.pendingToolUses.Load() > 0 || a.activeSubagents.Load() > 0
 }
 
 // staleDeathReason 判定这个 run 是否已经「无响应死」，返回原因码与结论。
 //
 // 口径（spec §3.3.1/§3.3.2）：
+//   - 审批等待态：只服 approvalTimeout，超过即判死。工具/子代理天花板在这里
+//     不参与评估——进入审批时工具钟已被清零（审批是人的时间，不是工具时间），
+//     所以「审批 + 子代理同时活跃」的收敛上界是 approvalTimeout。
+//   - 工具/子代理等待态（非审批）：不按 stale 阈值判死，只服各自天花板——
+//     toolCeiling、subagentCeiling。
 //   - 非等待态：lastActivityAt 距今超过 staleThreshold → stalled。activity 只由
 //     真实事件帧/审批帧/steer ack 刷新，ai.run.progress 心跳不参与（否则心跳
 //     会把一切判死判据击穿）。
-//   - 等待态：不按 stale 阈值判死，只服各自的既有天花板——审批
-//     approvalTimeout、工具 toolCeiling、子代理 subagentCeiling。
 func (a *agentAIActivity) staleDeathReason(staleThreshold, approvalTimeout, toolCeiling, subagentCeiling time.Duration) (string, bool) {
 	if a == nil {
 		return "", false
@@ -3717,13 +3741,21 @@ func agentAIApprovalMapKey(sessionID string, approvalID string) string {
 	return sessionID + "\x00" + approvalID
 }
 
-func (m *agentAIManager) clearRunning(sessionID string, runSeq int, writeJSON agentTerminalWriter) {
+// clearRunning 复位会话运行态。expectGuard 是可选的 guard 身份校验：给了就
+// 必须仍是该会话当前的 guard 才执行复位——/clear 会把 runSeq 归零后被新回合
+// 复用，只比 runSeq 会让迟到的强拆拆掉新回合（见 finalizeStalledGuard）。
+// 不传 expectGuard 的调用方行为与旧版逐字等价（guardOwns 恒真）。
+func (m *agentAIManager) clearRunning(sessionID string, runSeq int, writeJSON agentTerminalWriter, expectGuard ...*agentAIRunGuard) {
 	m.mu.Lock()
 	session := m.sessions[sessionID]
+	// 身份校验必须与复位在同一个临界区：独立的事前检查会留下「检查通过 →
+	// 新回合挂上 guard → 复位」的窗口，正是要消灭的竞态。
+	guardOwns := len(expectGuard) == 0 || expectGuard[0] == nil ||
+		(session != nil && session.guard == expectGuard[0])
 	var steerControl *agentAICodexSteerControl
 	var claudeSteerControl *agentAIClaudeSteerControl
 	var coreSteerControl *agentAICoreSteerControl
-	if session != nil && session.runSeq == runSeq {
+	if guardOwns && session != nil && session.runSeq == runSeq {
 		steerControl = session.codexSteer
 		claudeSteerControl = session.claudeSteer
 		coreSteerControl = session.coreSteer
@@ -3746,7 +3778,10 @@ func (m *agentAIManager) clearRunning(sessionID string, runSeq int, writeJSON ag
 		session.goalIdentity = nil
 		session.history = trimAgentAIHistory(session.history)
 	}
-	cancelled := m.clearPendingApprovalsLocked(sessionID, runSeq, models.AgentAIApprovalDecisionCancel)
+	var cancelled []string
+	if guardOwns {
+		cancelled = m.clearPendingApprovalsLocked(sessionID, runSeq, models.AgentAIApprovalDecisionCancel)
+	}
 	m.mu.Unlock()
 	if steerControl != nil {
 		steerControl.close("not_running", "codex turn ended before steer was applied", "turn_ended")
