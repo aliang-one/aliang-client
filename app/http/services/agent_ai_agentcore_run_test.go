@@ -971,6 +971,16 @@ func TestZombieSuccessWritesAreDiscarded(t *testing.T) {
 		t.Fatalf("resumeSessionID = %q, want 空（僵尸不得为下一回合留恢复点）", resume)
 	}
 
+	// 1b) 绑定是下一回合 resumeID 的来源（runStart 会用 confirmed 绑定覆盖
+	// resumeID），僵尸的 confirmed 绑定不撤掉，Retry 照样 resume 到含半截
+	// assistant 输出的 native session —— 只清 session.resumeSessionID 是假修。
+	m.mu.Lock()
+	binding := m.bindings[sessionID]
+	m.mu.Unlock()
+	if binding.NativeSessionID != "" {
+		t.Fatalf("bindings 仍指向僵尸会话 %q（Retry 会从 confirmed 绑定续接）", binding.NativeSessionID)
+	}
+
 	// 2) journal 不得出现 assistant 行，end 行必须如实记 error。
 	rows := readAgentCoreJournalRows(t, sessionID)
 	for _, row := range rows {
@@ -1042,6 +1052,13 @@ func TestZombieSideEffectsFencedWhenGuardReplaced(t *testing.T) {
 	if resume != "" {
 		t.Fatalf("resumeSessionID = %q, want 空", resume)
 	}
+	// 绑定是下一回合 resumeID 的真正来源，同样不得留下僵尸的 confirmed 绑定。
+	m.mu.Lock()
+	binding := m.bindings[sessionID]
+	m.mu.Unlock()
+	if binding.NativeSessionID != "" {
+		t.Fatalf("bindings 仍指向僵尸会话 %q（Retry 会从 confirmed 绑定续接）", binding.NativeSessionID)
+	}
 	for _, row := range readAgentCoreJournalRows(t, sessionID) {
 		if role, _ := row["role"].(string); role == "assistant" {
 			t.Fatalf("journal 出现僵尸 assistant 行：%v", row)
@@ -1049,5 +1066,42 @@ func TestZombieSideEffectsFencedWhenGuardReplaced(t *testing.T) {
 	}
 	if got := log.count(models.AgentEventAIDone); got != 1 {
 		t.Fatalf("ai.done 数量 = %d, want 1", got)
+	}
+}
+
+// TestDiscardAgentAIBindingForRunBoundaries 锁死撤绑定的三个边界：
+// 只在本回合捕获的 native id 与当前绑定一致时才删。
+func TestDiscardAgentAIBindingForRunBoundaries(t *testing.T) {
+	setTestAgentHome(t)
+	m := newAgentAIManager()
+	const sessionID = "conv-agentcore-binding"
+
+	m.mu.Lock()
+	m.bindings[sessionID] = agentAIBindingRecord{
+		ConversationID:  sessionID,
+		NativeSessionID: "native-current",
+		State:           "confirmed",
+	}
+	m.mu.Unlock()
+
+	// 空 id：无从校验，不动（capturedNativeID == "" 提前返回）。
+	m.discardAgentAIBindingForRun(sessionID, "   ")
+	// 不匹配：新回合已确认自己的绑定，不得误删。
+	m.discardAgentAIBindingForRun(sessionID, "native-other")
+
+	m.mu.Lock()
+	got := m.bindings[sessionID].NativeSessionID
+	m.mu.Unlock()
+	if got != "native-current" {
+		t.Fatalf("绑定被误删：NativeSessionID = %q, want native-current", got)
+	}
+
+	// 命中本回合捕获的 id：撤掉。
+	m.discardAgentAIBindingForRun(sessionID, "native-current")
+	m.mu.Lock()
+	_, ok := m.bindings[sessionID]
+	m.mu.Unlock()
+	if ok {
+		t.Fatal("命中本回合捕获的 id 时绑定必须被撤掉")
 	}
 }

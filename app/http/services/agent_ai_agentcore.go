@@ -1015,6 +1015,8 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		// 回合钉入；否则可能把上一轮合法恢复点误清。
 		if strings.TrimSpace(run.resumeSessionID) == "" {
 			m.clearAgentAIResumeSessionID(run.sessionID, run.runSeq, capturedResumeSessionID)
+			// 绑定是下一回合 resumeID 的真正来源，必须一并撤掉。
+			m.discardAgentAIBindingForRun(run.sessionID, capturedResumeSessionID)
 		}
 		logger.Warn(fmt.Sprintf("[ai.run.zombie_discard] session=%s runSeq=%d run=%s guard_fenced=%t reason=stale_side_effects",
 			run.sessionID, run.runSeq, run.runID, run.guard != nil))
