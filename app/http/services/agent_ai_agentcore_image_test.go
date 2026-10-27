@@ -88,7 +88,7 @@ func TestAgentCoreMessagesAttachesImageToLastUserMessage(t *testing.T) {
 		attachments: []agentAIAttachment{{Type: "image", Name: "shot.png", Path: path}},
 	}
 
-	msgs := m.agentCoreMessages(run)
+	msgs, _ := m.agentCoreMessages(run)
 	if len(msgs) != 3 {
 		t.Fatalf("消息数 = %d, want 3（历史三条，图不新增消息）", len(msgs))
 	}
@@ -147,7 +147,7 @@ func TestAgentCoreMessagesAppendsImageWhenHistoryEndsWithAssistant(t *testing.T)
 		attachments: []agentAIAttachment{{Type: "image", Name: "a.jpg", Path: path}},
 	}
 
-	msgs := m.agentCoreMessages(run)
+	msgs, _ := m.agentCoreMessages(run)
 	if len(msgs) != 3 {
 		t.Fatalf("消息数 = %d, want 3（历史两条 + 新增的图片消息）", len(msgs))
 	}
@@ -196,7 +196,7 @@ func TestAgentCoreMessagesDegradesWhenImageUnreadable(t *testing.T) {
 		attachments: []agentAIAttachment{{Type: "image", Name: "gone.png", Path: missing}},
 	}
 
-	msgs := m.agentCoreMessages(run)
+	msgs, _ := m.agentCoreMessages(run)
 	if len(msgs) != 1 {
 		t.Fatalf("消息数 = %d, want 1（降级不该新增消息）", len(msgs))
 	}
@@ -233,7 +233,7 @@ func TestAgentCoreMessagesWithoutAttachmentsKeepsStringContent(t *testing.T) {
 		},
 	})
 
-	msgs := m.agentCoreMessages(agentAIRun{sessionID: sessionID, runSeq: runSeq})
+	msgs, _ := m.agentCoreMessages(agentAIRun{sessionID: sessionID, runSeq: runSeq})
 	if len(msgs) != 2 {
 		t.Fatalf("消息数 = %d, want 2", len(msgs))
 	}
