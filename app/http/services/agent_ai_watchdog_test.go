@@ -577,3 +577,74 @@ func TestAgentAIWatchdogHardCeilingExcludesWaitingStates(t *testing.T) {
 		t.Fatal("hard ceiling did not fire after the run left the waiting state")
 	}
 }
+
+func TestAgentAIWatchdogHardCeilingAccumulatesAcrossWaits(t *testing.T) {
+	// 证伪「离开（或进入）等待态时把 engineActive 清零」这类自然误重构：
+	// 硬顶必须跨越多段等待继续累计引擎活跃时长——等待期间的拍既不计入，
+	// 也不该把既有的累计值抹掉。
+	//
+	// 时间轴（裕量刻意取大，宁可测试慢一点也不要 flake）：
+	//   阶段一 ~150ms 纯活跃            → 累计约 150ms（< 300ms，不应被杀）
+	//   阶段二 ~350ms beginToolUseWait  → 不累加，期间断言未被杀
+	//   阶段三 离开等待后 220ms 内必须收到 hard_ceiling：
+	//          正确实现只需再攒约 150ms（裕量 ~70ms）；
+	//          若误为「离开等待即清零」则需重新攒满 300ms，收不到 → 用例红。
+	//
+	// 计时按 tick 间的 wall delta 累加，ticker 迟到不会改变累计量，只会稍微
+	// 推迟判定，所以裕量只需要覆盖「判定延迟」，不需要覆盖 tick 精度。
+	const (
+		interval    = 10 * time.Millisecond
+		hardCeiling = 300 * time.Millisecond
+	)
+
+	activity := newAgentAIActivity()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	// 兜住所有失败路径：ctx 取消后 loop 必然退出，不会有 goroutine 泄漏。
+	defer cancel()
+
+	// killed 有缓冲：loop 的 loopCancel 只会触发一次，且即使测试已经返回
+	// 也不会让 loop 阻塞在发送上。
+	killed := make(chan string, 1)
+	loopCancel := func() { killed <- activity.killReasonOr("") }
+
+	go agentAIWatchdogLoop(ctx, activity, loopCancel,
+		// idle 分支没有 `>0` 禁用开关（条件为
+		// `!idlePaused() && idleFor() > idleWindow`），传 0 会一 tick 就杀，
+		// 所以传 time.Hour 关闭它。
+		time.Hour,   // idleWindow: 实际关闭
+		hardCeiling, // hardCeiling
+		0,           // noProgressWindow: 关
+		0,           // toolWaitCeiling: 关（本用例只验硬顶口径）
+		0,           // subagentCeiling: 关
+		interval,
+	)
+
+	// 阶段一：纯活跃，累计约 150ms，远未到硬顶。
+	select {
+	case reason := <-killed:
+		t.Fatalf("hard ceiling killed during the active phase (reason=%q)", reason)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	// 阶段二：进入工具等待，这段不得计入引擎活跃时长，也不得被杀。
+	activity.beginToolUseWait()
+	select {
+	case reason := <-killed:
+		t.Fatalf("hard ceiling killed during a tool wait (reason=%q)", reason)
+	case <-time.After(350 * time.Millisecond):
+	}
+
+	// 阶段三：离开等待。累计应保留阶段一的 ~150ms，只需再攒约 150ms 就越过
+	// 300ms 硬顶；220ms 的窗口对正确实现有 ~70ms 裕量，对「清零」误实现则
+	// 远远不够（它需要重新攒满 300ms）。
+	activity.endToolUseWait()
+	select {
+	case reason := <-killed:
+		if reason != "hard_ceiling" {
+			t.Fatalf("kill reason = %q, want hard_ceiling", reason)
+		}
+	case <-time.After(220 * time.Millisecond):
+		t.Fatal("hard ceiling did not fire within 220ms after leaving the wait; engine-active time was probably reset instead of accumulated across the wait")
+	}
+}

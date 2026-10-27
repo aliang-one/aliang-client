@@ -1049,11 +1049,12 @@ type agentAIActivity struct {
 	pendingToolUses  atomic.Int64
 	// toolWaitStartedAt is the UnixNano instant the current CONTIGUOUS
 	// tool/subagent wait began (0 = not waiting). The tool-wait watchdog uses
-	// it to bound hung tools/subagents that would otherwise survive until the
-	// hard ceiling while the progress heartbeat keeps telling the server the
-	// run is alive. Cleared while a human approval is pending so approval
-	// time never counts against the ceiling (approvals are bounded separately
-	// by agentAIApprovalTimeout).
+	// it to bound hung tools/subagents that would otherwise pin the run
+	// indefinitely (the hard ceiling no longer counts wait ticks) while the
+	// progress heartbeat keeps telling the server the run is alive. Cleared
+	// while a human approval is pending so approval time never counts against
+	// the ceiling (approvals are bounded separately by
+	// agentAIApprovalTimeout).
 	toolWaitStartedAt atomic.Int64
 	// activeSubagents counts in-flight subagent records (task_started …
 	// terminal frame / teardown). While >0 the idle and no-progress guards are
@@ -1288,8 +1289,9 @@ func (a *agentAIActivity) killReasonOr(fallback string) string {
 // startAIWatchdog cancels ctx when the run goes idle (no output for
 // agentAIIdleWindow and not awaiting approval/tool results), produces no
 // meaningful progress for agentAINoProgressWindow, a contiguous tool/subagent
-// wait outlives agentAIToolWaitCeiling, or the run exceeds agentAIHardCeiling.
-// It exits as soon as ctx is done, so it never outlives the run.
+// wait outlives agentAIToolWaitCeiling, or its engine-active time exceeds
+// agentAIHardCeiling. It exits as soon as ctx is done, so it never outlives
+// the run.
 func (m *agentAIManager) startAIWatchdog(ctx context.Context, activity *agentAIActivity, cancel context.CancelFunc) {
 	if activity == nil || cancel == nil {
 		return
@@ -1303,8 +1305,9 @@ func agentAIWatchdogLoop(ctx context.Context, activity *agentAIActivity, cancel 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	// 引擎活跃时钟：逐拍累加，但处于任一合法等待态（审批/工具/子代理）的拍
-	// 不计入。口径见 spec §3.2.4——等待态各自有独立天花板，硬顶只管真实
-	// 干活时长，否则 3h 的子代理批处理会被 2h 硬顶误杀。
+	// 不计入。口径见 spec §3.2 第 4 条——等待态各自有独立天花板，硬顶只管真实
+	// 干活时长，否则 3h 的子代理批处理会被 2h 硬顶误杀。按 ticker 粒度采样，
+	// 误差以一拍为界（生产 agentAIIdleCheckInterval 为 30s）。
 	lastTick := time.Now()
 	var engineActive time.Duration
 	for {
@@ -1388,7 +1391,7 @@ func agentAIRunStoppedStatus(activity *agentAIActivity, limiter *agentAIOutputLi
 	case "subagent_wait_timeout":
 		return "timeout", fmt.Sprintf("AI run subagent work exceeded %s without completing (suspected runaway subagent) and was stopped", agentAISubagentWaitCeiling)
 	case "hard_ceiling":
-		return "hard_timeout", fmt.Sprintf("AI run exceeded the maximum runtime %s", agentAIHardCeiling)
+		return "hard_timeout", fmt.Sprintf("AI run exceeded the maximum engine-active runtime %s (approval, tool and subagent waits are excluded)", agentAIHardCeiling)
 	}
 	if limiter != nil && limiter.Exceeded() {
 		return "output_limited", fmt.Sprintf("AI output exceeded rate limit (%d bytes per %s) or lifetime cap (%d bytes)", agentAIOutputRateBytes, agentAIOutputRateWindow, agentAIOutputCapBytes)

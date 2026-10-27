@@ -137,6 +137,8 @@ var (
 	//
 	// Explicitly set it to "0s" to disable. Blank/unparseable/negative values
 	// fall back to the default (see resolveEnvDurationAllowZero).
+	// 置 0 等于放弃该等待状态的唯一本地上限：硬顶只累加引擎活跃拍，等待期间
+	// 的拍不计入，不会兜住这段等待；审批等待的拍同样不计入。
 	// 无需再与 agentAIHardCeiling 比较大小：硬顶只累加引擎活跃时长，工具等待
 	// 的拍不计入，2h 硬顶永远不会在这条等待里先触发（它会由本上限或 stale
 	// 扫描器收敛）。审批等待的拍同样不计入本计时（挂起即停表），由
@@ -155,6 +157,8 @@ var (
 	// ticks, so subagent-wait time is never clipped by it. Active-subagent
 	// time also pauses the idle/no-progress guards (idlePaused), so without
 	// this bound a marquee subagent would pin the run indefinitely.
+	// 置 0 等于放弃该等待状态的唯一本地上限：硬顶只累加引擎活跃拍，等待期间
+	// 的拍不计入，不会兜住这段等待；审批等待的拍同样不计入硬顶。
 	agentAISubagentWaitCeiling = resolveEnvDurationAllowZero("ALIANG_AI_SUBAGENT_WAIT_CEILING", 6*time.Hour)
 )
 
