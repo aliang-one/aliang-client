@@ -21,12 +21,17 @@ import "encoding/base64"
 
 // MessagesRequest 是一次 /v1/messages 调用的请求体。
 type MessagesRequest struct {
-	Model     string    `json:"model"`
-	MaxTokens int       `json:"max_tokens"`
-	System    string    `json:"system,omitempty"`
-	Messages  []Message `json:"messages"`
-	Tools     []ToolDef `json:"tools,omitempty"`
-	Stream    bool      `json:"stream"`
+	Model     string `json:"model"`
+	MaxTokens int    `json:"max_tokens"`
+	// System 既可以是纯字符串，也可以是 []SystemBlock。
+	//
+	// 用 interface{} 而不是直接定成块数组：绝大多数调用点只想塞一段文本，
+	// 强制造块数组等于给每个测试和子调用加一层噪音。挂 prompt cache 断点时
+	// 由 applyCacheBreakpoints 就地升级成块形态（见 cache.go）。
+	System   interface{} `json:"system,omitempty"`
+	Messages []Message   `json:"messages"`
+	Tools    []ToolDef   `json:"tools,omitempty"`
+	Stream   bool        `json:"stream"`
 	// OutputConfig 承载 output_config 请求参数（Claude Messages API 语义：
 	// effort 挂在 output_config 里，不是顶层字段）。nil = 不下发。
 	OutputConfig *OutputConfig `json:"output_config,omitempty"`
@@ -84,6 +89,10 @@ type ContentBlock struct {
 	ToolUseID string      `json:"tool_use_id,omitempty"`
 	Content   interface{} `json:"content,omitempty"`
 	IsError   bool        `json:"is_error,omitempty"`
+
+	// cache_control 只在下发方向有意义：请求尾部块打一个断点，让上游把整段
+	// 前缀缓存起来。响应解析时上游不会回填这个字段，留 nil 即可。
+	CacheControl *CacheControl `json:"cache_control,omitempty"`
 }
 
 // ImageSource 是 image 块的来源。
@@ -123,9 +132,10 @@ func ImageURLBlock(url, mediaType string) ContentBlock {
 
 // ToolDef 是下发给模型的一个工具定义。
 type ToolDef struct {
-	Name        string                 `json:"name"`
-	Description string                 `json:"description"`
-	InputSchema map[string]interface{} `json:"input_schema"`
+	Name         string                 `json:"name"`
+	Description  string                 `json:"description"`
+	InputSchema  map[string]interface{} `json:"input_schema"`
+	CacheControl *CacheControl          `json:"cache_control,omitempty"`
 }
 
 // 停止原因。只有 max_tokens 会触发内核的截断守卫。
@@ -148,6 +158,30 @@ const (
 type Usage struct {
 	InputTokens  int `json:"input_tokens"`
 	OutputTokens int `json:"output_tokens"`
+
+	// 下面两个是 prompt cache 的记账字段（Anthropic Messages API 语义）。
+	// 不解析它们，缓存到底有没有命中就永远是瞎的——线上「慢」的排查会退化成
+	// 靠字节账本反推（2026-10-27 的 30 分钟跑就是这么查出来的）。
+	//
+	// CacheCreationInputTokens：本轮写进缓存的 token（首次或前缀变化时非 0）。
+	// CacheReadInputTokens：本轮从缓存读回的 token（命中时接近整个前缀）。
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens,omitempty"`
+	CacheReadInputTokens     int `json:"cache_read_input_tokens,omitempty"`
+}
+
+// CacheControl 是内容块上的缓存断点标记。
+//
+// 目前只有 "ephemeral"（5 分钟 TTL，读写都按上游定价打折）一种取值。
+type CacheControl struct {
+	Type string `json:"type"`
+}
+
+// SystemBlock 是 system 字段的块形态。挂 cache_control 必须走块数组——
+// 纯字符串形态没有办法承载断点。
+type SystemBlock struct {
+	Type         string        `json:"type"`
+	Text         string        `json:"text"`
+	CacheControl *CacheControl `json:"cache_control,omitempty"`
 }
 
 // sseEvent 是 SSE 流里的一个事件（已解析掉 "data: " 前缀）。

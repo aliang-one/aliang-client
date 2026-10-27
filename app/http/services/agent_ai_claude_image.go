@@ -20,6 +20,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"aliang.one/nursorgate/common/logger"
 )
 
 const (
@@ -70,6 +72,12 @@ func buildClaudeImageBlocks(attachments []agentAIAttachment) ([]map[string]inter
 		raw, err := os.ReadFile(attachment.Path)
 		if err != nil {
 			return nil, fmt.Errorf("read image attachment: %w", err)
+		}
+		// 先压再编：原始分辨率照片动辄 5MB，base64 后 6.7MB，而这份体积会跟着
+		// 会话历史每一轮重传（见 agent_ai_image_compress.go 的取舍说明）。
+		if compressed, compressedType, note := compressImageForModel(raw, mediaType); note != "" {
+			raw, mediaType = compressed, compressedType
+			logger.Warn(fmt.Sprintf("图片压缩 %s: %s", attachment.Name, note))
 		}
 		encoded := base64.StdEncoding.EncodeToString(raw)
 		if len(encoded) > claudeImageBase64MaxBytes {

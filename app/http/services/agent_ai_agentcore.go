@@ -38,22 +38,22 @@ import (
 // 由 relay 层注入 Authorization-Inner。走这条路不需要我们自己管凭据。
 const agentCoreDefaultBaseURL = "http://127.0.0.1:56432"
 
-// agentCoreDefaultModel 是手机没显式传模型时的兜底。
+// 模型 id 的唯一权威来源是手机（会话设置里选的那个）。本机不再持有任何
+// 「兜底模型」，因此这里没有 const——但下面这段结论要留住，它是手机侧
+// MODEL_PRESETS_BY_PROVIDER 里 agentcore 条目的依据：
 //
-// 必须是一个**本账号组真能路由**的 id。曾经写的是 claude-sonnet-4-5（真实
-// Anthropic id，指望网关做 model mapping），但实测该组对 claude-* 一律返回
-// model_not_found，只有 glm-* 通。手机每次建会话都会显式传 model（那是权威
-// 来源），这里只是「传空」时的保命值——保命值本身不能是必然失败的。
+//   - 必须是一个**本账号组真能路由**的 id。曾经写过 claude-sonnet-4-5（真实
+//     Anthropic id，指望网关做 model mapping），实测该组对 claude-* 一律返回
+//     model_not_found，只有 glm-* 通。
+//   - 视觉能力：2026-10-26 实测（容器内真出网，四象限四色图按 左上/右上/
+//     左下/右下 提问）glm-5.3 与 glm-5.3-flash[1m] 是真视觉（4/4 全对，5.3
+//     甚至自己读出 PNG 的 8×8 尺寸），而 glm-5.2 全盲——洋红纯色图答「棕色」，
+//     损坏图它自己说「只提供了一个图片的URL链接」。图片附件走 image 块直达
+//     模型，所以手机侧可选模型里必须至少有一个看得见图的。
+//   - `[1m]` 后缀 = 1M 上下文窗口。手机没选窗口时，模型自带窗口就是上限。
 //
 // 与 PhoneServer 的 SEED_PROVIDER_CATALOG、手机 MODEL_PRESETS_BY_PROVIDER
 // 的 agentcore 条目保持同一套 id。
-//
-// 选 glm-5.3 而不是 glm-5.2/5.1：2026-10-26 实测（容器内真出网，四象限四色
-// 图按 左上/右上/左下/右下 提问）glm-5.3 与 glm-5.3-flash[1m] 是真视觉
-// （4/4 全对，5.3 甚至自己读出了 PNG 的 8×8 尺寸），而 glm-5.2 全盲——
-// 洋红纯色图答「棕色」，损坏图它自己说「只提供了一个图片的URL链接」。
-// 图片附件走 image 块直达模型，默认模型必须挑看得见图的那个。
-const agentCoreDefaultModel = "glm-5.3"
 
 // agentCoreSettingsEnv 从 ~/.claude/settings.json 的 env 块里取一个值。
 // 与 claudeAuthEnvOverlay（agent_ai.go）同一套查找口径：先看子进程 env，
@@ -221,10 +221,15 @@ func agentCoreIsLoopbackBase(base string) bool {
 	return isLoopbackHost(u.Hostname())
 }
 
-// agentCoreModel 解析模型名：本轮指定 → env/settings → 兜底。
+// agentCoreModel 解析本轮模型名：唯一来源是手机下发的值。
 //
-// 手机每次建会话都会显式传 model，那是权威来源；本函数只负责「传空时也要
-// 有东西能发出去」，且发出去的东西必须网关认。
+// 这里刻意没有兜底链了。旧行为是「手机没传 → ANTHROPIC_MODEL →
+// ANTHROPIC_DEFAULT_SONNET_MODEL → 硬编码 glm-5.3」，代价是用户以为在 A 模型
+// 上对话、实际跑在 B 上：账单对不上、能力对不上（视觉、上下文窗口、effort 支持
+// 全都按模型而异），而错配在日志里一个字都不留。
+//
+// 新的约定：参数由下发方（手机）补全；补全不了就返回空串，调用方明确拒绝开跑，
+// 让用户回手机把模型选上。宁可拒绝，也不要静默换模型。
 //
 // effort 走第三条通道：请求体的 output_config.effort（Claude Messages API
 // 语义）。模型名后缀是 codex 专用约定——applyCodexEffortSuffix 的注释写明
@@ -233,26 +238,18 @@ func agentCoreIsLoopbackBase(base string) bool {
 // 上游发的同一个字段，claude_code 路径已验证网关/GLM 接受，内核复用同一
 // 通道即可。档位归一在内核侧 NormalizeEffortLevel（无法识别的静默丢弃）。
 func agentCoreModel(run agentAIRun) string {
-	// 手机显式传的模型是权威来源，直接采用。
-	if m := strings.TrimSpace(run.model); m != "" && !agentCoreModelUnusable(m) {
-		return m
+	m := strings.TrimSpace(run.model)
+	if agentCoreModelUnusable(m) {
+		return ""
 	}
-	// 没传才看本机配置。ANTHROPIC_MODEL 是显式覆盖；
-	// ANTHROPIC_DEFAULT_SONNET_MODEL 是 quick-setup 写的「默认档位映射」，
-	// 本机就落在 glm-5.3[1m]——比硬编码兜底更贴近这台机器真实在用的模型。
-	for _, key := range []string{"ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL"} {
-		if m := agentCoreEnvOrSettings(key); m != "" && !agentCoreModelUnusable(m) {
-			return m
-		}
-	}
-	return agentCoreDefaultModel
+	return m
 }
 
 // agentCoreModelUnusable 挡掉不能当模型名用的值。
 //
 // "<synthetic>" 是 claude CLI 自己造出来的占位名，网关不认识；空串会被网关
 // 以 "model is required" 拒绝（agent_ai.go 也把 synthetic 当失败吞掉）。
-// 解析到这种值时必须继续往下走兜底，而不是把它发出去。
+// 这两种值一律视作「没给模型」，由调用方拒绝开跑。
 func agentCoreModelUnusable(model string) bool {
 	m := strings.TrimSpace(model)
 	return m == "" || strings.EqualFold(m, "<synthetic>")
@@ -661,9 +658,17 @@ func (m *agentAIManager) handleAgentCoreCompactCommand(session *agentAISession, 
 		return
 	}
 
+	// /compact 也要模型（摘要得由模型写）。手机没给就明确说，不兜底换模型。
+	compactModel := agentCoreModel(agentAIRun{model: model})
+	if compactModel == "" {
+		_ = writeJSON(agentAIErrorPayload(session.id, messageID,
+			fmt.Errorf("未指定模型：手机没有下发模型名，无法生成摘要。请先在会话设置里选择模型")))
+		return
+	}
+
 	cfg := &agentcore.Config{
 		Client:        agentcore.NewClient(agentCoreBaseURL()).WithAPIKey(agentCoreAuthToken()),
-		Model:         agentCoreModel(agentAIRun{model: model}),
+		Model:         compactModel,
 		ContextWindow: contextWindow,
 	}
 	compacted, info, err := agentcore.Compact(ctx, cfg, messages, "manual")
@@ -936,6 +941,17 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		return
 	}
 
+	// 模型只认手机下发的值。没有就拒绝开跑，不做任何本机兜底——静默换模型
+	// 会让账单、上下文窗口、视觉能力全部与用户的选择错配，而且事后无从追查。
+	// 参数补全的责任在下发方（手机 / PhoneServer），不在这里。
+	model := agentCoreModel(run)
+	if model == "" {
+		err := fmt.Errorf("未指定模型：本次运行没有收到模型名（收到的是 %q）。请在手机的会话设置里选择模型后重新发送", strings.TrimSpace(run.model))
+		endErrMsg = err.Error()
+		_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, err))
+		return
+	}
+
 	messages, sessionContext := m.agentCoreMessages(run)
 	if len(messages) == 0 {
 		endErrMsg = "会话没有可发送的消息"
@@ -1110,7 +1126,7 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 
 	cfg := &agentcore.Config{
 		Client:    kernelClient,
-		Model:     agentCoreModel(run),
+		Model:     model,
 		System:    agentCoreSystemPromptWithContext(run.projectPath, sessionContext),
 		Tools:     registry,
 		SessionID: kernelSessionID,

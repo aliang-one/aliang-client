@@ -70,10 +70,12 @@ func TestAgentAIUseAgentCoreFallback(t *testing.T) {
 	}
 }
 
-// 手机每次建会话都会显式传 model，那是权威来源：本机 env / settings 一律不得
-// 覆盖它。反过来，手机传空或传 claude CLI 自己造的 "<synthetic>" 时必须继续
-// 往下兜底——网关不认识这两个值，直接发出去只会得到 "model is required" 或
-// model_not_found，而用户看到的是一句莫名其妙的失败。
+// 手机下发的模型名是唯一来源：本机 env / settings 一律不得介入，也不再有任何
+// 兜底常量。
+//
+// 为什么这么严：静默换模型的代价是「用户选了 A、实际跑在 B」——账单、上下文
+// 窗口、视觉能力全部错配，而错配在日志里不留痕。宁可拒绝开跑（由 runAgentCore
+// 报错让用户回手机选模型），也不要替他决定。
 func TestAgentCoreModelResolution(t *testing.T) {
 	// 隔离 ~/.claude/settings.json：agentCoreEnvOrSettings 会去读它。
 	t.Setenv("HOME", t.TempDir())
@@ -91,18 +93,12 @@ func TestAgentCoreModelResolution(t *testing.T) {
 		}
 	}
 
-	// 2) 手机没传（或传了不可用的占位名）→ 退回本机配置，不能把占位名发出去。
+	// 2) 手机没传、或传了不能当模型名的占位名 → 返回空串（调用方据此拒绝开跑）。
+	//    env 里明明有值也不能被采纳：那正是旧行为里「悄悄换模型」的入口。
 	for _, phone := range []string{"", "   ", "<synthetic>", "<SYNTHETIC>"} {
-		if got := agentCoreModel(agentAIRun{model: phone}); got != "glm-5.3-from-env" {
-			t.Errorf("手机传 %q → %q, want 本机 ANTHROPIC_MODEL", phone, got)
+		if got := agentCoreModel(agentAIRun{model: phone}); got != "" {
+			t.Errorf("手机传 %q → %q, want 空串（不兜底、不读 env）", phone, got)
 		}
-	}
-
-	// 3) 本机也没有显式覆盖 → 兜底值本身必须是网关认得的 id。
-	t.Setenv("ANTHROPIC_MODEL", "")
-	t.Setenv("ANTHROPIC_DEFAULT_SONNET_MODEL", "")
-	if got := agentCoreModel(agentAIRun{}); got != agentCoreDefaultModel {
-		t.Errorf("全空 → %q, want %q", got, agentCoreDefaultModel)
 	}
 }
 

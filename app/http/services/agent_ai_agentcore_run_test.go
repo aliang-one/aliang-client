@@ -850,6 +850,7 @@ func TestRunAgentCoreJournalsWriteFailureDoesNotAffectRun(t *testing.T) {
 		runSeq:      1,
 		messageID:   "msg-host-j4",
 		provider:    "agentcore",
+		model:       "glm-5.2",
 		projectPath: t.TempDir(),
 		activity:    newAgentAIActivity(),
 	}
@@ -887,6 +888,7 @@ func TestRunAgentCoreJournalsErrorEnd(t *testing.T) {
 		runSeq:      1,
 		messageID:   "msg-host-j3",
 		provider:    "agentcore",
+		model:       "glm-5.2",
 		projectPath: t.TempDir(),
 		activity:    newAgentAIActivity(),
 	}

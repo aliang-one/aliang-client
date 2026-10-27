@@ -24,14 +24,32 @@ import (
 // finish）—— 其余两个（PrepareNextTurn / GetFollowUpMessages）在 pi 里服务于
 // 它自己的扩展机制，本内核没有对应需求，等有真实用例再加，避免空接口。
 
-// maxIterations 是单次 run 的硬上限。防的是模型陷入「调工具 → 失败 → 再调」
-// 的死循环，那会把 token 烧穿。
+// 回合预算家族。这组护栏回答的是同一个问题：手机用户按下发送就走了，run
+// 必须保证有终态（否则会话永久 running，后续消息全部进死队列——比「跑太久」
+// 严重得多的故障），同时死循环不能把 token 烧穿。
 //
-// 200 而不是更小：探索型任务（读代码定位问题）每个回合通常只跑 1-2 条
-// grep/sed，50 回合在 7 分钟内就被打满，把仍在正常推进的对话从中间截断
-// （2026-10-27 实锤：83 条命令后撞上限，用户侧只看到「对话莫名停了」）。
-// 死循环仍会被这道上限兜住，只是允许的正常工作量更贴近真实场景。
-const maxIterations = 200
+// maxIterations 只是最后的兜底，真正先触发的是三个「无进展」检测：
+//
+//   - maxIdenticalToolTurns：连续 N 轮发起完全相同的工具调用（名字+参数一致）
+//     = 模型在原地打转；
+//   - maxConsecutiveToolErrors：连续 N 个工具结果都是错误 = 越错越试的螺旋；
+//   - runWallBudget：单次 run 的墙钟预算。用户对「跑了多久」的感知远强于
+//     「第几轮」，30 分钟没动静就是该停了。
+//
+// 三者命中都不直接报错：先补一次不带工具的收尾请求让模型把进度交代出来
+// （见 wrapUp），再以带说明的终止帧收场——用户至少知道干到了哪一步。
+const maxIterations = 50
+
+// maxIdenticalToolTurns 是无进展守卫的轮数阈值。
+const maxIdenticalToolTurns = 3
+
+// maxConsecutiveToolErrors 是连续工具错误的个数阈值（跨轮累计，遇成功清零）。
+const maxConsecutiveToolErrors = 5
+
+// runWallBudget 是单次 run 的墙钟预算。长活任务（探索型读代码、批量改造）
+// 10 分钟是常态，40 分钟给足余量；单个 LLM 调用本身可能耗掉大半预算，
+// 检查点在轮与轮之间，不在流中途。
+const runWallBudget = 40 * time.Minute
 
 // maxContextOverflowRetries 是「上游说上下文超长」后自动压缩并重试的轮数
 // 上限。每次压缩都会把历史砍到窗口一半以下，两三次足够落进任何真实窗口；
@@ -43,7 +61,6 @@ const maxContextOverflowRetries = 3
 // 算的，历史很小时会算到很小，窗口太小会让压缩把正常对话也折叠掉；32000
 // 已经小于任何主流模型窗口，再低就没有意义了。
 const minContextOverflowWindow = 32000
-
 
 // maxTruncationRetries 是**连续**被 max_tokens 截断后允许重试的次数。
 //
@@ -263,6 +280,11 @@ type runner struct {
 	// effortDropLogged:无法识别的档位被丢弃时只打一次日志,别每轮刷屏。
 	effortDropLogged bool
 
+	// cacheLatched:上游按模型拒绝过 cache_control(4xx 且错误体点名缓存)。
+	// 锁存后本 run 后续轮次不再挂缓存断点——缓存是纯优化,不该因为它不被支持
+	// 就让整轮对话失败。与 effortLatched 同一套自愈思路。
+	cacheLatched bool
+
 	// 累计
 	textAll   strings.Builder
 	turnText  strings.Builder
@@ -274,6 +296,18 @@ type runner struct {
 	// truncStreak 是连续被 max_tokens 截断的轮数。只要有一轮没截断就清零——
 	// 要防的是「原地打转」，不是累计次数。
 	truncStreak int
+
+	// 无进展守卫（见文件顶部「回合预算家族」注释）。
+	//
+	// lastToolSignature/dupStreak：连续 N 轮工具调用签名完全一致 = 打转。
+	// errStreak：连续 N 个工具结果都是错误（跨轮累计，遇成功清零）。
+	// startedAt/wallBudget：墙钟预算；startedAt 在 loop 入口惰性初始化，
+	// wallBudget 供测试缩短（0 = 用 runWallBudget）。
+	lastToolSignature string
+	dupStreak         int
+	errStreak         int
+	startedAt         time.Time
+	wallBudget        time.Duration
 
 	// contextTokens 是上游最近一次报告的本轮输入 token 数（message_start 的
 	// usage.input_tokens）。注意 usage.InputTokens 是按轮累加的账单口径，不能
@@ -293,9 +327,19 @@ type runner struct {
 
 // logf 走宿主的日志出口；没配就静默。
 func (r *runner) logf(format string, args ...interface{}) {
-	if r.cfg.Logf != nil {
-		r.cfg.Logf(format, args...)
+	if r == nil || r.cfg == nil || r.cfg.Logf == nil {
+		return
 	}
+	r.cfg.Logf(format, args...)
+}
+
+// sid 取会话 id 供日志使用。直接写 r.writer.sessionID 会在 writer 为 nil 时
+// 炸在参数求值上——而日志参数是**先求值后调用**，logf 里的 nil 判断救不了它。
+func (r *runner) sid() string {
+	if r == nil || r.writer == nil {
+		return ""
+	}
+	return r.writer.sessionID
 }
 
 // loop 是主循环本体。
@@ -306,11 +350,25 @@ func (r *runner) loop(ctx context.Context) (*RunResult, error) {
 			return nil, err
 		}
 	}
+	// 惰性初始化：直构造 runner 的测试路径不会设 startedAt，从这里起算。
+	if r.startedAt.IsZero() {
+		r.startedAt = time.Now()
+	}
 
 	for turn := 0; turn < maxIterations; turn++ {
 		// 进程内内核没有子进程可杀，取消只能靠自己轮询。
 		if err := ctx.Err(); err != nil {
 			return r.finishWithErr(ctx, "", err)
+		}
+
+		// 墙钟预算。检查点在轮与轮之间——单个流式调用本身可以耗很久，
+		// 这里拦的是「下一个回合还值不值得开」。
+		if elapsed := time.Since(r.startedAt); elapsed > r.budget() {
+			r.logf("[agentcore] 达到单次运行时间预算 %s（已耗时 %s），收尾 session=%s",
+				r.budget(), elapsed.Round(time.Second), r.sid())
+			return r.stopWithSummary(ctx,
+				fmt.Sprintf("本次运行已耗时 %s，达到单次运行时间预算 %s",
+					elapsed.Round(time.Minute), r.budget()))
 		}
 
 		r.turns = turn + 1
@@ -332,12 +390,22 @@ func (r *runner) loop(ctx context.Context) (*RunResult, error) {
 		if r.cfg.Hooks.PrepareRequest != nil {
 			r.cfg.Hooks.PrepareRequest(req)
 		}
+		// 断点挂在宿主 hook 之后：hook 可能整体替换 system / tools / messages
+		// （例如把 system 又塞回字符串），挂在之前会被它抹掉。
+		if !r.cacheLatched {
+			applyCacheBreakpoints(req)
+		}
 
 		assistantBlocks, stopReason, err := r.streamTurn(ctx, req, writer)
 		if err != nil && r.noteEffortRejection(err, req) {
 			// 上游按模型拒绝 effort:锁存后去掉 output_config 重试本回合
 			// 一次。此时还没发过任何事件帧(400 在响应检查阶段抛出),writer
 			// 状态干净,重跑安全。
+			assistantBlocks, stopReason, err = r.streamTurn(ctx, r.buildRequest(), writer)
+		}
+		if err != nil && r.noteCacheRejection(err, req) {
+			// 上游不认 cache_control:摘掉断点重试本回合一次。缓存是优化项,
+			// 宁可回退成无缓存也不要整轮失败。
 			assistantBlocks, stopReason, err = r.streamTurn(ctx, r.buildRequest(), writer)
 		}
 		if err != nil && r.noteContextOverflow(ctx, err) {
@@ -355,6 +423,10 @@ func (r *runner) loop(ctx context.Context) (*RunResult, error) {
 
 		// 把 assistant 输出写回历史（下一轮请求要带上）。
 		r.history = append(r.history, BlocksMessage("assistant", assistantBlocks))
+
+		// 第一轮已经把用户这一轮附的图片送进模型视野了。此后每一轮都重发同一
+		// 份 base64 只是白烧带宽——换成文字占位符（见 media.go）。
+		r.stubHistoricalImages()
 
 		toolUses := collectToolUses(assistantBlocks)
 		if len(toolUses) == 0 {
@@ -407,9 +479,42 @@ func (r *runner) loop(ctx context.Context) (*RunResult, error) {
 		}
 		r.truncStreak = 0
 
+		// 无进展守卫：连续 N 轮发起完全相同的工具调用（名字+参数一致）。
+		// 签名取本回合全部 tool_use；任何一轮不同即重新计数。真实重复
+		// （用户插话后要求再看一次同一状态）几乎总伴随参数或轮次内容变化，
+		// 三轮一模一样只有打转能解释。
+		if sig := toolCallSignature(toolUses); sig == r.lastToolSignature {
+			r.dupStreak++
+		} else {
+			r.lastToolSignature = sig
+			r.dupStreak = 1
+		}
+		if r.dupStreak >= maxIdenticalToolTurns {
+			r.logf("[agentcore] 连续 %d 轮发起完全相同的工具调用，判定无进展，收尾 session=%s",
+				r.dupStreak, r.sid())
+			return r.stopWithSummary(ctx,
+				fmt.Sprintf("模型连续 %d 轮发起完全相同的工具调用，判定为无进展", r.dupStreak))
+		}
+
 		// 执行工具。
 		results := r.executeTools(ctx, toolUses, writer)
 		r.history = append(r.history, BlocksMessage("user", results))
+
+		// 连续错误守卫：跨轮累计，遇任何成功清零。防「读文件失败→重试→
+		// 再失败」的螺旋——模型自己不会承认该换思路。
+		for _, res := range results {
+			if res.IsError {
+				r.errStreak++
+			} else {
+				r.errStreak = 0
+			}
+		}
+		if r.errStreak >= maxConsecutiveToolErrors {
+			r.logf("[agentcore] 连续 %d 个工具结果都是错误，判定打转，收尾 session=%s",
+				r.errStreak, r.sid())
+			return r.stopWithSummary(ctx,
+				fmt.Sprintf("工具连续 %d 次执行失败，疑似陷入重试循环", r.errStreak))
+		}
 
 		if writer != nil {
 			if err := writer.ToolResults(results); err != nil {
@@ -418,9 +523,73 @@ func (r *runner) loop(ctx context.Context) (*RunResult, error) {
 		}
 	}
 
-	// 撞上 maxIterations。
-	return r.finish(ctx, ResultSubtypeErrorMaxTurns,
-		fmt.Sprintf("达到最大回合数 %d，已停止", maxIterations), true, nil)
+	// 撞上 maxIterations——三个无进展守卫都没先触发时的兜底。
+	//
+	// 不直接报错收场：上限是防死循环的护栏，不该让用户看到一句「达到最大回合数」
+	// 之后什么都没有——前面几十条命令的进展全丢在历史里。stopWithSummary 会
+	// 补一次**不带工具**的请求，让模型把已完成的部分和下一步用文字交代出来。
+	// 这一次不计入回合数，失败也只是没有收尾文本，不改变终止结论。
+	return r.stopWithSummary(ctx,
+		fmt.Sprintf("达到单次运行的最大回合数 %d", maxIterations))
+}
+
+// budget 返回本 run 的墙钟预算（测试可经 wallBudget 缩短）。
+func (r *runner) budget() time.Duration {
+	if r.wallBudget > 0 {
+		return r.wallBudget
+	}
+	return runWallBudget
+}
+
+// stopWithSummary 是所有预算耗尽出口的统一收场：先补一次无工具的收尾总结
+// （wrapUp 内部吞错，不影响终止结论），再以带原因的终止帧结束。
+func (r *runner) stopWithSummary(ctx context.Context, reason string) (*RunResult, error) {
+	r.wrapUp(ctx, reason)
+	return r.finish(ctx, ResultSubtypeErrorMaxTurns, reason+"，已停止", true, nil)
+}
+
+// toolCallSignature 把一轮的全部工具调用压成可比较的签名：名字 + 参数 JSON。
+// map 序列化时 Go 按键排序，同一组参数的签名天然稳定。
+func toolCallSignature(uses []ContentBlock) string {
+	var sb strings.Builder
+	for _, tu := range uses {
+		sb.WriteString(tu.Name)
+		sb.WriteByte(0x1f)
+		if raw, err := json.Marshal(tu.Input); err == nil {
+			sb.Write(raw)
+		}
+		sb.WriteByte(0x1e)
+	}
+	return sb.String()
+}
+
+// wrapUp 在回合预算耗尽时补一次纯文本收尾。
+//
+// 关键手段是 req.Tools = nil：模型没有工具可调，只能输出文字，于是这一轮的
+// 文本天然就是总结。放在 hook 之后再清空，防止宿主 hook 又把工具塞回来。
+//
+// writer 传 nil：这一轮的文本不需要再走事件帧（宿主那边会说「对话已停止」，
+// 再补一串 assistant 帧反而像是还在跑）。文本经 r.turnText 由 finish 汇入结果。
+func (r *runner) wrapUp(ctx context.Context, reason string) {
+	if err := ctx.Err(); err != nil {
+		return
+	}
+	req := r.buildRequest()
+	if r.cfg.Hooks.PrepareRequest != nil {
+		r.cfg.Hooks.PrepareRequest(req)
+	}
+	req.Tools = nil
+	if !r.cacheLatched {
+		applyCacheBreakpoints(req)
+	}
+	// 明确告诉模型这是一次收尾，不是又一轮可以继续干活的对话。
+	req.Messages = append(append([]Message(nil), req.Messages...),
+		TextMessage("user", fmt.Sprintf(
+			"%s，本轮不会再执行任何工具。请用简洁的文字总结：已经完成了什么、当前状态如何、还剩哪些没做完、建议下一步怎么做。不要调用任何工具。",
+			reason)))
+	if _, _, err := r.streamTurn(ctx, req, nil); err != nil {
+		r.logf("[agentcore] 收尾总结请求失败（不影响终止结论）: %v session=%s", err, r.writer.sessionID)
+	}
 }
 
 // maybeAutoCompact 在上下文接近窗口上限时把较早的历史换成摘要。
@@ -643,6 +812,24 @@ func mentionsEffort(text string) bool {
 	return strings.Contains(t, "output_config") || strings.Contains(t, "effort")
 }
 
+// noteCacheRejection 判定这次流式失败是不是「上游不认 cache_control」。
+// 命中则锁存(r.cacheLatched)并返回 true，调用方据此摘掉断点重试。
+//
+// 为什么要这一层：我们没法事先知道每个上游（GLM / deepseek / 后续接入的）
+// 是否实现了 Anthropic 的缓存字段。与其加一个让用户去猜的开关，不如被拒一次
+// 就自动降级——缓存是优化，不是功能前提。
+func (r *runner) noteCacheRejection(err error, req *MessagesRequest) bool {
+	if r.cacheLatched || req == nil {
+		return false
+	}
+	if !isCacheRejection(err) {
+		return false
+	}
+	r.cacheLatched = true
+	r.logf("agentcore: 上游拒绝 cache_control，本 run 后续轮次不再挂缓存断点（回退为无缓存）: %v", err)
+	return true
+}
+
 // streamTurn 跑一次 LLM 调用，边流边写帧，返回本回合的完整内容块。
 func (r *runner) streamTurn(ctx context.Context, req *MessagesRequest, writer *streamWriter) ([]ContentBlock, string, error) {
 	// 按 index 累积各内容块。
@@ -654,6 +841,8 @@ func (r *runner) streamTurn(ctx context.Context, req *MessagesRequest, writer *s
 	started := map[int]bool{}
 	stopReason := ""
 	var messageID string
+	// 本回合的用量，只用于打一行日志。累计值另有 r.usage。
+	var turnIn, turnCacheRead, turnCacheWrite, turnOut int
 
 	ensureIndex := func(idx int) {
 		for len(blocks) <= idx {
@@ -667,8 +856,20 @@ func (r *runner) streamTurn(ctx context.Context, req *MessagesRequest, writer *s
 			messageID = ev.MessageID
 			if ev.Usage != nil {
 				r.usage.InputTokens += ev.Usage.InputTokens
+				r.usage.CacheReadInputTokens += ev.Usage.CacheReadInputTokens
+				r.usage.CacheCreationInputTokens += ev.Usage.CacheCreationInputTokens
+				turnIn = ev.Usage.InputTokens
+				turnCacheRead = ev.Usage.CacheReadInputTokens
+				turnCacheWrite = ev.Usage.CacheCreationInputTokens
 				// 本轮实测的上下文大小：自动压缩用它兜底估算误差。
-				r.contextTokens = ev.Usage.InputTokens
+				//
+				// 必须三项相加：Anthropic 语义里 input_tokens 只算「没命中缓存
+				// 的那部分」，命中的部分在 cache_read_input_tokens 里。缓存生效
+				// 之后 input_tokens 会骤降，若还只取它，contextTokens 会被严重
+				// 低估 → 压缩阈值永远不触发 → 请求一路涨到上游报超长。
+				r.contextTokens = ev.Usage.InputTokens +
+					ev.Usage.CacheReadInputTokens +
+					ev.Usage.CacheCreationInputTokens
 			}
 			if writer != nil {
 				if err := writer.TurnStart(messageID, ev.Model); err != nil {
@@ -772,6 +973,7 @@ func (r *runner) streamTurn(ctx context.Context, req *MessagesRequest, writer *s
 			stopReason = ev.StopReason
 			if ev.Usage != nil {
 				r.usage.OutputTokens += ev.Usage.OutputTokens
+				turnOut = ev.Usage.OutputTokens
 			}
 
 		case EventError:
@@ -782,6 +984,13 @@ func (r *runner) streamTurn(ctx context.Context, req *MessagesRequest, writer *s
 	if err != nil {
 		return nil, "", err
 	}
+
+	// 每回合一行用量日志。这是判断「缓存到底有没有生效」的唯一地面真值：
+	// 上游若支持前缀缓存，cache_read 会随轮次上升、input 会相应下降；若一直
+	// 是 cache_read=0，说明这一路上游没做缓存（或者断点全被忽略），此时提速
+	// 只能靠占位符化/压缩图片这类减少体积的手段。
+	r.logf("[agentcore] turn usage in=%d cache_read=%d cache_write=%d out=%d ctx=%d session=%s",
+		turnIn, turnCacheRead, turnCacheWrite, turnOut, r.contextTokens, r.sid())
 
 	// 收尾：丢掉空块（上游偶尔会发 content_block_start 但没内容）。
 	cleaned := make([]ContentBlock, 0, len(blocks))

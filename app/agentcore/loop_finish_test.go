@@ -51,13 +51,13 @@ func TestFinish_ErrorReasonComesFirst(t *testing.T) {
 	r.turnText.WriteString("找到了「待开始」的来源，接下来来看看 `isDraft` 是怎么判断的。")
 	r.turns = maxIterations
 
-	if _, err := r.finish(context.Background(), ResultSubtypeErrorMaxTurns, "达到最大回合数 200，已停止", true, nil); err != nil {
+	if _, err := r.finish(context.Background(), ResultSubtypeErrorMaxTurns, "达到单次运行的最大回合数 50，已停止", true, nil); err != nil {
 		t.Fatalf("finish 返回错误: %v", err)
 	}
 
 	frame := decodeResultFrame(t, buf.Bytes())
 	got, _ := frame["result"].(string)
-	want := "达到最大回合数 200，已停止\n\n找到了「待开始」的来源，接下来来看看 `isDraft` 是怎么判断的。"
+	want := "达到单次运行的最大回合数 50，已停止\n\n找到了「待开始」的来源，接下来来看看 `isDraft` 是怎么判断的。"
 	if got != want {
 		t.Fatalf("result 文本不对\n 实际: %q\n 期望: %q", got, want)
 	}
