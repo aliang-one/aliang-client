@@ -995,10 +995,30 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 	filesTouchedCount := len(filesTouched)
 	filesMu.Unlock()
 
-	m.appendAssistantHistory(run.sessionID, run.runSeq, run.messageID, assistantOutput)
-	journal.appendAssistant(run.sessionID, agentAssistantMessageID(run.messageID), assistantOutput, time.Now().UTC().Format(time.RFC3339))
-	endStatus = "success"
-	m.setAgentAIResumeSessionIDIfEmpty(run.sessionID, run.runSeq, capturedResumeSessionID)
+	if m.agentAIRunSideEffectsAllowed(run.sessionID, run.runSeq, run.guard) {
+		m.appendAssistantHistory(run.sessionID, run.runSeq, run.messageID, assistantOutput)
+		journal.appendAssistant(run.sessionID, agentAssistantMessageID(run.messageID), assistantOutput, time.Now().UTC().Format(time.RFC3339))
+		endStatus = "success"
+		m.setAgentAIResumeSessionIDIfEmpty(run.sessionID, run.runSeq, capturedResumeSessionID)
+	} else {
+		// 僵尸迟返回：强拆之后 runSeq 未变但已打 finalizedRunSeq 标记（或该回合
+		// 早已被新回合顶替），这些非帧副作用会污染 Retry 新回合的历史/恢复点，
+		// 必须丢弃（spec §2.4 / §3.2.2）。
+		// endStatus 保持默认 "error"：deferred journal.appendEnd 必须体现
+		// 「这一轮没有落库的成功结果」，否则 journal 会出现 end(success) 却查无
+		// assistant 行的自相矛盾记录。
+		//
+		// 恢复点还有第二个写入源：confirmBinding 在流式途中（早于强拆标记）就把
+		// 内核新发的 session id 钉进了 session.resumeSessionID，上面跳过的
+		// setAgentAIResumeSessionIDIfEmpty 并不是唯一入口。仅当本回合起跑时
+		// 本来没有恢复点（run.resumeSessionID 为空）时才撤——此时当前值必由本
+		// 回合钉入；否则可能把上一轮合法恢复点误清。
+		if strings.TrimSpace(run.resumeSessionID) == "" {
+			m.clearAgentAIResumeSessionID(run.sessionID, run.runSeq, capturedResumeSessionID)
+		}
+		logger.Warn(fmt.Sprintf("[ai.run.zombie_discard] session=%s runSeq=%d run=%s guard_fenced=%t reason=stale_side_effects",
+			run.sessionID, run.runSeq, run.runID, run.guard != nil))
+	}
 	// 刻意跳过 ccPeerSessionJSONL / appendLineageMarker：那是 Claude CLI 的
 	// transcript 谱系修补，内核没有对应的 JSONL 文件。
 	if blocks := extractAgentAIOptionBlocks(assistantOutput); len(blocks) > 0 {

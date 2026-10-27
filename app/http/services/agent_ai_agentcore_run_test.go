@@ -906,3 +906,148 @@ func TestRunAgentCoreJournalsErrorEnd(t *testing.T) {
 		}
 	}
 }
+
+// TestZombieSuccessWritesAreDiscarded 锁死 Task 8 的接线本身。
+//
+// 只断言谓词（agentAIRunSideEffectsAllowed）是空转的：真正会回归的是
+// 「守卫忘了包住成功收尾段」。所以这里跑完整的一轮 run，在流式途中打上强拆
+// 标记，再检查 history / resume / journal 三处都没被僵尸污染。
+// 删掉 Task 8 加的守卫后，本用例必然变红。
+func TestZombieSuccessWritesAreDiscarded(t *testing.T) {
+	setTestAgentHome(t)
+	_, srv := newAgentCoreUpstream(t, agentCoreTextTurn("你好", "，世界"))
+	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
+	t.Setenv("ANTHROPIC_MODEL", "")
+
+	m := newAgentAIManager()
+	const sessionID = "conv-agentcore-zombie"
+	const runSeq = 7
+	registerTestAISession(t, m, &agentAISession{
+		id:      sessionID,
+		runSeq:  runSeq,
+		cancel:  func() {},
+		history: []agentAIMessage{{Role: "user", Content: "跑一半被强拆"}},
+	})
+
+	log := &agentCoreEventLog{}
+	fenced := false
+	write := func(v interface{}) error {
+		if !fenced {
+			if frame, ok := v.(map[string]interface{}); ok {
+				if typ, _ := frame["type"].(string); typ == models.AgentEventAIDelta {
+					// 强拆发生在僵尸仍在输出之后：这正是迟返回写污染的窗口。
+					m.markRunFinalized(sessionID, runSeq)
+					fenced = true
+				}
+			}
+		}
+		return log.write(v)
+	}
+
+	run := agentAIRun{
+		sessionID:   sessionID,
+		runSeq:      runSeq,
+		messageID:   "msg-zombie",
+		provider:    "agentcore",
+		model:       "glm-5.2",
+		projectPath: t.TempDir(),
+		activity:    newAgentAIActivity(),
+	}
+	m.runAgentCore(context.Background(), run, write)
+
+	if !fenced {
+		t.Fatal("用例没触发强拆标记（没收到 ai.delta），断言无效")
+	}
+
+	// 1) 历史不得追加 assistant：否则 Retry 新回合会把僵尸的产出当成自己的上文。
+	m.mu.Lock()
+	history := append([]agentAIMessage(nil), m.sessions[sessionID].history...)
+	resume := m.sessions[sessionID].resumeSessionID
+	m.mu.Unlock()
+	if len(history) != 1 {
+		t.Fatalf("history len = %d, want 1（僵尸的 assistant 输出必须被丢弃）", len(history))
+	}
+	if resume != "" {
+		t.Fatalf("resumeSessionID = %q, want 空（僵尸不得为下一回合留恢复点）", resume)
+	}
+
+	// 2) journal 不得出现 assistant 行，end 行必须如实记 error。
+	rows := readAgentCoreJournalRows(t, sessionID)
+	for _, row := range rows {
+		if role, _ := row["role"].(string); role == "assistant" {
+			t.Fatalf("journal 出现僵尸 assistant 行：%v", row)
+		}
+	}
+	last := rows[len(rows)-1]
+	if status, _ := last["status"].(string); status != "error" {
+		t.Fatalf("journal end status = %q, want error（被丢弃的回合不能记成功）", status)
+	}
+	// 3) 终态不受影响：守的是非帧副作用，不是帧流水。
+	if got := log.count(models.AgentEventAIDone); got != 1 {
+		t.Fatalf("ai.done 数量 = %d, want 1（事件 %v）", got, log.types())
+	}
+}
+
+// TestZombieSideEffectsFencedWhenGuardReplaced 锁死 guard 身份判据：
+// /clear 会把 runSeq 归零，下一回合复用同一个 runSeq，此时只比 runSeq
+// 挡不住旧回合的僵尸迟返回。
+func TestZombieSideEffectsFencedWhenGuardReplaced(t *testing.T) {
+	setTestAgentHome(t)
+	_, srv := newAgentCoreUpstream(t, agentCoreTextTurn("你好", "，世界"))
+	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
+	t.Setenv("ANTHROPIC_MODEL", "")
+
+	m := newAgentAIManager()
+	const sessionID = "conv-agentcore-reuse"
+	const runSeq = 1
+	registerTestAISession(t, m, &agentAISession{
+		id:      sessionID,
+		runSeq:  runSeq,
+		cancel:  func() {},
+		history: []agentAIMessage{{Role: "user", Content: "旧回合的提问"}},
+	})
+
+	log := &agentCoreEventLog{}
+
+	// 必须用 newAgentAIRunGuard 构造：markRunGuardDone 会对 session.guard
+	// 调 markDone()（close(g.done)），裸字面量的 nil done 会 panic。
+	currentRun := agentAIRun{sessionID: sessionID, runSeq: runSeq, activity: newAgentAIActivity(), cancel: func() {}}
+	currentGuard := newAgentAIRunGuard(m, currentRun, log.write)
+
+	run := agentAIRun{
+		sessionID:   sessionID,
+		runSeq:      runSeq,
+		messageID:   "msg-zombie",
+		provider:    "agentcore",
+		model:       "glm-5.2",
+		projectPath: t.TempDir(),
+		activity:    newAgentAIActivity(),
+	}
+	run.guard = newAgentAIRunGuard(m, run, log.write) // 僵尸自己的 guard
+
+	// 会话当前挂的是「新回合」的 guard，runSeq 却与僵尸相同（/clear 复用）。
+	m.mu.Lock()
+	m.sessions[sessionID].guard = currentGuard
+	m.mu.Unlock()
+
+	m.runAgentCore(context.Background(), run, log.write)
+
+	m.mu.Lock()
+	history := append([]agentAIMessage(nil), m.sessions[sessionID].history...)
+	resume := m.sessions[sessionID].resumeSessionID
+	m.mu.Unlock()
+	if len(history) != 1 {
+		t.Fatalf("history len = %d, want 1（guard 不同即非本回合，不得写入）", len(history))
+	}
+	if resume != "" {
+		t.Fatalf("resumeSessionID = %q, want 空", resume)
+	}
+	for _, row := range readAgentCoreJournalRows(t, sessionID) {
+		if role, _ := row["role"].(string); role == "assistant" {
+			t.Fatalf("journal 出现僵尸 assistant 行：%v", row)
+		}
+	}
+	if got := log.count(models.AgentEventAIDone); got != 1 {
+		t.Fatalf("ai.done 数量 = %d, want 1", got)
+	}
+}

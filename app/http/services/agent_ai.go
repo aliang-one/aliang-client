@@ -390,6 +390,10 @@ type agentAIRun struct {
 	cancel                 context.CancelFunc
 	approvalToken          string
 	activity               *agentAIActivity
+	// guard 是本回合的收尾守卫指针，也是跨 /clear 唯一可靠的回合身份：
+	// /clear 把 runSeq 归零后会被新回合复用，只比 runSeq 无法区分「同一个
+	// runSeq 的不同回合」。未挂载（TUI / 单测路径）时为 nil。
+	guard *agentAIRunGuard
 	// subagents 跟踪本 run 的子 agent 生命周期（claude task_* 帧 / 兜底登记 /
 	// TUI 桥的 sidechain 目录 watch）。nil 安全（codex 路径不建）。
 	subagents    *agentAISubagentRegistry
@@ -2662,8 +2666,7 @@ func (m *agentAIManager) runUserMessage(session *agentAISession, runID, messageI
 	if svc := m.approvalService(); svc != nil {
 		svc.ensurePolicyBeforeRun(ctx, session.projectPath)
 	}
-	guard := m.attachRunGuard(run, emitter.emit)
-	_ = guard
+	run.guard = m.attachRunGuard(run, emitter.emit)
 	m.startAIWatchdog(ctx, activity, cancel)
 	m.mu.Lock()
 	if current := m.sessions[run.sessionID]; current != nil && current.runSeq == run.runSeq {

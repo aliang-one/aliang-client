@@ -259,13 +259,18 @@ func (m *agentAIManager) wrapKillCancel(activity *agentAIActivity, cancel contex
 	}
 }
 
-// agentAIRunSideEffectsAllowed 是僵尸非帧副作用的 runSeq 守卫。
+// agentAIRunSideEffectsAllowed 是僵尸非帧副作用的回合归属守卫。
 //
 // 判据是**强拆时打的显式标记** finalizedRunSeq，不是 session.cancel == nil：
 // 单测/TUI 路径注册的会话本来就没有 cancel，若拿它当判据，会把合法回合的
 // history/journal/resume 写一起挡掉（既有 6 个 agentcore 用例直接变红）。
 // 未注册会话（单测/TUI 路径）返回 true，保持既有行为。
-func (m *agentAIManager) agentAIRunSideEffectsAllowed(sessionID string, runSeq int) bool {
+//
+// expectGuard 是可选的回合身份：runSeq 不是跨 /clear 的稳定身份（/clear 把它
+// 归零后会被新回合复用），只比 runSeq 时旧回合的僵尸迟返回可能撞上新回合的
+// runSeq 并通过守卫。调用方传 run.guard 后，guard 指针不同即判为非本回合。
+// 不传或传 nil 时退化为纯 runSeq 判定（单测/TUI 路径）。
+func (m *agentAIManager) agentAIRunSideEffectsAllowed(sessionID string, runSeq int, expectGuard ...*agentAIRunGuard) bool {
 	if m == nil {
 		return true
 	}
@@ -274,6 +279,9 @@ func (m *agentAIManager) agentAIRunSideEffectsAllowed(sessionID string, runSeq i
 	session := m.sessions[sessionID]
 	if session == nil {
 		return true
+	}
+	if len(expectGuard) > 0 && expectGuard[0] != nil && session.guard != expectGuard[0] {
+		return false
 	}
 	if session.runSeq != runSeq {
 		return false
