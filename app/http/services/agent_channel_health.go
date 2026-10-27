@@ -168,11 +168,36 @@ func (h *agentChannelHealth) reset() {
 
 // agentChannelAlertWriter 是告警的实际发送通道；声明为 var 便于测试替换。
 //
-// 这里必须用 init() 赋值，不能在声明处写初始化表达式：Go 的包初始化依赖分析
-// 会顺着初始化表达式引用的函数体继续追踪，而发送逻辑引用 GetSharedAgentService
-// → NewAgentService → … → agentTransferFetchInbox（包级 func var）→
-// callAgentServer → 本文件 record401，形成 initialization cycle 编译错误。
-// init() 内的赋值不参与依赖分析，这条边因此在编译期被截断。
+// 这里必须用 init() 赋值，不能在声明处写初始化表达式——写成包级 var 会直接
+// 编译失败（2026-10-27 实测，原文见下）。Go 的初始化依赖分析确实会穿过函数
+// 字面量的函数体：本变量的初始化表达式引用 GetSharedAgentService，而它的函数
+// 体链一路走回 agentTransferFetchInbox，后者是**包级 func var**，于是两个包级
+// var 互为依赖顶点，形成 initialization cycle。
+//
+//	app/http/services/agent_channel_health.go:176:5: initialization cycle for agentChannelAlertWriter
+//	    agentChannelAlertWriter refers to GetSharedAgentService
+//	    GetSharedAgentService refers to NewAgentService
+//	    NewAgentService refers to ScheduleBootReconnectFallback
+//	    ScheduleBootReconnectFallback refers to EnsureRemoteConnection
+//	    EnsureRemoteConnection refers to remoteConnectionLoop
+//	    remoteConnectionLoop refers to runRemoteAgentSession
+//	    runRemoteAgentSession refers to handleRemoteAgentMessage
+//	    handleRemoteAgentMessage refers to kickAgentTransferInbox
+//	    kickAgentTransferInbox refers to agentTransferInboxTicker
+//	    agentTransferInboxTicker refers to pullAgentTransferInbox
+//	    pullAgentTransferInbox refers to agentTransferFetchInbox
+//	    agentTransferFetchInbox refers to callAgentServer
+//	    callAgentServer refers to callAgentServerWithAuthorization
+//	    callAgentServerWithAuthorization refers to record401
+//	    record401 refers to agentChannelAlert
+//	    agentChannelAlert refers to agentChannelAlertWriter
+//
+// 环的两端是两个包级 var：agentTransferFetchInbox（agent_transfer_inbox.go:47）
+// 与 agentChannelAlertWriter（本行）。init() 内的赋值不参与依赖分析，这条边
+// 因此在编译期被截断。同一份编译输出里另有 4 个同形态的环
+// （agentTransferFetchDownloadURL / agentTransferSendConfirm /
+// agentTransferFetchParts / agentTransferFetchInbox），它们都已用同样的
+// init() 手法断开——不要试图"清理"成包级 var。
 var agentChannelAlertWriter func(map[string]interface{}) error
 
 func init() {
@@ -220,6 +245,7 @@ type agentChannelBackoffError struct {
 func (e agentChannelBackoffError) Error() string {
 	return fmt.Sprintf("agent server endpoint %s is backing off after repeated 401", e.endpoint)
 }
+
 // isAgentChannelBackoffError 报告 err 是否为「本地 401 退避窗口内没有发请求」。
 //
 // 语义定位：退避是**本地限流**，等价于「这次我们压根没发请求」，必须按瞬时
