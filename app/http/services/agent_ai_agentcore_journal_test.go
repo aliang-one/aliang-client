@@ -82,6 +82,59 @@ func TestAgentCoreJournalAppendOrderAndDedup(t *testing.T) {
 	}
 }
 
+// 写侧残行防护（审计 ③）：上一进程死在写一半 → 文件尾无换行。若 O_APPEND
+// 直接追加，新行会粘在残行尾巴上双双损坏。断言：补写封口后新行仍是完整
+// 可解析的 JSON，残行片段被隔离在单独一行（reader 侧按解析失败跳过）。
+func TestAgentCoreJournalRepairsTornTail(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, agentCoreJournalFileName("conv-torn"))
+	torn := `{"kind":"session","created_at":"2026-10-26T00:00:00Z"}` + "\n" + `{"kind":"msg","role":"assi`
+	if err := os.WriteFile(path, []byte(torn), 0o600); err != nil {
+		t.Fatalf("写残行 fixture: %v", err)
+	}
+	j := newAgentCoreJournal(dir)
+	j.appendUser("conv-torn", "msg-1", "你好", "2026-10-26T00:00:01Z")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("读 journal: %v", err)
+	}
+	// 宽松解析（模拟 reader 的半行容忍）：坏行跳过，好行必须完好。
+	var parsed []map[string]interface{}
+	for _, line := range strings.Split(string(raw), "\n") {
+		if line == "" {
+			continue
+		}
+		var row map[string]interface{}
+		if json.Unmarshal([]byte(line), &row) == nil {
+			parsed = append(parsed, row)
+		}
+	}
+	if len(parsed) != 2 || parsed[0]["kind"] != "session" {
+		t.Fatalf("可解析行 = %v, want [session, 新 user 行]", parsed)
+	}
+	newRow := parsed[len(parsed)-1]
+	if newRow["role"] != "user" || newRow["text"] != "你好" || newRow["message_id"] != "msg-1" {
+		t.Fatalf("新行被残行污染: %v", newRow)
+	}
+	// 文件尾必须是换行（下一次追加仍安全，不依赖本次修补的偶然性）。
+	if len(raw) == 0 || raw[len(raw)-1] != '\n' {
+		t.Fatalf("文件尾无换行: %q", raw)
+	}
+}
+
+// 正常路径不引入多余空行：写侧只在残行时补封口。
+func TestAgentCoreJournalNoExtraNewlinesOnHealthyTail(t *testing.T) {
+	dir := t.TempDir()
+	j := newAgentCoreJournal(dir)
+	j.ensureSessionHeader("conv-ok", "/p", "m", "2026-10-26T00:00:00Z")
+	j.appendUser("conv-ok", "msg-1", "你好", "2026-10-26T00:00:01Z")
+	j.appendEnd("conv-ok", "success", "")
+	lines := readJournalLines(t, dir, "conv-ok") // 空行会被跳过但 JSON 必须全部可解析
+	if len(lines) != 3 {
+		t.Fatalf("lines = %d, want 3: %v", len(lines), lines)
+	}
+}
+
 func TestAgentCoreJournalFileNameSanitized(t *testing.T) {
 	got := agentCoreJournalFileName(`a/b:c..d`)
 	if got != "a_b_c..d.jsonl" {
@@ -113,17 +166,20 @@ func TestAgentCoreManagerJournalSteerUserMessage(t *testing.T) {
 		MessageID: "steer-1",
 		Content:   "先停一下",
 		CreatedAt: created,
-	})
+	}, "先停一下")
 	m.journalSteerUserMessage("conv-steer", agentAISteerMessage{
 		MessageID: "steer-1",
 		Content:   "先停一下",
 		CreatedAt: created,
-	})
+	}, "先停一下")
+	// 投递内容带附件后缀/手机契约包装时，journal 仍须落用户原文（spec §5）：
+	// steer.Content 是拼接产物，不是真实用户 content。
+	delivered := wrapAgentAIPhoneContract("再看看日志\n\n[附件] log.txt")
 	m.journalSteerUserMessage("conv-steer", agentAISteerMessage{
 		MessageID: "steer-2",
-		Content:   "再看看日志",
+		Content:   delivered,
 		CreatedAt: created,
-	})
+	}, "再看看日志")
 	lines := readJournalLines(t, agentCoreJournalDir(), "conv-steer")
 	if len(lines) != 2 {
 		t.Fatalf("lines = %d, want 2（同 id 去重）: %v", len(lines), lines)
@@ -132,7 +188,7 @@ func TestAgentCoreManagerJournalSteerUserMessage(t *testing.T) {
 		t.Errorf("第一条 = %v", lines[0])
 	}
 	if lines[1]["text"] != "再看看日志" {
-		t.Errorf("第二条 = %v", lines[1])
+		t.Errorf("第二条应落原文而非投递拼接产物: %v", lines[1])
 	}
 	if lines[0]["ts"] != "2026-10-26T12:00:00Z" {
 		t.Errorf("ts = %v, want 消息自身 CreatedAt", lines[0]["ts"])

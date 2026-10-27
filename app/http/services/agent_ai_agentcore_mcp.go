@@ -29,6 +29,9 @@ const (
 	agentCoreMCPToolCap     = 128
 	agentCoreMCPInitTimeout = 10 * time.Second
 	agentCoreMCPDescCap     = 500
+	// 建连超时后等待迟到 dial 返回的宽限窗：返回的会话就地关闭（收尸），
+	// 防止孤儿 stdio 进程/连接泄漏。
+	agentCoreMCPDialDrainGrace = 2 * time.Second
 )
 
 // agentCoreMCPRawServer 是一条未脱敏的 server 配置（连接用）。
@@ -314,12 +317,56 @@ func agentCoreMCPBridgeName(serverName, toolName string, seen map[string]bool) s
 	return name
 }
 
+// agentCoreMCPDialWithTimeout 在 timeout 内完成建连握手，但把「握手是否超时」
+// 与 session ctx 解耦：ctx 本身不带 deadline，超时由 select + 定时器外部施加。
+// 原因见 agentCoreMCPServerToolDefs 的 ctx 语义注记（SSE 的 GET 长流直绑
+// ctx，deadline 到期即断）。超时路径下调用方会 cancel ctx，迟到的握手结果
+// 由 detached goroutine 收尸关闭，防孤儿 stdio 进程/连接泄漏。
+func agentCoreMCPDialWithTimeout(dial func(context.Context, agentCoreMCPRawServer) (*mcp.ClientSession, func(), error), ctx context.Context, raw agentCoreMCPRawServer, timeout time.Duration) (*mcp.ClientSession, func(), error) {
+	type dialResult struct {
+		session *mcp.ClientSession
+		closeFn func()
+		err     error
+	}
+	ch := make(chan dialResult, 1)
+	go func() {
+		session, closeFn, err := dial(ctx, raw)
+		ch <- dialResult{session: session, closeFn: closeFn, err: err}
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case r := <-ch:
+		return r.session, r.closeFn, r.err
+	case <-timer.C:
+		go func() {
+			select {
+			case r := <-ch:
+				// dial 迟到返回：会话就地关掉（关停可能慢，detached 吸收）。
+				if r.closeFn != nil {
+					r.closeFn()
+				} else if r.session != nil {
+					_ = r.session.Close()
+				}
+			case <-time.After(agentCoreMCPDialDrainGrace):
+				// 握手 goroutine 仍不返回：放弃等待，由调用方 cancel ctx 兜底。
+			}
+		}()
+		return nil, nil, fmt.Errorf("connect timeout after %s", timeout)
+	}
+}
+
 // agentCoreMCPServerToolDefs 连接全部 raw server、拉工具清单并包成桥。
 // 返回桥列表（已截 128）与统一关闭函数。单个 server 失败跳过 + Warn；
 // 全部失败返回空桥列表（run 照常，纯内置工具）。
 // 超时按 server 计（agentCoreMCPInitTimeout 各自一份）——共享预算会让排后
-// 的 server 趋零被误杀；connect ctx 只裁握手（transport 连接不绑 ctx，
-// cancel 后 session 仍可 CallTool）。
+// 的 server 趋零被误杀。
+//
+// ⚠️ 会话 ctx 只带 cancel、不带 deadline：三种传输的 ctx 语义不同——stdio 的
+// CommandTransport 不读 ctx；streamable http 建连后 xcontext.Detach；SSE 的
+// GET 长流用 NewRequestWithContext 直绑 ctx（go-sdk v1.8.0）。给 SSE 绑
+// deadline 或建连后提前 cancel，都会把已建好的连接掐断，该 server 的
+// CallTool 全失败。建连超时因此改由 agentCoreMCPDialWithTimeout 外部施加。
 func (m *agentAIManager) agentCoreMCPServerToolDefs(ctx context.Context, raws []agentCoreMCPRawServer, onCall func(tool, summary string, isErr bool)) ([]agentcore.Tool, func()) {
 	var closes []func()
 	bridges := make([]agentcore.Tool, 0, agentCoreMCPToolCap)
@@ -350,27 +397,31 @@ func (m *agentAIManager) agentCoreMCPServerToolDefs(ctx context.Context, raws []
 			logger.Warn(fmt.Sprintf("agentcore-mcp: server 跳过 server=%s reason=headers 暂不支持（v1 限制）", sanitizeAgentCoreMCPSegment(raw.Name)))
 			continue
 		}
-		sctx, cancel := context.WithTimeout(ctx, agentCoreMCPInitTimeout)
+		sctx, cancel := context.WithCancel(ctx)
 		// 测试注入优先：内存 session 替真 dial（忽略 raw）；nil 走真实路径。
 		dial := agentCoreMCPDial
 		if m != nil && m.coreMCPDialForTest != nil {
 			dial = m.coreMCPDialForTest
 		}
-		session, closeFn, err := dial(sctx, raw)
+		session, closeFn, err := agentCoreMCPDialWithTimeout(dial, sctx, raw, agentCoreMCPInitTimeout)
 		if err != nil {
 			fail(raw.Name, err)
 			cancel()
 			continue
 		}
-		closes = append(closes, closeFn)
-		tools, err := listAgentCoreMCPTools(sctx, session)
+		closes = append(closes, func() { closeFn(); cancel() })
+		// ListTools 用独立短 ctx：只裁这一次 RPC（SSE 的请求走独立 POST，
+		// 取消它不影响 GET 长流），不触碰会话 ctx。
+		lctx, lcancel := context.WithTimeout(ctx, agentCoreMCPInitTimeout)
+		tools, err := listAgentCoreMCPTools(lctx, session)
+		lcancel()
 		if err != nil {
 			fail(raw.Name, err)
-			cancel()
 			continue
 		}
 		connected++
-		cancel() // 该 server 处理完（成功路径）；session 交给 closeAll 关
+		// 成功路径不 cancel：session 生命周期交给 closeAll（closeFn 内一并
+		// cancel，见上）。
 		for _, tool := range tools {
 			if len(bridges) >= agentCoreMCPToolCap {
 				logger.Warn(fmt.Sprintf("agentcore-mcp: 工具超上限截断 cap=%d", agentCoreMCPToolCap))

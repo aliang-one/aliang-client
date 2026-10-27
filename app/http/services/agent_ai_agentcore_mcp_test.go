@@ -295,6 +295,75 @@ func TestAgentCoreMCPServerToolDefsHTTPDial(t *testing.T) {
 	}
 }
 
+// 回归（审计 ①）：SSE 传输的 GET 长流绑在建连 ctx 上（go-sdk v1.8.0 用
+// NewRequestWithContext 建 GET 并在其退出时关传输）。旧实现 WithTimeout(10s)
+// 且枚举完工具立即 cancel，等于把刚建好的 SSE 连接掐死。此处钉死三条：
+// 枚举后会话 ctx 未取消、无 deadline、closeAll 后必须被 cancel（防泄漏）。
+func TestAgentCoreMCPServerToolDefsSessionContextLifetime(t *testing.T) {
+	session := startTestMCPSession(t, "lookup", func(map[string]interface{}) (string, bool) { return "ok", false })
+	m := &agentAIManager{}
+	var sessionCtx context.Context
+	var closeFnCalls int32
+	m.coreMCPDialForTest = func(ctx context.Context, _ agentCoreMCPRawServer) (*mcp.ClientSession, func(), error) {
+		sessionCtx = ctx
+		return session, func() { atomic.AddInt32(&closeFnCalls, 1) }, nil
+	}
+	bridges, closeAll := m.agentCoreMCPServerToolDefs(context.Background(), []agentCoreMCPRawServer{
+		{Name: "sse-like", Type: "sse", URL: "https://mcp.example.com/sse"},
+	}, nil)
+	if len(bridges) != 1 {
+		t.Fatalf("应产出 1 桥: %+v", bridges)
+	}
+	if sessionCtx == nil {
+		t.Fatal("dial 未被调用")
+	}
+	if err := sessionCtx.Err(); err != nil {
+		t.Fatalf("枚举完成后会话 ctx 不得取消（SSE 长流会被掐断）: %v", err)
+	}
+	if _, ok := sessionCtx.Deadline(); ok {
+		t.Fatal("会话 ctx 不得带 deadline（SSE 长流到期即断）")
+	}
+	closeAll()
+	if err := sessionCtx.Err(); err != context.Canceled {
+		t.Fatalf("closeAll 后会话 ctx 应被 cancel，got %v", err)
+	}
+	if atomic.LoadInt32(&closeFnCalls) != 1 {
+		t.Fatalf("closeFn 调用次数 = %d, want 1", closeFnCalls)
+	}
+}
+
+// agentCoreMCPDialWithTimeout 的超时路径：握手不绑会话 ctx deadline，超时由
+// 定时器外部施加；迟到返回的会话必须被收尸关闭（防孤儿进程/连接）。
+func TestAgentCoreMCPDialWithTimeoutDrainsLateSession(t *testing.T) {
+	var drained int32
+	dial := func(ctx context.Context, _ agentCoreMCPRawServer) (*mcp.ClientSession, func(), error) {
+		<-ctx.Done()
+		return nil, func() { atomic.AddInt32(&drained, 1) }, ctx.Err()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	started := time.Now()
+	session, closeFn, err := agentCoreMCPDialWithTimeout(dial, ctx, agentCoreMCPRawServer{Name: "slow"}, 50*time.Millisecond)
+	if session != nil || closeFn != nil || err == nil {
+		t.Fatalf("超时应返回 (nil, nil, err)，got session=%v closeFn!=nil=%v err=%v", session, closeFn != nil, err)
+	}
+	if !strings.Contains(err.Error(), "connect timeout") {
+		t.Fatalf("错误文案应含 connect timeout: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("超时未按 50ms 生效: %s", elapsed)
+	}
+	// 调用方超时后会 cancel ctx——握手 goroutine 随即返回，收尸路径关闭会话。
+	cancel()
+	deadline := time.Now().Add(agentCoreMCPDialDrainGrace + time.Second)
+	for time.Now().Before(deadline) && atomic.LoadInt32(&drained) == 0 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if atomic.LoadInt32(&drained) != 1 {
+		t.Fatalf("迟到返回的 closeFn 未被收尸调用（泄漏）")
+	}
+}
+
 func TestAgentCoreMCPServerToolDefsToolCap(t *testing.T) {
 	names := make([]string, 130)
 	for i := range names {

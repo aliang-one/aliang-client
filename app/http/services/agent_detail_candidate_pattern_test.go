@@ -56,3 +56,41 @@ func TestCandidateAgentVibeSessionFilesMatchesCodexRolloutNames(t *testing.T) {
 		t.Fatalf("candidates wrongly include unrelated rollout %q: %v", otherRollout, candidates)
 	}
 }
+
+// 枚举根测试锁（审计 ③）：agentcore journal 读侧（详情候选 + 全量列举）的
+// 扫描根必须与写侧 agentCoreJournalDir() 是同一目录。fixture 用写侧的目录
+// 函数取路径——agent_detail.go 里一旦把根改回/改错字面量，两个枚举入口都
+// 找不到文件，本测试即失败。
+func TestAgentVibeSessionEnumerationIncludesAgentCoreJournalRoot(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+
+	root := agentCoreJournalDir()
+	if root == "" {
+		t.Fatal("agentCoreJournalDir() 为空，无法定位 journal 根")
+	}
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatalf("mkdir journal root: %v", err)
+	}
+	sessionID := "sess-abc"
+	journalFile := filepath.Join(root, agentCoreJournalFileName(sessionID))
+	if err := os.WriteFile(journalFile, []byte(`{"kind":"session"}`+"\n"), 0o600); err != nil {
+		t.Fatalf("write journal fixture: %v", err)
+	}
+
+	listContains := func(list []string, target string) bool {
+		for _, item := range list {
+			if item == target {
+				return true
+			}
+		}
+		return false
+	}
+	if candidates := candidateAgentVibeSessionFiles(sessionID); !listContains(candidates, journalFile) {
+		t.Fatalf("详情候选未覆盖 journal 根: want %q in %v", journalFile, candidates)
+	}
+	if all := allAgentVibeSessionDetailFiles(); !listContains(all, journalFile) {
+		t.Fatalf("全量列举未覆盖 journal 根: want %q in %v", journalFile, all)
+	}
+}

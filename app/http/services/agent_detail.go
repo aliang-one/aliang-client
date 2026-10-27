@@ -263,8 +263,11 @@ func candidateAgentVibeSessionFiles(sourceSessionID string) []string {
 		out = append(out, findRecentAgentFiles(root, pattern, agentVibeDetailCandidateFileLimit)...)
 	}
 	out = append(out, findRecentAgentFiles(filepath.Join(home, ".claude", "projects"), pattern, agentVibeDetailCandidateFileLimit)...)
-	// 路径单一来源是 agentCoreJournalDir(),字面量改动会被 e2e 测试拦截。
-	out = append(out, findRecentAgentFiles(filepath.Join(home, ".aliang", "ai-sessions"), pattern, agentVibeDetailCandidateFileLimit)...)
+	// agentcore journal 根路径单一来源是 agentCoreJournalDir()：写侧（journal）
+	// 与读侧（详情/列举扫描）必须是同一目录，字面量漂移由枚举根测试拦截。
+	if dir := agentCoreJournalDir(); dir != "" {
+		out = append(out, findRecentAgentFiles(dir, pattern, agentVibeDetailCandidateFileLimit)...)
+	}
 	return out
 }
 
@@ -278,8 +281,10 @@ func allAgentVibeSessionDetailFiles() []string {
 		findRecentAgentFiles(filepath.Join(home, ".codex", "archived_sessions"), "*.jsonl", 100)...,
 	)
 	files = append(files, findRecentAgentFiles(filepath.Join(home, ".claude", "projects"), "*.jsonl", 100)...)
-	// 路径单一来源是 agentCoreJournalDir(),字面量改动会被 e2e 测试拦截。
-	files = append(files, findRecentAgentFiles(filepath.Join(home, ".aliang", "ai-sessions"), "*.jsonl", 100)...)
+	// 同上：agentcore journal 根只认 agentCoreJournalDir()。
+	if dir := agentCoreJournalDir(); dir != "" {
+		files = append(files, findRecentAgentFiles(dir, "*.jsonl", 100)...)
+	}
 	return files
 }
 

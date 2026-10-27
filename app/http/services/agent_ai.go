@@ -2198,7 +2198,9 @@ func (m *agentAIManager) steer(msg map[string]interface{}, writeJSON agentTermin
 		result, err = coreControl.deliver(steer)
 		if err == nil {
 			// agentcore 专属：插话投递成功才留痕（deliver 失败时消息没进内核）。
-			m.journalSteerUserMessage(sessionID, steer)
+			// 落 content（原文）而非 steer.Content——后者此时已拼上附件后缀与
+			// 手机契约包装，journal 按 spec §5 只存真实用户 content。
+			m.journalSteerUserMessage(sessionID, steer, content)
 		}
 	}
 	if err != nil {
@@ -3718,11 +3720,14 @@ func (m *agentAIManager) lastUserHistoryMessage(sessionID string) (agentAIMessag
 }
 
 // journalSteerUserMessage 把一条运行中插话落成 journal 的 user 行。
+// content 必须是用户原话：steer.Content 在投递前会被拼上附件后缀与手机契约
+// 包装（见 ai.steer 投递分支），journal 按 spec §5 取真实用户 content，与
+// session.history 的 user 行同口径。
 // steer 可能先于 run 的任何写入到达（目录/文件都还没有）——appendLineLocked
 // 内部有目录懒创建，这里只管追加。steer 先建的文件无头行：ProjectPath/Model
 // 留空是该会话的既定降级（reader ID 兜底取文件名），不要试图补写头行
 // （ensureSessionHeader 见文件存在即跳过，永远轮不到补）。
-func (m *agentAIManager) journalSteerUserMessage(sessionID string, msg agentAISteerMessage) {
+func (m *agentAIManager) journalSteerUserMessage(sessionID string, msg agentAISteerMessage, content string) {
 	if m == nil || m.coreJournal == nil {
 		return
 	}
@@ -3730,7 +3735,7 @@ func (m *agentAIManager) journalSteerUserMessage(sessionID string, msg agentAISt
 	if !msg.CreatedAt.IsZero() {
 		ts = msg.CreatedAt.UTC().Format(time.RFC3339)
 	}
-	m.coreJournal.appendUser(sessionID, msg.MessageID, msg.Content, ts)
+	m.coreJournal.appendUser(sessionID, msg.MessageID, content, ts)
 }
 
 // setAgentAIResumeSessionIDIfEmpty pins a CLI-assigned session id so the NEXT

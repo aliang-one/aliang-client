@@ -196,12 +196,27 @@ func (j *agentCoreJournal) appendLineLocked(sessionID string, row map[string]int
 		return false
 	}
 	path := filepath.Join(j.dir, agentCoreJournalFileName(sessionID))
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	// O_RDWR（不是 O_WRONLY）：下面的半行探测要 ReadAt 读尾字节，Linux 上
+	// O_WRONLY 的 ReadAt 返回 EBADF。O_APPEND 保证 Write 总是落到 EOF。
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		logger.Warn(fmt.Sprintf("agentcore-journal: open failed session=%s err=%v", sessionID, err))
 		return false
 	}
 	defer f.Close()
+	// 残行容忍（写侧）：上一进程可能死在写一半，文件尾没有换行。O_APPEND
+	// 直接追加会让新行粘在残行尾巴上、两条一起坏掉（reader 侧双双跳过）。
+	// 读尾字节探测，残行先补一个换行封口；残行本身不可修复，交给 reader
+	// 按「解析失败跳过」降级。
+	if fi, statErr := f.Stat(); statErr == nil && fi.Size() > 0 {
+		var tail [1]byte
+		if _, rdErr := f.ReadAt(tail[:], fi.Size()-1); rdErr == nil && tail[0] != '\n' {
+			if _, wErr := f.Write([]byte{'\n'}); wErr != nil {
+				logger.Warn(fmt.Sprintf("agentcore-journal: repair torn tail failed session=%s err=%v", sessionID, wErr))
+				return false
+			}
+		}
+	}
 	if _, err := f.Write(line); err != nil {
 		logger.Warn(fmt.Sprintf("agentcore-journal: append failed session=%s err=%v", sessionID, err))
 		return false
