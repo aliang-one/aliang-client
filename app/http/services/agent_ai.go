@@ -248,6 +248,33 @@ func agentChildProcessEnvValue(key string) (string, bool) {
 	return "", false
 }
 
+// agentAIContextWindowMin/Max bound the auto-compact window the phone may set.
+// The claude CLI accepts 100k–1M for `--autocompact`, and the server enforces
+// the same range (AliangPhoneServer server/src/modelConfig.ts), so an
+// out-of-range value can only come from a stale/misbehaving client. Clamp
+// instead of failing the turn.
+const (
+	agentAIContextWindowMin     = 100_000
+	agentAIContextWindowMax     = 1_000_000
+	agentAIContextWindowDefault = 200_000
+)
+
+// clampAgentAIContextWindow normalizes a client-supplied context window.
+// 0/negative means "unset" and is preserved so callers can tell "older server
+// sent nothing" (CLI default) apart from an explicit choice.
+func clampAgentAIContextWindow(v int) int {
+	if v <= 0 {
+		return 0
+	}
+	if v < agentAIContextWindowMin {
+		return agentAIContextWindowMin
+	}
+	if v > agentAIContextWindowMax {
+		return agentAIContextWindowMax
+	}
+	return v
+}
+
 type agentAISession struct {
 	id          string
 	mode        string
@@ -258,7 +285,13 @@ type agentAISession struct {
 	// none/minimal/low/medium/high/xhigh; claude: none/low/medium/high/max).
 	// Applied to the codex CLI as a `<base>-<effort>` model-name suffix that the
 	// downstream gateway derives reasoning effort from. Empty = no override.
-	effort                  string
+	effort string
+	// contextWindow is the model context size (tokens) chosen on the phone.
+	// For claude it is passed to the CLI as `--autocompact <tokens>` so the
+	// auto-compaction trigger matches the real window instead of whatever the
+	// model name implies; for agentcore it drives the kernel's own compaction
+	// threshold. 0 = unset (older server) → CLI/kernel defaults.
+	contextWindow           int
 	resumeSessionID         string
 	reservedNativeSessionID string
 	bindingVersion          int
@@ -362,13 +395,16 @@ type agentAIRun struct {
 	// — matching what the server rebuilds from the native session log on
 	// refresh. Empty when not yet captured; streamingMessageID falls back to
 	// the run-derived id.
-	providerMsgID           string
-	runSeq                  int
-	mode                    string
-	projectPath             string
-	provider                string
-	model                   string
-	effort                  string
+	providerMsgID string
+	runSeq        int
+	mode          string
+	projectPath   string
+	provider      string
+	model         string
+	effort        string
+	// contextWindow mirrors the session field for this run (claude:
+	// --autocompact tokens; agentcore: kernel compaction budget).
+	contextWindow           int
 	resumeSessionID         string
 	reservedNativeSessionID string
 	bindingVersion          int
@@ -1450,6 +1486,7 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 	}
 	model := strings.TrimSpace(remoteString(msg, "model"))
 	effort := strings.TrimSpace(remoteString(msg, "effort"))
+	contextWindow := clampAgentAIContextWindow(remoteInt(msg, "context_window", 0))
 	resumeSessionID := firstNonEmpty(remoteString(msg, "resume_session_id"), remoteString(msg, "source_session_id"))
 	reservedNativeSessionID := strings.TrimSpace(remoteString(msg, "reserved_native_session_id"))
 	bindingVersion := remoteInt(msg, "binding_version", 0)
@@ -1474,6 +1511,9 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 		existing.provider = provider
 		existing.model = model
 		existing.effort = effort
+		if contextWindow > 0 {
+			existing.contextWindow = contextWindow
+		}
 		existing.resumeSessionID = resumeSessionID
 		existing.reservedNativeSessionID = reservedNativeSessionID
 		existing.bindingVersion = bindingVersion
@@ -1487,7 +1527,7 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 			existing.claudeCaps = agentAIClaudeCapabilities{}
 		}
 		if len(history) > 0 {
-			existing.history = trimAgentAIHistory(history)
+			existing.history = trimAgentAIHistoryForSession(existing, history)
 		}
 		m.mu.Unlock()
 		_ = writeJSON(agentAISessionCreatedPayload(existing))
@@ -1497,6 +1537,7 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 	// path (see message()) registers the session unconditionally — so a cap only
 	// in create() was a dead check that emitted a misleading "limit reached"
 	// error while the conversation still ran. Bound via eviction, not a gate.
+	newHistoryMessages, newHistoryChars := agentAIHistoryLimits(provider, contextWindow)
 	session := &agentAISession{
 		id:                      sessionID,
 		mode:                    mode,
@@ -1504,6 +1545,7 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 		provider:                provider,
 		model:                   model,
 		effort:                  effort,
+		contextWindow:           contextWindow,
 		resumeSessionID:         resumeSessionID,
 		reservedNativeSessionID: reservedNativeSessionID,
 		bindingVersion:          bindingVersion,
@@ -1511,7 +1553,7 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 		isGoalFork:              isGoalFork,
 		surface:                 surface,
 		claudePolicy:            cloneAgentAIClaudeRemotePolicy(claudePolicy),
-		history:                 trimAgentAIHistory(history),
+		history:                 trimAgentAIHistoryWithLimits(history, newHistoryMessages, newHistoryChars),
 		lastActiveAt:            time.Now().UTC(),
 	}
 	m.registerAISessionLocked(session)
@@ -1638,6 +1680,8 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 				CreatedAt: time.Now().UTC(),
 			}}, lazyHistory...)
 		}
+		lazyContextWindow := clampAgentAIContextWindow(remoteInt(msg, "context_window", 0))
+		lazyHistoryMessages, lazyHistoryChars := agentAIHistoryLimits(lazyProvider, lazyContextWindow)
 		session = &agentAISession{
 			id:                      sessionID,
 			mode:                    lazyMode,
@@ -1645,6 +1689,7 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 			provider:                lazyProvider,
 			model:                   strings.TrimSpace(remoteString(msg, "model")),
 			effort:                  strings.TrimSpace(remoteString(msg, "effort")),
+			contextWindow:           lazyContextWindow,
 			resumeSessionID:         firstNonEmpty(remoteString(msg, "resume_session_id"), remoteString(msg, "source_session_id")),
 			reservedNativeSessionID: strings.TrimSpace(remoteString(msg, "reserved_native_session_id")),
 			bindingVersion:          remoteInt(msg, "binding_version", 0),
@@ -1652,7 +1697,7 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 			initialContext:          lazyInitialContext,
 			isGoalFork:              lazyIsGoalFork,
 			surface:                 normalizeAgentAISurface(remoteString(msg, "surface")),
-			history:                 trimAgentAIHistory(lazyHistory),
+			history:                 trimAgentAIHistoryWithLimits(lazyHistory, lazyHistoryMessages, lazyHistoryChars),
 			lastActiveAt:            time.Now().UTC(),
 		}
 		m.mu.Lock()
@@ -1670,6 +1715,9 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 	}
 	if surface := normalizeAgentAISurface(remoteString(msg, "surface")); surface != "" {
 		session.surface = surface
+	}
+	if cw := clampAgentAIContextWindow(remoteInt(msg, "context_window", 0)); cw > 0 {
+		session.contextWindow = cw
 	}
 	session.lastActiveAt = time.Now().UTC() // LRU recency: this conversation is active
 	if session.cancel != nil {
@@ -1778,6 +1826,9 @@ func (m *agentAIManager) runStart(msg map[string]interface{}, writeJSON agentTer
 		session.provider = firstNonEmpty(remoteString(msg, "provider"), remoteString(msg, "tool"), session.provider)
 		session.model = strings.TrimSpace(remoteString(msg, "model"))
 		session.effort = strings.TrimSpace(remoteString(msg, "effort"))
+		if cw := clampAgentAIContextWindow(remoteInt(msg, "context_window", 0)); cw > 0 {
+			session.contextWindow = cw
+		}
 		session.resumeSessionID = resumeID
 		session.reservedNativeSessionID = reservedID
 		session.bindingVersion = remoteInt(msg, "binding_version", session.bindingVersion)
@@ -1838,9 +1889,29 @@ func (m *agentAIManager) handleLocalSlashCommand(session *agentAISession, messag
 	if _, isLocal := localSlashBuiltins[name]; !isLocal {
 		return false // prompt-style (/review, custom .claude/commands) or unknown → normal turn
 	}
-	if name == "compact" && provider == "codex" {
-		m.handleCodexCompactCommand(session, messageID, writeJSON)
-		return true
+	if name == "compact" {
+		switch provider {
+		case "codex":
+			m.handleCodexCompactCommand(session, messageID, writeJSON)
+			return true
+		case "agentcore":
+			m.handleAgentCoreCompactCommand(session, messageID, writeJSON)
+			return true
+		case "claude", "claudecode":
+			m.mu.Lock()
+			resumeID := strings.TrimSpace(session.resumeSessionID)
+			m.mu.Unlock()
+			if resumeID == "" {
+				m.replyLocalSlashCommand(session, messageID, provider, writeJSON,
+					"当前还没有可压缩的原生上下文。先对话几轮，再发送 /compact。")
+				return true
+			}
+			// Claude Code 的 headless CLI 自己实现了 /compact（带 --resume 时
+			// 压缩原生会话并接着用压缩后的上下文）。这里不能本地应答，必须让
+			// 命令原样落成一个模型回合——runUserMessage 识别该形态后跳过手机
+			// 契约包装与 TUI 路由，否则命令文本会变成普通用户消息。
+			return false
+		}
 	}
 
 	assistantID := agentAssistantMessageID(messageID)
@@ -1869,6 +1940,36 @@ func (m *agentAIManager) handleLocalSlashCommand(session *agentAISession, messag
 		"message_id": assistantID,
 	})
 	return true
+}
+
+// replyLocalSlashCommand settles a slash command with a single local status
+// line (run.started → ai.delta → ai.done) without spawning a model turn.
+func (m *agentAIManager) replyLocalSlashCommand(session *agentAISession, messageID, provider string, writeJSON agentTerminalWriter, line string) {
+	if writeJSON == nil {
+		return
+	}
+	assistantID := agentAssistantMessageID(messageID)
+	_ = writeJSON(map[string]interface{}{
+		"type":         models.AgentEventAIRunStarted,
+		"session_id":   session.id,
+		"message_id":   assistantID,
+		"provider":     provider,
+		"mode":         session.mode,
+		"project_path": session.projectPath,
+		"state":        "running",
+	})
+	_ = writeJSON(map[string]interface{}{
+		"type":       models.AgentEventAIDelta,
+		"session_id": session.id,
+		"message_id": assistantID,
+		"channel":    "stdout",
+		"delta":      line + "\n",
+	})
+	_ = writeJSON(map[string]interface{}{
+		"type":       models.AgentEventAIDone,
+		"session_id": session.id,
+		"message_id": assistantID,
+	})
 }
 
 // applyLocalSlashCommand performs the side effect (if any) for a local slash
@@ -1902,15 +2003,38 @@ func (m *agentAIManager) applyLocalSlashCommand(session *agentAISession, name, a
 		}
 		return fmt.Sprintf("当前模型: %s。请在手机会话工具中切换。", cur)
 	case "help":
-		return "本机命令(remote=local): /clear  /model  /help  /cost  /compact\n注: 模型切换请使用手机会话设置；/compact 在 headless 模式不支持真实压缩。"
+		return "本机命令(remote=local): /clear  /model  /help  /cost  /compact\n注: 模型切换请使用手机会话设置；/compact 会对已连接的 Claude/Codex/内置内核执行真实压缩。"
 	case "cost":
 		// Per-turn usage is emitted as ai.usage but not accumulated on the
 		// session, so there is no running total to report here.
 		return "⚠ headless agent 未累计会话用量。请在桌面端查看 token / 费用统计。"
 	case "compact":
-		return fmt.Sprintf("⚠ /compact 暂不支持 %s 的 headless 模式。建议用 /clear 开启新会话。", agentAIProviderDisplayName(provider))
+		return fmt.Sprintf("⚠ 无法确定 %s 的原生会话类型，/compact 未执行。请先在会话设置里固定 provider。", agentAIProviderDisplayName(provider))
 	}
 	return ""
+}
+
+// agentAINativeCompactTurn reports whether this turn is a raw /compact passed
+// through to the Claude CLI instead of being answered locally.
+//
+// Claude Code's headless binary implements /compact itself: with --resume it
+// summarizes the native session and continues from the compacted context.
+// Agent-side wrapping (prompt builder, phone contract, history append) would
+// turn the command text into an ordinary user message and the CLI would never
+// see the slash command, so this turn runs bare. Only claude/claudecode
+// qualify — codex has its own compact path, and agentcore compaction is managed
+// by the kernel.
+func agentAINativeCompactTurn(content, provider, resumeSessionID string) bool {
+	if strings.TrimSpace(resumeSessionID) == "" {
+		return false
+	}
+	switch provider {
+	case "claude", "claudecode":
+	default:
+		return false
+	}
+	name, _, ok := parseLocalSlashCommand(content)
+	return ok && name == "compact"
 }
 
 func agentAIProviderDisplayName(provider string) string {
@@ -2461,23 +2585,32 @@ func (m *agentAIManager) runUserMessage(session *agentAISession, runID, messageI
 	session.goalAllowedCommands = emitter.goalAllowedCommands
 	resumeSessionID := strings.TrimSpace(session.resumeSessionID)
 	reservedNativeSessionID := strings.TrimSpace(session.reservedNativeSessionID)
+	// A raw /compact for claude must reach the CLI unchanged: the local command
+	// is the compaction trigger, and any agent-side wrapping turns it into an
+	// ordinary user message (the CLI then answers text instead of compacting).
+	nativeCompact := agentAINativeCompactTurn(content, provider, resumeSessionID)
 	logger.Info(fmt.Sprintf("ai.run: session=%s runSeq=%d resumeSessionID=%q (empty=fresh claude run this turn; non-empty=--resume)", session.id, session.runSeq, resumeSessionID))
-	session.history = append(session.history, agentAIMessage{
-		Role:      "user",
-		MessageID: messageID,
-		Content:   content,
-		CreatedAt: now,
-	})
-	freshPrompt := buildAgentAIPrompt(session, content)
+	if !nativeCompact {
+		session.history = append(session.history, agentAIMessage{
+			Role:      "user",
+			MessageID: messageID,
+			Content:   content,
+			CreatedAt: now,
+		})
+	}
+	freshPrompt := content
+	if !nativeCompact {
+		freshPrompt = buildAgentAIPrompt(session, content)
+	}
 	phoneSurface := session.surface == agentAISurfacePhone
-	if phoneSurface {
+	if phoneSurface && !nativeCompact {
 		// 手机驱动回合:行为契约随首条用户内容进上下文(幂等,见 wrap 实现)。
 		freshPrompt = wrapAgentAIPhoneContract(freshPrompt)
 	}
 	prompt := freshPrompt
 	if resumeSessionID != "" {
 		prompt = content
-		if phoneSurface {
+		if phoneSurface && !nativeCompact {
 			prompt = wrapAgentAIPhoneContract(content)
 		}
 	}
@@ -2491,6 +2624,7 @@ func (m *agentAIManager) runUserMessage(session *agentAISession, runID, messageI
 		provider:                provider,
 		model:                   session.model,
 		effort:                  session.effort,
+		contextWindow:           session.contextWindow,
 		resumeSessionID:         resumeSessionID,
 		reservedNativeSessionID: reservedNativeSessionID,
 		bindingVersion:          session.bindingVersion,
@@ -2536,7 +2670,7 @@ func (m *agentAIManager) runUserMessage(session *agentAISession, runID, messageI
 		ReadOnly:        run.readOnly,
 		HasGoalIdentity: len(run.goalIdentity) > 0,
 		JSONLPath:       ccPeerSessionJSONL(externalTUIHome(), run.resumeSessionID),
-	}); plan != nil {
+	}); plan != nil && !nativeCompact {
 		// 释放 spawn 路径预建的 ctx（执行器自建 runCtx，不再用这个）。
 		cancel()
 		// 传原始 content 而非 run.prompt（后者被 buildAgentAIPrompt 包装过）；
@@ -2630,6 +2764,9 @@ func agentAISessionCreatedPayload(session *agentAISession) map[string]interface{
 	}
 	if session.resumeSessionID != "" {
 		payload["resume_session_id"] = session.resumeSessionID
+	}
+	if session.contextWindow > 0 {
+		payload["context_window"] = session.contextWindow
 	}
 	return payload
 }
@@ -3653,7 +3790,7 @@ func (m *agentAIManager) clearRunning(sessionID string, runSeq int, writeJSON ag
 		session.coreSteer = nil
 		session.activeRunID = ""
 		session.goalIdentity = nil
-		session.history = trimAgentAIHistory(session.history)
+		session.history = trimAgentAIHistoryForSession(session, session.history)
 	}
 	cancelled := m.clearPendingApprovalsLocked(sessionID, runSeq, models.AgentAIApprovalDecisionCancel)
 	m.mu.Unlock()
@@ -3699,7 +3836,7 @@ func (m *agentAIManager) appendAssistantHistory(sessionID string, runSeq int, me
 		Content:   output,
 		CreatedAt: time.Now().UTC(),
 	})
-	session.history = trimAgentAIHistory(session.history)
+	session.history = trimAgentAIHistoryForSession(session, session.history)
 }
 
 // lastUserHistoryMessage 返回会话 history 里最后一条 user 消息（m.mu 内读取）。
@@ -5639,6 +5776,11 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 		}
 	}
 
+	// 上下文窗口钉死放到最后：前面任何一次 tool 重解析(capability 去档)都会
+	// 换出新的 args 副本，提前挂的话可能被覆盖掉。手机没选窗口时不加参数，
+	// 保持 CLI 自己的默认行为。
+	tool = withClaudeAutoCompact(tool, run.contextWindow)
+
 	cmd := newBackgroundCommandContext(ctx, tool.path, tool.args...)
 	cmd.Dir = run.projectPath
 	cmd.Env = agentChildProcessEnv()
@@ -6574,11 +6716,50 @@ func extractClaudeStreamTexts(event map[string]interface{}) aiStreamTexts {
 			return out
 		}
 		if text := remoteString(event, "result"); text != "" {
-			out.finalText = text
-			out.isResult = true
+			// 斜杠命令（/compact 等）的 headless 结果会被 CLI 包在
+			// <local-command-stdout> 等标记里；标记不是给用户看的内容。
+			if cleaned := stripLocalCommandMarkup(text); cleaned != "" {
+				out.finalText = cleaned
+				out.isResult = true
+			}
 		}
 	}
 	return out
+}
+
+// stripLocalCommandMarkup 去掉 CLI 斜杠命令输出的成对标记，保留其中的正文。
+//
+// headless 下 /compact 之类命令的结果会被包成
+// <local-command-stdout>…</local-command-stdout>；<local-command-caveat> 块
+// 是给模型的提示语，整体丢弃。标记缺失/未闭合时按容错处理，不吞正文。
+func stripLocalCommandMarkup(text string) string {
+	text = stripLocalCommandTag(text, "<local-command-caveat>", "</local-command-caveat>", true)
+	text = stripLocalCommandTag(text, "<local-command-stdout>", "</local-command-stdout>", false)
+	text = stripLocalCommandTag(text, "<local-command-stderr>", "</local-command-stderr>", false)
+	return strings.TrimSpace(text)
+}
+
+func stripLocalCommandTag(text, open, close string, dropInner bool) string {
+	var b strings.Builder
+	rest := text
+	for {
+		i := strings.Index(rest, open)
+		if i < 0 {
+			b.WriteString(rest)
+			return b.String()
+		}
+		j := strings.Index(rest[i+len(open):], close)
+		b.WriteString(rest[:i])
+		if j < 0 {
+			b.WriteString(rest[i+len(open):])
+			return b.String()
+		}
+		j += i + len(open)
+		if !dropInner {
+			b.WriteString(rest[i+len(open) : j])
+		}
+		rest = rest[j+len(close):]
+	}
 }
 
 // claudeResultError reports whether a Claude stream-json "result" event is a
@@ -6997,6 +7178,18 @@ func emitClaudeStructuredEvents(format agentAIOutputFormat, event map[string]int
 	}
 
 	switch remoteString(event, "type") {
+	case "system":
+		// 上下文压缩完成帧：CLI 的 /compact 与自动压缩都会发这一帧。把结果翻译
+		// 成一行可见提示，否则手机端 /compact 会安静地「什么都没发生」。
+		if notice := claudeCompactNotice(event); notice != "" {
+			_ = writeJSON(map[string]interface{}{
+				"type":       models.AgentEventAIDelta,
+				"session_id": run.sessionID,
+				"message_id": msgID,
+				"channel":    "stdout",
+				"delta":      notice,
+			})
+		}
 	case "assistant":
 		message := mapIf(event["message"])
 		if message == nil {
@@ -7020,6 +7213,60 @@ func emitClaudeStructuredEvents(format agentAIOutputFormat, event map[string]int
 		for _, ev := range claudeToolResultEvents(content, run, pending) {
 			_ = writeJSON(ev)
 		}
+	}
+}
+
+// claudeCompactNotice 把 CLI 的 system/compact_boundary 帧翻译成一行可见提示。
+//
+// 帧形状（2.1.x 实测 + CLI 源码常量）：type=system、subtype=compact_boundary、
+// compact_metadata={trigger:"manual"|"auto", pre_tokens, post_tokens}。注意
+// pre/post_tokens 在不同版本里既可能是 JSON 数字也可能是字符串，两种都认。
+// 非压缩帧返回空串。
+func claudeCompactNotice(event map[string]interface{}) string {
+	if remoteString(event, "type") != "system" || remoteString(event, "subtype") != "compact_boundary" {
+		return ""
+	}
+	meta := mapIf(event["compact_metadata"])
+	if meta == nil {
+		meta = mapIf(event["compactMetadata"])
+	}
+	trigger := remoteString(meta, "trigger")
+	pre := claudeCompactTokenValue(meta["pre_tokens"])
+	if pre <= 0 {
+		pre = claudeCompactTokenValue(meta["preTokens"])
+	}
+	post := claudeCompactTokenValue(meta["post_tokens"])
+	if post <= 0 {
+		post = claudeCompactTokenValue(meta["postTokens"])
+	}
+	switch {
+	case pre > 0 && post > 0:
+		return fmt.Sprintf("✓ 上下文已压缩：约 %s → %s tokens。\n",
+			agentAITokenCountLabel(pre), agentAITokenCountLabel(post))
+	case pre > 0:
+		return fmt.Sprintf("✓ 上下文已压缩（压缩前约 %s tokens）。\n", agentAITokenCountLabel(pre))
+	case trigger == "auto":
+		return "✓ 上下文已自动压缩。\n"
+	default:
+		return "✓ 上下文已压缩。\n"
+	}
+}
+
+// claudeCompactTokenValue 解析 compact_metadata 里的 token 数（数字或字符串）。
+func claudeCompactTokenValue(raw interface{}) int {
+	switch v := raw.(type) {
+	case float64:
+		return int(v)
+	case int:
+		return v
+	case string:
+		n, err := strconv.Atoi(strings.TrimSpace(v))
+		if err != nil {
+			return 0
+		}
+		return n
+	default:
+		return 0
 	}
 }
 
@@ -7449,7 +7696,7 @@ func serializeGoalContext(raw interface{}) string {
 }
 
 func buildAgentAIPrompt(session *agentAISession, latestContent string) string {
-	history := trimAgentAIHistory(append([]agentAIMessage(nil), session.history...))
+	history := trimAgentAIHistoryForSession(session, append([]agentAIMessage(nil), session.history...))
 	var builder strings.Builder
 	builder.WriteString("You are continuing an Aliang remote agent AI chat session.\n")
 	builder.WriteString("Use the existing conversation as context and answer the latest user message.\n")
@@ -7489,9 +7736,55 @@ func agentAIRoleLabel(role string) string {
 	}
 }
 
+// trimAgentAIHistory 是默认档：最多 16 条 / 64000 字符。
+//
+// 这档上限服务的是「宿主历史只用来拼初始 prompt 或生成会话摘要」的 provider
+// ——claude/codex 的上下文在 CLI 自己的会话里，宿主历史短一点无所谓。
 func trimAgentAIHistory(history []agentAIMessage) []agentAIMessage {
-	const maxMessages = 16
-	const maxChars = 64000
+	return trimAgentAIHistoryWithLimits(history, agentAIHistoryDefaultMessages, agentAIHistoryDefaultChars)
+}
+
+const (
+	agentAIHistoryDefaultMessages = 16
+	agentAIHistoryDefaultChars    = 64000
+)
+
+// agentAIHistoryLimits 返回某个会话应保留的历史上限。
+//
+// 内置内核（agentcore）直接消费这份历史：固定 16 条 / 64k 字符会把「手机上
+// 选了大窗口」变成一句空话——16 条消息远到不了 100k token，长对话在宿主这
+// 一层就被截断，内核的自动压缩永远不会触发。所以内核会话按选定窗口换算，
+// 其余 provider 维持原值（它们的上下文由 CLI 自己管理）。
+func agentAIHistoryLimits(provider string, contextWindow int) (maxMessages, maxChars int) {
+	if !agentAIUseAgentCore(provider) {
+		return agentAIHistoryDefaultMessages, agentAIHistoryDefaultChars
+	}
+	contextWindow = clampAgentAIContextWindow(contextWindow)
+	if contextWindow <= 0 {
+		// 与内核 DefaultContextWindow 对齐：手机没传窗口时内核按 200k 压缩，
+		// 宿主先把历史截到 64k 字符会让这个 200k 永远用不满。
+		contextWindow = agentAIContextWindowDefault
+	}
+	// 1 token ≈ 2 字符是保守换算：CJK 约 1 字符/token，ASCII 约 4 字符/token。
+	// 宁可多留一点让内核按真实估算去压，也不要在宿主层过早截断。
+	maxChars = contextWindow * 2
+	maxMessages = contextWindow / 100
+	if maxMessages < agentAIHistoryDefaultMessages {
+		maxMessages = agentAIHistoryDefaultMessages
+	}
+	return maxMessages, maxChars
+}
+
+// trimAgentAIHistoryForSession 按会话选定的 provider/窗口裁剪历史。
+func trimAgentAIHistoryForSession(session *agentAISession, history []agentAIMessage) []agentAIMessage {
+	if session == nil {
+		return trimAgentAIHistory(history)
+	}
+	maxMessages, maxChars := agentAIHistoryLimits(session.provider, session.contextWindow)
+	return trimAgentAIHistoryWithLimits(history, maxMessages, maxChars)
+}
+
+func trimAgentAIHistoryWithLimits(history []agentAIMessage, maxMessages, maxChars int) []agentAIMessage {
 	if len(history) > maxMessages {
 		history = history[len(history)-maxMessages:]
 	}
@@ -7705,6 +7998,61 @@ func newClaudeCodeAIToolForOSWithInput(goos string, id string, path string, prom
 		tool.stdinStreamJSON = true
 	}
 	return tool
+}
+
+var claudeAutoCompactProbeCache sync.Map
+
+// claudeAutoCompactAvailable reports whether this claude binary understands
+// `--autocompact`. Probe failure counts as unsupported: an unknown flag would
+// make every turn fail to start, so an older CLI keeps its built-in window.
+// The cache key includes symlink target + mtime + size
+// (executableProbeCacheKey), so an upgrade invalidates it automatically.
+func claudeAutoCompactAvailable(path string) bool {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return false
+	}
+	cacheKey := executableProbeCacheKey(path)
+	if cached, ok := claudeAutoCompactProbeCache.Load(cacheKey); ok {
+		return cached.(bool)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	output, err := newBackgroundCommandContext(ctx, path, "--help").CombinedOutput()
+	available := err == nil && strings.Contains(string(output), "--autocompact")
+	claudeAutoCompactProbeCache.Store(cacheKey, available)
+	return available
+}
+
+// withClaudeAutoCompact pins the CLI's auto-compaction window to the context
+// size chosen on the phone.
+//
+// Without it the CLI derives the window from the model name (a "[1m]" tag
+// claims 1M tokens even when the gateway window is ~262k), and compaction then
+// fires too late — the request dies with "Prompt is too long" instead. The flag
+// takes tokens directly (100k–1M). Old binaries silently skip it.
+func withClaudeAutoCompact(tool *agentAITool, contextWindow int) *agentAITool {
+	if tool == nil || len(tool.args) == 0 {
+		return tool
+	}
+	if tool.outputFormat != agentAIOutputClaudeStreamJSON {
+		return tool
+	}
+	contextWindow = clampAgentAIContextWindow(contextWindow)
+	if contextWindow <= 0 || !claudeAutoCompactAvailable(tool.path) {
+		return tool
+	}
+	copied := *tool
+	copied.args = append([]string(nil), tool.args...)
+	flags := []string{"--autocompact", strconv.Itoa(contextWindow)}
+	// prompt 走 stdin 时 args 末位不是位置参数：flags 直接追加尾部。
+	if copied.stdinPrompt != "" {
+		copied.args = append(copied.args, flags...)
+		return &copied
+	}
+	promptIndex := len(copied.args) - 1
+	copied.args = append(copied.args[:promptIndex], append(flags, copied.args[promptIndex])...)
+	return &copied
 }
 
 // claudePromptViaStdinForOS 报告该平台/路径下 prompt 是否必须走 stdin 而非

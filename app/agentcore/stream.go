@@ -88,6 +88,27 @@ func (w *streamWriter) Init() error {
 	})
 }
 
+// CompactBoundary 发一次 system/compact_boundary，告知宿主上下文刚被压缩。
+//
+// 帧形状对齐 claude CLI 的同名帧（compact_metadata 里 trigger/pre_tokens/
+// post_tokens），宿主的 claude 流解析器不用为内核另开一套识别路径。
+func (w *streamWriter) CompactBoundary(trigger string, preTokens, postTokens int) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if strings.TrimSpace(trigger) == "" {
+		trigger = "auto"
+	}
+	return w.writeFrame(map[string]interface{}{
+		"type":    "system",
+		"subtype": "compact_boundary",
+		"compact_metadata": map[string]interface{}{
+			"trigger":     trigger,
+			"pre_tokens":  preTokens,
+			"post_tokens": postTokens,
+		},
+	})
+}
+
 // TurnStart 发 message_start，确立本回合的 provider 消息 id。
 func (w *streamWriter) TurnStart(messageID, model string) error {
 	w.mu.Lock()

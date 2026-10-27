@@ -58,6 +58,11 @@ type LoopHooks struct {
 	// 「再答一轮」。与 GetSteeringMessages 共用宿主侧的同一个 drain：先到先得，
 	// 队列排空，不会重复投递。
 	GetFollowUpMessages func() []Message
+
+	// OnCompact 在自动压缩替换了历史之后调用，参数是压缩后的新消息列表。
+	// 宿主据此把会话 history 落成新形状（否则下一轮 run 又从旧历史重建，
+	// 压缩白做）。
+	OnCompact func([]Message, CompactInfo)
 }
 
 // TurnResult 是一个回合的结果。
@@ -121,6 +126,11 @@ type Config struct {
 	// 丢弃（见 NormalizeEffortLevel），绝不为它多付一次 400 往返。
 	// 空串 = 不下发。
 	Effort string
+	// ContextWindow 是手机为会话选定的上下文窗口（token）。0 用
+	// DefaultContextWindow。它决定自动压缩的触发阈值与保留预算——内核不向
+	// 上游申请窗口（Messages API 没有这个字段），它只约束自己的历史规模，
+	// 换到小窗口模型时也不会撞上 "prompt is too long"。
+	ContextWindow int
 }
 
 // NormalizeEffortLevel 把会话层的 effort 档位归一成上游认识的 Messages API
@@ -246,6 +256,13 @@ type runner struct {
 	// truncStreak 是连续被 max_tokens 截断的轮数。只要有一轮没截断就清零——
 	// 要防的是「原地打转」，不是累计次数。
 	truncStreak int
+
+	// contextTokens 是上游最近一次报告的本轮输入 token 数（message_start 的
+	// usage.input_tokens）。注意 usage.InputTokens 是按轮累加的账单口径，不能
+	// 拿它当「当前上下文多大」——这里单独记最近一次的实测值，供自动压缩判定。
+	contextTokens int
+	// autoCompacts 是本 run 内已执行的自动压缩次数，见 maxAutoCompactsPerRun。
+	autoCompacts int
 }
 
 // logf 走宿主的日志出口；没配就静默。
@@ -280,6 +297,10 @@ func (r *runner) loop(ctx context.Context) (*RunResult, error) {
 				r.history = append(r.history, steering...)
 			}
 		}
+
+		// 上下文接近窗口上限时先压缩，再发请求。放在 steering 之后：刚插进来
+		// 的话必须留在保留的原文尾部，而不是被折叠进摘要。
+		r.maybeAutoCompact(ctx)
 
 		req := r.buildRequest()
 		if r.cfg.Hooks.PrepareRequest != nil {
@@ -368,6 +389,51 @@ func (r *runner) loop(ctx context.Context) (*RunResult, error) {
 	// 撞上 maxIterations。
 	return r.finish(ctx, ResultSubtypeErrorMaxTurns,
 		fmt.Sprintf("达到最大回合数 %d，已停止", maxIterations), true, nil)
+}
+
+// maybeAutoCompact 在上下文接近窗口上限时把较早的历史换成摘要。
+//
+// 触发依据取两者的较大值：本地估算（稳定、但对 tokenizer 只是近似）与上游
+// 上一轮实测的 input_tokens（精确、但滞后一轮）。任一达到阈值的 3/4 就压缩，
+// 留出余量给本轮输出与工具结果。压缩失败不终止 run：宁可带着长上下文继续
+// 跑，也不要因为摘要请求偶发失败而中断用户的对话。
+func (r *runner) maybeAutoCompact(ctx context.Context) {
+	window := r.cfg.ContextWindow
+	if window <= 0 {
+		return
+	}
+	if r.autoCompacts >= maxAutoCompactsPerRun {
+		return
+	}
+	threshold := window * autoCompactRatioNum / autoCompactRatioDen
+	measured := EstimateTokens(r.history)
+	if r.contextTokens > measured {
+		measured = r.contextTokens
+	}
+	if measured < threshold {
+		return
+	}
+
+	compacted, info, err := Compact(ctx, r.cfg, r.history, "auto")
+	if err != nil {
+		if errors.Is(err, ErrNothingToCompact) {
+			return
+		}
+		r.logf("agentcore: 自动压缩失败，继续使用完整上下文: %v session=%s", err, r.writer.sessionID)
+		return
+	}
+	r.autoCompacts++
+	r.history = compacted
+	r.contextTokens = info.PostTokens
+	r.logf("agentcore: 上下文自动压缩 %d→%d tokens，%d 条早期消息折叠为摘要（本 run 第 %d 次）session=%s",
+		info.PreTokens, info.PostTokens, info.Removed, r.autoCompacts, r.writer.sessionID)
+	if r.writer != nil {
+		// 通知帧写不出去不拖累 run 本身；宿主会按帧给手机展示压缩提示。
+		_ = r.writer.CompactBoundary(info.Trigger, info.PreTokens, info.PostTokens)
+	}
+	if r.cfg.Hooks.OnCompact != nil {
+		r.cfg.Hooks.OnCompact(compacted, info)
+	}
 }
 
 // buildRequest 组装一次 Messages API 请求。
@@ -460,6 +526,8 @@ func (r *runner) streamTurn(ctx context.Context, req *MessagesRequest, writer *s
 			messageID = ev.MessageID
 			if ev.Usage != nil {
 				r.usage.InputTokens += ev.Usage.InputTokens
+				// 本轮实测的上下文大小：自动压缩用它兜底估算误差。
+				r.contextTokens = ev.Usage.InputTokens
 			}
 			if writer != nil {
 				if err := writer.TurnStart(messageID, ev.Model); err != nil {

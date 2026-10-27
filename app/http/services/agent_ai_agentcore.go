@@ -416,23 +416,7 @@ func (m *agentAIManager) agentCoreMessages(run agentAIRun) []agentcore.Message {
 	}
 	m.mu.Unlock()
 
-	msgs := make([]agentcore.Message, 0, len(history))
-	// texts 与 msgs 同下标，保存纯文本原文——Message.Content 是 interface{}，
-	// 追加附件清单时没法从它里面把字符串取回来。
-	texts := make([]string, 0, len(history))
-	for _, item := range history {
-		role := strings.ToLower(strings.TrimSpace(item.Role))
-		if role != "user" && role != "assistant" {
-			// 内核只认 user/assistant；其它角色（system 之类）由 System 字段
-			// 承载，塞进 messages 会被上游拒绝。
-			continue
-		}
-		if strings.TrimSpace(item.Content) == "" {
-			continue
-		}
-		msgs = append(msgs, agentcore.TextMessage(role, item.Content))
-		texts = append(texts, item.Content)
-	}
+	msgs, texts := agentCoreMessagesFromHistory(history)
 
 	// 图片附件 → image 块。这里的 run.attachments 在 runCLI 里已经下载过
 	// （downloadAgentAIAttachments 设了 Path 并清掉 URL），所以不再下载一次。
@@ -472,6 +456,196 @@ func (m *agentAIManager) agentCoreMessages(run agentAIRun) []agentcore.Message {
 		msgs = attachAgentCoreImageBlocks(msgs, imageBlocks)
 	}
 	return msgs
+}
+
+// agentCoreMessagesFromHistory 把宿主历史条目转成内核消息。
+//
+// texts 与 msgs 同下标，保存纯文本原文——Message.Content 是 interface{}，
+// 追加附件清单时没法从它里面把字符串取回来。
+//
+// 手动 /compact 也走这条转换：压缩的必须是「如果现在开一轮 run 会发给上游的
+// 东西」，两处各写一份迟早漂移。
+func agentCoreMessagesFromHistory(history []agentAIMessage) ([]agentcore.Message, []string) {
+	msgs := make([]agentcore.Message, 0, len(history))
+	texts := make([]string, 0, len(history))
+	for _, item := range history {
+		role := strings.ToLower(strings.TrimSpace(item.Role))
+		if role != "user" && role != "assistant" {
+			// 内核只认 user/assistant；其它角色（system 之类）由 System 字段
+			// 承载，塞进 messages 会被上游拒绝。
+			continue
+		}
+		if strings.TrimSpace(item.Content) == "" {
+			continue
+		}
+		msgs = append(msgs, agentcore.TextMessage(role, item.Content))
+		texts = append(texts, item.Content)
+	}
+	return msgs, texts
+}
+
+// agentCoreHistoryFromMessages 是 agentCoreMessagesFromHistory 的逆变换：
+// 把压缩后的内核消息落回宿主历史。
+//
+// 只保留有文字的块：tool_use / tool_result 离开 run 之后没有配对对象，
+// 落进历史会在下一轮被当成孤立的 user/assistant 文本，反而污染上下文。
+// 摘要消息是普通字符串，会原样保留。
+func agentCoreHistoryFromMessages(messages []agentcore.Message) []agentAIMessage {
+	now := time.Now().UTC()
+	out := make([]agentAIMessage, 0, len(messages))
+	for _, msg := range messages {
+		role := strings.ToLower(strings.TrimSpace(msg.Role))
+		if role != "user" && role != "assistant" {
+			continue
+		}
+		text := strings.TrimSpace(agentCoreMessagePlainText(msg.Content))
+		if text == "" {
+			continue
+		}
+		out = append(out, agentAIMessage{Role: role, Content: text, CreatedAt: now})
+	}
+	return out
+}
+
+// agentCoreMessagePlainText 抽取一条消息里进历史用的纯文本。
+func agentCoreMessagePlainText(content interface{}) string {
+	switch c := content.(type) {
+	case nil:
+		return ""
+	case string:
+		return c
+	case []agentcore.ContentBlock:
+		parts := make([]string, 0, len(c))
+		for _, block := range c {
+			if block.Type != agentcore.BlockTypeText {
+				continue
+			}
+			if text := strings.TrimSpace(block.Text); text != "" {
+				parts = append(parts, text)
+			}
+		}
+		return strings.Join(parts, "\n")
+	default:
+		raw, err := json.Marshal(content)
+		if err != nil {
+			return ""
+		}
+		return string(raw)
+	}
+}
+
+// replaceAgentCoreHistory 用压缩后的消息替换会话 history（自动压缩落库）。
+//
+// runSeq 守卫与 appendAssistantHistory 一致：run 进行中用户又发了新消息时
+// session 的 runSeq 已经前进，此时不能拿本 run 的快照覆盖——新消息会丢。
+// 跳过即可，下一轮 run 会用自己的快照重新压缩。
+func (m *agentAIManager) replaceAgentCoreHistory(sessionID string, runSeq int, messages []agentcore.Message) {
+	history := agentCoreHistoryFromMessages(messages)
+	if len(history) == 0 {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	session := m.sessions[sessionID]
+	if session == nil || session.runSeq != runSeq {
+		return
+	}
+	session.history = trimAgentAIHistoryForSession(session, history)
+	session.lastActiveAt = time.Now().UTC()
+}
+
+// handleAgentCoreCompactCommand 对内核对会话历史做一次真实压缩（/compact）。
+//
+// 与 codex 的原生线程压缩同构：命令不落成模型回合，而是宿主侧直接调内核的
+// Compact()，用一次摘要请求把较早的历史折叠掉，然后把压缩后的历史写回会话。
+// 之后再开 run 时 agentCoreMessages 送进内核的就是压缩后的上下文。
+func (m *agentAIManager) handleAgentCoreCompactCommand(session *agentAISession, messageID string, writeJSON agentTerminalWriter) {
+	if writeJSON == nil {
+		return
+	}
+	m.mu.Lock()
+	runSeq := session.runSeq
+	projectPath := session.projectPath
+	mode := session.mode
+	model := session.model
+	contextWindow := session.contextWindow
+	history := append([]agentAIMessage(nil), session.history...)
+	m.mu.Unlock()
+
+	assistantID := agentAssistantMessageID(messageID)
+	_ = writeJSON(map[string]interface{}{
+		"type":         models.AgentEventAIRunStarted,
+		"session_id":   session.id,
+		"message_id":   assistantID,
+		"provider":     "agentcore",
+		"mode":         mode,
+		"project_path": projectPath,
+		"state":        "running",
+	})
+	reply := func(line string) {
+		_ = writeJSON(map[string]interface{}{
+			"type":       models.AgentEventAIDelta,
+			"session_id": session.id,
+			"message_id": assistantID,
+			"channel":    "stdout",
+			"delta":      line + "\n",
+		})
+	}
+	done := func() {
+		_ = writeJSON(map[string]interface{}{
+			"type":       models.AgentEventAIDone,
+			"session_id": session.id,
+			"message_id": assistantID,
+		})
+	}
+
+	messages, _ := agentCoreMessagesFromHistory(history)
+	if len(messages) == 0 {
+		reply("当前会话还没有可压缩的上下文。先对话几轮，再发送 /compact。")
+		done()
+		return
+	}
+
+	// 摘要是一次普通 Messages 调用，大窗口下要读几十万 token，给足时间；
+	// 但也必须有上限，否则上游挂住会让手机一直停在「压缩中」。
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	if err := agentCoreEnsureUpstream(ctx); err != nil {
+		_ = writeJSON(agentAIErrorPayload(session.id, messageID, err))
+		return
+	}
+
+	cfg := &agentcore.Config{
+		Client:        agentcore.NewClient(agentCoreBaseURL()).WithAPIKey(agentCoreAuthToken()),
+		Model:         agentCoreModel(agentAIRun{model: model}),
+		ContextWindow: contextWindow,
+	}
+	compacted, info, err := agentcore.Compact(ctx, cfg, messages, "manual")
+	if err != nil {
+		if errors.Is(err, agentcore.ErrNothingToCompact) {
+			reply("上下文还比较短，无需压缩。")
+			done()
+			return
+		}
+		logger.Warn(fmt.Sprintf("agentcore: /compact 失败 session=%s: %v", session.id, err))
+		_ = writeJSON(agentAIErrorPayload(session.id, messageID, err))
+		return
+	}
+	m.replaceAgentCoreHistory(session.id, runSeq, compacted)
+	reply(fmt.Sprintf("✓ 上下文已压缩：约 %s → %s tokens（%d 条早期消息已折叠为摘要）。",
+		agentAITokenCountLabel(info.PreTokens), agentAITokenCountLabel(info.PostTokens), info.Removed))
+	done()
+}
+
+// agentAITokenCountLabel 把 token 数渲染成 12.3k / 1.0m 这样的短标签。
+func agentAITokenCountLabel(tokens int) string {
+	if tokens < 1000 {
+		return fmt.Sprintf("%d", tokens)
+	}
+	if tokens < 1_000_000 {
+		return strings.TrimSuffix(fmt.Sprintf("%.1f", float64(tokens)/1000), ".0") + "k"
+	}
+	return strings.TrimRight(strings.TrimRight(fmt.Sprintf("%.2f", float64(tokens)/1_000_000), "0"), ".") + "m"
 }
 
 // attachAgentCoreImageBlocks 把 image 块挂到最后一条 user 消息上。
@@ -896,10 +1070,12 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		SessionID: kernelSessionID,
 		// 会话的 effort 档位（手机选档 → server 透传 → 这里进请求体）。
 		// 空串/无法识别的档位在内核侧被丢弃，不下发。
-		Effort:  run.effort,
-		Env:     kernelEnv,
-		Approve: kernelApprove,
-		Logf:    kernelLogf,
+		Effort: run.effort,
+		// 手机选定的上下文窗口驱动内核的自动压缩阈值；0 时内核用 200k 兜底。
+		ContextWindow: run.contextWindow,
+		Env:           kernelEnv,
+		Approve:       kernelApprove,
+		Logf:          kernelLogf,
 		Emit: func(frame []byte) error {
 			_, err := pipeWriter.Write(frame)
 			return err
@@ -1001,6 +1177,11 @@ func agentCoreLoopHooks(m *agentAIManager, run agentAIRun) agentcore.LoopHooks {
 		},
 		GetFollowUpMessages: func() []agentcore.Message {
 			return m.drainAgentCoreSteering(run)
+		},
+		// 自动压缩替换了历史 → 同步落回会话 history。不落的话 next run 又从
+		// 旧历史重建，压缩白做（而且每轮 run 都会重新烧一次摘要请求）。
+		OnCompact: func(messages []agentcore.Message, info agentcore.CompactInfo) {
+			m.replaceAgentCoreHistory(run.sessionID, run.runSeq, messages)
 		},
 	}
 }

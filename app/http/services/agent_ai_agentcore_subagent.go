@@ -177,6 +177,10 @@ type agentCoreSubagentBridge struct {
 	// onToolCall：journal 回调——Task 调用本身与（经装饰器的）子 run 内置工具
 	// 调用都会触发；nil=不记。
 	onToolCall func(tool, summary string, isErr bool)
+	// contextWindow：主 run 的上下文窗口。子 run 与主 run 用同一模型、同一
+	// 上游配额，窗口必须一致——否则子 run 按 200k 兜底压缩，大窗口会话里
+	// 子 agent 反而先撞 prompt too long。
+	contextWindow int
 }
 
 func (b *agentCoreSubagentBridge) Name() string        { return b.name }
@@ -298,6 +302,8 @@ func (b *agentCoreSubagentBridge) Execute(ctx context.Context, input map[string]
 		Env:     b.env,
 		Approve: b.approve,
 		Logf:    b.logf,
+		// 与主 run 同窗口：子 run 的自动压缩阈值跟随会话设置。
+		ContextWindow: b.contextWindow,
 		// Emit/Hooks 刻意 nil（spec §3）。
 	}
 	res, err := agentcore.Run(ctx, cfg, []agentcore.Message{{Role: "user", Content: task}})
@@ -389,6 +395,7 @@ func (m *agentAIManager) agentCoreSubagentTools(run agentAIRun,
 			logf:           logf,
 			mcpTools:       mcpFactory,
 			onToolCall:     onToolCall,
+			contextWindow:  run.contextWindow,
 		})
 	}
 	logger.Info(fmt.Sprintf("agentcore-subagent: 注入 %d 个子 agent 桥", len(out)))
