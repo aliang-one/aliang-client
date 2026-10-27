@@ -675,8 +675,8 @@ func agentCoreScopeCheck(run agentAIRun) func(string, map[string]interface{}) (b
 // 再也返回不了——看门狗的 cancel 也就形同虚设（2026-10-27 事故的候选卡点）。
 //
 // 这里用一条守护 goroutine 把 ctx.Done 翻译成 pipe 关闭，让阻塞中的 Write
-// 立刻返回 io.ErrClosedPipe，Run 得以退出。stop 必须 defer 调用，否则
-// ctx 永不取消的路径（正常完成）会泄漏这条 goroutine。
+// 立刻返回 io.ErrClosedPipe（读端侧收到的才是 ctx 的取消错误），Run 得以退出。
+// stop 必须 defer 调用，否则 ctx 永不取消的路径（正常完成）会泄漏这条 goroutine。
 func newAgentCoreEmit(ctx context.Context, writer *io.PipeWriter) (emit func([]byte) error, stop func()) {
 	done := make(chan struct{})
 	go func() {
@@ -930,8 +930,8 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		Env:     kernelEnv,
 		Approve: kernelApprove,
 		Logf:    kernelLogf,
-		Emit: emitFrame,
-		Hooks: agentCoreLoopHooks(m, run),
+		Emit:    emitFrame,
+		Hooks:   agentCoreLoopHooks(m, run),
 	}
 
 	result, runErr := agentcore.Run(ctx, cfg, messages)
@@ -946,7 +946,8 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 	}
 
 	if ctx.Err() != nil {
-		// 被停止：内核已经发过 interrupted 终止帧（非错误），这里只收敛状态。
+		// 被停止：内核可能已发过 interrupted 终止帧；若 pipe 已随 cancel 关闭，
+		// 该帧会被丢弃（内核忽略这处写错误）。这里统一收敛状态。
 		status, errMsg := agentAIRunStoppedStatus(run.activity, limiter)
 		finalizeRunSubagents(run, writeJSON)
 		statusPayload := map[string]interface{}{
