@@ -25,7 +25,12 @@ import (
 
 // maxIterations 是单次 run 的硬上限。防的是模型陷入「调工具 → 失败 → 再调」
 // 的死循环，那会把 token 烧穿。
-const maxIterations = 50
+//
+// 200 而不是更小：探索型任务（读代码定位问题）每个回合通常只跑 1-2 条
+// grep/sed，50 回合在 7 分钟内就被打满，把仍在正常推进的对话从中间截断
+// （2026-10-27 实锤：83 条命令后撞上限，用户侧只看到「对话莫名停了」）。
+// 死循环仍会被这道上限兜住，只是允许的正常工作量更贴近真实场景。
+const maxIterations = 200
 
 // maxTruncationRetries 是**连续**被 max_tokens 截断后允许重试的次数。
 //
@@ -808,10 +813,16 @@ func (r *runner) finish(_ context.Context, subtype, errText string, isError bool
 	if r.writer != nil {
 		text := r.turnText.String()
 		if isError && errText != "" {
+			// 错误原因必须放**最前面**：这整段文本就是宿主 ai.error 的正文，
+			// 而手机的错误卡片只渲染第一段。把原因拼在模型最后一句话后面
+			// （旧行为）等于把真因藏起来——2026-10-27 实锤：用户只看到模型
+			// 说「接下来看看 isDraft 怎么判断」，看不到真正的
+			// 「达到最大回合数 50，已停止」。
 			if text != "" {
-				text += "\n\n"
+				text = errText + "\n\n" + text
+			} else {
+				text = errText
 			}
-			text += errText
 		}
 		_ = r.writer.Result(subtype, text, isError, &r.usage, r.turns)
 	}
