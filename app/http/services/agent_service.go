@@ -1818,6 +1818,38 @@ func (s *AgentService) callAgentServerWithAuthorization(method string, endpoint 
 	if endpoint == "" {
 		return nil, errors.New("agent server endpoint is empty")
 	}
+	if !agentChannelHealthInstance.allow(endpoint) {
+		return nil, agentChannelBackoffError{endpoint: sanitizeAgentEndpoint(endpoint)}
+	}
+
+	raw, err := s.doCallAgentServer(method, endpoint, payload, authHeader)
+	if err == nil {
+		agentChannelHealthInstance.recordSuccess(endpoint)
+		return raw, nil
+	}
+	var rejected agentUserAuthRejectedError
+	if !errors.As(err, &rejected) {
+		return nil, err
+	}
+
+	// 401：本地续期一次再重试一次（spec §3.4.1）。
+	//
+	// 刻意不用 RequestUserAgentSyncAfterAuth：那条路自己会走
+	// callAgentServer 的注册路径，同步调用会在这里递归。本地刷新 token
+	// 不经过 server 调用，安全。
+	fresh, refreshErr := agentChannelRefreshHeader()
+	if refreshErr == nil && strings.TrimSpace(fresh) != "" && strings.TrimSpace(fresh) != strings.TrimSpace(authHeader) {
+		if raw2, err2 := s.doCallAgentServer(method, endpoint, payload, fresh); err2 == nil {
+			agentChannelHealthInstance.recordSuccess(endpoint)
+			logger.Info(fmt.Sprintf("[AGENT-CHANNEL] 401 recovered after refresh endpoint=%s", sanitizeAgentEndpoint(endpoint)))
+			return raw2, nil
+		}
+	}
+	agentChannelHealthInstance.record401(endpoint)
+	return nil, err
+}
+
+func (s *AgentService) doCallAgentServer(method string, endpoint string, payload interface{}, authHeader string) ([]byte, error) {
 	var body io.Reader
 	if payload != nil {
 		raw, err := json.Marshal(payload)
@@ -1864,8 +1896,6 @@ func (s *AgentService) callAgentServerWithAuthorization(method string, endpoint 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		logger.Warn(fmt.Sprintf("[AGENT-BOOT] agent_server_call non_2xx method=%s endpoint=%s status=%d", method, sanitizeAgentEndpoint(endpoint), resp.StatusCode))
 		if resp.StatusCode == http.StatusUnauthorized {
-			logger.Warn(fmt.Sprintf("[AGENT-CHANNEL] 401 endpoint=%s has_auth=%t method=%s",
-				sanitizeAgentEndpoint(endpoint), authHeader != "", method))
 			if authHeader != "" {
 				return nil, agentUserAuthRejectedError{status: resp.StatusCode, body: string(raw)}
 			}
