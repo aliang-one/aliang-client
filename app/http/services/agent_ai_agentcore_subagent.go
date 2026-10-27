@@ -37,20 +37,27 @@ func agentCoreSubagentFrontmatter(path, content string) (agentCoreSubagentDef, b
 	def := agentCoreSubagentDef{
 		Name: sanitizeAgentCoreMCPSegment(strings.TrimSuffix(filepath.Base(path), ".md")),
 	}
+	hasFrontmatter := false
 	rest, ok := strings.CutPrefix(content, "---")
 	if ok {
 		block, tail, found := strings.Cut(rest, "\n---")
 		if found {
+			hasFrontmatter = true
+			toolsDeclared := false
 			for _, line := range strings.Split(block, "\n") {
 				key, value, has := strings.Cut(strings.TrimSpace(line), ":")
 				if !has {
 					continue
 				}
+				key = strings.TrimSpace(key)
 				v := strings.Trim(strings.TrimSpace(value), `"'`)
+				if key == "tools" {
+					toolsDeclared = true
+				}
 				if v == "" {
 					continue
 				}
-				switch strings.TrimSpace(key) {
+				switch key {
 				case "name":
 					def.Name = sanitizeAgentCoreMCPSegment(v)
 				case "description":
@@ -65,15 +72,26 @@ func agentCoreSubagentFrontmatter(path, content string) (agentCoreSubagentDef, b
 					}
 				}
 			}
+			// 行式解析只支持逗号标量（tools: Read, Grep）。YAML 块列表
+			// （tools:\n  - Read）与流式（tools: [Read]）会解析出空白名单，
+			// 此时语义是「全量放行」——用户写限制却拿到无限制，必须留痕。
+			if toolsDeclared && len(def.ToolsWhitelist) == 0 {
+				logger.Warn(fmt.Sprintf(
+					"agentcore-subagent: tools 字段未解析出白名单(仅支持逗号标量格式),按全量放行 name=%s file=%s",
+					def.Name, filepath.Base(path)))
+			}
 			def.Body = strings.TrimSpace(tail)
 		}
 	}
-	if def.Body == "" {
-		def.Body = strings.TrimSpace(content) // 无 frontmatter：全文即指令
+	// 只有「确认无 frontmatter」才全文回落。有 frontmatter 但正文为空时
+	// Body 保持空串——否则整块 frontmatter 会泄漏进指令文本。
+	if !hasFrontmatter {
+		def.Body = strings.TrimSpace(content)
 	}
-	if len(def.Body) > agentCoreSubagentBodyCap {
-		def.Body = def.Body[:agentCoreSubagentBodyCap]
-	}
+	// 字节截断：会在 UTF-8 多字节字符中间劈开（已知限制，与
+	// truncateAgentTextBytes 全仓语义一致），Body 下游只做拼接不再解析。
+	def.Body = truncateAgentTextBytes(def.Body, agentCoreSubagentBodyCap)
+	// sanitize 兜底保证非空（空串回落 "srv"），此守卫实际不可达，防御性保留。
 	if strings.TrimSpace(def.Name) == "" {
 		return agentCoreSubagentDef{}, false
 	}
@@ -86,7 +104,8 @@ func agentCoreSubagentDefsIn(home string) []agentCoreSubagentDef {
 	if strings.TrimSpace(home) == "" {
 		return nil
 	}
-	entries, err := os.ReadDir(filepath.Join(home, ".claude", "agents"))
+	dir := filepath.Join(home, ".claude", "agents")
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil
 	}
@@ -103,11 +122,14 @@ func agentCoreSubagentDefsIn(home string) []agentCoreSubagentDef {
 			logger.Warn(fmt.Sprintf("agentcore-subagent: 定义超上限截断 cap=%d", agentCoreSubagentCap))
 			break
 		}
-		content, err := os.ReadFile(filepath.Join(home, ".claude", "agents", name))
+		path := filepath.Join(dir, name)
+		content, err := os.ReadFile(path)
 		if err != nil {
+			// 留痕：用户会拿「为什么我的 agent 没出现」来问，静默跳过无法排查。
+			logger.Warn(fmt.Sprintf("agentcore-subagent: 定义读取失败跳过 file=%s err=%v", name, err))
 			continue
 		}
-		if def, ok := agentCoreSubagentFrontmatter(filepath.Join(home, ".claude", "agents", name), string(content)); ok {
+		if def, ok := agentCoreSubagentFrontmatter(path, string(content)); ok {
 			out = append(out, def)
 		}
 	}
@@ -116,6 +138,10 @@ func agentCoreSubagentDefsIn(home string) []agentCoreSubagentDef {
 
 // agentCoreSubagentBridgeName 工具名消解：避开 reserved（内核 8 规范名）与
 // seen（已用名），重名追加 -2/-3。字符清洗复用 MCP 段白名单。
+//
+// 长度预算：段白名单截 64 + 序号后缀最多 3 字符（"-99"）= 67 < 128（API
+// 工具名上限），无需再截。seen 表必须与 MCP 桥命名共用同一张：否则子
+// agent 桥名可能遮蔽/撞上 mcp__xxx 桥名，T2 接线时注意传同一 map。
 func agentCoreSubagentBridgeName(raw string, reserved, seen map[string]bool) string {
 	base := sanitizeAgentCoreMCPSegment(raw)
 	candidate := base

@@ -39,11 +39,56 @@ func TestAgentCoreSubagentDefsIn(t *testing.T) {
 	if r.Description != "代码评审" || len(r.ToolsWhitelist) != 2 || r.ToolsWhitelist[0] != "Read" {
 		t.Fatalf("frontmatter 解析错误: %+v", r)
 	}
+	if r.Model != "sonnet" {
+		t.Fatalf("model 解析错误: %+v", r)
+	}
 	if !strings.Contains(r.Body, "评审员") {
 		t.Fatalf("正文缺失: %+v", r)
 	}
 	if byName["fallback"].Body == "" {
 		t.Fatalf("无 frontmatter 文件应保留回落名+正文")
+	}
+	// broken.md：frontmatter 未闭合 → 名回落文件名，全文回落正文。
+	b := byName["broken"]
+	if b.Name != "broken" || b.Body != "---\nname: [ broken" {
+		t.Fatalf("未闭合 frontmatter 回落语义错误: %+v", b)
+	}
+}
+
+func TestAgentCoreSubagentFrontmatterOnlyStub(t *testing.T) {
+	// 有 frontmatter 但正文为空：Body 必须是空串，
+	// 绝不能把整块 frontmatter 泄漏进指令文本。
+	def, ok := agentCoreSubagentFrontmatter("stub.md", "---\nname: stub\ndescription: 只有头\n---\n")
+	if !ok {
+		t.Fatalf("frontmatter-only stub 应是有效定义")
+	}
+	if def.Name != "stub" || def.Description != "只有头" {
+		t.Fatalf("头字段解析错误: %+v", def)
+	}
+	if def.Body != "" || strings.Contains(def.Body, "---") {
+		t.Fatalf("空正文泄漏 frontmatter: %q", def.Body)
+	}
+}
+
+func TestAgentCoreSubagentBodyTruncation(t *testing.T) {
+	content := "---\nname: big\n---\n" + strings.Repeat("x", 9*1024)
+	def, ok := agentCoreSubagentFrontmatter("big.md", content)
+	if !ok {
+		t.Fatalf("应有效")
+	}
+	if got := len(def.Body); got != 8*1024 {
+		t.Fatalf("正文截断 = %d, want 8192", got)
+	}
+}
+
+func TestAgentCoreSubagentToolsBlockListFailsOpen(t *testing.T) {
+	// YAML 块列表不被行式解析支持：白名单为空=全量放行（Warn 留痕）。
+	def, ok := agentCoreSubagentFrontmatter("blk.md", "---\nname: blk\ntools:\n  - Read\n  - Grep\n---\nx")
+	if !ok {
+		t.Fatalf("应有效")
+	}
+	if len(def.ToolsWhitelist) != 0 {
+		t.Fatalf("块列表不应解析出白名单: %+v", def.ToolsWhitelist)
 	}
 }
 
