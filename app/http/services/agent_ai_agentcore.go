@@ -668,6 +668,33 @@ func agentCoreScopeCheck(run agentAIRun) func(string, map[string]interface{}) (b
 // run 入口
 // ---------------------------------------------------------------------------
 
+// newAgentCoreEmit 返回一个可被 ctx 解除的 Emit 函数。
+//
+// 内核的每一帧都经 io.Pipe 交给流式管线；pipeWriter.Write 会一直阻塞到读端
+// 消费（读端还有限流器与网络写出）。若读端卡住，写侧就永久阻塞，agentcore.Run
+// 再也返回不了——看门狗的 cancel 也就形同虚设（2026-10-27 事故的候选卡点）。
+//
+// 这里用一条守护 goroutine 把 ctx.Done 翻译成 pipe 关闭，让阻塞中的 Write
+// 立刻返回 io.ErrClosedPipe，Run 得以退出。stop 必须 defer 调用，否则
+// ctx 永不取消的路径（正常完成）会泄漏这条 goroutine。
+func newAgentCoreEmit(ctx context.Context, writer *io.PipeWriter) (emit func([]byte) error, stop func()) {
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = writer.CloseWithError(ctx.Err())
+		case <-done:
+		}
+	}()
+	var once sync.Once
+	stop = func() { once.Do(func() { close(done) }) }
+	emit = func(frame []byte) error {
+		_, err := writer.Write(frame)
+		return err
+	}
+	return emit, stop
+}
+
 // runAgentCore 跑一次内置内核的 run。
 //
 // 与 runCLIPass 的关系：spawn 换成了进程内调用，但**对外的事件契约完全一样**
@@ -888,6 +915,9 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		}
 	}
 
+	emitFrame, stopEmit := newAgentCoreEmit(ctx, pipeWriter)
+	defer stopEmit()
+
 	cfg := &agentcore.Config{
 		Client:    kernelClient,
 		Model:     agentCoreModel(run),
@@ -900,10 +930,7 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		Env:     kernelEnv,
 		Approve: kernelApprove,
 		Logf:    kernelLogf,
-		Emit: func(frame []byte) error {
-			_, err := pipeWriter.Write(frame)
-			return err
-		},
+		Emit: emitFrame,
 		Hooks: agentCoreLoopHooks(m, run),
 	}
 
