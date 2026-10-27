@@ -83,7 +83,10 @@ var (
 	sharedAgentServiceMu sync.Mutex
 	sharedAgentService   *AgentService
 
-	localUserAgentBaseURL = UserAgentBaseURL
+	// localUserAgentBaseURL 是本进程所有 user-agent 出站请求的基地址。
+	// 惰性求值：测试二进制要等包 init 之后才注册 testing 标志，init 期间判定
+	// 会漏掉，必须在调用时判断（见 resolveLocalUserAgentBaseURL）。
+	localUserAgentBaseURL = func() string { return resolveLocalUserAgentBaseURL(runningUnderGoTest()) }
 
 	// sessionOwnerAddrOverride 显式覆盖的 owner dashboard 基地址。管理面板
 	// 端口回退（默认端口被占用改听随机端口）时由 http server 回灌真实监听
