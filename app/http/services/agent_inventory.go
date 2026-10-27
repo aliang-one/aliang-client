@@ -423,6 +423,37 @@ func addAgentProjectSource(project *models.AgentProject, source string) {
 	sort.Strings(project.SourceTools)
 }
 
+// agentProjectProbe caches the filesystem-derived project facts last obtained
+// during a user-initiated action.
+type agentProjectProbe struct {
+	Description     string
+	LastActiveAt    string
+	IsGitRepo       bool
+	Branch          string
+	FileCount       int
+	GitChangedCount int
+	Language        string
+	PackageManager  string
+	ProbedAt        time.Time
+}
+
+// agentProjectProbeMaxEntries bounds the probe cache; entries are evicted
+// oldest-first once the cap is reached.
+const agentProjectProbeMaxEntries = 256
+
+var (
+	agentProjectProbeMu sync.RWMutex
+	agentProjectProbes  = make(map[string]agentProjectProbe)
+)
+
+// enrichAgentProject fills defaults and replays cached probe results.
+//
+// It is intentionally filesystem-free. Background inventory runs on connect,
+// every ~60s (inventoryTicker) and on digest changes; probing project folders
+// from there triggered macOS "Files & Folders" prompts for projects living in
+// Desktop/Documents/Downloads/iCloud — at arbitrary times, with no user
+// action to explain them. Live facts are collected by probeAgentProjectStats
+// only when the user acts on a project, then replayed here.
 func enrichAgentProject(project *models.AgentProject) {
 	if project == nil {
 		return
@@ -433,33 +464,90 @@ func enrichAgentProject(project *models.AgentProject) {
 	if project.Name == "" {
 		project.Name = agentProjectName(project.Path)
 	}
-	if stat, err := os.Stat(project.Path); err == nil && stat.IsDir() {
-		project.Description = firstNonEmpty(project.Description, "Discovered from local AI coding session history.")
-		if project.LastActiveAt == "" {
-			project.LastActiveAt = stat.ModTime().UTC().Format(time.RFC3339)
-		}
+	applyAgentProjectProbe(project)
+}
+
+// applyAgentProjectProbe overlays cached probe results onto a project without
+// touching the filesystem.
+func applyAgentProjectProbe(project *models.AgentProject) {
+	if project == nil {
+		return
 	}
-	if isDir(filepath.Join(project.Path, ".git")) {
+	path := cleanAgentProjectPath(project.Path)
+	if path == "" {
+		return
+	}
+	agentProjectProbeMu.RLock()
+	probe, ok := agentProjectProbes[path]
+	agentProjectProbeMu.RUnlock()
+	if !ok {
+		return
+	}
+	if project.Description == "" {
+		project.Description = probe.Description
+	}
+	if project.LastActiveAt == "" {
+		project.LastActiveAt = probe.LastActiveAt
+	}
+	if probe.IsGitRepo {
 		project.IsGitRepo = true
 		if project.Branch == "" {
-			project.Branch = readGitHeadBranch(project.Path)
+			project.Branch = probe.Branch
 		}
-		// Live dashboard metrics: report this run's project filesystem/git state on
-		// every snapshot (the inventoryTicker re-emits the project list ~1/min), so
-		// the mobile home card's Files/Changed reflect the real current project
-		// state without depending on an active vibe run. git ls-files = tracked file
-		// count (Files); git status --porcelain lines = uncommitted changes (Changed).
-		if tracked := countGitTrackedFiles(project.Path); tracked > 0 {
-			project.FileCount = tracked
+		if project.FileCount == 0 && probe.FileCount > 0 {
+			project.FileCount = probe.FileCount
 		}
-		project.GitChangedCount = countGitChanged(project.Path)
+		project.GitChangedCount = probe.GitChangedCount
 	}
 	if project.Language == "" {
-		project.Language = detectAgentProjectLanguage(project.Path)
+		project.Language = probe.Language
 	}
 	if project.PackageManager == "" {
-		project.PackageManager = detectAgentPackageManager(project.Path)
+		project.PackageManager = probe.PackageManager
 	}
+}
+
+// probeAgentProjectStats reads the project directory and records the results in
+// the probe cache. Call it only from user-initiated paths (e.g. the user opens
+// the project card): this is the only place that may trigger an OS folder
+// permission prompt, and it does so while the user is actually asking for that
+// project. It reads nothing outside path and never walks the tree.
+func probeAgentProjectStats(path string) {
+	path = cleanAgentProjectPath(path)
+	if path == "" || !isSafeAgentProjectPath(path) {
+		return
+	}
+	probe := agentProjectProbe{ProbedAt: time.Now()}
+	if stat, err := os.Stat(path); err == nil && stat.IsDir() {
+		probe.Description = "Discovered from local AI coding session history."
+		probe.LastActiveAt = stat.ModTime().UTC().Format(time.RFC3339)
+	}
+	if isDir(filepath.Join(path, ".git")) {
+		probe.IsGitRepo = true
+		probe.Branch = readGitHeadBranch(path)
+		// git ls-files = tracked file count (Files); git status --porcelain
+		// lines = uncommitted changes (Changed).
+		probe.FileCount = countGitTrackedFiles(path)
+		probe.GitChangedCount = countGitChanged(path)
+	}
+	probe.Language = detectAgentProjectLanguage(path)
+	probe.PackageManager = detectAgentPackageManager(path)
+
+	agentProjectProbeMu.Lock()
+	if len(agentProjectProbes) >= agentProjectProbeMaxEntries {
+		var oldestKey string
+		var oldest time.Time
+		for key, entry := range agentProjectProbes {
+			if oldestKey == "" || entry.ProbedAt.Before(oldest) {
+				oldestKey, oldest = key, entry.ProbedAt
+			}
+		}
+		if oldestKey != "" {
+			delete(agentProjectProbes, oldestKey)
+		}
+	}
+	agentProjectProbes[path] = probe
+	agentProjectProbeMu.Unlock()
 }
 
 func collectAgentVibeSessions(scanDirs []string) []models.AgentVibeSession {

@@ -17,6 +17,7 @@ import (
 
 	"aliang.one/nursorgate/app/http/models"
 	"aliang.one/nursorgate/common/cache"
+	"aliang.one/nursorgate/internal/tccguard"
 )
 
 const (
@@ -62,6 +63,9 @@ func agentProjectDetailPayload(msg map[string]interface{}) map[string]interface{
 		return agentFileErrorPayload(requestID, err)
 	}
 	project := ensureAgentProject(map[string]*models.AgentProject{}, projectPath)
+	// The user explicitly asked for this project — this is the moment where
+	// touching the folder (and thus any OS permission prompt) is expected.
+	probeAgentProjectStats(projectPath)
 	enrichAgentProject(project)
 	enrichAgentProjectDetail(project)
 	return map[string]interface{}{
@@ -466,15 +470,25 @@ func agentFileReadPayload(msg map[string]interface{}) map[string]interface{} {
 // 目录不存在时错误必须带手机端已识别的语义码 project_path_missing（手机
 // humanizeFileError 按码匹配渲染「路径不存在」错误卡）：会话历史扫描出的
 // 幽灵项目（目录已被移动/删除）打开时，裸 os.Stat 文案只会落到通用错误卡。
+//
+// 受 macOS TCC 保护目录（桌面/文稿/下载/iCloud/外置盘/其他本地账户）的访问
+// 先过 tccguard：手机远控时 Mac 可能无人值守，绝不能弹一个没人应答的系统
+// 授权框（2026-10-27 隐私修复）。
 func resolveAgentProjectPath(raw string) (string, error) {
+	if err := tccguard.GuardPath(raw); err != nil {
+		return "", err
+	}
 	resolved, err := cleanExistingAgentDirectory(raw)
-	if err == nil {
-		return resolved, nil
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return "", fmt.Errorf("project_path_missing: %s", agentPathDisplayForError(raw))
+		}
+		return "", err
 	}
-	if errors.Is(err, fs.ErrNotExist) {
-		return "", fmt.Errorf("project_path_missing: %s", agentPathDisplayForError(raw))
+	if err := tccguard.GuardPath(resolved); err != nil {
+		return "", err
 	}
-	return "", err
+	return resolved, nil
 }
 
 // agentPathDisplayForError 尽力还原请求路径的绝对形态用于错误提示；
@@ -508,7 +522,13 @@ func resolveAgentProjectContentPath(projectPath string, raw string) (string, err
 	if err != nil {
 		return "", err
 	}
+	if err := tccguard.GuardPath(abs); err != nil {
+		return "", err
+	}
 	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		if err := tccguard.GuardPath(resolved); err != nil {
+			return "", err
+		}
 		abs = resolved
 	}
 	// Operator policy: project/authorized-directory confinement REMOVED — any path

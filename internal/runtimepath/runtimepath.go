@@ -3,6 +3,7 @@ package runtimepath
 import (
 	"errors"
 	"os"
+	"os/exec"
 	"os/user"
 	"path/filepath"
 	"runtime"
@@ -200,10 +201,12 @@ func ResolveDefaultConfigPathForMode(mode Mode, logicalPath string) (string, err
 
 // effectiveHome resolves the desktop user's home when running as root, with a
 // short TTL so fast-user-switching is eventually picked up without re-reading
-// /etc/passwd on every call.
+// /etc/passwd (or probing /dev/console) on every call. Negative results are
+// cached too, so a headless host does not fork a probe per call.
 var (
 	effectiveHomeMu      sync.Mutex
 	effectiveHomeCached  string
+	effectiveHomeOK      bool
 	effectiveHomeChecked time.Time
 )
 
@@ -215,9 +218,13 @@ const effectiveHomeCacheTTL = 5 * time.Second
 // For a normal (non-root) process this is identical to UserHomeDir(). When the
 // process runs as root — e.g. the Linux systemd Core daemon, where $HOME is
 // /root and useless for detecting the desktop user's agent history — it resolves
-// the active desktop user's home instead (via systemd-logind's /run/user on
-// Linux, or by scanning /Users on macOS). It falls back to UserHomeDir() when no
-// desktop user can be determined.
+// the *console* (physically logged-in) user's home: the owner of /dev/console
+// on macOS, the active local seat session in systemd-logind on Linux.
+//
+// It never guesses a home from directory timestamps. On a multi-user machine
+// that guess can point the root daemon at another account's private files, so
+// an ambiguous situation resolves to ok=false and the caller falls back to the
+// process home (/root).
 func EffectiveAgentHome() (string, error) {
 	// os.Getuid() returns -1 on Windows, so this never triggers there.
 	if os.Getuid() != 0 {
@@ -225,95 +232,214 @@ func EffectiveAgentHome() (string, error) {
 	}
 
 	effectiveHomeMu.Lock()
-	if effectiveHomeCached != "" && time.Since(effectiveHomeChecked) < effectiveHomeCacheTTL {
-		cached := effectiveHomeCached
+	if !effectiveHomeChecked.IsZero() && time.Since(effectiveHomeChecked) < effectiveHomeCacheTTL {
+		cached, ok := effectiveHomeCached, effectiveHomeOK
 		effectiveHomeMu.Unlock()
-		return cached, nil
+		if ok {
+			return cached, nil
+		}
+		return UserHomeDir()
 	}
 	effectiveHomeMu.Unlock()
 
-	if home, ok := resolveDesktopUserHome(); ok {
+	home, ok := resolveDesktopUserHome()
+	if ok {
 		home = strings.TrimSpace(home)
-		if home != "" {
-			effectiveHomeMu.Lock()
-			effectiveHomeCached = home
-			effectiveHomeChecked = time.Now()
-			effectiveHomeMu.Unlock()
-			return home, nil
-		}
+		ok = home != ""
+	}
+
+	effectiveHomeMu.Lock()
+	effectiveHomeCached = home
+	effectiveHomeOK = ok
+	effectiveHomeChecked = time.Now()
+	effectiveHomeMu.Unlock()
+
+	if ok {
+		return home, nil
 	}
 
 	// No desktop user resolvable — fall back to the process home (/root).
 	return UserHomeDir()
 }
 
-// resolveDesktopUserHome locates the interactive desktop user's home when the
-// current process is root. Returns ok=false when it cannot be determined.
+// resolveDesktopUserHome locates the interactive console user's home when the
+// current process is root. Returns ok=false when it cannot be determined
+// unambiguously — never a best guess.
 func resolveDesktopUserHome() (string, bool) {
 	switch runtime.GOOS {
 	case "linux":
-		// systemd-logind creates /run/user/<uid> per active login session;
-		// the most recently touched one is the active desktop user.
-		if home, ok := newestSessionHome("/run/user", true); ok {
+		// systemd-logind publishes one KEY=VALUE record per session under
+		// /run/systemd/sessions; the physical console is the ACTIVE local
+		// session on a seat. This deliberately excludes SSH logins and
+		// background sessions, which an mtime scan cannot tell apart.
+		if home, ok := systemdConsoleUserHome(); ok {
 			return home, true
 		}
-		return newestSessionHome("/home", false)
+		// Older/non-systemd hosts: accept only an unambiguous single account.
+		if home, ok := soleDesktopUserHome("/run/user", true); ok {
+			return home, true
+		}
+		return soleDesktopUserHome("/home", false)
 	case "darwin":
-		if home, ok := newestSessionHome("/Users", false); ok {
-			return home, true
-		}
-		return "", false
+		return darwinConsoleUserHome()
 	default:
 		return "", false
 	}
 }
 
-// newestSessionHome scans a directory of entries (session dirs keyed by numeric
-// uid when uidKeyed, otherwise by username) and returns the home of the most
-// recently modified entry that maps to a real user.
-func newestSessionHome(dir string, uidKeyed bool) (string, bool) {
+// darwinConsoleUserHome resolves the owner of /dev/console — the user actually
+// logged in at the screen. At the login window (and on headless machines) the
+// console belongs to root, which is rejected. We never fall back to picking the
+// newest home under /Users: that is exactly how a root daemon ends up reading a
+// different local account's private files.
+func darwinConsoleUserHome() (string, bool) {
+	out, err := exec.Command("/usr/bin/stat", "-f", "%u", "/dev/console").Output()
+	if err != nil {
+		return "", false
+	}
+	uid := strings.TrimSpace(string(out))
+	if uid == "" || uid == "0" {
+		return "", false
+	}
+	home := homeForUID(uid)
+	if !isPlausibleUserHome(home) {
+		return "", false
+	}
+	return home, true
+}
+
+// systemdConsoleUserHome reads logind's session records and returns the home of
+// the user holding the active local seat session. It refuses to answer when
+// more than one candidate remains, so it can never silently land on a second
+// account.
+func systemdConsoleUserHome() (string, bool) {
+	const sessionDir = "/run/systemd/sessions"
+	entries, err := os.ReadDir(sessionDir)
+	if err != nil {
+		return "", false
+	}
+	homes := make(map[string]struct{})
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		raw, err := os.ReadFile(filepath.Join(sessionDir, entry.Name()))
+		if err != nil {
+			continue
+		}
+		fields := parseSystemdSessionFields(string(raw))
+		if fields["ACTIVE"] != "1" || fields["STATE"] != "active" {
+			continue
+		}
+		if fields["REMOTE"] == "1" || strings.TrimSpace(fields["SEAT"]) == "" {
+			continue
+		}
+		uid := strings.TrimSpace(fields["UID"])
+		if uid == "" || uid == "0" {
+			continue
+		}
+		home := homeForUID(uid)
+		if !isPlausibleUserHome(home) {
+			continue
+		}
+		homes[home] = struct{}{}
+	}
+	return soleHome(homes)
+}
+
+// parseSystemdSessionFields decodes the KEY=VALUE body of a logind session file.
+func parseSystemdSessionFields(raw string) map[string]string {
+	fields := make(map[string]string)
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		fields[strings.TrimSpace(key)] = strings.TrimSpace(value)
+	}
+	return fields
+}
+
+// soleHome returns the single home in the set, or ok=false when the set is
+// empty or ambiguous. Ambiguity is deliberately treated as "unknown": with
+// several candidate accounts there is no privacy-safe way to guess.
+func soleHome(homes map[string]struct{}) (string, bool) {
+	if len(homes) != 1 {
+		return "", false
+	}
+	for home := range homes {
+		return home, true
+	}
+	return "", false
+}
+
+// soleDesktopUserHome is the fallback for hosts without usable logind data. It
+// reads a directory keyed by uid (/run/user) or username (/home) and resolves a
+// home only when exactly one plausible desktop account is present — on a
+// multi-user box it returns ok=false rather than picking one at random.
+func soleDesktopUserHome(dir string, uidKeyed bool) (string, bool) {
+	return soleDesktopUserHomeWithResolver(dir, func(name string) string {
+		if uidKeyed {
+			if _, err := strconv.Atoi(name); err != nil {
+				return "" // not a uid
+			}
+			if name == "0" {
+				return ""
+			}
+			return homeForUID(name)
+		}
+		if isSystemUser(name) {
+			return ""
+		}
+		home := homeForUser(name)
+		if home == "" {
+			home = filepath.Join(dir, name) // no passwd entry; use the path as-is
+		}
+		return home
+	})
+}
+
+func soleDesktopUserHomeWithResolver(dir string, resolve func(name string) string) (string, bool) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return "", false
 	}
-	var bestHome string
-	var bestMtime time.Time
-	for _, e := range entries {
-		if !e.IsDir() {
+	homes := make(map[string]struct{})
+	for _, entry := range entries {
+		if !entry.IsDir() {
 			continue
 		}
-		name := e.Name()
-		var home string
-		if uidKeyed {
-			if _, err := strconv.Atoi(name); err != nil {
-				continue // not a uid
-			}
-			home = homeForUID(name)
-		} else {
-			if isSystemUser(name) {
-				continue
-			}
-			home = homeForUser(name)
-			if home == "" {
-				home = filepath.Join(dir, name) // no passwd entry; use the path as-is
-			}
-		}
-		if home == "" {
+		home := resolve(entry.Name())
+		if !isPlausibleUserHome(home) {
 			continue
 		}
-		info, err := e.Info()
-		if err != nil {
-			continue
-		}
-		if info.ModTime().After(bestMtime) {
-			bestMtime = info.ModTime()
-			bestHome = home
+		homes[home] = struct{}{}
+	}
+	return soleHome(homes)
+}
+
+// isPlausibleUserHome rejects homes that belong to service/system accounts
+// rather than a person who could have logged in at the console.
+func isPlausibleUserHome(home string) bool {
+	home = strings.TrimSpace(home)
+	if home == "" {
+		return false
+	}
+	home = filepath.Clean(home)
+	switch home {
+	case "/", "/root", "/nonexistent", "/var/root", "/var/empty":
+		return false
+	}
+	for _, prefix := range []string{"/var/", "/run/", "/usr/", "/etc/", "/bin", "/sbin", "/lib", "/dev/", "/proc/", "/sys/"} {
+		if home == strings.TrimSuffix(prefix, "/") || strings.HasPrefix(home, prefix) {
+			return false
 		}
 	}
-	if bestHome == "" {
-		return "", false
-	}
-	return bestHome, true
+	return true
 }
 
 func isSystemUser(name string) bool {

@@ -18,6 +18,7 @@ import (
 
 	"aliang.one/nursorgate/common/cache"
 	"aliang.one/nursorgate/common/logger"
+	"aliang.one/nursorgate/internal/tccguard"
 )
 
 const (
@@ -245,6 +246,12 @@ func envMiBAllowZero(key string, def int64) int64 {
 // resolveAgentAuthorizedCWD confines remote execution to project directories
 // discovered and synchronized by this agent. Symlinks are resolved before the
 // containment check so a path cannot escape an authorized root indirectly.
+//
+// Every disk-touching step (symlink resolution, stat) sits behind
+// resolveAgentCWDWithConsent: on macOS a project under Desktop/Documents/
+// Downloads/iCloud would otherwise raise a TCC prompt that nobody can answer
+// when the request comes from the phone while the user is away. The consent
+// gate probes the protected category once and remembers the grant.
 func resolveAgentAuthorizedCWD(raw string, label string) (string, error) {
 	cwd := strings.TrimSpace(raw)
 	authorized := agentAuthorizedExecutionDirectories()
@@ -252,14 +259,45 @@ func resolveAgentAuthorizedCWD(raw string, label string) (string, error) {
 		if len(authorized) == 0 {
 			return "", fmt.Errorf("%s is not authorized: no synchronized project directories", label)
 		}
-		cwd = authorized[0]
+		var firstErr error
+		for _, candidate := range authorized {
+			resolved, err := resolveAgentCWDWithConsent(candidate)
+			if err == nil {
+				return resolved, nil
+			}
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+		if firstErr != nil {
+			return "", firstErr
+		}
+		return "", fmt.Errorf("%s is not authorized: no usable project directories", label)
 	}
-	resolved, err := cleanExistingAgentDirectory(cwd)
+	resolved, err := resolveAgentCWDWithConsent(cwd)
 	if err != nil {
 		return "", err
 	}
-	if !agentPathInsideAnyDirectory(resolved, authorized) {
+	if !agentAuthorizedDirectoryMatch(resolved, authorized) {
 		return "", fmt.Errorf("%s is outside authorized project directories: %s", label, resolved)
+	}
+	return resolved, nil
+}
+
+// resolveAgentCWDWithConsent vets a working directory through tccguard before
+// and after symbolic-link resolution. The post-resolution check matters because
+// a path that looks unprotected can resolve into a protected folder (or another
+// account's home) through a symlink.
+func resolveAgentCWDWithConsent(raw string) (string, error) {
+	if err := tccguard.GuardPath(raw); err != nil {
+		return "", err
+	}
+	resolved, err := cleanExistingAgentDirectory(raw)
+	if err != nil {
+		return "", err
+	}
+	if err := tccguard.GuardPath(resolved); err != nil {
+		return "", err
 	}
 	return resolved, nil
 }
@@ -305,7 +343,7 @@ func resolveAgentCWDFallbackHome(raw string, label string) (string, error) {
 				raw = filepath.Join(home, raw[1:])
 			}
 		}
-		return cleanExistingAgentDirectory(raw)
+		return resolveAgentCWDWithConsent(raw)
 	}
 	return resolveAgentAuthorizedCWD(raw, label)
 }
@@ -332,12 +370,20 @@ func WarmAgentAuthorizedExecutionDirectories() {
 	go refreshAgentAuthorizedExecutionDirectories()
 }
 
+// setAgentAuthorizedExecutionDirectoriesCache refreshes the authorized-directory
+// cache without touching the disk. This runs from background paths (connect
+// hello, inventory/digest tickers, warm-up) where a stat of a project folder
+// under Desktop/Documents/Downloads would raise a macOS TCC prompt while the
+// user is away from the Mac (2026-10-27 privacy fix). Entries are therefore kept
+// as normalized strings only; existence and symlink resolution are deferred to
+// agentAuthorizedDirectoryMatch, which runs on an explicit user action
+// (terminal.create) and goes through the consent gate.
 func setAgentAuthorizedExecutionDirectoriesCache(rawDirs []string) []string {
 	seen := make(map[string]struct{}, len(rawDirs))
 	dirs := make([]string, 0, len(rawDirs))
 	for _, raw := range rawDirs {
-		dir, err := cleanExistingAgentDirectory(raw)
-		if err != nil {
+		dir, ok := normalizeAgentDirectoryString(raw)
+		if !ok {
 			continue
 		}
 		if _, ok := seen[dir]; ok {
@@ -350,6 +396,48 @@ func setAgentAuthorizedExecutionDirectoriesCache(rawDirs []string) []string {
 	agentAuthorizedDirsCache = append([]string(nil), dirs...)
 	agentAuthorizedDirsMu.Unlock()
 	return append([]string(nil), dirs...)
+}
+
+// normalizeAgentDirectoryString trims, expands ~, and absolutizes a configured
+// directory WITHOUT any filesystem access (no stat, no EvalSymlinks).
+func normalizeAgentDirectoryString(raw string) (string, bool) {
+	dir := strings.TrimSpace(raw)
+	if dir == "" {
+		return "", false
+	}
+	if expanded, err := cache.ExpandHomePath(dir); err == nil {
+		dir = expanded
+	}
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return "", false
+	}
+	return filepath.Clean(abs), true
+}
+
+// agentAuthorizedDirectoryMatch reports whether path (already symlink-resolved)
+// lies inside any authorized directory. The lexical comparison is tried first;
+// when it misses (the configured entry itself contains a symlinked component,
+// or is stale) each entry is re-resolved on demand — behind the TCC consent
+// gate — and compared again. Only an explicit user action reaches this helper,
+// so the on-demand disk access cannot fire from a background ticker.
+func agentAuthorizedDirectoryMatch(path string, dirs []string) bool {
+	if agentPathInsideAnyDirectory(path, dirs) {
+		return true
+	}
+	for _, dir := range dirs {
+		if err := tccguard.GuardPath(dir); err != nil {
+			continue
+		}
+		resolved, err := cleanExistingAgentDirectory(dir)
+		if err != nil {
+			continue
+		}
+		if agentPathInsideDirectory(path, resolved) {
+			return true
+		}
+	}
+	return false
 }
 
 func cleanExistingAgentDirectory(raw string) (string, error) {
