@@ -590,10 +590,11 @@ func TestEmitTerminalBoundedPassesThroughSuccess(t *testing.T) {
 
 // forceFinalize 自己绝不能被卡死的写侧拖住：会话复位（手机回到 idle）是
 // 强拆的第一目的，投递只是尽力而为。
-// 刻意不覆盖 agentAIKillGrace：写侧永久阻塞，投递 goroutine 会一直停在
-// emitTerminalBounded 里读 agentAIKillGrace；此时若用 t.Cleanup 回写这个
-// 包级 var，就与那个读构成真实数据竞争（-race 已实测报出）。用生产默认
-// 30s 判据更强：同步投递的话 forceFinalize 会卡 30s，异步则立刻返回。
+// 刻意不覆盖 agentAIKillGrace：实参求值读一次 agentAIKillGrace 后，投递
+// goroutine 便卡死在 emit 内部永不返回；此时若用 t.Cleanup 回写这个包级
+// var，回写与那次读之间没有任何同步边，构成真实数据竞争（-race 已实测
+// 报出）。用生产默认 30s 判据更强：同步投递的话 forceFinalize 会卡 30s，
+// 异步则立刻返回。
 func TestForceFinalizeReturnsImmediatelyWithBlockedEmitter(t *testing.T) {
 	m := newAgentAIManager()
 	activity := newAgentAIActivity()

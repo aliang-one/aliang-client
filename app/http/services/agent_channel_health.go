@@ -194,10 +194,11 @@ func (h *agentChannelHealth) reset() {
 //
 // 环的两端是两个包级 var：agentTransferFetchInbox（agent_transfer_inbox.go:47）
 // 与 agentChannelAlertWriter（本行）。init() 内的赋值不参与依赖分析，这条边
-// 因此在编译期被截断。同一份编译输出里另有 4 个同形态的环
+// 因此在编译期被截断。同一份编译输出里还有 4 个同形态的环
 // （agentTransferFetchDownloadURL / agentTransferSendConfirm /
-// agentTransferFetchParts / agentTransferFetchInbox），它们都已用同样的
-// init() 手法断开——不要试图"清理"成包级 var。
+// agentTransferFetchParts / agentTransferFetchInbox），它们经同一条公共边
+// 闭合，本变量维持 init() 即一截全断；那 4 个 transfer var **保持声明处
+// 初始化**，不要改成 init()，也不要把本变量"清理"成包级 var。
 var agentChannelAlertWriter func(map[string]interface{}) error
 
 func init() {

@@ -1810,8 +1810,10 @@ func classifyRegisterFailure(err error) bool {
 		return false
 	}
 	// 本地 401 退避 = 这次调用根本没发出去（allow() 在发请求前就拦下了），
-	// 等价于瞬时链路故障，不构成注销理由。必须在上面 typed 401 判定**之后**：
-	// 退避是 401 的后果，不是 401 本身，顺序反了会把真凭据拒绝也当瞬时。
+	// 等价于瞬时链路故障，不构成注销理由。排在 typed 401 判定之后是防御性
+	// 排序：当前两类错误互不包裹（401 只产自响应分支、backoff 只产自本地
+	// 闸门），但一旦未来同一条 wrap 链同时含两者，必须 401 优先——真凭据
+	// 拒绝不得被降格成瞬时。
 	if isAgentChannelBackoffError(err) {
 		return true
 	}

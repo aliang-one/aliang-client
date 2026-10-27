@@ -361,7 +361,8 @@ func TestRegisterBackoffKeepsRegistrationAndLastSyncStatus(t *testing.T) {
 
 	endpoint := config.GetGlobalConfig().GetAgentDeviceRegisterURL()
 	authHeader := effectiveAgentRegisterAuthHeader("")
-	// 打满阈值次真 401：首次落退避，后续被本地闸门挡下（不重复打上游）。
+	// 1 次真 401 即落退避（30s 基窗）；循环上界取阈值常量只为语义对齐，
+	// 后续迭代会被本地闸门拦下、不再打上游（用 hitsBefore 佐证）。
 	for i := 0; i < agentChannelAlertThreshold; i++ {
 		_, _ = service.callAgentServer(http.MethodPost, endpoint, nil, "")
 	}
