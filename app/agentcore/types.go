@@ -216,11 +216,15 @@ type streamMessage struct {
 // streamDelta 是各类 delta 的并集。
 //
 //	text_delta        → Text
+//	thinking_delta    → Thinking
 //	input_json_delta  → PartialJSON
 //	message_delta     → StopReason
 type streamDelta struct {
-	Type        string `json:"type"`
-	Text        string `json:"text,omitempty"`
+	Type string `json:"type"`
+	Text string `json:"text,omitempty"`
+	// thinking_delta 的思考文本。只流式转发给宿主（ai.thinking），
+	// 绝不进对话历史与结果正文。
+	Thinking    string `json:"thinking,omitempty"`
 	PartialJSON string `json:"partial_json,omitempty"`
 	StopReason  string `json:"stop_reason,omitempty"`
 }

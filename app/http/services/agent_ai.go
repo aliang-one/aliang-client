@@ -1136,8 +1136,11 @@ func (a *agentAIActivity) bump() {
 }
 
 // markProgress records meaningful progress and counts as activity. Callers:
-// emitAIDelta (assistant text/thinking), the run's fileSink (file written or
-// edited), and the Codex item/completed handler (one work unit finished).
+// emitAIDelta (assistant text/thinking), the claude/agentcore thinking stream
+// in emitClaudeStructuredEvents (内核把 thinking_delta 透传成帧后，纯推理期间
+// 这是服务层唯一活性信号——L3 stale 扫描器 5 分钟就判死), the run's fileSink
+// (file written or edited), and the Codex item/completed handler (one work
+// unit finished).
 func (a *agentAIActivity) markProgress() {
 	if a == nil {
 		return

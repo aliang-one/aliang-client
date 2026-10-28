@@ -153,6 +153,19 @@ func (w *streamWriter) TextBlockStart(index int) error {
 	})
 }
 
+// ThinkingBlockStart 是思考块的 content_block_start 便捷方法。
+//
+// 与 TextBlockStart 一样等到第一段 delta 才发（见 streamTurn 的 started 表）；
+// 宿主 emitClaudeStructuredEvents 靠 content_block_start 记住块类型，收
+// content_block_stop 时才知道要补一发 ai.thinking active:false，所以这个
+// start 不能省。
+func (w *streamWriter) ThinkingBlockStart(index int) error {
+	return w.ContentBlockStart(index, map[string]interface{}{
+		"type":     BlockTypeThinking,
+		"thinking": "",
+	})
+}
+
 // ToolUseBlockStart 是工具块的 content_block_start 便捷方法。
 func (w *streamWriter) ToolUseBlockStart(index int, id, name string) error {
 	return w.ContentBlockStart(index, map[string]interface{}{
@@ -171,6 +184,20 @@ func (w *streamWriter) TextDelta(index int, text string) error {
 	return w.ContentBlockDelta(index, map[string]interface{}{
 		"type": "text_delta",
 		"text": text,
+	})
+}
+
+// ThinkingDelta 发一段思考增量。字段名 thinking 对齐真 claude-code 的帧：
+// 宿主 emitClaudeStructuredEvents 只认 delta.type=thinking_delta、取
+// delta.thinking，翻成 ai.thinking 并 markProgress——纯推理期间这是服务层
+// 唯一的活性信号（L3 stale 扫描器 5 分钟就判死），内核必须原样透传而不是丢。
+func (w *streamWriter) ThinkingDelta(index int, text string) error {
+	if text == "" {
+		return nil
+	}
+	return w.ContentBlockDelta(index, map[string]interface{}{
+		"type":     "thinking_delta",
+		"thinking": text,
 	})
 }
 

@@ -112,15 +112,15 @@ func (c *Client) WithStreamIdleTimeout(d time.Duration) *Client {
 //
 // 内核只关心这几类，其余（ping 等）直接丢弃。
 type StreamEvent struct {
-	// Kind: "start" | "text" | "image" | "tool_use_start" | "tool_input"
-	//       | "block_stop" | "stop" | "error"
+	// Kind: "start" | "text" | "thinking" | "image" | "tool_use_start"
+	//       | "tool_input" | "block_stop" | "stop" | "error"
 	Kind string
 
 	// start
 	MessageID string
 	Model     string
 
-	// text
+	// text / thinking
 	Text string
 
 	// image
@@ -146,6 +146,7 @@ type StreamEvent struct {
 const (
 	EventStart        = "start"
 	EventText         = "text"
+	EventThinking     = "thinking"
 	EventImage        = "image"
 	EventToolUseStart = "tool_use_start"
 	EventToolInput    = "tool_input"
@@ -630,7 +631,7 @@ func translateEvent(ev *sseEvent) ([]StreamEvent, error) {
 		}
 		switch ev.ContentBlock.Type {
 		case BlockTypeText, BlockTypeThinking:
-			// 文本块起始本身不带内容，等 delta。
+			// 文本/思考块起始本身不带内容，等 delta。
 			return nil, nil
 		case BlockTypeImage:
 			// 图片块是**完整**的（source 在 start 里一次给全，没有 delta），
@@ -663,14 +664,23 @@ func translateEvent(ev *sseEvent) ([]StreamEvent, error) {
 				return nil, nil
 			}
 			return []StreamEvent{{Kind: EventText, Index: ev.Index, Text: ev.Delta.Text}}, nil
+		case "thinking_delta":
+			if ev.Delta.Thinking == "" {
+				return nil, nil
+			}
+			return []StreamEvent{{Kind: EventThinking, Index: ev.Index, Text: ev.Delta.Thinking}}, nil
 		case "input_json_delta":
 			return []StreamEvent{{
 				Kind:        EventToolInput,
 				Index:       ev.Index,
 				PartialJSON: ev.Delta.PartialJSON,
 			}}, nil
+		case "signature_delta":
+			// 思考块的签名字段：不是用户可见内容，内核也不做上游签名校验
+			// （思考块从不回传给上游——回传缺签名的思考块才会被拒），所以
+			// 没有需要保存的字节。丢掉。
+			return nil, nil
 		}
-		// thinking_delta / signature_delta 等首期不消费。
 		return nil, nil
 
 	case "content_block_stop":

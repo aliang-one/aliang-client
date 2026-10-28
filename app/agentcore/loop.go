@@ -896,6 +896,25 @@ func (r *runner) streamTurn(ctx context.Context, req *MessagesRequest, writer *s
 				}
 			}
 
+		case EventThinking:
+			// 思考块只流式转发给宿主（→ ai.thinking → 服务层活性），刻意不进
+			// blocks / textAll / turnText：
+			//   1. 思考块在上游带 signature，内核不消费 signature_delta，把
+			//      无签名的思考块回传给下一轮请求会被上游拒；
+			//   2. 宿主只把 finalized assistant 帧里的 text 块当正文落库，思考
+			//      内容混进去会污染 transcript 与 result 文本。
+			if writer != nil {
+				if !started[ev.Index] {
+					started[ev.Index] = true
+					if err := writer.ThinkingBlockStart(ev.Index); err != nil {
+						return err
+					}
+				}
+				if err := writer.ThinkingDelta(ev.Index, ev.Text); err != nil {
+					return err
+				}
+			}
+
 		case EventImage:
 			ensureIndex(ev.Index)
 			blocks[ev.Index] = ContentBlock{Type: BlockTypeImage, Source: ev.Image}

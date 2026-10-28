@@ -275,6 +275,102 @@ func TestRunTextOnlyFrameSequence(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// 思考块（thinking）
+// ---------------------------------------------------------------------------
+
+// TestRunThinkingFrameSequence 锁内核的思考流契约：上游 thinking 块逐段透传
+// 成 content_block_start/delta/stop（宿主翻成 ai.thinking 并 markProgress，
+// 纯推理期间这是服务层唯一活性信号）；signature_delta 丢弃不发帧；思考内容
+// 不进 blocks——finalized assistant 帧与 result 正文只有 text。
+func TestRunThinkingFrameSequence(t *testing.T) {
+	script := &turnScript{turns: []string{
+		`{"type":"message_start","message":{"id":"msg_think","model":"claude-x"}}` + "\n\n" +
+			`data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}` + "\n\n" +
+			`data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"先想"}}` + "\n\n" +
+			`data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-bytes"}}` + "\n\n" +
+			`data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"再答"}}` + "\n\n" +
+			`data: {"type":"content_block_stop","index":0}` + "\n\n" +
+			`data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}` + "\n\n" +
+			`data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"结论"}}` + "\n\n" +
+			`data: {"type":"content_block_stop","index":1}` + "\n\n" +
+			`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7}}`,
+	}}
+	srv := sseServer(t, script.handler(t))
+
+	rec := &frameRecorder{}
+	cfg := &Config{
+		Client:    NewClient(srv.URL),
+		Model:     "claude-x",
+		Emit:      rec.emit,
+		SessionID: "sess-think",
+	}
+	res, err := Run(context.Background(), cfg, []Message{TextMessage("user", "hi")})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Text != "结论" {
+		t.Errorf("RunResult.Text = %q, want 结论（思考内容不得进正文）", res.Text)
+	}
+
+	frames := rec.frames(t)
+	got := frameKinds(frames)
+	want := []string{
+		"system:init",
+		"stream_event:message_start",
+		"stream_event:content_block_start", // thinking 块 start（第一段 delta 触发）
+		"stream_event:content_block_delta", // thinking_delta
+		"stream_event:content_block_delta", // thinking_delta；signature_delta 不产生帧
+		"stream_event:content_block_stop",
+		"stream_event:content_block_start", // text 块
+		"stream_event:content_block_delta",
+		"stream_event:content_block_stop",
+		"assistant",
+		"result",
+	}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("帧序列不符\n got: %v\nwant: %v", got, want)
+	}
+
+	assertSessionIDOnEveryFrame(t, frames, "sess-think")
+
+	// thinking start 帧的形状：type=thinking，宿主 emitClaudeStructuredEvents
+	// 靠它登记块类型，stop 时才补得出 active:false。
+	startEv, _ := frames[2]["event"].(map[string]interface{})
+	if cb, _ := startEv["content_block"].(map[string]interface{}); cb["type"] != BlockTypeThinking {
+		t.Errorf("content_block.type = %v, want thinking", cb["type"])
+	}
+	// thinking delta 帧的形状：delta.type=thinking_delta、字段名 thinking，
+	// 宿主只认这一种（与 CLI 路径同帧，不造第二种 thinking 帧）。
+	for i, wantText := range map[int]string{3: "先想", 4: "再答"} {
+		ev, _ := frames[i]["event"].(map[string]interface{})
+		delta, _ := ev["delta"].(map[string]interface{})
+		if delta["type"] != "thinking_delta" {
+			t.Errorf("第 %d 帧 delta.type = %v, want thinking_delta", i, delta["type"])
+		}
+		if delta["thinking"] != wantText {
+			t.Errorf("第 %d 帧 delta.thinking = %v, want %q", i, delta["thinking"], wantText)
+		}
+	}
+
+	// finalized assistant 帧：content 只有 text 块——宿主只持久化这一帧的
+	// text，思考块混进去会污染 transcript。
+	content := messageContent(t, assistantFrame(t, frames))
+	if len(content) != 1 {
+		t.Fatalf("assistant content 长度 = %d, want 1（只有 text 块，无 thinking）", len(content))
+	}
+	block, _ := content[0].(map[string]interface{})
+	if bt, _ := block["type"].(string); bt != BlockTypeText {
+		t.Errorf("content[0].type = %q, want text", bt)
+	}
+	if txt, _ := block["text"].(string); txt != "结论" {
+		t.Errorf("content[0].text = %q, want 结论", txt)
+	}
+	if txt, _ := resultFrame(t, frames)["result"].(string); txt != "结论" {
+		t.Errorf("result.result = %q, want 结论", txt)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // 工具回合
 // ---------------------------------------------------------------------------
 
