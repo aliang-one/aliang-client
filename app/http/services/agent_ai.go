@@ -46,6 +46,11 @@ type agentAIManager struct {
 	// coreJournal 是 agentcore（AliangCode）调用记录落盘器；dir 为空时内部
 	// 全 no-op。构造时解析一次 agentHome()。
 	coreJournal *agentCoreJournal
+	// —— 跨端会话统一（2026-10-28）——
+	// aiSockets 是出站 socket 注册表；aiSocketSeq 发号。originSocket 不在
+	// manager：随消息 __origin_socket 字段走，落到 session.originSocket（后续任务）。
+	aiSockets   map[string]*agentAISocket
+	aiSocketSeq int
 	// coreMCPDialForTest 允许测试注入内存 MCP 会话（忽略 raw 配置直接返回
 	// session）；nil = 用真实 agentCoreMCPDial。仅测试可写。
 	coreMCPDialForTest func(ctx context.Context, raw agentCoreMCPRawServer) (*mcp.ClientSession, func(), error)
@@ -993,6 +998,7 @@ func newAgentAIManager() *agentAIManager {
 		bindings:           make(map[string]agentAIBindingRecord),
 		processedRuns:      make(map[string]agentAIProcessedRun),
 		coreJournal:        newAgentCoreJournal(agentCoreJournalDir()),
+		aiSockets:          make(map[string]*agentAISocket),
 	}
 	return m
 }
