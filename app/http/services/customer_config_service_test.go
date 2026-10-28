@@ -718,6 +718,57 @@ func TestExtractCustomerFromConfigContent_NormalizesAIRules(t *testing.T) {
 	}
 }
 
+// agentcore_llm 必须在可编辑白名单里,否则保存 400。
+func TestValidateEditableCustomerKeysAllowsAgentCoreLLM(t *testing.T) {
+	raw := map[string]json.RawMessage{
+		"agentcore_llm": json.RawMessage(`{"enabled":true,"base_url":"http://127.0.0.1:8082"}`),
+	}
+	if err := validateEditableCustomerKeys(raw); err != nil {
+		t.Fatalf("agentcore_llm 应放行, got %v", err)
+	}
+	err := validateEditableCustomerKeys(map[string]json.RawMessage{
+		"no_such_key": json.RawMessage(`{}`),
+	})
+	if err == nil || !strings.Contains(err.Error(), "agentcore_llm") {
+		t.Errorf("拒绝文案应含更新后的字段清单, got %v", err)
+	}
+}
+
+// 保存通道 400:agentcore_llm 远端+无 key 必须在保存时被 Config.Validate 拒绝,
+// 不能出现「保存成功、回合时静默整层关闭」的形态。
+func TestSaveCustomerConfigRejectsAgentCoreLLMRemoteNoKey(t *testing.T) {
+	config.ResetGlobalConfigForTest()
+	config.ResetEffectiveConfigCommitCoordinatorForTest()
+	storage.ResetSoftwareConfigDBForTest()
+	t.Cleanup(func() {
+		config.ResetGlobalConfigForTest()
+		config.ResetEffectiveConfigCommitCoordinatorForTest()
+		storage.ResetSoftwareConfigDBForTest()
+	})
+
+	tempHome := t.TempDir()
+	t.Setenv("HOME", tempHome)
+	t.Setenv("ALIANG_CACHE_DIR", filepath.Join(tempHome, ".aliang-cache"))
+
+	config.SetGlobalConfig(&config.Config{
+		Core:     &config.CoreConfig{APIServer: "https://api.aliang.one"},
+		Customer: &config.CustomerConfig{},
+	})
+
+	service := NewCustomerConfigService()
+	_, err := service.UpdateCommittedCustomerConfig([]byte(`{
+		"customer": {
+			"agentcore_llm": {"enabled": true, "base_url": "https://gw.example.com"}
+		}
+	}`))
+	if err == nil {
+		t.Fatal("agentcore_llm 远端+无 key 应保存失败, got nil")
+	}
+	if !strings.Contains(err.Error(), "agentcore_llm.api_key") {
+		t.Fatalf("错误信息应含 agentcore_llm.api_key, got %v", err)
+	}
+}
+
 func aiRuleKeys(rules map[string]*config.CustomerAIRuleSetting) []string {
 	keys := make([]string, 0, len(rules))
 	for key := range rules {

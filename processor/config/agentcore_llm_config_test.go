@@ -20,11 +20,14 @@ func TestEffectiveAgentCoreLLM(t *testing.T) {
 		t.Errorf("启用但 URL 空 → %v, want nil(整层关闭)", got)
 	}
 	cfg := &Config{Customer: &CustomerConfig{AgentCoreLLM: &AgentCoreLLMConfig{
-		Enabled: true, BaseURL: " https://gw.example.com ", APIKey: "sk-x",
+		Enabled: true, BaseURL: " https://gw.example.com ", APIKey: " sk-x ",
 	}}}
 	got := cfg.EffectiveAgentCoreLLM()
 	if got == nil || got.BaseURL != "https://gw.example.com" {
 		t.Errorf("→ %+v, want trim 后的配置副本", got)
+	}
+	if got == nil || got.APIKey != "sk-x" {
+		t.Errorf("APIKey 未 trim: got %+v, want trim 后的 %q", got, "sk-x")
 	}
 	// 返回副本:改副本不影响原配置
 	got.BaseURL = " mutated "
@@ -64,6 +67,10 @@ func TestAgentCoreLLMValidate(t *testing.T) {
 		{"启用+localhost+无 key 合法", &AgentCoreLLMConfig{Enabled: true, BaseURL: "http://localhost:8082"}, ""},
 		{"启用+远端+无 key 拒", &AgentCoreLLMConfig{Enabled: true, BaseURL: "https://gw.example.com"}, "api_key"},
 		{"启用+远端+有 key 合法", &AgentCoreLLMConfig{Enabled: true, BaseURL: "https://gw.example.com", APIKey: "sk-x"}, ""},
+		{"启用+ftp scheme 拒", &AgentCoreLLMConfig{Enabled: true, BaseURL: "ftp://gw.example.com", APIKey: "sk-x"}, "http/https"},
+		{"启用+IPv6 回环合法", &AgentCoreLLMConfig{Enabled: true, BaseURL: "http://[::1]:8082"}, ""},
+		{"启用+回环段其他地址合法", &AgentCoreLLMConfig{Enabled: true, BaseURL: "http://127.0.0.2:8082"}, ""},
+		{"启用+.localhost 后缀合法", &AgentCoreLLMConfig{Enabled: true, BaseURL: "http://api.localhost:8082"}, ""},
 	}
 	for _, tc := range cases {
 		err := tc.cfg.Validate()

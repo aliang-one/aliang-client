@@ -601,6 +601,11 @@ func (cfg *AgentCoreLLMConfig) Validate() error {
 	if err != nil || u.Scheme == "" || u.Host == "" {
 		return fmt.Errorf("agentcore_llm.base_url 必须是合法 URL(含 scheme 与 host), got %q", cfg.BaseURL)
 	}
+	// scheme 只放行 http/https(内核 HTTP 客户端不支持 ftp 等其他 scheme)。
+	// 有意放行远端 http://:家庭内网网关如 http://192.168.x.x 无 TLS 可言,属合理形态,不强推 https。
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("agentcore_llm.base_url 仅支持 http/https, got %q", cfg.BaseURL)
+	}
 	if !isLoopbackHostName(u.Hostname()) && strings.TrimSpace(cfg.APIKey) == "" {
 		return fmt.Errorf("agentcore_llm.api_key 必填: 非回环地址 %s 无平台 relay 注入凭据", strings.TrimSpace(cfg.BaseURL))
 	}
