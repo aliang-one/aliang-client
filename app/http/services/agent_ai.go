@@ -2898,6 +2898,15 @@ func (m *agentAIManager) optionResponse(msg map[string]interface{}, writeJSON ag
 		return
 	}
 	session := m.sessions[sessionID]
+	// 跨端同态（Task 7 前置）：option 作答同样刷新 session.originSocket——
+	// option 续接的执行 run 与其后续审批 ack 都要写回「作答这条 socket」，
+	// 不刷新的话执行 run 还带着上一回合的旧 origin，ack 双写会写到旧通道。
+	// 空标记（TUI/测试内部旧调用方）不动。
+	if session != nil {
+		if v := strings.TrimSpace(remoteString(msg, agentAIOriginSocketField)); v != "" {
+			session.originSocket = v
+		}
+	}
 	if session == nil || session.cancel != nil || session.pendingOption == nil || session.pendingOption.ID != optionID {
 		m.mu.Unlock()
 		return
@@ -3250,10 +3259,21 @@ func (m *agentAIManager) approval(msg map[string]interface{}, writeJSON agentTer
 	// Always ACK a delivery (even on duplicate / no_match / bad decision) so the
 	// server stops retrying it. result tells the server whether the decision
 	// actually took effect on a live waiter.
+	//
+	// 跨端同态（spec §4.2.2）：ack 双写——决策到达的 socket（现有语义，重投
+	// 引擎的对端确认）+ run 发起的 socket（修「仪表盘抢答手机回合时 PhoneServer
+	// 收不到 ack、已生效决策被重投至 10 次」）。runSocket 在闭包外一次取好
+	// （session.originSocket，Task 5 落）；同 socket 只写一次；run socket 已
+	// 换道/已死/未注册时尽力而为跳过（服务端宽限+离线撤单兜底）。duplicate /
+	// no_match / 坏决策各 return 路径都经这一个闭包，全覆盖。
+	originSocket := strings.TrimSpace(remoteString(msg, agentAIOriginSocketField))
+	runSocket := ""
+	m.mu.Lock()
+	if s := m.sessions[sessionID]; s != nil {
+		runSocket = s.originSocket
+	}
+	m.mu.Unlock()
 	ack := func(result string) {
-		if writeJSON == nil {
-			return
-		}
 		payload := map[string]interface{}{
 			"type":        models.AgentEventAIApprovalAck,
 			"session_id":  sessionID,
@@ -3263,7 +3283,17 @@ func (m *agentAIManager) approval(msg map[string]interface{}, writeJSON agentTer
 		if deliveryID != "" {
 			payload["delivery_id"] = deliveryID
 		}
-		_ = writeJSON(payload)
+		if writeJSON != nil {
+			_ = writeJSON(payload)
+		}
+		if runSocket != "" && runSocket != originSocket {
+			m.mu.Lock()
+			sock := m.aiSockets[runSocket]
+			m.mu.Unlock()
+			if sock != nil && sock.alive() {
+				sock.enqueue(payload)
+			}
+		}
 	}
 	if decision == "" {
 		ack("no_match")
