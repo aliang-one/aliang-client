@@ -316,9 +316,9 @@ func TestRunAgentCoreRejectsEmptyHistory(t *testing.T) {
 
 // TestAgentCoreApprovePolicyShortCircuits 锁死审批桥的本地短路。
 //
-// 关键性质：这些分支**都不问用户**。如果策略短路坏了，require_approval 会真的
-// 去等云端审批（超时默认 24h），测试会挂死——所以这里同时是「不许误走云端」
-// 的守卫。
+// 关键性质：项目内的读写不问用户。2026-10-28 起唯一不再本地判死的是
+// outside-project-path——它升级为 require_approval（与 outside-project-bash
+// 同口径），末尾用例改走「等审批登记 + 替用户拒绝」的交互路径。
 //
 // 工具名必须与内核注册表逐字一致（Read / Write，大写开头）：策略规则的
 // Match.Tool 是**大小写敏感**的精确比较，写成 "read" 会一条规则都不命中，
@@ -357,19 +357,36 @@ func TestAgentCoreApprovePolicyShortCircuits(t *testing.T) {
 		t.Fatalf("项目内 write 应被策略放行，实际 %+v", resp)
 	}
 
-	// 越界写入 → 项目边界规则直接拒绝（不进策略、不弹审批）。
-	resp, err = approve(context.Background(), agentcore.ApprovalRequest{
-		ToolName: "Write",
-		Input:    map[string]interface{}{"file_path": filepath.Join(string(filepath.Separator), "etc", "passwd")},
-	})
-	if err != nil {
-		t.Fatalf("越界 write 审批返回错误: %v", err)
+	// 越界写入 → 2026-10-28 降级：项目边界规则升级为 require_approval，
+	// 不再本地判死——审批请求必须真的登记（等用户在手机上拍板）。
+	// goroutine 发起审批，主 goroutine 等登记后替用户「拒绝」。
+	type approveResult struct {
+		resp agentcore.ApprovalResponse
+		err  error
 	}
-	if resp.Approved {
-		t.Fatalf("越界 write 必须被拒绝，实际 %+v", resp)
-	}
-	if !strings.Contains(resp.Reason, "策略") {
-		t.Errorf("拒绝原因 = %q, want 含「策略」（设备策略拒绝，不是用户拒绝）", resp.Reason)
+	resultCh := make(chan approveResult, 1)
+	go func() {
+		resp, err := approve(context.Background(), agentcore.ApprovalRequest{
+			ToolName: "Write",
+			Input:    map[string]interface{}{"file_path": filepath.Join(string(filepath.Separator), "etc", "passwd")},
+		})
+		resultCh <- approveResult{resp: resp, err: err}
+	}()
+	waiter := waitForAgentCoreApproval(t, m, "conv-approve", &agentCoreEventLog{})
+	waiter.request.respond <- agentAIApprovalResponse{Decision: models.AgentAIApprovalDecisionDecline}
+	select {
+	case got := <-resultCh:
+		if got.err != nil {
+			t.Fatalf("越界 write 审批返回错误: %v", got.err)
+		}
+		if got.resp.Approved {
+			t.Fatalf("越界 write 被用户拒绝后必须不执行，实际 %+v", got.resp)
+		}
+		if !strings.Contains(got.resp.Reason, "用户拒绝") {
+			t.Errorf("拒绝原因 = %q, want 含「用户拒绝」", got.resp.Reason)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("替用户拒绝后审批没有返回")
 	}
 }
 
