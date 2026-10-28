@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -145,14 +147,17 @@ func (r *Registry) Defs() []ToolDef {
 	return defs
 }
 
-// DefaultRegistry 返回 pi 对等的 8 个工具。
+// DefaultRegistry 返回 pi 对等的工具集。PowerShell 只在 Windows 注册：非
+// Windows 上它是一个必然失败的 schema 槽位，白占上下文还诱导模型去试。
 func DefaultRegistry() *Registry {
 	r := NewRegistry()
 	r.Register(&readTool{})
 	r.Register(&writeTool{})
 	r.Register(&editTool{})
 	r.Register(&bashTool{})
-	r.Register(&powershellTool{})
+	if runtime.GOOS == "windows" {
+		r.Register(&powershellTool{})
+	}
 	r.Register(&grepTool{})
 	r.Register(&globTool{})
 	r.Register(&lsTool{})
@@ -350,6 +355,13 @@ func inputInt(input map[string]interface{}, key string) (int, bool) {
 		return v, true
 	case int64:
 		return int(v), true
+	case string:
+		// 个别模型会把整数参数写成字符串（"2000"）。容忍纯数字字符串，
+		// 非数字字符串维持「参数缺失」语义。
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+			return n, true
+		}
+		return 0, false
 	}
 	return 0, false
 }

@@ -1,6 +1,7 @@
 package agentcore
 
 import (
+	"runtime"
 	"context"
 	"os"
 	"path/filepath"
@@ -904,7 +905,11 @@ func utf8Valid(s string) bool {
 
 func TestDefaultRegistryHasEightTools(t *testing.T) {
 	r := DefaultRegistry()
-	want := []string{"Bash", "Edit", "Glob", "Grep", "LS", "PowerShell", "Read", "Write"}
+	// PowerShell 只在 Windows 注册（非 Windows 上它是必然失败的 schema 槽位）。
+	want := []string{"Bash", "Edit", "Glob", "Grep", "LS", "Read", "Write"}
+	if runtime.GOOS == "windows" {
+		want = []string{"Bash", "Edit", "Glob", "Grep", "LS", "PowerShell", "Read", "Write"}
+	}
 	for _, name := range want {
 		if _, ok := r.Get(name); !ok {
 			t.Errorf("缺少工具 %s", name)
