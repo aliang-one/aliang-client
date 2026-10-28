@@ -531,8 +531,7 @@ export default {
       const HARDCODED_PRESETS = [
         { key: 'openai', label: 'OpenAI', default_include: ['openai.com', 'chatgpt.com'], editable: true },
         { key: 'claude', label: 'Claude', default_include: ['claude.ai', 'anthropic.com'], editable: true },
-        { key: 'cursor', label: 'Cursor', default_include: ['api.cursor.com'], editable: true },
-        { key: 'copilot', label: 'Copilot', default_include: ['copilot.microsoft.com'], editable: true }
+        { key: 'cursor', label: 'Cursor', default_include: ['api.cursor.com'], editable: true }
       ];
 
       // Direct fetch — avoids relying on window.customerConfigGetProviders being injected

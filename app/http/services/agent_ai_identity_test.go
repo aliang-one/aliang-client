@@ -81,6 +81,67 @@ printf '%s\n' '{"type":"result","subtype":"success","session_id":"native-claude-
 	}
 }
 
+// 绑定守卫回归（2026-10-27 native session id mismatch 事故）：绑定已 confirmed
+// 为 claudecode 时，provider=agentcore 的 ai.run.start（服务端设备推断翻转的
+// 形态）必须被强制改回绑定的 provider——否则内核 id 会被喂给 claude --resume，
+// confirmBinding mismatch 后会话从这一回合起永久报错。断言走的是 claude CLI
+// （fake 可执行 + --resume 绑定 id）而不是内核分流。
+func TestRunStartProviderForcedToConfirmedBinding(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	projectPath := setupAgentExecutionProjectForTest(t)
+	setAgentAuthorizedExecutionDirectoriesCache([]string{projectPath})
+	binDir := t.TempDir()
+	argsPath := t.TempDir() + "/args"
+	t.Setenv("ARGS_FILE", argsPath)
+	writeFakeExecutable(t, binDir, "claude", `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  printf '%s\n' '2.1.17 (Claude Code)'
+  exit 0
+fi
+printf '%s\n' "$@" >> "$ARGS_FILE"
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"native-claude-1"}'
+printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"ok"}]}}'
+printf '%s\n' '{"type":"result","subtype":"success","session_id":"native-claude-1","result":"ok"}'
+`)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	manager := newAgentAIManager()
+	defer manager.closeAll()
+	manager.bindings["managed-conversation-1"] = agentAIBindingRecord{
+		ConversationID:  "managed-conversation-1",
+		Provider:        "claudecode",
+		NativeSessionID: "native-claude-1",
+		State:           "confirmed",
+		BindingVersion:  1,
+	}
+	mu, events, writer := captureAIWriter(t)
+	start := map[string]interface{}{
+		"type":         "ai.run.start",
+		"session_id":   "managed-conversation-1",
+		"run_id":       "run-force-1",
+		"message_id":   "message-force-1",
+		"provider":     "agentcore",
+		"project_path": projectPath,
+		"content":      "hello",
+	}
+	manager.runStart(start, writer)
+	waitForAgentEvent(t, mu, events, "ai.done", func(event map[string]interface{}) bool {
+		return remoteString(event, "run_id") == "run-force-1"
+	})
+
+	raw, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatalf("read claude args: %v", err)
+	}
+	args := string(raw)
+	if !strings.Contains(args, "--resume\nnative-claude-1") {
+		t.Fatalf("claude args = %q, want --resume native-claude-1 (guard must force provider back to the confirmed binding)", args)
+	}
+	if strings.Contains(args, "--session-id") {
+		t.Fatalf("claude args = %q, must not pre-reserve a new session id", args)
+	}
+}
+
 func TestManagedInventoryUsesBindingAlias(t *testing.T) {
 	manager := newAgentAIManager()
 	manager.bindings["ai-canonical"] = agentAIBindingRecord{

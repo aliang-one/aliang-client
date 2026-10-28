@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -579,6 +580,160 @@ func TestRefreshRoutingRuntimeAfterCustomerConfigCommit_EmptyStoreDefaultsToSock
 	if !activeCanonical.Egress.ToSocks.Enabled {
 		t.Fatal("toSocks.enabled = false for empty store, want default true")
 	}
+}
+
+// 存量配置文件里是小写 anthropic、patch 用大写 Anthropic 保存时，合并结果必须
+// 只剩一个规范键，不得出现两张卡/两个键并存（deepMerge 按大小写敏感合并的缺陷）。
+func TestMergeCustomerPayload_FoldsAIRuleCaseVariants(t *testing.T) {
+	baseCfg := &config.Config{
+		Core: &config.CoreConfig{APIServer: "https://api.aliang.one"},
+		Customer: &config.CustomerConfig{
+			AIRules: map[string]*config.CustomerAIRuleSetting{
+				"anthropic": {
+					Enble:   customerBoolPtr(true),
+					Include: []string{"api.anthropic.com"},
+				},
+			},
+		},
+	}
+
+	mergedRaw, nextCfg, err := mergeCustomerPayload(baseCfg, []byte(`{
+		"ai_rules":{"Anthropic":{"enble":false}}
+	}`))
+	if err != nil {
+		t.Fatalf("mergeCustomerPayload() error = %v", err)
+	}
+
+	if nextCfg.Customer == nil {
+		t.Fatal("merged config missing customer")
+	}
+	rules := nextCfg.Customer.AIRules
+	if _, exists := rules["anthropic"]; exists {
+		t.Fatalf("lowercase \"anthropic\" must be folded away, got keys %v", aiRuleKeys(rules))
+	}
+	rule := rules["Anthropic"]
+	if rule == nil {
+		t.Fatalf("canonical \"Anthropic\" missing, got keys %v", aiRuleKeys(rules))
+	}
+	if rule.Enble == nil || *rule.Enble {
+		t.Fatalf("Anthropic.enble = %v, want false (patch value wins)", rule.Enble)
+	}
+	if len(rule.Include) != 1 || rule.Include[0] != "api.anthropic.com" {
+		t.Fatalf("Anthropic.include = %v, want preserved [api.anthropic.com]", rule.Include)
+	}
+	if !strings.Contains(mergedRaw, `"Anthropic"`) || strings.Contains(mergedRaw, `"anthropic"`) {
+		t.Fatalf("merged raw must contain only canonical key, got %s", mergedRaw)
+	}
+}
+
+// 已停用的 vscode provider 不允许通过 customer patch 复活。
+func TestMergeCustomerPayload_DropsRemovedVscodeProvider(t *testing.T) {
+	baseCfg := &config.Config{
+		Core:     &config.CoreConfig{APIServer: "https://api.aliang.one"},
+		Customer: &config.CustomerConfig{},
+	}
+
+	_, nextCfg, err := mergeCustomerPayload(baseCfg, []byte(`{
+		"ai_rules":{"vscode":{"enble":true,"include":["api.githubcopilot.com"]}}
+	}`))
+	if err != nil {
+		t.Fatalf("mergeCustomerPayload() error = %v", err)
+	}
+
+	if _, exists := nextCfg.Customer.AIRules["vscode"]; exists {
+		t.Fatalf("vscode provider must be dropped from merged config, got keys %v", aiRuleKeys(nextCfg.Customer.AIRules))
+	}
+}
+
+// 已被历史版本污染（两种大小写并存）的 base 也必须在合并时折叠干净。
+func TestMergeCustomerPayload_HealsPollutedBaseConfig(t *testing.T) {
+	baseCfg := &config.Config{
+		Core: &config.CoreConfig{APIServer: "https://api.aliang.one"},
+		Customer: &config.CustomerConfig{
+			AIRules: map[string]*config.CustomerAIRuleSetting{
+				"Anthropic": {Enble: customerBoolPtr(true), Include: []string{"api.aliang.one"}},
+				"anthropic": {Enble: customerBoolPtr(false), Include: []string{"api.anthropic.com"}},
+			},
+		},
+	}
+
+	_, nextCfg, err := mergeCustomerPayload(baseCfg, []byte(`{"ai_rules":{}}`))
+	if err != nil {
+		t.Fatalf("mergeCustomerPayload() error = %v", err)
+	}
+
+	rules := nextCfg.Customer.AIRules
+	if len(rules) != 1 {
+		t.Fatalf("polluted base must fold to 1 provider, got keys %v", aiRuleKeys(rules))
+	}
+	rule := rules["Anthropic"]
+	if rule == nil {
+		t.Fatalf("canonical \"Anthropic\" missing, got keys %v", aiRuleKeys(rules))
+	}
+	if rule.Enble == nil || !*rule.Enble {
+		t.Fatalf("Anthropic.enble = %v, want true (OR across variants)", rule.Enble)
+	}
+	if len(rule.Include) != 2 {
+		t.Fatalf("Anthropic.include = %v, want union of both variants", rule.Include)
+	}
+}
+
+// 已提交配置视图（GET /api/config/customer）必须返回折叠后的形态，
+// 前端在首次保存前就能看到单张规范卡片。
+func TestExtractCustomerFromConfigContent_NormalizesAIRules(t *testing.T) {
+	customer, err := extractCustomerFromConfigContent(`{
+		"customer": {
+			"proxy": {"enable": true, "type": "socks5", "server": "127.0.0.1:1080"},
+			"ai_rules": {
+				"anthropic": {"enble": true, "include": ["api.anthropic.com"]},
+				"Anthropic": {"enble": false},
+				"vscode": {"enble": true, "include": ["api.githubcopilot.com"]}
+			}
+		}
+	}`)
+	if err != nil {
+		t.Fatalf("extractCustomerFromConfigContent() error = %v", err)
+	}
+
+	rawRules, ok := customer["ai_rules"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("ai_rules missing or wrong type: %T", customer["ai_rules"])
+	}
+	if _, exists := rawRules["anthropic"]; exists {
+		t.Fatalf("lowercase \"anthropic\" must be folded in committed view, got keys %v", rawKeys(rawRules))
+	}
+	if _, exists := rawRules["vscode"]; exists {
+		t.Fatalf("removed provider \"vscode\" must be stripped in committed view, got keys %v", rawKeys(rawRules))
+	}
+	rule, ok := rawRules["Anthropic"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("canonical \"Anthropic\" missing, got keys %v", rawKeys(rawRules))
+	}
+	if enble, _ := rule["enble"].(bool); !enble {
+		t.Fatalf("Anthropic.enble = %v, want true (OR across variants)", rule["enble"])
+	}
+	include, _ := rule["include"].([]interface{})
+	if len(include) != 1 || include[0] != "api.anthropic.com" {
+		t.Fatalf("Anthropic.include = %v, want preserved [api.anthropic.com]", include)
+	}
+}
+
+func aiRuleKeys(rules map[string]*config.CustomerAIRuleSetting) []string {
+	keys := make([]string, 0, len(rules))
+	for key := range rules {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func rawKeys(raw map[string]interface{}) []string {
+	keys := make([]string, 0, len(raw))
+	for key := range raw {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func customerBoolPtr(v bool) *bool {

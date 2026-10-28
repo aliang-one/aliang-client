@@ -49,15 +49,6 @@
                 "cdn.openai.com"
               ]
             },
-            "vscode": {
-              "label": "Copilot",
-              "enble": true,
-              "editable": false,
-              "include": [
-                "api.githubcopilot.com",
-                "*.individual.githubcopilot.com"
-              ]
-            },
             "cursor": {
               "label": "Cursor",
               "enble": true,

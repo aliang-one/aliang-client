@@ -689,17 +689,59 @@ function providerKeys(aiRules = {}) {
   return Object.keys(aiRules);
 }
 
-function mergeProviderOrder(configuredKeys, presetProviders) {
-  const presetMap = {};
-  for (const p of presetProviders) {
-    presetMap[p.key] = p;
+// 归一化 AI provider 键：与后端 NormalizeAIProviderKey 对齐（trim + 小写）。
+// 键大小写不同但同一 provider 时，配置键与预置键必须折叠为一张卡——
+// 大小写敏感的精确匹配会渲染出「Anthropic」「anthropic」两张卡。
+function normalizeProviderKey(key) {
+  return String(key ?? '').trim().toLowerCase();
+}
+
+// 具名导出仅供同目录 RulesSettings.test.js 做大小写折叠回归测试使用。
+// 已配置键在前（大小写变体去重），预置中真正缺失的键按序补在后。
+export function mergeProviderOrder(configuredKeys = [], presetProviders = []) {
+  const seen = new Set();
+  const ordered = [];
+  for (const key of configuredKeys) {
+    const normalizedKey = normalizeProviderKey(key);
+    if (!normalizedKey || seen.has(normalizedKey)) continue;
+    seen.add(normalizedKey);
+    ordered.push(key);
   }
-  const ordered = [...configuredKeys];
   for (const p of presetProviders) {
-    if (!presetMap[p.key] || configuredKeys.includes(p.key)) continue;
-    ordered.push(p.key);
+    const key = String(p?.key ?? '').trim();
+    if (!key || seen.has(normalizeProviderKey(key))) continue;
+    seen.add(normalizeProviderKey(key));
+    ordered.push(key);
   }
   return ordered;
+}
+
+// 具名导出仅供同目录 RulesSettings.test.js 做大小写折叠回归测试使用。
+// 大小写不敏感补种缺失的预置 provider：配置里已存在同 provider 的任意大小写
+// 形态时绝不按预置键名再种一份（否则保存时会写回配置文件形成重复键）。
+export function seedMissingProviders(aiRules = {}, presetProviders = []) {
+  const existing = new Set(Object.keys(aiRules).map(normalizeProviderKey));
+  for (const p of presetProviders) {
+    const key = String(p?.key ?? '').trim();
+    if (!key) continue;
+    if (existing.has(normalizeProviderKey(key))) {
+      const entry = aiRules[key];
+      if (entry && typeof entry.editable !== 'boolean' && typeof p.editable === 'boolean') {
+        entry.editable = p.editable;
+      }
+      continue;
+    }
+    aiRules[key] = { enble: false, include: [], editable: Boolean(p.editable) };
+    existing.add(normalizeProviderKey(key));
+  }
+  return aiRules;
+}
+
+// 具名导出仅供同目录 RulesSettings.test.js 做大小写折叠回归测试使用。
+export function providerLabelFor(key, presetProviders = []) {
+  const normalizedKey = normalizeProviderKey(key);
+  const preset = presetProviders.find((p) => normalizeProviderKey(p?.key) === normalizedKey);
+  return preset ? preset.label : key;
 }
 
 const HOST_PORT_RE = /^(.+):(\d{1,5})$/;
@@ -962,20 +1004,10 @@ export default {
       this.clearSuccessDialogTimer();
     },
     ensureProviders() {
-      for (const p of this.presetProviders) {
-        if (!(p.key in this.form.ai_rules)) {
-          this.form.ai_rules[p.key] = { enble: false, include: [], editable: Boolean(p.editable) };
-          continue;
-        }
-
-        if (typeof this.form.ai_rules[p.key].editable !== 'boolean' && typeof p.editable === 'boolean') {
-          this.form.ai_rules[p.key].editable = p.editable;
-        }
-      }
+      this.form.ai_rules = seedMissingProviders(this.form.ai_rules, this.presetProviders);
     },
     providerLabel(key, presetProviders) {
-      const preset = presetProviders.find(p => p.key === key);
-      return preset ? preset.label : key;
+      return providerLabelFor(key, presetProviders);
     },
     // LOW#16：include 收起态副文案（空/单条目/first+N more）
     providerIncludeSummary(provider) {
