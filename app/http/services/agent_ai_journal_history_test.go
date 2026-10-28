@@ -247,25 +247,32 @@ func TestMessageLazyCreateRestoreFailureNotice(t *testing.T) {
 			strings.TrimSpace(remoteString(e, "detail")) != ""
 	})
 
+	// 必须等终态帧再返回：ai.error 在 runAgentCore 的上游守卫（agentCoreEnsureUpstream）
+	// 之后发出——等到它，才能保证 run goroutine 已在测试 env（ANTHROPIC_BASE_URL=
+	// httptest）下完成上游解析；否则测试先返回、t.Setenv 撤销 env，goroutine 里
+	// 晚到的解析会落回真实 127.0.0.1:56432，dial 失败后 heal() POST 真实管理
+	// 端口拉起本机 AI 代理（10-13/10-27 事故族）。
+	waitForAgentEvent(t, &mu, &frames, models.AgentEventAIError, func(e map[string]interface{}) bool {
+		return remoteString(e, "session_id") == "s-broken"
+	})
+
 	// 会话照常空起：注册成功，历史只有本条新 user 消息（run goroutine 里同步
-	// 追加，轮询等它落地）。
+	// 追加，轮询等它落地；快照锁内取，直接复用）。
+	var hist []agentAIMessage
 	waitUntilFor(t, 3*time.Second, func() bool {
 		m.mu.Lock()
 		defer m.mu.Unlock()
 		s := m.sessions["s-broken"]
-		return s != nil && len(s.history) == 1
+		if s == nil {
+			return false
+		}
+		hist = append(hist[:0], s.history...)
+		return len(hist) == 1
 	})
-	m.mu.Lock()
-	s := m.sessions["s-broken"]
-	var histLen int
-	if s != nil {
-		histLen = len(s.history)
+	if len(hist) != 1 || hist[0].Role != "user" || hist[0].Content != "看看还在吗" {
+		t.Fatalf("restore 失败后未照常空起（未注册或历史异常）: %+v", hist)
 	}
-	m.mu.Unlock()
-	if s == nil {
-		t.Fatal("restore 失败后会话必须照常注册（空起）")
-	}
-	if histLen != 1 || s.history[0].Content != "看看还在吗" || s.history[0].Role != "user" {
-		t.Fatalf("空起历史 = %+v, want 仅一条 user/看看还在吗", s.history)
-	}
+	// 测试收尾后 run goroutine 的 journal defer（appendEnd）可能撞上
+	// t.TempDir 清理，日志里的「agentcore-journal: mkdir failed ...
+	// invalid argument」告警属预期、行为无害，不作断言。
 }
