@@ -122,6 +122,8 @@ socketEntry 含 writer、角色（remote/local）、订阅集合。两条 socket
 - 订阅握手即推：转录快照（journal/原生转录读侧现成解析）+ pendingApprovalsSnapshot（原语现成
   `agent_ai.go:3264-3303`，改为按 socket 推送）。
 
+契约表方向基准=远端 /ws/agent 链路（client=agent 拨号方）：subscribe/unsubscribe 登记在 ServerSends（agent 收），snapshot/ai.run.notice 登记在 ClientSends（agent 发）；本机 /api/agent/ai/stream 通道复用同帧型不经此表。
+
 **安全边界不变**：本地 WS 维持 localhost-only 门（`aiStreamHostAllowed`），远端 WS 维持 `aiControlEnabled`
 设备门；订阅不做跨设备权限升级——手机订阅某会话仍需经 PhoneServer 现有会话归属校验（阶段 3 落实）。
 

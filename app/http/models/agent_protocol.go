@@ -66,10 +66,10 @@ const (
 	AgentEventAIOptionRequest         = "ai.option.request"       // agent→server: 请求用户在多个方案中选择
 	AgentEventAIOptionResponse        = "ai.option.response"      // server→agent: 用户的选择结果
 	AgentEventAIOptionCancelled       = "ai.option.cancelled"     // 双向: 选择对话失活，作废待选
-	AgentEventAISessionSubscribe      = "ai.session.subscribe"    // client→agent: 订阅一个会话的实时事件
-	AgentEventAISessionUnsubscribe    = "ai.session.unsubscribe"  // client→agent: 退订
-	AgentEventAISessionSnapshot       = "ai.session.snapshot"     // agent→client: 订阅握手回包（转录+待审批+状态）
-	AgentEventAIRunNotice             = "ai.run.notice"           // agent→client: 非致命运行期提示（resume_missing 等）
+	AgentEventAISessionSubscribe      = "ai.session.subscribe"    // server→agent: 订阅一个会话的实时事件（本机聊天 WS 与阶段3云端代订阅共用帧型）
+	AgentEventAISessionUnsubscribe    = "ai.session.unsubscribe"  // server→agent: 退订
+	AgentEventAISessionSnapshot       = "ai.session.snapshot"     // client→server: 订阅握手回包（转录+待审批+状态）
+	AgentEventAIRunNotice             = "ai.run.notice"           // client→server: 非致命运行期提示（resume_missing 等）
 	AgentEventToolAskRequest          = "tool_ask.request"        // agent→server: 自有 MCP 交互工具调用,等手机作答(阻塞 CC 的 tool_use→tool_result 间隙)
 	AgentEventToolAskResponse         = "tool_ask.response"       // server→agent: 手机作答/过期,按 interaction_id(=CC tool_use_id)幂等回填
 	AgentEventToolAskCancel           = "tool_ask.cancel"         // agent→server: 超时/run 终结/CC 报错,主动翻卡终态
@@ -244,9 +244,9 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				{Type: AgentEventAIApprovalAck, Required: []string{"type", "session_id", "approval_id", "result"}, Optional: []string{"delivery_id"}},
 				{Type: AgentEventAIApprovalSync, Required: []string{"type"}, Optional: []string{"pending"}},
 				{Type: AgentEventAIApprovalCancelled, Required: []string{"type", "session_id"}, Optional: []string{"approval_ids", "reason"}},
-				// 跨端会话统一（spec 2026-10-28 §4.1）：client 侧订阅/退订一个会话的实时事件流。
-				{Type: AgentEventAISessionSubscribe, Required: []string{"type", "session_id"}, Optional: []string{}},
-				{Type: AgentEventAISessionUnsubscribe, Required: []string{"type", "session_id"}, Optional: []string{}},
+				// 跨端会话统一（spec 2026-10-28 §4.1）：agent 发——订阅握手回包 + 非致命运行期提示。
+				{Type: AgentEventAISessionSnapshot, Required: []string{"type", "session_id"}, Optional: []string{"transcript", "pending_approvals", "status"}},
+				{Type: AgentEventAIRunNotice, Required: []string{"type", "session_id", "code"}, Optional: []string{"message_id", "detail"}},
 				{Type: AgentEventAISessionClosed, Required: []string{"type", "session_id"}, Optional: []string{"run_id", "event_seq"}},
 				{Type: AgentEventFileListResult, Required: []string{"type", "request_id", "path", "entries"}},
 				{Type: AgentEventFileReadResult, Required: []string{"type", "request_id", "path", "encoding", "content"}},
@@ -295,9 +295,9 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				{Type: AgentEventAISteer, Required: []string{"type", "session_id", "message_id", "content"}, Optional: []string{"mode", "surface"}, Emits: []string{AgentEventAISteerAck}},
 				{Type: AgentEventAIApprovalResponse, Required: []string{"type", "session_id", "approval_id", "decision"}, Optional: []string{"message_id", "scope", "raw", "delivery_id", "attempt"}, Emits: []string{AgentEventAIApprovalAck, AgentEventAIStatus, AgentEventAIError}},
 				{Type: AgentEventAIApprovalState, Required: []string{"type", "approval_id", "status"}, Optional: []string{"session_id"}},
-				// 跨端会话统一（spec 2026-10-28 §4.1/§4.3）：订阅握手回包 + 非致命运行期提示。
-				{Type: AgentEventAISessionSnapshot, Required: []string{"type", "session_id"}, Optional: []string{"transcript", "pending_approvals", "status"}},
-				{Type: AgentEventAIRunNotice, Required: []string{"type", "session_id", "code"}, Optional: []string{"message_id", "detail"}},
+				// 跨端会话统一（spec 2026-10-28 §4.1）：agent 收——本机聊天 WS 与阶段3云端代订阅共用帧型。
+				{Type: AgentEventAISessionSubscribe, Required: []string{"type", "session_id"}},
+				{Type: AgentEventAISessionUnsubscribe, Required: []string{"type", "session_id"}},
 				{Type: AgentEventAIStop, Required: []string{"type", "session_id"}, Optional: []string{"run_id", "source_session_id"}, Emits: []string{AgentEventAIStatus}},
 				{Type: AgentEventAITuiSync, Required: []string{"type", "session_id", "source_session_id", "digest"}, Optional: []string{"project_path"}, Emits: nil},
 				{Type: AgentEventAIRename, Required: []string{"type", "session_id", "title"}, Optional: []string{"project_path", "provider", "tool", "source_session_id", "resume_session_id"}, Emits: []string{AgentEventAIRenameAck}},
