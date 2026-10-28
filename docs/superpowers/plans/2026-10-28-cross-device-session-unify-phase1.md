@@ -82,6 +82,8 @@ Co-Authored-By: Claude Code <noreply@anthropic.com>"
 
 ### Task 2: 协议帧与契约登记
 
+> **修订（实施期，commit 518bc64）：** 本任务正文给出的落位与测试断言被质量评审推翻后已换表修正——契约表方向基准=远端 /ws/agent 链路（client=agent 拨号方）：subscribe/unsubscribe 登记在 **ServerSends**（agent 收），snapshot/ai.run.notice 登记在 **ClientSends**（agent 发）。下文正文保留原稿仅供追溯，以 518bc64 与 spec §4.1 方向基准句为准。
+
 **Files:**
 - Modify: `app/http/models/agent_protocol.go`（常量段 ~44-100、契约表 ClientSends ~239 / ServerSends ~289 / Streams ~323）
 - Test: `app/http/models/agent_protocol_contract_test.go`（新建）

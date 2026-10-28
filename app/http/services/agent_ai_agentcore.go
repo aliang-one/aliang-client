@@ -1381,6 +1381,8 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 // 生效——子 run 内置工具的轨迹由 agentCoreJournalToolDecorator 装饰器落行，
 // 不经这里。
 func agentCoreLoopHooks(m *agentAIManager, run agentAIRun) agentcore.LoopHooks {
+	// 本回合自动压缩序号（journal 去重键用；每回合独立计数）。
+	autoCompactSeq := 0
 	return agentcore.LoopHooks{
 		GetSteeringMessages: func() []agentcore.Message {
 			return m.drainAgentCoreSteering(run)
@@ -1390,8 +1392,21 @@ func agentCoreLoopHooks(m *agentAIManager, run agentAIRun) agentcore.LoopHooks {
 		},
 		// 自动压缩替换了历史 → 同步落回会话 history。不落的话 next run 又从
 		// 旧历史重建，压缩白做（而且每轮 run 都会重新烧一次摘要请求）。
+		// 自动压缩也落 journal（spec §4.5）：手动 /compact 由
+		// handleAgentCoreCompactCommand 落账（不经本钩子），此处只覆盖内核
+		// 自动路径（窗口触发/上下文溢出触发）。user 行用合成命令名 "/compact(auto)"
+		// 与手动命令区分；同回合多次自动压缩靠 runSeq+序号去重键区分
+		//（appendMsg 按 messageID 去重，固定 id 会让第二次压缩不落行）。
 		OnCompact: func(messages []agentcore.Message, info agentcore.CompactInfo) {
 			m.replaceAgentCoreHistory(run.sessionID, run.runSeq, messages)
+			autoCompactSeq++
+			ts := time.Now().UTC().Format(time.RFC3339)
+			compactID := fmt.Sprintf("compact-auto-%d-%d", run.runSeq, autoCompactSeq)
+			m.coreJournal.ensureSessionHeader(run.sessionID, run.projectPath, agentCoreModel(run), ts, agentCoreJournalOrigin(run))
+			m.coreJournal.appendUser(run.sessionID, compactID, "/compact(auto)", ts)
+			m.coreJournal.appendAssistant(run.sessionID, agentAssistantMessageID(compactID),
+				fmt.Sprintf("✓ 上下文已自动压缩：约 %s → %s tokens（%d 条早期消息已折叠为摘要）。",
+					agentAITokenCountLabel(info.PreTokens), agentAITokenCountLabel(info.PostTokens), info.Removed), ts)
 		},
 		// 内置工具的 journal 轨迹（spec §4.5 的缺口修复）：内核钩子在主循环
 		// 同步路径上触发，appendTool 自带锁、失败只 Warn，不阻塞不 panic。
