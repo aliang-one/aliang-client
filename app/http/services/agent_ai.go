@@ -4143,7 +4143,7 @@ func (m *agentAIManager) runCLI(ctx context.Context, run agentAIRun, writeJSON a
 	// 的解析指令，不是真实 provider。CLI 路径也是这么做的——confirmBinding 落
 	// 的是 tool.id（解析结果）而不是 "auto"，否则绑定记录的 provider 会和实际
 	// 跑的 provider 对不上，providersEquivalent 一比对就分叉。
-	if agentAIUseAgentCore(run.provider) || agentAIUseAgentCoreFallback(run) {
+	if agentAIUseAgentCoreForRun(run) {
 		run.provider = "agentcore"
 		m.runAgentCore(ctx, run, writeJSON)
 		return
@@ -4243,6 +4243,22 @@ func agentAIUseAgentCoreFallback(run agentAIRun) bool {
 		return false
 	}
 	return !agentAIExternalCLIAvailable()
+}
+
+// agentAIUseAgentCoreForRun 是 runCLI 分流用的总闸:显式 agentcore 或 auto
+// 兜底任一命中即走内核,但 **goal 回合一律除外**。
+//
+// 为什么要单独这道闸:goal 的排除逻辑此前只写在 auto 兜底分支里,
+// 「显式 provider=agentcore」的分流没有这层判据——服务端一旦显式下发
+// agentcore(目前被服务端 GoalProvider 白名单挡着,白名单一旦放宽就会漏),
+// goal 回合就会进内核,而内核不注入 ALIANG_GOAL_REPORT 强制段,goal 会永远
+// 拿不到报告行,被 attachGoalReport 记成 goal_report_missing。防御纵深要求
+// 判据长在离分流最近的地方,而不是只指望上游白名单。
+func agentAIUseAgentCoreForRun(run agentAIRun) bool {
+	if len(run.goalIdentity) > 0 {
+		return false
+	}
+	return agentAIUseAgentCore(run.provider) || agentAIUseAgentCoreFallback(run)
 }
 
 // agentAIExternalCLIProbe 报告 auto 的候选集里是否有可用的外部 CLI。

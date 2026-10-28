@@ -70,6 +70,34 @@ func TestAgentAIUseAgentCoreFallback(t *testing.T) {
 	}
 }
 
+func TestAgentAIUseAgentCoreForRunExcludesGoalRuns(t *testing.T) {
+	// goal 回合必须一律走外部 CLI:内核不注入 ALIANG_GOAL_REPORT 强制段,
+	// 跑起来 goal 永远拿不到报告行,会被 attachGoalReport 记成
+	// goal_report_missing。auto 兜底分支早已排除 goal,但 runCLI 里
+	// 「显式 provider=agentcore」的分流此前没有这层判据——服务端一旦
+	// 显式下发 agentcore,goal 回合就会被内核吃掉(2026-10-28 预算审计
+	// 发现的防御纵深缺口,当时只靠服务端 GoalProvider 白名单兜着)。
+	goal := map[string]interface{}{"goal_id": "g1"}
+	// auto 兜底依赖外部 CLI 探针,与宿主机装没装 claude 无关,按既有用例注入。
+	overrideExternalCLIProbe(t, false)
+	for _, tc := range []struct {
+		name string
+		run  agentAIRun
+		want bool
+	}{
+		{"显式 agentcore 普通 run 走内核", agentAIRun{provider: "agentcore"}, true},
+		{"auto 兜底普通 run 走内核", agentAIRun{provider: "auto"}, true},
+		{"显式 agentcore 的 goal run 不走内核", agentAIRun{provider: "agentcore", goalIdentity: goal}, false},
+		{"auto 兜底的 goal run 不走内核", agentAIRun{provider: "auto", goalIdentity: goal}, false},
+		{"auto 兜底只读 run 不走内核", agentAIRun{provider: "auto", readOnly: true}, false},
+		{"claudecode 走 CLI", agentAIRun{provider: "claudecode"}, false},
+	} {
+		if got := agentAIUseAgentCoreForRun(tc.run); got != tc.want {
+			t.Errorf("%s: 期望 %v,实际 %v", tc.name, tc.want, got)
+		}
+	}
+}
+
 // 手机下发的模型名是唯一来源：本机 env / settings 一律不得介入，也不再有任何
 // 兜底常量。
 //
