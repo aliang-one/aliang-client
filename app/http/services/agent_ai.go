@@ -1821,6 +1821,24 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 		lazyInitialContext := strings.TrimSpace(remoteString(msg, "initial_context"))
 		lazyIsGoalFork, _ := msg["is_goal_fork"].(bool) // #5: ai.run.start lazy-create
 		lazyHistory := remoteAgentAIHistory(msg)
+		// 跨端/重启续聊（spec §4.3）：agentcore 会话不在内存时，优先从 journal
+		// 读回历史装回内存再跑。载荷自带历史（remoteAgentAIHistory 非空）时跳过
+		// ——服务端重发的那份更新；claude/codex 的上下文在 CLI 自己的会话里，
+		// 宿主历史只做展示拼 prompt，不回灌，故不读。读回失败（非 ErrNotExist
+		// 的 IO 错）发 ai.run.notice 提示后照常空起——历史损坏不能顶死整轮 run。
+		// 头行 model 只在载荷未带时兜底：模型选择仍以手机显式下发为权威。
+		// 装回后下方的 limits 截断照常执行（超长历史按会话窗口裁剪，是有意的）。
+		var headModel string
+		var restoreFailed error
+		if lazyProvider == "agentcore" && len(lazyHistory) == 0 && m.coreJournal != nil {
+			if hist, head, herr := readAgentCoreJournalHistoryFrom(m.coreJournal.dir, sessionID); herr == nil && len(hist) > 0 {
+				lazyHistory = hist
+				headModel = head.model
+			} else if herr != nil && !errors.Is(herr, os.ErrNotExist) {
+				logger.Warn(fmt.Sprintf("ai.message: journal history restore failed session=%s err=%v", sessionID, herr))
+				restoreFailed = herr
+			}
+		}
 		if lazyInitialContext != "" {
 			lazyHistory = append([]agentAIMessage{{
 				Role:      "system",
@@ -1836,7 +1854,7 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 			mode:                    lazyMode,
 			projectPath:             projectPath,
 			provider:                lazyProvider,
-			model:                   strings.TrimSpace(remoteString(msg, "model")),
+			model:                   firstNonEmpty(strings.TrimSpace(remoteString(msg, "model")), headModel),
 			effort:                  strings.TrimSpace(remoteString(msg, "effort")),
 			contextWindow:           lazyContextWindow,
 			resumeSessionID:         firstNonEmpty(remoteString(msg, "resume_session_id"), remoteString(msg, "source_session_id")),
@@ -1856,6 +1874,17 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 			m.registerAISessionLocked(session)
 		}
 		m.mu.Unlock()
+		// 装回失败提示（在会话落地之后发）：经 runWrite=emitter→订阅扇出，
+		// 手机/跨端订阅者都能看到「历史没接上、本轮空跑」这一事实。
+		if restoreFailed != nil {
+			_ = runWrite(map[string]interface{}{
+				"type":       models.AgentEventAIRunNotice,
+				"session_id": sessionID,
+				"message_id": messageID,
+				"code":       "history_restore_failed",
+				"detail":     restoreFailed.Error(),
+			})
+		}
 	}
 	m.mu.Lock()
 	if policy := parseAgentAIClaudeRemotePolicy(msg); policy.enabled {
