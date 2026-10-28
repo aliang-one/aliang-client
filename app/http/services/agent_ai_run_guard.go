@@ -22,17 +22,21 @@ var agentAIKillGrace = resolveEnvDuration("ALIANG_AI_KILL_GRACE", 30*time.Second
 // 默认与 agentAIStaleRunThreshold 对齐（5min），不要调小：agentcore 传输层的
 // 重试链最坏合法静默 ≈ 8min——maxRetries=3 即全程 4 次尝试，每次可烧满
 // ResponseHeaderTimeout 120s 才吐出失败，加上 0.5s/1s/2s 的指数退避，
-// 4×120s + 3.5s ≈ 8min 才见分晓（此前注释按 3 次尝试算成 6min，少算一次）。
+// 4×120s + 3.5s ≈ 8min（此前注释按 3 次尝试算成 6min，少算一次）；若上游带
+// Retry-After（429/5xx 优先采用、封顶 30s），最坏 4×120s + 3×30s ≈ 9.5min。
 // 窗口一旦短于它，就会抢在 stale 扫描器前面误杀「本会自愈」的回合。
 //
 // 阈值结论：5min 口径的安全前提是重试帧活性刷新——内核每确定重试一次就发一帧
 // system/api_retry（streamWriter.RetryNotice），decoder 收到即 markProgress，
-// 于是相邻两次活性刷新的间隔只有「单次尝试 ≤120s + 退避」，远短于 5min，stale
-// 与本窗都不会误杀合法重试回合。若上游是没发这帧的旧内核，最坏 8min 的纯静默
-// 会超过 5min 被判死——所以这帧是活性链路的必要环节，不是锦上添花。本窗读到
-// 的也是同一 activity.idleFor()，重试帧同样为 steer 等待续命。已知例外：自动
-// 压缩（compactSummarize）的内部 Stream 没接 writer，压缩期间的重试仍不发帧，
-// 属遗留缺口，不在本条修正范围内。
+// 于是相邻两次活性刷新的间隔只有「单次尝试 ≤120s + 退避（Retry-After 封顶
+// 30s 时 ≤150s）」，远短于 5min，stale 与本窗都不会误杀合法重试回合。若上游
+// 是没发这帧的旧内核，最坏 8-9.5min 的纯静默会超过 5min 被判死——所以这帧是
+// 活性链路的必要环节，不是锦上添花。本窗读到的也是同一 activity.idleFor()，
+// 重试帧同样为 steer 等待续命。已知例外（同类静默路径，重试/正文均不发帧）：
+// 自动压缩（compactSummarize）与上下文溢出自愈（noteContextOverflow）的内部
+// Stream 没接 writer；wrapUp 刻意以 nil writer 收尾（收尾期再发帧像还在跑）。
+// 压缩期静默是先于本条修正存在的遗留缺口，接 writer 需改 Compact 导出签名，
+// 缓议。
 //
 //	ALIANG_AGENTCORE_STEER_LIVENESS  (time.ParseDuration). Default 5min.
 var steerLivenessWindow = resolveEnvDuration("ALIANG_AGENTCORE_STEER_LIVENESS", 5*time.Minute)

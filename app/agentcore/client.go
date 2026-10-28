@@ -34,8 +34,10 @@ const (
 
 	// maxRetries 是瞬态失败的重试次数。仅覆盖连接错误 / 429 / 5xx。注意口径：
 	// 重试 3 次 = 全程最多 4 次尝试；按 ResponseHeaderTimeout 120s 逐次烧满的
-	// 话，最坏 4×120s + 退避 ≈ 8min 才见分晓——服务层的 stale 扫描器（5min）
-	// 靠 api_retry 重试帧刷新活性才扛得住这段静默，见 Stream 里 notifyRetry。
+	// 话，最坏 4×120s + 退避 ≈ 8min 才见分晓——若上游带 Retry-After（429/5xx
+	// 优先采用、封顶 30s），最坏 4×120s + 3×30s ≈ 9.5min。服务层的 stale 扫描器
+	// （5min）靠 api_retry 重试帧刷新活性才扛得住这段静默，见 Stream 里
+	// notifyRetry。
 	maxRetries = 3
 
 	// baseRetryDelay 是指数退避的起点。
