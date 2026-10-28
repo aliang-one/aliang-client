@@ -98,6 +98,16 @@ type LoopHooks struct {
 	// 宿主据此把会话 history 落成新形状（否则下一轮 run 又从旧历史重建，
 	// 压缩白做）。
 	OnCompact func([]Message, CompactInfo)
+
+	// OnToolCall 在每个工具结果产出处触发一次（内置与桥接工具统一口径——
+	// MCP 桥/子 agent 桥此前各自带 onCall 落 journal，内置工具没有任何宿主
+	// 回调）。宿主用于 journal 工具轨迹（2026-10-28 spec §4.5）。nil=不启用。
+	//
+	// 回调不得阻塞（在 executeTools 的串行路径上，阻塞即挂死整个回合）；
+	// 回调 panic 由内核 recover 兜底，不许搅了已定的工具结果——executeOne
+	// 已有全量 recover，这里是纵深防御。同步在主循环 goroutine 上触发，
+	// 宿主侧自行加锁保护共享状态。
+	OnToolCall func(name string, input map[string]interface{}, result ToolResult)
 }
 
 // TurnResult 是一个回合的结果。
@@ -1034,6 +1044,15 @@ func (r *runner) executeTools(ctx context.Context, toolUses []ContentBlock, writ
 		r.toolCalls = append(r.toolCalls, ToolCallRecord{
 			ID: tu.ID, Name: tu.Name, Input: tu.Input, Result: result,
 		})
+		// 钩子在锁外触发（runner 无内部锁，宿主回调也不该在内核任何临界区里
+		// 被调），panic 独立 recover：回调挂了也不许搅了已定的工具结果
+		// （与 MCP 桥 safeOnCall 同语义）。
+		if r.cfg.Hooks.OnToolCall != nil {
+			func() {
+				defer func() { _ = recover() }()
+				r.cfg.Hooks.OnToolCall(tu.Name, tu.Input, result)
+			}()
+		}
 		results = append(results, ContentBlock{
 			Type:      BlockTypeToolResult,
 			ToolUseID: tu.ID,

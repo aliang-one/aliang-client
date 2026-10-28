@@ -7,7 +7,9 @@ package services
 
 import (
 	"os"
+	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 // newSlashJournalTestManager 建管理器并把 coreJournal 指到临时目录——
@@ -82,5 +84,67 @@ func TestLocalSlashCommandClaudeNotJournaled(t *testing.T) {
 	}
 	if _, err := os.Stat(dir + "/" + agentCoreJournalFileName("s-claude")); !os.IsNotExist(err) {
 		t.Fatalf("claude 通道不得写 journal,文件状态: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 内核内置工具 tool 行（Task 13，spec §4.5）：summarize 确定性/截断 + 桥接
+// 工具不双记的不变量
+// ---------------------------------------------------------------------------
+
+// TestSummarizeAgentCoreKernelToolDeterministic：map 遍历随机，键序必须 sort
+// 兜底——同一输入两次摘要必须逐字节一致，否则同一行输入每次落盘形状都不同。
+func TestSummarizeAgentCoreKernelToolDeterministic(t *testing.T) {
+	input := map[string]interface{}{"command": "ls -la", "timeout": 30, "z_last": true}
+	a := summarizeAgentCoreKernelTool("Bash", input)
+	for i := 0; i < 50; i++ {
+		if got := summarizeAgentCoreKernelTool("Bash", input); got != a {
+			t.Fatalf("摘要不确定: %q vs %q", got, a)
+		}
+	}
+	if a != "Bash command=ls -la timeout=30 z_last=true" {
+		t.Fatalf("摘要形状不对: %q", a)
+	}
+}
+
+// TestSummarizeAgentCoreKernelToolRuneSafeTruncation：超限截断必须按 rune，
+// 切点不得劈开多字节字符（36bcc43 教训）——截后仍是合法 UTF-8，且带截断尾缀。
+func TestSummarizeAgentCoreKernelToolRuneSafeTruncation(t *testing.T) {
+	pad := strings.Repeat("内", 5000) // 多字节，若按字节切必劈出 U+FFFD
+	got := summarizeAgentCoreKernelTool("Read", map[string]interface{}{"path": pad})
+	if !utf8.ValidString(got) {
+		t.Fatal("截断后不是合法 UTF-8（多字节 rune 被劈开）")
+	}
+	runes := []rune(got)
+	suffixRunes := utf8.RuneCountInString("…(truncated)")
+	if len(runes) != agentCoreKernelToolSummaryCapRune+suffixRunes {
+		t.Fatalf("截断长度 = %d, want %d", len(runes), agentCoreKernelToolSummaryCapRune+suffixRunes)
+	}
+	if !strings.HasSuffix(got, "…(truncated)") {
+		t.Fatalf("缺截断尾缀: %q", runes[len(runes)-20:])
+	}
+	if strings.ContainsRune(got, utf8.RuneError) {
+		t.Fatal("截断点出现 U+FFFD")
+	}
+	// 不超限的输入原样返回，不加尾缀。
+	short := summarizeAgentCoreKernelTool("Bash", map[string]interface{}{"command": "ls"})
+	if strings.HasSuffix(short, "(truncated)") {
+		t.Fatalf("短输入不该截断: %q", short)
+	}
+}
+
+// TestAgentCoreKernelBuiltinToolsExcludeBridges：双记防线的不变量——按内置名集
+// 过滤后，内置工具记行、桥接工具不记（MCP 恒 mcp__ 前缀不在集内；子 agent 桥
+// 名消解时避开 reserved 也不在集内）。防线破洞 = 同一次调用落两行 tool。
+func TestAgentCoreKernelBuiltinToolsExcludeBridges(t *testing.T) {
+	for _, name := range []string{"Bash", "Read", "Edit", "Write"} {
+		if !agentCoreKernelBuiltinTools[name] {
+			t.Errorf("内置工具 %s 应在集内（不记就丢了 spec §4.5 的缺口修复）", name)
+		}
+	}
+	for _, name := range []string{"mcp__srv__lookup", "mcp__mcp__x", "my-subagent"} {
+		if agentCoreKernelBuiltinTools[name] {
+			t.Errorf("桥接工具 %s 不得在集内（各自 onCall 已落行，在集内=双记）", name)
+		}
 	}
 }

@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -1350,6 +1351,10 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 // 下一条消息才被看到（2026-10-26 实测）。两个钩子先到先得，drain 排空队列，
 // 不会重复投递。PrepareRequest / FinishTurn 留空——前者的诉求（改 system /
 // max_tokens）已在 Config 里静态给定，后者没有消费方。
+//
+// 子 run（子 agent 桥递归）的 Config 显式 Hooks=nil，OnToolCall 只在主 run
+// 生效——子 run 内置工具的轨迹由 agentCoreJournalToolDecorator 装饰器落行，
+// 不经这里。
 func agentCoreLoopHooks(m *agentAIManager, run agentAIRun) agentcore.LoopHooks {
 	return agentcore.LoopHooks{
 		GetSteeringMessages: func() []agentcore.Message {
@@ -1363,7 +1368,60 @@ func agentCoreLoopHooks(m *agentAIManager, run agentAIRun) agentcore.LoopHooks {
 		OnCompact: func(messages []agentcore.Message, info agentcore.CompactInfo) {
 			m.replaceAgentCoreHistory(run.sessionID, run.runSeq, messages)
 		},
+		// 内置工具的 journal 轨迹（spec §4.5 的缺口修复）：内核钩子在主循环
+		// 同步路径上触发，appendTool 自带锁、失败只 Warn，不阻塞不 panic。
+		// 桥接工具（MCP mcp__* / 子 agent 桥）各自已带 onCall 落行——而桥名
+		// 恒不在内置名集里（MCP 恒 mcp__ 前缀、子 agent 桥名消解时避开
+		// reserved），所以按内置名集过滤恰好不重不漏：内置工具记一次，
+		// 桥接工具保持各自原有一行，不会双记。
+		OnToolCall: func(name string, input map[string]interface{}, res agentcore.ToolResult) {
+			if !agentCoreKernelBuiltinTools[name] {
+				return
+			}
+			m.coreJournal.appendTool(run.sessionID, name, summarizeAgentCoreKernelTool(name, input), res.IsError)
+		},
 	}
+}
+
+// agentCoreKernelBuiltinTools 是内核内置工具名集，从 DefaultRegistry 派生
+// （内核加第 9 个工具自动跟进，不留手抄清单漂移缺口）。与子 agent 桥的
+// agentCoreSubagentReservedNames 同源派生但各留各的：两者语义不同（journal
+// 过滤 vs 桥名回避），合并会让两处修改互相牵连。
+var agentCoreKernelBuiltinTools = func() map[string]bool {
+	names := map[string]bool{}
+	for _, def := range agentcore.DefaultRegistry().Defs() {
+		names[def.Name] = true
+	}
+	return names
+}()
+
+// agentCoreKernelToolSummaryCapRune 是 journal 摘要的 rune 上限。journal 每次工具
+// 调用一行，Read/Bash 的输入动辄几千字符，不截会撑爆文件（spec §4.5）。
+const agentCoreKernelToolSummaryCapRune = 4096
+
+// summarizeAgentCoreKernelTool 拼内核内置工具的 journal 摘要：
+// "name key=value…"（value 简单 fmt，map/slice 走 %v）。键序 sort 保证确定性
+// （map 遍历随机，不排则同行输入每次落盘形状都不同）。整体超
+// agentCoreKernelToolSummaryCapRune 按 []rune 截断加 "…(truncated)"——不按字节
+// 切，防在切点劈开多字节 rune（36bcc43 教训；本包 desc/summary 的字节级截断
+// 已知有此观感限制，新代码不再引入）。
+func summarizeAgentCoreKernelTool(name string, input map[string]interface{}) string {
+	keys := make([]string, 0, len(input))
+	for k := range input {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	b.WriteString(name)
+	for _, k := range keys {
+		b.WriteString(" " + k + "=" + fmt.Sprintf("%v", input[k]))
+	}
+	out := b.String()
+	runes := []rune(out)
+	if len(runes) <= agentCoreKernelToolSummaryCapRune {
+		return out
+	}
+	return string(runes[:agentCoreKernelToolSummaryCapRune]) + "…(truncated)"
 }
 
 // ---------------------------------------------------------------------------
