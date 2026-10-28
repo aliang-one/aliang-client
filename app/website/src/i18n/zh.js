@@ -1119,6 +1119,24 @@ export default {
   customEnv_save: '保存',
   customEnv_saving: '保存中…',
 
+  // -- AgentCoreSettings --
+  agentCore_title: 'AliangCode 内核 LLM 设置',
+  agentCore_description: '为本机全部 AliangCode 会话指定显式 LLM 端点（Anthropic Messages 兼容）。未启用时沿用 Claude Code 同款配置与平台代理。',
+  agentCore_enable: '启用自定义 LLM 端点',
+  agentCore_baseUrl: 'Base URL',
+  agentCore_baseUrlPlaceholder: '例如 https://your-gateway.example.com',
+  agentCore_apiKey: 'API Key',
+  agentCore_apiKeyPlaceholder: '非回环地址必填',
+  agentCore_showKey: '显示',
+  agentCore_hideKey: '隐藏',
+  agentCore_hint: '保存后下一个回合生效，无需重启。仅支持 Anthropic Messages 兼容端点；非回环地址必须填写 API Key。',
+  agentCore_error_urlRequired: '启用时必须填写 Base URL',
+  agentCore_error_urlInvalid: 'Base URL 必须是合法 URL（含协议与主机名）',
+  agentCore_error_keyRequired: '非回环地址必须填写 API Key',
+  agentCore_error_scheme: '仅支持 http/https 协议',
+  agentCore_save: '保存',
+  agentCore_saving: '保存中…',
+
   // -- ConfigSyncSettings --
   sync_title: '配置同步中心',
   sync_refresh: '刷新',

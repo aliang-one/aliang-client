@@ -172,15 +172,17 @@ func DefaultRegistry() *Registry {
 // 静默截断会让模型以为自己看完了全文。
 const maxToolOutputBytes = 64 * 1024
 
-// resolveToolPath 把工具入参里的路径解析成绝对路径，并挡掉逃逸出项目根的情况。
+// resolveToolPath 把工具入参里的路径解析成绝对路径。
 //
 // 规则：
 //   - 空路径 → 项目根（LS 用）
 //   - 相对路径 → 相对项目根
 //   - ~ 展开
-//   - 解析后（含符号链接）必须仍在项目根内
 //
-// 项目根为空时（未绑定项目）不做围栏，只做绝对化——由调用方决定是否允许。
+// 2026-10-28 起执行层不再做「必须仍在项目根内」的围栏：路径出界与否由审批层
+// （services 的 outside-project-path 规则）判定并交用户拍板——若这里继续硬拒，
+// 用户在手机上批准的越界操作会「批准了也白批」。项目根为空（未绑定项目）时
+// 只做绝对化。
 func resolveToolPath(env *ToolEnv, raw string) (string, error) {
 	raw = strings.TrimSpace(raw)
 	root := ""
@@ -194,84 +196,22 @@ func resolveToolPath(env *ToolEnv, raw string) (string, error) {
 		return filepath.Abs(root)
 	}
 
-	expanded, err := expandHome(raw)
+	expanded, err := ExpandHome(raw)
 	if err != nil {
 		return "", err
 	}
 
-	var abs string
 	if filepath.IsAbs(expanded) {
-		abs = filepath.Clean(expanded)
-	} else {
-		if root == "" {
-			return "", fmt.Errorf("未绑定项目目录，无法解析相对路径: %s", raw)
-		}
-		abs = filepath.Clean(filepath.Join(root, expanded))
+		return filepath.Clean(expanded), nil
 	}
-
 	if root == "" {
-		return abs, nil
+		return "", fmt.Errorf("未绑定项目目录，无法解析相对路径: %s", raw)
 	}
-
-	rootAbs, err := filepath.Abs(root)
-	if err != nil {
-		return "", err
-	}
-	// 用 EvalSymlinks 兜住「软链指到项目外」的逃逸；路径不存在时（新建文件）
-	// 退回逐级解析最近的已存在祖先。
-	resolvedRoot, err := evalSymlinksBestEffort(rootAbs)
-	if err != nil {
-		return "", err
-	}
-	resolvedAbs, err := evalSymlinksBestEffort(abs)
-	if err != nil {
-		return "", err
-	}
-	if !pathWithin(resolvedAbs, resolvedRoot) {
-		return "", fmt.Errorf("路径越界，拒绝访问项目目录之外的位置: %s", raw)
-	}
-	return abs, nil
+	return filepath.Clean(filepath.Join(root, expanded)), nil
 }
 
-// evalSymlinksBestEffort 解析符号链接；目标不存在时向上找到最近的存在祖先，
-// 解析它再把剩余段拼回去。这样「新建文件」也能正确判定围栏。
-func evalSymlinksBestEffort(p string) (string, error) {
-	if resolved, err := filepath.EvalSymlinks(p); err == nil {
-		return resolved, nil
-	}
-	var missing []string
-	cur := filepath.Clean(p)
-	for {
-		parent := filepath.Dir(cur)
-		if parent == cur {
-			return filepath.Clean(p), nil
-		}
-		missing = append([]string{filepath.Base(cur)}, missing...)
-		cur = parent
-		resolved, err := filepath.EvalSymlinks(cur)
-		if err != nil {
-			continue
-		}
-		return filepath.Join(append([]string{resolved}, missing...)...), nil
-	}
-}
-
-// pathWithin 判定 child 是否在 root 之内（含 root 本身）。
-func pathWithin(child, root string) bool {
-	child = filepath.Clean(child)
-	root = filepath.Clean(root)
-	if child == root {
-		return true
-	}
-	rel, err := filepath.Rel(root, child)
-	if err != nil {
-		return false
-	}
-	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
-}
-
-// expandHome 展开前导 ~。
-func expandHome(p string) (string, error) {
+// ExpandHome 展开前导 ~。导出供宿主审批层做同口径的路径判界。
+func ExpandHome(p string) (string, error) {
 	if p == "~" || strings.HasPrefix(p, "~/") || strings.HasPrefix(p, `~\`) {
 		home, err := os.UserHomeDir()
 		if err != nil {
