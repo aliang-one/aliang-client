@@ -612,10 +612,21 @@ func (m *agentAIManager) handleAgentCoreCompactCommand(session *agentAISession, 
 	mode := session.mode
 	model := session.model
 	contextWindow := session.contextWindow
+	originSocket := session.originSocket
+	surface := session.surface
 	history := append([]agentAIMessage(nil), session.history...)
 	m.mu.Unlock()
 
 	assistantID := agentAssistantMessageID(messageID)
+
+	// 斜杠命令留痕（spec §4.5）：/compact 不落成模型回合（上层 agentcore 分支
+	// 提前 return），journal 是这条命令唯一的历史痕迹。命令行与本地应答各落
+	// 一行，读回时才有始有终；写失败只 Warn（尽力而为口径）。
+	journal := m.coreJournal
+	now := time.Now().UTC().Format(time.RFC3339)
+	journal.ensureSessionHeader(session.id, projectPath, model, now, agentCoreJournalOriginFor(originSocket, surface))
+	journal.appendUser(session.id, messageID, "/compact", now)
+
 	_ = writeJSON(map[string]interface{}{
 		"type":         models.AgentEventAIRunStarted,
 		"session_id":   session.id,
@@ -644,7 +655,9 @@ func (m *agentAIManager) handleAgentCoreCompactCommand(session *agentAISession, 
 
 	messages, _ := agentCoreMessagesFromHistory(history)
 	if len(messages) == 0 {
-		reply("当前会话还没有可压缩的上下文。先对话几轮，再发送 /compact。")
+		const nothing = "当前会话还没有可压缩的上下文。先对话几轮，再发送 /compact。"
+		reply(nothing)
+		journal.appendAssistant(session.id, assistantID, nothing, time.Now().UTC().Format(time.RFC3339))
 		done()
 		return
 	}
@@ -654,6 +667,7 @@ func (m *agentAIManager) handleAgentCoreCompactCommand(session *agentAISession, 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 	if err := agentCoreEnsureUpstream(ctx); err != nil {
+		journal.appendAssistant(session.id, assistantID, "/compact 失败："+err.Error(), time.Now().UTC().Format(time.RFC3339))
 		_ = writeJSON(agentAIErrorPayload(session.id, messageID, err))
 		return
 	}
@@ -672,17 +686,22 @@ func (m *agentAIManager) handleAgentCoreCompactCommand(session *agentAISession, 
 	compacted, info, err := agentcore.Compact(ctx, cfg, messages, "manual")
 	if err != nil {
 		if errors.Is(err, agentcore.ErrNothingToCompact) {
-			reply("上下文还比较短，无需压缩。")
+			const short = "上下文还比较短，无需压缩。"
+			reply(short)
+			journal.appendAssistant(session.id, assistantID, short, time.Now().UTC().Format(time.RFC3339))
 			done()
 			return
 		}
 		logger.Warn(fmt.Sprintf("agentcore: /compact 失败 session=%s: %v", session.id, err))
+		journal.appendAssistant(session.id, assistantID, "/compact 失败："+err.Error(), time.Now().UTC().Format(time.RFC3339))
 		_ = writeJSON(agentAIErrorPayload(session.id, messageID, err))
 		return
 	}
 	m.replaceAgentCoreHistory(session.id, runSeq, compacted)
-	reply(fmt.Sprintf("✓ 上下文已压缩：约 %s → %s tokens（%d 条早期消息已折叠为摘要）。",
-		agentAITokenCountLabel(info.PreTokens), agentAITokenCountLabel(info.PostTokens), info.Removed))
+	line := fmt.Sprintf("✓ 上下文已压缩：约 %s → %s tokens（%d 条早期消息已折叠为摘要）。",
+		agentAITokenCountLabel(info.PreTokens), agentAITokenCountLabel(info.PostTokens), info.Removed)
+	reply(line)
+	journal.appendAssistant(session.id, assistantID, line, time.Now().UTC().Format(time.RFC3339))
 	done()
 }
 

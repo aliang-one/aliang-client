@@ -284,6 +284,8 @@ func TestAgentAINativeCompactTurn(t *testing.T) {
 // 上游请求（历史判空在 agentCoreEnsureUpstream 之前），事件序列
 // run.started → delta(提示语) → done。
 func TestHandleAgentCoreCompactCommandEmptyHistory(t *testing.T) {
+	// /compact 会在入口 journal 留痕（spec §4.5）：隔离 HOME，别落真家目录。
+	setTestAgentHome(t)
 	mgr := newAgentAIManager()
 	sess := newSlashTestSession()
 	sess.provider = "agentcore"

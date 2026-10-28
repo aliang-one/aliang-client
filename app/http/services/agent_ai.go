@@ -2124,6 +2124,22 @@ func (m *agentAIManager) handleLocalSlashCommand(session *agentAISession, messag
 		}
 	}
 
+	// 斜杠命令也是对话的一部分（spec §4.5）：agentcore 无原生转录，本地应答
+	// 的斜杠命令不产生 run 回合，journal 是它唯一的历史留痕——必须先落头行与
+	// 命令行。claude/codex 由各自原生转录承载（spec amendment），这里仅
+	// provider=agentcore 落。origin 走统一推导（Task 10 helper，与 run 路径同
+	// 源）。/compact 的 agentcore 分支在上面已提前 return，它的留账在
+	// handleAgentCoreCompactCommand 内，不会走到这里（无重复落账）。
+	if provider == "agentcore" {
+		m.mu.Lock()
+		projectPath, model := session.projectPath, session.model
+		originSocket, surface := session.originSocket, session.surface
+		m.mu.Unlock()
+		now := time.Now().UTC().Format(time.RFC3339)
+		m.coreJournal.ensureSessionHeader(session.id, projectPath, model, now, agentCoreJournalOriginFor(originSocket, surface))
+		m.coreJournal.appendUser(session.id, messageID, content, now)
+	}
+
 	assistantID := agentAssistantMessageID(messageID)
 	_ = writeJSON(map[string]interface{}{
 		"type":         models.AgentEventAIRunStarted,
@@ -2136,6 +2152,10 @@ func (m *agentAIManager) handleLocalSlashCommand(session *agentAISession, messag
 	})
 
 	line := m.applyLocalSlashCommand(session, name, args, provider)
+
+	if provider == "agentcore" && line != "" {
+		m.coreJournal.appendAssistant(session.id, assistantID, line, time.Now().UTC().Format(time.RFC3339))
+	}
 
 	_ = writeJSON(map[string]interface{}{
 		"type":       models.AgentEventAIDelta,
