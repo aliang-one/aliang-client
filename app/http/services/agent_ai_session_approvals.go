@@ -94,3 +94,17 @@ func (m *agentAIManager) sessionApprovalAllows(sessionID, provider, kind, toolNa
 	_, ok := keys[provider+"\x00"+key]
 	return ok
 }
+
+// journalSessionApprovalHit 记忆命中放行落审计行（spec §4.2.4 Amendment）：
+// 与显式决策同口径（kind=approval），approval_id 用 "session-mem:<匹配键>"
+// 标识来源（区别于真实 approval_id）。尽力而为：journal 不可用即静默跳过。
+func (m *agentAIManager) journalSessionApprovalHit(sessionID string, runSeq int, kind, toolName, command string) {
+	if m == nil || m.coreJournal == nil {
+		return
+	}
+	key := agentAISessionApprovalKey(kind, toolName, command)
+	if key == "" {
+		return
+	}
+	m.coreJournal.appendApprovalAudit(sessionID, "session-mem:"+key, runSeq, models.AgentAIApprovalDecisionAcceptForSession)
+}

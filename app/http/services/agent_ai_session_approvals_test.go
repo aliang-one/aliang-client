@@ -2,7 +2,11 @@ package services
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"aliang.one/nursorgate/app/http/models"
 )
@@ -63,5 +67,33 @@ func TestSessionApprovalRefusesDegenerateKeys(t *testing.T) {
 	m.rememberSessionApproval("s1", "codex", models.AgentAIApprovalKindTool, "mcp__x__y", "")
 	if !m.sessionApprovalAllows("s1", "codex", models.AgentAIApprovalKindTool, "mcp__x__y", "任意输入") {
 		t.Fatal("正常 tool kind 应照常命中")
+	}
+}
+
+// 记忆命中放行落审计行（spec §4.2.4 Amendment，B2 修复）：approval_id 带
+// session-mem: 前缀、decision=accept_for_session；退化键（空工具名）不落。
+func TestSessionApprovalHitJournalsAuditRow(t *testing.T) {
+	dir := t.TempDir()
+	m := newAgentAIManager()
+	m.coreJournal = newAgentCoreJournal(dir)
+	m.coreJournal.ensureSessionHeader("s-hit", "/p", "m", time.Now().UTC().Format(time.RFC3339), "phone")
+
+	m.journalSessionApprovalHit("s-hit", 5, models.AgentAIApprovalKindCommand, "Bash", "ls -la")
+	data, err := os.ReadFile(filepath.Join(dir, agentCoreJournalFileName("s-hit")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"kind":"approval"`) ||
+		!strings.Contains(string(data), `"approval_id":"session-mem:cmd:ls -la"`) ||
+		!strings.Contains(string(data), `"decision":"accept_for_session"`) {
+		t.Fatalf("缺记忆命中审计行或字段不符: %s", data)
+	}
+
+	// 退化键不落（无新行）
+	before := len(strings.Split(strings.TrimSpace(string(data)), "\n"))
+	m.journalSessionApprovalHit("s-hit", 6, models.AgentAIApprovalKindTool, "", "")
+	data2, _ := os.ReadFile(filepath.Join(dir, agentCoreJournalFileName("s-hit")))
+	if len(strings.Split(strings.TrimSpace(string(data2)), "\n")) != before {
+		t.Fatalf("退化键不应落审计行: %s", data2)
 	}
 }

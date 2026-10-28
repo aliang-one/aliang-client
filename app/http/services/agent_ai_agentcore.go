@@ -1769,6 +1769,7 @@ func (m *agentAIManager) agentCoreApprove(run agentAIRun, writeJSON agentTermina
 		// 对齐（buildAgentCoreApprovalRequest 用 run.provider，两侧一致）。
 		if pre := buildAgentCoreApprovalRequest(run, call); m.sessionApprovalAllows(run.sessionID, pre.Provider, pre.Kind, pre.ToolName, pre.Command) {
 			logger.Info(fmt.Sprintf("approval-hook: SESSION-APPROVED (memory) tool=%s kind=%s session=%s (agentcore)", pre.ToolName, pre.Kind, run.sessionID))
+			m.journalSessionApprovalHit(run.sessionID, run.runSeq, pre.Kind, pre.ToolName, pre.Command)
 			return agentcore.ApprovalResponse{Approved: true}, nil
 		}
 

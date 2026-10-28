@@ -173,6 +173,17 @@ socketEntry 含 writer、角色（remote/local）、订阅集合。两条 socket
 
 ### 4.4 steer 补齐
 
+> **Amendment（2026-10-29，实施期修正——阶段 1 落地后定稿）：**
+> 1. claude/codex 通道**不补** `.aliang/ai-sessions` journal steer 行。CLI 通道的插话本就落在原生转录
+>    （claude stream-json 输入消息、codex rollout），读侧三源聚合已可见；再写 journal 会为同一会话制造
+>    第二条清单条目（`claude_<uuid>` 原生条目 + 裸 ID journal 条目）。§4.5 斜杠命令落 journal 同理收敛为
+>    **仅 agentcore 通道**（claude `/compact` 是真实模型回合、codex 由 rollout 承载）。
+> 2. §4.4 第 3 条「steer ack 回发订阅者」首版不做：插话方自己的 socket 已直接收到 ack（emitAgentAISteerAck
+>    语义不变），对端靠清单/快照刷新可见；推送级 steer ack 广播推迟到有真实需求再做。
+> 3. §4.5 审批审计行**不含来源 socket 角色字段**：rememberCompletedApprovalLocked 是多路径汇聚点，无来源
+>    上下文可带；审计以 approval_id/decision/ts 为准，来源归属由 PhoneServer DB 审计承担。
+>    **记忆命中放行同样落审计行**（approval_id 用 `session-mem:<匹配键>` 标识），与显式决策同口径。
+
 - ChatPage 补 run 中插话：解掉 `sending` 守卫，running 状态（由 WS 事件维护）下提交走 `ai.steer`。
   传输/路由/ack 全现成，纯前端。
 - claude/codex 通道 journal steer 行：在 `steer()` 投递 switch 的 claude/codex 分支补
@@ -189,6 +200,9 @@ socketEntry 含 writer、角色（remote/local）、订阅集合。两条 socket
 | 失败/停止回合半截输出丢失 | defer end 行之前，若已流出部分 assistant 文本则补 assistant 行（尽力而为，与现有成功路径同一 append 通道） |
 | 审批决策无本地审计 | `rememberCompletedApprovalLocked` 同步追加 journal 审计行（approval_id/decision/来源 socket 角色） |
 | 头行缺失降级 | §4.3 幂等补写头行 |
+
+> （Amendment 见 §4.4——实施期修正共 4 条：CLI steer 行不落、斜杠仅 agentcore、steer ack 广播首版不做、
+> 审计行无 socket 角色字段但记忆命中也落审计。）
 
 ## 5. 各仓改动清单
 

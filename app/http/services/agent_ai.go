@@ -3900,6 +3900,7 @@ func (m *agentAIManager) handleClaudeApprovalHook(ctx context.Context, sessionID
 	// double build intentional: hit path stays branch-free
 	if preReq := buildClaudeApprovalRequest(run, raw); m.sessionApprovalAllows(sessionID, preReq.Provider, preReq.Kind, preReq.ToolName, preReq.Command) {
 		logger.Info(fmt.Sprintf("approval-hook: SESSION-APPROVED (memory) tool=%s kind=%s session=%s", preReq.ToolName, preReq.Kind, sessionID))
+		m.journalSessionApprovalHit(sessionID, run.runSeq, preReq.Kind, preReq.ToolName, preReq.Command)
 		return claudeApprovalHookDecision(hookEventName, true, "approved for this session"), nil
 	}
 
@@ -5824,6 +5825,7 @@ func (m *agentAIManager) codexAppServerApprovalResult(ctx context.Context, run a
 	// 可能是 "auto"——与 approval() 记录点存的 waiter.request.Provider 对齐）。
 	if pre := buildCodexApprovalRequest(run, method, params, fileChanges); m.sessionApprovalAllows(run.sessionID, pre.Provider, pre.Kind, pre.ToolName, pre.Command) {
 		logger.Info(fmt.Sprintf("approval-hook: SESSION-APPROVED (memory) tool=%s kind=%s method=%s session=%s (codex)", pre.ToolName, pre.Kind, method, run.sessionID))
+		m.journalSessionApprovalHit(run.sessionID, run.runSeq, pre.Kind, pre.ToolName, pre.Command)
 		return codexApprovalResponseResult(method, params, agentAIApprovalResponse{Decision: models.AgentAIApprovalDecisionAccept})
 	}
 	req := buildCodexApprovalRequest(run, method, params, fileChanges)
