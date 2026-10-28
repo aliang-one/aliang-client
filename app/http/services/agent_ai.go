@@ -1939,6 +1939,17 @@ func (m *agentAIManager) runStart(msg map[string]interface{}, writeJSON agentTer
 		if persisted.State == "confirmed" {
 			resumeID = persisted.NativeSessionID
 			reservedID = ""
+			// 绑定守卫（2026-10-27 native session id mismatch 事故根治的 agent
+			// 端半边）：绑定已 confirmed 时，resume id 归 persisted.Provider 所有。
+			// 消息里带来的 provider（服务端设备推断翻转 / 客户端误带 / 老服务端）
+			// 若与绑定不同族，以绑定为权威强制改写 msg——否则 CLI 拿内核的原生 id
+			// 去 --resume，confirmBinding 必然 mismatch，会话从这一回合起永久报错。
+			// 缺省也强制：provider 缺省但 tool 是外来值时同样会走错 CLI。
+			// claude/claudecode 经 providersEquivalent 视为同族，不触发强制。
+			if requested := firstNonEmpty(remoteString(msg, "provider"), remoteString(msg, "tool")); !providersEquivalent(requested, persisted.Provider) {
+				msg["provider"] = persisted.Provider
+				msg["tool"] = persisted.Provider
+			}
 		} else if reservedID == "" {
 			reservedID = persisted.NativeSessionID
 		}
