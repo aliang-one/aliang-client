@@ -16,7 +16,7 @@ import (
 //
 // 一轮 run 的结构：
 //
-//	for turn := 0; turn < maxIterations; turn++ {
+//	for turn := 0; ; turn++ {
 //	    拉 steering → 组请求 → 流式拿回复 → 有 tool_use 就执行并回填 → 否则收工
 //	}
 //
@@ -24,32 +24,32 @@ import (
 // finish）—— 其余两个（PrepareNextTurn / GetFollowUpMessages）在 pi 里服务于
 // 它自己的扩展机制，本内核没有对应需求，等有真实用例再加，避免空接口。
 
-// 回合预算家族。这组护栏回答的是同一个问题：手机用户按下发送就走了，run
-// 必须保证有终态（否则会话永久 running，后续消息全部进死队列——比「跑太久」
-// 严重得多的故障），同时死循环不能把 token 烧穿。
+// 进展守卫家族。这组护栏回答的是同一个问题：run 必须保证有终态（否则会话
+// 永久 running，后续消息全部进死队列——比「跑太久」严重得多的故障），但
+// **健康的工作不该被配额掐死**——一轮 run 跑多少轮、跑多久，由任务本身决定
+// （一条消息触发的 spec 执行/通宵改造跑几百上千轮是常态），模型智能负责收尾。
+// 对齐 claudecode / pi 的做法：无轮数上限、无墙钟，靠上下文管理 + 模型自己
+// 完成。曾经有过的 maxIterations=50 与 runWallBudget=40min 在 2026-10-28
+// 移除——它们防的从来不是故障，而是健康的长任务。
 //
-// maxIterations 只是最后的兜底，真正先触发的是三个「无进展」检测：
+// 这里只剩两个「无进展」检测，防的是病理而非时长：
 //
 //   - maxIdenticalToolTurns：连续 N 轮发起完全相同的工具调用（名字+参数一致）
 //     = 模型在原地打转；
-//   - maxConsecutiveToolErrors：连续 N 个工具结果都是错误 = 越错越试的螺旋；
-//   - runWallBudget：单次 run 的墙钟预算。用户对「跑了多久」的感知远强于
-//     「第几轮」，30 分钟没动静就是该停了。
+//   - maxConsecutiveToolErrors：连续 N 个工具结果都是错误 = 越错越试的螺旋。
 //
-// 三者命中都不直接报错：先补一次不带工具的收尾请求让模型把进度交代出来
+// 「挂死」（网络黑洞、网关吊死这类安静故障）不归内核管——宿主侧活性保护
+// （stale 扫描/看门狗）盯着 run.activity，几分钟没动静就判死，健康的任务
+// 哪怕通宵也在持续产出事件。
+//
+// 守卫命中不直接报错：先补一次不带工具的收尾请求让模型把进度交代出来
 // （见 wrapUp），再以带说明的终止帧收场——用户至少知道干到了哪一步。
-const maxIterations = 50
 
 // maxIdenticalToolTurns 是无进展守卫的轮数阈值。
 const maxIdenticalToolTurns = 3
 
 // maxConsecutiveToolErrors 是连续工具错误的个数阈值（跨轮累计，遇成功清零）。
 const maxConsecutiveToolErrors = 5
-
-// runWallBudget 是单次 run 的墙钟预算。长活任务（探索型读代码、批量改造）
-// 10 分钟是常态，40 分钟给足余量；单个 LLM 调用本身可能耗掉大半预算，
-// 检查点在轮与轮之间，不在流中途。
-const runWallBudget = 40 * time.Minute
 
 // maxContextOverflowRetries 是「上游说上下文超长」后自动压缩并重试的轮数
 // 上限。每次压缩都会把历史砍到窗口一半以下，两三次足够落进任何真实窗口；
@@ -347,23 +347,23 @@ type runner struct {
 	// 要防的是「原地打转」，不是累计次数。
 	truncStreak int
 
-	// 无进展守卫（见文件顶部「回合预算家族」注释）。
+	// 无进展守卫（见文件顶部「进展守卫家族」注释）。
 	//
 	// lastToolSignature/dupStreak：连续 N 轮工具调用签名完全一致 = 打转。
 	// errStreak：连续 N 个工具结果都是错误（跨轮累计，遇成功清零）。
-	// startedAt/wallBudget：墙钟预算；startedAt 在 loop 入口惰性初始化，
-	// wallBudget 供测试缩短（0 = 用 runWallBudget）。
 	lastToolSignature string
 	dupStreak         int
 	errStreak         int
-	startedAt         time.Time
-	wallBudget        time.Duration
+
+	// startedAt 是 run 起点，供 OnTurn 诊断钩子的 ElapsedMs（不再参与任何
+	// 终止判定——墙钟预算已于 2026-10-28 移除）。
+	startedAt time.Time
 
 	// contextTokens 是上游最近一次报告的本轮输入 token 数（message_start 的
 	// usage.input_tokens）。注意 usage.InputTokens 是按轮累加的账单口径，不能
 	// 拿它当「当前上下文多大」——这里单独记最近一次的实测值，供自动压缩判定。
 	contextTokens int
-	// autoCompacts 是本 run 内已执行的自动压缩次数，见 maxAutoCompactsPerRun。
+	// autoCompacts 是本 run 内已执行的自动压缩次数（遥测，进日志与诊断）。
 	autoCompacts int
 	// compactCooldown 是自动压缩失败后剩余的免压回合数（>0 时跳过判定，每
 	// 回合递减一次），见 compactFailureCooldownTurns。
@@ -410,25 +410,11 @@ func (r *runner) loop(ctx context.Context) (*RunResult, error) {
 			return nil, err
 		}
 	}
-	// 惰性初始化：直构造 runner 的测试路径不会设 startedAt，从这里起算。
-	if r.startedAt.IsZero() {
-		r.startedAt = time.Now()
-	}
 
-	for turn := 0; turn < maxIterations; turn++ {
+	for turn := 0; ; turn++ {
 		// 进程内内核没有子进程可杀，取消只能靠自己轮询。
 		if err := ctx.Err(); err != nil {
 			return r.finishWithErr(ctx, "", err)
-		}
-
-		// 墙钟预算。检查点在轮与轮之间——单个流式调用本身可以耗很久，
-		// 这里拦的是「下一个回合还值不值得开」。
-		if elapsed := time.Since(r.startedAt); elapsed > r.budget() {
-			r.logf("[agentcore] 达到单次运行时间预算 %s（已耗时 %s），收尾 session=%s",
-				r.budget(), elapsed.Round(time.Second), r.sid())
-			return r.stopWithSummary(ctx,
-				fmt.Sprintf("本次运行已耗时 %s，达到单次运行时间预算 %s",
-					elapsed.Round(time.Minute), r.budget()))
 		}
 
 		r.turns = turn + 1
@@ -503,7 +489,8 @@ func (r *runner) loop(ctx context.Context) (*RunResult, error) {
 			r.fireFinishTurn(stopReason)
 			// 收尾追补：steering 排进队列却没赶上任何一次下一轮调用时
 			// （典型：插话在最后一轮流式尾声才到），再跑一轮把它答掉，
-			// 别让用户的插话悬在队列里没有回复。上限仍是 maxIterations。
+			// 别让用户的插话悬在队列里没有回复。轮数无上限，run 由模型
+			// 自然收尾或进展守卫终止。
 			if r.cfg.Hooks.GetFollowUpMessages != nil {
 				if followUps := r.cfg.Hooks.GetFollowUpMessages(); len(followUps) > 0 {
 					r.history = append(r.history, followUps...)
@@ -591,26 +578,9 @@ func (r *runner) loop(ctx context.Context) (*RunResult, error) {
 			}
 		}
 	}
-
-	// 撞上 maxIterations——三个无进展守卫都没先触发时的兜底。
-	//
-	// 不直接报错收场：上限是防死循环的护栏，不该让用户看到一句「达到最大回合数」
-	// 之后什么都没有——前面几十条命令的进展全丢在历史里。stopWithSummary 会
-	// 补一次**不带工具**的请求，让模型把已完成的部分和下一步用文字交代出来。
-	// 这一次不计入回合数，失败也只是没有收尾文本，不改变终止结论。
-	return r.stopWithSummary(ctx,
-		fmt.Sprintf("达到单次运行的最大回合数 %d", maxIterations))
 }
 
-// budget 返回本 run 的墙钟预算（测试可经 wallBudget 缩短）。
-func (r *runner) budget() time.Duration {
-	if r.wallBudget > 0 {
-		return r.wallBudget
-	}
-	return runWallBudget
-}
-
-// stopWithSummary 是所有预算耗尽出口的统一收场：先补一次无工具的收尾总结
+// stopWithSummary 是所有进展守卫出口的统一收场：先补一次无工具的收尾总结
 // （wrapUp 内部吞错，不影响终止结论），再以带原因的终止帧结束。
 func (r *runner) stopWithSummary(ctx context.Context, reason string) (*RunResult, error) {
 	r.wrapUp(ctx, reason)
@@ -675,10 +645,9 @@ func (r *runner) maybeAutoCompact(ctx context.Context) {
 	if window <= 0 {
 		return
 	}
-	if r.autoCompacts >= maxAutoCompactsPerRun {
-		return
-	}
 	// 连续失败达上限：本 run 不再自动压缩（翻转时的那条日志在失败分支打）。
+	// 成功路径不设次数配额——压缩多少次由任务决定（通宵任务几十次是常态），
+	// 病理由失败侧的 compactFailureLimit 与冷却兜住。
 	if r.compactFailures >= compactFailureLimit {
 		return
 	}

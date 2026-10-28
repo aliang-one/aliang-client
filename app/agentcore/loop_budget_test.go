@@ -7,12 +7,11 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
-	"time"
 )
 
-// 这一组锁死「回合预算家族」的语义（见 loop.go 顶部注释）：三个无进展守卫
-// 必须先于 maxIterations 触发，且**每个出口都走 stopWithSummary**——用户拿到
-// 的是「干到哪了 + 为什么停」，不是一句裸错误。
+// 这一组锁死「进展守卫家族」的语义（见 loop.go 顶部注释）：无进展守卫是
+// 唯一的主动终止者（轮数/墙钟配额已于 2026-10-28 移除），且**每个出口都走
+// stopWithSummary**——用户拿到的是「干到哪了 + 为什么停」，不是一句裸错误。
 
 // toolTurn 是一个完整的工具调用回合 SSE（参数合法，会真实执行）。
 // 帧形态沿用 turnScript 的约定：writeSSE 给首帧补 data: 前缀，后续帧自带。
@@ -203,49 +202,6 @@ func TestLoopErrStreakResetsOnSuccess(t *testing.T) {
 	}
 }
 
-// TestLoopStopsOnWallClockBudget：墙钟预算。直构造 runner（startedAt 倒填、
-// wallBudget 缩短）让第一轮就超预算。
-func TestLoopStopsOnWallClockBudget(t *testing.T) {
-	srv := scriptServer(t, []string{toolTurn("toolu_wall", "Stub", `{"x":"late"}`), textTurn("来不及了")})
-	defer srv.Close()
-
-	logs := []string{}
-	registry := NewRegistry()
-	registry.Register(&stubTool{name: "Stub", result: ToolResult{Content: "ok"}})
-
-	rec := &frameRecorder{}
-	// Emit 必须在构造 writer 之前就位——newStreamWriter 在构造时捕获它。
-	r := &runner{
-		cfg: &Config{
-			Client: NewClient(srv.URL),
-			Model:  "claude-x",
-			Tools:  registry,
-			Emit:   rec.emit,
-			Logf: func(format string, args ...interface{}) {
-				logs = append(logs, fmt.Sprintf(format, args...))
-			},
-		},
-		history:    []Message{TextMessage("user", "跑很久")},
-		writer:     newStreamWriter(rec.emit, "sess-wall"),
-		startedAt:  time.Now().Add(-time.Hour), // 一小时前开始
-		wallBudget: time.Minute,                // 预算 1 分钟 → 第一轮就超
-	}
-	res, err := r.loop(context.Background())
-	if err != nil {
-		t.Fatalf("loop: %v", err)
-	}
-	if !res.IsError {
-		t.Fatal("超墙钟预算必须以终止帧收场")
-	}
-	resultFrame := lastResultFrame(t, rec)
-	if got, _ := resultFrame["result"].(string); !strings.Contains(got, "时间预算") {
-		t.Errorf("终止原因应点名时间预算，实际 %q", got)
-	}
-	if joined := strings.Join(logs, "\n"); !strings.Contains(joined, "时间预算") {
-		t.Errorf("应有观测日志，实际 %s", joined)
-	}
-}
-
 // TestToolCallSignature：签名的可比性——同参数同签名（id 不参与），参数或
 // 工具不同即不同。map 序列化按键排序，这是稳定性的来源。
 func TestToolCallSignature(t *testing.T) {
@@ -268,4 +224,82 @@ func TestToolCallSignature(t *testing.T) {
 // toolUseBlock 造一个 tool_use 内容块（测试辅助）。
 func toolUseBlock(id, name string, input map[string]interface{}) ContentBlock {
 	return ContentBlock{Type: BlockTypeToolUse, ID: id, Name: name, Input: input}
+}
+
+// TestLoopRunsPastLegacyIterationCap：轮数不设上限——60 个各不相同的工具轮
+// 加一个收尾轮必须全部跑完。旧版 for turn < 50 会在第 50 轮拦腰斩断并报错,
+// 一条消息触发的大任务(spec 执行/通宵改造)永远跑不完,只能靠用户肉眼看到
+// 错误再手动说「继续」。对齐 claudecode / pi:无轮数上限,任务跑多久由任务
+// 本身决定,防打转/防螺旋守卫照旧(2026-10-28 二轮审计,用户拍板)。
+func TestLoopRunsPastLegacyIterationCap(t *testing.T) {
+	const total = 60
+	turns := make([]string, 0, total+1)
+	for i := 0; i < total; i++ {
+		turns = append(turns, toolTurn("toolu_cap", "Stub", fmt.Sprintf(`{"x":"round-%d"}`, i)))
+	}
+	turns = append(turns, textTurn("干完了"))
+	srv := scriptServer(t, turns)
+	defer srv.Close()
+
+	registry := NewRegistry()
+	registry.Register(&stubTool{name: "Stub", result: ToolResult{Content: "ok"}})
+
+	rec := &frameRecorder{}
+	res, err := Run(context.Background(), &Config{
+		Client: NewClient(srv.URL),
+		Model:  "claude-x",
+		Tools:  registry,
+		Emit:   rec.emit,
+	}, []Message{TextMessage("user", "跑一个通宵大任务")})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("超过旧上限不得报错,实际以错误收场: %q", res.Text)
+	}
+	if res.Turns != total+1 {
+		t.Errorf("Turns = %d, want %d(全部轮数+收尾轮)", res.Turns, total+1)
+	}
+	if !strings.Contains(res.Text, "干完了") {
+		t.Errorf("应以收尾文本结束,实际 %q", res.Text)
+	}
+}
+
+// TestLoopDirectConstructionCompletes：直构造 runner(不走 Run)也能完整跑完
+// 工具回合。旧版这条路径曾带墙钟预算(startedAt 倒填即判死),墙钟移除后
+// 「跑太久」不再构成故障——故障只有「没进展」(守卫)与「挂死」(宿主活性保护)。
+// 保留直构造形态作为该路径的回归钉。
+func TestLoopDirectConstructionCompletes(t *testing.T) {
+	srv := scriptServer(t, []string{
+		toolTurn("toolu_old1", "Stub", `{"x":"a"}`),
+		toolTurn("toolu_old2", "Stub", `{"x":"b"}`),
+		textTurn("干完了"),
+	})
+	defer srv.Close()
+
+	registry := NewRegistry()
+	registry.Register(&stubTool{name: "Stub", result: ToolResult{Content: "ok"}})
+
+	rec := &frameRecorder{}
+	// Emit 必须在构造 writer 之前就位——newStreamWriter 在构造时捕获它。
+	r := &runner{
+		cfg: &Config{
+			Client: NewClient(srv.URL),
+			Model:  "claude-x",
+			Tools:  registry,
+			Emit:   rec.emit,
+		},
+		history: []Message{TextMessage("user", "跑很久")},
+		writer:  newStreamWriter(rec.emit, "sess-old"),
+	}
+	res, err := r.loop(context.Background())
+	if err != nil {
+		t.Fatalf("loop: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("陈旧 startedAt 不许触发终止,实际 %q", res.Text)
+	}
+	if res.Turns != 3 {
+		t.Errorf("Turns = %d, want 3", res.Turns)
+	}
 }

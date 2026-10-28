@@ -49,7 +49,7 @@ func TestFinish_ErrorReasonComesFirst(t *testing.T) {
 	var buf bytes.Buffer
 	r := newTestRunner(&buf)
 	r.turnText.WriteString("找到了「待开始」的来源，接下来来看看 `isDraft` 是怎么判断的。")
-	r.turns = maxIterations
+	r.turns = 50 // 旧版回合上限的字面量;上限本体已移除,这里只测 finish 帧的文本拼装
 
 	if _, err := r.finish(context.Background(), ResultSubtypeErrorMaxTurns, "达到单次运行的最大回合数 50，已停止", true, nil); err != nil {
 		t.Fatalf("finish 返回错误: %v", err)
