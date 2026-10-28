@@ -87,10 +87,21 @@ func (h *AgentHandler) HandleAIStream(w http.ResponseWriter, r *http.Request) {
 		return conn.WriteJSON(payload)
 	}
 
+	// 跨端同态（spec §4.1）：本地聊天连接注册进 socket 注册表，事件扇出与
+	// 审批广播靠它；连接退出即注销（pump 所有权契约见 registerAISocket）。
+	// defer 顺序：注销先于 conn.Close（LIFO）——先停 pump 再关连接。
+	socketID := h.service.RegisterLocalAIChatSocket(writeJSON)
+	defer h.service.UnregisterLocalAIChatSocket(socketID)
+
 	for {
 		var msg map[string]interface{}
 		if err := conn.ReadJSON(&msg); err != nil {
 			return
+		}
+		if socketID != "" {
+			// 内部标记（"__" 前缀，禁止转发到任何对端）：message()/create() 读它
+			// 落 session.originSocket，runEmitter 据此做 origin 去重扇出。
+			msg[services.AgentAIOriginSocketField] = socketID
 		}
 		h.service.DispatchLocalAI(msg, writeJSON)
 	}

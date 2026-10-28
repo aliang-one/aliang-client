@@ -146,6 +146,7 @@ func TestRunEventFanOutToSubscriber(t *testing.T) {
 	m := newTestAISocketsManager(t)
 	originWritten := make(chan struct{}, 8)
 	subWritten := make(chan map[string]interface{}, 8)
+	bystanderWritten := make(chan map[string]interface{}, 8)
 	originWrite := func(interface{}) error {
 		originWritten <- struct{}{}
 		return nil
@@ -155,9 +156,13 @@ func TestRunEventFanOutToSubscriber(t *testing.T) {
 		subWritten <- p.(map[string]interface{})
 		return nil
 	})
+	m.registerAISocket("local", func(p interface{}) error {
+		bystanderWritten <- p.(map[string]interface{})
+		return nil
+	})
 	m.subscribeAISocket(sub.id, "s1")
 
-	write := m.fanOutWrite("s1", origin.id, originWrite)
+	write := m.fanOutWrite(origin.id, "s1", originWrite)
 	_ = write(map[string]interface{}{"type": "ai.delta", "delta": "x"})
 
 	<-originWritten // origin 已内联写出
@@ -169,6 +174,13 @@ func TestRunEventFanOutToSubscriber(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("订阅者未收到 run 事件")
 	}
+	// 未订阅 socket 不收 run 流事件（非审批族只按订阅扇出）。
+	time.Sleep(50 * time.Millisecond)
+	select {
+	case got := <-bystanderWritten:
+		t.Fatalf("未订阅 socket 不应收到 run 事件,收到 %v", got["type"])
+	default:
+	}
 }
 
 // TestApprovalBroadcastReachesNonSubscriber 审批族事件广播到全部活跃 socket
@@ -177,11 +189,11 @@ func TestRunEventFanOutToSubscriber(t *testing.T) {
 func TestApprovalBroadcastReachesNonSubscriber(t *testing.T) {
 	m := newTestAISocketsManager(t)
 	got := make(chan map[string]interface{}, 8)
-	bystander := m.registerAISocket("local", func(p interface{}) error {
+	m.registerAISocket("local", func(p interface{}) error {
 		got <- p.(map[string]interface{})
 		return nil
 	})
-	write := m.fanOutWrite("s1", agentAIRemoteSocketID, func(interface{}) error { return nil })
+	write := m.fanOutWrite(agentAIRemoteSocketID, "s1", func(interface{}) error { return nil })
 	_ = write(map[string]interface{}{"type": models.AgentEventAIApprovalRequest, "session_id": "s1"})
 	select {
 	case p := <-got:
@@ -191,7 +203,6 @@ func TestApprovalBroadcastReachesNonSubscriber(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("未订阅 socket 未收到审批广播")
 	}
-	_ = bystander
 }
 
 // TestOriginSocketNotDuplicated origin 去重：包装内层的 originWrite 恰好执行
@@ -201,12 +212,123 @@ func TestOriginSocketNotDuplicated(t *testing.T) {
 	m := newTestAISocketsManager(t)
 	count := make(chan struct{}, 32)
 	sock := m.registerAISocket("local", func(interface{}) error { count <- struct{}{}; return nil })
-	write := m.fanOutWrite("s1", sock.id, func(interface{}) error { count <- struct{}{}; return nil })
+	write := m.fanOutWrite(sock.id, "s1", func(interface{}) error { count <- struct{}{}; return nil })
 	_ = write(map[string]interface{}{"type": "ai.delta"})
 	waitUntilFor(t, time.Second, func() bool { return len(count) == 1 })
 	time.Sleep(50 * time.Millisecond)
 	if n := len(count); n != 1 {
 		t.Fatalf("origin 事件应恰好写一次,实际 %d", n)
+	}
+}
+
+// TestOriginSocketStampedOnSessionViaCreate create 路径落标：入站帧盖
+// __origin_socket 后，DispatchLocalAI 走 create()，session.originSocket 应等于
+// 发起 socket 的注册表 id（Task 5 标记链的第一环）。
+func TestOriginSocketStampedOnSessionViaCreate(t *testing.T) {
+	m := newTestAISocketsManager(t)
+	svc := &AgentService{ai: m}
+	sock := m.registerAISocket("local", func(interface{}) error { return nil })
+	defer m.unregisterAISocket(sock.id)
+	svc.DispatchLocalAI(map[string]interface{}{
+		"type":                   models.AgentEventAISessionCreate,
+		"session_id":             "origin-stamp-c1",
+		"provider":               "agentcore",
+		"mode":                   "vibe",
+		"project_path":           t.TempDir(),
+		agentAIOriginSocketField: sock.id,
+	}, func(interface{}) error { return nil })
+	m.mu.Lock()
+	s := m.sessions["origin-stamp-c1"]
+	var got string
+	if s != nil {
+		got = s.originSocket
+	}
+	m.mu.Unlock()
+	if s == nil {
+		t.Fatal("create 未注册会话")
+	}
+	if got != sock.id {
+		t.Fatalf("session.originSocket = %q, 期望 %q", got, sock.id)
+	}
+}
+
+// TestOriginSocketStampedOnSessionViaMessage message 路径落标：会话已存在时，
+// 第二临界区（lastActiveAt 同点）应把入站标记落到 session.originSocket。
+// provider 用非法值让回合在落标点之后立刻以 ai.error 收场——不真正 spawn
+// 任何 provider（agentcore 会拨本机 56432，测试环境绝不能碰）。
+func TestOriginSocketStampedOnSessionViaMessage(t *testing.T) {
+	m := newTestAISocketsManager(t)
+	svc := &AgentService{ai: m}
+	sock := m.registerAISocket("local", func(interface{}) error { return nil })
+	defer m.unregisterAISocket(sock.id)
+	written := make(chan map[string]interface{}, 8)
+	dispense := func(p interface{}) error {
+		if row, ok := p.(map[string]interface{}); ok {
+			written <- row
+		}
+		return nil
+	}
+	svc.DispatchLocalAI(map[string]interface{}{
+		"type":                   models.AgentEventAISessionCreate,
+		"session_id":             "origin-stamp-m1",
+		"provider":               "agentcore",
+		"mode":                   "vibe",
+		"project_path":           t.TempDir(),
+		agentAIOriginSocketField: sock.id,
+	}, dispense)
+	svc.DispatchLocalAI(map[string]interface{}{
+		"type":                   models.AgentEventAIMessage,
+		"session_id":             "origin-stamp-m1",
+		"message_id":             "m1",
+		"content":                "hi",
+		"provider":               "no-such-provider",
+		agentAIOriginSocketField: sock.id,
+	}, dispense)
+	m.mu.Lock()
+	s := m.sessions["origin-stamp-m1"]
+	var got string
+	if s != nil {
+		got = s.originSocket
+	}
+	m.mu.Unlock()
+	if got != sock.id {
+		t.Fatalf("session.originSocket = %q, 期望 %q", got, sock.id)
+	}
+	// 回合应被非法 provider 拦下（ai.error），证明失败发生在落标之后、spawn 之前。
+	// 注意排空写法：len(chan) 随接收收缩，`i < len(ch)` 的计数循环只会读一半。
+	sawError := false
+drain:
+	for {
+		select {
+		case row := <-written:
+			if row["type"] == models.AgentEventAIError {
+				sawError = true
+				break drain
+			}
+		default:
+			break drain
+		}
+	}
+	if !sawError {
+		t.Fatal("message 未以 ai.error 收场（非法 provider 应在落标后被拒）")
+	}
+}
+
+// TestRunEmitterCarriesRunOriginSocket runEmitter 把 run.originSocketID 接进
+// fan-out 去重：Task 4 阶段恒空（无去重），Task 5 填充后 origin socket 不得
+// 再收到副本。
+func TestRunEmitterCarriesRunOriginSocket(t *testing.T) {
+	m := newTestAISocketsManager(t)
+	count := make(chan struct{}, 16)
+	sock := m.registerAISocket("local", func(interface{}) error { count <- struct{}{}; return nil })
+	defer m.unregisterAISocket(sock.id)
+	emitter := m.runEmitter(agentAIRun{sessionID: "s1", originSocketID: sock.id},
+		func(interface{}) error { count <- struct{}{}; return nil })
+	_ = emitter.emit(map[string]interface{}{"type": "ai.delta", "delta": "x"})
+	waitUntilFor(t, time.Second, func() bool { return len(count) == 1 })
+	time.Sleep(50 * time.Millisecond)
+	if n := len(count); n != 1 {
+		t.Fatalf("origin 事件应恰好写一次(内联),实际 %d", n)
 	}
 }
 

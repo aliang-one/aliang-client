@@ -352,6 +352,10 @@ type agentAISession struct {
 	// surface 是本会话最近一个手机回合的驱动面标记（"phone" 或 ""）。
 	// 只增不降：ai.session.create 等旧通道不带该字段时不清掉已置的 phone。
 	surface string
+	// originSocket 是本会话最近一个 run 的发起 socket 注册表 id（"remote" 或
+	// "aisock-N"）。由入站消息的 __origin_socket 标记落（message/create/runStart），
+	// 构造 run 时带进 run.originSocketID 供 fan-out 去重与审批 ack 双写（Task 7）。
+	originSocket string
 }
 
 type agentAISteerMessage struct {
@@ -460,7 +464,8 @@ type agentAIRun struct {
 	// streamAgentAIStdout/streamStructuredAIDelta 的签名与全部测试调用点。
 	claudeSteer *agentAIClaudeSteerControl
 	// originSocketID 是本回合发起 socket 的注册表 id（"remote" 或 "aisock-N"）。
-	// 由消息分发路径盖的 __origin_socket 标记经 message()/runStart() 落入；
+	// 由消息分发路径盖的 __origin_socket 标记经 message()/runStart() 落入
+	//（Task 5 起，由 message()/create()/runStart()/option-followup 四路填充）；
 	// 空串=旧调用方（TUI/测试内部路径），fan-out 无 origin 去重。
 	originSocketID string
 }
@@ -1030,10 +1035,10 @@ func (m *agentAIManager) runEmitter(run agentAIRun, write agentTerminalWriter) *
 		}
 	}
 	// 跨端同态（spec §4.1）：origin 仍内联，事件副本扇出到订阅 socket。
-	// originSocketID 从消息分发路径盖的 __origin_socket 来（Task 5 落地）；
-	// 此阶段恒空串=无 origin 去重，扇出与 origin 内联并存属可接受重复
-	//（仅测试/内部路径）。
-	e.write = m.fanOutWrite(run.sessionID, run.originSocketID, e.write)
+	// originSocketID 从消息分发路径盖的 __origin_socket 来（Task 5 起
+	// message()/create()/runStart()/option-followup 四路填充）；恒空串=无
+	// origin 去重，扇出与 origin 内联并存（仅测试/内部路径）。
+	e.write = m.fanOutWrite(run.originSocketID, run.sessionID, e.write)
 	return e
 }
 
@@ -1655,6 +1660,9 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 		if len(history) > 0 {
 			existing.history = trimAgentAIHistoryForSession(existing, history)
 		}
+		if v := strings.TrimSpace(remoteString(msg, agentAIOriginSocketField)); v != "" {
+			existing.originSocket = v
+		}
 		m.mu.Unlock()
 		_ = writeJSON(agentAISessionCreatedPayload(existing))
 		return
@@ -1678,6 +1686,7 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 		initialContext:          initialContext,
 		isGoalFork:              isGoalFork,
 		surface:                 surface,
+		originSocket:            strings.TrimSpace(remoteString(msg, agentAIOriginSocketField)),
 		claudePolicy:            cloneAgentAIClaudeRemotePolicy(claudePolicy),
 		history:                 trimAgentAIHistoryWithLimits(history, newHistoryMessages, newHistoryChars),
 		lastActiveAt:            time.Now().UTC(),
@@ -1715,9 +1724,13 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 	// carries is_goal_fork, and lazy-create persists it for subsequent turns.
 	messageIsGoalFork, _ := msg["is_goal_fork"].(bool)
 	messageRun := agentAIRun{
-		sessionID:              sessionID,
-		runID:                  remoteString(msg, "run_id"),
-		messageID:              messageID,
+		sessionID: sessionID,
+		runID:     remoteString(msg, "run_id"),
+		messageID: messageID,
+		// origin 必须在本条消息自带标记上取：emitter 在 session 解析（含
+		// lazy-create）之前就要建好，读 session.originSocket 只能拿到上一回合
+		// 的旧值——换端发起的回合会被误判成旧端 origin，去重失效变成双投。
+		originSocketID:         strings.TrimSpace(remoteString(msg, agentAIOriginSocketField)),
 		goalIdentity:           goalRunIdentityFromMessage(msg),
 		goalRequiredCheckCount: goalRequiredCheckCountFromContext(msg["goal_context"]),
 		goalAllowedRoots:       goalAllowedRootsFromContext(msg["goal_context"]),
@@ -1845,6 +1858,9 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 	if cw := clampAgentAIContextWindow(remoteInt(msg, "context_window", 0)); cw > 0 {
 		session.contextWindow = cw
 	}
+	if v := strings.TrimSpace(remoteString(msg, agentAIOriginSocketField)); v != "" {
+		session.originSocket = v
+	}
 	session.lastActiveAt = time.Now().UTC() // LRU recency: this conversation is active
 	if session.cancel != nil {
 		m.mu.Unlock()
@@ -1944,7 +1960,10 @@ func (m *agentAIManager) runStart(msg map[string]interface{}, writeJSON agentTer
 		// terminal instead of leaving a permanently "received" processed-run row.
 		emitter := m.runEmitter(agentAIRun{
 			runID: runID, sessionID: sessionID, messageID: messageID,
-			goalIdentity: goalRunIdentityFromMessage(msg),
+			// 错误回包也要带 origin：fan-out 去重靠它跳过发起通道，Task 7 的
+			// 审批 ack 双写同样按 origin 寻址。
+			originSocketID: strings.TrimSpace(remoteString(msg, agentAIOriginSocketField)),
+			goalIdentity:   goalRunIdentityFromMessage(msg),
 		}, writeJSON)
 		_ = emitter.emit(agentAIErrorPayload(sessionID, messageID, err))
 		return
@@ -1981,6 +2000,9 @@ func (m *agentAIManager) runStart(msg map[string]interface{}, writeJSON agentTer
 		session.resumeSessionID = resumeID
 		session.reservedNativeSessionID = reservedID
 		session.bindingVersion = remoteInt(msg, "binding_version", session.bindingVersion)
+		if v := strings.TrimSpace(remoteString(msg, agentAIOriginSocketField)); v != "" {
+			session.originSocket = v
+		}
 		if policy := parseAgentAIClaudeRemotePolicy(msg); policy.enabled {
 			session.claudePolicy = cloneAgentAIClaudeRemotePolicy(policy)
 			session.claudeCaps = agentAIClaudeCapabilities{}
@@ -2790,6 +2812,9 @@ func (m *agentAIManager) runUserMessage(session *agentAISession, runID, messageI
 		// the real run is built here — so it never reached runCLIPass/codex.
 		readOnly: session.isGoalFork,
 		surface:  session.surface,
+		// 执行 run 也带 origin（fan-out 去重走 emitter 侧的 messageRun 值，
+		// 这份供审批 ack 双写等 run 级消费方用；临界区内读，与 session 快照同源）。
+		originSocketID: session.originSocket,
 	}
 	run.onClaudeInit = func(commands []string, version string) {
 		m.recordClaudeCapabilities(run.sessionID, run.projectPath, commands, version)
@@ -2882,7 +2907,14 @@ func (m *agentAIManager) optionResponse(msg map[string]interface{}, writeJSON ag
 	content := buildAgentAIOptionFollowup(pending, selected, custom)
 	messageID := pending.MessageID + ".option"
 
-	run := agentAIRun{sessionID: sessionID, runID: remoteString(msg, "run_id"), messageID: messageID}
+	// option 续接回合同样盖 origin：不补的话，发起 socket 已注册时会出现
+	// 「内联 + 扇出」双投（无去重扇出）。
+	run := agentAIRun{
+		sessionID:      sessionID,
+		runID:          remoteString(msg, "run_id"),
+		messageID:      messageID,
+		originSocketID: strings.TrimSpace(remoteString(msg, agentAIOriginSocketField)),
+	}
 	emitter := m.runEmitter(run, writeJSON)
 	if err := m.runUserMessage(session, remoteString(msg, "run_id"), messageID, content, provider, nil, nil, emitter, nil); err != nil {
 		_ = emitter.emit(agentAIErrorPayload(sessionID, messageID, err))

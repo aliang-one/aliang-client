@@ -35,6 +35,9 @@ const agentAIOriginSocketField = "__origin_socket"
 // agentAIRemoteSocketID 远端 WS 的常驻 socket id（写函数是间接层，重连自动换道）。
 const agentAIRemoteSocketID = "remote"
 
+// AgentAIOriginSocketField 供 handlers 包盖标记用（与 agentAIOriginSocketField 同值）。
+const AgentAIOriginSocketField = agentAIOriginSocketField
+
 type agentAISocket struct {
 	id        string
 	role      string // "remote" | "local"；与常驻 socket id agentAIRemoteSocketID 值有意同词，语义不同（角色分类 vs 注册表键）：role=="remote" 的 socket 恒被改写为单键 agentAIRemoteSocketID，勿互相替代。
@@ -231,10 +234,13 @@ func agentAIEventIsApprovalFamily(payload map[string]interface{}) bool {
 }
 
 // fanOutWrite 包一层 origin 写函数：origin 内联（保 emitter 的互斥序与终态
-// 屏障语义），随后非阻塞扇出副本。审批族广播、其余仅订阅者。
+// 屏障语义），随后非阻塞扇出副本。审批族广播、其余仅订阅者。参数序与
+// fanOutFrom 对齐（originSocketID 在前）。
+// origin 写失败也照常扇出（错误原样返给调用方）——源连接死亡不该剥夺其他
+// 端的事件；阻塞的 origin 写会推迟扇出。
 // 契约：payload 在本函数返回后视为冻结——同一 map 实例会异步投递给 N 个
 // pump，调用方（emitter.emit）此后不得原地改写。
-func (m *agentAIManager) fanOutWrite(sessionID, originSocketID string, originWrite agentTerminalWriter) agentTerminalWriter {
+func (m *agentAIManager) fanOutWrite(originSocketID, sessionID string, originWrite agentTerminalWriter) agentTerminalWriter {
 	if originWrite == nil {
 		return nil
 	}
@@ -266,4 +272,25 @@ func (m *agentAIManager) fanOutFrom(originID, sessionID string, payload map[stri
 	for _, s := range targets {
 		s.enqueue(payload)
 	}
+}
+
+// RegisterLocalAIChatSocket 注册一条本地聊天 WS 出站 socket，返回其 id
+// （空串=manager 未就绪，调用方跳过注册与标记）。
+func (s *AgentService) RegisterLocalAIChatSocket(write agentTerminalWriter) string {
+	if s.ai == nil || write == nil {
+		return ""
+	}
+	if sock := s.ai.registerAISocket("local", write); sock != nil {
+		return sock.id
+	}
+	return ""
+}
+
+// UnregisterLocalAIChatSocket 注销本地聊天 socket（幂等；空串或 manager 未
+// 就绪时 no-op）。
+func (s *AgentService) UnregisterLocalAIChatSocket(id string) {
+	if id == "" || s.ai == nil {
+		return
+	}
+	s.ai.unregisterAISocket(id)
 }

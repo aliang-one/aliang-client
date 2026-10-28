@@ -447,6 +447,10 @@ func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn) error {
 		return w(payload)
 	}
 
+	// 远端常驻 socket：写函数是间接层（重连换道），注册一次进程内有效。
+	// 本函数每条连接跑一次——重连必然重入，断线死亡的 socket 在此复活。
+	s.ai.ensureRemoteAISocket(writeJSON)
+
 	// Read liveness: enforce a read deadline that is refreshed by inbound pongs
 	// (and any application message). If the peer goes silent the deadline fires
 	// -> ReadJSON errors -> the session ends and remoteConnectionLoop reconnects,
@@ -831,6 +835,10 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 		s.setRemoteConnectionState(true, "online", "")
 		s.terminal.quotaResolved(msg, writeJSON)
 	case models.AgentEventAISessionCreate, models.AgentEventAIMessage, models.AgentEventAIRunStart, models.AgentEventAISteer, models.AgentEventAIApprovalResponse, models.AgentEventAIOptionResponse, models.AgentEventAIStop, models.AgentEventAISessionClose, models.AgentEventAITuiSync, models.AgentEventToolAskResponse:
+		// 跨端同态（spec §4.1）：入站 AI 帧盖远端来源标记。位置刻意在 case 入口、
+		// aiControlEnabled 门与任何 early-return 之前——错误回包路径（含门拒绝）
+		// 同样有 origin 可寻址（Task 7 审批 ack 双写）。"__" 前缀标记禁止转发。
+		msg[agentAIOriginSocketField] = agentAIRemoteSocketID
 		s.setRemoteConnectionState(true, "online", "")
 		switch msgType {
 		case models.AgentEventAISessionCreate:
