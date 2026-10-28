@@ -976,7 +976,7 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 	endStatus, endErrMsg := "error", ""
 	defer func() { journal.appendEnd(run.sessionID, endStatus, endErrMsg) }()
 	now := time.Now().UTC().Format(time.RFC3339)
-	journal.ensureSessionHeader(run.sessionID, run.projectPath, agentCoreModel(run), now)
+	journal.ensureSessionHeader(run.sessionID, run.projectPath, agentCoreModel(run), now, agentCoreJournalOrigin(run))
 	if lastUser, ok := m.lastUserHistoryMessage(run.sessionID); ok {
 		ts := now
 		if !lastUser.CreatedAt.IsZero() {

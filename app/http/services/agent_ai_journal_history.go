@@ -15,8 +15,8 @@ import (
 type agentCoreJournalHead struct {
 	projectPath string
 	model       string
-	// origin：journal v1 头行暂不落该字段，读侧先行解析（缺席=空串）——
-	// 跨端续聊的来源归属随后续任务补写头行时即被本解析器自然拾起。
+	// origin：头行来源（phone|dashboard|unknown），写侧 ensureSessionHeader
+	// 落盘；旧文件/补写前的文件缺席=空串，本解析器自然容忍。
 	origin string
 }
 

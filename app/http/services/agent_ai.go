@@ -4151,9 +4151,9 @@ func (m *agentAIManager) lastUserHistoryMessage(sessionID string) (agentAIMessag
 // 包装（见 ai.steer 投递分支），journal 按 spec §5 取真实用户 content，与
 // session.history 的 user 行同口径。
 // steer 可能先于 run 的任何写入到达（目录/文件都还没有）——appendLineLocked
-// 内部有目录懒创建，这里只管追加。steer 先建的文件无头行：ProjectPath/Model
-// 留空是该会话的既定降级（reader ID 兜底取文件名），不要试图补写头行
-// （ensureSessionHeader 见文件存在即跳过，永远轮不到补）。
+// 内部有目录懒创建，这里只管追加。steer 先建的文件无头行（ProjectPath/Model
+// 暂空，reader ID 兜底取文件名），随后 run 入口的 ensureSessionHeader 会整体
+// 重写补头并保留已落内容（agent_ai_agentcore_journal.go prependHeaderLocked）。
 func (m *agentAIManager) journalSteerUserMessage(sessionID string, msg agentAISteerMessage, content string) {
 	if m == nil || m.coreJournal == nil {
 		return

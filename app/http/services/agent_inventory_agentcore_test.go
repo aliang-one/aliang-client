@@ -14,7 +14,7 @@ import (
 func writeAgentCoreJournalFixture(t *testing.T, dir, sessionID, projectPath string) {
 	t.Helper()
 	j := newAgentCoreJournal(dir)
-	j.ensureSessionHeader(sessionID, projectPath, "glm-5.2", "2026-10-26T08:00:00Z")
+	j.ensureSessionHeader(sessionID, projectPath, "glm-5.2", "2026-10-26T08:00:00Z", "phone")
 	base := time.Date(2026, 10, 26, 8, 0, 0, 0, time.UTC)
 	j.appendUser(sessionID, "m1", "第一句", base.Format(time.RFC3339))
 	j.appendAssistant(sessionID, "m1-assistant", "第一答", base.Add(time.Minute).Format(time.RFC3339))
