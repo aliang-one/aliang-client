@@ -165,6 +165,7 @@ func tryRestoreConfigFromDatabase() (*Config, error) {
 	if err := json.Unmarshal([]byte(snapshot.SnapshotJSON), &cfg); err != nil {
 		return nil, fmt.Errorf("failed to parse snapshot json: %w", err)
 	}
+	normalizeLoadedConfigAIRules(&cfg)
 
 	logger.Debug(fmt.Sprintf("Configuration restored from database snapshot (id=%d, created_at=%v)", snapshot.ID, snapshot.CreatedAt))
 	return &cfg, nil
@@ -181,6 +182,7 @@ func LoadConfig(configPath string) (*Config, error) {
 	if err := json.Unmarshal(data, &config); err != nil {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
+	normalizeLoadedConfigAIRules(&config)
 
 	return &config, nil
 }
@@ -191,8 +193,19 @@ func LoadConfigFromBytes(data []byte) (*Config, error) {
 	if err := json.Unmarshal(data, &config); err != nil {
 		return nil, fmt.Errorf("failed to parse config: %w", err)
 	}
+	normalizeLoadedConfigAIRules(&config)
 
 	return &config, nil
+}
+
+// normalizeLoadedConfigAIRules 在所有配置加载入口（文件/字节/DB 快照恢复）统一
+// 归一化 customer.ai_rules：大小写变体折叠为出厂拼写、剥除已停用 provider。
+// 归一只作用于内存态与后续提交，磁盘文件在下一次 customer 保存时随之洗成规范形态。
+func normalizeLoadedConfigAIRules(cfg *Config) {
+	if cfg == nil || cfg.Customer == nil {
+		return
+	}
+	cfg.Customer.AIRules = config.NormalizeCustomerAIRules(cfg.Customer.AIRules)
 }
 
 // ApplyConfig applies the configuration to the system in clear phases.

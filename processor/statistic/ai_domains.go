@@ -126,7 +126,6 @@ func builtinTrackedAIProviders() []trackedAIProvider {
 		{Key: "openai", Label: "OpenAI", Patterns: []string{"openai.com", "chatgpt.com"}},
 		{Key: "claude", Label: "Claude", Patterns: []string{"claude.ai", "anthropic.com"}},
 		{Key: "cursor", Label: "Cursor", Patterns: []string{"api.cursor.com"}},
-		{Key: "copilot", Label: "Copilot", Patterns: []string{"copilot.microsoft.com"}},
 	}
 }
 
@@ -221,10 +220,6 @@ func defaultProviderLabel(key, fallback string) string {
 		return "Claude"
 	case "cursor":
 		return "Cursor"
-	case "copilot":
-		return "Copilot"
-	case "vscode":
-		return "VS Code"
 	default:
 		if key == "" {
 			return "AI"

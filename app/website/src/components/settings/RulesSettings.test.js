@@ -11,7 +11,10 @@ import {
   findRuleOverlaps,
   formatEntryIssue,
   includeSummaryText,
+  mergeProviderOrder,
+  providerLabelFor,
   sanitizeList,
+  seedMissingProviders,
   validateRuleEntry
 } from './RulesSettings.vue';
 
@@ -257,5 +260,58 @@ describe('RulesSettings includeSummaryText', () => {
       .toBe('rules_includeDomainsPreview|chatgpt.com|1');
     expect(includeSummaryText(['a.com', 'b.com', 'c.com', 'd.com'], t))
       .toBe('rules_includeDomainsPreview|a.com|3');
+  });
+});
+
+// —— AI provider 键大小写不敏感（后端已折叠大小写变体，此为前端防御层）：
+// 存量配置里的 anthropic 与预置里的 Anthropic 必须合成一张卡，保存时不得把
+// 预置补种键写回配置文件制造重复 ——
+describe('RulesSettings provider case-insensitivity', () => {
+  const PRESETS = [
+    { key: 'Anthropic', label: 'Anthropic', editable: true },
+    { key: 'openai', label: 'OpenAI', editable: true },
+    { key: 'cursor', label: 'Cursor', editable: false }
+  ];
+
+  it('mergeProviderOrder folds configured key case-variants into one card', () => {
+    const order = mergeProviderOrder(['anthropic', 'openai'], PRESETS);
+    expect(order).toEqual(['anthropic', 'openai', 'cursor']);
+  });
+
+  it('mergeProviderOrder does not re-add a preset whose case-variant is configured', () => {
+    const order = mergeProviderOrder(['anthropic', 'openai', 'cursor'], PRESETS);
+    expect(order.filter((key) => key.toLowerCase() === 'anthropic')).toHaveLength(1);
+  });
+
+  it('mergeProviderOrder still appends genuinely missing presets', () => {
+    const order = mergeProviderOrder(['Anthropic'], PRESETS);
+    expect(order).toEqual(['Anthropic', 'openai', 'cursor']);
+  });
+
+  it('seedMissingProviders does not seed a preset whose case-variant is configured', () => {
+    const aiRules = { anthropic: { enble: true, include: ['api.anthropic.com'] } };
+    const seeded = seedMissingProviders(aiRules, PRESETS);
+    expect(Object.keys(seeded).filter((key) => key.toLowerCase() === 'anthropic')).toHaveLength(1);
+    expect(seeded.anthropic.enble).toBe(true);
+    expect(seeded.Anthropic).toBeUndefined();
+  });
+
+  it('seedMissingProviders backfills editable for an existing entry missing it', () => {
+    const aiRules = { Anthropic: { enble: true, include: [] } };
+    const seeded = seedMissingProviders(aiRules, PRESETS);
+    expect(seeded.Anthropic.editable).toBe(true);
+  });
+
+  it('seedMissingProviders keeps unrelated providers untouched', () => {
+    const aiRules = { deepseek: { enble: true, include: ['api.deepseek.com'] } };
+    const seeded = seedMissingProviders(aiRules, PRESETS);
+    expect(seeded.deepseek).toEqual({ enble: true, include: ['api.deepseek.com'] });
+    expect(seeded.Anthropic).toBeDefined();
+  });
+
+  it('providerLabelFor resolves labels case-insensitively', () => {
+    expect(providerLabelFor('anthropic', PRESETS)).toBe('Anthropic');
+    expect(providerLabelFor('Anthropic', PRESETS)).toBe('Anthropic');
+    expect(providerLabelFor('deepseek', PRESETS)).toBe('deepseek');
   });
 });

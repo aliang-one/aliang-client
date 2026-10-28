@@ -273,7 +273,13 @@ func mergeCustomerPayload(baseCfg *config.Config, payload []byte) (string, *conf
 		currentCustomer = map[string]interface{}{}
 	}
 
+	// 键对齐必须发生在 deepMerge 之前：patch 键与存量键大小写不同时，deepMerge
+	// 按大小写敏感的 JSON 键合并会并存两个键（且只增不减），前端随之出现
+	// 「Anthropic」「anthropic」两张卡。先对齐到存量拼写让 patch 自然覆盖，
+	// 之后的折叠归一只负责治愈存量文件自身的污染。
+	canonicalizeCustomerPatchAIRulesKeys(currentCustomer, customerPatch)
 	mergedCustomer := deepMergeJSONObjects(currentCustomer, customerPatch)
+	normalizeCustomerAIRulesRaw(mergedCustomer)
 	mergedCustomerRaw, err := json.Marshal(mergedCustomer)
 	if err != nil {
 		return "", nil, fmt.Errorf("marshal merged customer config: %w", err)
@@ -476,7 +482,105 @@ func extractCustomerFromConfigContent(content string) (map[string]interface{}, e
 		return map[string]interface{}{}, nil
 	}
 
+	normalizeCustomerAIRulesRaw(customer)
+
 	return customer, nil
+}
+
+// canonicalizeCustomerPatchAIRulesKeys 就地对齐 patch 中 ai_rules 的键：
+// ① 已停用 provider（如 vscode）直接剥除，不允许经 API 复活；
+// ② 与存量键大小写不敏感匹配的键改写为存量拼写，使 deepMerge 覆盖而非复制；
+// ③ 其余已知 provider 对齐出厂拼写（CanonicalAIRuleProviderKey）。
+// 存量存在多个大小写变体时，对齐到字典序最小的变体——它正是折叠归一的基线条目，
+// patch 值必须覆盖基线才能在后续 OR 折叠中胜出（否则 disable 会被吞掉）。
+func canonicalizeCustomerPatchAIRulesKeys(currentCustomer, customerPatch map[string]interface{}) {
+	if customerPatch == nil {
+		return
+	}
+	rawPatchRules, ok := customerPatch["ai_rules"].(map[string]interface{})
+	if !ok || len(rawPatchRules) == 0 {
+		return
+	}
+	rawBaseRules, _ := currentCustomer["ai_rules"].(map[string]interface{})
+
+	patchKeys := make([]string, 0, len(rawPatchRules))
+	for key := range rawPatchRules {
+		patchKeys = append(patchKeys, key)
+	}
+	sort.Strings(patchKeys)
+
+	aligned := make(map[string]interface{}, len(rawPatchRules))
+	for _, key := range patchKeys {
+		if config.IsRemovedAIRuleProvider(key) {
+			continue
+		}
+		target := key
+		if baseline := baselineAIRuleBaseKey(rawBaseRules, key); baseline != "" {
+			target = baseline
+		} else {
+			target = config.CanonicalAIRuleProviderKey(key)
+		}
+		aligned[target] = rawPatchRules[key]
+	}
+	customerPatch["ai_rules"] = aligned
+}
+
+// baselineAIRuleBaseKey 返回存量 ai_rules 中与 key 大小写不敏感匹配、且字典序最小
+// 的键（即折叠归一将采用的基线拼写）；无匹配返回 ""。
+func baselineAIRuleBaseKey(rawBaseRules map[string]interface{}, key string) string {
+	if len(rawBaseRules) == 0 {
+		return ""
+	}
+	normalized := config.NormalizeAIProviderKey(key)
+	baseline := ""
+	for baseKey := range rawBaseRules {
+		if config.NormalizeAIProviderKey(baseKey) != normalized {
+			continue
+		}
+		if baseline == "" || baseKey < baseline {
+			baseline = baseKey
+		}
+	}
+	return baseline
+}
+
+// normalizeCustomerAIRulesRaw 就地规范化 customer 原始 map 中的 ai_rules 子树：
+// 大小写变体折叠为出厂拼写、剥除已停用 provider（见 config.NormalizeCustomerAIRules）。
+// 合并路径调用它防止 patch 与存量键大小写不同时产生重复键；视图路径调用它保证
+// 前端在任何一次保存之前就能看到折叠后的形态。ai_rules 是全类型化结构，
+// 经 typed 往返是安全的（UnmarshalJSON 同时消化 enable/exclude 历史别名）。
+func normalizeCustomerAIRulesRaw(customer map[string]interface{}) {
+	if customer == nil {
+		return
+	}
+	rawRules, ok := customer["ai_rules"].(map[string]interface{})
+	if !ok || len(rawRules) == 0 {
+		return
+	}
+
+	serialized, err := json.Marshal(rawRules)
+	if err != nil {
+		return
+	}
+	var typed map[string]*config.CustomerAIRuleSetting
+	if err := json.Unmarshal(serialized, &typed); err != nil {
+		return
+	}
+	normalized := config.NormalizeCustomerAIRules(typed)
+	if len(normalized) == 0 {
+		delete(customer, "ai_rules")
+		return
+	}
+
+	reserialized, err := json.Marshal(normalized)
+	if err != nil {
+		return
+	}
+	var back map[string]interface{}
+	if err := json.Unmarshal(reserialized, &back); err != nil {
+		return
+	}
+	customer["ai_rules"] = back
 }
 
 func resolveBaseConfigForCustomerUpdate() (*config.Config, error) {

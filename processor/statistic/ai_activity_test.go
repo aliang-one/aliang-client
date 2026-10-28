@@ -100,8 +100,11 @@ func TestAIActivityTracker_RecordMetadataMatchesConfiguredDomains(t *testing.T) 
 	config.SetGlobalConfig(&config.Config{
 		Customer: &config.CustomerConfig{
 			AIRules: map[string]*config.CustomerAIRuleSetting{
-				"vscode": {
+				// vscode 预置已随「移除 vscode 支持」从出厂默认剥除；此处用
+				// 自定义 provider + 显式 Label 验证同一行为（配置驱动域名匹配）。
+				"copilot": {
 					Enble:   &enabled,
+					Label:   "Copilot",
 					Include: []string{"https://api.githubcopilot.com", "marketplace.visualstudio.com"},
 				},
 			},
@@ -122,8 +125,8 @@ func TestAIActivityTracker_RecordMetadataMatchesConfiguredDomains(t *testing.T) 
 	if summary.ActiveCount != 1 {
 		t.Fatalf("summary.ActiveCount = %d, want 1", summary.ActiveCount)
 	}
-	if got := summary.ActiveDetections[0].ProviderKey; got != "vscode" {
-		t.Fatalf("summary.ActiveDetections[0].ProviderKey = %q, want vscode", got)
+	if got := summary.ActiveDetections[0].ProviderKey; got != "copilot" {
+		t.Fatalf("summary.ActiveDetections[0].ProviderKey = %q, want copilot", got)
 	}
 	if got := summary.ActiveDetections[0].ProviderLabel; got != "Copilot" {
 		t.Fatalf("summary.ActiveDetections[0].ProviderLabel = %q, want Copilot", got)

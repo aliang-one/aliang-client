@@ -144,3 +144,22 @@ func TestTrackedAIProvidersSkipGeoIPEntries(t *testing.T) {
 		}
 	}
 }
+
+// 已停用的 vscode(Copilot) 不得再出现在统计归因的 provider 列表：
+// 预置已从出厂默认配置移除，内置 fallback 也同步剥除，防止「移除 vscode
+// 支持」之后 Copilot 流量仍被归类为 AI provider。
+func TestTrackedAIProvidersExcludeRemovedVscodeSupport(t *testing.T) {
+	config.ResetGlobalConfigForTest()
+	defer config.ResetGlobalConfigForTest()
+
+	for _, provider := range currentTrackedAIProviders() {
+		if provider.Key == "vscode" || provider.Key == "copilot" {
+			t.Fatalf("已停用 provider %q 不得再被统计归因跟踪", provider.Key)
+		}
+	}
+	for _, domain := range currentTrackedAIDomains() {
+		if strings.Contains(strings.ToLower(domain), "copilot") {
+			t.Fatalf("copilot 域名 %q 不得再进入 AI 统计域名清单", domain)
+		}
+	}
+}
