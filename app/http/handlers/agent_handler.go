@@ -50,10 +50,14 @@ func NewAgentHandler(service *services.AgentService) *AgentHandler {
 var aiStreamUpgrader = websocket.Upgrader{
 	ReadBufferSize:  4096,
 	WriteBufferSize: 4096,
-	CheckOrigin: func(r *http.Request) bool {
-		host := strings.Split(r.Host, ":")[0]
-		return host == "localhost" || host == "127.0.0.1"
-	},
+	CheckOrigin:     aiStreamHostAllowed,
+}
+
+// aiStreamHostAllowed 与 aiStreamUpgrader.CheckOrigin 同源同语义（r.Host 的
+// host 段须为 localhost/127.0.0.1）。抽成函数供两处共用，防再漂移。
+func aiStreamHostAllowed(r *http.Request) bool {
+	host := strings.Split(r.Host, ":")[0]
+	return host == "localhost" || host == "127.0.0.1"
 }
 
 // HandleAIStream is the local chat WebSocket endpoint (/api/agent/ai/stream).
@@ -63,6 +67,13 @@ var aiStreamUpgrader = websocket.Upgrader{
 // is written straight back over the same socket, giving the page a live,
 // token-by-token stream plus the running -> done status transitions.
 func (h *AgentHandler) HandleAIStream(w http.ResponseWriter, r *http.Request) {
+	// 2026-10-28 统一：仪表盘聊天必须在 agent 进程跑（journal/统一清单与手机
+	// 同源）。core 角色一律 TCP 透传到 56433，绝不本地兜底——本地跑的会话进不
+	// 了任何记录（2026-10-27 liang-dev 事故）。
+	if !services.IsUserAgentRuntime() {
+		proxyAIStream(w, r)
+		return
+	}
 	conn, err := aiStreamUpgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return

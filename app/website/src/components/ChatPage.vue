@@ -510,6 +510,33 @@ const modelCustomActive = ref(false);
 const modelCustomDraft = ref('');
 const createError = ref('');
 
+// 无活动看门狗：ai.message 发出即武装，连续 CHAT_IDLE_TIMEOUT_MS 无任何帧
+// （喂狗点在 handleAIEvent 入口，delta/thinking/status/progress/usage 一律算
+// 活动）→ 合成气泡错误。E2E 经 window.__CHAT_IDLE_TIMEOUT_MS__ 注入短值。
+const CHAT_IDLE_TIMEOUT_MS = Number(globalThis.__CHAT_IDLE_TIMEOUT_MS__) || 90000;
+let idleWatchdogTimer = null;
+
+function armIdleWatchdog(conv) {
+  disarmIdleWatchdog();
+  idleWatchdogTimer = setTimeout(() => {
+    idleWatchdogTimer = null;
+    const asst = findRunningAssistant(conv);
+    if (!asst) return;
+    asst.status = 'error';
+    if (!asst.content) asst.content = t('chat_idleTimeout');
+    clearApprovalsForSession(conv, conv.aiSessionId); // 与 ai.done/ai.error 同口径
+    finishRun(conv);
+    saveToStorage();
+  }, CHAT_IDLE_TIMEOUT_MS);
+}
+
+function disarmIdleWatchdog() {
+  if (idleWatchdogTimer) {
+    clearTimeout(idleWatchdogTimer);
+    idleWatchdogTimer = null;
+  }
+}
+
 // Local agent AI WebSocket: streams the local Claude Code / Codex headless run
 // token-by-token and carries the running -> done status transitions.
 let aiSocket = null;
@@ -954,6 +981,30 @@ function ensureAISocket() {
       console.log('[aliang-chat] ws close code=', e.code, 'reason=', e.reason);
       if (aiSocket === sock) aiSocket = null;
       aiSocketPromise = null;
+      // 陈旧 socket 的迟到 close（CLOSING→重连窗口）：aiSocket 已被新连接顶掉，
+      // 别解新 run 的看门狗、别给新 run 画错误——让旧 close 静默退场。
+      if (aiSocket && aiSocket !== sock) return;
+      disarmIdleWatchdog();
+      const conv = activeConversation.value;
+      if (conv && (sending.value || findRunningAssistant(conv))) {
+        const asst = findRunningAssistant(conv);
+        if (asst) {
+          asst.status = 'error';
+          if (!asst.content) {
+            asst.content = e.code === 1011 ? t('chat_agentOffline') : t('chat_connInterrupted');
+          }
+        }
+        conv.aiSessionCreated = false; // 下条消息经确认门重发 create 重试
+        // 离线语义下同步压住设置条的 serviceUnavailable（先设 createError，
+        // 再结算确认门——早退分支的 `!createError.value` 兜底就不触发了）
+        if (conv.id === activeId.value && !createError.value) {
+          createError.value = e.code === 1011 ? t('chat_agentOffline') : t('chat_connInterrupted');
+        }
+        const pending = conv.aiSessionId ? pendingCreates.get(conv.aiSessionId) : undefined;
+        if (pending) pending('error'); // 别让确认门空等 5s 超时
+        finishRun(conv);
+        saveToStorage();
+      }
     };
   });
   return aiSocketPromise;
@@ -1303,6 +1354,9 @@ function handleAIEvent(e) {
   // omitted to keep the log readable.
   console.log('[aliang-chat] ai event', e.type, 'session=', e.session_id, 'conv=', conv.id);
 
+  // 喂狗：任何到达会话归属判定之后的帧都算 AI 活动，重置无活动计时。
+  if (idleWatchdogTimer) armIdleWatchdog(conv);
+
   let persist = false;
   switch (e.type) {
     case 'ai.session.created': {
@@ -1349,6 +1403,7 @@ function handleAIEvent(e) {
       break;
     }
     case 'ai.done': {
+      disarmIdleWatchdog();
       const asst = findRunningAssistant(conv);
       if (asst) asst.status = 'done';
       clearApprovalsForSession(conv, e.session_id);
@@ -1356,6 +1411,7 @@ function handleAIEvent(e) {
       return;
     }
     case 'ai.error': {
+      disarmIdleWatchdog();
       const asst = findRunningAssistant(conv);
       if (!e.message_id) {
         // create 阶段失败（典型：手输目录不存在）。亮在设置条上、结算确认门；
@@ -1428,9 +1484,11 @@ async function sendMessage() {
       // 与 ai.error 分支同约定：只在发送会话仍是当前会话时落兜底提示。
       if (conv.id === activeId.value && !createError.value) createError.value = t('chat_serviceUnavailable');
       sending.value = false; // 本函数的 sending=false 在 catch 尾部，早退须自理
+      disarmIdleWatchdog();
       saveToStorage();
       return;
     }
+    armIdleWatchdog(conv);
     const ok = sendAI({
       type: 'ai.message',
       session_id: conv.aiSessionId,
@@ -1439,6 +1497,7 @@ async function sendMessage() {
     });
     if (!ok) throw new Error('socket-closed');
   } catch (_) {
+    disarmIdleWatchdog();
     const asst = findRunningAssistant(conv);
     if (asst) {
       asst.status = 'error';

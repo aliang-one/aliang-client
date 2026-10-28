@@ -9,8 +9,17 @@ import (
 	"strings"
 	"time"
 
+	"aliang.one/nursorgate/common/desktop"
+	"aliang.one/nursorgate/common/logger"
 	"aliang.one/nursorgate/processor/config"
 )
+
+// aiProxyHealNotifier 在自愈真正拉起代理后发出用户可见提示（桌面通知）。
+// 可注入替身；默认系统通知。re-dial 成功才触发——非 root 403 时 POST「成功」
+// 但代理没起来，不能误报。
+var aiProxyHealNotifier = func() {
+	desktop.Notify("aliang-gateway", "检测到 AI 代理未运行，已自动拉起")
+}
 
 // 56432 run service 的运行态不持久化:core/owner 重启后若无人手动
 // run/start,代理无监听,所有手机 AI run 的 claude 连 ANTHROPIC_BASE_URL
@@ -47,6 +56,8 @@ func ensureAIUpstreamReachable(ctx context.Context, baseURL string, deps aiProxy
 		_ = deps.heal()
 		deps.sleep(500 * time.Millisecond)
 		if err := deps.dial(ctx, u.Host); err == nil {
+			logger.Info("AI 上游不可达，已自动拉起本机代理(" + u.Host + ")")
+			aiProxyHealNotifier()
 			return nil
 		}
 		return fmt.Errorf("平台 AI 代理未运行(%s 连接被拒,已尝试自动拉起)——请在设备仪表盘启动代理后重试", u.Host)

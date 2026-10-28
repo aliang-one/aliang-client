@@ -56,3 +56,25 @@ func TestRegisterAgentRoutesCoversDashboardDataEndpoints(t *testing.T) {
 		})
 	}
 }
+
+// TestRegisterAgentRoutesIncludesAIStream 钉死仪表盘聊天 WS 端点：core 会把
+// /api/agent/ai/stream 透传到本 runtime（2026-10-28 起仪表盘聊天统一走
+// agent），缺注册=404 透传、仪表盘聊天全挂。ALIANG_USER_AGENT_RUNTIME=1 +
+// 独立 HOME 让请求在本进程内直接处理（与上方用例同范式，避免 dev 机 56433
+// 有活 agent 时握手后永久泵帧、测试挂到超时）；普通 GET 请求由 upgrader 以
+// 400 拒绝并直接返回，绝不会是 mux 裸 404——404 即漏注册。
+func TestRegisterAgentRoutesIncludesAIStream(t *testing.T) {
+	t.Setenv("ALIANG_USER_AGENT_RUNTIME", "1")
+	t.Setenv("HOME", t.TempDir())
+
+	mux := http.NewServeMux()
+	registerAgentRoutes(mux)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/agent/ai/stream", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code == http.StatusNotFound {
+		t.Fatalf("/api/agent/ai/stream status = 404：registerAgentRoutes 漏注册")
+	}
+}

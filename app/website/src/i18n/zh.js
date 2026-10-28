@@ -249,6 +249,9 @@ export default {
   chat_customPathPlaceholder: '输入 agent 机器上的绝对路径',
   chat_pathConfirm: '确定',
   chat_createFailed: '会话创建失败',
+  chat_agentOffline: '设备 agent 不在线，请检查设备后再试。',
+  chat_connInterrupted: '与设备的连接已中断，请重试。',
+  chat_idleTimeout: 'AI 长时间无响应，请重试。',
 
   // -- App --
   app_restoringSession: '正在恢复会话...',

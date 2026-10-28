@@ -973,6 +973,8 @@ func (s *AgentService) remoteControlAllowed() bool {
 // drive the local Claude Code / Codex headless run and receive streaming
 // ai.run.started / ai.delta / ai.done events without round-tripping through the
 // remote agent server. writeJSON receives every event the manager emits.
+// 2026-10-28 起 core 角色的仪表盘聊天改走 WS 透传（见 handlers.proxyAIStream），
+// 本函数现仅由 agent 进程的 /api/agent/ai/stream 端点（56433）调用。
 func (s *AgentService) DispatchLocalAI(msg map[string]interface{}, writeJSON func(interface{}) error) {
 	if writeJSON == nil || msg == nil {
 		return

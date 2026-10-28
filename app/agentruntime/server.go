@@ -111,7 +111,7 @@ func StopLocalServer() error {
 }
 
 func registerAgentRoutes(mux *http.ServeMux) {
-	logger.Info("[AGENT-BOOT] local_server registering_routes routes=/api/agent/status,/api/agent/sync,/api/agent/enable,/api/agent/disable,/api/agent/tools,/api/agent/protocol,/api/agent/tools/launch,/api/agent/ai/approval-hook")
+	logger.Info("[AGENT-BOOT] local_server registering_routes routes=/api/agent/status,/api/agent/sync,/api/agent/enable,/api/agent/disable,/api/agent/tools,/api/agent/protocol,/api/agent/tools/launch,/api/agent/ai/approval-hook,/api/agent/ai/stream")
 	agentHandler := handlers.NewAgentHandler(services.GetSharedAgentService())
 	mux.HandleFunc("/api/agent/status", agentHandler.HandleStatus)
 	mux.HandleFunc("/api/agent/sync", agentHandler.HandleSync)
@@ -126,6 +126,10 @@ func registerAgentRoutes(mux *http.ServeMux) {
 	//（双注册教训，2026-10-21 liang-dev 实测）。
 	mux.HandleFunc("/api/agent/transfers", agentHandler.HandleTransferCreate)
 	mux.HandleFunc("/api/agent/ai/approval-hook", agentHandler.HandleAIApprovalHook)
+	// 仪表盘聊天 WS（2026-10-28 统一）：core 把 /api/agent/ai/stream 透传到本
+	// runtime，由本地 AI 管理器跑（journal/清单与手机同源）。缺注册=404 透传
+	// （2026-10-21 liang-dev 双注册教训）。
+	mux.HandleFunc("/api/agent/ai/stream", agentHandler.HandleAIStream)
 	mux.HandleFunc("/mcp/aliang/", agentHandler.HandleToolAskMCP)
 	mux.HandleFunc("/api/agent/sessions", agentHandler.HandleVibeSessions)
 	mux.HandleFunc("/api/agent/session", agentHandler.HandleVibeSession)

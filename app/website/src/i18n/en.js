@@ -249,6 +249,9 @@ export default {
   chat_customPathPlaceholder: 'Absolute path on the agent machine',
   chat_pathConfirm: 'Confirm',
   chat_createFailed: 'Failed to create session',
+  chat_agentOffline: 'Device agent is offline. Check the device and retry.',
+  chat_connInterrupted: 'Connection to the device was interrupted. Please retry.',
+  chat_idleTimeout: 'AI did not respond for a long time. Please retry.',
 
   // -- App --
   app_restoringSession: 'Restoring saved session...',
