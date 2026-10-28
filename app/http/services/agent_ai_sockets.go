@@ -297,8 +297,7 @@ func (m *agentAIManager) emitSessionSnapshot(socketID, sessionID string, writeJS
 }
 
 // pendingApprovalsSnapshotForSession 单会话版待审批快照（字段口径与全量版
-// pendingApprovalsSnapshot 一致）。expires_at 随 waiter 字段补齐后再加
-// （Task 8 起补 expires_at）。
+// pendingApprovalsSnapshot 一致，含 expires_at，spec §4.2.1）。
 func (m *agentAIManager) pendingApprovalsSnapshotForSession(sessionID string) []map[string]interface{} {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -318,6 +317,9 @@ func (m *agentAIManager) pendingApprovalsSnapshotForSession(sessionID string) []
 		}
 		if waiter.request.ToolName != "" {
 			entry["tool_name"] = waiter.request.ToolName
+		}
+		if !waiter.expiresAt.IsZero() {
+			entry["expires_at"] = waiter.expiresAt.Format(time.RFC3339)
 		}
 		out = append(out, entry)
 	}

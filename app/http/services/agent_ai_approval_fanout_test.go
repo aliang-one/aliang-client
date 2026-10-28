@@ -9,6 +9,8 @@ package services
 // socket（现有）+ run 发起的 socket（session.originSocket，Task 5 落）。
 
 import (
+	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -126,4 +128,78 @@ func TestOptionResponseRefreshesOriginSocket(t *testing.T) {
 	if got != "aisock-9" {
 		t.Fatalf("optionResponse 未刷新 session.originSocket, got %q, want aisock-9", got)
 	}
+}
+
+// TestApprovalRequestCarriesExpiresAt 验证 ai.approval.request pending 帧与
+// 两端快照（全量 pendingApprovalsSnapshot / 按会话
+// pendingApprovalsSnapshotForSession）都带 expires_at（RFC3339，Task 8）。
+// 断言必须持 mu 锁：requestApproval 在 goroutine 里跑，sent 是共享变量。
+func TestApprovalRequestCarriesExpiresAt(t *testing.T) {
+	m := newTestAISocketsManager(t)
+	var mu sync.Mutex
+	var sent map[string]interface{}
+	write := func(p interface{}) error {
+		mu.Lock()
+		sent = p.(map[string]interface{})
+		mu.Unlock()
+		return nil
+	}
+	run := agentAIRun{sessionID: "s-exp", runSeq: 1, messageID: "m1", provider: "agentcore"}
+	m.mu.Lock()
+	m.sessions["s-exp"] = &agentAISession{id: "s-exp", runSeq: 1, originSocket: "remote"}
+	m.mu.Unlock()
+	go func() {
+		_, _ = m.requestApproval(context.Background(), run, write, agentAIApprovalRequest{ID: "a-exp"})
+	}()
+	waitUntilFor(t, time.Second, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return sent != nil
+	})
+	mu.Lock()
+	if _, ok := sent["expires_at"].(string); !ok {
+		mu.Unlock()
+		t.Fatalf("ai.approval.request 缺 expires_at: %v", sent)
+	}
+	mu.Unlock()
+	// waiter 上也要有（快照用）
+	m.mu.Lock()
+	w := m.approvals[agentAIApprovalMapKey("s-exp", "a-exp")]
+	m.mu.Unlock()
+	if w == nil || w.expiresAt.IsZero() {
+		t.Fatal("waiter.expiresAt 未记录")
+	}
+	// 全量快照带 expires_at
+	snap := m.pendingApprovalsSnapshot()
+	found := false
+	for _, e := range snap {
+		if e["approval_id"] == "a-exp" {
+			if _, ok := e["expires_at"].(string); !ok {
+				t.Fatal("快照缺 expires_at")
+			}
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("快照缺该审批项")
+	}
+	// 按会话快照也要带（Task 6 的 pendingApprovalsSnapshotForSession 占位处）
+	perSession := m.pendingApprovalsSnapshotForSession("s-exp")
+	if len(perSession) != 1 {
+		t.Fatalf("按会话快照应 1 项,实际 %d", len(perSession))
+	}
+	if _, ok := perSession[0]["expires_at"].(string); !ok {
+		t.Fatal("按会话快照缺 expires_at")
+	}
+	// 喂一个 cancel 决策让 goroutine 走到 return（否则泄漏一个阻塞 select，
+	// ctx=Background 永不 Done）；resolved 分支会再写一帧覆盖 sent，此时
+	// 断言均已结束，不影响结果。
+	m.mu.Lock()
+	if w := m.approvals[agentAIApprovalMapKey("s-exp", "a-exp")]; w != nil {
+		w.request.respond <- agentAIApprovalResponse{Decision: models.AgentAIApprovalDecisionCancel}
+	}
+	m.mu.Unlock()
+	m.mu.Lock()
+	delete(m.approvals, agentAIApprovalMapKey("s-exp", "a-exp"))
+	m.mu.Unlock()
 }

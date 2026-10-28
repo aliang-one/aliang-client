@@ -697,6 +697,9 @@ type agentAIApprovalWaiter struct {
 	sessionID string
 	runSeq    int
 	request   agentAIApprovalRequest
+	// expiresAt 是审批等待的绝对截止（requestApproval 时刻 + agentAIApprovalTimeout）。
+	// pending 帧与两端快照带 expires_at 供 UI 显示剩余时间（spec §4.2.1）。
+	expiresAt time.Time
 }
 
 type agentAICompletedApproval struct {
@@ -3367,6 +3370,9 @@ func (m *agentAIManager) pendingApprovalsSnapshot() []map[string]interface{} {
 		if waiter.request.ToolName != "" {
 			entry["tool_name"] = waiter.request.ToolName
 		}
+		if !waiter.expiresAt.IsZero() {
+			entry["expires_at"] = waiter.expiresAt.Format(time.RFC3339)
+		}
 		out = append(out, entry)
 	}
 	return out
@@ -3627,6 +3633,9 @@ func (m *agentAIManager) requestApproval(ctx context.Context, run agentAIRun, wr
 	}
 	req.respond = make(chan agentAIApprovalResponse, 1)
 
+	// deadline 与下方等待用的 agentAIApprovalTimeout 同源：expires_at 是给
+	// 两端 UI 显示剩余时间的绝对截止（RFC3339，spec §4.2.1）。
+	deadline := time.Now().UTC().Add(agentAIApprovalTimeout)
 	m.mu.Lock()
 	if m.approvals == nil {
 		m.approvals = make(map[string]*agentAIApprovalWaiter)
@@ -3636,13 +3645,16 @@ func (m *agentAIManager) requestApproval(ctx context.Context, run agentAIRun, wr
 		sessionID: run.sessionID,
 		runSeq:    run.runSeq,
 		request:   req,
+		expiresAt: deadline,
 	}
 	m.mu.Unlock()
 
 	run.activity.setAwaitingApproval(true)
 	defer run.activity.setAwaitingApproval(false)
 	logger.Info(fmt.Sprintf("approval-hook: requestApproval SENDING ai.approval.request to cloud session=%s approval_id=%s kind=%s — awaiting user decision (≤%s)", run.sessionID, req.ID, req.Kind, agentAIApprovalTimeout))
-	if err := writeAgentAIApprovalRequest(ctx, writeJSON, agentAIApprovalRequestPayload(req), 5, time.Second); err != nil {
+	payload := agentAIApprovalRequestPayload(req)
+	payload["expires_at"] = deadline.Format(time.RFC3339)
+	if err := writeAgentAIApprovalRequest(ctx, writeJSON, payload, 5, time.Second); err != nil {
 		m.mu.Lock()
 		if waiter := m.approvals[approvalKey]; waiter != nil && waiter.sessionID == run.sessionID && waiter.runSeq == run.runSeq {
 			delete(m.approvals, approvalKey)
