@@ -2892,6 +2892,10 @@ func (m *agentAIManager) optionResponse(msg map[string]interface{}, writeJSON ag
 	m.mu.Lock()
 	inputKey := agentAICodexInputMapKey(sessionID, optionID)
 	if waiter := m.codexInputs[inputKey]; waiter != nil && waiter.sessionID == sessionID {
+		// 刻意不刷新 session.originSocket（Task 7 评审落档）：codex-input 答复
+		// 续接的是正在运行的旧 run（经 waiter.respond 回传，不起新 run）——
+		// 把 origin 迁到答复方会劫持 session.originSocket，把该 run 后续审批
+		// ack 从发起通道路由走，复现 ack 双写要修的投递滞留。
 		delete(m.codexInputs, inputKey)
 		m.mu.Unlock()
 		waiter.respond <- agentAICodexInputAnswer{selected: selected, custom: custom}
@@ -2901,7 +2905,9 @@ func (m *agentAIManager) optionResponse(msg map[string]interface{}, writeJSON ag
 	// 跨端同态（Task 7 前置）：option 作答同样刷新 session.originSocket——
 	// option 续接的执行 run 与其后续审批 ack 都要写回「作答这条 socket」，
 	// 不刷新的话执行 run 还带着上一回合的旧 origin，ack 双写会写到旧通道。
-	// 空标记（TUI/测试内部旧调用方）不动。
+	// 盖章只来自两条 WS 分发路径（远端/本机），未盖章（测试内部旧调用方）
+	// 不动；未匹配/过期的 option 作答同样刷新 origin——与 message() 的
+	// 「origin 跟随最近盖章入站」语义一致。
 	if session != nil {
 		if v := strings.TrimSpace(remoteString(msg, agentAIOriginSocketField)); v != "" {
 			session.originSocket = v

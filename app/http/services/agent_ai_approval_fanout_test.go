@@ -67,8 +67,14 @@ func TestApprovalAckDualWrite(t *testing.T) {
 	}
 	// ack 出现在两条通道：决策通道同步内联；run 通道经 pump 异步落。
 	waitUntilFor(t, time.Second, func() bool { return countAckFrames(runCh) >= 1 })
-	if got := countAckFrames(decideCh); got < 1 {
-		t.Fatalf("决策通道缺 ack 帧, 实际 %d 条 ack", got)
+	// settle 后断言恰一：双写是「每通道一条」，不是跨 socket 重复灌
+	// （跨 socket 双 enqueue 回归此处必炸）。
+	time.Sleep(50 * time.Millisecond)
+	if got := countAckFrames(runCh); got != 0 {
+		t.Fatalf("run 通道 settle 后仍冒 ack, 实际 %d 条（应恰 1）", got+1)
+	}
+	if got := countAckFrames(decideCh); got != 1 {
+		t.Fatalf("决策通道应恰 1 条 ack, 实际 %d 条", got)
 	}
 }
 
