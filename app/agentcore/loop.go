@@ -804,7 +804,22 @@ func (r *runner) noteContextOverflow(ctx context.Context, err error) bool {
 	}
 	r.ctxOverflowWindow = eff
 
-	compacted, info, cerr := Compact(ctx, r.compactConfig(), r.history, "auto")
+	// 压缩进度 → 宿主活性帧：降级压缩与 maybeAutoCompact 同型，也是一次零
+	// delta 的长静默摘要请求，压缩期间 stale 5min 同样可判死。此时本回合还没
+	// 发过任何事件帧（上方 turnFrameEmitted 兜底已拦掉已发帧的形态；4xx 与
+	// 2xx 裸信封都在响应检查阶段抛出，writer 状态干净），且本路径本就在压缩
+	// 成功后发 CompactBoundary——进度帧没有引入新的帧类。writer 只在 run 内
+	// 非空，run 循环里恒非空；这里不做 nil 断言，对齐 maybeAutoCompact 的
+	// 防御写法。帧写失败只记日志，不拖累自愈。
+	var compactOpts []CompactOption
+	if r.writer != nil {
+		compactOpts = append(compactOpts, WithCompactProgress(func(summaryTokens int) {
+			if err := r.writer.CompactProgress(summaryTokens); err != nil {
+				r.logf("agentcore: 写 compact_progress 帧失败: %v", err)
+			}
+		}))
+	}
+	compacted, info, cerr := Compact(ctx, r.compactConfig(), r.history, "auto", compactOpts...)
 	if cerr != nil {
 		if errors.Is(cerr, ErrNothingToCompact) {
 			r.logf("agentcore: 上下文超出模型窗口，但历史已无早期消息可压缩 session=%s", r.writer.sessionID)

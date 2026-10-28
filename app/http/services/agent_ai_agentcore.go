@@ -751,6 +751,20 @@ func (m *agentAIManager) handleAgentCoreCompactCommand(session *agentAISession, 
 		Model:         compactModel,
 		ContextWindow: contextWindow,
 	}
+	// 刻意不接 CompactOption/WithCompactProgress（2026-10-28 复核定谳「确认
+	// 无害，无需接」）：手动压缩不在 run 内——不建 guard、无 run.activity，
+	// 也没有 stream decoder，内核的 compact_progress 帧在这个路径根本没有
+	// 接收方。误杀面逐项排除：
+	//   - stale 扫描器（agent_ai_run_guard.go scanStaleRuns）只判
+	//     session.guard != nil 的在跑回合，本路径从不挂 guard，扫不到；
+	//   - 看门狗/工具钟同挂在 run.activity 上，同样不适用；
+	//   - 本路径自带兜底：上面 3 分钟 ctx 超时把挂住的上游收掉。
+	// 就算要接帧，decoder 分支的 run.activity.markProgress() 在这里也无处
+	// 安放（markProgress 接收者虽 nil 安全，但没有可刷活性的对象），而把进度
+	// 转发手机需要新增「压缩中」契约字段——上一批已按最小改动否掉。压缩完成
+	// 时 reply() 的 ai.delta + done() 就是这条路径的全部可见反馈。
+	// 若将来给手动压缩挂 guard，必须同时接进度帧并重评本裁决
+	// （见 TestAgentCoreManualCompactHasNoStaleKillSurface）。
 	compacted, info, err := agentcore.Compact(ctx, cfg, messages, "manual")
 	if err != nil {
 		if errors.Is(err, agentcore.ErrNothingToCompact) {

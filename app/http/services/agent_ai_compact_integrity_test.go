@@ -284,3 +284,117 @@ func TestAgentCoreCompactProgressKeepsSlowCompactOffStaleScanner(t *testing.T) {
 		t.Fatalf("compact_progress 帧不得产生 ai.delta, got %d", n)
 	}
 }
+
+// TestAgentCoreManualCompactHasNoStaleKillSurface 钉住 /compact 手动压缩路径
+// 的「无误杀面」裁决（2026-10-28 复核）：手动压缩不在 run 内、不挂 guard，
+// stale 扫描器（scanStaleRuns 只判 guard != nil 的在跑回合）扫不到它——压缩
+// 期再静默也不会被判死，CompactOption/WithCompactProgress 在这条路径无处
+// 安放（没有 run.activity 可刷），确认无需接帧。见
+// handleAgentCoreCompactCommand 里的定谳注释。
+//
+// 执行必须真穿透 handleAgentCoreCompactCommand 里的 Compact 调用：非空历史 +
+// 假上游回摘要 + 小 contextWindow（split 合法的最小前提），空历史会在早退
+// 分支返回，测不到任何误杀面。对照臂证明扫描器本身没坏——同形态一旦挂上
+// guard 就会被判死，主臂的存活只能归因于「无 guard」。
+//
+// 变异推演（变异位置 = 给手动压缩挂 guard 且不接帧）：主臂首断言
+// （sess.guard != nil → Fatal）立即红；即便绕过该断言，回拨活性时钟 + 扫描器
+// 在对照臂已证的判死路径下会 cancel 会话并发 ai.error 终态，同样红。
+func TestAgentCoreManualCompactHasNoStaleKillSurface(t *testing.T) {
+	oldThreshold := agentAIStaleRunThreshold
+	agentAIStaleRunThreshold = 5 * time.Minute
+	t.Cleanup(func() { agentAIStaleRunThreshold = oldThreshold })
+
+	// 记录-2 对齐（同文件 TestAgentCoreCompactProgressKeepsSlowCompactOffStaleScanner
+	// 先例）：收窄 kill 宽限期，变异若真造出误杀，强拆终态不必等 30s 默认值。
+	oldGrace := agentAIKillGrace
+	agentAIKillGrace = 30 * time.Millisecond
+	t.Cleanup(func() { agentAIKillGrace = oldGrace })
+
+	// 假上游：第 1 个请求就是压缩摘要调用（/compact 只发这一次模型请求）。
+	up, srv := newAgentCoreUpstream(t, agentCoreTextTurn("早期内容摘要", ""))
+	// agentCoreBaseURL 只接受回环地址；httptest 正好是 127.0.0.1:PORT。
+	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
+
+	mgr := newAgentAIManager()
+	sess := newSlashTestSession()
+	sess.provider = "agentcore"
+	// 非空历史 + 小窗口：3 条各约 2k tokens 的消息，尾部预算 10000/4=2500
+	// 装不下全部历史 → split 落在中间；转录预算 10000/2=5000 装得下前两条
+	// → 摘要请求有料可带（窗口再小会先撞 ErrNothingToCompact 的空转录分支，
+	// 同样测不到误杀面）。Compact 一定会发起真实的摘要请求。
+	sess.history = []agentAIMessage{
+		{Role: "user", Content: strings.Repeat("早", 2000)},
+		{Role: "assistant", Content: strings.Repeat("复", 2000)},
+		{Role: "user", Content: strings.Repeat("问", 2000)},
+	}
+	sess.contextWindow = 10000
+	// 真实会话形态：cancel 已挂（会话起过跑）、activity 非空——唯独没有
+	// guard。这样 scanStaleRuns 的跳过只能归因于 guard == nil 这一条判据。
+	cancelled := false
+	sess.cancel = func() { cancelled = true }
+	mgr.sessions[sess.id] = sess
+
+	mu, events, w := captureAIWriter(t)
+	mgr.handleAgentCoreCompactCommand(sess, "msg_c1", w)
+
+	if len(findAIEvents(mu, events, "ai.run.started")) != 1 {
+		t.Fatalf("ai.run.started 数量异常: %v", events)
+	}
+	// 穿透证明：done 之前必须有一条「已压缩」delta——它只在 Compact 成功
+	// 返回后发出；早退分支的提示语是「没有可压缩的上下文」。
+	deltas := findAIEvents(mu, events, "ai.delta")
+	if len(deltas) != 1 {
+		t.Fatalf("ai.delta 数量 = %d, want 1（事件 %v）", len(deltas), events)
+	}
+	if delta, _ := deltas[0]["delta"].(string); !strings.Contains(delta, "已压缩") {
+		t.Fatalf("未穿透 Compact 成功路径（delta = %q）——测试前提不成立", delta)
+	}
+	if len(findAIEvents(mu, events, "ai.done")) != 1 {
+		t.Fatalf("ai.done 数量异常: %v", events)
+	}
+	if got := len(up.requests()); got != 1 {
+		t.Fatalf("上游收到 %d 个请求, want 1（/compact 只发摘要调用）", got)
+	}
+
+	// 关键裁决：手动压缩全程不挂 guard——这是「扫描器扫不到」的结构性依据。
+	if sess.guard != nil {
+		t.Fatal("手动压缩不应挂 run guard（否则压缩期静默就落进了 stale 扫描器的射程）")
+	}
+
+	// 回拨活性时钟到 stale 阈值之外再扫：无 guard 会话必须被整体跳过——
+	// 不判死、不强拆、不发终态。
+	backdateActivityStale(t, sess.activity)
+	mgr.scanStaleRuns()
+	time.Sleep(150 * time.Millisecond) // 误杀的话 kill 同步写 + 宽限期后出终态
+
+	if sess.guard != nil {
+		t.Fatal("扫描器不应给无 guard 会话补挂 guard")
+	}
+	if cancelled {
+		t.Fatal("无 guard 会话被 stale 扫描器强拆了——误杀面成立")
+	}
+	if got := len(findAIEvents(mu, events, "ai.error")); got != 0 {
+		t.Fatalf("无 guard 会话收到 %d 个 ai.error 终态，want 0: %v", got, events)
+	}
+
+	// ---- 对照臂：同形态一旦挂上 guard 就会被判死 ----
+	// 证明扫描器没坏、主臂的存活只能归因于「无 guard」。若日后真给手动压缩
+	// 挂 guard（变异位置），主臂红的原因就是这条已验证的判死路径。
+	guarded, _, guard, guardRec := newGuardTestManager(t)
+	backdateActivityStale(t, guard.activity)
+	guarded.scanStaleRuns()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if payloads := guardRec.snapshot(); len(payloads) == 1 {
+			if got := payloads[0]["error_code"]; got != "turn_stalled" {
+				t.Fatalf("对照臂 error_code = %v, want turn_stalled", got)
+			}
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if reason := guard.activity.killReasonOr(""); reason == "" {
+		t.Fatal("对照臂（同形态 + guard）未被判死——扫描器坏了，主臂的存活证明不了任何事")
+	}
+}

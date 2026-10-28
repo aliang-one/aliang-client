@@ -32,11 +32,13 @@ var agentAIKillGrace = resolveEnvDuration("ALIANG_AI_KILL_GRACE", 30*time.Second
 // 30s 时 ≤150s）」，远短于 5min，stale 与本窗都不会误杀合法重试回合。若上游
 // 是没发这帧的旧内核，最坏 12-14.5min 的纯静默会超过 5min 被判死——所以这帧
 // 是活性链路的必要环节，不是锦上添花。本窗读到的也是同一 activity.idleFor()，
-// 重试帧同样为 steer 等待续命。已知例外（同类静默路径，重试/正文均不发帧）：
-// 自动压缩（compactSummarize）与上下文溢出自愈（noteContextOverflow）的内部
-// Stream 没接 writer；wrapUp 刻意以 nil writer 收尾（收尾期再发帧像还在跑）。
-// 压缩期静默是先于本条修正存在的遗留缺口，接 writer 需改 Compact 导出签名，
-// 缓议。
+// 重试帧同样为 steer 等待续命。已知例外只剩一条：wrapUp 刻意以 nil writer
+// 收尾（收尾期再发帧像还在跑）。此前的两条同类静默缺口——自动压缩
+// （maybeAutoCompact→compactSummarize，2026-10-28 经 Compact 的
+// WithCompactProgress 接线）与上下文溢出自愈（noteContextOverflow 的降级压缩，
+// 同日同机制接线）——压缩期都会经 streamWriter 发 system/compact_progress 续命，
+// 不再是例外；/compact 手动路径不在 run 内（无 guard/activity），不在此扫描
+// 射程，见 handleAgentCoreCompactCommand 的定谳注释。
 //
 //	ALIANG_AGENTCORE_STEER_LIVENESS  (time.ParseDuration). Default 5min.
 var steerLivenessWindow = resolveEnvDuration("ALIANG_AGENTCORE_STEER_LIVENESS", 5*time.Minute)
