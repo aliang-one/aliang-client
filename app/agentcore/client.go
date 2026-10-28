@@ -32,8 +32,12 @@ const (
 	// anthropicVersion 是 Messages API 的版本头。上游要求必填。
 	anthropicVersion = "2023-06-01"
 
-	// maxRetries 是瞬态失败的重试次数。仅覆盖连接错误 / 429 / 5xx。
-	maxRetries = 3
+	// maxRetries 是瞬态失败的重试次数。仅覆盖连接错误 / 429 / 5xx / 2xx 限流过载。
+	//
+	// 5 次（原为 3）：agentcore 是长回合自主 agent，一次 run 可跑 30+ 回合、
+	// 数十分钟；单个瞬态抖动若在末尾把整轮判死，前面的工作全部作废。多给两
+	// 次退避（总计 ~15s 量级）换整轮韧性，代价可接受。
+	maxRetries = 5
 
 	// baseRetryDelay 是指数退避的起点。
 	baseRetryDelay = 500 * time.Millisecond
@@ -112,8 +116,8 @@ func (c *Client) WithStreamIdleTimeout(d time.Duration) *Client {
 //
 // 内核只关心这几类，其余（ping 等）直接丢弃。
 type StreamEvent struct {
-	// Kind: "start" | "text" | "image" | "tool_use_start" | "tool_input"
-	//       | "block_stop" | "stop" | "error"
+	// Kind: "start" | "text" | "thinking" | "image" | "tool_use_start"
+	//       | "tool_input" | "block_stop" | "stop" | "error"
 	Kind string
 
 	// start
@@ -146,6 +150,7 @@ type StreamEvent struct {
 const (
 	EventStart        = "start"
 	EventText         = "text"
+	EventThinking     = "thinking"
 	EventImage        = "image"
 	EventToolUseStart = "tool_use_start"
 	EventToolInput    = "tool_input"
@@ -263,11 +268,15 @@ func (e *upstreamError) Error() string {
 	return "agentcore: 上游返回错误响应: " + body
 }
 
-// retryable 判定这个 2xx 内错误值不值得重试。限流与过载是容量问题，
-// 退避后重试有意义；其余（如 invalid_request_error）重试只会重复失败。
+// retryable 判定这个 2xx 内错误值不值得重试。限流、过载、服务端瞬时错误
+// 是容量/抖动问题，退避后重试有意义；其余（如 invalid_request_error）重试
+// 只会重复失败。注意：上下文超长以 2xx 信封回来时 kind 多半是
+// invalid_request_error —— 那种不走本路径重试，而是由 loop 的
+// isContextOverflowError/noteContextOverflow 识别后压缩重跑。
 func (e *upstreamError) retryable() bool {
 	switch strings.TrimSpace(e.kind) {
-	case "rate_limit_error", "overloaded_error", "api_error":
+	case "rate_limit_error", "overloaded_error", "api_error",
+		"server_error", "timeout_error":
 		return true
 	}
 	return false
@@ -598,8 +607,22 @@ func translateEvent(ev *sseEvent) ([]StreamEvent, error) {
 				Index:       ev.Index,
 				PartialJSON: ev.Delta.PartialJSON,
 			}}, nil
+		case "thinking_delta":
+			// 载荷键是 "thinking"（Anthropic 语义），个别网关会走 "text"——
+			// 两个都收，取非空者。空文本直接丢。
+			text := ev.Delta.Thinking
+			if text == "" {
+				text = ev.Delta.Text
+			}
+			if text == "" {
+				return nil, nil
+			}
+			// thinking 只用于本地 transcript 留档（journal），不进历史、不发手机
+			// ——Anthropic 的 thinking 块回传需要合法 signature，塞回历史会破坏
+			// 下一轮请求。
+			return []StreamEvent{{Kind: EventThinking, Index: ev.Index, Text: text}}, nil
 		}
-		// thinking_delta / signature_delta 等首期不消费。
+		// signature_delta 等其余增量不消费。
 		return nil, nil
 
 	case "content_block_stop":

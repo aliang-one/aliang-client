@@ -216,11 +216,13 @@ type streamMessage struct {
 // streamDelta 是各类 delta 的并集。
 //
 //	text_delta        → Text
+//	thinking_delta    → Thinking（Anthropic 语义的载荷键就是 thinking，不是 text）
 //	input_json_delta  → PartialJSON
 //	message_delta     → StopReason
 type streamDelta struct {
 	Type        string `json:"type"`
 	Text        string `json:"text,omitempty"`
+	Thinking    string `json:"thinking,omitempty"`
 	PartialJSON string `json:"partial_json,omitempty"`
 	StopReason  string `json:"stop_reason,omitempty"`
 }

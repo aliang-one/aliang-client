@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"aliang.one/nursorgate/app/agentcore"
 	"aliang.one/nursorgate/common/logger"
 	"github.com/google/shlex"
 )
@@ -482,8 +483,8 @@ func approvalProjectBoundaryDecision(toolName string, toolInput json.RawMessage,
 // current project's Claude Code auto-memory directory
 // (~/.claude/projects/<slug>/memory). The carve-out exists because the Claude
 // Code harness instructs the model to persist memories THERE while the project
-// boundary below auto-denies any path outside the project cwd — without it the
-// model could never follow its own memory instructions.
+// boundary requires approval for any path outside the project cwd — without it
+// the model could never follow its own memory instructions.
 const claudeProjectMemoryRuleID = "memory-dir-carveout"
 
 func approvalProjectBoundaryDecisionForHook(toolName string, toolInput json.RawMessage, projectPath string, hookRaw map[string]interface{}) (policyDecision, string, bool) {
@@ -504,7 +505,7 @@ func approvalProjectBoundaryDecisionForHook(toolName string, toolInput json.RawM
 	if !valid {
 		return decisionAutoDeny, "invalid-project-path", true
 	}
-	// Auto-memory carve-out, evaluated BEFORE the blanket outside-project deny:
+	// Auto-memory carve-out, evaluated BEFORE the outside-project escalation:
 	// when every target path resolves inside this project's memory dir the call
 	// is approved regardless of the policy scheme — the memory dir is outside
 	// the project by construction, so no scheme (not even allow_all) could
@@ -512,9 +513,13 @@ func approvalProjectBoundaryDecisionForHook(toolName string, toolInput json.RawM
 	if len(paths) > 0 && allPathsInsideClaudeMemoryDir(paths, projectPath, hookRaw) {
 		return decisionAutoApprove, claudeProjectMemoryRuleID, true
 	}
+	// 2026-10-28 项目边界降级：项目外路径不再 auto_deny，改为 require_approval，
+	// 与 outside-project-bash 同口径（交手机审批由用户拍板）。此前文件路径工具
+	// 一律判死而 Bash 走审批，口径不一；且零上下文的拒绝文案让模型无从自救，
+	// 只能把「路径出界」泛化成「工具被禁」而回避。
 	for _, path := range paths {
 		if !approvalPathWithinProject(projectPath, path) {
-			return decisionAutoDeny, "outside-project-path", true
+			return decisionRequireApproval, "outside-project-path", true
 		}
 	}
 	return "", "", false
@@ -577,9 +582,16 @@ func approvalPathWithinProject(projectPath, candidate string) bool {
 		return false
 	}
 	candidate = strings.TrimSpace(candidate)
-	if candidate == "" || strings.HasPrefix(candidate, "~") {
+	if candidate == "" {
 		return false
 	}
+	// 与执行层 resolveToolPath 同口径：~ 先展开再判界。此前 ~ 前缀一票否决，
+	// 指向项目内的 ~/ 路径会在审批层被误杀（执行层本就会展开后才判界）。
+	expanded, expandErr := agentcore.ExpandHome(candidate)
+	if expandErr != nil {
+		return false
+	}
+	candidate = expanded
 	if !filepath.IsAbs(candidate) {
 		candidate = filepath.Join(projectRoot, candidate)
 	}
