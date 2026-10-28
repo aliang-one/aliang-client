@@ -3,7 +3,8 @@
 // AgentCoreLLMConfig.Validate(processor/config/types.go)同源,两端不许分叉。
 // 已知接受的分歧:WHATWG URL 会把 127.1/0x7f.0.0.1/2130706433 归一成
 // 127.0.0.1(前端放行),Go url.Parse 则保持原样并拒绝——后端是权威闸
-// (保存 400+读取防御),前端宽松只影响 UX。
+// (保存 400+读取防御),前端宽松只影响 UX。已接受的顺序分歧:后端先查
+// scheme 后查 host,前端相反——两端都拒,仅提示文案不同。
 
 function isLoopbackHost(hostname) {
   const host = String(hostname || '').trim().toLowerCase();

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  applyAgentCoreLLMClearing,
   normalizeAgentCoreLLMConfig,
   validateAgentCoreLLMConfig,
 } from './agentCoreSettings';
@@ -57,5 +58,37 @@ describe('normalizeAgentCoreLLMConfig', () => {
     const out = normalizeAgentCoreLLMConfig({ enable: true });
     expect(out.enabled).toBe(false);
     expect(Object.keys(out)).not.toContain('enable');
+  });
+});
+
+describe('applyAgentCoreLLMClearing', () => {
+  it('next 空且 current 非空 → 显式写空值', () => {
+    const patch = {};
+    applyAgentCoreLLMClearing(patch, { base_url: '', api_key: '' }, { base_url: 'https://a.b', api_key: 'sk-x' });
+    expect(patch.agentcore_llm).toEqual({ base_url: '', api_key: '' });
+  });
+
+  it('next 有值 → 只清空空的那维', () => {
+    const patch = {};
+    applyAgentCoreLLMClearing(patch, { base_url: 'https://c.d', api_key: '' }, { base_url: 'https://a.b', api_key: 'sk-x' });
+    expect(patch.agentcore_llm).toEqual({ api_key: '' });
+  });
+
+  it('双方都空 → 不产生键', () => {
+    const patch = {};
+    applyAgentCoreLLMClearing(patch, { base_url: '', api_key: '' }, { base_url: '', api_key: '' });
+    expect(patch.agentcore_llm).toBeUndefined();
+  });
+
+  it('与既有 patch.agentcore_llm 合并而非覆盖', () => {
+    const patch = { agentcore_llm: { enabled: true } };
+    applyAgentCoreLLMClearing(patch, { base_url: '', api_key: '' }, { base_url: 'https://a.b', api_key: 'sk-x' });
+    expect(patch.agentcore_llm).toEqual({ enabled: true, base_url: '', api_key: '' });
+  });
+
+  it('纯空白 next 值视为空(trim 语义)', () => {
+    const patch = {};
+    applyAgentCoreLLMClearing(patch, { base_url: '   ', api_key: '' }, { base_url: 'https://a.b', api_key: 'sk-x' });
+    expect(patch.agentcore_llm).toEqual({ base_url: '', api_key: '' });
   });
 });

@@ -119,6 +119,7 @@ const (
 // 直接对话」这个承诺对新用户不成立。
 //
 // 取值顺序：
+//  0. 显式 agentcore_llm（仪表盘配置）——命中且非空直接返回，不进缓存；
 //  1. ANTHROPIC_AUTH_TOKEN（子进程 env → ~/.claude/settings.json）——零网络，
 //     与 CLI 用的是同一个值，quick-setup 用户恒命中；
 //  2. user-center 的 key 列表（带缓存）——没跑过 quick-setup 的新装用户兜底。
@@ -204,6 +205,9 @@ func agentCoreResetTokenCache() {
 // 自己的 API key 另由 agentCoreAuthToken 作为 Authorization 显式带上，两者不是
 // 一回事（见 agentCoreAuthToken 注释）。
 //
+// 例外：仪表盘 customer.agentcore_llm 显式配置命中时直接采用，回环/远端都
+// 放行（见函数体首部）。
+//
 // 用户把 ANTHROPIC_BASE_URL 配成远端直连地址时（本机 settings.json 就是
 // https://api.aliang.one），不照抄：那条路要完整的 mTLS 客户端凭据，内核没有。
 // 宁可退回 56432 走隧道，也不要让「装了客户端却连不上」这种最难自查的失败发生。
@@ -269,7 +273,8 @@ func agentCoreModelUnusable(model string) bool {
 
 // agentCoreDialHost 返回拨测目标 host:port。URL 无显式端口时按 scheme 补
 // 默认值——u.Host 对 "https://gw.example.com" 是裸域名,直接 dial 会报
-// "missing port in address"。
+// "missing port in address"。80 兜底仅 http/https 可达（上游 Validate 白名单），
+// 勿当通用 helper 复用到任意 scheme。
 func agentCoreDialHost(u *url.URL) string {
 	if u.Port() != "" {
 		return u.Host

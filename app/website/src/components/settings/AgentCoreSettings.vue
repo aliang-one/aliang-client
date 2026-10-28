@@ -38,6 +38,7 @@
           <input
             v-model="form.apiKey"
             :type="showKey ? 'text' : 'password'"
+            autocomplete="off"
             :placeholder="t('agentCore_apiKeyPlaceholder')"
             :disabled="loading || saving"
             class="h-10 w-full rounded-lg border border-slate-200 bg-white px-3 pr-16 font-mono text-xs font-normal text-slate-800 outline-none transition-colors focus:border-primary focus:ring-2 focus:ring-primary/10 disabled:opacity-60 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
@@ -45,6 +46,8 @@
           <button
             type="button"
             class="absolute right-2 top-1/2 -translate-y-1/2 text-[11px] font-medium text-slate-400 hover:text-primary"
+            :aria-pressed="showKey"
+            :disabled="loading || saving"
             @click="showKey = !showKey"
           >
             {{ showKey ? t('agentCore_hideKey') : t('agentCore_showKey') }}
