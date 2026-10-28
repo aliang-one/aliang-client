@@ -465,8 +465,10 @@ type agentAIRun struct {
 	claudeSteer *agentAIClaudeSteerControl
 	// originSocketID 是本回合发起 socket 的注册表 id（"remote" 或 "aisock-N"）。
 	// 由消息分发路径盖的 __origin_socket 标记经 message()/runStart() 落入
-	//（Task 5 起，由 message()/create()/runStart()/option-followup 四路填充）；
-	// 空串=旧调用方（TUI/测试内部路径），fan-out 无 origin 去重。
+	//（Task 5 起，由 message 的 messageRun/runStart 保留绑定错误发射器/
+	// optionResponse 续接/runUserMessage 执行 run 四路填充；create() 只落
+	// session.originSocket，从不构造 run）；空串=旧调用方（TUI/测试内部
+	// 路径），fan-out 无 origin 去重。
 	originSocketID string
 }
 
@@ -1036,8 +1038,9 @@ func (m *agentAIManager) runEmitter(run agentAIRun, write agentTerminalWriter) *
 	}
 	// 跨端同态（spec §4.1）：origin 仍内联，事件副本扇出到订阅 socket。
 	// originSocketID 从消息分发路径盖的 __origin_socket 来（Task 5 起
-	// message()/create()/runStart()/option-followup 四路填充）；恒空串=无
-	// origin 去重，扇出与 origin 内联并存（仅测试/内部路径）。
+	// messageRun/保留绑定错误发射器/optionResponse/runUserMessage 四路
+	// 填充）；恒空串=无 origin 去重，扇出与 origin 内联并存（仅测试/内部
+	// 路径）。
 	e.write = m.fanOutWrite(run.originSocketID, run.sessionID, e.write)
 	return e
 }

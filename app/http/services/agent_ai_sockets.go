@@ -35,7 +35,9 @@ const agentAIOriginSocketField = "__origin_socket"
 // agentAIRemoteSocketID 远端 WS 的常驻 socket id（写函数是间接层，重连自动换道）。
 const agentAIRemoteSocketID = "remote"
 
-// AgentAIOriginSocketField 供 handlers 包盖标记用（与 agentAIOriginSocketField 同值）。
+// AgentAIOriginSocketField 供 handlers 包盖标记用（与 agentAIOriginSocketField
+// 同值）。内部代码一律用小写 agentAIOriginSocketField，导出别名仅供 handlers
+// 包盖标记。
 const AgentAIOriginSocketField = agentAIOriginSocketField
 
 type agentAISocket struct {

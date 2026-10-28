@@ -98,6 +98,10 @@ func (h *AgentHandler) HandleAIStream(w http.ResponseWriter, r *http.Request) {
 		if err := conn.ReadJSON(&msg); err != nil {
 			return
 		}
+		if msg == nil {
+			// 字面量 null 帧解码为 nil map：直接盖标记会 panic，静默跳过。
+			continue
+		}
 		if socketID != "" {
 			// 内部标记（"__" 前缀，禁止转发到任何对端）：message()/create() 读它
 			// 落 session.originSocket，runEmitter 据此做 origin 去重扇出。

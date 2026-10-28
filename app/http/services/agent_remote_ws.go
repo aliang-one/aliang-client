@@ -671,6 +671,12 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 		// keyed), so periodic re-hellos re-triggering them is safe.
 		s.markRegistrationReady()
 		s.ai.replayPendingTerminals(writeJSON)
+		// 远端 socket 门开后复活（2026-10-28 评审 I2）：ensureRemoteAISocket 在
+		// 连接建立即注册，但那时注册门未开——门开前的扇出会让 pump 卡在
+		// publishedWriter→waitForRegistration（≤5s）后撞写超时、被 onDead 摘除，
+		// 且本连接内不再有别的复活点（手机从此静默收不到审批广播）。此处幂等
+		// ensure 一次：门已开，被摘/缺失的 remote socket 就地复活；活着的 no-op。
+		s.ai.ensureRemoteAISocket(s.currentRemoteWriter())
 		// Tell the server which terminal sessions survived the disconnect (live
 		// set, tombstones excluded); an empty set still emits so the server can
 		// clear stale records. Idempotent on the server side, so re-hellos are

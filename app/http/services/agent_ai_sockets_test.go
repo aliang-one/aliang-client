@@ -207,11 +207,14 @@ func TestApprovalBroadcastReachesNonSubscriber(t *testing.T) {
 
 // TestOriginSocketNotDuplicated origin 去重：包装内层的 originWrite 恰好执行
 // 1 次（内联）；fan-out 跳过 origin socket，sock 自己的写函数不再被调——总数
-// 必须是 1，出现 2 即去重失效。
+// 必须是 1，出现 2 即去重失效。socket 必须订阅该会话（评审 I1）：非审批族
+// 事件只按订阅扇出，不订阅时 fan-out 本来就无目标，origin 传空也照样绿
+// （守卫形同虚设）。
 func TestOriginSocketNotDuplicated(t *testing.T) {
 	m := newTestAISocketsManager(t)
 	count := make(chan struct{}, 32)
 	sock := m.registerAISocket("local", func(interface{}) error { count <- struct{}{}; return nil })
+	m.subscribeAISocket(sock.id, "s1")
 	write := m.fanOutWrite(sock.id, "s1", func(interface{}) error { count <- struct{}{}; return nil })
 	_ = write(map[string]interface{}{"type": "ai.delta"})
 	waitUntilFor(t, time.Second, func() bool { return len(count) == 1 })
@@ -224,6 +227,13 @@ func TestOriginSocketNotDuplicated(t *testing.T) {
 // TestOriginSocketStampedOnSessionViaCreate create 路径落标：入站帧盖
 // __origin_socket 后，DispatchLocalAI 走 create()，session.originSocket 应等于
 // 发起 socket 的注册表 id（Task 5 标记链的第一环）。
+//
+// provider 用 "auto" 而非 "agentcore"（评审 M3）：create() 在注册前就校验
+// provider，非法值直接报错返回、会话根本不落标——非法 provider 在这里只会
+// 造出空转用例；create() 今日不 spawn，选 auto 是纵深防御：即使未来 create
+// 引入 spawn，auto 也不会显式命中 agentcore（agentAIUseAgentCore 只认显式值，
+// auto 唯一的 agentcore 通路是 CLI 全缺席时的 fallback 改写）。不可拨本机
+// 56432 是硬约束。
 func TestOriginSocketStampedOnSessionViaCreate(t *testing.T) {
 	m := newTestAISocketsManager(t)
 	svc := &AgentService{ai: m}
@@ -232,7 +242,7 @@ func TestOriginSocketStampedOnSessionViaCreate(t *testing.T) {
 	svc.DispatchLocalAI(map[string]interface{}{
 		"type":                   models.AgentEventAISessionCreate,
 		"session_id":             "origin-stamp-c1",
-		"provider":               "agentcore",
+		"provider":               "auto",
 		"mode":                   "vibe",
 		"project_path":           t.TempDir(),
 		agentAIOriginSocketField: sock.id,
@@ -269,9 +279,11 @@ func TestOriginSocketStampedOnSessionViaMessage(t *testing.T) {
 		return nil
 	}
 	svc.DispatchLocalAI(map[string]interface{}{
-		"type":                   models.AgentEventAISessionCreate,
-		"session_id":             "origin-stamp-m1",
-		"provider":               "agentcore",
+		"type":       models.AgentEventAISessionCreate,
+		"session_id": "origin-stamp-m1",
+		// "auto" 而非 "agentcore"：同 TestOriginSocketStampedOnSessionViaCreate
+		// 的理由（M3），create 铺底也不给未来 spawn 留 56432 通路。
+		"provider":               "auto",
 		"mode":                   "vibe",
 		"project_path":           t.TempDir(),
 		agentAIOriginSocketField: sock.id,
@@ -316,12 +328,15 @@ drain:
 
 // TestRunEmitterCarriesRunOriginSocket runEmitter 把 run.originSocketID 接进
 // fan-out 去重：Task 4 阶段恒空（无去重），Task 5 填充后 origin socket 不得
-// 再收到副本。
+// 再收到副本。socket 必须订阅该会话（评审 I1）：ai.delta 非审批族、只按订阅
+// 扇出——不订阅时丢失 origin 的退化路径（originSocketID=""）同样全绿，断言
+// 抓不到回归；订阅后丢 origin 必然 count==2 而失败。
 func TestRunEmitterCarriesRunOriginSocket(t *testing.T) {
 	m := newTestAISocketsManager(t)
 	count := make(chan struct{}, 16)
 	sock := m.registerAISocket("local", func(interface{}) error { count <- struct{}{}; return nil })
 	defer m.unregisterAISocket(sock.id)
+	m.subscribeAISocket(sock.id, "s1")
 	emitter := m.runEmitter(agentAIRun{sessionID: "s1", originSocketID: sock.id},
 		func(interface{}) error { count <- struct{}{}; return nil })
 	_ = emitter.emit(map[string]interface{}{"type": "ai.delta", "delta": "x"})
