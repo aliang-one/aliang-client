@@ -38,11 +38,15 @@ type agentAIManager struct {
 	sessions           map[string]*agentAISession
 	approvals          map[string]*agentAIApprovalWaiter
 	completedApprovals map[string]*agentAICompletedApproval
-	codexInputs        map[string]*agentAICodexInputWaiter
-	pendingTerminals   map[string]map[string]interface{}
-	runJournalEnabled  bool
-	bindings           map[string]agentAIBindingRecord
-	processedRuns      map[string]agentAIProcessedRun
+	// sessionApprovals 是会话级批准记忆（accept_for_session，2026-10-28，见
+	// agent_ai_session_approvals.go）：sessionID → {provider\x00匹配键}。内存态、
+	// 随进程消失，惰性 init（与 completedApprovals 的超限全清护栏同风格）。
+	sessionApprovals  map[string]map[string]struct{}
+	codexInputs       map[string]*agentAICodexInputWaiter
+	pendingTerminals  map[string]map[string]interface{}
+	runJournalEnabled bool
+	bindings          map[string]agentAIBindingRecord
+	processedRuns     map[string]agentAIProcessedRun
 	// coreJournal 是 agentcore（AliangCode）调用记录落盘器；dir 为空时内部
 	// 全 no-op。构造时解析一次 agentHome()。
 	coreJournal *agentCoreJournal
@@ -3344,6 +3348,14 @@ func (m *agentAIManager) approval(msg map[string]interface{}, writeJSON agentTer
 		return
 	}
 
+	// 会话级批准记忆（spec §4.2.4）：accept_for_session 落一条 (sessionID,
+	// provider, kind, 匹配键)，本会话内同键后续请求由三个检查点短路、不再
+	// 云端往返。普通 accept 不记录。必须在 m.mu.Unlock() 之后调用
+	// （rememberSessionApproval 自身取 m.mu，临界区内调用=死锁）。
+	if decision == models.AgentAIApprovalDecisionAcceptForSession {
+		m.rememberSessionApproval(sessionID, waiter.request.Provider, waiter.request.Kind, waiter.request.ToolName, waiter.request.Command)
+	}
+
 	waiter.request.respond <- response
 	ack("applied")
 }
@@ -3830,6 +3842,15 @@ func (m *agentAIManager) handleClaudeApprovalHook(ctx context.Context, sessionID
 			run.matchedRuleID = matchedID
 			run.policyVersion = svc.effectiveApprovalPolicyForPath(run.projectPath).Version
 		}
+	}
+
+	// 会话级批准记忆检查点（policy 之后、云端往返之前）：本会话用户对同键
+	// （command 逐字 / tool 按名，见 agent_ai_session_approvals.go）选过
+	// accept_for_session 的直接放行，不再问手机。provider 取请求对象自身，
+	// 与 approval() 记录点存的 waiter.request.Provider 对齐。
+	if preReq := buildClaudeApprovalRequest(run, raw); m.sessionApprovalAllows(sessionID, preReq.Provider, preReq.Kind, preReq.ToolName, preReq.Command) {
+		logger.Info(fmt.Sprintf("approval-hook: SESSION-APPROVED (memory) tool=%s kind=%s session=%s", preReq.ToolName, preReq.Kind, sessionID))
+		return claudeApprovalHookDecision(hookEventName, true, "approved for this session"), nil
 	}
 
 	req := buildClaudeApprovalRequest(run, raw)
@@ -5717,6 +5738,15 @@ func (m *agentAIManager) codexAppServerApprovalResult(ctx context.Context, run a
 			run.matchedRuleID = matchedID
 			run.policyVersion = svc.effectiveApprovalPolicyForPath(run.projectPath).Version
 		}
+	}
+	// 会话级批准记忆检查点（policy 之后、云端往返之前）：本会话用户对同键选过
+	// accept_for_session 的直接放行（agent_ai_session_approvals.go）。codex 原生
+	// scope=session 行为保留不动，这里只是 agent 侧叠加记忆免往返。provider 取
+	// 请求对象自身（buildCodexApprovalRequest 硬编码 "codex"，而 run.provider
+	// 可能是 "auto"——与 approval() 记录点存的 waiter.request.Provider 对齐）。
+	if pre := buildCodexApprovalRequest(run, method, params, fileChanges); m.sessionApprovalAllows(run.sessionID, pre.Provider, pre.Kind, pre.ToolName, pre.Command) {
+		logger.Info(fmt.Sprintf("approval-hook: SESSION-APPROVED (memory) tool=%s kind=%s method=%s session=%s (codex)", pre.ToolName, pre.Kind, method, run.sessionID))
+		return codexApprovalResponseResult(method, params, agentAIApprovalResponse{Decision: models.AgentAIApprovalDecisionAccept})
 	}
 	req := buildCodexApprovalRequest(run, method, params, fileChanges)
 	// Use the env-configurable approval timeout (ALIANG_AI_APPROVAL_TIMEOUT,

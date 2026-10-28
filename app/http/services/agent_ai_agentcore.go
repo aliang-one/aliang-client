@@ -1646,6 +1646,15 @@ func (m *agentAIManager) agentCoreApprove(run agentAIRun, writeJSON agentTermina
 			}
 		}
 
+		// 会话级批准记忆检查点（policy 之后、云端往返之前）：本会话用户对同键
+		// 选过 accept_for_session 的直接放行（agent_ai_session_approvals.go）。
+		// provider 取请求对象自身，与 approval() 记录点存的 waiter.request.Provider
+		// 对齐（buildAgentCoreApprovalRequest 用 run.provider，两侧一致）。
+		if pre := buildAgentCoreApprovalRequest(run, call); m.sessionApprovalAllows(run.sessionID, pre.Provider, pre.Kind, pre.ToolName, pre.Command) {
+			logger.Info(fmt.Sprintf("approval-hook: SESSION-APPROVED (memory) tool=%s kind=%s session=%s (agentcore)", pre.ToolName, pre.Kind, run.sessionID))
+			return agentcore.ApprovalResponse{Approved: true}, nil
+		}
+
 		approvalCtx, cancel := context.WithTimeout(ctx, agentAIApprovalTimeout)
 		defer cancel()
 		response, err := m.requestApproval(approvalCtx, run, writeJSON, buildAgentCoreApprovalRequest(run, call))
