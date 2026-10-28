@@ -235,6 +235,95 @@ func TestStreamErrorEvent(t *testing.T) {
 	}
 }
 
+// 上游发了一个 text delta 后中途断开连接（不是 message_stop）：此刻内核已经
+// 把事件下发给调用方，streamTurn 的内容累积和宿主已收到的帧都在。若还按
+// 「连接错误属瞬态」整轮重试，第二次尝试的 delta 会拼在第一次的半截文本
+// 后面，缝出一段从未被完整说出过的内容。必须一次都不重试、原样报错。
+//
+// 变异守卫：删掉 Stream 里的 delivered 守卫，本条的 attempts 断言即红。
+func TestStreamNoRetryAfterEventDelivered(t *testing.T) {
+	var attempts int32
+	srv := sseServer(t, func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&attempts, 1)
+		w.Header().Set("content-type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_cut\",\"model\":\"x\"}}\n\n")
+		fmt.Fprint(w, "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"半截\"}}\n\n")
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		// 中途断开：不写 chunked 终止块直接中止连接（模拟 reset/EOF 形态，
+		// 而非 message_stop）。net/http 对 ErrAbortHandler 静默处理、直接拆连接，
+		// 客户端在已读到事件之后得到读取错误。
+		panic(http.ErrAbortHandler)
+	})
+
+	var sawText bool
+	err := NewClient(srv.URL).Stream(context.Background(), &MessagesRequest{Model: "x"}, func(ev StreamEvent) error {
+		if ev.Kind == EventText {
+			sawText = true
+		}
+		return nil
+	})
+	if err == nil {
+		t.Fatal("流中途断开应返回错误")
+	}
+	var idleErr *streamIdleError
+	if errors.As(err, &idleErr) {
+		t.Fatalf("err = %v, 不应被判定为 streamIdleError（断开不是块间停滞）", err)
+	}
+	if !sawText {
+		t.Error("断开前下发的 text delta 应已到达调用方（delivered 守卫的前提）")
+	}
+	if n := atomic.LoadInt32(&attempts); n != 1 {
+		t.Fatalf("已下发事件后不应重试，attempts = %d, want 1", n)
+	}
+}
+
+// 首字节前断开（连接被接受但一个字节都不写就断）仍走重试：此时没有任何
+// 事件下发过，瞬态重试语义不丢。
+func TestStreamRetriesWhenCutBeforeFirstByte(t *testing.T) {
+	var attempts int32
+	srv := sseServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&attempts, 1) == 1 {
+			// 接受连接后立刻断开、零字节。POST 走的是全新连接，transport
+			// 不会替我们重试，这个错误必然到达 Stream 的重试循环。
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				t.Fatal("无法 hijack 连接")
+			}
+			conn, _, err := hj.Hijack()
+			if err != nil {
+				t.Fatalf("hijack: %v", err)
+			}
+			_ = conn.Close()
+			return
+		}
+		writeSSE(w,
+			`{"type":"message_start","message":{"id":"msg_retry","model":"x"}}`,
+			`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"完整"}}`,
+			`{"type":"message_delta","delta":{"stop_reason":"end_turn"}}`,
+		)
+	})
+
+	var texts int
+	err := NewClient(srv.URL).Stream(context.Background(), &MessagesRequest{Model: "x"}, func(ev StreamEvent) error {
+		if ev.Kind == EventText {
+			texts++
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("首字节前的断开应重试成功: %v", err)
+	}
+	if n := atomic.LoadInt32(&attempts); n != 2 {
+		t.Fatalf("attempts = %d, want 2（首断 + 重试成功）", n)
+	}
+	if texts != 1 {
+		t.Errorf("text delta 数 = %d, want 1（重试成功的完整回合，不是缝接）", texts)
+	}
+}
+
 func TestStreamContextCancel(t *testing.T) {
 	// 上游挂住不返回，ctx 取消后 Stream 必须及时退出（进程内内核没有子进程
 	// 可杀，取消只能靠自己轮询）。

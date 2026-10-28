@@ -170,6 +170,15 @@ func (c *Client) Stream(ctx context.Context, req *MessagesRequest, onEvent func(
 	}
 	req.Stream = true
 
+	// delivered 记录本调用是否已向调用方下发过任何事件。它是**跨尝试**的，
+	// 不随单次尝试重置：调用方（streamTurn）的内容累积与宿主已收到的帧都挂
+	// 在 onEvent 上，重试边界之外的状态不会归零。
+	delivered := false
+	emit := func(ev StreamEvent) error {
+		delivered = true
+		return onEvent(ev)
+	}
+
 	var lastErr error
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		if err := ctx.Err(); err != nil {
@@ -183,14 +192,32 @@ func (c *Client) Stream(ctx context.Context, req *MessagesRequest, onEvent func(
 			case <-time.After(delay):
 			}
 		}
-		err := c.streamOnce(ctx, req, onEvent)
+		err := c.streamOnce(ctx, req, emit)
 		if err == nil {
 			return nil
 		}
-		// onEvent 的错误不是传输错误，不重试。
+		// onEvent 的错误不是传输错误，不重试。必须先于 delivered 判定：它的
+		// 返回值是包内层 cause，走 delivered 分支会把 eventAbortError 壳一起
+		// 带出去，调用方的 errors.Is 语义就断了。
 		var abort *eventAbortError
 		if errors.As(err, &abort) {
 			return abort.cause
+		}
+		// 已经向调用方下发过任何事件之后，一切错误原样返回、绝不重试。
+		//
+		// streamIdleError 注释里那条理由对**一切**已下发事件后的错误都成立：
+		// 重试会从零重发 start/text 等事件帧，而调用方第一次尝试的半截内容
+		// 还在累积——第二次尝试的 delta 会拼接在半截文本后面，缝出一段从未
+		// 被模型完整说过的「缝合怪」，发往手机、进历史、毒化后续上下文。
+		// 连接中途重置/EOF/超时这些「瞬态」错误因此在此时不再瞬态。首字节
+		// 之前的失败不受影响，仍按下面的 isRetryable 正常重试。
+		//
+		// 刻意放在 reduceMaxTokens 之前：400 降档发生在响应检查阶段，此刻
+		// 必然还没有下发过任何事件，不受影响；而 2xx 体内的错误信封
+		// （upstreamError）可能出现在事件中途——那种情况下重试同样会缝内容，
+		// delivered 判定先拦住是对的。
+		if delivered {
+			return err
 		}
 		// 各模型的输出上限不同：defaultMaxTokens（32000）遇到只支持 8k/16k
 		// 的模型会被直接 400。与其整轮失败，不如降到保守值重试——线上用户
@@ -297,6 +324,10 @@ func upstreamErrorFromJSON(body string) *upstreamError {
 }
 
 // isRetryable 判定错误是否值得重试：连接类错误、429、5xx、2xx 内的限流/过载。
+//
+// 注意它只看错误本身的性质；「本调用已经下发过事件」这层守卫在 Stream 的
+// 重试循环里（delivered），两者是互补关系——这里放行、那里拦截的情形由
+// delivered 兜底。
 func isRetryable(err error) bool {
 	// 块间停滞不是瞬态：整条流已经断在半开状态，重试只会把本尝试已经下发的
 	// start/text 事件帧重复推给手机。
