@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"aliang.one/nursorgate/app/http/models"
 	"aliang.one/nursorgate/common/logger"
@@ -25,6 +26,13 @@ import (
 
 // agentAISocketQueueCap 单 socket 事件队列深度。溢出=消费者死了/卡了，断开。
 const agentAISocketQueueCap = 64
+
+// agentAISocketSubCap 单 socket 订阅数上限；超限全清再加（与 completedApprovals
+// 的 map 封顶同风格——防常驻 remote socket 的订阅集随会话结束无限累积）。
+// 全清而非逐出最旧的取舍：订阅集没有时间戳，逐出策略需要额外记账；且订阅方
+// （重连后的对端）拿快照后会重新订阅当前关注的会话，旧订阅本就是失联残留，
+// 清掉不构成正确性问题。
+const agentAISocketSubCap = 64
 
 // agentAIOriginSocketField 入站消息的内部来源 socket 标记。由两条分发路径
 // （handleRemoteAgentMessage AI 分支盖 "remote"、HandleAIStream 盖本地 socket
@@ -206,6 +214,9 @@ func (m *agentAIManager) subscribeAISocket(socketID, sessionID string) {
 	defer m.mu.Unlock()
 	if s := m.aiSockets[socketID]; s != nil {
 		s.mu.Lock()
+		if len(s.subs) >= agentAISocketSubCap {
+			s.subs = make(map[string]struct{})
+		}
 		s.subs[sessionID] = struct{}{}
 		s.mu.Unlock()
 	}
@@ -219,6 +230,88 @@ func (m *agentAIManager) unsubscribeAISocket(socketID, sessionID string) {
 		delete(s.subs, sessionID)
 		s.mu.Unlock()
 	}
+}
+
+// emitSessionSnapshot 订阅握手回包（spec §4.1）：转录快照（journal 读侧现成
+// 解析）+ 待审批 + 状态。尽力而为：转录取不到（非 journal 会话/读失败）就只
+// 回 pending+status，不报错。snapshot 经 writeJSON 直接回给订阅者——本机路径
+// 握手在读 goroutine 上内联执行，与该 socket pump 共用同一 writeJSON 闭包，
+// 并发安全由 HandleAIStream 的 writeMu 串行化保证（handlers/agent_handler.go），
+// 内联写不会与 pump 写交错；manager 不必为此再入队。
+// socketID 当前仅随参数对齐语义（订阅发生地），快照内容只由 sessionID 决定；
+// 留作后续日志/按 origin 裁剪的挂点。
+func (m *agentAIManager) emitSessionSnapshot(socketID, sessionID string, writeJSON agentTerminalWriter) {
+	if writeJSON == nil || sessionID == "" {
+		return
+	}
+	payload := map[string]interface{}{
+		"type":       models.AgentEventAISessionSnapshot,
+		"session_id": sessionID,
+		"status":     m.agentAISessionStatusForSnapshot(sessionID),
+	}
+	// 转录读 manager 自己的 journal（生产构造=agentCoreJournalDir() 同源；
+	// 测试注入临时目录时快照跟写侧同源，绝不读真机 ~/.aliang）。
+	dir := agentCoreJournalDir()
+	if m.coreJournal != nil && m.coreJournal.dir != "" {
+		dir = m.coreJournal.dir
+	}
+	if hist, _, err := readAgentCoreJournalHistoryFrom(dir, sessionID); err == nil && len(hist) > 0 {
+		tr := make([]map[string]interface{}, 0, len(hist))
+		for _, msg := range hist {
+			row := map[string]interface{}{"role": msg.Role, "text": msg.Content}
+			if msg.MessageID != "" {
+				row["message_id"] = msg.MessageID
+			}
+			if !msg.CreatedAt.IsZero() {
+				row["ts"] = msg.CreatedAt.UTC().Format(time.RFC3339)
+			}
+			tr = append(tr, row)
+		}
+		payload["transcript"] = tr
+	}
+	if pending := m.pendingApprovalsSnapshotForSession(sessionID); len(pending) > 0 {
+		payload["pending_approvals"] = pending
+	}
+	_ = writeJSON(payload)
+}
+
+// pendingApprovalsSnapshotForSession 单会话版待审批快照（字段口径与全量版
+// pendingApprovalsSnapshot 一致）。expires_at 随 waiter 字段补齐后再加
+// （Task 8 起补 expires_at）。
+func (m *agentAIManager) pendingApprovalsSnapshotForSession(sessionID string) []map[string]interface{} {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]map[string]interface{}, 0, 4)
+	for _, waiter := range m.approvals {
+		if waiter == nil || waiter.sessionID != sessionID {
+			continue
+		}
+		entry := map[string]interface{}{
+			"session_id":  waiter.sessionID,
+			"approval_id": waiter.request.ID,
+			"kind":        waiter.request.Kind,
+			"provider":    waiter.request.Provider,
+		}
+		if waiter.request.Command != "" {
+			entry["command"] = waiter.request.Command
+		}
+		if waiter.request.ToolName != "" {
+			entry["tool_name"] = waiter.request.ToolName
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+// agentAISessionStatusForSnapshot 会话态：cancel 非空=running；查无=idle
+// （订阅未知会话不报错——列表刷新场景友好，spec §6）。
+func (m *agentAIManager) agentAISessionStatusForSnapshot(sessionID string) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if s := m.sessions[sessionID]; s != nil && s.cancel != nil {
+		return "running"
+	}
+	return "idle"
 }
 
 // agentAIEventIsApprovalFamily 审批族判定：广播到全部 socket（spec §4.1）。

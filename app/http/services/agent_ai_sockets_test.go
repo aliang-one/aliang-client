@@ -1,6 +1,8 @@
 package services
 
 import (
+	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -344,6 +346,121 @@ func TestRunEmitterCarriesRunOriginSocket(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	if n := len(count); n != 1 {
 		t.Fatalf("origin 事件应恰好写一次(内联),实际 %d", n)
+	}
+}
+
+// TestDispatchLocalAISubscribeRepliesSnapshot 订阅握手（spec §4.1）：本机聊天
+// 连接经 DispatchLocalAI 订阅任意会话，必须在同连接回一个 ai.session.snapshot
+// ——未知会话也回（status=idle，列表刷新场景友好）。socket 透传是裸泵，此
+// 端点只存在于 agent 进程，订阅落地全靠 DispatchLocalAI 这条 case。
+func TestDispatchLocalAISubscribeRepliesSnapshot(t *testing.T) {
+	m := newTestAISocketsManager(t)
+	svc := &AgentService{ai: m}
+	sock := m.registerAISocket("local", func(interface{}) error { return nil })
+	defer m.unregisterAISocket(sock.id)
+	replies := make(chan map[string]interface{}, 8)
+	svc.DispatchLocalAI(map[string]interface{}{
+		"type":                   models.AgentEventAISessionSubscribe,
+		"session_id":             "any-session",
+		agentAIOriginSocketField: sock.id,
+	}, func(p interface{}) error {
+		replies <- p.(map[string]interface{})
+		return nil
+	})
+	select {
+	case p := <-replies:
+		if p["type"] != models.AgentEventAISessionSnapshot {
+			t.Fatalf("期望快照回包,收到 %v", p["type"])
+		}
+	case <-time.After(time.Second):
+		t.Fatal("订阅未回快照")
+	}
+}
+
+// TestDispatchLocalAISubscribeCarriesTranscriptAndPending 快照内容：转录来自
+// journal 读侧解析（manager 自己的 coreJournal.dir，不读真机 ~/.aliang）、
+// 待审批来自会话订阅表、状态按 cancel 非空=running。订阅帧不带 origin 标记
+// 也要能回快照（订阅≠发起，socketID 为空合法）。
+func TestDispatchLocalAISubscribeCarriesTranscriptAndPending(t *testing.T) {
+	m := newTestAISocketsManager(t)
+	svc := &AgentService{ai: m}
+	// 准备一个有 journal 历史与会话的会话。
+	dir := t.TempDir()
+	m.coreJournal = newAgentCoreJournal(dir)
+	m.coreJournal.ensureSessionHeader("s-snap", "/proj", "glm-5.3", time.Now().UTC().Format(time.RFC3339))
+	m.coreJournal.appendUser("s-snap", "m1", "第一问", time.Now().UTC().Format(time.RFC3339))
+	m.coreJournal.appendAssistant("s-snap", "a1", "第一答", time.Now().UTC().Format(time.RFC3339))
+	m.mu.Lock()
+	m.sessions["s-snap"] = &agentAISession{id: "s-snap", cancel: func() {}} // cancel 非空=running
+	m.approvals[agentAIApprovalMapKey("s-snap", "ap-1")] = &agentAIApprovalWaiter{
+		sessionID: "s-snap",
+		runSeq:    1,
+		request:   agentAIApprovalRequest{ID: "ap-1", Kind: "tool", Provider: "agentcore"},
+	}
+	m.mu.Unlock()
+
+	replies := make(chan map[string]interface{}, 8)
+	svc.DispatchLocalAI(map[string]interface{}{
+		"type":       models.AgentEventAISessionSubscribe,
+		"session_id": "s-snap",
+	}, func(p interface{}) error { replies <- p.(map[string]interface{}); return nil })
+	select {
+	case p := <-replies:
+		if p["status"] != "running" {
+			t.Fatalf("快照状态应 running,实际 %v", p["status"])
+		}
+		tr, _ := p["transcript"].([]map[string]interface{})
+		if len(tr) != 2 {
+			t.Fatalf("快照转录应 2 条,实际 %d: %v", len(tr), p["transcript"])
+		}
+		pend, _ := p["pending_approvals"].([]map[string]interface{})
+		if len(pend) != 1 || pend[0]["approval_id"] != "ap-1" {
+			t.Fatalf("快照待审批应 1 项 ap-1,实际 %v", p["pending_approvals"])
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("未收到快照")
+	}
+}
+
+// TestDispatchLocalAIOptionResponseRouted option.response 本机作答入口：从
+// default unsupported 分支捞出来，路由进 manager 既有 optionResponse（不改它）。
+// 用缺字段的帧触发 optionResponse 自身守卫错误——合法帧遇未知会话在
+// optionResponse 内静默 no-op（无回包可断言），缺字段错误则是可断言的路由
+// 证据：若仍走 default 会回 "unsupported local AI event type: ai.option.response"。
+func TestDispatchLocalAIOptionResponseRouted(t *testing.T) {
+	m := newTestAISocketsManager(t)
+	svc := &AgentService{ai: m}
+	replies := make(chan map[string]interface{}, 8)
+	svc.DispatchLocalAI(map[string]interface{}{
+		"type": models.AgentEventAIOptionResponse,
+	}, func(p interface{}) error { replies <- p.(map[string]interface{}); return nil })
+	waitUntilFor(t, time.Second, func() bool { return len(replies) > 0 })
+	p := <-replies
+	if p["type"] == models.AgentEventAIError && strings.Contains(fmt.Sprint(p["error"]), "unsupported") {
+		t.Fatalf("option.response 仍走 unsupported 分支: %v", p)
+	}
+	if !strings.Contains(fmt.Sprint(p["error"]), "missing session_id or option_id") {
+		t.Fatalf("应回 optionResponse 自身守卫错误,实际 %v", p)
+	}
+}
+
+// TestDispatchLocalAIToolAskResponseRouted tool_ask.response 本机作答入口：
+// 与远端同语义（run 阻塞在 ask_user 上时必须能答，不受本地开关门）。路由
+// 证据=toolAskResponse 懒初始化 tool ask 桥（default 分支不会建桥；作答投递
+// 进桥不写 writeJSON，无回包可断言）。
+func TestDispatchLocalAIToolAskResponseRouted(t *testing.T) {
+	m := newTestAISocketsManager(t)
+	svc := &AgentService{ai: m}
+	svc.DispatchLocalAI(map[string]interface{}{
+		"type":           models.AgentEventToolAskResponse,
+		"interaction_id": "ta-route-1",
+		"status":         "answered",
+	}, func(p interface{}) error { return nil })
+	m.mu.Lock()
+	hasBridge := m.toolAsk != nil
+	m.mu.Unlock()
+	if !hasBridge {
+		t.Fatal("tool_ask.response 未路由进 toolAskResponse（桥未初始化）")
 	}
 }
 

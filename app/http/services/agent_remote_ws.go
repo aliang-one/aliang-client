@@ -1007,6 +1007,31 @@ func (s *AgentService) DispatchLocalAI(msg map[string]interface{}, writeJSON fun
 		s.ai.stop(msg, writeJSON)
 	case models.AgentEventAISessionClose:
 		s.ai.close(msg, writeJSON)
+	case models.AgentEventAISessionSubscribe, models.AgentEventAISessionUnsubscribe:
+		// 跨端同态（spec §4.1）：本机聊天连接订阅任意会话（手机发起的、终端
+		// 导入的都行）。透传是裸泵，此端点只存在于 agent 进程。
+		// 刻意不设设备控制门：订阅是只读观察（快照 + 后续扇出），不驱动任何
+		// 会话状态；本端点也仅由 agent 进程自身的仪表盘回环（56433 localhost）
+		// 到达，无设备控制门语境。
+		// 刻意不扇出的回包（N2 记录）：steer ack 与 session.created 仍走
+		// origin 写——插话方/发起方自己直接收，另一端靠快照/清单刷新可见。
+		socketID := strings.TrimSpace(remoteString(msg, agentAIOriginSocketField))
+		sessionID := remoteString(msg, "session_id")
+		if sessionID == "" {
+			_ = writeJSON(agentAIErrorPayload("", "", errors.New("ai.session.subscribe missing session_id")))
+			return
+		}
+		if msgType == models.AgentEventAISessionSubscribe {
+			s.ai.subscribeAISocket(socketID, sessionID)
+			s.ai.emitSessionSnapshot(socketID, sessionID, writeJSON)
+		} else {
+			s.ai.unsubscribeAISocket(socketID, sessionID)
+		}
+	case models.AgentEventAIOptionResponse:
+		s.ai.optionResponse(msg, writeJSON)
+	case models.AgentEventToolAskResponse:
+		// 与远端同语义：不受本地开关门（run 阻塞在 ask_user 上时必须能答）。
+		s.ai.toolAskResponse(msg, writeJSON)
 	case models.AgentEventSlashCommandsList:
 		// Slash-command discovery shares the local chat socket so the web UI can
 		// offer `/` completion. It routes through the same detail handler as the
