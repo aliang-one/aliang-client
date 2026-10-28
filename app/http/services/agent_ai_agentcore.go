@@ -1052,11 +1052,22 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 	// 迟返回时若只比 runSeq，会把新回合的 cancel/activity/guard/done 一并清掉。
 	defer m.markRunGuardDone(run.sessionID, run.runSeq, run.guard)
 
+	// 逐回合诊断快照的落点：内核 OnTurn 写，进度心跳与 journal 终态行读。
+	// 必须先于 ticker 和 cfg 构造创建——两处都引用它。
+	diag := &agentCoreDiagnostics{}
 	// 调用记录落盘（AliangCode 留痕，spec §6）：入口写头行 + 首条 user 行，
 	// 成功出口写 assistant 行，所有出口经 defer 落 end 行。写失败只 Warn。
 	journal := m.coreJournal
 	endStatus, endErrMsg := "error", ""
-	defer func() { journal.appendEnd(run.sessionID, endStatus, endErrMsg) }()
+	defer func() {
+		// 内核终态快照的真因优先：IsError 分支在这里只有笼统的
+		// 「agentcore run failed」，而终止帧带给手机真因的那段文案经 OnTurn
+		// 终态快照回到了宿主——落进 end 行，重开旧会话才能还原「为什么死」。
+		if reason := diag.endReason(); reason != "" && endErrMsg == "agentcore run failed" {
+			endErrMsg = reason
+		}
+		journal.appendEndDiagnostics(run.sessionID, endStatus, endErrMsg, diag)
+	}()
 	now := time.Now().UTC().Format(time.RFC3339)
 	journal.ensureSessionHeader(run.sessionID, run.projectPath, agentCoreModel(run), now)
 	if lastUser, ok := m.lastUserHistoryMessage(run.sessionID); ok {
@@ -1133,6 +1144,9 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 				"message_id":          agentAssistantMessageID(run.messageID),
 				"files_touched_count": touched,
 				"git_changed_count":   countGitChanged(run.projectPath),
+				// 内核逐回合诊断快照（回合数/上下文用量/守卫连击），诊断面板的
+				// 实时数据源。尚无回合时为 nil，键不下发。
+				"diagnostics": diag.payload(),
 			})
 		}
 		for {
@@ -1294,7 +1308,7 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		// 经 newAgentCoreEmit 包装：ctx 取消时关写端解除阻塞，僵尸写侧不再
 		// 挂死消费侧（AI run 韧性 L2）。
 		Emit:  emitFrame,
-		Hooks: agentCoreLoopHooks(m, run),
+		Hooks: agentCoreLoopHooks(m, run, diag),
 	}
 
 	result, runErr := agentcore.Run(ctx, cfg, messages)
@@ -1417,6 +1431,73 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 	_ = writeJSON(done)
 }
 
+// agentCoreDiagnostics 聚合内核逐回合快照（LoopHooks.OnTurn 的落点），供
+// 进度心跳与 journal 终态行消费——诊断面板的数据源。写侧是内核 OnTurn 回调
+// （内核单 goroutine 串行触发），读侧是进度 ticker goroutine，跨 goroutine
+// 用互斥锁保护。
+type agentCoreDiagnostics struct {
+	mu   sync.Mutex
+	snap agentcore.TurnSnapshot
+}
+
+func (d *agentCoreDiagnostics) set(s agentcore.TurnSnapshot) {
+	if d == nil {
+		return
+	}
+	d.mu.Lock()
+	d.snap = s
+	d.mu.Unlock()
+}
+
+// payload 返回进 ai.run.progress 的扁平 diagnostics 字段。尚无任何回合时
+// 返回 nil——不下发空壳字段，心跳负载保持最小。JSON 键与
+// models.AgentVibeDiagnostics 的 json tag 一一对应，手机端两路（实时心跳 /
+// 详情回放）按同一套字段消费。
+func (d *agentCoreDiagnostics) payload() map[string]interface{} {
+	if d == nil {
+		return nil
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	s := d.snap
+	if s.Turns == 0 {
+		return nil
+	}
+	out := map[string]interface{}{
+		"turns":          s.Turns,
+		"context_tokens": s.ContextTokens,
+		"context_window": s.ContextWindow,
+		"dup_streak":     s.DupStreak,
+		"err_streak":     s.ErrStreak,
+		"trunc_streak":   s.TruncStreak,
+		"elapsed_ms":     s.ElapsedMs,
+	}
+	if s.StopReason != "" {
+		out["stop_reason"] = s.StopReason
+	}
+	if s.Terminal {
+		out["terminal"] = true
+		if s.Reason != "" {
+			out["reason"] = s.Reason
+		}
+	}
+	return out
+}
+
+// endReason 返回终态真因（终态快照的 Reason）。journal end 行用它把
+// 「agentcore run failed」这类笼统文案升级成内核给出的真因。
+func (d *agentCoreDiagnostics) endReason() string {
+	if d == nil {
+		return ""
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if !d.snap.Terminal {
+		return ""
+	}
+	return strings.TrimSpace(d.snap.Reason)
+}
+
 // agentCoreLoopHooks 组装内核的循环钩子。
 //
 // steering 与收尾追补共用同一个 drain：前者在**每次** LLM 调用前取走运行中
@@ -1425,7 +1506,8 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 // 下一条消息才被看到（2026-10-26 实测）。两个钩子先到先得，drain 排空队列，
 // 不会重复投递。PrepareRequest / FinishTurn 留空——前者的诉求（改 system /
 // max_tokens）已在 Config 里静态给定，后者没有消费方。
-func agentCoreLoopHooks(m *agentAIManager, run agentAIRun) agentcore.LoopHooks {
+// diag 可为 nil（测试路径）：OnTurn 的 set 对 nil 接收者直接短路。
+func agentCoreLoopHooks(m *agentAIManager, run agentAIRun, diag *agentCoreDiagnostics) agentcore.LoopHooks {
 	// 逐回合 transcript 落 journal 的回合序号（run 内 1 起）。
 	turnN := 0
 	return agentcore.LoopHooks{
@@ -1456,6 +1538,11 @@ func agentCoreLoopHooks(m *agentAIManager, run agentAIRun) agentcore.LoopHooks {
 		// 旧历史重建，压缩白做（而且每轮 run 都会重新烧一次摘要请求）。
 		OnCompact: func(messages []agentcore.Message, info agentcore.CompactInfo) {
 			m.replaceAgentCoreHistory(run.sessionID, run.runSeq, messages)
+		},
+		// 逐回合诊断快照：内核每回合发起请求前、以及终止时把运行状态交给宿主，
+		// 存进 diag 供进度心跳与 journal 终态行消费（诊断面板数据源）。
+		OnTurn: func(snap agentcore.TurnSnapshot) {
+			diag.set(snap)
 		},
 	}
 }
