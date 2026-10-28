@@ -1,7 +1,11 @@
 package services
 
 import (
+	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -11,6 +15,7 @@ import (
 
 	"aliang.one/nursorgate/app/agentcore"
 	auth "aliang.one/nursorgate/processor/auth"
+	"aliang.one/nursorgate/processor/config"
 )
 
 // 内置内核的路由判定。
@@ -324,5 +329,130 @@ func TestBuildAgentCoreApprovalRequestCarriesBoundaryReason(t *testing.T) {
 	run = agentAIRun{}
 	if req := buildCodexApprovalRequest(run, "item/fileChange/requestApproval", map[string]interface{}{"reason": "upstream"}, nil); req.Reason != "upstream" {
 		t.Fatalf("codex 普通审批 reason = %q, want upstream", req.Reason)
+	}
+}
+
+// 内核读取链的显式层(customer.agentcore_llm)。
+//
+// 优先级约定:显式设置 > 继承链(env → settings.json)> 回环闸/兜底。回环闸
+// 只拦**继承链**里意外带进来的远端地址;用户在仪表盘里显式填远端是知情行为,
+// 直接放行。显式 key 不进 token 缓存(改配置下一回合立即生效);显式端点没有
+// 「自愈」概念(POST /api/run/start 拉不活别人的进程),只做拨测。
+
+// setTestGlobalConfigAgentCoreLLM 临时替换带 AgentCoreLLM 的全局配置,还原走
+// t.Cleanup(形状对齐 agent_ai_child_env_test.go 的 setTestGlobalConfigCustomEnv)。
+func setTestGlobalConfigAgentCoreLLM(t *testing.T, llm *config.AgentCoreLLMConfig) {
+	t.Helper()
+	old := config.GetGlobalConfig()
+	next := &config.Config{}
+	if old != nil {
+		*next = *old
+	}
+	next.Customer = &config.CustomerConfig{AgentCoreLLM: llm}
+	t.Cleanup(func() { config.SetGlobalConfig(old) })
+	config.SetGlobalConfig(next)
+}
+
+func isolateAgentCoreBaseURL(t *testing.T) {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir()) // settings.json 缺席,继承链只剩 env
+	t.Setenv("ANTHROPIC_BASE_URL", "")
+}
+
+func TestAgentCoreBaseURLCustomOverridesAll(t *testing.T) {
+	isolateAgentCoreBaseURL(t)
+	t.Setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:9999") // 继承链给的回环值
+	setTestGlobalConfigAgentCoreLLM(t, &config.AgentCoreLLMConfig{
+		Enabled: true, BaseURL: "https://gw.example.com", APIKey: "sk-x",
+	})
+	if got := agentCoreBaseURL(); got != "https://gw.example.com" {
+		t.Errorf("→ %q, want 显式远端地址(绕过回环闸)", got)
+	}
+}
+
+func TestAgentCoreBaseURLCustomDisabledFallsToInheritedGate(t *testing.T) {
+	isolateAgentCoreBaseURL(t)
+	t.Setenv("ANTHROPIC_BASE_URL", "https://api.aliang.one") // 继承链远端:必须被回环闸拒
+	setTestGlobalConfigAgentCoreLLM(t, &config.AgentCoreLLMConfig{Enabled: false})
+	if got := agentCoreBaseURL(); got != agentCoreDefaultBaseURL {
+		t.Errorf("→ %q, want %s(闸语义不变)", got, agentCoreDefaultBaseURL)
+	}
+}
+
+func TestAgentCoreAuthTokenCustomSkipsCacheAndFallback(t *testing.T) {
+	isolateAgentCoreToken(t)
+	calls := stubAgentCoreUserAPIKeys(t, func() ([]auth.UserAPIKey, error) {
+		t.Error("显式 key 存在时不该打 user-center")
+		return nil, nil
+	})
+	setTestGlobalConfigAgentCoreLLM(t, &config.AgentCoreLLMConfig{
+		Enabled: true, BaseURL: "https://gw.example.com", APIKey: " sk-custom ",
+	})
+	if got := agentCoreAuthToken(); got != "sk-custom" {
+		t.Errorf("→ %q, want sk-custom(trim 后)", got)
+	}
+	// 显式 key 不进缓存:改配置立即生效
+	setTestGlobalConfigAgentCoreLLM(t, &config.AgentCoreLLMConfig{
+		Enabled: true, BaseURL: "https://gw.example.com", APIKey: "sk-two",
+	})
+	if got := agentCoreAuthToken(); got != "sk-two" {
+		t.Errorf("→ %q, want sk-two(不走缓存)", got)
+	}
+	if *calls != 0 {
+		t.Errorf("user-center 被调用 %d 次,应为 0", *calls)
+	}
+}
+
+func TestAgentCoreAuthTokenCustomLoopbackNoKeyFallsThrough(t *testing.T) {
+	isolateAgentCoreToken(t)
+	stubAgentCoreUserAPIKeys(t, func() ([]auth.UserAPIKey, error) {
+		return []auth.UserAPIKey{{Key: "sk-user", SecretAvailable: true, Status: "active"}}, nil
+	})
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "") // 隔离 env 继承
+	setTestGlobalConfigAgentCoreLLM(t, &config.AgentCoreLLMConfig{
+		Enabled: true, BaseURL: "http://127.0.0.1:8082", // 回环+无 key:合法,key 落继承链
+	})
+	if got := agentCoreAuthToken(); got != "sk-user" {
+		t.Errorf("→ %q, want sk-user(用户 API key 兜底)", got)
+	}
+}
+
+// 自定义端点拨测:可达 → nil;不可达 → 明确报错(不碰 56432 自愈)。
+func TestAgentCoreEnsureUpstreamCustomEndpoint(t *testing.T) {
+	isolateAgentCoreBaseURL(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer srv.Close()
+	setTestGlobalConfigAgentCoreLLM(t, &config.AgentCoreLLMConfig{Enabled: true, BaseURL: srv.URL})
+	if err := agentCoreEnsureUpstream(context.Background()); err != nil {
+		t.Fatalf("可达端点不应报错: %v", err)
+	}
+
+	setTestGlobalConfigAgentCoreLLM(t, &config.AgentCoreLLMConfig{
+		Enabled: true, BaseURL: "http://127.0.0.1:1",
+	})
+	err := agentCoreEnsureUpstream(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "自定义 LLM 端点不可达") {
+		t.Errorf("→ %v, want 含「自定义 LLM 端点不可达」", err)
+	}
+}
+
+// 无端口 URL 是 UI 示例的主形态(https://your-gateway.example.com):
+// u.Host 不带端口,直接拿去 dial 会报 "missing port in address"。
+// 拨测目标必须补默认端口。
+func TestAgentCoreDialHost(t *testing.T) {
+	cases := []struct{ raw, want string }{
+		{"https://gw.example.com", "gw.example.com:443"},
+		{"http://gw.example.com", "gw.example.com:80"},
+		{"http://127.0.0.1:8082", "127.0.0.1:8082"},
+		{"https://[::1]:9443", "[::1]:9443"},
+	}
+	for _, tc := range cases {
+		u, err := url.Parse(tc.raw)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.raw, err)
+		}
+		if got := agentCoreDialHost(u); got != tc.want {
+			t.Errorf("%s → %q, want %q", tc.raw, got, tc.want)
+		}
 	}
 }

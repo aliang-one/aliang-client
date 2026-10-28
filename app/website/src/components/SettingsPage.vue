@@ -197,6 +197,14 @@
               />
               <AgentScanDirectoriesSettings />
             </div>
+            <AgentCoreSettings
+              :config="customerConfig"
+              :loading="isLoadingCustomerConfig"
+              :saving="isSavingCustomerConfig"
+              :error="customerConfigError"
+              :success-message="customerConfigSuccess"
+              @save="saveCustomerConfig"
+            />
           </template>
         </section>
 
@@ -254,6 +262,8 @@ import AgentActivitySettings from './settings/AgentActivitySettings.vue';
 import AgentScanDirectoriesSettings from './settings/AgentScanDirectoriesSettings.vue';
 import ModelMappingSettings from './settings/ModelMappingSettings.vue';
 import CustomEnvSettings from './settings/CustomEnvSettings.vue';
+import AgentCoreSettings from './settings/AgentCoreSettings.vue';
+import { normalizeAgentCoreLLMConfig, applyAgentCoreLLMClearing } from '../utils/agentCoreSettings';
 import { useNavigation } from '../composables/useNavigation';
 import { openTutorialDocs } from '../composables/useTutorialDocs';
 import { useAuthStore } from '../stores/auth';
@@ -277,6 +287,13 @@ function createDefaultCustomerConfig() {
     custom_env_vars: {
       enable: false,
       vars: {}
+    },
+    // 线格式键 enabled(Go tag),与 normalizeAgentCoreLLMConfig 输出一致——
+    // 不要写 enable,否则 patch 里的布尔会被后端 encoding/json 静默丢弃
+    agentcore_llm: {
+      enabled: false,
+      base_url: '',
+      api_key: ''
     }
   };
 }
@@ -352,7 +369,8 @@ function normalizeCustomerConfig(payload = {}) {
     ai_rules: normalizeAiRules(payload?.ai_rules),
     proxy_rules: normalizeProxyRules(payload?.proxy_rules),
     model_mapping: normalizeModelMappingConfig(payload?.model_mapping),
-    custom_env_vars: normalizeCustomEnvVarsConfig(payload?.custom_env_vars)
+    custom_env_vars: normalizeCustomEnvVarsConfig(payload?.custom_env_vars),
+    agentcore_llm: normalizeAgentCoreLLMConfig(payload?.agentcore_llm)
   };
 }
 
@@ -384,6 +402,8 @@ function buildCustomerConfigPatch(nextConfig, currentConfig) {
       patch.proxy[key] = '';
     }
   }
+
+  applyAgentCoreLLMClearing(patch, normalizedNext.agentcore_llm, normalizedCurrent.agentcore_llm);
 
   return Object.keys(patch).length ? patch : undefined;
 }
@@ -432,7 +452,8 @@ export default {
     AgentActivitySettings,
     AgentScanDirectoriesSettings,
     ModelMappingSettings,
-    CustomEnvSettings
+    CustomEnvSettings,
+    AgentCoreSettings
   },
   setup() {
     const { currentPage, showPage, showDashboard } = useNavigation();
