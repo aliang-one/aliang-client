@@ -1136,8 +1136,11 @@ func (a *agentAIActivity) bump() {
 }
 
 // markProgress records meaningful progress and counts as activity. Callers:
-// emitAIDelta (assistant text/thinking), the run's fileSink (file written or
-// edited), and the Codex item/completed handler (one work unit finished).
+// emitAIDelta (assistant text/thinking), the claude/agentcore thinking stream
+// in emitClaudeStructuredEvents (内核把 thinking_delta 透传成帧后，纯推理期间
+// 这是服务层唯一活性信号——L3 stale 扫描器 5 分钟就判死), the run's fileSink
+// (file written or edited), and the Codex item/completed handler (one work
+// unit finished).
 func (a *agentAIActivity) markProgress() {
 	if a == nil {
 		return
@@ -6423,9 +6426,18 @@ func streamStructuredAIDelta(reader io.Reader, format agentAIOutputFormat, run a
 		// remember the last one to enrich the terminal ai.error with a structured
 		// cause. The CLI's own "Retrying..." text never appears in stream-json, so
 		// this event is the only retry signal available.
+		//
+		// Liveness: an api_retry frame means the provider talked to us and is
+		// retrying — real progress by the same standard as ai.thinking. The
+		// agentcore kernel's retry chain can legally stay silent ~8min worst case
+		// (4 attempts × ResponseHeaderTimeout 120s + backoff), which blows past
+		// the 5min stale threshold; each retry frame must refresh the activity
+		// clock or healthy retrying turns get killed as stalled. Same refresh
+		// extends the steer liveness window, which reads the same idleFor().
 		if format == agentAIOutputClaudeStreamJSON &&
 			remoteString(event, "type") == "system" &&
 			remoteString(event, "subtype") == "api_retry" {
+			run.activity.markProgress()
 			ri := claudeRetryInfo{has: true}
 			if n, ok := event["attempt"].(float64); ok {
 				ri.attempt = int(n)
@@ -6474,6 +6486,25 @@ func streamStructuredAIDelta(reader io.Reader, format agentAIOutputFormat, run a
 				progress["error_type"] = ri.errorType
 			}
 			_ = writeJSON(progress)
+			continue
+		}
+		// agentcore 内核的压缩进度帧：{"type":"system","subtype":
+		// "compact_progress","summary_tokens":N}。压缩期是全程零 delta 的长
+		// 静默（8192 token 的慢摘要在 20-25 tok/s 下超过 5min stale 阈值），
+		// 这帧是服务层唯一活性信号；markProgress 同时刷新 stale 扫描器与
+		// steer 活性窗（同源 idleFor）。与 api_retry 同一套镜像模式。
+		//
+		// 刻意不转发给手机：CLI 路径的压缩提示是 compact_boundary 完成帧
+		// （claudeCompactNotice），手机契约里没有「压缩中」态，转发需要新增
+		// 手机契约字段——按最小改动只做 markProgress + 日志；压缩完成时用户
+		// 仍会收到既有的 compact_boundary 可见提示。
+		if format == agentAIOutputClaudeStreamJSON &&
+			remoteString(event, "type") == "system" &&
+			remoteString(event, "subtype") == "compact_progress" {
+			run.activity.markProgress()
+			logger.Info(fmt.Sprintf(
+				"ai.run.compact_progress: session=%s runSeq=%d summary_tokens=%v",
+				run.sessionID, run.runSeq, event["summary_tokens"]))
 			continue
 		}
 		// Claude steer：第一个 result 事件意味着本 turn 的产出已定稿。

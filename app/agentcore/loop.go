@@ -333,6 +333,12 @@ type runner struct {
 	contextTokens int
 	// autoCompacts 是本 run 内已执行的自动压缩次数，见 maxAutoCompactsPerRun。
 	autoCompacts int
+	// compactCooldown 是自动压缩失败后剩余的免压回合数（>0 时跳过判定，每
+	// 回合递减一次），见 compactFailureCooldownTurns。
+	compactCooldown int
+	// compactFailures 是本 run **连续**自动压缩失败次数（成功清零），达
+	// compactFailureLimit 后本 run 永久禁用自动压缩。
+	compactFailures int
 	// turnFrameEmitted 记录本回合是否已经向 writer 发过事件帧。上下文超限
 	// 压缩重跑只在「本回合零帧」时才安全（否则会重复推送）。每回合在
 	// streamTurn 入口重置。
@@ -624,13 +630,25 @@ func (r *runner) wrapUp(ctx context.Context, reason string) {
 // 触发依据取两者的较大值：本地估算（稳定、但对 tokenizer 只是近似）与上游
 // 上一轮实测的 input_tokens（精确、但滞后一轮）。任一达到阈值的 3/4 就压缩，
 // 留出余量给本轮输出与工具结果。压缩失败不终止 run：宁可带着长上下文继续
-// 跑，也不要因为摘要请求偶发失败而中断用户的对话。
+// 跑，也不要因为摘要请求偶发失败而中断用户的对话。但失败也不能无代价地
+// 每回合重试——历史仍超阈值时每回合都会重新触发判定，原样重试就是「压缩
+// 失败熔炉」（每回合重烧一次全窗口摘要请求），所以失败后有回合级冷却
+// （compactFailureCooldownTurns），连续失败达上限则本 run 禁用自动压缩。
 func (r *runner) maybeAutoCompact(ctx context.Context) {
 	window := r.effectiveContextWindow()
 	if window <= 0 {
 		return
 	}
 	if r.autoCompacts >= maxAutoCompactsPerRun {
+		return
+	}
+	// 连续失败达上限：本 run 不再自动压缩（翻转时的那条日志在失败分支打）。
+	if r.compactFailures >= compactFailureLimit {
+		return
+	}
+	// 冷却期：跳过判定，不烧摘要请求。
+	if r.compactCooldown > 0 {
+		r.compactCooldown--
 		return
 	}
 	threshold := window * autoCompactRatioNum / autoCompactRatioDen
@@ -642,14 +660,36 @@ func (r *runner) maybeAutoCompact(ctx context.Context) {
 		return
 	}
 
-	compacted, info, err := Compact(ctx, r.compactConfig(), r.history, "auto")
+	// 压缩进度 → 宿主活性帧：压缩期是零 delta 的长静默（8192 token 的慢
+	// 摘要在 20-25 tok/s 下超过 5min stale 阈值），没有这帧健康的慢压缩会被
+	// 误杀。帧写失败只记日志，不拖累压缩本身。
+	var compactOpts []CompactOption
+	if r.writer != nil {
+		compactOpts = append(compactOpts, WithCompactProgress(func(summaryTokens int) {
+			if err := r.writer.CompactProgress(summaryTokens); err != nil {
+				r.logf("agentcore: 写 compact_progress 帧失败: %v", err)
+			}
+		}))
+	}
+	compacted, info, err := Compact(ctx, r.compactConfig(), r.history, "auto", compactOpts...)
 	if err != nil {
 		if errors.Is(err, ErrNothingToCompact) {
 			return
 		}
-		r.logf("agentcore: 自动压缩失败，继续使用完整上下文: %v session=%s", err, r.writer.sessionID)
+		r.compactFailures++
+		r.compactCooldown = compactFailureCooldownTurns
+		if r.compactFailures >= compactFailureLimit {
+			r.logf("agentcore: 自动压缩连续失败 %d 次，本次运行不再自动压缩（上下文超限时仍有降级压缩兜底）: %v session=%s",
+				r.compactFailures, err, r.sid())
+			return
+		}
+		r.logf("agentcore: 自动压缩失败，跳过接下来 %d 个回合再试: %v session=%s",
+			r.compactCooldown, err, r.sid())
 		return
 	}
+	// 成功即清零失败与冷却：偶发一次失败不该影响后续的压缩节奏。
+	r.compactFailures = 0
+	r.compactCooldown = 0
 	r.autoCompacts++
 	r.history = compacted
 	r.contextTokens = info.PostTokens
@@ -953,10 +993,27 @@ func (r *runner) streamTurn(ctx context.Context, req *MessagesRequest, writer *s
 			}
 
 		case EventThinking:
-			// thinking 只进本回合缓冲，供 OnTurnEnd 落 journal transcript；不进
-			// blocks（回传需要 signature）、不发 writer（手机不展示 agentcore
-			// thinking，与既有行为一致）。
+			// 思考文本两路分流，都刻意不进 blocks / textAll / turnText
+			// （思考块在上游带 signature，内核不消费 signature_delta，把无
+			// 签名的思考块回传给下一轮请求会被上游拒；宿主也只把 finalized
+			// assistant 帧的 text 块当正文落库，思考内容混进去会污染
+			// transcript 与 result 文本）：
+			//   1. 流式转发宿主（writer 帧 → ai.thinking → 手机渲染思考 +
+			//      服务层 markProgress 喂 L3 stale/steer 活性）——纯推理
+			//      回合不再被 5min 判死；
+			//   2. 进本回合缓冲，OnTurnEnd 落 journal transcript。
 			r.turnThinking.WriteString(ev.Text)
+			if writer != nil {
+				if !started[ev.Index] {
+					started[ev.Index] = true
+					if err := writer.ThinkingBlockStart(ev.Index); err != nil {
+						return err
+					}
+				}
+				if err := writer.ThinkingDelta(ev.Index, ev.Text); err != nil {
+					return err
+				}
+			}
 
 		case EventImage:
 			ensureIndex(ev.Index)
@@ -1043,7 +1100,22 @@ func (r *runner) streamTurn(ctx context.Context, req *MessagesRequest, writer *s
 			return ev.Err
 		}
 		return nil
-	})
+	},
+		// 重试可观测：上游瞬态失败、内核即将重试时发一帧 system/api_retry。
+		// 没有它，重试链（最坏 4×120s + 退避 ≈ 8min）在宿主看来就是纯静默，
+		// 会被 stale 扫描器 5min 判死；帧形对齐真 claude-code，宿主 decoder
+		// 既有处理直接生效（markProgress + ai.run.progress）。
+		WithRetryNotice(func(n RetryNotice) {
+			if writer == nil {
+				return
+			}
+			// emit 管道写失败意味着宿主侧已不在读（或已收尾）：这一帧丢了
+			// 无可挽回，也不该为一个观测帧中止回合本身——记一笔，继续重试。
+			if err := writer.RetryNotice(n); err != nil {
+				r.logf("agentcore: 写 api_retry 帧失败 (attempt=%d): %v", n.Attempt, err)
+			}
+		}),
+	)
 	if err != nil {
 		return nil, "", err
 	}
