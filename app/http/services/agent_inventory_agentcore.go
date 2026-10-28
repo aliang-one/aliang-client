@@ -98,6 +98,9 @@ func readAgentCoreSessionMetaWithOptions(path string, options agentVibeSessionRe
 			Tool        string `json:"tool"`
 			Summary     string `json:"summary"`
 			Ts          string `json:"ts"`
+			Status      string                 `json:"status"`
+			Error       string                 `json:"error"`
+			Diagnostics map[string]interface{} `json:"diagnostics"`
 		}
 		if err := json.Unmarshal(line, &row); err != nil {
 			return true // 半行容忍：跳过损坏行
@@ -170,6 +173,17 @@ func readAgentCoreSessionMetaWithOptions(path string, options agentVibeSessionRe
 				Timestamp: normalizeAgentTime(row.Ts),
 				Index:     transcriptRow - 1,
 			})
+		case "end":
+			// 终态行：失败真因 + 诊断块。诊断面板据此在重开旧会话时还原「这一轮
+			// 为什么死」。行按序追加，多次 run 时最后一次 end 胜出。
+			// 注意不写 session.Status：那是列表视图的既有契约（默认 "closed"，手
+			// 机按它映射），单次 run 的终态语义收进 Diagnostics.Status，两套口径
+			// 不互相污染。
+			// 不置 parsedAny：只有 end 行的文件（头行丢失的边缘形态）不应凭空
+			// 造出 0 消息的幽灵卡——end 行只 enrich 已解析的会话。
+			if row.Error != "" || len(row.Diagnostics) > 0 {
+				session.Diagnostics = newAgentVibeDiagnosticsFromEndRow(row.Status, row.Error, row.Diagnostics)
+			}
 		}
 		return true
 	})
@@ -202,4 +216,36 @@ func readAgentCoreSessionMetaWithOptions(path string, options agentVibeSessionRe
 		session.UpdatedAt = fileUpdatedAt(path)
 	}
 	return session
+}
+
+// newAgentVibeDiagnosticsFromEndRow 把 journal end 行的散字段折叠成诊断结构。
+// json.Unmarshal 到 map 的数值恒为 float64、其余为 string/bool，逐键缺省容忍
+// ——旧行没有 diagnostics 键时只有 Status/Error 有值，照样成卡。
+func newAgentVibeDiagnosticsFromEndRow(status, errMsg string, raw map[string]interface{}) *models.AgentVibeDiagnostics {
+	d := &models.AgentVibeDiagnostics{Status: status, Error: errMsg}
+	num := func(key string) float64 {
+		if v, ok := raw[key].(float64); ok {
+			return v
+		}
+		return 0
+	}
+	str := func(key string) string {
+		if v, ok := raw[key].(string); ok {
+			return v
+		}
+		return ""
+	}
+	d.Turns = int(num("turns"))
+	d.ContextTokens = int(num("context_tokens"))
+	d.ContextWindow = int(num("context_window"))
+	d.DupStreak = int(num("dup_streak"))
+	d.ErrStreak = int(num("err_streak"))
+	d.TruncStreak = int(num("trunc_streak"))
+	d.ElapsedMs = int64(num("elapsed_ms"))
+	d.StopReason = str("stop_reason")
+	d.Reason = str("reason")
+	if v, ok := raw["terminal"].(bool); ok {
+		d.Terminal = v
+	}
+	return d
 }

@@ -98,6 +98,38 @@ type LoopHooks struct {
 	// 宿主据此把会话 history 落成新形状（否则下一轮 run 又从旧历史重建，
 	// 压缩白做）。
 	OnCompact func([]Message, CompactInfo)
+
+	// OnTurn 在每个回合发起 LLM 请求前触发（压缩修正之后），以及 run 终止时
+	// 触发一次终态快照，携带本 run 至此的诊断数据：回合数、上下文用量、三个
+	// 无进展守卫的连击计数。宿主用它驱动手机端诊断面板——这些数据过去只在
+	// run 结束时经 RunResult 一次性暴露，「正在第几轮、上下文用了多少、离
+	// 被判死还有多远」面板全拿不到。参数是值拷贝，宿主可以随便存。可为 nil。
+	OnTurn func(TurnSnapshot)
+}
+
+// TurnSnapshot 是一次 run 的逐回合诊断快照（OnTurn 的参数）。
+type TurnSnapshot struct {
+	// Turns 是已开始的回合数（从 1 计）。
+	Turns int
+	// ContextTokens 是最近一次上游报告的本轮输入 token 数（含缓存读写），
+	// 自动压缩后为压缩后的估算值。0 表示还没有任何上游用量数据。
+	ContextTokens int
+	// ContextWindow 是本 run 的有效上下文窗口（手机选定值或内核兜底）。
+	ContextWindow int
+	// DupStreak / ErrStreak / TruncStreak 是三个无进展守卫的当前连击计数，
+	// 供面板展示「离被判死还有多远」。
+	DupStreak   int
+	ErrStreak   int
+	TruncStreak int
+	// StopReason 是最近一个回合的停止原因（回合快照时点为上一回合的值）。
+	StopReason string
+	// Terminal 为 true 表示这是终止快照：Reason 是终止真因，与终止帧带给
+	// 手机的文案同源。每个 run 恰好一次。
+	Terminal bool
+	// Reason 是终止真因文本（仅终态快照非空）。
+	Reason string
+	// ElapsedMs 是 run 已耗时（毫秒）。
+	ElapsedMs int64
 }
 
 // TurnResult 是一个回合的结果。
@@ -386,6 +418,10 @@ func (r *runner) loop(ctx context.Context) (*RunResult, error) {
 		// 上下文接近窗口上限时先压缩，再发请求。放在 steering 之后：刚插进来
 		// 的话必须留在保留的原文尾部，而不是被折叠进摘要。
 		r.maybeAutoCompact(ctx)
+
+		// 逐回合诊断快照：此刻 contextTokens 已含压缩修正，是「即将发出去的
+		// 上下文规模」最接近的真值。
+		r.fireOnTurn(false, "")
 
 		req := r.buildRequest()
 		if r.cfg.Hooks.PrepareRequest != nil {
@@ -1127,6 +1163,31 @@ func (r *runner) fireFinishTurn(stopReason string) {
 	})
 }
 
+// fireOnTurn 调用 OnTurn 钩子，携带当前诊断快照。terminal=true 表示终态快照
+// （每个 run 经 finish 恰好触发一次，Reason 为终止真因）。
+func (r *runner) fireOnTurn(terminal bool, reason string) {
+	// cfg 可能为 nil：直构造 runner 的测试路径（newTestRunner 单独驱动
+	// finish）没有 cfg，容忍之。
+	if r.cfg == nil || r.cfg.Hooks.OnTurn == nil {
+		return
+	}
+	if r.startedAt.IsZero() {
+		r.startedAt = time.Now()
+	}
+	r.cfg.Hooks.OnTurn(TurnSnapshot{
+		Turns:         r.turns,
+		ContextTokens: r.contextTokens,
+		ContextWindow: r.effectiveContextWindow(),
+		DupStreak:     r.dupStreak,
+		ErrStreak:     r.errStreak,
+		TruncStreak:   r.truncStreak,
+		StopReason:    r.stopLast,
+		Terminal:      terminal,
+		Reason:        reason,
+		ElapsedMs:     time.Since(r.startedAt).Milliseconds(),
+	})
+}
+
 // finishWithErr 按 ctx 状态选终止语义：被取消 → interrupted（非错误），
 // 其余 → error_during_execution（错误）。
 //
@@ -1156,6 +1217,10 @@ func (r *runner) finishWithErr(ctx context.Context, prefix string, runErr error)
 // 全文 —— 手机上表现为整轮回复再刷一遍、落库消息双份。与 fireFinishTurn
 // 的「只传本回合」是同一个理由。
 func (r *runner) finish(_ context.Context, subtype, errText string, isError bool, runErr error) (*RunResult, error) {
+	// 终态诊断快照先于终止帧发出：宿主据此把回合数/上下文规模/终止真因落进
+	// journal end 行与诊断面板。所有终止路径（成功/守卫判死/流式失败/取消）
+	// 都汇入 finish，这里是唯一需要触发的地方。
+	r.fireOnTurn(true, errText)
 	if r.writer != nil {
 		text := r.turnText.String()
 		if isError && errText != "" {

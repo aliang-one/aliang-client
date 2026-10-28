@@ -141,6 +141,13 @@ func (j *agentCoreJournal) appendMsg(sessionID, role, messageID, text, ts string
 
 // appendEnd 落 run 终态行。status ∈ success|stopped|error。
 func (j *agentCoreJournal) appendEnd(sessionID, status, errMsg string) {
+	j.appendEndDiagnostics(sessionID, status, errMsg, nil)
+}
+
+// appendEndDiagnostics 落带诊断块的 run 终态行：diagnostics 里带回合数、
+// 上下文规模、守卫连击与终止真因，诊断面板据此在重开旧会话时还原「这一轮
+// 为什么死」。写失败与 appendEnd 家族同款吞掉。
+func (j *agentCoreJournal) appendEndDiagnostics(sessionID, status, errMsg string, diag *agentCoreDiagnostics) {
 	if j == nil || j.dir == "" || strings.TrimSpace(sessionID) == "" {
 		return
 	}
@@ -153,6 +160,9 @@ func (j *agentCoreJournal) appendEnd(sessionID, status, errMsg string) {
 	}
 	if errMsg != "" {
 		row["error"] = errMsg
+	}
+	if payload := diag.payload(); payload != nil {
+		row["diagnostics"] = payload
 	}
 	j.appendLineLocked(sessionID, row)
 }
