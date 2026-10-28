@@ -745,7 +745,9 @@ func readAgentCoreJournalRows(t *testing.T, sessionID string) []map[string]inter
 }
 
 // TestRunAgentCoreJournalsTranscript 端到端：一次成功 run 必须留下
-// 头行 + user 行 + assistant 行 + end(success)，顺序固定。
+// 头行 + user 行 + turn 行（逐回合 transcript）+ assistant 行 + end(success)。
+// turn 行是本回合 assistant 完整文本/thinking 的留档，与 run 末整轮累计的
+// assistant 行并存——前者给「完整对话」复盘，后者给仪表盘消息气泡。
 func TestRunAgentCoreJournalsTranscript(t *testing.T) {
 	setTestAgentHome(t)
 	up, srv := newAgentCoreUpstream(t, agentCoreTextTurn("你好", "，世界"))
@@ -773,8 +775,8 @@ func TestRunAgentCoreJournalsTranscript(t *testing.T) {
 	m.runAgentCore(context.Background(), run, log.write)
 
 	lines := readAgentCoreJournalRows(t, sessionID)
-	if len(lines) != 4 {
-		t.Fatalf("journal 行数 = %d, want 4: %v", len(lines), lines)
+	if len(lines) != 5 {
+		t.Fatalf("journal 行数 = %d, want 5: %v", len(lines), lines)
 	}
 	if lines[0]["kind"] != "session" || lines[0]["model"] != "glm-5.2" {
 		t.Errorf("头行 = %v", lines[0])
@@ -782,11 +784,15 @@ func TestRunAgentCoreJournalsTranscript(t *testing.T) {
 	if lines[1]["role"] != "user" || lines[1]["text"] != "打个招呼" {
 		t.Errorf("user 行 = %v（必须是 history 里的真实用户 content）", lines[1])
 	}
-	if lines[2]["role"] != "assistant" || lines[2]["text"] != "你好，世界" {
-		t.Errorf("assistant 行 = %v", lines[2])
+	// turn 行：本回合 assistant 完整文本。
+	if lines[2]["kind"] != "turn" || lines[2]["text"] != "你好，世界" || lines[2]["turn"] != float64(1) {
+		t.Errorf("turn 行 = %v（逐回合 transcript）", lines[2])
 	}
-	if lines[3]["kind"] != "end" || lines[3]["status"] != "success" {
-		t.Errorf("end 行 = %v", lines[3])
+	if lines[3]["role"] != "assistant" || lines[3]["text"] != "你好，世界" {
+		t.Errorf("assistant 行 = %v", lines[3])
+	}
+	if lines[4]["kind"] != "end" || lines[4]["status"] != "success" {
+		t.Errorf("end 行 = %v", lines[4])
 	}
 	_ = up
 }

@@ -157,6 +157,44 @@ func (j *agentCoreJournal) appendEnd(sessionID, status, errMsg string) {
 	j.appendLineLocked(sessionID, row)
 }
 
+// appendAssistantTurn 落逐回合 transcript 行（kind=turn）：本回合 assistant
+// 的完整文本 + thinking + 停止原因 + 本回合发起的工具名。这是「完整对话」
+// 留档的核心——run 末的 appendAssistant 只写整轮累计的最终输出，会丢掉
+// 工具调用之间的中间叙述与 thinking；本函数每回合一行把它们补齐。
+//
+// 与 appendMsg 的去重无关：每回合必然一条（回合序号 turn 单调递增），不需要
+// 去重键。读侧（agent_inventory_agentcore）目前只认 session/msg/tool 三类，
+// 未知 kind 直接跳过，故新增 turn 行对仪表盘回放无副作用、向后兼容。
+//
+// 空回合（text/thinking 都空且无工具）不落，避免无意义空行。写失败只 Warn。
+func (j *agentCoreJournal) appendAssistantTurn(sessionID string, turn int, text, thinking, stopReason string, tools []string) {
+	if j == nil || j.dir == "" || strings.TrimSpace(sessionID) == "" {
+		return
+	}
+	if strings.TrimSpace(text) == "" && strings.TrimSpace(thinking) == "" && len(tools) == 0 {
+		return
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	row := map[string]interface{}{
+		"kind":        "turn",
+		"turn":        turn,
+		"role":        "assistant",
+		"stop_reason": stopReason,
+		"ts":          time.Now().UTC().Format(time.RFC3339),
+	}
+	if text != "" {
+		row["text"] = text
+	}
+	if thinking != "" {
+		row["thinking"] = thinking
+	}
+	if len(tools) > 0 {
+		row["tools"] = tools
+	}
+	j.appendLineLocked(sessionID, row)
+}
+
 // appendTool 落 journal v2 工具行（kind=tool）。不参与 message_id 去重：
 // 每次调用一行，是轨迹不是消息。写失败 Warn 吞掉。守卫与 appendEnd 家族
 // 同款（nil/dir 空/sessionID 空直接返回）。

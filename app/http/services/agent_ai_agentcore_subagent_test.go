@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -158,7 +159,13 @@ func TestAgentCoreSubagentBridgeDepthOne(t *testing.T) {
 	if _, ok := reg.Get("reviewer"); ok {
 		t.Fatalf("子 registry 不得包含子 agent 桥（depth=1 结构保证）")
 	}
-	for _, name := range []string{"Read", "Write", "Edit", "Bash", "PowerShell", "Grep", "Glob", "LS"} {
+	// PowerShell 仅在 Windows 注册（DefaultRegistry 按 runtime.GOOS 裁剪），
+	// 期望表必须同口径，否则非 Windows 平台永远红。
+	want := []string{"Read", "Write", "Edit", "Bash", "Grep", "Glob", "LS"}
+	if runtime.GOOS == "windows" {
+		want = append(want, "PowerShell")
+	}
+	for _, name := range want {
 		if _, ok := reg.Get(name); !ok {
 			t.Fatalf("子 registry 应含内置 %s", name)
 		}
