@@ -104,6 +104,38 @@ type LoopHooks struct {
 	// 宿主据此把会话 history 落成新形状（否则下一轮 run 又从旧历史重建，
 	// 压缩白做）。
 	OnCompact func([]Message, CompactInfo)
+
+	// OnTurn 在每个回合发起 LLM 请求前触发（压缩修正之后），以及 run 终止时
+	// 触发一次终态快照，携带本 run 至此的诊断数据：回合数、上下文用量、三个
+	// 无进展守卫的连击计数。宿主用它驱动手机端诊断面板——这些数据过去只在
+	// run 结束时经 RunResult 一次性暴露，「正在第几轮、上下文用了多少、离
+	// 被判死还有多远」面板全拿不到。参数是值拷贝，宿主可以随便存。可为 nil。
+	OnTurn func(TurnSnapshot)
+}
+
+// TurnSnapshot 是一次 run 的逐回合诊断快照（OnTurn 的参数）。
+type TurnSnapshot struct {
+	// Turns 是已开始的回合数（从 1 计）。
+	Turns int
+	// ContextTokens 是最近一次上游报告的本轮输入 token 数（含缓存读写），
+	// 自动压缩后为压缩后的估算值。0 表示还没有任何上游用量数据。
+	ContextTokens int
+	// ContextWindow 是本 run 的有效上下文窗口（手机选定值或内核兜底）。
+	ContextWindow int
+	// DupStreak / ErrStreak / TruncStreak 是三个无进展守卫的当前连击计数，
+	// 供面板展示「离被判死还有多远」。
+	DupStreak   int
+	ErrStreak   int
+	TruncStreak int
+	// StopReason 是最近一个回合的停止原因（回合快照时点为上一回合的值）。
+	StopReason string
+	// Terminal 为 true 表示这是终止快照：Reason 是终止真因，与终止帧带给
+	// 手机的文案同源。每个 run 恰好一次。
+	Terminal bool
+	// Reason 是终止真因文本（仅终态快照非空）。
+	Reason string
+	// ElapsedMs 是 run 已耗时（毫秒）。
+	ElapsedMs int64
 }
 
 // TurnResult 是一个回合的结果。
@@ -333,6 +365,12 @@ type runner struct {
 	contextTokens int
 	// autoCompacts 是本 run 内已执行的自动压缩次数，见 maxAutoCompactsPerRun。
 	autoCompacts int
+	// compactCooldown 是自动压缩失败后剩余的免压回合数（>0 时跳过判定，每
+	// 回合递减一次），见 compactFailureCooldownTurns。
+	compactCooldown int
+	// compactFailures 是本 run **连续**自动压缩失败次数（成功清零），达
+	// compactFailureLimit 后本 run 永久禁用自动压缩。
+	compactFailures int
 	// turnFrameEmitted 记录本回合是否已经向 writer 发过事件帧。上下文超限
 	// 压缩重跑只在「本回合零帧」时才安全（否则会重复推送）。每回合在
 	// streamTurn 入口重置。
@@ -408,6 +446,10 @@ func (r *runner) loop(ctx context.Context) (*RunResult, error) {
 		// 上下文接近窗口上限时先压缩，再发请求。放在 steering 之后：刚插进来
 		// 的话必须留在保留的原文尾部，而不是被折叠进摘要。
 		r.maybeAutoCompact(ctx)
+
+		// 逐回合诊断快照：此刻 contextTokens 已含压缩修正，是「即将发出去的
+		// 上下文规模」最接近的真值。
+		r.fireOnTurn(false, "")
 
 		req := r.buildRequest()
 		if r.cfg.Hooks.PrepareRequest != nil {
@@ -624,13 +666,25 @@ func (r *runner) wrapUp(ctx context.Context, reason string) {
 // 触发依据取两者的较大值：本地估算（稳定、但对 tokenizer 只是近似）与上游
 // 上一轮实测的 input_tokens（精确、但滞后一轮）。任一达到阈值的 3/4 就压缩，
 // 留出余量给本轮输出与工具结果。压缩失败不终止 run：宁可带着长上下文继续
-// 跑，也不要因为摘要请求偶发失败而中断用户的对话。
+// 跑，也不要因为摘要请求偶发失败而中断用户的对话。但失败也不能无代价地
+// 每回合重试——历史仍超阈值时每回合都会重新触发判定，原样重试就是「压缩
+// 失败熔炉」（每回合重烧一次全窗口摘要请求），所以失败后有回合级冷却
+// （compactFailureCooldownTurns），连续失败达上限则本 run 禁用自动压缩。
 func (r *runner) maybeAutoCompact(ctx context.Context) {
 	window := r.effectiveContextWindow()
 	if window <= 0 {
 		return
 	}
 	if r.autoCompacts >= maxAutoCompactsPerRun {
+		return
+	}
+	// 连续失败达上限：本 run 不再自动压缩（翻转时的那条日志在失败分支打）。
+	if r.compactFailures >= compactFailureLimit {
+		return
+	}
+	// 冷却期：跳过判定，不烧摘要请求。
+	if r.compactCooldown > 0 {
+		r.compactCooldown--
 		return
 	}
 	threshold := window * autoCompactRatioNum / autoCompactRatioDen
@@ -642,14 +696,36 @@ func (r *runner) maybeAutoCompact(ctx context.Context) {
 		return
 	}
 
-	compacted, info, err := Compact(ctx, r.compactConfig(), r.history, "auto")
+	// 压缩进度 → 宿主活性帧：压缩期是零 delta 的长静默（8192 token 的慢
+	// 摘要在 20-25 tok/s 下超过 5min stale 阈值），没有这帧健康的慢压缩会被
+	// 误杀。帧写失败只记日志，不拖累压缩本身。
+	var compactOpts []CompactOption
+	if r.writer != nil {
+		compactOpts = append(compactOpts, WithCompactProgress(func(summaryTokens int) {
+			if err := r.writer.CompactProgress(summaryTokens); err != nil {
+				r.logf("agentcore: 写 compact_progress 帧失败: %v", err)
+			}
+		}))
+	}
+	compacted, info, err := Compact(ctx, r.compactConfig(), r.history, "auto", compactOpts...)
 	if err != nil {
 		if errors.Is(err, ErrNothingToCompact) {
 			return
 		}
-		r.logf("agentcore: 自动压缩失败，继续使用完整上下文: %v session=%s", err, r.writer.sessionID)
+		r.compactFailures++
+		r.compactCooldown = compactFailureCooldownTurns
+		if r.compactFailures >= compactFailureLimit {
+			r.logf("agentcore: 自动压缩连续失败 %d 次，本次运行不再自动压缩（上下文超限时仍有降级压缩兜底）: %v session=%s",
+				r.compactFailures, err, r.sid())
+			return
+		}
+		r.logf("agentcore: 自动压缩失败，跳过接下来 %d 个回合再试: %v session=%s",
+			r.compactCooldown, err, r.sid())
 		return
 	}
+	// 成功即清零失败与冷却：偶发一次失败不该影响后续的压缩节奏。
+	r.compactFailures = 0
+	r.compactCooldown = 0
 	r.autoCompacts++
 	r.history = compacted
 	r.contextTokens = info.PostTokens
@@ -953,10 +1029,27 @@ func (r *runner) streamTurn(ctx context.Context, req *MessagesRequest, writer *s
 			}
 
 		case EventThinking:
-			// thinking 只进本回合缓冲，供 OnTurnEnd 落 journal transcript；不进
-			// blocks（回传需要 signature）、不发 writer（手机不展示 agentcore
-			// thinking，与既有行为一致）。
+			// 思考文本两路分流，都刻意不进 blocks / textAll / turnText
+			// （思考块在上游带 signature，内核不消费 signature_delta，把无
+			// 签名的思考块回传给下一轮请求会被上游拒；宿主也只把 finalized
+			// assistant 帧的 text 块当正文落库，思考内容混进去会污染
+			// transcript 与 result 文本）：
+			//   1. 流式转发宿主（writer 帧 → ai.thinking → 手机渲染思考 +
+			//      服务层 markProgress 喂 L3 stale/steer 活性）——纯推理
+			//      回合不再被 5min 判死；
+			//   2. 进本回合缓冲，OnTurnEnd 落 journal transcript。
 			r.turnThinking.WriteString(ev.Text)
+			if writer != nil {
+				if !started[ev.Index] {
+					started[ev.Index] = true
+					if err := writer.ThinkingBlockStart(ev.Index); err != nil {
+						return err
+					}
+				}
+				if err := writer.ThinkingDelta(ev.Index, ev.Text); err != nil {
+					return err
+				}
+			}
 
 		case EventImage:
 			ensureIndex(ev.Index)
@@ -1043,7 +1136,22 @@ func (r *runner) streamTurn(ctx context.Context, req *MessagesRequest, writer *s
 			return ev.Err
 		}
 		return nil
-	})
+	},
+		// 重试可观测：上游瞬态失败、内核即将重试时发一帧 system/api_retry。
+		// 没有它，重试链（最坏 4×120s + 退避 ≈ 8min）在宿主看来就是纯静默，
+		// 会被 stale 扫描器 5min 判死；帧形对齐真 claude-code，宿主 decoder
+		// 既有处理直接生效（markProgress + ai.run.progress）。
+		WithRetryNotice(func(n RetryNotice) {
+			if writer == nil {
+				return
+			}
+			// emit 管道写失败意味着宿主侧已不在读（或已收尾）：这一帧丢了
+			// 无可挽回，也不该为一个观测帧中止回合本身——记一笔，继续重试。
+			if err := writer.RetryNotice(n); err != nil {
+				r.logf("agentcore: 写 api_retry 帧失败 (attempt=%d): %v", n.Attempt, err)
+			}
+		}),
+	)
 	if err != nil {
 		return nil, "", err
 	}
@@ -1189,6 +1297,31 @@ func (r *runner) fireFinishTurn(stopReason string) {
 	})
 }
 
+// fireOnTurn 调用 OnTurn 钩子，携带当前诊断快照。terminal=true 表示终态快照
+// （每个 run 经 finish 恰好触发一次，Reason 为终止真因）。
+func (r *runner) fireOnTurn(terminal bool, reason string) {
+	// cfg 可能为 nil：直构造 runner 的测试路径（newTestRunner 单独驱动
+	// finish）没有 cfg，容忍之。
+	if r.cfg == nil || r.cfg.Hooks.OnTurn == nil {
+		return
+	}
+	if r.startedAt.IsZero() {
+		r.startedAt = time.Now()
+	}
+	r.cfg.Hooks.OnTurn(TurnSnapshot{
+		Turns:         r.turns,
+		ContextTokens: r.contextTokens,
+		ContextWindow: r.effectiveContextWindow(),
+		DupStreak:     r.dupStreak,
+		ErrStreak:     r.errStreak,
+		TruncStreak:   r.truncStreak,
+		StopReason:    r.stopLast,
+		Terminal:      terminal,
+		Reason:        reason,
+		ElapsedMs:     time.Since(r.startedAt).Milliseconds(),
+	})
+}
+
 // fireOnTurnEnd 调用 OnTurnEnd 钩子，每回合都发（含带工具调用的回合），
 // 供宿主把逐回合 assistant 文本/thinking 完整落 journal。只传本回合的
 // toolUses（不是累计的 r.toolCalls），与 FinishTurn 同理避免调用方重复处理。
@@ -1242,6 +1375,10 @@ func (r *runner) finishWithErr(ctx context.Context, prefix string, runErr error)
 // 全文 —— 手机上表现为整轮回复再刷一遍、落库消息双份。与 fireFinishTurn
 // 的「只传本回合」是同一个理由。
 func (r *runner) finish(_ context.Context, subtype, errText string, isError bool, runErr error) (*RunResult, error) {
+	// 终态诊断快照先于终止帧发出：宿主据此把回合数/上下文规模/终止真因落进
+	// journal end 行与诊断面板。所有终止路径（成功/守卫判死/流式失败/取消）
+	// 都汇入 finish，这里是唯一需要触发的地方。
+	r.fireOnTurn(true, errText)
 	if r.writer != nil {
 		text := r.turnText.String()
 		if isError && errText != "" {
