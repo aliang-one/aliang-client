@@ -35,6 +35,11 @@ describe('validateAgentCoreLLMConfig', () => {
     expect(validateAgentCoreLLMConfig({ enable: true, baseUrl: 'https://gw.example.com', apiKey: 'sk-x' }))
       .toBe('');
   });
+
+  it('启用+非 http/https 协议拒', () => {
+    expect(validateAgentCoreLLMConfig({ enable: true, baseUrl: 'ftp://gw.example.com', apiKey: 'k' }))
+      .toBe('agentCore_error_scheme');
+  });
 });
 
 describe('normalizeAgentCoreLLMConfig', () => {
