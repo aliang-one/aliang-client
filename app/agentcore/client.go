@@ -550,11 +550,16 @@ func parseSSE(ctx context.Context, r io.Reader, onEvent func(StreamEvent) error)
 				terminated = true
 				return nil
 			}
-			// message_delta 的非空 stop_reason 与 message_stop 同属终点信号
-			// （同一个判据，供 EOF 侧判断「流有没有正常收尾」）。这里只记账、
-			// 不早退：以它提前收口属于半开停滞治理，另行处理。
+			// message_delta 携带非空 stop_reason 与 message_stop 同属终点信号，
+			// 且以此处为终止判据收口、不等 message_stop。协议顺序上 message_delta
+			// 在所有内容块之后（tool_use 的 input_json_delta、thinking 的
+			// signature_delta 都已在各自的 content_block_stop 前发完），此刻内容
+			// 已经 100% 收全。半开的另一种形态正是：上游发完终点信号后连接停滞、
+			// 既不发 message_stop 也不断开——继续读只会被块间空闲闸在 90s 后判成
+			// 停滞，把用户已经看到完整回答的回合误杀成红色错误。
 			if ev.Type == "message_delta" && ev.Delta != nil && strings.TrimSpace(ev.Delta.StopReason) != "" {
 				terminated = true
+				return nil
 			}
 			// error 事件是显式失败的终局：结局已经告知调用方，EOF 不该再往
 			// 上面叠一层「未终止」。
