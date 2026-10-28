@@ -3848,6 +3848,7 @@ func (m *agentAIManager) handleClaudeApprovalHook(ctx context.Context, sessionID
 	// （command 逐字 / tool 按名，见 agent_ai_session_approvals.go）选过
 	// accept_for_session 的直接放行，不再问手机。provider 取请求对象自身，
 	// 与 approval() 记录点存的 waiter.request.Provider 对齐。
+	// double build intentional: hit path stays branch-free
 	if preReq := buildClaudeApprovalRequest(run, raw); m.sessionApprovalAllows(sessionID, preReq.Provider, preReq.Kind, preReq.ToolName, preReq.Command) {
 		logger.Info(fmt.Sprintf("approval-hook: SESSION-APPROVED (memory) tool=%s kind=%s session=%s", preReq.ToolName, preReq.Kind, sessionID))
 		return claudeApprovalHookDecision(hookEventName, true, "approved for this session"), nil

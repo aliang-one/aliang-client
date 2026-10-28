@@ -203,3 +203,56 @@ func TestApprovalRequestCarriesExpiresAt(t *testing.T) {
 	delete(m.approvals, agentAIApprovalMapKey("s-exp", "a-exp"))
 	m.mu.Unlock()
 }
+
+// TestApprovalAcceptForSessionRecordsMemory 验证 approval() 记录点（spec §4.2.4）：
+// accept_for_session 落会话级批准记忆、普通 accept 不落；首笔记忆在同会话
+// 后续同键请求上持续可用（agent_ai_session_approvals.go）。
+func TestApprovalAcceptForSessionRecordsMemory(t *testing.T) {
+	m := newTestAISocketsManager(t)
+	register := func(sessionID, approvalID string) chan agentAIApprovalResponse {
+		// registerApprovalAckFixture 同款（该 fixture 的 request 是空壳，这里要
+		// 填 Provider/Kind/ToolName 才能验记忆键），writeJSON 传 nil（ack 各
+		// return 路径均有 nil 守卫，无 run socket 时双写自动跳过）。
+		respond := make(chan agentAIApprovalResponse, 1)
+		m.mu.Lock()
+		m.approvals[agentAIApprovalMapKey(sessionID, approvalID)] = &agentAIApprovalWaiter{
+			sessionID: sessionID,
+			runSeq:    1,
+			request: agentAIApprovalRequest{
+				ID:       approvalID,
+				Provider: "codex",
+				Kind:     models.AgentAIApprovalKindTool,
+				ToolName: "mcp__x__y",
+				respond:  respond,
+			},
+		}
+		m.mu.Unlock()
+		return respond
+	}
+	decide := func(sessionID, approvalID, decision string) chan agentAIApprovalResponse {
+		respond := register(sessionID, approvalID)
+		m.approval(map[string]interface{}{
+			"type": models.AgentEventAIApprovalResponse, "session_id": sessionID,
+			"approval_id": approvalID, "decision": decision,
+		}, nil)
+		return respond
+	}
+
+	// s1: accept_for_session → 落记忆、同键命中。
+	if got := <-decide("s1", "a1", models.AgentAIApprovalDecisionAcceptForSession); got.Decision != models.AgentAIApprovalDecisionAcceptForSession {
+		t.Fatalf("决策未送达 waiter: %+v", got)
+	}
+	if !m.sessionApprovalAllows("s1", "codex", models.AgentAIApprovalKindTool, "mcp__x__y", "") {
+		t.Fatal("accept_for_session 应落会话记忆")
+	}
+	// 同会话第二笔普通 accept：不叠加记录，首笔记忆仍命中。
+	<-decide("s1", "a2", models.AgentAIApprovalDecisionAccept)
+	if !m.sessionApprovalAllows("s1", "codex", models.AgentAIApprovalKindTool, "mcp__x__y", "") {
+		t.Fatal("首笔记忆应持续命中")
+	}
+	// 新会话只有普通 accept：不落记忆。
+	<-decide("s2", "a3", models.AgentAIApprovalDecisionAccept)
+	if m.sessionApprovalAllows("s2", "codex", models.AgentAIApprovalKindTool, "mcp__x__y", "") {
+		t.Fatal("普通 accept 不应落会话记忆")
+	}
+}

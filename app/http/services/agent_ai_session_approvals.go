@@ -29,10 +29,16 @@ const (
 	agentAISessionApprovalKeyCap     = 64
 )
 
-// agentAISessionApprovalKey 计算一次审批请求的会话级匹配键。
+// agentAISessionApprovalKey 计算一次审批请求的会话级匹配键；无法构造精确键
+// 时返回 ""（调用方拒绝记录/放行）。
 func agentAISessionApprovalKey(kind, toolName, command string) string {
 	if kind == models.AgentAIApprovalKindCommand && strings.TrimSpace(command) != "" {
 		return "cmd:" + strings.TrimSpace(command)
+	}
+	// codex fileChange 请求不带 ToolName——通配键会让一次放行免审全会话所有
+	// 文件变更，宁可逐次问；claude/agentcore 的 tool_name 恒有名，不受影响。
+	if strings.TrimSpace(toolName) == "" {
+		return ""
 	}
 	return "tool:" + toolName
 }
@@ -41,6 +47,10 @@ func agentAISessionApprovalKey(kind, toolName, command string) string {
 // 自身取 m.mu——调用方必须在 m.mu.Unlock() 之后。
 func (m *agentAIManager) rememberSessionApproval(sessionID, provider, kind, toolName, command string) {
 	if sessionID == "" || provider == "" {
+		return
+	}
+	key := agentAISessionApprovalKey(kind, toolName, command)
+	if key == "" {
 		return
 	}
 	m.mu.Lock()
@@ -62,13 +72,17 @@ func (m *agentAIManager) rememberSessionApproval(sessionID, provider, kind, tool
 		m.sessionApprovals[sessionID] = make(map[string]struct{})
 		keys = m.sessionApprovals[sessionID]
 	}
-	keys[provider+"\x00"+agentAISessionApprovalKey(kind, toolName, command)] = struct{}{}
+	keys[provider+"\x00"+key] = struct{}{}
 }
 
 // sessionApprovalAllows 查询会话级放行。provider 必须与记录时完全一致才算
-// 命中（跨 provider 不放大）。
+// 命中（跨 provider 不放大）；键退化（空工具名等）一律不放行。
 func (m *agentAIManager) sessionApprovalAllows(sessionID, provider, kind, toolName, command string) bool {
 	if sessionID == "" || provider == "" {
+		return false
+	}
+	key := agentAISessionApprovalKey(kind, toolName, command)
+	if key == "" {
 		return false
 	}
 	m.mu.Lock()
@@ -77,6 +91,6 @@ func (m *agentAIManager) sessionApprovalAllows(sessionID, provider, kind, toolNa
 	if keys == nil {
 		return false
 	}
-	_, ok := keys[provider+"\x00"+agentAISessionApprovalKey(kind, toolName, command)]
+	_, ok := keys[provider+"\x00"+key]
 	return ok
 }
