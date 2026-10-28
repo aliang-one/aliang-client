@@ -425,7 +425,21 @@ jobs:
             case "$ARTIFACT" in
               *.pkg)
                 xcrun stapler staple "$ARTIFACT"
-                xcrun stapler validate "$ARTIFACT"
+                # stapler validate re-checks the staple against Apple's CloudKit
+                # ticket-delivery service; that call is network-flaky (v1.1.85
+                # died there with NSURLError -1005 AFTER an Accepted verdict and
+                # a successful staple). The staple is already embedded and the
+                # spctl gate below is the authoritative check, so retry a few
+                # times and downgrade a persistent failure to a warning.
+                V_OK=0
+                for _ in 1 2 3; do
+                  if xcrun stapler validate "$ARTIFACT"; then V_OK=1; break; fi
+                  echo "::warning::stapler validate failed, retrying in 15s..."
+                  sleep 15
+                done
+                if [ "$V_OK" != "1" ]; then
+                  echo "::warning::stapler validate kept failing (likely transient CloudKit network issue); staple is embedded and spctl below is the authoritative gate"
+                fi
                 spctl -a -t install -vv "$ARTIFACT"
                 ;;
               *.zip)
