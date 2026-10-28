@@ -241,6 +241,24 @@ func (j *agentCoreJournal) appendTool(sessionID, tool, summary string, isError b
 	})
 }
 
+// appendApprovalAudit 落 kind=approval 审计行（决策/取消/超时统一入口，
+// spec §4.5）。不参与去重、不进历史回放：读侧（inventory/history parser）
+// 对未知 kind 忽略。尽力而为；写失败 Warn 吞掉。守卫与 appendTool 同款。
+func (j *agentCoreJournal) appendApprovalAudit(sessionID, approvalID string, runSeq int, decision string) {
+	if j == nil || j.dir == "" || strings.TrimSpace(sessionID) == "" {
+		return
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.appendLineLocked(sessionID, map[string]interface{}{
+		"kind":        "approval",
+		"approval_id": approvalID,
+		"run_seq":     runSeq,
+		"decision":    decision,
+		"ts":          time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
 // appendLineLocked 追加一行；调用方必须持有 j.mu。写失败 Warn 后吞掉，
 // 返回是否写成功（mkdir/open/write 任一失败即 false）——appendMsg 靠它
 // 决定去重键只记「已落盘」。目录懒创建在此处（O_CREATE 建不了缺失的父

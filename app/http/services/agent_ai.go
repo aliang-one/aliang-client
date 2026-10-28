@@ -4085,6 +4085,12 @@ func (m *agentAIManager) rememberCompletedApprovalLocked(approvalID string, sess
 		response:  response,
 		createdAt: time.Now().UTC(),
 	}
+	// 审批审计行（spec §4.5）：决策/取消/超时全走本汇聚点，审计行自动覆盖
+	// 全部终态，两端回放可见。尽力而为。j.mu 与本函数调用方持有的 m.mu 是
+	// 不同的锁且无互调（journal 写侧从不取 m.mu），锁内调用安全。
+	if m.coreJournal != nil {
+		m.coreJournal.appendApprovalAudit(sessionID, approvalID, runSeq, response.Decision)
+	}
 }
 
 func agentAIApprovalMapKey(sessionID string, approvalID string) string {
@@ -4296,6 +4302,7 @@ func (m *agentAIManager) runCLI(ctx context.Context, run agentAIRun, writeJSON a
 	if agentAIUseCodexAppServer(run.provider) {
 		outcome := m.runCodexAppServer(ctx, run, writeJSON)
 		if outcome == agentAIRunResumeMissing && ctx.Err() == nil {
+			emitAgentAIResumeMissingNotice(writeJSON, run, run.resumeSessionID)
 			m.clearAgentAIResumeSessionID(run.sessionID, run.runSeq, run.resumeSessionID)
 			run.resumeSessionID = ""
 			run.prompt = firstNonEmpty(run.freshPrompt, run.prompt)
@@ -4328,9 +4335,29 @@ func (m *agentAIManager) runCLI(ctx context.Context, run agentAIRun, writeJSON a
 			m.retryAfterEffortRejected(ctx, run, writeJSON, outcome, rej, true)
 			return
 		}
+		// resume id 本机缺失（导入会话/异项目路径）→ 降级 fresh。显式提示一次：
+		// 此前这一降级完全静默，用户只看到「上下文断了」却说不出为什么。
+		emitAgentAIResumeMissingNotice(writeJSON, run, run.resumeSessionID)
 	}
 	outcome, rej := m.runCLIPass(ctx, run, writeJSON, false)
 	m.retryAfterEffortRejected(ctx, run, writeJSON, outcome, rej, false)
+}
+
+// emitAgentAIResumeMissingNotice 发 resume_missing 的 ai.run.notice（信息性帧，
+// 回合照常继续）。三处自愈降级（runCLI 主路径 / retryAfterEffortRejected /
+// codex 路径）共用；每条路径每回合至多降级一次，fresh 重跑不带 resume 不会再
+// 触发，故天然只发一次。
+func emitAgentAIResumeMissingNotice(writeJSON agentTerminalWriter, run agentAIRun, resumeSessionID string) {
+	if writeJSON == nil {
+		return
+	}
+	_ = writeJSON(map[string]interface{}{
+		"type":       models.AgentEventAIRunNotice,
+		"session_id": run.sessionID,
+		"message_id": agentAssistantMessageID(run.messageID),
+		"code":       "resume_missing",
+		"detail":     fmt.Sprintf("native session %s not found; continuing as a fresh conversation", strings.TrimSpace(resumeSessionID)),
+	})
 }
 
 // retryAfterEffortRejected 在 CLI 拒绝 effort(flag 本身不存在,或硬拒值)时
@@ -4366,6 +4393,7 @@ func (m *agentAIManager) retryAfterEffortRejected(ctx context.Context, run agent
 	// 既无输出也无错误(2026-09-29 评审确认的静默回归)。清掉 resume 再补一发
 	// fresh pass;此时 effort 已处理完毕,fresh pass 不再带被拒的档。
 	if second == agentAIRunResumeMissing && allowResume && ctx.Err() == nil {
+		emitAgentAIResumeMissingNotice(writeJSON, run, run.resumeSessionID)
 		m.clearAgentAIResumeSessionID(run.sessionID, run.runSeq, run.resumeSessionID)
 		run.resumeSessionID = ""
 		run.prompt = firstNonEmpty(run.freshPrompt, run.prompt)

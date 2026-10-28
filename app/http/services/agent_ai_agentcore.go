@@ -972,6 +972,28 @@ func (m *agentAIManager) bindAgentCoreNativeSession(run agentAIRun, writeJSON ag
 	return record, false, nil
 }
 
+// journalPartialAssistant 落失败回合的半截输出（spec §4.5）：停止/中途报错
+// 的回合若已流出一截文本，journal 留一条 -partial assistant 行——否则跨端/
+// 重启回放看到「这轮从未存在」，用户停之前读到一半的内容凭空消失。尽力而为：
+// 空输出不落行；僵尸回合不打（agentAIRunSideEffectsAllowed 围栏，与成功出口
+// 同款）——finalized 后迟返回的僵尸不许写任何 journal。messageID 加 -partial
+// 后缀防与成功行撞 appendMsg 去重键。
+func (m *agentAIManager) journalPartialAssistant(journal *agentCoreJournal, run agentAIRun, output *strings.Builder, outMu *sync.Mutex) {
+	if journal == nil || output == nil || outMu == nil {
+		return
+	}
+	if !m.agentAIRunSideEffectsAllowed(run.sessionID, run.runSeq, run.guard) {
+		return
+	}
+	outMu.Lock()
+	partial := strings.TrimSpace(output.String())
+	outMu.Unlock()
+	if partial == "" {
+		return
+	}
+	journal.appendAssistant(run.sessionID, agentAssistantMessageID(run.messageID)+"-partial", partial, time.Now().UTC().Format(time.RFC3339))
+}
+
 // runAgentCore 跑一次内置内核的 run。
 //
 // 与 runCLIPass 的关系：spawn 换成了进程内调用，但**对外的事件契约完全一样**
@@ -1249,6 +1271,7 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 	if ctx.Err() != nil {
 		// 被停止：内核可能已发过 interrupted 终止帧；若 pipe 已随 cancel 关闭，
 		// 该帧会被丢弃（内核忽略这处写错误）。这里统一收敛状态。
+		m.journalPartialAssistant(journal, run, &output, &outMu)
 		status, errMsg := agentAIRunStoppedStatus(run.activity, limiter)
 		finalizeRunSubagents(run, writeJSON)
 		statusPayload := map[string]interface{}{
@@ -1272,11 +1295,13 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 	// 终止帧」）才需要宿主兜底。
 	if result != nil && result.IsError {
 		endErrMsg = "agentcore run failed"
+		m.journalPartialAssistant(journal, run, &output, &outMu)
 		finalizeRunSubagents(run, writeJSON)
 		return
 	}
 	if runErr != nil {
 		endErrMsg = runErr.Error()
+		m.journalPartialAssistant(journal, run, &output, &outMu)
 		finalizeRunSubagents(run, writeJSON)
 		_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, runErr))
 		return

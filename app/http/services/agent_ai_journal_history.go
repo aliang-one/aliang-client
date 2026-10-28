@@ -50,6 +50,7 @@ func readAgentCoreJournalHistoryFrom(dir, sessionID string) ([]agentAIMessage, a
 			head.model, _ = row["model"].(string)
 			head.origin, _ = row["origin"].(string)
 		case "msg":
+			// kind=tool/approval 行由 inventory 侧消费，此处仅 msg 行进历史。
 			role, _ := row["role"].(string)
 			text, _ := row["text"].(string)
 			msgID, _ := row["message_id"].(string)

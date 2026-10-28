@@ -7,9 +7,13 @@ package services
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
+
+	"aliang.one/nursorgate/app/http/models"
 )
 
 // newSlashJournalTestManager 建管理器并把 coreJournal 指到临时目录——
@@ -146,5 +150,50 @@ func TestAgentCoreKernelBuiltinToolsExcludeBridges(t *testing.T) {
 		if agentCoreKernelBuiltinTools[name] {
 			t.Errorf("桥接工具 %s 不得在集内（各自 onCall 已落行，在集内=双记）", name)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 审批审计行（Task 14，spec §4.5）：决策/取消/超时统一落 kind=approval
+// ---------------------------------------------------------------------------
+
+// TestApprovalDecisionJournaledAsAuditRow：审批终态必须落审计行。决策
+// （accept/decline）、取消、超时全走 rememberCompletedApprovalLocked 这个
+// 汇聚点，审计行自动覆盖全部终态；读侧（inventory/history）对未知 kind
+// 忽略，不污染历史回放。
+func TestApprovalDecisionJournaledAsAuditRow(t *testing.T) {
+	dir := t.TempDir()
+	m := newAgentAIManager()
+	m.coreJournal = newAgentCoreJournal(dir)
+	m.coreJournal.ensureSessionHeader("s-audit", "/p", "m", time.Now().UTC().Format(time.RFC3339), "phone")
+	m.mu.Lock()
+	m.rememberCompletedApprovalLocked("ap-1", "s-audit", 3, agentAIApprovalResponse{Decision: models.AgentAIApprovalDecisionDecline})
+	m.mu.Unlock()
+	data, err := os.ReadFile(filepath.Join(dir, agentCoreJournalFileName("s-audit")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"kind":"approval"`) {
+		t.Fatalf("缺审批审计行: %s", data)
+	}
+	// 逐字段：决策值与 runSeq 必须如实落行，回放端才能重建「哪一回合的哪个
+	// 审批被怎么处理了」。
+	var audit map[string]interface{}
+	for _, row := range readJournalLines(t, dir, "s-audit") {
+		if row["kind"] == "approval" {
+			audit = row
+		}
+	}
+	if audit == nil {
+		t.Fatal("无 approval 行")
+	}
+	if audit["approval_id"] != "ap-1" {
+		t.Errorf("approval_id = %v, want ap-1", audit["approval_id"])
+	}
+	if audit["decision"] != models.AgentAIApprovalDecisionDecline {
+		t.Errorf("decision = %v, want %q", audit["decision"], models.AgentAIApprovalDecisionDecline)
+	}
+	if audit["run_seq"] != float64(3) {
+		t.Errorf("run_seq = %v, want 3", audit["run_seq"])
 	}
 }

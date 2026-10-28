@@ -102,6 +102,29 @@ func TestReadAgentCoreJournalHistoryFromMissing(t *testing.T) {
 	}
 }
 
+// TestReadAgentCoreJournalHistoryIgnoresApprovalRows（Task 14）：kind=approval
+// 审计行必须被历史读回忽略——审计是轨迹不是消息，混进回放会把「审批被怎么
+// 处理了」当成对话内容端到另一端。
+func TestReadAgentCoreJournalHistoryIgnoresApprovalRows(t *testing.T) {
+	dir := t.TempDir()
+	j := newAgentCoreJournal(dir)
+	j.ensureSessionHeader("s-ap", "/proj", "glm-5.3", "2026-10-28T00:00:00Z", "phone")
+	j.appendUser("s-ap", "m1", "第一问", "2026-10-28T00:01:00Z")
+	j.appendApprovalAudit("s-ap", "ap-1", 1, "decline")
+	j.appendAssistant("s-ap", "a1", "第一答", "2026-10-28T00:02:00Z")
+
+	hist, _, err := readAgentCoreJournalHistoryFrom(dir, "s-ap")
+	if err != nil {
+		t.Fatalf("读回失败: %v", err)
+	}
+	if len(hist) != 2 {
+		t.Fatalf("history 行数 = %d, want 2（approval 行不得混入）: %+v", len(hist), hist)
+	}
+	if hist[0].Content != "第一问" || hist[1].Content != "第一答" {
+		t.Fatalf("history 内容 = %+v", hist)
+	}
+}
+
 // TestMessageLazyCreateRestoresJournalHistory 跨端/重启续聊端到端（spec §4.3）：
 // agentcore 会话不在内存（进程重启/内存驱逐），journal 里有完整历史——ai.message
 // 的 lazy-create 必须把历史装回内存再跑。全链走 DispatchLocalAI，续聊的最终
