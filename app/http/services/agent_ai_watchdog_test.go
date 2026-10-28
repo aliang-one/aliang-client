@@ -648,3 +648,40 @@ func TestAgentAIWatchdogHardCeilingAccumulatesAcrossWaits(t *testing.T) {
 		t.Fatal("hard ceiling did not fire within 220ms after leaving the wait; engine-active time was probably reset instead of accumulated across the wait")
 	}
 }
+
+// TestAgentAIHardCeilingDisabledByDefault：时间墙默认关闭。2h 硬顶是纯配额——
+// 一条消息触发的通宵任务(spec 执行/大改造)engine-active 两小时算健康工作,
+// 不该被判死。runaway 防护交给活性家族(idle/no_progress/tool_wait/stale 扫描),
+// 硬顶降级为显式 opt-in(env ALIANG_AI_HARD_CEILING,0 以外即启用)。
+// 2026-10-28 预算审计二轮:用户拍板「时间墙没有必要,移除」。
+func TestAgentAIHardCeilingDisabledByDefault(t *testing.T) {
+	if agentAIHardCeiling != 0 {
+		t.Fatalf("agentAIHardCeiling 默认应为 0(关闭),实际 %s;时间墙已是 opt-in", agentAIHardCeiling)
+	}
+}
+
+// TestAgentAIWatchdogHardCeilingZeroNeverKills：硬顶为 0 时即使持续活跃也绝不
+// 判死——钉死零值禁用语义,防止未来有人把默认值改回正数时顺手破坏该分支。
+func TestAgentAIWatchdogHardCeilingZeroNeverKills(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	activity := newAgentAIActivity()
+	// 持续 bump:引擎时钟每拍都在累加,若硬顶分支无视零值,任意小正数都会杀。
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				activity.bump()
+				time.Sleep(5 * time.Millisecond)
+			}
+		}
+	}()
+	cancelled, reason := runWatchdogUntilCancelled(t,
+		time.Hour /*idle*/, 0 /*hard*/, 0 /*noProgress*/, 10*time.Millisecond, 200*time.Millisecond,
+		func(a *agentAIActivity) { _ = a })
+	if cancelled {
+		t.Fatalf("硬顶为 0 不许判死,reason=%q", reason)
+	}
+}

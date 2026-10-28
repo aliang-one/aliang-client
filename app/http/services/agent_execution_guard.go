@@ -103,15 +103,24 @@ var (
 // own bound (agentAIApprovalTimeout / agentAIToolWaitCeiling /
 // agentAISubagentWaitCeiling), so a long approval, a 3h subagent batch or a
 // 10min tool call can never be clipped by this ceiling — only time actually
-// spent running the engine counts. Env-configurable:
+// spent running the engine counts.
 //
-//	ALIANG_AI_HARD_CEILING  (time.ParseDuration form). Default 2h.
+// Default 0 (disabled) since 2026-10-28: engine-active time is HOW LONG
+// HEALTHY WORK TAKES, not a failure signal — a single message can legitimately
+// drive an overnight run. Runaway protection lives in the liveness family
+// (idle window / no-progress window / tool-wait & subagent ceilings / the
+// stale-run sweeper), all of which fire on "no progress" instead of "too
+// long". The ceiling remains as explicit opt-in for operators who want a
+// hard spend bound:
 //
-// Both resolve once at process start; blank/unparseable/non-positive values
-// fall back to the default (see resolveEnvDuration, which is unit-tested).
+//	ALIANG_AI_HARD_CEILING  (time.ParseDuration form). Default 0 = off;
+//	any positive value enables it.
+//
+// Both resolve once at process start; blank/unparseable values fall back to
+// the default (see resolveEnvDurationAllowZero, which is unit-tested).
 var (
 	agentAIApprovalTimeout = resolveEnvDuration("ALIANG_AI_APPROVAL_TIMEOUT", 24*time.Hour)
-	agentAIHardCeiling     = resolveEnvDuration("ALIANG_AI_HARD_CEILING", 2*time.Hour)
+	agentAIHardCeiling     = resolveEnvDurationAllowZero("ALIANG_AI_HARD_CEILING", 0)
 
 	// agentAINoProgressWindow bounds how long a run may keep EMITTING output
 	// without producing meaningful progress (assistant text/thinking, a file
