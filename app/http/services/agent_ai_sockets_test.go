@@ -84,6 +84,59 @@ func TestAISocketSubscribeUnknownSessionOK(t *testing.T) {
 	m.unregisterAISocket(sock.id)
 }
 
+// TestRemoteSocketReRegistration 远端重注册契约：同键换新、旧 socket 关闭、
+// 注册表恒只有一条 remote（回归 2026-10-28 AB-BA 死锁：驱逐曾持 m.mu 进
+// closeOnce.Do，与慢消费者摘除路径互锁）。
+func TestRemoteSocketReRegistration(t *testing.T) {
+	m := newTestAISocketsManager(t)
+	block := make(chan struct{})
+	defer close(block)
+	write := func(interface{}) error {
+		<-block
+		return nil
+	}
+	sock1 := m.registerAISocket("remote", write)
+	if sock1 == nil || sock1.id != agentAIRemoteSocketID {
+		t.Fatalf("首次注册远端 id = %v, 期望 %q", sock1, agentAIRemoteSocketID)
+	}
+	sock2 := m.registerAISocket("remote", write)
+	if sock2 == nil || sock2.id != agentAIRemoteSocketID {
+		t.Fatalf("重注册远端 id = %v, 期望 %q", sock2, agentAIRemoteSocketID)
+	}
+	if sock2 == sock1 {
+		t.Fatal("重注册应产生新 socket 对象")
+	}
+	defer m.unregisterAISocket(agentAIRemoteSocketID) // 收尾：让新 pump 退出
+	// 旧 socket 的 closed 必须触发（解锁后驱逐关闭）。
+	waitUntilFor(t, time.Second, func() bool {
+		select {
+		case <-sock1.closed:
+			return true
+		default:
+			return false
+		}
+	})
+	// 新 socket 活跃且独占注册表唯一 remote 条目。
+	m.mu.Lock()
+	live := m.aiSockets[agentAIRemoteSocketID]
+	remoteCount := 0
+	for _, s := range m.aiSockets {
+		if s.role == "remote" {
+			remoteCount++
+		}
+	}
+	m.mu.Unlock()
+	if live != sock2 {
+		t.Fatal("注册表 remote 键应指向新 socket")
+	}
+	if !sock2.alive() {
+		t.Fatal("新 socket 应活跃")
+	}
+	if remoteCount != 1 {
+		t.Fatalf("注册表 remote 条目数 = %d, 期望 1", remoteCount)
+	}
+}
+
 // waitUntilFor 轮询等待（注意：包内 agent_tui_turn_test.go 已有两个参数的
 // waitFor(t, cond)，本 helper 用不同名字避免重名冲突）。
 func waitUntilFor(t *testing.T, d time.Duration, fn func() bool) {

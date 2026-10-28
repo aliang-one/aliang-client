@@ -142,27 +142,35 @@ func (m *agentAIManager) registerAISocket(role string, write agentTerminalWriter
 		closed: make(chan struct{}),
 		subs:   make(map[string]struct{}),
 	}
-	// onDead 只做「从注册表摘除」，**绝不**再走 sock.closeOnce.Do——调用点
-	// 在 closeOnce.Do 闭包内，sync.Once 持锁期间同 goroutine 再入同一 Once
-	// 会自死锁（doSlow 在闭包返回后才落 done）。
+	// onDead 只做「从注册表摘除」，且只摘「仍是自己」的条目——旧远端被驱逐
+	// 后若残留一次迟到的溢出 onDead，不得误删同键的新 socket。**绝不**再走
+	// sock.closeOnce.Do——调用点在 closeOnce.Do 闭包内，sync.Once 持锁期间
+	// 同 goroutine 再入同一 Once 会自死锁（doSlow 在闭包返回后才落 done）。
 	sock.onDead = func(id string) {
 		m.mu.Lock()
-		delete(m.aiSockets, id)
+		if cur := m.aiSockets[id]; cur == sock {
+			delete(m.aiSockets, id)
+		}
 		m.mu.Unlock()
 	}
+	var evicted *agentAISocket
 	if role == "remote" {
-		// 远端是常驻单例：先摘旧（间接层写函数恒同一闭包，正常不会重复注册；
-		// 防御测试/重入）。旧 socket 只关不触发 onDead（否则会误删同 id 新 socket）。
-		for id, s := range m.aiSockets {
-			if s.role == "remote" {
-				s.closeOnce.Do(func() { close(s.closed) })
-				delete(m.aiSockets, id)
-			}
+		// 远端是常驻单例，恒居 agentAIRemoteSocketID 单键之下：先摘旧（间接层
+		// 写函数恒同一闭包，正常不会重复注册；防御测试/重入）。旧 socket 只
+		// 记下、解锁后再关——closeOnce 内部互斥不得与 m.mu 嵌套：enqueue 溢出/
+		// pump 写失败路径在 Once 闭包内取 m.mu（onDead），持 m.mu 进 Do 会
+		// AB-BA 死锁（2026-10-28 spec 评审）。
+		if old := m.aiSockets[agentAIRemoteSocketID]; old != nil {
+			evicted = old
+			delete(m.aiSockets, agentAIRemoteSocketID)
 		}
 		sock.id = agentAIRemoteSocketID
 	}
 	m.aiSockets[sock.id] = sock
 	m.mu.Unlock()
+	if evicted != nil {
+		evicted.closeOnce.Do(func() { close(evicted.closed) })
+	}
 	go sock.pump()
 	return sock
 }
