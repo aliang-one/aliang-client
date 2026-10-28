@@ -425,15 +425,19 @@ func (m *agentAIManager) agentCoreMessages(run agentAIRun) ([]agentcore.Message,
 	m.mu.Lock()
 	session := m.sessions[run.sessionID]
 	var history []agentAIMessage
+	initialContext := ""
 	if session != nil && session.runSeq == run.runSeq {
 		history = append(history, session.history...)
+		initialContext = session.initialContext
 	}
 	m.mu.Unlock()
 
 	msgs, texts := agentCoreMessagesFromHistory(history)
 	// 与 messages 用同一份快照：system 角色历史（initial_context）走 System
-	// 字段，见 agentCoreSystemContextFromHistory。
-	sessionContext := agentCoreSystemContextFromHistory(history)
+	// 字段，见 agentCoreSystemContextFromHistory。历史里已无 system 条目时
+	// （如旧版本落库已把它冲掉、或尾部裁剪把它裁掉）回落 session.initialContext
+	// ——立身上下文宁可重复兜底，也不能在内核通道上凭空消失。
+	sessionContext := agentCoreSystemContextFromHistory(history, initialContext)
 
 	// 图片附件 → image 块。这里的 run.attachments 在 runCLI 里已经下载过
 	// （downloadAgentAIAttachments 设了 Path 并清掉 URL），所以不再下载一次。
@@ -505,14 +509,19 @@ func agentCoreMessagesFromHistory(history []agentAIMessage) ([]agentcore.Message
 }
 
 // agentCoreSystemContextFromHistory 收集 system 角色的历史内容，交给内核的
-// Config.System 承载。
+// Config.System 承载；历史里没有 system 条目时回落 fallback（会话的
+// initialContext 字段）。
 //
 // 内核的 messages 只收 user/assistant（上游会拒绝 system 角色），但 system
 // 角色的历史不是噪音：ai.session.create / ai.run.start 的 initial_context
 // （fork 快照、goal 重规划上下文）就以 role=system 存在历史首部。CLI 通道
 // 靠 buildAgentAIPrompt 把它渲染成 "System: ..." 留在对话里，内核通道此前
 // 直接丢弃 —— 手机新建会话的初始上下文在 AgentCore 上等于不存在。
-func agentCoreSystemContextFromHistory(history []agentAIMessage) string {
+//
+// fallback 是纵深防御的第二层：session.initialContext 与历史首部的 system
+// 条目本就同源（create/lazy-create 两处同时写入），历史条目丢失（尾部裁剪、
+// 旧版本压缩落库冲掉）时它仍能兜住；两者都在时以历史为准，不重复拼接。
+func agentCoreSystemContextFromHistory(history []agentAIMessage, fallback string) string {
 	var parts []string
 	for _, item := range history {
 		if strings.ToLower(strings.TrimSpace(item.Role)) != "system" {
@@ -524,7 +533,10 @@ func agentCoreSystemContextFromHistory(history []agentAIMessage) string {
 		}
 		parts = append(parts, content)
 	}
-	return strings.Join(parts, "\n\n")
+	if ctx := strings.Join(parts, "\n\n"); strings.TrimSpace(ctx) != "" {
+		return ctx
+	}
+	return strings.TrimSpace(fallback)
 }
 
 // agentCoreHistoryFromMessages 是 agentCoreMessagesFromHistory 的逆变换：
@@ -593,8 +605,31 @@ func (m *agentAIManager) replaceAgentCoreHistory(sessionID string, runSeq int, m
 	if session == nil || session.runSeq != runSeq {
 		return
 	}
+	// 压缩产物只含 user/assistant（内核 messages 不收其它角色），若原样落库，
+	// 旧历史里的 system 条目（历史首部的 initial_context：fork 快照 / goal
+	// 上下文）会被永久抹掉——而摘要请求的 messages 同样不含 system（它由内核
+	// Config.System 承载，从历史派生），摘要补不回来。落库前把旧历史里的
+	// 非 user/assistant 条目按原相对顺序拼回新历史头部。
+	if preserved := agentCorePreservedSystemHistory(session.history); len(preserved) > 0 {
+		history = append(preserved, history...)
+	}
 	session.history = trimAgentAIHistoryForSession(session, history)
 	session.lastActiveAt = time.Now().UTC()
+}
+
+// agentCorePreservedSystemHistory 摘出历史里所有非 user/assistant 条目
+// （initial_context 等 system 条目），保持原相对顺序。返回独立切片，不与
+// 入参共享底层数组——调用方要在 m.mu 内把它拼进新历史，别名会写坏旧历史。
+func agentCorePreservedSystemHistory(history []agentAIMessage) []agentAIMessage {
+	out := make([]agentAIMessage, 0, len(history))
+	for _, item := range history {
+		role := strings.ToLower(strings.TrimSpace(item.Role))
+		if role == "user" || role == "assistant" || role == "" {
+			continue
+		}
+		out = append(out, item)
+	}
+	return out
 }
 
 // handleAgentCoreCompactCommand 对内核对会话历史做一次真实压缩（/compact）。
