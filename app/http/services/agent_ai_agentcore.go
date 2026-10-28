@@ -1647,6 +1647,19 @@ func (m *agentAIManager) attachCoreSteer(sessionID string, runSeq int, control *
 // 审批
 // ---------------------------------------------------------------------------
 
+// boundaryApprovalReason 把边界守卫的规则 ID 翻译成审批卡上的人话原因。
+// 三个内核（agentcore/claude CLI/codex）的审批卡共用：规则命中时边界原因
+// 优先于各自上游自带的原因；未命中返回空串，卡片保持原样。
+func boundaryApprovalReason(ruleID string) string {
+	switch ruleID {
+	case "outside-project-path":
+		return "目标路径在项目目录之外，需要您确认是否放行"
+	case "outside-project-bash":
+		return "命令引用了项目目录之外的路径，需要您确认是否放行"
+	}
+	return ""
+}
+
 // agentCoreApprove 是内核的 Config.Approve。策略短路与 codex/claude 一致：
 // auto_approve / auto_deny 本地直接判（不走云端往返），只有 require_approval
 // 才真的问用户。
@@ -1708,11 +1721,15 @@ func buildAgentCoreApprovalRequest(run agentAIRun, call agentcore.ApprovalReques
 	if kind == models.AgentAIApprovalKindCommand {
 		title = "Approve Aliang Agent command"
 	}
+	// 边界守卫升级为审批后，卡片必须说清「为什么问您」——否则用户看到的
+	// 只有一个 rule id，无从判断点同意意味着什么。
+	reason := boundaryApprovalReason(run.matchedRuleID)
 
 	return agentAIApprovalRequest{
 		Provider:  run.provider,
 		Kind:      kind,
 		Title:     title,
+		Reason:    reason,
 		Command:   command,
 		CWD:       run.projectPath,
 		ToolName:  call.ToolName,

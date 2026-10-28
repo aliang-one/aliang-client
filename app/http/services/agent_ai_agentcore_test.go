@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"aliang.one/nursorgate/app/agentcore"
 	auth "aliang.one/nursorgate/processor/auth"
 )
 
@@ -284,5 +285,44 @@ func TestAgentCoreSystemPromptIncludesEnvBlock(t *testing.T) {
 	}
 	if !strings.Contains(agentCoreSystemPrompt(gitDir), "Is a git repository: yes") {
 		t.Fatalf("git 目录应判 yes")
+	}
+}
+
+// 2026-10-28 边界降级后，审批卡必须带人话原因——用户看到的不再只是
+// matched_rule_id，而是「为什么问您」。普通策略命中的审批不额外编造原因。
+func TestBuildAgentCoreApprovalRequestCarriesBoundaryReason(t *testing.T) {
+	req := buildAgentCoreApprovalRequest(agentAIRun{matchedRuleID: "outside-project-path"}, agentcore.ApprovalRequest{ToolName: "Grep"})
+	if req.Reason == "" {
+		t.Fatal("outside-project-path 审批卡缺少 reason")
+	}
+	req = buildAgentCoreApprovalRequest(agentAIRun{matchedRuleID: "outside-project-bash"}, agentcore.ApprovalRequest{
+		ToolName: "Bash",
+		Input:    map[string]interface{}{"command": "cat /etc/passwd"},
+	})
+	if req.Reason == "" {
+		t.Fatal("outside-project-bash 审批卡缺少 reason")
+	}
+	req = buildAgentCoreApprovalRequest(agentAIRun{}, agentcore.ApprovalRequest{ToolName: "Bash"})
+	if req.Reason != "" {
+		t.Fatalf("普通审批不应携带边界 reason，得到 %q", req.Reason)
+	}
+
+	// claude CLI 与 codex 的审批卡同口径：边界升级时带 reason，
+	// 无边界规则命中时保留各自上游的 reason。
+	run := agentAIRun{matchedRuleID: "outside-project-path"}
+	if req := buildClaudeApprovalRequest(run, map[string]interface{}{"tool_name": "Read"}); req.Reason == "" {
+		t.Fatal("claude 边界审批卡缺少 reason")
+	}
+	run = agentAIRun{}
+	if req := buildClaudeApprovalRequest(run, map[string]interface{}{"tool_name": "Read", "reason": "upstream"}); req.Reason != "upstream" {
+		t.Fatalf("claude 普通审批 reason = %q, want upstream", req.Reason)
+	}
+	run = agentAIRun{matchedRuleID: "outside-project-path"}
+	if req := buildCodexApprovalRequest(run, "item/fileChange/requestApproval", map[string]interface{}{}, nil); req.Reason == "" {
+		t.Fatal("codex 边界审批卡缺少 reason")
+	}
+	run = agentAIRun{}
+	if req := buildCodexApprovalRequest(run, "item/fileChange/requestApproval", map[string]interface{}{"reason": "upstream"}, nil); req.Reason != "upstream" {
+		t.Fatalf("codex 普通审批 reason = %q, want upstream", req.Reason)
 	}
 }
