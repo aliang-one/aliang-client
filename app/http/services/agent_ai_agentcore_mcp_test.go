@@ -931,10 +931,12 @@ func TestRunAgentCoreMCPEndToEnd(t *testing.T) {
 		t.Fatalf("tool_result = %q, want 含 echo:hi（审批+桥+内核全链穿透）", toolContent)
 	}
 
-	// 3) journal v2 四类行齐且顺序固定：session / user / tool / assistant / end。
+	// 3) journal v2 五类行齐且顺序固定：session / user / turn(1) / tool /
+	// turn(2) / assistant / end。turn 是逐回合 transcript 行（每回合必落），
+	// 工具回合夹在 turn(1) 与 turn(2) 之间。
 	lines := readJournalLines(t, agentCoreJournalDir(), sessionID)
-	if len(lines) != 5 {
-		t.Fatalf("journal 行数 = %d, want 5: %v", len(lines), lines)
+	if len(lines) != 7 {
+		t.Fatalf("journal 行数 = %d, want 7: %v", len(lines), lines)
 	}
 	if lines[0]["kind"] != "session" {
 		t.Errorf("头行 = %v", lines[0])
@@ -942,15 +944,22 @@ func TestRunAgentCoreMCPEndToEnd(t *testing.T) {
 	if lines[1]["role"] != "user" || lines[1]["text"] != "调一下 echo" {
 		t.Errorf("user 行 = %v", lines[1])
 	}
-	if lines[2]["kind"] != "tool" || lines[2]["tool"] != "mcp__srv__echo" ||
-		lines[2]["summary"] != `q="hi"` || lines[2]["is_error"] != false {
-		t.Errorf("tool 行 = %v, want kind=tool tool=mcp__srv__echo summary=q=\"hi\" is_error=false", lines[2])
+	if lines[2]["kind"] != "turn" || lines[2]["stop_reason"] != "tool_use" {
+		t.Errorf("turn(1) 行 = %v, want kind=turn stop_reason=tool_use", lines[2])
 	}
-	if lines[3]["role"] != "assistant" || lines[3]["text"] != "好的" {
-		t.Errorf("assistant 行 = %v", lines[3])
+	if lines[3]["kind"] != "tool" || lines[3]["tool"] != "mcp__srv__echo" ||
+		lines[3]["summary"] != `q="hi"` || lines[3]["is_error"] != false {
+		t.Errorf("tool 行 = %v, want kind=tool tool=mcp__srv__echo summary=q=\"hi\" is_error=false", lines[3])
 	}
-	if lines[4]["kind"] != "end" || lines[4]["status"] != "success" {
-		t.Errorf("end 行 = %v, want status=success", lines[4])
+	if lines[4]["kind"] != "turn" || lines[4]["stop_reason"] != "end_turn" ||
+		lines[4]["text"] != "好的" {
+		t.Errorf("turn(2) 行 = %v, want kind=turn stop_reason=end_turn text=好的", lines[4])
+	}
+	if lines[5]["role"] != "assistant" || lines[5]["text"] != "好的" {
+		t.Errorf("assistant 行 = %v", lines[5])
+	}
+	if lines[6]["kind"] != "end" || lines[6]["status"] != "success" {
+		t.Errorf("end 行 = %v, want status=success", lines[6])
 	}
 
 	// 4) run 收尾后 closeAll 被调用恰好一次（defer 走 detached goroutine，

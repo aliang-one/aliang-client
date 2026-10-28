@@ -1286,7 +1286,19 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 	// runErr 非空但 IsError 为 false 的情形（理论上只有「内核内部报错但没走到
 	// 终止帧」）才需要宿主兜底。
 	if result != nil && result.IsError {
-		endErrMsg = "agentcore run failed"
+		// 真因不再吞掉：优先取内核结构化 ErrMessage，其次 runErr。写进 journal
+		// 的 end 记录 + 日志，否则线上只剩笼统的「agentcore run failed」无法复盘
+		// （2026-10-28 ai_3p18eg1aYQvE 事故）。
+		reason := strings.TrimSpace(result.ErrMessage)
+		if reason == "" && runErr != nil {
+			reason = runErr.Error()
+		}
+		if reason == "" {
+			reason = "agentcore run failed"
+		}
+		endErrMsg = reason
+		logger.Warn(fmt.Sprintf("[agentcore] run failed session=%s msg=%s err=%s",
+			run.sessionID, run.messageID, reason))
 		finalizeRunSubagents(run, writeJSON)
 		return
 	}
@@ -1367,12 +1379,31 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 // 不会重复投递。PrepareRequest / FinishTurn 留空——前者的诉求（改 system /
 // max_tokens）已在 Config 里静态给定，后者没有消费方。
 func agentCoreLoopHooks(m *agentAIManager, run agentAIRun) agentcore.LoopHooks {
+	// 逐回合 transcript 落 journal 的回合序号（run 内 1 起）。
+	turnN := 0
 	return agentcore.LoopHooks{
 		GetSteeringMessages: func() []agentcore.Message {
 			return m.drainAgentCoreSteering(run)
 		},
 		GetFollowUpMessages: func() []agentcore.Message {
 			return m.drainAgentCoreSteering(run)
+		},
+		// 每回合把 assistant 完整文本 + thinking + 工具名落 journal（kind=turn），
+		// 补齐 run 末单条 assistant 丢失的中间叙述与 thinking。围栏与收尾
+		// assistant 行同款：僵尸回合（guard 被换/runSeq 顶替）的 transcript 同样
+		// 不得落盘，否则 journal 会出现 turn 行却查无 assistant 行的自相矛盾。
+		OnTurnEnd: func(tr agentcore.TurnResult) {
+			if !m.agentAIRunSideEffectsAllowed(run.sessionID, run.runSeq, run.guard) {
+				return
+			}
+			turnN++
+			tools := make([]string, 0, len(tr.ToolCalls))
+			for _, tc := range tr.ToolCalls {
+				if tc.Name != "" {
+					tools = append(tools, tc.Name)
+				}
+			}
+			m.coreJournal.appendAssistantTurn(run.sessionID, turnN, tr.Text, tr.Thinking, tr.StopReason, tools)
 		},
 		// 自动压缩替换了历史 → 同步落回会话 history。不落的话 next run 又从
 		// 旧历史重建，压缩白做（而且每轮 run 都会重新烧一次摘要请求）。
@@ -1651,6 +1682,19 @@ func (m *agentAIManager) attachCoreSteer(sessionID string, runSeq int, control *
 // 审批
 // ---------------------------------------------------------------------------
 
+// boundaryApprovalReason 把边界守卫的规则 ID 翻译成审批卡上的人话原因。
+// 三个内核（agentcore/claude CLI/codex）的审批卡共用：规则命中时边界原因
+// 优先于各自上游自带的原因；未命中返回空串，卡片保持原样。
+func boundaryApprovalReason(ruleID string) string {
+	switch ruleID {
+	case "outside-project-path":
+		return "目标路径在项目目录之外，需要您确认是否放行"
+	case "outside-project-bash":
+		return "命令引用了项目目录之外的路径，需要您确认是否放行"
+	}
+	return ""
+}
+
 // agentCoreApprove 是内核的 Config.Approve。策略短路与 codex/claude 一致：
 // auto_approve / auto_deny 本地直接判（不走云端往返），只有 require_approval
 // 才真的问用户。
@@ -1712,11 +1756,15 @@ func buildAgentCoreApprovalRequest(run agentAIRun, call agentcore.ApprovalReques
 	if kind == models.AgentAIApprovalKindCommand {
 		title = "Approve Aliang Agent command"
 	}
+	// 边界守卫升级为审批后，卡片必须说清「为什么问您」——否则用户看到的
+	// 只有一个 rule id，无从判断点同意意味着什么。
+	reason := boundaryApprovalReason(run.matchedRuleID)
 
 	return agentAIApprovalRequest{
 		Provider:  run.provider,
 		Kind:      kind,
 		Title:     title,
+		Reason:    reason,
 		Command:   command,
 		CWD:       run.projectPath,
 		ToolName:  call.ToolName,

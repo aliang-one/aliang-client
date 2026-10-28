@@ -32,13 +32,17 @@ const (
 	// anthropicVersion 是 Messages API 的版本头。上游要求必填。
 	anthropicVersion = "2023-06-01"
 
-	// maxRetries 是瞬态失败的重试次数。仅覆盖连接错误 / 429 / 5xx。注意口径：
-	// 重试 3 次 = 全程最多 4 次尝试；按 ResponseHeaderTimeout 120s 逐次烧满的
-	// 话，最坏 4×120s + 退避 ≈ 8min 才见分晓——若上游带 Retry-After（429/5xx
-	// 优先采用、封顶 30s），最坏 4×120s + 3×30s ≈ 9.5min。服务层的 stale 扫描器
-	// （5min）靠 api_retry 重试帧刷新活性才扛得住这段静默，见 Stream 里
-	// notifyRetry。
-	maxRetries = 3
+	// maxRetries 是瞬态失败的重试次数。仅覆盖连接错误 / 429 / 5xx / 2xx 限流过载。
+	//
+	// 5 次（原为 3）：agentcore 是长回合自主 agent，一次 run 可跑 30+ 回合、
+	// 数十分钟；单个瞬态抖动若在末尾把整轮判死，前面的工作全部作废。多给两
+	// 次退避（总计 ~15s 量级）换整轮韧性，代价可接受。注意口径：重试 5 次 =
+	// 全程最多 6 次尝试；按 ResponseHeaderTimeout 120s 逐次烧满的话，最坏
+	// 6×120s + 退避 ≈ 12min——若上游带 Retry-After（429/5xx 优先采用、封顶
+	// 30s），最坏 6×120s + 5×30s ≈ 14.5min。服务层的 stale 扫描器（5min）
+	// 靠 api_retry 重试帧刷新活性才扛得住这段静默（相邻刷新 ≤150s），见
+	// Stream 里 notifyRetry。
+	maxRetries = 5
 
 	// baseRetryDelay 是指数退避的起点。
 	baseRetryDelay = 500 * time.Millisecond
@@ -375,11 +379,15 @@ func (e *upstreamError) Error() string {
 	return "agentcore: 上游返回错误响应: " + body
 }
 
-// retryable 判定这个 2xx 内错误值不值得重试。限流与过载是容量问题，
-// 退避后重试有意义；其余（如 invalid_request_error）重试只会重复失败。
+// retryable 判定这个 2xx 内错误值不值得重试。限流、过载、服务端瞬时错误
+// 是容量/抖动问题，退避后重试有意义；其余（如 invalid_request_error）重试
+// 只会重复失败。注意：上下文超长以 2xx 信封回来时 kind 多半是
+// invalid_request_error —— 那种不走本路径重试，而是由 loop 的
+// isContextOverflowError/noteContextOverflow 识别后压缩重跑。
 func (e *upstreamError) retryable() bool {
 	switch strings.TrimSpace(e.kind) {
-	case "rate_limit_error", "overloaded_error", "api_error":
+	case "rate_limit_error", "overloaded_error", "api_error",
+		"server_error", "timeout_error":
 		return true
 	}
 	return false
@@ -748,17 +756,27 @@ func translateEvent(ev *sseEvent) ([]StreamEvent, error) {
 				return nil, nil
 			}
 			return []StreamEvent{{Kind: EventText, Index: ev.Index, Text: ev.Delta.Text}}, nil
-		case "thinking_delta":
-			if ev.Delta.Thinking == "" {
-				return nil, nil
-			}
-			return []StreamEvent{{Kind: EventThinking, Index: ev.Index, Text: ev.Delta.Thinking}}, nil
 		case "input_json_delta":
 			return []StreamEvent{{
 				Kind:        EventToolInput,
 				Index:       ev.Index,
 				PartialJSON: ev.Delta.PartialJSON,
 			}}, nil
+		case "thinking_delta":
+			// 载荷键是 "thinking"（Anthropic 语义），个别网关会走 "text"——
+			// 两个都收，取非空者。空文本直接丢。
+			text := ev.Delta.Thinking
+			if text == "" {
+				text = ev.Delta.Text
+			}
+			if text == "" {
+				return nil, nil
+			}
+			// EventThinking 由 streamTurn 两路分流：流式转发宿主（writer 帧 →
+			// ai.thinking → 手机渲染思考 + markProgress 喂活性）、落 journal
+			// transcript；两路都不进历史——Anthropic 的 thinking 块回传需要
+			// 合法 signature，塞回历史会破坏下一轮请求。
+			return []StreamEvent{{Kind: EventThinking, Index: ev.Index, Text: text}}, nil
 		case "signature_delta":
 			// 思考块的签名字段：不是用户可见内容，内核也不做上游签名校验
 			// （思考块从不回传给上游——回传缺签名的思考块才会被拒），所以

@@ -3765,6 +3765,7 @@ func buildClaudeApprovalRequest(run agentAIRun, raw map[string]interface{}) agen
 		kind = models.AgentAIApprovalKindCommand
 	}
 	reason := firstNonEmpty(
+		boundaryApprovalReason(run.matchedRuleID),
 		remoteString(raw, "permission_prompt"),
 		remoteString(raw, "permissionPrompt"),
 		remoteString(raw, "reason"),
@@ -5644,7 +5645,7 @@ func buildCodexApprovalRequest(run agentAIRun, method string, params map[string]
 		Provider: "codex",
 		Kind:     models.AgentAIApprovalKindTool,
 		Title:    "Approve Codex action",
-		Reason:   remoteString(params, "reason"),
+		Reason:   firstNonEmpty(boundaryApprovalReason(run.matchedRuleID), remoteString(params, "reason")),
 		CWD:      firstNonEmpty(remoteString(params, "cwd"), run.projectPath),
 		Raw:      rawJSON,
 		AvailableDecisions: []string{
