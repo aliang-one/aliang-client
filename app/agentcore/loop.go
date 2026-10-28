@@ -316,6 +316,12 @@ type runner struct {
 	contextTokens int
 	// autoCompacts 是本 run 内已执行的自动压缩次数，见 maxAutoCompactsPerRun。
 	autoCompacts int
+	// compactCooldown 是自动压缩失败后剩余的免压回合数（>0 时跳过判定，每
+	// 回合递减一次），见 compactFailureCooldownTurns。
+	compactCooldown int
+	// compactFailures 是本 run **连续**自动压缩失败次数（成功清零），达
+	// compactFailureLimit 后本 run 永久禁用自动压缩。
+	compactFailures int
 
 	// ctxOverflowWindow 是「上游实测拒绝了当前上下文」后降级出的有效窗口。
 	// 配置窗口来自用户的上下文滑杆（100k~1M），它不知道模型真实上限：给
@@ -598,13 +604,25 @@ func (r *runner) wrapUp(ctx context.Context, reason string) {
 // 触发依据取两者的较大值：本地估算（稳定、但对 tokenizer 只是近似）与上游
 // 上一轮实测的 input_tokens（精确、但滞后一轮）。任一达到阈值的 3/4 就压缩，
 // 留出余量给本轮输出与工具结果。压缩失败不终止 run：宁可带着长上下文继续
-// 跑，也不要因为摘要请求偶发失败而中断用户的对话。
+// 跑，也不要因为摘要请求偶发失败而中断用户的对话。但失败也不能无代价地
+// 每回合重试——历史仍超阈值时每回合都会重新触发判定，原样重试就是「压缩
+// 失败熔炉」（每回合重烧一次全窗口摘要请求），所以失败后有回合级冷却
+// （compactFailureCooldownTurns），连续失败达上限则本 run 禁用自动压缩。
 func (r *runner) maybeAutoCompact(ctx context.Context) {
 	window := r.effectiveContextWindow()
 	if window <= 0 {
 		return
 	}
 	if r.autoCompacts >= maxAutoCompactsPerRun {
+		return
+	}
+	// 连续失败达上限：本 run 不再自动压缩（翻转时的那条日志在失败分支打）。
+	if r.compactFailures >= compactFailureLimit {
+		return
+	}
+	// 冷却期：跳过判定，不烧摘要请求。
+	if r.compactCooldown > 0 {
+		r.compactCooldown--
 		return
 	}
 	threshold := window * autoCompactRatioNum / autoCompactRatioDen
@@ -621,9 +639,20 @@ func (r *runner) maybeAutoCompact(ctx context.Context) {
 		if errors.Is(err, ErrNothingToCompact) {
 			return
 		}
-		r.logf("agentcore: 自动压缩失败，继续使用完整上下文: %v session=%s", err, r.writer.sessionID)
+		r.compactFailures++
+		r.compactCooldown = compactFailureCooldownTurns
+		if r.compactFailures >= compactFailureLimit {
+			r.logf("agentcore: 自动压缩连续失败 %d 次，本次运行不再自动压缩（上下文超限时仍有降级压缩兜底）: %v session=%s",
+				r.compactFailures, err, r.writer.sessionID)
+			return
+		}
+		r.logf("agentcore: 自动压缩失败，跳过接下来 %d 个回合再试: %v session=%s",
+			r.compactCooldown, err, r.writer.sessionID)
 		return
 	}
+	// 成功即清零失败与冷却：偶发一次失败不该影响后续的压缩节奏。
+	r.compactFailures = 0
+	r.compactCooldown = 0
 	r.autoCompacts++
 	r.history = compacted
 	r.contextTokens = info.PostTokens

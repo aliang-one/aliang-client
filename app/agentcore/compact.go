@@ -52,6 +52,20 @@ const (
 	// 兜住抖动，同时让长任务走完全程。
 	maxAutoCompactsPerRun = 10
 
+	// compactFailureCooldownTurns 是一次自动压缩失败后跳过自动压缩判定的
+	// 回合数。摘要请求要把全窗口输入重烧一遍，失败后每回合原样重试就是
+	// 「压缩失败熔炉」：历史仍超阈值 → 每个回合间再压一次 → 每回合都垫上
+	// 一次全窗口摘要请求的钱与延迟。冷却 3 个回合再试，给瞬态故障留恢复
+	// 窗口。
+	compactFailureCooldownTurns = 3
+
+	// compactFailureLimit 是本 run 内**连续**自动压缩失败多少次后彻底禁用
+	// 自动压缩。连续 3 次失败说明不是抖动（上游限流、网络中断），继续按节奏
+	// 重试只会每 4 个回合烧一次摘要请求；禁用后带着长上下文继续跑，真被上游
+	// 以 prompt too long 拒绝时仍有 noteContextOverflow 的降级压缩路径兜底
+	// （那条路不经本判定，不受禁用影响）。
+	compactFailureLimit = 3
+
 	// compactRenderEntryMaxChars 限制单条消息进摘要请求的长度：一条巨大的
 	// 工具输出不该吃掉整个摘要预算。
 	compactRenderEntryMaxChars = 8000
@@ -264,6 +278,14 @@ const compactSummarySystem = `你是上下文压缩器，为一个正在进行�
 const compactSummaryInstruction = "请为上面这段对话生成压缩摘要。\n\n===== 对话开始 =====\n"
 
 // compactSummarize 用一次不带工具的 Messages 调用生成前缀摘要。
+//
+// 整个调用带**最多一次**安全重试。为什么这里重试安全而回合主流不行（Stream
+// 的 delivered 守卫一刀切禁止已下发事件后的重试）：压缩的全部状态都悬在本次
+// 闭包里——builder 是局部变量，出错即弃，重试从零开始，不会像回合主流那样把
+// 第二次尝试的 delta 缝在半截文本后面；压缩期间内核不向宿主发任何事件帧，
+// 重试也不会让宿主/手机看到重复事件。回合主流恰恰相反：文本累积与已下发帧
+// 都挂在调用方身上，重试必然重复内容。ctx 取消/超时不重试——那不是上游的
+// 瞬态故障，重试只会拖住取消路径。
 func compactSummarize(ctx context.Context, cfg *Config, prefix []Message, window int) (string, error) {
 	transcript := renderCompactTranscript(prefix, window/compactTranscriptRatioDen)
 	if strings.TrimSpace(transcript) == "" {
@@ -275,20 +297,36 @@ func compactSummarize(ctx context.Context, cfg *Config, prefix []Message, window
 		System:    compactSummarySystem,
 		Messages:  []Message{TextMessage("user", compactSummaryInstruction+transcript)},
 	}
-	var b strings.Builder
-	err := cfg.Client.Stream(ctx, req, func(ev StreamEvent) error {
-		switch ev.Kind {
-		case EventText:
-			b.WriteString(ev.Text)
-		case EventError:
-			return ev.Err
+	attempt := func() (string, error) {
+		var b strings.Builder
+		err := cfg.Client.Stream(ctx, req, func(ev StreamEvent) error {
+			switch ev.Kind {
+			case EventText:
+				b.WriteString(ev.Text)
+			case EventError:
+				return ev.Err
+			}
+			return nil
+		})
+		if err != nil {
+			return "", fmt.Errorf("agentcore: 压缩摘要请求失败: %w", err)
 		}
-		return nil
-	})
-	if err != nil {
-		return "", fmt.Errorf("agentcore: 压缩摘要请求失败: %w", err)
+		return b.String(), nil
 	}
-	return b.String(), nil
+	summary, err := attempt()
+	if err == nil {
+		return summary, nil
+	}
+	if ctx.Err() != nil ||
+		errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded) {
+		return "", err
+	}
+	retried, retryErr := attempt()
+	if retryErr == nil {
+		return retried, nil
+	}
+	return "", fmt.Errorf("agentcore: 压缩摘要重试仍失败: %w（首次失败: %v）", retryErr, err)
 }
 
 // renderCompactTranscript 把前缀消息渲染成纯文本转录，带 token 预算。
