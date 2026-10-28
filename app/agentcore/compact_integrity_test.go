@@ -5,9 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"reflect"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -259,4 +259,108 @@ func headMessageText(t *testing.T, messages []Message) string {
 	}
 	text, _ := messages[0].Content.(string)
 	return text
+}
+
+// writeSummarySSEWithStopReason 输出一段完整 SSE 摘要流，stop_reason 可控——
+// 用于锁「stop_reason=max_tokens 的半截摘要不得替换历史」。
+func writeSummarySSEWithStopReason(w http.ResponseWriter, text, stopReason string) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	_, _ = w.Write([]byte(
+		"data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"claude-x\"}}\n\n" +
+			"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" +
+			"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"" + text + "\"}}\n\n" +
+			"data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" +
+			"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"" + stopReason + "\"}}\n\n" +
+			"data: [DONE]\n\n"))
+}
+
+// TestCompactRejectsMaxTokensTruncatedSummary 锁截断契约：上游 200 + 完整
+// SSE 但 stop_reason=max_tokens 时，Compact 必须报错且不发第二次请求（截断
+// 是确定性的，重试只是双倍烧钱）；stop_reason=end_turn 的同形流正常成功。
+//
+// 变异守卫：摘掉 EventStop 的 stop_reason 校验，第一臂即红（半截摘要被
+// 非空校验放行、替换历史，丢的恰是最接近当前的后半段）。
+func TestCompactRejectsMaxTokensTruncatedSummary(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]interface{}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if !isCompactSummaryRequest(body) {
+			writeSimpleText(w, "ok")
+			return
+		}
+		atomic.AddInt32(&hits, 1)
+		// 非空文本 + 截断停止：只看文本内容的旧校验会把它当成功放行。
+		writeSummarySSEWithStopReason(w, "半截摘要：用户在修 comp", "max_tokens")
+	}))
+	defer srv.Close()
+
+	messages := compactionFixture()
+	tailBudget := estimateMessageTokens(messages[6]) + estimateMessageTokens(messages[5]) + estimateMessageTokens(messages[4])
+	cfg := &Config{Client: NewClient(srv.URL), Model: "claude-x", ContextWindow: tailBudget * compactTailRatioDen}
+	_, _, err := Compact(t.Context(), cfg, messages, "auto")
+	var trunc *compactSummaryTruncatedError
+	if !errors.As(err, &trunc) {
+		t.Fatalf("max_tokens 截断的摘要应报错, got %v", err)
+	}
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Fatalf("上游命中 %d 次, want 1（截断确定性，不得重试）", got)
+	}
+
+	// 对照臂：同样的流形，stop_reason=end_turn → 正常成功。
+	var okHits int32
+	okSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]interface{}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if !isCompactSummaryRequest(body) {
+			writeSimpleText(w, "ok")
+			return
+		}
+		atomic.AddInt32(&okHits, 1)
+		writeSummarySSEWithStopReason(w, "完整摘要正文", "end_turn")
+	}))
+	defer okSrv.Close()
+	cfgOK := &Config{Client: NewClient(okSrv.URL), Model: "claude-x", ContextWindow: tailBudget * compactTailRatioDen}
+	compacted, _, err := Compact(t.Context(), cfgOK, messages, "auto")
+	if err != nil {
+		t.Fatalf("end_turn 摘要应成功: %v", err)
+	}
+	if !strings.Contains(headMessageText(t, compacted), "完整摘要正文") {
+		t.Fatalf("end_turn 摘要应替换进历史, got %q", headMessageText(t, compacted))
+	}
+}
+
+// TestAutoCompactTruncatedSummaryKeepsHistory 锁 run 侧：截断错误走修复-2 的
+// 失败路径（计一次失败、进冷却），r.history 不得被半截摘要替换。
+func TestAutoCompactTruncatedSummaryKeepsHistory(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]interface{}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if isCompactSummaryRequest(body) {
+			writeSummarySSEWithStopReason(w, "半截摘要", "max_tokens")
+			return
+		}
+		writeSimpleText(w, "ok")
+	}))
+	defer srv.Close()
+
+	logs := []string{}
+	r := newCompactIntegrityRunner(t, srv.URL, &logs)
+	before := append([]Message(nil), r.history...)
+	r.maybeAutoCompact(t.Context())
+
+	if r.autoCompacts != 0 {
+		t.Fatalf("autoCompacts = %d, want 0（截断不得算成功压缩）", r.autoCompacts)
+	}
+	if len(r.history) != len(before) {
+		t.Fatalf("历史被替换：before=%d 条 after=%d 条", len(before), len(r.history))
+	}
+	for i := range before {
+		if before[i].Role != r.history[i].Role {
+			t.Fatalf("历史第 %d 条被改动: %q → %q", i, before[i].Role, r.history[i].Role)
+		}
+	}
+	if r.compactFailures != 1 || r.compactCooldown != compactFailureCooldownTurns {
+		t.Fatalf("截断应走失败路径进冷却, failures=%d cooldown=%d", r.compactFailures, r.compactCooldown)
+	}
 }

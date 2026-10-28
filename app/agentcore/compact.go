@@ -286,6 +286,16 @@ const compactSummaryInstruction = "请为上面这段对话生成压缩摘要。
 // 重试也不会让宿主/手机看到重复事件。回合主流恰恰相反：文本累积与已下发帧
 // 都挂在调用方身上，重试必然重复内容。ctx 取消/超时不重试——那不是上游的
 // 瞬态故障，重试只会拖住取消路径。
+// compactSummaryTruncatedError 表示摘要回复被 max_tokens 截断
+// （stop_reason=max_tokens）。截断丢的恰是最接近当前的后半段，半截摘要绝不
+// 能替换历史；且同一输入、同一输出上限下截断是确定性的——重试只会原样再截
+// 一次，白烧一份全窗口请求。
+type compactSummaryTruncatedError struct{}
+
+func (e *compactSummaryTruncatedError) Error() string {
+	return fmt.Sprintf("agentcore: 压缩摘要在输出上限 %d tokens 处被截断（stop_reason=max_tokens），拒绝用半截摘要替换历史", compactSummaryMaxTokens)
+}
+
 func compactSummarize(ctx context.Context, cfg *Config, prefix []Message, window int) (string, error) {
 	transcript := renderCompactTranscript(prefix, window/compactTranscriptRatioDen)
 	if strings.TrimSpace(transcript) == "" {
@@ -299,10 +309,14 @@ func compactSummarize(ctx context.Context, cfg *Config, prefix []Message, window
 	}
 	attempt := func() (string, error) {
 		var b strings.Builder
+		// stop_reason 由 message_delta 带到 EventStop（内核五修后字段齐全）。
+		stopReason := ""
 		err := cfg.Client.Stream(ctx, req, func(ev StreamEvent) error {
 			switch ev.Kind {
 			case EventText:
 				b.WriteString(ev.Text)
+			case EventStop:
+				stopReason = ev.StopReason
 			case EventError:
 				return ev.Err
 			}
@@ -311,11 +325,21 @@ func compactSummarize(ctx context.Context, cfg *Config, prefix []Message, window
 		if err != nil {
 			return "", fmt.Errorf("agentcore: 压缩摘要请求失败: %w", err)
 		}
+		if stopReason == StopReasonMaxTokens {
+			// 只处理 EventText 的旧回调会把半截摘要照常通过非空校验替换
+			// 历史。end_turn 等正常停止照旧走成功路径。
+			return "", &compactSummaryTruncatedError{}
+		}
 		return b.String(), nil
 	}
 	summary, err := attempt()
 	if err == nil {
 		return summary, nil
+	}
+	var trunc *compactSummaryTruncatedError
+	if errors.As(err, &trunc) {
+		// 截断是确定性的，不重试（见 compactSummaryTruncatedError 注释）。
+		return "", err
 	}
 	if ctx.Err() != nil ||
 		errors.Is(err, context.Canceled) ||
