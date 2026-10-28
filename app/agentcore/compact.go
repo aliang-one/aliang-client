@@ -69,7 +69,32 @@ const (
 	// compactRenderEntryMaxChars 限制单条消息进摘要请求的长度：一条巨大的
 	// 工具输出不该吃掉整个摘要预算。
 	compactRenderEntryMaxChars = 8000
+
+	// compactProgressThrottleChars 控制压缩进度回调的节流粒度：摘要文本每
+	// 累计约 2k 字符至多回调一次。选字符数不选时间：单测完全确定（不依赖
+	// 时钟与真实流速率）；常见摘要速率（20-25 tok/s，约 4 字符/token）下
+	// 2k 字符 ≈ 20-30s 一帧，远小于宿主 5min 的 stale 阈值，又不会在高速
+	// 流里刷屏。
+	compactProgressThrottleChars = 2048
 )
+
+// compactOptions 收拢 Compact 的可选参数。零值即默认行为。
+type compactOptions struct {
+	onProgress func(summaryTokens int)
+}
+
+// CompactOption 是 Compact 的可选参数。变参是为了既有调用点（四参形态）零
+// 改动——压缩进度是内核对宿主的增量能力，不是新契约。
+type CompactOption func(*compactOptions)
+
+// WithCompactProgress 注册压缩进度观察者：摘要仍在流式产出时按
+// compactProgressThrottleChars 节流回调，参数是摘要至今的估算 token 数。
+// 压缩期全程零帧的话，一段 8192 token 的慢摘要（20-25 tok/s > 5min）会被
+// 宿主的 stale 扫描器误杀——这是宿主刷活性的唯一入口（WithRetryNotice 的
+// 压缩版）。
+func WithCompactProgress(fn func(summaryTokens int)) CompactOption {
+	return func(o *compactOptions) { o.onProgress = fn }
+}
 
 // ErrNothingToCompact 表示历史还没有多到值得压缩。
 var ErrNothingToCompact = errors.New("agentcore: 没有可压缩的历史消息")
@@ -162,12 +187,19 @@ func estimateBlockTokens(b ContentBlock) int {
 //
 // 返回的新消息列表可以直接作为下一轮 Run 的输入，也可以由宿主落库成新历史。
 // trigger 只用于 CompactInfo（"auto" / "manual"），不影响压缩行为。
-func Compact(ctx context.Context, cfg *Config, messages []Message, trigger string) ([]Message, CompactInfo, error) {
+// opts 可注册压缩进度观察者（见 WithCompactProgress）。
+func Compact(ctx context.Context, cfg *Config, messages []Message, trigger string, opts ...CompactOption) ([]Message, CompactInfo, error) {
 	if cfg == nil || cfg.Client == nil {
 		return nil, CompactInfo{}, errors.New("agentcore: 未配置 Client")
 	}
 	if strings.TrimSpace(cfg.Model) == "" {
 		return nil, CompactInfo{}, errors.New("agentcore: 未配置 Model")
+	}
+	var co compactOptions
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&co)
+		}
 	}
 	window := cfg.ContextWindow
 	if window <= 0 {
@@ -180,7 +212,7 @@ func Compact(ctx context.Context, cfg *Config, messages []Message, trigger strin
 		return nil, CompactInfo{}, ErrNothingToCompact
 	}
 
-	summary, err := compactSummarize(ctx, cfg, messages[:split], window)
+	summary, err := compactSummarize(ctx, cfg, messages[:split], window, co.onProgress)
 	if err != nil {
 		return nil, CompactInfo{}, err
 	}
@@ -296,7 +328,7 @@ func (e *compactSummaryTruncatedError) Error() string {
 	return fmt.Sprintf("agentcore: 压缩摘要在输出上限 %d tokens 处被截断（stop_reason=max_tokens），拒绝用半截摘要替换历史", compactSummaryMaxTokens)
 }
 
-func compactSummarize(ctx context.Context, cfg *Config, prefix []Message, window int) (string, error) {
+func compactSummarize(ctx context.Context, cfg *Config, prefix []Message, window int, onProgress func(int)) (string, error) {
 	transcript := renderCompactTranscript(prefix, window/compactTranscriptRatioDen)
 	if strings.TrimSpace(transcript) == "" {
 		return "", ErrNothingToCompact
@@ -311,10 +343,20 @@ func compactSummarize(ctx context.Context, cfg *Config, prefix []Message, window
 		var b strings.Builder
 		// stop_reason 由 message_delta 带到 EventStop（内核五修后字段齐全）。
 		stopReason := ""
+		// 进度节流游标：builder 每次尝试重置，游标随之重置。
+		lastProgressChars := 0
+		maybeProgress := func() {
+			if onProgress == nil || b.Len()-lastProgressChars < compactProgressThrottleChars {
+				return
+			}
+			lastProgressChars = b.Len()
+			onProgress(estimateTextTokens(b.String()))
+		}
 		err := cfg.Client.Stream(ctx, req, func(ev StreamEvent) error {
 			switch ev.Kind {
 			case EventText:
 				b.WriteString(ev.Text)
+				maybeProgress()
 			case EventStop:
 				stopReason = ev.StopReason
 			case EventError:

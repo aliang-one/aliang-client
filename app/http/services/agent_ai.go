@@ -6487,6 +6487,25 @@ func streamStructuredAIDelta(reader io.Reader, format agentAIOutputFormat, run a
 			_ = writeJSON(progress)
 			continue
 		}
+		// agentcore 内核的压缩进度帧：{"type":"system","subtype":
+		// "compact_progress","summary_tokens":N}。压缩期是全程零 delta 的长
+		// 静默（8192 token 的慢摘要在 20-25 tok/s 下超过 5min stale 阈值），
+		// 这帧是服务层唯一活性信号；markProgress 同时刷新 stale 扫描器与
+		// steer 活性窗（同源 idleFor）。与 api_retry 同一套镜像模式。
+		//
+		// 刻意不转发给手机：CLI 路径的压缩提示是 compact_boundary 完成帧
+		// （claudeCompactNotice），手机契约里没有「压缩中」态，转发需要新增
+		// 手机契约字段——按最小改动只做 markProgress + 日志；压缩完成时用户
+		// 仍会收到既有的 compact_boundary 可见提示。
+		if format == agentAIOutputClaudeStreamJSON &&
+			remoteString(event, "type") == "system" &&
+			remoteString(event, "subtype") == "compact_progress" {
+			run.activity.markProgress()
+			logger.Info(fmt.Sprintf(
+				"ai.run.compact_progress: session=%s runSeq=%d summary_tokens=%v",
+				run.sessionID, run.runSeq, event["summary_tokens"]))
+			continue
+		}
 		// Claude steer：第一个 result 事件意味着本 turn 的产出已定稿。
 		// 关闭 stdin 让 CLI 自然退出（约 0.5s）；实测「已进入管道」的 steer
 		// 仍会被 CLI 读完并执行，所以这里不必等待队列排空。放在错误分支之前，

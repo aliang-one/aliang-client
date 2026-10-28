@@ -634,7 +634,18 @@ func (r *runner) maybeAutoCompact(ctx context.Context) {
 		return
 	}
 
-	compacted, info, err := Compact(ctx, r.compactConfig(), r.history, "auto")
+	// 压缩进度 → 宿主活性帧：压缩期是零 delta 的长静默（8192 token 的慢
+	// 摘要在 20-25 tok/s 下超过 5min stale 阈值），没有这帧健康的慢压缩会被
+	// 误杀。帧写失败只记日志，不拖累压缩本身。
+	var compactOpts []CompactOption
+	if r.writer != nil {
+		compactOpts = append(compactOpts, WithCompactProgress(func(summaryTokens int) {
+			if err := r.writer.CompactProgress(summaryTokens); err != nil {
+				r.logf("agentcore: 写 compact_progress 帧失败: %v", err)
+			}
+		}))
+	}
+	compacted, info, err := Compact(ctx, r.compactConfig(), r.history, "auto", compactOpts...)
 	if err != nil {
 		if errors.Is(err, ErrNothingToCompact) {
 			return

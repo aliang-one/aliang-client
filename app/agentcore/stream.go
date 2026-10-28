@@ -141,6 +141,25 @@ func (w *streamWriter) RetryNotice(n RetryNotice) error {
 	return w.writeFrame(frame)
 }
 
+// CompactProgress 发一次 system/compact_progress：自动压缩的摘要仍在流式
+// 产出。
+//
+// 帧形是内核自造的 subtype——claude CLI 压缩期间不发任何帧，宿主没有现成
+// subtype 可对齐；宿主 decoder 对未知 system subtype 安全忽略，旧宿主不会
+// 因此报错。但它的存在意义就是被宿主认出来 markProgress 刷活性：压缩期全程
+// 零帧的话，8192 token 的慢摘要（20-25 tok/s > 5min）会被 stale 扫描器误杀
+// （steer 活性窗同源 idleFor，一并受益）。summary_tokens 是摘要至今的估算
+// token 数，仅供宿主日志。
+func (w *streamWriter) CompactProgress(summaryTokens int) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.writeFrame(map[string]interface{}{
+		"type":           "system",
+		"subtype":        "compact_progress",
+		"summary_tokens": summaryTokens,
+	})
+}
+
 // TurnStart 发 message_start，确立本回合的 provider 消息 id。
 func (w *streamWriter) TurnStart(messageID, model string) error {
 	w.mu.Lock()

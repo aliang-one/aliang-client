@@ -364,3 +364,122 @@ func TestAutoCompactTruncatedSummaryKeepsHistory(t *testing.T) {
 		t.Fatalf("截断应走失败路径进冷却, failures=%d cooldown=%d", r.compactFailures, r.compactCooldown)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 压缩进度活性帧（WithCompactProgress）
+// ---------------------------------------------------------------------------
+
+// TestCompactProgressThrottledByChars 锁节流：10 段 500 字符的摘要增量
+// （5000 字符）按每 2k 字符至多一帧的粒度恰好回调 2 次（累计 2500 与 5000
+// 处），而不是每段一帧。
+func TestCompactProgressThrottledByChars(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]interface{}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if !isCompactSummaryRequest(body) {
+			writeSimpleText(w, "ok")
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		var b strings.Builder
+		b.WriteString("data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"claude-x\"}}\n\n" +
+			"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n")
+		for i := 0; i < 10; i++ {
+			chunk := strings.Repeat("a", 500)
+			b.WriteString("data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"" + chunk + "\"}}\n\n")
+		}
+		b.WriteString("data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" +
+			"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n" +
+			"data: [DONE]\n\n")
+		_, _ = w.Write([]byte(b.String()))
+	}))
+	defer srv.Close()
+
+	messages := compactionFixture()
+	tailBudget := estimateMessageTokens(messages[6]) + estimateMessageTokens(messages[5]) + estimateMessageTokens(messages[4])
+	cfg := &Config{Client: NewClient(srv.URL), Model: "claude-x", ContextWindow: tailBudget * compactTailRatioDen}
+	_, _, err := Compact(t.Context(), cfg, messages, "auto", WithCompactProgress(func(int) {
+		atomic.AddInt32(&calls, 1)
+	}))
+	if err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("进度回调 %d 次, want 2（5000 字符按每 2k 至多一帧）", got)
+	}
+}
+
+// TestAutoCompactEmitsCompactProgressFrames 锁 run 侧接线：自动压缩期间进度
+// 帧必须经 streamWriter 发给宿主（帧形 system/compact_progress + 摘要估算
+// token 数），且与既有 compact_boundary 帧并存。
+func TestAutoCompactEmitsCompactProgressFrames(t *testing.T) {
+	var mu sync.Mutex
+	summaryServed := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]interface{}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		mu.Lock()
+		isSummary := isCompactSummaryRequest(body)
+		if isSummary {
+			summaryServed = true
+		}
+		mu.Unlock()
+		if !isSummary {
+			writeSimpleText(w, "ok")
+			return
+		}
+		// 一段 3000 字符的摘要：超过 2k 节流线，至少触发一次进度回调。
+		w.Header().Set("Content-Type", "text/event-stream")
+		chunk := strings.Repeat("甲", 3000)
+		_, _ = w.Write([]byte(
+			"data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"claude-x\"}}\n\n" +
+				"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" +
+				"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"" + chunk + "\"}}\n\n" +
+				"data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" +
+				"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n" +
+				"data: [DONE]\n\n"))
+	}))
+	defer srv.Close()
+
+	rec := &frameRecorder{}
+	cfg := &Config{
+		Client:        NewClient(srv.URL),
+		Model:         "claude-x",
+		ContextWindow: 800,
+		Emit:          rec.emit,
+	}
+	if _, err := Run(t.Context(), cfg, compactionBigHistory()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	mu.Lock()
+	served := summaryServed
+	mu.Unlock()
+	if !served {
+		t.Fatal("自动压缩未发生，测试前提不成立")
+	}
+	progressFrames := 0
+	for _, f := range rec.frames(t) {
+		if typ, _ := f["type"].(string); typ != "system" {
+			continue
+		}
+		if sub, _ := f["subtype"].(string); sub == "compact_progress" {
+			progressFrames++
+			if n, ok := f["summary_tokens"].(float64); !ok || n <= 0 {
+				t.Fatalf("compact_progress 帧缺 summary_tokens: %v", f)
+			}
+		}
+	}
+	if progressFrames == 0 {
+		t.Fatal("自动压缩未发出任何 system/compact_progress 活性帧")
+	}
+	foundBoundary := false
+	for _, f := range rec.frames(t) {
+		if sub, _ := f["subtype"].(string); sub == "compact_boundary" {
+			foundBoundary = true
+		}
+	}
+	if !foundBoundary {
+		t.Fatal("compact_boundary 帧丢失：进度帧不得挤掉完成提示")
+	}
+}
