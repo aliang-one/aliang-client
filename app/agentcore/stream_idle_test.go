@@ -215,3 +215,14 @@ func TestStreamCompletesWhenConnectionStaysOpenAfterMessageStop(t *testing.T) {
 		t.Fatal("Stream did not return after message_stop; idle guard must not be the exit path")
 	}
 }
+
+// TestStreamIdleDefaultWindow：默认静默窗口 10 分钟。90s 时代在高负载上游
+// 属于误杀——网关排队/模型慢思考可以合法静默超过 90s（用户实测反馈）。
+// 10min 与宿主 idle 看门狗同窗（10min 窗、30s 拍），字节级计时器通常先触发，
+// 且 streamIdleError 的「不可重试」语义给出比 idle_timeout 更精确的归因。
+// 半开连接检测语义不变：窗口内一个字节都没有才算死。
+func TestStreamIdleDefaultWindow(t *testing.T) {
+	if streamIdleDefault != 10*time.Minute {
+		t.Fatalf("streamIdleDefault = %s, want 10m（2026-10-28 放宽,用户拍板）", streamIdleDefault)
+	}
+}

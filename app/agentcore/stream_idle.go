@@ -11,10 +11,15 @@ import (
 
 // streamIdleDefault 是 SSE 两次字节到达之间的最长静默时间默认值。
 //
-// 上游协议带 ping 保活，正常的长时间回合不会静默这么久；一旦窗口内一个字节
-// 都没到，说明连接已半开或上游停滞，必须中断读取——否则 Read 会永久阻塞，
-// 整轮 run 卡死在 agentcore.Run 内部（2026-10-27 事故形态）。
-const streamIdleDefault = 90 * time.Second
+// 上游协议带 ping 保活；一旦窗口内一个字节都没到，说明连接已半开或上游
+// 停滞，必须中断读取——否则 Read 会永久阻塞，整轮 run 卡死在
+// agentcore.Run 内部（2026-10-27 事故形态）。
+//
+// 90s → 10min（2026-10-28）：高负载下网关排队/模型慢思考可以合法静默远超
+// 90s，旧窗口属于误杀健康流。10min 与宿主 idle 看门狗同窗（10min 窗、30s
+// 拍），字节级计时器通常先触发，且 streamIdleError 的不可重试语义给出比
+// idle_timeout 更精确的归因。半开检测语义不变：窗口内零字节才算死。
+const streamIdleDefault = 10 * time.Minute
 
 // streamIdleEnvKey 是覆盖上面默认值的环境变量（time.ParseDuration 语法）。
 // 0=禁用（仅测试用）。

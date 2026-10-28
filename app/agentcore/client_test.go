@@ -427,8 +427,19 @@ func TestStreamReducesMaxTokensOnRejection(t *testing.T) {
 	if _, err := collect(t, NewClient(srv.URL), &MessagesRequest{Model: "claude-x"}); err != nil {
 		t.Fatalf("降级后应成功，实际: %v", err)
 	}
-	if len(seen) < 2 || seen[0] != defaultMaxTokens || seen[1] != 16000 {
-		t.Fatalf("max_tokens 序列 = %v，期望以 [%d 16000 ...] 开头", seen, defaultMaxTokens)
+	// 断言梯子语义而非固定步数:首请求=默认值,此后逐次减半,直到 ≤模型上限
+	// (16000)才成功。旧断言钉死了「恰好一步到 16000」,那是默认 32000 的
+	// 减半巧合;默认提到 64000 后梯子是 64000→32000→16000,行为不变。
+	if len(seen) < 2 || seen[0] != defaultMaxTokens {
+		t.Fatalf("max_tokens 序列 = %v，首请求应为默认值 %d", seen, defaultMaxTokens)
+	}
+	for i := 1; i < len(seen); i++ {
+		if seen[i] != seen[i-1]/2 {
+			t.Fatalf("max_tokens 序列 = %v，第 %d 次应为主请求减半 %d", seen, i, seen[i-1]/2)
+		}
+	}
+	if seen[len(seen)-1] != 16000 {
+		t.Fatalf("max_tokens 终值 = %d, want 16000(模型上限)", seen[len(seen)-1])
 	}
 }
 
@@ -849,5 +860,19 @@ func TestStreamNoRetryNoticeOnNonRetryableFailure(t *testing.T) {
 	}
 	if len(notices) != 0 {
 		t.Fatalf("retry 帧数 = %d, want 0（未重试不发帧）", len(notices))
+	}
+}
+
+// TestDefaultMaxTokensHeadroom：默认输出上限 64000。1M 窗口世代（gpt6.1 级）
+// 模型的输出上限普遍 ≥64k,32000 会让一次超大文件写入在 in-band 截断,触发
+// 「整批工具调用丢弃重试」——用户看到 AI 说写完了文件却没变。小输出模型
+// 由 reduceMaxTokens 的 400 逐次减半兜底（64k→32k→16k→8k）,放大默认值的
+// 代价只是低配模型首次请求多一轮 400。
+func TestDefaultMaxTokensHeadroom(t *testing.T) {
+	if defaultMaxTokens != 64000 {
+		t.Fatalf("defaultMaxTokens = %d, want 64000（2026-10-28 放宽,用户拍板）", defaultMaxTokens)
+	}
+	if minMaxTokens >= defaultMaxTokens {
+		t.Fatalf("minMaxTokens(%d) 必须小于 defaultMaxTokens(%d)", minMaxTokens, defaultMaxTokens)
 	}
 }
