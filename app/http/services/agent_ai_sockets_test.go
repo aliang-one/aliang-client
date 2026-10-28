@@ -88,6 +88,24 @@ func TestAISocketSubscribeUnknownSessionOK(t *testing.T) {
 	m.unregisterAISocket(sock.id)
 }
 
+// TestAISocketSubscribeCapClearsOldestSet 订阅数上限（评审 M5）：第 cap+1 个
+// 订阅生效，之前的整组被清（与 completedApprovals 封顶同风格）；无错误、无
+// panic——「socket 突然收不到事件」的排查入口是 subscribeAISocket 的 Warn。
+func TestAISocketSubscribeCapClearsOldestSet(t *testing.T) {
+	m := newTestAISocketsManager(t)
+	sock := m.registerAISocket("local", func(interface{}) error { return nil })
+	defer m.unregisterAISocket(sock.id)
+	for i := 0; i < agentAISocketSubCap+1; i++ {
+		m.subscribeAISocket(sock.id, fmt.Sprintf("s-%d", i))
+	}
+	if sock.subscribed("s-0") {
+		t.Fatal("超限全清后首个订阅应消失")
+	}
+	if !sock.subscribed(fmt.Sprintf("s-%d", agentAISocketSubCap)) {
+		t.Fatal("第 cap+1 个订阅应生效")
+	}
+}
+
 // TestRemoteSocketReRegistration 远端重注册契约：同键换新、旧 socket 关闭、
 // 注册表恒只有一条 remote（回归 2026-10-28 AB-BA 死锁：驱逐曾持 m.mu 进
 // closeOnce.Do，与慢消费者摘除路径互锁）。
@@ -419,6 +437,61 @@ func TestDispatchLocalAISubscribeCarriesTranscriptAndPending(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("未收到快照")
+	}
+}
+
+// TestDispatchLocalAISnapshotTranscriptBounded 快照转录传输层限幅（评审 I1）：
+// 单条文本按清单口径截断（agentVibeTranscriptMaxContentRunes，与
+// agent_inventory_agentcore.go 同一 helper），总条数只保最近
+// agentAISnapshotTranscriptCap 条。解析器 readAgentCoreJournalHistoryFrom
+// 必须仍返回全文——Task 11 内存续聊恢复靠它，截断只发生在快照传输层。
+func TestDispatchLocalAISnapshotTranscriptBounded(t *testing.T) {
+	m := newTestAISocketsManager(t)
+	svc := &AgentService{ai: m}
+	dir := t.TempDir()
+	m.coreJournal = newAgentCoreJournal(dir)
+	ts := time.Now().UTC().Format(time.RFC3339)
+	m.coreJournal.ensureSessionHeader("s-bound", "/proj", "glm-5.3", ts)
+	for i := 0; i < 210; i++ {
+		m.coreJournal.appendUser("s-bound", fmt.Sprintf("m-%d", i), fmt.Sprintf("问%d", i), ts)
+	}
+	// 末条超长（5000 rune）：验证单条截断到恰好 agentVibeTranscriptMaxContentRunes。
+	big := strings.Repeat("长", 5000)
+	m.coreJournal.appendUser("s-bound", "m-big", big, ts)
+
+	replies := make(chan map[string]interface{}, 8)
+	svc.DispatchLocalAI(map[string]interface{}{
+		"type":       models.AgentEventAISessionSubscribe,
+		"session_id": "s-bound",
+	}, func(p interface{}) error { replies <- p.(map[string]interface{}); return nil })
+	var p map[string]interface{}
+	select {
+	case p = <-replies:
+	case <-time.After(2 * time.Second):
+		t.Fatal("未收到快照")
+	}
+	tr, _ := p["transcript"].([]map[string]interface{})
+	if len(tr) != agentAISnapshotTranscriptCap {
+		t.Fatalf("快照转录应限 %d 条,实际 %d", agentAISnapshotTranscriptCap, len(tr))
+	}
+	// 共 211 条，丢最旧 11 条 → 首条应是问11（保最近 200 条）。
+	if got, _ := tr[0]["text"].(string); got != "问11" {
+		t.Fatalf("应丢弃最旧、保留最近 %d 条: 首条=%v", agentAISnapshotTranscriptCap, tr[0]["text"])
+	}
+	last, _ := tr[len(tr)-1]["text"].(string)
+	if n := len([]rune(last)); n != agentVibeTranscriptMaxContentRunes {
+		t.Fatalf("末条超长文本应截断到 %d rune,实际 %d", agentVibeTranscriptMaxContentRunes, n)
+	}
+	// 解析器本身仍返回全文（Task 11 内存恢复依赖，I1 只许动传输层）。
+	hist, _, err := readAgentCoreJournalHistoryFrom(dir, "s-bound")
+	if err != nil {
+		t.Fatalf("读回失败: %v", err)
+	}
+	if len(hist) != 211 {
+		t.Fatalf("解析器应返回全部 211 条,实际 %d", len(hist))
+	}
+	if hist[len(hist)-1].Content != big {
+		t.Fatal("解析器必须保留全文（截断只在快照传输层）")
 	}
 }
 

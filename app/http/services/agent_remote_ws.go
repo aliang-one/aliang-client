@@ -1015,10 +1015,14 @@ func (s *AgentService) DispatchLocalAI(msg map[string]interface{}, writeJSON fun
 		// 到达，无设备控制门语境。
 		// 刻意不扇出的回包（N2 记录）：steer ack 与 session.created 仍走
 		// origin 写——插话方/发起方自己直接收，另一端靠快照/清单刷新可见。
+		// 半订阅（评审 M4）：帧缺 __origin_socket 标记时 socketID 为空串，
+		// subscribeAISocket 对未知 id no-op——什么都不订阅，但快照照发（只读
+		// 握手，无害）。生产路径 HandleAIStream 恒盖章（socketID=="" 仅本地
+		// socket 注册失败的极端场景），刻意不在读循环上打 Warn 防刷屏。
 		socketID := strings.TrimSpace(remoteString(msg, agentAIOriginSocketField))
 		sessionID := remoteString(msg, "session_id")
 		if sessionID == "" {
-			_ = writeJSON(agentAIErrorPayload("", "", errors.New("ai.session.subscribe missing session_id")))
+			_ = writeJSON(agentAIErrorPayload("", "", fmt.Errorf("%s missing session_id", msgType)))
 			return
 		}
 		if msgType == models.AgentEventAISessionSubscribe {

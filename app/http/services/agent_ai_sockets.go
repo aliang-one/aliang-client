@@ -34,6 +34,10 @@ const agentAISocketQueueCap = 64
 // 清掉不构成正确性问题。
 const agentAISocketSubCap = 64
 
+// agentAISnapshotTranscriptCap 订阅快照的转录条数上限：只保最近 N 条（journal
+// 文件顺序即时间序）。与清单扫描的行数上限同数量级（agentVibeIndexMaxLines=240）。
+const agentAISnapshotTranscriptCap = 200
+
 // agentAIOriginSocketField 入站消息的内部来源 socket 标记。由两条分发路径
 // （handleRemoteAgentMessage AI 分支盖 "remote"、HandleAIStream 盖本地 socket
 // id）在分发前注入，message()/create()/runUserMessage 读取后落到
@@ -215,7 +219,12 @@ func (m *agentAIManager) subscribeAISocket(socketID, sessionID string) {
 	if s := m.aiSockets[socketID]; s != nil {
 		s.mu.Lock()
 		if len(s.subs) >= agentAISocketSubCap {
+			cleared := len(s.subs)
 			s.subs = make(map[string]struct{})
+			// 观测点（评审 M5）：超限全清必须留痕——否则「我的 socket 突然
+			// 收不到事件了」没有任何排查入口。Warn 在 m.mu+s.mu 内同步打，
+			// logger 自持锁、与注册表锁无交集，无死锁环。
+			logger.Warn(fmt.Sprintf("[AI-SOCKET] subscribe cap reached, socket=%s cleared=%d", socketID, cleared))
 		}
 		s.subs[sessionID] = struct{}{}
 		s.mu.Unlock()
@@ -256,9 +265,21 @@ func (m *agentAIManager) emitSessionSnapshot(socketID, sessionID string, writeJS
 		dir = m.coreJournal.dir
 	}
 	if hist, _, err := readAgentCoreJournalHistoryFrom(dir, sessionID); err == nil && len(hist) > 0 {
+		// 传输层限幅（评审 I1）：单条文本按清单口径截断（agentVibeTranscript-
+		// MaxContentRunes，与 agent_inventory_agentcore.go 的转录生成同一
+		// helper/常量，rune 安全不断 UTF-8），总数只保最近
+		// agentAISnapshotTranscriptCap 条——一条倾倒大文件的 assistant 消息
+		// 原样上 WS 就是几十 MB。解析器保持全文：Task 11 内存续聊恢复复用
+		// readAgentCoreJournalHistoryFrom，截断只发生在快照传输层。
+		if len(hist) > agentAISnapshotTranscriptCap {
+			hist = hist[len(hist)-agentAISnapshotTranscriptCap:]
+		}
 		tr := make([]map[string]interface{}, 0, len(hist))
 		for _, msg := range hist {
-			row := map[string]interface{}{"role": msg.Role, "text": msg.Content}
+			row := map[string]interface{}{
+				"role": msg.Role,
+				"text": truncateAgentText(msg.Content, agentVibeTranscriptMaxContentRunes),
+			}
 			if msg.MessageID != "" {
 				row["message_id"] = msg.MessageID
 			}
