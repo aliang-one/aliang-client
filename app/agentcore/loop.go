@@ -654,11 +654,11 @@ func (r *runner) maybeAutoCompact(ctx context.Context) {
 		r.compactCooldown = compactFailureCooldownTurns
 		if r.compactFailures >= compactFailureLimit {
 			r.logf("agentcore: 自动压缩连续失败 %d 次，本次运行不再自动压缩（上下文超限时仍有降级压缩兜底）: %v session=%s",
-				r.compactFailures, err, r.writer.sessionID)
+				r.compactFailures, err, r.sid())
 			return
 		}
 		r.logf("agentcore: 自动压缩失败，跳过接下来 %d 个回合再试: %v session=%s",
-			r.compactCooldown, err, r.writer.sessionID)
+			r.compactCooldown, err, r.sid())
 		return
 	}
 	// 成功即清零失败与冷却：偶发一次失败不该影响后续的压缩节奏。
