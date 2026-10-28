@@ -82,6 +82,10 @@ jobs:
       - frontend
     if: needs.guard.outputs.on_master == 'true'
     runs-on: ${{ matrix.runner }}
+    # Hard ceiling for the whole build job: a hung codesign/keychain state
+    # must never hold a release hostage for GitHub's 6h default (v1.1.84
+    # hung 2h+ inside the packaging step before being cancelled).
+    timeout-minutes: 45
     env:
       # Signing master switch: true only when the Developer ID p12 secrets are
       # configured. Step-level `if` cannot read the secrets context directly,
@@ -203,8 +207,17 @@ jobs:
           done
 
           security import "$P12" -k "$KC" -P "$MAC_P12_PASSWORD" \
-            -T /usr/bin/codesign -T /usr/bin/pkgbuild -T /usr/bin/productsign
-          security set-key-partition-list -S apple-tool:,apple: -s -k "$KP" "$KC" >/dev/null
+            -T /usr/bin/codesign -T /usr/bin/pkgbuild -T /usr/bin/productsign -T /usr/bin/productbuild
+          # set-key-partition-list exits 0 even when it fails to re-wrap a key
+          # ("User interaction is not allowed"), which later surfaces as
+          # codesign hanging forever on a headless runner waiting for a GUI
+          # prompt nobody can click. Detect it here and fail loudly instead.
+          SKPL_OUT="$(security set-key-partition-list -S apple-tool:,apple: -s -k "$KP" "$KC" 2>&1)"
+          if printf '%s\n' "$SKPL_OUT" | grep -qi 'not allowed\|user interaction'; then
+            echo "::error::set-key-partition-list could not re-wrap the imported keys; signing would hang later. Output:"
+            printf '%s\n' "$SKPL_OUT"
+            exit 1
+          fi
           security default-keychain -s "$KC"
           rm -f "$P12"
 
@@ -230,6 +243,29 @@ jobs:
             echo "::error::Signing identity team '$TEAM_ID_INST' does not match EXPECTED_TEAM_ID '$EXPECTED_TEAM_ID'"
             exit 1
           fi
+
+          # Smoke-sign with BOTH identities under a hard 90s alarm. A first-use
+          # keychain prompt (headless runner, nobody to click) or a TSA stall
+          # fails HERE in seconds with a clear error instead of hanging the
+          # packaging step silently for hours (v1.1.84 lesson).
+          SMK="$RUNNER_TEMP/smoke-sign"
+          printf 'aliang-signing-smoke\n' > "$SMK"
+          if ! perl -e 'alarm shift; exec @ARGV' 90 \
+            codesign --force --timestamp --sign "$APP_ID" "$SMK"; then
+            echo "::error::smoke signing with Developer ID Application hung (90s alarm) or failed - keychain ACL / partition-list / TSA problem"
+            exit 1
+          fi
+          codesign --verify "$SMK"
+          SMKROOT="$RUNNER_TEMP/smoke-root"
+          mkdir -p "$SMKROOT"
+          printf 'x\n' > "$SMKROOT/f"
+          if ! perl -e 'alarm shift; exec @ARGV' 90 \
+            pkgbuild --root "$SMKROOT" --identifier one.aliang.smoke --version 1.0 --sign "$INST_ID" "$RUNNER_TEMP/smoke.pkg"; then
+            echo "::error::smoke signing with Developer ID Installer hung (90s alarm) or failed - keychain ACL / partition-list / TSA problem"
+            exit 1
+          fi
+          rm -rf "$SMK" "$SMKROOT" "$RUNNER_TEMP/smoke.pkg"
+
           {
             echo "MAC_APPLICATION_IDENTITY=$APP_ID"
             echo "MAC_INSTALLER_IDENTITY=$INST_ID"
