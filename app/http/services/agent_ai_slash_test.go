@@ -92,24 +92,42 @@ func TestHandleLocalSlashCommand(t *testing.T) {
 		}
 	})
 
-	t.Run("compact replies headless unsupported", func(t *testing.T) {
+	t.Run("compact dispatches by provider per the f720737 contract", func(t *testing.T) {
+		// f720737 起 /compact 不再回「headless 不支持」：codex/agentcore 各走
+		// 真实压缩，claude/claudecode 带 resume 时放行给 headless CLI 原生压缩
+		//（handleLocalSlashCommand 返回 false，命令文本原样落成模型回合），
+		// 无 resume 才回状态话术。这里只测 claude 两个分支——codex/agentcore
+		// 分支会触达 agentCoreEnsureUpstream 的真实网络探测，不属单元测试范畴。
 		mgr := newAgentAIManager()
+
+		// claudecode + resume → 放行（返回 false = 不在本地接管），且绝不改动
+		// 连续性状态——命令文本要原样到达 CLI。
 		sess := newSlashTestSession()
 		mu, events, w := captureAIWriter(t)
-		if !mgr.handleLocalSlashCommand(sess, "msg_3", "/compact", "claudecode", w) {
-			t.Fatal("expected /compact to be handled")
+		if mgr.handleLocalSlashCommand(sess, "msg_3", "/compact", "claudecode", w) {
+			t.Fatal("claudecode /compact with resume should fall through to the native CLI turn")
 		}
-		deltas := findAIEvents(mu, events, "ai.delta")
+		if sess.resumeSessionID != "resume-abc" {
+			t.Errorf("resumeSessionID changed to %q; fall-through must be side-effect-free", sess.resumeSessionID)
+		}
+		if frames := findAIEvents(mu, events, "ai.delta"); len(frames) != 0 {
+			t.Errorf("fall-through must not emit frames, got %#v", frames)
+		}
+
+		// claudecode 无 resume → 本地状态话术（还没有可压缩的原生上下文）。
+		sessNoResume := newSlashTestSession()
+		sessNoResume.resumeSessionID = ""
+		mu2, events2, w2 := captureAIWriter(t)
+		if !mgr.handleLocalSlashCommand(sessNoResume, "msg_3b", "/compact", "claudecode", w2) {
+			t.Fatal("expected /compact without resume to be handled with a status reply")
+		}
+		deltas := findAIEvents(mu2, events2, "ai.delta")
 		if len(deltas) != 1 {
 			t.Fatalf("expected 1 ai.delta, got %d", len(deltas))
 		}
 		delta, _ := deltas[0]["delta"].(string)
-		if !strings.Contains(delta, "headless") {
-			t.Errorf("expected delta to mention headless, got %q", delta)
-		}
-		// /compact must NOT mutate continuity state.
-		if sess.resumeSessionID != "resume-abc" {
-			t.Errorf("resumeSessionID changed to %q; /compact should be side-effect-free", sess.resumeSessionID)
+		if !strings.Contains(delta, "原生上下文") {
+			t.Errorf("expected delta to mention 原生上下文, got %q", delta)
 		}
 	})
 

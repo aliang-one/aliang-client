@@ -658,13 +658,11 @@ func (m *agentAIManager) handleAgentCoreCompactCommand(session *agentAISession, 
 		return
 	}
 
-	// /compact 也要模型（摘要得由模型写）。手机没给就明确说，不兜底换模型。
+	// /compact 也要模型（摘要得由模型写）。取模与 run 路径同源（agentCoreModel）：
+	// 会话显式模型优先，未带则回落本机 env/settings，最终兜底 glm-5.3——与对话
+	// 回合完全一致，绝不偷偷换档。agentCoreModel 不返回空值；Compact() 对空
+	// Model 自有兜底校验，这里不再重复死分支。
 	compactModel := agentCoreModel(agentAIRun{model: model})
-	if compactModel == "" {
-		_ = writeJSON(agentAIErrorPayload(session.id, messageID,
-			fmt.Errorf("未指定模型：手机没有下发模型名，无法生成摘要。请先在会话设置里选择模型")))
-		return
-	}
 
 	cfg := &agentcore.Config{
 		Client:        agentcore.NewClient(agentCoreBaseURL()).WithAPIKey(agentCoreAuthToken()),
