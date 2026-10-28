@@ -541,7 +541,11 @@ func TestParseSSEDetectsUpstreamErrorBody(t *testing.T) {
 
 // 非错误形状的 JSON（比如网关塞了别的东西）不能被当成错误，也不能吞掉后续 SSE。
 func TestParseSSEIgnoresNonErrorJSON(t *testing.T) {
-	body := "{\"ok\":true}\n\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"glm-5.2\"}}\n\n"
+	// 末尾给一个终点帧：EOF 侧现在要求流正常收尾（见 streamUnterminatedError），
+	// 本条只验证「非错误 JSON 不误伤、后续 SSE 照常解析」。
+	body := "{\"ok\":true}\n\n" +
+		"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"glm-5.2\"}}\n\n" +
+		"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n"
 	var events []StreamEvent
 	if err := parseSSE(context.Background(), strings.NewReader(body), func(ev StreamEvent) error {
 		events = append(events, ev)
@@ -549,8 +553,122 @@ func TestParseSSEIgnoresNonErrorJSON(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("不应报错: %v", err)
 	}
-	if len(events) != 1 || events[0].Kind != EventStart {
-		t.Fatalf("events = %+v, want 一个 start", events)
+	// {"ok":true} 不能变成事件（尤其不能变成错误），后续 message_start 必须照常解析。
+	if len(events) == 0 || events[0].Kind != EventStart {
+		t.Fatalf("events = %+v, want 首个事件是 start", events)
+	}
+	for _, ev := range events {
+		if ev.Kind == EventError {
+			t.Errorf("非错误形状的 JSON 不应产出错误事件: %+v", ev)
+		}
+	}
+}
+
+// 干净 EOF 但没有任何终点信号 = 上游把回答断在了半截。EOF 侧必须把它与
+// 「见到 message_stop 的正常收尾」区分开，否则半截文本带着 IsError=false
+// 静默落库，用户以为模型说完了。
+func TestStreamEOFWithoutTerminationIsError(t *testing.T) {
+	var attempts int32
+	srv := sseServer(t, func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&attempts, 1)
+		// handler 正常返回 → chunked 终止块写出 → 客户端读到干净 EOF。
+		// 全程没有 message_delta，也没有 message_stop。
+		writeSSE(w,
+			`{"type":"message_start","message":{"id":"msg_fin","model":"x"}}`,
+			`{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
+			`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"半截回答"}}`,
+			`{"type":"content_block_stop","index":0}`,
+		)
+	})
+
+	err := NewClient(srv.URL).Stream(context.Background(), &MessagesRequest{Model: "x"}, func(StreamEvent) error {
+		return nil
+	})
+	if err == nil {
+		t.Fatal("无终点信号的干净 EOF 应返回错误")
+	}
+	var unterm *streamUnterminatedError
+	if !errors.As(err, &unterm) {
+		t.Fatalf("err = %T %v, want *streamUnterminatedError", err, unterm)
+	}
+	if !strings.Contains(err.Error(), "未正常终止") {
+		t.Errorf("错误信息应能区分「上游流未正常终止」，实际 %q", err.Error())
+	}
+	if n := atomic.LoadInt32(&attempts); n != 1 {
+		t.Errorf("已下发事件后不应重试，attempts = %d, want 1", n)
+	}
+}
+
+// 反向钉住：以 message_delta(end_turn) + message_stop 正常收尾的流仍是成功。
+func TestStreamCleanTerminationStillSucceeds(t *testing.T) {
+	srv := sseServer(t, func(w http.ResponseWriter, r *http.Request) {
+		writeSSE(w,
+			`{"type":"message_start","message":{"id":"msg_ok","model":"x"}}`,
+			`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"完整"}}`,
+			`{"type":"message_delta","delta":{"stop_reason":"end_turn"}}`,
+			`{"type":"message_stop"}`,
+		)
+	})
+
+	var text strings.Builder
+	err := NewClient(srv.URL).Stream(context.Background(), &MessagesRequest{Model: "x"}, func(ev StreamEvent) error {
+		if ev.Kind == EventText {
+			text.WriteString(ev.Text)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("正常收尾不应报错: %v", err)
+	}
+	if text.String() != "完整" {
+		t.Errorf("text = %q, want 完整", text.String())
+	}
+}
+
+// 端到端钉死回合语义：上游发半截内容后直接结束响应（FIN，无 message_stop），
+// 回合必须以错误收尾、IsError=true、错误信息带可辨识标记——不能把半截当
+// 完整回答成功落库。
+//
+// 变异守卫：删掉 parseSSE 的 terminated 校验，本条与
+// TestStreamEOFWithoutTerminationIsError 即红。
+func TestRunFailsTurnWhenUpstreamEndsWithoutTermination(t *testing.T) {
+	srv := sseServer(t, func(w http.ResponseWriter, r *http.Request) {
+		writeSSE(w,
+			`{"type":"message_start","message":{"id":"msg_half","model":"claude-x"}}`,
+			`{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
+			`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"接下来我看看"}}`,
+			`{"type":"content_block_stop","index":0}`,
+		)
+	})
+
+	rec := &frameRecorder{}
+	cfg := &Config{
+		Client:    NewClient(srv.URL),
+		Model:     "claude-x",
+		Emit:      rec.emit,
+		SessionID: "sess-half",
+	}
+	res, err := Run(context.Background(), cfg, []Message{TextMessage("user", "hi")})
+	if err == nil {
+		t.Fatal("半截流应让 Run 返回错误")
+	}
+	if res == nil {
+		t.Fatal("Run 仍应返回结果供宿主收敛状态")
+	}
+	if !res.IsError {
+		t.Error("半截流收尾必须 IsError=true，不能当完整回答")
+	}
+
+	frames := rec.frames(t)
+	rf := resultFrame(t, frames)
+	if isErr, _ := rf["is_error"].(bool); !isErr {
+		t.Error("result 帧 is_error 必须为 true")
+	}
+	if sub, _ := rf["subtype"].(string); !strings.HasPrefix(sub, "error_") {
+		t.Errorf("result.subtype = %q, want error_ 前缀（宿主靠它转 ai.error）", sub)
+	}
+	if txt, _ := rf["result"].(string); !strings.Contains(txt, "未正常终止") {
+		t.Errorf("错误正文应含「未正常终止」标记，实际 %q", txt)
 	}
 }
 

@@ -475,6 +475,17 @@ func parseRetryAfter(raw string) time.Duration {
 	return time.Duration(secs) * time.Second
 }
 
+// streamUnterminatedError 表示上游把流「优雅地」断在了终点帧之前：连接正常
+// 关闭（EOF），但全程既没见到 message_stop，也没见到携带非空 stop_reason 的
+// message_delta。内容只收到一半；与 streamIdleError 的区别在于停滞是窗口内
+// 零字节，这里是流自己「说完就挂断」——逐字节都到了，唯独缺终点帧。不把它
+// 与正常收尾区分开，半截回答就会带着 IsError=false 静默落库。
+type streamUnterminatedError struct{}
+
+func (e *streamUnterminatedError) Error() string {
+	return "agentcore: 上游流未正常终止（连接在 message_stop/stop_reason 之前关闭，回答可能被截断）"
+}
+
 // parseSSE 逐行读 SSE，把 data 负载解析成 sseEvent 再翻译成 StreamEvent。
 //
 // 除了正常 SSE，这里还负责识别一种真实网关会返回的异常形状：HTTP 200 +
@@ -487,6 +498,11 @@ func parseSSE(ctx context.Context, r io.Reader, onEvent func(StreamEvent) error)
 	// 裸 JSON 体的累积缓冲（pretty-print 的 JSON 会跨多行）。
 	var jsonBuf strings.Builder
 	jsonOverflow := false
+
+	// terminated 记录流是否给出过「终点信号」：message_stop 帧、携带非空
+	// stop_reason 的 message_delta，或 error 事件。三者任一出现，流的结局就
+	// 已经定论；干净 EOF 时若三者都没见过，说明上游把流断在了终点之前。
+	terminated := false
 
 	for scanner.Scan() {
 		if err := ctx.Err(); err != nil {
@@ -531,7 +547,19 @@ func parseSSE(ctx context.Context, r io.Reader, onEvent func(StreamEvent) error)
 			// 判成停滞，把一个成功的回合误报成失败；而上游若一直补 ping 保活，
 			// ping 会不断续命、永远等不到 EOF。收到终点帧即视为流结束。
 			if ev.Type == "message_stop" {
+				terminated = true
 				return nil
+			}
+			// message_delta 的非空 stop_reason 与 message_stop 同属终点信号
+			// （同一个判据，供 EOF 侧判断「流有没有正常收尾」）。这里只记账、
+			// 不早退：以它提前收口属于半开停滞治理，另行处理。
+			if ev.Type == "message_delta" && ev.Delta != nil && strings.TrimSpace(ev.Delta.StopReason) != "" {
+				terminated = true
+			}
+			// error 事件是显式失败的终局：结局已经告知调用方，EOF 不该再往
+			// 上面叠一层「未终止」。
+			if ev.Type == "error" {
+				terminated = true
 			}
 			continue
 		}
@@ -568,6 +596,13 @@ func parseSSE(ctx context.Context, r io.Reader, onEvent func(StreamEvent) error)
 	}
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	// 干净 EOF（连接优雅关闭）但全程没有任何终点信号：上游把回答断在了
+	// 半截。不能与「见到 message_stop 的正常收尾」混为一谈——否则半截文本
+	// 会以成功收尾静默落库。作为普通错误返回后，重试语义交给 Stream：
+	// 零下发场景照常瞬态重试，已下发场景由 delivered 守卫拦住不重试。
+	if !terminated {
+		return &streamUnterminatedError{}
 	}
 	return nil
 }
