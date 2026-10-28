@@ -37,7 +37,7 @@ const agentAIRemoteSocketID = "remote"
 
 type agentAISocket struct {
 	id        string
-	role      string // "remote" | "local"
+	role      string // "remote" | "local"；与常驻 socket id agentAIRemoteSocketID 值有意同词，语义不同（角色分类 vs 注册表键）：role=="remote" 的 socket 恒被改写为单键 agentAIRemoteSocketID，勿互相替代。
 	write     agentTerminalWriter
 	out       chan map[string]interface{}
 	closed    chan struct{}
@@ -49,21 +49,14 @@ type agentAISocket struct {
 	onDead func(id string)
 }
 
+// alive 报告 socket 是否仍活跃（closed 未触发）。唯一的关闭极性 helper：
+// 历史上曾并存反极性的 isClosed，已删除（2026-10-28 评审）。
 func (s *agentAISocket) alive() bool {
 	select {
 	case <-s.closed:
 		return false
 	default:
 		return true
-	}
-}
-
-func (s *agentAISocket) isClosed() bool {
-	select {
-	case <-s.closed:
-		return true
-	default:
-		return false
 	}
 }
 
@@ -106,7 +99,7 @@ func (s *agentAISocket) pump() {
 		case <-s.closed:
 			return
 		case payload := <-s.out:
-			if s.isClosed() {
+			if !s.alive() {
 				return
 			}
 			if err := s.write(payload); err != nil {
@@ -125,6 +118,9 @@ func (s *agentAISocket) pump() {
 
 // registerAISocket 注册一条出站 socket 并启动 pump。write 为 nil 时返回 nil
 // （远端离线等场景，注册表容忍空缺）。
+//
+// 所有权契约：调用方负责在连接生命周期结束时 unregisterAISocket，否则
+// pump goroutine 与队列在 socket 意外死亡（写失败/溢出）前持续存活。
 func (m *agentAIManager) registerAISocket(role string, write agentTerminalWriter) *agentAISocket {
 	if write == nil {
 		return nil
@@ -231,6 +227,23 @@ func agentAIEventIsApprovalFamily(payload map[string]interface{}) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+// fanOutWrite 包一层 origin 写函数：origin 内联（保 emitter 的互斥序与终态
+// 屏障语义），随后非阻塞扇出副本。审批族广播、其余仅订阅者。
+// 契约：payload 在本函数返回后视为冻结——同一 map 实例会异步投递给 N 个
+// pump，调用方（emitter.emit）此后不得原地改写。
+func (m *agentAIManager) fanOutWrite(sessionID, originSocketID string, originWrite agentTerminalWriter) agentTerminalWriter {
+	if originWrite == nil {
+		return nil
+	}
+	return func(payload interface{}) error {
+		err := originWrite(payload)
+		if row, ok := payload.(map[string]interface{}); ok {
+			m.fanOutFrom(originSocketID, sessionID, row)
+		}
+		return err
 	}
 }
 

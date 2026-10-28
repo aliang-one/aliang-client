@@ -4,6 +4,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"aliang.one/nursorgate/app/http/models"
 )
 
 func newTestAISocketsManager(t *testing.T) *agentAIManager {
@@ -134,6 +136,77 @@ func TestRemoteSocketReRegistration(t *testing.T) {
 	}
 	if remoteCount != 1 {
 		t.Fatalf("注册表 remote 条目数 = %d, 期望 1", remoteCount)
+	}
+}
+
+// TestRunEventFanOutToSubscriber run 事件扇出：origin 内联写出 + 订阅者收到
+// 副本；未订阅 socket 不收 run 流事件。originWrite 与 origin socket 的写函数
+// 是同一闭包（生产等价：HandleAIStream 注册与 origin 内联走同一 writeJSON）。
+func TestRunEventFanOutToSubscriber(t *testing.T) {
+	m := newTestAISocketsManager(t)
+	originWritten := make(chan struct{}, 8)
+	subWritten := make(chan map[string]interface{}, 8)
+	originWrite := func(interface{}) error {
+		originWritten <- struct{}{}
+		return nil
+	}
+	origin := m.registerAISocket("local", originWrite)
+	sub := m.registerAISocket("local", func(p interface{}) error {
+		subWritten <- p.(map[string]interface{})
+		return nil
+	})
+	m.subscribeAISocket(sub.id, "s1")
+
+	write := m.fanOutWrite("s1", origin.id, originWrite)
+	_ = write(map[string]interface{}{"type": "ai.delta", "delta": "x"})
+
+	<-originWritten // origin 已内联写出
+	select {
+	case got := <-subWritten:
+		if got["type"] != "ai.delta" {
+			t.Fatalf("订阅者收到错误事件: %v", got["type"])
+		}
+	case <-time.After(time.Second):
+		t.Fatal("订阅者未收到 run 事件")
+	}
+}
+
+// TestApprovalBroadcastReachesNonSubscriber 审批族事件广播到全部活跃 socket
+// （不看订阅，spec §4.1 双端审核语义）；origin（此处=未注册的常驻 remote id）
+// 被跳过不影响他人收到。
+func TestApprovalBroadcastReachesNonSubscriber(t *testing.T) {
+	m := newTestAISocketsManager(t)
+	got := make(chan map[string]interface{}, 8)
+	bystander := m.registerAISocket("local", func(p interface{}) error {
+		got <- p.(map[string]interface{})
+		return nil
+	})
+	write := m.fanOutWrite("s1", agentAIRemoteSocketID, func(interface{}) error { return nil })
+	_ = write(map[string]interface{}{"type": models.AgentEventAIApprovalRequest, "session_id": "s1"})
+	select {
+	case p := <-got:
+		if p["type"] != models.AgentEventAIApprovalRequest {
+			t.Fatalf("期望审批广播,收到 %v", p["type"])
+		}
+	case <-time.After(time.Second):
+		t.Fatal("未订阅 socket 未收到审批广播")
+	}
+	_ = bystander
+}
+
+// TestOriginSocketNotDuplicated origin 去重：包装内层的 originWrite 恰好执行
+// 1 次（内联）；fan-out 跳过 origin socket，sock 自己的写函数不再被调——总数
+// 必须是 1，出现 2 即去重失效。
+func TestOriginSocketNotDuplicated(t *testing.T) {
+	m := newTestAISocketsManager(t)
+	count := make(chan struct{}, 32)
+	sock := m.registerAISocket("local", func(interface{}) error { count <- struct{}{}; return nil })
+	write := m.fanOutWrite("s1", sock.id, func(interface{}) error { count <- struct{}{}; return nil })
+	_ = write(map[string]interface{}{"type": "ai.delta"})
+	waitUntilFor(t, time.Second, func() bool { return len(count) == 1 })
+	time.Sleep(50 * time.Millisecond)
+	if n := len(count); n != 1 {
+		t.Fatalf("origin 事件应恰好写一次,实际 %d", n)
 	}
 }
 

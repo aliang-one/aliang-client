@@ -459,6 +459,10 @@ type agentAIRun struct {
 	// 放在 run 上而不是加参数：流循环与 run 同生命周期，且避免改动既有
 	// streamAgentAIStdout/streamStructuredAIDelta 的签名与全部测试调用点。
 	claudeSteer *agentAIClaudeSteerControl
+	// originSocketID 是本回合发起 socket 的注册表 id（"remote" 或 "aisock-N"）。
+	// 由消息分发路径盖的 __origin_socket 标记经 message()/runStart() 落入；
+	// 空串=旧调用方（TUI/测试内部路径），fan-out 无 origin 去重。
+	originSocketID string
 }
 
 // agentAIAttachment 是一条随消息下发的素材。线上是 JSON，但解析走 remoteString
@@ -1025,6 +1029,11 @@ func (m *agentAIManager) runEmitter(run agentAIRun, write agentTerminalWriter) *
 			return m.completeProcessedRun(run.runID, payload)
 		}
 	}
+	// 跨端同态（spec §4.1）：origin 仍内联，事件副本扇出到订阅 socket。
+	// originSocketID 从消息分发路径盖的 __origin_socket 来（Task 5 落地）；
+	// 此阶段恒空串=无 origin 去重，扇出与 origin 内联并存属可接受重复
+	//（仅测试/内部路径）。
+	e.write = m.fanOutWrite(run.sessionID, run.originSocketID, e.write)
 	return e
 }
 
