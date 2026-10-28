@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"aliang.one/nursorgate/common/logger"
 	"aliang.one/nursorgate/processor/match"
 )
 
@@ -524,6 +525,9 @@ type CustomerConfig struct {
 	ModelMapping  *ModelMappingConfig               `json:"model_mapping,omitempty"`
 	CustomEnvVars *CustomEnvVarsConfig              `json:"custom_env_vars,omitempty"`
 	GeoIP         *CustomerGeoIPSettings            `json:"geoip,omitempty"`
+	// AgentCoreLLM 是 AliangCode 内核的显式 LLM 端点设置(customer.agentcore_llm)。
+	// nil 或 Enabled=false 时整层不生效,行为回落继承链(env/settings→兜底)。
+	AgentCoreLLM *AgentCoreLLMConfig `json:"agentcore_llm,omitempty"`
 }
 
 // CustomerGeoIPSettings 自定义 GeoIP 国家库下载源（customer.geoip）。
@@ -554,6 +558,71 @@ func (c *CustomerGeoIPSettings) Validate() error {
 		return fmt.Errorf("geoip.download_url must be an https URL, got %q", c.DownloadURL)
 	}
 	return nil
+}
+
+// AgentCoreLLMConfig 显式 LLM 端点。仅支持 Anthropic Messages 兼容端点
+// (内核协议见 app/agentcore/client.go);BaseURL 远端时必须配 APIKey——
+// 远端直连没有平台 relay 注入凭据,裸 401 无法自查。
+type AgentCoreLLMConfig struct {
+	Enabled bool   `json:"enabled"`
+	BaseURL string `json:"base_url,omitempty"`
+	APIKey  string `json:"api_key,omitempty"`
+}
+
+// EffectiveAgentCoreLLM 返回显式设置的副本;未配置/未启用/URL 空/校验不过返回
+// nil,调用方按整层关闭处理。形状对齐 EffectiveCustomEnvVars 的 nil-guard。
+func (c *Config) EffectiveAgentCoreLLM() *AgentCoreLLMConfig {
+	if c == nil || c.Customer == nil || c.Customer.AgentCoreLLM == nil {
+		return nil
+	}
+	llm := c.Customer.AgentCoreLLM
+	if !llm.Enabled || strings.TrimSpace(llm.BaseURL) == "" {
+		return nil
+	}
+	cfg := *llm
+	cfg.BaseURL = strings.TrimSpace(cfg.BaseURL)
+	cfg.APIKey = strings.TrimSpace(cfg.APIKey)
+	// 读取端防御(spec §3.1):手改配置文件可绕过保存校验,这里兜底——非法
+	// 形态整层关闭 + Warn,不静默、不 crash、不把坏配置放进读取链。每回合
+	// 多次读取会重复 Warn 数行,属可接受噪声(用户必须修配置),不做去重。
+	if err := cfg.Validate(); err != nil {
+		logger.Warn("agentcore_llm 配置非法,本层关闭: " + err.Error())
+		return nil
+	}
+	return &cfg
+}
+
+// Validate 保存通道(Config.Validate)调用:URL 必须可解析;非回环 ⇒ key 必填。
+func (cfg *AgentCoreLLMConfig) Validate() error {
+	if cfg == nil || !cfg.Enabled {
+		return nil
+	}
+	u, err := url.Parse(strings.TrimSpace(cfg.BaseURL))
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return fmt.Errorf("agentcore_llm.base_url 必须是合法 URL(含 scheme 与 host), got %q", cfg.BaseURL)
+	}
+	if !isLoopbackHostName(u.Hostname()) && strings.TrimSpace(cfg.APIKey) == "" {
+		return fmt.Errorf("agentcore_llm.api_key 必填: 非回环地址 %s 无平台 relay 注入凭据", strings.TrimSpace(cfg.BaseURL))
+	}
+	return nil
+}
+
+// isLoopbackHostName 判断主机名是否本机回环(IP 回环段或 localhost)。
+// 注意:仓库里有三处回环判定——services 的 isLoopbackHost
+// (agent_ai_proxy_guard.go:69,窄口径:127.0.0.1/::1/localhost 字面量)、
+// 本函数(config 包,宽口径:全回环段+localhost)、前端的
+// utils/agentCoreSettings.js isLoopbackHost(与本函数同口径)。口径分歧是
+// 有意的:本函数与前端同源(校验语义),services 那个只服务 56432 特判。
+func isLoopbackHostName(host string) bool {
+	host = strings.ToLower(strings.TrimSpace(host))
+	if host == "" {
+		return false
+	}
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 type AliangServerConfig struct {
@@ -798,6 +867,11 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("invalid http1_drop configuration: %w", err)
 		}
 	}
+	if c.Customer != nil && c.Customer.AgentCoreLLM != nil {
+		if err := c.Customer.AgentCoreLLM.Validate(); err != nil {
+			return fmt.Errorf("invalid agentcore_llm configuration: %w", err)
+		}
+	}
 	if c.Customer != nil {
 		if modelMapping := c.Customer.ModelMapping; modelMapping != nil {
 			if err := modelMapping.Validate(); err != nil {
@@ -874,7 +948,7 @@ func (c *Config) customerUnknownKeyErrors() error {
 	if len(c.customerUnknownFields) > 0 {
 		sorted := append([]string(nil), c.customerUnknownFields...)
 		sort.Strings(sorted)
-		return fmt.Errorf("customer.%s is forbidden: editable customer fields are [proxy ai_rules proxy_rules traffic_mirror http1_drop model_mapping custom_env_vars geoip]", sorted[0])
+		return fmt.Errorf("customer.%s is forbidden: editable customer fields are [proxy ai_rules proxy_rules traffic_mirror http1_drop model_mapping custom_env_vars geoip agentcore_llm]", sorted[0])
 	}
 
 	providers := make([]string, 0, len(c.aiRuleUnknownFields))
@@ -911,7 +985,7 @@ func extractCustomerUnknownFields(root map[string]json.RawMessage) ([]string, ma
 
 	for key := range customerRoot {
 		switch key {
-		case "proxy", "ai_rules", "proxy_rules", "traffic_mirror", "http1_drop", "model_mapping", "custom_env_vars", "geoip":
+		case "proxy", "ai_rules", "proxy_rules", "traffic_mirror", "http1_drop", "model_mapping", "custom_env_vars", "geoip", "agentcore_llm":
 		default:
 			unknownCustomer = append(unknownCustomer, key)
 		}
