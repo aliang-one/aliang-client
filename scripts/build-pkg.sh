@@ -109,6 +109,12 @@ if [ -n "$MAC_APPLICATION_IDENTITY" ]; then
 		--sign "$MAC_APPLICATION_IDENTITY" "$CORE_DIR/aliang"
 	codesign --force --options runtime --timestamp \
 		--sign "$MAC_APPLICATION_IDENTITY" "$APP_DIR"
+	# Fail fast on an invalid signature (expired/revoked certificate, wrong
+	# identity name) instead of silently shipping a broken package. Only
+	# signature validity is checked here: notarization is a CI-side gate
+	# because spctl rejects any not-yet-notarized staged build.
+	codesign --verify --strict --verbose=2 "$CORE_DIR/aliang"
+	codesign --verify --strict --verbose=2 "$APP_DIR"
 else
 	echo "=== App signing skipped (development package only) ==="
 fi
@@ -297,7 +303,15 @@ if [ "$PACKAGED_BUNDLE_VERSION" != "$BUNDLE_VERSION" ]; then
 fi
 
 if [ -n "$MAC_INSTALLER_IDENTITY" ]; then
-	pkgutil --check-signature "$PKG_PATH"
+	# The exit code of pkgutil --check-signature varies across macOS releases
+	# (unsigned packages exit non-zero on recent versions), so judge by the
+	# printed output: a signed package always carries an Authority chain.
+	sig_output="$(pkgutil --check-signature "$PKG_PATH" || true)"
+	printf '%s\n' "$sig_output"
+	if [ "$REQUIRE_SIGNED_RELEASE" = "1" ] && ! printf '%s\n' "$sig_output" | grep -q 'Authority'; then
+		echo "ERROR: package signature missing Authority (productbuild did not sign)" >&2
+		exit 1
+	fi
 fi
 
 echo ""
