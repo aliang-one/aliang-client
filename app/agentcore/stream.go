@@ -109,6 +109,38 @@ func (w *streamWriter) CompactBoundary(trigger string, preTokens, postTokens int
 	})
 }
 
+// RetryNotice 发一次 system/api_retry：上游瞬态失败、内核即将重试。
+//
+// 帧形逐字段对齐真 claude-code 的同名帧（宿主 app/http/services/
+// agent_ai_retry_test.go 里锁着逐字样例：{"type":"system","subtype":"api_retry",
+// attempt, max_retries, retry_delay_ms, error_status, error}）。宿主 decoder
+// 对它本来就有完整处理：markProgress 刷活性 + ai.run.progress(retry_active)
+// 转发手机 + 失败时把 error_status/error 类别并进终态 ai.error。内核重试原本
+// 全程零帧，纯推理后的首字重试链（最坏 4×120s + 退避 ≈ 8min）会被 stale
+// 扫描器 5min 判死——这帧是活性链路的必要环节，不是锦上添花。
+//
+// 空字段刻意不发：decoder 对缺失字段按零值跳过，与 CLI 帧的稀疏形态一致。
+func (w *streamWriter) RetryNotice(n RetryNotice) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	frame := map[string]interface{}{
+		"type":        "system",
+		"subtype":     "api_retry",
+		"attempt":     n.Attempt,
+		"max_retries": maxRetries,
+	}
+	if n.Delay > 0 {
+		frame["retry_delay_ms"] = n.Delay.Milliseconds()
+	}
+	if n.ErrorStatus > 0 {
+		frame["error_status"] = n.ErrorStatus
+	}
+	if n.ErrorKind != "" {
+		frame["error"] = n.ErrorKind
+	}
+	return w.writeFrame(frame)
+}
+
 // TurnStart 发 message_start，确立本回合的 provider 消息 id。
 func (w *streamWriter) TurnStart(messageID, model string) error {
 	w.mu.Lock()

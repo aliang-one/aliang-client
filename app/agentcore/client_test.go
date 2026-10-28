@@ -725,3 +725,129 @@ func TestStreamNoRetryOnUpstreamInvalidRequest(t *testing.T) {
 		t.Errorf("错误信息应带上游原文，实际 %q", err.Error())
 	}
 }
+
+// 重试可观测：内核确定要重试时必须发一帧通知（经 WithRetryNotice），让宿主
+// decoder markProgress、扛住 stale 扫描器 5min 判据。首尝试 503、第二次成功
+// → 恰好一帧、attempt=1、类别对齐真 claude-code 的 server_error。
+//
+// 变异守卫：删掉 Stream 里 notifyRetry(attempt+1, err) 的可重试分支调用，本条即红。
+func TestStreamRetryNoticeOnTransientFailureThenSuccess(t *testing.T) {
+	var attempts int32
+	srv := sseServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&attempts, 1) == 1 {
+			w.Header().Set("content-type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			fmt.Fprint(w, `{"error":{"message":"upstream overloaded","type":"overloaded_error"},"type":"error"}`)
+			return
+		}
+		writeSSE(w,
+			`{"type":"message_start","message":{"id":"msg_retry_ok","model":"x"}}`,
+			`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"重试后成功"}}`,
+			`{"type":"message_delta","delta":{"stop_reason":"end_turn"}}`,
+		)
+	})
+
+	var notices []RetryNotice
+	var texts int
+	err := NewClient(srv.URL).Stream(context.Background(), &MessagesRequest{Model: "x"}, func(ev StreamEvent) error {
+		if ev.Kind == EventText {
+			texts++
+		}
+		return nil
+	}, WithRetryNotice(func(n RetryNotice) { notices = append(notices, n) }))
+	if err != nil {
+		t.Fatalf("503 后重试应成功: %v", err)
+	}
+	if n := atomic.LoadInt32(&attempts); n != 2 {
+		t.Fatalf("attempts = %d, want 2（503 + 重试成功）", n)
+	}
+	if texts != 1 {
+		t.Errorf("text delta 数 = %d, want 1（重试成功的完整回合）", texts)
+	}
+	if len(notices) != 1 {
+		t.Fatalf("retry 帧数 = %d, want 1", len(notices))
+	}
+	n := notices[0]
+	if n.Attempt != 1 {
+		t.Errorf("attempt = %d, want 1（首尝试失败后的第一次重试）", n.Attempt)
+	}
+	if n.ErrorStatus != http.StatusServiceUnavailable {
+		t.Errorf("error_status = %d, want 503", n.ErrorStatus)
+	}
+	if n.ErrorKind != "server_error" {
+		t.Errorf("error_kind = %q, want server_error", n.ErrorKind)
+	}
+	if n.Delay <= 0 {
+		t.Errorf("delay = %v, want > 0", n.Delay)
+	}
+}
+
+// 全部尝试都失败 → 帧数必须等于 maxRetries（不是 maxRetries+1）：最后一次
+// 失败直接返回错误，没有「第 4 次重试」这回事。
+func TestStreamRetryNoticeCountEqualsMaxRetriesOnExhaustion(t *testing.T) {
+	var attempts int32
+	srv := sseServer(t, func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&attempts, 1)
+		w.Header().Set("content-type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		fmt.Fprint(w, `{"error":{"message":"bad gateway","type":"api_error"},"type":"error"}`)
+	})
+
+	var notices []RetryNotice
+	err := NewClient(srv.URL).Stream(context.Background(), &MessagesRequest{Model: "x"}, func(StreamEvent) error {
+		return nil
+	}, WithRetryNotice(func(n RetryNotice) { notices = append(notices, n) }))
+	if err == nil {
+		t.Fatal("重试耗尽后应返回错误")
+	}
+	if n := atomic.LoadInt32(&attempts); n != int32(maxRetries)+1 {
+		t.Fatalf("attempts = %d, want %d（maxRetries 次重试 + 首次）", n, maxRetries+1)
+	}
+	if len(notices) != maxRetries {
+		t.Fatalf("retry 帧数 = %d, want %d（最后一次失败不发帧）", len(notices), maxRetries)
+	}
+	for i, n := range notices {
+		if want := i + 1; n.Attempt != want {
+			t.Errorf("notices[%d].Attempt = %d, want %d（重试序号从 1 连续递增）", i, n.Attempt, want)
+		}
+		if n.ErrorStatus != http.StatusBadGateway {
+			t.Errorf("notices[%d].ErrorStatus = %d, want 502", i, n.ErrorStatus)
+		}
+		if n.ErrorKind != "server_error" {
+			t.Errorf("notices[%d].ErrorKind = %q, want server_error（对齐真 claude-code 类别）", i, n.ErrorKind)
+		}
+		if n.Delay <= 0 {
+			t.Errorf("notices[%d].Delay = %v, want > 0（宿主要靠它展示 retry_delay_ms）", i, n.Delay)
+		}
+	}
+	last := notices[len(notices)-1]
+	if last.Attempt != maxRetries {
+		t.Errorf("最后一帧 attempt = %d, want %d", last.Attempt, maxRetries)
+	}
+}
+
+// 非重试类失败（400 且与输出上限无关）一次就返回，一帧都不该发：没有重试
+// 就没有重试通知，宿主不该看到幽灵进度。
+func TestStreamNoRetryNoticeOnNonRetryableFailure(t *testing.T) {
+	var attempts int32
+	srv := sseServer(t, func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&attempts, 1)
+		w.Header().Set("content-type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		fmt.Fprint(w, `{"error":{"message":"invalid api key","type":"authentication_error"},"type":"error"}`)
+	})
+
+	var notices []RetryNotice
+	err := NewClient(srv.URL).Stream(context.Background(), &MessagesRequest{Model: "x"}, func(StreamEvent) error {
+		return nil
+	}, WithRetryNotice(func(n RetryNotice) { notices = append(notices, n) }))
+	if err == nil {
+		t.Fatal("认证错误应直接失败")
+	}
+	if n := atomic.LoadInt32(&attempts); n != 1 {
+		t.Fatalf("attempts = %d, want 1（401 不重试）", n)
+	}
+	if len(notices) != 0 {
+		t.Fatalf("retry 帧数 = %d, want 0（未重试不发帧）", len(notices))
+	}
+}

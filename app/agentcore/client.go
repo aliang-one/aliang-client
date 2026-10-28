@@ -32,7 +32,10 @@ const (
 	// anthropicVersion 是 Messages API 的版本头。上游要求必填。
 	anthropicVersion = "2023-06-01"
 
-	// maxRetries 是瞬态失败的重试次数。仅覆盖连接错误 / 429 / 5xx。
+	// maxRetries 是瞬态失败的重试次数。仅覆盖连接错误 / 429 / 5xx。注意口径：
+	// 重试 3 次 = 全程最多 4 次尝试；按 ResponseHeaderTimeout 120s 逐次烧满的
+	// 话，最坏 4×120s + 退避 ≈ 8min 才见分晓——服务层的 stale 扫描器（5min）
+	// 靠 api_retry 重试帧刷新活性才扛得住这段静默，见 Stream 里 notifyRetry。
 	maxRetries = 3
 
 	// baseRetryDelay 是指数退避的起点。
@@ -155,11 +158,41 @@ const (
 	EventError        = "error"
 )
 
+// RetryNotice 描述一次「确定要重试」的上游瞬态失败。Stream 在退避等待**前**
+// 通过 WithRetryNotice 注册的观察者发出它；最后一次失败直接返回错误，不发。
+type RetryNotice struct {
+	// Attempt 是即将进行的第几次重试，从 1 起（首尝试失败后的第一次重试 = 1）。
+	Attempt int
+	// Delay 是本次重试前的退避时长（尊重 Retry-After 后的最终值）。
+	Delay time.Duration
+	// ErrorStatus 是触发重试的上游 HTTP 状态码；连接类失败为 0。
+	ErrorStatus int
+	// ErrorKind 是原因类别，取值对齐真 claude-code 的 api_retry 帧里 error
+	// 字段：server_error / rate_limit_error / invalid_request_error /
+	// overloaded_error / api_error / connection_error。
+	ErrorKind string
+}
+
+// streamOptions 收拢 Stream 的可选参数。零值即默认行为。
+type streamOptions struct {
+	onRetry func(RetryNotice)
+}
+
+// StreamOption 是 Stream 的可选参数。变参是为了既有调用点（含全部单测的
+// 三参形态）零改动——重试可观测是内核对宿主的增量能力，不是新契约。
+type StreamOption func(*streamOptions)
+
+// WithRetryNotice 注册重试观察者。内核在重试循环里「确定要重试」时（退避
+// 等待前）回调一次；没有可重试的失败（如 400 非降档）不会回调。
+func WithRetryNotice(fn func(RetryNotice)) StreamOption {
+	return func(o *streamOptions) { o.onRetry = fn }
+}
+
 // Stream 发起一次流式调用，把事件逐个回调给 onEvent。
 //
 // onEvent 返回错误即中止本次调用（用于把工具执行/取消信号传回传输层）。
 // 返回的 error 是传输层或上游错误；onEvent 自身的错误会原样返回。
-func (c *Client) Stream(ctx context.Context, req *MessagesRequest, onEvent func(StreamEvent) error) error {
+func (c *Client) Stream(ctx context.Context, req *MessagesRequest, onEvent func(StreamEvent) error, opts ...StreamOption) error {
 	if c.baseURL == "" {
 		return errors.New("agentcore: base URL 为空")
 	}
@@ -170,6 +203,30 @@ func (c *Client) Stream(ctx context.Context, req *MessagesRequest, onEvent func(
 		req.MaxTokens = defaultMaxTokens
 	}
 	req.Stream = true
+
+	var so streamOptions
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&so)
+		}
+	}
+	// notifyRetry 把「确定要重试」告知观察者。nextAttempt 是即将进行的重试
+	// 序号；loop 顶的退避等待发生在下一轮迭代开始时，所以这里先发帧再睡——
+	// 宿主拿到的是「要等多久、为什么等」，而不是等完之后的马后炮。
+	// nextAttempt > maxRetries 意味着循环条件即将自然终止（最后一次失败），
+	// 并没有真的重试，不发帧。
+	notifyRetry := func(nextAttempt int, err error) {
+		if so.onRetry == nil || nextAttempt > maxRetries {
+			return
+		}
+		status, kind := retryNoticeFields(err)
+		so.onRetry(RetryNotice{
+			Attempt:     nextAttempt,
+			Delay:       retryDelay(nextAttempt, err),
+			ErrorStatus: status,
+			ErrorKind:   kind,
+		})
+	}
 
 	// delivered 记录本调用是否已向调用方下发过任何事件。它是**跨尝试**的，
 	// 不随单次尝试重置：调用方（streamTurn）的内容累积与宿主已收到的帧都挂
@@ -225,15 +282,40 @@ func (c *Client) Stream(ctx context.Context, req *MessagesRequest, onEvent func(
 		// 要的是回复，不关心单次输出上限的具体数字。
 		if reduced, ok := reduceMaxTokens(err, req.MaxTokens); ok {
 			req.MaxTokens = reduced
+			notifyRetry(attempt+1, err)
 			lastErr = err
 			continue
 		}
 		if !isRetryable(err) {
 			return err
 		}
+		notifyRetry(attempt+1, err)
 		lastErr = err
 	}
 	return fmt.Errorf("agentcore: 重试 %d 次后仍失败: %w", maxRetries, lastErr)
+}
+
+// retryNoticeFields 把一次失败归类成 api_retry 帧里的 error_status / error
+// 类别。类别名对齐宿主在 CLI 路径见到的真 claude-code 取值（app/http/services/
+// agent_ai_retry_test.go 里的逐字样例：502 → "server_error"）。
+func retryNoticeFields(err error) (status int, kind string) {
+	var statusErr *httpStatusError
+	if errors.As(err, &statusErr) {
+		switch {
+		case statusErr.status == http.StatusTooManyRequests:
+			return statusErr.status, "rate_limit_error"
+		case statusErr.status >= 500:
+			return statusErr.status, "server_error"
+		default:
+			return statusErr.status, "invalid_request_error"
+		}
+	}
+	var upErr *upstreamError
+	if errors.As(err, &upErr) && strings.TrimSpace(upErr.kind) != "" {
+		return 0, strings.TrimSpace(upErr.kind)
+	}
+	// 连接被拒/重置、EOF、首字节前断开等都归到 connection_error。
+	return 0, "connection_error"
 }
 
 // eventAbortError 包住 onEvent 返回的错误，用于把它与传输错误区分开。

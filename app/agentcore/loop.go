@@ -1000,7 +1000,22 @@ func (r *runner) streamTurn(ctx context.Context, req *MessagesRequest, writer *s
 			return ev.Err
 		}
 		return nil
-	})
+	},
+		// 重试可观测：上游瞬态失败、内核即将重试时发一帧 system/api_retry。
+		// 没有它，重试链（最坏 4×120s + 退避 ≈ 8min）在宿主看来就是纯静默，
+		// 会被 stale 扫描器 5min 判死；帧形对齐真 claude-code，宿主 decoder
+		// 既有处理直接生效（markProgress + ai.run.progress）。
+		WithRetryNotice(func(n RetryNotice) {
+			if writer == nil {
+				return
+			}
+			// emit 管道写失败意味着宿主侧已不在读（或已收尾）：这一帧丢了
+			// 无可挽回，也不该为一个观测帧中止回合本身——记一笔，继续重试。
+			if err := writer.RetryNotice(n); err != nil {
+				r.logf("agentcore: 写 api_retry 帧失败 (attempt=%d): %v", n.Attempt, err)
+			}
+		}),
+	)
 	if err != nil {
 		return nil, "", err
 	}

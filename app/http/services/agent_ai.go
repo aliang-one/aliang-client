@@ -6414,9 +6414,18 @@ func streamStructuredAIDelta(reader io.Reader, format agentAIOutputFormat, run a
 		// remember the last one to enrich the terminal ai.error with a structured
 		// cause. The CLI's own "Retrying..." text never appears in stream-json, so
 		// this event is the only retry signal available.
+		//
+		// Liveness: an api_retry frame means the provider talked to us and is
+		// retrying — real progress by the same standard as ai.thinking. The
+		// agentcore kernel's retry chain can legally stay silent ~8min worst case
+		// (4 attempts × ResponseHeaderTimeout 120s + backoff), which blows past
+		// the 5min stale threshold; each retry frame must refresh the activity
+		// clock or healthy retrying turns get killed as stalled. Same refresh
+		// extends the steer liveness window, which reads the same idleFor().
 		if format == agentAIOutputClaudeStreamJSON &&
 			remoteString(event, "type") == "system" &&
 			remoteString(event, "subtype") == "api_retry" {
+			run.activity.markProgress()
 			ri := claudeRetryInfo{has: true}
 			if n, ok := event["attempt"].(float64); ok {
 				ri.attempt = int(n)

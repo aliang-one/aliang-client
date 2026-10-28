@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // 这一组测试锁死内核 → 宿主的帧契约。
@@ -866,5 +867,72 @@ func TestRunWithoutEmit(t *testing.T) {
 	}
 	if res.Text != "ok" {
 		t.Errorf("Text = %q, want ok", res.Text)
+	}
+}
+
+// RetryNotice 帧必须逐字段对齐真 claude-code 的 system/api_retry：宿主
+// decoder（streamStructuredAIDelta 的 api_retry 分支）按 type/subtype 识别、
+// 按 attempt/max_retries/retry_delay_ms/error_status/error 取值。形状一变，
+// 活性刷新与手机上的「重试 1/3 · 网关 503」就一起哑掉。
+func TestStreamWriterRetryNoticeFrameShape(t *testing.T) {
+	rec := &frameRecorder{}
+	w := newStreamWriter(rec.emit, "sess-r")
+	if err := w.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := w.RetryNotice(RetryNotice{
+		Attempt:     2,
+		Delay:       1500 * time.Millisecond,
+		ErrorStatus: 503,
+		ErrorKind:   "server_error",
+	}); err != nil {
+		t.Fatalf("RetryNotice: %v", err)
+	}
+
+	frames := rec.frames(t)
+	if len(frames) != 2 {
+		t.Fatalf("帧数 = %d, want 2（init + api_retry）", len(frames))
+	}
+	f := frames[1]
+	if typ, _ := f["type"].(string); typ != "system" {
+		t.Fatalf("type = %v, want system", f["type"])
+	}
+	if sub, _ := f["subtype"].(string); sub != "api_retry" {
+		t.Fatalf("subtype = %v, want api_retry", f["subtype"])
+	}
+	if got, _ := f["attempt"].(float64); got != 2 {
+		t.Errorf("attempt = %v, want 2", f["attempt"])
+	}
+	if got, _ := f["max_retries"].(float64); got != float64(maxRetries) {
+		t.Errorf("max_retries = %v, want %d", f["max_retries"], maxRetries)
+	}
+	if got, _ := f["retry_delay_ms"].(float64); got != 1500 {
+		t.Errorf("retry_delay_ms = %v, want 1500", f["retry_delay_ms"])
+	}
+	if got, _ := f["error_status"].(float64); got != 503 {
+		t.Errorf("error_status = %v, want 503", f["error_status"])
+	}
+	if got, _ := f["error"].(string); got != "server_error" {
+		t.Errorf("error = %v, want server_error", f["error"])
+	}
+	if got, _ := f["session_id"].(string); got != "sess-r" {
+		t.Errorf("session_id = %q, want sess-r（每一帧都必须可回填 resume 句柄）", got)
+	}
+}
+
+// 连接类失败没有 HTTP 状态码：稀疏帧不发 error_status/error，与 CLI 帧的
+// 稀疏形态一致（decoder 对缺失字段按零值跳过）。
+func TestStreamWriterRetryNoticeSparseFrame(t *testing.T) {
+	rec := &frameRecorder{}
+	w := newStreamWriter(rec.emit, "sess-r")
+	if err := w.RetryNotice(RetryNotice{Attempt: 1, Delay: 500 * time.Millisecond, ErrorKind: "connection_error"}); err != nil {
+		t.Fatalf("RetryNotice: %v", err)
+	}
+	f := rec.frames(t)[0]
+	if _, ok := f["error_status"]; ok {
+		t.Errorf("error_status = %v, want absent（无 HTTP 状态时不发）", f["error_status"])
+	}
+	if got, _ := f["error"].(string); got != "connection_error" {
+		t.Errorf("error = %v, want connection_error", f["error"])
 	}
 }
