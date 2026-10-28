@@ -360,8 +360,9 @@ func agentFileListPayload(msg map[string]interface{}) map[string]interface{} {
 		itemPath := filepath.Join(targetPath, entry.Name())
 		status := "clean"
 		if entry.IsDir() {
-			// Folder glows if any changed file lives anywhere beneath it.
-			status = gitDirectoryStatus(itemPath, gitStatus)
+			// Folder glows if it is itself untracked/changed, or any changed
+			// file lives anywhere beneath it.
+			status = agentDirectoryGitStatus(itemPath, gitStatus)
 		} else if s, ok := gitStatus[itemPath]; ok {
 			status = s
 		}
@@ -449,6 +450,11 @@ func agentFileReadPayload(msg map[string]interface{}) map[string]interface{} {
 	if binary {
 		content = base64.StdEncoding.EncodeToString(raw)
 		encoding = "base64"
+	} else {
+		// 截断边界按字节切会把多字节字符(中文等)切成半个 → JSON 里是乱码尾
+		// (2026-10-28 审计 #5)。文本分支剥掉末尾不完整的 UTF-8 序列再回包;
+		// 二进制走 base64 不受影响。
+		content = string(trimTruncatedUTF8Tail(raw))
 	}
 	return map[string]interface{}{
 		"type":        models.AgentEventFileReadResult,
@@ -653,6 +659,41 @@ func isLikelyAgentBinary(raw []byte) bool {
 // maxBytes 截断的文件头，末尾可能恰好切开一个多字节字符——utf8.Valid 对
 // 这种截断会误报，因此允许剥掉末尾最多 3 个不完整字节再验；中段任何非法
 // 序列仍会如实判否。
+// trimTruncatedUTF8Tail 剥掉 raw 末尾不完整的 UTF-8 多字节序列(按 maxBytes
+// 截断的常见产物);完整 UTF-8 或非法序列在「中段」而非尾部时原样返回。
+// 判定走序列头声明长度:从尾向前越过 continuation 字节找到 lead,按 lead 的
+// 前缀算应有序节数——不足才裁,够了说明非法性在中间,不动。
+func trimTruncatedUTF8Tail(raw []byte) []byte {
+	if utf8.Valid(raw) {
+		return raw
+	}
+	i := len(raw) - 1
+	for i >= 0 && i >= len(raw)-4 && raw[i]&0xC0 == 0x80 {
+		i-- // 尾部 continuation 字节
+	}
+	if i < 0 || i < len(raw)-4 {
+		return raw // 连续 continuation 超过 3 个,不是简单截断
+	}
+	lead := raw[i]
+	var want int
+	switch {
+	case lead < 0x80:
+		return raw // 尾字节是完整 ASCII,非法性在中段
+	case lead&0xE0 == 0xC0:
+		want = 2
+	case lead&0xF0 == 0xE0:
+		want = 3
+	case lead&0xF8 == 0xF0:
+		want = 4
+	default:
+		return raw // 非法 lead,不属尾部截断
+	}
+	if len(raw)-i >= want {
+		return raw // 序列完整,非法性在中段
+	}
+	return raw[:i]
+}
+
 func isAgentUTF8TextWithTruncatedTail(raw []byte) bool {
 	if utf8.Valid(raw) {
 		return true

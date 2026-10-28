@@ -69,6 +69,17 @@ func classifyGitStatusCode(code string) string {
 // gitDirectoryStatus returns 'modified' if any changed file lives under dirAbs
 // (at any depth), else 'clean'. Drives the "folder glows if it contains changes"
 // aggregation in the file browser.
+// agentDirectoryGitStatus 是目录行状态的总入口:porcelain 的未跟踪目录
+// `?? dir/` 经 filepath.Join 清洗后键不带尾斜杠,gitDirectoryStatus 的
+// 前缀聚合匹配不到它——先查目录自身键(直接命中 = added/modified),查不到
+// 再退回「目录下有改动文件」聚合。2026-10-28 审计 #3 配套。
+func agentDirectoryGitStatus(dirAbs string, changes map[string]string) string {
+	if s, ok := changes[dirAbs]; ok && s != "clean" {
+		return s
+	}
+	return gitDirectoryStatus(dirAbs, changes)
+}
+
 func gitDirectoryStatus(dirAbs string, changes map[string]string) string {
 	prefix := strings.TrimSuffix(dirAbs, string(filepath.Separator)) + string(filepath.Separator)
 	for p := range changes {
@@ -82,7 +93,11 @@ func gitDirectoryStatus(dirAbs string, changes map[string]string) string {
 func agentRunGit(dir string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), agentGitStatusTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...)
+	// -c core.quotepath=false:porcelain 对非 ASCII 路径默认输出八进制转义
+	// ("src/\346\226\207..."),与 ReadDir 的真实 UTF-8 名对不上 → 中文文件/
+	// 目录的 M/A 徽章与状态过滤全丢(2026-10-28 审计 #3)。关掉引号转义后
+	// 输出即原始 UTF-8;agentUnquoteGitPath 只兜重命名引号形态。
+	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", dir, "-c", "core.quotepath=false"}, args...)...)
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
 	// Discard stderr so a non-git dir doesn't spam the agent log.
