@@ -406,6 +406,7 @@ func normalizeCustomerPayload(payload []byte) (map[string]interface{}, error) {
 
 func validateEditableCustomerKeys(rawRoot map[string]json.RawMessage) error {
 	for key := range rawRoot {
+		// 字段清单与 processor/config/types.go customerUnknownKeyErrors 的文案逐字同步,改一处必改三处(两 switch + 三文案)。
 		switch key {
 		case "proxy", "ai_rules", "proxy_rules", "traffic_mirror", "http1_drop", "model_mapping", "custom_env_vars", "geoip", "agentcore_llm":
 		default:

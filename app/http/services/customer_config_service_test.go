@@ -751,6 +751,7 @@ func TestSaveCustomerConfigRejectsAgentCoreLLMRemoteNoKey(t *testing.T) {
 	t.Setenv("ALIANG_CACHE_DIR", filepath.Join(tempHome, ".aliang-cache"))
 
 	config.SetGlobalConfig(&config.Config{
+		// core.api_server 必填:Config.Validate 会先查它,不配到不了 agentcore_llm 的校验。
 		Core:     &config.CoreConfig{APIServer: "https://api.aliang.one"},
 		Customer: &config.CustomerConfig{},
 	})

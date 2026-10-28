@@ -126,6 +126,13 @@ const (
 // 两条都拿不到就返回空串：内核照旧出网，行为退回「由代理按分组兜底」，不因为
 // 拿不到 key 就把这一轮判死。
 func agentCoreAuthToken() string {
+	// 显式 key 最优先;不进 token 缓存(改配置下一回合立即生效,无需等 TTL)。
+	if custom := config.GetGlobalConfig().EffectiveAgentCoreLLM(); custom != nil {
+		if custom.APIKey != "" {
+			return custom.APIKey
+		}
+		// 回环+空 key 是合法形态:key 落继承链(URL 已显式)。
+	}
 	if v := agentCoreEnvOrSettings("ANTHROPIC_AUTH_TOKEN"); v != "" {
 		return v
 	}
@@ -201,6 +208,11 @@ func agentCoreResetTokenCache() {
 // https://api.aliang.one），不照抄：那条路要完整的 mTLS 客户端凭据，内核没有。
 // 宁可退回 56432 走隧道，也不要让「装了客户端却连不上」这种最难自查的失败发生。
 func agentCoreBaseURL() string {
+	// 显式设置(仪表盘 customer.agentcore_llm)最优先:回环/远端都放行——
+	// 用户显式担责,回环闸只拦继承链里意外带进来的远端地址。
+	if custom := config.GetGlobalConfig().EffectiveAgentCoreLLM(); custom != nil {
+		return custom.BaseURL
+	}
 	if v := agentCoreEnvOrSettings("ANTHROPIC_BASE_URL"); v != "" {
 		if agentCoreIsLoopbackBase(v) {
 			return v
@@ -255,6 +267,20 @@ func agentCoreModelUnusable(model string) bool {
 	return m == "" || strings.EqualFold(m, "<synthetic>")
 }
 
+// agentCoreDialHost 返回拨测目标 host:port。URL 无显式端口时按 scheme 补
+// 默认值——u.Host 对 "https://gw.example.com" 是裸域名,直接 dial 会报
+// "missing port in address"。
+func agentCoreDialHost(u *url.URL) string {
+	if u.Port() != "" {
+		return u.Host
+	}
+	port := "80"
+	if u.Scheme == "https" {
+		port = "443"
+	}
+	return net.JoinHostPort(u.Hostname(), port)
+}
+
 // agentCoreEnsureUpstream 探测并必要时自愈平台 AI 代理。
 //
 // 刻意不复用 ensureAIUpstreamReachableForRun：那个入口只读**子进程 env** 里的
@@ -262,6 +288,22 @@ func agentCoreModelUnusable(model string) bool {
 // 配时才生效）。用 ...ForRun 会在「什么都没配」这个最常见的场景下探测空地址、
 // 直接放行，于是 56432 没起时用户看到的仍是裸的 Connection refused。
 func agentCoreEnsureUpstream(ctx context.Context) error {
+	// 显式端点:没有「自愈」概念(不是我们的进程,POST /api/run/start 拉不活
+	// 它),只做同款 2s TCP 拨测,失败给可自查的文案。
+	if custom := config.GetGlobalConfig().EffectiveAgentCoreLLM(); custom != nil {
+		logger.Info("agentcore: 使用自定义 LLM 端点 " + custom.BaseURL)
+		u, err := url.Parse(custom.BaseURL)
+		if err != nil || u.Host == "" {
+			return nil // 形态已被 Effective/Validate 挡住;探测逻辑自身不挂 run
+		}
+		d := net.Dialer{Timeout: 2 * time.Second}
+		conn, err := d.DialContext(ctx, "tcp", agentCoreDialHost(u))
+		if err != nil {
+			return fmt.Errorf("自定义 LLM 端点不可达(%s: %v)——请检查地址与服务状态后重试", custom.BaseURL, err)
+		}
+		conn.Close()
+		return nil
+	}
 	return ensureAIUpstreamReachable(ctx, agentCoreBaseURL(), aiProxyGuardDeps{
 		dial: func(ctx context.Context, hostPort string) error {
 			d := net.Dialer{Timeout: 2 * time.Second}
