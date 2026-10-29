@@ -432,7 +432,7 @@ func TestEvaluateDecisionForAgentService(t *testing.T) {
 	}
 }
 
-func TestEvaluateDecisionConfinesFileToolsToProject(t *testing.T) {
+func TestEvaluateDecisionEscalatesFileToolsOutsideProject(t *testing.T) {
 	setupAgentPolicyTestEnv(t)
 	svc := NewAgentService()
 	project := t.TempDir()
@@ -449,8 +449,8 @@ func TestEvaluateDecisionConfinesFileToolsToProject(t *testing.T) {
 	if d, _ := svc.evaluateApprovalDecision("Edit", toolInput(map[string]interface{}{"file_path": inside}), project); d != decisionAutoApprove {
 		t.Fatalf("inside edit -> %s, want auto_approve", d)
 	}
-	if d, id := svc.evaluateApprovalDecision("Write", toolInput(map[string]interface{}{"file_path": outside}), project); d != decisionAutoDeny || id != "outside-project-path" {
-		t.Fatalf("outside write -> (%s, %s), want auto_deny/outside-project-path", d, id)
+	if d, id := svc.evaluateApprovalDecision("Write", toolInput(map[string]interface{}{"file_path": outside}), project); d != decisionRequireApproval || id != "outside-project-path" {
+		t.Fatalf("outside write -> (%s, %s), want require_approval/outside-project-path", d, id)
 	}
 	if d, id := svc.evaluateApprovalDecision("Read", nil, project); d != decisionAutoDeny || id != "invalid-project-path" {
 		t.Fatalf("missing read path -> (%s, %s), want auto_deny/invalid-project-path", d, id)
@@ -459,14 +459,55 @@ func TestEvaluateDecisionConfinesFileToolsToProject(t *testing.T) {
 	link := filepath.Join(project, "outside-link")
 	if err := os.Symlink(filepath.Dir(outside), link); err == nil {
 		linked := filepath.Join(link, filepath.Base(outside))
-		if d, id := svc.evaluateApprovalDecision("Edit", toolInput(map[string]interface{}{"file_path": linked}), project); d != decisionAutoDeny || id != "outside-project-path" {
-			t.Fatalf("symlink escape -> (%s, %s), want auto_deny/outside-project-path", d, id)
+		if d, id := svc.evaluateApprovalDecision("Edit", toolInput(map[string]interface{}{"file_path": linked}), project); d != decisionRequireApproval || id != "outside-project-path" {
+			t.Fatalf("symlink escape -> (%s, %s), want require_approval/outside-project-path", d, id)
 		}
 	}
 	changes, _ := json.Marshal([]map[string]interface{}{{"path": outside, "kind": "edit"}})
 	toolName, codexInput := codexPolicyToolHint("item/fileChange/requestApproval", map[string]interface{}{}, changes)
-	if d, id := svc.evaluateApprovalDecision(toolName, codexInput, project); d != decisionAutoDeny || id != "outside-project-path" {
-		t.Fatalf("Codex outside fileChange -> (%s, %s), want auto_deny/outside-project-path", d, id)
+	if d, id := svc.evaluateApprovalDecision(toolName, codexInput, project); d != decisionRequireApproval || id != "outside-project-path" {
+		t.Fatalf("Codex outside fileChange -> (%s, %s), want require_approval/outside-project-path", d, id)
+	}
+}
+
+// 2026-10-28 边界降级：项目外访问不再 auto_deny，统一走 require_approval
+// （与 outside-project-bash 同口径，交手机审批由用户拍板）；~ 路径先展开
+// 再判界，指向项目内的 ~/ 路径不再被审批层误杀（执行层本就会展开）。
+func TestEvaluateDecisionDowngradesOutsideProjectToApproval(t *testing.T) {
+	setupAgentPolicyTestEnv(t)
+	svc := NewAgentService()
+	project := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "outside.go")
+	toolInput := func(values map[string]interface{}) json.RawMessage {
+		raw, err := json.Marshal(values)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+
+	// 写类越界：auto_deny → require_approval。
+	if d, id := svc.evaluateApprovalDecision("Write", toolInput(map[string]interface{}{"file_path": outside}), project); d != decisionRequireApproval || id != "outside-project-path" {
+		t.Fatalf("outside write -> (%s, %s), want require_approval/outside-project-path", d, id)
+	}
+	// 只读越界（Grep 带 path）：同样降级，不再判死。
+	if d, id := svc.evaluateApprovalDecision("Grep", toolInput(map[string]interface{}{"path": outside}), project); d != decisionRequireApproval || id != "outside-project-path" {
+		t.Fatalf("outside grep -> (%s, %s), want require_approval/outside-project-path", d, id)
+	}
+
+	// ~ 展开一致性：HOME 指向项目根时 ~/src 实际在项目内，边界放行，
+	// 落回策略默认（balanced 只读规则对 Grep auto_approve）。
+	t.Setenv("HOME", project)
+	t.Setenv("USERPROFILE", project)
+	if d, _ := svc.evaluateApprovalDecision("Grep", toolInput(map[string]interface{}{"path": "~/src"}), project); d != decisionAutoApprove {
+		t.Fatalf("tilde-inside grep -> %s, want auto_approve (readonly rule)", d)
+	}
+	// 指向项目外的 ~/ 路径仍要走审批。
+	otherHome := t.TempDir()
+	t.Setenv("HOME", otherHome)
+	t.Setenv("USERPROFILE", otherHome)
+	if d, id := svc.evaluateApprovalDecision("Grep", toolInput(map[string]interface{}{"path": "~"}), project); d != decisionRequireApproval || id != "outside-project-path" {
+		t.Fatalf("tilde-outside grep -> (%s, %s), want require_approval/outside-project-path", d, id)
 	}
 }
 
@@ -1079,12 +1120,12 @@ func TestBoundaryCarveoutAutoApprovesProjectMemoryAccess(t *testing.T) {
 	}
 }
 
-func TestBoundaryCarveoutStillDeniesOutsideMemoryTargets(t *testing.T) {
+func TestBoundaryCarveoutStillEscalatesOutsideMemoryTargets(t *testing.T) {
 	setupAgentPolicyTestEnv(t)
 	svc := NewAgentService()
 	home, project, memoryDir := setupMemoryCarveoutProject(t)
 
-	// Another project's memory dir stays denied.
+	// Another project's memory dir still escalates to approval.
 	otherProject := filepath.Join(home, "workspace", "other")
 	otherMemory := filepath.Join(home, ".claude", "projects", claudeProjectSlug(otherProject), "memory")
 	if err := os.MkdirAll(otherMemory, 0o700); err != nil {
@@ -1092,22 +1133,23 @@ func TestBoundaryCarveoutStillDeniesOutsideMemoryTargets(t *testing.T) {
 	}
 	if d, id := svc.evaluateApprovalDecision("Write", memoryCarveoutToolInput(t, map[string]interface{}{
 		"file_path": filepath.Join(otherMemory, "MEMORY.md"),
-	}), project); d != decisionAutoDeny || id != "outside-project-path" {
-		t.Fatalf("other project memory write -> (%s, %s), want auto_deny/outside-project-path", d, id)
+	}), project); d != decisionRequireApproval || id != "outside-project-path" {
+		t.Fatalf("other project memory write -> (%s, %s), want require_approval/outside-project-path", d, id)
 	}
 	// .. traversal out of the memory dir must not ride the carve-out.
 	traversal := memoryDir + `/MEMORY.md/../../../workspace/demo/evil.md`
 	if d, id := svc.evaluateApprovalDecision("Write", memoryCarveoutToolInput(t, map[string]interface{}{
 		"file_path": traversal,
-	}), project); d != decisionAutoDeny || id != "outside-project-path" {
-		t.Fatalf("traversal write -> (%s, %s), want auto_deny/outside-project-path", d, id)
+	}), project); d != decisionRequireApproval || id != "outside-project-path" {
+		t.Fatalf("traversal write -> (%s, %s), want require_approval/outside-project-path", d, id)
 	}
-	// The carve-out covers the memory dir only, not the rest of ~/.claude.
+	// The carve-out covers the memory dir only, not the rest of ~/.claude
+	// (outside it still escalates).
 	settingsPath := filepath.Join(home, ".claude", "settings.json")
 	if d, id := svc.evaluateApprovalDecision("Write", memoryCarveoutToolInput(t, map[string]interface{}{
 		"file_path": settingsPath,
-	}), project); d != decisionAutoDeny || id != "outside-project-path" {
-		t.Fatalf("settings write -> (%s, %s), want auto_deny/outside-project-path", d, id)
+	}), project); d != decisionRequireApproval || id != "outside-project-path" {
+		t.Fatalf("settings write -> (%s, %s), want require_approval/outside-project-path", d, id)
 	}
 	// A symlink inside memory pointing outside resolves to its target and is denied.
 	existing := filepath.Join(home, "workspace", "other")
@@ -1118,8 +1160,8 @@ func TestBoundaryCarveoutStillDeniesOutsideMemoryTargets(t *testing.T) {
 	if err := os.Symlink(existing, link); err == nil {
 		if d, id := svc.evaluateApprovalDecision("Write", memoryCarveoutToolInput(t, map[string]interface{}{
 			"file_path": filepath.Join(link, "evil.md"),
-		}), project); d != decisionAutoDeny || id != "outside-project-path" {
-			t.Fatalf("symlink escape write -> (%s, %s), want auto_deny/outside-project-path", d, id)
+		}), project); d != decisionRequireApproval || id != "outside-project-path" {
+			t.Fatalf("symlink escape write -> (%s, %s), want require_approval/outside-project-path", d, id)
 		}
 	}
 	// A DANGLING symlink inside memory must not slip through lexical resolution either.
@@ -1127,8 +1169,8 @@ func TestBoundaryCarveoutStillDeniesOutsideMemoryTargets(t *testing.T) {
 	if err := os.Symlink(filepath.Join(home, "nowhere"), dangling); err == nil {
 		if d, id := svc.evaluateApprovalDecision("Write", memoryCarveoutToolInput(t, map[string]interface{}{
 			"file_path": filepath.Join(dangling, "evil.md"),
-		}), project); d != decisionAutoDeny || id != "outside-project-path" {
-			t.Fatalf("dangling symlink write -> (%s, %s), want auto_deny/outside-project-path", d, id)
+		}), project); d != decisionRequireApproval || id != "outside-project-path" {
+			t.Fatalf("dangling symlink write -> (%s, %s), want require_approval/outside-project-path", d, id)
 		}
 	}
 	// Any symlink below the memory root voids the grant — even one pointing back
@@ -1141,8 +1183,8 @@ func TestBoundaryCarveoutStillDeniesOutsideMemoryTargets(t *testing.T) {
 	if err := os.Symlink(inner, innerLink); err == nil {
 		if d, id := svc.evaluateApprovalDecision("Write", memoryCarveoutToolInput(t, map[string]interface{}{
 			"file_path": filepath.Join(innerLink, "note.md"),
-		}), project); d != decisionAutoDeny || id != "outside-project-path" {
-			t.Fatalf("inner symlink write -> (%s, %s), want auto_deny/outside-project-path", d, id)
+		}), project); d != decisionRequireApproval || id != "outside-project-path" {
+			t.Fatalf("inner symlink write -> (%s, %s), want require_approval/outside-project-path", d, id)
 		}
 	}
 	// Bash stays outside the carve-out: touching memory via shell still escalates.
@@ -1176,16 +1218,16 @@ func TestBoundaryCarveoutAcceptsTranscriptPathFallback(t *testing.T) {
 	// Without the hook payload the drifted dir must NOT be approved (computed slug only).
 	if d, id := svc.evaluateApprovalDecision("Write", memoryCarveoutToolInput(t, map[string]interface{}{
 		"file_path": filepath.Join(transcriptDir, "memory", "MEMORY.md"),
-	}), project); d != decisionAutoDeny || id != "outside-project-path" {
-		t.Fatalf("drifted memory write w/o hook -> (%s, %s), want auto_deny/outside-project-path", d, id)
+	}), project); d != decisionRequireApproval || id != "outside-project-path" {
+		t.Fatalf("drifted memory write w/o hook -> (%s, %s), want require_approval/outside-project-path", d, id)
 	}
 	// Untrustworthy transcript_path values are ignored: not under the projects root.
 	for _, bad := range []string{"/etc/passwd", "sess-1.jsonl", home} {
 		hookRaw := map[string]interface{}{"transcript_path": bad}
 		if d, id := svc.evaluateApprovalDecisionForHook("Write", memoryCarveoutToolInput(t, map[string]interface{}{
 			"file_path": filepath.Join(home, "somewhere-else", "MEMORY.md"),
-		}), project, hookRaw); d != decisionAutoDeny || id != "outside-project-path" {
-			t.Fatalf("bad transcript %q write -> (%s, %s), want auto_deny/outside-project-path", bad, d, id)
+		}), project, hookRaw); d != decisionRequireApproval || id != "outside-project-path" {
+			t.Fatalf("bad transcript %q write -> (%s, %s), want require_approval/outside-project-path", bad, d, id)
 		}
 	}
 	// With a transcript present, paths outside BOTH memory roots are still denied —
@@ -1196,8 +1238,8 @@ func TestBoundaryCarveoutAcceptsTranscriptPathFallback(t *testing.T) {
 	sibling := filepath.Join(home, ".claude", "projects", claudeProjectSlug(project), "sessions-index.json")
 	if d, id := svc.evaluateApprovalDecisionForHook("Write", memoryCarveoutToolInput(t, map[string]interface{}{
 		"file_path": sibling,
-	}), project, hookRaw); d != decisionAutoDeny || id != "outside-project-path" {
-		t.Fatalf("projects-root sibling write -> (%s, %s), want auto_deny/outside-project-path", d, id)
+	}), project, hookRaw); d != decisionRequireApproval || id != "outside-project-path" {
+		t.Fatalf("projects-root sibling write -> (%s, %s), want require_approval/outside-project-path", d, id)
 	}
 }
 

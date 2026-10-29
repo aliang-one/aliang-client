@@ -1166,8 +1166,11 @@ func (a *agentAIActivity) bump() {
 }
 
 // markProgress records meaningful progress and counts as activity. Callers:
-// emitAIDelta (assistant text/thinking), the run's fileSink (file written or
-// edited), and the Codex item/completed handler (one work unit finished).
+// emitAIDelta (assistant text/thinking), the claude/agentcore thinking stream
+// in emitClaudeStructuredEvents (内核把 thinking_delta 透传成帧后，纯推理期间
+// 这是服务层唯一活性信号——L3 stale 扫描器 5 分钟就判死), the run's fileSink
+// (file written or edited), and the Codex item/completed handler (one work
+// unit finished).
 func (a *agentAIActivity) markProgress() {
 	if a == nil {
 		return
@@ -3932,6 +3935,7 @@ func buildClaudeApprovalRequest(run agentAIRun, raw map[string]interface{}) agen
 		kind = models.AgentAIApprovalKindCommand
 	}
 	reason := firstNonEmpty(
+		boundaryApprovalReason(run.matchedRuleID),
 		remoteString(raw, "permission_prompt"),
 		remoteString(raw, "permissionPrompt"),
 		remoteString(raw, "reason"),
@@ -4320,7 +4324,7 @@ func (m *agentAIManager) runCLI(ctx context.Context, run agentAIRun, writeJSON a
 	// 的解析指令，不是真实 provider。CLI 路径也是这么做的——confirmBinding 落
 	// 的是 tool.id（解析结果）而不是 "auto"，否则绑定记录的 provider 会和实际
 	// 跑的 provider 对不上，providersEquivalent 一比对就分叉。
-	if agentAIUseAgentCore(run.provider) || agentAIUseAgentCoreFallback(run) {
+	if agentAIUseAgentCoreForRun(run) {
 		run.provider = "agentcore"
 		m.runAgentCore(ctx, run, writeJSON)
 		return
@@ -4441,6 +4445,22 @@ func agentAIUseAgentCoreFallback(run agentAIRun) bool {
 		return false
 	}
 	return !agentAIExternalCLIAvailable()
+}
+
+// agentAIUseAgentCoreForRun 是 runCLI 分流用的总闸:显式 agentcore 或 auto
+// 兜底任一命中即走内核,但 **goal 回合一律除外**。
+//
+// 为什么要单独这道闸:goal 的排除逻辑此前只写在 auto 兜底分支里,
+// 「显式 provider=agentcore」的分流没有这层判据——服务端一旦显式下发
+// agentcore(目前被服务端 GoalProvider 白名单挡着,白名单一旦放宽就会漏),
+// goal 回合就会进内核,而内核不注入 ALIANG_GOAL_REPORT 强制段,goal 会永远
+// 拿不到报告行,被 attachGoalReport 记成 goal_report_missing。防御纵深要求
+// 判据长在离分流最近的地方,而不是只指望上游白名单。
+func agentAIUseAgentCoreForRun(run agentAIRun) bool {
+	if len(run.goalIdentity) > 0 {
+		return false
+	}
+	return agentAIUseAgentCore(run.provider) || agentAIUseAgentCoreFallback(run)
 }
 
 // agentAIExternalCLIProbe 报告 auto 的候选集里是否有可用的外部 CLI。
@@ -5849,7 +5869,7 @@ func buildCodexApprovalRequest(run agentAIRun, method string, params map[string]
 		Provider: "codex",
 		Kind:     models.AgentAIApprovalKindTool,
 		Title:    "Approve Codex action",
-		Reason:   remoteString(params, "reason"),
+		Reason:   firstNonEmpty(boundaryApprovalReason(run.matchedRuleID), remoteString(params, "reason")),
 		CWD:      firstNonEmpty(remoteString(params, "cwd"), run.projectPath),
 		Raw:      rawJSON,
 		AvailableDecisions: []string{
@@ -6630,9 +6650,18 @@ func streamStructuredAIDelta(reader io.Reader, format agentAIOutputFormat, run a
 		// remember the last one to enrich the terminal ai.error with a structured
 		// cause. The CLI's own "Retrying..." text never appears in stream-json, so
 		// this event is the only retry signal available.
+		//
+		// Liveness: an api_retry frame means the provider talked to us and is
+		// retrying — real progress by the same standard as ai.thinking. The
+		// agentcore kernel's retry chain can legally stay silent ~8min worst case
+		// (4 attempts × ResponseHeaderTimeout 120s + backoff), which blows past
+		// the 5min stale threshold; each retry frame must refresh the activity
+		// clock or healthy retrying turns get killed as stalled. Same refresh
+		// extends the steer liveness window, which reads the same idleFor().
 		if format == agentAIOutputClaudeStreamJSON &&
 			remoteString(event, "type") == "system" &&
 			remoteString(event, "subtype") == "api_retry" {
+			run.activity.markProgress()
 			ri := claudeRetryInfo{has: true}
 			if n, ok := event["attempt"].(float64); ok {
 				ri.attempt = int(n)
@@ -6681,6 +6710,25 @@ func streamStructuredAIDelta(reader io.Reader, format agentAIOutputFormat, run a
 				progress["error_type"] = ri.errorType
 			}
 			_ = writeJSON(progress)
+			continue
+		}
+		// agentcore 内核的压缩进度帧：{"type":"system","subtype":
+		// "compact_progress","summary_tokens":N}。压缩期是全程零 delta 的长
+		// 静默（8192 token 的慢摘要在 20-25 tok/s 下超过 5min stale 阈值），
+		// 这帧是服务层唯一活性信号；markProgress 同时刷新 stale 扫描器与
+		// steer 活性窗（同源 idleFor）。与 api_retry 同一套镜像模式。
+		//
+		// 刻意不转发给手机：CLI 路径的压缩提示是 compact_boundary 完成帧
+		// （claudeCompactNotice），手机契约里没有「压缩中」态，转发需要新增
+		// 手机契约字段——按最小改动只做 markProgress + 日志；压缩完成时用户
+		// 仍会收到既有的 compact_boundary 可见提示。
+		if format == agentAIOutputClaudeStreamJSON &&
+			remoteString(event, "type") == "system" &&
+			remoteString(event, "subtype") == "compact_progress" {
+			run.activity.markProgress()
+			logger.Info(fmt.Sprintf(
+				"ai.run.compact_progress: session=%s runSeq=%d summary_tokens=%v",
+				run.sessionID, run.runSeq, event["summary_tokens"]))
 			continue
 		}
 		// Claude steer：第一个 result 事件意味着本 turn 的产出已定稿。

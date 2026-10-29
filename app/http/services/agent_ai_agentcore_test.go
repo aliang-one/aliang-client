@@ -1,7 +1,11 @@
 package services
 
 import (
+	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -9,7 +13,9 @@ import (
 	"testing"
 	"time"
 
+	"aliang.one/nursorgate/app/agentcore"
 	auth "aliang.one/nursorgate/processor/auth"
+	"aliang.one/nursorgate/processor/config"
 )
 
 // 内置内核的路由判定。
@@ -67,6 +73,34 @@ func TestAgentAIUseAgentCoreFallback(t *testing.T) {
 	}
 	if agentAIUseAgentCoreFallback(agentAIRun{provider: "auto", goalIdentity: map[string]interface{}{"goal_id": "g1"}}) {
 		t.Error("goal run 不应兜底")
+	}
+}
+
+func TestAgentAIUseAgentCoreForRunExcludesGoalRuns(t *testing.T) {
+	// goal 回合必须一律走外部 CLI:内核不注入 ALIANG_GOAL_REPORT 强制段,
+	// 跑起来 goal 永远拿不到报告行,会被 attachGoalReport 记成
+	// goal_report_missing。auto 兜底分支早已排除 goal,但 runCLI 里
+	// 「显式 provider=agentcore」的分流此前没有这层判据——服务端一旦
+	// 显式下发 agentcore,goal 回合就会被内核吃掉(2026-10-28 预算审计
+	// 发现的防御纵深缺口,当时只靠服务端 GoalProvider 白名单兜着)。
+	goal := map[string]interface{}{"goal_id": "g1"}
+	// auto 兜底依赖外部 CLI 探针,与宿主机装没装 claude 无关,按既有用例注入。
+	overrideExternalCLIProbe(t, false)
+	for _, tc := range []struct {
+		name string
+		run  agentAIRun
+		want bool
+	}{
+		{"显式 agentcore 普通 run 走内核", agentAIRun{provider: "agentcore"}, true},
+		{"auto 兜底普通 run 走内核", agentAIRun{provider: "auto"}, true},
+		{"显式 agentcore 的 goal run 不走内核", agentAIRun{provider: "agentcore", goalIdentity: goal}, false},
+		{"auto 兜底的 goal run 不走内核", agentAIRun{provider: "auto", goalIdentity: goal}, false},
+		{"auto 兜底只读 run 不走内核", agentAIRun{provider: "auto", readOnly: true}, false},
+		{"claudecode 走 CLI", agentAIRun{provider: "claudecode"}, false},
+	} {
+		if got := agentAIUseAgentCoreForRun(tc.run); got != tc.want {
+			t.Errorf("%s: 期望 %v,实际 %v", tc.name, tc.want, got)
+		}
 	}
 }
 
@@ -284,5 +318,169 @@ func TestAgentCoreSystemPromptIncludesEnvBlock(t *testing.T) {
 	}
 	if !strings.Contains(agentCoreSystemPrompt(gitDir), "Is a git repository: yes") {
 		t.Fatalf("git 目录应判 yes")
+	}
+}
+
+// 2026-10-28 边界降级后，审批卡必须带人话原因——用户看到的不再只是
+// matched_rule_id，而是「为什么问您」。普通策略命中的审批不额外编造原因。
+func TestBuildAgentCoreApprovalRequestCarriesBoundaryReason(t *testing.T) {
+	req := buildAgentCoreApprovalRequest(agentAIRun{matchedRuleID: "outside-project-path"}, agentcore.ApprovalRequest{ToolName: "Grep"})
+	if req.Reason == "" {
+		t.Fatal("outside-project-path 审批卡缺少 reason")
+	}
+	req = buildAgentCoreApprovalRequest(agentAIRun{matchedRuleID: "outside-project-bash"}, agentcore.ApprovalRequest{
+		ToolName: "Bash",
+		Input:    map[string]interface{}{"command": "cat /etc/passwd"},
+	})
+	if req.Reason == "" {
+		t.Fatal("outside-project-bash 审批卡缺少 reason")
+	}
+	req = buildAgentCoreApprovalRequest(agentAIRun{}, agentcore.ApprovalRequest{ToolName: "Bash"})
+	if req.Reason != "" {
+		t.Fatalf("普通审批不应携带边界 reason，得到 %q", req.Reason)
+	}
+
+	// claude CLI 与 codex 的审批卡同口径：边界升级时带 reason，
+	// 无边界规则命中时保留各自上游的 reason。
+	run := agentAIRun{matchedRuleID: "outside-project-path"}
+	if req := buildClaudeApprovalRequest(run, map[string]interface{}{"tool_name": "Read"}); req.Reason == "" {
+		t.Fatal("claude 边界审批卡缺少 reason")
+	}
+	run = agentAIRun{}
+	if req := buildClaudeApprovalRequest(run, map[string]interface{}{"tool_name": "Read", "reason": "upstream"}); req.Reason != "upstream" {
+		t.Fatalf("claude 普通审批 reason = %q, want upstream", req.Reason)
+	}
+	run = agentAIRun{matchedRuleID: "outside-project-path"}
+	if req := buildCodexApprovalRequest(run, "item/fileChange/requestApproval", map[string]interface{}{}, nil); req.Reason == "" {
+		t.Fatal("codex 边界审批卡缺少 reason")
+	}
+	run = agentAIRun{}
+	if req := buildCodexApprovalRequest(run, "item/fileChange/requestApproval", map[string]interface{}{"reason": "upstream"}, nil); req.Reason != "upstream" {
+		t.Fatalf("codex 普通审批 reason = %q, want upstream", req.Reason)
+	}
+}
+
+// 内核读取链的显式层(customer.agentcore_llm)。
+//
+// 优先级约定:显式设置 > 继承链(env → settings.json)> 回环闸/兜底。回环闸
+// 只拦**继承链**里意外带进来的远端地址;用户在仪表盘里显式填远端是知情行为,
+// 直接放行。显式 key 不进 token 缓存(改配置下一回合立即生效);显式端点没有
+// 「自愈」概念(POST /api/run/start 拉不活别人的进程),只做拨测。
+
+// setTestGlobalConfigAgentCoreLLM 临时替换带 AgentCoreLLM 的全局配置,还原走
+// t.Cleanup(形状对齐 agent_ai_child_env_test.go 的 setTestGlobalConfigCustomEnv)。
+func setTestGlobalConfigAgentCoreLLM(t *testing.T, llm *config.AgentCoreLLMConfig) {
+	t.Helper()
+	old := config.GetGlobalConfig()
+	next := &config.Config{}
+	if old != nil {
+		*next = *old
+	}
+	next.Customer = &config.CustomerConfig{AgentCoreLLM: llm}
+	t.Cleanup(func() { config.SetGlobalConfig(old) })
+	config.SetGlobalConfig(next)
+}
+
+func isolateAgentCoreBaseURL(t *testing.T) {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir()) // settings.json 缺席,继承链只剩 env
+	t.Setenv("ANTHROPIC_BASE_URL", "")
+}
+
+func TestAgentCoreBaseURLCustomOverridesAll(t *testing.T) {
+	isolateAgentCoreBaseURL(t)
+	t.Setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:9999") // 继承链给的回环值
+	setTestGlobalConfigAgentCoreLLM(t, &config.AgentCoreLLMConfig{
+		Enabled: true, BaseURL: "https://gw.example.com", APIKey: "sk-x",
+	})
+	if got := agentCoreBaseURL(); got != "https://gw.example.com" {
+		t.Errorf("→ %q, want 显式远端地址(绕过回环闸)", got)
+	}
+}
+
+func TestAgentCoreBaseURLCustomDisabledFallsToInheritedGate(t *testing.T) {
+	isolateAgentCoreBaseURL(t)
+	t.Setenv("ANTHROPIC_BASE_URL", "https://api.aliang.one") // 继承链远端:必须被回环闸拒
+	setTestGlobalConfigAgentCoreLLM(t, &config.AgentCoreLLMConfig{Enabled: false})
+	if got := agentCoreBaseURL(); got != agentCoreDefaultBaseURL {
+		t.Errorf("→ %q, want %s(闸语义不变)", got, agentCoreDefaultBaseURL)
+	}
+}
+
+func TestAgentCoreAuthTokenCustomSkipsCacheAndFallback(t *testing.T) {
+	isolateAgentCoreToken(t)
+	calls := stubAgentCoreUserAPIKeys(t, func() ([]auth.UserAPIKey, error) {
+		t.Error("显式 key 存在时不该打 user-center")
+		return nil, nil
+	})
+	setTestGlobalConfigAgentCoreLLM(t, &config.AgentCoreLLMConfig{
+		Enabled: true, BaseURL: "https://gw.example.com", APIKey: " sk-custom ",
+	})
+	if got := agentCoreAuthToken(); got != "sk-custom" {
+		t.Errorf("→ %q, want sk-custom(trim 后)", got)
+	}
+	// 显式 key 不进缓存:改配置立即生效
+	setTestGlobalConfigAgentCoreLLM(t, &config.AgentCoreLLMConfig{
+		Enabled: true, BaseURL: "https://gw.example.com", APIKey: "sk-two",
+	})
+	if got := agentCoreAuthToken(); got != "sk-two" {
+		t.Errorf("→ %q, want sk-two(不走缓存)", got)
+	}
+	if *calls != 0 {
+		t.Errorf("user-center 被调用 %d 次,应为 0", *calls)
+	}
+}
+
+func TestAgentCoreAuthTokenCustomLoopbackNoKeyFallsThrough(t *testing.T) {
+	isolateAgentCoreToken(t)
+	stubAgentCoreUserAPIKeys(t, func() ([]auth.UserAPIKey, error) {
+		return []auth.UserAPIKey{{Key: "sk-user", SecretAvailable: true, Status: "active"}}, nil
+	})
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "") // 隔离 env 继承
+	setTestGlobalConfigAgentCoreLLM(t, &config.AgentCoreLLMConfig{
+		Enabled: true, BaseURL: "http://127.0.0.1:8082", // 回环+无 key:合法,key 落继承链
+	})
+	if got := agentCoreAuthToken(); got != "sk-user" {
+		t.Errorf("→ %q, want sk-user(用户 API key 兜底)", got)
+	}
+}
+
+// 自定义端点拨测:可达 → nil;不可达 → 明确报错(不碰 56432 自愈)。
+func TestAgentCoreEnsureUpstreamCustomEndpoint(t *testing.T) {
+	isolateAgentCoreBaseURL(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer srv.Close()
+	setTestGlobalConfigAgentCoreLLM(t, &config.AgentCoreLLMConfig{Enabled: true, BaseURL: srv.URL})
+	if err := agentCoreEnsureUpstream(context.Background()); err != nil {
+		t.Fatalf("可达端点不应报错: %v", err)
+	}
+
+	setTestGlobalConfigAgentCoreLLM(t, &config.AgentCoreLLMConfig{
+		Enabled: true, BaseURL: "http://127.0.0.1:1",
+	})
+	err := agentCoreEnsureUpstream(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "自定义 LLM 端点不可达") {
+		t.Errorf("→ %v, want 含「自定义 LLM 端点不可达」", err)
+	}
+}
+
+// 无端口 URL 是 UI 示例的主形态(https://your-gateway.example.com):
+// u.Host 不带端口,直接拿去 dial 会报 "missing port in address"。
+// 拨测目标必须补默认端口。
+func TestAgentCoreDialHost(t *testing.T) {
+	cases := []struct{ raw, want string }{
+		{"https://gw.example.com", "gw.example.com:443"},
+		{"http://gw.example.com", "gw.example.com:80"},
+		{"http://127.0.0.1:8082", "127.0.0.1:8082"},
+		{"https://[::1]:9443", "[::1]:9443"},
+	}
+	for _, tc := range cases {
+		u, err := url.Parse(tc.raw)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.raw, err)
+		}
+		if got := agentCoreDialHost(u); got != tc.want {
+			t.Errorf("%s → %q, want %q", tc.raw, got, tc.want)
+		}
 	}
 }

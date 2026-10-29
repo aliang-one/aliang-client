@@ -159,13 +159,13 @@ func TestAgentCoreSubagentBridgeDepthOne(t *testing.T) {
 	if _, ok := reg.Get("reviewer"); ok {
 		t.Fatalf("子 registry 不得包含子 agent 桥（depth=1 结构保证）")
 	}
-	// PowerShell 仅 Windows 注册（app/agentcore/tools.go 平台裁剪，1599e3d）——
-	// 期望清单按平台构造，darwin/linux 上不断言它。
-	builtinNames := []string{"Read", "Write", "Edit", "Bash", "Grep", "Glob", "LS"}
+	// PowerShell 仅在 Windows 注册（DefaultRegistry 按 runtime.GOOS 裁剪），
+	// 期望表必须同口径，否则非 Windows 平台永远红。
+	want := []string{"Read", "Write", "Edit", "Bash", "Grep", "Glob", "LS"}
 	if runtime.GOOS == "windows" {
-		builtinNames = append(builtinNames, "PowerShell")
+		want = append(want, "PowerShell")
 	}
-	for _, name := range builtinNames {
+	for _, name := range want {
 		if _, ok := reg.Get(name); !ok {
 			t.Fatalf("子 registry 应含内置 %s", name)
 		}

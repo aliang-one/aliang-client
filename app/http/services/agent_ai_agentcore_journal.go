@@ -207,6 +207,13 @@ func (j *agentCoreJournal) appendMsg(sessionID, role, messageID, text, ts string
 
 // appendEnd 落 run 终态行。status ∈ success|stopped|error。
 func (j *agentCoreJournal) appendEnd(sessionID, status, errMsg string) {
+	j.appendEndDiagnostics(sessionID, status, errMsg, nil)
+}
+
+// appendEndDiagnostics 落带诊断块的 run 终态行：diagnostics 里带回合数、
+// 上下文规模、守卫连击与终止真因，诊断面板据此在重开旧会话时还原「这一轮
+// 为什么死」。写失败与 appendEnd 家族同款吞掉。
+func (j *agentCoreJournal) appendEndDiagnostics(sessionID, status, errMsg string, diag *agentCoreDiagnostics) {
 	if j == nil || j.dir == "" || strings.TrimSpace(sessionID) == "" {
 		return
 	}
@@ -219,6 +226,47 @@ func (j *agentCoreJournal) appendEnd(sessionID, status, errMsg string) {
 	}
 	if errMsg != "" {
 		row["error"] = errMsg
+	}
+	if payload := diag.payload(); payload != nil {
+		row["diagnostics"] = payload
+	}
+	j.appendLineLocked(sessionID, row)
+}
+
+// appendAssistantTurn 落逐回合 transcript 行（kind=turn）：本回合 assistant
+// 的完整文本 + thinking + 停止原因 + 本回合发起的工具名。这是「完整对话」
+// 留档的核心——run 末的 appendAssistant 只写整轮累计的最终输出，会丢掉
+// 工具调用之间的中间叙述与 thinking；本函数每回合一行把它们补齐。
+//
+// 与 appendMsg 的去重无关：每回合必然一条（回合序号 turn 单调递增），不需要
+// 去重键。读侧（agent_inventory_agentcore）目前只认 session/msg/tool 三类，
+// 未知 kind 直接跳过，故新增 turn 行对仪表盘回放无副作用、向后兼容。
+//
+// 空回合（text/thinking 都空且无工具）不落，避免无意义空行。写失败只 Warn。
+func (j *agentCoreJournal) appendAssistantTurn(sessionID string, turn int, text, thinking, stopReason string, tools []string) {
+	if j == nil || j.dir == "" || strings.TrimSpace(sessionID) == "" {
+		return
+	}
+	if strings.TrimSpace(text) == "" && strings.TrimSpace(thinking) == "" && len(tools) == 0 {
+		return
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	row := map[string]interface{}{
+		"kind":        "turn",
+		"turn":        turn,
+		"role":        "assistant",
+		"stop_reason": stopReason,
+		"ts":          time.Now().UTC().Format(time.RFC3339),
+	}
+	if text != "" {
+		row["text"] = text
+	}
+	if thinking != "" {
+		row["thinking"] = thinking
+	}
+	if len(tools) > 0 {
+		row["tools"] = tools
 	}
 	j.appendLineLocked(sessionID, row)
 }

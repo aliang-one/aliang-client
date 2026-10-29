@@ -1147,6 +1147,24 @@ export default {
   customEnv_save: 'Save',
   customEnv_saving: 'Saving...',
 
+  // -- AgentCoreSettings --
+  agentCore_title: 'AliangCode Kernel LLM Settings',
+  agentCore_description: 'Point all local AliangCode sessions at an explicit LLM endpoint (Anthropic Messages compatible). When disabled, the Claude Code configuration and platform proxy are used as-is.',
+  agentCore_enable: 'Enable custom LLM endpoint',
+  agentCore_baseUrl: 'Base URL',
+  agentCore_baseUrlPlaceholder: 'e.g. https://your-gateway.example.com',
+  agentCore_apiKey: 'API Key',
+  agentCore_apiKeyPlaceholder: 'Required for non-loopback endpoints',
+  agentCore_showKey: 'Show',
+  agentCore_hideKey: 'Hide',
+  agentCore_hint: 'Takes effect on the next turn after saving — no restart needed. Only Anthropic Messages compatible endpoints are supported; API Key is required for non-loopback endpoints.',
+  agentCore_error_urlRequired: 'Base URL is required when enabled',
+  agentCore_error_urlInvalid: 'Base URL must be a valid URL (including scheme and hostname)',
+  agentCore_error_keyRequired: 'API Key is required for non-loopback endpoints',
+  agentCore_error_scheme: 'Only http/https protocols are supported',
+  agentCore_save: 'Save',
+  agentCore_saving: 'Saving...',
+
   // -- ConfigSyncSettings --
   sync_title: 'Config Sync Center',
   sync_refresh: 'Refresh',

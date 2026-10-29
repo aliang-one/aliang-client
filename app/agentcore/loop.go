@@ -16,7 +16,7 @@ import (
 //
 // 一轮 run 的结构：
 //
-//	for turn := 0; turn < maxIterations; turn++ {
+//	for turn := 0; ; turn++ {
 //	    拉 steering → 组请求 → 流式拿回复 → 有 tool_use 就执行并回填 → 否则收工
 //	}
 //
@@ -24,32 +24,32 @@ import (
 // finish）—— 其余两个（PrepareNextTurn / GetFollowUpMessages）在 pi 里服务于
 // 它自己的扩展机制，本内核没有对应需求，等有真实用例再加，避免空接口。
 
-// 回合预算家族。这组护栏回答的是同一个问题：手机用户按下发送就走了，run
-// 必须保证有终态（否则会话永久 running，后续消息全部进死队列——比「跑太久」
-// 严重得多的故障），同时死循环不能把 token 烧穿。
+// 进展守卫家族。这组护栏回答的是同一个问题：run 必须保证有终态（否则会话
+// 永久 running，后续消息全部进死队列——比「跑太久」严重得多的故障），但
+// **健康的工作不该被配额掐死**——一轮 run 跑多少轮、跑多久，由任务本身决定
+// （一条消息触发的 spec 执行/通宵改造跑几百上千轮是常态），模型智能负责收尾。
+// 对齐 claudecode / pi 的做法：无轮数上限、无墙钟，靠上下文管理 + 模型自己
+// 完成。曾经有过的 maxIterations=50 与 runWallBudget=40min 在 2026-10-28
+// 移除——它们防的从来不是故障，而是健康的长任务。
 //
-// maxIterations 只是最后的兜底，真正先触发的是三个「无进展」检测：
+// 这里只剩两个「无进展」检测，防的是病理而非时长：
 //
 //   - maxIdenticalToolTurns：连续 N 轮发起完全相同的工具调用（名字+参数一致）
 //     = 模型在原地打转；
-//   - maxConsecutiveToolErrors：连续 N 个工具结果都是错误 = 越错越试的螺旋；
-//   - runWallBudget：单次 run 的墙钟预算。用户对「跑了多久」的感知远强于
-//     「第几轮」，30 分钟没动静就是该停了。
+//   - maxConsecutiveToolErrors：连续 N 个工具结果都是错误 = 越错越试的螺旋。
 //
-// 三者命中都不直接报错：先补一次不带工具的收尾请求让模型把进度交代出来
+// 「挂死」（网络黑洞、网关吊死这类安静故障）不归内核管——宿主侧活性保护
+// （stale 扫描/看门狗）盯着 run.activity，几分钟没动静就判死，健康的任务
+// 哪怕通宵也在持续产出事件。
+//
+// 守卫命中不直接报错：先补一次不带工具的收尾请求让模型把进度交代出来
 // （见 wrapUp），再以带说明的终止帧收场——用户至少知道干到了哪一步。
-const maxIterations = 50
 
 // maxIdenticalToolTurns 是无进展守卫的轮数阈值。
 const maxIdenticalToolTurns = 3
 
 // maxConsecutiveToolErrors 是连续工具错误的个数阈值（跨轮累计，遇成功清零）。
 const maxConsecutiveToolErrors = 5
-
-// runWallBudget 是单次 run 的墙钟预算。长活任务（探索型读代码、批量改造）
-// 10 分钟是常态，40 分钟给足余量；单个 LLM 调用本身可能耗掉大半预算，
-// 检查点在轮与轮之间，不在流中途。
-const runWallBudget = 40 * time.Minute
 
 // maxContextOverflowRetries 是「上游说上下文超长」后自动压缩并重试的轮数
 // 上限。每次压缩都会把历史砍到窗口一半以下，两三次足够落进任何真实窗口；
@@ -83,6 +83,12 @@ type LoopHooks struct {
 	// FinishTurn 在一个回合正常收尾（无 tool_use）时调用。
 	FinishTurn func(TurnResult)
 
+	// OnTurnEnd 在**每个**回合结束后调用（无论该回合是否发起了工具调用），
+	// 用于把逐回合 transcript 完整落盘。与 FinishTurn 的区别：后者只在无
+	// tool_use 的收尾回合触发，OnTurnEnd 每回合都触发，且在本回合历史写回
+	// 之后、工具执行之前触发——此时本回合的 assistant 文本/thinking 已完整。
+	OnTurnEnd func(TurnResult)
+
 	// GetFollowUpMessages 在回合收尾（无 tool_use、FinishTurn 已发）后调用，
 	// 追问宿主「还有没有必须本 run 内处理的消息」。返回非空则追加进 history
 	// 再跑一轮；空则真正收工。
@@ -113,12 +119,47 @@ type LoopHooks struct {
 	// ——executeOne 已有全量 recover，这里是纵深防御。同步在主循环
 	// goroutine 上触发，宿主侧自行加锁保护共享状态。
 	OnToolCall func(name string, input map[string]interface{}, result ToolResult)
+
+	// OnTurn 在每个回合发起 LLM 请求前触发（压缩修正之后），以及 run 终止时
+	// 触发一次终态快照，携带本 run 至此的诊断数据：回合数、上下文用量、三个
+	// 无进展守卫的连击计数。宿主用它驱动手机端诊断面板——这些数据过去只在
+	// run 结束时经 RunResult 一次性暴露，「正在第几轮、上下文用了多少、离
+	// 被判死还有多远」面板全拿不到。参数是值拷贝，宿主可以随便存。可为 nil。
+	OnTurn func(TurnSnapshot)
+}
+
+// TurnSnapshot 是一次 run 的逐回合诊断快照（OnTurn 的参数）。
+type TurnSnapshot struct {
+	// Turns 是已开始的回合数（从 1 计）。
+	Turns int
+	// ContextTokens 是最近一次上游报告的本轮输入 token 数（含缓存读写），
+	// 自动压缩后为压缩后的估算值。0 表示还没有任何上游用量数据。
+	ContextTokens int
+	// ContextWindow 是本 run 的有效上下文窗口（手机选定值或内核兜底）。
+	ContextWindow int
+	// DupStreak / ErrStreak / TruncStreak 是三个无进展守卫的当前连击计数，
+	// 供面板展示「离被判死还有多远」。
+	DupStreak   int
+	ErrStreak   int
+	TruncStreak int
+	// StopReason 是最近一个回合的停止原因（回合快照时点为上一回合的值）。
+	StopReason string
+	// Terminal 为 true 表示这是终止快照：Reason 是终止真因，与终止帧带给
+	// 手机的文案同源。每个 run 恰好一次。
+	Terminal bool
+	// Reason 是终止真因文本（仅终态快照非空）。
+	Reason string
+	// ElapsedMs 是 run 已耗时（毫秒）。
+	ElapsedMs int64
 }
 
 // TurnResult 是一个回合的结果。
 type TurnResult struct {
 	// Text 是本回合 assistant 输出的全部文本（已拼接）。
 	Text string
+	// Thinking 是本回合 assistant 的 thinking 文本（已拼接，可能为空）。
+	// 仅供本地 transcript 留档，不参与历史回传或手机展示。
+	Thinking string
 	// ToolCalls 是本回合执行的工具调用。
 	ToolCalls []ToolCallRecord
 	// StopReason 是上游返回的停止原因。
@@ -279,6 +320,13 @@ type RunResult struct {
 	// 宿主据此决定收尾：为 true 时流式管道已把 ai.error 发出去了，宿主只需
 	// 收敛状态，不能再补一条错误；为 false 才轮到宿主自己判「是不是被取消」。
 	IsError bool
+	// ErrMessage 是本次 run 失败的真因文本（is_error 终止时非空）。
+	//
+	// 终止帧只把它拼进 result 文本发给手机，宿主过去拿不到结构化真因，只能
+	// 在 journal 里写一句笼统的「agentcore run failed」，导致线上故障无法复盘
+	// （2026-10-28 ai_3p18eg1aYQvE 事故：31 回合长对话整轮判死，真因彻底丢失）。
+	// 宿主现在据此把真因落进 journal + 日志。
+	ErrMessage string
 }
 
 // runner 持有一次 run 的可变状态。
@@ -302,35 +350,46 @@ type runner struct {
 	cacheLatched bool
 
 	// 累计
-	textAll   strings.Builder
-	turnText  strings.Builder
-	turns     int
-	toolCalls []ToolCallRecord
-	usage     Usage
-	stopLast  string
+	textAll      strings.Builder
+	turnText     strings.Builder
+	turnThinking strings.Builder
+	turns        int
+	toolCalls    []ToolCallRecord
+	usage        Usage
+	stopLast     string
 
 	// truncStreak 是连续被 max_tokens 截断的轮数。只要有一轮没截断就清零——
 	// 要防的是「原地打转」，不是累计次数。
 	truncStreak int
 
-	// 无进展守卫（见文件顶部「回合预算家族」注释）。
+	// 无进展守卫（见文件顶部「进展守卫家族」注释）。
 	//
 	// lastToolSignature/dupStreak：连续 N 轮工具调用签名完全一致 = 打转。
 	// errStreak：连续 N 个工具结果都是错误（跨轮累计，遇成功清零）。
-	// startedAt/wallBudget：墙钟预算；startedAt 在 loop 入口惰性初始化，
-	// wallBudget 供测试缩短（0 = 用 runWallBudget）。
 	lastToolSignature string
 	dupStreak         int
 	errStreak         int
-	startedAt         time.Time
-	wallBudget        time.Duration
+
+	// startedAt 是 run 起点，供 OnTurn 诊断钩子的 ElapsedMs（不再参与任何
+	// 终止判定——墙钟预算已于 2026-10-28 移除）。
+	startedAt time.Time
 
 	// contextTokens 是上游最近一次报告的本轮输入 token 数（message_start 的
 	// usage.input_tokens）。注意 usage.InputTokens 是按轮累加的账单口径，不能
 	// 拿它当「当前上下文多大」——这里单独记最近一次的实测值，供自动压缩判定。
 	contextTokens int
-	// autoCompacts 是本 run 内已执行的自动压缩次数，见 maxAutoCompactsPerRun。
+	// autoCompacts 是本 run 内已执行的自动压缩次数（遥测，进日志与诊断）。
 	autoCompacts int
+	// compactCooldown 是自动压缩失败后剩余的免压回合数（>0 时跳过判定，每
+	// 回合递减一次），见 compactFailureCooldownTurns。
+	compactCooldown int
+	// compactFailures 是本 run **连续**自动压缩失败次数（成功清零），达
+	// compactFailureLimit 后本 run 永久禁用自动压缩。
+	compactFailures int
+	// turnFrameEmitted 记录本回合是否已经向 writer 发过事件帧。上下文超限
+	// 压缩重跑只在「本回合零帧」时才安全（否则会重复推送）。每回合在
+	// streamTurn 入口重置。
+	turnFrameEmitted bool
 
 	// ctxOverflowWindow 是「上游实测拒绝了当前上下文」后降级出的有效窗口。
 	// 配置窗口来自用户的上下文滑杆（100k~1M），它不知道模型真实上限：给
@@ -366,29 +425,16 @@ func (r *runner) loop(ctx context.Context) (*RunResult, error) {
 			return nil, err
 		}
 	}
-	// 惰性初始化：直构造 runner 的测试路径不会设 startedAt，从这里起算。
-	if r.startedAt.IsZero() {
-		r.startedAt = time.Now()
-	}
 
-	for turn := 0; turn < maxIterations; turn++ {
+	for turn := 0; ; turn++ {
 		// 进程内内核没有子进程可杀，取消只能靠自己轮询。
 		if err := ctx.Err(); err != nil {
 			return r.finishWithErr(ctx, "", err)
 		}
 
-		// 墙钟预算。检查点在轮与轮之间——单个流式调用本身可以耗很久，
-		// 这里拦的是「下一个回合还值不值得开」。
-		if elapsed := time.Since(r.startedAt); elapsed > r.budget() {
-			r.logf("[agentcore] 达到单次运行时间预算 %s（已耗时 %s），收尾 session=%s",
-				r.budget(), elapsed.Round(time.Second), r.sid())
-			return r.stopWithSummary(ctx,
-				fmt.Sprintf("本次运行已耗时 %s，达到单次运行时间预算 %s",
-					elapsed.Round(time.Minute), r.budget()))
-		}
-
 		r.turns = turn + 1
 		r.turnText.Reset()
+		r.turnThinking.Reset()
 
 		// 每轮前拉一次 steering：用户在运行中插的话要在下一次 LLM 调用前进入
 		// 上下文，而不是等这一轮跑完。
@@ -401,6 +447,10 @@ func (r *runner) loop(ctx context.Context) (*RunResult, error) {
 		// 上下文接近窗口上限时先压缩，再发请求。放在 steering 之后：刚插进来
 		// 的话必须留在保留的原文尾部，而不是被折叠进摘要。
 		r.maybeAutoCompact(ctx)
+
+		// 逐回合诊断快照：此刻 contextTokens 已含压缩修正，是「即将发出去的
+		// 上下文规模」最接近的真值。
+		r.fireOnTurn(false, "")
 
 		req := r.buildRequest()
 		if r.cfg.Hooks.PrepareRequest != nil {
@@ -445,12 +495,17 @@ func (r *runner) loop(ctx context.Context) (*RunResult, error) {
 		r.stubHistoricalImages()
 
 		toolUses := collectToolUses(assistantBlocks)
+		// 逐回合 transcript 落盘：无论本回合是否发起工具调用都记一条，捕获
+		// 工具调用之间的中间叙述与 thinking（journal 只在 run 末写一条 assistant
+		// 会丢掉这些）。放在历史写回之后、工具执行之前——此时本回合文本已完整。
+		r.fireOnTurnEnd(toolUses, stopReason)
 		if len(toolUses) == 0 {
 			// 无工具调用 = 回合收尾。
 			r.fireFinishTurn(stopReason)
 			// 收尾追补：steering 排进队列却没赶上任何一次下一轮调用时
 			// （典型：插话在最后一轮流式尾声才到），再跑一轮把它答掉，
-			// 别让用户的插话悬在队列里没有回复。上限仍是 maxIterations。
+			// 别让用户的插话悬在队列里没有回复。轮数无上限，run 由模型
+			// 自然收尾或进展守卫终止。
 			if r.cfg.Hooks.GetFollowUpMessages != nil {
 				if followUps := r.cfg.Hooks.GetFollowUpMessages(); len(followUps) > 0 {
 					r.history = append(r.history, followUps...)
@@ -538,26 +593,9 @@ func (r *runner) loop(ctx context.Context) (*RunResult, error) {
 			}
 		}
 	}
-
-	// 撞上 maxIterations——三个无进展守卫都没先触发时的兜底。
-	//
-	// 不直接报错收场：上限是防死循环的护栏，不该让用户看到一句「达到最大回合数」
-	// 之后什么都没有——前面几十条命令的进展全丢在历史里。stopWithSummary 会
-	// 补一次**不带工具**的请求，让模型把已完成的部分和下一步用文字交代出来。
-	// 这一次不计入回合数，失败也只是没有收尾文本，不改变终止结论。
-	return r.stopWithSummary(ctx,
-		fmt.Sprintf("达到单次运行的最大回合数 %d", maxIterations))
 }
 
-// budget 返回本 run 的墙钟预算（测试可经 wallBudget 缩短）。
-func (r *runner) budget() time.Duration {
-	if r.wallBudget > 0 {
-		return r.wallBudget
-	}
-	return runWallBudget
-}
-
-// stopWithSummary 是所有预算耗尽出口的统一收场：先补一次无工具的收尾总结
+// stopWithSummary 是所有进展守卫出口的统一收场：先补一次无工具的收尾总结
 // （wrapUp 内部吞错，不影响终止结论），再以带原因的终止帧结束。
 func (r *runner) stopWithSummary(ctx context.Context, reason string) (*RunResult, error) {
 	r.wrapUp(ctx, reason)
@@ -613,13 +651,24 @@ func (r *runner) wrapUp(ctx context.Context, reason string) {
 // 触发依据取两者的较大值：本地估算（稳定、但对 tokenizer 只是近似）与上游
 // 上一轮实测的 input_tokens（精确、但滞后一轮）。任一达到阈值的 3/4 就压缩，
 // 留出余量给本轮输出与工具结果。压缩失败不终止 run：宁可带着长上下文继续
-// 跑，也不要因为摘要请求偶发失败而中断用户的对话。
+// 跑，也不要因为摘要请求偶发失败而中断用户的对话。但失败也不能无代价地
+// 每回合重试——历史仍超阈值时每回合都会重新触发判定，原样重试就是「压缩
+// 失败熔炉」（每回合重烧一次全窗口摘要请求），所以失败后有回合级冷却
+// （compactFailureCooldownTurns），连续失败达上限则本 run 禁用自动压缩。
 func (r *runner) maybeAutoCompact(ctx context.Context) {
 	window := r.effectiveContextWindow()
 	if window <= 0 {
 		return
 	}
-	if r.autoCompacts >= maxAutoCompactsPerRun {
+	// 连续失败达上限：本 run 不再自动压缩（翻转时的那条日志在失败分支打）。
+	// 成功路径不设次数配额——压缩多少次由任务决定（通宵任务几十次是常态），
+	// 病理由失败侧的 compactFailureLimit 与冷却兜住。
+	if r.compactFailures >= compactFailureLimit {
+		return
+	}
+	// 冷却期：跳过判定，不烧摘要请求。
+	if r.compactCooldown > 0 {
+		r.compactCooldown--
 		return
 	}
 	threshold := window * autoCompactRatioNum / autoCompactRatioDen
@@ -631,14 +680,36 @@ func (r *runner) maybeAutoCompact(ctx context.Context) {
 		return
 	}
 
-	compacted, info, err := Compact(ctx, r.compactConfig(), r.history, "auto")
+	// 压缩进度 → 宿主活性帧：压缩期是零 delta 的长静默（8192 token 的慢
+	// 摘要在 20-25 tok/s 下超过 5min stale 阈值），没有这帧健康的慢压缩会被
+	// 误杀。帧写失败只记日志，不拖累压缩本身。
+	var compactOpts []CompactOption
+	if r.writer != nil {
+		compactOpts = append(compactOpts, WithCompactProgress(func(summaryTokens int) {
+			if err := r.writer.CompactProgress(summaryTokens); err != nil {
+				r.logf("agentcore: 写 compact_progress 帧失败: %v", err)
+			}
+		}))
+	}
+	compacted, info, err := Compact(ctx, r.compactConfig(), r.history, "auto", compactOpts...)
 	if err != nil {
 		if errors.Is(err, ErrNothingToCompact) {
 			return
 		}
-		r.logf("agentcore: 自动压缩失败，继续使用完整上下文: %v session=%s", err, r.writer.sessionID)
+		r.compactFailures++
+		r.compactCooldown = compactFailureCooldownTurns
+		if r.compactFailures >= compactFailureLimit {
+			r.logf("agentcore: 自动压缩连续失败 %d 次，本次运行不再自动压缩（上下文超限时仍有降级压缩兜底）: %v session=%s",
+				r.compactFailures, err, r.sid())
+			return
+		}
+		r.logf("agentcore: 自动压缩失败，跳过接下来 %d 个回合再试: %v session=%s",
+			r.compactCooldown, err, r.sid())
 		return
 	}
+	// 成功即清零失败与冷却：偶发一次失败不该影响后续的压缩节奏。
+	r.compactFailures = 0
+	r.compactCooldown = 0
 	r.autoCompacts++
 	r.history = compacted
 	r.contextTokens = info.PostTokens
@@ -656,9 +727,16 @@ func (r *runner) maybeAutoCompact(ctx context.Context) {
 // effectiveContextWindow 返回本 run 实际可用的上下文窗口：配置值与「上游
 // 实测拒绝后降级出的值」取小。手机端的滑杆不知道模型真实上限，配得再大也
 // 只是让压缩阈值失效；被拒一次之后以实测为准。
+//
+// cfg.ContextWindow<=0（手机没传窗口）时回落到 DefaultContextWindow，而不是
+// 返回 0——否则 maybeAutoCompact 会因 window<=0 直接 return，主动压缩永不
+// 触发，上下文一路膨胀到被上游拒（2026-10-28 事故的放大因素）。
 func (r *runner) effectiveContextWindow() int {
 	w := r.cfg.ContextWindow
-	if r.ctxOverflowWindow > 0 && (w <= 0 || r.ctxOverflowWindow < w) {
+	if w <= 0 {
+		w = DefaultContextWindow
+	}
+	if r.ctxOverflowWindow > 0 && r.ctxOverflowWindow < w {
 		return r.ctxOverflowWindow
 	}
 	return w
@@ -674,14 +752,19 @@ func (r *runner) compactConfig() *Config {
 // noteContextOverflow 判定失败是否因为上下文超出模型窗口；命中就把有效
 // 窗口降到实测规模以下、压缩历史并返回 true，调用方重试本回合。
 //
-// 只认 4xx（且是响应检查阶段抛出的 httpStatusError）——那种失败发生在任何
-// 事件帧之前，writer 状态干净，重跑一整回合是安全的。2xx 信封里的错误多
-// 半是限流，不能拿去压缩。
+// 恢复的前提是「本回合还没发过任何事件帧」——重跑会把已发帧重复推给手机。
+// 4xx 在响应检查阶段抛出（天然零帧）；2xx 裸 JSON 信封同样是整段无 data:
+// 行（parseSSE 识别到信封即返回，零帧）。turnFrameEmitted 做最后兜底：只要
+// 本回合已发过 TurnStart，就不在这里重跑。
 func (r *runner) noteContextOverflow(ctx context.Context, err error) bool {
 	if r.ctxOverflows >= maxContextOverflowRetries {
 		return false
 	}
 	if !isContextOverflowError(err) {
+		return false
+	}
+	if r.turnFrameEmitted {
+		r.logf("agentcore: 上下文超限但本回合已发过事件帧，跳过压缩重试以免重复推送 session=%s", r.sid())
 		return false
 	}
 	measured := EstimateTokens(r.history)
@@ -705,7 +788,22 @@ func (r *runner) noteContextOverflow(ctx context.Context, err error) bool {
 	}
 	r.ctxOverflowWindow = eff
 
-	compacted, info, cerr := Compact(ctx, r.compactConfig(), r.history, "auto")
+	// 压缩进度 → 宿主活性帧：降级压缩与 maybeAutoCompact 同型，也是一次零
+	// delta 的长静默摘要请求，压缩期间 stale 5min 同样可判死。此时本回合还没
+	// 发过任何事件帧（上方 turnFrameEmitted 兜底已拦掉已发帧的形态；4xx 与
+	// 2xx 裸信封都在响应检查阶段抛出，writer 状态干净），且本路径本就在压缩
+	// 成功后发 CompactBoundary——进度帧没有引入新的帧类。writer 只在 run 内
+	// 非空，run 循环里恒非空；这里不做 nil 断言，对齐 maybeAutoCompact 的
+	// 防御写法。帧写失败只记日志，不拖累自愈。
+	var compactOpts []CompactOption
+	if r.writer != nil {
+		compactOpts = append(compactOpts, WithCompactProgress(func(summaryTokens int) {
+			if err := r.writer.CompactProgress(summaryTokens); err != nil {
+				r.logf("agentcore: 写 compact_progress 帧失败: %v", err)
+			}
+		}))
+	}
+	compacted, info, cerr := Compact(ctx, r.compactConfig(), r.history, "auto", compactOpts...)
 	if cerr != nil {
 		if errors.Is(cerr, ErrNothingToCompact) {
 			r.logf("agentcore: 上下文超出模型窗口，但历史已无早期消息可压缩 session=%s", r.writer.sessionID)
@@ -728,21 +826,36 @@ func (r *runner) noteContextOverflow(ctx context.Context, err error) bool {
 	return true
 }
 
-// isContextOverflowError 判定是否为「上下文超出模型窗口」类 4xx。各家措辞
+// isContextOverflowError 判定是否为「上下文超出模型窗口」类错误。各家措辞
 // 不同（Anthropic: prompt is too long；OpenAI 兼容: context length /
 // maximum context length；GLM: input is too long），只认明确指向上下文/输入
 // 的短语，避免把 max_tokens 之类的错误误判成上下文问题。
+//
+// 同时识别两种载体：
+//   - 4xx httpStatusError（Anthropic 原生 / 大多数网关）
+//   - 2xx 裸 JSON 信封 upstreamError（本网关实测常把错误塞进 HTTP 200，见
+//     client.go 注释 2026-10-25；若不识别，这类「input too long」会被当成
+//     不可重试的 invalid_request 直接判死整轮，2026-10-28 事故即此路径）。
 func isContextOverflowError(err error) bool {
 	var statusErr *httpStatusError
-	if !errors.As(err, &statusErr) {
-		return false
+	if errors.As(err, &statusErr) {
+		switch statusErr.status {
+		case http.StatusBadRequest, http.StatusRequestEntityTooLarge, http.StatusUnprocessableEntity:
+		default:
+			return false
+		}
+		return matchesContextOverflowText(statusErr.body)
 	}
-	switch statusErr.status {
-	case http.StatusBadRequest, http.StatusRequestEntityTooLarge, http.StatusUnprocessableEntity:
-	default:
-		return false
+	var upErr *upstreamError
+	if errors.As(err, &upErr) {
+		return matchesContextOverflowText(upErr.message) || matchesContextOverflowText(upErr.body)
 	}
-	m := strings.ToLower(statusErr.body)
+	return false
+}
+
+// matchesContextOverflowText 判断一段错误文本是否指向「上下文/输入过长」。
+func matchesContextOverflowText(s string) bool {
+	m := strings.ToLower(s)
 	for _, needle := range []string{
 		"prompt is too long",
 		"context length",
@@ -848,6 +961,8 @@ func (r *runner) noteCacheRejection(err error, req *MessagesRequest) bool {
 
 // streamTurn 跑一次 LLM 调用，边流边写帧，返回本回合的完整内容块。
 func (r *runner) streamTurn(ctx context.Context, req *MessagesRequest, writer *streamWriter) ([]ContentBlock, string, error) {
+	// 本回合重新计数：是否已发过事件帧（供上下文超限压缩重跑的安全判定）。
+	r.turnFrameEmitted = false
 	// 按 index 累积各内容块。
 	var blocks []ContentBlock
 	partialJSON := map[int]*strings.Builder{}
@@ -891,6 +1006,7 @@ func (r *runner) streamTurn(ctx context.Context, req *MessagesRequest, writer *s
 				if err := writer.TurnStart(messageID, ev.Model); err != nil {
 					return err
 				}
+				r.turnFrameEmitted = true
 			}
 
 		case EventText:
@@ -907,6 +1023,29 @@ func (r *runner) streamTurn(ctx context.Context, req *MessagesRequest, writer *s
 					}
 				}
 				if err := writer.TextDelta(ev.Index, ev.Text); err != nil {
+					return err
+				}
+			}
+
+		case EventThinking:
+			// 思考文本两路分流，都刻意不进 blocks / textAll / turnText
+			// （思考块在上游带 signature，内核不消费 signature_delta，把无
+			// 签名的思考块回传给下一轮请求会被上游拒；宿主也只把 finalized
+			// assistant 帧的 text 块当正文落库，思考内容混进去会污染
+			// transcript 与 result 文本）：
+			//   1. 流式转发宿主（writer 帧 → ai.thinking → 手机渲染思考 +
+			//      服务层 markProgress 喂 L3 stale/steer 活性）——纯推理
+			//      回合不再被 5min 判死；
+			//   2. 进本回合缓冲，OnTurnEnd 落 journal transcript。
+			r.turnThinking.WriteString(ev.Text)
+			if writer != nil {
+				if !started[ev.Index] {
+					started[ev.Index] = true
+					if err := writer.ThinkingBlockStart(ev.Index); err != nil {
+						return err
+					}
+				}
+				if err := writer.ThinkingDelta(ev.Index, ev.Text); err != nil {
 					return err
 				}
 			}
@@ -996,7 +1135,22 @@ func (r *runner) streamTurn(ctx context.Context, req *MessagesRequest, writer *s
 			return ev.Err
 		}
 		return nil
-	})
+	},
+		// 重试可观测：上游瞬态失败、内核即将重试时发一帧 system/api_retry。
+		// 没有它，重试链（最坏 4×120s + 退避 ≈ 8min）在宿主看来就是纯静默，
+		// 会被 stale 扫描器 5min 判死；帧形对齐真 claude-code，宿主 decoder
+		// 既有处理直接生效（markProgress + ai.run.progress）。
+		WithRetryNotice(func(n RetryNotice) {
+			if writer == nil {
+				return
+			}
+			// emit 管道写失败意味着宿主侧已不在读（或已收尾）：这一帧丢了
+			// 无可挽回，也不该为一个观测帧中止回合本身——记一笔，继续重试。
+			if err := writer.RetryNotice(n); err != nil {
+				r.logf("agentcore: 写 api_retry 帧失败 (attempt=%d): %v", n.Attempt, err)
+			}
+		}),
+	)
 	if err != nil {
 		return nil, "", err
 	}
@@ -1156,6 +1310,50 @@ func (r *runner) fireFinishTurn(stopReason string) {
 	})
 }
 
+// fireOnTurn 调用 OnTurn 钩子，携带当前诊断快照。terminal=true 表示终态快照
+// （每个 run 经 finish 恰好触发一次，Reason 为终止真因）。
+func (r *runner) fireOnTurn(terminal bool, reason string) {
+	// cfg 可能为 nil：直构造 runner 的测试路径（newTestRunner 单独驱动
+	// finish）没有 cfg，容忍之。
+	if r.cfg == nil || r.cfg.Hooks.OnTurn == nil {
+		return
+	}
+	if r.startedAt.IsZero() {
+		r.startedAt = time.Now()
+	}
+	r.cfg.Hooks.OnTurn(TurnSnapshot{
+		Turns:         r.turns,
+		ContextTokens: r.contextTokens,
+		ContextWindow: r.effectiveContextWindow(),
+		DupStreak:     r.dupStreak,
+		ErrStreak:     r.errStreak,
+		TruncStreak:   r.truncStreak,
+		StopReason:    r.stopLast,
+		Terminal:      terminal,
+		Reason:        reason,
+		ElapsedMs:     time.Since(r.startedAt).Milliseconds(),
+	})
+}
+
+// fireOnTurnEnd 调用 OnTurnEnd 钩子，每回合都发（含带工具调用的回合），
+// 供宿主把逐回合 assistant 文本/thinking 完整落 journal。只传本回合的
+// toolUses（不是累计的 r.toolCalls），与 FinishTurn 同理避免调用方重复处理。
+func (r *runner) fireOnTurnEnd(toolUses []ContentBlock, stopReason string) {
+	if r.cfg.Hooks.OnTurnEnd == nil {
+		return
+	}
+	records := make([]ToolCallRecord, 0, len(toolUses))
+	for _, tu := range toolUses {
+		records = append(records, ToolCallRecord{ID: tu.ID, Name: tu.Name, Input: tu.Input})
+	}
+	r.cfg.Hooks.OnTurnEnd(TurnResult{
+		Text:       r.turnText.String(),
+		Thinking:   r.turnThinking.String(),
+		ToolCalls:  records,
+		StopReason: stopReason,
+	})
+}
+
 // finishWithErr 按 ctx 状态选终止语义：被取消 → interrupted（非错误），
 // 其余 → error_during_execution（错误）。
 //
@@ -1169,6 +1367,11 @@ func (r *runner) finishWithErr(ctx context.Context, prefix string, runErr error)
 	msg := strings.TrimSpace(prefix)
 	if msg == "" && runErr != nil {
 		msg = runErr.Error()
+	}
+	// 真因必须落日志：终止帧只把它带给手机，服务端过去一行都不留，线上故障
+	// 无法复盘（2026-10-28 事故）。r.logf 走宿主 logger.Warn → aliang_core.log。
+	if runErr != nil {
+		r.logf("[agentcore] run 失败终止 turn=%d err=%v session=%s", r.turns, runErr, r.sid())
 	}
 	return r.finish(ctx, ResultSubtypeErrorRun, msg, true, runErr)
 }
@@ -1185,6 +1388,10 @@ func (r *runner) finishWithErr(ctx context.Context, prefix string, runErr error)
 // 全文 —— 手机上表现为整轮回复再刷一遍、落库消息双份。与 fireFinishTurn
 // 的「只传本回合」是同一个理由。
 func (r *runner) finish(_ context.Context, subtype, errText string, isError bool, runErr error) (*RunResult, error) {
+	// 终态诊断快照先于终止帧发出：宿主据此把回合数/上下文规模/终止真因落进
+	// journal end 行与诊断面板。所有终止路径（成功/守卫判死/流式失败/取消）
+	// 都汇入 finish，这里是唯一需要触发的地方。
+	r.fireOnTurn(true, errText)
 	if r.writer != nil {
 		text := r.turnText.String()
 		if isError && errText != "" {
@@ -1209,6 +1416,9 @@ func (r *runner) finish(_ context.Context, subtype, errText string, isError bool
 		StopReason: r.stopLast,
 		Usage:      r.usage,
 		IsError:    isError,
+	}
+	if isError {
+		res.ErrMessage = errText
 	}
 	return res, runErr
 }

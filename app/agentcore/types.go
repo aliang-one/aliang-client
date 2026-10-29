@@ -216,11 +216,17 @@ type streamMessage struct {
 // streamDelta 是各类 delta 的并集。
 //
 //	text_delta        → Text
+//	thinking_delta    → Thinking（Anthropic 语义的载荷键就是 thinking，不是 text；
+//	                  个别网关走 text，translateEvent 两个都收）
 //	input_json_delta  → PartialJSON
 //	message_delta     → StopReason
 type streamDelta struct {
-	Type        string `json:"type"`
-	Text        string `json:"text,omitempty"`
+	Type string `json:"type"`
+	Text string `json:"text,omitempty"`
+	// thinking_delta 的思考文本。流式转发给宿主（writer 帧 → ai.thinking →
+	// 手机渲染思考 + 服务层 markProgress 喂活性），并落 journal transcript；
+	// 绝不进对话历史与结果正文（回传无签名思考块会被上游拒）。
+	Thinking    string `json:"thinking,omitempty"`
 	PartialJSON string `json:"partial_json,omitempty"`
 	StopReason  string `json:"stop_reason,omitempty"`
 }

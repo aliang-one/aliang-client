@@ -49,17 +49,17 @@ func TestAgentAITimeoutDefaults(t *testing.T) {
 	if agentAIApprovalTimeout != 24*time.Hour {
 		t.Fatalf("default agentAIApprovalTimeout = %s, want 24h", agentAIApprovalTimeout)
 	}
-	if agentAIHardCeiling != 2*time.Hour {
-		t.Fatalf("default agentAIHardCeiling = %s, want 2h", agentAIHardCeiling)
+	// 2026-10-28 起硬顶默认 0(关闭):引擎活跃时长是健康工作的长度,不是故障
+	// 信号——一条消息触发通宵 run 是合法形态。runaway 防护交给活性家族
+	// (idle/no_progress/tool_wait/stale 扫描),硬顶只是 env 显式 opt-in。
+	if agentAIHardCeiling != 0 {
+		t.Fatalf("default agentAIHardCeiling = %s, want 0(时间墙已移除,改 opt-in)", agentAIHardCeiling)
 	}
-	// 不再断言 agentAIHardCeiling > agentAIApprovalTimeout：硬顶只累加引擎
-	// 活跃时长，审批挂起的拍被排除，审批窗口由 agentAIApprovalTimeout 独立管辖。
 	if agentAIToolWaitCeiling != time.Hour {
 		t.Fatalf("default agentAIToolWaitCeiling = %s, want 1h", agentAIToolWaitCeiling)
 	}
-	if agentAIToolWaitCeiling >= agentAIHardCeiling {
-		t.Fatalf("agentAIToolWaitCeiling (%s) must be less than agentAIHardCeiling (%s) to fire first", agentAIToolWaitCeiling, agentAIHardCeiling)
-	}
+	// 旧契约「tool_wait < hard_ceiling 保证先触发」随硬顶默认关闭而失效:
+	// 各守卫独立判定,等待态各有专属天花板,不再有总闸排序要求。
 }
 
 // TestEnvMiB covers the env-to-MiB byte resolution used by the terminal quota

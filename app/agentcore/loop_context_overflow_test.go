@@ -1,6 +1,7 @@
 package agentcore
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -120,6 +121,130 @@ func TestRunRecoversFromContextOverflow(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("降级压缩应发出 compact_boundary 帧，让手机显示压缩提示")
+	}
+}
+
+// TestContextOverflowCompactEmitsProgressFrames 锁降级压缩的进度接线：上下文
+// 超限自愈的压缩与 maybeAutoCompact 同型（零 delta 长静默摘要请求），压缩期间
+// 必须经 streamWriter 发 system/compact_progress 活性帧（带正的 summary_tokens），
+// 且与既有 compact_boundary 帧并存。
+func TestContextOverflowCompactEmitsProgressFrames(t *testing.T) {
+	var requests int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&requests, 1)
+		switch n {
+		case 1:
+			// 第一次回合：上游说装不下（响应检查阶段的 4xx，天然零帧）。
+			http.Error(w, `{"type":"error","error":{"message":"prompt is too long: 250000 tokens > 200000 maximum"}}`, http.StatusBadRequest)
+		case 2:
+			// 压缩摘要请求：一段 3000 字符的摘要，超过 2k 节流线，至少触发
+			// 一次进度回调。
+			writeSimpleText(w, strings.Repeat("甲", 3000))
+		default:
+			// 压缩后的重试：正常收尾。
+			writeSimpleText(w, "ok")
+		}
+	}))
+	defer srv.Close()
+
+	big := strings.Repeat("a", 16000)
+	history := []Message{
+		TextMessage("user", big),
+		TextMessage("assistant", big),
+		TextMessage("user", big),
+		TextMessage("assistant", big),
+		TextMessage("user", big),
+	}
+
+	rec := &frameRecorder{}
+	cfg := &Config{
+		Client:        NewClient(srv.URL),
+		Model:         "claude-x",
+		ContextWindow: 1_000_000,
+		Emit:          rec.emit,
+	}
+	res, err := Run(t.Context(), cfg, history)
+	if err != nil {
+		t.Fatalf("Run 应自愈成功，实际: %v", err)
+	}
+	if res == nil || res.Text != "ok" {
+		t.Fatalf("Run 结果异常: %+v", res)
+	}
+	if got := atomic.LoadInt32(&requests); got != 3 {
+		t.Fatalf("请求 %d 次，期望 3 次（超限 → 摘要 → 重试）", got)
+	}
+	progressFrames := 0
+	foundBoundary := false
+	for _, f := range rec.frames(t) {
+		if typ, _ := f["type"].(string); typ != "system" {
+			continue
+		}
+		switch sub, _ := f["subtype"].(string); sub {
+		case "compact_progress":
+			progressFrames++
+			if n, ok := f["summary_tokens"].(float64); !ok || n <= 0 {
+				t.Fatalf("compact_progress 帧缺 summary_tokens: %v", f)
+			}
+		case "compact_boundary":
+			foundBoundary = true
+		}
+	}
+	if progressFrames == 0 {
+		t.Fatal("降级压缩未发出任何 system/compact_progress 活性帧")
+	}
+	if !foundBoundary {
+		t.Fatal("降级压缩应发出 compact_boundary 帧，让手机显示压缩提示")
+	}
+}
+
+// TestContextOverflowCompactProgressWriteFailureKeepsRecovery 锁旧语义：进度
+// 帧写失败只记日志，不拖累降级压缩与自愈——压缩照常完成、重试照常成功。
+func TestContextOverflowCompactProgressWriteFailureKeepsRecovery(t *testing.T) {
+	var requests int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&requests, 1)
+		switch n {
+		case 1:
+			http.Error(w, `{"type":"error","error":{"message":"prompt is too long: 250000 tokens > 200000 maximum"}}`, http.StatusBadRequest)
+		case 2:
+			writeSimpleText(w, strings.Repeat("甲", 3000))
+		default:
+			writeSimpleText(w, "ok")
+		}
+	}))
+	defer srv.Close()
+
+	big := strings.Repeat("a", 16000)
+	history := []Message{
+		TextMessage("user", big),
+		TextMessage("assistant", big),
+		TextMessage("user", big),
+		TextMessage("assistant", big),
+		TextMessage("user", big),
+	}
+
+	cfg := &Config{
+		Client:        NewClient(srv.URL),
+		Model:         "claude-x",
+		ContextWindow: 1_000_000,
+		// emit 只对 compact_progress 帧报错：TurnStart/正文帧照常通过，隔离
+		// 「进度帧写失败」这一个变量。
+		Emit: func(frame []byte) error {
+			if strings.Contains(string(frame), "compact_progress") {
+				return errors.New("emit: 宿主写端已关")
+			}
+			return nil
+		},
+	}
+	res, err := Run(t.Context(), cfg, history)
+	if err != nil {
+		t.Fatalf("进度帧写失败不得拖累自愈，实际: %v", err)
+	}
+	if res == nil || res.Text != "ok" {
+		t.Fatalf("Run 结果异常: %+v", res)
+	}
+	if got := atomic.LoadInt32(&requests); got != 3 {
+		t.Fatalf("请求 %d 次，期望 3 次（超限 → 摘要 → 重试）", got)
 	}
 }
 

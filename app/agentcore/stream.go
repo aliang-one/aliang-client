@@ -109,6 +109,57 @@ func (w *streamWriter) CompactBoundary(trigger string, preTokens, postTokens int
 	})
 }
 
+// RetryNotice 发一次 system/api_retry：上游瞬态失败、内核即将重试。
+//
+// 帧形逐字段对齐真 claude-code 的同名帧（宿主 app/http/services/
+// agent_ai_retry_test.go 里锁着逐字样例：{"type":"system","subtype":"api_retry",
+// attempt, max_retries, retry_delay_ms, error_status, error}）。宿主 decoder
+// 对它本来就有完整处理：markProgress 刷活性 + ai.run.progress(retry_active)
+// 转发手机 + 失败时把 error_status/error 类别并进终态 ai.error。内核重试原本
+// 全程零帧，纯推理后的首字重试链（最坏 4×120s + 退避 ≈ 8min）会被 stale
+// 扫描器 5min 判死——这帧是活性链路的必要环节，不是锦上添花。
+//
+// 空字段刻意不发：decoder 对缺失字段按零值跳过，与 CLI 帧的稀疏形态一致。
+func (w *streamWriter) RetryNotice(n RetryNotice) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	frame := map[string]interface{}{
+		"type":        "system",
+		"subtype":     "api_retry",
+		"attempt":     n.Attempt,
+		"max_retries": maxRetries,
+	}
+	if n.Delay > 0 {
+		frame["retry_delay_ms"] = n.Delay.Milliseconds()
+	}
+	if n.ErrorStatus > 0 {
+		frame["error_status"] = n.ErrorStatus
+	}
+	if n.ErrorKind != "" {
+		frame["error"] = n.ErrorKind
+	}
+	return w.writeFrame(frame)
+}
+
+// CompactProgress 发一次 system/compact_progress：自动压缩的摘要仍在流式
+// 产出。
+//
+// 帧形是内核自造的 subtype——claude CLI 压缩期间不发任何帧，宿主没有现成
+// subtype 可对齐；宿主 decoder 对未知 system subtype 安全忽略，旧宿主不会
+// 因此报错。但它的存在意义就是被宿主认出来 markProgress 刷活性：压缩期全程
+// 零帧的话，8192 token 的慢摘要（20-25 tok/s > 5min）会被 stale 扫描器误杀
+// （steer 活性窗同源 idleFor，一并受益）。summary_tokens 是摘要至今的估算
+// token 数，仅供宿主日志。
+func (w *streamWriter) CompactProgress(summaryTokens int) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.writeFrame(map[string]interface{}{
+		"type":           "system",
+		"subtype":        "compact_progress",
+		"summary_tokens": summaryTokens,
+	})
+}
+
 // TurnStart 发 message_start，确立本回合的 provider 消息 id。
 func (w *streamWriter) TurnStart(messageID, model string) error {
 	w.mu.Lock()
@@ -153,6 +204,19 @@ func (w *streamWriter) TextBlockStart(index int) error {
 	})
 }
 
+// ThinkingBlockStart 是思考块的 content_block_start 便捷方法。
+//
+// 与 TextBlockStart 一样等到第一段 delta 才发（见 streamTurn 的 started 表）；
+// 宿主 emitClaudeStructuredEvents 靠 content_block_start 记住块类型，收
+// content_block_stop 时才知道要补一发 ai.thinking active:false，所以这个
+// start 不能省。
+func (w *streamWriter) ThinkingBlockStart(index int) error {
+	return w.ContentBlockStart(index, map[string]interface{}{
+		"type":     BlockTypeThinking,
+		"thinking": "",
+	})
+}
+
 // ToolUseBlockStart 是工具块的 content_block_start 便捷方法。
 func (w *streamWriter) ToolUseBlockStart(index int, id, name string) error {
 	return w.ContentBlockStart(index, map[string]interface{}{
@@ -171,6 +235,20 @@ func (w *streamWriter) TextDelta(index int, text string) error {
 	return w.ContentBlockDelta(index, map[string]interface{}{
 		"type": "text_delta",
 		"text": text,
+	})
+}
+
+// ThinkingDelta 发一段思考增量。字段名 thinking 对齐真 claude-code 的帧：
+// 宿主 emitClaudeStructuredEvents 只认 delta.type=thinking_delta、取
+// delta.thinking，翻成 ai.thinking 并 markProgress——纯推理期间这是服务层
+// 唯一的活性信号（L3 stale 扫描器 5 分钟就判死），内核必须原样透传而不是丢。
+func (w *streamWriter) ThinkingDelta(index int, text string) error {
+	if text == "" {
+		return nil
+	}
+	return w.ContentBlockDelta(index, map[string]interface{}{
+		"type":     "thinking_delta",
+		"thinking": text,
 	})
 }
 

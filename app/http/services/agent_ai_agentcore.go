@@ -120,6 +120,7 @@ const (
 // 直接对话」这个承诺对新用户不成立。
 //
 // 取值顺序：
+//  0. 显式 agentcore_llm（仪表盘配置）——命中且非空直接返回，不进缓存；
 //  1. ANTHROPIC_AUTH_TOKEN（子进程 env → ~/.claude/settings.json）——零网络，
 //     与 CLI 用的是同一个值，quick-setup 用户恒命中；
 //  2. user-center 的 key 列表（带缓存）——没跑过 quick-setup 的新装用户兜底。
@@ -127,6 +128,13 @@ const (
 // 两条都拿不到就返回空串：内核照旧出网，行为退回「由代理按分组兜底」，不因为
 // 拿不到 key 就把这一轮判死。
 func agentCoreAuthToken() string {
+	// 显式 key 最优先;不进 token 缓存(改配置下一回合立即生效,无需等 TTL)。
+	if custom := config.GetGlobalConfig().EffectiveAgentCoreLLM(); custom != nil {
+		if custom.APIKey != "" {
+			return custom.APIKey
+		}
+		// 回环+空 key 是合法形态:key 落继承链(URL 已显式)。
+	}
 	if v := agentCoreEnvOrSettings("ANTHROPIC_AUTH_TOKEN"); v != "" {
 		return v
 	}
@@ -198,10 +206,18 @@ func agentCoreResetTokenCache() {
 // 自己的 API key 另由 agentCoreAuthToken 作为 Authorization 显式带上，两者不是
 // 一回事（见 agentCoreAuthToken 注释）。
 //
+// 例外：仪表盘 customer.agentcore_llm 显式配置命中时直接采用，回环/远端都
+// 放行（见函数体首部）。
+//
 // 用户把 ANTHROPIC_BASE_URL 配成远端直连地址时（本机 settings.json 就是
 // https://api.aliang.one），不照抄：那条路要完整的 mTLS 客户端凭据，内核没有。
 // 宁可退回 56432 走隧道，也不要让「装了客户端却连不上」这种最难自查的失败发生。
 func agentCoreBaseURL() string {
+	// 显式设置(仪表盘 customer.agentcore_llm)最优先:回环/远端都放行——
+	// 用户显式担责,回环闸只拦继承链里意外带进来的远端地址。
+	if custom := config.GetGlobalConfig().EffectiveAgentCoreLLM(); custom != nil {
+		return custom.BaseURL
+	}
 	if v := agentCoreEnvOrSettings("ANTHROPIC_BASE_URL"); v != "" {
 		if agentCoreIsLoopbackBase(v) {
 			return v
@@ -256,6 +272,21 @@ func agentCoreModelUnusable(model string) bool {
 	return m == "" || strings.EqualFold(m, "<synthetic>")
 }
 
+// agentCoreDialHost 返回拨测目标 host:port。URL 无显式端口时按 scheme 补
+// 默认值——u.Host 对 "https://gw.example.com" 是裸域名,直接 dial 会报
+// "missing port in address"。80 兜底仅 http/https 可达（上游 Validate 白名单），
+// 勿当通用 helper 复用到任意 scheme。
+func agentCoreDialHost(u *url.URL) string {
+	if u.Port() != "" {
+		return u.Host
+	}
+	port := "80"
+	if u.Scheme == "https" {
+		port = "443"
+	}
+	return net.JoinHostPort(u.Hostname(), port)
+}
+
 // agentCoreEnsureUpstream 探测并必要时自愈平台 AI 代理。
 //
 // 刻意不复用 ensureAIUpstreamReachableForRun：那个入口只读**子进程 env** 里的
@@ -263,6 +294,22 @@ func agentCoreModelUnusable(model string) bool {
 // 配时才生效）。用 ...ForRun 会在「什么都没配」这个最常见的场景下探测空地址、
 // 直接放行，于是 56432 没起时用户看到的仍是裸的 Connection refused。
 func agentCoreEnsureUpstream(ctx context.Context) error {
+	// 显式端点:没有「自愈」概念(不是我们的进程,POST /api/run/start 拉不活
+	// 它),只做同款 2s TCP 拨测,失败给可自查的文案。
+	if custom := config.GetGlobalConfig().EffectiveAgentCoreLLM(); custom != nil {
+		logger.Info("agentcore: 使用自定义 LLM 端点 " + custom.BaseURL)
+		u, err := url.Parse(custom.BaseURL)
+		if err != nil || u.Host == "" {
+			return nil // 形态已被 Effective/Validate 挡住;探测逻辑自身不挂 run
+		}
+		d := net.Dialer{Timeout: 2 * time.Second}
+		conn, err := d.DialContext(ctx, "tcp", agentCoreDialHost(u))
+		if err != nil {
+			return fmt.Errorf("自定义 LLM 端点不可达(%s: %v)——请检查地址与服务状态后重试", custom.BaseURL, err)
+		}
+		conn.Close()
+		return nil
+	}
 	return ensureAIUpstreamReachable(ctx, agentCoreBaseURL(), aiProxyGuardDeps{
 		dial: func(ctx context.Context, hostPort string) error {
 			d := net.Dialer{Timeout: 2 * time.Second}
@@ -426,15 +473,19 @@ func (m *agentAIManager) agentCoreMessages(run agentAIRun) ([]agentcore.Message,
 	m.mu.Lock()
 	session := m.sessions[run.sessionID]
 	var history []agentAIMessage
+	initialContext := ""
 	if session != nil && session.runSeq == run.runSeq {
 		history = append(history, session.history...)
+		initialContext = session.initialContext
 	}
 	m.mu.Unlock()
 
 	msgs, texts := agentCoreMessagesFromHistory(history)
 	// 与 messages 用同一份快照：system 角色历史（initial_context）走 System
-	// 字段，见 agentCoreSystemContextFromHistory。
-	sessionContext := agentCoreSystemContextFromHistory(history)
+	// 字段，见 agentCoreSystemContextFromHistory。历史里已无 system 条目时
+	// （如旧版本落库已把它冲掉、或尾部裁剪把它裁掉）回落 session.initialContext
+	// ——立身上下文宁可重复兜底，也不能在内核通道上凭空消失。
+	sessionContext := agentCoreSystemContextFromHistory(history, initialContext)
 
 	// 图片附件 → image 块。这里的 run.attachments 在 runCLI 里已经下载过
 	// （downloadAgentAIAttachments 设了 Path 并清掉 URL），所以不再下载一次。
@@ -506,14 +557,19 @@ func agentCoreMessagesFromHistory(history []agentAIMessage) ([]agentcore.Message
 }
 
 // agentCoreSystemContextFromHistory 收集 system 角色的历史内容，交给内核的
-// Config.System 承载。
+// Config.System 承载；历史里没有 system 条目时回落 fallback（会话的
+// initialContext 字段）。
 //
 // 内核的 messages 只收 user/assistant（上游会拒绝 system 角色），但 system
 // 角色的历史不是噪音：ai.session.create / ai.run.start 的 initial_context
 // （fork 快照、goal 重规划上下文）就以 role=system 存在历史首部。CLI 通道
 // 靠 buildAgentAIPrompt 把它渲染成 "System: ..." 留在对话里，内核通道此前
 // 直接丢弃 —— 手机新建会话的初始上下文在 AgentCore 上等于不存在。
-func agentCoreSystemContextFromHistory(history []agentAIMessage) string {
+//
+// fallback 是纵深防御的第二层：session.initialContext 与历史首部的 system
+// 条目本就同源（create/lazy-create 两处同时写入），历史条目丢失（尾部裁剪、
+// 旧版本压缩落库冲掉）时它仍能兜住；两者都在时以历史为准，不重复拼接。
+func agentCoreSystemContextFromHistory(history []agentAIMessage, fallback string) string {
 	var parts []string
 	for _, item := range history {
 		if strings.ToLower(strings.TrimSpace(item.Role)) != "system" {
@@ -525,7 +581,10 @@ func agentCoreSystemContextFromHistory(history []agentAIMessage) string {
 		}
 		parts = append(parts, content)
 	}
-	return strings.Join(parts, "\n\n")
+	if ctx := strings.Join(parts, "\n\n"); strings.TrimSpace(ctx) != "" {
+		return ctx
+	}
+	return strings.TrimSpace(fallback)
 }
 
 // agentCoreHistoryFromMessages 是 agentCoreMessagesFromHistory 的逆变换：
@@ -594,8 +653,31 @@ func (m *agentAIManager) replaceAgentCoreHistory(sessionID string, runSeq int, m
 	if session == nil || session.runSeq != runSeq {
 		return
 	}
+	// 压缩产物只含 user/assistant（内核 messages 不收其它角色），若原样落库，
+	// 旧历史里的 system 条目（历史首部的 initial_context：fork 快照 / goal
+	// 上下文）会被永久抹掉——而摘要请求的 messages 同样不含 system（它由内核
+	// Config.System 承载，从历史派生），摘要补不回来。落库前把旧历史里的
+	// 非 user/assistant 条目按原相对顺序拼回新历史头部。
+	if preserved := agentCorePreservedSystemHistory(session.history); len(preserved) > 0 {
+		history = append(preserved, history...)
+	}
 	session.history = trimAgentAIHistoryForSession(session, history)
 	session.lastActiveAt = time.Now().UTC()
+}
+
+// agentCorePreservedSystemHistory 摘出历史里所有非 user/assistant 条目
+// （initial_context 等 system 条目），保持原相对顺序。返回独立切片，不与
+// 入参共享底层数组——调用方要在 m.mu 内把它拼进新历史，别名会写坏旧历史。
+func agentCorePreservedSystemHistory(history []agentAIMessage) []agentAIMessage {
+	out := make([]agentAIMessage, 0, len(history))
+	for _, item := range history {
+		role := strings.ToLower(strings.TrimSpace(item.Role))
+		if role == "user" || role == "assistant" || role == "" {
+			continue
+		}
+		out = append(out, item)
+	}
+	return out
 }
 
 // handleAgentCoreCompactCommand 对内核对会话历史做一次真实压缩（/compact）。
@@ -684,6 +766,20 @@ func (m *agentAIManager) handleAgentCoreCompactCommand(session *agentAISession, 
 		Model:         compactModel,
 		ContextWindow: contextWindow,
 	}
+	// 刻意不接 CompactOption/WithCompactProgress（2026-10-28 复核定谳「确认
+	// 无害，无需接」）：手动压缩不在 run 内——不建 guard、无 run.activity，
+	// 也没有 stream decoder，内核的 compact_progress 帧在这个路径根本没有
+	// 接收方。误杀面逐项排除：
+	//   - stale 扫描器（agent_ai_run_guard.go scanStaleRuns）只判
+	//     session.guard != nil 的在跑回合，本路径从不挂 guard，扫不到；
+	//   - 看门狗/工具钟同挂在 run.activity 上，同样不适用；
+	//   - 本路径自带兜底：上面 3 分钟 ctx 超时把挂住的上游收掉。
+	// 就算要接帧，decoder 分支的 run.activity.markProgress() 在这里也无处
+	// 安放（markProgress 接收者虽 nil 安全，但没有可刷活性的对象），而把进度
+	// 转发手机需要新增「压缩中」契约字段——上一批已按最小改动否掉。压缩完成
+	// 时 reply() 的 ai.delta + done() 就是这条路径的全部可见反馈。
+	// 若将来给手动压缩挂 guard，必须同时接进度帧并重评本裁决
+	// （见 TestAgentCoreManualCompactHasNoStaleKillSurface）。
 	compacted, info, err := agentcore.Compact(ctx, cfg, messages, "manual")
 	if err != nil {
 		if errors.Is(err, agentcore.ErrNothingToCompact) {
@@ -1012,11 +1108,22 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 	// 迟返回时若只比 runSeq，会把新回合的 cancel/activity/guard/done 一并清掉。
 	defer m.markRunGuardDone(run.sessionID, run.runSeq, run.guard)
 
+	// 逐回合诊断快照的落点：内核 OnTurn 写，进度心跳与 journal 终态行读。
+	// 必须先于 ticker 和 cfg 构造创建——两处都引用它。
+	diag := &agentCoreDiagnostics{}
 	// 调用记录落盘（AliangCode 留痕，spec §6）：入口写头行 + 首条 user 行，
 	// 成功出口写 assistant 行，所有出口经 defer 落 end 行。写失败只 Warn。
 	journal := m.coreJournal
 	endStatus, endErrMsg := "error", ""
-	defer func() { journal.appendEnd(run.sessionID, endStatus, endErrMsg) }()
+	defer func() {
+		// 内核终态快照的真因优先：IsError 分支在这里只有笼统的
+		// 「agentcore run failed」，而终止帧带给手机真因的那段文案经 OnTurn
+		// 终态快照回到了宿主——落进 end 行，重开旧会话才能还原「为什么死」。
+		if reason := diag.endReason(); reason != "" && endErrMsg == "agentcore run failed" {
+			endErrMsg = reason
+		}
+		journal.appendEndDiagnostics(run.sessionID, endStatus, endErrMsg, diag)
+	}()
 	now := time.Now().UTC().Format(time.RFC3339)
 	journal.ensureSessionHeader(run.sessionID, run.projectPath, agentCoreModel(run), now, agentCoreJournalOrigin(run))
 	if lastUser, ok := m.lastUserHistoryMessage(run.sessionID); ok {
@@ -1093,6 +1200,9 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 				"message_id":          agentAssistantMessageID(run.messageID),
 				"files_touched_count": touched,
 				"git_changed_count":   countGitChanged(run.projectPath),
+				// 内核逐回合诊断快照（回合数/上下文用量/守卫连击），诊断面板的
+				// 实时数据源。尚无回合时为 nil，键不下发。
+				"diagnostics": diag.payload(),
 			})
 		}
 		for {
@@ -1254,7 +1364,7 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		// 经 newAgentCoreEmit 包装：ctx 取消时关写端解除阻塞，僵尸写侧不再
 		// 挂死消费侧（AI run 韧性 L2）。
 		Emit:  emitFrame,
-		Hooks: agentCoreLoopHooks(m, run),
+		Hooks: agentCoreLoopHooks(m, run, diag),
 	}
 
 	result, runErr := agentcore.Run(ctx, cfg, messages)
@@ -1294,7 +1404,19 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 	// runErr 非空但 IsError 为 false 的情形（理论上只有「内核内部报错但没走到
 	// 终止帧」）才需要宿主兜底。
 	if result != nil && result.IsError {
-		endErrMsg = "agentcore run failed"
+		// 真因不再吞掉：优先取内核结构化 ErrMessage，其次 runErr。写进 journal
+		// 的 end 记录 + 日志，否则线上只剩笼统的「agentcore run failed」无法复盘
+		// （2026-10-28 ai_3p18eg1aYQvE 事故）。
+		reason := strings.TrimSpace(result.ErrMessage)
+		if reason == "" && runErr != nil {
+			reason = runErr.Error()
+		}
+		if reason == "" {
+			reason = "agentcore run failed"
+		}
+		endErrMsg = reason
+		logger.Warn(fmt.Sprintf("[agentcore] run failed session=%s msg=%s err=%s",
+			run.sessionID, run.messageID, reason))
 		m.journalPartialAssistant(journal, run, &output, &outMu)
 		finalizeRunSubagents(run, writeJSON)
 		return
@@ -1368,6 +1490,73 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 	_ = writeJSON(done)
 }
 
+// agentCoreDiagnostics 聚合内核逐回合快照（LoopHooks.OnTurn 的落点），供
+// 进度心跳与 journal 终态行消费——诊断面板的数据源。写侧是内核 OnTurn 回调
+// （内核单 goroutine 串行触发），读侧是进度 ticker goroutine，跨 goroutine
+// 用互斥锁保护。
+type agentCoreDiagnostics struct {
+	mu   sync.Mutex
+	snap agentcore.TurnSnapshot
+}
+
+func (d *agentCoreDiagnostics) set(s agentcore.TurnSnapshot) {
+	if d == nil {
+		return
+	}
+	d.mu.Lock()
+	d.snap = s
+	d.mu.Unlock()
+}
+
+// payload 返回进 ai.run.progress 的扁平 diagnostics 字段。尚无任何回合时
+// 返回 nil——不下发空壳字段，心跳负载保持最小。JSON 键与
+// models.AgentVibeDiagnostics 的 json tag 一一对应，手机端两路（实时心跳 /
+// 详情回放）按同一套字段消费。
+func (d *agentCoreDiagnostics) payload() map[string]interface{} {
+	if d == nil {
+		return nil
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	s := d.snap
+	if s.Turns == 0 {
+		return nil
+	}
+	out := map[string]interface{}{
+		"turns":          s.Turns,
+		"context_tokens": s.ContextTokens,
+		"context_window": s.ContextWindow,
+		"dup_streak":     s.DupStreak,
+		"err_streak":     s.ErrStreak,
+		"trunc_streak":   s.TruncStreak,
+		"elapsed_ms":     s.ElapsedMs,
+	}
+	if s.StopReason != "" {
+		out["stop_reason"] = s.StopReason
+	}
+	if s.Terminal {
+		out["terminal"] = true
+		if s.Reason != "" {
+			out["reason"] = s.Reason
+		}
+	}
+	return out
+}
+
+// endReason 返回终态真因（终态快照的 Reason）。journal end 行用它把
+// 「agentcore run failed」这类笼统文案升级成内核给出的真因。
+func (d *agentCoreDiagnostics) endReason() string {
+	if d == nil {
+		return ""
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if !d.snap.Terminal {
+		return ""
+	}
+	return strings.TrimSpace(d.snap.Reason)
+}
+
 // agentCoreLoopHooks 组装内核的循环钩子。
 //
 // steering 与收尾追补共用同一个 drain：前者在**每次** LLM 调用前取走运行中
@@ -1380,15 +1569,35 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 // 子 run（子 agent 桥递归）的 Config 显式 Hooks=nil，OnToolCall 只在主 run
 // 生效——子 run 内置工具的轨迹由 agentCoreJournalToolDecorator 装饰器落行，
 // 不经这里。
-func agentCoreLoopHooks(m *agentAIManager, run agentAIRun) agentcore.LoopHooks {
+// diag 可为 nil（测试路径）：OnTurn 的 set 对 nil 接收者直接短路。
+func agentCoreLoopHooks(m *agentAIManager, run agentAIRun, diag *agentCoreDiagnostics) agentcore.LoopHooks {
 	// 本回合自动压缩序号（journal 去重键用；每回合独立计数）。
 	autoCompactSeq := 0
+	// 逐回合 transcript 落 journal 的回合序号（run 内 1 起）。
+	turnN := 0
 	return agentcore.LoopHooks{
 		GetSteeringMessages: func() []agentcore.Message {
 			return m.drainAgentCoreSteering(run)
 		},
 		GetFollowUpMessages: func() []agentcore.Message {
 			return m.drainAgentCoreSteering(run)
+		},
+		// 每回合把 assistant 完整文本 + thinking + 工具名落 journal（kind=turn），
+		// 补齐 run 末单条 assistant 丢失的中间叙述与 thinking。围栏与收尾
+		// assistant 行同款：僵尸回合（guard 被换/runSeq 顶替）的 transcript 同样
+		// 不得落盘，否则 journal 会出现 turn 行却查无 assistant 行的自相矛盾。
+		OnTurnEnd: func(tr agentcore.TurnResult) {
+			if !m.agentAIRunSideEffectsAllowed(run.sessionID, run.runSeq, run.guard) {
+				return
+			}
+			turnN++
+			tools := make([]string, 0, len(tr.ToolCalls))
+			for _, tc := range tr.ToolCalls {
+				if tc.Name != "" {
+					tools = append(tools, tc.Name)
+				}
+			}
+			m.coreJournal.appendAssistantTurn(run.sessionID, turnN, tr.Text, tr.Thinking, tr.StopReason, tools)
 		},
 		// 自动压缩替换了历史 → 同步落回会话 history。不落的话 next run 又从
 		// 旧历史重建，压缩白做（而且每轮 run 都会重新烧一次摘要请求）。
@@ -1419,6 +1628,11 @@ func agentCoreLoopHooks(m *agentAIManager, run agentAIRun) agentcore.LoopHooks {
 				return
 			}
 			m.coreJournal.appendTool(run.sessionID, name, summarizeAgentCoreKernelTool(name, input), res.IsError)
+		},
+		// 逐回合诊断快照：内核每回合发起请求前、以及终止时把运行状态交给宿主，
+		// 存进 diag 供进度心跳与 journal 终态行消费（诊断面板数据源）。
+		OnTurn: func(snap agentcore.TurnSnapshot) {
+			diag.set(snap)
 		},
 	}
 }
@@ -1733,6 +1947,19 @@ func (m *agentAIManager) attachCoreSteer(sessionID string, runSeq int, control *
 // 审批
 // ---------------------------------------------------------------------------
 
+// boundaryApprovalReason 把边界守卫的规则 ID 翻译成审批卡上的人话原因。
+// 三个内核（agentcore/claude CLI/codex）的审批卡共用：规则命中时边界原因
+// 优先于各自上游自带的原因；未命中返回空串，卡片保持原样。
+func boundaryApprovalReason(ruleID string) string {
+	switch ruleID {
+	case "outside-project-path":
+		return "目标路径在项目目录之外，需要您确认是否放行"
+	case "outside-project-bash":
+		return "命令引用了项目目录之外的路径，需要您确认是否放行"
+	}
+	return ""
+}
+
 // agentCoreApprove 是内核的 Config.Approve。策略短路与 codex/claude 一致：
 // auto_approve / auto_deny 本地直接判（不走云端往返），只有 require_approval
 // 才真的问用户。
@@ -1804,11 +2031,15 @@ func buildAgentCoreApprovalRequest(run agentAIRun, call agentcore.ApprovalReques
 	if kind == models.AgentAIApprovalKindCommand {
 		title = "Approve Aliang Agent command"
 	}
+	// 边界守卫升级为审批后，卡片必须说清「为什么问您」——否则用户看到的
+	// 只有一个 rule id，无从判断点同意意味着什么。
+	reason := boundaryApprovalReason(run.matchedRuleID)
 
 	return agentAIApprovalRequest{
 		Provider:  run.provider,
 		Kind:      kind,
 		Title:     title,
+		Reason:    reason,
 		Command:   command,
 		CWD:       run.projectPath,
 		ToolName:  call.ToolName,

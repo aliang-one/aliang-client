@@ -184,6 +184,39 @@ type AgentVibeSession struct {
 	TranscriptPage      *AgentVibeTranscriptPage `json:"transcript_page,omitempty"`
 	CreatedAt           string                   `json:"created_at,omitempty"`
 	UpdatedAt           string                   `json:"updated_at,omitempty"`
+	// Diagnostics 是该会话最后一次 run 的终态诊断（journal end 行落盘，详情
+	// 接口透传）。nil 表示没有带诊断块的 end 行——旧数据或非 agentcore 通道，
+	// 手机端面板据此降级为「无诊断数据」而不是渲染空卡。
+	Diagnostics *AgentVibeDiagnostics `json:"diagnostics,omitempty"`
+}
+
+// AgentVibeDiagnostics 是 agentcore 会话一次 run 的终态诊断快照。JSON 键与
+// 实时通道（ai.run.progress 携带的 diagnostics 字段）一致，手机端两路
+// （实时心跳 / 详情回放）按同一套字段消费。
+type AgentVibeDiagnostics struct {
+	// Turns 是最后一次 run 实际执行的回合数。
+	Turns int `json:"turns"`
+	// ContextTokens 是该 run 最后一次上游报告的本轮输入 token 数（含缓存），
+	// 自动压缩后为压缩后的估算值。
+	ContextTokens int `json:"context_tokens"`
+	// ContextWindow 是该 run 的有效上下文窗口。
+	ContextWindow int `json:"context_window"`
+	// DupStreak / ErrStreak / TruncStreak 是三个无进展守卫终止时的连击计数。
+	DupStreak   int `json:"dup_streak"`
+	ErrStreak   int `json:"err_streak"`
+	TruncStreak int `json:"trunc_streak"`
+	// StopReason 是最近一个回合的上游停止原因。
+	StopReason string `json:"stop_reason,omitempty"`
+	// ElapsedMs 是该 run 的总耗时（毫秒）。
+	ElapsedMs int64 `json:"elapsed_ms"`
+	// Terminal 恒为 true（终态快照），保留键是为了与实时通道的字段形状对齐。
+	Terminal bool `json:"terminal,omitempty"`
+	// Reason 是内核给出的结构化终止真因。
+	Reason string `json:"reason,omitempty"`
+	// Status 是 end 行的 status ∈ success|stopped|error。
+	Status string `json:"status,omitempty"`
+	// Error 是宿主落进 end 行的最终错误文案（Reason 为空时的回退显示值）。
+	Error string `json:"error,omitempty"`
 }
 
 type AgentVibeMessage struct {

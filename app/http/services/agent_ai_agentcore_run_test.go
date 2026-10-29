@@ -316,9 +316,9 @@ func TestRunAgentCoreRejectsEmptyHistory(t *testing.T) {
 
 // TestAgentCoreApprovePolicyShortCircuits 锁死审批桥的本地短路。
 //
-// 关键性质：这些分支**都不问用户**。如果策略短路坏了，require_approval 会真的
-// 去等云端审批（超时默认 24h），测试会挂死——所以这里同时是「不许误走云端」
-// 的守卫。
+// 关键性质：项目内的读写不问用户。2026-10-28 起唯一不再本地判死的是
+// outside-project-path——它升级为 require_approval（与 outside-project-bash
+// 同口径），末尾用例改走「等审批登记 + 替用户拒绝」的交互路径。
 //
 // 工具名必须与内核注册表逐字一致（Read / Write，大写开头）：策略规则的
 // Match.Tool 是**大小写敏感**的精确比较，写成 "read" 会一条规则都不命中，
@@ -357,19 +357,36 @@ func TestAgentCoreApprovePolicyShortCircuits(t *testing.T) {
 		t.Fatalf("项目内 write 应被策略放行，实际 %+v", resp)
 	}
 
-	// 越界写入 → 项目边界规则直接拒绝（不进策略、不弹审批）。
-	resp, err = approve(context.Background(), agentcore.ApprovalRequest{
-		ToolName: "Write",
-		Input:    map[string]interface{}{"file_path": filepath.Join(string(filepath.Separator), "etc", "passwd")},
-	})
-	if err != nil {
-		t.Fatalf("越界 write 审批返回错误: %v", err)
+	// 越界写入 → 2026-10-28 降级：项目边界规则升级为 require_approval，
+	// 不再本地判死——审批请求必须真的登记（等用户在手机上拍板）。
+	// goroutine 发起审批，主 goroutine 等登记后替用户「拒绝」。
+	type approveResult struct {
+		resp agentcore.ApprovalResponse
+		err  error
 	}
-	if resp.Approved {
-		t.Fatalf("越界 write 必须被拒绝，实际 %+v", resp)
-	}
-	if !strings.Contains(resp.Reason, "策略") {
-		t.Errorf("拒绝原因 = %q, want 含「策略」（设备策略拒绝，不是用户拒绝）", resp.Reason)
+	resultCh := make(chan approveResult, 1)
+	go func() {
+		resp, err := approve(context.Background(), agentcore.ApprovalRequest{
+			ToolName: "Write",
+			Input:    map[string]interface{}{"file_path": filepath.Join(string(filepath.Separator), "etc", "passwd")},
+		})
+		resultCh <- approveResult{resp: resp, err: err}
+	}()
+	waiter := waitForAgentCoreApproval(t, m, "conv-approve", &agentCoreEventLog{})
+	waiter.request.respond <- agentAIApprovalResponse{Decision: models.AgentAIApprovalDecisionDecline}
+	select {
+	case got := <-resultCh:
+		if got.err != nil {
+			t.Fatalf("越界 write 审批返回错误: %v", got.err)
+		}
+		if got.resp.Approved {
+			t.Fatalf("越界 write 被用户拒绝后必须不执行，实际 %+v", got.resp)
+		}
+		if !strings.Contains(got.resp.Reason, "用户拒绝") {
+			t.Errorf("拒绝原因 = %q, want 含「用户拒绝」", got.resp.Reason)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("替用户拒绝后审批没有返回")
 	}
 }
 
@@ -745,7 +762,9 @@ func readAgentCoreJournalRows(t *testing.T, sessionID string) []map[string]inter
 }
 
 // TestRunAgentCoreJournalsTranscript 端到端：一次成功 run 必须留下
-// 头行 + user 行 + assistant 行 + end(success)，顺序固定。
+// 头行 + user 行 + turn 行（逐回合 transcript）+ assistant 行 + end(success)。
+// turn 行是本回合 assistant 完整文本/thinking 的留档，与 run 末整轮累计的
+// assistant 行并存——前者给「完整对话」复盘，后者给仪表盘消息气泡。
 func TestRunAgentCoreJournalsTranscript(t *testing.T) {
 	setTestAgentHome(t)
 	up, srv := newAgentCoreUpstream(t, agentCoreTextTurn("你好", "，世界"))
@@ -773,8 +792,8 @@ func TestRunAgentCoreJournalsTranscript(t *testing.T) {
 	m.runAgentCore(context.Background(), run, log.write)
 
 	lines := readAgentCoreJournalRows(t, sessionID)
-	if len(lines) != 4 {
-		t.Fatalf("journal 行数 = %d, want 4: %v", len(lines), lines)
+	if len(lines) != 5 {
+		t.Fatalf("journal 行数 = %d, want 5: %v", len(lines), lines)
 	}
 	if lines[0]["kind"] != "session" || lines[0]["model"] != "glm-5.2" {
 		t.Errorf("头行 = %v", lines[0])
@@ -782,11 +801,15 @@ func TestRunAgentCoreJournalsTranscript(t *testing.T) {
 	if lines[1]["role"] != "user" || lines[1]["text"] != "打个招呼" {
 		t.Errorf("user 行 = %v（必须是 history 里的真实用户 content）", lines[1])
 	}
-	if lines[2]["role"] != "assistant" || lines[2]["text"] != "你好，世界" {
-		t.Errorf("assistant 行 = %v", lines[2])
+	// turn 行：本回合 assistant 完整文本。
+	if lines[2]["kind"] != "turn" || lines[2]["text"] != "你好，世界" || lines[2]["turn"] != float64(1) {
+		t.Errorf("turn 行 = %v（逐回合 transcript）", lines[2])
 	}
-	if lines[3]["kind"] != "end" || lines[3]["status"] != "success" {
-		t.Errorf("end 行 = %v", lines[3])
+	if lines[3]["role"] != "assistant" || lines[3]["text"] != "你好，世界" {
+		t.Errorf("assistant 行 = %v", lines[3])
+	}
+	if lines[4]["kind"] != "end" || lines[4]["status"] != "success" {
+		t.Errorf("end 行 = %v", lines[4])
 	}
 	_ = up
 }

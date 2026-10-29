@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // 这一组测试锁死内核 → 宿主的帧契约。
@@ -271,6 +272,102 @@ func TestRunTextOnlyFrameSequence(t *testing.T) {
 	}
 	if n, _ := res1["num_turns"].(float64); int(n) != 1 {
 		t.Errorf("result.num_turns = %v, want 1", res1["num_turns"])
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 思考块（thinking）
+// ---------------------------------------------------------------------------
+
+// TestRunThinkingFrameSequence 锁内核的思考流契约：上游 thinking 块逐段透传
+// 成 content_block_start/delta/stop（宿主翻成 ai.thinking 并 markProgress，
+// 纯推理期间这是服务层唯一活性信号）；signature_delta 丢弃不发帧；思考内容
+// 不进 blocks——finalized assistant 帧与 result 正文只有 text。
+func TestRunThinkingFrameSequence(t *testing.T) {
+	script := &turnScript{turns: []string{
+		`{"type":"message_start","message":{"id":"msg_think","model":"claude-x"}}` + "\n\n" +
+			`data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}` + "\n\n" +
+			`data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"先想"}}` + "\n\n" +
+			`data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-bytes"}}` + "\n\n" +
+			`data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"再答"}}` + "\n\n" +
+			`data: {"type":"content_block_stop","index":0}` + "\n\n" +
+			`data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}` + "\n\n" +
+			`data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"结论"}}` + "\n\n" +
+			`data: {"type":"content_block_stop","index":1}` + "\n\n" +
+			`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7}}`,
+	}}
+	srv := sseServer(t, script.handler(t))
+
+	rec := &frameRecorder{}
+	cfg := &Config{
+		Client:    NewClient(srv.URL),
+		Model:     "claude-x",
+		Emit:      rec.emit,
+		SessionID: "sess-think",
+	}
+	res, err := Run(context.Background(), cfg, []Message{TextMessage("user", "hi")})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Text != "结论" {
+		t.Errorf("RunResult.Text = %q, want 结论（思考内容不得进正文）", res.Text)
+	}
+
+	frames := rec.frames(t)
+	got := frameKinds(frames)
+	want := []string{
+		"system:init",
+		"stream_event:message_start",
+		"stream_event:content_block_start", // thinking 块 start（第一段 delta 触发）
+		"stream_event:content_block_delta", // thinking_delta
+		"stream_event:content_block_delta", // thinking_delta；signature_delta 不产生帧
+		"stream_event:content_block_stop",
+		"stream_event:content_block_start", // text 块
+		"stream_event:content_block_delta",
+		"stream_event:content_block_stop",
+		"assistant",
+		"result",
+	}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("帧序列不符\n got: %v\nwant: %v", got, want)
+	}
+
+	assertSessionIDOnEveryFrame(t, frames, "sess-think")
+
+	// thinking start 帧的形状：type=thinking，宿主 emitClaudeStructuredEvents
+	// 靠它登记块类型，stop 时才补得出 active:false。
+	startEv, _ := frames[2]["event"].(map[string]interface{})
+	if cb, _ := startEv["content_block"].(map[string]interface{}); cb["type"] != BlockTypeThinking {
+		t.Errorf("content_block.type = %v, want thinking", cb["type"])
+	}
+	// thinking delta 帧的形状：delta.type=thinking_delta、字段名 thinking，
+	// 宿主只认这一种（与 CLI 路径同帧，不造第二种 thinking 帧）。
+	for i, wantText := range map[int]string{3: "先想", 4: "再答"} {
+		ev, _ := frames[i]["event"].(map[string]interface{})
+		delta, _ := ev["delta"].(map[string]interface{})
+		if delta["type"] != "thinking_delta" {
+			t.Errorf("第 %d 帧 delta.type = %v, want thinking_delta", i, delta["type"])
+		}
+		if delta["thinking"] != wantText {
+			t.Errorf("第 %d 帧 delta.thinking = %v, want %q", i, delta["thinking"], wantText)
+		}
+	}
+
+	// finalized assistant 帧：content 只有 text 块——宿主只持久化这一帧的
+	// text，思考块混进去会污染 transcript。
+	content := messageContent(t, assistantFrame(t, frames))
+	if len(content) != 1 {
+		t.Fatalf("assistant content 长度 = %d, want 1（只有 text 块，无 thinking）", len(content))
+	}
+	block, _ := content[0].(map[string]interface{})
+	if bt, _ := block["type"].(string); bt != BlockTypeText {
+		t.Errorf("content[0].type = %q, want text", bt)
+	}
+	if txt, _ := block["text"].(string); txt != "结论" {
+		t.Errorf("content[0].text = %q, want 结论", txt)
+	}
+	if txt, _ := resultFrame(t, frames)["result"].(string); txt != "结论" {
+		t.Errorf("result.result = %q, want 结论", txt)
 	}
 }
 
@@ -770,5 +867,72 @@ func TestRunWithoutEmit(t *testing.T) {
 	}
 	if res.Text != "ok" {
 		t.Errorf("Text = %q, want ok", res.Text)
+	}
+}
+
+// RetryNotice 帧必须逐字段对齐真 claude-code 的 system/api_retry：宿主
+// decoder（streamStructuredAIDelta 的 api_retry 分支）按 type/subtype 识别、
+// 按 attempt/max_retries/retry_delay_ms/error_status/error 取值。形状一变，
+// 活性刷新与手机上的「重试 1/3 · 网关 503」就一起哑掉。
+func TestStreamWriterRetryNoticeFrameShape(t *testing.T) {
+	rec := &frameRecorder{}
+	w := newStreamWriter(rec.emit, "sess-r")
+	if err := w.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if err := w.RetryNotice(RetryNotice{
+		Attempt:     2,
+		Delay:       1500 * time.Millisecond,
+		ErrorStatus: 503,
+		ErrorKind:   "server_error",
+	}); err != nil {
+		t.Fatalf("RetryNotice: %v", err)
+	}
+
+	frames := rec.frames(t)
+	if len(frames) != 2 {
+		t.Fatalf("帧数 = %d, want 2（init + api_retry）", len(frames))
+	}
+	f := frames[1]
+	if typ, _ := f["type"].(string); typ != "system" {
+		t.Fatalf("type = %v, want system", f["type"])
+	}
+	if sub, _ := f["subtype"].(string); sub != "api_retry" {
+		t.Fatalf("subtype = %v, want api_retry", f["subtype"])
+	}
+	if got, _ := f["attempt"].(float64); got != 2 {
+		t.Errorf("attempt = %v, want 2", f["attempt"])
+	}
+	if got, _ := f["max_retries"].(float64); got != float64(maxRetries) {
+		t.Errorf("max_retries = %v, want %d", f["max_retries"], maxRetries)
+	}
+	if got, _ := f["retry_delay_ms"].(float64); got != 1500 {
+		t.Errorf("retry_delay_ms = %v, want 1500", f["retry_delay_ms"])
+	}
+	if got, _ := f["error_status"].(float64); got != 503 {
+		t.Errorf("error_status = %v, want 503", f["error_status"])
+	}
+	if got, _ := f["error"].(string); got != "server_error" {
+		t.Errorf("error = %v, want server_error", f["error"])
+	}
+	if got, _ := f["session_id"].(string); got != "sess-r" {
+		t.Errorf("session_id = %q, want sess-r（每一帧都必须可回填 resume 句柄）", got)
+	}
+}
+
+// 连接类失败没有 HTTP 状态码：稀疏帧不发 error_status/error，与 CLI 帧的
+// 稀疏形态一致（decoder 对缺失字段按零值跳过）。
+func TestStreamWriterRetryNoticeSparseFrame(t *testing.T) {
+	rec := &frameRecorder{}
+	w := newStreamWriter(rec.emit, "sess-r")
+	if err := w.RetryNotice(RetryNotice{Attempt: 1, Delay: 500 * time.Millisecond, ErrorKind: "connection_error"}); err != nil {
+		t.Fatalf("RetryNotice: %v", err)
+	}
+	f := rec.frames(t)[0]
+	if _, ok := f["error_status"]; ok {
+		t.Errorf("error_status = %v, want absent（无 HTTP 状态时不发）", f["error_status"])
+	}
+	if got, _ := f["error"].(string); got != "connection_error" {
+		t.Errorf("error = %v, want connection_error", f["error"])
 	}
 }

@@ -1,10 +1,10 @@
 package agentcore
 
 import (
-	"runtime"
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -57,64 +57,48 @@ func readFile(t *testing.T, path string) string {
 }
 
 // ---------------------------------------------------------------------------
-// 路径围栏
+// 路径解析
 // ---------------------------------------------------------------------------
 
-func TestResolveToolPathRejectsEscape(t *testing.T) {
+// 2026-10-28 围栏上移：路径出界与否由审批层（outside-project-path 规则）判定，
+// 执行层只负责解析。项目外路径不再在执行层硬拒——否则用户在手机上批准的越界
+// 操作会在这里二次失败。
+func TestResolveToolPathAllowsOutsidePaths(t *testing.T) {
 	env, root := projectEnv(t)
-	writeFile(t, root, "inside.txt", "ok")
 
-	cases := []struct {
-		name string
-		raw  string
-	}{
-		{"父目录", "../outside.txt"},
-		{"多级父目录", "../../etc/passwd"},
-		{"相对路径里的上跳", "sub/../../outside.txt"},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			if _, err := resolveToolPath(env, c.raw); err == nil {
-				t.Fatalf("路径 %q 应当被拒绝", c.raw)
-			}
-		})
-	}
-
-	// 项目内的相对与绝对路径都要放行。
-	if _, err := resolveToolPath(env, "inside.txt"); err != nil {
-		t.Errorf("项目内相对路径不应被拒: %v", err)
-	}
-	if _, err := resolveToolPath(env, filepath.Join(root, "inside.txt")); err != nil {
-		t.Errorf("项目内绝对路径不应被拒: %v", err)
-	}
-	// 空路径 = 项目根（LS 用）。
-	if p, err := resolveToolPath(env, ""); err != nil || p != root {
-		t.Errorf("空路径应解析为项目根，得到 %q, %v", p, err)
-	}
-}
-
-func TestResolveToolPathRejectsSymlinkEscape(t *testing.T) {
-	env, root := projectEnv(t)
-	outside := t.TempDir()
-	outsideResolved, err := filepath.EvalSymlinks(outside)
+	// 相对路径上跳出项目：解析为项目外的确定路径，不再报错。
+	p, err := resolveToolPath(env, "../outside.txt")
 	if err != nil {
-		t.Fatalf("EvalSymlinks: %v", err)
+		t.Fatalf("相对上跳路径不应被拒: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(outsideResolved, "secret.txt"), []byte("secret"), 0o644); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
-	// 在项目里放一个指向项目外的软链。
-	if err := os.Symlink(outsideResolved, filepath.Join(root, "escape")); err != nil {
-		t.Skipf("平台不支持创建软链: %v", err)
+	if want := filepath.Clean(filepath.Join(root, "../outside.txt")); p != want {
+		t.Fatalf("相对上跳解析结果 = %q, want %q", p, want)
 	}
 
-	if _, err := resolveToolPath(env, "escape/secret.txt"); err == nil {
-		t.Fatal("软链指向项目外应当被拒绝")
+	// 项目外绝对路径：放行并保持原样。
+	outside := filepath.Join(t.TempDir(), "outside.go")
+	if p, err := resolveToolPath(env, outside); err != nil || p != outside {
+		t.Fatalf("项目外绝对路径 = %q, %v, want %q", p, err, outside)
 	}
 
-	// 软链本身指向项目外，也应被拒。
-	if _, err := resolveToolPath(env, "escape"); err == nil {
-		t.Fatal("指向项目外的软链目录本身应当被拒绝")
+	// ~ 展开：HOME 指向项目时 ~/inside.txt 解析进项目。
+	t.Setenv("HOME", root)
+	t.Setenv("USERPROFILE", root)
+	if p, err := resolveToolPath(env, "~/inside.txt"); err != nil || p != filepath.Join(root, "inside.txt") {
+		t.Fatalf("~ 路径 = %q, %v, want %q", p, err, filepath.Join(root, "inside.txt"))
+	}
+
+	// 项目内相对路径与空路径行为不变。
+	if p, err := resolveToolPath(env, "inside.txt"); err != nil || p != filepath.Join(root, "inside.txt") {
+		t.Fatalf("项目内相对路径 = %q, %v", p, err)
+	}
+	if p, err := resolveToolPath(env, ""); err != nil || p != root {
+		t.Fatalf("空路径应解析为项目根，得到 %q, %v", p, err)
+	}
+
+	// 未绑定项目时相对路径仍无法解析。
+	if _, err := resolveToolPath(nil, "inside.txt"); err == nil {
+		t.Fatal("未绑定项目时相对路径应当报错")
 	}
 }
 
@@ -395,13 +379,19 @@ func TestWriteRejectsDirectory(t *testing.T) {
 	}
 }
 
-func TestWriteRejectsEscape(t *testing.T) {
+// 2026-10-28 围栏上移：越界写入的拦截移到审批层（outside-project-path），
+// 执行层在审批通过后照常落盘。
+func TestWriteResolvesOutsidePath(t *testing.T) {
 	env, _ := projectEnv(t)
+	outside := filepath.Join(t.TempDir(), "escaped.txt")
 	res := (&writeTool{}).Execute(context.Background(), map[string]interface{}{
-		"file_path": "../escaped.txt", "content": "x",
+		"file_path": outside, "content": "x",
 	}, env)
-	if !res.IsError {
-		t.Fatal("越界写入必须被拒绝")
+	if res.IsError {
+		t.Fatalf("审批通过的项目外写入不应被拒: %s", res.Content)
+	}
+	if got, err := os.ReadFile(outside); err != nil || string(got) != "x" {
+		t.Fatalf("写回内容 = %q, %v, want x", got, err)
 	}
 }
 

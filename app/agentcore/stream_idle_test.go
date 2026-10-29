@@ -112,6 +112,72 @@ func TestStreamDoesNotRetryOnStreamStall(t *testing.T) {
 	}
 }
 
+// message_delta(end_turn) 已到但 message_stop 丢失、连接此后停滞：协议顺序上
+// message_delta 在所有内容块之后，此刻内容已经 100% 收全。必须以它为终止判据
+// 正常返回成功，而不是在 scanner 上阻塞到空闲闸到期、把用户已看到完整回答的
+// 回合误杀成 90s 停滞错误。
+//
+// 变异守卫：删掉 parseSSE 对 message_delta 的早退，本条在空闲窗口到期即红。
+func TestStreamCompletesOnMessageDeltaStopReasonWithoutMessageStop(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		f, _ := w.(http.Flusher)
+		_, _ = w.Write([]byte("data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"x\"}}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"完整回答\"}}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"content_block_stop\",\"index\":0}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n"))
+		if f != nil {
+			f.Flush()
+		}
+		// 终点信号已发，连接不关也不再发 message_stop：半开的另一种形态。
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL).WithStreamIdleTimeout(60 * time.Millisecond)
+
+	var kinds []string
+	var last StreamEvent
+	done := make(chan error, 1)
+	go func() {
+		done <- c.Stream(context.Background(), &MessagesRequest{
+			Model:     "x",
+			MaxTokens: 16,
+			Messages:  []Message{{Role: "user", Content: "hi"}},
+		}, func(ev StreamEvent) error {
+			kinds = append(kinds, ev.Kind)
+			last = ev
+			return nil
+		})
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Stream error = %v, want nil（message_delta 终点信号即完整回合）", err)
+		}
+	case <-time.After(5 * time.Second):
+		srv.CloseClientConnections()
+		t.Fatal("Stream did not return on message_delta; must not wait for message_stop")
+	}
+
+	// 宿主收到的事件序列必须完整：起点、内容、块收尾、stop 一个不少。
+	want := []string{EventStart, EventText, EventBlockStop, EventStop}
+	if strings.Join(kinds, ",") != strings.Join(want, ",") {
+		t.Fatalf("事件序列 = %v, want %v", kinds, want)
+	}
+	if last.Kind == EventStop {
+		if last.StopReason != StopReasonEndTurn {
+			t.Errorf("stop_reason = %q, want end_turn", last.StopReason)
+		}
+		if last.Usage == nil || last.Usage.OutputTokens != 5 {
+			t.Errorf("usage = %+v, want output_tokens=5（message_delta 的用量不能丢）", last.Usage)
+		}
+	}
+}
+
 func TestStreamCompletesWhenConnectionStaysOpenAfterMessageStop(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("content-type", "text/event-stream")
@@ -147,5 +213,16 @@ func TestStreamCompletesWhenConnectionStaysOpenAfterMessageStop(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		srv.CloseClientConnections()
 		t.Fatal("Stream did not return after message_stop; idle guard must not be the exit path")
+	}
+}
+
+// TestStreamIdleDefaultWindow：默认静默窗口 10 分钟。90s 时代在高负载上游
+// 属于误杀——网关排队/模型慢思考可以合法静默超过 90s（用户实测反馈）。
+// 10min 与宿主 idle 看门狗同窗（10min 窗、30s 拍），字节级计时器通常先触发，
+// 且 streamIdleError 的「不可重试」语义给出比 idle_timeout 更精确的归因。
+// 半开连接检测语义不变：窗口内一个字节都没有才算死。
+func TestStreamIdleDefaultWindow(t *testing.T) {
+	if streamIdleDefault != 10*time.Minute {
+		t.Fatalf("streamIdleDefault = %s, want 10m（2026-10-28 放宽,用户拍板）", streamIdleDefault)
 	}
 }

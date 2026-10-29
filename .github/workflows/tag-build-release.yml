@@ -82,6 +82,15 @@ jobs:
       - frontend
     if: needs.guard.outputs.on_master == 'true'
     runs-on: ${{ matrix.runner }}
+    # Hard ceiling for the whole build job: a hung codesign/keychain state
+    # must never hold a release hostage for GitHub's 6h default (v1.1.84
+    # hung 2h+ inside the packaging step before being cancelled).
+    timeout-minutes: 45
+    env:
+      # Signing master switch: true only when the Developer ID p12 secrets are
+      # configured. Step-level `if` cannot read the secrets context directly,
+      # so it is materialized here once and referenced via `env` below.
+      MAC_SIGNING_ENABLED: ${{ secrets.MAC_P12_BASE64 != '' && secrets.MAC_P12_PASSWORD != '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -120,7 +129,7 @@ jobs:
             extra_ldflags: ''
             asset_name: aliang-darwin-amd64
             binary_ext: ''
-            archive_ext: tar.gz
+            archive_ext: zip
             package_type: pkg
           - runner: macos-15
             goos: darwin
@@ -129,7 +138,7 @@ jobs:
             extra_ldflags: ''
             asset_name: aliang-darwin-arm64
             binary_ext: ''
-            archive_ext: tar.gz
+            archive_ext: zip
             package_type: pkg
     steps:
       - name: Checkout repository
@@ -169,6 +178,100 @@ jobs:
           which pkgbuild || brew install pkg-config
           which productbuild || brew install productbuild
 
+      - name: Import macOS signing certificates
+        if: matrix.goos == 'darwin' && env.MAC_SIGNING_ENABLED == 'true'
+        env:
+          MAC_P12_BASE64: ${{ secrets.MAC_P12_BASE64 }}
+          MAC_P12_PASSWORD: ${{ secrets.MAC_P12_PASSWORD }}
+          EXPECTED_TEAM_ID: ${{ secrets.EXPECTED_TEAM_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          P12="$RUNNER_TEMP/aliang-signing.p12"
+          KC="$RUNNER_TEMP/aliang-signing.keychain-db"
+          KP="$(openssl rand -hex 32)"
+          echo "::add-mask::$KP"
+          echo "$MAC_P12_BASE64" | base64 --decode > "$P12"
+
+          security delete-keychain "$KC" 2>/dev/null || true
+          security create-keychain -p "$KP" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$KP" "$KC"
+
+          # Belt-and-suspenders: pull the Apple WWDR intermediates so codesign
+          # can build the full chain even if the p12 was exported without them.
+          for CER in AppleWWDRCAG4 AppleWWDRCAG5 AppleWWDRCAG6; do
+            if curl -fsSL "https://www.apple.com/certificateauthority/${CER}.cer" -o "$RUNNER_TEMP/${CER}.cer"; then
+              security import "$RUNNER_TEMP/${CER}.cer" -k "$KC" || true
+            fi
+          done
+
+          security import "$P12" -k "$KC" -P "$MAC_P12_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/pkgbuild -T /usr/bin/productsign -T /usr/bin/productbuild
+          # set-key-partition-list exits 0 even when it fails to re-wrap a key
+          # ("User interaction is not allowed"), which later surfaces as
+          # codesign hanging forever on a headless runner waiting for a GUI
+          # prompt nobody can click. Detect it here and fail loudly instead.
+          SKPL_OUT="$(security set-key-partition-list -S apple-tool:,apple: -s -k "$KP" "$KC" 2>&1)"
+          if printf '%s\n' "$SKPL_OUT" | grep -qi 'not allowed\|user interaction'; then
+            echo "::error::set-key-partition-list could not re-wrap the imported keys; signing would hang later. Output:"
+            printf '%s\n' "$SKPL_OUT"
+            exit 1
+          fi
+          security default-keychain -s "$KC"
+          rm -f "$P12"
+
+          # Detect the identity strings from the keychain instead of hardcoding
+          # them, so certificate renewal never requires a workflow change.
+          # NOTE: deliberately NO `-p codesigning` filter here. That trust policy
+          # does not match Developer ID Installer identities (verified: it omits
+          # them while the unfiltered listing shows them as valid), which would
+          # leave INST_ID empty and fail every signed release.
+          APP_ID="$(security find-identity -v "$KC" | sed -n 's/.*"\(Developer ID Application:.*\)"/\1/p' | head -1)"
+          INST_ID="$(security find-identity -v "$KC" | sed -n 's/.*"\(Developer ID Installer:.*\)"/\1/p' | head -1)"
+          if [ -z "$APP_ID" ] || [ -z "$INST_ID" ]; then
+            echo "::error::Developer ID certificates not found in imported p12 (the export must include both certificates with their private keys)"
+            exit 1
+          fi
+          TEAM_ID_APP="$(printf '%s' "$APP_ID" | sed -n 's/.*(\([A-Za-z0-9]*\))$/\1/p')"
+          TEAM_ID_INST="$(printf '%s' "$INST_ID" | sed -n 's/.*(\([A-Za-z0-9]*\))$/\1/p')"
+          if [ "$TEAM_ID_APP" != "$TEAM_ID_INST" ]; then
+            echo "::error::Developer ID Application and Installer identities belong to different teams ('$TEAM_ID_APP' vs '$TEAM_ID_INST')"
+            exit 1
+          fi
+          if [ -n "$EXPECTED_TEAM_ID" ] && [ "$TEAM_ID_INST" != "$EXPECTED_TEAM_ID" ]; then
+            echo "::error::Signing identity team '$TEAM_ID_INST' does not match EXPECTED_TEAM_ID '$EXPECTED_TEAM_ID'"
+            exit 1
+          fi
+
+          # Smoke-sign with BOTH identities under a hard 90s alarm. A first-use
+          # keychain prompt (headless runner, nobody to click) or a TSA stall
+          # fails HERE in seconds with a clear error instead of hanging the
+          # packaging step silently for hours (v1.1.84 lesson).
+          SMK="$RUNNER_TEMP/smoke-sign"
+          printf 'aliang-signing-smoke\n' > "$SMK"
+          if ! perl -e 'alarm shift; exec @ARGV' 90 \
+            codesign --force --timestamp --sign "$APP_ID" "$SMK"; then
+            echo "::error::smoke signing with Developer ID Application hung (90s alarm) or failed - keychain ACL / partition-list / TSA problem"
+            exit 1
+          fi
+          codesign --verify "$SMK"
+          SMKROOT="$RUNNER_TEMP/smoke-root"
+          mkdir -p "$SMKROOT"
+          printf 'x\n' > "$SMKROOT/f"
+          if ! perl -e 'alarm shift; exec @ARGV' 90 \
+            pkgbuild --root "$SMKROOT" --identifier one.aliang.smoke --version 1.0 --sign "$INST_ID" "$RUNNER_TEMP/smoke.pkg"; then
+            echo "::error::smoke signing with Developer ID Installer hung (90s alarm) or failed - keychain ACL / partition-list / TSA problem"
+            exit 1
+          fi
+          rm -rf "$SMK" "$SMKROOT" "$RUNNER_TEMP/smoke.pkg"
+
+          {
+            echo "MAC_APPLICATION_IDENTITY=$APP_ID"
+            echo "MAC_INSTALLER_IDENTITY=$INST_ID"
+          } >> "$GITHUB_ENV"
+          echo "::notice::Signing enabled: $APP_ID"
+
       - name: Prepare Go modules for CI
         shell: bash
         run: |
@@ -183,7 +286,7 @@ jobs:
           CGO_ENABLED: ${{ matrix.cgo_enabled }}
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
-          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.goos == 'darwin' && '10.15' || '' }}
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.goos == 'darwin' && '12.0' || '' }}
         run: |
           mkdir -p dist release
           VERSION="${GITHUB_REF_NAME}"
@@ -198,7 +301,19 @@ jobs:
         if: matrix.goos != 'windows'
         shell: bash
         run: |
-          tar -C dist -czf "release/${{ matrix.asset_name }}.${{ matrix.archive_ext }}" "${BINARY_NAME}${{ matrix.binary_ext }}"
+          # macOS bare binaries ship as zip because Apple notarization does not
+          # accept tar archives. Sign the binary first when identities exist;
+          # unsigned contents would be rejected by the notary service.
+          if [ "${{ matrix.goos }}" = "darwin" ] && [ -n "${MAC_APPLICATION_IDENTITY:-}" ]; then
+            codesign --force --options runtime --timestamp \
+              --sign "$MAC_APPLICATION_IDENTITY" "dist/${BINARY_NAME}${{ matrix.binary_ext }}"
+            codesign --verify --strict "dist/${BINARY_NAME}${{ matrix.binary_ext }}"
+          fi
+          if [ "${{ matrix.archive_ext }}" = "zip" ]; then
+            (cd dist && zip -q "../release/${{ matrix.asset_name }}.zip" "${BINARY_NAME}${{ matrix.binary_ext }}")
+          else
+            tar -C dist -czf "release/${{ matrix.asset_name }}.${{ matrix.archive_ext }}" "${BINARY_NAME}${{ matrix.binary_ext }}"
+          fi
 
       - name: Package Windows release archive
         if: matrix.goos == 'windows'
@@ -226,11 +341,17 @@ jobs:
         env:
           VERSION: ${{ github.ref_name }}
           ARCH: ${{ matrix.goarch }}
-          MACOSX_DEPLOYMENT_TARGET: '10.15'
+          MACOSX_DEPLOYMENT_TARGET: '12.0'
         run: |
           cd scripts
           chmod +x build-pkg.sh
           cp ../dist/$BINARY_NAME aliang
+          if [ -n "${MAC_APPLICATION_IDENTITY:-}" ] && [ -n "${MAC_INSTALLER_IDENTITY:-}" ]; then
+            export REQUIRE_SIGNED_RELEASE=1
+            echo "::notice::Building SIGNED package"
+          else
+            echo "::warning::No Developer ID identities available - producing UNSIGNED package (legacy path)"
+          fi
           ./build-pkg.sh
           generated_pkg="Aliang-${VERSION}-${ARCH}.pkg"
           if [ ! -f "$generated_pkg" ]; then
@@ -238,6 +359,97 @@ jobs:
             exit 1
           fi
           cp "$generated_pkg" "../release/${{ matrix.asset_name }}.pkg"
+
+      - name: Notarize and staple macOS artifacts
+        if: matrix.goos == 'darwin' && env.MAC_SIGNING_ENABLED == 'true'
+        env:
+          ASC_API_KEY_P8_BASE64: ${{ secrets.ASC_API_KEY_P8_BASE64 }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "$ASC_API_KEY_P8_BASE64" ] || [ -z "$ASC_KEY_ID" ] || [ -z "$ASC_ISSUER_ID" ]; then
+            echo "::error::Signing enabled but notarization secrets (ASC_API_KEY_P8_BASE64/ASC_KEY_ID/ASC_ISSUER_ID) are missing - refusing to publish signed-but-unnotarized artifacts"
+            exit 1
+          fi
+          P8="$RUNNER_TEMP/AuthKey_${ASC_KEY_ID}.p8"
+          echo "$ASC_API_KEY_P8_BASE64" | base64 --decode > "$P8"
+          trap 'rm -f "$P8"' EXIT
+
+          submit_notary() {
+            local artifact="$1"
+            local json attempt
+            json="$RUNNER_TEMP/notary-$(basename "$artifact").json"
+            # Apple's notary API intermittently fails mid-submission; retry the
+            # whole submit+wait a few times before giving up. Resubmitting the
+            # same artifact is safe - it just creates a fresh submission.
+            for attempt in 1 2 3; do
+              if xcrun notarytool submit "$artifact" \
+                --key "$P8" --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER_ID" \
+                --output-format json --wait --timeout 2h | tee "$json"; then
+                return 0
+              fi
+              echo "::warning::notarytool submit failed (attempt $attempt/3) for $(basename "$artifact")"
+              [ "$attempt" -lt 3 ] && sleep 60
+            done
+            return 1
+          }
+
+          # Pull the per-submission log so rejection reasons (missing signature
+          # on an inner binary, missing timestamp, ...) land in the CI output.
+          dump_notary_log() {
+            local artifact="$1"
+            local json
+            json="$RUNNER_TEMP/notary-$(basename "$artifact").json"
+            local id
+            id="$(sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$json" 2>/dev/null | head -1 || true)"
+            if [ -n "$id" ]; then
+              echo "::group::Notary log for $(basename "$artifact") (submission $id)"
+              xcrun notarytool log "$id" --key "$P8" --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER_ID" || true
+              echo "::endgroup::"
+            fi
+          }
+
+          ARTIFACTS=("release/${{ matrix.asset_name }}.pkg")
+          if [ "${{ matrix.archive_ext }}" = "zip" ]; then
+            ARTIFACTS+=("release/${{ matrix.asset_name }}.zip")
+          fi
+          for ARTIFACT in "${ARTIFACTS[@]}"; do
+            echo "=== Notarizing $ARTIFACT ==="
+            if ! submit_notary "$ARTIFACT"; then
+              echo "::error::Notarization failed for $ARTIFACT"
+              dump_notary_log "$ARTIFACT"
+              exit 1
+            fi
+            case "$ARTIFACT" in
+              *.pkg)
+                xcrun stapler staple "$ARTIFACT"
+                # stapler validate re-checks the staple against Apple's CloudKit
+                # ticket-delivery service; that call is network-flaky (v1.1.85
+                # died there with NSURLError -1005 AFTER an Accepted verdict and
+                # a successful staple). The staple is already embedded and the
+                # spctl gate below is the authoritative check, so retry a few
+                # times and downgrade a persistent failure to a warning.
+                V_OK=0
+                for _ in 1 2 3; do
+                  if xcrun stapler validate "$ARTIFACT"; then V_OK=1; break; fi
+                  echo "::warning::stapler validate failed, retrying in 15s..."
+                  sleep 15
+                done
+                if [ "$V_OK" != "1" ]; then
+                  echo "::warning::stapler validate kept failing (likely transient CloudKit network issue); staple is embedded and spctl below is the authoritative gate"
+                fi
+                spctl -a -t install -vv "$ARTIFACT"
+                ;;
+              *.zip)
+                # zip cannot carry a staple; Gatekeeper validates the contained
+                # binary against the online notary ledger on first launch.
+                echo "::notice::$ARTIFACT notarized (zip has no staple support)"
+                ;;
+            esac
+          done
+          echo "::notice::All macOS artifacts notarized"
 
       - name: Build MSI package
         if: matrix.package_type == 'msi'
@@ -326,6 +538,12 @@ jobs:
           name: ${{ matrix.asset_name }}-package
           path: release/${{ matrix.asset_name }}.msi
           if-no-files-found: error
+
+      - name: Clean up signing keychain
+        if: always() && matrix.goos == 'darwin' && env.MAC_SIGNING_ENABLED == 'true'
+        shell: bash
+        run: |
+          security delete-keychain "$RUNNER_TEMP/aliang-signing.keychain-db" 2>/dev/null || true
 
   release:
     name: Publish release assets
