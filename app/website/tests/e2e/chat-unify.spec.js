@@ -59,10 +59,14 @@ async function openChat(page, { wsStub }) {
       return;
     }
     if (url.pathname === '/api/agent/sessions') {
+      // 阶段 2：清单条目带 id/provider/title/status/origin（三源同列表渲染）；
+      // 三条重复 project_path 保留——设置条「最近项目」按路径去重语义不破。
       await route.fulfill({
         contentType: 'application/json',
         body: JSON.stringify({ code: 0, data: { sessions: [
-          { project_path: '/home/alice/proj-b' }, { project_path: '/home/alice/proj-a' }, { project_path: '/home/alice/proj-a' },
+          { id: 'sess-unify-b', provider: 'agentcore', title: '清单会话乙', status: 'idle', origin: 'phone', project_path: '/home/alice/proj-b' },
+          { id: 'claude_unify-a1', provider: 'claude', title: '清单会话甲一', status: 'idle', origin: '', project_path: '/home/alice/proj-a' },
+          { id: 'claude_unify-a2', provider: 'claude', title: '清单会话甲二', status: 'idle', origin: '', project_path: '/home/alice/proj-a' },
         ] } }),
       });
       return;

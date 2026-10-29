@@ -24,134 +24,69 @@
       </div>
 
       <div class="flex-1 overflow-y-auto py-1">
-        <template v-if="groupedConversations.today.length">
-          <div class="px-3 pt-3 pb-1 text-xs font-semibold text-slate-400 uppercase tracking-wider">{{ t('chat_today') }}</div>
-          <div
-            v-for="c in groupedConversations.today"
-            :key="c.id"
-            role="button"
-            tabindex="0"
-            class="group w-full cursor-pointer px-4 py-2.5 text-left text-sm transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
-            :class="c.id === activeId ? 'bg-primary/10 text-primary font-medium' : 'text-slate-700 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800'"
-            @click="selectConversation(c.id)"
-            @keydown.enter.prevent="selectConversation(c.id)"
-            @keydown.space.prevent="selectConversation(c.id)"
-          >
-            <input
-              v-if="renamingId === c.id && renameSurface === 'list'"
-              v-model="renameDraft"
-              :ref="(el) => { if (el) renameInputEl = el; }"
-              type="text"
-              maxlength="60"
-              :placeholder="t('chat_renamePlaceholder')"
-              class="w-full rounded border border-primary/40 bg-white px-2 py-1 text-sm outline-none dark:bg-slate-800"
-              @click.stop
-              @keydown.enter="onRenameEnter"
-              @keydown.esc="onRenameEscape"
-              @keydown.space.stop
-              @blur="commitRename"
-            />
-            <div v-else class="flex items-center gap-2">
-              <div class="min-w-0 flex-1 truncate">{{ c.title || t('chat_emptyTitle') }}</div>
-              <button
-                type="button"
-                class="relative shrink-0 rounded p-1 text-slate-400 opacity-100 transition-opacity hover:bg-slate-200 hover:text-slate-600 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 md:opacity-0 md:group-hover:opacity-100 md:focus-visible:opacity-100 dark:hover:bg-slate-700 before:absolute before:-inset-2 before:content-['']"
-                :aria-label="`${t('chat_rename')} ${c.title || t('chat_emptyTitle')}`"
-                @click.stop="startRename(c, 'list')"
-                @keydown.enter.stop
+        <!-- 三源统一清单（本地草稿 + 设备会话）：分组结构一致，单段循环渲染。
+             设备会话条目带来源角标与 running 状态点；点击分流 openDeviceSession。 -->
+        <template v-for="group in conversationGroups" :key="group.key">
+          <template v-if="group.items.length">
+            <div class="px-3 pt-3 pb-1 text-xs font-semibold text-slate-400 uppercase tracking-wider">{{ group.label }}</div>
+            <div
+              v-for="c in group.items"
+              :key="c.id"
+              role="button"
+              tabindex="0"
+              class="group w-full cursor-pointer px-4 py-2.5 text-left text-sm transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
+              :class="c.id === activeId ? 'bg-primary/10 text-primary font-medium' : 'text-slate-700 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800'"
+              @click="selectConversation(c.id)"
+              @keydown.enter.prevent="selectConversation(c.id)"
+              @keydown.space.prevent="selectConversation(c.id)"
+            >
+              <input
+                v-if="renamingId === c.id && renameSurface === 'list'"
+                v-model="renameDraft"
+                :ref="(el) => { if (el) renameInputEl = el; }"
+                type="text"
+                maxlength="60"
+                :placeholder="t('chat_renamePlaceholder')"
+                class="w-full rounded border border-primary/40 bg-white px-2 py-1 text-sm outline-none dark:bg-slate-800"
+                @click.stop
+                @keydown.enter="onRenameEnter"
+                @keydown.esc="onRenameEscape"
                 @keydown.space.stop
-              >
-                <span class="material-symbols-outlined text-base">edit</span>
-              </button>
+                @blur="commitRename"
+              />
+              <div v-else class="flex items-center gap-2">
+                <div class="min-w-0 flex-1 truncate">{{ c.title || t('chat_emptyTitle') }}</div>
+                <!-- TODO(i18n-task6): 角标文案键 chat_source_phone/dashboard/terminal/active -->
+                <span
+                  v-if="c.deviceSession && sessionSourceBadge(c.deviceSession)"
+                  data-testid="session-source-badge"
+                  class="shrink-0 rounded bg-slate-200 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-slate-500 dark:bg-slate-700 dark:text-slate-300"
+                >{{ sessionSourceBadge(c.deviceSession) }}</span>
+                <span
+                  v-if="c.running"
+                  data-testid="device-session-running-dot"
+                  class="inline-block h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-primary"
+                  :title="t('chat_statusRunning')"
+                ></span>
+                <!-- 设备会话不可在本端重命名/删除（后端无端点，title 由清单权威） -->
+                <button
+                  v-if="!c.deviceSession"
+                  type="button"
+                  class="relative shrink-0 rounded p-1 text-slate-400 opacity-100 transition-opacity hover:bg-slate-200 hover:text-slate-600 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 md:opacity-0 md:group-hover:opacity-100 md:focus-visible:opacity-100 dark:hover:bg-slate-700 before:absolute before:-inset-2 before:content-['']"
+                  :aria-label="`${t('chat_rename')} ${c.title || t('chat_emptyTitle')}`"
+                  @click.stop="startRename(c, 'list')"
+                  @keydown.enter.stop
+                  @keydown.space.stop
+                >
+                  <span class="material-symbols-outlined text-base">edit</span>
+                </button>
+              </div>
             </div>
-          </div>
+          </template>
         </template>
-        <template v-if="groupedConversations.yesterday.length">
-          <div class="px-3 pt-3 pb-1 text-xs font-semibold text-slate-400 uppercase tracking-wider">{{ t('chat_yesterday') }}</div>
-          <div
-            v-for="c in groupedConversations.yesterday"
-            :key="c.id"
-            role="button"
-            tabindex="0"
-            class="group w-full cursor-pointer px-4 py-2.5 text-left text-sm transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
-            :class="c.id === activeId ? 'bg-primary/10 text-primary font-medium' : 'text-slate-700 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800'"
-            @click="selectConversation(c.id)"
-            @keydown.enter.prevent="selectConversation(c.id)"
-            @keydown.space.prevent="selectConversation(c.id)"
-          >
-            <input
-              v-if="renamingId === c.id && renameSurface === 'list'"
-              v-model="renameDraft"
-              :ref="(el) => { if (el) renameInputEl = el; }"
-              type="text"
-              maxlength="60"
-              :placeholder="t('chat_renamePlaceholder')"
-              class="w-full rounded border border-primary/40 bg-white px-2 py-1 text-sm outline-none dark:bg-slate-800"
-              @click.stop
-              @keydown.enter="onRenameEnter"
-              @keydown.esc="onRenameEscape"
-              @keydown.space.stop
-              @blur="commitRename"
-            />
-            <div v-else class="flex items-center gap-2">
-              <div class="min-w-0 flex-1 truncate">{{ c.title || t('chat_emptyTitle') }}</div>
-              <button
-                type="button"
-                class="relative shrink-0 rounded p-1 text-slate-400 opacity-100 transition-opacity hover:bg-slate-200 hover:text-slate-600 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 md:opacity-0 md:group-hover:opacity-100 md:focus-visible:opacity-100 dark:hover:bg-slate-700 before:absolute before:-inset-2 before:content-['']"
-                :aria-label="`${t('chat_rename')} ${c.title || t('chat_emptyTitle')}`"
-                @click.stop="startRename(c, 'list')"
-                @keydown.enter.stop
-                @keydown.space.stop
-              >
-                <span class="material-symbols-outlined text-base">edit</span>
-              </button>
-            </div>
-          </div>
-        </template>
-        <template v-if="groupedConversations.older.length">
-          <div class="px-3 pt-3 pb-1 text-xs font-semibold text-slate-400 uppercase tracking-wider">{{ t('chat_older') }}</div>
-          <div
-            v-for="c in groupedConversations.older"
-            :key="c.id"
-            role="button"
-            tabindex="0"
-            class="group w-full cursor-pointer px-4 py-2.5 text-left text-sm transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
-            :class="c.id === activeId ? 'bg-primary/10 text-primary font-medium' : 'text-slate-700 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800'"
-            @click="selectConversation(c.id)"
-            @keydown.enter.prevent="selectConversation(c.id)"
-            @keydown.space.prevent="selectConversation(c.id)"
-          >
-            <input
-              v-if="renamingId === c.id && renameSurface === 'list'"
-              v-model="renameDraft"
-              :ref="(el) => { if (el) renameInputEl = el; }"
-              type="text"
-              maxlength="60"
-              :placeholder="t('chat_renamePlaceholder')"
-              class="w-full rounded border border-primary/40 bg-white px-2 py-1 text-sm outline-none dark:bg-slate-800"
-              @click.stop
-              @keydown.enter="onRenameEnter"
-              @keydown.esc="onRenameEscape"
-              @keydown.space.stop
-              @blur="commitRename"
-            />
-            <div v-else class="flex items-center gap-2">
-              <div class="min-w-0 flex-1 truncate">{{ c.title || t('chat_emptyTitle') }}</div>
-              <button
-                type="button"
-                class="relative shrink-0 rounded p-1 text-slate-400 opacity-100 transition-opacity hover:bg-slate-200 hover:text-slate-600 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 md:opacity-0 md:group-hover:opacity-100 md:focus-visible:opacity-100 dark:hover:bg-slate-700 before:absolute before:-inset-2 before:content-['']"
-                :aria-label="`${t('chat_rename')} ${c.title || t('chat_emptyTitle')}`"
-                @click.stop="startRename(c, 'list')"
-                @keydown.enter.stop
-                @keydown.space.stop
-              >
-                <span class="material-symbols-outlined text-base">edit</span>
-              </button>
-            </div>
-          </div>
-        </template>
-        <div v-if="conversations.length === 0" class="px-4 py-8 text-center text-sm text-slate-400">
-          {{ t('chat_noConversations') }}
+        <div v-if="mergedConversations.length === 0" class="px-4 py-8 text-center text-sm text-slate-400">
+          <!-- TODO(i18n-task6): chat_deviceSessionsEmpty / chat_deviceSessionsLoadFailed -->
+          {{ deviceAvailable ? '设备上还没有会话' : '设备会话不可用' }}
         </div>
       </div>
     </aside>
@@ -183,8 +118,9 @@
         <h3 v-else class="flex-1 truncate text-sm font-semibold text-slate-900 dark:text-white">
           {{ activeConversation?.title || t('chat_emptyTitle') }}
         </h3>
+        <!-- 设备会话不可在本端重命名/删除（后端无端点，title 由清单权威） -->
         <button
-          v-if="activeId && renamingId !== activeId"
+          v-if="activeId && renamingId !== activeId && !activeIsDevice"
           type="button"
           class="relative rounded p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-600 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 dark:hover:bg-slate-800 before:absolute before:-inset-2 before:content-['']"
           :aria-label="t('chat_rename')"
@@ -199,7 +135,7 @@
           <span class="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-primary"></span>{{ t('chat_statusRunning') }}
         </span>
         <button
-          v-if="activeId"
+          v-if="activeId && !activeIsDevice"
           type="button"
           class="rounded p-1 text-slate-400 hover:bg-slate-100 hover:text-rose-500 dark:hover:bg-slate-800"
           @click="deleteConversation"
@@ -477,7 +413,7 @@ import { useNavigation } from '../composables/useNavigation';
 import { slashProviderFor } from '../utils/chatProvider';
 import { normalizeConversationTitle } from '../utils/chatTitle';
 import { useAuthStore } from '../stores/auth';
-import { getAgentSessions } from '../services/agentApi';
+import { useDeviceSessions } from '../composables/useDeviceSessions';
 import {
   AGENTCORE_MODEL_OPTIONS,
   EFFORT_OPTIONS,
@@ -485,6 +421,7 @@ import {
   isDirectoryLocked,
   recentProjectsFromSessions,
   sessionCreatePayload,
+  sessionSourceBadge,
 } from '../utils/chatSettings';
 
 const STORAGE_KEY = 'aliang-chat-data';
@@ -492,6 +429,15 @@ const STORAGE_KEY = 'aliang-chat-data';
 const { t } = useI18n();
 const { showDashboard, chatProviderPreset } = useNavigation();
 const { isAuthenticated } = useAuthStore();
+
+// 设备会话清单（跨端统一阶段 2）：后端三源会话的拉取/节流/壳缓存都收在
+// composable，ChatPage 只消费壳对象与 openDeviceSession 装载流程。
+const {
+  deviceSessions,
+  available: deviceAvailable,
+  loadDeviceSessions,
+  shellForEntry,
+} = useDeviceSessions();
 
 const conversations = ref([]);
 const activeId = ref(null);
@@ -564,6 +510,42 @@ const activeRunning = computed(() => {
   return false;
 });
 
+// --- 三源统一清单（本地草稿 + 设备会话壳） ---
+
+const activeIsDevice = computed(() => !!activeConversation.value?.deviceSession);
+
+// 统一会话列表：本地草稿（无 deviceSession）+ 设备会话壳。壳对象由
+// composable 的 shellCache 保证稳定（打开后消息写在同一对象上）；打开过的
+// 设备会话也会插入 conversations（承载 activeConversation/sendMessage 既有
+// 路径），在这里去重——草稿过滤掉带 deviceSession 的成员，壳部分再补上
+// 「清单暂缺但已打开」的壳（agent 离线时代理回 200 空表，不能让打开着的
+// 会话从侧栏消失）。
+const mergedConversations = computed(() => {
+  const drafts = [];
+  const openedShells = [];
+  for (const c of conversations.value) {
+    if (c.deviceSession) openedShells.push(c);
+    else drafts.push(c);
+  }
+  const listedIds = new Set();
+  const shells = [];
+  for (const entry of deviceSessions.value) {
+    if (entry && typeof entry === 'object' && typeof entry.id === 'string') listedIds.add(entry.id);
+    const shell = shellForEntry(entry);
+    if (shell) shells.push(shell);
+  }
+  for (const shell of openedShells) {
+    if (!listedIds.has(shell.deviceSession.id)) shells.push(shell);
+  }
+  return [...drafts, ...shells];
+});
+
+const conversationGroups = computed(() => [
+  { key: 'today', label: t('chat_today'), items: groupedConversations.value.today },
+  { key: 'yesterday', label: t('chat_yesterday'), items: groupedConversations.value.yesterday },
+  { key: 'older', label: t('chat_older'), items: groupedConversations.value.older },
+]);
+
 // --- 会话设置条逻辑 ---
 
 const directoryLocked = computed(() => isDirectoryLocked(activeConversation.value));
@@ -612,12 +594,10 @@ async function toggleDirectoryPanel() {
   directoryPanelOpen.value = !directoryPanelOpen.value;
   if (directoryPanelOpen.value && !recentProjectsLoaded.value) {
     recentProjectsLoaded.value = true;
-    try {
-      const data = await getAgentSessions();
-      recentProjects.value = recentProjectsFromSessions(data?.sessions);
-    } catch (_) {
-      recentProjects.value = []; // 拉取失败静默，手输路径不受影响
-    }
+    // 与侧栏设备清单共享同一次 /api/agent/sessions 请求（promise 去重）；
+    // 失败静默（available=false、清单为空），手输路径不受影响。
+    await loadDeviceSessions();
+    recentProjects.value = recentProjectsFromSessions(deviceSessions.value);
   }
 }
 
@@ -777,7 +757,9 @@ const groupedConversations = computed(() => {
   const yesterday = [];
   const older = [];
 
-  const sorted = [...conversations.value].sort((a, b) => b.updatedAt - a.updatedAt);
+  // 三源统一清单排序：本地会话 updatedAt 与设备壳 updatedAt（composable 里
+  // 已把 updated_at 归一成 epoch ms）同一口径。
+  const sorted = [...mergedConversations.value].sort((a, b) => b.updatedAt - a.updatedAt);
   for (const c of sorted) {
     if (c.updatedAt >= todayTs) {
       today.push(c);
@@ -807,8 +789,13 @@ function loadFromStorage() {
 function saveToStorage() {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({
-      conversations: conversations.value.map(conversationForStorage),
-      activeConversationId: activeId.value
+      // 设备会话壳不落 localStorage（权威在后端，重进页重新拉取派生）；
+      // 活跃会话是设备壳时活跃指针一并置空——否则重进页会先落到一个
+      // 本地不存在的会话 id 上（主区空壳、侧栏高亮），体验割裂。
+      conversations: conversations.value.filter(c => !c.deviceSession).map(conversationForStorage),
+      activeConversationId: conversations.value.some(c => c.id === activeId.value && !c.deviceSession)
+        ? activeId.value
+        : null
     }));
   } catch (_) {
     // storage full or unavailable
@@ -918,6 +905,7 @@ function onRenameEscape(e) {
 function deleteConversation() {
   commitRename();
   if (!activeId.value) return;
+  if (activeConversation.value?.deviceSession) return; // 设备会话不可在本端删（后端无端点）
   if (!confirm(t('chat_deleteConfirm'))) return;
   conversations.value = conversations.value.filter(c => c.id !== activeId.value);
   if (conversations.value.length > 0) {
@@ -1523,6 +1511,7 @@ function handleKeydown(e) {
 onMounted(() => {
   console.log('[aliang-chat] ChatPage mounted build=stream-v3 ws=' + aiSocketUrl());
   loadFromStorage();
+  loadDeviceSessions(); // 设备会话清单：每次进页拉取（权威在后端，不进 localStorage）
   document.addEventListener('keydown', handleKeydown);
 });
 
