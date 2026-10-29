@@ -3,9 +3,12 @@ import {
   AGENTCORE_MODEL_OPTIONS,
   EFFORT_OPTIONS,
   MODEL_CUSTOM_VALUE,
+  deviceSessionToConversation,
   isDirectoryLocked,
+  normalizeDeviceProvider,
   recentProjectsFromSessions,
   sessionCreatePayload,
+  sessionSourceBadge,
 } from './chatSettings';
 
 describe('EFFORT_OPTIONS', () => {
@@ -78,5 +81,97 @@ describe('sessionCreatePayload', () => {
   it('透传非空值与自定义模型/effort', () => {
     const conv = { aiSessionId: 's2', projectPath: '/w', provider: 'agentcore', model: 'my-model', effort: 'xhigh' };
     expect(sessionCreatePayload(conv)).toMatchObject({ project_path: '/w', provider: 'agentcore', model: 'my-model', effort: 'xhigh' });
+  });
+
+  it('未设置 resume 字段时载荷不含对应键（e2e 断言 create 帧字段集，不得多出空键）', () => {
+    const payload = sessionCreatePayload({ aiSessionId: 's1', projectPath: '/w' });
+    expect(Object.keys(payload)).not.toContain('resume_session_id');
+    expect(payload.project_path).toBe('/w');
+  });
+
+  it('resumeSessionId 映射 resume_session_id，resumeProjectPath 覆盖 project_path', () => {
+    const payload = sessionCreatePayload({ aiSessionId: 's3', resumeSessionId: 'abc-123', resumeProjectPath: '/src' });
+    expect(payload.resume_session_id).toBe('abc-123');
+    expect(payload.project_path).toBe('/src');
+    // 只有 resumeSessionId 时路径不被动。
+    expect(sessionCreatePayload({ aiSessionId: 's4', projectPath: '/keep', resumeSessionId: 'x' }).project_path).toBe('/keep');
+  });
+
+  it('resume 字段为空串/未定义等价于未设置', () => {
+    const payload = sessionCreatePayload({ aiSessionId: 's5', resumeSessionId: '', resumeProjectPath: '' });
+    expect(Object.keys(payload)).not.toContain('resume_session_id');
+    expect(payload.project_path).toBe('');
+  });
+});
+
+describe('sessionSourceBadge', () => {
+  it('running → active 且优先于 origin/id 前缀', () => {
+    expect(sessionSourceBadge({ status: 'running', origin: 'phone', id: 'claude_x' })).toBe('active');
+  });
+
+  it('origin=phone / dashboard 各自映射', () => {
+    expect(sessionSourceBadge({ status: 'closed', origin: 'phone', id: 'conv-1' })).toBe('phone');
+    expect(sessionSourceBadge({ status: 'closed', origin: 'dashboard', id: 'conv-2' })).toBe('dashboard');
+  });
+
+  it('id 前缀 claude_/codex_ → terminal，其余前缀不命中', () => {
+    expect(sessionSourceBadge({ status: 'closed', id: 'claude_abc' })).toBe('terminal');
+    expect(sessionSourceBadge({ status: 'closed', id: 'codex_def' })).toBe('terminal');
+    expect(sessionSourceBadge({ status: 'closed', id: 'conv-123' })).toBe('');
+    expect(sessionSourceBadge({ status: 'closed', id: 'CLAUDE_abc' })).toBe('');
+    expect(sessionSourceBadge({ status: 'closed', id: 123 })).toBe('');
+  });
+
+  it('脏输入安全返回空串', () => {
+    expect(sessionSourceBadge(null)).toBe('');
+    expect(sessionSourceBadge(undefined)).toBe('');
+    expect(sessionSourceBadge('x')).toBe('');
+    expect(sessionSourceBadge(42)).toBe('');
+    expect(sessionSourceBadge({})).toBe('');
+  });
+});
+
+describe('normalizeDeviceProvider', () => {
+  it('归一映射全覆盖：claude/claudecode→claudecode，codex→codex，agentcore→agentcore，其余→claudecode', () => {
+    expect(normalizeDeviceProvider('claude')).toBe('claudecode');
+    expect(normalizeDeviceProvider('claudecode')).toBe('claudecode');
+    expect(normalizeDeviceProvider('codex')).toBe('codex');
+    expect(normalizeDeviceProvider('agentcore')).toBe('agentcore');
+    expect(normalizeDeviceProvider('')).toBe('claudecode');
+    expect(normalizeDeviceProvider('unknown')).toBe('claudecode');
+    expect(normalizeDeviceProvider(undefined)).toBe('claudecode');
+    expect(normalizeDeviceProvider('  Codex ')).toBe('codex');
+  });
+});
+
+describe('deviceSessionToConversation', () => {
+  it('设备会话条目映射为统一会话对象，原始条目挂 deviceSession', () => {
+    const entry = { id: 's9', title: '手机会话', provider: 'codex', project_path: '/w', created_at: 'c1', updated_at: 'u1' };
+    expect(deviceSessionToConversation(entry)).toEqual({
+      id: 'dev-s9',
+      title: '手机会话',
+      provider: 'codex',
+      projectPath: '/w',
+      deviceSession: entry,
+      createdAt: 'c1',
+      updatedAt: 'u1',
+    });
+  });
+
+  it('title 缺省回落 id，时间/路径缺省空串，provider 归一', () => {
+    const conv = deviceSessionToConversation({ id: 's10', provider: 'claude' });
+    expect(conv.id).toBe('dev-s10');
+    expect(conv.title).toBe('s10');
+    expect(conv.provider).toBe('claudecode');
+    expect(conv.projectPath).toBe('');
+    expect(conv.createdAt).toBe('');
+    expect(conv.updatedAt).toBe('');
+  });
+
+  it('脏输入安全返回 null', () => {
+    expect(deviceSessionToConversation(null)).toBe(null);
+    expect(deviceSessionToConversation(undefined)).toBe(null);
+    expect(deviceSessionToConversation('x')).toBe(null);
+    expect(deviceSessionToConversation(42)).toBe(null);
   });
 });

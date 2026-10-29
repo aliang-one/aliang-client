@@ -1,6 +1,7 @@
 // 会话设置条（工作目录/模型/effort）的纯逻辑：选项常量、最近项目整理、
-// create 载荷组装、目录锁定判定。UI 装配在 ChatPage.vue；本文件保持零依赖
-// 纯函数，vitest 直接覆盖（chatSettings.test.js）。
+// create 载荷组装、目录锁定判定、来源角标与设备会话清单映射（阶段 2 跨端
+// 统一）。UI 装配在 ChatPage.vue；本文件保持零依赖纯函数，vitest 直接覆盖
+// （chatSettings.test.js）。
 
 // 自定义模型的 select 哨兵值。真实模型名直接用自身作 value。
 export const MODEL_CUSTOM_VALUE = '__custom__';
@@ -57,8 +58,11 @@ export function isDirectoryLocked(conv) {
 }
 
 // ai.session.create 载荷统一出口：ChatPage 首发与重发共用，保证字段一致。
+// 续聊扩展（阶段 2）：resumeSessionId → resume_session_id、resumeProjectPath
+// → 覆盖 project_path。两者都是可选字段——未设置时键不得出现在载荷（e2e
+// 断言 create 帧字段集，多出的空键会被判为协议漂移）。
 export function sessionCreatePayload(conv) {
-  return {
+  const payload = {
     type: 'ai.session.create',
     session_id: (conv && conv.aiSessionId) || '',
     project_path: (conv && conv.projectPath) || '',
@@ -66,5 +70,54 @@ export function sessionCreatePayload(conv) {
     mode: 'vibe',
     model: (conv && conv.model) || '',
     effort: (conv && conv.effort) || '',
+  };
+  if (conv && conv.resumeSessionId) {
+    payload.resume_session_id = String(conv.resumeSessionId);
+  }
+  if (conv && conv.resumeProjectPath) {
+    payload.project_path = String(conv.resumeProjectPath);
+  }
+  return payload;
+}
+
+// 会话来源角标：跨端统一清单里标注该条目由哪一端/哪个入口发起。优先级
+// running > origin > id 前缀；都不命中返回 ''（UI 不渲染角标）。脏输入安全
+// 返回 ''。terminal 判定沿用终端会话 ID 的 claude_/codex_ 前缀约定。
+export function sessionSourceBadge(session) {
+  if (!session || typeof session !== 'object') return '';
+  if (session.status === 'running') return 'active';
+  if (session.origin === 'phone') return 'phone';
+  if (session.origin === 'dashboard') return 'dashboard';
+  const id = String(session.id ?? '');
+  if (id.startsWith('claude_') || id.startsWith('codex_')) return 'terminal';
+  return '';
+}
+
+// 设备会话 provider 归一：服务端清单对同一内核可能下发 claude/claudecode
+// 两种拼写（历史通道差异），统一到前端会话的 provider 词表；未知/空回落
+// claudecode（与 sessionCreatePayload 的缺省一致）。
+export function normalizeDeviceProvider(provider) {
+  const p = typeof provider === 'string' ? provider.trim().toLowerCase() : '';
+  if (p === 'claude' || p === 'claudecode') return 'claudecode';
+  if (p === 'codex') return 'codex';
+  if (p === 'agentcore') return 'agentcore';
+  return 'claudecode';
+}
+
+// 设备会话清单条目 → 前端统一会话对象（跨端清单与本地会话同池渲染的适配
+// 层）。id 加 dev- 前缀避免与本地会话 ID 撞车；title 缺省回落设备会话 ID；
+// 原始条目挂在 deviceSession 供续聊分流读 origin/created_at。脏输入（null/
+// undefined/非对象）安全返回 null，调用方过滤即可。
+export function deviceSessionToConversation(entry) {
+  if (!entry || typeof entry !== 'object') return null;
+  const id = typeof entry.id === 'string' ? entry.id : '';
+  return {
+    id: 'dev-' + id,
+    title: entry.title || id,
+    provider: normalizeDeviceProvider(entry.provider),
+    projectPath: entry.project_path || '',
+    deviceSession: entry,
+    createdAt: entry.created_at || '',
+    updatedAt: entry.updated_at || '',
   };
 }
