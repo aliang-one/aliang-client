@@ -246,3 +246,31 @@ func TestMergeActiveAgentVibeSessionPreservesKnownZeroDisplayCount(t *testing.T)
 	require.NotNil(t, merged.DisplayMessageCount)
 	assert.Equal(t, 2, *merged.DisplayMessageCount)
 }
+
+// 幽灵项目标记：collectAgentProjects 对目录已消失的项目置 dir_missing，
+// 存活目录保持 false，且两条都保留在清单里（剔除是服务端/UI 的决定）。
+// 测试下 tccguard 不拦（testing.Testing() 短路），tmpdir 非保护类别，stat 安全。
+func TestCollectAgentProjectsMarksMissingDirs(t *testing.T) {
+	existing := t.TempDir()
+	ghost := filepath.Join(t.TempDir(), "vanished-project")
+	sessions := []models.AgentVibeSession{
+		{ID: "s1", Tool: "claude", ProjectPath: existing, UpdatedAt: "2026-10-29T10:00:00Z"},
+		{ID: "s2", Tool: "claude", ProjectPath: ghost, UpdatedAt: "2026-10-29T09:00:00Z"},
+	}
+
+	projects := collectAgentProjects(sessions)
+	byPath := make(map[string]models.AgentProject, len(projects))
+	for _, p := range projects {
+		byPath[p.Path] = p
+	}
+
+	gotExisting, ok := byPath[filepath.Clean(existing)]
+	require.True(t, ok, "存活项目必须在清单里")
+	require.NotNil(t, gotExisting.DirMissing, "存活目录必须显式下发 false（与未探测区分）")
+	assert.False(t, *gotExisting.DirMissing, "存活目录不得标记 dir_missing")
+
+	gotGhost, ok := byPath[filepath.Clean(ghost)]
+	require.True(t, ok, "幽灵项目必须保留在清单里（只标记不剔除）")
+	require.NotNil(t, gotGhost.DirMissing)
+	assert.True(t, *gotGhost.DirMissing, "已消失目录必须标记 dir_missing")
+}

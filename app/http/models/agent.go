@@ -142,6 +142,12 @@ type AgentProject struct {
 	LastActiveAt    string   `json:"last_active_at,omitempty"`
 	SourceTools     []string `json:"source_tools,omitempty"`
 	DetailUpdatedAt string   `json:"detail_updated_at,omitempty"`
+	// DirMissing：目录存在性标记（幽灵项目）。指针三态：nil=未探测（受
+	// 保护/网络盘等不可安全 stat 的路径），true=已确认消失，false=已确认
+	// 存在。指针+omitempty 只省略 nil——false 必须显式下发，服务端才能区分
+	// 「已探测且正常」与「未探测」（否则三态塌缩成两态，复活语义失真）。
+	// 仅标记不剔除——手机侧把幽灵卡片当缓存展示，剔除由服务端/UI 决定。
+	DirMissing *bool `json:"dir_missing,omitempty"`
 }
 
 type AgentVibeSession struct {
