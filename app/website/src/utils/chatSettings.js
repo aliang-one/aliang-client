@@ -99,9 +99,10 @@ export function planWatchSwitch(currentSessionId, nextSessionId) {
   return ops;
 }
 
-// watch 目标：仅 attached 会话可被直播跟踪。本地会话必须返回 null、绝不自 watch：
-// 服务端 emit 对同一连接先扇出 watcher 再写属主，同 connID 两路都写且不去重，
-// 本地会话自 watch 会让 delta 文本翻倍。
+// watch 目标：仅 attached 会话可被直播跟踪。本地会话必须返回 null、绝不自 watch。
+// 注：服务端 Task 4.5 已根治自 watch 双投递（扇出跳过属主连接），此前本地自
+// watch 会让同一条 delta 经属主+watcher 两路写、文本翻倍——本门保留为纵深防御，
+// 前端不依赖服务端版本。
 export function watchTargetOf(conv) {
   return conv && conv.attached && conv.aiSessionId ? conv.aiSessionId : null;
 }
@@ -138,9 +139,10 @@ export function findConversationForEvent(conversations, sessionId, activeConvers
 }
 
 // 抽屉条目组装：会话全量列表 + runtime 快照（运行中徽章）+ 本页绑定集合
-// （bound = 该 session 已被本页某个对话接入；手机/桌面来源的区分标注需服务端
-// 在 sessions 端点补 origin 注解，当前数据不含——文案只用「已接入/未接入」），
-// 按 updated_at 倒序，客户端分页（服务端无分页）。任何脏输入安全。
+// （bound = 该 session 已被本页某个对话接入）+ 服务端 origin 注解（Task 4.5
+// 起 sessions 端点与手机 sync 快照同源：managed=手机绑定 / external=设备
+// 原生，活跃条目恒 managed），按 updated_at 倒序，客户端分页（服务端无分页）。
+// 任何脏输入安全。
 export function agentSessionDrawerEntries(sessions, { runningIds = [], localSessionIds = [], limit = 20, offset = 0 } = {}) {
   if (!Array.isArray(sessions)) sessions = [];
   const running = runningIds instanceof Set ? runningIds : new Set(runningIds || []);
@@ -152,6 +154,7 @@ export function agentSessionDrawerEntries(sessions, { runningIds = [], localSess
       title: typeof s.title === 'string' ? s.title.trim() : '',
       provider: s.provider || s.tool || '',
       projectPath: s.project_path || '',
+      origin: s.origin || '',
       updatedAtMs: Date.parse(s.updated_at || '') || 0,
       running: running.has(s.id),
       bound: bound.has(s.id),
@@ -160,6 +163,14 @@ export function agentSessionDrawerEntries(sessions, { runningIds = [], localSess
   const size = Math.max(limit, 0);
   const page = entries.slice(offset, offset + size);
   return { items: page, total: entries.length, hasMore: offset + page.length < entries.length };
+}
+
+// 来源标记三态：本页自建/接入 → 本机（bound 优先，attached 样式另表）；
+// 否则 managed（手机绑定）→ 手机；external/未知 → 桌面（设备原生）。
+export function originBadgeOf(entry) {
+  if (entry && entry.bound) return 'local';
+  if (entry && entry.origin === 'managed') return 'phone';
+  return 'desktop';
 }
 
 // 服务端转录行（/api/agent/session → transcript[]）→ 本页消息气泡。
@@ -184,4 +195,108 @@ export function restorableAttachedSessionIds(conversations) {
   return conversations
     .filter(c => c && c.attached && typeof c.aiSessionId === 'string' && c.aiSessionId !== '' && !c.aiSessionId.startsWith('local-'))
     .map(c => c.aiSessionId);
+}
+
+// —— Task 5：直播帧渲染 + steer/stop 操作（载荷与流式气泡纯逻辑）——
+
+// 插话：注入正在运行的回合（Required=type,session_id,message_id,content）。
+// 回执 ai.steer.ack 按 message_id 对账；result!=ok（not_running/turn_ended）
+// 表示没送进回合。
+export function steerPayload(sessionId, content, messageId) {
+  return { type: 'ai.steer', session_id: sessionId || '', message_id: messageId || '', content: content || '' };
+}
+
+// 停止：Required=type,session_id（run_id/source_session_id 可选，网页无 run_id 不带）。
+export function stopPayload(sessionId) {
+  return { type: 'ai.stop', session_id: sessionId || '' };
+}
+
+// 审批对账拉取：client→agent 请求 still-pending 全集（回执 ai.approval.sync
+// 带 pending，且向该会话 watcher 扇出）。用于自愈「属主兼 watcher 时旁路帧
+// 可能缺一份」的不对称——sync 是可主动拉取的权威源。
+export function approvalSyncRequestPayload() {
+  return { type: 'ai.approval.sync' };
+}
+
+// ai.run.progress 归一：只留可渲染的事实（重试/文件/Git 计数），缺省/非法
+// 数值归 NaN 由调用方过滤。
+export function runProgressFacts(e) {
+  const src = e && typeof e === 'object' ? e : {};
+  const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : NaN);
+  return {
+    retrying: src.retry_active === true || src.retry_active === 'true',
+    attempt: num(src.retry_attempt),
+    max: num(src.retry_max),
+    files: num(src.files_touched_count),
+    git: num(src.git_changed_count),
+  };
+}
+
+// 流式气泡定位：kind='prose'（正文）/'thinking'（思考）。规则：
+// ①尾部同类 running 气泡 → 续写；②末条助手气泡是 prose 且已收尾 → 回合已
+// 终结，迟到帧丢弃（绝不滞留孤泡）；③其余（思考尾 done、用户尾、空）→ 开
+// 新气泡——思考结束转正文时 prose 必须另起新泡，不能塞进思考泡。
+export function ensureStreamingBubble(conv, kind = 'prose') {
+  const msgs = (conv && conv.messages) || [];
+  const last = msgs[msgs.length - 1];
+  if (last && last.role === 'assistant' && (last.kind || 'prose') === kind && last.status === 'running') return last;
+  if (last && last.role === 'assistant' && (last.kind || 'prose') === 'prose' && (last.status === 'done' || last.status === 'error')) return null;
+  const fresh = { role: 'assistant', kind, content: '', status: 'running', ts: Date.now() };
+  if (conv) conv.messages.push(fresh);
+  return fresh;
+}
+
+// 回合开始（ai.run.started）：权威新回合。已有 running 占位（本地 sendMessage
+// 先推的占位）→ 复用；否则强制开新泡——attached 直播多回合时上一回合 prose
+// 已 done，必须开新泡而不是丢弃（旧 ensureAssistantBubble 在此丢帧）。
+export function startRunBubble(conv) {
+  const msgs = (conv && conv.messages) || [];
+  const last = msgs[msgs.length - 1];
+  if (last && last.role === 'assistant' && last.status === 'running') return last;
+  const fresh = { role: 'assistant', content: '', status: 'running', ts: Date.now() };
+  if (conv) conv.messages.push(fresh);
+  return fresh;
+}
+
+// 回合终结：把所有 running 助手气泡（正文+思考）翻到终态。
+export function finishRunBubbles(conv, status) {
+  let touched = false;
+  for (const m of (conv && conv.messages) || []) {
+    if (m.role === 'assistant' && m.status === 'running') {
+      m.status = status;
+      touched = true;
+    }
+  }
+  return touched;
+}
+
+// ai.approval.sync.pending 里的审批 id 全集（authoritative-replace 的 keep 集合）。
+export function syncApprovalIdSet(pending) {
+  const ids = new Set();
+  for (const item of Array.isArray(pending) ? pending : []) {
+    const id = item && typeof item === 'object' ? String(item.approval_id || item.id || '') : '';
+    if (id) ids.add(id);
+  }
+  return ids;
+}
+
+// 对账裁剪：该 session 下不在 keep 集合里的待批卡移除（服务端已不认）；
+// responding 的保留（本地请求在途，结果由 ack/终态帧收口）。
+export function dropStaleApprovals(approvals, sessionId, keepIds) {
+  if (!Array.isArray(approvals)) return [];
+  const keep = keepIds instanceof Set ? keepIds : new Set(keepIds || []);
+  return approvals.filter(a => !a || a.sessionId !== sessionId || !a.id || keep.has(a.id) || a.status === 'responding');
+}
+
+// 转录×直播对账（衔接点）：转录是冷路径快照，journal 落盘滞后会尾部缺段——
+// 抓取窗口内直播落进来的消息不能被盲替换丢掉。合并=转录全量 + 窗口内直播
+// 消息中未被转录覆盖的（role+content 精确去重，防两端都落时重复气泡）。
+export function mergeTranscriptWithLive(rows, liveSnapshot, fetchStartedTs) {
+  const transcript = transcriptToMessages(rows);
+  const live = (Array.isArray(liveSnapshot) ? liveSnapshot : [])
+    .filter(m => m && typeof m === 'object' && (m.ts || 0) >= (fetchStartedTs || 0));
+  if (!live.length) return transcript;
+  const seen = new Set(transcript.map(m => `${m.role}\u0000${m.content}`));
+  const tail = live.filter(m => !seen.has(`${m.role}\u0000${m.content}`));
+  return transcript.concat(tail);
 }

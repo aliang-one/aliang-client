@@ -12,6 +12,17 @@ import {
   recentProjectsFromSessions,
   restorableAttachedSessionIds,
   sessionCreatePayload,
+  steerPayload,
+  stopPayload,
+  syncApprovalIdSet,
+  mergeTranscriptWithLive,
+  originBadgeOf,
+  ensureStreamingBubble,
+  startRunBubble,
+  finishRunBubbles,
+  runProgressFacts,
+  approvalSyncRequestPayload,
+  dropStaleApprovals,
   shouldLoadTranscript,
   transcriptToMessages,
   unwatchSessionPayload,
@@ -296,5 +307,175 @@ describe('restorableAttachedSessionIds（刷新恢复候选）', () => {
   it('脏输入安全', () => {
     expect(restorableAttachedSessionIds(null)).toEqual([]);
     expect(restorableAttachedSessionIds('x')).toEqual([]);
+  });
+});
+
+// —— Task 5：直播帧渲染 + steer/stop 操作 ——
+
+describe('steerPayload / stopPayload / approvalSyncRequestPayload', () => {
+  it('steer 载荷四字段（Required=type,session_id,message_id,content）', () => {
+    expect(steerPayload('codex_1', '先跑测试', 'm-1')).toEqual({
+      type: 'ai.steer', session_id: 'codex_1', message_id: 'm-1', content: '先跑测试',
+    });
+  });
+
+  it('stop 载荷仅 type+session_id（run_id 网页不造）', () => {
+    expect(stopPayload('codex_1')).toEqual({ type: 'ai.stop', session_id: 'codex_1' });
+  });
+
+  it('审批对账拉取载荷仅 type（client→agent 请求 still-pending 全集）', () => {
+    expect(approvalSyncRequestPayload()).toEqual({ type: 'ai.approval.sync' });
+  });
+});
+
+describe('originBadgeOf（来源标记三态）', () => {
+  it('本页绑定优先→本机；managed→手机；external/未知→桌面', () => {
+    expect(originBadgeOf({ bound: true, origin: 'managed' })).toBe('local');
+    expect(originBadgeOf({ bound: false, origin: 'managed' })).toBe('phone');
+    expect(originBadgeOf({ bound: false, origin: 'external' })).toBe('desktop');
+    expect(originBadgeOf({ bound: false })).toBe('desktop'); // origin 缺省按设备原生
+    expect(originBadgeOf(null)).toBe('desktop');
+  });
+});
+
+describe('runProgressFacts（进度小字归一）', () => {
+  it('提取重试与文件/Git 计数，缺省归 NaN', () => {
+    expect(runProgressFacts({
+      retry_active: true, retry_attempt: 2, retry_max: 5, files_touched_count: 3, git_changed_count: 1,
+    })).toEqual({ retrying: true, attempt: 2, max: 5, files: 3, git: 1 });
+    expect(runProgressFacts({})).toEqual({ retrying: false, attempt: NaN, max: NaN, files: NaN, git: NaN });
+    expect(runProgressFacts(null)).toMatchObject({ retrying: false });
+  });
+});
+
+describe('ensureStreamingBubble（正文/思考双通道）', () => {
+  const proseDone = { role: 'assistant', content: '答案', status: 'done', ts: 1 };
+
+  it('尾部同类 running 气泡续写', () => {
+    const conv = { messages: [{ role: 'assistant', kind: 'thinking', content: '想', status: 'running' }] };
+    const bubble = ensureStreamingBubble(conv, 'thinking');
+    expect(bubble).toBe(conv.messages[0]);
+    expect(conv.messages).toHaveLength(1);
+  });
+
+  it('prose 已收尾 → 回合终结，迟到帧丢弃不开孤泡', () => {
+    const conv = { messages: [proseDone] };
+    expect(ensureStreamingBubble(conv, 'prose')).toBeNull();
+    expect(ensureStreamingBubble(conv, 'thinking')).toBeNull();
+    expect(conv.messages).toHaveLength(1);
+  });
+
+  it('思考尾 done → 正文另起新泡（不塞进思考泡）', () => {
+    const conv = { messages: [{ role: 'assistant', kind: 'thinking', content: '思路', status: 'done' }] };
+    const bubble = ensureStreamingBubble(conv, 'prose');
+    expect(bubble).toMatchObject({ role: 'assistant', kind: 'prose', status: 'running' });
+    expect(conv.messages).toHaveLength(2);
+  });
+
+  it('正文 running 中思考帧插入 → 开独立思考泡（交错渲染）', () => {
+    const conv = { messages: [{ role: 'assistant', kind: 'prose', content: '部分', status: 'running' }] };
+    expect(ensureStreamingBubble(conv, 'thinking')).toMatchObject({ kind: 'thinking' });
+    expect(conv.messages).toHaveLength(2);
+  });
+
+  it('用户尾/空消息 → 落新气泡；legacy 无 kind 气泡按 prose 归类', () => {
+    const conv = { messages: [{ role: 'user', content: '问题', status: 'done' }] };
+    expect(ensureStreamingBubble(conv, 'prose')).toMatchObject({ role: 'assistant' });
+    const legacy = { messages: [{ role: 'assistant', content: '旧', status: 'done' }] };
+    expect(ensureStreamingBubble(legacy, 'prose')).toBeNull(); // 旧语义保留：终态后丢弃
+  });
+});
+
+describe('startRunBubble（ai.run.started 权威开泡）', () => {
+  it('已有 running 占位（本地 sendMessage 先推的）→ 复用不重复', () => {
+    const conv = { messages: [{ role: 'assistant', content: '', status: 'running' }] };
+    expect(startRunBubble(conv)).toBe(conv.messages[0]);
+    expect(conv.messages).toHaveLength(1);
+  });
+
+  it('上一回合 prose 已 done → 强制开新泡（attached 直播多回合不丢帧）', () => {
+    const conv = { messages: [{ role: 'assistant', content: '上一回合', status: 'done' }] };
+    const bubble = startRunBubble(conv);
+    expect(bubble).toMatchObject({ role: 'assistant', status: 'running' });
+    expect(conv.messages).toHaveLength(2);
+  });
+
+  it('无 kind 字段（占位泡形态与本地路径一致）', () => {
+    const bubble = startRunBubble({ messages: [] });
+    expect(bubble).not.toHaveProperty('kind');
+  });
+});
+
+describe('finishRunBubbles（终态收口全部 running 气泡）', () => {
+  it('正文+思考一起翻终态；用户气泡不动', () => {
+    const conv = { messages: [
+      { role: 'user', content: '问', status: 'done' },
+      { role: 'assistant', kind: 'thinking', content: '想', status: 'running' },
+      { role: 'assistant', content: '答一半', status: 'running' },
+    ] };
+    expect(finishRunBubbles(conv, 'done')).toBe(true);
+    expect(conv.messages[1].status).toBe('done');
+    expect(conv.messages[2].status).toBe('done');
+    expect(conv.messages[0].status).toBe('done');
+  });
+
+  it('无 running 气泡返回 false', () => {
+    expect(finishRunBubbles({ messages: [{ role: 'assistant', status: 'done' }] }, 'done')).toBe(false);
+    expect(finishRunBubbles(null, 'done')).toBe(false);
+  });
+});
+
+describe('syncApprovalIdSet / dropStaleApprovals（审批对账）', () => {
+  it('pending 集合提取 approval_id/id，脏项跳过', () => {
+    expect(syncApprovalIdSet([
+      { approval_id: 'a1' }, { id: 'a2' }, {}, null, { approval_id: '' },
+    ])).toEqual(new Set(['a1', 'a2']));
+    expect(syncApprovalIdSet(null)).toEqual(new Set());
+  });
+
+  it('对账裁剪：同 session 不在 keep 集合的待批卡移除，responding 保留', () => {
+    const approvals = [
+      { id: 'a1', sessionId: 's1', status: 'pending' },
+      { id: 'a2', sessionId: 's1', status: 'responding' },
+      { id: 'a3', sessionId: 's1', status: 'pending' },  // 服务端已不认
+      { id: 'a4', sessionId: 's2', status: 'pending' },  // 别的会话不动
+    ];
+    const kept = dropStaleApprovals(approvals, 's1', new Set(['a1']));
+    expect(kept.map(a => a.id)).toEqual(['a1', 'a2', 'a4']);
+  });
+});
+
+describe('mergeTranscriptWithLive（转录×直播衔接点对账）', () => {
+  const rows = [
+    { role: 'user', content: '问题', timestamp: '2026-10-29T10:00:00Z' },
+    { role: 'assistant', content: '回答', timestamp: '2026-10-29T10:00:05Z' },
+  ];
+  const startTs = Date.parse('2026-10-29T10:00:10Z');
+
+  it('窗口外直播快照不并回（转录全量为准）', () => {
+    const live = [{ role: 'user', content: '旧的', status: 'done', ts: 1 }];
+    expect(mergeTranscriptWithLive(rows, live, startTs)).toHaveLength(2);
+  });
+
+  it('窗口内直播消息接在转录尾（journal 落盘滞后防缺段）', () => {
+    const live = [{ role: 'assistant', content: '刚直播完的一轮', status: 'done', ts: startTs + 5 }];
+    const merged = mergeTranscriptWithLive(rows, live, startTs);
+    expect(merged).toHaveLength(3);
+    expect(merged[2].content).toBe('刚直播完的一轮');
+  });
+
+  it('两端都落时按 role+content 去重（防重复气泡）', () => {
+    const live = [
+      { role: 'user', content: '问题', status: 'done', ts: startTs + 1 },      // 转录已有
+      { role: 'assistant', content: '新到的一轮', status: 'done', ts: startTs + 2 }, // 转录没有
+    ];
+    const merged = mergeTranscriptWithLive(rows, live, startTs);
+    expect(merged).toHaveLength(3);
+    expect(merged.filter(m => m.content === '问题')).toHaveLength(1);
+  });
+
+  it('脏输入安全', () => {
+    expect(mergeTranscriptWithLive(null, null, startTs)).toEqual([]);
+    expect(mergeTranscriptWithLive(rows, 'x', startTs)).toHaveLength(2);
   });
 });

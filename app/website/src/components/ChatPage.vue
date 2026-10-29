@@ -367,7 +367,7 @@
           </div>
           <div v-for="(msg, idx) in activeMessages" :key="idx" class="mb-3">
             <div class="mb-1 flex items-center gap-2 text-xs text-slate-400">
-              <span>{{ msg.role === 'user' ? t('dash_me') : t('dash_ai') }}</span>
+              <span>{{ msg.role === 'user' ? t('dash_me') : (msg.kind === 'thinking' ? t('chat_thinkingLabel') : t('dash_ai')) }}</span>
               <span v-if="msg.role === 'assistant' && msg.status === 'running'" class="inline-flex items-center gap-1 text-primary">
                 <span class="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-primary"></span>{{ t('chat_statusRunning') }}
               </span>
@@ -380,17 +380,23 @@
                 ? 'ml-auto block bg-primary text-white'
                 : msg.status === 'error'
                   ? 'bg-rose-50 text-rose-600 dark:bg-rose-900/30 dark:text-rose-300'
-                  : 'bg-white text-slate-700 dark:bg-slate-700 dark:text-slate-100'"
+                  : msg.kind === 'thinking'
+                    ? 'bg-slate-100 text-xs italic text-slate-500 dark:bg-slate-800/60 dark:text-slate-400'
+                    : 'bg-white text-slate-700 dark:bg-slate-700 dark:text-slate-100'"
             >
               <span
                 v-if="msg.role === 'assistant' && msg.status === 'running' && !msg.content"
                 class="ai-thinking"
               >
                 <span class="thinking-dot"></span><span class="thinking-dot"></span><span class="thinking-dot"></span>
-                <span class="ml-1 align-middle">{{ t('chat_aiThinking') }}</span>
+                <span class="ml-1 align-middle">{{ msg.kind === 'thinking' ? t('chat_thinkingLabel') : t('chat_aiThinking') }}</span>
               </span>
               <template v-else>{{ msg.content }}</template>
             </div>
+          </div>
+          <div v-if="activeConversation?.progressText" class="mb-3 text-xs text-slate-400">
+            <span class="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-slate-300 dark:bg-slate-600"></span>
+            {{ activeConversation.progressText }}
           </div>
           <div
             v-for="approval in activeApprovals"
@@ -488,7 +494,7 @@
               ref="inputRef"
               v-model="inputText"
               type="text"
-              :placeholder="t('chat_placeholder')"
+              :placeholder="attachedSteerActive ? t('chat_steerPlaceholder') : t('chat_placeholder')"
               :disabled="sending"
               class="h-10 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm text-slate-700 outline-none transition focus:border-primary dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100"
               @input="onSlashInput"
@@ -497,12 +503,21 @@
             />
           </div>
           <button
+            v-if="attachedSteerActive"
+            type="button"
+            class="h-10 shrink-0 rounded-lg border border-rose-300 px-3 text-sm font-semibold text-rose-600 transition hover:bg-rose-50 disabled:cursor-not-allowed disabled:opacity-60 dark:border-rose-800 dark:hover:bg-rose-950/40"
+            :aria-label="t('chat_stop')"
+            @click="stopAttachedRun(activeConversation)"
+          >
+            <span class="material-symbols-outlined align-middle text-base">stop_circle</span>{{ t('chat_stop') }}
+          </button>
+          <button
             type="button"
             class="h-10 rounded-lg bg-primary px-4 text-sm font-semibold text-white transition hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-60"
             :disabled="sending"
             @click="sendMessage"
           >
-            {{ sending ? t('chat_sending') : t('chat_send') }}
+            {{ sending ? t('chat_sending') : (attachedSteerActive ? t('chat_steerSend') : t('chat_send')) }}
           </button>
         </div>
       </div>
@@ -567,7 +582,7 @@
               </span>
             </div>
             <div class="mt-0.5 flex items-center gap-2 text-xs text-slate-400">
-              <span class="rounded bg-slate-100 px-1.5 py-0.5 dark:bg-slate-800">{{ entry.bound ? t('chat_sessionSourceBound') : t('chat_sessionSourceUnbound') }}</span>
+              <span class="rounded bg-slate-100 px-1.5 py-0.5 dark:bg-slate-800">{{ drawerSourceLabel(entry) }}</span>
               <span v-if="entry.provider" class="truncate">{{ entry.provider }}</span>
               <span v-if="entry.updatedAtMs" class="ml-auto shrink-0">{{ drawerTimeLabel(entry.updatedAtMs) }}</span>
             </div>
@@ -600,16 +615,26 @@ import {
   EFFORT_OPTIONS,
   MODEL_CUSTOM_VALUE,
   agentSessionDrawerEntries,
+  approvalSyncRequestPayload,
   attachSessionPayload,
+  dropStaleApprovals,
+  ensureStreamingBubble,
   findConversationForEvent,
   findRunningAssistant,
+  finishRunBubbles,
   isDirectoryLocked,
+  mergeTranscriptWithLive,
+  originBadgeOf,
   planWatchSwitch,
   recentProjectsFromSessions,
   restorableAttachedSessionIds,
+  runProgressFacts,
   sessionCreatePayload,
   shouldLoadTranscript,
-  transcriptToMessages,
+  startRunBubble,
+  steerPayload,
+  stopPayload,
+  syncApprovalIdSet,
   unwatchSessionPayload,
   watchSessionPayload,
   watchTargetOf,
@@ -701,6 +726,12 @@ const activeRunning = computed(() => {
   }
   return false;
 });
+
+// 插话/停止模式的门：attached 会话自身有 running 气泡（正文或思考）。
+// 只对 attached 会话生效——本地会话运行中的操作权仍归全局 sending 原语义。
+const attachedSteerActive = computed(() =>
+  !!(activeConversation.value?.attached && findRunningAssistant(activeConversation.value))
+);
 
 // --- 会话设置条逻辑 ---
 
@@ -961,10 +992,11 @@ function conversationForStorage(conv) {
   const copy = { ...conv };
   copy.approvals = [];
   // 转录状态是会话内的一次性 UI 状态：attached 会话刷新后重新拉取（数据可能
-  // 已在设备上变化），loading/error 更不能落盘。
+  // 已在设备上变化），loading/error 更不能落盘；进度小字同理（只属于当前回合）。
   delete copy.transcriptLoading;
   delete copy.transcriptError;
   delete copy.transcriptLoaded;
+  delete copy.progressText;
   return copy;
 }
 
@@ -1181,6 +1213,10 @@ function sendAI(payload) {
 // 中途/重复 watch 幂等；连接断开服务端按连接反注销，集合随之清空。
 const watchedSessions = new Set();
 
+// 已发出的插话（ai.steer）在途登记：message_id → {conv, userMsg}，ack 据此收口
+// （ok 静默；not_running/turn_ended 撤回乐观用户气泡并提示）。
+const pendingSteers = new Map();
+
 function sendWatch(sessionId) {
   if (!sessionId || watchedSessions.has(sessionId)) return;
   if (sendAI(watchSessionPayload(sessionId))) watchedSessions.add(sessionId);
@@ -1200,8 +1236,10 @@ function applyWatchSwitch(nextConv) {
   }
 }
 
-// attached 会话恢复直播态：attach（attach 载荷，回执异步更新字段）+ 紧跟 watch。
-// 静默执行——fork guard 等错误由 ai.error 分支亮在设置条上。
+// attached 会话恢复直播态：attach（attach 载荷，回执异步更新字段）+ 紧跟 watch
+// + 拉一次审批对账（sync 是可主动拉的权威源，自愈「属主兼 watcher 时旁路帧
+// 可能缺一份」的 0 投递不对称）。静默执行——fork guard 等错误由 ai.error 分支
+// 亮在设置条上。
 function ensureLiveAttached(conv) {
   if (!conv || !conv.attached || !conv.aiSessionId) return;
   ensureAISocket()
@@ -1209,8 +1247,48 @@ function ensureLiveAttached(conv) {
       if (!conv.attached || !conv.aiSessionId) return;
       sendAI(attachSessionPayload(conv.aiSessionId));
       sendWatch(conv.aiSessionId);
+      sendAI(approvalSyncRequestPayload());
     })
     .catch(() => { /* socket 不可用：发消息时经确认门兜底重试 */ });
+}
+
+// attached 运行中的插话（独立 steer 路径）：全局 sending 原语义不动，本地会话
+// 零变化；门=attached 会话自身是否有 running 气泡。乐观推用户气泡，ack 不 ok
+// 则撤回并提示（没送进回合，留着会误导）。
+async function sendSteer(conv, text) {
+  const userMsg = { role: 'user', content: text, ts: now() };
+  conv.messages.push(userMsg);
+  conv.updatedAt = now();
+  saveToStorage();
+  scrollToBottom();
+  const messageId = generateId();
+  try {
+    await ensureAISocket();
+    if (!sendAI(steerPayload(conv.aiSessionId, text, messageId))) throw new Error('socket-closed');
+    pendingSteers.set(messageId, { conv, userMsg });
+  } catch (_) {
+    settleSteerFailure(conv, userMsg, '');
+  }
+}
+
+function settleSteerFailure(conv, userMsg, code) {
+  conv.messages = conv.messages.filter(m => m !== userMsg);
+  conv.messages.push({
+    role: 'assistant',
+    content: code === 'turn_ended' || code === 'not_running' ? t('chat_steerTurnEnded') : t('chat_steerFailed'),
+    status: 'error',
+    ts: now(),
+  });
+  conv.updatedAt = now();
+  saveToStorage();
+  scrollToBottom();
+}
+
+// 停止 attached 会话的运行回合（ai.stop；终态经既有 ai.status/ai.done/ai.error
+// 帧收口，UI 不自行翻转状态）。
+function stopAttachedRun(conv) {
+  if (!conv || !conv.attached || !conv.aiSessionId) return;
+  sendAI(stopPayload(conv.aiSessionId));
 }
 
 // 转录（冷路径）：loading/错误挂在 conv 上（视图据其渲染重试按钮）。
@@ -1218,6 +1296,10 @@ function ensureLiveAttached(conv) {
 // messages，会把正在逐字直播的气泡冲掉，后续 delta 因末尾已是 done 气泡被丢弃。
 async function loadTranscriptInto(conv) {
   if (!shouldLoadTranscript(conv)) return;
+  // 衔接点对账：抓取起点前先留直播快照——journal 落盘滞后会尾部缺段，
+  // 窗口内直播落进来的消息不能被盲替换丢掉（mergeTranscriptWithLive 合并）。
+  const fetchStartedTs = now();
+  const liveSnapshot = (conv.messages || []).slice();
   conv.transcriptLoading = true;
   conv.transcriptError = '';
   try {
@@ -1225,7 +1307,7 @@ async function loadTranscriptInto(conv) {
     // TOCTOU：冷路径最长 40s，期间回合可能已开始直播——命中运行中就弃用本次
     // 结果，直播气泡继续增长（历史留给回合结束后的重进/重试）。
     if (findRunningAssistant(conv)) return;
-    conv.messages = transcriptToMessages(detail?.transcript);
+    conv.messages = mergeTranscriptWithLive(detail?.transcript, liveSnapshot, fetchStartedTs);
     conv.transcriptLoaded = true;
     conv.updatedAt = now();
     saveToStorage();
@@ -1252,6 +1334,14 @@ const visibleDrawerEntries = computed(() => drawerEntries.value.items);
 function drawerTimeLabel(ts) {
   const d = new Date(ts);
   return Number.isNaN(d.getTime()) ? '' : d.toLocaleString();
+}
+
+// 来源标记三态：本页自建/接入→本机；服务端 origin=managed（手机绑定）→手机；
+// external/未知（设备原生）→桌面。attached 状态另用样式表达（条目高亮=当前
+// 接管的会话）。
+function drawerSourceLabel(entry) {
+  const badge = originBadgeOf(entry);
+  return t(badge === 'local' ? 'chat_sessionSourceLocal' : badge === 'phone' ? 'chat_sessionSourcePhone' : 'chat_sessionSourceDesktop');
 }
 
 async function loadSessionDrawer() {
@@ -1399,22 +1489,9 @@ function onInputKeydown(e) {
   }
 }
 
-// Returns the live assistant bubble for a streaming run, creating a fresh
-// placeholder if sendMessage's placeholder was lost (e.g. page reloaded mid-run
-// holding a stale session id, or a state desync). Never spawns a stray bubble
-// after the turn already finished (done/error) — late deltas are then ignored.
-function ensureAssistantBubble(conv) {
-  const asst = findRunningAssistant(conv);
-  if (asst) return asst;
-  const msgs = conv.messages || [];
-  const last = msgs[msgs.length - 1];
-  if (last && last.role === 'assistant' && (last.status === 'done' || last.status === 'error')) {
-    return null;
-  }
-  const fresh = { role: 'assistant', content: '', status: 'running', ts: now() };
-  conv.messages.push(fresh);
-  return fresh;
-}
+// 直播流式气泡（正文/思考双通道）由 chatSettings.ensureStreamingBubble /
+// startRunBubble 承担：思考尾收束后正文另起新泡；attached 直播多回合在
+// run.started 强制开新泡（旧 ensureAssistantBubble 会在这里丢帧）。
 
 function normalizeConversation(conv) {
   if (!conv || typeof conv !== 'object') return null;
@@ -1618,6 +1695,42 @@ function handleAIEvent(e) {
     return;
   }
 
+  // 审批对账（ai.approval.sync）：顶层无 session_id，pending 各项自带——按项归位，
+  // authoritative-replace（服务端侧 still-pending 全集为准）。走在通用路由之前。
+  if (e.type === 'ai.approval.sync') {
+    const pending = Array.isArray(e.pending) ? e.pending : [];
+    const bySession = new Map();
+    for (const item of pending) {
+      const sid = item && typeof item === 'object' ? item.session_id : '';
+      if (!sid) continue;
+      if (!bySession.has(sid)) bySession.set(sid, []);
+      bySession.get(sid).push(item);
+    }
+    let touched = false;
+    for (const [sid, items] of bySession) {
+      const target = conversations.value.find(c => c.aiSessionId === sid);
+      if (!target) continue;
+      for (const item of items) upsertApproval(target, item);
+      const keep = syncApprovalIdSet(items);
+      target.approvals = dropStaleApprovals(target.approvals, sid, keep);
+      touched = true;
+    }
+    if (touched) saveToStorage();
+    return;
+  }
+
+  // 插话回执：按 message_id 对账（不依赖 session 归位）。ok 静默；没送进回合
+  // （not_running/turn_ended 等）撤回乐观用户气泡并提示。
+  if (e.type === 'ai.steer.ack') {
+    const entry = pendingSteers.get(e.message_id);
+    if (!entry) return;
+    pendingSteers.delete(e.message_id);
+    if (e.result && e.result !== 'ok') {
+      settleSteerFailure(entry.conv, entry.userMsg, e.code || '');
+    }
+    return;
+  }
+
   // 帧归位：优先按 session_id 精确命中（matchedById 纪律）；未命中走 fallback，
   // 但 fallback 仅允许本地（非 attached）会话承接——attached 会话的直播流绝不能
   // 被他页会话/未知 session 的帧污染。
@@ -1660,16 +1773,51 @@ function handleAIEvent(e) {
       break;
     }
     case 'ai.run.started': {
-      const asst = ensureAssistantBubble(conv);
-      if (asst) asst.status = 'running';
+      // 权威新回合：占位在（本地 sendMessage 先推的）→ 复用；否则强制开新泡
+      // （attached 直播多回合：上一回合 prose 已 done，不能在这里丢帧）。
+      startRunBubble(conv);
+      conv.progressText = '';
       break;
     }
     case 'ai.delta': {
-      const asst = ensureAssistantBubble(conv);
+      const asst = ensureStreamingBubble(conv, 'prose');
       if (!asst) break;
       asst.content += e.delta || '';
       console.log('[aliang-chat] rendered delta, contentLen=', asst.content.length, 'conv=', conv.id);
       scrollToBottom();
+      break;
+    }
+    case 'ai.thinking': {
+      // 思考流（claude thinking_delta / codex reasoning）：独立思考气泡，样式
+      // 弱化对齐手机；思考尾收束后正文另起新泡（ensureStreamingBubble 规则③）。
+      const asst = ensureStreamingBubble(conv, 'thinking');
+      if (!asst) break;
+      asst.content += e.delta || '';
+      scrollToBottom();
+      break;
+    }
+    case 'ai.run.progress': {
+      // 进度小字（重试/文件/Git 计数）：挂 conv 展示在消息流尾部，终态清空。
+      const facts = runProgressFacts(e);
+      const parts = [];
+      if (facts.retrying && Number.isFinite(facts.attempt)) {
+        parts.push(t('chat_progressRetry', { attempt: facts.attempt, max: Number.isFinite(facts.max) ? facts.max : '?' }));
+      }
+      if (Number.isFinite(facts.files) && facts.files > 0) parts.push(t('chat_progressFiles', { count: facts.files }));
+      if (Number.isFinite(facts.git) && facts.git > 0) parts.push(t('chat_progressGit', { count: facts.git }));
+      conv.progressText = parts.join(' · ');
+      break;
+    }
+    case 'ai.approval.cancelled': {
+      // 旁路帧：对话失活/审批被撤——按 approval_ids 关卡（缺省 ids=全关该会话）。
+      const ids = Array.isArray(e.approval_ids) ? e.approval_ids : null;
+      if (!ids) {
+        clearApprovalsForSession(conv, e.session_id);
+      } else {
+        for (const id of ids) markApprovalHandled(conv, approvalKeyFromValues(e.session_id, id));
+        conv.approvals = (conv.approvals || []).filter(a => !ids.includes(a.id) || a.sessionId !== e.session_id);
+      }
+      persist = true;
       break;
     }
     case 'ai.status': {
@@ -1685,8 +1833,9 @@ function handleAIEvent(e) {
     }
     case 'ai.done': {
       disarmIdleWatchdog();
-      const asst = findRunningAssistant(conv);
-      if (asst) asst.status = 'done';
+      // 终态收口：所有 running 气泡（正文+思考）一起翻 done，进度小字清空。
+      finishRunBubbles(conv, 'done');
+      conv.progressText = '';
       clearApprovalsForSession(conv, e.session_id);
       finishRun(conv);
       return;
@@ -1717,6 +1866,8 @@ function handleAIEvent(e) {
         asst.status = 'error';
         if (!asst.content) asst.content = e.error || t('chat_aiError');
       }
+      finishRunBubbles(conv, 'error');
+      conv.progressText = '';
       clearApprovalsForSession(conv, e.session_id);
       finishRun(conv);
       return;
@@ -1736,10 +1887,19 @@ async function sendMessage() {
   }
 
   const text = inputText.value.trim();
-  if (!text || sending.value || !activeId.value) return;
+  if (!text || !activeId.value) return;
 
   const conv = activeConversation.value;
   if (!conv) return;
+
+  // attached 会话运行中 → 独立 steer 路径（门=该会话自身 run 状态；全局 sending
+  // 原语义不动，本地会话行为零变化——本地运行中 sending=true，早已在上行拦截）。
+  if (conv.attached && findRunningAssistant(conv)) {
+    inputText.value = '';
+    await sendSteer(conv, text);
+    return;
+  }
+  if (sending.value) return;
 
   conv.messages.push({ role: 'user', content: text, ts: now() });
   if (!conv.title) {
