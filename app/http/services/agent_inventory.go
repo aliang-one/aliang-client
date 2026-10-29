@@ -5,18 +5,22 @@ import (
 	"bytes"
 	"crypto/sha1"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"aliang.one/nursorgate/app/http/models"
 	"aliang.one/nursorgate/common/cache"
 	"aliang.one/nursorgate/common/logger"
+	"aliang.one/nursorgate/internal/tccguard"
 )
 
 const (
@@ -354,6 +358,12 @@ func summarizeAgentVibeSessions(sessions []models.AgentVibeSession) []models.Age
 	return summaries
 }
 
+// agentProjectInventoryMax：项目清单条数硬顶（防御性冗余：上游 vibe 会话
+// 采样 agentVibeSummaryMaxSessions=200 使项目数实际 ≤200，本闸当前不可达；
+// 将来调高会话采样时与服务端 normalize 封顶共同兜底）。超出按最近活跃
+// 降序截断。
+const agentProjectInventoryMax = 500
+
 func collectAgentProjects(sessions []models.AgentVibeSession) []models.AgentProject {
 	byPath := make(map[string]*models.AgentProject)
 	for _, session := range sessions {
@@ -378,10 +388,118 @@ func collectAgentProjects(sessions []models.AgentVibeSession) []models.AgentProj
 		enrichAgentProject(project)
 		projects = append(projects, *project)
 	}
+	markAgentProjectDirMissing(projects)
 	sort.Slice(projects, func(i, j int) bool {
-		return projects[i].LastActiveAt > projects[j].LastActiveAt
+		if projects[i].LastActiveAt != projects[j].LastActiveAt {
+			return projects[i].LastActiveAt > projects[j].LastActiveAt
+		}
+		return projects[i].Path < projects[j].Path // 确定性次级键：并列时截断边界稳定
 	})
+	if len(projects) > agentProjectInventoryMax {
+		projects = projects[:agentProjectInventoryMax]
+	}
 	return projects
+}
+
+// 目录存在性检查的缓存与预算：hello 触发频率高（connect+10s digest 变化
+// +60s 周期+服务端轻推），不能每轮对每项目裸 stat——Windows/macOS 上断连
+// SMB/NFS 映射盘的单次 os.Stat 可阻塞数秒，会把 hello 拖死。缓存命中同步
+// 返回；未缓存路径交给带预算的后台刷新（单飞+500ms 预算），超时剩余路径
+// 本轮保持未知、缓存就位后下一轮生效。
+const (
+	agentProjectDirCacheTTL      = 10 * time.Minute
+	agentProjectDirRefreshBudget = 500 * time.Millisecond
+	agentProjectDirCacheMax      = 4096
+)
+
+type agentProjectDirState struct {
+	missing   bool
+	known     bool
+	checkedAt time.Time
+}
+
+var (
+	agentProjectDirMu      sync.Mutex
+	agentProjectDirCache   = map[string]agentProjectDirState{}
+	agentProjectDirRefresh atomic.Bool
+)
+
+// markAgentProjectDirMissing 为每个唯一项目路径做 best-effort 存在性标记：
+// 已确认消失置 DirMissing=true、已确认存在置 false（显式下发让服务端区分
+// 「已探测且正常」与「未探测」），不可安全检查的路径保持 nil。标记不剔除
+// ——剔除是服务端/UI 的决定。路径必须先过 tccguard.StatAllowed（绝不
+// probe，延续后台采集零 TCC 弹窗纪律）。
+func markAgentProjectDirMissing(projects []models.AgentProject) {
+	now := time.Now()
+	var refresh []string
+	agentProjectDirMu.Lock()
+	for i := range projects {
+		path := projects[i].Path
+		if path == "" {
+			continue
+		}
+		if st, ok := agentProjectDirCache[path]; ok && now.Sub(st.checkedAt) < agentProjectDirCacheTTL {
+			if st.known {
+				missing := st.missing
+				projects[i].DirMissing = &missing
+			}
+			continue
+		}
+		refresh = append(refresh, path)
+	}
+	agentProjectDirMu.Unlock()
+	if len(refresh) == 0 || !agentProjectDirRefresh.CompareAndSwap(false, true) {
+		return
+	}
+	done := make(chan struct{})
+	go func() {
+		defer agentProjectDirRefresh.Store(false)
+		defer close(done)
+		deadline := time.Now().Add(agentProjectDirRefreshBudget)
+		for _, path := range refresh {
+			if time.Now().After(deadline) {
+				return // 剩余路径留待下一轮触发
+			}
+			missing, known := statAgentProjectDir(path)
+			agentProjectDirMu.Lock()
+			if len(agentProjectDirCache) >= agentProjectDirCacheMax {
+				agentProjectDirCache = make(map[string]agentProjectDirState)
+			}
+			agentProjectDirCache[path] = agentProjectDirState{missing: missing, known: known, checkedAt: time.Now()}
+			agentProjectDirMu.Unlock()
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(agentProjectDirRefreshBudget):
+		// 预算耗尽：本轮剩余路径保持未知，刷新 goroutine 继续补缓存，
+		// single-flight 保证卡死的 stat 不会叠加多个后台刷新。
+	}
+	// 刷新完成后从缓存补应用（含预算耗尽时的已完成部分）。
+	agentProjectDirMu.Lock()
+	for i := range projects {
+		if st, ok := agentProjectDirCache[projects[i].Path]; ok && st.known {
+			missing := st.missing
+			projects[i].DirMissing = &missing
+		}
+	}
+	agentProjectDirMu.Unlock()
+}
+
+// statAgentProjectDir 返回 (missing, known)：StatAllowed 拒绝（受保护/
+// 无授权/异卷）或非 ErrNotExist 的 stat 错误（断连网络盘、权限等）一律
+// known=false 保持未知——只对「确认安全且答案明确」的路径下结论。
+func statAgentProjectDir(path string) (missing, known bool) {
+	if err := tccguard.StatAllowed(path); err != nil {
+		return false, false
+	}
+	if _, err := os.Stat(path); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return true, true
+		}
+		return false, false
+	}
+	return false, true
 }
 
 func agentProjectPaths(projects []models.AgentProject) []string {
