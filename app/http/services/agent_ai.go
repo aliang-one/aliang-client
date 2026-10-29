@@ -1094,8 +1094,26 @@ func (m *agentAIManager) evictOldestIdleAISessionLocked() {
 	m.clearPendingApprovalsLocked(victim.id, victim.runSeq, models.AgentAIApprovalDecisionCancel)
 	victim.pendingOption = nil
 	delete(m.sessions, victim.id)
+	// reserved 绑定随会话一并丢弃：reserved 是 server 下发的占位 id，会话没了
+	// 它就失去兑现语境，留着还会在「原生 id 已绑定别的会话」检查里误导后续
+	// confirm 的报错方向。confirmed 是合法 resume 锚（驱逐后 lazy-create 仍能
+	// 从它恢复），保留。persistIdentityState 自带锁，不能在持锁临界区里调，
+	// 丢 goroutine 异步落盘，失败仅日志。
+	reservedDropped := ""
+	if binding, ok := m.bindings[victim.id]; ok && binding.State == "reserved" {
+		reservedDropped = binding.NativeSessionID
+		delete(m.bindings, victim.id)
+	}
 	logger.Info(fmt.Sprintf("ai.session: evicted idle session %s to bound resident set (cap=%d, now=%d)",
 		victim.id, agentAISessionResidentCap, len(m.sessions)))
+	if reservedDropped != "" {
+		logger.Info(fmt.Sprintf("ai.session: evicted session %s 的 reserved 绑定 %q 一并丢弃", victim.id, reservedDropped))
+		go func(sessionID, native string) {
+			if err := m.persistIdentityState(); err != nil {
+				logger.Warn(fmt.Sprintf("ai.session: evict reserved binding persist_failed session=%s native=%s err=%v", sessionID, native, err))
+			}
+		}(victim.id, reservedDropped)
+	}
 }
 
 // approvalService returns the AgentService that owns this manager (used to
@@ -1963,6 +1981,20 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 // runStart is the protocol-v3 atomic create+message command. The server may
 // redeliver it from its durable outbox; replayProcessedRun guarantees the same
 // run never launches a second provider process.
+// mergeRunStartIdentityLocked 把 ai.run.start 携带的身份字段并进会话。空值不
+// 覆盖已钉值（与 attachLiveSession 的字段纪律同款）：server 重投/重连重放的
+// payload 常不带 resume/reserved 字段，空串覆盖会把上一轮 confirmBinding 钉下
+// 的恢复点抹掉，下一回合退化 fresh（2026-10-29 already-in-use 事故第 3 层）。
+// 非空新值（含绑定 confirmed 的权威改写）正常覆盖。调用方必须持有 m.mu。
+func mergeRunStartIdentityLocked(session *agentAISession, resumeID, reservedID string) {
+	if resumeID != "" {
+		session.resumeSessionID = resumeID
+	}
+	if reservedID != "" {
+		session.reservedNativeSessionID = reservedID
+	}
+}
+
 func (m *agentAIManager) runStart(msg map[string]interface{}, writeJSON agentTerminalWriter) {
 	runID := strings.TrimSpace(remoteString(msg, "run_id"))
 	sessionID := strings.TrimSpace(remoteString(msg, "session_id"))
@@ -2030,8 +2062,25 @@ func (m *agentAIManager) runStart(msg map[string]interface{}, writeJSON agentTer
 				msg["provider"] = persisted.Provider
 				msg["tool"] = persisted.Provider
 			}
-		} else if reservedID == "" {
-			reservedID = persisted.NativeSessionID
+		} else {
+			if reservedID == "" {
+				reservedID = persisted.NativeSessionID
+			}
+			// reserved 自愈（2026-10-29 already-in-use 事故的入口保险）：server
+			// 判死吞掉终态 confirm 后，reserved 身份对应的 jsonl 可能已由上一轮
+			// 真实落盘。此时仍按 fresh --session-id 启动必撞 "Session ID already
+			// in use" exit 1，且绑定恒停 reserved、每回合重试必死。探到落盘事实
+			// 即把本回合升级为 --resume，恢复点交由本轮 confirmBinding 正常收敛。
+			// 仅 claude 族有 jsonl 概念；codex 无从探测，由 codex 侧 mismatch
+			// 自愈兜底。
+			if persisted.State == "reserved" && resumeID == "" && reservedID != "" &&
+				providersEquivalent(persisted.Provider, "claudecode") {
+				if jsonl := ccPeerSessionJSONL(externalTUIHome(), reservedID); jsonl != "" {
+					logger.Info(fmt.Sprintf("ai.run.resume.revive: session=%s reserved id %q jsonl 已落盘(%s)，fresh 自动升级 --resume", sessionID, reservedID, jsonl))
+					resumeID = reservedID
+					reservedID = ""
+				}
+			}
 		}
 	}
 	if session := m.sessions[sessionID]; session != nil {
@@ -2043,8 +2092,7 @@ func (m *agentAIManager) runStart(msg map[string]interface{}, writeJSON agentTer
 		if cw := clampAgentAIContextWindow(remoteInt(msg, "context_window", 0)); cw > 0 {
 			session.contextWindow = cw
 		}
-		session.resumeSessionID = resumeID
-		session.reservedNativeSessionID = reservedID
+		mergeRunStartIdentityLocked(session, resumeID, reservedID)
 		session.bindingVersion = remoteInt(msg, "binding_version", session.bindingVersion)
 		if v := strings.TrimSpace(remoteString(msg, agentAIOriginSocketField)); v != "" {
 			session.originSocket = v
@@ -4263,7 +4311,13 @@ func (m *agentAIManager) clearAgentAIResumeSessionID(sessionID string, runSeq in
 	if session == nil || session.runSeq != runSeq {
 		return
 	}
-	if expected == "" || session.resumeSessionID == expected {
+	// expected 为空是「按值撤销」的退化形态：无条件清空会把确认期钉下的恢复点
+	// 一并抹掉（2026-10-29 already-in-use 事故类：空值覆盖已钉恢复点）。空锚即
+	// 不撤，撤销必须指名道姓。
+	if expected == "" {
+		return
+	}
+	if session.resumeSessionID == expected {
 		session.resumeSessionID = ""
 	}
 }
@@ -4281,6 +4335,12 @@ const (
 	// print the accepted levels). The pass emitted no assistant output; the
 	// caller should clamp the effort to a listed level and retry once.
 	agentAIRunEffortRejected
+	// agentAIRunSessionIDInUse means the CLI refused to START a new session
+	// with the caller-provided --session-id because a transcript with that id
+	// already exists on disk (the identity was consumed by an earlier run).
+	// The pass emitted no assistant output; the caller should release the
+	// reserved binding, drop --session-id, and retry fresh once.
+	agentAIRunSessionIDInUse
 )
 
 type agentAIRunOutcome int
@@ -4349,6 +4409,14 @@ func (m *agentAIManager) runCLI(ctx context.Context, run agentAIRun, writeJSON a
 		emitAgentAIResumeMissingNotice(writeJSON, run, run.resumeSessionID)
 	}
 	outcome, rej := m.runCLIPass(ctx, run, writeJSON, false)
+	if outcome == agentAIRunSessionIDInUse && ctx.Err() == nil {
+		// 自愈：reserved 身份已被消费（jsonl 在盘），释放绑定并去掉
+		// --session-id，让 CLI 自铸新 id 重跑一次（与 resume-missing 的清+重试
+		// 同构）。单次封顶：重跑时 newSessionID 为空，分类器不可能再命中。
+		m.releaseReservedBinding(run.sessionID, run.reservedNativeSessionID)
+		run.reservedNativeSessionID = ""
+		outcome, rej = m.runCLIPass(ctx, run, writeJSON, false)
+	}
 	m.retryAfterEffortRejected(ctx, run, writeJSON, outcome, rej, false)
 }
 
@@ -5143,6 +5211,9 @@ func (m *agentAIManager) runCodexAppServer(ctx context.Context, run agentAIRun, 
 	threadID := ""
 	turnID := ""
 	threadBound := false
+	// codex mismatch 自愈的单次封顶闸：reserved 占位释放后 confirmBinding 的
+	// expected 为空，结构上不可能二次 mismatch，闸只是纵深防御。
+	bindingRetried := false
 	bindThread := func() error {
 		if threadBound || threadID == "" {
 			return nil
@@ -5473,6 +5544,23 @@ func (m *agentAIManager) runCodexAppServer(ctx context.Context, run agentAIRun, 
 			}
 			if threadID != "" {
 				if err := bindThread(); err != nil {
+					// codex mismatch 自愈（2026-10-29 already-in-use 事故的 codex
+					// 侧）：本地还是 reserved 占位时，mismatch 说明占位 id 已不可
+					// 兑现——claude 族撞 jsonl 的同族问题在 codex 表现为撞绑定锚。
+					// 释放绑定、丢掉 resume 锚，就地以全新 thread/start 重试一次。
+					// 释放后 confirmBinding 的 expected 为空，不会二次 mismatch。
+					if !bindingRetried && strings.Contains(err.Error(), "mismatch") && m.reservedBindingID(run.sessionID) != "" {
+						bindingRetried = true
+						m.releaseReservedBinding(run.sessionID, "")
+						run.resumeSessionID = ""
+						delete(threadParams, "threadId")
+						threadMethod = "thread/start"
+						codexPhase = threadMethod
+						threadID = ""
+						logger.Warn(fmt.Sprintf("ai.codex.binding.revive: session=%s runSeq=%d reserved 绑定 mismatch 已释放，就地重跑 thread/start", run.sessionID, run.runSeq))
+						_ = send(map[string]interface{}{"method": threadMethod, "id": 1, "params": threadParams})
+						continue
+					}
 					terminalErr = "Codex provider binding failed: " + err.Error()
 					goto done
 				}
@@ -6110,6 +6198,20 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 		resumeID = ""
 	}
 
+	// spawn 前的第二道 revive 保险（runStart 入口是第一道）：真 fresh
+	// （resumeSessionID 为空）且 reserved 身份的 jsonl 已落盘时，直接升级
+	// --resume 复用既有历史，而不是撞 "Session ID already in use"。weld 路径
+	// （resume 已被判不可解）不翻转，避免把已知打不开的 resume 再翻回去。
+	if !allowResume && newSessionID != "" && strings.TrimSpace(run.resumeSessionID) == "" &&
+		(providersEquivalent(run.provider, "claudecode") || strings.EqualFold(run.provider, "auto")) {
+		if jsonl := ccPeerSessionJSONL(externalTUIHome(), newSessionID); jsonl != "" {
+			logger.Info(fmt.Sprintf("ai.run.resume.revive: session=%s runSeq=%d reserved id %q jsonl 已落盘(%s)，fresh 自动升级 --resume", run.sessionID, run.runSeq, newSessionID, jsonl))
+			resumeID = newSessionID
+			newSessionID = ""
+			allowResume = true
+		}
+	}
+
 	var tool *agentAITool
 	var err error
 	if run.readOnly || len(run.goalIdentity) > 0 {
@@ -6459,6 +6561,13 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 		if allowResume && isAgentAIResumeMissing(stderrBuf.String()) {
 			return agentAIRunResumeMissing, agentAIEffortRejection{}
 		}
+		// --session-id 撞已落盘 jsonl（CLI 启动期身份校验拒绝，无 assistant 输
+		// 出）：上报专用 outcome，让调用方释放 reserved 绑定、去掉 --session-id
+		// 重跑一次 fresh，而不是把可自愈的失败直接抛给用户（2026-10-29
+		// already-in-use 事故的兜底）。
+		if !allowResume && newSessionID != "" && isAgentAISessionIDInUse(stderrBuf.String()) {
+			return agentAIRunSessionIDInUse, agentAIEffortRejection{}
+		}
 		// CLI 在参数校验阶段拒绝了 --effort:极老世代连 flag 都没有(unknown
 		// option),旧世代硬拒值并枚举合法清单。此时不可能有 assistant 输出,
 		// 上报 agentAIRunEffortRejected 让调用方去 flag/按清单钳制后重试,而不是
@@ -6541,6 +6650,15 @@ func isAgentAIResumeMissing(stderr string) bool {
 	mentionsSession := strings.Contains(lower, "session") || strings.Contains(lower, "thread") || strings.Contains(lower, "rollout")
 	missing := strings.Contains(lower, "not found") || strings.Contains(lower, "does not exist") || strings.Contains(lower, "no rollout")
 	return mentionsSession && missing
+}
+
+// isAgentAISessionIDInUse 识别 claude CLI 对 --session-id 的「身份占用」拒绝：
+// 该 id 的 transcript jsonl 已存在（上一轮同 id run 已落盘）时，CLI 拒绝以该
+// id 开新会话并 exit 1。与 isAgentAIResumeMissing 同族，是它的镜像问题
+// （resume 打不开 vs fresh 身份被占）。
+func isAgentAISessionIDInUse(stderr string) bool {
+	lower := strings.ToLower(stderr)
+	return strings.Contains(lower, "session id") && strings.Contains(lower, "already in use")
 }
 
 // captureAgentAIStderr reads everything from reader, storing the first cap
