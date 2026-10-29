@@ -2496,6 +2496,20 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 // runStart is the protocol-v3 atomic create+message command. The server may
 // redeliver it from its durable outbox; replayProcessedRun guarantees the same
 // run never launches a second provider process.
+// mergeRunStartIdentityLocked 把 ai.run.start 携带的身份字段并进会话。空值不
+// 覆盖已钉值（与 attachLiveSession 的字段纪律同款）：server 重投/重连重放的
+// payload 常不带 resume/reserved 字段，空串覆盖会把上一轮 confirmBinding 钉下
+// 的恢复点抹掉，下一回合退化 fresh（2026-10-29 already-in-use 事故第 3 层）。
+// 非空新值（含绑定 confirmed 的权威改写）正常覆盖。调用方必须持有 m.mu。
+func mergeRunStartIdentityLocked(session *agentAISession, resumeID, reservedID string) {
+	if resumeID != "" {
+		session.resumeSessionID = resumeID
+	}
+	if reservedID != "" {
+		session.reservedNativeSessionID = reservedID
+	}
+}
+
 func (m *agentAIManager) runStart(msg map[string]interface{}, writeJSON agentTerminalWriter) {
 	runID := strings.TrimSpace(remoteString(msg, "run_id"))
 	sessionID := strings.TrimSpace(remoteString(msg, "session_id"))
@@ -2561,8 +2575,25 @@ func (m *agentAIManager) runStart(msg map[string]interface{}, writeJSON agentTer
 				msg["provider"] = persisted.Provider
 				msg["tool"] = persisted.Provider
 			}
-		} else if reservedID == "" {
-			reservedID = persisted.NativeSessionID
+		} else {
+			if reservedID == "" {
+				reservedID = persisted.NativeSessionID
+			}
+			// reserved 自愈（2026-10-29 already-in-use 事故的入口保险）：server
+			// 判死吞掉终态 confirm 后，reserved 身份对应的 jsonl 可能已由上一轮
+			// 真实落盘。此时仍按 fresh --session-id 启动必撞 "Session ID already
+			// in use" exit 1，且绑定恒停 reserved、每回合重试必死。探到落盘事实
+			// 即把本回合升级为 --resume，恢复点交由本轮 confirmBinding 正常收敛。
+			// 仅 claude 族有 jsonl 概念；codex 无从探测，由 codex 侧 mismatch
+			// 自愈兜底。
+			if persisted.State == "reserved" && resumeID == "" && reservedID != "" &&
+				providersEquivalent(persisted.Provider, "claudecode") {
+				if jsonl := ccPeerSessionJSONL(externalTUIHome(), reservedID); jsonl != "" {
+					logger.Info(fmt.Sprintf("ai.run.resume.revive: session=%s reserved id %q jsonl 已落盘(%s)，fresh 自动升级 --resume", sessionID, reservedID, jsonl))
+					resumeID = reservedID
+					reservedID = ""
+				}
+			}
 		}
 	}
 	if session := m.sessions[sessionID]; session != nil {
@@ -2574,8 +2605,7 @@ func (m *agentAIManager) runStart(msg map[string]interface{}, writeJSON agentTer
 		if cw := clampAgentAIContextWindow(remoteInt(msg, "context_window", 0)); cw > 0 {
 			session.contextWindow = cw
 		}
-		session.resumeSessionID = resumeID
-		session.reservedNativeSessionID = reservedID
+		mergeRunStartIdentityLocked(session, resumeID, reservedID)
 		session.bindingVersion = remoteInt(msg, "binding_version", session.bindingVersion)
 		if policy := parseAgentAIClaudeRemotePolicy(msg); policy.enabled {
 			session.claudePolicy = cloneAgentAIClaudeRemotePolicy(policy)
