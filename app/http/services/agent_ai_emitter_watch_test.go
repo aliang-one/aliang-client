@@ -1,9 +1,11 @@
 package services
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -167,18 +169,29 @@ func TestAgentAIEmitterSlowWatcherDoesNotBlockOwner(t *testing.T) {
 }
 
 // ③写错误 watcher:第一次投递即报错 → 摘除(emitter 拷贝 + manager 注册表),
-// 后续帧不再向它重投。
+// 后续帧不再向它重投;摘除伴随的一次性 dropped 通知帧不计入投递(R1)。
 func TestAgentAIEmitterWriteErrorWatcherDropped(t *testing.T) {
 	m := newAgentAIManager()
 	owner := &emitterWatchRecorder{}
-	var calls int
 	var callMu sync.Mutex
+	var calls []string
 	failing := agentTerminalWriter(func(value interface{}) error {
 		callMu.Lock()
-		calls++
+		calls = append(calls, fmt.Sprint(value.(map[string]interface{})["type"]))
 		callMu.Unlock()
 		return fmt.Errorf("conn gone")
 	})
+	runFrameCalls := func() int {
+		callMu.Lock()
+		defer callMu.Unlock()
+		n := 0
+		for _, typeName := range calls {
+			if typeName != models.AgentEventAISessionWatchDropped {
+				n++
+			}
+		}
+		return n
+	}
 	m.watchSession("s-1", "conn-err", failing)
 	emitter := m.runEmitter(agentAIRun{sessionID: "s-1", runID: "run-1", messageID: "msg-1"}, owner.write)
 
@@ -192,15 +205,30 @@ func TestAgentAIEmitterWriteErrorWatcherDropped(t *testing.T) {
 		t.Fatalf("manager registry still holds the failing watcher: %#v", snap)
 	}
 
-	// 后续 emit 不再向已摘除的 watcher 重投。
+	// 摘除伴随的 dropped 通知到达(一次性,尽力而为)。
+	waitForWatchCond(t, 2*time.Second, "dropped notification frame", func() bool {
+		callMu.Lock()
+		defer callMu.Unlock()
+		for _, typeName := range calls {
+			if typeName == models.AgentEventAISessionWatchDropped {
+				return true
+			}
+		}
+		return false
+	})
+
+	// 后续 emit 不再向已摘除的 watcher 重投(dropped 通知除外,且只此一次)。
 	if err := emitter.emit(emitterWatchPayload(models.AgentEventAIDelta, "s-1", 2)); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(100 * time.Millisecond)
+	if n := runFrameCalls(); n != 1 {
+		t.Fatalf("failing writer got %d run frames, want exactly 1 (no retry after drop)", n)
+	}
 	callMu.Lock()
 	defer callMu.Unlock()
-	if calls != 1 {
-		t.Fatalf("failing writer called %d times, want exactly 1 (no retry after drop)", calls)
+	if len(calls) != 2 {
+		t.Fatalf("writer called %d times total, want 2 (1 run frame + 1 dropped notice)", len(calls))
 	}
 }
 
@@ -362,4 +390,322 @@ func TestAgentAIEmitterBufferFullDropReachesManager(t *testing.T) {
 		t.Fatal("emitter copy kept the watcher after buffer-full drop")
 	}
 	close(block)
+}
+
+// ---------- Task 2: watch/unwatch 路由 + 审批全类帧扇出 ----------
+
+// newWatchableTestSession 注册一个带在跑 emitter 的内存会话(不真跑 CLI),
+// 供 watch/unwatch 处理器与审批帧测试复用。
+func newWatchableTestSession(t *testing.T, m *agentAIManager, sessionID string) (*agentAIRunEmitter, *emitterWatchRecorder) {
+	t.Helper()
+	owner := &emitterWatchRecorder{}
+	emitter := m.runEmitter(agentAIRun{sessionID: sessionID, runID: "run-" + sessionID, messageID: "msg-1"}, owner.write)
+	_, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	m.mu.Lock()
+	m.sessions[sessionID] = &agentAISession{
+		id:            sessionID,
+		cancel:        cancel,
+		activeWriter:  emitter.emit,
+		activeEmitter: emitter,
+		runSeq:        1,
+		lastActiveAt:  time.Now(),
+	}
+	m.mu.Unlock()
+	return emitter, owner
+}
+
+// insertPendingTestApproval 造一个挂起的审批 waiter(runSeq 须匹配会话),
+// 让 sync/cancelled 路径有真实素材。
+func insertPendingTestApproval(m *agentAIManager, sessionID, approvalID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.approvals == nil {
+		m.approvals = make(map[string]*agentAIApprovalWaiter)
+	}
+	req := agentAIApprovalRequest{
+		ID:        approvalID,
+		SessionID: sessionID,
+		Kind:      models.AgentAIApprovalKindTool,
+		respond:   make(chan agentAIApprovalResponse, 1),
+	}
+	m.approvals[agentAIApprovalMapKey(sessionID, approvalID)] = &agentAIApprovalWaiter{
+		sessionID: sessionID,
+		runSeq:    1,
+		request:   req,
+	}
+}
+
+// watch 内存解析不到的 id → ai.error session not found(磁盘解析 Task 3 才
+// 开放);缺 session_id/conn_id → ai.error;内存命中则登记 + 立即补种在跑
+// emitter 拷贝(R2);unwatch 幂等且连在跑拷贝一起裁剪。
+func TestAgentAIWatchHandlerMemoryResolveAndError(t *testing.T) {
+	m := newAgentAIManager()
+	rec := &emitterWatchRecorder{}
+
+	// 未解析:拒绝且不留注册痕迹。
+	m.watch(map[string]interface{}{"session_id": "ghost", "conn_id": "c1"}, rec.write)
+	frames := rec.snapshot()
+	if len(frames) != 1 || frames[0]["type"] != models.AgentEventAIError {
+		t.Fatalf("watch ghost = %#v, want single ai.error", frames)
+	}
+	if !strings.Contains(fmt.Sprint(frames[0]["error"]), "session not found") {
+		t.Fatalf("error = %v, want session not found", frames[0]["error"])
+	}
+	if snap := m.sessionWatchersSnapshot("ghost"); snap != nil {
+		t.Fatalf("ghost watch left registry: %#v", snap)
+	}
+
+	emitter, owner := newWatchableTestSession(t, m, "s-1")
+	// 缺 conn_id:拒绝。
+	m.watch(map[string]interface{}{"session_id": "s-1"}, rec.write)
+	if n := len(rec.snapshot()); n != 2 {
+		t.Fatalf("missing conn_id watch wrote %d frames total, want 2 (1 new error)", n)
+	}
+	// 命中:登记 + 补种在跑 emitter。
+	m.watch(map[string]interface{}{"session_id": "s-1", "conn_id": "c1"}, rec.write)
+	if n := len(rec.snapshot()); n != 2 {
+		t.Fatalf("successful watch wrote extra frames: %d", n-2)
+	}
+	if snap := m.sessionWatchersSnapshot("s-1"); len(snap) != 1 {
+		t.Fatalf("registry after watch = %#v", snap)
+	}
+	if _, ok := watcherCopyForTest(emitter)["c1"]; !ok {
+		t.Fatal("watching a running session did not attach to its live emitter (R2)")
+	}
+	// R6:重复 watch 不产生重复投递。
+	m.watch(map[string]interface{}{"session_id": "s-1", "conn_id": "c1"}, rec.write)
+	if err := emitter.emit(emitterWatchPayload(models.AgentEventAIDelta, "s-1", 1)); err != nil {
+		t.Fatal(err)
+	}
+	waitForWatchCond(t, 2*time.Second, "watcher to receive the frame", func() bool {
+		return len(rec.snapshot()) == 3
+	})
+	if got := len(rec.snapshot()); got != 3 {
+		t.Fatalf("duplicate watch produced %d frames total, want exactly 3 (no dup)", got)
+	}
+	if len(owner.snapshot()) != 1 {
+		t.Fatalf("owner frames = %d, want 1", len(owner.snapshot()))
+	}
+
+	// unwatch:注册表与在跑拷贝同时消失,无错误帧。
+	m.unwatch(map[string]interface{}{"session_id": "s-1", "conn_id": "c1"}, rec.write)
+	if n := len(rec.snapshot()); n != 3 {
+		t.Fatalf("unwatch wrote extra frames: %d", n-3)
+	}
+	if snap := m.sessionWatchersSnapshot("s-1"); len(snap) != 0 {
+		t.Fatalf("registry after unwatch = %#v", snap)
+	}
+	if _, ok := watcherCopyForTest(emitter)["c1"]; ok {
+		t.Fatal("unwatch did not prune the running emitter copy")
+	}
+	// 幂等:再 unwatch 不报错。
+	m.unwatch(map[string]interface{}{"session_id": "s-1", "conn_id": "c1"}, rec.write)
+	if n := len(rec.snapshot()); n != 3 {
+		t.Fatalf("idempotent unwatch wrote frames: %d", n-3)
+	}
+	_ = emitter
+}
+
+// 审批四类帧全到达 watcher:pending/resolved 走在跑 emitter(Task 1 emit 扇
+// 出自动覆盖,本测试钉住该契约),sync 与 close 的 cancelled 走显式旁路扇出。
+func TestAgentAIWatchApprovalFourFrameClasses(t *testing.T) {
+	m := newAgentAIManager()
+	emitter, owner := newWatchableTestSession(t, m, "s-1")
+	rec := &emitterWatchRecorder{}
+	m.watch(map[string]interface{}{"session_id": "s-1", "conn_id": "c1"}, rec.write)
+	insertPendingTestApproval(m, "s-1", "ap-1")
+
+	// pending:审批请求帧经 emitter 属主写路径发出。
+	if err := emitter.emit(map[string]interface{}{
+		"type":        models.AgentEventAIApprovalRequest,
+		"session_id":  "s-1",
+		"message_id":  "msg-1",
+		"approval_id": "ap-1",
+		"kind":        models.AgentAIApprovalKindTool,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// resolved:属主响应后 run 侧回写的 resolved 帧,同样经 emitter。
+	if err := emitter.emit(map[string]interface{}{
+		"type":        models.AgentEventAIApprovalRequest,
+		"session_id":  "s-1",
+		"message_id":  "msg-1",
+		"approval_id": "ap-1",
+		"status":      "resolved",
+		"decision":    models.AgentAIApprovalDecisionAccept,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitForWatchCond(t, 2*time.Second, "watcher to receive pending+resolved via emitter", func() bool {
+		return len(rec.snapshot()) == 2
+	})
+
+	// sync:socket 级对账帧,显式旁路扇出到 watcher。
+	syncRec := &emitterWatchRecorder{}
+	m.emitApprovalSync(syncRec.write)
+	if n := len(syncRec.snapshot()); n != 1 {
+		t.Fatalf("owner sync frames = %d, want 1", n)
+	}
+	waitForWatchCond(t, 2*time.Second, "watcher to receive ai.approval.sync", func() bool {
+		for _, frame := range rec.snapshot() {
+			if frame["type"] == models.AgentEventAIApprovalSync {
+				return true
+			}
+		}
+		return false
+	})
+
+	// cancelled + 终态:close 用裸 writer 写 cancelled(显式扇出),终态经
+	// activeWriter=emitter(自动扇出)。
+	closer := &emitterWatchRecorder{}
+	m.close(map[string]interface{}{"session_id": "s-1"}, closer.write)
+	waitForWatchCond(t, 2*time.Second, "watcher to receive ai.approval.cancelled and ai.session.closed", func() bool {
+		var cancelled, closed bool
+		for _, frame := range rec.snapshot() {
+			switch frame["type"] {
+			case models.AgentEventAIApprovalCancelled:
+				cancelled = true
+			case models.AgentEventAISessionClosed:
+				closed = true
+			}
+		}
+		return cancelled && closed
+	})
+	var cancelledIdx, closedIdx = -1, -1
+	for i, frame := range rec.snapshot() {
+		switch frame["type"] {
+		case models.AgentEventAIApprovalCancelled:
+			cancelledIdx = i
+			ids, _ := frame["approval_ids"].([]string)
+			if len(ids) != 1 || ids[0] != "ap-1" {
+				t.Fatalf("cancelled approval_ids = %#v, want [ap-1]", frame["approval_ids"])
+			}
+		case models.AgentEventAISessionClosed:
+			closedIdx = i
+		}
+	}
+	if cancelledIdx == -1 || closedIdx == -1 {
+		t.Fatalf("cancelled idx=%d closed idx=%d, both required", cancelledIdx, closedIdx)
+	}
+	// 同一 sink 队列入队即保序:watcher 先见 cancelled 再见终态。
+	if cancelledIdx > closedIdx {
+		t.Fatalf("watcher saw cancelled (%d) after session closed (%d)", cancelledIdx, closedIdx)
+	}
+	if len(owner.snapshot()) == 0 {
+		t.Fatal("owner received nothing from the approval/close flow")
+	}
+}
+
+// unwatch 即时停帧:unwatch 后在跑 emitter 的下一帧不得再到达(unwatch 处理
+// 器补裁剪在跑拷贝——「unwatch 即时停帧」严格成立)。
+func TestAgentAIUnwatchPrunesRunningEmitterCopy(t *testing.T) {
+	m := newAgentAIManager()
+	emitter, _ := newWatchableTestSession(t, m, "s-1")
+	rec := &emitterWatchRecorder{}
+	m.watch(map[string]interface{}{"session_id": "s-1", "conn_id": "c1"}, rec.write)
+	if err := emitter.emit(emitterWatchPayload(models.AgentEventAIDelta, "s-1", 1)); err != nil {
+		t.Fatal(err)
+	}
+	waitForWatchCond(t, 2*time.Second, "first frame", func() bool { return len(rec.snapshot()) == 1 })
+
+	m.unwatch(map[string]interface{}{"session_id": "s-1", "conn_id": "c1"}, rec.write)
+	if err := emitter.emit(emitterWatchPayload(models.AgentEventAIDelta, "s-1", 2)); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if got := len(rec.snapshot()); got != 1 {
+		t.Fatalf("watcher received %d frames after unwatch, want 1 (immediate stop)", got)
+	}
+}
+
+// R1 弱网语义:缓冲打满双摘后,该连接收到一次性 ai.session.watch.dropped
+// 通知帧(尽力而为,收到即知该重新 watch)。
+func TestAgentAIWatchDroppedNotificationOnQueueFull(t *testing.T) {
+	m := newAgentAIManager()
+	emitter, _ := newWatchableTestSession(t, m, "s-1")
+	gate := make(chan struct{})
+	rec := &emitterWatchRecorder{}
+	slow := agentTerminalWriter(func(value interface{}) error {
+		if value.(map[string]interface{})["type"] == models.AgentEventAISessionWatchDropped {
+			rec.write(value) // 通知帧直达,不参与限流
+			return nil
+		}
+		<-gate
+		rec.write(value)
+		return nil
+	})
+	m.watch(map[string]interface{}{"session_id": "s-1", "conn_id": "c1"}, slow)
+
+	// 第 1 帧进 pump 并卡在写桩;灌满 64 帧缓冲,第 66 帧触发满即摘。
+	if err := emitter.emit(emitterWatchPayload(models.AgentEventAIDelta, "s-1", 1)); err != nil {
+		t.Fatal(err)
+	}
+	waitForWatchCond(t, 2*time.Second, "pump to pick up the first frame", func() bool {
+		emitter.watchMu.Lock()
+		defer emitter.watchMu.Unlock()
+		sink, ok := emitter.watchers["c1"]
+		return ok && len(sink.ch) == 0
+	})
+	for n := 2; n <= agentAIWatcherQueueCap+2; n++ {
+		if err := emitter.emit(emitterWatchPayload(models.AgentEventAIDelta, "s-1", n)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitForWatchCond(t, 2*time.Second, "dropped notification frame", func() bool {
+		for _, frame := range rec.snapshot() {
+			if frame["type"] == models.AgentEventAISessionWatchDropped {
+				return true
+			}
+		}
+		return false
+	})
+	for _, frame := range rec.snapshot() {
+		if frame["type"] == models.AgentEventAISessionWatchDropped {
+			if frame["session_id"] != "s-1" {
+				t.Fatalf("dropped frame session_id = %v, want s-1", frame["session_id"])
+			}
+			if !strings.Contains(fmt.Sprint(frame["reason"]), "queue full") {
+				t.Fatalf("dropped frame reason = %v, want queue full", frame["reason"])
+			}
+		}
+	}
+	close(gate)
+}
+
+// R5:注册表超 cap 走 LRU 摘除,被摘连接收到 dropped 通知(否则它无从知道
+// 自己已失联,页面会静默黑屏到下一次重连)。
+func TestAgentAIWatcherRegistryCapLRUEvictsOldest(t *testing.T) {
+	m := newAgentAIManager()
+	newWatchableTestSession(t, m, "s-1")
+	evicted := &emitterWatchRecorder{}
+	m.watch(map[string]interface{}{"session_id": "s-1", "conn_id": "conn-0"}, evicted.write)
+	fill := &emitterWatchRecorder{}
+	for i := 1; i <= agentAIWatcherRegistryCap-1; i++ {
+		m.watch(map[string]interface{}{"session_id": "s-1", "conn_id": fmt.Sprintf("conn-%d", i)}, fill.write)
+	}
+	snap := m.sessionWatchersSnapshot("s-1")
+	if len(snap) != agentAIWatcherRegistryCap {
+		t.Fatalf("registry size = %d, want cap %d", len(snap), agentAIWatcherRegistryCap)
+	}
+	if _, ok := snap["conn-0"]; !ok {
+		t.Fatal("conn-0 evicted before cap was exceeded")
+	}
+
+	// 超 cap:最老的 conn-0 被摘,收到 dropped 通知;新 conn 留下。
+	fresh := &emitterWatchRecorder{}
+	m.watch(map[string]interface{}{"session_id": "s-1", "conn_id": "conn-new"}, fresh.write)
+	snap = m.sessionWatchersSnapshot("s-1")
+	if _, ok := snap["conn-0"]; ok {
+		t.Fatal("oldest watcher survived over-cap registration")
+	}
+	if _, ok := snap["conn-new"]; !ok {
+		t.Fatal("newest watcher missing after LRU eviction")
+	}
+	waitForWatchCond(t, 2*time.Second, "evicted conn to receive the dropped notification", func() bool {
+		return len(evicted.snapshot()) > 0
+	})
+	if frame := evicted.snapshot()[0]; frame["type"] != models.AgentEventAISessionWatchDropped {
+		t.Fatalf("evicted frame type = %v, want %s", frame["type"], models.AgentEventAISessionWatchDropped)
+	}
 }

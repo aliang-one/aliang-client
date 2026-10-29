@@ -35,6 +35,9 @@ const (
 	AgentEventTerminalSessions        = "terminal.sessions" // agent→server: full set of LIVE sessions, broadcast after registration ack so the server can converge its stale records
 	AgentEventAISessionCreate         = "ai.session.create"
 	AgentEventAISessionCreated        = "ai.session.created"
+	AgentEventAISessionWatch          = "ai.session.watch"         // local chat socket → agent: 订阅某会话的事件直播;conn_id 由 HandleAIStream 注入(服务端铸造,客户端不可伪造)
+	AgentEventAISessionUnwatch        = "ai.session.unwatch"       // local chat socket → agent: 退订;幂等
+	AgentEventAISessionWatchDropped   = "ai.session.watch.dropped" // agent → watcher 连接: 该订阅被摘(缓冲打满/写错/LRU 淘汰)。一次性尽力而为,客户端收到即应重新 watch
 	AgentEventAISessionClose          = "ai.session.close"
 	AgentEventAISessionClosed         = "ai.session.closed"
 	AgentEventAIMessage               = "ai.message"
@@ -292,6 +295,12 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				{Type: AgentEventAITuiSync, Required: []string{"type", "session_id", "source_session_id", "digest"}, Optional: []string{"project_path"}, Emits: nil},
 				{Type: AgentEventAIRename, Required: []string{"type", "session_id", "title"}, Optional: []string{"project_path", "provider", "tool", "source_session_id", "resume_session_id"}, Emits: []string{AgentEventAIRenameAck}},
 				{Type: AgentEventAISessionClose, Required: []string{"type", "session_id"}, Emits: []string{AgentEventAISessionClosed}},
+				// watch/unwatch 目前仅本地聊天 socket(56433 /api/agent/ai/stream):
+				// conn_id 是服务端在 HandleAIStream 铸造后注入的连接标识,客户端
+				// 不发也不可伪造,故列为 Optional。dropped 是 agent 对被摘订阅的
+				// 单向通知(无法回执,重试无意义),reason 说明摘除原因。
+				{Type: AgentEventAISessionWatch, Required: []string{"type", "session_id"}, Optional: []string{"conn_id", "message_id"}, Emits: []string{AgentEventAIError, AgentEventAISessionWatchDropped}},
+				{Type: AgentEventAISessionUnwatch, Required: []string{"type", "session_id"}, Optional: []string{"conn_id", "message_id"}},
 				{Type: AgentEventFileList, Required: []string{"type", "request_id", "project_path", "path"}, Optional: []string{"max_entries"}, Emits: []string{AgentEventFileListResult, AgentEventFileError}},
 				{Type: AgentEventFileRead, Required: []string{"type", "request_id", "project_path", "path"}, Optional: []string{"max_bytes"}, Emits: []string{AgentEventFileReadResult, AgentEventFileError}},
 				{Type: AgentEventFileUpload, Required: []string{"type", "request_id", "project_path", "path", "upload_url", "max_bytes"}, Emits: []string{AgentEventFileUploadProgress, AgentEventFileUploadResult, AgentEventFileError}},

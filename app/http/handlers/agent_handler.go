@@ -107,6 +107,11 @@ func (h *AgentHandler) HandleAIStream(w http.ResponseWriter, r *http.Request) {
 		if err := conn.ReadJSON(&msg); err != nil {
 			return
 		}
+		if msg != nil {
+			// 服务端铸造的连接标识随消息下发:ai.session.watch/unwatch 以它为
+			// 注册表键,客户端不发也不可伪造;断线反注销按同一键一次清干净。
+			msg["conn_id"] = connID
+		}
 		h.service.DispatchLocalAI(msg, writeJSON)
 	}
 }

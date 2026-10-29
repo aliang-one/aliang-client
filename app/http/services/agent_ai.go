@@ -44,10 +44,10 @@ type agentAIManager struct {
 	bindings           map[string]agentAIBindingRecord
 	processedRuns      map[string]agentAIProcessedRun
 	// sessionWatchers 是「谁在围观哪个会话」的唯一持久注册表:
-	// sessionID -> connID -> 该连接的事件写出函数。与 sessions 生命周期解耦
-	// (会话被逐出/终态后注册表仍在),这样下一个 run 构造 emitter 时能重新
-	// 播种,watcher 天然跟随后续所有 run。写访问一律持 m.mu。
-	sessionWatchers map[string]map[string]agentTerminalWriter
+	// sessionID -> connID -> watcher 条目。与 sessions 生命周期解耦(会话被逐
+	// 出/终态后注册表仍在),这样下一个 run 构造 emitter 时能重新播种,watcher
+	// 天然跟随后续所有 run。写访问一律持 m.mu。
+	sessionWatchers map[string]map[string]*agentSessionWatcher
 	// coreJournal 是 agentcore（AliangCode）调用记录落盘器；dir 为空时内部
 	// 全 no-op。构造时解析一次 agentHome()。
 	coreJournal *agentCoreJournal
@@ -307,9 +307,13 @@ type agentAISession struct {
 	// isGoalFork marks a fork (re-planning exploration) session. #5: its runs are
 	// forced read-only (run.readOnly) so exploration can't mutate the workspace —
 	// real provider-level enforcement, not just a prompt.
-	isGoalFork    bool
-	cancel        context.CancelFunc
-	activeWriter  agentTerminalWriter
+	isGoalFork   bool
+	cancel       context.CancelFunc
+	activeWriter agentTerminalWriter
+	// activeEmitter 是本会话当前在跑回合的 emitter(activeWriter 的宿主)。
+	// watch 中途订阅(R2)靠它把新 watcher 立即补种进在跑拷贝,不必等到下一
+	// 个 run;clearRunning 收尾置 nil。
+	activeEmitter *agentAIRunEmitter
 	approvalToken string
 	activity      *agentAIActivity
 	// guard 是本回合的收尾守卫（kill 观测 + 宽限强拆）。clearRunning 清空。
@@ -479,6 +483,20 @@ type agentAIAttachment struct {
 // watcher 靠它被识别并移除,绝不反压 run。
 const agentAIWatcherQueueCap = 64
 
+// agentAIWatcherRegistryCap 是全部会话 watcher 注册表的总条目上限。依据:现
+// 实里是少数管理端连接(56431 仪表盘 + 手机)× 每连接个位数会话,128 远超真
+// 实需求;它是断线反注销失效时的防泄漏安全阀,不是工作集策略——被 LRU 摘掉
+// 的连接会收到一次性 ai.session.watch.dropped 通知,客户端据此重新 watch。
+const agentAIWatcherRegistryCap = 128
+
+// agentSessionWatcher 是注册表里的一个 watcher 条目。lastWatchAt 只在
+// watch/重 watch 时刷新(逐帧刷新要每帧抢 m.mu,太烫);LRU 摘除按它排序。
+type agentSessionWatcher struct {
+	connID      string
+	write       agentTerminalWriter
+	lastWatchAt time.Time
+}
+
 // agentSessionWatchSink 是一个 watcher 连接在本 run 内的投递通道:常驻
 // goroutine 从 ch 取帧写给对端,写失败或缓冲打满即整体摘除。removed 在
 // sink 被摘除时关闭,goroutine 清空残余帧后退出(不再阻塞泄漏)。
@@ -594,7 +612,9 @@ func (e *agentAIRunEmitter) pumpWatchSink(sink *agentSessionWatchSink) {
 }
 
 // dropWatchSink 把一个 watcher 从 emitter 拷贝与 manager 注册表同时摘除并
-// 打 Warn。同一 sink 只会被第一个到达的摘除者处理一次(removed 也只关一次)。
+// 打 Warn,同时向该连接尽力投递一次 dropped 通知(R1:收到即知该重新 watch;
+// 异步 spawn——本函数可能在 e.mu 内被调,通知写绝不占主写路径)。同一 sink
+// 只会被第一个到达的摘除者处理一次(removed 也只关一次)。
 // 锁序:e.mu(调用方)→ watchMu → m.mu;任何路径都不反向。
 func (e *agentAIRunEmitter) dropWatchSink(sink *agentSessionWatchSink, reason string) {
 	e.watchMu.Lock()
@@ -609,13 +629,64 @@ func (e *agentAIRunEmitter) dropWatchSink(sink *agentSessionWatchSink, reason st
 		e.mgr.unwatchSession(e.sessionID, sink.connID)
 	}
 	logger.Warn(fmt.Sprintf("[ai.session.watch] dropped session=%s conn=%s reason=%s", e.sessionID, sink.connID, reason))
+	go notifySessionWatchDropped(e.sessionID, sink.writer, reason)
+}
+
+// attachWatch 在 run 进行中把一条 watcher 补种进拷贝(R2 中途订阅:页面中途
+// 打开不再静默等到下一 run)。已存在的 connID 是 no-op(R6:重复 watch 对在
+// 跑 run 的拷贝无效,不产生重复帧)。
+func (e *agentAIRunEmitter) attachWatch(connID string, write agentTerminalWriter) {
+	connID = strings.TrimSpace(connID)
+	if connID == "" || write == nil {
+		return
+	}
+	e.watchMu.Lock()
+	if _, ok := e.watchers[connID]; ok {
+		e.watchMu.Unlock()
+		return
+	}
+	sink := &agentSessionWatchSink{
+		connID:  connID,
+		writer:  write,
+		ch:      make(chan map[string]interface{}, agentAIWatcherQueueCap),
+		removed: make(chan struct{}),
+	}
+	e.watchers[connID] = sink
+	e.watchMu.Unlock()
+	go e.pumpWatchSink(sink)
+}
+
+// detachWatch 从拷贝移除一个 watcher(unwatch/断线的即时停帧路径)。不回删
+// manager 注册表(调用方已处理),不打 dropped 通知(主动退订无需惊动客户端)。
+// 返回是否真的移除了条目。
+func (e *agentAIRunEmitter) detachWatch(connID string) bool {
+	e.watchMu.Lock()
+	sink, ok := e.watchers[connID]
+	if ok {
+		delete(e.watchers, connID)
+		close(sink.removed)
+	}
+	e.watchMu.Unlock()
+	return ok
 }
 
 // fanOutWatchers 把一帧投给所有 watcher:非阻塞 try-send(绝不阻塞主写路径,
 // 缓冲打满即摘)+ 每 watcher 独立浅拷贝(异步写不与属主/后续 emit 共享同一
 // map)。必须在 e.mu 内调用——保证 watcher 与属主看到同一 event_seq 序。
-// 缓冲打满的摘除在释放 watchMu 后统一执行,避免持锁重入 dropWatchSink。
 func (e *agentAIRunEmitter) fanOutWatchers(payload map[string]interface{}) {
+	e.fanOutLocked(payload)
+}
+
+// fanOutOutOfBand 把不带 run 序号的旁路帧(审批 cancelled/sync 等)投给
+// watcher 拷贝。不持 e.mu:这些帧不经 run 屏障、不参与 event_seq 序(属主收
+// 到的也是同一份裸帧),唯一共享约束是 watchMu 保护的拷贝遍历与摘除。
+func (e *agentAIRunEmitter) fanOutOutOfBand(payload map[string]interface{}) {
+	e.fanOutLocked(payload)
+}
+
+// fanOutLocked 是两条扇出入口共用的实现:非阻塞 try-send + 满即摘,摘除在
+// 释放 watchMu 后统一执行,避免持锁重入 dropWatchSink。
+func (e *agentAIRunEmitter) fanOutLocked(payload map[string]interface{}) {
 	var dropped []*agentSessionWatchSink
 	e.watchMu.Lock()
 	for _, sink := range e.watchers {
@@ -1140,7 +1211,7 @@ func newAgentAIManager() *agentAIManager {
 		pendingTerminals:   make(map[string]map[string]interface{}),
 		bindings:           make(map[string]agentAIBindingRecord),
 		processedRuns:      make(map[string]agentAIProcessedRun),
-		sessionWatchers:    make(map[string]map[string]agentTerminalWriter),
+		sessionWatchers:    make(map[string]map[string]*agentSessionWatcher),
 		coreJournal:        newAgentCoreJournal(agentCoreJournalDir()),
 	}
 	return m
@@ -1175,7 +1246,10 @@ func (m *agentAIManager) runEmitter(run agentAIRun, write agentTerminalWriter) *
 }
 
 // watchSession 把一条连接登记为某会话的 watcher(跨 run 持久)。同 connID 重
-// 复登记直接覆盖(幂等)。持 m.mu,与 manager 其余注册表同一锁纪律。
+// 复登记刷新 LRU 时间戳(幂等)。超总 cap 时按 lastWatchAt LRU 摘除最老条目
+// 并向被摘连接尽力投递一次 dropped 通知。持 m.mu;写入方保证 writer 已带写
+// 期限(HandleAIStream 的 writeJSON 为每次写设 5s deadline——watcher 写绝不
+// 无限阻塞 pump)。
 func (m *agentAIManager) watchSession(sessionID, connID string, write agentTerminalWriter) {
 	sessionID = strings.TrimSpace(sessionID)
 	connID = strings.TrimSpace(connID)
@@ -1186,21 +1260,48 @@ func (m *agentAIManager) watchSession(sessionID, connID string, write agentTermi
 	defer m.mu.Unlock()
 	conns := m.sessionWatchers[sessionID]
 	if conns == nil {
-		conns = make(map[string]agentTerminalWriter)
+		conns = make(map[string]*agentSessionWatcher)
 		m.sessionWatchers[sessionID] = conns
 	}
-	conns[connID] = write
+	if _, exists := conns[connID]; !exists && m.totalSessionWatchersLocked() >= agentAIWatcherRegistryCap {
+		m.evictOldestSessionWatcherLocked()
+	}
+	conns[connID] = &agentSessionWatcher{connID: connID, write: write, lastWatchAt: time.Now()}
 }
 
-// unwatchSession 摘除一条连接对某会话的 watch;不存在的组合是 no-op。
-func (m *agentAIManager) unwatchSession(sessionID, connID string) {
-	sessionID = strings.TrimSpace(sessionID)
-	connID = strings.TrimSpace(connID)
-	if sessionID == "" || connID == "" {
+// totalSessionWatchersLocked 统计注册表总条目数。调用方必须持 m.mu。
+func (m *agentAIManager) totalSessionWatchersLocked() int {
+	total := 0
+	for _, conns := range m.sessionWatchers {
+		total += len(conns)
+	}
+	return total
+}
+
+// evictOldestSessionWatcherLocked 按 lastWatchAt 摘除全局最老的 watcher 条目,
+// 并异步向被摘连接投递一次 dropped 通知(通知 goroutine 不碰 m.mu,持锁期间
+// spawn 安全;writer 带 5s deadline,不会无限挂)。调用方必须持 m.mu。
+func (m *agentAIManager) evictOldestSessionWatcherLocked() {
+	var oldestSessionID string
+	var oldest *agentSessionWatcher
+	for sessionID, conns := range m.sessionWatchers {
+		for _, w := range conns {
+			if oldest == nil || w.lastWatchAt.Before(oldest.lastWatchAt) {
+				oldestSessionID = sessionID
+				oldest = w
+			}
+		}
+	}
+	if oldest == nil {
 		return
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.removeSessionWatcherLocked(oldestSessionID, oldest.connID)
+	go notifySessionWatchDropped(oldestSessionID, oldest.write, "registry cap: lru eviction")
+}
+
+// removeSessionWatcherLocked 从注册表摘除单条目,空组连带删除。调用方必须持
+// m.mu。
+func (m *agentAIManager) removeSessionWatcherLocked(sessionID, connID string) {
 	conns := m.sessionWatchers[sessionID]
 	if conns == nil {
 		return
@@ -1211,23 +1312,48 @@ func (m *agentAIManager) unwatchSession(sessionID, connID string) {
 	}
 }
 
+// unwatchSession 摘除一条连接对某会话的 watch,并同步裁剪该会话在跑 emitter
+// 的 watcher 拷贝——「unwatch 即时停帧」对在跑 run 也要成立。不存在的组合是
+// no-op。锁纪律:m.mu(取指针)释放后再取 emitter 的 watchMu,任何路径都不
+// 同时持有两把锁,与 emit 期的 e.mu → watchMu → m.mu 顺序无环。
+func (m *agentAIManager) unwatchSession(sessionID, connID string) {
+	sessionID = strings.TrimSpace(sessionID)
+	connID = strings.TrimSpace(connID)
+	if sessionID == "" || connID == "" {
+		return
+	}
+	m.mu.Lock()
+	m.removeSessionWatcherLocked(sessionID, connID)
+	var emitter *agentAIRunEmitter
+	if session := m.sessions[sessionID]; session != nil {
+		emitter = session.activeEmitter
+	}
+	m.mu.Unlock()
+	if emitter != nil {
+		emitter.detachWatch(connID)
+	}
+}
+
 // unwatchSessionConn 按连接反注销:一条 socket 断开时,把它名下对全部会话的
-// watch 一次清干净(读循环退出处调用)。
+// watch 一次清干净(读循环退出处调用),并裁剪所有在跑 emitter 的拷贝。
 func (m *agentAIManager) unwatchSessionConn(connID string) {
 	connID = strings.TrimSpace(connID)
 	if connID == "" {
 		return
 	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	for sessionID, conns := range m.sessionWatchers {
-		if _, ok := conns[connID]; !ok {
-			continue
+	for sessionID := range m.sessionWatchers {
+		m.removeSessionWatcherLocked(sessionID, connID)
+	}
+	emitters := make([]*agentAIRunEmitter, 0, len(m.sessions))
+	for _, session := range m.sessions {
+		if session != nil && session.activeEmitter != nil {
+			emitters = append(emitters, session.activeEmitter)
 		}
-		delete(conns, connID)
-		if len(conns) == 0 {
-			delete(m.sessionWatchers, sessionID)
-		}
+	}
+	m.mu.Unlock()
+	for _, emitter := range emitters {
+		emitter.detachWatch(connID)
 	}
 }
 
@@ -1241,10 +1367,107 @@ func (m *agentAIManager) sessionWatchersSnapshot(sessionID string) map[string]ag
 		return nil
 	}
 	out := make(map[string]agentTerminalWriter, len(conns))
-	for connID, write := range conns {
-		out[connID] = write
+	for connID, watcher := range conns {
+		out[connID] = watcher.write
 	}
 	return out
+}
+
+// notifySessionWatchDropped 向一条 watcher 连接尽力投递一次 dropped 通知
+// (R1 弱网语义:满即摘/写错/LRU 摘除后,收到即知该重新 watch)。写失败忽略
+// 且绝不重试——writer 自带 5s deadline,最坏有界阻塞。
+func notifySessionWatchDropped(sessionID string, write agentTerminalWriter, reason string) {
+	if write == nil {
+		return
+	}
+	_ = write(map[string]interface{}{
+		"type":       models.AgentEventAISessionWatchDropped,
+		"session_id": sessionID,
+		"reason":     reason,
+	})
+}
+
+// watch 处理 ai.session.watch:把本连接登记为会话 watcher。本任务只认
+// manager 内存可解析的会话(磁盘解析 Task 3 开放),解析不到一律
+// ai.error session not found——绝不静默建壳,防上下文分叉。命中则登记并在
+// 有在跑 run 时立即补种 emitter 拷贝(R2)。成功不回执(无 ai.error 即成功)。
+func (m *agentAIManager) watch(msg map[string]interface{}, writeJSON agentTerminalWriter) {
+	if writeJSON == nil {
+		return
+	}
+	sessionID := remoteString(msg, "session_id")
+	connID := remoteString(msg, "conn_id")
+	messageID := remoteString(msg, "message_id")
+	if sessionID == "" || connID == "" {
+		_ = writeJSON(agentAIErrorPayload(sessionID, messageID, errors.New("ai.session.watch missing session_id or conn_id")))
+		return
+	}
+	m.mu.Lock()
+	_, active := m.sessions[sessionID]
+	m.mu.Unlock()
+	if !active {
+		_ = writeJSON(map[string]interface{}{
+			"type":       models.AgentEventAIError,
+			"session_id": sessionID,
+			"message_id": messageID,
+			"error":      fmt.Sprintf("ai.session.watch: session not found: %s", sessionID),
+		})
+		return
+	}
+	m.attachSessionWatch(sessionID, connID, writeJSON)
+}
+
+// unwatch 处理 ai.session.unwatch:幂等退订(注册表 + 在跑 emitter 拷贝一起
+// 裁剪),无回执。
+func (m *agentAIManager) unwatch(msg map[string]interface{}, writeJSON agentTerminalWriter) {
+	if writeJSON == nil {
+		return
+	}
+	sessionID := remoteString(msg, "session_id")
+	connID := remoteString(msg, "conn_id")
+	if sessionID == "" || connID == "" {
+		_ = writeJSON(agentAIErrorPayload(sessionID, remoteString(msg, "message_id"), errors.New("ai.session.unwatch missing session_id or conn_id")))
+		return
+	}
+	m.unwatchSession(sessionID, connID)
+}
+
+// attachSessionWatch 登记注册表 + 对在跑 emitter 立即补种(R2 中途订阅)。
+func (m *agentAIManager) attachSessionWatch(sessionID, connID string, write agentTerminalWriter) {
+	m.watchSession(sessionID, connID, write)
+	m.mu.Lock()
+	var emitter *agentAIRunEmitter
+	if session := m.sessions[sessionID]; session != nil {
+		emitter = session.activeEmitter
+	}
+	m.mu.Unlock()
+	if emitter != nil {
+		emitter.attachWatch(connID, write)
+	}
+}
+
+// fanOutSessionWatchFrame 把一帧旁路投给某会话的全部 watcher(审批
+// cancelled/sync 等不经 emitter.emit 的裸帧)。优先走该会话在跑 emitter 的
+// sink 通道(Task 1 同一异步机制、同一满即摘纪律);无在跑 emitter 时退化为
+// 每 watcher 一条一次性 goroutine(注册 writer 带 5s 写期限,有界)。
+func (m *agentAIManager) fanOutSessionWatchFrame(sessionID string, payload map[string]interface{}) {
+	if payload == nil {
+		return
+	}
+	m.mu.Lock()
+	var emitter *agentAIRunEmitter
+	if session := m.sessions[sessionID]; session != nil {
+		emitter = session.activeEmitter
+	}
+	m.mu.Unlock()
+	if emitter != nil {
+		emitter.fanOutOutOfBand(payload)
+		return
+	}
+	for _, write := range m.sessionWatchersSnapshot(sessionID) {
+		frame := cloneAgentAIMap(payload)
+		go func(w agentTerminalWriter) { _ = w(frame) }(write)
+	}
 }
 
 // registerAISessionLocked stores a new session, evicting the oldest idle
@@ -2938,6 +3161,7 @@ func (m *agentAIManager) runUserMessage(session *agentAISession, runID, messageI
 	m.mu.Lock()
 	session.cancel = cancel
 	session.activeWriter = writeJSON
+	session.activeEmitter = emitter
 	session.approvalToken = approvalToken
 	session.activity = activity
 	session.runSeq++
@@ -3053,6 +3277,7 @@ func (m *agentAIManager) runUserMessage(session *agentAISession, runID, messageI
 		// at the same per-run emitter so they share run_id/event_seq and cannot
 		// escape the terminal barrier through the original socket writer.
 		current.activeWriter = emitter.emit
+		current.activeEmitter = emitter
 	}
 	m.mu.Unlock()
 	go m.runCLI(ctx, run, emitter.emit)
@@ -3516,6 +3741,9 @@ func (m *agentAIManager) pendingApprovalsSnapshot() []map[string]interface{} {
 
 // emitApprovalSync sends ai.approval.sync for all still-pending approvals (a
 // no-op when there are none). Used after reconnect and on a periodic ticker.
+// The frame is socket-scoped for the requester, but its pending entries carry
+// session_id — watchers of those sessions get the same frame fanned out so an
+// attached page can render live approval cards without racing its own sync.
 func (m *agentAIManager) emitApprovalSync(writeJSON agentTerminalWriter) {
 	if writeJSON == nil {
 		return
@@ -3524,19 +3752,33 @@ func (m *agentAIManager) emitApprovalSync(writeJSON agentTerminalWriter) {
 	if len(pending) == 0 {
 		return
 	}
-	_ = writeJSON(map[string]interface{}{
+	payload := map[string]interface{}{
 		"type":    models.AgentEventAIApprovalSync,
 		"pending": pending,
-	})
+	}
+	_ = writeJSON(payload)
+	sessions := make(map[string]struct{}, len(pending))
+	for _, entry := range pending {
+		if sessionID := remoteString(entry, "session_id"); sessionID != "" {
+			sessions[sessionID] = struct{}{}
+		}
+	}
+	for sessionID := range sessions {
+		m.fanOutSessionWatchFrame(sessionID, payload)
+	}
 }
 
 // emitApprovalCancelled notifies the server that a dialogue went inactive and
 // its pending approvals were dropped, so the server stops retrying them.
 // Best-effort: callers without a writer (closeAll on shutdown) rely on the
-// server's offline-grace cancellation instead.
-func (m *agentAIManager) emitApprovalCancelled(writeJSON agentTerminalWriter, sessionID string, approvalIDs []string, reason string) {
+// server's offline-grace cancellation instead. Returns the payload it wrote
+// (nil when nothing was written) so raw-writer call sites (ai.session.close)
+// can fan the identical frame to watchers — the run-scoped call sites write
+// through emitter.emit, where Task 1's emit fanout already covers watchers and
+// an extra fan would duplicate.
+func (m *agentAIManager) emitApprovalCancelled(writeJSON agentTerminalWriter, sessionID string, approvalIDs []string, reason string) map[string]interface{} {
 	if writeJSON == nil || sessionID == "" || len(approvalIDs) == 0 {
-		return
+		return nil
 	}
 	payload := map[string]interface{}{
 		"type":         models.AgentEventAIApprovalCancelled,
@@ -3547,6 +3789,7 @@ func (m *agentAIManager) emitApprovalCancelled(writeJSON agentTerminalWriter, se
 		payload["reason"] = reason
 	}
 	_ = writeJSON(payload)
+	return payload
 }
 
 // emitOptionCancelled 在 session 失活（close 等）时，best-effort 通知服务端作废待选。
@@ -3606,12 +3849,24 @@ func (m *agentAIManager) close(msg map[string]interface{}, writeJSON agentTermin
 	}
 	var cancel context.CancelFunc
 	var runWrite agentTerminalWriter
+	var terminalEmitter *agentAIRunEmitter
 	if session != nil {
 		cancel = session.cancel
 		runWrite = session.activeWriter
+		terminalEmitter = session.activeEmitter
 	}
 	m.mu.Unlock()
-	m.emitApprovalCancelled(writeJSON, sessionID, cancelled, "session_closed")
+	// close 的 writeJSON 是发起方的裸 socket writer,不经 emitter——cancelled
+	// 帧在这里显式扇出给 watcher。有在跑 emitter 时直接入它的 sink 队列,
+	// 抢在随后的 ai.session.closed 终态之前(同队保序);终态经
+	// activeWriter(=emitter)发布,由 Task 1 的 emit 扇出天然覆盖,勿重复扇。
+	if cancelledPayload := m.emitApprovalCancelled(writeJSON, sessionID, cancelled, "session_closed"); cancelledPayload != nil {
+		if terminalEmitter != nil {
+			terminalEmitter.fanOutOutOfBand(cancelledPayload)
+		} else {
+			m.fanOutSessionWatchFrame(sessionID, cancelledPayload)
+		}
+	}
 	m.emitOptionCancelled(writeJSON, sessionID, cancelledOptions, "session_closed")
 
 	if runWrite == nil {
@@ -4171,6 +4426,7 @@ func (m *agentAIManager) clearRunning(sessionID string, runSeq int, writeJSON ag
 		coreSteerControl = session.coreSteer
 		session.cancel = nil
 		session.activeWriter = nil
+		session.activeEmitter = nil
 		session.approvalToken = ""
 		session.activity = nil
 		if session.guard != nil {
