@@ -531,10 +531,16 @@ type agentAIRunEmitter struct {
 	// watcher 异步扇出(跨端同权直播):watchers 是 manager 注册表在构造时的
 	// 拷贝,由 watchMu 保护(独立于 e.mu——扇出绝不阻塞主写路径)。mgr 用于
 	// 摘除时同步回删 manager 注册表;sessionID 供日志与回删定位。
-	mgr       *agentAIManager
-	sessionID string
-	watchMu   sync.Mutex
-	watchers  map[string]*agentSessionWatchSink
+	// watchTerminated 在终态清拷贝时一次性关闭:attachWatch(R2 中途订阅)据
+	// 此对已终态的 emitter no-op——毫秒窗内「探测时未终态、插入后清拷贝已跑
+	// 过」的竞窗若不设防, sink 会插进死 emitter,removed 永不关,pump 永久
+	// park。与 clearWatcherCopies 同持 watchMu,无竞窗。
+	mgr             *agentAIManager
+	sessionID       string
+	watchMu         sync.Mutex
+	watchers        map[string]*agentSessionWatchSink
+	watchTerminated chan struct{}
+	watchClosedOnce sync.Once
 }
 
 func newAgentAIRunEmitter(run agentAIRun, write agentTerminalWriter) *agentAIRunEmitter {
@@ -552,6 +558,7 @@ func newAgentAIRunEmitter(run agentAIRun, write agentTerminalWriter) *agentAIRun
 		goalAllowedRoots:       run.goalAllowedRoots,
 		goalAllowedCommands:    run.goalAllowedCommands,
 		watchers:               make(map[string]*agentSessionWatchSink),
+		watchTerminated:        make(chan struct{}),
 	}
 }
 
@@ -634,13 +641,21 @@ func (e *agentAIRunEmitter) dropWatchSink(sink *agentSessionWatchSink, reason st
 
 // attachWatch 在 run 进行中把一条 watcher 补种进拷贝(R2 中途订阅:页面中途
 // 打开不再静默等到下一 run)。已存在的 connID 是 no-op(R6:重复 watch 对在
-// 跑 run 的拷贝无效,不产生重复帧)。
+// 跑 run 的拷贝无效,不产生重复帧);已终态的 emitter 同样 no-op(Y1 同源防
+// 御:watchTerminated 已关 = 拷贝已清,再插 sink 就是 parked pump 泄漏)——
+// 调用方(manager 层)此时只登记注册表,等下一 run 播种。
 func (e *agentAIRunEmitter) attachWatch(connID string, write agentTerminalWriter) {
 	connID = strings.TrimSpace(connID)
 	if connID == "" || write == nil {
 		return
 	}
 	e.watchMu.Lock()
+	select {
+	case <-e.watchTerminated:
+		e.watchMu.Unlock()
+		return
+	default:
+	}
 	if _, ok := e.watchers[connID]; ok {
 		e.watchMu.Unlock()
 		return
@@ -707,15 +722,17 @@ func (e *agentAIRunEmitter) fanOutLocked(payload map[string]interface{}) {
 }
 
 // clearWatcherCopies 只清 emitter 拷贝并让投递 goroutine 排空退出;manager
-// 注册表不动(watcher 跨 run 持久,下一 run 播种仍在)。终态时调用。
+// 注册表不动(watcher 跨 run 持久,下一 run 播种仍在)。终态时调用。一次性
+// 关闭 watchTerminated,给 attachWatch 的终态防御供旗标。
 func (e *agentAIRunEmitter) clearWatcherCopies() {
 	e.watchMu.Lock()
 	sinks := e.watchers
 	e.watchers = make(map[string]*agentSessionWatchSink)
+	e.watchClosedOnce.Do(func() { close(e.watchTerminated) })
+	e.watchMu.Unlock()
 	for _, sink := range sinks {
 		close(sink.removed)
 	}
-	e.watchMu.Unlock()
 }
 
 func agentAIRunEventTerminal(payload map[string]interface{}) bool {
@@ -1247,9 +1264,10 @@ func (m *agentAIManager) runEmitter(run agentAIRun, write agentTerminalWriter) *
 
 // watchSession 把一条连接登记为某会话的 watcher(跨 run 持久)。同 connID 重
 // 复登记刷新 LRU 时间戳(幂等)。超总 cap 时按 lastWatchAt LRU 摘除最老条目
-// 并向被摘连接尽力投递一次 dropped 通知。持 m.mu;写入方保证 writer 已带写
-// 期限(HandleAIStream 的 writeJSON 为每次写设 5s deadline——watcher 写绝不
-// 无限阻塞 pump)。
+// 并向被摘连接尽力投递一次 dropped 通知。持 m.mu。writer 契约:①已带写期限
+// (HandleAIStream 的 writeJSON 每次写设 5s deadline——watcher 写绝不无限阻
+// 塞 pump);②并发安全——writer 内部自带串行(同一 socket 的 writeMu),
+// 多路扇出(pump/旁路帧/dropped 通知)可并发调用而不撕裂帧。
 func (m *agentAIManager) watchSession(sessionID, connID string, write agentTerminalWriter) {
 	sessionID = strings.TrimSpace(sessionID)
 	connID = strings.TrimSpace(connID)
@@ -1387,10 +1405,14 @@ func notifySessionWatchDropped(sessionID string, write agentTerminalWriter, reas
 	})
 }
 
-// watch 处理 ai.session.watch:把本连接登记为会话 watcher。本任务只认
-// manager 内存可解析的会话(磁盘解析 Task 3 开放),解析不到一律
-// ai.error session not found——绝不静默建壳,防上下文分叉。命中则登记并在
-// 有在跑 run 时立即补种 emitter 拷贝(R2)。成功不回执(无 ai.error 即成功)。
+// watch 处理 ai.session.watch:把本连接登记为会话 watcher。解析与 attach 完
+// 全同一路径(绝不另写一份):内存活跃 → 直接收;内存无 → 磁盘惰性解析
+// (绑定优先/journal 补 agentcore/journal-有-绑定-无拒绝)→ 命中即注册壳再
+// 收;完全未知 → ai.error session not found。
+// J5 语义(写明):会话 close 后重 watch——持久会话经惰性解析重建壳成功,
+// watch 与后续 run 无缝继续;非持久会话 session not found 诚实报错,不静默、
+// 不凭空重建。命中并在跑 run 时立即补种 emitter 拷贝(R2)。成功不回执
+// (无 ai.error 即成功)。
 func (m *agentAIManager) watch(msg map[string]interface{}, writeJSON agentTerminalWriter) {
 	if writeJSON == nil {
 		return
@@ -1406,13 +1428,28 @@ func (m *agentAIManager) watch(msg map[string]interface{}, writeJSON agentTermin
 	_, active := m.sessions[sessionID]
 	m.mu.Unlock()
 	if !active {
-		_ = writeJSON(map[string]interface{}{
-			"type":       models.AgentEventAIError,
-			"session_id": sessionID,
-			"message_id": messageID,
-			"error":      fmt.Sprintf("ai.session.watch: session not found: %s", sessionID),
-		})
-		return
+		shell, rejectReason := m.resolveDurableSessionShell(sessionID)
+		if shell == nil && rejectReason != "" {
+			_ = writeJSON(map[string]interface{}{
+				"type":       models.AgentEventAIError,
+				"session_id": sessionID,
+				"message_id": messageID,
+				"error":      rejectReason,
+			})
+			return
+		}
+		if shell == nil {
+			_ = writeJSON(map[string]interface{}{
+				"type":       models.AgentEventAIError,
+				"session_id": sessionID,
+				"message_id": messageID,
+				"error":      fmt.Sprintf("ai.session.watch: session not found: %s", sessionID),
+			})
+			return
+		}
+		m.mu.Lock()
+		m.registerAISessionLocked(shell)
+		m.mu.Unlock()
 	}
 	m.attachSessionWatch(sessionID, connID, writeJSON)
 }
@@ -1432,7 +1469,8 @@ func (m *agentAIManager) unwatch(msg map[string]interface{}, writeJSON agentTerm
 	m.unwatchSession(sessionID, connID)
 }
 
-// attachSessionWatch 登记注册表 + 对在跑 emitter 立即补种(R2 中途订阅)。
+// attachSessionWatch 登记注册表 + 对在跑 emitter 立即补种(R2 中途订阅;
+// terminal emitter 由 attachWatch 自防 no-op,此处注册表照登——下一 run 播种)。
 func (m *agentAIManager) attachSessionWatch(sessionID, connID string, write agentTerminalWriter) {
 	m.watchSession(sessionID, connID, write)
 	m.mu.Lock()
@@ -1444,6 +1482,74 @@ func (m *agentAIManager) attachSessionWatch(sessionID, connID string, write agen
 	if emitter != nil {
 		emitter.attachWatch(connID, write)
 	}
+}
+
+// attachLiveSession 把来者接入既有会话(内存活跃或惰性壳通用):只登记
+// watcher(带 conn_id 时)+ 可选更新 surface,显式不覆写 provider/model/
+// effort/resumeSessionID/bindingVersion/initialContext 六字段,也不重置
+// history/runSeq——跨端接管的根本纪律:旁观端不得改写属主配置。回执带
+// attached:true 与会话元数据。
+func (m *agentAIManager) attachLiveSession(session *agentAISession, msg map[string]interface{}, writeJSON agentTerminalWriter) {
+	if writeJSON == nil {
+		return
+	}
+	connID := remoteString(msg, "conn_id")
+	surface := normalizeAgentAISurface(remoteString(msg, "surface"))
+	m.mu.Lock()
+	if surface != "" {
+		session.surface = surface
+	}
+	session.lastActiveAt = time.Now().UTC()
+	sessionID := session.id
+	m.mu.Unlock()
+	if connID != "" {
+		m.attachSessionWatch(sessionID, connID, writeJSON)
+	}
+	payload := agentAISessionCreatedPayload(session)
+	payload["attached"] = true
+	_ = writeJSON(payload)
+}
+
+// resolveDurableSessionShell 惰性解析磁盘持久会话为最小安全壳
+// (id/provider/resumeSessionID/bindingVersion/projectPath/model/mode=vibe)。
+// 解析序:持久化绑定(bindingForConversation,全 provider)优先;journal 头行
+// 仅补 agentcore 的 model/project_path(头行只有 agentcore 写)。返回:
+//   - shell != nil          → 命中,调用方注册后走 attachLiveSession;
+//   - shell == nil && reason != "" → 命中痕迹但拒绝(journal 有而绑定无——
+//     没有持久绑定就重建壳会鼓励「换 provider 新开 resume id」的静默上下文
+//     分叉,诚实报错而非默许);
+//   - 两者皆空              → 完全未知,调用方走既有新建。
+func (m *agentAIManager) resolveDurableSessionShell(sessionID string) (shell *agentAISession, rejectReason string) {
+	binding, hasBinding := m.bindingForConversation(sessionID)
+	journalProjectPath, journalModel, hasJournal := m.coreJournal.readSessionHeader(sessionID)
+	if !hasBinding && !hasJournal {
+		return nil, ""
+	}
+	if !hasBinding {
+		return nil, fmt.Sprintf("ai.session.create: session %s has a call journal but no durable binding; refusing to recreate it (context fork guard)", sessionID)
+	}
+	provider, err := normalizeAgentAIProvider(binding.Provider)
+	if err != nil {
+		return nil, fmt.Sprintf("ai.session.create: session %s has a corrupt binding provider %q: %v", sessionID, binding.Provider, err)
+	}
+	result := &agentAISession{
+		id:              sessionID,
+		mode:            "vibe",
+		provider:        provider,
+		resumeSessionID: binding.NativeSessionID,
+		bindingVersion:  binding.BindingVersion,
+		lastActiveAt:    time.Now().UTC(),
+	}
+	if binding.State != "confirmed" {
+		// reserved 态:resume + reserved 同指原生 id,与手机首建形态一致,
+		// confirmBinding 的 expected 取绑定本身,不受此影响。
+		result.reservedNativeSessionID = binding.NativeSessionID
+	}
+	if providersEquivalent(provider, "agentcore") {
+		result.projectPath = journalProjectPath
+		result.model = journalModel
+	}
+	return result, ""
 }
 
 // fanOutSessionWatchFrame 把一帧旁路投给某会话的全部 watcher(审批
@@ -2028,6 +2134,33 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 		_ = writeJSON(agentAIErrorPayload("", "", errors.New("ai.session.create missing session_id")))
 		return
 	}
+
+	// 跨端同权 attach 探测,先于一切新建动作:
+	// ① 内存活跃会话 → attach(只登记 watcher + surface,禁覆写属主六字段);
+	// ② 磁盘持久会话(绑定优先,journal 仅补 agentcore)→ 惰性壳 + attach,
+	//    跳过 resolveAgentAICWD(路径来自磁盘记录,换机接管是常态);
+	// ③ journal 有而绑定无 → 拒绝(防上下文静默分叉);
+	// ④ 完全未知 → 走下方既有新建,行为不变。
+	m.mu.Lock()
+	existing := m.sessions[sessionID]
+	m.mu.Unlock()
+	if existing != nil {
+		m.attachLiveSession(existing, msg, writeJSON)
+		return
+	}
+	shell, rejectReason := m.resolveDurableSessionShell(sessionID)
+	if shell == nil && rejectReason != "" {
+		_ = writeJSON(agentAIErrorPayload(sessionID, "", errors.New(rejectReason)))
+		return
+	}
+	if shell != nil {
+		m.mu.Lock()
+		m.registerAISessionLocked(shell)
+		m.mu.Unlock()
+		m.attachLiveSession(shell, msg, writeJSON)
+		return
+	}
+
 	projectPath, err := resolveAgentAICWD(remoteString(msg, "project_path"))
 	if err != nil {
 		_ = writeJSON(agentAIErrorPayload(sessionID, "", err))
@@ -2067,34 +2200,6 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 	}
 
 	m.mu.Lock()
-	if existing := m.sessions[sessionID]; existing != nil {
-		existing.mode = mode
-		existing.projectPath = projectPath
-		existing.provider = provider
-		existing.model = model
-		existing.effort = effort
-		if contextWindow > 0 {
-			existing.contextWindow = contextWindow
-		}
-		existing.resumeSessionID = resumeSessionID
-		existing.reservedNativeSessionID = reservedNativeSessionID
-		existing.bindingVersion = bindingVersion
-		existing.initialContext = initialContext
-		existing.isGoalFork = isGoalFork
-		if surface != "" {
-			existing.surface = surface
-		}
-		if claudePolicy.enabled {
-			existing.claudePolicy = cloneAgentAIClaudeRemotePolicy(claudePolicy)
-			existing.claudeCaps = agentAIClaudeCapabilities{}
-		}
-		if len(history) > 0 {
-			existing.history = trimAgentAIHistoryForSession(existing, history)
-		}
-		m.mu.Unlock()
-		_ = writeJSON(agentAISessionCreatedPayload(existing))
-		return
-	}
 	// NOTE: no count cap here. The real turn runs on ai.message, whose lazy-create
 	// path (see message()) registers the session unconditionally — so a cap only
 	// in create() was a dead check that emitted a misleading "limit reached"
@@ -3794,9 +3899,12 @@ func (m *agentAIManager) emitApprovalCancelled(writeJSON agentTerminalWriter, se
 
 // emitOptionCancelled 在 session 失活（close 等）时，best-effort 通知服务端作废待选。
 // 与 emitApprovalCancelled 同理：closeAll 等无 writer 的场景依赖服务端 offline-grace。
-func (m *agentAIManager) emitOptionCancelled(writeJSON agentTerminalWriter, sessionID string, optionIDs []string, reason string) {
+// 返回所写 payload(未写返回 nil),供裸 writer 调用点(close)向 watcher
+// 扇出同一帧——与 emitApprovalCancelled 同构(J7):attached 页面的方案卡也
+// 需要据此关闭。
+func (m *agentAIManager) emitOptionCancelled(writeJSON agentTerminalWriter, sessionID string, optionIDs []string, reason string) map[string]interface{} {
 	if writeJSON == nil || sessionID == "" || len(optionIDs) == 0 {
-		return
+		return nil
 	}
 	payload := map[string]interface{}{
 		"type":       models.AgentEventAIOptionCancelled,
@@ -3807,6 +3915,7 @@ func (m *agentAIManager) emitOptionCancelled(writeJSON agentTerminalWriter, sess
 		payload["reason"] = reason
 	}
 	_ = writeJSON(payload)
+	return payload
 }
 
 // cancelOptions 处理 server→agent 的 ai.option.cancelled：清匹配的 pendingOption，
@@ -3867,7 +3976,13 @@ func (m *agentAIManager) close(msg map[string]interface{}, writeJSON agentTermin
 			m.fanOutSessionWatchFrame(sessionID, cancelledPayload)
 		}
 	}
-	m.emitOptionCancelled(writeJSON, sessionID, cancelledOptions, "session_closed")
+	if optionCancelled := m.emitOptionCancelled(writeJSON, sessionID, cancelledOptions, "session_closed"); optionCancelled != nil {
+		if terminalEmitter != nil {
+			terminalEmitter.fanOutOutOfBand(optionCancelled)
+		} else {
+			m.fanOutSessionWatchFrame(sessionID, optionCancelled)
+		}
+	}
 
 	if runWrite == nil {
 		runWrite = writeJSON

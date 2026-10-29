@@ -809,3 +809,346 @@ func TestAgentAIUnwatchSessionConnDisconnectCleanup(t *testing.T) {
 	}
 	(&AgentService{}).UnwatchLocalAIConn("c2") // nil ai:不得 panic
 }
+
+// ---------- Task 3: attach 语义(绑定优先,禁覆写) ----------
+
+// seedTestBinding 直写注册表造持久绑定(与 reserveBinding 落库形态一致)。
+func seedTestBinding(m *agentAIManager, sessionID, provider, nativeSessionID, state string, version int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.bindings == nil {
+		m.bindings = make(map[string]agentAIBindingRecord)
+	}
+	m.bindings[sessionID] = agentAIBindingRecord{
+		ConversationID:  sessionID,
+		Provider:        provider,
+		NativeSessionID: nativeSessionID,
+		State:           state,
+		BindingVersion:  version,
+		UpdatedAt:       time.Now().UTC().Format(time.RFC3339Nano),
+	}
+}
+
+// hijackCreatePayload 构造一个「六字段全部与属主不同」的来者 create 载荷:
+// 变异思维——attach 守卫若被删掉任何一条,对应字段断言即红。
+func hijackCreatePayload(sessionID string) map[string]interface{} {
+	return map[string]interface{}{
+		"session_id":        sessionID,
+		"conn_id":           "c-attach",
+		"provider":          "codex",
+		"model":             "hijacked-model",
+		"effort":            "xhigh",
+		"resume_session_id": "hijacked-resume",
+		"binding_version":   99,
+		"initial_context":   "hijacked-context",
+		"project_path":      "/nonexistent/hijack-cwd",
+	}
+}
+
+// ①attach 内存活跃会话:不新建不重置,六字段逐字段不变,回执含元数据 +
+// attached:true。
+func TestAgentAIAttachLiveSessionKeepsOwnerFields(t *testing.T) {
+	m := newAgentAIManager()
+	owner := &agentAISession{
+		id:              "s-live",
+		mode:            "vibe",
+		projectPath:     "/owner/proj",
+		provider:        "claude",
+		model:           "owner-model",
+		effort:          "medium",
+		resumeSessionID: "owner-native-1",
+		bindingVersion:  7,
+		initialContext:  "owner context",
+		runSeq:          1,
+		lastActiveAt:    time.Now().UTC(),
+	}
+	m.mu.Lock()
+	m.sessions["s-live"] = owner
+	m.mu.Unlock()
+
+	rec := &emitterWatchRecorder{}
+	m.create(hijackCreatePayload("s-live"), rec.write)
+
+	frames := rec.snapshot()
+	if len(frames) != 1 {
+		t.Fatalf("create frames = %d, want 1 receipt: %#v", len(frames), frames)
+	}
+	receipt := frames[0]
+	if receipt["attached"] != true {
+		t.Fatalf("receipt attached = %v, want true", receipt["attached"])
+	}
+	if receipt["provider"] != "claude" || receipt["model"] != "owner-model" || receipt["resume_session_id"] != "owner-native-1" {
+		t.Fatalf("receipt metadata reflects the hijacker, not the owner: %#v", receipt)
+	}
+
+	// 六字段逐字段:任何一条守卫被删,对应断言即红。(速照后即释放 m.mu,
+	// 下面的 registry 断言还要取 m.mu——sync.Mutex 不可重入。)
+	m.mu.Lock()
+	provider := owner.provider
+	model := owner.model
+	effort := owner.effort
+	resume := owner.resumeSessionID
+	version := owner.bindingVersion
+	initial := owner.initialContext
+	runSeq := owner.runSeq
+	projectPath := owner.projectPath
+	m.mu.Unlock()
+	if provider != "claude" {
+		t.Fatalf("provider overwritten: %q", provider)
+	}
+	if model != "owner-model" {
+		t.Fatalf("model overwritten: %q", model)
+	}
+	if effort != "medium" {
+		t.Fatalf("effort overwritten: %q", effort)
+	}
+	if resume != "owner-native-1" {
+		t.Fatalf("resumeSessionID overwritten: %q", resume)
+	}
+	if version != 7 {
+		t.Fatalf("bindingVersion overwritten: %d", version)
+	}
+	if initial != "owner context" {
+		t.Fatalf("initialContext overwritten: %q", initial)
+	}
+	// 不重置:history 未被来者 transcript/initialContext 重建,runSeq 不动。
+	if runSeq != 1 {
+		t.Fatalf("runSeq moved: %d", runSeq)
+	}
+	if projectPath != "/owner/proj" {
+		t.Fatalf("projectPath overwritten: %q", projectPath)
+	}
+	// attach 顺带登记了发起连接为 watcher(Task 4 前端复用)。
+	if snap := m.sessionWatchersSnapshot("s-live"); len(snap) != 1 {
+		t.Fatalf("attach did not register the watcher: %#v", snap)
+	}
+}
+
+// ②attach 磁盘会话:绑定优先(全 provider);journal 头行仅补 agentcore 的
+// model/project_path;壳最小字段集带齐 → confirmBinding expected-mismatch
+// 守卫照常生效。
+func TestAgentAIAttachDiskSessionBindingFirst(t *testing.T) {
+	m := newAgentAIManager()
+	m.coreJournal = newAgentCoreJournal(t.TempDir())
+	seedTestBinding(m, "s-claude", "claude", "native-claude-1", "confirmed", 3)
+	seedTestBinding(m, "s-core", "agentcore", "native-core-1", "reserved", 5)
+	m.coreJournal.ensureSessionHeader("s-core", "/tmp/core-proj", "glm-5.2", "2026-10-29T00:00:00Z")
+
+	// claude:无 journal,壳全从绑定来;来者六字段不落地。
+	rec := &emitterWatchRecorder{}
+	m.create(hijackCreatePayload("s-claude"), rec.write)
+	receipt := rec.snapshot()[0]
+	if receipt["attached"] != true || receipt["provider"] != "claude" {
+		t.Fatalf("claude attach receipt = %#v", receipt)
+	}
+	if receipt["resume_session_id"] != "native-claude-1" {
+		t.Fatalf("claude attach resume = %v, want native-claude-1", receipt["resume_session_id"])
+	}
+	m.mu.Lock()
+	shell := m.sessions["s-claude"]
+	m.mu.Unlock()
+	if shell == nil {
+		t.Fatal("claude disk attach did not register the shell")
+	}
+	if shell.provider != "claude" || shell.resumeSessionID != "native-claude-1" || shell.bindingVersion != 3 {
+		t.Fatalf("claude shell = provider:%s resume:%s ver:%d", shell.provider, shell.resumeSessionID, shell.bindingVersion)
+	}
+	if shell.model != "" || shell.projectPath != "" {
+		t.Fatalf("claude shell must not take model/path from anywhere: model=%q path=%q", shell.model, shell.projectPath)
+	}
+	if shell.mode != "vibe" {
+		t.Fatalf("shell mode = %q, want vibe", shell.mode)
+	}
+
+	// agentcore:journal 头行补 model/project_path。
+	rec2 := &emitterWatchRecorder{}
+	m.create(map[string]interface{}{"session_id": "s-core", "conn_id": "c-attach"}, rec2.write)
+	m.mu.Lock()
+	coreShell := m.sessions["s-core"]
+	m.mu.Unlock()
+	if coreShell == nil || coreShell.model != "glm-5.2" || coreShell.projectPath != "/tmp/core-proj" {
+		t.Fatalf("agentcore shell = %#v, want model/project_path from journal header", coreShell)
+	}
+
+	// 壳带齐 → confirmBinding 守卫照常生效:expected-mismatch 拒绝。
+	if _, err := m.confirmBinding("s-claude", "claude", "native-WRONG", 3); err == nil {
+		t.Fatal("confirmBinding mismatch accepted after attach; guard is broken")
+	}
+}
+
+// ③journal 有而绑定无 → ai.error 拒绝,不得走新建(防上下文静默分叉)。
+func TestAgentAIAttachRejectsJournalWithoutBinding(t *testing.T) {
+	m := newAgentAIManager()
+	m.coreJournal = newAgentCoreJournal(t.TempDir())
+	m.coreJournal.ensureSessionHeader("s-orphan", "/tmp/orphan-proj", "glm-5.2", "2026-10-29T00:00:00Z")
+
+	rec := &emitterWatchRecorder{}
+	m.create(map[string]interface{}{"session_id": "s-orphan", "conn_id": "c1"}, rec.write)
+	frames := rec.snapshot()
+	if len(frames) != 1 || frames[0]["type"] != models.AgentEventAIError {
+		t.Fatalf("orphan journal create = %#v, want single ai.error", frames)
+	}
+	if !strings.Contains(fmt.Sprint(frames[0]["error"]), "binding") {
+		t.Fatalf("error = %v, want a binding-related refusal", frames[0]["error"])
+	}
+	m.mu.Lock()
+	orphan := m.sessions["s-orphan"]
+	m.mu.Unlock()
+	if orphan != nil {
+		t.Fatal("orphan journal created a session; silent context fork")
+	}
+}
+
+// ④完全未知 id → 现行新建行为不变(回归钉):字段照来者落地,回执无 attached。
+func TestAgentAIAttachUnknownIdCreatesAsBefore(t *testing.T) {
+	m := newAgentAIManager()
+	rec := &emitterWatchRecorder{}
+	m.create(map[string]interface{}{
+		"session_id":        "brand-new",
+		"provider":          "claude",
+		"model":             "new-model",
+		"effort":            "high",
+		"resume_session_id": "fresh-native",
+		"binding_version":   2,
+		"initial_context":   "fresh ctx",
+	}, rec.write)
+	frames := rec.snapshot()
+	if len(frames) != 1 {
+		t.Fatalf("create frames = %d", len(frames))
+	}
+	if frames[0]["attached"] == true {
+		t.Fatalf("fresh create must not be marked attached: %#v", frames[0])
+	}
+	m.mu.Lock()
+	session := m.sessions["brand-new"]
+	m.mu.Unlock()
+	if session == nil || session.provider != "claude" || session.model != "new-model" || session.effort != "high" || session.resumeSessionID != "fresh-native" || session.bindingVersion != 2 || session.initialContext != "fresh ctx" {
+		t.Fatalf("fresh create session = %#v", session)
+	}
+}
+
+// ⑤attach 跳过 resolveAgentAICWD 校验:磁盘路径不必在本机可解析(换个机器接
+// 管是常态);对照:新建路径同样坏路径必须报错。
+func TestAgentAIAttachSkipsCWDCheck(t *testing.T) {
+	m := newAgentAIManager()
+	m.coreJournal = newAgentCoreJournal(t.TempDir())
+	seedTestBinding(m, "s-core", "agentcore", "native-core-1", "confirmed", 1)
+	m.coreJournal.ensureSessionHeader("s-core", "/nonexistent/attach-cwd", "glm-5.2", "2026-10-29T00:00:00Z")
+
+	rec := &emitterWatchRecorder{}
+	m.create(map[string]interface{}{"session_id": "s-core", "conn_id": "c1"}, rec.write)
+	frames := rec.snapshot()
+	if len(frames) != 1 || frames[0]["type"] == models.AgentEventAIError {
+		t.Fatalf("disk attach must skip the CWD check: %#v", frames)
+	}
+	m.mu.Lock()
+	shell := m.sessions["s-core"]
+	m.mu.Unlock()
+	if shell == nil || shell.projectPath != "/nonexistent/attach-cwd" {
+		t.Fatalf("shell projectPath = %#v", shell)
+	}
+
+	// 对照:新建路径同坏路径必须报错(CWD 校验没有被全局拆掉)。
+	rec2 := &emitterWatchRecorder{}
+	m.create(map[string]interface{}{"session_id": "brand-new-2", "project_path": "/nonexistent/attach-cwd"}, rec2.write)
+	frames2 := rec2.snapshot()
+	if len(frames2) != 1 || frames2[0]["type"] != models.AgentEventAIError {
+		t.Fatalf("fresh create with bad cwd = %#v, want ai.error", frames2)
+	}
+}
+
+// ⑥watch 处理器开放磁盘解析:内存无则走 attach 同一路径(绑定优先/journal 补
+// 全/journal-有-绑定-无拒绝),不另写一份解析;J5 语义=持久会话 close 后重
+// watch 经惰性解析重建壳成功,非持久会话 session not found 诚实报错。
+func TestAgentAIWatchResolvesDiskSessionLazily(t *testing.T) {
+	m := newAgentAIManager()
+	m.coreJournal = newAgentCoreJournal(t.TempDir())
+	seedTestBinding(m, "s-disk", "claude", "native-disk-1", "confirmed", 4)
+	m.coreJournal.ensureSessionHeader("s-orphan", "/tmp/x", "glm-5.2", "2026-10-29T00:00:00Z")
+
+	rec := &emitterWatchRecorder{}
+	// 持久会话:惰性解析成功,零 error 帧。
+	m.watch(map[string]interface{}{"session_id": "s-disk", "conn_id": "c1"}, rec.write)
+	for _, frame := range rec.snapshot() {
+		if frame["type"] == models.AgentEventAIError {
+			t.Fatalf("durable re-watch errored: %#v", frame)
+		}
+	}
+	if snap := m.sessionWatchersSnapshot("s-disk"); len(snap) != 1 {
+		t.Fatalf("disk watch registry = %#v", snap)
+	}
+	m.mu.Lock()
+	shell := m.sessions["s-disk"]
+	m.mu.Unlock()
+	if shell == nil || shell.resumeSessionID != "native-disk-1" {
+		t.Fatalf("lazy shell = %#v", shell)
+	}
+
+	// journal 有绑定无:拒绝。
+	rec2 := &emitterWatchRecorder{}
+	m.watch(map[string]interface{}{"session_id": "s-orphan", "conn_id": "c1"}, rec2.write)
+	frames := rec2.snapshot()
+	if len(frames) != 1 || frames[0]["type"] != models.AgentEventAIError {
+		t.Fatalf("orphan watch = %#v, want ai.error", frames)
+	}
+
+	// 完全未知:session not found(诚实报错,不静默)。
+	rec3 := &emitterWatchRecorder{}
+	m.watch(map[string]interface{}{"session_id": "s-ghost", "conn_id": "c1"}, rec3.write)
+	frames3 := rec3.snapshot()
+	if len(frames3) != 1 || !strings.Contains(fmt.Sprint(frames3[0]["error"]), "session not found") {
+		t.Fatalf("ghost watch = %#v", frames3)
+	}
+}
+
+// attach 后 watch 同会话(复用 attach 的登记路径)只登记一份、投递不重复。
+func TestAgentAIAttachThenWatchSingleRegistration(t *testing.T) {
+	m := newAgentAIManager()
+	emitter, _ := newWatchableTestSession(t, m, "s-live")
+	rec := &emitterWatchRecorder{}
+	m.create(map[string]interface{}{"session_id": "s-live", "conn_id": "c1"}, rec.write)
+	m.watch(map[string]interface{}{"session_id": "s-live", "conn_id": "c1"}, rec.write)
+
+	if snap := m.sessionWatchersSnapshot("s-live"); len(snap) != 1 {
+		t.Fatalf("registry after attach+watch = %#v, want exactly one", snap)
+	}
+	if sinks := watcherCopyForTest(emitter); len(sinks) != 1 {
+		t.Fatalf("emitter copy sinks = %d, want 1", len(sinks))
+	}
+	if err := emitter.emit(emitterWatchPayload(models.AgentEventAIDelta, "s-live", 1)); err != nil {
+		t.Fatal(err)
+	}
+	waitForWatchCond(t, 2*time.Second, "single delivery", func() bool {
+		return len(rec.snapshot()) == 2 // create 回执 + 1 delta
+	})
+}
+
+// attach 对 terminal emitter 的防御:emitter 已终态(拷贝已清)时 attachWatch
+// 必须 no-op——只登记 manager,绝不向死 emitter 插 sink(parked pump 泄漏)。
+func TestAgentAIAttachSkipsTerminalEmitter(t *testing.T) {
+	m := newAgentAIManager()
+	emitter, owner := newWatchableTestSession(t, m, "s-live")
+	if err := emitter.emit(map[string]interface{}{
+		"type":       models.AgentEventAIDone,
+		"session_id": "s-live",
+		"message_id": "msg-1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitForWatchCond(t, 2*time.Second, "emitter copy cleared on terminal", func() bool {
+		return len(watcherCopyForTest(emitter)) == 0
+	})
+
+	rec := &emitterWatchRecorder{}
+	m.watch(map[string]interface{}{"session_id": "s-live", "conn_id": "c-late"}, rec.write)
+	if snap := m.sessionWatchersSnapshot("s-live"); len(snap) != 1 {
+		t.Fatalf("registry must still register the late watcher: %#v", snap)
+	}
+	if _, ok := watcherCopyForTest(emitter)["c-late"]; ok {
+		t.Fatal("attachWatch inserted a sink into a terminal emitter; pump would park forever")
+	}
+	// 终态后的 emitter 不再有事件;watcher 等下一 run 播种。属主恰好 1 帧。
+	if len(owner.snapshot()) != 1 {
+		t.Fatalf("owner frames = %d, want 1", len(owner.snapshot()))
+	}
+}

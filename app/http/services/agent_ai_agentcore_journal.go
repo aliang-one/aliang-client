@@ -8,6 +8,7 @@ package services
 // 尽力而为留痕：任何写失败只 Warn，绝不影响 run。
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -103,6 +104,37 @@ func (j *agentCoreJournal) ensureSessionHeader(sessionID, projectPath, model, cr
 	// 首次纳管一个会话打 Info（spec §12 观测点），写失败才有 Warn 对照。
 	logger.Info(fmt.Sprintf("agentcore-journal: session tracked session=%s file=%s", sessionID, agentCoreJournalFileName(sessionID)))
 	j.pruneLocked(sessionID)
+}
+
+// readSessionHeader 读会话 journal 文件的头行(kind=="session"),返回
+// project_path 与 model。惰性 attach 解析(Task 3)用:文件不存在/头行损坏/
+// kind 不符 → ok=false。只读第一行,不整文件载入(转录可能很大)。
+func (j *agentCoreJournal) readSessionHeader(sessionID string) (projectPath, model string, ok bool) {
+	if j == nil || j.dir == "" || strings.TrimSpace(sessionID) == "" {
+		return "", "", false
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	path := filepath.Join(j.dir, agentCoreJournalFileName(sessionID))
+	file, err := os.Open(path)
+	if err != nil {
+		return "", "", false
+	}
+	defer file.Close()
+	scanner := bufio.NewScanner(file)
+	if !scanner.Scan() {
+		return "", "", false
+	}
+	var head map[string]interface{}
+	if json.Unmarshal([]byte(scanner.Text()), &head) != nil {
+		return "", "", false
+	}
+	if kind, _ := head["kind"].(string); kind != "session" {
+		return "", "", false
+	}
+	projectPath, _ = head["project_path"].(string)
+	model, _ = head["model"].(string)
+	return strings.TrimSpace(projectPath), strings.TrimSpace(model), true
 }
 
 func (j *agentCoreJournal) appendUser(sessionID, messageID, text, ts string) {
