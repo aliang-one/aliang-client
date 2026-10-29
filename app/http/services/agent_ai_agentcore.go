@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -694,10 +695,21 @@ func (m *agentAIManager) handleAgentCoreCompactCommand(session *agentAISession, 
 	mode := session.mode
 	model := session.model
 	contextWindow := session.contextWindow
+	originSocket := session.originSocket
+	surface := session.surface
 	history := append([]agentAIMessage(nil), session.history...)
 	m.mu.Unlock()
 
 	assistantID := agentAssistantMessageID(messageID)
+
+	// 斜杠命令留痕（spec §4.5）：/compact 不落成模型回合（上层 agentcore 分支
+	// 提前 return），journal 是这条命令唯一的历史痕迹。命令行与本地应答各落
+	// 一行，读回时才有始有终；写失败只 Warn（尽力而为口径）。
+	journal := m.coreJournal
+	now := time.Now().UTC().Format(time.RFC3339)
+	journal.ensureSessionHeader(session.id, projectPath, model, now, agentCoreJournalOriginFor(originSocket, surface))
+	journal.appendUser(session.id, messageID, "/compact", now)
+
 	_ = writeJSON(map[string]interface{}{
 		"type":         models.AgentEventAIRunStarted,
 		"session_id":   session.id,
@@ -726,7 +738,9 @@ func (m *agentAIManager) handleAgentCoreCompactCommand(session *agentAISession, 
 
 	messages, _ := agentCoreMessagesFromHistory(history)
 	if len(messages) == 0 {
-		reply("当前会话还没有可压缩的上下文。先对话几轮，再发送 /compact。")
+		const nothing = "当前会话还没有可压缩的上下文。先对话几轮，再发送 /compact。"
+		reply(nothing)
+		journal.appendAssistant(session.id, assistantID, nothing, time.Now().UTC().Format(time.RFC3339))
 		done()
 		return
 	}
@@ -736,6 +750,7 @@ func (m *agentAIManager) handleAgentCoreCompactCommand(session *agentAISession, 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 	if err := agentCoreEnsureUpstream(ctx); err != nil {
+		journal.appendAssistant(session.id, assistantID, "/compact 失败："+err.Error(), time.Now().UTC().Format(time.RFC3339))
 		_ = writeJSON(agentAIErrorPayload(session.id, messageID, err))
 		return
 	}
@@ -768,17 +783,22 @@ func (m *agentAIManager) handleAgentCoreCompactCommand(session *agentAISession, 
 	compacted, info, err := agentcore.Compact(ctx, cfg, messages, "manual")
 	if err != nil {
 		if errors.Is(err, agentcore.ErrNothingToCompact) {
-			reply("上下文还比较短，无需压缩。")
+			const short = "上下文还比较短，无需压缩。"
+			reply(short)
+			journal.appendAssistant(session.id, assistantID, short, time.Now().UTC().Format(time.RFC3339))
 			done()
 			return
 		}
 		logger.Warn(fmt.Sprintf("agentcore: /compact 失败 session=%s: %v", session.id, err))
+		journal.appendAssistant(session.id, assistantID, "/compact 失败："+err.Error(), time.Now().UTC().Format(time.RFC3339))
 		_ = writeJSON(agentAIErrorPayload(session.id, messageID, err))
 		return
 	}
 	m.replaceAgentCoreHistory(session.id, runSeq, compacted)
-	reply(fmt.Sprintf("✓ 上下文已压缩：约 %s → %s tokens（%d 条早期消息已折叠为摘要）。",
-		agentAITokenCountLabel(info.PreTokens), agentAITokenCountLabel(info.PostTokens), info.Removed))
+	line := fmt.Sprintf("✓ 上下文已压缩：约 %s → %s tokens（%d 条早期消息已折叠为摘要）。",
+		agentAITokenCountLabel(info.PreTokens), agentAITokenCountLabel(info.PostTokens), info.Removed)
+	reply(line)
+	journal.appendAssistant(session.id, assistantID, line, time.Now().UTC().Format(time.RFC3339))
 	done()
 }
 
@@ -1048,6 +1068,28 @@ func (m *agentAIManager) bindAgentCoreNativeSession(run agentAIRun, writeJSON ag
 	return record, false, nil
 }
 
+// journalPartialAssistant 落失败回合的半截输出（spec §4.5）：停止/中途报错
+// 的回合若已流出一截文本，journal 留一条 -partial assistant 行——否则跨端/
+// 重启回放看到「这轮从未存在」，用户停之前读到一半的内容凭空消失。尽力而为：
+// 空输出不落行；僵尸回合不打（agentAIRunSideEffectsAllowed 围栏，与成功出口
+// 同款）——finalized 后迟返回的僵尸不许写任何 journal。messageID 加 -partial
+// 后缀防与成功行撞 appendMsg 去重键。
+func (m *agentAIManager) journalPartialAssistant(journal *agentCoreJournal, run agentAIRun, output *strings.Builder, outMu *sync.Mutex) {
+	if journal == nil || output == nil || outMu == nil {
+		return
+	}
+	if !m.agentAIRunSideEffectsAllowed(run.sessionID, run.runSeq, run.guard) {
+		return
+	}
+	outMu.Lock()
+	partial := strings.TrimSpace(output.String())
+	outMu.Unlock()
+	if partial == "" {
+		return
+	}
+	journal.appendAssistant(run.sessionID, agentAssistantMessageID(run.messageID)+"-partial", partial, time.Now().UTC().Format(time.RFC3339))
+}
+
 // runAgentCore 跑一次内置内核的 run。
 //
 // 与 runCLIPass 的关系：spawn 换成了进程内调用，但**对外的事件契约完全一样**
@@ -1083,7 +1125,7 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		journal.appendEndDiagnostics(run.sessionID, endStatus, endErrMsg, diag)
 	}()
 	now := time.Now().UTC().Format(time.RFC3339)
-	journal.ensureSessionHeader(run.sessionID, run.projectPath, agentCoreModel(run), now)
+	journal.ensureSessionHeader(run.sessionID, run.projectPath, agentCoreModel(run), now, agentCoreJournalOrigin(run))
 	if lastUser, ok := m.lastUserHistoryMessage(run.sessionID); ok {
 		ts := now
 		if !lastUser.CreatedAt.IsZero() {
@@ -1339,6 +1381,7 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 	if ctx.Err() != nil {
 		// 被停止：内核可能已发过 interrupted 终止帧；若 pipe 已随 cancel 关闭，
 		// 该帧会被丢弃（内核忽略这处写错误）。这里统一收敛状态。
+		m.journalPartialAssistant(journal, run, &output, &outMu)
 		status, errMsg := agentAIRunStoppedStatus(run.activity, limiter)
 		finalizeRunSubagents(run, writeJSON)
 		statusPayload := map[string]interface{}{
@@ -1374,11 +1417,13 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		endErrMsg = reason
 		logger.Warn(fmt.Sprintf("[agentcore] run failed session=%s msg=%s err=%s",
 			run.sessionID, run.messageID, reason))
+		m.journalPartialAssistant(journal, run, &output, &outMu)
 		finalizeRunSubagents(run, writeJSON)
 		return
 	}
 	if runErr != nil {
 		endErrMsg = runErr.Error()
+		m.journalPartialAssistant(journal, run, &output, &outMu)
 		finalizeRunSubagents(run, writeJSON)
 		_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, runErr))
 		return
@@ -1520,8 +1565,14 @@ func (d *agentCoreDiagnostics) endReason() string {
 // 下一条消息才被看到（2026-10-26 实测）。两个钩子先到先得，drain 排空队列，
 // 不会重复投递。PrepareRequest / FinishTurn 留空——前者的诉求（改 system /
 // max_tokens）已在 Config 里静态给定，后者没有消费方。
+//
+// 子 run（子 agent 桥递归）的 Config 显式 Hooks=nil，OnToolCall 只在主 run
+// 生效——子 run 内置工具的轨迹由 agentCoreJournalToolDecorator 装饰器落行，
+// 不经这里。
 // diag 可为 nil（测试路径）：OnTurn 的 set 对 nil 接收者直接短路。
 func agentCoreLoopHooks(m *agentAIManager, run agentAIRun, diag *agentCoreDiagnostics) agentcore.LoopHooks {
+	// 本回合自动压缩序号（journal 去重键用；每回合独立计数）。
+	autoCompactSeq := 0
 	// 逐回合 transcript 落 journal 的回合序号（run 内 1 起）。
 	turnN := 0
 	return agentcore.LoopHooks{
@@ -1550,8 +1601,33 @@ func agentCoreLoopHooks(m *agentAIManager, run agentAIRun, diag *agentCoreDiagno
 		},
 		// 自动压缩替换了历史 → 同步落回会话 history。不落的话 next run 又从
 		// 旧历史重建，压缩白做（而且每轮 run 都会重新烧一次摘要请求）。
+		// 自动压缩也落 journal（spec §4.5）：手动 /compact 由
+		// handleAgentCoreCompactCommand 落账（不经本钩子），此处只覆盖内核
+		// 自动路径（窗口触发/上下文溢出触发）。user 行用合成命令名 "/compact(auto)"
+		// 与手动命令区分；同回合多次自动压缩靠 runSeq+序号去重键区分
+		//（appendMsg 按 messageID 去重，固定 id 会让第二次压缩不落行）。
 		OnCompact: func(messages []agentcore.Message, info agentcore.CompactInfo) {
 			m.replaceAgentCoreHistory(run.sessionID, run.runSeq, messages)
+			autoCompactSeq++
+			ts := time.Now().UTC().Format(time.RFC3339)
+			compactID := fmt.Sprintf("compact-auto-%d-%d", run.runSeq, autoCompactSeq)
+			m.coreJournal.ensureSessionHeader(run.sessionID, run.projectPath, agentCoreModel(run), ts, agentCoreJournalOrigin(run))
+			m.coreJournal.appendUser(run.sessionID, compactID, "/compact(auto)", ts)
+			m.coreJournal.appendAssistant(run.sessionID, agentAssistantMessageID(compactID),
+				fmt.Sprintf("✓ 上下文已自动压缩：约 %s → %s tokens（%d 条早期消息已折叠为摘要）。",
+					agentAITokenCountLabel(info.PreTokens), agentAITokenCountLabel(info.PostTokens), info.Removed), ts)
+		},
+		// 内置工具的 journal 轨迹（spec §4.5 的缺口修复）：内核钩子在主循环
+		// 同步路径上触发，appendTool 自带锁、失败只 Warn，不阻塞不 panic。
+		// 桥接工具（MCP mcp__* / 子 agent 桥）各自已带 onCall 落行——而桥名
+		// 恒不在内置名集里（MCP 恒 mcp__ 前缀、子 agent 桥名消解时避开
+		// reserved），所以按内置名集过滤恰好不重不漏：内置工具记一次，
+		// 桥接工具保持各自原有一行，不会双记。
+		OnToolCall: func(name string, input map[string]interface{}, res agentcore.ToolResult) {
+			if !agentCoreKernelBuiltinTools[name] {
+				return
+			}
+			m.coreJournal.appendTool(run.sessionID, name, summarizeAgentCoreKernelTool(name, input), res.IsError)
 		},
 		// 逐回合诊断快照：内核每回合发起请求前、以及终止时把运行状态交给宿主，
 		// 存进 diag 供进度心跳与 journal 终态行消费（诊断面板数据源）。
@@ -1559,6 +1635,47 @@ func agentCoreLoopHooks(m *agentAIManager, run agentAIRun, diag *agentCoreDiagno
 			diag.set(snap)
 		},
 	}
+}
+
+// agentCoreKernelBuiltinTools 是内核内置工具名集，从 DefaultRegistry 派生
+// （内核加第 9 个工具自动跟进，不留手抄清单漂移缺口）。与子 agent 桥的
+// agentCoreSubagentReservedNames 同源派生但各留各的：两者语义不同（journal
+// 过滤 vs 桥名回避），合并会让两处修改互相牵连。
+var agentCoreKernelBuiltinTools = func() map[string]bool {
+	names := map[string]bool{}
+	for _, def := range agentcore.DefaultRegistry().Defs() {
+		names[def.Name] = true
+	}
+	return names
+}()
+
+// agentCoreKernelToolSummaryCapRune 是 journal 摘要的 rune 上限。journal 每次工具
+// 调用一行，Read/Bash 的输入动辄几千字符，不截会撑爆文件（spec §4.5）。
+const agentCoreKernelToolSummaryCapRune = 4096
+
+// summarizeAgentCoreKernelTool 拼内核内置工具的 journal 摘要：
+// "name key=value…"（value 简单 fmt，map/slice 走 %v）。键序 sort 保证确定性
+// （map 遍历随机，不排则同行输入每次落盘形状都不同）。整体超
+// agentCoreKernelToolSummaryCapRune 按 []rune 截断加 "…(truncated)"——不按字节
+// 切，防在切点劈开多字节 rune（36bcc43 教训；本包 desc/summary 的字节级截断
+// 已知有此观感限制，新代码不再引入）。
+func summarizeAgentCoreKernelTool(name string, input map[string]interface{}) string {
+	keys := make([]string, 0, len(input))
+	for k := range input {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	b.WriteString(name)
+	for _, k := range keys {
+		b.WriteString(" " + k + "=" + fmt.Sprintf("%v", input[k]))
+	}
+	out := b.String()
+	runes := []rune(out)
+	if len(runes) <= agentCoreKernelToolSummaryCapRune {
+		return out
+	}
+	return string(runes[:agentCoreKernelToolSummaryCapRune]) + "…(truncated)"
 }
 
 // ---------------------------------------------------------------------------
@@ -1871,6 +1988,16 @@ func (m *agentAIManager) agentCoreApprove(run agentAIRun, writeJSON agentTermina
 				run.matchedRuleID = matchedID
 				run.policyVersion = svc.effectiveApprovalPolicyForPath(run.projectPath).Version
 			}
+		}
+
+		// 会话级批准记忆检查点（policy 之后、云端往返之前）：本会话用户对同键
+		// 选过 accept_for_session 的直接放行（agent_ai_session_approvals.go）。
+		// provider 取请求对象自身，与 approval() 记录点存的 waiter.request.Provider
+		// 对齐（buildAgentCoreApprovalRequest 用 run.provider，两侧一致）。
+		if pre := buildAgentCoreApprovalRequest(run, call); m.sessionApprovalAllows(run.sessionID, pre.Provider, pre.Kind, pre.ToolName, pre.Command) {
+			logger.Info(fmt.Sprintf("approval-hook: SESSION-APPROVED (memory) tool=%s kind=%s session=%s (agentcore)", pre.ToolName, pre.Kind, run.sessionID))
+			m.journalSessionApprovalHit(run.sessionID, run.runSeq, pre.Kind, pre.ToolName, pre.Command)
+			return agentcore.ApprovalResponse{Approved: true}, nil
 		}
 
 		approvalCtx, cancel := context.WithTimeout(ctx, agentAIApprovalTimeout)

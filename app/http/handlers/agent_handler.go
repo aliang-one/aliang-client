@@ -17,7 +17,6 @@ import (
 	"aliang.one/nursorgate/app/http/models"
 	"aliang.one/nursorgate/app/http/services"
 
-	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 )
 
@@ -81,36 +80,32 @@ func (h *AgentHandler) HandleAIStream(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
-	// 连接标识:watcher 注册表按「连接」记账(跨端同权直播的订阅主体)。每条
-	// 连接铸造一次,与会话解耦——一条连接可 watch 多个会话,断开时按它一次性
-	// 反注销全部 watch(见 unwatchSessionConn)。
-	connID := uuid.NewString()
-
 	var writeMu sync.Mutex
 	writeJSON := func(payload interface{}) error {
 		writeMu.Lock()
 		defer writeMu.Unlock()
-		// 5s 写期限。行为变更:属主 socket 此前无限阻塞——客户端半死(不读
-		// 不断)时 WriteJSON 会永久挂起并拖死整个 run(属主写路径串行所有事
-		// 件)。现在超时报错返回,run 结束后终态经 pendingTerminal 持久化,重
-		// 连/下一连接重放兜底,丢帧不丢终态。
-		_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 		return conn.WriteJSON(payload)
 	}
 
-	// 读循环退出即反注销本连接的全部会话 watch(本任务先落钩子,watch 注册
-	// 由 ai.session.watch 接线)。
-	defer h.service.UnwatchLocalAIConn(connID)
+	// 跨端同态（spec §4.1）：本地聊天连接注册进 socket 注册表，事件扇出与
+	// 审批广播靠它；连接退出即注销（pump 所有权契约见 registerAISocket）。
+	// defer 顺序：注销先于 conn.Close（LIFO）——先停 pump 再关连接。
+	socketID := h.service.RegisterLocalAIChatSocket(writeJSON)
+	defer h.service.UnregisterLocalAIChatSocket(socketID)
 
 	for {
 		var msg map[string]interface{}
 		if err := conn.ReadJSON(&msg); err != nil {
 			return
 		}
-		if msg != nil {
-			// 服务端铸造的连接标识随消息下发:ai.session.watch/unwatch 以它为
-			// 注册表键,客户端不发也不可伪造;断线反注销按同一键一次清干净。
-			msg["conn_id"] = connID
+		if msg == nil {
+			// 字面量 null 帧解码为 nil map：直接盖标记会 panic，静默跳过。
+			continue
+		}
+		if socketID != "" {
+			// 内部标记（"__" 前缀，禁止转发到任何对端）：message()/create() 读它
+			// 落 session.originSocket，runEmitter 据此做 origin 去重扇出。
+			msg[services.AgentAIOriginSocketField] = socketID
 		}
 		h.service.DispatchLocalAI(msg, writeJSON)
 	}

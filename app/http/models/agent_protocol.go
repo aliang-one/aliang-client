@@ -35,9 +35,6 @@ const (
 	AgentEventTerminalSessions        = "terminal.sessions" // agent→server: full set of LIVE sessions, broadcast after registration ack so the server can converge its stale records
 	AgentEventAISessionCreate         = "ai.session.create"
 	AgentEventAISessionCreated        = "ai.session.created"
-	AgentEventAISessionWatch          = "ai.session.watch"         // local chat socket → agent: 订阅某会话的事件直播;conn_id 由 HandleAIStream 注入(服务端铸造,客户端不可伪造)
-	AgentEventAISessionUnwatch        = "ai.session.unwatch"       // local chat socket → agent: 退订;幂等
-	AgentEventAISessionWatchDropped   = "ai.session.watch.dropped" // agent → watcher 连接: 该订阅被摘(缓冲打满/写错/LRU 淘汰)。一次性尽力而为,客户端收到即应重新 watch
 	AgentEventAISessionClose          = "ai.session.close"
 	AgentEventAISessionClosed         = "ai.session.closed"
 	AgentEventAIMessage               = "ai.message"
@@ -69,6 +66,10 @@ const (
 	AgentEventAIOptionRequest         = "ai.option.request"       // agent→server: 请求用户在多个方案中选择
 	AgentEventAIOptionResponse        = "ai.option.response"      // server→agent: 用户的选择结果
 	AgentEventAIOptionCancelled       = "ai.option.cancelled"     // 双向: 选择对话失活，作废待选
+	AgentEventAISessionSubscribe      = "ai.session.subscribe"    // server→agent: 订阅一个会话的实时事件（本机聊天 WS 与阶段3云端代订阅共用帧型）
+	AgentEventAISessionUnsubscribe    = "ai.session.unsubscribe"  // server→agent: 退订
+	AgentEventAISessionSnapshot       = "ai.session.snapshot"     // client→server: 订阅握手回包（转录+待审批+状态）
+	AgentEventAIRunNotice             = "ai.run.notice"           // client→server: 非致命运行期提示（resume_missing 等）
 	AgentEventToolAskRequest          = "tool_ask.request"        // agent→server: 自有 MCP 交互工具调用,等手机作答(阻塞 CC 的 tool_use→tool_result 间隙)
 	AgentEventToolAskResponse         = "tool_ask.response"       // server→agent: 手机作答/过期,按 interaction_id(=CC tool_use_id)幂等回填
 	AgentEventToolAskCancel           = "tool_ask.cancel"         // agent→server: 超时/run 终结/CC 报错,主动翻卡终态
@@ -239,10 +240,13 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				{Type: AgentEventAIStatus, Required: []string{"type", "session_id", "status", "run_id", "event_seq"}},
 				{Type: AgentEventAIError, Required: []string{"type", "session_id", "error", "run_id", "event_seq"}, Optional: []string{"message_id", "error_status", "error_type", "error_code", "retry_attempt", "retry_max", "detail", "status"}},
 				{Type: AgentEventChannelAlert, Required: []string{"type", "code", "message", "since"}, Optional: []string{"consecutive_401"}},
-				{Type: AgentEventAIApprovalRequest, Required: []string{"type", "session_id", "message_id", "approval_id", "provider", "kind", "status", "run_id", "event_seq"}, Optional: []string{"title", "reason", "command", "cwd", "tool_name", "tool_input", "file_changes", "available_decisions", "decision", "raw", "matched_rule_id", "policy_version"}},
+				{Type: AgentEventAIApprovalRequest, Required: []string{"type", "session_id", "message_id", "approval_id", "provider", "kind", "status", "run_id", "event_seq"}, Optional: []string{"title", "reason", "command", "cwd", "tool_name", "tool_input", "file_changes", "available_decisions", "decision", "raw", "matched_rule_id", "policy_version", "expires_at"}},
 				{Type: AgentEventAIApprovalAck, Required: []string{"type", "session_id", "approval_id", "result"}, Optional: []string{"delivery_id"}},
 				{Type: AgentEventAIApprovalSync, Required: []string{"type"}, Optional: []string{"pending"}},
 				{Type: AgentEventAIApprovalCancelled, Required: []string{"type", "session_id"}, Optional: []string{"approval_ids", "reason"}},
+				// 跨端会话统一（spec 2026-10-28 §4.1）：agent 发——订阅握手回包 + 非致命运行期提示。
+				{Type: AgentEventAISessionSnapshot, Required: []string{"type", "session_id"}, Optional: []string{"transcript", "pending_approvals", "status"}},
+				{Type: AgentEventAIRunNotice, Required: []string{"type", "session_id", "code"}, Optional: []string{"message_id", "detail"}},
 				{Type: AgentEventAISessionClosed, Required: []string{"type", "session_id"}, Optional: []string{"run_id", "event_seq"}},
 				{Type: AgentEventFileListResult, Required: []string{"type", "request_id", "path", "entries"}},
 				{Type: AgentEventFileReadResult, Required: []string{"type", "request_id", "path", "encoding", "content"}},
@@ -291,16 +295,13 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				{Type: AgentEventAISteer, Required: []string{"type", "session_id", "message_id", "content"}, Optional: []string{"mode", "surface"}, Emits: []string{AgentEventAISteerAck}},
 				{Type: AgentEventAIApprovalResponse, Required: []string{"type", "session_id", "approval_id", "decision"}, Optional: []string{"message_id", "scope", "raw", "delivery_id", "attempt"}, Emits: []string{AgentEventAIApprovalAck, AgentEventAIStatus, AgentEventAIError}},
 				{Type: AgentEventAIApprovalState, Required: []string{"type", "approval_id", "status"}, Optional: []string{"session_id"}},
+				// 跨端会话统一（spec 2026-10-28 §4.1）：agent 收——本机聊天 WS 与阶段3云端代订阅共用帧型。
+				{Type: AgentEventAISessionSubscribe, Required: []string{"type", "session_id"}},
+				{Type: AgentEventAISessionUnsubscribe, Required: []string{"type", "session_id"}},
 				{Type: AgentEventAIStop, Required: []string{"type", "session_id"}, Optional: []string{"run_id", "source_session_id"}, Emits: []string{AgentEventAIStatus}},
 				{Type: AgentEventAITuiSync, Required: []string{"type", "session_id", "source_session_id", "digest"}, Optional: []string{"project_path"}, Emits: nil},
 				{Type: AgentEventAIRename, Required: []string{"type", "session_id", "title"}, Optional: []string{"project_path", "provider", "tool", "source_session_id", "resume_session_id"}, Emits: []string{AgentEventAIRenameAck}},
 				{Type: AgentEventAISessionClose, Required: []string{"type", "session_id"}, Emits: []string{AgentEventAISessionClosed}},
-				// watch/unwatch 目前仅本地聊天 socket(56433 /api/agent/ai/stream):
-				// conn_id 是服务端在 HandleAIStream 铸造后注入的连接标识,客户端
-				// 不发也不可伪造,故列为 Optional。dropped 是 agent 对被摘订阅的
-				// 单向通知(无法回执,重试无意义),reason 说明摘除原因。
-				{Type: AgentEventAISessionWatch, Required: []string{"type", "session_id"}, Optional: []string{"conn_id", "message_id"}, Emits: []string{AgentEventAIError, AgentEventAISessionWatchDropped}},
-				{Type: AgentEventAISessionUnwatch, Required: []string{"type", "session_id"}, Optional: []string{"conn_id", "message_id"}},
 				{Type: AgentEventFileList, Required: []string{"type", "request_id", "project_path", "path"}, Optional: []string{"max_entries"}, Emits: []string{AgentEventFileListResult, AgentEventFileError}},
 				{Type: AgentEventFileRead, Required: []string{"type", "request_id", "project_path", "path"}, Optional: []string{"max_bytes"}, Emits: []string{AgentEventFileReadResult, AgentEventFileError}},
 				{Type: AgentEventFileUpload, Required: []string{"type", "request_id", "project_path", "path", "upload_url", "max_bytes"}, Emits: []string{AgentEventFileUploadProgress, AgentEventFileUploadResult, AgentEventFileError}},
@@ -329,7 +330,8 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 		Streams: []AgentProtocolStream{
 			{Name: "terminal", Event: AgentEventTerminalOutput, Required: []string{"session_id", "encoding", "data"}, Description: "PTY bytes are forwarded as text chunks in arrival order."},
 			{Name: "ai_chat", Event: AgentEventAIDelta, Required: []string{"session_id", "message_id", "channel", "delta", "run_id", "event_seq"}, Optional: []string{"provider"}, Description: "Headless AI CLI stdout/stderr is streamed as soon as bytes arrive."},
-			{Name: "ai_approval", Event: AgentEventAIApprovalRequest, Required: []string{"session_id", "message_id", "approval_id", "provider", "kind", "status", "run_id", "event_seq"}, Optional: []string{"title", "reason", "command", "cwd", "tool_name", "tool_input", "file_changes", "available_decisions", "decision", "matched_rule_id", "policy_version"}, Description: "Headless AI CLI permission requests are surfaced to the user and resumed only after an ai.approval.response decision. matched_rule_id/policy_version carry the approval-policy context that triggered the escalation (optional; absent for auto-approved tools, which never reach the cloud)."},
+			{Name: "ai_approval", Event: AgentEventAIApprovalRequest, Required: []string{"session_id", "message_id", "approval_id", "provider", "kind", "status", "run_id", "event_seq"}, Optional: []string{"title", "reason", "command", "cwd", "tool_name", "tool_input", "file_changes", "available_decisions", "decision", "matched_rule_id", "policy_version", "expires_at"}, Description: "Headless AI CLI permission requests are surfaced to the user and resumed only after an ai.approval.response decision. matched_rule_id/policy_version carry the approval-policy context that triggered the escalation (optional; absent for auto-approved tools, which never reach the cloud)."},
+			{Name: "ai_run_notice", Event: AgentEventAIRunNotice, Required: []string{"session_id", "code"}, Optional: []string{"message_id", "detail"}, Description: "Non-fatal run notices (e.g. resume_missing: native session absent, continuing as a fresh conversation). Informational; runs always continue."},
 		},
 	}
 }

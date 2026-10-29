@@ -447,6 +447,10 @@ func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn) error {
 		return w(payload)
 	}
 
+	// 远端常驻 socket：写函数是间接层（重连换道），注册一次进程内有效。
+	// 本函数每条连接跑一次——重连必然重入，断线死亡的 socket 在此复活。
+	s.ai.ensureRemoteAISocket(writeJSON)
+
 	// Read liveness: enforce a read deadline that is refreshed by inbound pongs
 	// (and any application message). If the peer goes silent the deadline fires
 	// -> ReadJSON errors -> the session ends and remoteConnectionLoop reconnects,
@@ -538,12 +542,16 @@ func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn) error {
 		approvalSyncTicker := time.NewTicker(time.Minute)
 		defer approvalSyncTicker.Stop()
 		// Change-driven inventory: re-hash the cheap session fingerprint every
-		// few seconds; on a change push a hello immediately instead of waiting
-		// for the minute backstop. Titles, running status and rename-cache
-		// mutations reach the phone in ~one tick instead of up to 60s.
+		// few seconds and push a hello on a change, throttled to
+		// agentVibeDigestHelloMinInterval: an active machine flips the
+		// fingerprint on nearly every tick (live jsonl appends), which produced
+		// 3367 hellos/day on the 2026-10-29 production Mac and drove the
+		// server's detail-refresh fan-out into PG deadlocks. Consecutive
+		// changes within the window coalesce into one hello carrying the latest
+		// fingerprint; other hello reasons (connect/periodic/rename) bypass the
+		// gate and refresh its baseline via sendAgentHello.
 		digestTicker := time.NewTicker(agentVibeDigestInterval)
 		defer digestTicker.Stop()
-		var lastVibeDigest string
 		for {
 			select {
 			case <-heartbeatTicker.C:
@@ -556,19 +564,32 @@ func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn) error {
 					"agent_tools_rev": agentToolRegistryRev,
 				})
 			case <-digestTicker.C:
-				// The first tick only records the baseline — the connect hello
-				// already carried that state. Log-only on failure (see the
-				// periodic hello case): a failed push must not kill the stream.
+				// The first observed fingerprint only records the baseline — the
+				// connect hello already carried that state. Log-only on failure
+				// (see the periodic hello case): a failed push must not kill
+				// the stream.
 				digest := agentVibeDigest(agentHome())
 				if digest == "" {
 					continue
 				}
-				if lastVibeDigest != "" && digest != lastVibeDigest {
-					if err := s.sendAgentHello(writeJSON, "vibe_digest_change"); err != nil {
-						logger.Warn(fmt.Sprintf("[AGENT-BOOT] remote_connection digest_hello_failed error=%v", err))
-					}
+				if s.remoteHello.baseline(digest) {
+					continue
 				}
-				lastVibeDigest = digest
+				if s.remoteHello.unchanged(digest) {
+					continue
+				}
+				if ok, firstDefer := s.remoteHello.allow(digest, time.Now(), agentVibeDigestHelloMinInterval); !ok {
+					if firstDefer {
+						// 窗口内连续变更合批为一次 hello,只打一条去重日志。
+						logger.Info("[AGENT-BOOT] remote_connection digest_hello_deferred min_interval=" + agentVibeDigestHelloMinInterval.String())
+					}
+					continue
+				}
+				if err := s.sendAgentHello(writeJSON, "vibe_digest_change"); err != nil {
+					logger.Warn(fmt.Sprintf("[AGENT-BOOT] remote_connection digest_hello_failed error=%v", err))
+				}
+				// 成功路径的基线/时间窗刷新在 sendAgentHello→noteSent 内完成;
+				// 失败时不刷新基线,下个 tick 会带着最新指纹重试放行。
 			case <-inventoryTicker.C:
 				// Log-only on failure: a periodic hello failure must NOT tear down
 				// the heartbeat/liveness stream. Returning here (the old behavior)
@@ -612,6 +633,10 @@ func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn) error {
 }
 
 func (s *AgentService) sendAgentHello(writeJSON func(interface{}) error, reason string) error {
+	// 先取指纹再构建 payload:noteSent 的基线应与本次 hello 覆盖的状态对齐。
+	// 所有 reason 的成功 hello 都在此刷新 gate(单一咽喉),rename/periodic 后
+	// 不会紧跟一次重复的 digest hello(见 agent_vibe_hello_gate.go)。
+	sentDigest := agentVibeDigest(agentHome())
 	hello := s.agentHelloPayload()
 	projectCount := 0
 	if projects, ok := hello["projects"].([]models.AgentProject); ok {
@@ -636,6 +661,7 @@ func (s *AgentService) sendAgentHello(writeJSON func(interface{}) error, reason 
 	if err := writeJSON(hello); err != nil {
 		return err
 	}
+	s.remoteHello.noteSent(sentDigest, time.Now())
 	logger.Info(fmt.Sprintf("[AGENT-BOOT] remote_connection hello_sent reason=%s", strings.TrimSpace(reason)))
 	return nil
 }
@@ -667,6 +693,12 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 		// keyed), so periodic re-hellos re-triggering them is safe.
 		s.markRegistrationReady()
 		s.ai.replayPendingTerminals(writeJSON)
+		// 远端 socket 门开后复活（2026-10-28 评审 I2）：ensureRemoteAISocket 在
+		// 连接建立即注册，但那时注册门未开——门开前的扇出会让 pump 卡在
+		// publishedWriter→waitForRegistration（≤5s）后撞写超时、被 onDead 摘除，
+		// 且本连接内不再有别的复活点（手机从此静默收不到审批广播）。此处幂等
+		// ensure 一次：门已开，被摘/缺失的 remote socket 就地复活；活着的 no-op。
+		s.ai.ensureRemoteAISocket(s.currentRemoteWriter())
 		// Tell the server which terminal sessions survived the disconnect (live
 		// set, tombstones excluded); an empty set still emits so the server can
 		// clear stale records. Idempotent on the server side, so re-hellos are
@@ -830,7 +862,30 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 		// challenge and eventually kill a session the user just approved.
 		s.setRemoteConnectionState(true, "online", "")
 		s.terminal.quotaResolved(msg, writeJSON)
+	case models.AgentEventAISessionSubscribe, models.AgentEventAISessionUnsubscribe:
+		// 跨端同态（spec §4.1/阶段 3）：服务端为打开会话详情的手机代发订阅。
+		// 刻意不受 aiControlEnabled 门——订阅是只读观察（快照+事件副本），
+		// 关掉 AI 控制不应让已打开的详情页变瞎；与本地透传路径同语义
+		//（DispatchLocalAI 同款注释）。盖远端 origin 标记：快照经 emitter
+		// 写回时 origin 去重 + ack 可寻址。
+		msg[agentAIOriginSocketField] = agentAIRemoteSocketID
+		s.setRemoteConnectionState(true, "online", "")
+		sessionID := strings.TrimSpace(remoteString(msg, "session_id"))
+		if sessionID == "" {
+			_ = writeJSON(agentAIErrorPayload("", "", errors.New("ai.session.subscribe missing session_id")))
+			return
+		}
+		if msgType == models.AgentEventAISessionSubscribe {
+			s.ai.subscribeAISocket(agentAIRemoteSocketID, sessionID)
+			s.ai.emitSessionSnapshot(agentAIRemoteSocketID, sessionID, writeJSON)
+		} else {
+			s.ai.unsubscribeAISocket(agentAIRemoteSocketID, sessionID)
+		}
 	case models.AgentEventAISessionCreate, models.AgentEventAIMessage, models.AgentEventAIRunStart, models.AgentEventAISteer, models.AgentEventAIApprovalResponse, models.AgentEventAIOptionResponse, models.AgentEventAIStop, models.AgentEventAISessionClose, models.AgentEventAITuiSync, models.AgentEventToolAskResponse:
+		// 跨端同态（spec §4.1）：入站 AI 帧盖远端来源标记。位置刻意在 case 入口、
+		// aiControlEnabled 门与任何 early-return 之前——错误回包路径（含门拒绝）
+		// 同样有 origin 可寻址（Task 7 审批 ack 双写）。"__" 前缀标记禁止转发。
+		msg[agentAIOriginSocketField] = agentAIRemoteSocketID
 		s.setRemoteConnectionState(true, "online", "")
 		switch msgType {
 		case models.AgentEventAISessionCreate:
@@ -993,17 +1048,35 @@ func (s *AgentService) DispatchLocalAI(msg map[string]interface{}, writeJSON fun
 		s.ai.stop(msg, writeJSON)
 	case models.AgentEventAISessionClose:
 		s.ai.close(msg, writeJSON)
-	case models.AgentEventAISessionWatch:
-		s.ai.watch(msg, writeJSON)
-	case models.AgentEventAISessionUnwatch:
-		s.ai.unwatch(msg, writeJSON)
-	case models.AgentEventAIApprovalSync:
-		// 审批对账拉取（网页 attach 后主动拉）：请求方经 e.write 直写一份 sync
-		// payload——属主兼 watcher 时扇出侧跳过属主连接，直写恰好补上那一份；
-		// 无活跃 run 会话的注册表扇出排除请求方连接（直写已覆盖，不排除双投递）；
-		// 其余 watcher 按 pending 条目 session_id 照常扇出。无待批时静默返回
-		// （与 watch 同语义：无回执即成功）。
-		s.ai.emitApprovalSyncForRequester(msg, writeJSON)
+	case models.AgentEventAISessionSubscribe, models.AgentEventAISessionUnsubscribe:
+		// 跨端同态（spec §4.1）：本机聊天连接订阅任意会话（手机发起的、终端
+		// 导入的都行）。透传是裸泵，此端点只存在于 agent 进程。
+		// 刻意不设设备控制门：订阅是只读观察（快照 + 后续扇出），不驱动任何
+		// 会话状态；本端点也仅由 agent 进程自身的仪表盘回环（56433 localhost）
+		// 到达，无设备控制门语境。
+		// 刻意不扇出的回包（N2 记录）：steer ack 与 session.created 仍走
+		// origin 写——插话方/发起方自己直接收，另一端靠快照/清单刷新可见。
+		// 半订阅（评审 M4）：帧缺 __origin_socket 标记时 socketID 为空串，
+		// subscribeAISocket 对未知 id no-op——什么都不订阅，但快照照发（只读
+		// 握手，无害）。生产路径 HandleAIStream 恒盖章（socketID=="" 仅本地
+		// socket 注册失败的极端场景），刻意不在读循环上打 Warn 防刷屏。
+		socketID := strings.TrimSpace(remoteString(msg, agentAIOriginSocketField))
+		sessionID := remoteString(msg, "session_id")
+		if sessionID == "" {
+			_ = writeJSON(agentAIErrorPayload("", "", fmt.Errorf("%s missing session_id", msgType)))
+			return
+		}
+		if msgType == models.AgentEventAISessionSubscribe {
+			s.ai.subscribeAISocket(socketID, sessionID)
+			s.ai.emitSessionSnapshot(socketID, sessionID, writeJSON)
+		} else {
+			s.ai.unsubscribeAISocket(socketID, sessionID)
+		}
+	case models.AgentEventAIOptionResponse:
+		s.ai.optionResponse(msg, writeJSON)
+	case models.AgentEventToolAskResponse:
+		// 与远端同语义：不受本地开关门（run 阻塞在 ask_user 上时必须能答）。
+		s.ai.toolAskResponse(msg, writeJSON)
 	case models.AgentEventSlashCommandsList:
 		// Slash-command discovery shares the local chat socket so the web UI can
 		// offer `/` completion. It routes through the same detail handler as the
@@ -1015,15 +1088,6 @@ func (s *AgentService) DispatchLocalAI(msg map[string]interface{}, writeJSON fun
 			"error": fmt.Sprintf("unsupported local AI event type: %s", msgType),
 		})
 	}
-}
-
-// UnwatchLocalAIConn 反注销一条本地聊天 socket 连接名下的全部会话 watch。
-// 读循环退出时由 HandleAIStream 调用;ai 管理器缺省(部分测试直构)时静默。
-func (s *AgentService) UnwatchLocalAIConn(connID string) {
-	if s == nil || s.ai == nil {
-		return
-	}
-	s.ai.unwatchSessionConn(connID)
 }
 
 type remoteConnectionIdentity struct {

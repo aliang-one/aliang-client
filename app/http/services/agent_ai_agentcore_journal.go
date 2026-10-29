@@ -9,6 +9,7 @@ package services
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -69,9 +70,11 @@ func agentCoreJournalFileName(sessionID string) string {
 	return name + ".jsonl"
 }
 
-// ensureSessionHeader 保证会话文件存在且第一行是头行；只在文件不存在时写。
-// 顺带触发 prune（在锁内）。
-func (j *agentCoreJournal) ensureSessionHeader(sessionID, projectPath, model, createdAt string) {
+// ensureSessionHeader 保证会话文件第一行是头行（kind=session）。文件不存在
+// 时创建；存在但无头行（steer 先于 run 的历史竞态，spec §4.3）时整体重写
+// 补头——读全量、写 头行+原内容、原子 rename。文件体量有界（消息+截断
+// 工具行），重写代价可接受。幂等：已有头行直接返回。顺带触发 prune（锁内）。
+func (j *agentCoreJournal) ensureSessionHeader(sessionID, projectPath, model, createdAt, origin string) {
 	if j == nil || j.dir == "" || strings.TrimSpace(sessionID) == "" {
 		return
 	}
@@ -79,6 +82,10 @@ func (j *agentCoreJournal) ensureSessionHeader(sessionID, projectPath, model, cr
 	defer j.mu.Unlock()
 	path := filepath.Join(j.dir, agentCoreJournalFileName(sessionID))
 	if _, err := os.Stat(path); err == nil {
+		if j.hasSessionHeaderLocked(path) {
+			return
+		}
+		j.prependHeaderLocked(path, sessionID, projectPath, model, createdAt, origin)
 		return
 	}
 	if err := os.MkdirAll(j.dir, 0o700); err != nil {
@@ -86,15 +93,9 @@ func (j *agentCoreJournal) ensureSessionHeader(sessionID, projectPath, model, cr
 		return
 	}
 	j.dirReady = true
-	line, err := jsonMarshalLine(map[string]interface{}{
-		"kind":         "session",
-		"session_id":   sessionID,
-		"project_path": projectPath,
-		"model":        model,
-		"created_at":   createdAt,
-	})
-	if err != nil {
-		logger.Warn(fmt.Sprintf("agentcore-journal: header marshal failed session=%s err=%v", sessionID, err))
+	line := j.sessionHeaderLine(sessionID, projectPath, model, createdAt, origin)
+	if line == nil {
+		logger.Warn(fmt.Sprintf("agentcore-journal: header marshal failed session=%s", sessionID))
 		return
 	}
 	if err := os.WriteFile(path, line, 0o600); err != nil {
@@ -106,48 +107,68 @@ func (j *agentCoreJournal) ensureSessionHeader(sessionID, projectPath, model, cr
 	j.pruneLocked(sessionID)
 }
 
-// readSessionHeader 读会话 journal 文件的头行(kind=="session")。惰性 attach
-// 解析(Task 3)用。只读第一行,不整文件载入(转录可能很大)。返回:
-//   - exists=true:头行损坏/超长/kind 不符——文件在场但无法证明不是本家,
-//     调用方按「journal 在场」保守拒绝(绑定缺失不得静默新建,分叉守卫不失效);
-//   - matched=true:本家头行(头行 session_id 与入参一致——文件名是多对一
-//     清洗映射:非法字符→`_`、120 截断,必须逐字比对防把别家会话当本家),
-//     project_path/model 可用;
-//   - exists=false:文件不在场,或头行可读但 session_id 是别家(清洗映射碰撞,
-//     本家确无 journal → 调用方按「无 journal」放行新建)。
-func (j *agentCoreJournal) readSessionHeader(sessionID string) (projectPath, model string, matched bool, exists bool) {
-	if j == nil || j.dir == "" || strings.TrimSpace(sessionID) == "" {
-		return "", "", false, false
-	}
-	j.mu.Lock()
-	defer j.mu.Unlock()
-	path := filepath.Join(j.dir, agentCoreJournalFileName(sessionID))
-	file, err := os.Open(path)
+// sessionHeaderLine 生成头行字节（含结尾 \n）；marshal 失败返回 nil。
+func (j *agentCoreJournal) sessionHeaderLine(sessionID, projectPath, model, createdAt, origin string) []byte {
+	line, err := jsonMarshalLine(map[string]interface{}{
+		"kind":         "session",
+		"session_id":   sessionID,
+		"project_path": projectPath,
+		"model":        model,
+		"created_at":   createdAt,
+		"origin":       origin,
+	})
 	if err != nil {
-		return "", "", false, false
+		return nil
 	}
-	defer file.Close()
-	// Scanner 默认 64KiB 行上限:超长/损坏头行会被误读成「无行」→ 假阴性 →
-	// 绑定也缺时静默走新建,分叉守卫恰在最需要时失效。放宽到 4MiB。
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-	if !scanner.Scan() {
-		return "", "", true, true
+	return line
+}
+
+// hasSessionHeaderLocked 判断文件首行是否已是合法 session 头行；文件打不开、
+// 空文件、首行非法 JSON 或 kind 不是 session 都算无头。调用方必须持有 j.mu。
+func (j *agentCoreJournal) hasSessionHeaderLocked(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	if !sc.Scan() {
+		return false
 	}
 	var head map[string]interface{}
-	if json.Unmarshal([]byte(scanner.Text()), &head) != nil {
-		return "", "", true, true
+	if json.Unmarshal(sc.Bytes(), &head) != nil {
+		return false
 	}
-	if kind, _ := head["kind"].(string); kind != "session" {
-		return "", "", true, true
+	return head["kind"] == "session"
+}
+
+// prependHeaderLocked 整体重写补头：tmp 文件写 头行+原内容，rename 原子替换。
+// 在 j.mu 锁内做全量读+写+rename——journal 文件有界（消息+截断工具行），
+// 重写代价可接受；与 appendLineLocked 同锁互斥，无并发写坏。调用方必须持有 j.mu。
+func (j *agentCoreJournal) prependHeaderLocked(path, sessionID, projectPath, model, createdAt, origin string) {
+	head := j.sessionHeaderLine(sessionID, projectPath, model, createdAt, origin)
+	if head == nil {
+		return
 	}
-	if headSessionID, _ := head["session_id"].(string); strings.TrimSpace(headSessionID) != sessionID {
-		// 清洗映射碰撞:文件是别家的,本家确无 journal。
-		return "", "", false, false
+	old, err := os.ReadFile(path)
+	if err != nil {
+		logger.Warn(fmt.Sprintf("agentcore-journal: header backfill read failed session=%s err=%v", sessionID, err))
+		return
 	}
-	projectPath, _ = head["project_path"].(string)
-	model, _ = head["model"].(string)
-	return strings.TrimSpace(projectPath), strings.TrimSpace(model), true, true
+	tmp := path + ".tmp"
+	var buf bytes.Buffer
+	buf.Write(head)
+	buf.Write(old)
+	if err := os.WriteFile(tmp, buf.Bytes(), 0o600); err != nil {
+		logger.Warn(fmt.Sprintf("agentcore-journal: header backfill write failed session=%s err=%v", sessionID, err))
+		return
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		logger.Warn(fmt.Sprintf("agentcore-journal: header backfill rename failed session=%s err=%v", sessionID, err))
+		_ = os.Remove(tmp)
+		return
+	}
+	logger.Info(fmt.Sprintf("agentcore-journal: session header backfilled session=%s", sessionID))
 }
 
 func (j *agentCoreJournal) appendUser(sessionID, messageID, text, ts string) {
@@ -268,6 +289,24 @@ func (j *agentCoreJournal) appendTool(sessionID, tool, summary string, isError b
 	})
 }
 
+// appendApprovalAudit 落 kind=approval 审计行（决策/取消/超时统一入口，
+// spec §4.5）。不参与去重、不进历史回放：读侧（inventory/history parser）
+// 对未知 kind 忽略。尽力而为；写失败 Warn 吞掉。守卫与 appendTool 同款。
+func (j *agentCoreJournal) appendApprovalAudit(sessionID, approvalID string, runSeq int, decision string) {
+	if j == nil || j.dir == "" || strings.TrimSpace(sessionID) == "" {
+		return
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.appendLineLocked(sessionID, map[string]interface{}{
+		"kind":        "approval",
+		"approval_id": approvalID,
+		"run_seq":     runSeq,
+		"decision":    decision,
+		"ts":          time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
 // appendLineLocked 追加一行；调用方必须持有 j.mu。写失败 Warn 后吞掉，
 // 返回是否写成功（mkdir/open/write 任一失败即 false）——appendMsg 靠它
 // 决定去重键只记「已落盘」。目录懒创建在此处（O_CREATE 建不了缺失的父
@@ -360,4 +399,26 @@ func jsonMarshalLine(row map[string]interface{}) ([]byte, error) {
 		return nil, err
 	}
 	return append(raw, '\n'), nil
+}
+
+// agentCoreJournalOriginFor 头行来源统一推导（run 路径与斜杠命令路径共用，
+// Task 12 也调它）：以发起 socket 推导——remote 常驻 socket=phone，本地聊天
+// socket（aisock-* 前缀）=dashboard；socket 标记缺失（旧调用方/TUI/测试路径）
+// 才回落 surface（只认 "phone"，normalizeAgentAISurface 白名单仅此一词——
+// 刻意不动它）。phone 会话未来被本机续聊时，origin 忠实记录这一回合是谁发的。
+func agentCoreJournalOriginFor(originSocketID, surface string) string {
+	switch {
+	case originSocketID == agentAIRemoteSocketID:
+		return "phone"
+	case strings.HasPrefix(originSocketID, "aisock-"):
+		return "dashboard"
+	case surface == "phone":
+		return "phone"
+	default:
+		return "unknown"
+	}
+}
+
+func agentCoreJournalOrigin(run agentAIRun) string {
+	return agentCoreJournalOriginFor(run.originSocketID, run.surface)
 }

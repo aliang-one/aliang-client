@@ -183,6 +183,12 @@ type AgentService struct {
 	// the owner is driving the connection lifecycle.
 	bootSessionEventSeen atomic.Bool
 
+	// remoteHello gates change-driven full hellos (see agent_vibe_hello_gate.go):
+	// 2026-10-29 生产实锤 digest 风暴(3367 hello/天,2496 次因 vibe_digest_change)
+	// 把 server 端 ai_messages 写路径拖入死锁。变更推送改为 ≥30s 合批;状态挂
+	// 服务级以跨重连存活,sendAgentHello 单一咽喉刷新基线。
+	remoteHello agentRemoteHelloGate
+
 	// remoteWriter holds the live remote-connection writer. AI (and terminal)
 	// events are emitted through currentRemoteWriter() rather than a closure
 	// captured at message-arrival time, so a reconnect reattaches in-flight AI
@@ -329,19 +335,11 @@ func (s *AgentService) Status() models.AgentStatusResponse {
 // VibeSessions returns the local AI coding sessions (Claude/Codex) as
 // lightweight summaries, newest first. Transcript is stripped.
 func (s *AgentService) VibeSessions() []models.AgentVibeSession {
-	return s.annotateAndOverlayVibeSessions(summarizeAgentVibeSessions(collectAgentVibeSessions(nil)))
-}
-
-// annotateAndOverlayVibeSessions 是会话列表的注解+活跃覆盖尾段。origin 注解
-// (只增不改既有字段)与手机 sync 快照同源同序——先注解再 overlay,前端抽屉
-// 的「手机/桌面」来源标记才拿得到非空 origin。抽出成函数是为了可测(端点
-// 本体带全量磁盘扫描,单测不可负担)。
-func (s *AgentService) annotateAndOverlayVibeSessions(base []models.AgentVibeSession) []models.AgentVibeSession {
+	snapshot := agentSyncSnapshot{VibeSessions: summarizeAgentVibeSessions(collectAgentVibeSessions(nil))}
 	if s == nil || s.ai == nil {
-		return base
+		return snapshot.VibeSessions
 	}
-	base = s.ai.annotateManagedVibeSessions(base)
-	return overlayActiveAgentVibeSessions(agentSyncSnapshot{VibeSessions: base}, s.ai.activeVibeSessionsSnapshot(), nil).VibeSessions
+	return overlayActiveAgentVibeSessions(snapshot, s.ai.activeVibeSessionsSnapshot(), nil).VibeSessions
 }
 
 // RuntimeSessions returns process-local sessions that are actively executing.

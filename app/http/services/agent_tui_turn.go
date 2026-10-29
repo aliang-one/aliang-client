@@ -830,15 +830,11 @@ func agentAITUIAttachmentPromptSuffix(attachments []agentAIAttachment) string {
 }
 
 // clearTUITurnSessionState 清掉本回合在 session 上的占用标记，让后续回合可跑。
-// activeEmitter 必须与 activeWriter 同对清零：回合结束后 emitter 已终态、
-// watcher 拷贝已被 clearWatcherCopies 清空——留着它会让回合间隙的
-// ai.session.watch 把 sink 插进死 emitter（removed 永不关，pump 永久 park）。
 func (m *agentAIManager) clearTUITurnSessionState(session *agentAISession) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	session.cancel = nil
 	session.activeWriter = nil
-	session.activeEmitter = nil
 	session.activity = nil
 	session.tuiTurn = nil
 	session.activeRunID = ""

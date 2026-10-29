@@ -62,34 +62,15 @@ export async function getAgentRuntimeSessions() {
   return request('/api/agent/runtime-sessions', { method: 'GET' });
 }
 
-export async function getAgentSessionDetail(sessionId, { limit, before, signal } = {}) {
+export async function getAgentSessionDetail(sessionId, { limit, before } = {}) {
   const params = new URLSearchParams();
   if (limit) params.set('limit', String(limit));
   if (before) params.set('before', before);
   const query = params.toString();
   return request(
     `/api/agent/session?id=${encodeURIComponent(sessionId)}${query ? `&${query}` : ''}`,
-    { method: 'GET', signal }
+    { method: 'GET' }
   );
-}
-
-// 转录冷路径（首请求可能触发设备侧冷扫描/读盘，>15s 是常态）：AbortController
-// 硬顶 40s。超时抛 'transcript-timeout' 标记错误；重试=再次调用（UI 重试按钮）。
-export const AGENT_TRANSCRIPT_TIMEOUT_MS = 40000;
-
-export async function loadAgentTranscript(sessionId, { limit = 50, timeoutMs = AGENT_TRANSCRIPT_TIMEOUT_MS } = {}) {
-  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
-  const timer = setTimeout(() => controller && controller.abort(), timeoutMs);
-  try {
-    return await getAgentSessionDetail(sessionId, { limit, signal: controller ? controller.signal : undefined });
-  } catch (err) {
-    if (err && err.name === 'AbortError') {
-      throw new Error('transcript-timeout');
-    }
-    throw err;
-  } finally {
-    clearTimeout(timer);
-  }
 }
 
 export async function getAgentScanDirectories() {

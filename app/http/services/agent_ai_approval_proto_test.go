@@ -5,9 +5,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
-
-	"aliang.one/nursorgate/app/http/models"
 )
 
 // captureAIWriter returns a writer that records emitted events and the mutex
@@ -358,58 +355,5 @@ func TestAgentAIApprovalCancelledEmittedOnClose(t *testing.T) {
 	manager.mu.Unlock()
 	if stillThere {
 		t.Fatal("pending approval was not removed on close")
-	}
-}
-
-// Y1（跨端 Task 4.5 交接）：网页 attach 后主动拉审批对账——DispatchLocalAI 的
-// ai.approval.sync case。属主兼 watcher 的连接请求 sync：直写恰好一份（无活跃
-// run 的注册表扇出排除请求方连接；活跃 emitter 路径由 isOwnerConn 跳过属主），
-// peer watcher 照常一份；无待批时静默（与 watch 同语义）。
-func TestDispatchLocalAIApprovalSyncOwnerDirectWrite(t *testing.T) {
-	svc := &AgentService{ai: newAgentAIManager()}
-	defer svc.ai.closeAll()
-
-	ownerRec := &emitterWatchRecorder{}
-	peerRec := &emitterWatchRecorder{}
-	svc.ai.watchSession("s-sync", "conn-owner", ownerRec.write)
-	svc.ai.watchSession("s-sync", "conn-peer", peerRec.write)
-
-	// 无待批 → 静默：请求方与 watcher 均零帧。
-	svc.DispatchLocalAI(map[string]interface{}{
-		"type": models.AgentEventAIApprovalSync, "conn_id": "conn-owner",
-	}, ownerRec.write)
-	if n := len(ownerRec.snapshot()); n != 0 {
-		t.Fatalf("owner frames with none pending = %d, want 0", n)
-	}
-	if n := len(peerRec.snapshot()); n != 0 {
-		t.Fatalf("peer frames with none pending = %d, want 0", n)
-	}
-
-	registerPendingApproval(svc.ai, "s-sync", "ap_sync", 1)
-
-	// 有待批：属主兼 watcher 恰好一份（直写；注册表扇出排除请求方连接）。
-	svc.DispatchLocalAI(map[string]interface{}{
-		"type": models.AgentEventAIApprovalSync, "conn_id": "conn-owner",
-	}, ownerRec.write)
-	waitForWatchCond(t, 2*time.Second, "owner direct sync frame", func() bool {
-		return len(ownerRec.snapshot()) == 1
-	})
-	if n := len(ownerRec.snapshot()); n != 1 {
-		t.Fatalf("owner sync copies = %d, want exactly 1 (direct write only)", n)
-	}
-	waitForWatchCond(t, 2*time.Second, "peer fanout sync frame", func() bool {
-		return len(peerRec.snapshot()) == 1
-	})
-	if n := len(peerRec.snapshot()); n != 1 {
-		t.Fatalf("peer sync copies = %d, want 1", n)
-	}
-
-	frame := ownerRec.snapshot()[0]
-	if frame["type"] != models.AgentEventAIApprovalSync {
-		t.Fatalf("frame type = %v, want ai.approval.sync", frame["type"])
-	}
-	pending, _ := frame["pending"].([]map[string]interface{})
-	if len(pending) != 1 || pending[0]["approval_id"] != "ap_sync" {
-		t.Fatalf("pending = %+v, want single ap_sync entry", pending)
 	}
 }

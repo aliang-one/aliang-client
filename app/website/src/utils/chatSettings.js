@@ -1,6 +1,7 @@
 // 会话设置条（工作目录/模型/effort）的纯逻辑：选项常量、最近项目整理、
-// create 载荷组装、目录锁定判定。UI 装配在 ChatPage.vue；本文件保持零依赖
-// 纯函数，vitest 直接覆盖（chatSettings.test.js）。
+// create 载荷组装、目录锁定判定、来源角标与设备会话清单映射（阶段 2 跨端
+// 统一）。UI 装配在 ChatPage.vue；本文件保持零依赖纯函数，vitest 直接覆盖
+// （chatSettings.test.js）。
 
 // 自定义模型的 select 哨兵值。真实模型名直接用自身作 value。
 export const MODEL_CUSTOM_VALUE = '__custom__';
@@ -56,9 +57,40 @@ export function isDirectoryLocked(conv) {
   return !!(conv && typeof conv === 'object' && conv.dirLocked);
 }
 
+// 终端原生会话的 id 前缀约定（claude_<nativeId> / codex_<id>）。带前缀的
+// 条目本端没有可直连的 journal，续聊必须走「新建托管会话 + resume」。全仓
+// 唯一定义（阶段 2 评审收敛）：useDeviceSessions / ChatPage 均从这里引用。
+export function isTerminalPrefixedSessionId(id) {
+  return typeof id === 'string' && (id.startsWith('claude_') || id.startsWith('codex_'));
+}
+
+// agentcore 上下文喂入（阶段 2 Task 4）：裸 id 设备会话首条续聊的 create 要带
+// journal 转录——否则 create 先注册空 history 会话，message() 的 journal 读回
+// 被跳过，续聊静默变成新会话。后端 remoteAgentAIHistory（agent_ai.go）按
+// row.role/row.content 解析 transcript 数组。判定收口：仅 agentcore 裸 id
+// 设备壳（claude_/codex_ 前缀壳走 resume，由 CLI 自己装回原生历史，再喂转录
+// 会重复）、转录非空、且尚未 ack 消费（deviceTranscriptSent 由 ChatPage 在
+// created ack 后置位——resendCreate/确认门重发在 ack 前同样携带）。脏输入
+// 安全返回 null。
+export function deviceTranscriptForCreate(conv) {
+  if (!conv || typeof conv !== 'object') return null;
+  const entry = conv.deviceSession;
+  if (!entry || typeof entry !== 'object') return null;
+  if (conv.provider !== 'agentcore') return null;
+  if (isTerminalPrefixedSessionId(entry.id) || !entry.id) return null;
+  if (conv.deviceTranscriptSent) return null;
+  const rows = Array.isArray(conv.deviceTranscript) ? conv.deviceTranscript : [];
+  if (!rows.length) return null;
+  return rows;
+}
+
 // ai.session.create 载荷统一出口：ChatPage 首发与重发共用，保证字段一致。
+// 续聊扩展（阶段 2）：resumeSessionId → resume_session_id、resumeProjectPath
+// → 覆盖 project_path、deviceTranscriptForCreate → transcript。可选字段——
+// 未设置时键不得出现在载荷（e2e 断言 create 帧字段集，多出的空键会被判为
+// 协议漂移）。
 export function sessionCreatePayload(conv) {
-  return {
+  const payload = {
     type: 'ai.session.create',
     session_id: (conv && conv.aiSessionId) || '',
     project_path: (conv && conv.projectPath) || '',
@@ -67,264 +99,57 @@ export function sessionCreatePayload(conv) {
     model: (conv && conv.model) || '',
     effort: (conv && conv.effort) || '',
   };
-}
-
-// —— attach 语义（服务端契约见 ai.session.create 分支）——
-// 对已存在的 session_id 发 create = attach：不新建、回执 ai.session.created
-// 全字段 + attached:true。六个属主字段（provider/model/effort/resume_session_id/
-// binding_version/initial_context）服务端在 attach 分支静默忽略——前端干脆不发，
-// 换 provider/model 只能新建会话。attach 载荷 = 仅 type + session_id。
-export function attachSessionPayload(sessionId) {
-  return { type: 'ai.session.create', session_id: sessionId || '' };
-}
-
-// watch/unwatch：成功无回执（无 ai.error 即成功）；中途/重复 watch 幂等。
-export function watchSessionPayload(sessionId) {
-  return { type: 'ai.session.watch', session_id: sessionId || '' };
-}
-
-export function unwatchSessionPayload(sessionId) {
-  return { type: 'ai.session.unwatch', session_id: sessionId || '' };
-}
-
-// watch 生命周期：同一时刻最多直播跟踪一个会话。从 current 切到 next 的操作计划
-// （先 unwatch 旧的，再 watch 新的；相同 id → 无操作）。纯函数，ChatPage 依此发帧。
-export function planWatchSwitch(currentSessionId, nextSessionId) {
-  const cur = currentSessionId || null;
-  const next = nextSessionId || null;
-  if (cur === next) return [];
-  const ops = [];
-  if (cur) ops.push({ op: 'unwatch', sessionId: cur });
-  if (next) ops.push({ op: 'watch', sessionId: next });
-  return ops;
-}
-
-// watch 目标：仅 attached 会话可被直播跟踪。本地会话必须返回 null、绝不自 watch。
-// 注：服务端 Task 4.5 已根治自 watch 双投递（扇出跳过属主连接），此前本地自
-// watch 会让同一条 delta 经属主+watcher 两路写、文本翻倍——本门保留为纵深防御，
-// 前端不依赖服务端版本。
-export function watchTargetOf(conv) {
-  return conv && conv.attached && conv.aiSessionId ? conv.aiSessionId : null;
-}
-
-// 流式中的助手气泡（status=running）。零依赖纯函数，ChatPage 与转录守卫共用。
-export function findRunningAssistant(conv) {
-  const msgs = (conv && conv.messages) || [];
-  for (let i = msgs.length - 1; i >= 0; i--) {
-    if (msgs[i].role === 'assistant' && msgs[i].status === 'running') return msgs[i];
+  if (conv && conv.resumeSessionId) {
+    payload.resume_session_id = String(conv.resumeSessionId);
   }
-  return null;
-}
-
-// 转录加载门槛：仅 attached 会话、未在加载、未加载过、且**不在运行中**——
-// 转录整体替换 messages，运行中加载会把逐字直播的气泡冲掉，后续 delta 又因
-// 末尾已是 done 气泡被丢弃（回合剩余输出静默丢失）。
-export function shouldLoadTranscript(conv) {
-  if (!conv || !conv.attached || !conv.aiSessionId) return false;
-  if (conv.transcriptLoading || conv.transcriptLoaded) return false;
-  return !findRunningAssistant(conv);
-}
-
-// 帧归位：优先按 session_id 精确命中（matchedById 纪律）；未命中才走 fallback——
-// 且 fallback 仅允许本地（非 attached）会话承接：attached 会话是别人的直播流，
-// 绝不能被他页会话/未知 session 的帧污染。
-export function findConversationForEvent(conversations, sessionId, activeConversation) {
-  if (sessionId) {
-    const matched = (Array.isArray(conversations) ? conversations : [])
-      .find(c => c && c.aiSessionId === sessionId);
-    if (matched) return matched;
+  if (conv && conv.resumeProjectPath) {
+    payload.project_path = String(conv.resumeProjectPath);
   }
-  if (activeConversation && !activeConversation.attached) return activeConversation;
-  return null;
+  const transcript = deviceTranscriptForCreate(conv);
+  if (transcript) {
+    payload.transcript = transcript;
+  }
+  return payload;
 }
 
-// 抽屉条目组装：会话全量列表 + runtime 快照（运行中徽章）+ 本页绑定集合
-// （bound = 该 session 已被本页某个对话接入）+ 服务端 origin 注解（Task 4.5
-// 起 sessions 端点与手机 sync 快照同源：managed=手机绑定 / external=设备
-// 原生，活跃条目恒 managed），按 updated_at 倒序，客户端分页（服务端无分页）。
-// 任何脏输入安全。
-export function agentSessionDrawerEntries(sessions, { runningIds = [], localSessionIds = [], limit = 20, offset = 0 } = {}) {
-  if (!Array.isArray(sessions)) sessions = [];
-  const running = runningIds instanceof Set ? runningIds : new Set(runningIds || []);
-  const bound = localSessionIds instanceof Set ? localSessionIds : new Set(localSessionIds || []);
-  const entries = sessions
-    .filter(s => s && typeof s === 'object' && s.id)
-    .map(s => ({
-      id: s.id,
-      title: typeof s.title === 'string' ? s.title.trim() : '',
-      provider: s.provider || s.tool || '',
-      projectPath: s.project_path || '',
-      origin: s.origin || '',
-      updatedAtMs: Date.parse(s.updated_at || '') || 0,
-      running: running.has(s.id),
-      bound: bound.has(s.id),
-    }))
-    .sort((a, b) => b.updatedAtMs - a.updatedAtMs);
-  const size = Math.max(limit, 0);
-  const page = entries.slice(offset, offset + size);
-  return { items: page, total: entries.length, hasMore: offset + page.length < entries.length };
+// 会话来源角标：跨端统一清单里标注该条目由哪一端/哪个入口发起。优先级
+// running > origin > id 前缀；都不命中返回 ''（UI 不渲染角标）。脏输入安全
+// 返回 ''。terminal 判定沿用终端会话 ID 的 claude_/codex_ 前缀约定。
+export function sessionSourceBadge(session) {
+  if (!session || typeof session !== 'object') return '';
+  if (session.status === 'running') return 'active';
+  if (session.origin === 'phone') return 'phone';
+  if (session.origin === 'dashboard') return 'dashboard';
+  const id = String(session.id ?? '');
+  if (id.startsWith('claude_') || id.startsWith('codex_')) return 'terminal';
+  return '';
 }
 
-// 来源标记三态：本页自建/接入 → 本机（bound 优先，attached 样式另表）；
-// 否则 managed（手机绑定）→ 手机；external/未知 → 桌面（设备原生）。
-export function originBadgeOf(entry) {
-  if (entry && entry.bound) return 'local';
-  if (entry && entry.origin === 'managed') return 'phone';
-  return 'desktop';
+// 设备会话 provider 归一：服务端清单对同一内核可能下发 claude/claudecode
+// 两种拼写（历史通道差异），统一到前端会话的 provider 词表；未知/空回落
+// claudecode（与 sessionCreatePayload 的缺省一致）。
+export function normalizeDeviceProvider(provider) {
+  const p = typeof provider === 'string' ? provider.trim().toLowerCase() : '';
+  if (p === 'claude' || p === 'claudecode') return 'claudecode';
+  if (p === 'codex') return 'codex';
+  if (p === 'agentcore') return 'agentcore';
+  return 'claudecode';
 }
 
-// 服务端转录行（/api/agent/session → transcript[]）→ 本页消息气泡。
-// 空 content 行丢弃；role 非 user 一律按 assistant 渲染。
-export function transcriptToMessages(rows) {
-  if (!Array.isArray(rows)) return [];
-  return rows
-    .filter(r => r && typeof r === 'object' && typeof r.content === 'string' && r.content.trim() !== '')
-    .map(r => ({
-      role: r.role === 'user' ? 'user' : 'assistant',
-      content: r.content,
-      status: 'done',
-      ts: Date.parse(r.timestamp || '') || 0,
-    }));
-}
-
-// 刷新恢复候选：attach 接管过、带真实设备会话 id 的会话。session id 形态由
-// 服务端定（codex_*/claude_*/agentcore 内部 id 等），前端只排除自己造的
-// local- 伪 id——按 ai_ 前缀过滤会把几乎全部真实会话排除掉。
-export function restorableAttachedSessionIds(conversations) {
-  if (!Array.isArray(conversations)) return [];
-  return conversations
-    .filter(c => c && c.attached && typeof c.aiSessionId === 'string' && c.aiSessionId !== '' && !c.aiSessionId.startsWith('local-'))
-    .map(c => c.aiSessionId);
-}
-
-// —— Task 5：直播帧渲染 + steer/stop 操作（载荷与流式气泡纯逻辑）——
-
-// 插话：注入正在运行的回合（Required=type,session_id,message_id,content）。
-// 回执 ai.steer.ack 按 message_id 对账；result 非成功集合（not_running/
-// unsupported/error）表示没送进回合。
-export function steerPayload(sessionId, content, messageId) {
-  return { type: 'ai.steer', session_id: sessionId || '', message_id: messageId || '', content: content || '' };
-}
-
-// ai.steer.ack 成功判定：Go 侧成功回执值是 queued（TUI/claude stdin 路径）或
-// applied（agentcore 等专用执行器）——没有 'ok'；'ok' 仅防御性容错。
-export function isSteerAckSuccess(result) {
-  return ['ok', 'queued', 'applied'].includes(String(result || '').trim().toLowerCase());
-}
-
-// steer 失败分级：turn_ended（没送进回合，回合已结束）/ rejected（不可重试：
-// bad_request、ai_control_disabled、unsupported_attachment）/ retryable（其余，
-// 通常是发送层失败可重试）。
-export function steerFailureKind(code) {
-  const c = String(code || '').trim().toLowerCase();
-  if (c === 'turn_ended' || c === 'not_running') return 'turn_ended';
-  if (c === 'bad_request' || c === 'ai_control_disabled' || c === 'unsupported_attachment') return 'rejected';
-  return 'retryable';
-}
-
-// 停止：Required=type,session_id（run_id/source_session_id 可选，网页无 run_id 不带）。
-export function stopPayload(sessionId) {
-  return { type: 'ai.stop', session_id: sessionId || '' };
-}
-
-// 审批对账拉取：client→agent 请求 still-pending 全集（回执 ai.approval.sync
-// 带 pending，且向该会话 watcher 扇出）。用于自愈「属主兼 watcher 时旁路帧
-// 可能缺一份」的不对称——sync 是可主动拉取的权威源。
-export function approvalSyncRequestPayload() {
-  return { type: 'ai.approval.sync' };
-}
-
-// ai.run.progress 归一：只留可渲染的事实（重试/文件/Git 计数），缺省/非法
-// 数值归 NaN 由调用方过滤。
-export function runProgressFacts(e) {
-  const src = e && typeof e === 'object' ? e : {};
-  const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : NaN);
+// 设备会话清单条目 → 前端统一会话对象（跨端清单与本地会话同池渲染的适配
+// 层）。id 加 dev- 前缀避免与本地会话 ID 撞车；title 缺省回落设备会话 ID；
+// 原始条目挂在 deviceSession 供续聊分流读 origin/created_at。脏输入（null/
+// undefined/非对象）安全返回 null，调用方过滤即可。
+export function deviceSessionToConversation(entry) {
+  if (!entry || typeof entry !== 'object') return null;
+  const id = typeof entry.id === 'string' ? entry.id : '';
   return {
-    retrying: src.retry_active === true || src.retry_active === 'true',
-    attempt: num(src.retry_attempt),
-    max: num(src.retry_max),
-    files: num(src.files_touched_count),
-    git: num(src.git_changed_count),
+    id: 'dev-' + id,
+    title: entry.title || id,
+    provider: normalizeDeviceProvider(entry.provider),
+    projectPath: entry.project_path || '',
+    deviceSession: entry,
+    createdAt: entry.created_at || '',
+    updatedAt: entry.updated_at || '',
   };
-}
-
-// 流式气泡定位：kind='prose'（正文）/'thinking'（思考）。规则：
-// ①尾部同类 running 气泡 → 续写；②末条助手气泡是 prose 且已收尾 → 回合已
-// 终结，迟到帧丢弃（绝不滞留孤泡）；③其余（思考尾 done、用户尾、空）→ 开
-// 新气泡——思考结束转正文时 prose 必须另起新泡，不能塞进思考泡。
-export function ensureStreamingBubble(conv, kind = 'prose') {
-  const msgs = (conv && conv.messages) || [];
-  const last = msgs[msgs.length - 1];
-  if (last && last.role === 'assistant' && (last.kind || 'prose') === kind && last.status === 'running') return last;
-  if (last && last.role === 'assistant' && (last.kind || 'prose') === 'prose' && (last.status === 'done' || last.status === 'error')) return null;
-  const fresh = { role: 'assistant', kind, content: '', status: 'running', ts: Date.now() };
-  if (conv) conv.messages.push(fresh);
-  return fresh;
-}
-
-// 回合开始（ai.run.started）：权威新回合。已有 running 占位（本地 sendMessage
-// 先推的占位）→ 复用；否则强制开新泡——attached 直播多回合时上一回合 prose
-// 已 done，必须开新泡而不是丢弃（旧 ensureAssistantBubble 在此丢帧）。
-export function startRunBubble(conv) {
-  const msgs = (conv && conv.messages) || [];
-  const last = msgs[msgs.length - 1];
-  if (last && last.role === 'assistant' && last.status === 'running') return last;
-  const fresh = { role: 'assistant', content: '', status: 'running', ts: Date.now() };
-  if (conv) conv.messages.push(fresh);
-  return fresh;
-}
-
-// 回合终结：把所有 running 助手气泡（正文+思考）翻到终态。
-export function finishRunBubbles(conv, status) {
-  let touched = false;
-  for (const m of (conv && conv.messages) || []) {
-    if (m.role === 'assistant' && m.status === 'running') {
-      m.status = status;
-      touched = true;
-    }
-  }
-  return touched;
-}
-
-// ai.approval.sync.pending 里的审批 id 全集（authoritative-replace 的 keep 集合）。
-export function syncApprovalIdSet(pending) {
-  const ids = new Set();
-  for (const item of Array.isArray(pending) ? pending : []) {
-    const id = item && typeof item === 'object' ? String(item.approval_id || item.id || '') : '';
-    if (id) ids.add(id);
-  }
-  return ids;
-}
-
-// 对账裁剪：该 session 下不在 keep 集合里的待批卡移除（服务端已不认）；
-// responding 的保留（本地请求在途，结果由 ack/终态帧收口）。
-export function dropStaleApprovals(approvals, sessionId, keepIds) {
-  if (!Array.isArray(approvals)) return [];
-  const keep = keepIds instanceof Set ? keepIds : new Set(keepIds || []);
-  return approvals.filter(a => !a || a.sessionId !== sessionId || !a.id || keep.has(a.id) || a.status === 'responding');
-}
-
-// 转录×直播对账（衔接点）：转录是冷路径快照，journal 落盘滞后会尾部缺段——
-// 抓取起点拍的直播快照不能被盲替换丢掉（快照里的消息 ts 全部早于抓取起点，
-// 不能按时间窗筛——那会筛成空集、合并退化为盲替换）。TOCTOU 守卫已保证取
-// 完成时无运行中气泡，快照即全量直播面：对整个快照按 (role+content) **多重
-// 集**去重后接回——转录里同内容出现 N 次，直播面同内容只补 N 次之外的部分
-// （「继续」×2 这类同 role 连续重复条目保守保留，不按集合去重误删）。
-export function mergeTranscriptWithLive(rows, liveSnapshot) {
-  const transcript = transcriptToMessages(rows);
-  const live = (Array.isArray(liveSnapshot) ? liveSnapshot : []).filter(m => m && typeof m === 'object');
-  if (!live.length) return transcript;
-  const counts = new Map();
-  for (const m of transcript) {
-    const key = `${m.role}\u0000${m.content}`;
-    counts.set(key, (counts.get(key) || 0) + 1);
-  }
-  const tail = [];
-  for (const m of live) {
-    const key = `${m.role}\u0000${m.content}`;
-    const remaining = counts.get(key) || 0;
-    if (remaining > 0) counts.set(key, remaining - 1);
-    else tail.push(m);
-  }
-  return transcript.concat(tail);
 }

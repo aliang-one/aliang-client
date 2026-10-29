@@ -1672,3 +1672,175 @@ func TestRunAgentCoreReportsStalledStreamAsError(t *testing.T) {
 		t.Fatalf("上游请求次数 = %d, want 1（停滞必须不可重试）", got)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 失败回合半截输出落盘（Task 14，spec §4.5）
+// ---------------------------------------------------------------------------
+
+// journalPartialAssistantRows 取 journal 里的 assistant msg 行。
+func journalPartialAssistantRows(t *testing.T, dir, sessionID string) []map[string]interface{} {
+	t.Helper()
+	var out []map[string]interface{}
+	for _, row := range readJournalLines(t, dir, sessionID) {
+		if row["kind"] == "msg" && row["role"] == "assistant" {
+			out = append(out, row)
+		}
+	}
+	return out
+}
+
+// TestRunAgentCoreStoppedJournalsPartialOutput：停止的回合若已流出一截文本，
+// journal 必须留半截输出（-partial 行）——不然跨端/重启回放看到的是「这轮
+// 从未存在」，用户停之前读到一半的内容凭空消失。-partial 后缀防与成功行的
+// message_id 撞 appendMsg 去重键；僵尸回合（finalized 后迟返回）不落行。
+func TestRunAgentCoreStoppedJournalsPartialOutput(t *testing.T) {
+	setTestAgentHome(t)
+	journalDir := t.TempDir()
+	m := newAgentAIManager()
+	m.coreJournal = newAgentCoreJournal(journalDir)
+
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		w.Header().Set("content-type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprint(w, "data: "+`{"type":"message_start","message":{"id":"msg_p","model":"glm-5.2"}}`+"\n\n")
+		_, _ = fmt.Fprint(w, "data: "+`{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`+"\n\n")
+		_, _ = fmt.Fprint(w, "data: "+`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"停前半截"}}`+"\n\n")
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-release // 观察到 ai.delta 并 cancel 后放行
+	}))
+	t.Cleanup(func() {
+		close(release)
+		srv.Close()
+	})
+	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
+	t.Setenv("ANTHROPIC_MODEL", "")
+
+	const sessionID = "conv-partial-stop"
+	const runSeq = 2
+	registerTestAISession(t, m, &agentAISession{
+		id:      sessionID,
+		runSeq:  runSeq,
+		history: []agentAIMessage{{Role: "user", Content: "写个长篇"}},
+	})
+
+	log := &agentCoreEventLog{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		m.runAgentCore(ctx, agentAIRun{
+			sessionID:   sessionID,
+			runSeq:      runSeq,
+			messageID:   "msg-partial-stop1",
+			provider:    "agentcore",
+			model:       "glm-5.2",
+			projectPath: t.TempDir(),
+			activity:    newAgentAIActivity(),
+		}, log.write)
+	}()
+
+	// 流管线先 capture（output 缓冲）再 writeJSON(ai.delta)，看到 delta 即
+	// 半截文本已进缓冲——此时 cancel，无竞态。
+	deadline := time.Now().Add(10 * time.Second)
+	for log.count(models.AgentEventAIDelta) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("等首个 ai.delta 超时（事件 %v）", log.types())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatalf("cancel 后 runAgentCore 未返回（事件 %v）", log.types())
+	}
+
+	rows := journalPartialAssistantRows(t, journalDir, sessionID)
+	if len(rows) != 1 {
+		t.Fatalf("assistant 行数 = %d, want 恰 1 条 -partial 行: %v", len(rows), rows)
+	}
+	if rows[0]["message_id"] != "assistant_msg-partial-stop1-partial" {
+		t.Errorf("partial 行 message_id = %v, want assistant_msg-partial-stop1-partial", rows[0]["message_id"])
+	}
+	if text, _ := rows[0]["text"].(string); !strings.Contains(text, "停前半截") {
+		t.Errorf("partial 行 text = %q, want 含停前半截", text)
+	}
+	// end 行必须是 stopped：证明走的确实是真实停止出口。
+	jr := readJournalLines(t, journalDir, sessionID)
+	last := jr[len(jr)-1]
+	if last["kind"] != "end" || last["status"] != "stopped" {
+		t.Fatalf("end 行 = %v, want status=stopped（事件 %v）", last, log.types())
+	}
+}
+
+// TestRunAgentCoreErrorJournalsPartialOutput：中途失败的回合（文本已流出、
+// 上游随后报错）同样要留半截输出。该回合走 result.IsError 出口——内核终止帧
+// 已转成 ai.error，宿主只补 journal。
+func TestRunAgentCoreErrorJournalsPartialOutput(t *testing.T) {
+	setTestAgentHome(t)
+	journalDir := t.TempDir()
+	m := newAgentAIManager()
+	m.coreJournal = newAgentCoreJournal(journalDir)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		w.Header().Set("content-type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprint(w, "data: "+`{"type":"message_start","message":{"id":"msg_e","model":"glm-5.2"}}`+"\n\n")
+		_, _ = fmt.Fprint(w, "data: "+`{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`+"\n\n")
+		_, _ = fmt.Fprint(w, "data: "+`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"错前半截"}}`+"\n\n")
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		// 裸 JSON 错误信封（2xx 内）：invalid_request_error 不可重试，单请求
+		// 即失败——文本已流出、回合中途报错，正是半截形态。
+		_, _ = fmt.Fprint(w, `{"error":{"type":"invalid_request_error","message":"mid-stream boom"}}`+"\n\n")
+	}))
+	t.Cleanup(srv.Close)
+	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
+	t.Setenv("ANTHROPIC_MODEL", "")
+
+	const sessionID = "conv-partial-err"
+	const runSeq = 1
+	registerTestAISession(t, m, &agentAISession{
+		id:      sessionID,
+		runSeq:  runSeq,
+		history: []agentAIMessage{{Role: "user", Content: "写点东西"}},
+	})
+
+	log := &agentCoreEventLog{}
+	m.runAgentCore(context.Background(), agentAIRun{
+		sessionID:   sessionID,
+		runSeq:      runSeq,
+		messageID:   "msg-partial-err1",
+		provider:    "agentcore",
+		model:       "glm-5.2",
+		projectPath: t.TempDir(),
+		activity:    newAgentAIActivity(),
+	}, log.write)
+
+	if got := log.count(models.AgentEventAIError); got != 1 {
+		t.Fatalf("ai.error 数量 = %d, want 1（内核终止帧，序列 %v）", got, log.types())
+	}
+
+	rows := journalPartialAssistantRows(t, journalDir, sessionID)
+	if len(rows) != 1 {
+		t.Fatalf("assistant 行数 = %d, want 恰 1 条 -partial 行: %v", len(rows), rows)
+	}
+	if rows[0]["message_id"] != "assistant_msg-partial-err1-partial" {
+		t.Errorf("partial 行 message_id = %v, want assistant_msg-partial-err1-partial", rows[0]["message_id"])
+	}
+	if text, _ := rows[0]["text"].(string); !strings.Contains(text, "错前半截") {
+		t.Errorf("partial 行 text = %q, want 含错前半截", text)
+	}
+	jr := readJournalLines(t, journalDir, sessionID)
+	last := jr[len(jr)-1]
+	if last["kind"] != "end" || last["status"] != "error" {
+		t.Fatalf("end 行 = %v, want status=error", last)
+	}
+}

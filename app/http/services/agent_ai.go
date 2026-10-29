@@ -38,19 +38,23 @@ type agentAIManager struct {
 	sessions           map[string]*agentAISession
 	approvals          map[string]*agentAIApprovalWaiter
 	completedApprovals map[string]*agentAICompletedApproval
-	codexInputs        map[string]*agentAICodexInputWaiter
-	pendingTerminals   map[string]map[string]interface{}
-	runJournalEnabled  bool
-	bindings           map[string]agentAIBindingRecord
-	processedRuns      map[string]agentAIProcessedRun
-	// sessionWatchers 是「谁在围观哪个会话」的唯一持久注册表:
-	// sessionID -> connID -> watcher 条目。与 sessions 生命周期解耦(会话被逐
-	// 出/终态后注册表仍在),这样下一个 run 构造 emitter 时能重新播种,watcher
-	// 天然跟随后续所有 run。写访问一律持 m.mu。
-	sessionWatchers map[string]map[string]*agentSessionWatcher
+	// sessionApprovals 是会话级批准记忆（accept_for_session，2026-10-28，见
+	// agent_ai_session_approvals.go）：sessionID → {provider\x00匹配键}。内存态、
+	// 随进程消失，惰性 init（与 completedApprovals 的超限全清护栏同风格）。
+	sessionApprovals  map[string]map[string]struct{}
+	codexInputs       map[string]*agentAICodexInputWaiter
+	pendingTerminals  map[string]map[string]interface{}
+	runJournalEnabled bool
+	bindings          map[string]agentAIBindingRecord
+	processedRuns     map[string]agentAIProcessedRun
 	// coreJournal 是 agentcore（AliangCode）调用记录落盘器；dir 为空时内部
 	// 全 no-op。构造时解析一次 agentHome()。
 	coreJournal *agentCoreJournal
+	// —— 跨端会话统一（2026-10-28）——
+	// aiSockets 是出站 socket 注册表；aiSocketSeq 发号。originSocket 不在
+	// manager：随消息 __origin_socket 字段走，落到 session.originSocket（后续任务）。
+	aiSockets   map[string]*agentAISocket
+	aiSocketSeq int
 	// coreMCPDialForTest 允许测试注入内存 MCP 会话（忽略 raw 配置直接返回
 	// session）；nil = 用真实 agentCoreMCPDial。仅测试可写。
 	coreMCPDialForTest func(ctx context.Context, raw agentCoreMCPRawServer) (*mcp.ClientSession, func(), error)
@@ -307,13 +311,9 @@ type agentAISession struct {
 	// isGoalFork marks a fork (re-planning exploration) session. #5: its runs are
 	// forced read-only (run.readOnly) so exploration can't mutate the workspace —
 	// real provider-level enforcement, not just a prompt.
-	isGoalFork   bool
-	cancel       context.CancelFunc
-	activeWriter agentTerminalWriter
-	// activeEmitter 是本会话当前在跑回合的 emitter(activeWriter 的宿主)。
-	// watch 中途订阅(R2)靠它把新 watcher 立即补种进在跑拷贝,不必等到下一
-	// 个 run;clearRunning 收尾置 nil。
-	activeEmitter *agentAIRunEmitter
+	isGoalFork    bool
+	cancel        context.CancelFunc
+	activeWriter  agentTerminalWriter
 	approvalToken string
 	activity      *agentAIActivity
 	// guard 是本回合的收尾守卫（kill 观测 + 宽限强拆）。clearRunning 清空。
@@ -356,6 +356,10 @@ type agentAISession struct {
 	// surface 是本会话最近一个手机回合的驱动面标记（"phone" 或 ""）。
 	// 只增不降：ai.session.create 等旧通道不带该字段时不清掉已置的 phone。
 	surface string
+	// originSocket 是本会话最近一个 run 的发起 socket 注册表 id（"remote" 或
+	// "aisock-N"）。由入站消息的 __origin_socket 标记落（message/create/runStart），
+	// 构造 run 时带进 run.originSocketID 供 fan-out 去重与审批 ack 双写（Task 7）。
+	originSocket string
 }
 
 type agentAISteerMessage struct {
@@ -404,11 +408,6 @@ type agentAIRun struct {
 	sessionID string
 	runID     string
 	messageID string
-	// ownerConnID 是发起本回合的本地聊天 socket 连接标识(HandleAIStream 铸
-	// 造、随入站帧注入 conn_id)。扇出时跳过它——属主走 e.write 直写,同一
-	// 连接若又 watch 了本会话(attach 即自登记),再去重就是双份文本。手机/
-	// remote 路径无 connID(空串),空串永不匹配,行为不变。
-	ownerConnID string
 	// surface 是本回合的驱动面标记（agentAISurfacePhone 或 ""），来自会话
 	// 状态；claudeApprovalHookSettings 据此决定是否硬禁终端交互构件。
 	surface string
@@ -472,6 +471,13 @@ type agentAIRun struct {
 	// 放在 run 上而不是加参数：流循环与 run 同生命周期，且避免改动既有
 	// streamAgentAIStdout/streamStructuredAIDelta 的签名与全部测试调用点。
 	claudeSteer *agentAIClaudeSteerControl
+	// originSocketID 是本回合发起 socket 的注册表 id（"remote" 或 "aisock-N"）。
+	// 由消息分发路径盖的 __origin_socket 标记经 message()/runStart() 落入
+	//（Task 5 起，由 message 的 messageRun/runStart 保留绑定错误发射器/
+	// optionResponse 续接/runUserMessage 执行 run 四路填充；create() 只落
+	// session.originSocket，从不构造 run）；空串=旧调用方（TUI/测试内部
+	// 路径），fan-out 无 origin 去重。
+	originSocketID string
 }
 
 // agentAIAttachment 是一条随消息下发的素材。线上是 JSON，但解析走 remoteString
@@ -486,34 +492,6 @@ type agentAIAttachment struct {
 	Path string
 	URL  string
 	Text string // 仅 Type=="text"
-}
-
-// agentAIWatcherQueueCap 是单个 watcher 的异步投递缓冲。打满即摘:慢/挂死
-// watcher 靠它被识别并移除,绝不反压 run。
-const agentAIWatcherQueueCap = 64
-
-// agentAIWatcherRegistryCap 是全部会话 watcher 注册表的总条目上限。依据:现
-// 实里是少数管理端连接(56431 仪表盘 + 手机)× 每连接个位数会话,128 远超真
-// 实需求;它是断线反注销失效时的防泄漏安全阀,不是工作集策略——被 LRU 摘掉
-// 的连接会收到一次性 ai.session.watch.dropped 通知,客户端据此重新 watch。
-const agentAIWatcherRegistryCap = 128
-
-// agentSessionWatcher 是注册表里的一个 watcher 条目。lastWatchAt 只在
-// watch/重 watch 时刷新(逐帧刷新要每帧抢 m.mu,太烫);LRU 摘除按它排序。
-type agentSessionWatcher struct {
-	connID      string
-	write       agentTerminalWriter
-	lastWatchAt time.Time
-}
-
-// agentSessionWatchSink 是一个 watcher 连接在本 run 内的投递通道:常驻
-// goroutine 从 ch 取帧写给对端,写失败或缓冲打满即整体摘除。removed 在
-// sink 被摘除时关闭,goroutine 清空残余帧后退出(不再阻塞泄漏)。
-type agentSessionWatchSink struct {
-	connID  string
-	writer  agentTerminalWriter
-	ch      chan map[string]interface{}
-	removed chan struct{}
 }
 
 // agentAIRunEmitter serializes every event emitted by one run. Besides adding
@@ -537,20 +515,6 @@ type agentAIRunEmitter struct {
 	// goalAllowedRoots/Commands mirrors run.*; approval hook 读。
 	goalAllowedRoots    []string
 	goalAllowedCommands []string
-	// watcher 异步扇出(跨端同权直播):watchers 是 manager 注册表在构造时的
-	// 拷贝,由 watchMu 保护(独立于 e.mu——扇出绝不阻塞主写路径)。mgr 用于
-	// 摘除时同步回删 manager 注册表;sessionID 供日志与回删定位。
-	// watchTerminated 在终态清拷贝时一次性关闭:attachWatch(R2 中途订阅)据
-	// 此对已终态的 emitter no-op——毫秒窗内「探测时未终态、插入后清拷贝已跑
-	// 过」的竞窗若不设防, sink 会插进死 emitter,removed 永不关,pump 永久
-	// park。与 clearWatcherCopies 同持 watchMu,无竞窗。
-	mgr             *agentAIManager
-	sessionID       string
-	ownerConnID     string
-	watchMu         sync.Mutex
-	watchers        map[string]*agentSessionWatchSink
-	watchTerminated chan struct{}
-	watchClosedOnce sync.Once
 }
 
 func newAgentAIRunEmitter(run agentAIRun, write agentTerminalWriter) *agentAIRunEmitter {
@@ -563,204 +527,10 @@ func newAgentAIRunEmitter(run agentAIRun, write agentTerminalWriter) *agentAIRun
 	return &agentAIRunEmitter{
 		runID:                  runID,
 		write:                  write,
-		ownerConnID:            run.ownerConnID,
 		goalIdentity:           cloneGoalIdentity(run.goalIdentity),
 		goalRequiredCheckCount: run.goalRequiredCheckCount,
 		goalAllowedRoots:       run.goalAllowedRoots,
 		goalAllowedCommands:    run.goalAllowedCommands,
-		watchers:               make(map[string]*agentSessionWatchSink),
-		watchTerminated:        make(chan struct{}),
-	}
-}
-
-// bindSessionWatchers 在构造时从 manager 注册表播种 watcher 拷贝,并为每个
-// watcher 启动常驻投递 goroutine(有界缓冲 + 满即摘)。直接构造的 emitter
-// (不经 manager.runEmitter)没有 watcher,行为与此前完全一致。
-func (e *agentAIRunEmitter) bindSessionWatchers(mgr *agentAIManager, sessionID string) {
-	if mgr == nil {
-		return
-	}
-	e.mgr = mgr
-	e.sessionID = sessionID
-	snapshot := mgr.sessionWatchersSnapshot(sessionID)
-	if len(snapshot) == 0 {
-		return
-	}
-	// 播种本身也持 watchMu:先建齐全部 sink 再启 pump,杜绝构造期与 pump 的
-	// 摘除路径并发改同一 map 的理论窗口。
-	e.watchMu.Lock()
-	defer e.watchMu.Unlock()
-	for connID, write := range snapshot {
-		if e.isOwnerConn(connID) {
-			continue // 属主连接走 e.write 直写,扇出再投就是双份
-		}
-		sink := &agentSessionWatchSink{
-			connID:  connID,
-			writer:  write,
-			ch:      make(chan map[string]interface{}, agentAIWatcherQueueCap),
-			removed: make(chan struct{}),
-		}
-		e.watchers[connID] = sink
-		go e.pumpWatchSink(sink)
-	}
-}
-
-// isOwnerConn 判定一条 watcher 连接是否就是本回合属主(空串永不匹配:手机/
-// remote 路径无连接标识,行为与引入前一致)。
-func (e *agentAIRunEmitter) isOwnerConn(connID string) bool {
-	return e.ownerConnID != "" && connID == e.ownerConnID
-}
-
-// pumpWatchSink 是一个 watcher 的常驻投递 goroutine:从缓冲取帧写给对端。
-// 写失败 → 摘除并退出;removed 关闭(被摘除/终态清拷贝)→ 清空残余帧后退出。
-func (e *agentAIRunEmitter) pumpWatchSink(sink *agentSessionWatchSink) {
-	for {
-		select {
-		case payload := <-sink.ch:
-			if err := sink.writer(payload); err != nil {
-				e.dropWatchSink(sink, fmt.Sprintf("write error: %v", err))
-				return
-			}
-		case <-sink.removed:
-			for {
-				select {
-				case payload := <-sink.ch:
-					// 摘除前的残余帧尽力投递(终态可见);写失败直接放弃,
-					// 不再重复摘除。
-					if err := sink.writer(payload); err != nil {
-						return
-					}
-				default:
-					return
-				}
-			}
-		}
-	}
-}
-
-// dropWatchSink 把一个 watcher 从 emitter 拷贝与 manager 注册表同时摘除并
-// 打 Warn,同时向该连接尽力投递一次 dropped 通知(R1:收到即知该重新 watch;
-// 异步 spawn——本函数可能在 e.mu 内被调,通知写绝不占主写路径)。同一 sink
-// 只会被第一个到达的摘除者处理一次(removed 也只关一次)。
-// 锁序:e.mu(调用方)→ watchMu → m.mu;任何路径都不反向。
-func (e *agentAIRunEmitter) dropWatchSink(sink *agentSessionWatchSink, reason string) {
-	e.watchMu.Lock()
-	if e.watchers[sink.connID] != sink {
-		e.watchMu.Unlock()
-		return
-	}
-	delete(e.watchers, sink.connID)
-	close(sink.removed)
-	e.watchMu.Unlock()
-	if e.mgr != nil {
-		e.mgr.unwatchSession(e.sessionID, sink.connID)
-	}
-	logger.Warn(fmt.Sprintf("[ai.session.watch] dropped session=%s conn=%s reason=%s", e.sessionID, sink.connID, reason))
-	go notifySessionWatchDropped(e.sessionID, sink.writer, reason)
-}
-
-// attachWatch 在 run 进行中把一条 watcher 补种进拷贝(R2 中途订阅:页面中途
-// 打开不再静默等到下一 run)。已存在的 connID 是 no-op(R6:重复 watch 对在
-// 跑 run 的拷贝无效,不产生重复帧);已终态的 emitter 同样 no-op(Y1 同源防
-// 御:watchTerminated 已关 = 拷贝已清,再插 sink 就是 parked pump 泄漏)——
-// 调用方(manager 层)此时只登记注册表,等下一 run 播种。
-func (e *agentAIRunEmitter) attachWatch(connID string, write agentTerminalWriter) {
-	connID = strings.TrimSpace(connID)
-	if connID == "" || write == nil {
-		return
-	}
-	e.watchMu.Lock()
-	select {
-	case <-e.watchTerminated:
-		e.watchMu.Unlock()
-		return
-	default:
-	}
-	if e.isOwnerConn(connID) {
-		// attach 即自登记的属主连接:manager 注册表照登(下一 run/换属主后
-		// 仍有效),但本 run 不插 sink——它拿 e.write 直写,再插即双份。
-		e.watchMu.Unlock()
-		return
-	}
-	if _, ok := e.watchers[connID]; ok {
-		e.watchMu.Unlock()
-		return
-	}
-	sink := &agentSessionWatchSink{
-		connID:  connID,
-		writer:  write,
-		ch:      make(chan map[string]interface{}, agentAIWatcherQueueCap),
-		removed: make(chan struct{}),
-	}
-	e.watchers[connID] = sink
-	e.watchMu.Unlock()
-	go e.pumpWatchSink(sink)
-}
-
-// detachWatch 从拷贝移除一个 watcher(unwatch/断线的即时停帧路径)。不回删
-// manager 注册表(调用方已处理),不打 dropped 通知(主动退订无需惊动客户端)。
-// 返回是否真的移除了条目。
-func (e *agentAIRunEmitter) detachWatch(connID string) bool {
-	e.watchMu.Lock()
-	sink, ok := e.watchers[connID]
-	if ok {
-		delete(e.watchers, connID)
-		close(sink.removed)
-	}
-	e.watchMu.Unlock()
-	return ok
-}
-
-// fanOutWatchers 把一帧投给所有 watcher:非阻塞 try-send(绝不阻塞主写路径,
-// 缓冲打满即摘)+ 每 watcher 独立浅拷贝(异步写不与属主/后续 emit 共享同一
-// map)。必须在 e.mu 内调用——保证 watcher 与属主看到同一 event_seq 序。
-func (e *agentAIRunEmitter) fanOutWatchers(payload map[string]interface{}) {
-	e.fanOutLocked(payload)
-}
-
-// fanOutOutOfBand 把不带 run 序号的旁路帧(审批 cancelled/sync 等)投给
-// watcher 拷贝。不持 e.mu:这些帧不经 run 屏障、不参与 event_seq 序(属主收
-// 到的也是同一份裸帧),唯一共享约束是 watchMu 保护的拷贝遍历与摘除。
-func (e *agentAIRunEmitter) fanOutOutOfBand(payload map[string]interface{}) {
-	e.fanOutLocked(payload)
-}
-
-// fanOutLocked 是两条扇出入口共用的实现:非阻塞 try-send + 满即摘,摘除在
-// 释放 watchMu 后统一执行,避免持锁重入 dropWatchSink。
-func (e *agentAIRunEmitter) fanOutLocked(payload map[string]interface{}) {
-	var dropped []*agentSessionWatchSink
-	e.watchMu.Lock()
-	for _, sink := range e.watchers {
-		if e.isOwnerConn(sink.connID) {
-			continue // 属主连接走 e.write 直写,扇出再投就是双份
-		}
-		frame := make(map[string]interface{}, len(payload))
-		for key, value := range payload {
-			frame[key] = value
-		}
-		select {
-		case sink.ch <- frame:
-		default:
-			dropped = append(dropped, sink)
-		}
-	}
-	e.watchMu.Unlock()
-	for _, sink := range dropped {
-		e.dropWatchSink(sink, "queue full")
-	}
-}
-
-// clearWatcherCopies 只清 emitter 拷贝并让投递 goroutine 排空退出;manager
-// 注册表不动(watcher 跨 run 持久,下一 run 播种仍在)。终态时调用。一次性
-// 关闭 watchTerminated,给 attachWatch 的终态防御供旗标。
-func (e *agentAIRunEmitter) clearWatcherCopies() {
-	e.watchMu.Lock()
-	sinks := e.watchers
-	e.watchers = make(map[string]*agentSessionWatchSink)
-	e.watchClosedOnce.Do(func() { close(e.watchTerminated) })
-	e.watchMu.Unlock()
-	for _, sink := range sinks {
-		close(sink.removed)
 	}
 }
 
@@ -814,20 +584,9 @@ func (e *agentAIRunEmitter) emit(value interface{}) error {
 		e.terminal = true
 		if e.onTerminal != nil {
 			if err := e.onTerminal(payload); err != nil {
-				// 终态没有发布(属主也没收到这帧),所以不向 watcher 扇出;
-				// 但 emitter 拷贝必须照样清理——否则每个 watcher 的常驻
-				// pump 永久阻塞,把整个 emitter 钉死(A1 泄漏回归钉)。
-				e.clearWatcherCopies()
 				return err
 			}
 		}
-	}
-	// watcher 异步扇出:仍持 e.mu 只为保 event_seq 序,扇出本身是非阻塞
-	// try-send,慢/挂 watcher 不可能拖住属主写路径。终态帧扇出后只清 emitter
-	// 拷贝,manager 注册表不动(跨 run 持久)。
-	e.fanOutWatchers(payload)
-	if terminal {
-		e.clearWatcherCopies()
 	}
 	return e.write(payload)
 }
@@ -946,6 +705,9 @@ type agentAIApprovalWaiter struct {
 	sessionID string
 	runSeq    int
 	request   agentAIApprovalRequest
+	// expiresAt 是审批等待的绝对截止（requestApproval 时刻 + agentAIApprovalTimeout）。
+	// pending 帧与两端快照带 expires_at 供 UI 显示剩余时间（spec §4.2.1）。
+	expiresAt time.Time
 }
 
 type agentAICompletedApproval struct {
@@ -1257,17 +1019,14 @@ func newAgentAIManager() *agentAIManager {
 		pendingTerminals:   make(map[string]map[string]interface{}),
 		bindings:           make(map[string]agentAIBindingRecord),
 		processedRuns:      make(map[string]agentAIProcessedRun),
-		sessionWatchers:    make(map[string]map[string]*agentSessionWatcher),
 		coreJournal:        newAgentCoreJournal(agentCoreJournalDir()),
+		aiSockets:          make(map[string]*agentAISocket),
 	}
 	return m
 }
 
 func (m *agentAIManager) runEmitter(run agentAIRun, write agentTerminalWriter) *agentAIRunEmitter {
 	e := newAgentAIRunEmitter(run, write)
-	// 播种拷贝:emitter 拿到的是注册表此刻的快照,本 run 内的扇出走这份拷贝,
-	// manager 注册表继续独立增删(跨 run 持久)。
-	e.bindSessionWatchers(m, run.sessionID)
 	// Only protocol-v2 cloud runs have a Server ACK peer. Local in-app chat and
 	// legacy servers omit run_id; journaling those terminals would leak forever.
 	if strings.TrimSpace(run.runID) != "" {
@@ -1288,353 +1047,13 @@ func (m *agentAIManager) runEmitter(run agentAIRun, write agentTerminalWriter) *
 			return m.completeProcessedRun(run.runID, payload)
 		}
 	}
+	// 跨端同态（spec §4.1）：origin 仍内联，事件副本扇出到订阅 socket。
+	// originSocketID 从消息分发路径盖的 __origin_socket 来（Task 5 起
+	// messageRun/保留绑定错误发射器/optionResponse/runUserMessage 四路
+	// 填充）；恒空串=无 origin 去重，扇出与 origin 内联并存（仅测试/内部
+	// 路径）。
+	e.write = m.fanOutWrite(run.originSocketID, run.sessionID, e.write)
 	return e
-}
-
-// watchSession 把一条连接登记为某会话的 watcher(跨 run 持久)。同 connID 重
-// 复登记刷新 LRU 时间戳(幂等)。超总 cap 时按 lastWatchAt LRU 摘除最老条目
-// 并向被摘连接尽力投递一次 dropped 通知。持 m.mu。writer 契约:①已带写期限
-// (HandleAIStream 的 writeJSON 每次写设 5s deadline——watcher 写绝不无限阻
-// 塞 pump);②并发安全——writer 内部自带串行(同一 socket 的 writeMu),
-// 多路扇出(pump/旁路帧/dropped 通知)可并发调用而不撕裂帧。
-func (m *agentAIManager) watchSession(sessionID, connID string, write agentTerminalWriter) {
-	sessionID = strings.TrimSpace(sessionID)
-	connID = strings.TrimSpace(connID)
-	if sessionID == "" || connID == "" || write == nil {
-		return
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	conns := m.sessionWatchers[sessionID]
-	if conns == nil {
-		conns = make(map[string]*agentSessionWatcher)
-		m.sessionWatchers[sessionID] = conns
-	}
-	if _, exists := conns[connID]; !exists && m.totalSessionWatchersLocked() >= agentAIWatcherRegistryCap {
-		m.evictOldestSessionWatcherLocked()
-	}
-	conns[connID] = &agentSessionWatcher{connID: connID, write: write, lastWatchAt: time.Now()}
-}
-
-// totalSessionWatchersLocked 统计注册表总条目数。调用方必须持 m.mu。
-func (m *agentAIManager) totalSessionWatchersLocked() int {
-	total := 0
-	for _, conns := range m.sessionWatchers {
-		total += len(conns)
-	}
-	return total
-}
-
-// evictOldestSessionWatcherLocked 按 lastWatchAt 摘除全局最老的 watcher 条目,
-// 并异步向被摘连接投递一次 dropped 通知(通知 goroutine 不碰 m.mu,持锁期间
-// spawn 安全;writer 带 5s deadline,不会无限挂)。调用方必须持 m.mu。
-func (m *agentAIManager) evictOldestSessionWatcherLocked() {
-	var oldestSessionID string
-	var oldest *agentSessionWatcher
-	for sessionID, conns := range m.sessionWatchers {
-		for _, w := range conns {
-			if oldest == nil || w.lastWatchAt.Before(oldest.lastWatchAt) {
-				oldestSessionID = sessionID
-				oldest = w
-			}
-		}
-	}
-	if oldest == nil {
-		return
-	}
-	m.removeSessionWatcherLocked(oldestSessionID, oldest.connID)
-	go notifySessionWatchDropped(oldestSessionID, oldest.write, "registry cap: lru eviction")
-}
-
-// removeSessionWatcherLocked 从注册表摘除单条目,空组连带删除。调用方必须持
-// m.mu。
-func (m *agentAIManager) removeSessionWatcherLocked(sessionID, connID string) {
-	conns := m.sessionWatchers[sessionID]
-	if conns == nil {
-		return
-	}
-	delete(conns, connID)
-	if len(conns) == 0 {
-		delete(m.sessionWatchers, sessionID)
-	}
-}
-
-// unwatchSession 摘除一条连接对某会话的 watch,并同步裁剪该会话在跑 emitter
-// 的 watcher 拷贝——「unwatch 即时停帧」对在跑 run 也要成立。不存在的组合是
-// no-op。锁纪律:m.mu(取指针)释放后再取 emitter 的 watchMu,任何路径都不
-// 同时持有两把锁,与 emit 期的 e.mu → watchMu → m.mu 顺序无环。
-func (m *agentAIManager) unwatchSession(sessionID, connID string) {
-	sessionID = strings.TrimSpace(sessionID)
-	connID = strings.TrimSpace(connID)
-	if sessionID == "" || connID == "" {
-		return
-	}
-	m.mu.Lock()
-	m.removeSessionWatcherLocked(sessionID, connID)
-	var emitter *agentAIRunEmitter
-	if session := m.sessions[sessionID]; session != nil {
-		emitter = session.activeEmitter
-	}
-	m.mu.Unlock()
-	if emitter != nil {
-		emitter.detachWatch(connID)
-	}
-}
-
-// unwatchSessionConn 按连接反注销:一条 socket 断开时,把它名下对全部会话的
-// watch 一次清干净(读循环退出处调用),并裁剪所有在跑 emitter 的拷贝。
-func (m *agentAIManager) unwatchSessionConn(connID string) {
-	connID = strings.TrimSpace(connID)
-	if connID == "" {
-		return
-	}
-	m.mu.Lock()
-	for sessionID := range m.sessionWatchers {
-		m.removeSessionWatcherLocked(sessionID, connID)
-	}
-	emitters := make([]*agentAIRunEmitter, 0, len(m.sessions))
-	for _, session := range m.sessions {
-		if session != nil && session.activeEmitter != nil {
-			emitters = append(emitters, session.activeEmitter)
-		}
-	}
-	m.mu.Unlock()
-	for _, emitter := range emitters {
-		emitter.detachWatch(connID)
-	}
-}
-
-// sessionWatchersSnapshot 返回某会话 watcher 注册表的拷贝(nil 安全)。供
-// runEmitter 构造时播种与测试断言;调用方对结果的修改不影响注册表。
-func (m *agentAIManager) sessionWatchersSnapshot(sessionID string) map[string]agentTerminalWriter {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	conns := m.sessionWatchers[sessionID]
-	if len(conns) == 0 {
-		return nil
-	}
-	out := make(map[string]agentTerminalWriter, len(conns))
-	for connID, watcher := range conns {
-		out[connID] = watcher.write
-	}
-	return out
-}
-
-// notifySessionWatchDropped 向一条 watcher 连接尽力投递一次 dropped 通知
-// (R1 弱网语义:满即摘/写错/LRU 摘除后,收到即知该重新 watch)。写失败忽略
-// 且绝不重试——writer 自带 5s deadline,最坏有界阻塞。
-func notifySessionWatchDropped(sessionID string, write agentTerminalWriter, reason string) {
-	if write == nil {
-		return
-	}
-	_ = write(map[string]interface{}{
-		"type":       models.AgentEventAISessionWatchDropped,
-		"session_id": sessionID,
-		"reason":     reason,
-	})
-}
-
-// watch 处理 ai.session.watch:把本连接登记为会话 watcher。解析与 attach 完
-// 全同一路径(绝不另写一份):内存活跃 → 直接收;内存无 → 磁盘惰性解析
-// (绑定优先/journal 补 agentcore/journal-有-绑定-无拒绝)→ 命中即注册壳再
-// 收;完全未知 → ai.error session not found。
-// J5 语义(写明):会话 close 后重 watch——持久会话经惰性解析重建壳成功,
-// watch 与后续 run 无缝继续;非持久会话 session not found 诚实报错,不静默、
-// 不凭空重建。命中并在跑 run 时立即补种 emitter 拷贝(R2)。成功不回执
-// (无 ai.error 即成功)。
-func (m *agentAIManager) watch(msg map[string]interface{}, writeJSON agentTerminalWriter) {
-	if writeJSON == nil {
-		return
-	}
-	sessionID := remoteString(msg, "session_id")
-	connID := remoteString(msg, "conn_id")
-	messageID := remoteString(msg, "message_id")
-	if sessionID == "" || connID == "" {
-		_ = writeJSON(agentAIErrorPayload(sessionID, messageID, errors.New("ai.session.watch missing session_id or conn_id")))
-		return
-	}
-	m.mu.Lock()
-	_, active := m.sessions[sessionID]
-	m.mu.Unlock()
-	if !active {
-		shell, rejectReason := m.resolveDurableSessionShell(sessionID)
-		if shell == nil && rejectReason != "" {
-			_ = writeJSON(map[string]interface{}{
-				"type":       models.AgentEventAIError,
-				"session_id": sessionID,
-				"message_id": messageID,
-				"error":      rejectReason,
-			})
-			return
-		}
-		if shell == nil {
-			_ = writeJSON(map[string]interface{}{
-				"type":       models.AgentEventAIError,
-				"session_id": sessionID,
-				"message_id": messageID,
-				"error":      fmt.Sprintf("ai.session.watch: session not found: %s", sessionID),
-			})
-			return
-		}
-		m.registerSessionIfAbsent(shell)
-	}
-	m.attachSessionWatch(sessionID, connID, writeJSON)
-}
-
-// unwatch 处理 ai.session.unwatch:幂等退订(注册表 + 在跑 emitter 拷贝一起
-// 裁剪),无回执。
-func (m *agentAIManager) unwatch(msg map[string]interface{}, writeJSON agentTerminalWriter) {
-	if writeJSON == nil {
-		return
-	}
-	sessionID := remoteString(msg, "session_id")
-	connID := remoteString(msg, "conn_id")
-	if sessionID == "" || connID == "" {
-		_ = writeJSON(agentAIErrorPayload(sessionID, remoteString(msg, "message_id"), errors.New("ai.session.unwatch missing session_id or conn_id")))
-		return
-	}
-	m.unwatchSession(sessionID, connID)
-}
-
-// attachSessionWatch 登记注册表 + 对在跑 emitter 立即补种(R2 中途订阅;
-// terminal emitter 由 attachWatch 自防 no-op,此处注册表照登——下一 run 播种)。
-func (m *agentAIManager) attachSessionWatch(sessionID, connID string, write agentTerminalWriter) {
-	m.watchSession(sessionID, connID, write)
-	m.mu.Lock()
-	var emitter *agentAIRunEmitter
-	if session := m.sessions[sessionID]; session != nil {
-		emitter = session.activeEmitter
-	}
-	m.mu.Unlock()
-	if emitter != nil {
-		emitter.attachWatch(connID, write)
-	}
-}
-
-// registerSessionIfAbsent 把一个新会话注册进注册表,锁内重查在场(防
-// TOCTOU:两个并发 create/watch 同一磁盘 id——恰是本特性主场景,重启后手机
-// +网页同时接管——后注册者若直接顶掉前壳,而两壳之间已起跑一回合,内存态
-// 上下文就分叉了)。在场返回既有对象,不在场才注册。形状照抄 message() 的
-// lazy-create。MUST be called instead of raw registerAISessionLocked from
-// every attach/lazy resolution path.
-func (m *agentAIManager) registerSessionIfAbsent(session *agentAISession) *agentAISession {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if existing := m.sessions[session.id]; existing != nil {
-		return existing // a concurrent create/watch registered it first
-	}
-	m.registerAISessionLocked(session)
-	return session
-}
-
-// attachLiveSession 把来者接入既有会话(内存活跃或惰性壳通用):只登记
-// watcher(带 conn_id 时)+ 可选更新 surface,显式不覆写 provider/model/
-// effort/resumeSessionID/bindingVersion/initialContext 六字段,也不重置
-// history/runSeq——跨端接管的根本纪律:旁观端不得改写属主配置。回执带
-// attached:true 与会话元数据。
-func (m *agentAIManager) attachLiveSession(session *agentAISession, msg map[string]interface{}, writeJSON agentTerminalWriter) {
-	if writeJSON == nil {
-		return
-	}
-	connID := remoteString(msg, "conn_id")
-	surface := normalizeAgentAISurface(remoteString(msg, "surface"))
-	m.mu.Lock()
-	// is_goal_fork true-only 应用:不在六字段纪律内,但只许收紧不许放松——
-	// 执行回合的 readOnly 取自 session.isGoalFork,放松即 goal fork 的探索期
-	// 工作区保护静默失效。
-	if fork, _ := msg["is_goal_fork"].(bool); fork {
-		session.isGoalFork = true
-	}
-	if surface != "" {
-		session.surface = surface
-	}
-	session.lastActiveAt = time.Now().UTC()
-	sessionID := session.id
-	m.mu.Unlock()
-	if connID != "" {
-		m.attachSessionWatch(sessionID, connID, writeJSON)
-	}
-	payload := agentAISessionCreatedPayload(session)
-	payload["attached"] = true
-	_ = writeJSON(payload)
-}
-
-// resolveDurableSessionShell 惰性解析磁盘持久会话为最小安全壳
-// (id/provider/resumeSessionID/bindingVersion/projectPath/model/mode=vibe)。
-// 解析序:持久化绑定(bindingForConversation,全 provider)优先;journal 头行
-// 仅补 agentcore 的 model/project_path(头行只有 agentcore 写)。返回:
-//   - shell != nil          → 命中,调用方注册后走 attachLiveSession;
-//   - shell == nil && reason != "" → 命中痕迹但拒绝(journal 有而绑定无——
-//     没有持久绑定就重建壳会鼓励「换 provider 新开 resume id」的静默上下文
-//     分叉,诚实报错而非默许);
-//   - 两者皆空              → 完全未知,调用方走既有新建。
-func (m *agentAIManager) resolveDurableSessionShell(sessionID string) (shell *agentAISession, rejectReason string) {
-	binding, hasBinding := m.bindingForConversation(sessionID)
-	journalProjectPath, journalModel, journalMatched, journalExists := m.coreJournal.readSessionHeader(sessionID)
-	hasJournal := journalExists
-	if !hasBinding && !hasJournal {
-		return nil, ""
-	}
-	if !hasBinding {
-		return nil, fmt.Sprintf("ai.session.create: session %s has a call journal but no durable binding; refusing to recreate it (context fork guard)", sessionID)
-	}
-	provider, err := normalizeAgentAIProvider(binding.Provider)
-	if err != nil {
-		return nil, fmt.Sprintf("ai.session.create: session %s has a corrupt binding provider %q: %v", sessionID, binding.Provider, err)
-	}
-	result := &agentAISession{
-		id:              sessionID,
-		mode:            "vibe",
-		provider:        provider,
-		resumeSessionID: binding.NativeSessionID,
-		bindingVersion:  binding.BindingVersion,
-		lastActiveAt:    time.Now().UTC(),
-	}
-	if binding.State != "confirmed" {
-		// reserved 态:resume + reserved 同指原生 id,与手机首建形态一致,
-		// confirmBinding 的 expected 取绑定本身,不受此影响。
-		result.reservedNativeSessionID = binding.NativeSessionID
-	}
-	if journalMatched && providersEquivalent(provider, "agentcore") {
-		result.projectPath = journalProjectPath
-		result.model = journalModel
-	}
-	return result, ""
-}
-
-// fanOutSessionWatchFrame 把一帧旁路投给某会话的全部 watcher(审批
-// cancelled/sync 等不经 emitter.emit 的裸帧)。优先走该会话在跑 emitter 的
-// sink 通道(Task 1 同一异步机制、同一满即摘纪律);无在跑 emitter 时退化为
-// 每 watcher 一条一次性 goroutine(注册 writer 带 5s 写期限,有界)。
-func (m *agentAIManager) fanOutSessionWatchFrame(sessionID string, payload map[string]interface{}) {
-	m.fanOutSessionWatchFrameExcept(sessionID, payload, "")
-}
-
-// fanOutSessionWatchFrameExcept 把会话级帧扇给全部 watcher，可排除一个连接
-// （emitApprovalSyncForRequester 用：请求方已拿直写，注册表扇出不重复投递）。
-// 活跃 emitter 在场时走 emitter 旁路扇出（属主连接由 isOwnerConn 跳过——
-// excludeConn 拦不到 emitter 路径，直写/扇出两侧的属主语义仍由 4.5 保证）。
-func (m *agentAIManager) fanOutSessionWatchFrameExcept(sessionID string, payload map[string]interface{}, excludeConn string) {
-	if payload == nil {
-		return
-	}
-	m.mu.Lock()
-	var emitter *agentAIRunEmitter
-	if session := m.sessions[sessionID]; session != nil {
-		emitter = session.activeEmitter
-	}
-	m.mu.Unlock()
-	if emitter != nil {
-		emitter.fanOutOutOfBand(payload)
-		return
-	}
-	for connID, write := range m.sessionWatchersSnapshot(sessionID) {
-		if excludeConn != "" && connID == excludeConn {
-			continue
-		}
-		frame := cloneAgentAIMap(payload)
-		go func(w agentTerminalWriter) { _ = w(frame) }(write)
-	}
 }
 
 // registerAISessionLocked stores a new session, evicting the oldest idle
@@ -2195,31 +1614,6 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 		_ = writeJSON(agentAIErrorPayload("", "", errors.New("ai.session.create missing session_id")))
 		return
 	}
-
-	// 跨端同权 attach 探测,先于一切新建动作:
-	// ① 内存活跃会话 → attach(只登记 watcher + surface,禁覆写属主六字段);
-	// ② 磁盘持久会话(绑定优先,journal 仅补 agentcore)→ 惰性壳 + attach,
-	//    跳过 resolveAgentAICWD(路径来自磁盘记录,换机接管是常态);
-	// ③ journal 有而绑定无 → 拒绝(防上下文静默分叉);
-	// ④ 完全未知 → 走下方既有新建,行为不变。
-	m.mu.Lock()
-	existing := m.sessions[sessionID]
-	m.mu.Unlock()
-	if existing != nil {
-		m.attachLiveSession(existing, msg, writeJSON)
-		return
-	}
-	shell, rejectReason := m.resolveDurableSessionShell(sessionID)
-	if shell == nil && rejectReason != "" {
-		_ = writeJSON(agentAIErrorPayload(sessionID, "", errors.New(rejectReason)))
-		return
-	}
-	if shell != nil {
-		shell = m.registerSessionIfAbsent(shell)
-		m.attachLiveSession(shell, msg, writeJSON)
-		return
-	}
-
 	projectPath, err := resolveAgentAICWD(remoteString(msg, "project_path"))
 	if err != nil {
 		_ = writeJSON(agentAIErrorPayload(sessionID, "", err))
@@ -2258,6 +1652,38 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 		}}, history...)
 	}
 
+	m.mu.Lock()
+	if existing := m.sessions[sessionID]; existing != nil {
+		existing.mode = mode
+		existing.projectPath = projectPath
+		existing.provider = provider
+		existing.model = model
+		existing.effort = effort
+		if contextWindow > 0 {
+			existing.contextWindow = contextWindow
+		}
+		existing.resumeSessionID = resumeSessionID
+		existing.reservedNativeSessionID = reservedNativeSessionID
+		existing.bindingVersion = bindingVersion
+		existing.initialContext = initialContext
+		existing.isGoalFork = isGoalFork
+		if surface != "" {
+			existing.surface = surface
+		}
+		if claudePolicy.enabled {
+			existing.claudePolicy = cloneAgentAIClaudeRemotePolicy(claudePolicy)
+			existing.claudeCaps = agentAIClaudeCapabilities{}
+		}
+		if len(history) > 0 {
+			existing.history = trimAgentAIHistoryForSession(existing, history)
+		}
+		if v := strings.TrimSpace(remoteString(msg, agentAIOriginSocketField)); v != "" {
+			existing.originSocket = v
+		}
+		m.mu.Unlock()
+		_ = writeJSON(agentAISessionCreatedPayload(existing))
+		return
+	}
 	// NOTE: no count cap here. The real turn runs on ai.message, whose lazy-create
 	// path (see message()) registers the session unconditionally — so a cap only
 	// in create() was a dead check that emitted a misleading "limit reached"
@@ -2277,11 +1703,13 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 		initialContext:          initialContext,
 		isGoalFork:              isGoalFork,
 		surface:                 surface,
+		originSocket:            strings.TrimSpace(remoteString(msg, agentAIOriginSocketField)),
 		claudePolicy:            cloneAgentAIClaudeRemotePolicy(claudePolicy),
 		history:                 trimAgentAIHistoryWithLimits(history, newHistoryMessages, newHistoryChars),
 		lastActiveAt:            time.Now().UTC(),
 	}
-	session = m.registerSessionIfAbsent(session)
+	m.registerAISessionLocked(session)
+	m.mu.Unlock()
 
 	_ = writeJSON(agentAISessionCreatedPayload(session))
 }
@@ -2313,9 +1741,13 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 	// carries is_goal_fork, and lazy-create persists it for subsequent turns.
 	messageIsGoalFork, _ := msg["is_goal_fork"].(bool)
 	messageRun := agentAIRun{
-		sessionID:              sessionID,
-		runID:                  remoteString(msg, "run_id"),
-		messageID:              messageID,
+		sessionID: sessionID,
+		runID:     remoteString(msg, "run_id"),
+		messageID: messageID,
+		// origin 必须在本条消息自带标记上取：emitter 在 session 解析（含
+		// lazy-create）之前就要建好，读 session.originSocket 只能拿到上一回合
+		// 的旧值——换端发起的回合会被误判成旧端 origin，去重失效变成双投。
+		originSocketID:         strings.TrimSpace(remoteString(msg, agentAIOriginSocketField)),
 		goalIdentity:           goalRunIdentityFromMessage(msg),
 		goalRequiredCheckCount: goalRequiredCheckCountFromContext(msg["goal_context"]),
 		goalAllowedRoots:       goalAllowedRootsFromContext(msg["goal_context"]),
@@ -2323,7 +1755,6 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 		nativeGoal:             cloneAgentAIMap(mapIf(msg["native_goal"])),
 		readOnly:               messageIsGoalFork,
 	}
-	messageRun.ownerConnID = remoteString(msg, "conn_id")
 	emitter := m.runEmitter(messageRun, writeJSON)
 	runWrite := agentTerminalWriter(emitter.emit)
 	if content == "" {
@@ -2397,6 +1828,24 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 		lazyInitialContext := strings.TrimSpace(remoteString(msg, "initial_context"))
 		lazyIsGoalFork, _ := msg["is_goal_fork"].(bool) // #5: ai.run.start lazy-create
 		lazyHistory := remoteAgentAIHistory(msg)
+		// 跨端/重启续聊（spec §4.3）：agentcore 会话不在内存时，优先从 journal
+		// 读回历史装回内存再跑。载荷自带历史（remoteAgentAIHistory 非空）时跳过
+		// ——服务端重发的那份更新；claude/codex 的上下文在 CLI 自己的会话里，
+		// 宿主历史只做展示拼 prompt，不回灌，故不读。读回失败（非 ErrNotExist
+		// 的 IO 错）发 ai.run.notice 提示后照常空起——历史损坏不能顶死整轮 run。
+		// 头行 model 只在载荷未带时兜底：模型选择仍以手机显式下发为权威。
+		// 装回后下方的 limits 截断照常执行（超长历史按会话窗口裁剪，是有意的）。
+		var headModel string
+		var restoreFailed error
+		if lazyProvider == "agentcore" && len(lazyHistory) == 0 && m.coreJournal != nil {
+			if hist, head, herr := readAgentCoreJournalHistoryFrom(m.coreJournal.dir, sessionID); herr == nil && len(hist) > 0 {
+				lazyHistory = hist
+				headModel = head.model
+			} else if herr != nil && !errors.Is(herr, os.ErrNotExist) {
+				logger.Warn(fmt.Sprintf("ai.message: journal history restore failed session=%s err=%v", sessionID, herr))
+				restoreFailed = herr
+			}
+		}
 		if lazyInitialContext != "" {
 			lazyHistory = append([]agentAIMessage{{
 				Role:      "system",
@@ -2412,7 +1861,7 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 			mode:                    lazyMode,
 			projectPath:             projectPath,
 			provider:                lazyProvider,
-			model:                   strings.TrimSpace(remoteString(msg, "model")),
+			model:                   firstNonEmpty(strings.TrimSpace(remoteString(msg, "model")), headModel),
 			effort:                  strings.TrimSpace(remoteString(msg, "effort")),
 			contextWindow:           lazyContextWindow,
 			resumeSessionID:         firstNonEmpty(remoteString(msg, "resume_session_id"), remoteString(msg, "source_session_id")),
@@ -2432,6 +1881,17 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 			m.registerAISessionLocked(session)
 		}
 		m.mu.Unlock()
+		// 装回失败提示（在会话落地之后发）：经 runWrite=emitter→订阅扇出，
+		// 手机/跨端订阅者都能看到「历史没接上、本轮空跑」这一事实。
+		if restoreFailed != nil {
+			_ = runWrite(map[string]interface{}{
+				"type":       models.AgentEventAIRunNotice,
+				"session_id": sessionID,
+				"message_id": messageID,
+				"code":       "history_restore_failed",
+				"detail":     restoreFailed.Error(),
+			})
+		}
 	}
 	m.mu.Lock()
 	if policy := parseAgentAIClaudeRemotePolicy(msg); policy.enabled {
@@ -2443,6 +1903,9 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 	}
 	if cw := clampAgentAIContextWindow(remoteInt(msg, "context_window", 0)); cw > 0 {
 		session.contextWindow = cw
+	}
+	if v := strings.TrimSpace(remoteString(msg, agentAIOriginSocketField)); v != "" {
+		session.originSocket = v
 	}
 	session.lastActiveAt = time.Now().UTC() // LRU recency: this conversation is active
 	if session.cancel != nil {
@@ -2543,8 +2006,10 @@ func (m *agentAIManager) runStart(msg map[string]interface{}, writeJSON agentTer
 		// terminal instead of leaving a permanently "received" processed-run row.
 		emitter := m.runEmitter(agentAIRun{
 			runID: runID, sessionID: sessionID, messageID: messageID,
-			ownerConnID:  remoteString(msg, "conn_id"),
-			goalIdentity: goalRunIdentityFromMessage(msg),
+			// 错误回包也要带 origin：fan-out 去重靠它跳过发起通道，Task 7 的
+			// 审批 ack 双写同样按 origin 寻址。
+			originSocketID: strings.TrimSpace(remoteString(msg, agentAIOriginSocketField)),
+			goalIdentity:   goalRunIdentityFromMessage(msg),
 		}, writeJSON)
 		_ = emitter.emit(agentAIErrorPayload(sessionID, messageID, err))
 		return
@@ -2581,6 +2046,9 @@ func (m *agentAIManager) runStart(msg map[string]interface{}, writeJSON agentTer
 		session.resumeSessionID = resumeID
 		session.reservedNativeSessionID = reservedID
 		session.bindingVersion = remoteInt(msg, "binding_version", session.bindingVersion)
+		if v := strings.TrimSpace(remoteString(msg, agentAIOriginSocketField)); v != "" {
+			session.originSocket = v
+		}
 		if policy := parseAgentAIClaudeRemotePolicy(msg); policy.enabled {
 			session.claudePolicy = cloneAgentAIClaudeRemotePolicy(policy)
 			session.claudeCaps = agentAIClaudeCapabilities{}
@@ -2663,6 +2131,22 @@ func (m *agentAIManager) handleLocalSlashCommand(session *agentAISession, messag
 		}
 	}
 
+	// 斜杠命令也是对话的一部分（spec §4.5）：agentcore 无原生转录，本地应答
+	// 的斜杠命令不产生 run 回合，journal 是它唯一的历史留痕——必须先落头行与
+	// 命令行。claude/codex 由各自原生转录承载（spec amendment），这里仅
+	// provider=agentcore 落。origin 走统一推导（Task 10 helper，与 run 路径同
+	// 源）。/compact 的 agentcore 分支在上面已提前 return，它的留账在
+	// handleAgentCoreCompactCommand 内，不会走到这里（无重复落账）。
+	if provider == "agentcore" {
+		m.mu.Lock()
+		projectPath, model := session.projectPath, session.model
+		originSocket, surface := session.originSocket, session.surface
+		m.mu.Unlock()
+		now := time.Now().UTC().Format(time.RFC3339)
+		m.coreJournal.ensureSessionHeader(session.id, projectPath, model, now, agentCoreJournalOriginFor(originSocket, surface))
+		m.coreJournal.appendUser(session.id, messageID, content, now)
+	}
+
 	assistantID := agentAssistantMessageID(messageID)
 	_ = writeJSON(map[string]interface{}{
 		"type":         models.AgentEventAIRunStarted,
@@ -2675,6 +2159,10 @@ func (m *agentAIManager) handleLocalSlashCommand(session *agentAISession, messag
 	})
 
 	line := m.applyLocalSlashCommand(session, name, args, provider)
+
+	if provider == "agentcore" && line != "" {
+		m.coreJournal.appendAssistant(session.id, assistantID, line, time.Now().UTC().Format(time.RFC3339))
+	}
 
 	_ = writeJSON(map[string]interface{}{
 		"type":       models.AgentEventAIDelta,
@@ -3325,7 +2813,6 @@ func (m *agentAIManager) runUserMessage(session *agentAISession, runID, messageI
 	m.mu.Lock()
 	session.cancel = cancel
 	session.activeWriter = writeJSON
-	session.activeEmitter = emitter
 	session.approvalToken = approvalToken
 	session.activity = activity
 	session.runSeq++
@@ -3391,6 +2878,9 @@ func (m *agentAIManager) runUserMessage(session *agentAISession, runID, messageI
 		// the real run is built here — so it never reached runCLIPass/codex.
 		readOnly: session.isGoalFork,
 		surface:  session.surface,
+		// 执行 run 也带 origin（fan-out 去重走 emitter 侧的 messageRun 值，
+		// 这份供审批 ack 双写等 run 级消费方用；临界区内读，与 session 快照同源）。
+		originSocketID: session.originSocket,
 	}
 	run.onClaudeInit = func(commands []string, version string) {
 		m.recordClaudeCapabilities(run.sessionID, run.projectPath, commands, version)
@@ -3441,7 +2931,6 @@ func (m *agentAIManager) runUserMessage(session *agentAISession, runID, messageI
 		// at the same per-run emitter so they share run_id/event_seq and cannot
 		// escape the terminal barrier through the original socket writer.
 		current.activeWriter = emitter.emit
-		current.activeEmitter = emitter
 	}
 	m.mu.Unlock()
 	go m.runCLI(ctx, run, emitter.emit)
@@ -3466,12 +2955,27 @@ func (m *agentAIManager) optionResponse(msg map[string]interface{}, writeJSON ag
 	m.mu.Lock()
 	inputKey := agentAICodexInputMapKey(sessionID, optionID)
 	if waiter := m.codexInputs[inputKey]; waiter != nil && waiter.sessionID == sessionID {
+		// 刻意不刷新 session.originSocket（Task 7 评审落档）：codex-input 答复
+		// 续接的是正在运行的旧 run（经 waiter.respond 回传，不起新 run）——
+		// 把 origin 迁到答复方会劫持 session.originSocket，把该 run 后续审批
+		// ack 从发起通道路由走，复现 ack 双写要修的投递滞留。
 		delete(m.codexInputs, inputKey)
 		m.mu.Unlock()
 		waiter.respond <- agentAICodexInputAnswer{selected: selected, custom: custom}
 		return
 	}
 	session := m.sessions[sessionID]
+	// 跨端同态（Task 7 前置）：option 作答同样刷新 session.originSocket——
+	// option 续接的执行 run 与其后续审批 ack 都要写回「作答这条 socket」，
+	// 不刷新的话执行 run 还带着上一回合的旧 origin，ack 双写会写到旧通道。
+	// 盖章只来自两条 WS 分发路径（远端/本机），未盖章（测试内部旧调用方）
+	// 不动；未匹配/过期的 option 作答同样刷新 origin——与 message() 的
+	// 「origin 跟随最近盖章入站」语义一致。
+	if session != nil {
+		if v := strings.TrimSpace(remoteString(msg, agentAIOriginSocketField)); v != "" {
+			session.originSocket = v
+		}
+	}
 	if session == nil || session.cancel != nil || session.pendingOption == nil || session.pendingOption.ID != optionID {
 		m.mu.Unlock()
 		return
@@ -3484,7 +2988,14 @@ func (m *agentAIManager) optionResponse(msg map[string]interface{}, writeJSON ag
 	content := buildAgentAIOptionFollowup(pending, selected, custom)
 	messageID := pending.MessageID + ".option"
 
-	run := agentAIRun{sessionID: sessionID, runID: remoteString(msg, "run_id"), messageID: messageID, ownerConnID: remoteString(msg, "conn_id")}
+	// option 续接回合同样盖 origin：不补的话，发起 socket 已注册时会出现
+	// 「内联 + 扇出」双投（无去重扇出）。
+	run := agentAIRun{
+		sessionID:      sessionID,
+		runID:          remoteString(msg, "run_id"),
+		messageID:      messageID,
+		originSocketID: strings.TrimSpace(remoteString(msg, agentAIOriginSocketField)),
+	}
 	emitter := m.runEmitter(run, writeJSON)
 	if err := m.runUserMessage(session, remoteString(msg, "run_id"), messageID, content, provider, nil, nil, emitter, nil); err != nil {
 		_ = emitter.emit(agentAIErrorPayload(sessionID, messageID, err))
@@ -3817,10 +3328,21 @@ func (m *agentAIManager) approval(msg map[string]interface{}, writeJSON agentTer
 	// Always ACK a delivery (even on duplicate / no_match / bad decision) so the
 	// server stops retrying it. result tells the server whether the decision
 	// actually took effect on a live waiter.
+	//
+	// 跨端同态（spec §4.2.2）：ack 双写——决策到达的 socket（现有语义，重投
+	// 引擎的对端确认）+ run 发起的 socket（修「仪表盘抢答手机回合时 PhoneServer
+	// 收不到 ack、已生效决策被重投至 10 次」）。runSocket 在闭包外一次取好
+	// （session.originSocket，Task 5 落）；同 socket 只写一次；run socket 已
+	// 换道/已死/未注册时尽力而为跳过（服务端宽限+离线撤单兜底）。duplicate /
+	// no_match / 坏决策各 return 路径都经这一个闭包，全覆盖。
+	originSocket := strings.TrimSpace(remoteString(msg, agentAIOriginSocketField))
+	runSocket := ""
+	m.mu.Lock()
+	if s := m.sessions[sessionID]; s != nil {
+		runSocket = s.originSocket
+	}
+	m.mu.Unlock()
 	ack := func(result string) {
-		if writeJSON == nil {
-			return
-		}
 		payload := map[string]interface{}{
 			"type":        models.AgentEventAIApprovalAck,
 			"session_id":  sessionID,
@@ -3830,7 +3352,17 @@ func (m *agentAIManager) approval(msg map[string]interface{}, writeJSON agentTer
 		if deliveryID != "" {
 			payload["delivery_id"] = deliveryID
 		}
-		_ = writeJSON(payload)
+		if writeJSON != nil {
+			_ = writeJSON(payload)
+		}
+		if runSocket != "" && runSocket != originSocket {
+			m.mu.Lock()
+			sock := m.aiSockets[runSocket]
+			m.mu.Unlock()
+			if sock != nil && sock.alive() {
+				sock.enqueue(payload)
+			}
+		}
 	}
 	if decision == "" {
 		ack("no_match")
@@ -3872,6 +3404,14 @@ func (m *agentAIManager) approval(msg map[string]interface{}, writeJSON agentTer
 		return
 	}
 
+	// 会话级批准记忆（spec §4.2.4）：accept_for_session 落一条 (sessionID,
+	// provider, kind, 匹配键)，本会话内同键后续请求由三个检查点短路、不再
+	// 云端往返。普通 accept 不记录。必须在 m.mu.Unlock() 之后调用
+	// （rememberSessionApproval 自身取 m.mu，临界区内调用=死锁）。
+	if decision == models.AgentAIApprovalDecisionAcceptForSession {
+		m.rememberSessionApproval(sessionID, waiter.request.Provider, waiter.request.Kind, waiter.request.ToolName, waiter.request.Command)
+	}
+
 	waiter.request.respond <- response
 	ack("applied")
 }
@@ -3898,6 +3438,9 @@ func (m *agentAIManager) pendingApprovalsSnapshot() []map[string]interface{} {
 		if waiter.request.ToolName != "" {
 			entry["tool_name"] = waiter.request.ToolName
 		}
+		if !waiter.expiresAt.IsZero() {
+			entry["expires_at"] = waiter.expiresAt.Format(time.RFC3339)
+		}
 		out = append(out, entry)
 	}
 	return out
@@ -3905,9 +3448,6 @@ func (m *agentAIManager) pendingApprovalsSnapshot() []map[string]interface{} {
 
 // emitApprovalSync sends ai.approval.sync for all still-pending approvals (a
 // no-op when there are none). Used after reconnect and on a periodic ticker.
-// The frame is socket-scoped for the requester, but its pending entries carry
-// session_id — watchers of those sessions get the same frame fanned out so an
-// attached page can render live approval cards without racing its own sync.
 func (m *agentAIManager) emitApprovalSync(writeJSON agentTerminalWriter) {
 	if writeJSON == nil {
 		return
@@ -3916,64 +3456,19 @@ func (m *agentAIManager) emitApprovalSync(writeJSON agentTerminalWriter) {
 	if len(pending) == 0 {
 		return
 	}
-	payload := map[string]interface{}{
+	_ = writeJSON(map[string]interface{}{
 		"type":    models.AgentEventAIApprovalSync,
 		"pending": pending,
-	}
-	_ = writeJSON(payload)
-	sessions := make(map[string]struct{}, len(pending))
-	for _, entry := range pending {
-		if sessionID := remoteString(entry, "session_id"); sessionID != "" {
-			sessions[sessionID] = struct{}{}
-		}
-	}
-	for sessionID := range sessions {
-		m.fanOutSessionWatchFrame(sessionID, payload)
-	}
-}
-
-// emitApprovalSyncForRequester 处理网页主动拉取的审批对账（DispatchLocalAI 的
-// ai.approval.sync case）：请求方经 e.write 直写一份 sync payload——属主兼
-// watcher 时扇出侧跳过属主连接（fanOutLocked），直写恰好补上那一份；无活跃
-// run 的会话走 manager 注册表扇出，须排除请求方连接（直写已覆盖，注册表不知
-// 属主身份，不排除就是双投递）。其余 watcher 按 pending 条目 session_id 照常
-// 扇出。无待批时静默（与 watch 同语义：无回执即成功）。
-func (m *agentAIManager) emitApprovalSyncForRequester(msg map[string]interface{}, writeJSON agentTerminalWriter) {
-	if writeJSON == nil {
-		return
-	}
-	requesterConn := strings.TrimSpace(remoteString(msg, "conn_id"))
-	pending := m.pendingApprovalsSnapshot()
-	if len(pending) == 0 {
-		return
-	}
-	payload := map[string]interface{}{
-		"type":    models.AgentEventAIApprovalSync,
-		"pending": pending,
-	}
-	_ = writeJSON(payload)
-	sessions := make(map[string]struct{}, len(pending))
-	for _, entry := range pending {
-		if sessionID := remoteString(entry, "session_id"); sessionID != "" {
-			sessions[sessionID] = struct{}{}
-		}
-	}
-	for sessionID := range sessions {
-		m.fanOutSessionWatchFrameExcept(sessionID, payload, requesterConn)
-	}
+	})
 }
 
 // emitApprovalCancelled notifies the server that a dialogue went inactive and
 // its pending approvals were dropped, so the server stops retrying them.
 // Best-effort: callers without a writer (closeAll on shutdown) rely on the
-// server's offline-grace cancellation instead. Returns the payload it wrote
-// (nil when nothing was written) so raw-writer call sites (ai.session.close)
-// can fan the identical frame to watchers — the run-scoped call sites write
-// through emitter.emit, where Task 1's emit fanout already covers watchers and
-// an extra fan would duplicate.
-func (m *agentAIManager) emitApprovalCancelled(writeJSON agentTerminalWriter, sessionID string, approvalIDs []string, reason string) map[string]interface{} {
+// server's offline-grace cancellation instead.
+func (m *agentAIManager) emitApprovalCancelled(writeJSON agentTerminalWriter, sessionID string, approvalIDs []string, reason string) {
 	if writeJSON == nil || sessionID == "" || len(approvalIDs) == 0 {
-		return nil
+		return
 	}
 	payload := map[string]interface{}{
 		"type":         models.AgentEventAIApprovalCancelled,
@@ -3984,17 +3479,13 @@ func (m *agentAIManager) emitApprovalCancelled(writeJSON agentTerminalWriter, se
 		payload["reason"] = reason
 	}
 	_ = writeJSON(payload)
-	return payload
 }
 
 // emitOptionCancelled 在 session 失活（close 等）时，best-effort 通知服务端作废待选。
 // 与 emitApprovalCancelled 同理：closeAll 等无 writer 的场景依赖服务端 offline-grace。
-// 返回所写 payload(未写返回 nil),供裸 writer 调用点(close)向 watcher
-// 扇出同一帧——与 emitApprovalCancelled 同构(J7):attached 页面的方案卡也
-// 需要据此关闭。
-func (m *agentAIManager) emitOptionCancelled(writeJSON agentTerminalWriter, sessionID string, optionIDs []string, reason string) map[string]interface{} {
+func (m *agentAIManager) emitOptionCancelled(writeJSON agentTerminalWriter, sessionID string, optionIDs []string, reason string) {
 	if writeJSON == nil || sessionID == "" || len(optionIDs) == 0 {
-		return nil
+		return
 	}
 	payload := map[string]interface{}{
 		"type":       models.AgentEventAIOptionCancelled,
@@ -4005,7 +3496,6 @@ func (m *agentAIManager) emitOptionCancelled(writeJSON agentTerminalWriter, sess
 		payload["reason"] = reason
 	}
 	_ = writeJSON(payload)
-	return payload
 }
 
 // cancelOptions 处理 server→agent 的 ai.option.cancelled：清匹配的 pendingOption，
@@ -4048,31 +3538,13 @@ func (m *agentAIManager) close(msg map[string]interface{}, writeJSON agentTermin
 	}
 	var cancel context.CancelFunc
 	var runWrite agentTerminalWriter
-	var terminalEmitter *agentAIRunEmitter
 	if session != nil {
 		cancel = session.cancel
 		runWrite = session.activeWriter
-		terminalEmitter = session.activeEmitter
 	}
 	m.mu.Unlock()
-	// close 的 writeJSON 是发起方的裸 socket writer,不经 emitter——cancelled
-	// 帧在这里显式扇出给 watcher。有在跑 emitter 时直接入它的 sink 队列,
-	// 抢在随后的 ai.session.closed 终态之前(同队保序);终态经
-	// activeWriter(=emitter)发布,由 Task 1 的 emit 扇出天然覆盖,勿重复扇。
-	if cancelledPayload := m.emitApprovalCancelled(writeJSON, sessionID, cancelled, "session_closed"); cancelledPayload != nil {
-		if terminalEmitter != nil {
-			terminalEmitter.fanOutOutOfBand(cancelledPayload)
-		} else {
-			m.fanOutSessionWatchFrame(sessionID, cancelledPayload)
-		}
-	}
-	if optionCancelled := m.emitOptionCancelled(writeJSON, sessionID, cancelledOptions, "session_closed"); optionCancelled != nil {
-		if terminalEmitter != nil {
-			terminalEmitter.fanOutOutOfBand(optionCancelled)
-		} else {
-			m.fanOutSessionWatchFrame(sessionID, optionCancelled)
-		}
-	}
+	m.emitApprovalCancelled(writeJSON, sessionID, cancelled, "session_closed")
+	m.emitOptionCancelled(writeJSON, sessionID, cancelledOptions, "session_closed")
 
 	if runWrite == nil {
 		runWrite = writeJSON
@@ -4229,6 +3701,9 @@ func (m *agentAIManager) requestApproval(ctx context.Context, run agentAIRun, wr
 	}
 	req.respond = make(chan agentAIApprovalResponse, 1)
 
+	// deadline 与下方等待用的 agentAIApprovalTimeout 同源：expires_at 是给
+	// 两端 UI 显示剩余时间的绝对截止（RFC3339，spec §4.2.1）。
+	deadline := time.Now().UTC().Add(agentAIApprovalTimeout)
 	m.mu.Lock()
 	if m.approvals == nil {
 		m.approvals = make(map[string]*agentAIApprovalWaiter)
@@ -4238,13 +3713,16 @@ func (m *agentAIManager) requestApproval(ctx context.Context, run agentAIRun, wr
 		sessionID: run.sessionID,
 		runSeq:    run.runSeq,
 		request:   req,
+		expiresAt: deadline,
 	}
 	m.mu.Unlock()
 
 	run.activity.setAwaitingApproval(true)
 	defer run.activity.setAwaitingApproval(false)
 	logger.Info(fmt.Sprintf("approval-hook: requestApproval SENDING ai.approval.request to cloud session=%s approval_id=%s kind=%s — awaiting user decision (≤%s)", run.sessionID, req.ID, req.Kind, agentAIApprovalTimeout))
-	if err := writeAgentAIApprovalRequest(ctx, writeJSON, agentAIApprovalRequestPayload(req), 5, time.Second); err != nil {
+	payload := agentAIApprovalRequestPayload(req)
+	payload["expires_at"] = deadline.Format(time.RFC3339)
+	if err := writeAgentAIApprovalRequest(ctx, writeJSON, payload, 5, time.Second); err != nil {
 		m.mu.Lock()
 		if waiter := m.approvals[approvalKey]; waiter != nil && waiter.sessionID == run.sessionID && waiter.runSeq == run.runSeq {
 			delete(m.approvals, approvalKey)
@@ -4420,6 +3898,17 @@ func (m *agentAIManager) handleClaudeApprovalHook(ctx context.Context, sessionID
 			run.matchedRuleID = matchedID
 			run.policyVersion = svc.effectiveApprovalPolicyForPath(run.projectPath).Version
 		}
+	}
+
+	// 会话级批准记忆检查点（policy 之后、云端往返之前）：本会话用户对同键
+	// （command 逐字 / tool 按名，见 agent_ai_session_approvals.go）选过
+	// accept_for_session 的直接放行，不再问手机。provider 取请求对象自身，
+	// 与 approval() 记录点存的 waiter.request.Provider 对齐。
+	// double build intentional: hit path stays branch-free
+	if preReq := buildClaudeApprovalRequest(run, raw); m.sessionApprovalAllows(sessionID, preReq.Provider, preReq.Kind, preReq.ToolName, preReq.Command) {
+		logger.Info(fmt.Sprintf("approval-hook: SESSION-APPROVED (memory) tool=%s kind=%s session=%s", preReq.ToolName, preReq.Kind, sessionID))
+		m.journalSessionApprovalHit(sessionID, run.runSeq, preReq.Kind, preReq.ToolName, preReq.Command)
+		return claudeApprovalHookDecision(hookEventName, true, "approved for this session"), nil
 	}
 
 	req := buildClaudeApprovalRequest(run, raw)
@@ -4605,6 +4094,12 @@ func (m *agentAIManager) rememberCompletedApprovalLocked(approvalID string, sess
 		response:  response,
 		createdAt: time.Now().UTC(),
 	}
+	// 审批审计行（spec §4.5）：决策/取消/超时全走本汇聚点，审计行自动覆盖
+	// 全部终态，两端回放可见。尽力而为。j.mu 与本函数调用方持有的 m.mu 是
+	// 不同的锁且无互调（journal 写侧从不取 m.mu），锁内调用安全。
+	if m.coreJournal != nil {
+		m.coreJournal.appendApprovalAudit(sessionID, approvalID, runSeq, response.Decision)
+	}
 }
 
 func agentAIApprovalMapKey(sessionID string, approvalID string) string {
@@ -4631,7 +4126,6 @@ func (m *agentAIManager) clearRunning(sessionID string, runSeq int, writeJSON ag
 		coreSteerControl = session.coreSteer
 		session.cancel = nil
 		session.activeWriter = nil
-		session.activeEmitter = nil
 		session.approvalToken = ""
 		session.activity = nil
 		if session.guard != nil {
@@ -4721,9 +4215,9 @@ func (m *agentAIManager) lastUserHistoryMessage(sessionID string) (agentAIMessag
 // 包装（见 ai.steer 投递分支），journal 按 spec §5 取真实用户 content，与
 // session.history 的 user 行同口径。
 // steer 可能先于 run 的任何写入到达（目录/文件都还没有）——appendLineLocked
-// 内部有目录懒创建，这里只管追加。steer 先建的文件无头行：ProjectPath/Model
-// 留空是该会话的既定降级（reader ID 兜底取文件名），不要试图补写头行
-// （ensureSessionHeader 见文件存在即跳过，永远轮不到补）。
+// 内部有目录懒创建，这里只管追加。steer 先建的文件无头行（ProjectPath/Model
+// 暂空，reader ID 兜底取文件名），随后 run 入口的 ensureSessionHeader 会整体
+// 重写补头并保留已落内容（agent_ai_agentcore_journal.go prependHeaderLocked）。
 func (m *agentAIManager) journalSteerUserMessage(sessionID string, msg agentAISteerMessage, content string) {
 	if m == nil || m.coreJournal == nil {
 		return
@@ -4817,6 +4311,7 @@ func (m *agentAIManager) runCLI(ctx context.Context, run agentAIRun, writeJSON a
 	if agentAIUseCodexAppServer(run.provider) {
 		outcome := m.runCodexAppServer(ctx, run, writeJSON)
 		if outcome == agentAIRunResumeMissing && ctx.Err() == nil {
+			emitAgentAIResumeMissingNotice(writeJSON, run, run.resumeSessionID)
 			m.clearAgentAIResumeSessionID(run.sessionID, run.runSeq, run.resumeSessionID)
 			run.resumeSessionID = ""
 			run.prompt = firstNonEmpty(run.freshPrompt, run.prompt)
@@ -4849,9 +4344,29 @@ func (m *agentAIManager) runCLI(ctx context.Context, run agentAIRun, writeJSON a
 			m.retryAfterEffortRejected(ctx, run, writeJSON, outcome, rej, true)
 			return
 		}
+		// resume id 本机缺失（导入会话/异项目路径）→ 降级 fresh。显式提示一次：
+		// 此前这一降级完全静默，用户只看到「上下文断了」却说不出为什么。
+		emitAgentAIResumeMissingNotice(writeJSON, run, run.resumeSessionID)
 	}
 	outcome, rej := m.runCLIPass(ctx, run, writeJSON, false)
 	m.retryAfterEffortRejected(ctx, run, writeJSON, outcome, rej, false)
+}
+
+// emitAgentAIResumeMissingNotice 发 resume_missing 的 ai.run.notice（信息性帧，
+// 回合照常继续）。三处自愈降级（runCLI 主路径 / retryAfterEffortRejected /
+// codex 路径）共用；每条路径每回合至多降级一次，fresh 重跑不带 resume 不会再
+// 触发，故天然只发一次。
+func emitAgentAIResumeMissingNotice(writeJSON agentTerminalWriter, run agentAIRun, resumeSessionID string) {
+	if writeJSON == nil {
+		return
+	}
+	_ = writeJSON(map[string]interface{}{
+		"type":       models.AgentEventAIRunNotice,
+		"session_id": run.sessionID,
+		"message_id": agentAssistantMessageID(run.messageID),
+		"code":       "resume_missing",
+		"detail":     fmt.Sprintf("native session %s not found; continuing as a fresh conversation", strings.TrimSpace(resumeSessionID)),
+	})
 }
 
 // retryAfterEffortRejected 在 CLI 拒绝 effort(flag 本身不存在,或硬拒值)时
@@ -4887,6 +4402,7 @@ func (m *agentAIManager) retryAfterEffortRejected(ctx context.Context, run agent
 	// 既无输出也无错误(2026-09-29 评审确认的静默回归)。清掉 resume 再补一发
 	// fresh pass;此时 effort 已处理完毕,fresh pass 不再带被拒的档。
 	if second == agentAIRunResumeMissing && allowResume && ctx.Err() == nil {
+		emitAgentAIResumeMissingNotice(writeJSON, run, run.resumeSessionID)
 		m.clearAgentAIResumeSessionID(run.sessionID, run.runSeq, run.resumeSessionID)
 		run.resumeSessionID = ""
 		run.prompt = firstNonEmpty(run.freshPrompt, run.prompt)
@@ -6351,6 +5867,16 @@ func (m *agentAIManager) codexAppServerApprovalResult(ctx context.Context, run a
 			run.matchedRuleID = matchedID
 			run.policyVersion = svc.effectiveApprovalPolicyForPath(run.projectPath).Version
 		}
+	}
+	// 会话级批准记忆检查点（policy 之后、云端往返之前）：本会话用户对同键选过
+	// accept_for_session 的直接放行（agent_ai_session_approvals.go）。codex 原生
+	// scope=session 行为保留不动，这里只是 agent 侧叠加记忆免往返。provider 取
+	// 请求对象自身（buildCodexApprovalRequest 硬编码 "codex"，而 run.provider
+	// 可能是 "auto"——与 approval() 记录点存的 waiter.request.Provider 对齐）。
+	if pre := buildCodexApprovalRequest(run, method, params, fileChanges); m.sessionApprovalAllows(run.sessionID, pre.Provider, pre.Kind, pre.ToolName, pre.Command) {
+		logger.Info(fmt.Sprintf("approval-hook: SESSION-APPROVED (memory) tool=%s kind=%s method=%s session=%s (codex)", pre.ToolName, pre.Kind, method, run.sessionID))
+		m.journalSessionApprovalHit(run.sessionID, run.runSeq, pre.Kind, pre.ToolName, pre.Command)
+		return codexApprovalResponseResult(method, params, agentAIApprovalResponse{Decision: models.AgentAIApprovalDecisionAccept})
 	}
 	req := buildCodexApprovalRequest(run, method, params, fileChanges)
 	// Use the env-configurable approval timeout (ALIANG_AI_APPROVAL_TIMEOUT,

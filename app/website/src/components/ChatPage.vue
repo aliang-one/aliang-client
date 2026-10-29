@@ -24,134 +24,67 @@
       </div>
 
       <div class="flex-1 overflow-y-auto py-1">
-        <template v-if="groupedConversations.today.length">
-          <div class="px-3 pt-3 pb-1 text-xs font-semibold text-slate-400 uppercase tracking-wider">{{ t('chat_today') }}</div>
-          <div
-            v-for="c in groupedConversations.today"
-            :key="c.id"
-            role="button"
-            tabindex="0"
-            class="group w-full cursor-pointer px-4 py-2.5 text-left text-sm transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
-            :class="c.id === activeId ? 'bg-primary/10 text-primary font-medium' : 'text-slate-700 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800'"
-            @click="selectConversation(c.id)"
-            @keydown.enter.prevent="selectConversation(c.id)"
-            @keydown.space.prevent="selectConversation(c.id)"
-          >
-            <input
-              v-if="renamingId === c.id && renameSurface === 'list'"
-              v-model="renameDraft"
-              :ref="(el) => { if (el) renameInputEl = el; }"
-              type="text"
-              maxlength="60"
-              :placeholder="t('chat_renamePlaceholder')"
-              class="w-full rounded border border-primary/40 bg-white px-2 py-1 text-sm outline-none dark:bg-slate-800"
-              @click.stop
-              @keydown.enter="onRenameEnter"
-              @keydown.esc="onRenameEscape"
-              @keydown.space.stop
-              @blur="commitRename"
-            />
-            <div v-else class="flex items-center gap-2">
-              <div class="min-w-0 flex-1 truncate">{{ c.title || t('chat_emptyTitle') }}</div>
-              <button
-                type="button"
-                class="relative shrink-0 rounded p-1 text-slate-400 opacity-100 transition-opacity hover:bg-slate-200 hover:text-slate-600 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 md:opacity-0 md:group-hover:opacity-100 md:focus-visible:opacity-100 dark:hover:bg-slate-700 before:absolute before:-inset-2 before:content-['']"
-                :aria-label="`${t('chat_rename')} ${c.title || t('chat_emptyTitle')}`"
-                @click.stop="startRename(c, 'list')"
-                @keydown.enter.stop
+        <!-- 三源统一清单（本地草稿 + 设备会话）：分组结构一致，单段循环渲染。
+             设备会话条目带来源角标与 running 状态点；点击分流 openDeviceSession。 -->
+        <template v-for="group in conversationGroups" :key="group.key">
+          <template v-if="group.items.length">
+            <div class="px-3 pt-3 pb-1 text-xs font-semibold text-slate-400 uppercase tracking-wider">{{ group.label }}</div>
+            <div
+              v-for="c in group.items"
+              :key="c.id"
+              role="button"
+              tabindex="0"
+              class="group w-full cursor-pointer px-4 py-2.5 text-left text-sm transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
+              :class="c.id === activeId ? 'bg-primary/10 text-primary font-medium' : 'text-slate-700 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800'"
+              @click="onSidebarItemClick(c)"
+              @keydown.enter.prevent="onSidebarItemClick(c)"
+              @keydown.space.prevent="onSidebarItemClick(c)"
+            >
+              <input
+                v-if="renamingId === c.id && renameSurface === 'list'"
+                v-model="renameDraft"
+                :ref="(el) => { if (el) renameInputEl = el; }"
+                type="text"
+                maxlength="60"
+                :placeholder="t('chat_renamePlaceholder')"
+                class="w-full rounded border border-primary/40 bg-white px-2 py-1 text-sm outline-none dark:bg-slate-800"
+                @click.stop
+                @keydown.enter="onRenameEnter"
+                @keydown.esc="onRenameEscape"
                 @keydown.space.stop
-              >
-                <span class="material-symbols-outlined text-base">edit</span>
-              </button>
+                @blur="commitRename"
+              />
+              <div v-else class="flex items-center gap-2">
+                <div class="min-w-0 flex-1 truncate">{{ c.title || t('chat_emptyTitle') }}</div>
+                <span
+                  v-if="c.deviceSession && sourceBadgeLabel(c.deviceSession)"
+                  data-testid="session-source-badge"
+                  class="shrink-0 rounded bg-slate-200 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-slate-500 dark:bg-slate-700 dark:text-slate-300"
+                >{{ sourceBadgeLabel(c.deviceSession) }}</span>
+                <span
+                  v-if="c.running"
+                  data-testid="device-session-running-dot"
+                  class="inline-block h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-primary"
+                  :title="t('chat_statusRunning')"
+                ></span>
+                <!-- 设备会话不可在本端重命名/删除（后端无端点，title 由清单权威） -->
+                <button
+                  v-if="!c.deviceSession"
+                  type="button"
+                  class="relative shrink-0 rounded p-1 text-slate-400 opacity-100 transition-opacity hover:bg-slate-200 hover:text-slate-600 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 md:opacity-0 md:group-hover:opacity-100 md:focus-visible:opacity-100 dark:hover:bg-slate-700 before:absolute before:-inset-2 before:content-['']"
+                  :aria-label="`${t('chat_rename')} ${c.title || t('chat_emptyTitle')}`"
+                  @click.stop="startRename(c, 'list')"
+                  @keydown.enter.stop
+                  @keydown.space.stop
+                >
+                  <span class="material-symbols-outlined text-base">edit</span>
+                </button>
+              </div>
             </div>
-          </div>
+          </template>
         </template>
-        <template v-if="groupedConversations.yesterday.length">
-          <div class="px-3 pt-3 pb-1 text-xs font-semibold text-slate-400 uppercase tracking-wider">{{ t('chat_yesterday') }}</div>
-          <div
-            v-for="c in groupedConversations.yesterday"
-            :key="c.id"
-            role="button"
-            tabindex="0"
-            class="group w-full cursor-pointer px-4 py-2.5 text-left text-sm transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
-            :class="c.id === activeId ? 'bg-primary/10 text-primary font-medium' : 'text-slate-700 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800'"
-            @click="selectConversation(c.id)"
-            @keydown.enter.prevent="selectConversation(c.id)"
-            @keydown.space.prevent="selectConversation(c.id)"
-          >
-            <input
-              v-if="renamingId === c.id && renameSurface === 'list'"
-              v-model="renameDraft"
-              :ref="(el) => { if (el) renameInputEl = el; }"
-              type="text"
-              maxlength="60"
-              :placeholder="t('chat_renamePlaceholder')"
-              class="w-full rounded border border-primary/40 bg-white px-2 py-1 text-sm outline-none dark:bg-slate-800"
-              @click.stop
-              @keydown.enter="onRenameEnter"
-              @keydown.esc="onRenameEscape"
-              @keydown.space.stop
-              @blur="commitRename"
-            />
-            <div v-else class="flex items-center gap-2">
-              <div class="min-w-0 flex-1 truncate">{{ c.title || t('chat_emptyTitle') }}</div>
-              <button
-                type="button"
-                class="relative shrink-0 rounded p-1 text-slate-400 opacity-100 transition-opacity hover:bg-slate-200 hover:text-slate-600 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 md:opacity-0 md:group-hover:opacity-100 md:focus-visible:opacity-100 dark:hover:bg-slate-700 before:absolute before:-inset-2 before:content-['']"
-                :aria-label="`${t('chat_rename')} ${c.title || t('chat_emptyTitle')}`"
-                @click.stop="startRename(c, 'list')"
-                @keydown.enter.stop
-                @keydown.space.stop
-              >
-                <span class="material-symbols-outlined text-base">edit</span>
-              </button>
-            </div>
-          </div>
-        </template>
-        <template v-if="groupedConversations.older.length">
-          <div class="px-3 pt-3 pb-1 text-xs font-semibold text-slate-400 uppercase tracking-wider">{{ t('chat_older') }}</div>
-          <div
-            v-for="c in groupedConversations.older"
-            :key="c.id"
-            role="button"
-            tabindex="0"
-            class="group w-full cursor-pointer px-4 py-2.5 text-left text-sm transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
-            :class="c.id === activeId ? 'bg-primary/10 text-primary font-medium' : 'text-slate-700 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800'"
-            @click="selectConversation(c.id)"
-            @keydown.enter.prevent="selectConversation(c.id)"
-            @keydown.space.prevent="selectConversation(c.id)"
-          >
-            <input
-              v-if="renamingId === c.id && renameSurface === 'list'"
-              v-model="renameDraft"
-              :ref="(el) => { if (el) renameInputEl = el; }"
-              type="text"
-              maxlength="60"
-              :placeholder="t('chat_renamePlaceholder')"
-              class="w-full rounded border border-primary/40 bg-white px-2 py-1 text-sm outline-none dark:bg-slate-800"
-              @click.stop
-              @keydown.enter="onRenameEnter"
-              @keydown.esc="onRenameEscape"
-              @keydown.space.stop
-              @blur="commitRename"
-            />
-            <div v-else class="flex items-center gap-2">
-              <div class="min-w-0 flex-1 truncate">{{ c.title || t('chat_emptyTitle') }}</div>
-              <button
-                type="button"
-                class="relative shrink-0 rounded p-1 text-slate-400 opacity-100 transition-opacity hover:bg-slate-200 hover:text-slate-600 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 md:opacity-0 md:group-hover:opacity-100 md:focus-visible:opacity-100 dark:hover:bg-slate-700 before:absolute before:-inset-2 before:content-['']"
-                :aria-label="`${t('chat_rename')} ${c.title || t('chat_emptyTitle')}`"
-                @click.stop="startRename(c, 'list')"
-                @keydown.enter.stop
-                @keydown.space.stop
-              >
-                <span class="material-symbols-outlined text-base">edit</span>
-              </button>
-            </div>
-          </div>
-        </template>
-        <div v-if="conversations.length === 0" class="px-4 py-8 text-center text-sm text-slate-400">
-          {{ t('chat_noConversations') }}
+        <div v-if="mergedConversations.length === 0" class="px-4 py-8 text-center text-sm text-slate-400">
+          {{ deviceAvailable ? t('chat_deviceSessionsEmpty') : t('chat_deviceSessionsLoadFailed') }}
         </div>
       </div>
     </aside>
@@ -183,17 +116,9 @@
         <h3 v-else class="flex-1 truncate text-sm font-semibold text-slate-900 dark:text-white">
           {{ activeConversation?.title || t('chat_emptyTitle') }}
         </h3>
+        <!-- 设备会话不可在本端重命名/删除（后端无端点，title 由清单权威） -->
         <button
-          type="button"
-          class="rounded p-1 text-slate-500 hover:bg-slate-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 dark:hover:bg-slate-800"
-          :aria-label="t('chat_sessionsDrawer')"
-          :title="t('chat_sessionsDrawer')"
-          @click="openSessionDrawer"
-        >
-          <span class="material-symbols-outlined text-lg">devices</span>
-        </button>
-        <button
-          v-if="activeId && renamingId !== activeId"
+          v-if="activeId && renamingId !== activeId && !activeIsDevice"
           type="button"
           class="relative rounded p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-600 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 dark:hover:bg-slate-800 before:absolute before:-inset-2 before:content-['']"
           :aria-label="t('chat_rename')"
@@ -208,7 +133,7 @@
           <span class="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-primary"></span>{{ t('chat_statusRunning') }}
         </span>
         <button
-          v-if="activeId"
+          v-if="activeId && !activeIsDevice"
           type="button"
           class="rounded p-1 text-slate-400 hover:bg-slate-100 hover:text-rose-500 dark:hover:bg-slate-800"
           @click="deleteConversation"
@@ -226,25 +151,9 @@
 
       <!-- Session settings bar: directory / model / effort -->
       <div v-if="activeConversation" class="relative border-b border-slate-200 dark:border-slate-800">
-        <!-- attached 会话（接管既有 ai_* 会话）：目录/模型/effort 只读展示——
-             服务端 attach 分支忽略这六个属主字段，改配置只能新建会话。 -->
-        <div v-if="activeConversation.attached" class="flex items-center gap-2 overflow-x-auto px-4 py-1.5 text-xs">
-          <span
-            data-testid="chat-settings-directory"
-            class="flex min-h-[40px] max-w-[16rem] shrink-0 items-center gap-1 text-slate-400 md:min-h-0"
-            :title="directoryLabel"
-          >
-            <span class="material-symbols-outlined text-sm">folder</span>
-            <span class="truncate">{{ directoryLabel }}</span>
-          </span>
-          <span class="ml-2 shrink-0 rounded bg-slate-100 px-1.5 py-0.5 font-medium text-slate-500 dark:bg-slate-800 dark:text-slate-400">
-            {{ activeConversation.provider || '' }}<span v-if="activeConversation.model"> · {{ activeConversation.model }}</span>
-          </span>
-          <span v-if="activeConversation.effort" class="shrink-0 text-slate-400">{{ activeConversation.effort }}</span>
-        </div>
         <!-- 内层滚动行：overflow-x-auto 会连 y 轴一起裁剪（CSS 规范行为），
-             absolute 浮层若放行会被整个裁掉，必须挂到外层包裹容器上。 -->
-        <div v-else class="flex items-center gap-2 overflow-x-auto px-4 py-1.5 text-xs">
+             absolute 浮层若放行内会被整个裁掉，必须挂到外层包裹容器上。 -->
+        <div class="flex items-center gap-2 overflow-x-auto px-4 py-1.5 text-xs">
           <span class="hidden shrink-0 text-slate-400 md:inline">{{ t('chat_settingsDirectory') }}</span>
           <span
             v-if="directoryLocked"
@@ -347,56 +256,72 @@
           <p class="text-sm text-slate-400">{{ t('chat_startNew') }}</p>
         </div>
         <template v-else>
-          <!-- 转录加载态（冷路径首请求可能 >15s，40s 超时+重试） -->
-          <div v-if="activeConversation?.transcriptLoading" class="flex h-full items-center justify-center gap-2">
-            <span class="ai-thinking">
-              <span class="thinking-dot"></span><span class="thinking-dot"></span><span class="thinking-dot"></span>
-            </span>
-            <p class="text-sm text-slate-400">{{ t('chat_transcriptLoading') }}</p>
+          <div
+            v-if="activeConversation?.deviceLoadError"
+            data-testid="device-session-load-error"
+            class="mb-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-600 dark:border-rose-800 dark:bg-rose-950/40 dark:text-rose-300"
+          >
+            <!-- deviceLoadError 只存布尔标记，文案在渲染时走 i18n（随语言切换） -->
+            {{ t('chat_deviceSessionLoadFailed') }}
           </div>
-          <div v-else-if="activeConversation?.transcriptError" class="flex h-full flex-col items-center justify-center gap-2">
-            <p class="text-sm text-rose-500">{{ activeConversation.transcriptError }}</p>
-            <button
-              type="button"
-              class="rounded border border-slate-200 px-3 py-1 text-xs font-semibold text-slate-600 transition hover:bg-slate-100 dark:border-slate-600 dark:text-slate-300 dark:hover:bg-slate-800"
-              @click="loadTranscriptInto(activeConversation)"
-            >{{ t('chat_retry') }}</button>
-          </div>
-          <div v-else-if="activeMessages.length === 0" class="flex h-full items-center justify-center">
+          <div v-if="activeMessages.length === 0" class="flex h-full items-center justify-center">
             <p class="text-sm text-slate-400">{{ t('chat_startNew') }}</p>
           </div>
           <div v-for="(msg, idx) in activeMessages" :key="idx" class="mb-3">
-            <div class="mb-1 flex items-center gap-2 text-xs text-slate-400">
-              <span>{{ msg.role === 'user' ? t('dash_me') : (msg.kind === 'thinking' ? t('chat_thinkingLabel') : t('dash_ai')) }}</span>
-              <span v-if="msg.role === 'assistant' && msg.status === 'running'" class="inline-flex items-center gap-1 text-primary">
-                <span class="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-primary"></span>{{ t('chat_statusRunning') }}
-              </span>
-              <span v-else-if="msg.role === 'assistant' && msg.status === 'done'" class="text-emerald-500">{{ t('chat_statusDone') }}</span>
-              <span v-else-if="msg.role === 'assistant' && msg.status === 'error'" class="text-rose-500">!</span>
-            </div>
+            <!-- 系统提示条（审批取消 / run notice）：不是对话气泡，通栏弱化样式 -->
             <div
-              class="inline-block max-w-[85%] whitespace-pre-wrap rounded-lg px-3 py-2 text-sm"
-              :class="msg.role === 'user'
-                ? 'ml-auto block bg-primary text-white'
-                : msg.status === 'error'
-                  ? 'bg-rose-50 text-rose-600 dark:bg-rose-900/30 dark:text-rose-300'
-                  : msg.kind === 'thinking'
-                    ? 'bg-slate-100 text-xs italic text-slate-500 dark:bg-slate-800/60 dark:text-slate-400'
+              v-if="msg.kind === 'system'"
+              :data-testid="msg.note === 'run_notice' ? 'chat-run-notice' : 'chat-approval-cancelled-note'"
+              class="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-500 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300"
+            >{{ msg.content }}</div>
+            <template v-else>
+              <div class="mb-1 flex items-center gap-2 text-xs text-slate-400">
+                <span>{{ msg.role === 'user' ? t('dash_me') : t('dash_ai') }}</span>
+                <span v-if="msg.role === 'assistant' && msg.status === 'running'" class="inline-flex items-center gap-1 text-primary">
+                  <span class="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-primary"></span>{{ t('chat_statusRunning') }}
+                </span>
+                <span v-else-if="msg.role === 'assistant' && msg.status === 'done'" class="text-emerald-500">{{ t('chat_statusDone') }}</span>
+                <span v-else-if="msg.role === 'assistant' && msg.status === 'error'" class="text-rose-500">!</span>
+              </div>
+              <div
+                class="inline-block max-w-[85%] whitespace-pre-wrap rounded-lg px-3 py-2 text-sm"
+                :class="msg.role === 'user'
+                  ? 'ml-auto block bg-primary text-white'
+                  : msg.status === 'error'
+                    ? 'bg-rose-50 text-rose-600 dark:bg-rose-900/30 dark:text-rose-300'
                     : 'bg-white text-slate-700 dark:bg-slate-700 dark:text-slate-100'"
-            >
-              <span
-                v-if="msg.role === 'assistant' && msg.status === 'running' && !msg.content"
-                class="ai-thinking"
               >
-                <span class="thinking-dot"></span><span class="thinking-dot"></span><span class="thinking-dot"></span>
-                <span class="ml-1 align-middle">{{ msg.kind === 'thinking' ? t('chat_thinkingLabel') : t('chat_aiThinking') }}</span>
-              </span>
-              <template v-else>{{ msg.content }}</template>
-            </div>
+                <span
+                  v-if="msg.role === 'assistant' && msg.status === 'running' && !msg.content"
+                  class="ai-thinking"
+                >
+                  <span class="thinking-dot"></span><span class="thinking-dot"></span><span class="thinking-dot"></span>
+                  <span class="ml-1 align-middle">{{ t('chat_aiThinking') }}</span>
+                </span>
+                <template v-else>{{ msg.content }}</template>
+              </div>
+            </template>
           </div>
-          <div v-if="activeConversation?.progressText" class="mb-3 text-xs text-slate-400">
-            <span class="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-slate-300 dark:bg-slate-600"></span>
-            {{ activeConversation.progressText }}
+          <!-- 插话轻量条（Task 4）：运行中回合的旁路注入，不插独立 user 气泡——
+               快照/详情装载的转录才是权威流，避免回灌重复渲染。 -->
+          <div
+            v-for="item in activeSteerItems"
+            :key="item.messageId"
+            data-testid="chat-steer-item"
+            class="mb-3 ml-auto max-w-[85%] rounded-lg border border-primary/30 bg-primary/5 px-3 py-2 text-xs"
+          >
+            <div class="flex flex-wrap items-center gap-2">
+              <span class="material-symbols-outlined text-sm text-primary">bolt</span>
+              <span class="font-semibold text-slate-600 dark:text-slate-200">
+                {{ t('chat_steerLabel') }}
+              </span>
+              <span
+                data-testid="chat-steer-status"
+                :class="item.status === 'failed' ? 'text-rose-500' : 'font-medium text-primary'"
+              >{{ steerStatusLabel(item) }}</span>
+            </div>
+            <p class="mt-1 whitespace-pre-wrap break-all text-slate-600 dark:text-slate-300">{{ item.content }}</p>
+            <p v-if="item.status === 'failed' && item.detail" class="mt-1 text-rose-500">{{ item.detail }}</p>
           </div>
           <div
             v-for="approval in activeApprovals"
@@ -409,7 +334,18 @@
               <span class="rounded bg-white/70 px-1.5 py-0.5 text-xs font-medium text-amber-700 dark:bg-amber-900/60 dark:text-amber-200">
                 {{ approval.status === 'responding' ? t('chat_approvalResponding') : t('chat_approvalPending') }}
               </span>
+              <!-- expires_at 倒计时（Task 5）：缺失/已过不渲染；nowTick 每 30s 重算 -->
+              <span
+                v-if="approvalExpiresLabel(approval)"
+                data-testid="approval-expires"
+                class="rounded bg-white/70 px-1.5 py-0.5 text-xs font-medium text-amber-700 dark:bg-amber-900/60 dark:text-amber-200"
+              >
+                {{ approvalExpiresLabel(approval) }}
+              </span>
             </div>
+            <p v-if="approval.sourceId" class="mt-1 text-xs font-medium text-amber-700 dark:text-amber-200">
+              {{ t('chat_approvalFromSession', { id: approval.sourceId }) }}
+            </p>
             <p v-if="approval.reason" class="mt-1 whitespace-pre-wrap text-xs text-amber-800 dark:text-amber-200">
               {{ approval.reason }}
             </p>
@@ -470,6 +406,16 @@
 
       <!-- Input -->
       <div v-if="activeId" class="border-t border-slate-200 p-4 dark:border-slate-700">
+        <!-- steer 阻断提示（Task 4）：壳 running 且无可用 steer 目标
+             （claude_/codex_ 壳无 managed id；agentcore 裸 id 已回退 entry.id），
+             插话不可能（不发帧、绝不引导重发为普通消息）——常驻说明而非提交后报错。 -->
+        <div
+          v-if="steerBlocked"
+          data-testid="chat-steer-blocked-hint"
+          class="mb-2 rounded-lg border border-slate-200 bg-slate-100 px-3 py-2 text-xs text-slate-500 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300"
+        >
+          {{ t('chat_steerBlocked') }}
+        </div>
         <div class="flex items-center gap-2">
           <div class="relative flex-1">
             <div
@@ -494,8 +440,8 @@
               ref="inputRef"
               v-model="inputText"
               type="text"
-              :placeholder="attachedSteerActive ? t('chat_steerPlaceholder') : t('chat_placeholder')"
-              :disabled="sending"
+              :placeholder="inputPlaceholder"
+              :disabled="sendDisabled"
               class="h-10 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm text-slate-700 outline-none transition focus:border-primary dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100"
               @input="onSlashInput"
               @keydown="onInputKeydown"
@@ -503,102 +449,16 @@
             />
           </div>
           <button
-            v-if="attachedSteerActive"
             type="button"
-            class="h-10 shrink-0 rounded-lg border border-rose-300 px-3 text-sm font-semibold text-rose-600 transition hover:bg-rose-50 disabled:cursor-not-allowed disabled:opacity-60 dark:border-rose-800 dark:hover:bg-rose-950/40"
-            :aria-label="t('chat_stop')"
-            @click="stopAttachedRun(activeConversation)"
-          >
-            <span class="material-symbols-outlined align-middle text-base">stop_circle</span>{{ t('chat_stop') }}
-          </button>
-          <button
-            type="button"
-            class="h-10 rounded-lg bg-primary px-4 text-sm font-semibold text-white transition hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-60"
-            :disabled="sending"
+            class="h-10 shrink-0 rounded-lg bg-primary px-4 text-sm font-semibold text-white transition hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-60"
+            :disabled="sendDisabled"
             @click="sendMessage"
           >
-            {{ sending ? t('chat_sending') : (attachedSteerActive ? t('chat_steerSend') : t('chat_send')) }}
+            {{ sendButtonLabel }}
           </button>
         </div>
       </div>
     </div>
-
-    <!-- Session drawer: agent sessions on the device (attach to take over) -->
-    <div
-      v-if="sessionDrawerOpen"
-      class="fixed inset-0 z-[950] bg-black/50"
-      @click="sessionDrawerOpen = false"
-    ></div>
-    <aside
-      v-if="sessionDrawerOpen"
-      class="fixed right-0 top-0 bottom-0 z-[960] flex w-80 flex-col border-l border-slate-200 bg-white shadow-xl dark:border-slate-700 dark:bg-slate-900"
-      aria-label="session-drawer"
-    >
-      <div class="flex items-center justify-between border-b border-slate-200 px-4 py-3 dark:border-slate-700">
-        <h2 class="text-sm font-bold text-slate-900 dark:text-white">{{ t('chat_sessionsDrawer') }}</h2>
-        <button
-          type="button"
-          class="rounded p-1 text-slate-500 hover:bg-slate-200 dark:hover:bg-slate-700"
-          :aria-label="t('chat_close')"
-          @click="sessionDrawerOpen = false"
-        >
-          <span class="material-symbols-outlined text-lg">close</span>
-        </button>
-      </div>
-      <div class="flex-1 overflow-y-auto py-1">
-        <div v-if="drawerLoading" class="flex items-center justify-center gap-2 px-4 py-8">
-          <span class="ai-thinking">
-            <span class="thinking-dot"></span><span class="thinking-dot"></span><span class="thinking-dot"></span>
-          </span>
-          <span class="text-sm text-slate-400">{{ t('chat_drawerLoading') }}</span>
-        </div>
-        <div v-else-if="drawerError" class="flex flex-col items-center gap-2 px-4 py-8">
-          <p class="text-center text-sm text-rose-500">{{ drawerError }}</p>
-          <button
-            type="button"
-            class="rounded border border-slate-200 px-3 py-1 text-xs font-semibold text-slate-600 transition hover:bg-slate-100 dark:border-slate-600 dark:text-slate-300 dark:hover:bg-slate-800"
-            @click="loadSessionDrawer"
-          >{{ t('chat_retry') }}</button>
-        </div>
-        <template v-else>
-          <div
-            v-for="entry in visibleDrawerEntries"
-            :key="entry.id"
-            role="button"
-            tabindex="0"
-            class="w-full cursor-pointer px-4 py-2.5 text-left text-sm transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
-            :class="entry.id === activeConversation?.aiSessionId ? 'bg-primary/10' : 'hover:bg-slate-100 dark:hover:bg-slate-800'"
-            @click="attachFromDrawer(entry)"
-            @keydown.enter.prevent="attachFromDrawer(entry)"
-            @keydown.space.prevent="attachFromDrawer(entry)"
-          >
-            <div class="flex items-center gap-2">
-              <div class="min-w-0 flex-1 truncate text-slate-700 dark:text-slate-200">{{ entry.title || t('chat_emptyTitle') }}</div>
-              <span
-                v-if="entry.running"
-                class="inline-flex shrink-0 items-center gap-1 rounded-full bg-primary/10 px-2 py-0.5 text-xs font-medium text-primary"
-              >
-                <span class="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-primary"></span>{{ t('chat_statusRunning') }}
-              </span>
-            </div>
-            <div class="mt-0.5 flex items-center gap-2 text-xs text-slate-400">
-              <span class="rounded bg-slate-100 px-1.5 py-0.5 dark:bg-slate-800">{{ drawerSourceLabel(entry) }}</span>
-              <span v-if="entry.provider" class="truncate">{{ entry.provider }}</span>
-              <span v-if="entry.updatedAtMs" class="ml-auto shrink-0">{{ drawerTimeLabel(entry.updatedAtMs) }}</span>
-            </div>
-          </div>
-          <div v-if="drawerEntries.total === 0" class="px-4 py-8 text-center text-sm text-slate-400">
-            {{ t('chat_drawerEmpty') }}
-          </div>
-          <button
-            v-if="drawerEntries.hasMore"
-            type="button"
-            class="mx-4 my-2 rounded border border-slate-200 px-3 py-1 text-xs font-semibold text-slate-600 transition hover:bg-slate-100 dark:border-slate-600 dark:text-slate-300 dark:hover:bg-slate-800"
-            @click="drawerVisibleCount += DRAWER_PAGE_SIZE"
-          >{{ t('chat_drawerShowMore') }}</button>
-        </template>
-      </div>
-    </aside>
   </div>
 </template>
 
@@ -609,37 +469,16 @@ import { useNavigation } from '../composables/useNavigation';
 import { slashProviderFor } from '../utils/chatProvider';
 import { normalizeConversationTitle } from '../utils/chatTitle';
 import { useAuthStore } from '../stores/auth';
-import { getAgentRuntimeSessions, getAgentSessions, loadAgentTranscript } from '../services/agentApi';
+import { getAgentSessionDetail } from '../services/agentApi';
+import { useDeviceSessions, DEVICE_SESSION_DETAIL_TTL_MS, isTerminalPrefixedSessionId } from '../composables/useDeviceSessions';
 import {
   AGENTCORE_MODEL_OPTIONS,
   EFFORT_OPTIONS,
   MODEL_CUSTOM_VALUE,
-  agentSessionDrawerEntries,
-  approvalSyncRequestPayload,
-  attachSessionPayload,
-  dropStaleApprovals,
-  ensureStreamingBubble,
-  findConversationForEvent,
-  findRunningAssistant,
-  finishRunBubbles,
-  isSteerAckSuccess,
   isDirectoryLocked,
-  mergeTranscriptWithLive,
-  originBadgeOf,
-  planWatchSwitch,
   recentProjectsFromSessions,
-  restorableAttachedSessionIds,
-  runProgressFacts,
   sessionCreatePayload,
-  shouldLoadTranscript,
-  startRunBubble,
-  steerFailureKind,
-  steerPayload,
-  stopPayload,
-  syncApprovalIdSet,
-  unwatchSessionPayload,
-  watchSessionPayload,
-  watchTargetOf,
+  sessionSourceBadge,
 } from '../utils/chatSettings';
 
 const STORAGE_KEY = 'aliang-chat-data';
@@ -648,6 +487,17 @@ const { t } = useI18n();
 const { showDashboard, chatProviderPreset } = useNavigation();
 const { isAuthenticated } = useAuthStore();
 
+// 设备会话清单（跨端统一阶段 2）：后端三源会话的拉取/节流/壳缓存都收在
+// composable，ChatPage 只消费壳对象与 openDeviceSession 装载流程。
+const {
+  deviceSessions,
+  available: deviceAvailable,
+  loadDeviceSessions,
+  refreshOnEvent,
+  shellForEntry,
+  findDeviceShellBySessionId,
+} = useDeviceSessions();
+
 const conversations = ref([]);
 const activeId = ref(null);
 const inputText = ref('');
@@ -655,16 +505,6 @@ const sending = ref(false);
 const messagesContainer = ref(null);
 const inputRef = ref(null);
 const showMobileSidebar = ref(false);
-
-// --- 会话抽屉（agent 设备上的会话 + attach 接管）---
-const DRAWER_PAGE_SIZE = 20;
-const TRANSCRIPT_LIMIT = 50;
-const sessionDrawerOpen = ref(false);
-const agentSessions = ref([]);
-const drawerLoading = ref(false);
-const drawerError = ref('');
-const drawerVisibleCount = ref(DRAWER_PAGE_SIZE);
-const runtimeSessionIds = ref(new Set());
 
 // --- 会话设置条（工作目录/模型/effort）状态 ---
 const directoryPanelOpen = ref(false);
@@ -729,11 +569,142 @@ const activeRunning = computed(() => {
   return false;
 });
 
-// 插话/停止模式的门：attached 会话自身有 running 气泡（正文或思考）。
-// 只对 attached 会话生效——本地会话运行中的操作权仍归全局 sending 原语义。
-const attachedSteerActive = computed(() =>
-  !!(activeConversation.value?.attached && findRunningAssistant(activeConversation.value))
+// --- 续聊发送分流（跨端统一阶段 2 Task 4） ---
+
+// 会话「running」判定 = 本地气泡推断（activeRunning）OR 设备壳清单/快照
+// status（conv.running，composable 原位刷新）。两者并集：另一端跑着的会话
+// （壳 running 但本地无流式气泡）与本端正在流的会话都算 running。
+function isConversationRunning(conv) {
+  if (!conv) return false;
+  return !!conv.running || !!findRunningAssistant(conv);
+}
+
+const activeSessionRunning = computed(() => isConversationRunning(activeConversation.value));
+
+// steer 目标（阶段 2 计划钉死 + 评审折叠项）：壳带 managed_conversation_id
+// （清单 running 绑定态带回）→ steer 该 id（真正的在跑回合）；agentcore 裸
+// id 壳无 managed id → 回退 entry.id（==托管通道会话 id，订阅/续聊同源，严格
+// 安全——消除清单刷新带回 managed id 前 ~2s 节流窗的误阻断）；claude_/codex_
+// 前缀壳无 managed id → 空（绝不发帧，也绝不引导「重发为普通消息」——那会对
+// 同一原生转录并发第二个 CLI run）；本地自跑会话 → 自身 aiSessionId。
+function steerTargetId(conv) {
+  if (!conv) return '';
+  if (conv.deviceSession) {
+    const entry = conv.deviceSession;
+    const managed = typeof entry.managed_conversation_id === 'string'
+      ? entry.managed_conversation_id.trim()
+      : '';
+    if (managed) return managed;
+    if (conv.provider === 'agentcore'
+      && !isTerminalPrefixedSessionId(entry.id)
+      && typeof entry.id === 'string' && entry.id) {
+      return entry.id;
+    }
+    return '';
+  }
+  return conv.aiSessionId || '';
+}
+
+const activeSteerTarget = computed(() => steerTargetId(activeConversation.value));
+
+// 壳 running 且无 steer 目标（agentcore 裸 id 已回退 entry.id，只剩
+// claude_/codex_ 前缀壳等情形）：插话不可能（不发帧）——输入区常驻提示。
+const steerBlocked = computed(() =>
+  activeSessionRunning.value
+  && !!activeConversation.value?.deviceSession
+  && !activeSteerTarget.value
 );
+
+// sending 守卫改造：running 会话在 sending 中仍可输入提交（插话），非 running
+// 维持禁用（本地 run 在途时输入框照旧锁住——此时 activeRunning=true 会放行，
+// 提交自然分流成 steer，这正是预期交互）。
+const sendDisabled = computed(() => sending.value && !activeSessionRunning.value);
+
+const sendButtonLabel = computed(() => {
+  if (sending.value && activeSessionRunning.value) {
+    return t('chat_steerSending');
+  }
+  return sending.value ? t('chat_sending') : t('chat_send');
+});
+
+const inputPlaceholder = computed(() => {
+  // 仅在插话真正可达时换占位符提示（阻断态保持普通占位，提示条已另行说明）
+  if (activeSessionRunning.value && activeSteerTarget.value) {
+    return t('chat_steerPlaceholder');
+  }
+  return t('chat_placeholder');
+});
+
+const activeSteerItems = computed(() => activeConversation.value?.steerItems || []);
+
+function steerStatusLabel(item) {
+  switch (item?.status) {
+    case 'sent':
+      return t('chat_steerSent');
+    case 'queued':
+      return t('chat_steerQueued');
+    case 'applied':
+      return t('chat_steerApplied');
+    case 'not_running':
+      return t('chat_steerNotRunning');
+    case 'unknown':
+      // 未知 result（含未来新增值如 held）：中性渲染，不误标失败（评审折叠项）
+      return t('chat_steerUnknown', { result: item?.result || t('chat_steerUnknownResult') });
+    default:
+      return t('chat_steerFailed');
+  }
+}
+
+// --- i18n 渲染辅助（跨端统一阶段 2 Task 6） ---
+
+// 来源角标：sessionSourceBadge 返回逻辑键（active/phone/dashboard/terminal），
+// 展示文案在此映射为 chat_source_* 键（逻辑键与文案解耦，单元测试可钉逻辑键）。
+function sourceBadgeLabel(session) {
+  const key = sessionSourceBadge(session);
+  return key ? t(`chat_source_${key}`) : '';
+}
+
+// 系统条文案组装：③活跃兜底时带「来自会话 X」前缀（评审折叠项），无来源
+// 单行直出。sourceId 只存 id 切片（翻译在渲染时做，随语言切换）。
+function systemNoteContent(sourceId, text) {
+  return sourceId ? `${t('chat_approvalFromSession', { id: sourceId })}: ${text}` : text;
+}
+
+// --- 三源统一清单（本地草稿 + 设备会话壳） ---
+
+const activeIsDevice = computed(() => !!activeConversation.value?.deviceSession);
+
+// 统一会话列表：本地草稿（无 deviceSession）+ 设备会话壳。壳对象由
+// composable 的 shellCache 保证稳定（打开后消息写在同一对象上）；打开过的
+// 设备会话也会插入 conversations（承载 activeConversation/sendMessage 既有
+// 路径），在这里去重——草稿过滤掉带 deviceSession 的成员，壳部分再补上
+// 「清单暂缺但已打开」的壳（agent 离线时代理回 200 空表，不能让打开着的
+// 会话从侧栏消失）。
+const mergedConversations = computed(() => {
+  const drafts = [];
+  const openedShells = [];
+  for (const c of conversations.value) {
+    if (c.deviceSession) openedShells.push(c);
+    else drafts.push(c);
+  }
+  const listedIds = new Set();
+  const shells = [];
+  for (const entry of deviceSessions.value) {
+    if (entry && typeof entry === 'object' && typeof entry.id === 'string') listedIds.add(entry.id);
+    const shell = shellForEntry(entry);
+    if (shell) shells.push(shell);
+  }
+  for (const shell of openedShells) {
+    if (!listedIds.has(shell.deviceSession.id)) shells.push(shell);
+  }
+  return [...drafts, ...shells];
+});
+
+const conversationGroups = computed(() => [
+  { key: 'today', label: t('chat_today'), items: groupedConversations.value.today },
+  { key: 'yesterday', label: t('chat_yesterday'), items: groupedConversations.value.yesterday },
+  { key: 'older', label: t('chat_older'), items: groupedConversations.value.older },
+]);
 
 // --- 会话设置条逻辑 ---
 
@@ -760,9 +731,8 @@ function isPresetModel(m) {
 }
 
 // 统一写入口：落字段 → 持久化 → 清错误 → 服务端原位同步（掉线时下条消息兜底）。
-// attached 会话不可改（provider/model/effort 是属主字段，attach 不覆写，要改就新建）。
 function applySessionSettings(conv, patch) {
-  if (activeRunning.value || conv.attached) return;
+  if (activeRunning.value) return;
   Object.assign(conv, patch);
   conv.updatedAt = now();
   saveToStorage();
@@ -773,7 +743,7 @@ function applySessionSettings(conv, patch) {
 // 已建会话的设置变更要立即让服务端知道；socket 不在线就放弃本轮——
 // sendMessage 现在每条消息前都重发 create，天然兜底，无需脏标记。
 function resendCreate(conv) {
-  if (conv.attached || !conv.aiSessionCreated) return;
+  if (!conv.aiSessionCreated) return;
   if (!aiSocket || aiSocket.readyState !== WebSocket.OPEN) return;
   sendAI(sessionCreatePayload(conv));
 }
@@ -784,12 +754,10 @@ async function toggleDirectoryPanel() {
   directoryPanelOpen.value = !directoryPanelOpen.value;
   if (directoryPanelOpen.value && !recentProjectsLoaded.value) {
     recentProjectsLoaded.value = true;
-    try {
-      const data = await getAgentSessions();
-      recentProjects.value = recentProjectsFromSessions(data?.sessions);
-    } catch (_) {
-      recentProjects.value = []; // 拉取失败静默，手输路径不受影响
-    }
+    // 与侧栏设备清单共享同一次 /api/agent/sessions 请求（promise 去重）；
+    // 失败静默（available=false、清单为空），手输路径不受影响。
+    await loadDeviceSessions();
+    recentProjects.value = recentProjectsFromSessions(deviceSessions.value);
   }
 }
 
@@ -861,8 +829,13 @@ const activeEffort = computed({
   },
 });
 
-// 切会话收起面板、清一次性错误。
-watch(activeId, () => {
+// 切会话收起面板、清一次性错误；同时给切走的 agentcore 设备会话退订快照流
+// （幂等，socket 不在线时 sendAI 静默失败，重开会话会重新订阅）。
+watch(activeId, (nv, ov) => {
+  if (ov) {
+    const prev = conversations.value.find(c => c.id === ov);
+    if (prev) unsubscribeDeviceSession(prev);
+  }
   directoryPanelOpen.value = false;
   modelCustomActive.value = false;
   createError.value = '';
@@ -890,10 +863,7 @@ function waitForCreateAck(conv, timeoutMs = 5000) {
     conv.aiSessionCreated = true;
     // ensureAISocket 之后 socket 仍可能已死：sendAI 返回 false 就立刻按超时
     // 结算，不白等 5 秒死钟。
-    // attached 会话重发的是 attach 载荷（仅 type+session_id）：六属主字段服务端
-    // 在 attach 分支静默忽略，发多了也没意义，且改 provider/model 本就须新建。
-    const payload = conv.attached ? attachSessionPayload(sid) : sessionCreatePayload(conv);
-    if (!sendAI(payload)) settle('timeout');
+    if (!sendAI(sessionCreatePayload(conv))) settle('timeout');
   });
 }
 
@@ -952,7 +922,9 @@ const groupedConversations = computed(() => {
   const yesterday = [];
   const older = [];
 
-  const sorted = [...conversations.value].sort((a, b) => b.updatedAt - a.updatedAt);
+  // 三源统一清单排序：本地会话 updatedAt 与设备壳 updatedAt（composable 里
+  // 已把 updated_at 归一成 epoch ms）同一口径。
+  const sorted = [...mergedConversations.value].sort((a, b) => b.updatedAt - a.updatedAt);
   for (const c of sorted) {
     if (c.updatedAt >= todayTs) {
       today.push(c);
@@ -982,8 +954,13 @@ function loadFromStorage() {
 function saveToStorage() {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({
-      conversations: conversations.value.map(conversationForStorage),
-      activeConversationId: activeId.value
+      // 设备会话壳不落 localStorage（权威在后端，重进页重新拉取派生）；
+      // 活跃会话是设备壳时活跃指针一并置空——否则重进页会先落到一个
+      // 本地不存在的会话 id 上（主区空壳、侧栏高亮），体验割裂。
+      conversations: conversations.value.filter(c => !c.deviceSession).map(conversationForStorage),
+      activeConversationId: conversations.value.some(c => c.id === activeId.value && !c.deviceSession)
+        ? activeId.value
+        : null
     }));
   } catch (_) {
     // storage full or unavailable
@@ -993,12 +970,11 @@ function saveToStorage() {
 function conversationForStorage(conv) {
   const copy = { ...conv };
   copy.approvals = [];
-  // 转录状态是会话内的一次性 UI 状态：attached 会话刷新后重新拉取（数据可能
-  // 已在设备上变化），loading/error 更不能落盘；进度小字同理（只属于当前回合）。
-  delete copy.transcriptLoading;
-  delete copy.transcriptError;
-  delete copy.transcriptLoaded;
-  delete copy.progressText;
+  // steer 轻量条是瞬态 UI：ack 状态不跨页持久（陈旧的「已受理」比没有更糟）
+  copy.steerItems = [];
+  // deviceTranscript 不落盘（评审折叠项）：重开设备会话有 5 分钟 TTL+详情
+  // 分页重拉兜底，防大转录长期占 localStorage。
+  delete copy.deviceTranscript;
   return copy;
 }
 
@@ -1019,18 +995,20 @@ function createConversation() {
   nextTick(() => inputRef.value?.focus());
 }
 
+// 侧栏点击分流：设备会话壳 → openDeviceSession（转录装载+订阅）；本地草稿
+// → 原 selectConversation。
+function onSidebarItemClick(c) {
+  if (c?.deviceSession) {
+    openDeviceSession(c);
+    return;
+  }
+  selectConversation(c.id);
+}
+
 function selectConversation(id) {
-  const next = conversations.value.find(c => c.id === id) || null;
-  applyWatchSwitch(next);
   activeId.value = id;
   showMobileSidebar.value = false;
   saveToStorage();
-  if (next && next.attached) {
-    // 断线重连后 watch 随连接被反注销：重进会话时补 attach+watch（内部幂等），
-    // 否则抽屉徽章显示「运行中」而页面永远收不到帧。
-    if (!watchedSessions.has(next.aiSessionId)) ensureLiveAttached(next);
-    if (shouldLoadTranscript(next)) loadTranscriptInto(next);
-  }
   nextTick(() => scrollToBottom());
 }
 
@@ -1107,6 +1085,7 @@ function onRenameEscape(e) {
 function deleteConversation() {
   commitRename();
   if (!activeId.value) return;
+  if (activeConversation.value?.deviceSession) return; // 设备会话不可在本端删（后端无端点）
   if (!confirm(t('chat_deleteConfirm'))) return;
   conversations.value = conversations.value.filter(c => c.id !== activeId.value);
   if (conversations.value.length > 0) {
@@ -1115,6 +1094,160 @@ function deleteConversation() {
     activeId.value = null;
   }
   saveToStorage();
+}
+
+// --- 打开设备会话（跨端统一阶段 2，Task 3） ---
+
+// 详情/快照转录 → 壳 messages（复用既有气泡渲染路径）。role 只认
+// user/assistant，系统/工具行跳过；同时存壳 deviceTranscript（[{role,content}]
+// 原始形态，Task 4 的 agentcore create transcript 喂入消费——后端
+// remoteAgentAIHistory 按 row.role/row.content 解析）。
+function applyDeviceTranscript(shell, transcript) {
+  const rows = Array.isArray(transcript) ? transcript : [];
+  const renderable = rows.filter(m => m && (m.role === 'user' || m.role === 'assistant')
+    && typeof m.content === 'string' && m.content);
+  shell.messages = renderable.map(m => ({
+    role: m.role,
+    content: m.content,
+    status: 'done',
+    ts: Date.parse(m.timestamp) || now(),
+  }));
+  shell.deviceTranscript = renderable.map(m => ({ role: m.role, content: m.content }));
+  scrollToBottom();
+}
+
+// 快照转录行（{role,text,message_id?,ts?}）→ 壳 messages（**仅展示流**），
+// 字段名与详情不同（快照用 text，详情用 content）。职责分离（阶段 2 评审
+// 钉死）：快照是有损切片（200 行/4000 rune）且晚到会覆盖屏幕，但续聊喂入的
+// deviceTranscript 必须保持详情分页拉全的版本——快照绝不写 deviceTranscript，
+// 否则截断尾巴会在 create 时顶掉全量上下文（喂入即全部上下文）。
+function applyDeviceSnapshotTranscript(shell, rows) {
+  const list = Array.isArray(rows) ? rows : [];
+  const renderable = list.filter(m => m && (m.role === 'user' || m.role === 'assistant')
+    && typeof m.text === 'string' && m.text);
+  shell.messages = renderable.map(m => ({
+    role: m.role,
+    content: m.text,
+    status: 'done',
+    ts: Date.parse(m.ts) || now(),
+  }));
+}
+
+// 订阅判定（钉死）：仅 agentcore 且裸 conversation id（journal 源才有转录
+// 快照）。claude_/codex_ 前缀不订阅（无 journal，详情已够）。
+function deviceSessionSubscribable(shell) {
+  return !!shell?.deviceSession
+    && shell.provider === 'agentcore'
+    && !isTerminalPrefixedSessionId(shell.deviceSession.id);
+}
+
+// 打开设备会话：壳复用（composable 缓存的稳定对象）→ 分页拉全详情转录 →
+// agentcore 裸 id 发订阅等快照。404/网络错 → 空转录+错误条，不阻断续聊输入。
+
+// 详情转录分页参数（阶段 2 评审）：create 时的 transcript 喂入是续聊上下文
+// 的全部来源（载荷自带历史时后端跳过 journal 读回），默认 limit=40 的截断
+// 尾巴会让续聊静默丢早期上下文——必须拉全。单页 100 行、最多 5 页（500 行
+// 封顶）：防异常服务端拖死打开流程；超出封顶接受截断，仍远好于 40 行尾巴。
+const DEVICE_DETAIL_PAGE_LIMIT = 100;
+const DEVICE_DETAIL_MAX_PAGES = 5;
+
+async function openDeviceSession(shell) {
+  const entry = shell?.deviceSession;
+  if (!entry || typeof entry.id !== 'string' || !entry.id) return;
+  if (!conversations.value.includes(shell)) {
+    conversations.value.unshift(shell);
+  }
+  // 关键：壳对象来自 composable 的非响应式缓存，直接 unshift 进会话池后
+  // 续写 raw 对象不会触发渲染——必须取会话池里的响应式代理来写后续字段。
+  const live = conversations.value.find(c => c.id === shell.id) || shell;
+  activeId.value = live.id;
+  showMobileSidebar.value = false;
+  saveToStorage();
+  nextTick(() => scrollToBottom());
+
+  // 详情装载：5 分钟内重复打开不重拉（之后的更新由快照覆盖**展示流**，
+  // deviceTranscript 喂入流仍以这里的分页全量为准——见 applyDeviceSnapshotTranscript）
+  if (Date.now() - (live.deviceLoadedAt || 0) > DEVICE_SESSION_DETAIL_TTL_MS) {
+    // 翻页方向是「向更早」（before = 上一页最旧行的 message_id）：每页新行
+    // 前插，最终保持时间正序。中途页失败降级为已取到的部分转录（console
+    // 留痕，不亮错误条）；首页失败维持既有「空转录+错误条」。
+    const pageRows = [];
+    let before = '';
+    let pageError = null;
+    for (let page = 0; page < DEVICE_DETAIL_MAX_PAGES; page++) {
+      try {
+        const detail = await getAgentSessionDetail(entry.id, {
+          limit: DEVICE_DETAIL_PAGE_LIMIT,
+          before: before || undefined,
+        });
+        const rows = Array.isArray(detail?.transcript) ? detail.transcript : [];
+        pageRows.unshift(rows);
+        live.deviceLoadedAt = now();
+        live.deviceLoadError = '';
+        const pg = detail?.transcript_page;
+        if (!pg?.has_more || !pg?.next_before_message_id || !rows.length) break;
+        before = String(pg.next_before_message_id);
+      } catch (err) {
+        pageError = err;
+        break;
+      }
+    }
+    const transcript = pageRows.flat();
+    if (transcript.length) {
+      if (pageError) console.warn('[aliang-chat] device transcript partial pages', pageError);
+      applyDeviceTranscript(live, transcript);
+    } else if (pageError) {
+      // 空转录+错误条：详情缺席不阻断（本地会话池里壳已在，输入照常）。
+      // 只存布尔标记——文案在模板渲染时走 i18n，不冻结赋值时的语言。
+      live.deviceLoadError = true;
+    }
+  }
+
+  if (!deviceSessionSubscribable(shell)) return;
+  try {
+    await ensureAISocket();
+    sendAI({ type: 'ai.session.subscribe', session_id: entry.id });
+  } catch (_) {
+    // socket 不可用：快照缺席不阻断（详情已渲染）
+  }
+}
+
+// ai.session.snapshot（订阅握手回包）：按 session_id 找设备壳——先 aiSessionId
+// 匹配（打开过的壳），后三键兜底（entry.id/source_session_id/
+// managed_conversation_id）。未订阅/无壳的快照静默丢。
+function handleDeviceSnapshot(e) {
+  const sessionId = String(e.session_id || '');
+  if (!sessionId) return;
+  let shell = conversations.value.find(c => c.deviceSession && c.aiSessionId === sessionId)
+    || findDeviceShellBySessionId(sessionId);
+  if (!shell) return;
+  // 兜底路径可能拿到 composable 缓存的 raw 壳：已在会话池里就换代理写值
+  // （raw 写不触发渲染），不在池里（未打开）则保持原对象——下次打开时可见。
+  shell = conversations.value.find(c => c.id === shell.id && c.deviceSession) || shell;
+
+  // transcript 非空 → 覆盖壳 messages（快照是 journal 权威流的最新切片）
+  const rows = Array.isArray(e.transcript) ? e.transcript : [];
+  if (rows.length) {
+    applyDeviceSnapshotTranscript(shell, rows);
+    if (activeId.value === shell.id) scrollToBottom();
+  }
+
+  // pending_approvals → 逐条走既有 upsertApproval；快照行缺 status 时补
+  // pending 默认（展开顺序：item 在前——行自带 status 时不得被默认值反客为主，
+  // upsertApproval 只认 pending/responding，其余 status 走收卡）。
+  for (const item of Array.isArray(e.pending_approvals) ? e.pending_approvals : []) {
+    if (!item || typeof item !== 'object') continue;
+    upsertApproval(shell, { ...item, status: item.status || 'pending' });
+  }
+
+  // status → 壳 running 标记（侧栏状态点消费）
+  shell.running = e.status === 'running';
+}
+
+// 切走设备会话时退订（幂等，多发无害）：agentcore 裸 id 才订过。
+function unsubscribeDeviceSession(shell) {
+  if (!deviceSessionSubscribable(shell)) return;
+  sendAI({ type: 'ai.session.unsubscribe', session_id: shell.deviceSession.id });
 }
 
 function scrollToBottom() {
@@ -1170,8 +1303,6 @@ function ensureAISocket() {
       console.log('[aliang-chat] ws close code=', e.code, 'reason=', e.reason);
       if (aiSocket === sock) aiSocket = null;
       aiSocketPromise = null;
-      // 服务端按连接反注销 watch：本连接的注册表作废（新连接按需重 watch）。
-      watchedSessions.clear();
       // 陈旧 socket 的迟到 close（CLOSING→重连窗口）：aiSocket 已被新连接顶掉，
       // 别解新 run 的看门狗、别给新 run 画错误——让旧 close 静默退场。
       if (aiSocket && aiSocket !== sock) return;
@@ -1207,214 +1338,6 @@ function sendAI(payload) {
     return true;
   }
   return false;
-}
-
-// --- watch 生命周期 + 会话抽屉（attach 接管） ---
-
-// 本连接上已发过 watch 的 session id 集合。watch 成功无回执（无 ai.error 即成功），
-// 中途/重复 watch 幂等；连接断开服务端按连接反注销，集合随之清空。
-const watchedSessions = new Set();
-
-// 已发出的插话（ai.steer）在途登记：message_id → {conv, userMsg}，ack 据此收口
-// （ok 静默；not_running/turn_ended 撤回乐观用户气泡并提示）。
-const pendingSteers = new Map();
-
-function sendWatch(sessionId) {
-  if (!sessionId || watchedSessions.has(sessionId)) return;
-  if (sendAI(watchSessionPayload(sessionId))) watchedSessions.add(sessionId);
-}
-
-function sendUnwatch(sessionId) {
-  if (!sessionId || !watchedSessions.has(sessionId)) return;
-  if (sendAI(unwatchSessionPayload(sessionId))) watchedSessions.delete(sessionId);
-}
-
-// 切换直播跟踪目标（attach 成功后必须紧跟 watch；切走/关闭时 unwatch）。
-function applyWatchSwitch(nextConv) {
-  const ops = planWatchSwitch(watchTargetOf(activeConversation.value), watchTargetOf(nextConv));
-  for (const { op, sessionId } of ops) {
-    if (op === 'watch') sendWatch(sessionId);
-    else sendUnwatch(sessionId);
-  }
-}
-
-// attached 会话恢复直播态：attach（attach 载荷，回执异步更新字段）+ 紧跟 watch
-// + 拉一次审批对账（sync 是可主动拉的权威源，自愈「属主兼 watcher 时旁路帧
-// 可能缺一份」的 0 投递不对称）。静默执行——fork guard 等错误由 ai.error 分支
-// 亮在设置条上。
-function ensureLiveAttached(conv) {
-  if (!conv || !conv.attached || !conv.aiSessionId) return;
-  ensureAISocket()
-    .then(() => {
-      if (!conv.attached || !conv.aiSessionId) return;
-      sendAI(attachSessionPayload(conv.aiSessionId));
-      sendWatch(conv.aiSessionId);
-      sendAI(approvalSyncRequestPayload());
-    })
-    .catch(() => { /* socket 不可用：发消息时经确认门兜底重试 */ });
-}
-
-// ai.steer.ack 成功集合与失败分级在 chatSettings（isSteerAckSuccess/
-// steerFailureKind，纯函数已测）。
-function settleSteerAck(entry, result, code) {
-  clearTimeout(entry.timer);
-  pendingSteers.delete(entry.messageId);
-  if (isSteerAckSuccess(result)) return;
-  settleSteerFailure(entry.conv, entry.userMsg, code);
-}
-
-function settleSteerFailure(conv, userMsg, code) {
-  conv.messages = conv.messages.filter(m => m !== userMsg);
-  const kind = steerFailureKind(code);
-  conv.messages.push({
-    role: 'assistant',
-    content: kind === 'turn_ended' ? t('chat_steerTurnEnded') : kind === 'rejected' ? t('chat_steerRejected') : t('chat_steerFailed'),
-    status: 'error',
-    ts: now(),
-  });
-  conv.updatedAt = now();
-  saveToStorage();
-  scrollToBottom();
-}
-
-// attached 运行中的插话（独立 steer 路径）：全局 sending 原语义不动，本地会话
-// 零变化；门=attached 会话自身是否有 running 气泡。乐观推用户气泡，ack 不 ok
-// 则撤回并提示（没送进回合，留着会误导）；ack 丢失时超时兜底只解除跟踪、
-// 不撤气泡（插话可能已落地，误撤比漏报更糟）。
-async function sendSteer(conv, text) {
-  const userMsg = { role: 'user', content: text, ts: now() };
-  conv.messages.push(userMsg);
-  conv.updatedAt = now();
-  saveToStorage();
-  scrollToBottom();
-  const messageId = generateId();
-  try {
-    await ensureAISocket();
-    if (!sendAI(steerPayload(conv.aiSessionId, text, messageId))) throw new Error('socket-closed');
-    const entry = { messageId, conv, userMsg, timer: null };
-    entry.timer = setTimeout(() => pendingSteers.delete(messageId), 10000);
-    pendingSteers.set(messageId, entry);
-  } catch (_) {
-    settleSteerFailure(conv, userMsg, 'send_failed');
-  }
-}
-
-// 停止 attached 会话的运行回合（ai.stop；终态经既有 ai.status/ai.done/ai.error
-// 帧收口，UI 不自行翻转状态）。
-function stopAttachedRun(conv) {
-  if (!conv || !conv.attached || !conv.aiSessionId) return;
-  sendAI(stopPayload(conv.aiSessionId));
-}
-
-// 转录（冷路径）：loading/错误挂在 conv 上（视图据其渲染重试按钮）。
-// 运行中不加载（shouldLoadTranscript 门 + await 后复查双保险）：转录整体替换
-// messages，会把正在逐字直播的气泡冲掉，后续 delta 因末尾已是 done 气泡被丢弃。
-async function loadTranscriptInto(conv) {
-  if (!shouldLoadTranscript(conv)) return;
-  // 衔接点对账：抓取起点留直播快照——journal 落盘滞后会尾部缺段，快照整面
-  // 参与 mergeTranscriptWithLive 的多重集去重合并（不按时间窗筛）。
-  const liveSnapshot = (conv.messages || []).slice();
-  conv.transcriptLoading = true;
-  conv.transcriptError = '';
-  try {
-    const detail = await loadAgentTranscript(conv.aiSessionId, { limit: TRANSCRIPT_LIMIT });
-    // TOCTOU：冷路径最长 40s，期间回合可能已开始直播——命中运行中就弃用本次
-    // 结果，直播气泡继续增长（历史留给回合结束后的重进/重试）。
-    if (findRunningAssistant(conv)) return;
-    conv.messages = mergeTranscriptWithLive(detail?.transcript, liveSnapshot);
-    conv.transcriptLoaded = true;
-    conv.updatedAt = now();
-    saveToStorage();
-    scrollToBottom();
-  } catch (err) {
-    conv.transcriptError = err && err.message === 'transcript-timeout'
-      ? t('chat_transcriptTimeout')
-      : t('chat_transcriptFailed');
-  } finally {
-    conv.transcriptLoading = false;
-  }
-}
-
-const drawerEntries = computed(() => agentSessionDrawerEntries(agentSessions.value, {
-  runningIds: runtimeSessionIds.value,
-  localSessionIds: conversations.value.filter(c => c.aiSessionId).map(c => c.aiSessionId),
-  // 客户端分页的页大小在这里生效：不传 limit 会被纯函数默认截到 20，「显示更多」
-  // 永远翻不动。
-  limit: drawerVisibleCount.value,
-}));
-
-const visibleDrawerEntries = computed(() => drawerEntries.value.items);
-
-function drawerTimeLabel(ts) {
-  const d = new Date(ts);
-  return Number.isNaN(d.getTime()) ? '' : d.toLocaleString();
-}
-
-// 来源标记三态：本页自建/接入→本机；服务端 origin=managed（手机绑定）→手机；
-// external/未知（设备原生）→桌面。attached 状态另用样式表达（条目高亮=当前
-// 接管的会话）。
-function drawerSourceLabel(entry) {
-  const badge = originBadgeOf(entry);
-  return t(badge === 'local' ? 'chat_sessionSourceLocal' : badge === 'phone' ? 'chat_sessionSourcePhone' : 'chat_sessionSourceDesktop');
-}
-
-async function loadSessionDrawer() {
-  drawerLoading.value = true;
-  drawerError.value = '';
-  try {
-    const [list, runtime] = await Promise.all([
-      getAgentSessions(),
-      getAgentRuntimeSessions().catch(() => null), // runtime 徽章拉不到不挡列表
-    ]);
-    agentSessions.value = Array.isArray(list?.sessions) ? list.sessions : [];
-    runtimeSessionIds.value = new Set(
-      (Array.isArray(runtime?.ai_conversations) ? runtime.ai_conversations : [])
-        .map(s => s && s.id).filter(Boolean)
-    );
-    drawerVisibleCount.value = DRAWER_PAGE_SIZE;
-  } catch (err) {
-    agentSessions.value = [];
-    drawerError.value = t('chat_drawerError');
-  } finally {
-    drawerLoading.value = false;
-  }
-}
-
-function openSessionDrawer() {
-  sessionDrawerOpen.value = true;
-  loadSessionDrawer();
-}
-
-// 点抽屉条目 → attach（不新建，回执 ai.session.created + attached:true）→ 紧跟
-// watch → 转录渲染历史 → attached 模式（aiSessionId = ai_*）。attach 的六字段
-// 纪律由 attachSessionPayload 保证；回执 state 恒 idle，运行态以帧为准。
-async function attachFromDrawer(entry) {
-  if (!entry || !entry.id) return;
-  sessionDrawerOpen.value = false;
-  let conv = conversations.value.find(c => c.aiSessionId === entry.id);
-  if (!conv) {
-    conv = {
-      id: generateId(),
-      title: entry.title || '',
-      messages: [],
-      approvals: [],
-      provider: entry.provider || 'claudecode',
-      createdAt: now(),
-      updatedAt: now(),
-      aiSessionId: entry.id,
-      attached: true,
-      projectPath: entry.projectPath || '',
-    };
-    conversations.value.unshift(conv);
-  }
-  applyWatchSwitch(conv);
-  activeId.value = conv.id;
-  showMobileSidebar.value = false;
-  saveToStorage();
-  scrollToBottom();
-  ensureLiveAttached(conv);
-  // 运行中的会话跳过自动转录：先看直播，回合结束后的重进/重试再取历史。
-  if (!entry.running && shouldLoadTranscript(conv)) await loadTranscriptInto(conv);
 }
 
 // Ask the agent for the active provider's `/`-command surface. Cached per
@@ -1503,9 +1426,30 @@ function onInputKeydown(e) {
   }
 }
 
-// 直播流式气泡（正文/思考双通道）由 chatSettings.ensureStreamingBubble /
-// startRunBubble 承担：思考尾收束后正文另起新泡；attached 直播多回合在
-// run.started 强制开新泡（旧 ensureAssistantBubble 会在这里丢帧）。
+function findRunningAssistant(conv) {
+  const msgs = conv.messages || [];
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (msgs[i].role === 'assistant' && msgs[i].status === 'running') return msgs[i];
+  }
+  return null;
+}
+
+// Returns the live assistant bubble for a streaming run, creating a fresh
+// placeholder if sendMessage's placeholder was lost (e.g. page reloaded mid-run
+// holding a stale session id, or a state desync). Never spawns a stray bubble
+// after the turn already finished (done/error) — late deltas are then ignored.
+function ensureAssistantBubble(conv) {
+  const asst = findRunningAssistant(conv);
+  if (asst) return asst;
+  const msgs = conv.messages || [];
+  const last = msgs[msgs.length - 1];
+  if (last && last.role === 'assistant' && (last.status === 'done' || last.status === 'error')) {
+    return null;
+  }
+  const fresh = { role: 'assistant', content: '', status: 'running', ts: now() };
+  conv.messages.push(fresh);
+  return fresh;
+}
 
 function normalizeConversation(conv) {
   if (!conv || typeof conv !== 'object') return null;
@@ -1591,6 +1535,9 @@ function upsertApproval(conv, event) {
     provider: event.provider || existing?.provider || '',
     kind: event.kind || existing?.kind || 'tool',
     status: existing?.status === 'responding' ? 'responding' : 'pending',
+    // ③兜底挂活跃会话时的来源 id 切片（「来自会话 X」的 X）：挂对壳/本端
+    // 会话的卡无此字段。文案在渲染时经 chat_approvalFromSession 翻译。
+    sourceId: event.sourceId || existing?.sourceId || '',
     title: event.title || existing?.title || '',
     reason: event.reason || existing?.reason || '',
     command: event.command || existing?.command || '',
@@ -1598,6 +1545,9 @@ function upsertApproval(conv, event) {
     toolName: event.tool_name || event.toolName || existing?.toolName || '',
     toolInput: event.tool_input ?? event.toolInput ?? existing?.toolInput ?? null,
     fileChanges: event.file_changes ?? event.fileChanges ?? existing?.fileChanges ?? null,
+    // 审批等待的绝对截止（RFC3339，pending 帧与快照行带、resolved 同型不带）：
+    // 不存则模板倒计时永远渲染不出。已过/缺失由 approvalExpiresLabel 折叠为空。
+    expiresAt: event.expires_at || existing?.expiresAt || '',
     availableDecisions: normalizeApprovalDecisions(event.available_decisions || event.availableDecisions || existing?.availableDecisions),
     error: '',
     updatedAt: now()
@@ -1641,6 +1591,29 @@ function approvalIcon(approval) {
     default:
       return 'rule';
   }
+}
+
+// --- 审批卡 expires_at 倒计时（跨端统一阶段 2 Task 5） ---
+
+// 倒计时刷新时钟：30s 粒度足够（文案最小单位是分钟级「即将超时」）。
+const nowTick = ref(now());
+let nowTickTimer = null;
+
+// 剩余时间文案（nowTick 驱动 30s 重算）：>1h「约 X 小时」、≤1h「X 分钟」、
+// <2 分钟「即将超时」；缺失/已过返回空（徽标不渲染）。
+function approvalExpiresLabel(approval) {
+  const expiresMs = Date.parse(approval?.expiresAt || '');
+  if (!Number.isFinite(expiresMs)) return '';
+  const remainMs = expiresMs - nowTick.value;
+  if (remainMs <= 0) return '';
+  if (remainMs < 2 * 60 * 1000) {
+    return t('chat_approvalExpiringSoon');
+  }
+  const minutes = Math.ceil(remainMs / 60000);
+  if (minutes <= 60) {
+    return t('chat_approvalExpiresMinutes', { minutes });
+  }
+  return t('chat_approvalExpiresHours', { hours: Math.round(remainMs / 3600000) });
 }
 
 async function respondApproval(conv, approval, decision) {
@@ -1688,6 +1661,83 @@ function finishRun(conv) {
   saveToStorage();
 }
 
+// ai.run.notice code → 用户文案（Task 5）；未知 code 返回空（调用方忽略）。
+function agentRunNoticeText(code) {
+  switch (code) {
+    case 'resume_missing':
+      return t('chat_noticeResumeMissing');
+    case 'history_restore_failed':
+      return t('chat_noticeHistoryRestoreFailed');
+    default:
+      return '';
+  }
+}
+
+// --- steer 分流（跨端统一阶段 2 Task 4） ---
+
+// 运行中回合的旁路注入：不插 user 气泡、不走 create 确认门、不武装看门狗、
+// 不动 sending——轻量条自己承载状态（sent → ack 落定）。目标为空（claude_/
+// codex_ 壳 running 且无 managed id）时静默返回：阻断提示条已常驻输入区，
+// 绝不做「重发为普通消息」引导（会对同一原生转录并发第二个 CLI run）。
+async function submitSteer(conv, text) {
+  const target = steerTargetId(conv);
+  if (!target) return;
+  if (!Array.isArray(conv.steerItems)) conv.steerItems = [];
+  const item = {
+    messageId: 'steer-' + generateId(),
+    content: text,
+    status: 'sent',
+    result: '',
+    detail: '',
+    ts: now(),
+  };
+  conv.steerItems.push(item);
+  inputText.value = '';
+  scrollToBottom();
+  try {
+    await ensureAISocket();
+    const ok = sendAI({ type: 'ai.steer', session_id: target, message_id: item.messageId, content: text });
+    if (!ok) throw new Error('socket-closed');
+  } catch (_) {
+    item.status = 'failed';
+    item.detail = t('chat_serviceUnavailable');
+  }
+}
+
+function handleSteerAck(e) {
+  const mid = String(e.message_id || '');
+  if (!mid) return;
+  for (const c of conversations.value) {
+    const items = Array.isArray(c.steerItems) ? c.steerItems : [];
+    const item = items.find(it => it.messageId === mid);
+    if (!item) continue;
+    applySteerAck(item, e);
+    refreshOnEvent(); // 插话落定（not_running 等）可能伴随清单 running 态翻转，节流刷新侧栏
+    return;
+  }
+  console.debug('[chat] steer ack has no matching item, dropped', mid);
+}
+
+// queued/applied/not_running 落各自状态；error/unsupported 是契约内失败值
+// （失败渲染 + detail）；其余未知 result（含未来新增值）中性渲染 `插话状态：x`，
+// 不误标失败（评审折叠项）。
+function applySteerAck(item, e) {
+  const result = String(e.result || '');
+  item.result = result;
+  if (result === 'queued' || result === 'applied' || result === 'not_running') {
+    item.status = result;
+    item.detail = '';
+    return;
+  }
+  if (result === 'error' || result === 'unsupported') {
+    item.status = 'failed';
+    item.detail = String(e.error || e.code || result);
+    return;
+  }
+  item.status = 'unknown';
+  item.detail = '';
+}
+
 function handleAIEvent(e) {
   if (!e || !e.type) return;
 
@@ -1709,46 +1759,67 @@ function handleAIEvent(e) {
     return;
   }
 
-  // 审批对账（ai.approval.sync）：顶层无 session_id，pending 各项自带——按项归位，
-  // authoritative-replace（服务端侧 still-pending 全集为准）。走在通用路由之前。
-  if (e.type === 'ai.approval.sync') {
-    const pending = Array.isArray(e.pending) ? e.pending : [];
-    const bySession = new Map();
-    for (const item of pending) {
-      const sid = item && typeof item === 'object' ? item.session_id : '';
-      if (!sid) continue;
-      if (!bySession.has(sid)) bySession.set(sid, []);
-      bySession.get(sid).push(item);
-    }
-    let touched = false;
-    for (const [sid, items] of bySession) {
-      const target = conversations.value.find(c => c.aiSessionId === sid);
-      if (!target) continue;
-      for (const item of items) upsertApproval(target, item);
-      const keep = syncApprovalIdSet(items);
-      target.approvals = dropStaleApprovals(target.approvals, sid, keep);
-      touched = true;
-    }
-    if (touched) saveToStorage();
+  // 设备会话快照（订阅握手回包）：必须在通用会话归属判定**之前**接住——
+  // 快照可能属于未打开的设备会话，绝不能落进「未命中挂活跃会话」的
+  // fallback 链（会把他会转录灌进当前会话）。
+  if (e.type === 'ai.session.snapshot') {
+    handleDeviceSnapshot(e);
     return;
   }
 
-  // 插话回执：按 message_id 对账（不依赖 session 归位）。成功集合=ok/queued/
-  // applied（Go 侧 ack 成功值是 queued（TUI/claude）或 applied（agentcore），
-  // 没有 ok）；失败（error/not_running/unsupported 等）撤回乐观用户气泡并按
-  // code 分级提示。
+  // steer ack：按 message_id 反查提交方会话的轻量条更新。必须在通用会话归属
+  // 判定之前接住——ack 的 session_id 是 steer 目标（managed_conversation_id
+  // 等），按 aiSessionId 匹配不上时会走「未命中挂活跃会话」fallback，把跨端/
+  // 他会话的 ack 渲染进当前会话。匹配不上（跨端 steer 的 ack 不回本 socket、
+  // 刷新丢条）静默丢。
   if (e.type === 'ai.steer.ack') {
-    const entry = pendingSteers.get(e.message_id);
-    if (!entry) return;
-    settleSteerAck(entry, e.result || '', e.code || '');
+    handleSteerAck(e);
     return;
   }
 
-  // 帧归位：优先按 session_id 精确命中（matchedById 纪律）；未命中走 fallback，
-  // 但 fallback 仅允许本地（非 attached）会话承接——attached 会话的直播流绝不能
-  // 被他页会话/未知 session 的帧污染。
-  let conv = findConversationForEvent(conversations.value, e.session_id, activeConversation.value);
-  const matchedById = !!(e.session_id && conv && conv.aiSessionId === e.session_id);
+  // 清单跟随设备侧 run/审批生命周期：2s 节流刷新侧栏角标/状态点（对未打开
+  // 的设备会话同样生效，故放在归属判定之前）。
+  if (e.type === 'ai.run.started' || e.type === 'ai.done' || e.type === 'ai.error' || e.type === 'ai.approval.request') {
+    refreshOnEvent();
+  }
+
+  let conv = e.session_id ? conversations.value.find(c => c.aiSessionId === e.session_id) : null;
+  // session_id 是否命中决定事件归属；matchedById=false 的事件走 fallback 仅为
+  // 让流仍能渲染，绝不能成为回显/dirLocked 的写入目标（会话已删或他页会话的
+  // 迟到 create 回执会污染当前活跃会话）。
+  const matchedById = !!conv;
+  // 审批族帧（request——resolved 是同型 request 带 status——与 cancelled）未按
+  // aiSessionId 命中时的分源兜底（阶段 2 计划钉死）：
+  // ②设备壳三键匹配（entry.id/source_session_id/managed_conversation_id）→
+  //   挂该壳，**不切 activeId**（卡在壳上，用户点开即见）；
+  // ③仍无命中 → 挂活跃会话（现状 fallback），审批卡带「来自会话 <id 前 8>」
+  //   来源标签。非审批帧维持现状 fallback。
+  const isApprovalFamily = e.type === 'ai.approval.request' || e.type === 'ai.approval.cancelled';
+  let routedToShell = false;
+  if (!conv && isApprovalFamily && e.session_id) {
+    const shell = findDeviceShellBySessionId(e.session_id);
+    if (shell) {
+      conv = shell;
+      routedToShell = true;
+    } else if (activeConversation.value) {
+      // ③ 兜底：只记 id 切片，前缀文案由渲染层经 chat_approvalFromSession 翻译
+      e.sourceId = String(e.session_id).slice(0, 8);
+    }
+  }
+  // run.notice 走活跃兜底（③）时同样带来源标签（评审折叠项）：系统条是单行
+  // 文案，前缀由各 case 拼进内容。notice 不做壳三键路由（session_id 即
+  // manager 会话 id，① 直连已覆盖，壳路由会放大误挂面）。
+  if (!conv && e.type === 'ai.run.notice' && e.session_id && activeConversation.value) {
+    e.sourceId = String(e.session_id).slice(0, 8);
+  }
+  // Fallback: a run started from this page always targets the active
+  // conversation's live assistant bubble. If the session id didn't match
+  // (e.g. reloaded localStorage holding a stale id, or an id mismatch), route
+  // to the active conversation so the stream still renders instead of being
+  // silently dropped.
+  if (!conv && activeConversation.value) {
+    conv = activeConversation.value;
+  }
   if (!conv) {
     console.debug('[chat] ai event has no target conversation', e);
     return;
@@ -1759,8 +1830,9 @@ function handleAIEvent(e) {
   // omitted to keep the log readable.
   console.log('[aliang-chat] ai event', e.type, 'session=', e.session_id, 'conv=', conv.id);
 
-  // 喂狗：任何到达会话归属判定之后的帧都算 AI 活动，重置无活动计时。
-  if (idleWatchdogTimer) armIdleWatchdog(conv);
+  // 喂狗：任何到达会话归属判定之后的帧都算 AI 活动，重置无活动计时。审批族
+  // 帧路由到设备壳时例外——看门狗目标是活跃 run 的会话，不能被无关帧换靶。
+  if (idleWatchdogTimer && !routedToShell) armIdleWatchdog(conv);
 
   let persist = false;
   switch (e.type) {
@@ -1775,62 +1847,35 @@ function handleAIEvent(e) {
       conv.aiReady = true;
       // 目录锁定以服务端确认为准：create 成功后不可再改（create 失败保持可改）。
       conv.dirLocked = true;
-      // attach 接管标记以服务端回执为准（attached:true = 既有会话，未新建）。
-      if (e.attached) conv.attached = true;
       // 回显是服务端清洗后的权威值：project_path 已是解析后的绝对路径。
       if (typeof e.project_path === 'string' && e.project_path) conv.projectPath = e.project_path;
       if (typeof e.model === 'string') conv.model = e.model;
       if (typeof e.effort === 'string') conv.effort = e.effort;
+      // resume 字段仅首次 create（阶段 2 计划钉死）：ack 即消费——此后每条
+      // 消息前的 create 重发与设置条同步都不再携带，防陈旧 resume 压过用户
+      // 纠正后的路径（服务端 binding 守卫目前掩盖，但契约在本端收口）。
+      // resumeConsumed 同时约束 composable 的清单刷新路径不得复活字段。
+      conv.resumeConsumed = true;
+      delete conv.resumeSessionId;
+      delete conv.resumeProjectPath;
+      // agentcore 上下文喂入（Task 4）：transcript 只随首条 create 发出，ack
+      // 即消费——此后确认门/设置条重发的 create 不再携带（防大载荷反复传输）。
+      conv.deviceTranscriptSent = true;
       if (pending) pending('created');
       persist = true;
       break;
     }
     case 'ai.run.started': {
-      // 权威新回合：占位在（本地 sendMessage 先推的）→ 复用；否则强制开新泡
-      // （attached 直播多回合：上一回合 prose 已 done，不能在这里丢帧）。
-      startRunBubble(conv);
-      conv.progressText = '';
+      const asst = ensureAssistantBubble(conv);
+      if (asst) asst.status = 'running';
       break;
     }
     case 'ai.delta': {
-      const asst = ensureStreamingBubble(conv, 'prose');
+      const asst = ensureAssistantBubble(conv);
       if (!asst) break;
       asst.content += e.delta || '';
       console.log('[aliang-chat] rendered delta, contentLen=', asst.content.length, 'conv=', conv.id);
       scrollToBottom();
-      break;
-    }
-    case 'ai.thinking': {
-      // 思考流（claude thinking_delta / codex reasoning）：独立思考气泡，样式
-      // 弱化对齐手机；思考尾收束后正文另起新泡（ensureStreamingBubble 规则③）。
-      const asst = ensureStreamingBubble(conv, 'thinking');
-      if (!asst) break;
-      asst.content += e.delta || '';
-      scrollToBottom();
-      break;
-    }
-    case 'ai.run.progress': {
-      // 进度小字（重试/文件/Git 计数）：挂 conv 展示在消息流尾部，终态清空。
-      const facts = runProgressFacts(e);
-      const parts = [];
-      if (facts.retrying && Number.isFinite(facts.attempt)) {
-        parts.push(t('chat_progressRetry', { attempt: facts.attempt, max: Number.isFinite(facts.max) ? facts.max : '?' }));
-      }
-      if (Number.isFinite(facts.files) && facts.files > 0) parts.push(t('chat_progressFiles', { count: facts.files }));
-      if (Number.isFinite(facts.git) && facts.git > 0) parts.push(t('chat_progressGit', { count: facts.git }));
-      conv.progressText = parts.join(' · ');
-      break;
-    }
-    case 'ai.approval.cancelled': {
-      // 旁路帧：对话失活/审批被撤——按 approval_ids 关卡（缺省 ids=全关该会话）。
-      const ids = Array.isArray(e.approval_ids) ? e.approval_ids : null;
-      if (!ids) {
-        clearApprovalsForSession(conv, e.session_id);
-      } else {
-        for (const id of ids) markApprovalHandled(conv, approvalKeyFromValues(e.session_id, id));
-        conv.approvals = (conv.approvals || []).filter(a => !ids.includes(a.id) || a.sessionId !== e.session_id);
-      }
-      persist = true;
       break;
     }
     case 'ai.status': {
@@ -1844,11 +1889,54 @@ function handleAIEvent(e) {
       persist = true;
       break;
     }
+    case 'ai.approval.cancelled': {
+      // 未结束回合的精确清卡（区别于 done/error 路径的 clearApprovalsForSession
+      // 粗暴清空）：逐个作废 + 系统提示条挂对应会话（审批族链已路由到设备壳/
+      // 活跃兜底）。③ 兜底时带「来自会话 X」前缀（评审折叠项，单行文案内联）。
+      const ids = Array.isArray(e.approval_ids) ? e.approval_ids : [];
+      for (const id of ids) {
+        const key = approvalKeyFromValues(e.session_id, id);
+        handledApprovalIds.add(key);
+        removeApproval(conv, key);
+      }
+      const cancelledText = e.reason
+        ? t('chat_approvalCancelledReason', { reason: e.reason })
+        : t('chat_approvalCancelled');
+      conv.messages.push({
+        role: 'assistant',
+        kind: 'system',
+        note: 'approval_cancelled',
+        content: systemNoteContent(e.sourceId, cancelledText),
+        status: 'done',
+        ts: now(),
+      });
+      scrollToBottom();
+      persist = true;
+      break;
+    }
+    case 'ai.run.notice': {
+      // 信息性帧：resume/历史降级的事实说明，不阻断输入、不进错误气泡。
+      // 未知 code 忽略（协议向后兼容——服务端新增 code 不炸旧前端）。
+      // ③ 兜底时带「来自会话 X」前缀（评审折叠项）。
+      const noticeText = agentRunNoticeText(e.code);
+      if (noticeText) {
+        conv.messages.push({
+          role: 'assistant',
+          kind: 'system',
+          note: 'run_notice',
+          content: systemNoteContent(e.sourceId, noticeText),
+          status: 'done',
+          ts: now(),
+        });
+        scrollToBottom();
+        persist = true;
+      }
+      break;
+    }
     case 'ai.done': {
       disarmIdleWatchdog();
-      // 终态收口：所有 running 气泡（正文+思考）一起翻 done，进度小字清空。
-      finishRunBubbles(conv, 'done');
-      conv.progressText = '';
+      const asst = findRunningAssistant(conv);
+      if (asst) asst.status = 'done';
       clearApprovalsForSession(conv, e.session_id);
       finishRun(conv);
       return;
@@ -1862,14 +1950,7 @@ function handleAIEvent(e) {
         // 下一条消息重发 create 即成功。判定只用 message_id 单条件：运行期
         // 所有 ai.error 出口都带 message_id，create 期全不带；「无 running 气泡」
         // 不可作条件——sendMessage 在发 create 前已推入占位气泡。
-        // 例外：watch/attach 不存在持久绑定的会话（journal 有、绑定无）——服务端
-        // 拒绝防上下文分叉（错误串含 "context fork guard"），翻成人话并给恢复引导。
-        const errorText = String(e.error || '');
-        if (errorText.includes('context fork guard')) {
-          if (matchedById && conv.id === activeId.value) createError.value = t('chat_forkGuard');
-        } else if (matchedById && conv.id === activeId.value) {
-          createError.value = e.error || t('chat_createFailed');
-        }
+        if (matchedById && conv.id === activeId.value) createError.value = e.error || t('chat_createFailed');
         const pending = pendingCreates.get(e.session_id);
         if (pending) pending('error');
         saveToStorage();
@@ -1879,8 +1960,6 @@ function handleAIEvent(e) {
         asst.status = 'error';
         if (!asst.content) asst.content = e.error || t('chat_aiError');
       }
-      finishRunBubbles(conv, 'error');
-      conv.progressText = '';
       clearApprovalsForSession(conv, e.session_id);
       finishRun(conv);
       return;
@@ -1901,18 +1980,19 @@ async function sendMessage() {
 
   const text = inputText.value.trim();
   if (!text || !activeId.value) return;
+  // sending 守卫（Task 4 分流）：非 running 维持禁用；running 会话在 sending
+  // 中放行——提交分流成 steer（见下）。
+  if (sending.value && !activeSessionRunning.value) return;
 
   const conv = activeConversation.value;
   if (!conv) return;
 
-  // attached 会话运行中 → 独立 steer 路径（门=该会话自身 run 状态；全局 sending
-  // 原语义不动，本地会话行为零变化——本地运行中 sending=true，早已在上行拦截）。
-  if (conv.attached && findRunningAssistant(conv)) {
-    inputText.value = '';
-    await sendSteer(conv, text);
+  // 分流规则（阶段 2 计划钉死）：running（本地气泡推断 OR 设备壳清单/快照
+  // status）→ 提交走 ai.steer；非 running → 原链（create 确认门 + ai.message）。
+  if (isConversationRunning(conv)) {
+    await submitSteer(conv, text);
     return;
   }
-  if (sending.value) return;
 
   conv.messages.push({ role: 'user', content: text, ts: now() });
   if (!conv.title) {
@@ -1950,10 +2030,6 @@ async function sendMessage() {
       return;
     }
     armIdleWatchdog(conv);
-    // attach 成功后必须紧跟 watch（重连场景续上直播跟踪）。仅 attached 会话：
-    // 本地会话自 watch 会让同一条 delta 经属主+watcher 两路写回、文本翻倍。
-    const watchTarget = watchTargetOf(conv);
-    if (watchTarget) sendWatch(watchTarget);
     const ok = sendAI({
       type: 'ai.message',
       session_id: conv.aiSessionId,
@@ -1976,58 +2052,30 @@ async function sendMessage() {
 function close() {
   // iOS Safari 上点关闭不会触发输入框 blur，先把在编的标题落地再卸载页面。
   commitRename();
-  unwatchAll();
   showDashboard();
 }
 
 function handleKeydown(e) {
   if (e.key === 'Escape') {
-    // Esc 先关抽屉（与目录浮层同套路），再关整页。
-    if (sessionDrawerOpen.value) {
-      sessionDrawerOpen.value = false;
-      return;
-    }
     close();
-  }
-}
-
-// 刷新恢复：localStorage 里 attach 接管过的会话重新 attach+watch——只对当前
-// 活跃的 attached 会话执行（其余会话切换时再接）；runtime 徽章预取与是否有
-// attached 会话解耦（抽屉首开也要徽章）。
-async function restoreAttachedSessions() {
-  const restorable = restorableAttachedSessionIds(conversations.value);
-  const conv = activeConversation.value;
-  if (conv && restorable.includes(conv.aiSessionId)) {
-    ensureLiveAttached(conv);
-    if (shouldLoadTranscript(conv)) loadTranscriptInto(conv);
-  }
-  try {
-    const runtime = await getAgentRuntimeSessions();
-    runtimeSessionIds.value = new Set(
-      (Array.isArray(runtime?.ai_conversations) ? runtime.ai_conversations : [])
-        .map(s => s && s.id).filter(Boolean)
-    );
-  } catch (_) {
-    // 徽章拉不到不影响恢复；下次打开抽屉再取。
-  }
-}
-
-function unwatchAll() {
-  for (const sessionId of [...watchedSessions]) {
-    sendUnwatch(sessionId);
   }
 }
 
 onMounted(() => {
   console.log('[aliang-chat] ChatPage mounted build=stream-v3 ws=' + aiSocketUrl());
   loadFromStorage();
-  restoreAttachedSessions();
+  loadDeviceSessions(); // 设备会话清单：每次进页拉取（权威在后端，不进 localStorage）
   document.addEventListener('keydown', handleKeydown);
+  // 审批卡 expires_at 倒计时刷新（30s 粒度，见 approvalExpiresLabel）
+  nowTickTimer = setInterval(() => { nowTick.value = now(); }, 30000);
 });
 
 onUnmounted(() => {
   document.removeEventListener('keydown', handleKeydown);
-  unwatchAll();
+  if (nowTickTimer) {
+    clearInterval(nowTickTimer);
+    nowTickTimer = null;
+  }
   if (aiSocket) {
     try { aiSocket.close(); } catch (_) {}
     aiSocket = null;
