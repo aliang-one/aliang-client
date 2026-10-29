@@ -404,6 +404,11 @@ type agentAIRun struct {
 	sessionID string
 	runID     string
 	messageID string
+	// ownerConnID 是发起本回合的本地聊天 socket 连接标识(HandleAIStream 铸
+	// 造、随入站帧注入 conn_id)。扇出时跳过它——属主走 e.write 直写,同一
+	// 连接若又 watch 了本会话(attach 即自登记),再去重就是双份文本。手机/
+	// remote 路径无 connID(空串),空串永不匹配,行为不变。
+	ownerConnID string
 	// surface 是本回合的驱动面标记（agentAISurfacePhone 或 ""），来自会话
 	// 状态；claudeApprovalHookSettings 据此决定是否硬禁终端交互构件。
 	surface string
@@ -537,6 +542,7 @@ type agentAIRunEmitter struct {
 	// park。与 clearWatcherCopies 同持 watchMu,无竞窗。
 	mgr             *agentAIManager
 	sessionID       string
+	ownerConnID     string
 	watchMu         sync.Mutex
 	watchers        map[string]*agentSessionWatchSink
 	watchTerminated chan struct{}
@@ -553,6 +559,7 @@ func newAgentAIRunEmitter(run agentAIRun, write agentTerminalWriter) *agentAIRun
 	return &agentAIRunEmitter{
 		runID:                  runID,
 		write:                  write,
+		ownerConnID:            run.ownerConnID,
 		goalIdentity:           cloneGoalIdentity(run.goalIdentity),
 		goalRequiredCheckCount: run.goalRequiredCheckCount,
 		goalAllowedRoots:       run.goalAllowedRoots,
@@ -580,6 +587,9 @@ func (e *agentAIRunEmitter) bindSessionWatchers(mgr *agentAIManager, sessionID s
 	e.watchMu.Lock()
 	defer e.watchMu.Unlock()
 	for connID, write := range snapshot {
+		if e.isOwnerConn(connID) {
+			continue // 属主连接走 e.write 直写,扇出再投就是双份
+		}
 		sink := &agentSessionWatchSink{
 			connID:  connID,
 			writer:  write,
@@ -589,6 +599,12 @@ func (e *agentAIRunEmitter) bindSessionWatchers(mgr *agentAIManager, sessionID s
 		e.watchers[connID] = sink
 		go e.pumpWatchSink(sink)
 	}
+}
+
+// isOwnerConn 判定一条 watcher 连接是否就是本回合属主(空串永不匹配:手机/
+// remote 路径无连接标识,行为与引入前一致)。
+func (e *agentAIRunEmitter) isOwnerConn(connID string) bool {
+	return e.ownerConnID != "" && connID == e.ownerConnID
 }
 
 // pumpWatchSink 是一个 watcher 的常驻投递 goroutine:从缓冲取帧写给对端。
@@ -656,6 +672,12 @@ func (e *agentAIRunEmitter) attachWatch(connID string, write agentTerminalWriter
 		return
 	default:
 	}
+	if e.isOwnerConn(connID) {
+		// attach 即自登记的属主连接:manager 注册表照登(下一 run/换属主后
+		// 仍有效),但本 run 不插 sink——它拿 e.write 直写,再插即双份。
+		e.watchMu.Unlock()
+		return
+	}
 	if _, ok := e.watchers[connID]; ok {
 		e.watchMu.Unlock()
 		return
@@ -705,6 +727,9 @@ func (e *agentAIRunEmitter) fanOutLocked(payload map[string]interface{}) {
 	var dropped []*agentSessionWatchSink
 	e.watchMu.Lock()
 	for _, sink := range e.watchers {
+		if e.isOwnerConn(sink.connID) {
+			continue // 属主连接走 e.write 直写,扇出再投就是双份
+		}
 		frame := make(map[string]interface{}, len(payload))
 		for key, value := range payload {
 			frame[key] = value
@@ -2283,6 +2308,7 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 		nativeGoal:             cloneAgentAIMap(mapIf(msg["native_goal"])),
 		readOnly:               messageIsGoalFork,
 	}
+	messageRun.ownerConnID = remoteString(msg, "conn_id")
 	emitter := m.runEmitter(messageRun, writeJSON)
 	runWrite := agentTerminalWriter(emitter.emit)
 	if content == "" {
@@ -2502,6 +2528,7 @@ func (m *agentAIManager) runStart(msg map[string]interface{}, writeJSON agentTer
 		// terminal instead of leaving a permanently "received" processed-run row.
 		emitter := m.runEmitter(agentAIRun{
 			runID: runID, sessionID: sessionID, messageID: messageID,
+			ownerConnID:  remoteString(msg, "conn_id"),
 			goalIdentity: goalRunIdentityFromMessage(msg),
 		}, writeJSON)
 		_ = emitter.emit(agentAIErrorPayload(sessionID, messageID, err))
@@ -3442,7 +3469,7 @@ func (m *agentAIManager) optionResponse(msg map[string]interface{}, writeJSON ag
 	content := buildAgentAIOptionFollowup(pending, selected, custom)
 	messageID := pending.MessageID + ".option"
 
-	run := agentAIRun{sessionID: sessionID, runID: remoteString(msg, "run_id"), messageID: messageID}
+	run := agentAIRun{sessionID: sessionID, runID: remoteString(msg, "run_id"), messageID: messageID, ownerConnID: remoteString(msg, "conn_id")}
 	emitter := m.runEmitter(run, writeJSON)
 	if err := m.runUserMessage(session, remoteString(msg, "run_id"), messageID, content, provider, nil, nil, emitter, nil); err != nil {
 		_ = emitter.emit(agentAIErrorPayload(sessionID, messageID, err))

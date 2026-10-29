@@ -329,11 +329,19 @@ func (s *AgentService) Status() models.AgentStatusResponse {
 // VibeSessions returns the local AI coding sessions (Claude/Codex) as
 // lightweight summaries, newest first. Transcript is stripped.
 func (s *AgentService) VibeSessions() []models.AgentVibeSession {
-	snapshot := agentSyncSnapshot{VibeSessions: summarizeAgentVibeSessions(collectAgentVibeSessions(nil))}
+	return s.annotateAndOverlayVibeSessions(summarizeAgentVibeSessions(collectAgentVibeSessions(nil)))
+}
+
+// annotateAndOverlayVibeSessions 是会话列表的注解+活跃覆盖尾段。origin 注解
+// (只增不改既有字段)与手机 sync 快照同源同序——先注解再 overlay,前端抽屉
+// 的「手机/桌面」来源标记才拿得到非空 origin。抽出成函数是为了可测(端点
+// 本体带全量磁盘扫描,单测不可负担)。
+func (s *AgentService) annotateAndOverlayVibeSessions(base []models.AgentVibeSession) []models.AgentVibeSession {
 	if s == nil || s.ai == nil {
-		return snapshot.VibeSessions
+		return base
 	}
-	return overlayActiveAgentVibeSessions(snapshot, s.ai.activeVibeSessionsSnapshot(), nil).VibeSessions
+	base = s.ai.annotateManagedVibeSessions(base)
+	return overlayActiveAgentVibeSessions(agentSyncSnapshot{VibeSessions: base}, s.ai.activeVibeSessionsSnapshot(), nil).VibeSessions
 }
 
 // RuntimeSessions returns process-local sessions that are actively executing.

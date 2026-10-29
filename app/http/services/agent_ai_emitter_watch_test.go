@@ -1334,3 +1334,126 @@ func TestAgentAIJournalHeaderIdentityAndCorruption(t *testing.T) {
 		t.Fatalf("overlong head without binding = %#v, want refusal", frames4)
 	}
 }
+
+// ---------- Task 4.5: 属主连接去重 + 会话列表 origin 注解 ----------
+
+// 属主连接去重:同一连接既属主又 watcher(attach 即自登记,前端拦不住)时,
+// 扇出必须跳过属主——属主拿 e.write 直写,再投就是双份文本;不同连接的
+// watcher 照常两路都到。手机/remote 无 connID(空串)永不匹配。
+func TestAgentAIEmitterSkipsOwnerConnectionInFanout(t *testing.T) {
+	m := newAgentAIManager()
+	ownerRec := &emitterWatchRecorder{}
+	peerRec := &emitterWatchRecorder{}
+	m.watchSession("s-1", "conn-owner", ownerRec.write)
+	m.watchSession("s-1", "conn-peer", peerRec.write)
+
+	emitter := m.runEmitter(agentAIRun{
+		sessionID: "s-1", runID: "run-1", messageID: "msg-1",
+		ownerConnID: "conn-owner",
+	}, ownerRec.write)
+
+	if err := emitter.emit(emitterWatchPayload(models.AgentEventAIDelta, "s-1", 1)); err != nil {
+		t.Fatal(err)
+	}
+	waitForWatchCond(t, 2*time.Second, "peer watcher to receive the frame", func() bool {
+		return len(peerRec.snapshot()) == 1
+	})
+	if got := len(ownerRec.snapshot()); got != 1 {
+		t.Fatalf("owner connection received %d copies, want exactly 1 (direct write only)", got)
+	}
+
+	// 中途 attachWatch 属主 connID:不插 sink(manager 注册表照登)。
+	emitter.attachWatch("conn-owner", ownerRec.write)
+	if _, ok := watcherCopyForTest(emitter)["conn-owner"]; ok {
+		t.Fatal("owner connID got a sink; owner would receive double frames")
+	}
+	if snap := m.sessionWatchersSnapshot("s-1"); len(snap) != 2 {
+		t.Fatalf("registry after owner attachWatch = %#v, want both conns kept", snap)
+	}
+
+	// 换属主后的下一个 run:旧属主(仍在注册表)恢复扇出语义——它不再是属主,
+	// 该收到帧;run-2 用独立属主写,计数互不混淆。
+	newOwnerRec := &emitterWatchRecorder{}
+	next := m.runEmitter(agentAIRun{
+		sessionID: "s-1", runID: "run-2", messageID: "msg-2",
+		ownerConnID: "conn-new-owner",
+	}, newOwnerRec.write)
+	if err := next.emit(emitterWatchPayload(models.AgentEventAIDelta, "s-1", 2)); err != nil {
+		t.Fatal(err)
+	}
+	waitForWatchCond(t, 2*time.Second, "previous owner (now pure watcher) to receive fanout", func() bool {
+		return len(ownerRec.snapshot()) == 2 // run-1 直写 + run-2 扇出
+	})
+	waitForWatchCond(t, 2*time.Second, "new owner direct write", func() bool {
+		return len(newOwnerRec.snapshot()) == 1
+	})
+}
+
+// 属主为空串(手机/remote 路径)永不匹配:全部 watcher 照常两路。
+func TestAgentAIEmitterEmptyOwnerConnKeepsFanout(t *testing.T) {
+	m := newAgentAIManager()
+	ownerRec := &emitterWatchRecorder{}
+	watchRec := &emitterWatchRecorder{}
+	m.watchSession("s-1", "conn-peer", watchRec.write)
+	emitter := m.runEmitter(agentAIRun{
+		sessionID: "s-1", runID: "run-1", messageID: "msg-1",
+		ownerConnID: "",
+	}, ownerRec.write)
+	if err := emitter.emit(emitterWatchPayload(models.AgentEventAIDelta, "s-1", 1)); err != nil {
+		t.Fatal(err)
+	}
+	waitForWatchCond(t, 2*time.Second, "watcher to receive the frame", func() bool {
+		return len(watchRec.snapshot()) == 1
+	})
+	if got := len(ownerRec.snapshot()); got != 1 {
+		t.Fatalf("owner frames = %d, want 1", got)
+	}
+}
+
+// 会话列表 origin 注解(只增不改):合成 base 走端点同一段尾段(免全量磁盘
+// 扫描)——origin 必须非空(managed/external),既有字段值一个不动。
+func TestAgentAIVibeSessionsEndpointAnnotatesOrigin(t *testing.T) {
+	m := newAgentAIManager()
+	svc := &AgentService{ai: m}
+	_, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	m.mu.Lock()
+	m.sessions["s-active"] = &agentAISession{
+		id: "s-active", mode: "vibe", provider: "claude", projectPath: "/tmp/proj",
+		cancel: cancel, lastActiveAt: time.Now().UTC(),
+	}
+	m.mu.Unlock()
+
+	base := []models.AgentVibeSession{{
+		ID: "disk-1", Provider: "claude", Tool: "claude", ProjectPath: "/tmp/disk-proj",
+		Status: "idle",
+	}}
+	out := svc.annotateAndOverlayVibeSessions(base)
+	if len(out) == 0 {
+		t.Fatal("empty result")
+	}
+	for _, session := range out {
+		if strings.TrimSpace(session.Origin) == "" {
+			t.Fatalf("session %s has empty origin; drawer source tag would be blank", session.ID)
+		}
+	}
+	// 只增不改:磁盘条目的既有字段值原样保留(origin/source 除外)。
+	for _, session := range out {
+		if session.ID != "disk-1" {
+			continue
+		}
+		if session.Provider != "claude" || session.Tool != "claude" || session.ProjectPath != "/tmp/disk-proj" || session.Status != "idle" {
+			t.Fatalf("existing fields mutated: %#v", session)
+		}
+	}
+	// 活跃 overlay 条目也在且 origin 非空。
+	var activeSeen bool
+	for _, session := range out {
+		if session.ID == "s-active" && strings.TrimSpace(session.Origin) != "" {
+			activeSeen = true
+		}
+	}
+	if !activeSeen {
+		t.Fatalf("active session missing or un-annotated: %#v", out)
+	}
+}
