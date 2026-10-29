@@ -56,12 +56,11 @@
               />
               <div v-else class="flex items-center gap-2">
                 <div class="min-w-0 flex-1 truncate">{{ c.title || t('chat_emptyTitle') }}</div>
-                <!-- TODO(i18n-task6): 角标文案键 chat_source_phone/dashboard/terminal/active -->
                 <span
-                  v-if="c.deviceSession && sessionSourceBadge(c.deviceSession)"
+                  v-if="c.deviceSession && sourceBadgeLabel(c.deviceSession)"
                   data-testid="session-source-badge"
                   class="shrink-0 rounded bg-slate-200 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-slate-500 dark:bg-slate-700 dark:text-slate-300"
-                >{{ sessionSourceBadge(c.deviceSession) }}</span>
+                >{{ sourceBadgeLabel(c.deviceSession) }}</span>
                 <span
                   v-if="c.running"
                   data-testid="device-session-running-dot"
@@ -85,8 +84,7 @@
           </template>
         </template>
         <div v-if="mergedConversations.length === 0" class="px-4 py-8 text-center text-sm text-slate-400">
-          <!-- TODO(i18n-task6): chat_deviceSessionsEmpty / chat_deviceSessionsLoadFailed -->
-          {{ deviceAvailable ? '设备上还没有会话' : '设备会话不可用' }}
+          {{ deviceAvailable ? t('chat_deviceSessionsEmpty') : t('chat_deviceSessionsLoadFailed') }}
         </div>
       </div>
     </aside>
@@ -263,8 +261,8 @@
             data-testid="device-session-load-error"
             class="mb-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-600 dark:border-rose-800 dark:bg-rose-950/40 dark:text-rose-300"
           >
-            <!-- TODO(i18n-task6): chat_deviceSessionLoadFailed -->
-            {{ activeConversation.deviceLoadError }}
+            <!-- deviceLoadError 只存布尔标记，文案在渲染时走 i18n（随语言切换） -->
+            {{ t('chat_deviceSessionLoadFailed') }}
           </div>
           <div v-if="activeMessages.length === 0" class="flex h-full items-center justify-center">
             <p class="text-sm text-slate-400">{{ t('chat_startNew') }}</p>
@@ -315,8 +313,7 @@
             <div class="flex flex-wrap items-center gap-2">
               <span class="material-symbols-outlined text-sm text-primary">bolt</span>
               <span class="font-semibold text-slate-600 dark:text-slate-200">
-                <!-- TODO(i18n-task6): chat_steerLabel -->
-                插话
+                {{ t('chat_steerLabel') }}
               </span>
               <span
                 data-testid="chat-steer-status"
@@ -346,9 +343,8 @@
                 {{ approvalExpiresLabel(approval) }}
               </span>
             </div>
-            <p v-if="approval.sourceLabel" class="mt-1 text-xs font-medium text-amber-700 dark:text-amber-200">
-              <!-- TODO(i18n-task6): chat_approvalFromSession -->
-              {{ approval.sourceLabel }}
+            <p v-if="approval.sourceId" class="mt-1 text-xs font-medium text-amber-700 dark:text-amber-200">
+              {{ t('chat_approvalFromSession', { id: approval.sourceId }) }}
             </p>
             <p v-if="approval.reason" class="mt-1 whitespace-pre-wrap text-xs text-amber-800 dark:text-amber-200">
               {{ approval.reason }}
@@ -418,8 +414,7 @@
           data-testid="chat-steer-blocked-hint"
           class="mb-2 rounded-lg border border-slate-200 bg-slate-100 px-3 py-2 text-xs text-slate-500 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300"
         >
-          <!-- TODO(i18n-task6): chat_steerBlocked -->
-          该会话正在其他端运行，暂不能插话
+          {{ t('chat_steerBlocked') }}
         </div>
         <div class="flex items-center gap-2">
           <div class="relative flex-1">
@@ -627,7 +622,7 @@ const sendDisabled = computed(() => sending.value && !activeSessionRunning.value
 
 const sendButtonLabel = computed(() => {
   if (sending.value && activeSessionRunning.value) {
-    return '插话中'; // TODO(i18n-task6): chat_steerSending
+    return t('chat_steerSending');
   }
   return sending.value ? t('chat_sending') : t('chat_send');
 });
@@ -635,7 +630,7 @@ const sendButtonLabel = computed(() => {
 const inputPlaceholder = computed(() => {
   // 仅在插话真正可达时换占位符提示（阻断态保持普通占位，提示条已另行说明）
   if (activeSessionRunning.value && activeSteerTarget.value) {
-    return '运行中，发送将作为插话'; // TODO(i18n-task6): chat_steerPlaceholder
+    return t('chat_steerPlaceholder');
   }
   return t('chat_placeholder');
 });
@@ -645,19 +640,34 @@ const activeSteerItems = computed(() => activeConversation.value?.steerItems || 
 function steerStatusLabel(item) {
   switch (item?.status) {
     case 'sent':
-      return '已发送'; // TODO(i18n-task6): chat_steerSent
+      return t('chat_steerSent');
     case 'queued':
-      return '已受理，将在下一轮生效'; // TODO(i18n-task6): chat_steerQueued
+      return t('chat_steerQueued');
     case 'applied':
-      return '已送达'; // TODO(i18n-task6): chat_steerApplied
+      return t('chat_steerApplied');
     case 'not_running':
-      return '回合已结束，插话未生效'; // TODO(i18n-task6): chat_steerNotRunning
+      return t('chat_steerNotRunning');
     case 'unknown':
       // 未知 result（含未来新增值如 held）：中性渲染，不误标失败（评审折叠项）
-      return `插话状态：${item?.result || '未知'}`; // TODO(i18n-task6): chat_steerUnknown
+      return t('chat_steerUnknown', { result: item?.result || t('chat_steerUnknownResult') });
     default:
-      return '插话失败'; // TODO(i18n-task6): chat_steerFailed
+      return t('chat_steerFailed');
   }
+}
+
+// --- i18n 渲染辅助（跨端统一阶段 2 Task 6） ---
+
+// 来源角标：sessionSourceBadge 返回逻辑键（active/phone/dashboard/terminal），
+// 展示文案在此映射为 chat_source_* 键（逻辑键与文案解耦，单元测试可钉逻辑键）。
+function sourceBadgeLabel(session) {
+  const key = sessionSourceBadge(session);
+  return key ? t(`chat_source_${key}`) : '';
+}
+
+// 系统条文案组装：③活跃兜底时带「来自会话 X」前缀（评审折叠项），无来源
+// 单行直出。sourceId 只存 id 切片（翻译在渲染时做，随语言切换）。
+function systemNoteContent(sourceId, text) {
+  return sourceId ? `${t('chat_approvalFromSession', { id: sourceId })}: ${text}` : text;
 }
 
 // --- 三源统一清单（本地草稿 + 设备会话壳） ---
@@ -1187,8 +1197,9 @@ async function openDeviceSession(shell) {
       if (pageError) console.warn('[aliang-chat] device transcript partial pages', pageError);
       applyDeviceTranscript(live, transcript);
     } else if (pageError) {
-      // 空转录+错误条：详情缺席不阻断（本地会话池里壳已在，输入照常）
-      live.deviceLoadError = '会话详情加载失败，暂显示空会话'; // TODO(i18n-task6): chat_deviceSessionLoadFailed
+      // 空转录+错误条：详情缺席不阻断（本地会话池里壳已在，输入照常）。
+      // 只存布尔标记——文案在模板渲染时走 i18n，不冻结赋值时的语言。
+      live.deviceLoadError = true;
     }
   }
 
@@ -1524,9 +1535,9 @@ function upsertApproval(conv, event) {
     provider: event.provider || existing?.provider || '',
     kind: event.kind || existing?.kind || 'tool',
     status: existing?.status === 'responding' ? 'responding' : 'pending',
-    // ③兜底挂活跃会话时的来源标签（「来自会话 xxx」）：挂对壳/本端会话的卡
-    // 无此字段。
-    sourceLabel: event.sourceLabel || existing?.sourceLabel || '',
+    // ③兜底挂活跃会话时的来源 id 切片（「来自会话 X」的 X）：挂对壳/本端
+    // 会话的卡无此字段。文案在渲染时经 chat_approvalFromSession 翻译。
+    sourceId: event.sourceId || existing?.sourceId || '',
     title: event.title || existing?.title || '',
     reason: event.reason || existing?.reason || '',
     command: event.command || existing?.command || '',
@@ -1596,13 +1607,13 @@ function approvalExpiresLabel(approval) {
   const remainMs = expiresMs - nowTick.value;
   if (remainMs <= 0) return '';
   if (remainMs < 2 * 60 * 1000) {
-    return '即将超时'; // TODO(i18n-task6): chat_approvalExpiringSoon
+    return t('chat_approvalExpiringSoon');
   }
   const minutes = Math.ceil(remainMs / 60000);
   if (minutes <= 60) {
-    return `${minutes} 分钟`; // TODO(i18n-task6): chat_approvalExpiresMinutes
+    return t('chat_approvalExpiresMinutes', { minutes });
   }
-  return `约 ${Math.round(remainMs / 3600000)} 小时`; // TODO(i18n-task6): chat_approvalExpiresHours
+  return t('chat_approvalExpiresHours', { hours: Math.round(remainMs / 3600000) });
 }
 
 async function respondApproval(conv, approval, decision) {
@@ -1654,9 +1665,9 @@ function finishRun(conv) {
 function agentRunNoticeText(code) {
   switch (code) {
     case 'resume_missing':
-      return '原生会话不存在，已按新会话继续'; // TODO(i18n-task6): chat_noticeResumeMissing
+      return t('chat_noticeResumeMissing');
     case 'history_restore_failed':
-      return '历史恢复失败，已按空会话继续'; // TODO(i18n-task6): chat_noticeHistoryRestoreFailed
+      return t('chat_noticeHistoryRestoreFailed');
     default:
       return '';
   }
@@ -1791,16 +1802,15 @@ function handleAIEvent(e) {
       conv = shell;
       routedToShell = true;
     } else if (activeConversation.value) {
-      // TODO(i18n-task6): chat_approvalFromSession 前缀键
-      e.sourceLabel = `来自会话 ${String(e.session_id).slice(0, 8)}`;
+      // ③ 兜底：只记 id 切片，前缀文案由渲染层经 chat_approvalFromSession 翻译
+      e.sourceId = String(e.session_id).slice(0, 8);
     }
   }
   // run.notice 走活跃兜底（③）时同样带来源标签（评审折叠项）：系统条是单行
   // 文案，前缀由各 case 拼进内容。notice 不做壳三键路由（session_id 即
   // manager 会话 id，① 直连已覆盖，壳路由会放大误挂面）。
   if (!conv && e.type === 'ai.run.notice' && e.session_id && activeConversation.value) {
-    // TODO(i18n-task6): chat_approvalFromSession 前缀键
-    e.sourceLabel = `来自会话 ${String(e.session_id).slice(0, 8)}`;
+    e.sourceId = String(e.session_id).slice(0, 8);
   }
   // Fallback: a run started from this page always targets the active
   // conversation's live assistant bubble. If the session id didn't match
@@ -1889,13 +1899,14 @@ function handleAIEvent(e) {
         handledApprovalIds.add(key);
         removeApproval(conv, key);
       }
-      // TODO(i18n-task6): chat_approvalCancelled
-      const cancelledText = e.reason ? `审批已被取消（${e.reason}）` : '审批已被取消';
+      const cancelledText = e.reason
+        ? t('chat_approvalCancelledReason', { reason: e.reason })
+        : t('chat_approvalCancelled');
       conv.messages.push({
         role: 'assistant',
         kind: 'system',
         note: 'approval_cancelled',
-        content: e.sourceLabel ? `${e.sourceLabel}：${cancelledText}` : cancelledText,
+        content: systemNoteContent(e.sourceId, cancelledText),
         status: 'done',
         ts: now(),
       });
@@ -1913,7 +1924,7 @@ function handleAIEvent(e) {
           role: 'assistant',
           kind: 'system',
           note: 'run_notice',
-          content: e.sourceLabel ? `${e.sourceLabel}：${noticeText}` : noticeText,
+          content: systemNoteContent(e.sourceId, noticeText),
           status: 'done',
           ts: now(),
         });

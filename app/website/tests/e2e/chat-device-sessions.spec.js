@@ -151,7 +151,8 @@ async function pushFrame(page, frame) {
 test('侧栏三源清单：来源角标、running 状态点、设备条目不可删除/重命名', async ({ page }) => {
   await openChat(page);
   const badges = page.getByTestId('session-source-badge');
-  await expect(badges).toHaveText(['active', 'terminal']); // running > origin > id 前缀
+  // i18n 后角标渲染 chat_source_* 文案（无头 Chrome=en-US → 英文），双语文本匹配
+  await expect(badges).toHaveText([/Running|进行中/, /Terminal|终端/]); // running > origin > id 前缀
   await expect(page.getByTestId('device-session-running-dot')).toHaveCount(1); // 仅 agentcore running 条目
   // 无本地草稿时不应有任何重命名入口（设备会话不可本端改名/删除）
   await expect(page.getByRole('button', { name: /重命名|Rename/ })).toHaveCount(0);
@@ -201,7 +202,7 @@ test('详情 404：错误条可见，空态仍可输入，订阅照发', async (
   await page.getByText('手机发起的会话').click();
   await expect(page.getByTestId('device-session-load-error')).toBeVisible();
   // running agentcore 裸 id → 占位符切插话语义（评审折叠项：回退 entry.id 可插话）
-  const input = page.getByPlaceholder(/输入消息|运行中|Type a message/);
+  const input = page.getByPlaceholder(/输入消息|运行中|Running|Type a message/);
   await expect(input).toBeEnabled();
   await input.fill('续聊草稿');
   await expect(input).toHaveValue('续聊草稿');
@@ -239,7 +240,7 @@ test('审批族帧③：未知会话兜底挂活跃会话，卡带「来自会�
   });
   // 挂活跃会话（现状 fallback）+ 来源标签（id 前 8）
   await expect(page.getByText('echo from-ghost')).toBeVisible();
-  await expect(page.getByText(/来自会话 ghost-99/)).toBeVisible();
+  await expect(page.getByText(/来自会话 ghost-99|From session ghost-99/)).toBeVisible();
 });
 
 test('resume 字段仅首次 create：created ack 后清除，后续 create 不再携带', async ({ page }) => {
@@ -276,9 +277,9 @@ test('running 设备壳（managed_conversation_id）提交 → ai.steer 目标�
   ];
   await openChat(page, { sessions });
   await page.getByText('他端跑着的会话').click();
-  // running+可插话 → 占位符切到插话语义（chat_steerPlaceholder，i18n 前硬编码中文）
-  const input = page.getByPlaceholder(/输入消息|运行中|Type a message/);
-  await expect(input).toHaveAttribute('placeholder', /运行中，发送将作为插话/);
+  // running+可插话 → 占位符切到插话语义（chat_steerPlaceholder，双语文本匹配）
+  const input = page.getByPlaceholder(/输入消息|运行中|Running|Type a message/);
+  await expect(input).toHaveAttribute('placeholder', /运行中，发送将作为插话|Running — your message will be sent as a steer/);
   await input.fill('插一句话');
   await page.keyboard.press('Enter');
   // steer 帧目标 = managed_conversation_id（真正的在跑回合）
@@ -299,7 +300,7 @@ test('running 设备壳（managed_conversation_id）提交 → ai.steer 目标�
   await pushFrame(page, {
     type: 'ai.steer.ack', session_id: 'managed-run-9', message_id: steer.message_id, result: 'queued',
   });
-  await expect(page.getByTestId('chat-steer-status')).toHaveText(/已受理/);
+  await expect(page.getByTestId('chat-steer-status')).toHaveText(/已受理|Queued/);
 });
 
 test('running agentcore 裸 id 无 managed id：steer 回退 entry.id，不误阻断', async ({ page }) => {
@@ -310,7 +311,7 @@ test('running agentcore 裸 id 无 managed id：steer 回退 entry.id，不误�
   await page.getByText('裸 id 运行').click();
   // 无阻断提示：entry.id ==托管通道会话 id（订阅/续聊同源），可直连 steer
   await expect(page.getByTestId('chat-steer-blocked-hint')).toHaveCount(0);
-  const input = page.getByPlaceholder(/输入消息|运行中|Type a message/);
+  const input = page.getByPlaceholder(/输入消息|运行中|Running|Type a message/);
   await input.fill('裸 id 插话');
   await page.keyboard.press('Enter');
   await expect.poll(async () => page.evaluate(() =>
@@ -445,7 +446,7 @@ test('pending 审批带 expires_at：倒计时徽标显示约 23 小时', async 
     type: 'ai.approval.request', session_id: 'conv-agentcore-1', approval_id: 'ap-exp-1',
     kind: 'command', command: 'sleep 1', expires_at: new Date(Date.now() + 23 * 3600 * 1000).toISOString(),
   });
-  await expect(page.getByTestId('approval-expires')).toHaveText(/约 23 小时|23\s*小时/);
+  await expect(page.getByTestId('approval-expires')).toHaveText(/约 23 小时|~23 h/);
 });
 
 test('ai.approval.cancelled：卡消失 + 提示条（含 reason）', async ({ page }) => {
@@ -464,7 +465,7 @@ test('ai.approval.cancelled：卡消失 + 提示条（含 reason）', async ({ p
   await expect(page.getByText('echo cx')).toHaveCount(0); // 精确清卡
   // ③ 活跃兜底 → 系统条带「来自会话 X」前缀（评审折叠项；slice(0,8)='ghost-55'）
   await expect(page.getByTestId('chat-approval-cancelled-note'))
-    .toHaveText(/来自会话 ghost-55：审批已被取消（run_cancelled）/);
+    .toHaveText(/来自会话 ghost-55: 审批已被取消（run_cancelled）|From session ghost-55: Approval was cancelled \(run_cancelled\)/);
 });
 
 test('ai.run.notice resume_missing：提示条可见，不阻断输入', async ({ page }) => {
@@ -482,6 +483,6 @@ test('ai.run.notice resume_missing：提示条可见，不阻断输入', async (
   await pushFrame(page, {
     type: 'ai.run.notice', session_id: sid, message_id: 'm-1', code: 'resume_missing', detail: 'native session native9 not found',
   });
-  await expect(page.getByTestId('chat-run-notice')).toHaveText(/原生会话不存在/);
+  await expect(page.getByTestId('chat-run-notice')).toHaveText(/原生会话不存在|Native session not found/);
   await expect(input).toBeEnabled(); // 信息性帧不锁输入
 });
