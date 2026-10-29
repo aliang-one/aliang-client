@@ -470,6 +470,14 @@ func (m *agentAIManager) revokeRunResumePointLocked(g *agentAIRunGuard) (revoked
 		revokedResume = session.resumeSessionID
 		session.resumeSessionID = ""
 	}
+	// 只撤半个身份会喂出下回合碰撞：被强拆的 run 若以 reserved 身份起跑
+	// （bindingAtStart 即该 id），其 jsonl 可能已落盘；reservedNativeSessionID
+	// 留着会让下一回合 fresh 再拿同 id 撞 "already in use"。判据与绑定撤销
+	// 同款：仅清等于起跑快照的值，不动其他来源。
+	if session.reservedNativeSessionID != "" && session.reservedNativeSessionID == g.bindingAtStart {
+		logger.Info(fmt.Sprintf("[ai.run.zombie_revoke] session=%s runSeq=%d cleared stale reserved id %q", g.sessionID, g.runSeq, session.reservedNativeSessionID))
+		session.reservedNativeSessionID = ""
+	}
 	if binding, ok := m.bindings[g.sessionID]; ok && binding.NativeSessionID != "" && binding.NativeSessionID != g.bindingAtStart {
 		droppedBinding = binding.NativeSessionID
 		delete(m.bindings, g.sessionID)
