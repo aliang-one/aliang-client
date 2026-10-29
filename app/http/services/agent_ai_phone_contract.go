@@ -50,7 +50,7 @@ func agentAIPhoneContractReminder() string {
 	return "<system-reminder>\n" +
 		agentAIPhoneContractMarker + "。\n" +
 		"- 用户看不到终端；结论要自包含、手机可读，不要让用户去看命令输出或文件行号。\n" +
-		"- 需要用户选择/回答时：优先调用 mcp__aliang__ask_user 工具；不可用时输出 ```aliang-options JSON 围栏（title + options[{id,label,description}]，用三反引号围住）；再退纯文本编号列表等用户打字回复。\n" +
+		"- 需要用户选择/回答时：优先调用 mcp__aliang__ask_user 工具；不可用时输出 ```aliang-options JSON 围栏——首行只有 ```aliang-options，下一行是独占一行的单个 JSON 对象，收尾三反引号独占一行（{\"title\",\"options\":[{\"id\",\"label\",\"description\",\"response\",\"previews\"}],\"multi\",\"allow_custom\"}；id 用 ≤48 字符短英文 slug、label 纯文本禁 markdown、其余字段按需省略，围栏后停下等用户选）；再退纯文本编号列表等用户打字回复。\n" +
 		"- 不要调用 AskUserQuestion 等终端交互工具（本环境已禁用，调用会直接报错）。\n" +
 		"- 工具需要授权时正常发起，审批会以卡片形式推送到手机，无需终端确认。\n" +
 		"</system-reminder>\n\n"

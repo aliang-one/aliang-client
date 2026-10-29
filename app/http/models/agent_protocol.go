@@ -267,7 +267,7 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				{Type: AgentEventFileError, Required: []string{"type", "request_id", "error"}},
 				{Type: AgentEventError, Required: []string{"type", "error"}},
 				{Type: AgentEventAIRenameAck, Required: []string{"type", "session_id", "accepted"}, Optional: []string{"title_updated_at", "error"}},
-				{Type: AgentEventAIOptionRequest, Required: []string{"type", "session_id", "option_id", "options", "run_id", "event_seq"}, Optional: []string{"message_id", "title", "allow_custom", "multi", "provider"}},
+				{Type: AgentEventAIOptionRequest, Required: []string{"type", "session_id", "option_id", "options", "run_id", "event_seq"}, Optional: []string{"message_id", "title", "header", "summary", "v", "allow_custom", "multi", "provider"}},
 				{Type: AgentEventGoalPlanAIRequest, Required: []string{"type", "request_id", "goal_id", "planning_attempt_id", "ai_session_id", "turn", "messages"}},
 				{Type: AgentEventGoalPlanResult, Required: []string{"type", "request_id", "workspace_fingerprint_before", "workspace_fingerprint_after", "proposal"}, Optional: []string{"provider_run_id"}},
 				{Type: AgentEventGoalPlanError, Required: []string{"type", "request_id", "error"}},
