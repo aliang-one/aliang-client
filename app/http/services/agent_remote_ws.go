@@ -542,12 +542,16 @@ func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn) error {
 		approvalSyncTicker := time.NewTicker(time.Minute)
 		defer approvalSyncTicker.Stop()
 		// Change-driven inventory: re-hash the cheap session fingerprint every
-		// few seconds; on a change push a hello immediately instead of waiting
-		// for the minute backstop. Titles, running status and rename-cache
-		// mutations reach the phone in ~one tick instead of up to 60s.
+		// few seconds and push a hello on a change, throttled to
+		// agentVibeDigestHelloMinInterval: an active machine flips the
+		// fingerprint on nearly every tick (live jsonl appends), which produced
+		// 3367 hellos/day on the 2026-10-29 production Mac and drove the
+		// server's detail-refresh fan-out into PG deadlocks. Consecutive
+		// changes within the window coalesce into one hello carrying the latest
+		// fingerprint; other hello reasons (connect/periodic/rename) bypass the
+		// gate and refresh its baseline via sendAgentHello.
 		digestTicker := time.NewTicker(agentVibeDigestInterval)
 		defer digestTicker.Stop()
-		var lastVibeDigest string
 		for {
 			select {
 			case <-heartbeatTicker.C:
@@ -560,19 +564,32 @@ func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn) error {
 					"agent_tools_rev": agentToolRegistryRev,
 				})
 			case <-digestTicker.C:
-				// The first tick only records the baseline — the connect hello
-				// already carried that state. Log-only on failure (see the
-				// periodic hello case): a failed push must not kill the stream.
+				// The first observed fingerprint only records the baseline — the
+				// connect hello already carried that state. Log-only on failure
+				// (see the periodic hello case): a failed push must not kill
+				// the stream.
 				digest := agentVibeDigest(agentHome())
 				if digest == "" {
 					continue
 				}
-				if lastVibeDigest != "" && digest != lastVibeDigest {
-					if err := s.sendAgentHello(writeJSON, "vibe_digest_change"); err != nil {
-						logger.Warn(fmt.Sprintf("[AGENT-BOOT] remote_connection digest_hello_failed error=%v", err))
-					}
+				if s.remoteHello.baseline(digest) {
+					continue
 				}
-				lastVibeDigest = digest
+				if s.remoteHello.unchanged(digest) {
+					continue
+				}
+				if ok, firstDefer := s.remoteHello.allow(digest, time.Now(), agentVibeDigestHelloMinInterval); !ok {
+					if firstDefer {
+						// 窗口内连续变更合批为一次 hello,只打一条去重日志。
+						logger.Info("[AGENT-BOOT] remote_connection digest_hello_deferred min_interval=" + agentVibeDigestHelloMinInterval.String())
+					}
+					continue
+				}
+				if err := s.sendAgentHello(writeJSON, "vibe_digest_change"); err != nil {
+					logger.Warn(fmt.Sprintf("[AGENT-BOOT] remote_connection digest_hello_failed error=%v", err))
+				}
+				// 成功路径的基线/时间窗刷新在 sendAgentHello→noteSent 内完成;
+				// 失败时不刷新基线,下个 tick 会带着最新指纹重试放行。
 			case <-inventoryTicker.C:
 				// Log-only on failure: a periodic hello failure must NOT tear down
 				// the heartbeat/liveness stream. Returning here (the old behavior)
@@ -616,6 +633,10 @@ func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn) error {
 }
 
 func (s *AgentService) sendAgentHello(writeJSON func(interface{}) error, reason string) error {
+	// 先取指纹再构建 payload:noteSent 的基线应与本次 hello 覆盖的状态对齐。
+	// 所有 reason 的成功 hello 都在此刷新 gate(单一咽喉),rename/periodic 后
+	// 不会紧跟一次重复的 digest hello(见 agent_vibe_hello_gate.go)。
+	sentDigest := agentVibeDigest(agentHome())
 	hello := s.agentHelloPayload()
 	projectCount := 0
 	if projects, ok := hello["projects"].([]models.AgentProject); ok {
@@ -640,6 +661,7 @@ func (s *AgentService) sendAgentHello(writeJSON func(interface{}) error, reason 
 	if err := writeJSON(hello); err != nil {
 		return err
 	}
+	s.remoteHello.noteSent(sentDigest, time.Now())
 	logger.Info(fmt.Sprintf("[AGENT-BOOT] remote_connection hello_sent reason=%s", strings.TrimSpace(reason)))
 	return nil
 }
