@@ -1006,6 +1006,15 @@ func (s *AgentService) DispatchLocalAI(msg map[string]interface{}, writeJSON fun
 	}
 }
 
+// UnwatchLocalAIConn 反注销一条本地聊天 socket 连接名下的全部会话 watch。
+// 读循环退出时由 HandleAIStream 调用;ai 管理器缺省(部分测试直构)时静默。
+func (s *AgentService) UnwatchLocalAIConn(connID string) {
+	if s == nil || s.ai == nil {
+		return
+	}
+	s.ai.unwatchSessionConn(connID)
+}
+
 type remoteConnectionIdentity struct {
 	authorization string
 	deviceID      string

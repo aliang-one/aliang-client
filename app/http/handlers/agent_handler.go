@@ -17,6 +17,7 @@ import (
 	"aliang.one/nursorgate/app/http/models"
 	"aliang.one/nursorgate/app/http/services"
 
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 )
 
@@ -80,12 +81,26 @@ func (h *AgentHandler) HandleAIStream(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
+	// 连接标识:watcher 注册表按「连接」记账(跨端同权直播的订阅主体)。每条
+	// 连接铸造一次,与会话解耦——一条连接可 watch 多个会话,断开时按它一次性
+	// 反注销全部 watch(见 unwatchSessionConn)。
+	connID := uuid.NewString()
+
 	var writeMu sync.Mutex
 	writeJSON := func(payload interface{}) error {
 		writeMu.Lock()
 		defer writeMu.Unlock()
+		// 5s 写期限。行为变更:属主 socket 此前无限阻塞——客户端半死(不读
+		// 不断)时 WriteJSON 会永久挂起并拖死整个 run(属主写路径串行所有事
+		// 件)。现在超时报错返回,run 结束后终态经 pendingTerminal 持久化,重
+		// 连/下一连接重放兜底,丢帧不丢终态。
+		_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 		return conn.WriteJSON(payload)
 	}
+
+	// 读循环退出即反注销本连接的全部会话 watch(本任务先落钩子,watch 注册
+	// 由 ai.session.watch 接线)。
+	defer h.service.UnwatchLocalAIConn(connID)
 
 	for {
 		var msg map[string]interface{}
