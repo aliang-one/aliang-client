@@ -84,6 +84,11 @@ func (h *AgentHandler) HandleAIStream(w http.ResponseWriter, r *http.Request) {
 	writeJSON := func(payload interface{}) error {
 		writeMu.Lock()
 		defer writeMu.Unlock()
+		// 5s 写期限（自跨端 parity 线移植）：origin socket 的写是 emitter
+		// fanOutWrite 的内联路径，客户端半死（不读不断）时 WriteJSON 无限期
+		// 挂起会拖死整个 run 的事件发布。超时报错返回后，fanOutWrite 照常
+		// 扇出副本给其他端，origin 的错误语义走调用方自己的终态屏障。
+		_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 		return conn.WriteJSON(payload)
 	}
 
