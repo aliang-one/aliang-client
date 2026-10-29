@@ -164,6 +164,9 @@ func TestReadAgentCoreSessionMetaOriginBackfill(t *testing.T) {
 	// 清单条目回填 journal 头行 origin：phone 起会话标 phone（跨端续聊分流依据），
 	// 旧头行（无 origin 键）与无头行文件保持空串。fixture 走真实写侧
 	// ensureSessionHeader（origin="phone"），保证头行格式与生产一致。
+	// setTestAgentHome 必须最先调：writeCoreJournalRawFixture 经 agentCoreJournalDir()
+	// 解析真实家目录，晚隔离会把 fixture 写进开发者 ~/.aliang（幽灵卡片污染）。
+	setTestAgentHome(t)
 	dir := t.TempDir()
 	writeAgentCoreJournalFixture(t, dir, "conv-origin", "/tmp/po")
 	path := filepath.Join(dir, agentCoreJournalFileName("conv-origin"))
