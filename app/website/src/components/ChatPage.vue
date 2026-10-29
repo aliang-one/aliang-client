@@ -184,6 +184,15 @@
           {{ activeConversation?.title || t('chat_emptyTitle') }}
         </h3>
         <button
+          type="button"
+          class="rounded p-1 text-slate-500 hover:bg-slate-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 dark:hover:bg-slate-800"
+          :aria-label="t('chat_sessionsDrawer')"
+          :title="t('chat_sessionsDrawer')"
+          @click="openSessionDrawer"
+        >
+          <span class="material-symbols-outlined text-lg">devices</span>
+        </button>
+        <button
           v-if="activeId && renamingId !== activeId"
           type="button"
           class="relative rounded p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-600 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 dark:hover:bg-slate-800 before:absolute before:-inset-2 before:content-['']"
@@ -217,9 +226,25 @@
 
       <!-- Session settings bar: directory / model / effort -->
       <div v-if="activeConversation" class="relative border-b border-slate-200 dark:border-slate-800">
+        <!-- attached 会话（接管既有 ai_* 会话）：目录/模型/effort 只读展示——
+             服务端 attach 分支忽略这六个属主字段，改配置只能新建会话。 -->
+        <div v-if="activeConversation.attached" class="flex items-center gap-2 overflow-x-auto px-4 py-1.5 text-xs">
+          <span
+            data-testid="chat-settings-directory"
+            class="flex min-h-[40px] max-w-[16rem] shrink-0 items-center gap-1 text-slate-400 md:min-h-0"
+            :title="directoryLabel"
+          >
+            <span class="material-symbols-outlined text-sm">folder</span>
+            <span class="truncate">{{ directoryLabel }}</span>
+          </span>
+          <span class="ml-2 shrink-0 rounded bg-slate-100 px-1.5 py-0.5 font-medium text-slate-500 dark:bg-slate-800 dark:text-slate-400">
+            {{ activeConversation.provider || '' }}<span v-if="activeConversation.model"> · {{ activeConversation.model }}</span>
+          </span>
+          <span v-if="activeConversation.effort" class="shrink-0 text-slate-400">{{ activeConversation.effort }}</span>
+        </div>
         <!-- 内层滚动行：overflow-x-auto 会连 y 轴一起裁剪（CSS 规范行为），
-             absolute 浮层若放行内会被整个裁掉，必须挂到外层包裹容器上。 -->
-        <div class="flex items-center gap-2 overflow-x-auto px-4 py-1.5 text-xs">
+             absolute 浮层若放行会被整个裁掉，必须挂到外层包裹容器上。 -->
+        <div v-else class="flex items-center gap-2 overflow-x-auto px-4 py-1.5 text-xs">
           <span class="hidden shrink-0 text-slate-400 md:inline">{{ t('chat_settingsDirectory') }}</span>
           <span
             v-if="directoryLocked"
@@ -322,7 +347,22 @@
           <p class="text-sm text-slate-400">{{ t('chat_startNew') }}</p>
         </div>
         <template v-else>
-          <div v-if="activeMessages.length === 0" class="flex h-full items-center justify-center">
+          <!-- 转录加载态（冷路径首请求可能 >15s，40s 超时+重试） -->
+          <div v-if="activeConversation?.transcriptLoading" class="flex h-full items-center justify-center gap-2">
+            <span class="ai-thinking">
+              <span class="thinking-dot"></span><span class="thinking-dot"></span><span class="thinking-dot"></span>
+            </span>
+            <p class="text-sm text-slate-400">{{ t('chat_transcriptLoading') }}</p>
+          </div>
+          <div v-else-if="activeConversation?.transcriptError" class="flex h-full flex-col items-center justify-center gap-2">
+            <p class="text-sm text-rose-500">{{ activeConversation.transcriptError }}</p>
+            <button
+              type="button"
+              class="rounded border border-slate-200 px-3 py-1 text-xs font-semibold text-slate-600 transition hover:bg-slate-100 dark:border-slate-600 dark:text-slate-300 dark:hover:bg-slate-800"
+              @click="loadTranscriptInto(activeConversation)"
+            >{{ t('chat_retry') }}</button>
+          </div>
+          <div v-else-if="activeMessages.length === 0" class="flex h-full items-center justify-center">
             <p class="text-sm text-slate-400">{{ t('chat_startNew') }}</p>
           </div>
           <div v-for="(msg, idx) in activeMessages" :key="idx" class="mb-3">
@@ -467,6 +507,83 @@
         </div>
       </div>
     </div>
+
+    <!-- Session drawer: agent sessions on the device (attach to take over) -->
+    <div
+      v-if="sessionDrawerOpen"
+      class="fixed inset-0 z-[950] bg-black/50"
+      @click="sessionDrawerOpen = false"
+    ></div>
+    <aside
+      v-if="sessionDrawerOpen"
+      class="fixed right-0 top-0 bottom-0 z-[960] flex w-80 flex-col border-l border-slate-200 bg-white shadow-xl dark:border-slate-700 dark:bg-slate-900"
+      aria-label="session-drawer"
+    >
+      <div class="flex items-center justify-between border-b border-slate-200 px-4 py-3 dark:border-slate-700">
+        <h2 class="text-sm font-bold text-slate-900 dark:text-white">{{ t('chat_sessionsDrawer') }}</h2>
+        <button
+          type="button"
+          class="rounded p-1 text-slate-500 hover:bg-slate-200 dark:hover:bg-slate-700"
+          :aria-label="t('chat_close')"
+          @click="sessionDrawerOpen = false"
+        >
+          <span class="material-symbols-outlined text-lg">close</span>
+        </button>
+      </div>
+      <div class="flex-1 overflow-y-auto py-1">
+        <div v-if="drawerLoading" class="flex items-center justify-center gap-2 px-4 py-8">
+          <span class="ai-thinking">
+            <span class="thinking-dot"></span><span class="thinking-dot"></span><span class="thinking-dot"></span>
+          </span>
+          <span class="text-sm text-slate-400">{{ t('chat_drawerLoading') }}</span>
+        </div>
+        <div v-else-if="drawerError" class="flex flex-col items-center gap-2 px-4 py-8">
+          <p class="text-center text-sm text-rose-500">{{ drawerError }}</p>
+          <button
+            type="button"
+            class="rounded border border-slate-200 px-3 py-1 text-xs font-semibold text-slate-600 transition hover:bg-slate-100 dark:border-slate-600 dark:text-slate-300 dark:hover:bg-slate-800"
+            @click="loadSessionDrawer"
+          >{{ t('chat_retry') }}</button>
+        </div>
+        <template v-else>
+          <div
+            v-for="entry in visibleDrawerEntries"
+            :key="entry.id"
+            role="button"
+            tabindex="0"
+            class="w-full cursor-pointer px-4 py-2.5 text-left text-sm transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
+            :class="entry.id === activeConversation?.aiSessionId ? 'bg-primary/10' : 'hover:bg-slate-100 dark:hover:bg-slate-800'"
+            @click="attachFromDrawer(entry)"
+            @keydown.enter.prevent="attachFromDrawer(entry)"
+            @keydown.space.prevent="attachFromDrawer(entry)"
+          >
+            <div class="flex items-center gap-2">
+              <div class="min-w-0 flex-1 truncate text-slate-700 dark:text-slate-200">{{ entry.title || t('chat_emptyTitle') }}</div>
+              <span
+                v-if="entry.running"
+                class="inline-flex shrink-0 items-center gap-1 rounded-full bg-primary/10 px-2 py-0.5 text-xs font-medium text-primary"
+              >
+                <span class="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-primary"></span>{{ t('chat_statusRunning') }}
+              </span>
+            </div>
+            <div class="mt-0.5 flex items-center gap-2 text-xs text-slate-400">
+              <span class="rounded bg-slate-100 px-1.5 py-0.5 dark:bg-slate-800">{{ entry.local ? t('chat_sessionSourceLocal') : t('chat_sessionSourceExternal') }}</span>
+              <span v-if="entry.provider" class="truncate">{{ entry.provider }}</span>
+              <span v-if="entry.updatedAtMs" class="ml-auto shrink-0">{{ drawerTimeLabel(entry.updatedAtMs) }}</span>
+            </div>
+          </div>
+          <div v-if="drawerEntries.total === 0" class="px-4 py-8 text-center text-sm text-slate-400">
+            {{ t('chat_drawerEmpty') }}
+          </div>
+          <button
+            v-if="drawerEntries.hasMore"
+            type="button"
+            class="mx-4 my-2 rounded border border-slate-200 px-3 py-1 text-xs font-semibold text-slate-600 transition hover:bg-slate-100 dark:border-slate-600 dark:text-slate-300 dark:hover:bg-slate-800"
+            @click="drawerVisibleCount += DRAWER_PAGE_SIZE"
+          >{{ t('chat_drawerShowMore') }}</button>
+        </template>
+      </div>
+    </aside>
   </div>
 </template>
 
@@ -477,14 +594,22 @@ import { useNavigation } from '../composables/useNavigation';
 import { slashProviderFor } from '../utils/chatProvider';
 import { normalizeConversationTitle } from '../utils/chatTitle';
 import { useAuthStore } from '../stores/auth';
-import { getAgentSessions } from '../services/agentApi';
+import { getAgentRuntimeSessions, getAgentSessions, loadAgentTranscript } from '../services/agentApi';
 import {
   AGENTCORE_MODEL_OPTIONS,
   EFFORT_OPTIONS,
   MODEL_CUSTOM_VALUE,
+  agentSessionDrawerEntries,
+  attachSessionPayload,
+  findConversationForEvent,
   isDirectoryLocked,
+  planWatchSwitch,
   recentProjectsFromSessions,
+  restorableAttachedSessionIds,
   sessionCreatePayload,
+  transcriptToMessages,
+  unwatchSessionPayload,
+  watchSessionPayload,
 } from '../utils/chatSettings';
 
 const STORAGE_KEY = 'aliang-chat-data';
@@ -500,6 +625,16 @@ const sending = ref(false);
 const messagesContainer = ref(null);
 const inputRef = ref(null);
 const showMobileSidebar = ref(false);
+
+// --- 会话抽屉（agent 设备上的会话 + attach 接管）---
+const DRAWER_PAGE_SIZE = 20;
+const TRANSCRIPT_LIMIT = 50;
+const sessionDrawerOpen = ref(false);
+const agentSessions = ref([]);
+const drawerLoading = ref(false);
+const drawerError = ref('');
+const drawerVisibleCount = ref(DRAWER_PAGE_SIZE);
+const runtimeSessionIds = ref(new Set());
 
 // --- 会话设置条（工作目录/模型/effort）状态 ---
 const directoryPanelOpen = ref(false);
@@ -589,8 +724,9 @@ function isPresetModel(m) {
 }
 
 // 统一写入口：落字段 → 持久化 → 清错误 → 服务端原位同步（掉线时下条消息兜底）。
+// attached 会话不可改（provider/model/effort 是属主字段，attach 不覆写，要改就新建）。
 function applySessionSettings(conv, patch) {
-  if (activeRunning.value) return;
+  if (activeRunning.value || conv.attached) return;
   Object.assign(conv, patch);
   conv.updatedAt = now();
   saveToStorage();
@@ -601,7 +737,7 @@ function applySessionSettings(conv, patch) {
 // 已建会话的设置变更要立即让服务端知道；socket 不在线就放弃本轮——
 // sendMessage 现在每条消息前都重发 create，天然兜底，无需脏标记。
 function resendCreate(conv) {
-  if (!conv.aiSessionCreated) return;
+  if (conv.attached || !conv.aiSessionCreated) return;
   if (!aiSocket || aiSocket.readyState !== WebSocket.OPEN) return;
   sendAI(sessionCreatePayload(conv));
 }
@@ -718,7 +854,10 @@ function waitForCreateAck(conv, timeoutMs = 5000) {
     conv.aiSessionCreated = true;
     // ensureAISocket 之后 socket 仍可能已死：sendAI 返回 false 就立刻按超时
     // 结算，不白等 5 秒死钟。
-    if (!sendAI(sessionCreatePayload(conv))) settle('timeout');
+    // attached 会话重发的是 attach 载荷（仅 type+session_id）：六属主字段服务端
+    // 在 attach 分支静默忽略，发多了也没意义，且改 provider/model 本就须新建。
+    const payload = conv.attached ? attachSessionPayload(sid) : sessionCreatePayload(conv);
+    if (!sendAI(payload)) settle('timeout');
   });
 }
 
@@ -818,6 +957,11 @@ function saveToStorage() {
 function conversationForStorage(conv) {
   const copy = { ...conv };
   copy.approvals = [];
+  // 转录状态是会话内的一次性 UI 状态：attached 会话刷新后重新拉取（数据可能
+  // 已在设备上变化），loading/error 更不能落盘。
+  delete copy.transcriptLoading;
+  delete copy.transcriptError;
+  delete copy.transcriptLoaded;
   return copy;
 }
 
@@ -839,9 +983,14 @@ function createConversation() {
 }
 
 function selectConversation(id) {
+  const next = conversations.value.find(c => c.id === id) || null;
+  applyWatchSwitch(next);
   activeId.value = id;
   showMobileSidebar.value = false;
   saveToStorage();
+  if (next && next.attached && !next.transcriptLoaded && !next.transcriptLoading) {
+    loadTranscriptInto(next);
+  }
   nextTick(() => scrollToBottom());
 }
 
@@ -981,6 +1130,8 @@ function ensureAISocket() {
       console.log('[aliang-chat] ws close code=', e.code, 'reason=', e.reason);
       if (aiSocket === sock) aiSocket = null;
       aiSocketPromise = null;
+      // 服务端按连接反注销 watch：本连接的注册表作废（新连接按需重 watch）。
+      watchedSessions.clear();
       // 陈旧 socket 的迟到 close（CLOSING→重连窗口）：aiSocket 已被新连接顶掉，
       // 别解新 run 的看门狗、别给新 run 画错误——让旧 close 静默退场。
       if (aiSocket && aiSocket !== sock) return;
@@ -1016,6 +1167,142 @@ function sendAI(payload) {
     return true;
   }
   return false;
+}
+
+// --- watch 生命周期 + 会话抽屉（attach 接管） ---
+
+// 本连接上已发过 watch 的 session id 集合。watch 成功无回执（无 ai.error 即成功），
+// 中途/重复 watch 幂等；连接断开服务端按连接反注销，集合随之清空。
+const watchedSessions = new Set();
+
+function sendWatch(sessionId) {
+  if (!sessionId || watchedSessions.has(sessionId)) return;
+  if (sendAI(watchSessionPayload(sessionId))) watchedSessions.add(sessionId);
+}
+
+function sendUnwatch(sessionId) {
+  if (!sessionId || !watchedSessions.has(sessionId)) return;
+  if (sendAI(unwatchSessionPayload(sessionId))) watchedSessions.delete(sessionId);
+}
+
+function watchedSessionIdOf(conv) {
+  return conv && conv.attached && conv.aiSessionId ? conv.aiSessionId : null;
+}
+
+// 切换直播跟踪目标（attach 成功后必须紧跟 watch；切走/关闭时 unwatch）。
+function applyWatchSwitch(nextConv) {
+  const ops = planWatchSwitch(watchedSessionIdOf(activeConversation.value), watchedSessionIdOf(nextConv));
+  for (const { op, sessionId } of ops) {
+    if (op === 'watch') sendWatch(sessionId);
+    else sendUnwatch(sessionId);
+  }
+}
+
+// attached 会话恢复直播态：attach（attach 载荷，回执异步更新字段）+ 紧跟 watch。
+// 静默执行——fork guard 等错误由 ai.error 分支亮在设置条上。
+function ensureLiveAttached(conv) {
+  if (!conv || !conv.attached || !conv.aiSessionId) return;
+  ensureAISocket()
+    .then(() => {
+      if (!conv.attached || !conv.aiSessionId) return;
+      sendAI(attachSessionPayload(conv.aiSessionId));
+      sendWatch(conv.aiSessionId);
+    })
+    .catch(() => { /* socket 不可用：发消息时经确认门兜底重试 */ });
+}
+
+// 转录（冷路径）：loading/错误挂在 conv 上（视图据其渲染重试按钮）。
+// 运行中不加载：转录整体替换 messages，会把正在逐字直播的气泡冲掉——
+// 等回合并结束（ai.done 后重进会话/重试）再取全量历史。
+async function loadTranscriptInto(conv) {
+  if (!conv || !conv.attached || !conv.aiSessionId || conv.transcriptLoading) return;
+  if (findRunningAssistant(conv)) return;
+  conv.transcriptLoading = true;
+  conv.transcriptError = '';
+  try {
+    const detail = await loadAgentTranscript(conv.aiSessionId, { limit: TRANSCRIPT_LIMIT });
+    conv.messages = transcriptToMessages(detail?.transcript);
+    conv.transcriptLoaded = true;
+    conv.updatedAt = now();
+    saveToStorage();
+    scrollToBottom();
+  } catch (err) {
+    conv.transcriptError = err && err.message === 'transcript-timeout'
+      ? t('chat_transcriptTimeout')
+      : t('chat_transcriptFailed');
+  } finally {
+    conv.transcriptLoading = false;
+  }
+}
+
+const drawerEntries = computed(() => agentSessionDrawerEntries(agentSessions.value, {
+  runningIds: runtimeSessionIds.value,
+  localSessionIds: conversations.value.filter(c => c.aiSessionId).map(c => c.aiSessionId),
+}));
+
+const visibleDrawerEntries = computed(() => drawerEntries.value.items.slice(0, drawerVisibleCount.value));
+
+function drawerTimeLabel(ts) {
+  const d = new Date(ts);
+  return Number.isNaN(d.getTime()) ? '' : d.toLocaleString();
+}
+
+async function loadSessionDrawer() {
+  drawerLoading.value = true;
+  drawerError.value = '';
+  try {
+    const [list, runtime] = await Promise.all([
+      getAgentSessions(),
+      getAgentRuntimeSessions().catch(() => null), // runtime 徽章拉不到不挡列表
+    ]);
+    agentSessions.value = Array.isArray(list?.sessions) ? list.sessions : [];
+    runtimeSessionIds.value = new Set(
+      (Array.isArray(runtime?.ai_conversations) ? runtime.ai_conversations : [])
+        .map(s => s && s.id).filter(Boolean)
+    );
+    drawerVisibleCount.value = DRAWER_PAGE_SIZE;
+  } catch (err) {
+    agentSessions.value = [];
+    drawerError.value = t('chat_drawerError');
+  } finally {
+    drawerLoading.value = false;
+  }
+}
+
+function openSessionDrawer() {
+  sessionDrawerOpen.value = true;
+  loadSessionDrawer();
+}
+
+// 点抽屉条目 → attach（不新建，回执 ai.session.created + attached:true）→ 紧跟
+// watch → 转录渲染历史 → attached 模式（aiSessionId = ai_*）。attach 的六字段
+// 纪律由 attachSessionPayload 保证；回执 state 恒 idle，运行态以帧为准。
+async function attachFromDrawer(entry) {
+  if (!entry || !entry.id) return;
+  sessionDrawerOpen.value = false;
+  let conv = conversations.value.find(c => c.aiSessionId === entry.id);
+  if (!conv) {
+    conv = {
+      id: generateId(),
+      title: entry.title || '',
+      messages: [],
+      approvals: [],
+      provider: entry.provider || 'claudecode',
+      createdAt: now(),
+      updatedAt: now(),
+      aiSessionId: entry.id,
+      attached: true,
+      projectPath: entry.projectPath || '',
+    };
+    conversations.value.unshift(conv);
+  }
+  applyWatchSwitch(conv);
+  activeId.value = conv.id;
+  showMobileSidebar.value = false;
+  saveToStorage();
+  scrollToBottom();
+  ensureLiveAttached(conv);
+  await loadTranscriptInto(conv);
 }
 
 // Ask the agent for the active provider's `/`-command surface. Cached per
@@ -1331,19 +1618,11 @@ function handleAIEvent(e) {
     return;
   }
 
-  let conv = e.session_id ? conversations.value.find(c => c.aiSessionId === e.session_id) : null;
-  // session_id 是否命中决定事件归属；matchedById=false 的事件走 fallback 仅为
-  // 让流仍能渲染，绝不能成为回显/dirLocked 的写入目标（会话已删或他页会话的
-  // 迟到 create 回执会污染当前活跃会话）。
-  const matchedById = !!conv;
-  // Fallback: a run started from this page always targets the active
-  // conversation's live assistant bubble. If the session id didn't match
-  // (e.g. reloaded localStorage holding a stale id, or an id mismatch), route
-  // to the active conversation so the stream still renders instead of being
-  // silently dropped.
-  if (!conv && activeConversation.value) {
-    conv = activeConversation.value;
-  }
+  // 帧归位：优先按 session_id 精确命中（matchedById 纪律）；未命中走 fallback，
+  // 但 fallback 仅允许本地（非 attached）会话承接——attached 会话的直播流绝不能
+  // 被他页会话/未知 session 的帧污染。
+  let conv = findConversationForEvent(conversations.value, e.session_id, activeConversation.value);
+  const matchedById = !!(e.session_id && conv && conv.aiSessionId === e.session_id);
   if (!conv) {
     console.debug('[chat] ai event has no target conversation', e);
     return;
@@ -1370,6 +1649,8 @@ function handleAIEvent(e) {
       conv.aiReady = true;
       // 目录锁定以服务端确认为准：create 成功后不可再改（create 失败保持可改）。
       conv.dirLocked = true;
+      // attach 接管标记以服务端回执为准（attached:true = 既有会话，未新建）。
+      if (e.attached) conv.attached = true;
       // 回显是服务端清洗后的权威值：project_path 已是解析后的绝对路径。
       if (typeof e.project_path === 'string' && e.project_path) conv.projectPath = e.project_path;
       if (typeof e.model === 'string') conv.model = e.model;
@@ -1419,7 +1700,14 @@ function handleAIEvent(e) {
         // 下一条消息重发 create 即成功。判定只用 message_id 单条件：运行期
         // 所有 ai.error 出口都带 message_id，create 期全不带；「无 running 气泡」
         // 不可作条件——sendMessage 在发 create 前已推入占位气泡。
-        if (matchedById && conv.id === activeId.value) createError.value = e.error || t('chat_createFailed');
+        // 例外：watch/attach 不存在持久绑定的会话（journal 有、绑定无）——服务端
+        // 拒绝防上下文分叉（错误串含 "context fork guard"），翻成人话并给恢复引导。
+        const errorText = String(e.error || '');
+        if (errorText.includes('context fork guard')) {
+          if (matchedById && conv.id === activeId.value) createError.value = t('chat_forkGuard');
+        } else if (matchedById && conv.id === activeId.value) {
+          createError.value = e.error || t('chat_createFailed');
+        }
         const pending = pendingCreates.get(e.session_id);
         if (pending) pending('error');
         saveToStorage();
@@ -1489,6 +1777,9 @@ async function sendMessage() {
       return;
     }
     armIdleWatchdog(conv);
+    // attach 成功后必须紧跟 watch：socket 重连后 watch 随连接被反注销，
+    // 确认门重放 attach 的同时也把直播跟踪续上（幂等）。
+    sendWatch(conv.aiSessionId);
     const ok = sendAI({
       type: 'ai.message',
       session_id: conv.aiSessionId,
@@ -1511,23 +1802,58 @@ async function sendMessage() {
 function close() {
   // iOS Safari 上点关闭不会触发输入框 blur，先把在编的标题落地再卸载页面。
   commitRename();
+  unwatchAll();
   showDashboard();
 }
 
 function handleKeydown(e) {
   if (e.key === 'Escape') {
+    // Esc 先关抽屉（与目录浮层同套路），再关整页。
+    if (sessionDrawerOpen.value) {
+      sessionDrawerOpen.value = false;
+      return;
+    }
     close();
+  }
+}
+
+// 刷新恢复：localStorage 里的 attached 会话重新 attach+watch。活跃的 attached
+// 会话立即恢复直播态；运行中徽章来自 runtime-sessions（仅作角标，运行态以帧为准）。
+async function restoreAttachedSessions() {
+  const conv = activeConversation.value;
+  const attached = restorableAttachedSessionIds(conversations.value);
+  if (!attached.length) return;
+  if (conv && conv.attached) {
+    ensureLiveAttached(conv);
+    if (!conv.transcriptLoaded && !conv.transcriptLoading) loadTranscriptInto(conv);
+  }
+  try {
+    const runtime = await getAgentRuntimeSessions();
+    runtimeSessionIds.value = new Set(
+      (Array.isArray(runtime?.ai_conversations) ? runtime.ai_conversations : [])
+        .map(s => s && s.id).filter(Boolean)
+    );
+  } catch (_) {
+    // 徽章拉不到不影响恢复；下次打开抽屉再取。
+  }
+}
+
+function unwatchAll() {
+  for (const sessionId of [...watchedSessions]) {
+    sendUnwatch(sessionId);
   }
 }
 
 onMounted(() => {
   console.log('[aliang-chat] ChatPage mounted build=stream-v3 ws=' + aiSocketUrl());
   loadFromStorage();
+  restoreAttachedSessions();
   document.addEventListener('keydown', handleKeydown);
 });
 
 onUnmounted(() => {
   document.removeEventListener('keydown', handleKeydown);
+  unwatchAll();
   if (aiSocket) {
     try { aiSocket.close(); } catch (_) {}
     aiSocket = null;

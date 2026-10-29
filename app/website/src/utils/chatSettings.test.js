@@ -3,9 +3,17 @@ import {
   AGENTCORE_MODEL_OPTIONS,
   EFFORT_OPTIONS,
   MODEL_CUSTOM_VALUE,
+  agentSessionDrawerEntries,
+  attachSessionPayload,
+  findConversationForEvent,
   isDirectoryLocked,
+  planWatchSwitch,
   recentProjectsFromSessions,
+  restorableAttachedSessionIds,
   sessionCreatePayload,
+  transcriptToMessages,
+  unwatchSessionPayload,
+  watchSessionPayload,
 } from './chatSettings';
 
 describe('EFFORT_OPTIONS', () => {
@@ -78,5 +86,151 @@ describe('sessionCreatePayload', () => {
   it('透传非空值与自定义模型/effort', () => {
     const conv = { aiSessionId: 's2', projectPath: '/w', provider: 'agentcore', model: 'my-model', effort: 'xhigh' };
     expect(sessionCreatePayload(conv)).toMatchObject({ project_path: '/w', provider: 'agentcore', model: 'my-model', effort: 'xhigh' });
+  });
+});
+
+// —— attach 语义（Go 契约：六属主字段服务端静默忽略，前端不发）——
+describe('attachSessionPayload', () => {
+  it('attach 载荷 = 仅 type + session_id：绝不携带六属主字段', () => {
+    const payload = attachSessionPayload('ai_abc123');
+    expect(payload).toEqual({ type: 'ai.session.create', session_id: 'ai_abc123' });
+    expect(Object.keys(payload).sort()).toEqual(['session_id', 'type']);
+    for (const forbidden of ['provider', 'model', 'effort', 'resume_session_id', 'binding_version', 'initial_context', 'project_path', 'mode']) {
+      expect(payload).not.toHaveProperty(forbidden);
+    }
+  });
+
+  it('空 id 归空串（服务端按未知 id 新建，回归现行行为）', () => {
+    expect(attachSessionPayload('')).toEqual({ type: 'ai.session.create', session_id: '' });
+    expect(attachSessionPayload(undefined)).toEqual({ type: 'ai.session.create', session_id: '' });
+  });
+});
+
+describe('watchSessionPayload / unwatchSessionPayload', () => {
+  it('op 与 session_id 正确，无多余字段（Required=type,session_id）', () => {
+    expect(watchSessionPayload('ai_1')).toEqual({ type: 'ai.session.watch', session_id: 'ai_1' });
+    expect(unwatchSessionPayload('ai_1')).toEqual({ type: 'ai.session.unwatch', session_id: 'ai_1' });
+  });
+});
+
+describe('planWatchSwitch（watch 生命周期）', () => {
+  it('attach 后首次 watch：无旧目标 → 仅 watch', () => {
+    expect(planWatchSwitch(null, 'ai_1')).toEqual([{ op: 'watch', sessionId: 'ai_1' }]);
+  });
+
+  it('切会话：先 unwatch 旧目标，再 watch 新目标', () => {
+    expect(planWatchSwitch('ai_1', 'ai_2')).toEqual([
+      { op: 'unwatch', sessionId: 'ai_1' },
+      { op: 'watch', sessionId: 'ai_2' },
+    ]);
+  });
+
+  it('切到本地会话（next=null）：仅 unwatch；相同目标幂等无操作', () => {
+    expect(planWatchSwitch('ai_1', null)).toEqual([{ op: 'unwatch', sessionId: 'ai_1' }]);
+    expect(planWatchSwitch('ai_1', 'ai_1')).toEqual([]);
+    expect(planWatchSwitch(null, null)).toEqual([]);
+  });
+});
+
+describe('findConversationForEvent（帧按 session_id 归位）', () => {
+  const local = { id: 'c1', aiSessionId: 'local-x', attached: false };
+  const attached = { id: 'c2', aiSessionId: 'ai_run', attached: true };
+
+  it('session_id 精确命中（matchedById 纪律），fallback 不参与', () => {
+    expect(findConversationForEvent([local, attached], 'ai_run', local)).toBe(attached);
+    expect(findConversationForEvent([local, attached], 'local-x', attached)).toBe(local);
+  });
+
+  it('本地活跃会话承接未知帧（既有 fallback 语义保留）', () => {
+    expect(findConversationForEvent([local], 'ai_unknown', local)).toBe(local);
+    expect(findConversationForEvent([], null, local)).toBe(local);
+  });
+
+  it('attached 活跃会话绝不走 fallback：他页会话/未知 session 的帧不污染直播流', () => {
+    expect(findConversationForEvent([attached], 'ai_other', attached)).toBeNull();
+    expect(findConversationForEvent([], 'ai_other', attached)).toBeNull();
+    expect(findConversationForEvent([], null, attached)).toBeNull();
+  });
+});
+
+describe('agentSessionDrawerEntries（抽屉列表：合并/标记/排序/客户端分页）', () => {
+  const sessions = [
+    { id: 'ai_a', title: '手机会话', provider: 'agentcore', updated_at: '2026-10-29T10:00:00Z' },
+    { id: 'ai_b', title: '', provider: 'claude', updated_at: '2026-10-29T12:00:00Z', tool: 'claude' },
+    { id: 'ai_c', title: '旧会话', provider: 'codex' }, // 无 updated_at → 排最后
+  ];
+
+  it('按 updated_at 倒序，缺时间戳排最后；字段清洗', () => {
+    const { items, total, hasMore } = agentSessionDrawerEntries(sessions, {});
+    expect(items.map(e => e.id)).toEqual(['ai_b', 'ai_a', 'ai_c']);
+    expect(items[0]).toMatchObject({ id: 'ai_b', title: '', provider: 'claude', running: false, local: false });
+    expect(total).toBe(3);
+    expect(hasMore).toBe(false);
+  });
+
+  it('runtime 快照合并出「运行中」徽章；本页绑定集合标记「本机」', () => {
+    const { items } = agentSessionDrawerEntries(sessions, {
+      runningIds: ['ai_a'],
+      localSessionIds: ['ai_b'],
+    });
+    expect(items.find(e => e.id === 'ai_a').running).toBe(true);
+    expect(items.find(e => e.id === 'ai_b').local).toBe(true);
+    expect(items.find(e => e.id === 'ai_c').running).toBe(false);
+  });
+
+  it('客户端分页：limit/offset 切页，hasMore 正确', () => {
+    const page1 = agentSessionDrawerEntries(sessions, { limit: 2, offset: 0 });
+    expect(page1.items.map(e => e.id)).toEqual(['ai_b', 'ai_a']);
+    expect(page1.hasMore).toBe(true);
+    const page2 = agentSessionDrawerEntries(sessions, { limit: 2, offset: 2 });
+    expect(page2.items.map(e => e.id)).toEqual(['ai_c']);
+    expect(page2.hasMore).toBe(false);
+  });
+
+  it('脏输入安全：非数组/脏行/无 id 行', () => {
+    expect(agentSessionDrawerEntries(null, {})).toEqual({ items: [], total: 0, hasMore: false });
+    expect(agentSessionDrawerEntries([null, {}, { id: '' }, 'x'], {}).total).toBe(0);
+  });
+});
+
+describe('transcriptToMessages（转录渲染历史）', () => {
+  it('映射 user/assistant 气泡，status=done，时间戳解析', () => {
+    const rows = [
+      { role: 'user', content: 'привет', timestamp: '2026-10-29T10:00:00Z' },
+      { role: 'assistant', content: 'ответ', timestamp: '2026-10-29T10:00:05Z' },
+    ];
+    const msgs = transcriptToMessages(rows);
+    expect(msgs).toHaveLength(2);
+    expect(msgs[0]).toMatchObject({ role: 'user', content: 'привет', status: 'done' });
+    expect(msgs[0].ts).toBe(Date.parse('2026-10-29T10:00:00Z'));
+    expect(msgs[1].role).toBe('assistant');
+  });
+
+  it('空 content 行丢弃，未知 role 按 assistant，脏输入安全', () => {
+    expect(transcriptToMessages([
+      { role: 'user', content: '   ' },
+      { role: 'tool', content: 'x' },
+      null,
+      { role: 'user' },
+    ]).map(m => m.role)).toEqual(['assistant']);
+    expect(transcriptToMessages(null)).toEqual([]);
+    expect(transcriptToMessages('x')).toEqual([]);
+  });
+});
+
+describe('restorableAttachedSessionIds（刷新恢复候选）', () => {
+  it('仅 attached 且带真实 ai_* session id 的会话参与恢复', () => {
+    expect(restorableAttachedSessionIds([
+      { attached: true, aiSessionId: 'ai_1' },
+      { attached: true, aiSessionId: 'local-c1' }, // 本地伪 id 不恢复
+      { attached: false, aiSessionId: 'ai_2' },    // 非 attached 不恢复
+      { aiSessionId: 'ai_3' },
+      null,
+    ])).toEqual(['ai_1']);
+  });
+
+  it('脏输入安全', () => {
+    expect(restorableAttachedSessionIds(null)).toEqual([]);
+    expect(restorableAttachedSessionIds('x')).toEqual([]);
   });
 });

@@ -62,15 +62,36 @@ export async function getAgentRuntimeSessions() {
   return request('/api/agent/runtime-sessions', { method: 'GET' });
 }
 
-export async function getAgentSessionDetail(sessionId, { limit, before } = {}) {
+export async function getAgentSessionDetail(sessionId, { limit, before, signal } = {}) {
   const params = new URLSearchParams();
   if (limit) params.set('limit', String(limit));
   if (before) params.set('before', before);
   const query = params.toString();
   return request(
     `/api/agent/session?id=${encodeURIComponent(sessionId)}${query ? `&${query}` : ''}`,
-    { method: 'GET' }
+    { method: 'GET', signal }
   );
+}
+
+// Холодный путь транскрипта (первый запрос может выполнять холодное сканирование/чтение с диска
+// больше 15 секунд) — жесткий таймаут 40 секунд через AbortController. В случае таймаута
+// выбрасывается ошибка с маркером 'transcript-timeout', повторная попытка — просто
+// вызывать функцию заново (кнопка «Повторить» в UI).
+export const AGENT_TRANSCRIPT_TIMEOUT_MS = 40000;
+
+export async function loadAgentTranscript(sessionId, { limit = 50, timeoutMs = AGENT_TRANSCRIPT_TIMEOUT_MS } = {}) {
+  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const timer = setTimeout(() => controller && controller.abort(), timeoutMs);
+  try {
+    return await getAgentSessionDetail(sessionId, { limit, signal: controller ? controller.signal : undefined });
+  } catch (err) {
+    if (err && err.name === 'AbortError') {
+      throw new Error('transcript-timeout');
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export async function getAgentScanDirectories() {

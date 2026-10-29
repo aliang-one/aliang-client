@@ -68,3 +68,91 @@ export function sessionCreatePayload(conv) {
     effort: (conv && conv.effort) || '',
   };
 }
+
+// —— attach 语义（服务端契约见 ai.session.create 分支）——
+// 对已存在的 session_id 发 create = attach：不新建、回执 ai.session.created
+// 全字段 + attached:true。六个属主字段（provider/model/effort/resume_session_id/
+// binding_version/initial_context）服务端在 attach 分支静默忽略——前端干脆不发，
+// 换 provider/model 只能新建会话。attach 载荷 = 仅 type + session_id。
+export function attachSessionPayload(sessionId) {
+  return { type: 'ai.session.create', session_id: sessionId || '' };
+}
+
+// watch/unwatch：成功无回执（无 ai.error 即成功）；中途/重复 watch 幂等。
+export function watchSessionPayload(sessionId) {
+  return { type: 'ai.session.watch', session_id: sessionId || '' };
+}
+
+export function unwatchSessionPayload(sessionId) {
+  return { type: 'ai.session.unwatch', session_id: sessionId || '' };
+}
+
+// watch 生命周期：同一时刻最多直播跟踪一个会话。从 current 切到 next 的操作计划
+// （先 unwatch 旧的，再 watch 新的；相同 id → 无操作）。纯函数，ChatPage 依此发帧。
+export function planWatchSwitch(currentSessionId, nextSessionId) {
+  const cur = currentSessionId || null;
+  const next = nextSessionId || null;
+  if (cur === next) return [];
+  const ops = [];
+  if (cur) ops.push({ op: 'unwatch', sessionId: cur });
+  if (next) ops.push({ op: 'watch', sessionId: next });
+  return ops;
+}
+
+// 帧归位：优先按 session_id 精确命中（matchedById 纪律）；未命中才走 fallback——
+// 且 fallback 仅允许本地（非 attached）会话承接：attached 会话是别人的直播流，
+// 绝不能被他页会话/未知 session 的帧污染。
+export function findConversationForEvent(conversations, sessionId, activeConversation) {
+  if (sessionId) {
+    const matched = (Array.isArray(conversations) ? conversations : [])
+      .find(c => c && c.aiSessionId === sessionId);
+    if (matched) return matched;
+  }
+  if (activeConversation && !activeConversation.attached) return activeConversation;
+  return null;
+}
+
+// 抽屉条目组装：会话全量列表 + runtime 快照（运行中徽章）+ 本页绑定集合（来源
+// 标记）合并，按 updated_at 倒序，客户端分页（服务端无分页）。任何脏输入安全。
+export function agentSessionDrawerEntries(sessions, { runningIds = [], localSessionIds = [], limit = 20, offset = 0 } = {}) {
+  if (!Array.isArray(sessions)) sessions = [];
+  const running = runningIds instanceof Set ? runningIds : new Set(runningIds || []);
+  const local = localSessionIds instanceof Set ? localSessionIds : new Set(localSessionIds || []);
+  const entries = sessions
+    .filter(s => s && typeof s === 'object' && s.id)
+    .map(s => ({
+      id: s.id,
+      title: typeof s.title === 'string' ? s.title.trim() : '',
+      provider: s.provider || s.tool || '',
+      projectPath: s.project_path || '',
+      updatedAtMs: Date.parse(s.updated_at || '') || 0,
+      running: running.has(s.id),
+      local: local.has(s.id),
+    }))
+    .sort((a, b) => b.updatedAtMs - a.updatedAtMs);
+  const size = Math.max(limit, 0);
+  const page = entries.slice(offset, offset + size);
+  return { items: page, total: entries.length, hasMore: offset + page.length < entries.length };
+}
+
+// 服务端转录行（/api/agent/session → transcript[]）→ 本页消息气泡。
+// 空 content 行丢弃；role 非 user 一律按 assistant 渲染。
+export function transcriptToMessages(rows) {
+  if (!Array.isArray(rows)) return [];
+  return rows
+    .filter(r => r && typeof r === 'object' && typeof r.content === 'string' && r.content.trim() !== '')
+    .map(r => ({
+      role: r.role === 'user' ? 'user' : 'assistant',
+      content: r.content,
+      status: 'done',
+      ts: Date.parse(r.timestamp || '') || 0,
+    }));
+}
+
+// 刷新恢复候选：attached 会话（attach 接管过、带真实 ai_* session id）。
+export function restorableAttachedSessionIds(conversations) {
+  if (!Array.isArray(conversations)) return [];
+  return conversations
+    .filter(c => c && c.attached && typeof c.aiSessionId === 'string' && c.aiSessionId.startsWith('ai_'))
+    .map(c => c.aiSessionId);
+}
