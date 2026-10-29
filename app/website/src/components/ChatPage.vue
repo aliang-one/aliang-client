@@ -36,9 +36,9 @@
               tabindex="0"
               class="group w-full cursor-pointer px-4 py-2.5 text-left text-sm transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
               :class="c.id === activeId ? 'bg-primary/10 text-primary font-medium' : 'text-slate-700 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800'"
-              @click="selectConversation(c.id)"
-              @keydown.enter.prevent="selectConversation(c.id)"
-              @keydown.space.prevent="selectConversation(c.id)"
+              @click="onSidebarItemClick(c)"
+              @keydown.enter.prevent="onSidebarItemClick(c)"
+              @keydown.space.prevent="onSidebarItemClick(c)"
             >
               <input
                 v-if="renamingId === c.id && renameSurface === 'list'"
@@ -258,6 +258,14 @@
           <p class="text-sm text-slate-400">{{ t('chat_startNew') }}</p>
         </div>
         <template v-else>
+          <div
+            v-if="activeConversation?.deviceLoadError"
+            data-testid="device-session-load-error"
+            class="mb-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-600 dark:border-rose-800 dark:bg-rose-950/40 dark:text-rose-300"
+          >
+            <!-- TODO(i18n-task6): chat_deviceSessionLoadFailed -->
+            {{ activeConversation.deviceLoadError }}
+          </div>
           <div v-if="activeMessages.length === 0" class="flex h-full items-center justify-center">
             <p class="text-sm text-slate-400">{{ t('chat_startNew') }}</p>
           </div>
@@ -413,7 +421,8 @@ import { useNavigation } from '../composables/useNavigation';
 import { slashProviderFor } from '../utils/chatProvider';
 import { normalizeConversationTitle } from '../utils/chatTitle';
 import { useAuthStore } from '../stores/auth';
-import { useDeviceSessions } from '../composables/useDeviceSessions';
+import { getAgentSessionDetail } from '../services/agentApi';
+import { useDeviceSessions, DEVICE_SESSION_DETAIL_TTL_MS, isTerminalPrefixedSessionId } from '../composables/useDeviceSessions';
 import {
   AGENTCORE_MODEL_OPTIONS,
   EFFORT_OPTIONS,
@@ -436,7 +445,9 @@ const {
   deviceSessions,
   available: deviceAvailable,
   loadDeviceSessions,
+  refreshOnEvent,
   shellForEntry,
+  findDeviceShellBySessionId,
 } = useDeviceSessions();
 
 const conversations = ref([]);
@@ -669,8 +680,13 @@ const activeEffort = computed({
   },
 });
 
-// 切会话收起面板、清一次性错误。
-watch(activeId, () => {
+// 切会话收起面板、清一次性错误；同时给切走的 agentcore 设备会话退订快照流
+// （幂等，socket 不在线时 sendAI 静默失败，重开会话会重新订阅）。
+watch(activeId, (nv, ov) => {
+  if (ov) {
+    const prev = conversations.value.find(c => c.id === ov);
+    if (prev) unsubscribeDeviceSession(prev);
+  }
   directoryPanelOpen.value = false;
   modelCustomActive.value = false;
   createError.value = '';
@@ -825,6 +841,16 @@ function createConversation() {
   nextTick(() => inputRef.value?.focus());
 }
 
+// 侧栏点击分流：设备会话壳 → openDeviceSession（转录装载+订阅）；本地草稿
+// → 原 selectConversation。
+function onSidebarItemClick(c) {
+  if (c?.deviceSession) {
+    openDeviceSession(c);
+    return;
+  }
+  selectConversation(c.id);
+}
+
 function selectConversation(id) {
   activeId.value = id;
   showMobileSidebar.value = false;
@@ -914,6 +940,124 @@ function deleteConversation() {
     activeId.value = null;
   }
   saveToStorage();
+}
+
+// --- 打开设备会话（跨端统一阶段 2，Task 3） ---
+
+// 详情/快照转录 → 壳 messages（复用既有气泡渲染路径）。role 只认
+// user/assistant，系统/工具行跳过；同时存壳 deviceTranscript（[{role,content}]
+// 原始形态，Task 4 的 agentcore create transcript 喂入消费——后端
+// remoteAgentAIHistory 按 row.role/row.content 解析）。
+function applyDeviceTranscript(shell, transcript) {
+  const rows = Array.isArray(transcript) ? transcript : [];
+  const renderable = rows.filter(m => m && (m.role === 'user' || m.role === 'assistant')
+    && typeof m.content === 'string' && m.content);
+  shell.messages = renderable.map(m => ({
+    role: m.role,
+    content: m.content,
+    status: 'done',
+    ts: Date.parse(m.timestamp) || now(),
+  }));
+  shell.deviceTranscript = renderable.map(m => ({ role: m.role, content: m.content }));
+  scrollToBottom();
+}
+
+// 快照转录行（{role,text,message_id?,ts?}）→ 壳 messages，语义同上但字段
+// 名不同（快照用 text，详情用 content）。
+function applyDeviceSnapshotTranscript(shell, rows) {
+  const list = Array.isArray(rows) ? rows : [];
+  const renderable = list.filter(m => m && (m.role === 'user' || m.role === 'assistant')
+    && typeof m.text === 'string' && m.text);
+  shell.messages = renderable.map(m => ({
+    role: m.role,
+    content: m.text,
+    status: 'done',
+    ts: Date.parse(m.ts) || now(),
+  }));
+  shell.deviceTranscript = renderable.map(m => ({ role: m.role, content: m.text }));
+}
+
+// 订阅判定（钉死）：仅 agentcore 且裸 conversation id（journal 源才有转录
+// 快照）。claude_/codex_ 前缀不订阅（无 journal，详情已够）。
+function deviceSessionSubscribable(shell) {
+  return !!shell?.deviceSession
+    && shell.provider === 'agentcore'
+    && !isTerminalPrefixedSessionId(shell.deviceSession.id);
+}
+
+// 打开设备会话：壳复用（composable 缓存的稳定对象）→ 拉详情装载转录 →
+// agentcore 裸 id 发订阅等快照。404/网络错 → 空转录+错误条，不阻断续聊输入。
+async function openDeviceSession(shell) {
+  const entry = shell?.deviceSession;
+  if (!entry || typeof entry.id !== 'string' || !entry.id) return;
+  if (!conversations.value.includes(shell)) {
+    conversations.value.unshift(shell);
+  }
+  // 关键：壳对象来自 composable 的非响应式缓存，直接 unshift 进会话池后
+  // 续写 raw 对象不会触发渲染——必须取会话池里的响应式代理来写后续字段。
+  const live = conversations.value.find(c => c.id === shell.id) || shell;
+  activeId.value = live.id;
+  showMobileSidebar.value = false;
+  saveToStorage();
+  nextTick(() => scrollToBottom());
+
+  // 详情装载：5 分钟内重复打开不重拉（之后的更新由快照覆盖）
+  if (Date.now() - (live.deviceLoadedAt || 0) > DEVICE_SESSION_DETAIL_TTL_MS) {
+    try {
+      const detail = await getAgentSessionDetail(entry.id);
+      applyDeviceTranscript(live, detail?.transcript);
+      live.deviceLoadedAt = now();
+      live.deviceLoadError = '';
+    } catch (_) {
+      // 空转录+错误条：详情缺席不阻断（本地会话池里壳已在，输入照常）
+      live.deviceLoadError = '会话详情加载失败，暂显示空会话'; // TODO(i18n-task6): chat_deviceSessionLoadFailed
+    }
+  }
+
+  if (!deviceSessionSubscribable(shell)) return;
+  try {
+    await ensureAISocket();
+    sendAI({ type: 'ai.session.subscribe', session_id: entry.id });
+  } catch (_) {
+    // socket 不可用：快照缺席不阻断（详情已渲染）
+  }
+}
+
+// ai.session.snapshot（订阅握手回包）：按 session_id 找设备壳——先 aiSessionId
+// 匹配（打开过的壳），后三键兜底（entry.id/source_session_id/
+// managed_conversation_id）。未订阅/无壳的快照静默丢。
+function handleDeviceSnapshot(e) {
+  const sessionId = String(e.session_id || '');
+  if (!sessionId) return;
+  let shell = conversations.value.find(c => c.deviceSession && c.aiSessionId === sessionId)
+    || findDeviceShellBySessionId(sessionId);
+  if (!shell) return;
+  // 兜底路径可能拿到 composable 缓存的 raw 壳：已在会话池里就换代理写值
+  // （raw 写不触发渲染），不在池里（未打开）则保持原对象——下次打开时可见。
+  shell = conversations.value.find(c => c.id === shell.id && c.deviceSession) || shell;
+
+  // transcript 非空 → 覆盖壳 messages（快照是 journal 权威流的最新切片）
+  const rows = Array.isArray(e.transcript) ? e.transcript : [];
+  if (rows.length) {
+    applyDeviceSnapshotTranscript(shell, rows);
+    if (activeId.value === shell.id) scrollToBottom();
+  }
+
+  // pending_approvals → 逐条走既有 upsertApproval；快照行无 status，补 pending
+  // 默认（upsertApproval 只认 pending/responding）。
+  for (const item of Array.isArray(e.pending_approvals) ? e.pending_approvals : []) {
+    if (!item || typeof item !== 'object') continue;
+    upsertApproval(shell, { status: 'pending', ...item });
+  }
+
+  // status → 壳 running 标记（侧栏状态点消费）
+  shell.running = e.status === 'running';
+}
+
+// 切走设备会话时退订（幂等，多发无害）：agentcore 裸 id 才订过。
+function unsubscribeDeviceSession(shell) {
+  if (!deviceSessionSubscribable(shell)) return;
+  sendAI({ type: 'ai.session.unsubscribe', session_id: shell.deviceSession.id });
 }
 
 function scrollToBottom() {
@@ -1317,6 +1461,20 @@ function handleAIEvent(e) {
     slashPending[provider] = false;
     slashCommandsByProvider.value = { ...slashCommandsByProvider.value, [provider]: [] };
     return;
+  }
+
+  // 设备会话快照（订阅握手回包）：必须在通用会话归属判定**之前**接住——
+  // 快照可能属于未打开的设备会话，绝不能落进「未命中挂活跃会话」的
+  // fallback 链（会把他会转录灌进当前会话）。
+  if (e.type === 'ai.session.snapshot') {
+    handleDeviceSnapshot(e);
+    return;
+  }
+
+  // 清单跟随设备侧 run/审批生命周期：2s 节流刷新侧栏角标/状态点（对未打开
+  // 的设备会话同样生效，故放在归属判定之前）。
+  if (e.type === 'ai.run.started' || e.type === 'ai.done' || e.type === 'ai.error' || e.type === 'ai.approval.request') {
+    refreshOnEvent();
   }
 
   let conv = e.session_id ? conversations.value.find(c => c.aiSessionId === e.session_id) : null;
