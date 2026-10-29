@@ -106,35 +106,48 @@ func (j *agentCoreJournal) ensureSessionHeader(sessionID, projectPath, model, cr
 	j.pruneLocked(sessionID)
 }
 
-// readSessionHeader 读会话 journal 文件的头行(kind=="session"),返回
-// project_path 与 model。惰性 attach 解析(Task 3)用:文件不存在/头行损坏/
-// kind 不符 → ok=false。只读第一行,不整文件载入(转录可能很大)。
-func (j *agentCoreJournal) readSessionHeader(sessionID string) (projectPath, model string, ok bool) {
+// readSessionHeader 读会话 journal 文件的头行(kind=="session")。惰性 attach
+// 解析(Task 3)用。只读第一行,不整文件载入(转录可能很大)。返回:
+//   - exists=true:头行损坏/超长/kind 不符——文件在场但无法证明不是本家,
+//     调用方按「journal 在场」保守拒绝(绑定缺失不得静默新建,分叉守卫不失效);
+//   - matched=true:本家头行(头行 session_id 与入参一致——文件名是多对一
+//     清洗映射:非法字符→`_`、120 截断,必须逐字比对防把别家会话当本家),
+//     project_path/model 可用;
+//   - exists=false:文件不在场,或头行可读但 session_id 是别家(清洗映射碰撞,
+//     本家确无 journal → 调用方按「无 journal」放行新建)。
+func (j *agentCoreJournal) readSessionHeader(sessionID string) (projectPath, model string, matched bool, exists bool) {
 	if j == nil || j.dir == "" || strings.TrimSpace(sessionID) == "" {
-		return "", "", false
+		return "", "", false, false
 	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	path := filepath.Join(j.dir, agentCoreJournalFileName(sessionID))
 	file, err := os.Open(path)
 	if err != nil {
-		return "", "", false
+		return "", "", false, false
 	}
 	defer file.Close()
+	// Scanner 默认 64KiB 行上限:超长/损坏头行会被误读成「无行」→ 假阴性 →
+	// 绑定也缺时静默走新建,分叉守卫恰在最需要时失效。放宽到 4MiB。
 	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	if !scanner.Scan() {
-		return "", "", false
+		return "", "", true, true
 	}
 	var head map[string]interface{}
 	if json.Unmarshal([]byte(scanner.Text()), &head) != nil {
-		return "", "", false
+		return "", "", true, true
 	}
 	if kind, _ := head["kind"].(string); kind != "session" {
-		return "", "", false
+		return "", "", true, true
+	}
+	if headSessionID, _ := head["session_id"].(string); strings.TrimSpace(headSessionID) != sessionID {
+		// 清洗映射碰撞:文件是别家的,本家确无 journal。
+		return "", "", false, false
 	}
 	projectPath, _ = head["project_path"].(string)
 	model, _ = head["model"].(string)
-	return strings.TrimSpace(projectPath), strings.TrimSpace(model), true
+	return strings.TrimSpace(projectPath), strings.TrimSpace(model), true, true
 }
 
 func (j *agentCoreJournal) appendUser(sessionID, messageID, text, ts string) {

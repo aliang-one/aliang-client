@@ -1447,9 +1447,7 @@ func (m *agentAIManager) watch(msg map[string]interface{}, writeJSON agentTermin
 			})
 			return
 		}
-		m.mu.Lock()
-		m.registerAISessionLocked(shell)
-		m.mu.Unlock()
+		m.registerSessionIfAbsent(shell)
 	}
 	m.attachSessionWatch(sessionID, connID, writeJSON)
 }
@@ -1484,6 +1482,22 @@ func (m *agentAIManager) attachSessionWatch(sessionID, connID string, write agen
 	}
 }
 
+// registerSessionIfAbsent 把一个新会话注册进注册表,锁内重查在场(防
+// TOCTOU:两个并发 create/watch 同一磁盘 id——恰是本特性主场景,重启后手机
+// +网页同时接管——后注册者若直接顶掉前壳,而两壳之间已起跑一回合,内存态
+// 上下文就分叉了)。在场返回既有对象,不在场才注册。形状照抄 message() 的
+// lazy-create。MUST be called instead of raw registerAISessionLocked from
+// every attach/lazy resolution path.
+func (m *agentAIManager) registerSessionIfAbsent(session *agentAISession) *agentAISession {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if existing := m.sessions[session.id]; existing != nil {
+		return existing // a concurrent create/watch registered it first
+	}
+	m.registerAISessionLocked(session)
+	return session
+}
+
 // attachLiveSession 把来者接入既有会话(内存活跃或惰性壳通用):只登记
 // watcher(带 conn_id 时)+ 可选更新 surface,显式不覆写 provider/model/
 // effort/resumeSessionID/bindingVersion/initialContext 六字段,也不重置
@@ -1496,6 +1510,12 @@ func (m *agentAIManager) attachLiveSession(session *agentAISession, msg map[stri
 	connID := remoteString(msg, "conn_id")
 	surface := normalizeAgentAISurface(remoteString(msg, "surface"))
 	m.mu.Lock()
+	// is_goal_fork true-only 应用:不在六字段纪律内,但只许收紧不许放松——
+	// 执行回合的 readOnly 取自 session.isGoalFork,放松即 goal fork 的探索期
+	// 工作区保护静默失效。
+	if fork, _ := msg["is_goal_fork"].(bool); fork {
+		session.isGoalFork = true
+	}
 	if surface != "" {
 		session.surface = surface
 	}
@@ -1521,7 +1541,8 @@ func (m *agentAIManager) attachLiveSession(session *agentAISession, msg map[stri
 //   - 两者皆空              → 完全未知,调用方走既有新建。
 func (m *agentAIManager) resolveDurableSessionShell(sessionID string) (shell *agentAISession, rejectReason string) {
 	binding, hasBinding := m.bindingForConversation(sessionID)
-	journalProjectPath, journalModel, hasJournal := m.coreJournal.readSessionHeader(sessionID)
+	journalProjectPath, journalModel, journalMatched, journalExists := m.coreJournal.readSessionHeader(sessionID)
+	hasJournal := journalExists
 	if !hasBinding && !hasJournal {
 		return nil, ""
 	}
@@ -1545,7 +1566,7 @@ func (m *agentAIManager) resolveDurableSessionShell(sessionID string) (shell *ag
 		// confirmBinding 的 expected 取绑定本身,不受此影响。
 		result.reservedNativeSessionID = binding.NativeSessionID
 	}
-	if providersEquivalent(provider, "agentcore") {
+	if journalMatched && providersEquivalent(provider, "agentcore") {
 		result.projectPath = journalProjectPath
 		result.model = journalModel
 	}
@@ -2154,9 +2175,7 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 		return
 	}
 	if shell != nil {
-		m.mu.Lock()
-		m.registerAISessionLocked(shell)
-		m.mu.Unlock()
+		shell = m.registerSessionIfAbsent(shell)
 		m.attachLiveSession(shell, msg, writeJSON)
 		return
 	}
@@ -2199,7 +2218,6 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 		}}, history...)
 	}
 
-	m.mu.Lock()
 	// NOTE: no count cap here. The real turn runs on ai.message, whose lazy-create
 	// path (see message()) registers the session unconditionally — so a cap only
 	// in create() was a dead check that emitted a misleading "limit reached"
@@ -2223,8 +2241,7 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 		history:                 trimAgentAIHistoryWithLimits(history, newHistoryMessages, newHistoryChars),
 		lastActiveAt:            time.Now().UTC(),
 	}
-	m.registerAISessionLocked(session)
-	m.mu.Unlock()
+	session = m.registerSessionIfAbsent(session)
 
 	_ = writeJSON(agentAISessionCreatedPayload(session))
 }

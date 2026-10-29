@@ -561,6 +561,11 @@ func TestEvaluateSafeBashRejectsUnknownChainedCommand(t *testing.T) {
 // so handleClaudeApprovalHook's session/token guards pass.
 func setupHookReadySession(t *testing.T, svc *AgentService, sessionID, token string, events *[]map[string]interface{}, mu *sync.Mutex) {
 	t.Helper()
+	// journal 目录必须随测试隔离:agentHome() 解析的是真实用户 home(不吃
+	// ALIANG_DATA_DIR),hook 测试的审批行会写进 ~/.aliang/ai-sessions 并跨
+	// 运行残留;残留文件会让 create 的惰性解析把「journal 有而绑定无」的
+	// 分叉守卫错误地点到这些 id 上(2026-10-29 s1/s2 残留实测)。
+	svc.ai.coreJournal = newAgentCoreJournal(t.TempDir())
 	projectPath := setupAgentExecutionProjectForTest(t)
 	t.Cleanup(func() {
 		agentAuthorizedDirsMu.Lock()

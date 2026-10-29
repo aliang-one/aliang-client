@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -1150,5 +1152,185 @@ func TestAgentAIAttachSkipsTerminalEmitter(t *testing.T) {
 	// 终态后的 emitter 不再有事件;watcher 等下一 run 播种。属主恰好 1 帧。
 	if len(owner.snapshot()) != 1 {
 		t.Fatalf("owner frames = %d, want 1", len(owner.snapshot()))
+	}
+}
+
+// ---------- Task 3 复核:A1 锁内重查 / A2 is_goal_fork 只收紧 / A3 journal 头行 ----------
+
+// A1 回归钉(确定性):同 id 二次注册不得顶掉在场的活会话——后注册者拿到
+// 既有对象(照抄 message() lazy-create 的形状),内存态不分叉。
+func TestAgentAIRegisterSessionIfAbsentKeepsFirstWinner(t *testing.T) {
+	m := newAgentAIManager()
+	first := &agentAISession{id: "s-race", mode: "vibe", provider: "claude", model: "first", resumeSessionID: "native-1", bindingVersion: 3, lastActiveAt: time.Now().UTC()}
+	if got := m.registerSessionIfAbsent(first); got != first {
+		t.Fatal("first registration did not return its own session")
+	}
+	// 模拟并发后来者:同 id、不同字段。
+	second := &agentAISession{id: "s-race", mode: "vibe", provider: "codex", model: "second", resumeSessionID: "native-2", bindingVersion: 9, lastActiveAt: time.Now().UTC()}
+	if got := m.registerSessionIfAbsent(second); got != first {
+		t.Fatalf("second registration replaced the live session (context fork): got %#v want %#v", got, first)
+	}
+	m.mu.Lock()
+	inMap := m.sessions["s-race"]
+	m.mu.Unlock()
+	if inMap != first {
+		t.Fatalf("map holds %#v, want the first winner", inMap)
+	}
+}
+
+// A1 行为钉:两个并发 create 同一磁盘 id(重启后手机+网页同时接管)——
+// 恰好一个会话对象,provider 归绑定,双方都拿到 attached 回执。
+func TestAgentAIConcurrentDiskAttachSingleSession(t *testing.T) {
+	m := newAgentAIManager()
+	m.coreJournal = newAgentCoreJournal(t.TempDir())
+	seedTestBinding(m, "s-disk", "claude", "native-disk-1", "confirmed", 3)
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	receipts := make([][]map[string]interface{}, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			rec := &emitterWatchRecorder{}
+			m.create(map[string]interface{}{"session_id": "s-disk", "conn_id": fmt.Sprintf("conn-%d", i)}, rec.write)
+			receipts[i] = rec.snapshot()
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for i, frames := range receipts {
+		if len(frames) != 1 || frames[0]["attached"] != true {
+			t.Fatalf("attach %d = %#v, want single attached receipt", i, frames)
+		}
+		if frames[0]["provider"] != "claude" {
+			t.Fatalf("attach %d provider = %v, want binding's claude", i, frames[0]["provider"])
+		}
+	}
+	m.mu.Lock()
+	session := m.sessions["s-disk"]
+	m.mu.Unlock()
+	// map 按 id 唯一;锁定对象必须就是绑定原生 id 的那份（后注册者未顶掉）。
+	if session == nil || session.provider != "claude" || session.resumeSessionID != "native-disk-1" {
+		t.Fatalf("post-race session = %#v", session)
+	}
+}
+
+// A2 回归钉:attach 侧 is_goal_fork true-only——传 true 收紧生效;不带不放松
+// 既有 fork 标记(goal fork 的读写保护不因重挂载静默消失)。
+func TestAgentAIAttachGoalForkTightenOnly(t *testing.T) {
+	m := newAgentAIManager()
+	// fork 会话重挂载不带 flag:仍是 fork。
+	fork := &agentAISession{id: "s-fork", isGoalFork: true, provider: "claude", lastActiveAt: time.Now().UTC()}
+	m.mu.Lock()
+	m.sessions["s-fork"] = fork
+	m.mu.Unlock()
+	rec := &emitterWatchRecorder{}
+	m.create(map[string]interface{}{"session_id": "s-fork", "conn_id": "c1"}, rec.write)
+	m.mu.Lock()
+	stillFork := fork.isGoalFork
+	m.mu.Unlock()
+	if !stillFork {
+		t.Fatal("attach relaxed is_goal_fork; exploration read-only protection silently lost")
+	}
+
+	// 非 fork 会话 attach 带 true:收紧生效。
+	plain := &agentAISession{id: "s-plain", provider: "claude", lastActiveAt: time.Now().UTC()}
+	m.mu.Lock()
+	m.sessions["s-plain"] = plain
+	m.mu.Unlock()
+	m.create(map[string]interface{}{"session_id": "s-plain", "conn_id": "c1", "is_goal_fork": true}, rec.write)
+	m.mu.Lock()
+	tightened := plain.isGoalFork
+	m.mu.Unlock()
+	if !tightened {
+		t.Fatal("attach did not apply is_goal_fork=true")
+	}
+
+	// 惰性壳同路径:磁盘 attach 带 true → 壳 fork。
+	m.coreJournal = newAgentCoreJournal(t.TempDir())
+	seedTestBinding(m, "s-disk-fork", "claude", "native-1", "confirmed", 1)
+	m.create(map[string]interface{}{"session_id": "s-disk-fork", "conn_id": "c1", "is_goal_fork": true}, rec.write)
+	m.mu.Lock()
+	diskFork := m.sessions["s-disk-fork"]
+	var diskForkFlag bool
+	if diskFork != nil {
+		diskForkFlag = diskFork.isGoalFork
+	}
+	m.mu.Unlock()
+	if diskFork == nil || !diskForkFlag {
+		t.Fatalf("disk attach lost is_goal_fork: %#v", diskFork)
+	}
+}
+
+// A3 回归钉:①头行 session_id 比对——文件名清洗映射碰撞时不得把别家会话
+// 当本家(误报 journal / 装别家字段);②头行损坏 → journal 视为在场,绑定
+// 缺失时必须拒绝,守卫不得静默失效;绑定在场时 binding-first 照常 attach。
+func TestAgentAIJournalHeaderIdentityAndCorruption(t *testing.T) {
+	m := newAgentAIManager()
+	dir := t.TempDir()
+	m.coreJournal = newAgentCoreJournal(dir)
+
+	// ①碰撞:文件名落点与 s-other 相同,但头行 session_id 是 s-other →
+	// 对 s-collide 而言「无本家 journal」→ 未知 id 走新建,不误拒。
+	collidePath := filepath.Join(dir, agentCoreJournalFileName("s-collide"))
+	line, err := jsonMarshalLine(map[string]interface{}{"kind": "session", "session_id": "s-other", "project_path": "/other", "model": "other-model"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(collidePath, line, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rec := &emitterWatchRecorder{}
+	m.create(map[string]interface{}{"session_id": "s-collide", "provider": "claude"}, rec.write)
+	frames := rec.snapshot()
+	if len(frames) != 1 || frames[0]["type"] == models.AgentEventAIError {
+		t.Fatalf("collision id create must fall through to fresh create: %#v", frames)
+	}
+	m.mu.Lock()
+	fresh := m.sessions["s-collide"]
+	m.mu.Unlock()
+	if fresh == nil {
+		t.Fatal("collision id did not register a fresh session")
+	}
+	// 别家的字段不得泄漏:model 必须空,project_path 走新建默认(HOME 解析),
+	// 绝不是别家的 /other。
+	if fresh.model != "" || fresh.projectPath == "/other" {
+		t.Fatalf("collision leaked another session's fields: model=%q path=%q", fresh.model, fresh.projectPath)
+	}
+
+	// ②损坏头行:文件在场但不可读 → 绑定缺失必须拒绝(守卫生效)。
+	corruptPath := filepath.Join(dir, agentCoreJournalFileName("s-corrupt"))
+	if err := os.WriteFile(corruptPath, []byte("\x00\xff not json at all\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rec2 := &emitterWatchRecorder{}
+	m.create(map[string]interface{}{"session_id": "s-corrupt", "conn_id": "c1"}, rec2.write)
+	frames2 := rec2.snapshot()
+	if len(frames2) != 1 || frames2[0]["type"] != models.AgentEventAIError {
+		t.Fatalf("corrupt head without binding = %#v, want refusal", frames2)
+	}
+
+	// ②续:同一损坏 journal + 绑定在场 → binding-first 照常 attach。
+	seedTestBinding(m, "s-corrupt", "claude", "native-c1", "confirmed", 2)
+	rec3 := &emitterWatchRecorder{}
+	m.create(map[string]interface{}{"session_id": "s-corrupt", "conn_id": "c1"}, rec3.write)
+	frames3 := rec3.snapshot()
+	if len(frames3) != 1 || frames3[0]["attached"] != true {
+		t.Fatalf("binding-first attach over corrupt head = %#v", frames3)
+	}
+
+	// ②续:超长头行(>64KiB Scanner 默认上限)同损坏处理:绑定缺失拒绝。
+	longPath := filepath.Join(dir, agentCoreJournalFileName("s-longhead"))
+	if err := os.WriteFile(longPath, []byte("{\"kind\":\"session\",\"session_id\":\"s-longhead\",\"pad\":\""+strings.Repeat("x", 200_000)+"\"}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rec4 := &emitterWatchRecorder{}
+	m.create(map[string]interface{}{"session_id": "s-longhead", "conn_id": "c1"}, rec4.write)
+	frames4 := rec4.snapshot()
+	if len(frames4) != 1 || frames4[0]["type"] != models.AgentEventAIError {
+		t.Fatalf("overlong head without binding = %#v, want refusal", frames4)
 	}
 }
