@@ -840,6 +840,25 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 		// challenge and eventually kill a session the user just approved.
 		s.setRemoteConnectionState(true, "online", "")
 		s.terminal.quotaResolved(msg, writeJSON)
+	case models.AgentEventAISessionSubscribe, models.AgentEventAISessionUnsubscribe:
+		// 跨端同态（spec §4.1/阶段 3）：服务端为打开会话详情的手机代发订阅。
+		// 刻意不受 aiControlEnabled 门——订阅是只读观察（快照+事件副本），
+		// 关掉 AI 控制不应让已打开的详情页变瞎；与本地透传路径同语义
+		//（DispatchLocalAI 同款注释）。盖远端 origin 标记：快照经 emitter
+		// 写回时 origin 去重 + ack 可寻址。
+		msg[agentAIOriginSocketField] = agentAIRemoteSocketID
+		s.setRemoteConnectionState(true, "online", "")
+		sessionID := strings.TrimSpace(remoteString(msg, "session_id"))
+		if sessionID == "" {
+			_ = writeJSON(agentAIErrorPayload("", "", errors.New("ai.session.subscribe missing session_id")))
+			return
+		}
+		if msgType == models.AgentEventAISessionSubscribe {
+			s.ai.subscribeAISocket(agentAIRemoteSocketID, sessionID)
+			s.ai.emitSessionSnapshot(agentAIRemoteSocketID, sessionID, writeJSON)
+		} else {
+			s.ai.unsubscribeAISocket(agentAIRemoteSocketID, sessionID)
+		}
 	case models.AgentEventAISessionCreate, models.AgentEventAIMessage, models.AgentEventAIRunStart, models.AgentEventAISteer, models.AgentEventAIApprovalResponse, models.AgentEventAIOptionResponse, models.AgentEventAIStop, models.AgentEventAISessionClose, models.AgentEventAITuiSync, models.AgentEventToolAskResponse:
 		// 跨端同态（spec §4.1）：入站 AI 帧盖远端来源标记。位置刻意在 case 入口、
 		// aiControlEnabled 门与任何 early-return 之前——错误回包路径（含门拒绝）

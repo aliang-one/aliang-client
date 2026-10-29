@@ -550,3 +550,50 @@ func waitUntilFor(t *testing.T, d time.Duration, fn func() bool) {
 	}
 	t.Fatal("waitUntilFor 超时")
 }
+
+// 阶段 3：服务端为打开会话详情的手机代发订阅——远端 WS 路由（与本地
+// DispatchLocalAI 同语义：订阅挂 remote 常驻 socket、回快照；不受
+// aiControlEnabled 门）。测试钉：订阅注册 + 快照回包 + 未知会话 idle 不报错
+// + 退订生效。
+func TestRemoteSubscribeRepliesSnapshotAndRegisters(t *testing.T) {
+	m := newTestAISocketsManager(t)
+	svc := &AgentService{ai: m}
+	// 生产中 remote 常驻 socket 由 runRemoteAgentSession 的 ensureRemoteAISocket
+	// 注册（连接建立先于任何帧）；测试同序注册。
+	m.registerAISocket("remote", func(interface{}) error { return nil })
+	replies := make(chan map[string]interface{}, 8)
+	write := func(p interface{}) error { replies <- p.(map[string]interface{}); return nil }
+
+	svc.handleRemoteAgentMessage(map[string]interface{}{
+		"type": models.AgentEventAISessionSubscribe, "session_id": "s-remote-1",
+	}, write)
+	select {
+	case p := <-replies:
+		if p["type"] != models.AgentEventAISessionSnapshot {
+			t.Fatalf("远端订阅应回快照,收到 %v", p["type"])
+		}
+		if p["status"] != "idle" {
+			t.Fatalf("未知会话快照应 idle,实际 %v", p["status"])
+		}
+	case <-time.After(time.Second):
+		t.Fatal("远端订阅未回快照")
+	}
+	m.mu.Lock()
+	sock := m.aiSockets[agentAIRemoteSocketID]
+	subscribed := sock != nil && sock.subscribed("s-remote-1")
+	m.mu.Unlock()
+	if !subscribed {
+		t.Fatal("订阅未挂到 remote 常驻 socket")
+	}
+
+	// aiControlEnabled=false 的设备也允许订阅（只读观察语义）——门在业务帧上
+	svc.handleRemoteAgentMessage(map[string]interface{}{
+		"type": models.AgentEventAISessionUnsubscribe, "session_id": "s-remote-1",
+	}, write)
+	m.mu.Lock()
+	subscribed = sock != nil && sock.subscribed("s-remote-1")
+	m.mu.Unlock()
+	if subscribed {
+		t.Fatal("退订未生效")
+	}
+}
