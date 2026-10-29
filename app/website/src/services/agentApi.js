@@ -73,10 +73,8 @@ export async function getAgentSessionDetail(sessionId, { limit, before, signal }
   );
 }
 
-// Холодный путь транскрипта (первый запрос может выполнять холодное сканирование/чтение с диска
-// больше 15 секунд) — жесткий таймаут 40 секунд через AbortController. В случае таймаута
-// выбрасывается ошибка с маркером 'transcript-timeout', повторная попытка — просто
-// вызывать функцию заново (кнопка «Повторить» в UI).
+// 转录冷路径（首请求可能触发设备侧冷扫描/读盘，>15s 是常态）：AbortController
+// 硬顶 40s。超时抛 'transcript-timeout' 标记错误；重试=再次调用（UI 重试按钮）。
 export const AGENT_TRANSCRIPT_TIMEOUT_MS = 40000;
 
 export async function loadAgentTranscript(sessionId, { limit = 50, timeoutMs = AGENT_TRANSCRIPT_TIMEOUT_MS } = {}) {

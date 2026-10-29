@@ -6,14 +6,17 @@ import {
   agentSessionDrawerEntries,
   attachSessionPayload,
   findConversationForEvent,
+  findRunningAssistant,
   isDirectoryLocked,
   planWatchSwitch,
   recentProjectsFromSessions,
   restorableAttachedSessionIds,
   sessionCreatePayload,
+  shouldLoadTranscript,
   transcriptToMessages,
   unwatchSessionPayload,
   watchSessionPayload,
+  watchTargetOf,
 } from './chatSettings';
 
 describe('EFFORT_OPTIONS', () => {
@@ -113,6 +116,15 @@ describe('watchSessionPayload / unwatchSessionPayload', () => {
   });
 });
 
+describe('watchTargetOf（B1：本地会话绝不自 watch）', () => {
+  it('attached 会话返回 session id；本地会话返回 null', () => {
+    expect(watchTargetOf({ attached: true, aiSessionId: 'codex_1' })).toBe('codex_1');
+    expect(watchTargetOf({ attached: false, aiSessionId: 'local-x' })).toBeNull();
+    expect(watchTargetOf({ attached: true })).toBeNull();
+    expect(watchTargetOf(null)).toBeNull();
+  });
+});
+
 describe('planWatchSwitch（watch 生命周期）', () => {
   it('attach 后首次 watch：无旧目标 → 仅 watch', () => {
     expect(planWatchSwitch(null, 'ai_1')).toEqual([{ op: 'watch', sessionId: 'ai_1' }]);
@@ -163,18 +175,18 @@ describe('agentSessionDrawerEntries（抽屉列表：合并/标记/排序/客户
   it('按 updated_at 倒序，缺时间戳排最后；字段清洗', () => {
     const { items, total, hasMore } = agentSessionDrawerEntries(sessions, {});
     expect(items.map(e => e.id)).toEqual(['ai_b', 'ai_a', 'ai_c']);
-    expect(items[0]).toMatchObject({ id: 'ai_b', title: '', provider: 'claude', running: false, local: false });
+    expect(items[0]).toMatchObject({ id: 'ai_b', title: '', provider: 'claude', running: false, bound: false });
     expect(total).toBe(3);
     expect(hasMore).toBe(false);
   });
 
-  it('runtime 快照合并出「运行中」徽章；本页绑定集合标记「本机」', () => {
+  it('runtime 快照合并出「运行中」徽章；本页绑定集合标记「已接入」', () => {
     const { items } = agentSessionDrawerEntries(sessions, {
       runningIds: ['ai_a'],
       localSessionIds: ['ai_b'],
     });
     expect(items.find(e => e.id === 'ai_a').running).toBe(true);
-    expect(items.find(e => e.id === 'ai_b').local).toBe(true);
+    expect(items.find(e => e.id === 'ai_b').bound).toBe(true);
     expect(items.find(e => e.id === 'ai_c').running).toBe(false);
   });
 
@@ -187,21 +199,70 @@ describe('agentSessionDrawerEntries（抽屉列表：合并/标记/排序/客户
     expect(page2.hasMore).toBe(false);
   });
 
+  it('超过默认 20 条时按传入 limit 翻页（「显示更多」把 limit 提到 visibleCount）', () => {
+    const many = Array.from({ length: 25 }, (_, i) => ({
+      id: `s_${i}`,
+      updated_at: `2026-10-29T00:${String(i).padStart(2, '0')}:00Z`,
+    }));
+    const page1 = agentSessionDrawerEntries(many, { limit: 20 });
+    expect(page1.items).toHaveLength(20);
+    expect(page1.total).toBe(25);
+    expect(page1.hasMore).toBe(true);
+    const page2 = agentSessionDrawerEntries(many, { limit: 40 });
+    expect(page2.items).toHaveLength(25);
+    expect(page2.hasMore).toBe(false);
+  });
+
   it('脏输入安全：非数组/脏行/无 id 行', () => {
     expect(agentSessionDrawerEntries(null, {})).toEqual({ items: [], total: 0, hasMore: false });
     expect(agentSessionDrawerEntries([null, {}, { id: '' }, 'x'], {}).total).toBe(0);
   });
 });
 
+describe('shouldLoadTranscript（F1：运行中不载转录）', () => {
+  const idleAttached = { attached: true, aiSessionId: 'codex_1', messages: [] };
+
+  it('空闲的 attached 会话可加载', () => {
+    expect(shouldLoadTranscript(idleAttached)).toBe(true);
+  });
+
+  it('运行中不加载：直播气泡会被整体替换冲掉', () => {
+    expect(shouldLoadTranscript({
+      ...idleAttached,
+      messages: [{ role: 'assistant', content: '部分输出', status: 'running' }],
+    })).toBe(false);
+  });
+
+  it('非 attached / 无 id / 已在加载 / 已加载过 → false', () => {
+    expect(shouldLoadTranscript({ attached: false, aiSessionId: 'local-x', messages: [] })).toBe(false);
+    expect(shouldLoadTranscript({ attached: true, messages: [] })).toBe(false);
+    expect(shouldLoadTranscript({ ...idleAttached, transcriptLoading: true })).toBe(false);
+    expect(shouldLoadTranscript({ ...idleAttached, transcriptLoaded: true })).toBe(false);
+    expect(shouldLoadTranscript(null)).toBe(false);
+  });
+
+  it('findRunningAssistant 取最后一条 running 助手气泡，脏输入安全', () => {
+    const conv = {
+      messages: [
+        { role: 'assistant', content: '旧', status: 'done' },
+        { role: 'assistant', content: '', status: 'running' },
+      ],
+    };
+    expect(findRunningAssistant(conv)?.status).toBe('running');
+    expect(findRunningAssistant({ messages: [{ role: 'user', content: 'hi' }] })).toBeNull();
+    expect(findRunningAssistant(null)).toBeNull();
+  });
+});
+
 describe('transcriptToMessages（转录渲染历史）', () => {
   it('映射 user/assistant 气泡，status=done，时间戳解析', () => {
     const rows = [
-      { role: 'user', content: 'привет', timestamp: '2026-10-29T10:00:00Z' },
-      { role: 'assistant', content: 'ответ', timestamp: '2026-10-29T10:00:05Z' },
+      { role: 'user', content: '你好', timestamp: '2026-10-29T10:00:00Z' },
+      { role: 'assistant', content: '回复', timestamp: '2026-10-29T10:00:05Z' },
     ];
     const msgs = transcriptToMessages(rows);
     expect(msgs).toHaveLength(2);
-    expect(msgs[0]).toMatchObject({ role: 'user', content: 'привет', status: 'done' });
+    expect(msgs[0]).toMatchObject({ role: 'user', content: '你好', status: 'done' });
     expect(msgs[0].ts).toBe(Date.parse('2026-10-29T10:00:00Z'));
     expect(msgs[1].role).toBe('assistant');
   });
@@ -219,14 +280,17 @@ describe('transcriptToMessages（转录渲染历史）', () => {
 });
 
 describe('restorableAttachedSessionIds（刷新恢复候选）', () => {
-  it('仅 attached 且带真实 ai_* session id 的会话参与恢复', () => {
+  it('仅排除 local- 伪 id：真实设备会话 id（codex_*/claude_*/自造串）都参与恢复', () => {
     expect(restorableAttachedSessionIds([
-      { attached: true, aiSessionId: 'ai_1' },
-      { attached: true, aiSessionId: 'local-c1' }, // 本地伪 id 不恢复
-      { attached: false, aiSessionId: 'ai_2' },    // 非 attached 不恢复
-      { aiSessionId: 'ai_3' },
+      { attached: true, aiSessionId: 'codex_abc' },
+      { attached: true, aiSessionId: 'claude_xyz' },
+      { attached: true, aiSessionId: 'session-20261029' }, // agentcore 内部自造 id 无固定前缀
+      { attached: true, aiSessionId: 'local-c1' },         // 本地伪 id 不恢复
+      { attached: true, aiSessionId: '' },                 // 空 id 不恢复
+      { attached: false, aiSessionId: 'codex_2' },         // 非 attached 不恢复
+      { aiSessionId: 'codex_3' },
       null,
-    ])).toEqual(['ai_1']);
+    ])).toEqual(['codex_abc', 'claude_xyz', 'session-20261029']);
   });
 
   it('脏输入安全', () => {

@@ -99,6 +99,31 @@ export function planWatchSwitch(currentSessionId, nextSessionId) {
   return ops;
 }
 
+// watch 目标：仅 attached 会话可被直播跟踪。本地会话必须返回 null、绝不自 watch：
+// 服务端 emit 对同一连接先扇出 watcher 再写属主，同 connID 两路都写且不去重，
+// 本地会话自 watch 会让 delta 文本翻倍。
+export function watchTargetOf(conv) {
+  return conv && conv.attached && conv.aiSessionId ? conv.aiSessionId : null;
+}
+
+// 流式中的助手气泡（status=running）。零依赖纯函数，ChatPage 与转录守卫共用。
+export function findRunningAssistant(conv) {
+  const msgs = (conv && conv.messages) || [];
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (msgs[i].role === 'assistant' && msgs[i].status === 'running') return msgs[i];
+  }
+  return null;
+}
+
+// 转录加载门槛：仅 attached 会话、未在加载、未加载过、且**不在运行中**——
+// 转录整体替换 messages，运行中加载会把逐字直播的气泡冲掉，后续 delta 又因
+// 末尾已是 done 气泡被丢弃（回合剩余输出静默丢失）。
+export function shouldLoadTranscript(conv) {
+  if (!conv || !conv.attached || !conv.aiSessionId) return false;
+  if (conv.transcriptLoading || conv.transcriptLoaded) return false;
+  return !findRunningAssistant(conv);
+}
+
 // 帧归位：优先按 session_id 精确命中（matchedById 纪律）；未命中才走 fallback——
 // 且 fallback 仅允许本地（非 attached）会话承接：attached 会话是别人的直播流，
 // 绝不能被他页会话/未知 session 的帧污染。
@@ -112,12 +137,14 @@ export function findConversationForEvent(conversations, sessionId, activeConvers
   return null;
 }
 
-// 抽屉条目组装：会话全量列表 + runtime 快照（运行中徽章）+ 本页绑定集合（来源
-// 标记）合并，按 updated_at 倒序，客户端分页（服务端无分页）。任何脏输入安全。
+// 抽屉条目组装：会话全量列表 + runtime 快照（运行中徽章）+ 本页绑定集合
+// （bound = 该 session 已被本页某个对话接入；手机/桌面来源的区分标注需服务端
+// 在 sessions 端点补 origin 注解，当前数据不含——文案只用「已接入/未接入」），
+// 按 updated_at 倒序，客户端分页（服务端无分页）。任何脏输入安全。
 export function agentSessionDrawerEntries(sessions, { runningIds = [], localSessionIds = [], limit = 20, offset = 0 } = {}) {
   if (!Array.isArray(sessions)) sessions = [];
   const running = runningIds instanceof Set ? runningIds : new Set(runningIds || []);
-  const local = localSessionIds instanceof Set ? localSessionIds : new Set(localSessionIds || []);
+  const bound = localSessionIds instanceof Set ? localSessionIds : new Set(localSessionIds || []);
   const entries = sessions
     .filter(s => s && typeof s === 'object' && s.id)
     .map(s => ({
@@ -127,7 +154,7 @@ export function agentSessionDrawerEntries(sessions, { runningIds = [], localSess
       projectPath: s.project_path || '',
       updatedAtMs: Date.parse(s.updated_at || '') || 0,
       running: running.has(s.id),
-      local: local.has(s.id),
+      bound: bound.has(s.id),
     }))
     .sort((a, b) => b.updatedAtMs - a.updatedAtMs);
   const size = Math.max(limit, 0);
@@ -149,10 +176,12 @@ export function transcriptToMessages(rows) {
     }));
 }
 
-// 刷新恢复候选：attached 会话（attach 接管过、带真实 ai_* session id）。
+// 刷新恢复候选：attach 接管过、带真实设备会话 id 的会话。session id 形态由
+// 服务端定（codex_*/claude_*/agentcore 内部 id 等），前端只排除自己造的
+// local- 伪 id——按 ai_ 前缀过滤会把几乎全部真实会话排除掉。
 export function restorableAttachedSessionIds(conversations) {
   if (!Array.isArray(conversations)) return [];
   return conversations
-    .filter(c => c && c.attached && typeof c.aiSessionId === 'string' && c.aiSessionId.startsWith('ai_'))
+    .filter(c => c && c.attached && typeof c.aiSessionId === 'string' && c.aiSessionId !== '' && !c.aiSessionId.startsWith('local-'))
     .map(c => c.aiSessionId);
 }

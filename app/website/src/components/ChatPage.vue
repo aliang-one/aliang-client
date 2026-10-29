@@ -567,7 +567,7 @@
               </span>
             </div>
             <div class="mt-0.5 flex items-center gap-2 text-xs text-slate-400">
-              <span class="rounded bg-slate-100 px-1.5 py-0.5 dark:bg-slate-800">{{ entry.local ? t('chat_sessionSourceLocal') : t('chat_sessionSourceExternal') }}</span>
+              <span class="rounded bg-slate-100 px-1.5 py-0.5 dark:bg-slate-800">{{ entry.bound ? t('chat_sessionSourceBound') : t('chat_sessionSourceUnbound') }}</span>
               <span v-if="entry.provider" class="truncate">{{ entry.provider }}</span>
               <span v-if="entry.updatedAtMs" class="ml-auto shrink-0">{{ drawerTimeLabel(entry.updatedAtMs) }}</span>
             </div>
@@ -602,14 +602,17 @@ import {
   agentSessionDrawerEntries,
   attachSessionPayload,
   findConversationForEvent,
+  findRunningAssistant,
   isDirectoryLocked,
   planWatchSwitch,
   recentProjectsFromSessions,
   restorableAttachedSessionIds,
   sessionCreatePayload,
+  shouldLoadTranscript,
   transcriptToMessages,
   unwatchSessionPayload,
   watchSessionPayload,
+  watchTargetOf,
 } from '../utils/chatSettings';
 
 const STORAGE_KEY = 'aliang-chat-data';
@@ -988,8 +991,11 @@ function selectConversation(id) {
   activeId.value = id;
   showMobileSidebar.value = false;
   saveToStorage();
-  if (next && next.attached && !next.transcriptLoaded && !next.transcriptLoading) {
-    loadTranscriptInto(next);
+  if (next && next.attached) {
+    // 断线重连后 watch 随连接被反注销：重进会话时补 attach+watch（内部幂等），
+    // 否则抽屉徽章显示「运行中」而页面永远收不到帧。
+    if (!watchedSessions.has(next.aiSessionId)) ensureLiveAttached(next);
+    if (shouldLoadTranscript(next)) loadTranscriptInto(next);
   }
   nextTick(() => scrollToBottom());
 }
@@ -1185,13 +1191,9 @@ function sendUnwatch(sessionId) {
   if (sendAI(unwatchSessionPayload(sessionId))) watchedSessions.delete(sessionId);
 }
 
-function watchedSessionIdOf(conv) {
-  return conv && conv.attached && conv.aiSessionId ? conv.aiSessionId : null;
-}
-
 // 切换直播跟踪目标（attach 成功后必须紧跟 watch；切走/关闭时 unwatch）。
 function applyWatchSwitch(nextConv) {
-  const ops = planWatchSwitch(watchedSessionIdOf(activeConversation.value), watchedSessionIdOf(nextConv));
+  const ops = planWatchSwitch(watchTargetOf(activeConversation.value), watchTargetOf(nextConv));
   for (const { op, sessionId } of ops) {
     if (op === 'watch') sendWatch(sessionId);
     else sendUnwatch(sessionId);
@@ -1212,15 +1214,17 @@ function ensureLiveAttached(conv) {
 }
 
 // 转录（冷路径）：loading/错误挂在 conv 上（视图据其渲染重试按钮）。
-// 运行中不加载：转录整体替换 messages，会把正在逐字直播的气泡冲掉——
-// 等回合并结束（ai.done 后重进会话/重试）再取全量历史。
+// 运行中不加载（shouldLoadTranscript 门 + await 后复查双保险）：转录整体替换
+// messages，会把正在逐字直播的气泡冲掉，后续 delta 因末尾已是 done 气泡被丢弃。
 async function loadTranscriptInto(conv) {
-  if (!conv || !conv.attached || !conv.aiSessionId || conv.transcriptLoading) return;
-  if (findRunningAssistant(conv)) return;
+  if (!shouldLoadTranscript(conv)) return;
   conv.transcriptLoading = true;
   conv.transcriptError = '';
   try {
     const detail = await loadAgentTranscript(conv.aiSessionId, { limit: TRANSCRIPT_LIMIT });
+    // TOCTOU：冷路径最长 40s，期间回合可能已开始直播——命中运行中就弃用本次
+    // 结果，直播气泡继续增长（历史留给回合结束后的重进/重试）。
+    if (findRunningAssistant(conv)) return;
     conv.messages = transcriptToMessages(detail?.transcript);
     conv.transcriptLoaded = true;
     conv.updatedAt = now();
@@ -1238,9 +1242,12 @@ async function loadTranscriptInto(conv) {
 const drawerEntries = computed(() => agentSessionDrawerEntries(agentSessions.value, {
   runningIds: runtimeSessionIds.value,
   localSessionIds: conversations.value.filter(c => c.aiSessionId).map(c => c.aiSessionId),
+  // 客户端分页的页大小在这里生效：不传 limit 会被纯函数默认截到 20，「显示更多」
+  // 永远翻不动。
+  limit: drawerVisibleCount.value,
 }));
 
-const visibleDrawerEntries = computed(() => drawerEntries.value.items.slice(0, drawerVisibleCount.value));
+const visibleDrawerEntries = computed(() => drawerEntries.value.items);
 
 function drawerTimeLabel(ts) {
   const d = new Date(ts);
@@ -1302,7 +1309,8 @@ async function attachFromDrawer(entry) {
   saveToStorage();
   scrollToBottom();
   ensureLiveAttached(conv);
-  await loadTranscriptInto(conv);
+  // 运行中的会话跳过自动转录：先看直播，回合结束后的重进/重试再取历史。
+  if (!entry.running && shouldLoadTranscript(conv)) await loadTranscriptInto(conv);
 }
 
 // Ask the agent for the active provider's `/`-command surface. Cached per
@@ -1389,14 +1397,6 @@ function onInputKeydown(e) {
     e.preventDefault();
     sendMessage();
   }
-}
-
-function findRunningAssistant(conv) {
-  const msgs = conv.messages || [];
-  for (let i = msgs.length - 1; i >= 0; i--) {
-    if (msgs[i].role === 'assistant' && msgs[i].status === 'running') return msgs[i];
-  }
-  return null;
 }
 
 // Returns the live assistant bubble for a streaming run, creating a fresh
@@ -1777,9 +1777,10 @@ async function sendMessage() {
       return;
     }
     armIdleWatchdog(conv);
-    // attach 成功后必须紧跟 watch：socket 重连后 watch 随连接被反注销，
-    // 确认门重放 attach 的同时也把直播跟踪续上（幂等）。
-    sendWatch(conv.aiSessionId);
+    // attach 成功后必须紧跟 watch（重连场景续上直播跟踪）。仅 attached 会话：
+    // 本地会话自 watch 会让同一条 delta 经属主+watcher 两路写回、文本翻倍。
+    const watchTarget = watchTargetOf(conv);
+    if (watchTarget) sendWatch(watchTarget);
     const ok = sendAI({
       type: 'ai.message',
       session_id: conv.aiSessionId,
@@ -1817,15 +1818,15 @@ function handleKeydown(e) {
   }
 }
 
-// 刷新恢复：localStorage 里的 attached 会话重新 attach+watch。活跃的 attached
-// 会话立即恢复直播态；运行中徽章来自 runtime-sessions（仅作角标，运行态以帧为准）。
+// 刷新恢复：localStorage 里 attach 接管过的会话重新 attach+watch——只对当前
+// 活跃的 attached 会话执行（其余会话切换时再接）；runtime 徽章预取与是否有
+// attached 会话解耦（抽屉首开也要徽章）。
 async function restoreAttachedSessions() {
+  const restorable = restorableAttachedSessionIds(conversations.value);
   const conv = activeConversation.value;
-  const attached = restorableAttachedSessionIds(conversations.value);
-  if (!attached.length) return;
-  if (conv && conv.attached) {
+  if (conv && restorable.includes(conv.aiSessionId)) {
     ensureLiveAttached(conv);
-    if (!conv.transcriptLoaded && !conv.transcriptLoading) loadTranscriptInto(conv);
+    if (shouldLoadTranscript(conv)) loadTranscriptInto(conv);
   }
   try {
     const runtime = await getAgentRuntimeSessions();
