@@ -78,8 +78,10 @@ const SNAPSHOT_PAYLOAD = {
 };
 
 // detail404：详情端点回 404（必须走 openChat 的同一 route 表——Playwright
-// 先注册者优先，事后 addRoute 压不过 openChat 的通配兜底）。
-async function openChat(page, { detail404 = false } = {}) {
+// 先注册者优先，事后 addRoute 压不过 openChat 的通配兜底）。sessions：用例
+// 专属清单（Task 4/5 的分流用例需要 running 带.managed_conversation_id、
+// running 无 managed id、idle agentcore 等形态，不动共享默认清单）。
+async function openChat(page, { detail404 = false, sessions = SESSIONS } = {}) {
   await page.addInitScript(WS_STUB);
   await page.addInitScript(() => localStorage.setItem('alianggate.onboarding.v2', 'completed'));
   await page.route('**/api/**', async (route) => {
@@ -95,7 +97,7 @@ async function openChat(page, { detail404 = false } = {}) {
       return;
     }
     if (url.pathname === '/api/agent/sessions') {
-      await route.fulfill({ contentType: 'application/json', body: JSON.stringify({ code: 0, data: { sessions: SESSIONS } }) });
+      await route.fulfill({ contentType: 'application/json', body: JSON.stringify({ code: 0, data: { sessions } }) });
       return;
     }
     if (url.pathname === '/api/agent/session') {
@@ -114,7 +116,15 @@ async function openChat(page, { detail404 = false } = {}) {
   await page.goto('/');
   await expect(page.getByTestId('aliang-chat-entry-sidebar')).toBeVisible();
   await page.getByTestId('aliang-chat-entry-sidebar').click();
-  await expect(page.getByTestId('session-source-badge')).toHaveCount(2);
+  // 角标数随用例清单走（与 sessionSourceBadge 同一条优先级规则的镜像实现：
+  // running > origin > id 前缀）；默认双条清单维持 2。
+  const badgeCount = sessions.filter((s) => {
+    if (!s || typeof s !== 'object') return false;
+    if (s.status === 'running') return true;
+    if (s.origin === 'phone' || s.origin === 'dashboard') return true;
+    return typeof s.id === 'string' && (s.id.startsWith('claude_') || s.id.startsWith('codex_'));
+  }).length;
+  await expect(page.getByTestId('session-source-badge')).toHaveCount(badgeCount);
 }
 
 // 向页面注入一帧 WS 事件（走最新一个 socket 实例的 onmessage）。socket 是
@@ -244,4 +254,91 @@ test('resume 字段仅首次 create：created ack 后清除，后续 create 不�
   expect(creates[0].resume_session_id).toBe('native9'); // 首次 create 携带
   expect(creates[0].project_path).toBe('/home/alice/proj-term'); // resumeProjectPath 覆盖
   expect('resume_session_id' in creates[creates.length - 1]).toBe(false); // ack 后清除
+});
+
+// --- Task 4：续聊发送分流（steer）+ agentcore 上下文喂入 ---
+
+test('running 设备壳（managed_conversation_id）提交 → ai.steer 目标正确，queued ack 渲染提示条', async ({ page }) => {
+  const sessions = [
+    { id: 'conv-mgd', provider: 'agentcore', title: '他端跑着的会话', status: 'running', origin: 'phone', managed_conversation_id: 'managed-run-9', project_path: '/p/mgd', updated_at: NOW_ISO },
+  ];
+  await openChat(page, { sessions });
+  await page.getByText('他端跑着的会话').click();
+  // running+可插话 → 占位符切到插话语义（chat_steerPlaceholder，i18n 前硬编码中文）
+  const input = page.getByPlaceholder(/输入消息|运行中|Type a message/);
+  await expect(input).toHaveAttribute('placeholder', /运行中，发送将作为插话/);
+  await input.fill('插一句话');
+  await page.keyboard.press('Enter');
+  // steer 帧目标 = managed_conversation_id（真正的在跑回合）
+  let steer = null;
+  await expect.poll(async () => {
+    steer = await page.evaluate(() =>
+      window.__aiFrames.find(f => f.type === 'ai.steer') || null
+    );
+    return steer ? steer.session_id : '';
+  }).toBe('managed-run-9');
+  expect(steer.content).toBe('插一句话');
+  // 分流绝不走原链：零 create / 零 ai.message / 零 user 气泡（轻量条承载）
+  const types = await page.evaluate(() => window.__aiFrames.map(f => f.type));
+  expect(types).not.toContain('ai.session.create');
+  expect(types).not.toContain('ai.message');
+  await expect(page.getByTestId('chat-steer-item')).toContainText('插一句话');
+  // queued ack → 状态文案（message_id 回读自帧，串起 ack 匹配链路）
+  await pushFrame(page, {
+    type: 'ai.steer.ack', session_id: 'managed-run-9', message_id: steer.message_id, result: 'queued',
+  });
+  await expect(page.getByTestId('chat-steer-status')).toHaveText(/已受理/);
+});
+
+test('running 设备壳无 managed id：内联提示常驻、提交零帧、输入保留', async ({ page }) => {
+  const sessions = [
+    { id: 'conv-nomgd', provider: 'agentcore', title: '无绑定运行', status: 'running', origin: 'phone', project_path: '/p/nm', updated_at: NOW_ISO },
+  ];
+  await openChat(page, { sessions });
+  await page.getByText('无绑定运行').click();
+  await expect(page.getByTestId('chat-steer-blocked-hint')).toBeVisible();
+  const input = page.getByPlaceholder(/输入消息|Type a message/);
+  await input.fill('试试插话');
+  await page.keyboard.press('Enter');
+  await expect(page.getByTestId('chat-steer-blocked-hint')).toBeVisible();
+  await expect(input).toHaveValue('试试插话'); // 不清输入（没有可去的去处）
+  // 零帧（subscribe 是打开壳时的订阅，不算提交产物）
+  const types = await page.evaluate(() =>
+    window.__aiFrames.map(f => f.type).filter(t => t !== 'ai.session.subscribe')
+  );
+  expect(types).toEqual([]);
+});
+
+test('idle agentcore 壳首条续聊：create 帧带 transcript，created ack 后不再携带', async ({ page }) => {
+  const sessions = [
+    { id: 'conv-idle', provider: 'agentcore', title: '空闲手机会话', status: 'idle', origin: 'phone', source_session_id: 'managed-idle-1', project_path: '/home/alice/proj-phone', updated_at: NOW_ISO },
+  ];
+  await openChat(page, { sessions });
+  await page.getByText('空闲手机会话').click();
+  await expect(page.getByText('详情用户消息')).toBeVisible();
+  const input = page.getByPlaceholder(/输入消息|Type a message/);
+  await input.fill('接着聊');
+  await page.keyboard.press('Enter');
+  await expect.poll(async () => page.evaluate(() =>
+    window.__aiFrames.filter(f => f.type === 'ai.session.create').length
+  )).toBeGreaterThanOrEqual(1);
+  const creates = await page.evaluate(() =>
+    window.__aiFrames.filter(f => f.type === 'ai.session.create')
+  );
+  // transcript 行形态 = remoteAgentAIHistory 消费的 {role, content}
+  expect(creates[0].transcript).toEqual([
+    { role: 'user', content: '详情用户消息' },
+    { role: 'assistant', content: '详情助手消息' },
+  ]);
+  expect('resume_session_id' in creates[0]).toBe(false); // 裸 id 壳不走 resume
+  await expect(input).toBeEnabled(); // done 回包落地，sending 复位
+  await input.fill('再来一句');
+  await page.keyboard.press('Enter');
+  await expect.poll(async () => page.evaluate(() =>
+    window.__aiFrames.filter(f => f.type === 'ai.session.create').length
+  )).toBeGreaterThanOrEqual(2);
+  const later = await page.evaluate(() =>
+    window.__aiFrames.filter(f => f.type === 'ai.session.create')
+  );
+  expect('transcript' in later[later.length - 1]).toBe(false); // ack 后一次性消费
 });

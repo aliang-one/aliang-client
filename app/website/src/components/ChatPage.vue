@@ -296,6 +296,28 @@
               <template v-else>{{ msg.content }}</template>
             </div>
           </div>
+          <!-- 插话轻量条（Task 4）：运行中回合的旁路注入，不插独立 user 气泡——
+               快照/详情装载的转录才是权威流，避免回灌重复渲染。 -->
+          <div
+            v-for="item in activeSteerItems"
+            :key="item.messageId"
+            data-testid="chat-steer-item"
+            class="mb-3 ml-auto max-w-[85%] rounded-lg border border-primary/30 bg-primary/5 px-3 py-2 text-xs"
+          >
+            <div class="flex flex-wrap items-center gap-2">
+              <span class="material-symbols-outlined text-sm text-primary">bolt</span>
+              <span class="font-semibold text-slate-600 dark:text-slate-200">
+                <!-- TODO(i18n-task6): chat_steerLabel -->
+                插话
+              </span>
+              <span
+                data-testid="chat-steer-status"
+                :class="item.status === 'failed' ? 'text-rose-500' : 'font-medium text-primary'"
+              >{{ steerStatusLabel(item) }}</span>
+            </div>
+            <p class="mt-1 whitespace-pre-wrap break-all text-slate-600 dark:text-slate-300">{{ item.content }}</p>
+            <p v-if="item.status === 'failed' && item.detail" class="mt-1 text-rose-500">{{ item.detail }}</p>
+          </div>
           <div
             v-for="approval in activeApprovals"
             :key="approval.key"
@@ -372,6 +394,16 @@
 
       <!-- Input -->
       <div v-if="activeId" class="border-t border-slate-200 p-4 dark:border-slate-700">
+        <!-- steer 阻断提示（Task 4）：设备壳 running 且无 managed_conversation_id，
+             插话不可能（不发帧、绝不引导重发为普通消息）——常驻说明而非提交后报错。 -->
+        <div
+          v-if="steerBlocked"
+          data-testid="chat-steer-blocked-hint"
+          class="mb-2 rounded-lg border border-slate-200 bg-slate-100 px-3 py-2 text-xs text-slate-500 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300"
+        >
+          <!-- TODO(i18n-task6): chat_steerBlocked -->
+          该会话正在其他端运行，暂不能插话
+        </div>
         <div class="flex items-center gap-2">
           <div class="relative flex-1">
             <div
@@ -396,8 +428,8 @@
               ref="inputRef"
               v-model="inputText"
               type="text"
-              :placeholder="t('chat_placeholder')"
-              :disabled="sending"
+              :placeholder="inputPlaceholder"
+              :disabled="sendDisabled"
               class="h-10 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm text-slate-700 outline-none transition focus:border-primary dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100"
               @input="onSlashInput"
               @keydown="onInputKeydown"
@@ -406,11 +438,11 @@
           </div>
           <button
             type="button"
-            class="h-10 rounded-lg bg-primary px-4 text-sm font-semibold text-white transition hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-60"
-            :disabled="sending"
+            class="h-10 shrink-0 rounded-lg bg-primary px-4 text-sm font-semibold text-white transition hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-60"
+            :disabled="sendDisabled"
             @click="sendMessage"
           >
-            {{ sending ? t('chat_sending') : t('chat_send') }}
+            {{ sendButtonLabel }}
           </button>
         </div>
       </div>
@@ -524,6 +556,79 @@ const activeRunning = computed(() => {
   }
   return false;
 });
+
+// --- 续聊发送分流（跨端统一阶段 2 Task 4） ---
+
+// 会话「running」判定 = 本地气泡推断（activeRunning）OR 设备壳清单/快照
+// status（conv.running，composable 原位刷新）。两者并集：另一端跑着的会话
+// （壳 running 但本地无流式气泡）与本端正在流的会话都算 running。
+function isConversationRunning(conv) {
+  if (!conv) return false;
+  return !!conv.running || !!findRunningAssistant(conv);
+}
+
+const activeSessionRunning = computed(() => isConversationRunning(activeConversation.value));
+
+// steer 目标（阶段 2 计划钉死）：壳带 managed_conversation_id（清单 running
+// 绑定态带回）→ steer 该 id（真正的在跑回合）；设备壳无 managed id → 空
+// （绝不发帧，也绝不引导「重发为普通消息」——那会对同一原生转录并发第二个
+// CLI run）；本地自跑会话 → 自身 aiSessionId。
+function steerTargetId(conv) {
+  if (!conv) return '';
+  if (conv.deviceSession) {
+    const managed = typeof conv.deviceSession.managed_conversation_id === 'string'
+      ? conv.deviceSession.managed_conversation_id.trim()
+      : '';
+    return managed;
+  }
+  return conv.aiSessionId || '';
+}
+
+const activeSteerTarget = computed(() => steerTargetId(activeConversation.value));
+
+// 设备壳 running 且无 managed id：插话不可能（不发帧）——输入区常驻提示。
+const steerBlocked = computed(() =>
+  activeSessionRunning.value
+  && !!activeConversation.value?.deviceSession
+  && !activeSteerTarget.value
+);
+
+// sending 守卫改造：running 会话在 sending 中仍可输入提交（插话），非 running
+// 维持禁用（本地 run 在途时输入框照旧锁住——此时 activeRunning=true 会放行，
+// 提交自然分流成 steer，这正是预期交互）。
+const sendDisabled = computed(() => sending.value && !activeSessionRunning.value);
+
+const sendButtonLabel = computed(() => {
+  if (sending.value && activeSessionRunning.value) {
+    return '插话中'; // TODO(i18n-task6): chat_steerSending
+  }
+  return sending.value ? t('chat_sending') : t('chat_send');
+});
+
+const inputPlaceholder = computed(() => {
+  // 仅在插话真正可达时换占位符提示（阻断态保持普通占位，提示条已另行说明）
+  if (activeSessionRunning.value && activeSteerTarget.value) {
+    return '运行中，发送将作为插话'; // TODO(i18n-task6): chat_steerPlaceholder
+  }
+  return t('chat_placeholder');
+});
+
+const activeSteerItems = computed(() => activeConversation.value?.steerItems || []);
+
+function steerStatusLabel(item) {
+  switch (item?.status) {
+    case 'sent':
+      return '已发送'; // TODO(i18n-task6): chat_steerSent
+    case 'queued':
+      return '已受理，将在下一轮生效'; // TODO(i18n-task6): chat_steerQueued
+    case 'applied':
+      return '已送达'; // TODO(i18n-task6): chat_steerApplied
+    case 'not_running':
+      return '回合已结束，插话未生效'; // TODO(i18n-task6): chat_steerNotRunning
+    default:
+      return '插话失败'; // TODO(i18n-task6): chat_steerFailed
+  }
+}
 
 // --- 三源统一清单（本地草稿 + 设备会话壳） ---
 
@@ -825,6 +930,8 @@ function saveToStorage() {
 function conversationForStorage(conv) {
   const copy = { ...conv };
   copy.approvals = [];
+  // steer 轻量条是瞬态 UI：ack 状态不跨页持久（陈旧的「已受理」比没有更糟）
+  copy.steerItems = [];
   return copy;
 }
 
@@ -1450,6 +1557,65 @@ function finishRun(conv) {
   saveToStorage();
 }
 
+// --- steer 分流（跨端统一阶段 2 Task 4） ---
+
+// 运行中回合的旁路注入：不插 user 气泡、不走 create 确认门、不武装看门狗、
+// 不动 sending——轻量条自己承载状态（sent → ack 落定）。目标为空（设备壳
+// running 且无 managed id）时静默返回：阻断提示条已常驻输入区，绝不做
+// 「重发为普通消息」引导（会对同一原生转录并发第二个 CLI run）。
+async function submitSteer(conv, text) {
+  const target = steerTargetId(conv);
+  if (!target) return;
+  if (!Array.isArray(conv.steerItems)) conv.steerItems = [];
+  const item = {
+    messageId: 'steer-' + generateId(),
+    content: text,
+    status: 'sent',
+    result: '',
+    detail: '',
+    ts: now(),
+  };
+  conv.steerItems.push(item);
+  inputText.value = '';
+  scrollToBottom();
+  try {
+    await ensureAISocket();
+    const ok = sendAI({ type: 'ai.steer', session_id: target, message_id: item.messageId, content: text });
+    if (!ok) throw new Error('socket-closed');
+  } catch (_) {
+    item.status = 'failed';
+    item.detail = t('chat_serviceUnavailable');
+  }
+}
+
+function handleSteerAck(e) {
+  const mid = String(e.message_id || '');
+  if (!mid) return;
+  for (const c of conversations.value) {
+    const items = Array.isArray(c.steerItems) ? c.steerItems : [];
+    const item = items.find(it => it.messageId === mid);
+    if (!item) continue;
+    applySteerAck(item, e);
+    refreshOnEvent(); // 插话落定（not_running 等）可能伴随清单 running 态翻转，节流刷新侧栏
+    return;
+  }
+  console.debug('[chat] steer ack has no matching item, dropped', mid);
+}
+
+// queued/applied/not_running 是契约枚举；error/unsupported 及未知 result
+// （含未来新增值）一律按失败渲染 + detail，不静默。
+function applySteerAck(item, e) {
+  const result = String(e.result || '');
+  item.result = result;
+  if (result === 'queued' || result === 'applied' || result === 'not_running') {
+    item.status = result;
+    item.detail = '';
+    return;
+  }
+  item.status = 'failed';
+  item.detail = String(e.error || e.code || result || 'unknown');
+}
+
 function handleAIEvent(e) {
   if (!e || !e.type) return;
 
@@ -1476,6 +1642,16 @@ function handleAIEvent(e) {
   // fallback 链（会把他会转录灌进当前会话）。
   if (e.type === 'ai.session.snapshot') {
     handleDeviceSnapshot(e);
+    return;
+  }
+
+  // steer ack：按 message_id 反查提交方会话的轻量条更新。必须在通用会话归属
+  // 判定之前接住——ack 的 session_id 是 steer 目标（managed_conversation_id
+  // 等），按 aiSessionId 匹配不上时会走「未命中挂活跃会话」fallback，把跨端/
+  // 他会话的 ack 渲染进当前会话。匹配不上（跨端 steer 的 ack 不回本 socket、
+  // 刷新丢条）静默丢。
+  if (e.type === 'ai.steer.ack') {
+    handleSteerAck(e);
     return;
   }
 
@@ -1554,6 +1730,9 @@ function handleAIEvent(e) {
       conv.resumeConsumed = true;
       delete conv.resumeSessionId;
       delete conv.resumeProjectPath;
+      // agentcore 上下文喂入（Task 4）：transcript 只随首条 create 发出，ack
+      // 即消费——此后确认门/设置条重发的 create 不再携带（防大载荷反复传输）。
+      conv.deviceTranscriptSent = true;
       if (pending) pending('created');
       persist = true;
       break;
@@ -1628,10 +1807,20 @@ async function sendMessage() {
   }
 
   const text = inputText.value.trim();
-  if (!text || sending.value || !activeId.value) return;
+  if (!text || !activeId.value) return;
+  // sending 守卫（Task 4 分流）：非 running 维持禁用；running 会话在 sending
+  // 中放行——提交分流成 steer（见下）。
+  if (sending.value && !activeSessionRunning.value) return;
 
   const conv = activeConversation.value;
   if (!conv) return;
+
+  // 分流规则（阶段 2 计划钉死）：running（本地气泡推断 OR 设备壳清单/快照
+  // status）→ 提交走 ai.steer；非 running → 原链（create 确认门 + ai.message）。
+  if (isConversationRunning(conv)) {
+    await submitSteer(conv, text);
+    return;
+  }
 
   conv.messages.push({ role: 'user', content: text, ts: now() });
   if (!conv.title) {

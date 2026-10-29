@@ -7,6 +7,7 @@ import {
   isDirectoryLocked,
   normalizeDeviceProvider,
   recentProjectsFromSessions,
+  deviceTranscriptForCreate,
   sessionCreatePayload,
   sessionSourceBadge,
 } from './chatSettings';
@@ -101,6 +102,68 @@ describe('sessionCreatePayload', () => {
     const payload = sessionCreatePayload({ aiSessionId: 's5', resumeSessionId: '', resumeProjectPath: '' });
     expect(Object.keys(payload)).not.toContain('resume_session_id');
     expect(payload.project_path).toBe('');
+  });
+});
+
+describe('deviceTranscriptForCreate（agentcore 上下文喂入）', () => {
+  const transcript = [
+    { role: 'user', content: '早' },
+    { role: 'assistant', content: '好' },
+  ];
+  const agentcoreShell = {
+    deviceSession: { id: 'conv-1' },
+    provider: 'agentcore',
+    aiSessionId: 'conv-1',
+    deviceTranscript: transcript,
+  };
+
+  it('agentcore 裸 id 设备壳且未 ack 消费 → 返回转录原样', () => {
+    expect(deviceTranscriptForCreate(agentcoreShell)).toEqual(transcript);
+  });
+
+  it('claude_ 前缀壳（resume 链）/本地草稿/provider 非 agentcore → null', () => {
+    expect(deviceTranscriptForCreate({ ...agentcoreShell, aiSessionId: 'local-dev-claude_x', deviceSession: { id: 'claude_x' } })).toBeNull();
+    expect(deviceTranscriptForCreate({ provider: 'agentcore', deviceTranscript: transcript })).toBeNull();
+    expect(deviceTranscriptForCreate({ ...agentcoreShell, provider: 'claudecode' })).toBeNull();
+  });
+
+  it('deviceTranscriptSent=true（created ack 已消费）或空/缺失转录 → null', () => {
+    expect(deviceTranscriptForCreate({ ...agentcoreShell, deviceTranscriptSent: true })).toBeNull();
+    expect(deviceTranscriptForCreate({ ...agentcoreShell, deviceTranscript: [] })).toBeNull();
+    expect(deviceTranscriptForCreate({ ...agentcoreShell, deviceTranscript: undefined })).toBeNull();
+  });
+
+  it('脏输入安全返回 null', () => {
+    expect(deviceTranscriptForCreate(null)).toBeNull();
+    expect(deviceTranscriptForCreate('x')).toBeNull();
+    expect(deviceTranscriptForCreate(undefined)).toBeNull();
+  });
+});
+
+describe('sessionCreatePayload transcript 键', () => {
+  const transcript = [{ role: 'user', content: '早' }];
+
+  it('agentcore 设备壳带转录 → create 载荷携带 transcript（remoteAgentAIHistory 行形态）', () => {
+    const payload = sessionCreatePayload({
+      aiSessionId: 'conv-1',
+      deviceSession: { id: 'conv-1' },
+      provider: 'agentcore',
+      deviceTranscript: transcript,
+    });
+    expect(payload.transcript).toEqual(transcript);
+  });
+
+  it('已 ack 消费/本地草稿 → 载荷不含 transcript 键（e2e 字段集断言不得多出空键）', () => {
+    const consumed = sessionCreatePayload({
+      aiSessionId: 'conv-1',
+      deviceSession: { id: 'conv-1' },
+      provider: 'agentcore',
+      deviceTranscript: transcript,
+      deviceTranscriptSent: true,
+    });
+    expect(Object.keys(consumed)).not.toContain('transcript');
+    const draft = sessionCreatePayload({ aiSessionId: 's6', deviceTranscript: transcript });
+    expect(Object.keys(draft)).not.toContain('transcript');
   });
 });
 

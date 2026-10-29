@@ -57,10 +57,33 @@ export function isDirectoryLocked(conv) {
   return !!(conv && typeof conv === 'object' && conv.dirLocked);
 }
 
+// agentcore 上下文喂入（阶段 2 Task 4）：裸 id 设备会话首条续聊的 create 要带
+// journal 转录——否则 create 先注册空 history 会话，message() 的 journal 读回
+// 被跳过，续聊静默变成新会话。后端 remoteAgentAIHistory（agent_ai.go）按
+// row.role/row.content 解析 transcript 数组。判定收口：仅 agentcore 裸 id
+// 设备壳（claude_/codex_ 前缀壳走 resume，由 CLI 自己装回原生历史，再喂转录
+// 会重复）、转录非空、且尚未 ack 消费（deviceTranscriptSent 由 ChatPage 在
+// created ack 后置位——resendCreate/确认门重发在 ack 前同样携带）。脏输入
+// 安全返回 null。本文件保持零依赖：前缀判定与 useDeviceSessions.isTerminal
+// PrefixedSessionId 同一条规则的内联副本（改动须两处同步）。
+export function deviceTranscriptForCreate(conv) {
+  if (!conv || typeof conv !== 'object') return null;
+  const entry = conv.deviceSession;
+  if (!entry || typeof entry !== 'object') return null;
+  if (conv.provider !== 'agentcore') return null;
+  const rawId = typeof entry.id === 'string' ? entry.id : '';
+  if (!rawId || rawId.startsWith('claude_') || rawId.startsWith('codex_')) return null;
+  if (conv.deviceTranscriptSent) return null;
+  const rows = Array.isArray(conv.deviceTranscript) ? conv.deviceTranscript : [];
+  if (!rows.length) return null;
+  return rows;
+}
+
 // ai.session.create 载荷统一出口：ChatPage 首发与重发共用，保证字段一致。
 // 续聊扩展（阶段 2）：resumeSessionId → resume_session_id、resumeProjectPath
-// → 覆盖 project_path。两者都是可选字段——未设置时键不得出现在载荷（e2e
-// 断言 create 帧字段集，多出的空键会被判为协议漂移）。
+// → 覆盖 project_path、deviceTranscriptForCreate → transcript。可选字段——
+// 未设置时键不得出现在载荷（e2e 断言 create 帧字段集，多出的空键会被判为
+// 协议漂移）。
 export function sessionCreatePayload(conv) {
   const payload = {
     type: 'ai.session.create',
@@ -76,6 +99,10 @@ export function sessionCreatePayload(conv) {
   }
   if (conv && conv.resumeProjectPath) {
     payload.project_path = String(conv.resumeProjectPath);
+  }
+  const transcript = deviceTranscriptForCreate(conv);
+  if (transcript) {
+    payload.transcript = transcript;
   }
   return payload;
 }
