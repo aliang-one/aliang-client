@@ -111,11 +111,17 @@ func StopLocalServer() error {
 }
 
 func registerAgentRoutes(mux *http.ServeMux) {
-	logger.Info("[AGENT-BOOT] local_server registering_routes routes=/api/agent/status,/api/agent/sync,/api/agent/enable,/api/agent/disable,/api/agent/tools,/api/agent/protocol,/api/agent/tools/launch,/api/agent/ai/approval-hook,/api/agent/ai/stream")
+	logger.Info("[AGENT-BOOT] local_server registering_routes routes=/api/agent/status,/api/agent/sync,/api/agent/enable,/api/agent/auth-recover,/api/agent/disable,/api/agent/tools,/api/agent/protocol,/api/agent/tools/launch,/api/agent/ai/approval-hook,/api/agent/ai/stream")
 	agentHandler := handlers.NewAgentHandler(services.GetSharedAgentService())
 	mux.HandleFunc("/api/agent/status", agentHandler.HandleStatus)
 	mux.HandleFunc("/api/agent/sync", agentHandler.HandleSync)
 	mux.HandleFunc("/api/agent/enable", agentHandler.HandleEnable)
+	// auth_expired 自愈链（2026-10-29 修复）：core 在 token 刷新成功后经
+	// requestLocalUserAgentRecoverAfterAuthExpired 直连 POST 本端点，仪表盘侧
+	// HandleAuthRecover 的 proxyIfNeeded 也转发到本 runtime。缺注册=404 透传，
+	// auth_expired 终态在 core+user agent 双进程拓扑下永不自愈（双注册教训，
+	// 2026-10-21 liang-dev 同族）。
+	mux.HandleFunc("/api/agent/auth-recover", agentHandler.HandleAuthRecover)
 	mux.HandleFunc("/api/agent/disable", agentHandler.HandleDisable)
 	mux.HandleFunc("/api/agent/reconnect", agentHandler.HandleReconnect)
 	mux.HandleFunc("/api/agent/session-event", agentHandler.HandleSessionEvent)
