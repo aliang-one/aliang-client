@@ -225,13 +225,14 @@ func (b *agentToolAskBridge) buildMCPServer() *mcp.Server {
 			"properties":{
 				"title":{"type":"string","description":"Short question text shown to the user."},
 				"options":{"type":"array","maxItems":8,"items":{"type":"object","properties":{
-					"id":{"type":"string","description":"Stable short slug for the option."},
-					"label":{"type":"string","description":"Human-readable option label."},
+					"id":{"type":"string","description":"Short stable ASCII slug (letters/digits/-/_, max 48 chars). Never reuse the label as the id."},
+					"label":{"type":"string","description":"Human-readable option label. Plain text only (emoji fine, no markdown), aim under 60 chars."},
 					"description":{"type":"string","description":"Optional longer explanation."},
-					"response":{"type":"string","description":"Optional text sent back as the answer when chosen."}
+					"response":{"type":"string","description":"Optional confirmation text returned as the answer when chosen (consumed as-is)."},
+					"previews":{"type":"array","maxItems":8,"items":{"type":"string","maxLength":200},"description":"Optional one-line strings (commands/code) shown under the option."}
 				},"required":["id","label"]}},
 				"allow_custom":{"type":"boolean","description":"Whether the user may answer with free text instead of an option."},
-				"multi":{"type":"boolean","description":"Whether multiple options may be selected."}
+				"multi":{"type":"boolean","description":"Whether multiple options may be selected. When true, the answer returns selected_option_ids/selected_answers arrays."}
 			},
 			"required":["title"]
 		}`),
@@ -297,8 +298,20 @@ func (b *agentToolAskBridge) handleAskUser(ctx context.Context, rawArgs, token s
 		case models.AgentToolAskStatusAnswered:
 			body := map[string]interface{}{"status": "answered"}
 			if resp.Answer != nil {
+				// v2：作答体从裸 slug 升级为「id + 人类可读答案」。fence 主通道
+				// 的 optionResponse 早已把 id 反查回 label 原样回给模型，这里对齐，
+				// 并把 schema 里声明已久的 per-option response 死字段真正消费掉。
+				if ids := resp.Answer.SelectedOptionIDs; len(ids) > 0 {
+					body["selected_option_ids"] = ids
+					answers := make([]string, 0, len(ids))
+					for _, id := range ids {
+						answers = append(answers, toolAskAnswerText(input, id))
+					}
+					body["selected_answers"] = answers
+				}
 				if resp.Answer.SelectedOptionID != "" {
 					body["selected_option_id"] = resp.Answer.SelectedOptionID
+					body["selected_label"] = toolAskAnswerText(input, resp.Answer.SelectedOptionID)
 				}
 				if resp.Answer.Message != "" {
 					body["message"] = resp.Answer.Message
@@ -323,13 +336,28 @@ func (b *agentToolAskBridge) handleAskUser(ctx context.Context, rawArgs, token s
 type agentAskUserInput struct {
 	Title   string `json:"title"`
 	Options []struct {
-		ID          string `json:"id"`
-		Label       string `json:"label"`
-		Description string `json:"description"`
-		Response    string `json:"response"`
+		ID          string   `json:"id"`
+		Label       string   `json:"label"`
+		Description string   `json:"description"`
+		Response    string   `json:"response"`
+		Previews    []string `json:"previews"`
 	} `json:"options"`
 	AllowCustom bool `json:"allow_custom"`
 	Multi       bool `json:"multi"`
+}
+
+// toolAskAnswerText 反查 id → 人类可读答案文本：response（模型预写确认语）
+// 优先，否则 label；未知 id 原样返回（不应发生，兜底不失真）。
+func toolAskAnswerText(input *agentAskUserInput, id string) string {
+	for _, opt := range input.Options {
+		if opt.ID == id {
+			if resp := strings.TrimSpace(opt.Response); resp != "" {
+				return resp
+			}
+			return opt.Label
+		}
+	}
+	return id
 }
 
 func parseAskUserInput(raw string) (*agentAskUserInput, error) {
@@ -346,6 +374,9 @@ func parseAskUserInput(raw string) (*agentAskUserInput, error) {
 	for _, opt := range input.Options {
 		if strings.TrimSpace(opt.ID) == "" || strings.TrimSpace(opt.Label) == "" {
 			return nil, fmt.Errorf("every option needs id and label")
+		}
+		if len(opt.Previews) > 8 {
+			return nil, fmt.Errorf("too many previews (max 8 per option)")
 		}
 	}
 	return &input, nil

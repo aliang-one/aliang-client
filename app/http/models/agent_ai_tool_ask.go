@@ -56,9 +56,12 @@ type AgentToolAskRequest struct {
 }
 
 // AgentToolAskAnswer 手机作答载荷;与 server 审批卡 options/message 契约同构。
+// v2：multi 卡经 SelectedOptionIDs 多选回传(按选项声明顺序);单选继续走
+// SelectedOptionID 单值,两字段并存互斥由 server 侧保证。
 type AgentToolAskAnswer struct {
-	SelectedOptionID string `json:"selected_option_id,omitempty"`
-	Message          string `json:"message,omitempty"`
+	SelectedOptionID  string   `json:"selected_option_id,omitempty"`
+	SelectedOptionIDs []string `json:"selected_option_ids,omitempty"`
+	Message           string   `json:"message,omitempty"`
 }
 
 // AgentToolAskResponse server→agent:tool_ask.response。answered 必带 Answer,

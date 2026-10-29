@@ -636,36 +636,77 @@ type agentAIApprovalResponse struct {
 }
 
 // agentAIOptionRequest 描述一次"多方案选择"请求（agent→server）。
+// v2 新增 Header/Summary/Version 均可选：旧 JSON 无这些字段零影响。
 type agentAIOptionRequest struct {
 	ID          string                `json:"option_id,omitempty"`
 	SessionID   string                `json:"session_id,omitempty"`
 	MessageID   string                `json:"message_id,omitempty"`
 	Provider    string                `json:"provider,omitempty"`
 	Title       string                `json:"title,omitempty"`
+	Header      string                `json:"header,omitempty"`
+	Summary     string                `json:"summary,omitempty"`
+	Version     int                   `json:"v,omitempty"`
 	Options     []agentAIOptionChoice `json:"options"`
 	AllowCustom bool                  `json:"allow_custom"`
 	Multi       bool                  `json:"multi"`
 }
 
 type agentAIOptionChoice struct {
-	ID          string `json:"id"`
-	Label       string `json:"label"`
-	Description string `json:"description,omitempty"`
+	ID          string   `json:"id"`
+	Label       string   `json:"label"`
+	Description string   `json:"description,omitempty"`
+	Response    string   `json:"response,omitempty"`
+	Previews    []string `json:"previews,omitempty"`
 }
 
 // aliangOptionsBlockRe 匹配 ```aliang-options\n<json>\n``` 围栏块（DOTALL）。
 var aliangOptionsBlockRe = regexp.MustCompile("(?s)```aliang-options\\s*\\n(.*?)\\n```")
 
+// agentAIOptionIDRe v2 id 硬规则：≤48 字符 ASCII slug（大小写均可，模型常写
+// BlueGreen 之类混合形式，一律重造反而制造 churn）。
+var agentAIOptionIDRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$`)
+
+const agentAIOptionMaxCount = 8
+
+// normalizeAgentAIOptionRequest 对模型产出的块做硬规范化（prompt 只能劝，这里必须拦）：
+// 空 label 选项丢弃；id 缺失/非法/重复 → 重造 option-N（撞已有合法 id 时顺延）；
+// 清洗后再截到 8——先截后丢会白丢名额。重造后的 id 会随 ai.option.request
+// 下发、作答原样回传，全链自洽。
+func normalizeAgentAIOptionRequest(req *agentAIOptionRequest) {
+	seen := make(map[string]bool, len(req.Options))
+	kept := make([]agentAIOptionChoice, 0, agentAIOptionMaxCount)
+	for _, opt := range req.Options {
+		if strings.TrimSpace(opt.Label) == "" {
+			continue
+		}
+		if !agentAIOptionIDRe.MatchString(opt.ID) || seen[opt.ID] {
+			opt.ID = fmt.Sprintf("option-%d", len(kept)+1)
+			for seen[opt.ID] {
+				opt.ID = opt.ID + "x"
+			}
+		}
+		seen[opt.ID] = true
+		kept = append(kept, opt)
+		if len(kept) == agentAIOptionMaxCount {
+			break
+		}
+	}
+	req.Options = kept
+}
+
 // extractAgentAIOptionBlocks 扫描 assistant 完整输出，提取所有 aliang-options 块。
-// 无效 JSON 或 options 为空的块被静默丢弃。
+// 无效 JSON 或 options 为空的块丢弃（JSON 解析失败不再静默：打 Warn 日志，
+// 否则模型写坏围栏=用户什么都看不到且无迹可查）。
 func extractAgentAIOptionBlocks(output string) []agentAIOptionRequest {
 	matches := aliangOptionsBlockRe.FindAllStringSubmatch(output, -1)
 	out := make([]agentAIOptionRequest, 0, len(matches))
 	for _, m := range matches {
 		var req agentAIOptionRequest
 		if err := json.Unmarshal([]byte(m[1]), &req); err != nil {
+			logger.Warn(fmt.Sprintf("[ai.option] aliang-options block dropped: bad JSON (%d bytes): %v", len(m[1]), err))
 			continue
 		}
+		normalizeAgentAIOptionRequest(&req)
 		if len(req.Options) == 0 {
 			continue
 		}
@@ -676,17 +717,23 @@ func extractAgentAIOptionBlocks(output string) []agentAIOptionRequest {
 
 // buildAgentAIOptionFollowup 把用户的选择拼成下一轮的 user prompt。
 // Claude 经 --resume 续接时，这段文本作为新的用户输入。
+// v2：选项带 response（模型预写的确认文案）时优先原样回填，语义最强；
+// 否则退回 label（description）旧形态。
 func buildAgentAIOptionFollowup(req *agentAIOptionRequest, selected []string, custom string) string {
 	var b strings.Builder
 	b.WriteString("用户已在上述方案中做出选择，请据此继续，不要再重复列出方案：\n")
-	labelByID := make(map[string]agentAIOptionChoice, len(req.Options))
+	choiceByID := make(map[string]agentAIOptionChoice, len(req.Options))
 	for _, opt := range req.Options {
-		labelByID[opt.ID] = opt
+		choiceByID[opt.ID] = opt
 	}
 	for _, id := range selected {
-		opt, ok := labelByID[id]
+		opt, ok := choiceByID[id]
 		if !ok {
 			b.WriteString("- 选择了未知选项 id=" + id + "\n")
+			continue
+		}
+		if resp := strings.TrimSpace(opt.Response); resp != "" {
+			b.WriteString("- 选择了：" + resp + "\n")
 			continue
 		}
 		b.WriteString("- 选择了：" + opt.Label)
@@ -1007,8 +1054,11 @@ const (
 )
 
 // agentAIOptionSystemPrompt 引导 Claude 在需要用户多方案抉择时，输出结构化 aliang-options 块，
-// 以便 agent 提取并发 ai.option.request。仅在 Claude 路径注入。
-const agentAIOptionSystemPrompt = `When you have multiple viable approaches/options and the best choice depends on user preference, you MUST let the user choose instead of deciding for them. Present options using a fenced code block with language "aliang-options" containing one JSON object on its own line, shaped exactly: {"title":string,"options":[{"id":string,"label":string,"description":string}],"allow_custom":bool,"multi":bool}. Keep "id" short stable slugs. After the block, stop and wait for the user's choice in the next message; do not proceed on assumption.`
+// 以便 agent 提取并发 ai.option.request。claude(--append-system-prompt)与
+// agentcore(拼进 system)两路注入；codex 不注入（走原生 requestUserInput 映射）。
+// v2 契约：新增 header/summary/response/previews 全部可选；围栏换行格式是硬规则
+// （JSON 粘着标签行/收尾行会被提取正则静默丢弃），必须向模型言明。
+const agentAIOptionSystemPrompt = `When you have multiple viable approaches/options and the best choice depends on user preference, you MUST let the user choose instead of deciding for them. Present them as a fenced code block with language tag aliang-options, formatted exactly: the tag line contains ONLY the three backticks followed by aliang-options and ends with a newline, the next line is exactly one JSON object and nothing else, and the closing three backticks are alone on their own line — a JSON glued to the tag line or to the closing fence, or prose right after the JSON, is silently discarded. JSON shape: {"v":2,"title":string,"header":string,"summary":string,"options":[{"id":string,"label":string,"description":string,"response":string,"previews":[string]}],"allow_custom":bool,"multi":bool}. Only "title" and "options" are required; every other field is optional — omit anything you don't need. Rules: "id" is a short stable ASCII slug (letters, digits, hyphen, underscore; max 48 chars; unique per option); never reuse the label as the id. "label" is what the user reads — plain text only, no markdown syntax and no backticks (emoji/kaomoji are fine), aim under 60 chars. "description" is one short sentence. "response" (write only when it helps) is the receipt text returned as the user's answer when that option is picked — phrase it as a confirmation of that choice. "previews" (write only when it helps, e.g. commands or a short code sketch) is up to 8 one-line strings shown under the option. "header" is a category tag of 16 chars or fewer shown above the title. "summary" is one or two sentences of context. Maximum 8 options. Set "multi":true only when the user should pick several options at once — their picks are sent back together as one answer. Set "allow_custom":true when a free-text answer makes sense. After the fence, stop and wait for the user's choice in the next message; do not proceed on assumption and do not list the options again as prose.`
 
 func newAgentAIManager() *agentAIManager {
 	m := &agentAIManager{
@@ -3717,6 +3767,9 @@ func (m *agentAIManager) emitOptionRequest(run agentAIRun, writeJSON agentTermin
 		"message_id":   req.MessageID,
 		"option_id":    req.ID,
 		"title":        req.Title,
+		"header":       req.Header,
+		"summary":      req.Summary,
+		"v":            req.Version,
 		"options":      req.Options,
 		"allow_custom": req.AllowCustom,
 		"multi":        req.Multi,
