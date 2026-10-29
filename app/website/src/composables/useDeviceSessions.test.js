@@ -105,6 +105,25 @@ describe('useDeviceSessions', () => {
     expect(again.deviceSession).toBe(refreshed);
   });
 
+  it('resumeConsumed 后清单刷新不再复活 resume 字段（仅首次 create 语义）', async () => {
+    getAgentSessions.mockResolvedValue({ sessions: [CLAUDE_ENTRY] });
+    const ds = useDeviceSessions();
+    await ds.loadDeviceSessions();
+    const shell = ds.shellForEntry(CLAUDE_ENTRY);
+    expect(shell.resumeSessionId).toBe('native9');
+
+    // 模拟 created ack 消费（ChatPage 侧：置位 + delete）
+    shell.resumeConsumed = true;
+    delete shell.resumeSessionId;
+    delete shell.resumeProjectPath;
+
+    const again = ds.shellForEntry({ ...CLAUDE_ENTRY, project_path: '/home/a/term-new' });
+    expect(again).toBe(shell);
+    expect('resumeSessionId' in again).toBe(false); // 刷新不复活
+    expect('resumeProjectPath' in again).toBe(false);
+    expect(again.projectPath).toBe('/home/a/term-new'); // 其余清单字段照常刷新
+  });
+
   it('网络错 → available=false；200 空列表 → available=true（core 代理空表歧义已接受）', async () => {
     getAgentSessions.mockRejectedValue(new Error('boom'));
     const ds = useDeviceSessions();

@@ -308,6 +308,10 @@
                 {{ approval.status === 'responding' ? t('chat_approvalResponding') : t('chat_approvalPending') }}
               </span>
             </div>
+            <p v-if="approval.sourceLabel" class="mt-1 text-xs font-medium text-amber-700 dark:text-amber-200">
+              <!-- TODO(i18n-task6): chat_approvalFromSession -->
+              {{ approval.sourceLabel }}
+            </p>
             <p v-if="approval.reason" class="mt-1 whitespace-pre-wrap text-xs text-amber-800 dark:text-amber-200">
               {{ approval.reason }}
             </p>
@@ -1043,11 +1047,12 @@ function handleDeviceSnapshot(e) {
     if (activeId.value === shell.id) scrollToBottom();
   }
 
-  // pending_approvals → 逐条走既有 upsertApproval；快照行无 status，补 pending
-  // 默认（upsertApproval 只认 pending/responding）。
+  // pending_approvals → 逐条走既有 upsertApproval；快照行缺 status 时补
+  // pending 默认（展开顺序：item 在前——行自带 status 时不得被默认值反客为主，
+  // upsertApproval 只认 pending/responding，其余 status 走收卡）。
   for (const item of Array.isArray(e.pending_approvals) ? e.pending_approvals : []) {
     if (!item || typeof item !== 'object') continue;
-    upsertApproval(shell, { status: 'pending', ...item });
+    upsertApproval(shell, { ...item, status: item.status || 'pending' });
   }
 
   // status → 壳 running 标记（侧栏状态点消费）
@@ -1345,6 +1350,9 @@ function upsertApproval(conv, event) {
     provider: event.provider || existing?.provider || '',
     kind: event.kind || existing?.kind || 'tool',
     status: existing?.status === 'responding' ? 'responding' : 'pending',
+    // ③兜底挂活跃会话时的来源标签（「来自会话 xxx」）：挂对壳/本端会话的卡
+    // 无此字段。
+    sourceLabel: event.sourceLabel || existing?.sourceLabel || '',
     title: event.title || existing?.title || '',
     reason: event.reason || existing?.reason || '',
     command: event.command || existing?.command || '',
@@ -1482,6 +1490,24 @@ function handleAIEvent(e) {
   // 让流仍能渲染，绝不能成为回显/dirLocked 的写入目标（会话已删或他页会话的
   // 迟到 create 回执会污染当前活跃会话）。
   const matchedById = !!conv;
+  // 审批族帧（request——resolved 是同型 request 带 status——与 cancelled）未按
+  // aiSessionId 命中时的分源兜底（阶段 2 计划钉死）：
+  // ②设备壳三键匹配（entry.id/source_session_id/managed_conversation_id）→
+  //   挂该壳，**不切 activeId**（卡在壳上，用户点开即见）；
+  // ③仍无命中 → 挂活跃会话（现状 fallback），审批卡带「来自会话 <id 前 8>」
+  //   来源标签。非审批帧维持现状 fallback。
+  const isApprovalFamily = e.type === 'ai.approval.request' || e.type === 'ai.approval.cancelled';
+  let routedToShell = false;
+  if (!conv && isApprovalFamily && e.session_id) {
+    const shell = findDeviceShellBySessionId(e.session_id);
+    if (shell) {
+      conv = shell;
+      routedToShell = true;
+    } else if (activeConversation.value) {
+      // TODO(i18n-task6): chat_approvalFromSession 前缀键
+      e.sourceLabel = `来自会话 ${String(e.session_id).slice(0, 8)}`;
+    }
+  }
   // Fallback: a run started from this page always targets the active
   // conversation's live assistant bubble. If the session id didn't match
   // (e.g. reloaded localStorage holding a stale id, or an id mismatch), route
@@ -1500,8 +1526,9 @@ function handleAIEvent(e) {
   // omitted to keep the log readable.
   console.log('[aliang-chat] ai event', e.type, 'session=', e.session_id, 'conv=', conv.id);
 
-  // 喂狗：任何到达会话归属判定之后的帧都算 AI 活动，重置无活动计时。
-  if (idleWatchdogTimer) armIdleWatchdog(conv);
+  // 喂狗：任何到达会话归属判定之后的帧都算 AI 活动，重置无活动计时。审批族
+  // 帧路由到设备壳时例外——看门狗目标是活跃 run 的会话，不能被无关帧换靶。
+  if (idleWatchdogTimer && !routedToShell) armIdleWatchdog(conv);
 
   let persist = false;
   switch (e.type) {
@@ -1520,6 +1547,13 @@ function handleAIEvent(e) {
       if (typeof e.project_path === 'string' && e.project_path) conv.projectPath = e.project_path;
       if (typeof e.model === 'string') conv.model = e.model;
       if (typeof e.effort === 'string') conv.effort = e.effort;
+      // resume 字段仅首次 create（阶段 2 计划钉死）：ack 即消费——此后每条
+      // 消息前的 create 重发与设置条同步都不再携带，防陈旧 resume 压过用户
+      // 纠正后的路径（服务端 binding 守卫目前掩盖，但契约在本端收口）。
+      // resumeConsumed 同时约束 composable 的清单刷新路径不得复活字段。
+      conv.resumeConsumed = true;
+      delete conv.resumeSessionId;
+      delete conv.resumeProjectPath;
       if (pending) pending('created');
       persist = true;
       break;

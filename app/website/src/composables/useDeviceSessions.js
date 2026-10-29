@@ -117,7 +117,9 @@ export function useDeviceSessions() {
     cached.deviceSession = entry;
     cached.running = entry.status === 'running';
     cached.updatedAt = Date.parse(entry.updated_at || '') || cached.updatedAt || 0;
-    if (isTerminalPrefixedSessionId(entry.id)) {
+    // resume 字段仅首次 create：created ack 消费后置 resumeConsumed（ChatPage
+    // 侧），清单刷新不得复活——否则每次刷新都会把刚删掉的 resume 加回来。
+    if (isTerminalPrefixedSessionId(entry.id) && !cached.resumeConsumed) {
       cached.resumeSessionId = deviceResumeSessionId(entry);
       cached.resumeProjectPath = entry.project_path || '';
     }
