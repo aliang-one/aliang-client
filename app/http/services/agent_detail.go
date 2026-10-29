@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -314,10 +315,33 @@ func agentVibeSessionMatches(session models.AgentVibeSession, sessionID string, 
 	ids := []string{session.ID, strings.TrimPrefix(session.ID, "codex_"), strings.TrimPrefix(session.ID, "claude_")}
 	for _, id := range ids {
 		if id != "" && (id == sessionID || id == sourceSessionID) {
-			return projectPath == "" || cleanAgentProjectPath(session.ProjectPath) == projectPath
+			return agentVibeProjectPathMatches(projectPath, session.ProjectPath)
 		}
 	}
 	return false
+}
+
+// agentVibeProjectPathMatches 比较 server 下发的 project_path 与会话自报路径。
+// 双侧先经 cleanAgentProjectPath 归一化(TrimSpace/展开 ~/Abs/Clean,尾分隔符
+// 一并消除);darwin/windows 默认文件系统大小写不敏感,再按 strings.EqualFold
+// 折叠——server 落库路径与转录 jsonl cwd 大小写/归一化不一致曾把会话误判为
+// "vibe session not found"(2026-10-29 11:03Z 生产实锤)。requestPath 为空
+// 表示服务端未携带该字段:沿用既有行为不设此门。不做 basename 模糊匹配。
+func agentVibeProjectPathMatches(requestPath, sessionPath string) bool {
+	if strings.TrimSpace(requestPath) == "" {
+		return true
+	}
+	if strings.TrimSpace(sessionPath) == "" {
+		return false
+	}
+	requestPath = cleanAgentProjectPath(requestPath)
+	sessionPath = cleanAgentProjectPath(sessionPath)
+	switch runtime.GOOS {
+	case "darwin", "windows":
+		return strings.EqualFold(requestPath, sessionPath)
+	default:
+		return requestPath == sessionPath
+	}
 }
 
 func agentFileListPayload(msg map[string]interface{}) map[string]interface{} {
