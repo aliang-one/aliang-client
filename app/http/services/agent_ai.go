@@ -4813,6 +4813,12 @@ const (
 	// print the accepted levels). The pass emitted no assistant output; the
 	// caller should clamp the effort to a listed level and retry once.
 	agentAIRunEffortRejected
+	// agentAIRunSessionIDInUse means the CLI refused to START a new session
+	// with the caller-provided --session-id because a transcript with that id
+	// already exists on disk (the identity was consumed by an earlier run).
+	// The pass emitted no assistant output; the caller should release the
+	// reserved binding, drop --session-id, and retry fresh once.
+	agentAIRunSessionIDInUse
 )
 
 type agentAIRunOutcome int
@@ -4877,6 +4883,14 @@ func (m *agentAIManager) runCLI(ctx context.Context, run agentAIRun, writeJSON a
 		}
 	}
 	outcome, rej := m.runCLIPass(ctx, run, writeJSON, false)
+	if outcome == agentAIRunSessionIDInUse && ctx.Err() == nil {
+		// 自愈：reserved 身份已被消费（jsonl 在盘），释放绑定并去掉
+		// --session-id，让 CLI 自铸新 id 重跑一次（与 resume-missing 的清+重试
+		// 同构）。单次封顶：重跑时 newSessionID 为空，分类器不可能再命中。
+		m.releaseReservedBinding(run.sessionID, run.reservedNativeSessionID)
+		run.reservedNativeSessionID = ""
+		outcome, rej = m.runCLIPass(ctx, run, writeJSON, false)
+	}
 	m.retryAfterEffortRejected(ctx, run, writeJSON, outcome, rej, false)
 }
 
@@ -6584,6 +6598,20 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 		resumeID = ""
 	}
 
+	// spawn 前的第二道 revive 保险（runStart 入口是第一道）：真 fresh
+	// （resumeSessionID 为空）且 reserved 身份的 jsonl 已落盘时，直接升级
+	// --resume 复用既有历史，而不是撞 "Session ID already in use"。weld 路径
+	// （resume 已被判不可解）不翻转，避免把已知打不开的 resume 再翻回去。
+	if !allowResume && newSessionID != "" && strings.TrimSpace(run.resumeSessionID) == "" &&
+		(providersEquivalent(run.provider, "claudecode") || strings.EqualFold(run.provider, "auto")) {
+		if jsonl := ccPeerSessionJSONL(externalTUIHome(), newSessionID); jsonl != "" {
+			logger.Info(fmt.Sprintf("ai.run.resume.revive: session=%s runSeq=%d reserved id %q jsonl 已落盘(%s)，fresh 自动升级 --resume", run.sessionID, run.runSeq, newSessionID, jsonl))
+			resumeID = newSessionID
+			newSessionID = ""
+			allowResume = true
+		}
+	}
+
 	var tool *agentAITool
 	var err error
 	if run.readOnly || len(run.goalIdentity) > 0 {
@@ -6902,6 +6930,13 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 		if allowResume && isAgentAIResumeMissing(stderrBuf.String()) {
 			return agentAIRunResumeMissing, agentAIEffortRejection{}
 		}
+		// --session-id 撞已落盘 jsonl（CLI 启动期身份校验拒绝，无 assistant 输
+		// 出）：上报专用 outcome，让调用方释放 reserved 绑定、去掉 --session-id
+		// 重跑一次 fresh，而不是把可自愈的失败直接抛给用户（2026-10-29
+		// already-in-use 事故的兜底）。
+		if !allowResume && newSessionID != "" && isAgentAISessionIDInUse(stderrBuf.String()) {
+			return agentAIRunSessionIDInUse, agentAIEffortRejection{}
+		}
 		// CLI 在参数校验阶段拒绝了 --effort:极老世代连 flag 都没有(unknown
 		// option),旧世代硬拒值并枚举合法清单。此时不可能有 assistant 输出,
 		// 上报 agentAIRunEffortRejected 让调用方去 flag/按清单钳制后重试,而不是
@@ -6984,6 +7019,15 @@ func isAgentAIResumeMissing(stderr string) bool {
 	mentionsSession := strings.Contains(lower, "session") || strings.Contains(lower, "thread") || strings.Contains(lower, "rollout")
 	missing := strings.Contains(lower, "not found") || strings.Contains(lower, "does not exist") || strings.Contains(lower, "no rollout")
 	return mentionsSession && missing
+}
+
+// isAgentAISessionIDInUse 识别 claude CLI 对 --session-id 的「身份占用」拒绝：
+// 该 id 的 transcript jsonl 已存在（上一轮同 id run 已落盘）时，CLI 拒绝以该
+// id 开新会话并 exit 1。与 isAgentAIResumeMissing 同族，是它的镜像问题
+// （resume 打不开 vs fresh 身份被占）。
+func isAgentAISessionIDInUse(stderr string) bool {
+	lower := strings.ToLower(stderr)
+	return strings.Contains(lower, "session id") && strings.Contains(lower, "already in use")
 }
 
 // captureAgentAIStderr reads everything from reader, storing the first cap
