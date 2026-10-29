@@ -57,6 +57,13 @@ export function isDirectoryLocked(conv) {
   return !!(conv && typeof conv === 'object' && conv.dirLocked);
 }
 
+// 终端原生会话的 id 前缀约定（claude_<nativeId> / codex_<id>）。带前缀的
+// 条目本端没有可直连的 journal，续聊必须走「新建托管会话 + resume」。全仓
+// 唯一定义（阶段 2 评审收敛）：useDeviceSessions / ChatPage 均从这里引用。
+export function isTerminalPrefixedSessionId(id) {
+  return typeof id === 'string' && (id.startsWith('claude_') || id.startsWith('codex_'));
+}
+
 // agentcore 上下文喂入（阶段 2 Task 4）：裸 id 设备会话首条续聊的 create 要带
 // journal 转录——否则 create 先注册空 history 会话，message() 的 journal 读回
 // 被跳过，续聊静默变成新会话。后端 remoteAgentAIHistory（agent_ai.go）按
@@ -64,15 +71,13 @@ export function isDirectoryLocked(conv) {
 // 设备壳（claude_/codex_ 前缀壳走 resume，由 CLI 自己装回原生历史，再喂转录
 // 会重复）、转录非空、且尚未 ack 消费（deviceTranscriptSent 由 ChatPage 在
 // created ack 后置位——resendCreate/确认门重发在 ack 前同样携带）。脏输入
-// 安全返回 null。本文件保持零依赖：前缀判定与 useDeviceSessions.isTerminal
-// PrefixedSessionId 同一条规则的内联副本（改动须两处同步）。
+// 安全返回 null。
 export function deviceTranscriptForCreate(conv) {
   if (!conv || typeof conv !== 'object') return null;
   const entry = conv.deviceSession;
   if (!entry || typeof entry !== 'object') return null;
   if (conv.provider !== 'agentcore') return null;
-  const rawId = typeof entry.id === 'string' ? entry.id : '';
-  if (!rawId || rawId.startsWith('claude_') || rawId.startsWith('codex_')) return null;
+  if (isTerminalPrefixedSessionId(entry.id) || !entry.id) return null;
   if (conv.deviceTranscriptSent) return null;
   const rows = Array.isArray(conv.deviceTranscript) ? conv.deviceTranscript : [];
   if (!rows.length) return null;

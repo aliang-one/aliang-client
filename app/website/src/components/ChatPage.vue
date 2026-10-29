@@ -410,7 +410,8 @@
 
       <!-- Input -->
       <div v-if="activeId" class="border-t border-slate-200 p-4 dark:border-slate-700">
-        <!-- steer 阻断提示（Task 4）：设备壳 running 且无 managed_conversation_id，
+        <!-- steer 阻断提示（Task 4）：壳 running 且无可用 steer 目标
+             （claude_/codex_ 壳无 managed id；agentcore 裸 id 已回退 entry.id），
              插话不可能（不发帧、绝不引导重发为普通消息）——常驻说明而非提交后报错。 -->
         <div
           v-if="steerBlocked"
@@ -585,24 +586,34 @@ function isConversationRunning(conv) {
 
 const activeSessionRunning = computed(() => isConversationRunning(activeConversation.value));
 
-// steer 目标（阶段 2 计划钉死）：壳带 managed_conversation_id（清单 running
-// 绑定态带回）→ steer 该 id（真正的在跑回合）；设备壳无 managed id → 空
-// （绝不发帧，也绝不引导「重发为普通消息」——那会对同一原生转录并发第二个
-// CLI run）；本地自跑会话 → 自身 aiSessionId。
+// steer 目标（阶段 2 计划钉死 + 评审折叠项）：壳带 managed_conversation_id
+// （清单 running 绑定态带回）→ steer 该 id（真正的在跑回合）；agentcore 裸
+// id 壳无 managed id → 回退 entry.id（==托管通道会话 id，订阅/续聊同源，严格
+// 安全——消除清单刷新带回 managed id 前 ~2s 节流窗的误阻断）；claude_/codex_
+// 前缀壳无 managed id → 空（绝不发帧，也绝不引导「重发为普通消息」——那会对
+// 同一原生转录并发第二个 CLI run）；本地自跑会话 → 自身 aiSessionId。
 function steerTargetId(conv) {
   if (!conv) return '';
   if (conv.deviceSession) {
-    const managed = typeof conv.deviceSession.managed_conversation_id === 'string'
-      ? conv.deviceSession.managed_conversation_id.trim()
+    const entry = conv.deviceSession;
+    const managed = typeof entry.managed_conversation_id === 'string'
+      ? entry.managed_conversation_id.trim()
       : '';
-    return managed;
+    if (managed) return managed;
+    if (conv.provider === 'agentcore'
+      && !isTerminalPrefixedSessionId(entry.id)
+      && typeof entry.id === 'string' && entry.id) {
+      return entry.id;
+    }
+    return '';
   }
   return conv.aiSessionId || '';
 }
 
 const activeSteerTarget = computed(() => steerTargetId(activeConversation.value));
 
-// 设备壳 running 且无 managed id：插话不可能（不发帧）——输入区常驻提示。
+// 壳 running 且无 steer 目标（agentcore 裸 id 已回退 entry.id，只剩
+// claude_/codex_ 前缀壳等情形）：插话不可能（不发帧）——输入区常驻提示。
 const steerBlocked = computed(() =>
   activeSessionRunning.value
   && !!activeConversation.value?.deviceSession
@@ -641,6 +652,9 @@ function steerStatusLabel(item) {
       return '已送达'; // TODO(i18n-task6): chat_steerApplied
     case 'not_running':
       return '回合已结束，插话未生效'; // TODO(i18n-task6): chat_steerNotRunning
+    case 'unknown':
+      // 未知 result（含未来新增值如 held）：中性渲染，不误标失败（评审折叠项）
+      return `插话状态：${item?.result || '未知'}`; // TODO(i18n-task6): chat_steerUnknown
     default:
       return '插话失败'; // TODO(i18n-task6): chat_steerFailed
   }
@@ -948,6 +962,9 @@ function conversationForStorage(conv) {
   copy.approvals = [];
   // steer 轻量条是瞬态 UI：ack 状态不跨页持久（陈旧的「已受理」比没有更糟）
   copy.steerItems = [];
+  // deviceTranscript 不落盘（评审折叠项）：重开设备会话有 5 分钟 TTL+详情
+  // 分页重拉兜底，防大转录长期占 localStorage。
+  delete copy.deviceTranscript;
   return copy;
 }
 
@@ -1089,8 +1106,11 @@ function applyDeviceTranscript(shell, transcript) {
   scrollToBottom();
 }
 
-// 快照转录行（{role,text,message_id?,ts?}）→ 壳 messages，语义同上但字段
-// 名不同（快照用 text，详情用 content）。
+// 快照转录行（{role,text,message_id?,ts?}）→ 壳 messages（**仅展示流**），
+// 字段名与详情不同（快照用 text，详情用 content）。职责分离（阶段 2 评审
+// 钉死）：快照是有损切片（200 行/4000 rune）且晚到会覆盖屏幕，但续聊喂入的
+// deviceTranscript 必须保持详情分页拉全的版本——快照绝不写 deviceTranscript，
+// 否则截断尾巴会在 create 时顶掉全量上下文（喂入即全部上下文）。
 function applyDeviceSnapshotTranscript(shell, rows) {
   const list = Array.isArray(rows) ? rows : [];
   const renderable = list.filter(m => m && (m.role === 'user' || m.role === 'assistant')
@@ -1101,7 +1121,6 @@ function applyDeviceSnapshotTranscript(shell, rows) {
     status: 'done',
     ts: Date.parse(m.ts) || now(),
   }));
-  shell.deviceTranscript = renderable.map(m => ({ role: m.role, content: m.text }));
 }
 
 // 订阅判定（钉死）：仅 agentcore 且裸 conversation id（journal 源才有转录
@@ -1112,8 +1131,16 @@ function deviceSessionSubscribable(shell) {
     && !isTerminalPrefixedSessionId(shell.deviceSession.id);
 }
 
-// 打开设备会话：壳复用（composable 缓存的稳定对象）→ 拉详情装载转录 →
+// 打开设备会话：壳复用（composable 缓存的稳定对象）→ 分页拉全详情转录 →
 // agentcore 裸 id 发订阅等快照。404/网络错 → 空转录+错误条，不阻断续聊输入。
+
+// 详情转录分页参数（阶段 2 评审）：create 时的 transcript 喂入是续聊上下文
+// 的全部来源（载荷自带历史时后端跳过 journal 读回），默认 limit=40 的截断
+// 尾巴会让续聊静默丢早期上下文——必须拉全。单页 100 行、最多 5 页（500 行
+// 封顶）：防异常服务端拖死打开流程；超出封顶接受截断，仍远好于 40 行尾巴。
+const DEVICE_DETAIL_PAGE_LIMIT = 100;
+const DEVICE_DETAIL_MAX_PAGES = 5;
+
 async function openDeviceSession(shell) {
   const entry = shell?.deviceSession;
   if (!entry || typeof entry.id !== 'string' || !entry.id) return;
@@ -1128,14 +1155,38 @@ async function openDeviceSession(shell) {
   saveToStorage();
   nextTick(() => scrollToBottom());
 
-  // 详情装载：5 分钟内重复打开不重拉（之后的更新由快照覆盖）
+  // 详情装载：5 分钟内重复打开不重拉（之后的更新由快照覆盖**展示流**，
+  // deviceTranscript 喂入流仍以这里的分页全量为准——见 applyDeviceSnapshotTranscript）
   if (Date.now() - (live.deviceLoadedAt || 0) > DEVICE_SESSION_DETAIL_TTL_MS) {
-    try {
-      const detail = await getAgentSessionDetail(entry.id);
-      applyDeviceTranscript(live, detail?.transcript);
-      live.deviceLoadedAt = now();
-      live.deviceLoadError = '';
-    } catch (_) {
+    // 翻页方向是「向更早」（before = 上一页最旧行的 message_id）：每页新行
+    // 前插，最终保持时间正序。中途页失败降级为已取到的部分转录（console
+    // 留痕，不亮错误条）；首页失败维持既有「空转录+错误条」。
+    const pageRows = [];
+    let before = '';
+    let pageError = null;
+    for (let page = 0; page < DEVICE_DETAIL_MAX_PAGES; page++) {
+      try {
+        const detail = await getAgentSessionDetail(entry.id, {
+          limit: DEVICE_DETAIL_PAGE_LIMIT,
+          before: before || undefined,
+        });
+        const rows = Array.isArray(detail?.transcript) ? detail.transcript : [];
+        pageRows.unshift(rows);
+        live.deviceLoadedAt = now();
+        live.deviceLoadError = '';
+        const pg = detail?.transcript_page;
+        if (!pg?.has_more || !pg?.next_before_message_id || !rows.length) break;
+        before = String(pg.next_before_message_id);
+      } catch (err) {
+        pageError = err;
+        break;
+      }
+    }
+    const transcript = pageRows.flat();
+    if (transcript.length) {
+      if (pageError) console.warn('[aliang-chat] device transcript partial pages', pageError);
+      applyDeviceTranscript(live, transcript);
+    } else if (pageError) {
       // 空转录+错误条：详情缺席不阻断（本地会话池里壳已在，输入照常）
       live.deviceLoadError = '会话详情加载失败，暂显示空会话'; // TODO(i18n-task6): chat_deviceSessionLoadFailed
     }
@@ -1614,9 +1665,9 @@ function agentRunNoticeText(code) {
 // --- steer 分流（跨端统一阶段 2 Task 4） ---
 
 // 运行中回合的旁路注入：不插 user 气泡、不走 create 确认门、不武装看门狗、
-// 不动 sending——轻量条自己承载状态（sent → ack 落定）。目标为空（设备壳
-// running 且无 managed id）时静默返回：阻断提示条已常驻输入区，绝不做
-// 「重发为普通消息」引导（会对同一原生转录并发第二个 CLI run）。
+// 不动 sending——轻量条自己承载状态（sent → ack 落定）。目标为空（claude_/
+// codex_ 壳 running 且无 managed id）时静默返回：阻断提示条已常驻输入区，
+// 绝不做「重发为普通消息」引导（会对同一原生转录并发第二个 CLI run）。
 async function submitSteer(conv, text) {
   const target = steerTargetId(conv);
   if (!target) return;
@@ -1656,8 +1707,9 @@ function handleSteerAck(e) {
   console.debug('[chat] steer ack has no matching item, dropped', mid);
 }
 
-// queued/applied/not_running 是契约枚举；error/unsupported 及未知 result
-// （含未来新增值）一律按失败渲染 + detail，不静默。
+// queued/applied/not_running 落各自状态；error/unsupported 是契约内失败值
+// （失败渲染 + detail）；其余未知 result（含未来新增值）中性渲染 `插话状态：x`，
+// 不误标失败（评审折叠项）。
 function applySteerAck(item, e) {
   const result = String(e.result || '');
   item.result = result;
@@ -1666,8 +1718,13 @@ function applySteerAck(item, e) {
     item.detail = '';
     return;
   }
-  item.status = 'failed';
-  item.detail = String(e.error || e.code || result || 'unknown');
+  if (result === 'error' || result === 'unsupported') {
+    item.status = 'failed';
+    item.detail = String(e.error || e.code || result);
+    return;
+  }
+  item.status = 'unknown';
+  item.detail = '';
 }
 
 function handleAIEvent(e) {
@@ -1737,6 +1794,13 @@ function handleAIEvent(e) {
       // TODO(i18n-task6): chat_approvalFromSession 前缀键
       e.sourceLabel = `来自会话 ${String(e.session_id).slice(0, 8)}`;
     }
+  }
+  // run.notice 走活跃兜底（③）时同样带来源标签（评审折叠项）：系统条是单行
+  // 文案，前缀由各 case 拼进内容。notice 不做壳三键路由（session_id 即
+  // manager 会话 id，① 直连已覆盖，壳路由会放大误挂面）。
+  if (!conv && e.type === 'ai.run.notice' && e.session_id && activeConversation.value) {
+    // TODO(i18n-task6): chat_approvalFromSession 前缀键
+    e.sourceLabel = `来自会话 ${String(e.session_id).slice(0, 8)}`;
   }
   // Fallback: a run started from this page always targets the active
   // conversation's live assistant bubble. If the session id didn't match
@@ -1818,19 +1882,20 @@ function handleAIEvent(e) {
     case 'ai.approval.cancelled': {
       // 未结束回合的精确清卡（区别于 done/error 路径的 clearApprovalsForSession
       // 粗暴清空）：逐个作废 + 系统提示条挂对应会话（审批族链已路由到设备壳/
-      // 活跃兜底）。
+      // 活跃兜底）。③ 兜底时带「来自会话 X」前缀（评审折叠项，单行文案内联）。
       const ids = Array.isArray(e.approval_ids) ? e.approval_ids : [];
       for (const id of ids) {
         const key = approvalKeyFromValues(e.session_id, id);
         handledApprovalIds.add(key);
         removeApproval(conv, key);
       }
+      // TODO(i18n-task6): chat_approvalCancelled
+      const cancelledText = e.reason ? `审批已被取消（${e.reason}）` : '审批已被取消';
       conv.messages.push({
         role: 'assistant',
         kind: 'system',
         note: 'approval_cancelled',
-        // TODO(i18n-task6): chat_approvalCancelled
-        content: e.reason ? `审批已被取消（${e.reason}）` : '审批已被取消',
+        content: e.sourceLabel ? `${e.sourceLabel}：${cancelledText}` : cancelledText,
         status: 'done',
         ts: now(),
       });
@@ -1841,13 +1906,14 @@ function handleAIEvent(e) {
     case 'ai.run.notice': {
       // 信息性帧：resume/历史降级的事实说明，不阻断输入、不进错误气泡。
       // 未知 code 忽略（协议向后兼容——服务端新增 code 不炸旧前端）。
+      // ③ 兜底时带「来自会话 X」前缀（评审折叠项）。
       const noticeText = agentRunNoticeText(e.code);
       if (noticeText) {
         conv.messages.push({
           role: 'assistant',
           kind: 'system',
           note: 'run_notice',
-          content: noticeText,
+          content: e.sourceLabel ? `${e.sourceLabel}：${noticeText}` : noticeText,
           status: 'done',
           ts: now(),
         });

@@ -79,9 +79,11 @@ const SNAPSHOT_PAYLOAD = {
 
 // detail404：详情端点回 404（必须走 openChat 的同一 route 表——Playwright
 // 先注册者优先，事后 addRoute 压不过 openChat 的通配兜底）。sessions：用例
-// 专属清单（Task 4/5 的分流用例需要 running 带.managed_conversation_id、
-// running 无 managed id、idle agentcore 等形态，不动共享默认清单）。
-async function openChat(page, { detail404 = false, sessions = SESSIONS } = {}) {
+// 专属清单（分流用例需要 running 带.managed_conversation_id、裸 id running、
+// idle agentcore 等形态，不动共享默认清单）。detailPages：按调用顺序弹出的
+// 详情分页 mock（rows + transcript_page），验证分页拉全（评审 must-fix）；
+// detailLog：可选数组，按序记录每次详情请求的 {limit, before}。
+async function openChat(page, { detail404 = false, sessions = SESSIONS, detailPages = null, detailLog = null } = {}) {
   await page.addInitScript(WS_STUB);
   await page.addInitScript(() => localStorage.setItem('alianggate.onboarding.v2', 'completed'));
   await page.route('**/api/**', async (route) => {
@@ -103,6 +105,15 @@ async function openChat(page, { detail404 = false, sessions = SESSIONS } = {}) {
     if (url.pathname === '/api/agent/session') {
       if (detail404) {
         await route.fulfill({ status: 404, contentType: 'application/json', body: JSON.stringify({ code: 404, msg: 'not found' }) });
+        return;
+      }
+      if (detailPages) {
+        if (detailLog) detailLog.push({ limit: url.searchParams.get('limit'), before: url.searchParams.get('before') });
+        const nextPage = detailPages.length ? detailPages.shift() : { rows: [], page: { has_more: false } };
+        await route.fulfill({
+          contentType: 'application/json',
+          body: JSON.stringify({ code: 0, data: { id: url.searchParams.get('id'), transcript: nextPage.rows, transcript_page: nextPage.page } }),
+        });
         return;
       }
       await route.fulfill({
@@ -189,7 +200,8 @@ test('详情 404：错误条可见，空态仍可输入，订阅照发', async (
   await openChat(page, { detail404: true });
   await page.getByText('手机发起的会话').click();
   await expect(page.getByTestId('device-session-load-error')).toBeVisible();
-  const input = page.getByPlaceholder(/输入消息|Type a message/);
+  // running agentcore 裸 id → 占位符切插话语义（评审折叠项：回退 entry.id 可插话）
+  const input = page.getByPlaceholder(/输入消息|运行中|Type a message/);
   await expect(input).toBeEnabled();
   await input.fill('续聊草稿');
   await expect(input).toHaveValue('续聊草稿');
@@ -290,12 +302,28 @@ test('running 设备壳（managed_conversation_id）提交 → ai.steer 目标�
   await expect(page.getByTestId('chat-steer-status')).toHaveText(/已受理/);
 });
 
-test('running 设备壳无 managed id：内联提示常驻、提交零帧、输入保留', async ({ page }) => {
+test('running agentcore 裸 id 无 managed id：steer 回退 entry.id，不误阻断', async ({ page }) => {
   const sessions = [
-    { id: 'conv-nomgd', provider: 'agentcore', title: '无绑定运行', status: 'running', origin: 'phone', project_path: '/p/nm', updated_at: NOW_ISO },
+    { id: 'conv-bare', provider: 'agentcore', title: '裸 id 运行', status: 'running', origin: 'phone', project_path: '/p/bare', updated_at: NOW_ISO },
   ];
   await openChat(page, { sessions });
-  await page.getByText('无绑定运行').click();
+  await page.getByText('裸 id 运行').click();
+  // 无阻断提示：entry.id ==托管通道会话 id（订阅/续聊同源），可直连 steer
+  await expect(page.getByTestId('chat-steer-blocked-hint')).toHaveCount(0);
+  const input = page.getByPlaceholder(/输入消息|运行中|Type a message/);
+  await input.fill('裸 id 插话');
+  await page.keyboard.press('Enter');
+  await expect.poll(async () => page.evaluate(() =>
+    window.__aiFrames.some(f => f.type === 'ai.steer' && f.session_id === 'conv-bare')
+  )).toBe(true);
+});
+
+test('running claude_ 壳无 managed id：内联提示常驻、提交零帧、输入保留', async ({ page }) => {
+  const sessions = [
+    { id: 'claude_nobind', provider: 'claude', title: '无绑定终端运行', status: 'running', origin: '', project_path: '/p/nb', updated_at: NOW_ISO },
+  ];
+  await openChat(page, { sessions });
+  await page.getByText('无绑定终端运行').click();
   await expect(page.getByTestId('chat-steer-blocked-hint')).toBeVisible();
   const input = page.getByPlaceholder(/输入消息|Type a message/);
   await input.fill('试试插话');
@@ -343,6 +371,70 @@ test('idle agentcore 壳首条续聊：create 帧带 transcript，created ack �
   expect('transcript' in later[later.length - 1]).toBe(false); // ack 后一次性消费
 });
 
+test('journal 超详情默认尾巴：详情分页拉全，create 帧的 transcript 为全量（评审 must-fix）', async ({ page }) => {
+  // 首页 = 最新 40 行（m41..m80，模拟默认尾巴形态），has_more → before=m41
+  // 续拉更早 40 行（m1..m40）；create 喂入必须 80 行全量且时间正序。
+  const oldest = Array.from({ length: 40 }, (_, i) => ({
+    id: `m${i + 1}`, role: i % 2 ? 'assistant' : 'user', content: `旧消息${i + 1}`, timestamp: NOW_ISO, index: i + 1,
+  }));
+  const newest = Array.from({ length: 40 }, (_, i) => ({
+    id: `m${i + 41}`, role: i % 2 ? 'assistant' : 'user', content: `新消息${i + 41}`, timestamp: NOW_ISO, index: i + 41,
+  }));
+  const detailPages = [
+    { rows: newest, page: { limit: 100, count: 40, has_more: true, next_before_message_id: 'm41' } },
+    { rows: oldest, page: { limit: 100, count: 80, has_more: false, next_before_message_id: '' } },
+  ];
+  const detailLog = [];
+  const sessions = [
+    { id: 'conv-big', provider: 'agentcore', title: '长会话', status: 'idle', origin: 'phone', project_path: '/p/big', updated_at: NOW_ISO },
+  ];
+  await openChat(page, { sessions, detailPages, detailLog });
+  await page.getByText('长会话').click();
+  await expect(page.getByText('旧消息1', { exact: true })).toBeVisible(); // 全量渲染（含最旧行）
+  // 续拉请求带 limit=100 + before=首页最旧行 id
+  await expect.poll(async () => detailLog.length).toBe(2);
+  expect(detailLog[0]).toEqual({ limit: '100', before: null });
+  expect(detailLog[1]).toEqual({ limit: '100', before: 'm41' });
+  const input = page.getByPlaceholder(/输入消息|Type a message/);
+  await input.fill('续一句');
+  await page.keyboard.press('Enter');
+  await expect.poll(async () => page.evaluate(() =>
+    window.__aiFrames.some(f => f.type === 'ai.session.create')
+  )).toBe(true);
+  const create = await page.evaluate(() => window.__aiFrames.find(f => f.type === 'ai.session.create'));
+  expect(create.transcript.length).toBe(80); // 全量而非 40 行尾巴
+  expect(create.transcript[0].content).toBe('旧消息1'); // 每页新行前插 → 时间正序
+  expect(create.transcript[79].content).toBe('新消息80');
+});
+
+test('快照只覆盖展示流，deviceTranscript 保持详情版（喂入即全部上下文）', async ({ page }) => {
+  const sessions = [
+    { id: 'conv-snap', provider: 'agentcore', title: '快照覆盖会话', status: 'idle', origin: 'phone', project_path: '/p/snap', updated_at: NOW_ISO },
+  ];
+  await openChat(page, { sessions });
+  // 快照切片只有 1 行（有损），详情转录有 2 行
+  await page.evaluate(payload => { window.__snapshot = payload; }, {
+    status: 'idle',
+    transcript: [{ role: 'user', text: '快照用户消息' }],
+  });
+  await page.getByText('快照覆盖会话').click();
+  // 展示流被快照覆盖（评审折叠项 b：职责分离后的既有行为）
+  await expect(page.getByText('快照用户消息')).toBeVisible();
+  await expect(page.getByText('详情用户消息')).toHaveCount(0);
+  const input = page.getByPlaceholder(/输入消息|Type a message/);
+  await input.fill('续一句');
+  await page.keyboard.press('Enter');
+  await expect.poll(async () => page.evaluate(() =>
+    window.__aiFrames.some(f => f.type === 'ai.session.create')
+  )).toBe(true);
+  const create = await page.evaluate(() => window.__aiFrames.find(f => f.type === 'ai.session.create'));
+  // 喂入 = 详情版本（快照切片不得顶掉 deviceTranscript）
+  expect(create.transcript).toEqual([
+    { role: 'user', content: '详情用户消息' },
+    { role: 'assistant', content: '详情助手消息' },
+  ]);
+});
+
 // --- Task 5：审批卡补齐 + notice ---
 
 test('pending 审批带 expires_at：倒计时徽标显示约 23 小时', async ({ page }) => {
@@ -370,7 +462,9 @@ test('ai.approval.cancelled：卡消失 + 提示条（含 reason）', async ({ p
     type: 'ai.approval.cancelled', session_id: 'ghost-555', approval_ids: ['ap-cx-1'], reason: 'run_cancelled',
   });
   await expect(page.getByText('echo cx')).toHaveCount(0); // 精确清卡
-  await expect(page.getByTestId('chat-approval-cancelled-note')).toHaveText(/审批已被取消（run_cancelled）/);
+  // ③ 活跃兜底 → 系统条带「来自会话 X」前缀（评审折叠项；slice(0,8)='ghost-55'）
+  await expect(page.getByTestId('chat-approval-cancelled-note'))
+    .toHaveText(/来自会话 ghost-55：审批已被取消（run_cancelled）/);
 });
 
 test('ai.run.notice resume_missing：提示条可见，不阻断输入', async ({ page }) => {

@@ -1,6 +1,14 @@
 import { ref } from 'vue';
 import { getAgentSessions } from '../services/agentApi';
-import { deviceSessionToConversation, normalizeDeviceProvider } from '../utils/chatSettings';
+import {
+  deviceSessionToConversation,
+  isTerminalPrefixedSessionId,
+  normalizeDeviceProvider,
+} from '../utils/chatSettings';
+
+// 前缀判定唯一定义在 chatSettings（阶段 2 评审收敛）；此处转发保持既有
+// import 面（ChatPage / 本 composable 测试）不动。
+export { isTerminalPrefixedSessionId };
 
 // 设备会话清单（跨端统一阶段 2）：ChatPage 侧栏「后端三源会话」的唯一数据
 // 入口。权威在后端（GET /api/agent/sessions），本 composable 不进
@@ -13,13 +21,6 @@ export const DEVICE_SESSIONS_REFRESH_THROTTLE_MS = 2000;
 // 打开设备会话后 5 分钟内重复点击不重拉详情（详情装载幂等，之后的转录更新
 // 由 ai.session.snapshot 覆盖）。
 export const DEVICE_SESSION_DETAIL_TTL_MS = 5 * 60 * 1000;
-
-// 终端原生会话的 id 前缀约定（claude_<nativeId> / codex_<id>）。带前缀的
-// 条目本端没有可直连的 journal，续聊必须走「新建托管会话 + resume」；
-// 裸 conversation id（agentcore/托管）则可被 ai.* 帧按 id 直连。
-export function isTerminalPrefixedSessionId(id) {
-  return typeof id === 'string' && (id.startsWith('claude_') || id.startsWith('codex_'));
-}
 
 // resume 目标 id：清单 source_session_id 优先（托管通道回填），缺省从前缀
 // id 剥出原生 id（inventory 通道的 claude_/codex_ 条目不带 source_session_id，
