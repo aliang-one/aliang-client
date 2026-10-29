@@ -200,10 +200,26 @@ export function restorableAttachedSessionIds(conversations) {
 // —— Task 5：直播帧渲染 + steer/stop 操作（载荷与流式气泡纯逻辑）——
 
 // 插话：注入正在运行的回合（Required=type,session_id,message_id,content）。
-// 回执 ai.steer.ack 按 message_id 对账；result!=ok（not_running/turn_ended）
-// 表示没送进回合。
+// 回执 ai.steer.ack 按 message_id 对账；result 非成功集合（not_running/
+// unsupported/error）表示没送进回合。
 export function steerPayload(sessionId, content, messageId) {
   return { type: 'ai.steer', session_id: sessionId || '', message_id: messageId || '', content: content || '' };
+}
+
+// ai.steer.ack 成功判定：Go 侧成功回执值是 queued（TUI/claude stdin 路径）或
+// applied（agentcore 等专用执行器）——没有 'ok'；'ok' 仅防御性容错。
+export function isSteerAckSuccess(result) {
+  return ['ok', 'queued', 'applied'].includes(String(result || '').trim().toLowerCase());
+}
+
+// steer 失败分级：turn_ended（没送进回合，回合已结束）/ rejected（不可重试：
+// bad_request、ai_control_disabled、unsupported_attachment）/ retryable（其余，
+// 通常是发送层失败可重试）。
+export function steerFailureKind(code) {
+  const c = String(code || '').trim().toLowerCase();
+  if (c === 'turn_ended' || c === 'not_running') return 'turn_ended';
+  if (c === 'bad_request' || c === 'ai_control_disabled' || c === 'unsupported_attachment') return 'rejected';
+  return 'retryable';
 }
 
 // 停止：Required=type,session_id（run_id/source_session_id 可选，网页无 run_id 不带）。
@@ -289,14 +305,26 @@ export function dropStaleApprovals(approvals, sessionId, keepIds) {
 }
 
 // 转录×直播对账（衔接点）：转录是冷路径快照，journal 落盘滞后会尾部缺段——
-// 抓取窗口内直播落进来的消息不能被盲替换丢掉。合并=转录全量 + 窗口内直播
-// 消息中未被转录覆盖的（role+content 精确去重，防两端都落时重复气泡）。
-export function mergeTranscriptWithLive(rows, liveSnapshot, fetchStartedTs) {
+// 抓取起点拍的直播快照不能被盲替换丢掉（快照里的消息 ts 全部早于抓取起点，
+// 不能按时间窗筛——那会筛成空集、合并退化为盲替换）。TOCTOU 守卫已保证取
+// 完成时无运行中气泡，快照即全量直播面：对整个快照按 (role+content) **多重
+// 集**去重后接回——转录里同内容出现 N 次，直播面同内容只补 N 次之外的部分
+// （「继续」×2 这类同 role 连续重复条目保守保留，不按集合去重误删）。
+export function mergeTranscriptWithLive(rows, liveSnapshot) {
   const transcript = transcriptToMessages(rows);
-  const live = (Array.isArray(liveSnapshot) ? liveSnapshot : [])
-    .filter(m => m && typeof m === 'object' && (m.ts || 0) >= (fetchStartedTs || 0));
+  const live = (Array.isArray(liveSnapshot) ? liveSnapshot : []).filter(m => m && typeof m === 'object');
   if (!live.length) return transcript;
-  const seen = new Set(transcript.map(m => `${m.role}\u0000${m.content}`));
-  const tail = live.filter(m => !seen.has(`${m.role}\u0000${m.content}`));
+  const counts = new Map();
+  for (const m of transcript) {
+    const key = `${m.role}\u0000${m.content}`;
+    counts.set(key, (counts.get(key) || 0) + 1);
+  }
+  const tail = [];
+  for (const m of live) {
+    const key = `${m.role}\u0000${m.content}`;
+    const remaining = counts.get(key) || 0;
+    if (remaining > 0) counts.set(key, remaining - 1);
+    else tail.push(m);
+  }
   return transcript.concat(tail);
 }

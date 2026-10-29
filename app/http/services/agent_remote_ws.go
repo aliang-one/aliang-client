@@ -997,6 +997,13 @@ func (s *AgentService) DispatchLocalAI(msg map[string]interface{}, writeJSON fun
 		s.ai.watch(msg, writeJSON)
 	case models.AgentEventAISessionUnwatch:
 		s.ai.unwatch(msg, writeJSON)
+	case models.AgentEventAIApprovalSync:
+		// 审批对账拉取（网页 attach 后主动拉）：请求方经 e.write 直写一份 sync
+		// payload——属主兼 watcher 时扇出侧跳过属主连接，直写恰好补上那一份；
+		// 无活跃 run 会话的注册表扇出排除请求方连接（直写已覆盖，不排除双投递）；
+		// 其余 watcher 按 pending 条目 session_id 照常扇出。无待批时静默返回
+		// （与 watch 同语义：无回执即成功）。
+		s.ai.emitApprovalSyncForRequester(msg, writeJSON)
 	case models.AgentEventSlashCommandsList:
 		// Slash-command discovery shares the local chat socket so the web UI can
 		// offer `/` completion. It routes through the same detail handler as the

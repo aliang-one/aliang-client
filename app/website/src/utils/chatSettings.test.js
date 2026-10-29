@@ -23,6 +23,8 @@ import {
   runProgressFacts,
   approvalSyncRequestPayload,
   dropStaleApprovals,
+  isSteerAckSuccess,
+  steerFailureKind,
   shouldLoadTranscript,
   transcriptToMessages,
   unwatchSessionPayload,
@@ -446,36 +448,88 @@ describe('syncApprovalIdSet / dropStaleApprovals（审批对账）', () => {
 });
 
 describe('mergeTranscriptWithLive（转录×直播衔接点对账）', () => {
+  // 真实形态：快照在抓取**起点**拍，快照内消息 ts 全部早于抓取完成时刻——
+  // 不存在「窗口内 ts」，整个快照都是直播面（TOCTOU 守卫保证取完成时无运行中）。
   const rows = [
     { role: 'user', content: '问题', timestamp: '2026-10-29T10:00:00Z' },
     { role: 'assistant', content: '回答', timestamp: '2026-10-29T10:00:05Z' },
   ];
-  const startTs = Date.parse('2026-10-29T10:00:10Z');
+  const fetchCompletedTs = Date.parse('2026-10-29T10:00:40Z');
 
-  it('窗口外直播快照不并回（转录全量为准）', () => {
-    const live = [{ role: 'user', content: '旧的', status: 'done', ts: 1 }];
-    expect(mergeTranscriptWithLive(rows, live, startTs)).toHaveLength(2);
-  });
-
-  it('窗口内直播消息接在转录尾（journal 落盘滞后防缺段）', () => {
-    const live = [{ role: 'assistant', content: '刚直播完的一轮', status: 'done', ts: startTs + 5 }];
-    const merged = mergeTranscriptWithLive(rows, live, startTs);
+  it('快照中未被转录覆盖的消息接在转录尾（journal 落盘滞后防缺段）', () => {
+    const live = [{ role: 'assistant', content: '刚直播完的一轮', status: 'done', ts: fetchCompletedTs - 3000 }];
+    const merged = mergeTranscriptWithLive(rows, live);
     expect(merged).toHaveLength(3);
     expect(merged[2].content).toBe('刚直播完的一轮');
   });
 
   it('两端都落时按 role+content 去重（防重复气泡）', () => {
     const live = [
-      { role: 'user', content: '问题', status: 'done', ts: startTs + 1 },      // 转录已有
-      { role: 'assistant', content: '新到的一轮', status: 'done', ts: startTs + 2 }, // 转录没有
+      { role: 'user', content: '问题', status: 'done', ts: fetchCompletedTs - 40000 },        // 转录已有
+      { role: 'assistant', content: '新到的一轮', status: 'done', ts: fetchCompletedTs - 2000 }, // 转录没有
     ];
-    const merged = mergeTranscriptWithLive(rows, live, startTs);
+    const merged = mergeTranscriptWithLive(rows, live);
     expect(merged).toHaveLength(3);
     expect(merged.filter(m => m.content === '问题')).toHaveLength(1);
   });
 
+  it('同内容多条保守保留：转录只落了一份「继续」时，直播面第二份不丢', () => {
+    const laggingRows = [{ role: 'user', content: '继续', timestamp: '2026-10-29T10:00:00Z' }];
+    const live = [
+      { role: 'user', content: '继续', status: 'done', ts: fetchCompletedTs - 30000 }, // 已落盘
+      { role: 'user', content: '继续', status: 'done', ts: fetchCompletedTs - 5000 },  // journal 滞后未落
+    ];
+    const merged = mergeTranscriptWithLive(laggingRows, live);
+    expect(merged).toHaveLength(2);
+    expect(merged.filter(m => m.content === '继续')).toHaveLength(2);
+  });
+
+  it('转录已收全时直播快照整体去重（不产生重复气泡）', () => {
+    const live = [
+      { role: 'user', content: '问题', status: 'done', ts: fetchCompletedTs - 40000 },
+      { role: 'assistant', content: '回答', status: 'done', ts: fetchCompletedTs - 35000 },
+    ];
+    expect(mergeTranscriptWithLive(rows, live)).toHaveLength(2);
+  });
+
   it('脏输入安全', () => {
-    expect(mergeTranscriptWithLive(null, null, startTs)).toEqual([]);
-    expect(mergeTranscriptWithLive(rows, 'x', startTs)).toHaveLength(2);
+    expect(mergeTranscriptWithLive(null, null)).toEqual([]);
+    expect(mergeTranscriptWithLive(rows, 'x')).toHaveLength(2);
+  });
+});
+
+describe('isSteerAckSuccess（B1：ack 成功值三态钉死）', () => {
+  it('Go 成功回执 queued/applied 为真；ok 防御性容错', () => {
+    expect(isSteerAckSuccess('queued')).toBe(true);
+    expect(isSteerAckSuccess('applied')).toBe(true);
+    expect(isSteerAckSuccess('ok')).toBe(true);
+    expect(isSteerAckSuccess('QUEUED')).toBe(true);
+  });
+
+  it('失败值与空值全假（成功路径绝不能误判为失败）', () => {
+    expect(isSteerAckSuccess('error')).toBe(false);
+    expect(isSteerAckSuccess('not_running')).toBe(false);
+    expect(isSteerAckSuccess('unsupported')).toBe(false);
+    expect(isSteerAckSuccess('')).toBe(false);
+    expect(isSteerAckSuccess(undefined)).toBe(false);
+  });
+});
+
+describe('steerFailureKind（失败分级：不可重试类不说请重试）', () => {
+  it('turn_ended/not_running → turn_ended', () => {
+    expect(steerFailureKind('turn_ended')).toBe('turn_ended');
+    expect(steerFailureKind('not_running')).toBe('turn_ended');
+  });
+
+  it('bad_request/ai_control_disabled/unsupported_attachment → rejected', () => {
+    expect(steerFailureKind('bad_request')).toBe('rejected');
+    expect(steerFailureKind('ai_control_disabled')).toBe('rejected');
+    expect(steerFailureKind('unsupported_attachment')).toBe('rejected');
+  });
+
+  it('其余（send_failed 等）→ retryable；空码同', () => {
+    expect(steerFailureKind('send_failed')).toBe('retryable');
+    expect(steerFailureKind('')).toBe('retryable');
+    expect(steerFailureKind(undefined)).toBe('retryable');
   });
 });

@@ -268,6 +268,7 @@ export default {
   chat_stop: '停止',
   chat_steerTurnEnded: '插话未送达：回合已结束。',
   chat_steerFailed: '插话发送失败，请重试。',
+  chat_steerRejected: '插话未被接受，请检查输入。',
   chat_progressRetry: '重试中 {attempt}/{max}',
   chat_progressFiles: '文件 {count}',
   chat_progressGit: 'Git 变更 {count}',

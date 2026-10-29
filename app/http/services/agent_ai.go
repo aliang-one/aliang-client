@@ -1603,6 +1603,14 @@ func (m *agentAIManager) resolveDurableSessionShell(sessionID string) (shell *ag
 // sink 通道(Task 1 同一异步机制、同一满即摘纪律);无在跑 emitter 时退化为
 // 每 watcher 一条一次性 goroutine(注册 writer 带 5s 写期限,有界)。
 func (m *agentAIManager) fanOutSessionWatchFrame(sessionID string, payload map[string]interface{}) {
+	m.fanOutSessionWatchFrameExcept(sessionID, payload, "")
+}
+
+// fanOutSessionWatchFrameExcept 把会话级帧扇给全部 watcher，可排除一个连接
+// （emitApprovalSyncForRequester 用：请求方已拿直写，注册表扇出不重复投递）。
+// 活跃 emitter 在场时走 emitter 旁路扇出（属主连接由 isOwnerConn 跳过——
+// excludeConn 拦不到 emitter 路径，直写/扇出两侧的属主语义仍由 4.5 保证）。
+func (m *agentAIManager) fanOutSessionWatchFrameExcept(sessionID string, payload map[string]interface{}, excludeConn string) {
 	if payload == nil {
 		return
 	}
@@ -1616,7 +1624,10 @@ func (m *agentAIManager) fanOutSessionWatchFrame(sessionID string, payload map[s
 		emitter.fanOutOutOfBand(payload)
 		return
 	}
-	for _, write := range m.sessionWatchersSnapshot(sessionID) {
+	for connID, write := range m.sessionWatchersSnapshot(sessionID) {
+		if excludeConn != "" && connID == excludeConn {
+			continue
+		}
 		frame := cloneAgentAIMap(payload)
 		go func(w agentTerminalWriter) { _ = w(frame) }(write)
 	}
@@ -3914,6 +3925,37 @@ func (m *agentAIManager) emitApprovalSync(writeJSON agentTerminalWriter) {
 	}
 	for sessionID := range sessions {
 		m.fanOutSessionWatchFrame(sessionID, payload)
+	}
+}
+
+// emitApprovalSyncForRequester 处理网页主动拉取的审批对账（DispatchLocalAI 的
+// ai.approval.sync case）：请求方经 e.write 直写一份 sync payload——属主兼
+// watcher 时扇出侧跳过属主连接（fanOutLocked），直写恰好补上那一份；无活跃
+// run 的会话走 manager 注册表扇出，须排除请求方连接（直写已覆盖，注册表不知
+// 属主身份，不排除就是双投递）。其余 watcher 按 pending 条目 session_id 照常
+// 扇出。无待批时静默（与 watch 同语义：无回执即成功）。
+func (m *agentAIManager) emitApprovalSyncForRequester(msg map[string]interface{}, writeJSON agentTerminalWriter) {
+	if writeJSON == nil {
+		return
+	}
+	requesterConn := strings.TrimSpace(remoteString(msg, "conn_id"))
+	pending := m.pendingApprovalsSnapshot()
+	if len(pending) == 0 {
+		return
+	}
+	payload := map[string]interface{}{
+		"type":    models.AgentEventAIApprovalSync,
+		"pending": pending,
+	}
+	_ = writeJSON(payload)
+	sessions := make(map[string]struct{}, len(pending))
+	for _, entry := range pending {
+		if sessionID := remoteString(entry, "session_id"); sessionID != "" {
+			sessions[sessionID] = struct{}{}
+		}
+	}
+	for sessionID := range sessions {
+		m.fanOutSessionWatchFrameExcept(sessionID, payload, requesterConn)
 	}
 }
 

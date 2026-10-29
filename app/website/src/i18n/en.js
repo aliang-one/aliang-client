@@ -268,6 +268,7 @@ export default {
   chat_stop: 'Stop',
   chat_steerTurnEnded: 'Steer not delivered: the turn already ended.',
   chat_steerFailed: 'Failed to send the interjection. Please retry.',
+  chat_steerRejected: 'The interjection was not accepted. Please check your input.',
   chat_progressRetry: 'Retrying {attempt}/{max}',
   chat_progressFiles: 'files {count}',
   chat_progressGit: 'git changes {count}',

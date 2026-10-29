@@ -622,6 +622,7 @@ import {
   findConversationForEvent,
   findRunningAssistant,
   finishRunBubbles,
+  isSteerAckSuccess,
   isDirectoryLocked,
   mergeTranscriptWithLive,
   originBadgeOf,
@@ -632,6 +633,7 @@ import {
   sessionCreatePayload,
   shouldLoadTranscript,
   startRunBubble,
+  steerFailureKind,
   steerPayload,
   stopPayload,
   syncApprovalIdSet,
@@ -1252,9 +1254,33 @@ function ensureLiveAttached(conv) {
     .catch(() => { /* socket 不可用：发消息时经确认门兜底重试 */ });
 }
 
+// ai.steer.ack 成功集合与失败分级在 chatSettings（isSteerAckSuccess/
+// steerFailureKind，纯函数已测）。
+function settleSteerAck(entry, result, code) {
+  clearTimeout(entry.timer);
+  pendingSteers.delete(entry.messageId);
+  if (isSteerAckSuccess(result)) return;
+  settleSteerFailure(entry.conv, entry.userMsg, code);
+}
+
+function settleSteerFailure(conv, userMsg, code) {
+  conv.messages = conv.messages.filter(m => m !== userMsg);
+  const kind = steerFailureKind(code);
+  conv.messages.push({
+    role: 'assistant',
+    content: kind === 'turn_ended' ? t('chat_steerTurnEnded') : kind === 'rejected' ? t('chat_steerRejected') : t('chat_steerFailed'),
+    status: 'error',
+    ts: now(),
+  });
+  conv.updatedAt = now();
+  saveToStorage();
+  scrollToBottom();
+}
+
 // attached 运行中的插话（独立 steer 路径）：全局 sending 原语义不动，本地会话
 // 零变化；门=attached 会话自身是否有 running 气泡。乐观推用户气泡，ack 不 ok
-// 则撤回并提示（没送进回合，留着会误导）。
+// 则撤回并提示（没送进回合，留着会误导）；ack 丢失时超时兜底只解除跟踪、
+// 不撤气泡（插话可能已落地，误撤比漏报更糟）。
 async function sendSteer(conv, text) {
   const userMsg = { role: 'user', content: text, ts: now() };
   conv.messages.push(userMsg);
@@ -1265,23 +1291,12 @@ async function sendSteer(conv, text) {
   try {
     await ensureAISocket();
     if (!sendAI(steerPayload(conv.aiSessionId, text, messageId))) throw new Error('socket-closed');
-    pendingSteers.set(messageId, { conv, userMsg });
+    const entry = { messageId, conv, userMsg, timer: null };
+    entry.timer = setTimeout(() => pendingSteers.delete(messageId), 10000);
+    pendingSteers.set(messageId, entry);
   } catch (_) {
-    settleSteerFailure(conv, userMsg, '');
+    settleSteerFailure(conv, userMsg, 'send_failed');
   }
-}
-
-function settleSteerFailure(conv, userMsg, code) {
-  conv.messages = conv.messages.filter(m => m !== userMsg);
-  conv.messages.push({
-    role: 'assistant',
-    content: code === 'turn_ended' || code === 'not_running' ? t('chat_steerTurnEnded') : t('chat_steerFailed'),
-    status: 'error',
-    ts: now(),
-  });
-  conv.updatedAt = now();
-  saveToStorage();
-  scrollToBottom();
 }
 
 // 停止 attached 会话的运行回合（ai.stop；终态经既有 ai.status/ai.done/ai.error
@@ -1296,9 +1311,8 @@ function stopAttachedRun(conv) {
 // messages，会把正在逐字直播的气泡冲掉，后续 delta 因末尾已是 done 气泡被丢弃。
 async function loadTranscriptInto(conv) {
   if (!shouldLoadTranscript(conv)) return;
-  // 衔接点对账：抓取起点前先留直播快照——journal 落盘滞后会尾部缺段，
-  // 窗口内直播落进来的消息不能被盲替换丢掉（mergeTranscriptWithLive 合并）。
-  const fetchStartedTs = now();
+  // 衔接点对账：抓取起点留直播快照——journal 落盘滞后会尾部缺段，快照整面
+  // 参与 mergeTranscriptWithLive 的多重集去重合并（不按时间窗筛）。
   const liveSnapshot = (conv.messages || []).slice();
   conv.transcriptLoading = true;
   conv.transcriptError = '';
@@ -1307,7 +1321,7 @@ async function loadTranscriptInto(conv) {
     // TOCTOU：冷路径最长 40s，期间回合可能已开始直播——命中运行中就弃用本次
     // 结果，直播气泡继续增长（历史留给回合结束后的重进/重试）。
     if (findRunningAssistant(conv)) return;
-    conv.messages = mergeTranscriptWithLive(detail?.transcript, liveSnapshot, fetchStartedTs);
+    conv.messages = mergeTranscriptWithLive(detail?.transcript, liveSnapshot);
     conv.transcriptLoaded = true;
     conv.updatedAt = now();
     saveToStorage();
@@ -1719,15 +1733,14 @@ function handleAIEvent(e) {
     return;
   }
 
-  // 插话回执：按 message_id 对账（不依赖 session 归位）。ok 静默；没送进回合
-  // （not_running/turn_ended 等）撤回乐观用户气泡并提示。
+  // 插话回执：按 message_id 对账（不依赖 session 归位）。成功集合=ok/queued/
+  // applied（Go 侧 ack 成功值是 queued（TUI/claude）或 applied（agentcore），
+  // 没有 ok）；失败（error/not_running/unsupported 等）撤回乐观用户气泡并按
+  // code 分级提示。
   if (e.type === 'ai.steer.ack') {
     const entry = pendingSteers.get(e.message_id);
     if (!entry) return;
-    pendingSteers.delete(e.message_id);
-    if (e.result && e.result !== 'ok') {
-      settleSteerFailure(entry.conv, entry.userMsg, e.code || '');
-    }
+    settleSteerAck(entry, e.result || '', e.code || '');
     return;
   }
 
