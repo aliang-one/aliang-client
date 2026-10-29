@@ -709,3 +709,103 @@ func TestAgentAIWatcherRegistryCapLRUEvictsOldest(t *testing.T) {
 		t.Fatalf("evicted frame type = %v, want %s", frame["type"], models.AgentEventAISessionWatchDropped)
 	}
 }
+
+// ---------- Y1 + J2: TUI 清理补齐 activeEmitter;fallback 与断线反注销钉 ----------
+
+// Y1 回归钉:TUI 注入回合收尾清理(cancel/activeWriter/activity/tuiTurn/
+// activeRunID)必须连同 activeEmitter 一起清——否则回合结束后、下一 run 前的
+// 无界窗口里,任何 ai.session.watch 都会 attachWatch 到已终态、拷贝已清空的
+// 旧 emitter:removed 永不关,常驻 pump 永久 park(每次页面刷新泄一条
+// goroutine + 64 槽)。
+func TestAgentAITUITurnClearReleasesActiveEmitter(t *testing.T) {
+	m := newAgentAIManager()
+	emitter, _ := newWatchableTestSession(t, m, "s-1")
+
+	m.mu.Lock()
+	session := m.sessions["s-1"]
+	m.mu.Unlock()
+	m.clearTUITurnSessionState(session)
+
+	m.mu.Lock()
+	released := session.activeEmitter == nil && session.activeWriter == nil
+	m.mu.Unlock()
+	if !released {
+		t.Fatal("clearTUITurnSessionState left activeEmitter/activeWriter set")
+	}
+
+	// 行为钉:清理后 watch 仍登记(为下一 run 播种),但不得挂上旧 emitter 拷贝。
+	rec := &emitterWatchRecorder{}
+	m.watch(map[string]interface{}{"session_id": "s-1", "conn_id": "c-late"}, rec.write)
+	if _, ok := watcherCopyForTest(emitter)["c-late"]; ok {
+		t.Fatal("watch after TUI cleanup attached to the stale emitter copy (pump would park forever)")
+	}
+	if snap := m.sessionWatchersSnapshot("s-1"); len(snap) != 1 {
+		t.Fatalf("registry after late watch = %#v, want the watcher kept for the next run", snap)
+	}
+}
+
+// J2:fanOutSessionWatchFrame 的 registry-direct fallback(run 间隙:会话在、
+// 无在跑 emitter)把旁路帧送达 watcher;nil payload 是 no-op。
+func TestAgentAIFanOutSessionFrameFallbackWithoutEmitter(t *testing.T) {
+	m := newAgentAIManager()
+	rec := &emitterWatchRecorder{}
+	// run 间隙形态:会话在注册表,但没有 activeEmitter/activeWriter。
+	m.mu.Lock()
+	m.sessions["s-gap"] = &agentAISession{id: "s-gap", runSeq: 1, lastActiveAt: time.Now()}
+	m.mu.Unlock()
+	m.watch(map[string]interface{}{"session_id": "s-gap", "conn_id": "c1"}, rec.write)
+
+	m.fanOutSessionWatchFrame("s-gap", nil) // no-op,不 panic
+	m.fanOutSessionWatchFrame("s-gap", map[string]interface{}{
+		"type":       models.AgentEventAIApprovalCancelled,
+		"session_id": "s-gap",
+	})
+	waitForWatchCond(t, 2*time.Second, "fallback fanned frame to reach the watcher", func() bool {
+		return len(rec.snapshot()) == 1
+	})
+	if frame := rec.snapshot()[0]; frame["type"] != models.AgentEventAIApprovalCancelled {
+		t.Fatalf("fanned frame type = %v", frame["type"])
+	}
+
+	// 无 watcher 的会话:fallback 静默(空注册表快照,零 goroutine)。
+	m.fanOutSessionWatchFrame("s-unknown", map[string]interface{}{"type": "x"})
+}
+
+// J2:断线反注销两层——manager.unwatchSessionConn 一次清掉该连接对全部会话的
+// 注册与在跑 emitter 拷贝;service.UnwatchLocalAIConn 透传且 nil ai 安全。
+func TestAgentAIUnwatchSessionConnDisconnectCleanup(t *testing.T) {
+	m := newAgentAIManager()
+	emitter, _ := newWatchableTestSession(t, m, "s-1")
+	rec := &emitterWatchRecorder{}
+	m.watch(map[string]interface{}{"session_id": "s-1", "conn_id": "c1"}, rec.write)
+	// 同一连接的第二个会话注册(无 emitter 的 run 间隙会话)。
+	m.mu.Lock()
+	m.sessions["s-2"] = &agentAISession{id: "s-2", runSeq: 1, lastActiveAt: time.Now()}
+	m.mu.Unlock()
+	m.watch(map[string]interface{}{"session_id": "s-2", "conn_id": "c1"}, rec.write)
+	if snap := m.sessionWatchersSnapshot("s-1"); len(snap) != 1 {
+		t.Fatalf("s-1 registry before disconnect = %#v", snap)
+	}
+
+	// manager 层:断线一次清全部会话 + 在跑 emitter 拷贝。
+	m.unwatchSessionConn("c1")
+	if snap := m.sessionWatchersSnapshot("s-1"); len(snap) != 0 {
+		t.Fatalf("s-1 registry after disconnect = %#v", snap)
+	}
+	if snap := m.sessionWatchersSnapshot("s-2"); len(snap) != 0 {
+		t.Fatalf("s-2 registry after disconnect = %#v", snap)
+	}
+	if _, ok := watcherCopyForTest(emitter)["c1"]; ok {
+		t.Fatal("disconnect did not prune the running emitter copy")
+	}
+
+	// service 层:透传生效;nil ai 静默不 panic。
+	svcWatch := &emitterWatchRecorder{}
+	m.watch(map[string]interface{}{"session_id": "s-1", "conn_id": "c2"}, svcWatch.write)
+	svc := &AgentService{ai: m}
+	svc.UnwatchLocalAIConn("c2")
+	if snap := m.sessionWatchersSnapshot("s-1"); len(snap) != 0 {
+		t.Fatalf("s-1 registry after service unwatch = %#v", snap)
+	}
+	(&AgentService{}).UnwatchLocalAIConn("c2") // nil ai:不得 panic
+}
