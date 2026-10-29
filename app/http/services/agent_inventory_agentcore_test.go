@@ -160,6 +160,62 @@ func TestReadAgentCoreSessionMetaSummary(t *testing.T) {
 	}
 }
 
+func TestReadAgentCoreSessionMetaOriginBackfill(t *testing.T) {
+	// 清单条目回填 journal 头行 origin：phone 起会话标 phone（跨端续聊分流依据），
+	// 旧头行（无 origin 键）与无头行文件保持空串。fixture 走真实写侧
+	// ensureSessionHeader（origin="phone"），保证头行格式与生产一致。
+	dir := t.TempDir()
+	writeAgentCoreJournalFixture(t, dir, "conv-origin", "/tmp/po")
+	path := filepath.Join(dir, agentCoreJournalFileName("conv-origin"))
+	session := readAgentCoreSessionMetaWithOptions(path, agentVibeSessionReadOptions{Limit: 24})
+	if session.Origin != "phone" {
+		t.Fatalf("Origin = %q, want phone（头行回填）", session.Origin)
+	}
+
+	// 旧文件：头行没有 origin 键（阶段 1 之前的落盘格式）。
+	legacyPath := writeCoreJournalRawFixture(t, "conv-origin-legacy",
+		`{"kind":"session","session_id":"conv-origin-legacy","project_path":"/tmp/pl","model":"m","created_at":"2026-10-26T01:00:00Z"}`,
+		`{"kind":"msg","role":"user","message_id":"u1","text":"旧会话","ts":"2026-10-26T01:00:05Z"}`,
+	)
+	legacy := readAgentCoreSessionMetaWithOptions(legacyPath, agentVibeSessionReadOptions{Limit: 24})
+	if legacy.Origin != "" {
+		t.Fatalf("旧头行 Origin = %q, want 空串", legacy.Origin)
+	}
+
+	// 无头行文件（steer 先到，只有 msg 行）：origin 无处可读,保持空串。
+	headlessDir := t.TempDir()
+	j := newAgentCoreJournal(headlessDir)
+	j.appendUser("conv-origin-headless", "s1", "插话", "2026-10-26T08:00:00Z")
+	headless := readAgentCoreSessionMetaWithOptions(filepath.Join(headlessDir, agentCoreJournalFileName("conv-origin-headless")), agentVibeSessionReadOptions{Limit: 24})
+	if headless.Origin != "" {
+		t.Fatalf("无头行 Origin = %q, want 空串", headless.Origin)
+	}
+
+	// 清单扫描路（collectAgentCoreVibeSessions → parse cache）同样携带 origin,
+	// 且二次扫描命中 (size,mtime) 缓存后不丢字段。
+	setTestAgentHome(t)
+	writeAgentCoreJournalFixture(t, agentCoreJournalDir(), "conv-collect-origin", "/tmp/pc")
+	entries := collectAgentCoreVibeSessions(nil)
+	var hit *models.AgentVibeSession
+	for i := range entries {
+		if entries[i].ID == "conv-collect-origin" {
+			hit = &entries[i]
+		}
+	}
+	if hit == nil {
+		t.Fatalf("collect 未命中 fixture 会话: %v", entries)
+	}
+	if hit.Origin != "phone" {
+		t.Fatalf("collect 条目 Origin = %q, want phone", hit.Origin)
+	}
+	cached := collectAgentCoreVibeSessions(nil)
+	for i := range cached {
+		if cached[i].ID == "conv-collect-origin" && cached[i].Origin != "phone" {
+			t.Fatalf("缓存扫描后 Origin = %q, want phone（缓存不得投毒）", cached[i].Origin)
+		}
+	}
+}
+
 func TestReadAgentCoreSessionMetaHotWindow(t *testing.T) {
 	dir := t.TempDir()
 	writeAgentCoreJournalFixture(t, dir, "conv-w", "/p")

@@ -92,6 +92,7 @@ func readAgentCoreSessionMetaWithOptions(path string, options agentVibeSessionRe
 			ProjectPath string `json:"project_path"`
 			Model       string `json:"model"`
 			CreatedAt   string `json:"created_at"`
+			Origin      string `json:"origin"`
 			Role        string `json:"role"`
 			MessageID   string `json:"message_id"`
 			Text        string `json:"text"`
@@ -109,6 +110,10 @@ func readAgentCoreSessionMetaWithOptions(path string, options agentVibeSessionRe
 			session.ProjectPath = firstNonEmpty(session.ProjectPath, cleanAgentProjectPath(row.ProjectPath))
 			session.Model = firstNonEmpty(session.Model, row.Model)
 			session.CreatedAt = firstNonEmpty(session.CreatedAt, normalizeAgentTime(row.CreatedAt))
+			// 头行 origin（phone/dashboard/terminal…）忠实回填摘要条目：跨端续聊
+			// 分流靠它判断该会话由哪一端发起。旧文件（头行无 origin 键）与无头行
+			// 文件保持空串（omitempty 不下发）。
+			session.Origin = firstNonEmpty(session.Origin, row.Origin)
 			// 早过滤：扫描目录限制开启时,project_path 不在任一目录内则丢弃整个
 			// 会话,不读 transcript（同 codex 的 session_meta 分支）。
 			if len(options.ScanDirs) > 0 && session.ProjectPath != "" && !pathUnderAnyScanDir(session.ProjectPath, options.ScanDirs) {
