@@ -5641,6 +5641,9 @@ func (m *agentAIManager) runCodexAppServer(ctx context.Context, run agentAIRun, 
 	threadID := ""
 	turnID := ""
 	threadBound := false
+	// codex mismatch 自愈的单次封顶闸：reserved 占位释放后 confirmBinding 的
+	// expected 为空，结构上不可能二次 mismatch，闸只是纵深防御。
+	bindingRetried := false
 	bindThread := func() error {
 		if threadBound || threadID == "" {
 			return nil
@@ -5971,6 +5974,23 @@ func (m *agentAIManager) runCodexAppServer(ctx context.Context, run agentAIRun, 
 			}
 			if threadID != "" {
 				if err := bindThread(); err != nil {
+					// codex mismatch 自愈（2026-10-29 already-in-use 事故的 codex
+					// 侧）：本地还是 reserved 占位时，mismatch 说明占位 id 已不可
+					// 兑现——claude 族撞 jsonl 的同族问题在 codex 表现为撞绑定锚。
+					// 释放绑定、丢掉 resume 锚，就地以全新 thread/start 重试一次。
+					// 释放后 confirmBinding 的 expected 为空，不会二次 mismatch。
+					if !bindingRetried && strings.Contains(err.Error(), "mismatch") && m.reservedBindingID(run.sessionID) != "" {
+						bindingRetried = true
+						m.releaseReservedBinding(run.sessionID, "")
+						run.resumeSessionID = ""
+						delete(threadParams, "threadId")
+						threadMethod = "thread/start"
+						codexPhase = threadMethod
+						threadID = ""
+						logger.Warn(fmt.Sprintf("ai.codex.binding.revive: session=%s runSeq=%d reserved 绑定 mismatch 已释放，就地重跑 thread/start", run.sessionID, run.runSeq))
+						_ = send(map[string]interface{}{"method": threadMethod, "id": 1, "params": threadParams})
+						continue
+					}
 					terminalErr = "Codex provider binding failed: " + err.Error()
 					goto done
 				}
