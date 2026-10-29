@@ -697,6 +697,10 @@ func (e *agentAIRunEmitter) emit(value interface{}) error {
 		e.terminal = true
 		if e.onTerminal != nil {
 			if err := e.onTerminal(payload); err != nil {
+				// 终态没有发布(属主也没收到这帧),所以不向 watcher 扇出;
+				// 但 emitter 拷贝必须照样清理——否则每个 watcher 的常驻
+				// pump 永久阻塞,把整个 emitter 钉死(A1 泄漏回归钉)。
+				e.clearWatcherCopies()
 				return err
 			}
 		}
@@ -1243,6 +1247,7 @@ func (m *agentAIManager) sessionWatchersSnapshot(sessionID string) map[string]ag
 	return out
 }
 
+// registerAISessionLocked stores a new session, evicting the oldest idle
 // session first if the resident map is at capacity. The session must NOT
 // already be present — both call sites (create + message lazy-create) resolve
 // or update an existing session before reaching here. MUST be called with m.mu

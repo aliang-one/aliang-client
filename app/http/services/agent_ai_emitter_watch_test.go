@@ -1,7 +1,9 @@
 package services
 
 import (
+	"errors"
 	"fmt"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -273,6 +275,40 @@ func TestAgentAIEmitterTerminalClearsCopyKeepsRegistry(t *testing.T) {
 	if _, ok := watcherCopyForTest(next)["conn-a"]; !ok {
 		t.Fatal("next run emitter did not re-seed the persisted watcher")
 	}
+}
+
+// ⑦onTerminal 持久化失败(rememberPendingTerminal/identity 落盘出错)时,
+// emit 提前返回错误、帧不上线(属主与 watcher 都收不到);但 watcher 拷贝
+// 必须照样清理——否则每个 pump 永久阻塞,钉住整个 emitter(A1 泄漏回归钉)。
+func TestAgentAIEmitterTerminalJournalErrorStillClearsWatchers(t *testing.T) {
+	m := newAgentAIManager()
+	owner := &emitterWatchRecorder{}
+	watcher := &emitterWatchRecorder{}
+	m.watchSession("s-1", "conn-a", watcher.write)
+	emitter := m.runEmitter(agentAIRun{sessionID: "s-1", runID: "run-1", messageID: "msg-1"}, owner.write)
+	emitter.onTerminal = func(map[string]interface{}) error {
+		return errors.New("disk unavailable")
+	}
+	// 基线在 pump 启动之后:pump 退出才可能回到基线。
+	baseline := runtime.NumGoroutine()
+
+	if err := emitter.emit(map[string]interface{}{
+		"type":       models.AgentEventAIDone,
+		"session_id": "s-1",
+		"message_id": "msg-1",
+	}); err == nil {
+		t.Fatal("terminal emit error = nil, want journal failure")
+	}
+
+	if got := len(watcherCopyForTest(emitter)); got != 0 {
+		t.Fatalf("watcher copy survived the failed terminal: %d", got)
+	}
+	if frames := watcher.snapshot(); len(frames) != 0 {
+		t.Fatalf("watcher received %d frames on an unpublished terminal, want 0", len(frames))
+	}
+	waitForWatchCond(t, 2*time.Second, "watcher pump goroutine to exit after failed terminal", func() bool {
+		return runtime.NumGoroutine() <= baseline
+	})
 }
 
 // ⑥emit 期摘除同步回删 manager:缓冲打满触发摘除的那次 emit 返回后,
