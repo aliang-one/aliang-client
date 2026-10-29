@@ -1671,8 +1671,26 @@ func (m *agentAIManager) evictOldestIdleAISessionLocked() {
 	m.clearPendingApprovalsLocked(victim.id, victim.runSeq, models.AgentAIApprovalDecisionCancel)
 	victim.pendingOption = nil
 	delete(m.sessions, victim.id)
+	// reserved 绑定随会话一并丢弃：reserved 是 server 下发的占位 id，会话没了
+	// 它就失去兑现语境，留着还会在「原生 id 已绑定别的会话」检查里误导后续
+	// confirm 的报错方向。confirmed 是合法 resume 锚（驱逐后 lazy-create 仍能
+	// 从它恢复），保留。persistIdentityState 自带锁，不能在持锁临界区里调，
+	// 丢 goroutine 异步落盘，失败仅日志。
+	reservedDropped := ""
+	if binding, ok := m.bindings[victim.id]; ok && binding.State == "reserved" {
+		reservedDropped = binding.NativeSessionID
+		delete(m.bindings, victim.id)
+	}
 	logger.Info(fmt.Sprintf("ai.session: evicted idle session %s to bound resident set (cap=%d, now=%d)",
 		victim.id, agentAISessionResidentCap, len(m.sessions)))
+	if reservedDropped != "" {
+		logger.Info(fmt.Sprintf("ai.session: evicted session %s 的 reserved 绑定 %q 一并丢弃", victim.id, reservedDropped))
+		go func(sessionID, native string) {
+			if err := m.persistIdentityState(); err != nil {
+				logger.Warn(fmt.Sprintf("ai.session: evict reserved binding persist_failed session=%s native=%s err=%v", sessionID, native, err))
+			}
+		}(victim.id, reservedDropped)
+	}
 }
 
 // approvalService returns the AgentService that owns this manager (used to
@@ -4795,7 +4813,13 @@ func (m *agentAIManager) clearAgentAIResumeSessionID(sessionID string, runSeq in
 	if session == nil || session.runSeq != runSeq {
 		return
 	}
-	if expected == "" || session.resumeSessionID == expected {
+	// expected 为空是「按值撤销」的退化形态：无条件清空会把确认期钉下的恢复点
+	// 一并抹掉（2026-10-29 already-in-use 事故类：空值覆盖已钉恢复点）。空锚即
+	// 不撤，撤销必须指名道姓。
+	if expected == "" {
+		return
+	}
+	if session.resumeSessionID == expected {
 		session.resumeSessionID = ""
 	}
 }
