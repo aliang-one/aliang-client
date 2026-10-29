@@ -1129,6 +1129,20 @@ func (r *runner) streamTurn(ctx context.Context, req *MessagesRequest, writer *s
 			if ev.Usage != nil {
 				r.usage.OutputTokens += ev.Usage.OutputTokens
 				turnOut = ev.Usage.OutputTokens
+				// 流末 usage 兜底：deepseek 等 OpenAI 风格的 anthropic 兼容端点
+				// 不在 message_start 报用量（或报 0），全量 input 侧计数要等流末
+				// message_delta.usage 才出现——此前 contextTokens 恒 0，诊断面板
+				// 的「上下文用量」整卡空白（2026-10-29 线上 deepseek-flash 实测）。
+				// anthropic 正常语义里流末只补 output_tokens（input 侧为 0），
+				// 三项和为 0 不会触发覆盖；只有流末给出更大的 input 侧合计才接管，
+				// 且只更新快照与本回合日志局部量——usage 是账单累计，不能在这里
+				// 双计。
+				if tail := ev.Usage.InputTokens + ev.Usage.CacheReadInputTokens + ev.Usage.CacheCreationInputTokens; tail > r.contextTokens {
+					r.contextTokens = tail
+					turnIn = ev.Usage.InputTokens
+					turnCacheRead = ev.Usage.CacheReadInputTokens
+					turnCacheWrite = ev.Usage.CacheCreationInputTokens
+				}
 			}
 
 		case EventError:
@@ -1321,9 +1335,16 @@ func (r *runner) fireOnTurn(terminal bool, reason string) {
 	if r.startedAt.IsZero() {
 		r.startedAt = time.Now()
 	}
+	// 上游整轮没报过用量（协议缺 usage 字段）时按估算兜底：与自动压缩判定
+	// 同一把尺子（EstimateTokens），面板有数好过恒 0。一旦有任何上游实测值
+	// 就以实测为准，估算只填真空。
+	ctxTokens := r.contextTokens
+	if ctxTokens == 0 {
+		ctxTokens = EstimateTokens(r.history)
+	}
 	r.cfg.Hooks.OnTurn(TurnSnapshot{
 		Turns:         r.turns,
-		ContextTokens: r.contextTokens,
+		ContextTokens: ctxTokens,
 		ContextWindow: r.effectiveContextWindow(),
 		DupStreak:     r.dupStreak,
 		ErrStreak:     r.errStreak,

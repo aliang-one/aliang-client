@@ -428,7 +428,11 @@ type agentAIRun struct {
 	effort        string
 	// contextWindow mirrors the session field for this run (claude:
 	// --autocompact tokens; agentcore: kernel compaction budget).
-	contextWindow           int
+	contextWindow int
+	// claudeDiag 聚合 CLI 通道的逐回合诊断快照（诊断面板数据源）。runCLIPass
+	// 在起 ticker 前挂载；run 按值传递，但指针字段在所有副本里仍指向同一
+	// 聚合器。nil 安全（agentcore / codex 路径不挂）。
+	claudeDiag              *claudeRunDiagnostics
 	resumeSessionID         string
 	reservedNativeSessionID string
 	bindingVersion          int
@@ -4712,6 +4716,32 @@ func toIntValue(raw interface{}) (int, bool) {
 	return 0, false
 }
 
+// remoteIntOK / remoteFloatOK / remoteBoolValue：claudeRunDiagnostics 读
+// result 事件数值/布尔字段的取值器（encoding/json 解出的数字是 float64），
+// 形态对齐 remoteString(event, key)。
+func usageFieldInt(usage map[string]interface{}, key string) int {
+	if v, ok := toIntValue(usage[key]); ok {
+		return v
+	}
+	return 0
+}
+
+func remoteIntOK(event map[string]interface{}, key string) (int, bool) {
+	return toIntValue(event[key])
+}
+
+func remoteFloatOK(event map[string]interface{}, key string) (float64, bool) {
+	if v, ok := event[key].(float64); ok {
+		return v, true
+	}
+	return 0, false
+}
+
+func remoteBoolValue(event map[string]interface{}, key string) bool {
+	b, _ := event[key].(bool)
+	return b
+}
+
 // agentAICloudFieldCap bounds a single structured-event text field (command
 // output, diff) so one verbose command/edit cannot blow up a websocket frame.
 const agentAICloudFieldCap = 8 * 1024
@@ -6286,6 +6316,30 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 	}
 	progressStop := make(chan struct{})
 	defer close(progressStop)
+	// CLI 通道诊断聚合器（与 agentcore 路径的 agentCoreDiagnostics 对应）：
+	// stdout goroutine 经 streamStructuredAIDelta 写，这里 ticker 与收尾终帧
+	// 读。挂载在 run 上（指针字段），流解析副本共享同一聚合器。
+	run.claudeDiag = newClaudeRunDiagnostics(run.contextWindow)
+	// 终态诊断帧：CLI 进程退出后收尾显式补一帧带 terminal 标记的诊断——
+	// server 归一化落库后，面板重开会话回放显示的就是这份终值。注册在
+	// progressStop 的 defer 之后（LIFO 先执行），终帧先于 ticker 关闭发出。
+	defer func() {
+		if run.claudeDiag == nil {
+			return
+		}
+		// 无 result 事件（进程被杀/崩溃）时补终态标记，reason 留空——结构化
+		// 真因已由 ai.error 通道单独下发，这里不重复拼文案。
+		run.claudeDiag.finish("")
+		frame := map[string]interface{}{
+			"type":       models.AgentEventAIRunProgress,
+			"session_id": run.sessionID,
+			"message_id": agentAssistantMessageID(run.messageID),
+		}
+		if diag := run.claudeDiag.payload(); diag != nil {
+			frame["diagnostics"] = diag
+			_ = writeJSON(frame)
+		}
+	}()
 	go func() {
 		ticker := time.NewTicker(agentAIRunProgressInterval)
 		defer ticker.Stop()
@@ -6293,13 +6347,20 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 			filesMu.Lock()
 			touched := len(filesTouched)
 			filesMu.Unlock()
-			_ = writeJSON(map[string]interface{}{
+			frame := map[string]interface{}{
 				"type":                models.AgentEventAIRunProgress,
 				"session_id":          run.sessionID,
 				"message_id":          agentAssistantMessageID(run.messageID),
 				"files_touched_count": touched,
 				"git_changed_count":   countGitChanged(run.projectPath),
-			})
+			}
+			// 逐回合诊断快照（回合数/上下文用量/停止原因），诊断面板的 CLI
+			// 实时数据源。尚无回合时为 nil，键不下发（与 agentcore 同约定：
+			// server 端 isRecord 判定后归一化，空壳不覆盖旧值）。
+			if diag := run.claudeDiag.payload(); diag != nil {
+				frame["diagnostics"] = diag
+			}
+			_ = writeJSON(frame)
 		}
 		for {
 			select {
@@ -6631,6 +6692,10 @@ func streamStructuredAIDelta(reader io.Reader, format agentAIOutputFormat, run a
 			// + 看门狗喂食。放在 activity 配对之后、结构化发射之前，保证同一
 			// 帧上 activity 状态先于 wire 事件就绪。
 			handleClaudeTaskEvents(event, run, writeJSON)
+			// 诊断聚合：assistant 帧（回合数/最近用量/停止原因）与 result 帧
+			// （终态）喂给 claudeRunDiagnostics，进度 ticker 与 runCLIPass 收尾
+			// 读它发 ai.run.progress.diagnostics。nil 安全（无挂载即跳过）。
+			run.claudeDiag.observe(event)
 		}
 		emitClaudeStructuredEvents(format, event, run, writeJSON, pendingCommands, claudeBlockTypes)
 		emitOpenCodeStructuredEvents(format, event, run, writeJSON)
@@ -9131,6 +9196,133 @@ type claudeRetryInfo struct {
 	delayMs     float64
 	errorStatus int // upstream HTTP status that triggered the retry (e.g. 502)
 	errorType   string
+}
+
+// claudeRunDiagnostics 聚合 claude CLI 通道的逐回合诊断快照，供进度心跳与
+// run 终帧消费——诊断面板的 CLI 数据源（与 agentCoreDiagnostics 对应）。
+// CLI 的用量在 finalized assistant 事件的 message.usage（anthropic 语义），
+// 回合数按 assistant 帧计、result 事件的 num_turns 为权威终值；写侧是
+// stdout 流 goroutine（streamStructuredAIDelta），读侧是进度 ticker 与
+// runCLIPass 收尾，跨 goroutine 用互斥锁保护。nil 接收者全部安全短路。
+type claudeRunDiagnostics struct {
+	mu            sync.Mutex
+	turns         int
+	contextTokens int
+	contextWindow int
+	stopReason    string
+	startedAt     time.Time
+	// terminal/reason/elapsedMs 由 result 事件（或收尾 finish）写入：终帧
+	// 携带 run 的权威回合数与耗时，面板重开回放显示的就是这份终值。
+	terminal  bool
+	reason    string
+	elapsedMs int64
+}
+
+func newClaudeRunDiagnostics(contextWindow int) *claudeRunDiagnostics {
+	return &claudeRunDiagnostics{contextWindow: contextWindow, startedAt: time.Now()}
+}
+
+// observe 吃一条 claude stream-json 事件，维护回合数/最近用量/停止原因。
+// assistant 帧的 usage 三项和直接覆盖——与 agentcore 同语义：缓存生效后
+// input 骤降、自动压缩后回落都是正常形态，快照要的是「最近一次实测」。
+func (d *claudeRunDiagnostics) observe(event map[string]interface{}) {
+	if d == nil {
+		return
+	}
+	switch remoteString(event, "type") {
+	case "assistant":
+		message := mapIf(event["message"])
+		if message == nil {
+			return
+		}
+		d.mu.Lock()
+		d.turns++
+		if usage := mapIf(message["usage"]); usage != nil {
+			// 缺失键按 0 计（remoteIntValue 对缺失返回 -1 是「未知」语义，
+			// 混进求和会把三项和拉低 1 的脏值）。
+			in := usageFieldInt(usage, "input_tokens")
+			read := usageFieldInt(usage, "cache_read_input_tokens")
+			write := usageFieldInt(usage, "cache_creation_input_tokens")
+			if total := in + read + write; total > 0 {
+				d.contextTokens = total
+			}
+		}
+		if sr := remoteString(message, "stop_reason"); sr != "" {
+			d.stopReason = sr
+		}
+		d.mu.Unlock()
+	case "result":
+		d.mu.Lock()
+		d.terminal = true
+		if n, ok := remoteIntOK(event, "num_turns"); ok && n > 0 {
+			d.turns = n
+		}
+		if ms, ok := remoteFloatOK(event, "duration_ms"); ok && ms > 0 {
+			d.elapsedMs = int64(ms)
+		}
+		if remoteBoolValue(event, "is_error") {
+			d.reason = "claude: " + firstNonEmpty(remoteString(event, "subtype"), "error")
+		} else {
+			d.reason = ""
+		}
+		d.mu.Unlock()
+	}
+}
+
+// finish 在 runCLIPass 收尾调用：CLI 进程异常退出（无 result 事件）时补一个
+// 终态标记，reason 取自既有的失败文案；正常路径 observe(result) 已标终态，
+// finish 只兜真空。
+func (d *claudeRunDiagnostics) finish(reason string) {
+	if d == nil {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.elapsedMs <= 0 && !d.startedAt.IsZero() {
+		d.elapsedMs = time.Since(d.startedAt).Milliseconds()
+	}
+	if !d.terminal {
+		d.terminal = true
+		d.reason = reason
+	}
+}
+
+// payload 返回进 ai.run.progress 的扁平 diagnostics 字段，键与
+// agentCoreDiagnostics.payload() 一一对应——server 归一化与手机面板共用
+// 同一套字段，CLI 通道不发明新形状。尚无任何回合时返回 nil。
+func (d *claudeRunDiagnostics) payload() map[string]interface{} {
+	if d == nil {
+		return nil
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.turns == 0 {
+		return nil
+	}
+	out := map[string]interface{}{
+		"turns":          d.turns,
+		"context_tokens": d.contextTokens,
+		"context_window": d.contextWindow,
+		// CLI 通道没有内核级无进展守卫，三连击恒 0；键位保持与 agentcore
+		// 对齐，面板按同一形状渲染。
+		"dup_streak":   0,
+		"err_streak":   0,
+		"trunc_streak": 0,
+		"elapsed_ms":   d.elapsedMs,
+	}
+	if d.elapsedMs <= 0 && !d.startedAt.IsZero() {
+		out["elapsed_ms"] = time.Since(d.startedAt).Milliseconds()
+	}
+	if d.stopReason != "" {
+		out["stop_reason"] = d.stopReason
+	}
+	if d.terminal {
+		out["terminal"] = true
+		if d.reason != "" {
+			out["reason"] = d.reason
+		}
+	}
+	return out
 }
 
 // claudeFailureCause builds a concise, phone-friendly cause string for a failed
