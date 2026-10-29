@@ -342,3 +342,52 @@ test('idle agentcore 壳首条续聊：create 帧带 transcript，created ack �
   );
   expect('transcript' in later[later.length - 1]).toBe(false); // ack 后一次性消费
 });
+
+// --- Task 5：审批卡补齐 + notice ---
+
+test('pending 审批带 expires_at：倒计时徽标显示约 23 小时', async ({ page }) => {
+  await openChat(page);
+  await page.getByText('手机发起的会话').click(); // session_id 走壳 aiSessionId 直连
+  await expect(page.getByText('详情用户消息')).toBeVisible();
+  await pushFrame(page, {
+    type: 'ai.approval.request', session_id: 'conv-agentcore-1', approval_id: 'ap-exp-1',
+    kind: 'command', command: 'sleep 1', expires_at: new Date(Date.now() + 23 * 3600 * 1000).toISOString(),
+  });
+  await expect(page.getByTestId('approval-expires')).toHaveText(/约 23 小时|23\s*小时/);
+});
+
+test('ai.approval.cancelled：卡消失 + 提示条（含 reason）', async ({ page }) => {
+  await openChat(page);
+  await page.getByText('手机发起的会话').click();
+  await expect(page.getByText('详情用户消息')).toBeVisible();
+  // 未知 session_id → 审批族 ③ 兜底挂活跃会话（壳）
+  await pushFrame(page, {
+    type: 'ai.approval.request', session_id: 'ghost-555', approval_id: 'ap-cx-1',
+    kind: 'command', command: 'echo cx',
+  });
+  await expect(page.getByText('echo cx')).toBeVisible();
+  await pushFrame(page, {
+    type: 'ai.approval.cancelled', session_id: 'ghost-555', approval_ids: ['ap-cx-1'], reason: 'run_cancelled',
+  });
+  await expect(page.getByText('echo cx')).toHaveCount(0); // 精确清卡
+  await expect(page.getByTestId('chat-approval-cancelled-note')).toHaveText(/审批已被取消（run_cancelled）/);
+});
+
+test('ai.run.notice resume_missing：提示条可见，不阻断输入', async ({ page }) => {
+  await openChat(page);
+  await page.getByText('终端 Claude 会话').click(); // resume 壳——resume_missing 的真实来源
+  const input = page.getByPlaceholder(/输入消息|Type a message/);
+  await input.fill('第一句');
+  await page.keyboard.press('Enter');
+  await expect.poll(async () => page.evaluate(() =>
+    window.__aiFrames.some(f => f.type === 'ai.session.create')
+  )).toBe(true);
+  const sid = await page.evaluate(() =>
+    window.__aiFrames.find(f => f.type === 'ai.session.create').session_id
+  );
+  await pushFrame(page, {
+    type: 'ai.run.notice', session_id: sid, message_id: 'm-1', code: 'resume_missing', detail: 'native session native9 not found',
+  });
+  await expect(page.getByTestId('chat-run-notice')).toHaveText(/原生会话不存在/);
+  await expect(input).toBeEnabled(); // 信息性帧不锁输入
+});

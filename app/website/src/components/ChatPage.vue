@@ -270,31 +270,39 @@
             <p class="text-sm text-slate-400">{{ t('chat_startNew') }}</p>
           </div>
           <div v-for="(msg, idx) in activeMessages" :key="idx" class="mb-3">
-            <div class="mb-1 flex items-center gap-2 text-xs text-slate-400">
-              <span>{{ msg.role === 'user' ? t('dash_me') : t('dash_ai') }}</span>
-              <span v-if="msg.role === 'assistant' && msg.status === 'running'" class="inline-flex items-center gap-1 text-primary">
-                <span class="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-primary"></span>{{ t('chat_statusRunning') }}
-              </span>
-              <span v-else-if="msg.role === 'assistant' && msg.status === 'done'" class="text-emerald-500">{{ t('chat_statusDone') }}</span>
-              <span v-else-if="msg.role === 'assistant' && msg.status === 'error'" class="text-rose-500">!</span>
-            </div>
+            <!-- 系统提示条（审批取消 / run notice）：不是对话气泡，通栏弱化样式 -->
             <div
-              class="inline-block max-w-[85%] whitespace-pre-wrap rounded-lg px-3 py-2 text-sm"
-              :class="msg.role === 'user'
-                ? 'ml-auto block bg-primary text-white'
-                : msg.status === 'error'
-                  ? 'bg-rose-50 text-rose-600 dark:bg-rose-900/30 dark:text-rose-300'
-                  : 'bg-white text-slate-700 dark:bg-slate-700 dark:text-slate-100'"
-            >
-              <span
-                v-if="msg.role === 'assistant' && msg.status === 'running' && !msg.content"
-                class="ai-thinking"
+              v-if="msg.kind === 'system'"
+              :data-testid="msg.note === 'run_notice' ? 'chat-run-notice' : 'chat-approval-cancelled-note'"
+              class="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-500 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300"
+            >{{ msg.content }}</div>
+            <template v-else>
+              <div class="mb-1 flex items-center gap-2 text-xs text-slate-400">
+                <span>{{ msg.role === 'user' ? t('dash_me') : t('dash_ai') }}</span>
+                <span v-if="msg.role === 'assistant' && msg.status === 'running'" class="inline-flex items-center gap-1 text-primary">
+                  <span class="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-primary"></span>{{ t('chat_statusRunning') }}
+                </span>
+                <span v-else-if="msg.role === 'assistant' && msg.status === 'done'" class="text-emerald-500">{{ t('chat_statusDone') }}</span>
+                <span v-else-if="msg.role === 'assistant' && msg.status === 'error'" class="text-rose-500">!</span>
+              </div>
+              <div
+                class="inline-block max-w-[85%] whitespace-pre-wrap rounded-lg px-3 py-2 text-sm"
+                :class="msg.role === 'user'
+                  ? 'ml-auto block bg-primary text-white'
+                  : msg.status === 'error'
+                    ? 'bg-rose-50 text-rose-600 dark:bg-rose-900/30 dark:text-rose-300'
+                    : 'bg-white text-slate-700 dark:bg-slate-700 dark:text-slate-100'"
               >
-                <span class="thinking-dot"></span><span class="thinking-dot"></span><span class="thinking-dot"></span>
-                <span class="ml-1 align-middle">{{ t('chat_aiThinking') }}</span>
-              </span>
-              <template v-else>{{ msg.content }}</template>
-            </div>
+                <span
+                  v-if="msg.role === 'assistant' && msg.status === 'running' && !msg.content"
+                  class="ai-thinking"
+                >
+                  <span class="thinking-dot"></span><span class="thinking-dot"></span><span class="thinking-dot"></span>
+                  <span class="ml-1 align-middle">{{ t('chat_aiThinking') }}</span>
+                </span>
+                <template v-else>{{ msg.content }}</template>
+              </div>
+            </template>
           </div>
           <!-- 插话轻量条（Task 4）：运行中回合的旁路注入，不插独立 user 气泡——
                快照/详情装载的转录才是权威流，避免回灌重复渲染。 -->
@@ -328,6 +336,14 @@
               <span class="font-semibold">{{ approval.title || t('chat_approvalTitle') }}</span>
               <span class="rounded bg-white/70 px-1.5 py-0.5 text-xs font-medium text-amber-700 dark:bg-amber-900/60 dark:text-amber-200">
                 {{ approval.status === 'responding' ? t('chat_approvalResponding') : t('chat_approvalPending') }}
+              </span>
+              <!-- expires_at 倒计时（Task 5）：缺失/已过不渲染；nowTick 每 30s 重算 -->
+              <span
+                v-if="approvalExpiresLabel(approval)"
+                data-testid="approval-expires"
+                class="rounded bg-white/70 px-1.5 py-0.5 text-xs font-medium text-amber-700 dark:bg-amber-900/60 dark:text-amber-200"
+              >
+                {{ approvalExpiresLabel(approval) }}
               </span>
             </div>
             <p v-if="approval.sourceLabel" class="mt-1 text-xs font-medium text-amber-700 dark:text-amber-200">
@@ -1467,6 +1483,9 @@ function upsertApproval(conv, event) {
     toolName: event.tool_name || event.toolName || existing?.toolName || '',
     toolInput: event.tool_input ?? event.toolInput ?? existing?.toolInput ?? null,
     fileChanges: event.file_changes ?? event.fileChanges ?? existing?.fileChanges ?? null,
+    // 审批等待的绝对截止（RFC3339，pending 帧与快照行带、resolved 同型不带）：
+    // 不存则模板倒计时永远渲染不出。已过/缺失由 approvalExpiresLabel 折叠为空。
+    expiresAt: event.expires_at || existing?.expiresAt || '',
     availableDecisions: normalizeApprovalDecisions(event.available_decisions || event.availableDecisions || existing?.availableDecisions),
     error: '',
     updatedAt: now()
@@ -1512,6 +1531,29 @@ function approvalIcon(approval) {
   }
 }
 
+// --- 审批卡 expires_at 倒计时（跨端统一阶段 2 Task 5） ---
+
+// 倒计时刷新时钟：30s 粒度足够（文案最小单位是分钟级「即将超时」）。
+const nowTick = ref(now());
+let nowTickTimer = null;
+
+// 剩余时间文案（nowTick 驱动 30s 重算）：>1h「约 X 小时」、≤1h「X 分钟」、
+// <2 分钟「即将超时」；缺失/已过返回空（徽标不渲染）。
+function approvalExpiresLabel(approval) {
+  const expiresMs = Date.parse(approval?.expiresAt || '');
+  if (!Number.isFinite(expiresMs)) return '';
+  const remainMs = expiresMs - nowTick.value;
+  if (remainMs <= 0) return '';
+  if (remainMs < 2 * 60 * 1000) {
+    return '即将超时'; // TODO(i18n-task6): chat_approvalExpiringSoon
+  }
+  const minutes = Math.ceil(remainMs / 60000);
+  if (minutes <= 60) {
+    return `${minutes} 分钟`; // TODO(i18n-task6): chat_approvalExpiresMinutes
+  }
+  return `约 ${Math.round(remainMs / 3600000)} 小时`; // TODO(i18n-task6): chat_approvalExpiresHours
+}
+
 async function respondApproval(conv, approval, decision) {
   if (!conv || !approval || approval.status !== 'pending') return;
   const normalized = normalizeApprovalDecision(decision);
@@ -1555,6 +1597,18 @@ function finishRun(conv) {
   conv.updatedAt = now();
   if (activeId.value === conv.id) sending.value = false;
   saveToStorage();
+}
+
+// ai.run.notice code → 用户文案（Task 5）；未知 code 返回空（调用方忽略）。
+function agentRunNoticeText(code) {
+  switch (code) {
+    case 'resume_missing':
+      return '原生会话不存在，已按新会话继续'; // TODO(i18n-task6): chat_noticeResumeMissing
+    case 'history_restore_failed':
+      return '历史恢复失败，已按空会话继续'; // TODO(i18n-task6): chat_noticeHistoryRestoreFailed
+    default:
+      return '';
+  }
 }
 
 // --- steer 分流（跨端统一阶段 2 Task 4） ---
@@ -1761,6 +1815,47 @@ function handleAIEvent(e) {
       persist = true;
       break;
     }
+    case 'ai.approval.cancelled': {
+      // 未结束回合的精确清卡（区别于 done/error 路径的 clearApprovalsForSession
+      // 粗暴清空）：逐个作废 + 系统提示条挂对应会话（审批族链已路由到设备壳/
+      // 活跃兜底）。
+      const ids = Array.isArray(e.approval_ids) ? e.approval_ids : [];
+      for (const id of ids) {
+        const key = approvalKeyFromValues(e.session_id, id);
+        handledApprovalIds.add(key);
+        removeApproval(conv, key);
+      }
+      conv.messages.push({
+        role: 'assistant',
+        kind: 'system',
+        note: 'approval_cancelled',
+        // TODO(i18n-task6): chat_approvalCancelled
+        content: e.reason ? `审批已被取消（${e.reason}）` : '审批已被取消',
+        status: 'done',
+        ts: now(),
+      });
+      scrollToBottom();
+      persist = true;
+      break;
+    }
+    case 'ai.run.notice': {
+      // 信息性帧：resume/历史降级的事实说明，不阻断输入、不进错误气泡。
+      // 未知 code 忽略（协议向后兼容——服务端新增 code 不炸旧前端）。
+      const noticeText = agentRunNoticeText(e.code);
+      if (noticeText) {
+        conv.messages.push({
+          role: 'assistant',
+          kind: 'system',
+          note: 'run_notice',
+          content: noticeText,
+          status: 'done',
+          ts: now(),
+        });
+        scrollToBottom();
+        persist = true;
+      }
+      break;
+    }
     case 'ai.done': {
       disarmIdleWatchdog();
       const asst = findRunningAssistant(conv);
@@ -1894,10 +1989,16 @@ onMounted(() => {
   loadFromStorage();
   loadDeviceSessions(); // 设备会话清单：每次进页拉取（权威在后端，不进 localStorage）
   document.addEventListener('keydown', handleKeydown);
+  // 审批卡 expires_at 倒计时刷新（30s 粒度，见 approvalExpiresLabel）
+  nowTickTimer = setInterval(() => { nowTick.value = now(); }, 30000);
 });
 
 onUnmounted(() => {
   document.removeEventListener('keydown', handleKeydown);
+  if (nowTickTimer) {
+    clearInterval(nowTickTimer);
+    nowTickTimer = null;
+  }
   if (aiSocket) {
     try { aiSocket.close(); } catch (_) {}
     aiSocket = null;
