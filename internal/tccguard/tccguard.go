@@ -199,6 +199,36 @@ func GuardPath(path string) error {
 	return nil
 }
 
+// StatAllowed reports whether path may be stat'ed from a background routine
+// with zero chance of raising a TCC prompt. Unlike GuardPath it never probes
+// a protected category: unprotected paths (and paths with a cached grant)
+// return nil, everything else returns ErrConsentRequired so the caller can
+// silently skip the check and leave the fact unknown. Built for periodic
+// inventory jobs where a dialog would be worse than a missing data point.
+// normalize 失败或空串返回 nil（与 GuardPath 同款放行）：调用方随后以原始
+// 路径 stat 自担结果，本函数对该情形不做安全判断。
+func StatAllowed(path string) error {
+	if !guardEnabled() {
+		return nil
+	}
+	home, _ := homeFn()
+	abs, err := normalizePath(path, home)
+	if err != nil || abs == "" {
+		return nil
+	}
+	category, outcome := classify(abs, home)
+	switch outcome {
+	case classUnprotected:
+		return nil
+	case classForeign:
+		return &ConsentRequiredError{Path: abs, Category: category.label, Foreign: true}
+	}
+	if hasGrant(category.key) {
+		return nil
+	}
+	return &ConsentRequiredError{Path: abs, Category: category.label}
+}
+
 // ---------------------------------------------------------------------------
 // Path normalization and classification
 // ---------------------------------------------------------------------------

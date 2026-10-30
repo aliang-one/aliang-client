@@ -84,6 +84,11 @@ func (h *AgentHandler) HandleAIStream(w http.ResponseWriter, r *http.Request) {
 	writeJSON := func(payload interface{}) error {
 		writeMu.Lock()
 		defer writeMu.Unlock()
+		// 5s 写期限（自跨端 parity 线移植）：origin socket 的写是 emitter
+		// fanOutWrite 的内联路径，客户端半死（不读不断）时 WriteJSON 无限期
+		// 挂起会拖死整个 run 的事件发布。超时报错返回后，fanOutWrite 照常
+		// 扇出副本给其他端，origin 的错误语义走调用方自己的终态屏障。
+		_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 		return conn.WriteJSON(payload)
 	}
 
@@ -115,6 +120,136 @@ func (h *AgentHandler) HandleAIStream(w http.ResponseWriter, r *http.Request) {
 // SDK,鉴权/关联由 bridge 的 per-run token 把关(见 services.agentToolAskBridge)。
 func (h *AgentHandler) HandleToolAskMCP(w http.ResponseWriter, r *http.Request) {
 	h.service.HandleToolAskMCP(w, r)
+}
+
+// ---------------------------------------------------------------------------
+// 设备互访本地面（peer-link / `aliang mcp` stdio 面的 HTTP 后端）。
+//
+// 鉴权=56433 loopbackOnly+零 token 既有红线（本机同用户才够得着），不新增
+// 凭据面；出网凭据由本进程持有（services.*Local 门面注释的认证三层模型）。
+// 核心进程（56431）与本 runtime（56433）两侧都要注册——双注册教训
+//（缺任一侧=404 透传，2026-10-21 liang-dev 实测）。
+// ---------------------------------------------------------------------------
+
+func (h *AgentHandler) HandlePeerExec(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
+		return
+	}
+	if h.proxyIfNeeded(w, r) {
+		return
+	}
+	defer r.Body.Close()
+	var payload struct {
+		DeviceID  string `json:"device_id"`
+		Command   string `json:"command"`
+		TimeoutMs int    `json:"timeout_ms"`
+		Workdir   string `json:"workdir"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&payload); err != nil {
+		common.Error(w, http.StatusBadRequest, "Invalid peer exec payload", nil)
+		return
+	}
+	// 630s=工具层 ctx 上限（服务端 fence 600s 先行裁决），与注册表护栏一致。
+	ctx, cancel := context.WithTimeout(r.Context(), 630*time.Second)
+	defer cancel()
+	text, err := h.service.PeerExecLocal(ctx, payload.DeviceID, payload.Command, payload.TimeoutMs, payload.Workdir)
+	if err != nil {
+		common.Error(w, http.StatusBadGateway, err.Error(), nil)
+		return
+	}
+	common.Success(w, map[string]interface{}{"result": text})
+}
+
+func (h *AgentHandler) HandlePeerFetchFile(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
+		return
+	}
+	if h.proxyIfNeeded(w, r) {
+		return
+	}
+	defer r.Body.Close()
+	var payload struct {
+		DeviceID   string `json:"device_id"`
+		RemotePath string `json:"remote_path"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 16<<10)).Decode(&payload); err != nil {
+		common.Error(w, http.StatusBadRequest, "Invalid peer fetch payload", nil)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+	text, err := h.service.PeerFetchFileLocal(ctx, payload.DeviceID, payload.RemotePath)
+	if err != nil {
+		common.Error(w, http.StatusBadGateway, err.Error(), nil)
+		return
+	}
+	common.Success(w, map[string]interface{}{"result": text})
+}
+
+func (h *AgentHandler) HandlePeerDevices(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
+		return
+	}
+	if h.proxyIfNeeded(w, r) {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 14*time.Second)
+	defer cancel()
+	text, err := h.service.DeviceListLocal(ctx)
+	if err != nil {
+		common.Error(w, http.StatusBadGateway, err.Error(), nil)
+		return
+	}
+	common.Success(w, map[string]interface{}{"result": text})
+}
+
+func (h *AgentHandler) HandlePeerDeviceInfo(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
+		return
+	}
+	if h.proxyIfNeeded(w, r) {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 14*time.Second)
+	defer cancel()
+	text, err := h.service.DeviceInfoLocal(ctx, r.URL.Query().Get("device_id"))
+	if err != nil {
+		common.Error(w, http.StatusBadGateway, err.Error(), nil)
+		return
+	}
+	common.Success(w, map[string]interface{}{"result": text})
+}
+
+func (h *AgentHandler) HandlePeerNote(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
+		return
+	}
+	if h.proxyIfNeeded(w, r) {
+		return
+	}
+	defer r.Body.Close()
+	var payload struct {
+		DeviceID string `json:"device_id"`
+		Key      string `json:"key"`
+		Value    string `json:"value"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 16<<10)).Decode(&payload); err != nil {
+		common.Error(w, http.StatusBadRequest, "Invalid peer note payload", nil)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	text, err := h.service.DeviceNoteLocal(ctx, payload.DeviceID, payload.Key, payload.Value)
+	if err != nil {
+		common.Error(w, http.StatusBadGateway, err.Error(), nil)
+		return
+	}
+	common.Success(w, map[string]interface{}{"result": text})
 }
 
 func (h *AgentHandler) HandleAIApprovalHook(w http.ResponseWriter, r *http.Request) {

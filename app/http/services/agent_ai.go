@@ -428,7 +428,11 @@ type agentAIRun struct {
 	effort        string
 	// contextWindow mirrors the session field for this run (claude:
 	// --autocompact tokens; agentcore: kernel compaction budget).
-	contextWindow           int
+	contextWindow int
+	// claudeDiag 聚合 CLI 通道的逐回合诊断快照（诊断面板数据源）。runCLIPass
+	// 在起 ticker 前挂载；run 按值传递，但指针字段在所有副本里仍指向同一
+	// 聚合器。nil 安全（agentcore / codex 路径不挂）。
+	claudeDiag              *claudeRunDiagnostics
 	resumeSessionID         string
 	reservedNativeSessionID string
 	bindingVersion          int
@@ -632,36 +636,77 @@ type agentAIApprovalResponse struct {
 }
 
 // agentAIOptionRequest 描述一次"多方案选择"请求（agent→server）。
+// v2 新增 Header/Summary/Version 均可选：旧 JSON 无这些字段零影响。
 type agentAIOptionRequest struct {
 	ID          string                `json:"option_id,omitempty"`
 	SessionID   string                `json:"session_id,omitempty"`
 	MessageID   string                `json:"message_id,omitempty"`
 	Provider    string                `json:"provider,omitempty"`
 	Title       string                `json:"title,omitempty"`
+	Header      string                `json:"header,omitempty"`
+	Summary     string                `json:"summary,omitempty"`
+	Version     int                   `json:"v,omitempty"`
 	Options     []agentAIOptionChoice `json:"options"`
 	AllowCustom bool                  `json:"allow_custom"`
 	Multi       bool                  `json:"multi"`
 }
 
 type agentAIOptionChoice struct {
-	ID          string `json:"id"`
-	Label       string `json:"label"`
-	Description string `json:"description,omitempty"`
+	ID          string   `json:"id"`
+	Label       string   `json:"label"`
+	Description string   `json:"description,omitempty"`
+	Response    string   `json:"response,omitempty"`
+	Previews    []string `json:"previews,omitempty"`
 }
 
 // aliangOptionsBlockRe 匹配 ```aliang-options\n<json>\n``` 围栏块（DOTALL）。
 var aliangOptionsBlockRe = regexp.MustCompile("(?s)```aliang-options\\s*\\n(.*?)\\n```")
 
+// agentAIOptionIDRe v2 id 硬规则：≤48 字符 ASCII slug（大小写均可，模型常写
+// BlueGreen 之类混合形式，一律重造反而制造 churn）。
+var agentAIOptionIDRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$`)
+
+const agentAIOptionMaxCount = 8
+
+// normalizeAgentAIOptionRequest 对模型产出的块做硬规范化（prompt 只能劝，这里必须拦）：
+// 空 label 选项丢弃；id 缺失/非法/重复 → 重造 option-N（撞已有合法 id 时顺延）；
+// 清洗后再截到 8——先截后丢会白丢名额。重造后的 id 会随 ai.option.request
+// 下发、作答原样回传，全链自洽。
+func normalizeAgentAIOptionRequest(req *agentAIOptionRequest) {
+	seen := make(map[string]bool, len(req.Options))
+	kept := make([]agentAIOptionChoice, 0, agentAIOptionMaxCount)
+	for _, opt := range req.Options {
+		if strings.TrimSpace(opt.Label) == "" {
+			continue
+		}
+		if !agentAIOptionIDRe.MatchString(opt.ID) || seen[opt.ID] {
+			opt.ID = fmt.Sprintf("option-%d", len(kept)+1)
+			for seen[opt.ID] {
+				opt.ID = opt.ID + "x"
+			}
+		}
+		seen[opt.ID] = true
+		kept = append(kept, opt)
+		if len(kept) == agentAIOptionMaxCount {
+			break
+		}
+	}
+	req.Options = kept
+}
+
 // extractAgentAIOptionBlocks 扫描 assistant 完整输出，提取所有 aliang-options 块。
-// 无效 JSON 或 options 为空的块被静默丢弃。
+// 无效 JSON 或 options 为空的块丢弃（JSON 解析失败不再静默：打 Warn 日志，
+// 否则模型写坏围栏=用户什么都看不到且无迹可查）。
 func extractAgentAIOptionBlocks(output string) []agentAIOptionRequest {
 	matches := aliangOptionsBlockRe.FindAllStringSubmatch(output, -1)
 	out := make([]agentAIOptionRequest, 0, len(matches))
 	for _, m := range matches {
 		var req agentAIOptionRequest
 		if err := json.Unmarshal([]byte(m[1]), &req); err != nil {
+			logger.Warn(fmt.Sprintf("[ai.option] aliang-options block dropped: bad JSON (%d bytes): %v", len(m[1]), err))
 			continue
 		}
+		normalizeAgentAIOptionRequest(&req)
 		if len(req.Options) == 0 {
 			continue
 		}
@@ -672,17 +717,23 @@ func extractAgentAIOptionBlocks(output string) []agentAIOptionRequest {
 
 // buildAgentAIOptionFollowup 把用户的选择拼成下一轮的 user prompt。
 // Claude 经 --resume 续接时，这段文本作为新的用户输入。
+// v2：选项带 response（模型预写的确认文案）时优先原样回填，语义最强；
+// 否则退回 label（description）旧形态。
 func buildAgentAIOptionFollowup(req *agentAIOptionRequest, selected []string, custom string) string {
 	var b strings.Builder
 	b.WriteString("用户已在上述方案中做出选择，请据此继续，不要再重复列出方案：\n")
-	labelByID := make(map[string]agentAIOptionChoice, len(req.Options))
+	choiceByID := make(map[string]agentAIOptionChoice, len(req.Options))
 	for _, opt := range req.Options {
-		labelByID[opt.ID] = opt
+		choiceByID[opt.ID] = opt
 	}
 	for _, id := range selected {
-		opt, ok := labelByID[id]
+		opt, ok := choiceByID[id]
 		if !ok {
 			b.WriteString("- 选择了未知选项 id=" + id + "\n")
+			continue
+		}
+		if resp := strings.TrimSpace(opt.Response); resp != "" {
+			b.WriteString("- 选择了：" + resp + "\n")
 			continue
 		}
 		b.WriteString("- 选择了：" + opt.Label)
@@ -1003,8 +1054,11 @@ const (
 )
 
 // agentAIOptionSystemPrompt 引导 Claude 在需要用户多方案抉择时，输出结构化 aliang-options 块，
-// 以便 agent 提取并发 ai.option.request。仅在 Claude 路径注入。
-const agentAIOptionSystemPrompt = `When you have multiple viable approaches/options and the best choice depends on user preference, you MUST let the user choose instead of deciding for them. Present options using a fenced code block with language "aliang-options" containing one JSON object on its own line, shaped exactly: {"title":string,"options":[{"id":string,"label":string,"description":string}],"allow_custom":bool,"multi":bool}. Keep "id" short stable slugs. After the block, stop and wait for the user's choice in the next message; do not proceed on assumption.`
+// 以便 agent 提取并发 ai.option.request。claude(--append-system-prompt)与
+// agentcore(拼进 system)两路注入；codex 不注入（走原生 requestUserInput 映射）。
+// v2 契约：新增 header/summary/response/previews 全部可选；围栏换行格式是硬规则
+// （JSON 粘着标签行/收尾行会被提取正则静默丢弃），必须向模型言明。
+const agentAIOptionSystemPrompt = `When you have multiple viable approaches/options and the best choice depends on user preference, you MUST let the user choose instead of deciding for them. Present them as a fenced code block with language tag aliang-options, formatted exactly: the tag line contains ONLY the three backticks followed by aliang-options and ends with a newline, the next line is exactly one JSON object and nothing else, and the closing three backticks are alone on their own line — a JSON glued to the tag line or to the closing fence, or prose right after the JSON, is silently discarded. JSON shape: {"v":2,"title":string,"header":string,"summary":string,"options":[{"id":string,"label":string,"description":string,"response":string,"previews":[string]}],"allow_custom":bool,"multi":bool}. Only "title" and "options" are required; every other field is optional — omit anything you don't need. Rules: "id" is a short stable ASCII slug (letters, digits, hyphen, underscore; max 48 chars; unique per option); never reuse the label as the id. "label" is what the user reads — plain text only, no markdown syntax and no backticks (emoji/kaomoji are fine), aim under 60 chars. "description" is one short sentence. "response" (write only when it helps) is the receipt text returned as the user's answer when that option is picked — phrase it as a confirmation of that choice. "previews" (write only when it helps, e.g. commands or a short code sketch) is up to 8 one-line strings shown under the option. "header" is a category tag of 16 chars or fewer shown above the title. "summary" is one or two sentences of context. Maximum 8 options. Set "multi":true only when the user should pick several options at once — their picks are sent back together as one answer. Set "allow_custom":true when a free-text answer makes sense. After the fence, stop and wait for the user's choice in the next message; do not proceed on assumption and do not list the options again as prose.`
 
 func newAgentAIManager() *agentAIManager {
 	m := &agentAIManager{
@@ -1090,8 +1144,26 @@ func (m *agentAIManager) evictOldestIdleAISessionLocked() {
 	m.clearPendingApprovalsLocked(victim.id, victim.runSeq, models.AgentAIApprovalDecisionCancel)
 	victim.pendingOption = nil
 	delete(m.sessions, victim.id)
+	// reserved 绑定随会话一并丢弃：reserved 是 server 下发的占位 id，会话没了
+	// 它就失去兑现语境，留着还会在「原生 id 已绑定别的会话」检查里误导后续
+	// confirm 的报错方向。confirmed 是合法 resume 锚（驱逐后 lazy-create 仍能
+	// 从它恢复），保留。persistIdentityState 自带锁，不能在持锁临界区里调，
+	// 丢 goroutine 异步落盘，失败仅日志。
+	reservedDropped := ""
+	if binding, ok := m.bindings[victim.id]; ok && binding.State == "reserved" {
+		reservedDropped = binding.NativeSessionID
+		delete(m.bindings, victim.id)
+	}
 	logger.Info(fmt.Sprintf("ai.session: evicted idle session %s to bound resident set (cap=%d, now=%d)",
 		victim.id, agentAISessionResidentCap, len(m.sessions)))
+	if reservedDropped != "" {
+		logger.Info(fmt.Sprintf("ai.session: evicted session %s 的 reserved 绑定 %q 一并丢弃", victim.id, reservedDropped))
+		go func(sessionID, native string) {
+			if err := m.persistIdentityState(); err != nil {
+				logger.Warn(fmt.Sprintf("ai.session: evict reserved binding persist_failed session=%s native=%s err=%v", sessionID, native, err))
+			}
+		}(victim.id, reservedDropped)
+	}
 }
 
 // approvalService returns the AgentService that owns this manager (used to
@@ -1959,6 +2031,20 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 // runStart is the protocol-v3 atomic create+message command. The server may
 // redeliver it from its durable outbox; replayProcessedRun guarantees the same
 // run never launches a second provider process.
+// mergeRunStartIdentityLocked 把 ai.run.start 携带的身份字段并进会话。空值不
+// 覆盖已钉值（与 attachLiveSession 的字段纪律同款）：server 重投/重连重放的
+// payload 常不带 resume/reserved 字段，空串覆盖会把上一轮 confirmBinding 钉下
+// 的恢复点抹掉，下一回合退化 fresh（2026-10-29 already-in-use 事故第 3 层）。
+// 非空新值（含绑定 confirmed 的权威改写）正常覆盖。调用方必须持有 m.mu。
+func mergeRunStartIdentityLocked(session *agentAISession, resumeID, reservedID string) {
+	if resumeID != "" {
+		session.resumeSessionID = resumeID
+	}
+	if reservedID != "" {
+		session.reservedNativeSessionID = reservedID
+	}
+}
+
 func (m *agentAIManager) runStart(msg map[string]interface{}, writeJSON agentTerminalWriter) {
 	runID := strings.TrimSpace(remoteString(msg, "run_id"))
 	sessionID := strings.TrimSpace(remoteString(msg, "session_id"))
@@ -2026,8 +2112,25 @@ func (m *agentAIManager) runStart(msg map[string]interface{}, writeJSON agentTer
 				msg["provider"] = persisted.Provider
 				msg["tool"] = persisted.Provider
 			}
-		} else if reservedID == "" {
-			reservedID = persisted.NativeSessionID
+		} else {
+			if reservedID == "" {
+				reservedID = persisted.NativeSessionID
+			}
+			// reserved 自愈（2026-10-29 already-in-use 事故的入口保险）：server
+			// 判死吞掉终态 confirm 后，reserved 身份对应的 jsonl 可能已由上一轮
+			// 真实落盘。此时仍按 fresh --session-id 启动必撞 "Session ID already
+			// in use" exit 1，且绑定恒停 reserved、每回合重试必死。探到落盘事实
+			// 即把本回合升级为 --resume，恢复点交由本轮 confirmBinding 正常收敛。
+			// 仅 claude 族有 jsonl 概念；codex 无从探测，由 codex 侧 mismatch
+			// 自愈兜底。
+			if persisted.State == "reserved" && resumeID == "" && reservedID != "" &&
+				providersEquivalent(persisted.Provider, "claudecode") {
+				if jsonl := ccPeerSessionJSONL(externalTUIHome(), reservedID); jsonl != "" {
+					logger.Info(fmt.Sprintf("ai.run.resume.revive: session=%s reserved id %q jsonl 已落盘(%s)，fresh 自动升级 --resume", sessionID, reservedID, jsonl))
+					resumeID = reservedID
+					reservedID = ""
+				}
+			}
 		}
 	}
 	if session := m.sessions[sessionID]; session != nil {
@@ -2039,8 +2142,7 @@ func (m *agentAIManager) runStart(msg map[string]interface{}, writeJSON agentTer
 		if cw := clampAgentAIContextWindow(remoteInt(msg, "context_window", 0)); cw > 0 {
 			session.contextWindow = cw
 		}
-		session.resumeSessionID = resumeID
-		session.reservedNativeSessionID = reservedID
+		mergeRunStartIdentityLocked(session, resumeID, reservedID)
 		session.bindingVersion = remoteInt(msg, "binding_version", session.bindingVersion)
 		if v := strings.TrimSpace(remoteString(msg, agentAIOriginSocketField)); v != "" {
 			session.originSocket = v
@@ -3665,6 +3767,9 @@ func (m *agentAIManager) emitOptionRequest(run agentAIRun, writeJSON agentTermin
 		"message_id":   req.MessageID,
 		"option_id":    req.ID,
 		"title":        req.Title,
+		"header":       req.Header,
+		"summary":      req.Summary,
+		"v":            req.Version,
 		"options":      req.Options,
 		"allow_custom": req.AllowCustom,
 		"multi":        req.Multi,
@@ -4259,7 +4364,13 @@ func (m *agentAIManager) clearAgentAIResumeSessionID(sessionID string, runSeq in
 	if session == nil || session.runSeq != runSeq {
 		return
 	}
-	if expected == "" || session.resumeSessionID == expected {
+	// expected 为空是「按值撤销」的退化形态：无条件清空会把确认期钉下的恢复点
+	// 一并抹掉（2026-10-29 already-in-use 事故类：空值覆盖已钉恢复点）。空锚即
+	// 不撤，撤销必须指名道姓。
+	if expected == "" {
+		return
+	}
+	if session.resumeSessionID == expected {
 		session.resumeSessionID = ""
 	}
 }
@@ -4277,6 +4388,12 @@ const (
 	// print the accepted levels). The pass emitted no assistant output; the
 	// caller should clamp the effort to a listed level and retry once.
 	agentAIRunEffortRejected
+	// agentAIRunSessionIDInUse means the CLI refused to START a new session
+	// with the caller-provided --session-id because a transcript with that id
+	// already exists on disk (the identity was consumed by an earlier run).
+	// The pass emitted no assistant output; the caller should release the
+	// reserved binding, drop --session-id, and retry fresh once.
+	agentAIRunSessionIDInUse
 )
 
 type agentAIRunOutcome int
@@ -4345,6 +4462,14 @@ func (m *agentAIManager) runCLI(ctx context.Context, run agentAIRun, writeJSON a
 		emitAgentAIResumeMissingNotice(writeJSON, run, run.resumeSessionID)
 	}
 	outcome, rej := m.runCLIPass(ctx, run, writeJSON, false)
+	if outcome == agentAIRunSessionIDInUse && ctx.Err() == nil {
+		// 自愈：reserved 身份已被消费（jsonl 在盘），释放绑定并去掉
+		// --session-id，让 CLI 自铸新 id 重跑一次（与 resume-missing 的清+重试
+		// 同构）。单次封顶：重跑时 newSessionID 为空，分类器不可能再命中。
+		m.releaseReservedBinding(run.sessionID, run.reservedNativeSessionID)
+		run.reservedNativeSessionID = ""
+		outcome, rej = m.runCLIPass(ctx, run, writeJSON, false)
+	}
 	m.retryAfterEffortRejected(ctx, run, writeJSON, outcome, rej, false)
 }
 
@@ -4710,6 +4835,32 @@ func toIntValue(raw interface{}) (int, bool) {
 		return int(v), true
 	}
 	return 0, false
+}
+
+// remoteIntOK / remoteFloatOK / remoteBoolValue：claudeRunDiagnostics 读
+// result 事件数值/布尔字段的取值器（encoding/json 解出的数字是 float64），
+// 形态对齐 remoteString(event, key)。
+func usageFieldInt(usage map[string]interface{}, key string) int {
+	if v, ok := toIntValue(usage[key]); ok {
+		return v
+	}
+	return 0
+}
+
+func remoteIntOK(event map[string]interface{}, key string) (int, bool) {
+	return toIntValue(event[key])
+}
+
+func remoteFloatOK(event map[string]interface{}, key string) (float64, bool) {
+	if v, ok := event[key].(float64); ok {
+		return v, true
+	}
+	return 0, false
+}
+
+func remoteBoolValue(event map[string]interface{}, key string) bool {
+	b, _ := event[key].(bool)
+	return b
 }
 
 // agentAICloudFieldCap bounds a single structured-event text field (command
@@ -5113,6 +5264,9 @@ func (m *agentAIManager) runCodexAppServer(ctx context.Context, run agentAIRun, 
 	threadID := ""
 	turnID := ""
 	threadBound := false
+	// codex mismatch 自愈的单次封顶闸：reserved 占位释放后 confirmBinding 的
+	// expected 为空，结构上不可能二次 mismatch，闸只是纵深防御。
+	bindingRetried := false
 	bindThread := func() error {
 		if threadBound || threadID == "" {
 			return nil
@@ -5443,6 +5597,23 @@ func (m *agentAIManager) runCodexAppServer(ctx context.Context, run agentAIRun, 
 			}
 			if threadID != "" {
 				if err := bindThread(); err != nil {
+					// codex mismatch 自愈（2026-10-29 already-in-use 事故的 codex
+					// 侧）：本地还是 reserved 占位时，mismatch 说明占位 id 已不可
+					// 兑现——claude 族撞 jsonl 的同族问题在 codex 表现为撞绑定锚。
+					// 释放绑定、丢掉 resume 锚，就地以全新 thread/start 重试一次。
+					// 释放后 confirmBinding 的 expected 为空，不会二次 mismatch。
+					if !bindingRetried && strings.Contains(err.Error(), "mismatch") && m.reservedBindingID(run.sessionID) != "" {
+						bindingRetried = true
+						m.releaseReservedBinding(run.sessionID, "")
+						run.resumeSessionID = ""
+						delete(threadParams, "threadId")
+						threadMethod = "thread/start"
+						codexPhase = threadMethod
+						threadID = ""
+						logger.Warn(fmt.Sprintf("ai.codex.binding.revive: session=%s runSeq=%d reserved 绑定 mismatch 已释放，就地重跑 thread/start", run.sessionID, run.runSeq))
+						_ = send(map[string]interface{}{"method": threadMethod, "id": 1, "params": threadParams})
+						continue
+					}
 					terminalErr = "Codex provider binding failed: " + err.Error()
 					goto done
 				}
@@ -6080,6 +6251,20 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 		resumeID = ""
 	}
 
+	// spawn 前的第二道 revive 保险（runStart 入口是第一道）：真 fresh
+	// （resumeSessionID 为空）且 reserved 身份的 jsonl 已落盘时，直接升级
+	// --resume 复用既有历史，而不是撞 "Session ID already in use"。weld 路径
+	// （resume 已被判不可解）不翻转，避免把已知打不开的 resume 再翻回去。
+	if !allowResume && newSessionID != "" && strings.TrimSpace(run.resumeSessionID) == "" &&
+		(providersEquivalent(run.provider, "claudecode") || strings.EqualFold(run.provider, "auto")) {
+		if jsonl := ccPeerSessionJSONL(externalTUIHome(), newSessionID); jsonl != "" {
+			logger.Info(fmt.Sprintf("ai.run.resume.revive: session=%s runSeq=%d reserved id %q jsonl 已落盘(%s)，fresh 自动升级 --resume", run.sessionID, run.runSeq, newSessionID, jsonl))
+			resumeID = newSessionID
+			newSessionID = ""
+			allowResume = true
+		}
+	}
+
 	var tool *agentAITool
 	var err error
 	if run.readOnly || len(run.goalIdentity) > 0 {
@@ -6286,6 +6471,30 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 	}
 	progressStop := make(chan struct{})
 	defer close(progressStop)
+	// CLI 通道诊断聚合器（与 agentcore 路径的 agentCoreDiagnostics 对应）：
+	// stdout goroutine 经 streamStructuredAIDelta 写，这里 ticker 与收尾终帧
+	// 读。挂载在 run 上（指针字段），流解析副本共享同一聚合器。
+	run.claudeDiag = newClaudeRunDiagnostics(run.contextWindow)
+	// 终态诊断帧：CLI 进程退出后收尾显式补一帧带 terminal 标记的诊断——
+	// server 归一化落库后，面板重开会话回放显示的就是这份终值。注册在
+	// progressStop 的 defer 之后（LIFO 先执行），终帧先于 ticker 关闭发出。
+	defer func() {
+		if run.claudeDiag == nil {
+			return
+		}
+		// 无 result 事件（进程被杀/崩溃）时补终态标记，reason 留空——结构化
+		// 真因已由 ai.error 通道单独下发，这里不重复拼文案。
+		run.claudeDiag.finish("")
+		frame := map[string]interface{}{
+			"type":       models.AgentEventAIRunProgress,
+			"session_id": run.sessionID,
+			"message_id": agentAssistantMessageID(run.messageID),
+		}
+		if diag := run.claudeDiag.payload(); diag != nil {
+			frame["diagnostics"] = diag
+			_ = writeJSON(frame)
+		}
+	}()
 	go func() {
 		ticker := time.NewTicker(agentAIRunProgressInterval)
 		defer ticker.Stop()
@@ -6293,13 +6502,20 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 			filesMu.Lock()
 			touched := len(filesTouched)
 			filesMu.Unlock()
-			_ = writeJSON(map[string]interface{}{
+			frame := map[string]interface{}{
 				"type":                models.AgentEventAIRunProgress,
 				"session_id":          run.sessionID,
 				"message_id":          agentAssistantMessageID(run.messageID),
 				"files_touched_count": touched,
 				"git_changed_count":   countGitChanged(run.projectPath),
-			})
+			}
+			// 逐回合诊断快照（回合数/上下文用量/停止原因），诊断面板的 CLI
+			// 实时数据源。尚无回合时为 nil，键不下发（与 agentcore 同约定：
+			// server 端 isRecord 判定后归一化，空壳不覆盖旧值）。
+			if diag := run.claudeDiag.payload(); diag != nil {
+				frame["diagnostics"] = diag
+			}
+			_ = writeJSON(frame)
 		}
 		for {
 			select {
@@ -6398,6 +6614,13 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 		if allowResume && isAgentAIResumeMissing(stderrBuf.String()) {
 			return agentAIRunResumeMissing, agentAIEffortRejection{}
 		}
+		// --session-id 撞已落盘 jsonl（CLI 启动期身份校验拒绝，无 assistant 输
+		// 出）：上报专用 outcome，让调用方释放 reserved 绑定、去掉 --session-id
+		// 重跑一次 fresh，而不是把可自愈的失败直接抛给用户（2026-10-29
+		// already-in-use 事故的兜底）。
+		if !allowResume && newSessionID != "" && isAgentAISessionIDInUse(stderrBuf.String()) {
+			return agentAIRunSessionIDInUse, agentAIEffortRejection{}
+		}
 		// CLI 在参数校验阶段拒绝了 --effort:极老世代连 flag 都没有(unknown
 		// option),旧世代硬拒值并枚举合法清单。此时不可能有 assistant 输出,
 		// 上报 agentAIRunEffortRejected 让调用方去 flag/按清单钳制后重试,而不是
@@ -6480,6 +6703,15 @@ func isAgentAIResumeMissing(stderr string) bool {
 	mentionsSession := strings.Contains(lower, "session") || strings.Contains(lower, "thread") || strings.Contains(lower, "rollout")
 	missing := strings.Contains(lower, "not found") || strings.Contains(lower, "does not exist") || strings.Contains(lower, "no rollout")
 	return mentionsSession && missing
+}
+
+// isAgentAISessionIDInUse 识别 claude CLI 对 --session-id 的「身份占用」拒绝：
+// 该 id 的 transcript jsonl 已存在（上一轮同 id run 已落盘）时，CLI 拒绝以该
+// id 开新会话并 exit 1。与 isAgentAIResumeMissing 同族，是它的镜像问题
+// （resume 打不开 vs fresh 身份被占）。
+func isAgentAISessionIDInUse(stderr string) bool {
+	lower := strings.ToLower(stderr)
+	return strings.Contains(lower, "session id") && strings.Contains(lower, "already in use")
 }
 
 // captureAgentAIStderr reads everything from reader, storing the first cap
@@ -6631,6 +6863,10 @@ func streamStructuredAIDelta(reader io.Reader, format agentAIOutputFormat, run a
 			// + 看门狗喂食。放在 activity 配对之后、结构化发射之前，保证同一
 			// 帧上 activity 状态先于 wire 事件就绪。
 			handleClaudeTaskEvents(event, run, writeJSON)
+			// 诊断聚合：assistant 帧（回合数/最近用量/停止原因）与 result 帧
+			// （终态）喂给 claudeRunDiagnostics，进度 ticker 与 runCLIPass 收尾
+			// 读它发 ai.run.progress.diagnostics。nil 安全（无挂载即跳过）。
+			run.claudeDiag.observe(event)
 		}
 		emitClaudeStructuredEvents(format, event, run, writeJSON, pendingCommands, claudeBlockTypes)
 		emitOpenCodeStructuredEvents(format, event, run, writeJSON)
@@ -9131,6 +9367,133 @@ type claudeRetryInfo struct {
 	delayMs     float64
 	errorStatus int // upstream HTTP status that triggered the retry (e.g. 502)
 	errorType   string
+}
+
+// claudeRunDiagnostics 聚合 claude CLI 通道的逐回合诊断快照，供进度心跳与
+// run 终帧消费——诊断面板的 CLI 数据源（与 agentCoreDiagnostics 对应）。
+// CLI 的用量在 finalized assistant 事件的 message.usage（anthropic 语义），
+// 回合数按 assistant 帧计、result 事件的 num_turns 为权威终值；写侧是
+// stdout 流 goroutine（streamStructuredAIDelta），读侧是进度 ticker 与
+// runCLIPass 收尾，跨 goroutine 用互斥锁保护。nil 接收者全部安全短路。
+type claudeRunDiagnostics struct {
+	mu            sync.Mutex
+	turns         int
+	contextTokens int
+	contextWindow int
+	stopReason    string
+	startedAt     time.Time
+	// terminal/reason/elapsedMs 由 result 事件（或收尾 finish）写入：终帧
+	// 携带 run 的权威回合数与耗时，面板重开回放显示的就是这份终值。
+	terminal  bool
+	reason    string
+	elapsedMs int64
+}
+
+func newClaudeRunDiagnostics(contextWindow int) *claudeRunDiagnostics {
+	return &claudeRunDiagnostics{contextWindow: contextWindow, startedAt: time.Now()}
+}
+
+// observe 吃一条 claude stream-json 事件，维护回合数/最近用量/停止原因。
+// assistant 帧的 usage 三项和直接覆盖——与 agentcore 同语义：缓存生效后
+// input 骤降、自动压缩后回落都是正常形态，快照要的是「最近一次实测」。
+func (d *claudeRunDiagnostics) observe(event map[string]interface{}) {
+	if d == nil {
+		return
+	}
+	switch remoteString(event, "type") {
+	case "assistant":
+		message := mapIf(event["message"])
+		if message == nil {
+			return
+		}
+		d.mu.Lock()
+		d.turns++
+		if usage := mapIf(message["usage"]); usage != nil {
+			// 缺失键按 0 计（remoteIntValue 对缺失返回 -1 是「未知」语义，
+			// 混进求和会把三项和拉低 1 的脏值）。
+			in := usageFieldInt(usage, "input_tokens")
+			read := usageFieldInt(usage, "cache_read_input_tokens")
+			write := usageFieldInt(usage, "cache_creation_input_tokens")
+			if total := in + read + write; total > 0 {
+				d.contextTokens = total
+			}
+		}
+		if sr := remoteString(message, "stop_reason"); sr != "" {
+			d.stopReason = sr
+		}
+		d.mu.Unlock()
+	case "result":
+		d.mu.Lock()
+		d.terminal = true
+		if n, ok := remoteIntOK(event, "num_turns"); ok && n > 0 {
+			d.turns = n
+		}
+		if ms, ok := remoteFloatOK(event, "duration_ms"); ok && ms > 0 {
+			d.elapsedMs = int64(ms)
+		}
+		if remoteBoolValue(event, "is_error") {
+			d.reason = "claude: " + firstNonEmpty(remoteString(event, "subtype"), "error")
+		} else {
+			d.reason = ""
+		}
+		d.mu.Unlock()
+	}
+}
+
+// finish 在 runCLIPass 收尾调用：CLI 进程异常退出（无 result 事件）时补一个
+// 终态标记，reason 取自既有的失败文案；正常路径 observe(result) 已标终态，
+// finish 只兜真空。
+func (d *claudeRunDiagnostics) finish(reason string) {
+	if d == nil {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.elapsedMs <= 0 && !d.startedAt.IsZero() {
+		d.elapsedMs = time.Since(d.startedAt).Milliseconds()
+	}
+	if !d.terminal {
+		d.terminal = true
+		d.reason = reason
+	}
+}
+
+// payload 返回进 ai.run.progress 的扁平 diagnostics 字段，键与
+// agentCoreDiagnostics.payload() 一一对应——server 归一化与手机面板共用
+// 同一套字段，CLI 通道不发明新形状。尚无任何回合时返回 nil。
+func (d *claudeRunDiagnostics) payload() map[string]interface{} {
+	if d == nil {
+		return nil
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.turns == 0 {
+		return nil
+	}
+	out := map[string]interface{}{
+		"turns":          d.turns,
+		"context_tokens": d.contextTokens,
+		"context_window": d.contextWindow,
+		// CLI 通道没有内核级无进展守卫，三连击恒 0；键位保持与 agentcore
+		// 对齐，面板按同一形状渲染。
+		"dup_streak":   0,
+		"err_streak":   0,
+		"trunc_streak": 0,
+		"elapsed_ms":   d.elapsedMs,
+	}
+	if d.elapsedMs <= 0 && !d.startedAt.IsZero() {
+		out["elapsed_ms"] = time.Since(d.startedAt).Milliseconds()
+	}
+	if d.stopReason != "" {
+		out["stop_reason"] = d.stopReason
+	}
+	if d.terminal {
+		out["terminal"] = true
+		if d.reason != "" {
+			out["reason"] = d.reason
+		}
+	}
+	return out
 }
 
 // claudeFailureCause builds a concise, phone-friendly cause string for a failed

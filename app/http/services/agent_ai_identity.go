@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"aliang.one/nursorgate/app/http/models"
+	"aliang.one/nursorgate/common/logger"
 )
 
 const (
@@ -302,6 +303,39 @@ func (m *agentAIManager) reserveBinding(
 	}
 	m.mu.Unlock()
 	return m.persistIdentityState()
+}
+
+// releaseReservedBinding 释放滞留的 reserved 绑定。reserved 是 server 下发的
+// 占位 id，一旦被证实不可按 fresh 兑现（jsonl 已落盘 / codex mismatch），留着
+// 只会让后续每个回合继续拿它当错锚（2026-10-29 already-in-use 事故类）。
+// confirmed 是合法 resume 锚，绝不释放。expected 非空时还要求 id 相等，防误删
+// 换绑后的新绑定。落盘失败只 Warn：内存已干净，下一次成功的 persistIdentityState
+// 会用当前内存状态覆盖磁盘（与 zombie_revoke 的取舍一致）。
+func (m *agentAIManager) releaseReservedBinding(sessionID, expected string) {
+	m.mu.Lock()
+	binding, ok := m.bindings[sessionID]
+	if !ok || binding.State != "reserved" || (expected != "" && binding.NativeSessionID != expected) {
+		m.mu.Unlock()
+		return
+	}
+	delete(m.bindings, sessionID)
+	if session := m.sessions[sessionID]; session != nil && session.reservedNativeSessionID == binding.NativeSessionID {
+		session.reservedNativeSessionID = ""
+	}
+	m.mu.Unlock()
+	if err := m.persistIdentityState(); err != nil {
+		logger.Warn(fmt.Sprintf("ai.binding.release: persist_failed session=%s err=%v", sessionID, err))
+	}
+}
+
+// reservedBindingID 返回会话当前 reserved 绑定的原生 id（非 reserved 态返回空）。
+func (m *agentAIManager) reservedBindingID(sessionID string) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if binding, ok := m.bindings[sessionID]; ok && binding.State == "reserved" {
+		return binding.NativeSessionID
+	}
+	return ""
 }
 
 func (m *agentAIManager) bindingForNative(provider, nativeSessionID string) (agentAIBindingRecord, bool) {

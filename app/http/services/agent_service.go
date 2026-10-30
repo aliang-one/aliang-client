@@ -183,6 +183,12 @@ type AgentService struct {
 	// the owner is driving the connection lifecycle.
 	bootSessionEventSeen atomic.Bool
 
+	// remoteHello gates change-driven full hellos (see agent_vibe_hello_gate.go):
+	// 2026-10-29 生产实锤 digest 风暴(3367 hello/天,2496 次因 vibe_digest_change)
+	// 把 server 端 ai_messages 写路径拖入死锁。变更推送改为 ≥30s 合批;状态挂
+	// 服务级以跨重连存活,sendAgentHello 单一咽喉刷新基线。
+	remoteHello agentRemoteHelloGate
+
 	// remoteWriter holds the live remote-connection writer. AI (and terminal)
 	// events are emitted through currentRemoteWriter() rather than a closure
 	// captured at message-arrival time, so a reconnect reattaches in-flight AI

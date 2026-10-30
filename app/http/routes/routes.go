@@ -269,6 +269,13 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	register("/api/agent/tools/launch", h.Agent.HandleLaunch, http.MethodPost)
 	// 设备互传本地触发（D13）：转发 PhoneServer POST /api/transfers
 	register("/api/agent/transfers", h.Agent.HandleTransferCreate, http.MethodPost)
+	// 设备互访本地面（peer-link / `aliang mcp` stdio 面的 HTTP 后端）：核心侧
+	// 透传到 user agent runtime（双注册教训：缺这里=404，2026-10-21 实测）。
+	register("/api/agent/peer/exec", h.Agent.HandlePeerExec, http.MethodPost)
+	register("/api/agent/peer/fetch-file", h.Agent.HandlePeerFetchFile, http.MethodPost)
+	register("/api/agent/peer/devices", h.Agent.HandlePeerDevices, http.MethodGet)
+	register("/api/agent/peer/device-info", h.Agent.HandlePeerDeviceInfo, http.MethodGet)
+	register("/api/agent/peer/note", h.Agent.HandlePeerNote, http.MethodPost)
 	register("/api/agent/ai/stream", h.Agent.HandleAIStream, http.MethodGet)
 	register("/api/agent/ai/approval-hook", h.Agent.HandleAIApprovalHook, http.MethodPost)
 	// 自有交互工具 MCP 端点(tool_ask bridge):路径含 per-run token,方法由

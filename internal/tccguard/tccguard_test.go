@@ -95,6 +95,50 @@ func TestGuardPathAllowsUnprotectedWithoutProbe(t *testing.T) {
 	}
 }
 
+func TestStatAllowedAllowsUnprotectedWithoutProbe(t *testing.T) {
+	env := newGuardEnv(t, true) // 即使在场（GuardPath 会 probe 的条件）也绝不 probe
+	path := filepath.Join(env.home, "dev", "proj")
+	if err := StatAllowed(path); err != nil {
+		t.Fatalf("StatAllowed(unprotected) = %v, want nil", err)
+	}
+	if got := env.probes.Load(); got != 0 {
+		t.Fatalf("StatAllowed probed %d times, want 0", got)
+	}
+}
+
+// 关键安全契约：受保护且无授权的路径必须拒绝，且【无论是否在场】绝不触发
+// probe——这是 StatAllowed 与 GuardPath 的全部区别。此测试变红说明有人把
+// probe 语义漏进了 StatAllowed，后台采集会重新出现 TCC 弹窗风险。
+func TestStatAllowedRefusesProtectedWithoutGrantAndNeverProbes(t *testing.T) {
+	for _, attended := range []bool{false, true} {
+		env := newGuardEnv(t, attended)
+		env.setProbe(func(string) error {
+			t.Error("StatAllowed must never probe a protected path")
+			return nil
+		})
+		path := filepath.Join(env.home, "Documents", "proj")
+		consentErr := assertConsent(t, StatAllowed(path))
+		if consentErr.Foreign {
+			t.Errorf("attended=%v: Foreign = true, want false", attended)
+		}
+		if got := env.probes.Load(); got != 0 {
+			t.Fatalf("attended=%v: StatAllowed probed %d times, want 0", attended, got)
+		}
+	}
+}
+
+func TestStatAllowedAllowsProtectedWithCachedGrant(t *testing.T) {
+	env := newGuardEnv(t, true)
+	project := filepath.Join(env.home, "Documents", "proj")
+	// 授权先由 GuardPath（用户点开语义，允许 probe）建立，StatAllowed 才放行。
+	if err := GuardPath(project); err != nil {
+		t.Fatalf("GuardPath seed grant = %v, want nil", err)
+	}
+	if err := StatAllowed(project); err != nil {
+		t.Fatalf("StatAllowed with cached grant = %v, want nil", err)
+	}
+}
+
 func TestGuardPathUnattendedRefusesProtected(t *testing.T) {
 	env := newGuardEnv(t, false)
 	for _, rel := range []string{
