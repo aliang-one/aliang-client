@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -13,30 +14,78 @@ import (
 // directory listing request.
 const agentGitStatusTimeout = 5 * time.Second
 
-// loadGitStatusMap runs `git status --porcelain` rooted at targetPath and
-// returns map[absolutePath]→'added'|'modified'|'deleted' for changed files
-// UNDER targetPath. Keys are filepath.Join(targetPath, rel) — the same space the
-// listing's itemPath uses — so lookups match regardless of symlink resolution.
-// Non-git dir / git missing / any error → empty map (everything reads 'clean').
+// 测试注入点:包装真实 agentRunGit 以计数/stub。
+var agentRunGitFn = agentRunGit
+
+// --- repo 级 porcelain 缓存(2026-10-30 文件浏览器慢治理)---
+// 旧行为:每次目录 listing 在 targetPath 跑全仓 git status,5s 超时——大仓库
+// 每次展开/刷新都是秒级重扫,叠加 agent 忙时排队 → server 12s 超时 → 错误卡。
+// 现改为:git status 在 repo root 跑一次,结果(绝对路径键)按 root 缓存
+// gitStatusCacheTTL;并发 listing single-flight 共享同一次扫描。
+// 只读契约:调用方不得修改返回的 map。
+var (
+	gitStatusCacheTTL = 5 * time.Second
+	gitStatusCacheMu  sync.Mutex
+	gitStatusCache    = map[string]*gitStatusCacheEntry{}
+)
+
+type gitStatusCacheEntry struct {
+	once      chan struct{} // close = 填充完成(成功或失败)
+	changes   map[string]string
+	fetchedAt time.Time
+}
+
+// loadGitStatusMap returns map[absolutePath]→'added'|'modified'|'deleted' for
+// changed files in the repo containing targetPath. Keys are
+// filepath.Join(root, rel) — the same absolute space the listing's itemPath
+// uses. Non-git dir / git missing / any error → empty map (everything reads
+// 'clean'); failures are NOT cached (next listing retries).
 func loadGitStatusMap(targetPath string) map[string]string {
-	out := make(map[string]string)
-	porcelain, err := agentRunGit(targetPath, "status", "--porcelain=v1", "-unormal")
+	rootOut, err := agentRunGitFn(targetPath, "rev-parse", "--show-toplevel")
 	if err != nil {
-		return out
+		return map[string]string{}
 	}
-	parentPrefix := ".." + string(filepath.Separator)
-	for _, line := range strings.Split(porcelain, "\n") {
-		if len(line) < 4 {
-			continue
+	root := strings.TrimSpace(rootOut)
+
+	gitStatusCacheMu.Lock()
+	entry := gitStatusCache[root]
+	if entry != nil {
+		select {
+		case <-entry.once:
+			// 已就绪:新鲜则复用;过期则走下方重建。
+			if time.Since(entry.fetchedAt) < gitStatusCacheTTL {
+				gitStatusCacheMu.Unlock()
+				return entry.changes
+			}
+		default:
+			// 在飞:single-flight,等同一个 runner 填完。
+			gitStatusCacheMu.Unlock()
+			<-entry.once
+			return entry.changes
 		}
-		code := line[:2]
-		rel := agentUnquoteGitPath(strings.TrimSpace(line[3:]))
-		if rel == "" || strings.HasPrefix(rel, parentPrefix) {
-			continue // skip changes outside targetPath's subtree
-		}
-		out[filepath.Join(targetPath, rel)] = classifyGitStatusCode(code)
 	}
-	return out
+	entry = &gitStatusCacheEntry{once: make(chan struct{})}
+	gitStatusCache[root] = entry
+	gitStatusCacheMu.Unlock()
+
+	porcelain, err := agentRunGitFn(root, "status", "--porcelain=v1", "-unormal")
+	changes := map[string]string{}
+	if err == nil {
+		for _, line := range strings.Split(porcelain, "\n") {
+			if len(line) < 4 {
+				continue
+			}
+			rel := agentUnquoteGitPath(strings.TrimSpace(line[3:]))
+			if rel == "" {
+				continue
+			}
+			changes[filepath.Join(root, rel)] = classifyGitStatusCode(line[:2])
+		}
+	}
+	entry.changes = changes
+	entry.fetchedAt = time.Now()
+	close(entry.once)
+	return entry.changes
 }
 
 // classifyGitStatusCode maps a 2-char `git status --porcelain` code (XY: index +
