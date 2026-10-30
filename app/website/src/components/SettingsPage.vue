@@ -205,6 +205,10 @@
               :success-message="customerConfigSuccess"
               @save="saveCustomerConfig"
             />
+            <!-- MCP 与技能（只读）：设备侧清单 + 对 AliangCode 内核的生效态。
+                 放在 AliangCode 设置之后——「我配的东西有没有被 AliangCode 用上」
+                 是看完内核配置后的自然下一问。 -->
+            <AgentIntegrationsSettings />
           </template>
         </section>
 
@@ -260,6 +264,7 @@ import AgentSettings from './settings/AgentSettings.vue';
 import AgentRuntimeSessions from './settings/AgentRuntimeSessions.vue';
 import AgentActivitySettings from './settings/AgentActivitySettings.vue';
 import AgentScanDirectoriesSettings from './settings/AgentScanDirectoriesSettings.vue';
+import AgentIntegrationsSettings from './settings/AgentIntegrationsSettings.vue';
 import ModelMappingSettings from './settings/ModelMappingSettings.vue';
 import CustomEnvSettings from './settings/CustomEnvSettings.vue';
 import AgentCoreSettings from './settings/AgentCoreSettings.vue';
@@ -451,6 +456,7 @@ export default {
     AgentRuntimeSessions,
     AgentActivitySettings,
     AgentScanDirectoriesSettings,
+    AgentIntegrationsSettings,
     ModelMappingSettings,
     CustomEnvSettings,
     AgentCoreSettings

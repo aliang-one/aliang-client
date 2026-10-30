@@ -62,6 +62,12 @@ export async function getAgentRuntimeSessions() {
   return request('/api/agent/runtime-sessions', { method: 'GET' });
 }
 
+// MCP 与技能只读报告：设备侧 MCP server / skill 清单 + 每项对 AliangCode
+// 内核的生效状态（injected / skipped_headers / not_collected）。
+export async function getAgentIntegrations() {
+  return request('/api/agent/integrations', { method: 'GET' });
+}
+
 export async function getAgentSessionDetail(sessionId, { limit, before } = {}) {
   const params = new URLSearchParams();
   if (limit) params.set('limit', String(limit));
