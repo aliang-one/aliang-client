@@ -534,6 +534,7 @@ func (s *AgentService) deviceListReport(ctx context.Context) (string, error) {
 	selfID := strings.TrimSpace(s.currentDeviceID())
 	type peerDeviceEntry struct {
 		id, name, platform, status, version string
+		osText                              string
 		peerExec                            bool
 		self                                bool
 	}
@@ -549,6 +550,7 @@ func (s *AgentService) deviceListReport(ctx context.Context) (string, error) {
 			platform: peerAPIString(d, "platform"),
 			status:   peerAPIString(d, "status"),
 			version:  peerAPIString(d, "agent_version", "agentVersion"),
+			osText:   peerAPISystemSummary(d),
 			peerExec: peerAPIBool(d, "peer_exec_enabled", "peerExecEnabled"),
 			self:     id == selfID,
 		})
@@ -580,8 +582,12 @@ func (s *AgentService) deviceListReport(ctx context.Context) (string, error) {
 			}
 			return v
 		}
-		fmt.Fprintf(&b, "- id=%s | %s | platform=%s | status=%s | agent=%s | peer_exec=%s\n",
-			e.id, name, field(e.platform), field(e.status), field(e.version), peerExec)
+		osText := e.osText
+		if osText == "" {
+			osText = field(e.platform)
+		}
+		fmt.Fprintf(&b, "- id=%s | %s | os=%s | status=%s | agent=%s | peer_exec=%s\n",
+			e.id, name, osText, field(e.status), field(e.version), peerExec)
 	}
 	return strings.TrimRight(b.String(), "\n"), nil
 }
@@ -614,6 +620,14 @@ func (s *AgentService) deviceInfoLocalReport() (string, error) {
 	fmt.Fprintf(&b, "device %s (this machine)\n", strings.TrimSpace(s.currentDeviceID()))
 	fmt.Fprintf(&b, "hostname: %s\n", hostname)
 	fmt.Fprintf(&b, "platform: %s, agent_version: %s\n", snapshot.Platform, snapshot.AgentVersion)
+	if sysText := agentSystemSummary(collectAgentSystemSnapshot()); sysText != "" {
+		fmt.Fprintf(&b, "system: %s\n", sysText)
+	}
+	// 内网地址是「路由基础信息」——spec §7.3 只允许 device_info 返回，
+	// device_list 不返回（避免把全网拓扑铺进上下文）。
+	if netText := agentNetSummary(collectAgentNetSnapshot()); netText != "" {
+		fmt.Fprintf(&b, "network: %s\n", netText)
+	}
 	fmt.Fprintf(&b, "load: cpu=%.0f%% mem=%.0f%% (%d/%d MiB used) load1=%.2f uptime=%ds\n",
 		load.CPUUsagePct, load.MemUsagePct, load.MemUsedBytes>>20, load.MemTotalBytes>>20,
 		load.LoadAvg1, load.AgentUptimeSec)
@@ -642,6 +656,12 @@ func (s *AgentService) deviceInfoRemoteReport(ctx context.Context, deviceID stri
 		fmt.Fprintf(&b, "platform: %s, agent_version: %s, status: %s\n",
 			peerAPIString(device, "platform"), peerAPIString(device, "agent_version", "agentVersion"),
 			peerAPIString(device, "status"))
+		if sysText := peerAPISystemSummary(device); sysText != "" {
+			fmt.Fprintf(&b, "system: %s\n", sysText)
+		}
+		if netText := peerAPINetSummary(device); netText != "" {
+			fmt.Fprintf(&b, "network: %s\n", netText)
+		}
 		if loadText := peerAPILoadSummary(device); loadText != "" {
 			fmt.Fprintf(&b, "load: %s\n", loadText)
 		}
@@ -672,6 +692,60 @@ func peerAPILoadSummary(device map[string]interface{}) string {
 		parts = append(parts, fmt.Sprintf("load1=%.2f", avg))
 	}
 	return strings.Join(parts, " ")
+}
+
+// peerAPISystemSummary 从设备响应的 system 子对象抽一行式画像摘要（冷层）。
+// 缺字段整体退化为空串，调用方回落到 platform。只取对「选目标设备」有用的
+// 信息：OS/版本、架构、内存——不取序列号/主机名之外的任何硬件指纹。
+func peerAPISystemSummary(device map[string]interface{}) string {
+	sys, ok := device["system"].(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	name := peerAPIString(sys, "os_name")
+	if name == "" {
+		return ""
+	}
+	if ver := peerAPIString(sys, "os_version"); ver != "" {
+		name += " " + ver
+	}
+	parts := []string{name}
+	if arch := peerAPIString(sys, "arch"); arch != "" {
+		parts = append(parts, arch)
+	}
+	if memBytes, ok := sys["mem_total_bytes"].(float64); ok && memBytes > 0 {
+		parts = append(parts, fmt.Sprintf("%d MiB RAM", int64(memBytes)>>20))
+	}
+	return strings.Join(parts, ", ")
+}
+
+// peerAPINetSummary 从设备响应的 net 子对象抽内网地址摘要（热层网络身份）。
+func peerAPINetSummary(device map[string]interface{}) string {
+	netObj, ok := device["net"].(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	ifaces, _ := netObj["interfaces"].([]interface{})
+	parts := make([]string, 0, len(ifaces))
+	for _, item := range ifaces {
+		iface, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		ip := peerAPIString(iface, "ipv4")
+		if ip == "" {
+			continue
+		}
+		entry := ip
+		if name := peerAPIString(iface, "name"); name != "" {
+			entry = name + "=" + ip
+		}
+		if prefix, ok := iface["prefix_len"].(float64); ok {
+			entry += fmt.Sprintf("/%d", int(prefix))
+		}
+		parts = append(parts, entry)
+	}
+	return strings.Join(parts, ", ")
 }
 
 // peerAPIMetadataSummary 概括 metadata 响应：条数 + 最近 updated_by（条目级）。
