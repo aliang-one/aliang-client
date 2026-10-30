@@ -61,11 +61,11 @@ describe('useDeviceSessions', () => {
   });
 
   it('loadDeviceSessions 成功：清单就位、available=true，壳派生稳定且字段钉死', async () => {
-    getAgentSessions.mockResolvedValue({ sessions: [AGENTCORE_ENTRY, CLAUDE_ENTRY] });
+    getAgentSessions.mockResolvedValue({ sessions: [AGENTCORE_ENTRY] });
     const ds = useDeviceSessions();
     await ds.loadDeviceSessions();
     expect(ds.available.value).toBe(true);
-    expect(ds.deviceSessions.value).toHaveLength(2);
+    expect(ds.deviceSessions.value).toHaveLength(1);
 
     const shell = ds.shellForEntry(AGENTCORE_ENTRY);
     expect(shell).not.toBeNull();
@@ -79,13 +79,23 @@ describe('useDeviceSessions', () => {
     expect(shell.provider).toBe('agentcore');
     expect(shell.deviceSession).toBe(AGENTCORE_ENTRY);
 
+    // 同一条目重复派生返回同一对象（缓存防重建）
+    expect(ds.shellForEntry(AGENTCORE_ENTRY)).toBe(shell);
+  });
+
+  it('loadDeviceSessions 只认 agentcore：claude/codex 清单条目被过滤（聊天窗口径）', async () => {
+    getAgentSessions.mockResolvedValue({ sessions: [AGENTCORE_ENTRY, CLAUDE_ENTRY] });
+    const ds = useDeviceSessions();
+    await ds.loadDeviceSessions();
+    // 聊天窗只展示 AliangCode 对话（用户拍板 2026-10-30）；claude_/codex_ 等
+    // 其他 agent 的条目不进本窗口——审计面在设置页「AI 会话活动」。
+    expect(ds.deviceSessions.value).toHaveLength(1);
+    expect(ds.deviceSessions.value[0].provider).toBe('agentcore');
+    // 壳派生对被过滤条目仍可用（防御：审批族帧三键命中时兜底建壳）
     const termShell = ds.shellForEntry(CLAUDE_ENTRY);
     expect(termShell.aiSessionId).toBe('local-dev-claude_native9'); // 前缀 id 新建托管会话
     expect(termShell.resumeSessionId).toBe('native9'); // 清单无 source_session_id → 剥前缀
     expect(termShell.resumeProjectPath).toBe('/home/a/term');
-
-    // 同一条目重复派生返回同一对象（缓存防重建）
-    expect(ds.shellForEntry(AGENTCORE_ENTRY)).toBe(shell);
   });
 
   it('shellForEntry 原位刷新：同对象换清单字段，打开态（messages）保留', async () => {
