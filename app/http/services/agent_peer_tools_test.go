@@ -385,6 +385,57 @@ func TestAgentDeviceInfoHandler_WrapperBodyTolerated(t *testing.T) {
 	}
 }
 
+func TestAgentDeviceListHandler_SlimDirectory(t *testing.T) {
+	// 安全字段白名单：host/location/load/IP 一律不得进 LLM 上下文
+	//（「LLM 路径零泄漏」纪律，spec §7.3）。本机 device-b 置顶。
+	payload := `[
+		{"id":"device-c","name":"win-box","platform":"windows-amd64","status":"offline","agent_version":"1.1.86","peer_exec_enabled":true,"host":"192.168.1.44","location":"bedroom","load":{"cpu_usage_pct":77}},
+		{"id":"device-b","name":"mac-studio","platform":"darwin-arm64","status":"online","agent_version":"1.1.89","peer_exec_enabled":false,"host":"10.0.0.2"},
+		{"device_id":"device-d","name":"headless","status":"online"}
+	]`
+	ts := newPeerToolsTestServer(t, http.StatusOK, payload)
+	peerToolsTestEnv(t, ts)
+
+	res := agentPeerDeviceListPayload(map[string]interface{}{"type": "peer.device_list", "request_id": "req-10"})
+	if res["error"] != nil {
+		t.Fatalf("device_list failed: %v", res)
+	}
+	text, _ := res["result"].(string)
+	for _, want := range []string{
+		"3 device(s)",
+		"id=device-b | mac-studio (this machine) | platform=darwin-arm64 | status=online | agent=1.1.89 | peer_exec=disabled",
+		"id=device-c | win-box | platform=windows-amd64 | status=offline | agent=1.1.86 | peer_exec=enabled",
+		// device_id 兼容键也要吃到 id；缺 platform/agent 落 "-"。
+		"id=device-d | headless | platform=- | status=online | agent=-",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("directory missing %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "192.168.1.44") || strings.Contains(text, "10.0.0.2") ||
+		strings.Contains(text, "bedroom") || strings.Contains(text, "cpu=77") {
+		t.Fatalf("host/location/load leaked into LLM context:\n%s", text)
+	}
+	// 本机置顶：device-b 行必须先于 device-c 行出现。
+	if strings.Index(text, "id=device-b") > strings.Index(text, "id=device-c") {
+		t.Fatalf("self device must sort first:\n%s", text)
+	}
+	_, path, _, _, _ := ts.last()
+	if path != "/api/devices" {
+		t.Fatalf("path = %s, want /api/devices", path)
+	}
+}
+
+func TestAgentDeviceListHandler_ServerError(t *testing.T) {
+	ts := newPeerToolsTestServer(t, http.StatusUnauthorized, `{"error":"token expired"}`)
+	peerToolsTestEnv(t, ts)
+
+	res := agentPeerDeviceListPayload(map[string]interface{}{"type": "peer.device_list", "request_id": "req-11"})
+	if res["error"] == nil {
+		t.Fatalf("expected structured error, got %+v", res)
+	}
+}
+
 func TestSanitizePeerError_StripsTokenAndSignature(t *testing.T) {
 	in := "dial failed: Get \"https://api.example.com/v1/peer/exec?token=abc123&x=1&q-signature=zzz&trace=ok\": connection reset"
 	out := sanitizePeerError(errors.New(in))
@@ -419,6 +470,7 @@ func TestAgentToolRegistry_ContainsPeerTools(t *testing.T) {
 		"peer_fetch_file": {AgentPeerToolEventFetchFile, false},
 		"device_info":     {AgentPeerToolEventDeviceInfo, true},
 		"device_note":     {AgentPeerToolEventDeviceNote, false},
+		"device_list":     {AgentPeerToolEventDeviceList, true},
 	}
 	for id, wantCaps := range want {
 		tool, ok := reg.Get(wantCaps.event)
@@ -453,14 +505,14 @@ func TestAgentCorePeerTools_BridgeSharesHandlers(t *testing.T) {
 
 	m := &agentAIManager{coreJournal: newAgentCoreJournal(t.TempDir())}
 	tools := m.agentCorePeerTools(agentAIRun{sessionID: "sess-bridge"})
-	if len(tools) != 4 {
-		t.Fatalf("tools = %d, want 4", len(tools))
+	if len(tools) != 5 {
+		t.Fatalf("tools = %d, want 5", len(tools))
 	}
 	names := map[string]bool{}
 	for _, tool := range tools {
 		names[tool.Name()] = true
 	}
-	for _, want := range []string{"peer.exec", "peer.fetch_file", "peer.device_info", "peer.device_note"} {
+	for _, want := range []string{"peer.exec", "peer.fetch_file", "peer.device_info", "peer.device_note", "peer.device_list"} {
 		if !names[want] {
 			t.Fatalf("missing bridge tool %s (have %v)", want, names)
 		}

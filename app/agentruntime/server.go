@@ -111,7 +111,7 @@ func StopLocalServer() error {
 }
 
 func registerAgentRoutes(mux *http.ServeMux) {
-	logger.Info("[AGENT-BOOT] local_server registering_routes routes=/api/agent/status,/api/agent/sync,/api/agent/enable,/api/agent/auth-recover,/api/agent/disable,/api/agent/tools,/api/agent/protocol,/api/agent/tools/launch,/api/agent/ai/approval-hook,/api/agent/ai/stream")
+	logger.Info("[AGENT-BOOT] local_server registering_routes routes=/api/agent/status,/api/agent/sync,/api/agent/enable,/api/agent/auth-recover,/api/agent/disable,/api/agent/tools,/api/agent/protocol,/api/agent/tools/launch,/api/agent/ai/approval-hook,/api/agent/ai/stream,/api/agent/peer/*")
 	agentHandler := handlers.NewAgentHandler(services.GetSharedAgentService())
 	mux.HandleFunc("/api/agent/status", agentHandler.HandleStatus)
 	mux.HandleFunc("/api/agent/sync", agentHandler.HandleSync)
@@ -131,6 +131,13 @@ func registerAgentRoutes(mux *http.ServeMux) {
 	// 设备互传本地触发（D13）：核心侧 routes.go 已有同名注册，缺这里会 404
 	//（双注册教训，2026-10-21 liang-dev 实测）。
 	mux.HandleFunc("/api/agent/transfers", agentHandler.HandleTransferCreate)
+	// 设备互访本地面（peer-link / `aliang mcp` stdio 面的 HTTP 后端）：核心侧
+	// routes.go 同名注册透传（双注册教训同上，缺任一侧=404）。
+	mux.HandleFunc("/api/agent/peer/exec", agentHandler.HandlePeerExec)
+	mux.HandleFunc("/api/agent/peer/fetch-file", agentHandler.HandlePeerFetchFile)
+	mux.HandleFunc("/api/agent/peer/devices", agentHandler.HandlePeerDevices)
+	mux.HandleFunc("/api/agent/peer/device-info", agentHandler.HandlePeerDeviceInfo)
+	mux.HandleFunc("/api/agent/peer/note", agentHandler.HandlePeerNote)
 	mux.HandleFunc("/api/agent/ai/approval-hook", agentHandler.HandleAIApprovalHook)
 	// 仪表盘聊天 WS（2026-10-28 统一）：core 把 /api/agent/ai/stream 透传到本
 	// runtime，由本地 AI 管理器跑（journal/清单与手机同源）。缺注册=404 透传

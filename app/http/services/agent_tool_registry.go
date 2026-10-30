@@ -17,7 +17,10 @@ import (
 // peer.device_info/peer.device_note 同样不与任何显式臂冲突,完整走 default
 // 臂护栏分发；服务端靠心跳 rev 漂移自动重拉 tools.list,零服务端点亮代码。
 // 写工具免逐次审批的取舍记录在 agent_peer_tools.go 文件头。
-const agentToolRegistryRev = 4
+// rev 5: 新增 device_list(读,GET /api/devices 客户端侧瘦身)——阶段1 四件工具
+// 全部只收 device_id,LLM 无从自查「账号里有哪几台设备」；本工具补上设备
+// 发现闭环（2026-10-30 审计缺口#2）。事件 peer.device_list 同样不与显式臂冲突。
+const agentToolRegistryRev = 5
 
 // buildAgentToolRegistry is THE single source of truth for remotely-invokable
 // read-only tools. Legacy four first (events unchanged = old-server compat);
@@ -184,6 +187,22 @@ func buildAgentToolRegistry() *tools.Registry {
 			},
 			Caps:    tools.Caps{ReadOnly: false, TimeoutMs: 35000, MaxOutputBytes: 16384},
 			Handler: agentDeviceNotePayload,
+		},
+		// 设备发现闭环（rev 5）：其余 peer 工具都要 device_id,本工具是唯一
+		// 的目录口。只回安全字段（id/name/platform/status/agent_version/
+		// peer_exec），host/location/load/IP 一律不进 LLM 上下文。
+		&tools.Tool{
+			ID:    "device_list",
+			Event: AgentPeerToolEventDeviceList,
+			Description: "List every device in this account with id, name, platform, online status " +
+				"and whether peer exec is enabled. This is the directory to pick device_id from for " +
+				"the other peer tools (peer_exec / peer_fetch_file / device_info / device_note).",
+			Parameters: map[string]interface{}{
+				"type":       "object",
+				"properties": map[string]interface{}{},
+			},
+			Caps:    tools.Caps{ReadOnly: true, TimeoutMs: 15000, MaxOutputBytes: 16384},
+			Handler: agentPeerDeviceListPayload,
 		},
 	)
 }
