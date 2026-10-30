@@ -408,6 +408,13 @@ var (
 	// need to observe close(done); the grace exists so a goroutine parked inside a
 	// socket write can never delay loop exit indefinitely.
 	agentRemoteTeardownGrace = newDurationAtom(2 * time.Second)
+	// agentRemoteMaxFrameBytes 是远端 WS 单帧读上限（gorilla 连接级，一次设置
+	// 即对整条连接生效）。此前双方均无帧限（gorilla 默认不限），对端/中间层
+	// 异常可把进程内存灌爆。8MiB 与 PhoneServer /ws/agent 的 maxPayload 对齐
+	// ——peer.* 阶段 1 帧族（stdout/stderr 各 256KiB）远小于该值，取服务端
+	// 上限而不是 1MiB 是为了让既有大帧（如 terminal.replay 批量回放）不被
+	// 客户端读限先行掐断。
+	agentRemoteMaxFrameBytes int64 = 8 << 20
 )
 
 func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn) error {
@@ -459,6 +466,9 @@ func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn) error {
 		_ = conn.SetReadDeadline(time.Now().Add(agentRemoteReadWindow.Load()))
 	}
 	resetReadDeadline()
+	// 单帧读上限（spec §5.1/§8.4）：连接级一次设置，超限帧让 ReadJSON 立即
+	// 报错断连重连，而不是把内存交给对端任意挥霍。
+	conn.SetReadLimit(agentRemoteMaxFrameBytes)
 	conn.SetPongHandler(func(string) error {
 		resetReadDeadline()
 		return nil
@@ -784,6 +794,21 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 		// 不匹配为 no-op。
 		s.setRemoteConnectionState(true, "online", "")
 		safeGo("transfer_cancel", func() { s.handleAgentTransferCancel(msg, writeJSON) })
+	case models.AgentEventPeerExecRequest:
+		// 设备互访阶段 1（spec §5.2）：B 端一次性命令执行。离线化处理（不堵
+		// read loop，长命令最长 600s），串行/超时/封顶/审计全在
+		// handleAgentPeerExecRequest 内。经 remoteAgentMessageRequiresEnabledDevice
+		// 门禁——与 terminal/AI 同族的控制面能力，禁用设备不得响应。
+		s.setRemoteConnectionState(true, "online", "")
+		safeGo("peer_exec", func() { s.handleAgentPeerExecRequest(msg, writeJSON) })
+	case models.AgentEventPeerExecRejected:
+		// 设备互访阶段 1（spec §5.2）：服务端对 A 侧请求的裁决回包。A 侧工具
+		// 走同步 REST 编排（POST /api/peer/exec 的 4xx 即裁决），本帧是异步
+		// 补发的旁证（如目标机中途 busy）——静默消费，避免落 default 臂回
+		// unsupported 噪声。留一条日志供审计对账（reason 是契约必填字段）。
+		s.setRemoteConnectionState(true, "online", "")
+		logger.Warn(fmt.Sprintf("[AGENT-PEER] peer_exec_rejected request_id=%s reason=%s",
+			remoteString(msg, "request_id"), remoteString(msg, "reason")))
 	// 注意：这四个旧工具事件（file.list/file.read/git.status/env.info）由下面的
 	// 显式臂直派、有意绕过 default 臂的 tools.RunWithGuards 护栏（无超时看门狗/
 	// 输出上限/panic 恢复）——响应形状兼容优先。注册表里它们的 caps（TimeoutMs/
@@ -1001,7 +1026,10 @@ func remoteAgentMessageRequiresEnabledDevice(msgType string) bool {
 		models.AgentEventAIOptionResponse,
 		models.AgentEventAIRename,
 		models.AgentEventAIStop,
-		models.AgentEventAISessionClose:
+		models.AgentEventAISessionClose,
+		// 设备互访阶段 1（spec §5.2）：对端发来的命令执行请求是控制面能力，
+		// 与 terminal/AI 同族——禁用设备不得响应。
+		models.AgentEventPeerExecRequest:
 		return true
 	default:
 		// tools.list 是元 RPC（非注册表工具项），显式门控；注册表命中的工具事件
@@ -1242,6 +1270,9 @@ func agentCapabilities() []string {
 		"goal_verify_v1",
 		"workspace_fingerprint_v1",
 		"file_transfer_v1",
+		// 设备互访阶段 1（spec §5.1）：一次性命令执行 + fetch 编排能力位。
+		// 服务端按位门控下发 peer.* 流量，老设备自动落「仅中继」兼容路径。
+		"peer_v1",
 	)
 	return caps
 }

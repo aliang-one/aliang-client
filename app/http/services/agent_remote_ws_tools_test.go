@@ -73,10 +73,18 @@ func TestRegistryEventsDoNotCollideWithExplicitArms(t *testing.T) {
 	// 工具若未处理该不变量，会在此失败并提示作者核对显式臂。
 	// git.log（rev 3 新增）已人工核对：switch 无该 case，经 default 臂
 	// RunWithGuards 分发，不受旧臂遮蔽影响。
+	// 设备互访四件（rev 4 新增，spec 2026-10-29 §7）已人工核对：switch 显式
+	// 臂只有 peer.exec.request / peer.exec.rejected（帧族），与工具事件
+	// peer.exec / peer.fetch_file / peer.device_info / peer.device_note 均不同
+	// 名，全部经 default 臂护栏分发。
 	allowed := map[string]bool{
 		models.AgentEventFileList: true, models.AgentEventFileRead: true,
 		models.AgentEventGitStatus: true, models.AgentEventEnvInfo: true,
-		models.AgentEventGitLog: true,
+		models.AgentEventGitLog:      true,
+		AgentPeerToolEventExec:       true,
+		AgentPeerToolEventFetchFile:  true,
+		AgentPeerToolEventDeviceInfo: true,
+		AgentPeerToolEventDeviceNote: true,
 	}
 	for _, tool := range agentToolRegistry().List() {
 		if !allowed[tool.Event] {
