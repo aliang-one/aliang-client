@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestClassifyGitStatusCode(t *testing.T) {
@@ -60,7 +61,7 @@ func TestLoadGitStatusMap(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not installed")
 	}
-	dir := t.TempDir()
+	dir := realPath(t, t.TempDir())
 	run := func(args ...string) {
 		cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
 		if out, err := cmd.CombinedOutput(); err != nil {
@@ -103,7 +104,7 @@ func TestLoadGitStatusMapChineseFilenames(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not installed")
 	}
-	dir := t.TempDir()
+	dir := realPath(t, t.TempDir())
 	run := func(args ...string) {
 		cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
 		if out, err := cmd.CombinedOutput(); err != nil {
@@ -156,5 +157,201 @@ func TestLoadGitStatusMapChineseFilenames(t *testing.T) {
 	// (文档.md 在仓库根,这里补验聚合路径没被直接命中分支挡住。)
 	if got := gitDirectoryStatus(dir, m); got != "modified" {
 		t.Errorf("仓库根聚合: got %q, want modified", got)
+	}
+}
+
+// --- repo 级缓存 + single-flight(2026-10-30 文件浏览器慢治理)---
+// loadGitStatusMap 现按 repo root 缓存 porcelain 结果(5s TTL,在飞 single-flight):
+// 子目录 listing 复用同一次全仓扫描,不再每次展开/刷新都重扫。以下钉子用
+// 计数桩包住真实 git 验证:status 调用次数、子目录共享、TTL 过期重扫、
+// 并发 single-flight、非 git 目录不入缓存。
+
+// 计数桩:包住原 agentRunGit,返回 status 调用次数指针;测试结束自动还原。
+func withCountedGitRun(t *testing.T) *int {
+	t.Helper()
+	calls := 0
+	orig := agentRunGitFn
+	agentRunGitFn = func(dir string, args ...string) (string, error) {
+		if len(args) > 0 && args[0] == "status" {
+			calls++
+		}
+		return orig(dir, args...)
+	}
+	t.Cleanup(func() { agentRunGitFn = orig })
+	return &calls
+}
+
+// 清空缓存 + 记录 TTL/桩还原。
+func resetGitStatusCacheForTest(t *testing.T) {
+	t.Helper()
+	drain := func() {
+		gitStatusCacheMu.Lock()
+		gitStatusCache = map[string]*gitStatusCacheEntry{}
+		gitStatusCacheMu.Unlock()
+	}
+	drain()
+	origTTL := gitStatusCacheTTL
+	t.Cleanup(func() {
+		drain()
+		gitStatusCacheTTL = origTTL
+	})
+}
+
+// realPath 解析符号链接:t.TempDir() 在 macOS 走 /var→/private/var,而
+// git rev-parse --show-toplevel 返回真路径——缓存的键空间是真路径,断言
+// 查找必须用同一拼写(生产用户目录无此差异)。
+func realPath(t *testing.T, p string) string {
+	t.Helper()
+	r, err := filepath.EvalSymlinks(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+
+func newGitRepoWithChanges(t *testing.T) string {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	dir := realPath(t, t.TempDir())
+	run := func(args ...string) {
+		cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	run("init")
+	run("config", "user.email", "t@t")
+	run("config", "user.name", "t")
+	if err := os.WriteFile(filepath.Join(dir, "clean.go"), []byte("package x\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", "-A")
+	run("commit", "-m", "init")
+	if err := os.WriteFile(filepath.Join(dir, "dirty.go"), []byte("package y\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+func TestLoadGitStatusMapCacheHitWithinTTL(t *testing.T) {
+	dir := newGitRepoWithChanges(t)
+	resetGitStatusCacheForTest(t)
+	statusCalls := withCountedGitRun(t)
+
+	first := loadGitStatusMap(dir)
+	second := loadGitStatusMap(dir)
+
+	if *statusCalls != 1 {
+		t.Fatalf("status 调用次数 = %d, want 1(TTL 内第二次必须命中缓存)", *statusCalls)
+	}
+	if len(first) != len(second) || first[filepath.Join(dir, "dirty.go")] != "added" {
+		t.Fatalf("缓存命中结果不一致: first=%v second=%v", first, second)
+	}
+}
+
+func TestLoadGitStatusMapSubdirSharesRootEntry(t *testing.T) {
+	dir := newGitRepoWithChanges(t)
+	resetGitStatusCacheForTest(t)
+	statusCalls := withCountedGitRun(t)
+
+	sub := filepath.Join(dir, "sub")
+	if err := os.MkdirAll(sub, 0755); err != nil {
+		t.Fatal(err)
+	}
+	sub = realPath(t, sub)
+	mSub := loadGitStatusMap(sub)
+	mRoot := loadGitStatusMap(dir)
+
+	if *statusCalls != 1 {
+		t.Fatalf("子目录+根共 %d 次 status, want 1(共享 root 条目)", *statusCalls)
+	}
+	// repo 全量 map:子目录调用也能看到根下的改动键(绝对路径同一空间)。
+	if mSub[filepath.Join(dir, "dirty.go")] != "added" || mRoot[filepath.Join(dir, "dirty.go")] != "added" {
+		t.Fatalf("map 缺 dirty.go 键: sub=%v root=%v", mSub, mRoot)
+	}
+}
+
+func TestLoadGitStatusMapTTLExpiryRescans(t *testing.T) {
+	dir := newGitRepoWithChanges(t)
+	resetGitStatusCacheForTest(t)
+	gitStatusCacheTTL = 1 * time.Millisecond
+	statusCalls := withCountedGitRun(t)
+
+	if m := loadGitStatusMap(dir); m[filepath.Join(dir, "dirty.go")] != "added" {
+		t.Fatalf("首次扫描缺 dirty.go: %v", m)
+	}
+	// TTL 内改文件 → 缓存仍旧;过期后重扫必须看到新文件。
+	time.Sleep(5 * time.Millisecond)
+	if err := os.WriteFile(filepath.Join(dir, "fresh.go"), []byte("package f\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	m := loadGitStatusMap(dir)
+	if *statusCalls != 2 {
+		t.Fatalf("status 调用次数 = %d, want 2(TTL 过期必须重扫)", *statusCalls)
+	}
+	if m[filepath.Join(dir, "fresh.go")] != "added" {
+		t.Fatalf("过期重扫未看到新文件: %v", m)
+	}
+}
+
+func TestLoadGitStatusMapSingleFlight(t *testing.T) {
+	dir := newGitRepoWithChanges(t)
+	resetGitStatusCacheForTest(t)
+
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	calls := 0
+	orig := agentRunGitFn
+	agentRunGitFn = func(rdir string, args ...string) (string, error) {
+		if len(args) > 0 && args[0] == "status" {
+			calls++
+			select {
+			case entered <- struct{}{}:
+			default:
+			}
+			<-release
+			return " M dirty.go\n", nil
+		}
+		return orig(rdir, args...)
+	}
+	t.Cleanup(func() { agentRunGitFn = orig })
+
+	type result struct {
+		m   map[string]string
+		err bool
+	}
+	done := make(chan result, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			m := loadGitStatusMap(dir)
+			done <- result{m: m}
+		}()
+	}
+	<-entered          // runner 已进入(一次)
+	close(release)     // 放行
+	r1, r2 := <-done, <-done
+	if calls != 1 {
+		t.Fatalf("并发下 status 调用 = %d, want 1(single-flight)", calls)
+	}
+	if r1.m[filepath.Join(dir, "dirty.go")] != "modified" || r2.m[filepath.Join(dir, "dirty.go")] != "modified" {
+		t.Fatalf("两个并发调用结果不一致: %v / %v", r1.m, r2.m)
+	}
+}
+
+func TestLoadGitStatusMapNonGitNotCached(t *testing.T) {
+	resetGitStatusCacheForTest(t)
+	statusCalls := withCountedGitRun(t)
+
+	plain := t.TempDir() // 非 git 目录
+	if got := loadGitStatusMap(plain); len(got) != 0 {
+		t.Fatalf("非 git 目录: got %v, want empty", got)
+	}
+	if got := loadGitStatusMap(plain); len(got) != 0 {
+		t.Fatalf("非 git 目录第二次: got %v, want empty", got)
+	}
+	if *statusCalls != 0 {
+		t.Fatalf("非 git 目录不应触发 status, got %d 次", *statusCalls)
 	}
 }
