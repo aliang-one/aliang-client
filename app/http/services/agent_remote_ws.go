@@ -570,6 +570,8 @@ func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn) error {
 					"device_id": s.currentDeviceID(),
 					"ts":        time.Now().UnixMilli(),
 					"load":      collectAgentLoadSnapshot(),
+					// 热层网络身份(spec §4.3)：接口地址随插拔变化，2s TTL 缓存。
+					"net": collectAgentNetSnapshot(),
 					// 工具注册表 rev：服务端比对发现漂移即重拉 tools.list。
 					"agent_tools_rev": agentToolRegistryRev,
 				})
@@ -1168,6 +1170,13 @@ func (s *AgentService) agentHelloPayload() map[string]interface{} {
 	s.mu.Unlock()
 
 	snapshot := s.collectAgentSyncSnapshotWithActiveRuns(scanDirs)
+	// 画像冷层/热层(spec §4.2/§4.3)：system 是设备固定身份(OS/CPU/内存)，
+	// net 是当前内网地址。服务端据此让 LLM 选目标设备、判同内网。
+	systemSnap := collectAgentSystemSnapshot()
+	toolVersions := make([]string, 0, len(snapshot.Tools))
+	for _, tool := range snapshot.Tools {
+		toolVersions = append(toolVersions, tool.ID+"@"+tool.Version)
+	}
 	return map[string]interface{}{
 		"type":                   models.AgentEventHello,
 		"protocol_version":       models.AgentProtocolVersion,
@@ -1188,6 +1197,11 @@ func (s *AgentService) agentHelloPayload() map[string]interface{} {
 		"collected_at":           snapshot.CollectedAt,
 		"started_at":             time.Now().UTC().Format(time.RFC3339),
 		"load":                   collectAgentLoadSnapshot(),
+		"system":                 systemSnap,
+		"net":                    collectAgentNetSnapshot(),
+		// 冷层规范化摘要：服务端可用它识别「能力画像未变」的重复 hello
+		// (spec §4.2 profile_hash)。老服务端忽略未知字段，向前兼容。
+		"profile_hash": agentProfileHash(snapshot.Platform, snapshot.Capabilities, toolVersions, snapshot.AuthorizedDirectories),
 	}
 }
 
