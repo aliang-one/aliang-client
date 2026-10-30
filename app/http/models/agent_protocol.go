@@ -121,6 +121,13 @@ const (
 	AgentEventGoalVerify              = "goal.verify"
 	AgentEventGoalVerifyResult        = "goal.verify.result"
 	AgentEventGoalVerifyError         = "goal.verify.error"
+	// 设备互访阶段 1（spec 2026-10-29-device-peer-link-and-profile-design §5.2）：
+	// 一次性命令执行帧族。与 LLM 工具事件（peer.exec/peer.fetch_file/
+	// peer.device_info/peer.device_note，走注册表 default 臂）是两套名空间——
+	// 工具层经服务端 REST 编排下发本帧族，工具事件本身不产生 request 帧。
+	AgentEventPeerExecRequest  = "peer.exec.request"  // server→B: A 设备发起的命令执行请求
+	AgentEventPeerExecResult   = "peer.exec.result"   // B→server→A: 执行回显（真实 exit_code 或 -1+fail_reason）
+	AgentEventPeerExecRejected = "peer.exec.rejected" // server→A: 服务端裁决拒绝（ACL/离线/限流/busy）——服务端实现路由,客户端登记契约+静默消费
 )
 
 // Terminal output quota challenge protocol (spec §5.2). There is NO
@@ -276,6 +283,11 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				{Type: AgentEventTunnelConfigured, Required: []string{"type", "request_id", "device_id", "state", "changed"}},
 				{Type: AgentEventTunnelStatus, Required: []string{"type", "device_id", "state"}, Optional: []string{"error"}},
 				{Type: AgentEventTunnelError, Required: []string{"type", "error"}, Optional: []string{"request_id"}},
+				// 设备互访阶段 1（spec §5.2）：B 端执行回显。exit_code 为 -1 表示
+				// 未能正常结束（busy/start_failed/workdir_missing/timeout），真实
+				// 终态写在 fail_reason；正常结束回 shell 真实退出码。stdout/stderr
+				// 各 256KiB 封顶，超出置 truncated。
+				{Type: AgentEventPeerExecResult, Required: []string{"type", "request_id", "target_device_id", "exit_code"}, Optional: []string{"stdout", "stderr", "truncated", "duration_ms", "fail_reason"}},
 			},
 			ServerSends: []AgentProtocolEvent{
 				{Type: AgentEventRegistered, Optional: []string{"device_id"}},
@@ -325,6 +337,13 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				{Type: AgentEventGoalVerify, Required: []string{"type", "request_id", "goal_id", "verification_batch_id", "project_path", "checks"}, Emits: []string{AgentEventGoalVerifyResult, AgentEventGoalVerifyError}},
 				{Type: AgentEventTunnelConfigure, Required: []string{"type", "request_id", "device_id", "piko_upstream_url", "tunnel_token", "route_public_key", "expires_at"}, Optional: []string{"allow_private_targets"}, Emits: []string{AgentEventTunnelConfigured, AgentEventTunnelStatus, AgentEventTunnelError}},
 				{Type: AgentEventAIOptionCancelled, Required: []string{"type", "session_id"}, Optional: []string{"option_ids", "reason"}},
+				// 设备互访阶段 1（spec §5.2）：A 设备经服务端编排下发的命令执行请求。
+				// B 端串行（同设备同时 1 个，忙即回 busy）、env 最小集、输出 256KiB 封顶。
+				{Type: AgentEventPeerExecRequest, Required: []string{"type", "request_id", "source_device_id", "command"}, Optional: []string{"timeout_ms", "workdir"}, Emits: []string{AgentEventPeerExecResult}},
+				// peer.exec.rejected 是服务端对 A 设备的裁决回包（ACL/离线/限流/busy/
+				// timeout/target_missing_capability）；reason 是裁决语义的载体，必填。
+				// agent 不据此动作（A 侧工具走同步 REST 编排），登记契约 + 静默消费。
+				{Type: AgentEventPeerExecRejected, Required: []string{"type", "request_id", "reason"}},
 			},
 		},
 		Streams: []AgentProtocolStream{

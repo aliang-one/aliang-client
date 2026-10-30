@@ -12,7 +12,12 @@ import (
 // 重拉 tools.list。
 // rev 3: 新增 git_log(项目提交历史,默认臂护栏分发——event git.log 不与
 // 任何显式臂冲突,是首个完整走 RunWithGuards 的非 legacy 工具)。
-const agentToolRegistryRev = 3
+// rev 4: 设备互访阶段 1（spec 2026-10-29 §7）新增四件意图工具 peer_exec/
+// peer_fetch_file/device_info/device_note——事件 peer.exec/peer.fetch_file/
+// peer.device_info/peer.device_note 同样不与任何显式臂冲突,完整走 default
+// 臂护栏分发；服务端靠心跳 rev 漂移自动重拉 tools.list,零服务端点亮代码。
+// 写工具免逐次审批的取舍记录在 agent_peer_tools.go 文件头。
+const agentToolRegistryRev = 4
 
 // buildAgentToolRegistry is THE single source of truth for remotely-invokable
 // read-only tools. Legacy four first (events unchanged = old-server compat);
@@ -104,6 +109,81 @@ func buildAgentToolRegistry() *tools.Registry {
 			OnError: func(requestID string, err error) map[string]interface{} {
 				return agentEnvToolErrorPayload(models.AgentEventEnvInfoError, requestID, err)
 			},
+		},
+		// 设备互访阶段 1（spec §7 第一批四件）。设备级工具不调 resolveEnvToolCwd
+		//（无项目 cwd 语义）；错误统一过 sanitizePeerError 脱敏。
+		&tools.Tool{
+			ID:    "peer_exec",
+			Event: AgentPeerToolEventExec,
+			Description: "Run a one-shot command on another device owned by the same account and " +
+				"return its exit code plus stdout/stderr. Requires peer exec enabled on the target. " +
+				"Targets run commands serially; a busy target fails fast with fail_reason=busy.",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"device_id":  map[string]interface{}{"type": "string", "description": "Target device id"},
+					"command":    map[string]interface{}{"type": "string", "description": "Shell command to run on the target device"},
+					"timeout_ms": map[string]interface{}{"type": "integer", "description": "Command timeout in ms (1000-600000, default 30000)"},
+					"workdir":    map[string]interface{}{"type": "string", "description": "Working directory on the target device (must exist, default home)"},
+				},
+				"required": []string{"device_id", "command"},
+			},
+			// TimeoutMs 640s 是第三道防线（服务端 fence 600s → 客户端 ctx 630s
+			// → 护栏 640s，见 agent_peer_tools.go agentPeerToolTimeoutMs 注释）。
+			// MaxOutputBytes 4MiB：契约合法结果最坏形态（stdout/stderr 各 256KiB
+			// 裸字节经 JSON 转义可膨胀 1.5-3 倍）必须放得下——护栏超限是整体
+			// 替换，卡在 768KiB 会把合法的满输出结果整条吞掉。
+			Caps:    tools.Caps{ReadOnly: false, TimeoutMs: 640000, MaxOutputBytes: 4 << 20},
+			Handler: agentPeerExecPayload,
+		},
+		&tools.Tool{
+			ID:    "peer_fetch_file",
+			Event: AgentPeerToolEventFetchFile,
+			Description: "Queue an asynchronous file fetch from another device in the same account " +
+				"into this machine's transfer inbox. Returns a transfer_id; completion arrives via " +
+				"transfer.progress events.",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"device_id":   map[string]interface{}{"type": "string", "description": "Source device id"},
+					"remote_path": map[string]interface{}{"type": "string", "description": "File path on the source device"},
+				},
+				"required": []string{"device_id", "remote_path"},
+			},
+			Caps:    tools.Caps{ReadOnly: false, TimeoutMs: 65000, MaxOutputBytes: 32768},
+			Handler: agentPeerFetchFilePayload,
+		},
+		&tools.Tool{
+			ID:    "device_info",
+			Event: AgentPeerToolEventDeviceInfo,
+			Description: "Device profile snapshot: hostname, platform, agent version, load summary, " +
+				"project count with the most recent project paths, authorized directory count. Omit " +
+				"device_id for this machine; pass one for a remote device in the same account.",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"device_id": map[string]interface{}{"type": "string", "description": "Target device id; omit for this machine"},
+				},
+			},
+			Caps:    tools.Caps{ReadOnly: true, TimeoutMs: 15000, MaxOutputBytes: 16384},
+			Handler: agentDeviceInfoPayload,
+		},
+		&tools.Tool{
+			ID:    "device_note",
+			Event: AgentPeerToolEventDeviceNote,
+			Description: "Save a named key/value note on a device (this machine when device_id is " +
+				"omitted). Notes survive reconnects and are visible to every device in the account.",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"key":       map[string]interface{}{"type": "string", "description": "Note key"},
+					"value":     map[string]interface{}{"type": "string", "description": "Note value"},
+					"device_id": map[string]interface{}{"type": "string", "description": "Target device id; omit for this machine"},
+				},
+				"required": []string{"key", "value"},
+			},
+			Caps:    tools.Caps{ReadOnly: false, TimeoutMs: 35000, MaxOutputBytes: 16384},
+			Handler: agentDeviceNotePayload,
 		},
 	)
 }
