@@ -233,7 +233,7 @@ func findAgentVibeSessionDetail(sessionID string, sourceSessionID string, projec
 	sourceSessionID = strings.TrimSpace(sourceSessionID)
 	sessionID = strings.TrimSpace(sessionID)
 	projectPath = cleanAgentProjectPath(projectPath)
-	for _, candidate := range candidateAgentVibeSessionFiles(sourceSessionID) {
+	for _, candidate := range candidateAgentVibeSessionFiles(sessionID, sourceSessionID) {
 		session := readAgentVibeSessionDetailFile(candidate, options)
 		if agentVibeSessionMatches(session, sessionID, sourceSessionID, projectPath) {
 			return session
@@ -248,14 +248,32 @@ func findAgentVibeSessionDetail(sessionID string, sourceSessionID string, projec
 	return models.AgentVibeSession{}
 }
 
-func candidateAgentVibeSessionFiles(sourceSessionID string) []string {
+func candidateAgentVibeSessionFiles(sessionID, sourceSessionID string) []string {
+	sessionID = strings.TrimSpace(sessionID)
 	sourceSessionID = strings.TrimSpace(sourceSessionID)
-	if sourceSessionID == "" {
+	if sessionID == "" && sourceSessionID == "" {
 		return nil
 	}
 	home := agentHome()
 	if home == "" {
 		return nil
+	}
+	// agentcore journal 以**手机会话 id**(ai_<nanoid>.jsonl)为文件名词根,
+	// 而 agentcore 会话的 source_session_id 是 kernel-native handle
+	// (agentcore-<ts>-<n>),只存在于帧内容里——按 handle 的 glob 永不命中,
+	// 每个 agentcore 详情请求都跌入 allAgentVibeSessionDetailFiles 兜底:在
+	// 4.5GB 的 ~/.claude/projects 里硬啃 100 个最新转录(2026-10-30 实测
+	// ~343MB)才轮到只有几十个文件的 agentcore 根,12s 详情围栏必炸
+	// (ai_1h_pnTOM2HIJ/ai_Z1gJftEgnz2A 生产实锤:连续 504
+	// agent_request_timeout,手机历史空白)。手机会话 id 就是 journal 文件名
+	// 词根,按它先补一把 glob 精确直击;目录只有几十个小文件,空扫开销可忽略。
+	// (id 由 server 会话表下发,ai_<nanoid> 字符集不含 glob 元字符。)
+	var out []string
+	if dir := agentCoreJournalDir(); dir != "" && sessionID != "" {
+		out = append(out, findRecentAgentFiles(dir, "*"+sessionID+"*.jsonl", agentVibeDetailCandidateFileLimit)...)
+	}
+	if sourceSessionID == "" {
+		return out
 	}
 	// Codex rollout 文件名是 rollout-<时间戳>-<sessionID>.jsonl —— session id 是
 	// 文件名中段,精确 <id>.jsonl 模式永不命中,每个详情请求都跌入 300 文件兜底
@@ -263,7 +281,6 @@ func candidateAgentVibeSessionFiles(sourceSessionID string) []string {
 	// 包含匹配一次定位候选;Claude 的 <id>.jsonl 命名同样被包含模式覆盖。
 	// (session id 是 hex+连字符的 uuid,不含 glob 元字符,可直接拼进模式。)
 	pattern := "*" + sourceSessionID + "*.jsonl"
-	var out []string
 	for _, root := range []string{filepath.Join(home, ".codex", "sessions"), filepath.Join(home, ".codex", "archived_sessions")} {
 		out = append(out, findRecentAgentFiles(root, pattern, agentVibeDetailCandidateFileLimit)...)
 	}

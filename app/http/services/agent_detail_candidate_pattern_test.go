@@ -41,7 +41,7 @@ func TestCandidateAgentVibeSessionFilesMatchesCodexRolloutNames(t *testing.T) {
 		t.Fatalf("write claude: %v", err)
 	}
 
-	candidates := candidateAgentVibeSessionFiles(sessionID)
+	candidates := candidateAgentVibeSessionFiles("", sessionID)
 	found := map[string]bool{}
 	for _, candidate := range candidates {
 		found[candidate] = true
@@ -87,10 +87,38 @@ func TestAgentVibeSessionEnumerationIncludesAgentCoreJournalRoot(t *testing.T) {
 		}
 		return false
 	}
-	if candidates := candidateAgentVibeSessionFiles(sessionID); !listContains(candidates, journalFile) {
+	if candidates := candidateAgentVibeSessionFiles("", sessionID); !listContains(candidates, journalFile) {
 		t.Fatalf("详情候选未覆盖 journal 根: want %q in %v", journalFile, candidates)
 	}
 	if all := allAgentVibeSessionDetailFiles(); !listContains(all, journalFile) {
 		t.Fatalf("全量列举未覆盖 journal 根: want %q in %v", journalFile, all)
 	}
+}
+
+// 2026-10-30 生产实锤回归钉:agentcore 详情请求的 source_session_id 是
+// kernel-native handle(agentcore-<ts>-<n>),而 journal 文件名是手机会话 id
+// (ai_<nanoid>.jsonl)——handle glob 永不命中,每次详情都跌入 4.5GB 兜底,
+// 12s 围栏必炸(手机历史空白)。候选必须另按 sessionID 补一把 glob 直击。
+func TestCandidateAgentVibeSessionFilesHitsJournalByPhoneSessionID(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+
+	root := agentCoreJournalDir()
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatalf("mkdir journal root: %v", err)
+	}
+	phoneID := "ai_1h_pnTOM2HIJ"
+	journalFile := filepath.Join(root, agentCoreJournalFileName(phoneID))
+	if err := os.WriteFile(journalFile, []byte(`{"kind":"session"}`+"\n"), 0o600); err != nil {
+		t.Fatalf("write journal fixture: %v", err)
+	}
+
+	candidates := candidateAgentVibeSessionFiles(phoneID, "agentcore-1793325934057639000-1")
+	for _, candidate := range candidates {
+		if candidate == journalFile {
+			return
+		}
+	}
+	t.Fatalf("sessionID glob 未命中 journal: want %q in %v", journalFile, candidates)
 }
