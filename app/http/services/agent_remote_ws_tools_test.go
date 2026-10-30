@@ -77,6 +77,8 @@ func TestRegistryEventsDoNotCollideWithExplicitArms(t *testing.T) {
 	// 臂只有 peer.exec.request / peer.exec.rejected（帧族），与工具事件
 	// peer.exec / peer.fetch_file / peer.device_info / peer.device_note 均不同
 	// 名，全部经 default 臂护栏分发。
+	// device_list（rev 5 新增，2026-10-30 审计补缺）已人工核对：switch 无该
+	// case，经 default 臂护栏分发。
 	allowed := map[string]bool{
 		models.AgentEventFileList: true, models.AgentEventFileRead: true,
 		models.AgentEventGitStatus: true, models.AgentEventEnvInfo: true,
@@ -85,6 +87,7 @@ func TestRegistryEventsDoNotCollideWithExplicitArms(t *testing.T) {
 		AgentPeerToolEventFetchFile:  true,
 		AgentPeerToolEventDeviceInfo: true,
 		AgentPeerToolEventDeviceNote: true,
+		AgentPeerToolEventDeviceList: true,
 	}
 	for _, tool := range agentToolRegistry().List() {
 		if !allowed[tool.Event] {

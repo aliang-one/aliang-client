@@ -1,8 +1,9 @@
 package services
 
 // 设备互访阶段 1（spec 2026-10-29-device-peer-link-and-profile-design §5.3/§7/§10）：
-// LLM 意图工具门面（第一批四件：peer_exec / peer_fetch_file / device_info /
-// device_note）。两个接入点共享同一套实现：
+// LLM 意图工具门面（peer_exec / peer_fetch_file / device_info / device_note，
+// 另加 device_list 设备发现目录——2026-10-30 审计补缺：阶段1 四件全部只收
+// device_id,LLM 无从自查账号设备清单）。两个接入点共享同一套实现：
 //   - 注册表工具（服务端编排的 AI 会话）：agent_tool_registry.go 追加描述符，
 //     事件经 default 臂 RunWithGuards 护栏分发（事件名不与显式臂冲突）；
 //   - agentcore 自定义工具（本机 AI 会话）：agentCorePeerTools 宿主注入。
@@ -46,6 +47,7 @@ const (
 	AgentPeerToolEventFetchFile  = "peer.fetch_file"
 	AgentPeerToolEventDeviceInfo = "peer.device_info"
 	AgentPeerToolEventDeviceNote = "peer.device_note"
+	AgentPeerToolEventDeviceList = "peer.device_list"
 )
 
 const (
@@ -61,6 +63,8 @@ const (
 	agentPeerNoteTimeoutMs = 30_000
 	// agentPeerDeviceInfoTimeoutMs 是 device_info 的 ctx 超时（两跳 GET）。
 	agentPeerDeviceInfoTimeoutMs = 14_000
+	// agentPeerDeviceListTimeoutMs 是 device_list 的 ctx 超时（单跳 GET 清单）。
+	agentPeerDeviceListTimeoutMs = 14_000
 	// agentPeerHTTPBodyLimit 限制编排响应体的读取上限。超出即截断——解析侧
 	// 对缺关键字段的结构化错误兜底（见 peerExecCall 的 exit_code 必存在断言），
 	// 绝不把截断的响应解析成假成功。
@@ -514,6 +518,74 @@ func peerMetadataUpdatedBy(meta map[string]interface{}) string {
 	return ""
 }
 
+// deviceListReport 拉取账号设备清单并瘦身为 LLM 可读目录。安全字段白名单：
+// id/name/platform/status/agent_version/peer_exec——host/location/load/IP 一律
+// 不进上下文（延续「LLM 路径零泄漏」纪律，spec §7.3）。这是设备发现闭环的
+// 唯一目录口：其余 peer 工具全部要 device_id，LLM 从这里选目标。
+func (s *AgentService) deviceListReport(ctx context.Context) (string, error) {
+	raw, err := s.doAgentServerGET(ctx, agentPeerServerURL()+"/api/devices")
+	if err != nil {
+		return "", err
+	}
+	var devices []map[string]interface{}
+	if err := json.Unmarshal(raw, &devices); err != nil {
+		return "", fmt.Errorf("device list response is not an array: %w", err)
+	}
+	selfID := strings.TrimSpace(s.currentDeviceID())
+	type peerDeviceEntry struct {
+		id, name, platform, status, version string
+		peerExec                            bool
+		self                                bool
+	}
+	entries := make([]peerDeviceEntry, 0, len(devices))
+	for _, d := range devices {
+		id := peerAPIString(d, "id", "device_id")
+		if id == "" {
+			continue
+		}
+		entries = append(entries, peerDeviceEntry{
+			id:       id,
+			name:     peerAPIString(d, "name", "device_name"),
+			platform: peerAPIString(d, "platform"),
+			status:   peerAPIString(d, "status"),
+			version:  peerAPIString(d, "agent_version", "agentVersion"),
+			peerExec: peerAPIBool(d, "peer_exec_enabled", "peerExecEnabled"),
+			self:     id == selfID,
+		})
+	}
+	// 本机置顶（LLM 最常用的锚点），其余按名称稳定排序。
+	sort.SliceStable(entries, func(i, j int) bool {
+		if entries[i].self != entries[j].self {
+			return entries[i].self
+		}
+		return entries[i].name < entries[j].name
+	})
+	var b strings.Builder
+	fmt.Fprintf(&b, "%d device(s) in this account:\n", len(entries))
+	for _, e := range entries {
+		name := e.name
+		if name == "" {
+			name = "-"
+		}
+		if e.self {
+			name += " (this machine)"
+		}
+		peerExec := "disabled"
+		if e.peerExec {
+			peerExec = "enabled"
+		}
+		field := func(v string) string {
+			if v == "" {
+				return "-"
+			}
+			return v
+		}
+		fmt.Fprintf(&b, "- id=%s | %s | platform=%s | status=%s | agent=%s | peer_exec=%s\n",
+			e.id, name, field(e.platform), field(e.status), field(e.version), peerExec)
+	}
+	return strings.TrimRight(b.String(), "\n"), nil
+}
+
 // deviceInfoReport 组装设备画像快照：deviceID 为空=本机（冷层+load 摘要）；
 // 非空=远端 GET /api/devices/:id + /api/devices/:id/metadata。这是唯一允许
 // 返回链路基础信息的口（spec §7.3），但仍只给一行式摘要，不给拓扑细节。
@@ -728,6 +800,21 @@ func agentDeviceInfoPayload(msg map[string]interface{}) map[string]interface{} {
 	}
 }
 
+func agentPeerDeviceListPayload(msg map[string]interface{}) map[string]interface{} {
+	requestID := agentPeerToolRequestID(msg)
+	ctx, cancel := context.WithTimeout(context.Background(), agentPeerDeviceListTimeoutMs*time.Millisecond)
+	defer cancel()
+	text, err := agentPeerServiceProvider().deviceListReport(ctx)
+	if err != nil {
+		return agentPeerToolError(AgentPeerToolEventDeviceList+".result", requestID, err)
+	}
+	return map[string]interface{}{
+		"type":       AgentPeerToolEventDeviceList + ".result",
+		"request_id": requestID,
+		"result":     text,
+	}
+}
+
 func agentDeviceNotePayload(msg map[string]interface{}) map[string]interface{} {
 	requestID := agentPeerToolRequestID(msg)
 	key := remoteString(msg, "key")
@@ -865,6 +952,21 @@ func (m *agentAIManager) agentCorePeerTools(run agentAIRun) []agentcore.Tool {
 			journal: journal,
 		},
 		&agentCorePeerToolBridge{
+			name: AgentPeerToolEventDeviceList,
+			description: "List every device in this account with id, name, platform, online status " +
+				"and whether peer exec is enabled. This is the directory to pick device_id from for " +
+				"the other peer tools (peer.exec / peer.fetch_file / peer.device_info / peer.device_note).",
+			schema: peerToolSchema(nil, map[string]interface{}{}),
+			execute: func(ctx context.Context, _ map[string]interface{}) (string, bool) {
+				text, err := agentPeerServiceProvider().deviceListReport(ctx)
+				if err != nil {
+					return agentPeerReadableError(err), true
+				}
+				return text, false
+			},
+			journal: journal,
+		},
+		&agentCorePeerToolBridge{
 			name: AgentPeerToolEventDeviceNote,
 			description: "Save a named note (key/value metadata) on a device. Omit device_id to note " +
 				"this machine. Notes survive reconnects and are visible to every device in the account. " +
@@ -901,4 +1003,35 @@ func inputIntField(input map[string]interface{}, key string) int {
 		return 0
 	}
 	return remoteInt(input, key, 0)
+}
+
+// ---------------------------------------------------------------------------
+// 本地 MCP/CLI 面（导出门面）
+// ---------------------------------------------------------------------------
+
+// Local 门面：`aliang mcp`（stdio MCP）与本机 CLI 经 56433 loopback 路由调用，
+// 复用与 LLM 工具完全相同的实现与脱敏，不另开代码路径。认证三层（零新增凭据）：
+// ① stdio 子进程由 CLI 自己拉起——同用户同进程身份即信任；② 本地路由只在
+// 56433 loopbackOnly 红线内可达；③ 出网凭据（用户 JWT + 设备身份）由本进程
+// 持有，CLI/LLM 全程接触不到。目标机门禁（peer_exec_enabled 默认关 + 云端
+// peer ACL + 全量审计）对 MCP 路径同样生效。
+
+func (s *AgentService) PeerExecLocal(ctx context.Context, deviceID, command string, timeoutMs int, workdir string) (string, error) {
+	return s.peerExecCall(ctx, deviceID, command, timeoutMs, workdir)
+}
+
+func (s *AgentService) PeerFetchFileLocal(ctx context.Context, deviceID, remotePath string) (string, error) {
+	return s.peerFetchFileCall(ctx, deviceID, remotePath)
+}
+
+func (s *AgentService) DeviceListLocal(ctx context.Context) (string, error) {
+	return s.deviceListReport(ctx)
+}
+
+func (s *AgentService) DeviceInfoLocal(ctx context.Context, deviceID string) (string, error) {
+	return s.deviceInfoReport(ctx, deviceID)
+}
+
+func (s *AgentService) DeviceNoteLocal(ctx context.Context, deviceID, key, value string) (string, error) {
+	return s.deviceNoteCall(ctx, deviceID, key, value)
 }
