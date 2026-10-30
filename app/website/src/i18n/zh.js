@@ -1076,6 +1076,8 @@ export default {
   agent_activity_noSessions: '暂无 Agent 会话记录',
   agent_activity_runtimeOffline: 'Agent 运行时未运行，暂无数据',
   agent_activity_refresh: '刷新',
+  agent_activity_onlyAliangCode: '仅 AliangCode',
+  agent_activity_onlyAliangCodeHint: '关闭后显示本机所有 AI CLI（Claude Code / Codex 等）的会话',
   agent_activity_messages: '条消息',
   agent_activity_recentTitle: '最近会话',
   agent_activity_recentCount: '共 {count} 条会话记录',

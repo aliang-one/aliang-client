@@ -1076,6 +1076,8 @@ export default {
   agent_activity_noSessions: 'No agent sessions yet',
   agent_activity_runtimeOffline: 'Agent runtime is not running',
   agent_activity_refresh: 'Refresh',
+  agent_activity_onlyAliangCode: 'AliangCode only',
+  agent_activity_onlyAliangCodeHint: 'Turn off to show sessions from all local AI CLIs (Claude Code, Codex, …)',
   agent_activity_messages: 'messages',
   agent_activity_recentTitle: 'Recent Sessions',
   agent_activity_recentCount: '{count} session records',

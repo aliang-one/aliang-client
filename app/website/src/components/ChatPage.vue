@@ -476,6 +476,7 @@ import {
   EFFORT_OPTIONS,
   MODEL_CUSTOM_VALUE,
   isDirectoryLocked,
+  normalizeDeviceProvider,
   recentProjectsFromSessions,
   sessionCreatePayload,
   sessionSourceBadge,
@@ -943,8 +944,16 @@ function loadFromStorage() {
     if (!raw) return;
     const data = JSON.parse(raw);
     if (data && Array.isArray(data.conversations)) {
-      conversations.value = data.conversations.map(normalizeConversation).filter(Boolean);
+      // 一次性清理历史残留：①设备会话壳（权威在后端，重进页重新派生）；
+      // ②provider 非 AliangCode 的旧草稿（2026-10-30 前默认 claudecode 落过盘）——
+      // 否则它们会以「本地草稿」身份绕过侧栏的清单过滤，继续在窗口里露脸。
+      conversations.value = data.conversations
+        .map(normalizeConversation)
+        .filter((c) => c && !c.deviceSession && normalizeDeviceProvider(c.provider) === 'agentcore');
       activeId.value = data.activeConversationId || null;
+      if (activeId.value && !conversations.value.some((c) => c.id === activeId.value)) {
+        activeId.value = null;
+      }
     }
   } catch (_) {
     // ignore corrupt data
@@ -984,7 +993,9 @@ function createConversation() {
     title: '',
     messages: [],
     approvals: [],
-    provider: chatProviderPreset.value || 'claudecode',
+    // 本窗口是 AliangCode 对话窗口（2026-10-30 用户拍板）：新建会话默认
+    // agentcore；聊天窗只展示自家 agent 的对话，不该默认落成 claudecode。
+    provider: chatProviderPreset.value || 'agentcore',
     createdAt: now(),
     updatedAt: now()
   };

@@ -128,12 +128,22 @@ export function sessionSourceBadge(session) {
 // 设备会话 provider 归一：服务端清单对同一内核可能下发 claude/claudecode
 // 两种拼写（历史通道差异），统一到前端会话的 provider 词表；未知/空回落
 // claudecode（与 sessionCreatePayload 的缺省一致）。
+// agent-core/agent_core 是 AliangCode 内核的别名拼写（与 chatProvider.js
+// 的判定同源）——漏认会被归成 claudecode，让 AliangCode 会话被误过滤掉。
 export function normalizeDeviceProvider(provider) {
   const p = typeof provider === 'string' ? provider.trim().toLowerCase() : '';
   if (p === 'claude' || p === 'claudecode') return 'claudecode';
   if (p === 'codex') return 'codex';
-  if (p === 'agentcore') return 'agentcore';
+  if (p === 'agentcore' || p === 'agent-core' || p === 'agent_core') return 'agentcore';
   return 'claudecode';
+}
+
+// isAliangCodeSession 是「这个清单条目属不属于 AliangCode」的唯一判据
+// （2026-10-30 用户拍板：仪表盘只展示 AliangCode 对话）。聊天窗侧栏与设置页
+// 「AI 会话活动」共用本函数，避免两处词表漂移。脏输入一律判否。
+export function isAliangCodeSession(entry) {
+  if (!entry || typeof entry !== 'object') return false;
+  return normalizeDeviceProvider(entry.provider) === 'agentcore';
 }
 
 // 设备会话清单条目 → 前端统一会话对象（跨端清单与本地会话同池渲染的适配

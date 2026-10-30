@@ -14,15 +14,24 @@
           </p>
         </div>
       </div>
-      <button
-        type="button"
-        class="inline-flex h-11 shrink-0 items-center justify-center gap-1 rounded-lg border border-slate-200 px-3 text-xs font-bold text-slate-600 transition-colors hover:border-primary/40 hover:bg-primary/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/20 disabled:opacity-60 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-primary/10"
-        :disabled="loading"
-        @click="loadSessions"
-      >
-        <span class="material-symbols-outlined text-sm">refresh</span>
-        {{ t('agent_activity_refresh') }}
-      </button>
+      <div class="flex shrink-0 items-center gap-2">
+        <label
+          class="inline-flex min-h-11 cursor-pointer items-center gap-1.5 rounded-lg border border-slate-200 px-3 text-xs font-semibold text-slate-600 dark:border-slate-700 dark:text-slate-300"
+          :title="t('agent_activity_onlyAliangCodeHint')"
+        >
+          <input v-model="onlyAliangCode" type="checkbox" class="h-3.5 w-3.5 accent-primary" />
+          {{ t('agent_activity_onlyAliangCode') }}
+        </label>
+        <button
+          type="button"
+          class="inline-flex h-11 shrink-0 items-center justify-center gap-1 rounded-lg border border-slate-200 px-3 text-xs font-bold text-slate-600 transition-colors hover:border-primary/40 hover:bg-primary/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/20 disabled:opacity-60 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-primary/10"
+          :disabled="loading"
+          @click="loadSessions"
+        >
+          <span class="material-symbols-outlined text-sm">refresh</span>
+          {{ t('agent_activity_refresh') }}
+        </button>
+      </div>
     </div>
 
     <div v-if="loading" class="mt-5 flex min-h-28 items-center justify-center text-xs text-slate-500 dark:text-slate-400">
@@ -184,6 +193,7 @@
 
 <script>
 import { getAgentRuntimeSessions, getAgentSessions, getAgentSessionDetail } from '../../services/agentApi';
+import { isAliangCodeSession } from '../../utils/chatSettings';
 import { useI18n } from '../../i18n';
 
 export default {
@@ -207,20 +217,33 @@ export default {
       detailLoading: false,
       hasMore: false,
       nextBefore: '',
+      // 默认只看 AliangCode（用户拍板 2026-10-30）：本页此前是全量三源审计面，
+      // 现在默认收敛到自家 agent；需要看其他 CLI 时手动开启（不丢能力）。
+      onlyAliangCode: true,
     };
   },
   computed: {
     runningIds() {
       return new Set(this.runtimeAi.map((session) => session.id));
     },
+    // AliangCode 判据与聊天窗共用（chatSettings.isAliangCodeSession），
+    // 防两处词表漂移。
+    scopedSessions() {
+      if (!this.onlyAliangCode) return this.sessions;
+      return this.sessions.filter((session) => isAliangCodeSession(session));
+    },
+    scopedRuntimeAi() {
+      if (!this.onlyAliangCode) return this.runtimeAi;
+      return this.runtimeAi.filter((session) => isAliangCodeSession(session));
+    },
     decoratedSessions() {
-      const historyIds = new Set(this.sessions.map((session) => session.id));
-      const runtimeOnly = this.runtimeAi
+      const historyIds = new Set(this.scopedSessions.map((session) => session.id));
+      const runtimeOnly = this.scopedRuntimeAi
         .filter((session) => !historyIds.has(session.id))
         .map((session) => ({ ...session, __running: true }));
       return [
         ...runtimeOnly,
-        ...this.sessions.map((session) => ({
+        ...this.scopedSessions.map((session) => ({
           ...session,
           __running: this.runningIds.has(session.id),
         })),

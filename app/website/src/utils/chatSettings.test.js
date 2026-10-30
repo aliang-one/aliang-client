@@ -4,6 +4,7 @@ import {
   EFFORT_OPTIONS,
   MODEL_CUSTOM_VALUE,
   deviceSessionToConversation,
+  isAliangCodeSession,
   isDirectoryLocked,
   normalizeDeviceProvider,
   recentProjectsFromSessions,
@@ -236,5 +237,28 @@ describe('deviceSessionToConversation', () => {
     expect(deviceSessionToConversation(undefined)).toBe(null);
     expect(deviceSessionToConversation('x')).toBe(null);
     expect(deviceSessionToConversation(42)).toBe(null);
+  });
+});
+
+// 「这条会话属不属于 AliangCode」的唯一判据（聊天窗侧栏与设置页共用）。
+describe('isAliangCodeSession', () => {
+  it('agentcore 及其别名拼写判真', () => {
+    expect(isAliangCodeSession({ provider: 'agentcore' })).toBe(true);
+    expect(isAliangCodeSession({ provider: ' AgentCore ' })).toBe(true); // trim+lower
+    // 服务端历史通道可能下发连字符/下划线拼写——漏认会让 AliangCode 会话
+    // 被误过滤掉（本次一并修正 normalizeDeviceProvider）。
+    expect(isAliangCodeSession({ provider: 'agent-core' })).toBe(true);
+    expect(isAliangCodeSession({ provider: 'agent_core' })).toBe(true);
+  });
+
+  it('claude/codex/未知/脏输入一律判否', () => {
+    expect(isAliangCodeSession({ provider: 'claude' })).toBe(false);
+    expect(isAliangCodeSession({ provider: 'claudecode' })).toBe(false);
+    expect(isAliangCodeSession({ provider: 'codex' })).toBe(false);
+    expect(isAliangCodeSession({ provider: 'openai' })).toBe(false);
+    expect(isAliangCodeSession({ provider: '' })).toBe(false);
+    expect(isAliangCodeSession({})).toBe(false);
+    expect(isAliangCodeSession(null)).toBe(false);
+    expect(isAliangCodeSession('agentcore')).toBe(false);
   });
 });

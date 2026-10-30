@@ -2,6 +2,7 @@ import { ref } from 'vue';
 import { getAgentSessions } from '../services/agentApi';
 import {
   deviceSessionToConversation,
+  isAliangCodeSession,
   isTerminalPrefixedSessionId,
   normalizeDeviceProvider,
 } from '../utils/chatSettings';
@@ -51,12 +52,10 @@ export function useDeviceSessions() {
         const data = await getAgentSessions();
         const list = Array.isArray(data?.sessions) ? data.sessions : [];
         // 聊天窗只认 AliangCode(agentcore) 对话（用户拍板 2026-10-30）：
-        // claudecode/codex 等其他 agent 的清单条目不进本窗口——它们仍在
-        // 设置页「AI 会话活动」全量可见（审计面）。审批族帧对非 agentcore
-        // 会话走活跃兜底+来源标签（findDeviceShellBySessionId 查不到即兜底）。
-        deviceSessions.value = list.filter(
-          (entry) => normalizeDeviceProvider(entry?.provider) === 'agentcore',
-        );
+        // claudecode/codex 等其他 agent 的清单条目不进本窗口（判据与设置页
+        // 共用 isAliangCodeSession）。审批族帧对被过滤会话走活跃兜底+来源标签
+        // （findDeviceShellBySessionId 查不到即兜底）。
+        deviceSessions.value = list.filter(isAliangCodeSession);
         available.value = true;
         // 200 空列表按「无会话」渲染是已接受的歧义：core 代理失败也回 200 空
         // 列表，区分需另拉 /api/agent/status，v1 不做（阶段 2 计划「已知取舍」）。
