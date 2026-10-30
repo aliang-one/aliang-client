@@ -147,6 +147,8 @@ func registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/agent/sessions", agentHandler.HandleVibeSessions)
 	mux.HandleFunc("/api/agent/session", agentHandler.HandleVibeSession)
 	mux.HandleFunc("/api/agent/scan-directories", agentHandler.HandleScanDirectories)
+	// MCP 与技能只读报告：核心侧 routes.go 同名注册透传（双注册教训同上）。
+	mux.HandleFunc("/api/agent/integrations", agentHandler.HandleAgentIntegrations)
 	// 仪表盘数据面端点：核心进程会把这两个请求代理到本 runtime，缺注册会让
 	// 仪表盘 Agent 页的「远程终端」列表和「进行中」徽章永远拿不到数据
 	// （2026-10-21 liang-dev 实测 404 透传）。

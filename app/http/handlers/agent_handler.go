@@ -422,6 +422,20 @@ func (h *AgentHandler) HandleLaunch(w http.ResponseWriter, r *http.Request) {
 	common.Success(w, resp)
 }
 
+// HandleAgentIntegrations 返回「MCP 与技能」页的只读报告（设备侧 MCP server
+// 与 skill 清单 + 每项对 AliangCode 内核的生效状态）。纯读：不改任何配置。
+// 非 runtime 角色走数据面代理（扫描 ~/.claude.json 等文件，冷读可能较慢）。
+func (h *AgentHandler) HandleAgentIntegrations(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
+		return
+	}
+	if h.proxyDataIfNeeded(w, r) {
+		return
+	}
+	common.Success(w, h.service.AgentIntegrations())
+}
+
 // HandleVibeSessions returns local AI coding sessions as summaries. When this
 // process is not the user-agent runtime and the runtime is unreachable, an
 // empty list is returned so the page can show an empty state instead of an error.

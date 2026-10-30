@@ -287,6 +287,8 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	register("GET /api/agent/terminal/{sessionId}/scrollback", h.Agent.HandleTerminalScrollback, http.MethodGet)
 	register("/api/agent/session", h.Agent.HandleVibeSession, http.MethodGet)
 	register("/api/agent/scan-directories", h.Agent.HandleScanDirectories, http.MethodGet, http.MethodPost)
+	// MCP 与技能只读报告（设备侧清单 + 内核生效态）。
+	register("/api/agent/integrations", h.Agent.HandleAgentIntegrations, http.MethodGet)
 	register("/api/docs/tutorials", h.Tutorial.HandleGetTutorial, http.MethodGet)
 
 	registerDocsRoutes(mux, catalog)
