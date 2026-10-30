@@ -45,8 +45,13 @@ import (
 // 守卫命中不直接报错：先补一次不带工具的收尾请求让模型把进度交代出来
 // （见 wrapUp），再以带说明的终止帧收场——用户至少知道干到了哪一步。
 
-// maxIdenticalToolTurns 是无进展守卫的轮数阈值。
-const maxIdenticalToolTurns = 3
+// defaultMaxIdenticalToolTurns 是无进展守卫的轮数阈值默认值。宿主可用
+// Config.MaxIdenticalToolTurns 覆盖（仪表盘 customer.agentcore.max_identical_tool_turns，
+// 0 = 用这里）。曾经是 3：2026-10-30 ai_1h_pnTOM2HIJ 实录显示，模型在
+// 「Bash 不保留 cwd、漏了 cd 前缀」这类可自省的坑上也会连发两次一模一样的
+// 调用才醒，3 的余量太薄，第 3 次就掐断剥夺了模型自我纠错的机会——放宽到 5，
+// 打转的病理 5 轮一样拦得住，健康的纠错不再误伤。
+const defaultMaxIdenticalToolTurns = 5
 
 // maxConsecutiveToolErrors 是连续工具错误的个数阈值（跨轮累计，遇成功清零）。
 const maxConsecutiveToolErrors = 5
@@ -222,6 +227,20 @@ type Config struct {
 	// 上游申请窗口（Messages API 没有这个字段），它只约束自己的历史规模，
 	// 换到小窗口模型时也不会撞上 "prompt is too long"。
 	ContextWindow int
+	// MaxIdenticalToolTurns 覆盖无进展守卫「连续 N 轮完全相同的工具调用即
+	// 判定打转终止」的阈值（见 defaultMaxIdenticalToolTurns）。0 或负数用
+	// 默认值。仪表盘 customer.agentcore.max_identical_tool_turns → 宿主
+	// EffectiveAgentCoreMaxIdenticalToolTurns → 这里。
+	MaxIdenticalToolTurns int
+}
+
+// effectiveMaxIdenticalToolTurns 返回本 run 实际生效的打转守卫阈值：
+// 宿主显式配置优先，未配置（<=0）回落默认值。
+func (c *Config) effectiveMaxIdenticalToolTurns() int {
+	if c != nil && c.MaxIdenticalToolTurns > 0 {
+		return c.MaxIdenticalToolTurns
+	}
+	return defaultMaxIdenticalToolTurns
 }
 
 // NormalizeEffortLevel 把会话层的 effort 档位归一成上游认识的 Messages API
@@ -560,7 +579,7 @@ func (r *runner) loop(ctx context.Context) (*RunResult, error) {
 			r.lastToolSignature = sig
 			r.dupStreak = 1
 		}
-		if r.dupStreak >= maxIdenticalToolTurns {
+		if r.dupStreak >= r.cfg.effectiveMaxIdenticalToolTurns() {
 			r.logf("[agentcore] 连续 %d 轮发起完全相同的工具调用，判定无进展，收尾 session=%s",
 				r.dupStreak, r.sid())
 			return r.stopWithSummary(ctx,

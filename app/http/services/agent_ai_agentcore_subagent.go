@@ -16,6 +16,7 @@ import (
 
 	"aliang.one/nursorgate/app/agentcore"
 	"aliang.one/nursorgate/common/logger"
+	"aliang.one/nursorgate/processor/config"
 )
 
 const (
@@ -304,6 +305,9 @@ func (b *agentCoreSubagentBridge) Execute(ctx context.Context, input map[string]
 		Logf:    b.logf,
 		// 与主 run 同窗口：子 run 的自动压缩阈值跟随会话设置。
 		ContextWindow: b.contextWindow,
+		// 与主 run 同阈值：子 agent 同样跑 loop，打转守卫口径必须一致
+		// （仪表盘 customer.agentcore.max_identical_tool_turns；0 走内核默认）。
+		MaxIdenticalToolTurns: config.GetGlobalConfig().EffectiveAgentCoreMaxIdenticalToolTurns(),
 		// Emit/Hooks 刻意 nil（spec §3）。
 	}
 	res, err := agentcore.Run(ctx, cfg, []agentcore.Message{{Role: "user", Content: task}})

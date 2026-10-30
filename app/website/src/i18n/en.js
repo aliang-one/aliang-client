@@ -1164,8 +1164,8 @@ export default {
   customEnv_saving: 'Saving...',
 
   // -- AgentCoreSettings --
-  agentCore_title: 'AliangCode Kernel LLM Settings',
-  agentCore_description: 'Point all local AliangCode sessions at an explicit LLM endpoint (Anthropic Messages compatible). When disabled, the Claude Code configuration and platform proxy are used as-is.',
+  agentCore_title: 'AliangCode Kernel Settings',
+  agentCore_description: 'Point all local AliangCode sessions at an explicit LLM endpoint (Anthropic Messages compatible) and tune kernel behavior (no-progress guard threshold). When the endpoint is disabled, the Claude Code configuration and platform proxy are used as-is.',
   agentCore_enable: 'Enable custom LLM endpoint',
   agentCore_baseUrl: 'Base URL',
   agentCore_baseUrlPlaceholder: 'e.g. https://your-gateway.example.com',
@@ -1174,6 +1174,10 @@ export default {
   agentCore_showKey: 'Show',
   agentCore_hideKey: 'Hide',
   agentCore_hint: 'Takes effect on the next turn after saving — no restart needed. Only Anthropic Messages compatible endpoints are supported; API Key is required for non-loopback endpoints.',
+  agentCore_guardTitle: 'No-progress guard threshold (identical tool-call turns)',
+  agentCore_guardPlaceholder: 'Leave empty for default (5)',
+  agentCore_guardHint: 'When AliangCode issues the exact same tool call (name + identical arguments) for several turns in a row, the kernel judges it as spinning in place and wraps up the run to prevent unbounded idle work. Leave empty for the default of 5; range 1–50.',
+  agentCore_error_guardInvalid: 'No-progress guard threshold must be an integer between 1 and 50 (leave empty for default)',
   agentCore_error_urlRequired: 'Base URL is required when enabled',
   agentCore_error_urlInvalid: 'Base URL must be a valid URL (including scheme and hostname)',
   agentCore_error_keyRequired: 'API Key is required for non-loopback endpoints',

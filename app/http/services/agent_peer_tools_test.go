@@ -389,8 +389,8 @@ func TestAgentDeviceListHandler_SlimDirectory(t *testing.T) {
 	// 安全字段白名单：host/location/load/IP 一律不得进 LLM 上下文
 	//（「LLM 路径零泄漏」纪律，spec §7.3）。本机 device-b 置顶。
 	payload := `[
-		{"id":"device-c","name":"win-box","platform":"windows-amd64","status":"offline","agent_version":"1.1.86","peer_exec_enabled":true,"host":"192.168.1.44","location":"bedroom","load":{"cpu_usage_pct":77}},
-		{"id":"device-b","name":"mac-studio","platform":"darwin-arm64","status":"online","agent_version":"1.1.89","peer_exec_enabled":false,"host":"10.0.0.2"},
+		{"id":"device-c","name":"win-box","platform":"windows-amd64","status":"offline","agent_version":"1.1.86","peer_exec_enabled":true,"host":"192.168.1.44","location":"bedroom","load":{"cpu_usage_pct":77},"system":{"os_name":"windows","os_version":"11 Pro","arch":"amd64","mem_total_bytes":17179869184},"net":{"interfaces":[{"name":"eth0","ipv4":"192.168.1.44","prefix_len":24}]}},
+		{"id":"device-b","name":"mac-studio","platform":"darwin-arm64","status":"online","agent_version":"1.1.89","peer_exec_enabled":false,"host":"10.0.0.2","system":{"os_name":"darwin","os_version":"15.2","arch":"arm64","mem_total_bytes":68719476736}},
 		{"device_id":"device-d","name":"headless","status":"online"}
 	]`
 	ts := newPeerToolsTestServer(t, http.StatusOK, payload)
@@ -403,10 +403,11 @@ func TestAgentDeviceListHandler_SlimDirectory(t *testing.T) {
 	text, _ := res["result"].(string)
 	for _, want := range []string{
 		"3 device(s)",
-		"id=device-b | mac-studio (this machine) | platform=darwin-arm64 | status=online | agent=1.1.89 | peer_exec=disabled",
-		"id=device-c | win-box | platform=windows-amd64 | status=offline | agent=1.1.86 | peer_exec=enabled",
-		// device_id 兼容键也要吃到 id；缺 platform/agent 落 "-"。
-		"id=device-d | headless | platform=- | status=online | agent=-",
+		// system 子对象存在时 os= 用 OS/版本/架构/内存（让 LLM 能选目标机）。
+		"id=device-b | mac-studio (this machine) | os=darwin 15.2, arm64, 65536 MiB RAM | status=online | agent=1.1.89 | peer_exec=disabled",
+		"id=device-c | win-box | os=windows 11 Pro, amd64, 16384 MiB RAM | status=offline | agent=1.1.86 | peer_exec=enabled",
+		// 缺 system 时回落到 platform；缺 platform/agent 落 "-"。
+		"id=device-d | headless | os=- | status=online | agent=-",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("directory missing %q:\n%s", want, text)

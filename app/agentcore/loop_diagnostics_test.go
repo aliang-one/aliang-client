@@ -84,8 +84,9 @@ func TestLoopOnTurnSnapshotsProgressAndTerminal(t *testing.T) {
 // TestLoopOnTurnTerminalCarriesGuardReason：无进展守卫判死——终态快照必须
 // 携带真因与触发的守卫计数，journal end 行与面板的「为什么死」都出自这里。
 func TestLoopOnTurnTerminalCarriesGuardReason(t *testing.T) {
-	turns := make([]string, 0, maxIdenticalToolTurns+2)
-	for i := 0; i < maxIdenticalToolTurns+2; i++ {
+	const guardLimit = 3
+	turns := make([]string, 0, guardLimit+2)
+	for i := 0; i < guardLimit+2; i++ {
 		turns = append(turns, toolTurn("toolu_dup", "Stub", `{"x":"always-the-same"}`))
 	}
 	srv := scriptServer(t, turns)
@@ -96,9 +97,10 @@ func TestLoopOnTurnTerminalCarriesGuardReason(t *testing.T) {
 
 	snapshots := []TurnSnapshot{}
 	res, err := Run(context.Background(), &Config{
-		Client: NewClient(srv.URL),
-		Model:  "claude-x",
-		Tools:  registry,
+		Client:                NewClient(srv.URL),
+		Model:                 "claude-x",
+		Tools:                 registry,
+		MaxIdenticalToolTurns: guardLimit,
 		Hooks: LoopHooks{
 			OnTurn: func(snap TurnSnapshot) { snapshots = append(snapshots, snap) },
 		},
@@ -125,8 +127,8 @@ func TestLoopOnTurnTerminalCarriesGuardReason(t *testing.T) {
 	if !strings.Contains(terminal.Reason, "无进展") {
 		t.Errorf("终态 Reason 应点名无进展, got %q", terminal.Reason)
 	}
-	if terminal.DupStreak != maxIdenticalToolTurns {
-		t.Errorf("终态 DupStreak = %d, want %d", terminal.DupStreak, maxIdenticalToolTurns)
+	if terminal.DupStreak != guardLimit {
+		t.Errorf("终态 DupStreak = %d, want %d", terminal.DupStreak, guardLimit)
 	}
 	// 真因必须与终止帧带给手机的文案同源（finish 的 errText 前缀）。
 	if !strings.HasPrefix(terminal.Reason, "模型连续") {
