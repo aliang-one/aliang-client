@@ -1,8 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import {
+  agentCoreTuningToLineFormat,
   applyAgentCoreLLMClearing,
   normalizeAgentCoreLLMConfig,
+  normalizeAgentCoreTuning,
   validateAgentCoreLLMConfig,
+  validateAgentCoreTuning,
 } from './agentCoreSettings';
 
 describe('validateAgentCoreLLMConfig', () => {
@@ -90,5 +93,60 @@ describe('applyAgentCoreLLMClearing', () => {
     const patch = {};
     applyAgentCoreLLMClearing(patch, { base_url: '   ', api_key: '' }, { base_url: 'https://a.b', api_key: 'sk-x' });
     expect(patch.agentcore_llm).toEqual({ base_url: '', api_key: '' });
+  });
+});
+
+// ---- customer.agentcore(行为调优) ----
+
+describe('normalizeAgentCoreTuning', () => {
+  it('非对象/缺键 → 0(= 未配置,与 Go nil 层等价)', () => {
+    expect(normalizeAgentCoreTuning(undefined)).toEqual({ max_identical_tool_turns: 0 });
+    expect(normalizeAgentCoreTuning(null)).toEqual({ max_identical_tool_turns: 0 });
+    expect(normalizeAgentCoreTuning('oops')).toEqual({ max_identical_tool_turns: 0 });
+    expect(normalizeAgentCoreTuning({})).toEqual({ max_identical_tool_turns: 0 });
+  });
+
+  it('合法数字原样,非法数字归一成 0(报错是 validate 的职责)', () => {
+    expect(normalizeAgentCoreTuning({ max_identical_tool_turns: 7 })).toEqual({ max_identical_tool_turns: 7 });
+    expect(normalizeAgentCoreTuning({ max_identical_tool_turns: 0 })).toEqual({ max_identical_tool_turns: 0 });
+    expect(normalizeAgentCoreTuning({ max_identical_tool_turns: -3 })).toEqual({ max_identical_tool_turns: 0 });
+    expect(normalizeAgentCoreTuning({ max_identical_tool_turns: 1.5 })).toEqual({ max_identical_tool_turns: 0 });
+    expect(normalizeAgentCoreTuning({ max_identical_tool_turns: '7' })).toEqual({ max_identical_tool_turns: 0 });
+  });
+});
+
+describe('validateAgentCoreTuning', () => {
+  it('空串/纯空白 = 用默认,合法', () => {
+    expect(validateAgentCoreTuning('')).toBe('');
+    expect(validateAgentCoreTuning('   ')).toBe('');
+    expect(validateAgentCoreTuning(undefined)).toBe('');
+  });
+
+  it('0 = 用默认,合法;1..50 合法', () => {
+    expect(validateAgentCoreTuning('0')).toBe('');
+    expect(validateAgentCoreTuning('1')).toBe('');
+    expect(validateAgentCoreTuning('5')).toBe('');
+    expect(validateAgentCoreTuning('50')).toBe('');
+  });
+
+  it('负数/非整数/越界/非数字 拒绝', () => {
+    expect(validateAgentCoreTuning('-1')).toBe('agentCore_error_guardInvalid');
+    expect(validateAgentCoreTuning('2.5')).toBe('agentCore_error_guardInvalid');
+    expect(validateAgentCoreTuning('51')).toBe('agentCore_error_guardInvalid');
+    expect(validateAgentCoreTuning('abc')).toBe('agentCore_error_guardInvalid');
+  });
+});
+
+describe('agentCoreTuningToLineFormat', () => {
+  it('空串/0 → 0(后端 omitempty 抹掉 = 回默认)', () => {
+    expect(agentCoreTuningToLineFormat('')).toBe(0);
+    expect(agentCoreTuningToLineFormat('0')).toBe(0);
+    expect(agentCoreTuningToLineFormat(undefined)).toBe(0);
+  });
+
+  it('正整数原样,非法兜底归 0(提交前已被 validate 挡住)', () => {
+    expect(agentCoreTuningToLineFormat('5')).toBe(5);
+    expect(agentCoreTuningToLineFormat('50')).toBe(50);
+    expect(agentCoreTuningToLineFormat('abc')).toBe(0);
   });
 });

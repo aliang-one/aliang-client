@@ -73,3 +73,47 @@ export function applyAgentCoreLLMClearing(patch, nextLLM, currentLLM) {
   }
   return patch;
 }
+
+// ---- customer.agentcore(行为调优) ----
+// 与 agentcore_llm(端点)同面板不同层。校验规则与后端
+// AgentCoreTuningConfig.Validate(processor/config/types.go)同源,两端不许分叉:
+// 0/未填 = 用内核默认,1..50 = 显式阈值,负数/非整数/越界拒绝。
+// ⚠️ 与 agentcore_llm 的字符串不同,数字的「清空」天然可达:归一成 0 后,
+// buildConfigPatch 的 Object.is 比较会把 0≠旧值写进 patch(0 显式落盘,
+// 后端 omitempty 存储时抹掉 = 回到默认),所以这里不需要 applyXxxClearing。
+
+// 服务端载荷 → 归一线格式。非对象/缺键输出 {max_identical_tool_turns: 0}
+// (= 未配置,与 Go 侧 nil 层等价)。非法数字(负数/非整数)归一成 0——归一层
+// 不报错,报错是 validate 的职责;这里只保证输出永远是合法线格式。
+export function normalizeAgentCoreTuning(source) {
+  let turns = 0;
+  if (source && typeof source === 'object' && !Array.isArray(source)) {
+    const raw = source.max_identical_tool_turns;
+    if (typeof raw === 'number' && Number.isInteger(raw) && raw > 0) {
+      turns = raw;
+    }
+  }
+  return { max_identical_tool_turns: turns };
+}
+
+// 表单值('' 或数字字符串)→ 校验。返回 ''(合法)或 i18n 键。空串与 0 都是
+// 「用默认」,合法;正整数上限 50 与后端 Validate 对齐。
+export function validateAgentCoreTuning(maxTurns) {
+  const raw = String(maxTurns ?? '').trim();
+  if (!raw) return '';
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 0) return 'agentCore_error_guardInvalid';
+  if (n === 0) return '';
+  if (n > 50) return 'agentCore_error_guardInvalid';
+  return '';
+}
+
+// 表单值 → 线格式数字。空串/0 → 0(= 默认,后端 omitempty 存储时抹掉)。
+// 非法输入不会被提交(validate 挡在 save 前),这里兜底归 0。
+export function agentCoreTuningToLineFormat(maxTurns) {
+  const raw = String(maxTurns ?? '').trim();
+  if (!raw) return 0;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n <= 0) return 0;
+  return n;
+}

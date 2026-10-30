@@ -528,6 +528,9 @@ type CustomerConfig struct {
 	// AgentCoreLLM 是 AliangCode 内核的显式 LLM 端点设置(customer.agentcore_llm)。
 	// nil 或 Enabled=false 时整层不生效,行为回落继承链(env/settings→兜底)。
 	AgentCoreLLM *AgentCoreLLMConfig `json:"agentcore_llm,omitempty"`
+	// AgentCore 是 AliangCode 内核的行为调优设置(customer.agentcore)。nil 时
+	// 全部字段走内核默认值——这是未配置时的线上形态,不许有隐式副作用。
+	AgentCore *AgentCoreTuningConfig `json:"agentcore,omitempty"`
 }
 
 // CustomerGeoIPSettings 自定义 GeoIP 国家库下载源（customer.geoip）。
@@ -610,6 +613,45 @@ func (cfg *AgentCoreLLMConfig) Validate() error {
 		return fmt.Errorf("agentcore_llm.api_key 必填: 非回环地址 %s 无平台 relay 注入凭据", strings.TrimSpace(cfg.BaseURL))
 	}
 	return nil
+}
+
+// AgentCoreTuningConfig 是 AliangCode 内核的行为调优设置(customer.agentcore)。
+// 与 agentcore_llm(端点)分开:端点是「连到哪」,这里是「行为阈值」。
+type AgentCoreTuningConfig struct {
+	// MaxIdenticalToolTurns 是无进展守卫「连续 N 轮发起完全相同的工具调用
+	// (名字+参数一致)即判定打转并终止」的阈值。0 = 用内核默认
+	// (defaultMaxIdenticalToolTurns);上限 50——再大守卫就形同虚设,烧 token
+	// 的空转跑满 50 轮才停,不如直接关掉。
+	MaxIdenticalToolTurns int `json:"max_identical_tool_turns,omitempty"`
+}
+
+// Validate 保存通道(Config.Validate)调用。0 合法(=未配置,走默认);
+// 上限 50 是防呆,不是业务约束。
+func (c *AgentCoreTuningConfig) Validate() error {
+	if c == nil {
+		return nil
+	}
+	if c.MaxIdenticalToolTurns < 0 || c.MaxIdenticalToolTurns > 50 {
+		return fmt.Errorf("agentcore.max_identical_tool_turns 必须在 [0,50] 内(0=用内核默认), got %d", c.MaxIdenticalToolTurns)
+	}
+	return nil
+}
+
+// EffectiveAgentCoreMaxIdenticalToolTurns 返回打转守卫阈值;未配置(0/nil/负数)
+// 返回 0,由内核按 defaultMaxIdenticalToolTurns 兜底。读取端做钳制防御:手改
+// 配置文件可绕过保存校验,>50 的值收口到 50——越界只会让守卫变弱,不会 crash。
+func (c *Config) EffectiveAgentCoreMaxIdenticalToolTurns() int {
+	if c == nil || c.Customer == nil || c.Customer.AgentCore == nil {
+		return 0
+	}
+	v := c.Customer.AgentCore.MaxIdenticalToolTurns
+	if v < 0 {
+		return 0
+	}
+	if v > 50 {
+		return 50
+	}
+	return v
 }
 
 // isLoopbackHostName 判断主机名是否本机回环(IP 回环段或 localhost)。
@@ -877,6 +919,11 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("invalid agentcore_llm configuration: %w", err)
 		}
 	}
+	if c.Customer != nil && c.Customer.AgentCore != nil {
+		if err := c.Customer.AgentCore.Validate(); err != nil {
+			return fmt.Errorf("invalid agentcore configuration: %w", err)
+		}
+	}
 	if c.Customer != nil {
 		if modelMapping := c.Customer.ModelMapping; modelMapping != nil {
 			if err := modelMapping.Validate(); err != nil {
@@ -953,7 +1000,7 @@ func (c *Config) customerUnknownKeyErrors() error {
 	if len(c.customerUnknownFields) > 0 {
 		sorted := append([]string(nil), c.customerUnknownFields...)
 		sort.Strings(sorted)
-		return fmt.Errorf("customer.%s is forbidden: editable customer fields are [proxy ai_rules proxy_rules traffic_mirror http1_drop model_mapping custom_env_vars geoip agentcore_llm]", sorted[0])
+		return fmt.Errorf("customer.%s is forbidden: editable customer fields are [proxy ai_rules proxy_rules traffic_mirror http1_drop model_mapping custom_env_vars geoip agentcore_llm agentcore]", sorted[0])
 	}
 
 	providers := make([]string, 0, len(c.aiRuleUnknownFields))
@@ -990,7 +1037,7 @@ func extractCustomerUnknownFields(root map[string]json.RawMessage) ([]string, ma
 
 	for key := range customerRoot {
 		switch key {
-		case "proxy", "ai_rules", "proxy_rules", "traffic_mirror", "http1_drop", "model_mapping", "custom_env_vars", "geoip", "agentcore_llm":
+		case "proxy", "ai_rules", "proxy_rules", "traffic_mirror", "http1_drop", "model_mapping", "custom_env_vars", "geoip", "agentcore_llm", "agentcore":
 		default:
 			unknownCustomer = append(unknownCustomer, key)
 		}

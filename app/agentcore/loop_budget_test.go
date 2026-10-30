@@ -41,11 +41,13 @@ func scriptServer(t *testing.T, turns []string) *httptest.Server {
 	return sseServer(t, (&turnScript{turns: turns}).handler(t))
 }
 
-// TestLoopStopsOnRepeatedIdenticalToolCalls：连续 3 轮一模一样的工具调用
-// 必须停。模型自己不会承认在打转，等 maxIterations 兜底要再烧 47 轮。
+// TestLoopStopsOnRepeatedIdenticalToolCalls：连续阈值轮一模一样的工具调用
+// 必须停。这里显式把阈值配成 3（覆盖路径）；默认值语义由
+// TestLoopGuardDefaultThresholdWhenUnset 单独锁死。
 func TestLoopStopsOnRepeatedIdenticalToolCalls(t *testing.T) {
-	turns := make([]string, 0, maxIdenticalToolTurns+2)
-	for i := 0; i < maxIdenticalToolTurns+2; i++ {
+	const guardLimit = 3
+	turns := make([]string, 0, guardLimit+2)
+	for i := 0; i < guardLimit+2; i++ {
 		turns = append(turns, toolTurn("toolu_dup", "Stub", `{"x":"always-the-same"}`))
 	}
 	srv := scriptServer(t, turns)
@@ -58,10 +60,11 @@ func TestLoopStopsOnRepeatedIdenticalToolCalls(t *testing.T) {
 
 	rec := &frameRecorder{}
 	res, err := Run(context.Background(), &Config{
-		Client: NewClient(srv.URL),
-		Model:  "claude-x",
-		Tools:  registry,
-		Emit:   rec.emit,
+		Client:                NewClient(srv.URL),
+		Model:                 "claude-x",
+		Tools:                 registry,
+		MaxIdenticalToolTurns: guardLimit,
+		Emit:                  rec.emit,
 		Logf: func(format string, args ...interface{}) {
 			logs = append(logs, fmt.Sprintf(format, args...))
 		},
@@ -72,8 +75,8 @@ func TestLoopStopsOnRepeatedIdenticalToolCalls(t *testing.T) {
 	if !res.IsError {
 		t.Fatalf("无进展必须以终止帧收场，实际文本 %q", res.Text)
 	}
-	if res.Turns != maxIdenticalToolTurns {
-		t.Errorf("Turns = %d, want %d（第 3 轮就停，不烧到上限）", res.Turns, maxIdenticalToolTurns)
+	if res.Turns != guardLimit {
+		t.Errorf("Turns = %d, want %d（到阈值就停，不烧到上限）", res.Turns, guardLimit)
 	}
 	// 终止原因写在 result 帧里（res.Text 是整轮文本累计，模型全程没说过话
 	// 时它是空的）——手机错误卡片渲染的正是帧里的这个字段。
@@ -81,12 +84,46 @@ func TestLoopStopsOnRepeatedIdenticalToolCalls(t *testing.T) {
 	if got, _ := resultFrame["result"].(string); !strings.Contains(got, "无进展") {
 		t.Errorf("终止原因应点名无进展，实际 %q", got)
 	}
-	// 守卫在第 3 轮执行工具**之前**触发：只执行前 2 轮的调用。
-	if got := atomic.LoadInt32(&stub.calls); got != int32(maxIdenticalToolTurns-1) {
-		t.Errorf("工具执行了 %d 次, want %d", got, maxIdenticalToolTurns-1)
+	// 守卫在阈值轮执行工具**之前**触发：只执行前 guardLimit-1 轮的调用。
+	if got := atomic.LoadInt32(&stub.calls); got != int32(guardLimit-1) {
+		t.Errorf("工具执行了 %d 次, want %d", got, guardLimit-1)
 	}
 	if joined := strings.Join(logs, "\n"); !strings.Contains(joined, "完全相同的工具调用") {
 		t.Errorf("应有观测日志，实际 %s", joined)
+	}
+}
+
+// TestLoopGuardDefaultThresholdWhenUnset：宿主没配阈值时（0）走
+// defaultMaxIdenticalToolTurns。这是仪表盘未配置时的线上真实形态——默认值
+// 被误改（比如改回过紧的 3）会在这里直接红。
+func TestLoopGuardDefaultThresholdWhenUnset(t *testing.T) {
+	turns := make([]string, 0, defaultMaxIdenticalToolTurns+2)
+	for i := 0; i < defaultMaxIdenticalToolTurns+2; i++ {
+		turns = append(turns, toolTurn("toolu_dup", "Stub", `{"x":"always-the-same"}`))
+	}
+	srv := scriptServer(t, turns)
+	defer srv.Close()
+
+	stub := &stubTool{name: "Stub", result: ToolResult{Content: "ok"}}
+	registry := NewRegistry()
+	registry.Register(stub)
+
+	res, err := Run(context.Background(), &Config{
+		Client: NewClient(srv.URL),
+		Model:  "claude-x",
+		Tools:  registry,
+	}, []Message{TextMessage("user", "重复干活")})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !res.IsError {
+		t.Fatalf("无进展必须以终止帧收场，实际文本 %q", res.Text)
+	}
+	if res.Turns != defaultMaxIdenticalToolTurns {
+		t.Errorf("Turns = %d, want %d（未配置走默认阈值）", res.Turns, defaultMaxIdenticalToolTurns)
+	}
+	if got := atomic.LoadInt32(&stub.calls); got != int32(defaultMaxIdenticalToolTurns-1) {
+		t.Errorf("工具执行了 %d 次, want %d", got, defaultMaxIdenticalToolTurns-1)
 	}
 }
 
@@ -106,8 +143,8 @@ func lastResultFrame(t *testing.T, rec *frameRecorder) map[string]interface{} {
 // TestLoopContinuesWhenToolCallsDiffer：签名不同（参数在变）不算打转。
 // 参数每轮变化的同工具调用是正常工作形态，守卫不许误伤。
 func TestLoopContinuesWhenToolCallsDiffer(t *testing.T) {
-	turns := make([]string, 0, maxIdenticalToolTurns+1)
-	for i := 0; i < maxIdenticalToolTurns+1; i++ {
+	turns := make([]string, 0, defaultMaxIdenticalToolTurns+1)
+	for i := 0; i < defaultMaxIdenticalToolTurns+1; i++ {
 		turns = append(turns, toolTurn("toolu_var", "Stub", fmt.Sprintf(`{"x":"round-%d"}`, i)))
 	}
 	turns = append(turns, textTurn("干完了"))

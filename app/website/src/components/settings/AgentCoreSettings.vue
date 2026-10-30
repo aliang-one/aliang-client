@@ -56,6 +56,21 @@
       </label>
     </div>
 
+    <label class="mt-3 min-w-0 text-[10px] font-bold uppercase text-slate-400">
+      <span>{{ t('agentCore_guardTitle') }}</span>
+      <input
+        v-model="form.maxTurns"
+        type="number"
+        min="0"
+        max="50"
+        step="1"
+        :placeholder="t('agentCore_guardPlaceholder')"
+        :disabled="loading || saving"
+        class="mt-1.5 h-10 w-full rounded-lg border border-slate-200 bg-white px-3 font-mono text-xs font-normal text-slate-800 outline-none transition-colors focus:border-primary focus:ring-2 focus:ring-primary/10 disabled:opacity-60 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+      />
+      <span class="mt-1.5 block text-[11px] font-normal normal-case leading-4 text-slate-500 dark:text-slate-400">{{ t('agentCore_guardHint') }}</span>
+    </label>
+
     <p class="mt-3 text-[11px] leading-4 text-slate-500 dark:text-slate-400">{{ t('agentCore_hint') }}</p>
 
     <div v-if="localError" class="mt-3 text-xs text-red-600 dark:text-red-400" role="status">{{ localError }}</div>
@@ -76,7 +91,12 @@
 
 <script>
 import { useI18n } from '../../i18n';
-import { normalizeAgentCoreLLMConfig, validateAgentCoreLLMConfig } from '../../utils/agentCoreSettings';
+import {
+  agentCoreTuningToLineFormat,
+  normalizeAgentCoreLLMConfig,
+  validateAgentCoreLLMConfig,
+  validateAgentCoreTuning,
+} from '../../utils/agentCoreSettings';
 
 export default {
   name: 'AgentCoreSettings',
@@ -100,12 +120,14 @@ export default {
   },
   computed: {
     localError() {
-      const key = validateAgentCoreLLMConfig({
+      const llmKey = validateAgentCoreLLMConfig({
         enable: this.form.enable,
         baseUrl: this.form.baseUrl,
         apiKey: this.form.apiKey
       });
-      return key ? this.t(key) : '';
+      if (llmKey) return this.t(llmKey);
+      const guardKey = validateAgentCoreTuning(this.form.maxTurns);
+      return guardKey ? this.t(guardKey) : '';
     }
   },
   watch: {
@@ -119,8 +141,15 @@ export default {
   methods: {
     formFromConfig(config) {
       const llm = normalizeAgentCoreLLMConfig(config?.agentcore_llm);
-      // llm 是线格式(enabled);面板表单内部状态键用 enable
-      return { enable: llm.enabled, baseUrl: llm.base_url, apiKey: llm.api_key };
+      const guard = config?.agentcore?.max_identical_tool_turns;
+      // llm 是线格式(enabled);面板表单内部状态键用 enable。
+      // 守卫阈值:0/缺省 = 未配置,表单显示空串(placeholder 提示默认值)。
+      return {
+        enable: llm.enabled,
+        baseUrl: llm.base_url,
+        apiKey: llm.api_key,
+        maxTurns: typeof guard === 'number' && guard > 0 ? String(guard) : ''
+      };
     },
     save() {
       if (this.localError) return;
@@ -133,6 +162,11 @@ export default {
           enabled: !!this.form.enable,
           base_url: String(this.form.baseUrl || ''),
           api_key: String(this.form.apiKey || '')
+        },
+        agentcore: {
+          // 线格式键 max_identical_tool_turns(Go tag)。空串/0 归一成 0 =
+          // 用内核默认;清空语义经数字比较天然可达(0≠旧值进 patch)。
+          max_identical_tool_turns: agentCoreTuningToLineFormat(this.form.maxTurns)
         }
       };
       this.$emit('save', nextConfig);

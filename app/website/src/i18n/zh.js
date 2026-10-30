@@ -1148,8 +1148,8 @@ export default {
   customEnv_saving: '保存中…',
 
   // -- AgentCoreSettings --
-  agentCore_title: 'AliangCode 内核 LLM 设置',
-  agentCore_description: '为本机全部 AliangCode 会话指定显式 LLM 端点（Anthropic Messages 兼容）。未启用时沿用 Claude Code 同款配置与平台代理。',
+  agentCore_title: 'AliangCode 内核设置',
+  agentCore_description: '为本机全部 AliangCode 会话指定显式 LLM 端点（Anthropic Messages 兼容），并调优内核行为（无进展守卫阈值）。端点未启用时沿用 Claude Code 同款配置与平台代理。',
   agentCore_enable: '启用自定义 LLM 端点',
   agentCore_baseUrl: 'Base URL',
   agentCore_baseUrlPlaceholder: '例如 https://your-gateway.example.com',
@@ -1158,6 +1158,10 @@ export default {
   agentCore_showKey: '显示',
   agentCore_hideKey: '隐藏',
   agentCore_hint: '保存后下一个回合生效，无需重启。仅支持 Anthropic Messages 兼容端点；非回环地址必须填写 API Key。',
+  agentCore_guardTitle: '无进展守卫阈值（连续相同工具调用轮数）',
+  agentCore_guardPlaceholder: '留空使用默认（5）',
+  agentCore_guardHint: 'AliangCode 连续多轮发起完全相同的工具调用（名字+参数一致）时，内核判定为原地打转并收尾终止，防止无限空转。留空用默认 5；范围 1–50。',
+  agentCore_error_guardInvalid: '无进展守卫阈值必须是 1–50 的整数（留空使用默认）',
   agentCore_error_urlRequired: '启用时必须填写 Base URL',
   agentCore_error_urlInvalid: 'Base URL 必须是合法 URL（含协议与主机名）',
   agentCore_error_keyRequired: '非回环地址必须填写 API Key',

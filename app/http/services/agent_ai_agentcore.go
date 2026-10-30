@@ -1369,6 +1369,9 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		Effort: run.effort,
 		// 手机选定的上下文窗口驱动内核的自动压缩阈值；0 时内核用 200k 兜底。
 		ContextWindow: run.contextWindow,
+		// 打转守卫阈值（仪表盘 customer.agentcore.max_identical_tool_turns）；
+		// 0 时内核用默认值。子 agent 同参（见 agentCoreSubagentRunner）。
+		MaxIdenticalToolTurns: config.GetGlobalConfig().EffectiveAgentCoreMaxIdenticalToolTurns(),
 		Env:           kernelEnv,
 		Approve:       kernelApprove,
 		Logf:          kernelLogf,

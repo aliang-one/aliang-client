@@ -263,7 +263,7 @@ import AgentScanDirectoriesSettings from './settings/AgentScanDirectoriesSetting
 import ModelMappingSettings from './settings/ModelMappingSettings.vue';
 import CustomEnvSettings from './settings/CustomEnvSettings.vue';
 import AgentCoreSettings from './settings/AgentCoreSettings.vue';
-import { normalizeAgentCoreLLMConfig, applyAgentCoreLLMClearing } from '../utils/agentCoreSettings';
+import { normalizeAgentCoreLLMConfig, applyAgentCoreLLMClearing, normalizeAgentCoreTuning } from '../utils/agentCoreSettings';
 import { useNavigation } from '../composables/useNavigation';
 import { openTutorialDocs } from '../composables/useTutorialDocs';
 import { useAuthStore } from '../stores/auth';
@@ -370,7 +370,8 @@ function normalizeCustomerConfig(payload = {}) {
     proxy_rules: normalizeProxyRules(payload?.proxy_rules),
     model_mapping: normalizeModelMappingConfig(payload?.model_mapping),
     custom_env_vars: normalizeCustomEnvVarsConfig(payload?.custom_env_vars),
-    agentcore_llm: normalizeAgentCoreLLMConfig(payload?.agentcore_llm)
+    agentcore_llm: normalizeAgentCoreLLMConfig(payload?.agentcore_llm),
+    agentcore: normalizeAgentCoreTuning(payload?.agentcore)
   };
 }
 
