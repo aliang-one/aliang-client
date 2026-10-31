@@ -1,7 +1,7 @@
 import { expect } from '@playwright/test';
 
 // 聊天页 e2e 共享桩（chat-settings / chat-device-sessions / chat-unify /
-// chat-stop 四份 spec 的消重唯一真源）：
+// chat-stop / chat-steer-stream 等六份 spec 消重的唯一真源）：
 //   installChatStub(page, options) —— route mock（/api/auth/session 固定快照、
 //     /api/agent/sessions 可覆写清单、可选 /api/agent/session 详情、其余空
 //     答复）+ addInitScript 注入 FakeWebSocket 与 window.__aiFrames。

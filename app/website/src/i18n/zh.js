@@ -241,6 +241,7 @@ export default {
   chat_settingsDirectory: '工作目录',
   chat_settingsModel: '模型',
   chat_settingsEffort: '推理力度',
+  chat_effortPending: '下轮生效',
   chat_modelDefault: '默认',
   chat_pathDefault: '默认（home）',
   chat_recentProjects: '最近项目',

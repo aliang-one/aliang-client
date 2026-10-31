@@ -56,6 +56,14 @@
       >
         <option v-for="opt in EFFORT_OPTIONS" :key="opt.value" :value="opt.value">{{ opt.value || t('chat_modelDefault') }}</option>
       </select>
+      <!-- 「下轮生效」角标（Task 12）：effort/model 改动落值即挂（conv.pendingConfig，
+           随 applySessionSettings 置位），ai.run.started 路由回本会话即清——新回合
+           已按新配置跑。瞬态不落盘，重载后自然退场。 -->
+      <span
+        v-if="conversation?.pendingConfig"
+        data-testid="chat-effort-pending"
+        class="shrink-0 rounded bg-amber-100 px-1.5 py-0.5 text-[10px] text-amber-700 dark:bg-amber-900/40 dark:text-amber-300"
+      >{{ t('chat_effortPending') }}</span>
       <div
         v-if="createError"
         data-testid="chat-settings-error"

@@ -241,6 +241,7 @@ export default {
   chat_settingsDirectory: 'Directory',
   chat_settingsModel: 'Model',
   chat_settingsEffort: 'Effort',
+  chat_effortPending: 'Next turn',
   chat_modelDefault: 'Default',
   chat_pathDefault: 'Default (home)',
   chat_recentProjects: 'Recent projects',

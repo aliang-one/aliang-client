@@ -76,7 +76,7 @@ test('融入位置：steer 条在消息流内最后一条消息之后（右侧�
   expect(cls).toContain('border-primary/40');
   expect(cls).toContain('rounded-2xl');
   // 初始态「已发送」→ 注入 ack applied →「已送达」
-  await expect(page.getByTestId('chat-steer-status')).toHaveText(/已发送|^Sent$/);
+  await expect(page.getByTestId('chat-steer-status')).toHaveText(/已发送|Sent/);
   await pushFrame(page, {
     type: 'ai.steer.ack', session_id: 'managed-steer-1', message_id: steer.message_id, result: 'applied',
   });

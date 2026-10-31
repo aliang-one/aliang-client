@@ -34,9 +34,10 @@
           <!-- 统一时间线（Task 11）：messages（权威流）与 steerItems（瞬态插话）
                按 ts 升序归并渲染——插话以 user 气泡形态出现在它被发出的时间点，
                不再是消息流外的独立区块。归并纯渲染层：数据结构零变化，steer
-               仍不写 messages、不进持久化。key 复合（messageId 优先）：steer 项
-               天然带 messageId；message 大多无 id 走 'm-'+序号兜底，带 id 的
-               （审批派生行等）跨 splice 保持稳定（防 Task 13 撤回的 idx 键脆断）。 -->
+               仍不写 messages、不进持久化。key 现状：messages 一律 'm-'+idx 兜底
+               （messageId 分支为 Task 13 预留——落地后本地/设备壳消息将带 id）；
+               Task 13 撤回 splice 前需确认稳定 id 已引入，否则 idx 键会让后续
+               气泡错位复用。 -->
           <template v-for="(item, idx) in timeline" :key="item.messageId || 'm-' + idx">
             <ChatMessageBubble
               v-if="item.type === 'message'"
@@ -44,9 +45,10 @@
               :now-tick="nowTick"
             />
             <!-- 插话气泡（原 Task 4 轻量条融入时间线）：⚡ 徽 + 插话标签 +
-                 状态 chip（steerStatusLabel 六态）+ 正文/失败详情。 -->
+                 状态 chip（steerStatusLabel 六态）+ 正文/失败详情。v-else-if
+                 显式钉 steer：未来第三种 type 不得静默套用插话气泡形态。 -->
             <div
-              v-else
+              v-else-if="item.type === 'steer'"
               data-testid="chat-steer-item"
               class="mb-3 ml-auto w-fit max-w-[85%] rounded-2xl border border-primary/40 bg-primary/5 px-3 py-2 text-xs"
             >

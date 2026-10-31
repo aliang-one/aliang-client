@@ -264,6 +264,11 @@ export function useAliangChat() {
   function applySessionSettings(conv, patch) {
     if (activeRunning.value) return;
     Object.assign(conv, patch);
+    // effort/model 是「下一回合生效」配置：落值即挂「下轮生效」角标，直到
+    // ai.run.started 路由回本会话才清（running 守卫已过 = 改动确实落值）。
+    // 空串 effort（跟随默认）也是合法改动，同样触发。ai.session.created 的
+    // 回显不走本入口，不会误挂角标。瞬态：conversationForStorage 剥离不落盘。
+    if ('effort' in patch || 'model' in patch) conv.pendingConfig = true;
     conv.updatedAt = now();
     saveToStorage();
     createError.value = '';
@@ -439,6 +444,9 @@ export function useAliangChat() {
     copy.approvals = [];
     // steer 轻量条是瞬态 UI：ack 状态不跨页持久（陈旧的「已受理」比没有更糟）
     copy.steerItems = [];
+    // pendingConfig（「下轮生效」角标）同为瞬态：重载后「是否已开新回合」
+    // 无从判定，跨页保留只会展示陈旧角标——与 approvals/steerItems 同剥。
+    delete copy.pendingConfig;
     // deviceTranscript 不落盘（评审折叠项）：重开设备会话有 5 分钟 TTL+详情
     // 分页重拉兜底，防大转录长期占 localStorage。
     delete copy.deviceTranscript;
@@ -1250,6 +1258,9 @@ export function useAliangChat() {
       case 'ai.run.started': {
         const asst = ensureAssistantBubble(conv);
         if (asst) asst.status = 'running';
+        // 新回合开始：上一手 effort/model 改动已随本回合的 create 生效，
+        // 「下轮生效」角标退场（改动只会经 applySessionSettings 挂起）。
+        conv.pendingConfig = false;
         break;
       }
       case 'ai.delta': {

@@ -1,5 +1,5 @@
 import { expect, test } from '@playwright/test';
-import { openChat as openChatBase } from './helpers/chatStub.js';
+import { openChat as openChatBase, pushFrame } from './helpers/chatStub.js';
 
 // 阶段 2：清单条目带 id/provider/title/status/origin（三源同列表渲染）；
 // 三条重复 project_path 保留——设置条「最近项目」按路径去重语义不破。
@@ -47,6 +47,40 @@ test('已建会话改 effort 触发第二次 create；目录锁定为只读', as
   // 改 effort → 追加一次 create
   await page.getByTestId('chat-settings-effort').selectOption('high');
   await expect.poll(async () => page.evaluate(() => window.__aiFrames.filter(f => f.type === 'ai.session.create' && f.effort === 'high').length)).toBeGreaterThan(0);
+});
+
+// 「下轮生效」角标（Task 12）：effort/model 经 applySessionSettings 落值即挂
+// conv.pendingConfig；ai.run.started 路由回该会话（新回合开始）即清。前置：
+// 先发一句把 aiSessionId 建起来（'local-'+conv.id，首条 create 前落值），run
+// 由默认 responder 以 ai.done 收敛后设置条才可改（running 禁改语义不变）。
+async function establishCreatedSession(page) {
+  await page.getByPlaceholder(/输入消息|Type a message/).fill('第一句');
+  await page.keyboard.press('Enter');
+  await expect(page.getByTestId('chat-stop-button')).toHaveCount(0); // run 已收敛
+  return page.evaluate(() => window.__aiFrames.filter(f => f.type === 'ai.message').slice(-1)[0].session_id);
+}
+
+test('改 effort 落「下轮生效」角标，ai.run.started 后清除', async ({ page }) => {
+  await openChat(page);
+  const sid = await establishCreatedSession(page);
+  await page.getByTestId('chat-settings-effort').selectOption('high');
+  const chip = page.getByTestId('chat-effort-pending');
+  await expect(chip).toBeVisible();
+  await expect(chip).toHaveText(/下轮生效|Next turn/);
+  // 注入该会话的 ai.run.started（新回合开始）→ 角标消失
+  await pushFrame(page, { type: 'ai.run.started', session_id: sid });
+  await expect(chip).toHaveCount(0);
+});
+
+test('改模型同样落「下轮生效」角标，ai.run.started 后清除', async ({ page }) => {
+  await openChat(page);
+  const sid = await establishCreatedSession(page);
+  await page.getByTestId('chat-settings-model').selectOption('glm-5.2');
+  const chip = page.getByTestId('chat-effort-pending');
+  await expect(chip).toBeVisible();
+  await expect(chip).toHaveText(/下轮生效|Next turn/);
+  await pushFrame(page, { type: 'ai.run.started', session_id: sid });
+  await expect(chip).toHaveCount(0);
 });
 
 test('create 失败内联可见且下次发送重试', async ({ page }) => {
