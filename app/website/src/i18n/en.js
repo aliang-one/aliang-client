@@ -308,6 +308,18 @@ export default {
   chat_recallStopTimeout: 'Stop timed out. Please retry.',
   chat_recallUnconfirmed: 'Recall not confirmed. You can retry.',
   chat_copyMessage: 'Copy',
+  // Structured option card (Task 14): ai.option two-step interactive card +
+  // static fence card. Paired with zh.js (i18n.test.js key-set guard).
+  chat_optionTitle: 'Choose an option',
+  chat_optionSubmit: 'Confirm selection',
+  chat_optionSelected: 'Selected',
+  chat_optionCustom: 'Custom reply…',
+  chat_optionMulti: 'Multi-select',
+  chat_optionPreview: 'Preview',
+  chat_optionStaticHint: 'Pick below',
+  chat_optionCancelled: 'Option selection expired',
+  chat_optionCancelledReason: 'Option selection expired ({reason})',
+  chat_optionSendFailed: 'Failed to send selection. Please retry.',
 
   // -- App --
   app_restoringSession: 'Restoring saved session...',

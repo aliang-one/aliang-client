@@ -132,6 +132,10 @@ export function useAliangChat() {
     (activeConversation.value?.approvals || []).filter(a => a.status === 'pending' || a.status === 'responding')
   );
 
+  // 方案交互卡（Task 14）：pending/sending 展开作答，answered 折叠「已选择」
+  // 终态常驻（作废即被移除）——与审批族数据结构独立，全量透传给列表渲染。
+  const activeOptionCards = computed(() => activeConversation.value?.optionCards || []);
+
   // True while the active conversation's latest assistant message is still streaming.
   const activeRunning = computed(() => {
     const msgs = activeMessages.value;
@@ -502,6 +506,9 @@ export function useAliangChat() {
   function conversationForStorage(conv) {
     const copy = { ...conv };
     copy.approvals = [];
+    // 方案交互卡同为瞬态（Task 14）：后端 run 结束才重发请求，跨页保留的
+    // 「已选择」终态/待答卡只会误导（作答通道已随页面关闭而失联）。
+    copy.optionCards = [];
     // steer 轻量条是瞬态 UI：ack 状态不跨页持久（陈旧的「已受理」比没有更糟）
     copy.steerItems = [];
     // pendingConfig（「下轮生效」角标）同为瞬态：重载后「是否已开新回合」
@@ -519,6 +526,7 @@ export function useAliangChat() {
       title: '',
       messages: [],
       approvals: [],
+      optionCards: [],
       // 本窗口是 AliangCode 对话窗口（2026-10-30 用户拍板）：新建会话默认
       // agentcore；聊天窗只展示自家 agent 的对话，不该默认落成 claudecode。
       provider: chatProviderPreset.value || 'agentcore',
@@ -964,6 +972,8 @@ export function useAliangChat() {
     if (!conv || typeof conv !== 'object') return null;
     if (!Array.isArray(conv.messages)) conv.messages = [];
     conv.approvals = [];
+    // optionCards 从不落盘（storage 侧已剥离），此处兜底旧数据/异常形态。
+    conv.optionCards = [];
     return conv;
   }
 
@@ -1093,6 +1103,110 @@ export function useAliangChat() {
         approval.updatedAt = now();
         saveToStorage();
       }
+    }
+  }
+
+  // --- 方案交互卡 ai.option（Task 14，与审批族同构但数据结构独立） ---
+  // 协议：run 结束时后端从模型输出的 aliang-options 围栏提取发
+  // ai.option.request（先于 ai.done 到达——ai.done 清审批但绝不清卡），作答
+  // ai.option.response 续接新 run；ai.option.cancelled 作废（option_ids[]）。
+  // optionCards 挂会话、瞬态（conversationForStorage 剥离，同 approvals）。
+
+  function optionKeyFromValues(sessionId, optionId) {
+    return `${sessionId || ''}:${optionId || ''}`;
+  }
+
+  // 选项行硬规范化（镜像后端 normalize：空 label 丢、id/label 字符串化）——
+  // 帧来自模型产物清洗，逐项容错防坏行炸卡。
+  function normalizeOptionChoices(raw) {
+    const list = Array.isArray(raw) ? raw : [];
+    const out = [];
+    for (const item of list) {
+      if (!item || typeof item !== 'object') continue;
+      const id = String(item.id ?? '').trim();
+      const label = String(item.label ?? '').trim();
+      if (!id || !label) continue;
+      out.push({
+        id,
+        label,
+        description: typeof item.description === 'string' ? item.description : '',
+        response: typeof item.response === 'string' ? item.response : '',
+        previews: Array.isArray(item.previews) ? item.previews.map(p => String(p)) : [],
+      });
+    }
+    return out;
+  }
+
+  function ensureOptionCards(conv) {
+    if (!Array.isArray(conv.optionCards)) conv.optionCards = [];
+    return conv.optionCards;
+  }
+
+  function upsertOptionCard(conv, e) {
+    const optionId = String(e.option_id || '').trim();
+    const choices = normalizeOptionChoices(e.options);
+    if (!optionId || !choices.length) return;
+    const sessionId = e.session_id || conv.aiSessionId || '';
+    const key = optionKeyFromValues(sessionId, optionId);
+    const cards = ensureOptionCards(conv);
+    const existing = cards.find(c => c.key === key);
+    const next = {
+      key,
+      optionId,
+      sessionId,
+      messageId: e.message_id || existing?.messageId || '',
+      provider: e.provider || existing?.provider || '',
+      title: e.title || existing?.title || '',
+      header: e.header || existing?.header || '',
+      summary: e.summary || existing?.summary || '',
+      version: typeof e.v === 'number' ? e.v : (existing?.version || 0),
+      options: choices,
+      allowCustom: !!e.allow_custom,
+      multi: !!e.multi,
+      // 同 key 新请求（新 run 重发方案）整体复位：旧终态/旧选中不作数。
+      status: 'pending',
+      selected: [],
+      customText: '',
+      error: '',
+      // ③活跃兜底来源标（镜像审批族，渲染层经 chat_approvalFromSession 翻译）
+      sourceId: e.sourceId || existing?.sourceId || '',
+      updatedAt: now(),
+    };
+    if (existing) Object.assign(existing, next);
+    else cards.push(next);
+    conv.updatedAt = now();
+    scrollToBottom();
+  }
+
+  // 作答：裸 sendAI（与 respondApproval 同构，不进 create 确认门——作答续接
+  // 的是既有会话）。成功置 answered+记录选择（卡折叠终态），失败恢复 pending
+  // +错误文案（保留已选可直接重试）。optionCards 不落盘，无需 saveToStorage。
+  async function respondOption(conv, card, selected, customText) {
+    if (!conv || !card || card.status !== 'pending') return;
+    const picked = (Array.isArray(selected) ? selected : []).map(v => String(v)).filter(Boolean);
+    if (!picked.length) return;
+    const custom = typeof customText === 'string' ? customText.trim() : '';
+    card.status = 'sending';
+    card.error = '';
+    card.updatedAt = now();
+    try {
+      await ensureAISocket();
+      const ok = sendAI({
+        type: 'ai.option.response',
+        session_id: card.sessionId || conv.aiSessionId,
+        option_id: card.optionId,
+        selected: picked,
+        custom_text: custom,
+      });
+      if (!ok) throw new Error('socket-closed');
+      card.status = 'answered';
+      card.selected = picked;
+      card.customText = custom;
+      card.updatedAt = now();
+    } catch (_) {
+      card.status = 'pending';
+      card.error = t('chat_optionSendFailed');
+      card.updatedAt = now();
     }
   }
 
@@ -1467,7 +1581,11 @@ export function useAliangChat() {
     //   挂该壳，**不切 activeId**（卡在壳上，用户点开即见）；
     // ③仍无命中 → 挂活跃会话（现状 fallback），审批卡带「来自会话 <id 前 8>」
     //   来源标签。非审批帧维持现状 fallback。
-    const isApprovalFamily = e.type === 'ai.approval.request' || e.type === 'ai.approval.cancelled';
+    // Task 14：ai.option.request/cancelled 与审批族同走后端审批族广播
+    // （fanOut 白名单同表），归属判定镜像同一条链（①直连→②壳三键→③兜底
+    // 带来源标）——数据结构独立，路由链共享。
+    const isApprovalFamily = e.type === 'ai.approval.request' || e.type === 'ai.approval.cancelled'
+      || e.type === 'ai.option.request' || e.type === 'ai.option.cancelled';
     let routedToShell = false;
     if (!conv && isApprovalFamily && e.session_id) {
       const shell = findDeviceShellBySessionId(e.session_id);
@@ -1590,6 +1708,46 @@ export function useAliangChat() {
         });
         scrollToBottom();
         persist = true;
+        break;
+      }
+      case 'ai.option.request': {
+        upsertOptionCard(conv, e);
+        break;
+      }
+      case 'ai.option.cancelled': {
+        // 镜像 ai.approval.cancelled：逐 id 清卡 + 系统提示条挂对应会话。
+        // 已作答（answered 终态）的卡同样按作废语义移除；未带 option_ids
+        // （协议 Optional）时作废该 session 全部卡。③兜底时带「来自会话 X」
+        // 前缀（与审批取消同构）。注意 ai.done/ai.error 清审批但绝不清卡——
+        // option.request 先于 ai.done 到达，卡必须活过 run 终态等用户作答。
+        const ids = (Array.isArray(e.option_ids) ? e.option_ids : []).map(v => String(v));
+        const cards = Array.isArray(conv.optionCards) ? conv.optionCards : [];
+        const sid = String(e.session_id || '');
+        const kept = [];
+        let removed = 0;
+        for (const card of cards) {
+          const hit = ids.length
+            ? ids.includes(card.optionId) && card.key === optionKeyFromValues(sid, card.optionId)
+            : card.sessionId === sid;
+          if (hit) removed++;
+          else kept.push(card);
+        }
+        if (removed) {
+          conv.optionCards = kept;
+          const cancelledText = e.reason
+            ? t('chat_optionCancelledReason', { reason: e.reason })
+            : t('chat_optionCancelled');
+          conv.messages.push({
+            role: 'assistant',
+            kind: 'system',
+            note: 'option_cancelled',
+            content: systemNoteContent(e.sourceId, cancelledText),
+            status: 'done',
+            ts: now(),
+          });
+          scrollToBottom();
+        }
+        persist = true; // 系统条进消息流要落盘（无卡可清时无副作用）
         break;
       }
       case 'ai.run.notice': {
@@ -1768,6 +1926,7 @@ export function useAliangChat() {
     activeIsDevice,
     activeMessages,
     activeApprovals,
+    activeOptionCards,
     activeSteerItems,
     activeRunning,
     // 动作槽（发送/停止交替）的 running 门控源：会话级并集判定（本地气泡
@@ -1813,6 +1972,7 @@ export function useAliangChat() {
     onSlashInput,
     recallActive,
     respondApproval,
+    respondOption,
     sendMessage,
     sendRecall,
     startRecall,

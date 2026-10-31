@@ -3,18 +3,43 @@
     whitespace-normal:气泡容器带 whitespace-pre-wrap 且会被继承,markdown
     HTML 源里的块级换行会被 pre-wrap 渲染成多余空行,这里显式还原。
     交互(复制/展开)全部走根节点事件委托,v-html 内容不绑任何事件。
+    模板分两段(Task 14):①v-html 只承载正文(渲染前永远 stripAliangOptions,
+    围栏原文块不再出现——与交互卡是否在场无关);②extractAliangOptions 提取
+    的每个结构化块渲染静态只读卡(命中 hiddenOptionIds 且带 option_id 的隐藏,
+    防与交互卡双份;无 option_id 的块不参与比对,照渲染)。
   -->
-  <div
-    ref="rootRef"
-    class="chat-md whitespace-normal text-sm leading-relaxed break-words"
-    v-html="html"
-    @click="onClick"
-  ></div>
+  <div class="whitespace-normal text-sm leading-relaxed break-words">
+    <div
+      ref="rootRef"
+      class="chat-md"
+      v-html="html"
+      @click="onClick"
+    ></div>
+    <div
+      v-for="(block, bi) in visibleOptionBlocks"
+      :key="bi"
+      data-testid="chat-option-static"
+      class="mt-2 rounded-xl border border-primary/30 bg-primary/5 px-3 py-2 text-xs dark:border-primary/40 dark:bg-primary/10"
+    >
+      <div class="flex items-center gap-1.5 font-semibold text-primary">
+        <span class="material-symbols-outlined text-sm leading-none">checklist</span>
+        <span>{{ blockTitle(block) }}</span>
+      </div>
+      <ul class="mt-1 space-y-0.5 text-slate-600 dark:text-slate-300">
+        <li
+          v-for="opt in blockOptions(block)"
+          :key="opt.id"
+          class="break-words"
+        >• {{ opt.label }}</li>
+      </ul>
+      <p class="mt-1 text-slate-400 dark:text-slate-500">{{ t('chat_optionStaticHint') }}</p>
+    </div>
+  </div>
 </template>
 
 <script setup>
-import { ref, watch, onMounted, onUnmounted } from 'vue';
-import { renderMarkdownSafe } from '../../utils/chatMarkdown';
+import { ref, computed, watch, onMounted, onUnmounted } from 'vue';
+import { renderMarkdownSafe, extractAliangOptions, stripAliangOptions } from '../../utils/chatMarkdown';
 import { useI18n } from '../../i18n';
 
 const { t } = useI18n();
@@ -32,18 +57,64 @@ const FOLD_LINE_THRESHOLD = 20;
 // 复制成功反馈在按钮上的停留时长,超时还原为「复制」,避免长期占位误导。
 const FEEDBACK_RESET_MS = 1500;
 
-const props = defineProps({ content: { type: String, default: '' } });
+const props = defineProps({
+  content: { type: String, default: '' },
+  // 该会话在挂交互卡（ai.option.request upsert 的 optionCards）的 option_id
+  // 集合：命中（且块自带 option_id）的静态卡隐藏——防交互卡/静态卡双份。
+  // 只控静态卡显隐，正文 strip 围栏无条件执行（防双份正确流）。
+  hiddenOptionIds: { type: Array, default: () => [] },
+});
 
 // 渲染短路:content 未变直接复用上次 HTML——撤回重发/尾部重复等场景不
 // 重跑 markdown 也不触碰 v-html,代码块交互态(复制反馈/展开)不被无谓
 // 抹掉(renderMarkdownSafe 确定性渲染,同输入同输出,可安全记忆)。
+// Task 14:渲染输入是 stripAliangOptions(content)——正文永远先剔除
+// aliang-options 围栏(坏 JSON 块同样剔原文:extract 已跳过不产卡,原文
+// 也不再以代码块形态露出)。
 let lastContent = '';
 let lastHtml = '';
 function render(content) {
-  if (content === lastContent) return lastHtml;
-  lastContent = content;
-  lastHtml = renderMarkdownSafe(content);
+  const stripped = stripAliangOptions(content);
+  if (stripped === lastContent) return lastHtml;
+  lastContent = stripped;
+  lastHtml = renderMarkdownSafe(stripped);
   return lastHtml;
+}
+
+// 围栏 → 结构化块（extract 坏 JSON 跳过）：驱动静态卡第二段渲染。
+const optionBlocks = computed(() => extractAliangOptions(props.content));
+
+const hiddenOptionIdSet = computed(() =>
+  new Set((props.hiddenOptionIds || []).map(v => String(v)))
+);
+
+// 隐藏比对仅对带 option_id 的块生效（Task 4 质量审查交接：模型漏写
+// option_id 的静态块照渲染，不进比对）。
+const visibleOptionBlocks = computed(() =>
+  optionBlocks.value.filter((block) => {
+    const id = block.option_id ? String(block.option_id) : '';
+    return !id || !hiddenOptionIdSet.value.has(id);
+  })
+);
+
+function blockTitle(block) {
+  const title = typeof block?.title === 'string' ? block.title.trim() : '';
+  return title || t('chat_optionTitle');
+}
+
+// 只读选项列表：extract 已保证 options 非空数组，但元素形态不保证——
+// 逐项取 id/label 字符串化，无 label 的行跳过（与后端 normalize 同口径的
+// 容错，坏行不炸卡）。
+function blockOptions(block) {
+  const list = Array.isArray(block?.options) ? block.options : [];
+  const out = [];
+  for (const item of list) {
+    if (!item || typeof item !== 'object') continue;
+    const id = String(item.id ?? '');
+    const label = String(item.label ?? '').trim();
+    if (id && label) out.push({ id, label });
+  }
+  return out;
 }
 
 // 初始渲染同步完成(ref 初始化),挂载即有内容——不参与节流。
@@ -69,9 +140,12 @@ function enhance() {
   if (!root) return;
   root.querySelectorAll('pre').forEach((pre, preIndex) => {
     const code = pre.querySelector('code');
-    // 未闭合/已闭合的 ```aliang-options 围栏都渲染成 language-aliang-options
-    // 代码块:直接隐藏防流式闪烁(交互卡由上层渲染,原文块永不露出),
-    // 也不给它包 wrapper,避免语言标签/按钮闪现。
+    // ```aliang-options 围栏的原文代码块永不露出(Task 14 静态卡实现的唯一
+    // 兜底位):已闭合围栏在渲染前已被 stripAliangOptions 从正文剔除,正常
+    // 不会走到这里;能到达的只剩流式半截围栏(markdown-it 按未闭合代码块
+    // 渲染,extract 匹配不到闭合围栏、无静态卡)——隐藏防闪烁,也不包
+    // wrapper,避免语言标签/按钮闪现。闭合瞬间正文重渲染(strip 后无此 pre)
+    // 自然换成静态卡。
     if (code && code.classList.contains('language-aliang-options')) {
       pre.hidden = true;
       return;

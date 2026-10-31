@@ -21,7 +21,7 @@
         <!-- 品牌空状态（无活跃会话 / 空转录且无插话/审批在挂）：渐变圆徽 + 标题 +
              副文案。空转录但已有审批/插话时不显示 hero（内容列表照常渲染）。 -->
         <div
-          v-if="!activeId || (activeMessages.length === 0 && steerItems.length === 0 && approvals.length === 0)"
+          v-if="!activeId || (activeMessages.length === 0 && steerItems.length === 0 && approvals.length === 0 && optionCards.length === 0)"
           class="flex min-h-[45vh] flex-col items-center justify-center gap-3 py-10 text-center"
         >
           <div class="flex size-16 items-center justify-center rounded-full bg-gradient-to-br from-primary to-emerald-500 text-white shadow-lg shadow-primary/20">
@@ -44,6 +44,7 @@
               :msg="item"
               :now-tick="nowTick"
               :recall-enabled="recallEnabled"
+              :hidden-option-ids="hiddenOptionIds"
               @recall="emit('recall', $event)"
             />
             <!-- 插话气泡（原 Task 4 轻量条融入时间线）：⚡ 徽 + 插话标签 +
@@ -75,6 +76,15 @@
             :now-tick="nowTick"
             @respond="(decision) => emit('approval-respond', approval, decision)"
           />
+          <!-- 方案交互卡（Task 14）：与审批卡同区（消息时间线之后），两步
+               作答的 respond 事件上抛给 ChatPage → useAliangChat.respondOption。 -->
+          <ChatOptionCard
+            v-for="card in optionCards"
+            :key="card.key"
+            :card="card"
+            :now-tick="nowTick"
+            @respond="(payload) => emit('option-respond', card, payload)"
+          />
         </template>
       </div>
     </div>
@@ -104,6 +114,7 @@ import { useI18n } from '../../i18n';
 import { mergeTimeline } from '../../utils/chatTimeline';
 import ChatMessageBubble from './ChatMessageBubble.vue';
 import ChatApprovalCard from './ChatApprovalCard.vue';
+import ChatOptionCard from './ChatOptionCard.vue';
 
 const props = defineProps({
   conversation: { type: Object, default: null },
@@ -112,6 +123,10 @@ const props = defineProps({
   steerItems: { type: Array, default: () => [] },
   // 已过滤的活跃审批（pending/responding），过滤逻辑在 useAliangChat。
   approvals: { type: Array, default: () => [] },
+  // 方案交互卡（Task 14，含 answered 终态折叠卡；作废即被移除），透传渲染。
+  optionCards: { type: Array, default: () => [] },
+  // 在挂交互卡的 option_id 集合 → 气泡层静态围栏卡防双份（Task 14）。
+  hiddenOptionIds: { type: Array, default: () => [] },
   nowTick: { type: Number, default: 0 },
   // 滚动容器元素交接：scrollToBottom 由 useAliangChat 在流式增量/转录装载/
   // 发送等时点驱动（与拆分前 ref="messagesContainer" 的字符串 ref 语义等价）。
@@ -125,7 +140,7 @@ const props = defineProps({
   scrollToBottom: { type: Function, required: true },
 });
 
-const emit = defineEmits(['approval-respond', 'recall']);
+const emit = defineEmits(['approval-respond', 'option-respond', 'recall']);
 
 const { t } = useI18n();
 
@@ -139,12 +154,13 @@ const timeline = computed(() => mergeTimeline(props.activeMessages, props.steerI
 // 锚点解析后解锁（messageId 接线保留，canRecall 纯函数不动，门控收在渲染层）。
 const recallEnabled = computed(() => !props.conversation?.deviceSession);
 
-// 未读徽标：非贴底期间到达的消息数（user/assistant 气泡 + 插话条 + 审批卡）。
-// 回底（滚动事件判定贴底，或点浮钮）即清零。
+// 未读徽标：非贴底期间到达的消息数（user/assistant 气泡 + 插话条 + 审批卡 +
+// 方案交互卡，Task 14 一并计入）。回底（滚动事件判定贴底，或点浮钮）即清零。
 const unseenCount = ref(0);
 
 function feedTotal() {
-  return props.activeMessages.length + props.steerItems.length + props.approvals.length;
+  return props.activeMessages.length + props.steerItems.length + props.approvals.length
+    + props.optionCards.length;
 }
 
 watch(feedTotal, (n, o) => {

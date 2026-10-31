@@ -53,12 +53,15 @@
         :active-messages="activeMessages"
         :steer-items="activeSteerItems"
         :approvals="activeApprovals"
+        :option-cards="activeOptionCards"
+        :hidden-option-ids="hiddenOptionIds"
         :now-tick="nowTick"
         :set-container="setMessagesContainer"
         :near-bottom="messagesNearBottom"
         :set-near-bottom="setMessagesNearBottom"
         :scroll-to-bottom="scrollToBottom"
         @approval-respond="onApprovalRespond"
+        @option-respond="onOptionRespond"
         @recall="startRecall"
       />
 
@@ -93,7 +96,7 @@
 // 聊天页编排壳：状态与全部业务逻辑收在 useAliangChat（WS 生命周期/看门狗/
 // 帧路由/审批/steer/三源清单/持久化），渲染拆在 chat/ 组件树（侧栏、顶栏、
 // 设置条、消息列表、气泡、审批卡、输入区）。本文件只做组件接线。
-import { onMounted, onUnmounted } from 'vue';
+import { computed, onMounted, onUnmounted } from 'vue';
 import { useAliangChat } from '../composables/useAliangChat';
 import ChatSidebar from './chat/ChatSidebar.vue';
 import ChatHeader from './chat/ChatHeader.vue';
@@ -107,6 +110,7 @@ const {
   activeId,
   activeIsDevice,
   activeMessages,
+  activeOptionCards,
   activeRunning,
   activeSessionRunning,
   activeSteerItems,
@@ -134,6 +138,7 @@ const {
   renamingId,
   renameSurface,
   respondApproval,
+  respondOption,
   scrollToBottom,
   sendMessage,
   sendRecall,
@@ -164,6 +169,19 @@ function onApplySettings(patch) {
 function onApprovalRespond(approval, decision) {
   respondApproval(activeConversation.value, approval, decision);
 }
+
+// 方案交互卡作答落点（Task 14）：两步作答的 respond 事件（selected/customText）
+// 由 useAliangChat.respondOption 发 ai.option.response（成功置 answered 折叠态）。
+function onOptionRespond(card, payload) {
+  respondOption(activeConversation.value, card, payload?.selected, payload?.customText);
+}
+
+// 静态围栏卡防双份集合（Task 14）：活跃会话在挂交互卡的 option_id →
+// MessageList → Bubble → ChatMarkdown 隐藏同 id 静态卡（无 option_id 的静态
+// 块不参与比对，在渲染层自行容忍）。
+const hiddenOptionIds = computed(() =>
+  (activeOptionCards.value || []).map(c => c.optionId).filter(Boolean)
+);
 
 // 撤回确认重发落点（Task 13）：conv 取当前活跃会话；状态机/发送链全在
 // useAliangChat（recalling 在途守卫、stop→终态等待、truncate create 确认门）。

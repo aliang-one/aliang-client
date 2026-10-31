@@ -3,7 +3,7 @@
     <!-- 系统提示条（审批取消 / run notice）：不是对话气泡，居中弱化胶囊 -->
     <div
       v-if="msg.kind === 'system'"
-      :data-testid="msg.note === 'run_notice' ? 'chat-run-notice' : 'chat-approval-cancelled-note'"
+      :data-testid="systemNoteTestId(msg.note)"
       class="mx-auto w-fit max-w-full rounded-full border border-slate-200 bg-white/80 px-3 py-1 text-center text-xs text-slate-500 dark:border-slate-700 dark:bg-slate-800/80 dark:text-slate-400"
     >{{ msg.content }}</div>
     <template v-else>
@@ -79,9 +79,11 @@
             <span class="ml-1 align-middle">{{ t('chat_aiThinking') }}</span>
           </span>
           <!-- spec §E:仅 assistant 正常气泡走 markdown(消毒管线);user 与
-               error 气泡铁律保持纯文本插值防注入,markdown 渲染不递给它们。 -->
+               error 气泡铁律保持纯文本插值防注入,markdown 渲染不递给它们。
+               hiddenOptionIds（Task 14）:该会话在挂交互卡的 option_id 集合,
+               透传给 markdown 的静态围栏卡做防双份隐藏比对。 -->
           <template v-else-if="msg.role === 'assistant' && msg.status !== 'error'">
-            <ChatMarkdown :content="msg.content" />
+            <ChatMarkdown :content="msg.content" :hidden-option-ids="hiddenOptionIds" />
             <!-- 流式光标：running 且已有正文时缀在内容尾部闪烁
                  （reduced-motion 下静态常亮不动画）。 -->
             <span
@@ -110,11 +112,21 @@ const props = defineProps({
   nowTick: { type: Number, default: 0 },
   // 撤回入口可用门：设备壳会话（spec §6）整体禁用，由 ChatMessageList 计算下传。
   recallEnabled: { type: Boolean, default: true },
+  // 在挂交互卡的 option_id 集合（Task 14 防双份），透传给 ChatMarkdown。
+  hiddenOptionIds: { type: Array, default: () => [] },
 });
 
 const emit = defineEmits(['recall']);
 
 const { t } = useI18n();
+
+// 系统条 testid 按 note 种类分流（Task 14 新增 option_cancelled；未知种类
+// 退审批取消条形态，与既有 run_notice/approval_cancelled 同族）。
+function systemNoteTestId(note) {
+  if (note === 'run_notice') return 'chat-run-notice';
+  if (note === 'option_cancelled') return 'chat-option-cancelled-note';
+  return 'chat-approval-cancelled-note';
+}
 
 // 复制 user 气泡原文（assistant 正文已有 ChatMarkdown 的复制入口）。剪贴板
 // 不可用（非安全上下文等）静默失败，与 chat_md 的复制行为同口径。

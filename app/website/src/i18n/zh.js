@@ -305,6 +305,18 @@ export default {
   chat_recallStopTimeout: '停止超时，请重试',
   chat_recallUnconfirmed: '撤回未确认，可重试',
   chat_copyMessage: '复制',
+  // 方案选择交互卡（Task 14）：ai.option 两步作答交互卡 + 静态围栏卡，与
+  // en.js 成对维护（i18n.test.js 守键集）。
+  chat_optionTitle: '方案选择',
+  chat_optionSubmit: '确认选择',
+  chat_optionSelected: '已选择',
+  chat_optionCustom: '自定义回复…',
+  chat_optionMulti: '可多选',
+  chat_optionPreview: '预览',
+  chat_optionStaticHint: '在下方选择',
+  chat_optionCancelled: '方案选择已失效',
+  chat_optionCancelledReason: '方案选择已失效（{reason}）',
+  chat_optionSendFailed: '选择发送失败，请重试。',
 
   // -- App --
   app_restoringSession: '正在恢复会话...',
