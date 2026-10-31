@@ -63,7 +63,9 @@ const WS_STUB = `
 const NOW_ISO = new Date().toISOString();
 const SESSIONS = [
   { id: 'conv-agentcore-1', provider: 'agentcore', title: '手机发起的会话', status: 'running', origin: 'phone', source_session_id: 'managed-xyz', project_path: '/home/alice/proj-phone', updated_at: NOW_ISO },
-  { id: 'claude_native9', provider: 'claude', title: '终端 Claude 会话', status: 'idle', origin: '', project_path: '/home/alice/proj-term', updated_at: NOW_ISO },
+  // provider=agentcore（2026-10-30 只见 AliangCode 后 claude 原生条目不再进侧栏）；
+  // id 保留 claude_ 前缀 → 徽标/resume/steer 阻断/不订阅仍走前缀判定，语义不变
+  { id: 'claude_native9', provider: 'agentcore', title: '终端 Claude 会话', status: 'idle', origin: '', project_path: '/home/alice/proj-term', updated_at: NOW_ISO },
 ];
 const DETAIL_TRANSCRIPT = [
   { id: 'm1', role: 'user', content: '详情用户消息', timestamp: NOW_ISO, index: 1 },
@@ -321,7 +323,9 @@ test('running agentcore 裸 id 无 managed id：steer 回退 entry.id，不误�
 
 test('running claude_ 壳无 managed id：内联提示常驻、提交零帧、输入保留', async ({ page }) => {
   const sessions = [
-    { id: 'claude_nobind', provider: 'claude', title: '无绑定终端运行', status: 'running', origin: '', project_path: '/p/nb', updated_at: NOW_ISO },
+    // provider=agentcore 过清单过滤；claude_ 前缀仍被 steerTargetId 排除在裸 id
+    // 回退之外（前缀判定），「running 无 managed id → 阻断」覆盖意图不变
+    { id: 'claude_nobind', provider: 'agentcore', title: '无绑定终端运行', status: 'running', origin: '', project_path: '/p/nb', updated_at: NOW_ISO },
   ];
   await openChat(page, { sessions });
   await page.getByText('无绑定终端运行').click();
