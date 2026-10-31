@@ -165,7 +165,7 @@ func TestApprovalDecisionJournaledAsAuditRow(t *testing.T) {
 	dir := t.TempDir()
 	m := newAgentAIManager()
 	m.coreJournal = newAgentCoreJournal(dir)
-	m.coreJournal.ensureSessionHeader("s-audit", "/p", "m", time.Now().UTC().Format(time.RFC3339), "phone")
+	m.coreJournal.ensureSessionHeader("s-audit", "/p", "m", "", time.Now().UTC().Format(time.RFC3339), "phone")
 	m.mu.Lock()
 	m.rememberCompletedApprovalLocked("ap-1", "s-audit", 3, agentAIApprovalResponse{Decision: models.AgentAIApprovalDecisionDecline})
 	m.mu.Unlock()

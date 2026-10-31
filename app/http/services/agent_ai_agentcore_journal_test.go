@@ -38,8 +38,8 @@ func readJournalLines(t *testing.T, dir, sessionID string) []map[string]interfac
 func TestAgentCoreJournalHeaderWrittenOnce(t *testing.T) {
 	dir := t.TempDir()
 	j := newAgentCoreJournal(dir)
-	j.ensureSessionHeader("conv-1", "/tmp/proj", "glm-5.2", "2026-10-26T00:00:00Z", "phone")
-	j.ensureSessionHeader("conv-1", "/tmp/proj", "glm-5.2", "2026-10-26T01:00:00Z", "phone")
+	j.ensureSessionHeader("conv-1", "/tmp/proj", "glm-5.2", "", "2026-10-26T00:00:00Z", "phone")
+	j.ensureSessionHeader("conv-1", "/tmp/proj", "glm-5.2", "", "2026-10-26T01:00:00Z", "phone")
 	lines := readJournalLines(t, dir, "conv-1")
 	if len(lines) != 1 || lines[0]["kind"] != "session" {
 		t.Fatalf("lines = %v, want 恰好 1 条 session 头行", lines)
@@ -57,7 +57,7 @@ func TestAgentCoreJournalHeaderWrittenOnce(t *testing.T) {
 func TestAgentCoreJournalAppendOrderAndDedup(t *testing.T) {
 	dir := t.TempDir()
 	j := newAgentCoreJournal(dir)
-	j.ensureSessionHeader("conv-1", "/p", "m", "2026-10-26T00:00:00Z", "phone")
+	j.ensureSessionHeader("conv-1", "/p", "m", "", "2026-10-26T00:00:00Z", "phone")
 	j.appendUser("conv-1", "msg-1", "你好", "2026-10-26T00:00:01Z")
 	j.appendUser("conv-1", "msg-1", "你好", "2026-10-26T00:00:01Z") // 去重
 	j.appendAssistant("conv-1", "msg-1-assistant", "你好，世界", "2026-10-26T00:00:02Z")
@@ -127,7 +127,7 @@ func TestAgentCoreJournalRepairsTornTail(t *testing.T) {
 func TestAgentCoreJournalNoExtraNewlinesOnHealthyTail(t *testing.T) {
 	dir := t.TempDir()
 	j := newAgentCoreJournal(dir)
-	j.ensureSessionHeader("conv-ok", "/p", "m", "2026-10-26T00:00:00Z", "phone")
+	j.ensureSessionHeader("conv-ok", "/p", "m", "", "2026-10-26T00:00:00Z", "phone")
 	j.appendUser("conv-ok", "msg-1", "你好", "2026-10-26T00:00:01Z")
 	j.appendEnd("conv-ok", "success", "")
 	lines := readJournalLines(t, dir, "conv-ok") // 空行会被跳过但 JSON 必须全部可解析
@@ -152,7 +152,7 @@ func TestAgentCoreJournalFileNameSanitized(t *testing.T) {
 
 func TestAgentCoreJournalNilSafeAndNoDir(t *testing.T) {
 	var j *agentCoreJournal
-	j.ensureSessionHeader("x", "/p", "m", "now", "phone") // 不 panic
+	j.ensureSessionHeader("x", "/p", "m", "", "now", "phone") // 不 panic
 	j.appendUser("x", "m1", "t", "now")
 	j.appendEnd("x", "success", "")
 	empty := newAgentCoreJournal("") // dir 为空 = 禁用
@@ -199,7 +199,7 @@ func TestAgentCoreManagerJournalSteerUserMessage(t *testing.T) {
 func TestAgentCoreJournalAppendTool(t *testing.T) {
 	dir := t.TempDir()
 	j := newAgentCoreJournal(dir)
-	j.ensureSessionHeader("conv-tool", "/tmp/p", "glm-5.2", "2026-10-26T01:00:00Z", "phone")
+	j.ensureSessionHeader("conv-tool", "/tmp/p", "glm-5.2", "", "2026-10-26T01:00:00Z", "phone")
 	j.appendTool("conv-tool", "mcp__s__lookup", "q=hi", false)
 	j.appendTool("conv-tool", "mcp__s__lookup", "q=hi", false) // 完全相同实参:行为级证明 tool 行不去重
 	rows := readJournalLines(t, dir, "conv-tool")
@@ -222,7 +222,7 @@ func TestAgentCoreJournalPruneKeepsNewest(t *testing.T) {
 	dir := t.TempDir()
 	j := newAgentCoreJournal(dir)
 	for i := 0; i < agentCoreJournalMaxFiles+5; i++ {
-		j.ensureSessionHeader(fmt.Sprintf("conv-%03d", i), "/p", "m", "2026-10-26T00:00:00Z", "phone")
+		j.ensureSessionHeader(fmt.Sprintf("conv-%03d", i), "/p", "m", "", "2026-10-26T00:00:00Z", "phone")
 		time.Sleep(2 * time.Millisecond) // mtime 可区分
 	}
 	entries, err := os.ReadDir(dir)
@@ -249,7 +249,7 @@ func TestEnsureSessionHeaderBackfillsHeadlessFile(t *testing.T) {
 	path := filepath.Join(dir, agentCoreJournalFileName("s-headless"))
 	os.WriteFile(path, []byte(`{"kind":"msg","role":"user","message_id":"m1","text":"hi","ts":"2026-10-28T00:00:00Z"}`+"\n"), 0o600)
 
-	j.ensureSessionHeader("s-headless", "/proj", "glm-5.3", "2026-10-28T01:00:00Z", "dashboard")
+	j.ensureSessionHeader("s-headless", "/proj", "glm-5.3", "", "2026-10-28T01:00:00Z", "dashboard")
 
 	data, _ := os.ReadFile(path)
 	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
@@ -267,7 +267,7 @@ func TestEnsureSessionHeaderBackfillsHeadlessFile(t *testing.T) {
 		t.Fatalf("原内容应保留,实际 %d 行", len(lines))
 	}
 	// 幂等：再调一次不重复
-	j.ensureSessionHeader("s-headless", "/proj", "glm-5.3", "2026-10-28T01:00:00Z", "dashboard")
+	j.ensureSessionHeader("s-headless", "/proj", "glm-5.3", "", "2026-10-28T01:00:00Z", "dashboard")
 	data2, _ := os.ReadFile(path)
 	if len(strings.Split(strings.TrimSpace(string(data2)), "\n")) != 2 {
 		t.Fatal("幂等补写被破坏")
@@ -277,7 +277,7 @@ func TestEnsureSessionHeaderBackfillsHeadlessFile(t *testing.T) {
 func TestEnsureSessionHeaderOriginPhone(t *testing.T) {
 	dir := t.TempDir()
 	j := newAgentCoreJournal(dir)
-	j.ensureSessionHeader("s-origin", "/proj", "m", "2026-10-28T00:00:00Z", "phone")
+	j.ensureSessionHeader("s-origin", "/proj", "m", "", "2026-10-28T00:00:00Z", "phone")
 	data, _ := os.ReadFile(filepath.Join(dir, agentCoreJournalFileName("s-origin")))
 	var head map[string]interface{}
 	_ = json.Unmarshal(bytes.Split(data, []byte("\n"))[0], &head)

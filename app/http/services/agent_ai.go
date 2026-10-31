@@ -118,6 +118,7 @@ func (m *agentAIManager) activeVibeSessionsSnapshot() []models.AgentVibeSession 
 			Status:                "running",
 			MessageCount:          len(session.history),
 			Model:                 session.model,
+			Effort:                session.effort,
 			CreatedAt:             createdAt,
 			UpdatedAt:             now,
 		})
@@ -287,6 +288,60 @@ func clampAgentAIContextWindow(v int) int {
 	return v
 }
 
+// agentAIMaxTokensMin/Max bound the per-conversation output cap.
+//
+// 下限取 1024：再低连一个中等大小的工具调用参数都写不完，只会制造
+// stop_reason=max_tokens 的截断（内核见到被截断的 tool_use 会整批丢弃）。
+// 上限取 128k：超过它没有已知模型能兑现，且会把「小模型」的 400 降档重试
+// 从 1 轮拖成多轮。0 表示「未设置」——内核用 defaultMaxTokens（64000）。
+const (
+	agentAIMaxTokensMin = 1_024
+	agentAIMaxTokensMax = 128_000
+)
+
+// parseAgentAIDisabledMCPServers 解析会话级 MCP 开关。
+//
+// 第二个返回值区分「键缺失」（不动既有设置）与「显式空数组」（全部启用）——
+// 这两者在协议上是不同意图，合并成一个 nil 会让用户无法重新打开全部 server。
+func parseAgentAIDisabledMCPServers(msg map[string]interface{}) ([]string, bool) {
+	if msg == nil {
+		return nil, false
+	}
+	if _, ok := msg["disabled_mcp_servers"]; !ok {
+		return nil, false
+	}
+	raw := remoteStringSlice(msg, "disabled_mcp_servers")
+	out := make([]string, 0, len(raw))
+	seen := make(map[string]struct{}, len(raw))
+	for _, name := range raw {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if _, dup := seen[name]; dup {
+			continue
+		}
+		seen[name] = struct{}{}
+		out = append(out, name)
+	}
+	return out, true
+}
+
+// clampAgentAIMaxTokens 归一化客户端下发的输出上限。0/负数表示未设置并
+// 原样保留（区分「旧客户端没发」与「显式选择」）。
+func clampAgentAIMaxTokens(v int) int {
+	if v <= 0 {
+		return 0
+	}
+	if v < agentAIMaxTokensMin {
+		return agentAIMaxTokensMin
+	}
+	if v > agentAIMaxTokensMax {
+		return agentAIMaxTokensMax
+	}
+	return v
+}
+
 type agentAISession struct {
 	id          string
 	mode        string
@@ -303,7 +358,16 @@ type agentAISession struct {
 	// auto-compaction trigger matches the real window instead of whatever the
 	// model name implies; for agentcore it drives the kernel's own compaction
 	// threshold. 0 = unset (older server) → CLI/kernel defaults.
-	contextWindow           int
+	contextWindow int
+	// maxTokens is the per-conversation output cap (tokens) chosen on the phone
+	// or dashboard. 0 = unset → the agentcore kernel uses its default (64000,
+	// with 400-driven halving down to 8192). Only the agentcore channel consumes
+	// it; claude/codex ignore it.
+	maxTokens int
+	// disabledMCPServers 是本会话显式关掉的 MCP server 名（配置原始键）。
+	// nil = 未下发（沿用全部启用）；空切片 = 显式「全部启用」。
+	// 只在 agentcore 通道生效（claude/codex 走各自 CLI 的 MCP 配置）。
+	disabledMCPServers      []string
 	resumeSessionID         string
 	reservedNativeSessionID string
 	bindingVersion          int
@@ -429,6 +493,11 @@ type agentAIRun struct {
 	// contextWindow mirrors the session field for this run (claude:
 	// --autocompact tokens; agentcore: kernel compaction budget).
 	contextWindow int
+	// maxTokens mirrors the session field (agentcore: per-request max_tokens).
+	maxTokens int
+	// disabledMCPServers mirrors the session field: MCP server names this run
+	// must NOT inject. nil = all enabled.
+	disabledMCPServers []string
 	// claudeDiag 聚合 CLI 通道的逐回合诊断快照（诊断面板数据源）。runCLIPass
 	// 在起 ticker 前挂载；run 按值传递，但指针字段在所有副本里仍指向同一
 	// 聚合器。nil 安全（agentcore / codex 路径不挂）。
@@ -1703,6 +1772,9 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 	model := strings.TrimSpace(remoteString(msg, "model"))
 	effort := strings.TrimSpace(remoteString(msg, "effort"))
 	contextWindow := clampAgentAIContextWindow(remoteInt(msg, "context_window", 0))
+	maxTokens := clampAgentAIMaxTokens(remoteInt(msg, "max_tokens", 0))
+	// 会话级 MCP 开关：键存在即整体替换（含空数组=全部启用）；键缺失=不动。
+	disabledMCPServers, disabledMCPServersSet := parseAgentAIDisabledMCPServers(msg)
 	resumeSessionID := firstNonEmpty(remoteString(msg, "resume_session_id"), remoteString(msg, "source_session_id"))
 	reservedNativeSessionID := strings.TrimSpace(remoteString(msg, "reserved_native_session_id"))
 	bindingVersion := remoteInt(msg, "binding_version", 0)
@@ -1725,10 +1797,25 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 		existing.mode = mode
 		existing.projectPath = projectPath
 		existing.provider = provider
-		existing.model = model
-		existing.effort = effort
+		// model/effort 只在「本次下发非空」时才覆盖既有会话。聊天页每条消息前
+		// 都会重发一次 create，而续聊设备会话时前端可能拿不到原值（清单未回填
+		// 时为 undefined）→ 若无条件赋值，空串会把服务端记住的模型抹掉，紧接着
+		// 内核因「未指定模型」拒绝开跑（agent_ai_agentcore.go 无兜底链）。空值
+		// 一律视为「沿用既有设置」，显式清空由 UI 侧禁止。
+		if model != "" {
+			existing.model = model
+		}
+		if effort != "" {
+			existing.effort = effort
+		}
 		if contextWindow > 0 {
 			existing.contextWindow = contextWindow
+		}
+		if maxTokens > 0 {
+			existing.maxTokens = maxTokens
+		}
+		if disabledMCPServersSet {
+			existing.disabledMCPServers = disabledMCPServers
 		}
 		existing.resumeSessionID = resumeSessionID
 		existing.reservedNativeSessionID = reservedNativeSessionID
@@ -1765,6 +1852,8 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 		model:                   model,
 		effort:                  effort,
 		contextWindow:           contextWindow,
+		maxTokens:               maxTokens,
+		disabledMCPServers:      disabledMCPServers,
 		resumeSessionID:         resumeSessionID,
 		reservedNativeSessionID: reservedNativeSessionID,
 		bindingVersion:          bindingVersion,
@@ -2237,11 +2326,11 @@ func (m *agentAIManager) handleLocalSlashCommand(session *agentAISession, messag
 	// handleAgentCoreCompactCommand 内，不会走到这里（无重复落账）。
 	if provider == "agentcore" {
 		m.mu.Lock()
-		projectPath, model := session.projectPath, session.model
+		projectPath, model, effort := session.projectPath, session.model, session.effort
 		originSocket, surface := session.originSocket, session.surface
 		m.mu.Unlock()
 		now := time.Now().UTC().Format(time.RFC3339)
-		m.coreJournal.ensureSessionHeader(session.id, projectPath, model, now, agentCoreJournalOriginFor(originSocket, surface))
+		m.coreJournal.ensureSessionHeader(session.id, projectPath, model, effort, now, agentCoreJournalOriginFor(originSocket, surface))
 		m.coreJournal.appendUser(session.id, messageID, content, now)
 	}
 
@@ -2955,6 +3044,8 @@ func (m *agentAIManager) runUserMessage(session *agentAISession, runID, messageI
 		model:                   session.model,
 		effort:                  session.effort,
 		contextWindow:           session.contextWindow,
+		maxTokens:               session.maxTokens,
+		disabledMCPServers:      session.disabledMCPServers,
 		resumeSessionID:         resumeSessionID,
 		reservedNativeSessionID: reservedNativeSessionID,
 		bindingVersion:          session.bindingVersion,

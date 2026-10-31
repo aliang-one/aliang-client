@@ -405,7 +405,7 @@ func TestDispatchLocalAISubscribeCarriesTranscriptAndPending(t *testing.T) {
 	// 准备一个有 journal 历史与会话的会话。
 	dir := t.TempDir()
 	m.coreJournal = newAgentCoreJournal(dir)
-	m.coreJournal.ensureSessionHeader("s-snap", "/proj", "glm-5.3", time.Now().UTC().Format(time.RFC3339), "phone")
+	m.coreJournal.ensureSessionHeader("s-snap", "/proj", "glm-5.3", "", time.Now().UTC().Format(time.RFC3339), "phone")
 	m.coreJournal.appendUser("s-snap", "m1", "第一问", time.Now().UTC().Format(time.RFC3339))
 	m.coreJournal.appendAssistant("s-snap", "a1", "第一答", time.Now().UTC().Format(time.RFC3339))
 	m.mu.Lock()
@@ -451,7 +451,7 @@ func TestDispatchLocalAISnapshotTranscriptBounded(t *testing.T) {
 	dir := t.TempDir()
 	m.coreJournal = newAgentCoreJournal(dir)
 	ts := time.Now().UTC().Format(time.RFC3339)
-	m.coreJournal.ensureSessionHeader("s-bound", "/proj", "glm-5.3", ts, "phone")
+	m.coreJournal.ensureSessionHeader("s-bound", "/proj", "glm-5.3", "", ts, "phone")
 	for i := 0; i < 210; i++ {
 		m.coreJournal.appendUser("s-bound", fmt.Sprintf("m-%d", i), fmt.Sprintf("问%d", i), ts)
 	}

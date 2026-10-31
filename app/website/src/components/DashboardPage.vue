@@ -1704,7 +1704,9 @@ function openQuickSetup() {
 }
 
 function handleGuideOpenSettings() {
-  showSettings();
+  // 运行模式随设置 IA 重整移到「设备与网络」分区（2026-10-31），引导必须
+  // 跟着跳过去，否则滚动锚点在另一个标签页里永远找不到。
+  showAgent();
   void nextTick(() => {
     document.querySelector('[data-guide="run-mode"]')?.scrollIntoView({ block: 'center', behavior: 'smooth' });
   });

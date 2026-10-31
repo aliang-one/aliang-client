@@ -206,12 +206,98 @@
           >
             <option v-for="opt in EFFORT_OPTIONS" :key="opt.value" :value="opt.value">{{ opt.value || t('chat_modelDefault') }}</option>
           </select>
+          <!-- 输出预算（默认折叠）：max_tokens / context_window 都只在用户显式
+               填写时下发；留空 = 不下发 = 内核默认（输出 64000、窗口 200k）。 -->
+          <button
+            type="button"
+            data-testid="chat-settings-more"
+            class="ml-1 flex min-h-[40px] shrink-0 items-center gap-0.5 rounded border border-slate-200 px-2 text-slate-500 transition hover:bg-slate-100 dark:border-slate-700 dark:text-slate-400 dark:hover:bg-slate-800 md:min-h-0"
+            :aria-expanded="moreSettingsOpen ? 'true' : 'false'"
+            :title="t('chat_settingsMore')"
+            @click="toggleMoreSettings"
+          >
+            <span class="material-symbols-outlined text-sm">tune</span>
+            <span class="hidden md:inline">{{ t('chat_settingsMore') }}</span>
+          </button>
           <div
             v-if="createError"
             data-testid="chat-settings-error"
             class="ml-2 shrink-0 truncate text-rose-500"
             :title="createError"
           >{{ createError }}</div>
+        </div>
+
+        <div
+          v-if="moreSettingsOpen"
+          data-testid="chat-settings-more-panel"
+          class="flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-slate-100 px-4 py-2 text-xs dark:border-slate-800"
+        >
+          <label class="flex items-center gap-1.5 text-slate-500 dark:text-slate-400">
+            <span>{{ t('chat_settingsMaxTokens') }}</span>
+            <input
+              v-model="maxTokensDraft"
+              type="number"
+              min="1024"
+              max="128000"
+              step="1024"
+              data-testid="chat-settings-max-tokens"
+              class="h-8 w-24 rounded border border-slate-200 bg-white px-2 font-mono text-xs text-slate-700 outline-none focus:border-primary disabled:opacity-60 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200"
+              :placeholder="t('chat_settingsMaxTokensPlaceholder')"
+              :disabled="activeRunning"
+              @change="commitMaxTokens"
+            />
+          </label>
+          <label class="flex items-center gap-1.5 text-slate-500 dark:text-slate-400">
+            <span>{{ t('chat_settingsContextWindow') }}</span>
+            <input
+              v-model="contextWindowDraft"
+              type="number"
+              min="100000"
+              max="1000000"
+              step="10000"
+              data-testid="chat-settings-context-window"
+              class="h-8 w-28 rounded border border-slate-200 bg-white px-2 font-mono text-xs text-slate-700 outline-none focus:border-primary disabled:opacity-60 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200"
+              :placeholder="t('chat_settingsContextWindowPlaceholder')"
+              :disabled="activeRunning"
+              @change="commitContextWindow"
+            />
+          </label>
+          <span class="text-[11px] text-slate-400 dark:text-slate-500">{{ t('chat_settingsBudgetHint') }}</span>
+        </div>
+
+        <!-- 会话级 MCP 开关：只影响本会话（服务端按整列表替换 disabled_mcp_servers）。
+             技能不做开关——内核当前没有 skill 能力，做了也是死控件。 -->
+        <div
+          v-if="moreSettingsOpen"
+          data-testid="chat-settings-mcp-panel"
+          class="border-t border-slate-100 px-4 py-2 text-xs dark:border-slate-800"
+        >
+          <div class="flex items-center gap-1.5 text-slate-500 dark:text-slate-400">
+            <span class="material-symbols-outlined text-sm">hub</span>
+            <span class="font-semibold">{{ t('chat_settingsMcpTitle') }}</span>
+            <span class="text-[11px] text-slate-400">{{ t('chat_settingsMcpHint') }}</span>
+          </div>
+          <p v-if="mcpLoadError" class="mt-1 text-[11px] text-rose-500">{{ mcpLoadError }}</p>
+          <p v-else-if="mcpLoaded && !mcpServers.length" class="mt-1 text-[11px] text-slate-400">
+            {{ t('chat_settingsMcpEmpty') }}
+          </p>
+          <div v-else-if="mcpServers.length" class="mt-1.5 flex flex-wrap gap-x-4 gap-y-1.5">
+            <label
+              v-for="server in mcpServers"
+              :key="server.name"
+              class="flex min-h-[32px] items-center gap-1.5 text-slate-600 dark:text-slate-300"
+            >
+              <input
+                type="checkbox"
+                class="h-3.5 w-3.5 rounded border-slate-300 text-primary focus:ring-primary/20 dark:border-slate-600 dark:bg-slate-900"
+                :checked="!disabledMcpSet.has(server.name)"
+                :disabled="activeRunning"
+                :data-testid="'chat-mcp-' + server.name"
+                @change="toggleMcpServer(server.name)"
+              />
+              <span class="truncate">{{ server.name }}</span>
+            </label>
+          </div>
         </div>
 
         <!-- 遮罩与浮层是滚动行的兄弟节点（外层容器的直接子级）：不再被裁剪；
@@ -469,7 +555,7 @@ import { useNavigation } from '../composables/useNavigation';
 import { slashProviderFor } from '../utils/chatProvider';
 import { normalizeConversationTitle } from '../utils/chatTitle';
 import { useAuthStore } from '../stores/auth';
-import { getAgentSessionDetail } from '../services/agentApi';
+import { getAgentIntegrations, getAgentSessionDetail } from '../services/agentApi';
 import { useDeviceSessions, DEVICE_SESSION_DETAIL_TTL_MS, isTerminalPrefixedSessionId } from '../composables/useDeviceSessions';
 import {
   AGENTCORE_MODEL_OPTIONS,
@@ -477,7 +563,11 @@ import {
   MODEL_CUSTOM_VALUE,
   isDirectoryLocked,
   normalizeDeviceProvider,
+  readLastUsedEffort,
+  readLastUsedModel,
   recentProjectsFromSessions,
+  rememberLastUsedEffort,
+  rememberLastUsedModel,
   sessionCreatePayload,
   sessionSourceBadge,
 } from '../utils/chatSettings';
@@ -514,6 +604,15 @@ const recentProjects = ref([]);
 const recentProjectsLoaded = ref(false);
 const modelCustomActive = ref(false);
 const modelCustomDraft = ref('');
+// 输出预算面板（默认折叠）：max_tokens / context_window 的编辑草稿。
+const moreSettingsOpen = ref(false);
+const maxTokensDraft = ref('');
+const contextWindowDraft = ref('');
+// 会话级 MCP 开关：设备侧清单（name 即配置原始键）+ 本会话关掉的集合。
+// 清单只在首次展开面板时拉一次；拉不到就整块不渲染（不制造假开关）。
+const mcpServers = ref([]);
+const mcpLoaded = ref(false);
+const mcpLoadError = ref('');
 const createError = ref('');
 
 // 无活动看门狗：ai.message 发出即武装，连续 CHAT_IDLE_TIMEOUT_MS 无任何帧
@@ -715,7 +814,7 @@ const directoryLabel = computed(() => activeConversation.value?.projectPath || t
 
 const modelOptions = computed(() => AGENTCORE_MODEL_OPTIONS.map(o => ({
   ...o,
-  label: o.value === '' ? t('chat_modelDefault')
+  label: o.value === '' ? t('chat_modelUnset')
     : o.value === MODEL_CUSTOM_VALUE ? t('chat_customModel')
     : o.label,
 })));
@@ -799,6 +898,38 @@ function onModelSelect(value) {
   applySessionSettings(conv, { model: value });
 }
 
+// 输出预算：空输入 = 清除（不下发），非数字/<=0 同样视为清除。
+function commitMaxTokens() {
+  const conv = activeConversation.value;
+  if (!conv || activeRunning.value) return;
+  const raw = String(maxTokensDraft.value || '').trim();
+  const n = Number(raw);
+  if (!raw || !Number.isFinite(n) || n <= 0) {
+    maxTokensDraft.value = '';
+    applySessionSettings(conv, { maxTokens: 0 });
+    return;
+  }
+  // 与后端 clampAgentAIMaxTokens 同区间，避免下发后被静默改值造成困惑。
+  const clamped = Math.min(128000, Math.max(1024, Math.trunc(n)));
+  maxTokensDraft.value = String(clamped);
+  applySessionSettings(conv, { maxTokens: clamped });
+}
+
+function commitContextWindow() {
+  const conv = activeConversation.value;
+  if (!conv || activeRunning.value) return;
+  const raw = String(contextWindowDraft.value || '').trim();
+  const n = Number(raw);
+  if (!raw || !Number.isFinite(n) || n <= 0) {
+    contextWindowDraft.value = '';
+    applySessionSettings(conv, { contextWindow: 0 });
+    return;
+  }
+  const clamped = Math.min(1000000, Math.max(100000, Math.trunc(n)));
+  contextWindowDraft.value = String(clamped);
+  applySessionSettings(conv, { contextWindow: clamped });
+}
+
 function commitCustomModel() {
   const conv = activeConversation.value;
   if (!conv) return;
@@ -839,8 +970,59 @@ watch(activeId, (nv, ov) => {
   }
   directoryPanelOpen.value = false;
   modelCustomActive.value = false;
+  moreSettingsOpen.value = false;
   createError.value = '';
+  syncBudgetDrafts();
 });
+
+// 本会话已关闭的 MCP server 名集合（渲染复选框勾选态用）。
+const disabledMcpSet = computed(() => {
+  const list = activeConversation.value?.disabledMcpServers;
+  return new Set(Array.isArray(list) ? list : []);
+});
+
+// 展开面板时按需拉一次 MCP 清单（失败静默降级：整块不渲染）。
+async function ensureMcpServersLoaded() {
+  if (mcpLoaded.value) return;
+  mcpLoaded.value = true;
+  try {
+    const data = await getAgentIntegrations();
+    mcpServers.value = Array.isArray(data?.mcp_servers) ? data.mcp_servers : [];
+    mcpLoadError.value = '';
+  } catch (_) {
+    mcpServers.value = [];
+    mcpLoadError.value = t('chat_mcpLoadFailed');
+  }
+}
+
+function toggleMoreSettings() {
+  moreSettingsOpen.value = !moreSettingsOpen.value;
+  if (moreSettingsOpen.value) void ensureMcpServersLoaded();
+}
+
+// 勾选/取消某个 MCP server：把整份「已关闭清单」整体写回会话（服务端按
+// 整列表替换），保证「全部重新打开」是显式空数组而不是缺键。
+function toggleMcpServer(name) {
+  const conv = activeConversation.value;
+  if (!conv || activeRunning.value) return;
+  const key = String(name || '').trim();
+  if (!key) return;
+  const current = Array.isArray(conv.disabledMcpServers) ? conv.disabledMcpServers.slice() : [];
+  const idx = current.indexOf(key);
+  if (idx >= 0) current.splice(idx, 1);
+  else current.push(key);
+  applySessionSettings(conv, { disabledMcpServers: current });
+}
+
+// 输出预算草稿回填：留空表示「不下发（用内核默认）」，所以未设置时给空串
+// 而不是 0——0 在 number input 里会显示成 "0"，误导用户以为设了 0。
+function syncBudgetDrafts() {
+  const conv = activeConversation.value;
+  const mt = Number(conv && conv.maxTokens);
+  const cw = Number(conv && conv.contextWindow);
+  maxTokensDraft.value = Number.isFinite(mt) && mt > 0 ? String(mt) : '';
+  contextWindowDraft.value = Number.isFinite(cw) && cw > 0 ? String(cw) : '';
+}
 
 // create 确认门：sendMessage 发出 create 后等回执再发 ai.message——目录无效
 // 时服务端拒绝建会话，绝不能让消息经 ai.message 的 lazy-create 落到 home 跑。
@@ -996,6 +1178,14 @@ function createConversation() {
     // 本窗口是 AliangCode 对话窗口（2026-10-30 用户拍板）：新建会话默认
     // agentcore；聊天窗只展示自家 agent 的对话，不该默认落成 claudecode。
     provider: chatProviderPreset.value || 'agentcore',
+    // 默认模型留空（用户拍板 2026-10-31），但新建会话沿用「上一次用过的
+    // 模型/档位」——否则每次新建都要重选，且空模型会被内核直接拒跑。
+    model: readLastUsedModel(),
+    effort: readLastUsedEffort(),
+    // 输出预算默认不设（留空 = 内核默认 64000 / 200k），避免新建会话继承
+    // 上一次的激进值而用户没意识到。
+    maxTokens: 0,
+    contextWindow: 0,
     createdAt: now(),
     updatedAt: now()
   };
@@ -2005,6 +2195,14 @@ async function sendMessage() {
     return;
   }
 
+  // 模型必填守卫（2026-10-31）：内核已删除模型兜底链，空模型会被直接拒跑并
+  // 回「未指定模型」。与其让用户等一个必然失败的回合，不如在发送前就地拦住
+  // 并指路——错误挂在会话设置条上（选中模型后 applySessionSettings 自动清）。
+  if (!String(conv.model || '').trim()) {
+    createError.value = t('chat_modelRequired');
+    return;
+  }
+
   conv.messages.push({ role: 'user', content: text, ts: now() });
   if (!conv.title) {
     conv.title = text.slice(0, 20);
@@ -2040,6 +2238,9 @@ async function sendMessage() {
       saveToStorage();
       return;
     }
+    // create 已被服务端接受：记下本次模型/档位，供新建会话沿用（last-used）。
+    rememberLastUsedModel(conv.model);
+    rememberLastUsedEffort(conv.effort);
     armIdleWatchdog(conv);
     const ok = sendAI({
       type: 'ai.message',

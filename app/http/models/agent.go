@@ -183,13 +183,17 @@ type AgentVibeSession struct {
 	// transcript), so it is not a display count. Nil means "this path does not
 	// compute it" (e.g. the index-only channel) and the server falls back to
 	// MessageCount; a non-nil 0 is a KNOWN zero (command/artifact husk).
-	DisplayMessageCount *int                     `json:"display_message_count,omitempty"`
-	Branch              string                   `json:"branch,omitempty"`
-	Model               string                   `json:"model,omitempty"`
-	Transcript          []AgentVibeMessage       `json:"transcript,omitempty"`
-	TranscriptPage      *AgentVibeTranscriptPage `json:"transcript_page,omitempty"`
-	CreatedAt           string                   `json:"created_at,omitempty"`
-	UpdatedAt           string                   `json:"updated_at,omitempty"`
+	DisplayMessageCount *int   `json:"display_message_count,omitempty"`
+	Branch              string `json:"branch,omitempty"`
+	Model               string `json:"model,omitempty"`
+	// Effort 是该会话最近一次运行使用的推理强度档位（low/medium/high/xhigh/max）。
+	// 空串表示「未设置/未下发」。前端会话设置条据此回填真实档位，而不是永远
+	// 显示「默认」——设备会话续聊时若看不到真实档位，用户无法判断该不该重设。
+	Effort         string                   `json:"effort,omitempty"`
+	Transcript     []AgentVibeMessage       `json:"transcript,omitempty"`
+	TranscriptPage *AgentVibeTranscriptPage `json:"transcript_page,omitempty"`
+	CreatedAt      string                   `json:"created_at,omitempty"`
+	UpdatedAt      string                   `json:"updated_at,omitempty"`
 	// Diagnostics 是该会话最后一次 run 的终态诊断（journal end 行落盘，详情
 	// 接口透传）。nil 表示没有带诊断块的 end 行——旧数据或非 agentcore 通道，
 	// 手机端面板据此降级为「无诊断数据」而不是渲染空卡。

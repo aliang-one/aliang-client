@@ -41,7 +41,7 @@ func agentCoreMessageText(msg agentcore.Message) string {
 func TestReadAgentCoreJournalHistory(t *testing.T) {
 	dir := t.TempDir()
 	j := newAgentCoreJournal(dir)
-	j.ensureSessionHeader("s-hist", "/proj", "glm-5.3", "2026-10-28T00:00:00Z", "phone")
+	j.ensureSessionHeader("s-hist", "/proj", "glm-5.3", "", "2026-10-28T00:00:00Z", "phone")
 	j.appendUser("s-hist", "m1", "第一问", "2026-10-28T00:01:00Z")
 	j.appendAssistant("s-hist", "a1", "第一答", "2026-10-28T00:02:00Z")
 	j.appendTool("s-hist", "Bash", "ls", false) // 工具行：轨迹不是消息，解析器必须跳过
@@ -108,7 +108,7 @@ func TestReadAgentCoreJournalHistoryFromMissing(t *testing.T) {
 func TestReadAgentCoreJournalHistoryIgnoresApprovalRows(t *testing.T) {
 	dir := t.TempDir()
 	j := newAgentCoreJournal(dir)
-	j.ensureSessionHeader("s-ap", "/proj", "glm-5.3", "2026-10-28T00:00:00Z", "phone")
+	j.ensureSessionHeader("s-ap", "/proj", "glm-5.3", "", "2026-10-28T00:00:00Z", "phone")
 	j.appendUser("s-ap", "m1", "第一问", "2026-10-28T00:01:00Z")
 	j.appendApprovalAudit("s-ap", "ap-1", 1, "decline")
 	j.appendAssistant("s-ap", "a1", "第一答", "2026-10-28T00:02:00Z")
@@ -136,7 +136,7 @@ func TestMessageLazyCreateRestoresJournalHistory(t *testing.T) {
 	m := newAgentAIManager()
 	m.coreJournal = newAgentCoreJournal(journalDir)
 	now := time.Now().UTC().Format(time.RFC3339)
-	m.coreJournal.ensureSessionHeader("s-restore", "/proj", "glm-5.3", now, "phone")
+	m.coreJournal.ensureSessionHeader("s-restore", "/proj", "glm-5.3", "", now, "phone")
 	m.coreJournal.appendUser("s-restore", "m1", "第一问", now)
 	m.coreJournal.appendAssistant("s-restore", "a1", "第一答", now)
 

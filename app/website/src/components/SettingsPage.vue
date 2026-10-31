@@ -40,6 +40,14 @@
             </a>
             <a
               class="py-5 text-sm font-medium"
+              :class="currentPage === 'capability' ? 'border-b-2 border-primary text-primary' : 'text-slate-500 hover:text-slate-700 dark:text-slate-300 dark:hover:text-slate-100'"
+              href="javascript:void(0)"
+              @click="showPage('capability')"
+            >
+              {{ t('settings_tabCapability') }}
+            </a>
+            <a
+              class="py-5 text-sm font-medium"
               :class="currentPage === 'agent' ? 'border-b-2 border-primary text-primary' : 'text-slate-500 hover:text-slate-700 dark:text-slate-300 dark:hover:text-slate-100'"
               href="javascript:void(0)"
               @click="showPage('agent')"
@@ -110,6 +118,14 @@
           <button
             type="button"
             class="min-h-10 rounded-lg border px-3 py-2 text-sm font-semibold transition"
+            :class="currentPage === 'capability' ? 'border-primary bg-primary text-white' : 'border-slate-200 bg-white text-slate-700 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-100'"
+            @click="showPage('capability')"
+          >
+            {{ t('settings_tabCapability') }}
+          </button>
+          <button
+            type="button"
+            class="min-h-10 rounded-lg border px-3 py-2 text-sm font-semibold transition"
             :class="currentPage === 'agent' ? 'border-primary bg-primary text-white' : 'border-slate-200 bg-white text-slate-700 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-100'"
             @click="showPage('agent')"
           >
@@ -125,37 +141,23 @@
           {{ authNotice }}
         </div>
 
-        <div v-if="currentPage === 'settings'" class="grid grid-cols-1 gap-8 lg:grid-cols-12">
-          <section class="flex flex-col gap-4 lg:col-span-8">
-            <div
-              v-if="!isAuthenticated"
-              class="rounded-2xl border border-dashed border-slate-300 bg-white px-6 py-8 text-center shadow-sm dark:border-slate-700 dark:bg-slate-900"
-            >
-              <div class="mx-auto max-w-2xl space-y-3">
-                <h2 class="text-xl font-bold text-slate-900 dark:text-white">{{ t('settings_loginRequiredSettings') }}</h2>
-                <p class="text-sm text-slate-500 dark:text-slate-300">
-                  {{ t('settings_loginRequiredSettingsDesc') }}
-                </p>
-              </div>
+        <!-- ① 模型与推理（设备级）：连到哪 / 用什么模型 / 转发层改写。
+             仅影响未单独设置的新会话；会话级覆盖在聊天页会话设置条。 -->
+        <section v-if="currentPage === 'settings'" class="flex flex-col gap-5">
+          <SectionHeader :title="t('settings_tabSettings')" :desc="t('settings_sectionModelDesc')" scope="device" />
+          <div
+            v-if="!isAuthenticated"
+            class="rounded-2xl border border-dashed border-slate-300 bg-white px-6 py-8 text-center shadow-sm dark:border-slate-700 dark:bg-slate-900"
+          >
+            <div class="mx-auto max-w-2xl space-y-3">
+              <h2 class="text-xl font-bold text-slate-900 dark:text-white">{{ t('settings_loginRequiredSettings') }}</h2>
+              <p class="text-sm text-slate-500 dark:text-slate-300">
+                {{ t('settings_loginRequiredSettingsDesc') }}
+              </p>
             </div>
-            <template v-else>
-              <RulesSettings
-                :config="customerConfig"
-                :preset-providers="presetProviders"
-                :loading="isLoadingCustomerConfig"
-                :saving="isSavingCustomerConfig"
-                :error="customerConfigError"
-                :success-message="customerConfigSuccess"
-                :version="customerConfigVersion"
-                @save="saveCustomerConfig"
-              />
-            </template>
-          </section>
-
-          <aside class="flex flex-col gap-6 lg:col-span-4">
-            <SystemSettings v-if="isAuthenticated" />
-            <ModelMappingSettings
-              v-if="isAuthenticated"
+          </div>
+          <template v-else>
+            <AgentCoreSettings
               :config="customerConfig"
               :loading="isLoadingCustomerConfig"
               :saving="isSavingCustomerConfig"
@@ -163,14 +165,47 @@
               :success-message="customerConfigSuccess"
               @save="saveCustomerConfig"
             />
-          </aside>
-        </div>
-
-        <section v-else-if="currentPage === 'user'" class="flex flex-col gap-4">
-          <UserInfoSettings />
+            <ModelMappingSettings
+              :config="customerConfig"
+              :loading="isLoadingCustomerConfig"
+              :saving="isSavingCustomerConfig"
+              :error="customerConfigError"
+              :success-message="customerConfigSuccess"
+              @save="saveCustomerConfig"
+            />
+          </template>
         </section>
 
+        <!-- ② 能力接入（设备级）：MCP / 技能 / 环境变量 -->
+        <section v-else-if="currentPage === 'capability'" class="flex flex-col gap-5">
+          <SectionHeader :title="t('settings_tabCapability')" :desc="t('settings_sectionCapabilityDesc')" scope="device" />
+          <div
+            v-if="!isAuthenticated"
+            class="rounded-2xl border border-dashed border-slate-300 bg-white px-6 py-8 text-center shadow-sm dark:border-slate-700 dark:bg-slate-900"
+          >
+            <div class="mx-auto max-w-2xl space-y-3">
+              <h2 class="text-xl font-bold text-slate-900 dark:text-white">{{ t('settings_loginRequiredCapability') }}</h2>
+              <p class="text-sm text-slate-500 dark:text-slate-300">
+                {{ t('settings_loginRequiredCapabilityDesc') }}
+              </p>
+            </div>
+          </div>
+          <template v-else>
+            <AgentIntegrationsSettings />
+            <CustomEnvSettings
+              :config="customerConfig"
+              :loading="isLoadingCustomerConfig"
+              :saving="isSavingCustomerConfig"
+              :error="customerConfigError"
+              :success-message="customerConfigSuccess"
+              @save="saveCustomerConfig"
+            />
+          </template>
+        </section>
+
+        <!-- ③ 设备与网络（设备级）：出网 / 分流 / 绑定 / 扫描范围 -->
         <section v-else-if="currentPage === 'agent'" class="flex flex-col gap-5">
+          <SectionHeader :title="t('settings_tabAgent')" :desc="t('settings_sectionDeviceDesc')" scope="device" />
           <div
             v-if="!isAuthenticated"
             class="rounded-2xl border border-dashed border-slate-300 bg-white px-6 py-8 text-center shadow-sm dark:border-slate-700 dark:bg-slate-900"
@@ -184,35 +219,31 @@
           </div>
           <template v-else>
             <AgentSettings />
-            <AgentRuntimeSessions />
-            <AgentActivitySettings />
-            <div class="grid grid-cols-1 items-stretch gap-5 lg:grid-cols-2">
-              <CustomEnvSettings
-                :config="customerConfig"
-                :loading="isLoadingCustomerConfig"
-                :saving="isSavingCustomerConfig"
-                :error="customerConfigError"
-                :success-message="customerConfigSuccess"
-                @save="saveCustomerConfig"
-              />
-              <AgentScanDirectoriesSettings />
-            </div>
-            <AgentCoreSettings
+            <SystemSettings />
+            <RulesSettings
               :config="customerConfig"
+              :preset-providers="presetProviders"
               :loading="isLoadingCustomerConfig"
               :saving="isSavingCustomerConfig"
               :error="customerConfigError"
               :success-message="customerConfigSuccess"
+              :version="customerConfigVersion"
               @save="saveCustomerConfig"
             />
-            <!-- MCP 与技能（只读）：设备侧清单 + 对 AliangCode 内核的生效态。
-                 放在 AliangCode 设置之后——「我配的东西有没有被 AliangCode 用上」
-                 是看完内核配置后的自然下一问。 -->
-            <AgentIntegrationsSettings />
+            <AgentScanDirectoriesSettings />
           </template>
         </section>
 
-        <section v-else class="flex flex-col gap-4">
+        <!-- ④ 账户与界面（账户级 + 本机） -->
+        <section v-else-if="currentPage === 'user'" class="flex flex-col gap-5">
+          <SectionHeader :title="t('settings_tabUserCenter')" :desc="t('settings_sectionAccountDesc')" scope="account" />
+          <UserInfoSettings />
+          <AppearanceSettings />
+        </section>
+
+        <!-- ⑤ 诊断（只读观测） -->
+        <section v-else class="flex flex-col gap-5">
+          <SectionHeader :title="t('settings_tabLogs')" :desc="t('settings_sectionDiagnosticsDesc')" scope="readonly" />
           <div
             v-if="!isAuthenticated"
             class="rounded-2xl border border-dashed border-slate-300 bg-white px-6 py-8 text-center shadow-sm dark:border-slate-700 dark:bg-slate-900"
@@ -224,7 +255,11 @@
               </p>
             </div>
           </div>
-          <LogsSettings v-if="isAuthenticated" />
+          <template v-else>
+            <AgentActivitySettings />
+            <AgentRuntimeSessions />
+            <LogsSettings />
+          </template>
         </section>
       </main>
 
@@ -268,6 +303,8 @@ import AgentIntegrationsSettings from './settings/AgentIntegrationsSettings.vue'
 import ModelMappingSettings from './settings/ModelMappingSettings.vue';
 import CustomEnvSettings from './settings/CustomEnvSettings.vue';
 import AgentCoreSettings from './settings/AgentCoreSettings.vue';
+import AppearanceSettings from './settings/AppearanceSettings.vue';
+import SectionHeader from './settings/SectionHeader.vue';
 import { normalizeAgentCoreLLMConfig, applyAgentCoreLLMClearing, normalizeAgentCoreTuning } from '../utils/agentCoreSettings';
 import { useNavigation } from '../composables/useNavigation';
 import { openTutorialDocs } from '../composables/useTutorialDocs';
@@ -460,7 +497,9 @@ export default {
     AgentIntegrationsSettings,
     ModelMappingSettings,
     CustomEnvSettings,
-    AgentCoreSettings
+    AgentCoreSettings,
+    AppearanceSettings,
+    SectionHeader
   },
   setup() {
     const { currentPage, showPage, showDashboard } = useNavigation();
@@ -492,31 +531,26 @@ export default {
   },
   computed: {
     isVisible() {
-      return ['settings', 'user', 'log', 'agent'].includes(this.currentPage);
+      return ['settings', 'capability', 'user', 'log', 'agent'].includes(this.currentPage);
     },
     pageTitle() {
+      // 标题直接复用分区名，避免页头与标签页两套措辞漂移。
       if (this.currentPage === 'user') {
-        return this.t('settings_pageUser');
+        return this.t('settings_tabUserCenter');
       }
       if (this.currentPage === 'log') {
-        return this.t('settings_pageLog');
+        return this.t('settings_tabLogs');
       }
       if (this.currentPage === 'agent') {
-        return this.t('settings_pageAgent');
+        return this.t('settings_tabAgent');
       }
-      return this.t('settings_pageConfiguration');
+      if (this.currentPage === 'capability') {
+        return this.t('settings_tabCapability');
+      }
+      return this.t('settings_tabSettings');
     },
     pageAccent() {
-      if (this.currentPage === 'user') {
-        return this.t('settings_pageCenter');
-      }
-      if (this.currentPage === 'log') {
-	      return this.t('settings_pageOverview');
-      }
-      if (this.currentPage === 'agent') {
-        return this.t('settings_pageActivity');
-      }
-      return this.t('settings_pageCenter');
+      return '';
     },
     userAvatarText() {
       const normalized = String(this.userDisplayName || '').trim();

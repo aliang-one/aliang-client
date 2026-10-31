@@ -76,7 +76,7 @@ func TestSessionApprovalHitJournalsAuditRow(t *testing.T) {
 	dir := t.TempDir()
 	m := newAgentAIManager()
 	m.coreJournal = newAgentCoreJournal(dir)
-	m.coreJournal.ensureSessionHeader("s-hit", "/p", "m", time.Now().UTC().Format(time.RFC3339), "phone")
+	m.coreJournal.ensureSessionHeader("s-hit", "/p", "m", "", time.Now().UTC().Format(time.RFC3339), "phone")
 
 	m.journalSessionApprovalHit("s-hit", 5, models.AgentAIApprovalKindCommand, "Bash", "ls -la")
 	data, err := os.ReadFile(filepath.Join(dir, agentCoreJournalFileName("s-hit")))

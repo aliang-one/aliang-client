@@ -17,7 +17,7 @@ import (
 func TestAgentCoreJournalEndDiagnosticsRoundtrip(t *testing.T) {
 	dir := t.TempDir()
 	j := newAgentCoreJournal(dir)
-	j.ensureSessionHeader("conv-diag", "/tmp/proj-diag", "glm-5.2", "2026-10-28T00:00:00Z", "unknown")
+	j.ensureSessionHeader("conv-diag", "/tmp/proj-diag", "glm-5.2", "", "2026-10-28T00:00:00Z", "unknown")
 	j.appendUser("conv-diag", "msg-1", "帮我把这个功能做完", "2026-10-28T00:00:01Z")
 
 	diag := &agentCoreDiagnostics{}
@@ -75,7 +75,7 @@ func TestAgentCoreJournalEndDiagnosticsRoundtrip(t *testing.T) {
 func TestAgentCoreJournalEndLegacyRow(t *testing.T) {
 	dir := t.TempDir()
 	j := newAgentCoreJournal(dir)
-	j.ensureSessionHeader("conv-legacy", "/tmp/proj-legacy", "glm-5.2", "2026-10-28T00:00:00Z", "unknown")
+	j.ensureSessionHeader("conv-legacy", "/tmp/proj-legacy", "glm-5.2", "", "2026-10-28T00:00:00Z", "unknown")
 	j.appendUser("conv-legacy", "msg-1", "你好", "2026-10-28T00:00:01Z")
 	j.appendEnd("conv-legacy", "error", "agentcore run failed")
 
@@ -134,7 +134,7 @@ func TestAgentCoreDiagnosticsPayload(t *testing.T) {
 func TestAgentCoreJournalEndSuccessNoDiagnosticsNoise(t *testing.T) {
 	dir := t.TempDir()
 	j := newAgentCoreJournal(dir)
-	j.ensureSessionHeader("conv-ok", "/tmp/proj-ok", "glm-5.2", "2026-10-28T00:00:00Z", "unknown")
+	j.ensureSessionHeader("conv-ok", "/tmp/proj-ok", "glm-5.2", "", "2026-10-28T00:00:00Z", "unknown")
 	j.appendUser("conv-ok", "msg-1", "你好", "2026-10-28T00:00:01Z")
 	j.appendEnd("conv-ok", "success", "")
 

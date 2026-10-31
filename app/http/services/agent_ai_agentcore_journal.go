@@ -74,7 +74,7 @@ func agentCoreJournalFileName(sessionID string) string {
 // 时创建；存在但无头行（steer 先于 run 的历史竞态，spec §4.3）时整体重写
 // 补头——读全量、写 头行+原内容、原子 rename。文件体量有界（消息+截断
 // 工具行），重写代价可接受。幂等：已有头行直接返回。顺带触发 prune（锁内）。
-func (j *agentCoreJournal) ensureSessionHeader(sessionID, projectPath, model, createdAt, origin string) {
+func (j *agentCoreJournal) ensureSessionHeader(sessionID, projectPath, model, effort, createdAt, origin string) {
 	if j == nil || j.dir == "" || strings.TrimSpace(sessionID) == "" {
 		return
 	}
@@ -85,7 +85,7 @@ func (j *agentCoreJournal) ensureSessionHeader(sessionID, projectPath, model, cr
 		if j.hasSessionHeaderLocked(path) {
 			return
 		}
-		j.prependHeaderLocked(path, sessionID, projectPath, model, createdAt, origin)
+		j.prependHeaderLocked(path, sessionID, projectPath, model, effort, createdAt, origin)
 		return
 	}
 	if err := os.MkdirAll(j.dir, 0o700); err != nil {
@@ -93,7 +93,7 @@ func (j *agentCoreJournal) ensureSessionHeader(sessionID, projectPath, model, cr
 		return
 	}
 	j.dirReady = true
-	line := j.sessionHeaderLine(sessionID, projectPath, model, createdAt, origin)
+	line := j.sessionHeaderLine(sessionID, projectPath, model, effort, createdAt, origin)
 	if line == nil {
 		logger.Warn(fmt.Sprintf("agentcore-journal: header marshal failed session=%s", sessionID))
 		return
@@ -108,12 +108,13 @@ func (j *agentCoreJournal) ensureSessionHeader(sessionID, projectPath, model, cr
 }
 
 // sessionHeaderLine 生成头行字节（含结尾 \n）；marshal 失败返回 nil。
-func (j *agentCoreJournal) sessionHeaderLine(sessionID, projectPath, model, createdAt, origin string) []byte {
+func (j *agentCoreJournal) sessionHeaderLine(sessionID, projectPath, model, effort, createdAt, origin string) []byte {
 	line, err := jsonMarshalLine(map[string]interface{}{
 		"kind":         "session",
 		"session_id":   sessionID,
 		"project_path": projectPath,
 		"model":        model,
+		"effort":       effort,
 		"created_at":   createdAt,
 		"origin":       origin,
 	})
@@ -145,8 +146,8 @@ func (j *agentCoreJournal) hasSessionHeaderLocked(path string) bool {
 // prependHeaderLocked 整体重写补头：tmp 文件写 头行+原内容，rename 原子替换。
 // 在 j.mu 锁内做全量读+写+rename——journal 文件有界（消息+截断工具行），
 // 重写代价可接受；与 appendLineLocked 同锁互斥，无并发写坏。调用方必须持有 j.mu。
-func (j *agentCoreJournal) prependHeaderLocked(path, sessionID, projectPath, model, createdAt, origin string) {
-	head := j.sessionHeaderLine(sessionID, projectPath, model, createdAt, origin)
+func (j *agentCoreJournal) prependHeaderLocked(path, sessionID, projectPath, model, effort, createdAt, origin string) {
+	head := j.sessionHeaderLine(sessionID, projectPath, model, effort, createdAt, origin)
 	if head == nil {
 		return
 	}

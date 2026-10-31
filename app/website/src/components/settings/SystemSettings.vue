@@ -42,51 +42,6 @@
           </div>
         </div>
 
-        <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-          <div>
-            <p class="text-sm font-semibold">{{ t('sys_language') }}</p>
-            <p class="text-[10px] text-slate-500">{{ t('sys_languageDesc') }}</p>
-          </div>
-          <div class="flex rounded bg-slate-100 p-1 dark:bg-slate-800">
-            <button
-              v-for="lang in languages"
-              :key="lang.value"
-              type="button"
-              :class="[
-                'rounded px-3 py-2 md:py-1 text-[10px] font-bold transition',
-                locale === lang.value
-                  ? 'bg-primary text-white shadow-sm'
-                  : 'text-slate-500 hover:bg-slate-200 dark:text-slate-300 dark:hover:bg-slate-700/70'
-              ]"
-              @click="setLocale(lang.value)"
-            >
-              {{ lang.label }}
-            </button>
-          </div>
-        </div>
-
-        <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
-          <div>
-            <p class="text-sm font-semibold">{{ t('sys_theme') }}</p>
-            <p class="text-[10px] text-slate-500">{{ t('sys_themeDesc') }}</p>
-            <p class="mt-1 text-[10px] text-slate-400 dark:text-slate-500">{{ themeStatusText }}</p>
-          </div>
-          <div class="flex rounded bg-slate-100 p-1 dark:bg-slate-800">
-            <button
-              v-for="option in themeOptions"
-              :key="option.value"
-              type="button"
-              :class="[
-                'rounded px-3 py-2 md:py-1 text-[10px] font-bold transition',
-                themeButtonClass(option.value)
-              ]"
-              @click="applyThemeMode(option.value)"
-            >
-              {{ t(option.labelKey) }}
-            </button>
-          </div>
-        </div>
-
         <div class="space-y-3 rounded-lg border border-slate-200 bg-slate-50 p-3 dark:border-slate-700 dark:bg-slate-900/50">
           <div class="flex flex-wrap items-center gap-2 text-[11px] text-slate-600 dark:text-slate-300">
             <span class="rounded bg-slate-200 px-2 py-0.5 font-semibold dark:bg-slate-700">{{ t('sys_backend') }}: {{ backendModeLabel }}</span>
@@ -477,15 +432,13 @@
 import { nextTick } from 'vue';
 import { useNavigation } from '../../composables/useNavigation';
 import { useRunStatus } from '../../composables/useRunStatus';
-import { useTheme } from '../../composables/useTheme';
 import { useI18n } from '../../i18n';
 import { useCertStatus } from '../../composables/useCertStatus';
 
 export default {
   name: 'SystemSettings',
   setup() {
-    const { locale, t, setLocale } = useI18n();
-    const { themeMode, resolvedTheme, setThemeMode } = useTheme();
+    const { t } = useI18n();
     const { showDashboard } = useNavigation();
     const { certStatus, startPolling: startCertPolling, stopPolling: stopCertPolling } = useCertStatus();
     const {
@@ -500,21 +453,7 @@ export default {
     } = useRunStatus();
 
     return {
-      locale,
       t,
-      setLocale,
-      themeMode,
-      resolvedTheme,
-      setThemeMode,
-      languages: [
-        { value: 'en', label: 'English' },
-        { value: 'zh', label: '\u4E2D\u6587' },
-      ],
-      themeOptions: [
-        { value: 'system', labelKey: 'sys_themeSystem' },
-        { value: 'light', labelKey: 'sys_themeLight' },
-        { value: 'dark', labelKey: 'sys_themeDark' },
-      ],
       showDashboard,
       sharedRunMode: runMode,
       sharedRunIsRunning: runIsRunning,
@@ -709,17 +648,6 @@ export default {
     friendlyServiceLabel() {
       return this.systemServiceInfo.service_label || this.systemServiceInfo.service_kind || this.t('sys_serviceLabelFallback');
     },
-    resolvedThemeLabel() {
-      return this.resolvedTheme === 'dark'
-        ? this.t('sys_themeDark')
-        : this.t('sys_themeLight');
-    },
-    themeStatusText() {
-      if (this.themeMode === 'system') {
-        return this.t('sys_themeFollowingSystemState', { mode: this.resolvedThemeLabel });
-      }
-      return this.t('sys_themeManualState', { mode: this.resolvedThemeLabel });
-    },
     serviceBadgeClass() {
       if (!this.systemServiceInfo.supported) {
         return 'bg-slate-200 text-slate-600 dark:bg-slate-700 dark:text-slate-300';
@@ -849,11 +777,6 @@ export default {
         Math.max(1, Math.trunc(normalizedPage))
       );
     },
-    themeButtonClass(mode) {
-      return this.themeMode === mode
-        ? 'bg-primary text-white shadow-sm'
-        : 'text-slate-500 hover:bg-slate-200 dark:text-slate-300 dark:hover:bg-slate-700/70';
-    },
     modeLabel(mode) {
       if (mode === 'http') {
         return this.t('sys_modeRegular');
@@ -877,9 +800,6 @@ export default {
       this.showDashboard();
       await nextTick();
       window.dispatchEvent(new CustomEvent(name, { detail }));
-    },
-    applyThemeMode(mode) {
-      this.setThemeMode(mode);
     },
     async fetchWintunDependencyStatus() {
       const result = await this.requestJSON('/api/run/wintun/status', {

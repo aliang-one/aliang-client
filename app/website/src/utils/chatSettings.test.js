@@ -1,13 +1,19 @@
-import { describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it } from 'vitest';
 import {
   AGENTCORE_MODEL_OPTIONS,
   EFFORT_OPTIONS,
+  LAST_USED_EFFORT_KEY,
+  LAST_USED_MODEL_KEY,
   MODEL_CUSTOM_VALUE,
   deviceSessionToConversation,
   isAliangCodeSession,
   isDirectoryLocked,
   normalizeDeviceProvider,
+  readLastUsedEffort,
+  readLastUsedModel,
   recentProjectsFromSessions,
+  rememberLastUsedEffort,
+  rememberLastUsedModel,
   deviceTranscriptForCreate,
   sessionCreatePayload,
   sessionSourceBadge,
@@ -83,6 +89,46 @@ describe('sessionCreatePayload', () => {
   it('透传非空值与自定义模型/effort', () => {
     const conv = { aiSessionId: 's2', projectPath: '/w', provider: 'agentcore', model: 'my-model', effort: 'xhigh' };
     expect(sessionCreatePayload(conv)).toMatchObject({ project_path: '/w', provider: 'agentcore', model: 'my-model', effort: 'xhigh' });
+  });
+
+  it('输出预算只在显式设置时出现；未设置时整个键不出现（协议漂移守卫）', () => {
+    const bare = sessionCreatePayload({ aiSessionId: 's1' });
+    expect('max_tokens' in bare).toBe(false);
+    expect('context_window' in bare).toBe(false);
+
+    const set = sessionCreatePayload({ aiSessionId: 's1', maxTokens: 32000, contextWindow: 200000 });
+    expect(set.max_tokens).toBe(32000);
+    expect(set.context_window).toBe(200000);
+
+    // 0 / 负数 / 非数字一律视为「未设置」，不下发
+    const zero = sessionCreatePayload({ aiSessionId: 's1', maxTokens: 0, contextWindow: -1 });
+    expect('max_tokens' in zero).toBe(false);
+    expect('context_window' in zero).toBe(false);
+    const junk = sessionCreatePayload({ aiSessionId: 's1', maxTokens: 'abc', contextWindow: null });
+    expect('max_tokens' in junk).toBe(false);
+    expect('context_window' in junk).toBe(false);
+
+    // 小数被截断成整数（后端是 int 字段）
+    const frac = sessionCreatePayload({ aiSessionId: 's1', maxTokens: 32000.9 });
+    expect(frac.max_tokens).toBe(32000);
+  });
+
+  it('会话级 MCP 开关：数组才下发，空数组=显式全部启用，缺键=不动', () => {
+    // 缺键：不出现
+    const bare = sessionCreatePayload({ aiSessionId: 's1' });
+    expect('disabled_mcp_servers' in bare).toBe(false);
+
+    // 显式空数组：出现且为空（语义是「全部启用」，与缺键不同）
+    const allOn = sessionCreatePayload({ aiSessionId: 's1', disabledMcpServers: [] });
+    expect(allOn.disabled_mcp_servers).toEqual([]);
+
+    // 正常列表：trim + 去空
+    const some = sessionCreatePayload({ aiSessionId: 's1', disabledMcpServers: [' a ', '', 'b'] });
+    expect(some.disabled_mcp_servers).toEqual(['a', 'b']);
+
+    // 非数组（脏数据）不下发
+    const junk = sessionCreatePayload({ aiSessionId: 's1', disabledMcpServers: 'a,b' });
+    expect('disabled_mcp_servers' in junk).toBe(false);
   });
 
   it('未设置 resume 字段时载荷不含对应键（e2e 断言 create 帧字段集，不得多出空键）', () => {
@@ -216,10 +262,22 @@ describe('deviceSessionToConversation', () => {
       title: '手机会话',
       provider: 'codex',
       projectPath: '/w',
+      model: '',
+      effort: '',
       deviceSession: entry,
       createdAt: 'c1',
       updatedAt: 'u1',
     });
+  });
+
+  it('回填 model/effort：续聊时设置条显示真实值，而不是假「默认」', () => {
+    // 回归：曾漏映射 model/effort，导致设备会话续聊恒显示「默认」且下一条
+    // 消息重发 create 带空值、把服务端记住的模型抹掉 → 内核「未指定模型」拒跑。
+    const conv = deviceSessionToConversation({
+      id: 's11', provider: 'agentcore', model: 'glm-5.3', effort: 'high',
+    });
+    expect(conv.model).toBe('glm-5.3');
+    expect(conv.effort).toBe('high');
   });
 
   it('title 缺省回落 id，时间/路径缺省空串，provider 归一', () => {
@@ -228,6 +286,8 @@ describe('deviceSessionToConversation', () => {
     expect(conv.title).toBe('s10');
     expect(conv.provider).toBe('claudecode');
     expect(conv.projectPath).toBe('');
+    expect(conv.model).toBe('');
+    expect(conv.effort).toBe('');
     expect(conv.createdAt).toBe('');
     expect(conv.updatedAt).toBe('');
   });
@@ -260,5 +320,41 @@ describe('isAliangCodeSession', () => {
     expect(isAliangCodeSession({})).toBe(false);
     expect(isAliangCodeSession(null)).toBe(false);
     expect(isAliangCodeSession('agentcore')).toBe(false);
+  });
+});
+
+// last-used 记忆（用户拍板 2026-10-31：默认模型留空，新会话沿用上一次用过的）。
+// 用内存版 localStorage 桩，避免依赖 vitest 的 jsdom 环境。
+describe('last-used model/effort 记忆', () => {
+  beforeEach(() => {
+    const store = new Map();
+    globalThis.localStorage = {
+      getItem: (k) => (store.has(k) ? store.get(k) : null),
+      setItem: (k, v) => store.set(k, String(v)),
+      removeItem: (k) => store.delete(k),
+      clear: () => store.clear(),
+    };
+  });
+
+  it('写入后可读回；空值不覆盖已记录的模型', () => {
+    rememberLastUsedModel('glm-5.3');
+    expect(readLastUsedModel()).toBe('glm-5.3');
+    rememberLastUsedModel('');
+    rememberLastUsedModel('   ');
+    expect(readLastUsedModel()).toBe('glm-5.3');
+  });
+
+  it('读回时 trim；无记录返回空串', () => {
+    expect(readLastUsedModel()).toBe('');
+    localStorage.setItem(LAST_USED_MODEL_KEY, '  glm-5.2  ');
+    expect(readLastUsedModel()).toBe('glm-5.2');
+  });
+
+  it('effort 空值表示「清除记忆」（与模型不同：空 effort 是合法语义）', () => {
+    rememberLastUsedEffort('high');
+    expect(readLastUsedEffort()).toBe('high');
+    rememberLastUsedEffort('');
+    expect(readLastUsedEffort()).toBe('');
+    expect(localStorage.getItem(LAST_USED_EFFORT_KEY)).toBe(null);
   });
 });

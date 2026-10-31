@@ -87,18 +87,19 @@ func readAgentCoreSessionMetaWithOptions(path string, options agentVibeSessionRe
 	parsedAny := false
 	forEachAgentSessionJSONLLine(path, maxLineBytes, func(line []byte) bool {
 		var row struct {
-			Kind        string `json:"kind"`
-			SessionID   string `json:"session_id"`
-			ProjectPath string `json:"project_path"`
-			Model       string `json:"model"`
-			CreatedAt   string `json:"created_at"`
-			Origin      string `json:"origin"`
-			Role        string `json:"role"`
-			MessageID   string `json:"message_id"`
-			Text        string `json:"text"`
-			Tool        string `json:"tool"`
-			Summary     string `json:"summary"`
-			Ts          string `json:"ts"`
+			Kind        string                 `json:"kind"`
+			SessionID   string                 `json:"session_id"`
+			ProjectPath string                 `json:"project_path"`
+			Model       string                 `json:"model"`
+			Effort      string                 `json:"effort"`
+			CreatedAt   string                 `json:"created_at"`
+			Origin      string                 `json:"origin"`
+			Role        string                 `json:"role"`
+			MessageID   string                 `json:"message_id"`
+			Text        string                 `json:"text"`
+			Tool        string                 `json:"tool"`
+			Summary     string                 `json:"summary"`
+			Ts          string                 `json:"ts"`
 			Status      string                 `json:"status"`
 			Error       string                 `json:"error"`
 			Diagnostics map[string]interface{} `json:"diagnostics"`
@@ -112,6 +113,7 @@ func readAgentCoreSessionMetaWithOptions(path string, options agentVibeSessionRe
 			session.ID = firstNonEmpty(session.ID, row.SessionID)
 			session.ProjectPath = firstNonEmpty(session.ProjectPath, cleanAgentProjectPath(row.ProjectPath))
 			session.Model = firstNonEmpty(session.Model, row.Model)
+			session.Effort = firstNonEmpty(session.Effort, row.Effort)
 			session.CreatedAt = firstNonEmpty(session.CreatedAt, normalizeAgentTime(row.CreatedAt))
 			// 头行 origin（phone/dashboard/terminal…）忠实回填摘要条目：跨端续聊
 			// 分流靠它判断该会话由哪一端发起。旧文件（头行无 origin 键）与无头行

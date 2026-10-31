@@ -6,10 +6,14 @@
 // 自定义模型的 select 哨兵值。真实模型名直接用自身作 value。
 export const MODEL_CUSTOM_VALUE = '__custom__';
 
-// 模型清单：前端常量维护（后端无清单接口）。glm-only 是回环网关的环境约束，
-// 代码层不强制——自定义值原样透传，合法性与网关裁决。default('') 表示跟随
-// 本机配置（agentCoreModel：ANTHROPIC_MODEL/ANTHROPIC_DEFAULT_SONNET_MODEL
-// env 兜底，最终回落 glm-5.3）。
+// 模型清单：前端常量维护（后端无清单接口，也不打算加——用户可能接第三方
+// LLM，白名单会挡人）。这些只是「建议值」，自定义值原样透传，合法性由上游
+// 裁决。
+//
+// ⚠️ 空串不再表示「跟随本机配置」：内核已删除模型兜底链
+// （app/http/services/agent_ai_agentcore.go 的 agentCoreModel 只剩手机下发值），
+// 空模型会被直接拒绝开跑并报「未指定模型」。空串在此仅表示「用户还没填」，
+// 由 ChatPage 在发送前拦截，并用上一次用过的模型（last-used）预填。
 export const AGENTCORE_MODEL_OPTIONS = [
   { value: '', label: 'default' },
   { value: 'glm-5.3', label: 'glm-5.3' },
@@ -105,6 +109,23 @@ export function sessionCreatePayload(conv) {
   if (conv && conv.resumeProjectPath) {
     payload.project_path = String(conv.resumeProjectPath);
   }
+  // 输出预算（可选）：只有用户显式设了正数才下发，否则整个键不出现——
+  // 后端把「没这个键」当作「未设置」（内核用 64000 默认值），与显式 0 区分。
+  const maxTokens = Number(conv && conv.maxTokens);
+  if (Number.isFinite(maxTokens) && maxTokens > 0) {
+    payload.max_tokens = Math.trunc(maxTokens);
+  }
+  const contextWindow = Number(conv && conv.contextWindow);
+  if (Number.isFinite(contextWindow) && contextWindow > 0) {
+    payload.context_window = Math.trunc(contextWindow);
+  }
+  // 会话级 MCP 开关：数组存在即整体下发（空数组 = 显式全部启用）。
+  // 缺键 = 不动既有设置，两者语义不同，不能合并。
+  if (conv && Array.isArray(conv.disabledMcpServers)) {
+    payload.disabled_mcp_servers = conv.disabledMcpServers
+      .map((n) => (typeof n === 'string' ? n.trim() : ''))
+      .filter(Boolean);
+  }
   const transcript = deviceTranscriptForCreate(conv);
   if (transcript) {
     payload.transcript = transcript;
@@ -158,8 +179,76 @@ export function deviceSessionToConversation(entry) {
     title: entry.title || id,
     provider: normalizeDeviceProvider(entry.provider),
     projectPath: entry.project_path || '',
+    // model/effort 必须回填：服务端清单/详情已带 model（agent_inventory_*），
+    // effort 由 journal 头行持久化。不回填会让续聊的设备会话设置条恒显示
+    // 「默认」，且下一条消息重发 create 时带空值——旧后端会因此把服务端记住
+    // 的模型抹掉（现已在 create 侧改为「空值不覆盖」双保险）。
+    model: entry.model || '',
+    effort: entry.effort || '',
     deviceSession: entry,
     createdAt: entry.created_at || '',
     updatedAt: entry.updated_at || '',
   };
+}
+
+// --- last-used 记忆 -------------------------------------------------------
+//
+// 用户拍板（2026-10-31）：默认模型留空；新建会话沿用「上一次用过的模型」。
+// 模型清单不做后端接口（用户可能接第三方 LLM），因此这个记忆只能落在本端。
+// 键名带前缀，避免与其它 localStorage 数据混。
+export const LAST_USED_MODEL_KEY = 'aliang-last-used-model';
+export const LAST_USED_EFFORT_KEY = 'aliang-last-used-effort';
+
+function safeStorage() {
+  try {
+    return typeof localStorage !== 'undefined' ? localStorage : null;
+  } catch {
+    return null;
+  }
+}
+
+// readLastUsedModel 返回上一次成功发送时用的模型；无记录/脏值返回 ''。
+export function readLastUsedModel() {
+  const s = safeStorage();
+  if (!s) return '';
+  try {
+    const v = s.getItem(LAST_USED_MODEL_KEY);
+    return typeof v === 'string' ? v.trim() : '';
+  } catch {
+    return '';
+  }
+}
+
+export function rememberLastUsedModel(model) {
+  const s = safeStorage();
+  const v = typeof model === 'string' ? model.trim() : '';
+  if (!s || !v) return;
+  try {
+    s.setItem(LAST_USED_MODEL_KEY, v);
+  } catch {
+    /* 配额满/隐私模式：记忆是锦上添花，失败不影响发送 */
+  }
+}
+
+export function readLastUsedEffort() {
+  const s = safeStorage();
+  if (!s) return '';
+  try {
+    const v = s.getItem(LAST_USED_EFFORT_KEY);
+    return typeof v === 'string' ? v.trim() : '';
+  } catch {
+    return '';
+  }
+}
+
+export function rememberLastUsedEffort(effort) {
+  const s = safeStorage();
+  const v = typeof effort === 'string' ? effort.trim() : '';
+  if (!s) return;
+  try {
+    if (v) s.setItem(LAST_USED_EFFORT_KEY, v);
+    else s.removeItem(LAST_USED_EFFORT_KEY);
+  } catch {
+    /* 同上 */
+  }
 }

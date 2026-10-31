@@ -694,6 +694,7 @@ func (m *agentAIManager) handleAgentCoreCompactCommand(session *agentAISession, 
 	projectPath := session.projectPath
 	mode := session.mode
 	model := session.model
+	effort := session.effort
 	contextWindow := session.contextWindow
 	originSocket := session.originSocket
 	surface := session.surface
@@ -707,7 +708,7 @@ func (m *agentAIManager) handleAgentCoreCompactCommand(session *agentAISession, 
 	// 一行，读回时才有始有终；写失败只 Warn（尽力而为口径）。
 	journal := m.coreJournal
 	now := time.Now().UTC().Format(time.RFC3339)
-	journal.ensureSessionHeader(session.id, projectPath, model, now, agentCoreJournalOriginFor(originSocket, surface))
+	journal.ensureSessionHeader(session.id, projectPath, model, effort, now, agentCoreJournalOriginFor(originSocket, surface))
 	journal.appendUser(session.id, messageID, "/compact", now)
 
 	_ = writeJSON(map[string]interface{}{
@@ -1125,7 +1126,7 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		journal.appendEndDiagnostics(run.sessionID, endStatus, endErrMsg, diag)
 	}()
 	now := time.Now().UTC().Format(time.RFC3339)
-	journal.ensureSessionHeader(run.sessionID, run.projectPath, agentCoreModel(run), now, agentCoreJournalOrigin(run))
+	journal.ensureSessionHeader(run.sessionID, run.projectPath, agentCoreModel(run), run.effort, now, agentCoreJournalOrigin(run))
 	if lastUser, ok := m.lastUserHistoryMessage(run.sessionID); ok {
 		ts := now
 		if !lastUser.CreatedAt.IsZero() {
@@ -1293,6 +1294,23 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		// go closeMCP() 不会因 nil func panic。
 		raws = nil
 	}
+	// 会话级 MCP 开关（聊天页「更多 › MCP」）：按配置原始键过滤。nil = 全部
+	// 启用；空切片同样是全部启用（显式「重新打开」）。过滤放在建连之前，
+	// 被关掉的 server 连 dial 都不做——省掉子进程与 10s 超时预算。
+	if len(run.disabledMCPServers) > 0 {
+		disabled := make(map[string]struct{}, len(run.disabledMCPServers))
+		for _, name := range run.disabledMCPServers {
+			disabled[strings.TrimSpace(name)] = struct{}{}
+		}
+		kept := raws[:0]
+		for _, raw := range raws {
+			if _, off := disabled[raw.Name]; off {
+				continue
+			}
+			kept = append(kept, raw)
+		}
+		raws = kept
+	}
 	mcpTools, closeMCP := m.agentCoreMCPServerToolDefs(ctx, raws, func(tool, summary string, isErr bool) {
 		m.coreJournal.appendTool(run.sessionID, tool, summary, isErr)
 	})
@@ -1369,12 +1387,16 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		Effort: run.effort,
 		// 手机选定的上下文窗口驱动内核的自动压缩阈值；0 时内核用 200k 兜底。
 		ContextWindow: run.contextWindow,
+		// 会话级输出上限（聊天页「最大输出 token」）。0 = 未设置 → 内核用
+		// defaultMaxTokens（64000，遇 400 逐次减半到 8192）。此前宿主从不设置，
+		// 用户以为能调的「max token」在 web 上完全不存在。
+		MaxTokens: run.maxTokens,
 		// 打转守卫阈值（仪表盘 customer.agentcore.max_identical_tool_turns）；
 		// 0 时内核用默认值。子 agent 同参（见 agentCoreSubagentRunner）。
 		MaxIdenticalToolTurns: config.GetGlobalConfig().EffectiveAgentCoreMaxIdenticalToolTurns(),
-		Env:           kernelEnv,
-		Approve:       kernelApprove,
-		Logf:          kernelLogf,
+		Env:                   kernelEnv,
+		Approve:               kernelApprove,
+		Logf:                  kernelLogf,
 		// 经 newAgentCoreEmit 包装：ctx 取消时关写端解除阻塞，僵尸写侧不再
 		// 挂死消费侧（AI run 韧性 L2）。
 		Emit:  emitFrame,
@@ -1625,7 +1647,7 @@ func agentCoreLoopHooks(m *agentAIManager, run agentAIRun, diag *agentCoreDiagno
 			autoCompactSeq++
 			ts := time.Now().UTC().Format(time.RFC3339)
 			compactID := fmt.Sprintf("compact-auto-%d-%d", run.runSeq, autoCompactSeq)
-			m.coreJournal.ensureSessionHeader(run.sessionID, run.projectPath, agentCoreModel(run), ts, agentCoreJournalOrigin(run))
+			m.coreJournal.ensureSessionHeader(run.sessionID, run.projectPath, agentCoreModel(run), run.effort, ts, agentCoreJournalOrigin(run))
 			m.coreJournal.appendUser(run.sessionID, compactID, "/compact(auto)", ts)
 			m.coreJournal.appendAssistant(run.sessionID, agentAssistantMessageID(compactID),
 				fmt.Sprintf("✓ 上下文已自动压缩：约 %s → %s tokens（%d 条早期消息已折叠为摘要）。",
