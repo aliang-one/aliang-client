@@ -175,6 +175,12 @@ type agentCoreSubagentBridge struct {
 	// mcpTools：主 run 已建连的 mcp__ 桥工厂（子 run 继承同一 session，零重复建连）。
 	// nil=无 MCP。
 	mcpTools func() []agentcore.Tool
+	// peerTools：设备互访工具工厂（peer.exec/peer.fetch_file/device_list/
+	// device_info/device_note 桥）。nil=不注入。与 MCP 桥同款继承语义——主
+	// run 能跨设备，子 agent 也应能（spec 缺口修补：此前子 registry 只装
+	// 内置+MCP,主 agent 把跨设备任务 delegate 给子 agent 时子 agent 无从
+	// 执行）。桥自带 journal 闭包(绑主 run session),复用实例零额外建连。
+	peerTools func() []agentcore.Tool
 	// onToolCall：journal 回调——Task 调用本身与（经装饰器的）子 run 内置工具
 	// 调用都会触发；nil=不记。
 	onToolCall func(tool, summary string, isErr bool)
@@ -216,8 +222,10 @@ func agentCoreSubagentModel(defModel, mainModel string) string {
 
 // subRegistry 组装子 run 工具表：内置工具（遍历 agentcore.DefaultRegistry
 // 的 Defs() 派生——内核加新工具自动跟进，frontmatter 白名单生效，规范名
-// 精确匹配，白名单未知名忽略+Warn）+ MCP 桥（自带 onCall 无需装饰）；
-// **不含任何子 agent 桥（depth=1 结构保证）**。
+// 精确匹配，白名单未知名忽略+Warn）+ MCP 桥 + peer 设备互访桥（两者自带
+// onCall/journal 无需装饰、不受 frontmatter 白名单过滤——白名单语义只对
+// 内核内置名生效，与 MCP 既有先例一致）；**不含任何子 agent 桥（depth=1
+// 结构保证）**。
 func (b *agentCoreSubagentBridge) subRegistry(mcpTools []agentcore.Tool, journal bool) *agentcore.Registry {
 	base := agentcore.DefaultRegistry()
 	registry := agentcore.NewRegistry()
@@ -244,6 +252,11 @@ func (b *agentCoreSubagentBridge) subRegistry(mcpTools []agentcore.Tool, journal
 	}
 	for _, tool := range mcpTools {
 		registry.Register(tool)
+	}
+	if b.peerTools != nil {
+		for _, tool := range b.peerTools() {
+			registry.Register(tool)
+		}
 	}
 	return registry
 }
@@ -367,6 +380,14 @@ func (m *agentAIManager) agentCoreSubagentTools(run agentAIRun,
 	if len(mcpTools) > 0 {
 		mcpFactory = func() []agentcore.Tool { return mcpTools }
 	}
+	// peer 设备互访桥:与 MCP 桥同款工厂继承。此处自建(agentCorePeerTools 只
+	// 依赖 m 与 run,调用方 runAgentCore 无需改签名)——readOnly 判定由调用方
+	// 的注入闸保证(子 agent 桥只在 !run.readOnly 时注入,peer 桥随之天然只
+	// 出现在非 readOnly run 的子 agent 里)。
+	var peerFactory func() []agentcore.Tool
+	if peerTools := m.agentCorePeerTools(run); len(peerTools) > 0 {
+		peerFactory = func() []agentcore.Tool { return peerTools }
+	}
 	mainModel := agentCoreModel(run)
 	seen := map[string]bool{}
 	out := make([]agentcore.Tool, 0, len(defs))
@@ -398,6 +419,7 @@ func (m *agentAIManager) agentCoreSubagentTools(run agentAIRun,
 			approve:        approve,
 			logf:           logf,
 			mcpTools:       mcpFactory,
+			peerTools:      peerFactory,
 			onToolCall:     onToolCall,
 			contextWindow:  run.contextWindow,
 		})

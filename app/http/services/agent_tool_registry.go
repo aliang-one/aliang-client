@@ -120,7 +120,9 @@ func buildAgentToolRegistry() *tools.Registry {
 			Event: AgentPeerToolEventExec,
 			Description: "Run a one-shot command on another device owned by the same account and " +
 				"return its exit code plus stdout/stderr. Requires peer exec enabled on the target. " +
-				"Targets run commands serially; a busy target fails fast with fail_reason=busy.",
+				"Targets run commands serially; a busy target fails fast with fail_reason=busy. Peer " +
+				"calls are also serial per calling device — run them one after another, never in " +
+				"parallel (concurrent calls fail with rate_limited).",
 			Parameters: map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
@@ -143,8 +145,8 @@ func buildAgentToolRegistry() *tools.Registry {
 			ID:    "peer_fetch_file",
 			Event: AgentPeerToolEventFetchFile,
 			Description: "Queue an asynchronous file fetch from another device in the same account " +
-				"into this machine's transfer inbox. Returns a transfer_id; completion arrives via " +
-				"transfer.progress events.",
+				"into this machine's transfer inbox. The source device must have peer fetch enabled. " +
+				"Returns a transfer_id; completion arrives via transfer.progress events.",
 			Parameters: map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{

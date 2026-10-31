@@ -262,3 +262,39 @@ func TestPeerMCPBaseURL_EnvOverrides(t *testing.T) {
 		t.Fatalf("url = %s", got)
 	}
 }
+
+func TestPeerMCPCall_LargeResultWithin4MiBCap(t *testing.T) {
+	// 合法满输出(stdout/stderr 各 256KiB 裸字节)经 JSON 转义可膨胀到 >1MiB;
+	// 响应读侧封顶必须与注册表面 MaxOutputBytes(4MiB)对齐,否则合法结果被
+	// 截断成非法 JSON、整次调用误报 "not JSON" 报废。
+	payload := strings.Repeat("a\"b\\c\n", 200000) // 1.4MiB 裸字节,转义后 ~1.8MiB
+	raw, err := json.Marshal(map[string]interface{}{
+		"code": 0, "msg": "success",
+		"data": map[string]string{"result": payload},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if len(raw) <= 1<<20 {
+		t.Fatalf("test payload too small: %d bytes, want > 1MiB", len(raw))
+	}
+	rec := newMCPTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(raw)
+	})
+	srv := newMCPServerForTest(t, rec)
+
+	resp := feed(t, srv, `{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"peer_exec","arguments":{"device_id":"device-c","command":"big"}}}`)
+	if resp["error"] != nil {
+		t.Fatalf("tools/call errored: %v", resp["error"])
+	}
+	result, _ := resp["result"].(map[string]interface{})
+	if result["isError"] == true {
+		t.Fatalf("large legal result must not be isError: %v", result)
+	}
+	content, _ := result["content"].([]interface{})
+	block, _ := content[0].(map[string]interface{})
+	if !strings.Contains(block["text"].(string), `a"b\c`) {
+		t.Fatalf("payload mangled: %.80v", block["text"])
+	}
+}

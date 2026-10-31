@@ -254,3 +254,29 @@ func TestAgentCoreSubagentToolsAssembly(t *testing.T) {
 		t.Fatalf("空定义集应返回 nil, got %+v", got)
 	}
 }
+
+func TestAgentCoreSubagentRegistryIncludesPeerTools(t *testing.T) {
+	// peer 设备互访桥必须进子 registry(与 MCP 桥同款继承):否则主 agent 把
+	// 跨设备任务 delegate 给子 agent 时,子 agent 无从执行(缺口修补的钉子)。
+	m := &agentAIManager{coreJournal: newAgentCoreJournal(t.TempDir())}
+	run := agentAIRun{sessionID: "sess-sub-peer"}
+	peerTools := m.agentCorePeerTools(run)
+	if len(peerTools) != 5 {
+		t.Fatalf("peer tools = %d, want 5", len(peerTools))
+	}
+	bridge := &agentCoreSubagentBridge{
+		name:      "reviewer",
+		peerTools: func() []agentcore.Tool { return peerTools },
+	}
+	registry := bridge.subRegistry(nil, false)
+	for _, want := range []string{"peer.exec", "peer.fetch_file", "peer.device_info", "peer.device_note", "peer.device_list"} {
+		if _, ok := registry.Get(want); !ok {
+			t.Fatalf("sub registry missing peer tool %s", want)
+		}
+	}
+	// peerTools=nil(理论不可达,防御)不注入、不炸。
+	plain := (&agentCoreSubagentBridge{name: "x"}).subRegistry(nil, false)
+	if _, ok := plain.Get("peer.exec"); ok {
+		t.Fatalf("nil peerTools must not register peer.exec")
+	}
+}

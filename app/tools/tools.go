@@ -10,8 +10,10 @@ import (
 	"sort"
 )
 
-// Caps bounds how a tool may run. All Phase-1 tools are read-only; ReadOnly is
-// declared for future policy use and surfaced to the server.
+// Caps bounds how a tool may run. Most registry tools are read-only; the peer
+// tools (peer_exec / peer_fetch_file / device_note) declare ReadOnly=false and
+// rely on their own server-side gates (device switches + ACL + audit). ReadOnly
+// is surfaced to the server for policy use.
 type Caps struct {
 	ReadOnly       bool `json:"read_only"`
 	NeedsProject   bool `json:"needs_project"`

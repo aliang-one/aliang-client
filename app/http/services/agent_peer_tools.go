@@ -305,6 +305,8 @@ func peerReasonReadable(reason string) string {
 		return "target device is offline"
 	case "not_allowed":
 		return "target device does not allow this peer operation (peer ACL or device switch off)"
+	case "peer_fetch_not_allowed":
+		return "source device does not allow peer file fetch (peer fetch switch is off on that device)"
 	case "rate_limited":
 		return "peer operation rate limited, retry later"
 	case "timeout":
@@ -519,9 +521,10 @@ func peerMetadataUpdatedBy(meta map[string]interface{}) string {
 }
 
 // deviceListReport 拉取账号设备清单并瘦身为 LLM 可读目录。安全字段白名单：
-// id/name/platform/status/agent_version/peer_exec——host/location/load/IP 一律
-// 不进上下文（延续「LLM 路径零泄漏」纪律，spec §7.3）。这是设备发现闭环的
-// 唯一目录口：其余 peer 工具全部要 device_id，LLM 从这里选目标。
+// id/name/platform/status/agent_version/peer_exec/peer_fetch——host/location/
+// load/IP 一律不进上下文（延续「LLM 路径零泄漏」纪律，spec §7.3）。这是设备
+// 发现闭环的唯一目录口：其余 peer 工具全部要 device_id，LLM 从这里选目标；
+// 两个开关列（exec/fetch）让 LLM 在选择目标前就能预判门禁，不烧一次 4xx。
 func (s *AgentService) deviceListReport(ctx context.Context) (string, error) {
 	raw, err := s.doAgentServerGET(ctx, agentPeerServerURL()+"/api/devices")
 	if err != nil {
@@ -536,6 +539,7 @@ func (s *AgentService) deviceListReport(ctx context.Context) (string, error) {
 		id, name, platform, status, version string
 		osText                              string
 		peerExec                            bool
+		peerFetch                           bool
 		self                                bool
 	}
 	entries := make([]peerDeviceEntry, 0, len(devices))
@@ -545,14 +549,15 @@ func (s *AgentService) deviceListReport(ctx context.Context) (string, error) {
 			continue
 		}
 		entries = append(entries, peerDeviceEntry{
-			id:       id,
-			name:     peerAPIString(d, "name", "device_name"),
-			platform: peerAPIString(d, "platform"),
-			status:   peerAPIString(d, "status"),
-			version:  peerAPIString(d, "agent_version", "agentVersion"),
-			osText:   peerAPISystemSummary(d),
-			peerExec: peerAPIBool(d, "peer_exec_enabled", "peerExecEnabled"),
-			self:     id == selfID,
+			id:        id,
+			name:      peerAPIString(d, "name", "device_name"),
+			platform:  peerAPIString(d, "platform"),
+			status:    peerAPIString(d, "status"),
+			version:   peerAPIString(d, "agent_version", "agentVersion"),
+			osText:    peerAPISystemSummary(d),
+			peerExec:  peerAPIBool(d, "peer_exec_enabled", "peerExecEnabled"),
+			peerFetch: peerAPIBool(d, "peer_fetch_enabled", "peerFetchEnabled"),
+			self:      id == selfID,
 		})
 	}
 	// 本机置顶（LLM 最常用的锚点），其余按名称稳定排序。
@@ -572,9 +577,11 @@ func (s *AgentService) deviceListReport(ctx context.Context) (string, error) {
 		if e.self {
 			name += " (this machine)"
 		}
-		peerExec := "disabled"
-		if e.peerExec {
-			peerExec = "enabled"
+		switchText := func(on bool) string {
+			if on {
+				return "enabled"
+			}
+			return "disabled"
 		}
 		field := func(v string) string {
 			if v == "" {
@@ -586,8 +593,8 @@ func (s *AgentService) deviceListReport(ctx context.Context) (string, error) {
 		if osText == "" {
 			osText = field(e.platform)
 		}
-		fmt.Fprintf(&b, "- id=%s | %s | os=%s | status=%s | agent=%s | peer_exec=%s\n",
-			e.id, name, osText, field(e.status), field(e.version), peerExec)
+		fmt.Fprintf(&b, "- id=%s | %s | os=%s | status=%s | agent=%s | peer_exec=%s | peer_fetch=%s\n",
+			e.id, name, osText, field(e.status), field(e.version), switchText(e.peerExec), switchText(e.peerFetch))
 	}
 	return strings.TrimRight(b.String(), "\n"), nil
 }
@@ -969,7 +976,10 @@ func (m *agentAIManager) agentCorePeerTools(run agentAIRun) []agentcore.Tool {
 			name: AgentPeerToolEventExec,
 			description: "Run a one-shot command on another device owned by the same account and " +
 				"return its exit code plus stdout/stderr. The remote device must have peer exec enabled. " +
-				"Serial per target device: a busy target returns fail_reason=busy immediately.",
+				"Serial per target device: a busy target returns fail_reason=busy immediately. Also " +
+				"serial per calling device: only one peer command may be in flight at a time, so run " +
+				"peer calls one after another, never in parallel (concurrent calls fail with " +
+				"fail_reason=rate_limited).",
 			schema: peerToolSchema([]string{"device_id", "command"}, map[string]interface{}{
 				"device_id":  map[string]interface{}{"type": "string", "description": "Target device id"},
 				"command":    map[string]interface{}{"type": "string", "description": "Shell command to run on the target device"},
@@ -992,7 +1002,8 @@ func (m *agentAIManager) agentCorePeerTools(run agentAIRun) []agentcore.Tool {
 		&agentCorePeerToolBridge{
 			name: AgentPeerToolEventFetchFile,
 			description: "Queue an asynchronous file fetch from another device into this machine's " +
-				"transfer inbox. Returns a transfer_id; completion is delivered via transfer.progress.",
+				"transfer inbox. The source device must have peer fetch enabled. Returns a transfer_id; " +
+				"completion is delivered via transfer.progress.",
 			schema: peerToolSchema([]string{"device_id", "remote_path"}, map[string]interface{}{
 				"device_id":   map[string]interface{}{"type": "string", "description": "Source device id"},
 				"remote_path": map[string]interface{}{"type": "string", "description": "File path on the source device"},
