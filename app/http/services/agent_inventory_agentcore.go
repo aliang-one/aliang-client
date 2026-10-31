@@ -71,14 +71,16 @@ func readAgentCoreSessionMetaWithOptions(path string, options agentVibeSessionRe
 	if maxLineBytes <= 0 {
 		maxLineBytes = agentVibeJSONLMaxLineBytes
 	}
-	// agentcore journal 落 user/assistant/tool 三种行,MessageCount/displayCount
-	// 只数 msg 行（tool 行是轨迹不计对话计数）;仍单独维护 displayCount 保持与
-	// codex/claude reader 相同的字段语义（残壳=0）。
+	// agentcore journal 落 user/assistant/turn/tool 多种行,MessageCount/displayCount
+	// 数 msg 行与有正文的 turn 行（tool 行是轨迹不计对话计数）;仍单独维护
+	// displayCount 保持与 codex/claude reader 相同的字段语义（残壳=0）。
 	displayCount := 0
-	// toolCount 给 tool 行造稳定唯一 ID;transcriptRow 是全转录行序号（msg+tool
-	// 共用）,作 Index——msg 与 tool 交错时若各用各的计数会撞号,统一计数器对
-	// 无 tool 行的旧文件与原 messageCount-1 口径数值恒等（向后兼容）。
+	// toolCount/turnCount 给 tool/turn 行造稳定唯一 ID;transcriptRow 是全转录
+	// 行序号（msg+turn+tool 共用）,作 Index——各类行交错时若各用各的计数会
+	// 撞号,统一计数器对无 tool/turn 行的旧文件与原 messageCount-1 口径数值
+	// 恒等（向后兼容）。
 	toolCount := 0
+	turnCount := 0
 	transcriptRow := 0
 	// parsedAny：是否有任何一行真正解析成功（session 头行被识别,或 msg 行
 	// 通过角色+内容校验）。整文件损坏时一行都不成立——文件名兜底会凭空造出
@@ -97,6 +99,8 @@ func readAgentCoreSessionMetaWithOptions(path string, options agentVibeSessionRe
 			Role        string                 `json:"role"`
 			MessageID   string                 `json:"message_id"`
 			Text        string                 `json:"text"`
+			Thinking    string                 `json:"thinking"`
+			Turn        int                    `json:"turn"`
 			Tool        string                 `json:"tool"`
 			Summary     string                 `json:"summary"`
 			Ts          string                 `json:"ts"`
@@ -155,6 +159,43 @@ func readAgentCoreSessionMetaWithOptions(path string, options agentVibeSessionRe
 			}
 			if session.CreatedAt == "" {
 				session.CreatedAt = ts
+			}
+		case "turn":
+			// 逐回合转录行(OnTurnEnd 落盘,text+thinking+stop_reason+tools)。
+			// 2026-10-31 审计定谳前本 case 缺席,19 回合的内容在 detail/扫盘
+			// 上报里永远只看得到每 run 一条 msg——这是「agentcore 会话手机
+			// 端无历史」事故的内核侧根因。有正文的回合回放为 assistant 转录
+			// 行;纯工具回合(text 空)无可渲染正文,Phase 2(工具/思考历史
+			// 门控)前跳过。thinking 随 AgentVibeMessage.Thinking 新字段携带,
+			// server zod 剥未知字段,手机契约未消费——先上梅,Phase 1/2 点亮。
+			// 无头行文件(session.ID 空)与 tool 行同规跳过:turn 行没有
+			// message_id,无归属依据;损失模式同 tool 行(steer 先到→无头行),
+			// 有意接受。与直播已落库的 assistant 行文字相重时,server 侧
+			// dropContentDuplicates(role+空白折叠 content 键,863fe6f)按存量
+			// 份数吸收,不产生重复气泡。
+			if session.ID == "" {
+				return true
+			}
+			content := truncateAgentText(row.Text, agentVibeTranscriptMaxContentRunes)
+			if content == "" {
+				return true
+			}
+			parsedAny = true
+			turnCount++
+			transcriptRow++
+			ts := normalizeAgentTime(row.Ts)
+			session.MessageCount++
+			window.add(models.AgentVibeMessage{
+				ID:        fmt.Sprintf("turn-%06d", turnCount),
+				Role:      "assistant",
+				Content:   content,
+				Thinking:  truncateAgentText(row.Thinking, agentVibeTranscriptMaxContentRunes),
+				Timestamp: ts,
+				Index:     transcriptRow - 1,
+			})
+			displayCount++
+			if ts != "" { // 空 ts 不赋值:防损坏行抹掉前一行已落下的有效值
+				session.UpdatedAt = ts
 			}
 		case "tool":
 			// 工具轨迹行：渲染进 Transcript 但不计 MessageCount/displayCount。

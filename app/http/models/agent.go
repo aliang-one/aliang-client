@@ -235,6 +235,10 @@ type AgentVibeMessage struct {
 	Content   string `json:"content"`
 	Timestamp string `json:"timestamp,omitempty"`
 	Index     int    `json:"index,omitempty"`
+	// Thinking 是回合级思考文本(journal kind=turn 行携带)。2026-10-31 起
+	// 随 turn 行回放下发;server zod 剥未知字段、手机契约未消费——先上梅,
+	// Phase 1/2(思考历史渲染+门控)再点亮,避免届时再动传输结构。
+	Thinking string `json:"thinking,omitempty"`
 }
 
 type AgentVibeTranscriptPage struct {

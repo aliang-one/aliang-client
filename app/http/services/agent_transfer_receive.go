@@ -78,6 +78,9 @@ func (s *AgentService) handleAgentTransferReceive(msg map[string]interface{}, wr
 	}
 	objectETag := remoteString(msg, "object_etag")
 	targetDir := remoteString(msg, "target_dir")
+	// 阶段 2 LAN 直连候选(spec §6):服务端协商成功才带;畸形候选就地降级为
+	// nil(纯 COS),绝不让坏帧打断既有链路。
+	lanCandidate := parseAgentLanDirectCandidates(msg)
 
 	// D6 幂等：已完成的重复投递不再收第二次，补发 confirm 自愈后返回。
 	if marker, _ := readAgentTransferMarker(ident.TransferID); marker != nil && marker.State == transferMarkerStateDone {
@@ -101,12 +104,12 @@ func (s *AgentService) handleAgentTransferReceive(msg map[string]interface{}, wr
 	defer transferReceiveSlot().release(ident.TransferID)
 	defer cancel()
 
-	logger.Info(fmt.Sprintf("[TRANSFER] receive begin transfer_id=%s file=%q dir=%q size=%d archive=%t",
-		ident.TransferID, ident.Filename, targetDir, ident.SizeBytes, ident.IsDirectoryArchive))
-	startAgentTransferReceive(ctx, s, ident, getURL, objectETag, targetDir, writeJSON)
+	logger.Info(fmt.Sprintf("[TRANSFER] receive begin transfer_id=%s file=%q dir=%q size=%d archive=%t lan=%t",
+		ident.TransferID, ident.Filename, targetDir, ident.SizeBytes, ident.IsDirectoryArchive, lanCandidate != nil))
+	startAgentTransferReceive(ctx, s, ident, getURL, objectETag, targetDir, lanCandidate, writeJSON)
 }
 
-func startAgentTransferReceive(ctx context.Context, s *AgentService, ident agentTransferIdentity, getURL, objectETag, targetDir string, writeJSON func(interface{}) error) {
+func startAgentTransferReceive(ctx context.Context, s *AgentService, ident agentTransferIdentity, getURL, objectETag, targetDir string, lanCandidate *agentLanDirectCandidate, writeJSON func(interface{}) error) {
 	inbox, err := agentTransferInboxDir()
 	if err != nil {
 		_ = emitAgentTransferFailure(writeJSON, ident.RequestID, ident.TransferID, transferErrInternal, err)
@@ -135,10 +138,38 @@ func startAgentTransferReceive(ctx context.Context, s *AgentService, ident agent
 	}
 
 	partialPath := agentTransferPartialPath(inbox, ident.TransferID, safeName)
-	finalSize, finalSHA, err := downloadAgentTransferPayload(ctx, s, ident, getURL, objectETag, partialPath, writeJSON)
-	if err != nil {
-		handleAgentTransferReceiveFailure(ctx, s, ident, partialPath, err, writeJSON)
-		return
+
+	// 阶段 2 LAN 直连腿(spec §6):候选在手就先试直连,任何失败(拨号/握手/
+	// 中途/sha 不符)静默落回 COS——COS 对象是真值源,「现链路零改动」。
+	// skip 类错误(partial 已有偏移/归档)同样直接走 COS,不算失败。
+	via := "cos"
+	lanFailStage := ""
+	var finalSize int64
+	var finalSHA string
+	if lanCandidate != nil {
+		size, sha, lanErr := attemptAgentTransferLANDownload(ctx, ident, lanCandidate, partialPath, writeJSON)
+		switch {
+		case lanErr == nil:
+			finalSize, finalSHA, via = size, sha, "lan"
+			logger.Info(fmt.Sprintf("[TRANSFER] lan direct complete transfer_id=%s bytes=%d", ident.TransferID, finalSize))
+		case errors.Is(lanErr, errAgentTransferLanSkip):
+			logger.Info(fmt.Sprintf("[TRANSFER] lan direct skipped transfer_id=%s: %v", ident.TransferID, lanErr))
+		default:
+			// 分级只用于日志/审计回带:A 端行为统一=落 COS。
+			lanFailStage = classifyAgentLanFailStage(lanErr)
+			logger.Info(fmt.Sprintf("[TRANSFER] lan direct failed transfer_id=%s stage=%s err=%v — falling back to COS",
+				ident.TransferID, lanFailStage, lanErr))
+			if cleanupErr := os.Remove(partialPath); cleanupErr != nil && !os.IsNotExist(cleanupErr) {
+				logger.Warn(fmt.Sprintf("[TRANSFER] lan partial cleanup failed transfer_id=%s err=%v", ident.TransferID, cleanupErr))
+			}
+		}
+	}
+	if via == "cos" {
+		finalSize, finalSHA, err = downloadAgentTransferPayload(ctx, s, ident, getURL, objectETag, partialPath, writeJSON)
+		if err != nil {
+			handleAgentTransferReceiveFailure(ctx, s, ident, partialPath, err, writeJSON)
+			return
+		}
 	}
 
 	finalPath := agentTransferFinalPath(landDir, safeName)
@@ -193,6 +224,12 @@ func startAgentTransferReceive(ctx context.Context, s *AgentService, ident agent
 	payload["path"] = finalPath
 	payload["size_bytes"] = finalSize
 	payload["sha256"] = finalSHA
+	// 阶段 2 LAN 直连:实际走的路径回带(via=lan|cos),服务端据此落审计
+	// (spec §6.3「全部协商结果服务端留痕」)。
+	payload["via"] = via
+	if lanFailStage != "" {
+		payload["lan_fail_stage"] = lanFailStage
+	}
 	if err := writeJSON(payload); err != nil {
 		logger.Warn(fmt.Sprintf("[TRANSFER] receive result write failed transfer_id=%s err=%v", ident.TransferID, err))
 	}

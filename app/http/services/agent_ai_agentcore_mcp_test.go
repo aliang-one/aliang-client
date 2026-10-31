@@ -931,12 +931,13 @@ func TestRunAgentCoreMCPEndToEnd(t *testing.T) {
 		t.Fatalf("tool_result = %q, want 含 echo:hi（审批+桥+内核全链穿透）", toolContent)
 	}
 
-	// 3) journal v2 五类行齐且顺序固定：session / user / turn(1) / tool /
-	// turn(2) / assistant / end。turn 是逐回合 transcript 行（每回合必落），
-	// 工具回合夹在 turn(1) 与 turn(2) 之间。
+	// 3) journal v2 行齐且顺序固定：session / user / turn(1) / tool /
+	// turn(2) / end。turn 是逐回合 transcript 行（每回合必落），工具回合夹在
+	// turn(1) 与 turn(2) 之间。2026-10-31 单一真源门:run 级累计 assistant 行
+	// 不再落(turn 行已覆盖,见 agent_ai_agentcore.go 成功出口)。
 	lines := readJournalLines(t, agentCoreJournalDir(), sessionID)
-	if len(lines) != 7 {
-		t.Fatalf("journal 行数 = %d, want 7: %v", len(lines), lines)
+	if len(lines) != 6 {
+		t.Fatalf("journal 行数 = %d, want 6: %v", len(lines), lines)
 	}
 	if lines[0]["kind"] != "session" {
 		t.Errorf("头行 = %v", lines[0])
@@ -955,11 +956,8 @@ func TestRunAgentCoreMCPEndToEnd(t *testing.T) {
 		lines[4]["text"] != "好的" {
 		t.Errorf("turn(2) 行 = %v, want kind=turn stop_reason=end_turn text=好的", lines[4])
 	}
-	if lines[5]["role"] != "assistant" || lines[5]["text"] != "好的" {
-		t.Errorf("assistant 行 = %v", lines[5])
-	}
-	if lines[6]["kind"] != "end" || lines[6]["status"] != "success" {
-		t.Errorf("end 行 = %v, want status=success", lines[6])
+	if lines[5]["kind"] != "end" || lines[5]["status"] != "success" {
+		t.Errorf("end 行 = %v, want status=success(累计 assistant 行已废)", lines[5])
 	}
 
 	// 4) run 收尾后 closeAll 被调用恰好一次（defer 走 detached goroutine，

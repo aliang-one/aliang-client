@@ -128,6 +128,12 @@ const (
 	AgentEventPeerExecRequest  = "peer.exec.request"  // server→B: A 设备发起的命令执行请求
 	AgentEventPeerExecResult   = "peer.exec.result"   // B→server→A: 执行回显（真实 exit_code 或 -1+fail_reason）
 	AgentEventPeerExecRejected = "peer.exec.rejected" // server→A: 服务端裁决拒绝（ACL/离线/限流/busy）——服务端实现路由,客户端登记契约+静默消费
+
+	// 设备互访阶段 2 增量 2（spec §6）：LAN 直连文件数据面的信令帧。COS 对象
+	// 仍是真值源——协商成功仅是把「一次性临时 TLS listener」候选附进
+	// transfer.receive 的 direct_candidates，任何失败 A 静默落回 COS。
+	AgentEventPeerLanListen       = "peer.lan.listen"        // server→B(源设备): 拉起一次性临时文件 listener
+	AgentEventPeerLanListenResult = "peer.lan.listen.result" // B→server: 绑定结果(addr+fingerprint)或失败原因
 )
 
 // Terminal output quota challenge protocol (spec §5.2). There is NO
@@ -261,7 +267,7 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				// file.upload.progress / file.upload.cancel 此前在用但从未登记（漏登先例，本次补齐）。
 				{Type: AgentEventFileUploadProgress, Required: []string{"type", "request_id", "uploaded_bytes", "total_bytes"}},
 				{Type: AgentEventTransferProgress, Required: []string{"type", "transfer_id", "direction", "bytes_done", "total_bytes"}, Optional: []string{"request_id", "part_number"}},
-				{Type: AgentEventTransferResult, Required: []string{"type", "transfer_id", "ok"}, Optional: []string{"request_id", "etags", "path", "size_bytes", "sha256", "error_code", "error"}},
+				{Type: AgentEventTransferResult, Required: []string{"type", "transfer_id", "ok"}, Optional: []string{"request_id", "etags", "path", "size_bytes", "sha256", "error_code", "error", "via", "lan_fail_stage"}},
 				{Type: AgentEventGitStatusResult, Required: []string{"type", "request_id", "is_repo"}, Optional: []string{"branch", "status", "generated_at"}},
 				{Type: AgentEventEnvInfoResult, Required: []string{"type", "request_id", "os"}, Optional: []string{"arch", "shell", "user", "versions", "generated_at"}},
 				{Type: AgentEventGitStatusError, Required: []string{"type", "request_id", "error"}},
@@ -344,6 +350,11 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				// timeout/target_missing_capability）；reason 是裁决语义的载体，必填。
 				// agent 不据此动作（A 侧工具走同步 REST 编排），登记契约 + 静默消费。
 				{Type: AgentEventPeerExecRejected, Required: []string{"type", "request_id", "reason"}},
+				// 设备互访阶段 2（spec §6）：LAN 直连协商。token 是服务端签发的
+				// 单用途短时凭据（≤30s），advertise_ip 是两端同子网的重叠对提示。
+				// B 绑定成功立即回 result（addr+fingerprint），服务过程异步单连接。
+				{Type: AgentEventPeerLanListen, Required: []string{"type", "request_id", "transfer_id", "token", "source_path", "size_bytes"}, Optional: []string{"sha256", "advertise_ip", "ttl_seconds"}, Emits: []string{AgentEventPeerLanListenResult}},
+				{Type: AgentEventPeerLanListenResult, Required: []string{"type", "request_id", "ok"}, Optional: []string{"addr", "fingerprint", "fail_reason"}},
 			},
 		},
 		Streams: []AgentProtocolStream{
