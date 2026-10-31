@@ -67,8 +67,8 @@ async function openChat(page) {
         contentType: 'application/json',
         body: JSON.stringify({ code: 0, data: { sessions: [
           { id: 'sess-settings-b', provider: 'agentcore', title: '清单会话乙', status: 'idle', origin: 'phone', project_path: '/home/alice/proj-b' },
-          { id: 'claude_settings-a1', provider: 'claude', title: '清单会话甲一', status: 'idle', origin: '', project_path: '/home/alice/proj-a' },
-          { id: 'claude_settings-a2', provider: 'claude', title: '清单会话甲二', status: 'idle', origin: '', project_path: '/home/alice/proj-a' },
+          { id: 'sess-settings-a1', provider: 'agentcore', title: '清单会话甲一', status: 'idle', origin: '', project_path: '/home/alice/proj-a' },
+          { id: 'sess-settings-a2', provider: 'agentcore', title: '清单会话甲二', status: 'idle', origin: '', project_path: '/home/alice/proj-a' },
         ] } }),
       });
       return;
