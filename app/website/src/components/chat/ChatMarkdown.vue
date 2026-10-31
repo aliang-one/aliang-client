@@ -15,10 +15,14 @@
 <script setup>
 import { ref, watch, onMounted, onUnmounted } from 'vue';
 import { renderMarkdownSafe } from '../../utils/chatMarkdown';
+import { useI18n } from '../../i18n';
+
+const { t } = useI18n();
 
 // 流式容忍(spec §E):delta 高频追加,80ms 防抖重渲染。测试/E2E 经
-// globalThis.__CHAT_MD_DEBOUNCE_MS__ 注入 0 延迟(与 __CHAT_IDLE_TIMEOUT_MS__
-// 同款手法)。未闭合围栏由 markdown-it 天然按代码块处理,半截内容不闪错。
+// globalThis.__CHAT_MD_DEBOUNCE_MS__ 注入正值可覆盖,0 会被 || 回退到默认
+// (与 __CHAT_IDLE_TIMEOUT_MS__ 手法一致);测试需要同步渲染路径时走初始
+// ref 渲染。未闭合围栏由 markdown-it 天然按代码块处理,半截内容不闪错。
 const CHAT_MD_DEBOUNCE_MS = Number(globalThis.__CHAT_MD_DEBOUNCE_MS__) || 80;
 const FOLD_LINE_THRESHOLD = 20;
 
@@ -59,7 +63,7 @@ function enhance() {
     const copy = document.createElement('button');
     copy.type = 'button';
     copy.className = 'chat-md-copy';
-    copy.textContent = '复制';
+    copy.textContent = t('chat_md_copy');
     pre.replaceWith(wrap);
     wrap.appendChild(pre);
     wrap.appendChild(label);
@@ -72,7 +76,7 @@ function enhance() {
       const unfold = document.createElement('button');
       unfold.type = 'button';
       unfold.className = 'chat-md-unfold';
-      unfold.textContent = '展开全部';
+      unfold.textContent = t('chat_md_unfold');
       wrap.appendChild(unfold);
     }
   });
@@ -101,7 +105,7 @@ function onClick(e) {
     const code = copy.parentElement && copy.parentElement.querySelector('pre code');
     const original = copy.textContent;
     copyText(code ? code.textContent : '').then(() => {
-      copy.textContent = '已复制';
+      copy.textContent = t('chat_md_copied');
       const t = setTimeout(() => {
         copy.textContent = original;
         feedbackTimers.delete(t);

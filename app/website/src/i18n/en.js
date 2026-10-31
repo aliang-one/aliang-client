@@ -281,6 +281,9 @@ export default {
   chat_noticeHistoryRestoreFailed: 'History restore failed — continuing with empty context',
   chat_approvalCancelled: 'Approval was cancelled',
   chat_approvalCancelledReason: 'Approval was cancelled ({reason})',
+  chat_md_copy: 'Copy',
+  chat_md_copied: 'Copied',
+  chat_md_unfold: 'Expand',
 
   // -- App --
   app_restoringSession: 'Restoring saved session...',

@@ -280,6 +280,9 @@ export default {
   chat_noticeHistoryRestoreFailed: '历史恢复失败，已按空会话继续',
   chat_approvalCancelled: '审批已被取消',
   chat_approvalCancelledReason: '审批已被取消（{reason}）',
+  chat_md_copy: '复制',
+  chat_md_copied: '已复制',
+  chat_md_unfold: '展开全部',
 
   // -- App --
   app_restoringSession: '正在恢复会话...',
