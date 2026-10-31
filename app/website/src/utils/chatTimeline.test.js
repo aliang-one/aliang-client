@@ -13,6 +13,10 @@ describe('mergeTimeline', () => {
     const out = mergeTimeline([{ role: 'user', content: 'a' }], []);
     expect(out).toHaveLength(1);
   });
+  it('两个都无 ts 的项保持 concat 序(比较器 NaN 防御)', () => {
+    const out = mergeTimeline([{ role: 'user', content: 'a' }], [{ messageId: 's1', content: 'x' }]);
+    expect(out.map(i => [i.type, i.content])).toEqual([['message', 'a'], ['steer', 'x']]);
+  });
   it('脏输入安全返回空数组', () => {
     expect(mergeTimeline(null, undefined)).toEqual([]);
   });

@@ -1,6 +1,5 @@
 import { describe, it, expect } from 'vitest';
 import { sliceMessagesBefore, canRecall, recallCreatePayload } from './chatRecall';
-import { sessionCreatePayload } from './chatSettings';
 
 describe('sliceMessagesBefore', () => {
   it('返回目标消息之前的切片(不含目标)', () => {
@@ -27,19 +26,24 @@ describe('canRecall', () => {
     expect(canRecall({ provider: 'agentcore', role: 'assistant', messageId: 'x' })).toBe(false);
     expect(canRecall(null)).toBe(false);
   });
+  it('messageId 空串/非字符串 → 不可撤回', () => {
+    expect(canRecall({ provider: 'agentcore', role: 'user', messageId: '' })).toBe(false);
+    expect(canRecall({ provider: 'agentcore', role: 'user', messageId: 123 })).toBe(false);
+  });
 });
 
 describe('recallCreatePayload', () => {
   it('基于常规载荷但绝不携带 transcript,且带 truncate_before_message_id', () => {
     const conv = {
       aiSessionId: 'sid', projectPath: '/p', provider: 'agentcore',
-      model: 'glm-5.3', effort: 'high',
+      model: 'glm-5.3', effort: 'high', resumeSessionId: 'old',
       deviceSession: { id: 'sid' }, deviceTranscript: [{ role: 'user', content: 'x' }],
     };
     const p = recallCreatePayload(conv, 'm9');
     expect(p.truncate_before_message_id).toBe('m9');
     expect(p.transcript).toBeUndefined();          // 撤回路径绝不喂 transcript
-    expect(p.resume_session_id).toBeUndefined();   // resume 仅首次,撤回不带
+    expect(p.resume_session_id).toBeUndefined();   // resume 仅首次,撤回不带(带上 resumeSessionId 才是真删)
+    expect(p.project_path).toBe('/p');             // resumeProjectPath 不在撤回路径污染 project_path
     expect(p.effort).toBe('high');
     expect(p.session_id).toBe('sid');
   });

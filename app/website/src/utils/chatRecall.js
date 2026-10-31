@@ -20,9 +20,14 @@ export function canRecall(msg) {
     && msg.provider === 'agentcore';
 }
 
-// 撤回 create 载荷:常规载荷打底,删 transcript/resume,加 truncate 键。
+/**
+ * 撤回 create 载荷:常规载荷打底,删 transcript/resume,加 truncate 键。
+ * beforeMessageId 必须由调用方保证为非空字符串(sliceMessagesBefore 已验,
+ * 本函数 String() 兜底)。
+ */
 export function recallCreatePayload(conv, beforeMessageId) {
   const payload = sessionCreatePayload(conv);
+  // 铁律锚点(spec §A):宿主从 journal 全文重建,帧携带 transcript 会污染上下文,勿删。
   delete payload.transcript;
   delete payload.resume_session_id;
   payload.truncate_before_message_id = String(beforeMessageId);
