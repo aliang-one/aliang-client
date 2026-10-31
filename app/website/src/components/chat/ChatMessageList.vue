@@ -82,7 +82,6 @@
             v-for="card in optionCards"
             :key="card.key"
             :card="card"
-            :now-tick="nowTick"
             @respond="(payload) => emit('option-respond', card, payload)"
           />
         </template>

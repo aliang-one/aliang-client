@@ -20,7 +20,6 @@ function makeCard(overrides = {}) {
     title: '部署方式',
     header: '',
     summary: '请选择',
-    version: 2,
     options: [
       { id: 'a', label: '方案 A', description: '蓝绿', response: '', previews: [] },
       { id: 'b', label: '方案 B', description: '直接替换', response: '', previews: [] },
@@ -124,5 +123,37 @@ describe('ChatOptionCard', () => {
     await nextTick();
     m.el.querySelector('[data-testid="chat-option-submit"]').click();
     expect(m.events).toEqual([{ selected: ['a'], customText: '' }]);
+  });
+
+  it('previews 折叠块是选项行兄弟而非 button 后代，开合预览不翻转选中态', async () => {
+    const card = reactive(makeCard({
+      options: [
+        { id: 'a', label: '方案 A', description: '', response: '', previews: ['api: GET /v1/deploy'] },
+      ],
+    }));
+    const m = await mountVisible(card);
+    const details = m.el.querySelector('details');
+    expect(details).toBeTruthy();
+    expect(details.textContent).toContain(t('chat_optionPreview'));
+    // HTML 内容模型：button 禁交互后代，details 必须在按钮外
+    expect(m.el.querySelector('button details')).toBeNull();
+    // 开合预览（summary 点击）不顺带翻转选项选中态
+    m.el.querySelector('[role="radio"]').click();
+    await nextTick();
+    details.querySelector('summary').click();
+    await nextTick();
+    expect(m.el.querySelector('[role="radio"]').getAttribute('aria-checked')).toBe('true');
+  });
+
+  it('answeredSummary 分隔符 locale 中立（逗号拼接 + 自定义补充）', async () => {
+    const card = reactive(makeCard({
+      multi: true,
+      status: 'answered',
+      selected: ['a', 'b'],
+      customText: '补充灰度',
+    }));
+    const m = await mountVisible(card);
+    expect(m.el.textContent).toContain('方案 A, 方案 B — 补充灰度');
+    expect(m.el.textContent).not.toContain('、');
   });
 });

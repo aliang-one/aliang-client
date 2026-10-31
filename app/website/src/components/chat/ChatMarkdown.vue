@@ -30,7 +30,13 @@
           v-for="opt in blockOptions(block)"
           :key="opt.id"
           class="break-words"
-        >• {{ opt.label }}</li>
+        >
+          • {{ opt.label }}
+          <span
+            v-if="opt.description"
+            class="mt-0.5 block text-[11px] text-slate-400 dark:text-slate-500"
+          >{{ opt.description }}</span>
+        </li>
       </ul>
       <p class="mt-1 text-slate-400 dark:text-slate-500">{{ t('chat_optionStaticHint') }}</p>
     </div>
@@ -103,8 +109,9 @@ function blockTitle(block) {
 }
 
 // 只读选项列表：extract 已保证 options 非空数组，但元素形态不保证——
-// 逐项取 id/label 字符串化，无 label 的行跳过（与后端 normalize 同口径的
-// 容错，坏行不炸卡）。
+// 逐项取 id/label/description 字符串化，无 label 的行跳过（与后端
+// normalize 同口径的容错，坏行不炸卡）；description 透传渲染（缺失为空串，
+// 模板不渲染副行）。
 function blockOptions(block) {
   const list = Array.isArray(block?.options) ? block.options : [];
   const out = [];
@@ -112,7 +119,13 @@ function blockOptions(block) {
     if (!item || typeof item !== 'object') continue;
     const id = String(item.id ?? '');
     const label = String(item.label ?? '').trim();
-    if (id && label) out.push({ id, label });
+    if (id && label) {
+      out.push({
+        id,
+        label,
+        description: typeof item.description === 'string' ? item.description : '',
+      });
+    }
   }
   return out;
 }

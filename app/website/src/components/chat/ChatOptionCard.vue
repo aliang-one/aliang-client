@@ -43,44 +43,47 @@
       class="mt-1.5 whitespace-pre-wrap text-xs text-sky-800 dark:text-sky-200"
     >{{ card.summary }}</p>
     <div class="mt-2 space-y-1.5">
-      <button
-        v-for="opt in card.options"
-        :key="opt.id"
-        type="button"
-        :role="card.multi ? 'checkbox' : 'radio'"
-        :aria-checked="isSelected(opt.id) ? 'true' : 'false'"
-        class="flex w-full min-h-[40px] items-start gap-2 rounded-xl border px-3 py-2 text-left transition disabled:cursor-not-allowed disabled:opacity-70 md:min-h-0"
-        :class="isSelected(opt.id)
-          ? 'border-primary bg-primary/10'
-          : 'border-slate-200 bg-white hover:border-primary/50 dark:border-slate-700 dark:bg-slate-900'"
-        :disabled="card.status === 'sending'"
-        @click="toggle(opt.id)"
-      >
-        <span class="material-symbols-outlined mt-0.5 shrink-0 text-[16px] leading-none text-primary">
-          {{ isSelected(opt.id) ? (card.multi ? 'check_box' : 'radio_button_checked') : (card.multi ? 'check_box_outline_blank' : 'radio_button_unchecked') }}
-        </span>
-        <span class="min-w-0">
-          <span class="block font-medium">{{ opt.label }}</span>
-          <span
-            v-if="opt.description"
-            class="mt-0.5 block text-xs text-slate-500 dark:text-slate-400"
-          >{{ opt.description }}</span>
-          <!-- previews 折叠块：details 自带开关语义，click.stop 防止开合预览
-               顺带翻转选项选中态。 -->
-          <details
-            v-if="opt.previews && opt.previews.length"
-            class="mt-1"
+      <div v-for="opt in card.options" :key="opt.id">
+        <button
+          type="button"
+          :role="card.multi ? 'checkbox' : 'radio'"
+          :aria-checked="isSelected(opt.id) ? 'true' : 'false'"
+          class="flex w-full min-h-[40px] items-start gap-2 rounded-xl border px-3 py-2 text-left transition disabled:cursor-not-allowed disabled:opacity-70 md:min-h-0"
+          :class="isSelected(opt.id)
+            ? 'border-primary bg-primary/10'
+            : 'border-slate-200 bg-white hover:border-primary/50 dark:border-slate-700 dark:bg-slate-900'"
+          :disabled="card.status === 'sending'"
+          @click="toggle(opt.id)"
+        >
+          <span class="material-symbols-outlined mt-0.5 shrink-0 text-[16px] leading-none text-primary">
+            {{ isSelected(opt.id) ? (card.multi ? 'check_box' : 'radio_button_checked') : (card.multi ? 'check_box_outline_blank' : 'radio_button_unchecked') }}
+          </span>
+          <span class="min-w-0">
+            <span class="block font-medium">{{ opt.label }}</span>
+            <span
+              v-if="opt.description"
+              class="mt-0.5 block text-xs text-slate-500 dark:text-slate-400"
+            >{{ opt.description }}</span>
+          </span>
+        </button>
+        <!-- previews 折叠块：button 的内容模型禁止交互后代（details 不可为
+             button 子孙），故移为选项行的兄弟元素（行下方展开）。click.stop
+             保留在 summary 上，防止开合预览的点击向外冒泡。 -->
+        <details
+          v-if="opt.previews && opt.previews.length"
+          class="px-3"
+        >
+          <summary
+            class="mt-1 cursor-pointer text-[11px] text-slate-400 underline underline-offset-2"
             @click.stop
-          >
-            <summary class="cursor-pointer text-[11px] text-slate-400 underline underline-offset-2">{{ t('chat_optionPreview') }}</summary>
-            <pre
-              v-for="(pv, pi) in opt.previews"
-              :key="pi"
-              class="mt-1 max-h-40 overflow-auto rounded-lg bg-slate-950 px-3 py-2 font-mono text-xs text-slate-100"
-            >{{ pv }}</pre>
-          </details>
-        </span>
-      </button>
+          >{{ t('chat_optionPreview') }}</summary>
+          <pre
+            v-for="(pv, pi) in opt.previews"
+            :key="pi"
+            class="mt-1 max-h-40 overflow-auto rounded-lg bg-slate-950 px-3 py-2 font-mono text-xs text-slate-100"
+          >{{ pv }}</pre>
+        </details>
+      </div>
     </div>
     <div v-if="card.allowCustom" class="mt-2">
       <textarea
@@ -119,8 +122,6 @@ import { useI18n } from '../../i18n';
 // 发帧并在成功后置 card.status='answered'（终态渲染由状态驱动）。
 const props = defineProps({
   card: { type: Object, required: true },
-  // 时钟节拍（与审批卡 prop 面对齐预留；当前卡无倒计时字段，暂不消费）。
-  nowTick: { type: Number, default: 0 },
 });
 
 const emit = defineEmits(['respond']);
@@ -172,12 +173,13 @@ watch(
   },
 );
 
-// 终态摘要：选中项 label（缺 label 退 id）拼接 + 自定义补充。
+// 终态摘要：选中项 label（缺 label 退 id）拼接 + 自定义补充。分隔符取
+// locale 中立的 ', '（CJK 顿号/分号在 en 界面下突兀，且无对应 i18n 键）。
 const answeredSummary = computed(() => {
   const labels = (props.card.selected || []).map((id) =>
     props.card.options.find(o => o.id === id)?.label || id,
   );
   const custom = (props.card.customText || '').trim();
-  return custom ? `${labels.join('、')}；${custom}` : labels.join('、');
+  return custom ? `${labels.join(', ')} — ${custom}` : labels.join(', ');
 });
 </script>

@@ -119,6 +119,10 @@ export function useAliangChat() {
   let aiSocket = null;
   let aiSocketPromise = null;
   const handledApprovalIds = new Set();
+  // 作废/已作答的方案卡键位（镜像 handledApprovalIds 防御）：迟到重投的
+  // ai.option.request 命中即弃，防已答卡被复活成 pending 邀请重复作答
+  // （后端对二次作答本就静默忽略，这里保 UX 一致）。
+  const handledOptionIds = new Set();
 
   const activeConversation = computed(() =>
     conversations.value.find(c => c.id === activeId.value) || null
@@ -1148,6 +1152,8 @@ export function useAliangChat() {
     if (!optionId || !choices.length) return;
     const sessionId = e.session_id || conv.aiSessionId || '';
     const key = optionKeyFromValues(sessionId, optionId);
+    // 镜像审批族防御：已作答/已作废键位的迟到重投帧直接丢弃（不复活卡）。
+    if (handledOptionIds.has(key)) return;
     const cards = ensureOptionCards(conv);
     const existing = cards.find(c => c.key === key);
     const next = {
@@ -1159,11 +1165,11 @@ export function useAliangChat() {
       title: e.title || existing?.title || '',
       header: e.header || existing?.header || '',
       summary: e.summary || existing?.summary || '',
-      version: typeof e.v === 'number' ? e.v : (existing?.version || 0),
       options: choices,
       allowCustom: !!e.allow_custom,
       multi: !!e.multi,
-      // 同 key 新请求（新 run 重发方案）整体复位：旧终态/旧选中不作数。
+      // 同 key 新请求（新 run 重发方案）整体复位：旧选中/旧错误不作数。
+      // 已作答（answered）键位已被 handledOptionIds 封死，进不了这里。
       status: 'pending',
       selected: [],
       customText: '',
@@ -1203,6 +1209,9 @@ export function useAliangChat() {
       card.selected = picked;
       card.customText = custom;
       card.updatedAt = now();
+      // 作答落定即封死键位（镜像 markApprovalHandled）：此后同 key 的迟到
+      // 重投 request 帧不再复活本卡（后端对二次作答静默忽略）。
+      handledOptionIds.add(card.key);
     } catch (_) {
       card.status = 'pending';
       card.error = t('chat_optionSendFailed');
@@ -1729,8 +1738,14 @@ export function useAliangChat() {
           const hit = ids.length
             ? ids.includes(card.optionId) && card.key === optionKeyFromValues(sid, card.optionId)
             : card.sessionId === sid;
-          if (hit) removed++;
-          else kept.push(card);
+          if (hit) {
+            // 确认在场被移除的卡才封键位（与精确匹配同域；空 option_ids 兜底
+            // 分支同样经 hit 走到这里）——防作废后迟到重投帧复活。
+            handledOptionIds.add(card.key);
+            removed++;
+          } else {
+            kept.push(card);
+          }
         }
         if (removed) {
           conv.optionCards = kept;
