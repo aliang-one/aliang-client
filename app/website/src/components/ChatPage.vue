@@ -97,7 +97,7 @@
 // 帧路由/审批/steer/三源清单/持久化），渲染拆在 chat/ 组件树（侧栏、顶栏、
 // 设置条、消息列表、气泡、审批卡、输入区）。本文件只做组件接线。
 import { computed, onMounted, onUnmounted } from 'vue';
-import { useAliangChat } from '../composables/useAliangChat';
+import { isComposingEvent, useAliangChat } from '../composables/useAliangChat';
 import ChatSidebar from './chat/ChatSidebar.vue';
 import ChatHeader from './chat/ChatHeader.vue';
 import ChatSettingsBar from './chat/ChatSettingsBar.vue';
@@ -189,8 +189,18 @@ function onRecallConfirm() {
   sendRecall(activeConversation.value);
 }
 
+// 文档级 Esc 分流：撤回编辑态（chat-recall-banner 在场）优先消费——取消编辑
+// 态并恢复进入前草稿（spec §A「退出：banner 取消按钮或 Esc」），不关页。分层
+// 消费：Esc 先过 Composer textarea 的 keydown 再冒泡到这里——组合期被
+// isComposingEvent 守卫放行（归属输入法，这里同口径不消费）；slash 弹层分支
+// 在编辑态被禁用（onSlashInput 守卫）不会并发；非编辑态仍走 close() 关页。
 function handleKeydown(e) {
   if (e.key === 'Escape') {
+    if (recallActive.value) {
+      if (isComposingEvent(e)) return;
+      cancelRecall();
+      return;
+    }
     close();
   }
 }

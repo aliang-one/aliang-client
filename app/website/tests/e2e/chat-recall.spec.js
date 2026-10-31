@@ -288,3 +288,32 @@ test('场景G 连续两次撤回：首次成功后入口复活，第二条 trunc
   await expect(page.locator(LIST).getByText('第一句', { exact: true })).toBeVisible();
   await expect(page.getByTestId('chat-recall-banner')).toHaveCount(0);
 });
+
+test('场景H 撤回编辑态 Esc：恢复草稿退出编辑态，聊天页不关、无新 create 帧（spec §A）', async ({ page }) => {
+  await openChat(page);
+  await establishCreatedSession(page, '第一句');
+  const input = page.getByPlaceholder(INPUT);
+  await input.fill('我的草稿'); // 进入编辑态前的草稿
+  const { bubble, button } = recallButtonOf(page, '第一句');
+  await bubble.hover();
+  await expect(button).toBeVisible();
+  await button.click();
+  await expect(page.getByTestId('chat-recall-banner')).toBeVisible();
+  await expect(input).toHaveValue('第一句'); // 回填原文
+
+  const createsBefore = await page.evaluate(() =>
+    window.__aiFrames.filter((f) => f.type === 'ai.session.create').length);
+
+  // Esc（焦点在 textarea，经 Composer keydown 冒泡到文档级分流）→ 取消编辑态
+  await page.keyboard.press('Escape');
+
+  await expect(page.getByTestId('chat-recall-banner')).toHaveCount(0); // banner 退场
+  await expect(input).toHaveValue('我的草稿'); // 恢复进入前草稿
+  // 聊天页仍打开（修复前此处 Esc 会走 close() 整页关闭）
+  await expect(page.getByTestId('chat-settings-directory')).toBeVisible();
+  await expect(page.getByPlaceholder(INPUT)).toBeVisible();
+  // 无新 create 帧
+  const createsAfter = await page.evaluate(() =>
+    window.__aiFrames.filter((f) => f.type === 'ai.session.create').length);
+  expect(createsAfter).toBe(createsBefore);
+});

@@ -34,10 +34,9 @@
           <!-- 统一时间线（Task 11）：messages（权威流）与 steerItems（瞬态插话）
                按 ts 升序归并渲染——插话以 user 气泡形态出现在它被发出的时间点，
                不再是消息流外的独立区块。归并纯渲染层：数据结构零变化，steer
-               仍不写 messages、不进持久化。key 现状：messages 一律 'm-'+idx 兜底
-               （messageId 分支为 Task 13 预留——落地后本地/设备壳消息将带 id）；
-               Task 13 撤回 splice 前需确认稳定 id 已引入，否则 idx 键会让后续
-               气泡错位复用。 -->
+               仍不写 messages、不进持久化。key：messageId 分支已随 Task 13 落地
+               （本地发送/撤回重发/设备壳转录行均带 id），'m-'+idx 仅兜底无 id 的
+               存量旧消息。 -->
           <template v-for="(item, idx) in timeline" :key="item.messageId || 'm-' + idx">
             <ChatMessageBubble
               v-if="item.type === 'message'"
