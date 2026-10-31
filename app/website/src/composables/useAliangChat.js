@@ -1184,9 +1184,10 @@ export function useAliangChat() {
   function startRecall(msg) {
     const conv = activeConversation.value;
     if (!conv || recalling.value) return;
-    // 非 running 会话的在途发送（create 确认门窗口）不进编辑态；running 会话
-    // 的 sending 常驻为真（ai.run.started 不落 sending=false，终态才落），
-    // 撤回链与 steer 一样必须在 running 下可用——并发由 recalling 单守。
+    // 拦截 idle 发送窗：sending 中且会话非 running（占位符未落/已撤的窗口）。
+    // 注意常规发送的 create 确认门窗口**不**在此列——占位符在等 ack 前已推
+    // （running=true），该窗口本守卫不拦；running 态撤回必须可用（running 中
+    // 发送/撤回并存是常态），故对 running 放行——并发由 recalling 单守。
     if (sending.value && !isConversationRunning(conv)) return;
     if (!canRecall(msg)) return;
     if (!sliceMessagesBefore(conv.messages, msg.messageId)) return;
@@ -1225,6 +1226,11 @@ export function useAliangChat() {
   async function sendRecall(conv) {
     const st = recallState.value;
     if (!st || !conv || conv.id !== st.convId || recalling.value) return;
+    // 设备壳撤回禁用（spec §6）：壳续聊 create 落新建的 local-* journal，而壳
+    // 气泡锚点 id 来自原 entry.id journal——truncate 未命中是 no-op 非报错，
+    // UI 假成功、上下文静默分叉。渲染层（ChatMessageList recallEnabled）已收掉
+    // 入口，这里兜底防绕过；待服务端跨 journal 锚点解析后解锁。
+    if (conv.deviceSession) return;
     const edited = inputText.value.trim();
     if (!edited) return; // 空文本不允许重发（与 sendMessage trim 守卫同口径）
     if (!sliceMessagesBefore(conv.messages, st.targetMessageId)) {
@@ -1388,7 +1394,10 @@ export function useAliangChat() {
     // 撤回链的会话终态结算（Task 13）：done/error 都是回合终态，在通用会话
     // 归属判定之前结算——壳路由/活跃兜底的归属差异不让等待方空等超时。
     if ((e.type === 'ai.done' || e.type === 'ai.error') && e.session_id) {
-      const pendingTerminal = pendingTerminals.get(e.session_id);
+      // 键归一与 set 侧对称（waitForSessionTerminal 的 String()）：WS 帧 JSON
+      // 反序列化后 session_id 理应为 string，但历史帧/桩注入可能带数字——
+      // get 侧不归一会静默 miss，等待方空等超时。
+      const pendingTerminal = pendingTerminals.get(String(e.session_id));
       if (pendingTerminal) pendingTerminal('terminal');
     }
 

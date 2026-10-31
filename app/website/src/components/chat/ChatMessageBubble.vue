@@ -24,8 +24,9 @@
         <span v-else-if="msg.role === 'assistant' && msg.status === 'error'" class="font-semibold text-rose-500">!</span>
       </div>
       <!-- user 气泡：品牌绿实底、右对齐。group 包装层承载 hover 操作条
-           （Task 13）：复制 + 撤回重发（撤回键仅 canRecall 命中——user 角色 +
-           有 messageId + provider=agentcore——才渲染，存量旧消息只有复制）。 -->
+           （Task 13）：复制 + 撤回重发（撤回键需 canRecall 命中——user 角色 +
+           有 messageId + provider=agentcore——且非设备壳会话，见撤回键处
+           注释；存量旧消息/壳会话只有复制）。 -->
       <div v-if="msg.role === 'user'" class="group relative ml-auto w-fit max-w-[85%]">
         <div class="whitespace-pre-wrap break-words rounded-2xl bg-primary px-4 py-2.5 text-sm text-white shadow-sm">{{ msg.content }}</div>
         <div
@@ -41,8 +42,13 @@
           >
             <span class="material-symbols-outlined text-[16px] leading-none">content_copy</span>
           </button>
+          <!-- 撤回键门控（spec §6 壳禁用决策）：canRecall 纯函数语义不动（user +
+               messageId + provider=agentcore），设备壳会话在此渲染层整体收掉——
+               壳续聊 journal 键分叉（local-* vs 原 entry.id），锚点 no-op 致上下文
+               静默分叉，待服务端跨 journal 解析后解锁。recallEnabled 由
+               ChatMessageList 按 !conversation.deviceSession 下传。 -->
           <button
-            v-if="canRecall(msg)"
+            v-if="canRecall(msg) && recallEnabled"
             type="button"
             data-testid="chat-recall-button"
             :title="t('chat_recallButton')"
@@ -102,6 +108,8 @@ import ChatMarkdown from './ChatMarkdown.vue';
 const props = defineProps({
   msg: { type: Object, required: true },
   nowTick: { type: Number, default: 0 },
+  // 撤回入口可用门：设备壳会话（spec §6）整体禁用，由 ChatMessageList 计算下传。
+  recallEnabled: { type: Boolean, default: true },
 });
 
 const emit = defineEmits(['recall']);

@@ -13,6 +13,9 @@ import { establishCreatedSession, openChat as openChatBase, pushFrame } from './
 // agentcore 草稿 + 清单 isAliangCodeSession 只收 agentcore），claudecode 会话
 // 无法在此窗口构造——canRecall 的 provider 门控由 chatRecall.test.js 单测钉死，
 // e2e 验证同一 v-if 渲染分支的另一失配条件（存量无 messageId 的旧消息）。
+// 场景 F 门控说明：设备壳会话撤回整体禁用（spec §6 定案）——壳气泡的
+// messageId/provider 齐备（canRecall 本会通过），门控来自渲染层的壳禁用
+// （recallEnabled=!?deviceSession），与 D 的 canRecall 失配是不同分支。
 
 // 消息列表容器（页面上唯一 max-w-3xl 容器）：所有消息文本断言统一 scope 到
 // 这里——会话标题（侧栏/顶栏）会取首条消息切片，裸 getByText 会撞严格模式。
@@ -172,6 +175,34 @@ test('场景D 门控：不可撤回的 user 气泡 hover 菜单只有复制键',
   await bubble.hover();
   await expect(bubble.locator('..').getByTestId('chat-copy-button')).toBeVisible(); // 只有复制
   await expect(button).toHaveCount(0); // 撤回键不渲染
+});
+
+test('场景F 设备壳会话撤回整体禁用：带 id 的转录行 hover 只有复制键（spec §6）', async ({ page }) => {
+  // 根因：壳续聊 create 落新建 local-* journal，而壳气泡锚点 id 来自原
+  // entry.id journal——truncate 未命中是 no-op 非报错（UI 假成功、上下文静默
+  // 分叉），spec §6 定案壳撤回整体禁用。转录行带 id + provider=agentcore
+  // （canRecall 两条件齐备），钉死门控来自壳禁用而非 canRecall 失配。
+  const NOW_ISO = new Date().toISOString();
+  const sessions = [
+    { id: 'conv-shell', provider: 'agentcore', title: '手机壳会话', status: 'idle', origin: 'phone', project_path: '/p/shell', updated_at: NOW_ISO },
+  ];
+  await openChatBase(page, {
+    sessions,
+    newSession: false,
+    detail: {
+      transcript: [
+        { id: 'shell-m1', role: 'user', content: '壳里用户消息', timestamp: NOW_ISO, index: 1 },
+        { id: 'shell-m2', role: 'assistant', content: '壳里助手回复', timestamp: NOW_ISO, index: 2 },
+      ],
+    },
+  });
+  await page.getByText('手机壳会话').click(); // 打开设备壳（详情转录装载）
+  await expect(page.locator(LIST).getByText('壳里用户消息')).toBeVisible();
+
+  const { bubble, button } = recallButtonOf(page, '壳里用户消息');
+  await bubble.hover();
+  await expect(bubble.locator('..').getByTestId('chat-copy-button')).toBeVisible(); // 复制键在
+  await expect(button).toHaveCount(0); // 撤回键不渲染（壳禁用，与场景D不同分支）
 });
 
 test('场景E stop 超时中止：只有 ai.stop、无 truncate create，编辑态不丢', async ({ page }) => {

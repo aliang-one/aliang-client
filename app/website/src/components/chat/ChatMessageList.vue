@@ -43,6 +43,7 @@
               v-if="item.type === 'message'"
               :msg="item"
               :now-tick="nowTick"
+              :recall-enabled="recallEnabled"
               @recall="emit('recall', $event)"
             />
             <!-- 插话气泡（原 Task 4 轻量条融入时间线）：⚡ 徽 + 插话标签 +
@@ -131,6 +132,12 @@ const { t } = useI18n();
 // 统一渲染时间线（Task 11）：messages + steerItems 按 ts 归并、打 type 标。
 // 归并函数单测已覆盖（chatTimeline.test.js），组件层不加重复单测。
 const timeline = computed(() => mergeTimeline(props.activeMessages, props.steerItems));
+
+// 撤回可用门（spec §6 定案）：设备壳会话整体禁用撤回——壳续聊 create 落在
+// 新建的 local-* journal，而壳气泡锚点 id 来自原 entry.id journal，truncate
+// 锚点未命中是 no-op 非报错 → UI 假成功、上下文静默分叉；待服务端跨 journal
+// 锚点解析后解锁（messageId 接线保留，canRecall 纯函数不动，门控收在渲染层）。
+const recallEnabled = computed(() => !props.conversation?.deviceSession);
 
 // 未读徽标：非贴底期间到达的消息数（user/assistant 气泡 + 插话条 + 审批卡）。
 // 回底（滚动事件判定贴底，或点浮钮）即清零。
