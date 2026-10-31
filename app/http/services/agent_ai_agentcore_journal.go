@@ -484,7 +484,9 @@ func (j *agentCoreJournal) truncateBefore(sessionID, beforeMessageID string) (bo
 			break
 		}
 	}
+	kept := 0
 	if firstKeep >= 0 {
+		kept = target - firstKeep // 首个 msg 行之前的孤儿非 msg 行不计入保留区间
 		for i := firstKeep; i < target; i++ {
 			buf.Write(lines[i])
 			buf.WriteByte('\n')
@@ -498,6 +500,6 @@ func (j *agentCoreJournal) truncateBefore(sessionID, beforeMessageID string) (bo
 		_ = os.Remove(tmp)
 		return false, err
 	}
-	logger.Info(fmt.Sprintf("agentcore-journal: truncated session=%s before=%s kept=%d/%d lines", sessionID, beforeMessageID, target-start, len(lines)-start))
+	logger.Info(fmt.Sprintf("agentcore-journal: truncated session=%s before=%s kept=%d/%d lines", sessionID, beforeMessageID, kept, len(lines)-start))
 	return true, nil
 }

@@ -1720,6 +1720,42 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 		}}, history...)
 	}
 
+	// 撤回重发（spec §A.2）：截断 journal + history 全文重建（帧不带 transcript）。
+	// 时序：①活跃拒绝先于任何 journal 写；②不在内存 ⇒ 无活跃 run，前置检查
+	// 覆盖 create() 双分支；③读写失败绝不静默空 history，幂等重试即收敛。
+	// 仅 agentcore 生效——claude/codex 有各自的原生转录，journal 无锚点。
+	truncateBeforeID := strings.TrimSpace(remoteString(msg, "truncate_before_message_id"))
+	truncateApplied := false
+	if truncateBeforeID != "" && provider == "agentcore" {
+		m.mu.Lock()
+		existingPeek := m.sessions[sessionID]
+		busy := existingPeek != nil && existingPeek.cancel != nil
+		m.mu.Unlock()
+		if busy {
+			// cancel==nil ⇒ runAgentCore defer LIFO 已落 end 行（清位锚，勿重排）。
+			_ = writeJSON(agentAIErrorPayload(sessionID, "", errors.New("ai.session.create truncate rejected: run active")))
+			return
+		}
+		if m.coreJournal == nil {
+			_ = writeJSON(agentAIErrorPayload(sessionID, "", errors.New("ai.session.create truncate unavailable: journal disabled")))
+			return
+		}
+		applied, err := m.coreJournal.truncateBefore(sessionID, truncateBeforeID)
+		if err != nil {
+			_ = writeJSON(agentAIErrorPayload(sessionID, "", fmt.Errorf("ai.session.create truncate failed: %w", err)))
+			return
+		}
+		truncateApplied = applied
+		hist, _, rerr := readAgentCoreJournalHistoryFrom(m.coreJournal.dir, sessionID)
+		if rerr != nil {
+			// 截断成功后文件必在；ErrNotExist 只会出现在「从未落过 journal」的
+			// no-op 截断上——同样拒绝，绝不静默回退空 history。
+			_ = writeJSON(agentAIErrorPayload(sessionID, "", fmt.Errorf("ai.session.create rebuild failed: %w", rerr)))
+			return
+		}
+		history = hist // 空 journal=空 history:允许空覆盖（撤回到空）
+	}
+
 	m.mu.Lock()
 	if existing := m.sessions[sessionID]; existing != nil {
 		existing.mode = mode
@@ -1742,14 +1778,21 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 			existing.claudePolicy = cloneAgentAIClaudeRemotePolicy(claudePolicy)
 			existing.claudeCaps = agentAIClaudeCapabilities{}
 		}
-		if len(history) > 0 {
+		if truncateBeforeID != "" && provider == "agentcore" {
+			// 撤回路径:允许空覆盖（重建结果哪怕是空也必须生效）。
+			existing.history = trimAgentAIHistoryForSession(existing, history)
+		} else if len(history) > 0 {
 			existing.history = trimAgentAIHistoryForSession(existing, history)
 		}
 		if v := strings.TrimSpace(remoteString(msg, agentAIOriginSocketField)); v != "" {
 			existing.originSocket = v
 		}
 		m.mu.Unlock()
-		_ = writeJSON(agentAISessionCreatedPayload(existing))
+		payload := agentAISessionCreatedPayload(existing)
+		if truncateBeforeID != "" {
+			payload["truncate_applied"] = truncateApplied
+		}
+		_ = writeJSON(payload)
 		return
 	}
 	// NOTE: no count cap here. The real turn runs on ai.message, whose lazy-create
@@ -1779,7 +1822,11 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 	m.registerAISessionLocked(session)
 	m.mu.Unlock()
 
-	_ = writeJSON(agentAISessionCreatedPayload(session))
+	payload := agentAISessionCreatedPayload(session)
+	if truncateBeforeID != "" {
+		payload["truncate_applied"] = truncateApplied
+	}
+	_ = writeJSON(payload)
 }
 
 func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerminalWriter) {

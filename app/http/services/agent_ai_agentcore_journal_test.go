@@ -400,3 +400,40 @@ func TestJournalTruncateBeforeSteerRowFollowsPosition(t *testing.T) {
 		t.Fatalf("steer row inside kept interval must survive: %+v", hist)
 	}
 }
+
+// 无头文件（首行即 msg 行，缺 session 头）：truncate 仍按位置语义工作——
+// 首行既可作保留前缀，也可作截断目标（不造头，读侧本就容忍无头）。
+func TestJournalTruncateBeforeHeadlessFile(t *testing.T) {
+	j := newAgentCoreJournal(t.TempDir())
+	const sid = "s-trunc-6"
+	raw := `{"kind":"msg","role":"user","message_id":"u1","text":"第一问","ts":"ts"}` + "\n" +
+		`{"kind":"msg","role":"assistant","message_id":"a1","text":"第一答","ts":"ts"}` + "\n" +
+		`{"kind":"msg","role":"user","message_id":"u2","text":"第二问","ts":"ts"}` + "\n"
+	if err := os.WriteFile(filepath.Join(j.dir, agentCoreJournalFileName(sid)), []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// 首行作保留前缀:truncate u2 → 保留 u1+a1,结果仍无头。
+	if _, err := j.truncateBefore(sid, "u2"); err != nil {
+		t.Fatal(err)
+	}
+	hist, head, err := readAgentCoreJournalHistoryFrom(j.dir, sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hist) != 2 || hist[0].MessageID != "u1" || hist[1].MessageID != "a1" {
+		t.Fatalf("headless keep-prefix: %+v", hist)
+	}
+	if head.projectPath != "" {
+		t.Fatalf("headless file must not gain a session header: %+v", head)
+	}
+
+	// 首行作截断目标:truncate u1 → 整文件清空（连头都没有,历史为空）。
+	if _, err := j.truncateBefore(sid, "u1"); err != nil {
+		t.Fatal(err)
+	}
+	hist, _, _ = readAgentCoreJournalHistoryFrom(j.dir, sid)
+	if len(hist) != 0 {
+		t.Fatalf("headless first-line-target must empty the file: %+v", hist)
+	}
+}

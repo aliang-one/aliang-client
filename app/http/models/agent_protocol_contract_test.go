@@ -61,6 +61,38 @@ func TestContractCrossDeviceSessionUnifyFrames(t *testing.T) {
 	}
 }
 
+// 2026-10-31 撤回重发：create 侧 truncate_before_message_id 与回显
+// truncate_applied 必须双双登记进契约表（表对外下发，漏登=前端拿不到契约）。
+func TestContractTruncateRecallFields(t *testing.T) {
+	c := DefaultAgentProtocolContract()
+	create := findProtocolEvent(c.WebSocket.ServerSends, AgentEventAISessionCreate)
+	if create == nil {
+		t.Fatalf("契约表缺 ai.session.create")
+	}
+	found := false
+	for _, f := range create.Optional {
+		if f == "truncate_before_message_id" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("ai.session.create Optional 缺 truncate_before_message_id")
+	}
+	created := findProtocolEvent(c.WebSocket.ClientSends, AgentEventAISessionCreated)
+	if created == nil {
+		t.Fatalf("契约表缺 ai.session.created")
+	}
+	found = false
+	for _, f := range created.Optional {
+		if f == "truncate_applied" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("ai.session.created Optional 缺 truncate_applied")
+	}
+}
+
 func findProtocolEvent(events []AgentProtocolEvent, typ string) *AgentProtocolEvent {
 	for i := range events {
 		if events[i].Type == typ {
