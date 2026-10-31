@@ -1290,6 +1290,11 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 	// 10s 超时/个、条目上限 24——最坏给 run 起跑加约 4 分钟。关停已解耦，
 	// 建连未并行是 v1 取舍（spec §5 未承诺并行）。
 	raws := agentCoreMCPRawServersIn(agentHome())
+	// 全局开关（仪表盘「能力接入 › MCP 全局开关」）：显式关闭时一个 server 都
+	// 不连。默认开启——MCP 是既有能力，不能让没配过的人被这个开关误关。
+	if !config.GetGlobalConfig().EffectiveAgentCoreMCPEnabled() {
+		raws = nil
+	}
 	if run.readOnly {
 		// readOnly run 不注入任何 MCP 工具，对齐 claude 路径同一判据
 		// （agent_ai.go runCLIPass 的 readOnly 分支，withAgentReadOnlyPolicy
@@ -1384,9 +1389,11 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 	defer stopEmit()
 
 	cfg := &agentcore.Config{
-		Client:    kernelClient,
-		Model:     model,
-		System:    agentCoreSystemPromptWithContext(run.projectPath, sessionContext),
+		Client: kernelClient,
+		Model:  model,
+		// 技能清单注入（渐进披露：名称+描述+路径，正文由模型按需 Read）。
+		// 全局关闭或无技能时返回空串，拼接无副作用。
+		System:    agentCoreSystemPromptWithContext(run.projectPath, sessionContext) + m.agentCoreSkillsPromptBlock(run),
 		Tools:     registry,
 		SessionID: kernelSessionID,
 		// 会话的 effort 档位（手机选档 → server 透传 → 这里进请求体）。

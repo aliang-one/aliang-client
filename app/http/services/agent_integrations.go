@@ -31,6 +31,8 @@ import (
 	"strings"
 
 	"aliang.one/nursorgate/app/http/models"
+
+	"aliang.one/nursorgate/processor/config"
 )
 
 // MCP 内核注入态。
@@ -188,11 +190,14 @@ func collectAgentIntegrationSkills(home string) []AgentIntegrationSkill {
 				continue
 			}
 			out = append(out, AgentIntegrationSkill{
-				Name:            name,
-				Scope:           strings.TrimSpace(mapString(entry, "scope")),
-				Description:     strings.TrimSpace(mapString(entry, "description")),
-				Source:          strings.TrimSpace(mapString(entry, "source")),
-				KernelSupported: false, // 内核暂无 skill 能力（见文件头注释）
+				Name:        name,
+				Scope:       strings.TrimSpace(mapString(entry, "scope")),
+				Description: strings.TrimSpace(mapString(entry, "description")),
+				Source:      strings.TrimSpace(mapString(entry, "source")),
+				// 2026-10-31：内核已支持技能注入（agent_ai_agentcore_skills.go），
+				// 这里改为反映全局开关——关掉总闸时仍标「未生效」，与内核实际
+				// 行为一致，避免面板说支持而内核不注入。
+				KernelSupported: config.GetGlobalConfig().EffectiveAgentCoreSkillsEnabled(),
 			})
 		}
 	}

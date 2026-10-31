@@ -126,6 +126,13 @@ export function sessionCreatePayload(conv) {
       .map((n) => (typeof n === 'string' ? n.trim() : ''))
       .filter(Boolean);
   }
+  // 会话级技能开关：与 disabled_mcp_servers 同语义（数组存在即整体下发，
+  // 空数组=显式全部启用，缺键=不动）。
+  if (conv && Array.isArray(conv.disabledSkills)) {
+    payload.disabled_skills = conv.disabledSkills
+      .map((n) => (typeof n === 'string' ? n.trim() : ''))
+      .filter(Boolean);
+  }
   const transcript = deviceTranscriptForCreate(conv);
   if (transcript) {
     payload.transcript = transcript;

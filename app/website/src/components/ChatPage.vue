@@ -300,6 +300,42 @@
           </div>
         </div>
 
+        <!-- 会话级技能开关（与 MCP 同构）。内核 2026-10-31 起真正支持技能注入，
+             这里不再是死控件：取消勾选后该技能不再进 system prompt 清单。 -->
+        <div
+          v-if="moreSettingsOpen"
+          data-testid="chat-settings-skills-panel"
+          class="border-t border-slate-100 px-4 py-2 text-xs dark:border-slate-800"
+        >
+          <div class="flex items-center gap-1.5 text-slate-500 dark:text-slate-400">
+            <span class="material-symbols-outlined text-sm">school</span>
+            <span class="font-semibold">{{ t('chat_settingsSkillsTitle') }}</span>
+            <span class="text-[11px] text-slate-400">{{ t('chat_settingsSkillsHint') }}</span>
+          </div>
+          <p v-if="mcpLoadError" class="mt-1 text-[11px] text-rose-500">{{ mcpLoadError }}</p>
+          <p v-else-if="mcpLoaded && !skills.length" class="mt-1 text-[11px] text-slate-400">
+            {{ t('chat_settingsSkillsEmpty') }}
+          </p>
+          <div v-else-if="skills.length" class="mt-1.5 flex flex-wrap gap-x-4 gap-y-1.5">
+            <label
+              v-for="skill in skills"
+              :key="skill.name"
+              class="flex min-h-[32px] items-center gap-1.5 text-slate-600 dark:text-slate-300"
+              :title="skill.description || ''"
+            >
+              <input
+                type="checkbox"
+                class="h-3.5 w-3.5 rounded border-slate-300 text-primary focus:ring-primary/20 dark:border-slate-600 dark:bg-slate-900"
+                :checked="!disabledSkillSet.has(skill.name)"
+                :disabled="activeRunning"
+                :data-testid="'chat-skill-' + skill.name"
+                @change="toggleSkill(skill.name)"
+              />
+              <span class="truncate">{{ skill.name }}</span>
+            </label>
+          </div>
+        </div>
+
         <!-- 遮罩与浮层是滚动行的兄弟节点（外层容器的直接子级）：不再被裁剪；
              Esc 在浮层上拦截（.stop），不冒泡到文档级 handleKeydown 的 close()。 -->
         <div v-if="directoryPanelOpen" class="fixed inset-0 z-20" @click="directoryPanelOpen = false"></div>
@@ -611,6 +647,7 @@ const contextWindowDraft = ref('');
 // 会话级 MCP 开关：设备侧清单（name 即配置原始键）+ 本会话关掉的集合。
 // 清单只在首次展开面板时拉一次；拉不到就整块不渲染（不制造假开关）。
 const mcpServers = ref([]);
+const skills = ref([]);
 const mcpLoaded = ref(false);
 const mcpLoadError = ref('');
 const createError = ref('');
@@ -975,6 +1012,25 @@ watch(activeId, (nv, ov) => {
   syncBudgetDrafts();
 });
 
+// 本会话已关闭的技能名集合。
+const disabledSkillSet = computed(() => {
+  const list = activeConversation.value?.disabledSkills;
+  return new Set(Array.isArray(list) ? list : []);
+});
+
+// 勾选/取消某个技能：整份「已关闭清单」整体写回（与 MCP 同语义）。
+function toggleSkill(name) {
+  const conv = activeConversation.value;
+  if (!conv || activeRunning.value) return;
+  const key = String(name || '').trim();
+  if (!key) return;
+  const current = Array.isArray(conv.disabledSkills) ? conv.disabledSkills.slice() : [];
+  const idx = current.indexOf(key);
+  if (idx >= 0) current.splice(idx, 1);
+  else current.push(key);
+  applySessionSettings(conv, { disabledSkills: current });
+}
+
 // 本会话已关闭的 MCP server 名集合（渲染复选框勾选态用）。
 const disabledMcpSet = computed(() => {
   const list = activeConversation.value?.disabledMcpServers;
@@ -988,6 +1044,7 @@ async function ensureMcpServersLoaded() {
   try {
     const data = await getAgentIntegrations();
     mcpServers.value = Array.isArray(data?.mcp_servers) ? data.mcp_servers : [];
+    skills.value = Array.isArray(data?.skills) ? data.skills : [];
     mcpLoadError.value = '';
   } catch (_) {
     mcpServers.value = [];
@@ -1186,6 +1243,8 @@ function createConversation() {
     // 上一次的激进值而用户没意识到。
     maxTokens: 0,
     contextWindow: 0,
+    disabledMcpServers: [],
+    disabledSkills: [],
     createdAt: now(),
     updatedAt: now()
   };

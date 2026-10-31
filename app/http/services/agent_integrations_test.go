@@ -139,9 +139,11 @@ func TestCollectAgentIntegrationsSkills(t *testing.T) {
 	if skill.Scope != "user" {
 		t.Fatalf("scope 应为 user，实际 %q", skill.Scope)
 	}
-	// 内核当前无 skill 能力——必须显式标注，不能假装生效。
-	if skill.KernelSupported {
-		t.Fatal("kernel_supported 必须为 false（内核暂无 skill 能力）")
+	// 2026-10-31：内核已支持技能注入（agent_ai_agentcore_skills.go），
+	// kernel_supported 改为反映全局开关。默认开启 ⇒ 应为 true；关掉总闸时
+	// 应为 false。这里用默认配置断言「开着」这一态。
+	if !skill.KernelSupported {
+		t.Fatal("默认（skills_enabled 未配置）时 kernel_supported 应为 true——内核已支持技能注入")
 	}
 }
 

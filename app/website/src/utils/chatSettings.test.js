@@ -131,6 +131,17 @@ describe('sessionCreatePayload', () => {
     expect('disabled_mcp_servers' in junk).toBe(false);
   });
 
+  it('会话级技能开关：与 MCP 同构三态', () => {
+    const bare = sessionCreatePayload({ aiSessionId: 's1' });
+    expect('disabled_skills' in bare).toBe(false);
+    const allOn = sessionCreatePayload({ aiSessionId: 's1', disabledSkills: [] });
+    expect(allOn.disabled_skills).toEqual([]);
+    const some = sessionCreatePayload({ aiSessionId: 's1', disabledSkills: [' pdf ', '', 'docx'] });
+    expect(some.disabled_skills).toEqual(['pdf', 'docx']);
+    const junk = sessionCreatePayload({ aiSessionId: 's1', disabledSkills: 'pdf' });
+    expect('disabled_skills' in junk).toBe(false);
+  });
+
   it('未设置 resume 字段时载荷不含对应键（e2e 断言 create 帧字段集，不得多出空键）', () => {
     const payload = sessionCreatePayload({ aiSessionId: 's1', projectPath: '/w' });
     expect(Object.keys(payload)).not.toContain('resume_session_id');

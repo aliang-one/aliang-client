@@ -327,6 +327,36 @@ func parseAgentAIDisabledMCPServers(msg map[string]interface{}) ([]string, bool)
 	return out, true
 }
 
+// parseAgentAIDisabledSkills 解析会话级技能开关，语义与
+// parseAgentAIDisabledMCPServers 完全一致（缺键=不动、空数组=全部启用）。
+func parseAgentAIDisabledSkills(msg map[string]interface{}) ([]string, bool) {
+	if msg == nil {
+		return nil, false
+	}
+	if _, ok := msg["disabled_skills"]; !ok {
+		return nil, false
+	}
+	return normalizeAgentAINameList(remoteStringSlice(msg, "disabled_skills")), true
+}
+
+// normalizeAgentAINameList 去空白、去重、保序。
+func normalizeAgentAINameList(raw []string) []string {
+	out := make([]string, 0, len(raw))
+	seen := make(map[string]struct{}, len(raw))
+	for _, name := range raw {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if _, dup := seen[name]; dup {
+			continue
+		}
+		seen[name] = struct{}{}
+		out = append(out, name)
+	}
+	return out
+}
+
 // clampAgentAIMaxTokens 归一化客户端下发的输出上限。0/负数表示未设置并
 // 原样保留（区分「旧客户端没发」与「显式选择」）。
 func clampAgentAIMaxTokens(v int) int {
@@ -367,7 +397,10 @@ type agentAISession struct {
 	// disabledMCPServers 是本会话显式关掉的 MCP server 名（配置原始键）。
 	// nil = 未下发（沿用全部启用）；空切片 = 显式「全部启用」。
 	// 只在 agentcore 通道生效（claude/codex 走各自 CLI 的 MCP 配置）。
-	disabledMCPServers      []string
+	disabledMCPServers []string
+	// disabledSkills 是本会话显式关掉的技能名（与 MCP 同构：nil=未下发、
+	// 空切片=显式全部启用）。只在 agentcore 通道生效。
+	disabledSkills          []string
 	resumeSessionID         string
 	reservedNativeSessionID string
 	bindingVersion          int
@@ -498,6 +531,9 @@ type agentAIRun struct {
 	// disabledMCPServers mirrors the session field: MCP server names this run
 	// must NOT inject. nil = all enabled.
 	disabledMCPServers []string
+	// disabledSkills mirrors the session field: skill names this run must NOT
+	// inject. nil = all enabled.
+	disabledSkills []string
 	// claudeDiag 聚合 CLI 通道的逐回合诊断快照（诊断面板数据源）。runCLIPass
 	// 在起 ticker 前挂载；run 按值传递，但指针字段在所有副本里仍指向同一
 	// 聚合器。nil 安全（agentcore / codex 路径不挂）。
@@ -1775,6 +1811,7 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 	maxTokens := clampAgentAIMaxTokens(remoteInt(msg, "max_tokens", 0))
 	// 会话级 MCP 开关：键存在即整体替换（含空数组=全部启用）；键缺失=不动。
 	disabledMCPServers, disabledMCPServersSet := parseAgentAIDisabledMCPServers(msg)
+	disabledSkills, disabledSkillsSet := parseAgentAIDisabledSkills(msg)
 	resumeSessionID := firstNonEmpty(remoteString(msg, "resume_session_id"), remoteString(msg, "source_session_id"))
 	reservedNativeSessionID := strings.TrimSpace(remoteString(msg, "reserved_native_session_id"))
 	bindingVersion := remoteInt(msg, "binding_version", 0)
@@ -1817,6 +1854,9 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 		if disabledMCPServersSet {
 			existing.disabledMCPServers = disabledMCPServers
 		}
+		if disabledSkillsSet {
+			existing.disabledSkills = disabledSkills
+		}
 		existing.resumeSessionID = resumeSessionID
 		existing.reservedNativeSessionID = reservedNativeSessionID
 		existing.bindingVersion = bindingVersion
@@ -1854,6 +1894,7 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 		contextWindow:           contextWindow,
 		maxTokens:               maxTokens,
 		disabledMCPServers:      disabledMCPServers,
+		disabledSkills:          disabledSkills,
 		resumeSessionID:         resumeSessionID,
 		reservedNativeSessionID: reservedNativeSessionID,
 		bindingVersion:          bindingVersion,
@@ -3052,6 +3093,7 @@ func (m *agentAIManager) runUserMessage(session *agentAISession, runID, messageI
 		contextWindow:           session.contextWindow,
 		maxTokens:               session.maxTokens,
 		disabledMCPServers:      session.disabledMCPServers,
+		disabledSkills:          session.disabledSkills,
 		resumeSessionID:         resumeSessionID,
 		reservedNativeSessionID: reservedNativeSessionID,
 		bindingVersion:          session.bindingVersion,

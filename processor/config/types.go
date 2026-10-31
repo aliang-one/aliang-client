@@ -623,6 +623,15 @@ type AgentCoreTuningConfig struct {
 	// (defaultMaxIdenticalToolTurns);上限 50——再大守卫就形同虚设,烧 token
 	// 的空转跑满 50 轮才停,不如直接关掉。
 	MaxIdenticalToolTurns int `json:"max_identical_tool_turns,omitempty"`
+	// MCPEnabled 是 MCP 工具注入的全局开关（仪表盘「能力接入 › MCP 全局开关」）。
+	// 用指针是为了区分三态：nil = 未配置（默认开启，保持既有行为）、
+	// true = 显式开启、false = 显式关闭（内核一个 MCP server 都不连）。
+	// 只作用于 agentcore 内核；claude/codex 走各自 CLI 的 MCP 配置，不受它影响。
+	MCPEnabled *bool `json:"mcp_enabled,omitempty"`
+	// SkillsEnabled 是技能注入的全局开关（仪表盘「能力接入 › 技能全局开关」）。
+	// 同样用指针保留三态：nil = 未配置（默认开启）、true/false 显式。只作用于
+	// agentcore 内核。
+	SkillsEnabled *bool `json:"skills_enabled,omitempty"`
 }
 
 // Validate 保存通道(Config.Validate)调用。0 合法(=未配置,走默认);
@@ -635,6 +644,31 @@ func (c *AgentCoreTuningConfig) Validate() error {
 		return fmt.Errorf("agentcore.max_identical_tool_turns 必须在 [0,50] 内(0=用内核默认), got %d", c.MaxIdenticalToolTurns)
 	}
 	return nil
+}
+
+// EffectiveAgentCoreMCPEnabled 返回 MCP 注入是否开启。
+//
+// 默认开启：MCP 是既有能力，加开关不能把没配过的人的功能关掉。只有显式
+// 写成 false 才关闭。nil（未配置）与 true 等价。
+func (c *Config) EffectiveAgentCoreMCPEnabled() bool {
+	if c == nil || c.Customer == nil || c.Customer.AgentCore == nil {
+		return true
+	}
+	if c.Customer.AgentCore.MCPEnabled == nil {
+		return true
+	}
+	return *c.Customer.AgentCore.MCPEnabled
+}
+
+// EffectiveAgentCoreSkillsEnabled 返回技能注入是否开启。默认开启（同 MCP）。
+func (c *Config) EffectiveAgentCoreSkillsEnabled() bool {
+	if c == nil || c.Customer == nil || c.Customer.AgentCore == nil {
+		return true
+	}
+	if c.Customer.AgentCore.SkillsEnabled == nil {
+		return true
+	}
+	return *c.Customer.AgentCore.SkillsEnabled
 }
 
 // EffectiveAgentCoreMaxIdenticalToolTurns 返回打转守卫阈值;未配置(0/nil/负数)

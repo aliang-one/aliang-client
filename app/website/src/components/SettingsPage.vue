@@ -191,6 +191,24 @@
             </div>
           </div>
           <template v-else>
+            <div class="grid grid-cols-1 items-stretch gap-5 lg:grid-cols-2">
+              <AgentMCPGlobalSettings
+                :config="customerConfig"
+                :loading="isLoadingCustomerConfig"
+                :saving="isSavingCustomerConfig"
+                :error="customerConfigError"
+                :success-message="customerConfigSuccess"
+                @save="saveCustomerConfig"
+              />
+              <AgentSkillsGlobalSettings
+                :config="customerConfig"
+                :loading="isLoadingCustomerConfig"
+                :saving="isSavingCustomerConfig"
+                :error="customerConfigError"
+                :success-message="customerConfigSuccess"
+                @save="saveCustomerConfig"
+              />
+            </div>
             <AgentIntegrationsSettings />
             <CustomEnvSettings
               :config="customerConfig"
@@ -304,6 +322,8 @@ import ModelMappingSettings from './settings/ModelMappingSettings.vue';
 import CustomEnvSettings from './settings/CustomEnvSettings.vue';
 import AgentCoreSettings from './settings/AgentCoreSettings.vue';
 import AppearanceSettings from './settings/AppearanceSettings.vue';
+import AgentMCPGlobalSettings from './settings/AgentMCPGlobalSettings.vue';
+import AgentSkillsGlobalSettings from './settings/AgentSkillsGlobalSettings.vue';
 import SectionHeader from './settings/SectionHeader.vue';
 import { normalizeAgentCoreLLMConfig, applyAgentCoreLLMClearing, normalizeAgentCoreTuning } from '../utils/agentCoreSettings';
 import { useNavigation } from '../composables/useNavigation';
@@ -499,6 +519,8 @@ export default {
     CustomEnvSettings,
     AgentCoreSettings,
     AppearanceSettings,
+    AgentMCPGlobalSettings,
+    AgentSkillsGlobalSettings,
     SectionHeader
   },
   setup() {

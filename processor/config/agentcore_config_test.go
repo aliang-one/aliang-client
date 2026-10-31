@@ -110,3 +110,26 @@ func TestCustomerUnknownKeyAcceptsAgentcore(t *testing.T) {
 		t.Fatal("未知键必须仍被收集")
 	}
 }
+
+// TestEffectiveAgentCoreMCPEnabled：三态语义——nil=默认开启、true=开启、
+// false=关闭。默认必须是 true，否则升级会把存量用户的 MCP 全部静默关掉。
+func TestEffectiveAgentCoreMCPEnabled(t *testing.T) {
+	tru, fals := true, false
+	cases := []struct {
+		name string
+		cfg  *Config
+		want bool
+	}{
+		{"nil config 默认开启", nil, true},
+		{"无 customer 默认开启", &Config{}, true},
+		{"无 agentcore 块默认开启", &Config{Customer: &CustomerConfig{}}, true},
+		{"未设置字段默认开启", &Config{Customer: &CustomerConfig{AgentCore: &AgentCoreTuningConfig{}}}, true},
+		{"显式 true", &Config{Customer: &CustomerConfig{AgentCore: &AgentCoreTuningConfig{MCPEnabled: &tru}}}, true},
+		{"显式 false 关闭", &Config{Customer: &CustomerConfig{AgentCore: &AgentCoreTuningConfig{MCPEnabled: &fals}}}, false},
+	}
+	for _, tc := range cases {
+		if got := tc.cfg.EffectiveAgentCoreMCPEnabled(); got != tc.want {
+			t.Errorf("%s: = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
