@@ -2891,6 +2891,12 @@ func (m *agentAIManager) setCodexSteerControl(sessionID string, runSeq int, cont
 // runUserMessage 在 session 上派发一轮新的 AI run。message()（用户消息）与
 // optionResponse()（用户方案选择续接）共用。调用者须已确认 session 存在且当前未在跑。
 func (m *agentAIManager) runUserMessage(session *agentAISession, runID, messageID, content, provider string, attachments []agentAIAttachment, attachmentAllowedHosts []string, emitter *agentAIRunEmitter, nativeGoal map[string]interface{}) error {
+	// continued-in 重定向（2026-10-30 1dc69343 事故）：resume 目标被 /fork/
+	// continuation 续走（尾部标记且标记后无对话活动）时改指续接会话——否则
+	// TUI 注入会落进不消化的退役身份（消息入队永不 dequeue → 10 分钟零输出
+	// idle_timeout），headless --resume 也挂在幽灵转录上。必须先于 TUI busy
+	// 预检，让预检评估的是重定向后的真实目标。
+	m.redirectAgentAIContinuedSession(session, provider)
 	// Spawn precheck (imported Claude sessions): refuse to --resume a native
 	// session whose interactive TUI is mid-turn — two writers on one native
 	// conversation would interleave transcripts. Earliest abortable point: no

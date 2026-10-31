@@ -1364,3 +1364,221 @@ func TestSteerTUITurnAttachmentRejected(t *testing.T) {
 	case <-time.After(200 * time.Millisecond):
 	}
 }
+
+// TestTUITurnStartWatchNotStarted 锁死事故形态：注入后 transcript 只涨
+// queue-operation/元数据行（没有任何真实对话活动），窗口耗尽必须判「未起跑」。
+// 2026-10-30 1dc69343：旧逻辑对这种形态只能等 10 分钟 idle 看门狗。
+func TestTUITurnStartWatchNotStarted(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "s.jsonl")
+	if err := os.WriteFile(path, []byte(""), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oldInterval := tuiTurnPollInterval
+	tuiTurnPollInterval = 10 * time.Millisecond
+	t.Cleanup(func() { tuiTurnPollInterval = oldInterval })
+	done := chanOfWatch()
+	go func() {
+		outcome, _ := tuiTurnStartWatch(context.Background(), path, 0, 150*time.Millisecond, ownEchoMatcher("继续。"))
+		done <- outcome
+	}()
+	time.Sleep(30 * time.Millisecond)
+	// 注入后 CC 只写入队+元数据（都不是起跑信号）。
+	appendLines := func(lines ...string) {
+		f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, l := range lines {
+			f.WriteString(l + "\n")
+		}
+		f.Close()
+	}
+	b, _ := json.Marshal(map[string]string{"type": "queue-operation", "operation": "enqueue"})
+	appendLines(string(b))
+	b, _ = json.Marshal(map[string]string{"type": "permission-mode", "permissionMode": "bypassPermissions"})
+	appendLines(string(b))
+	if outcome := <-done; outcome != tuiTurnNotStarted {
+		t.Fatalf("只有入队/元数据行时窗口耗尽应判未起跑, got %v", outcome)
+	}
+}
+
+// TestTUITurnStartWatchStarted：user 回显（dequeue 产物）一出现立刻判已起跑。
+func TestTUITurnStartWatchStarted(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "s.jsonl")
+	if err := os.WriteFile(path, []byte(""), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oldInterval := tuiTurnPollInterval
+	tuiTurnPollInterval = 10 * time.Millisecond
+	t.Cleanup(func() { tuiTurnPollInterval = oldInterval })
+	type watchResult struct {
+		outcome tuiTurnStartOutcome
+		echoEnd int64
+	}
+	done := make(chan watchResult, 1)
+	go func() {
+		outcome, echoEnd := tuiTurnStartWatch(context.Background(), path, 0, 10*time.Second, ownEchoMatcher("继续。"))
+		done <- watchResult{outcome: outcome, echoEnd: echoEnd}
+	}()
+	time.Sleep(30 * time.Millisecond)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	user, _ := json.Marshal(map[string]interface{}{
+		"type": "user", "isMeta": false,
+		"message": map[string]interface{}{"role": "user", "content": "继续。"},
+	})
+	f.WriteString(string(user) + "\n")
+	f.Close()
+	select {
+	case result := <-done:
+		if result.outcome != tuiTurnStarted {
+			t.Fatalf("user 回显出现应判已起跑, got %v", result.outcome)
+		}
+		want := int64(len(string(user)) + 1)
+		if result.echoEnd != want {
+			t.Fatalf("echoEnd = %d, want %d（本回合 echo 行之后的偏移）", result.echoEnd, want)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("起跑信号未被识别（超时）")
+	}
+}
+
+// TestTUITurnStartWatchCtxCancel：ctx 取消返回 false（走停止收尾，不误报失败）。
+func TestTUITurnStartWatchCtxCancel(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "s.jsonl")
+	if err := os.WriteFile(path, []byte(""), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oldInterval := tuiTurnPollInterval
+	tuiTurnPollInterval = 10 * time.Millisecond
+	t.Cleanup(func() { tuiTurnPollInterval = oldInterval })
+	ctx, cancel := context.WithCancel(context.Background())
+	done := chanOfWatch()
+	go func() {
+		outcome, _ := tuiTurnStartWatch(ctx, path, 0, 10*time.Second, ownEchoMatcher("继续。"))
+		done <- outcome
+	}()
+	time.Sleep(30 * time.Millisecond)
+	cancel()
+	select {
+	case outcome := <-done:
+		if outcome == tuiTurnStarted {
+			t.Fatalf("ctx 取消不应报已起跑")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("ctx 取消未被观察（超时）")
+	}
+}
+
+// chanOfWatch 是起跑观察测试的结果通道（三态枚举）。
+func chanOfWatch() chan tuiTurnStartOutcome {
+	return make(chan tuiTurnStartOutcome, 1)
+}
+
+// TestRunTUITurnNoTurn 端到端锁死事故形态：注入成功（socket up、未 held）、
+// fake TUI 收帧后什么都不写（消息被入队、永不 dequeue），窗口耗尽必须以
+// tui_no_turn 收尾——2026-10-30 1dc69343 事故里这一形态要等 10 分钟 idle
+// 看门狗才收尸。
+func TestRunTUITurnNoTurn(t *testing.T) {
+	_ = stubExternalInterrupt(t, nil)
+	pid := os.Getpid()
+	oldPoll := tuiTurnPollInterval
+	tuiTurnPollInterval = 20 * time.Millisecond
+	defer func() { tuiTurnPollInterval = oldPoll }()
+	oldWindow := tuiTurnStartWindow
+	tuiTurnStartWindow = 300 * time.Millisecond
+	defer func() { tuiTurnStartWindow = oldWindow }()
+
+	home := t.TempDir()
+	sock := ccPeerShortSocketPath(t)
+	startFakeTUI(t, sock, make(chan string, 4), func(string) {})
+	writeClaudePidRecord(t, home, "sess-1", pid, "idle", sock)
+	jsonl := writeTranscriptFixture(t, home, "sess-1")
+	m := newAgentAIManager()
+	var mu sync.Mutex
+	var events []map[string]any
+	write := func(v any) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if p, ok := v.(map[string]any); ok {
+			events = append(events, p)
+		}
+		return nil
+	}
+	session := &agentAISession{id: "sess-1", projectPath: t.TempDir(), provider: "claude", resumeSessionID: "sess-1"}
+	m.registerAISessionLocked(session)
+	emitter := m.runEmitter(agentAIRun{runID: "r", sessionID: "sess-1", messageID: "m"}, write)
+
+	m.runTUITurn(context.Background(), session, agentAIRun{
+		runID: "r", sessionID: "sess-1", messageID: "m",
+		projectPath: session.projectPath, provider: "claude", resumeSessionID: "sess-1",
+	}, "继续。", &tuiTurnPlan{
+		Home: home, NativeSessionID: "sess-1", SocketPath: sock,
+		PID: pid, JSONLPath: jsonl, JSONLOffset: mustSize(t, jsonl),
+	}, emitter)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(events) == 0 {
+		t.Fatal("未发出任何事件")
+	}
+	last := events[len(events)-1]
+	if last["type"] != "ai.error" {
+		t.Fatalf("last type = %v, want ai.error (events=%v)", last["type"], events)
+	}
+	if last["error_code"] != agentTUIErrNoTurn {
+		t.Fatalf("error_code = %v, want %s", last["error_code"], agentTUIErrNoTurn)
+	}
+}
+
+// TestTUITurnStartWatchUncorrelated 锁死回显漂移语义：认不出本回合 echo 但有
+// 对话活动（assistant 行）时必须立即按旧语义起跑——窗口绝不能拖慢健康回合
+// （TestRunTUITurnCompletesOnTurnEnd 的单元面）。
+func TestTUITurnStartWatchUncorrelated(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "s.jsonl")
+	if err := os.WriteFile(path, []byte(""), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oldInterval := tuiTurnPollInterval
+	tuiTurnPollInterval = 10 * time.Millisecond
+	t.Cleanup(func() { tuiTurnPollInterval = oldInterval })
+	type watchResult struct {
+		outcome tuiTurnStartOutcome
+		anchor  int64
+	}
+	done := make(chan watchResult, 1)
+	go func() {
+		outcome, anchor := tuiTurnStartWatch(context.Background(), path, 0, 10*time.Second, ownEchoMatcher("手机消息"))
+		done <- watchResult{outcome: outcome, anchor: anchor}
+	}()
+	time.Sleep(30 * time.Millisecond)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assistant, _ := json.Marshal(map[string]interface{}{
+		"type": "assistant", "uuid": "a1",
+		"message": map[string]interface{}{"content": []map[string]string{{"type": "text", "text": "完成。"}}},
+	})
+	f.WriteString(string(assistant) + "\n")
+	f.Close()
+	select {
+	case result := <-done:
+		if result.outcome != tuiTurnStartedUncorrelated {
+			t.Fatalf("assistant 活动应立即按旧语义起跑, got %v", result.outcome)
+		}
+		// Uncorrelated 锚点 = 原始 offset：tail 桥重读全部活动行，delta 一个
+		// 不吞（TestRunTUITurnCompletesOnTurnEnd 的 ai.delta 断言依赖此语义）。
+		if result.anchor != 0 {
+			t.Fatalf("anchor = %d, want 0（原始 offset）", result.anchor)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("uncorrelated 起跑未被识别（超时）")
+	}
+}

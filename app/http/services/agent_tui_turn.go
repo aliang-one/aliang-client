@@ -23,6 +23,7 @@ const (
 	agentTUIErrUnavailable    = "tui_unavailable"       // 注入前判定中途失效（TUI 退出/记录消失）或回合超上限
 	agentTUIErrInjectFailed   = "tui_inject_failed"     // 拨号或写入 UDS 失败
 	agentTUIErrHeld           = "tui_held"              // 接收方（bypass 门）静默扣留注入消息
+	agentTUIErrNoTurn         = "tui_no_turn"           // 消息被接收（入队）但窗口内从未起跑（2026-10-30 事故形态）
 	agentTUIErrTranscriptLost = "tui_transcript_lost"   // tail 期间 transcript 消失
 	agentTUIErrAttachment     = "tui_attachment_failed" // 附件下载失败（注入前）
 )
@@ -399,6 +400,39 @@ var tuiTurnPollInterval = 200 * time.Millisecond
 // 轮询次数。CC 写完最后一个块到把 pid record 翻成 idle 之间有短暂窗口。
 var tuiTurnQuietRounds = 3
 
+// tuiTurnStartWindow 是注入后等待**本回合回显**的窗口：窗口内 transcript 没有
+// 出现本回合注入消息的 user 回显（dequeue 的产物——入队与元数据行不算，事故
+// 形态恰恰是它们在涨而回合永不开始），判为「接收了但没跑」，以 tui_no_turn
+// 快速失败。不杀 TUI、不回收消息——消息仍在 TUI 队列里，若它后续起跑，
+// tuiSync 会把产出同步进会话；这里只是让手机立刻拿到诚实的失败态，而不是等
+// 10 分钟 idle 看门狗收尸（2026-10-30 1dc69343 事故）。
+//
+// 起跑信号刻意只认本回合自己的回显（ownEchoMatcher）：他人回合/前一条滞留
+// 消息的回显与产出都不算——它们先于本回合消息出队时，旧的「任何 user 行都
+// 算起跑」会把新回合的 tail 桥错误锚定在别人的输出上（2026-10-31 评审定谳）。
+// 窗口期内心跳照常发送（见 runTUITurn 里 ticker 先行），任意窗口长度都不会
+// 撞上服务端 10 分钟安静 sweeper。默认 5 分钟（覆盖网关抖动期实测数分钟的
+// 静默重试），可经 ALIANG_TUI_TURN_START_WINDOW 覆写；"0" = 关闭守卫
+// （resolveEnvDurationAllowZero 约定）。
+var tuiTurnStartWindow = resolveEnvDurationAllowZero("ALIANG_TUI_TURN_START_WINDOW", 5*time.Minute)
+
+// ownEchoMatcher 返回「本回合注入消息的回显」判定：transcript 的 user 行文本
+// 包含本回合原始内容即视为本回合 echo（注入帧是 content 的超集——前面拼了
+// surface 契约、后面拼了附件清单，CC 的 dequeued 回显写的是完整注入文本）。
+// content 为空时退化为任意真实 user 行（保底不比旧行为更差）。
+func ownEchoMatcher(content string) func(line []byte) bool {
+	needle := strings.TrimSpace(content)
+	return func(line []byte) bool {
+		if classifyTranscriptLine(line) != transcriptUserEcho {
+			return false
+		}
+		if needle == "" {
+			return true
+		}
+		return strings.Contains(transcriptUserText(line), needle)
+	}
+}
+
 // tuiTurnCeiling 是注入回合的全局上限。没有它，一个永不回显也永不结束的注入
 // （TUI 卡死 / transcript 不写 / 判定条件永不满足）会让这个 goroutine 永久占着
 // session.cancel，该会话此后再也无法发起回合。兜底必须有。
@@ -487,6 +521,30 @@ func (m *agentAIManager) runTUITurn(ctx context.Context, session *agentAISession
 		"state": "running", "executor": "tui",
 	})
 
+	// 2.2) 进度心跳先行：附件下载、注入、起跑观察（窗口可达数分钟）都是
+	// 「run 活着但没有产出」的阶段——心跳让服务端 10 分钟安静 sweeper 在任意
+	// 窗口配置下都不会把这一段误判成超时（2026-10-31 评审定谳）。TUI 长时间
+	// 思考时手机也需要「仍活着」的信号（与 spawn 两条路径同间隔）。
+	progressStop := make(chan struct{})
+	defer close(progressStop)
+	go func() {
+		ticker := time.NewTicker(agentAIRunProgressInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-progressStop:
+				return
+			case <-ticker.C:
+				_ = write(map[string]any{
+					"type":              models.AgentEventAIRunProgress,
+					"session_id":        session.id,
+					"message_id":        assistantMsgID,
+					"git_changed_count": countGitChanged(session.projectPath),
+				})
+			}
+		}
+	}()
+
 	// 2.5) 附件落地。TUI 注入帧只有文本：图片必须先由 agent 下载成本地文件，
 	// 再把路径交给终端里的 Claude Code 用 Read 打开。spawn 路径在
 	// buildClaudeImageBlocks 里做同样的事；这里若只拼预签名 URL，模型不会
@@ -527,40 +585,48 @@ func (m *agentAIManager) runTUITurn(ctx context.Context, session *agentAISession
 		emitStopStatus()
 		return
 	}
+	// 起跑检测：接收≠起跑。窗口内没有出现本回合自己的回显（入队/元数据行/
+	// 他人回合的回显都不算，见 tuiTurnStartWatch）判 tui_no_turn——手机立刻
+	// 拿到诚实失败，而不是等 10 分钟 idle 看门狗（2026-10-30 事故形态）。
+	// 失败不杀 TUI：消息可能仍在队列里，后续起跑由 tuiSync 补同步。
+	outcome, echoEnd := tuiTurnStartWatch(runCtx, plan.JSONLPath, plan.JSONLOffset, tuiTurnStartWindow, ownEchoMatcher(content))
+	if runCtx.Err() != nil {
+		emitStopStatus()
+		return
+	}
+	if outcome == tuiTurnNotStarted {
+		fail(agentTUIErrNoTurn, "终端会话接收了消息但一直未开始执行；消息可能仍留在终端队列中，请到终端确认处理")
+		return
+	}
+	// 本回合回显显式回传（tail 桥起点在本回 echo 之后，不会再读到它）。
+	// Uncorrelated（回显认不出）时不发——旧语义里这行由 tail 桥的 user 行承担；
+	// transcript 已消失（TranscriptGone）时跳过——tail 桥首轮立刻上报
+	// tui_transcript_lost。
+	if outcome == tuiTurnStarted {
+		_ = write(map[string]any{
+			"type": models.AgentEventAIDelta, "session_id": session.id,
+			"message_id": assistantMsgID,
+			"channel":    "user", "delta": content,
+		})
+	}
 
-	// 4) tail 桥 + 完成判定。
+	// 4) tail 桥 + 完成判定。起点 = 本回合 echo 之后（watch 返回的锚点）：
+	// 先于本回合出队的滞留消息与他人回合的产出被天然跳过，不会被错误归入
+	// 本回合（2026-10-31 评审定谳）。
 	m.startAIWatchdog(runCtx, activity, cancel)
-	// 进度心跳：TUI 长时间思考时手机需要「仍活着」的信号，否则服务端 10 分钟
-	// 安静 sweeper 会把回合打翻成 timed out（与 spawn 两条路径同间隔）。
-	progressStop := make(chan struct{})
-	defer close(progressStop)
-	go func() {
-		ticker := time.NewTicker(agentAIRunProgressInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-progressStop:
-				return
-			case <-ticker.C:
-				_ = write(map[string]any{
-					"type":              models.AgentEventAIRunProgress,
-					"session_id":        session.id,
-					"message_id":        assistantMsgID,
-					"git_changed_count": countGitChanged(session.projectPath),
-				})
-			}
-		}
-	}()
 
 	emitted := make(map[string]struct{}) // 已发过的行 uuid，防重
 	touched := make(map[string]struct{})
 	quiet := 0
-	sawUserEcho := false
+	// 本回合回显已在起跑观察阶段确认，tail 从其后开始（TranscriptGone 时让位
+	// tail 桥首轮上报，二者都到不了完成判定）。Uncorrelated 也算看到过活动
+	// （旧语义的 quiet 累计前提），否则零新行时完成判定永不满足。
+	sawUserEcho := outcome == tuiTurnStarted || outcome == tuiTurnStartedUncorrelated
 	// 回合结束的权威信号与辅助信号（见下方完成判定的分层注释）。
 	sawTurnEnd := false        // CC 亲写的 turn_duration/stop_hook_summary 行
 	sawBusyTransition := false // pid 记录出现过 busy——回显分类失配时证明回合真实跑过
 	turnDurationMs := int64(0)
-	offset := plan.JSONLOffset
+	offset := echoEnd
 	ceiling := time.After(tuiTurnCeiling)
 tail:
 	for {
@@ -712,6 +778,73 @@ tail:
 		donePayload["turn_duration_ms"] = turnDurationMs
 	}
 	_ = write(donePayload)
+}
+
+// tuiTurnStartOutcome 是起跑观察的结论。transcript 消失必须是独立一态：
+// 它是 tail 桥的 tui_transcript_lost 职责，绝不能在观察窗里被顶成 tui_no_turn
+// （第一版实现的真 bug，TestRunTUITurnFailures/transcript_lost 锁死）。
+// Started 与 StartedUncorrelated 都算「已起跑」——差别只在回显归因：CC 版本
+// 改过回显形态（2026-10-20 实录），完成/起跑绝不能依赖认得出回显。
+type tuiTurnStartOutcome int
+
+const (
+	tuiTurnStarted             tuiTurnStartOutcome = iota // 本回合 echo 已出现（可归因锚定）
+	tuiTurnStartedUncorrelated                            // 有对话活动但认不出本回合 echo → 按旧语义起跑
+	tuiTurnNotStarted                                     // 窗口耗尽零对话活动 → tui_no_turn
+	tuiTurnTranscriptGone                                 // transcript 读错误 → 让位 tail 桥上报
+)
+
+// tuiTurnStartWatch 阻塞观察注入后的「本回合起跑」信号，分层判定：
+//
+//   - 本回合注入消息的 user 回显（isOwnEcho）→ (tuiTurnStarted, 该 echo 行之后
+//     的偏移)。调用方以它为 tail 桥起点，天然跳过先于本回合出队的滞留消息与他
+//     人回合的产出（错锚防护，2026-10-31 评审定谳）。
+//   - 其他任何对话活动（assistant/turn-end/认不出的 user 行）→ 立即
+//     (tuiTurnStartedUncorrelated, 该行之后的偏移)。刻意不等窗口：回显形态
+//     漂移时旧语义照样要能跑（TestRunTUITurnCompletesOnTurnEnd 锁死），窗口
+//     绝不能拖慢健康回合。
+//   - 窗口耗尽仍零活动 → (tuiTurnNotStarted, seen)——这才是事故形态：入队/
+//     元数据行（ignore 类）不算活动，文件可以一直涨但回合永不开始。
+//
+// ctx 取消返回 NotStarted（调用方先查 runCtx 走停止收尾）；transcript 读错误
+// 返回 (tuiTurnTranscriptGone, offset)。
+func tuiTurnStartWatch(ctx context.Context, jsonlPath string, offset int64, window time.Duration, isOwnEcho func([]byte) bool) (tuiTurnStartOutcome, int64) {
+	if isOwnEcho == nil {
+		isOwnEcho = func([]byte) bool { return false }
+	}
+	deadline := time.Now().Add(window)
+	seen := offset
+	for {
+		lines, newOffset, err := readTranscriptFrom(jsonlPath, seen)
+		if err != nil {
+			// transcript 消失是独立失败（tui_transcript_lost）：立即让位，交给
+			// tail 桥首轮上报，绝不在这里干等窗口把错误顶成 tui_no_turn。
+			return tuiTurnTranscriptGone, offset
+		}
+		for _, line := range lines {
+			if isOwnEcho(line) {
+				return tuiTurnStarted, seen + int64(len(line)+1)
+			}
+			if classifyTranscriptLine(line) != transcriptIgnore {
+				// 他人回合/回显形态漂移：按旧语义立即起跑，不拖窗口。锚点回到
+				// 原始 offset——tail 桥重读全部活动行（delta 一个不吞），与旧
+				// 行为逐字节一致；只有认得出本回合 echo 时才跳到 echo 之后。
+				return tuiTurnStartedUncorrelated, offset
+			}
+		}
+		seen = newOffset
+		if ctx.Err() != nil {
+			return tuiTurnNotStarted, offset
+		}
+		if time.Now().After(deadline) {
+			return tuiTurnNotStarted, seen
+		}
+		select {
+		case <-ctx.Done():
+			return tuiTurnNotStarted, offset
+		case <-time.After(tuiTurnPollInterval):
+		}
+	}
 }
 
 // readTranscriptFrom 从 offset 读完整新行。只消费以 \n 结尾的部分——半行留在
