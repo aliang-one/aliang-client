@@ -811,6 +811,19 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 		s.setRemoteConnectionState(true, "online", "")
 		logger.Warn(fmt.Sprintf("[AGENT-PEER] peer_exec_rejected request_id=%s reason=%s",
 			remoteString(msg, "request_id"), remoteString(msg, "reason")))
+	case models.AgentEventPeerLanListen:
+		// 设备互访阶段 2 增量 2（spec §6）：LAN 直连文件面的 B 端信令。绑定
+		// listener 是毫秒级动作（回包不等服务过程），经 safeGo 离线化——读
+		// loop 畅通优先，服务过程单连接一生由 TTL+单用途自然收摊。经
+		// remoteAgentMessageRequiresEnabledDevice 门禁（与 peer.exec 同族）。
+		s.setRemoteConnectionState(true, "online", "")
+		safeGo("peer_lan_listen", func() { s.handleAgentPeerLanListen(msg, writeJSON) })
+	case models.AgentEventPeerLanListenResult:
+		// B→server 的绑定回包经通用 RPC resolve（request_id 匹配）消费；到达
+		// A 侧属异常路径——静默消费防 default 臂 unsupported 噪声。
+		s.setRemoteConnectionState(true, "online", "")
+		logger.Info(fmt.Sprintf("[AGENT-PEER-LAN] listen_result at unexpected peer request_id=%s",
+			remoteString(msg, "request_id")))
 	// 注意：这四个旧工具事件（file.list/file.read/git.status/env.info）由下面的
 	// 显式臂直派、有意绕过 default 臂的 tools.RunWithGuards 护栏（无超时看门狗/
 	// 输出上限/panic 恢复）——响应形状兼容优先。注册表里它们的 caps（TimeoutMs/
@@ -1031,7 +1044,10 @@ func remoteAgentMessageRequiresEnabledDevice(msgType string) bool {
 		models.AgentEventAISessionClose,
 		// 设备互访阶段 1（spec §5.2）：对端发来的命令执行请求是控制面能力，
 		// 与 terminal/AI 同族——禁用设备不得响应。
-		models.AgentEventPeerExecRequest:
+		// 设备互访阶段 2（spec §6）：LAN 直连 listener 同族——被禁用设备不得
+		// 为他人提供文件服务。
+		models.AgentEventPeerExecRequest,
+		models.AgentEventPeerLanListen:
 		return true
 	default:
 		// tools.list 是元 RPC（非注册表工具项），显式门控；注册表命中的工具事件
@@ -1287,6 +1303,9 @@ func agentCapabilities() []string {
 		// 设备互访阶段 1（spec §5.1）：一次性命令执行 + fetch 编排能力位。
 		// 服务端按位门控下发 peer.* 流量，老设备自动落「仅中继」兼容路径。
 		"peer_v1",
+		// 设备互访阶段 2 增量 2（spec §6）：LAN 协商/直连数据面。具备该位才
+		// 参与 transfer.receive 的 direct_candidates 协商与 peer.lan.listen。
+		"peer_path_v1",
 	)
 	return caps
 }
