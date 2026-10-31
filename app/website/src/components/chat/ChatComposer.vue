@@ -23,6 +23,14 @@
     >
       {{ t('chat_approvalBlockHint') }}
     </div>
+    <!-- 撤回编辑态 banner（Task 13）：截断警告 + 取消出口；编辑态下发送键位
+         换「确认重发」（label 由 useAliangChat.sendButtonLabel 单源切换），点击
+         经 recall-confirm 走 sendRecall；禁用语义与发送键同源（sendDisabled——
+         审批硬拦同样拦住确认重发）。 -->
+    <ChatRecallBanner
+      v-if="recallActive"
+      @cancel="emit('recall-cancel')"
+    />
     <div class="flex items-end gap-2">
       <div class="relative min-w-0 flex-1">
         <div
@@ -85,7 +93,7 @@
         type="button"
         class="min-h-[40px] shrink-0 rounded-lg bg-primary px-4 text-sm font-semibold text-white transition hover:bg-primary/90 md:min-h-0"
         :disabled="disabled"
-        @click="emit('send')"
+        @click="onSendAction"
       >{{ label }}</button>
     </div>
   </div>
@@ -95,6 +103,7 @@
 import { computed, watch } from 'vue';
 import { useI18n } from '../../i18n';
 import { isComposingEvent } from '../../composables/useAliangChat';
+import ChatRecallBanner from './ChatRecallBanner.vue';
 
 // 自增高上限：144px ≈ 6 行（行高 20px + 上下 padding）。
 const TEXTAREA_MAX_HEIGHT = 144;
@@ -114,7 +123,11 @@ const props = defineProps({
   steerBlocked: { type: Boolean, default: false },
   // 审批等待期硬拦（Task 10）：ChatPage 从 activeApprovals.length>0 接线——
   // true 时渲染提示条；输入/发送键的禁用由 disabled（=sendDisabled）同源承担。
+  // 撤回编辑态（Task 13）：true 时渲染截断警告 banner、slash 补全禁用、发送
+  // 动作（含 Enter）改发 recall-confirm（状态机与发送链在 useAliangChat）。
   approvalBlocked: { type: Boolean, default: false },
+  // 撤回编辑态（Task 13）：banner 挂载 + slash 禁用 + 发送动作分流（见上）。
+  recallActive: { type: Boolean, default: false },
   // slash 补全状态由 useAliangChat 持有（命令缓存被帧路由写、open/index 被
   // 输入事件写），本组件经 props 读、事件回写。
   slashOpen: { type: Boolean, default: false },
@@ -130,6 +143,10 @@ const emit = defineEmits([
   'send',
   // running 且输入空时停止键的点击出口（Task 9）：ChatPage 接 stopRun 发 ai.stop。
   'stop',
+  // 撤回编辑态的动作出口（Task 13）：confirm → sendRecall（ChatPage 以活跃
+  // 会话落值）；cancel → cancelRecall（恢复进入前草稿）。
+  'recall-confirm',
+  'recall-cancel',
   'slash-apply',
   'slash-index',
   'slash-close',
@@ -137,6 +154,16 @@ const emit = defineEmits([
 ]);
 
 const { t } = useI18n();
+
+// 发送动作分流（Task 13）：编辑态下按钮点击与 Enter 都改发 recall-confirm，
+// ChatPage 侧路由到 sendRecall；常规路径原样 emit('send')。
+function onSendAction() {
+  if (props.recallActive) {
+    emit('recall-confirm');
+    return;
+  }
+  emit('send');
+}
 
 // 输入是否「实义非空」：空白按空判定——与 sendMessage 的 trim 守卫同口径，
 // 别让「看似可发、点了无操作」的死发送键占住停止键位。
@@ -226,7 +253,7 @@ function onInputKeydown(e) {
     // Shift+Enter 换行（textarea 语义），裸 Enter 发送。
     if (e.shiftKey) return;
     e.preventDefault();
-    emit('send');
+    onSendAction();
   }
 }
 

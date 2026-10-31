@@ -202,6 +202,23 @@ export async function pushFrame(page, frame) {
   }, frame);
 }
 
+// 建会话 + 收敛正锚（Task 13 自 chat-settings.spec.js 迁入，并按 Task 12 质量
+// 审查钉死结论加固为正锚）：发一句让 create 确认门 → ai.message 全链走完。
+// 正锚两头：①outbound ai.message 帧存在（create-fail 路径没有它——弱阴性杀手）；
+// ②run 以终态收敛（停止键退场 = 入站 ai.done/ai.error 已到达并走完收尾）。
+// 注意 __aiFrames 只录出站帧，入站终态只能从 UI 键位读。返回该 ai.message 帧
+// 的 session_id（本地会话 == aiSessionId）。
+export async function establishCreatedSession(page, text = '第一句') {
+  await page.getByPlaceholder(/输入消息|Type a message/).fill(text);
+  await page.keyboard.press('Enter');
+  await expect.poll(async () => page.evaluate(() => {
+    const msg = window.__aiFrames.filter((f) => f.type === 'ai.message').slice(-1)[0];
+    return msg ? msg.session_id : '';
+  })).not.toBe('');
+  await expect(page.getByTestId('chat-stop-button')).toHaveCount(0); // 终态收敛锚
+  return page.evaluate(() => window.__aiFrames.filter((f) => f.type === 'ai.message').slice(-1)[0].session_id);
+}
+
 // 侧栏来源角标数的镜像实现（与 sessionSourceBadge 同一条优先级规则：
 // running > origin > id 前缀），供清单类 spec 在 openChat 后校验角标数。
 export function expectedSourceBadgeCount(sessions) {

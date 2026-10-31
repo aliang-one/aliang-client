@@ -23,11 +23,37 @@
         <span v-else-if="msg.role === 'assistant' && msg.status === 'done'" class="text-emerald-500">{{ t('chat_statusDone') }}</span>
         <span v-else-if="msg.role === 'assistant' && msg.status === 'error'" class="font-semibold text-rose-500">!</span>
       </div>
-      <!-- user 气泡：品牌绿实底、右对齐 -->
-      <div
-        v-if="msg.role === 'user'"
-        class="ml-auto w-fit max-w-[85%] whitespace-pre-wrap break-words rounded-2xl bg-primary px-4 py-2.5 text-sm text-white shadow-sm"
-      >{{ msg.content }}</div>
+      <!-- user 气泡：品牌绿实底、右对齐。group 包装层承载 hover 操作条
+           （Task 13）：复制 + 撤回重发（撤回键仅 canRecall 命中——user 角色 +
+           有 messageId + provider=agentcore——才渲染，存量旧消息只有复制）。 -->
+      <div v-if="msg.role === 'user'" class="group relative ml-auto w-fit max-w-[85%]">
+        <div class="whitespace-pre-wrap break-words rounded-2xl bg-primary px-4 py-2.5 text-sm text-white shadow-sm">{{ msg.content }}</div>
+        <div
+          class="absolute -top-3 right-0 z-10 flex items-center gap-0.5 rounded-lg border border-slate-200 bg-white px-1 py-0.5 opacity-0 shadow-sm transition-opacity group-hover:opacity-100 dark:border-slate-700 dark:bg-slate-800"
+        >
+          <button
+            type="button"
+            data-testid="chat-copy-button"
+            :title="t('chat_copyMessage')"
+            :aria-label="t('chat_copyMessage')"
+            class="flex min-h-[40px] items-center justify-center rounded-md px-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-slate-600 md:min-h-0 dark:hover:bg-slate-700 dark:hover:text-slate-200"
+            @click="copyMessage"
+          >
+            <span class="material-symbols-outlined text-[16px] leading-none">content_copy</span>
+          </button>
+          <button
+            v-if="canRecall(msg)"
+            type="button"
+            data-testid="chat-recall-button"
+            :title="t('chat_recallButton')"
+            :aria-label="t('chat_recallButton')"
+            class="flex min-h-[40px] items-center justify-center rounded-md px-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-primary md:min-h-0 dark:hover:bg-slate-700"
+            @click="emit('recall', msg)"
+          >
+            <span class="material-symbols-outlined text-[16px] leading-none">restart_alt</span>
+          </button>
+        </div>
+      </div>
       <!-- assistant：头像 + 内容卡 -->
       <div v-else class="flex gap-2.5">
         <div class="flex size-6 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-primary to-emerald-500 text-white">
@@ -67,16 +93,29 @@
 
 <script setup>
 import { useI18n } from '../../i18n';
+import { canRecall } from '../../utils/chatRecall';
 import ChatMarkdown from './ChatMarkdown.vue';
 
 // 纯渲染：单条消息块（系统胶囊 / eyebrow 行 / 气泡）。nowTick 驱动相对时间
-// 随 30s 心跳重算（不做本地定时器，复用列表已有的时钟节拍）。
+// 随 30s 心跳重算（不做本地定时器，复用列表已有的时钟节拍）。user 气泡的
+// hover 操作条只发事件（recall），编辑态状态机与发送链都在 useAliangChat。
 const props = defineProps({
   msg: { type: Object, required: true },
   nowTick: { type: Number, default: 0 },
 });
 
+const emit = defineEmits(['recall']);
+
 const { t } = useI18n();
+
+// 复制 user 气泡原文（assistant 正文已有 ChatMarkdown 的复制入口）。剪贴板
+// 不可用（非安全上下文等）静默失败，与 chat_md 的复制行为同口径。
+function copyMessage() {
+  const text = props.msg.content || '';
+  if (text && navigator.clipboard?.writeText) {
+    navigator.clipboard.writeText(text).catch(() => {});
+  }
+}
 
 // 相对时间：<60s「刚刚」/<60m「X 分钟前」/<24h「X 小时前」/否则「M-D HH:mm」。
 // 绝对时间走 toLocaleString 挂 hover title（不加 i18n 键——数值格式无文案）。

@@ -10,12 +10,21 @@ import {
   normalizeDeviceProvider,
   sessionCreatePayload,
 } from '../utils/chatSettings';
+import {
+  canRecall,
+  recallCreatePayload,
+  sliceMessagesBefore,
+} from '../utils/chatRecall';
 
 const STORAGE_KEY = 'aliang-chat-data';
 
 // 无活动看门狗阈值：模块顶层读取（E2E 经 window.__CHAT_IDLE_TIMEOUT_MS__
 // 注入短值，注入脚本先于应用模块求值，与原 ChatPage.vue 内联声明等价）。
 const CHAT_IDLE_TIMEOUT_MS = Number(globalThis.__CHAT_IDLE_TIMEOUT_MS__) || 90000;
+
+// 撤回链的会话终态等待阈值（Task 13）：同 __CHAT_IDLE_TIMEOUT_MS__ 手法，
+// E2E 经 window.__CHAT_STOP_TIMEOUT_MS__ 注入短值；0 会被 || 回退到默认。
+const CHAT_STOP_TIMEOUT_MS = Number(globalThis.__CHAT_STOP_TIMEOUT_MS__) || 10000;
 
 // IME 组合期（中文/日文输入法）的 Enter/Esc 属于「确认候选词 / 取消组合」，
 // Firefox/Safari 会如实上报 key，模板修饰符拦不住，必须自己判。
@@ -195,7 +204,22 @@ export function useAliangChat() {
     (sending.value && !activeSessionRunning.value) || sendApprovalBlocked.value
   );
 
+  // --- 撤回重发编辑态（Task 13，转录级真撤回） ---
+  // recallState 非空且 convId 命中活跃会话即「编辑态」：banner 常驻、发送键位
+  // 变确认重发、slash 补全禁用。originalText 回填输入框；draftBefore 是进入
+  // 编辑态前的输入框草稿（cancel 时恢复；中途切换目标不覆盖——「进入前」以
+  // 第一次进入为准）。瞬态：不进 conversationForStorage。
+  const recallState = ref(null);
+
+  const recallActive = computed(() => {
+    const st = recallState.value;
+    return !!st && !!activeConversation.value && st.convId === activeConversation.value.id;
+  });
+
   const sendButtonLabel = computed(() => {
+    // 撤回编辑态（Task 13）：键位文案换「确认重发」，动作经 Composer 的
+    // recall-confirm 事件走 sendRecall（禁用语义与发送键同源 sendDisabled）。
+    if (recallActive.value) return t('chat_recallConfirm');
     if (sending.value && activeSessionRunning.value) {
       return t('chat_steerSending');
     }
@@ -295,6 +319,8 @@ export function useAliangChat() {
   // （幂等，socket 不在线时 sendAI 静默失败，重开会话会重新订阅）。
   // 目录面板/自定义模型的 UI 复位已迁 ChatSettingsBar（watch conversation prop）。
   watch(activeId, (nv, ov) => {
+    // 撤回编辑态随会话切换取消（Task 13）：恢复进入前草稿，banner 不跨会话悬挂。
+    if (ov && recallState.value?.convId === ov) cancelRecall();
     if (ov) {
       const prev = conversations.value.find(c => c.id === ov);
       if (prev) unsubscribeDeviceSession(prev);
@@ -309,9 +335,12 @@ export function useAliangChat() {
   // 时服务端拒绝建会话，绝不能让消息经 ai.message 的 lazy-create 落到 home 跑。
   // 回执来源：ai.session.created → 'created'；create 期 ai.error（无 message_id）
   // → 'error'（错误文本已由该分支渲染）；超时 → 'timeout'（socket 死亡等）。
+  // payloadFn（Task 13，可选）：发出什么载荷由调用方决定——常规路径缺省
+  // sessionCreatePayload(conv)，撤回路径传 recallCreatePayload 工厂（铁律：
+  // 载荷必须真的经 sendAI 上帧，故工厂在发送点求值而非提前构造）。
   const pendingCreates = new Map(); // session_id -> settle(status)
 
-  function waitForCreateAck(conv, timeoutMs = 5000) {
+  function waitForCreateAck(conv, timeoutMs = 5000, payloadFn = null) {
     return new Promise((resolve) => {
       const sid = conv.aiSessionId;
       let done = false;
@@ -327,7 +356,34 @@ export function useAliangChat() {
       conv.aiSessionCreated = true;
       // ensureAISocket 之后 socket 仍可能已死：sendAI 返回 false 就立刻按超时
       // 结算，不白等 5 秒死钟。
-      if (!sendAI(sessionCreatePayload(conv))) settle('timeout');
+      if (!sendAI(payloadFn ? payloadFn() : sessionCreatePayload(conv))) settle('timeout');
+    });
+  }
+
+  // 会话终态等待（Task 13 撤回链）：ai.stop 不是终态——回合的 ai.done/ai.error
+  // 才算停稳，宿主在 run 未收敛时处理 truncate create 会以 truncate_run_active
+  // 拒绝。镜像 pendingCreates 的一次性 settle 模式；settle 挂在帧路由上
+  //（handleAIEvent 的终态早结算段，归属未命中也不让等待方空等），超时 settle
+  // 'timeout'（调用方据此中止，保留编辑态）。
+  const pendingTerminals = new Map(); // session_id -> settle(status)
+
+  function waitForSessionTerminal(sessionId, timeoutMs = CHAT_STOP_TIMEOUT_MS) {
+    return new Promise((resolve) => {
+      const sid = String(sessionId || '');
+      if (!sid) {
+        resolve('timeout');
+        return;
+      }
+      let done = false;
+      const settle = (status) => {
+        if (done) return;
+        done = true;
+        pendingTerminals.delete(sid);
+        clearTimeout(timer);
+        resolve(status);
+      };
+      const timer = setTimeout(() => settle('timeout'), timeoutMs);
+      pendingTerminals.set(sid, settle);
     });
   }
 
@@ -540,6 +596,9 @@ export function useAliangChat() {
     if (!activeId.value) return;
     if (activeConversation.value?.deviceSession) return; // 设备会话不可在本端删（后端无端点）
     if (!confirm(t('chat_deleteConfirm'))) return;
+    // 被删会话挂着撤回编辑态时一并清（recallActive 已随 conv 消失失活，但
+    // 悬挂的 targetMessageId 会让下一条同 id 消息误配——直接清态）。
+    if (recallState.value?.convId === activeId.value) recallState.value = null;
     conversations.value = conversations.value.filter(c => c.id !== activeId.value);
     if (conversations.value.length > 0) {
       activeId.value = conversations.value[0].id;
@@ -563,6 +622,10 @@ export function useAliangChat() {
       role: m.role,
       content: m.content,
       status: 'done',
+      // 撤回锚点接线（Task 13）：详情 wire 行的 id 即 journal message_id，落
+      // 气泡后可作 truncate_before_message_id；provider 落上（canRecall 依赖）。
+      messageId: m.id || '',
+      provider: shell.provider || '',
       ts: Date.parse(m.timestamp) || now(),
     }));
     shell.deviceTranscript = renderable.map(m => ({ role: m.role, content: m.content }));
@@ -582,6 +645,10 @@ export function useAliangChat() {
       role: m.role,
       content: m.text,
       status: 'done',
+      // 快照 id 系 journal 同源（spec §A 已修订），可作撤回锚点；内容仍绝不
+      // 喂入（deviceTranscript 专属流不变）。provider 落上（canRecall 依赖）。
+      messageId: m.message_id || '',
+      provider: shell.provider || '',
       ts: Date.parse(m.ts) || now(),
     }));
   }
@@ -835,6 +902,12 @@ export function useAliangChat() {
   }
 
   function onSlashInput() {
+    // 撤回编辑态禁用 slash 补全（Task 13）：确认重发的输入语义是「改写后的
+    // 消息正文」，`/` 开头按普通文本重发。
+    if (recallActive.value) {
+      slashOpen.value = false;
+      return;
+    }
     const token = slashToken(inputText.value);
     // 无命令面（agentcore）：`/` 按普通文本发送，不弹补全。
     if (token === null || !slashActiveProvider.value) {
@@ -1103,6 +1176,145 @@ export function useAliangChat() {
     item.detail = '';
   }
 
+  // --- 撤回重发：编辑态进出与发送链（Task 13） ---
+
+  // 进入/切换编辑态：气泡 hover 菜单经 ChatPage 落到这里。canRecall + 目标仍
+  // 在会话消息里（与发送链同源的切片判定，目标不存在=禁用入口）双重把关。
+  // 已在编辑态时再点（同条或另一条）→ 直接重置目标与回填。
+  function startRecall(msg) {
+    const conv = activeConversation.value;
+    if (!conv || recalling.value) return;
+    // 非 running 会话的在途发送（create 确认门窗口）不进编辑态；running 会话
+    // 的 sending 常驻为真（ai.run.started 不落 sending=false，终态才落），
+    // 撤回链与 steer 一样必须在 running 下可用——并发由 recalling 单守。
+    if (sending.value && !isConversationRunning(conv)) return;
+    if (!canRecall(msg)) return;
+    if (!sliceMessagesBefore(conv.messages, msg.messageId)) return;
+    const prev = recallState.value;
+    recallState.value = {
+      convId: conv.id,
+      targetMessageId: msg.messageId,
+      originalText: msg.content || '',
+      draftBefore: prev ? prev.draftBefore : inputText.value,
+    };
+    inputText.value = recallState.value.originalText;
+    slashOpen.value = false;
+    nextTick(() => inputRef.value?.focus());
+  }
+
+  // 取消编辑态：恢复进入前草稿、清态。仅在状态属于当前活跃会话或会话切换
+  //（watch activeId）时被调用，恢复草稿总是安全的（状态不会跨会话悬挂）。
+  function cancelRecall() {
+    const st = recallState.value;
+    if (!st) return;
+    recallState.value = null;
+    inputText.value = st.draftBefore || '';
+  }
+
+  // 撤回重发发送链（与 sendMessage 尾段同构）：
+  //   running → ai.stop（目标与 steer 同构）→ 等会话终态（超时中止：保留编辑态
+  //   + createError，绝不把 truncate create 发进仍在跑的回合）
+  //   → create 确认门（recallCreatePayload：无 transcript/无 resume + truncate 键，
+  //   宿主从 journal 全文重建；宿主侧按 beforeMessageID 位置幂等 → 超时可重试）
+  //   → ack created → 本地时间线截到目标之前 + 新 user 气泡（新 messageId，
+  //   provider 落上——canRecall 依赖）+ assistant 占位 → 看门狗 + ai.message。
+  // create 超时/被拒：不发 ai.message，编辑态保留（createError 落可重试文案）。
+  const RECALL_CREATE_ACK_MS = 5000;
+  const recalling = ref(false);
+
+  async function sendRecall(conv) {
+    const st = recallState.value;
+    if (!st || !conv || conv.id !== st.convId || recalling.value) return;
+    const edited = inputText.value.trim();
+    if (!edited) return; // 空文本不允许重发（与 sendMessage trim 守卫同口径）
+    if (!sliceMessagesBefore(conv.messages, st.targetMessageId)) {
+      cancelRecall();
+      return;
+    }
+
+    recalling.value = true;
+    sending.value = true;
+    createError.value = '';
+    try {
+      await ensureAISocket();
+
+      // ① running 先停。stop 目标与 steer 同构（本地 aiSessionId / 壳 managed
+      //    ?? entry.id）；agentcore 撤回链的壳必回退 entry.id，空目标理论不可达，
+      //    真发生按可重试失败中止。
+      if (isConversationRunning(conv)) {
+        const target = steerTargetId(conv);
+        if (!target || !sendAI({ type: 'ai.stop', session_id: target })) {
+          throw new Error('socket-closed');
+        }
+        const terminal = await waitForSessionTerminal(target);
+        if (terminal === 'timeout') {
+          // 中止：编辑态与回填保留，绝不发 truncate create（场景 E 钉死）。
+          createError.value = t('chat_recallStopTimeout');
+          sending.value = false; // 本函数的收尾在 recalling 尾部，早退须自理
+          recalling.value = false;
+          return;
+        }
+      }
+
+      // ② create 确认门。载荷工厂在发送点求值——铁律：撤回 create 绝不带
+      //    transcript（宿主从 journal 全文重建），也绝不带 resume_session_id。
+      if (!conv.aiSessionId) conv.aiSessionId = 'local-' + conv.id;
+      const ack = await waitForCreateAck(
+        conv,
+        RECALL_CREATE_ACK_MS,
+        () => recallCreatePayload(conv, st.targetMessageId),
+      );
+      if (ack !== 'created') {
+        createError.value = t('chat_recallUnconfirmed');
+        sending.value = false;
+        recalling.value = false;
+        return; // 编辑态保留；truncate 幂等，原样重试安全
+      }
+
+      // ③ ack created → 本地截断 + 追加（重切一次：stop 收敛期可能新落了系统
+      //    条，截断点之后的内容一律弃置，与 journal 截断口径一致）。
+      const before = sliceMessagesBefore(conv.messages, st.targetMessageId);
+      if (!before) {
+        cancelRecall();
+        sending.value = false;
+        recalling.value = false;
+        return;
+      }
+      const messageId = generateId(); // 重发必换新 id（journal 去重）
+      conv.messages = [
+        ...before,
+        { role: 'user', content: edited, messageId, provider: conv.provider, ts: now() },
+        { role: 'assistant', content: '', status: 'running', ts: now() },
+      ];
+      if (!conv.title) conv.title = edited.slice(0, 20);
+      conv.updatedAt = now();
+      recallState.value = null;
+      inputText.value = '';
+      scrollToBottom(true);
+      saveToStorage();
+
+      armIdleWatchdog(conv);
+      const ok = sendAI({
+        type: 'ai.message',
+        session_id: conv.aiSessionId,
+        message_id: messageId,
+        content: edited,
+      });
+      if (!ok) throw new Error('socket-closed');
+    } catch (_) {
+      disarmIdleWatchdog();
+      const asst = findRunningAssistant(conv);
+      if (asst) {
+        asst.status = 'error';
+        asst.content = t('chat_serviceUnavailable');
+      }
+      createError.value = t('chat_recallUnconfirmed');
+      sending.value = false;
+      recalling.value = false;
+      saveToStorage();
+    }
+  }
+
   // --- 停止当前运行（Task 9，动作槽对齐手机端） ---
   // running 时可停：stop 帧不是终态——后端只回 ai.status "stopping" + 取消
   // 审批，终态由被取消 run 的 done/error 既有路径收敛（这里不新增等待/超时
@@ -1171,6 +1383,13 @@ export function useAliangChat() {
     // 的设备会话同样生效，故放在归属判定之前）。
     if (e.type === 'ai.run.started' || e.type === 'ai.done' || e.type === 'ai.error' || e.type === 'ai.approval.request') {
       refreshOnEvent();
+    }
+
+    // 撤回链的会话终态结算（Task 13）：done/error 都是回合终态，在通用会话
+    // 归属判定之前结算——壳路由/活跃兜底的归属差异不让等待方空等超时。
+    if ((e.type === 'ai.done' || e.type === 'ai.error') && e.session_id) {
+      const pendingTerminal = pendingTerminals.get(e.session_id);
+      if (pendingTerminal) pendingTerminal('terminal');
     }
 
     let conv = e.session_id ? conversations.value.find(c => c.aiSessionId === e.session_id) : null;
@@ -1389,7 +1608,10 @@ export function useAliangChat() {
       return;
     }
 
-    conv.messages.push({ role: 'user', content: text, ts: now() });
+    // messageId 提前生成、随气泡落值（Task 13）：撤回链以气泡 id 为 journal
+    // 截断锚点，ai.message 帧复用同一 id；provider 落气泡——canRecall 依赖。
+    const messageId = generateId();
+    conv.messages.push({ role: 'user', content: text, messageId, provider: conv.provider, ts: now() });
     if (!conv.title) {
       conv.title = text.slice(0, 20);
     }
@@ -1408,7 +1630,6 @@ export function useAliangChat() {
 
     sending.value = true;
     if (!conv.aiSessionId) conv.aiSessionId = 'local-' + conv.id;
-    const messageId = generateId();
 
     try {
       await ensureAISocket();
@@ -1517,6 +1738,7 @@ export function useAliangChat() {
     // 方法（模板事件直接绑定的入口）
     applySessionSettings,
     applySlash,
+    cancelRecall,
     cancelRename,
     close,
     commitRename,
@@ -1525,8 +1747,11 @@ export function useAliangChat() {
     loadRecentProjects,
     onSidebarItemClick,
     onSlashInput,
+    recallActive,
     respondApproval,
     sendMessage,
+    sendRecall,
+    startRecall,
     startRename,
     stopRun,
   };

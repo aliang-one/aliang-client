@@ -43,6 +43,7 @@
               v-if="item.type === 'message'"
               :msg="item"
               :now-tick="nowTick"
+              @recall="emit('recall', $event)"
             />
             <!-- 插话气泡（原 Task 4 轻量条融入时间线）：⚡ 徽 + 插话标签 +
                  状态 chip（steerStatusLabel 六态）+ 正文/失败详情。v-else-if
@@ -123,7 +124,7 @@ const props = defineProps({
   scrollToBottom: { type: Function, required: true },
 });
 
-const emit = defineEmits(['approval-respond']);
+const emit = defineEmits(['approval-respond', 'recall']);
 
 const { t } = useI18n();
 

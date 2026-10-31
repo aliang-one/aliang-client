@@ -298,6 +298,16 @@ export default {
   chat_scrollToBottom: 'Back to bottom',
   chat_approvalMore: 'Show more',
   chat_approvalLess: 'Show less',
+  // Recall & resend (Task 13): banner / bubble hover actions (copy + recall) /
+  // confirm / cancel / stop-timeout and unconfirmed retry copy. Paired with zh.js
+  // (i18n.test.js key-set guard).
+  chat_recallBanner: 'This will truncate this message and everything after it, effective on send',
+  chat_recallButton: 'Recall & resend',
+  chat_recallConfirm: 'Resend',
+  chat_recallCancel: 'Cancel',
+  chat_recallStopTimeout: 'Stop timed out. Please retry.',
+  chat_recallUnconfirmed: 'Recall not confirmed. You can retry.',
+  chat_copyMessage: 'Copy',
 
   // -- App --
   app_restoringSession: 'Restoring saved session...',

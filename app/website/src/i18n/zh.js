@@ -296,6 +296,15 @@ export default {
   chat_scrollToBottom: '回到底部',
   chat_approvalMore: '展开',
   chat_approvalLess: '收起',
+  // 撤回重发（Task 13）：banner / 气泡 hover 操作条（复制+撤回）/ 确认键 /
+  // 取消 / 停止超时与未确认的可重试文案，与 en.js 成对维护（i18n.test.js 守键集）。
+  chat_recallBanner: '将截断此消息及之后的全部对话，发送后生效',
+  chat_recallButton: '撤回重发',
+  chat_recallConfirm: '确认重发',
+  chat_recallCancel: '取消',
+  chat_recallStopTimeout: '停止超时，请重试',
+  chat_recallUnconfirmed: '撤回未确认，可重试',
+  chat_copyMessage: '复制',
 
   // -- App --
   app_restoringSession: '正在恢复会话...',

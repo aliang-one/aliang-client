@@ -59,6 +59,7 @@
         :set-near-bottom="setMessagesNearBottom"
         :scroll-to-bottom="scrollToBottom"
         @approval-respond="onApprovalRespond"
+        @recall="startRecall"
       />
 
       <ChatComposer
@@ -70,12 +71,15 @@
         :running="activeSessionRunning"
         :steer-blocked="steerBlocked"
         :approval-blocked="sendApprovalBlocked"
+        :recall-active="recallActive"
         :slash-open="slashOpen"
         :slash-matches="slashMatches"
         :slash-index="slashIndex"
         :set-input-el="setInputEl"
         @send="sendMessage"
         @stop="stopRun"
+        @recall-confirm="onRecallConfirm"
+        @recall-cancel="cancelRecall"
         @slash-apply="applySlash"
         @slash-index="slashIndex = $event"
         @slash-close="slashOpen = false"
@@ -108,6 +112,7 @@ const {
   activeSteerItems,
   applySessionSettings,
   applySlash,
+  cancelRecall,
   cancelRename,
   close,
   commitRename,
@@ -124,12 +129,14 @@ const {
   nowTick,
   onSidebarItemClick,
   onSlashInput,
+  recallActive,
   renameDraft,
   renamingId,
   renameSurface,
   respondApproval,
   scrollToBottom,
   sendMessage,
+  sendRecall,
   sendButtonLabel,
   sendApprovalBlocked,
   sendDisabled,
@@ -141,6 +148,7 @@ const {
   slashIndex,
   slashMatches,
   slashOpen,
+  startRecall,
   startRename,
   steerBlocked,
   stopRun,
@@ -155,6 +163,12 @@ function onApplySettings(patch) {
 // 审批卡应答落点：conv 取当前活跃会话（列表只渲染活跃会话的审批）。
 function onApprovalRespond(approval, decision) {
   respondApproval(activeConversation.value, approval, decision);
+}
+
+// 撤回确认重发落点（Task 13）：conv 取当前活跃会话；状态机/发送链全在
+// useAliangChat（recalling 在途守卫、stop→终态等待、truncate create 确认门）。
+function onRecallConfirm() {
+  sendRecall(activeConversation.value);
 }
 
 function handleKeydown(e) {
