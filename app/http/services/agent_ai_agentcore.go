@@ -1074,11 +1074,18 @@ func (m *agentAIManager) bindAgentCoreNativeSession(run agentAIRun, writeJSON ag
 // 空输出不落行；僵尸回合不打（agentAIRunSideEffectsAllowed 围栏，与成功出口
 // 同款）——finalized 后迟返回的僵尸不许写任何 journal。messageID 加 -partial
 // 后缀防与成功行撞 appendMsg 去重键。
-func (m *agentAIManager) journalPartialAssistant(journal *agentCoreJournal, run agentAIRun, output *strings.Builder, outMu *sync.Mutex) {
+func (m *agentAIManager) journalPartialAssistant(journal *agentCoreJournal, diag *agentCoreDiagnostics, run agentAIRun, output *strings.Builder, outMu *sync.Mutex) {
 	if journal == nil || output == nil || outMu == nil {
 		return
 	}
 	if !m.agentAIRunSideEffectsAllowed(run.sessionID, run.runSeq, run.guard) {
+		return
+	}
+	// 单一真源门(2026-10-31 健康会话重复气泡防御):run 已有带正文回合完成
+	// 时,turn 行已覆盖 assistant 内容,半截输出与 turn 行内容重叠——再落
+	// -partial 只会在 detail 回放时成为重复表示。零带正文回合的在途半截文本
+	// 仍由 -partial 独家保留(见 test:KeptWithoutTextTurn)。
+	if diag.hasTextTurns() {
 		return
 	}
 	outMu.Lock()
@@ -1395,7 +1402,7 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 	if ctx.Err() != nil {
 		// 被停止：内核可能已发过 interrupted 终止帧；若 pipe 已随 cancel 关闭，
 		// 该帧会被丢弃（内核忽略这处写错误）。这里统一收敛状态。
-		m.journalPartialAssistant(journal, run, &output, &outMu)
+		m.journalPartialAssistant(journal, diag, run, &output, &outMu)
 		status, errMsg := agentAIRunStoppedStatus(run.activity, limiter)
 		finalizeRunSubagents(run, writeJSON)
 		statusPayload := map[string]interface{}{
@@ -1431,13 +1438,13 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		endErrMsg = reason
 		logger.Warn(fmt.Sprintf("[agentcore] run failed session=%s msg=%s err=%s",
 			run.sessionID, run.messageID, reason))
-		m.journalPartialAssistant(journal, run, &output, &outMu)
+		m.journalPartialAssistant(journal, diag, run, &output, &outMu)
 		finalizeRunSubagents(run, writeJSON)
 		return
 	}
 	if runErr != nil {
 		endErrMsg = runErr.Error()
-		m.journalPartialAssistant(journal, run, &output, &outMu)
+		m.journalPartialAssistant(journal, diag, run, &output, &outMu)
 		finalizeRunSubagents(run, writeJSON)
 		_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, runErr))
 		return
@@ -1452,7 +1459,13 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 
 	if m.agentAIRunSideEffectsAllowed(run.sessionID, run.runSeq, run.guard) {
 		m.appendAssistantHistory(run.sessionID, run.runSeq, run.messageID, assistantOutput)
-		journal.appendAssistant(run.sessionID, agentAssistantMessageID(run.messageID), assistantOutput, time.Now().UTC().Format(time.RFC3339))
+		// 单一真源门:带正文回合已完成时 turn 行已覆盖 assistant 内容,run 级
+		// 累计行(内容=各回合拼接,与任何单行都不等,server 内容去重接不住)
+		// 不再落 journal——否则 detail 回放出现重复大气泡。零带正文回合时
+		// assistantOutput 为空,appendMsg 空文本守卫本就不落行。
+		if !diag.hasTextTurns() {
+			journal.appendAssistant(run.sessionID, agentAssistantMessageID(run.messageID), assistantOutput, time.Now().UTC().Format(time.RFC3339))
+		}
 		endStatus = "success"
 		m.setAgentAIResumeSessionIDIfEmpty(run.sessionID, run.runSeq, capturedResumeSessionID)
 		// 刻意跳过 ccPeerSessionJSONL / appendLineageMarker：那是 Claude CLI 的
@@ -1511,6 +1524,30 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 type agentCoreDiagnostics struct {
 	mu   sync.Mutex
 	snap agentcore.TurnSnapshot
+	// textTurns:本 run 已完成且带正文的回合数(OnTurnEnd 且 text 非空)。
+	// journal 单一真源门的依据——有带正文回合即意味着 turn 行已覆盖该 run
+	// 的 assistant 内容,-partial/run 级累计行都只会成为重复表示。
+	textTurns int
+}
+
+// noteTextTurn 记录一个带正文回合完成(OnTurnEnd 且 text 非空)。
+func (d *agentCoreDiagnostics) noteTextTurn() {
+	if d == nil {
+		return
+	}
+	d.mu.Lock()
+	d.textTurns++
+	d.mu.Unlock()
+}
+
+// hasTextTurns 报告本 run 是否已有带正文回合完成。
+func (d *agentCoreDiagnostics) hasTextTurns() bool {
+	if d == nil {
+		return false
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.textTurns > 0
 }
 
 func (d *agentCoreDiagnostics) set(s agentcore.TurnSnapshot) {
@@ -1612,6 +1649,9 @@ func agentCoreLoopHooks(m *agentAIManager, run agentAIRun, diag *agentCoreDiagno
 				}
 			}
 			m.coreJournal.appendAssistantTurn(run.sessionID, turnN, tr.Text, tr.Thinking, tr.StopReason, tools)
+			if strings.TrimSpace(tr.Text) != "" {
+				diag.noteTextTurn()
+			}
 		},
 		// 自动压缩替换了历史 → 同步落回会话 history。不落的话 next run 又从
 		// 旧历史重建，压缩白做（而且每轮 run 都会重新烧一次摘要请求）。

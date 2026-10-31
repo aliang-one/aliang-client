@@ -792,8 +792,11 @@ func TestRunAgentCoreJournalsTranscript(t *testing.T) {
 	m.runAgentCore(context.Background(), run, log.write)
 
 	lines := readAgentCoreJournalRows(t, sessionID)
-	if len(lines) != 5 {
-		t.Fatalf("journal 行数 = %d, want 5: %v", len(lines), lines)
+	// 2026-10-31 单一真源门:带正文回合已完成 → run 级累计 assistant 行不再
+	// 落(内容=各回合拼接,与 turn 行构成重复表示,detail 回放会出重复气泡)。
+	// journal 契约 = session / user / turn / end 四行。
+	if len(lines) != 4 {
+		t.Fatalf("journal 行数 = %d, want 4: %v", len(lines), lines)
 	}
 	if lines[0]["kind"] != "session" || lines[0]["model"] != "glm-5.2" {
 		t.Errorf("头行 = %v", lines[0])
@@ -805,11 +808,8 @@ func TestRunAgentCoreJournalsTranscript(t *testing.T) {
 	if lines[2]["kind"] != "turn" || lines[2]["text"] != "你好，世界" || lines[2]["turn"] != float64(1) {
 		t.Errorf("turn 行 = %v（逐回合 transcript）", lines[2])
 	}
-	if lines[3]["role"] != "assistant" || lines[3]["text"] != "你好，世界" {
-		t.Errorf("assistant 行 = %v", lines[3])
-	}
-	if lines[4]["kind"] != "end" || lines[4]["status"] != "success" {
-		t.Errorf("end 行 = %v", lines[4])
+	if lines[3]["kind"] != "end" || lines[3]["status"] != "success" {
+		t.Errorf("end 行 = %v(累计 assistant 行已由 turn 行取代,不再落)", lines[3])
 	}
 	_ = up
 }
