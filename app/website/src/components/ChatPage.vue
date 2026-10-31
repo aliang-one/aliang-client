@@ -67,13 +67,14 @@
         :disabled="sendDisabled"
         :label="sendButtonLabel"
         :placeholder="inputPlaceholder"
-        :running="activeRunning"
+        :running="activeSessionRunning"
         :steer-blocked="steerBlocked"
         :slash-open="slashOpen"
         :slash-matches="slashMatches"
         :slash-index="slashIndex"
         :set-input-el="setInputEl"
         @send="sendMessage"
+        @stop="stopRun"
         @slash-apply="applySlash"
         @slash-index="slashIndex = $event"
         @slash-close="slashOpen = false"
@@ -102,6 +103,7 @@ const {
   activeIsDevice,
   activeMessages,
   activeRunning,
+  activeSessionRunning,
   activeSteerItems,
   applySessionSettings,
   applySlash,
@@ -139,6 +141,7 @@ const {
   slashOpen,
   startRename,
   steerBlocked,
+  stopRun,
 } = useAliangChat();
 
 // 设置条补丁落点：conv 取当前活跃会话（与拆分前各调用点同源），

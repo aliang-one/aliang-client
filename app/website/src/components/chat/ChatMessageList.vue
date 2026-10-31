@@ -9,62 +9,62 @@
       @scroll.passive="onScroll"
     >
       <div class="mx-auto w-full max-w-3xl px-4 py-6">
-      <!-- deviceLoadError 独立于空态渲染（首页失败 =「空转录 + 错误条」并存） -->
-      <div
-        v-if="conversation?.deviceLoadError"
-        data-testid="device-session-load-error"
-        class="mb-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-600 dark:border-rose-800 dark:bg-rose-950/40 dark:text-rose-300"
-      >
-        <!-- deviceLoadError 只存布尔标记，文案在渲染时走 i18n（随语言切换） -->
-        {{ t('chat_deviceSessionLoadFailed') }}
-      </div>
-      <!-- 品牌空状态（无活跃会话 / 空转录且无插话/审批在挂）：渐变圆徽 + 标题 +
-           副文案。空转录但已有审批/插话时不显示 hero（内容列表照常渲染）。 -->
-      <div
-        v-if="!activeId || (activeMessages.length === 0 && steerItems.length === 0 && approvals.length === 0)"
-        class="flex min-h-[45vh] flex-col items-center justify-center gap-3 py-10 text-center"
-      >
-        <div class="flex size-16 items-center justify-center rounded-full bg-gradient-to-br from-primary to-emerald-500 text-white shadow-lg shadow-primary/20">
-          <span class="material-symbols-outlined text-3xl">auto_awesome</span>
-        </div>
-        <p class="text-base font-semibold text-slate-700 dark:text-slate-200">{{ t('chat_heroTitle') }}</p>
-        <p class="text-sm text-slate-400">{{ t('chat_startNew') }}</p>
-      </div>
-      <template v-else>
-        <ChatMessageBubble
-          v-for="(msg, idx) in activeMessages"
-          :key="idx"
-          :msg="msg"
-          :now-tick="nowTick"
-        />
-        <!-- 插话轻量条（Task 4）：运行中回合的旁路注入，不插独立 user 气泡——
-             快照/详情装载的转录才是权威流，避免回灌重复渲染。 -->
+        <!-- deviceLoadError 独立于空态渲染（首页失败 =「空转录 + 错误条」并存） -->
         <div
-          v-for="item in steerItems"
-          :key="item.messageId"
-          data-testid="chat-steer-item"
-          class="mb-3 ml-auto w-fit max-w-[85%] rounded-lg border border-primary/30 bg-primary/5 px-3 py-2 text-xs"
+          v-if="conversation?.deviceLoadError"
+          data-testid="device-session-load-error"
+          class="mb-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-600 dark:border-rose-800 dark:bg-rose-950/40 dark:text-rose-300"
         >
-          <div class="flex flex-wrap items-center gap-2">
-            <span class="material-symbols-outlined text-sm text-primary">bolt</span>
-            <span class="font-semibold text-slate-600 dark:text-slate-200">
-              {{ t('chat_steerLabel') }}
-            </span>
-            <span
-              data-testid="chat-steer-status"
-              :class="item.status === 'failed' ? 'text-rose-500' : 'font-medium text-primary'"
-            >{{ steerStatusLabel(item) }}</span>
-          </div>
-          <p class="mt-1 whitespace-pre-wrap break-all text-slate-600 dark:text-slate-300">{{ item.content }}</p>
-          <p v-if="item.status === 'failed' && item.detail" class="mt-1 text-rose-500">{{ item.detail }}</p>
+          <!-- deviceLoadError 只存布尔标记，文案在渲染时走 i18n（随语言切换） -->
+          {{ t('chat_deviceSessionLoadFailed') }}
         </div>
-        <ChatApprovalCard
-          v-for="approval in approvals"
-          :key="approval.key"
-          :approval="approval"
-          :now-tick="nowTick"
-          @respond="(decision) => emit('approval-respond', approval, decision)"
-        />
+        <!-- 品牌空状态（无活跃会话 / 空转录且无插话/审批在挂）：渐变圆徽 + 标题 +
+             副文案。空转录但已有审批/插话时不显示 hero（内容列表照常渲染）。 -->
+        <div
+          v-if="!activeId || (activeMessages.length === 0 && steerItems.length === 0 && approvals.length === 0)"
+          class="flex min-h-[45vh] flex-col items-center justify-center gap-3 py-10 text-center"
+        >
+          <div class="flex size-16 items-center justify-center rounded-full bg-gradient-to-br from-primary to-emerald-500 text-white shadow-lg shadow-primary/20">
+            <span class="material-symbols-outlined text-3xl">auto_awesome</span>
+          </div>
+          <p class="text-base font-semibold text-slate-700 dark:text-slate-200">{{ t('chat_heroTitle') }}</p>
+          <p class="text-sm text-slate-400">{{ t('chat_startNew') }}</p>
+        </div>
+        <template v-else>
+          <ChatMessageBubble
+            v-for="(msg, idx) in activeMessages"
+            :key="idx"
+            :msg="msg"
+            :now-tick="nowTick"
+          />
+          <!-- 插话轻量条（Task 4）：运行中回合的旁路注入，不插独立 user 气泡——
+               快照/详情装载的转录才是权威流，避免回灌重复渲染。 -->
+          <div
+            v-for="item in steerItems"
+            :key="item.messageId"
+            data-testid="chat-steer-item"
+            class="mb-3 ml-auto w-fit max-w-[85%] rounded-lg border border-primary/30 bg-primary/5 px-3 py-2 text-xs"
+          >
+            <div class="flex flex-wrap items-center gap-2">
+              <span class="material-symbols-outlined text-sm text-primary">bolt</span>
+              <span class="font-semibold text-slate-600 dark:text-slate-200">
+                {{ t('chat_steerLabel') }}
+              </span>
+              <span
+                data-testid="chat-steer-status"
+                :class="item.status === 'failed' ? 'text-rose-500' : 'font-medium text-primary'"
+              >{{ steerStatusLabel(item) }}</span>
+            </div>
+            <p class="mt-1 whitespace-pre-wrap break-all text-slate-600 dark:text-slate-300">{{ item.content }}</p>
+            <p v-if="item.status === 'failed' && item.detail" class="mt-1 text-rose-500">{{ item.detail }}</p>
+          </div>
+          <ChatApprovalCard
+            v-for="approval in approvals"
+            :key="approval.key"
+            :approval="approval"
+            :now-tick="nowTick"
+            @respond="(decision) => emit('approval-respond', approval, decision)"
+          />
         </template>
       </div>
     </div>

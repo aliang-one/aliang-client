@@ -50,23 +50,29 @@
           ></textarea>
         </div>
       </div>
+      <!-- 动作槽（Task 9，对齐手机端交替语义）：非 running → 发送键；running
+           且输入非空 → 发送键（点击走既有 steer 分流——emit('send') 不变，
+           label 沿用 插话中/发送，disabled 沿用 sendDisabled）；running 且输入
+           空 → 停止键（emit('stop') 接 ai.stop，目标 id 与 steer 同构）。
+           Task 8 占位的「running 即整键禁用」死路径已删——触控端 running 时
+           两个键位至少有一个可点。 -->
       <button
+        v-if="running && !hasInput"
         type="button"
-        class="min-h-[40px] shrink-0 rounded-lg px-4 text-sm font-semibold transition md:min-h-0"
-        :class="running
-          ? 'flex items-center gap-1 bg-slate-200 text-slate-500 dark:bg-slate-700 dark:text-slate-400'
-          : 'bg-primary text-white hover:bg-primary/90'"
-        :disabled="disabled || running"
-        @click="emit('send')"
+        data-testid="chat-stop-button"
+        class="min-h-[40px] flex shrink-0 items-center gap-1 rounded-lg bg-slate-200 px-4 text-sm font-semibold text-slate-500 transition hover:bg-slate-300 md:min-h-0 dark:bg-slate-700 dark:text-slate-400 dark:hover:bg-slate-600"
+        @click="emit('stop')"
       >
-        <!-- running 键位切换停止键（Task 8 仅 UI 占位与禁用态视觉，点击行为
-             Task 9 接线）：disabled 兜底保证占位期点击无副作用。 -->
-        <template v-if="running">
-          <span class="material-symbols-outlined text-base leading-none">stop_circle</span>
-          <span>{{ t('chat_stop') }}</span>
-        </template>
-        <template v-else>{{ label }}</template>
+        <span class="material-symbols-outlined text-base leading-none">stop_circle</span>
+        <span>{{ t('chat_stop') }}</span>
       </button>
+      <button
+        v-else
+        type="button"
+        class="min-h-[40px] shrink-0 rounded-lg bg-primary px-4 text-sm font-semibold text-white transition hover:bg-primary/90 md:min-h-0"
+        :disabled="disabled"
+        @click="emit('send')"
+      >{{ label }}</button>
     </div>
   </div>
 </template>
@@ -84,7 +90,8 @@ const props = defineProps({
   disabled: { type: Boolean, default: false },
   label: { type: String, default: '' },
   placeholder: { type: String, default: '' },
-  // running（活跃会话流式中）→ 发送键位切停止键占位（Task 9 接点击行为）。
+  // running（会话级并集判定：本地流式气泡 OR 设备壳清单/快照 running）→
+  // 动作槽进入 发送/停止 交替语义（Task 9；门控源与 steer 分流同源）。
   running: { type: Boolean, default: false },
   steerBlocked: { type: Boolean, default: false },
   // slash 补全状态由 useAliangChat 持有（命令缓存被帧路由写、open/index 被
@@ -100,6 +107,8 @@ const props = defineProps({
 const emit = defineEmits([
   'update:modelValue',
   'send',
+  // running 且输入空时停止键的点击出口（Task 9）：ChatPage 接 stopRun 发 ai.stop。
+  'stop',
   'slash-apply',
   'slash-index',
   'slash-close',
@@ -107,6 +116,10 @@ const emit = defineEmits([
 ]);
 
 const { t } = useI18n();
+
+// 输入是否「实义非空」：空白按空判定——与 sendMessage 的 trim 守卫同口径，
+// 别让「看似可发、点了无操作」的死发送键占住停止键位。
+const hasInput = computed(() => props.modelValue.trim() !== '');
 
 // 经 computed 承接原生 v-model：保留 Vue 对 IME 组合期的守卫语义（组合期间
 // 不回写），事件顺序与拆分前一致（v-model 先写值，@input 再做 slash 求值）。
@@ -145,14 +158,15 @@ function onInput() {
 }
 
 // 发送后（或任意清空）复位单行；外部赋值（e2e fill/applySlash 补全）走
-// 同一 watcher 同步高度。
+// 同一 watcher 同步高度。immediate：挂载即带初值（恢复草稿等）时也走一次
+// 高度同步——setup 期元素未交接则 autosize 内部空守卫自然跳过。
 watch(() => props.modelValue, (v) => {
   if (!v) {
     resetHeight();
     return;
   }
   autosize();
-});
+}, { immediate: true });
 
 // Unified keydown so the popup can intercept arrows/enter/tab/escape before the
 // send-on-enter binding fires.

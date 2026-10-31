@@ -28,6 +28,9 @@
       <template v-for="group in groups" :key="group.key">
         <template v-if="group.items.length">
           <div class="px-5 pt-3 pb-1 text-[11px] font-semibold text-slate-400 uppercase tracking-wider">{{ group.label }}</div>
+          <!-- active 竖条依赖同插件值序：基类 before:opacity-0 兜底非活跃态，
+               活跃态 before:opacity-100 按 opacity 插件值序（0 → 100）在生成
+               样式表中居后胜出——:class 分支里不再重复写 before:opacity-0。 -->
           <div
             v-for="c in group.items"
             :key="c.id"
@@ -36,7 +39,7 @@
             class="group relative mx-2 cursor-pointer rounded-lg px-3 py-2 text-left text-sm transition-colors before:absolute before:inset-y-1 before:left-0 before:w-0.5 before:rounded-full before:bg-primary before:content-[''] before:opacity-0 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
             :class="c.id === activeId
               ? 'bg-primary/10 font-medium text-primary before:opacity-100'
-              : 'text-slate-700 hover:bg-slate-100 before:opacity-0 dark:text-slate-300 dark:hover:bg-slate-800'"
+              : 'text-slate-700 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800'"
             @click="emit('item-click', c)"
             @keydown.enter.prevent="emit('item-click', c)"
             @keydown.space.prevent="emit('item-click', c)"
