@@ -2,9 +2,12 @@
 // 沿用 createApp + document.body 挂载断言 innerHTML 的手法(vite.config
 // 已配 jsdom)。初始渲染是同步路径(ref 初始化 + onMounted 增强),
 // mount() 返回后 innerHTML 即含增强产物,无需等待防抖。
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { createApp, h } from 'vue';
 import ChatMarkdown from './ChatMarkdown.vue';
+import { useI18n } from '../../i18n';
+
+const { t } = useI18n();
 
 function mountHtml(content) {
   const el = document.createElement('div');
@@ -30,5 +33,29 @@ describe('ChatMarkdown', () => {
     const long = '```txt\n' + Array.from({ length: 25 }, (_, i) => 'l' + i).join('\n') + '\n```';
     const html = mountHtml(long);
     expect(html).toContain('chat-md-fold');
+  });
+  // C1 回归:回调内定时器变量曾遮蔽 i18n 的 t(TDZ ReferenceError),
+  // 复制反馈从未生效。jsdom 无 navigator.clipboard,显式置 undefined
+  // 强制走 execCommand 兜底路径;文案期望值经 useI18n().t 动态取,
+  // 不依赖测试环境 locale。
+  it('点击复制按钮:文案变「已复制」并在定时后还原', async () => {
+    vi.useFakeTimers();
+    try {
+      Object.defineProperty(navigator, 'clipboard', { value: undefined, configurable: true });
+      const el = document.createElement('div');
+      const app = createApp({ render: () => h(ChatMarkdown, { content: '```go\nx := 1\n```' }) });
+      app.mount(el);
+      const btn = el.querySelector('.chat-md-copy');
+      expect(btn.textContent).toBe(t('chat_md_copy'));
+      btn.click();
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(btn.textContent).toBe(t('chat_md_copied'));
+      vi.advanceTimersByTime(1500);
+      expect(btn.textContent).toBe(t('chat_md_copy'));
+      app.unmount();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
