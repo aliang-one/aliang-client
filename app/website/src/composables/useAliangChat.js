@@ -69,6 +69,11 @@ export function useAliangChat() {
   const inputText = ref('');
   const sending = ref(false);
   const messagesContainer = ref(null);
+  // 滚动跟随守卫（Task 8）：用户贴底时流式增量照常拽底；一旦上翻看历史
+  // （距底 ≥120px），delta/审批卡/系统条等自动滚动全部静默，改由「回到底部」
+  // 浮钮承载。初始 true——发消息前用户必然在底部（e2e「发消息后内容可见」
+  // 依赖该行为保真）。ChatMessageList 的 @scroll 经函数 prop 反向同步。
+  const messagesNearBottom = ref(true);
   const inputRef = ref(null);
   const showMobileSidebar = ref(false);
 
@@ -278,6 +283,9 @@ export function useAliangChat() {
       if (prev) unsubscribeDeviceSession(prev);
     }
     createError.value = '';
+    // 切会话即视为重新贴底：转录装载后的「看到最新一条」语义不被上一个
+    // 会话里残留的上翻状态劫持（随后 scrollToBottom 走常规贴底路径）。
+    messagesNearBottom.value = true;
   });
 
   // create 确认门：sendMessage 发出 create 后等回执再发 ai.message——目录无效
@@ -675,7 +683,11 @@ export function useAliangChat() {
     sendAI({ type: 'ai.session.unsubscribe', session_id: shell.deviceSession.id });
   }
 
-  function scrollToBottom() {
+  // 自动滚动改为贴底守卫版（Task 8）：默认仅在 messagesNearBottom 时执行；
+  // 用户主动作（发消息/插话/点「回到底部」）传 force=true 无条件拽底——用户
+  // 动作意味着「我要看新内容」，不回首翻滚前的阅读位置。
+  function scrollToBottom(force = false) {
+    if (!force && !messagesNearBottom.value) return;
     nextTick(() => {
       if (messagesContainer.value) {
         messagesContainer.value.scrollTop = messagesContainer.value.scrollHeight;
@@ -687,6 +699,13 @@ export function useAliangChat() {
   // 卸载时以 null 落值）。
   function setMessagesContainer(el) {
     messagesContainer.value = el;
+  }
+
+  // nearBottom 反向同步：滚动容器元素同样在 ChatMessageList，@scroll 几何判定
+  // （距底 <120px 即贴底）后经本函数写回。与 setMessagesContainer 同一套
+  // 函数-prop 交接模式。
+  function setMessagesNearBottom(v) {
+    messagesNearBottom.value = !!v;
   }
 
   // --- Local agent AI streaming over WebSocket ---
@@ -1018,7 +1037,8 @@ export function useAliangChat() {
     };
     conv.steerItems.push(item);
     inputText.value = '';
-    scrollToBottom();
+    // 用户主动作：无条件贴底（上翻状态不劫持用户刚发出的插话）。
+    scrollToBottom(true);
     try {
       await ensureAISocket();
       const ok = sendAI({ type: 'ai.steer', session_id: target, message_id: item.messageId, content: text });
@@ -1326,13 +1346,15 @@ export function useAliangChat() {
     conv.updatedAt = now();
     inputText.value = '';
     saveToStorage();
-    scrollToBottom();
+    // 用户主动作：无条件贴底（e2e「发消息后内容可见」的保真路径——发消息前
+    // 用户必然在底部，force 只是把该不变量钉死，不被任何上翻残留劫持）。
+    scrollToBottom(true);
 
     // Live assistant placeholder: its content fills in token-by-token as
     // ai.delta frames arrive, and its status drives the running -> done UI.
     const assistantMsg = { role: 'assistant', content: '', status: 'running', ts: now() };
     conv.messages.push(assistantMsg);
-    scrollToBottom();
+    scrollToBottom(true);
 
     sending.value = true;
     if (!conv.aiSessionId) conv.aiSessionId = 'local-' + conv.id;
@@ -1432,9 +1454,12 @@ export function useAliangChat() {
     slashOpen,
     steerBlocked,
     // DOM 交接（拆分后元素在 chat/ 子组件里，经函数 prop 交回）
+    messagesNearBottom,
     setInputEl,
     setMessagesContainer,
+    setMessagesNearBottom,
     setRenameInput,
+    scrollToBottom,
     // 方法（模板事件直接绑定的入口）
     applySessionSettings,
     applySlash,

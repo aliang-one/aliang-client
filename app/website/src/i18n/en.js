@@ -284,6 +284,17 @@ export default {
   chat_md_copy: 'Copy',
   chat_md_copied: 'Copied',
   chat_md_unfold: 'Expand',
+  // Visual modernization (Task 8): empty-state hero / relative time / stop
+  // button placeholder / back-to-bottom pill / approval summary toggle,
+  // kept in pairs with zh.js (i18n.test.js key-set guard).
+  chat_heroTitle: 'Start a new conversation',
+  chat_justNow: 'Just now',
+  chat_minutesAgo: '{minutes} min ago',
+  chat_hoursAgo: '{hours} h ago',
+  chat_stop: 'Stop',
+  chat_scrollToBottom: 'Back to bottom',
+  chat_approvalMore: 'Show more',
+  chat_approvalLess: 'Show less',
 
   // -- App --
   app_restoringSession: 'Restoring saved session...',

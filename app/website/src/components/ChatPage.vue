@@ -55,6 +55,9 @@
         :approvals="activeApprovals"
         :now-tick="nowTick"
         :set-container="setMessagesContainer"
+        :near-bottom="messagesNearBottom"
+        :set-near-bottom="setMessagesNearBottom"
+        :scroll-to-bottom="scrollToBottom"
         @approval-respond="onApprovalRespond"
       />
 
@@ -64,6 +67,7 @@
         :disabled="sendDisabled"
         :label="sendButtonLabel"
         :placeholder="inputPlaceholder"
+        :running="activeRunning"
         :steer-blocked="steerBlocked"
         :slash-open="slashOpen"
         :slash-matches="slashMatches"
@@ -113,6 +117,7 @@ const {
   inputText,
   loadRecentProjects,
   mergedConversations,
+  messagesNearBottom,
   nowTick,
   onSidebarItemClick,
   onSlashInput,
@@ -120,11 +125,13 @@ const {
   renamingId,
   renameSurface,
   respondApproval,
+  scrollToBottom,
   sendMessage,
   sendButtonLabel,
   sendDisabled,
   setInputEl,
   setMessagesContainer,
+  setMessagesNearBottom,
   setRenameInput,
   showMobileSidebar,
   slashIndex,

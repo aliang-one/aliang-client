@@ -283,6 +283,16 @@ export default {
   chat_md_copy: '复制',
   chat_md_copied: '已复制',
   chat_md_unfold: '展开全部',
+  // 视觉现代化（Task 8）：空状态 hero / 相对时间 / 停止键占位 / 回到底部浮钮 /
+  // 审批卡摘要展开，与 en.js 成对维护（i18n.test.js 守键集）。
+  chat_heroTitle: '开始新的对话',
+  chat_justNow: '刚刚',
+  chat_minutesAgo: '{minutes} 分钟前',
+  chat_hoursAgo: '{hours} 小时前',
+  chat_stop: '停止',
+  chat_scrollToBottom: '回到底部',
+  chat_approvalMore: '展开',
+  chat_approvalLess: '收起',
 
   // -- App --
   app_restoringSession: '正在恢复会话...',

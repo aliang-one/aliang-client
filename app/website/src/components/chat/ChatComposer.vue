@@ -11,8 +11,8 @@
     >
       {{ t('chat_steerBlocked') }}
     </div>
-    <div class="flex items-center gap-2">
-      <div class="relative flex-1">
+    <div class="flex items-end gap-2">
+      <div class="relative min-w-0 flex-1">
         <div
           v-if="slashOpen && slashMatches.length"
           class="absolute bottom-full left-0 z-20 mb-2 max-h-60 w-full overflow-auto rounded-lg border border-slate-200 bg-white shadow-lg dark:border-slate-600 dark:bg-slate-800"
@@ -31,39 +31,61 @@
             <span class="truncate text-xs text-slate-500 dark:text-slate-400">{{ c.description }}</span>
           </button>
         </div>
-        <input
-          :ref="setInputEl"
-          v-model="inputModel"
-          type="text"
-          :placeholder="placeholder"
-          :disabled="disabled"
-          class="h-10 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm text-slate-700 outline-none transition focus:border-primary dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100"
-          @input="emit('slash-input')"
-          @keydown="onInputKeydown"
-          @blur="closeSlashDeferred"
-        />
+        <!-- 胶囊容器 + 自增高 textarea（≤6 行 = 144px）。focus 环挂在容器
+             focus-within 上；触控定式 min-h-[40px] md:min-h-0 保留在 textarea
+             与发送键上。 -->
+        <div
+          class="flex items-end rounded-2xl border border-slate-200 bg-white transition focus-within:border-primary dark:border-slate-600 dark:bg-slate-800"
+        >
+          <textarea
+            :ref="bindInputEl"
+            v-model="inputModel"
+            rows="1"
+            :placeholder="placeholder"
+            :disabled="disabled"
+            class="min-h-[40px] w-full resize-none bg-transparent px-3 py-2 text-sm text-slate-700 outline-none placeholder:text-slate-400 dark:text-slate-100 dark:placeholder:text-slate-500 md:min-h-0"
+            @input="onInput"
+            @keydown="onInputKeydown"
+            @blur="closeSlashDeferred"
+          ></textarea>
+        </div>
       </div>
       <button
         type="button"
-        class="h-10 shrink-0 rounded-lg bg-primary px-4 text-sm font-semibold text-white transition hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-60"
-        :disabled="disabled"
+        class="min-h-[40px] shrink-0 rounded-lg px-4 text-sm font-semibold transition md:min-h-0"
+        :class="running
+          ? 'flex items-center gap-1 bg-slate-200 text-slate-500 dark:bg-slate-700 dark:text-slate-400'
+          : 'bg-primary text-white hover:bg-primary/90'"
+        :disabled="disabled || running"
         @click="emit('send')"
       >
-        {{ label }}
+        <!-- running 键位切换停止键（Task 8 仅 UI 占位与禁用态视觉，点击行为
+             Task 9 接线）：disabled 兜底保证占位期点击无副作用。 -->
+        <template v-if="running">
+          <span class="material-symbols-outlined text-base leading-none">stop_circle</span>
+          <span>{{ t('chat_stop') }}</span>
+        </template>
+        <template v-else>{{ label }}</template>
       </button>
     </div>
   </div>
 </template>
 
 <script setup>
-import { computed } from 'vue';
+import { computed, watch } from 'vue';
 import { useI18n } from '../../i18n';
+import { isComposingEvent } from '../../composables/useAliangChat';
+
+// 自增高上限：144px ≈ 6 行（行高 20px + 上下 padding）。
+const TEXTAREA_MAX_HEIGHT = 144;
 
 const props = defineProps({
   modelValue: { type: String, default: '' },
   disabled: { type: Boolean, default: false },
   label: { type: String, default: '' },
   placeholder: { type: String, default: '' },
+  // running（活跃会话流式中）→ 发送键位切停止键占位（Task 9 接点击行为）。
+  running: { type: Boolean, default: false },
   steerBlocked: { type: Boolean, default: false },
   // slash 补全状态由 useAliangChat 持有（命令缓存被帧路由写、open/index 被
   // 输入事件写），本组件经 props 读、事件回写。
@@ -93,9 +115,52 @@ const inputModel = computed({
   set: (v) => emit('update:modelValue', v),
 });
 
+// 自增高：输入即按内容撑开（auto → min(scrollHeight, 144px)）；发送后
+// modelValue 清空，watch 复位单行。
+function autosize() {
+  const el = inputEl;
+  if (!el) return;
+  el.style.height = 'auto';
+  el.style.height = `${Math.min(el.scrollHeight, TEXTAREA_MAX_HEIGHT)}px`;
+}
+
+function resetHeight() {
+  const el = inputEl;
+  if (!el) return;
+  el.style.height = 'auto';
+}
+
+// 函数 ref 双职：本地记录元素（自增高用），同时把元素交接给 useAliangChat
+// （焦点驱动权仍在彼处，createConversation/applySlash 的 nextTick focus 不变；
+// 卸载时以 null 落值，两侧同步清空）。
+let inputEl = null;
+function bindInputEl(el) {
+  inputEl = el;
+  props.setInputEl(el);
+}
+
+function onInput() {
+  autosize();
+  emit('slash-input');
+}
+
+// 发送后（或任意清空）复位单行；外部赋值（e2e fill/applySlash 补全）走
+// 同一 watcher 同步高度。
+watch(() => props.modelValue, (v) => {
+  if (!v) {
+    resetHeight();
+    return;
+  }
+  autosize();
+});
+
 // Unified keydown so the popup can intercept arrows/enter/tab/escape before the
 // send-on-enter binding fires.
 function onInputKeydown(e) {
+  // IME 组合期守卫（Task 8 新增，textarea 迁移时顺带补齐——原 input 迁移自
+  // 拆分前时代的预存缺口）：组合期 Enter/Esc/方向键归属输入法（确认候选词/
+  // 取消组合/选词），不发送、不 preventDefault、不触发 slash 键盘流。
+  if (isComposingEvent(e)) return;
   const matches = props.slashMatches;
   if (props.slashOpen && matches.length) {
     if (e.key === 'ArrowDown') {
@@ -120,6 +185,8 @@ function onInputKeydown(e) {
     }
   }
   if (e.key === 'Enter') {
+    // Shift+Enter 换行（textarea 语义），裸 Enter 发送。
+    if (e.shiftKey) return;
     e.preventDefault();
     emit('send');
   }
