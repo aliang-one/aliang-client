@@ -383,6 +383,10 @@ export function useAliangChat() {
         resolve(status);
       };
       const timer = setTimeout(() => settle('timeout'), timeoutMs);
+      // 同 sid 二次 set 会把路由表项顶掉、首等待方从此无人结算只能空等死钟
+      //（与 pendingCreates 同款隐患）。当前唯一调用方（撤回链）由 recalling
+      // 单守不会并发；这里兜底撞键——立刻按 timeout 结算被顶掉的首等待方。
+      pendingTerminals.get(sid)?.('timeout');
       pendingTerminals.set(sid, settle);
     });
   }
@@ -1220,6 +1224,10 @@ export function useAliangChat() {
   //   → ack created → 本地时间线截到目标之前 + 新 user 气泡（新 messageId，
   //   provider 落上——canRecall 依赖）+ assistant 占位 → 看门狗 + ai.message。
   // create 超时/被拒：不发 ai.message，编辑态保留（createError 落可重试文案）。
+  // 取消（cancelRecall 清 recallState）= 中止在途链：链内每个 await 后复验
+  // 身份，失配即静默收尾——不发 ai.message、不动输入框（草稿由 cancelRecall
+  // 恢复）；recalling 由 finally 链尾复位（C1：成功路径曾漏复位，首次撤回后
+  // startRecall 守卫使入口永久哑火）。
   const RECALL_CREATE_ACK_MS = 5000;
   const recalling = ref(false);
 
@@ -1241,8 +1249,23 @@ export function useAliangChat() {
     recalling.value = true;
     sending.value = true;
     createError.value = '';
+    // resent：step③ 的 ai.message 是否已发出——catch 据此分流兜底文案（未发=
+    // 链前段失败、编辑态仍在可重试；已发=journal 已截/新气泡已落/编辑态已清，
+    // 「未确认可重试」文案错位，改走 sendMessage catch 同款口径）。
+    // aborted：链因取消在 await 点中止——finally 据此做编辑态兜底（见 finally）。
+    let resent = false;
+    let aborted = false;
     try {
       await ensureAISocket();
+      // I2 复验（每个 await 后）：取消=中止在途链。cancelRecall（用户取消/切
+      // 会话）清走 recallState——失配即静默收尾，后续动作一概不发、输入框不
+      // 动（草稿已由 cancelRecall 恢复）；sending 就地复位（未发出回合，终态
+      // 帧不会来），recalling 归 finally。
+      if (recallState.value !== st) {
+        aborted = true;
+        sending.value = false;
+        return;
+      }
 
       // ① running 先停。stop 目标与 steer 同构（本地 aiSessionId / 壳 managed
       //    ?? entry.id）；agentcore 撤回链的壳必回退 entry.id，空目标理论不可达，
@@ -1253,11 +1276,15 @@ export function useAliangChat() {
           throw new Error('socket-closed');
         }
         const terminal = await waitForSessionTerminal(target);
+        if (recallState.value !== st) {
+          aborted = true;
+          sending.value = false;
+          return; // 取消中止（同 ensureAISocket 后复验）
+        }
         if (terminal === 'timeout') {
           // 中止：编辑态与回填保留，绝不发 truncate create（场景 E 钉死）。
           createError.value = t('chat_recallStopTimeout');
-          sending.value = false; // 本函数的收尾在 recalling 尾部，早退须自理
-          recalling.value = false;
+          sending.value = false; // recalling 复位归 finally；早退分支 sending 自理
           return;
         }
       }
@@ -1270,10 +1297,16 @@ export function useAliangChat() {
         RECALL_CREATE_ACK_MS,
         () => recallCreatePayload(conv, st.targetMessageId),
       );
+      if (recallState.value !== st) {
+        // 取消中止：truncate create 帧可能已发出（宿主侧按位置幂等），但本地
+        // 截断与 ai.message 一概不发——「用取消前捕获的文本推气泡」在此掐断。
+        aborted = true;
+        sending.value = false;
+        return;
+      }
       if (ack !== 'created') {
         createError.value = t('chat_recallUnconfirmed');
-        sending.value = false;
-        recalling.value = false;
+        sending.value = false; // recalling 复位归 finally
         return; // 编辑态保留；truncate 幂等，原样重试安全
       }
 
@@ -1282,8 +1315,7 @@ export function useAliangChat() {
       const before = sliceMessagesBefore(conv.messages, st.targetMessageId);
       if (!before) {
         cancelRecall();
-        sending.value = false;
-        recalling.value = false;
+        sending.value = false; // recalling 复位归 finally
         return;
       }
       const messageId = generateId(); // 重发必换新 id（journal 去重）
@@ -1300,6 +1332,7 @@ export function useAliangChat() {
       saveToStorage();
 
       armIdleWatchdog(conv);
+      resent = true; // ai.message 发出前置位：此后失败属「已撤回、重发未达」
       const ok = sendAI({
         type: 'ai.message',
         session_id: conv.aiSessionId,
@@ -1314,10 +1347,32 @@ export function useAliangChat() {
         asst.status = 'error';
         asst.content = t('chat_serviceUnavailable');
       }
-      createError.value = t('chat_recallUnconfirmed');
+      if (resent) {
+        // step③ 已走完（journal 已截、新气泡已落、编辑态已清）——落「撤回未
+        // 确认可重试」会指向不存在的重试入口；改与 sendMessage catch 同款：
+        // 服务不可用兜底 + 同款守卫（仅当前会话且无既有错误时落）。
+        if (conv.id === activeId.value && !createError.value) {
+          createError.value = t('chat_serviceUnavailable');
+        }
+      } else {
+        // 链前段失败（socket 建连/ai.stop 发不出）：编辑态保留，可原样重试。
+        createError.value = t('chat_recallUnconfirmed');
+      }
       sending.value = false;
-      recalling.value = false;
       saveToStorage();
+    } finally {
+      // C1：recalling 是链域标志，链尾（成功/失败/取消中止）必须复位——原缺陷
+      // 成功路径不复位，首次撤回后 startRecall 守卫（recalling=true）使撤回
+      // 入口永久哑火。sending 不在此动：回合域标志由终态帧（finishRun）清理，
+      // 未发出回合的分支已就地自理。
+      recalling.value = false;
+      // I2 联动兜底：取消中止时编辑态本已被 cancelRecall 清走；若链因取消中止
+      // 而 recallState 竟仍挂本链 st（未来未经 cancelRecall 的取消路径），清掉
+      // 防悬挂。可重试失败路径（停止超时/create 未确认）不在此列——编辑态
+      // 保留是场景 E 钉死语义，finally 不得误伤。
+      if (aborted && recallState.value === st) {
+        recallState.value = null;
+      }
     }
   }
 

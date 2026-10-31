@@ -232,3 +232,59 @@ test('场景E stop 超时中止：只有 ai.stop、无 truncate create，编辑�
   await expect(input).toHaveValue('跑起来别停');
   await expect(page.getByTestId('chat-settings-error')).toContainText(/停止超时|Stop timed out/i);
 });
+
+test('场景G 连续两次撤回：首次成功后入口复活，第二条 truncate create 再现（C1 回归）', async ({ page }) => {
+  await openChat(page);
+  await establishCreatedSession(page, '第一句');
+  // 第二条消息（第一次撤回目标）
+  await page.getByPlaceholder(INPUT).fill('第二句原文');
+  await page.keyboard.press('Enter');
+  await expect(page.getByTestId('chat-stop-button')).toHaveCount(0); // run 收敛
+
+  // 第一次撤回：第二条 user 气泡改写重发
+  const first = recallButtonOf(page, '第二句原文');
+  await first.bubble.hover();
+  await expect(first.button).toBeVisible();
+  await first.button.click();
+  await expect(page.getByTestId('chat-recall-banner')).toBeVisible();
+  await page.getByPlaceholder(INPUT).fill('第二句改后');
+  await page.getByRole('button', { name: CONFIRM }).click();
+
+  await expect.poll(async () => page.evaluate(() => {
+    const msgs = window.__aiFrames.filter((f) => f.type === 'ai.message');
+    const truncates = window.__aiFrames
+      .filter((f) => f.type === 'ai.session.create' && f.truncate_before_message_id);
+    return msgs.length >= 3 && truncates.length === 1;
+  })).toBe(true);
+  await expect(page.getByTestId('chat-stop-button')).toHaveCount(0); // 重发回合收敛
+  const resentId = await page.evaluate(() =>
+    window.__aiFrames.filter((f) => f.type === 'ai.message').slice(-1)[0].message_id);
+
+  // 第二次撤回当前最后一条 user 气泡（首次重发产物）。C1 缺陷时 recalling 在
+  // 成功路径不复位——startRecall 守卫吞掉点击、banner 永不出现，本用例在此
+  // 超时失败，即「入口永久哑火」的回归锚。
+  const second = recallButtonOf(page, '第二句改后');
+  await second.bubble.hover();
+  await expect(second.button).toBeVisible();
+  await second.button.click();
+  await expect(page.getByTestId('chat-recall-banner')).toBeVisible(); // 入口未哑火
+  await expect(page.getByPlaceholder(INPUT)).toHaveValue('第二句改后'); // 回填原文
+  await page.getByPlaceholder(INPUT).fill('第二句再改');
+  await page.getByRole('button', { name: CONFIRM }).click();
+
+  // 第二条 truncate create 出现 = 第二次撤回链真正走通
+  await expect.poll(async () => page.evaluate(() =>
+    window.__aiFrames
+      .filter((f) => f.type === 'ai.session.create' && f.truncate_before_message_id).length
+  )).toBe(2);
+
+  const truncates = await page.evaluate(() => window.__aiFrames
+    .filter((f) => f.type === 'ai.session.create' && f.truncate_before_message_id));
+  expect(truncates[1].truncate_before_message_id).toBe(resentId); // 锚点=首次重发的新 id
+
+  // 本地截断生效 + 编辑态退场
+  await expect(page.locator(LIST).getByText('第二句再改')).toBeVisible();
+  await expect(page.locator(LIST).getByText('第二句改后', { exact: true })).toHaveCount(0);
+  await expect(page.locator(LIST).getByText('第一句', { exact: true })).toBeVisible();
+  await expect(page.getByTestId('chat-recall-banner')).toHaveCount(0);
+});

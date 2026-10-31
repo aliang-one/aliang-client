@@ -21,6 +21,8 @@ import { useI18n } from '../../i18n';
 
 // 纯渲染：撤回编辑态的截断警告条。状态（recallActive）由 ChatComposer 以
 // v-if 决定挂载，本组件不持有任何状态。
+// 文案偏差留痕：spec 原稿是动态标题切片版（「撤回『xx…』及之后的全部对话」），
+// 因标题可能为空/过长撑爆 banner，收敛为静态文案（chat_recallBanner）。
 const emit = defineEmits(['cancel']);
 const { t } = useI18n();
 </script>
