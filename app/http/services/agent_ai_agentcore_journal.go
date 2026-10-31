@@ -422,3 +422,82 @@ func agentCoreJournalOriginFor(originSocketID, surface string) string {
 func agentCoreJournalOrigin(run agentAIRun) string {
 	return agentCoreJournalOriginFor(run.originSocketID, run.surface)
 }
+
+// truncateBefore 按「文件位置语义」截断 journal(spec §A.1):保留头行与
+// 位置先于 beforeMessageID 所在 msg 行的全部行;end/turn/tool/approval 等
+// 非 msg 行归属其前最近的 msg 行所在区间(随宿主保留/丢弃);目标前没有
+// 任何 msg 行时只留头行(孤儿非 msg 行丢弃)。目标 msg 行不存在或文件缺失
+// 幂等成功(仅日志;「已截断过」与「id 不匹配」两成因不可区分,接受模糊,
+// 终态展示以 journal 刷新为准)。同一 beforeMessageID 重复调用幂等,支持
+// 撤回重试。锁内全读→tmp→rename,prependHeaderLocked 同款套路。
+// 返回 applied=是否实际发生截断。
+func (j *agentCoreJournal) truncateBefore(sessionID, beforeMessageID string) (bool, error) {
+	if j == nil || j.dir == "" || strings.TrimSpace(sessionID) == "" || strings.TrimSpace(beforeMessageID) == "" {
+		return false, nil
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	path := filepath.Join(j.dir, agentCoreJournalFileName(sessionID))
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	lines := splitJSONLLines(data)
+	if len(lines) == 0 {
+		return false, nil
+	}
+	// 头行:首行是合法 session 头则原样保留,否则不造头(读侧容忍无头)。
+	var buf bytes.Buffer
+	var first map[string]interface{}
+	start := 0
+	if json.Unmarshal(lines[0], &first) == nil && first["kind"] == "session" {
+		buf.Write(lines[0])
+		buf.WriteByte('\n')
+		start = 1
+	}
+	// 线性扫描:定位目标 msg 行;msg 行携带 message_id,非 msg 行归属区间。
+	isMsg := make([]bool, len(lines))
+	target := -1
+	for i := start; i < len(lines); i++ {
+		var row map[string]interface{}
+		if json.Unmarshal(lines[i], &row) != nil || row["kind"] != "msg" {
+			continue
+		}
+		isMsg[i] = true
+		if target < 0 {
+			if id, _ := row["message_id"].(string); id == beforeMessageID {
+				target = i
+			}
+		}
+	}
+	if target < 0 {
+		logger.Info(fmt.Sprintf("agentcore-journal: truncate no-op (target absent) session=%s before=%s", sessionID, beforeMessageID))
+		return false, nil
+	}
+	firstKeep := -1
+	for i := start; i < target; i++ {
+		if isMsg[i] {
+			firstKeep = i
+			break
+		}
+	}
+	if firstKeep >= 0 {
+		for i := firstKeep; i < target; i++ {
+			buf.Write(lines[i])
+			buf.WriteByte('\n')
+		}
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, buf.Bytes(), 0o600); err != nil {
+		return false, err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return false, err
+	}
+	logger.Info(fmt.Sprintf("agentcore-journal: truncated session=%s before=%s kept=%d/%d lines", sessionID, beforeMessageID, target-start, len(lines)-start))
+	return true, nil
+}
