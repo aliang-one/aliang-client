@@ -262,3 +262,10 @@ describe('isAliangCodeSession', () => {
     expect(isAliangCodeSession('agentcore')).toBe(false);
   });
 });
+
+describe('sessionCreatePayload 回归(truncate 键不常驻)', () => {
+  it('常规载荷不含 truncate_before_message_id 键', () => {
+    const p = sessionCreatePayload({ aiSessionId: 's', provider: 'agentcore' });
+    expect('truncate_before_message_id' in p).toBe(false);
+  });
+});
