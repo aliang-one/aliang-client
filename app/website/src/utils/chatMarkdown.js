@@ -55,10 +55,12 @@ export function normalizeCjkMarkdown(src) {
   return src.split('\n').map((line) => {
     if (/^\s*(```|~~~)/.test(line)) { fenced = !fenced; return line; }
     if (fenced) return line;
+    // lookahead 排除 #*+- 防 ##/**/-- 连写被误插空格,勿简化成 [^\s]
     return line.replace(/^(\s*)(#{1,6}|[-+*])(?=[^\s#*+-])/y, (m, ind, mark) => `${ind}${mark} `);
   }).join('\n');
 }
 
+// matchAll 克隆正则/replace 自归零 lastIndex,勿改用共享 lastIndex 的 exec() 循环
 const aliangOptionsRe = /```aliang-options\s*\n([\s\S]*?)\n```/g;
 
 // 提取 ```aliang-options 围栏(供静态卡渲染/防双份对账);坏 JSON 块跳过。
@@ -71,7 +73,10 @@ export function extractAliangOptions(src) {
       if (parsed && typeof parsed === 'object' && Array.isArray(parsed.options) && parsed.options.length) {
         out.push(parsed);
       }
-    } catch (_) { /* 坏块跳过 */ }
+    } catch (err) {
+      // 不再静默:浏览器端 console 是坏块被丢弃的唯一可查出口(保留跳过行为)
+      console.warn('[chat-md] aliang-options block dropped: bad JSON', err);
+    }
   }
   return out;
 }
@@ -89,7 +94,7 @@ export function renderMarkdownSafe(src) {
   try {
     html = md.render(input);
   } catch (_) {
-    html = md.render('');
+    html = md.utils.escapeHtml(input);
   }
   return DOMPurify.sanitize(html, {
     ADD_ATTR: ['target', 'rel'],

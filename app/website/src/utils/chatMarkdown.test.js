@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { renderMarkdownSafe, normalizeCjkMarkdown, extractAliangOptions } from './chatMarkdown';
+import { renderMarkdownSafe, normalizeCjkMarkdown, extractAliangOptions, stripAliangOptions } from './chatMarkdown';
 
 describe('normalizeCjkMarkdown', () => {
   it('补齐 #/- 后缺空格的标题与列表', () => {
@@ -46,5 +46,16 @@ describe('extractAliangOptions', () => {
   });
   it('坏 JSON 块安全跳过', () => {
     expect(extractAliangOptions('```aliang-options\nnot-json\n```')).toHaveLength(0);
+  });
+});
+
+describe('stripAliangOptions', () => {
+  it('带围栏剔除:围栏消失、正文保留、trim', () => {
+    const src = '前言\n```aliang-options\n{"options":[{"id":"a","label":"A"}]}\n```\n后记';
+    // 围栏整块移除,前后文各保留一个换行(段间空行);trim 只去首尾空白
+    expect(stripAliangOptions(src)).toBe('前言\n\n后记');
+  });
+  it('恒等性钉死:无围栏时仅 trim,无其他副作用', () => {
+    expect(stripAliangOptions('hello ')).toBe('hello');
   });
 });
