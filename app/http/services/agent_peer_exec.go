@@ -21,9 +21,13 @@ package services
 // exec.CommandContext 是已知的串行槽杀手——子进程后台化的孙进程继承 stdout
 // 管道（nohup x & 在管道上不重定向），直接子进程退出后 cmd.Wait() 仍阻塞在
 // 管道 EOF，ctx kill 只杀直接子进程 → defer Unlock 永不执行 → 本设备
-// peer-exec 槽永久 busy 直到进程重启。Setpgid + Cancel 组杀(-pgid) +
-// WaitDelay 三件套保证：超时杀整组、孙进程管道随之关闭、最坏 WaitDelay
-// 后 Wait 强制返回、串行槽必然释放。
+// peer-exec 槽永久 busy 直到进程重启。平台各自的组杀 + WaitDelay 保证：超时
+// 杀整棵树、孙进程管道随之关闭、最坏 WaitDelay 后 Wait 强制返回、串行槽必然
+// 释放。本执行器走组杀增强版 newBackgroundCommandTreeContext：
+//   - POSIX：Setpgid + Cancel 组杀(-pgid SIGKILL) + WaitDelay；
+//   - Windows：Job Object（KILL_ON_JOB_CLOSE）+ Start 后 AssignProcessToJobObject
+//     入树 + TerminateJobObject 组杀 + WaitDelay + Close 兜底（agent 崩溃时
+//     内核关句柄连带杀树）。
 
 import (
 	"bytes"
@@ -35,6 +39,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -208,7 +213,7 @@ func peerExecWorkdir(raw string) string {
 // runPeerExecCommand 用可信 shell 一次性执行 command，返回
 // (exitCode, stdout, stderr, truncated, durationMs, failReason)。
 // 正常结束回真实 exit_code（含非零）；无法启动回 -1+start_failed；超时组杀回
-// -1+timeout；被外部信号杀（且非自家超时）回 -1+signaled。
+// -1+timeout；被外部信号杀（且非自家超时，仅 POSIX 有此语义）回 -1+signaled。
 func runPeerExecCommand(command, workdir string, timeout time.Duration) (int, string, string, bool, int64, string) {
 	shellPath, args, err := agentPeerShellCommand(command)
 	if err != nil {
@@ -216,13 +221,33 @@ func runPeerExecCommand(command, workdir string, timeout time.Duration) (int, st
 		return -1, "", "", false, 0, peerExecFailStartFailed
 	}
 
-	// 进程纪律（见文件头）：Setpgid+组杀+WaitDelay 由 newBackgroundCommandContext
-	// 统一提供，Windows 侧带 HideWindow（不闪 powershell 窗口）。
+	// 进程纪律（见文件头）：组杀+WaitDelay 由平台侧封装统一提供（POSIX
+	// Setpgid+组杀 / Windows Job Object），Windows 另带 HideWindow（不闪
+	// powershell 窗口）。
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	cmd := newBackgroundCommandContext(ctx, shellPath, args...)
+	cmd, procTree := newBackgroundCommandTreeContext(ctx, shellPath, args...)
 	cmd.Dir = workdir
 	cmd.Env = agentPeerExecEnv()
+
+	// kill 标志（平台无关的超时判据）：ctx 到期触发 cmd.Cancel（自家 kill）时
+	// 置位，分类以它为第一判据。必要性：Windows 上 Go 的终止实现是
+	// TerminateProcess(exitCode=1)，被杀子进程表现为「正常退出码 1」，且
+	// WaitStatus.Signaled() 在 Windows 恒 false——Signaled() 判据在该平台完全
+	// 不工作，只有本标志能区分「自家超时杀」与「进程自然退出码 1」。
+	// 链式包装保留构造器/树里的平台组杀（POSIX -pgid / Windows Job）。
+	killInitiated := new(atomic.Bool)
+	innerCancel := cmd.Cancel
+	cmd.Cancel = func() error {
+		killInitiated.Store(true)
+		if innerCancel != nil {
+			return innerCancel()
+		}
+		if cmd.Process != nil {
+			return cmd.Process.Kill()
+		}
+		return nil
+	}
 
 	stdoutBuf := &peerExecBoundedBuffer{max: peerExecOutputCap}
 	stderrBuf := &peerExecBoundedBuffer{max: peerExecOutputCap}
@@ -230,28 +255,47 @@ func runPeerExecCommand(command, workdir string, timeout time.Duration) (int, st
 	cmd.Stderr = stderrBuf
 
 	started := time.Now()
-	runErr := cmd.Run()
+	runErr := cmd.Start()
+	if runErr == nil {
+		// Windows：立即入树，之后派生的全部子孙自动进 Job（组杀覆盖）；
+		// attach 之前已存在的孤儿子进程靠 WaitDelay 盖帽兜底。尽力而为：
+		// 失败降级为直接子进程 kill + WaitDelay，不阻断主流程。
+		_ = procTree.attach(cmd)
+		runErr = cmd.Wait()
+	}
+	// 正常路径显式收尾；agent 进程异常退出时靠 KILL_ON_JOB_CLOSE 由内核兜底
+	// （Close 语义，见 command_windows.go）。
+	procTree.release()
 	durationMs := time.Since(started).Milliseconds()
 
-	exitCode, failReason := classifyPeerExecOutcome(cmd, runErr, ctx)
+	exitCode, failReason := classifyPeerExecOutcome(runErr, ctx, killInitiated)
 	truncated := stdoutBuf.isTruncated() || stderrBuf.isTruncated()
 	return exitCode, stdoutBuf.String(), stderrBuf.String(), truncated, durationMs, failReason
 }
 
-// classifyPeerExecOutcome 把 cmd.Run 的结局翻译成 (exit_code, fail_reason)。
-// 判定顺序刻意以 ProcessState.Signaled() 为第一判据（而非 ctx.Err()）：命令
-// 恰好在超时瞬间正常退出时，ctx.Err() 已非 nil，先看 ctx 会把真实退出码误报
-// 成 timeout。
-func classifyPeerExecOutcome(cmd *exec.Cmd, runErr error, ctx context.Context) (int, string) {
+// classifyPeerExecOutcome 把 cmd.Wait 的结局翻译成 (exit_code, fail_reason)。
+// 判定顺序：
+//  1. runErr==nil：自然成功退出（先于一切——命令恰好在超时瞬间正常退出时
+//     ctx.Err() 已非 nil，先看 ctx 会把真实退出码误报成 timeout）；
+//  2. kill 标志（平台无关）：执行器在 ctx 到期主动发起 kill 时置位，按
+//     timeout 报告、exit_code=-1（不把 TerminateProcess/SIGKILL 的痕迹当业务
+//     退出码）。Windows 上 Go kill=TerminateProcess(1) 且 Signaled() 恒 false，
+//     本平台完全依赖这一判据；
+//  3. Signaled()（Unix 精确）：外部信号杀，超时窗口内按 timeout、窗口外如实
+//     报 signaled。
+func classifyPeerExecOutcome(runErr error, ctx context.Context, killInitiated *atomic.Bool) (int, string) {
 	if runErr == nil {
 		return 0, ""
 	}
 	var exitErr *exec.ExitError
 	signaled := peerExecProcessSignaled(runErr, &exitErr)
 	switch {
+	case killInitiated != nil && killInitiated.Load():
+		// 第一判据：自家超时 kill（组杀打在整组/整树上），平台无关。
+		return -1, peerExecFailTimeout
 	case signaled && ctx.Err() != nil:
-		// 自家超时组杀（SIGKILL 打在整组上）：按 timeout 报告，不把 kill 信号
-		// 码当业务退出码。
+		// Unix 冗余路径（kill 标志已覆盖自家超时）：外部信号恰逢超时窗口，
+		// 按窗口语义报告。
 		return -1, peerExecFailTimeout
 	case signaled:
 		// 外部信号杀（且非超时窗口）：如实报告。
@@ -275,9 +319,12 @@ func classifyPeerExecOutcome(cmd *exec.Cmd, runErr error, ctx context.Context) (
 }
 
 // peerExecProcessSignaled 报告进程是否被信号终止。os.ProcessState 没有导出
-// Signaled：非 Windows 经 Sys().(syscall.WaitStatus).Signaled() 精确判定；
-// Windows 的 Sys() 为 nil，退回 ExitCode()==-1（Go 约定：被信号杀/未退出时
-// 恒 -1，本场景子进程必然已退出）。
+// Signaled：经 Sys().(syscall.WaitStatus).Signaled() 精确判定（仅 POSIX 有意义）。
+// Windows 前提修正（对抗审查）：exec_posix.go 的 build tag 含 windows，Sys() 同样
+// 返回 syscall.WaitStatus（并非旧注释所称的 nil），但其 Signaled() 在 Windows
+// 恒返回 false——Go 在 Windows 的终止实现是 TerminateProcess（退出码 1），不存在
+// 信号语义。因此 Windows 侧的分类完全依赖 kill 标志判据，本函数不设 ExitCode()
+// 兜底（Windows 退出码是任意 DWORD，-1 也是合法业务码，不能当被信号杀的证据）。
 func peerExecProcessSignaled(runErr error, exitErr **exec.ExitError) bool {
 	if !errors.As(runErr, exitErr) || *exitErr == nil || (*exitErr).ProcessState == nil {
 		return false
@@ -285,7 +332,7 @@ func peerExecProcessSignaled(runErr error, exitErr **exec.ExitError) bool {
 	if ws, ok := (*exitErr).Sys().(syscall.WaitStatus); ok {
 		return ws.Signaled()
 	}
-	return (*exitErr).ExitCode() == -1
+	return false
 }
 
 // agentPeerShellCommand 按平台挑 shell 并构造参数：

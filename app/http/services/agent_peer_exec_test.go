@@ -4,10 +4,14 @@ package services
 // 封顶截断/workdir 不存在/串行 busy/最小 env 断言（不含 ANTHROPIC 等敏感键）。
 
 import (
+	"context"
+	"errors"
 	"os"
+	"os/exec"
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -393,6 +397,83 @@ func TestPeerExec_SignaledOutcome(t *testing.T) {
 	}
 	if exitCode != -1 {
 		t.Fatalf("exit_code = %d, want -1", exitCode)
+	}
+}
+
+func TestPeerExec_NestedShellNaturalExitIsRealCode(t *testing.T) {
+	// 对抗审查任务 1b：kill 标志引入后的「不误报」回归——命令自然退出码不得被
+	// 当成超时。嵌套 `sh -c "exit 7"`（外层可信 shell 再起一层 sh）在 ctx 给足
+	// 时必须回真实 exit_code=7 且无 fail_reason。
+	if peerExecShellSemanticsSupported(t) {
+		return
+	}
+	exitCode, _, _, _, _, failReason :=
+		runPeerExecCommand(`sh -c "exit 7"`, t.TempDir(), 10*time.Second)
+	if exitCode != 7 {
+		t.Fatalf("exit=%d, want real code 7 (not -1)", exitCode)
+	}
+	if failReason != "" {
+		t.Fatalf("fail_reason=%q, natural termination must not carry one", failReason)
+	}
+}
+
+func TestPeerExec_ClassifyKillFlagIsFirstCriterion(t *testing.T) {
+	// 对抗审查任务 1b 单元级：kill 标志是第一判据。用真实 ExitError（外部信号
+	// 杀，Signaled() 为 true）+ 标志置位，验证分类走 timeout 而不是 signaled；
+	// 标志未置位时同一 runErr 必须如实回 signaled（第二判据才轮到 Signaled）。
+	// Windows 上 Signaled() 恒 false，自家 TerminateProcess 只能靠本标志识别
+	// ——此用例锁死「标志优先于 Signaled」的顺序。
+	if peerExecShellSemanticsSupported(t) {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	runErr := exec.Command("sh", "-c", "kill -TERM $$").Run()
+	var exitErr *exec.ExitError
+	if !errors.As(runErr, &exitErr) || exitErr.ProcessState == nil {
+		t.Fatalf("expected ExitError from signaled child, got %v", runErr)
+	}
+
+	flag := new(atomic.Bool)
+	flag.Store(true)
+	code, reason := classifyPeerExecOutcome(runErr, ctx, flag)
+	if code != -1 || reason != peerExecFailTimeout {
+		t.Fatalf("kill-flag set: exit=%d fail=%q, want -1/timeout (flag must precede Signaled)", code, reason)
+	}
+
+	code, reason = classifyPeerExecOutcome(runErr, ctx, new(atomic.Bool))
+	if code != -1 || reason != peerExecFailSignaled {
+		t.Fatalf("kill-flag unset: exit=%d fail=%q, want -1/signaled", code, reason)
+	}
+
+	// 零值安全：nil 标志不得 panic（老调用面兼容）。
+	code, reason = classifyPeerExecOutcome(runErr, ctx, nil)
+	if code != -1 || reason != peerExecFailSignaled {
+		t.Fatalf("nil flag: exit=%d fail=%q, want -1/signaled", code, reason)
+	}
+}
+
+func TestPeerExec_ClassifyNaturalExitSurvivesExpiredDeadline(t *testing.T) {
+	// kill 标志引入后的第二个「不误报」：命令恰在超时瞬间自然退出（标志未置位
+	// ——Cancel 只在进程未退出时才被触发）而 ctx 已到期，真实退出码必须原样
+	// 保留，不得被 ctx.Err() 兜底吞成 timeout。
+	if peerExecShellSemanticsSupported(t) {
+		return
+	}
+	runErr := exec.Command("sh", "-c", "exit 7").Run()
+	var exitErr *exec.ExitError
+	if !errors.As(runErr, &exitErr) || exitErr.ExitCode() != 7 {
+		t.Fatalf("expected ExitError exit=7, got %v", runErr)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+	defer cancel()
+	time.Sleep(5 * time.Millisecond) // 确保已到期
+	if ctx.Err() == nil {
+		t.Fatal("test setup: deadline did not elapse")
+	}
+	code, reason := classifyPeerExecOutcome(runErr, ctx, new(atomic.Bool))
+	if code != 7 || reason != "" {
+		t.Fatalf("exit=%d fail=%q, want real code 7 with no fail_reason at expired deadline", code, reason)
 	}
 }
 
