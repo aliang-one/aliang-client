@@ -31,33 +31,39 @@
           <p class="text-sm text-slate-400">{{ t('chat_startNew') }}</p>
         </div>
         <template v-else>
-          <ChatMessageBubble
-            v-for="(msg, idx) in activeMessages"
-            :key="idx"
-            :msg="msg"
-            :now-tick="nowTick"
-          />
-          <!-- 插话轻量条（Task 4）：运行中回合的旁路注入，不插独立 user 气泡——
-               快照/详情装载的转录才是权威流，避免回灌重复渲染。 -->
-          <div
-            v-for="item in steerItems"
-            :key="item.messageId"
-            data-testid="chat-steer-item"
-            class="mb-3 ml-auto w-fit max-w-[85%] rounded-lg border border-primary/30 bg-primary/5 px-3 py-2 text-xs"
-          >
-            <div class="flex flex-wrap items-center gap-2">
-              <span class="material-symbols-outlined text-sm text-primary">bolt</span>
-              <span class="font-semibold text-slate-600 dark:text-slate-200">
-                {{ t('chat_steerLabel') }}
-              </span>
-              <span
-                data-testid="chat-steer-status"
-                :class="item.status === 'failed' ? 'text-rose-500' : 'font-medium text-primary'"
-              >{{ steerStatusLabel(item) }}</span>
+          <!-- 统一时间线（Task 11）：messages（权威流）与 steerItems（瞬态插话）
+               按 ts 升序归并渲染——插话以 user 气泡形态出现在它被发出的时间点，
+               不再是消息流外的独立区块。归并纯渲染层：数据结构零变化，steer
+               仍不写 messages、不进持久化。key 复合（messageId 优先）：steer 项
+               天然带 messageId；message 大多无 id 走 'm-'+序号兜底，带 id 的
+               （审批派生行等）跨 splice 保持稳定（防 Task 13 撤回的 idx 键脆断）。 -->
+          <template v-for="(item, idx) in timeline" :key="item.messageId || 'm-' + idx">
+            <ChatMessageBubble
+              v-if="item.type === 'message'"
+              :msg="item"
+              :now-tick="nowTick"
+            />
+            <!-- 插话气泡（原 Task 4 轻量条融入时间线）：⚡ 徽 + 插话标签 +
+                 状态 chip（steerStatusLabel 六态）+ 正文/失败详情。 -->
+            <div
+              v-else
+              data-testid="chat-steer-item"
+              class="mb-3 ml-auto w-fit max-w-[85%] rounded-2xl border border-primary/40 bg-primary/5 px-3 py-2 text-xs"
+            >
+              <div class="flex flex-wrap items-center gap-2">
+                <span class="material-symbols-outlined text-sm text-primary">bolt</span>
+                <span class="font-semibold text-slate-600 dark:text-slate-200">
+                  {{ t('chat_steerLabel') }}
+                </span>
+                <span
+                  data-testid="chat-steer-status"
+                  :class="item.status === 'failed' ? 'text-rose-500' : 'font-medium text-primary'"
+                >{{ steerStatusLabel(item) }}</span>
+              </div>
+              <p class="mt-1 whitespace-pre-wrap break-all text-slate-600 dark:text-slate-300">{{ item.content }}</p>
+              <p v-if="item.status === 'failed' && item.detail" class="mt-1 text-rose-500">{{ item.detail }}</p>
             </div>
-            <p class="mt-1 whitespace-pre-wrap break-all text-slate-600 dark:text-slate-300">{{ item.content }}</p>
-            <p v-if="item.status === 'failed' && item.detail" class="mt-1 text-rose-500">{{ item.detail }}</p>
-          </div>
+          </template>
           <ChatApprovalCard
             v-for="approval in approvals"
             :key="approval.key"
@@ -89,8 +95,9 @@
 </template>
 
 <script setup>
-import { ref, watch } from 'vue';
+import { computed, ref, watch } from 'vue';
 import { useI18n } from '../../i18n';
+import { mergeTimeline } from '../../utils/chatTimeline';
 import ChatMessageBubble from './ChatMessageBubble.vue';
 import ChatApprovalCard from './ChatApprovalCard.vue';
 
@@ -117,6 +124,10 @@ const props = defineProps({
 const emit = defineEmits(['approval-respond']);
 
 const { t } = useI18n();
+
+// 统一渲染时间线（Task 11）：messages + steerItems 按 ts 归并、打 type 标。
+// 归并函数单测已覆盖（chatTimeline.test.js），组件层不加重复单测。
+const timeline = computed(() => mergeTimeline(props.activeMessages, props.steerItems));
 
 // 未读徽标：非贴底期间到达的消息数（user/assistant 气泡 + 插话条 + 审批卡）。
 // 回底（滚动事件判定贴底，或点浮钮）即清零。
