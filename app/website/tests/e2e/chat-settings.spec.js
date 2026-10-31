@@ -1,85 +1,18 @@
 import { expect, test } from '@playwright/test';
+import { openChat as openChatBase } from './helpers/chatStub.js';
 
-// 注入假 WebSocket：捕获客户端发出的帧到 window.__aiFrames，并对
-// ai.session.create 回 ai.session.created（可经 window.__failCreate 翻转为
-// ai.error 以模拟目录不存在）。
-const WS_STUB = `
-  window.__aiFrames = [];
-  window.__failCreate = false;
-  window.EventSource = class { constructor() { setTimeout(() => this.onopen?.(), 0); } close() {} };
-  class FakeWebSocket {
-    // 应用代码以 WebSocket.OPEN 等静态常量做就绪判定（readyState === WebSocket.OPEN），
-    // stub 替换全局后若缺这些常量判定恒假、sendAI 永不发帧——必须补齐。
-    static OPEN = 1;
-    static CONNECTING = 0;
-    static CLOSING = 2;
-    static CLOSED = 3;
-    constructor(url) {
-      this.url = url;
-      this.readyState = 0;
-      FakeWebSocket.instances.push(this);
-      setTimeout(() => { this.readyState = 1; this.onopen?.(); }, 0);
-    }
-    send(data) {
-      const frame = JSON.parse(data);
-      window.__aiFrames.push(frame);
-      if (frame.type === 'ai.session.create') {
-        setTimeout(() => {
-          if (!this.onmessage) return;
-          const payload = window.__failCreate
-            ? { type: 'ai.error', session_id: frame.session_id, error: 'stat /no/such/dir: no such file or directory' }
-            : { type: 'ai.session.created', session_id: frame.session_id, mode: frame.mode, project_path: frame.project_path || '/home/e2e', provider: frame.provider, model: frame.model || '', effort: frame.effort || '', state: 'idle' };
-          this.onmessage({ data: JSON.stringify(payload) });
-        }, 0);
-      }
-      if (frame.type === 'ai.message') {
-        setTimeout(() => {
-          if (!this.onmessage) return;
-          this.onmessage({ data: JSON.stringify({ type: 'ai.done', session_id: frame.session_id }) });
-        }, 0);
-      }
-    }
-    close() {}
-  }
-  FakeWebSocket.instances = [];
-  window.WebSocket = FakeWebSocket;
-`;
+// 阶段 2：清单条目带 id/provider/title/status/origin（三源同列表渲染）；
+// 三条重复 project_path 保留——设置条「最近项目」按路径去重语义不破。
+const SESSIONS = [
+  { id: 'sess-settings-b', provider: 'agentcore', title: '清单会话乙', status: 'idle', origin: 'phone', project_path: '/home/alice/proj-b' },
+  { id: 'sess-settings-a1', provider: 'agentcore', title: '清单会话甲一', status: 'idle', origin: '', project_path: '/home/alice/proj-a' },
+  { id: 'sess-settings-a2', provider: 'agentcore', title: '清单会话甲二', status: 'idle', origin: '', project_path: '/home/alice/proj-a' },
+];
 
+// createResponder='failCreate'：ai.session.create 的回执可经 window.__failCreate
+// （用例 page.evaluate 随时翻转）变为 ai.error（模拟目录不存在），默认照常回执。
 async function openChat(page) {
-  await page.addInitScript(WS_STUB);
-  await page.addInitScript(() => localStorage.setItem('alianggate.onboarding.v2', 'completed'));
-  await page.route('**/api/**', async (route) => {
-    const url = new URL(route.request().url());
-    if (url.pathname === '/api/auth/session') {
-      await route.fulfill({
-        contentType: 'application/json',
-        body: JSON.stringify({
-          code: 0,
-          data: { type: 'session_snapshot', instance_id: 'e2e', revision: 1, state: 'active', user: { id: 1, username: 'alice', email: 'a@b.c' } },
-        }),
-      });
-      return;
-    }
-    if (url.pathname === '/api/agent/sessions') {
-      // 阶段 2：清单条目带 id/provider/title/status/origin（三源同列表渲染）；
-      // 三条重复 project_path 保留——设置条「最近项目」按路径去重语义不破。
-      await route.fulfill({
-        contentType: 'application/json',
-        body: JSON.stringify({ code: 0, data: { sessions: [
-          { id: 'sess-settings-b', provider: 'agentcore', title: '清单会话乙', status: 'idle', origin: 'phone', project_path: '/home/alice/proj-b' },
-          { id: 'sess-settings-a1', provider: 'agentcore', title: '清单会话甲一', status: 'idle', origin: '', project_path: '/home/alice/proj-a' },
-          { id: 'sess-settings-a2', provider: 'agentcore', title: '清单会话甲二', status: 'idle', origin: '', project_path: '/home/alice/proj-a' },
-        ] } }),
-      });
-      return;
-    }
-    await route.fulfill({ contentType: 'application/json', body: JSON.stringify({ code: 0, data: {} }) });
-  });
-  await page.goto('/');
-  await expect(page.getByTestId('aliang-chat-entry-sidebar')).toBeVisible();
-  await page.getByTestId('aliang-chat-entry-sidebar').click();
-  await page.getByRole('button').filter({ hasText: 'add' }).first().click(); // 侧栏「+」新建会话
-  await expect(page.getByTestId('chat-settings-directory')).toBeVisible();
+  await openChatBase(page, { sessions: SESSIONS, createResponder: 'failCreate' });
 }
 
 test('设置条渲染 + 最近项目去重 + 改模型后 create 帧带 model', async ({ page }) => {

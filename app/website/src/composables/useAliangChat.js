@@ -1086,8 +1086,8 @@ export function useAliangChat() {
   // --- 停止当前运行（Task 9，动作槽对齐手机端） ---
   // running 时可停：stop 帧不是终态——后端只回 ai.status "stopping" + 取消
   // 审批，终态由被取消 run 的 done/error 既有路径收敛（这里不新增等待/超时
-  // 逻辑，视觉保持 running 直到终态帧到达；中途连点由 running 态门控兜住，
-  // 重复 stop 帧幂等无害）。目标 id 与 steer 同构（steerTargetId）：本地会话
+  // 逻辑，视觉保持 running 直到终态帧到达；终态到达前停止键仍可点，重复
+  // stop 帧幂等无害）。目标 id 与 steer 同构（steerTargetId）：本地会话
   // aiSessionId / 设备壳 managed_conversation_id ?? entry.id；空目标（claude_/
   // codex_ 壳 running 且无 managed id）静默返回——停止本就无的放矢。
   async function stopRun() {
@@ -1099,8 +1099,10 @@ export function useAliangChat() {
       const ok = sendAI({ type: 'ai.stop', session_id: target });
       if (!ok) throw new Error('socket-closed');
     } catch (_) {
-      // 既有错误呈现口径：设置条内联错误（socket 不可用时不静默；下次发送自清）
-      if (conv && conv.id === activeId.value) {
+      // 既有错误呈现口径：设置条内联错误（socket 不可用时不静默；下次发送自清）。
+      // !createError.value 防覆盖：帧路由（ai.error 等）已落的错误不被兜底文案
+      // 顶掉（对齐 sendMessage 确认门早退分支同款守卫）。
+      if (conv && conv.id === activeId.value && !createError.value) {
         createError.value = t('chat_serviceUnavailable');
       }
     }

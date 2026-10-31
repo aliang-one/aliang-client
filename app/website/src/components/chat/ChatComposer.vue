@@ -145,11 +145,13 @@ function resetHeight() {
 
 // 函数 ref 双职：本地记录元素（自增高用），同时把元素交接给 useAliangChat
 // （焦点驱动权仍在彼处，createConversation/applySlash 的 nextTick focus 不变；
-// 卸载时以 null 落值，两侧同步清空）。
+// 卸载时以 null 落值，两侧同步清空）。元素交接即 autosize 的确切可用时机：
+// 挂载初值（恢复草稿等）在此同步一次高度。
 let inputEl = null;
 function bindInputEl(el) {
   inputEl = el;
   props.setInputEl(el);
+  if (el) autosize();
 }
 
 function onInput() {
@@ -158,15 +160,16 @@ function onInput() {
 }
 
 // 发送后（或任意清空）复位单行；外部赋值（e2e fill/applySlash 补全）走
-// 同一 watcher 同步高度。immediate：挂载即带初值（恢复草稿等）时也走一次
-// 高度同步——setup 期元素未交接则 autosize 内部空守卫自然跳过。
+// 同一 watcher 同步高度。挂载初值的高度同步由 bindInputEl 交接回调承担
+// （元素可用的确切时机）——不设 immediate：setup 期模板 ref 未绑定，
+// immediate 只会撞 autosize 空守卫空转。
 watch(() => props.modelValue, (v) => {
   if (!v) {
     resetHeight();
     return;
   }
   autosize();
-}, { immediate: true });
+});
 
 // Unified keydown so the popup can intercept arrows/enter/tab/escape before the
 // send-on-enter binding fires.
