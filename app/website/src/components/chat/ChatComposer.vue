@@ -11,6 +11,18 @@
     >
       {{ t('chat_steerBlocked') }}
     </div>
+    <!-- 审批等待期硬拦提示（Task 10，对齐手机端 spec §C 防顶翻）：活跃会话
+         挂着待审批卡时 sendDisabled=true（textarea 与发送键同源禁用），提交新
+         消息/插话会顶掉待审批把会话打翻成 failed——常驻说明而非提交后报错。
+         与 steer 阻断提示不互斥（running+审批并存可同屏叠加）；停止键不受
+         硬拦（审批等待期停止是合法自救）。 -->
+    <div
+      v-if="approvalBlocked"
+      data-testid="chat-approval-block-hint"
+      class="mb-2 rounded-lg border border-slate-200 bg-slate-100 px-3 py-2 text-xs text-slate-500 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300"
+    >
+      {{ t('chat_approvalBlockHint') }}
+    </div>
     <div class="flex items-end gap-2">
       <div class="relative min-w-0 flex-1">
         <div
@@ -94,6 +106,9 @@ const props = defineProps({
   // 动作槽进入 发送/停止 交替语义（Task 9；门控源与 steer 分流同源）。
   running: { type: Boolean, default: false },
   steerBlocked: { type: Boolean, default: false },
+  // 审批等待期硬拦（Task 10）：ChatPage 从 activeApprovals.length>0 接线——
+  // true 时渲染提示条；输入/发送键的禁用由 disabled（=sendDisabled）同源承担。
+  approvalBlocked: { type: Boolean, default: false },
   // slash 补全状态由 useAliangChat 持有（命令缓存被帧路由写、open/index 被
   // 输入事件写），本组件经 props 读、事件回写。
   slashOpen: { type: Boolean, default: false },

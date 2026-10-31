@@ -276,6 +276,8 @@ export default {
   chat_approvalExpiresMinutes: '{minutes} 分钟',
   chat_approvalExpiresHours: '约 {hours} 小时',
   chat_approvalFromSession: '来自会话 {id}',
+  // 审批等待期硬拦提示（Task 10）：输入区常驻说明（与 en.js 成对维护）
+  chat_approvalBlockHint: '有待审批请求，请先处理后再发送',
   chat_noticeResumeMissing: '原生会话不存在，已按新会话继续',
   chat_noticeHistoryRestoreFailed: '历史恢复失败，已按空会话继续',
   chat_approvalCancelled: '审批已被取消',

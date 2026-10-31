@@ -69,6 +69,7 @@
         :placeholder="inputPlaceholder"
         :running="activeSessionRunning"
         :steer-blocked="steerBlocked"
+        :approval-blocked="activeApprovals.length > 0"
         :slash-open="slashOpen"
         :slash-matches="slashMatches"
         :slash-index="slashIndex"

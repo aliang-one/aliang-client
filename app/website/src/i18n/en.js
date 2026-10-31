@@ -277,6 +277,8 @@ export default {
   chat_approvalExpiresMinutes: '{minutes} min',
   chat_approvalExpiresHours: '~{hours} h',
   chat_approvalFromSession: 'From session {id}',
+  // Approval-wait hard block hint (Task 10): persistent composer notice (paired with zh.js)
+  chat_approvalBlockHint: 'Approval required before sending.',
   chat_noticeResumeMissing: 'Native session not found — continuing as a new conversation',
   chat_noticeHistoryRestoreFailed: 'History restore failed — continuing with empty context',
   chat_approvalCancelled: 'Approval was cancelled',

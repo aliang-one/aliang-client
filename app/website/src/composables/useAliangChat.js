@@ -181,7 +181,15 @@ export function useAliangChat() {
   // sending 守卫改造：running 会话在 sending 中仍可输入提交（插话），非 running
   // 维持禁用（本地 run 在途时输入框照旧锁住——此时 activeRunning=true 会放行，
   // 提交自然分流成 steer，这正是预期交互）。
-  const sendDisabled = computed(() => sending.value && !activeSessionRunning.value);
+  // 审批等待期硬拦（Task 10，对齐手机端 spec §C 防顶翻）：活跃会话挂着
+  // pending/responding 审批卡时，新消息/插话发送都会顶掉待审批、把会话打翻成
+  // failed——所有 provider 一律禁发，直至卡被处理（响应/ai.done/cancelled 清卡）。
+  // 停止键不受此拦（running+空输入仍可停——审批等待期停止是合法自救，走
+  // ChatComposer 独立出口不经 sendDisabled）。仅拦活跃会话自身的审批（与
+  // activeApprovals 口径一致，壳路由到他端会话的卡不拦本端输入）。
+  const sendDisabled = computed(() =>
+    (sending.value && !activeSessionRunning.value) || activeApprovals.value.length > 0
+  );
 
   const sendButtonLabel = computed(() => {
     if (sending.value && activeSessionRunning.value) {
