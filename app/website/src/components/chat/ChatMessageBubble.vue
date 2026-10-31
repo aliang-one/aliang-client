@@ -30,6 +30,9 @@
           <span class="thinking-dot"></span><span class="thinking-dot"></span><span class="thinking-dot"></span>
           <span class="ml-1 align-middle">{{ t('chat_aiThinking') }}</span>
         </span>
+        <!-- spec §E:仅 assistant 正常气泡走 markdown(消毒管线);user 与
+             error 气泡铁律保持纯文本插值防注入,markdown 渲染不递给它们。 -->
+        <ChatMarkdown v-else-if="msg.role === 'assistant' && msg.status !== 'error'" :content="msg.content" />
         <template v-else>{{ msg.content }}</template>
       </div>
     </template>
@@ -38,9 +41,10 @@
 
 <script setup>
 import { useI18n } from '../../i18n';
+import ChatMarkdown from './ChatMarkdown.vue';
 
 // 纯渲染：单条消息块（系统条 / 角色行 / 气泡）。nowTick 目前未被本组件消费
-// （为 Task 7 markdown 时间敏感渲染预留的 prop），传入不产生任何行为。
+// （markdown 渲染不依赖时钟;该 prop 供后续消息级相对时间显示用），传入不产生任何行为。
 defineProps({
   msg: { type: Object, required: true },
   nowTick: { type: Number, default: 0 },
