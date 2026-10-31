@@ -486,7 +486,7 @@ func (j *agentCoreJournal) truncateBefore(sessionID, beforeMessageID string) (bo
 	}
 	kept := 0
 	if firstKeep >= 0 {
-		kept = target - firstKeep // 首个 msg 行之前的孤儿非 msg 行不计入保留区间
+		kept = target - firstKeep // 首个 msg 行之前的孤儿非 msg 行不计入保留区间,并随本次截断一并丢弃(不写入保留区)
 		for i := firstKeep; i < target; i++ {
 			buf.Write(lines[i])
 			buf.WriteByte('\n')
