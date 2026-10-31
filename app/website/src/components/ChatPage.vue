@@ -406,9 +406,9 @@
                 <span v-else-if="msg.role === 'assistant' && msg.status === 'error'" class="text-rose-500">!</span>
               </div>
               <div
-                class="inline-block max-w-[85%] whitespace-pre-wrap rounded-lg px-3 py-2 text-sm"
+                class="inline-block max-w-[85%] rounded-lg px-3 py-2 text-sm"
                 :class="msg.role === 'user'
-                  ? 'ml-auto block bg-primary text-white'
+                  ? 'whitespace-pre-wrap ml-auto block bg-primary text-white'
                   : msg.status === 'error'
                     ? 'bg-rose-50 text-rose-600 dark:bg-rose-900/30 dark:text-rose-300'
                     : 'bg-white text-slate-700 dark:bg-slate-700 dark:text-slate-100'"
@@ -420,6 +420,12 @@
                   <span class="thinking-dot"></span><span class="thinking-dot"></span><span class="thinking-dot"></span>
                   <span class="ml-1 align-middle">{{ t('chat_aiThinking') }}</span>
                 </span>
+                <div
+                  v-else-if="msg.role === 'assistant'"
+                  class="chat-md"
+                  data-testid="chat-assistant-markdown"
+                  v-html="renderMarkdown(msg.content)"
+                ></div>
                 <template v-else>{{ msg.content }}</template>
               </div>
             </template>
@@ -589,6 +595,7 @@ import { ref, computed, nextTick, onMounted, onUnmounted, watch } from 'vue';
 import { useI18n } from '../i18n';
 import { useNavigation } from '../composables/useNavigation';
 import { slashProviderFor } from '../utils/chatProvider';
+import { renderMarkdown } from '../utils/markdown';
 import { normalizeConversationTitle } from '../utils/chatTitle';
 import { useAuthStore } from '../stores/auth';
 import { getAgentIntegrations, getAgentSessionDetail } from '../services/agentApi';
@@ -2355,6 +2362,62 @@ onUnmounted(() => {
 </script>
 
 <style scoped>
+/* assistant 气泡 markdown(与手机端契约对齐;user 气泡保持裸原文) */
+.chat-md :deep(h1),
+.chat-md :deep(h2),
+.chat-md :deep(h3),
+.chat-md :deep(h4) {
+  font-weight: 600;
+  margin: 0.75em 0 0.35em;
+  line-height: 1.3;
+}
+.chat-md :deep(h1) { font-size: 1.15rem; }
+.chat-md :deep(h2) { font-size: 1.05rem; }
+.chat-md :deep(h3),
+.chat-md :deep(h4) { font-size: 0.95rem; }
+.chat-md :deep(p) { margin: 0.35em 0; }
+.chat-md :deep(ul),
+.chat-md :deep(ol) { margin: 0.35em 0; padding-left: 1.25em; }
+.chat-md :deep(li) { margin: 0.15em 0; }
+.chat-md :deep(code) {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.85em;
+  background: rgba(100, 116, 139, 0.15);
+  border-radius: 4px;
+  padding: 0.1em 0.35em;
+}
+.chat-md :deep(pre) {
+  background: rgba(15, 23, 42, 0.92);
+  color: #e2e8f0;
+  border-radius: 8px;
+  padding: 0.7em 0.9em;
+  overflow-x: auto;
+  margin: 0.5em 0;
+}
+.chat-md :deep(pre code) { background: transparent; padding: 0; color: inherit; }
+.chat-md :deep(table) {
+  border-collapse: collapse;
+  margin: 0.5em 0;
+  font-size: 0.85em;
+  display: block;
+  overflow-x: auto;
+}
+.chat-md :deep(th),
+.chat-md :deep(td) {
+  border: 1px solid rgba(100, 116, 139, 0.4);
+  padding: 0.3em 0.6em;
+  text-align: left;
+}
+.chat-md :deep(th) { font-weight: 600; background: rgba(100, 116, 139, 0.12); }
+.chat-md :deep(blockquote) {
+  border-left: 3px solid rgba(100, 116, 139, 0.45);
+  margin: 0.5em 0;
+  padding: 0.1em 0 0.1em 0.75em;
+  opacity: 0.9;
+}
+.chat-md :deep(a) { text-decoration: underline; }
+.chat-md :deep(hr) { border-color: rgba(100, 116, 139, 0.3); margin: 0.75em 0; }
+
 .ai-thinking {
   display: inline-flex;
   align-items: center;
