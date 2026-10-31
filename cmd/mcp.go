@@ -16,7 +16,10 @@ package cmd
 // notifications·initialized / tools/list / tools/call / ping；一切日志走
 // stderr，绝不污染 stdout。
 //
-// Claude Code 接入：claude mcp add aliang-peer -- <aliang绝对路径> mcp
+// Claude Code 接入：claude mcp add -s user aliang-peer -- <aliang绝对路径> mcp
+// （-s user 必写：默认 local 作用域写在 .claude.json 的 per-project 条目里，
+// 而内核 sanitized 档重建 mcp-config 时只合并顶层 user 作用域 mcpServers，
+// local 作用域的条目在 sanitized 档 run 里不可见。）另可写入项目 .mcp.json。
 // Codex 接入：config.toml [mcp_servers.aliang-peer]
 //
 //	command = "<aliang绝对路径>"
@@ -129,8 +132,8 @@ func peerMCPBaseURL() string {
 	return "http://" + strings.TrimRight(raw, "/")
 }
 
-// handleLine 解析并应答一行 JSON-RPC。通知（无 id）不应答；解析失败回 -32727
-// parse error（保守起见 id 置 null）。
+// handleLine 解析并应答一行 JSON-RPC。通知（无 id）不应答；解析失败回
+// -32700 parse error（保守起见 id 置 null）。
 func (s *peerMCPServer) handleLine(line []byte) {
 	var req mcpRequest
 	if err := json.Unmarshal(line, &req); err != nil {
@@ -226,7 +229,9 @@ var peerMCPTools = []peerMCPTool{
 		name: "peer_exec",
 		description: "Run a one-shot command on another device owned by the same account and " +
 			"return its exit code plus stdout/stderr. The remote device must have peer exec " +
-			"enabled. Serial per target device: a busy target returns fail_reason=busy immediately.",
+			"enabled. Serial per target device: a busy target returns fail_reason=busy immediately. " +
+			"Also serial per calling device — run peer calls one after another, never in parallel " +
+			"(concurrent calls fail with fail_reason=rate_limited).",
 		schema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
@@ -257,7 +262,8 @@ var peerMCPTools = []peerMCPTool{
 	{
 		name: "peer_fetch_file",
 		description: "Queue an asynchronous file fetch from another device into this machine's " +
-			"transfer inbox. Returns a transfer_id; completion is delivered via transfer progress.",
+			"transfer inbox. The source device must have peer fetch enabled. Returns a transfer_id; " +
+			"completion is delivered via transfer progress.",
 		schema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
@@ -381,7 +387,10 @@ func (s *peerMCPServer) invokeTool(name string, rawArgs json.RawMessage) (string
 		return fmt.Sprintf("local agent unreachable at %s: %v (is the Aliang agent running?)", s.baseURL, err), true
 	}
 	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	// 响应体 4MiB 封顶,与 LLM 注册表面 MaxOutputBytes 同值(agent_tool_registry
+	// .go peer_exec):契约合法满输出(stdout/stderr 各 256KiB 裸字节)经 JSON
+	// 转义可膨胀 1.5-3 倍,卡在 1MiB 会把合法结果截断成非法 JSON 整次报废。
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if err != nil {
 		return fmt.Sprintf("read local agent response: %v", err), true
 	}

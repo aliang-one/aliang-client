@@ -1898,9 +1898,18 @@ func (s *AgentService) callAgentServerWithAuthorization(method string, endpoint 
 	} else if refreshErr != nil {
 		logger.Warn(fmt.Sprintf("[AGENT-CHANNEL] 401 本地续期失败，不重试 endpoint=%s: %v",
 			sanitizeAgentEndpoint(endpoint), refreshErr))
+		// 本地刷新通道自身失败 = agent 侧永远无法自救,同样请求 owner 恢复链
+		// (带指纹去重,与未轮转分支共用一枚闸)。
+		s.NotifyOwnerAuthRejectedForChannel(agentChannelAuthFingerprint(rejectedAuth))
 	} else {
 		logger.Warn(fmt.Sprintf("[AGENT-CHANNEL] 401 续期未轮转凭据（token 未临近过期，或被服务端吊销但未过期），不重试 endpoint=%s",
 			sanitizeAgentEndpoint(endpoint)))
+		// 2026-10-31 生产事故(transfer 401 持续):「吊销但未过期」时本地续期
+		// 永远返回同头,这条分支曾是通道 401 的死胡同——用户重登、core 两次
+		// auth_sync success 都救不了它。通知 owner 走恢复链(真刷新+经
+		// /api/agent/sync 重推),指纹去重保证退避循环不会变成恢复链风暴:
+		// 同一凭据指纹只触发一次;owner 重推后指纹变化,若仍 401 会再次武装。
+		s.NotifyOwnerAuthRejectedForChannel(agentChannelAuthFingerprint(rejectedAuth))
 	}
 	agentChannelHealthInstance.record401(endpoint, rejectedAuth)
 	return nil, err
@@ -2005,6 +2014,10 @@ const agentOwnerNotifyTimeout = 2 * time.Second
 const (
 	agentAuthRejectedReasonRegister = "agent_register_rejected"
 	agentAuthRejectedReasonWS       = "agent_ws_rejected"
+	// 通道(transfer/REST)401 且本地续期未轮转(吊销但未过期)时使用——
+	// 2026-10-31 生产事故(transfer 401 持续)新增,见
+	// NotifyOwnerAuthRejectedForChannel。
+	agentAuthRejectedReasonChannel = "agent_channel_rejected"
 )
 
 var (
@@ -2082,12 +2095,22 @@ func NotifyOwnerAuthRejected(reason string) {
 	}
 	ownerAuthRejectedNotifyMu.Unlock()
 
-	payload := sessionOwnerAuthRejectedNotify{
+	postOwnerAuthRejectedNotify(ownerBase, sessionOwnerAuthRejectedNotify{
 		Reason:     reason,
 		DeviceID:   currentAgentDeviceIDForNotify(),
 		ObservedAt: time.Now().Unix(),
 		Generation: currentSessionGenerationForNotify(),
-	}
+	}, reason, consumeOwnerAuthRejectedNotifyEdge)
+}
+
+// postOwnerAuthRejectedNotify 把「凭据被远端拒绝」通知 POST 给 session owner,
+// 并按应答处置调用方的沿:applied=true 或永久 4xx → consumeEdge()(消耗);
+// 传输错 / 5xx / 408/429 / applied=false / 应答不可解析 → 不调 consumeEdge
+// (沿保留)。payload 由调用方构造——sender 不得静态引用 currentAgentDeviceID
+// ForNotify 之类会牵出 GetSharedAgentService 的取值路径,否则从包级 var
+// agentTransferFetchInbox 出发的初始化依赖链会成环(2026-10-31 实测)。
+// register/WS 与通道两条通知路径共用本 sender,各自持有独立的沿。
+func postOwnerAuthRejectedNotify(ownerBase string, payload sessionOwnerAuthRejectedNotify, reason string, consumeEdge func()) {
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		// 序列化失败不消耗沿：下次 401 重试通知会重新构建并重试。
@@ -2112,7 +2135,7 @@ func NotifyOwnerAuthRejected(reason string) {
 			logger.Warn(fmt.Sprintf("[AGENT-BOOT] owner_notify_auth_rejected unreadable_response reason=%s owner=%s status=%d edge=retained will_retry=true response=%s",
 				reason, ownerBase, resp.StatusCode, strings.TrimSpace(string(body))))
 		} else if parsed.applied() {
-			consumeOwnerAuthRejectedNotifyEdge()
+			consumeEdge()
 			logger.Info(fmt.Sprintf("[AGENT-BOOT] owner_notify_auth_rejected sent reason=%s status=%d applied=true edge=consumed response=%s",
 				reason, resp.StatusCode, strings.TrimSpace(string(body))))
 		} else {
@@ -2134,7 +2157,7 @@ func NotifyOwnerAuthRejected(reason string) {
 	default:
 		// 其余非 2xx/5xx（400/404 等）：请求已送达但被按契约永久拒绝，
 		// 重试无意义——消耗沿。
-		consumeOwnerAuthRejectedNotifyEdge()
+		consumeEdge()
 		logger.Warn(fmt.Sprintf("[AGENT-BOOT] owner_notify_auth_rejected permanent_rejection reason=%s owner=%s status=%d edge=consumed response=%s",
 			reason, ownerBase, resp.StatusCode, strings.TrimSpace(string(body))))
 	}
@@ -2148,6 +2171,77 @@ func consumeOwnerAuthRejectedNotifyEdge() {
 	ownerAuthRejectedNotifyMu.Lock()
 	defer ownerAuthRejectedNotifyMu.Unlock()
 	ownerAuthRejectedNotifyFired = true
+}
+
+// —— 通道(transfer/REST)专用通知 ——————————————————————————————————————
+// 2026-10-31 生产事故(transfer 401 持续):用户重登后 core 两次 auth_sync
+// success,但 transfer 客户端的本地续期被「未临近过期/被吊销但未过期」闸门
+// 短路(ensureFreshRegisterAuthHeaderForPush 只看 ExpiresIn),同一头原样返回,
+// owner 的恢复链(真刷新+经 /api/agent/sync 重推)从未被触发,通道 401 无限
+// 退避。NotifyOwnerAuthRejectedForChannel 是通道 401 触达恢复链的入口,带
+// 指纹去重:同一凭据指纹只触发一次(退避循环不得变成恢复链风暴);凭据被
+// 替换(指纹变化)重新武装——owner 重推的新凭证若仍被拒,允许再次请求恢复。
+// 沿语义与 NotifyOwnerAuthRejected 相同(applied/永久 4xx 消耗;传输错/5xx/
+// 408/429/applied=false/不可解析保留),但与 register/WS 的转换沿互相独立,
+// 互不抢占。非 agent 运行时或 owner 地址为空静默跳过(降级为既有行为)。
+var (
+	ownerChannelNotifyMu          sync.Mutex
+	ownerChannelNotifyFingerprint string
+	ownerChannelNotifyConsumed    bool
+)
+
+func (s *AgentService) NotifyOwnerAuthRejectedForChannel(fingerprint string) {
+	if !IsUserAgentRuntime() {
+		return
+	}
+	ownerBase := strings.TrimRight(strings.TrimSpace(os.Getenv(SessionOwnerAddrEnv)), "/")
+	if ownerBase == "" {
+		return
+	}
+	ownerChannelNotifyMu.Lock()
+	if fingerprint != ownerChannelNotifyFingerprint {
+		ownerChannelNotifyFingerprint = fingerprint
+		ownerChannelNotifyConsumed = false
+	}
+	if ownerChannelNotifyConsumed {
+		ownerChannelNotifyMu.Unlock()
+		return
+	}
+	ownerChannelNotifyMu.Unlock()
+	// 设备号取进程本地 state(不碰 GetSharedAgentService——见
+	// postOwnerAuthRejectedNotify 的成环注释);未注册时为空串,owner 对
+	// 空 device_id 的通知按 generation+时间窗校验,可正常应用。
+	payload := sessionOwnerAuthRejectedNotify{
+		Reason:     agentAuthRejectedReasonChannel,
+		DeviceID:   s.currentAgentDeviceIDForChannelNotify(),
+		ObservedAt: time.Now().Unix(),
+		Generation: currentSessionGenerationForNotify(),
+	}
+	postOwnerAuthRejectedNotify(ownerBase, payload, agentAuthRejectedReasonChannel, func() {
+		ownerChannelNotifyMu.Lock()
+		defer ownerChannelNotifyMu.Unlock()
+		// 指纹未变才消耗:沿与指纹绑定,指纹变化即重新武装。
+		if fingerprint == ownerChannelNotifyFingerprint {
+			ownerChannelNotifyConsumed = true
+		}
+	})
+}
+
+// currentAgentDeviceIDForChannelNotify 通道通知专用的设备号读取:与
+// currentAgentDeviceIDForNotify 语义一致,但只读本进程 state,不走
+// GetSharedAgentService(保持通知路径在包级 var 初始化依赖图之外)。
+func (s *AgentService) currentAgentDeviceIDForChannelNotify() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.state.DeviceID
+}
+
+// resetOwnerChannelNotifyForTest 复位通道通知的指纹与沿(仅测试使用)。
+func resetOwnerChannelNotifyForTest() {
+	ownerChannelNotifyMu.Lock()
+	defer ownerChannelNotifyMu.Unlock()
+	ownerChannelNotifyFingerprint = ""
+	ownerChannelNotifyConsumed = false
 }
 
 // resetOwnerAuthRejectedNotify 复位转换沿：注册成功（ok 边沿）后由
