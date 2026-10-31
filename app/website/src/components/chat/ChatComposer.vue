@@ -7,7 +7,7 @@
     <div
       v-if="steerBlocked"
       data-testid="chat-steer-blocked-hint"
-      class="mb-2 rounded-lg border border-slate-200 bg-slate-100 px-3 py-2 text-xs text-slate-500 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300"
+      :class="HINT_BAR_CLASS"
     >
       {{ t('chat_steerBlocked') }}
     </div>
@@ -19,7 +19,7 @@
     <div
       v-if="approvalBlocked"
       data-testid="chat-approval-block-hint"
-      class="mb-2 rounded-lg border border-slate-200 bg-slate-100 px-3 py-2 text-xs text-slate-500 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300"
+      :class="HINT_BAR_CLASS"
     >
       {{ t('chat_approvalBlockHint') }}
     </div>
@@ -66,10 +66,12 @@
            且输入非空 → 发送键（点击走既有 steer 分流——emit('send') 不变，
            label 沿用 插话中/发送，disabled 沿用 sendDisabled）；running 且输入
            空 → 停止键（emit('stop') 接 ai.stop，目标 id 与 steer 同构）。
+           审批等待期 textarea 禁用，带草稿时用户清不了空——放宽让停止键
+           成为自救出口；非审批态仍要求空输入（避免误触打断运行中回合）。
            Task 8 占位的「running 即整键禁用」死路径已删——触控端 running 时
            两个键位至少有一个可点。 -->
       <button
-        v-if="running && !hasInput"
+        v-if="running && (!hasInput || approvalBlocked)"
         type="button"
         data-testid="chat-stop-button"
         class="min-h-[40px] flex shrink-0 items-center gap-1 rounded-lg bg-slate-200 px-4 text-sm font-semibold text-slate-500 transition hover:bg-slate-300 md:min-h-0 dark:bg-slate-700 dark:text-slate-400 dark:hover:bg-slate-600"
@@ -96,6 +98,10 @@ import { isComposingEvent } from '../../composables/useAliangChat';
 
 // 自增高上限：144px ≈ 6 行（行高 20px + 上下 padding）。
 const TEXTAREA_MAX_HEIGHT = 144;
+
+// 同族提示条（steer 阻断 / 审批硬拦）的公共 class 串：两处提示同一定式，
+// 下次加 role="status" 等属性时只改这一处。
+const HINT_BAR_CLASS = 'mb-2 rounded-lg border border-slate-200 bg-slate-100 px-3 py-2 text-xs text-slate-500 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300';
 
 const props = defineProps({
   modelValue: { type: String, default: '' },

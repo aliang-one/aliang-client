@@ -181,6 +181,10 @@ export function useAliangChat() {
   // sending 守卫改造：running 会话在 sending 中仍可输入提交（插话），非 running
   // 维持禁用（本地 run 在途时输入框照旧锁住——此时 activeRunning=true 会放行，
   // 提交自然分流成 steer，这正是预期交互）。
+  // 审批硬拦谓词单源：sendDisabled 与 ChatPage 的 :approval-blocked 接线共同
+  // 消费——提示条与输入/发送禁用必须同真同假，别再各写一遍 length > 0。
+  const sendApprovalBlocked = computed(() => activeApprovals.value.length > 0);
+
   // 审批等待期硬拦（Task 10，对齐手机端 spec §C 防顶翻）：活跃会话挂着
   // pending/responding 审批卡时，新消息/插话发送都会顶掉待审批、把会话打翻成
   // failed——所有 provider 一律禁发，直至卡被处理（响应/ai.done/cancelled 清卡）。
@@ -188,7 +192,7 @@ export function useAliangChat() {
   // ChatComposer 独立出口不经 sendDisabled）。仅拦活跃会话自身的审批（与
   // activeApprovals 口径一致，壳路由到他端会话的卡不拦本端输入）。
   const sendDisabled = computed(() =>
-    (sending.value && !activeSessionRunning.value) || activeApprovals.value.length > 0
+    (sending.value && !activeSessionRunning.value) || sendApprovalBlocked.value
   );
 
   const sendButtonLabel = computed(() => {
@@ -1271,6 +1275,8 @@ export function useAliangChat() {
         // 未结束回合的精确清卡（区别于 done/error 路径的 clearApprovalsForSession
         // 粗暴清空）：逐个作废 + 系统提示条挂对应会话（审批族链已路由到设备壳/
         // 活跃兜底）。③ 兜底时带「来自会话 X」前缀（评审折叠项，单行文案内联）。
+        // expires_at 到期后端会以 ai.approval.cancelled(reason=approval_timeout)
+        // 收尾，同样走清卡。
         const ids = Array.isArray(e.approval_ids) ? e.approval_ids : [];
         for (const id of ids) {
           const key = approvalKeyFromValues(e.session_id, id);
@@ -1483,6 +1489,7 @@ export function useAliangChat() {
     renamingId,
     renameSurface,
     sendButtonLabel,
+    sendApprovalBlocked,
     sendDisabled,
     showMobileSidebar,
     slashIndex,

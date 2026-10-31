@@ -5,7 +5,9 @@ import { openChat as openChatBase, pushFrame } from './helpers/chatStub.js';
 // 消息/插话都会顶掉待审批、把会话打翻成 failed，所有 provider 一律禁发）。
 // 用例①硬拦：审批卡挂活跃会话 → activeApprovals 非空 → sendDisabled=true
 // （textarea 与发送键同源 disabled——Enter 路径走 textarea keydown，禁用态
-// 收不到键事件，与按钮同守卫）+ 提示条；ai.done 清卡后恢复。
+// 收不到键事件，与按钮同守卫）+ 提示条；ai.done 清卡后恢复。带草稿被拦时
+// 停止键仍可见（死锁出口存活——textarea 禁用清不了草稿，放宽后的停止键是
+// 唯一自救位）。
 // 用例②壳路由不拦：审批帧三键命中设备壳（session_id=source_session_id）时
 // 卡挂壳不挂活跃会话——与 activeApprovals「仅活跃会话自身审批」口径一致，
 // 本地新会话输入不受他壳审批影响。
@@ -17,12 +19,14 @@ const DETAIL_TRANSCRIPT = [
 ];
 
 // sessions：①硬拦走纯本地会话（空清单，先发一句建立 socket + aiSessionId）；
-// ②壳路由需要 source_session_id 可命中的 agentcore 壳。aiMessageResponder 维持
-// 默认 'ai.done'——①的第一句需要终态复位 sending，后续 ai.done 由用例注入。
+// ②壳路由需要 source_session_id 可命中的 agentcore 壳。aiMessageResponder 覆写
+// 为 'ai.run.started'（默认回 ai.done）——①的停止键断言需要会话进 running
+// （停止键 v-if 含 running），终态 ai.done 由用例自行注入收敛。
 async function openChat(page, { sessions = [] } = {}) {
   await openChatBase(page, {
     sessions,
     newSession: false,
+    aiMessageResponder: 'ai.run.started',
     detail: { transcript: DETAIL_TRANSCRIPT },
   });
 }
@@ -30,10 +34,11 @@ async function openChat(page, { sessions = [] } = {}) {
 test('硬拦：审批卡挂活跃会话 → 输入禁用+提示条，Enter 不发送，ai.done 清卡后恢复', async ({ page }) => {
   await openChat(page);
   await page.getByRole('button').filter({ hasText: 'add' }).first().click(); // 新建本地会话
-  const input = page.getByPlaceholder(/输入消息|Type a message/);
+  const input = page.getByPlaceholder(/输入消息|运行中|Running|Type a message/);
   await input.fill('第一句');
   await page.keyboard.press('Enter');
-  // 默认桩 ai.message 即回 ai.done：sending 复位、输入恢复可用；create 帧的
+  // 桩 ai.message 回 ai.run.started：run 保持 running（停止键的 running 门控
+  // 由它满足），输入不锁（running 会话在 sending 中仍可输入）；create 帧的
   // session_id 即 conv.aiSessionId（后续审批帧按它直连命中）
   await expect(input).toBeEnabled();
   const sid = await page.evaluate(() =>
@@ -51,6 +56,9 @@ test('硬拦：审批卡挂活跃会话 → 输入禁用+提示条，Enter 不�
   const hint = page.getByTestId('chat-approval-block-hint');
   await expect(hint).toBeVisible();
   await expect(hint).toContainText(/有待审批请求，请先处理后再发送|Approval required before sending/);
+  // 死锁出口存活：带草稿被硬拦时 textarea 禁用、用户清不了空——放宽后的
+  // 停止键必须可见（running && (!hasInput || approvalBlocked) 的自救分支）
+  await expect(page.getByTestId('chat-stop-button')).toBeVisible();
   // Enter 路径同拦：禁用态下敲 Enter 绝不产生第二条 ai.message
   await page.keyboard.press('Enter');
   await page.waitForTimeout(300);
@@ -58,10 +66,12 @@ test('硬拦：审批卡挂活跃会话 → 输入禁用+提示条，Enter 不�
     window.__aiFrames.filter(f => f.type === 'ai.message').length
   );
   expect(messageCount).toBe(1);
-  // 注入 ai.done 清卡（clearApprovalsForSession 同口径）→ 输入恢复、提示条消失
+  // 注入 ai.done 清卡（clearApprovalsForSession 同口径）+ running 终态 → 输入
+  // 恢复、提示条消失、停止键随 running 归零让位发送键
   await pushFrame(page, { type: 'ai.done', session_id: sid });
   await expect(input).toBeEnabled();
   await expect(page.getByTestId('chat-approval-block-hint')).toHaveCount(0);
+  await expect(page.getByTestId('chat-stop-button')).toHaveCount(0);
 });
 
 test('壳路由卡不拦：审批帧命中设备壳（session_id 三键）→ 活跃本地会话输入保持可用', async ({ page }) => {

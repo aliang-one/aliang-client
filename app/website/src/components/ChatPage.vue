@@ -69,7 +69,7 @@
         :placeholder="inputPlaceholder"
         :running="activeSessionRunning"
         :steer-blocked="steerBlocked"
-        :approval-blocked="activeApprovals.length > 0"
+        :approval-blocked="sendApprovalBlocked"
         :slash-open="slashOpen"
         :slash-matches="slashMatches"
         :slash-index="slashIndex"
@@ -131,6 +131,7 @@ const {
   scrollToBottom,
   sendMessage,
   sendButtonLabel,
+  sendApprovalBlocked,
   sendDisabled,
   setInputEl,
   setMessagesContainer,
