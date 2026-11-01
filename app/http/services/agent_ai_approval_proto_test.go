@@ -296,22 +296,28 @@ func TestAgentAIApprovalSyncListsPending(t *testing.T) {
 	defer manager.closeAll()
 	mu, events, writer := captureAIWriter(t)
 
-	// No pending -> no sync emitted.
+	// No pending -> sync still emitted with an empty list (2026-11-01 审计:
+	// 空 no-op 使协议无法表达「已无 pending」,server 侧残留卡只能靠 deadline
+	// 收敛;显式空集为反向对账提供数据基础,服务端对空数组 no-op)。
 	manager.emitApprovalSync(writer)
-	if got := findAIEvents(mu, events, "ai.approval.sync"); len(got) != 0 {
-		t.Fatalf("expected no sync when none pending, got %d", len(got))
+	emptySyncs := findAIEvents(mu, events, "ai.approval.sync")
+	if len(emptySyncs) != 1 {
+		t.Fatalf("expected exactly 1 empty sync when none pending, got %d", len(emptySyncs))
+	}
+	if empty, _ := emptySyncs[0]["pending"].([]map[string]interface{}); len(empty) != 0 {
+		t.Fatalf("expected empty pending list, got %v", empty)
 	}
 
 	registerPendingApproval(manager, "s4", "ap_a", 1)
 	registerPendingApproval(manager, "s4", "ap_b", 1)
 
-	// Pending approvals are listed.
+	// Pending approvals are listed (第 2 条 sync;第 1 条是空集心跳)。
 	manager.emitApprovalSync(writer)
 	syncs := findAIEvents(mu, events, "ai.approval.sync")
-	if len(syncs) != 1 {
-		t.Fatalf("expected 1 sync, got %d", len(syncs))
+	if len(syncs) != 2 {
+		t.Fatalf("expected 2 syncs (empty heartbeat + listing), got %d", len(syncs))
 	}
-	pending, _ := syncs[0]["pending"].([]map[string]interface{})
+	pending, _ := syncs[len(syncs)-1]["pending"].([]map[string]interface{})
 	if len(pending) != 2 {
 		t.Fatalf("sync pending len = %d, want 2", len(pending))
 	}

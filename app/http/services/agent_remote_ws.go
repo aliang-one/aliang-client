@@ -705,6 +705,9 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 		// keyed), so periodic re-hellos re-triggering them is safe.
 		s.markRegistrationReady()
 		s.ai.replayPendingTerminals(writeJSON)
+		// 审批请求投递 journal 重放(L1,2026-11-01):半开 socket 期间丢失的
+		// ai.approval.request 原样补发;服务端 intake 以 approval_id 幂等。
+		s.ai.replayPendingApprovalRequests(writeJSON)
 		// 远端 socket 门开后复活（2026-10-28 评审 I2）：ensureRemoteAISocket 在
 		// 连接建立即注册，但那时注册门未开——门开前的扇出会让 pump 卡在
 		// publishedWriter→waitForRegistration（≤5s）后撞写超时、被 onDead 摘除，
@@ -729,6 +732,7 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 		// delivery may have reached Server while its database was unavailable;
 		// waiting for another reconnect would otherwise leave the run stuck.
 		s.ai.replayPendingTerminals(writeJSON)
+		s.ai.replayPendingApprovalRequests(writeJSON)
 	case models.AgentEventAIRunEventAck:
 		s.setRemoteConnectionState(true, "online", "")
 		s.ai.acknowledgePendingTerminal(
@@ -975,10 +979,16 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 		case models.AgentEventAISessionClose:
 			s.ai.close(msg, writeJSON)
 		}
-	case models.AgentEventAIApprovalState, models.AgentEventAIApprovalRequestAck:
-		// Server-side approval status / request-received ack: informational.
-		// Touch liveness; delivery/retry is driven by ai.approval.ack.
+	case models.AgentEventAIApprovalState:
+		// Server-side approval status: informational. Touch liveness;
+		// delivery/retry is driven by ai.approval.ack.
 		s.setRemoteConnectionState(true, "online", "")
+	case models.AgentEventAIApprovalRequestAck:
+		// 服务端已收货(intake 幂等 outcome 随帧):清除投递 journal 条目。
+		// L1 可靠投递(2026-11-01)——半开 socket 丢帧靠重连重放补达,ack 是
+		// 「必达」的终止信号。
+		s.setRemoteConnectionState(true, "online", "")
+		s.ai.acknowledgePendingApprovalRequest(remoteString(msg, "approval_id"))
 	case models.AgentEventAIApprovalCancelled:
 		// Server cancelled approvals (e.g. device was offline past grace): drop
 		// the matching local waiters so a still-running CLI is told to give up.

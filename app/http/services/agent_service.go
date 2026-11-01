@@ -254,6 +254,9 @@ func NewAgentService() *AgentService {
 	s.tunnel = tunnel.NewManager(s.emitTunnelStatus)
 	s.ai.service = s
 	s.ai.loadPendingTerminals()
+	// 审批请求投递 journal 回灌(L1,2026-11-01):上次进程未确认送达的审批
+	// 请求,注册成功后重放(服务端 intake 幂等)。
+	s.ai.loadPendingApprovalRequests()
 	s.ai.loadIdentityState()
 	if err := s.loadState(); err != nil {
 		logger.Warn(fmt.Sprintf("[AGENT-BOOT] state_load failed error=%v", err))
