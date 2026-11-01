@@ -31,6 +31,33 @@ const readBinaryProbeBytes = 8192
 // 对话一起拖死——所以必须在本地先挡住并给出可执行的提示（缩图/截图）。
 const readImageRawMaxBytes = 5 * 1024 * 1024
 
+// maxWalkDepth 是 Glob/Grep 遍历的最大递归层数（相对搜索根）。
+//
+// 目的不是省时间，而是防「根选错」：一旦模型把 path 给成家目录甚至 /，没有层数
+// 上限的 WalkDir 会一路下潜到几十万条目。40 层足够覆盖任何真实仓库结构。
+const maxWalkDepth = 40
+
+// maxWalkEntries 是单次遍历访问的最大条目数（目录+文件都算）。
+//
+// 与结果数上限是两回事：`grep -r 一个不存在的串` 的结果是 0，但遍历可能扫完
+// 整棵树。有了这个闸，最坏情况也有界。
+const maxWalkEntries = 200000
+
+// maxGrepResults 是 max_results 的上限。
+//
+// max_results 由模型给，此前只有下限没有上限：传 10000000 就能让内核把命中
+// 全部攒进 []string 再 Join，内存直接放大（每条命中还带 400 字符上限）。
+const maxGrepResults = 2000
+
+// walkDepth 返回 p 相对 root 的层数（root 自身为 0）。
+func walkDepth(root, p string) int {
+	rel, err := filepath.Rel(root, p)
+	if err != nil || rel == "." {
+		return 0
+	}
+	return strings.Count(filepath.ToSlash(rel), "/") + 1
+}
+
 // readImageMediaType 按扩展名判定图片媒体类型。
 //
 // 只认 Anthropic 明确支持的四种。不认识的一律当普通文件走文本路径（而不是
@@ -78,6 +105,11 @@ func (t *readTool) Execute(ctx context.Context, input map[string]interface{}, en
 	}
 	path, err := resolveToolPath(env, raw)
 	if err != nil {
+		return ErrorResult("%v", err)
+	}
+	// 隐私闸必须在任何磁盘访问之前：macOS 受保护目录的 stat 本身就会阻塞在
+	// 系统授权框上（见 privacy.go 文件头）。
+	if err := guardToolPath(path); err != nil {
 		return ErrorResult("%v", err)
 	}
 
@@ -208,6 +240,9 @@ func (t *lsTool) Execute(ctx context.Context, input map[string]interface{}, env 
 	if err != nil {
 		return ErrorResult("%v", err)
 	}
+	if err := guardToolPath(path); err != nil {
+		return ErrorResult("%v", err)
+	}
 
 	entries, err := os.ReadDir(path)
 	if err != nil {
@@ -272,6 +307,9 @@ func (t *globTool) Execute(ctx context.Context, input map[string]interface{}, en
 	if err != nil {
 		return ErrorResult("%v", err)
 	}
+	if err := guardToolPath(root); err != nil {
+		return ErrorResult("%v", err)
+	}
 	info, err := os.Stat(root)
 	if err != nil {
 		return ErrorResult("无法访问 %s: %v", root, err)
@@ -285,6 +323,8 @@ func (t *globTool) Execute(ctx context.Context, input map[string]interface{}, en
 		mtime int64
 	}
 	var hits []hit
+	walked := 0
+	walkTruncated := false
 	walkErr := filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
 		if err != nil {
 			return nil // 权限不足的目录直接跳过
@@ -292,8 +332,13 @@ func (t *globTool) Execute(ctx context.Context, input map[string]interface{}, en
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		walked++
+		if walked > maxWalkEntries {
+			walkTruncated = true
+			return filepath.SkipAll
+		}
 		if d.IsDir() {
-			if shouldSkipDir(d.Name()) && p != root {
+			if shouldSkipWalkDir(root, p) {
 				return filepath.SkipDir
 			}
 			return nil
@@ -339,6 +384,9 @@ func (t *globTool) Execute(ctx context.Context, input map[string]interface{}, en
 	out := strings.Join(lines, "\n")
 	if truncated {
 		out += fmt.Sprintf("\n[仅显示前 %d 个结果，请缩小 pattern 或指定 path。]", globMaxResults)
+	}
+	if walkTruncated {
+		out += fmt.Sprintf("\n[遍历已达 %d 个条目上限，结果不完整；请缩小 path 范围。]", maxWalkEntries)
 	}
 	return ToolResult{Content: truncateToolOutput(out)}
 }
@@ -415,6 +463,9 @@ func (t *grepTool) Execute(ctx context.Context, input map[string]interface{}, en
 	if err != nil {
 		return ErrorResult("%v", err)
 	}
+	if err := guardToolPath(root); err != nil {
+		return ErrorResult("%v", err)
+	}
 	info, err := os.Stat(root)
 	if err != nil {
 		return ErrorResult("无法访问 %s: %v", root, err)
@@ -425,9 +476,16 @@ func (t *grepTool) Execute(ctx context.Context, input map[string]interface{}, en
 	if !ok || maxResults <= 0 {
 		maxResults = defaultGrepMaxResults
 	}
+	if maxResults > maxGrepResults {
+		maxResults = maxGrepResults
+	}
 
 	var out []string
 	truncated := false
+	// walked/walkTruncated 在 else 分支里累加，但结果文案在分支外拼装，
+	// 所以必须在函数作用域声明。
+	walked := 0
+	walkTruncated := false
 
 	collect := func(path, rel string) error {
 		fileHits, err := grepFile(ctx, path, rel, re, maxResults-len(out))
@@ -454,8 +512,13 @@ func (t *grepTool) Execute(ctx context.Context, input map[string]interface{}, en
 			if cerr := ctx.Err(); cerr != nil {
 				return cerr
 			}
+			walked++
+			if walked > maxWalkEntries {
+				walkTruncated = true
+				return filepath.SkipAll
+			}
 			if d.IsDir() {
-				if shouldSkipDir(d.Name()) && p != root {
+				if shouldSkipWalkDir(root, p) {
 					return filepath.SkipDir
 				}
 				return nil
@@ -476,11 +539,18 @@ func (t *grepTool) Execute(ctx context.Context, input map[string]interface{}, en
 	}
 
 	if len(out) == 0 {
-		return ToolResult{Content: fmt.Sprintf("没有匹配 %q 的内容。", pattern)}
+		text := fmt.Sprintf("没有匹配 %q 的内容。", pattern)
+		if walkTruncated {
+			text += fmt.Sprintf("\n[遍历已达 %d 个条目上限，可能还有未搜索到的文件；请缩小 path 范围。]", maxWalkEntries)
+		}
+		return ToolResult{Content: text}
 	}
 	text := strings.Join(out, "\n")
 	if truncated {
 		text += fmt.Sprintf("\n[已达 %d 条上限，请缩小范围或加 glob 过滤。]", maxResults)
+	}
+	if walkTruncated {
+		text += fmt.Sprintf("\n[遍历已达 %d 个条目上限，结果不完整；请缩小 path 范围。]", maxWalkEntries)
 	}
 	return ToolResult{Content: truncateToolOutput(text)}
 }
