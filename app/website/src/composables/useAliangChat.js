@@ -1347,6 +1347,8 @@ export function useAliangChat() {
         return t('chat_noticeResumeMissing');
       case 'history_restore_failed':
         return t('chat_noticeHistoryRestoreFailed');
+      case 'tool_timeout':
+        return t('chat_noticeToolTimeout');
       default:
         return '';
     }

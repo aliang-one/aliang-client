@@ -152,7 +152,7 @@ func runShell(ctx context.Context, kind string, input map[string]interface{}, en
 
 	if runCtx.Err() == context.DeadlineExceeded {
 		sb.WriteString(fmt.Sprintf("[命令超时，已终止（上限 %s）]", timeout))
-		return ToolResult{Content: truncateToolOutput(sb.String()), IsError: true}
+		return ToolResult{Content: truncateToolOutput(sb.String()), IsError: true, TimedOut: true}
 	}
 	if ctx.Err() != nil {
 		sb.WriteString("[命令被取消]")

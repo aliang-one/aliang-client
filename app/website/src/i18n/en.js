@@ -296,6 +296,7 @@ export default {
   chat_approvalBlockHint: 'Approval required before sending.',
   chat_noticeResumeMissing: 'Native session not found — continuing as a new conversation',
   chat_noticeHistoryRestoreFailed: 'History restore failed — continuing with empty context',
+  chat_noticeToolTimeout: 'A tool timed out and was stopped (the command may have hit a protected folder or been too broad). Narrow the scope and retry.',
   chat_approvalCancelled: 'Approval was cancelled',
   chat_approvalCancelledReason: 'Approval was cancelled ({reason})',
   chat_md_copy: 'Copy',

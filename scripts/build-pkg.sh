@@ -103,6 +103,28 @@ fi
 
 # Sign both installed executables before packaging. The app bundle owns its own
 # copy while the LaunchDaemon installs the Core copy separately.
+#
+# Auto-detect a local Developer ID identity when none was supplied explicitly.
+# Why this matters beyond packaging hygiene: an ad-hoc signed bundle has no
+# certificate, so macOS TCC keys the app's privacy grants on the binary's
+# cdhash — and cdhash changes on EVERY rebuild. The result is that every dev
+# rebuild silently loses "Files & Folders"/Music/Photos permissions and the
+# system re-prompts. A Developer ID signature makes the grant requirement
+# certificate-based (identifier + anchor apple generic), which survives
+# rebuilds. Observed 2026-10-31: tccd logged
+#   "Failed to match existing code requirement for subject one.aliang.aliang
+#    ... cdhash H\"8b918936...\""
+# followed immediately by a fresh kTCCServiceMediaLibrary prompt.
+# Set ALIANG_SKIP_CODESIGN=1 to opt out (pure dev package, no TCC grants kept).
+if [ -z "$MAC_APPLICATION_IDENTITY" ] && [ "$(uname)" = "Darwin" ] && [ "${ALIANG_SKIP_CODESIGN:-0}" != "1" ]; then
+	MAC_APPLICATION_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
+		| sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -1)"
+	if [ -n "$MAC_APPLICATION_IDENTITY" ]; then
+		echo "=== Auto-detected signing identity: $MAC_APPLICATION_IDENTITY ==="
+		echo "=== (stable signing keeps macOS TCC grants across rebuilds) ==="
+	fi
+fi
+
 if [ -n "$MAC_APPLICATION_IDENTITY" ]; then
 	echo "=== Signing app and Core binaries ==="
 	codesign --force --options runtime --timestamp \
