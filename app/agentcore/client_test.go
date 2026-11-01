@@ -796,6 +796,11 @@ func TestStreamRetryNoticeOnTransientFailureThenSuccess(t *testing.T) {
 // 全部尝试都失败 → 帧数必须等于 maxRetries（不是 maxRetries+1）：最后一次
 // 失败直接返回错误，没有「第 4 次重试」这回事。
 func TestStreamRetryNoticeCountEqualsMaxRetriesOnExhaustion(t *testing.T) {
+	// 退避改为 vars 后测试可收缩：默认退避 10 次重试累计 ~2min，测试等不起。
+	oldBase, oldMax := baseRetryDelay, maxRetryDelay
+	baseRetryDelay, maxRetryDelay = time.Millisecond, 2*time.Millisecond
+	t.Cleanup(func() { baseRetryDelay, maxRetryDelay = oldBase, oldMax })
+
 	var attempts int32
 	srv := sseServer(t, func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&attempts, 1)
@@ -834,6 +839,29 @@ func TestStreamRetryNoticeCountEqualsMaxRetriesOnExhaustion(t *testing.T) {
 	last := notices[len(notices)-1]
 	if last.Attempt != maxRetries {
 		t.Errorf("最后一帧 attempt = %d, want %d", last.Attempt, maxRetries)
+	}
+}
+
+// TestMaxRetriesFromEnv 钉住重试预算的环境变量口径（2026-11-01 上游 502 风暴
+// 加固）：缺省回落 10、合法值直读、0 合法（禁用重试）、非数字/负数回落缺省、
+// 超上限钳到上限。
+func TestMaxRetriesFromEnv(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want int
+	}{
+		{"", defaultMaxRetries},
+		{"7", 7},
+		{"0", 0},
+		{"abc", defaultMaxRetries},
+		{"-3", defaultMaxRetries},
+		{"99", maxMaxRetries},
+	}
+	for _, tc := range cases {
+		t.Setenv("ALIANG_AGENTCORE_MAX_RETRIES", tc.raw)
+		if got := agentCoreMaxRetriesFromEnv(); got != tc.want {
+			t.Fatalf("ALIANG_AGENTCORE_MAX_RETRIES=%q: got %d, want %d", tc.raw, got, tc.want)
+		}
 	}
 }
 

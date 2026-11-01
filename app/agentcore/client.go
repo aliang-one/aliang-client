@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -32,23 +33,24 @@ const (
 	// anthropicVersion 是 Messages API 的版本头。上游要求必填。
 	anthropicVersion = "2023-06-01"
 
-	// maxRetries 是瞬态失败的重试次数。仅覆盖连接错误 / 429 / 5xx / 2xx 限流过载。
+	// defaultMaxRetries 是瞬态失败重试次数的缺省值。仅覆盖连接错误 / 429 /
+	// 5xx / 2xx 限流过载。
 	//
-	// 5 次（原为 3）：agentcore 是长回合自主 agent，一次 run 可跑 30+ 回合、
-	// 数十分钟；单个瞬态抖动若在末尾把整轮判死，前面的工作全部作废。多给两
-	// 次退避（总计 ~15s 量级）换整轮韧性，代价可接受。注意口径：重试 5 次 =
-	// 全程最多 6 次尝试；按 ResponseHeaderTimeout 120s 逐次烧满的话，最坏
-	// 6×120s + 退避 ≈ 12min——若上游带 Retry-After（429/5xx 优先采用、封顶
-	// 30s），最坏 6×120s + 5×30s ≈ 14.5min。服务层的 stale 扫描器（5min）
-	// 靠 api_retry 重试帧刷新活性才扛得住这段静默（相邻刷新 ≤150s），见
-	// Stream 里 notifyRetry。
-	maxRetries = 5
+	// 10 次（原为 5，2026-11-01 上游 502 风暴加固）：agentcore 是长回合自主
+	// agent，一次 run 可跑 30+ 回合、数十分钟；单个瞬态抖动若在末尾把整轮判
+	// 死，前面的工作全部作废。实测故障形态是网关每 502 要烧 ~60s 才返回，5 次
+	// 预算只够 ~5.5 分钟就放弃——正是 10-30「优化聊天页面」会话整轮死掉的节奏；
+	// 10 次把存活窗拉到 ~11 分钟。注意口径：重试 10 次 = 全程最多 11 次尝试；
+	// 按 ResponseHeaderTimeout 120s 逐次烧满的话，最坏 11×120s + 退避 ≈ 24min
+	// ——若上游带 Retry-After（429/5xx 优先采用、封顶 30s），最坏 11×120s +
+	// 10×30s ≈ 27min。服务层的 stale 扫描器（5min）靠 api_retry 重试帧刷新活
+	// 性才扛得住这段静默（相邻刷新 ≤150s），见 Stream 里 notifyRetry；运行中
+	// 可用 ALIANG_AGENTCORE_MAX_RETRIES 覆盖（0 = 禁用重试，上限 20）。
+	defaultMaxRetries = 10
 
-	// baseRetryDelay 是指数退避的起点。
-	baseRetryDelay = 500 * time.Millisecond
-
-	// maxRetryDelay 是退避上限（同时兜住 Retry-After 的离谱值）。
-	maxRetryDelay = 30 * time.Second
+	// maxMaxRetries 是 ALIANG_AGENTCORE_MAX_RETRIES 的钳制上限：再大的预算也
+	// 只是拉长必败风暴里的煎熬，不给无界。
+	maxMaxRetries = 20
 
 	// defaultMaxTokens 是请求体没指定时的输出上限。
 	//
@@ -72,6 +74,19 @@ const (
 	// jsonErrorBodyMaxBytes 是「裸 JSON 错误体」的识别上限。真实网关的错误
 	// 信封只有一两百字节；设上限只是为了别把一段异常的巨型响应攒进内存。
 	jsonErrorBodyMaxBytes = 4096
+)
+
+// 生效的重试参数（var 而非 const）：预算 init 期从环境读一次（见
+// agentCoreMaxRetriesFromEnv），退避做成 var 是让测试能把累计 ~2min 的默认
+// 退避收缩到毫秒级。
+var (
+	maxRetries = agentCoreMaxRetriesFromEnv()
+
+	// baseRetryDelay 是指数退避的起点。
+	baseRetryDelay = 500 * time.Millisecond
+
+	// maxRetryDelay 是退避上限（同时兜住 Retry-After 的离谱值）。
+	maxRetryDelay = 30 * time.Second
 )
 
 // Client 是 Messages API 的流式客户端。零值不可用，用 NewClient 构造。
@@ -516,6 +531,23 @@ func retryDelay(attempt int, lastErr error) time.Duration {
 		return maxRetryDelay
 	}
 	return delay
+}
+
+// agentCoreMaxRetriesFromEnv 从 ALIANG_AGENTCORE_MAX_RETRIES 读重试预算：
+// 空/非数字/负数回落缺省，超上限钳到上限，0 合法（禁用重试，等价一次性尝试）。
+func agentCoreMaxRetriesFromEnv() int {
+	raw := strings.TrimSpace(os.Getenv("ALIANG_AGENTCORE_MAX_RETRIES"))
+	if raw == "" {
+		return defaultMaxRetries
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 0 {
+		return defaultMaxRetries
+	}
+	if n > maxMaxRetries {
+		return maxMaxRetries
+	}
+	return n
 }
 
 // streamOnce 是单次尝试。
