@@ -78,11 +78,13 @@ test.describe('mobile 390x844', () => {
     await page.goto('/');
     await expect(page.locator('h1').first()).toContainText('ALiang');
     await page.locator('[data-mobile-panel-toggle]').click();
-    await page.getByRole('button', { name: /更多设置|More Settings/ }).click();
-    await expect(page.locator('aside').first()).toBeVisible(); // settings 页 aside 是导航栏
+    // 2026-11-01 设置五分区重构:面板「更多设置」入口与 aside 导航移除,
+    // 设置入口=面板 agent-entry-panel,页内导航=分区 tab 网格(5 分区)。
+    await page.getByTestId('agent-entry-panel').click();
+    await expect(page.locator('#settings-page')).toBeVisible();
     const tabs = page.locator('div.grid.grid-cols-2.md\\:hidden > button');
     const count = await tabs.count();
-    expect(count).toBeGreaterThanOrEqual(4);
+    expect(count).toBeGreaterThanOrEqual(5);
     for (let i = 0; i < count; i++) {
       await tabs.nth(i).click();
       await expect(tabs.nth(i)).toHaveClass(/border-primary/);
@@ -99,7 +101,7 @@ test.describe('mobile 390x844', () => {
     await expect(topbarEntry).toBeVisible();
     await topbarEntry.click();
     await expect(page.locator('#settings-page')).toBeVisible();
-    await expect(page.locator('#settings-page h1').first()).toContainText(/Agent/);
+    await expect(page.locator('#settings-page h1').first()).toContainText(/设备与网络|Device & Network/);
 
     // 回到仪表板，走折叠面板整行入口
     await page.locator('#backToDashboard').click();
@@ -108,7 +110,7 @@ test.describe('mobile 390x844', () => {
     const panelEntry = page.locator('[data-testid="agent-entry-panel"]');
     await expect(panelEntry).toBeVisible();
     await panelEntry.click();
-    await expect(page.locator('#settings-page h1').first()).toContainText(/Agent/);
+    await expect(page.locator('#settings-page h1').first()).toContainText(/设备与网络|Device & Network/);
   });
 
   test('登录弹窗在视口内且可滚动到底部按钮', async ({ page }) => {
@@ -172,12 +174,12 @@ test.describe('desktop 1280x800 控制组（桌面零变化）', () => {
 
     await sidebarEntry.click();
     await expect(page.locator('#settings-page')).toBeVisible();
-    await expect(page.locator('#settings-page h1').first()).toContainText(/Agent/);
+    await expect(page.locator('#settings-page h1').first()).toContainText(/设备与网络|Device & Network/);
 
     await page.locator('#backToDashboard').click();
     await expect(page.locator('h1').first()).toContainText('ALiang');
     await headerEntry.click();
-    await expect(page.locator('#settings-page h1').first()).toContainText(/Agent/);
+    await expect(page.locator('#settings-page h1').first()).toContainText(/设备与网络|Device & Network/);
   });
 });
 
