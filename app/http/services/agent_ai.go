@@ -1510,7 +1510,11 @@ func (a *agentAIActivity) staleDeathReason(staleThreshold, approvalTimeout, tool
 		return "", false
 	}
 	if a.pendingToolUses.Load() > 0 || a.activeSubagents.Load() > 0 {
-		if toolCeiling > 0 && a.toolWaitFor() > toolCeiling {
+		// 工具天花板只管纯工具等待；外层 Task 工具在飞（activeSubagents>0）
+		// 的工具钟是长子代理 run 的合法在飞，交给子代理天花板管——否则工具
+		// 天花板（10min）永远先于子代理天花板（6h）触发，误杀一切长子代理
+		// （2026-11-01 天花板下调的配套豁免，与 watchdog 工具分支同口径）。
+		if toolCeiling > 0 && a.activeSubagents.Load() == 0 && a.toolWaitFor() > toolCeiling {
 			return "tool_wait_timeout", true
 		}
 		if subagentCeiling > 0 && a.subagentWaitFor() > subagentCeiling {
@@ -1685,7 +1689,16 @@ func agentAIWatchdogLoop(ctx context.Context, activity *agentAIActivity, cancel 
 			// approval hook fires): approval waits are bounded separately by
 			// agentAIApprovalTimeout, so skipping the kill while a human
 			// decision is pending is always safe.
-			if toolWaitCeiling > 0 && !activity.awaiting() && activity.toolWaitFor() > toolWaitCeiling {
+			//
+			// 子代理豁免（2026-11-01 工具天花板下调到 10min 的配套）：外层
+			// Task 工具在飞时 pendingToolUses 与 activeSubagents 同时非零，
+			// 长子代理 run 的工具钟是合法在飞——此时工具天花板让位给下面
+			// 的 subagentCeiling 分支，否则 10min 工具天花板永远先于 6h 子
+			// 代理天花板触发，一切长子代理都会被误杀（内核子代理桥是同步
+			// 返回，整段 run 期间没有 task_progress 帧来重置工具钟）。
+			if toolWaitCeiling > 0 && !activity.awaiting() &&
+				activity.activeSubagents.Load() == 0 &&
+				activity.toolWaitFor() > toolWaitCeiling {
 				activity.setKillReason("tool_wait_timeout")
 				cancel()
 				return

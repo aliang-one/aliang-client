@@ -273,6 +273,66 @@ func TestStaleScannerSparesHealthyToolWait(t *testing.T) {
 	}
 }
 
+// TestStaleScannerKillsOverlongShellToolWait 钉住僵尸回合快速判死（2026-11-01）：
+// 内核 shell 命令自带 10min 硬上限（agentcore maxShellTimeout），工具等待超过
+// 同值即定义为「工具已挂死」——扫描器必须在工具天花板上判死，而不是等 1h。
+func TestStaleScannerKillsOverlongShellToolWait(t *testing.T) {
+	oldCeiling := agentAIToolWaitCeiling
+	agentAIToolWaitCeiling = 10 * time.Minute
+	t.Cleanup(func() { agentAIToolWaitCeiling = oldCeiling })
+
+	m, _, guard, _ := newGuardTestManager(t)
+	guard.activity.beginToolUseWait()
+	// 工具钟回拨 11min：超过 10min 天花板，且期间无任何帧（真实僵尸形态——
+	// 2026-11-01 事故 ai_1sll913fE82l 的 tool_use 之后 35min 零输出）。
+	guard.activity.toolWaitStartedAt.Store(time.Now().Add(-11 * time.Minute).UnixNano())
+
+	m.scanStaleRuns()
+
+	if reason := guard.activity.killReasonOr(""); reason != "tool_wait_timeout" {
+		t.Fatalf("overlong shell tool wait not killed, reason=%q", reason)
+	}
+}
+
+// TestStaleScannerSparesSubagentBackedToolWait 防误杀配套：外层 Task 工具调用
+// 会让 pendingToolUses 与 activeSubagents 同时非零，长子代理 run（可跑数十分钟）
+// 的工具钟是合法在飞——此时工具天花板必须让位给子代理天花板（6h），否则
+// 下调工具天花板等于杀死一切长子代理。
+func TestStaleScannerSparesSubagentBackedToolWait(t *testing.T) {
+	oldCeiling := agentAIToolWaitCeiling
+	agentAIToolWaitCeiling = 10 * time.Minute
+	t.Cleanup(func() { agentAIToolWaitCeiling = oldCeiling })
+
+	m, _, guard, _ := newGuardTestManager(t)
+	guard.activity.beginToolUseWait()
+	guard.activity.beginSubagent()
+	// 工具钟回拨 30min（远超 10min 天花板），子代理钟只走了 1min（远小于 6h）。
+	guard.activity.toolWaitStartedAt.Store(time.Now().Add(-30 * time.Minute).UnixNano())
+	guard.activity.subagentWaitStartedAt.Store(time.Now().Add(-time.Minute).UnixNano())
+
+	m.scanStaleRuns()
+
+	if reason := guard.activity.killReasonOr(""); reason != "" {
+		t.Fatalf("subagent-backed tool wait was killed, reason=%q", reason)
+	}
+}
+
+// TestStaleScannerStillKillsOverlongSubagent 钉住豁免不破坏原有兜底：子代理
+// 自己的连续在飞超过 6h 仍由子代理天花板判死。
+func TestStaleScannerStillKillsOverlongSubagent(t *testing.T) {
+	m, _, guard, _ := newGuardTestManager(t)
+	guard.activity.beginToolUseWait()
+	guard.activity.beginSubagent()
+	guard.activity.toolWaitStartedAt.Store(time.Now().Add(-30 * time.Minute).UnixNano())
+	guard.activity.subagentWaitStartedAt.Store(time.Now().Add(-7 * time.Hour).UnixNano())
+
+	m.scanStaleRuns()
+
+	if reason := guard.activity.killReasonOr(""); reason != "subagent_wait_timeout" {
+		t.Fatalf("overlong subagent not killed, reason=%q", reason)
+	}
+}
+
 func TestStaleDeathReasonApprovalOverflow(t *testing.T) {
 	a := newAgentAIActivity()
 	a.setAwaitingApproval(true)

@@ -55,8 +55,11 @@ func TestAgentAITimeoutDefaults(t *testing.T) {
 	if agentAIHardCeiling != 0 {
 		t.Fatalf("default agentAIHardCeiling = %s, want 0(时间墙已移除,改 opt-in)", agentAIHardCeiling)
 	}
-	if agentAIToolWaitCeiling != time.Hour {
-		t.Fatalf("default agentAIToolWaitCeiling = %s, want 1h", agentAIToolWaitCeiling)
+	// 2026-11-01 起默认 10min（僵尸回合快速判死）：内核 shell 命令自带
+	// 10min 硬上限（agentcore maxShellTimeout），合法工具等待不可能超过它；
+	// 活跃子代理的外层工具钟由子代理天花板豁免（见 watchdog 工具分支）。
+	if agentAIToolWaitCeiling != 10*time.Minute {
+		t.Fatalf("default agentAIToolWaitCeiling = %s, want 10m", agentAIToolWaitCeiling)
 	}
 	// 旧契约「tool_wait < hard_ceiling 保证先触发」随硬顶默认关闭而失效:
 	// 各守卫独立判定,等待态各有专属天花板,不再有总闸排序要求。

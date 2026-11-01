@@ -143,7 +143,7 @@ var (
 	// sweeper — without this bound a hung subagent keeps the phone showing
 	// "running" until the stale-run sweeper reclaims it. Env:
 	//
-	//	ALIANG_AI_TOOL_WAIT_CEILING  (time.ParseDuration, e.g. "90m"). Default 1h.
+	//	ALIANG_AI_TOOL_WAIT_CEILING  (time.ParseDuration, e.g. "90m"). Default 10m.
 	//
 	// Explicitly set it to "0s" to disable. Blank/unparseable/negative values
 	// fall back to the default (see resolveEnvDurationAllowZero).
@@ -153,7 +153,14 @@ var (
 	// 的拍不计入，2h 硬顶永远不会在这条等待里先触发（它会由本上限或 stale
 	// 扫描器收敛）。审批等待的拍同样不计入本计时（挂起即停表），由
 	// agentAIApprovalTimeout 管辖。
-	agentAIToolWaitCeiling = resolveEnvDurationAllowZero("ALIANG_AI_TOOL_WAIT_CEILING", time.Hour)
+	//
+	// 默认 1h → 10min（2026-11-01 僵尸回合快速判死）：内核 shell 工具单条命令
+	// 自带 10min 硬上限（agentcore maxShellTimeout），合法工具等待本就不可能
+	// 超过它；超时即工具已挂死（实测形态：tool_use 后内核楔死、零帧零子进程，
+	// 会话 frozen 到 1h 才被收走，用户看到「对话停了」）。活跃子代理的外层
+	// Task 工具钟豁免于本上限（见 agentAIWatchdogLoop 的工具分支），长子代理
+	// 由 agentAISubagentWaitCeiling 管辖，不受本次下调影响。
+	agentAIToolWaitCeiling = resolveEnvDurationAllowZero("ALIANG_AI_TOOL_WAIT_CEILING", 10*time.Minute)
 
 	// agentAISubagentWaitCeiling bounds one CONTIGUOUS stretch with >=1 active
 	// subagent, regardless of progress. task_progress resets the 1h tool-wait

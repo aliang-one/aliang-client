@@ -264,6 +264,50 @@ func TestAgentAIWatchdogSubagentCeiling(t *testing.T) {
 	}
 }
 
+// TestAgentAIWatchdogToolCeilingExemptsSubagentRuns 防误杀配套（2026-11-01）：
+// 工具等待天花板下调到 10min 后，外层 Task 工具在飞的长子代理 run 不得被工具
+// 天花板误杀——工具钟与子代理钟同时非零时，工具分支必须让位给子代理分支。
+func TestAgentAIWatchdogToolCeilingExemptsSubagentRuns(t *testing.T) {
+	activity := newAgentAIActivity()
+	activity.beginToolUseWait()
+	activity.beginSubagent()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{}, 1)
+	go func() {
+		agentAIWatchdogLoop(ctx, activity, cancel, time.Hour /*idle*/, 0 /*hard*/, 0 /*noProgress*/, 30*time.Millisecond /*toolWait*/, 0 /*subagent*/, 2*time.Millisecond)
+		close(done)
+	}()
+	select {
+	case <-done:
+		t.Fatalf("tool ceiling killed a subagent-backed run, killReason=%q", activity.killReasonOr(""))
+	case <-time.After(300 * time.Millisecond):
+		// 300ms ≫ 30ms 工具天花板：合法在飞的长子代理必须活过它。
+	}
+	cancel()
+}
+
+// 对照组：同样的工具钟，无子代理在飞时必须在工具天花板内判死。
+func TestAgentAIWatchdogToolCeilingKillsPlainToolWait(t *testing.T) {
+	activity := newAgentAIActivity()
+	activity.beginToolUseWait()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{}, 1)
+	go func() {
+		agentAIWatchdogLoop(ctx, activity, cancel, time.Hour /*idle*/, 0 /*hard*/, 0 /*noProgress*/, 30*time.Millisecond /*toolWait*/, 0 /*subagent*/, 2*time.Millisecond)
+		close(done)
+	}()
+	select {
+	case <-done:
+		if got := activity.killReasonOr(""); got != "tool_wait_timeout" {
+			t.Fatalf("killReason = %q, want tool_wait_timeout", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("tool ceiling did not fire within 2s")
+	}
+}
+
 func TestFinalizeRunSubagentsEmitsInterrupted(t *testing.T) {
 	run := agentAIRun{sessionID: "s1", messageID: "m1", activity: newAgentAIActivity(), subagents: newAgentAISubagentRegistry()}
 	if _, ok := run.subagents.start("task-a", "tool-a", "msg-1", "A", "general", 1, "local_agent", false, time.Now()); !ok {
