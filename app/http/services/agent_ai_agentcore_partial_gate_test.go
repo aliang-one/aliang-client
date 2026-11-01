@@ -21,7 +21,7 @@ import (
 func TestJournalPartialAssistantSkippedWhenTextTurnCompleted(t *testing.T) {
 	dir := t.TempDir()
 	j := newAgentCoreJournal(dir)
-	j.ensureSessionHeader("conv-gate", "/tmp/proj-gate", "glm-5.2", "", "2026-10-31T00:00:00Z", "phone")
+	j.ensureSessionHeader("conv-gate", "/tmp/proj-gate", "glm-5.2", "", "2026-10-31T00:00:00Z", "phone", nil, nil)
 	diag := &agentCoreDiagnostics{}
 	diag.noteTextTurn() // 回合1 已带正文完成
 
@@ -46,7 +46,7 @@ func TestJournalPartialAssistantSkippedWhenTextTurnCompleted(t *testing.T) {
 func TestJournalPartialAssistantKeptWithoutTextTurn(t *testing.T) {
 	dir := t.TempDir()
 	j := newAgentCoreJournal(dir)
-	j.ensureSessionHeader("conv-gate2", "/tmp/proj-gate2", "glm-5.2", "", "2026-10-31T00:00:00Z", "phone")
+	j.ensureSessionHeader("conv-gate2", "/tmp/proj-gate2", "glm-5.2", "", "2026-10-31T00:00:00Z", "phone", nil, nil)
 	diag := &agentCoreDiagnostics{} // 无带正文回合
 
 	var out strings.Builder

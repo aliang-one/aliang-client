@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"aliang.one/nursorgate/processor/config"
 )
 
 // writeIntegrationsHome 在假家目录里铺一份最小可用的配置：
@@ -160,5 +162,39 @@ func TestCollectAgentIntegrationsEmptyHome(t *testing.T) {
 	// home 为空串：直接返回空报告，不 panic。
 	if empty := collectAgentIntegrations(""); len(empty.MCPServers) != 0 || len(empty.Skills) != 0 {
 		t.Fatalf("空 home 应返回空报告: %+v", empty)
+	}
+}
+
+// TestCollectAgentIntegrationsMasterOffMarksDisabled MCP 全局总闸显式关闭时，
+// 内核采集面内的条目必须标 disabled（与内核建连前 gate 一致），而不是继续
+// 说「已注入」。2026-10-31 验收缺陷：此前 kernel_state 只看采集成员资格，
+// 不看总闸——「面板说注入而内核不连」正是本次一致性修法要消灭的误导。
+func TestCollectAgentIntegrationsMasterOffMarksDisabled(t *testing.T) {
+	home := t.TempDir()
+	writeIntegrationsHome(t, home)
+
+	old := config.GetGlobalConfig()
+	fals := false
+	next := &config.Config{Customer: &config.CustomerConfig{
+		AgentCore: &config.AgentCoreTuningConfig{MCPEnabled: &fals},
+	}}
+	t.Cleanup(func() { config.SetGlobalConfig(old) })
+	config.SetGlobalConfig(next)
+
+	report := collectAgentIntegrations(home)
+	byName := map[string]AgentIntegrationMCPServer{}
+	for _, srv := range report.MCPServers {
+		byName[srv.Name] = srv
+	}
+	// 总闸关闭压过一切：stdio 条目与「headers 跳过」条目都不再连。
+	if got := byName["shell"].KernelState; got != agentIntegrationKernelDisabled {
+		t.Fatalf("shell 应为 disabled, got %q", got)
+	}
+	if got := byName["remote"].KernelState; got != agentIntegrationKernelDisabled {
+		t.Fatalf("remote 应为 disabled(总闸压过 headers 跳过), got %q", got)
+	}
+	// codex 条目本就不在内核采集面内，仍是 not_collected。
+	if got := byName["docs"].KernelState; got != agentIntegrationKernelNotCollected {
+		t.Fatalf("docs 应保持 not_collected, got %q", got)
 	}
 }

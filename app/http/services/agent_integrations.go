@@ -41,6 +41,10 @@ const (
 	agentIntegrationKernelInjected = "injected"
 	// agentIntegrationKernelSkippedHeaders http/sse 带自定义 headers —— v1 跳过。
 	agentIntegrationKernelSkippedHeaders = "skipped_headers"
+	// agentIntegrationKernelDisabled MCP 全局总闸显式关闭——内核一个 server
+	// 都不连（agent_ai_agentcore.go 建连前 gate），面板与内核一致标「已关总闸」。
+	// 与技能侧 KernelSupported 反映总闸（2026-10-31）是同一类一致性修法。
+	agentIntegrationKernelDisabled = "disabled"
 	// agentIntegrationKernelNotCollected 不在内核采集面内（如 codex 配置）。
 	agentIntegrationKernelNotCollected = "not_collected"
 )
@@ -93,7 +97,7 @@ func collectAgentIntegrations(home string) AgentIntegrationsReport {
 			"MCP 工具由内核按需连接：本页只列配置，工具数量需连上该 server 才知道。",
 			"内核上限：24 个 MCP server / 128 个工具；带自定义 headers 的 http/sse 条目当前版本会跳过。",
 			"Codex 的 MCP 配置不进 AliangCode 内核（内核只读 Claude 侧配置），故恒为「未采集」。",
-			"AliangCode 内核当前不支持 skill（仅内置 8 个工具），技能列表仅供查看与后续规划。",
+			"AliangCode 内核已支持技能注入与 MCP/技能全局开关（「能力接入」分区）；技能正文按需由模型读取（渐进披露）。",
 			"项目级技能需要具体项目上下文，本页不列入。",
 		},
 	}
@@ -151,12 +155,14 @@ func collectAgentIntegrationMCPServers(home string) []AgentIntegrationMCPServer 
 	for name, entry := range merged {
 		entry.Source = strings.Join(sources[name], ",")
 		if raw, ok := kernelByName[name]; ok {
-			// 内核采集到了：http/sse 且带自定义 headers 的会被 v1 跳过
-			// （agent_ai_agentcore_mcp.go 的同名限制），其余视为已注入。
-			isHTTP := strings.EqualFold(strings.TrimSpace(raw.Type), "http") ||
-				strings.EqualFold(strings.TrimSpace(raw.Type), "sse") ||
-				strings.TrimSpace(raw.URL) != ""
-			if isHTTP && len(raw.Headers) > 0 {
+			// MCP 全局总闸显式关闭：内核在建连前就把整个采集清单置空
+			// （agent_ai_agentcore.go 的 raws=nil gate），任何 server 都不会连。
+			// 面板必须与内核一致标「已关总闸」，不能再说「已注入」。
+			if !config.GetGlobalConfig().EffectiveAgentCoreMCPEnabled() {
+				entry.KernelState = agentIntegrationKernelDisabled
+			} else if isHTTPWithHeaders(raw) {
+				// http/sse 且带自定义 headers 的会被 v1 跳过
+				// （agent_ai_agentcore_mcp.go 的同名限制），其余视为已注入。
 				entry.KernelState = agentIntegrationKernelSkippedHeaders
 			} else {
 				entry.KernelState = agentIntegrationKernelInjected
@@ -228,11 +234,22 @@ func kernelStateRank(state string) int {
 	switch state {
 	case agentIntegrationKernelInjected:
 		return 0
-	case agentIntegrationKernelSkippedHeaders:
+	case agentIntegrationKernelDisabled:
 		return 1
-	default:
+	case agentIntegrationKernelSkippedHeaders:
 		return 2
+	default:
+		return 3
 	}
+}
+
+// isHTTPWithHeaders 判定该原始条目是否属于 v1 会预判跳过的形态
+// （http/sse 且带自定义 headers——go-sdk 传输层无 Headers 字段）。
+func isHTTPWithHeaders(raw agentCoreMCPRawServer) bool {
+	isHTTP := strings.EqualFold(strings.TrimSpace(raw.Type), "http") ||
+		strings.EqualFold(strings.TrimSpace(raw.Type), "sse") ||
+		strings.TrimSpace(raw.URL) != ""
+	return isHTTP && len(raw.Headers) > 0
 }
 
 func appendUniqueString(list []string, value string) []string {

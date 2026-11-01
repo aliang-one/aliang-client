@@ -41,7 +41,7 @@ func agentCoreMessageText(msg agentcore.Message) string {
 func TestReadAgentCoreJournalHistory(t *testing.T) {
 	dir := t.TempDir()
 	j := newAgentCoreJournal(dir)
-	j.ensureSessionHeader("s-hist", "/proj", "glm-5.3", "", "2026-10-28T00:00:00Z", "phone")
+	j.ensureSessionHeader("s-hist", "/proj", "glm-5.3", "", "2026-10-28T00:00:00Z", "phone", nil, nil)
 	j.appendUser("s-hist", "m1", "第一问", "2026-10-28T00:01:00Z")
 	j.appendAssistant("s-hist", "a1", "第一答", "2026-10-28T00:02:00Z")
 	j.appendTool("s-hist", "Bash", "ls", false) // 工具行：轨迹不是消息，解析器必须跳过
@@ -108,7 +108,7 @@ func TestReadAgentCoreJournalHistoryFromMissing(t *testing.T) {
 func TestReadAgentCoreJournalHistoryIgnoresApprovalRows(t *testing.T) {
 	dir := t.TempDir()
 	j := newAgentCoreJournal(dir)
-	j.ensureSessionHeader("s-ap", "/proj", "glm-5.3", "", "2026-10-28T00:00:00Z", "phone")
+	j.ensureSessionHeader("s-ap", "/proj", "glm-5.3", "", "2026-10-28T00:00:00Z", "phone", nil, nil)
 	j.appendUser("s-ap", "m1", "第一问", "2026-10-28T00:01:00Z")
 	j.appendApprovalAudit("s-ap", "ap-1", 1, "decline")
 	j.appendAssistant("s-ap", "a1", "第一答", "2026-10-28T00:02:00Z")
@@ -136,7 +136,7 @@ func TestMessageLazyCreateRestoresJournalHistory(t *testing.T) {
 	m := newAgentAIManager()
 	m.coreJournal = newAgentCoreJournal(journalDir)
 	now := time.Now().UTC().Format(time.RFC3339)
-	m.coreJournal.ensureSessionHeader("s-restore", "/proj", "glm-5.3", "", now, "phone")
+	m.coreJournal.ensureSessionHeader("s-restore", "/proj", "glm-5.3", "", now, "phone", nil, nil)
 	m.coreJournal.appendUser("s-restore", "m1", "第一问", now)
 	m.coreJournal.appendAssistant("s-restore", "a1", "第一答", now)
 
@@ -298,4 +298,234 @@ func TestMessageLazyCreateRestoreFailureNotice(t *testing.T) {
 	// 测试收尾后 run goroutine 的 journal defer（appendEnd）可能撞上
 	// t.TempDir 清理，日志里的「agentcore-journal: mkdir failed ...
 	// invalid argument」告警属预期、行为无害，不作断言。
+}
+
+// TestMessageLazyCreateRestoresSessionSwitches 会话级开关的懒建恢复端到端
+// （2026-10-31 验收缺陷③的持久化半边）：重启/驱逐后 run 不带开关键直达
+// message() 懒建——必须从 journal 头行恢复「上次显式设置」，而不是静默
+// 回滚成全启用。
+func TestMessageLazyCreateRestoresSessionSwitches(t *testing.T) {
+	setTestAgentHome(t)
+	journalDir := t.TempDir()
+	m := newAgentAIManager()
+	m.coreJournal = newAgentCoreJournal(journalDir)
+	now := time.Now().UTC().Format(time.RFC3339)
+	m.coreJournal.ensureSessionHeader("s-sw-restore", "/proj", "glm-5.3", "", now, "phone", nil, nil)
+	m.coreJournal.appendUser("s-sw-restore", "m1", "第一问", now)
+	m.coreJournal.appendAssistant("s-sw-restore", "a1", "第一答", now)
+	m.coreJournal.syncSessionSwitches("s-sw-restore", []string{"github"}, true, []string{"pdf"}, true)
+
+	up, srv := newAgentCoreUpstream(t, agentCoreTextTurn("第二", "答"))
+	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
+
+	svc := &AgentService{ai: m}
+	var mu sync.Mutex
+	var frames []map[string]interface{}
+	write := func(p interface{}) error {
+		if row, ok := p.(map[string]interface{}); ok {
+			mu.Lock()
+			frames = append(frames, row)
+			mu.Unlock()
+		}
+		return nil
+	}
+	// 载荷不带 disabled_mcp_servers/disabled_skills（重启后的 run.start 形态）
+	svc.DispatchLocalAI(map[string]interface{}{
+		"type":         models.AgentEventAIMessage,
+		"session_id":   "s-sw-restore",
+		"message_id":   "m2",
+		"content":      "第二问",
+		"provider":     "agentcore",
+		"mode":         "vibe",
+		"project_path": t.TempDir(),
+		"model":        "glm-5.3",
+	}, write)
+
+	waitForAgentEvent(t, &mu, &frames, models.AgentEventAIDone, func(e map[string]interface{}) bool {
+		return remoteString(e, "session_id") == "s-sw-restore"
+	})
+
+	m.mu.Lock()
+	sess := m.sessions["s-sw-restore"]
+	mcp := append([]string(nil), sess.disabledMCPServers...)
+	skills := append([]string(nil), sess.disabledSkills...)
+	m.mu.Unlock()
+	if len(mcp) != 1 || mcp[0] != "github" {
+		t.Fatalf("懒建应从头行恢复 disabledMCPServers=[github], got %v", mcp)
+	}
+	if len(skills) != 1 || skills[0] != "pdf" {
+		t.Fatalf("懒建应从头行恢复 disabledSkills=[pdf], got %v", skills)
+	}
+	_ = up
+}
+
+// TestMessageLazyCreateSwitchesPayloadOverridesHead 载荷显式带键时以载荷为
+// 权威（与 headModel 的「载荷权威」纪律同款）：头行 [github]、载荷 []（显式
+// 全部启用）→ 会话落 []。
+func TestMessageLazyCreateSwitchesPayloadOverridesHead(t *testing.T) {
+	setTestAgentHome(t)
+	journalDir := t.TempDir()
+	m := newAgentAIManager()
+	m.coreJournal = newAgentCoreJournal(journalDir)
+	now := time.Now().UTC().Format(time.RFC3339)
+	m.coreJournal.ensureSessionHeader("s-sw-payload", "/proj", "glm-5.3", "", now, "phone", nil, nil)
+	m.coreJournal.appendUser("s-sw-payload", "m1", "第一问", now)
+	m.coreJournal.appendAssistant("s-sw-payload", "a1", "第一答", now)
+	m.coreJournal.syncSessionSwitches("s-sw-payload", []string{"github"}, true, nil, true)
+
+	_, srv := newAgentCoreUpstream(t, agentCoreTextTurn("第二", "答"))
+	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
+
+	svc := &AgentService{ai: m}
+	var mu sync.Mutex
+	var frames []map[string]interface{}
+	write := func(p interface{}) error {
+		if row, ok := p.(map[string]interface{}); ok {
+			mu.Lock()
+			frames = append(frames, row)
+			mu.Unlock()
+		}
+		return nil
+	}
+	svc.DispatchLocalAI(map[string]interface{}{
+		"type":                 models.AgentEventAIMessage,
+		"session_id":           "s-sw-payload",
+		"message_id":           "m2",
+		"content":              "第二问",
+		"provider":             "agentcore",
+		"mode":                 "vibe",
+		"project_path":         t.TempDir(),
+		"model":                "glm-5.3",
+		"disabled_mcp_servers": []interface{}{},
+	}, write)
+
+	waitForAgentEvent(t, &mu, &frames, models.AgentEventAIDone, func(e map[string]interface{}) bool {
+		return remoteString(e, "session_id") == "s-sw-payload"
+	})
+
+	m.mu.Lock()
+	mcp := append([]string(nil), m.sessions["s-sw-payload"].disabledMCPServers...)
+	m.mu.Unlock()
+	// 断言的是优先级：载荷显式键整体替换，头行的 [github] 不得幸存。
+	// （append(nil,...) 快照会把空切片变 nil，故只断长度不断 nil-ness——
+	// 下游 nil 与 [] 行为等价。）
+	if len(mcp) != 0 {
+		t.Fatalf("载荷显式空数组应整体替换(不得保留头行 [github]), got %v", mcp)
+	}
+}
+
+// TestMessageLazyCreateWithTranscriptStillHydratesSwitches 手机主路径的开关
+// 水合 + 头行不可自毁（2026-10-31 评审 confirmed-0/2 的回归锚）：手机 v3 的
+// ai.run.start 恒带 transcript、载荷不带开关键、服务端也不认识这两个键——
+// ①懒建必须无视「载荷有历史」门、从 journal 头行恢复开关；
+// ②run 进门绝不写头行（持久化写点只在显式改键处），头行名单必须原样幸存。
+func TestMessageLazyCreateWithTranscriptStillHydratesSwitches(t *testing.T) {
+	setTestAgentHome(t)
+	journalDir := t.TempDir()
+	m := newAgentAIManager()
+	m.coreJournal = newAgentCoreJournal(journalDir)
+	now := time.Now().UTC().Format(time.RFC3339)
+	m.coreJournal.ensureSessionHeader("s-sw-tx", "/proj", "glm-5.3", "", now, "phone", nil, nil)
+	m.coreJournal.appendUser("s-sw-tx", "m1", "第一问", now)
+	m.coreJournal.appendAssistant("s-sw-tx", "a1", "第一答", now)
+	m.coreJournal.syncSessionSwitches("s-sw-tx", []string{"github"}, true, []string{"pdf"}, true)
+
+	up, srv := newAgentCoreUpstream(t, agentCoreTextTurn("第二", "答"))
+	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
+
+	svc := &AgentService{ai: m}
+	var mu sync.Mutex
+	var frames []map[string]interface{}
+	write := func(p interface{}) error {
+		if row, ok := p.(map[string]interface{}); ok {
+			mu.Lock()
+			frames = append(frames, row)
+			mu.Unlock()
+		}
+		return nil
+	}
+	svc.DispatchLocalAI(map[string]interface{}{
+		"type":       models.AgentEventAIMessage,
+		"session_id": "s-sw-tx",
+		"message_id": "m2",
+		"content":    "第二问",
+		"provider":   "agentcore",
+		"mode":       "vibe",
+		"model":      "glm-5.3",
+		// 手机 v3 形态：transcript 恒带（历史以载荷为准），开关键缺席
+		"transcript": []interface{}{
+			map[string]interface{}{"role": "user", "id": "t1", "content": "第一问"},
+			map[string]interface{}{"role": "assistant", "id": "t1a", "content": "第一答"},
+		},
+	}, write)
+
+	waitForAgentEvent(t, &mu, &frames, models.AgentEventAIDone, func(e map[string]interface{}) bool {
+		return remoteString(e, "session_id") == "s-sw-tx"
+	})
+
+	m.mu.Lock()
+	mcp := append([]string(nil), m.sessions["s-sw-tx"].disabledMCPServers...)
+	skills := append([]string(nil), m.sessions["s-sw-tx"].disabledSkills...)
+	m.mu.Unlock()
+	if len(mcp) != 1 || mcp[0] != "github" {
+		t.Fatalf("transcript 载荷也必须从头行水合 disabledMCPServers=[github], got %v", mcp)
+	}
+	if len(skills) != 1 || skills[0] != "pdf" {
+		t.Fatalf("transcript 载荷也必须从头行水合 disabledSkills=[pdf], got %v", skills)
+	}
+
+	// 头行不可被 run 自毁：跑完一轮后名单必须原样幸存
+	_, head, err := readAgentCoreJournalHistoryFrom(journalDir, "s-sw-tx")
+	if err != nil {
+		t.Fatalf("read journal: %v", err)
+	}
+	if len(head.disabledMCPServers) != 1 || head.disabledMCPServers[0] != "github" {
+		t.Fatalf("头行名单被 run 抹掉了: %v", head.disabledMCPServers)
+	}
+	_ = up
+}
+
+// TestCreateBackfillsSiblingFromHeader 单键 create 的兄弟侧兜底（2026-10-31
+// 二轮评审 F3）：冷会话 + create 只带 disabled_mcp_servers——skills 侧必须
+// 从 journal 头行兜底恢复，而不是按 nil 注册后在整段进程生命周期里失效。
+func TestCreateBackfillsSiblingFromHeader(t *testing.T) {
+	setTestAgentHome(t)
+	journalDir := t.TempDir()
+	m := newAgentAIManager()
+	m.coreJournal = newAgentCoreJournal(journalDir)
+	now := time.Now().UTC().Format(time.RFC3339)
+	m.coreJournal.ensureSessionHeader("s-f3", "/proj", "glm-5.3", "", now, "phone", nil, []string{"pdf"})
+
+	svc := &AgentService{ai: m}
+	var mu sync.Mutex
+	var frames []map[string]interface{}
+	write := func(p interface{}) error {
+		if row, ok := p.(map[string]interface{}); ok {
+			mu.Lock()
+			frames = append(frames, row)
+			mu.Unlock()
+		}
+		return nil
+	}
+	svc.DispatchLocalAI(map[string]interface{}{
+		"type":                 models.AgentEventAISessionCreate,
+		"session_id":           "s-f3",
+		"provider":             "agentcore",
+		"mode":                 "vibe",
+		"project_path":         t.TempDir(),
+		"model":                "glm-5.3",
+		"disabled_mcp_servers": []interface{}{"a"},
+		// 故意不带 disabled_skills —— 兄弟侧应从头行兜底
+	}, write)
+
+	m.mu.Lock()
+	mcp := append([]string(nil), m.sessions["s-f3"].disabledMCPServers...)
+	skills := append([]string(nil), m.sessions["s-f3"].disabledSkills...)
+	m.mu.Unlock()
+	if len(mcp) != 1 || mcp[0] != "a" {
+		t.Fatalf("带键侧应以载荷为权威, got %v", mcp)
+	}
+	if len(skills) != 1 || skills[0] != "pdf" {
+		t.Fatalf("单键 create 的兄弟侧应从头行兜底 [pdf], got %v", skills)
+	}
 }

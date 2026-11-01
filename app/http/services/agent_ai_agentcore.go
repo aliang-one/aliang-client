@@ -708,7 +708,7 @@ func (m *agentAIManager) handleAgentCoreCompactCommand(session *agentAISession, 
 	// 一行，读回时才有始有终；写失败只 Warn（尽力而为口径）。
 	journal := m.coreJournal
 	now := time.Now().UTC().Format(time.RFC3339)
-	journal.ensureSessionHeader(session.id, projectPath, model, effort, now, agentCoreJournalOriginFor(originSocket, surface))
+	journal.ensureSessionHeader(session.id, projectPath, model, effort, now, agentCoreJournalOriginFor(originSocket, surface), session.disabledMCPServers, session.disabledSkills)
 	journal.appendUser(session.id, messageID, "/compact", now)
 
 	_ = writeJSON(map[string]interface{}{
@@ -1133,7 +1133,11 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		journal.appendEndDiagnostics(run.sessionID, endStatus, endErrMsg, diag)
 	}()
 	now := time.Now().UTC().Format(time.RFC3339)
-	journal.ensureSessionHeader(run.sessionID, run.projectPath, agentCoreModel(run), run.effort, now, agentCoreJournalOrigin(run))
+	journal.ensureSessionHeader(run.sessionID, run.projectPath, agentCoreModel(run), run.effort, now, agentCoreJournalOrigin(run), run.disabledMCPServers, run.disabledSkills)
+	// 会话级开关的持久化写点在 create()/message() 的显式改键处（2026-10-31
+	// 评审修正）：这里**不**做每 run 进门同步——run 的内存名单可能还没从
+	// journal 头行水合（手机 v3 恒带 transcript、懒建恢复被历史门挡住、恢复
+	// 读失败等），拿未水合的 nil 当权威会把头行里持久化的名单删掉。
 	if lastUser, ok := m.lastUserHistoryMessage(run.sessionID); ok {
 		ts := now
 		if !lastUser.CreatedAt.IsZero() {
@@ -1694,7 +1698,7 @@ func agentCoreLoopHooks(m *agentAIManager, run agentAIRun, diag *agentCoreDiagno
 			autoCompactSeq++
 			ts := time.Now().UTC().Format(time.RFC3339)
 			compactID := fmt.Sprintf("compact-auto-%d-%d", run.runSeq, autoCompactSeq)
-			m.coreJournal.ensureSessionHeader(run.sessionID, run.projectPath, agentCoreModel(run), run.effort, ts, agentCoreJournalOrigin(run))
+			m.coreJournal.ensureSessionHeader(run.sessionID, run.projectPath, agentCoreModel(run), run.effort, ts, agentCoreJournalOrigin(run), run.disabledMCPServers, run.disabledSkills)
 			m.coreJournal.appendUser(run.sessionID, compactID, "/compact(auto)", ts)
 			m.coreJournal.appendAssistant(run.sessionID, agentAssistantMessageID(compactID),
 				fmt.Sprintf("✓ 上下文已自动压缩：约 %s → %s tokens（%d 条早期消息已折叠为摘要）。",

@@ -6,6 +6,7 @@ package services
 // 无痕（spec §9 已声明）。残行/非法行跳过。
 
 import (
+	"bufio"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -18,6 +19,11 @@ type agentCoreJournalHead struct {
 	// origin：头行来源（phone|dashboard|unknown），写侧 ensureSessionHeader
 	// 落盘；旧文件/补写前的文件缺席=空串，本解析器自然容忍。
 	origin string
+	// disabledMCPServers/disabledSkills：会话级 MCP/技能开关的持久化值
+	// （syncSessionSwitches 落头行，2026-10-31）。缺键=nil（未设置，行为同
+	// 全部启用）；懒建恢复时载荷没带键就用它兜底，避免重启后静默回滚。
+	disabledMCPServers []string
+	disabledSkills     []string
 }
 
 // readAgentCoreJournalHistory 便捷包装：扫默认 journal 根。
@@ -49,6 +55,8 @@ func readAgentCoreJournalHistoryFrom(dir, sessionID string) ([]agentAIMessage, a
 			head.projectPath, _ = row["project_path"].(string)
 			head.model, _ = row["model"].(string)
 			head.origin, _ = row["origin"].(string)
+			head.disabledMCPServers = headerStringList(row["disabled_mcp_servers"])
+			head.disabledSkills = headerStringList(row["disabled_skills"])
 		case "msg":
 			// kind=tool/approval 行由 inventory 侧消费，此处仅 msg 行进历史。
 			role, _ := row["role"].(string)
@@ -67,6 +75,52 @@ func readAgentCoreJournalHistoryFrom(dir, sessionID string) ([]agentAIMessage, a
 		}
 	}
 	return hist, head, nil
+}
+
+// headerStringList 从头行取字符串数组；缺键/类型不符返回 nil（=未设置）。
+func headerStringList(v interface{}) []string {
+	raw, _ := v.([]interface{})
+	out := make([]string, 0, len(raw))
+	for _, item := range raw {
+		if s, ok := item.(string); ok {
+			out = append(out, s)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// readAgentCoreJournalHeaderFrom 只读会话 journal 的头行（kind=session），
+// 供显式改键点取「当前持久化的开关名单」用——比整文件读便宜（bufio 单行），
+// 语义上与 readAgentCoreJournalHistoryFrom 的头行解析一致。文件缺失/无头行
+// 返回 ErrNotExist 透传。
+func readAgentCoreJournalHeaderFrom(dir, sessionID string) (agentCoreJournalHead, error) {
+	if dir == "" || sessionID == "" {
+		return agentCoreJournalHead{}, os.ErrNotExist
+	}
+	f, err := os.Open(filepath.Join(dir, agentCoreJournalFileName(sessionID)))
+	if err != nil {
+		return agentCoreJournalHead{}, err
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	if !sc.Scan() {
+		return agentCoreJournalHead{}, os.ErrNotExist
+	}
+	var row map[string]interface{}
+	if json.Unmarshal(sc.Bytes(), &row) != nil || row["kind"] != "session" {
+		return agentCoreJournalHead{}, os.ErrNotExist
+	}
+	var head agentCoreJournalHead
+	head.projectPath, _ = row["project_path"].(string)
+	head.model, _ = row["model"].(string)
+	head.origin, _ = row["origin"].(string)
+	head.disabledMCPServers = headerStringList(row["disabled_mcp_servers"])
+	head.disabledSkills = headerStringList(row["disabled_skills"])
+	return head, nil
 }
 
 // splitJSONLLines 切 JSONL：按 \n 分行，跳过空行；不完整 JSON 由调用方

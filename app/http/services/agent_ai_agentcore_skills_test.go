@@ -11,7 +11,10 @@ package services
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"aliang.one/nursorgate/processor/config"
 )
 
 func writeSkill(t *testing.T, dir, name, frontmatter string) {
@@ -86,5 +89,44 @@ func TestAgentCoreSkillsPromptBlock(t *testing.T) {
 	if block := m.agentCoreSkillsPromptBlock(agentAIRun{disabledSkills: []string{"__none__"}}); block != "" {
 		// 若测试机恰好没有技能，block 为空——两种情况都合法，只要不 panic
 		_ = block
+	}
+}
+
+// 全局总闸关闭 → 技能 prompt 块必须为空串（与内核行为一致：一个技能都不
+// 注入）。2026-10-31 验收缺陷④：agentCoreSkillsPromptBlock 的全局关闭分支
+// 此前无测试覆盖。
+func TestAgentCoreSkillsPromptBlockMasterOff(t *testing.T) {
+	old := config.GetGlobalConfig()
+	fals := false
+	next := &config.Config{Customer: &config.CustomerConfig{
+		AgentCore: &config.AgentCoreTuningConfig{SkillsEnabled: &fals},
+	}}
+	t.Cleanup(func() { config.SetGlobalConfig(old) })
+	config.SetGlobalConfig(next)
+
+	m := newAgentAIManager()
+	if got := m.agentCoreSkillsPromptBlock(agentAIRun{}); got != "" {
+		t.Fatalf("总闸关闭时技能块应为空串, got %q", got)
+	}
+}
+
+// 总闸默认开启 + 有技能 → prompt 块含名字与 SKILL.md 路径（渐进披露契约：
+// 只注清单不注正文）。
+func TestAgentCoreSkillsPromptBlockInjectsList(t *testing.T) {
+	setTestAgentHome(t)
+	home := agentHome()
+	writeSkill(t, filepath.Join(home, ".claude", "skills"), "pdf", "name: pdf\ndescription: Work with PDF files")
+
+	old := config.GetGlobalConfig()
+	t.Cleanup(func() { config.SetGlobalConfig(old) })
+	config.SetGlobalConfig(&config.Config{})
+
+	m := newAgentAIManager()
+	got := m.agentCoreSkillsPromptBlock(agentAIRun{})
+	if !strings.Contains(got, "pdf") || !strings.Contains(got, filepath.Join("skills", "pdf", "SKILL.md")) {
+		t.Fatalf("技能块应含名字与路径, got %q", got)
+	}
+	if strings.Contains(got, "body") {
+		t.Fatalf("技能块不得注入正文(渐进披露), got %q", got)
 	}
 }

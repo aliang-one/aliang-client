@@ -1131,6 +1131,7 @@ export default {
   agent_integrations_skillEmpty: 'No skills found.',
   agent_integrations_skillUnsupported: 'Not supported by kernel',
   agent_integrations_kernelInjected: 'Injected',
+  agent_integrations_kernelDisabled: 'Master off',
   agent_integrations_kernelSkippedHeaders: 'Skipped',
   agent_integrations_kernelNotCollected: 'Not collected',
   agent_integrations_toolPrefix: 'Tool prefix {prefix}',

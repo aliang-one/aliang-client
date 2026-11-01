@@ -1,6 +1,6 @@
 // 「MCP 与技能」页的展示映射（纯函数，供组件与单测共用）。
 //
-// 内核注入态 → 徽章文案键 + 配色：三态语义见后端
+// 内核注入态 → 徽章文案键 + 配色：四态语义见后端
 // app/http/services/agent_integrations.go 的常量定义。
 
 /** 内核态徽章：i18n 键 + Tailwind 类。未知态按「未采集」渲染（fail-safe）。 */
@@ -10,6 +10,11 @@ export function kernelStateBadge(state) {
       return {
         key: 'agent_integrations_kernelInjected',
         className: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300',
+      };
+    case 'disabled':
+      return {
+        key: 'agent_integrations_kernelDisabled',
+        className: 'bg-orange-100 text-orange-700 dark:bg-orange-500/15 dark:text-orange-300',
       };
     case 'skipped_headers':
       return {

@@ -1133,6 +1133,7 @@ export default {
   agent_integrations_skillEmpty: '未发现技能。',
   agent_integrations_skillUnsupported: '内核暂不支持',
   agent_integrations_kernelInjected: '已注入内核',
+  agent_integrations_kernelDisabled: '已关总闸',
   agent_integrations_kernelSkippedHeaders: '受限跳过',
   agent_integrations_kernelNotCollected: '未采集',
   agent_integrations_toolPrefix: '工具前缀 {prefix}',

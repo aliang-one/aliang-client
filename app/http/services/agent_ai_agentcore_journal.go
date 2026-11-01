@@ -74,7 +74,7 @@ func agentCoreJournalFileName(sessionID string) string {
 // 时创建；存在但无头行（steer 先于 run 的历史竞态，spec §4.3）时整体重写
 // 补头——读全量、写 头行+原内容、原子 rename。文件体量有界（消息+截断
 // 工具行），重写代价可接受。幂等：已有头行直接返回。顺带触发 prune（锁内）。
-func (j *agentCoreJournal) ensureSessionHeader(sessionID, projectPath, model, effort, createdAt, origin string) {
+func (j *agentCoreJournal) ensureSessionHeader(sessionID, projectPath, model, effort, createdAt, origin string, disabledMCP, disabledSkills []string) {
 	if j == nil || j.dir == "" || strings.TrimSpace(sessionID) == "" {
 		return
 	}
@@ -85,7 +85,7 @@ func (j *agentCoreJournal) ensureSessionHeader(sessionID, projectPath, model, ef
 		if j.hasSessionHeaderLocked(path) {
 			return
 		}
-		j.prependHeaderLocked(path, sessionID, projectPath, model, effort, createdAt, origin)
+		j.prependHeaderLocked(path, sessionID, projectPath, model, effort, createdAt, origin, disabledMCP, disabledSkills)
 		return
 	}
 	if err := os.MkdirAll(j.dir, 0o700); err != nil {
@@ -93,7 +93,7 @@ func (j *agentCoreJournal) ensureSessionHeader(sessionID, projectPath, model, ef
 		return
 	}
 	j.dirReady = true
-	line := j.sessionHeaderLine(sessionID, projectPath, model, effort, createdAt, origin)
+	line := j.sessionHeaderLine(sessionID, projectPath, model, effort, createdAt, origin, disabledMCP, disabledSkills)
 	if line == nil {
 		logger.Warn(fmt.Sprintf("agentcore-journal: header marshal failed session=%s", sessionID))
 		return
@@ -108,8 +108,11 @@ func (j *agentCoreJournal) ensureSessionHeader(sessionID, projectPath, model, ef
 }
 
 // sessionHeaderLine 生成头行字节（含结尾 \n）；marshal 失败返回 nil。
-func (j *agentCoreJournal) sessionHeaderLine(sessionID, projectPath, model, effort, createdAt, origin string) []byte {
-	line, err := jsonMarshalLine(map[string]interface{}{
+// 开关名单只在非 nil 时写键（nil=未设置，读侧容忍缺键）——首建头行就带上
+// 当前名单（2026-10-31 评审 F1：create 先于首个 run 设的键，不能等首个 run
+// 之后的显式同步才落盘，否则重启即丢）。
+func (j *agentCoreJournal) sessionHeaderLine(sessionID, projectPath, model, effort, createdAt, origin string, disabledMCP, disabledSkills []string) []byte {
+	header := map[string]interface{}{
 		"kind":         "session",
 		"session_id":   sessionID,
 		"project_path": projectPath,
@@ -117,7 +120,14 @@ func (j *agentCoreJournal) sessionHeaderLine(sessionID, projectPath, model, effo
 		"effort":       effort,
 		"created_at":   createdAt,
 		"origin":       origin,
-	})
+	}
+	if disabledMCP != nil {
+		header["disabled_mcp_servers"] = append([]string{}, disabledMCP...)
+	}
+	if disabledSkills != nil {
+		header["disabled_skills"] = append([]string{}, disabledSkills...)
+	}
+	line, err := jsonMarshalLine(header)
 	if err != nil {
 		return nil
 	}
@@ -143,11 +153,104 @@ func (j *agentCoreJournal) hasSessionHeaderLocked(path string) bool {
 	return head["kind"] == "session"
 }
 
+// syncSessionSwitches 把会话级 MCP/技能开关同步进 journal 头行（会话级开关
+// 持久化，2026-10-31）。
+//
+// ⚠️ 调用纪律（2026-10-31 两轮评审定案）：**只在显式改键点调用**——create()
+// 与 message() 里「键存在才整体替换」的两处。绝不许做「每 run 进门同步」：
+// run 携带的内存名单可能尚未从 journal 头行水合（手机 v3 的 ai.run.start 恒
+// 带 transcript、懒建恢复可能被跳过、恢复读可能瞬时失败），拿未水合的 nil 当
+// 权威会把头行里持久化的名单**删掉**——持久化机制自己变成删除机制。
+//
+// set 标记区分「本载荷没带这个键」与「带键」：没带的**一侧完全不动头行**
+// （preserve 语义，2026-10-31 评审 F2——单键写入绝不许拿未水合的兄弟内存值
+// 覆盖兄弟持久值）。带键一侧：非空写键、nil/空删键（与缺键行为等价，读侧
+// 容忍）。仅在头行实际变化时重写第一行（tmp+rename 原子替换，文件体量有界，
+// 与 prependHeaderLocked 同款代价）；无变化零写盘。
+func (j *agentCoreJournal) syncSessionSwitches(sessionID string, disabledMCP []string, mcpSet bool, disabledSkills []string, skillsSet bool) {
+	if j == nil || j.dir == "" || strings.TrimSpace(sessionID) == "" {
+		return
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	path := filepath.Join(j.dir, agentCoreJournalFileName(sessionID))
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	nl := bytes.IndexByte(data, '\n')
+	if nl < 0 {
+		return
+	}
+	var head map[string]interface{}
+	if json.Unmarshal(data[:nl], &head) != nil || head["kind"] != "session" {
+		return
+	}
+	changed := false
+	if mcpSet && !headerSwitchesEqual(head["disabled_mcp_servers"], disabledMCP) {
+		applyHeaderSwitches(head, "disabled_mcp_servers", disabledMCP)
+		changed = true
+	}
+	if skillsSet && !headerSwitchesEqual(head["disabled_skills"], disabledSkills) {
+		applyHeaderSwitches(head, "disabled_skills", disabledSkills)
+		changed = true
+	}
+	if !changed {
+		return
+	}
+	line, err := jsonMarshalLine(head)
+	if err != nil {
+		return
+	}
+	tmp := path + ".tmp"
+	buf := append([]byte{}, line...)
+	buf = append(buf, data[nl+1:]...)
+	if err := os.WriteFile(tmp, buf, 0o600); err != nil {
+		logger.Warn(fmt.Sprintf("agentcore-journal: header switches write failed session=%s err=%v", sessionID, err))
+		return
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		logger.Warn(fmt.Sprintf("agentcore-journal: header switches rename failed session=%s err=%v", sessionID, err))
+		_ = os.Remove(tmp)
+		return
+	}
+}
+
+// headerSwitchesEqual 判断头行已存的开关名单与会话当前值是否一致。缺键与
+// 空数组等价（都=未关任何项）；非字符串元素按缺失计（旧文件/畸形容忍）。
+func headerSwitchesEqual(stored interface{}, list []string) bool {
+	storedRaw, _ := stored.([]interface{})
+	normalized := make([]string, 0, len(storedRaw))
+	for _, v := range storedRaw {
+		if s, ok := v.(string); ok {
+			normalized = append(normalized, s)
+		}
+	}
+	if len(normalized) != len(list) {
+		return false
+	}
+	for i := range list {
+		if normalized[i] != list[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// applyHeaderSwitches 把一侧开关名单写进头行 map：nil/空数组=删键（不写键）。
+func applyHeaderSwitches(head map[string]interface{}, key string, list []string) {
+	if len(list) == 0 {
+		delete(head, key)
+		return
+	}
+	head[key] = append([]string{}, list...)
+}
+
 // prependHeaderLocked 整体重写补头：tmp 文件写 头行+原内容，rename 原子替换。
 // 在 j.mu 锁内做全量读+写+rename——journal 文件有界（消息+截断工具行），
 // 重写代价可接受；与 appendLineLocked 同锁互斥，无并发写坏。调用方必须持有 j.mu。
-func (j *agentCoreJournal) prependHeaderLocked(path, sessionID, projectPath, model, effort, createdAt, origin string) {
-	head := j.sessionHeaderLine(sessionID, projectPath, model, effort, createdAt, origin)
+func (j *agentCoreJournal) prependHeaderLocked(path, sessionID, projectPath, model, effort, createdAt, origin string, disabledMCP, disabledSkills []string) {
+	head := j.sessionHeaderLine(sessionID, projectPath, model, effort, createdAt, origin, disabledMCP, disabledSkills)
 	if head == nil {
 		return
 	}

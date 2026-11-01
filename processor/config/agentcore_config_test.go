@@ -133,3 +133,28 @@ func TestEffectiveAgentCoreMCPEnabled(t *testing.T) {
 		}
 	}
 }
+
+// TestEffectiveAgentCoreSkillsEnabled：技能总闸三态语义，与 MCP 侧同款——
+// nil=默认开启（升级不得静默关掉存量用户的功能）、true=开启、false=关闭。
+// 2026-10-31 验收发现技能侧缺这份用例（commit message 宣称「MCP/技能全局
+// 三态用例」，技能半句缺失），补齐。
+func TestEffectiveAgentCoreSkillsEnabled(t *testing.T) {
+	tru, fals := true, false
+	cases := []struct {
+		name string
+		cfg  *Config
+		want bool
+	}{
+		{"nil config 默认开启", nil, true},
+		{"无 customer 默认开启", &Config{}, true},
+		{"无 agentcore 块默认开启", &Config{Customer: &CustomerConfig{}}, true},
+		{"未设置字段默认开启", &Config{Customer: &CustomerConfig{AgentCore: &AgentCoreTuningConfig{}}}, true},
+		{"显式 true", &Config{Customer: &CustomerConfig{AgentCore: &AgentCoreTuningConfig{SkillsEnabled: &tru}}}, true},
+		{"显式 false 关闭", &Config{Customer: &CustomerConfig{AgentCore: &AgentCoreTuningConfig{SkillsEnabled: &fals}}}, false},
+	}
+	for _, tc := range cases {
+		if got := tc.cfg.EffectiveAgentCoreSkillsEnabled(); got != tc.want {
+			t.Errorf("%s: = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}

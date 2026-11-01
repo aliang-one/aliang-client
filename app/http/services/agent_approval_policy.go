@@ -16,6 +16,7 @@ import (
 
 	"aliang.one/nursorgate/app/agentcore"
 	"aliang.one/nursorgate/common/logger"
+	"aliang.one/nursorgate/processor/config"
 	"github.com/google/shlex"
 )
 
@@ -487,6 +488,11 @@ func approvalProjectBoundaryDecision(toolName string, toolInput json.RawMessage,
 // the model could never follow its own memory instructions.
 const claudeProjectMemoryRuleID = "memory-dir-carveout"
 
+// agentSkillsCarveoutRuleID is the matched-rule ID reported when a Read call
+// is auto-approved because every target path resolves inside an agentcore
+// skill root (~/.claude/skills or an enabled plugin's skills directory).
+const agentSkillsCarveoutRuleID = "agent-skills-read-carveout"
+
 func approvalProjectBoundaryDecisionForHook(toolName string, toolInput json.RawMessage, projectPath string, hookRaw map[string]interface{}) (policyDecision, string, bool) {
 	projectPath = strings.TrimSpace(projectPath)
 	if projectPath == "" {
@@ -512,6 +518,23 @@ func approvalProjectBoundaryDecisionForHook(toolName string, toolInput json.RawM
 	// otherwise reach it past the containment check below.
 	if len(paths) > 0 && allPathsInsideClaudeMemoryDir(paths, projectPath, hookRaw) {
 		return decisionAutoApprove, claudeProjectMemoryRuleID, true
+	}
+	// AliangCode 技能渐进披露 carve-out（2026-10-31）：内核把 SKILL.md 路径
+	// 注进 system prompt 并指示模型「先 Read 再照做」（agentCoreSkillsPromptBlock）。
+	// 技能目录在 ~/.claude 下天然出项目界，没有这个只读特例，每个会话首次用
+	// 技能必弹手机审批卡——渐进披露在审批层不成立。只豁免 Read：对技能文件
+	// 的写/改仍走审批（outside-project-path）。技能根与注入侧（agentCoreSkillsFor）
+	// 同源：用户 skills 根 + 已启用插件的 skills 根。受技能总闸约束——总闸
+	// 关闭时内核根本不注入技能，豁免面不得比功能面宽。会话级 disabled_skills
+	// 不在本层强制：审批层是纯路径判定、无会话上下文，被关技能的 SKILL.md
+	// 仍是用户自装技能文本（读它不是提权），只影响是否被注入。与 memory
+	// carve-out 同理，此处会短路策略 scheme——这正是 carve-out 存在的目的
+	// （这些路径在任何 scheme 下都到不了）。
+	if strings.EqualFold(strings.TrimSpace(toolName), "read") &&
+		len(paths) > 0 &&
+		config.GetGlobalConfig().EffectiveAgentCoreSkillsEnabled() &&
+		allPathsInsideAgentSkillsRoots(paths) {
+		return decisionAutoApprove, agentSkillsCarveoutRuleID, true
 	}
 	// 2026-10-28 项目边界降级：项目外路径不再 auto_deny，改为 require_approval，
 	// 与 outside-project-bash 同口径（交手机审批由用户拍板）。此前文件路径工具
@@ -774,6 +797,67 @@ func approvalPathWithinClaudeMemoryRoot(memoryRoot, candidate string) bool {
 		}
 		current = filepath.Join(current, part)
 		if info, err := os.Lstat(current); err == nil && info.Mode()&os.ModeSymlink != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// agentSkillsRootUsable reports whether root may serve as a carve-out root:
+// it must exist and must NOT itself be a symlink. Plugin skills roots come
+// from the user-writable installed_plugins.json with no containment
+// validation — a symlinked skills entry would extend the approval-free read
+// surface along the link to anywhere on disk, so fail closed (such reads fall
+// back to require_approval). Ancestor symlinks (e.g. dotfiles users symlinking
+// all of ~/.claude) are NOT rejected: os.Lstat resolves through parent
+// symlinks, so the grant stays pinned to the resolved real subtree.
+func agentSkillsRootUsable(root string) bool {
+	info, err := os.Lstat(root)
+	return err == nil && info.Mode()&os.ModeSymlink == 0
+}
+
+// allPathsInsideAgentSkillsRoots reports whether every candidate path resolves
+// inside one of the agentcore skill roots — the same sources the skills
+// injector reads (agentCoreSkillsFor): the user skills root (~/.claude/skills)
+// plus enabled user-scope plugins' skills directories. Read-only carve-out
+// only; symlink discipline is inherited from the memory-root checker
+// (approvalPathWithinClaudeMemoryRoot — generic "inside root" containment
+// that tolerates a missing root and voids the grant on any symlink strictly
+// below it), plus the root-itself symlink refusal above. Plugin roots are
+// discovered lazily and only when a candidate falls outside the user skills
+// root, so the hot path stays disk-free.
+func allPathsInsideAgentSkillsRoots(paths []string) bool {
+	if len(paths) == 0 {
+		return false
+	}
+	home := strings.TrimSpace(agentHomeForMemoryHook())
+	if home == "" {
+		return false
+	}
+	userRoot := filepath.Join(home, ".claude", "skills")
+	userRootUsable := agentSkillsRootUsable(userRoot)
+	var pluginRoots []string
+	pluginRootsLoaded := false
+	for _, path := range paths {
+		if userRootUsable && approvalPathWithinClaudeMemoryRoot(userRoot, path) {
+			continue
+		}
+		if !pluginRootsLoaded {
+			pluginRootsLoaded = true
+			for _, inst := range enabledUserScopePluginInstallsIn(home) {
+				if installPath := strings.TrimSpace(inst.installPath); installPath != "" {
+					pluginRoots = append(pluginRoots, filepath.Join(installPath, "skills"))
+				}
+			}
+		}
+		matched := false
+		for _, root := range pluginRoots {
+			if agentSkillsRootUsable(root) && approvalPathWithinClaudeMemoryRoot(root, path) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
 			return false
 		}
 	}

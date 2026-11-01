@@ -150,3 +150,36 @@ describe('agentCoreTuningToLineFormat', () => {
     expect(agentCoreTuningToLineFormat('abc')).toBe(0);
   });
 });
+
+// 全局总闸键透传（2026-10-31 验收缺陷①）：normalizeAgentCoreTuning 的输出
+// 经 normalizeCustomerConfig → buildCustomerConfigPatch 原样进 POST patch 与
+// GET 回显——在这里剥掉的话，两张全局开关卡「保存 200 但永不落盘、刷新恒
+// 显默认开」。本组用例锁死：布尔键透传、非布尔/缺键不产出键。
+describe('normalizeAgentCoreTuning 全局总闸透传', () => {
+  it('布尔键显式透传', () => {
+    expect(normalizeAgentCoreTuning({ mcp_enabled: false }))
+      .toEqual({ max_identical_tool_turns: 0, mcp_enabled: false });
+    expect(normalizeAgentCoreTuning({ skills_enabled: true }))
+      .toEqual({ max_identical_tool_turns: 0, skills_enabled: true });
+    expect(normalizeAgentCoreTuning({ max_identical_tool_turns: 3, mcp_enabled: true, skills_enabled: false }))
+      .toEqual({ max_identical_tool_turns: 3, mcp_enabled: true, skills_enabled: false });
+  });
+
+  it('非布尔值不透传', () => {
+    expect(normalizeAgentCoreTuning({ mcp_enabled: 'false' }))
+      .toEqual({ max_identical_tool_turns: 0 });
+    expect(normalizeAgentCoreTuning({ skills_enabled: null }))
+      .toEqual({ max_identical_tool_turns: 0 });
+    expect(normalizeAgentCoreTuning({ mcp_enabled: 1 }))
+      .toEqual({ max_identical_tool_turns: 0 });
+  });
+
+  it('缺键不产出键(=未配置,后端 nil 视为开启)', () => {
+    const next = normalizeAgentCoreTuning({ max_identical_tool_turns: 2 });
+    expect('mcp_enabled' in next).toBe(false);
+    expect('skills_enabled' in next).toBe(false);
+    const empty = normalizeAgentCoreTuning(undefined);
+    expect('mcp_enabled' in empty).toBe(false);
+    expect('skills_enabled' in empty).toBe(false);
+  });
+});

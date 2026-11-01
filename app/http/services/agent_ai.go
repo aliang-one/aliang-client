@@ -1857,6 +1857,24 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 		if disabledSkillsSet {
 			existing.disabledSkills = disabledSkills
 		}
+		// 显式改键立即同步 journal 头行——这是持久化的唯一写点（2026-10-31
+		// 评审修正：不做「每 run 进门同步」，那会把未恢复/未水合的内存态当
+		// 权威、把头行里持久化的名单删掉）。未带键的一侧先从当前头行水合内存
+		// 再交 preserve 语义同步（评审 F2/F3：单键写入绝不许拿未水合的兄弟
+		// 内存值覆盖兄弟持久值）。
+		if (disabledMCPServersSet || disabledSkillsSet) && m.coreJournal != nil {
+			if !disabledMCPServersSet || !disabledSkillsSet {
+				if head, herr := readAgentCoreJournalHeaderFrom(m.coreJournal.dir, sessionID); herr == nil {
+					if !disabledMCPServersSet {
+						existing.disabledMCPServers = head.disabledMCPServers
+					}
+					if !disabledSkillsSet {
+						existing.disabledSkills = head.disabledSkills
+					}
+				}
+			}
+			m.coreJournal.syncSessionSwitches(sessionID, existing.disabledMCPServers, disabledMCPServersSet, existing.disabledSkills, disabledSkillsSet)
+		}
 		existing.resumeSessionID = resumeSessionID
 		existing.reservedNativeSessionID = reservedNativeSessionID
 		existing.bindingVersion = bindingVersion
@@ -1883,6 +1901,22 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 	// path (see message()) registers the session unconditionally — so a cap only
 	// in create() was a dead check that emitted a misleading "limit reached"
 	// error while the conversation still ran. Bound via eviction, not a gate.
+	// 2026-10-31 评审修正：新建内存会话时，载荷没带键的那一侧从 journal 头行
+	// 兜底恢复——仪表盘设备会话壳经 deviceSessionToConversation 重建后不带这
+	// 两个键（服务端也不认识它们），若按 nil 注册，重启后对同一会话的 create
+	// 会把持久化的开关「视为未设置」。逐键兜底（评审 F3：单键 create 的兄弟
+	// 侧也要兜底）；载荷显式带键时以载荷为权威。
+	if provider == "agentcore" && m.coreJournal != nil &&
+		(!disabledMCPServersSet || !disabledSkillsSet) {
+		if _, head, herr := readAgentCoreJournalHistoryFrom(m.coreJournal.dir, sessionID); herr == nil {
+			if !disabledMCPServersSet {
+				disabledMCPServers = head.disabledMCPServers
+			}
+			if !disabledSkillsSet {
+				disabledSkills = head.disabledSkills
+			}
+		}
+	}
 	newHistoryMessages, newHistoryChars := agentAIHistoryLimits(provider, contextWindow)
 	session := &agentAISession{
 		id:                      sessionID,
@@ -2026,23 +2060,46 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 		lazyInitialContext := strings.TrimSpace(remoteString(msg, "initial_context"))
 		lazyIsGoalFork, _ := msg["is_goal_fork"].(bool) // #5: ai.run.start lazy-create
 		lazyHistory := remoteAgentAIHistory(msg)
+		// 会话级 MCP/技能开关（2026-10-31 持久化）：懒建路径同样吃这两个键——
+		// 缺键=不动（此处无既有设置），键存在才落。载荷没带时兜底读 journal
+		// 头行（syncSessionSwitches 落的持久化值）：重启后 run.start 直达懒建、
+		// 不带 create 的开关键，必须恢复「上次显式设置」而不是静默回滚成全启用。
+		lazyDisabledMCP, lazyDisabledMCPSet := parseAgentAIDisabledMCPServers(msg)
+		lazyDisabledSkills, lazyDisabledSkillsSet := parseAgentAIDisabledSkills(msg)
 		// 跨端/重启续聊（spec §4.3）：agentcore 会话不在内存时，优先从 journal
-		// 读回历史装回内存再跑。载荷自带历史（remoteAgentAIHistory 非空）时跳过
-		// ——服务端重发的那份更新；claude/codex 的上下文在 CLI 自己的会话里，
-		// 宿主历史只做展示拼 prompt，不回灌，故不读。读回失败（非 ErrNotExist
-		// 的 IO 错）发 ai.run.notice 提示后照常空起——历史损坏不能顶死整轮 run。
-		// 头行 model 只在载荷未带时兜底：模型选择仍以手机显式下发为权威。
+		// 读回历史装回内存再跑。历史仍只在载荷没带时采纳——载荷那份更新；
+		// claude/codex 的上下文在 CLI 自己的会话里，宿主历史只做展示拼 prompt，
+		// 不回灌，故不读。读回失败（非 ErrNotExist 的 IO 错）发 ai.run.notice
+		// 提示后照常空起——历史损坏不能顶死整轮 run。
+		// 2026-10-31 评审修正：头行读取**不能**被「载荷没带历史」门住——手机
+		// v3 的 ai.run.start 恒带 transcript（服务端不认识 disabled_mcp_servers/
+		// disabled_skills，永远不会补发），若只在无载荷历史时读 journal，重启
+		// 后的会话级开关恢复在手机主路径上永远不发生。头行 model/开关兜底照旧
+		// 「载荷权威」：载荷显式带的值永远优先。
 		// 装回后下方的 limits 截断照常执行（超长历史按会话窗口裁剪，是有意的）。
 		var headModel string
+		var headSwitches agentCoreJournalHead
 		var restoreFailed error
-		if lazyProvider == "agentcore" && len(lazyHistory) == 0 && m.coreJournal != nil {
-			if hist, head, herr := readAgentCoreJournalHistoryFrom(m.coreJournal.dir, sessionID); herr == nil && len(hist) > 0 {
-				lazyHistory = hist
+		if lazyProvider == "agentcore" && m.coreJournal != nil {
+			if hist, head, herr := readAgentCoreJournalHistoryFrom(m.coreJournal.dir, sessionID); herr == nil {
+				if len(lazyHistory) == 0 && len(hist) > 0 {
+					lazyHistory = hist
+				}
 				headModel = head.model
-			} else if herr != nil && !errors.Is(herr, os.ErrNotExist) {
+				headSwitches = head
+			} else if herr != nil && !errors.Is(herr, os.ErrNotExist) && len(lazyHistory) == 0 {
+				// 只在历史确实指望 journal 时才告警：载荷自带 transcript 的会话
+				// 历史不缺，journal 读失败只影响开关兜底，不该发「历史没接上」。
 				logger.Warn(fmt.Sprintf("ai.message: journal history restore failed session=%s err=%v", sessionID, herr))
 				restoreFailed = herr
 			}
+		}
+		// 载荷没带开关键时用头行兜底（与 headModel 的「载荷权威」纪律同款）。
+		if !lazyDisabledMCPSet {
+			lazyDisabledMCP = headSwitches.disabledMCPServers
+		}
+		if !lazyDisabledSkillsSet {
+			lazyDisabledSkills = headSwitches.disabledSkills
 		}
 		if lazyInitialContext != "" {
 			lazyHistory = append([]agentAIMessage{{
@@ -2066,6 +2123,8 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 			reservedNativeSessionID: strings.TrimSpace(remoteString(msg, "reserved_native_session_id")),
 			bindingVersion:          remoteInt(msg, "binding_version", 0),
 			claudePolicy:            cloneAgentAIClaudeRemotePolicy(parseAgentAIClaudeRemotePolicy(msg)),
+			disabledMCPServers:      lazyDisabledMCP,
+			disabledSkills:          lazyDisabledSkills,
 			initialContext:          lazyInitialContext,
 			isGoalFork:              lazyIsGoalFork,
 			surface:                 normalizeAgentAISurface(remoteString(msg, "surface")),
@@ -2095,6 +2154,35 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 	if policy := parseAgentAIClaudeRemotePolicy(msg); policy.enabled {
 		session.claudePolicy = cloneAgentAIClaudeRemotePolicy(policy)
 		session.claudeCaps = agentAIClaudeCapabilities{}
+	}
+	// 会话级开关的「键存在才整体替换」合并（与 create 同语义，2026-10-31）：
+	// ai.message / ai.run.start 载荷带了 disabled_mcp_servers/disabled_skills
+	// 就整体替换——普通回合不带键，自然零影响。缺这半边时，懒建之外的存量
+	// 会话对 run.start 携带的开关键视而不见（验收 D1 的另一半）。显式改键时
+	// 同步 journal 头行（与 create 同为持久化写点）；未带键的一侧先从头行
+	// 水合内存再交 preserve 语义同步（评审 F2/F3，同 create 处注释）。
+	mcpSet := false
+	skillsSet := false
+	if lists, set := parseAgentAIDisabledMCPServers(msg); set {
+		session.disabledMCPServers = lists
+		mcpSet = true
+	}
+	if lists, set := parseAgentAIDisabledSkills(msg); set {
+		session.disabledSkills = lists
+		skillsSet = true
+	}
+	if (mcpSet || skillsSet) && m.coreJournal != nil {
+		if !mcpSet || !skillsSet {
+			if head, herr := readAgentCoreJournalHeaderFrom(m.coreJournal.dir, sessionID); herr == nil {
+				if !mcpSet {
+					session.disabledMCPServers = head.disabledMCPServers
+				}
+				if !skillsSet {
+					session.disabledSkills = head.disabledSkills
+				}
+			}
+		}
+		m.coreJournal.syncSessionSwitches(sessionID, session.disabledMCPServers, mcpSet, session.disabledSkills, skillsSet)
 	}
 	if surface := normalizeAgentAISurface(remoteString(msg, "surface")); surface != "" {
 		session.surface = surface
@@ -2371,7 +2459,7 @@ func (m *agentAIManager) handleLocalSlashCommand(session *agentAISession, messag
 		originSocket, surface := session.originSocket, session.surface
 		m.mu.Unlock()
 		now := time.Now().UTC().Format(time.RFC3339)
-		m.coreJournal.ensureSessionHeader(session.id, projectPath, model, effort, now, agentCoreJournalOriginFor(originSocket, surface))
+		m.coreJournal.ensureSessionHeader(session.id, projectPath, model, effort, now, agentCoreJournalOriginFor(originSocket, surface), session.disabledMCPServers, session.disabledSkills)
 		m.coreJournal.appendUser(session.id, messageID, content, now)
 	}
 
