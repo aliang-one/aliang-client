@@ -241,6 +241,7 @@ export default {
   chat_settingsDirectory: 'Directory',
   chat_settingsModel: 'Model',
   chat_settingsEffort: 'Effort',
+  chat_effortPending: 'Next turn',
   chat_modelDefault: 'Default',
   chat_modelUnset: 'Not set',
   chat_modelRequired: 'Select or enter a model before sending',
@@ -293,10 +294,48 @@ export default {
   chat_approvalExpiresMinutes: '{minutes} min',
   chat_approvalExpiresHours: '~{hours} h',
   chat_approvalFromSession: 'From session {id}',
+  // Approval-wait hard block hint (Task 10): persistent composer notice (paired with zh.js)
+  chat_approvalBlockHint: 'Approval required before sending.',
   chat_noticeResumeMissing: 'Native session not found — continuing as a new conversation',
   chat_noticeHistoryRestoreFailed: 'History restore failed — continuing with empty context',
   chat_approvalCancelled: 'Approval was cancelled',
   chat_approvalCancelledReason: 'Approval was cancelled ({reason})',
+  chat_md_copy: 'Copy',
+  chat_md_copied: 'Copied',
+  chat_md_unfold: 'Expand',
+  // Visual modernization (Task 8): empty-state hero / relative time / stop
+  // button placeholder / back-to-bottom pill / approval summary toggle,
+  // kept in pairs with zh.js (i18n.test.js key-set guard).
+  chat_heroTitle: 'Start a new conversation',
+  chat_justNow: 'Just now',
+  chat_minutesAgo: '{minutes} min ago',
+  chat_hoursAgo: '{hours} h ago',
+  chat_stop: 'Stop',
+  chat_scrollToBottom: 'Back to bottom',
+  chat_approvalMore: 'Show more',
+  chat_approvalLess: 'Show less',
+  // Recall & resend (Task 13): banner / bubble hover actions (copy + recall) /
+  // confirm / cancel / stop-timeout and unconfirmed retry copy. Paired with zh.js
+  // (i18n.test.js key-set guard).
+  chat_recallBanner: 'This will truncate this message and everything after it, effective on send',
+  chat_recallButton: 'Recall & resend',
+  chat_recallConfirm: 'Resend',
+  chat_recallCancel: 'Cancel',
+  chat_recallStopTimeout: 'Stop timed out. Please retry.',
+  chat_recallUnconfirmed: 'Recall not confirmed. You can retry.',
+  chat_copyMessage: 'Copy',
+  // Structured option card (Task 14): ai.option two-step interactive card +
+  // static fence card. Paired with zh.js (i18n.test.js key-set guard).
+  chat_optionTitle: 'Choose an option',
+  chat_optionSubmit: 'Confirm selection',
+  chat_optionSelected: 'Selected',
+  chat_optionCustom: 'Custom reply…',
+  chat_optionMulti: 'Multi-select',
+  chat_optionPreview: 'Preview',
+  chat_optionStaticHint: 'Pick below',
+  chat_optionCancelled: 'Option selection expired',
+  chat_optionCancelledReason: 'Option selection expired ({reason})',
+  chat_optionSendFailed: 'Failed to send selection. Please retry.',
 
   // -- App --
   app_restoringSession: 'Restoring saved session...',

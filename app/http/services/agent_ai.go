@@ -1778,6 +1778,35 @@ func currentAgentAIApprovalHookBaseURL() string {
 	return base
 }
 
+// 撤回截断四类拒绝的机器可读 code（ai.error 载荷的 error_code 键，供
+// server/前端精确分支，先例 externalTUIBusyErrCode 的 ErrorCode() 机制）。
+const (
+	truncateErrCodeRunActive          = "truncate_run_active"
+	truncateErrCodeJournalUnavailable = "truncate_journal_unavailable"
+	truncateErrCodeFailed             = "truncate_failed"
+	truncateErrCodeRebuildFailed      = "truncate_rebuild_failed"
+)
+
+// agentAITruncateError 是 create() 截断路径的拒绝错误：带 code 字段的单一
+// 类型覆盖四成因，agentAIErrorPayload 经 ErrorCode() 发出 error_code。
+// 消息文本与旧版 errors.New/fmt.Errorf 逐字一致（行为不变，仅多一个键）。
+type agentAITruncateError struct {
+	code string
+	msg  string
+	err  error // 可选底层成因（truncate/journal 读失败），Unwrap 透出
+}
+
+func (e *agentAITruncateError) Error() string {
+	if e.err != nil {
+		return e.msg + ": " + e.err.Error()
+	}
+	return e.msg
+}
+
+func (e *agentAITruncateError) ErrorCode() string { return e.code }
+
+func (e *agentAITruncateError) Unwrap() error { return e.err }
+
 func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTerminalWriter) {
 	if writeJSON == nil {
 		return
@@ -1827,6 +1856,51 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 			Content:   initialContext,
 			CreatedAt: time.Now().UTC(),
 		}}, history...)
+	}
+
+	// 撤回重发（spec §A.2）：截断 journal + history 全文重建（帧不带 transcript）。
+	// 时序：①活跃拒绝先于任何 journal 写；②不在内存 ⇒ 无活跃 run，前置检查
+	// 覆盖 create() 双分支；③读写失败绝不静默空 history，幂等重试即收敛。
+	// 仅 agentcore 生效——claude/codex 有各自的原生转录，journal 无锚点。
+	//
+	// TOCTOU 窗口声明（时序铁律不变量的一部分，重排者必读）：下方 peek 解锁
+	// （m.mu.Unlock）与 truncateBefore 的 rename 之间存在理论竞态窗——窗口内
+	// 并发起跑的 run 对本路径不可见，其 end 行可能落进刚截断的 journal。接受
+	// 依据＝前端「stop → 等终态 → create」的串行契约（撤回流程不并发起跑），
+	// 加上并发截断的收敛性（truncateBefore 按位置幂等，重试即收敛）；不加锁
+	// 贯穿 journal 重写是因为锁内 rename 会把 peek→truncate 的临界区拉长到
+	// 覆盖磁盘 IO，与「活跃拒绝先于任何 journal 写」的次序保证互相卡死。
+	truncateBeforeID := strings.TrimSpace(remoteString(msg, "truncate_before_message_id"))
+	truncateActive := truncateBeforeID != "" && provider == "agentcore"
+	truncateApplied := false
+	if truncateActive {
+		m.mu.Lock()
+		existingPeek := m.sessions[sessionID]
+		busy := existingPeek != nil && existingPeek.cancel != nil
+		m.mu.Unlock()
+		if busy {
+			// cancel==nil ⇒ runAgentCore defer LIFO 已落 end 行（清位锚，勿重排）。
+			_ = writeJSON(agentAIErrorPayload(sessionID, "", &agentAITruncateError{code: truncateErrCodeRunActive, msg: "ai.session.create truncate rejected: run active"}))
+			return
+		}
+		if m.coreJournal == nil {
+			_ = writeJSON(agentAIErrorPayload(sessionID, "", &agentAITruncateError{code: truncateErrCodeJournalUnavailable, msg: "ai.session.create truncate unavailable: journal disabled"}))
+			return
+		}
+		applied, err := m.coreJournal.truncateBefore(sessionID, truncateBeforeID)
+		if err != nil {
+			_ = writeJSON(agentAIErrorPayload(sessionID, "", &agentAITruncateError{code: truncateErrCodeFailed, msg: "ai.session.create truncate failed", err: err}))
+			return
+		}
+		truncateApplied = applied
+		hist, _, rerr := readAgentCoreJournalHistoryFrom(m.coreJournal.dir, sessionID)
+		if rerr != nil {
+			// 截断成功后文件必在；ErrNotExist 只会出现在「从未落过 journal」的
+			// no-op 截断上——同样拒绝，绝不静默回退空 history。
+			_ = writeJSON(agentAIErrorPayload(sessionID, "", &agentAITruncateError{code: truncateErrCodeRebuildFailed, msg: "ai.session.create rebuild failed", err: rerr}))
+			return
+		}
+		history = hist // 空 journal=空 history:允许空覆盖（撤回到空）
 	}
 
 	m.mu.Lock()
@@ -1887,14 +1961,21 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 			existing.claudePolicy = cloneAgentAIClaudeRemotePolicy(claudePolicy)
 			existing.claudeCaps = agentAIClaudeCapabilities{}
 		}
-		if len(history) > 0 {
+		if truncateActive {
+			// 撤回路径:允许空覆盖（重建结果哪怕是空也必须生效）。
+			existing.history = trimAgentAIHistoryForSession(existing, history)
+		} else if len(history) > 0 {
 			existing.history = trimAgentAIHistoryForSession(existing, history)
 		}
 		if v := strings.TrimSpace(remoteString(msg, agentAIOriginSocketField)); v != "" {
 			existing.originSocket = v
 		}
 		m.mu.Unlock()
-		_ = writeJSON(agentAISessionCreatedPayload(existing))
+		payload := agentAISessionCreatedPayload(existing)
+		if truncateBeforeID != "" {
+			payload["truncate_applied"] = truncateApplied
+		}
+		_ = writeJSON(payload)
 		return
 	}
 	// NOTE: no count cap here. The real turn runs on ai.message, whose lazy-create
@@ -1943,7 +2024,11 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 	m.registerAISessionLocked(session)
 	m.mu.Unlock()
 
-	_ = writeJSON(agentAISessionCreatedPayload(session))
+	payload := agentAISessionCreatedPayload(session)
+	if truncateBeforeID != "" {
+		payload["truncate_applied"] = truncateApplied
+	}
+	_ = writeJSON(payload)
 }
 
 func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerminalWriter) {

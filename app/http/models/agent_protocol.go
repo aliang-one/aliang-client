@@ -237,7 +237,8 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				{Type: AgentEventTerminalError, Required: []string{"type", "session_id", "error"}},
 				{Type: AgentEventTerminalReplay, Required: []string{"type", "session_id", "encoding", "data", "seq", "final", "status"}, Optional: []string{"truncated"}},
 				{Type: AgentEventTerminalSessions, Required: []string{"type", "sessions"}},
-				{Type: AgentEventAISessionCreated, Required: []string{"type", "session_id", "mode", "project_path", "provider", "state"}, Optional: []string{"state=idle"}},
+				// truncate_applied：撤回重发回显（create 带 truncate_before_message_id 时）。
+				{Type: AgentEventAISessionCreated, Required: []string{"type", "session_id", "mode", "project_path", "provider", "state"}, Optional: []string{"state=idle", "truncate_applied"}},
 				{Type: AgentEventAIMessageReceived, Required: []string{"type", "session_id", "message_id", "run_id", "event_seq"}, Optional: []string{"received_at"}},
 				{Type: AgentEventAIRunStarted, Required: []string{"type", "session_id", "message_id", "provider", "mode", "project_path", "run_id", "event_seq"}, Optional: []string{"state=running"}},
 				{Type: AgentEventAISteerAck, Required: []string{"type", "session_id", "message_id", "result"}, Optional: []string{"error", "code", "acked_at"}},
@@ -308,7 +309,10 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				{Type: AgentEventTerminalInput, Required: []string{"type", "session_id", "data"}, Emits: []string{AgentEventTerminalOutput, AgentEventTerminalError}},
 				{Type: AgentEventTerminalResize, Required: []string{"type", "session_id", "rows", "cols"}, Emits: []string{AgentEventTerminalResized, AgentEventTerminalError}},
 				{Type: AgentEventTerminalClose, Required: []string{"type", "session_id"}, Emits: []string{AgentEventTerminalExit}},
-				{Type: AgentEventAISessionCreate, Required: []string{"type", "session_id"}, Optional: []string{"project_path", "mode", "provider", "tool", "model", "effort", "source_session_id", "resume_session_id", "initial_context", "transcript", "claude_remote_policy"}, Emits: []string{AgentEventAISessionCreated, AgentEventAIError}},
+				// truncate_before_message_id：撤回重发专用——截断 journal 到该 msg
+				// 行之前，宿主从截断后 journal 全文重建 history（帧不携带
+				// transcript）；仅 agentcore 生效。
+				{Type: AgentEventAISessionCreate, Required: []string{"type", "session_id"}, Optional: []string{"project_path", "mode", "provider", "tool", "model", "effort", "source_session_id", "resume_session_id", "initial_context", "transcript", "truncate_before_message_id", "claude_remote_policy"}, Emits: []string{AgentEventAISessionCreated, AgentEventAIError}},
 				{Type: AgentEventAIMessage, Required: []string{"type", "session_id", "message_id", "content"}, Optional: []string{"attachments", "provider", "tool", "model", "project_path", "source_session_id", "resume_session_id", "claude_remote_policy", "surface"}, Emits: []string{AgentEventAIMessageReceived, AgentEventAIRunStarted, AgentEventAIDelta, AgentEventAIThinking, AgentEventAICommand, AgentEventAIFileChange, AgentEventAIUsage, AgentEventAITask, AgentEventAIApprovalRequest, AgentEventAIRunProgress, AgentEventAIDone, AgentEventAIError}},
 				{Type: AgentEventAISteer, Required: []string{"type", "session_id", "message_id", "content"}, Optional: []string{"mode", "surface"}, Emits: []string{AgentEventAISteerAck}},
 				{Type: AgentEventAIApprovalResponse, Required: []string{"type", "session_id", "approval_id", "decision"}, Optional: []string{"message_id", "scope", "raw", "delivery_id", "attempt"}, Emits: []string{AgentEventAIApprovalAck, AgentEventAIStatus, AgentEventAIError}},

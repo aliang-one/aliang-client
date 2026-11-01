@@ -1,69 +1,20 @@
 import { expect, test } from '@playwright/test';
+import { openChat as openChatBase, pushFrame, expectedSourceBadgeCount } from './helpers/chatStub.js';
 
 // 跨端会话统一阶段 2（Task 2+3 + 评审修复）：侧栏三源清单合并渲染（角标/
 // 状态点/删除收敛本地草稿）+ 打开设备会话（详情转录装载、agentcore 订阅、
 // 快照覆盖、切走退订、详情 404 不阻断输入）+ 审批族帧分源路由（②壳三键/
 // ③活跃兜底带来源标签）+ resume 字段 created ack 后清除。
-
-// WS 桩：ai.session.subscribe 回 window.__snapshot（用例注入；null=不回包，
-// 覆盖「未订阅静默」）；create 照常回执；ai.message 回 done（复位 sending，
-// 供 resume 清除用例连发两句）；socket 实例入 FakeWebSocket.instances 供
-// 用例向页面注入任意帧。
-const WS_STUB = `
-  window.__aiFrames = [];
-  window.__snapshot = null;
-  window.EventSource = class { constructor() { setTimeout(() => this.onopen?.(), 0); } close() {} };
-  class FakeWebSocket {
-    static OPEN = 1;
-    static CONNECTING = 0;
-    static CLOSING = 2;
-    static CLOSED = 3;
-    constructor(url) {
-      this.url = url;
-      this.readyState = 0;
-      FakeWebSocket.instances.push(this);
-      setTimeout(() => { this.readyState = 1; this.onopen?.(); }, 0);
-    }
-    send(data) {
-      const frame = JSON.parse(data);
-      window.__aiFrames.push(frame);
-      if (frame.type === 'ai.session.subscribe') {
-        setTimeout(() => {
-          if (!this.onmessage || !window.__snapshot) return;
-          this.onmessage({ data: JSON.stringify({
-            type: 'ai.session.snapshot',
-            session_id: frame.session_id,
-            ...window.__snapshot,
-          }) });
-        }, 0);
-      }
-      if (frame.type === 'ai.session.create') {
-        setTimeout(() => {
-          if (!this.onmessage) return;
-          this.onmessage({ data: JSON.stringify({
-            type: 'ai.session.created', session_id: frame.session_id, mode: frame.mode,
-            project_path: frame.project_path || '/home/e2e', provider: frame.provider,
-            model: frame.model || '', effort: frame.effort || '', state: 'idle',
-          }) });
-        }, 0);
-      }
-      if (frame.type === 'ai.message') {
-        setTimeout(() => {
-          if (!this.onmessage) return;
-          this.onmessage({ data: JSON.stringify({ type: 'ai.done', session_id: frame.session_id }) });
-        }, 0);
-      }
-    }
-    close() {}
-  }
-  FakeWebSocket.instances = [];
-  window.WebSocket = FakeWebSocket;
-`;
+// WS 桩语义（helpers/chatStub.js 默认档）：subscribe 回 window.__snapshot
+// （用例注入；null=不回包，覆盖「未订阅静默」）；create 照常回执；ai.message
+// 回 done（复位 sending，供 resume 清除用例连发两句）。
 
 const NOW_ISO = new Date().toISOString();
 const SESSIONS = [
   { id: 'conv-agentcore-1', provider: 'agentcore', title: '手机发起的会话', status: 'running', origin: 'phone', source_session_id: 'managed-xyz', project_path: '/home/alice/proj-phone', updated_at: NOW_ISO },
-  { id: 'claude_native9', provider: 'claude', title: '终端 Claude 会话', status: 'idle', origin: '', project_path: '/home/alice/proj-term', updated_at: NOW_ISO },
+  // provider=agentcore（2026-10-30 只见 AliangCode 后 claude 原生条目不再进侧栏）；
+  // id 保留 claude_ 前缀 → 徽标/resume/steer 阻断/不订阅仍走前缀判定，语义不变
+  { id: 'claude_native9', provider: 'agentcore', title: '终端 Claude 会话', status: 'idle', origin: '', project_path: '/home/alice/proj-term', updated_at: NOW_ISO },
 ];
 const DETAIL_TRANSCRIPT = [
   { id: 'm1', role: 'user', content: '详情用户消息', timestamp: NOW_ISO, index: 1 },
@@ -84,68 +35,14 @@ const SNAPSHOT_PAYLOAD = {
 // 详情分页 mock（rows + transcript_page），验证分页拉全（评审 must-fix）；
 // detailLog：可选数组，按序记录每次详情请求的 {limit, before}。
 async function openChat(page, { detail404 = false, sessions = SESSIONS, detailPages = null, detailLog = null } = {}) {
-  await page.addInitScript(WS_STUB);
-  await page.addInitScript(() => localStorage.setItem('alianggate.onboarding.v2', 'completed'));
-  await page.route('**/api/**', async (route) => {
-    const url = new URL(route.request().url());
-    if (url.pathname === '/api/auth/session') {
-      await route.fulfill({
-        contentType: 'application/json',
-        body: JSON.stringify({
-          code: 0,
-          data: { type: 'session_snapshot', instance_id: 'e2e', revision: 1, state: 'active', user: { id: 1, username: 'alice', email: 'a@b.c' } },
-        }),
-      });
-      return;
-    }
-    if (url.pathname === '/api/agent/sessions') {
-      await route.fulfill({ contentType: 'application/json', body: JSON.stringify({ code: 0, data: { sessions } }) });
-      return;
-    }
-    if (url.pathname === '/api/agent/session') {
-      if (detail404) {
-        await route.fulfill({ status: 404, contentType: 'application/json', body: JSON.stringify({ code: 404, msg: 'not found' }) });
-        return;
-      }
-      if (detailPages) {
-        if (detailLog) detailLog.push({ limit: url.searchParams.get('limit'), before: url.searchParams.get('before') });
-        const nextPage = detailPages.length ? detailPages.shift() : { rows: [], page: { has_more: false } };
-        await route.fulfill({
-          contentType: 'application/json',
-          body: JSON.stringify({ code: 0, data: { id: url.searchParams.get('id'), transcript: nextPage.rows, transcript_page: nextPage.page } }),
-        });
-        return;
-      }
-      await route.fulfill({
-        contentType: 'application/json',
-        body: JSON.stringify({ code: 0, data: { id: url.searchParams.get('id'), transcript: DETAIL_TRANSCRIPT, transcript_page: { limit: 40, count: DETAIL_TRANSCRIPT.length } } }),
-      });
-      return;
-    }
-    await route.fulfill({ contentType: 'application/json', body: JSON.stringify({ code: 0, data: {} }) });
+  await openChatBase(page, {
+    sessions,
+    newSession: false,
+    detail: { transcript: DETAIL_TRANSCRIPT, notFound: detail404, pages: detailPages, log: detailLog },
   });
-  await page.goto('/');
-  await expect(page.getByTestId('aliang-chat-entry-sidebar')).toBeVisible();
-  await page.getByTestId('aliang-chat-entry-sidebar').click();
   // 角标数随用例清单走（与 sessionSourceBadge 同一条优先级规则的镜像实现：
   // running > origin > id 前缀）；默认双条清单维持 2。
-  const badgeCount = sessions.filter((s) => {
-    if (!s || typeof s !== 'object') return false;
-    if (s.status === 'running') return true;
-    if (s.origin === 'phone' || s.origin === 'dashboard') return true;
-    return typeof s.id === 'string' && (s.id.startsWith('claude_') || s.id.startsWith('codex_'));
-  }).length;
-  await expect(page.getByTestId('session-source-badge')).toHaveCount(badgeCount);
-}
-
-// 向页面注入一帧 WS 事件（走最新一个 socket 实例的 onmessage）。socket 是
-// 惰性建立的（发消息/订阅才 ensureAISocket），注入前必须确认实例存在。
-async function pushFrame(page, frame) {
-  await page.waitForFunction(() => window.WebSocket.instances.length > 0);
-  await page.evaluate(f => {
-    const ws = window.WebSocket.instances[window.WebSocket.instances.length - 1];
-    ws.onmessage?.({ data: JSON.stringify(f) });
-  }, frame);
+  await expect(page.getByTestId('session-source-badge')).toHaveCount(expectedSourceBadgeCount(sessions));
 }
 
 test('侧栏三源清单：来源角标、running 状态点、设备条目不可删除/重命名', async ({ page }) => {
@@ -321,7 +218,9 @@ test('running agentcore 裸 id 无 managed id：steer 回退 entry.id，不误�
 
 test('running claude_ 壳无 managed id：内联提示常驻、提交零帧、输入保留', async ({ page }) => {
   const sessions = [
-    { id: 'claude_nobind', provider: 'claude', title: '无绑定终端运行', status: 'running', origin: '', project_path: '/p/nb', updated_at: NOW_ISO },
+    // provider=agentcore 过清单过滤；claude_ 前缀仍被 steerTargetId 排除在裸 id
+    // 回退之外（前缀判定），「running 无 managed id → 阻断」覆盖意图不变
+    { id: 'claude_nobind', provider: 'agentcore', title: '无绑定终端运行', status: 'running', origin: '', project_path: '/p/nb', updated_at: NOW_ISO },
   ];
   await openChat(page, { sessions });
   await page.getByText('无绑定终端运行').click();

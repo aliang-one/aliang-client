@@ -241,6 +241,7 @@ export default {
   chat_settingsDirectory: '工作目录',
   chat_settingsModel: '模型',
   chat_settingsEffort: '推理力度',
+  chat_effortPending: '下轮生效',
   chat_modelDefault: '默认',
   chat_modelUnset: '未选择',
   chat_modelRequired: '请先选择或填写模型再发送',
@@ -292,10 +293,46 @@ export default {
   chat_approvalExpiresMinutes: '{minutes} 分钟',
   chat_approvalExpiresHours: '约 {hours} 小时',
   chat_approvalFromSession: '来自会话 {id}',
+  // 审批等待期硬拦提示（Task 10）：输入区常驻说明（与 en.js 成对维护）
+  chat_approvalBlockHint: '有待审批请求，请先处理后再发送',
   chat_noticeResumeMissing: '原生会话不存在，已按新会话继续',
   chat_noticeHistoryRestoreFailed: '历史恢复失败，已按空会话继续',
   chat_approvalCancelled: '审批已被取消',
   chat_approvalCancelledReason: '审批已被取消（{reason}）',
+  chat_md_copy: '复制',
+  chat_md_copied: '已复制',
+  chat_md_unfold: '展开全部',
+  // 视觉现代化（Task 8）：空状态 hero / 相对时间 / 停止键占位 / 回到底部浮钮 /
+  // 审批卡摘要展开，与 en.js 成对维护（i18n.test.js 守键集）。
+  chat_heroTitle: '开始新的对话',
+  chat_justNow: '刚刚',
+  chat_minutesAgo: '{minutes} 分钟前',
+  chat_hoursAgo: '{hours} 小时前',
+  chat_stop: '停止',
+  chat_scrollToBottom: '回到底部',
+  chat_approvalMore: '展开',
+  chat_approvalLess: '收起',
+  // 撤回重发（Task 13）：banner / 气泡 hover 操作条（复制+撤回）/ 确认键 /
+  // 取消 / 停止超时与未确认的可重试文案，与 en.js 成对维护（i18n.test.js 守键集）。
+  chat_recallBanner: '将截断此消息及之后的全部对话，发送后生效',
+  chat_recallButton: '撤回重发',
+  chat_recallConfirm: '确认重发',
+  chat_recallCancel: '取消',
+  chat_recallStopTimeout: '停止超时，请重试',
+  chat_recallUnconfirmed: '撤回未确认，可重试',
+  chat_copyMessage: '复制',
+  // 方案选择交互卡（Task 14）：ai.option 两步作答交互卡 + 静态围栏卡，与
+  // en.js 成对维护（i18n.test.js 守键集）。
+  chat_optionTitle: '方案选择',
+  chat_optionSubmit: '确认选择',
+  chat_optionSelected: '已选择',
+  chat_optionCustom: '自定义回复…',
+  chat_optionMulti: '可多选',
+  chat_optionPreview: '预览',
+  chat_optionStaticHint: '在下方选择',
+  chat_optionCancelled: '方案选择已失效',
+  chat_optionCancelledReason: '方案选择已失效（{reason}）',
+  chat_optionSendFailed: '选择发送失败，请重试。',
 
   // -- App --
   app_restoringSession: '正在恢复会话...',

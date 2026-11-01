@@ -300,3 +300,140 @@ func TestAgentCoreJournalOriginFor(t *testing.T) {
 		t.Fatalf("双空应 unknown,实际 %q", got)
 	}
 }
+
+// 辅助:写一份标准 journal(头行 + msg(u1) + turn + msg(a1) + end + msg(u2-目标) + turn + msg(a2) + end)
+func writeTruncateFixture(t *testing.T, j *agentCoreJournal, sessionID string) {
+	t.Helper()
+	j.ensureSessionHeader(sessionID, "/proj", "glm-5.3", "", "2026-10-31T00:00:00Z", "dashboard", nil, nil)
+	j.appendUser(sessionID, "u1", "第一问", "2026-10-31T00:01:00Z")
+	j.appendAssistantTurn(sessionID, 1, "中间叙述", "", "end_turn", nil)
+	j.appendAssistant(sessionID, "a1", "第一答", "2026-10-31T00:02:00Z")
+	j.appendEnd(sessionID, "success", "")
+	j.appendUser(sessionID, "u2", "第二问", "2026-10-31T00:03:00Z")
+	j.appendAssistantTurn(sessionID, 2, "叙述二", "", "end_turn", nil)
+	j.appendAssistant(sessionID, "a2", "第二答", "2026-10-31T00:04:00Z")
+	j.appendEnd(sessionID, "success", "")
+}
+
+func TestJournalTruncateBeforeKeepsPrefixWithAttachedRows(t *testing.T) {
+	j := newAgentCoreJournal(t.TempDir())
+	const sid = "s-trunc-1"
+	writeTruncateFixture(t, j, sid)
+
+	applied, err := j.truncateBefore(sid, "u2")
+	if err != nil || !applied {
+		t.Fatalf("truncate: applied=%v err=%v", applied, err)
+	}
+	hist, _, err := readAgentCoreJournalHistoryFrom(j.dir, sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 保留区间 = u1 + a1(a1 是 u1 区间宿主行);u2 之后全部消失。
+	if len(hist) != 2 || hist[0].MessageID != "u1" || hist[1].MessageID != "a1" || hist[1].Content != "第一答" {
+		t.Fatalf("unexpected history: %+v", hist)
+	}
+}
+
+func TestJournalTruncateBeforeIsIdempotent(t *testing.T) {
+	j := newAgentCoreJournal(t.TempDir())
+	const sid = "s-trunc-2"
+	writeTruncateFixture(t, j, sid)
+	if _, err := j.truncateBefore(sid, "u2"); err != nil {
+		t.Fatal(err)
+	}
+	applied, err := j.truncateBefore(sid, "u2") // 已截过:目标行不在,幂等成功
+	if err != nil || applied {
+		t.Fatalf("second truncate should be no-op: applied=%v err=%v", applied, err)
+	}
+}
+
+func TestJournalTruncateBeforeMissingTargetAndFile(t *testing.T) {
+	j := newAgentCoreJournal(t.TempDir())
+	const sid = "s-trunc-3"
+	writeTruncateFixture(t, j, sid)
+	// 不匹配的 id:无操作不报错
+	if applied, err := j.truncateBefore(sid, "nope"); err != nil || applied {
+		t.Fatalf("missing target: applied=%v err=%v", applied, err)
+	}
+	// 文件缺失:幂等成功
+	if applied, err := j.truncateBefore("ghost", "u1"); err != nil || applied {
+		t.Fatalf("missing file: applied=%v err=%v", applied, err)
+	}
+}
+
+func TestJournalTruncateBeforeKeepsHeadWhenFirstMsgIsTarget(t *testing.T) {
+	j := newAgentCoreJournal(t.TempDir())
+	const sid = "s-trunc-4"
+	writeTruncateFixture(t, j, sid)
+	if _, err := j.truncateBefore(sid, "u1"); err != nil {
+		t.Fatal(err)
+	}
+	hist, head, err := readAgentCoreJournalHistoryFrom(j.dir, sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hist) != 0 {
+		t.Fatalf("expect empty history, got %+v", hist)
+	}
+	if head.projectPath != "/proj" {
+		t.Fatalf("head lost: %+v", head)
+	}
+}
+
+func TestJournalTruncateBeforeSteerRowFollowsPosition(t *testing.T) {
+	j := newAgentCoreJournal(t.TempDir())
+	const sid = "s-trunc-5"
+	// 手工排布(fixture 的行序固定,无法把 steer 行插进 u1 区间):steer 是
+	// 带 message_id 的 kind=msg 行,物理位置在 u1 区间内(a1 之后、u2 之前)。
+	j.ensureSessionHeader(sid, "/proj", "glm-5.3", "", "2026-10-31T00:00:00Z", "dashboard", nil, nil)
+	j.appendUser(sid, "u1", "第一问", "ts")
+	j.appendAssistant(sid, "a1", "第一答", "ts")
+	j.appendUser(sid, "steer-1", "插话", "ts")
+	j.appendUser(sid, "u2", "第二问", "ts")
+	j.appendAssistant(sid, "a2", "第二答", "ts")
+	if _, err := j.truncateBefore(sid, "u2"); err != nil {
+		t.Fatal(err)
+	}
+	hist, _, _ := readAgentCoreJournalHistoryFrom(j.dir, sid)
+	// 保留侧断言(关键):u1/a1/steer 三行按位置归属 u1 区间,全保。
+	if len(hist) != 3 || hist[2].MessageID != "steer-1" {
+		t.Fatalf("steer row inside kept interval must survive: %+v", hist)
+	}
+}
+
+// 无头文件（首行即 msg 行，缺 session 头）：truncate 仍按位置语义工作——
+// 首行既可作保留前缀，也可作截断目标（不造头，读侧本就容忍无头）。
+func TestJournalTruncateBeforeHeadlessFile(t *testing.T) {
+	j := newAgentCoreJournal(t.TempDir())
+	const sid = "s-trunc-6"
+	raw := `{"kind":"msg","role":"user","message_id":"u1","text":"第一问","ts":"ts"}` + "\n" +
+		`{"kind":"msg","role":"assistant","message_id":"a1","text":"第一答","ts":"ts"}` + "\n" +
+		`{"kind":"msg","role":"user","message_id":"u2","text":"第二问","ts":"ts"}` + "\n"
+	if err := os.WriteFile(filepath.Join(j.dir, agentCoreJournalFileName(sid)), []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// 首行作保留前缀:truncate u2 → 保留 u1+a1,结果仍无头。
+	if _, err := j.truncateBefore(sid, "u2"); err != nil {
+		t.Fatal(err)
+	}
+	hist, head, err := readAgentCoreJournalHistoryFrom(j.dir, sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hist) != 2 || hist[0].MessageID != "u1" || hist[1].MessageID != "a1" {
+		t.Fatalf("headless keep-prefix: %+v", hist)
+	}
+	if head.projectPath != "" {
+		t.Fatalf("headless file must not gain a session header: %+v", head)
+	}
+
+	// 首行作截断目标:truncate u1 → 整文件清空（连头都没有,历史为空）。
+	if _, err := j.truncateBefore(sid, "u1"); err != nil {
+		t.Fatal(err)
+	}
+	hist, _, _ = readAgentCoreJournalHistoryFrom(j.dir, sid)
+	if len(hist) != 0 {
+		t.Fatalf("headless first-line-target must empty the file: %+v", hist)
+	}
+}
