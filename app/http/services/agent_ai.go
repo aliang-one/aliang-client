@@ -45,6 +45,12 @@ type agentAIManager struct {
 	codexInputs       map[string]*agentAICodexInputWaiter
 	pendingTerminals  map[string]map[string]interface{}
 	runJournalEnabled bool
+	// pendingApprovalRequests 是审批请求投递 journal(L1 可靠投递,2026-11-01,
+	// 见 agent_ai_approval_journal.go):approval_id → 原始 request payload。
+	// 发送前 remember,服务端 ai.approval.request.ack / waiter 终结时清除,
+	// 重连/心跳时重放(服务端 intake 幂等)。
+	pendingApprovalRequests map[string]map[string]interface{}
+	approvalJournalEnabled  bool
 	bindings          map[string]agentAIBindingRecord
 	processedRuns     map[string]agentAIProcessedRun
 	// coreJournal 是 agentcore（AliangCode）调用记录落盘器；dir 为空时内部
@@ -1167,15 +1173,16 @@ const agentAIOptionSystemPrompt = `When you have multiple viable approaches/opti
 
 func newAgentAIManager() *agentAIManager {
 	m := &agentAIManager{
-		sessions:           make(map[string]*agentAISession),
-		approvals:          make(map[string]*agentAIApprovalWaiter),
-		completedApprovals: make(map[string]*agentAICompletedApproval),
-		codexInputs:        make(map[string]*agentAICodexInputWaiter),
-		pendingTerminals:   make(map[string]map[string]interface{}),
-		bindings:           make(map[string]agentAIBindingRecord),
-		processedRuns:      make(map[string]agentAIProcessedRun),
-		coreJournal:        newAgentCoreJournal(agentCoreJournalDir()),
-		aiSockets:          make(map[string]*agentAISocket),
+		sessions:                make(map[string]*agentAISession),
+		approvals:               make(map[string]*agentAIApprovalWaiter),
+		completedApprovals:      make(map[string]*agentAICompletedApproval),
+		codexInputs:             make(map[string]*agentAICodexInputWaiter),
+		pendingTerminals:        make(map[string]map[string]interface{}),
+		pendingApprovalRequests: make(map[string]map[string]interface{}),
+		bindings:                make(map[string]agentAIBindingRecord),
+		processedRuns:           make(map[string]agentAIProcessedRun),
+		coreJournal:             newAgentCoreJournal(agentCoreJournalDir()),
+		aiSockets:               make(map[string]*agentAISocket),
 	}
 	return m
 }
@@ -3856,16 +3863,15 @@ func (m *agentAIManager) pendingApprovalsSnapshot() []map[string]interface{} {
 	return out
 }
 
-// emitApprovalSync sends ai.approval.sync for all still-pending approvals (a
-// no-op when there are none). Used after reconnect and on a periodic ticker.
+// emitApprovalSync sends ai.approval.sync for all still-pending approvals.
+// Used after reconnect and on a periodic ticker. 空集也发(2026-11-01 审计):
+// 显式表达「本机无 pending」——此前 no-op 使协议无法传达撤销,server 侧残留
+// 卡只能靠 24h/deadline 收敛;服务端对空数组 no-op,安全。
 func (m *agentAIManager) emitApprovalSync(writeJSON agentTerminalWriter) {
 	if writeJSON == nil {
 		return
 	}
 	pending := m.pendingApprovalsSnapshot()
-	if len(pending) == 0 {
-		return
-	}
 	_ = writeJSON(map[string]interface{}{
 		"type":    models.AgentEventAIApprovalSync,
 		"pending": pending,
@@ -4135,17 +4141,23 @@ func (m *agentAIManager) requestApproval(ctx context.Context, run agentAIRun, wr
 	logger.Info(fmt.Sprintf("approval-hook: requestApproval SENDING ai.approval.request to cloud session=%s approval_id=%s kind=%s — awaiting user decision (≤%s)", run.sessionID, req.ID, req.Kind, agentAIApprovalTimeout))
 	payload := agentAIApprovalRequestPayload(req)
 	payload["expires_at"] = deadline.Format(time.RFC3339)
+	// L1 可靠投递(2026-11-01 一致性审计根因 1):发送前 write-through 记入
+	// 投递 journal,ack/waiter 终结时清除;半开 socket 静默丢帧后由重连重放
+	// 补达(服务端 intake 幂等)。持久化失败只降级为现状,不阻塞审批。
+	m.rememberPendingApprovalRequest(payload)
 	if err := writeAgentAIApprovalRequest(ctx, writeJSON, payload, 5, time.Second); err != nil {
 		m.mu.Lock()
 		if waiter := m.approvals[approvalKey]; waiter != nil && waiter.sessionID == run.sessionID && waiter.runSeq == run.runSeq {
 			delete(m.approvals, approvalKey)
 		}
 		m.mu.Unlock()
+		m.acknowledgePendingApprovalRequest(req.ID)
 		return agentAIApprovalResponse{}, fmt.Errorf("send approval request: %w", err)
 	}
 
 	select {
 	case response := <-req.respond:
+		m.acknowledgePendingApprovalRequest(req.ID)
 		_ = writeJSON(map[string]interface{}{
 			"type":        models.AgentEventAIApprovalRequest,
 			"session_id":  run.sessionID,
@@ -4173,6 +4185,9 @@ func (m *agentAIManager) requestApproval(ctx context.Context, run agentAIRun, wr
 			}
 			m.emitApprovalCancelled(writeJSON, run.sessionID, []string{req.ID}, reason)
 		}
+		// waiter 已终结,journal 条目随之清除:后续重放只会得到服务端
+		// already_resolved/duplicate 告知,主动清干净。
+		m.acknowledgePendingApprovalRequest(req.ID)
 		return agentAIApprovalResponse{}, ctx.Err()
 	}
 }
@@ -6257,6 +6272,16 @@ func (m *agentAIManager) codexAppServerUserInputResult(ctx context.Context, run 
 			return nil, ctx.Err()
 		case answer = <-waiter.respond:
 			cleanup()
+		case <-time.After(agentAIApprovalTimeout):
+			// 交互输入唯一 deadline(2026-11-01 审计 P0):codex requestUserInput
+			// 此前无任何上限——断连即永挂,ai.run.progress 心跳还让服务端永远
+			// 视为活跑。超时与审批同源(默认 24h,可 env 调),到期按取消收口。
+			cleanup()
+			if run.activity != nil {
+				run.activity.setAwaitingApproval(false)
+			}
+			m.emitApprovalCancelled(writeJSON, run.sessionID, []string{optionID}, "approval_timeout")
+			return nil, fmt.Errorf("Codex requestUserInput timed out after %s", agentAIApprovalTimeout)
 		}
 		if run.activity != nil {
 			run.activity.setAwaitingApproval(false)
