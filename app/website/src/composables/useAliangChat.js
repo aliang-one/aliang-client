@@ -4,10 +4,14 @@ import { useNavigation } from './useNavigation';
 import { slashProviderFor } from '../utils/chatProvider';
 import { normalizeConversationTitle } from '../utils/chatTitle';
 import { useAuthStore } from '../stores/auth';
-import { getAgentSessionDetail } from '../services/agentApi';
+import { getAgentIntegrations, getAgentSessionDetail } from '../services/agentApi';
 import { useDeviceSessions, DEVICE_SESSION_DETAIL_TTL_MS, isTerminalPrefixedSessionId } from './useDeviceSessions';
 import {
   normalizeDeviceProvider,
+  readLastUsedEffort,
+  readLastUsedModel,
+  rememberLastUsedEffort,
+  rememberLastUsedModel,
   sessionCreatePayload,
 } from '../utils/chatSettings';
 import {
@@ -323,9 +327,107 @@ export function useAliangChat() {
     return deviceSessions.value;
   }
 
+  // --- 输出预算 + 会话级 MCP/技能开关（master 并行线 ChatPage 原位迁入：
+  //     数据与动作归 composable，展开态 moreSettingsOpen 留在 ChatSettingsBar）---
+
+  // 输出预算面板草稿：max_tokens / context_window 的编辑草稿。
+  const maxTokensDraft = ref('');
+  const contextWindowDraft = ref('');
+  // 会话级 MCP 开关：设备侧清单（name 即配置原始键）+ 本会话关掉的集合。
+  // 清单只在首次展开面板时拉一次；拉不到就整块不渲染（不制造假开关）。
+  const mcpServers = ref([]);
+  const skills = ref([]);
+  const mcpLoaded = ref(false);
+  const mcpLoadError = ref('');
+
+  // 展开面板时按需拉一次 MCP/技能清单（失败静默降级：只留错误行，整块不再假渲染）。
+  async function ensureMcpServersLoaded() {
+    if (mcpLoaded.value) return;
+    mcpLoaded.value = true;
+    try {
+      const data = await getAgentIntegrations();
+      mcpServers.value = Array.isArray(data?.mcp_servers) ? data.mcp_servers : [];
+      skills.value = Array.isArray(data?.skills) ? data.skills : [];
+      mcpLoadError.value = '';
+    } catch (_) {
+      mcpServers.value = [];
+      mcpLoadError.value = t('chat_mcpLoadFailed');
+    }
+  }
+
+  // 勾选/取消某个 MCP server：把整份「已关闭清单」整体写回会话（服务端按
+  // 整列表替换），保证「全部重新打开」是显式空数组而不是缺键。
+  function toggleMcpServer(name) {
+    const conv = activeConversation.value;
+    if (!conv || activeRunning.value) return;
+    const key = String(name || '').trim();
+    if (!key) return;
+    const current = Array.isArray(conv.disabledMcpServers) ? conv.disabledMcpServers.slice() : [];
+    const idx = current.indexOf(key);
+    if (idx >= 0) current.splice(idx, 1);
+    else current.push(key);
+    applySessionSettings(conv, { disabledMcpServers: current });
+  }
+
+  // 勾选/取消某个技能：整份「已关闭清单」整体写回（与 MCP 同语义）。
+  function toggleSkill(name) {
+    const conv = activeConversation.value;
+    if (!conv || activeRunning.value) return;
+    const key = String(name || '').trim();
+    if (!key) return;
+    const current = Array.isArray(conv.disabledSkills) ? conv.disabledSkills.slice() : [];
+    const idx = current.indexOf(key);
+    if (idx >= 0) current.splice(idx, 1);
+    else current.push(key);
+    applySessionSettings(conv, { disabledSkills: current });
+  }
+
+  // 输出预算：空输入 = 清除（不下发），非数字/<=0 同样视为清除。
+  function commitMaxTokens() {
+    const conv = activeConversation.value;
+    if (!conv || activeRunning.value) return;
+    const raw = String(maxTokensDraft.value || '').trim();
+    const n = Number(raw);
+    if (!raw || !Number.isFinite(n) || n <= 0) {
+      maxTokensDraft.value = '';
+      applySessionSettings(conv, { maxTokens: 0 });
+      return;
+    }
+    // 与后端 clampAgentAIMaxTokens 同区间，避免下发后被静默改值造成困惑。
+    const clamped = Math.min(128000, Math.max(1024, Math.trunc(n)));
+    maxTokensDraft.value = String(clamped);
+    applySessionSettings(conv, { maxTokens: clamped });
+  }
+
+  function commitContextWindow() {
+    const conv = activeConversation.value;
+    if (!conv || activeRunning.value) return;
+    const raw = String(contextWindowDraft.value || '').trim();
+    const n = Number(raw);
+    if (!raw || !Number.isFinite(n) || n <= 0) {
+      contextWindowDraft.value = '';
+      applySessionSettings(conv, { contextWindow: 0 });
+      return;
+    }
+    const clamped = Math.min(1000000, Math.max(100000, Math.trunc(n)));
+    contextWindowDraft.value = String(clamped);
+    applySessionSettings(conv, { contextWindow: clamped });
+  }
+
+  // 输出预算草稿回填：留空表示「不下发（用内核默认）」，所以未设置时给空串
+  // 而不是 0——0 在 number input 里会显示成 "0"，误导用户以为设了 0。
+  function syncBudgetDrafts() {
+    const conv = activeConversation.value;
+    const mt = Number(conv && conv.maxTokens);
+    const cw = Number(conv && conv.contextWindow);
+    maxTokensDraft.value = Number.isFinite(mt) && mt > 0 ? String(mt) : '';
+    contextWindowDraft.value = Number.isFinite(cw) && cw > 0 ? String(cw) : '';
+  }
+
   // 切会话收起面板、清一次性错误；同时给切走的 agentcore 设备会话退订快照流
   // （幂等，socket 不在线时 sendAI 静默失败，重开会话会重新订阅）。
-  // 目录面板/自定义模型的 UI 复位已迁 ChatSettingsBar（watch conversation prop）。
+  // 目录面板/自定义模型/「更多」面板的 UI 复位在 ChatSettingsBar（watch
+  // conversation prop）；预算草稿在数据侧，随会话切换在这里重同步。
   watch(activeId, (nv, ov) => {
     // 撤回编辑态随会话切换取消（Task 13）：恢复进入前草稿，banner 不跨会话悬挂。
     if (ov && recallState.value?.convId === ov) cancelRecall();
@@ -334,6 +436,7 @@ export function useAliangChat() {
       if (prev) unsubscribeDeviceSession(prev);
     }
     createError.value = '';
+    syncBudgetDrafts();
     // 切会话即视为重新贴底：转录装载后的「看到最新一条」语义不被上一个
     // 会话里残留的上翻状态劫持（随后 scrollToBottom 走常规贴底路径）。
     messagesNearBottom.value = true;
@@ -534,6 +637,16 @@ export function useAliangChat() {
       // 本窗口是 AliangCode 对话窗口（2026-10-30 用户拍板）：新建会话默认
       // agentcore；聊天窗只展示自家 agent 的对话，不该默认落成 claudecode。
       provider: chatProviderPreset.value || 'agentcore',
+      // 默认模型留空（用户拍板 2026-10-31），但新建会话沿用「上一次用过的
+      // 模型/档位」——否则每次新建都要重选，且空模型会被内核直接拒跑。
+      model: readLastUsedModel(),
+      effort: readLastUsedEffort(),
+      // 输出预算默认不设（留空 = 内核默认 64000 / 200k），避免新建会话继承
+      // 上一次的激进值而用户没意识到。
+      maxTokens: 0,
+      contextWindow: 0,
+      disabledMcpServers: [],
+      disabledSkills: [],
       createdAt: now(),
       updatedAt: now()
     };
@@ -1845,6 +1958,16 @@ export function useAliangChat() {
       return;
     }
 
+    // 模型必填守卫（2026-10-31）：内核已删除模型兜底链，空模型会被直接拒跑并
+    // 回「未指定模型」。与其让用户等一个必然失败的回合，不如在发送前就地拦住
+    // 并指路——错误挂在会话设置条上（选中模型后 applySessionSettings 自动清）。
+    // 拦截点在 steer 分流之后（running 会话插话不需要模型）、user 气泡 push
+    // 之前；撤回链 sendRecall 不加此守卫（撤回重发的 create 自带 conv.model）。
+    if (!String(conv.model || '').trim()) {
+      createError.value = t('chat_modelRequired');
+      return;
+    }
+
     // messageId 提前生成、随气泡落值（Task 13）：撤回链以气泡 id 为 journal
     // 截断锚点，ai.message 帧复用同一 id；provider 落气泡——canRecall 依赖。
     const messageId = generateId();
@@ -1884,6 +2007,9 @@ export function useAliangChat() {
         saveToStorage();
         return;
       }
+      // create 已被服务端接受：记下本次模型/档位，供新建会话沿用（last-used）。
+      rememberLastUsedModel(conv.model);
+      rememberLastUsedEffort(conv.effort);
       armIdleWatchdog(conv);
       const ok = sendAI({
         type: 'ai.message',
@@ -1950,10 +2076,16 @@ export function useAliangChat() {
     conversationGroups,
     conversations,
     createError,
+    contextWindowDraft,
     deviceAvailable,
     inputPlaceholder,
     inputText,
+    maxTokensDraft,
+    mcpLoadError,
+    mcpLoaded,
+    mcpServers,
     mergedConversations,
+    skills,
     nowTick,
     renameDraft,
     renamingId,
@@ -1979,9 +2111,12 @@ export function useAliangChat() {
     cancelRecall,
     cancelRename,
     close,
+    commitContextWindow,
+    commitMaxTokens,
     commitRename,
     createConversation,
     deleteConversation,
+    ensureMcpServersLoaded,
     loadRecentProjects,
     onSidebarItemClick,
     onSlashInput,
@@ -1993,5 +2128,7 @@ export function useAliangChat() {
     startRecall,
     startRename,
     stopRun,
+    toggleMcpServer,
+    toggleSkill,
   };
 }

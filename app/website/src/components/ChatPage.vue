@@ -44,7 +44,20 @@
         :active-running="activeRunning"
         :create-error="createError"
         :load-recent-projects="loadRecentProjects"
+        :max-tokens-draft="maxTokensDraft"
+        :context-window-draft="contextWindowDraft"
+        :mcp-servers="mcpServers"
+        :skills="skills"
+        :mcp-loaded="mcpLoaded"
+        :mcp-load-error="mcpLoadError"
+        :ensure-mcp-loaded="ensureMcpServersLoaded"
         @apply-settings="onApplySettings"
+        @update:max-tokens-draft="maxTokensDraft = $event"
+        @update:context-window-draft="contextWindowDraft = $event"
+        @commit-max-tokens="commitMaxTokens"
+        @commit-context-window="commitContextWindow"
+        @toggle-mcp="toggleMcpServer"
+        @toggle-skill="toggleSkill"
       />
 
       <ChatMessageList
@@ -119,15 +132,23 @@ const {
   cancelRecall,
   cancelRename,
   close,
+  commitContextWindow,
+  commitMaxTokens,
   commitRename,
   conversationGroups,
   createConversation,
   createError,
+  contextWindowDraft,
   deleteConversation,
   deviceAvailable,
+  ensureMcpServersLoaded,
   inputPlaceholder,
   inputText,
   loadRecentProjects,
+  maxTokensDraft,
+  mcpLoadError,
+  mcpLoaded,
+  mcpServers,
   mergedConversations,
   messagesNearBottom,
   nowTick,
@@ -153,10 +174,13 @@ const {
   slashIndex,
   slashMatches,
   slashOpen,
+  skills,
   startRecall,
   startRename,
   steerBlocked,
   stopRun,
+  toggleMcpServer,
+  toggleSkill,
 } = useAliangChat();
 
 // 设置条补丁落点：conv 取当前活跃会话（与拆分前各调用点同源），

@@ -137,9 +137,16 @@ export async function installChatStub(page, {
   createResponder = 'created',
   aiMessageResponder = 'ai.done',
   detail = null,
+  integrations = null,
 } = {}) {
   await page.addInitScript(buildChatWsStub({ mode, createResponder, aiMessageResponder }));
   await page.addInitScript(() => localStorage.setItem('alianggate.onboarding.v2', 'completed'));
+  await page.addInitScript(() => {
+    // 模型必填守卫（移植自 master 并行线）配套：发送前空模型会被拦截，而
+    // 新建本地会话的模型来自 last-used 记忆。真实用户发送过一次即有记忆，
+    // 这里预置同值让既有用例的裸发送照常走通。
+    try { localStorage.setItem('aliang-last-used-model', 'glm-5.2'); } catch (_) {}
+  });
   await page.route('**/api/**', async (route) => {
     const url = new URL(route.request().url());
     if (url.pathname === '/api/auth/session') {
@@ -147,11 +154,17 @@ export async function installChatStub(page, {
       return;
     }
     if (url.pathname === '/api/agent/sessions') {
-      await route.fulfill({ contentType: 'application/json', body: JSON.stringify({ code: 0, data: { sessions } }) });
+      // 设备壳条目缺省补 model（服务端清单实际带 model——agent_inventory_*），
+      // 让设备壳续聊同样过模型守卫；用例显式给的值优先（写在后面覆盖）。
+      await route.fulfill({ contentType: 'application/json', body: JSON.stringify({ code: 0, data: { sessions: sessions.map((s) => ({ model: 'glm-5.2', ...s })) } }) });
       return;
     }
     if (url.pathname === '/api/agent/session' && detail) {
       await fulfillDetail(route, url, detail);
+      return;
+    }
+    if (url.pathname === '/api/agent/integrations' && integrations) {
+      await route.fulfill({ contentType: 'application/json', body: JSON.stringify({ code: 0, data: integrations }) });
       return;
     }
     await route.fulfill({ contentType: 'application/json', body: JSON.stringify({ code: 0, data: {} }) });

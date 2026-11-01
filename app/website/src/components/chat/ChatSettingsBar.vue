@@ -56,6 +56,19 @@
       >
         <option v-for="opt in EFFORT_OPTIONS" :key="opt.value" :value="opt.value">{{ opt.value || t('chat_modelDefault') }}</option>
       </select>
+      <!-- 「更多」输出预算/会话级 MCP·技能开关（master 并行线 ChatPage 迁入）：
+           面板数据与动作收在 useAliangChat，本组件只承载展开态与递交。 -->
+      <button
+        type="button"
+        data-testid="chat-settings-more"
+        class="ml-1 flex min-h-[40px] shrink-0 items-center gap-0.5 rounded-lg border border-slate-200 px-2 text-slate-500 transition hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-primary/30 dark:border-slate-700 dark:text-slate-400 dark:hover:bg-slate-800 md:min-h-0"
+        :aria-expanded="moreSettingsOpen ? 'true' : 'false'"
+        :title="t('chat_settingsMore')"
+        @click="toggleMoreSettings"
+      >
+        <span class="material-symbols-outlined text-sm">tune</span>
+        <span class="hidden md:inline">{{ t('chat_settingsMore') }}</span>
+      </button>
       <!-- 「下轮生效」角标（Task 12）：effort/model 改动落值即挂（conv.pendingConfig，
            随 applySessionSettings 置位），ai.run.started 路由回本会话即清——新回合
            已按新配置跑。瞬态不落盘，重载后自然退场。 -->
@@ -70,6 +83,115 @@
         class="ml-2 shrink-0 truncate text-rose-500"
         :title="createError"
       >{{ createError }}</div>
+    </div>
+
+    <!-- 输出预算（默认折叠）：max_tokens / context_window 都只在用户显式
+         填写时下发；留空 = 不下发 = 内核默认（输出 64000、窗口 200k）。 -->
+    <div
+      v-if="moreSettingsOpen"
+      data-testid="chat-settings-more-panel"
+      class="flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-slate-100 px-4 py-2 text-xs dark:border-slate-800"
+    >
+      <label class="flex items-center gap-1.5 text-slate-500 dark:text-slate-400">
+        <span>{{ t('chat_settingsMaxTokens') }}</span>
+        <input
+          v-model="maxTokensModel"
+          type="number"
+          min="1024"
+          max="128000"
+          step="1024"
+          data-testid="chat-settings-max-tokens"
+          class="h-8 w-24 rounded-lg border border-slate-200 bg-white px-2 font-mono text-xs text-slate-700 outline-none transition focus:border-primary focus:ring-2 focus:ring-primary/30 disabled:opacity-60 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200"
+          :placeholder="t('chat_settingsMaxTokensPlaceholder')"
+          :disabled="activeRunning"
+          @change="emit('commit-max-tokens')"
+        />
+      </label>
+      <label class="flex items-center gap-1.5 text-slate-500 dark:text-slate-400">
+        <span>{{ t('chat_settingsContextWindow') }}</span>
+        <input
+          v-model="contextWindowModel"
+          type="number"
+          min="100000"
+          max="1000000"
+          step="10000"
+          data-testid="chat-settings-context-window"
+          class="h-8 w-28 rounded-lg border border-slate-200 bg-white px-2 font-mono text-xs text-slate-700 outline-none transition focus:border-primary focus:ring-2 focus:ring-primary/30 disabled:opacity-60 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200"
+          :placeholder="t('chat_settingsContextWindowPlaceholder')"
+          :disabled="activeRunning"
+          @change="emit('commit-context-window')"
+        />
+      </label>
+      <span class="text-[11px] text-slate-400 dark:text-slate-500">{{ t('chat_settingsBudgetHint') }}</span>
+    </div>
+
+    <!-- 会话级 MCP 开关：只影响本会话（服务端按整列表替换 disabled_mcp_servers）。 -->
+    <div
+      v-if="moreSettingsOpen"
+      data-testid="chat-settings-mcp-panel"
+      class="border-t border-slate-100 px-4 py-2 text-xs dark:border-slate-800"
+    >
+      <div class="flex items-center gap-1.5 text-slate-500 dark:text-slate-400">
+        <span class="material-symbols-outlined text-sm">hub</span>
+        <span class="font-semibold">{{ t('chat_settingsMcpTitle') }}</span>
+        <span class="text-[11px] text-slate-400">{{ t('chat_settingsMcpHint') }}</span>
+      </div>
+      <p v-if="mcpLoadError" class="mt-1 text-[11px] text-rose-500">{{ mcpLoadError }}</p>
+      <p v-else-if="mcpLoaded && !mcpServers.length" class="mt-1 text-[11px] text-slate-400">
+        {{ t('chat_settingsMcpEmpty') }}
+      </p>
+      <div v-else-if="mcpServers.length" class="mt-1.5 flex flex-wrap gap-x-4 gap-y-1.5">
+        <label
+          v-for="server in mcpServers"
+          :key="server.name"
+          class="flex min-h-[32px] items-center gap-1.5 text-slate-600 dark:text-slate-300"
+        >
+          <input
+            type="checkbox"
+            class="h-3.5 w-3.5 rounded border-slate-300 text-primary focus:ring-primary/20 dark:border-slate-600 dark:bg-slate-900"
+            :checked="!disabledMcpSet.has(server.name)"
+            :disabled="activeRunning"
+            :data-testid="'chat-mcp-' + server.name"
+            @change="emit('toggle-mcp', server.name)"
+          />
+          <span class="truncate">{{ server.name }}</span>
+        </label>
+      </div>
+    </div>
+
+    <!-- 会话级技能开关（与 MCP 同构）：取消勾选后该技能不再进 system prompt 清单。 -->
+    <div
+      v-if="moreSettingsOpen"
+      data-testid="chat-settings-skills-panel"
+      class="border-t border-slate-100 px-4 py-2 text-xs dark:border-slate-800"
+    >
+      <div class="flex items-center gap-1.5 text-slate-500 dark:text-slate-400">
+        <span class="material-symbols-outlined text-sm">school</span>
+        <span class="font-semibold">{{ t('chat_settingsSkillsTitle') }}</span>
+        <span class="text-[11px] text-slate-400">{{ t('chat_settingsSkillsHint') }}</span>
+      </div>
+      <p v-if="mcpLoadError" class="mt-1 text-[11px] text-rose-500">{{ mcpLoadError }}</p>
+      <p v-else-if="mcpLoaded && !skills.length" class="mt-1 text-[11px] text-slate-400">
+        {{ t('chat_settingsSkillsEmpty') }}
+      </p>
+      <div v-else-if="skills.length" class="mt-1.5 flex flex-wrap gap-x-4 gap-y-1.5">
+        <label
+          v-for="skill in skills"
+          :key="skill.name"
+          class="flex min-h-[32px] items-center gap-1.5 text-slate-600 dark:text-slate-300"
+          :title="skill.description || ''"
+        >
+          <input
+            type="checkbox"
+            class="h-3.5 w-3.5 rounded border-slate-300 text-primary focus:ring-primary/20 dark:border-slate-600 dark:bg-slate-900"
+            :checked="!disabledSkillSet.has(skill.name)"
+            :disabled="activeRunning"
+            :data-testid="'chat-skill-' + skill.name"
+            @change="emit('toggle-skill', skill.name)"
+          />
+          <span class="truncate">{{ skill.name }}</span>
+        </label>
+      </div>
     </div>
 
     <!-- 遮罩与浮层是滚动行的兄弟节点（外层容器的直接子级）：不再被裁剪；
@@ -128,11 +250,29 @@ const props = defineProps({
   // 最近项目数据通道：面板首开时拉一次（与侧栏清单共享同一次
   // /api/agent/sessions 请求的 promise 去重），返回设备清单原值。
   loadRecentProjects: { type: Function, required: true },
+  // 输出预算/会话级 MCP·技能开关（master 并行线迁入）：数据在 useAliangChat，
+  // 经 props 进来，动作经事件递交回 composable（commit/toggle 全走
+  // applySessionSettings 的 running 守卫/持久化/清错/服务端同步）。
+  maxTokensDraft: { type: String, default: '' },
+  contextWindowDraft: { type: String, default: '' },
+  mcpServers: { type: Array, default: () => [] },
+  skills: { type: Array, default: () => [] },
+  mcpLoaded: { type: Boolean, default: false },
+  mcpLoadError: { type: String, default: '' },
+  ensureMcpLoaded: { type: Function, default: null },
 });
 
 // apply-settings(patch)：统一写入口在 useAliangChat.applySessionSettings
 // （running 守卫/持久化/清错/服务端原位同步），本组件只递交补丁。
-const emit = defineEmits(['apply-settings']);
+const emit = defineEmits([
+  'apply-settings',
+  'update:max-tokens-draft',
+  'update:context-window-draft',
+  'commit-max-tokens',
+  'commit-context-window',
+  'toggle-mcp',
+  'toggle-skill',
+]);
 
 const { t } = useI18n();
 
@@ -143,6 +283,34 @@ const recentProjects = ref([]);
 const recentProjectsLoaded = ref(false);
 const modelCustomActive = ref(false);
 const modelCustomDraft = ref('');
+// 「更多」面板展开态（纯 UI）：数据与动作在 useAliangChat，这里只管开关。
+const moreSettingsOpen = ref(false);
+
+// 预算草稿双向绑定：值真身在 composable（commit 函数读同源草稿），
+// 经 props 进 / 事件出的 computed 桥（与 activeModel/activeEffort 同构）。
+const maxTokensModel = computed({
+  get: () => props.maxTokensDraft,
+  set: (v) => emit('update:max-tokens-draft', v),
+});
+const contextWindowModel = computed({
+  get: () => props.contextWindowDraft,
+  set: (v) => emit('update:context-window-draft', v),
+});
+
+// 本会话已关闭的 MCP server / 技能名集合（渲染复选框勾选态用，纯派生视图态）。
+const disabledMcpSet = computed(() => {
+  const list = props.conversation?.disabledMcpServers;
+  return new Set(Array.isArray(list) ? list : []);
+});
+const disabledSkillSet = computed(() => {
+  const list = props.conversation?.disabledSkills;
+  return new Set(Array.isArray(list) ? list : []);
+});
+
+function toggleMoreSettings() {
+  moreSettingsOpen.value = !moreSettingsOpen.value;
+  if (moreSettingsOpen.value && props.ensureMcpLoaded) void props.ensureMcpLoaded();
+}
 
 const directoryLocked = computed(() => isDirectoryLocked(props.conversation));
 
@@ -247,11 +415,13 @@ function onCustomPathEnter(e) {
   commitCustomPath();
 }
 
-// 切会话收起面板：原 ChatPage watch(activeId) 里的两项 UI 复位迁入本组件。
+// 切会话收起面板：原 ChatPage watch(activeId) 里的 UI 复位迁入本组件
+// （预算草稿的重同步在数据侧，随 composable 的 watch(activeId) 走）。
 // conversation prop 的对象身份只在 activeId 变化时改变（activeConversation 在
 // 会话池里按同引用命中），触发集合与原 watch 等价。
 watch(() => props.conversation, () => {
   directoryPanelOpen.value = false;
   modelCustomActive.value = false;
+  moreSettingsOpen.value = false;
 });
 </script>

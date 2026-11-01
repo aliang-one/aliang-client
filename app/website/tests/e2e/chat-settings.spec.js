@@ -11,8 +11,9 @@ const SESSIONS = [
 
 // createResponder='failCreate'：ai.session.create 的回执可经 window.__failCreate
 // （用例 page.evaluate 随时翻转）变为 ai.error（模拟目录不存在），默认照常回执。
-async function openChat(page) {
-  await openChatBase(page, { sessions: SESSIONS, createResponder: 'failCreate' });
+// 额外 options（如 integrations）透传给 helper 的 installChatStub。
+async function openChat(page, options = {}) {
+  await openChatBase(page, { sessions: SESSIONS, createResponder: 'failCreate', ...options });
 }
 
 test('设置条渲染 + 最近项目去重 + 改模型后 create 帧带 model', async ({ page }) => {
@@ -104,4 +105,57 @@ test('create 失败内联可见且下次发送重试', async ({ page }) => {
     return creates.length >= 2 && creates[creates.length - 1].project_path === '/no/such/dir' && !messageBeforeRetry;
   }).toBe(true);
   await expect(page.getByTestId('chat-settings-error')).toHaveCount(0);
+});
+
+// --- 「更多」输出预算 + 会话级 MCP/技能开关（master 并行线移植面） ---
+
+test('输出预算面板：留空不下发，输入 clamp 后随 create 帧下发', async ({ page }) => {
+  await openChat(page);
+  // 默认（未显式设置）不携带 max_tokens/context_window 键
+  await establishCreatedSession(page, '首句');
+  let create = await page.evaluate(() => window.__aiFrames.filter(f => f.type === 'ai.session.create').slice(-1)[0]);
+  expect('max_tokens' in create).toBe(false);
+  expect('context_window' in create).toBe(false);
+  // 展开面板：默认桩 integrations 为空 → MCP/技能面板空态可见（不渲染假开关）
+  await page.getByTestId('chat-settings-more').click();
+  await expect(page.getByTestId('chat-settings-more-panel')).toBeVisible();
+  await expect(page.getByTestId('chat-settings-mcp-panel')).toContainText(/未配置|No MCP servers/);
+  await expect(page.getByTestId('chat-settings-skills-panel')).toContainText(/未配置|No skills/);
+  // 低于下限的输入被 clamp 到与后端同区间（1024 / 100000）。
+  // commit 挂在 @change（blur/Enter 语义），fill() 只派发 input——须补 blur。
+  const mt = page.getByTestId('chat-settings-max-tokens');
+  await mt.fill('999');
+  await mt.blur();
+  await expect(mt).toHaveValue('1024');
+  const cw = page.getByTestId('chat-settings-context-window');
+  await cw.fill('50000');
+  await cw.blur();
+  await expect(cw).toHaveValue('100000');
+  // 下一条消息的 create 帧携带 clamp 后的预算
+  await establishCreatedSession(page, '次句');
+  create = await page.evaluate(() => window.__aiFrames.filter(f => f.type === 'ai.session.create').slice(-1)[0]);
+  expect(create.max_tokens).toBe(1024);
+  expect(create.context_window).toBe(100000);
+});
+
+test('会话级 MCP/技能开关：取消勾选随 create 帧整体下发 disabled 列表', async ({ page }) => {
+  await openChat(page, {
+    integrations: { mcp_servers: [{ name: 'weather' }], skills: [{ name: 'pdf' }] },
+  });
+  await establishCreatedSession(page, '首句');
+  await page.getByTestId('chat-settings-more').click();
+  await expect(page.getByTestId('chat-mcp-weather')).toBeVisible();
+  await expect(page.getByTestId('chat-skill-pdf')).toBeVisible();
+  // 取消勾选 → 整份「已关闭清单」写回会话并立即 resendCreate（已建会话）
+  await page.getByTestId('chat-mcp-weather').click();
+  await page.getByTestId('chat-skill-pdf').click();
+  await expect.poll(async () => page.evaluate(() =>
+    window.__aiFrames.some(f => f.type === 'ai.session.create'
+      && Array.isArray(f.disabled_mcp_servers) && f.disabled_mcp_servers.includes('weather'))
+  )).toBe(true);
+  // 下一条消息的 create 帧同时携带两份 disabled 列表
+  await establishCreatedSession(page, '次句');
+  const create = await page.evaluate(() => window.__aiFrames.filter(f => f.type === 'ai.session.create').slice(-1)[0]);
+  expect(create.disabled_mcp_servers).toEqual(['weather']);
+  expect(create.disabled_skills).toEqual(['pdf']);
 });
