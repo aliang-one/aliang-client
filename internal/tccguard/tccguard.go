@@ -283,6 +283,11 @@ var homeProtectedSubdirs = []struct {
 	{"documents", "Documents", "文稿"},
 	{"downloads", "Downloads", "下载"},
 	{"trash", ".Trash", "废纸篓"},
+	// 音乐库（kTCCServiceMediaLibrary）与照片库（kTCCServicePhotos）：2026-11-01
+	// 线上事故里真正弹出来的就是这两类。此前只覆盖「文件与文件夹」四类，所以
+	// 一条 `find ~ -maxdepth 4` 照样能把人卡住——补上后才算完整。
+	{"music", "Music", "音乐"},
+	{"pictures", "Pictures", "照片"},
 	{"icloud", filepath.Join("Library", "Mobile Documents"), "iCloud 云盘"},
 	{"cloudstorage", filepath.Join("Library", "CloudStorage"), "云端存储"},
 }

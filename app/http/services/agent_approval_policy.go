@@ -1021,9 +1021,49 @@ func shellWordPathCandidates(word string) []string {
 		if value == "" || strings.HasPrefix(value, "-") || strings.Contains(value, "://") {
 			continue
 		}
+		// /dev/null 一类设备汇不是文件路径。此前 `2>/dev/null` 会被按 ">" 切开
+		// 得到 /dev/null，判成「项目外路径」→ 每条带重定向的命令都要手机拍板
+		// （线上 journal 里 1500+ 条审批行主要就是这么来的）。放行这些标准设备，
+		// 真正的越界路径仍会被下面的判界拦下。
+		if isDeviceSinkPath(value) {
+			continue
+		}
 		out = append(out, value)
 	}
 	return out
+}
+
+// isDeviceSinkPath 判断是否是 shell 的标准设备/重定向汇，而不是真实文件路径。
+//
+// 只认明确的几个，不做 /dev 前缀通配：`find /dev`、`grep -r x /dev` 这类真正
+// 越界的写法必须照旧触发审批。
+//
+// 含 ".." 的值一律不算设备汇——否则 `/dev/fd/../../../etc/passwd` 会因为
+// 前缀命中而被整条丢弃，越界候选消失、命令被 safe-bash 自动放行（评审实测：
+// 该写法能直接读出 /etc/passwd 而不弹审批卡）。
+func isDeviceSinkPath(value string) bool {
+	if strings.Contains(value, "..") {
+		return false
+	}
+	switch value {
+	case "/dev/null", "/dev/zero", "/dev/full", "/dev/tty",
+		"/dev/stdin", "/dev/stdout", "/dev/stderr":
+		return true
+	}
+	// /dev/fd/0、/dev/fd/1、/dev/fd/2 等 fd 别名：只允许纯数字，避免借后缀夹带
+	// 路径片段。
+	if rest, ok := strings.CutPrefix(value, "/dev/fd/"); ok {
+		if rest == "" {
+			return false
+		}
+		for _, r := range rest {
+			if r < '0' || r > '9' {
+				return false
+			}
+		}
+		return true
+	}
+	return false
 }
 
 func containsString(list []string, s string) bool {

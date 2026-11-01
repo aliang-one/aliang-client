@@ -59,6 +59,11 @@ func (t *writeTool) Execute(ctx context.Context, input map[string]interface{}, e
 	if err != nil {
 		return ErrorResult("%v", err)
 	}
+	// 写路径同样要过隐私闸：对 ~/Desktop、~/Documents 的 MkdirAll/CreateTemp
+	// 一样会阻塞在 macOS 授权框上（privacy.go）。
+	if err := guardToolPath(path); err != nil {
+		return ErrorResult("%v", err)
+	}
 	if info, statErr := os.Stat(path); statErr == nil && info.IsDir() {
 		return ErrorResult("%s 是目录，无法写入", raw)
 	}
@@ -154,6 +159,9 @@ func (t *editTool) Execute(ctx context.Context, input map[string]interface{}, en
 
 	path, err := resolveToolPath(env, raw)
 	if err != nil {
+		return ErrorResult("%v", err)
+	}
+	if err := guardToolPath(path); err != nil {
 		return ErrorResult("%v", err)
 	}
 	info, err := os.Stat(path)

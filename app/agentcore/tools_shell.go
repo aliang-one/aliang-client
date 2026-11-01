@@ -2,6 +2,7 @@ package agentcore
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -115,7 +116,11 @@ func runShell(ctx context.Context, kind string, input map[string]interface{}, en
 	defer cancel()
 
 	args := append(append([]string(nil), baseArgs...), command)
-	cmd := exec.CommandContext(runCtx, shellPath, args...)
+	// 必须走 newToolCommandContext（Setpgid + 组杀 + WaitDelay）：裸
+	// exec.CommandContext 只杀直接子进程，复合命令（`a; b | c`）fork 出的孙
+	// 进程会继承 stdout 管道并成为孤儿，导致 cmd.Run() 在超时后仍然无限等待。
+	// 详见 exec_unix.go 的文件注释与 2026-11-01 线上事故。
+	cmd := newToolCommandContext(runCtx, shellPath, args...)
 	if env.ProjectPath != "" {
 		cmd.Dir = env.ProjectPath
 	}
@@ -152,6 +157,17 @@ func runShell(ctx context.Context, kind string, input map[string]interface{}, en
 	if ctx.Err() != nil {
 		sb.WriteString("[命令被取消]")
 		return ToolResult{Content: truncateToolOutput(sb.String()), IsError: true}
+	}
+
+	// WaitDelay 到期：命令**自己已经结束**，只是还有后代进程（`cmd &`、nohup、
+	// dev server）握着输出管道没关。这不是失败——必须把已采集的输出回填，并
+	// 说明它可能不完整。此前这里会落到下面的通用失败分支，把 stdout 整段丢掉
+	// 并报「执行失败」，模型于是重试，每重试一次再漏一个后台孤儿进程。
+	if errors.Is(runErr, exec.ErrWaitDelay) {
+		sb.WriteString(fmt.Sprintf("\n[命令已结束，但仍有后台子进程在运行并占用输出管道，" +
+			"上面的输出可能不完整。]"))
+		isErr := cmd.ProcessState == nil || !cmd.ProcessState.Success()
+		return ToolResult{Content: truncateToolOutput(sb.String()), IsError: isErr}
 	}
 
 	if runErr != nil {
