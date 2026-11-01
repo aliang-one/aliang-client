@@ -77,9 +77,12 @@
            审批等待期 textarea 禁用，带草稿时用户清不了空——放宽让停止键
            成为自救出口；非审批态仍要求空输入（避免误触打断运行中回合）。
            Task 8 占位的「running 即整键禁用」死路径已删——触控端 running 时
-           两个键位至少有一个可点。 -->
+           两个键位至少有一个可点。
+           steerBlocked 时停止键整体隐藏：claude_/codex_ 壳无 stop 目标，点了
+           静默无帧（同插话阻断根因），blocked 提示条已说明处境——占住键位只会
+           制造「可点但无效」的死按钮。 -->
       <button
-        v-if="running && (!hasInput || approvalBlocked)"
+        v-if="running && (!hasInput || approvalBlocked) && !steerBlocked"
         type="button"
         data-testid="chat-stop-button"
         class="min-h-[40px] flex shrink-0 items-center gap-1 rounded-lg bg-slate-200 px-4 text-sm font-semibold text-slate-500 transition hover:bg-slate-300 md:min-h-0 dark:bg-slate-700 dark:text-slate-400 dark:hover:bg-slate-600"

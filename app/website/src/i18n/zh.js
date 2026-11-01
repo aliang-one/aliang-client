@@ -209,7 +209,6 @@ export default {
 
   // -- ChatPage --
   chat_title: 'AI 对话',
-  chat_newConversation: '新建对话',
   chat_emptyTitle: '新对话',
   chat_rename: '重命名',
   chat_renamePlaceholder: '输入对话名称',
@@ -217,7 +216,6 @@ export default {
   chat_send: '发送',
   chat_sending: '发送中...',
   chat_deleteConfirm: '确定删除此对话？',
-  chat_noConversations: '暂无对话',
   chat_startNew: '点击左侧「新建对话」开始',
   chat_today: '今天',
   chat_yesterday: '昨天',
@@ -320,6 +318,12 @@ export default {
   chat_recallCancel: '取消',
   chat_recallStopTimeout: '停止超时，请重试',
   chat_recallUnconfirmed: '撤回未确认，可重试',
+  // 撤回 create 被拒的按成因文案（后端 truncate_* error_code 映射，见
+  // useAliangChat RECALL_CREATE_ERROR_KEYS），与 en.js 成对维护。
+  chat_recallErrActive: '回合仍在运行，请停止后重试',
+  chat_recallErrNoJournal: '撤回不可用：会话记录缺失',
+  chat_recallErrFailed: '撤回失败，可重试',
+  chat_recallErrRebuild: '撤回失败（上下文重建失败），可重试',
   chat_copyMessage: '复制',
   // 方案选择交互卡（Task 14）：ai.option 两步作答交互卡 + 静态围栏卡，与
   // en.js 成对维护（i18n.test.js 守键集）。

@@ -30,7 +30,7 @@
       <div v-if="msg.role === 'user'" class="group relative ml-auto w-fit max-w-[85%]">
         <div class="whitespace-pre-wrap break-words rounded-2xl bg-primary px-4 py-2.5 text-sm text-white shadow-sm">{{ msg.content }}</div>
         <div
-          class="absolute -top-3 right-0 z-10 flex items-center gap-0.5 rounded-lg border border-slate-200 bg-white px-1 py-0.5 opacity-0 shadow-sm transition-opacity group-hover:opacity-100 dark:border-slate-700 dark:bg-slate-800"
+          class="absolute -top-3 right-0 z-10 flex items-center gap-0.5 rounded-lg border border-slate-200 bg-white px-1 py-0.5 opacity-100 shadow-sm transition-opacity md:opacity-0 md:group-hover:opacity-100 dark:border-slate-700 dark:bg-slate-800"
         >
           <button
             type="button"

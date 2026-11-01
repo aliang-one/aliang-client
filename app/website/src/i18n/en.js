@@ -209,7 +209,6 @@ export default {
 
   // -- ChatPage --
   chat_title: 'AI Chat',
-  chat_newConversation: 'New Chat',
   chat_emptyTitle: 'New Chat',
   chat_rename: 'Rename',
   chat_renamePlaceholder: 'Enter a conversation name',
@@ -217,7 +216,6 @@ export default {
   chat_send: 'Send',
   chat_sending: 'Sending...',
   chat_deleteConfirm: 'Delete this conversation?',
-  chat_noConversations: 'No conversations',
   chat_startNew: 'Click "New Chat" to start',
   chat_today: 'Today',
   chat_yesterday: 'Yesterday',
@@ -323,6 +321,12 @@ export default {
   chat_recallCancel: 'Cancel',
   chat_recallStopTimeout: 'Stop timed out. Please retry.',
   chat_recallUnconfirmed: 'Recall not confirmed. You can retry.',
+  // Recall create rejected: per-cause copy mapped from backend truncate_*
+  // error_code (see useAliangChat RECALL_CREATE_ERROR_KEYS). Paired with zh.js.
+  chat_recallErrActive: 'Turn still running. Stop it and retry.',
+  chat_recallErrNoJournal: 'Recall unavailable: session journal missing.',
+  chat_recallErrFailed: 'Recall failed. You can retry.',
+  chat_recallErrRebuild: 'Recall failed (context rebuild). You can retry.',
   chat_copyMessage: 'Copy',
   // Structured option card (Task 14): ai.option two-step interactive card +
   // static fence card. Paired with zh.js (i18n.test.js key-set guard).

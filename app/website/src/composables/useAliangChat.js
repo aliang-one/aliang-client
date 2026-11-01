@@ -444,23 +444,25 @@ export function useAliangChat() {
 
   // create 确认门：sendMessage 发出 create 后等回执再发 ai.message——目录无效
   // 时服务端拒绝建会话，绝不能让消息经 ai.message 的 lazy-create 落到 home 跑。
-  // 回执来源：ai.session.created → 'created'；create 期 ai.error（无 message_id）
-  // → 'error'（错误文本已由该分支渲染）；超时 → 'timeout'（socket 死亡等）。
+  // 回执来源：ai.session.created → {status:'created'}；create 期 ai.error（无
+  // message_id）→ {status:'error', errorCode}（错误文本已由该分支渲染，errorCode
+  // 透传帧上 e.error_code——后端 agentAIErrorPayload 对带码拒绝才落该字段）；
+  // 超时/socket 死 → {status:'timeout'}（无 errorCode）。
   // payloadFn（Task 13，可选）：发出什么载荷由调用方决定——常规路径缺省
   // sessionCreatePayload(conv)，撤回路径传 recallCreatePayload 工厂（铁律：
   // 载荷必须真的经 sendAI 上帧，故工厂在发送点求值而非提前构造）。
-  const pendingCreates = new Map(); // session_id -> settle(status)
+  const pendingCreates = new Map(); // session_id -> settle(status, errorCode)
 
   function waitForCreateAck(conv, timeoutMs = 5000, payloadFn = null) {
     return new Promise((resolve) => {
       const sid = conv.aiSessionId;
       let done = false;
-      const settle = (status) => {
+      const settle = (status, errorCode) => {
         if (done) return;
         done = true;
         pendingCreates.delete(sid);
         clearTimeout(timer);
-        resolve(status);
+        resolve({ status, errorCode });
       };
       const timer = setTimeout(() => settle('timeout'), timeoutMs);
       pendingCreates.set(sid, settle);
@@ -1465,6 +1467,17 @@ export function useAliangChat() {
   // 恢复）；recalling 由 finally 链尾复位（C1：成功路径曾漏复位，首次撤回后
   // startRecall 守卫使入口永久哑火）。
   const RECALL_CREATE_ACK_MS = 5000;
+  // 撤回 create 被拒的 error_code → 专属文案键：后端 ai.session.create truncate
+  // 四成因（agent_ai.go truncateErrCode*，经 agentAIErrorPayload 的 ErrorCode()
+  // 落帧 error_code），句柄是英文技术语，直译给用户没有行动指向——按成因映射
+  // 成可操作的中文/英文文案；未知/缺 code（含 timeout，无帧）回落
+  // chat_recallUnconfirmed 的「未确认可重试」。
+  const RECALL_CREATE_ERROR_KEYS = {
+    truncate_run_active: 'chat_recallErrActive',
+    truncate_journal_unavailable: 'chat_recallErrNoJournal',
+    truncate_failed: 'chat_recallErrFailed',
+    truncate_rebuild_failed: 'chat_recallErrRebuild',
+  };
   const recalling = ref(false);
 
   async function sendRecall(conv) {
@@ -1540,8 +1553,8 @@ export function useAliangChat() {
         sending.value = false;
         return;
       }
-      if (ack !== 'created') {
-        createError.value = t('chat_recallUnconfirmed');
+      if (ack.status !== 'created') {
+        createError.value = t(RECALL_CREATE_ERROR_KEYS[ack.errorCode] || 'chat_recallUnconfirmed');
         sending.value = false; // recalling 复位归 finally
         return; // 编辑态保留；truncate 幂等，原样重试安全
       }
@@ -1916,7 +1929,9 @@ export function useAliangChat() {
           // 不可作条件——sendMessage 在发 create 前已推入占位气泡。
           if (matchedById && conv.id === activeId.value) createError.value = e.error || t('chat_createFailed');
           const pending = pendingCreates.get(e.session_id);
-          if (pending) pending('error');
+          // error_code 随结算透传给确认门调用方（撤回链据此映射专属文案；
+          // 帧是整体 parsed JSON，字段天然可达，无需另行解包）。
+          if (pending) pending('error', e.error_code);
           saveToStorage();
           return;
         }
@@ -1995,7 +2010,7 @@ export function useAliangChat() {
       await ensureAISocket();
       createError.value = '';
       const ack = await waitForCreateAck(conv);
-      if (ack !== 'created') {
+      if (ack.status !== 'created') {
         // create 被拒或无回执：内联错误已由 ai.error 分支渲染（timeout 无帧，
         // 这里兜底提示）；撤掉空占位气泡防空转；不发 ai.message。
         const asst = findRunningAssistant(conv);
