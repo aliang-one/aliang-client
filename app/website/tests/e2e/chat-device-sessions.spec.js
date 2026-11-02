@@ -385,3 +385,22 @@ test('ai.run.notice resume_missing：提示条可见，不阻断输入', async (
   await expect(page.getByTestId('chat-run-notice')).toHaveText(/原生会话不存在|Native session not found/);
   await expect(input).toBeEnabled(); // 信息性帧不锁输入
 });
+
+test('ai.run.notice tool_timeout：工具超时提示条可见，不阻断输入', async ({ page }) => {
+  await openChat(page);
+  const input = page.getByPlaceholder(/输入消息|Type a message/);
+  await input.fill('第一句');
+  await page.keyboard.press('Enter');
+  await expect.poll(async () => page.evaluate(() =>
+    window.__aiFrames.some(f => f.type === 'ai.session.create')
+  )).toBe(true);
+  const sid = await page.evaluate(() =>
+    window.__aiFrames.find(f => f.type === 'ai.session.create').session_id
+  );
+  // 工具超时是用户需要知道的事件（2026-11-01：一条命令卡 1h58m 用户全程无提示）
+  await pushFrame(page, {
+    type: 'ai.run.notice', session_id: sid, message_id: 'm-1', code: 'tool_timeout', detail: 'Bash',
+  });
+  await expect(page.getByTestId('chat-run-notice')).toHaveText(/工具执行超时|A tool timed out/);
+  await expect(input).toBeEnabled(); // 信息性帧不锁输入
+});

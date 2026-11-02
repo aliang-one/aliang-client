@@ -928,7 +928,14 @@ func (p *agentCoreShellPolicy) Resolve(kind string) (string, []string, error) {
 
 // Allow 判定命令是否在 goal 的 allowed_commands 白名单内。
 // 白名单为空 = 不强制（与 goalScopeAllowsToolCall 的语义一致）。
+//
+// 白名单之前先过「家目录根遍历」硬拦：这类命令（find ~、ls ~/*/*x）会扫进
+// macOS 隐私库、弹无人应答的授权框并把工具卡死（2026-11-01 事故）。与其先让
+// 用户批一张卡、批准后再撞墙，不如直接回一句可执行的改道建议。
 func (p *agentCoreShellPolicy) Allow(command string) (bool, string) {
+	if reason := homeRootTraversalReason(command); reason != "" {
+		return false, reason
+	}
 	return agentCoreCommandAllowed(p.run.goalAllowedCommands, command)
 }
 
@@ -1418,7 +1425,7 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		// 经 newAgentCoreEmit 包装：ctx 取消时关写端解除阻塞，僵尸写侧不再
 		// 挂死消费侧（AI run 韧性 L2）。
 		Emit:  emitFrame,
-		Hooks: agentCoreLoopHooks(m, run, diag),
+		Hooks: agentCoreLoopHooks(m, run, diag, writeJSON),
 	}
 
 	result, runErr := agentcore.Run(ctx, cfg, messages)
@@ -1561,6 +1568,28 @@ type agentCoreDiagnostics struct {
 	// journal 单一真源门的依据——有带正文回合即意味着 turn 行已覆盖该 run
 	// 的 assistant 内容,-partial/run 级累计行都只会成为重复表示。
 	textTurns int
+	// toolTimeoutNotified 是本 run 已提示过超时的工具名集合。模型超时后重试
+	// 同一命令很常见，每条都发一次 ai.run.notice 会把提示条刷成噪音、淹没真正
+	// 的信号；同一工具每 run 只提示一次。nil 接收者安全。
+	toolTimeoutNotified map[string]struct{}
+}
+
+// markToolTimeoutNotified 报告「这个工具的超时提示是否该发」：首次返回 true，
+// 之后同 run 同工具返回 false。nil 接收者按「不提示」处理（测试路径）。
+func (d *agentCoreDiagnostics) markToolTimeoutNotified(tool string) bool {
+	if d == nil {
+		return false
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.toolTimeoutNotified == nil {
+		d.toolTimeoutNotified = make(map[string]struct{}, 4)
+	}
+	if _, seen := d.toolTimeoutNotified[tool]; seen {
+		return false
+	}
+	d.toolTimeoutNotified[tool] = struct{}{}
+	return true
 }
 
 // noteTextTurn 记录一个带正文回合完成(OnTurnEnd 且 text 非空)。
@@ -1654,7 +1683,32 @@ func (d *agentCoreDiagnostics) endReason() string {
 // 生效——子 run 内置工具的轨迹由 agentCoreJournalToolDecorator 装饰器落行，
 // 不经这里。
 // diag 可为 nil（测试路径）：OnTurn 的 set 对 nil 接收者直接短路。
-func agentCoreLoopHooks(m *agentAIManager, run agentAIRun, diag *agentCoreDiagnostics) agentcore.LoopHooks {
+// emitAgentCoreToolTimeoutNotice 把「工具超时」这件事送到用户眼前。
+//
+// 为什么需要它：工具超时后内核只回模型一句错误，模型通常自己重试下一轮——
+// 用户那边看到的只是「半天没动静」。2026-11-01 事故里那条命令卡了 1 小时 58
+// 分，用户全程在手机上等，没有任何提示。这里补一条 ai.run.notice（信息性帧，
+// 不终止回合），网页/手机渲染成系统提示条。
+//
+// 去重：同一 run 内同一工具只提示一次。模型重试同一命令很常见，每条都弹一遍
+// 会把提示条刷成噪音，反而淹没真正的信号。
+func emitAgentCoreToolTimeoutNotice(writeJSON agentTerminalWriter, run agentAIRun, diag *agentCoreDiagnostics, toolName string) {
+	if writeJSON == nil {
+		return
+	}
+	if !diag.markToolTimeoutNotified(toolName) {
+		return
+	}
+	_ = writeJSON(map[string]interface{}{
+		"type":       models.AgentEventAIRunNotice,
+		"session_id": run.sessionID,
+		"message_id": agentAssistantMessageID(run.messageID),
+		"code":       "tool_timeout",
+		"detail":     toolName,
+	})
+}
+
+func agentCoreLoopHooks(m *agentAIManager, run agentAIRun, diag *agentCoreDiagnostics, writeJSON agentTerminalWriter) agentcore.LoopHooks {
 	// 本回合自动压缩序号（journal 去重键用；每回合独立计数）。
 	autoCompactSeq := 0
 	// 逐回合 transcript 落 journal 的回合序号（run 内 1 起）。
@@ -1711,6 +1765,14 @@ func agentCoreLoopHooks(m *agentAIManager, run agentAIRun, diag *agentCoreDiagno
 		// reserved），所以按内置名集过滤恰好不重不漏：内置工具记一次，
 		// 桥接工具保持各自原有一行，不会双记。
 		OnToolCall: func(name string, input map[string]interface{}, res agentcore.ToolResult) {
+			// 超时是**用户需要知道**的事件，不只是模型需要知道：用户可能正
+			// 在手机上干等，而工具超时后模型只会自己看到一句错误然后继续重试。
+			// 走 ai.run.notice（信息性帧，不终止回合），手机/网页会渲染成一条
+			// 系统提示条。放在内置工具判定之前——MCP/子 agent 桥工具超时同样
+			// 值得让用户看到。
+			if res.TimedOut {
+				emitAgentCoreToolTimeoutNotice(writeJSON, run, diag, name)
+			}
 			if !agentCoreKernelBuiltinTools[name] {
 				return
 			}

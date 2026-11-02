@@ -34,6 +34,12 @@ type ToolResult struct {
 	Images []ContentBlock
 	// IsError 为 true 时以 is_error 回填，模型会据此自行纠错。
 	IsError bool
+	// TimedOut 表示这次失败是**超时终止**（而不是普通报错）。
+	//
+	// 单独一个字段而不是让宿主去匹配文案：超时是需要让用户知道的事件——
+	// 用户可能在手机上干等，而模型只是自己看到一句错误继续重试。宿主据此
+	// 发 ai.run.notice，把「工具超时了」这件事送到用户眼前。
+	TimedOut bool
 }
 
 // ContentForModel 返回回填给模型的 tool_result content。

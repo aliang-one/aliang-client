@@ -435,7 +435,7 @@ func TestAgentCoreLoopHooksFollowUpDrainsSameQueue(t *testing.T) {
 	control := newAgentAICoreSteerControl(run, log.write)
 	m.attachCoreSteer(run.sessionID, run.runSeq, control)
 
-	hooks := agentCoreLoopHooks(m, run, nil)
+	hooks := agentCoreLoopHooks(m, run, nil, nil)
 
 	if _, err := control.deliver(agentAISteerMessage{
 		MessageID: "tail-steer",

@@ -295,6 +295,7 @@ export default {
   chat_approvalBlockHint: '有待审批请求，请先处理后再发送',
   chat_noticeResumeMissing: '原生会话不存在，已按新会话继续',
   chat_noticeHistoryRestoreFailed: '历史恢复失败，已按空会话继续',
+  chat_noticeToolTimeout: '工具执行超时已终止（命令可能扫到了受保护目录或范围过大），请缩小范围后重试',
   chat_approvalCancelled: '审批已被取消',
   chat_approvalCancelledReason: '审批已被取消（{reason}）',
   chat_md_copy: '复制',
