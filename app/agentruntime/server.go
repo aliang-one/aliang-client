@@ -147,6 +147,12 @@ func registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/agent/sessions", agentHandler.HandleVibeSessions)
 	mux.HandleFunc("/api/agent/session", agentHandler.HandleVibeSession)
 	mux.HandleFunc("/api/agent/scan-directories", agentHandler.HandleScanDirectories)
+	// 文件访问授权：探测必须在本 runtime 内执行（tccguard 的 grant 按可执行
+	// 文件 stamp 记录，在 core 里探测等于给另一个进程记授权）。核心侧 routes.go
+	// 同名注册透传，缺任一侧=404（双注册教训，2026-10-21 实测）。
+	mux.HandleFunc("/api/agent/file-access", agentHandler.HandleFileAccess)
+	mux.HandleFunc("/api/agent/file-access/request", agentHandler.HandleFileAccessRequest)
+	mux.HandleFunc("/api/agent/file-access/settings", agentHandler.HandleFileAccessSettings)
 	// MCP 与技能只读报告：核心侧 routes.go 同名注册透传（双注册教训同上）。
 	mux.HandleFunc("/api/agent/integrations", agentHandler.HandleAgentIntegrations)
 	// 仪表盘数据面端点：核心进程会把这两个请求代理到本 runtime，缺注册会让

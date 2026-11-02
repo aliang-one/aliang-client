@@ -573,6 +573,57 @@ func (h *AgentHandler) HandleScanDirectories(w http.ResponseWriter, r *http.Requ
 	}
 }
 
+// HandleFileAccess GET 读取「文件访问授权」状态快照。
+//
+// 必须经 proxyIfNeeded 落到 user-agent 进程：tccguard 的 grant 以可执行文件的
+// stamp 为键，在 core（root LaunchDaemon）里探测写下的授权，与真正执行工具的
+// agent 进程对不上，用户会看到「已授权」但下次照样卡死。
+func (h *AgentHandler) HandleFileAccess(w http.ResponseWriter, r *http.Request) {
+	if h.proxyIfNeeded(w, r) {
+		return
+	}
+	if r.Method != http.MethodGet {
+		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
+		return
+	}
+	common.Success(w, services.GetSharedAgentFileAccessService().Snapshot())
+}
+
+// HandleFileAccessRequest POST 启动一次授权 sweep（立即返回，不阻塞等弹窗）。
+func (h *AgentHandler) HandleFileAccessRequest(w http.ResponseWriter, r *http.Request) {
+	if h.proxyIfNeeded(w, r) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
+		return
+	}
+	snap, started := services.GetSharedAgentFileAccessService().Start()
+	common.Success(w, map[string]interface{}{"started": started, "snapshot": snap})
+}
+
+// HandleFileAccessSettings POST 打开 macOS 系统设置的隐私面板。
+//
+// 完全磁盘访问权限（FDA）无法程序化申请，只能把用户送到面板前自己勾选。
+func (h *AgentHandler) HandleFileAccessSettings(w http.ResponseWriter, r *http.Request) {
+	if h.proxyIfNeeded(w, r) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
+		return
+	}
+	var req struct {
+		Pane string `json:"pane"`
+	}
+	_ = json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req)
+	if err := services.OpenFileAccessSystemSettings(req.Pane); err != nil {
+		common.ErrorInternalServer(w, "Failed to open System Settings", map[string]interface{}{"error": err.Error()})
+		return
+	}
+	common.Success(w, map[string]interface{}{"opened": true})
+}
+
 func (h *AgentHandler) proxyIfNeeded(w http.ResponseWriter, r *http.Request) bool {
 	if services.IsUserAgentRuntime() {
 		return false

@@ -90,6 +90,24 @@ export async function setAgentScanDirectories({ enabled, directories }) {
   });
 }
 
+// --- 文件访问授权（一次性预先授权 macOS 隐私目录） ---
+
+export async function getAgentFileAccess() {
+  return request('/api/agent/file-access', { method: 'GET' });
+}
+
+export async function requestAgentFileAccess() {
+  return request('/api/agent/file-access/request', { method: 'POST' });
+}
+
+// pane: 'files'（文件与文件夹）| 'allfiles'（完全磁盘访问权限）
+export async function openAgentFileAccessSettings(pane = 'files') {
+  return request('/api/agent/file-access/settings', {
+    method: 'POST',
+    body: JSON.stringify({ pane }),
+  });
+}
+
 export async function getAgentTerminalScrollback(sessionId, { limit } = {}) {
   const params = new URLSearchParams();
   if (limit) params.set('limit', String(limit));
