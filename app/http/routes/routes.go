@@ -287,6 +287,11 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	register("GET /api/agent/terminal/{sessionId}/scrollback", h.Agent.HandleTerminalScrollback, http.MethodGet)
 	register("/api/agent/session", h.Agent.HandleVibeSession, http.MethodGet)
 	register("/api/agent/scan-directories", h.Agent.HandleScanDirectories, http.MethodGet, http.MethodPost)
+	// 文件访问授权（一次性预先授权 macOS 隐私目录）：核心侧透传到 user agent
+	// runtime，探测必须在那里发生（grant 按可执行文件 stamp 记录，双注册教训同上）。
+	register("/api/agent/file-access", h.Agent.HandleFileAccess, http.MethodGet)
+	register("/api/agent/file-access/request", h.Agent.HandleFileAccessRequest, http.MethodPost)
+	register("/api/agent/file-access/settings", h.Agent.HandleFileAccessSettings, http.MethodPost)
 	// MCP 与技能只读报告（设备侧清单 + 内核生效态）。
 	register("/api/agent/integrations", h.Agent.HandleAgentIntegrations, http.MethodGet)
 	register("/api/docs/tutorials", h.Tutorial.HandleGetTutorial, http.MethodGet)

@@ -237,6 +237,9 @@
           </div>
           <template v-else>
             <AgentSettings />
+            <!-- 文件访问授权：一次性预先授权 macOS 隐私目录，避免远程调用时
+                 弹窗无人应答把工具卡死（2026-11-01 事故）。 -->
+            <AgentFileAccessSettings />
             <SystemSettings />
             <RulesSettings
               :config="customerConfig"
@@ -317,6 +320,7 @@ import AgentSettings from './settings/AgentSettings.vue';
 import AgentRuntimeSessions from './settings/AgentRuntimeSessions.vue';
 import AgentActivitySettings from './settings/AgentActivitySettings.vue';
 import AgentScanDirectoriesSettings from './settings/AgentScanDirectoriesSettings.vue';
+import AgentFileAccessSettings from './settings/AgentFileAccessSettings.vue';
 import AgentIntegrationsSettings from './settings/AgentIntegrationsSettings.vue';
 import ModelMappingSettings from './settings/ModelMappingSettings.vue';
 import CustomEnvSettings from './settings/CustomEnvSettings.vue';
@@ -514,6 +518,7 @@ export default {
     AgentRuntimeSessions,
     AgentActivitySettings,
     AgentScanDirectoriesSettings,
+    AgentFileAccessSettings,
     AgentIntegrationsSettings,
     ModelMappingSettings,
     CustomEnvSettings,

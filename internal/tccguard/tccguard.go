@@ -436,9 +436,25 @@ var errNothingToProbe = errors.New("tccguard: protected category root is absent"
 // eventually answers the prompt.
 var errProbeTimeout = errors.New("tccguard: consent probe timed out")
 
+// probeResult 是一次探测的完整结果。
+//
+// absent 单独一个字段而不是把 errNothingToProbe 一路往外传：GuardPath 的既有
+// 语义是「目录不存在 = 无需授权 = 放行」，这个不能变；而「立即授权」功能需要
+// 把「这个目录根本不存在」如实告诉用户（不能显示成「已授权」）。用返回值承载
+// 两者，两条调用方各取所需，谁也不用猜。
+type probeResult struct {
+	err    error
+	absent bool
+}
+
 type probeFlight struct {
 	done chan struct{}
-	err  error
+	res  probeResult
+	// createdAt 用于判定「陈旧 flight」。一次探测如果卡在没人应答的系统弹窗上，
+	// 它的 goroutine 会一直留在 flights map 里直到 syscall 真正返回；后续调用
+	// join 到它只会陪着一起等（表现为「点了立即授权又卡一次」）。超过
+	// staleProbeFlightAge 的 flight 允许被丢弃重建。
+	createdAt time.Time
 }
 
 var (
@@ -451,16 +467,27 @@ var (
 // timeout never leaves a goroutine leak on the caller's path — and so a grant
 // answered late is still recorded.
 func probeCategory(key, root string) error {
+	return probeCategoryResult(key, root).err
+}
+
+// probeCategoryResult 与 probeCategory 同源，但额外把「目录不存在」暴露出来。
+func probeCategoryResult(key, root string) probeResult {
 	flightsMu.Lock()
 	flight, exists := flights[key]
+	if exists && !flight.createdAt.IsZero() && time.Since(flight.createdAt) > staleProbeFlightAge() {
+		// 陈旧 flight：丢弃并重建，避免后续调用陪着一起等一个早就没人应答的弹窗。
+		// 旧 goroutine 仍会跑完（并在完成时按自己的 flight 指针写结果，不会污染
+		// 新 flight）。
+		exists = false
+	}
 	if !exists {
-		flight = &probeFlight{done: make(chan struct{})}
+		flight = &probeFlight{done: make(chan struct{}), createdAt: time.Now()}
 		flights[key] = flight
 		probe := probeFn // capture: tests may restore hooks while the probe runs
 		flightsMu.Unlock()
 		go func() {
-			err := runProbe(probe, key, root)
-			flight.err = err
+			res := runProbe(probe, key, root)
+			flight.res = res
 			flightsMu.Lock()
 			delete(flights, key)
 			flightsMu.Unlock()
@@ -477,24 +504,78 @@ func probeCategory(key, root string) error {
 	defer timer.Stop()
 	select {
 	case <-flight.done:
-		return flight.err
+		return flight.res
 	case <-timer.C:
-		return errProbeTimeout
+		return probeResult{err: errProbeTimeout}
 	}
 }
 
-func runProbe(probe func(string) error, key, root string) error {
+// staleProbeFlightAge 是 flight 的保鲜期：超过它就允许重建。
+// 取 2×probeWait —— 正常情况下一个 flight 最多活一个 probeWait，超过两倍还没
+// 结束说明底层卡死了（弹窗没人点），继续 join 只会让后来者陪着一起等。
+func staleProbeFlightAge() time.Duration {
+	wait := probeWait
+	if wait <= 0 {
+		wait = 25 * time.Second
+	}
+	return 2 * wait
+}
+
+// gatedProbePaths 是「macOS 真正 gate 的资源」相对类别根的路径。
+//
+// 音乐与照片不是「文件与文件夹」那四类：系统 gate 的是库本身，读父目录
+// （~/Music、~/Pictures）根本不会申请到 MediaLibrary / Photos 权限。只探测
+// 父目录会得到一个假的「已授权」——用户以为授权了，下次工具真去读库时照样弹窗
+// 卡死。所以对这两类必须在父目录可读之后，再打开真正的库。
+var gatedProbePaths = map[string][]string{
+	"music":    {"Music/Media", "Music"},
+	"pictures": {"Photos Library.photoslibrary", "Photo Library.photoslibrary"},
+}
+
+// probeGatedChild 探测该类别里真正被 gate 的库；没有库则视为无需额外授权。
+func probeGatedChild(key, root string) error {
+	rels, ok := gatedProbePaths[key]
+	if !ok {
+		return nil
+	}
+	for _, rel := range rels {
+		p := filepath.Join(root, filepath.FromSlash(rel))
+		if _, err := os.Lstat(p); err != nil {
+			if os.IsNotExist(err) {
+				continue // 没有这个库，就没有需要额外申请的资源
+			}
+			return err // 连 Lstat 都被拒：这正是要抓的「未授权」
+		}
+		f, err := os.Open(p)
+		if err != nil {
+			return err
+		}
+		_, _ = f.Readdirnames(1) // 触发一次真实读取
+		_ = f.Close()
+		return nil
+	}
+	return nil
+}
+
+func runProbe(probe func(string) error, key, root string) probeResult {
 	err := probe(root)
 	switch {
 	case errors.Is(err, errNothingToProbe):
-		return nil
+		// 目录不存在：GuardPath 视作放行（既有语义），但要标记 absent 供
+		// 「立即授权」如实上报。不写 grant —— 目录将来出现时仍需真实授权。
+		return probeResult{absent: true}
 	case err != nil:
 		rememberProbeFailure(key)
-		return err
+		return probeResult{err: err}
+	}
+	// 父目录可读不等于「被 gate 的库也可读」（见 gatedProbePaths 注释）。
+	if err := probeGatedChild(key, root); err != nil {
+		rememberProbeFailure(key)
+		return probeResult{err: err}
 	}
 	clearProbeFailure(key)
 	recordGrant(key, root)
-	return nil
+	return probeResult{}
 }
 
 // defaultProbe reads the category root itself: opening and listing the
