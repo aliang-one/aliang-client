@@ -1956,9 +1956,23 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 			}
 			m.coreJournal.syncSessionSwitches(sessionID, existing.disabledMCPServers, disabledMCPServersSet, existing.disabledSkills, disabledSkillsSet)
 		}
-		existing.resumeSessionID = resumeSessionID
-		existing.reservedNativeSessionID = reservedNativeSessionID
-		existing.bindingVersion = bindingVersion
+		// 身份三字段空值不覆写已钉值(与 mergeRunStartIdentityLocked 同纪律):
+		// 聊天页每条消息前都重发一次 create 且不带 resume/reserved/binding_version
+		// 键——无条件覆写会把 confirmBinding 上一轮钉下的原生会话 id 抹空,下一
+		// 回合内核拿到空 SessionID 必然重铸(loop.go 空则 newSessionID),
+		// confirmBinding 期望旧 id≠实际新 id 拒整回合,会话从第二回合起轮轮必败
+		// (2026-11-02 新装机 agentcore 实锤)。非空新值(服务端权威改写)照常
+		// 覆盖;撤回 truncate 的 create 刻意不带 resume,同样受益于保留已钉身份。
+		if resumeSessionID != "" {
+			existing.resumeSessionID = resumeSessionID
+		}
+		if reservedNativeSessionID != "" {
+			existing.reservedNativeSessionID = reservedNativeSessionID
+		}
+		if bindingVersion != 0 {
+			existing.bindingVersion = bindingVersion
+		}
+		m.seedConfirmedBindingResumeLocked(existing)
 		existing.initialContext = initialContext
 		existing.isGoalFork = isGoalFork
 		if surface != "" {
@@ -2028,6 +2042,9 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 		history:                 trimAgentAIHistoryWithLimits(history, newHistoryMessages, newHistoryChars),
 		lastActiveAt:            time.Now().UTC(),
 	}
+	// 新建内存会话同样从 confirmed 绑定供种(重启后首回合 create 不带 resume
+	// 键的场景);细节见 seedConfirmedBindingResumeLocked 注释。
+	m.seedConfirmedBindingResumeLocked(session)
 	m.registerAISessionLocked(session)
 	m.mu.Unlock()
 
@@ -2227,6 +2244,9 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 		if existing := m.sessions[sessionID]; existing != nil {
 			session = existing // a concurrent create/message registered it first
 		} else {
+			// 懒建同样从 confirmed 绑定供种:手机/仪表盘的裸 ai.message 在
+			// agent 重启后直达懒建,不带 resume 键(细节见 helper 注释)。
+			m.seedConfirmedBindingResumeLocked(session)
 			m.registerAISessionLocked(session)
 		}
 		m.mu.Unlock()
@@ -2353,6 +2373,27 @@ func mergeRunStartIdentityLocked(session *agentAISession, resumeID, reservedID s
 	if reservedID != "" {
 		session.reservedNativeSessionID = reservedID
 	}
+}
+
+// seedConfirmedBindingResumeLocked 在会话侧 resume 恢复点为空时,从 confirmed
+// 绑定供种(镜像 runStart 的绑定反推分支)。v2 面(create/message 裸走)在
+// agent 重启丢内存后同样要拿回绑定钉下的原生 id,否则内核重新铸造 →
+// confirmBinding mismatch。reserved 绑定不供种(fresh 铸造/预留是它的正当
+// 路径);provider 不同族不供种——跨端污染警报(confirmBinding mismatch)是
+// 2026-10-27/10-29 两轮事故建起来的线,不许在这里被悄悄拆掉。
+// 调用方必须持有 m.mu。
+func (m *agentAIManager) seedConfirmedBindingResumeLocked(session *agentAISession) {
+	if session.resumeSessionID != "" {
+		return
+	}
+	b, ok := m.bindings[session.id]
+	if !ok || b.State != "confirmed" || b.NativeSessionID == "" {
+		return
+	}
+	if !providersEquivalent(session.provider, b.Provider) {
+		return
+	}
+	session.resumeSessionID = b.NativeSessionID
 }
 
 func (m *agentAIManager) runStart(msg map[string]interface{}, writeJSON agentTerminalWriter) {
