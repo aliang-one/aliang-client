@@ -4,6 +4,7 @@ import {
   applyAgentCoreLLMClearing,
   normalizeAgentCoreLLMConfig,
   normalizeAgentCoreTuning,
+  normalizePeerMCPConfig,
   validateAgentCoreLLMConfig,
   validateAgentCoreTuning,
 } from './agentCoreSettings';
@@ -181,5 +182,23 @@ describe('normalizeAgentCoreTuning 全局总闸透传', () => {
     const empty = normalizeAgentCoreTuning(undefined);
     expect('mcp_enabled' in empty).toBe(false);
     expect('skills_enabled' in empty).toBe(false);
+  });
+});
+
+// peer_mcp 归一:布尔透传为线格式 enable;缺键/非对象/非布尔 → undefined
+// (不进 patch 与回显,后端 nil 视为开启——三态与 mcp_enabled 同族)。
+// ⚠️ 还必须在 SettingsPage.normalizeCustomerConfig 挂键,否则「保存 HTTP 200
+// 但永不落盘、刷新恒显默认开」(2026-10-31 验收缺陷①同族)。
+describe('normalizePeerMCPConfig', () => {
+  it('布尔透传为线格式 enable', () => {
+    expect(normalizePeerMCPConfig({ enable: false })).toEqual({ enable: false });
+    expect(normalizePeerMCPConfig({ enable: true })).toEqual({ enable: true });
+  });
+
+  it('缺键/非对象/非布尔 → undefined', () => {
+    expect(normalizePeerMCPConfig(undefined)).toBeUndefined();
+    expect(normalizePeerMCPConfig('x')).toBeUndefined();
+    expect(normalizePeerMCPConfig({})).toBeUndefined();
+    expect(normalizePeerMCPConfig({ enable: 'yes' })).toBeUndefined();
   });
 });

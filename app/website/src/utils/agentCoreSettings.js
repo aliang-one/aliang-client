@@ -113,6 +113,18 @@ export function normalizeAgentCoreTuning(source) {
   };
 }
 
+// ---- customer.peer_mcp(aliang-peer 跨设备工具面总开关) ----
+// 三态与 mcp_enabled 同族:布尔显式落盘;缺键/非布尔 → undefined(不进
+// patch,后端 nil 视为开启)。⚠️ 必须在 SettingsPage.normalizeCustomerConfig
+// 挂键,否则「保存 HTTP 200 但永不落盘」(2026-10-31 验收缺陷①同族)。
+export function normalizePeerMCPConfig(source) {
+  if (source && typeof source === 'object' && !Array.isArray(source)
+    && typeof source.enable === 'boolean') {
+    return { enable: source.enable };
+  }
+  return undefined;
+}
+
 // 表单值('' 或数字字符串)→ 校验。返回 ''(合法)或 i18n 键。空串与 0 都是
 // 「用默认」,合法;正整数上限 50 与后端 Validate 对齐。
 export function validateAgentCoreTuning(maxTurns) {

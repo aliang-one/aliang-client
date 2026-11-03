@@ -90,6 +90,18 @@ export async function setAgentScanDirectories({ enabled, directories }) {
   });
 }
 
+// aliang-peer 跨设备 MCP:GET 注册状态 / POST 应用注册(runtime 执行)。
+export async function getPeerMCPStatus() {
+  return request('/api/agent/peer/mcp', { method: 'GET' });
+}
+
+export async function setPeerMCPRegistration(enable) {
+  return request('/api/agent/peer/mcp', {
+    method: 'POST',
+    body: JSON.stringify({ enable }),
+  });
+}
+
 // --- 文件访问授权（一次性预先授权 macOS 隐私目录） ---
 
 export async function getAgentFileAccess() {

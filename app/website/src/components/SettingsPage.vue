@@ -208,6 +208,14 @@
                 :success-message="customerConfigSuccess"
                 @save="saveCustomerConfig"
               />
+              <PeerMCPSettings
+                :config="customerConfig"
+                :loading="isLoadingCustomerConfig"
+                :saving="isSavingCustomerConfig"
+                :error="customerConfigError"
+                :success-message="customerConfigSuccess"
+                @save="saveCustomerConfig"
+              />
             </div>
             <AgentIntegrationsSettings />
             <CustomEnvSettings
@@ -328,8 +336,9 @@ import AgentCoreSettings from './settings/AgentCoreSettings.vue';
 import AppearanceSettings from './settings/AppearanceSettings.vue';
 import AgentMCPGlobalSettings from './settings/AgentMCPGlobalSettings.vue';
 import AgentSkillsGlobalSettings from './settings/AgentSkillsGlobalSettings.vue';
+import PeerMCPSettings from './settings/PeerMCPSettings.vue';
 import SectionHeader from './settings/SectionHeader.vue';
-import { normalizeAgentCoreLLMConfig, applyAgentCoreLLMClearing, normalizeAgentCoreTuning } from '../utils/agentCoreSettings';
+import { normalizeAgentCoreLLMConfig, applyAgentCoreLLMClearing, normalizeAgentCoreTuning, normalizePeerMCPConfig } from '../utils/agentCoreSettings';
 import { useNavigation } from '../composables/useNavigation';
 import { openTutorialDocs } from '../composables/useTutorialDocs';
 import { useAuthStore } from '../stores/auth';
@@ -424,6 +433,9 @@ function normalizeCustomEnvVarsConfig(payload = {}) {
 
 function normalizeCustomerConfig(payload = {}) {
   const defaults = createDefaultCustomerConfig();
+  // 三态布尔:显式布尔才产出 peer_mcp 键(缺键/非布尔不进 patch 与回显,
+  // 后端 nil 视为开启)。漏挂此键 = 保存 200 但永不落盘(验收缺陷①同族)。
+  const peerMcp = normalizePeerMCPConfig(payload?.peer_mcp);
   return {
     proxy: {
       enable: typeof payload?.proxy?.enable === 'boolean' ? payload.proxy.enable : defaults.proxy.enable,
@@ -437,7 +449,8 @@ function normalizeCustomerConfig(payload = {}) {
     model_mapping: normalizeModelMappingConfig(payload?.model_mapping),
     custom_env_vars: normalizeCustomEnvVarsConfig(payload?.custom_env_vars),
     agentcore_llm: normalizeAgentCoreLLMConfig(payload?.agentcore_llm),
-    agentcore: normalizeAgentCoreTuning(payload?.agentcore)
+    agentcore: normalizeAgentCoreTuning(payload?.agentcore),
+    ...(peerMcp ? { peer_mcp: peerMcp } : {})
   };
 }
 
@@ -526,6 +539,7 @@ export default {
     AppearanceSettings,
     AgentMCPGlobalSettings,
     AgentSkillsGlobalSettings,
+    PeerMCPSettings,
     SectionHeader
   },
   setup() {
