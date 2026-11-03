@@ -129,6 +129,7 @@ func TestAgentTransferGate(t *testing.T) {
 		{models.AgentEventTransferUpload, true},
 		{models.AgentEventTransferReceive, true},
 		{models.AgentEventTransferCancel, false}, // D14：豁免（照 file.upload.cancel 先例）
+		{models.AgentEventFileWrite, true},       // D3:写侧必须同列 enabled-device 门禁
 	}
 	for _, tc := range cases {
 		if got := remoteAgentMessageRequiresEnabledDevice(tc.msgType); got != tc.want {
@@ -195,5 +196,126 @@ func TestAgentTransferDispatchArmsWireUp(t *testing.T) {
 		if m["type"] == models.AgentEventError {
 			t.Fatalf("transfer.cancel on a disabled device must not be rejected, got %v", m)
 		}
+	}
+}
+
+// D2(spec 2026-11-02):transfer.receive 实际携带 direct_candidates
+// (agent_transfer_receive.go 经 parseAgentLanDirectCandidates 实读该键),
+// 契约表漏登记=「实读键 vs 登记」先例复发。对齐 transfer.result 已登记
+// via/lan_fail_stage 的先例。
+func TestAgentTransferReceiveDirectCandidatesRegistered(t *testing.T) {
+	contract := models.DefaultAgentProtocolContract()
+	var rcv *models.AgentProtocolEvent
+	for i := range contract.WebSocket.ServerSends {
+		if contract.WebSocket.ServerSends[i].Type == models.AgentEventTransferReceive {
+			rcv = &contract.WebSocket.ServerSends[i]
+			break
+		}
+	}
+	if rcv == nil {
+		t.Fatal("transfer.receive missing from ServerSends")
+	}
+	hasCandidates := false
+	for _, f := range rcv.Optional {
+		if f == "direct_candidates" {
+			hasCandidates = true
+		}
+	}
+	if !hasCandidates {
+		t.Fatalf("transfer.receive Optional must include direct_candidates, got %v", rcv.Optional)
+	}
+}
+
+// D3(spec 2026-11-02):file.write 帧族「四点齐」——常量/契约条目/Emits/
+// 门禁(门禁已由 remoteAgentMessageRequiresEnabledDevice 接线,见 TestAgentTransferGate 的 D3 行)。
+func TestAgentFileWriteContractEntriesRegistered(t *testing.T) {
+	contract := models.DefaultAgentProtocolContract()
+
+	// 局部 helper(照 TestAgentTransferContractEntriesRegistered 的闭包风格;
+	// 那两个是函数内闭包,跨测试不可引用)
+	find := func(events []models.AgentProtocolEvent, typ string) *models.AgentProtocolEvent {
+		for i := range events {
+			if events[i].Type == typ {
+				return &events[i]
+			}
+		}
+		return nil
+	}
+	requireField := func(t *testing.T, ev *models.AgentProtocolEvent, field string) {
+		t.Helper()
+		for _, f := range ev.Required {
+			if f == field {
+				return
+			}
+		}
+		t.Fatalf("%s contract missing required field %q (Required=%v)", ev.Type, field, ev.Required)
+	}
+
+	if models.AgentEventFileWrite != "file.write" || models.AgentEventFileWriteResult != "file.write.result" {
+		t.Fatalf("file.write 常量漂移: got %q/%q want %q/%q",
+			models.AgentEventFileWrite, models.AgentEventFileWriteResult, "file.write", "file.write.result")
+	}
+
+	up := find(contract.WebSocket.ServerSends, models.AgentEventFileWrite)
+	if up == nil {
+		t.Fatal("file.write missing from ServerSends")
+	}
+	for _, field := range []string{"type", "request_id", "project_path", "path", "content"} {
+		requireField(t, up, field)
+	}
+	hasEmits := false
+	for _, e := range up.Emits {
+		if e == models.AgentEventFileWriteResult {
+			hasEmits = true
+		}
+	}
+	if !hasEmits {
+		t.Fatalf("file.write Emits must include file.write.result, got %v", up.Emits)
+	}
+
+	// 断言盲区 B:Optional 成员性与 file.error 发出帧也钉住
+	for _, f := range []string{"encoding", "expected_sha256"} {
+		has := false
+		for _, o := range up.Optional {
+			if o == f {
+				has = true
+			}
+		}
+		if !has {
+			t.Fatalf("file.write Optional must include %q, got %v", f, up.Optional)
+		}
+	}
+	hasErrEmit := false
+	for _, e := range up.Emits {
+		if e == models.AgentEventFileError {
+			hasErrEmit = true
+		}
+	}
+	if !hasErrEmit {
+		t.Fatalf("file.write Emits must include file.error, got %v", up.Emits)
+	}
+
+	res := find(contract.WebSocket.ClientSends, models.AgentEventFileWriteResult)
+	if res == nil {
+		t.Fatal("file.write.result missing from ClientSends")
+	}
+	requireField(t, res, "ok")
+	// 断言盲区 C:type/request_id 也是必填(信封字段与业务字段一并钉)
+	requireField(t, res, "type")
+	requireField(t, res, "request_id")
+
+	// D3+D4 同批:file.error 必须登记 error_code(错误码全集走此帧)
+	fe := find(contract.WebSocket.ClientSends, models.AgentEventFileError)
+	if fe == nil {
+		t.Fatal("file.error missing from ClientSends")
+	}
+	hasCode := false
+	for _, f := range fe.Optional {
+		if f == "error_code" {
+			hasCode = true
+		}
+	}
+	if !hasCode {
+		t.Fatalf("file.error Optional must include error_code, got %v", fe.Optional)
 	}
 }

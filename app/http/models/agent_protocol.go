@@ -89,6 +89,8 @@ const (
 	AgentEventFileUploadProgress      = "file.upload.progress"
 	AgentEventFileUploadResult        = "file.upload.result"
 	AgentEventFileUploadCancel        = "file.upload.cancel"
+	AgentEventFileWrite               = "file.write"        // server→agent: 手机端原生远程编辑(内联 content,原子写)
+	AgentEventFileWriteResult         = "file.write.result" // agent→server: file.write 终态(ok/size_bytes/sha256)
 	AgentEventTransferUpload          = "transfer.upload"   // server→agent: 源设备按分块计划打包直传 COS（同账号设备互传）
 	AgentEventTransferProgress        = "transfer.progress" // agent→server: 收/发双向进度（direction 区分），节流 5%/1s
 	AgentEventTransferResult          = "transfer.result"   // agent→server: 单次传输的终态帧；业务键是 transfer_id，request_id 缺失/陈旧也必须被应用
@@ -278,7 +280,8 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				{Type: AgentEventSlashCommandsListResult, Required: []string{"type", "request_id", "project_path", "commands"}, Optional: []string{"generated_at", "verified", "claude_version", "capability_generation"}},
 				{Type: AgentEventToolsListResult, Required: []string{"type", "request_id"}, Optional: []string{"rev", "tools", "generated_at"}},
 				{Type: AgentEventSlashCommandsListError, Required: []string{"type", "request_id", "error"}},
-				{Type: AgentEventFileError, Required: []string{"type", "request_id", "error"}},
+				{Type: AgentEventFileError, Required: []string{"type", "request_id", "error"}, Optional: []string{"error_code"}},
+				{Type: AgentEventFileWriteResult, Required: []string{"type", "request_id", "ok"}, Optional: []string{"path", "size_bytes", "sha256"}},
 				{Type: AgentEventError, Required: []string{"type", "error"}},
 				{Type: AgentEventAIRenameAck, Required: []string{"type", "session_id", "accepted"}, Optional: []string{"title_updated_at", "error"}},
 				{Type: AgentEventAIOptionRequest, Required: []string{"type", "session_id", "option_id", "options", "run_id", "event_seq"}, Optional: []string{"message_id", "title", "header", "summary", "v", "allow_custom", "multi", "provider"}},
@@ -328,11 +331,15 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				{Type: AgentEventFileRead, Required: []string{"type", "request_id", "project_path", "path"}, Optional: []string{"max_bytes"}, Emits: []string{AgentEventFileReadResult, AgentEventFileError}},
 				{Type: AgentEventFileUpload, Required: []string{"type", "request_id", "project_path", "path", "upload_url", "max_bytes"}, Emits: []string{AgentEventFileUploadProgress, AgentEventFileUploadResult, AgentEventFileError}},
 				{Type: AgentEventFileUploadCancel, Required: []string{"type", "request_id"}},
+				// 手机端原生远程编辑(spec 2026-11-02 §D3):内联 content 回写,
+				// 512KiB 上限与 file.read 对称;expected_sha256 乐观锁防与 AI
+				// 回合并发互踩;门禁照 file.read/upload 同列 enabled-device 清单。
+				{Type: AgentEventFileWrite, Required: []string{"type", "request_id", "project_path", "path", "content"}, Optional: []string{"encoding", "expected_sha256"}, Emits: []string{AgentEventFileWriteResult, AgentEventFileError}},
 				// 设备间互传（spec 2026-10-25-device-file-transfer-design）：upload/receive 走 enabled-device 门禁，
 				// cancel 豁免（照 file.upload.cancel 先例——中途被禁用的设备仍须能收尾）。
 				// size_bytes/sha256 登记时可为 0/空，设备在 transfer.result 里回填真实值（流式打包无法先验）。
 				{Type: AgentEventTransferUpload, Required: []string{"type", "request_id", "transfer_id", "filename", "source_path", "upload"}, Optional: []string{"size_bytes", "sha256", "max_bytes", "is_directory_archive", "source"}, Emits: []string{AgentEventTransferProgress, AgentEventTransferResult}},
-				{Type: AgentEventTransferReceive, Required: []string{"type", "request_id", "transfer_id", "filename", "size_bytes", "sha256", "get_url"}, Optional: []string{"is_directory_archive", "target_dir", "object_etag", "max_bytes", "source"}, Emits: []string{AgentEventTransferProgress, AgentEventTransferResult}},
+				{Type: AgentEventTransferReceive, Required: []string{"type", "request_id", "transfer_id", "filename", "size_bytes", "sha256", "get_url"}, Optional: []string{"is_directory_archive", "target_dir", "object_etag", "max_bytes", "source", "direct_candidates"}, Emits: []string{AgentEventTransferProgress, AgentEventTransferResult}},
 				{Type: AgentEventTransferCancel, Required: []string{"type", "transfer_id"}, Emits: []string{AgentEventTransferResult}},
 				{Type: AgentEventGitStatus, Required: []string{"type", "request_id", "cwd"}, Emits: []string{AgentEventGitStatusResult, AgentEventGitStatusError}},
 				{Type: AgentEventEnvInfo, Required: []string{"type", "request_id", "cwd"}, Emits: []string{AgentEventEnvInfoResult, AgentEventEnvInfoError}},

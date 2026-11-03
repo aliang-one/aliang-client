@@ -177,7 +177,8 @@ func sanitizeTransferError(err error) string {
 // 端口、host 必须是腾讯云 COS 源站域（*.myqcloud.com）。报错文本不回显
 // URL（那会泄漏签名）。互传把上行常态化，须比既有 file.upload 收紧；测试
 // 用假 COS 服务时整体替换此变量。
-var agentTransferHostAllowed = func(rawURL string) error {
+// agentTransferHostAllowedDefault 钉扎本体(提名为具名函数以便测试显式还原默认档)。
+func agentTransferHostAllowedDefault(rawURL string) error {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return errors.New("transfer url is not parseable")
@@ -194,6 +195,8 @@ var agentTransferHostAllowed = func(rawURL string) error {
 	}
 	return nil
 }
+
+var agentTransferHostAllowed = agentTransferHostAllowedDefault
 
 // --------------------------------------------------------------------------
 // 并发槽（upload / receive 各一张，按 transfer_id 索引）

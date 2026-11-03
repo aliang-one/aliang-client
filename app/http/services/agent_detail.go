@@ -50,6 +50,8 @@ func handleAgentDetailMessageWithAI(msg map[string]interface{}, writeJSON func(i
 		_ = writeJSON(agentFileListPayload(msg))
 	case models.AgentEventFileRead:
 		_ = writeJSON(agentFileReadPayload(msg))
+	case models.AgentEventFileWrite:
+		_ = writeJSON(agentFileWritePayload(msg))
 	case "file.working_tree_diff":
 		_ = writeJSON(agentWorkingTreeDiffPayload(msg))
 	case models.AgentEventSlashCommandsList:
@@ -594,6 +596,15 @@ func agentFileErrorPayload(requestID string, err error) map[string]interface{} {
 		"request_id": requestID,
 		"error":      message,
 	}
+}
+
+// agentFileErrorPayloadCode file.error 的结构化细分码变体(spec 2026-11-02
+// §D3/D4):code 契约已登记(AgentEventFileError Optional error_code),
+// 报错文本照旧不回显 URL/签名类敏感信息。
+func agentFileErrorPayloadCode(requestID, code string, err error) map[string]interface{} {
+	payload := agentFileErrorPayload(requestID, err)
+	payload["error_code"] = code
+	return payload
 }
 
 func fileSizeForAgentEntry(info os.FileInfo, isDir bool) interface{} {
