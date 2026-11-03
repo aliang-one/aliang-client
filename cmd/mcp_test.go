@@ -298,3 +298,35 @@ func TestPeerMCPCall_LargeResultWithin4MiBCap(t *testing.T) {
 		t.Fatalf("payload mangled: %.80v", block["text"])
 	}
 }
+
+// D1(spec 2026-11-02):stdio 面工具名 ↔ bridge 名映射断言。后三个无
+// peer_ 前缀是历史现状(claude mcp add 存量用户工具引用),勿改名。
+func TestPeerMCPToolNamesMapBridgeNames(t *testing.T) {
+	// bridge 名(services/agent_ai_tool_ask_peer.go)
+	bridgeNames := map[string]bool{
+		"peer_exec": true, "peer_fetch_file": true, "peer_device_info": true,
+		"peer_device_list": true, "peer_device_note": true,
+	}
+	// stdio 名 → bridge 名(历史映射)
+	mapping := map[string]string{
+		"peer_exec":       "peer_exec",
+		"peer_fetch_file": "peer_fetch_file",
+		"device_info":     "peer_device_info",
+		"device_list":     "peer_device_list",
+		"device_note":     "peer_device_note",
+	}
+	seen := map[string]bool{}
+	for _, tool := range peerMCPTools {
+		bridge, ok := mapping[tool.name]
+		if !ok {
+			t.Fatalf("unexpected stdio tool %q (mapping stale)", tool.name)
+		}
+		if !bridgeNames[bridge] {
+			t.Fatalf("stdio tool %q maps to unknown bridge name %q", tool.name, bridge)
+		}
+		seen[tool.name] = true
+	}
+	if len(seen) != len(mapping) {
+		t.Fatalf("stdio has %d tools, mapping has %d", len(seen), len(mapping))
+	}
+}

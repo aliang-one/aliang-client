@@ -244,6 +244,23 @@ func (b *agentToolAskBridge) buildMCPServer() *mcp.Server {
 		}
 		return res, nil
 	})
+	for _, def := range agentPeerMCPBridgeTools() {
+		def := def
+		server.AddTool(&mcp.Tool{Name: def.name, Description: def.description, InputSchema: def.inputSchema},
+			func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+				args := map[string]interface{}{}
+				if len(req.Params.Arguments) > 0 {
+					if err := json.Unmarshal(req.Params.Arguments, &args); err != nil {
+						return toolAskErrorResult(fmt.Sprintf("invalid %s input: %v", def.name, err)), nil
+					}
+				}
+				text, isErr := def.handle(ctx, args)
+				if isErr {
+					return toolAskErrorResult(text), nil
+				}
+				return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: text}}}, nil
+			})
+	}
 	return server
 }
 
