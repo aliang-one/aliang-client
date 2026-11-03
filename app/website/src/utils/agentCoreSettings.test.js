@@ -201,4 +201,13 @@ describe('normalizePeerMCPConfig', () => {
     expect(normalizePeerMCPConfig({})).toBeUndefined();
     expect(normalizePeerMCPConfig({ enable: 'yes' })).toBeUndefined();
   });
+
+  it('数组输入 → undefined', () => {
+    expect(normalizePeerMCPConfig([])).toBeUndefined();
+    expect(normalizePeerMCPConfig([{ enable: true }])).toBeUndefined();
+  });
+
+  it('多余键剔除(只保留 enable)', () => {
+    expect(normalizePeerMCPConfig({ enable: false, junk: 1 })).toEqual({ enable: false });
+  });
 });
