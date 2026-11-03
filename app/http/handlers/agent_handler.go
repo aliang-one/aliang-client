@@ -573,6 +573,30 @@ func (h *AgentHandler) HandleScanDirectories(w http.ResponseWriter, r *http.Requ
 	}
 }
 
+// HandlePeerMcp GET 读取 / POST 应用 aliang-peer 跨设备 MCP 注册(经
+// proxyIfNeeded 代理到 runtime:注册写入的是用户家目录的内核配置文件,
+// 必须发生在用户态进程;core 侧同名注册只做透传,双注册教训同 peer 家族)。
+func (h *AgentHandler) HandlePeerMcp(w http.ResponseWriter, r *http.Request) {
+	if h.proxyIfNeeded(w, r) {
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		common.Success(w, h.service.PeerMCPStatus())
+	case http.MethodPost:
+		var req struct {
+			Enable *bool `json:"enable"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil || req.Enable == nil {
+			common.ErrorBadRequest(w, "Invalid request body: enable(bool) required", nil)
+			return
+		}
+		common.Success(w, h.service.SetPeerMCPRegistration(*req.Enable))
+	default:
+		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
+	}
+}
+
 // HandleFileAccess GET 读取「文件访问授权」状态快照。
 //
 // 必须经 proxyIfNeeded 落到 user-agent 进程：tccguard 的 grant 以可执行文件的

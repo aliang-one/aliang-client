@@ -276,6 +276,8 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	register("/api/agent/peer/devices", h.Agent.HandlePeerDevices, http.MethodGet)
 	register("/api/agent/peer/device-info", h.Agent.HandlePeerDeviceInfo, http.MethodGet)
 	register("/api/agent/peer/note", h.Agent.HandlePeerNote, http.MethodPost)
+	// aliang-peer 跨设备 MCP 平台托管注册/状态(GET 读状态,POST 应用)。
+	register("/api/agent/peer/mcp", h.Agent.HandlePeerMcp, http.MethodGet, http.MethodPost)
 	register("/api/agent/ai/stream", h.Agent.HandleAIStream, http.MethodGet)
 	register("/api/agent/ai/approval-hook", h.Agent.HandleAIApprovalHook, http.MethodPost)
 	// 自有交互工具 MCP 端点(tool_ask bridge):路径含 per-run token,方法由
