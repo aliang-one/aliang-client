@@ -197,3 +197,30 @@ func TestAgentTransferDispatchArmsWireUp(t *testing.T) {
 		}
 	}
 }
+
+// D2(spec 2026-11-02):transfer.receive 实际携带 direct_candidates
+// (agent_transfer_receive.go 经 parseAgentLanDirectCandidates 实读该键),
+// 契约表漏登记=「实读键 vs 登记」先例复发。对齐 transfer.result 已登记
+// via/lan_fail_stage 的先例。
+func TestAgentTransferReceiveDirectCandidatesRegistered(t *testing.T) {
+	contract := models.DefaultAgentProtocolContract()
+	var rcv *models.AgentProtocolEvent
+	for i := range contract.WebSocket.ServerSends {
+		if contract.WebSocket.ServerSends[i].Type == models.AgentEventTransferReceive {
+			rcv = &contract.WebSocket.ServerSends[i]
+			break
+		}
+	}
+	if rcv == nil {
+		t.Fatal("transfer.receive missing from ServerSends")
+	}
+	hasCandidates := false
+	for _, f := range rcv.Optional {
+		if f == "direct_candidates" {
+			hasCandidates = true
+		}
+	}
+	if !hasCandidates {
+		t.Fatalf("transfer.receive Optional must include direct_candidates, got %v", rcv.Optional)
+	}
+}

@@ -332,7 +332,7 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				// cancel 豁免（照 file.upload.cancel 先例——中途被禁用的设备仍须能收尾）。
 				// size_bytes/sha256 登记时可为 0/空，设备在 transfer.result 里回填真实值（流式打包无法先验）。
 				{Type: AgentEventTransferUpload, Required: []string{"type", "request_id", "transfer_id", "filename", "source_path", "upload"}, Optional: []string{"size_bytes", "sha256", "max_bytes", "is_directory_archive", "source"}, Emits: []string{AgentEventTransferProgress, AgentEventTransferResult}},
-				{Type: AgentEventTransferReceive, Required: []string{"type", "request_id", "transfer_id", "filename", "size_bytes", "sha256", "get_url"}, Optional: []string{"is_directory_archive", "target_dir", "object_etag", "max_bytes", "source"}, Emits: []string{AgentEventTransferProgress, AgentEventTransferResult}},
+				{Type: AgentEventTransferReceive, Required: []string{"type", "request_id", "transfer_id", "filename", "size_bytes", "sha256", "get_url"}, Optional: []string{"is_directory_archive", "target_dir", "object_etag", "max_bytes", "source", "direct_candidates"}, Emits: []string{AgentEventTransferProgress, AgentEventTransferResult}},
 				{Type: AgentEventTransferCancel, Required: []string{"type", "transfer_id"}, Emits: []string{AgentEventTransferResult}},
 				{Type: AgentEventGitStatus, Required: []string{"type", "request_id", "cwd"}, Emits: []string{AgentEventGitStatusResult, AgentEventGitStatusError}},
 				{Type: AgentEventEnvInfo, Required: []string{"type", "request_id", "cwd"}, Emits: []string{AgentEventEnvInfoResult, AgentEventEnvInfoError}},
