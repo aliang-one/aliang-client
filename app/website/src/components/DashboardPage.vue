@@ -1034,7 +1034,7 @@ const isProdBuild = import.meta.env.PROD || ['prod', 'production'].includes(Stri
 const frontEndLogsFetchLimit = isProdBuild ? 200 : 800;
 
 const { certStatus, loading: certLoading, startPolling: startCertPolling, stopPolling: stopCertPolling } = useCertStatus();
-const { currentPage, showSettings, showAgent, showChat } = useNavigation();
+const { currentPage, showPage, showSettings, showAgent, showChat } = useNavigation();
 // Agent 入口的状态点：与 Agent 页共享同一份 /api/agent/status 单例，
 // 仪表盘加载时预热一次，进 Agent 页不再重复拉取。
 const { runtimeOnline, agentEnabled, statusLabel, ensureLoaded } = useAgentStatus();
@@ -1704,9 +1704,9 @@ function openQuickSetup() {
 }
 
 function handleGuideOpenSettings() {
-  // 运行模式随设置 IA 重整移到「设备与网络」分区（2026-10-31），引导必须
-  // 跟着跳过去，否则滚动锚点在另一个标签页里永远找不到。
-  showAgent();
+  // 运行模式随 2026-11-03 四栏重组落位「状态」页页尾「其他」（SystemSettings
+  // 随迁），引导跳状态页，滚动锚点 data-guide="run-mode" 不变。
+  showPage('log');
   void nextTick(() => {
     document.querySelector('[data-guide="run-mode"]')?.scrollIntoView({ block: 'center', behavior: 'smooth' });
   });

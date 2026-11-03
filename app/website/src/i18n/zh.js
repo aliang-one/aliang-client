@@ -559,16 +559,31 @@ export default {
 
   // -- SettingsPage --
   settings_title: 'ALiang Gateway',
-  settings_tabSettings: '模型与推理',
-  settings_tabUserCenter: '账户与界面',
-  settings_tabLogs: '诊断',
+  settings_tabSettings: '代理设置',
+  settings_tabUserCenter: '用户',
+  settings_tabLogs: '状态',
   settings_live: '在线',
-  // 分区副标题（信息架构重整 2026-10-31）
-  settings_sectionModelDesc: '决定连到哪、用哪个模型、怎么推理。仅影响未单独设置的新会话。',
-  settings_sectionCapabilityDesc: '把外部能力接进来：MCP、技能、环境变量。',
-  settings_sectionDeviceDesc: '这台设备怎么出网、怎么分流、绑不绑、扫什么。',
+  // 分区副标题（四栏重组 2026-11-03：代理设置 → Agent → 状态 → 用户）
+  settings_sectionProxyDesc: '出站代理、AI 规则、分流规则与模型映射。仅影响新会话与代理层。',
+  settings_sectionAgentDesc: '会话记录、用户态 Agent 与 aliangcode 内核设置集中地。',
   settings_sectionAccountDesc: '账户身份与本机显示偏好。',
-  settings_sectionDiagnosticsDesc: '只读观测：实时日志、会话活动、远程终端。',
+  settings_sectionStatusDesc: '只读观测：实时日志；页尾「其他」为设备级开关杂项。',
+  settings_scopeDevice: '本机生效，换设备不同步',
+  settings_scopeLocal: '仅本机浏览器',
+  // Agent 三子 tab（四栏重组 2026-11-03）
+  agent_subRecords: '记录',
+  agent_subUserAgent: '用户态 agent',
+  agent_subAliangCode: 'aliangcode',
+  // 状态页尾「其他」区块（设备级杂项集中地）
+  settings_otherTitle: '其他',
+  settings_otherDesc: '设备级开关与系统杂项：设备互访、运行模式、文件访问授权。',
+  // 置灰占位开关（设备门禁层 peer_exec_enabled / peer_fetch_enabled，
+  // 真值源在服务端设备注册表，写通道待跨仓落地，先占位零请求）
+  settings_peerExecPendingTitle: '跨设备执行',
+  settings_peerExecPendingDesc: '允许其他设备在本机执行命令的设备级门禁。',
+  settings_peerTransferPendingTitle: '文件传输',
+  settings_peerTransferPendingDesc: '允许跨设备拉取本机文件的设备级门禁。',
+  settings_comingSoon: '即将上线',
   settings_scopeDevice: '本机生效，换设备不同步',
   settings_scopeLocal: '仅本机浏览器',
   // 界面偏好（从系统设置抽出）
@@ -604,7 +619,6 @@ export default {
   appearance_title: '界面偏好',
   appearance_description: '语言与外观。',
   appearance_localOnlyHint: '这两项只保存在本机浏览器，不上报后端，换设备不同步。',
-  settings_pageUser: '用户',
   settings_pageLog: '状态',
   settings_pageConfiguration: '配置',
   settings_pageCenter: '中心',
@@ -614,8 +628,7 @@ export default {
   settings_loginRequiredSettingsDesc: '在后端认证会话恢复或您在本页登录之前，客户配置编辑将保持锁定状态。',
   settings_loginRequiredLogs: '查看状态需要先登录',
   settings_loginRequiredLogsDesc: '状态与实时日志在您登录前不可见。切换回设置标签页后可使用账户卡片上的登录表单。',
-  settings_tabAgent: '设备与网络',
-  settings_tabCapability: '能力接入',
+  settings_tabAgent: 'Agent', // 四栏重组 2026-11-03(原「设备与网络」)
   settings_pageAgent: 'Agent',
   settings_pageActivity: '工作台',
   settings_loginRequiredCapability: '查看能力接入需要先登录',
@@ -1172,19 +1185,25 @@ export default {
   // -- AgentActivitySettings --
   agent_activity_title: 'Agent 活动',
   agent_activity_desc: '最近的 Agent 会话与提问记录（仅展示提问，回答为摘要）',
+  // agent 类型筛选（四栏重组 2026-11-03：替代「仅 AliangCode」单一开关）
+  agent_activity_filterLabel: 'Agent 类型',
+  agent_activity_filterAll: '全部',
   agent_activity_running: '进行中',
   agent_activity_loading: '加载中…',
   agent_activity_loadFailed: '加载失败',
   agent_activity_noSessions: '暂无 Agent 会话记录',
   agent_activity_runtimeOffline: 'Agent 运行时未运行，暂无数据',
   agent_activity_refresh: '刷新',
-  agent_activity_onlyAliangCode: '仅 AliangCode',
-  agent_activity_onlyAliangCodeHint: '关闭后显示本机所有 AI CLI（Claude Code / Codex 等）的会话',
   agent_integrations_title: 'MCP 与技能',
   agent_integrations_desc: '本机 AI 工具的 MCP 服务与技能清单，标注哪些对 AliangCode 内核真正生效（只读）。',
   agent_integrations_refresh: '刷新',
   agent_integrations_loading: '正在读取配置…',
   agent_integrations_loadFailed: '读取失败：设备 agent 可能未运行。',
+  // MCP / 技能列表分页（2026-11-04）
+  agent_integrations_paginationLabel: '集成报告分页',
+  agent_integrations_pageInfo: '第 {page} / {total} 页 · 共 {count} 条',
+  agent_integrations_prev: '上一页',
+  agent_integrations_next: '下一页',
   agent_integrations_mcpTitle: 'MCP 服务（{count}）',
   agent_integrations_mcpEmpty: '未发现 MCP 服务配置。',
   agent_integrations_skillTitle: '技能（{count}）',

@@ -24,11 +24,11 @@
             </a>
             <a
               class="py-5 text-sm font-medium"
-              :class="currentPage === 'user' ? 'border-b-2 border-primary text-primary' : 'text-slate-500 hover:text-slate-700 dark:text-slate-300 dark:hover:text-slate-100'"
+              :class="currentPage === 'agent' ? 'border-b-2 border-primary text-primary' : 'text-slate-500 hover:text-slate-700 dark:text-slate-300 dark:hover:text-slate-100'"
               href="javascript:void(0)"
-              @click="showPage('user')"
+              @click="showPage('agent')"
             >
-              {{ t('settings_tabUserCenter') }}
+              {{ t('settings_tabAgent') }}
             </a>
             <a
               class="py-5 text-sm font-medium"
@@ -40,19 +40,11 @@
             </a>
             <a
               class="py-5 text-sm font-medium"
-              :class="currentPage === 'capability' ? 'border-b-2 border-primary text-primary' : 'text-slate-500 hover:text-slate-700 dark:text-slate-300 dark:hover:text-slate-100'"
+              :class="currentPage === 'user' ? 'border-b-2 border-primary text-primary' : 'text-slate-500 hover:text-slate-700 dark:text-slate-300 dark:hover:text-slate-100'"
               href="javascript:void(0)"
-              @click="showPage('capability')"
+              @click="showPage('user')"
             >
-              {{ t('settings_tabCapability') }}
-            </a>
-            <a
-              class="py-5 text-sm font-medium"
-              :class="currentPage === 'agent' ? 'border-b-2 border-primary text-primary' : 'text-slate-500 hover:text-slate-700 dark:text-slate-300 dark:hover:text-slate-100'"
-              href="javascript:void(0)"
-              @click="showPage('agent')"
-            >
-              {{ t('settings_tabAgent') }}
+              {{ t('settings_tabUserCenter') }}
             </a>
           </nav>
           <div class="flex items-center gap-4">
@@ -102,10 +94,10 @@
           <button
             type="button"
             class="min-h-10 rounded-lg border px-3 py-2 text-sm font-semibold transition"
-            :class="currentPage === 'user' ? 'border-primary bg-primary text-white' : 'border-slate-200 bg-white text-slate-700 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-100'"
-            @click="showPage('user')"
+            :class="currentPage === 'agent' ? 'border-primary bg-primary text-white' : 'border-slate-200 bg-white text-slate-700 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-100'"
+            @click="showPage('agent')"
           >
-            {{ t('settings_pageUser') }}
+            {{ t('settings_tabAgent') }}
           </button>
           <button
             type="button"
@@ -118,18 +110,10 @@
           <button
             type="button"
             class="min-h-10 rounded-lg border px-3 py-2 text-sm font-semibold transition"
-            :class="currentPage === 'capability' ? 'border-primary bg-primary text-white' : 'border-slate-200 bg-white text-slate-700 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-100'"
-            @click="showPage('capability')"
+            :class="currentPage === 'user' ? 'border-primary bg-primary text-white' : 'border-slate-200 bg-white text-slate-700 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-100'"
+            @click="showPage('user')"
           >
-            {{ t('settings_tabCapability') }}
-          </button>
-          <button
-            type="button"
-            class="min-h-10 rounded-lg border px-3 py-2 text-sm font-semibold transition"
-            :class="currentPage === 'agent' ? 'border-primary bg-primary text-white' : 'border-slate-200 bg-white text-slate-700 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-100'"
-            @click="showPage('agent')"
-          >
-            {{ t('settings_tabAgent') }}
+            {{ t('settings_tabUserCenter') }}
           </button>
         </div>
 
@@ -141,10 +125,10 @@
           {{ authNotice }}
         </div>
 
-        <!-- ① 模型与推理（设备级）：连到哪 / 用什么模型 / 转发层改写。
-             仅影响未单独设置的新会话；会话级覆盖在聊天页会话设置条。 -->
+        <!-- ① 代理设置（设备级）：出站代理 / AI 规则 / 分流 / 模型映射。
+             仅影响未单独设置的新会话与代理层；会话级覆盖在聊天页会话设置条。 -->
         <section v-if="currentPage === 'settings'" class="flex flex-col gap-5">
-          <SectionHeader :title="t('settings_tabSettings')" :desc="t('settings_sectionModelDesc')" scope="device" />
+          <SectionHeader :title="t('settings_tabSettings')" :desc="t('settings_sectionProxyDesc')" scope="device" />
           <div
             v-if="!isAuthenticated"
             class="rounded-2xl border border-dashed border-slate-300 bg-white px-6 py-8 text-center shadow-sm dark:border-slate-700 dark:bg-slate-900"
@@ -157,14 +141,6 @@
             </div>
           </div>
           <template v-else>
-            <AgentCoreSettings
-              :config="customerConfig"
-              :loading="isLoadingCustomerConfig"
-              :saving="isSavingCustomerConfig"
-              :error="customerConfigError"
-              :success-message="customerConfigSuccess"
-              @save="saveCustomerConfig"
-            />
             <ModelMappingSettings
               :config="customerConfig"
               :loading="isLoadingCustomerConfig"
@@ -173,82 +149,6 @@
               :success-message="customerConfigSuccess"
               @save="saveCustomerConfig"
             />
-          </template>
-        </section>
-
-        <!-- ② 能力接入（设备级）：MCP / 技能 / 环境变量 -->
-        <section v-else-if="currentPage === 'capability'" class="flex flex-col gap-5">
-          <SectionHeader :title="t('settings_tabCapability')" :desc="t('settings_sectionCapabilityDesc')" scope="device" />
-          <div
-            v-if="!isAuthenticated"
-            class="rounded-2xl border border-dashed border-slate-300 bg-white px-6 py-8 text-center shadow-sm dark:border-slate-700 dark:bg-slate-900"
-          >
-            <div class="mx-auto max-w-2xl space-y-3">
-              <h2 class="text-xl font-bold text-slate-900 dark:text-white">{{ t('settings_loginRequiredCapability') }}</h2>
-              <p class="text-sm text-slate-500 dark:text-slate-300">
-                {{ t('settings_loginRequiredCapabilityDesc') }}
-              </p>
-            </div>
-          </div>
-          <template v-else>
-            <div class="grid grid-cols-1 items-stretch gap-5 lg:grid-cols-2">
-              <AgentMCPGlobalSettings
-                :config="customerConfig"
-                :loading="isLoadingCustomerConfig"
-                :saving="isSavingCustomerConfig"
-                :error="customerConfigError"
-                :success-message="customerConfigSuccess"
-                @save="saveCustomerConfig"
-              />
-              <AgentSkillsGlobalSettings
-                :config="customerConfig"
-                :loading="isLoadingCustomerConfig"
-                :saving="isSavingCustomerConfig"
-                :error="customerConfigError"
-                :success-message="customerConfigSuccess"
-                @save="saveCustomerConfig"
-              />
-              <PeerMCPSettings
-                :config="customerConfig"
-                :loading="isLoadingCustomerConfig"
-                :saving="isSavingCustomerConfig"
-                :error="customerConfigError"
-                :success-message="customerConfigSuccess"
-                @save="saveCustomerConfig"
-              />
-            </div>
-            <AgentIntegrationsSettings />
-            <CustomEnvSettings
-              :config="customerConfig"
-              :loading="isLoadingCustomerConfig"
-              :saving="isSavingCustomerConfig"
-              :error="customerConfigError"
-              :success-message="customerConfigSuccess"
-              @save="saveCustomerConfig"
-            />
-          </template>
-        </section>
-
-        <!-- ③ 设备与网络（设备级）：出网 / 分流 / 绑定 / 扫描范围 -->
-        <section v-else-if="currentPage === 'agent'" class="flex flex-col gap-5">
-          <SectionHeader :title="t('settings_tabAgent')" :desc="t('settings_sectionDeviceDesc')" scope="device" />
-          <div
-            v-if="!isAuthenticated"
-            class="rounded-2xl border border-dashed border-slate-300 bg-white px-6 py-8 text-center shadow-sm dark:border-slate-700 dark:bg-slate-900"
-          >
-            <div class="mx-auto max-w-2xl space-y-3">
-              <h2 class="text-xl font-bold text-slate-900 dark:text-white">{{ t('settings_loginRequiredAgent') }}</h2>
-              <p class="text-sm text-slate-500 dark:text-slate-300">
-                {{ t('settings_loginRequiredAgentDesc') }}
-              </p>
-            </div>
-          </div>
-          <template v-else>
-            <AgentSettings />
-            <!-- 文件访问授权：一次性预先授权 macOS 隐私目录，避免远程调用时
-                 弹窗无人应答把工具卡死（2026-11-01 事故）。 -->
-            <AgentFileAccessSettings />
-            <SystemSettings />
             <RulesSettings
               :config="customerConfig"
               :preset-providers="presetProviders"
@@ -259,8 +159,22 @@
               :version="customerConfigVersion"
               @save="saveCustomerConfig"
             />
-            <AgentScanDirectoriesSettings />
           </template>
+        </section>
+
+        <!-- ② Agent（设备级）：三子 tab = 记录 / 用户态 agent / aliangcode。
+             子 tab 状态在导航层（useNavigation.agentSubTab），支持深链；
+             登录占位语义见 spec §5.4（占位收在 aliangcode 子 tab 内）。 -->
+        <section v-else-if="currentPage === 'agent'" class="flex flex-col gap-5">
+          <SectionHeader :title="t('settings_tabAgent')" :desc="t('settings_sectionAgentDesc')" scope="device" />
+          <AgentPage
+            :config="customerConfig"
+            :loading="isLoadingCustomerConfig"
+            :saving="isSavingCustomerConfig"
+            :error="customerConfigError"
+            :success-message="customerConfigSuccess"
+            @save="saveCustomerConfig"
+          />
         </section>
 
         <!-- ④ 账户与界面（账户级 + 本机） -->
@@ -270,9 +184,9 @@
           <AppearanceSettings />
         </section>
 
-        <!-- ⑤ 诊断（只读观测） -->
+        <!-- ③ 状态（只读观测）：实时日志 + 页尾「其他」设备级杂项区块。 -->
         <section v-else class="flex flex-col gap-5">
-          <SectionHeader :title="t('settings_tabLogs')" :desc="t('settings_sectionDiagnosticsDesc')" scope="readonly" />
+          <SectionHeader :title="t('settings_tabLogs')" :desc="t('settings_sectionStatusDesc')" scope="readonly" />
           <div
             v-if="!isAuthenticated"
             class="rounded-2xl border border-dashed border-slate-300 bg-white px-6 py-8 text-center shadow-sm dark:border-slate-700 dark:bg-slate-900"
@@ -285,9 +199,15 @@
             </div>
           </div>
           <template v-else>
-            <AgentActivitySettings />
-            <AgentRuntimeSessions />
             <LogsSettings />
+            <OtherSettings
+              :config="customerConfig"
+              :loading="isLoadingCustomerConfig"
+              :saving="isSavingCustomerConfig"
+              :error="customerConfigError"
+              :success-message="customerConfigSuccess"
+              @save="saveCustomerConfig"
+            />
           </template>
         </section>
       </main>
@@ -320,23 +240,15 @@
 </template>
 
 <script>
+// 四栏重组 2026-11-03：代理设置(settings) → Agent(agent,三子 tab) → 状态(log) → 用户(user)。
+// Agent 子组件收拢在 settings/agent/AgentPage.vue，设备级杂项收拢在 OtherSettings.vue。
 import RulesSettings from './settings/RulesSettings.vue';
 import UserInfoSettings from './settings/UserInfoSettings.vue';
 import LogsSettings from './settings/LogsSettings.vue';
-import SystemSettings from './settings/SystemSettings.vue';
-import AgentSettings from './settings/AgentSettings.vue';
-import AgentRuntimeSessions from './settings/AgentRuntimeSessions.vue';
-import AgentActivitySettings from './settings/AgentActivitySettings.vue';
-import AgentScanDirectoriesSettings from './settings/AgentScanDirectoriesSettings.vue';
-import AgentFileAccessSettings from './settings/AgentFileAccessSettings.vue';
-import AgentIntegrationsSettings from './settings/AgentIntegrationsSettings.vue';
 import ModelMappingSettings from './settings/ModelMappingSettings.vue';
-import CustomEnvSettings from './settings/CustomEnvSettings.vue';
-import AgentCoreSettings from './settings/AgentCoreSettings.vue';
 import AppearanceSettings from './settings/AppearanceSettings.vue';
-import AgentMCPGlobalSettings from './settings/AgentMCPGlobalSettings.vue';
-import AgentSkillsGlobalSettings from './settings/AgentSkillsGlobalSettings.vue';
-import PeerMCPSettings from './settings/PeerMCPSettings.vue';
+import AgentPage from './settings/agent/AgentPage.vue';
+import OtherSettings from './settings/OtherSettings.vue';
 import SectionHeader from './settings/SectionHeader.vue';
 import { normalizeAgentCoreLLMConfig, applyAgentCoreLLMClearing, normalizeAgentCoreTuning, normalizePeerMCPConfig } from '../utils/agentCoreSettings';
 import { useNavigation } from '../composables/useNavigation';
@@ -526,20 +438,10 @@ export default {
     RulesSettings,
     UserInfoSettings,
     LogsSettings,
-    SystemSettings,
-    AgentSettings,
-    AgentRuntimeSessions,
-    AgentActivitySettings,
-    AgentScanDirectoriesSettings,
-    AgentFileAccessSettings,
-    AgentIntegrationsSettings,
     ModelMappingSettings,
-    CustomEnvSettings,
-    AgentCoreSettings,
     AppearanceSettings,
-    AgentMCPGlobalSettings,
-    AgentSkillsGlobalSettings,
-    PeerMCPSettings,
+    AgentPage,
+    OtherSettings,
     SectionHeader
   },
   setup() {
@@ -572,7 +474,7 @@ export default {
   },
   computed: {
     isVisible() {
-      return ['settings', 'capability', 'user', 'log', 'agent'].includes(this.currentPage);
+      return ['settings', 'agent', 'log', 'user'].includes(this.currentPage);
     },
     pageTitle() {
       // 标题直接复用分区名，避免页头与标签页两套措辞漂移。
@@ -584,9 +486,6 @@ export default {
       }
       if (this.currentPage === 'agent') {
         return this.t('settings_tabAgent');
-      }
-      if (this.currentPage === 'capability') {
-        return this.t('settings_tabCapability');
       }
       return this.t('settings_tabSettings');
     },

@@ -7,9 +7,23 @@ const currentPage = ref('dashboard');
 // 不引入陈旧状态（不持久化）。
 const chatProviderPreset = ref('');
 
+// Agent 页子 tab（模块级，与 currentPage 同生命周期，浏览器刷新自然重置）。
+// 词表与 settings/agent/AgentPage.vue 的子 tab 一一对应；非法值写入时归一
+// 为默认，深链安全。仅 showPage('agent', { sub }) 显式携带时才改写——仪表盘
+// showAgent() 一类无参跳转不打断用户当前所在子 tab。
+export const AGENT_SUB_TABS = ['records', 'user-agent', 'aliangcode'];
+const agentSubTab = ref('records');
+
+function normalizeAgentSubTab(sub) {
+  return AGENT_SUB_TABS.includes(sub) ? sub : 'records';
+}
+
 export function useNavigation() {
-  function showPage(page) {
+  function showPage(page, options = {}) {
     currentPage.value = page;
+    if (page === 'agent' && options && options.sub !== undefined) {
+      agentSubTab.value = normalizeAgentSubTab(options.sub);
+    }
   }
 
   function showSettings() {
@@ -43,6 +57,7 @@ export function useNavigation() {
   return {
     currentPage,
     chatProviderPreset,
+    agentSubTab,
     showPage,
     showSettings,
     showAgent,

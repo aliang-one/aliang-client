@@ -1,6 +1,6 @@
 // app/website/src/composables/useNavigation.test.js
 import { beforeEach, describe, expect, it } from 'vitest';
-import { useNavigation } from './useNavigation';
+import { AGENT_SUB_TABS, useNavigation } from './useNavigation';
 
 describe('useNavigation chat provider preset', () => {
   beforeEach(() => {
@@ -45,5 +45,45 @@ describe('useNavigation chat provider preset', () => {
     const b = useNavigation();
     a.showChat({ provider: 'agentcore' });
     expect(b.chatProviderPreset.value).toBe('agentcore');
+  });
+});
+
+describe('useNavigation agentSubTab', () => {
+  beforeEach(() => {
+    const nav = useNavigation();
+    nav.showPage('agent', { sub: 'records' });
+    nav.showDashboard();
+  });
+
+  it('showPage("agent", { sub }) 写入合法子 tab', () => {
+    const nav = useNavigation();
+    nav.showPage('agent', { sub: 'aliangcode' });
+    expect(nav.currentPage.value).toBe('agent');
+    expect(nav.agentSubTab.value).toBe('aliangcode');
+  });
+
+  it('未知 sub 归一为 records（深链 fallback）', () => {
+    const nav = useNavigation();
+    nav.showPage('agent', { sub: 'bogus' });
+    expect(nav.agentSubTab.value).toBe('records');
+  });
+
+  it('无 sub 参数保留现状（仪表盘跳转不打断用户所在子 tab）', () => {
+    const nav = useNavigation();
+    nav.showPage('agent', { sub: 'aliangcode' });
+    nav.showDashboard();
+    nav.showPage('agent');
+    expect(nav.agentSubTab.value).toBe('aliangcode');
+  });
+
+  it('非 agent 页不改写子 tab', () => {
+    const nav = useNavigation();
+    nav.showPage('agent', { sub: 'user-agent' });
+    nav.showPage('settings', { sub: 'records' });
+    expect(nav.agentSubTab.value).toBe('user-agent');
+  });
+
+  it('AGENT_SUB_TABS 词表与 AgentPage 子 tab 一一对应', () => {
+    expect(AGENT_SUB_TABS).toEqual(['records', 'user-agent', 'aliangcode']);
   });
 });

@@ -562,18 +562,31 @@ export default {
 
   // -- SettingsPage --
   settings_title: 'ALiang Gateway',
-  settings_tabSettings: 'Model & Reasoning',
-  settings_tabUserCenter: 'Account & Appearance',
-  settings_tabLogs: 'Diagnostics',
+  settings_tabSettings: 'Proxy',
+  settings_tabUserCenter: 'User',
+  settings_tabLogs: 'Status',
   settings_live: 'LIVE',
-  // Section subtitles (IA reorganisation 2026-10-31)
-  settings_sectionModelDesc: 'Where to connect, which model, how hard to reason. Affects new sessions that have not overridden it.',
-  settings_sectionCapabilityDesc: 'Bring in external capabilities: MCP, skills, environment variables.',
-  settings_sectionDeviceDesc: 'How this device goes online, routes traffic, registers, and what it scans.',
+  // Section subtitles (four-section IA reorganisation 2026-11-03: Proxy → Agent → Status → User)
+  settings_sectionProxyDesc: 'Outbound proxy, AI rules, routing rules and model mapping. Applies to new sessions and the proxy layer.',
+  settings_sectionAgentDesc: 'Session records, the user-mode agent, and the aliangcode kernel settings in one place.',
   settings_sectionAccountDesc: 'Account identity and local display preferences.',
-  settings_sectionDiagnosticsDesc: 'Read-only observation: live logs, session activity, remote terminals.',
+  settings_sectionStatusDesc: 'Read-only observation: live logs. Device-level switches live in Other at the bottom.',
   settings_scopeDevice: 'This device only; not synced across devices',
   settings_scopeLocal: 'This browser only',
+  // Agent sub-tabs (four-section reorganisation 2026-11-03)
+  agent_subRecords: 'Records',
+  agent_subUserAgent: 'User-mode agent',
+  agent_subAliangCode: 'aliangcode',
+  // Status page trailing Other section (device-level misc)
+  settings_otherTitle: 'Other',
+  settings_otherDesc: 'Device-level switches and system misc: peer access, run mode, file access authorization.',
+  // Grayed-out placeholder switches (device-gate layer peer_exec_enabled / peer_fetch_enabled;
+  // source of truth lives in the server device registry, write channel lands cross-repo later)
+  settings_peerExecPendingTitle: 'Cross-device execution',
+  settings_peerExecPendingDesc: 'Device-level gate for letting other devices run commands here.',
+  settings_peerTransferPendingTitle: 'File transfer',
+  settings_peerTransferPendingDesc: 'Device-level gate for letting other devices fetch files from this machine.',
+  settings_comingSoon: 'Coming soon',
   mcpGlobal_title: 'MCP master switch',
   mcpGlobal_description: 'Master switch: when off, the AliangCode kernel connects to no MCP server.',
   mcpGlobal_enable: 'Let AliangCode use MCP tools',
@@ -604,7 +617,6 @@ export default {
   appearance_title: 'Appearance',
   appearance_description: 'Language and theme.',
   appearance_localOnlyHint: 'Both are stored in this browser only, not reported to the backend, and not synced across devices.',
-  settings_pageUser: 'User',
   settings_pageLog: 'Status',
   settings_pageConfiguration: 'Configuration',
   settings_pageCenter: 'Center',
@@ -614,8 +626,7 @@ export default {
   settings_loginRequiredSettingsDesc: 'Customer config editing stays blocked until a backend auth session is restored or you log in with the account card on this page.',
   settings_loginRequiredLogs: 'Login required for status access',
   settings_loginRequiredLogsDesc: 'Status and live logs stay hidden until you log in. The login form stays available in the account card when you switch back to the Settings tab.',
-  settings_tabAgent: 'Device & Network',
-  settings_tabCapability: 'Capabilities',
+  settings_tabAgent: 'Agent', // four-section reorganisation 2026-11-03 (was Device & Network)
   settings_pageAgent: 'Agent',
   settings_pageActivity: 'Workspace',
   settings_loginRequiredCapability: 'Sign in to view capabilities',
@@ -1170,6 +1181,9 @@ export default {
 
   // -- AgentActivitySettings --
   agent_activity_title: 'Agent Activity',
+  // Agent type filter (four-section reorganisation 2026-11-03: replaces the AliangCode-only toggle)
+  agent_activity_filterLabel: 'Agent type',
+  agent_activity_filterAll: 'All',
   agent_activity_desc: 'Recent Agent sessions and prompts (prompts in full, replies summarized)',
   agent_activity_running: 'Running',
   agent_activity_loading: 'Loading…',
@@ -1177,13 +1191,16 @@ export default {
   agent_activity_noSessions: 'No agent sessions yet',
   agent_activity_runtimeOffline: 'Agent runtime is not running',
   agent_activity_refresh: 'Refresh',
-  agent_activity_onlyAliangCode: 'AliangCode only',
-  agent_activity_onlyAliangCodeHint: 'Turn off to show sessions from all local AI CLIs (Claude Code, Codex, …)',
   agent_integrations_title: 'MCP & Skills',
   agent_integrations_desc: 'MCP servers and skills on this device, with what actually takes effect in the AliangCode kernel (read-only).',
   agent_integrations_refresh: 'Refresh',
   agent_integrations_loading: 'Reading configuration…',
   agent_integrations_loadFailed: 'Failed to load: the device agent may not be running.',
+  // MCP / skills list pagination (2026-11-04)
+  agent_integrations_paginationLabel: 'Integration report pagination',
+  agent_integrations_pageInfo: 'Page {page} / {total} · {count} items',
+  agent_integrations_prev: 'Previous page',
+  agent_integrations_next: 'Next page',
   agent_integrations_mcpTitle: 'MCP servers ({count})',
   agent_integrations_mcpEmpty: 'No MCP server configuration found.',
   agent_integrations_skillTitle: 'Skills ({count})',
