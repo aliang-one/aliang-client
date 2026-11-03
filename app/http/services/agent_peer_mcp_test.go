@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"aliang.one/nursorgate/processor/config"
 )
@@ -222,4 +223,81 @@ func configSetGlobalForTest(t *testing.T, enable *bool) {
 	old := config.GetGlobalConfig()
 	config.SetGlobalConfig(&config.Config{Customer: &config.CustomerConfig{PeerMCP: &config.PeerMCPConfig{Enable: enable}}})
 	t.Cleanup(func() { config.SetGlobalConfig(old) })
+}
+
+func TestPeerMCPStaleDetectionClaude(t *testing.T) {
+	home := swapPeerMCPHome(t)
+	path := filepath.Join(home, ".claude.json")
+	stale := `{"mcpServers":{"aliang-peer":{"command":"/old/aliang","args":["mcp"]}}}`
+	if err := os.WriteFile(path, []byte(stale), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if st, err := peerMCPKernelState(home, "claude"); err != nil {
+		t.Fatal(err)
+	} else if st != PeerMCPStateStale {
+		t.Fatalf("应用前应为 stale: %s", st)
+	}
+	for _, r := range ApplyPeerMCPRegistration(home, true) {
+		if r.Kernel == "claude" && (r.State != PeerMCPStateRegistered || r.Error != "") {
+			t.Fatalf("claude stale 应被自愈为 registered: %+v", r)
+		}
+	}
+}
+
+func TestPeerMCPRegistrationSkipsWriteWhenAlreadyRegistered(t *testing.T) {
+	home := swapPeerMCPHome(t)
+	for _, r := range ApplyPeerMCPRegistration(home, true) {
+		if r.State != PeerMCPStateRegistered || r.Error != "" {
+			t.Fatalf("前置注册应成功: %+v", r)
+		}
+	}
+	// 把两内核文件 mtime 拨到一小时前;再次 register 若真跳过写盘,
+	// mtime 必须原样(静默重写会刷新 mtime,字节比对抓不住)。
+	past := time.Now().Add(-time.Hour)
+	files := []string{
+		filepath.Join(home, ".claude.json"),
+		filepath.Join(home, ".codex", "config.toml"),
+	}
+	for _, p := range files {
+		if err := os.Chtimes(p, past, past); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, r := range ApplyPeerMCPRegistration(home, true) {
+		if r.State != PeerMCPStateRegistered || r.Error != "" {
+			t.Fatalf("已满足的内核应幂等跳过: %+v", r)
+		}
+	}
+	for _, p := range files {
+		info, err := os.Stat(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !info.ModTime().Equal(past) {
+			t.Fatalf("重写了已满足的内核文件: %s mtime=%v want=%v", p, info.ModTime(), past)
+		}
+	}
+}
+
+func TestPeerMCPCodexEquivalentHeaderRefusesBlindSplice(t *testing.T) {
+	home := swapPeerMCPHome(t)
+	path := filepath.Join(home, ".codex", "config.toml")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// 引号表头是 toml 的等价形态;文本拼接不认,盲追加会造重复表定义打碎文件
+	quoted := "[mcp_servers.\"aliang-peer\"]\ncommand = \"/old/aliang\"\n"
+	if err := os.WriteFile(path, []byte(quoted), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyPeerMCPCodexRegistration(home, true); err == nil {
+		t.Fatal("等价表头形态注册应拒写")
+	}
+	if err := applyPeerMCPCodexRegistration(home, false); err == nil {
+		t.Fatal("等价表头形态注销同样应拒写(防假幂等)")
+	}
+	raw, _ := os.ReadFile(path)
+	if string(raw) != quoted {
+		t.Fatalf("拒写时不得改写文件:\n%s", raw)
+	}
 }

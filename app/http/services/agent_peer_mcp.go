@@ -48,7 +48,7 @@ const (
 // PeerMCPApplyResult 单内核注册结果(HTTP 状态回显的数据形状)。
 type PeerMCPApplyResult struct {
 	Kernel string             `json:"kernel"`          // "claude" | "codex"
-	State  PeerMCPKernelState `json:"state"`           // 应用后的状态(失败时为应用前状态)
+	State  PeerMCPKernelState `json:"state"`           // 应用后的状态;失败时为应用前状态,应用前读取失败时记 missing 并在 Error 说明
 	Error  string             `json:"error,omitempty"` // 非空=该内核应用失败,其余内核不受影响
 }
 
@@ -217,11 +217,7 @@ func EnsurePeerMCPMatchesConfigForTest(home string) {
 		return
 	}
 	register := config.GetGlobalConfig().EffectivePeerMCPEnabled()
-	for _, r := range ApplyPeerMCPRegistration(home, register) {
-		if r.Error != "" {
-			logger.Warn(fmt.Sprintf("peer-mcp: startup heal kernel=%s register=%v err=%s", r.Kernel, register, r.Error))
-		}
-	}
+	warnPeerMCPFailures(fmt.Sprintf("peer-mcp: startup heal register=%v", register), ApplyPeerMCPRegistration(home, register))
 }
 
 // ---------------------------------------------------------------------------
@@ -242,6 +238,9 @@ func applyPeerMCPClaudeRegistration(home string, register bool) error {
 		dec.UseNumber()
 		if err := dec.Decode(&root); err != nil {
 			return fmt.Errorf("parse %s: %w", path, err)
+		}
+		if root == nil {
+			root = map[string]interface{}{} // 文档字面 null 解出 nil map,直接写键会 panic
 		}
 	case os.IsNotExist(err):
 		if !register {
@@ -277,11 +276,16 @@ func applyPeerMCPClaudeRegistration(home string, register bool) error {
 		delete(servers, peerMCPManagedServerName)
 	}
 
-	out, err := json.MarshalIndent(root, "", "  ")
-	if err != nil {
+	// json.Encoder 而非 MarshalIndent:后者默认把用户内容里的 <>& 转义成
+	// < 等(语义等价但不必要地改写用户字节);Encoder 自带尾换行。
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(root); err != nil {
 		return fmt.Errorf("encode %s: %w", path, err)
 	}
-	return writePeerMCPFileAtomic(path, out)
+	return writePeerMCPFileAtomic(path, buf.Bytes())
 }
 
 // ---------------------------------------------------------------------------
@@ -320,6 +324,15 @@ func applyPeerMCPCodexRegistration(home string, register bool) error {
 		if strings.HasPrefix(trimmed, "[") {
 			end = i
 			break
+		}
+	}
+	if start < 0 {
+		// 文本扫描只认规范表头,toml 解析器却还认 [mcp_servers."aliang-peer"]
+		// 等引号/尾注释等价形态。此形态下 register 盲追加会造出重复表定义
+		// 直接打碎用户文件,注销则假幂等静默不删——两分支都拒写,让用户先
+		// 把表头规范成官方形态。
+		if _, found, parseErr := readPeerMCPCodexEntry(home); parseErr == nil && found {
+			return fmt.Errorf("codex config has an aliang-peer entry whose table header is not the canonical %s form; refusing to splice text to avoid corrupting the file; normalize the header manually first", header)
 		}
 	}
 
@@ -411,7 +424,17 @@ func writePeerMCPFileAtomic(path string, data []byte) error {
 
 // PeerMCPStatus 返回总开关与两内核注册状态(诚实回显,不写任何文件)。
 func (s *AgentService) PeerMCPStatus() map[string]interface{} {
-	states, err := peerMCPRegistrationStates(peerMCPHome())
+	home := peerMCPHome()
+	if home == "" {
+		// agentHome 可能解析不出家目录;filepath.Join("",...) 会把路径落进
+		// 进程 CWD,宁可如实报错也不读错地方。
+		return map[string]interface{}{
+			"enabled":      config.GetGlobalConfig().EffectivePeerMCPEnabled(),
+			"registration": nil,
+			"status_error": "agent home unavailable",
+		}
+	}
+	states, err := peerMCPRegistrationStates(home)
 	registration := states
 	if err != nil {
 		registration = nil
@@ -429,31 +452,54 @@ func (s *AgentService) PeerMCPStatus() map[string]interface{} {
 func (s *AgentService) SetPeerMCPRegistration(enable bool) map[string]interface{} {
 	syncPeerMCPConfigInMemory(enable)
 	home := peerMCPHome()
+	if home == "" {
+		// 同 PeerMCPStatus:home 缺失时绝不落盘(filepath.Join("",...) 会写
+		// 进进程 CWD),逐内核如实报错。
+		results := []PeerMCPApplyResult{
+			{Kernel: "claude", State: PeerMCPStateMissing, Error: "agent home unavailable"},
+			{Kernel: "codex", State: PeerMCPStateMissing, Error: "agent home unavailable"},
+		}
+		warnPeerMCPFailures(fmt.Sprintf("peer-mcp: apply register=%v", enable), results)
+		return map[string]interface{}{"enabled": enable, "registration": results}
+	}
 	results := ApplyPeerMCPRegistration(home, enable)
+	warnPeerMCPFailures(fmt.Sprintf("peer-mcp: apply register=%v", enable), results)
+	return map[string]interface{}{"enabled": enable, "registration": results}
+}
+
+// warnPeerMCPFailures 逐内核记录应用失败(只 Warn 不阻断)。
+func warnPeerMCPFailures(prefix string, results []PeerMCPApplyResult) {
 	for _, r := range results {
 		if r.Error != "" {
-			logger.Warn(fmt.Sprintf("peer-mcp: apply kernel=%s register=%v err=%s", r.Kernel, enable, r.Error))
+			logger.Warn(fmt.Sprintf("%s kernel=%s err=%s", prefix, r.Kernel, r.Error))
 		}
 	}
-	return map[string]interface{}{"enabled": enable, "registration": results}
 }
 
 // syncPeerMCPConfigInMemory 把开关同步进本进程内存全局配置:runtime 的配置
 // 快照只在启动时加载(core 负责落盘与 DB),不同步的话 agentcore 注入门控
-// 要等 agent 重启才生效。只动内存,磁盘持久化仍归 customer 配置通道。
+// 要等 agent 重启才生效。GetGlobalConfig 返回共享裸指针且读取方(agentcore
+// 注入门控每 run 无锁读)与之并发——绝不能锁外直改字段,必须像
+// customer_config_service 的提交路径一样:浅拷贝 Config、拷贝 Customer、
+// 在拷贝上设 PeerMCP,再 SetGlobalConfig 换指针。指针交换让读取方要么拿
+// 旧要么拿新、各自视为不可变,天然免竞争。只动内存,磁盘持久化仍归
+// customer 配置通道。
 func syncPeerMCPConfigInMemory(enable bool) {
-	cfg := config.GetGlobalConfig()
-	if cfg == nil {
+	old := config.GetGlobalConfig()
+	if old == nil {
 		return
 	}
-	if cfg.Customer == nil {
-		cfg.Customer = &config.CustomerConfig{}
+	next := *old
+	next.Customer = &config.CustomerConfig{}
+	if old.Customer != nil {
+		*next.Customer = *old.Customer
 	}
 	on := enable
-	cfg.Customer.PeerMCP = &config.PeerMCPConfig{Enable: &on}
+	next.Customer.PeerMCP = &config.PeerMCPConfig{Enable: &on}
+	config.SetGlobalConfig(&next)
 }
 
-func errorStringOrNil(err error) interface{} {
+func errorStringOrNil(err error) any {
 	if err == nil {
 		return nil
 	}
