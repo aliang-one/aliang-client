@@ -828,12 +828,13 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 		s.setRemoteConnectionState(true, "online", "")
 		logger.Info(fmt.Sprintf("[AGENT-PEER-LAN] listen_result at unexpected peer request_id=%s",
 			remoteString(msg, "request_id")))
-	// 注意：这四个旧工具事件（file.list/file.read/git.status/env.info）由下面的
+	// 注意：这五个旧工具事件（file.list/file.read/file.write/git.status/env.info；
+	// file.write 为 D3 新增，与 file.list/file.read 同走 agent_detail 臂）由下面的
 	// 显式臂直派、有意绕过 default 臂的 tools.RunWithGuards 护栏（无超时看门狗/
 	// 输出上限/panic 恢复）——响应形状兼容优先。注册表里它们的 caps（TimeoutMs/
 	// MaxOutputBytes）暂不对这两个臂生效。严禁新增 Event 与任何显式臂冲突的
 	// 注册表工具项（会被广告但永远不会走护栏分发）。
-	case models.AgentEventProjectDetail, models.AgentEventAISessionDetail, models.AgentEventFileList, models.AgentEventFileRead, models.AgentEventSlashCommandsList, "file.working_tree_diff":
+	case models.AgentEventProjectDetail, models.AgentEventAISessionDetail, models.AgentEventFileList, models.AgentEventFileRead, models.AgentEventFileWrite, models.AgentEventSlashCommandsList, "file.working_tree_diff":
 		s.setRemoteConnectionState(true, "online", "")
 		// 旧臂仍绕过 RunWithGuards(响应形状兼容优先,caps 暂不生效),但 panic
 		// 恢复必须兜住:裸 go 的 panic 顺 Go 语义杀全进程——read_file 是云端
@@ -1031,6 +1032,7 @@ func remoteAgentMessageRequiresEnabledDevice(msgType string) bool {
 		models.AgentEventFileList,
 		models.AgentEventFileRead,
 		models.AgentEventFileUpload,
+		models.AgentEventFileWrite,
 		models.AgentEventTransferUpload,
 		models.AgentEventTransferReceive,
 		"file.working_tree_diff",
