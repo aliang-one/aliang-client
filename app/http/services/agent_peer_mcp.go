@@ -505,3 +505,51 @@ func errorStringOrNil(err error) any {
 	}
 	return err.Error()
 }
+
+// ---------------------------------------------------------------------------
+// 语义等价契约(spec 2026-11-03 §8.4)
+// ---------------------------------------------------------------------------
+
+// PeerMCPContractSpec 钉住 stdio 面(cmd/mcp.go peerMCPTools)与 agentcore 面
+// (agent_peer_tools.go agentCorePeerTools)五工具的语义等价契约。两处描述符
+// 是手维护近似副本:三个工具名不同(agentcore 点名 vs stdio 无前缀)、描述
+// 措辞有差,仅执行后端同源。本契约只钉语义(参数面 + 关键行为约束双侧俱在),
+// 刻意不做统一改名。
+type PeerMCPContractSpec struct {
+	CoreName  string   // agentcore 面名(点名)
+	StdioName string   // stdio 面名(claude/codex 共用)
+	Required  []string // 双侧 required 必须一致
+	Optional  []string // 双侧可选参数名集必须一致
+	Keywords  []string // 双侧描述都必须出现的关键约束词
+}
+
+func PeerMCPContractSpecs() []PeerMCPContractSpec {
+	return []PeerMCPContractSpec{
+		{
+			CoreName: "peer.exec", StdioName: "peer_exec",
+			Required: []string{"device_id", "command"},
+			Optional: []string{"timeout_ms", "workdir"},
+			Keywords: []string{"peer exec enabled", "fail_reason=rate_limited", "Serial"},
+		},
+		{
+			CoreName: "peer.fetch_file", StdioName: "peer_fetch_file",
+			Required: []string{"device_id", "remote_path"},
+			Keywords: []string{"peer fetch enabled", "transfer_id"},
+		},
+		{
+			CoreName: "peer.device_list", StdioName: "device_list",
+			Keywords: []string{"peer exec is enabled"},
+		},
+		{
+			CoreName: "peer.device_info", StdioName: "device_info",
+			Optional: []string{"device_id"},
+			Keywords: []string{"load summary"},
+		},
+		{
+			CoreName: "peer.device_note", StdioName: "device_note",
+			Required: []string{"key", "value"},
+			Optional: []string{"device_id"},
+			Keywords: []string{"max 64 bytes", "max 4096 bytes"},
+		},
+	}
+}
