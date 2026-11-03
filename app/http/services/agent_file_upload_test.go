@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -110,6 +111,12 @@ type fakeCOSUploadServer struct {
 
 func newFakeCOSUploadServer(t *testing.T, statusCode int, chunkBytes int64, chunkDelay time.Duration) *fakeCOSUploadServer {
 	t.Helper()
+	// D4 钉扎落地后,file.upload 的假 COS(http://127.0.0.1:<port>)会被
+	// upload_url_not_allowed 拦下;本文件全部用例按 stub 放行,真实钉扎
+	// 逻辑由 TestAgentFileUploadRejectsNonCOSUploadURL 覆盖。
+	origHost := agentTransferHostAllowed
+	agentTransferHostAllowed = func(string) error { return nil }
+	t.Cleanup(func() { agentTransferHostAllowed = origHost })
 	f := &fakeCOSUploadServer{
 		statusCode: statusCode,
 		chunkBytes: chunkBytes,
@@ -491,6 +498,11 @@ func TestAgentFileUploadCancelAbortsInFlightPUT(t *testing.T) {
 // upload starts immediately instead of being told "in progress".
 func TestAgentFileUploadResponseHeaderHangReleasesSlot(t *testing.T) {
 	resetAgentFileUploadSlot(t)
+	// D4:自建 hang server(http://127.0.0.1:<port>)不走 newFakeCOSUploadServer
+	// 的放行 stub,须单独补;后文第二次上传用的假 COS helper 亦已自带 stub。
+	origHost := agentTransferHostAllowed
+	agentTransferHostAllowed = func(string) error { return nil }
+	t.Cleanup(func() { agentTransferHostAllowed = origHost })
 	project := t.TempDir()
 	writeAgentUploadFile(t, project, "hang.bin", 4096)
 
@@ -631,6 +643,39 @@ func TestHandleRemoteAgentMessageUploadDisabledGate(t *testing.T) {
 	for _, m := range written[before:] {
 		if m["type"] == models.AgentEventError {
 			t.Fatalf("file.upload.cancel on a disabled device must not be rejected, got error %v", m)
+		}
+	}
+}
+
+// D4(spec 2026-11-02):file.upload 的 upload_url 必须过 COS 域钉扎,
+// 与互传通道同族一致;报错不回显 URL(防签名泄漏)。
+func TestAgentFileUploadRejectsNonCOSUploadURL(t *testing.T) {
+	orig := agentTransferHostAllowed
+	agentTransferHostAllowed = agentTransferHostAllowedDefault
+	defer func() { agentTransferHostAllowed = orig }()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "x.txt"), []byte("data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []string{
+		"http://bucket.cos.ap-beijing.myqcloud.com/x",       // 非 https
+		"https://bucket.cos.ap-beijing.myqcloud.com:8443/x", // 显式端口
+		"https://evil.example.com/x",                        // 非 COS 域
+	} {
+		var got map[string]interface{}
+		w := func(v interface{}) error { got = v.(map[string]interface{}); return nil }
+		msg := map[string]interface{}{
+			"type": models.AgentEventFileUpload, "request_id": "req-pin",
+			"project_path": dir, "path": "x.txt", "max_bytes": 100,
+			"upload_url": bad,
+		}
+		handleAgentFileUploadRun(context.Background(), msg, w)
+		if got["error_code"] != "upload_url_not_allowed" {
+			t.Fatalf("upload_url %q: want error_code=upload_url_not_allowed, got %v", bad, got)
+		}
+		if strings.Contains(fmt.Sprint(got["error"]), bad) {
+			t.Fatalf("error text must not echo the URL: %v", got["error"])
 		}
 	}
 }

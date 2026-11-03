@@ -103,6 +103,11 @@ func handleAgentFileUploadRun(ctx context.Context, msg map[string]interface{}, w
 			logger.Warn(fmt.Sprintf("[file.upload] write error payload failed (request %s): %v", requestID, werr))
 		}
 	}
+	emitErrCode := func(code string, err error) {
+		if werr := writeJSON(agentFileErrorPayloadCode(requestID, code, err)); werr != nil {
+			logger.Warn(fmt.Sprintf("[file.upload] write error payload failed (request %s): %v", requestID, werr))
+		}
+	}
 	projectPath, err := resolveAgentProjectPath(remoteString(msg, "project_path"))
 	if err != nil {
 		emitErr(err)
@@ -132,6 +137,12 @@ func handleAgentFileUploadRun(ctx context.Context, msg map[string]interface{}, w
 	uploadURL := remoteString(msg, "upload_url")
 	if uploadURL == "" {
 		emitErr(errors.New("missing upload_url"))
+		return
+	}
+	// D4(spec 2026-11-02):与互传通道同族钉扎。报错文本不回显 URL
+	// (agentTransferHostAllowed 已保证),结构化码供手机端细分提示。
+	if err := agentTransferHostAllowed(uploadURL); err != nil {
+		emitErrCode("upload_url_not_allowed", err)
 		return
 	}
 	file, err := os.Open(targetPath)
