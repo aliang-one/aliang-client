@@ -531,6 +531,10 @@ type CustomerConfig struct {
 	// AgentCore 是 AliangCode 内核的行为调优设置(customer.agentcore)。nil 时
 	// 全部字段走内核默认值——这是未配置时的线上形态,不许有隐式副作用。
 	AgentCore *AgentCoreTuningConfig `json:"agentcore,omitempty"`
+	// PeerMCP 是 aliang-peer 跨设备 MCP 工具面的总开关(customer.peer_mcp)。
+	// nil 时 Enable 视为 true——对齐 agentcore peer 注入的既有现状(默认开),
+	// 升级不产生行为回退。它门控三处:agentcore 注入、claude/codex 注册。
+	PeerMCP *PeerMCPConfig `json:"peer_mcp,omitempty"`
 }
 
 // CustomerGeoIPSettings 自定义 GeoIP 国家库下载源（customer.geoip）。
@@ -669,6 +673,22 @@ func (c *Config) EffectiveAgentCoreSkillsEnabled() bool {
 		return true
 	}
 	return *c.Customer.AgentCore.SkillsEnabled
+}
+
+// PeerMCPConfig 控制 aliang-peer 跨设备工具面(customer.peer_mcp)。三态指针
+// 语义与 agentcore.mcp_enabled 同族:nil=未配置(默认开)、true/false=显式。
+type PeerMCPConfig struct {
+	Enable *bool `json:"enable,omitempty"`
+}
+
+// EffectivePeerMCPEnabled 返回 aliang-peer 跨设备工具面是否开启。默认开启:
+// peer 工具是既有能力(agentcore 已默认注入),加开关不能把没配过的人的功能
+// 关掉。只有显式写成 false 才关闭。
+func (c *Config) EffectivePeerMCPEnabled() bool {
+	if c == nil || c.Customer == nil || c.Customer.PeerMCP == nil || c.Customer.PeerMCP.Enable == nil {
+		return true
+	}
+	return *c.Customer.PeerMCP.Enable
 }
 
 // EffectiveAgentCoreMaxIdenticalToolTurns 返回打转守卫阈值;未配置(0/nil/负数)
@@ -1034,7 +1054,7 @@ func (c *Config) customerUnknownKeyErrors() error {
 	if len(c.customerUnknownFields) > 0 {
 		sorted := append([]string(nil), c.customerUnknownFields...)
 		sort.Strings(sorted)
-		return fmt.Errorf("customer.%s is forbidden: editable customer fields are [proxy ai_rules proxy_rules traffic_mirror http1_drop model_mapping custom_env_vars geoip agentcore_llm agentcore]", sorted[0])
+		return fmt.Errorf("customer.%s is forbidden: editable customer fields are [proxy ai_rules proxy_rules traffic_mirror http1_drop model_mapping custom_env_vars geoip agentcore_llm agentcore peer_mcp]", sorted[0])
 	}
 
 	providers := make([]string, 0, len(c.aiRuleUnknownFields))
@@ -1071,7 +1091,7 @@ func extractCustomerUnknownFields(root map[string]json.RawMessage) ([]string, ma
 
 	for key := range customerRoot {
 		switch key {
-		case "proxy", "ai_rules", "proxy_rules", "traffic_mirror", "http1_drop", "model_mapping", "custom_env_vars", "geoip", "agentcore_llm", "agentcore":
+		case "proxy", "ai_rules", "proxy_rules", "traffic_mirror", "http1_drop", "model_mapping", "custom_env_vars", "geoip", "agentcore_llm", "agentcore", "peer_mcp":
 		default:
 			unknownCustomer = append(unknownCustomer, key)
 		}
