@@ -301,3 +301,19 @@ func TestPeerMCPCodexEquivalentHeaderRefusesBlindSplice(t *testing.T) {
 		t.Fatalf("拒写时不得改写文件:\n%s", raw)
 	}
 }
+
+func TestAgentCorePeerToolsGatedByPeerMCPEnabled(t *testing.T) {
+	swapPeerMCPHome(t) // 防 agentHome 意外落真实家目录(本测试不写文件,防御性)
+	config.ResetGlobalConfigForTest()
+	t.Cleanup(config.ResetGlobalConfigForTest)
+	m := newAgentAIManager()
+	run := agentAIRun{sessionID: "gate"}
+	if len(m.agentCorePeerTools(run)) == 0 {
+		t.Fatal("默认(未配置)应注入 peer 工具")
+	}
+	off := false
+	config.SetGlobalConfig(&config.Config{Customer: &config.CustomerConfig{PeerMCP: &config.PeerMCPConfig{Enable: &off}}})
+	if got := m.agentCorePeerTools(run); len(got) != 0 {
+		t.Fatalf("显式关闭后不应注入 peer 工具, got %d", len(got))
+	}
+}
