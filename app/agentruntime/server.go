@@ -87,6 +87,10 @@ func StartLocalServer() error {
 	services.StartUsageTrackerRuntime()
 	services.StartAgentRegistrationKeepalive()
 	services.WarmAgentAuthorizedExecutionDirectories()
+	// aliang-peer 注册自愈:按 customer.peer_mcp 对齐内核配置文件(开=确保
+	// 注册且 command 最新;关=确保注销)。只 Warn 不阻断启动;应用细节见
+	// services.EnsurePeerMCPMatchesConfig。
+	services.EnsurePeerMCPMatchesConfig()
 	logger.Info("[AGENT-BOOT] local_server awaiting session owner sync")
 	return nil
 }
