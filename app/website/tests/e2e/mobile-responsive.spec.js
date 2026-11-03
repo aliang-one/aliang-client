@@ -84,7 +84,7 @@ test.describe('mobile 390x844', () => {
     await expect(page.locator('#settings-page')).toBeVisible();
     const tabs = page.locator('div.grid.grid-cols-2.md\\:hidden > button');
     const count = await tabs.count();
-    expect(count).toBeGreaterThanOrEqual(5);
+    expect(count).toBe(4); // 2026-11-03 四栏重组:代理设置/Agent/状态/用户 2×2
     for (let i = 0; i < count; i++) {
       await tabs.nth(i).click();
       await expect(tabs.nth(i)).toHaveClass(/border-primary/);
@@ -101,7 +101,7 @@ test.describe('mobile 390x844', () => {
     await expect(topbarEntry).toBeVisible();
     await topbarEntry.click();
     await expect(page.locator('#settings-page')).toBeVisible();
-    await expect(page.locator('#settings-page h1').first()).toContainText(/设备与网络|Device & Network/);
+    await expect(page.locator('#settings-page h1').first()).toContainText(/Agent/);
 
     // 回到仪表板，走折叠面板整行入口
     await page.locator('#backToDashboard').click();
@@ -110,7 +110,7 @@ test.describe('mobile 390x844', () => {
     const panelEntry = page.locator('[data-testid="agent-entry-panel"]');
     await expect(panelEntry).toBeVisible();
     await panelEntry.click();
-    await expect(page.locator('#settings-page h1').first()).toContainText(/设备与网络|Device & Network/);
+    await expect(page.locator('#settings-page h1').first()).toContainText(/Agent/);
   });
 
   test('登录弹窗在视口内且可滚动到底部按钮', async ({ page }) => {
@@ -174,12 +174,12 @@ test.describe('desktop 1280x800 控制组（桌面零变化）', () => {
 
     await sidebarEntry.click();
     await expect(page.locator('#settings-page')).toBeVisible();
-    await expect(page.locator('#settings-page h1').first()).toContainText(/设备与网络|Device & Network/);
+    await expect(page.locator('#settings-page h1').first()).toContainText(/Agent/);
 
     await page.locator('#backToDashboard').click();
     await expect(page.locator('h1').first()).toContainText('ALiang');
     await headerEntry.click();
-    await expect(page.locator('#settings-page h1').first()).toContainText(/设备与网络|Device & Network/);
+    await expect(page.locator('#settings-page h1').first()).toContainText(/Agent/);
   });
 });
 

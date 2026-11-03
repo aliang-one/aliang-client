@@ -16,11 +16,20 @@
       </div>
       <div class="flex shrink-0 items-center gap-2">
         <label
-          class="inline-flex min-h-11 cursor-pointer items-center gap-1.5 rounded-lg border border-slate-200 px-3 text-xs font-semibold text-slate-600 dark:border-slate-700 dark:text-slate-300"
-          :title="t('agent_activity_onlyAliangCodeHint')"
+          class="inline-flex min-h-11 items-center gap-1.5 rounded-lg border border-slate-200 px-3 text-xs font-semibold text-slate-600 dark:border-slate-700 dark:text-slate-300"
         >
-          <input v-model="onlyAliangCode" type="checkbox" class="h-3.5 w-3.5 accent-primary" />
-          {{ t('agent_activity_onlyAliangCode') }}
+          <span>{{ t('agent_activity_filterLabel') }}</span>
+          <select
+            v-model="agentFilter"
+            class="h-8 rounded border border-slate-200 bg-transparent px-1 text-xs dark:border-slate-700"
+            :aria-label="t('agent_activity_filterLabel')"
+          >
+            <option value="all">{{ t('agent_activity_filterAll') }}</option>
+            <option value="claude">Claude</option>
+            <option value="codex">Codex</option>
+            <option value="aliangcode">AliangCode</option>
+            <option value="opencode">OpenCode</option>
+          </select>
         </label>
         <button
           type="button"
@@ -196,6 +205,20 @@ import { getAgentRuntimeSessions, getAgentSessions, getAgentSessionDetail } from
 import { isAliangCodeSession } from '../../utils/chatSettings';
 import { useI18n } from '../../i18n';
 
+// 记录页 agent 类型筛选（2026-11-03 设置页四栏重组）：aliangcode 判据与
+// 聊天窗同源（chatSettings.isAliangCodeSession），其余按 tool/provider 名
+// 包含匹配；未知来源仅在「全部」可见。导出纯函数供单测（RulesSettings 范式）。
+export function matchesAgentFilter(session, filter) {
+  if (!session) return false;
+  if (filter === 'all') return true;
+  if (filter === 'aliangcode') return isAliangCodeSession(session);
+  const name = String(session.tool || session.provider || '').toLowerCase();
+  if (filter === 'claude') return name.includes('claude');
+  if (filter === 'codex') return name.includes('codex');
+  if (filter === 'opencode') return name.includes('opencode');
+  return false;
+}
+
 export default {
   name: 'AgentActivitySettings',
   setup() {
@@ -217,24 +240,22 @@ export default {
       detailLoading: false,
       hasMore: false,
       nextBefore: '',
-      // 默认只看 AliangCode（用户拍板 2026-10-30）：本页此前是全量三源审计面，
-      // 现在默认收敛到自家 agent；需要看其他 CLI 时手动开启（不丢能力）。
-      onlyAliangCode: true,
+      // agent 类型筛选（2026-11-03 四栏重组：记录页定位为「各种 coding agent」
+      // 的全量视角，默认全部；aliangcode 有独立子 tab，不再默认收敛）。
+      agentFilter: 'all',
     };
   },
   computed: {
     runningIds() {
       return new Set(this.runtimeAi.map((session) => session.id));
     },
-    // AliangCode 判据与聊天窗共用（chatSettings.isAliangCodeSession），
-    // 防两处词表漂移。
+    // agent 类型筛选（matchesAgentFilter：aliangcode 走 isAliangCodeSession
+    // 同源判据，其余按名匹配；名字沿用 scoped*，消费方 decoratedSessions 不动）。
     scopedSessions() {
-      if (!this.onlyAliangCode) return this.sessions;
-      return this.sessions.filter((session) => isAliangCodeSession(session));
+      return this.sessions.filter((session) => matchesAgentFilter(session, this.agentFilter));
     },
     scopedRuntimeAi() {
-      if (!this.onlyAliangCode) return this.runtimeAi;
-      return this.runtimeAi.filter((session) => isAliangCodeSession(session));
+      return this.runtimeAi.filter((session) => matchesAgentFilter(session, this.agentFilter));
     },
     decoratedSessions() {
       const historyIds = new Set(this.scopedSessions.map((session) => session.id));
