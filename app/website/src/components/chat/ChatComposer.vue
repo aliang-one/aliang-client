@@ -51,11 +51,12 @@
             <span class="truncate text-xs text-slate-500 dark:text-slate-400">{{ c.description }}</span>
           </button>
         </div>
-        <!-- 胶囊容器 + 自增高 textarea（≤6 行 = 144px）。focus 环挂在容器
-             focus-within 上；触控定式 min-h-[40px] md:min-h-0 保留在 textarea
-             与发送键上。 -->
+        <!-- 胶囊容器 + 自增高 textarea（≤6 行 = 144px）+ 动作键内嵌。focus
+             环挂在容器 focus-within 上。动作键内嵌（2026-11-04 圆角直角混存
+             修复）：等高 pill(16px 圆角)外贴 rounded-lg 按钮读作「圆角胶囊+
+             直角方块」；键收进 pill 后全部圆角同族，多行增高时键贴底。 -->
         <div
-          class="flex items-end rounded-2xl border border-slate-200 bg-white transition focus-within:border-primary dark:border-slate-600 dark:bg-slate-800"
+          class="flex items-end gap-1.5 rounded-2xl border border-slate-200 bg-white p-1.5 pl-2 transition focus-within:border-primary dark:border-slate-600 dark:bg-slate-800"
         >
           <!-- min-h-[40px] 全端生效（不随 md 折叠回 0）：空输入时桌面端不再被
                autosize 压成 ~36px 细条（2026-11-04 用户反馈「太矮」）。autosize
@@ -66,41 +67,40 @@
             rows="1"
             :placeholder="placeholder"
             :disabled="disabled"
-            class="min-h-[40px] w-full resize-none bg-transparent px-3 py-2 text-sm text-slate-700 outline-none placeholder:text-slate-400 dark:text-slate-100 dark:placeholder:text-slate-500"
+            class="chat-composer-field min-h-[36px] min-w-0 w-full flex-1 resize-none bg-transparent px-2 py-2 text-sm text-slate-700 outline-none placeholder:text-slate-400 dark:text-slate-100 dark:placeholder:text-slate-500"
             @input="onInput"
             @keydown="onInputKeydown"
             @blur="closeSlashDeferred"
           ></textarea>
+          <!-- 动作槽（Task 9，对齐手机端交替语义）：非 running → 发送键；running
+               且输入非空 → 发送键（点击走既有 steer 分流——emit('send') 不变，
+               label 沿用 插话中/发送，disabled 沿用 sendDisabled）；running 且输入
+               空 → 停止键（emit('stop') 接 ai.stop，目标 id 与 steer 同构）。
+               审批等待期 textarea 禁用，带草稿时用户清不了空——放宽让停止键
+               成为自救出口；非审批态仍要求空输入（避免误触打断运行中回合）。
+               steerBlocked 时停止键整体隐藏：claude_/codex_ 壳无 stop 目标，点了
+               静默无帧（同插话阻断根因），blocked 提示条已说明处境——占住键位只会
+               制造「可点但无效」的死按钮。移动端 h-10 保 40px 触控底线，桌面 h-9
+               与 pill 比例协调。 -->
+          <button
+            v-if="running && (!hasInput || approvalBlocked) && !steerBlocked"
+            type="button"
+            data-testid="chat-stop-button"
+            class="mb-0.5 flex h-10 shrink-0 items-center gap-1 rounded-xl bg-slate-200 px-3 text-sm font-semibold text-slate-500 transition hover:bg-slate-300 md:h-9 md:px-3.5 dark:bg-slate-700 dark:text-slate-400 dark:hover:bg-slate-600"
+            @click="emit('stop')"
+          >
+            <span class="material-symbols-outlined text-base leading-none">stop_circle</span>
+            <span>{{ t('chat_stop') }}</span>
+          </button>
+          <button
+            v-else
+            type="button"
+            class="mb-0.5 h-10 shrink-0 rounded-xl bg-primary px-3.5 text-sm font-semibold text-white transition hover:bg-primary/90 md:h-9 md:px-4"
+            :disabled="disabled"
+            @click="onSendAction"
+          >{{ label }}</button>
         </div>
       </div>
-      <!-- 动作槽（Task 9，对齐手机端交替语义）：非 running → 发送键；running
-           且输入非空 → 发送键（点击走既有 steer 分流——emit('send') 不变，
-           label 沿用 插话中/发送，disabled 沿用 sendDisabled）；running 且输入
-           空 → 停止键（emit('stop') 接 ai.stop，目标 id 与 steer 同构）。
-           审批等待期 textarea 禁用，带草稿时用户清不了空——放宽让停止键
-           成为自救出口；非审批态仍要求空输入（避免误触打断运行中回合）。
-           Task 8 占位的「running 即整键禁用」死路径已删——触控端 running 时
-           两个键位至少有一个可点。
-           steerBlocked 时停止键整体隐藏：claude_/codex_ 壳无 stop 目标，点了
-           静默无帧（同插话阻断根因），blocked 提示条已说明处境——占住键位只会
-           制造「可点但无效」的死按钮。 -->
-      <button
-        v-if="running && (!hasInput || approvalBlocked) && !steerBlocked"
-        type="button"
-        data-testid="chat-stop-button"
-        class="min-h-[40px] flex shrink-0 items-center gap-1 rounded-lg bg-slate-200 px-4 text-sm font-semibold text-slate-500 transition hover:bg-slate-300 dark:bg-slate-700 dark:text-slate-400 dark:hover:bg-slate-600"
-        @click="emit('stop')"
-      >
-        <span class="material-symbols-outlined text-base leading-none">stop_circle</span>
-        <span>{{ t('chat_stop') }}</span>
-      </button>
-      <button
-        v-else
-        type="button"
-        class="min-h-[40px] shrink-0 rounded-lg bg-primary px-4 text-sm font-semibold text-white transition hover:bg-primary/90"
-        :disabled="disabled"
-        @click="onSendAction"
-      >{{ label }}</button>
     </div>
   </div>
 </template>
@@ -183,12 +183,15 @@ const inputModel = computed({
 });
 
 // 自增高：输入即按内容撑开（auto → min(scrollHeight, 144px)）；发送后
-// modelValue 清空，watch 复位单行。
+// modelValue 清空，watch 复位单行。scrollHeight ≤ 0（未布局/隐藏期测量）
+// 不写内联高度——写 0 会留下 height:0px 残留，靠 CSS min-height 兜底是
+// 脆弱形态（2026-11-04 实测 bind 期测出 0 的高度残留）。
 function autosize() {
   const el = inputEl;
   if (!el) return;
   el.style.height = 'auto';
-  el.style.height = `${Math.min(el.scrollHeight, TEXTAREA_MAX_HEIGHT)}px`;
+  const h = el.scrollHeight;
+  if (h > 0) el.style.height = `${Math.min(h, TEXTAREA_MAX_HEIGHT)}px`;
 }
 
 function resetHeight() {
@@ -269,3 +272,16 @@ function closeSlashDeferred() {
   setTimeout(() => { emit('slash-close'); }, 150);
 }
 </script>
+
+<style scoped>
+/* 免疫性兜底(2026-11-04「圆角直角混存」实锤):某浏览器层来源(本机 Chrome
+   实测 UA 级蓝色 border+ring 挂在 textarea 上,页面 author 规则遍历与 CDP
+   getMatchedStylesForNode 双双查无此规则)给聚焦框画出直角,叠在圆角 pill
+   里。author !important 在级联中压过 UA/用户层一切声明——这里强制裸形态,
+   焦点态由 pill 的 focus-within 统一表达,圆角给 12px 防残留描边露角。 */
+.chat-composer-field {
+  border: none !important;
+  box-shadow: none !important;
+  border-radius: 12px !important;
+}
+</style>

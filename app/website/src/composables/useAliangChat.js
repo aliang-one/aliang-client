@@ -956,6 +956,17 @@ export function useAliangChat() {
       }
     }
 
+    // 锚定 user 气泡之后本地是否已有 assistant 气泡——「无气泡」形态（占位
+    // 未落盘的刷新窗口/历史陈旧缓存）由快照补建；有气泡则走对齐/收敛。
+    let hasAssistantAfter = false;
+    if (turnIsOurs && localLastUser) {
+      const userIdxLocal = local.messages.findIndex(
+        (m) => m.role === 'user' && m.messageId === localLastUser.messageId
+      );
+      hasAssistantAfter = userIdxLocal >= 0
+        && local.messages.slice(userIdxLocal + 1).some((m) => m.role === 'assistant');
+    }
+
     if (asst) {
       if (e.status === 'running') {
         // 流继续：锚定成立的 runText 前缀对齐（空气泡回填/部分内容延伸）；
@@ -983,6 +994,34 @@ export function useAliangChat() {
         if (activeId.value === local.id) scrollToBottom();
       }
       // inFlight 且收敛态：不动作——终态帧/下一轮快照负责收敛。
+    } else if (!inFlight && turnIsOurs && !hasAssistantAfter) {
+      // 无气泡形态（2026-11-04 刷新丢回答事故主形态）：占位气泡未落盘或
+      // 历史缓存缺答案，快照是唯一真值——running 补建运行态（后续 delta
+      // 经订阅续流落进它）；idle 且 journal 有锚定回答则补建完成气泡，
+      // 历史丢失的回答就此修复。hasAssistantAfter 守卫防对已完成会话
+      // 重复补气泡（全量订阅后每个会话都会收到快照）。
+      if (e.status === 'running') {
+        local.messages.push({
+          role: 'assistant',
+          content: runText || '',
+          status: 'running',
+          ts: now(),
+        });
+        if ((local.id === activeId.value || !idleWatchdogTimer) && !inFlight) {
+          armIdleWatchdog(local);
+        }
+        if (activeId.value === local.id) scrollToBottom();
+      } else if (runText) {
+        local.messages.push({
+          role: 'assistant',
+          content: runText,
+          status: 'done',
+          ts: now(),
+        });
+        clearApprovalsForSession(local, sessionId);
+        finishRun(local);
+        if (activeId.value === local.id) scrollToBottom();
+      }
     }
     // pending_approvals 恢复与状态分支解耦（审批等待中关窗重进：running
     // 快照同样带在挂审批，任何早退分支都不得丢）。
@@ -2167,8 +2206,13 @@ export function useAliangChat() {
 
     // Live assistant placeholder: its content fills in token-by-token as
     // ai.delta frames arrive, and its status drives the running -> done UI.
+    // 占位气泡必须即时落盘(2026-11-04 刷新丢回答事故):delta 只进内存不落
+    // 盘,占位若不持久化,刷新后恢复的会话末尾只有 user 气泡——运行态消失、
+    // 且 resubscribeRestoredRuns 以「存在 running 气泡」为触发,对账通道
+    // 整体哑火,答案永远追不回。create 被拒的早退分支会移除空占位并重存。
     const assistantMsg = { role: 'assistant', content: '', status: 'running', ts: now() };
     conv.messages.push(assistantMsg);
+    saveToStorage();
     scrollToBottom(true);
 
     sending.value = true;
@@ -2219,16 +2263,19 @@ export function useAliangChat() {
     showDashboard();
   }
 
-  // 重进页对账（后台静默运行，2026-11-04）：localStorage 恢复的 running 气泡
-  // 只是「上次窗口看到的局部视角」，run 在 agent 侧照跑、终态在 journal/会话
-  // 态里。对仍有 running 气泡的本地会话发订阅拿快照（ai.session.snapshot），
-  // 快照路由进 handleDeviceSnapshot 的本地对账分支收敛真值；running → 续流。
-  // 设备壳不落盘（重进页不在会话池），打开时 openDeviceSession 自带订阅，
-  // 无需此处处理。
+  // 重进页对账（后台静默运行，2026-11-04）：**会话状态的权威在 agent 侧**
+  // （journal + 会话态），localStorage 只是视图缓存。因此对账绝不能以本地
+  // 缓存形态（恰好有 running 气泡）为触发前提——占位气泡没落盘、或历史
+  // 陈旧缓存缺答案时，按缓存触发的订阅会整体哑火，答案永远追不回（用户
+  // 实测：刷新后回答与运行态双双消失）。正解：凡有 aiSessionId 的本地会话
+  // 一律订阅，由 Go 侧快照决定前端形态——running 补建运行态、idle+journal
+  // 补答案（见 reconcileLocalSnapshot）。设备壳不落盘（重进页不在会话池），
+  // 打开时 openDeviceSession 自带订阅，无需此处处理。
   async function resubscribeRestoredRuns() {
-    const targets = conversations.value.filter(
-      (c) => !c.deviceSession && !!c.aiSessionId && !!findRunningAssistant(c)
-    );
+    const targets = conversations.value
+      .filter((c) => !c.deviceSession && !!c.aiSessionId)
+      .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))
+      .slice(0, 32); // 爆发上限：一次性订阅全量清单,防超大历史刷屏
     if (!targets.length) return;
     try {
       await ensureAISocket();
