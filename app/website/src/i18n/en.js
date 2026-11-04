@@ -568,18 +568,19 @@ export default {
   settings_live: 'LIVE',
   // Section subtitles (four-section IA reorganisation 2026-11-03: Proxy → Agent → Status → User)
   settings_sectionProxyDesc: 'Outbound proxy, AI rules, routing rules and model mapping. Applies to new sessions and the proxy layer.',
-  settings_sectionAgentDesc: 'Session records, the user-mode agent, and the aliangcode kernel settings in one place.',
+  settings_sectionAgentDesc: 'Session records, the user-mode agent, the aliangcode kernel, and device mesh settings in one place.',
   settings_sectionAccountDesc: 'Account identity and local display preferences.',
   settings_sectionStatusDesc: 'Read-only observation: live logs. Device-level switches live in Other at the bottom.',
   settings_scopeDevice: 'This device only; not synced across devices',
   settings_scopeLocal: 'This browser only',
-  // Agent sub-tabs (four-section reorganisation 2026-11-03)
+  // Agent sub-tabs (four-section reorganisation 2026-11-03; device mesh added 2026-11-04)
   agent_subRecords: 'Records',
   agent_subUserAgent: 'User-mode agent',
   agent_subAliangCode: 'aliangcode',
+  agent_subPeerAccess: 'Device Access',
   // Status page trailing Other section (device-level misc)
   settings_otherTitle: 'Other',
-  settings_otherDesc: 'Device-level switches and system misc: peer access, run mode, file access authorization.',
+  settings_otherDesc: 'Device-level switches and system misc: run mode and file access authorization.',
   // Grayed-out placeholder switches (device-gate layer peer_exec_enabled / peer_fetch_enabled;
   // source of truth lives in the server device registry, write channel lands cross-repo later)
   settings_peerExecPendingTitle: 'Cross-device execution',

@@ -1,18 +1,20 @@
 <template>
   <div class="flex flex-col gap-5">
     <!-- 子 tab：key 词表唯一真值源 = useNavigation.AGENT_SUB_TABS，状态在导航层，
-         支持 showPage('agent', { sub }) 深链定向（2026-11-03 四栏重组）。 -->
-    <div class="flex flex-wrap gap-2" role="tablist" :aria-label="t('settings_tabAgent')">
+         支持 showPage('agent', { sub }) 深链定向（2026-11-03 四栏重组）。
+         样式为 navitem 下划线式（对齐顶导航先例）；非激活垫 border-transparent
+         防切换跳动，min-h-10 保触控目标，flex-wrap 供 390px 哨兵兜底。 -->
+    <div class="flex flex-wrap items-center gap-x-5 gap-y-2 border-b border-slate-200 dark:border-slate-700" role="tablist" :aria-label="t('settings_tabAgent')">
       <button
         v-for="tab in agentSubTabs"
         :key="tab.key"
         type="button"
         role="tab"
         :aria-selected="active === tab.key"
-        class="min-h-10 rounded-full px-4 text-xs font-bold transition"
+        class="min-h-10 border-b-2 px-1 py-2 text-sm font-medium transition"
         :class="active === tab.key
-          ? 'bg-primary text-white shadow-sm'
-          : 'bg-slate-100 text-slate-600 hover:bg-slate-200 dark:bg-slate-800 dark:text-slate-300 dark:hover:bg-slate-700/70'"
+          ? 'border-primary text-primary'
+          : 'border-transparent text-slate-500 hover:text-slate-700 dark:text-slate-300 dark:hover:text-slate-100'"
         @click="switchTab(tab.key)"
       >
         {{ t(tab.labelKey) }}
@@ -28,6 +30,19 @@
       <AgentSettings />
       <AgentScanDirectoriesSettings />
       <AgentIntegrationsSettings />
+    </template>
+
+    <!-- 设备互访：customerConfig 依赖登录态的卡片（PeerMCPSettings 两段式保存
+         需父页 config/save 透传；门禁占位卡为纯展示）。 -->
+    <template v-else-if="active === 'peer-access'">
+      <PeerAccessSettings
+        :config="config"
+        :loading="loading"
+        :saving="saving"
+        :error="error"
+        :success-message="successMessage"
+        @save="emitSave"
+      />
     </template>
 
     <!-- aliangcode：customerConfig 依赖登录态，唯一带登录占位的子 tab
@@ -95,6 +110,7 @@ import AgentCoreSettings from '../AgentCoreSettings.vue';
 import AgentMCPGlobalSettings from '../AgentMCPGlobalSettings.vue';
 import AgentSkillsGlobalSettings from '../AgentSkillsGlobalSettings.vue';
 import CustomEnvSettings from '../CustomEnvSettings.vue';
+import PeerAccessSettings from './PeerAccessSettings.vue';
 import { useNavigation } from '../../../composables/useNavigation';
 import { useAuthStore } from '../../../stores/auth';
 import { useI18n } from '../../../i18n';
@@ -104,7 +120,8 @@ import { useI18n } from '../../../i18n';
 const agentSubTabs = [
   { key: 'records', labelKey: 'agent_subRecords' },
   { key: 'user-agent', labelKey: 'agent_subUserAgent' },
-  { key: 'aliangcode', labelKey: 'agent_subAliangCode' }
+  { key: 'aliangcode', labelKey: 'agent_subAliangCode' },
+  { key: 'peer-access', labelKey: 'agent_subPeerAccess' }
 ];
 
 export default {
@@ -118,7 +135,8 @@ export default {
     AgentCoreSettings,
     AgentMCPGlobalSettings,
     AgentSkillsGlobalSettings,
-    CustomEnvSettings
+    CustomEnvSettings,
+    PeerAccessSettings
   },
   props: {
     config: { type: Object, default: () => ({}) },

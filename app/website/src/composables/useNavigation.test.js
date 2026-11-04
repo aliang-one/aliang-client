@@ -84,6 +84,12 @@ describe('useNavigation agentSubTab', () => {
   });
 
   it('AGENT_SUB_TABS 词表与 AgentPage 子 tab 一一对应', () => {
-    expect(AGENT_SUB_TABS).toEqual(['records', 'user-agent', 'aliangcode']);
+    expect(AGENT_SUB_TABS).toEqual(['records', 'user-agent', 'aliangcode', 'peer-access']);
+  });
+
+  it('peer-access 是合法子 tab（深链写入不被归一）', () => {
+    const nav = useNavigation();
+    nav.showPage('agent', { sub: 'peer-access' });
+    expect(nav.agentSubTab.value).toBe('peer-access');
   });
 });

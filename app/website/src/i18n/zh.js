@@ -565,18 +565,19 @@ export default {
   settings_live: '在线',
   // 分区副标题（四栏重组 2026-11-03：代理设置 → Agent → 状态 → 用户）
   settings_sectionProxyDesc: '出站代理、AI 规则、分流规则与模型映射。仅影响新会话与代理层。',
-  settings_sectionAgentDesc: '会话记录、用户态 Agent 与 aliangcode 内核设置集中地。',
+  settings_sectionAgentDesc: '会话记录、用户态 Agent、aliangcode 内核与设备互访设置集中地。',
   settings_sectionAccountDesc: '账户身份与本机显示偏好。',
   settings_sectionStatusDesc: '只读观测：实时日志；页尾「其他」为设备级开关杂项。',
   settings_scopeDevice: '本机生效，换设备不同步',
   settings_scopeLocal: '仅本机浏览器',
-  // Agent 三子 tab（四栏重组 2026-11-03）
+  // Agent 四子 tab（四栏重组 2026-11-03；2026-11-04 增设备互访）
   agent_subRecords: '记录',
   agent_subUserAgent: '用户态 agent',
   agent_subAliangCode: 'aliangcode',
+  agent_subPeerAccess: '设备互访',
   // 状态页尾「其他」区块（设备级杂项集中地）
   settings_otherTitle: '其他',
-  settings_otherDesc: '设备级开关与系统杂项：设备互访、运行模式、文件访问授权。',
+  settings_otherDesc: '设备级开关与系统杂项：运行模式、文件访问授权。',
   // 置灰占位开关（设备门禁层 peer_exec_enabled / peer_fetch_enabled，
   // 真值源在服务端设备注册表，写通道待跨仓落地，先占位零请求）
   settings_peerExecPendingTitle: '跨设备执行',

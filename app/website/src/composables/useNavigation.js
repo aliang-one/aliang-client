@@ -11,7 +11,7 @@ const chatProviderPreset = ref('');
 // 词表与 settings/agent/AgentPage.vue 的子 tab 一一对应；非法值写入时归一
 // 为默认，深链安全。仅 showPage('agent', { sub }) 显式携带时才改写——仪表盘
 // showAgent() 一类无参跳转不打断用户当前所在子 tab。
-export const AGENT_SUB_TABS = ['records', 'user-agent', 'aliangcode'];
+export const AGENT_SUB_TABS = ['records', 'user-agent', 'aliangcode', 'peer-access'];
 const agentSubTab = ref('records');
 
 function normalizeAgentSubTab(sub) {
