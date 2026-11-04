@@ -225,6 +225,8 @@ export default {
   chat_statusRunning: 'In conversation',
   chat_statusDone: 'Done',
   chat_aiThinking: 'Thinking…',
+  chat_thinkingRunning: 'Thinking…',
+  chat_thinkingDone: 'Thought process',
   chat_aiError: 'AI response failed, please retry.',
   chat_approvalTitle: 'Approval required',
   chat_approvalTool: 'Tool',

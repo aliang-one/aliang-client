@@ -72,7 +72,7 @@
             : 'border-slate-200 bg-white text-slate-700 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100'"
         >
           <span
-            v-if="msg.role === 'assistant' && msg.status === 'running' && !msg.content"
+            v-if="msg.role === 'assistant' && msg.status === 'running' && !msg.content && !msg.thinking"
             class="ai-thinking"
           >
             <span class="thinking-dot"></span><span class="thinking-dot"></span><span class="thinking-dot"></span>
@@ -83,6 +83,22 @@
                hiddenOptionIds（Task 14）:该会话在挂交互卡的 option_id 集合,
                透传给 markdown 的静态围栏卡做防双份隐藏比对。 -->
           <template v-else-if="msg.role === 'assistant' && msg.status !== 'error'">
+            <!-- 思考过程(2026-11-05):agentcore 推理走 ai.thinking,此前
+                 整段被 default 丢弃,思考阶段仪表盘全程隐形。running 时
+                 默认展开随流滚动,结束收起为可展开摘要。纯文本插值防注入。 -->
+            <details
+              v-if="msg.thinking"
+              class="mb-1.5 rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1.5 text-xs dark:border-slate-700 dark:bg-slate-800/60"
+              :open="msg.status === 'running'"
+            >
+              <summary class="cursor-pointer select-none font-medium text-slate-400 dark:text-slate-500">
+                <span
+                  v-if="msg.status === 'running'"
+                  class="mr-1 inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-primary align-middle"
+                ></span>{{ msg.status === 'running' ? t('chat_thinkingRunning') : t('chat_thinkingDone') }}
+              </summary>
+              <div class="mt-1 max-h-40 overflow-y-auto whitespace-pre-wrap leading-relaxed text-slate-400 dark:text-slate-500">{{ msg.thinking }}</div>
+            </details>
             <ChatMarkdown :content="msg.content" :hidden-option-ids="hiddenOptionIds" />
             <!-- 流式光标：running 且已有正文时缀在内容尾部闪烁
                  （reduced-motion 下静态常亮不动画）。 -->

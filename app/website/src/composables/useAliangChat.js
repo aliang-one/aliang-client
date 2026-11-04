@@ -1996,6 +1996,18 @@ export function useAliangChat() {
         conv.pendingConfig = false;
         break;
       }
+      case 'ai.thinking': {
+        // GLM 思考阶段输出(2026-11-05 真机复现实锤):agentcore 回答前的
+        // 整段推理走 ai.thinking(不带进 journal text),此前落 default 被
+        // 静默丢弃——思考阶段(经常数十秒)仪表盘全程隐形,用户看到的是
+        // 「始终没有正在输出的对话」。挂进气泡的 thinking 字段随流渲染。
+        const asst = ensureAssistantBubble(conv);
+        if (!asst) break;
+        const delta = e.delta || '';
+        if (delta) asst.thinking = (asst.thinking || '') + delta;
+        scrollToBottom();
+        break;
+      }
       case 'ai.delta': {
         const asst = ensureAssistantBubble(conv);
         if (!asst) break;

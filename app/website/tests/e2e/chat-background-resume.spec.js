@@ -213,3 +213,26 @@ test('关窗主动 close 不画假中断：重进后气泡仍是 running 并经�
   await expect(page.getByTestId('chat-stop-button')).toHaveCount(0);
   await expect(page.getByText(/连接.*中断|interrupted/i)).toHaveCount(0);
 });
+
+test('ai.thinking 随流渲染:思考块可见,回答 delta 照常,终态收起', async ({ page }) => {
+  // 2026-11-05 真机复现:agentcore 思考阶段整段走 ai.thinking,前端 switch
+  // 无此分支,帧落 default 被静默丢弃——思考阶段(经常数十秒)仪表盘全程
+  // 隐形,用户看到「始终没有正在输出的对话」。回答本体只有结尾一条 ai.delta。
+  await seedAndOpen(page, { bubbleContent: '', bubbleStatus: 'running' });
+  await expect(page.getByTestId('chat-stop-button')).toBeVisible();
+
+  await pushFrame(page, { type: 'ai.thinking', session_id: 'local-seedconv1', delta: '用户想要' });
+  await pushFrame(page, { type: 'ai.thinking', session_id: 'local-seedconv1', delta: '一句测试回复' });
+  // 思考块展开可见(running 态默认 open)
+  const block = page.locator('details', { hasText: /思考中|Thinking/ });
+  await expect(block).toBeVisible();
+  await expect(page.getByText('用户想要一句测试回复')).toBeVisible();
+
+  // 回答本体照常 ai.delta 渲染
+  await pushFrame(page, { type: 'ai.delta', session_id: 'local-seedconv1', delta: '测试通过' });
+  await expect(page.getByText('测试通过', { exact: true })).toBeVisible();
+
+  // 终态:思考块收起(summary 仍在,正文仍可查),停止键退场
+  await pushFrame(page, { type: 'ai.done', session_id: 'local-seedconv1' });
+  await expect(page.getByTestId('chat-stop-button')).toHaveCount(0);
+});
