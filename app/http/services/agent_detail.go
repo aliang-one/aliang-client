@@ -2,7 +2,9 @@ package services
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -27,6 +29,9 @@ const (
 	agentProjectDetailMaxScanDuration = 750 * time.Millisecond
 	agentProjectReadmeMaxBytes        = 24 * 1024
 	agentProjectFileReadMaxByte       = 512 * 1024
+	// file.read 携带完整文件 sha256 的体积上限;超过则不带该键(乐观锁原料
+	// 缺失,手机端退化为无锁写入)。编辑器消费面 ≤512KiB,恒在上限内。
+	agentProjectFileReadShaCapByte = 8 * 1024 * 1024
 )
 
 var errAgentProjectDetailScanLimit = errors.New("agent project detail scan limit reached")
@@ -487,6 +492,22 @@ func agentFileReadPayload(msg map[string]interface{}) map[string]interface{} {
 		}
 	}
 	raw := buffer[:minInt(n, maxBytes)]
+	// 手机端编辑器乐观锁原料(2026-11-04):完整文件的 sha256。仅对小文件
+	// 计算(≤8MiB)——file.read 的常规消费面(预览/下载探针)没有 sha 也成立,
+	// 而编辑器只碰 ≤512KiB 的文本,恒有 sha;大文件不做全量读,避免把一次
+	// 128KiB 的预览放大成 GB 级磁盘扫描。缺失键=手机端不做乐观锁。
+	// LimitReader 封顶是 TOCTOU 守卫:Stat 后文件被并发追加越过上限时,
+	// 读满 cap+1 即弃 hash,扫描成本有界。
+	var fileSHA256 string
+	if info.Size() <= agentProjectFileReadShaCapByte {
+		if _, err := file.Seek(0, io.SeekStart); err == nil {
+			h := sha256.New()
+			n2, err := io.Copy(h, io.LimitReader(file, agentProjectFileReadShaCapByte+1))
+			if err == nil && n2 <= agentProjectFileReadShaCapByte { // == cap+1 证明被 Limit 截断
+				fileSHA256 = hex.EncodeToString(h.Sum(nil))
+			}
+		}
+	}
 	binary := isLikelyAgentBinary(raw)
 	content := string(raw)
 	encoding := "utf8"
@@ -499,7 +520,7 @@ func agentFileReadPayload(msg map[string]interface{}) map[string]interface{} {
 		// 二进制走 base64 不受影响。
 		content = string(trimTruncatedUTF8Tail(raw))
 	}
-	return map[string]interface{}{
+	payload := map[string]interface{}{
 		"type":        models.AgentEventFileReadResult,
 		"request_id":  requestID,
 		"path":        targetPath,
@@ -510,6 +531,10 @@ func agentFileReadPayload(msg map[string]interface{}) map[string]interface{} {
 		"modified_at": info.ModTime().UTC().Format(time.RFC3339),
 		"truncated":   info.Size() > int64(maxBytes),
 	}
+	if fileSHA256 != "" {
+		payload["sha256"] = fileSHA256
+	}
+	return payload
 }
 
 // resolveAgentProjectPath resolves the project/base directory for a request.

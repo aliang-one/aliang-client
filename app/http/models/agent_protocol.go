@@ -265,7 +265,7 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				{Type: AgentEventAIRunNotice, Required: []string{"type", "session_id", "code"}, Optional: []string{"message_id", "detail"}},
 				{Type: AgentEventAISessionClosed, Required: []string{"type", "session_id"}, Optional: []string{"run_id", "event_seq"}},
 				{Type: AgentEventFileListResult, Required: []string{"type", "request_id", "path", "entries"}},
-				{Type: AgentEventFileReadResult, Required: []string{"type", "request_id", "path", "encoding", "content"}},
+				{Type: AgentEventFileReadResult, Required: []string{"type", "request_id", "path", "encoding", "content"}, Optional: []string{"sha256"}},
 				{Type: AgentEventFileUploadResult, Required: []string{"type", "request_id", "ok", "size_bytes", "http_status"}},
 				// file.upload.progress / file.upload.cancel 此前在用但从未登记（漏登先例，本次补齐）。
 				{Type: AgentEventFileUploadProgress, Required: []string{"type", "request_id", "uploaded_bytes", "total_bytes"}},
