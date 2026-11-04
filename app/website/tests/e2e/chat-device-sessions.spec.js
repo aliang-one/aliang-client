@@ -388,6 +388,10 @@ test('ai.run.notice resume_missing：提示条可见，不阻断输入', async (
 
 test('ai.run.notice tool_timeout：工具超时提示条可见，不阻断输入', async ({ page }) => {
   await openChat(page);
+  // 本 spec 的 openChat 包装器恒传 newSession:false（设备清单类语义）——必须
+  // 自行点「+」新建本地会话，composer（v-if="activeId"）才存在。原用例漏了
+  // 这一步，fill 恒等不到输入框（2026-11-04 修复预存红）。
+  await page.getByRole('button').filter({ hasText: 'add' }).first().click();
   const input = page.getByPlaceholder(/输入消息|Type a message/);
   await input.fill('第一句');
   await page.keyboard.press('Enter');

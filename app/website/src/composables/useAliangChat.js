@@ -22,6 +22,14 @@ import {
 
 const STORAGE_KEY = 'aliang-chat-data';
 
+// 重连预算的归零帧型（模块级常量）：只认「run 数据面」帧——纯订阅握手快照
+// 不算（防「连上→回一帧快照→立刻断」的代理假活环境把预算洗白成无限重连）。
+const AGENT_AI_RECONNECT_RESET_TYPES = new Set([
+  'ai.session.created', 'ai.run.started', 'ai.delta', 'ai.status', 'ai.run.progress',
+  'ai.run.notice', 'ai.done', 'ai.error', 'ai.approval.request', 'ai.approval.cancelled',
+  'ai.option.request', 'ai.option.cancelled', 'ai.steer.ack',
+]);
+
 // 无活动看门狗阈值：模块顶层读取（E2E 经 window.__CHAT_IDLE_TIMEOUT_MS__
 // 注入短值，注入脚本先于应用模块求值，与原 ChatPage.vue 内联声明等价）。
 const CHAT_IDLE_TIMEOUT_MS = Number(globalThis.__CHAT_IDLE_TIMEOUT_MS__) || 90000;
@@ -122,6 +130,15 @@ export function useAliangChat() {
   // token-by-token and carries the running -> done status transitions.
   let aiSocket = null;
   let aiSocketPromise = null;
+  // 关窗守卫（后台静默运行，2026-11-04）：onUnmounted 主动 close 是预期生命周期
+  // 而非断线——run 在 agent 侧照跑（后端 fanOut 对死 socket 仅忽略写错误，
+  // journal 持续落盘），onclose 不得把 running 气泡画成「连接已中断」并持久化
+  // （旧实现关窗即污染气泡，重进页满屏假中断）。重进页由
+  // resubscribeRestoredRuns 的订阅快照对齐真值。
+  let closingIntentionally = false;
+  // 断线自愈重连计数（onopen 归零）：意外 close 先重连+重订阅对账，超限才
+  // 回落「中断」画法——真正的 run 不随 socket 断而停，立即画错误是假中断。
+  let reconnectAttempts = 0;
   const handledApprovalIds = new Set();
   // 作废/已作答的方案卡键位（镜像 handledApprovalIds 防御）：迟到重投的
   // ai.option.request 命中即弃，防已答卡被复活成 pending 邀请重复作答
@@ -623,6 +640,8 @@ export function useAliangChat() {
     // pendingConfig（「下轮生效」角标）同为瞬态：重载后「是否已开新回合」
     // 无从判定，跨页保留只会展示陈旧角标——与 approvals/steerItems 同剥。
     delete copy.pendingConfig;
+    // snapshotCatchupAt（快照对账去重窗口起点）同为瞬态：跨页无意义。
+    delete copy.snapshotCatchupAt;
     // deviceTranscript 不落盘（评审折叠项）：重开设备会话有 5 分钟 TTL+详情
     // 分页重拉兜底，防大转录长期占 localStorage。
     delete copy.deviceTranscript;
@@ -866,9 +885,20 @@ export function useAliangChat() {
   // ai.session.snapshot（订阅握手回包）：按 session_id 找设备壳——先 aiSessionId
   // 匹配（打开过的壳），后三键兜底（entry.id/source_session_id/
   // managed_conversation_id）。未订阅/无壳的快照静默丢。
+  // 2026-11-04 增补本地会话对账（reconcileLocalSnapshot）：窗口关闭期间 run
+  // 照跑（journal 权威），重进页/断线重订阅的快照把恢复的 running 气泡收敛
+  // 到真值——idle → done 收敛；running → 前缀延伸续流。
   function handleDeviceSnapshot(e) {
     const sessionId = String(e.session_id || '');
     if (!sessionId) return;
+    // 本地草稿优先于壳查找：本地会话同样出现在设备清单（journal 三源扫描），
+    // 壳查找若先命中同名 entry，快照会被壳分支吃掉、本地对账永远走不到
+    // （2026-11-04 评审 P1：本地对账被设备壳清单劫持）。
+    const local = conversations.value.find(c => !c.deviceSession && c.aiSessionId === sessionId);
+    if (local) {
+      reconcileLocalSnapshot(e, sessionId);
+      return;
+    }
     let shell = conversations.value.find(c => c.deviceSession && c.aiSessionId === sessionId)
       || findDeviceShellBySessionId(sessionId);
     if (!shell) return;
@@ -893,6 +923,73 @@ export function useAliangChat() {
 
     // status → 壳 running 标记（侧栏状态点消费）
     shell.running = e.status === 'running';
+  }
+
+  // 本地会话快照对账。归属锚定（评审 P1/P2 误种家族的总闸）：journal 的
+  // user 行随消息分发即时落盘、assistant 行在回合/run 终态才落——运行中
+  // 快照尾部的 assistant 行属于**上一回合**，直接前缀延伸/回填会把旧答案
+  // 顶进当前气泡。锚 = transcript 末条 user 行 message_id === 本地末条 user
+  // 气泡 messageId；锚定成立后，本回合输出 = 我们 user 行之后的 assistant
+  // 行（运行中=逐回合 turn 行拼接，结束后=整轮累计最终行），前缀延伸才安全。
+  function reconcileLocalSnapshot(e, sessionId) {
+    const local = conversations.value.find(c => !c.deviceSession && c.aiSessionId === sessionId);
+    if (!local) return;
+    const asst = findRunningAssistant(local);
+    const rows = Array.isArray(e.transcript) ? e.transcript : [];
+    // 本端发送在途（create/ai.message 未落定）：run 可能刚要起跑，此刻的
+    // idle 快照不是终态证据，绝不收敛占位气泡（误收敛=假 done+delta 全丢）。
+    const inFlight = local.id === activeId.value && sending.value;
+
+    const localLastUser = [...(local.messages || [])].reverse().find(m => m.role === 'user');
+    const turnIsOurs = !!localLastUser?.messageId
+      && rows.some(r => r && r.role === 'user'
+        && String(r.message_id || '') === String(localLastUser.messageId));
+    let runText = '';
+    if (turnIsOurs) {
+      const userIdx = rows.findIndex(r => r && r.role === 'user'
+        && String(r.message_id || '') === String(localLastUser.messageId));
+      for (let i = userIdx + 1; i < rows.length; i++) {
+        const row = rows[i];
+        if (row && row.role === 'assistant' && typeof row.text === 'string' && row.text) {
+          runText += (runText ? '\n\n' : '') + row.text;
+        }
+      }
+    }
+
+    if (asst) {
+      if (e.status === 'running') {
+        // 流继续：锚定成立的 runText 前缀对齐（空气泡回填/部分内容延伸）；
+        // 未锚定（runText 空）绝不种内容。看门狗恢复：onclose 的无条件
+        // disarm 清了计时器，快照证实 run 活着 → 重新武装（此后每帧喂狗）。
+        // 只在「本地是活跃会话或当前无看门狗」时武装——单槽看门狗不能被
+        // 后台对账从活跃会话手里抢走。
+        if (runText && runText.startsWith(asst.content)) {
+          asst.content = runText;
+          local.snapshotCatchupAt = now(); // 扇出副本去重窗口起点（见 ai.delta）
+        }
+        if ((local.id === activeId.value || !idleWatchdogTimer) && !inFlight) {
+          armIdleWatchdog(local);
+        }
+      } else if (!inFlight) {
+        // run 已收敛（快照态不区分 done/error，按完成呈现）：锚定的 runText
+        // 优先对齐（前缀延伸/空气泡回填）；sending/看门狗/审批同步收尾——
+        // 不落 finishRun 会把输入框永久锁死在 sendDisabled。审批清卡镜像
+        // ai.done：run 已结束，快照 pending_approvals 为空即权威「无在挂」。
+        if (runText && runText.startsWith(asst.content)) asst.content = runText;
+        asst.status = 'done';
+        clearApprovalsForSession(local, sessionId);
+        if (local.id === activeId.value) disarmIdleWatchdog();
+        finishRun(local);
+        if (activeId.value === local.id) scrollToBottom();
+      }
+      // inFlight 且收敛态：不动作——终态帧/下一轮快照负责收敛。
+    }
+    // pending_approvals 恢复与状态分支解耦（审批等待中关窗重进：running
+    // 快照同样带在挂审批，任何早退分支都不得丢）。
+    for (const item of Array.isArray(e.pending_approvals) ? e.pending_approvals : []) {
+      if (!item || typeof item !== 'object') continue;
+      upsertApproval(local, { ...item, status: item.status || 'pending' });
+    }
   }
 
   // 切走设备会话时退订（幂等，多发无害）：agentcore 裸 id 才订过。
@@ -950,6 +1047,11 @@ export function useAliangChat() {
       sock.onopen = () => {
         console.log('[aliang-chat] ws open', aiSocketUrl());
         aiSocketPromise = null;
+        // 刻意不在这里归零 reconnectAttempts：「连上就断」的离线环境（agent
+        // 离线时浏览器侧照样先 Upgrade 再 close(1011)）每轮重连都会触发
+        // open——若 open 即归零，重连预算永远清零、封顶永远到不了，退化成
+        // 无限重连风暴（2026-11-04 e2e 实测）。归零点在 handleAIEvent：收到
+        // 生产性入站帧才是「通道被证实健康」。
         resolve();
       };
       sock.onmessage = (ev) => {
@@ -975,26 +1077,44 @@ export function useAliangChat() {
         // 别解新 run 的看门狗、别给新 run 画错误——让旧 close 静默退场。
         if (aiSocket && aiSocket !== sock) return;
         disarmIdleWatchdog();
-        const conv = activeConversation.value;
-        if (conv && (sending.value || findRunningAssistant(conv))) {
-          const asst = findRunningAssistant(conv);
-          if (asst) {
-            asst.status = 'error';
-            if (!asst.content) {
-              asst.content = e.code === 1011 ? t('chat_agentOffline') : t('chat_connInterrupted');
-            }
-          }
-          conv.aiSessionCreated = false; // 下条消息经确认门重发 create 重试
-          // 离线语义下同步压住设置条的 serviceUnavailable（先设 createError，
-          // 再结算确认门——早退分支的 `!createError.value` 兜底就不触发了）
-          if (conv.id === activeId.value && !createError.value) {
-            createError.value = e.code === 1011 ? t('chat_agentOffline') : t('chat_connInterrupted');
-          }
-          const pending = conv.aiSessionId ? pendingCreates.get(conv.aiSessionId) : undefined;
-          if (pending) pending('error'); // 别让确认门空等 5s 超时
-          finishRun(conv);
-          saveToStorage();
+        // 关窗卸载的主动 close 不是断线：run 在 agent 侧继续跑，重进页经订阅
+        // 快照对齐终态（见 resubscribeRestoredRuns / handleDeviceSnapshot 的
+        // 本地会话对账分支），这里绝不画「连接已中断」。
+        if (closingIntentionally) return;
+        // 受影响会话 = 有 running 气泡的（含后台会话）+ 活跃会话发送在途。
+        const affected = conversations.value.filter(
+          (c) => findRunningAssistant(c) || (c.id === activeId.value && sending.value)
+        );
+        if (!affected.length) return;
+        // 断线自愈（后台静默运行）：先重连 + 重订阅拿快照对账——socket 断了
+        // run 并没停，立即把 running 气泡画成 error 是假中断。重连失败（构造
+        // 异常）或连上又立刻断（下轮 onclose 超限）才回落「中断」画法。
+        // 800ms 退避：重连预算只防死线，不给学生式的瞬时抖动上强度。
+        if (reconnectAttempts < 2) {
+          reconnectAttempts += 1;
+          setTimeout(() => {
+            ensureAISocket()
+              .then(() => {
+                // 新 socket 的订阅集全灭（Go 侧订阅挂 socket 键，连接结束即
+                // 整体摘除）——重订阅所有需要观察的会话：打开过的可订阅设备
+                // 壳 + 有 running 气泡/发送在途的本地会话，不止 affected 子集
+                // （已打开但无 running 气泡的壳不重订阅会静默失聪）。
+                for (const c of conversations.value) {
+                  if (c.deviceSession) {
+                    if (deviceSessionSubscribable(c)) {
+                      sendAI({ type: 'ai.session.subscribe', session_id: c.deviceSession.id });
+                    }
+                  } else if (c.aiSessionId
+                    && (findRunningAssistant(c) || (c.id === activeId.value && sending.value))) {
+                    sendAI({ type: 'ai.session.subscribe', session_id: c.aiSessionId });
+                  }
+                }
+              })
+              .catch(() => markRunsInterrupted(affected, e.code));
+          }, 800);
+          return;
         }
+        markRunsInterrupted(affected, e.code);
       };
     });
     return aiSocketPromise;
@@ -1006,6 +1126,35 @@ export function useAliangChat() {
       return true;
     }
     return false;
+  }
+
+  // 断线终态画法：仅重连自愈失败/超限后调用。只把「本端发送在途」的活跃
+  // 会话画成中断——管道真断在我们自己的请求上，错误可操作（重发即重试）。
+  // 其余 running 气泡（含后台会话/恢复态）保持原样：run 在 agent 侧的真值
+  // 未知，running 是 last-known 状态，等下一次重连/重进页订阅快照对账——
+  // 绝不自动落「连接已中断」假中断（本分支主诉求；旧实现关窗/断线即污染
+  // 气泡并持久化）。
+  function markRunsInterrupted(convList, closeCode) {
+    for (const conv of convList) {
+      const inFlight = conv.id === activeId.value && sending.value;
+      const asst = findRunningAssistant(conv);
+      if (asst && inFlight) {
+        asst.status = 'error';
+        if (!asst.content) {
+          asst.content = closeCode === 1011 ? t('chat_agentOffline') : t('chat_connInterrupted');
+        }
+      }
+      conv.aiSessionCreated = false; // 下条消息经确认门重发 create 重试
+      // 离线语义下同步压住设置条的 serviceUnavailable（先设 createError，
+      // 再结算确认门——早退分支的 `!createError.value` 兜底就不触发了）
+      if (inFlight && !createError.value) {
+        createError.value = closeCode === 1011 ? t('chat_agentOffline') : t('chat_connInterrupted');
+      }
+      const pending = conv.aiSessionId ? pendingCreates.get(conv.aiSessionId) : undefined;
+      if (pending) pending('error'); // 别让确认门空等 5s 超时
+      if (inFlight) finishRun(conv);
+    }
+    saveToStorage();
   }
 
   // Ask the agent for the active provider's `/`-command surface. Cached per
@@ -1654,6 +1803,10 @@ export function useAliangChat() {
 
   function handleAIEvent(e) {
     if (!e || !e.type) return;
+    // run 数据面入站帧证明管道活着：重连预算归零（纯快照握手不算——防
+    // 「连上→回一帧→断」假活环境无限洗白预算；长跑 run 的偶发断线在健康
+    // 恢复后靠 delta/终态帧重新拿满预算，不会被累计封顶误伤）。
+    if (AGENT_AI_RECONNECT_RESET_TYPES.has(e.type)) reconnectAttempts = 0;
 
     // Slash-command discovery results are not tied to a conversation session; cache
     // them by provider before the conversation-targeting logic below.
@@ -1760,7 +1913,10 @@ export function useAliangChat() {
 
     // 喂狗：任何到达会话归属判定之后的帧都算 AI 活动，重置无活动计时。审批族
     // 帧路由到设备壳时例外——看门狗目标是活跃 run 的会话，不能被无关帧换靶。
-    if (idleWatchdogTimer && !routedToShell) armIdleWatchdog(conv);
+    // 断线自愈路径的再武装口：onclose 曾无条件 disarm（计时器为 null，旧门
+    // `if (idleWatchdogTimer && ...)` 从此永远假——重连治愈的 run 僵死即永
+    // running），活跃会话发送在途时允许从零重新武装。
+    if ((idleWatchdogTimer || (conv.id === activeId.value && sending.value)) && !routedToShell) armIdleWatchdog(conv);
 
     let persist = false;
     switch (e.type) {
@@ -1804,7 +1960,17 @@ export function useAliangChat() {
       case 'ai.delta': {
         const asst = ensureAssistantBubble(conv);
         if (!asst) break;
-        asst.content += e.delta || '';
+        const delta = e.delta || '';
+        // 快照对账去重（窄窗口）：subscribe 注册→快照 journal 读之间落进的
+        // delta 既入快照文本又被扇出副本，对账顶内容后紧随的第一枚 delta 若
+        // 已是内容尾缀则丢弃，防重复段。窗口 1.5s 后一律放行。
+        if (conv.snapshotCatchupAt && Date.now() - conv.snapshotCatchupAt < 1500
+          && delta && asst.content.endsWith(delta)) {
+          conv.snapshotCatchupAt = 0;
+          break;
+        }
+        conv.snapshotCatchupAt = 0;
+        asst.content += delta;
         console.log('[aliang-chat] rendered delta, contentLen=', asst.content.length, 'conv=', conv.id);
         scrollToBottom();
         break;
@@ -2053,15 +2219,37 @@ export function useAliangChat() {
     showDashboard();
   }
 
+  // 重进页对账（后台静默运行，2026-11-04）：localStorage 恢复的 running 气泡
+  // 只是「上次窗口看到的局部视角」，run 在 agent 侧照跑、终态在 journal/会话
+  // 态里。对仍有 running 气泡的本地会话发订阅拿快照（ai.session.snapshot），
+  // 快照路由进 handleDeviceSnapshot 的本地对账分支收敛真值；running → 续流。
+  // 设备壳不落盘（重进页不在会话池），打开时 openDeviceSession 自带订阅，
+  // 无需此处处理。
+  async function resubscribeRestoredRuns() {
+    const targets = conversations.value.filter(
+      (c) => !c.deviceSession && !!c.aiSessionId && !!findRunningAssistant(c)
+    );
+    if (!targets.length) return;
+    try {
+      await ensureAISocket();
+    } catch (_) {
+      return; // socket 不可用：下次进页再对账，恢复态不动
+    }
+    for (const c of targets) {
+      sendAI({ type: 'ai.session.subscribe', session_id: c.aiSessionId });
+    }
+  }
+
   function setInputEl(el) {
     // 字符串 ref 语义：卸载时以 null 落值（与拆分前 ref="inputRef" 等价）。
     inputRef.value = el;
   }
 
   onMounted(() => {
-    console.log('[aliang-chat] ChatPage mounted build=stream-v3 ws=' + aiSocketUrl());
+    console.log('[aliang-chat] ChatPage mounted build=stream-v4 ws=' + aiSocketUrl());
     loadFromStorage();
     loadDeviceSessions(); // 设备会话清单：每次进页拉取（权威在后端，不进 localStorage）
+    resubscribeRestoredRuns(); // 后台静默运行对账：恢复的 running 气泡向真值收敛
     // 审批卡 expires_at 倒计时刷新（30s 粒度，见 ChatApprovalCard 的 approvalExpiresLabel）
     nowTickTimer = setInterval(() => { nowTick.value = now(); }, 30000);
   });
@@ -2072,6 +2260,10 @@ export function useAliangChat() {
       nowTickTimer = null;
     }
     if (aiSocket) {
+      // 主动关窗 ≠ 断线：run 在 agent 侧继续跑。closingIntentionally 让
+      // onclose 的断线画法（重连/「连接已中断」）整体退场，恢复态留给下次
+      // 进页的 resubscribeRestoredRuns 对账。
+      closingIntentionally = true;
       try { aiSocket.close(); } catch (_) {}
       aiSocket = null;
     }

@@ -57,13 +57,16 @@
         <div
           class="flex items-end rounded-2xl border border-slate-200 bg-white transition focus-within:border-primary dark:border-slate-600 dark:bg-slate-800"
         >
+          <!-- min-h-[40px] 全端生效（不随 md 折叠回 0）：空输入时桌面端不再被
+               autosize 压成 ~36px 细条（2026-11-04 用户反馈「太矮」）。autosize
+               的内联 height 低于 40 时由 CSS min-height 兜底钳制。 -->
           <textarea
             :ref="bindInputEl"
             v-model="inputModel"
             rows="1"
             :placeholder="placeholder"
             :disabled="disabled"
-            class="min-h-[40px] w-full resize-none bg-transparent px-3 py-2 text-sm text-slate-700 outline-none placeholder:text-slate-400 dark:text-slate-100 dark:placeholder:text-slate-500 md:min-h-0"
+            class="min-h-[40px] w-full resize-none bg-transparent px-3 py-2 text-sm text-slate-700 outline-none placeholder:text-slate-400 dark:text-slate-100 dark:placeholder:text-slate-500"
             @input="onInput"
             @keydown="onInputKeydown"
             @blur="closeSlashDeferred"
@@ -85,7 +88,7 @@
         v-if="running && (!hasInput || approvalBlocked) && !steerBlocked"
         type="button"
         data-testid="chat-stop-button"
-        class="min-h-[40px] flex shrink-0 items-center gap-1 rounded-lg bg-slate-200 px-4 text-sm font-semibold text-slate-500 transition hover:bg-slate-300 md:min-h-0 dark:bg-slate-700 dark:text-slate-400 dark:hover:bg-slate-600"
+        class="min-h-[40px] flex shrink-0 items-center gap-1 rounded-lg bg-slate-200 px-4 text-sm font-semibold text-slate-500 transition hover:bg-slate-300 dark:bg-slate-700 dark:text-slate-400 dark:hover:bg-slate-600"
         @click="emit('stop')"
       >
         <span class="material-symbols-outlined text-base leading-none">stop_circle</span>
@@ -94,7 +97,7 @@
       <button
         v-else
         type="button"
-        class="min-h-[40px] shrink-0 rounded-lg bg-primary px-4 text-sm font-semibold text-white transition hover:bg-primary/90 md:min-h-0"
+        class="min-h-[40px] shrink-0 rounded-lg bg-primary px-4 text-sm font-semibold text-white transition hover:bg-primary/90"
         :disabled="disabled"
         @click="onSendAction"
       >{{ label }}</button>
