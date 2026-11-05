@@ -2,6 +2,7 @@ package services
 
 // agent_mcp_registry_test.go 统一 MCP 注册表(~/.aliang/mcp.json)文件层单测。
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -258,5 +259,27 @@ func TestRegistryRoundTripKeepsAngleBytes(t *testing.T) {
 	// 会被 JSON 转义成 \" 属正常行为,不作为判别对象(评审第 3 轮实证)。
 	if !strings.Contains(string(raw), `<b>&</b>`) {
 		t.Fatalf("转义语义违例(HTML 转义不该发生): %s", raw)
+	}
+}
+
+func TestUpsertDeleteFailClosedOnBrokenFile(t *testing.T) {
+	// 写路径 fail-closed 姿态:坏文件必须报错且字节零改动,绝不静默重建
+	home := t.TempDir()
+	writeRegistryFile(t, home, `not json`)
+	before, err := os.ReadFile(aliangMCPRegistryPath(home))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := upsertAliangMCPServerForTest(home, "a", aliangMCPServerEntry{Command: "x"}); err == nil {
+		t.Fatal("坏文件上 upsert 必须报错")
+	}
+	if after, _ := os.ReadFile(aliangMCPRegistryPath(home)); !bytes.Equal(before, after) {
+		t.Fatalf("坏文件必须保持字节零改动: %s", after)
+	}
+	if existed, err := deleteAliangMCPServerForTest(home, "a"); err == nil || existed {
+		t.Fatalf("坏文件上 delete 必须 (false, err): existed=%v err=%v", existed, err)
+	}
+	if after, _ := os.ReadFile(aliangMCPRegistryPath(home)); !bytes.Equal(before, after) {
+		t.Fatalf("坏文件必须保持字节零改动: %s", after)
 	}
 }

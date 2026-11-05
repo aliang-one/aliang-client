@@ -174,15 +174,13 @@ func readAliangMCPRegistryInto(home string, dst map[string]interface{}) int {
 }
 
 // validateAliangMCPEntry 写通道校验(spec §5.2)。读通道容忍、写通道 fail-closed。
+// 长度上限由正则 {1,aliangMCPServerNameMax} 拦截,无单独长度分支。
 func validateAliangMCPEntry(name string, e aliangMCPServerEntry) error {
 	if !aliangMCPServerNameRe.MatchString(name) {
-		return fmt.Errorf("server 名称须为 ^[a-zA-Z0-9_-]{1,64}$, got %q", name)
+		return fmt.Errorf("server 名称须为 ^[a-zA-Z0-9_-]{1,%d}$, got %q", aliangMCPServerNameMax, name)
 	}
 	if strings.HasPrefix(name, aliangMCPReservedPrefix) {
 		return fmt.Errorf("server 名称不允许保留前缀 %q", aliangMCPReservedPrefix)
-	}
-	if len(name) > aliangMCPServerNameMax {
-		return fmt.Errorf("server 名称超长")
 	}
 	switch strings.ToLower(strings.TrimSpace(e.Type)) {
 	case "", "stdio":
@@ -200,11 +198,12 @@ func validateAliangMCPEntry(name string, e aliangMCPServerEntry) error {
 }
 
 // aliangMCPEntryToMap 结构体→注册表 map 形态(仅非零字段;Enabled 仅显式非 nil
-// 时落盘)。数字字段不存在于本结构,无 UseNumber 需求。
+// 时落盘)。type 与校验同口径归一(TrimSpace+ToLower)后落盘,防把 "HTTP" 等
+// 非规范字节冻进注册表。数字字段不存在于本结构,无 UseNumber 需求。
 func aliangMCPEntryToMap(e aliangMCPServerEntry) map[string]interface{} {
 	out := map[string]interface{}{}
-	if strings.TrimSpace(e.Type) != "" {
-		out["type"] = e.Type
+	if typ := strings.ToLower(strings.TrimSpace(e.Type)); typ != "" {
+		out["type"] = typ
 	}
 	if e.Command != "" {
 		out["command"] = e.Command
@@ -258,10 +257,10 @@ func upsertAliangMCPServerForTest(home, name string, entry aliangMCPServerEntry)
 		return err // 坏文件不静默覆盖,让用户先修
 	}
 	if !existed {
-		root = map[string]interface{}{"version": json.Number("1"), "servers": map[string]interface{}{}}
+		root = map[string]interface{}{"version": json.Number(fmt.Sprint(aliangMCPRegistryVersion)), "servers": map[string]interface{}{}}
 	}
 	if _, has := root["version"]; !has {
-		root["version"] = json.Number("1")
+		root["version"] = json.Number(fmt.Sprint(aliangMCPRegistryVersion))
 	}
 	servers, _ := root["servers"].(map[string]interface{})
 	if servers == nil {
@@ -309,10 +308,12 @@ func aliangMCPEnabledEntries(home string) map[string]aliangMCPServerEntry {
 		}
 		b, err := json.Marshal(m)
 		if err != nil {
+			logger.Warn(fmt.Sprintf("aliang-mcp: 条目 %s 序列化失败,跳过: %v", name, err))
 			continue
 		}
 		var e aliangMCPServerEntry
 		if err := json.Unmarshal(b, &e); err != nil {
+			logger.Warn(fmt.Sprintf("aliang-mcp: 条目 %s 反序列化失败,跳过: %v", name, err))
 			continue
 		}
 		out[name] = e
