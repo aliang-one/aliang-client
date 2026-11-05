@@ -251,7 +251,10 @@ type agentAISession struct {
 	history       []agentAIMessage
 	pendingOption *agentAIOptionRequest // run 结束检测到方案块时置位，等 ai.option.response
 	codexSteer    *agentAICodexSteerControl
-	claudePolicy  agentAIClaudeRemotePolicy
+	// claudeSteer 是 Claude headless（--input-format stream-json）run 的
+	// steer 通道；与 codexSteer 二选一，同一条 run 上不会同时存在。
+	claudeSteer  *agentAIClaudeSteerControl
+	claudePolicy agentAIClaudeRemotePolicy
 	claudeCaps    agentAIClaudeCapabilities
 }
 
@@ -337,6 +340,10 @@ type agentAIRun struct {
 	goalAllowedCommands []string
 	nativeGoal          map[string]interface{}
 	readOnly            bool
+	// claudeSteer 是本次 run 的 Claude steer 通道（仅 stream-json 输入模式）。
+	// 放在 run 上而不是加参数：流循环与 run 同生命周期，且避免改动既有
+	// streamAgentAIStdout/streamStructuredAIDelta 的签名与全部测试调用点。
+	claudeSteer *agentAIClaudeSteerControl
 }
 
 type agentAIAttachment struct {
@@ -449,6 +456,18 @@ type agentAITool struct {
 	args         []string
 	env          []string
 	outputFormat agentAIOutputFormat
+<<<<<<< HEAD
+=======
+	// stdinPrompt 非空时经子进程 stdin 传递而非 argv：Windows 批处理 shim
+	// (.cmd/.bat) 的命令行经 cmd.exe 解析，引号翻转重切分、%VAR% 展开、& | ^
+	// 元字符——prompt 是不可信自由文本，绝不走 argv（见 claudePromptViaStdinForOS）。
+	stdinPrompt string
+	// stdinStreamJSON 表示该 run 走 `--input-format stream-json`：prompt 与
+	// 后续 steer 都以 JSON 行写入一条常驻 stdin 管道，进程在 turn 之间保持
+	// 存活。为 true 时 stdinPrompt 仍保存原始 prompt 文本（供附件/只读等
+	// 包装器拼接），真正的管道由 runCLIPass 建立并交给 steer 通道。
+	stdinStreamJSON bool
+>>>>>>> 3fa9510 (新增：Claude headless 回合中插话(steer))
 }
 
 type agentAIApprovalRequest struct {
@@ -1829,9 +1848,10 @@ func (m *agentAIManager) steer(msg map[string]interface{}, writeJSON agentTermin
 		return
 	}
 	control := session.codexSteer
-	if control == nil {
+	claudeControl := session.claudeSteer
+	if control == nil && claudeControl == nil {
 		m.mu.Unlock()
-		emitAgentAISteerAck(writeJSON, sessionID, messageID, "unsupported", "ai.steer is only supported by active Codex app-server runs", "unsupported_provider")
+		emitAgentAISteerAck(writeJSON, sessionID, messageID, "unsupported", "ai.steer is only supported by active Codex app-server or Claude stream-json runs", "unsupported_provider")
 		return
 	}
 	now := time.Now().UTC()
@@ -1843,13 +1863,24 @@ func (m *agentAIManager) steer(msg map[string]interface{}, writeJSON agentTermin
 	})
 	m.mu.Unlock()
 
-	result, err := control.enqueue(agentAISteerMessage{
+	steer := agentAISteerMessage{
 		MessageID: messageID,
 		Content:   content,
 		CreatedAt: now,
-	})
+	}
+	var result string
+	var err error
+	if control != nil {
+		result, err = control.enqueue(steer)
+	} else {
+		result, err = claudeControl.deliver(steer)
+	}
 	if err != nil {
-		emitAgentAISteerAck(writeJSON, sessionID, messageID, "error", err.Error(), "send_failed")
+		code := "send_failed"
+		if result == "not_running" {
+			code = "turn_ended"
+		}
+		emitAgentAISteerAck(writeJSON, sessionID, messageID, result, err.Error(), code)
 		return
 	}
 	emitAgentAISteerAck(writeJSON, sessionID, messageID, result, "", "")
@@ -3104,13 +3135,16 @@ func (m *agentAIManager) clearRunning(sessionID string, runSeq int, writeJSON ag
 	m.mu.Lock()
 	session := m.sessions[sessionID]
 	var steerControl *agentAICodexSteerControl
+	var claudeSteerControl *agentAIClaudeSteerControl
 	if session != nil && session.runSeq == runSeq {
 		steerControl = session.codexSteer
+		claudeSteerControl = session.claudeSteer
 		session.cancel = nil
 		session.activeWriter = nil
 		session.approvalToken = ""
 		session.activity = nil
 		session.codexSteer = nil
+		session.claudeSteer = nil
 		session.activeRunID = ""
 		session.goalIdentity = nil
 		session.history = trimAgentAIHistory(session.history)
@@ -3120,7 +3154,23 @@ func (m *agentAIManager) clearRunning(sessionID string, runSeq int, writeJSON ag
 	if steerControl != nil {
 		steerControl.close("not_running", "codex turn ended before steer was applied", "turn_ended")
 	}
+	if claudeSteerControl != nil {
+		claudeSteerControl.close("not_running", "claude turn ended before steer was applied", "turn_ended")
+	}
 	m.emitApprovalCancelled(writeJSON, sessionID, cancelled, "run_ended")
+}
+
+// attachClaudeSteer 把 Claude steer 通道挂到会话上，供 ai.steer 路由查找。
+// 只在 runSeq 仍匹配时挂载，避免迟到/串号的 run 覆盖当前通道。
+func (m *agentAIManager) attachClaudeSteer(sessionID string, runSeq int, control *agentAIClaudeSteerControl) {
+	if control == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if session := m.sessions[sessionID]; session != nil && session.runSeq == runSeq {
+		session.claudeSteer = control
+	}
 }
 
 func (m *agentAIManager) appendAssistantHistory(sessionID string, runSeq int, messageID string, output string) {
@@ -4885,6 +4935,26 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 	cmd := newBackgroundCommandContext(ctx, tool.path, tool.args...)
 	cmd.Dir = run.projectPath
 	cmd.Env = agentChildProcessEnv()
+<<<<<<< HEAD
+=======
+	var claudeSteer *agentAIClaudeSteerControl
+	if tool.stdinStreamJSON {
+		// 常驻 stdin：prompt 与后续 steer 都写成 stream-json 的 user 行。
+		// 管道必须在 Start 之前建好并挂到会话上，否则启动窗口内到达的
+		// steer 会误判为 unsupported。
+		stdinPipe, err := cmd.StdinPipe()
+		if err != nil {
+			_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, err))
+			return agentAIRunDone, agentAIEffortRejection{}
+		}
+		claudeSteer = newAgentAIClaudeSteerControl(run, stdinPipe, writeJSON)
+		m.attachClaudeSteer(run.sessionID, run.runSeq, claudeSteer)
+		run.claudeSteer = claudeSteer
+	} else if tool.stdinPrompt != "" {
+		// Windows 批处理 shim 的 prompt 走 stdin（claudePromptViaStdinForOS）。
+		cmd.Stdin = strings.NewReader(tool.stdinPrompt)
+	}
+>>>>>>> 3fa9510 (新增：Claude headless 回合中插话(steer))
 	if len(tool.env) > 0 {
 		cmd.Env = append(cmd.Env, tool.env...)
 	}
@@ -4917,8 +4987,19 @@ func (m *agentAIManager) runCLIPass(ctx context.Context, run agentAIRun, writeJS
 		return agentAIRunDone, agentAIEffortRejection{}
 	}
 	if err := cmd.Start(); err != nil {
+		if claudeSteer != nil {
+			claudeSteer.close("error", err.Error(), "start_failed")
+		}
 		_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, err))
 		return agentAIRunDone, agentAIEffortRejection{}
+	}
+	if claudeSteer != nil {
+		// 首条 prompt 必须以 stream-json user 行写入；写完才放行排队中的 steer。
+		claudeSteer.start(tool.stdinPrompt)
+		// 本次 pass 结束时兜底关闸：resume-missing/effort-rejected 会在同一
+		// run 里再起一次 runCLIPass，若不在返回时关闭，旧管道的写端会一直
+		// 挂着，且旧通道在重试挂载新通道前仍可被 ai.steer 命中。
+		defer claudeSteer.close("not_running", "claude run ended before steer was applied", "turn_ended")
 	}
 
 	started := map[string]interface{}{
@@ -5361,6 +5442,14 @@ func streamStructuredAIDelta(reader io.Reader, format agentAIOutputFormat, run a
 			}
 			_ = writeJSON(progress)
 			continue
+		}
+		// Claude steer：第一个 result 事件意味着本 turn 的产出已定稿。
+		// 关闭 stdin 让 CLI 自然退出（约 0.5s）；实测「已进入管道」的 steer
+		// 仍会被 CLI 读完并执行，所以这里不必等待队列排空。放在错误分支之前，
+		// 失败 result 同样要关闸，否则进程会一直等输入。
+		if format == agentAIOutputClaudeStreamJSON && run.claudeSteer != nil &&
+			remoteString(event, "type") == "result" {
+			run.claudeSteer.closeInput()
 		}
 		// A Claude "result" event that failed (is_error / error_* subtype) must
 		// surface as ai.error with a structured cause, not be masked as an
@@ -6810,8 +6899,28 @@ func endsWithKnownAgentEffortSuffix(model string) bool {
 }
 
 func newClaudeCodeAITool(id string, path string, prompt string, model string, effort string, resumeSessionID string, newSessionID ...string) *agentAITool {
+<<<<<<< HEAD
+=======
+	return newClaudeCodeAIToolForOS(runtime.GOOS, id, path, prompt, model, effort, resumeSessionID, newSessionID...)
+}
+
+func newClaudeCodeAIToolForOS(goos string, id string, path string, prompt string, model string, effort string, resumeSessionID string, newSessionID ...string) *agentAITool {
+	return newClaudeCodeAIToolForOSWithInput(goos, id, path, prompt, model, effort, resumeSessionID,
+		claudeStreamJSONInputAvailable(path), newSessionID...)
+}
+
+// newClaudeCodeAIToolForOSWithInput 是 newClaudeCodeAIToolForOS 的可注入版本：
+// streamInput 为 true 时启用 `--input-format stream-json`，prompt 改由
+// runCLIPass 写入常驻 stdin 管道（这是 Claude steer 的物理前提）；为 false
+// 时保持历史行为（prompt 走 argv，或 Windows .cmd shim 走一次性 stdin）。
+func newClaudeCodeAIToolForOSWithInput(goos string, id string, path string, prompt string, model string, effort string, resumeSessionID string, streamInput bool, newSessionID ...string) *agentAITool {
+>>>>>>> 3fa9510 (新增：Claude headless 回合中插话(steer))
 	args := claudeCodeHeadlessSlimArgs()
 	args = append(args, "--print", "--verbose", "--output-format", "stream-json", "--include-partial-messages")
+	if streamInput {
+		// 双向 stream-json：stdin 保持打开，后续 steer 以 JSON 行追加。
+		args = append(args, "--input-format", "stream-json")
+	}
 	args = append(args, "--append-system-prompt", agentAIOptionSystemPrompt)
 	if resumeSessionID != "" {
 		args = append(args, "--resume", resumeSessionID)
@@ -6824,13 +6933,46 @@ func newClaudeCodeAITool(id string, path string, prompt string, model string, ef
 	if effort = strings.TrimSpace(effort); effort != "" {
 		args = append(args, "--effort", effort)
 	}
+<<<<<<< HEAD
 	args = append(args, prompt)
 	return &agentAITool{
+=======
+	promptViaStdin := claudePromptViaStdinForOS(goos, path)
+	if !streamInput && !promptViaStdin {
+		args = append(args, prompt)
+	}
+	tool := &agentAITool{
+>>>>>>> 3fa9510 (新增：Claude headless 回合中插话(steer))
 		id:           id,
 		path:         path,
 		args:         args,
 		outputFormat: agentAIOutputClaudeStreamJSON,
 	}
+<<<<<<< HEAD
+=======
+	// stdinPrompt 在两条 stdin 路径上都保存原始 prompt：附件/只读等包装器
+	// 靠它判断「末位不是位置参数」，并把附件清单拼进同一份 stdin 文本。
+	if streamInput || promptViaStdin {
+		tool.stdinPrompt = prompt
+	}
+	if streamInput {
+		tool.stdinStreamJSON = true
+	}
+	return tool
+}
+
+// claudePromptViaStdinForOS 报告该平台/路径下 prompt 是否必须走 stdin 而非
+// argv。Windows 批处理 shim(.cmd/.bat)经 cmd.exe /c 调起：即使 Go 已按 cmd.exe
+// 规则转义，%VAR% 展开与引号/脱字符的边缘序列仍会重切或污染自由文本参数——
+// 用户 prompt 不可信，不允许进 argv。claude --print 原生支持从 stdin 读提示词，
+// 语义与位置参数完全一致。
+func claudePromptViaStdinForOS(goos, path string) bool {
+	if goos != "windows" {
+		return false
+	}
+	ext := strings.ToLower(filepath.Ext(path))
+	return ext == ".cmd" || ext == ".bat"
+>>>>>>> 3fa9510 (新增：Claude headless 回合中插话(steer))
 }
 
 func newOpenCodeAITool(path string, prompt string, model string, effort string, resumeSessionID string) *agentAITool {
@@ -7148,14 +7290,23 @@ func normalizeAgentAIModel(model string) string {
 }
 
 func agentAICapabilities() []string {
-	_, hasClaude := lookPathCLI("claude")
-	_, hasClaudeCode := lookPathCLI("claudecode")
+	claudePath, hasClaude := lookPathCLI("claude")
+	claudeCodePath, hasClaudeCode := lookPathCLI("claudecode")
 	_, hasOpenCode := lookPathCLI("opencode")
-	return agentAICapabilitiesForTools(hasClaude == nil, hasClaudeCode == nil, codexAppServerAvailable(), hasOpenCode == nil, codexNativeGoalAvailable())
+	// Claude steer 依赖 `--input-format stream-json`；老世代 CLI 没有该 flag，
+	// 探测失败即不宣称能力，服务端/手机会退回「运行中不可发消息」的旧行为。
+	hasClaudeSteer := (hasClaude == nil && claudeStreamJSONInputAvailable(claudePath)) ||
+		(hasClaudeCode == nil && claudeStreamJSONInputAvailable(claudeCodePath))
+	return agentAICapabilitiesForTools(hasClaude == nil, hasClaudeCode == nil, codexAppServerAvailable(), hasOpenCode == nil, codexNativeGoalAvailable(), hasClaudeSteer)
 }
 
-func agentAICapabilitiesForTools(hasClaude, hasClaudeCode, hasCodexAppServer, hasOpenCode, hasCodexNativeGoal bool) []string {
+func agentAICapabilitiesForTools(hasClaude, hasClaudeCode, hasCodexAppServer, hasOpenCode, hasCodexNativeGoal, hasClaudeSteer bool) []string {
 	caps := []string{"ai_chat", "ai_chat_context", "ai_stream", "ai_approval", "ai_steer", "vibe_session"}
+	if hasClaudeSteer {
+		// 与 ai_steer（Codex app-server 通道）区分：老 agent 也会无条件宣称
+		// ai_steer，但只有新 agent 才能真正对 Claude run 注入。
+		caps = append(caps, "ai_steer_claude")
+	}
 	if hasClaude {
 		caps = append(caps, "ai_provider_claude")
 	}
