@@ -5,8 +5,8 @@ import { describe, expect, it, vi } from 'vitest';
 
 vi.mock('../../../i18n', () => ({ useI18n: () => ({ t: (k) => k }) }));
 vi.mock('../../../services/agentApi', () => ({
-  getPeerMCPStatus: vi.fn(async () => ({ registration: [] })),
-  setPeerMCPRegistration: vi.fn(async () => ({}))
+  getPeerMCPStatus: vi.fn(async () => ({ targets: [] })),
+  setPeerMCPRegistration: vi.fn(async () => ({ targets: [] }))
 }));
 
 import { createApp, h } from 'vue';
@@ -46,6 +46,7 @@ describe('PeerAccessSettings 收编卡', () => {
     await Promise.resolve();
     await Promise.resolve();
     expect(onSave).toHaveBeenCalledTimes(1);
-    expect(onSave.mock.calls[0][0]).toEqual({ peer_mcp: { enable: true } });
+    // 2026-11-05 细分开关:save 总是显式产出四键(子开关初始=跟随默认开)
+    expect(onSave.mock.calls[0][0]).toEqual({ peer_mcp: { enable: true, agentcore_enabled: true, claude_enabled: true, codex_enabled: true } });
   });
 });

@@ -143,7 +143,7 @@ func TestApplyPeerMCPCodexRegistrationPreservesUserContent(t *testing.T) {
 func TestPeerMCPKernelStateTransitions(t *testing.T) {
 	home := swapPeerMCPHome(t)
 	// 初始:missing
-	if st, err := peerMCPRegistrationStates(home); err != nil {
+	if st, err := peerMCPRegistrationTargets(home); err != nil {
 		t.Fatal(err)
 	} else {
 		for _, r := range st {
@@ -193,7 +193,7 @@ func TestEnsurePeerMCPMatchesConfig(t *testing.T) {
 	configSetGlobalForTest(t, &off)
 	EnsurePeerMCPMatchesConfigForTest(home)
 	// 关:两内核注册态应为 missing(没注册过,注销幂等)
-	st, err := peerMCPRegistrationStates(home)
+	st, err := peerMCPRegistrationTargets(home)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -205,7 +205,7 @@ func TestEnsurePeerMCPMatchesConfig(t *testing.T) {
 	on := true
 	configSetGlobalForTest(t, &on)
 	EnsurePeerMCPMatchesConfigForTest(home)
-	st, err = peerMCPRegistrationStates(home)
+	st, err = peerMCPRegistrationTargets(home)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -315,5 +315,119 @@ func TestAgentCorePeerToolsGatedByPeerMCPEnabled(t *testing.T) {
 	config.SetGlobalConfig(&config.Config{Customer: &config.CustomerConfig{PeerMCP: &config.PeerMCPConfig{Enable: &off}}})
 	if got := m.agentCorePeerTools(run); len(got) != 0 {
 		t.Fatalf("显式关闭后不应注入 peer 工具, got %d", len(got))
+	}
+}
+
+
+// —— 2026-11-05 per-kernel 细分开关:逐内核应用/自愈/回显 ——
+
+// 逐内核原语:关 claude 不碰 codex;Expected 随载荷回显。
+func TestApplyPeerMCPRegistrationPerKernel(t *testing.T) {
+	home := swapPeerMCPHome(t)
+	if results := ApplyPeerMCPRegistration(home, true); len(results) != 2 {
+		t.Fatalf("register both: %v", results)
+	}
+	// 只关 claude
+	res := applyPeerMCPKernel(home, "claude", false)
+	if res.State != PeerMCPStateMissing || res.Expected {
+		t.Fatalf("claude want missing+expected=false, got %+v", res)
+	}
+	// codex 不受影响(上方只关了 claude)
+	states, err := peerMCPKernelState(home, "codex")
+	if err != nil || states != PeerMCPStateRegistered {
+		t.Fatalf("codex 应保持 registered, got %v err=%v", states, err)
+	}
+}
+
+// 自愈逐内核:master 开 + claude 显式关 + codex 跟随 → claude 注销、codex 保持。
+func TestEnsurePeerMCPMatchesConfigPerKernel(t *testing.T) {
+	home := swapPeerMCPHome(t)
+	old := config.GetGlobalConfig()
+	on, off := true, false
+	config.SetGlobalConfig(&config.Config{Customer: &config.CustomerConfig{PeerMCP: &config.PeerMCPConfig{
+		Enable: &on, ClaudeEnabled: &off,
+	}}})
+	t.Cleanup(func() { config.SetGlobalConfig(old) })
+
+	// 先双开,再自愈(应只关 claude)
+	if results := ApplyPeerMCPRegistration(home, true); len(results) != 2 {
+		t.Fatalf("register both: %v", results)
+	}
+	EnsurePeerMCPMatchesConfigForTest(home)
+	if st, err := peerMCPKernelState(home, "claude"); err != nil || st != PeerMCPStateMissing {
+		t.Fatalf("claude 应被自愈注销, got %v err=%v", st, err)
+	}
+	if st, err := peerMCPKernelState(home, "codex"); err != nil || st != PeerMCPStateRegistered {
+		t.Fatalf("codex 应保持注册, got %v err=%v", st, err)
+	}
+}
+
+// 状态回显 targets 形状:逐内核 expected 与有效读点一致;registration 键不复存在。
+func TestPeerMCPStatusTargetsShape(t *testing.T) {
+	home := swapPeerMCPHome(t)
+	_ = home // 桩已换上即可,本用例只看形状
+	old := config.GetGlobalConfig()
+	on, off := true, false
+	config.SetGlobalConfig(&config.Config{Customer: &config.CustomerConfig{PeerMCP: &config.PeerMCPConfig{
+		Enable: &on, ClaudeEnabled: &off,
+	}}})
+	t.Cleanup(func() { config.SetGlobalConfig(old) })
+
+	s := &AgentService{}
+	status := s.PeerMCPStatus()
+	if _, ok := status["registration"]; ok {
+		t.Fatal("registration 旧键应已移除(一次性切换)")
+	}
+	targets, ok := status["targets"].([]PeerMCPApplyResult)
+	if !ok || len(targets) != 2 {
+		t.Fatalf("targets 形状不符: %v", status["targets"])
+	}
+	byKernel := map[string]PeerMCPApplyResult{}
+	for _, r := range targets {
+		byKernel[r.Kernel] = r
+	}
+	if byKernel["claude"].Expected {
+		t.Fatal("claude expected 应为 false(显式关)")
+	}
+	if !byKernel["codex"].Expected {
+		t.Fatal("codex expected 应为 true(nil 跟随 master 开)")
+	}
+}
+
+// SetPeerMCPRegistration 载荷即真相:传入 cfg 决定逐内核应用与内存同步,
+// 不受调用时刻全局配置影响(两段式的立即性保证)。
+func TestSetPeerMCPRegistrationPayloadIsTruth(t *testing.T) {
+	home := swapPeerMCPHome(t)
+	_ = home // 桩已换上即可,本用例只看形状与内存保真
+	old := config.GetGlobalConfig()
+	off := false
+	// 全局此刻是「全关」,但载荷说 claude 开——结果应以载荷为准。
+	config.SetGlobalConfig(&config.Config{Customer: &config.CustomerConfig{PeerMCP: &config.PeerMCPConfig{Enable: &off}}})
+	t.Cleanup(func() { config.SetGlobalConfig(old) })
+
+	on, off := true, false
+	s := &AgentService{}
+	result := s.SetPeerMCPRegistration(&config.PeerMCPConfig{
+		Enable: &on, ClaudeEnabled: &on, CodexEnabled: &off,
+	})
+	targets, ok := result["targets"].([]PeerMCPApplyResult)
+	if !ok || len(targets) != 2 {
+		t.Fatalf("targets 形状不符: %v", result["targets"])
+	}
+	byKernel := map[string]PeerMCPApplyResult{}
+	for _, r := range targets {
+		byKernel[r.Kernel] = r
+	}
+	if st := byKernel["claude"].State; st != PeerMCPStateRegistered {
+		t.Fatalf("claude 应按载荷注册, got %v err=%s", st, byKernel["claude"].Error)
+	}
+	if st := byKernel["codex"].State; st != PeerMCPStateMissing {
+		t.Fatalf("codex 应按载荷注销, got %v err=%s", st, byKernel["codex"].Error)
+	}
+	// 内存同步保真:载荷四键深拷贝写回内存配置
+	mem := config.GetGlobalConfig().Customer.PeerMCP
+	if mem == nil || mem.ClaudeEnabled == nil || !*mem.ClaudeEnabled ||
+		mem.CodexEnabled == nil || *mem.CodexEnabled || mem.AgentcoreEnabled != nil {
+		t.Fatalf("内存配置应保真子键, got %+v", mem)
 	}
 }

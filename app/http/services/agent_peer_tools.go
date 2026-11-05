@@ -966,10 +966,10 @@ func peerToolSchema(required []string, props map[string]interface{}) map[string]
 // 门控（与 MCP/子 agent 注入同判据）；审批取舍见文件头注释（各工具真实门禁
 // 不同，peer_exec 有 ACL+开关，fetch/note 仅同账号）。
 func (m *agentAIManager) agentCorePeerTools(run agentAIRun) []agentcore.Tool {
-	// peer_mcp 总开关(customer.peer_mcp,仪表盘「设备互访」卡):关 =
-	// 三内核工具面同关。读点与 MCP 全局开关(EffectiveAgentCoreMCPEnabled)
-	// 同族同语义:默认开,nil 与 true 等价,每 run 现场读取。
-	if !config.GetGlobalConfig().EffectivePeerMCPEnabled() {
+	// peer_mcp 总开关+agentcore 子键(customer.peer_mcp,仪表盘「设备互访」卡):
+	// 总开关关=三面全关;子键 nil=跟随总开关。读点与 MCP 全局开关
+	//(EffectiveAgentCoreMCPEnabled)同族同语义:默认开,nil 与 true 等价,每 run 现场读取。
+	if !config.GetGlobalConfig().EffectivePeerMCPAgentCoreEnabled() {
 		return nil
 	}
 	journal := func(tool, summary string, isErr bool) {

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"aliang.one/nursorgate/app/http/common"
+	"aliang.one/nursorgate/processor/config"
 	"aliang.one/nursorgate/app/http/models"
 	"aliang.one/nursorgate/app/http/services"
 
@@ -584,16 +585,21 @@ func (h *AgentHandler) HandlePeerMcp(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		common.Success(w, h.service.PeerMCPStatus())
 	case http.MethodPost:
+		// 载荷=完整 peer_mcp 配置对象(载荷即真相):runtime 内存配置是启动
+		// 快照,core 侧持久化同步有延迟,显式载荷保证两段式保存的立即性。
+		// nil 子键=跟随总开关(三态由前端归一层保证「显式布尔才产键」)。
 		var req struct {
-			Enable *bool `json:"enable"`
+			PeerMCP *config.PeerMCPConfig `json:"peer_mcp"`
 		}
-		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil || req.Enable == nil {
-			common.ErrorBadRequest(w, "Invalid request body: enable(bool) required", nil)
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil || req.PeerMCP == nil {
+			common.ErrorBadRequest(w, "Invalid request body: peer_mcp object required", nil)
 			return
 		}
-		common.Success(w, h.service.SetPeerMCPRegistration(*req.Enable))
+		common.Success(w, h.service.SetPeerMCPRegistration(req.PeerMCP))
 	default:
-		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
+		// common.Error 收业务码(100-299),直传 http.StatusMethodNotAllowed 会被
+		// 映射成 500;此处须真实 405,同 HandleTerminalScrollback 的 http.Error 惯例。
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
 }
 

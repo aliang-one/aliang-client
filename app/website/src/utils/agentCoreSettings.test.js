@@ -190,9 +190,18 @@ describe('normalizeAgentCoreTuning 全局总闸透传', () => {
 // ⚠️ 还必须在 SettingsPage.normalizeCustomerConfig 挂键,否则「保存 HTTP 200
 // 但永不落盘、刷新恒显默认开」(2026-10-31 验收缺陷①同族)。
 describe('normalizePeerMCPConfig', () => {
-  it('布尔透传为线格式 enable', () => {
+  it('四键显式布尔透传(总开关+三目标子键,2026-11-05 细分)', () => {
     expect(normalizePeerMCPConfig({ enable: false })).toEqual({ enable: false });
     expect(normalizePeerMCPConfig({ enable: true })).toEqual({ enable: true });
+    expect(normalizePeerMCPConfig({
+      enable: true, agentcore_enabled: true, claude_enabled: false, codex_enabled: true
+    })).toEqual({ enable: true, agentcore_enabled: true, claude_enabled: false, codex_enabled: true });
+  });
+
+  it('子键缺键不产出(nil=跟随总开关,不清用户配置)', () => {
+    expect(normalizePeerMCPConfig({ enable: true })).toEqual({ enable: true });
+    expect(normalizePeerMCPConfig({ enable: true, claude_enabled: false }))
+      .toEqual({ enable: true, claude_enabled: false });
   });
 
   it('缺键/非对象/非布尔 → undefined', () => {
@@ -200,6 +209,7 @@ describe('normalizePeerMCPConfig', () => {
     expect(normalizePeerMCPConfig('x')).toBeUndefined();
     expect(normalizePeerMCPConfig({})).toBeUndefined();
     expect(normalizePeerMCPConfig({ enable: 'yes' })).toBeUndefined();
+    expect(normalizePeerMCPConfig({ claude_enabled: 1 })).toBeUndefined();
   });
 
   it('数组输入 → undefined', () => {
@@ -207,7 +217,9 @@ describe('normalizePeerMCPConfig', () => {
     expect(normalizePeerMCPConfig([{ enable: true }])).toBeUndefined();
   });
 
-  it('多余键剔除(只保留 enable)', () => {
+  it('多余键剔除(只保留四键)', () => {
     expect(normalizePeerMCPConfig({ enable: false, junk: 1 })).toEqual({ enable: false });
+    expect(normalizePeerMCPConfig({ enable: true, claude_enabled: true, junk: 'x' }))
+      .toEqual({ enable: true, claude_enabled: true });
   });
 });

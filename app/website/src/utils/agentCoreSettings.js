@@ -117,12 +117,17 @@ export function normalizeAgentCoreTuning(source) {
 // 三态与 mcp_enabled 同族:布尔显式落盘;缺键/非布尔 → undefined(不进
 // patch,后端 nil 视为开启)。⚠️ 必须在 SettingsPage.normalizeCustomerConfig
 // 挂键,否则「保存 HTTP 200 但永不落盘」(2026-10-31 验收缺陷①同族)。
+// 四键三态:显式布尔才产出对应键(缺键/非布尔不进 patch,不清用户配置);
+// 全空对象 → undefined。enable=总开关,其余三键 nil=跟随总开关(2026-11-05 细分)。
 export function normalizePeerMCPConfig(source) {
-  if (source && typeof source === 'object' && !Array.isArray(source)
-    && typeof source.enable === 'boolean') {
-    return { enable: source.enable };
+  if (!source || typeof source !== 'object' || Array.isArray(source)) {
+    return undefined;
   }
-  return undefined;
+  const out = {};
+  for (const key of ['enable', 'agentcore_enabled', 'claude_enabled', 'codex_enabled']) {
+    if (typeof source[key] === 'boolean') out[key] = source[key];
+  }
+  return Object.keys(out).length ? out : undefined;
 }
 
 // 表单值('' 或数字字符串)→ 校验。返回 ''(合法)或 i18n 键。空串与 0 都是

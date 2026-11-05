@@ -1,8 +1,8 @@
 <template>
-  <!-- 设备互访(aliang-peer 跨设备工具面,2026-11-03)。平台托管卡:开关
-       走 customer.peer_mcp(core 落盘/DB),应用走 /api/agent/peer/mcp(runtime
-       写内核配置)。与上面两张总闸卡同层:那张管 AliangCode 内核,这张管
-       claude/codex 的跨设备工具入口。
+  <!-- 设备互访(aliang-peer 跨设备工具面,2026-11-03;2026-11-05 细分开关)。
+       平台托管卡:开关走 customer.peer_mcp(core 落盘/DB),应用走
+       /api/agent/peer/mcp(runtime 写内核配置)。总开关+三目标子键:
+       agentcore 工具面 / claudecode 注册 / codex 注册,子键 nil=跟随总开关。
        保存按钮不设 dirty 门(对照 AgentMCPGlobalSettings 的 !dirty 禁用)是
        有意的:两段式里持久化与应用可能漂移(runtime 自愈失败/配置被手改),
        允许随时保存 = 允许强制重新对齐 runtime 与持久化配置的偏差。 -->
@@ -32,6 +32,39 @@
       />
     </label>
 
+    <!-- 三目标细分:子键三态(nil=跟随总开关),UI 上是普通布尔,保存总是
+         显式产出四键——行为等价、免去 touched 跟踪;nil 语义留给旧数据/程序化写入。 -->
+    <label
+      v-for="sub in subTargets"
+      :key="sub.key"
+      class="flex min-h-11 cursor-pointer items-center justify-between gap-3 border-b border-slate-100 py-3 text-sm text-slate-700 last:border-b-0 dark:border-slate-800 dark:text-slate-200"
+    >
+      <span class="min-w-0">
+        <span class="flex flex-wrap items-center gap-1.5 text-xs font-semibold">
+          {{ t(sub.labelKey) }}
+          <!-- claude/codex 行带注册状态徽章;expected≠state(含 stale)即漂移,如实呈现 -->
+          <span
+            v-if="rowFor(sub.kernel)"
+            class="rounded px-1.5 py-0.5 text-[10px] font-bold"
+            :class="stateClass(rowFor(sub.kernel).state)"
+          >{{ sub.kernel }}:{{ stateLabel(rowFor(sub.kernel).state) }}</span>
+          <span
+            v-if="isDrift(rowFor(sub.kernel))"
+            class="rounded bg-red-50 px-1.5 py-0.5 text-[10px] font-bold text-red-600 dark:bg-red-900/30 dark:text-red-300"
+          >{{ t('peerMcp_drift') }}</span>
+        </span>
+        <span class="mt-0.5 block text-[11px] leading-4 text-slate-500 dark:text-slate-400">{{ t(sub.descKey) }}</span>
+      </span>
+      <input
+        type="checkbox"
+        :data-testid="'peer-mcp-sub-' + sub.key"
+        class="h-4 w-4 shrink-0 rounded border-slate-300 text-primary focus:ring-primary/20 dark:border-slate-600 dark:bg-slate-900"
+        :checked="form[sub.formKey]"
+        :disabled="loading || saving"
+        @change="form[sub.formKey] = $event.target.checked"
+      />
+    </label>
+
     <ul class="mt-3 flex flex-wrap gap-1.5">
       <li
         v-for="tool in tools"
@@ -42,12 +75,6 @@
 
     <div class="mt-3 flex flex-wrap items-center gap-2 text-[11px]" data-testid="peer-mcp-registration" aria-live="polite">
       <template v-if="statusAvailable">
-        <span
-          v-for="row in registration"
-          :key="row.kernel"
-          class="rounded px-1.5 py-0.5 font-bold"
-          :class="stateClass(row.state)"
-        >{{ row.kernel }}:{{ stateLabel(row.state) }}</span>
         <!-- spec §7 诚实回显:逐内核失败原因短文案,不做静默假绿 -->
         <span
           v-for="row in failedRows"
@@ -91,6 +118,13 @@ import { getPeerMCPStatus, setPeerMCPRegistration } from '../../services/agentAp
 // 工具名按 stdio 面展示(本卡是 claude/codex 的入口,以它们实际可见的名字为准)。
 const PEER_TOOLS = ['peer_exec', 'peer_fetch_file', 'device_list', 'device_info', 'device_note'];
 
+// 三目标细分:kernel 仅 claude/codex 有注册状态(agentcore 是工具面注入,无注册态)。
+const SUB_TARGETS = [
+  { key: 'agentcore', kernel: '', formKey: 'agentcoreEnabled', labelKey: 'peerMcp_subAgentcore', descKey: 'peerMcp_subAgentcoreDesc' },
+  { key: 'claude', kernel: 'claude', formKey: 'claudeEnabled', labelKey: 'peerMcp_subClaude', descKey: 'peerMcp_subClaudeDesc' },
+  { key: 'codex', kernel: 'codex', formKey: 'codexEnabled', labelKey: 'peerMcp_subCodex', descKey: 'peerMcp_subCodexDesc' }
+];
+
 export default {
   name: 'PeerMCPSettings',
   setup() {
@@ -106,15 +140,18 @@ export default {
   },
   emits: ['save'],
   computed: {
+    subTargets() {
+      return SUB_TARGETS;
+    },
     failedRows() {
-      return this.registration.filter((row) => row.error);
+      return this.targets.filter((row) => row.error);
     }
   },
   data() {
     return {
-      form: { enabled: this.formFromConfig(this.config) },
+      form: this.formFromConfig(this.config),
       tools: PEER_TOOLS,
-      registration: [],
+      targets: [],
       statusAvailable: false,
       // 「状态不可用」的真实原因:后端 status_error 或请求层 message。
       statusError: '',
@@ -126,7 +163,7 @@ export default {
     config: {
       deep: true,
       handler(nextConfig) {
-        this.form.enabled = this.formFromConfig(nextConfig);
+        this.form = this.formFromConfig(nextConfig);
       }
     }
   },
@@ -135,15 +172,32 @@ export default {
   },
   methods: {
     formFromConfig(config) {
-      const raw = config?.peer_mcp?.enable;
-      return typeof raw === 'boolean' ? raw : true;
+      // 显式布尔才采用;缺省一律视为开启(与后端三态默认开同族)。
+      const boolOr = (raw) => (typeof raw === 'boolean' ? raw : true);
+      return {
+        enabled: boolOr(config?.peer_mcp?.enable),
+        agentcoreEnabled: boolOr(config?.peer_mcp?.agentcore_enabled),
+        claudeEnabled: boolOr(config?.peer_mcp?.claude_enabled),
+        codexEnabled: boolOr(config?.peer_mcp?.codex_enabled)
+      };
     },
-    // 后端读取失败时 registration 为 null 且带 status_error——此时按「状态
+    rowFor(kernel) {
+      if (!kernel) return null;
+      return this.targets.find((row) => row.kernel === kernel) || null;
+    },
+    // expected(有效值)≠ 实际注册态即漂移:stale 恒漂移;
+    // registered↔missing 与 expected 不符即漂移。
+    isDrift(row) {
+      if (!row) return false;
+      if (row.state === 'stale') return true;
+      return row.expected !== (row.state === 'registered');
+    },
+    // 后端读取失败时 targets 为 null 且带 status_error——此时按「状态
     // 不可用」回显,不拿空数组假装读到了零内核(spec §7 诚实回显)。
     // status_error 是后端给出的精确原因,原样透出不猜。
     absorbStatus(data) {
-      this.registration = Array.isArray(data?.registration) ? data.registration : [];
-      this.statusAvailable = Array.isArray(data?.registration);
+      this.targets = Array.isArray(data?.targets) ? data.targets : [];
+      this.statusAvailable = Array.isArray(data?.targets);
       const raw = data?.status_error;
       this.statusError = typeof raw === 'string' && raw ? raw : '';
     },
@@ -172,12 +226,18 @@ export default {
     },
     async save() {
       const enable = !!this.form.enabled;
+      const payloadPeerMcp = {
+        enable,
+        agentcore_enabled: !!this.form.agentcoreEnabled,
+        claude_enabled: !!this.form.claudeEnabled,
+        codex_enabled: !!this.form.codexEnabled
+      };
       this.applyError = '';
       // 两段式:①emit 让父页持久化 customer.peer_mcp(core 落盘/DB);
-      // ②本端点让 runtime 立即应用注册(写内核配置 + 内存同步)。
-      this.$emit('save', { ...(this.config || {}), peer_mcp: { enable } });
+      // ②本端点让 runtime 立即应用注册(载荷即真相,写内核配置 + 内存同步)。
+      this.$emit('save', { ...(this.config || {}), peer_mcp: payloadPeerMcp });
       try {
-        this.absorbStatus(await setPeerMCPRegistration(enable));
+        this.absorbStatus(await setPeerMCPRegistration(payloadPeerMcp));
       } catch (e) {
         // ②失败与①结果互不掩盖:即使父页持久化成功(绿 success),apply
         // 失败也要红显——runtime 工具面可能仍是旧状态(spec §7 诚实回显)。

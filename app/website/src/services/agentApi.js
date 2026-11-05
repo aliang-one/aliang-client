@@ -95,10 +95,12 @@ export async function getPeerMCPStatus() {
   return request('/api/agent/peer/mcp', { method: 'GET' });
 }
 
-export async function setPeerMCPRegistration(enable) {
+// 载荷=完整 peer_mcp 配置对象(载荷即真相):runtime 内存配置是启动快照,
+// 显式载荷保证两段式保存的立即性;nil 子键=跟随总开关(由归一层三态契约保证)。
+export async function setPeerMCPRegistration(peerMcp) {
   return request('/api/agent/peer/mcp', {
     method: 'POST',
-    body: JSON.stringify({ enable }),
+    body: JSON.stringify({ peer_mcp: peerMcp }),
   });
 }
 

@@ -47,9 +47,10 @@ const (
 
 // PeerMCPApplyResult 单内核注册结果(HTTP 状态回显的数据形状)。
 type PeerMCPApplyResult struct {
-	Kernel string             `json:"kernel"`          // "claude" | "codex"
-	State  PeerMCPKernelState `json:"state"`           // 应用后的状态;失败时为应用前状态,应用前读取失败时记 missing 并在 Error 说明
-	Error  string             `json:"error,omitempty"` // 非空=该内核应用失败,其余内核不受影响
+	Kernel   string             `json:"kernel"`          // "claude" | "codex"
+	Expected bool               `json:"expected"`        // 该内核当前有效值(总开关∧子键);expected≠state 即漂移
+	State    PeerMCPKernelState `json:"state"`           // 应用后的状态;失败时为应用前状态,应用前读取失败时记 missing 并在 Error 说明
+	Error    string             `json:"error,omitempty"` // 非空=该内核应用失败,其余内核不受影响
 }
 
 // peerMCPCommand 返回注册进内核配置的 stdio 命令:当前二进制绝对路径 +
@@ -151,15 +152,20 @@ func peerMCPKernelState(home, kernel string) (PeerMCPKernelState, error) {
 	return PeerMCPStateStale, nil
 }
 
-// peerMCPRegistrationStates 读两内核当前注册状态(不写)。
-func peerMCPRegistrationStates(home string) ([]PeerMCPApplyResult, error) {
+// peerMCPRegistrationTargets 读两内核当前注册状态并带上各自有效值 expected
+// (只读,不写;expected≠state 即漂移,前端如实呈现)。
+func peerMCPRegistrationTargets(home string) ([]PeerMCPApplyResult, error) {
 	out := make([]PeerMCPApplyResult, 0, 2)
 	for _, kernel := range []string{"claude", "codex"} {
+		expected := config.GetGlobalConfig().EffectivePeerMCPClaudeEnabled()
+		if kernel == "codex" {
+			expected = config.GetGlobalConfig().EffectivePeerMCPCodexEnabled()
+		}
 		state, err := peerMCPKernelState(home, kernel)
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, PeerMCPApplyResult{Kernel: kernel, State: state})
+		out = append(out, PeerMCPApplyResult{Kernel: kernel, Expected: expected, State: state})
 	}
 	return out, nil
 }
@@ -170,37 +176,57 @@ func peerMCPRegistrationStates(home string) ([]PeerMCPApplyResult, error) {
 
 // ApplyPeerMCPRegistration 按 register 对齐两内核注册状态。已满足的内核
 // 跳过写盘(幂等);单内核失败不影响另一内核;返回应用后的逐内核状态。
-func ApplyPeerMCPRegistration(home string, register bool) []PeerMCPApplyResult {
-	out := make([]PeerMCPApplyResult, 0, 2)
-	for _, kernel := range []string{"claude", "codex"} {
-		state, err := peerMCPKernelState(home, kernel)
-		if err != nil {
-			out = append(out, PeerMCPApplyResult{Kernel: kernel, State: PeerMCPStateMissing, Error: err.Error()})
-			continue
-		}
-		if (register && state == PeerMCPStateRegistered) || (!register && state == PeerMCPStateMissing) {
-			out = append(out, PeerMCPApplyResult{Kernel: kernel, State: state})
-			continue
-		}
-		var applyErr error
-		switch kernel {
-		case "claude":
-			applyErr = applyPeerMCPClaudeRegistration(home, register)
-		case "codex":
-			applyErr = applyPeerMCPCodexRegistration(home, register)
-		}
-		if applyErr != nil {
-			out = append(out, PeerMCPApplyResult{Kernel: kernel, State: state, Error: applyErr.Error()})
-			continue
-		}
-		newState, err := peerMCPKernelState(home, kernel)
-		if err != nil {
-			out = append(out, PeerMCPApplyResult{Kernel: kernel, State: state, Error: err.Error()})
-			continue
-		}
-		out = append(out, PeerMCPApplyResult{Kernel: kernel, State: newState})
+// applyPeerMCPKernel 单内核注册对齐原语:幂等(已满足即跳过写盘),失败返回
+// 应用前状态+Error,不影响另一内核。
+func applyPeerMCPKernel(home, kernel string, register bool) PeerMCPApplyResult {
+	result := PeerMCPApplyResult{Kernel: kernel, Expected: register}
+	state, err := peerMCPKernelState(home, kernel)
+	if err != nil {
+		result.State = PeerMCPStateMissing
+		result.Error = err.Error()
+		return result
 	}
-	return out
+	if (register && state == PeerMCPStateRegistered) || (!register && state == PeerMCPStateMissing) {
+		result.State = state
+		return result
+	}
+	var applyErr error
+	switch kernel {
+	case "claude":
+		applyErr = applyPeerMCPClaudeRegistration(home, register)
+	case "codex":
+		applyErr = applyPeerMCPCodexRegistration(home, register)
+	}
+	if applyErr != nil {
+		result.State = state
+		result.Error = applyErr.Error()
+		return result
+	}
+	newState, err := peerMCPKernelState(home, kernel)
+	if err != nil {
+		result.State = state
+		result.Error = err.Error()
+		return result
+	}
+	result.State = newState
+	return result
+}
+
+// ApplyPeerMCPRegistration 按 register 对齐两内核(同值路径,自愈历史形态)。
+func ApplyPeerMCPRegistration(home string, register bool) []PeerMCPApplyResult {
+	return []PeerMCPApplyResult{
+		applyPeerMCPKernel(home, "claude", register),
+		applyPeerMCPKernel(home, "codex", register),
+	}
+}
+
+// ApplyPeerMCPRegistrationFromConfig 按当前内存配置逐内核对齐(claude/codex
+// 各自取有效值:总开关∧子键)。启动自愈走这里。
+func ApplyPeerMCPRegistrationFromConfig(home string) []PeerMCPApplyResult {
+	return []PeerMCPApplyResult{
+		applyPeerMCPKernel(home, "claude", config.GetGlobalConfig().EffectivePeerMCPClaudeEnabled()),
+		applyPeerMCPKernel(home, "codex", config.GetGlobalConfig().EffectivePeerMCPCodexEnabled()),
+	}
 }
 
 // EnsurePeerMCPMatchesConfig 启动自愈(runtime 进程专用):按总开关对齐
@@ -216,8 +242,7 @@ func EnsurePeerMCPMatchesConfigForTest(home string) {
 		logger.Warn("peer-mcp: startup heal skipped, agent home unavailable")
 		return
 	}
-	register := config.GetGlobalConfig().EffectivePeerMCPEnabled()
-	warnPeerMCPFailures(fmt.Sprintf("peer-mcp: startup heal register=%v", register), ApplyPeerMCPRegistration(home, register))
+	warnPeerMCPFailures("peer-mcp: startup heal", ApplyPeerMCPRegistrationFromConfig(home))
 }
 
 // ---------------------------------------------------------------------------
@@ -430,18 +455,17 @@ func (s *AgentService) PeerMCPStatus() map[string]interface{} {
 		// 进程 CWD,宁可如实报错也不读错地方。
 		return map[string]interface{}{
 			"enabled":      config.GetGlobalConfig().EffectivePeerMCPEnabled(),
-			"registration": nil,
+			"targets":      nil,
 			"status_error": "agent home unavailable",
 		}
 	}
-	states, err := peerMCPRegistrationStates(home)
-	registration := states
+	targets, err := peerMCPRegistrationTargets(home)
 	if err != nil {
-		registration = nil
+		targets = nil
 	}
 	return map[string]interface{}{
 		"enabled":      config.GetGlobalConfig().EffectivePeerMCPEnabled(),
-		"registration": registration,
+		"targets":      targets,
 		"status_error": errorStringOrNil(err),
 	}
 }
@@ -449,22 +473,35 @@ func (s *AgentService) PeerMCPStatus() map[string]interface{} {
 // SetPeerMCPRegistration 应用注册(逐内核 best-effort)并同步本进程内存
 // 配置,返回应用后的状态。总开关本身的持久化走 customer.peer_mcp(仪表盘
 // 两段式:先存配置再调本端点),本方法不写配置文件。
-func (s *AgentService) SetPeerMCPRegistration(enable bool) map[string]interface{} {
-	syncPeerMCPConfigInMemory(enable)
+// SetPeerMCPRegistration 按传入 peer_mcp 配置(载荷即真相,规避 runtime 配置
+// 同步竞态)逐内核应用注册,并同步本进程内存配置。返回应用后的状态。总开关
+// 本身的持久化走 customer.peer_mcp(仪表盘两段式:先存配置再调本端点)。
+func (s *AgentService) SetPeerMCPRegistration(cfg *config.PeerMCPConfig) map[string]interface{} {
+	if cfg == nil {
+		cfg = &config.PeerMCPConfig{}
+	}
+	syncPeerMCPConfigInMemory(cfg)
+	// 有效值按传入 cfg 现算(不读全局——全局此刻可能还没同步到本进程)。
+	probe := &config.Config{Customer: &config.CustomerConfig{PeerMCP: deepCopyPeerMCPConfig(cfg)}}
+	claudeOn := probe.EffectivePeerMCPClaudeEnabled()
+	codexOn := probe.EffectivePeerMCPCodexEnabled()
 	home := peerMCPHome()
 	if home == "" {
 		// 同 PeerMCPStatus:home 缺失时绝不落盘(filepath.Join("",...) 会写
 		// 进进程 CWD),逐内核如实报错。
 		results := []PeerMCPApplyResult{
-			{Kernel: "claude", State: PeerMCPStateMissing, Error: "agent home unavailable"},
-			{Kernel: "codex", State: PeerMCPStateMissing, Error: "agent home unavailable"},
+			{Kernel: "claude", Expected: claudeOn, State: PeerMCPStateMissing, Error: "agent home unavailable"},
+			{Kernel: "codex", Expected: codexOn, State: PeerMCPStateMissing, Error: "agent home unavailable"},
 		}
-		warnPeerMCPFailures(fmt.Sprintf("peer-mcp: apply register=%v", enable), results)
-		return map[string]interface{}{"enabled": enable, "registration": results}
+		warnPeerMCPFailures("peer-mcp: apply per-kernel", results)
+		return map[string]interface{}{"enabled": probe.EffectivePeerMCPEnabled(), "targets": results}
 	}
-	results := ApplyPeerMCPRegistration(home, enable)
-	warnPeerMCPFailures(fmt.Sprintf("peer-mcp: apply register=%v", enable), results)
-	return map[string]interface{}{"enabled": enable, "registration": results}
+	results := []PeerMCPApplyResult{
+		applyPeerMCPKernel(home, "claude", claudeOn),
+		applyPeerMCPKernel(home, "codex", codexOn),
+	}
+	warnPeerMCPFailures("peer-mcp: apply per-kernel", results)
+	return map[string]interface{}{"enabled": probe.EffectivePeerMCPEnabled(), "targets": results}
 }
 
 // warnPeerMCPFailures 逐内核记录应用失败(只 Warn 不阻断)。
@@ -484,7 +521,7 @@ func warnPeerMCPFailures(prefix string, results []PeerMCPApplyResult) {
 // 在拷贝上设 PeerMCP,再 SetGlobalConfig 换指针。指针交换让读取方要么拿
 // 旧要么拿新、各自视为不可变,天然免竞争。只动内存,磁盘持久化仍归
 // customer 配置通道。
-func syncPeerMCPConfigInMemory(enable bool) {
+func syncPeerMCPConfigInMemory(cfg *config.PeerMCPConfig) {
 	old := config.GetGlobalConfig()
 	if old == nil {
 		return
@@ -494,9 +531,33 @@ func syncPeerMCPConfigInMemory(enable bool) {
 	if old.Customer != nil {
 		*next.Customer = *old.Customer
 	}
-	on := enable
-	next.Customer.PeerMCP = &config.PeerMCPConfig{Enable: &on}
+	// 深拷贝入参,避免与调用方/前端载荷共享指针(载荷即真相,内存里自持一份)。
+	next.Customer.PeerMCP = deepCopyPeerMCPConfig(cfg)
 	config.SetGlobalConfig(&next)
+}
+
+func deepCopyPeerMCPConfig(cfg *config.PeerMCPConfig) *config.PeerMCPConfig {
+	if cfg == nil {
+		return nil
+	}
+	out := &config.PeerMCPConfig{}
+	if cfg.Enable != nil {
+		v := *cfg.Enable
+		out.Enable = &v
+	}
+	if cfg.AgentcoreEnabled != nil {
+		v := *cfg.AgentcoreEnabled
+		out.AgentcoreEnabled = &v
+	}
+	if cfg.ClaudeEnabled != nil {
+		v := *cfg.ClaudeEnabled
+		out.ClaudeEnabled = &v
+	}
+	if cfg.CodexEnabled != nil {
+		v := *cfg.CodexEnabled
+		out.CodexEnabled = &v
+	}
+	return out
 }
 
 func errorStringOrNil(err error) any {

@@ -678,7 +678,10 @@ func (c *Config) EffectiveAgentCoreSkillsEnabled() bool {
 // PeerMCPConfig 控制 aliang-peer 跨设备工具面(customer.peer_mcp)。三态指针
 // 语义与 agentcore.mcp_enabled 同族:nil=未配置(默认开)、true/false=显式。
 type PeerMCPConfig struct {
-	Enable *bool `json:"enable,omitempty"`
+	Enable           *bool `json:"enable,omitempty"` // 总开关:关=三面全关
+	AgentcoreEnabled *bool `json:"agentcore_enabled,omitempty"` // agentcore 工具面注入;nil=跟随总开关
+	ClaudeEnabled    *bool `json:"claude_enabled,omitempty"` // claudecode 自动注册;nil=跟随总开关
+	CodexEnabled     *bool `json:"codex_enabled,omitempty"` // codex 自动注册;nil=跟随总开关
 }
 
 // EffectivePeerMCPEnabled 返回 aliang-peer 跨设备工具面是否开启。默认开启:
@@ -689,6 +692,41 @@ func (c *Config) EffectivePeerMCPEnabled() bool {
 		return true
 	}
 	return *c.Customer.PeerMCP.Enable
+}
+
+// effectivePeerMCPSub 总开关与子键的合取:master(默认真) && (sub nil=跟随→真)。
+func (c *Config) effectivePeerMCPSub(sub *bool) bool {
+	if !c.EffectivePeerMCPEnabled() {
+		return false
+	}
+	if sub == nil {
+		return true
+	}
+	return *sub
+}
+
+// EffectivePeerMCPAgentCoreEnabled agentcore 工具面注入开关(peer 五件套 per-run 注入)。
+func (c *Config) EffectivePeerMCPAgentCoreEnabled() bool {
+	if c == nil || c.Customer == nil || c.Customer.PeerMCP == nil {
+		return true
+	}
+	return c.effectivePeerMCPSub(c.Customer.PeerMCP.AgentcoreEnabled)
+}
+
+// EffectivePeerMCPClaudeEnabled claudecode 平台托管注册开关(启动自愈+apply 对齐读点)。
+func (c *Config) EffectivePeerMCPClaudeEnabled() bool {
+	if c == nil || c.Customer == nil || c.Customer.PeerMCP == nil {
+		return true
+	}
+	return c.effectivePeerMCPSub(c.Customer.PeerMCP.ClaudeEnabled)
+}
+
+// EffectivePeerMCPCodexEnabled codex 平台托管注册开关(启动自愈+apply 对齐读点)。
+func (c *Config) EffectivePeerMCPCodexEnabled() bool {
+	if c == nil || c.Customer == nil || c.Customer.PeerMCP == nil {
+		return true
+	}
+	return c.effectivePeerMCPSub(c.Customer.PeerMCP.CodexEnabled)
 }
 
 // EffectiveAgentCoreMaxIdenticalToolTurns 返回打转守卫阈值;未配置(0/nil/负数)
