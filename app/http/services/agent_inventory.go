@@ -1917,6 +1917,12 @@ func agentContentText(value interface{}) string {
 		if nested, ok := typed["content"]; ok {
 			return agentContentText(nested)
 		}
+		// 图片块占位（spec §3.3）：claude image block / codex input_image 没有
+		// text 键，旧逻辑静默返回空串——纯图消息在 inventory 转录里整条消失。
+		// 原生转录无可达 URL，phase 1 只落占位文本防丢行。
+		if kind, _ := typed["type"].(string); kind == "image" || kind == "input_image" {
+			return "[图片]"
+		}
 	default:
 		return ""
 	}

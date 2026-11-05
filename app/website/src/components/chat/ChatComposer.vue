@@ -51,6 +51,33 @@
             <span class="truncate text-xs text-slate-500 dark:text-slate-400">{{ c.description }}</span>
           </button>
         </div>
+        <!-- 图片附件 chips（spec 2026-11-05-chat-image-pipeline §3.6）：已上传
+             待发送的引用，可单独移除；上传中显示状态行（sendDisabled 已含
+             uploading 禁发）。 -->
+        <div
+          v-if="pendingAttachments.length || attachmentUploading"
+          class="mb-2 flex flex-wrap items-center gap-2"
+          data-testid="chat-attach-chips"
+        >
+          <span
+            v-for="attachment in pendingAttachments"
+            :key="attachment.ref"
+            class="flex items-center gap-1 rounded-full border border-slate-200 bg-white px-2.5 py-1 text-xs text-slate-600 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-300"
+          >
+            <span class="material-symbols-outlined text-[14px] leading-none text-primary">image</span>
+            <span class="max-w-[160px] truncate">{{ attachment.name }}</span>
+            <button
+              type="button"
+              :aria-label="t('chat_attachRemove')"
+              :title="t('chat_attachRemove')"
+              class="flex h-5 w-5 items-center justify-center rounded-full text-slate-400 transition hover:bg-slate-100 hover:text-slate-600 dark:hover:bg-slate-700 dark:hover:text-slate-200"
+              @click="emit('remove-attachment', attachment.ref)"
+            >
+              <span class="material-symbols-outlined text-[12px] leading-none">close</span>
+            </button>
+          </span>
+          <span v-if="attachmentUploading" class="text-xs text-slate-400">{{ t('chat_attachUploading') }}</span>
+        </div>
         <!-- 胶囊容器 + 自增高 textarea（≤6 行 = 144px）+ 动作键内嵌。focus
              环挂在容器 focus-within 上。动作键内嵌（2026-11-04 圆角直角混存
              修复）：等高 pill(16px 圆角)外贴 rounded-lg 按钮读作「圆角胶囊+
@@ -58,9 +85,33 @@
         <div
           class="flex items-end gap-1.5 rounded-2xl border border-slate-200 bg-white p-1.5 pl-2 transition focus-within:border-primary dark:border-slate-600 dark:bg-slate-800"
         >
-          <!-- min-h-[40px] 全端生效（不随 md 折叠回 0）：空输入时桌面端不再被
+          <!-- 图片选择按钮（spec §3.6）：隐藏 file input，回形针按钮触发。
+               上传动作经函数 prop 交 useAliangChat（session 键与发送同源）。
+               min-h-[40px] 全端生效（不随 md 折叠回 0）：空输入时桌面端不再被
                autosize 压成 ~36px 细条（2026-11-04 用户反馈「太矮」）。autosize
                的内联 height 低于 40 时由 CSS min-height 兜底钳制。 -->
+          <button
+            v-if="addAttachmentFiles"
+            type="button"
+            data-testid="chat-attach-button"
+            :aria-label="t('chat_attachAdd')"
+            :title="t('chat_attachAdd')"
+            :disabled="disabled"
+            class="mb-0.5 flex h-10 shrink-0 items-center justify-center rounded-xl px-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-primary md:h-9 dark:hover:bg-slate-700"
+            @click="bindFileInputEl && bindFileInputEl.click()"
+          >
+            <span class="material-symbols-outlined text-[18px] leading-none">attach_file</span>
+          </button>
+          <input
+            v-if="addAttachmentFiles"
+            :ref="bindFileInputEl"
+            type="file"
+            class="hidden"
+            multiple
+            accept="image/png,image/jpeg,image/gif,image/webp"
+            :aria-label="t('chat_attachAdd')"
+            @change="onFilesPicked"
+          />
           <textarea
             :ref="bindInputEl"
             v-model="inputModel"
@@ -106,9 +157,8 @@
 </template>
 
 <script setup>
-import { computed, watch } from 'vue';
-import { useI18n } from '../../i18n';
-import { isComposingEvent } from '../../composables/useAliangChat';
+import { computed, ref, watch } from 'vue';
+import { useI18n } from '../../i18n';import { isComposingEvent } from '../../composables/useAliangChat';
 import ChatRecallBanner from './ChatRecallBanner.vue';
 
 // 自增高上限：144px ≈ 6 行（行高 20px + 上下 padding）。
@@ -142,6 +192,12 @@ const props = defineProps({
   // 输入框元素交接：createConversation/applySlash 在 nextTick 里 focus（元素
   // 在本组件渲染，焦点驱动仍在 useAliangChat，与拆分前 ref="inputRef" 等价）。
   setInputEl: { type: Function, required: true },
+  // 图片附件（spec §3.6）：pending 列表+上传/移除动作由 useAliangChat 持有
+  // （session 键与发送同源），经函数 prop 注入（setInputEl 同款惯例）。
+  pendingAttachments: { type: Array, default: () => [] },
+  attachmentUploading: { type: Boolean, default: false },
+  addAttachmentFiles: { type: Function, default: null },
+  removePendingAttachment: { type: Function, default: null },
 });
 
 const emit = defineEmits([
@@ -157,9 +213,28 @@ const emit = defineEmits([
   'slash-index',
   'slash-close',
   'slash-input',
+  // 图片附件（spec §3.6）：移除单个已上传 pending 引用（ChatPage 接
+  // removePendingAttachment）。
+  'remove-attachment',
 ]);
 
 const { t } = useI18n();
+
+// 图片附件（spec §3.6）：file input 元素交接（setInputEl 同款函数 prop 惯例
+// ——元素在本组件渲染）+ 选中即交 useAliangChat 上传；input value 复位以便
+// 同名文件可重复选择。
+const fileInputEl = ref(null);
+
+function bindFileInputEl(el) {
+  fileInputEl.value = el;
+}
+
+function onFilesPicked(event) {
+  if (typeof props.addAttachmentFiles === 'function') {
+    props.addAttachmentFiles(event.target.files);
+  }
+  event.target.value = '';
+}
 
 // 发送动作分流（Task 13）：编辑态下按钮点击与 Enter 都改发 recall-confirm，
 // ChatPage 侧路由到 sendRecall；常规路径原样 emit('send')。

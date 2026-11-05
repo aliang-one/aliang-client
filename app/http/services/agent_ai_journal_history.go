@@ -10,8 +10,44 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
+
+	"aliang.one/nursorgate/app/http/models"
 )
+
+// agentVibeAttachmentsFromRow 把 journal 行的 attachments 原始 JSON 值转成
+// wire 视图（models.AgentVibeAttachment 形状，spec §3.3）。缺键/形状不符
+// 返回 nil——老行（2026-11-05 前落盘）无此键，天然兼容。
+func agentVibeAttachmentsFromRow(raw interface{}) []models.AgentVibeAttachment {
+	list, ok := raw.([]interface{})
+	if !ok || len(list) == 0 {
+		return nil
+	}
+	out := make([]models.AgentVibeAttachment, 0, len(list))
+	for _, item := range list {
+		entry, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		ref, _ := entry["ref"].(string)
+		if strings.TrimSpace(ref) == "" {
+			continue
+		}
+		view := models.AgentVibeAttachment{Name: ref, Ref: ref}
+		if name, ok := entry["name"].(string); ok && name != "" {
+			view.Name = name
+		}
+		if mime, ok := entry["mime"].(string); ok {
+			view.Mime = mime
+		}
+		if bytes, ok := entry["bytes"].(float64); ok {
+			view.Bytes = int64(bytes)
+		}
+		out = append(out, view)
+	}
+	return out
+}
 
 type agentCoreJournalHead struct {
 	projectPath string
@@ -62,10 +98,13 @@ func readAgentCoreJournalHistoryFrom(dir, sessionID string) ([]agentAIMessage, a
 			role, _ := row["role"].(string)
 			text, _ := row["text"].(string)
 			msgID, _ := row["message_id"].(string)
-			if (role != "user" && role != "assistant") || text == "" {
+			// 附件透传（spec §3.3）：text 空但带附件的纯图行保留——这是手机图
+			// 网页显示链的读侧半段。
+			atts := agentVibeAttachmentsFromRow(row["attachments"])
+			if (role != "user" && role != "assistant") || (text == "" && len(atts) == 0) {
 				continue
 			}
-			msg := agentAIMessage{Role: role, MessageID: msgID, Content: text}
+			msg := agentAIMessage{Role: role, MessageID: msgID, Content: text, Attachments: atts}
 			if ts, ok := row["ts"].(string); ok {
 				if t, err := time.Parse(time.RFC3339, ts); err == nil {
 					msg.CreatedAt = t
@@ -79,7 +118,7 @@ func readAgentCoreJournalHistoryFrom(dir, sessionID string) ([]agentAIMessage, a
 			// 内存续聊恢复全部拿不到回答（2026-11-05 仪表盘刷新丢回答事故的
 			// 内核侧根因；inventory 侧 2026-10-31 已补，本读侧漏网）。turn 行
 			// 无 message_id（inventory 同款接受），thinking 字段快照契约未
-			// 消费，不进历史。
+			// 消费，不进历史。turn 行本批次无附件（内核回答纯文本）。
 			role, _ := row["role"].(string)
 			text, _ := row["text"].(string)
 			if (role != "user" && role != "assistant") || text == "" {

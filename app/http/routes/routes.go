@@ -280,6 +280,10 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	register("/api/agent/peer/mcp", h.Agent.HandlePeerMcp, http.MethodGet, http.MethodPost)
 	register("/api/agent/ai/stream", h.Agent.HandleAIStream, http.MethodGet)
 	register("/api/agent/ai/approval-hook", h.Agent.HandleAIApprovalHook, http.MethodPost)
+	// 聊天图片链路（spec 2026-11-05-chat-image-pipeline §3.4）：网页发图上传
+	// 与网页显示取图（loopback+Origin 守卫在 handler 内,transfers D13 同源）。
+	register("/api/agent/ai/attachment/upload", h.Agent.HandleAttachmentUpload, http.MethodPost)
+	register("/api/agent/ai/attachment", h.Agent.HandleAttachmentGet, http.MethodGet)
 	// 自有交互工具 MCP 端点(tool_ask bridge):路径含 per-run token,方法由
 	// MCP Streamable HTTP 协议决定(POST 消息/GET SSE/DELETE 关会话)。
 	register("/mcp/aliang/", h.Agent.HandleToolAskMCP, http.MethodPost, http.MethodGet, http.MethodDelete)

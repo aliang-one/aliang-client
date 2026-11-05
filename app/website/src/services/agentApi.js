@@ -131,3 +131,29 @@ export async function getAgentTerminalScrollback(sessionId, { limit } = {}) {
     { method: 'GET' }
   );
 }
+
+// 聊天图片上传（spec 2026-11-05-chat-image-pipeline §3.4）：multipart 直传
+// 本机 agent（不能用 request()——它强制 JSON Content-Type，会破坏 multipart
+// boundary）。信封/鉴权处理与 request() 同构；data.attachment 形状
+// {ref,path,name,mime,bytes}，ref 供渲染 URL，path 供 ai.message 载荷。
+export async function uploadChatAttachment(sessionId, file) {
+  const form = new FormData();
+  form.append('session_id', sessionId);
+  form.append('file', file);
+  const response = await fetch('/api/agent/ai/attachment/upload', {
+    method: 'POST',
+    credentials: 'same-origin',
+    body: form,
+  });
+  const json = await response.json().catch(() => ({}));
+  const envelope = extractEnvelope(json);
+  handleAuthenticationFailure(response.status, envelope, syncUnauthenticatedAuthState);
+  if (!response.ok || envelope.code !== 0) {
+    throw new Error(envelope.msg || `Upload failed with HTTP ${response.status}`);
+  }
+  const attachment = envelope.data && envelope.data.attachment;
+  if (!attachment || !attachment.ref || !attachment.path) {
+    throw new Error('Malformed upload response');
+  }
+  return attachment;
+}

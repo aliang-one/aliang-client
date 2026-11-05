@@ -4,6 +4,15 @@ import { useNavigation } from './useNavigation';
 import { slashProviderFor } from '../utils/chatProvider';
 import { normalizeConversationTitle } from '../utils/chatTitle';
 import { useAuthStore } from '../stores/auth';
+import { uploadChatAttachment } from '../services/agentApi';
+
+// 附件缩略图/原图 URL（spec 2026-11-05-chat-image-pipeline §3.6）：ref 来自
+// journal/wire 行，一律走本机 agent 回环端点取图（COS/预签名 URL 永不出现在
+// 前端）。组件直接 import 本模块级纯函数。
+export function chatAttachmentUrl(refId) {
+  if (!refId) return '';
+  return '/api/agent/ai/attachment?ref=' + encodeURIComponent(refId);
+}
 import { getAgentIntegrations, getAgentSessionDetail } from '../services/agentApi';
 import { useDeviceSessions, DEVICE_SESSION_DETAIL_TTL_MS, isTerminalPrefixedSessionId } from './useDeviceSessions';
 import {
@@ -89,6 +98,11 @@ export function useAliangChat() {
   const activeId = ref(null);
   const inputText = ref('');
   const sending = ref(false);
+  // 图片附件（spec 2026-11-05-chat-image-pipeline §3.6）：pending=已上传待随
+  // ai.message 发出的引用（{ref,path,name,mime,bytes}）；uploading 期间禁发
+  // （防载荷半截）。瞬态：不进 conversationForStorage。
+  const pendingAttachments = ref([]);
+  const attachmentUploading = ref(false);
   const messagesContainer = ref(null);
   // 滚动跟随守卫（Task 8）：用户贴底时流式增量照常拽底；一旦上翻看历史
   // （距底 ≥120px），delta/审批卡/系统条等自动滚动全部静默，改由「回到底部」
@@ -231,6 +245,7 @@ export function useAliangChat() {
   // activeApprovals 口径一致，壳路由到他端会话的卡不拦本端输入）。
   const sendDisabled = computed(() =>
     (sending.value && !activeSessionRunning.value) || sendApprovalBlocked.value
+    || attachmentUploading.value
   );
 
   // --- 撤回重发编辑态（Task 13，转录级真撤回） ---
@@ -769,18 +784,25 @@ export function useAliangChat() {
   function applyDeviceTranscript(shell, transcript) {
     const rows = Array.isArray(transcript) ? transcript : [];
     const renderable = rows.filter(m => m && (m.role === 'user' || m.role === 'assistant')
-      && typeof m.content === 'string' && m.content);
+      && ((typeof m.content === 'string' && m.content)
+        || (Array.isArray(m.attachments) && m.attachments.length > 0)));
     shell.messages = renderable.map(m => ({
       role: m.role,
-      content: m.content,
+      content: m.content || '',
       status: 'done',
       // 撤回锚点接线（Task 13）：详情 wire 行的 id 即 journal message_id，落
       // 气泡后可作 truncate_before_message_id；provider 落上（canRecall 依赖）。
       messageId: m.id || '',
       provider: shell.provider || '',
       ts: Date.parse(m.timestamp) || now(),
+      // 图片附件（spec §3.6）：ref → 本机端点 URL，气泡缩略图分支渲染。
+      ...(Array.isArray(m.attachments) && m.attachments.length
+        ? { attachments: m.attachments.map(a => ({ name: a.name || '', url: chatAttachmentUrl(a.ref) })) }
+        : {}),
     }));
-    shell.deviceTranscript = renderable.map(m => ({ role: m.role, content: m.content }));
+    // 续聊喂入保持纯文本语义：空文本纯图行不进 deviceTranscript（本批次图片
+    // 仅显示，不回灌内核历史）。
+    shell.deviceTranscript = renderable.filter(m => m.content).map(m => ({ role: m.role, content: m.content }));
     scrollToBottom();
   }
 
@@ -792,16 +814,20 @@ export function useAliangChat() {
   function applyDeviceSnapshotTranscript(shell, rows) {
     const list = Array.isArray(rows) ? rows : [];
     const renderable = list.filter(m => m && (m.role === 'user' || m.role === 'assistant')
-      && typeof m.text === 'string' && m.text);
+      && ((typeof m.text === 'string' && m.text)
+        || (Array.isArray(m.attachments) && m.attachments.length > 0)));
     shell.messages = renderable.map(m => ({
       role: m.role,
-      content: m.text,
+      content: m.text || '',
       status: 'done',
       // 快照 id 系 journal 同源（spec §A 已修订），可作撤回锚点；内容仍绝不
       // 喂入（deviceTranscript 专属流不变）。provider 落上（canRecall 依赖）。
       messageId: m.message_id || '',
       provider: shell.provider || '',
       ts: Date.parse(m.ts) || now(),
+      ...(Array.isArray(m.attachments) && m.attachments.length
+        ? { attachments: m.attachments.map(a => ({ name: a.name || '', url: chatAttachmentUrl(a.ref) })) }
+        : {}),
     }));
   }
 
@@ -1566,8 +1592,56 @@ export function useAliangChat() {
     }
   }
 
-  // --- steer 分流（跨端统一阶段 2 Task 4） ---
+  // --- 图片附件（spec 2026-11-05-chat-image-pipeline §3.6） ---
 
+  // 客户端预检与 agent 侧对齐：≤8 张/消息、单张 ≤10MiB、仅 jpeg/png/gif/webp。
+  // 错误走 createError 面板（下次成功发送清除）；上传串行进行防乱序。
+  const ATTACH_IMAGE_EXT = /\.(jpe?g|png|gif|webp)$/i;
+  function addPendingAttachments(files) {
+    const list = Array.from(files || []);
+    if (list.length === 0) return;
+    const conv = activeConversation.value;
+    if (!conv) return;
+    for (const file of list) {
+      if (!ATTACH_IMAGE_EXT.test(file.name)) {
+        createError.value = t('chat_attachUnsupported');
+        return;
+      }
+      if (file.size > 10 * 1024 * 1024) {
+        createError.value = t('chat_attachTooLarge');
+        return;
+      }
+    }
+    if (pendingAttachments.value.length + list.length > 8) {
+      createError.value = t('chat_attachTooMany');
+      return;
+    }
+    const sessionId = conv.aiSessionId || ('local-' + conv.id);
+    attachmentUploading.value = true;
+    (async () => {
+      try {
+        for (const file of list) {
+          const attachment = await uploadChatAttachment(sessionId, file);
+          pendingAttachments.value.push(attachment);
+        }
+        createError.value = '';
+      } catch (err) {
+        createError.value = (err && err.message) || t('chat_attachUploadFailed');
+      } finally {
+        attachmentUploading.value = false;
+      }
+    })();
+  }
+
+  function removePendingAttachment(refId) {
+    pendingAttachments.value = pendingAttachments.value.filter(a => a.ref !== refId);
+  }
+
+  function clearPendingAttachments() {
+    pendingAttachments.value = [];
+  }
+
+  // --- steer 分流（跨端统一阶段 2 Task 4） ---
   // 运行中回合的旁路注入：不插 user 气泡、不走 create 确认门、不武装看门狗、
   // 不动 sending——轻量条自己承载状态（sent → ack 落定）。目标为空（claude_/
   // codex_ 壳 running 且无 managed id）时静默返回：阻断提示条已常驻输入区，
@@ -2237,13 +2311,22 @@ export function useAliangChat() {
     }
 
     const text = inputText.value.trim();
-    if (!text || !activeId.value) return;
+    if ((!text && pendingAttachments.value.length === 0) || !activeId.value) return;
     // sending 守卫（Task 4 分流）：非 running 维持禁用；running 会话在 sending
     // 中放行——提交分流成 steer（见下）。
     if (sending.value && !activeSessionRunning.value) return;
 
     const conv = activeConversation.value;
     if (!conv) return;
+
+    // 图片走完整消息路径（create 门 + ai.message attachments）；running 插话
+    // 本批次仅承载文本——带图插话提示等回合结束，绝不静默丢附件。
+    if (pendingAttachments.value.length > 0 && isConversationRunning(conv)) {
+      createError.value = t('chat_attachSteerBlocked');
+      return;
+    }
+    const attachments = pendingAttachments.value.map(a => ({ type: 'image', name: a.name, path: a.path }));
+    const bubbleAttachments = pendingAttachments.value.map(a => ({ name: a.name, url: chatAttachmentUrl(a.ref) }));
 
     // 分流规则（阶段 2 计划钉死）：running（本地气泡推断 OR 设备壳清单/快照
     // status）→ 提交走 ai.steer；非 running → 原链（create 确认门 + ai.message）。
@@ -2265,7 +2348,14 @@ export function useAliangChat() {
     // messageId 提前生成、随气泡落值（Task 13）：撤回链以气泡 id 为 journal
     // 截断锚点，ai.message 帧复用同一 id；provider 落气泡——canRecall 依赖。
     const messageId = generateId();
-    conv.messages.push({ role: 'user', content: text, messageId, provider: conv.provider, ts: now() });
+    conv.messages.push({
+      role: 'user',
+      content: text,
+      messageId,
+      provider: conv.provider,
+      ts: now(),
+      ...(bubbleAttachments.length ? { attachments: bubbleAttachments } : {}),
+    });
     if (!conv.title) {
       conv.title = text.slice(0, 20);
     }
@@ -2316,8 +2406,11 @@ export function useAliangChat() {
         session_id: conv.aiSessionId,
         message_id: messageId,
         content: text,
+        ...(attachments.length ? { attachments } : {}),
       });
       if (!ok) throw new Error('socket-closed');
+      // 发送落地才清 pending（失败保留，用户重试不丢图）。
+      clearPendingAttachments();
     } catch (_) {
       disarmIdleWatchdog();
       const asst = findRunningAssistant(conv);
@@ -2460,5 +2553,10 @@ export function useAliangChat() {
     stopRun,
     toggleMcpServer,
     toggleSkill,
+    // 图片附件（spec §3.6）：pending 态 + 上传/移除动作（ChatComposer 接线）。
+    pendingAttachments,
+    attachmentUploading,
+    addPendingAttachments,
+    removePendingAttachment,
   };
 }

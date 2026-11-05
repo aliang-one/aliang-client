@@ -28,7 +28,15 @@
            有 messageId + provider=agentcore——且非设备壳会话，见撤回键处
            注释；存量旧消息/壳会话只有复制）。 -->
       <div v-if="msg.role === 'user'" class="group relative ml-auto w-fit max-w-[85%]">
-        <div class="whitespace-pre-wrap break-words rounded-2xl bg-primary px-4 py-2.5 text-sm text-white shadow-sm">{{ msg.content }}</div>
+        <!-- 图片附件缩略图条（spec §3.6）：兄弟 DOM 元素渲染，绝不进 markdown
+             管线——user 气泡纯文本插值铁律不破；纯图消息（content 空）只渲染
+             缩略图条。 -->
+        <ChatAttachmentStrip
+          v-if="msg.attachments && msg.attachments.length"
+          :attachments="msg.attachments"
+          class="mb-1 justify-end"
+        />
+        <div v-if="msg.content" class="whitespace-pre-wrap break-words rounded-2xl bg-primary px-4 py-2.5 text-sm text-white shadow-sm">{{ msg.content }}</div>
         <div
           class="absolute -top-3 right-0 z-10 flex items-center gap-0.5 rounded-lg border border-slate-200 bg-white px-1 py-0.5 opacity-100 shadow-sm transition-opacity md:opacity-0 md:group-hover:opacity-100 dark:border-slate-700 dark:bg-slate-800"
         >
@@ -100,6 +108,12 @@
               <div class="mt-1 max-h-40 overflow-y-auto whitespace-pre-wrap leading-relaxed text-slate-400 dark:text-slate-500">{{ msg.thinking }}</div>
             </details>
             <ChatMarkdown :content="msg.content" :hidden-option-ids="hiddenOptionIds" />
+            <!-- 图片附件缩略图条（assistant 侧预留，任何角色带图均渲染）。 -->
+            <ChatAttachmentStrip
+              v-if="msg.attachments && msg.attachments.length"
+              :attachments="msg.attachments"
+              class="mt-1.5"
+            />
             <!-- 流式光标：running 且已有正文时缀在内容尾部闪烁
                  （reduced-motion 下静态常亮不动画）。 -->
             <span
@@ -119,6 +133,7 @@
 import { useI18n } from '../../i18n';
 import { canRecall } from '../../utils/chatRecall';
 import ChatMarkdown from './ChatMarkdown.vue';
+import ChatAttachmentStrip from './ChatAttachmentStrip.vue';
 
 // 纯渲染：单条消息块（系统胶囊 / eyebrow 行 / 气泡）。nowTick 驱动相对时间
 // 随 30s 心跳重算（不做本地定时器，复用列表已有的时钟节拍）。user 气泡的

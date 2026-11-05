@@ -286,6 +286,9 @@ func (m *agentAIManager) emitSessionSnapshot(socketID, sessionID string, writeJS
 			if !msg.CreatedAt.IsZero() {
 				row["ts"] = msg.CreatedAt.UTC().Format(time.RFC3339)
 			}
+			if len(msg.Attachments) > 0 {
+				row["attachments"] = msg.Attachments
+			}
 			tr = append(tr, row)
 		}
 		payload["transcript"] = tr
