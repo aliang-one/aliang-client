@@ -122,7 +122,9 @@ func buildAgentToolRegistry() *tools.Registry {
 				"return its exit code plus stdout/stderr. Requires peer exec enabled on the target. " +
 				"Targets run commands serially; a busy target fails fast with fail_reason=busy. Peer " +
 				"calls are also serial per calling device — run them one after another, never in " +
-				"parallel (concurrent calls fail with rate_limited).",
+				"parallel (concurrent calls fail with rate_limited). Windows = PowerShell 5.1: no " +
+				"\"&&\" (use \";\" or PS cmdlets); .exe may be missing — prefer PS built-ins or " +
+				"absolute paths.",
 			Parameters: map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{

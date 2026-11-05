@@ -508,3 +508,78 @@ func TestPeerExecJournalAudit_CoversEarlyExits(t *testing.T) {
 		t.Fatalf("workdir_missing path not audited:\n%s", text)
 	}
 }
+
+// TestPeerExecEnvFor_WindowsAddsSystemKeys：Windows 键集 = 五键 + 系统键。
+// 用平台参数化纯函数在 darwin 上直接断言（规避 GOOS 尾段测试文件静默跳过
+// 陷阱）；凭据污染源显式 setenv，让「不泄漏」断言有真实对照物。
+func TestPeerExecEnvFor_WindowsAddsSystemKeys(t *testing.T) {
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "sk-leak-me-not")
+	t.Setenv("ANTHROPIC_BASE_URL", "https://leak.example.com")
+	t.Setenv("PATH", "") // 触发 Windows PATH 兜底
+	env := agentPeerExecEnvFor("windows")
+	seen := map[string]string{}
+	for _, entry := range env {
+		idx := strings.IndexByte(entry, '=')
+		if idx <= 0 {
+			t.Fatalf("malformed env entry %q", entry)
+		}
+		seen[entry[:idx]] = entry[idx+1:]
+	}
+	for _, key := range []string{
+		"PATH", "HOME", "TERM", "LANG", "TMPDIR",
+		"SystemRoot", "windir", "ComSpec", "PATHEXT", "TEMP", "TMP", "USERPROFILE",
+	} {
+		if _, ok := seen[key]; !ok {
+			t.Fatalf("windows env missing key %q", key)
+		}
+	}
+	if seen["SystemRoot"] != `C:\Windows` {
+		t.Fatalf("SystemRoot fallback = %q", seen["SystemRoot"])
+	}
+	if seen["PATHEXT"] != ".COM;.EXE;.BAT;.CMD" {
+		t.Fatalf("PATHEXT fallback = %q", seen["PATHEXT"])
+	}
+	if !strings.Contains(seen["PATH"], `C:\Windows\System32`) {
+		t.Fatalf("windows PATH fallback = %q", seen["PATH"])
+	}
+	// 凭据键绝不流入（setenv 过，断言有真实对照）
+	if _, ok := seen["ANTHROPIC_AUTH_TOKEN"]; ok {
+		t.Fatal("credential key leaked into windows env")
+	}
+	if _, ok := seen["ANTHROPIC_BASE_URL"]; ok {
+		t.Fatal("credential base url leaked into windows env")
+	}
+}
+
+// TestPeerExecEnvFor_DarwinKeysUnchanged：darwin 键集五键契约不变——现有
+// TestPeerExecEnv_MinimalAllowlist 之外再钉一层「不增键」。
+func TestPeerExecEnvFor_DarwinKeysUnchanged(t *testing.T) {
+	t.Setenv("PATH", "/usr/bin:/bin")
+	env := agentPeerExecEnvFor("darwin")
+	allowed := map[string]bool{"PATH": true, "HOME": true, "TERM": true, "LANG": true, "TMPDIR": true}
+	for _, entry := range env {
+		idx := strings.IndexByte(entry, '=')
+		if idx <= 0 {
+			t.Fatalf("malformed env entry %q", entry)
+		}
+		if key := entry[:idx]; !allowed[key] {
+			t.Fatalf("darwin env gained key %q (five-key contract broken)", key)
+		}
+	}
+}
+
+// TestAgentPeerPowerShellArgs_UTF8Prefix：PS 参数构造含 UTF-8 OutputEncoding
+// 前缀（PS 5.1 默认按系统 ANSI 代码页写输出，Go 侧按 UTF-8 解释必乱码），
+// 且原始命令完整保留在末尾。
+func TestAgentPeerPowerShellArgs_UTF8Prefix(t *testing.T) {
+	args := agentPeerPowerShellArgs("Get-Date")
+	if len(args) != 4 || args[0] != "-NoProfile" || args[1] != "-NonInteractive" || args[2] != "-Command" {
+		t.Fatalf("unexpected powershell args %v", args)
+	}
+	if !strings.HasPrefix(args[3], "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; ") {
+		t.Fatalf("UTF-8 prefix missing: %q", args[3])
+	}
+	if !strings.HasSuffix(args[3], "Get-Date") {
+		t.Fatalf("original command lost: %q", args[3])
+	}
+}

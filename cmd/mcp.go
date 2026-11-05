@@ -231,7 +231,11 @@ var peerMCPTools = []peerMCPTool{
 			"return its exit code plus stdout/stderr. The remote device must have peer exec " +
 			"enabled. Serial per target device: a busy target returns fail_reason=busy immediately. " +
 			"Also serial per calling device — run peer calls one after another, never in parallel " +
-			"(concurrent calls fail with fail_reason=rate_limited).",
+			"(concurrent calls fail with fail_reason=rate_limited). On Windows targets the command " +
+			"runs under Windows PowerShell 5.1: \"&&\" is unavailable (use \";\" or PS cmdlets), " +
+			"external .exe may be unavailable (prefer PS built-ins like $env:COMPUTERNAME or " +
+			"Get-FileHash, or absolute paths), and PS output is UTF-8 (native-exe output in a " +
+			"legacy codepage may still be garbled).",
 		schema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{

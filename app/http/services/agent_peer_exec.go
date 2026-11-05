@@ -338,14 +338,15 @@ func peerExecProcessSignaled(runErr error, exitErr **exec.ExitError) bool {
 // agentPeerShellCommand 按平台挑 shell 并构造参数：
 //   - 非 Windows：defaultAgentShell()（zsh/bash/sh）经 resolveAgentShell 全套
 //     校验（白名单基名 + 可执行 + isTrustedAgentShellPath 可信目录）后 `-c`；
-//   - Windows：powershell `-Command`（契约钉死，cmd.exe 的引号转义不可靠）。
+//   - Windows：powershell `-Command`（契约钉死，cmd.exe 的引号转义不可靠），
+//     参数由 agentPeerPowerShellArgs 构造（含 UTF-8 输出前缀）。
 func agentPeerShellCommand(command string) (string, []string, error) {
 	if runtime.GOOS == "windows" {
 		shellPath, err := resolveAgentShell("powershell.exe")
 		if err != nil {
 			return "", nil, err
 		}
-		return shellPath, []string{"-NoProfile", "-NonInteractive", "-Command", command}, nil
+		return shellPath, agentPeerPowerShellArgs(command), nil
 	}
 	shellPath, err := resolveAgentShell("")
 	if err != nil {
@@ -354,16 +355,44 @@ func agentPeerShellCommand(command string) (string, []string, error) {
 	return shellPath, []string{"-c", command}, nil
 }
 
-// agentPeerExecEnv 是 peer 子进程的最小环境集。逐键取值——只读这些白名单键，
-// 不继承 agent 进程其余 env（其中含 LLM 网关凭据等敏感项，继承即跨设备泄漏）。
-// Windows 注：HOME/TERM/LANG 非必需键，设置了也无害；SystemRoot 等系统键缺失
-// 会影响部分 GUI 子进程，属可接受的最小集取舍（契约钉死五键）。
+// peerExecPSUtf8Prefix 前置语句：PS 5.1 默认按系统 ANSI 代码页（中文系统=
+// GBK）写 stdout/stderr，Go 侧按 UTF-8 解释必乱码；该语句使 PS 自身输出转
+// UTF-8。边界：原生 exe 按 OEM 代码页输出的解码侧仍可能乱码（spec
+// 2026-11-05-peer-exec-windows-defects §Fix2），彻底方案需按代码页转码，
+// 本批次不做。审计行落原始命令，前缀不进审计。
+const peerExecPSUtf8Prefix = "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; "
+
+// agentPeerPowerShellArgs 纯函数（darwin 可测）：PS 参数构造 + UTF-8 前缀。
+// -EncodedCommand 不动（避免与丢行缺陷④的诊断互相干扰——一次只改一个变量）。
+func agentPeerPowerShellArgs(command string) []string {
+	return []string{"-NoProfile", "-NonInteractive", "-Command", peerExecPSUtf8Prefix + command}
+}
+
+// agentPeerExecEnv 是 peer 子进程的最小环境集（平台参数化）。键集纪律不变：
+// 逐键取值——只读白名单键，不继承 agent 进程其余 env（其中含 LLM 网关凭据
+// 等敏感项，继承即跨设备泄漏）。
+//   - POSIX：五键契约钉死（PATH/HOME/TERM/LANG/TMPDIR），不增不减；
+//   - Windows：五键之外增补 7 个系统键（SystemRoot/windir/ComSpec/PATHEXT/
+//     TEMP/TMP/USERPROFILE）——它们是系统变量非凭据，但缺失会让外部 exe
+//     解析不了（PATHEXT/PATH）、临时目录错乱（TEMP/TMP）、PS/.NET 初始化
+//     异常（SystemRoot）。$env:TEMP 为空、hostname 解析失败的实机证据见
+//     spec 2026-11-05-peer-exec-windows-defects §1。
 func agentPeerExecEnv() []string {
-	env := make([]string, 0, 5)
+	return agentPeerExecEnvFor(runtime.GOOS)
+}
+
+// agentPeerExecEnvFor 平台参数化纯函数：goos 可注入，darwin 测试直接断言
+// windows 键集（规避 GOOS 尾段测试文件静默跳过陷阱）。
+func agentPeerExecEnvFor(goos string) []string {
+	capacity := 5
+	if goos == "windows" {
+		capacity = 12
+	}
+	env := make([]string, 0, capacity)
 	path := strings.TrimSpace(os.Getenv("PATH"))
 	if path == "" {
-		if runtime.GOOS == "windows" {
-			path = `C:\Windows\System32`
+		if goos == "windows" {
+			path = `C:\Windows\System32;C:\Windows;C:\Windows\System32\Wbem;C:\Windows\System32\WindowsPowerShell\v1.0`
 		} else {
 			path = "/usr/bin:/bin:/usr/local/bin"
 		}
@@ -384,7 +413,29 @@ func agentPeerExecEnv() []string {
 	}
 	env = append(env, "LANG="+lang)
 	env = append(env, "TMPDIR="+os.TempDir())
+	if goos != "windows" {
+		return env
+	}
+	env = append(env, windowsEnvEntry("SystemRoot", `C:\Windows`))
+	env = append(env, windowsEnvEntry("windir", `C:\Windows`))
+	env = append(env, windowsEnvEntry("ComSpec", `C:\Windows\system32\cmd.exe`))
+	env = append(env, windowsEnvEntry("PATHEXT", ".COM;.EXE;.BAT;.CMD"))
+	env = append(env, windowsEnvEntry("TEMP", os.TempDir()))
+	env = append(env, windowsEnvEntry("TMP", os.TempDir()))
+	if profile := strings.TrimSpace(os.Getenv("USERPROFILE")); profile != "" {
+		env = append(env, "USERPROFILE="+profile)
+	} else if home != "" {
+		env = append(env, "USERPROFILE="+home)
+	}
 	return env
+}
+
+// windowsEnvEntry 组 key=value：值取 agent 进程 env（trim 后非空），否则兜底。
+func windowsEnvEntry(key, fallback string) string {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		return key + "=" + v
+	}
+	return key + "=" + fallback
 }
 
 func agentPeerHomeValue() string {
