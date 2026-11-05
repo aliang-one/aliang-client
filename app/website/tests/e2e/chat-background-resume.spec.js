@@ -265,3 +265,26 @@ test('恢复会话尾巴补全：delta 只有增量片段，终态回取快照�
   await expect(page.getByText('30 31')).toBeVisible();
   await expect(page.getByTestId('chat-stop-button')).toHaveCount(0);
 });
+
+test('approval_not_found：过期点击不污染气泡,清残留卡+系统条提示', async ({ page }) => {
+  // 2026-11-05 用户报「想自动放行 approval 结果 404」：审批过期/已处理后
+  // 残留卡上的点击回发,后端回 ai.status approval_not_found——旧实现把它
+  // 原样写进空气泡(英文 not found ≈ 用户口中的 404)。新行为=系统条说明
+  // + 残留 pending 卡清理,气泡内容不动。
+  await seedAndOpen(page, { bubbleContent: '', bubbleStatus: 'running' });
+  // 伪造一张在挂审批卡(真实时序:取消帧丢失/审批已过期但卡仍挂屏)
+  await pushFrame(page, {
+    type: 'ai.approval.request', session_id: 'local-seedconv1',
+    approval_id: 'ap-stale', kind: 'tool', provider: 'agentcore',
+    title: 'Bash', command: 'ls', available_decisions: ['accept', 'decline'],
+  });
+  await expect(page.getByTestId('chat-approval-card')).toBeVisible({ timeout: 10000 });
+
+  await pushFrame(page, { type: 'ai.status', session_id: 'local-seedconv1', status: 'approval_not_found' });
+
+  // 残留卡清理 + 系统条出现 + 气泡不被污染
+  await expect(page.getByTestId('chat-approval-card')).toHaveCount(0);
+  await expect(page.getByTestId('chat-approval-not-found-note')).toBeVisible();
+  await expect(page.getByText(/approval_not_found/)).toHaveCount(0);
+  await expect(page.getByTestId('chat-stop-button')).toBeVisible(); // 运行态不受影响
+});

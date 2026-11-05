@@ -1,5 +1,5 @@
 <template>
-  <div class="mb-3 max-w-[85%] rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-950 shadow-sm dark:border-amber-700/60 dark:bg-amber-950/40 dark:text-amber-100">
+  <div data-testid="chat-approval-card" class="mb-3 max-w-[85%] rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-950 shadow-sm dark:border-amber-700/60 dark:bg-amber-950/40 dark:text-amber-100">
     <div class="flex flex-wrap items-center gap-2">
       <!-- 盾形徽章：warning 色调圆底，内嵌 shield 图标 -->
       <span class="flex size-8 shrink-0 items-center justify-center rounded-full bg-amber-100 text-amber-600 dark:bg-amber-900/40 dark:text-amber-300">

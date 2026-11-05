@@ -2051,6 +2051,33 @@ export function useAliangChat() {
         break;
       }
       case 'ai.status': {
+        // approval_not_found(2026-11-05 用户报「404」):审批已过期/已被处理/
+        // waiter 已被取消后,残留卡上的点击回发拿不到 waiter——后端回此状态。
+        // 它是协议状态不是回答正文:不得写进气泡(旧实现空气泡时会把英文
+        // "approval_not_found" 原样写成回答)。处理=清该会话残留 pending 卡
+        // (取消帧丢失的陈旧卡)+ 系统条说明,引导重发触发新审批。
+        if (e.status === 'approval_not_found') {
+          const stale = Array.isArray(conv.approvals)
+            ? conv.approvals.filter(a => a.status === 'pending' || a.status === 'responding')
+            : [];
+          for (const a of stale) {
+            handledApprovalIds.add(a.key);
+          }
+          if (stale.length) {
+            conv.approvals = conv.approvals.filter(a => a.status !== 'pending' && a.status !== 'responding');
+          }
+          conv.messages.push({
+            role: 'assistant',
+            kind: 'system',
+            note: 'approval_not_found',
+            content: t('chat_approvalNotFound'),
+            status: 'done',
+            ts: now(),
+          });
+          scrollToBottom();
+          persist = true;
+          break;
+        }
         const asst = findRunningAssistant(conv);
         if (asst && !asst.content && e.status) asst.content = e.status;
         persist = true;

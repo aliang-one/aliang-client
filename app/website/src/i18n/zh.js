@@ -226,6 +226,7 @@ export default {
   chat_statusDone: '已完成',
   chat_aiThinking: '正在思考…',
   chat_thinkingRunning: '思考中…',
+  chat_approvalNotFound: '该审批已过期或已被处理，请重新发送消息触发新的审批；如需本会话内自动放行，请在审批卡仍在时选择「会话内放行」。',
   chat_thinkingDone: '思考过程',
   chat_aiError: 'AI 回复出错，请重试。',
   chat_approvalTitle: '需要授权',

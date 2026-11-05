@@ -141,6 +141,7 @@ const { t } = useI18n();
 function systemNoteTestId(note) {
   if (note === 'run_notice') return 'chat-run-notice';
   if (note === 'option_cancelled') return 'chat-option-cancelled-note';
+  if (note === 'approval_not_found') return 'chat-approval-not-found-note';
   return 'chat-approval-cancelled-note';
 }
 

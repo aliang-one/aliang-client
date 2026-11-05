@@ -226,6 +226,7 @@ export default {
   chat_statusDone: 'Done',
   chat_aiThinking: 'Thinking…',
   chat_thinkingRunning: 'Thinking…',
+  chat_approvalNotFound: 'This approval has expired or was already handled. Send a new message to trigger a fresh approval; to auto-approve for this session, pick "Allow for session" while the approval card is still live.',
   chat_thinkingDone: 'Thought process',
   chat_aiError: 'AI response failed, please retry.',
   chat_approvalTitle: 'Approval required',
