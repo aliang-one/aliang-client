@@ -86,6 +86,42 @@ func TestReadAliangMCPRegistryIntoToleratesMissingAndBroken(t *testing.T) {
 	}
 }
 
+func TestReadAliangMCPRegistryIntoGuardClauses(t *testing.T) {
+	// 双护栏:home 空串 / dst nil 各返回 0 且不 panic
+	if got := readAliangMCPRegistryInto("", map[string]interface{}{}); got != 0 {
+		t.Fatalf("home 空串护栏失效, got %d", got)
+	}
+	if got := readAliangMCPRegistryInto(t.TempDir(), nil); got != 0 {
+		t.Fatalf("dst nil 护栏失效, got %d", got)
+	}
+}
+
+func TestReadAliangMCPRegistryIntoSkipsReservedAndMalformed(t *testing.T) {
+	home := t.TempDir()
+	writeRegistryFile(t, home, `{
+	  "version": 1,
+	  "servers": {
+	    "aliang-peer":      {"type":"stdio","command":"shadow"},
+	    "aliang-mcp-ghost": {"type":"stdio","command":"shadow2"},
+	    "junk":             "text",
+	    "strfalse":         {"type":"stdio","command":"x","enabled":"false"},
+	    "good":             {"type":"stdio","command":"y"}
+	  }
+	}`)
+	dst := map[string]interface{}{}
+	if got := readAliangMCPRegistryInto(home, dst); got != 1 {
+		t.Fatalf("merged count = %d, want 1 (仅 good)", got)
+	}
+	for _, name := range []string{"aliang-peer", "aliang-mcp-ghost", "junk", "strfalse"} {
+		if _, ok := dst[name]; ok {
+			t.Fatalf("条目 %s 不得并入", name)
+		}
+	}
+	if m, ok := dst["good"].(map[string]interface{}); !ok || m["command"] != "y" {
+		t.Fatalf("good 条目形态不对: %#v", dst["good"])
+	}
+}
+
 func TestAliangMCPRegistryPathUnderHome(t *testing.T) {
 	p := aliangMCPRegistryPath("/h")
 	if !strings.HasSuffix(filepath.ToSlash(p), "/h/.aliang/mcp.json") {

@@ -42,7 +42,8 @@ const (
 	aliangMCPRegistryVersion = 1
 )
 
-var aliangMCPServerNameRe = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,64}$`)
+// aliangMCPServerNameRe 单一真值源:段宽引用 aliangMCPServerNameMax,勿再写字面量。
+var aliangMCPServerNameRe = regexp.MustCompile(fmt.Sprintf("^[a-zA-Z0-9_-]{1,%d}$", aliangMCPServerNameMax))
 
 // aliangMCPServerEntry 一条注册表条目(写通道强类型形态)。
 type aliangMCPServerEntry struct {
@@ -83,7 +84,7 @@ func loadAliangMCPRegistryRoot(home string) (root map[string]interface{}, existe
 
 // aliangMCPEntryUsable 读通道形态判定:type 归一(stdio 缺省),stdio 需非空
 // command,http/sse 需非空 url;其余形态 fail-closed 跳过。返回归一 type。
-func aliangMCPEntryUsable(name string, raw map[string]interface{}) (string, bool) {
+func aliangMCPEntryUsable(_ string, raw map[string]interface{}) (string, bool) {
 	typ := "stdio"
 	if v, ok := raw["type"].(string); ok && strings.TrimSpace(v) != "" {
 		typ = strings.ToLower(strings.TrimSpace(v))
@@ -102,8 +103,10 @@ func aliangMCPEntryUsable(name string, raw map[string]interface{}) (string, bool
 }
 
 // readAliangMCPRegistryInto 把注册表启用条目并入 claude 形态 dst(同名键覆盖
-// 遗留源),返回并入条目数。语义:
-//   - enabled=false / 畸形 / 未知 transport 条目跳过(Warn);
+// 遗留源),返回并入条目数。跳过语义(fail-closed):
+//   - 名称触碰平台保留前缀 aliang- / enabled 非 bool / 形态不合法(缺
+//     command/url、未知 transport)→ Warn 后跳过;
+//   - enabled=false(布尔)与 server 值非 map 的条目 → 静默跳过;
 //   - 并入时剥掉注册表专属 enabled 键(claude 形态无此字段,语义已由跳过表达);
 //   - version 非 1 仅 Warn(前向兼容:不拒读、不迁移、不改写);
 //   - 文件缺失/坏文件零并入(容忍不降级,对齐 readMCPServersFile 姿态)。
@@ -134,15 +137,22 @@ func readAliangMCPRegistryInto(home string, dst map[string]interface{}) int {
 	sort.Strings(names)
 	count := 0
 	for _, name := range names {
+		if strings.HasPrefix(name, aliangMCPReservedPrefix) {
+			logger.Warn(fmt.Sprintf("aliang-mcp: 条目 %s 触碰平台保留前缀 %s,读侧跳过(防遮蔽托管条目)", name, aliangMCPReservedPrefix))
+			continue
+		}
 		raw, ok := servers[name].(map[string]interface{})
 		if !ok {
 			continue
 		}
 		enabled := true
 		if ev, has := raw["enabled"]; has {
-			if b, ok := ev.(bool); ok {
-				enabled = b
+			b, ok := ev.(bool)
+			if !ok {
+				logger.Warn(fmt.Sprintf("aliang-mcp: 条目 %s 的 enabled 非布尔,fail-closed 跳过", name))
+				continue
 			}
+			enabled = b
 		}
 		if !enabled {
 			continue
