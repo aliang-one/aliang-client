@@ -640,8 +640,10 @@ export function useAliangChat() {
     // pendingConfig（「下轮生效」角标）同为瞬态：重载后「是否已开新回合」
     // 无从判定，跨页保留只会展示陈旧角标——与 approvals/steerItems 同剥。
     delete copy.pendingConfig;
-    // snapshotCatchupAt（快照对账去重窗口起点）同为瞬态：跨页无意义。
+    // snapshotCatchupAt（快照对账去重窗口起点）与 recoveredRun（恢复会话
+    // 待终态回取快照标记）同为瞬态：跨页无意义，重进页 resubscribe 重建。
     delete copy.snapshotCatchupAt;
+    delete copy.recoveredRun;
     // deviceTranscript 不落盘（评审折叠项）：重开设备会话有 5 分钟 TTL+详情
     // 分页重拉兜底，防大转录长期占 localStorage。
     delete copy.deviceTranscript;
@@ -968,13 +970,15 @@ export function useAliangChat() {
     }
 
     if (asst) {
+      const canAlign = !!runText && runText.startsWith(asst.content)
+        && runText.length > asst.content.length;
       if (e.status === 'running') {
         // 流继续：锚定成立的 runText 前缀对齐（空气泡回填/部分内容延伸）；
         // 未锚定（runText 空）绝不种内容。看门狗恢复：onclose 的无条件
         // disarm 清了计时器，快照证实 run 活着 → 重新武装（此后每帧喂狗）。
         // 只在「本地是活跃会话或当前无看门狗」时武装——单槽看门狗不能被
         // 后台对账从活跃会话手里抢走。
-        if (runText && runText.startsWith(asst.content)) {
+        if (canAlign) {
           asst.content = runText;
           local.snapshotCatchupAt = now(); // 扇出副本去重窗口起点（见 ai.delta）
         }
@@ -983,10 +987,12 @@ export function useAliangChat() {
         }
       } else if (!inFlight) {
         // run 已收敛（快照态不区分 done/error，按完成呈现）：锚定的 runText
-        // 优先对齐（前缀延伸/空气泡回填）；sending/看门狗/审批同步收尾——
-        // 不落 finishRun 会把输入框永久锁死在 sendDisabled。审批清卡镜像
-        // ai.done：run 已结束，快照 pending_approvals 为空即权威「无在挂」。
-        if (runText && runText.startsWith(asst.content)) asst.content = runText;
+        // 比本地长则对齐补全（journal turn 行在回合结束才落盘——刷新恢复的
+        // 会话此前的 delta 只覆盖刷新点之后的尾巴，头部就在这次快照里补齐）；
+        // sending/看门狗/审批同步收尾——不落 finishRun 会把输入框永久锁死在
+        // sendDisabled。审批清卡镜像 ai.done：run 已结束，快照
+        // pending_approvals 为空即权威「无在挂」。
+        if (canAlign) asst.content = runText;
         asst.status = 'done';
         clearApprovalsForSession(local, sessionId);
         if (local.id === activeId.value) disarmIdleWatchdog();
@@ -1007,6 +1013,7 @@ export function useAliangChat() {
           status: 'running',
           ts: now(),
         });
+        local.recoveredRun = true; // 后续 delta 只是增量,终态后需回取全文
         if ((local.id === activeId.value || !idleWatchdogTimer) && !inFlight) {
           armIdleWatchdog(local);
         }
@@ -1019,6 +1026,23 @@ export function useAliangChat() {
           ts: now(),
         });
         clearApprovalsForSession(local, sessionId);
+        finishRun(local);
+        if (activeId.value === local.id) scrollToBottom();
+      }
+    } else if (!inFlight && turnIsOurs && hasAssistantAfter && local.recoveredRun) {
+      // 恢复会话的尾巴补全（2026-11-05「只看到 59 60」形态）：恢复后的
+      // delta 只覆盖刷新点之后的增量，done 气泡内容是尾巴碎片；终态回取的
+      // 快照此刻带 journal 全文，直接以全文替换（journal 是该回合的权威
+      // 文本；截断限幅内的更长文本才替换，防退化）。
+      let target = null;
+      for (let i = local.messages.length - 1; i >= 0; i--) {
+        const m = local.messages[i];
+        if (m.role === 'assistant') { target = m; break; }
+      }
+      if (target && target.status === 'done' && runText
+        && runText.length > target.content.length) {
+        target.content = runText;
+        local.recoveredRun = false;
         finishRun(local);
         if (activeId.value === local.id) scrollToBottom();
       }
@@ -2135,6 +2159,15 @@ export function useAliangChat() {
         if (asst) asst.status = 'done';
         clearApprovalsForSession(conv, e.session_id);
         finishRun(conv);
+        // 恢复会话终态回取（2026-11-05「只看到 59 60」形态）：journal turn
+        // 行在回合结束才落盘——恢复会话收到的 delta 只覆盖刷新点之后的增量，
+        // 头部此刻才第一次可得。再取一次快照，reconcileLocalSnapshot 用
+        // journal 全文对齐补齐。（仅本地会话；设备壳走清单/详情通道。）
+        if (!conv.deviceSession && conv.recoveredRun && conv.aiSessionId) {
+          // 刻意不清 recoveredRun：终态快照回来时尾巴补全分支还靠它放行，
+          // 补全成功处在 reconcile（runText 全文替换）里落旗。
+          sendAI({ type: 'ai.session.subscribe', session_id: conv.aiSessionId });
+        }
         return;
       }
       case 'ai.error': {
@@ -2249,6 +2282,7 @@ export function useAliangChat() {
       // create 已被服务端接受：记下本次模型/档位，供新建会话沿用（last-used）。
       rememberLastUsedModel(conv.model);
       rememberLastUsedEffort(conv.effort);
+      conv.recoveredRun = false; // 新回合自本端发起:delta 全量可达,无需终态回取
       armIdleWatchdog(conv);
       const ok = sendAI({
         type: 'ai.message',
@@ -2295,6 +2329,7 @@ export function useAliangChat() {
       return; // socket 不可用：下次进页再对账，恢复态不动
     }
     for (const c of targets) {
+      c.recoveredRun = true; // 终态后回取快照补全 journal 头部（见 ai.done）
       sendAI({ type: 'ai.session.subscribe', session_id: c.aiSessionId });
     }
   }

@@ -236,3 +236,32 @@ test('ai.thinking 随流渲染:思考块可见,回答 delta 照常,终态收起'
   await pushFrame(page, { type: 'ai.done', session_id: 'local-seedconv1' });
   await expect(page.getByTestId('chat-stop-button')).toHaveCount(0);
 });
+
+test('恢复会话尾巴补全：delta 只有增量片段，终态回取快照补齐 journal 全文', async ({ page }) => {
+  // 2026-11-05 真机形态「只看到 59 60」：journal turn 行在回合结束才落盘，
+  // 刷新恢复收到的 delta 只覆盖刷新点之后的增量；ai.done 后对恢复会话再取
+  // 一次快照，journal 全文对齐补齐头部。
+  await seedAndOpen(
+    page,
+    { bubbleContent: '59 60', bubbleStatus: 'running' },
+    undefined,
+  );
+  await expect(page.getByTestId('chat-stop-button')).toBeVisible();
+
+  // ai.done 前挂好终态快照（stub 在 subscribe 时读 __snapshot）：此刻
+  // journal 已落 turn 全文（真实时序：写侧先落行、后发终态帧）。
+  await page.evaluate(() => {
+    window.__snapshot = {
+      status: 'idle',
+      transcript: [
+        { role: 'user', text: '请从1数到60', message_id: 'm-user-1' },
+        { role: 'assistant', text: '1\n2\n3\n30\n31\n59\n60', message_id: '' },
+      ],
+    };
+  });
+  await pushFrame(page, { type: 'ai.done', session_id: 'local-seedconv1' });
+
+  // 终态回取的快照把头部补齐（1 2 3 30 31 都该在）
+  await expect(page.getByText('30 31')).toBeVisible();
+  await expect(page.getByTestId('chat-stop-button')).toHaveCount(0);
+});
