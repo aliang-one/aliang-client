@@ -78,3 +78,26 @@ func TestRegisterAgentRoutesIncludesAIStream(t *testing.T) {
 		t.Fatalf("/api/agent/ai/stream status = 404：registerAgentRoutes 漏注册")
 	}
 }
+
+// TestRegisterAgentRoutesIncludesAuthRecover 钉死 auth_expired 自愈链端点：
+// core 在每次 token 刷新成功后经 requestLocalUserAgentRecoverAfterAuthExpired
+// 直连 POST 本端点（agent_service.go），仪表盘侧则经 HandleAuthRecover 的
+// proxyIfNeeded 转发过来。缺注册时两路都 404，auth_expired 终态在 core+user
+// agent 双进程拓扑下永不自愈（2026-10-29 修复，双注册教训同族）。RecoverIfAuthExpired
+// 自门控（非 auth_expired 态为纯读 no-op），走到 handler 即成功，绝不应当是
+// mux 裸 404。
+func TestRegisterAgentRoutesIncludesAuthRecover(t *testing.T) {
+	t.Setenv("ALIANG_USER_AGENT_RUNTIME", "1")
+	t.Setenv("HOME", t.TempDir())
+
+	mux := http.NewServeMux()
+	registerAgentRoutes(mux)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/agent/auth-recover", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code == http.StatusNotFound {
+		t.Fatalf("/api/agent/auth-recover status = 404：registerAgentRoutes 漏注册，auth_expired 自愈链断")
+	}
+}
