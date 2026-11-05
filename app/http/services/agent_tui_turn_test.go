@@ -823,7 +823,7 @@ func TestReadTranscriptFromHalfLine(t *testing.T) {
 // activity 创建后从不 bump，idle 看门狗只看到 run 起点，10 分钟就把合法的长
 // 回合当卡死杀掉。
 func TestFeedTUITurnActivity(t *testing.T) {
-	stale := time.Now().Add(-time.Hour).UnixNano()
+	stale := time.Now().Add(-time.Hour)
 	fresh := func() *agentAIActivity {
 		a := newAgentAIActivity()
 		a.lastActivityAt.Store(stale)

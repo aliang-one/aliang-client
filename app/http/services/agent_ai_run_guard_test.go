@@ -229,8 +229,8 @@ func TestStaleScannerKillsNonWaitingRunEvenWithHeartbeat(t *testing.T) {
 
 	// lastActivityAt 回拨 10min，相对 5min 阈值有 2 倍余量。
 	// 只让「进度心跳」在流：心跳不经 activity，lastActivityAt 仍是旧的。
-	guard.activity.lastActivityAt.Store(time.Now().Add(-10 * time.Minute).UnixNano())
-	guard.activity.lastProgressAt.Store(time.Now().Add(-10 * time.Minute).UnixNano())
+	guard.activity.lastActivityAt.Store(time.Now().Add(-10 * time.Minute))
+	guard.activity.lastProgressAt.Store(time.Now().Add(-10 * time.Minute))
 
 	m.scanStaleRuns()
 
@@ -257,7 +257,7 @@ func TestStaleScannerSparesHealthyToolWait(t *testing.T) {
 	// lastActivityAt 回拨 30min，相对 5min 阈值有 6 倍余量。
 	m, _, guard, rec := newGuardTestManager(t)
 	guard.activity.beginToolUseWait()
-	guard.activity.lastActivityAt.Store(time.Now().Add(-30 * time.Minute).UnixNano())
+	guard.activity.lastActivityAt.Store(time.Now().Add(-30 * time.Minute))
 
 	m.scanStaleRuns()
 
@@ -276,7 +276,7 @@ func TestStaleScannerSparesHealthyToolWait(t *testing.T) {
 func TestStaleDeathReasonApprovalOverflow(t *testing.T) {
 	a := newAgentAIActivity()
 	a.setAwaitingApproval(true)
-	a.approvalWaitStartedAt.Store(time.Now().Add(-25 * time.Hour).UnixNano())
+	a.approvalWaitStartedAt.Store(time.Now().Add(-25 * time.Hour))
 
 	reason, dead := a.staleDeathReason(5*time.Minute, 24*time.Hour, time.Hour, 6*time.Hour)
 	if !dead || reason != "approval_timeout" {
@@ -286,11 +286,11 @@ func TestStaleDeathReasonApprovalOverflow(t *testing.T) {
 	// 3h 审批（> 2h 硬顶）既不该被 stale 判死，也不该被审批天花板判死。
 	b := newAgentAIActivity()
 	b.setAwaitingApproval(true)
-	b.approvalWaitStartedAt.Store(time.Now().Add(-3 * time.Hour).UnixNano())
+	b.approvalWaitStartedAt.Store(time.Now().Add(-3 * time.Hour))
 	// setAwaitingApproval 会 bump()，idleFor 因此归零；必须把 lastActivityAt
 	// 回拨，否则即使 staleDeathReason 里的 awaiting 分支被整段删掉，本用例也会
 	// 因为「刚 bump 过、还没到 stale 阈值」而假绿。
-	b.lastActivityAt.Store(time.Now().Add(-time.Hour).UnixNano())
+	b.lastActivityAt.Store(time.Now().Add(-time.Hour))
 	if reason, dead := b.staleDeathReason(5*time.Minute, 24*time.Hour, time.Hour, 6*time.Hour); dead {
 		t.Fatalf("3h approval was judged dead (reason=%q)", reason)
 	}

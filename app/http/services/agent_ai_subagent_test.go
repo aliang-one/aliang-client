@@ -233,12 +233,12 @@ func TestSubagentProgressResetsToolWaitClock(t *testing.T) {
 	activity := newAgentAIActivity()
 	activity.beginToolUseWait()
 	// 把连续等待钟拨回 2h 前,再喂一次子 agent 进度。
-	activity.toolWaitStartedAt.Store(time.Now().Add(-2 * time.Hour).UnixNano())
+	activity.toolWaitStartedAt.Store(time.Now().Add(-2 * time.Hour))
 	activity.subagentProgress()
 	if got := activity.toolWaitFor(); got > time.Minute {
 		t.Fatalf("toolWaitFor = %v after progress, want reset (small)", got)
 	}
-	if activity.lastProgressAt.Load() == 0 {
+	if _, ok := loadTS(&activity.lastProgressAt); !ok {
 		t.Fatal("progress must count as meaningful progress")
 	}
 }

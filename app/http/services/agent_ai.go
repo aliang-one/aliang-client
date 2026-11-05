@@ -1288,41 +1288,46 @@ func (m *agentAIManager) approvalService() *AgentService {
 // silent for longer than agentAIIdleWindow without one of those waits in flight;
 // agentAIHardCeiling is a runaway backstop. nil-safe so call sites need no guards.
 type agentAIActivity struct {
-	lastActivityAt atomic.Int64
+	// 五个时钟一律存 time.Time（time.Now() 自带单调读数）：读侧 time.Since
+	// 优先走单调读数，而 macOS 的单调钟不含系统睡眠时间——Mac 睡醒后守卫不再
+	// 把睡眠时长计入 idle/progressIdle/审批等待（2026-10-31 两连死事故：
+	// 墙钟 progressIdleFor=2h9m vs 单调 runFor=18m 误杀）。atomic.Value 只存
+	// time.Time 一种具体类型；「未臂起」哨兵 = 零值 time.Time（loadTS 返回 !ok）。
+	lastActivityAt atomic.Value // time.Time（带单调读数）
 	// lastProgressAt tracks MEANINGFUL progress (assistant text/thinking via
 	// emitAIDelta, file changes via fileSink, a completed Codex work item) —
 	// NOT raw output. A degenerate model loop (e.g. filler `echo` tool calls
 	// every few seconds for hours) keeps lastActivityAt fresh, so only the
 	// progress clock can distinguish "alive" from "getting anywhere".
-	lastProgressAt atomic.Int64
+	lastProgressAt atomic.Value // time.Time（带单调读数）
 	// pendingApprovals 是并发的审批请求数（0=无人在等）。用计数而不是 bool，
 	// 是因为一个回合可能有多个审批重叠：A、B 同时在等时 A 先结束，B 仍需要
 	// 保住审批钟与 idlePaused——bool 会被 A 的 false 提前清掉，随后
 	// pendingToolUses>0 又把工具钟臂起，合法的人工等待会被工具天花板误杀。
 	pendingApprovals atomic.Int64
 	pendingToolUses  atomic.Int64
-	// approvalWaitStartedAt 是当前这段「等人工决策」的开始时刻（0=不在等）。
+	// approvalWaitStartedAt 是当前这段「等人工决策」的开始时刻（零值=不在等）。
 	// 计数版下它不保证与 toolWaitStartedAt 互斥：第一个审批开启时清工具钟，
 	// 但期间若工具重新臂起（或第二个重叠审批不清工具钟），两钟可同时非零；
 	// 这不误判，因为 staleDeathReason 的 awaiting 分支优先于工具钟分支。
 	// 审批等待由 agentAIApprovalTimeout 单独约束，stale 扫描器也要能读到它。
-	approvalWaitStartedAt atomic.Int64
-	// toolWaitStartedAt is the UnixNano instant the current CONTIGUOUS
-	// tool/subagent wait began (0 = not waiting). The tool-wait watchdog uses
+	approvalWaitStartedAt atomic.Value // time.Time
+	// toolWaitStartedAt is the instant the current CONTIGUOUS tool/subagent
+	// wait began (zero time = not waiting). The tool-wait watchdog uses
 	// it to bound hung tools/subagents that would otherwise pin the run
 	// indefinitely (the hard ceiling no longer counts wait ticks) while the
 	// progress heartbeat keeps telling the server the run is alive. Cleared
 	// while a human approval is pending so approval time never counts against
 	// the ceiling (approvals are bounded separately by
 	// agentAIApprovalTimeout).
-	toolWaitStartedAt atomic.Int64
+	toolWaitStartedAt atomic.Value // time.Time
 	// activeSubagents counts in-flight subagent records (task_started …
 	// terminal frame / teardown). While >0 the idle and no-progress guards are
 	// paused (idlePaused) and agentAISubagentWaitCeiling bounds the contiguous
 	// stretch instead — subagent work is legitimately silent on the parent's
 	// stdout (sync mode: no frames between launch and completion).
 	activeSubagents       atomic.Int64
-	subagentWaitStartedAt atomic.Int64
+	subagentWaitStartedAt atomic.Value // time.Time
 	runStart              time.Time
 	killReasonMu          sync.RWMutex
 	killReason            string
@@ -1330,16 +1335,30 @@ type agentAIActivity struct {
 
 func newAgentAIActivity() *agentAIActivity {
 	a := &agentAIActivity{runStart: time.Now()}
-	a.lastActivityAt.Store(a.runStart.UnixNano())
-	a.lastProgressAt.Store(a.runStart.UnixNano())
+	// 保持旧语义：构造即以 runStart 预填充两钟（idle 窗口从 run 构建起算，
+	// 而非首次 bump），勿改成零值懒填充——那是行为变更，现有容差测试抓不住。
+	a.lastActivityAt.Store(a.runStart)
+	a.lastProgressAt.Store(a.runStart)
 	return a
+}
+
+// storeTS 以 time.Now()（自带单调读数）写入任一活动时钟。
+func (a *agentAIActivity) storeTS(field *atomic.Value) { field.Store(time.Now()) }
+
+// clearTS 清零一个等待时钟（零值 time.Time = 未臂起，loadTS 据此返回 !ok）。
+func (a *agentAIActivity) clearTS(field *atomic.Value) { field.Store(time.Time{}) }
+
+// loadTS 读回时钟；false = 从未臂起或已被 clearTS。
+func loadTS(field *atomic.Value) (time.Time, bool) {
+	t, ok := field.Load().(time.Time)
+	return t, ok && !t.IsZero()
 }
 
 func (a *agentAIActivity) bump() {
 	if a == nil {
 		return
 	}
-	a.lastActivityAt.Store(time.Now().UnixNano())
+	a.storeTS(&a.lastActivityAt)
 }
 
 // markProgress records meaningful progress and counts as activity. Callers:
@@ -1352,7 +1371,7 @@ func (a *agentAIActivity) markProgress() {
 	if a == nil {
 		return
 	}
-	now := time.Now().UnixNano()
+	now := time.Now()
 	a.lastActivityAt.Store(now)
 	a.lastProgressAt.Store(now)
 }
@@ -1364,11 +1383,11 @@ func (a *agentAIActivity) progressIdleFor() time.Duration {
 	if a == nil {
 		return 0
 	}
-	last := a.lastProgressAt.Load()
-	if last == 0 {
+	last, ok := loadTS(&a.lastProgressAt)
+	if !ok {
 		return 0
 	}
-	return time.Since(time.Unix(0, last))
+	return time.Since(last)
 }
 
 // setAwaitingApproval 登记/解除一个审批等待，并 bump 活动时间，让审批结束时
@@ -1385,8 +1404,8 @@ func (a *agentAIActivity) setAwaitingApproval(v bool) {
 		if a.pendingApprovals.Add(1) == 1 {
 			// Approval time is human time, not tool time: pause the tool-wait
 			// clock so a slow decision never trips the tool-wait ceiling.
-			a.approvalWaitStartedAt.Store(time.Now().UnixNano())
-			a.toolWaitStartedAt.Store(0)
+			a.storeTS(&a.approvalWaitStartedAt)
+			a.clearTS(&a.toolWaitStartedAt)
 		}
 	} else {
 		// CAS 递减且不允许减到负数：多余的 false（重复解除）在 0 处直接 break。
@@ -1401,12 +1420,12 @@ func (a *agentAIActivity) setAwaitingApproval(v bool) {
 			}
 			if a.pendingApprovals.CompareAndSwap(current, current-1) {
 				if current-1 == 0 {
-					a.approvalWaitStartedAt.Store(0)
+					a.clearTS(&a.approvalWaitStartedAt)
 					if a.pendingToolUses.Load() > 0 {
 						// Decision resolved but the tool is still in flight:
 						// re-arm with a fresh ceiling window for the remaining
 						// execution.
-						a.toolWaitStartedAt.Store(time.Now().UnixNano())
+						a.storeTS(&a.toolWaitStartedAt)
 					}
 				}
 				break
@@ -1421,11 +1440,11 @@ func (a *agentAIActivity) approvalWaitFor() time.Duration {
 	if a == nil {
 		return 0
 	}
-	ts := a.approvalWaitStartedAt.Load()
-	if ts == 0 {
+	started, ok := loadTS(&a.approvalWaitStartedAt)
+	if !ok {
 		return 0
 	}
-	return time.Since(time.Unix(0, ts))
+	return time.Since(started)
 }
 
 func (a *agentAIActivity) awaiting() bool {
@@ -1441,11 +1460,11 @@ func (a *agentAIActivity) toolWaitFor() time.Duration {
 	if a == nil {
 		return 0
 	}
-	ts := a.toolWaitStartedAt.Load()
-	if ts == 0 {
+	started, ok := loadTS(&a.toolWaitStartedAt)
+	if !ok {
 		return 0
 	}
-	return time.Since(time.Unix(0, ts))
+	return time.Since(started)
 }
 
 // beginToolUseWait marks that Claude has emitted a tool_use (Task/subagent,
@@ -1457,7 +1476,7 @@ func (a *agentAIActivity) beginToolUseWait() {
 		return
 	}
 	if a.pendingToolUses.Add(1) == 1 {
-		a.toolWaitStartedAt.Store(time.Now().UnixNano())
+		a.storeTS(&a.toolWaitStartedAt)
 	}
 	a.bump()
 }
@@ -1473,7 +1492,7 @@ func (a *agentAIActivity) endToolUseWait() {
 		}
 		if a.pendingToolUses.CompareAndSwap(current, current-1) {
 			if current-1 == 0 {
-				a.toolWaitStartedAt.Store(0)
+				a.clearTS(&a.toolWaitStartedAt)
 			}
 			break
 		}
@@ -1532,7 +1551,7 @@ func (a *agentAIActivity) beginSubagent() {
 		return
 	}
 	if a.activeSubagents.Add(1) == 1 {
-		a.subagentWaitStartedAt.Store(time.Now().UnixNano())
+		a.storeTS(&a.subagentWaitStartedAt)
 	}
 	a.bump()
 }
@@ -1550,7 +1569,7 @@ func (a *agentAIActivity) endSubagent() {
 		}
 		if a.activeSubagents.CompareAndSwap(current, current-1) {
 			if current-1 == 0 {
-				a.subagentWaitStartedAt.Store(0)
+				a.clearTS(&a.subagentWaitStartedAt)
 			}
 			break
 		}
@@ -1563,11 +1582,11 @@ func (a *agentAIActivity) subagentWaitFor() time.Duration {
 	if a == nil {
 		return 0
 	}
-	ts := a.subagentWaitStartedAt.Load()
-	if ts == 0 {
+	started, ok := loadTS(&a.subagentWaitStartedAt)
+	if !ok {
 		return 0
 	}
-	return time.Since(time.Unix(0, ts))
+	return time.Since(started)
 }
 
 // subagentProgress feeds every watchdog clock from a task_progress frame: raw
@@ -1581,7 +1600,7 @@ func (a *agentAIActivity) subagentProgress() {
 	if a == nil {
 		return
 	}
-	now := time.Now().UnixNano()
+	now := time.Now()
 	a.lastActivityAt.Store(now)
 	a.lastProgressAt.Store(now)
 	if a.pendingToolUses.Load() > 0 {
@@ -1593,11 +1612,11 @@ func (a *agentAIActivity) idleFor() time.Duration {
 	if a == nil {
 		return 0
 	}
-	last := a.lastActivityAt.Load()
-	if last == 0 {
+	last, ok := loadTS(&a.lastActivityAt)
+	if !ok {
 		return 0
 	}
-	return time.Since(time.Unix(0, last))
+	return time.Since(last)
 }
 
 func (a *agentAIActivity) setKillReason(reason string) {

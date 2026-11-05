@@ -147,6 +147,32 @@ func TestAgentAIActivityProgressNilSafe(t *testing.T) {
 	}
 }
 
+// TestAgentAIActivityTimestampSemanticsUnchanged 锁定时钟字段的 time.Time 语义:
+// 字段直接存带单调读数的 time.Time,读侧 time.Since 优先走单调读数(macOS 单调
+// 钟不含睡眠——Mac 睡醒后守卫不再把睡眠时长计入 idle)。睡眠免疫是结构性保证,
+// 单测无法伪造「墙钟跳 2h 但单调只走 50ms」,这里锁定连续性:构造预填非零、
+// markProgress 归零、以 time.Time 回拨可测得完整时长。
+func TestAgentAIActivityTimestampSemanticsUnchanged(t *testing.T) {
+	a := newAgentAIActivity()
+	// 构造即以 runStart 预填充时钟(newAgentAIActivity),故新建 activity 的
+	// idle 是微小非零值——勿断言 ==0,容差写法对齐本文件 1s 惯例。
+	if d := a.progressIdleFor(); d > time.Second {
+		t.Fatalf("新建 activity 的 idle 应 ≈0(容差内), got %s", d)
+	}
+	if d := a.idleFor(); d > time.Second {
+		t.Fatalf("新建 activity 的 idleFor 应 ≈0(容差内), got %s", d)
+	}
+	a.markProgress()
+	if d := a.progressIdleFor(); d > time.Second {
+		t.Fatalf("刚写入的进度 idle 应 ≈0, got %s", d)
+	}
+	// 新 API 直接以 time.Time 伪造「过去的进度」:
+	a.lastProgressAt.Store(time.Now().Add(-30 * time.Minute))
+	if d := a.progressIdleFor(); d < 29*time.Minute {
+		t.Fatalf("30 分钟前的进度应测得 ≈30m idle, got %s", d)
+	}
+}
+
 func TestAgentAIActivityNilSafe(t *testing.T) {
 	var a *agentAIActivity
 	// None of these must panic on a nil receiver.

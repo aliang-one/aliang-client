@@ -39,7 +39,7 @@ const agentCorePureThinkingNDJSON = `{"type":"stream_event","event":{"type":"mes
 // 已经静默了很久」——此后的生死完全取决于 thinking 流能不能刷新活性。
 func backdateActivityStale(t *testing.T, a *agentAIActivity) {
 	t.Helper()
-	stale := time.Now().Add(-6 * time.Minute).UnixNano()
+	stale := time.Now().Add(-6 * time.Minute)
 	a.lastActivityAt.Store(stale)
 	a.lastProgressAt.Store(stale)
 }
@@ -189,14 +189,14 @@ func TestAgentCoreThinkingStreamStaysOutOfTranscript(t *testing.T) {
 	// 活性判据：thinking 流与 CLI 路径同一口径刷新 lastProgressAt。用纯推理
 	// 流单测——全量流里的 text_delta 也会刷进度，混在一起测不出 thinking。
 	pureRun := agentAIRun{sessionID: "sess-k", messageID: "m", runSeq: 1, activity: newAgentAIActivity()}
-	pureBefore := pureRun.activity.lastProgressAt.Load()
+	pureBefore, _ := loadTS(&pureRun.activity.lastProgressAt)
 	streamStructuredAIDelta(
 		bytes.NewReader([]byte(agentCorePureThinkingNDJSON)),
 		agentAIOutputClaudeStreamJSON,
 		pureRun, agentTerminalWriter(func(interface{}) error { return nil }),
 		nil, nil, nil, &claudeRetryInfo{}, nil,
 	)
-	if after := pureRun.activity.lastProgressAt.Load(); after == pureBefore {
+	if after, _ := loadTS(&pureRun.activity.lastProgressAt); after == pureBefore {
 		t.Fatal("pure thinking stream did not refresh lastProgressAt — pure reasoning would stall the run")
 	}
 

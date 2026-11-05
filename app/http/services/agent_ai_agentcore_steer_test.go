@@ -10,7 +10,7 @@ import (
 
 func TestCoreSteerDrainBumpsActivity(t *testing.T) {
 	activity := newAgentAIActivity()
-	activity.lastActivityAt.Store(time.Now().Add(-time.Hour).UnixNano())
+	activity.lastActivityAt.Store(time.Now().Add(-time.Hour))
 
 	rec := &recordingWriter{}
 	run := agentAIRun{sessionID: "sess-1", runSeq: 1, messageID: "msg-1", activity: activity}
@@ -32,7 +32,7 @@ func TestCoreSteerDrainBumpsActivity(t *testing.T) {
 // 若有人把 bump 挪进 deliver，卡死的回合就能被用户反复插话无限续命。
 func TestCoreSteerDeliverDoesNotBumpActivity(t *testing.T) {
 	activity := newAgentAIActivity()
-	stale := time.Now().Add(-time.Hour).UnixNano()
+	stale := time.Now().Add(-time.Hour)
 	activity.lastActivityAt.Store(stale)
 
 	rec := &recordingWriter{}
@@ -45,8 +45,8 @@ func TestCoreSteerDeliverDoesNotBumpActivity(t *testing.T) {
 	}
 	// 投递只证明 run 尚未 close，不证明内核循环在转。活性必须等到 drain
 	// （内核真的把消息取走）才刷新，否则僵尸可靠用户反复插话无限续命。
-	if got := activity.lastActivityAt.Load(); got != stale {
-		t.Fatalf("deliver 不应刷新 lastActivityAt（now-stale=%s）", time.Duration(got-stale))
+	if got, ok := loadTS(&activity.lastActivityAt); !ok || got != stale {
+		t.Fatalf("deliver 不应刷新 lastActivityAt（now-stale=%s）", time.Since(stale))
 	}
 }
 
