@@ -172,3 +172,150 @@ func readAliangMCPRegistryInto(home string, dst map[string]interface{}) int {
 	}
 	return count
 }
+
+// validateAliangMCPEntry 写通道校验(spec §5.2)。读通道容忍、写通道 fail-closed。
+func validateAliangMCPEntry(name string, e aliangMCPServerEntry) error {
+	if !aliangMCPServerNameRe.MatchString(name) {
+		return fmt.Errorf("server 名称须为 ^[a-zA-Z0-9_-]{1,64}$, got %q", name)
+	}
+	if strings.HasPrefix(name, aliangMCPReservedPrefix) {
+		return fmt.Errorf("server 名称不允许保留前缀 %q", aliangMCPReservedPrefix)
+	}
+	if len(name) > aliangMCPServerNameMax {
+		return fmt.Errorf("server 名称超长")
+	}
+	switch strings.ToLower(strings.TrimSpace(e.Type)) {
+	case "", "stdio":
+		if strings.TrimSpace(e.Command) == "" {
+			return fmt.Errorf("stdio 条目必须提供 command")
+		}
+	case "http", "sse":
+		if strings.TrimSpace(e.URL) == "" {
+			return fmt.Errorf("%s 条目必须提供 url", strings.ToLower(strings.TrimSpace(e.Type)))
+		}
+	default:
+		return fmt.Errorf("type 须为 stdio|http|sse, got %q", e.Type)
+	}
+	return nil
+}
+
+// aliangMCPEntryToMap 结构体→注册表 map 形态(仅非零字段;Enabled 仅显式非 nil
+// 时落盘)。数字字段不存在于本结构,无 UseNumber 需求。
+func aliangMCPEntryToMap(e aliangMCPServerEntry) map[string]interface{} {
+	out := map[string]interface{}{}
+	if strings.TrimSpace(e.Type) != "" {
+		out["type"] = e.Type
+	}
+	if e.Command != "" {
+		out["command"] = e.Command
+	}
+	if len(e.Args) > 0 {
+		out["args"] = e.Args
+	}
+	if len(e.Env) > 0 {
+		out["env"] = e.Env
+	}
+	if e.URL != "" {
+		out["url"] = e.URL
+	}
+	if len(e.Headers) > 0 {
+		out["headers"] = e.Headers
+	}
+	if e.Enabled != nil {
+		out["enabled"] = *e.Enabled
+	}
+	return out
+}
+
+// saveAliangMCPRegistryRoot 全量往返落盘:SetEscapeHTML(false)+缩进 2 +
+// tmp+rename 原子写 + 内容未变幂等跳写。目录不存在自动创建。
+func saveAliangMCPRegistryRoot(home string, root map[string]interface{}) error {
+	path := aliangMCPRegistryPath(home)
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(root); err != nil {
+		return fmt.Errorf("encode %s: %w", path, err)
+	}
+	if existing, err := os.ReadFile(path); err == nil && bytes.Equal(existing, buf.Bytes()) {
+		return nil // 幂等跳写
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", filepath.Dir(path), err)
+	}
+	return writePeerMCPFileAtomic(path, buf.Bytes())
+}
+
+// upsertAliangMCPServerForTest 校验→全量往返→原子写(home 注入,测试与
+// service 层共用本体)。version 键缺失时补 1,已有值(含更高版本)原样保留。
+func upsertAliangMCPServerForTest(home, name string, entry aliangMCPServerEntry) error {
+	if err := validateAliangMCPEntry(name, entry); err != nil {
+		return err
+	}
+	root, existed, err := loadAliangMCPRegistryRoot(home)
+	if err != nil {
+		return err // 坏文件不静默覆盖,让用户先修
+	}
+	if !existed {
+		root = map[string]interface{}{"version": json.Number("1"), "servers": map[string]interface{}{}}
+	}
+	if _, has := root["version"]; !has {
+		root["version"] = json.Number("1")
+	}
+	servers, _ := root["servers"].(map[string]interface{})
+	if servers == nil {
+		servers = map[string]interface{}{}
+		root["servers"] = servers
+	}
+	if _, existed := servers[name]; !existed {
+		// 只数现存键,与读通道的 enabled/畸形口径无关:写通道上限按条目数防呆
+		names := 0
+		for range servers {
+			names++
+		}
+		if names >= aliangMCPServerMaxCount {
+			return fmt.Errorf("注册表条目数已达上限 %d", aliangMCPServerMaxCount)
+		}
+	}
+	servers[name] = aliangMCPEntryToMap(entry)
+	return saveAliangMCPRegistryRoot(home, root)
+}
+
+// deleteAliangMCPServerForTest 删条目;返回是否存在。
+func deleteAliangMCPServerForTest(home, name string) (bool, error) {
+	root, existed, err := loadAliangMCPRegistryRoot(home)
+	if err != nil || !existed {
+		return false, err
+	}
+	servers, _ := root["servers"].(map[string]interface{})
+	if _, ok := servers[name]; !ok {
+		return false, nil
+	}
+	delete(servers, name)
+	return true, saveAliangMCPRegistryRoot(home, root)
+}
+
+// aliangMCPEnabledEntries 读通道强类型视图:启用且形态合法的条目
+// (codex 托管块同步的数据源)。畸形 Warn 跳过。
+func aliangMCPEnabledEntries(home string) map[string]aliangMCPServerEntry {
+	out := map[string]aliangMCPServerEntry{}
+	raw := map[string]interface{}{}
+	readAliangMCPRegistryInto(home, raw)
+	for name, v := range raw {
+		m, ok := v.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		b, err := json.Marshal(m)
+		if err != nil {
+			continue
+		}
+		var e aliangMCPServerEntry
+		if err := json.Unmarshal(b, &e); err != nil {
+			continue
+		}
+		out[name] = e
+	}
+	return out
+}
