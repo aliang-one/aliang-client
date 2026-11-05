@@ -26,6 +26,7 @@ import (
 	"strings"
 
 	"aliang.one/nursorgate/common/logger"
+	"github.com/BurntSushi/toml"
 )
 
 const (
@@ -319,4 +320,173 @@ func aliangMCPEnabledEntries(home string) map[string]aliangMCPServerEntry {
 		out[name] = e
 	}
 	return out
+}
+
+// tomlQuote TOML basic string 转义(控制字符 \uXXXX,其余原样)。
+func tomlQuote(s string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, r := range s {
+		switch r {
+		case '"':
+			b.WriteString(`\"`)
+		case '\\':
+			b.WriteString(`\\`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			b.WriteString(`\r`)
+		case '\t':
+			b.WriteString(`\t`)
+		default:
+			if r < 0x20 {
+				b.WriteString(fmt.Sprintf(`\u%04X`, r))
+			} else {
+				b.WriteRune(r)
+			}
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
+}
+
+// aliangMCPCodexBlockLines 生成一个托管块的行序列。codex 无 headers 通道,
+// registry headers 不进 codex(spec §6.4);http/sse 只带 url;env 用 inline
+// table 保持块内无子表头(块扫描按「[ 开头的行」定界,子表头会撕开块)。
+func aliangMCPCodexBlockLines(key string, e aliangMCPServerEntry) []string {
+	lines := []string{"[mcp_servers." + key + "]"}
+	if strings.TrimSpace(e.URL) != "" {
+		return append(lines, "url = "+tomlQuote(e.URL))
+	}
+	lines = append(lines, "command = "+tomlQuote(e.Command))
+	if len(e.Args) > 0 {
+		parts := make([]string, 0, len(e.Args))
+		for _, a := range e.Args {
+			parts = append(parts, tomlQuote(a))
+		}
+		lines = append(lines, "args = ["+strings.Join(parts, ", ")+"]")
+	}
+	if len(e.Env) > 0 {
+		keys := make([]string, 0, len(e.Env))
+		for k := range e.Env {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		pairs := make([]string, 0, len(keys))
+		for _, k := range keys {
+			pairs = append(pairs, tomlQuote(k)+" = "+tomlQuote(e.Env[k]))
+		}
+		lines = append(lines, "env = {"+strings.Join(pairs, ", ")+"}")
+	}
+	return lines
+}
+
+// scanAliangMCPCanonicalManagedHeaders 文本扫描 config.toml 中规范形态的
+// [mcp_servers.aliang-mcp-*] 表头(整行精确相等,与 peer 块拼接同一判据)。
+func scanAliangMCPCanonicalManagedHeaders(raw string) map[string]bool {
+	out := map[string]bool{}
+	for _, line := range strings.Split(raw, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "[mcp_servers."+aliangMCPCodexPrefix) && strings.HasSuffix(trimmed, "]") && !strings.Contains(trimmed, "\"") {
+			key := strings.TrimSuffix(strings.TrimPrefix(trimmed, "[mcp_servers."), "]")
+			if !strings.Contains(key, ".") {
+				out[key] = true
+			}
+		}
+	}
+	return out
+}
+
+// applyAliangMCPCodexSyncForTest 把 config.toml 的 aliang-mcp-* 托管块集合
+// 对齐到注册表启用条目集合(多块 diff:期望集内的块重写,期望集外的托管块
+// 删除,其余内容逐字保留)。安全:
+//   - 用户文件不可解析 → 拒写(codex 自身同样读不了,fail-closed);
+//   - TOML 解析出托管键但文本扫描找不到规范表头(引号/空格/尾注释形态)
+//     → 拒写,提示手工规范(防重复表定义打碎文件,peer 注册同款纪律);
+//   - 字节无变化 → 幂等跳写;文件缺失且期望集为空 → 不建文件。
+func applyAliangMCPCodexSyncForTest(home string) error {
+	path := filepath.Join(home, ".codex", "config.toml")
+	raw, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("read %s: %w", path, err)
+	}
+	desired := map[string]aliangMCPServerEntry{}
+	for name, e := range aliangMCPEnabledEntries(home) {
+		desired[aliangMCPCodexPrefix+name] = e
+	}
+	hasFile := err == nil
+	if !hasFile && len(desired) == 0 {
+		return nil
+	}
+	if hasFile {
+		var cfg codexConfigFile
+		if _, perr := toml.Decode(string(raw), &cfg); perr != nil {
+			return fmt.Errorf("parse %s: %w;拒绝在无法解析的用户文件上拼块,请先修复 config.toml", path, perr)
+		}
+		canonical := scanAliangMCPCanonicalManagedHeaders(string(raw))
+		for key := range cfg.MCPServers {
+			if !strings.HasPrefix(key, aliangMCPCodexPrefix) {
+				continue
+			}
+			if !canonical[key] {
+				return fmt.Errorf("codex config 的托管条目 %s 表头不是规范形态 [mcp_servers.%s];拒绝拼接以免打碎文件,请先手工规范表头", key, key)
+			}
+		}
+	}
+	// 摘除全部规范托管块 span,其余行原样保留。
+	lines := strings.Split(string(raw), "\n")
+	if len(lines) == 1 && lines[0] == "" {
+		lines = nil
+	}
+	var kept []string
+	i := 0
+	for i < len(lines) {
+		trimmed := strings.TrimSpace(lines[i])
+		key := ""
+		if strings.HasPrefix(trimmed, "[mcp_servers."+aliangMCPCodexPrefix) && strings.HasSuffix(trimmed, "]") && !strings.Contains(trimmed, "\"") {
+			k := strings.TrimSuffix(strings.TrimPrefix(trimmed, "[mcp_servers."), "]")
+			if !strings.Contains(k, ".") {
+				key = k
+			}
+		}
+		if key == "" {
+			kept = append(kept, lines[i])
+			i++
+			continue
+		}
+		i++ // 跳过表头行
+		for i < len(lines) && !strings.HasPrefix(strings.TrimSpace(lines[i]), "[") {
+			i++ // 跳到下一表头/文件尾
+		}
+	}
+	// 追加期望块(键序确定)。
+	keys := make([]string, 0, len(desired))
+	for k := range desired {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := kept
+	for _, k := range keys {
+		if len(out) > 0 && strings.TrimSpace(out[len(out)-1]) != "" {
+			out = append(out, "")
+		}
+		out = append(out, aliangMCPCodexBlockLines(k, desired[k])...)
+	}
+	if len(out) == 0 {
+		if !hasFile {
+			return nil
+		}
+		out = nil
+	}
+	content := strings.Join(out, "\n")
+	if content != "" && !strings.HasSuffix(content, "\n") {
+		content += "\n" // 尾换行与 peer 的块构造口径一致
+	}
+	if hasFile && content == string(raw) {
+		return nil // 幂等跳写
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", filepath.Dir(path), err)
+	}
+	return writePeerMCPFileAtomic(path, []byte(content))
 }

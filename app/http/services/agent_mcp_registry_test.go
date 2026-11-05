@@ -283,3 +283,113 @@ func TestUpsertDeleteFailClosedOnBrokenFile(t *testing.T) {
 		t.Fatalf("坏文件必须保持字节零改动: %s", after)
 	}
 }
+
+func writeCodexConfig(t *testing.T, home, content string) {
+	t.Helper()
+	path := filepath.Join(home, ".codex", "config.toml")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func readCodexConfigRaw(t *testing.T, home string) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(home, ".codex", "config.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+func TestCodexSyncCreatesManagedBlocks(t *testing.T) {
+	home := t.TempDir()
+	// aliang-peer 托管块共存(spec §8):peer 块对同步器而言就是「用户自有块」
+	writeCodexConfig(t, home, "# user comment\n[mcp_servers.aliang-peer]\ncommand = \"peer\"\n\n[mcp_servers.mine]\ncommand = \"x\"\n")
+	dis := false
+	if err := upsertAliangMCPServerForTest(home, "blender", aliangMCPServerEntry{
+		Type: "stdio", Command: "/usr/bin/uvx", Args: []string{"a", "b"},
+		Env: map[string]string{"K": "V"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := upsertAliangMCPServerForTest(home, "off", aliangMCPServerEntry{Command: "x", Enabled: &dis}); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyAliangMCPCodexSyncForTest(home); err != nil {
+		t.Fatal(err)
+	}
+	out := readCodexConfigRaw(t, home)
+	if !strings.Contains(out, "[mcp_servers.aliang-mcp-blender]") ||
+		!strings.Contains(out, `command = "/usr/bin/uvx"`) ||
+		!strings.Contains(out, `args = ["a", "b"]`) ||
+		!strings.Contains(out, "env = {") {
+		t.Fatalf("托管块缺失: %s", out)
+	}
+	if strings.Contains(out, "aliang-mcp-off") || strings.Contains(out, "aliang-mcp-blender.env") {
+		t.Fatal("enabled=false 条目不得产出托管块;env 必须是 inline table(子表头会撕开块扫描)")
+	}
+	if !strings.Contains(out, "# user comment") || !strings.Contains(out, "[mcp_servers.mine]") {
+		t.Fatalf("用户既有内容必须原样保留: %s", out)
+	}
+	if !strings.Contains(out, "[mcp_servers.aliang-peer]") {
+		t.Fatalf("peer 托管块必须原样共存: %s", out)
+	}
+}
+
+func TestCodexSyncIdempotent(t *testing.T) {
+	home := t.TempDir()
+	_ = upsertAliangMCPServerForTest(home, "a", aliangMCPServerEntry{Command: "x"})
+	if err := applyAliangMCPCodexSyncForTest(home); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(home, ".codex", "config.toml")
+	st := stampAgentMCPFile(p)
+	if err := applyAliangMCPCodexSyncForTest(home); err != nil {
+		t.Fatal(err)
+	}
+	if stampAgentMCPFile(p) != st {
+		t.Fatal("同步必须幂等(无变化不写盘)")
+	}
+}
+
+func TestCodexSyncRemovesStaleBlocksAndKeepsOthers(t *testing.T) {
+	home := t.TempDir()
+	writeCodexConfig(t, home, "[mcp_servers.aliang-mcp-stale]\ncommand = \"x\"\n\n[mcp_servers.mine]\ncommand = \"y\"\n")
+	_ = upsertAliangMCPServerForTest(home, "fresh", aliangMCPServerEntry{Command: "f"})
+	if err := applyAliangMCPCodexSyncForTest(home); err != nil {
+		t.Fatal(err)
+	}
+	out := readCodexConfigRaw(t, home)
+	if strings.Contains(out, "aliang-mcp-stale") {
+		t.Fatalf("失配托管块必须删除: %s", out)
+	}
+	if !strings.Contains(out, "aliang-mcp-fresh") || !strings.Contains(out, "[mcp_servers.mine]") {
+		t.Fatalf("新块与用户块必须共存: %s", out)
+	}
+}
+
+func TestCodexSyncRefusesNonCanonicalHeader(t *testing.T) {
+	home := t.TempDir()
+	writeCodexConfig(t, home, "[mcp_servers.\"aliang-mcp-x\"]\ncommand = \"old\"\n")
+	if err := applyAliangMCPCodexSyncForTest(home); err == nil {
+		t.Fatal("TOML 可解析但表头非规范形态必须拒写")
+	}
+	// 纯托管块场景:注册表为空且文件无托管键 → 空转不报错
+	home2 := t.TempDir()
+	writeCodexConfig(t, home2, "[mcp_servers.mine]\ncommand = \"y\"\n")
+	if err := applyAliangMCPCodexSyncForTest(home2); err != nil {
+		t.Fatalf("空期望集空转不应报错: %v", err)
+	}
+}
+
+func TestCodexSyncUnparseableConfigRefuses(t *testing.T) {
+	home := t.TempDir()
+	writeCodexConfig(t, home, "not toml [[[")
+	_ = upsertAliangMCPServerForTest(home, "a", aliangMCPServerEntry{Command: "x"})
+	if err := applyAliangMCPCodexSyncForTest(home); err == nil {
+		t.Fatal("不可解析的用户文件必须拒写(fail-closed)")
+	}
+}
