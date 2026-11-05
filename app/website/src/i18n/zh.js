@@ -225,6 +225,8 @@ export default {
   chat_statusRunning: '对话中',
   chat_statusDone: '已完成',
   chat_aiThinking: '正在思考…',
+  chat_thinkingRunning: '思考中…',
+  chat_thinkingDone: '思考过程',
   chat_aiError: 'AI 回复出错，请重试。',
   chat_approvalTitle: '需要授权',
   chat_approvalTool: '工具',

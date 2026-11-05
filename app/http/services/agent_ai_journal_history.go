@@ -72,6 +72,26 @@ func readAgentCoreJournalHistoryFrom(dir, sessionID string) ([]agentAIMessage, a
 				}
 			}
 			hist = append(hist, msg)
+		case "turn":
+			// 逐回合转录行(OnTurnEnd)：assistant 回答的唯一载体——msg 行只有
+			// user(appendUser)，回答经 appendAssistantTurn/appendAssistant 全部
+			// 落 kind=turn。缺席则快照转录永远只有 user 行：重进页订阅快照、
+			// 内存续聊恢复全部拿不到回答（2026-11-05 仪表盘刷新丢回答事故的
+			// 内核侧根因；inventory 侧 2026-10-31 已补，本读侧漏网）。turn 行
+			// 无 message_id（inventory 同款接受），thinking 字段快照契约未
+			// 消费，不进历史。
+			role, _ := row["role"].(string)
+			text, _ := row["text"].(string)
+			if (role != "user" && role != "assistant") || text == "" {
+				continue
+			}
+			msg := agentAIMessage{Role: role, Content: text}
+			if ts, ok := row["ts"].(string); ok {
+				if t, err := time.Parse(time.RFC3339, ts); err == nil {
+					msg.CreatedAt = t
+				}
+			}
+			hist = append(hist, msg)
 		}
 	}
 	return hist, head, nil

@@ -529,3 +529,37 @@ func TestCreateBackfillsSiblingFromHeader(t *testing.T) {
 		t.Fatalf("单键 create 的兄弟侧应从头行兜底 [pdf], got %v", skills)
 	}
 }
+
+// 2026-11-05 仪表盘刷新丢回答事故回归锚：agentcore 路径的回答走
+// appendAssistantTurn(kind=turn, 无 message_id)——快照读侧此前只认
+// kind=msg,转录里永远只有 user 行,重进页订阅快照/内存续聊恢复全部拿不到
+// 回答。turn 行必须与 msg 行同权进历史。
+func TestReadAgentCoreJournalHistoryIncludesTurnRows(t *testing.T) {
+	dir := t.TempDir()
+	j := newAgentCoreJournal(dir)
+	j.ensureSessionHeader("s-turn", "/proj", "glm-5.3", "", "2026-11-05T00:00:00Z", "dashboard", nil, nil)
+	j.appendUser("s-turn", "m1", "请只回复四个字：测试通过", "2026-11-05T00:01:00Z")
+	j.appendAssistantTurn("s-turn", 1, "测试通过", "The user is asking me to reply with four characters.", "end_turn", nil)
+
+	hist, _, err := readAgentCoreJournalHistoryFrom(dir, "s-turn")
+	if err != nil {
+		t.Fatalf("读回失败: %v", err)
+	}
+	if len(hist) != 2 {
+		t.Fatalf("应回 2 条消息(user+turn),实际 %d: %+v", len(hist), hist)
+	}
+	if hist[0].Role != "user" || hist[0].Content != "请只回复四个字：测试通过" {
+		t.Fatalf("user 行错: %+v", hist[0])
+	}
+	if hist[1].Role != "assistant" || hist[1].Content != "测试通过" {
+		t.Fatalf("turn 行错(回答必须进历史): %+v", hist[1])
+	}
+	// turn 行无 message_id:MessageID 保持空,不冒充锚点。
+	if hist[1].MessageID != "" {
+		t.Fatalf("turn 行不得伪造 message_id: %+v", hist[1])
+	}
+	// thinking 不进历史(快照契约未消费)。
+	if strings.Contains(hist[1].Content, "The user is asking") {
+		t.Fatalf("thinking 不得混入正文: %+v", hist[1])
+	}
+}

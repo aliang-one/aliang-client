@@ -66,7 +66,7 @@
                 class="shrink-0 rounded bg-slate-200 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-slate-500 dark:bg-slate-700 dark:text-slate-300"
               >{{ sourceBadgeLabel(c.deviceSession) }}</span>
               <span
-                v-if="c.running"
+                v-if="conversationRunning(c)"
                 data-testid="device-session-running-dot"
                 class="inline-block h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-primary"
                 :title="t('chat_statusRunning')"
@@ -161,5 +161,19 @@ function onRenameEscape(e) {
 function sourceBadgeLabel(session) {
   const key = sessionSourceBadge(session);
   return key ? t(`chat_source_${key}`) : '';
+}
+
+// running 状态点判定推广（后台静默运行可见性，2026-11-04）：设备壳走清单/
+// 快照 status（c.running），本地草稿无壳标记，从气泡状态推导——窗口关闭期间
+// 照跑的会话，重进页侧栏同样亮运行点。响应式依赖 c.messages（conversations
+// ref 内的响应式对象），快照对账把气泡收敛为 done 后点自动熄灭。
+function conversationRunning(c) {
+  if (!c) return false;
+  if (c.running) return true;
+  const msgs = Array.isArray(c.messages) ? c.messages : [];
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (msgs[i].role === 'assistant') return msgs[i].status === 'running';
+  }
+  return false;
 }
 </script>

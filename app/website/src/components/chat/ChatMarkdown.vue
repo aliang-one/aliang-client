@@ -287,13 +287,168 @@ onUnmounted(() => {
      元素不带 scope 属性,故全部选择器挂在模板根 .chat-md 上、逻辑整体
      放进单个 :deep() 内。 -->
 <style scoped>
+/* ---- 块级排版基线(spec §E:标题/列表/表格/引用)。此前只有代码块包装样式,
+     标题/列表/表格/行内代码全是浏览器默认形态——「看似 markdown、渲染怪」
+     的根因。基线字号 text-sm(0.875rem),标题只比正文大半档,不占气泡。 */
+.chat-md :deep(p) {
+  margin: 0.4em 0;
+  line-height: 1.7;
+}
+
+.chat-md :deep(> p:first-child),
+.chat-md :deep(> :first-child) {
+  margin-top: 0;
+}
+
+.chat-md :deep(> :last-child) {
+  margin-bottom: 0;
+}
+
+.chat-md :deep(h1),
+.chat-md :deep(h2),
+.chat-md :deep(h3),
+.chat-md :deep(h4),
+.chat-md :deep(h5),
+.chat-md :deep(h6) {
+  margin: 0.9em 0 0.4em;
+  font-weight: 600;
+  line-height: 1.4;
+  color: rgb(15 23 42);
+}
+
+.dark .chat-md :deep(h1),
+.dark .chat-md :deep(h2),
+.dark .chat-md :deep(h3),
+.dark .chat-md :deep(h4),
+.dark .chat-md :deep(h5),
+.dark .chat-md :deep(h6) {
+  color: rgb(241 245 249);
+}
+
+.chat-md :deep(h1) { font-size: 1.25em; }
+.chat-md :deep(h2) { font-size: 1.125em; }
+.chat-md :deep(h3) { font-size: 1em; }
+.chat-md :deep(h4),
+.chat-md :deep(h5),
+.chat-md :deep(h6) { font-size: 0.95em; }
+
+.chat-md :deep(h1:first-child),
+.chat-md :deep(h2:first-child),
+.chat-md :deep(h3:first-child),
+.chat-md :deep(h4:first-child),
+.chat-md :deep(h5:first-child),
+.chat-md :deep(h6:first-child) {
+  margin-top: 0;
+}
+
+.chat-md :deep(ul),
+.chat-md :deep(ol) {
+  margin: 0.4em 0;
+  padding-left: 1.4em;
+}
+
+.chat-md :deep(li) {
+  margin: 0.2em 0;
+  line-height: 1.65;
+}
+
+.chat-md :deep(li > ul),
+.chat-md :deep(li > ol) {
+  margin: 0.2em 0;
+}
+
+.chat-md :deep(blockquote) {
+  margin: 0.5em 0;
+  padding: 0.1em 0 0.1em 0.8em;
+  border-left: 3px solid rgb(203 213 225);
+  color: rgb(100 116 139);
+}
+
+.dark .chat-md :deep(blockquote) {
+  border-left-color: rgb(71 85 105);
+  color: rgb(148 163 184);
+}
+
+.chat-md :deep(blockquote p) {
+  margin: 0.25em 0;
+}
+
+.chat-md :deep(hr) {
+  margin: 0.9em 0;
+  border: 0;
+  border-top: 1px solid rgb(226 232 240);
+}
+
+.dark .chat-md :deep(hr) {
+  border-top-color: rgb(51 65 85);
+}
+
+.chat-md :deep(a) {
+  /* 浅色下压深到 emerald-700 级（primary 亮绿 #21C45D 白底对比 ~2.2:1 不达
+     WCAG AA）；暗色底上亮绿对比充足，保持品牌色。 */
+  color: rgb(4 120 87);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.dark .chat-md :deep(a) {
+  color: rgb(var(--color-primary-rgb));
+}
+
+.chat-md :deep(a:hover) {
+  text-decoration-thickness: 2px;
+}
+
+/* 行内代码(不在 pre 里的 code):浅底胶囊。 */
+.chat-md :deep(code) {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.85em;
+}
+
+.chat-md :deep(:not(pre) > code) {
+  margin: 0 0.1em;
+  padding: 0.15em 0.4em;
+  border-radius: 4px;
+  background: rgb(241 245 249);
+  border: 1px solid rgb(226 232 240);
+  color: rgb(190 24 93);
+}
+
+.dark .chat-md :deep(:not(pre) > code) {
+  background: rgb(30 41 59);
+  border-color: rgb(51 65 85);
+  color: rgb(244 114 182);
+}
+
+/* ---- 代码块底座:此前 pre 无背景无边框,裸文本混在气泡里。 */
+.chat-md :deep(.chat-md-pre-wrap pre) {
+  margin: 0;
+  padding: 1.6rem 0.75rem 0.6rem;
+  border-radius: 0.5rem;
+  border: 1px solid rgb(226 232 240);
+  background: rgb(248 250 252);
+  overflow-x: auto;
+  font-size: 0.8125rem;
+  line-height: 1.6;
+}
+
+.dark .chat-md :deep(.chat-md-pre-wrap pre) {
+  border-color: rgb(51 65 85);
+  background: rgb(2 6 23);
+}
+
+.chat-md :deep(.chat-md-pre-wrap pre code) {
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: 1em;
+}
+
+/* 语言标签/复制按钮要压在 pre 上沿 padding 区(1.6rem 顶垫是它们的位置)。
+   折叠态下 pre 被 max-height 裁切,按钮仍浮在 wrap 层不受影响。 */
 .chat-md :deep(.chat-md-pre-wrap) {
   position: relative;
   margin: 0.5rem 0;
-}
-
-.chat-md :deep(.chat-md-pre-wrap pre) {
-  margin: 0;
 }
 
 .chat-md :deep(.chat-md-fold pre) {
@@ -304,7 +459,7 @@ onUnmounted(() => {
 .chat-md :deep(.lang-label),
 .chat-md :deep(.chat-md-copy) {
   position: absolute;
-  top: 4px;
+  top: 6px;
   font-size: 11px;
   line-height: 1;
   color: rgb(148 163 184);
@@ -312,6 +467,8 @@ onUnmounted(() => {
 
 .chat-md :deep(.lang-label) {
   left: 8px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
 }
 
 .chat-md :deep(.chat-md-copy) {
@@ -320,10 +477,19 @@ onUnmounted(() => {
   background: none;
   border: none;
   padding: 2px 4px;
+  border-radius: 4px;
 }
 
 .chat-md :deep(.chat-md-copy:hover) {
   color: rgb(100 116 139);
+  background: rgb(226 232 240 / 0.5);
+}
+
+/* 暗色代码块底近黑，浅灰 hover 底会把 slate-500 文字混没（对比 1.06:1）
+   ——换亮文字+深底。 */
+.dark .chat-md :deep(.chat-md-copy:hover) {
+  color: rgb(203 213 225);
+  background: rgb(51 65 85 / 0.6);
 }
 
 .chat-md :deep(.chat-md-unfold) {
@@ -336,5 +502,135 @@ onUnmounted(() => {
   padding: 2px 4px;
   cursor: pointer;
   text-decoration: underline;
+}
+
+/* ---- 表格:markdown-it 输出裸 table,无样式时边框全无、挤成一行。 */
+.chat-md :deep(table) {
+  margin: 0.5em 0;
+  border-collapse: collapse;
+  font-size: 0.875em;
+  display: block;
+  overflow-x: auto;
+  max-width: 100%;
+}
+
+.chat-md :deep(th),
+.chat-md :deep(td) {
+  border: 1px solid rgb(226 232 240);
+  padding: 0.3em 0.7em;
+  text-align: left;
+  line-height: 1.5;
+}
+
+.dark .chat-md :deep(th),
+.dark .chat-md :deep(td) {
+  border-color: rgb(51 65 85);
+}
+
+.chat-md :deep(th) {
+  background: rgb(248 250 252);
+  font-weight: 600;
+}
+
+.dark .chat-md :deep(th) {
+  background: rgb(15 23 42);
+}
+
+/* ---- highlight.js 配色(手写亮暗双态):不引入 hljs 主题文件——主题是
+     单态的,与 .dark 切换冲突;这里按 github / github-dark 官方色板摘录
+     常用 token 类,未覆盖的类回落正文色。 */
+.chat-md :deep(.hljs-comment),
+.chat-md :deep(.hljs-quote) {
+  color: rgb(106 115 125);
+  font-style: italic;
+}
+
+.chat-md :deep(.hljs-keyword),
+.chat-md :deep(.hljs-selector-tag) {
+  color: rgb(215 58 73);
+}
+
+.chat-md :deep(.hljs-string),
+.chat-md :deep(.hljs-regexp),
+.chat-md :deep(.hljs-addition) {
+  color: rgb(3 47 98);
+}
+
+.chat-md :deep(.hljs-number),
+.chat-md :deep(.hljs-built_in),
+.chat-md :deep(.hljs-literal),
+.chat-md :deep(.hljs-type),
+.chat-md :deep(.hljs-params),
+.chat-md :deep(.hljs-meta),
+.chat-md :deep(.hljs-link) {
+  color: rgb(0 92 197);
+}
+
+.chat-md :deep(.hljs-title),
+.chat-md :deep(.hljs-section),
+.chat-md :deep(.hljs-name),
+.chat-md :deep(.hljs-selector-id),
+.chat-md :deep(.hljs-selector-class) {
+  color: rgb(111 66 193);
+}
+
+.chat-md :deep(.hljs-attribute),
+.chat-md :deep(.hljs-symbol),
+.chat-md :deep(.hljs-variable),
+.chat-md :deep(.hljs-template-variable),
+.chat-md :deep(.hljs-bullet) {
+  color: rgb(227 98 9);
+}
+
+.chat-md :deep(.hljs-deletion) {
+  color: rgb(179 29 40);
+  background: rgb(255 238 240);
+}
+
+.dark .chat-md :deep(.hljs-comment),
+.dark .chat-md :deep(.hljs-quote) {
+  color: rgb(139 148 158);
+}
+
+.dark .chat-md :deep(.hljs-keyword),
+.dark .chat-md :deep(.hljs-selector-tag) {
+  color: rgb(255 123 114);
+}
+
+.dark .chat-md :deep(.hljs-string),
+.dark .chat-md :deep(.hljs-regexp),
+.dark .chat-md :deep(.hljs-addition) {
+  color: rgb(165 214 255);
+}
+
+.dark .chat-md :deep(.hljs-number),
+.dark .chat-md :deep(.hljs-built_in),
+.dark .chat-md :deep(.hljs-literal),
+.dark .chat-md :deep(.hljs-type),
+.dark .chat-md :deep(.hljs-params),
+.dark .chat-md :deep(.hljs-meta),
+.dark .chat-md :deep(.hljs-link) {
+  color: rgb(121 192 255);
+}
+
+.dark .chat-md :deep(.hljs-title),
+.dark .chat-md :deep(.hljs-section),
+.dark .chat-md :deep(.hljs-name),
+.dark .chat-md :deep(.hljs-selector-id),
+.dark .chat-md :deep(.hljs-selector-class) {
+  color: rgb(210 168 255);
+}
+
+.dark .chat-md :deep(.hljs-attribute),
+.dark .chat-md :deep(.hljs-symbol),
+.dark .chat-md :deep(.hljs-variable),
+.dark .chat-md :deep(.hljs-template-variable),
+.dark .chat-md :deep(.hljs-bullet) {
+  color: rgb(255 166 87);
+}
+
+.dark .chat-md :deep(.hljs-deletion) {
+  color: rgb(255 220 215);
+  background: rgb(128 32 32 / 0.35);
 }
 </style>
