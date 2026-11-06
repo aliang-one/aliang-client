@@ -229,6 +229,18 @@ type AgentVibeDiagnostics struct {
 	Error string `json:"error,omitempty"`
 }
 
+// AgentVibeAttachment 是消息携带的图片引用（spec 2026-11-05-chat-image-
+// pipeline §3.3）。Ref=相对持久附件缓存根——网页经
+// /api/agent/ai/attachment?ref= 取图，绝不携带 COS/预签名 URL。先上梅
+// （agentcore journal msg 行携带；server zod 剥未知字段、手机契约未消费，
+// 同 Thinking 先例——网页 Phase 1 即点亮）。
+type AgentVibeAttachment struct {
+	Name  string `json:"name"`
+	Mime  string `json:"mime,omitempty"`
+	Bytes int64  `json:"bytes,omitempty"`
+	Ref   string `json:"ref"`
+}
+
 type AgentVibeMessage struct {
 	ID        string `json:"id,omitempty"`
 	Role      string `json:"role"`
@@ -239,6 +251,10 @@ type AgentVibeMessage struct {
 	// 随 turn 行回放下发;server zod 剥未知字段、手机契约未消费——先上梅,
 	// Phase 1/2(思考历史渲染+门控)再点亮,避免届时再动传输结构。
 	Thinking string `json:"thinking,omitempty"`
+	// Attachments 是用户消息携带的图片引用（journal kind=msg 行的
+	// attachments 字段，2026-11-05 聊天图片链路新增）。纯图消息 Content
+	// 为空、仅靠本字段渲染缩略图。
+	Attachments []AgentVibeAttachment `json:"attachments,omitempty"`
 }
 
 type AgentVibeTranscriptPage struct {

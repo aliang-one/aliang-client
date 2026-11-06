@@ -1150,7 +1150,7 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		if !lastUser.CreatedAt.IsZero() {
 			ts = lastUser.CreatedAt.UTC().Format(time.RFC3339)
 		}
-		journal.appendUser(run.sessionID, run.messageID, lastUser.Content, ts)
+		journal.appendUser(run.sessionID, run.messageID, lastUser.Content, ts, agentAIJournalAttachmentsFrom(run.attachments))
 	}
 
 	if run.cancel != nil {

@@ -473,6 +473,9 @@ type agentAISteerMessage struct {
 	// 刻意在 steer 入口就编码完：steer 可能排队到 control.started 之后才写出，
 	// 若携带临时文件路径，排队期间清理就会把文件删掉。
 	ImageBlocks []map[string]interface{}
+	// JournalAttachments 是图片的持久缓存引用（buildSteerImageBlocks 落副本
+	// 时带回），journalSteerUserMessage 落 journal user 行用。
+	JournalAttachments []agentAIJournalAttachment
 }
 
 type agentAICodexSteerControl struct {
@@ -505,6 +508,9 @@ type agentAIMessage struct {
 	MessageID string
 	Content   string
 	CreatedAt time.Time
+	// Attachments 是用户消息携带的图片引用（journal msg 行透传，快照/详情
+	// 序列化直接用 wire 形状）。纯图消息 Content 为空。
+	Attachments []models.AgentVibeAttachment
 }
 
 type agentAIRun struct {
@@ -603,6 +609,13 @@ type agentAIAttachment struct {
 	Path string
 	URL  string
 	Text string // 仅 Type=="text"
+	// PersistPath 是持久附件缓存里的相对引用（spec 2026-11-05-chat-image-
+	// pipeline §3.1）：下载/上传成功落副本时置位，journal 落账与网页取图读它。
+	// 空=未持久化（下载失败或 10-20MiB 降级带），只损失网页显示，不影响内核。
+	PersistPath string
+	// Origin 记录图片来源：phone（手机经 PhoneServer 下发，runCLI 落缓存）/
+	// web（网页上传，resolve 阶段即已命中缓存根）。journal 落账透传。
+	Origin string
 }
 
 // agentAIRunEmitter serializes every event emitted by one run. Besides adding
@@ -2978,12 +2991,13 @@ func (m *agentAIManager) steer(msg map[string]interface{}, writeJSON agentTermin
 			steer.Content += suffix
 		}
 		if hasImageAttachments(attachments) {
-			blocks, buildErr := buildSteerImageBlocks(context.Background(), attachments, remoteStringSlice(msg, "attachment_allowed_hosts"))
+			blocks, journalRefs, buildErr := buildSteerImageBlocks(context.Background(), sessionID, messageID, attachments, remoteStringSlice(msg, "attachment_allowed_hosts"))
 			if buildErr != nil {
 				emitAgentAISteerAck(writeJSON, sessionID, messageID, "error", buildErr.Error(), "send_failed")
 				return
 			}
 			steer.ImageBlocks = blocks
+			steer.JournalAttachments = journalRefs
 		}
 	}
 
@@ -3611,6 +3625,15 @@ func resolveAgentAIAttachments(raw interface{}, projectPath string) ([]agentAIAt
 			totalBytes += stat.Size()
 			if totalBytes > maxTotalBytes {
 				return nil, fmt.Errorf("attachments exceed %d MiB in total", maxTotalBytes/(1024*1024))
+			}
+			// 网页上传（spec §3.5/§3.6）：持久缓存根内的路径视为已持久化，
+			// PersistPath/Origin=web 就地置位并放行——缓存根是 agent 自控目录
+			// （仅上传端点写入），项目目录守卫对根外路径原样拒绝，防线不弱化。
+			if cacheRoot, cacheErr := agentAttachmentCacheRoot(); cacheErr == nil && agentPathInsideDirectory(absolute, cacheRoot) {
+				if rel, relErr := filepath.Rel(cacheRoot, absolute); relErr == nil {
+					attachment.PersistPath = filepath.ToSlash(rel)
+					attachment.Origin = "web"
+				}
 			}
 			attachment.Path = absolute
 			if attachment.Name == "" {
@@ -4695,7 +4718,7 @@ func (m *agentAIManager) journalSteerUserMessage(sessionID string, msg agentAISt
 	if !msg.CreatedAt.IsZero() {
 		ts = msg.CreatedAt.UTC().Format(time.RFC3339)
 	}
-	m.coreJournal.appendUser(sessionID, msg.MessageID, content, ts)
+	m.coreJournal.appendUser(sessionID, msg.MessageID, content, ts, msg.JournalAttachments)
 }
 
 // setAgentAIResumeSessionIDIfEmpty pins a CLI-assigned session id so the NEXT
@@ -4788,6 +4811,14 @@ func (m *agentAIManager) runCLI(ctx context.Context, run agentAIRun, writeJSON a
 	}
 	defer cleanupAttachments()
 	run.attachments = attachments
+
+	// 持久附件缓存（尽力而为）：副本落 <home>/aliang-attachments/<session>/，
+	// journal 与网页显示读它；失败仅 Warn 降级（无网页显示≠内核失图）。
+	persistBase := strings.TrimSpace(run.messageID)
+	if persistBase == "" {
+		persistBase = fmt.Sprintf("run-%d", run.runSeq)
+	}
+	persistAgentAIAttachmentFiles(run.sessionID, persistBase, run.attachments)
 
 	if agentAIUseCodexAppServer(run.provider) {
 		outcome := m.runCodexAppServer(ctx, run, writeJSON)

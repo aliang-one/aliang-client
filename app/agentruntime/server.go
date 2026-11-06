@@ -91,6 +91,11 @@ func StartLocalServer() error {
 	// 注册且 command 最新;关=确保注销)。只 Warn 不阻断启动;应用细节见
 	// services.EnsurePeerMCPMatchesConfig。
 	services.EnsurePeerMCPMatchesConfig()
+	// 持久附件缓存全局帽清扫(1GiB,按会话最旧驱逐):recall/truncateBefore 的
+	// 孤儿文件统一在此收敛。只 Warn 不阻断启动。
+	if err := services.AgentAttachmentSweepStartup(); err != nil {
+		logger.Warn(fmt.Sprintf("[AGENT-BOOT] attachment cache sweep failed err=%v", err))
+	}
 	logger.Info("[AGENT-BOOT] local_server awaiting session owner sync")
 	return nil
 }
@@ -148,6 +153,9 @@ func registerAgentRoutes(mux *http.ServeMux) {
 	// runtime，由本地 AI 管理器跑（journal/清单与手机同源）。缺注册=404 透传
 	// （2026-10-21 liang-dev 双注册教训）。
 	mux.HandleFunc("/api/agent/ai/stream", agentHandler.HandleAIStream)
+	// 聊天图片链路（spec §3.4）：上传+取图,双注册另一处 routes.go。
+	mux.HandleFunc("/api/agent/ai/attachment/upload", agentHandler.HandleAttachmentUpload)
+	mux.HandleFunc("/api/agent/ai/attachment", agentHandler.HandleAttachmentGet)
 	mux.HandleFunc("/mcp/aliang/", agentHandler.HandleToolAskMCP)
 	mux.HandleFunc("/api/agent/sessions", agentHandler.HandleVibeSessions)
 	mux.HandleFunc("/api/agent/session", agentHandler.HandleVibeSession)

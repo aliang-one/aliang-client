@@ -88,6 +88,10 @@
         :steer-blocked="steerBlocked"
         :approval-blocked="sendApprovalBlocked"
         :recall-active="recallActive"
+        :pending-attachments="pendingAttachments"
+        :attachment-uploading="attachmentUploading"
+        :add-attachment-files="addPendingAttachments"
+        @remove-attachment="removePendingAttachment"
         :slash-open="slashOpen"
         :slash-matches="slashMatches"
         :slash-index="slashIndex"
@@ -164,6 +168,12 @@ const {
   sendMessage,
   sendRecall,
   sendButtonLabel,
+  // 图片附件（spec 2026-11-05-chat-image-pipeline §3.6）：pending 态与上传
+  // 动作下传 ChatComposer。
+  pendingAttachments,
+  attachmentUploading,
+  addPendingAttachments,
+  removePendingAttachment,
   sendApprovalBlocked,
   sendDisabled,
   setInputEl,

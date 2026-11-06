@@ -100,13 +100,21 @@ func buildClaudeImageBlocks(attachments []agentAIAttachment) ([]map[string]inter
 // 与 run 路径的区别：run 的临时文件要活到子进程结束（codex/opencode 按路径读），
 // 插话则是在这里就把 base64 编好塞进 steer 队列——排队期间 steer 可能还没写出，
 // 若只存路径，清理早就把文件删了。所以下载完立即删，只留内存里的 block。
-func buildSteerImageBlocks(ctx context.Context, attachments []agentAIAttachment, allowedHosts []string) ([]map[string]interface{}, error) {
+// sessionID/messageID 用于持久附件缓存落副本（网页显示用；尽力而为，失败仅
+// Warn 降级），必须在 cleanup 前落——临时文件活不过 defer。副本落盘后把
+// journal 附件引用一并返回（steer.JournalAttachments → journal user 行）。
+func buildSteerImageBlocks(ctx context.Context, sessionID, messageID string, attachments []agentAIAttachment, allowedHosts []string) ([]map[string]interface{}, []agentAIJournalAttachment, error) {
 	local, cleanup, err := downloadAgentAIAttachments(ctx, attachments, allowedHosts)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	persistAgentAIAttachmentFiles(sessionID, messageID, local)
 	defer cleanup()
-	return buildClaudeImageBlocks(local)
+	blocks, err := buildClaudeImageBlocks(local)
+	if err != nil {
+		return nil, nil, err
+	}
+	return blocks, agentAIJournalAttachmentsFrom(local), nil
 }
 
 // hasImageAttachments 报告是否有需要走 image block 的附件。

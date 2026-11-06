@@ -99,6 +99,7 @@ func readAgentCoreSessionMetaWithOptions(path string, options agentVibeSessionRe
 			Role        string                 `json:"role"`
 			MessageID   string                 `json:"message_id"`
 			Text        string                 `json:"text"`
+			Attachments []models.AgentVibeAttachment `json:"attachments,omitempty"`
 			Thinking    string                 `json:"thinking"`
 			Turn        int                    `json:"turn"`
 			Tool        string                 `json:"tool"`
@@ -133,25 +134,28 @@ func readAgentCoreSessionMetaWithOptions(path string, options agentVibeSessionRe
 			if row.Role != "user" && row.Role != "assistant" {
 				return true
 			}
-			// 写侧保证 text 非空,这里防损坏行：空文本不计数的语义与 codex
-			// reader 的 msg.Content != "" 守卫一致。
+			// 写侧保证 text 非空或带 attachments（纯图行 text 空但附件非空,
+			// spec 2026-11-05-chat-image-pipeline §3.3）,这里防损坏行：两者
+			// 皆空的行不计数的语义与 codex reader 的 msg.Content != "" 守卫
+			// 一致。
 			content := truncateAgentText(row.Text, agentVibeTranscriptMaxContentRunes)
-			if content == "" {
+			if content == "" && len(row.Attachments) == 0 {
 				return true
 			}
 			parsedAny = true
 			ts := normalizeAgentTime(row.Ts)
 			session.MessageCount++
 			transcriptRow++
-			if session.Title == "" && row.Role == "user" && !isJunkAgentTitle(content) {
+			if session.Title == "" && row.Role == "user" && content != "" && !isJunkAgentTitle(content) {
 				session.Title = truncateAgentText(content, 200)
 			}
 			window.add(models.AgentVibeMessage{
-				ID:        row.MessageID,
-				Role:      row.Role,
-				Content:   content,
-				Timestamp: ts,
-				Index:     transcriptRow - 1,
+				ID:          row.MessageID,
+				Role:        row.Role,
+				Content:     content,
+				Timestamp:   ts,
+				Index:       transcriptRow - 1,
+				Attachments: row.Attachments,
 			})
 			displayCount++
 			if ts != "" { // 空 ts 不赋值:防损坏行抹掉前一行已落下的有效值
