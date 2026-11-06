@@ -7,6 +7,7 @@ import { useAuthStore } from '../stores/auth';
 import { getAgentIntegrations, getAgentSessionDetail } from '../services/agentApi';
 import { useDeviceSessions, DEVICE_SESSION_DETAIL_TTL_MS, isTerminalPrefixedSessionId } from './useDeviceSessions';
 import {
+  draftMatchesDeviceSession,
   normalizeDeviceProvider,
   readLastUsedEffort,
   readLastUsedModel,
@@ -57,6 +58,44 @@ export function normalizeApprovalDecision(value) {
   if (['decline', 'declined', 'deny', 'denied', 'reject', 'rejected', 'no'].includes(lower)) return 'decline';
   if (['cancel', 'abort', 'timed_out', 'timeout'].includes(lower)) return 'cancel';
   return '';
+}
+
+// 侧栏三源合并（纯函数，G6 双卡去重收口）：本地草稿（无 deviceSession）+
+// 设备会话壳。壳对象由 useDeviceSessions 的 shellCache 保证稳定（打开后消息
+// 写在同一对象上）；打开过的设备会话也会插入 conversations（承载
+// activeConversation/sendMessage 既有路径），壳部分在这里去重——补上「清单
+// 暂缺但已打开」的壳（agent 离线时代理回 200 空表，不能让打开着的会话从
+// 侧栏消失）。草稿部分按键去重（draftMatchesDeviceSession，chatSettings）：
+// 草稿 aiSessionId 对上壳的会话归属键即同一会话，壳优先展示（服务端状态
+// 权威），草稿只在无对应壳时显示——否则仪表盘自建会话首条消息发出后侧栏
+// 必现「本地草稿 + 设备壳」双卡（journal 回清单 → 壳与草稿并存，刷新页也不
+// 消失：草稿持久在 localStorage）。shellForEntry 由调用方注入（shellCache
+// 闭包），本函数保持纯逻辑可被 vitest 直接覆盖（useAliangChat.sidebar.test.js）。
+export function mergeSidebarConversations(conversations, deviceEntries, shellForEntry) {
+  const drafts = [];
+  const openedShells = [];
+  for (const c of Array.isArray(conversations) ? conversations : []) {
+    if (!c || typeof c !== 'object') continue;
+    if (c.deviceSession) openedShells.push(c);
+    else drafts.push(c);
+  }
+  const listedIds = new Set();
+  const shells = [];
+  for (const entry of Array.isArray(deviceEntries) ? deviceEntries : []) {
+    if (entry && typeof entry === 'object' && typeof entry.id === 'string') listedIds.add(entry.id);
+    const shell = typeof shellForEntry === 'function' ? shellForEntry(entry) : null;
+    if (shell) shells.push(shell);
+  }
+  for (const shell of openedShells) {
+    if (!listedIds.has(shell.deviceSession.id)) shells.push(shell);
+  }
+  // 草稿去重（G6）：草稿 aiSessionId 对上任意将渲染壳的 deviceSession 归属键
+  // 即同一会话——壳有服务端状态优先，草稿只在无对应壳时显示。打开态壳的
+  // deviceSession 一并参与（清单暂缺窗口内草稿+壳并存的同会话也并成单卡）。
+  const dedupedDrafts = drafts.filter(
+    (c) => !shells.some((s) => draftMatchesDeviceSession(c, s.deviceSession))
+  );
+  return [...dedupedDrafts, ...shells];
 }
 
 export function normalizeApprovalDecisions(values) {
@@ -335,31 +374,11 @@ export function useAliangChat() {
 
   const activeIsDevice = computed(() => !!activeConversation.value?.deviceSession);
 
-  // 统一会话列表：本地草稿（无 deviceSession）+ 设备会话壳。壳对象由
-  // composable 的 shellCache 保证稳定（打开后消息写在同一对象上）；打开过的
-  // 设备会话也会插入 conversations（承载 activeConversation/sendMessage 既有
-  // 路径），在这里去重——草稿过滤掉带 deviceSession 的成员，壳部分再补上
-  // 「清单暂缺但已打开」的壳（agent 离线时代理回 200 空表，不能让打开着的
-  // 会话从侧栏消失）。
-  const mergedConversations = computed(() => {
-    const drafts = [];
-    const openedShells = [];
-    for (const c of conversations.value) {
-      if (c.deviceSession) openedShells.push(c);
-      else drafts.push(c);
-    }
-    const listedIds = new Set();
-    const shells = [];
-    for (const entry of deviceSessions.value) {
-      if (entry && typeof entry === 'object' && typeof entry.id === 'string') listedIds.add(entry.id);
-      const shell = shellForEntry(entry);
-      if (shell) shells.push(shell);
-    }
-    for (const shell of openedShells) {
-      if (!listedIds.has(shell.deviceSession.id)) shells.push(shell);
-    }
-    return [...drafts, ...shells];
-  });
+  // 统一会话列表：本地草稿（无 deviceSession）+ 设备会话壳。装配逻辑在模块级
+  // mergeSidebarConversations（纯函数，vitest 直接覆盖）；本 computed 只接线。
+  const mergedConversations = computed(() =>
+    mergeSidebarConversations(conversations.value, deviceSessions.value, shellForEntry)
+  );
 
   const conversationGroups = computed(() => [
     { key: 'today', label: t('chat_today'), items: groupedConversations.value.today },

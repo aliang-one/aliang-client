@@ -174,6 +174,21 @@ export function isAliangCodeSession(entry) {
   return normalizeDeviceProvider(entry.provider) === 'agentcore';
 }
 
+// 本地草稿与设备壳同会话判定（G6 侧栏双卡去重）：草稿 aiSessionId（首个
+// ai.session.create/message 的 session_id，= 后端 ai 会话 id = journal 文件名）
+// 对上清单条目的「会话归属三键」（entry.id / source_session_id /
+// managed_conversation_id，与 useDeviceSessions.findDeviceShellBySessionId
+// 同一口径）即视为同一会话。仪表盘自建会话首条消息发出后，journal 回清单，
+// 壳与草稿并存成双卡——本谓词是去重的按键依据。脏输入一律判否。
+export function draftMatchesDeviceSession(draft, entry) {
+  if (!draft || typeof draft !== 'object' || !entry || typeof entry !== 'object') return false;
+  const sid = typeof draft.aiSessionId === 'string' ? draft.aiSessionId.trim() : '';
+  if (!sid) return false;
+  return entry.id === sid
+    || entry.source_session_id === sid
+    || entry.managed_conversation_id === sid;
+}
+
 // 设备会话清单条目 → 前端统一会话对象（跨端清单与本地会话同池渲染的适配
 // 层）。id 加 dev- 前缀避免与本地会话 ID 撞车；title 缺省回落设备会话 ID；
 // 原始条目挂在 deviceSession 供续聊分流读 origin/created_at。脏输入（null/
