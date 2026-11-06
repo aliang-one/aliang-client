@@ -24,6 +24,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 
 	"aliang.one/nursorgate/common/logger"
 	"github.com/BurntSushi/toml"
@@ -518,6 +519,8 @@ func applyAliangMCPCodexSyncForTest(home string) error {
 // 纠正「注册表已写但 codex 拼块被拒后用户已手工修复」与「用户手删托管块」
 // 的漂移。只 Warn 不返回错误——自愈永不阻断启动。
 func EnsureAliangMCPCodexMatchesRegistryForTest(home string) {
+	aliangMCPRegistryMu.Lock()
+	defer aliangMCPRegistryMu.Unlock()
 	if home == "" {
 		logger.Warn("aliang-mcp: startup codex sync skipped, agent home unavailable")
 		return
@@ -541,6 +544,13 @@ func EnsureAliangMCPCodexMatchesRegistry() {
 // swap 期间不得有后台调用方——写 API 走 HTTP 请求同步路径,天然满足)。
 var mcpRegistryHome = agentHome
 
+// aliangMCPRegistryMu 串行化注册表写路径:HTTP 已暴露 PUT/DELETE,双请求重叠
+// 时「读-改-写」会丢更新(原子写只防撕裂不防丢失;注册表是真相源且无自愈)。
+// 覆盖面=本文件三个写入口(Upsert/Delete/Ensure 自愈)整体两段式单元,对照
+// agentMCPInventoryMu 先例。与 peer 家族对 ~/.codex/config.toml 的写跨族
+// 不互斥=documented-accept(peer 侧无锁,两侧各有自愈兜底)。
+var aliangMCPRegistryMu sync.Mutex
+
 // AliangMCPServerRequest 是 PUT 通道的请求形态(handler DTO)。
 type AliangMCPServerRequest struct {
 	Type    string            `json:"type"`
@@ -552,6 +562,9 @@ type AliangMCPServerRequest struct {
 	Enabled *bool             `json:"enabled"`
 }
 
+// entry 字段必须与 aliangMCPServerEntry 逐一同名同型同序,结构体转换才是合法
+// 的——将来任一侧字段漂移会在编译期炸(这正是想要的护栏),别用删转换改写
+// 逐字段拷贝的方式「修」,那会静默吞掉新字段的透传。
 func (r AliangMCPServerRequest) entry() aliangMCPServerEntry {
 	return aliangMCPServerEntry(r)
 }
@@ -589,6 +602,8 @@ func (s *AgentService) AliangMCPRegistry() (map[string]interface{}, error) {
 
 // UpsertAliangMCPServer PUT 语义:新增或整体替换。
 func (s *AgentService) UpsertAliangMCPServer(name string, req AliangMCPServerRequest) AliangMCPSyncResult {
+	aliangMCPRegistryMu.Lock()
+	defer aliangMCPRegistryMu.Unlock()
 	res := AliangMCPSyncResult{}
 	home := mcpRegistryHome()
 	if home == "" {
@@ -609,6 +624,8 @@ func (s *AgentService) UpsertAliangMCPServer(name string, req AliangMCPServerReq
 
 // DeleteAliangMCPServer DELETE 语义。
 func (s *AgentService) DeleteAliangMCPServer(name string) AliangMCPSyncResult {
+	aliangMCPRegistryMu.Lock()
+	defer aliangMCPRegistryMu.Unlock()
 	res := AliangMCPSyncResult{}
 	home := mcpRegistryHome()
 	if home == "" {

@@ -495,3 +495,76 @@ func TestAgentServiceMCPRegistryFlow(t *testing.T) {
 		t.Fatalf("delete: %+v", res)
 	}
 }
+
+func TestAliangMCPSyncTwoPhaseNoRollback(t *testing.T) {
+	// spec §10 两段式契约:第二段(codex 托管块)失败不回滚第一段——非规范
+	// 表头让 sync 拒写,但注册表条目必须已落盘(注册表是真相源,自愈兜底)。
+	home := t.TempDir()
+	old := mcpRegistryHome
+	mcpRegistryHome = func() string { return home }
+	t.Cleanup(func() { mcpRegistryHome = old })
+	svc := &AgentService{}
+	writeCodexConfig(t, home, "[mcp_servers.\"aliang-mcp-web\"]\ncommand = \"old\"\n")
+	res := svc.UpsertAliangMCPServer("web", AliangMCPServerRequest{
+		Type: "http", URL: "https://api.example.com/mcp",
+	})
+	if res.RegistryErr != "" {
+		t.Fatalf("第一段(注册表落盘)不应失败: %s", res.RegistryErr)
+	}
+	if res.CodexSync.OK || res.CodexSync.Error == "" {
+		t.Fatalf("非规范表头须 codex_sync.ok=false 且带原因: %+v", res.CodexSync)
+	}
+	reg, err := svc.AliangMCPRegistry()
+	if err != nil {
+		t.Fatal(err)
+	}
+	servers, _ := reg["servers"].(map[string]interface{})
+	if _, ok := servers["web"].(map[string]interface{}); !ok {
+		t.Fatalf("第二段失败时注册表条目必须已落盘(不回滚): %#v", reg)
+	}
+}
+
+func TestAliangMCPDeleteUnknownName(t *testing.T) {
+	home := t.TempDir()
+	old := mcpRegistryHome
+	mcpRegistryHome = func() string { return home }
+	t.Cleanup(func() { mcpRegistryHome = old })
+	svc := &AgentService{}
+	res := svc.DeleteAliangMCPServer("ghost")
+	if res.RegistryErr != "" || res.Existed {
+		t.Fatalf("删未知名须 Existed=false 且无 RegistryErr: %+v", res)
+	}
+}
+
+func TestAliangMCPRegistryRoundTripEnvHeaders(t *testing.T) {
+	home := t.TempDir()
+	old := mcpRegistryHome
+	mcpRegistryHome = func() string { return home }
+	t.Cleanup(func() { mcpRegistryHome = old })
+	svc := &AgentService{}
+	res := svc.UpsertAliangMCPServer("web", AliangMCPServerRequest{
+		Type: "stdio", Command: "uvx",
+		Env:     map[string]string{"API_KEY": "v-1"},
+		Headers: map[string]string{"Authorization": "Bearer t"},
+	})
+	if res.RegistryErr != "" {
+		t.Fatal(res.RegistryErr)
+	}
+	reg, err := svc.AliangMCPRegistry()
+	if err != nil {
+		t.Fatal(err)
+	}
+	servers, _ := reg["servers"].(map[string]interface{})
+	web, _ := servers["web"].(map[string]interface{})
+	if web == nil {
+		t.Fatalf("web 条目缺失: %#v", reg)
+	}
+	env, _ := web["env"].(map[string]interface{})
+	if env["API_KEY"] != "v-1" {
+		t.Fatalf("env 往返丢失: %#v", web)
+	}
+	headers, _ := web["headers"].(map[string]interface{})
+	if headers["Authorization"] != "Bearer t" {
+		t.Fatalf("headers 往返丢失: %#v", web)
+	}
+}
