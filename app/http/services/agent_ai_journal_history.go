@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -35,7 +36,22 @@ func readAgentCoreJournalHistory(sessionID string) ([]agentAIMessage, agentCoreJ
 // （顺序=文件顺序）。os.ErrNotExist 透传（调用方回退 lazy-create）；其余 IO
 // 错误也返回 error（调用方发 history_restore_failed 提示）。dir 为空（journal
 // 禁用）视同不存在。head 取自文件头行（kind=session），文件缺失时为零值。
+//
+// 本函数是**模型上下文回装口径**：只回 user/assistant 对话行（含 turn 行），
+// end 行不折系统条（includeEndNotes=false）——回装结果要进模型 prompt，
+// 「这一轮执行失败」的事实说明喂回去会污染续聊上下文。快照订阅读侧（展示面）
+// 走 readAgentCoreJournalTranscriptFrom(true)。
 func readAgentCoreJournalHistoryFrom(dir, sessionID string) ([]agentAIMessage, agentCoreJournalHead, error) {
+	return readAgentCoreJournalTranscriptFrom(dir, sessionID, false)
+}
+
+// readAgentCoreJournalTranscriptFrom journal 读侧共用解析器。includeEndNotes
+// 为 true 时（快照订阅展示面，agent_ai_sockets.go emitSessionSnapshot），
+// end(error) 行额外折成 role=system 的系统条进转录（G5 问题悬空修复）——
+// 失败回合在快照里悬空（有提问无任何反馈）是用户「为什么没有回答」的直接
+// 来源。系统条照常吃 agentAISnapshotTranscriptCap 限幅（失败信息值得占位，
+// 计划钉死）。false 时 end 行完全跳过（模型上下文回装口径）。
+func readAgentCoreJournalTranscriptFrom(dir, sessionID string, includeEndNotes bool) ([]agentAIMessage, agentCoreJournalHead, error) {
 	if dir == "" || sessionID == "" {
 		return nil, agentCoreJournalHead{}, os.ErrNotExist
 	}
@@ -92,6 +108,32 @@ func readAgentCoreJournalHistoryFrom(dir, sessionID string) ([]agentAIMessage, a
 				}
 			}
 			hist = append(hist, msg)
+		case "end":
+			// end(error) 行 → 系统条（G5 问题悬空修复，2026-11-05）：终态真因
+			// 人话化后以 role=system 下发，前端按既有系统条先例渲染居中弱化胶囊。
+			// 仅 error——success/stopped（正常完成/用户取消）不值得占位；无正文
+			// 的边缘形态（agentCoreEndNoteText 恒有主句，防御性守卫）跳过。
+			// 位置照 journal 文件序：失败插在它的提问之后、后续成功回合之前。
+			if !includeEndNotes {
+				continue
+			}
+			status, _ := row["status"].(string)
+			if !strings.EqualFold(strings.TrimSpace(status), "error") {
+				continue
+			}
+			errMsg, _ := row["error"].(string)
+			diag, _ := row["diagnostics"].(map[string]interface{})
+			note := agentCoreEndNoteText(errMsg, diag)
+			if note == "" {
+				continue
+			}
+			noteMsg := agentAIMessage{Role: "system", Content: note}
+			if ts, ok := row["ts"].(string); ok {
+				if t, err := time.Parse(time.RFC3339, ts); err == nil {
+					noteMsg.CreatedAt = t
+				}
+			}
+			hist = append(hist, noteMsg)
 		}
 	}
 	return hist, head, nil

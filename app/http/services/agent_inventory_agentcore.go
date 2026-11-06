@@ -34,7 +34,40 @@ func collectAgentCoreVibeSessions(scanDirs []string) []models.AgentVibeSession {
 		}
 		sessions = append(sessions, session)
 	}
+	applyAgentCoreRenameOverlay(sessions)
 	return sessions
+}
+
+// applyAgentCoreRenameOverlay 把 rename 缓存里按「会话 id」键落的用户改名
+// 覆盖到 agentcore 清单卡上（优先级:rename 缓存标题 > journal 首条消息标题）。
+// 与 claude 通道的 applyClaudeRenameNames 同构,但简单得多:agentcore 没有
+// pid 记录观察通道,写侧只有 phone origin 一条来路（handleRemoteAIRename 的
+// 别名键,G4 改名断链）。
+//
+// 必须放在 parse cache 之外:rename 不改 journal 文件的 (size,mtime),放缓存
+// 读取点之内会让改名永远命中旧摘要——claude 通道的覆盖层同样在组装末端。
+// 只认显式条目（agentRenameEntryExplicit:phone origin 恒显式）,derived/auto
+// 类标签不覆盖标题——与服务端 title_updated_at 守卫同一防线。
+func applyAgentCoreRenameOverlay(sessions []models.AgentVibeSession) {
+	if len(sessions) == 0 {
+		return
+	}
+	renameCache := loadAgentRenameCache()
+	if len(renameCache) == 0 {
+		return
+	}
+	for index := range sessions {
+		entry, ok := renameCache[sessions[index].ID]
+		if !ok || strings.TrimSpace(entry.Name) == "" || !agentRenameEntryExplicit(entry) {
+			continue
+		}
+		sessions[index].Title = truncateAgentText(entry.Name, 200)
+		if sessions[index].Summary == "" {
+			sessions[index].Summary = truncateAgentText(entry.Name, 500)
+		}
+		sessions[index].TitleUpdatedAt = entry.UpdatedAt
+		sessions[index].TitleSource = wireAgentRenameSource(entry)
+	}
 }
 
 // readAgentCoreVibeSummary 带解析缓存的摘要读取（同 readAgentVibeCodexSummary 模式）。
@@ -81,6 +114,9 @@ func readAgentCoreSessionMetaWithOptions(path string, options agentVibeSessionRe
 	// 恒等（向后兼容）。
 	toolCount := 0
 	turnCount := 0
+	// endNoteCount 给 end(error) 折出的系统条造稳定唯一 ID（end-%06d）；系统条
+	// 是轨迹性说明行,只进转录序不进对话计数(见 end case 注释)。
+	endNoteCount := 0
 	transcriptRow := 0
 	// parsedAny：是否有任何一行真正解析成功（session 头行被识别,或 msg 行
 	// 通过角色+内容校验）。整文件损坏时一行都不成立——文件名兜底会凭空造出
@@ -232,6 +268,29 @@ func readAgentCoreSessionMetaWithOptions(path string, options agentVibeSessionRe
 			if row.Error != "" || len(row.Diagnostics) > 0 {
 				session.Diagnostics = newAgentVibeDiagnosticsFromEndRow(row.Status, row.Error, row.Diagnostics)
 			}
+			// end(error) 行 → 系统条（G5 问题悬空修复，2026-11-05）：失败回合在
+			// 转录里悬空（有提问无任何反馈）是用户「为什么没有回答」的直接来源。
+			// 仅 error——success/stopped（正常完成/用户取消）不值得占位。无头行
+			// 文件（session.ID 解析期尚空）与 tool/turn 同款跳过：行无归属依据，
+			// 诊断 enrich 不受影响。计数照 tool 行口径：进转录序（Index 单调）但
+			// 不计 MessageCount/displayCount——系统条是轨迹性说明行，PhoneServer
+			// 入库边界本就按 role=system 过滤、消息数过滤宇宙亦排除它。
+			if !strings.EqualFold(strings.TrimSpace(row.Status), "error") || session.ID == "" {
+				break
+			}
+			note := agentCoreEndNoteText(row.Error, row.Diagnostics)
+			if note == "" {
+				break
+			}
+			endNoteCount++
+			transcriptRow++
+			window.add(models.AgentVibeMessage{
+				ID:        fmt.Sprintf("end-%06d", endNoteCount),
+				Role:      "system",
+				Content:   truncateAgentText(note, agentVibeTranscriptMaxContentRunes),
+				Timestamp: normalizeAgentTime(row.Ts),
+				Index:     transcriptRow - 1,
+			})
 		}
 		return true
 	})
@@ -264,6 +323,25 @@ func readAgentCoreSessionMetaWithOptions(path string, options agentVibeSessionRe
 		session.UpdatedAt = fileUpdatedAt(path)
 	}
 	return session
+}
+
+// agentCoreEndNoteText 把 journal end(error) 行折成用户可读的系统条文案（G5
+// 问题悬空修复）。供两层读侧共用：详情转录（本文件）与快照订阅
+// （agent_ai_journal_history.go）。内核终止真因（loop.go 守卫出口）与宿主
+// 错误文案（agentCoreEnsureUpstream 等）本身已是中文人话，直接缀在主句后；
+// 「agentcore run failed」是宿主侧的笼统兜底占位（真因丢失时才出现），不得
+// 进正文。diagnostics.reason（内核终态快照的真因键）优先于 error 键——宿主
+// 升级后两者常同文，天然去重；无 reason 时保留 error 原文兜底。
+func agentCoreEndNoteText(errMsg string, raw map[string]interface{}) string {
+	reason := ""
+	if v, ok := raw["reason"].(string); ok {
+		reason = strings.TrimSpace(v)
+	}
+	detail := firstNonEmpty(reason, strings.TrimSpace(errMsg))
+	if detail == "" || detail == "agentcore run failed" {
+		return "这一轮执行失败"
+	}
+	return "这一轮执行失败：" + detail
 }
 
 // newAgentVibeDiagnosticsFromEndRow 把 journal end 行的散字段折叠成诊断结构。

@@ -69,6 +69,64 @@ export function normalizeApprovalDecisions(values) {
   return out.length ? out : ['accept', 'decline', 'cancel'];
 }
 
+// 设备转录系统条气泡（G5 错误终态；纯函数，导出供单测，与上方审批归一纯函数
+// 同族）：server 读侧（agent_inventory_agentcore.go / agent_ai_journal_history.go）
+// 把 journal end(error) 行折成 role=system 的人话终态文案下发，前端镜像仓内
+// 系统条先例（审批取消/运行提示条：role:'assistant'+kind:'system'+note+
+// status:'done'）渲染为居中弱化胶囊。note='turn_failed' 供 testid 分流；文案
+// server 已人话化，原样展示。
+export function deviceSystemNoteBubble(content, ts) {
+  return { role: 'assistant', kind: 'system', note: 'turn_failed', content, status: 'done', ts };
+}
+
+// 详情转录行 → 壳气泡 + 喂入流（纯函数，导出供单测）。user/assistant 原样
+// 落气泡并进喂入；role=system 行（G5 错误终态系统条）**只落气泡、绝不进喂入**
+// ——deviceTranscript 是续聊的模型上下文，事实说明喂回去会污染；其余角色
+// （tool 轨迹等）跳过。
+export function deviceDetailTranscriptToMessages(rows, provider, fallbackTs) {
+  const list = Array.isArray(rows) ? rows : [];
+  const renderable = list.filter(m => m && (m.role === 'user' || m.role === 'assistant' || m.role === 'system')
+    && typeof m.content === 'string' && m.content);
+  return {
+    messages: renderable.map(m => m.role === 'system'
+      ? deviceSystemNoteBubble(m.content, Date.parse(m.timestamp) || fallbackTs)
+      : {
+        role: m.role,
+        content: m.content,
+        status: 'done',
+        // 撤回锚点接线（Task 13）：详情 wire 行的 id 即 journal message_id，落
+        // 气泡后可作 truncate_before_message_id；provider 落上（canRecall 依赖）。
+        messageId: m.id || '',
+        provider: provider || '',
+        ts: Date.parse(m.timestamp) || fallbackTs,
+      }),
+    feed: renderable.filter(m => m.role !== 'system').map(m => ({ role: m.role, content: m.content })),
+  };
+}
+
+// 快照转录行 → 壳气泡（纯函数，导出供单测；**仅展示流**）。字段名与详情不同
+// （快照用 text，详情用 content）。system 行同款落系统条（快照侧本就不写
+// deviceTranscript，无需喂入分离）。
+export function deviceSnapshotTranscriptToMessages(rows, provider, fallbackTs) {
+  const list = Array.isArray(rows) ? rows : [];
+  const renderable = list.filter(m => m && (m.role === 'user' || m.role === 'assistant' || m.role === 'system')
+    && typeof m.text === 'string' && m.text);
+  return {
+    messages: renderable.map(m => m.role === 'system'
+      ? deviceSystemNoteBubble(m.text, Date.parse(m.ts) || fallbackTs)
+      : {
+        role: m.role,
+        content: m.text,
+        status: 'done',
+        // 快照 id 系 journal 同源（spec §A 已修订），可作撤回锚点；内容仍绝不
+        // 喂入（deviceTranscript 专属流不变）。provider 落上（canRecall 依赖）。
+        messageId: m.message_id || '',
+        provider: provider || '',
+        ts: Date.parse(m.ts) || fallbackTs,
+      }),
+  };
+}
+
 export function useAliangChat() {
   const { t } = useI18n();
   const { showDashboard, chatProviderPreset } = useNavigation();
@@ -762,47 +820,24 @@ export function useAliangChat() {
 
   // --- 打开设备会话（跨端统一阶段 2，Task 3） ---
 
-  // 详情/快照转录 → 壳 messages（复用既有气泡渲染路径）。role 只认
-  // user/assistant，系统/工具行跳过；同时存壳 deviceTranscript（[{role,content}]
-  // 原始形态，Task 4 的 agentcore create transcript 喂入消费——后端
-  // remoteAgentAIHistory 按 row.role/row.content 解析）。
+  // 详情/快照转录 → 壳 messages（复用既有气泡渲染路径）；deviceTranscript
+  // （[{role,content}] 原始形态，Task 4 的 agentcore create transcript 喂入
+  // 消费——后端 remoteAgentAIHistory 按 row.role/row.content 解析）由
+  // deviceDetailTranscriptToMessages 的 feed 供给。
   function applyDeviceTranscript(shell, transcript) {
-    const rows = Array.isArray(transcript) ? transcript : [];
-    const renderable = rows.filter(m => m && (m.role === 'user' || m.role === 'assistant')
-      && typeof m.content === 'string' && m.content);
-    shell.messages = renderable.map(m => ({
-      role: m.role,
-      content: m.content,
-      status: 'done',
-      // 撤回锚点接线（Task 13）：详情 wire 行的 id 即 journal message_id，落
-      // 气泡后可作 truncate_before_message_id；provider 落上（canRecall 依赖）。
-      messageId: m.id || '',
-      provider: shell.provider || '',
-      ts: Date.parse(m.timestamp) || now(),
-    }));
-    shell.deviceTranscript = renderable.map(m => ({ role: m.role, content: m.content }));
+    const out = deviceDetailTranscriptToMessages(transcript, shell.provider || '', now());
+    shell.messages = out.messages;
+    shell.deviceTranscript = out.feed;
     scrollToBottom();
   }
 
-  // 快照转录行（{role,text,message_id?,ts?}）→ 壳 messages（**仅展示流**），
-  // 字段名与详情不同（快照用 text，详情用 content）。职责分离（阶段 2 评审
-  // 钉死）：快照是有损切片（200 行/4000 rune）且晚到会覆盖屏幕，但续聊喂入的
-  // deviceTranscript 必须保持详情分页拉全的版本——快照绝不写 deviceTranscript，
-  // 否则截断尾巴会在 create 时顶掉全量上下文（喂入即全部上下文）。
+  // 快照转录行（{role,text,message_id?,ts?}）→ 壳 messages（**仅展示流**）。
+  // 职责分离（阶段 2 评审钉死）：快照是有损切片（200 行/4000 rune）且晚到会
+  // 覆盖屏幕，但续聊喂入的 deviceTranscript 必须保持详情分页拉全的版本——快照
+  // 绝不写 deviceTranscript，否则截断尾巴会在 create 时顶掉全量上下文（喂入即
+  // 全部上下文）。
   function applyDeviceSnapshotTranscript(shell, rows) {
-    const list = Array.isArray(rows) ? rows : [];
-    const renderable = list.filter(m => m && (m.role === 'user' || m.role === 'assistant')
-      && typeof m.text === 'string' && m.text);
-    shell.messages = renderable.map(m => ({
-      role: m.role,
-      content: m.text,
-      status: 'done',
-      // 快照 id 系 journal 同源（spec §A 已修订），可作撤回锚点；内容仍绝不
-      // 喂入（deviceTranscript 专属流不变）。provider 落上（canRecall 依赖）。
-      messageId: m.message_id || '',
-      provider: shell.provider || '',
-      ts: Date.parse(m.ts) || now(),
-    }));
+    shell.messages = deviceSnapshotTranscriptToMessages(rows, shell.provider || '', now()).messages;
   }
 
   // 订阅判定（钉死）：仅 agentcore 且裸 conversation id（journal 源才有转录
