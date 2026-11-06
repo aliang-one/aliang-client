@@ -1312,3 +1312,25 @@ func TestRunAgentCoreReadOnlySkipsMCPInjection(t *testing.T) {
 		}
 	}
 }
+
+func TestAgentCoreMCPRawServersInIncludesRegistry(t *testing.T) {
+	home := t.TempDir()
+	// 遗留源与注册表同名:注册表胜
+	writeRegistryFile(t, home, `{"version":1,"servers":{
+	  "dup":{"command":"registry-cmd"},
+	  "blend":{"type":"stdio","command":"uvx","args":["blender-mcp"]}}}`)
+	claudeJSON := filepath.Join(home, ".claude.json")
+	_ = os.WriteFile(claudeJSON, []byte(`{"mcpServers":{"dup":{"command":"claude-cmd","args":["x"]}}}`), 0o600)
+
+	raws := agentCoreMCPRawServersIn(home)
+	byName := map[string]agentCoreMCPRawServer{}
+	for _, r := range raws {
+		byName[r.Name] = r
+	}
+	if byName["dup"].Command != "registry-cmd" {
+		t.Fatalf("注册表同名键必须覆盖遗留源, got %+v", byName["dup"])
+	}
+	if byName["blend"].Command != "uvx" || len(byName["blend"].Args) != 1 {
+		t.Fatalf("注册表 stdio 条目必须进采集: %+v", byName["blend"])
+	}
+}

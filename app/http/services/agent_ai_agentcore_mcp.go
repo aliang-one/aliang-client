@@ -100,6 +100,9 @@ func agentCoreMCPRawServersIn(home string) []agentCoreMCPRawServer {
 	for _, inst := range enabledUserScopePluginInstallsIn(home) {
 		readPluginMCPDeclaration(inst.installPath, inst.pluginName, raw)
 	}
+	// 统一注册表(~/.aliang/mcp.json):遗留源之后合并,同名键注册表胜出
+	// (enabled/畸形条目在读通道已跳过)。
+	readAliangMCPRegistryInto(home, raw)
 	keys := make([]string, 0, len(raw))
 	for k := range raw {
 		keys = append(keys, k)
