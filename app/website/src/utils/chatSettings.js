@@ -259,3 +259,24 @@ export function rememberLastUsedEffort(effort) {
     /* 同上 */
   }
 }
+
+// 侧栏双源去重（2026-11-06 侧栏双记录修复）：dashboard 发起的会话以
+// local-<convId>.jsonl 入 journal 三源扫描清单，与 localStorage 本地草稿
+// （aiSessionId='local-'+convId，同值）在侧栏各渲染一条——本地优先，丢被
+// 草稿遮蔽的壳。对齐键=aiSessionId；壳缺键（异常形态）或草稿未发送（无键）
+// 都不遮蔽，防误杀真实设备会话。
+export function dropShadowedDeviceShells(drafts, shells) {
+  const draftList = Array.isArray(drafts) ? drafts : [];
+  const shellList = Array.isArray(shells) ? shells : [];
+  const draftSessionIds = new Set(
+    draftList.map((c) => (c && typeof c.aiSessionId === 'string' ? c.aiSessionId : '')).filter(Boolean)
+  );
+  if (draftSessionIds.size === 0) return shellList;
+  return shellList.filter(
+    (shell) =>
+      !shell ||
+      typeof shell.aiSessionId !== 'string' ||
+      shell.aiSessionId === '' ||
+      !draftSessionIds.has(shell.aiSessionId)
+  );
+}

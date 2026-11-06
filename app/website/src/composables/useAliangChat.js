@@ -22,6 +22,7 @@ import {
   rememberLastUsedEffort,
   rememberLastUsedModel,
   sessionCreatePayload,
+  dropShadowedDeviceShells,
 } from '../utils/chatSettings';
 import {
   canRecall,
@@ -315,7 +316,11 @@ export function useAliangChat() {
     for (const shell of openedShells) {
       if (!listedIds.has(shell.deviceSession.id)) shells.push(shell);
     }
-    return [...drafts, ...shells];
+    // 侧栏双源去重（2026-11-06 侧栏双记录修复）：dashboard 会话的
+    // journal 壳 aiSessionId=local-<convId> 与本地草稿同值——本地优先
+    // 丢遮蔽壳，防「一条消息两条记录」（键缺失/未发送草稿不遮蔽）。
+    const visibleShells = dropShadowedDeviceShells(drafts, shells);
+    return [...drafts, ...visibleShells];
   });
 
   const conversationGroups = computed(() => [
