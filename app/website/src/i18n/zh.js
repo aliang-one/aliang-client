@@ -1240,6 +1240,8 @@ export default {
   agent_mcp_registry_headers: '请求头（每行 KEY: VALUE，仅 http/sse）',
   agent_mcp_registry_enabled: '启用',
   agent_mcp_registry_name_invalid: '名称仅允许字母/数字/下划线/连字符（≤64），且不能以 aliang- 开头',
+  agent_mcp_registry_command_required: '命令不能为空',
+  agent_mcp_registry_url_required: 'URL 不能为空',
   agent_mcp_registry_delete_confirm: '删除后将从所有内核移除（Codex 托管块同步删除）。确定删除「{name}」？',
   agent_mcp_registry_codex_sync_failed: '注册表已保存，但 Codex 配置同步失败：{error}（修复 config.toml 表头后重启 agent 会自动补齐）',
   agent_mcp_registry_empty: '尚无自管 MCP 服务器',

@@ -288,13 +288,14 @@ export default {
       const servers = this.servers && typeof this.servers === 'object' ? this.servers : {};
       return Object.entries(servers).map(([name, entry]) => {
         const safeEntry = entry && typeof entry === 'object' ? entry : {};
+        const { label, warn } = this.sourceInfo(name);
         return {
           name,
           entry: safeEntry,
           enabled: safeEntry.enabled !== false,
           endpoint: this.endpointLabel(safeEntry),
-          sourceLabel: this.sourceInfo(name).label,
-          sourceWarn: this.sourceInfo(name).warn,
+          sourceLabel: label,
+          sourceWarn: warn,
         };
       });
     },
@@ -369,7 +370,8 @@ export default {
       this.editingName = null;
       this.formError = '';
     },
-    // 客户端校验失败不发请求（镜像服务端 400 规则，提示统一走 name_invalid）。
+    // 客户端校验失败不发请求（镜像服务端 400 规则）；文案按字段分开报，
+    // 名称规则/必填命令/必填 URL 各用各的键，避免「名字没错却报名称错」。
     validateForm() {
       const name = String(this.form.name || '');
       if (!NAME_RE.test(name) || name.startsWith('aliang-')) {
@@ -377,11 +379,11 @@ export default {
         return false;
       }
       if (this.form.type === 'stdio' && !String(this.form.command || '').trim()) {
-        this.formError = this.t('agent_mcp_registry_name_invalid');
+        this.formError = this.t('agent_mcp_registry_command_required');
         return false;
       }
       if (this.form.type !== 'stdio' && !String(this.form.url || '').trim()) {
-        this.formError = this.t('agent_mcp_registry_name_invalid');
+        this.formError = this.t('agent_mcp_registry_url_required');
         return false;
       }
       return true;

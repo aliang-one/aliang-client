@@ -1237,6 +1237,8 @@ export default {
   agent_mcp_registry_headers: 'Headers (one KEY: VALUE per line, http/sse only)',
   agent_mcp_registry_enabled: 'Enabled',
   agent_mcp_registry_name_invalid: 'Name allows only letters/digits/underscores/hyphens (max 64) and must not start with aliang-',
+  agent_mcp_registry_command_required: 'Command is required',
+  agent_mcp_registry_url_required: 'URL is required',
   agent_mcp_registry_delete_confirm: 'Deleting removes it from all kernels (the Codex managed block is deleted too). Delete "{name}"?',
   agent_mcp_registry_codex_sync_failed: 'Registry saved, but Codex config sync failed: {error} (fix the config.toml header and restart the agent to re-sync automatically)',
   agent_mcp_registry_empty: 'No self-managed MCP servers yet',

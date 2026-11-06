@@ -2,7 +2,7 @@
 // @vue/test-utils，PeerAccessSettings.test.js 同范式）；i18n 与 agentApi 必须
 // mock：前者避免 locale 依赖，后者阻止 mounted 的真实网络请求。
 // 断言走 i18n 键名（mock t 原样回键），不硬编码文案。
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../../i18n', () => ({
   // 键原样回吐，参数值尾随拼接：让 delete_confirm 这类插值文案的
@@ -17,7 +17,10 @@ vi.mock('../../services/agentApi', () => ({
 }));
 
 import { createApp, h } from 'vue';
-import AgentMCPRegistrySettings from './AgentMCPRegistrySettings.vue';
+import AgentMCPRegistrySettings, {
+  formatKeyValueLines,
+  parseKeyValueLines,
+} from './AgentMCPRegistrySettings.vue';
 import {
   deleteAliangMCPServer,
   getAgentIntegrations,
@@ -64,6 +67,11 @@ describe('AgentMCPRegistrySettings MCP 注册表管理卡', () => {
     getAgentIntegrations.mockResolvedValue({ mcp_servers: [] });
     putAliangMCPServer.mockResolvedValue({ codex_sync: { ok: true } });
     deleteAliangMCPServer.mockResolvedValue({ codex_sync: { ok: true } });
+  });
+
+  // confirm spy 等 spyOn 统一还原，防跨用例泄漏（beforeEach 会重设 agentApi 实现）。
+  afterEach(() => {
+    vi.restoreAllMocks();
   });
 
   it('挂载后渲染注册表行（名称/类型/入口）', async () => {
@@ -122,6 +130,25 @@ describe('AgentMCPRegistrySettings MCP 注册表管理卡', () => {
     confirmSpy.mockRestore();
   });
 
+  it('删除 404（条目已不存在）按良性处理：无错误文案且照常重拉', async () => {
+    // request 封装对 404 抛泛型 Error（无 status、消息形如 "Request failed with HTTP 404"）
+    deleteAliangMCPServer.mockRejectedValue(new Error('Request failed with HTTP 404'));
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    const el = mountComp();
+    await flush();
+    const regBefore = getAliangMCPRegistry.mock.calls.length;
+    const integBefore = getAgentIntegrations.mock.calls.length;
+    buttonByText(el, 'agent_mcp_registry_delete').click();
+    await flush();
+    expect(deleteAliangMCPServer).toHaveBeenCalledWith('demo');
+    // 良性：不出现保存失败/加载失败文案
+    expect(el.textContent).not.toContain('agent_mcp_registry_save_failed');
+    expect(el.textContent).not.toContain('agent_integrations_loadFailed');
+    // 仍按「条目已不存在」刷新：两 API 调用数都增加
+    expect(getAliangMCPRegistry.mock.calls.length).toBeGreaterThan(regBefore);
+    expect(getAgentIntegrations.mock.calls.length).toBeGreaterThan(integBefore);
+  });
+
   it('codex_sync.ok=false 响应显示同步失败文案', async () => {
     putAliangMCPServer.mockResolvedValue({ codex_sync: { ok: false, error: 'config.toml header broken' } });
     const el = mountComp();
@@ -159,5 +186,42 @@ describe('AgentMCPRegistrySettings MCP 注册表管理卡', () => {
     }));
     expect(getAliangMCPRegistry.mock.calls.length).toBeGreaterThanOrEqual(2);
     expect(getAgentIntegrations.mock.calls.length).toBeGreaterThanOrEqual(2);
+  });
+});
+
+// 导出纯函数直测（对照 AgentIntegrationsSettings.vue 的 paginateItems 先例）。
+describe('parseKeyValueLines / formatKeyValueLines 多行键值解析', () => {
+  it('按首个分隔符拆分，值含分隔符不误伤（headers 冒号 URL 场景）', () => {
+    expect(parseKeyValueLines('X-Endpoint: https://a.com', ':')).toEqual({ 'X-Endpoint': 'https://a.com' });
+    expect(parseKeyValueLines('URL=https://a.com?x=1', '=')).toEqual({ URL: 'https://a.com?x=1' });
+  });
+
+  it('重复键后写优先', () => {
+    expect(parseKeyValueLines('A=1\nA=2', '=')).toEqual({ A: '2' });
+    expect(parseKeyValueLines('K: v1\nK: v2', ':')).toEqual({ K: 'v2' });
+  });
+
+  it('无分隔符行跳过', () => {
+    expect(parseKeyValueLines('NOSEP\nA=1', '=')).toEqual({ A: '1' });
+    expect(parseKeyValueLines('NOSEP', ':')).toEqual({});
+  });
+
+  it('空键行跳过', () => {
+    expect(parseKeyValueLines('=value', '=')).toEqual({});
+    expect(parseKeyValueLines('  : value', ':')).toEqual({});
+  });
+
+  it('空输入/非对象输入安全返回空', () => {
+    expect(parseKeyValueLines('', '=')).toEqual({});
+    expect(parseKeyValueLines(null, '=')).toEqual({});
+    expect(formatKeyValueLines(null, '=')).toBe('');
+    expect(formatKeyValueLines(undefined, ': ')).toBe('');
+  });
+
+  it('往返一致：parse → format 还原规范形文本', () => {
+    const envText = 'A=1\nB=https://x.example/p?q=2';
+    expect(formatKeyValueLines(parseKeyValueLines(envText, '='), '=')).toBe(envText);
+    const headerText = 'X-Endpoint: https://a.com\nAuthorization: Bearer t0k3n';
+    expect(formatKeyValueLines(parseKeyValueLines(headerText, ':'), ': ')).toBe(headerText);
   });
 });
