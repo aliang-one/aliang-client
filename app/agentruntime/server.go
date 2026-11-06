@@ -91,6 +91,8 @@ func StartLocalServer() error {
 	// 注册且 command 最新;关=确保注销)。只 Warn 不阻断启动;应用细节见
 	// services.EnsurePeerMCPMatchesConfig。
 	services.EnsurePeerMCPMatchesConfig()
+	// 统一 MCP 注册表 codex 托管块自愈(同 peer 自愈纪律:只 Warn 不阻断)。
+	services.EnsureAliangMCPCodexMatchesRegistry()
 	logger.Info("[AGENT-BOOT] local_server awaiting session owner sync")
 	return nil
 }

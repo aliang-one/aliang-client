@@ -444,3 +444,17 @@ func TestCodexSyncRefusesWhenSpliceWouldCorrupt(t *testing.T) {
 		t.Fatalf("拒写时原文件必须字节零改动:\nbefore=%s\nafter=%s", before, after)
 	}
 }
+
+func TestEnsureAliangMCPCodexMatchesRegistry(t *testing.T) {
+	home := t.TempDir()
+	// 注册表有条目 + codex 块缺失 → 自愈补齐,不 panic 不返回错误
+	_ = upsertAliangMCPServerForTest(home, "a", aliangMCPServerEntry{Command: "x"})
+	EnsureAliangMCPCodexMatchesRegistryForTest(home)
+	out := readCodexConfigRaw(t, home)
+	if !strings.Contains(out, "aliang-mcp-a") {
+		t.Fatalf("自愈必须补齐托管块: %s", out)
+	}
+	// 非规范表头场景:拒写只 Warn 不抛(自愈永不阻断启动)
+	writeCodexConfig(t, home, "[mcp_servers.\"aliang-mcp-a\"]\ncommand = \"old\"\n")
+	EnsureAliangMCPCodexMatchesRegistryForTest(home) // 不 panic 即通过
+}

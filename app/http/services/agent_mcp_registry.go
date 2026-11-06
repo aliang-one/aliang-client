@@ -513,3 +513,21 @@ func applyAliangMCPCodexSyncForTest(home string) error {
 	}
 	return writePeerMCPFileAtomic(path, []byte(content))
 }
+
+// EnsureAliangMCPCodexMatchesRegistryForTest 是 home 可注入的自愈本体:
+// 纠正「注册表已写但 codex 拼块被拒后用户已手工修复」与「用户手删托管块」
+// 的漂移。只 Warn 不返回错误——自愈永不阻断启动。
+func EnsureAliangMCPCodexMatchesRegistryForTest(home string) {
+	if home == "" {
+		logger.Warn("aliang-mcp: startup codex sync skipped, agent home unavailable")
+		return
+	}
+	if err := applyAliangMCPCodexSyncForTest(home); err != nil {
+		logger.Warn(fmt.Sprintf("aliang-mcp: startup codex sync failed (注册表不受影响,修复 config.toml 后下次启动补齐): %v", err))
+	}
+}
+
+// EnsureAliangMCPCodexMatchesRegistry 生产入口(agentHome 注入)。
+func EnsureAliangMCPCodexMatchesRegistry() {
+	EnsureAliangMCPCodexMatchesRegistryForTest(agentHome())
+}
