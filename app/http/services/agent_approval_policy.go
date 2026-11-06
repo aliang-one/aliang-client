@@ -369,6 +369,67 @@ func remoteApprovalPolicyHash(msg, device map[string]interface{}) string {
 // docs/superpowers/specs/2026-06-22-project-scoped-approval-policy-design.md.
 
 // policyDecision is the outcome of evaluating a policy rule (or the default).
+// 会话级审批模式词表(spec 2026-11-05):空=策略默认;ask_all=每次询问;
+// bypass_all=放过所有。非法值一律归一为空。
+const (
+	agentAIApprovalModeAskAll    = "ask_all"
+	agentAIApprovalModeBypassAll = "bypass_all"
+)
+
+// parseAgentAIApprovalMode 解析载荷里的 approval_mode:第二个返回值区分
+// 「键缺失」(preserve,不动既有模式——老客户端不带键的 F2 纪律)与「带键」
+// (含显式空串=默认推荐,合法)。
+func parseAgentAIApprovalMode(msg map[string]interface{}) (string, bool) {
+	if msg == nil {
+		return "", false
+	}
+	raw, ok := msg["approval_mode"]
+	if !ok {
+		return "", false
+	}
+	str, _ := raw.(string)
+	return normalizeAgentAIApprovalMode(str), true
+}
+
+func normalizeAgentAIApprovalMode(raw string) string {
+	switch raw {
+	case agentAIApprovalModeAskAll:
+		return agentAIApprovalModeAskAll
+	case agentAIApprovalModeBypassAll:
+		return agentAIApprovalModeBypassAll
+	default:
+		return ""
+	}
+}
+
+// applyApprovalModeOverride 会话级审批模式对策略决策的覆盖(三内核共用):
+//   - bypass_all: require 降级为本地放行(跳手机云端往返);auto_deny 是安全
+//     护栏,恒不越过。会话批准记忆在 bypass 下无意义(反正放行),调用方跳过。
+//   - ask_all: auto_approve 降级为 require(每次问);auto_deny 恒拒。会话
+//     批准记忆同样跳过——用户显式要求每次问,不再吃 accept_for_session。
+//   - 空:现状。
+func applyApprovalModeOverride(mode string, decision policyDecision) policyDecision {
+	switch mode {
+	case agentAIApprovalModeBypassAll:
+		if decision == decisionRequireApproval {
+			return decisionAutoApprove
+		}
+		return decision
+	case agentAIApprovalModeAskAll:
+		if decision == decisionAutoApprove {
+			return decisionRequireApproval
+		}
+		return decision
+	default:
+		return decision
+	}
+}
+
+// approvalModeSkipsSessionMemory 该模式下跳过会话批准记忆检查点。
+func approvalModeSkipsSessionMemory(mode string) bool {
+	return mode == agentAIApprovalModeAskAll || mode == agentAIApprovalModeBypassAll
+}
+
 type policyDecision string
 
 const (

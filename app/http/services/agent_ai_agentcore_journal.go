@@ -74,7 +74,9 @@ func agentCoreJournalFileName(sessionID string) string {
 // 时创建；存在但无头行（steer 先于 run 的历史竞态，spec §4.3）时整体重写
 // 补头——读全量、写 头行+原内容、原子 rename。文件体量有界（消息+截断
 // 工具行），重写代价可接受。幂等：已有头行直接返回。顺带触发 prune（锁内）。
-func (j *agentCoreJournal) ensureSessionHeader(sessionID, projectPath, model, effort, createdAt, origin string, disabledMCP, disabledSkills []string) {
+// approvalMode 会话级审批模式(2026-11-05,空=默认):头行持久化 + 读侧回填,
+// 与 model/effort 同族;显式改键走 syncSessionApprovalMode(幂等头行不重写)。
+func (j *agentCoreJournal) ensureSessionHeader(sessionID, projectPath, model, effort, createdAt, origin string, disabledMCP, disabledSkills []string, approvalMode string) {
 	if j == nil || j.dir == "" || strings.TrimSpace(sessionID) == "" {
 		return
 	}
@@ -85,7 +87,7 @@ func (j *agentCoreJournal) ensureSessionHeader(sessionID, projectPath, model, ef
 		if j.hasSessionHeaderLocked(path) {
 			return
 		}
-		j.prependHeaderLocked(path, sessionID, projectPath, model, effort, createdAt, origin, disabledMCP, disabledSkills)
+		j.prependHeaderLocked(path, sessionID, projectPath, model, effort, createdAt, origin, disabledMCP, disabledSkills, approvalMode)
 		return
 	}
 	if err := os.MkdirAll(j.dir, 0o700); err != nil {
@@ -93,7 +95,7 @@ func (j *agentCoreJournal) ensureSessionHeader(sessionID, projectPath, model, ef
 		return
 	}
 	j.dirReady = true
-	line := j.sessionHeaderLine(sessionID, projectPath, model, effort, createdAt, origin, disabledMCP, disabledSkills)
+	line := j.sessionHeaderLine(sessionID, projectPath, model, effort, createdAt, origin, disabledMCP, disabledSkills, approvalMode)
 	if line == nil {
 		logger.Warn(fmt.Sprintf("agentcore-journal: header marshal failed session=%s", sessionID))
 		return
@@ -111,15 +113,16 @@ func (j *agentCoreJournal) ensureSessionHeader(sessionID, projectPath, model, ef
 // 开关名单只在非 nil 时写键（nil=未设置，读侧容忍缺键）——首建头行就带上
 // 当前名单（2026-10-31 评审 F1：create 先于首个 run 设的键，不能等首个 run
 // 之后的显式同步才落盘，否则重启即丢）。
-func (j *agentCoreJournal) sessionHeaderLine(sessionID, projectPath, model, effort, createdAt, origin string, disabledMCP, disabledSkills []string) []byte {
+func (j *agentCoreJournal) sessionHeaderLine(sessionID, projectPath, model, effort, createdAt, origin string, disabledMCP, disabledSkills []string, approvalMode string) []byte {
 	header := map[string]interface{}{
-		"kind":         "session",
-		"session_id":   sessionID,
-		"project_path": projectPath,
-		"model":        model,
-		"effort":       effort,
-		"created_at":   createdAt,
-		"origin":       origin,
+		"kind":          "session",
+		"session_id":    sessionID,
+		"project_path":  projectPath,
+		"model":         model,
+		"effort":        effort,
+		"approval_mode": approvalMode,
+		"created_at":    createdAt,
+		"origin":        origin,
 	}
 	if disabledMCP != nil {
 		header["disabled_mcp_servers"] = append([]string{}, disabledMCP...)
@@ -216,6 +219,50 @@ func (j *agentCoreJournal) syncSessionSwitches(sessionID string, disabledMCP []s
 	}
 }
 
+// syncSessionApprovalMode 把会话级审批模式同步进 journal 头行(显式改键点
+// 调用:ai.session.create/apply 里键存在时;缺键绝不调用——preserve 纪律,
+// 防老客户端把持久化模式冲成默认)。空串=默认推荐,合法值照写。
+func (j *agentCoreJournal) syncSessionApprovalMode(sessionID, approvalMode string, set bool) {
+	if j == nil || j.dir == "" || strings.TrimSpace(sessionID) == "" || !set {
+		return
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	path := filepath.Join(j.dir, agentCoreJournalFileName(sessionID))
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	nl := bytes.IndexByte(data, '\n')
+	if nl < 0 {
+		return
+	}
+	var head map[string]interface{}
+	if json.Unmarshal(data[:nl], &head) != nil || head["kind"] != "session" {
+		return
+	}
+	if stored, _ := head["approval_mode"].(string); stored == approvalMode {
+		return
+	}
+	head["approval_mode"] = approvalMode
+	line, err := jsonMarshalLine(head)
+	if err != nil {
+		return
+	}
+	tmp := path + ".tmp"
+	buf := append([]byte{}, line...)
+	buf = append(buf, data[nl+1:]...)
+	if err := os.WriteFile(tmp, buf, 0o600); err != nil {
+		logger.Warn(fmt.Sprintf("agentcore-journal: header approval_mode write failed session=%s err=%v", sessionID, err))
+		return
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		logger.Warn(fmt.Sprintf("agentcore-journal: header approval_mode rename failed session=%s err=%v", sessionID, err))
+		_ = os.Remove(tmp)
+		return
+	}
+}
+
 // headerSwitchesEqual 判断头行已存的开关名单与会话当前值是否一致。缺键与
 // 空数组等价（都=未关任何项）；非字符串元素按缺失计（旧文件/畸形容忍）。
 func headerSwitchesEqual(stored interface{}, list []string) bool {
@@ -249,8 +296,8 @@ func applyHeaderSwitches(head map[string]interface{}, key string, list []string)
 // prependHeaderLocked 整体重写补头：tmp 文件写 头行+原内容，rename 原子替换。
 // 在 j.mu 锁内做全量读+写+rename——journal 文件有界（消息+截断工具行），
 // 重写代价可接受；与 appendLineLocked 同锁互斥，无并发写坏。调用方必须持有 j.mu。
-func (j *agentCoreJournal) prependHeaderLocked(path, sessionID, projectPath, model, effort, createdAt, origin string, disabledMCP, disabledSkills []string) {
-	head := j.sessionHeaderLine(sessionID, projectPath, model, effort, createdAt, origin, disabledMCP, disabledSkills)
+func (j *agentCoreJournal) prependHeaderLocked(path, sessionID, projectPath, model, effort, createdAt, origin string, disabledMCP, disabledSkills []string, approvalMode string) {
+	head := j.sessionHeaderLine(sessionID, projectPath, model, effort, createdAt, origin, disabledMCP, disabledSkills, approvalMode)
 	if head == nil {
 		return
 	}

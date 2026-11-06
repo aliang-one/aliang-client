@@ -1,5 +1,7 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import {
+  APPROVAL_MODES,
+  normalizeApprovalMode,
   AGENTCORE_MODEL_OPTIONS,
   EFFORT_OPTIONS,
   LAST_USED_EFFORT_KEY,
@@ -83,12 +85,23 @@ describe('sessionCreatePayload', () => {
       mode: 'vibe',
       model: '',
       effort: '',
+      approval_mode: '',
     });
   });
 
   it('透传非空值与自定义模型/effort', () => {
     const conv = { aiSessionId: 's2', projectPath: '/w', provider: 'agentcore', model: 'my-model', effort: 'xhigh' };
     expect(sessionCreatePayload(conv)).toMatchObject({ project_path: '/w', provider: 'agentcore', model: 'my-model', effort: 'xhigh' });
+  });
+
+  it('审批模式:词表封闭归一,payload 恒带键(显式空=默认)', () => {
+    expect(APPROVAL_MODES.map((o) => o.value)).toEqual(['', 'ask_all', 'bypass_all']);
+    expect(normalizeApprovalMode('bypass_all')).toBe('bypass_all');
+    expect(normalizeApprovalMode('ask_all')).toBe('ask_all');
+    expect(normalizeApprovalMode('yolo')).toBe('');
+    expect(normalizeApprovalMode(undefined)).toBe('');
+    expect(sessionCreatePayload({ aiSessionId: 's1', approvalMode: 'ask_all' }).approval_mode).toBe('ask_all');
+    expect(sessionCreatePayload({ aiSessionId: 's1', approvalMode: 'yolo' }).approval_mode).toBe('');
   });
 
   it('输出预算只在显式设置时出现；未设置时整个键不出现（协议漂移守卫）', () => {

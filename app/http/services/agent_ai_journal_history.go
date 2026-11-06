@@ -24,6 +24,8 @@ type agentCoreJournalHead struct {
 	// 全部启用）；懒建恢复时载荷没带键就用它兜底，避免重启后静默回滚。
 	disabledMCPServers []string
 	disabledSkills     []string
+	// approvalMode:会话级审批模式持久化值(2026-11-05)。缺键=空(默认)。
+	approvalMode string
 }
 
 // readAgentCoreJournalHistory 便捷包装：扫默认 journal 根。
@@ -55,6 +57,7 @@ func readAgentCoreJournalHistoryFrom(dir, sessionID string) ([]agentAIMessage, a
 			head.projectPath, _ = row["project_path"].(string)
 			head.model, _ = row["model"].(string)
 			head.origin, _ = row["origin"].(string)
+			head.approvalMode, _ = row["approval_mode"].(string)
 			head.disabledMCPServers = headerStringList(row["disabled_mcp_servers"])
 			head.disabledSkills = headerStringList(row["disabled_skills"])
 		case "msg":

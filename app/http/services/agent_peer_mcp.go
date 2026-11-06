@@ -599,7 +599,7 @@ func PeerMCPContractSpecs() []PeerMCPContractSpec {
 		},
 		{
 			CoreName: "peer.device_list", StdioName: "device_list",
-			Keywords: []string{"peer exec is enabled"},
+			Keywords: []string{"peer exec is enabled", "Call this FIRST"},
 		},
 		{
 			CoreName: "peer.device_info", StdioName: "device_info",

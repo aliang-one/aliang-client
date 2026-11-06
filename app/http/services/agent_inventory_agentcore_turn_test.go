@@ -20,7 +20,7 @@ import (
 func TestAgentCoreInventoryReaderTurnRowsReplay(t *testing.T) {
 	dir := t.TempDir()
 	j := newAgentCoreJournal(dir)
-	j.ensureSessionHeader("conv-turn", "/tmp/proj-turn", "glm-5.2", "", "2026-10-30T08:27:27Z", "phone", nil, nil)
+	j.ensureSessionHeader("conv-turn", "/tmp/proj-turn", "glm-5.2", "", "2026-10-30T08:27:27Z", "phone", nil, nil, "")
 	j.appendUser("conv-turn", "msg-1", "我们不是已经有了每一个设备上边的基础信息", "2026-10-30T08:27:27Z")
 	// 回合1:有正文+思考(应回放)
 	j.appendAssistantTurn("conv-turn", 1, "我先看一下设备信息的现有实现。", "用户想展示设备基础信息,先找相关代码。", "tool_use", []string{"Bash", "peer_device_info"})

@@ -16,7 +16,7 @@ import (
 func TestSyncSessionSwitchesPersistsAndRestores(t *testing.T) {
 	j := newAgentCoreJournal(t.TempDir())
 	now := time.Now().UTC().Format(time.RFC3339)
-	j.ensureSessionHeader("s-sw", "/proj", "glm-5.3", "", now, "phone", nil, nil)
+	j.ensureSessionHeader("s-sw", "/proj", "glm-5.3", "", now, "phone", nil, nil, "")
 	j.appendUser("s-sw", "m1", "第一问", now)
 
 	// 落盘 + 读回
@@ -66,7 +66,7 @@ func TestSyncSessionSwitchesPersistsAndRestores(t *testing.T) {
 func TestJournalHeadSwitchesAbsentInLegacyHeader(t *testing.T) {
 	j := newAgentCoreJournal(t.TempDir())
 	now := time.Now().UTC().Format(time.RFC3339)
-	j.ensureSessionHeader("s-legacy", "/proj", "", "", now, "phone", nil, nil)
+	j.ensureSessionHeader("s-legacy", "/proj", "", "", now, "phone", nil, nil, "")
 	_, head, err := readAgentCoreJournalHistoryFrom(j.dir, "s-legacy")
 	if err != nil {
 		t.Fatalf("read journal: %v", err)
@@ -81,7 +81,7 @@ func TestJournalHeadSwitchesAbsentInLegacyHeader(t *testing.T) {
 func TestEnsureSessionHeaderBornWithSwitches(t *testing.T) {
 	j := newAgentCoreJournal(t.TempDir())
 	now := time.Now().UTC().Format(time.RFC3339)
-	j.ensureSessionHeader("s-f1", "/proj", "glm-5.3", "", now, "phone", []string{"github"}, nil)
+	j.ensureSessionHeader("s-f1", "/proj", "glm-5.3", "", now, "phone", []string{"github"}, nil, "")
 	_, head, err := readAgentCoreJournalHistoryFrom(j.dir, "s-f1")
 	if err != nil {
 		t.Fatalf("read journal: %v", err)
@@ -100,7 +100,7 @@ func TestEnsureSessionHeaderBornWithSwitches(t *testing.T) {
 func TestSyncSessionSwitchesPreservesUnsetSide(t *testing.T) {
 	j := newAgentCoreJournal(t.TempDir())
 	now := time.Now().UTC().Format(time.RFC3339)
-	j.ensureSessionHeader("s-f2", "/proj", "glm-5.3", "", now, "phone", nil, nil)
+	j.ensureSessionHeader("s-f2", "/proj", "glm-5.3", "", now, "phone", nil, nil, "")
 	j.syncSessionSwitches("s-f2", nil, true, []string{"pdf"}, true)
 
 	// 只带 mcp 键：skills 侧持久值必须原样保留（哪怕调用方传的内存值是 nil）

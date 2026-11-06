@@ -190,6 +190,7 @@ type AgentVibeSession struct {
 	// 空串表示「未设置/未下发」。前端会话设置条据此回填真实档位，而不是永远
 	// 显示「默认」——设备会话续聊时若看不到真实档位，用户无法判断该不该重设。
 	Effort         string                   `json:"effort,omitempty"`
+	ApprovalMode   string                   `json:"approval_mode,omitempty"`
 	Transcript     []AgentVibeMessage       `json:"transcript,omitempty"`
 	TranscriptPage *AgentVibeTranscriptPage `json:"transcript_page,omitempty"`
 	CreatedAt      string                   `json:"created_at,omitempty"`

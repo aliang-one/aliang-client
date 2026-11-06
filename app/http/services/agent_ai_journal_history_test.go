@@ -41,7 +41,7 @@ func agentCoreMessageText(msg agentcore.Message) string {
 func TestReadAgentCoreJournalHistory(t *testing.T) {
 	dir := t.TempDir()
 	j := newAgentCoreJournal(dir)
-	j.ensureSessionHeader("s-hist", "/proj", "glm-5.3", "", "2026-10-28T00:00:00Z", "phone", nil, nil)
+	j.ensureSessionHeader("s-hist", "/proj", "glm-5.3", "", "2026-10-28T00:00:00Z", "phone", nil, nil, "")
 	j.appendUser("s-hist", "m1", "第一问", "2026-10-28T00:01:00Z")
 	j.appendAssistant("s-hist", "a1", "第一答", "2026-10-28T00:02:00Z")
 	j.appendTool("s-hist", "Bash", "ls", false) // 工具行：轨迹不是消息，解析器必须跳过
@@ -108,7 +108,7 @@ func TestReadAgentCoreJournalHistoryFromMissing(t *testing.T) {
 func TestReadAgentCoreJournalHistoryIgnoresApprovalRows(t *testing.T) {
 	dir := t.TempDir()
 	j := newAgentCoreJournal(dir)
-	j.ensureSessionHeader("s-ap", "/proj", "glm-5.3", "", "2026-10-28T00:00:00Z", "phone", nil, nil)
+	j.ensureSessionHeader("s-ap", "/proj", "glm-5.3", "", "2026-10-28T00:00:00Z", "phone", nil, nil, "")
 	j.appendUser("s-ap", "m1", "第一问", "2026-10-28T00:01:00Z")
 	j.appendApprovalAudit("s-ap", "ap-1", 1, "decline")
 	j.appendAssistant("s-ap", "a1", "第一答", "2026-10-28T00:02:00Z")
@@ -136,7 +136,7 @@ func TestMessageLazyCreateRestoresJournalHistory(t *testing.T) {
 	m := newAgentAIManager()
 	m.coreJournal = newAgentCoreJournal(journalDir)
 	now := time.Now().UTC().Format(time.RFC3339)
-	m.coreJournal.ensureSessionHeader("s-restore", "/proj", "glm-5.3", "", now, "phone", nil, nil)
+	m.coreJournal.ensureSessionHeader("s-restore", "/proj", "glm-5.3", "", now, "phone", nil, nil, "")
 	m.coreJournal.appendUser("s-restore", "m1", "第一问", now)
 	m.coreJournal.appendAssistant("s-restore", "a1", "第一答", now)
 
@@ -310,7 +310,7 @@ func TestMessageLazyCreateRestoresSessionSwitches(t *testing.T) {
 	m := newAgentAIManager()
 	m.coreJournal = newAgentCoreJournal(journalDir)
 	now := time.Now().UTC().Format(time.RFC3339)
-	m.coreJournal.ensureSessionHeader("s-sw-restore", "/proj", "glm-5.3", "", now, "phone", nil, nil)
+	m.coreJournal.ensureSessionHeader("s-sw-restore", "/proj", "glm-5.3", "", now, "phone", nil, nil, "")
 	m.coreJournal.appendUser("s-sw-restore", "m1", "第一问", now)
 	m.coreJournal.appendAssistant("s-sw-restore", "a1", "第一答", now)
 	m.coreJournal.syncSessionSwitches("s-sw-restore", []string{"github"}, true, []string{"pdf"}, true)
@@ -368,7 +368,7 @@ func TestMessageLazyCreateSwitchesPayloadOverridesHead(t *testing.T) {
 	m := newAgentAIManager()
 	m.coreJournal = newAgentCoreJournal(journalDir)
 	now := time.Now().UTC().Format(time.RFC3339)
-	m.coreJournal.ensureSessionHeader("s-sw-payload", "/proj", "glm-5.3", "", now, "phone", nil, nil)
+	m.coreJournal.ensureSessionHeader("s-sw-payload", "/proj", "glm-5.3", "", now, "phone", nil, nil, "")
 	m.coreJournal.appendUser("s-sw-payload", "m1", "第一问", now)
 	m.coreJournal.appendAssistant("s-sw-payload", "a1", "第一答", now)
 	m.coreJournal.syncSessionSwitches("s-sw-payload", []string{"github"}, true, nil, true)
@@ -425,7 +425,7 @@ func TestMessageLazyCreateWithTranscriptStillHydratesSwitches(t *testing.T) {
 	m := newAgentAIManager()
 	m.coreJournal = newAgentCoreJournal(journalDir)
 	now := time.Now().UTC().Format(time.RFC3339)
-	m.coreJournal.ensureSessionHeader("s-sw-tx", "/proj", "glm-5.3", "", now, "phone", nil, nil)
+	m.coreJournal.ensureSessionHeader("s-sw-tx", "/proj", "glm-5.3", "", now, "phone", nil, nil, "")
 	m.coreJournal.appendUser("s-sw-tx", "m1", "第一问", now)
 	m.coreJournal.appendAssistant("s-sw-tx", "a1", "第一答", now)
 	m.coreJournal.syncSessionSwitches("s-sw-tx", []string{"github"}, true, []string{"pdf"}, true)
@@ -494,7 +494,7 @@ func TestCreateBackfillsSiblingFromHeader(t *testing.T) {
 	m := newAgentAIManager()
 	m.coreJournal = newAgentCoreJournal(journalDir)
 	now := time.Now().UTC().Format(time.RFC3339)
-	m.coreJournal.ensureSessionHeader("s-f3", "/proj", "glm-5.3", "", now, "phone", nil, []string{"pdf"})
+	m.coreJournal.ensureSessionHeader("s-f3", "/proj", "glm-5.3", "", now, "phone", nil, []string{"pdf"}, "")
 
 	svc := &AgentService{ai: m}
 	var mu sync.Mutex
@@ -537,7 +537,7 @@ func TestCreateBackfillsSiblingFromHeader(t *testing.T) {
 func TestReadAgentCoreJournalHistoryIncludesTurnRows(t *testing.T) {
 	dir := t.TempDir()
 	j := newAgentCoreJournal(dir)
-	j.ensureSessionHeader("s-turn", "/proj", "glm-5.3", "", "2026-11-05T00:00:00Z", "dashboard", nil, nil)
+	j.ensureSessionHeader("s-turn", "/proj", "glm-5.3", "", "2026-11-05T00:00:00Z", "dashboard", nil, nil, "")
 	j.appendUser("s-turn", "m1", "请只回复四个字：测试通过", "2026-11-05T00:01:00Z")
 	j.appendAssistantTurn("s-turn", 1, "测试通过", "The user is asking me to reply with four characters.", "end_turn", nil)
 

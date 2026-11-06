@@ -102,6 +102,9 @@
         </div>
       </div>
     </div>
+    <!-- 工具行 slot(ChatComposerTools 经 ChatPage 注入):权限模式/模型/effort
+         chips,学 Cursor/VSCode 挂输入框下缘。 -->
+    <slot name="tools"></slot>
   </div>
 </template>
 

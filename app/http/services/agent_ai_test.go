@@ -34,7 +34,7 @@ func TestCreateTruncateRebuildsHistoryFromJournal(t *testing.T) {
 	m := newAgentAIManager()
 	m.coreJournal = newAgentCoreJournal(t.TempDir()) // 隔离:绝不碰真机 journal
 	const sid = "s-create-trunc"
-	m.coreJournal.ensureSessionHeader(sid, "/proj", "glm-5.3", "", "2026-10-31T00:00:00Z", "dashboard", nil, nil)
+	m.coreJournal.ensureSessionHeader(sid, "/proj", "glm-5.3", "", "2026-10-31T00:00:00Z", "dashboard", nil, nil, "")
 	m.coreJournal.appendUser(sid, "u1", "第一问", "ts")
 	m.coreJournal.appendAssistant(sid, "a1", "第一答", "ts")
 	m.coreJournal.appendUser(sid, "u2", "第二问", "ts")
@@ -68,7 +68,7 @@ func TestCreateTruncateRejectsWhileRunActive(t *testing.T) {
 	m := newAgentAIManager()
 	m.coreJournal = newAgentCoreJournal(t.TempDir())
 	const sid = "s-create-trunc-busy"
-	m.coreJournal.ensureSessionHeader(sid, "/proj", "glm-5.3", "", "ts", "dashboard", nil, nil)
+	m.coreJournal.ensureSessionHeader(sid, "/proj", "glm-5.3", "", "ts", "dashboard", nil, nil, "")
 	m.coreJournal.appendUser(sid, "u1", "第一问", "ts")
 	// cancel != nil 即活跃回合（clearRunning 清位的是同一字段，agent_ai.go:315/:4281）。
 	m.mu.Lock()
@@ -101,7 +101,7 @@ func TestCreateTruncateAllowsEmptyHistory(t *testing.T) {
 	m := newAgentAIManager()
 	m.coreJournal = newAgentCoreJournal(t.TempDir())
 	const sid = "s-create-trunc-empty"
-	m.coreJournal.ensureSessionHeader(sid, "/proj", "glm-5.3", "", "2026-10-31T00:00:00Z", "dashboard", nil, nil)
+	m.coreJournal.ensureSessionHeader(sid, "/proj", "glm-5.3", "", "2026-10-31T00:00:00Z", "dashboard", nil, nil, "")
 	m.coreJournal.appendUser(sid, "u1", "第一问", "ts")
 
 	mu, events, writer := captureAIWriter(t)
@@ -132,7 +132,7 @@ func TestCreateTruncateIgnoredForNonAgentcore(t *testing.T) {
 	m := newAgentAIManager()
 	m.coreJournal = newAgentCoreJournal(t.TempDir())
 	const sid = "s-create-trunc-claude"
-	m.coreJournal.ensureSessionHeader(sid, "/proj", "glm-5.3", "", "2026-10-31T00:00:00Z", "dashboard", nil, nil)
+	m.coreJournal.ensureSessionHeader(sid, "/proj", "glm-5.3", "", "2026-10-31T00:00:00Z", "dashboard", nil, nil, "")
 	m.coreJournal.appendUser(sid, "u1", "第一问", "ts")
 	m.coreJournal.appendUser(sid, "u2", "第二问", "ts")
 
@@ -166,7 +166,7 @@ func TestCreateTruncateEmptyOverrideOnExistingSession(t *testing.T) {
 	m := newAgentAIManager()
 	m.coreJournal = newAgentCoreJournal(t.TempDir())
 	const sid = "s-create-trunc-exist-empty"
-	m.coreJournal.ensureSessionHeader(sid, "/proj", "glm-5.3", "", "ts", "dashboard", nil, nil)
+	m.coreJournal.ensureSessionHeader(sid, "/proj", "glm-5.3", "", "ts", "dashboard", nil, nil, "")
 	m.coreJournal.appendUser(sid, "u1", "第一问", "ts")
 	// 既有会话（无 cancel:无活跃 run,前置检查须放行）带着非空 history。
 	m.mu.Lock()
@@ -201,7 +201,7 @@ func TestCreateTruncateMiddleOverrideOnExistingSession(t *testing.T) {
 	m := newAgentAIManager()
 	m.coreJournal = newAgentCoreJournal(t.TempDir())
 	const sid = "s-create-trunc-exist-mid"
-	m.coreJournal.ensureSessionHeader(sid, "/proj", "glm-5.3", "", "ts", "dashboard", nil, nil)
+	m.coreJournal.ensureSessionHeader(sid, "/proj", "glm-5.3", "", "ts", "dashboard", nil, nil, "")
 	m.coreJournal.appendUser(sid, "u1", "第一问", "ts")
 	m.coreJournal.appendAssistant(sid, "a1", "第一答", "ts")
 	m.coreJournal.appendUser(sid, "u2", "第二问", "ts")

@@ -24,8 +24,9 @@ test('设置条渲染 + 最近项目去重 + 改模型后 create 帧带 model', 
   const projectButtons = page.locator('button', { hasText: '/home/alice/proj-' });
   await expect(projectButtons).toHaveCount(2);
   await page.getByText('/home/alice/proj-b').click();
-  // 改模型为 glm-5.2
-  await page.getByTestId('chat-settings-model').selectOption('glm-5.2');
+  // 改模型为 glm-5.2(composer 工具行 chip,2026-11-05 迁移)
+  await page.getByTestId('chat-composer-model').click();
+  await page.getByRole('button', { name: 'glm-5.2' }).click();
   // 发消息 → 捕获的 create 帧含目录与 model
   await page.getByPlaceholder(/输入消息|Type a message/).fill('你好');
   await page.keyboard.press('Enter');
@@ -45,8 +46,9 @@ test('已建会话改 effort 触发第二次 create；目录锁定为只读', as
   await expect.poll(async () => page.evaluate(() => window.__aiFrames.some(f => f.type === 'ai.session.create'))).toBe(true);
   // 发送过 → 目录锁定（只读 span，非 button）
   await expect(page.locator('span[data-testid="chat-settings-directory"]')).toBeVisible();
-  // 改 effort → 追加一次 create
-  await page.getByTestId('chat-settings-effort').selectOption('high');
+  // 改 effort → 追加一次 create(composer chip)
+  await page.getByTestId('chat-composer-effort').click();
+  await page.getByRole('button', { name: 'high', exact: true }).click();
   await expect.poll(async () => page.evaluate(() => window.__aiFrames.filter(f => f.type === 'ai.session.create' && f.effort === 'high').length)).toBeGreaterThan(0);
 });
 
@@ -57,7 +59,8 @@ test('已建会话改 effort 触发第二次 create；目录锁定为只读', as
 test('改 effort 落「下轮生效」角标，ai.run.started 后清除', async ({ page }) => {
   await openChat(page);
   const sid = await establishCreatedSession(page);
-  await page.getByTestId('chat-settings-effort').selectOption('high');
+  await page.getByTestId('chat-composer-effort').click();
+  await page.getByRole('button', { name: 'high', exact: true }).click();
   const chip = page.getByTestId('chat-effort-pending');
   await expect(chip).toBeVisible();
   await expect(chip).toHaveText(/下轮生效|Next turn/);
@@ -69,7 +72,8 @@ test('改 effort 落「下轮生效」角标，ai.run.started 后清除', async 
 test('改模型同样落「下轮生效」角标，ai.run.started 后清除', async ({ page }) => {
   await openChat(page);
   const sid = await establishCreatedSession(page);
-  await page.getByTestId('chat-settings-model').selectOption('glm-5.2');
+  await page.getByTestId('chat-composer-model').click();
+  await page.getByRole('button', { name: 'glm-5.2' }).click();
   const chip = page.getByTestId('chat-effort-pending');
   await expect(chip).toBeVisible();
   await expect(chip).toHaveText(/下轮生效|Next turn/);
@@ -158,4 +162,33 @@ test('会话级 MCP/技能开关：取消勾选随 create 帧整体下发 disabl
   const create = await page.evaluate(() => window.__aiFrames.filter(f => f.type === 'ai.session.create').slice(-1)[0]);
   expect(create.disabled_mcp_servers).toEqual(['weather']);
   expect(create.disabled_skills).toEqual(['pdf']);
+});
+
+// 孤儿属性守卫:ChatPage 模板一旦被打坏(标签截断),残缺事件属性会以
+// 裸文本渲染在页面上——这里廉价断言正文不含模板源码特征(2026-11-05 事故)。
+test('composer 区域无孤儿模板文本(标签截断哨兵)', async ({ page }) => {
+  await openChat(page);
+  const body = await page.locator('body').innerText();
+  expect(body).not.toContain('@recall-confirm');
+  expect(body).not.toContain('@slash-apply');
+  expect(body).not.toContain('@apply-settings');
+  await expect(page.getByTestId('chat-approval-mode-chip')).toBeVisible();
+});
+
+test('审批模式 chip:切放过所有走确认,create 载荷带 approval_mode', async ({ page }) => {
+  // bypass 切换有 window.confirm 确认——e2e 自动接受
+  page.on('dialog', (d) => d.accept());
+  await openChat(page);
+  const sid = await establishCreatedSession(page);
+  await page.getByTestId('chat-approval-mode-chip').click();
+  await page.getByRole('button', { name: /放过所有|Allow all/ }).click();
+  // 下轮生效角标亮起(approvalMode 挂 pendingConfig)
+  const chip = page.getByTestId('chat-effort-pending');
+  await expect(chip).toBeVisible();
+  // 触发新回合的 create(重发),载荷带 approval_mode
+  await page.getByPlaceholder(/输入消息|Type a message/).fill('试试');
+  await page.keyboard.press('Enter');
+  await expect.poll(async () => page.evaluate(() => window.__aiFrames.some((f) => f.type === 'ai.session.create' && f.approval_mode === 'bypass_all'))).toBe(true);
+  await pushFrame(page, { type: 'ai.run.started', session_id: sid });
+  await expect(page.getByTestId('chat-effort-pending')).toHaveCount(0);
 });

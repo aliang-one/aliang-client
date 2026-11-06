@@ -51,8 +51,8 @@ type agentAIManager struct {
 	// 重连/心跳时重放(服务端 intake 幂等)。
 	pendingApprovalRequests map[string]map[string]interface{}
 	approvalJournalEnabled  bool
-	bindings          map[string]agentAIBindingRecord
-	processedRuns     map[string]agentAIProcessedRun
+	bindings                map[string]agentAIBindingRecord
+	processedRuns           map[string]agentAIProcessedRun
 	// coreJournal 是 agentcore（AliangCode）调用记录落盘器；dir 为空时内部
 	// 全 no-op。构造时解析一次 agentHome()。
 	coreJournal *agentCoreJournal
@@ -389,6 +389,10 @@ type agentAISession struct {
 	// Applied to the codex CLI as a `<base>-<effort>` model-name suffix that the
 	// downstream gateway derives reasoning effort from. Empty = no override.
 	effort string
+	// approvalMode 会话级审批模式(2026-11-05):空=策略默认;ask_all=每次询问
+	// (auto_approve 降级 require,会话记忆跳过);bypass_all=放过所有(require
+	// 降级本地放行跳手机,auto_deny 恒拒)。非法值归一回落空。
+	approvalMode string
 	// contextWindow is the model context size (tokens) chosen on the phone.
 	// For claude it is passed to the CLI as `--autocompact <tokens>` so the
 	// auto-compaction trigger matches the real window instead of whatever the
@@ -529,6 +533,9 @@ type agentAIRun struct {
 	provider      string
 	model         string
 	effort        string
+	// approvalMode 镜像会话级审批模式(空=策略默认;ask_all/bypass_all 见
+	// applyApprovalModeOverride)。agentCoreApprove 与审批 hook 短路径读取。
+	approvalMode string
 	// contextWindow mirrors the session field for this run (claude:
 	// --autocompact tokens; agentcore: kernel compaction budget).
 	contextWindow int
@@ -1843,6 +1850,9 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 	}
 	model := strings.TrimSpace(remoteString(msg, "model"))
 	effort := strings.TrimSpace(remoteString(msg, "effort"))
+	// approval_mode 带键标记(2026-10-31 F2 同款纪律):老客户端不带键时
+	// 绝不把持久化的模式冲成默认。
+	approvalMode, approvalModeSet := parseAgentAIApprovalMode(msg)
 	contextWindow := clampAgentAIContextWindow(remoteInt(msg, "context_window", 0))
 	maxTokens := clampAgentAIMaxTokens(remoteInt(msg, "max_tokens", 0))
 	// 会话级 MCP 开关：键存在即整体替换（含空数组=全部启用）；键缺失=不动。
@@ -1955,6 +1965,7 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 				}
 			}
 			m.coreJournal.syncSessionSwitches(sessionID, existing.disabledMCPServers, disabledMCPServersSet, existing.disabledSkills, disabledSkillsSet)
+			m.coreJournal.syncSessionApprovalMode(sessionID, approvalMode, approvalModeSet)
 		}
 		// 身份三字段空值不覆写已钉值(与 mergeRunStartIdentityLocked 同纪律):
 		// 聊天页每条消息前都重发一次 create 且不带 resume/reserved/binding_version
@@ -2210,6 +2221,10 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 		if !lazyDisabledSkillsSet {
 			lazyDisabledSkills = headSwitches.disabledSkills
 		}
+		lazyApprovalMode, lazyApprovalModeSet := parseAgentAIApprovalMode(msg)
+		if !lazyApprovalModeSet {
+			lazyApprovalMode = headSwitches.approvalMode
+		}
 		if lazyInitialContext != "" {
 			lazyHistory = append([]agentAIMessage{{
 				Role:      "system",
@@ -2227,6 +2242,7 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 			provider:                lazyProvider,
 			model:                   firstNonEmpty(strings.TrimSpace(remoteString(msg, "model")), headModel),
 			effort:                  strings.TrimSpace(remoteString(msg, "effort")),
+			approvalMode:            lazyApprovalMode,
 			contextWindow:           lazyContextWindow,
 			resumeSessionID:         firstNonEmpty(remoteString(msg, "resume_session_id"), remoteString(msg, "source_session_id")),
 			reservedNativeSessionID: strings.TrimSpace(remoteString(msg, "reserved_native_session_id")),
@@ -2295,6 +2311,9 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 			}
 		}
 		m.coreJournal.syncSessionSwitches(sessionID, session.disabledMCPServers, mcpSet, session.disabledSkills, skillsSet)
+	}
+	if approvalMode, ok := parseAgentAIApprovalMode(msg); ok {
+		m.coreJournal.syncSessionApprovalMode(sessionID, approvalMode, ok)
 	}
 	if surface := normalizeAgentAISurface(remoteString(msg, "surface")); surface != "" {
 		session.surface = surface
@@ -2490,6 +2509,9 @@ func (m *agentAIManager) runStart(msg map[string]interface{}, writeJSON agentTer
 		session.provider = firstNonEmpty(remoteString(msg, "provider"), remoteString(msg, "tool"), session.provider)
 		session.model = strings.TrimSpace(remoteString(msg, "model"))
 		session.effort = strings.TrimSpace(remoteString(msg, "effort"))
+		if approvalMode, ok := parseAgentAIApprovalMode(msg); ok {
+			session.approvalMode = approvalMode
+		}
 		if cw := clampAgentAIContextWindow(remoteInt(msg, "context_window", 0)); cw > 0 {
 			session.contextWindow = cw
 		}
@@ -2592,7 +2614,7 @@ func (m *agentAIManager) handleLocalSlashCommand(session *agentAISession, messag
 		originSocket, surface := session.originSocket, session.surface
 		m.mu.Unlock()
 		now := time.Now().UTC().Format(time.RFC3339)
-		m.coreJournal.ensureSessionHeader(session.id, projectPath, model, effort, now, agentCoreJournalOriginFor(originSocket, surface), session.disabledMCPServers, session.disabledSkills)
+		m.coreJournal.ensureSessionHeader(session.id, projectPath, model, effort, now, agentCoreJournalOriginFor(originSocket, surface), session.disabledMCPServers, session.disabledSkills, session.approvalMode)
 		m.coreJournal.appendUser(session.id, messageID, content, now)
 	}
 
@@ -3311,6 +3333,7 @@ func (m *agentAIManager) runUserMessage(session *agentAISession, runID, messageI
 		provider:                provider,
 		model:                   session.model,
 		effort:                  session.effort,
+		approvalMode:            session.approvalMode,
 		contextWindow:           session.contextWindow,
 		maxTokens:               session.maxTokens,
 		disabledMCPServers:      session.disabledMCPServers,
@@ -3466,14 +3489,15 @@ func agentAICodexInputMapKey(sessionID, optionID string) string {
 
 func agentAISessionCreatedPayload(session *agentAISession) map[string]interface{} {
 	payload := map[string]interface{}{
-		"type":         models.AgentEventAISessionCreated,
-		"session_id":   session.id,
-		"mode":         session.mode,
-		"project_path": session.projectPath,
-		"provider":     session.provider,
-		"model":        session.model,
-		"effort":       session.effort,
-		"state":        "idle",
+		"type":          models.AgentEventAISessionCreated,
+		"session_id":    session.id,
+		"mode":          session.mode,
+		"project_path":  session.projectPath,
+		"provider":      session.provider,
+		"model":         session.model,
+		"effort":        session.effort,
+		"approval_mode": session.approvalMode,
+		"state":         "idle",
 	}
 	if session.resumeSessionID != "" {
 		payload["resume_session_id"] = session.resumeSessionID
@@ -4303,6 +4327,7 @@ func (m *agentAIManager) handleClaudeApprovalHook(ctx context.Context, sessionID
 		projectPath:         session.projectPath,
 		provider:            session.provider,
 		model:               session.model,
+		approvalMode:        session.approvalMode,
 		cancel:              session.cancel,
 		approvalToken:       session.approvalToken,
 		activity:            session.activity,
@@ -4352,10 +4377,22 @@ func (m *agentAIManager) handleClaudeApprovalHook(ctx context.Context, sessionID
 		logger.Info(fmt.Sprintf("approval-hook: AUTO-APPROVE (goal run, pre-approved plan) tool=%s session=%s", toolName, sessionID))
 		return claudeApprovalHookDecision(hookEventName, true, "auto-approved: goal execution within pre-approved plan"), nil
 	}
-	if svc := m.approvalService(); svc != nil {
+	// bypass_all 快路径(仅策略服务缺失,同 agentcore):服务在场时由块内
+	// override 处理,deny 规则照拒。
+	hookSvc := m.approvalService()
+	if run.approvalMode == agentAIApprovalModeBypassAll && hookSvc == nil {
+		logger.Info(fmt.Sprintf("approval-hook: BYPASS-ALL fast path (policy service unavailable) tool=%s session=%s (hook)", toolName, sessionID))
+		return claudeApprovalHookDecision(hookEventName, true, "bypassed by session approval mode"), nil
+	}
+	if hookSvc != nil {
 		// raw 传入边界判定:Claude auto-memory carve-out 需要 transcript_path
 		// 在 slug 编码漂移时精确锁定本会话的 memory 目录。
-		switch decision, matchedID := svc.evaluateApprovalDecisionForHook(toolName, toolInput, run.projectPath, raw); decision {
+		rawDecision, rawMatchedID := hookSvc.evaluateApprovalDecisionForHook(toolName, toolInput, run.projectPath, raw)
+		overridden := applyApprovalModeOverride(run.approvalMode, rawDecision)
+		if overridden != rawDecision {
+			logger.Info(fmt.Sprintf("approval-hook: MODE-OVERRIDE mode=%s %s→%s tool=%s session=%s (hook)", run.approvalMode, rawDecision, overridden, toolName, sessionID))
+		}
+		switch decision, matchedID := overridden, rawMatchedID; decision {
 		case decisionAutoApprove:
 			logger.Info(fmt.Sprintf("approval-hook: AUTO-APPROVE by policy rule=%s tool=%s session=%s (no cloud round-trip)", matchedID, toolName, sessionID))
 			return claudeApprovalHookDecision(hookEventName, true, "auto-approved by policy: "+matchedID), nil
@@ -4365,7 +4402,7 @@ func (m *agentAIManager) handleClaudeApprovalHook(ctx context.Context, sessionID
 		case decisionRequireApproval:
 			// Attach policy context so the approver sees why it escalated.
 			run.matchedRuleID = matchedID
-			run.policyVersion = svc.effectiveApprovalPolicyForPath(run.projectPath).Version
+			run.policyVersion = hookSvc.effectiveApprovalPolicyForPath(run.projectPath).Version
 		}
 	}
 
@@ -4374,7 +4411,10 @@ func (m *agentAIManager) handleClaudeApprovalHook(ctx context.Context, sessionID
 	// accept_for_session 的直接放行，不再问手机。provider 取请求对象自身，
 	// 与 approval() 记录点存的 waiter.request.Provider 对齐。
 	// double build intentional: hit path stays branch-free
-	if preReq := buildClaudeApprovalRequest(run, raw); m.sessionApprovalAllows(sessionID, preReq.Provider, preReq.Kind, preReq.ToolName, preReq.Command) {
+	// ask_all/bypass_all 下跳过会话批准记忆(用户显式要求每次问/反正全放)。
+	if approvalModeSkipsSessionMemory(run.approvalMode) {
+		logger.Info(fmt.Sprintf("approval-hook: SESSION-MEMORY-SKIPPED mode=%s tool=%s session=%s (hook)", run.approvalMode, toolName, sessionID))
+	} else if preReq := buildClaudeApprovalRequest(run, raw); m.sessionApprovalAllows(sessionID, preReq.Provider, preReq.Kind, preReq.ToolName, preReq.Command) {
 		logger.Info(fmt.Sprintf("approval-hook: SESSION-APPROVED (memory) tool=%s kind=%s session=%s", preReq.ToolName, preReq.Kind, sessionID))
 		m.journalSessionApprovalHit(sessionID, run.runSeq, preReq.Kind, preReq.ToolName, preReq.Command)
 		return claudeApprovalHookDecision(hookEventName, true, "approved for this session"), nil
@@ -6373,9 +6413,20 @@ func (m *agentAIManager) codexAppServerApprovalResult(ctx context.Context, run a
 	// Policy short-circuit (mirrors the Claude hook): auto-approve/deny locally
 	// when the device policy says so, with no cloud round-trip. Only
 	// require_approval falls through to requestApproval.
-	if svc := m.approvalService(); svc != nil {
+	// bypass_all 快路径(仅策略服务缺失,同 agentcore/claude hook)。
+	codexSvc := m.approvalService()
+	if run.approvalMode == agentAIApprovalModeBypassAll && codexSvc == nil {
+		logger.Info(fmt.Sprintf("approval-hook: BYPASS-ALL fast path (policy service unavailable) method=%s session=%s (codex)", method, run.sessionID))
+		return codexApprovalResponseResult(method, params, agentAIApprovalResponse{Decision: models.AgentAIApprovalDecisionAccept})
+	}
+	if codexSvc != nil {
 		toolName, toolInput := codexPolicyToolHint(method, params, fileChanges)
-		switch decision, matchedID := svc.evaluateApprovalDecision(toolName, toolInput, run.projectPath); decision {
+		rawDecision, rawMatchedID := codexSvc.evaluateApprovalDecision(toolName, toolInput, run.projectPath)
+		overridden := applyApprovalModeOverride(run.approvalMode, rawDecision)
+		if overridden != rawDecision {
+			logger.Info(fmt.Sprintf("approval-hook: MODE-OVERRIDE mode=%s %s→%s tool=%s session=%s (codex)", run.approvalMode, rawDecision, overridden, toolName, run.sessionID))
+		}
+		switch decision, matchedID := overridden, rawMatchedID; decision {
 		case decisionAutoApprove:
 			logger.Info(fmt.Sprintf("approval-hook: AUTO-APPROVE by policy rule=%s method=%s session=%s (codex, no cloud round-trip)", matchedID, method, run.sessionID))
 			return codexApprovalResponseResult(method, params, agentAIApprovalResponse{Decision: models.AgentAIApprovalDecisionAccept})
@@ -6384,7 +6435,7 @@ func (m *agentAIManager) codexAppServerApprovalResult(ctx context.Context, run a
 			return codexApprovalResponseResult(method, params, agentAIApprovalResponse{Decision: models.AgentAIApprovalDecisionDecline})
 		case decisionRequireApproval:
 			run.matchedRuleID = matchedID
-			run.policyVersion = svc.effectiveApprovalPolicyForPath(run.projectPath).Version
+			run.policyVersion = codexSvc.effectiveApprovalPolicyForPath(run.projectPath).Version
 		}
 	}
 	// 会话级批准记忆检查点（policy 之后、云端往返之前）：本会话用户对同键选过
@@ -6392,7 +6443,10 @@ func (m *agentAIManager) codexAppServerApprovalResult(ctx context.Context, run a
 	// scope=session 行为保留不动，这里只是 agent 侧叠加记忆免往返。provider 取
 	// 请求对象自身（buildCodexApprovalRequest 硬编码 "codex"，而 run.provider
 	// 可能是 "auto"——与 approval() 记录点存的 waiter.request.Provider 对齐）。
-	if pre := buildCodexApprovalRequest(run, method, params, fileChanges); m.sessionApprovalAllows(run.sessionID, pre.Provider, pre.Kind, pre.ToolName, pre.Command) {
+	// ask_all/bypass_all 下跳过会话批准记忆(同 claude hook)。
+	if approvalModeSkipsSessionMemory(run.approvalMode) {
+		logger.Info(fmt.Sprintf("approval-hook: SESSION-MEMORY-SKIPPED mode=%s method=%s session=%s (codex)", run.approvalMode, method, run.sessionID))
+	} else if pre := buildCodexApprovalRequest(run, method, params, fileChanges); m.sessionApprovalAllows(run.sessionID, pre.Provider, pre.Kind, pre.ToolName, pre.Command) {
 		logger.Info(fmt.Sprintf("approval-hook: SESSION-APPROVED (memory) tool=%s kind=%s method=%s session=%s (codex)", pre.ToolName, pre.Kind, method, run.sessionID))
 		m.journalSessionApprovalHit(run.sessionID, run.runSeq, pre.Kind, pre.ToolName, pre.Command)
 		return codexApprovalResponseResult(method, params, agentAIApprovalResponse{Decision: models.AgentAIApprovalDecisionAccept})

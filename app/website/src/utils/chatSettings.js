@@ -93,6 +93,18 @@ export function deviceTranscriptForCreate(conv) {
 // → 覆盖 project_path、deviceTranscriptForCreate → transcript。可选字段——
 // 未设置时键不得出现在载荷（e2e 断言 create 帧字段集，多出的空键会被判为
 // 协议漂移）。
+// 会话级审批模式词表(2026-11-05,spec chat-approval-mode):''=默认推荐
+// (策略现状)/ask_all=每次询问/bypass_all=放过所有。非法值归一为空。
+export const APPROVAL_MODES = [
+  { value: '', labelKey: 'chat_approvalModeDefault' },
+  { value: 'ask_all', labelKey: 'chat_approvalModeAskAll' },
+  { value: 'bypass_all', labelKey: 'chat_approvalModeBypassAll' },
+];
+
+export function normalizeApprovalMode(raw) {
+  return raw === 'ask_all' || raw === 'bypass_all' ? raw : '';
+}
+
 export function sessionCreatePayload(conv) {
   const payload = {
     type: 'ai.session.create',
@@ -102,6 +114,9 @@ export function sessionCreatePayload(conv) {
     mode: 'vibe',
     model: (conv && conv.model) || '',
     effort: (conv && conv.effort) || '',
+    // 审批模式恒下发(显式空串=默认推荐);后端带键标记 preserve 语义对
+    // 老客户端生效,本端新 UI 恒显式。
+    approval_mode: normalizeApprovalMode(conv && conv.approvalMode),
   };
   if (conv && conv.resumeSessionId) {
     payload.resume_session_id = String(conv.resumeSessionId);

@@ -321,7 +321,7 @@ export function useAliangChat() {
     // ai.run.started 路由回本会话才清（running 守卫已过 = 改动确实落值）。
     // 空串 effort（跟随默认）也是合法改动，同样触发。ai.session.created 的
     // 回显不走本入口，不会误挂角标。瞬态：conversationForStorage 剥离不落盘。
-    if ('effort' in patch || 'model' in patch) conv.pendingConfig = true;
+    if ('effort' in patch || 'model' in patch || 'approvalMode' in patch) conv.pendingConfig = true;
     conv.updatedAt = now();
     saveToStorage();
     createError.value = '';
@@ -1998,6 +1998,8 @@ export function useAliangChat() {
         if (typeof e.project_path === 'string' && e.project_path) conv.projectPath = e.project_path;
         if (typeof e.model === 'string') conv.model = e.model;
         if (typeof e.effort === 'string') conv.effort = e.effort;
+        // approval_mode 回显:后端归一后的权威值(非法值回落空)。
+        if (typeof e.approval_mode === 'string') conv.approvalMode = e.approval_mode;
         // resume 字段仅首次 create（阶段 2 计划钉死）：ack 即消费——此后每条
         // 消息前的 create 重发与设置条同步都不再携带，防陈旧 resume 压过用户
         // 纠正后的路径（服务端 binding 守卫目前掩盖，但契约在本端收口）。

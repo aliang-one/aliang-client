@@ -27,35 +27,8 @@
         <span class="material-symbols-outlined text-sm">folder</span>
         <span class="truncate">{{ directoryLabel }}</span>
       </button>
-      <span class="ml-2 hidden shrink-0 text-slate-400 md:inline">{{ t('chat_settingsModel') }}</span>
-      <select
-        v-model="activeModel"
-        data-testid="chat-settings-model"
-        class="min-h-[40px] shrink-0 rounded-lg border border-slate-200 bg-white px-1 text-slate-600 outline-none transition focus:border-primary focus:ring-2 focus:ring-primary/30 disabled:cursor-not-allowed disabled:opacity-60 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300 md:min-h-0"
-        :disabled="activeRunning"
-        :aria-label="t('chat_settingsModel')"
-      >
-        <option v-for="opt in modelOptions" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
-      </select>
-      <input
-        v-if="modelCustomActive"
-        v-model="modelCustomDraft"
-        type="text"
-        class="h-9 w-36 shrink-0 rounded-lg border border-slate-200 bg-white px-2 text-xs outline-none transition focus:border-primary focus:ring-2 focus:ring-primary/30 dark:border-slate-600 dark:bg-slate-800"
-        :placeholder="t('chat_customModel')"
-        @keydown.enter="onCustomModelEnter"
-        @blur="commitCustomModel"
-      />
-      <span class="ml-2 hidden shrink-0 text-slate-400 md:inline">{{ t('chat_settingsEffort') }}</span>
-      <select
-        v-model="activeEffort"
-        data-testid="chat-settings-effort"
-        class="min-h-[40px] shrink-0 rounded-lg border border-slate-200 bg-white px-1 text-slate-600 outline-none transition focus:border-primary focus:ring-2 focus:ring-primary/30 disabled:cursor-not-allowed disabled:opacity-60 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300 md:min-h-0"
-        :disabled="activeRunning"
-        :aria-label="t('chat_settingsEffort')"
-      >
-        <option v-for="opt in EFFORT_OPTIONS" :key="opt.value" :value="opt.value">{{ opt.value || t('chat_modelDefault') }}</option>
-      </select>
+      <!-- 模型/effort 选择器迁 composer 工具行(2026-11-05,学 Cursor;
+           单入口纪律——本条只留 目录/更多/预算面板,状态源唯一) -->
       <!-- 「更多」输出预算/会话级 MCP·技能开关（master 并行线 ChatPage 迁入）：
            面板数据与动作收在 useAliangChat，本组件只承载展开态与递交。 -->
       <button
@@ -69,14 +42,7 @@
         <span class="material-symbols-outlined text-sm">tune</span>
         <span class="hidden md:inline">{{ t('chat_settingsMore') }}</span>
       </button>
-      <!-- 「下轮生效」角标（Task 12）：effort/model 改动落值即挂（conv.pendingConfig，
-           随 applySessionSettings 置位），ai.run.started 路由回本会话即清——新回合
-           已按新配置跑。瞬态不落盘，重载后自然退场。 -->
-      <span
-        v-if="conversation?.pendingConfig"
-        data-testid="chat-effort-pending"
-        class="shrink-0 rounded bg-amber-100 px-1.5 py-0.5 text-[10px] text-amber-700 dark:bg-amber-900/40 dark:text-amber-300"
-      >{{ t('chat_effortPending') }}</span>
+      <!-- 「下轮生效」角标随模型/effort 选择器迁 composer 工具行（2026-11-05）。 -->
       <div
         v-if="createError"
         data-testid="chat-settings-error"
@@ -236,9 +202,6 @@ import { ref, computed, watch } from 'vue';
 import { useI18n } from '../../i18n';
 import { isComposingEvent } from '../../composables/useAliangChat';
 import {
-  AGENTCORE_MODEL_OPTIONS,
-  EFFORT_OPTIONS,
-  MODEL_CUSTOM_VALUE,
   isDirectoryLocked,
   recentProjectsFromSessions,
 } from '../../utils/chatSettings';
@@ -281,8 +244,6 @@ const directoryPanelOpen = ref(false);
 const customPathDraft = ref('');
 const recentProjects = ref([]);
 const recentProjectsLoaded = ref(false);
-const modelCustomActive = ref(false);
-const modelCustomDraft = ref('');
 // 「更多」面板展开态（纯 UI）：数据与动作在 useAliangChat，这里只管开关。
 const moreSettingsOpen = ref(false);
 
@@ -316,66 +277,7 @@ const directoryLocked = computed(() => isDirectoryLocked(props.conversation));
 
 const directoryLabel = computed(() => props.conversation?.projectPath || t('chat_pathDefault'));
 
-const modelOptions = computed(() => AGENTCORE_MODEL_OPTIONS.map(o => ({
-  ...o,
-  label: o.value === '' ? t('chat_modelDefault')
-    : o.value === MODEL_CUSTOM_VALUE ? t('chat_customModel')
-    : o.label,
-})));
-
-// select 当前值：预设模型→自身；非预设自定义值→哨兵（输入框承接显示）。
-const modelSelectValue = computed(() => {
-  const m = props.conversation?.model || '';
-  if (!m) return '';
-  return isPresetModel(m) ? m : MODEL_CUSTOM_VALUE;
-});
-
-function isPresetModel(m) {
-  return AGENTCORE_MODEL_OPTIONS.some(o => o.value === m && o.value !== MODEL_CUSTOM_VALUE);
-}
-
-function onModelSelect(value) {
-  const conv = props.conversation;
-  if (!conv || props.activeRunning) return;
-  if (value === MODEL_CUSTOM_VALUE) {
-    modelCustomDraft.value = conv.model && !isPresetModel(conv.model) ? conv.model : '';
-    modelCustomActive.value = true;
-    return;
-  }
-  modelCustomActive.value = false;
-  emit('apply-settings', { model: value });
-}
-
-function commitCustomModel() {
-  const conv = props.conversation;
-  if (!conv) return;
-  const model = modelCustomDraft.value.trim();
-  modelCustomActive.value = false;
-  if (!model) return; // 空输入视作取消，保持原值
-  emit('apply-settings', { model });
-}
-
-function onCustomModelEnter(e) {
-  if (isComposingEvent(e)) return;
-  e.preventDefault();
-  commitCustomModel();
-}
-
-// v-model 写法让 select 每次渲染都回写 el.value：取消自定义输入后选择框
-// 立即弹回当前值，不会停留在已被丢弃的哨兵选项上（与 activeEffort 同构）。
-const activeModel = computed({
-  get: () => modelSelectValue.value,
-  set: (v) => onModelSelect(v),
-});
-
-const activeEffort = computed({
-  get: () => props.conversation?.effort || '',
-  set(value) {
-    const conv = props.conversation;
-    if (!conv || props.activeRunning) return;
-    emit('apply-settings', { effort: value });
-  },
-});
+// 模型/effort 选择逻辑已迁 ChatComposerTools(2026-11-05 单入口收编)。
 
 async function toggleDirectoryPanel() {
   const conv = props.conversation;
@@ -421,7 +323,6 @@ function onCustomPathEnter(e) {
 // 会话池里按同引用命中），触发集合与原 watch 等价。
 watch(() => props.conversation, () => {
   directoryPanelOpen.value = false;
-  modelCustomActive.value = false;
   moreSettingsOpen.value = false;
 });
 </script>

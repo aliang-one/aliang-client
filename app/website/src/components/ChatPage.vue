@@ -100,7 +100,16 @@
         @slash-index="slashIndex = $event"
         @slash-close="slashOpen = false"
         @slash-input="onSlashInput"
-      />
+      >
+        <template #tools>
+          <ChatComposerTools
+            :conversation="activeConversation"
+            :settings-disabled="activeRunning"
+            :pending-config="Boolean(activeConversation && activeConversation.pendingConfig)"
+            @apply-settings="onApplySettings"
+          />
+        </template>
+      </ChatComposer>
     </div>
   </div>
 </template>
@@ -116,6 +125,7 @@ import ChatHeader from './chat/ChatHeader.vue';
 import ChatSettingsBar from './chat/ChatSettingsBar.vue';
 import ChatMessageList from './chat/ChatMessageList.vue';
 import ChatComposer from './chat/ChatComposer.vue';
+import ChatComposerTools from './chat/ChatComposerTools.vue';
 
 const {
   activeApprovals,

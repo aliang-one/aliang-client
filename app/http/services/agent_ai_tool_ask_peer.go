@@ -114,7 +114,8 @@ func agentPeerMCPBridgeTools() []agentPeerMCPToolDef {
 		},
 		{
 			name: "peer_device_list",
-			description: "List every device in this account with id, name, platform, online status " +
+			description: "Cross-device directory for this Aliang account. Call this FIRST whenever the user asks to run commands on, inspect, or fetch files from another device or machine. " +
+				"List every device in this account with id, name, platform, online status " +
 				"and whether peer exec is enabled. This is the directory to pick device_id from for " +
 				"the other peer tools (peer.exec / peer.fetch_file / peer.device_info / peer.device_note).",
 			inputSchema: json.RawMessage(`{"type":"object","properties":{}}`),

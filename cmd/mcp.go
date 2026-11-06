@@ -153,11 +153,7 @@ func (s *peerMCPServer) handleLine(line []byte) {
 		if proto == "" {
 			proto = peerMCPProtocolVersion
 		}
-		s.writeResult(req.ID, map[string]interface{}{
-			"protocolVersion": proto,
-			"capabilities":    map[string]interface{}{"tools": map[string]interface{}{"listChanged": false}},
-			"serverInfo":      map[string]interface{}{"name": "aliang-peer", "version": version.Version},
-		})
+		s.writeResult(req.ID, peerMCPInitializeResult(proto))
 	case "tools/list":
 		s.writeResult(req.ID, map[string]interface{}{"tools": peerMCPToolDescriptors()})
 	case "tools/call":
@@ -188,6 +184,22 @@ type peerMCPTool struct {
 	method   string
 	path     string
 	buildReq func(args map[string]interface{}) interface{}
+}
+
+// peerMCPInitializeResult 构造 initialize 响应。instructions 是 MCP 协议的
+// 服务端级说明字段(Claude Code 会注入模型上下文):LLM 在工具列表之外由此
+// 获得「本机属于设备舰队、跨设备需求先查 device_list」的全局图景——工具
+// 描述只管单工具语义,路由意识靠这里(spec 2026-11-05 感知缺口修补)。
+func peerMCPInitializeResult(protocolVersion string) map[string]interface{} {
+	return map[string]interface{}{
+		"protocolVersion": protocolVersion,
+		"capabilities":    map[string]interface{}{"tools": map[string]interface{}{"listChanged": false}},
+		"serverInfo":      map[string]interface{}{"name": "aliang-peer", "version": version.Version},
+		"instructions": "Aliang cross-device toolset: this machine belongs to an Aliang account with other registered devices. " +
+			"When the user asks to run a command on, inspect, or fetch a file from another device or machine, " +
+			"call device_list FIRST to pick the device_id, then peer_exec / peer_fetch_file. " +
+			"Remote targets enforce their own peer-exec gates; failures are reported per call.",
+	}
 }
 
 func peerMCPToolDescriptors() []map[string]interface{} {
@@ -288,7 +300,8 @@ var peerMCPTools = []peerMCPTool{
 	},
 	{
 		name: "device_list",
-		description: "List every device in this account with id, name, platform, online status " +
+		description: "Cross-device directory for this Aliang account. Call this FIRST whenever the user asks to run commands on, inspect, or fetch files from another device or machine. " +
+			"List every device in this account with id, name, platform, online status " +
 			"and whether peer exec is enabled. This is the directory to pick device_id from for " +
 			"the other peer tools.",
 		schema:    map[string]interface{}{"type": "object", "properties": map[string]interface{}{}},

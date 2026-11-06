@@ -708,7 +708,7 @@ func (m *agentAIManager) handleAgentCoreCompactCommand(session *agentAISession, 
 	// 一行，读回时才有始有终；写失败只 Warn（尽力而为口径）。
 	journal := m.coreJournal
 	now := time.Now().UTC().Format(time.RFC3339)
-	journal.ensureSessionHeader(session.id, projectPath, model, effort, now, agentCoreJournalOriginFor(originSocket, surface), session.disabledMCPServers, session.disabledSkills)
+	journal.ensureSessionHeader(session.id, projectPath, model, effort, now, agentCoreJournalOriginFor(originSocket, surface), session.disabledMCPServers, session.disabledSkills, session.approvalMode)
 	journal.appendUser(session.id, messageID, "/compact", now)
 
 	_ = writeJSON(map[string]interface{}{
@@ -1140,7 +1140,7 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		journal.appendEndDiagnostics(run.sessionID, endStatus, endErrMsg, diag)
 	}()
 	now := time.Now().UTC().Format(time.RFC3339)
-	journal.ensureSessionHeader(run.sessionID, run.projectPath, agentCoreModel(run), run.effort, now, agentCoreJournalOrigin(run), run.disabledMCPServers, run.disabledSkills)
+	journal.ensureSessionHeader(run.sessionID, run.projectPath, agentCoreModel(run), run.effort, now, agentCoreJournalOrigin(run), run.disabledMCPServers, run.disabledSkills, run.approvalMode)
 	// 会话级开关的持久化写点在 create()/message() 的显式改键处（2026-10-31
 	// 评审修正）：这里**不**做每 run 进门同步——run 的内存名单可能还没从
 	// journal 头行水合（手机 v3 恒带 transcript、懒建恢复被历史门挡住、恢复
@@ -1752,7 +1752,7 @@ func agentCoreLoopHooks(m *agentAIManager, run agentAIRun, diag *agentCoreDiagno
 			autoCompactSeq++
 			ts := time.Now().UTC().Format(time.RFC3339)
 			compactID := fmt.Sprintf("compact-auto-%d-%d", run.runSeq, autoCompactSeq)
-			m.coreJournal.ensureSessionHeader(run.sessionID, run.projectPath, agentCoreModel(run), run.effort, ts, agentCoreJournalOrigin(run), run.disabledMCPServers, run.disabledSkills)
+			m.coreJournal.ensureSessionHeader(run.sessionID, run.projectPath, agentCoreModel(run), run.effort, ts, agentCoreJournalOrigin(run), run.disabledMCPServers, run.disabledSkills, run.approvalMode)
 			m.coreJournal.appendUser(run.sessionID, compactID, "/compact(auto)", ts)
 			m.coreJournal.appendAssistant(run.sessionID, agentAssistantMessageID(compactID),
 				fmt.Sprintf("✓ 上下文已自动压缩：约 %s → %s tokens（%d 条早期消息已折叠为摘要）。",
@@ -2115,7 +2115,15 @@ func boundaryApprovalReason(ruleID string) string {
 func (m *agentAIManager) agentCoreApprove(run agentAIRun, writeJSON agentTerminalWriter) func(context.Context, agentcore.ApprovalRequest) (agentcore.ApprovalResponse, error) {
 	return func(ctx context.Context, call agentcore.ApprovalRequest) (agentcore.ApprovalResponse, error) {
 		toolInput := marshalAgentAIRaw(call.Input)
-		if svc := m.approvalService(); svc != nil {
+		svc := m.approvalService()
+		// bypass_all 快路径(仅策略服务缺失):此时 auto_deny 无从谈起,用户
+		// 显式放过就直接放行,绝不落进无人应答的审批等待(卡死链路)。服务
+		// 在场时 deny 规则照拒,由块内 override 处理。
+		if run.approvalMode == agentAIApprovalModeBypassAll && svc == nil {
+			logger.Info(fmt.Sprintf("approval-hook: BYPASS-ALL fast path (policy service unavailable) tool=%s session=%s (agentcore)", call.ToolName, run.sessionID))
+			return agentcore.ApprovalResponse{Approved: true}, nil
+		}
+		if svc != nil {
 			decision, matchedID := svc.evaluateApprovalDecision(call.ToolName, toolInput, run.projectPath)
 			// MCP 默认门（spec §7）：没有显式设备规则命中（matchedID 为空 =
 			// 落到策略 DefaultDecision）的 mcp__* 工具一律要求手机审批——
@@ -2126,6 +2134,13 @@ func (m *agentAIManager) agentCoreApprove(run agentAIRun, writeJSON agentTermina
 				logger.Info(fmt.Sprintf("approval-hook: MCP default gate require_approval tool=%s session=%s matched=none", call.ToolName, run.sessionID))
 				decision = decisionRequireApproval
 			}
+			// 会话级审批模式覆盖(spec 2026-11-05):bypass_all 降 require 为放行
+			// (跳手机);ask_all 降 auto_approve 为 require(每次问);auto_deny 恒拒。
+			overridden := applyApprovalModeOverride(run.approvalMode, decision)
+			if overridden != decision {
+				logger.Info(fmt.Sprintf("approval-hook: MODE-OVERRIDE mode=%s %s→%s tool=%s session=%s", run.approvalMode, decision, overridden, call.ToolName, run.sessionID))
+			}
+			decision = overridden
 			switch decision {
 			case decisionAutoApprove:
 				logger.Info(fmt.Sprintf("approval-hook: AUTO-APPROVE by policy rule=%s tool=%s session=%s (agentcore, no cloud round-trip)", matchedID, call.ToolName, run.sessionID))
@@ -2143,7 +2158,10 @@ func (m *agentAIManager) agentCoreApprove(run agentAIRun, writeJSON agentTermina
 		// 选过 accept_for_session 的直接放行（agent_ai_session_approvals.go）。
 		// provider 取请求对象自身，与 approval() 记录点存的 waiter.request.Provider
 		// 对齐（buildAgentCoreApprovalRequest 用 run.provider，两侧一致）。
-		if pre := buildAgentCoreApprovalRequest(run, call); m.sessionApprovalAllows(run.sessionID, pre.Provider, pre.Kind, pre.ToolName, pre.Command) {
+		// ask_all/bypass_all 下跳过:用户显式要求每次问/反正全放,记忆免问无意义。
+		if approvalModeSkipsSessionMemory(run.approvalMode) {
+			logger.Info(fmt.Sprintf("approval-hook: SESSION-MEMORY-SKIPPED mode=%s tool=%s session=%s (agentcore)", run.approvalMode, call.ToolName, run.sessionID))
+		} else if pre := buildAgentCoreApprovalRequest(run, call); m.sessionApprovalAllows(run.sessionID, pre.Provider, pre.Kind, pre.ToolName, pre.Command) {
 			logger.Info(fmt.Sprintf("approval-hook: SESSION-APPROVED (memory) tool=%s kind=%s session=%s (agentcore)", pre.ToolName, pre.Kind, run.sessionID))
 			m.journalSessionApprovalHit(run.sessionID, run.runSeq, pre.Kind, pre.ToolName, pre.Command)
 			return agentcore.ApprovalResponse{Approved: true}, nil
