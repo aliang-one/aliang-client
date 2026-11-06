@@ -174,6 +174,8 @@ export function isAliangCodeSession(entry) {
   return normalizeDeviceProvider(entry.provider) === 'agentcore';
 }
 
+
+
 // 设备会话清单条目 → 前端统一会话对象（跨端清单与本地会话同池渲染的适配
 // 层）。id 加 dev- 前缀避免与本地会话 ID 撞车；title 缺省回落设备会话 ID；
 // 原始条目挂在 deviceSession 供续聊分流读 origin/created_at。脏输入（null/

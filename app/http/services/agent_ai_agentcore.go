@@ -1126,11 +1126,21 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 	// 逐回合诊断快照的落点：内核 OnTurn 写，进度心跳与 journal 终态行读。
 	// 必须先于 ticker 和 cfg 构造创建——两处都引用它。
 	diag := &agentCoreDiagnostics{}
-	// 调用记录落盘（AliangCode 留痕，spec §6）：入口写头行 + 首条 user 行，
-	// 成功出口写 assistant 行，所有出口经 defer 落 end 行。写失败只 Warn。
+	// 调用记录落盘（AliangCode 留痕，spec §6）：门禁全过后写头行 + 首条 user
+	// 行（见下方 journal 落盘段），成功出口写 assistant 行，所有出口经 defer
+	// 落 end 行。写失败只 Warn。
+	//
+	// journalStarted 是幽灵卡闸（2026-11-05）：校验失败回合（上游未起/未指定
+	// 模型/会话无消息）连 end 行也不许落——appendLineLocked 会 MkdirAll+
+	// O_CREATE 建文件，放行 defer 就会在没有任何对话内容的目录里凭空造出一张
+	// 只有失败记录的幽灵会话卡（仪表盘侧边栏出现打不开/没内容的卡）。
 	journal := m.coreJournal
+	journalStarted := false
 	endStatus, endErrMsg := "error", ""
 	defer func() {
+		if !journalStarted {
+			return
+		}
 		// 内核终态快照的真因优先：IsError 分支在这里只有笼统的
 		// 「agentcore run failed」，而终止帧带给手机真因的那段文案经 OnTurn
 		// 终态快照回到了宿主——落进 end 行，重开旧会话才能还原「为什么死」。
@@ -1139,19 +1149,6 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		}
 		journal.appendEndDiagnostics(run.sessionID, endStatus, endErrMsg, diag)
 	}()
-	now := time.Now().UTC().Format(time.RFC3339)
-	journal.ensureSessionHeader(run.sessionID, run.projectPath, agentCoreModel(run), run.effort, now, agentCoreJournalOrigin(run), run.disabledMCPServers, run.disabledSkills)
-	// 会话级开关的持久化写点在 create()/message() 的显式改键处（2026-10-31
-	// 评审修正）：这里**不**做每 run 进门同步——run 的内存名单可能还没从
-	// journal 头行水合（手机 v3 恒带 transcript、懒建恢复被历史门挡住、恢复
-	// 读失败等），拿未水合的 nil 当权威会把头行里持久化的名单删掉。
-	if lastUser, ok := m.lastUserHistoryMessage(run.sessionID); ok {
-		ts := now
-		if !lastUser.CreatedAt.IsZero() {
-			ts = lastUser.CreatedAt.UTC().Format(time.RFC3339)
-		}
-		journal.appendUser(run.sessionID, run.messageID, lastUser.Content, ts, agentAIJournalAttachmentsFrom(run.attachments))
-	}
 
 	if run.cancel != nil {
 		defer run.cancel()
@@ -1191,6 +1188,23 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, fmt.Errorf("会话没有可发送的消息")))
 		return
 	}
+
+	// 调用记录落盘（AliangCode 留痕，spec §6）：头行 + 首条 user 行在入口门禁
+	// 全过后才写——上游未起/未指定模型这类失败回合必须零痕迹（幽灵卡修复，
+	// 2026-11-05）。会话级开关的持久化写点在 create()/message() 的显式改键处
+	// （2026-10-31 评审修正）：这里**不**做每 run 进门同步——run 的内存名单
+	// 可能还没从 journal 头行水合（手机 v3 恒带 transcript、懒建恢复被历史门
+	// 挡住、恢复读失败等），拿未水合的 nil 当权威会把头行里持久化的名单删掉。
+	now := time.Now().UTC().Format(time.RFC3339)
+	journal.ensureSessionHeader(run.sessionID, run.projectPath, model, run.effort, now, agentCoreJournalOrigin(run), run.disabledMCPServers, run.disabledSkills)
+	if lastUser, ok := m.lastUserHistoryMessage(run.sessionID); ok {
+		ts := now
+		if !lastUser.CreatedAt.IsZero() {
+			ts = lastUser.CreatedAt.UTC().Format(time.RFC3339)
+		}
+		journal.appendUser(run.sessionID, run.messageID, lastUser.Content, ts, agentAIJournalAttachmentsFrom(run.attachments))
+	}
+	journalStarted = true
 
 	// 进度上报：与 CLI 路径同一套节拍与字段，手机端的「已改 N 个文件」直接复用。
 	var filesMu sync.Mutex

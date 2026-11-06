@@ -19,6 +19,7 @@ import (
 	"aliang.one/nursorgate/app/agentcore"
 	"aliang.one/nursorgate/app/http/models"
 	"aliang.one/nursorgate/common/cache"
+	"aliang.one/nursorgate/processor/config"
 )
 
 // 这一组测试锁死**宿主侧**的内置内核接线，与 app/agentcore 的内核测试互补：
@@ -284,10 +285,15 @@ func TestRunAgentCoreEmitsSingleDone(t *testing.T) {
 // TestRunAgentCoreRejectsEmptyHistory 覆盖「会话没有可发送的消息」这条前置。
 //
 // 没有它，用户会看到一个 ai.run.started 之后什么都没有的气泡。
+// 幽灵卡修复（Task G1）同款断言：这道门失败同样不得新建 journal 文件。
+// 上游改用活 httptest——死端口会先在 agentCoreEnsureUpstream 失败，测不到
+// 本道门，还会触发对 127.0.0.1:56431 管理面的自愈 POST（真机副作用）。
 func TestRunAgentCoreRejectsEmptyHistory(t *testing.T) {
 	setTestAgentHome(t) // journal 根在 newAgentAIManager 构造时解析
-	// 上游不该被访问；指到一个必然连不上的回环端口也不影响（这里先判空）。
-	t.Setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:1")
+	up, srv := newAgentCoreUpstream(t, agentCoreTextTurn("不该", "被调用"))
+	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
+	t.Setenv("ANTHROPIC_MODEL", "")
+	_ = up
 
 	m := newAgentAIManager()
 	const sessionID = "conv-agentcore-empty"
@@ -312,6 +318,7 @@ func TestRunAgentCoreRejectsEmptyHistory(t *testing.T) {
 	if got := log.count(models.AgentEventAIDone); got != 0 {
 		t.Fatalf("空会话不该发 ai.done，实际 %d 条", got)
 	}
+	assertNoJournalEntries(t, sessionID)
 }
 
 // TestAgentCoreApprovePolicyShortCircuits 锁死审批桥的本地短路。
@@ -817,6 +824,9 @@ func TestRunAgentCoreJournalsTranscript(t *testing.T) {
 // TestRunAgentCoreJournalsAutoProviderFirstUserLine 防回归：fallback 用户
 // （provider=auto）的 run 同样必须留下首条 user 行——这正是挂点收进
 // runAgentCore 入口的原因（派发前 provider 还是 auto）。
+// 幽灵卡修复（Task G1）后门禁全过才落盘，auto 回合也必须带模型名——
+// 无模型的 auto 回合会先在「未指定模型」门失败、零 journal（那条语义
+// 归 TestRunAgentCoreEmptyModelLeavesNoJournalFile 管）。
 func TestRunAgentCoreJournalsAutoProviderFirstUserLine(t *testing.T) {
 	setTestAgentHome(t)
 	_, srv := newAgentCoreUpstream(t, agentCoreTextTurn("好", ""))
@@ -836,6 +846,7 @@ func TestRunAgentCoreJournalsAutoProviderFirstUserLine(t *testing.T) {
 		runSeq:      1,
 		messageID:   "msg-host-j2",
 		provider:    "auto",
+		model:       "glm-5.2",
 		projectPath: t.TempDir(),
 		activity:    newAgentAIActivity(),
 	}
@@ -845,6 +856,101 @@ func TestRunAgentCoreJournalsAutoProviderFirstUserLine(t *testing.T) {
 	if len(lines) < 2 || lines[1]["role"] != "user" || lines[1]["text"] != "自动档" {
 		t.Fatalf("fallback 用户的首条 user 行缺失: %v", lines)
 	}
+}
+
+// assertNoJournalEntries 断言 journal 目录没有任何本会话（乃至任何会话）的
+// 落盘痕迹。setTestAgentHome 之后 journal 根是全新 TempDir，出现任何条目都是
+// 本回合的写入方造的——幽灵卡的判定就靠它。
+func assertNoJournalEntries(t *testing.T, sessionID string) {
+	t.Helper()
+	if _, err := os.Stat(filepath.Join(agentCoreJournalDir(), agentCoreJournalFileName(sessionID))); !os.IsNotExist(err) {
+		t.Fatalf("失败回合不得新建 journal 文件（幽灵卡）: %v", err)
+	}
+	entries, err := os.ReadDir(agentCoreJournalDir())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return
+		}
+		t.Fatalf("读 journal 目录: %v", err)
+	}
+	if len(entries) != 0 {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Fatalf("journal 目录应为空，实际 %v", names)
+	}
+}
+
+// TestRunAgentCoreEmptyModelLeavesNoJournalFile 锁死幽灵卡修复（Task G1）：
+// 「未指定模型」的失败回合不得在 journal 留下任何痕迹。会话 history 带
+// 真实 user 消息——证明跳过的不是「无话可写」而是入口门禁失败；修复前
+// 入口无条件写头行+user 行，这回合会凭空造出一张只有失败记录的幽灵会话卡。
+func TestRunAgentCoreEmptyModelLeavesNoJournalFile(t *testing.T) {
+	setTestAgentHome(t)
+	// 活上游：让 agentCoreEnsureUpstream 的回环拨测通过，失败必须落在
+	// 「未指定模型」这一道门上，而不是上游探测。
+	_, srv := newAgentCoreUpstream(t, agentCoreTextTurn("不该", "被调用"))
+	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
+	t.Setenv("ANTHROPIC_MODEL", "")
+
+	m := newAgentAIManager()
+	const sessionID = "conv-journal-nomodel"
+	registerTestAISession(t, m, &agentAISession{
+		id:      sessionID,
+		runSeq:  1,
+		history: []agentAIMessage{{Role: "user", Content: "没选模型"}},
+	})
+	log := &agentCoreEventLog{}
+	run := agentAIRun{
+		sessionID:   sessionID,
+		runSeq:      1,
+		messageID:   "msg-host-nomodel",
+		provider:    "agentcore",
+		model:       "", // 手机没下发模型名 → 入口门禁拒绝开跑
+		projectPath: t.TempDir(),
+		activity:    newAgentAIActivity(),
+	}
+	m.runAgentCore(context.Background(), run, log.write)
+
+	if got := log.count(models.AgentEventAIError); got != 1 {
+		t.Fatalf("ai.error 数量 = %d, want 1（序列 %v）", got, log.types())
+	}
+	assertNoJournalEntries(t, sessionID)
+}
+
+// TestRunAgentCoreUpstreamDownLeavesNoJournalFile 同上，落点换成「上游未起」
+// 这道门。用显式自定义端点（EffectiveAgentCoreLLM 指向必然连不上的回环端口）
+// 触发——该分支只拨测不自愈，绝不 POST 本机管理面。
+func TestRunAgentCoreUpstreamDownLeavesNoJournalFile(t *testing.T) {
+	setTestAgentHome(t)
+	setTestGlobalConfigAgentCoreLLM(t, &config.AgentCoreLLMConfig{
+		Enabled: true, BaseURL: "http://127.0.0.1:1",
+	})
+
+	m := newAgentAIManager()
+	const sessionID = "conv-journal-updown"
+	registerTestAISession(t, m, &agentAISession{
+		id:      sessionID,
+		runSeq:  1,
+		history: []agentAIMessage{{Role: "user", Content: "代理没起"}},
+	})
+	log := &agentCoreEventLog{}
+	run := agentAIRun{
+		sessionID:   sessionID,
+		runSeq:      1,
+		messageID:   "msg-host-updown",
+		provider:    "agentcore",
+		model:       "glm-5.2",
+		projectPath: t.TempDir(),
+		activity:    newAgentAIActivity(),
+	}
+	m.runAgentCore(context.Background(), run, log.write)
+
+	if got := log.count(models.AgentEventAIError); got != 1 {
+		t.Fatalf("ai.error 数量 = %d, want 1（序列 %v）", got, log.types())
+	}
+	assertNoJournalEntries(t, sessionID)
 }
 
 // TestRunAgentCoreJournalsWriteFailureDoesNotAffectRun journal 写失败绝不影响
@@ -891,13 +997,22 @@ func TestRunAgentCoreJournalsWriteFailureDoesNotAffectRun(t *testing.T) {
 }
 
 // TestRunAgentCoreJournalsErrorEnd 错误出口也要落 end 行，但绝不落 assistant 行。
+//
+// 幽灵卡修复（Task G1）后的形态：上游未起这类**入口门禁**失败完全不写 journal
+// （失败回合连卡都不建），所以这里改用「门禁全过、内核 run 中途失败」的形态
+// ——上游返回 200+错误体（镜像 TestRunAgentCoreSurfacesUpstreamErrorBody），
+// journal 必须留下 头行+user 行+end(error)。
 func TestRunAgentCoreJournalsErrorEnd(t *testing.T) {
 	setTestAgentHome(t)
-	// 不配可用上游（BASE_URL 指向必然连不上的回环端口）→ agentCoreEnsureUpstream
-	// 或内核请求失败。若发现该测试因自愈逻辑产生重副作用，参考现有
-	// TestRunAgentCoreRejectsEmptyHistory 的处理方式调整，但断言不变：
-	// journal 末行必须是 end/status=error，且全程无 assistant 行。
-	t.Setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:1")
+	// 200 + 裸错误 JSON：网关把错误塞进响应体的形态，内核会以 result.IsError
+	// 终止。拨测只做 TCP，所以门禁照样放行。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{"error":{"message":"model not found","type":"invalid_request_error"},"type":"error"}`)
+	}))
+	t.Cleanup(srv.Close)
+	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
 	t.Setenv("ANTHROPIC_MODEL", "")
 
 	m := newAgentAIManager()

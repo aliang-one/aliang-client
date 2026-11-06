@@ -153,10 +153,12 @@ const { t } = useI18n();
 
 // 系统条 testid 按 note 种类分流（Task 14 新增 option_cancelled；未知种类
 // 退审批取消条形态，与既有 run_notice/approval_cancelled 同族）。
+// turn_failed（G5 错误终态）：journal end(error) 折出的失败说明条。
 function systemNoteTestId(note) {
   if (note === 'run_notice') return 'chat-run-notice';
   if (note === 'option_cancelled') return 'chat-option-cancelled-note';
   if (note === 'approval_not_found') return 'chat-approval-not-found-note';
+  if (note === 'turn_failed') return 'chat-turn-failed-note';
   return 'chat-approval-cancelled-note';
 }
 

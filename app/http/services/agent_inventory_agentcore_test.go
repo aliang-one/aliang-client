@@ -7,7 +7,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+
 	"aliang.one/nursorgate/app/http/models"
+	"aliang.one/nursorgate/common/cache"
 )
 
 // writeAgentCoreJournalFixture 用真实 journal 写侧造测试文件（保证格式一致）。
@@ -388,5 +391,146 @@ func TestOverlayMergesAgentCoreActiveWithFileEntry(t *testing.T) {
 	}
 	if merged.VibeSessions[0].Status != "running" {
 		t.Errorf("合并后 status = %q, want running", merged.VibeSessions[0].Status)
+	}
+}
+
+// TestCollectAgentCoreVibeSessionsAppliesRenameCache 收口改名断链：手机经
+// ai.session.rename 改名 agentcore 会话时,agent 写侧把改名同时以「会话 id」
+// 为键落 rename 缓存（native 键对裸 id 卡不可达）,清单组装处按会话 id 兜底
+// 覆盖标题——优先级 rename 缓存 > journal 首条消息截断。
+func TestCollectAgentCoreVibeSessionsAppliesRenameCache(t *testing.T) {
+	setTestAgentHome(t)
+	cache.ResetCacheDirForTest()
+	dir := agentCoreJournalDir()
+	writeAgentCoreJournalFixture(t, dir, "conv-renamed", "/tmp/p1")
+	writeAgentCoreJournalFixture(t, dir, "conv-plain", "/tmp/p2")
+
+	path, err := agentRenameCachePath()
+	require.NoError(t, err)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	require.NoError(t, saveAgentRenameCacheFile(path, map[string]agentRenameCacheEntry{
+		"conv-renamed": {
+			Name:        "手机新标题",
+			Origin:      "phone",
+			Source:      "phone",
+			UpdatedAt:   now,
+			ProjectPath: "/tmp/p1",
+			SkipMirror:  true,
+		},
+	}))
+
+	sessions := collectAgentCoreVibeSessions(nil)
+	byID := map[string]models.AgentVibeSession{}
+	for _, s := range sessions {
+		byID[s.ID] = s
+	}
+	renamed, ok := byID["conv-renamed"]
+	if !ok {
+		t.Fatalf("missing conv-renamed in %v", sessions)
+	}
+	if renamed.Title != "手机新标题" {
+		t.Errorf("Title = %q, want 手机新标题（rename 缓存优先于 journal 首条消息）", renamed.Title)
+	}
+	if renamed.TitleSource != "user" {
+		t.Errorf("TitleSource = %q, want user（phone origin 归一为用户意图）", renamed.TitleSource)
+	}
+	if renamed.TitleUpdatedAt == "" {
+		t.Error("TitleUpdatedAt 为空,服务端 latest-of-writer 守卫将失去锚点")
+	}
+	plain, ok := byID["conv-plain"]
+	if !ok {
+		t.Fatalf("missing conv-plain in %v", sessions)
+	}
+	if plain.Title != "第一句" {
+		t.Errorf("未改名卡 Title = %q, want journal 首条消息「第一句」", plain.Title)
+	}
+}
+
+// TestReadAgentCoreSessionMetaEndErrorSystemBar（G5 问题悬空）：详情转录必须
+// 把 journal end(error) 行折成 role=system 的系统条（人话终态文案），失败提问
+// 不再悬空。核对项：①系统条按转录序插在失败位置（tool/turn 同款行序计数器，
+// Index 单调）；②不计 MessageCount/displayCount（系统条是轨迹性说明行，与
+// tool 行同口径——PhoneServer 消息数过滤宇宙已按 role=system 排除）；③成功
+// /取消终态不产条；④无头行文件不产条（session.ID 空时无归属，与 tool/turn
+// 同款损失模式）。
+func TestReadAgentCoreSessionMetaEndErrorSystemBar(t *testing.T) {
+	setTestAgentHome(t)
+	path := writeCoreJournalRawFixture(t, "sess-endbar",
+		`{"kind":"session","session_id":"sess-endbar","project_path":"/tmp/p","model":"m","created_at":"2026-11-05T01:00:00Z"}`,
+		`{"kind":"msg","role":"user","message_id":"u1","text":"查一下","ts":"2026-11-05T01:00:05Z"}`,
+		`{"kind":"turn","turn":1,"role":"assistant","stop_reason":"tool_use","text":"正在查看相关文件…","ts":"2026-11-05T01:00:06Z","tools":["Bash"]}`,
+		`{"kind":"end","status":"error","error":"工具连续 3 次执行失败，疑似陷入重试循环，已停止","diagnostics":{"turns":3,"reason":"工具连续 3 次执行失败，疑似陷入重试循环"},"ts":"2026-11-05T01:00:07Z"}`,
+		`{"kind":"msg","role":"user","message_id":"u2","text":"再试一次","ts":"2026-11-05T01:01:00Z"}`,
+		`{"kind":"end","status":"success","ts":"2026-11-05T01:01:10Z"}`,
+	)
+	session := readAgentCoreSessionMetaWithOptions(path, agentVibeSessionReadOptions{Limit: agentVibeTranscriptMaxMessages, IncludePageMeta: true})
+	// 计数口径：msg+turn 行计数（user×2 + turn×1 = 3），系统条不计数。
+	if session.MessageCount != 3 || session.DisplayMessageCount == nil || *session.DisplayMessageCount != 3 {
+		t.Fatalf("系统条不得计入对话计数: %d %v", session.MessageCount, session.DisplayMessageCount)
+	}
+	want := []struct {
+		role    string
+		id      string
+		index   int
+		content string
+	}{
+		{"user", "u1", 0, "查一下"},
+		{"assistant", "turn-000001", 1, ""},
+		{"system", "end-000001", 2, "这一轮执行失败：工具连续 3 次执行失败，疑似陷入重试循环"},
+		{"user", "u2", 3, "再试一次"},
+	}
+	if len(session.Transcript) != len(want) {
+		t.Fatalf("Transcript = %d 行, want %d: %+v", len(session.Transcript), len(want), session.Transcript)
+	}
+	for i, w := range want {
+		msg := session.Transcript[i]
+		if msg.Role != w.role || msg.ID != w.id || msg.Index != w.index {
+			t.Fatalf("Transcript[%d] = %+v, want role=%s id=%s index=%d", i, msg, w.role, w.id, w.index)
+		}
+		if w.content != "" && msg.Content != w.content {
+			t.Fatalf("Transcript[%d].Content = %q, want %q", i, msg.Content, w.content)
+		}
+	}
+	// 系统条带 end 行时间戳（气泡相对时间用它）。
+	if session.Transcript[2].Timestamp != normalizeAgentTime("2026-11-05T01:00:07Z") {
+		t.Fatalf("系统条时间戳错: %+v", session.Transcript[2])
+	}
+}
+
+// 成功终态-only 文件：任何位置都不得出现系统条（与快照读侧同款守卫）。
+func TestReadAgentCoreSessionMetaSuccessEndNoSystemBar(t *testing.T) {
+	setTestAgentHome(t)
+	path := writeCoreJournalRawFixture(t, "sess-endok",
+		`{"kind":"session","session_id":"sess-endok","project_path":"/tmp/p","model":"m","created_at":"2026-11-05T01:00:00Z"}`,
+		`{"kind":"msg","role":"user","message_id":"u1","text":"问","ts":"2026-11-05T01:00:05Z"}`,
+		`{"kind":"end","status":"success","ts":"2026-11-05T01:00:09Z"}`,
+	)
+	session := readAgentCoreSessionMetaWithOptions(path, agentVibeSessionReadOptions{Limit: agentVibeTranscriptMaxMessages})
+	for _, msg := range session.Transcript {
+		if msg.Role == "system" {
+			t.Fatalf("成功终态不得产系统条: %+v", session.Transcript)
+		}
+	}
+}
+
+// 无头行文件（steer 先到）：系统条与 tool/turn 同款跳过——session.ID 在解析期
+// 尚空，无归属依据；诊断 enrich 不受影响（既有口径不变）。
+func TestReadAgentCoreSessionMetaEndBarHeadlessFileSkipped(t *testing.T) {
+	setTestAgentHome(t)
+	path := writeCoreJournalRawFixture(t, "sess-endheadless",
+		`{"kind":"msg","role":"user","message_id":"u1","text":"问","ts":"2026-11-05T01:00:05Z"}`,
+		`{"kind":"end","status":"error","error":"上游失联","ts":"2026-11-05T01:00:09Z"}`,
+	)
+	session := readAgentCoreSessionMetaWithOptions(path, agentVibeSessionReadOptions{Limit: agentVibeTranscriptMaxMessages})
+	if session.ID == "" {
+		t.Fatalf("无头行文件应兜底文件名 ID: %+v", session)
+	}
+	for _, msg := range session.Transcript {
+		if msg.Role == "system" {
+			t.Fatalf("无头行文件的系统条应跳过(无归属): %+v", session.Transcript)
+		}
+	}
+	if session.Diagnostics == nil || session.Diagnostics.Error != "上游失联" {
+		t.Fatalf("诊断 enrich 口径不得受系统条改动影响: %+v", session.Diagnostics)
 	}
 }

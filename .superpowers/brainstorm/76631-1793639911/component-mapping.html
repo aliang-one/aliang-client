@@ -1,0 +1,69 @@
+<h2>问题 3：现有 17 个组件的新归属（请确认/调整）</h2>
+<p class="subtitle">四栏骨架 + Agent 三子 tab 定了，下面是把现有组件逐一放进新骨架的完整地图。<b style="color:#d97706">橙标</b>是我拿不准、需要你拍板的。</p>
+
+<div class="section">
+  <table style="width:100%;border-collapse:collapse;font-size:13px">
+    <tr style="border-bottom:2px solid #ccc;text-align:left">
+      <th style="padding:6px">新位置</th>
+      <th style="padding:6px">组件（现状）</th>
+      <th style="padding:6px">说明</th>
+    </tr>
+    <tr style="border-bottom:1px solid #eee"><td style="padding:6px"><b>① 代理设置</b><br><span style="color:#999;font-size:11px">原「设置」改名</span></td>
+      <td style="padding:6px">模型映射 ModelMapping<br>AI 规则 + 分流规则 Rules<br>代理开关（Rules 内含 proxy 开关）</td>
+      <td style="padding:6px;color:#666">凡代理层的东西：出站模型改写、分流、AI 规则</td></tr>
+    <tr style="border-bottom:1px solid #eee"><td style="padding:6px" rowspan="2"><b>② Agent › 记录</b></td>
+      <td style="padding:6px">AI 会话活动 AgentActivity<br><span style="color:#999;font-size:11px">已含分页 + aliangcode 过滤</span></td>
+      <td style="padding:6px;color:#666">claude/codex/aliangcode 全量会话</td></tr>
+    <tr style="border-bottom:1px solid #eee"><td style="padding:6px">远程终端实时 AgentRuntimeSessions</td>
+      <td style="padding:6px;color:#666">在连终端 + 回放（实时）</td></tr>
+    <tr style="border-bottom:1px solid #eee"><td style="padding:6px" rowspan="3"><b>② Agent › 用户态 agent</b></td>
+      <td style="padding:6px">用户态 Agent 卡片+设置弹窗 AgentSettings</td>
+      <td style="padding:6px;color:#666">注册状态/历史同步/工具/启动配置</td></tr>
+    <tr style="border-bottom:1px solid #eee"><td style="padding:6px">扫描目录 AgentScanDirectories</td>
+      <td style="padding:6px;color:#666">历史同步的扫描范围（属于用户态 agent 的历史同步）</td></tr>
+    <tr style="border-bottom:1px solid #eee"><td style="padding:6px">外部 CLI 集成 AgentIntegrations</td>
+      <td style="padding:6px;color:#666">claudecode/codex 的 MCP/技能生效报告（适用对象是外部 CLI，非 aliangcode）</td></tr>
+    <tr style="border-bottom:1px solid #eee"><td style="padding:6px" rowspan="3"><b>② Agent › aliangcode</b><br><span style="color:#999;font-size:11px">「小入口」= 第三个子 tab</span></td>
+      <td style="padding:6px">aliangcode LLM 开关+BaseURL+Key AgentCore</td>
+      <td style="padding:6px;color:#666">从旧「设置」tab 挪入</td></tr>
+    <tr style="border-bottom:1px solid #eee"><td style="padding:6px">MCP 全局 AgentMCPGlobal</td>
+      <td style="padding:6px;color:#666">从旧「能力接入」挪入</td></tr>
+    <tr style="border-bottom:1px solid #eee"><td style="padding:6px">技能全局 AgentSkillsGlobal</td>
+      <td style="padding:6px;color:#666">从旧「能力接入」挪入</td></tr>
+    <tr style="border-bottom:1px solid #eee"><td style="padding:6px"><b>③ 状态</b><br><span style="color:#999;font-size:11px">原「日志」改名</span></td>
+      <td style="padding:6px">实时日志 Logs</td>
+      <td style="padding:6px;color:#666">只读观测保留</td></tr>
+    <tr style="border-bottom:1px solid #eee"><td style="padding:6px"><b>③ 状态 › 其他</b>（页尾区块）</td>
+      <td style="padding:6px">系统设置 System（运行模式/系统服务/证书）<br>🆕 跨设备执行开关（peer_exec_enabled）<br>🆕 文件传输开关（peer_fetch_enabled）</td>
+      <td style="padding:6px;color:#666">设备级杂项集中地</td></tr>
+    <tr style="border-bottom:1px solid #eee"><td style="padding:6px"><b>④ 用户</b><br><span style="color:#999;font-size:11px">原「用户中心」</span></td>
+      <td style="padding:6px">账户信息 UserInfo<br>外观 Appearance</td>
+      <td style="padding:6px;color:#666">不变</td></tr>
+  </table>
+</div>
+
+<div class="options" data-multiselect>
+  <div class="option" data-choice="q1" onclick="toggleSelect(this)">
+    <div class="letter">?</div>
+    <div class="content">
+      <h3>疑点 1：文件访问授权 AgentFileAccess 放哪？</h3>
+      <p>macOS 隐私目录一次性授权（防远程调用弹窗卡死）。它授权的是整个 Agent 链路，不是用户态 agent 独有。<br><b>我的建议：放「状态 › 其他」</b>（和系统设置同级的设备级开关）。若你觉得它跟启动工具绑定更紧，也可以放「用户态 agent」。</p>
+    </div>
+  </div>
+  <div class="option" data-choice="q2" onclick="toggleSelect(this)">
+    <div class="letter">?</div>
+    <div class="content">
+      <h3>疑点 2：自定义环境变量 CustomEnv 放哪？</h3>
+      <p>自定义 env 注入 AI run。注入对象是平台通道的 AI run（含 aliangcode 和外部 CLI）。<br><b>我的建议：放「Agent › aliangcode」</b>（跟 LLM 设置同区，都是「AI run 用什么环境」）。也可放「用户态 agent」或「状态 › 其他」。</p>
+    </div>
+  </div>
+  <div class="option" data-choice="q3" onclick="toggleSelect(this)">
+    <div class="letter">!</div>
+    <div class="content">
+      <h3>提醒：🆕 两个开关需要后端配合</h3>
+      <p>peer_exec_enabled / peer_fetch_enabled 存在服务端设备注册表，本机 agent 只读。<b>前端开关需要新增一条「写设备开关」的 API</b>（本仓 agent 侧 + 服务端 PhoneServer 配合）。<br>这一轮做，还是先留占位（开关置灰 + 「即将上线」）？</p>
+    </div>
+  </div>
+</div>
+
+<p class="subtitle" style="margin-top:20px">整体地图没问题就回复「地图 OK + 疑点怎么定」；有问题直接说哪行要改。</p>

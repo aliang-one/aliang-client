@@ -1,0 +1,70 @@
+<h2>设计 §1：新页面骨架总览</h2>
+<p class="subtitle">四栏导航 + Agent 三子 tab 的最终形态。确认后我再过技术节。</p>
+
+<div class="section">
+  <div class="label">① 代理设置（原「模型与推理」改名）</div>
+  <div class="mockup"><div class="mockup-body">
+    <div class="mock-nav">代理设置 · Agent · 状态 · 用户</div>
+    <div style="border:1px solid #ddd;border-radius:6px;padding:10px;margin-top:8px">
+      <p style="font-size:12px;font-weight:bold">模型映射</p>
+      <p style="font-size:11px;color:#888">出站模型名改写（原「设置」tab 挪入）</p>
+      <hr style="margin:8px 0;border-color:#eee">
+      <p style="font-size:12px;font-weight:bold">代理开关 · AI 规则 · 分流规则</p>
+      <p style="font-size:11px;color:#888">RulesSettings 整卡（原「设备与网络」挪入）</p>
+    </div>
+  </div></div>
+</div>
+
+<div class="section">
+  <div class="label">② Agent（新独立页 AgentPage，含三个子 tab）</div>
+  <div class="mockup"><div class="mockup-body">
+    <div style="display:flex;gap:6px;margin-bottom:8px">
+      <span style="background:#2563eb;color:#fff;padding:4px 12px;border-radius:999px;font-size:12px;font-weight:bold">记录</span>
+      <span style="background:#eee;padding:4px 12px;border-radius:999px;font-size:12px">用户态 agent</span>
+      <span style="background:#eee;padding:4px 12px;border-radius:999px;font-size:12px">aliangcode</span>
+    </div>
+    <div style="border:1px solid #ddd;border-radius:6px;padding:10px;margin-bottom:6px">
+      <p style="font-size:12px;font-weight:bold">🤖 AI 会话记录 <span style="color:#2563eb;font-size:10px">claude/codex/aliangcode/… · 已有分页</span></p>
+      <p style="font-size:11px;color:#888">AgentActivitySettings 迁入 + agent 类型筛选（取代原「仅 aliangcode」单一开关）</p>
+    </div>
+    <div style="border:1px solid #ddd;border-radius:6px;padding:10px">
+      <p style="font-size:12px;font-weight:bold">⌨️ 远程终端 <span style="color:#059669;font-size:10px">● 实时</span></p>
+      <p style="font-size:11px;color:#888">AgentRuntimeSessions 迁入（在连终端 + 回放）</p>
+    </div>
+    <p style="font-size:11px;color:#999;margin-top:8px">子 tab ②：AgentSettings 卡片+设置弹窗、扫描目录、外部 CLI 集成（MCP/技能报告）<br>子 tab ③：aliangcode LLM（开关/BaseURL/Key）、MCP 全局、技能全局、自定义环境变量</p>
+  </div></div>
+</div>
+
+<div class="section">
+  <div class="label">③ 状态（原「诊断」改名）+ 页尾「其他」</div>
+  <div class="mockup"><div class="mockup-body">
+    <div style="border:1px solid #ddd;border-radius:6px;padding:10px">
+      <p style="font-size:12px;font-weight:bold">实时日志</p>
+      <p style="font-size:11px;color:#888">LogsSettings（只读观测）</p>
+    </div>
+    <div style="border:1px dashed #d97706;border-radius:6px;padding:10px;margin-top:6px">
+      <p style="font-size:12px;font-weight:bold">⚙️ 其他（页尾区块）</p>
+      <p style="font-size:11px;color:#888">系统设置（运行模式/系统服务/证书）· 文件访问授权 ·<br>🆕 跨设备执行开关（置灰·即将上线）· 🆕 文件传输开关（置灰·即将上线）</p>
+    </div>
+  </div></div>
+</div>
+
+<div class="section">
+  <div class="label">④ 用户（原「账户与界面」改名，内容不变）</div>
+  <div class="mockup"><div class="mockup-body">
+    <div style="border:1px solid #ddd;border-radius:6px;padding:10px">
+      <p style="font-size:11px;color:#888">账户信息 UserInfo · 外观 Appearance —— 原样保留</p>
+    </div>
+  </div></div>
+</div>
+
+<div class="options">
+  <div class="option" data-choice="ok" onclick="toggleSelect(this)">
+    <div class="letter">✓</div>
+    <div class="content"><h3>骨架没问题，继续过技术设计</h3></div>
+  </div>
+  <div class="option" data-choice="adjust" onclick="toggleSelect(this)">
+    <div class="letter">✗</div>
+    <div class="content"><h3>有要调的地方（在终端说明）</h3></div>
+  </div>
+</div>

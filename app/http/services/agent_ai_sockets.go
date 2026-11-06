@@ -264,7 +264,11 @@ func (m *agentAIManager) emitSessionSnapshot(socketID, sessionID string, writeJS
 	if m.coreJournal != nil && m.coreJournal.dir != "" {
 		dir = m.coreJournal.dir
 	}
-	if hist, _, err := readAgentCoreJournalHistoryFrom(dir, sessionID); err == nil && len(hist) > 0 {
+	// 展示面走带 end 系统条的口径（G5 问题悬空修复）：end(error) 行折成
+	// role=system 的系统条进快照转录；模型上下文回装仍走纯对话口径
+	// readAgentCoreJournalHistoryFrom，两口径在同一解析器上分叉（见
+	// readAgentCoreJournalTranscriptFrom 注释）。
+	if hist, _, err := readAgentCoreJournalTranscriptFrom(dir, sessionID, true); err == nil && len(hist) > 0 {
 		// 传输层限幅（评审 I1）：单条文本按清单口径截断（agentVibeTranscript-
 		// MaxContentRunes，与 agent_inventory_agentcore.go 的转录生成同一
 		// helper/常量，rune 安全不断 UTF-8），总数只保最近
