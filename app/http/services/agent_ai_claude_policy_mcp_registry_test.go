@@ -102,3 +102,23 @@ func TestClaudeTierMCPArgsTrustedAllEmptyStaysNil(t *testing.T) {
 	}
 	cleanup()
 }
+
+func TestClaudeTierMCPArgsProjectWinsOverRegistry(t *testing.T) {
+	home := t.TempDir()
+	swapClaudeTierHome(t, home)
+	// 全优先级链锁定:同名 dup 三源齐备,可信项目条目最后合并必须胜出
+	// (user < plugin < registry < project 的合并序,防将来重构静默翻转)。
+	_ = os.WriteFile(filepath.Join(home, ".claude.json"), []byte(`{"mcpServers":{"dup":{"command":"legacy"}}}`), 0o600)
+	_ = upsertAliangMCPServerForTest(home, "dup", aliangMCPServerEntry{Command: "registry"})
+	proj := t.TempDir()
+	_ = os.WriteFile(filepath.Join(proj, ".mcp.json"), []byte(`{"mcpServers":{"dup":{"command":"project"}}}`), 0o600)
+	policy := agentAIClaudeRemotePolicy{projectMCPTrusted: true}
+	flags, cleanup, err := claudeTierMCPArgs(policy, proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	servers := claudeTierPayloadServerNames(t, flags, cleanup)
+	if servers["dup"]["command"] != "project" {
+		t.Fatalf("可信项目同名条目必须胜过注册表, got %v", servers["dup"])
+	}
+}

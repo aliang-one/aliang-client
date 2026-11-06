@@ -87,7 +87,8 @@ func sanitizeAgentCoreMCPSegment(s string) string {
 }
 
 // agentCoreMCPRawServersIn 采集 user 域原始 MCP 配置（未脱敏，连接专用）。
-// 数据源与清单层同源：~/.claude.json 顶层 mcpServers + 已启用插件 .mcp.json，
+// 数据源与清单层同源：~/.claude.json 顶层 mcpServers + 已启用插件 .mcp.json
+// + 统一注册表 ~/.aliang/mcp.json（遗留源之后合并，同名键注册表胜出），
 // 解析直接复用清单层的 readMCPServersFile / readPluginMCPDeclaration（它们
 // 填充的是未脱敏原始 map，脱敏发生在更下游的 FromClaudeRaw，我们绕开它）。
 // 畸形/disabled 条目跳过；上限 24，按键排序保证截断确定性。

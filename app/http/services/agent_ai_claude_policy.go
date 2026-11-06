@@ -242,12 +242,15 @@ func claudeTierMCPArgs(policy agentAIClaudeRemotePolicy, projectPath string) ([]
 	return []string{"--strict-mcp-config", "--mcp-config", tmp.Name()}, cleanup, nil
 }
 
-// claudeTierMCPHome 是 claudeTierMCPArgs 取 home 的注入点(测试替换);
-// swap 期间该包测试禁 t.Parallel。
+// claudeTierMCPHome 是 claudeTierMCPArgs 取 home 的注入点(测试替换)。
+// 测试 swap 期间不得有后台 claudeTierMCPArgs 调用方;包内测试禁 t.Parallel
+// (同 mcpInventoryHome 条款:生产唯一调用方 withClaudeRemotePolicy 是 run
+// 组装期同步调用,条款立在此防将来有人加后台调用)。
 var claudeTierMCPHome = agentHome
 
-// readPluginMCPServersIn 与 readPluginMCPServers(agent_ai_claude_policy.go:338)
-// 行为一致,仅 home 注入化;插件复合键 plugin:<name>:<server> 语义不变。
+// readPluginMCPServersIn 与 readPluginMCPServers 行为一致,仅 home 注入化;
+// 插件复合键 plugin:<name>:<server> 语义不变。返回值与原函数对齐,供测试/
+// 调用方按需消费。
 func readPluginMCPServersIn(home string, dst map[string]interface{}) int {
 	added := 0
 	for _, inst := range enabledUserScopePluginInstallsIn(home) {
