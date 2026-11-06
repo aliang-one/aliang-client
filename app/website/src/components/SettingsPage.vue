@@ -129,6 +129,9 @@
              仅影响未单独设置的新会话与代理层；会话级覆盖在聊天页会话设置条。 -->
         <section v-if="currentPage === 'settings'" class="flex flex-col gap-5">
           <SectionHeader :title="t('settings_tabSettings')" :desc="t('settings_sectionProxyDesc')" scope="device" />
+          <!-- 运行模式随 2026-11-05 spec 迁入(自状态页尾「其他」),置于登录占位
+               之上:设备本地操作与电源按钮同级,不被登录挡。 -->
+          <SystemRunModeSettings />
           <div
             v-if="!isAuthenticated"
             class="rounded-2xl border border-dashed border-slate-300 bg-white px-6 py-8 text-center shadow-sm dark:border-slate-700 dark:bg-slate-900"
@@ -200,14 +203,6 @@
           </div>
           <template v-else>
             <LogsSettings />
-            <OtherSettings
-              :config="customerConfig"
-              :loading="isLoadingCustomerConfig"
-              :saving="isSavingCustomerConfig"
-              :error="customerConfigError"
-              :success-message="customerConfigSuccess"
-              @save="saveCustomerConfig"
-            />
           </template>
         </section>
       </main>
@@ -241,14 +236,15 @@
 
 <script>
 // 四栏重组 2026-11-03：代理设置(settings) → Agent(agent,三子 tab) → 状态(log) → 用户(user)。
-// Agent 子组件收拢在 settings/agent/AgentPage.vue，设备级杂项收拢在 OtherSettings.vue。
+// Agent 子组件收拢在 settings/agent/AgentPage.vue；设备级杂项已于 2026-11-05
+// 迁出：运行模式→代理设置首卡，系统状态/文件访问授权→仪表盘侧栏紧凑卡。
 import RulesSettings from './settings/RulesSettings.vue';
 import UserInfoSettings from './settings/UserInfoSettings.vue';
 import LogsSettings from './settings/LogsSettings.vue';
 import ModelMappingSettings from './settings/ModelMappingSettings.vue';
+import SystemRunModeSettings from './settings/SystemRunModeSettings.vue';
 import AppearanceSettings from './settings/AppearanceSettings.vue';
 import AgentPage from './settings/agent/AgentPage.vue';
-import OtherSettings from './settings/OtherSettings.vue';
 import SectionHeader from './settings/SectionHeader.vue';
 import { normalizeAgentCoreLLMConfig, applyAgentCoreLLMClearing, normalizeAgentCoreTuning, normalizePeerMCPConfig } from '../utils/agentCoreSettings';
 import { useNavigation } from '../composables/useNavigation';
@@ -439,9 +435,9 @@ export default {
     UserInfoSettings,
     LogsSettings,
     ModelMappingSettings,
+    SystemRunModeSettings,
     AppearanceSettings,
     AgentPage,
-    OtherSettings,
     SectionHeader
   },
   setup() {

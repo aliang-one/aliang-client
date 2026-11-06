@@ -322,16 +322,37 @@ func (j *agentCoreJournal) prependHeaderLocked(path, sessionID, projectPath, mod
 	logger.Info(fmt.Sprintf("agentcore-journal: session header backfilled session=%s", sessionID))
 }
 
-func (j *agentCoreJournal) appendUser(sessionID, messageID, text, ts string) {
-	j.appendMsg(sessionID, "user", messageID, text, ts)
+// agentAIJournalAttachment 是 msg 行的附件引用（spec 2026-11-05-chat-image-
+// pipeline §3.2）。Ref=相对持久缓存根；journal 不落绝对路径与 URL（网页经
+// /api/agent/ai/attachment?ref= 取图）。Origin=phone|web。
+type agentAIJournalAttachment struct {
+	Name   string `json:"name"`
+	Mime   string `json:"mime,omitempty"`
+	Bytes  int64  `json:"bytes,omitempty"`
+	Ref    string `json:"ref"`
+	Origin string `json:"origin,omitempty"`
+}
+
+func (j *agentCoreJournal) appendUser(sessionID, messageID, text, ts string, attachments ...[]agentAIJournalAttachment) {
+	j.appendMsg(sessionID, "user", messageID, text, ts, attachments...)
 }
 
 func (j *agentCoreJournal) appendAssistant(sessionID, messageID, text, ts string) {
 	j.appendMsg(sessionID, "assistant", messageID, text, ts)
 }
 
-func (j *agentCoreJournal) appendMsg(sessionID, role, messageID, text, ts string) {
-	if j == nil || j.dir == "" || strings.TrimSpace(sessionID) == "" || strings.TrimSpace(messageID) == "" || strings.TrimSpace(text) == "" {
+func (j *agentCoreJournal) appendMsg(sessionID, role, messageID, text, ts string, attachments ...[]agentAIJournalAttachment) {
+	var atts []agentAIJournalAttachment
+	if len(attachments) > 0 {
+		atts = attachments[0]
+	}
+	// 守卫修正（spec §3.2）：text 空但带附件的纯图消息必须落盘——旧逻辑
+	// 「text 空直接 return」是手机图在网页消失的治本断点①。空文本且无附件
+	// 依旧不落（防空行垃圾）。
+	if j == nil || j.dir == "" || strings.TrimSpace(sessionID) == "" || strings.TrimSpace(messageID) == "" {
+		return
+	}
+	if strings.TrimSpace(text) == "" && len(atts) == 0 {
 		return
 	}
 	j.mu.Lock()
@@ -340,13 +361,17 @@ func (j *agentCoreJournal) appendMsg(sessionID, role, messageID, text, ts string
 	if _, dup := j.written[key]; dup {
 		return
 	}
-	if !j.appendLineLocked(sessionID, map[string]interface{}{
+	row := map[string]interface{}{
 		"kind":       "msg",
 		"role":       role,
 		"message_id": messageID,
 		"text":       text,
 		"ts":         ts,
-	}) {
+	}
+	if len(atts) > 0 {
+		row["attachments"] = atts
+	}
+	if !j.appendLineLocked(sessionID, row) {
 		// 写失败不记去重键：written 只记「已落盘」，IO 恢复后同消息可补写。
 		return
 	}

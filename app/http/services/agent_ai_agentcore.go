@@ -1126,11 +1126,21 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 	// 逐回合诊断快照的落点：内核 OnTurn 写，进度心跳与 journal 终态行读。
 	// 必须先于 ticker 和 cfg 构造创建——两处都引用它。
 	diag := &agentCoreDiagnostics{}
-	// 调用记录落盘（AliangCode 留痕，spec §6）：入口写头行 + 首条 user 行，
-	// 成功出口写 assistant 行，所有出口经 defer 落 end 行。写失败只 Warn。
+	// 调用记录落盘（AliangCode 留痕，spec §6）：门禁全过后写头行 + 首条 user
+	// 行（见下方 journal 落盘段），成功出口写 assistant 行，所有出口经 defer
+	// 落 end 行。写失败只 Warn。
+	//
+	// journalStarted 是幽灵卡闸（2026-11-05）：校验失败回合（上游未起/未指定
+	// 模型/会话无消息）连 end 行也不许落——appendLineLocked 会 MkdirAll+
+	// O_CREATE 建文件，放行 defer 就会在没有任何对话内容的目录里凭空造出一张
+	// 只有失败记录的幽灵会话卡（仪表盘侧边栏出现打不开/没内容的卡）。
 	journal := m.coreJournal
+	journalStarted := false
 	endStatus, endErrMsg := "error", ""
 	defer func() {
+		if !journalStarted {
+			return
+		}
 		// 内核终态快照的真因优先：IsError 分支在这里只有笼统的
 		// 「agentcore run failed」，而终止帧带给手机真因的那段文案经 OnTurn
 		// 终态快照回到了宿主——落进 end 行，重开旧会话才能还原「为什么死」。
@@ -1139,19 +1149,6 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		}
 		journal.appendEndDiagnostics(run.sessionID, endStatus, endErrMsg, diag)
 	}()
-	now := time.Now().UTC().Format(time.RFC3339)
-	journal.ensureSessionHeader(run.sessionID, run.projectPath, agentCoreModel(run), run.effort, now, agentCoreJournalOrigin(run), run.disabledMCPServers, run.disabledSkills, run.approvalMode)
-	// 会话级开关的持久化写点在 create()/message() 的显式改键处（2026-10-31
-	// 评审修正）：这里**不**做每 run 进门同步——run 的内存名单可能还没从
-	// journal 头行水合（手机 v3 恒带 transcript、懒建恢复被历史门挡住、恢复
-	// 读失败等），拿未水合的 nil 当权威会把头行里持久化的名单删掉。
-	if lastUser, ok := m.lastUserHistoryMessage(run.sessionID); ok {
-		ts := now
-		if !lastUser.CreatedAt.IsZero() {
-			ts = lastUser.CreatedAt.UTC().Format(time.RFC3339)
-		}
-		journal.appendUser(run.sessionID, run.messageID, lastUser.Content, ts)
-	}
 
 	if run.cancel != nil {
 		defer run.cancel()
@@ -1191,6 +1188,23 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		_ = writeJSON(agentAIErrorPayload(run.sessionID, run.messageID, fmt.Errorf("会话没有可发送的消息")))
 		return
 	}
+
+	// 调用记录落盘（AliangCode 留痕，spec §6）：头行 + 首条 user 行在入口门禁
+	// 全过后才写——上游未起/未指定模型这类失败回合必须零痕迹（幽灵卡修复，
+	// 2026-11-05）。会话级开关的持久化写点在 create()/message() 的显式改键处
+	// （2026-10-31 评审修正）：这里**不**做每 run 进门同步——run 的内存名单
+	// 可能还没从 journal 头行水合（手机 v3 恒带 transcript、懒建恢复被历史门
+	// 挡住、恢复读失败等），拿未水合的 nil 当权威会把头行里持久化的名单删掉。
+	now := time.Now().UTC().Format(time.RFC3339)
+	journal.ensureSessionHeader(run.sessionID, run.projectPath, model, run.effort, now, agentCoreJournalOrigin(run), run.disabledMCPServers, run.disabledSkills, run.approvalMode)
+	if lastUser, ok := m.lastUserHistoryMessage(run.sessionID); ok {
+		ts := now
+		if !lastUser.CreatedAt.IsZero() {
+			ts = lastUser.CreatedAt.UTC().Format(time.RFC3339)
+		}
+		journal.appendUser(run.sessionID, run.messageID, lastUser.Content, ts, agentAIJournalAttachmentsFrom(run.attachments))
+	}
+	journalStarted = true
 
 	// 进度上报：与 CLI 路径同一套节拍与字段，手机端的「已改 N 个文件」直接复用。
 	var filesMu sync.Mutex
@@ -1365,7 +1379,14 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		ScopeCheck:  agentCoreScopeCheck(run),
 		ShellPolicy: &agentCoreShellPolicy{run: run},
 	}
-	kernelApprove := m.agentCoreApprove(run, writeJSON)
+	// 审批串行门（agentCoreApprovalGate）：单卡语义要求同一时刻只有一张手机
+	// 审批卡在等。并行子 agent（内核 Parallelizable 批）会让多个 goroutine
+	// 并发进入审批闭包——不互斥既弹多张卡打架，也让 agentCoreApprove 闭包
+	// 内的 run 字段（matchedRuleID/policyVersion 等）产生数据竞争。一个门
+	// 罩住主层（含对子 agent 桥工具本身的审批）与子 run 内部工具审批两条
+	// 链——agentCoreSubagentTools 收到的就是这份已互斥化的闭包。
+	approvalGate := newAgentCoreApprovalGate()
+	kernelApprove := approvalGate.wrap(m.agentCoreApprove(run, writeJSON))
 	// 内核不 import 日志包，这里把宿主 logger 包一层递进去（签名不同：
 	// logger.Warn 是 variadic interface{}）。目前只承载截断这类无事件帧的
 	// 内部决策。
@@ -2107,6 +2128,42 @@ func boundaryApprovalReason(ruleID string) string {
 		return "命令引用了项目目录之外的路径，需要您确认是否放行"
 	}
 	return ""
+}
+
+// agentCoreApprovalGate 把审批闭包串行化到「同一时刻只有一张手机审批卡在
+// 等」。并行子 agent（内核 Parallelizable 批）会让多个 goroutine 并发进入
+// 审批闭包——不互斥既并发弹卡（单卡语义破坏），也让 agentCoreApprove 闭包
+// 内的 run 字段读写产生数据竞争。
+//
+// 等待用带缓冲 chan 信号量实现且 ctx 可感知（2026-11-06 评审 C2/C6）：排队
+// 中的调用者被取消/超时可立即退出，不在锁上盲等。信号量持有期=整个审批
+// 往返，**含手机端人的等待（SLA 24h）**——这是单卡语义的必然代价：并行排
+// 队者的有效审批窗口 = min(自身工具窗口, 前序审批等待时长)，工具窗口
+// （TimeoutHint ceiling）在排队期持续计时。已有到期 ctx 的调用者进闸复核
+// 快速失败，绝不空等后死。
+type agentCoreApprovalGate struct {
+	sem chan struct{}
+}
+
+func newAgentCoreApprovalGate() *agentCoreApprovalGate {
+	return &agentCoreApprovalGate{sem: make(chan struct{}, 1)}
+}
+
+// wrap 把一份审批闭包串行化。
+func (g *agentCoreApprovalGate) wrap(approve func(context.Context, agentcore.ApprovalRequest) (agentcore.ApprovalResponse, error)) func(context.Context, agentcore.ApprovalRequest) (agentcore.ApprovalResponse, error) {
+	return func(ctx context.Context, req agentcore.ApprovalRequest) (agentcore.ApprovalResponse, error) {
+		select {
+		case g.sem <- struct{}{}:
+		case <-ctx.Done():
+			return agentcore.ApprovalResponse{}, fmt.Errorf("审批排队被取消: %w", ctx.Err())
+		}
+		defer func() { <-g.sem }()
+		// 进闸复核：排队期间本调用的窗口可能已被前序审批耗尽。
+		if err := ctx.Err(); err != nil {
+			return agentcore.ApprovalResponse{}, fmt.Errorf("审批窗口已过期: %w", err)
+		}
+		return approve(ctx, req)
+	}
 }
 
 // agentCoreApprove 是内核的 Config.Approve。策略短路与 codex/claude 一致：

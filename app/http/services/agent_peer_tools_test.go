@@ -185,7 +185,7 @@ func TestAgentPeerExecHandler_CallShapeAndResultText(t *testing.T) {
 	ts := newPeerToolsTestServer(t, http.StatusOK, `{"exit_code":0,"stdout":"peer-hello\n","stderr":"","duration_ms":12}`)
 	peerToolsTestEnv(t, ts)
 
-	res := agentPeerExecPayload(map[string]interface{}{
+	res := agentPeerExecPayload(context.Background(), map[string]interface{}{
 		"type":       "peer.exec",
 		"request_id": "req-1",
 		"device_id":  "device-b",
@@ -220,7 +220,7 @@ func TestAgentPeerExecHandler_RejectedReasonReadable(t *testing.T) {
 	ts := newPeerToolsTestServer(t, http.StatusForbidden, `{"reason":"not_allowed"}`)
 	peerToolsTestEnv(t, ts)
 
-	res := agentPeerExecPayload(map[string]interface{}{
+	res := agentPeerExecPayload(context.Background(), map[string]interface{}{
 		"type": "peer.exec", "request_id": "req-2", "device_id": "device-b", "command": "ls",
 	})
 	text, _ := res["error"].(string)
@@ -237,7 +237,7 @@ func TestAgentPeerExecHandler_RejectedReasonReadable(t *testing.T) {
 
 func TestAgentPeerExecHandler_MissingParams(t *testing.T) {
 	peerToolsTestEnv(t, nil)
-	res := agentPeerExecPayload(map[string]interface{}{"type": "peer.exec", "request_id": "req-3"})
+	res := agentPeerExecPayload(context.Background(), map[string]interface{}{"type": "peer.exec", "request_id": "req-3"})
 	if res["error"] == nil {
 		t.Fatalf("missing params must error: %v", res)
 	}
@@ -247,7 +247,7 @@ func TestAgentPeerFetchFileHandler(t *testing.T) {
 	ts := newPeerToolsTestServer(t, http.StatusOK, `{"transfer_id":"tr-77"}`)
 	peerToolsTestEnv(t, ts)
 
-	res := agentPeerFetchFilePayload(map[string]interface{}{
+	res := agentPeerFetchFilePayload(context.Background(), map[string]interface{}{
 		"type": "peer.fetch_file", "request_id": "req-4", "device_id": "device-b", "remote_path": "~/report.txt",
 	})
 	text, _ := res["result"].(string)
@@ -273,7 +273,7 @@ func TestAgentDeviceNoteHandler(t *testing.T) {
 	ts := newPeerToolsTestServer(t, http.StatusOK, `{"entries":[{"key":"deploy_root","value":"/srv/app","updated_by":"llm"}]}`)
 	peerToolsTestEnv(t, ts)
 
-	res := agentDeviceNotePayload(map[string]interface{}{
+	res := agentDeviceNotePayload(context.Background(), map[string]interface{}{
 		"type": "peer.device_note", "request_id": "req-5", "device_id": "device-x",
 		"key": "deploy_root", "value": "/srv/app",
 	})
@@ -306,7 +306,7 @@ func TestAgentDeviceNoteHandler_DefaultsToLocalDevice(t *testing.T) {
 	ts := newPeerToolsTestServer(t, http.StatusOK, `{}`)
 	peerToolsTestEnv(t, ts)
 
-	res := agentDeviceNotePayload(map[string]interface{}{
+	res := agentDeviceNotePayload(context.Background(), map[string]interface{}{
 		"type": "peer.device_note", "request_id": "req-6", "key": "k", "value": "v",
 	})
 	if res["error"] != nil {
@@ -321,7 +321,7 @@ func TestAgentDeviceNoteHandler_DefaultsToLocalDevice(t *testing.T) {
 func TestAgentDeviceInfoHandler_LocalSnapshot(t *testing.T) {
 	peerToolsTestEnv(t, nil)
 	// 不起 mock 服务端：本地分支绝不发出网络请求。
-	res := agentDeviceInfoPayload(map[string]interface{}{"type": "peer.device_info", "request_id": "req-7"})
+	res := agentDeviceInfoPayload(context.Background(), map[string]interface{}{"type": "peer.device_info", "request_id": "req-7"})
 	if res["error"] != nil {
 		t.Fatalf("local device_info failed: %v", res)
 	}
@@ -356,7 +356,7 @@ func TestAgentDeviceInfoHandler_RemoteDeviceAndMetadata(t *testing.T) {
 	agentPeerServerURL = func() string { return ts.URL }
 	t.Cleanup(func() { agentPeerServerURL = origURL })
 
-	res := agentDeviceInfoPayload(map[string]interface{}{
+	res := agentDeviceInfoPayload(context.Background(), map[string]interface{}{
 		"type": "peer.device_info", "request_id": "req-8", "device_id": "device-x",
 	})
 	mu.Lock()
@@ -376,7 +376,7 @@ func TestAgentDeviceInfoHandler_WrapperBodyTolerated(t *testing.T) {
 	ts := newPeerToolsTestServer(t, http.StatusOK, `{"data":{"exit_code":3,"stderr":"boom"}}`)
 	peerToolsTestEnv(t, ts)
 
-	res := agentPeerExecPayload(map[string]interface{}{
+	res := agentPeerExecPayload(context.Background(), map[string]interface{}{
 		"type": "peer.exec", "request_id": "req-9", "device_id": "device-b", "command": "false",
 	})
 	text, _ := res["result"].(string)
@@ -396,7 +396,7 @@ func TestAgentDeviceListHandler_SlimDirectory(t *testing.T) {
 	ts := newPeerToolsTestServer(t, http.StatusOK, payload)
 	peerToolsTestEnv(t, ts)
 
-	res := agentPeerDeviceListPayload(map[string]interface{}{"type": "peer.device_list", "request_id": "req-10"})
+	res := agentPeerDeviceListPayload(context.Background(), map[string]interface{}{"type": "peer.device_list", "request_id": "req-10"})
 	if res["error"] != nil {
 		t.Fatalf("device_list failed: %v", res)
 	}
@@ -432,7 +432,7 @@ func TestAgentDeviceListHandler_ServerError(t *testing.T) {
 	ts := newPeerToolsTestServer(t, http.StatusUnauthorized, `{"error":"token expired"}`)
 	peerToolsTestEnv(t, ts)
 
-	res := agentPeerDeviceListPayload(map[string]interface{}{"type": "peer.device_list", "request_id": "req-11"})
+	res := agentPeerDeviceListPayload(context.Background(), map[string]interface{}{"type": "peer.device_list", "request_id": "req-11"})
 	if res["error"] == nil {
 		t.Fatalf("expected structured error, got %+v", res)
 	}
@@ -610,7 +610,7 @@ func TestAgentPeerExecHandler_MissingExitCodeIsStructuredError(t *testing.T) {
 	ts := newPeerToolsTestServer(t, http.StatusOK, `{"stdout":"partial"}`)
 	peerToolsTestEnv(t, ts)
 
-	res := agentPeerExecPayload(map[string]interface{}{
+	res := agentPeerExecPayload(context.Background(), map[string]interface{}{
 		"type": "peer.exec", "request_id": "req-nec", "device_id": "device-b", "command": "ls",
 	})
 	text, _ := res["error"].(string)
@@ -627,7 +627,7 @@ func TestAgentPeerFetchFileHandler_TransferNestedShell(t *testing.T) {
 	ts := newPeerToolsTestServer(t, http.StatusCreated, `{"transfer":{"transfer_id":"tr-nest-9","status":"pending"}}`)
 	peerToolsTestEnv(t, ts)
 
-	res := agentPeerFetchFilePayload(map[string]interface{}{
+	res := agentPeerFetchFilePayload(context.Background(), map[string]interface{}{
 		"type": "peer.fetch_file", "request_id": "req-nest", "device_id": "device-b", "remote_path": "a.txt",
 	})
 	text, _ := res["result"].(string)
@@ -641,7 +641,7 @@ func TestAgentPeerExecHandler_TimeoutPreClamped(t *testing.T) {
 	ts := newPeerToolsTestServer(t, http.StatusOK, `{"exit_code":0}`)
 	peerToolsTestEnv(t, ts)
 
-	agentPeerExecPayload(map[string]interface{}{
+	agentPeerExecPayload(context.Background(), map[string]interface{}{
 		"type": "peer.exec", "request_id": "req-clamp", "device_id": "device-b",
 		"command": "ls", "timeout_ms": float64(500),
 	})
@@ -658,7 +658,7 @@ func TestAgentPeerExecHandler_TimeoutPreClamped(t *testing.T) {
 func TestAgentDeviceNoteHandler_OverLengthFailsLocally(t *testing.T) {
 	// should-fix 6：value 超 4096 字节本地预检报可读错误，不发起网络请求。
 	peerToolsTestEnv(t, nil)
-	res := agentDeviceNotePayload(map[string]interface{}{
+	res := agentDeviceNotePayload(context.Background(), map[string]interface{}{
 		"type": "peer.device_note", "request_id": "req-len",
 		"key": "k", "value": strings.Repeat("v", 5000),
 	})

@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -44,7 +45,7 @@ func TestResolveAgentProjectPathNotADirectoryKeepsOriginalError(t *testing.T) {
 // 线上手机走 file.list 拉目录;错误必须以 file.error 帧回到 request_id。
 func TestAgentFileListPayloadMissingProjectPathReturnsFileErrorFrame(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "aliang-know-you-plan")
-	payload := agentFileListPayload(map[string]interface{}{
+	payload := agentFileListPayload(context.Background(), map[string]interface{}{
 		"request_id":   "req-ghost-1",
 		"project_path": missing,
 	})

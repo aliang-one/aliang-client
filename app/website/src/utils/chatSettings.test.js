@@ -8,6 +8,7 @@ import {
   LAST_USED_MODEL_KEY,
   MODEL_CUSTOM_VALUE,
   deviceSessionToConversation,
+  dropShadowedDeviceShells,
   isAliangCodeSession,
   isDirectoryLocked,
   normalizeDeviceProvider,
@@ -388,5 +389,38 @@ describe('sessionCreatePayload 回归(truncate 键不常驻)', () => {
     const p = sessionCreatePayload({ aiSessionId: 's', provider: 'agentcore' });
     expect('truncate_before_message_id' in p).toBe(false);
 
+  });
+});
+
+// 侧栏双记录修复（2026-11-06）：同一会话以「本地草稿」与「journal 壳」双源
+// 入列（dashboard 会话 journal id=local-<convId>，草稿 aiSessionId 同值）——
+// 本地优先：丢被草稿遮蔽的壳，对齐键=aiSessionId；草稿从未发送（无
+// aiSessionId）时壳原样保留。
+describe('dropShadowedDeviceShells 侧栏双源去重', () => {
+  const draft = (id, aiSessionId) => ({ id, aiSessionId });
+  const shell = (id, aiSessionId) => ({ id: 'dev-' + id, aiSessionId, deviceSession: { id } });
+
+  it('草稿 aiSessionId 命中壳 → 丢遮蔽壳（本地优先）', () => {
+    const drafts = [draft('abc', 'local-abc')];
+    const shells = [shell('local-abc', 'local-abc'), shell('other', 'other')];
+    const out = dropShadowedDeviceShells(drafts, shells);
+    expect(out).toHaveLength(1);
+    expect(out[0].aiSessionId).toBe('other');
+  });
+
+  it('草稿从未发送（无 aiSessionId）→ 壳全保留', () => {
+    const drafts = [draft('xyz', '')];
+    const shells = [shell('s1', 's1'), shell('s2', 's2')];
+    expect(dropShadowedDeviceShells(drafts, shells)).toHaveLength(2);
+  });
+
+  it('空输入不炸：drafts/shells 非数组或缺省都返回空数组', () => {
+    expect(dropShadowedDeviceShells(null, null)).toEqual([]);
+    expect(dropShadowedDeviceShells([], [])).toEqual([]);
+  });
+
+  it('壳缺 aiSessionId（异常形态）→ 保留（只按显式键遮蔽）', () => {
+    const out = dropShadowedDeviceShells([draft('abc', 'local-abc')], [{ id: 'dev-weird' }]);
+    expect(out).toHaveLength(1);
   });
 });

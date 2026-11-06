@@ -5,6 +5,7 @@ package services
 // 补登记也钉在这里。
 
 import (
+	"context"
 	"testing"
 
 	"aliang.one/nursorgate/app/http/models"
@@ -175,7 +176,7 @@ func TestAgentTransferDispatchArmsWireUp(t *testing.T) {
 		return nil
 	}
 
-	service.handleRemoteAgentMessage(map[string]interface{}{
+	service.handleRemoteAgentMessage(context.Background(), map[string]interface{}{
 		"type":        models.AgentEventTransferUpload,
 		"request_id":  "req-t1",
 		"transfer_id": "tr_disabled1",
@@ -188,7 +189,7 @@ func TestAgentTransferDispatchArmsWireUp(t *testing.T) {
 	}
 
 	before := len(written)
-	service.handleRemoteAgentMessage(map[string]interface{}{
+	service.handleRemoteAgentMessage(context.Background(), map[string]interface{}{
 		"type":        models.AgentEventTransferCancel,
 		"transfer_id": "tr_disabled1",
 	}, writeJSON)

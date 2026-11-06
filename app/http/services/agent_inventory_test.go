@@ -225,3 +225,20 @@ func TestCollectClaudeVibeSessionsRenamePidRecordBeatsIndexCustomTitle(t *testin
 	require.NotNil(t, found, "claude session %q was not collected", "claude_"+sid)
 	assert.Equal(t, "进程里的新名字", found.Title, "live pid rename must beat the index customTitle")
 }
+
+// claude/codex 原生转录的 image/input_image 块必须落 [图片] 占位——旧逻辑
+// 静默返回空串，纯图消息在 inventory 转录里整条消失（spec §3.3）。
+func TestAgentContentTextImagePlaceholder(t *testing.T) {
+	image := map[string]interface{}{"type": "image", "source": map[string]interface{}{"type": "base64"}}
+	if got := agentContentText(image); got != "[图片]" {
+		t.Fatalf("image block -> %q, want [图片]", got)
+	}
+	inputImage := map[string]interface{}{"type": "input_image", "image_url": "https://x/y.png"}
+	if got := agentContentText(inputImage); got != "[图片]" {
+		t.Fatalf("input_image -> %q, want [图片]", got)
+	}
+	mixed := agentContentText([]interface{}{"看这张", image})
+	if got := strings.TrimSpace(mixed); got != "看这张 [图片]" {
+		t.Fatalf("mixed -> %q", got)
+	}
+}

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -1218,46 +1219,138 @@ func (r *runner) streamTurn(ctx context.Context, req *MessagesRequest, writer *s
 }
 
 // executeTools 逐个执行本回合的工具调用，返回 tool_result 块。
+//
+// 并行（2026-11-05 子 agent 审计盲点 2）：相邻的 Parallelizable 工具（子
+// agent 桥）组成批并发执行，上限 maxParallelToolCalls。只有工具体在飞——
+// toolCalls 记录、OnToolCall 钩子、结果块一律按原调用顺序在批汇合后回填，
+// 内核状态保持单线程（journal 上游按顺序消费，宿主回调不做并发承诺）。
+// 批与批之间、可并行与普通工具之间保持严格串行。
 func (r *runner) executeTools(ctx context.Context, toolUses []ContentBlock, writer *streamWriter) []ContentBlock {
 	results := make([]ContentBlock, 0, len(toolUses))
 
-	for _, tu := range toolUses {
+	// runOne 执行单个调用并产出（结果块，toolCalls 记录）。ctx 已取消时
+	// ran=false：回填取消块、不记 toolCalls、不触发钩子（与历史串行行为
+	// 逐位对齐）。
+	runOne := func(ctx context.Context, tu ContentBlock) (ContentBlock, ToolCallRecord, bool) {
 		if err := ctx.Err(); err != nil {
-			results = append(results, ContentBlock{
-				Type:      BlockTypeToolResult,
-				ToolUseID: tu.ID,
-				Content:   "运行已取消，工具未执行",
-				IsError:   true,
-			})
+			return cancelledToolResultBlock(tu), ToolCallRecord{}, false
+		}
+		result := r.executeOne(ctx, tu)
+		return toolResultContentBlock(tu, result),
+			ToolCallRecord{ID: tu.ID, Name: tu.Name, Input: tu.Input, Result: result},
+			true
+	}
+	// 钩子在锁外触发（runner 无内部锁，宿主回调也不该在内核任何临界区里
+	// 被调），panic 独立 recover：回调挂了也不许搅了已定的工具结果
+	// （与 MCP 桥 safeOnCall 同语义）。拦截必须留痕——静默吞 panic 会让
+	// 宿主回调的 bug 永远查不到。并行批汇合后按调用序串行触发。
+	fireHook := func(tu ContentBlock, result ToolResult) {
+		if r.cfg.Hooks.OnToolCall == nil {
+			return
+		}
+		func() {
+			defer func() {
+				if rec := recover(); rec != nil {
+					r.logf("agentcore: OnToolCall 回调 panic 已拦截 tool=%s: %v", tu.Name, rec)
+				}
+			}()
+			r.cfg.Hooks.OnToolCall(tu.Name, tu.Input, result)
+		}()
+	}
+
+	for i := 0; i < len(toolUses); {
+		tu := toolUses[i]
+		if !r.toolParallelizable(tu.Name) {
+			block, record, ran := runOne(ctx, tu)
+			if ran {
+				r.toolCalls = append(r.toolCalls, record)
+				fireHook(tu, record.Result)
+			}
+			results = append(results, block)
+			i++
 			continue
 		}
-
-		result := r.executeOne(ctx, tu)
-		r.toolCalls = append(r.toolCalls, ToolCallRecord{
-			ID: tu.ID, Name: tu.Name, Input: tu.Input, Result: result,
-		})
-		// 钩子在锁外触发（runner 无内部锁，宿主回调也不该在内核任何临界区里
-		// 被调），panic 独立 recover：回调挂了也不许搅了已定的工具结果
-		// （与 MCP 桥 safeOnCall 同语义）。拦截必须留痕——静默吞 panic 会让
-		// 宿主回调的 bug 永远查不到。
-		if r.cfg.Hooks.OnToolCall != nil {
-			func() {
-				defer func() {
-					if rec := recover(); rec != nil {
-						r.logf("agentcore: OnToolCall 回调 panic 已拦截 tool=%s: %v", tu.Name, rec)
-					}
-				}()
-				r.cfg.Hooks.OnToolCall(tu.Name, tu.Input, result)
-			}()
+		// 收集极大可并行批（相邻连续的 Parallelizable 调用）。
+		j := i
+		for j < len(toolUses) && r.toolParallelizable(toolUses[j].Name) {
+			j++
 		}
-		results = append(results, ContentBlock{
-			Type:      BlockTypeToolResult,
-			ToolUseID: tu.ID,
-			Content:   result.ContentForModel(),
-			IsError:   result.IsError,
-		})
+		batch := toolUses[i:j]
+		blocks, records, ran := r.executeParallelBatch(ctx, batch)
+		for k := range batch {
+			if ran[k] {
+				r.toolCalls = append(r.toolCalls, records[k])
+				fireHook(batch[k], records[k].Result)
+			}
+			results = append(results, blocks[k])
+		}
+		i = j
 	}
 	return results
+}
+
+// executeParallelBatch 并发执行一批可并行工具。goroutine 只写自己的下标槽，
+// 汇合后由调用方按原顺序回填——槽间零共享。ctx 取消的成员不起飞（回填取消
+// 块），执行中取消靠工具体自己响应 ctx（协作式，与串行路径同语义）。
+func (r *runner) executeParallelBatch(ctx context.Context, batch []ContentBlock) ([]ContentBlock, []ToolCallRecord, []bool) {
+	blocks := make([]ContentBlock, len(batch))
+	records := make([]ToolCallRecord, len(batch))
+	ran := make([]bool, len(batch))
+	sem := make(chan struct{}, maxParallelToolCalls)
+	var wg sync.WaitGroup
+	for k := range batch {
+		tu := batch[k]
+		if err := ctx.Err(); err != nil {
+			blocks[k] = cancelledToolResultBlock(tu)
+			continue
+		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(k int, tu ContentBlock) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			result := r.executeOne(ctx, tu)
+			blocks[k] = toolResultContentBlock(tu, result)
+			records[k] = ToolCallRecord{ID: tu.ID, Name: tu.Name, Input: tu.Input, Result: result}
+			ran[k] = true
+		}(k, tu)
+	}
+	wg.Wait()
+	return blocks, records, ran
+}
+
+// toolParallelizable 判定调用是否落在可并行批内。未知工具返回 false（走串
+// 行路径报「未知工具」错误，与历史行为一致）。
+func (r *runner) toolParallelizable(name string) bool {
+	if r.cfg == nil || r.cfg.Tools == nil {
+		return false
+	}
+	tool, ok := r.cfg.Tools.Get(name)
+	if !ok {
+		return false
+	}
+	p, ok := tool.(Parallelizable)
+	return ok && p.Parallelizable()
+}
+
+// toolResultContentBlock 把 ToolResult 包成回填给模型的 tool_result 块。
+func toolResultContentBlock(tu ContentBlock, result ToolResult) ContentBlock {
+	return ContentBlock{
+		Type:      BlockTypeToolResult,
+		ToolUseID: tu.ID,
+		Content:   result.ContentForModel(),
+		IsError:   result.IsError,
+	}
+}
+
+// cancelledToolResultBlock 是已取消调用的占位结果块（文案与历史逐字一致）。
+func cancelledToolResultBlock(tu ContentBlock) ContentBlock {
+	return ContentBlock{
+		Type:      BlockTypeToolResult,
+		ToolUseID: tu.ID,
+		Content:   "运行已取消，工具未执行",
+		IsError:   true,
+	}
 }
 
 // executeOne 执行单个工具调用，串起审批 → 围栏 → 执行。
@@ -1323,8 +1416,10 @@ func (r *runner) executeOneInner(ctx context.Context, tu ContentBlock) ToolResul
 		return ErrorResult("未知工具: %s", tu.Name)
 	}
 
-	// 工具自己也要能被取消打断。
-	toolCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	// 工具自己也要能被取消打断。TimeoutHint 工具（子 agent 桥）可覆盖默认
+	// 窗口——桥的 Execute 是一整段子 run，10 分钟会把子 run 里等手机审批
+	// （SLA 24h）连坐掐死（2026-11-05 审计盲点 1）。
+	toolCtx, cancel := context.WithTimeout(ctx, toolExecutionCeiling(tool))
 	defer cancel()
 	return tool.Execute(toolCtx, tu.Input, r.cfg.Env)
 }

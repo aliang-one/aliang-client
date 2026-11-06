@@ -65,7 +65,9 @@ func agentPeerMCPBridgeTools() []agentPeerMCPToolDef {
 				"PowerShell 5.1: \"&&\" is unavailable (use \";\" or PS cmdlets), external .exe may " +
 				"be unavailable (prefer PS built-ins like $env:COMPUTERNAME or Get-FileHash, or " +
 				"absolute paths), and PS output is UTF-8 (native-exe output in a legacy codepage " +
-				"may still be garbled).",
+				"may still be garbled). Cancellation/timeout only aborts the local wait — the " +
+				"remote command still runs to completion on the target; do not blindly retry " +
+				"side-effecting commands.",
 			inputSchema: json.RawMessage(`{
 				"type":"object",
 				"properties":{
@@ -76,15 +78,16 @@ func agentPeerMCPBridgeTools() []agentPeerMCPToolDef {
 				},
 				"required":["device_id","command"]
 			}`),
-			handle: func(_ context.Context, args map[string]interface{}) (string, bool) {
-				return peerMCPText(agentPeerExecPayload(peerMCPMsg(args)))
+			handle: func(ctx context.Context, args map[string]interface{}) (string, bool) {
+				return peerMCPText(agentPeerExecPayload(ctx, peerMCPMsg(args)))
 			},
 		},
 		{
 			name: "peer_fetch_file",
 			description: "Queue an asynchronous file fetch from another device into this machine's " +
 				"transfer inbox. The source device must have peer fetch enabled. Returns a transfer_id; " +
-				"completion is delivered via transfer.progress.",
+				"completion is delivered via transfer.progress. Cancellation only aborts the local " +
+				"wait — the transfer may still complete; check the inbox before re-issuing.",
 			inputSchema: json.RawMessage(`{
 				"type":"object",
 				"properties":{
@@ -93,8 +96,8 @@ func agentPeerMCPBridgeTools() []agentPeerMCPToolDef {
 				},
 				"required":["device_id","remote_path"]
 			}`),
-			handle: func(_ context.Context, args map[string]interface{}) (string, bool) {
-				return peerMCPText(agentPeerFetchFilePayload(peerMCPMsg(args)))
+			handle: func(ctx context.Context, args map[string]interface{}) (string, bool) {
+				return peerMCPText(agentPeerFetchFilePayload(ctx, peerMCPMsg(args)))
 			},
 		},
 		{
@@ -108,8 +111,8 @@ func agentPeerMCPBridgeTools() []agentPeerMCPToolDef {
 					"device_id":{"type":"string","description":"Target device id; omit for this machine"}
 				}
 			}`),
-			handle: func(_ context.Context, args map[string]interface{}) (string, bool) {
-				return peerMCPText(agentDeviceInfoPayload(peerMCPMsg(args)))
+			handle: func(ctx context.Context, args map[string]interface{}) (string, bool) {
+				return peerMCPText(agentDeviceInfoPayload(ctx, peerMCPMsg(args)))
 			},
 		},
 		{
@@ -119,8 +122,8 @@ func agentPeerMCPBridgeTools() []agentPeerMCPToolDef {
 				"and whether peer exec is enabled. This is the directory to pick device_id from for " +
 				"the other peer tools (peer.exec / peer.fetch_file / peer.device_info / peer.device_note).",
 			inputSchema: json.RawMessage(`{"type":"object","properties":{}}`),
-			handle: func(_ context.Context, _ map[string]interface{}) (string, bool) {
-				return peerMCPText(agentPeerDeviceListPayload(peerMCPMsg(nil)))
+			handle: func(ctx context.Context, _ map[string]interface{}) (string, bool) {
+				return peerMCPText(agentPeerDeviceListPayload(ctx, peerMCPMsg(nil)))
 			},
 		},
 		{
@@ -137,8 +140,8 @@ func agentPeerMCPBridgeTools() []agentPeerMCPToolDef {
 				},
 				"required":["key","value"]
 			}`),
-			handle: func(_ context.Context, args map[string]interface{}) (string, bool) {
-				return peerMCPText(agentDeviceNotePayload(peerMCPMsg(args)))
+			handle: func(ctx context.Context, args map[string]interface{}) (string, bool) {
+				return peerMCPText(agentDeviceNotePayload(ctx, peerMCPMsg(args)))
 			},
 		},
 	}

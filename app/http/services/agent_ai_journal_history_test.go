@@ -6,6 +6,7 @@ package services
 // 双端一致（与 agent_ai_agentcore_journal_test.go 同一取舍）。
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -530,6 +531,221 @@ func TestCreateBackfillsSiblingFromHeader(t *testing.T) {
 	}
 }
 
+// TestCreateRestoresJournalHistoryWithoutTranscript 重启失忆修复端到端
+// （2026-11-05 G2）：仪表盘每条消息先发 ai.session.create（不带 transcript），
+// agent 进程重启后 create 重建的内存会话历史为空——下回合模型只看到最新一条。
+// create 无 transcript 且 journal 存在时必须回装历史，且与 message() 懒建
+// 分支同一读侧（过滤/顺序/条数上限完全一致）。全链走 DispatchLocalAI：
+// ①create 落内存历史（user/assistant/turn 三行，工具行不入）；②紧随的
+// ai.message 把「回装历史 + 本问」作为独立消息发到内核上游——内核收到的
+// messages 前文即回装证据；③若 message 再二次回装，前文会重复出现，
+// 消息条数断言同时守住幂等。
+func TestCreateRestoresJournalHistoryWithoutTranscript(t *testing.T) {
+	setTestAgentHome(t)
+	journalDir := t.TempDir()
+	m := newAgentAIManager()
+	m.coreJournal = newAgentCoreJournal(journalDir)
+	now := time.Now().UTC().Format(time.RFC3339)
+	m.coreJournal.ensureSessionHeader("s-g2", "/proj", "glm-5.3", "", now, "dashboard", nil, nil)
+	m.coreJournal.appendUser("s-g2", "m1", "第一问", now)
+	m.coreJournal.appendAssistant("s-g2", "a1", "第一答", now)
+	m.coreJournal.appendTool("s-g2", "Bash", "ls", false) // 工具行:轨迹不是消息
+	m.coreJournal.appendAssistantTurn("s-g2", 1, "第一回合答复", "thinking 不进历史", "end_turn", nil)
+
+	up, srv := newAgentCoreUpstream(t, agentCoreTextTurn("第二", "答"))
+	// agentCoreBaseURL 只认回环；httptest 正是 127.0.0.1:PORT——守卫探测必过，
+	// 绝不触发自愈 POST（真实本机管理端口不能被测试触碰，2026-10-27 事故口径）。
+	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
+
+	svc := &AgentService{ai: m}
+	var mu sync.Mutex
+	var frames []map[string]interface{}
+	write := func(p interface{}) error {
+		if row, ok := p.(map[string]interface{}); ok {
+			mu.Lock()
+			frames = append(frames, row)
+			mu.Unlock()
+		}
+		return nil
+	}
+	// 仪表盘形态：create 不带 transcript（历史只能来自 journal）。
+	svc.DispatchLocalAI(map[string]interface{}{
+		"type":         models.AgentEventAISessionCreate,
+		"session_id":   "s-g2",
+		"provider":     "agentcore",
+		"mode":         "vibe",
+		"project_path": t.TempDir(),
+		"model":        "glm-5.3",
+	}, write)
+
+	// ①create 即回装：内存历史 = journal 的 user/assistant/turn 三行，顺序正确。
+	m.mu.Lock()
+	history := append([]agentAIMessage(nil), m.sessions["s-g2"].history...)
+	m.mu.Unlock()
+	if len(history) != 3 {
+		t.Fatalf("create 后内存历史条数 = %d, want 3: %+v", len(history), history)
+	}
+	if history[0].Role != "user" || history[0].Content != "第一问" {
+		t.Fatalf("create 后 history[0] = %+v, want user/第一问", history[0])
+	}
+	if history[1].Role != "assistant" || history[1].Content != "第一答" {
+		t.Fatalf("create 后 history[1] = %+v, want assistant/第一答", history[1])
+	}
+	if history[2].Role != "assistant" || history[2].Content != "第一回合答复" {
+		t.Fatalf("create 后 history[2] = %+v, want assistant/第一回合答复(turn 行)", history[2])
+	}
+
+	// ②仪表盘每条消息先 create 再 message 的序列：session 已在内存，走既有
+	// 分支（不得二次回装）。
+	svc.DispatchLocalAI(map[string]interface{}{
+		"type":         models.AgentEventAIMessage,
+		"session_id":   "s-g2",
+		"message_id":   "m2",
+		"content":      "第二问",
+		"provider":     "agentcore",
+		"mode":         "vibe",
+		"project_path": t.TempDir(),
+		"model":        "glm-5.3",
+	}, write)
+	waitForAgentEvent(t, &mu, &frames, models.AgentEventAIDone, func(e map[string]interface{}) bool {
+		return remoteString(e, "session_id") == "s-g2"
+	})
+
+	// ③内核收到的 messages：回装历史（3 行）在前、本问排最后；重复回装会让
+	// 前文翻倍，条数即幂等证据。
+	reqs := up.requests()
+	if len(reqs) != 1 {
+		t.Fatalf("上游请求次数 = %d, want 1", len(reqs))
+	}
+	want := []struct{ role, text string }{
+		{"user", "第一问"}, {"assistant", "第一答"},
+		{"assistant", "第一回合答复"}, {"user", "第二问"},
+	}
+	if len(reqs[0].Messages) != len(want) {
+		t.Fatalf("内核收到的消息条数 = %d, want %d: %+v", len(reqs[0].Messages), len(want), reqs[0].Messages)
+	}
+	for i, w := range want {
+		msg := reqs[0].Messages[i]
+		text := agentCoreMessageText(msg)
+		if msg.Role != w.role || text != w.text {
+			t.Errorf("内核 messages[%d] = %s/%q, want %s/%q", i, msg.Role, text, w.role, w.text)
+		}
+	}
+}
+
+// TestCreateWithTranscriptKeepsTranscriptOverJournal 核对项④：载荷带 transcript
+// 的 create 仍以 transcript 为准（既有语义），journal 历史不得混入。
+func TestCreateWithTranscriptKeepsTranscriptOverJournal(t *testing.T) {
+	setTestAgentHome(t)
+	journalDir := t.TempDir()
+	m := newAgentAIManager()
+	m.coreJournal = newAgentCoreJournal(journalDir)
+	now := time.Now().UTC().Format(time.RFC3339)
+	m.coreJournal.ensureSessionHeader("s-g2-tx", "/proj", "glm-5.3", "", now, "dashboard", nil, nil)
+	m.coreJournal.appendUser("s-g2-tx", "m1", "journal旧问", now)
+	m.coreJournal.appendAssistant("s-g2-tx", "a1", "journal旧答", now)
+
+	up, srv := newAgentCoreUpstream(t, agentCoreTextTurn("第三", "答"))
+	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
+
+	svc := &AgentService{ai: m}
+	var mu sync.Mutex
+	var frames []map[string]interface{}
+	write := func(p interface{}) error {
+		if row, ok := p.(map[string]interface{}); ok {
+			mu.Lock()
+			frames = append(frames, row)
+			mu.Unlock()
+		}
+		return nil
+	}
+	svc.DispatchLocalAI(map[string]interface{}{
+		"type":         models.AgentEventAISessionCreate,
+		"session_id":   "s-g2-tx",
+		"provider":     "agentcore",
+		"mode":         "vibe",
+		"project_path": t.TempDir(),
+		"model":        "glm-5.3",
+		"transcript": []interface{}{
+			map[string]interface{}{"role": "user", "id": "t1", "content": "载荷问"},
+			map[string]interface{}{"role": "assistant", "id": "t1a", "content": "载荷答"},
+		},
+	}, write)
+
+	svc.DispatchLocalAI(map[string]interface{}{
+		"type":         models.AgentEventAIMessage,
+		"session_id":   "s-g2-tx",
+		"message_id":   "m2",
+		"content":      "第三问",
+		"provider":     "agentcore",
+		"mode":         "vibe",
+		"project_path": t.TempDir(),
+		"model":        "glm-5.3",
+	}, write)
+	waitForAgentEvent(t, &mu, &frames, models.AgentEventAIDone, func(e map[string]interface{}) bool {
+		return remoteString(e, "session_id") == "s-g2-tx"
+	})
+
+	reqs := up.requests()
+	if len(reqs) != 1 {
+		t.Fatalf("上游请求次数 = %d, want 1", len(reqs))
+	}
+	want := []struct{ role, text string }{
+		{"user", "载荷问"}, {"assistant", "载荷答"}, {"user", "第三问"},
+	}
+	if len(reqs[0].Messages) != len(want) {
+		t.Fatalf("内核收到的消息条数 = %d, want %d（journal 历史不得混入）: %+v",
+			len(reqs[0].Messages), len(want), reqs[0].Messages)
+	}
+	for i, w := range want {
+		msg := reqs[0].Messages[i]
+		text := agentCoreMessageText(msg)
+		if msg.Role != w.role || text != w.text {
+			t.Errorf("内核 messages[%d] = %s/%q, want %s/%q", i, msg.Role, text, w.role, w.text)
+		}
+	}
+	_ = up
+}
+
+// TestCreateRestoreKeepsInitialContext 回装不得冲掉 initial_context：create 的
+// initial_context 拼接点在解析期（早于 message() 懒建的拼接点），无 transcript
+// 回装时 system 条目必须保留在历史首部（内核经 System 字段承载）。
+func TestCreateRestoreKeepsInitialContext(t *testing.T) {
+	setTestAgentHome(t)
+	journalDir := t.TempDir()
+	m := newAgentAIManager()
+	m.coreJournal = newAgentCoreJournal(journalDir)
+	now := time.Now().UTC().Format(time.RFC3339)
+	m.coreJournal.ensureSessionHeader("s-g2-ic", "/proj", "glm-5.3", "", now, "dashboard", nil, nil)
+	m.coreJournal.appendUser("s-g2-ic", "m1", "journal旧问", now)
+	m.coreJournal.appendAssistant("s-g2-ic", "a1", "journal旧答", now)
+
+	svc := &AgentService{ai: m}
+	write := func(p interface{}) error { return nil }
+	svc.DispatchLocalAI(map[string]interface{}{
+		"type":            models.AgentEventAISessionCreate,
+		"session_id":      "s-g2-ic",
+		"provider":        "agentcore",
+		"mode":            "vibe",
+		"project_path":    t.TempDir(),
+		"model":           "glm-5.3",
+		"initial_context": "这是初始上下文",
+	}, write)
+
+	m.mu.Lock()
+	history := append([]agentAIMessage(nil), m.sessions["s-g2-ic"].history...)
+	m.mu.Unlock()
+	if len(history) != 3 {
+		t.Fatalf("create 后内存历史条数 = %d, want 3(system+journal 两行): %+v", len(history), history)
+	}
+	if history[0].Role != "system" || history[0].Content != "这是初始上下文" {
+		t.Fatalf("回装冲掉了 initial_context, history[0] = %+v", history[0])
+	}
+	if history[1].Content != "journal旧问" || history[2].Content != "journal旧答" {
+		t.Fatalf("journal 回装行错: %+v", history[1:])
+	}
+}
+
 // 2026-11-05 仪表盘刷新丢回答事故回归锚：agentcore 路径的回答走
 // appendAssistantTurn(kind=turn, 无 message_id)——快照读侧此前只认
 // kind=msg,转录里永远只有 user 行,重进页订阅快照/内存续聊恢复全部拿不到
@@ -561,5 +777,97 @@ func TestReadAgentCoreJournalHistoryIncludesTurnRows(t *testing.T) {
 	// thinking 不进历史(快照契约未消费)。
 	if strings.Contains(hist[1].Content, "The user is asking") {
 		t.Fatalf("thinking 不得混入正文: %+v", hist[1])
+	}
+}
+
+// writeJournalRawLines 往指定 journal 目录手写原始 JSONL 行（绕过写侧 helper
+// 才能造带 diagnostics 块的 end 行——appendEndDiagnostics 的 agentCoreDiagnostics
+// 字段不导出，测试造不出带 reason 键的终态快照）。
+func writeJournalRawLines(t *testing.T, dir, sessionID string, lines ...string) {
+	t.Helper()
+	path := filepath.Join(dir, agentCoreJournalFileName(sessionID))
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatalf("写 journal fixture: %v", err)
+	}
+}
+
+// TestReadAgentCoreJournalTranscriptEndErrorNote（G5 问题悬空）：快照订阅读侧
+// 必须把 journal end(error) 行折成 role=system 的系统条——失败回合在转录里
+// 悬空（有提问无任何反馈）是仪表盘用户「为什么没有回答」的直接来源。
+// 核对项：①diagnostics.reason（内核真因）优先于 error 键；②笼统兜底文案
+// 「agentcore run failed」不得进正文；③成功/取消（success/stopped）终态不产条；
+// ④模型上下文回装口径（readAgentCoreJournalHistoryFrom 薄包装）保持纯对话
+// 历史——系统条绝不能进模型 prompt。
+func TestReadAgentCoreJournalTranscriptEndErrorNote(t *testing.T) {
+	dir := t.TempDir()
+	head := `{"kind":"session","session_id":"%s","project_path":"/proj","model":"glm-5.3","created_at":"2026-11-05T00:00:00Z","origin":"phone"}`
+	user := `{"kind":"msg","role":"user","message_id":"m1","text":"第一问","ts":"2026-11-05T00:01:00Z"}`
+	// 真因形态：宿主已把笼统文案升级成内核真因时，error 与 diagnostics.reason
+	// 同文；reason 键是权威源。
+	writeJournalRawLines(t, dir, "s-err-reason",
+		fmt.Sprintf(head, "s-err-reason"), user,
+		`{"kind":"end","status":"error","error":"模型连续 3 轮发起完全相同的工具调用，判定为无进展，已停止","diagnostics":{"turns":3,"reason":"模型连续 3 轮发起完全相同的工具调用，判定为无进展"},"ts":"2026-11-05T00:02:00Z"}`)
+	// 笼统形态：真因丢失，只有占位文案。
+	writeJournalRawLines(t, dir, "s-err-generic",
+		fmt.Sprintf(head, "s-err-generic"), user,
+		`{"kind":"end","status":"error","error":"agentcore run failed","ts":"2026-11-05T00:02:00Z"}`)
+	// 纯宿主错误形态：无 diagnostics 块（上游探测失败等早期出口）。
+	writeJournalRawLines(t, dir, "s-err-host",
+		fmt.Sprintf(head, "s-err-host"), user,
+		`{"kind":"end","status":"error","error":"平台 AI 代理未运行(127.0.0.1:56432 连接被拒,已尝试自动拉起)——请在设备仪表盘启动代理后重试","ts":"2026-11-05T00:02:00Z"}`)
+	writeJournalRawLines(t, dir, "s-success",
+		fmt.Sprintf(head, "s-success"), user,
+		`{"kind":"end","status":"success","ts":"2026-11-05T00:02:00Z"}`)
+	writeJournalRawLines(t, dir, "s-stopped",
+		fmt.Sprintf(head, "s-stopped"), user,
+		`{"kind":"end","status":"stopped","ts":"2026-11-05T00:02:00Z"}`)
+
+	hist, _, err := readAgentCoreJournalTranscriptFrom(dir, "s-err-reason", true)
+	if err != nil {
+		t.Fatalf("读回失败: %v", err)
+	}
+	if len(hist) != 2 || hist[1].Role != "system" {
+		t.Fatalf("end(error) 必须折出系统条: %+v", hist)
+	}
+	if hist[1].Content != "这一轮执行失败：模型连续 3 轮发起完全相同的工具调用，判定为无进展" {
+		t.Fatalf("系统条文案错(reason 键优先): %q", hist[1].Content)
+	}
+	if hist[1].CreatedAt.IsZero() {
+		t.Fatalf("系统条应带 end 行 ts: %+v", hist[1])
+	}
+
+	hist, _, err = readAgentCoreJournalTranscriptFrom(dir, "s-err-generic", true)
+	if err != nil {
+		t.Fatalf("读回失败: %v", err)
+	}
+	if len(hist) != 2 || hist[1].Content != "这一轮执行失败" {
+		t.Fatalf("笼统兜底文案不得进正文: %+v", hist)
+	}
+
+	hist, _, err = readAgentCoreJournalTranscriptFrom(dir, "s-err-host", true)
+	if err != nil {
+		t.Fatalf("读回失败: %v", err)
+	}
+	if len(hist) != 2 || hist[1].Content != "这一轮执行失败：平台 AI 代理未运行(127.0.0.1:56432 连接被拒,已尝试自动拉起)——请在设备仪表盘启动代理后重试" {
+		t.Fatalf("宿主错误原文必须保留兜底: %+v", hist)
+	}
+
+	for _, sessionID := range []string{"s-success", "s-stopped"} {
+		hist, _, err = readAgentCoreJournalTranscriptFrom(dir, sessionID, true)
+		if err != nil {
+			t.Fatalf("读回失败: %v", err)
+		}
+		if len(hist) != 1 || hist[0].Role != "user" {
+			t.Fatalf("%s: 成功/取消终态不得产系统条: %+v", sessionID, hist)
+		}
+	}
+
+	// 模型上下文回装口径（false）：同文件系统条不出现——历史要进模型 prompt。
+	hist, _, err = readAgentCoreJournalHistoryFrom(dir, "s-err-reason")
+	if err != nil {
+		t.Fatalf("读回失败: %v", err)
+	}
+	if len(hist) != 1 || hist[0].Role != "user" {
+		t.Fatalf("回装口径不得带系统条(会污染模型 prompt): %+v", hist)
 	}
 }

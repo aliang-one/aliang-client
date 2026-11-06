@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"sync"
@@ -564,7 +565,7 @@ func TestRemoteSubscribeRepliesSnapshotAndRegisters(t *testing.T) {
 	replies := make(chan map[string]interface{}, 8)
 	write := func(p interface{}) error { replies <- p.(map[string]interface{}); return nil }
 
-	svc.handleRemoteAgentMessage(map[string]interface{}{
+	svc.handleRemoteAgentMessage(context.Background(), map[string]interface{}{
 		"type": models.AgentEventAISessionSubscribe, "session_id": "s-remote-1",
 	}, write)
 	select {
@@ -587,7 +588,7 @@ func TestRemoteSubscribeRepliesSnapshotAndRegisters(t *testing.T) {
 	}
 
 	// aiControlEnabled=false 的设备也允许订阅（只读观察语义）——门在业务帧上
-	svc.handleRemoteAgentMessage(map[string]interface{}{
+	svc.handleRemoteAgentMessage(context.Background(), map[string]interface{}{
 		"type": models.AgentEventAISessionUnsubscribe, "session_id": "s-remote-1",
 	}, write)
 	m.mu.Lock()

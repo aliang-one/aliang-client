@@ -2,6 +2,7 @@ package services
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -41,20 +42,20 @@ type agentProjectFileCandidate struct {
 	modTime time.Time
 }
 
-func handleAgentDetailMessage(msg map[string]interface{}, writeJSON func(interface{}) error) {
-	handleAgentDetailMessageWithAI(msg, writeJSON, nil)
+func handleAgentDetailMessage(ctx context.Context, msg map[string]interface{}, writeJSON func(interface{}) error) {
+	handleAgentDetailMessageWithAI(ctx, msg, writeJSON, nil)
 }
 
-func handleAgentDetailMessageWithAI(msg map[string]interface{}, writeJSON func(interface{}) error, manager *agentAIManager) {
+func handleAgentDetailMessageWithAI(ctx context.Context, msg map[string]interface{}, writeJSON func(interface{}) error, manager *agentAIManager) {
 	switch remoteString(msg, "type") {
 	case models.AgentEventProjectDetail:
 		_ = writeJSON(agentProjectDetailPayload(msg))
 	case models.AgentEventAISessionDetail:
 		_ = writeJSON(agentVibeSessionDetailPayload(msg))
 	case models.AgentEventFileList:
-		_ = writeJSON(agentFileListPayload(msg))
+		_ = writeJSON(agentFileListPayload(ctx, msg))
 	case models.AgentEventFileRead:
-		_ = writeJSON(agentFileReadPayload(msg))
+		_ = writeJSON(agentFileReadPayload(ctx, msg))
 	case models.AgentEventFileWrite:
 		_ = writeJSON(agentFileWritePayload(msg))
 	case "file.working_tree_diff":
@@ -368,7 +369,7 @@ func agentVibeProjectPathMatches(requestPath, sessionPath string) bool {
 	}
 }
 
-func agentFileListPayload(msg map[string]interface{}) map[string]interface{} {
+func agentFileListPayload(_ context.Context, msg map[string]interface{}) map[string]interface{} {
 	requestID := remoteString(msg, "request_id")
 	projectPath, err := resolveAgentProjectPath(remoteString(msg, "project_path"))
 	if err != nil {
@@ -455,7 +456,7 @@ func readAgentDirectoryEntries(path string, maxEntries int) ([]os.DirEntry, bool
 	return entries, truncated, nil
 }
 
-func agentFileReadPayload(msg map[string]interface{}) map[string]interface{} {
+func agentFileReadPayload(_ context.Context, msg map[string]interface{}) map[string]interface{} {
 	requestID := remoteString(msg, "request_id")
 	projectPath, err := resolveAgentProjectPath(remoteString(msg, "project_path"))
 	if err != nil {

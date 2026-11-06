@@ -1,19 +1,21 @@
 package tools
 
 import (
+	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
 )
 
-func okPayload(msg map[string]interface{}) map[string]interface{} {
+func okPayload(_ context.Context, msg map[string]interface{}) map[string]interface{} {
 	return map[string]interface{}{"type": "x.y.result", "request_id": msg["request_id"], "ok": true}
 }
 
 func TestDispatch_PanicBecomesErrorPayload(t *testing.T) {
 	tool := &Tool{ID: "boom", Event: "x.boom", Description: "d",
-		Handler: func(map[string]interface{}) map[string]interface{} { panic("kaboom") }}
-	res := SafeCall(tool, map[string]interface{}{"request_id": "r1"})
+		Handler: func(_ context.Context, _ map[string]interface{}) map[string]interface{} { panic("kaboom") }}
+	res := SafeCall(tool, context.Background(), map[string]interface{}{"request_id": "r1"})
 	if res["error"] == nil || res["request_id"] != "r1" {
 		t.Fatalf("panic should convert to error payload, got %v", res)
 	}
@@ -24,11 +26,11 @@ func TestDispatch_PanicBecomesErrorPayload(t *testing.T) {
 
 func TestDispatch_OnErrorPreferred(t *testing.T) {
 	tool := &Tool{ID: "f", Event: "file.x", Description: "d",
-		Handler: func(map[string]interface{}) map[string]interface{} { panic("kaboom") },
+		Handler: func(_ context.Context, _ map[string]interface{}) map[string]interface{} { panic("kaboom") },
 		OnError: func(requestID string, err error) map[string]interface{} {
 			return map[string]interface{}{"type": "file.error", "request_id": requestID, "error": "family:" + err.Error()}
 		}}
-	res := SafeCall(tool, map[string]interface{}{"request_id": "r2"})
+	res := SafeCall(tool, context.Background(), map[string]interface{}{"request_id": "r2"})
 	if res["error"] != "family:kaboom" {
 		t.Fatalf("OnError payload not used: %v", res)
 	}
@@ -37,12 +39,12 @@ func TestDispatch_OnErrorPreferred(t *testing.T) {
 func TestRunWithGuards_Timeout(t *testing.T) {
 	slow := &Tool{ID: "slow", Event: "x.slow", Description: "d",
 		Caps: Caps{TimeoutMs: 50},
-		Handler: func(map[string]interface{}) map[string]interface{} {
+		Handler: func(_ context.Context, _ map[string]interface{}) map[string]interface{} {
 			time.Sleep(2 * time.Second)
-			return okPayload(nil)
+			return okPayload(context.Background(), nil)
 		}}
 	var wrote map[string]interface{}
-	RunWithGuards(slow, map[string]interface{}{"request_id": "r3"}, func(p interface{}) error {
+	RunWithGuards(context.Background(), slow, map[string]interface{}{"request_id": "r3"}, func(p interface{}) error {
 		wrote = p.(map[string]interface{})
 		return nil
 	})
@@ -54,11 +56,11 @@ func TestRunWithGuards_Timeout(t *testing.T) {
 func TestRunWithGuards_OutputCapTruncates(t *testing.T) {
 	big := &Tool{ID: "big", Event: "x.big", Description: "d",
 		Caps: Caps{TimeoutMs: 5000, MaxOutputBytes: 64},
-		Handler: func(map[string]interface{}) map[string]interface{} {
+		Handler: func(_ context.Context, _ map[string]interface{}) map[string]interface{} {
 			return map[string]interface{}{"type": "x.big.result", "blob": strings.Repeat("x", 4096)}
 		}}
 	var wrote map[string]interface{}
-	RunWithGuards(big, map[string]interface{}{"request_id": "r4"}, func(p interface{}) error {
+	RunWithGuards(context.Background(), big, map[string]interface{}{"request_id": "r4"}, func(p interface{}) error {
 		wrote = p.(map[string]interface{})
 		return nil
 	})
@@ -72,7 +74,7 @@ func TestRunWithGuards_NormalPath(t *testing.T) {
 		Caps:    Caps{TimeoutMs: 5000, MaxOutputBytes: 65536},
 		Handler: okPayload}
 	var wrote map[string]interface{}
-	RunWithGuards(tool, map[string]interface{}{"request_id": "r5"}, func(p interface{}) error {
+	RunWithGuards(context.Background(), tool, map[string]interface{}{"request_id": "r5"}, func(p interface{}) error {
 		wrote = p.(map[string]interface{})
 		return nil
 	})
@@ -83,11 +85,11 @@ func TestRunWithGuards_NormalPath(t *testing.T) {
 
 func TestDispatch_OnErrorPanicsFallsBackToGeneric(t *testing.T) {
 	tool := &Tool{ID: "y", Event: "x.y", Description: "d",
-		Handler: func(map[string]interface{}) map[string]interface{} { panic("kaboom") },
+		Handler: func(_ context.Context, _ map[string]interface{}) map[string]interface{} { panic("kaboom") },
 		OnError: func(requestID string, err error) map[string]interface{} {
 			panic("OnError exploded")
 		}}
-	res := SafeCall(tool, map[string]interface{}{"request_id": "r6"})
+	res := SafeCall(tool, context.Background(), map[string]interface{}{"request_id": "r6"})
 	if res["error"] != "kaboom" {
 		t.Fatalf("panicking OnError should fall back to generic payload, got %v", res)
 	}
@@ -110,8 +112,8 @@ func TestRequestIDOf_MissingKeyReturnsEmpty(t *testing.T) {
 
 func TestDispatch_NilResultBecomesErrorPayload(t *testing.T) {
 	tool := &Tool{ID: "n", Event: "x.n", Description: "d",
-		Handler: func(map[string]interface{}) map[string]interface{} { return nil }}
-	res := SafeCall(tool, map[string]interface{}{"request_id": "r7"})
+		Handler: func(_ context.Context, _ map[string]interface{}) map[string]interface{} { return nil }}
+	res := SafeCall(tool, context.Background(), map[string]interface{}{"request_id": "r7"})
 	if res["error"] != "tool_returned_nil" {
 		t.Fatalf("nil handler result should become error payload, got %v", res)
 	}
@@ -123,11 +125,11 @@ func TestDispatch_NilResultBecomesErrorPayload(t *testing.T) {
 func TestRunWithGuards_UnserializableOutputReportsError(t *testing.T) {
 	bad := &Tool{ID: "bad", Event: "x.bad", Description: "d",
 		Caps: Caps{TimeoutMs: 5000, MaxOutputBytes: 65536},
-		Handler: func(map[string]interface{}) map[string]interface{} {
+		Handler: func(_ context.Context, _ map[string]interface{}) map[string]interface{} {
 			return map[string]interface{}{"type": "x.bad.result", "ch": make(chan int)}
 		}}
 	var wrote map[string]interface{}
-	RunWithGuards(bad, map[string]interface{}{"request_id": "r8"}, func(p interface{}) error {
+	RunWithGuards(context.Background(), bad, map[string]interface{}{"request_id": "r8"}, func(p interface{}) error {
 		wrote = p.(map[string]interface{})
 		return nil
 	})
@@ -136,5 +138,84 @@ func TestRunWithGuards_UnserializableOutputReportsError(t *testing.T) {
 	}
 	if _, has := wrote["truncated"]; has {
 		t.Fatalf("marshal failure must not set truncated flag, got %v", wrote)
+	}
+}
+
+// TestRunWithGuardsTimeoutCancelsHandlerContext：护栏超时必须让 handler 的
+// ctx 进入 Done（真实远端调用类 handler——peer_exec——靠它停止孤儿执行），
+// 调用方收到 tool_timeout。
+func TestRunWithGuardsTimeoutCancelsHandlerContext(t *testing.T) {
+	handlerSaw := make(chan error, 1)
+	tt := &Tool{ID: "x", Event: "x.y", Description: "d",
+		Caps: Caps{TimeoutMs: 60},
+		Handler: func(ctx context.Context, _ map[string]interface{}) map[string]interface{} {
+			<-ctx.Done()
+			handlerSaw <- ctx.Err()
+			return nil
+		}}
+	var out []interface{}
+	RunWithGuards(context.Background(), tt, map[string]interface{}{"request_id": "r1"}, func(v interface{}) error {
+		out = append(out, v)
+		return nil
+	})
+	select {
+	case err := <-handlerSaw:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("handler ctx 取消原因 = %v, want DeadlineExceeded", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("超时时 handler 未收到 ctx 取消")
+	}
+	if len(out) != 1 {
+		t.Fatalf("应回写 1 个 payload, got %d", len(out))
+	}
+	payload := out[0].(map[string]interface{})
+	if payload["error"] != "tool_timeout" {
+		t.Fatalf("payload error = %v, want tool_timeout", payload["error"])
+	}
+}
+
+// TestRunWithGuardsParentCancelReportsToolCancelled：上层（WS 会话）取消时，
+// handler 被连带取消，调用方收到 tool_cancelled 而非 tool_timeout。
+func TestRunWithGuardsParentCancelReportsToolCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	handlerSaw := make(chan error, 1)
+	tt := &Tool{ID: "x", Event: "x.y", Description: "d",
+		Caps: Caps{TimeoutMs: 10_000},
+		Handler: func(ctx context.Context, _ map[string]interface{}) map[string]interface{} {
+			<-ctx.Done()
+			handlerSaw <- ctx.Err()
+			return nil
+		}}
+	var out []interface{}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		RunWithGuards(ctx, tt, map[string]interface{}{"request_id": "r2"}, func(v interface{}) error {
+			out = append(out, v)
+			return nil
+		})
+	}()
+	time.Sleep(30 * time.Millisecond)
+	cancel()
+	<-done
+	// RunWithGuards 返回 ≠ handler goroutine 已把取消写进 handlerSaw——
+	// 两者间无 happens-before（handler 从 Done 醒来后还要跑一段）。用超时
+	// 等待而非即时 default，否则调度延迟会偶发假失败。
+	select {
+	case err := <-handlerSaw:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("handler ctx 取消原因 = %v, want Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("会话取消未传导到 handler ctx")
+	}
+	if len(out) != 1 {
+		t.Fatalf("应回写 1 个 payload, got %d", len(out))
+	}
+	payload := out[0].(map[string]interface{})
+	if payload["error"] != "tool_cancelled" {
+		t.Fatalf("payload error = %v, want tool_cancelled", payload["error"])
 	}
 }

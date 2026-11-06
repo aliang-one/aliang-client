@@ -91,6 +91,13 @@ func StartLocalServer() error {
 	// 注册且 command 最新;关=确保注销)。只 Warn 不阻断启动;应用细节见
 	// services.EnsurePeerMCPMatchesConfig。
 	services.EnsurePeerMCPMatchesConfig()
+	// 持久附件缓存全局帽清扫(1GiB,按会话最旧驱逐):recall/truncateBefore 的
+	// 孤儿文件统一在此收敛。只 Warn 不阻断启动。
+	if err := services.AgentAttachmentSweepStartup(); err != nil {
+		logger.Warn(fmt.Sprintf("[AGENT-BOOT] attachment cache sweep failed err=%v", err))
+	}
+	// 统一 MCP 注册表 codex 托管块自愈(同 peer 自愈纪律:只 Warn 不阻断)。
+	services.EnsureAliangMCPCodexMatchesRegistry()
 	logger.Info("[AGENT-BOOT] local_server awaiting session owner sync")
 	return nil
 }
@@ -148,6 +155,9 @@ func registerAgentRoutes(mux *http.ServeMux) {
 	// runtime，由本地 AI 管理器跑（journal/清单与手机同源）。缺注册=404 透传
 	// （2026-10-21 liang-dev 双注册教训）。
 	mux.HandleFunc("/api/agent/ai/stream", agentHandler.HandleAIStream)
+	// 聊天图片链路（spec §3.4）：上传+取图,双注册另一处 routes.go。
+	mux.HandleFunc("/api/agent/ai/attachment/upload", agentHandler.HandleAttachmentUpload)
+	mux.HandleFunc("/api/agent/ai/attachment", agentHandler.HandleAttachmentGet)
 	mux.HandleFunc("/mcp/aliang/", agentHandler.HandleToolAskMCP)
 	mux.HandleFunc("/api/agent/sessions", agentHandler.HandleVibeSessions)
 	mux.HandleFunc("/api/agent/session", agentHandler.HandleVibeSession)
@@ -160,6 +170,12 @@ func registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/agent/file-access/settings", agentHandler.HandleFileAccessSettings)
 	// MCP 与技能只读报告：核心侧 routes.go 同名注册透传（双注册教训同上）。
 	mux.HandleFunc("/api/agent/integrations", agentHandler.HandleAgentIntegrations)
+	// 统一 MCP 注册表三端点；双注册纪律——core routes.go + 本 mux 缺任一侧
+	// =404（2026-10-21 教训）。{name} 用方法前缀模式（PUT/DELETE 分流到不同
+	// handler，同 core 侧写法）。
+	mux.HandleFunc("/api/agent/mcp", agentHandler.HandleAliangMCPRegistry)
+	mux.HandleFunc("PUT /api/agent/mcp/servers/{name}", agentHandler.HandleAliangMCPServerPut)
+	mux.HandleFunc("DELETE /api/agent/mcp/servers/{name}", agentHandler.HandleAliangMCPServerDelete)
 	// 仪表盘数据面端点：核心进程会把这两个请求代理到本 runtime，缺注册会让
 	// 仪表盘 Agent 页的「远程终端」列表和「进行中」徽章永远拿不到数据
 	// （2026-10-21 liang-dev 实测 404 透传）。

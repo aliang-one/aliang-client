@@ -826,14 +826,14 @@ func agentPeerToolError(eventType, requestID string, err error) map[string]inter
 	}
 }
 
-func agentPeerExecPayload(msg map[string]interface{}) map[string]interface{} {
+func agentPeerExecPayload(ctx context.Context, msg map[string]interface{}) map[string]interface{} {
 	requestID := agentPeerToolRequestID(msg)
 	deviceID := remoteString(msg, "device_id")
 	command := remoteString(msg, "command")
 	if strings.TrimSpace(deviceID) == "" || strings.TrimSpace(command) == "" {
 		return agentPeerToolError(AgentPeerToolEventExec+".result", requestID, errors.New("device_id and command are required"))
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), agentPeerToolTimeoutMs*time.Millisecond)
+	ctx, cancel := context.WithTimeout(ctx, agentPeerToolTimeoutMs*time.Millisecond)
 	defer cancel()
 	text, err := agentPeerServiceProvider().peerExecCall(ctx, deviceID, command,
 		remoteInt(msg, "timeout_ms", 0), remoteString(msg, "workdir"))
@@ -847,14 +847,14 @@ func agentPeerExecPayload(msg map[string]interface{}) map[string]interface{} {
 	}
 }
 
-func agentPeerFetchFilePayload(msg map[string]interface{}) map[string]interface{} {
+func agentPeerFetchFilePayload(ctx context.Context, msg map[string]interface{}) map[string]interface{} {
 	requestID := agentPeerToolRequestID(msg)
 	deviceID := remoteString(msg, "device_id")
 	remotePath := remoteString(msg, "remote_path")
 	if strings.TrimSpace(deviceID) == "" || strings.TrimSpace(remotePath) == "" {
 		return agentPeerToolError(AgentPeerToolEventFetchFile+".result", requestID, errors.New("device_id and remote_path are required"))
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), agentPeerFetchFileTimeoutMs*time.Millisecond)
+	ctx, cancel := context.WithTimeout(ctx, agentPeerFetchFileTimeoutMs*time.Millisecond)
 	defer cancel()
 	text, err := agentPeerServiceProvider().peerFetchFileCall(ctx, deviceID, remotePath)
 	if err != nil {
@@ -867,9 +867,9 @@ func agentPeerFetchFilePayload(msg map[string]interface{}) map[string]interface{
 	}
 }
 
-func agentDeviceInfoPayload(msg map[string]interface{}) map[string]interface{} {
+func agentDeviceInfoPayload(ctx context.Context, msg map[string]interface{}) map[string]interface{} {
 	requestID := agentPeerToolRequestID(msg)
-	ctx, cancel := context.WithTimeout(context.Background(), agentPeerDeviceInfoTimeoutMs*time.Millisecond)
+	ctx, cancel := context.WithTimeout(ctx, agentPeerDeviceInfoTimeoutMs*time.Millisecond)
 	defer cancel()
 	text, err := agentPeerServiceProvider().deviceInfoReport(ctx, remoteString(msg, "device_id"))
 	if err != nil {
@@ -882,9 +882,9 @@ func agentDeviceInfoPayload(msg map[string]interface{}) map[string]interface{} {
 	}
 }
 
-func agentPeerDeviceListPayload(msg map[string]interface{}) map[string]interface{} {
+func agentPeerDeviceListPayload(ctx context.Context, msg map[string]interface{}) map[string]interface{} {
 	requestID := agentPeerToolRequestID(msg)
-	ctx, cancel := context.WithTimeout(context.Background(), agentPeerDeviceListTimeoutMs*time.Millisecond)
+	ctx, cancel := context.WithTimeout(ctx, agentPeerDeviceListTimeoutMs*time.Millisecond)
 	defer cancel()
 	text, err := agentPeerServiceProvider().deviceListReport(ctx)
 	if err != nil {
@@ -897,14 +897,14 @@ func agentPeerDeviceListPayload(msg map[string]interface{}) map[string]interface
 	}
 }
 
-func agentDeviceNotePayload(msg map[string]interface{}) map[string]interface{} {
+func agentDeviceNotePayload(ctx context.Context, msg map[string]interface{}) map[string]interface{} {
 	requestID := agentPeerToolRequestID(msg)
 	key := remoteString(msg, "key")
 	value := remoteString(msg, "value")
 	if strings.TrimSpace(key) == "" || strings.TrimSpace(value) == "" {
 		return agentPeerToolError(AgentPeerToolEventDeviceNote+".result", requestID, errors.New("key and value are required"))
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), agentPeerNoteTimeoutMs*time.Millisecond)
+	ctx, cancel := context.WithTimeout(ctx, agentPeerNoteTimeoutMs*time.Millisecond)
 	defer cancel()
 	text, err := agentPeerServiceProvider().deviceNoteCall(ctx, remoteString(msg, "device_id"), key, value)
 	if err != nil {
@@ -930,7 +930,15 @@ type agentCorePeerToolBridge struct {
 	schema      map[string]interface{}
 	execute     func(ctx context.Context, input map[string]interface{}) (string, bool)
 	journal     func(tool, summary string, isErr bool)
+	// hint 覆盖内核默认单工具窗口（agentcore.TimeoutHint）。peer_exec 的
+	// 内部 clamp 上限 600s + 30s 网络宽限（agentPeerToolTimeoutMs=630s），
+	// 而内核默认窗口 600s——不 hint 的话满档超时请求会在窗口边缘被内核
+	// 掐掉、拿不到结构化 timeout 结果（2026-11-05 审计盲点 4 收尾）。0=默认。
+	hint time.Duration
 }
+
+// TimeoutHint 覆盖内核默认窗口（仅 peer_exec 桥设了 hint；0 回落默认）。
+func (b *agentCorePeerToolBridge) TimeoutHint() time.Duration { return b.hint }
 
 func (b *agentCorePeerToolBridge) Name() string        { return b.name }
 func (b *agentCorePeerToolBridge) Description() string { return b.description }
@@ -990,13 +998,22 @@ func (m *agentAIManager) agentCorePeerTools(run agentAIRun) []agentcore.Tool {
 				"PowerShell 5.1: \"&&\" is unavailable (use \";\" or PS cmdlets), external .exe may " +
 				"be unavailable (prefer PS built-ins like $env:COMPUTERNAME or Get-FileHash, or " +
 				"absolute paths), and PS output is UTF-8 (native-exe output in a legacy codepage " +
-				"may still be garbled).",
+				"may still be garbled). Cancellation/timeout only aborts the local wait — the " +
+				"remote command still runs to completion on the target; do not blindly retry " +
+				"side-effecting commands.",
 			schema: peerToolSchema([]string{"device_id", "command"}, map[string]interface{}{
 				"device_id":  map[string]interface{}{"type": "string", "description": "Target device id"},
 				"command":    map[string]interface{}{"type": "string", "description": "Shell command to run on the target device"},
 				"timeout_ms": map[string]interface{}{"type": "integer", "description": "Command timeout in ms (1000-600000, default 30000; out-of-range values are clamped)"},
 				"workdir":    map[string]interface{}{"type": "string", "description": "Working directory on the target device (must exist, default home)"},
 			}),
+			// 内核窗口 630s：内部 clamp 上限 600s + 30s 网络宽限（与注册表/
+			// stdio 面的 agentPeerToolTimeoutMs 同值），否则满档超时请求会在
+			// 内核默认 600s 窗口边缘被掐、拿不到结构化 timeout 结果。
+			// 注意单位：agentPeerToolTimeoutMs 是无类型整型常量（毫秒语义），
+			// 必须 ×time.Millisecond 才是 Duration——直赋会变 630µs（2026-11-06
+			// 评审 C1 实锤过的事故形态，测试里有 >=time.Minute 防单位回归）。
+			hint: agentPeerToolTimeoutMs * time.Millisecond,
 			execute: func(ctx context.Context, input map[string]interface{}) (string, bool) {
 				text, err := agentPeerServiceProvider().peerExecCall(ctx,
 					inputStringField(input, "device_id"),

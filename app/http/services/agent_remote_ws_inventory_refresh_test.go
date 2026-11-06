@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -31,7 +32,7 @@ func TestHandleRemoteInventoryRefreshSendsHello(t *testing.T) {
 		return nil
 	}
 
-	service.handleRemoteAgentMessage(map[string]interface{}{
+	service.handleRemoteAgentMessage(context.Background(), map[string]interface{}{
 		"type": models.AgentEventInventoryRefresh,
 	}, writeJSON)
 

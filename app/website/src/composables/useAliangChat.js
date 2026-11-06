@@ -4,6 +4,15 @@ import { useNavigation } from './useNavigation';
 import { slashProviderFor } from '../utils/chatProvider';
 import { normalizeConversationTitle } from '../utils/chatTitle';
 import { useAuthStore } from '../stores/auth';
+import { uploadChatAttachment } from '../services/agentApi';
+
+// 附件缩略图/原图 URL（spec 2026-11-05-chat-image-pipeline §3.6）：ref 来自
+// journal/wire 行，一律走本机 agent 回环端点取图（COS/预签名 URL 永不出现在
+// 前端）。组件直接 import 本模块级纯函数。
+export function chatAttachmentUrl(refId) {
+  if (!refId) return '';
+  return '/api/agent/ai/attachment?ref=' + encodeURIComponent(refId);
+}
 import { getAgentIntegrations, getAgentSessionDetail } from '../services/agentApi';
 import { useDeviceSessions, DEVICE_SESSION_DETAIL_TTL_MS, isTerminalPrefixedSessionId } from './useDeviceSessions';
 import {
@@ -13,6 +22,7 @@ import {
   rememberLastUsedEffort,
   rememberLastUsedModel,
   sessionCreatePayload,
+  dropShadowedDeviceShells,
 } from '../utils/chatSettings';
 import {
   canRecall,
@@ -69,6 +79,64 @@ export function normalizeApprovalDecisions(values) {
   return out.length ? out : ['accept', 'decline', 'cancel'];
 }
 
+// 设备转录系统条气泡（G5 错误终态；纯函数，导出供单测，与上方审批归一纯函数
+// 同族）：server 读侧（agent_inventory_agentcore.go / agent_ai_journal_history.go）
+// 把 journal end(error) 行折成 role=system 的人话终态文案下发，前端镜像仓内
+// 系统条先例（审批取消/运行提示条：role:'assistant'+kind:'system'+note+
+// status:'done'）渲染为居中弱化胶囊。note='turn_failed' 供 testid 分流；文案
+// server 已人话化，原样展示。
+export function deviceSystemNoteBubble(content, ts) {
+  return { role: 'assistant', kind: 'system', note: 'turn_failed', content, status: 'done', ts };
+}
+
+// 详情转录行 → 壳气泡 + 喂入流（纯函数，导出供单测）。user/assistant 原样
+// 落气泡并进喂入；role=system 行（G5 错误终态系统条）**只落气泡、绝不进喂入**
+// ——deviceTranscript 是续聊的模型上下文，事实说明喂回去会污染；其余角色
+// （tool 轨迹等）跳过。
+export function deviceDetailTranscriptToMessages(rows, provider, fallbackTs) {
+  const list = Array.isArray(rows) ? rows : [];
+  const renderable = list.filter(m => m && (m.role === 'user' || m.role === 'assistant' || m.role === 'system')
+    && typeof m.content === 'string' && m.content);
+  return {
+    messages: renderable.map(m => m.role === 'system'
+      ? deviceSystemNoteBubble(m.content, Date.parse(m.timestamp) || fallbackTs)
+      : {
+        role: m.role,
+        content: m.content,
+        status: 'done',
+        // 撤回锚点接线（Task 13）：详情 wire 行的 id 即 journal message_id，落
+        // 气泡后可作 truncate_before_message_id；provider 落上（canRecall 依赖）。
+        messageId: m.id || '',
+        provider: provider || '',
+        ts: Date.parse(m.timestamp) || fallbackTs,
+      }),
+    feed: renderable.filter(m => m.role !== 'system').map(m => ({ role: m.role, content: m.content })),
+  };
+}
+
+// 快照转录行 → 壳气泡（纯函数，导出供单测；**仅展示流**）。字段名与详情不同
+// （快照用 text，详情用 content）。system 行同款落系统条（快照侧本就不写
+// deviceTranscript，无需喂入分离）。
+export function deviceSnapshotTranscriptToMessages(rows, provider, fallbackTs) {
+  const list = Array.isArray(rows) ? rows : [];
+  const renderable = list.filter(m => m && (m.role === 'user' || m.role === 'assistant' || m.role === 'system')
+    && typeof m.text === 'string' && m.text);
+  return {
+    messages: renderable.map(m => m.role === 'system'
+      ? deviceSystemNoteBubble(m.text, Date.parse(m.ts) || fallbackTs)
+      : {
+        role: m.role,
+        content: m.text,
+        status: 'done',
+        // 快照 id 系 journal 同源（spec §A 已修订），可作撤回锚点；内容仍绝不
+        // 喂入（deviceTranscript 专属流不变）。provider 落上（canRecall 依赖）。
+        messageId: m.message_id || '',
+        provider: provider || '',
+        ts: Date.parse(m.ts) || fallbackTs,
+      }),
+  };
+}
+
 export function useAliangChat() {
   const { t } = useI18n();
   const { showDashboard, chatProviderPreset } = useNavigation();
@@ -89,6 +157,11 @@ export function useAliangChat() {
   const activeId = ref(null);
   const inputText = ref('');
   const sending = ref(false);
+  // 图片附件（spec 2026-11-05-chat-image-pipeline §3.6）：pending=已上传待随
+  // ai.message 发出的引用（{ref,path,name,mime,bytes}）；uploading 期间禁发
+  // （防载荷半截）。瞬态：不进 conversationForStorage。
+  const pendingAttachments = ref([]);
+  const attachmentUploading = ref(false);
   const messagesContainer = ref(null);
   // 滚动跟随守卫（Task 8）：用户贴底时流式增量照常拽底；一旦上翻看历史
   // （距底 ≥120px），delta/审批卡/系统条等自动滚动全部静默，改由「回到底部」
@@ -231,6 +304,7 @@ export function useAliangChat() {
   // activeApprovals 口径一致，壳路由到他端会话的卡不拦本端输入）。
   const sendDisabled = computed(() =>
     (sending.value && !activeSessionRunning.value) || sendApprovalBlocked.value
+    || attachmentUploading.value
   );
 
   // --- 撤回重发编辑态（Task 13，转录级真撤回） ---
@@ -300,7 +374,11 @@ export function useAliangChat() {
     for (const shell of openedShells) {
       if (!listedIds.has(shell.deviceSession.id)) shells.push(shell);
     }
-    return [...drafts, ...shells];
+    // 侧栏双源去重（2026-11-06 侧栏双记录修复）：dashboard 会话的
+    // journal 壳 aiSessionId=local-<convId> 与本地草稿同值——本地优先
+    // 丢遮蔽壳，防「一条消息两条记录」（键缺失/未发送草稿不遮蔽）。
+    const visibleShells = dropShadowedDeviceShells(drafts, shells);
+    return [...drafts, ...visibleShells];
   });
 
   const conversationGroups = computed(() => [
@@ -762,47 +840,98 @@ export function useAliangChat() {
 
   // --- 打开设备会话（跨端统一阶段 2，Task 3） ---
 
-  // 详情/快照转录 → 壳 messages（复用既有气泡渲染路径）。role 只认
-  // user/assistant，系统/工具行跳过；同时存壳 deviceTranscript（[{role,content}]
-  // 原始形态，Task 4 的 agentcore create transcript 喂入消费——后端
-  // remoteAgentAIHistory 按 row.role/row.content 解析）。
+  // 详情/快照转录 → 壳 messages（复用既有气泡渲染路径）；deviceTranscript
+  // （[{role,content}] 原始形态，Task 4 的 agentcore create transcript 喂入
+  // 消费——后端 remoteAgentAIHistory 按 row.role/row.content 解析）由
+  // deviceDetailTranscriptToMessages 的 feed 供给。
   function applyDeviceTranscript(shell, transcript) {
     const rows = Array.isArray(transcript) ? transcript : [];
-    const renderable = rows.filter(m => m && (m.role === 'user' || m.role === 'assistant')
-      && typeof m.content === 'string' && m.content);
-    shell.messages = renderable.map(m => ({
-      role: m.role,
-      content: m.content,
-      status: 'done',
-      // 撤回锚点接线（Task 13）：详情 wire 行的 id 即 journal message_id，落
-      // 气泡后可作 truncate_before_message_id；provider 落上（canRecall 依赖）。
-      messageId: m.id || '',
-      provider: shell.provider || '',
-      ts: Date.parse(m.timestamp) || now(),
-    }));
-    shell.deviceTranscript = renderable.map(m => ({ role: m.role, content: m.content }));
+    const bubbles = [];
+    const feed = [];
+    for (const m of rows) {
+      if (!m) continue;
+      // 错误终态系统条（G5 问题悬空修复）：role=system 的行渲染居中弱化胶囊
+      // （note=turn_failed），绝不进气泡对话流、绝不进续聊喂入流。
+      if (m.role === 'system') {
+        bubbles.push({
+          role: 'assistant',
+          kind: 'system',
+          note: 'turn_failed',
+          content: m.content || '',
+          status: 'done',
+          ts: Date.parse(m.timestamp) || now(),
+        });
+        continue;
+      }
+      if (m.role !== 'user' && m.role !== 'assistant') continue;
+      const hasText = typeof m.content === 'string' && m.content;
+      const hasAttachments = Array.isArray(m.attachments) && m.attachments.length > 0;
+      if (!hasText && !hasAttachments) continue;
+      bubbles.push({
+        role: m.role,
+        content: m.content || '',
+        status: 'done',
+        // 撤回锚点接线（Task 13）：详情 wire 行的 id 即 journal message_id，落
+        // 气泡后可作 truncate_before_message_id；provider 落上（canRecall 依赖）。
+        messageId: m.id || '',
+        provider: shell.provider || '',
+        ts: Date.parse(m.timestamp) || now(),
+        // 图片附件（spec §3.6）：ref → 本机端点 URL，气泡缩略图分支渲染。
+        ...(hasAttachments
+          ? { attachments: m.attachments.map(a => ({ name: a.name || '', url: chatAttachmentUrl(a.ref) })) }
+          : {}),
+      });
+      // 续聊喂入保持纯文本语义：空文本纯图行不进 deviceTranscript（本批次图片
+      // 仅显示，不回灌内核历史）。
+      if (hasText) feed.push({ role: m.role, content: m.content });
+    }
+    shell.messages = bubbles;
+    shell.deviceTranscript = feed;
     scrollToBottom();
   }
 
-  // 快照转录行（{role,text,message_id?,ts?}）→ 壳 messages（**仅展示流**），
-  // 字段名与详情不同（快照用 text，详情用 content）。职责分离（阶段 2 评审
-  // 钉死）：快照是有损切片（200 行/4000 rune）且晚到会覆盖屏幕，但续聊喂入的
-  // deviceTranscript 必须保持详情分页拉全的版本——快照绝不写 deviceTranscript，
-  // 否则截断尾巴会在 create 时顶掉全量上下文（喂入即全部上下文）。
+  // 快照转录行（{role,text,message_id?,ts?}）→ 壳 messages（**仅展示流**）。
+  // 职责分离（阶段 2 评审钉死）：快照是有损切片（200 行/4000 rune）且晚到会
+  // 覆盖屏幕，但续聊喂入的 deviceTranscript 必须保持详情分页拉全的版本——快照
+  // 绝不写 deviceTranscript，否则截断尾巴会在 create 时顶掉全量上下文（喂入即
+  // 全部上下文）。
   function applyDeviceSnapshotTranscript(shell, rows) {
     const list = Array.isArray(rows) ? rows : [];
-    const renderable = list.filter(m => m && (m.role === 'user' || m.role === 'assistant')
-      && typeof m.text === 'string' && m.text);
-    shell.messages = renderable.map(m => ({
-      role: m.role,
-      content: m.text,
-      status: 'done',
-      // 快照 id 系 journal 同源（spec §A 已修订），可作撤回锚点；内容仍绝不
-      // 喂入（deviceTranscript 专属流不变）。provider 落上（canRecall 依赖）。
-      messageId: m.message_id || '',
-      provider: shell.provider || '',
-      ts: Date.parse(m.ts) || now(),
-    }));
+    const bubbles = [];
+    for (const m of list) {
+      if (!m) continue;
+      // 错误终态系统条（G5）：同详情口径——胶囊展示，绝不进喂入流
+      // （快照本就不写 deviceTranscript，双保险）。
+      if (m.role === 'system') {
+        bubbles.push({
+          role: 'assistant',
+          kind: 'system',
+          note: 'turn_failed',
+          content: m.text || '',
+          status: 'done',
+          ts: Date.parse(m.ts) || now(),
+        });
+        continue;
+      }
+      if (m.role !== 'user' && m.role !== 'assistant') continue;
+      const hasText = typeof m.text === 'string' && m.text;
+      const hasAttachments = Array.isArray(m.attachments) && m.attachments.length > 0;
+      if (!hasText && !hasAttachments) continue;
+      bubbles.push({
+        role: m.role,
+        content: m.text || '',
+        status: 'done',
+        // 快照 id 系 journal 同源（spec §A 已修订），可作撤回锚点；内容仍绝不
+        // 喂入（deviceTranscript 专属流不变）。provider 落上（canRecall 依赖）。
+        messageId: m.message_id || '',
+        provider: shell.provider || '',
+        ts: Date.parse(m.ts) || now(),
+        ...(hasAttachments
+          ? { attachments: m.attachments.map(a => ({ name: a.name || '', url: chatAttachmentUrl(a.ref) })) }
+          : {}),
+      });
+    }
+    shell.messages = bubbles;
   }
 
   // 订阅判定（钉死）：仅 agentcore 且裸 conversation id（journal 源才有转录
@@ -1566,8 +1695,56 @@ export function useAliangChat() {
     }
   }
 
-  // --- steer 分流（跨端统一阶段 2 Task 4） ---
+  // --- 图片附件（spec 2026-11-05-chat-image-pipeline §3.6） ---
 
+  // 客户端预检与 agent 侧对齐：≤8 张/消息、单张 ≤10MiB、仅 jpeg/png/gif/webp。
+  // 错误走 createError 面板（下次成功发送清除）；上传串行进行防乱序。
+  const ATTACH_IMAGE_EXT = /\.(jpe?g|png|gif|webp)$/i;
+  function addPendingAttachments(files) {
+    const list = Array.from(files || []);
+    if (list.length === 0) return;
+    const conv = activeConversation.value;
+    if (!conv) return;
+    for (const file of list) {
+      if (!ATTACH_IMAGE_EXT.test(file.name)) {
+        createError.value = t('chat_attachUnsupported');
+        return;
+      }
+      if (file.size > 10 * 1024 * 1024) {
+        createError.value = t('chat_attachTooLarge');
+        return;
+      }
+    }
+    if (pendingAttachments.value.length + list.length > 8) {
+      createError.value = t('chat_attachTooMany');
+      return;
+    }
+    const sessionId = conv.aiSessionId || ('local-' + conv.id);
+    attachmentUploading.value = true;
+    (async () => {
+      try {
+        for (const file of list) {
+          const attachment = await uploadChatAttachment(sessionId, file);
+          pendingAttachments.value.push(attachment);
+        }
+        createError.value = '';
+      } catch (err) {
+        createError.value = (err && err.message) || t('chat_attachUploadFailed');
+      } finally {
+        attachmentUploading.value = false;
+      }
+    })();
+  }
+
+  function removePendingAttachment(refId) {
+    pendingAttachments.value = pendingAttachments.value.filter(a => a.ref !== refId);
+  }
+
+  function clearPendingAttachments() {
+    pendingAttachments.value = [];
+  }
+
+  // --- steer 分流（跨端统一阶段 2 Task 4） ---
   // 运行中回合的旁路注入：不插 user 气泡、不走 create 确认门、不武装看门狗、
   // 不动 sending——轻量条自己承载状态（sent → ack 落定）。目标为空（claude_/
   // codex_ 壳 running 且无 managed id）时静默返回：阻断提示条已常驻输入区，
@@ -2239,13 +2416,22 @@ export function useAliangChat() {
     }
 
     const text = inputText.value.trim();
-    if (!text || !activeId.value) return;
+    if ((!text && pendingAttachments.value.length === 0) || !activeId.value) return;
     // sending 守卫（Task 4 分流）：非 running 维持禁用；running 会话在 sending
     // 中放行——提交分流成 steer（见下）。
     if (sending.value && !activeSessionRunning.value) return;
 
     const conv = activeConversation.value;
     if (!conv) return;
+
+    // 图片走完整消息路径（create 门 + ai.message attachments）；running 插话
+    // 本批次仅承载文本——带图插话提示等回合结束，绝不静默丢附件。
+    if (pendingAttachments.value.length > 0 && isConversationRunning(conv)) {
+      createError.value = t('chat_attachSteerBlocked');
+      return;
+    }
+    const attachments = pendingAttachments.value.map(a => ({ type: 'image', name: a.name, path: a.path }));
+    const bubbleAttachments = pendingAttachments.value.map(a => ({ name: a.name, url: chatAttachmentUrl(a.ref) }));
 
     // 分流规则（阶段 2 计划钉死）：running（本地气泡推断 OR 设备壳清单/快照
     // status）→ 提交走 ai.steer；非 running → 原链（create 确认门 + ai.message）。
@@ -2267,7 +2453,14 @@ export function useAliangChat() {
     // messageId 提前生成、随气泡落值（Task 13）：撤回链以气泡 id 为 journal
     // 截断锚点，ai.message 帧复用同一 id；provider 落气泡——canRecall 依赖。
     const messageId = generateId();
-    conv.messages.push({ role: 'user', content: text, messageId, provider: conv.provider, ts: now() });
+    conv.messages.push({
+      role: 'user',
+      content: text,
+      messageId,
+      provider: conv.provider,
+      ts: now(),
+      ...(bubbleAttachments.length ? { attachments: bubbleAttachments } : {}),
+    });
     if (!conv.title) {
       conv.title = text.slice(0, 20);
     }
@@ -2318,8 +2511,11 @@ export function useAliangChat() {
         session_id: conv.aiSessionId,
         message_id: messageId,
         content: text,
+        ...(attachments.length ? { attachments } : {}),
       });
       if (!ok) throw new Error('socket-closed');
+      // 发送落地才清 pending（失败保留，用户重试不丢图）。
+      clearPendingAttachments();
     } catch (_) {
       disarmIdleWatchdog();
       const asst = findRunningAssistant(conv);
@@ -2462,5 +2658,10 @@ export function useAliangChat() {
     stopRun,
     toggleMcpServer,
     toggleSkill,
+    // 图片附件（spec §3.6）：pending 态 + 上传/移除动作（ChatComposer 接线）。
+    pendingAttachments,
+    attachmentUploading,
+    addPendingAttachments,
+    removePendingAttachment,
   };
 }

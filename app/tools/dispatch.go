@@ -1,7 +1,9 @@
 package tools
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -11,14 +13,14 @@ import (
 // a panicking handler must never take down the WS read loop's goroutine pool
 // with an unrecovered panic or return nothing. A nil result map is converted
 // to a tool_returned_nil error payload so null never flows to the wire.
-func SafeCall(t *Tool, msg map[string]interface{}) (res map[string]interface{}) {
+func SafeCall(t *Tool, ctx context.Context, msg map[string]interface{}) (res map[string]interface{}) {
 	requestID := requestIDOf(msg)
 	defer func() {
 		if r := recover(); r != nil {
 			res = safeOnError(t, requestID, fmt.Errorf("%v", r))
 		}
 	}()
-	res = t.Handler(msg)
+	res = t.Handler(ctx, msg)
 	if res == nil {
 		return genericErrorPayload(t, requestID, "tool_returned_nil")
 	}
@@ -26,22 +28,32 @@ func SafeCall(t *Tool, msg map[string]interface{}) (res map[string]interface{}) 
 }
 
 // RunWithGuards wraps SafeCall with the registry-level execution guards:
-// per-tool timeout watchdog + serialized output-size cap. A slow handler's
-// goroutine is abandoned (handlers are internally bounded — fixed-subcommand
-// git probes, bounded walks, byte-capped reads); the caller gets a
-// tool_timeout payload instead of hanging the tool loop.
-func RunWithGuards(t *Tool, msg map[string]interface{}, writeJSON func(interface{}) error) {
+// per-tool timeout watchdog + output-size cap. The guard window is a real
+// cancellation signal: on timeout (tool_timeout) or parent/session cancel
+// (tool_cancelled) the handler's ctx goes Done, so bounded-but-slow handlers
+// (peer_exec 这类真实远端调用) stop their local wait instead of orphaning.
+func RunWithGuards(ctx context.Context, t *Tool, msg map[string]interface{}, writeJSON func(interface{}) error) {
 	requestID := requestIDOf(msg)
-	done := make(chan map[string]interface{}, 1)
-	go func() { done <- SafeCall(t, msg) }()
 	timeout := time.Duration(t.Caps.TimeoutMs) * time.Millisecond
 	if timeout <= 0 {
 		timeout = 10 * time.Second
 	}
+	// guardCtx 把护栏窗口变成 handler 可感知的 ctx：超时不再只是「调用方
+	// 放弃后孤儿 goroutine 继续跑」，handler（peer_exec 这类真实远端调用）
+	// 会在窗口到期/会话取消时收到取消信号（此前五个 peer handler 用
+	// context.Background() 自立门户，run 停了也照跑最长 630s）。
+	guardCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	done := make(chan map[string]interface{}, 1)
+	go func() { done <- SafeCall(t, guardCtx, msg) }()
 	select {
 	case res := <-done:
 		_ = writeJSON(enforceOutputCap(t, res, requestID))
-	case <-time.After(timeout):
+	case <-guardCtx.Done():
+		if err := ctx.Err(); err != nil {
+			_ = writeJSON(safeOnError(t, requestID, errors.New("tool_cancelled")))
+			return
+		}
 		_ = writeJSON(safeOnError(t, requestID, fmt.Errorf("tool_timeout")))
 	}
 }

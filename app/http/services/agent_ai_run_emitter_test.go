@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"errors"
 	"sync"
 	"testing"
@@ -169,7 +170,7 @@ func TestAgentGoalRunTerminalClearsOnGoalAck(t *testing.T) {
 	}
 
 	svc := &AgentService{ai: m}
-	svc.handleRemoteAgentMessage(map[string]interface{}{
+	svc.handleRemoteAgentMessage(context.Background(), map[string]interface{}{
 		"type":         models.AgentEventGoalRunEventAck,
 		"goal_run_id":  "goal-run-pending",
 		"accepted_seq": 6,

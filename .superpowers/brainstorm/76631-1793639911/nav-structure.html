@@ -1,0 +1,58 @@
+<h2>问题 1：「其他」放在哪里？</h2>
+<p class="subtitle">你定的顶部顺序是「代理设置 → Agent → 状态 → 用户」。跨设备执行、文件传输、系统服务这类设备级开关要放「其他」——「其他」是独立导航项，还是塞进某个页面里？</p>
+
+<div class="section">
+  <div class="label">现状（对照）</div>
+  <div class="mockup">
+    <div class="mockup-header">现在的 5 个 tab</div>
+    <div class="mockup-body">
+      <div class="mock-nav">设置 · 用户中心 · 日志 · 能力接入 · Agent</div>
+      <p style="font-size:13px;margin-top:10px;color:#888">问题：能力接入、Agent、日志内容互相穿插（aliangcode 的 MCP/技能在「能力接入」，用户态 Agent 的设备网络在「Agent」，会话记录在「日志」），找东西要来回跳。</p>
+    </div>
+  </div>
+</div>
+
+<div class="options">
+  <div class="option" data-choice="a" onclick="toggleSelect(this)">
+    <div class="letter">A</div>
+    <div class="content">
+      <h3>「其他」作为第 5 个导航项（推荐）</h3>
+      <div class="mockup" style="margin:10px 0">
+        <div class="mockup-body">
+          <div class="mock-nav">代理设置 · <b>Agent</b> · 状态 · 用户 · <b>其他</b></div>
+        </div>
+      </div>
+      <p>「其他」= 设备级杂项：跨设备执行开关、文件传输开关、运行模式（TUN/常规）、系统服务、证书管理、文件访问授权（macOS 隐私目录）。<br>优点：设备级开关一个地方管完；「代理设置」保持纯代理。<br>代价：顶部 5 项（移动端网格 2 列会余 1 个）。</p>
+    </div>
+  </div>
+
+  <div class="option" data-choice="b" onclick="toggleSelect(this)">
+    <div class="letter">B</div>
+    <div class="content">
+      <h3>只保留 4 个导航，「其他」做成页面底部区块</h3>
+      <div class="mockup" style="margin:10px 0">
+        <div class="mockup-body">
+          <div class="mock-nav">代理设置 · <b>Agent</b> · 状态 · 用户</div>
+          <p style="font-size:12px;color:#999;margin-top:8px">「其他」= 代理设置页最底下的折叠区块</p>
+        </div>
+      </div>
+      <p>严格四栏。但跨设备执行/文件传输和代理规则、模型映射混在一页，语义不合；运行模式/系统服务也是重内容，放代理设置下不合适。</p>
+    </div>
+  </div>
+
+  <div class="option" data-choice="c" onclick="toggleSelect(this)">
+    <div class="letter">C</div>
+    <div class="content">
+      <h3>「其他」并入「状态」页尾部</h3>
+      <div class="mockup" style="margin:10px 0">
+        <div class="mockup-body">
+          <div class="mock-nav">代理设置 · <b>Agent</b> · <b>状态</b> · 用户</div>
+          <p style="font-size:12px;color:#999;margin-top:8px">状态页 = 日志 + 终端实时 + 会话活动 + 尾部「其他」开关区</p>
+        </div>
+      </div>
+      <p>保持 4 个导航。但「状态」语义是只读观测，放可写开关（跨设备执行）会混淆；服务安装/卸载这种重操作也会拖长页面。</p>
+    </div>
+  </div>
+</div>
+
+<p class="subtitle" style="margin-top:20px">点击选择，或在终端里直接回复你的想法。</p>

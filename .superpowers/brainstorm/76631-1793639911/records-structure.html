@@ -1,0 +1,65 @@
+<h2>问题 2：「记录」tab 里终端的记录是什么？</h2>
+<p class="subtitle">AI 会话记录后端已有现成接口（/api/agent/sessions，覆盖 claude/codex/aliangcode 全部本地 coding agent，前端也已有分页逻辑可直接复用）。但「终端的记录」有个事实要摊开：后端只有<b>实时</b>终端列表（/api/agent/runtime-sessions），<b>没有终端历史持久化</b>——终端断了，记录就没了。</p>
+
+<div class="options">
+  <div class="option" data-choice="a" onclick="toggleSelect(this)">
+    <div class="letter">A</div>
+    <div class="content">
+      <h3>两个区块：AI 会话（分页）+ 远程终端（实时）（推荐）</h3>
+      <div class="mockup" style="margin:10px 0">
+        <div class="mockup-body">
+          <p style="font-size:12px;font-weight:bold">Agent › 记录</p>
+          <div style="border:1px solid #ddd;padding:8px;margin-top:6px;border-radius:6px">
+            <p style="font-size:12px;font-weight:bold">🤖 AI 会话记录 <span style="color:#999;font-size:11px">（claude/codex/aliangcode/… · 分页）</span></p>
+            <p style="font-size:11px;color:#888">列表行：agent 名 + 项目 + 时间 + 进行中徽章，点开看对话</p>
+          </div>
+          <div style="border:1px solid #ddd;padding:8px;margin-top:6px;border-radius:6px">
+            <p style="font-size:12px;font-weight:bold">⌨️ 远程终端 <span style="color:#059669;font-size:11px">● 实时</span></p>
+            <p style="font-size:11px;color:#888">当前保持连接的终端 + 回放，断开即从列表消失</p>
+          </div>
+        </div>
+      </div>
+      <p>零后端改动。终端的「记录」= 实时在连列表（现状能力）。纯前端重组。</p>
+    </div>
+  </div>
+
+  <div class="option" data-choice="b" onclick="toggleSelect(this)">
+    <div class="letter">B</div>
+    <div class="content">
+      <h3>统一列表：AI 会话和终端混排，类型徽章区分</h3>
+      <div class="mockup" style="margin:10px 0">
+        <div class="mockup-body">
+          <p style="font-size:12px;font-weight:bold">Agent › 记录</p>
+          <div style="border:1px solid #ddd;padding:8px;margin-top:6px;border-radius:6px">
+            <p style="font-size:11px">⌨️ 终端 · bash @~/demo · 刚刚 <span style="color:#059669">●</span></p>
+            <p style="font-size:11px">🤖 claude · alianggate · 2 分钟前 · 进行中</p>
+            <p style="font-size:11px">🤖 aliangcode · vibe_on_phone · 1 小时前</p>
+            <p style="font-size:11px">🤖 codex · demo-app · 昨天</p>
+            <p style="font-size:11px;color:#888">…统一分页</p>
+          </div>
+        </div>
+      </div>
+      <p>时间线视角，符合「记录各种 coding 的 agent 和 terminal 的东西」。但要新做合并排序逻辑，且终端仍只有实时条目。</p>
+    </div>
+  </div>
+
+  <div class="option" data-choice="c" onclick="toggleSelect(this)">
+    <div class="letter">C</div>
+    <div class="content">
+      <h3>终端历史持久化（后端新增工作）</h3>
+      <div class="mockup" style="margin:10px 0">
+        <div class="mockup-body">
+          <p style="font-size:12px;font-weight:bold">Agent › 记录</p>
+          <div style="border:1px solid #ddd;padding:8px;margin-top:6px;border-radius:6px">
+            <p style="font-size:11px">⌨️ 终端 · bash · 今天 14:20–14:35（回放可看）</p>
+            <p style="font-size:11px">⌨️ 终端 · zsh · 昨天 09:00（回放可看）</p>
+            <p style="font-size:11px;color:#888">断开的终端也留下历史，统一分页</p>
+          </div>
+        </div>
+      </div>
+      <p>真正意义上的「terminal 记录」，但后端要新增终端会话持久化（滚动缓冲落盘、清理策略），跨端还要考虑手机侧展示，工作量大一档。</p>
+    </div>
+  </div>
+</div>
+
+<p class="subtitle" style="margin-top:20px">点选或在终端回复。也可以混合：比如 A 的结构 + 以后再补 C 的终端历史。</p>

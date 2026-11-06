@@ -1,13 +1,14 @@
 package tools
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
 )
 
-func ok(map[string]interface{}) map[string]interface{} { return nil }
+func ok(_ context.Context, _ map[string]interface{}) map[string]interface{} { return nil }
 
 func TestNewRegistry_RejectsInvalidTool(t *testing.T) {
 	cases := []struct {
@@ -39,7 +40,7 @@ func TestNewRegistry_RejectsInvalidTool(t *testing.T) {
 }
 
 func TestRegistry_DuplicateEventPanics(t *testing.T) {
-	h := func(map[string]interface{}) map[string]interface{} { return nil }
+	h := func(_ context.Context, _ map[string]interface{}) map[string]interface{} { return nil }
 	p := map[string]interface{}{"type": "object"}
 	defer func() {
 		r := recover()
@@ -59,7 +60,7 @@ func TestRegistry_DuplicateEventPanics(t *testing.T) {
 }
 
 func TestRegistry_DuplicateIDPanics(t *testing.T) {
-	h := func(map[string]interface{}) map[string]interface{} { return nil }
+	h := func(_ context.Context, _ map[string]interface{}) map[string]interface{} { return nil }
 	p := map[string]interface{}{"type": "object"}
 	defer func() {
 		r := recover()
@@ -78,7 +79,7 @@ func TestRegistry_DuplicateIDPanics(t *testing.T) {
 }
 
 func TestRegistry_GetAndList(t *testing.T) {
-	h := func(map[string]interface{}) map[string]interface{} { return nil }
+	h := func(_ context.Context, _ map[string]interface{}) map[string]interface{} { return nil }
 	reg := NewRegistry(7,
 		&Tool{ID: "b", Event: "x.b", Description: "db", Parameters: map[string]interface{}{"type": "object"}, Handler: h},
 		&Tool{ID: "a", Event: "x.a", Description: "da", Parameters: map[string]interface{}{"type": "object"}, Handler: h},
@@ -101,7 +102,7 @@ func TestRegistry_GetAndList(t *testing.T) {
 }
 
 func TestTool_DescriptorJSON(t *testing.T) {
-	h := func(map[string]interface{}) map[string]interface{} { return nil }
+	h := func(_ context.Context, _ map[string]interface{}) map[string]interface{} { return nil }
 	tool := &Tool{
 		ID: "list_dir", Event: "file.list", Description: "List entries.",
 		Parameters: map[string]interface{}{"type": "object"},

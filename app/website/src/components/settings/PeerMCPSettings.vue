@@ -1,8 +1,8 @@
 <template>
-  <!-- 设备互访(aliang-peer 跨设备工具面,2026-11-03;2026-11-05 细分开关)。
+  <!-- 设备互访(aliang-peer,2026-11-03;2026-11-05 细分开关)。
        平台托管卡:开关走 customer.peer_mcp(core 落盘/DB),应用走
        /api/agent/peer/mcp(runtime 写内核配置)。总开关+三目标子键:
-       agentcore 工具面 / claudecode 注册 / codex 注册,子键 nil=跟随总开关。
+       agentcore 工具注入 / claudecode 注册 / codex 注册,子键 nil=跟随总开关。
        保存按钮不设 dirty 门(对照 AgentMCPGlobalSettings 的 !dirty 禁用)是
        有意的:两段式里持久化与应用可能漂移(runtime 自愈失败/配置被手改),
        允许随时保存 = 允许强制重新对齐 runtime 与持久化配置的偏差。 -->

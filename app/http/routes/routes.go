@@ -280,6 +280,10 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	register("/api/agent/peer/mcp", h.Agent.HandlePeerMcp, http.MethodGet, http.MethodPost)
 	register("/api/agent/ai/stream", h.Agent.HandleAIStream, http.MethodGet)
 	register("/api/agent/ai/approval-hook", h.Agent.HandleAIApprovalHook, http.MethodPost)
+	// 聊天图片链路（spec 2026-11-05-chat-image-pipeline §3.4）：网页发图上传
+	// 与网页显示取图（loopback+Origin 守卫在 handler 内,transfers D13 同源）。
+	register("/api/agent/ai/attachment/upload", h.Agent.HandleAttachmentUpload, http.MethodPost)
+	register("/api/agent/ai/attachment", h.Agent.HandleAttachmentGet, http.MethodGet)
 	// 自有交互工具 MCP 端点(tool_ask bridge):路径含 per-run token,方法由
 	// MCP Streamable HTTP 协议决定(POST 消息/GET SSE/DELETE 关会话)。
 	register("/mcp/aliang/", h.Agent.HandleToolAskMCP, http.MethodPost, http.MethodGet, http.MethodDelete)
@@ -296,6 +300,11 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	register("/api/agent/file-access/settings", h.Agent.HandleFileAccessSettings, http.MethodPost)
 	// MCP 与技能只读报告（设备侧清单 + 内核生效态）。
 	register("/api/agent/integrations", h.Agent.HandleAgentIntegrations, http.MethodGet)
+	// 统一 MCP 注册表（第一方资产，三内核消费）。{name} 用方法前缀模式注册
+	// （同 quick-setup combos 约定，避免 ServeMux 双注册 panic）。
+	register("/api/agent/mcp", h.Agent.HandleAliangMCPRegistry, http.MethodGet)
+	register("PUT /api/agent/mcp/servers/{name}", h.Agent.HandleAliangMCPServerPut, http.MethodPut)
+	register("DELETE /api/agent/mcp/servers/{name}", h.Agent.HandleAliangMCPServerDelete, http.MethodDelete)
 	register("/api/docs/tutorials", h.Tutorial.HandleGetTutorial, http.MethodGet)
 
 	registerDocsRoutes(mux, catalog)

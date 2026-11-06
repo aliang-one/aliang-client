@@ -394,26 +394,58 @@ func (s *AgentService) handleRemoteAIRename(msg map[string]interface{}, writeJSO
 		}
 	}
 	if nativeID == "" {
-		reject("missing source_session_id and no conversation binding")
-		return
+		// agentcore/codex/opencode 家族:journal-only 会话（绑定丢失/未建立）
+		// 没有 native id 可键,但 agentcore 清单卡本身按会话 id 组织——会话 id
+		// 就是可用键,接受而不是拒绝。claude 家族保持既有拒绝（没有可用键,
+		// 裸会话 id 卡在 claude 通道按 native id 查,写进去也读不到）。
+		if !agentRenameMirrorsClaude(remoteString(msg, "provider"), remoteString(msg, "tool")) {
+			if sid := strings.TrimSpace(sessionID); sid != "" {
+				nativeID = sid
+			}
+		}
+		if nativeID == "" {
+			reject("missing source_session_id and no conversation binding")
+			return
+		}
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	mirrorsClaude := agentRenameMirrorsClaude(remoteString(msg, "provider"), remoteString(msg, "tool"))
+	// 键面扩展（G4 改名断链）:agentcore 清单卡是裸会话 id 卡（journal 文件名
+	// 键,inventoryNativeSessionID 对无前缀 id 返回空）,native 键条目对清单
+	// 不可达。非 claude 家族（= SkipMirror 家族）额外以「会话 id」为别名键落
+	// 一条,清单组装处（collectAgentCoreVibeSessions）按会话 id 读取。claude
+	// 家族不写别名键:claude 卡按 native id 查,多余键只会白占缓存。同一会话
+	// id 恰为某 claude native id 的碰撞概率忽略（不同命名空间）。
+	aliasKeys := make([]string, 0, 1)
+	if !mirrorsClaude {
+		if sid := strings.TrimSpace(sessionID); sid != "" && sid != nativeID {
+			aliasKeys = append(aliasKeys, sid)
+		}
+	}
 	// One serialized read-modify-write: the inventory ticker and HTTP handlers
 	// merge observed renames on other goroutines, and an interleaved whole-file
 	// save here used to drop this phone entry permanently (no local re-source).
 	persistErr := updateAgentRenameCache(func(entries map[string]agentRenameCacheEntry) bool {
-		before, existed := entries[nativeID]
-		mergeAgentRenameEntry(entries, nativeID, agentRenameCacheEntry{
+		entry := agentRenameCacheEntry{
 			Name:        title,
 			Origin:      agentRenameOriginPhone,
 			Source:      agentRenameSourcePhone,
 			UpdatedAt:   now,
 			ProjectPath: strings.TrimSpace(remoteString(msg, "project_path")),
 			SkipMirror:  !mirrorsClaude,
-		})
-		return !existed || entries[nativeID] != before
+		}
+		before, existed := entries[nativeID]
+		mergeAgentRenameEntry(entries, nativeID, entry)
+		changed := !existed || entries[nativeID] != before
+		for _, alias := range aliasKeys {
+			aliasBefore, aliasExisted := entries[alias]
+			mergeAgentRenameEntry(entries, alias, entry)
+			if !aliasExisted || entries[alias] != aliasBefore {
+				changed = true
+			}
+		}
+		return changed
 	})
 	if persistErr != nil {
 		logger.Warn("[AGENT-RENAME] phone_rename_persist_failed sid=" + nativeID + " error=" + persistErr.Error())

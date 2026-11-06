@@ -20,7 +20,10 @@ import (
 // rev 5: 新增 device_list(读,GET /api/devices 客户端侧瘦身)——阶段1 四件工具
 // 全部只收 device_id,LLM 无从自查「账号里有哪几台设备」；本工具补上设备
 // 发现闭环（2026-10-30 审计缺口#2）。事件 peer.device_list 同样不与显式臂冲突。
-const agentToolRegistryRev = 5
+// rev 6: peer_exec/peer_fetch_file 描述符补取消语义（RunWithGuards guardCtx
+// 落地后取消真正可达,2026-11-06 评审 C5）——「取消只掐本地等待,远端照跑,
+// 勿盲目重试」;服务端靠 rev 漂移重拉。
+const agentToolRegistryRev = 6
 
 // buildAgentToolRegistry is THE single source of truth for remotely-invokable
 // read-only tools. Legacy four first (events unchanged = old-server compat);
@@ -118,13 +121,12 @@ func buildAgentToolRegistry() *tools.Registry {
 		&tools.Tool{
 			ID:    "peer_exec",
 			Event: AgentPeerToolEventExec,
-			Description: "Run a one-shot command on another device owned by the same account and " +
-				"return its exit code plus stdout/stderr. Requires peer exec enabled on the target. " +
-				"Targets run commands serially; a busy target fails fast with fail_reason=busy. Peer " +
-				"calls are also serial per calling device — run them one after another, never in " +
-				"parallel (concurrent calls fail with rate_limited). Windows = PowerShell 5.1: no " +
-				"\"&&\" (use \";\" or PS cmdlets); .exe may be missing — prefer PS built-ins or " +
-				"absolute paths.",
+			Description: "Run a one-shot command on another device in the same account; returns exit " +
+				"code and stdout/stderr. Target must have peer exec enabled. Serial per target (busy " +
+				"fails fast with fail_reason=busy) and per calling device (concurrent calls fail with " +
+				"rate_limited). Windows = PowerShell 5.1: no \"&&\" (use \";\"); prefer PS built-ins or " +
+				"absolute paths. Cancellation only aborts the local wait — the remote command still " +
+				"completes; never blindly retry side-effecting commands.",
 			Parameters: map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
@@ -148,7 +150,9 @@ func buildAgentToolRegistry() *tools.Registry {
 			Event: AgentPeerToolEventFetchFile,
 			Description: "Queue an asynchronous file fetch from another device in the same account " +
 				"into this machine's transfer inbox. The source device must have peer fetch enabled. " +
-				"Returns a transfer_id; completion arrives via transfer.progress events.",
+				"Returns a transfer_id; completion arrives via transfer.progress events. Cancellation " +
+				"only aborts the local wait — the transfer may still complete; check the inbox before " +
+				"re-issuing.",
 			Parameters: map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{

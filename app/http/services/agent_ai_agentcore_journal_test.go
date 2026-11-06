@@ -328,8 +328,10 @@ func TestJournalTruncateBeforeKeepsPrefixWithAttachedRows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 保留区间 = u1 + a1(a1 是 u1 区间宿主行);u2 之后全部消失。
-	if len(hist) != 2 || hist[0].MessageID != "u1" || hist[1].MessageID != "a1" || hist[1].Content != "第一答" {
+	// 保留区间 = u1 + 中间叙述(turn 行,2026-11-05 读侧补 turn 支持)+ a1(a1 是
+	// u1 区间宿主行);u2 之后全部消失。旧断言期望 2 条是 turn 支持合入前的
+	// 陈旧语义（预存失败 dc2bfa0 基线），本批次修 reader 时一并对齐。
+	if len(hist) != 3 || hist[0].MessageID != "u1" || hist[1].Content != "中间叙述" || hist[2].MessageID != "a1" || hist[2].Content != "第一答" {
 		t.Fatalf("unexpected history: %+v", hist)
 	}
 }
@@ -435,5 +437,100 @@ func TestJournalTruncateBeforeHeadlessFile(t *testing.T) {
 	hist, _, _ = readAgentCoreJournalHistoryFrom(j.dir, sid)
 	if len(hist) != 0 {
 		t.Fatalf("headless first-line-target must empty the file: %+v", hist)
+	}
+}
+
+// 纯图消息（text 空但带附件）必须整条落 journal——这是手机图在网页显示链的
+// 治本断点①（spec 2026-11-05-chat-image-pipeline §3.2）。旧守卫「text 空
+// 直接 return」会让纯图消息连一行都不存在。
+func TestAgentCoreJournalPureImageRowLands(t *testing.T) {
+	dir := t.TempDir()
+	j := newAgentCoreJournal(dir)
+	j.appendUser("s-img", "m-img", "", "2026-11-05T00:00:00Z", []agentAIJournalAttachment{
+		{Name: "photo.jpg", Ref: "s-img/m-img-0.jpg", Mime: "image/jpeg", Bytes: 1234, Origin: "phone"},
+	})
+	lines := readJournalLines(t, dir, "s-img")
+	var msgRows []map[string]interface{}
+	for _, row := range lines {
+		if row["kind"] == "msg" {
+			msgRows = append(msgRows, row)
+		}
+	}
+	if len(msgRows) != 1 {
+		t.Fatalf("pure-image row must land: %d msg rows", len(msgRows))
+	}
+	row := msgRows[0]
+	if row["text"] != "" {
+		t.Fatalf("text = %v, want empty", row["text"])
+	}
+	atts, ok := row["attachments"].([]interface{})
+	if !ok || len(atts) != 1 {
+		t.Fatalf("attachments = %v, want 1 entry", row["attachments"])
+	}
+	entry, _ := atts[0].(map[string]interface{})
+	if entry["ref"] != "s-img/m-img-0.jpg" || entry["origin"] != "phone" {
+		t.Fatalf("attachment entry = %v", entry)
+	}
+}
+
+// 空文本且无附件的行依旧不落（旧守卫语义保留——防止空行垃圾）。
+func TestAgentCoreJournalEmptyRowStillDropped(t *testing.T) {
+	dir := t.TempDir()
+	j := newAgentCoreJournal(dir)
+	j.appendUser("s-empty", "m-empty", "", "2026-11-05T00:00:00Z")
+	// 无行=连会话文件都不应创建；存在则必须 0 行（两种形态都算「没落」）。
+	if _, err := os.Stat(filepath.Join(dir, agentCoreJournalFileName("s-empty"))); err == nil {
+		if lines := readJournalLines(t, dir, "s-empty"); len(lines) != 0 {
+			t.Fatalf("empty text+no-attachment row must not land: %v", lines)
+		}
+	}
+}
+
+// 带字+附件的行：text 与 attachments 同落。
+func TestAgentCoreJournalTextWithAttachments(t *testing.T) {
+	dir := t.TempDir()
+	j := newAgentCoreJournal(dir)
+	j.appendUser("s-both", "m-both", "看这张图", "2026-11-05T00:00:00Z", []agentAIJournalAttachment{
+		{Name: "shot.png", Ref: "s-both/m-both-0.png", Mime: "image/png", Origin: "web"},
+	})
+	lines := readJournalLines(t, dir, "s-both")
+	var msgRows []map[string]interface{}
+	for _, row := range lines {
+		if row["kind"] == "msg" {
+			msgRows = append(msgRows, row)
+		}
+	}
+	if len(msgRows) != 1 {
+		t.Fatalf("msg rows = %d", len(msgRows))
+	}
+	if msgRows[0]["text"] != "看这张图" {
+		t.Fatalf("text = %v", msgRows[0]["text"])
+	}
+	atts, _ := msgRows[0]["attachments"].([]interface{})
+	if len(atts) != 1 || atts[0].(map[string]interface{})["origin"] != "web" {
+		t.Fatalf("attachments = %v", msgRows[0]["attachments"])
+	}
+}
+
+// journal history 读侧透传：纯图行带 attachments 进 hist（Content 空）——
+// 网页 detail/快照据此渲染缩略图（spec §3.3）。
+func TestJournalHistoryPureImageRowKeepsAttachments(t *testing.T) {
+	dir := t.TempDir()
+	j := newAgentCoreJournal(dir)
+	j.appendUser("s-hist-img", "m-h1", "", "2026-11-05T00:00:00Z", []agentAIJournalAttachment{
+		{Name: "photo.jpg", Ref: "s-hist-img/m-h1-0.jpg", Mime: "image/jpeg", Bytes: 42, Origin: "phone"},
+	})
+	hist, _, err := readAgentCoreJournalHistoryFrom(dir, "s-hist-img")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hist) != 1 {
+		t.Fatalf("hist = %+v, want 1", hist)
+	}
+	if hist[0].Content != "" {
+		t.Fatalf("content = %q, want empty", hist[0].Content)
+	}
+	if len(hist[0].Attachments) != 1 || hist[0].Attachments[0].Ref != "s-hist-img/m-h1-0.jpg" || hist[0].Attachments[0].Name != "photo.jpg" {
+		t.Fatalf("attachments = %+v", hist[0].Attachments)
 	}
 }

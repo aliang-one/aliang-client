@@ -2,6 +2,7 @@ package services
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"os"
@@ -64,7 +65,7 @@ func TestAgentFileReadSha256SmallFile(t *testing.T) {
 	if err := os.WriteFile(target, content, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	got := agentFileReadPayload(map[string]interface{}{
+	got := agentFileReadPayload(context.Background(), map[string]interface{}{
 		"request_id": "req-sha-1", "project_path": dir, "path": name,
 	})
 	if got["type"] != models.AgentEventFileReadResult || got["request_id"] != "req-sha-1" {
@@ -92,7 +93,7 @@ func TestAgentFileReadSha256TruncatedIsFullFileHash(t *testing.T) {
 	if err := os.WriteFile(target, content, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	got := agentFileReadPayload(map[string]interface{}{
+	got := agentFileReadPayload(context.Background(), map[string]interface{}{
 		"request_id": "req-sha-2", "project_path": dir, "path": name, "max_bytes": 128 * 1024,
 	})
 	if got["truncated"] != true {
@@ -124,7 +125,7 @@ func TestAgentFileReadSha256SkippedOverCap(t *testing.T) {
 	if err := os.Truncate(target, agentProjectFileReadShaCapByte+1); err != nil {
 		t.Fatal(err)
 	}
-	got := agentFileReadPayload(map[string]interface{}{
+	got := agentFileReadPayload(context.Background(), map[string]interface{}{
 		"request_id": "req-sha-3", "project_path": dir, "path": name, "max_bytes": 128 * 1024,
 	})
 	info, err := os.Stat(target)

@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -41,7 +42,7 @@ func TestHandleRemoteAgentMessage_ToolsList(t *testing.T) {
 	svc.state.Enabled = true
 	svc.state.Registered = true
 	svc.mu.Unlock()
-	svc.handleRemoteAgentMessage(map[string]interface{}{
+	svc.handleRemoteAgentMessage(context.Background(), map[string]interface{}{
 		"type":       models.AgentEventToolsList,
 		"request_id": "req_tools1",
 	}, writeJSON)
@@ -111,7 +112,7 @@ func TestHandleRemoteAgentMessage_DefaultArmRegistryDispatch(t *testing.T) {
 		ID: "fake_probe", Event: "fake.probe", Description: "test fake",
 		Parameters: map[string]interface{}{"type": "object", "properties": map[string]interface{}{}},
 		Caps:       tools.Caps{ReadOnly: true, TimeoutMs: 5000, MaxOutputBytes: 4096},
-		Handler: func(msg map[string]interface{}) map[string]interface{} {
+		Handler: func(_ context.Context, msg map[string]interface{}) map[string]interface{} {
 			return map[string]interface{}{"type": "fake.probe.result", "request_id": msg["request_id"], "ok": true}
 		},
 	}
@@ -130,7 +131,7 @@ func TestHandleRemoteAgentMessage_DefaultArmRegistryDispatch(t *testing.T) {
 	svc.state.Enabled = true
 	svc.state.Registered = true
 	svc.mu.Unlock()
-	svc.handleRemoteAgentMessage(map[string]interface{}{
+	svc.handleRemoteAgentMessage(context.Background(), map[string]interface{}{
 		"type":       "fake.probe",
 		"request_id": "req_fake1",
 	}, writeJSON)

@@ -1,0 +1,3 @@
+{"type":"click","text":"?\n    \n      疑点 1：文件访问授权 AgentFileAccess 放哪？\n      macOS 隐私目录一次性授权（防远程调用弹窗卡死）。它授权的是整个 Agent 链路，不是用户态 agent 独有。我的建议：放「状态 › 其他」（和系统设置同级的设备级开关）。若你觉得它跟启动工具绑定更紧，也可以放「用户态 agent」。","choice":"q1","id":null,"timestamp":1793662563103}
+{"type":"click","text":"?\n    \n      疑点 2：自定义环境变量 CustomEnv 放哪？\n      自定义 env 注入 AI run。注入对象是平台通道的 AI run（含 aliangcode 和外部 CLI）。我的建议：放「Agent › aliangcode」（跟 LLM 设置同区，都是「AI run 用什么环境」）。也可放「用户态 agent」或「状态 › 其他」。","choice":"q2","id":null,"timestamp":1793662594706}
+{"type":"click","text":"!\n    \n      提醒：🆕 两个开关需要后端配合\n      peer_exec_enabled / peer_fetch_enabled 存在服务端设备注册表，本机 agent 只读。前端开关需要新增一条「写设备开关」的 API（本仓 agent 侧 + 服务端 PhoneServer 配合）。这一轮做，还是先留占位（开关置灰 + 「即将上线」）？","choice":"q3","id":null,"timestamp":1793662596817}

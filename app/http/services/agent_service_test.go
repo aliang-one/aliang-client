@@ -772,7 +772,7 @@ func TestAgentServiceRejectsRemoteCommandsAfterDisable(t *testing.T) {
 		return nil
 	}
 
-	service.handleRemoteAgentMessage(map[string]interface{}{
+	service.handleRemoteAgentMessage(context.Background(), map[string]interface{}{
 		"type":       "terminal.create",
 		"session_id": "term_after_disable",
 		"cwd":        os.TempDir(),
@@ -1354,7 +1354,7 @@ func TestAgentServiceAppliesRemoteDeviceSettings(t *testing.T) {
 	}
 	service.mu.Unlock()
 
-	service.handleRemoteAgentMessage(map[string]interface{}{
+	service.handleRemoteAgentMessage(context.Background(), map[string]interface{}{
 		"type": "device.settings.updated",
 		"device": map[string]interface{}{
 			"id":                      "dev_remote",
@@ -1428,7 +1428,7 @@ func TestAgentServiceRejectsRemoteCommandsWhenDeviceFeaturesDisabled(t *testing.
 		return nil
 	}
 
-	service.handleRemoteAgentMessage(map[string]interface{}{
+	service.handleRemoteAgentMessage(context.Background(), map[string]interface{}{
 		"type":       "terminal.create",
 		"session_id": "term_disabled",
 		"cwd":        os.TempDir(),
@@ -1437,7 +1437,7 @@ func TestAgentServiceRejectsRemoteCommandsWhenDeviceFeaturesDisabled(t *testing.
 		return event["session_id"] == "term_disabled" && strings.Contains(remoteString(event, "error"), "disabled")
 	})
 
-	service.handleRemoteAgentMessage(map[string]interface{}{
+	service.handleRemoteAgentMessage(context.Background(), map[string]interface{}{
 		"type":         "ai.session.create",
 		"session_id":   "ai_disabled",
 		"project_path": os.TempDir(),
@@ -3120,7 +3120,7 @@ func TestAgentServiceRemoteAIApprovalResponseUnblocksCodexAppServer(t *testing.T
 		return nil
 	}
 
-	svc.handleRemoteAgentMessage(map[string]interface{}{
+	svc.handleRemoteAgentMessage(context.Background(), map[string]interface{}{
 		"type":         "ai.session.create",
 		"session_id":   "remote_codex_approval",
 		"project_path": projectPath,
@@ -3131,7 +3131,7 @@ func TestAgentServiceRemoteAIApprovalResponseUnblocksCodexAppServer(t *testing.T
 		return event["session_id"] == "remote_codex_approval"
 	})
 
-	svc.handleRemoteAgentMessage(map[string]interface{}{
+	svc.handleRemoteAgentMessage(context.Background(), map[string]interface{}{
 		"type":       "ai.message",
 		"session_id": "remote_codex_approval",
 		"message_id": "msg_remote_approval",
@@ -3144,7 +3144,7 @@ func TestAgentServiceRemoteAIApprovalResponseUnblocksCodexAppServer(t *testing.T
 			remoteString(event, "command") == "git push"
 	})
 
-	svc.handleRemoteAgentMessage(map[string]interface{}{
+	svc.handleRemoteAgentMessage(context.Background(), map[string]interface{}{
 		"type":        "ai.approval.response",
 		"session_id":  "remote_codex_approval",
 		"message_id":  remoteString(approval, "message_id"),
@@ -3176,7 +3176,7 @@ func TestAgentServiceRemoteAIApprovalResponseUnblocksCodexAppServer(t *testing.T
 	mu.Lock()
 	beforeDuplicate := len(events)
 	mu.Unlock()
-	svc.handleRemoteAgentMessage(map[string]interface{}{
+	svc.handleRemoteAgentMessage(context.Background(), map[string]interface{}{
 		"type":        "ai.approval.response",
 		"session_id":  "remote_codex_approval",
 		"message_id":  remoteString(approval, "message_id"),
@@ -4132,7 +4132,7 @@ func TestAgentRemoteDetailRequestsReturnProjectAndVibeSessionDetail(t *testing.T
 		return nil
 	}
 
-	service.handleRemoteAgentMessage(map[string]interface{}{
+	service.handleRemoteAgentMessage(context.Background(), map[string]interface{}{
 		"type":         "project.detail",
 		"request_id":   "req_project",
 		"project_id":   "proj_detail",
@@ -4150,7 +4150,7 @@ func TestAgentRemoteDetailRequestsReturnProjectAndVibeSessionDetail(t *testing.T
 		t.Fatalf("project detail event = %#v project=%+v ok=%t", projectEvent, project, ok)
 	}
 
-	service.handleRemoteAgentMessage(map[string]interface{}{
+	service.handleRemoteAgentMessage(context.Background(), map[string]interface{}{
 		"type":         "file.list",
 		"request_id":   "req_files",
 		"project_path": projectPath,
@@ -4165,7 +4165,7 @@ func TestAgentRemoteDetailRequestsReturnProjectAndVibeSessionDetail(t *testing.T
 		t.Fatalf("file list event = %#v entries=%+v ok=%t", fileListEvent, entries, ok)
 	}
 
-	service.handleRemoteAgentMessage(map[string]interface{}{
+	service.handleRemoteAgentMessage(context.Background(), map[string]interface{}{
 		"type":              "ai.session.detail",
 		"request_id":        "req_session",
 		"source_session_id": codexID,
