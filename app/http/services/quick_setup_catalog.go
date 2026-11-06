@@ -126,32 +126,10 @@ const quickSetupCodexProviderID = "aliang"
 
 // quickSetupTOMLQuote 把值编码为 TOML 基本字符串（转义引号/反斜杠/控制字符）。
 // 自 v2 merge 引擎迁入：catalog 的空白 codex 模板（quickSetupBlankCodexFiles）是
-// 唯一调用方。
+// 唯一调用方。实现委托 agent_mcp_registry.go 的 tomlQuote——两份字节等价拷贝
+// 已漂移(DEL 转义只在新实现),收敛到单一真值源。
 func quickSetupTOMLQuote(s string) string {
-	var b strings.Builder
-	b.WriteByte('"')
-	for _, r := range s {
-		switch r {
-		case '"':
-			b.WriteString(`\"`)
-		case '\\':
-			b.WriteString(`\\`)
-		case '\t':
-			b.WriteString(`\t`)
-		case '\n':
-			b.WriteString(`\n`)
-		case '\r':
-			b.WriteString(`\r`)
-		default:
-			if r < 0x20 {
-				fmt.Fprintf(&b, `\u%04X`, r)
-			} else {
-				b.WriteRune(r)
-			}
-		}
-	}
-	b.WriteByte('"')
-	return b.String()
+	return tomlQuote(s)
 }
 
 // quickSetupComboBlankTemplates 返回 software 的空白组合模板（含 {{base_url}}/

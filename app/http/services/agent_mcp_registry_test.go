@@ -393,3 +393,54 @@ func TestCodexSyncUnparseableConfigRefuses(t *testing.T) {
 		t.Fatal("不可解析的用户文件必须拒写(fail-closed)")
 	}
 }
+
+func TestCodexSyncHTTPURLOnlyBlock(t *testing.T) {
+	home := t.TempDir()
+	if err := upsertAliangMCPServerForTest(home, "web", aliangMCPServerEntry{
+		Type: "http", URL: "https://api.example.com/mcp",
+		Headers: map[string]string{"Authorization": "secret"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyAliangMCPCodexSyncForTest(home); err != nil {
+		t.Fatal(err)
+	}
+	out := readCodexConfigRaw(t, home)
+	if !strings.Contains(out, "[mcp_servers.aliang-mcp-web]") ||
+		!strings.Contains(out, `url = "https://api.example.com/mcp"`) {
+		t.Fatalf("url-only 托管块缺失: %s", out)
+	}
+	// http 条目只带 url:command/args/env 不得出现;headers 无通道更不得泄漏
+	for _, leak := range []string{"command =", "args =", "env =", "Authorization"} {
+		if strings.Contains(out, leak) {
+			t.Fatalf("http 条目泄漏 %s: %s", leak, out)
+		}
+	}
+}
+
+func TestCodexSyncRefusesWhenSpliceWouldCorrupt(t *testing.T) {
+	// 写前自检回归:规范托管块+用户手加的孤儿子表 [..aliang-mcp-x.env]、
+	// 注册表 x 带非空 Env → 父块摘除而子表保留,新块 inline env 与子表构成
+	// 重复键定义——同步必须拒写且原文件字节零改动。
+	home := t.TempDir()
+	writeCodexConfig(t, home, "[mcp_servers.aliang-mcp-x]\ncommand = \"old\"\n\n[mcp_servers.aliang-mcp-x.env]\nK = \"V\"\n")
+	before, err := os.ReadFile(filepath.Join(home, ".codex", "config.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := upsertAliangMCPServerForTest(home, "x", aliangMCPServerEntry{
+		Command: "new", Env: map[string]string{"K": "V"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyAliangMCPCodexSyncForTest(home); err == nil {
+		t.Fatal("拼块会打碎文件(重复键定义)时必须拒写")
+	}
+	after, err := os.ReadFile(filepath.Join(home, ".codex", "config.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("拒写时原文件必须字节零改动:\nbefore=%s\nafter=%s", before, after)
+	}
+}

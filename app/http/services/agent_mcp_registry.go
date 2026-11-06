@@ -322,7 +322,8 @@ func aliangMCPEnabledEntries(home string) map[string]aliangMCPServerEntry {
 	return out
 }
 
-// tomlQuote TOML basic string 转义(控制字符 \uXXXX,其余原样)。
+// tomlQuote TOML basic string 转义(控制字符含 DEL(0x7F)转 \uXXXX,其余原样;
+// 裸 0x7F 在 TOML basic string 里是解析错误,评审实证)。
 func tomlQuote(s string) string {
 	var b strings.Builder
 	b.WriteByte('"')
@@ -339,7 +340,7 @@ func tomlQuote(s string) string {
 		case '\t':
 			b.WriteString(`\t`)
 		default:
-			if r < 0x20 {
+			if r < 0x20 || r == 0x7F {
 				b.WriteString(fmt.Sprintf(`\u%04X`, r))
 			} else {
 				b.WriteRune(r)
@@ -381,17 +382,28 @@ func aliangMCPCodexBlockLines(key string, e aliangMCPServerEntry) []string {
 	return lines
 }
 
+// aliangMCPCodexHeaderKey 判定一行是否规范形态的 [mcp_servers.aliang-mcp-*]
+// 托管表头;是则返回键名(如 aliang-mcp-blender),否则返回 ""。规范形态=
+// 去空白后前缀匹配+右括号收尾+无引号+键内无点(带点是子表头,属用户内容,
+// 摘块与门禁两处共用同一判据——两份拷贝漂移会互相打脸,故收敛于此)。
+func aliangMCPCodexHeaderKey(line string) string {
+	trimmed := strings.TrimSpace(line)
+	if strings.HasPrefix(trimmed, "[mcp_servers."+aliangMCPCodexPrefix) && strings.HasSuffix(trimmed, "]") && !strings.Contains(trimmed, "\"") {
+		key := strings.TrimSuffix(strings.TrimPrefix(trimmed, "[mcp_servers."), "]")
+		if !strings.Contains(key, ".") {
+			return key
+		}
+	}
+	return ""
+}
+
 // scanAliangMCPCanonicalManagedHeaders 文本扫描 config.toml 中规范形态的
-// [mcp_servers.aliang-mcp-*] 表头(整行精确相等,与 peer 块拼接同一判据)。
+// [mcp_servers.aliang-mcp-*] 表头(判据见 aliangMCPCodexHeaderKey)。
 func scanAliangMCPCanonicalManagedHeaders(raw string) map[string]bool {
 	out := map[string]bool{}
 	for _, line := range strings.Split(raw, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "[mcp_servers."+aliangMCPCodexPrefix) && strings.HasSuffix(trimmed, "]") && !strings.Contains(trimmed, "\"") {
-			key := strings.TrimSuffix(strings.TrimPrefix(trimmed, "[mcp_servers."), "]")
-			if !strings.Contains(key, ".") {
-				out[key] = true
-			}
+		if key := aliangMCPCodexHeaderKey(line); key != "" {
+			out[key] = true
 		}
 	}
 	return out
@@ -403,6 +415,8 @@ func scanAliangMCPCanonicalManagedHeaders(raw string) map[string]bool {
 //   - 用户文件不可解析 → 拒写(codex 自身同样读不了,fail-closed);
 //   - TOML 解析出托管键但文本扫描找不到规范表头(引号/空格/尾注释形态)
 //     → 拒写,提示手工规范(防重复表定义打碎文件,peer 注册同款纪律);
+//   - 写前自检:拼出的内容必须自己解析得过(如规范块+孤儿子表 env 与新块
+//     inline env 构成重复键定义)→ 拒写,原文件字节不动;
 //   - 字节无变化 → 幂等跳写;文件缺失且期望集为空 → 不建文件。
 func applyAliangMCPCodexSyncForTest(home string) error {
 	path := filepath.Join(home, ".codex", "config.toml")
@@ -412,6 +426,13 @@ func applyAliangMCPCodexSyncForTest(home string) error {
 	}
 	desired := map[string]aliangMCPServerEntry{}
 	for name, e := range aliangMCPEnabledEntries(home) {
+		// 读通道只拦保留前缀,名称合法性是写通道纪律;手改注册表可塞进
+		// a.b 这类名——它会产出 [mcp_servers.aliang-mcp-a.b],codex 理解成
+		// 子表头,直接拒出。
+		if !aliangMCPServerNameRe.MatchString(name) {
+			logger.Warn(fmt.Sprintf("aliang-mcp: 条目 %s 名称不合规范,codex 托管块跳过", name))
+			continue
+		}
 		desired[aliangMCPCodexPrefix+name] = e
 	}
 	hasFile := err == nil
@@ -433,7 +454,7 @@ func applyAliangMCPCodexSyncForTest(home string) error {
 			}
 		}
 	}
-	// 摘除全部规范托管块 span,其余行原样保留。
+	// 摘除全部规范托管块 span,其余行原样保留(判据与门禁同一函数)。
 	lines := strings.Split(string(raw), "\n")
 	if len(lines) == 1 && lines[0] == "" {
 		lines = nil
@@ -441,15 +462,7 @@ func applyAliangMCPCodexSyncForTest(home string) error {
 	var kept []string
 	i := 0
 	for i < len(lines) {
-		trimmed := strings.TrimSpace(lines[i])
-		key := ""
-		if strings.HasPrefix(trimmed, "[mcp_servers."+aliangMCPCodexPrefix) && strings.HasSuffix(trimmed, "]") && !strings.Contains(trimmed, "\"") {
-			k := strings.TrimSuffix(strings.TrimPrefix(trimmed, "[mcp_servers."), "]")
-			if !strings.Contains(k, ".") {
-				key = k
-			}
-		}
-		if key == "" {
+		if aliangMCPCodexHeaderKey(lines[i]) == "" {
 			kept = append(kept, lines[i])
 			i++
 			continue
@@ -472,11 +485,8 @@ func applyAliangMCPCodexSyncForTest(home string) error {
 		}
 		out = append(out, aliangMCPCodexBlockLines(k, desired[k])...)
 	}
-	if len(out) == 0 {
-		if !hasFile {
-			return nil
-		}
-		out = nil
+	if len(out) == 0 && !hasFile {
+		return nil
 	}
 	content := strings.Join(out, "\n")
 	if content != "" && !strings.HasSuffix(content, "\n") {
@@ -485,7 +495,12 @@ func applyAliangMCPCodexSyncForTest(home string) error {
 	if hasFile && content == string(raw) {
 		return nil // 幂等跳写
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	// 写前自检:自己产出的内容必须自己解析得过(孤儿子表等形态会拼出重复
+	// 键定义);失败=拒写,原文件字节不动,与坏文件 fail-closed 同姿态。
+	if _, perr := toml.Decode(content, &codexConfigFile{}); perr != nil {
+		return fmt.Errorf("aliang-mcp: codex 托管块同步产出不可解析内容,拒绝写盘: %w", perr)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return fmt.Errorf("mkdir %s: %w", filepath.Dir(path), err)
 	}
 	return writePeerMCPFileAtomic(path, []byte(content))
