@@ -875,6 +875,9 @@ func TestClaudeTierMCPArgsMergesUserAndProjectServers(t *testing.T) {
 }
 
 func TestClaudeTierMCPArgsInactive(t *testing.T) {
+	// 真机 home 一旦存在 ~/.aliang/mcp.json(统一注册表),「不可信=无操作」
+	// 断言就会翻红;swap 到空 TempDir 让本测只依赖自身输入。
+	swapClaudeTierHome(t, t.TempDir())
 	policy := parseAgentAIClaudeRemotePolicy(map[string]interface{}{"claude_remote_policy": map[string]interface{}{"trust_level": "sanitized"}})
 	project := t.TempDir()
 	flags, cleanup, err := claudeTierMCPArgs(policy, project)

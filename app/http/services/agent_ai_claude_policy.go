@@ -168,31 +168,57 @@ func readMCPServersFile(path string, dst map[string]interface{}) error {
 }
 
 // claudeTierMCPArgs builds --strict-mcp-config/--mcp-config flags for the
-// sanitized tier when the server marked the project MCP trusted (spec §5):
-// user-scope servers (top-level "mcpServers" in <agentHome>/.claude.json —
-// NOT the per-project entries) plus user-scope plugin servers
-// ("plugin:<name>:<server>", see readPluginMCPServers) merged with the
-// project's .mcp.json, project entries winning name collisions (mirrors the
-// CLI's local > project > user precedence at merge time). Returns nil flags —
-// native user-scope discovery — when the project contributes no servers.
+// sanitized tier: user-scope servers (top-level "mcpServers" in
+// <agentHome>/.claude.json — NOT the per-project entries) plus user-scope
+// plugin servers ("plugin:<name>:<server>", see readPluginMCPServers) and
+// the unified aliang registry, then — only when the server marked the
+// project MCP trusted (spec §5) — the project's .mcp.json, project entries
+// winning name collisions (mirrors the CLI's local > project > user
+// precedence at merge time).
+//
+// Registry source: native claude discovery cannot see ~/.aliang/mcp.json
+// (see readAliangMCPRegistryInto), so ANY enabled registry entry forces the
+// explicit flags; the count is raw — an entry that shadows an existing
+// user/plugin name still counts as a contribution — and on name collisions
+// the registry overrides the user/plugin entries.
+//
+// Untrusted-project branch: an untrusted project is no longer a hard no-op —
+// with a non-empty registry the flags are still emitted and the payload is
+// user+plugin+registry WITHOUT any project entries (strict mode suppresses
+// native plugin/user loading, so those servers must be re-included in the
+// payload; see readPluginMCPServers).
+//
+// Returns nil flags — native user-scope discovery — only when BOTH the
+// project (if trusted) and the registry contribute zero entries.
 // Callers invoke the returned cleanup only on success; on error the
 // implementation has already released everything it created.
 // Note: a project .mcp.json that only redefines names already present in
 // user scope contributes no new names, so no merge happens and the
 // user-scope definitions win (direction: load fewer, never more).
 func claudeTierMCPArgs(policy agentAIClaudeRemotePolicy, projectPath string) ([]string, func(), error) {
-	if !policy.projectMCPTrusted {
-		return nil, func() {}, nil
-	}
 	merged := map[string]interface{}{}
-	if home := agentHome(); home != "" {
+	home := claudeTierMCPHome()
+	if home != "" {
 		readMCPServersFile(filepath.Join(home, ".claude.json"), merged)
+		readPluginMCPServersIn(home, merged)
 	}
-	readPluginMCPServers(merged)
-	beforeProject := len(merged)
-	readMCPServersFile(filepath.Join(projectPath, ".mcp.json"), merged)
-	projectCount := len(merged) - beforeProject
-	if projectCount == 0 {
+	// 统一注册表:claude 原生发现看不见 ~/.aliang/mcp.json,有任意启用条目
+	// 就必须发 flags;同名键在此覆盖 user/plugin 条目。raw 计数(覆盖型条目
+	// 也算贡献,防「同名 shadow 被当零贡献」误判)。
+	registryCount := 0
+	if home != "" {
+		registryCount = readAliangMCPRegistryInto(home, merged)
+	}
+	// 项目 .mcp.json 仅在项目 MCP 可信时并入(信任闸语义不变,项目条目仍最后
+	// 合并、同名仍项目胜)。
+	projectCount := 0
+	if policy.projectMCPTrusted {
+		beforeProject := len(merged)
+		readMCPServersFile(filepath.Join(projectPath, ".mcp.json"), merged)
+		projectCount = len(merged) - beforeProject
+	}
+	if projectCount == 0 && registryCount == 0 {
+		// 双零贡献:走 claude 原生 user 域发现(原两条快速路径的并集)。
 		return nil, func() {}, nil
 	}
 	payload, err := json.Marshal(map[string]interface{}{"mcpServers": merged})
@@ -214,6 +240,20 @@ func claudeTierMCPArgs(policy agentAIClaudeRemotePolicy, projectPath string) ([]
 	}
 	cleanup := func() { _ = os.Remove(tmp.Name()) }
 	return []string{"--strict-mcp-config", "--mcp-config", tmp.Name()}, cleanup, nil
+}
+
+// claudeTierMCPHome 是 claudeTierMCPArgs 取 home 的注入点(测试替换);
+// swap 期间该包测试禁 t.Parallel。
+var claudeTierMCPHome = agentHome
+
+// readPluginMCPServersIn 与 readPluginMCPServers(agent_ai_claude_policy.go:338)
+// 行为一致,仅 home 注入化;插件复合键 plugin:<name>:<server> 语义不变。
+func readPluginMCPServersIn(home string, dst map[string]interface{}) int {
+	added := 0
+	for _, inst := range enabledUserScopePluginInstallsIn(home) {
+		added += readPluginMCPDeclaration(inst.installPath, inst.pluginName, dst)
+	}
+	return added
 }
 
 // claudeEnabledPluginsIn 同 claudeEnabledPlugins,但 home 由调用方给定
