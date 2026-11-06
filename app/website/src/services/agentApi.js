@@ -68,6 +68,24 @@ export async function getAgentIntegrations() {
   return request('/api/agent/integrations', { method: 'GET' });
 }
 
+// 统一 MCP 注册表管理（第一方资产，三内核消费）。
+export async function getAliangMCPRegistry() {
+  return request('/api/agent/mcp', { method: 'GET' });
+}
+
+export async function putAliangMCPServer(name, entry) {
+  return request(`/api/agent/mcp/servers/${encodeURIComponent(name)}`, {
+    method: 'PUT',
+    body: JSON.stringify(entry),
+  });
+}
+
+export async function deleteAliangMCPServer(name) {
+  return request(`/api/agent/mcp/servers/${encodeURIComponent(name)}`, {
+    method: 'DELETE',
+  });
+}
+
 export async function getAgentSessionDetail(sessionId, { limit, before } = {}) {
   const params = new URLSearchParams();
   if (limit) params.set('limit', String(limit));
