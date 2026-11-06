@@ -54,7 +54,7 @@ type AgentIntegrationMCPServer struct {
 	Name string `json:"name"`
 	// Transport 传输形态：stdio | http | sse。
 	Transport string `json:"transport"`
-	// Source 配置来源：user | plugin | codex（多来源合并时逗号分隔）。
+	// Source 配置来源：user | plugin | aliang（统一注册表）| codex（多来源合并时逗号分隔）。
 	Source string `json:"source"`
 	// Command stdio 形态的命令行（可疑 token 已打码）。
 	Command string `json:"command,omitempty"`
