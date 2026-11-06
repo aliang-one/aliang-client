@@ -531,3 +531,100 @@ func EnsureAliangMCPCodexMatchesRegistryForTest(home string) {
 func EnsureAliangMCPCodexMatchesRegistry() {
 	EnsureAliangMCPCodexMatchesRegistryForTest(agentHome())
 }
+
+// ---------------------------------------------------------------------------
+// HTTP service 层(GET/PUT/DELETE)。文件层本体见上;此处只做 home 注入、
+// 两段式编排与 DTO 形态转换。
+// ---------------------------------------------------------------------------
+
+// mcpRegistryHome 是本文件 service 方法取 home 的注入点(测试 swap,禁并行;
+// swap 期间不得有后台调用方——写 API 走 HTTP 请求同步路径,天然满足)。
+var mcpRegistryHome = agentHome
+
+// AliangMCPServerRequest 是 PUT 通道的请求形态(handler DTO)。
+type AliangMCPServerRequest struct {
+	Type    string            `json:"type"`
+	Command string            `json:"command"`
+	Args    []string          `json:"args"`
+	Env     map[string]string `json:"env"`
+	URL     string            `json:"url"`
+	Headers map[string]string `json:"headers"`
+	Enabled *bool             `json:"enabled"`
+}
+
+func (r AliangMCPServerRequest) entry() aliangMCPServerEntry {
+	return aliangMCPServerEntry(r)
+}
+
+// AliangMCPSyncResult 是注册表写 API 的统一响应骨架。两段式:第一段(注册表
+// 落盘)失败在 RegistryErr;第二段(codex 托管块)失败在 CodexSync.Error 且
+// 不回滚第一段(spec §7.1——注册表已是真值,自愈兜底)。
+type AliangMCPSyncResult struct {
+	Existed     bool               `json:"existed,omitempty"`
+	RegistryErr string             `json:"registry_error,omitempty"`
+	CodexSync   AliangMCPCodexSync `json:"codex_sync"`
+}
+
+type AliangMCPCodexSync struct {
+	OK    bool   `json:"ok"`
+	Error string `json:"error,omitempty"`
+}
+
+// AliangMCPRegistry GET 视图:注册表原文(本地管理须见原文;文件在用户自己
+// 机器上)。缺文件返回空表视图。
+func (s *AgentService) AliangMCPRegistry() (map[string]interface{}, error) {
+	home := mcpRegistryHome()
+	if home == "" {
+		return nil, fmt.Errorf("agent home unavailable")
+	}
+	root, existed, err := loadAliangMCPRegistryRoot(home)
+	if err != nil {
+		return nil, err
+	}
+	if !existed {
+		return map[string]interface{}{"version": json.Number(fmt.Sprint(aliangMCPRegistryVersion)), "servers": map[string]interface{}{}}, nil
+	}
+	return root, nil
+}
+
+// UpsertAliangMCPServer PUT 语义:新增或整体替换。
+func (s *AgentService) UpsertAliangMCPServer(name string, req AliangMCPServerRequest) AliangMCPSyncResult {
+	res := AliangMCPSyncResult{}
+	home := mcpRegistryHome()
+	if home == "" {
+		res.RegistryErr = "agent home unavailable"
+		return res
+	}
+	if err := upsertAliangMCPServerForTest(home, name, req.entry()); err != nil {
+		res.RegistryErr = err.Error()
+		return res
+	}
+	if err := applyAliangMCPCodexSyncForTest(home); err != nil {
+		res.CodexSync = AliangMCPCodexSync{OK: false, Error: err.Error()}
+		return res
+	}
+	res.CodexSync = AliangMCPCodexSync{OK: true}
+	return res
+}
+
+// DeleteAliangMCPServer DELETE 语义。
+func (s *AgentService) DeleteAliangMCPServer(name string) AliangMCPSyncResult {
+	res := AliangMCPSyncResult{}
+	home := mcpRegistryHome()
+	if home == "" {
+		res.RegistryErr = "agent home unavailable"
+		return res
+	}
+	existed, err := deleteAliangMCPServerForTest(home, name)
+	if err != nil {
+		res.RegistryErr = err.Error()
+		return res
+	}
+	res.Existed = existed
+	if err := applyAliangMCPCodexSyncForTest(home); err != nil {
+		res.CodexSync = AliangMCPCodexSync{OK: false, Error: err.Error()}
+		return res
+	}
+	res.CodexSync = AliangMCPCodexSync{OK: true}
+	return res
+}

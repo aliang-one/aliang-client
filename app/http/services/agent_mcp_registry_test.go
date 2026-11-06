@@ -458,3 +458,40 @@ func TestEnsureAliangMCPCodexMatchesRegistry(t *testing.T) {
 	writeCodexConfig(t, home, "[mcp_servers.\"aliang-mcp-a\"]\ncommand = \"old\"\n")
 	EnsureAliangMCPCodexMatchesRegistryForTest(home) // 不 panic 即通过
 }
+
+func TestAgentServiceMCPRegistryFlow(t *testing.T) {
+	home := t.TempDir()
+	old := mcpRegistryHome
+	mcpRegistryHome = func() string { return home }
+	t.Cleanup(func() { mcpRegistryHome = old })
+	svc := &AgentService{}
+
+	// 初始空表
+	reg, err := svc.AliangMCPRegistry()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reg["version"] == nil {
+		t.Fatalf("空表必须返回 version 视图, got %#v", reg)
+	}
+	// upsert + 同步结果
+	res := svc.UpsertAliangMCPServer("web", AliangMCPServerRequest{
+		Type: "http", URL: "https://api.example.com/mcp",
+	})
+	if res.RegistryErr != "" {
+		t.Fatalf("registry err: %s", res.RegistryErr)
+	}
+	if res.CodexSync.Error != "" {
+		t.Fatalf("空 codex 场景同步不应报错: %s", res.CodexSync.Error)
+	}
+	// 校验失败路径
+	res = svc.UpsertAliangMCPServer("bad name!", AliangMCPServerRequest{Command: "x"})
+	if res.RegistryErr == "" {
+		t.Fatal("非法名必须失败且带原因")
+	}
+	// 删除
+	res = svc.DeleteAliangMCPServer("web")
+	if res.RegistryErr != "" || !res.Existed {
+		t.Fatalf("delete: %+v", res)
+	}
+}
