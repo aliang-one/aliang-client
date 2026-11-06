@@ -95,7 +95,7 @@ func TestHandleRemoteAIRenameAgentcoreKeysConversationID(t *testing.T) {
 		return nil
 	}
 
-	service.handleRemoteAgentMessage(map[string]interface{}{
+	service.handleRemoteAgentMessage(context.Background(), map[string]interface{}{
 		"type":              "ai.session.rename",
 		"session_id":        "conv-agentcore-1",
 		"title":             "agentcore改名",
@@ -142,7 +142,7 @@ func TestHandleRemoteAIRenameAgentcoreAcceptsWithoutNativeID(t *testing.T) {
 		return nil
 	}
 
-	service.handleRemoteAgentMessage(map[string]interface{}{
+	service.handleRemoteAgentMessage(context.Background(), map[string]interface{}{
 		"type":       "ai.session.rename",
 		"session_id": "conv-agentcore-2",
 		"title":      "兜底改名",
@@ -183,7 +183,7 @@ func TestHandleRemoteAIRenameClaudeKeepsRejectWithoutNative(t *testing.T) {
 		return nil
 	}
 
-	service.handleRemoteAgentMessage(map[string]interface{}{
+	service.handleRemoteAgentMessage(context.Background(), map[string]interface{}{
 		"type":       "ai.session.rename",
 		"session_id": "conv-claude-x",
 		"title":      "claude改名",
