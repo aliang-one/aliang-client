@@ -546,7 +546,7 @@ func TestCreateRestoresJournalHistoryWithoutTranscript(t *testing.T) {
 	m := newAgentAIManager()
 	m.coreJournal = newAgentCoreJournal(journalDir)
 	now := time.Now().UTC().Format(time.RFC3339)
-	m.coreJournal.ensureSessionHeader("s-g2", "/proj", "glm-5.3", "", now, "dashboard", nil, nil)
+	m.coreJournal.ensureSessionHeader("s-g2", "/proj", "glm-5.3", "", now, "dashboard", nil, nil, "")
 	m.coreJournal.appendUser("s-g2", "m1", "第一问", now)
 	m.coreJournal.appendAssistant("s-g2", "a1", "第一答", now)
 	m.coreJournal.appendTool("s-g2", "Bash", "ls", false) // 工具行:轨迹不是消息
@@ -641,7 +641,7 @@ func TestCreateWithTranscriptKeepsTranscriptOverJournal(t *testing.T) {
 	m := newAgentAIManager()
 	m.coreJournal = newAgentCoreJournal(journalDir)
 	now := time.Now().UTC().Format(time.RFC3339)
-	m.coreJournal.ensureSessionHeader("s-g2-tx", "/proj", "glm-5.3", "", now, "dashboard", nil, nil)
+	m.coreJournal.ensureSessionHeader("s-g2-tx", "/proj", "glm-5.3", "", now, "dashboard", nil, nil, "")
 	m.coreJournal.appendUser("s-g2-tx", "m1", "journal旧问", now)
 	m.coreJournal.appendAssistant("s-g2-tx", "a1", "journal旧答", now)
 
@@ -716,7 +716,7 @@ func TestCreateRestoreKeepsInitialContext(t *testing.T) {
 	m := newAgentAIManager()
 	m.coreJournal = newAgentCoreJournal(journalDir)
 	now := time.Now().UTC().Format(time.RFC3339)
-	m.coreJournal.ensureSessionHeader("s-g2-ic", "/proj", "glm-5.3", "", now, "dashboard", nil, nil)
+	m.coreJournal.ensureSessionHeader("s-g2-ic", "/proj", "glm-5.3", "", now, "dashboard", nil, nil, "")
 	m.coreJournal.appendUser("s-g2-ic", "m1", "journal旧问", now)
 	m.coreJournal.appendAssistant("s-g2-ic", "a1", "journal旧答", now)
 
