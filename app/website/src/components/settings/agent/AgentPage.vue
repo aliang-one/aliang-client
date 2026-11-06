@@ -29,6 +29,7 @@
     <template v-else-if="active === 'user-agent'">
       <AgentSettings />
       <AgentScanDirectoriesSettings />
+      <AgentMCPRegistrySettings />
       <AgentIntegrationsSettings />
     </template>
 
@@ -106,6 +107,7 @@ import AgentRuntimeSessions from '../AgentRuntimeSessions.vue';
 import AgentSettings from '../AgentSettings.vue';
 import AgentScanDirectoriesSettings from '../AgentScanDirectoriesSettings.vue';
 import AgentIntegrationsSettings from '../AgentIntegrationsSettings.vue';
+import AgentMCPRegistrySettings from '../AgentMCPRegistrySettings.vue';
 import AgentCoreSettings from '../AgentCoreSettings.vue';
 import AgentMCPGlobalSettings from '../AgentMCPGlobalSettings.vue';
 import AgentSkillsGlobalSettings from '../AgentSkillsGlobalSettings.vue';
@@ -132,6 +134,7 @@ export default {
     AgentSettings,
     AgentScanDirectoriesSettings,
     AgentIntegrationsSettings,
+    AgentMCPRegistrySettings,
     AgentCoreSettings,
     AgentMCPGlobalSettings,
     AgentSkillsGlobalSettings,
