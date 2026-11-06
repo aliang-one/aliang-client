@@ -288,7 +288,8 @@ func stampAgentMCPFile(path string) agentMCPFileStamp {
 
 // claudeMCPServerInventoryIn 采集 <home> 下的 Claude 设备级 MCP 清单:
 // <home>/.claude.json 顶层 mcpServers(source=user)+ 已启用插件 MCP
-// (source=plugin)。项目级 .mcp.json 不采集(随 cwd 变化,非设备能力)。
+// (source=plugin)+ 统一注册表 <home>/.aliang/mcp.json(source=aliang)。
+// 项目级 .mcp.json 不采集(随 cwd 变化,非设备能力)。
 // 所有读取以传入 home 为根,不回落 agentHome()。
 //
 // 两态返回契约:stamps 恒非 nil(= 本次读过/统计过的全部文件指纹,
@@ -300,13 +301,14 @@ func claudeMCPServerInventoryIn(home string) ([]models.AgentMCPServer, []agentMC
 	claudeJSON := filepath.Join(home, ".claude.json")
 	settingsJSON := filepath.Join(home, ".claude", "settings.json")
 	registryJSON := filepath.Join(home, ".claude", "plugins", "installed_plugins.json")
+	aliangJSON := aliangMCPRegistryPath(home)
+	aliangStamp := stampAgentMCPFile(aliangJSON)
 	claudeStamp := stampAgentMCPFile(claudeJSON)
 	settingsStamp := stampAgentMCPFile(settingsJSON)
 	registryStamp := stampAgentMCPFile(registryJSON)
-	stamps := []agentMCPFileStamp{claudeStamp, settingsStamp, registryStamp}
-	// 无任何 claude 配置:清单为空,但 stamps 必须照交——缓存据此感知
-	// 「配置后来出现」(任一文件从缺失变存在即失效)。
-	if !claudeStamp.exists && !registryStamp.exists {
+	stamps := []agentMCPFileStamp{claudeStamp, settingsStamp, registryStamp, aliangStamp}
+	// 早退条件收紧:注册表单独存在也必须出清单(没装 Claude 的机器自洽)
+	if !claudeStamp.exists && !registryStamp.exists && !aliangStamp.exists {
 		return nil, stamps
 	}
 	userRaw := map[string]interface{}{}
@@ -319,6 +321,13 @@ func claudeMCPServerInventoryIn(home string) ([]models.AgentMCPServer, []agentMC
 	}
 	out := agentMCPServersFromClaudeRaw(userRaw, "user")
 	out = append(out, agentMCPServersFromClaudeRaw(pluginRaw, "plugin")...)
+	// 统一注册表:enabled+合法条目(source=aliang);readAliangMCPRegistryInto
+	// 输出的就是 claude 形态,脱敏复用同一转换器。与 codex 侧「托管块不占
+	// 额度」不同,aliang 行与 user+plugin 一起竞争 24 上限——同侧同额度才
+	// 公平;极端超量时截断方向是「少报能力」(fail-safe),不会虚报。
+	registryRaw := map[string]interface{}{}
+	readAliangMCPRegistryInto(home, registryRaw)
+	out = append(out, agentMCPServersFromClaudeRaw(registryRaw, "aliang")...)
 	if len(out) > mcpServerMaxCount {
 		out = out[:mcpServerMaxCount]
 	}
@@ -348,6 +357,8 @@ type codexConfigFile struct {
 // 两者皆无的条目丢弃;url 与 command 并存时 url 优先(报 http);
 // enabled=false 的停用条目跳过(不占用数量上限额度——codex 自身不会启动
 // 停用的服务器,它不是可用设备能力);
+// 平台托管块 aliang-mcp-*(同步器写入的 codex 侧形态)跳过:同一能力已由
+// claude 侧清单以 source=aliang 呈现,不过滤会一行双身份;也不占额度;
 // 单条目类型不匹配(如 args 混入数字)会使整文件不可解码→归零——
 // codex 自身(serde 强类型)同样无法加载此类配置,语义对齐;
 // 畸形 TOML fail-soft 返回 nil。
@@ -372,6 +383,12 @@ func codexMCPServerInventoryIn(home string) ([]models.AgentMCPServer, []agentMCP
 	sort.Strings(names)
 	out := make([]models.AgentMCPServer, 0, len(names))
 	for _, name := range names {
+		// 平台托管块不入清单:同名注册表条目已在 claude 侧以 source=aliang
+		// 呈现,不过滤会出现一行双身份(评审第 1 轮实锤)。peer 的 aliang-peer
+		// 行为保持现状不动。
+		if strings.HasPrefix(name, aliangMCPCodexPrefix) {
+			continue
+		}
 		if len(out) >= mcpServerMaxCount {
 			break
 		}

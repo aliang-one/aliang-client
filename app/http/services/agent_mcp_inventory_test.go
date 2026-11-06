@@ -355,9 +355,9 @@ func TestClaudeMCPServerInventoryIn(t *testing.T) {
 	if out[1].Name != "plugin:superplugin:super-srv" || out[1].Source != "plugin" {
 		t.Fatalf("plugin entry wrong: %+v", out[1])
 	}
-	// stamps 必须覆盖全部被读文件:settings/registry/claude.json + 已启用插件 .mcp.json
-	if len(stamps) != 4 {
-		t.Fatalf("want 4 stamps (claude.json+settings+registry+enabled plugin decl), got %d", len(stamps))
+	// stamps 必须覆盖全部被读文件:settings/registry/claude.json/aliang 注册表 + 已启用插件 .mcp.json
+	if len(stamps) != 5 {
+		t.Fatalf("want 5 stamps (claude.json+settings+registry+aliang registry+enabled plugin decl), got %d", len(stamps))
 	}
 }
 
@@ -368,8 +368,8 @@ func TestClaudeMCPServerInventoryInMissingHome(t *testing.T) {
 	if out != nil {
 		t.Fatalf("empty home must yield nil, got %+v", out)
 	}
-	if len(stamps) != 3 {
-		t.Fatalf("missing config must still yield 3 stamps, got %d: %+v", len(stamps), stamps)
+	if len(stamps) != 4 {
+		t.Fatalf("missing config must still yield 4 stamps, got %d: %+v", len(stamps), stamps)
 	}
 	for _, s := range stamps {
 		if s.exists {
@@ -388,8 +388,8 @@ func TestClaudeMCPServerInventoryInEmptyConfig(t *testing.T) {
 	if out != nil {
 		t.Fatalf("empty mcpServers must yield nil, got %+v", out)
 	}
-	if len(stamps) != 3 {
-		t.Fatalf("want 3 stamps, got %d: %+v", len(stamps), stamps)
+	if len(stamps) != 4 {
+		t.Fatalf("want 4 stamps, got %d: %+v", len(stamps), stamps)
 	}
 }
 
@@ -404,7 +404,7 @@ func TestClaudeMCPServerInventoryInMalformedJSON(t *testing.T) {
 	if out != nil {
 		t.Fatalf("malformed claude.json must fail soft, got %+v", out)
 	}
-	if len(stamps) != 3 {
+	if len(stamps) != 4 {
 		t.Fatalf("stamps must still be reported, got %d", len(stamps))
 	}
 }

@@ -300,6 +300,11 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	register("/api/agent/file-access/settings", h.Agent.HandleFileAccessSettings, http.MethodPost)
 	// MCP 与技能只读报告（设备侧清单 + 内核生效态）。
 	register("/api/agent/integrations", h.Agent.HandleAgentIntegrations, http.MethodGet)
+	// 统一 MCP 注册表（第一方资产，三内核消费）。{name} 用方法前缀模式注册
+	// （同 quick-setup combos 约定，避免 ServeMux 双注册 panic）。
+	register("/api/agent/mcp", h.Agent.HandleAliangMCPRegistry, http.MethodGet)
+	register("PUT /api/agent/mcp/servers/{name}", h.Agent.HandleAliangMCPServerPut, http.MethodPut)
+	register("DELETE /api/agent/mcp/servers/{name}", h.Agent.HandleAliangMCPServerDelete, http.MethodDelete)
 	register("/api/docs/tutorials", h.Tutorial.HandleGetTutorial, http.MethodGet)
 
 	registerDocsRoutes(mux, catalog)
