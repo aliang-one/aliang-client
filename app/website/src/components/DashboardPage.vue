@@ -146,6 +146,12 @@
           </button>
         </div>
       </div>
+      <!-- 系统状态/文件访问授权紧凑卡(2026-11-05 spec):自状态页尾「其他」
+           收编至侧栏;移动端同款组件在下方 data-mobile-panel。 -->
+      <div class="mt-6 space-y-3 px-6">
+        <SystemStatusSidebarCard />
+        <FileAccessSidebarCard />
+      </div>
       <div class="mt-8 px-6 space-y-3">
         <p class="text-[10px] font-bold text-slate-400 uppercase tracking-widest px-1">{{ t('dash_quickTools') }}</p>
         <div class="group relative">
@@ -332,6 +338,11 @@
                 {{ t('dash_reinstall') }}
               </button>
             </div>
+          </div>
+          <!-- 系统状态/文件访问授权紧凑卡(2026-11-05 spec,与桌面侧栏同组件) -->
+          <div class="space-y-3">
+            <SystemStatusSidebarCard />
+            <FileAccessSidebarCard />
           </div>
           <!-- 快捷工具块 -->
           <div class="space-y-3">
@@ -1009,6 +1020,8 @@
 import { computed, ref, onMounted, onUnmounted, watch, nextTick } from 'vue';
 import OnboardingGuide from './OnboardingGuide.vue';
 import ScanLoginPanel from './settings/ScanLoginPanel.vue';
+import SystemStatusSidebarCard from './dashboard/SystemStatusSidebarCard.vue';
+import FileAccessSidebarCard from './dashboard/FileAccessSidebarCard.vue';
 import { isOnboardingCompleted, openOnboardingGuide } from '../composables/useOnboardingGuide';
 import { openTutorialDocs } from '../composables/useTutorialDocs';
 import { useI18n } from '../i18n';
@@ -1704,9 +1717,10 @@ function openQuickSetup() {
 }
 
 function handleGuideOpenSettings() {
-  // 运行模式随 2026-11-03 四栏重组落位「状态」页页尾「其他」（SystemSettings
-  // 随迁），引导跳状态页，滚动锚点 data-guide="run-mode" 不变。
-  showPage('log');
+  // 运行模式第二次随迁（2026-11-05 spec）：状态页尾「其他」解散，落位代理
+  // 设置 tab 首卡（SystemRunModeSettings），引导跳代理设置页，滚动锚点
+  // data-guide="run-mode" 不变。
+  showPage('settings');
   void nextTick(() => {
     document.querySelector('[data-guide="run-mode"]')?.scrollIntoView({ block: 'center', behavior: 'smooth' });
   });

@@ -430,6 +430,10 @@ export default {
   dash_balanceHint: '余额不足 — 请充值以保持代理运行',
   dash_balanceOk: '余额充足',
   dash_serverLink: '服务器连接',
+  // 侧栏紧凑卡(2026-11-05 spec):系统状态/文件访问授权
+  dash_systemStatusTitle: '系统状态',
+  dash_systemManage: '管理…',
+  dash_fileAccessManage: '查看 / 申请…',
   dash_scoreLatency: '评分/延迟',
   dash_state: '状态',
   dash_refreshDashboard: '刷新仪表板',
@@ -578,15 +582,12 @@ export default {
   agent_subUserAgent: '用户态 agent',
   agent_subAliangCode: 'aliangcode',
   agent_subPeerAccess: '设备互访',
-  // 状态页尾「其他」区块（设备级杂项集中地）
-  settings_otherTitle: '其他',
-  settings_otherDesc: '设备级开关与系统杂项：运行模式、文件访问授权。',
   // 置灰占位开关（设备门禁层 peer_exec_enabled / peer_fetch_enabled，
   // 真值源在服务端设备注册表，写通道待跨仓落地，先占位零请求）
   settings_peerExecPendingTitle: '跨设备执行',
   settings_peerExecPendingDesc: '允许其他设备在本机执行命令的设备级门禁。',
   settings_peerTransferPendingTitle: '文件传输',
-  settings_peerTransferPendingDesc: '允许跨设备拉取本机文件的设备级门禁。',
+  settings_peerTransferPendingDesc: '允许其他设备发起文件传输、拉取本机文件的设备级门禁。',
   settings_comingSoon: '即将上线',
   settings_scopeDevice: '本机生效，换设备不同步',
   settings_scopeLocal: '仅本机浏览器',
@@ -598,11 +599,11 @@ export default {
   mcpGlobal_hint: '只作用于 AliangCode 内核；claude/codex 走各自 CLI 的配置。默认开启。',
   mcpGlobal_save: '保存',
   mcpGlobal_saving: '保存中…',
-  // 设备互访(aliang-peer 跨设备工具面,能力接入)
+  // 设备互访(aliang-peer,能力接入)
   peerMcp_title: '设备互访 (Aliang Peer)',
-  peerMcp_description: '让 claude/codex 内核获得跨设备工具（列出设备、拉取文件、远程执行）。目标机的访问仍受对方设备开关与访问控制约束。',
+  peerMcp_description: '让 claude/codex 内核获得设备互访工具（列出设备、文件传输、跨设备执行）。目标机的访问仍受对方设备开关与访问控制约束。',
   peerMcp_managed: '平台托管',
-  peerMcp_enable: '启用跨设备工具面',
+  peerMcp_enable: '启用设备互访',
   peerMcp_hint: '关闭后三内核（claude/codex/agentcore）都不再暴露这组工具，已注册条目会被移除。',
   peerMcp_state_registered: '已注册',
   peerMcp_state_missing: '未注册',
@@ -612,8 +613,8 @@ export default {
   peerMcp_state_error: '失败',
   peerMcp_statusUnavailable: '注册状态不可用',
   peerMcp_applyFailed: '注册应用失败',
-  peerMcp_subAgentcore: 'aliangcode 工具面',
-  peerMcp_subAgentcoreDesc: 'aliangcode 内核的跨设备工具注入(设备互访五件套)。',
+  peerMcp_subAgentcore: 'aliangcode 工具注入',
+  peerMcp_subAgentcoreDesc: 'aliangcode 内核的设备互访工具注入(五件套)。',
   peerMcp_subClaude: '注册到 Claude Code',
   peerMcp_subClaudeDesc: '把 aliang-peer MCP 服务端写入 ~/.claude.json(平台托管)。',
   peerMcp_subCodex: '注册到 Codex',

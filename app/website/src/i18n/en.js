@@ -433,6 +433,10 @@ export default {
   dash_balanceHint: 'Low balance — top up to keep proxy running',
   dash_balanceOk: 'Balance is healthy',
   dash_serverLink: 'Server Link',
+  // Sidebar compact cards (2026-11-05 spec): system status / file access
+  dash_systemStatusTitle: 'System Status',
+  dash_systemManage: 'Manage…',
+  dash_fileAccessManage: 'View / Request…',
   dash_scoreLatency: 'Score/Latency',
   dash_state: 'State',
   dash_refreshDashboard: 'Refresh Dashboard',
@@ -571,25 +575,22 @@ export default {
   settings_live: 'LIVE',
   // Section subtitles (four-section IA reorganisation 2026-11-03: Proxy → Agent → Status → User)
   settings_sectionProxyDesc: 'Outbound proxy, AI rules, routing rules and model mapping. Applies to new sessions and the proxy layer.',
-  settings_sectionAgentDesc: 'Session records, the user-mode agent, the aliangcode kernel, and device mesh settings in one place.',
+  settings_sectionAgentDesc: 'Session records, the user-mode agent, the aliangcode kernel, and device access settings in one place.',
   settings_sectionAccountDesc: 'Account identity and local display preferences.',
   settings_sectionStatusDesc: 'Read-only observation: live logs. Device-level switches live in Other at the bottom.',
   settings_scopeDevice: 'This device only; not synced across devices',
   settings_scopeLocal: 'This browser only',
-  // Agent sub-tabs (four-section reorganisation 2026-11-03; device mesh added 2026-11-04)
+  // Agent sub-tabs (four-section reorganisation 2026-11-03; device access added 2026-11-04)
   agent_subRecords: 'Records',
   agent_subUserAgent: 'User-mode agent',
   agent_subAliangCode: 'aliangcode',
   agent_subPeerAccess: 'Device Access',
-  // Status page trailing Other section (device-level misc)
-  settings_otherTitle: 'Other',
-  settings_otherDesc: 'Device-level switches and system misc: run mode and file access authorization.',
   // Grayed-out placeholder switches (device-gate layer peer_exec_enabled / peer_fetch_enabled;
   // source of truth lives in the server device registry, write channel lands cross-repo later)
   settings_peerExecPendingTitle: 'Cross-device execution',
   settings_peerExecPendingDesc: 'Device-level gate for letting other devices run commands here.',
   settings_peerTransferPendingTitle: 'File transfer',
-  settings_peerTransferPendingDesc: 'Device-level gate for letting other devices fetch files from this machine.',
+  settings_peerTransferPendingDesc: 'Device-level gate letting other devices start file transfers to pull files from this machine.',
   settings_comingSoon: 'Coming soon',
   mcpGlobal_title: 'MCP master switch',
   mcpGlobal_description: 'Master switch: when off, the AliangCode kernel connects to no MCP server.',
@@ -597,11 +598,11 @@ export default {
   mcpGlobal_hint: 'Applies to the AliangCode kernel only; claude/codex use their own CLI configuration. Enabled by default.',
   mcpGlobal_save: 'Save',
   mcpGlobal_saving: 'Saving…',
-  // Device mesh (aliang-peer cross-device tool surface, capability tab)
-  peerMcp_title: 'Device Mesh (Aliang Peer)',
-  peerMcp_description: 'Give the claude/codex kernels cross-device tools (list devices, fetch files, run remotely). Access to a target device is still gated by its own switch and access controls.',
+  // Device access (aliang-peer, capability tab)
+  peerMcp_title: 'Device Access (Aliang Peer)',
+  peerMcp_description: 'Give the claude/codex kernels device access tools (list devices, file transfer, cross-device execution). Access to a target device is still gated by its own switch and access controls.',
   peerMcp_managed: 'Managed',
-  peerMcp_enable: 'Enable the cross-device tool surface',
+  peerMcp_enable: 'Enable device access',
   peerMcp_hint: 'When off, none of the three kernels (claude/codex/agentcore) expose these tools, and registered entries are removed.',
   peerMcp_state_registered: 'registered',
   peerMcp_state_missing: 'missing',
@@ -610,8 +611,8 @@ export default {
   peerMcp_state_error: 'failed',
   peerMcp_statusUnavailable: 'Registration status unavailable',
   peerMcp_applyFailed: 'Failed to apply registration',
-  peerMcp_subAgentcore: 'aliangcode tool face',
-  peerMcp_subAgentcoreDesc: 'Cross-device tool injection into the aliangcode kernel (peer five-piece set).',
+  peerMcp_subAgentcore: 'aliangcode tool injection',
+  peerMcp_subAgentcoreDesc: 'Device access tool injection into the aliangcode kernel (peer five-piece set).',
   peerMcp_subClaude: 'Register to Claude Code',
   peerMcp_subClaudeDesc: 'Write the aliang-peer MCP server entry into ~/.claude.json (platform-managed).',
   peerMcp_subCodex: 'Register to Codex',
