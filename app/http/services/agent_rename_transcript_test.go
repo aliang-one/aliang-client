@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -49,7 +50,7 @@ func dispatchRename(t *testing.T, service *AgentService, payload map[string]inte
 		}
 		return nil
 	}
-	service.handleRemoteAgentMessage(payload, writeJSON)
+	service.handleRemoteAgentMessage(context.Background(), payload, writeJSON)
 	return acks
 }
 

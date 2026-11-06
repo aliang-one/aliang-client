@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -37,7 +38,7 @@ func TestHandleRemoteAIRenameWritesCacheAndAcks(t *testing.T) {
 	}
 
 	before := time.Now().UTC().Add(-time.Second)
-	service.handleRemoteAgentMessage(map[string]interface{}{
+	service.handleRemoteAgentMessage(context.Background(), map[string]interface{}{
 		"type":              "ai.session.rename",
 		"session_id":        "conv-123",
 		"title":             "手机端新标题",

@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // 工具层。
@@ -100,6 +101,40 @@ type Tool interface {
 	Description() string
 	InputSchema() map[string]interface{}
 	Execute(ctx context.Context, input map[string]interface{}, env *ToolEnv) ToolResult
+}
+
+// defaultToolTimeout 是单个工具调用的默认执行上限（loop.go executeOneInner
+// 注入 ctx deadline）。存在是为了防一个挂死的工具拖死整轮 run；不是配额。
+const defaultToolTimeout = 10 * time.Minute
+
+// maxParallelToolCalls 是同回合可并行工具批的并发上限。模型一回合派多少
+// 个子 agent 是模型的事，内核只按资源形状封顶。
+const maxParallelToolCalls = 4
+
+// TimeoutHint 是可选接口：实现它的工具可为单次 Execute 覆盖默认执行上限
+// （defaultToolTimeout）。典型场景是「工具体本身就是一段完整工作流」的
+// 桥——子 agent 桥的 Execute 递归跑整个子 run，10 分钟窗口会把子 run 里
+// 等待手机审批的过程连坐掐死（审批 SLA 是 24h）。返回 <=0 表示沿用默认。
+type TimeoutHint interface {
+	TimeoutHint() time.Duration
+}
+
+// Parallelizable 是可选接口：声明 true 的工具允许与同回合其它可并行工具
+// 并发执行（executeTools 的批处理）。工具实现必须自行保证并发安全——
+// 包括它触发的宿主侧回调（审批闭包、journal 落行）。串行语义的桥（如
+// peer 工具，per-calling-device 串行）不要实现本接口。
+type Parallelizable interface {
+	Parallelizable() bool
+}
+
+// toolExecutionCeiling 解析单工具执行上限：TimeoutHint >0 覆盖，否则默认。
+func toolExecutionCeiling(tool Tool) time.Duration {
+	if h, ok := tool.(TimeoutHint); ok {
+		if d := h.TimeoutHint(); d > 0 {
+			return d
+		}
+	}
+	return defaultToolTimeout
 }
 
 // Registry 是工具注册表。零值不可用，用 NewRegistry 构造。

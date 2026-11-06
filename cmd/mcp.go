@@ -235,7 +235,9 @@ var peerMCPTools = []peerMCPTool{
 			"runs under Windows PowerShell 5.1: \"&&\" is unavailable (use \";\" or PS cmdlets), " +
 			"external .exe may be unavailable (prefer PS built-ins like $env:COMPUTERNAME or " +
 			"Get-FileHash, or absolute paths), and PS output is UTF-8 (native-exe output in a " +
-			"legacy codepage may still be garbled).",
+			"legacy codepage may still be garbled). Cancellation/timeout only aborts the local " +
+			"wait — the remote command still runs to completion on the target; do not blindly " +
+			"retry side-effecting commands.",
 		schema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{

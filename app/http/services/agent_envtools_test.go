@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"runtime"
@@ -56,7 +57,7 @@ func TestAgentGitStatusPayload_OnRepo(t *testing.T) {
 	}
 
 	msg := map[string]interface{}{"request_id": "r1", "cwd": dir}
-	result := agentGitStatusPayload(msg)
+	result := agentGitStatusPayload(context.Background(), msg)
 
 	if got := result["type"]; got != models.AgentEventGitStatusResult {
 		t.Fatalf("type = %v, want %s", got, models.AgentEventGitStatusResult)
@@ -86,7 +87,7 @@ func TestAgentGitStatusPayload_NonRepo(t *testing.T) {
 	authorizeEnvToolDir(t, dir)
 
 	msg := map[string]interface{}{"request_id": "r2", "cwd": dir}
-	result := agentGitStatusPayload(msg)
+	result := agentGitStatusPayload(context.Background(), msg)
 
 	if got := result["type"]; got != models.AgentEventGitStatusResult {
 		t.Fatalf("type = %v, want %s", got, models.AgentEventGitStatusResult)
@@ -106,7 +107,7 @@ func TestAgentGitStatusPayload_UnauthorizedCwd(t *testing.T) {
 	missing := "/definitely/not/a/real/project/path/xyz-12345"
 
 	msg := map[string]interface{}{"request_id": "r3", "cwd": missing}
-	result := agentGitStatusPayload(msg)
+	result := agentGitStatusPayload(context.Background(), msg)
 
 	if got := result["type"]; got != models.AgentEventGitStatusError {
 		t.Fatalf("type = %v, want %s", got, models.AgentEventGitStatusError)
@@ -124,7 +125,7 @@ func TestAgentEnvInfoPayload_WhitelistedKeysOnly(t *testing.T) {
 	authorizeEnvToolDir(t, dir)
 
 	msg := map[string]interface{}{"request_id": "r4", "cwd": dir}
-	result := agentEnvInfoPayload(msg)
+	result := agentEnvInfoPayload(context.Background(), msg)
 
 	if got := result["type"]; got != models.AgentEventEnvInfoResult {
 		t.Fatalf("type = %v, want %s", got, models.AgentEventEnvInfoResult)
@@ -233,7 +234,7 @@ func TestAgentGitLogPayload_OnRepo(t *testing.T) {
 	}
 
 	// 默认 limit:两笔全部返回,最新在前
-	out := agentGitLogPayload(map[string]interface{}{"cwd": dir, "request_id": "r1"})
+	out := agentGitLogPayload(context.Background(), map[string]interface{}{"cwd": dir, "request_id": "r1"})
 	if out["type"] != models.AgentEventGitLogResult {
 		t.Fatalf("type = %v", out["type"])
 	}
@@ -252,14 +253,14 @@ func TestAgentGitLogPayload_OnRepo(t *testing.T) {
 	}
 
 	// limit=1 + offset=1:跳过最新,只剩最旧一笔
-	out = agentGitLogPayload(map[string]interface{}{"cwd": dir, "request_id": "r2", "limit": float64(1), "offset": float64(1)})
+	out = agentGitLogPayload(context.Background(), map[string]interface{}{"cwd": dir, "request_id": "r2", "limit": float64(1), "offset": float64(1)})
 	entries, _ = out["entries"].([]map[string]string)
 	if len(entries) != 1 || entries[0]["subject"] != "first subject" {
 		t.Fatalf("limit/offset paging wrong: %+v", entries)
 	}
 
 	// limit 越界钳制
-	out = agentGitLogPayload(map[string]interface{}{"cwd": dir, "request_id": "r3", "limit": float64(100000)})
+	out = agentGitLogPayload(context.Background(), map[string]interface{}{"cwd": dir, "request_id": "r3", "limit": float64(100000)})
 	entries, _ = out["entries"].([]map[string]string)
 	if len(entries) != 2 {
 		t.Fatalf("clamped limit should return all 2, got %d", len(entries))
@@ -271,7 +272,7 @@ func TestAgentGitLogPayload_NonRepo(t *testing.T) {
 	dir := t.TempDir()
 	authorizeEnvToolDir(t, dir)
 
-	out := agentGitLogPayload(map[string]interface{}{"cwd": dir, "request_id": "r1"})
+	out := agentGitLogPayload(context.Background(), map[string]interface{}{"cwd": dir, "request_id": "r1"})
 	if out["type"] != models.AgentEventGitLogResult {
 		t.Fatalf("type = %v", out["type"])
 	}

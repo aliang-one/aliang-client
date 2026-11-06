@@ -6,6 +6,7 @@
 package tools
 
 import (
+	"context"
 	"fmt"
 	"sort"
 )
@@ -22,8 +23,9 @@ type Caps struct {
 }
 
 // HandlerFunc is the shape every existing payload function already has:
-// msg in, complete response map out (type/request_id/... filled by the handler).
-type HandlerFunc func(msg map[string]interface{}) map[string]interface{}
+// ctx in (run/会话生命周期,可取消——长时间工具应监听), msg in, complete
+// response map out (type/request_id/... filled by the handler).
+type HandlerFunc func(ctx context.Context, msg map[string]interface{}) map[string]interface{}
 
 // ErrorPayloadFunc builds the family error payload for a tool (e.g. the
 // legacy file.error shape). Optional; the generic shape is used when nil.

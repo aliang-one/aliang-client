@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -170,7 +171,7 @@ func TestHandleRemoteAgentMessage_RoutesWorkingTreeDiff(t *testing.T) {
 		return nil
 	}
 
-	svc.handleRemoteAgentMessage(map[string]interface{}{
+	svc.handleRemoteAgentMessage(context.Background(), map[string]interface{}{
 		"type":         "file.working_tree_diff",
 		"request_id":   "req_wtd_dispatch",
 		"project_path": dir,

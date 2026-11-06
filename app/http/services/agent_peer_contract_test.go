@@ -4,6 +4,7 @@ package services
 // WS 单帧读限、peer.exec.request 分发可达（四点齐，照互传契约测试先例）。
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -146,7 +147,7 @@ func TestHandleRemoteAgentMessage_PeerExecRequestDispatch(t *testing.T) {
 		}
 		return nil
 	}
-	svc.handleRemoteAgentMessage(map[string]interface{}{
+	svc.handleRemoteAgentMessage(context.Background(), map[string]interface{}{
 		"type":             models.AgentEventPeerExecRequest,
 		"request_id":       "req-dispatch-1",
 		"source_device_id": "device-a",
@@ -182,7 +183,7 @@ func TestHandleRemoteAgentMessage_PeerExecRejectedSilent(t *testing.T) {
 		called = true
 		return nil
 	}
-	svc.handleRemoteAgentMessage(map[string]interface{}{
+	svc.handleRemoteAgentMessage(context.Background(), map[string]interface{}{
 		"type":       models.AgentEventPeerExecRejected,
 		"request_id": "req-rej-1",
 		"reason":     "not_allowed",

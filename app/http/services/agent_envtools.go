@@ -22,12 +22,12 @@ const agentEnvToolStatusMaxLines = 40
 // (git.status / env.info) the cloud orchestrator sends before generating a bash command.
 // These tools never execute caller-controlled command text: only fixed read-only
 // subcommands of git / node / git / python3 are probed.
-func handleAgentEnvToolsMessage(msg map[string]interface{}, writeJSON func(interface{}) error) {
+func handleAgentEnvToolsMessage(ctx context.Context, msg map[string]interface{}, writeJSON func(interface{}) error) {
 	switch remoteString(msg, "type") {
 	case models.AgentEventGitStatus:
-		_ = writeJSON(agentGitStatusPayload(msg))
+		_ = writeJSON(agentGitStatusPayload(ctx, msg))
 	case models.AgentEventEnvInfo:
-		_ = writeJSON(agentEnvInfoPayload(msg))
+		_ = writeJSON(agentEnvInfoPayload(ctx, msg))
 	}
 }
 
@@ -54,7 +54,7 @@ func agentEnvToolErrorPayload(errorType, requestID string, err error) map[string
 	}
 }
 
-func agentGitStatusPayload(msg map[string]interface{}) map[string]interface{} {
+func agentGitStatusPayload(_ context.Context, msg map[string]interface{}) map[string]interface{} {
 	requestID := remoteString(msg, "request_id")
 	cwd, errPayload, ok := resolveEnvToolCwd(msg, requestID, models.AgentEventGitStatusError)
 	if !ok {
@@ -90,7 +90,7 @@ const (
 // agentGitLogPayload 返回项目仓库最近提交历史(新→旧)。分页 limit/offset 由
 // 调用方给;输出结构化五字段(hash/short/author/date/subject,tab 解析),
 // 供云端能力消费直接取用。非 repo → is_repo=false + 空 entries。
-func agentGitLogPayload(msg map[string]interface{}) map[string]interface{} {
+func agentGitLogPayload(_ context.Context, msg map[string]interface{}) map[string]interface{} {
 	requestID := remoteString(msg, "request_id")
 	cwd, errPayload, ok := resolveEnvToolCwd(msg, requestID, models.AgentEventGitLogError)
 	if !ok {
@@ -148,7 +148,7 @@ func agentGitLogPayload(msg map[string]interface{}) map[string]interface{} {
 	}
 }
 
-func agentEnvInfoPayload(msg map[string]interface{}) map[string]interface{} {
+func agentEnvInfoPayload(_ context.Context, msg map[string]interface{}) map[string]interface{} {
 	requestID := remoteString(msg, "request_id")
 	// env.info probes are global, but we still resolve cwd to confirm the device is
 	// allowed to be inspected (mirrors file.* handler gating) and keep the request honest.

@@ -10,6 +10,7 @@ package services
 // 指临时目录 + 重算 cache 单例。
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -26,7 +27,7 @@ func TestLegacyArmPanicDoesNotKillProcess(t *testing.T) {
 	t.Cleanup(func() { dispatchDetailWithAI, dispatchEnvTools = origDetail, origEnv })
 
 	panicked := make(chan struct{})
-	dispatchDetailWithAI = func(msg map[string]interface{}, writeJSON func(interface{}) error, manager *agentAIManager) {
+	dispatchDetailWithAI = func(_ context.Context, msg map[string]interface{}, writeJSON func(interface{}) error, manager *agentAIManager) {
 		defer close(panicked)
 		panic("boom: injected legacy-arm panic")
 	}
@@ -40,7 +41,7 @@ func TestLegacyArmPanicDoesNotKillProcess(t *testing.T) {
 
 	// ① detail 臂 panic:必须被 recover——裸 go 下本测试二进制直接崩,go test
 	// 以非零退出报告(panic 不是断言失败,恰是本测试要钉死的事故形态)。
-	svc.handleRemoteAgentMessage(map[string]interface{}{"type": "file.read", "request_id": "r1"}, writeJSON)
+	svc.handleRemoteAgentMessage(context.Background(), map[string]interface{}{"type": "file.read", "request_id": "r1"}, writeJSON)
 	select {
 	case <-panicked:
 	case <-time.After(3 * time.Second):
@@ -50,10 +51,10 @@ func TestLegacyArmPanicDoesNotKillProcess(t *testing.T) {
 	// ② panic 之后同一 svc 继续受理后续消息:env 臂假实现应答,证明分发未被执行
 	// 上一条消息的 panic 拖死(读循环存活语义)。
 	answered := make(chan map[string]interface{}, 1)
-	dispatchEnvTools = func(msg map[string]interface{}, writeJSON func(interface{}) error) {
+	dispatchEnvTools = func(_ context.Context, msg map[string]interface{}, writeJSON func(interface{}) error) {
 		answered <- map[string]interface{}{"type": "env.info.result", "request_id": msg["request_id"]}
 	}
-	svc.handleRemoteAgentMessage(map[string]interface{}{"type": "env.info", "request_id": "r2"}, writeJSON)
+	svc.handleRemoteAgentMessage(context.Background(), map[string]interface{}{"type": "env.info", "request_id": "r2"}, writeJSON)
 	select {
 	case m := <-answered:
 		if m["request_id"] != "r2" {

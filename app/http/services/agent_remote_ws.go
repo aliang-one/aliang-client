@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -418,6 +419,11 @@ var (
 )
 
 func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn) error {
+	// sessionCtx 是本条 WS 会话的生命周期：会话退出（断线/重连/停用）即取消，
+	// 让经注册表派发的工具调用（peer_exec 这类真实远端操作）不再 Background
+	// 孤儿到底（2026-11-05 审计盲点 4）。
+	sessionCtx, sessionCancel := context.WithCancel(context.Background())
+	defer sessionCancel()
 	// Write deadline: a stuck write (peer stopped reading / NAT blackhole) must
 	// fail fast instead of blocking forever while holding writeMu.
 	var writeMu sync.Mutex
@@ -640,7 +646,7 @@ func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn) error {
 		// Any inbound traffic confirms the peer is alive; refresh the deadline so
 		// a chatty-but-pong-less peer isn't misclassified as dead.
 		resetReadDeadline()
-		s.handleRemoteAgentMessage(msg, writeJSON)
+		s.handleRemoteAgentMessage(sessionCtx, msg, writeJSON)
 	}
 }
 
@@ -678,7 +684,7 @@ func (s *AgentService) sendAgentHello(writeJSON func(interface{}) error, reason 
 	return nil
 }
 
-func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writeJSON func(interface{}) error) {
+func (s *AgentService) handleRemoteAgentMessage(ctx context.Context, msg map[string]interface{}, writeJSON func(interface{}) error) {
 	msgType := strings.TrimSpace(fmt.Sprint(msg["type"]))
 	if remoteAgentMessageRequiresEnabledDevice(msgType) && !s.remoteControlAllowed() {
 		_ = writeJSON(map[string]interface{}{
@@ -839,10 +845,10 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 		// 旧臂仍绕过 RunWithGuards(响应形状兼容优先,caps 暂不生效),但 panic
 		// 恢复必须兜住:裸 go 的 panic 顺 Go 语义杀全进程——read_file 是云端
 		// 每回合必调的高频工具,一次 payload 解析 panic 就带走所有活 PTY。
-		safeGo("agent_detail", func() { dispatchDetailWithAI(msg, writeJSON, s.ai) })
+		safeGo("agent_detail", func() { dispatchDetailWithAI(ctx, msg, writeJSON, s.ai) })
 	case models.AgentEventGitStatus, models.AgentEventEnvInfo:
 		s.setRemoteConnectionState(true, "online", "")
-		safeGo("agent_envtools", func() { dispatchEnvTools(msg, writeJSON) })
+		safeGo("agent_envtools", func() { dispatchEnvTools(ctx, msg, writeJSON) })
 	case models.AgentEventToolsList:
 		// 元 RPC：回显当前工具注册表（工具清单 + rev），服务端据此做能力
 		// 发现与 rev 漂移检测（heartbeat 带 agent_tools_rev）。
@@ -1014,7 +1020,7 @@ func (s *AgentService) handleRemoteAgentMessage(msg map[string]interface{}, writ
 		// 表即可，无需再动这个 switch。未注册的类型维持原有 unsupported 行为。
 		if t, ok := agentToolRegistry().Get(msgType); ok {
 			s.setRemoteConnectionState(true, "online", "")
-			go tools.RunWithGuards(t, msg, writeJSON)
+			go tools.RunWithGuards(ctx, t, msg, writeJSON)
 			return
 		}
 		_ = writeJSON(map[string]interface{}{
@@ -1139,7 +1145,9 @@ func (s *AgentService) DispatchLocalAI(msg map[string]interface{}, writeJSON fun
 		// Slash-command discovery shares the local chat socket so the web UI can
 		// offer `/` completion. It routes through the same detail handler as the
 		// remote link and is provider-aware (claude vs codex).
-		handleAgentDetailMessageWithAI(msg, writeJSON, s.ai)
+		// 本地 socket 入口没有 WS 会话生命周期可挂，保持无主 ctx（与历史
+		// 行为一致——file.detail 类工具自身有界，无孤儿面）。
+		handleAgentDetailMessageWithAI(context.Background(), msg, writeJSON, s.ai)
 	default:
 		_ = writeJSON(map[string]interface{}{
 			"type":  models.AgentEventAIError,

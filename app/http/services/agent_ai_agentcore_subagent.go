@@ -13,6 +13,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
+	"unicode/utf8"
 
 	"aliang.one/nursorgate/app/agentcore"
 	"aliang.one/nursorgate/common/logger"
@@ -23,7 +25,23 @@ const (
 	agentCoreSubagentCap     = 24
 	agentCoreSubagentDescCap = 500
 	agentCoreSubagentBodyCap = 8 * 1024
+	// agentCoreSubagentTaskCap 是 task 入参的字节封顶（rune 安全截断）。超长
+	// task 会原样进子 run 首轮请求，上游可能直接 400（2026-11-05 审计盲点 5：
+	// 此前只有 TrimSpace 空校验，无上限）。64KB 与 MCP 输出截断同量级。
+	agentCoreSubagentTaskCap = 64 * 1024
 )
+
+// agentCoreSubagentToolCeiling 解析子 agent 桥的内核执行窗口（TimeoutHint）。
+// 与 claude 侧子 agent 看门狗共用同一把旋钮 ALIANG_AI_SUBAGENT_WAIT_CEILING
+// （默认 6h）：两个内核对「子 agent 最多跑多久」应该是一个语义。显式 "0"
+// （关）不产生无上限——回落默认值，内核窗口必须存在（防挂死子 run 拖死父
+// run），只是放宽到 6h 档。
+func agentCoreSubagentToolCeiling() time.Duration {
+	if d := resolveEnvDurationAllowZero("ALIANG_AI_SUBAGENT_WAIT_CEILING", agentAISubagentWaitCeiling); d > 0 {
+		return d
+	}
+	return agentAISubagentWaitCeiling
+}
 
 // agentCoreSubagentDef 是一条子 agent 定义。
 type agentCoreSubagentDef struct {
@@ -188,6 +206,42 @@ type agentCoreSubagentBridge struct {
 	// 上游配额，窗口必须一致——否则子 run 按 200k 兜底压缩，大窗口会话里
 	// 子 agent 反而先撞 prompt too long。
 	contextWindow int
+	// toolCeiling 是内核单工具窗口的覆盖值（TimeoutHint，2026-11-05 审计
+	// 盲点 1）。桥的 Execute 是一整段子 run：默认 10 分钟窗口会把子 run 里
+	// 等手机审批（SLA 24h）连坐掐死。取值见 agentCoreSubagentToolCeiling。
+	toolCeiling time.Duration
+	// skillsBlock 是主 run 同款的技能清单块（agentCoreSkillsPromptBlock 产
+	// 出，装配期求值一次；2026-11-05 审计盲点 3——此前只注主 run System，
+	// 子 registry 明明有 Read，渐进披露对子 agent 却失效）。空串=无副作用。
+	skillsBlock string
+}
+
+// TimeoutHint 覆盖内核默认单工具窗口（agentcore.TimeoutHint）。
+func (b *agentCoreSubagentBridge) TimeoutHint() time.Duration { return b.toolCeiling }
+
+// Parallelizable 声明桥可并发（agentcore.Parallelizable）：子 run 各自独立
+// 组装 registry/Config，互享状态只有 client（并发安全）/env（只读）/审批闭包
+// （agentCoreSubagentTools 已互斥化）/journal（内部带锁）。内核据此把同回合
+// 的多个子 agent 并发跑，对齐 claude Task 原生并行。
+func (b *agentCoreSubagentBridge) Parallelizable() bool { return true }
+
+// subSystem 组装子 run System prompt：基础提示 + 技能清单 + 定义正文。
+// skillsBlock 为空时与历史拼接（prompt + "\n\n" + body）逐字节等价。
+func (b *agentCoreSubagentBridge) subSystem() string {
+	return agentCoreSystemPrompt(b.projectPath) + b.skillsBlock + "\n\n" + b.body
+}
+
+// truncateAgentCoreSubagentTask 把 task 入参封到 maxBytes 字节内（rune 安全：
+// 回退到完整 UTF-8 边界，绝不送非法字节序列上游），尾部附截断标记。
+func truncateAgentCoreSubagentTask(task string, maxBytes int) string {
+	if maxBytes <= 0 || len(task) <= maxBytes {
+		return task
+	}
+	cut := task[:maxBytes]
+	for len(cut) > 0 && !utf8.ValidString(cut) {
+		cut = cut[:len(cut)-1]
+	}
+	return cut + fmt.Sprintf("\n\n[系统提示：任务超长，已在传输层截断——原始 %d 字节，保留前 %d 字节。请按现有内容执行，勿复述本提示]", len(task), len(cut))
 }
 
 func (b *agentCoreSubagentBridge) Name() string        { return b.name }
@@ -296,7 +350,8 @@ func safeOnToolCall(onCall func(tool, summary string, isErr bool), tool, summary
 	onCall(tool, summary, isErr)
 }
 
-// Execute：递归子 run。ctx 继承（内核单工具 10 分钟上限罩住整个子循环）。
+// Execute：递归子 run。ctx 继承（内核单工具窗口由 TimeoutHint 覆盖为
+// toolCeiling，默认 6h——不再是 10 分钟，见 agentCoreSubagentToolCeiling）。
 // 子 Config 显式置零：Emit=nil（子 run 静默，防帧交错进父管道）、Hooks=nil
 // （防窃主 run 插话队列）——spec §3 钉死，勿照抄父 Config。
 func (b *agentCoreSubagentBridge) Execute(ctx context.Context, input map[string]interface{}, _ *agentcore.ToolEnv) (result agentcore.ToolResult) {
@@ -304,6 +359,7 @@ func (b *agentCoreSubagentBridge) Execute(ctx context.Context, input map[string]
 	if strings.TrimSpace(task) == "" {
 		return agentcore.ToolResult{Content: "task 参数必填", IsError: true}
 	}
+	task = truncateAgentCoreSubagentTask(task, agentCoreSubagentTaskCap)
 	var mcpTools []agentcore.Tool
 	if b.mcpTools != nil {
 		mcpTools = b.mcpTools()
@@ -311,7 +367,7 @@ func (b *agentCoreSubagentBridge) Execute(ctx context.Context, input map[string]
 	cfg := &agentcore.Config{
 		Client:  b.client,
 		Model:   agentCoreSubagentModel(b.defModel, b.mainModel),
-		System:  agentCoreSystemPrompt(b.projectPath) + "\n\n" + b.body,
+		System:  b.subSystem(),
 		Tools:   b.subRegistry(mcpTools, true),
 		Env:     b.env,
 		Approve: b.approve,
@@ -376,6 +432,13 @@ func (m *agentAIManager) agentCoreSubagentTools(run agentAIRun,
 	onToolCall := func(tool, summary string, isErr bool) {
 		m.coreJournal.appendTool(run.sessionID, tool, summary, isErr)
 	}
+	// 审批串行由调用方保证：传入的 approve 必须已过 agentCoreApprovalGate
+	// （runAgentCore 对 kernelApprove 统一 wrap）——主层（含对桥工具本身的
+	// 审批）与子 run 内部工具审批共用同一道门，单卡语义+闭包内 run 字段
+	// 无数据竞争（2026-11-06 评审 C4/C8：互斥必须在闭包源头，桥内自包会漏
+	// 掉主层）。本函数不再自行包裹。
+	// 技能清单块装配期求值一次（与主 run 同源同开关；空串=无副作用）。
+	skillsBlock := m.agentCoreSkillsPromptBlock(run)
 	var mcpFactory func() []agentcore.Tool
 	if len(mcpTools) > 0 {
 		mcpFactory = func() []agentcore.Tool { return mcpTools }
@@ -422,6 +485,8 @@ func (m *agentAIManager) agentCoreSubagentTools(run agentAIRun,
 			peerTools:      peerFactory,
 			onToolCall:     onToolCall,
 			contextWindow:  run.contextWindow,
+			toolCeiling:    agentCoreSubagentToolCeiling(),
+			skillsBlock:    skillsBlock,
 		})
 	}
 	logger.Info(fmt.Sprintf("agentcore-subagent: 注入 %d 个子 agent 桥", len(out)))

@@ -1365,7 +1365,14 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		ScopeCheck:  agentCoreScopeCheck(run),
 		ShellPolicy: &agentCoreShellPolicy{run: run},
 	}
-	kernelApprove := m.agentCoreApprove(run, writeJSON)
+	// 审批串行门（agentCoreApprovalGate）：单卡语义要求同一时刻只有一张手机
+	// 审批卡在等。并行子 agent（内核 Parallelizable 批）会让多个 goroutine
+	// 并发进入审批闭包——不互斥既弹多张卡打架，也让 agentCoreApprove 闭包
+	// 内的 run 字段（matchedRuleID/policyVersion 等）产生数据竞争。一个门
+	// 罩住主层（含对子 agent 桥工具本身的审批）与子 run 内部工具审批两条
+	// 链——agentCoreSubagentTools 收到的就是这份已互斥化的闭包。
+	approvalGate := newAgentCoreApprovalGate()
+	kernelApprove := approvalGate.wrap(m.agentCoreApprove(run, writeJSON))
 	// 内核不 import 日志包，这里把宿主 logger 包一层递进去（签名不同：
 	// logger.Warn 是 variadic interface{}）。目前只承载截断这类无事件帧的
 	// 内部决策。
@@ -2107,6 +2114,42 @@ func boundaryApprovalReason(ruleID string) string {
 		return "命令引用了项目目录之外的路径，需要您确认是否放行"
 	}
 	return ""
+}
+
+// agentCoreApprovalGate 把审批闭包串行化到「同一时刻只有一张手机审批卡在
+// 等」。并行子 agent（内核 Parallelizable 批）会让多个 goroutine 并发进入
+// 审批闭包——不互斥既并发弹卡（单卡语义破坏），也让 agentCoreApprove 闭包
+// 内的 run 字段读写产生数据竞争。
+//
+// 等待用带缓冲 chan 信号量实现且 ctx 可感知（2026-11-06 评审 C2/C6）：排队
+// 中的调用者被取消/超时可立即退出，不在锁上盲等。信号量持有期=整个审批
+// 往返，**含手机端人的等待（SLA 24h）**——这是单卡语义的必然代价：并行排
+// 队者的有效审批窗口 = min(自身工具窗口, 前序审批等待时长)，工具窗口
+// （TimeoutHint ceiling）在排队期持续计时。已有到期 ctx 的调用者进闸复核
+// 快速失败，绝不空等后死。
+type agentCoreApprovalGate struct {
+	sem chan struct{}
+}
+
+func newAgentCoreApprovalGate() *agentCoreApprovalGate {
+	return &agentCoreApprovalGate{sem: make(chan struct{}, 1)}
+}
+
+// wrap 把一份审批闭包串行化。
+func (g *agentCoreApprovalGate) wrap(approve func(context.Context, agentcore.ApprovalRequest) (agentcore.ApprovalResponse, error)) func(context.Context, agentcore.ApprovalRequest) (agentcore.ApprovalResponse, error) {
+	return func(ctx context.Context, req agentcore.ApprovalRequest) (agentcore.ApprovalResponse, error) {
+		select {
+		case g.sem <- struct{}{}:
+		case <-ctx.Done():
+			return agentcore.ApprovalResponse{}, fmt.Errorf("审批排队被取消: %w", ctx.Err())
+		}
+		defer func() { <-g.sem }()
+		// 进闸复核：排队期间本调用的窗口可能已被前序审批耗尽。
+		if err := ctx.Err(); err != nil {
+			return agentcore.ApprovalResponse{}, fmt.Errorf("审批窗口已过期: %w", err)
+		}
+		return approve(ctx, req)
+	}
 }
 
 // agentCoreApprove 是内核的 Config.Approve。策略短路与 codex/claude 一致：
