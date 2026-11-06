@@ -322,7 +322,9 @@ func claudeMCPServerInventoryIn(home string) ([]models.AgentMCPServer, []agentMC
 	out := agentMCPServersFromClaudeRaw(userRaw, "user")
 	out = append(out, agentMCPServersFromClaudeRaw(pluginRaw, "plugin")...)
 	// 统一注册表:enabled+合法条目(source=aliang);readAliangMCPRegistryInto
-	// 输出的就是 claude 形态,脱敏复用同一转换器。
+	// 输出的就是 claude 形态,脱敏复用同一转换器。与 codex 侧「托管块不占
+	// 额度」不同,aliang 行与 user+plugin 一起竞争 24 上限——同侧同额度才
+	// 公平;极端超量时截断方向是「少报能力」(fail-safe),不会虚报。
 	registryRaw := map[string]interface{}{}
 	readAliangMCPRegistryInto(home, registryRaw)
 	out = append(out, agentMCPServersFromClaudeRaw(registryRaw, "aliang")...)

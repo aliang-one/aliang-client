@@ -108,7 +108,9 @@ func aliangMCPEntryUsable(_ string, raw map[string]interface{}) (string, bool) {
 //   - 名称触碰平台保留前缀 aliang- / enabled 非 bool / 形态不合法(缺
 //     command/url、未知 transport)→ Warn 后跳过;
 //   - enabled=false(布尔)与 server 值非 map 的条目 → 静默跳过;
-//   - 并入时剥掉注册表专属 enabled 键(claude 形态无此字段,语义已由跳过表达);
+//   - 并入时剥掉注册表专属 enabled 键(claude 形态无此字段,语义已由跳过表达)
+//     并把非空 type 归一为小写(与写通道同口径;防手改 "HTTP" 在清单层被丢、
+//     在 agentcore/flags 层连上的层间差异);
 //   - version 非 1 仅 Warn(前向兼容:不拒读、不迁移、不改写);
 //   - 文件缺失/坏文件零并入(容忍不降级,对齐 readMCPServersFile 姿态)。
 //
@@ -168,6 +170,12 @@ func readAliangMCPRegistryInto(home string, dst map[string]interface{}) int {
 			entry[k] = v
 		}
 		delete(entry, "enabled")
+		// 读侧 type 归一:存在且非空字符串时写回小写(trim 后)结果。写通道
+		// 落盘已同口径归一,此处兜住手改文件——否则 "HTTP" 会在清单层
+		// (精确 switch)被丢、在 agentcore 层(EqualFold)连上,两层各说各话。
+		if tv, ok := entry["type"].(string); ok && strings.TrimSpace(tv) != "" {
+			entry["type"] = strings.ToLower(strings.TrimSpace(tv))
+		}
 		dst[name] = entry
 		count++
 	}

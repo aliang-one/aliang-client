@@ -84,7 +84,7 @@ type AgentMCPServer struct {
 	Command string `json:"command,omitempty"`
 	// URL 是 http/sse 形态的端点(可疑 query 值已打码);stdio 形态省略。
 	URL string `json:"url,omitempty"`
-	// Source 标记来源:claude 为 user|plugin,codex 为 config。
+	// Source 标记来源:claude 为 user|plugin|aliang(统一注册表),codex 为 config。
 	Source string `json:"source,omitempty"`
 }
 
