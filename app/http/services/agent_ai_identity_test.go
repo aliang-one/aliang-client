@@ -142,6 +142,166 @@ printf '%s\n' '{"type":"result","subtype":"success","session_id":"native-claude-
 	}
 }
 
+// v2 面绑定族守卫回归（Task G3）：裸 ai.message 带来的外来 provider（服务端
+// 设备推断翻转 / 客户端误带 / 老服务端）不得把 agentcore 会话改派给 claude
+// CLI 路径——修复前 message() 仅 normalize 无守卫，翻转会被执行路径分派真的
+// 跑成 claude（内核原生 id 被喂给 --resume，confirmBinding mismatch 后会话
+// 从这一回合起永久报错）。已存在会话形态：会话在内存、绑定 confirmed。
+func TestMessageProviderForcedToConfirmedBindingAgentcore(t *testing.T) {
+	setTestAgentHome(t) // journal 根在 newAgentAIManager 构造时解析
+	up, srv := newAgentCoreUpstream(t, agentCoreTextTurn("你好", "，世界"))
+	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
+	t.Setenv("ANTHROPIC_MODEL", "")
+	defer func() { _ = up }()
+
+	// 防真机 PATH 上的 claude 被测试拉起：预置假 claude 计数。修复前翻转会把
+	// 假 claude 跑起来（计数>0），修复后必须保持零。
+	projectPath := setupAgentExecutionProjectForTest(t)
+	setAgentAuthorizedExecutionDirectoriesCache([]string{projectPath})
+	binDir := t.TempDir()
+	counterPath := t.TempDir() + "/launches"
+	t.Setenv("COUNTER_FILE", counterPath)
+	writeFakeExecutable(t, binDir, "claude", `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  printf '%s\n' '2.1.17 (Claude Code)'
+  exit 0
+fi
+printf x >> "$COUNTER_FILE"
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"native-claude-x"}'
+printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"ok"}]}}'
+printf '%s\n' '{"type":"result","subtype":"success","session_id":"native-claude-x","result":"ok"}'
+`)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	m := newAgentAIManager()
+	defer m.closeAll()
+	const sid = "s-msg-guard-agentcore"
+	m.mu.Lock()
+	m.bindings[sid] = agentAIBindingRecord{
+		ConversationID:  sid,
+		Provider:        "agentcore",
+		NativeSessionID: "agentcore-444-1",
+		State:           "confirmed",
+		BindingVersion:  1,
+	}
+	m.sessions[sid] = &agentAISession{
+		id:              sid,
+		provider:        "agentcore",
+		model:           "glm-5.2",
+		resumeSessionID: "agentcore-444-1",
+		history:         []agentAIMessage{{Role: "user", Content: "打个招呼"}},
+	}
+	m.mu.Unlock()
+
+	mu, events, writer := captureAIWriter(t)
+	m.message(map[string]interface{}{
+		"session_id":   sid,
+		"message_id":   "msg-guard-1",
+		"content":      "再打个招呼",
+		"provider":     "claude_code",
+		"model":        "glm-5.2",
+		"project_path": projectPath,
+	}, writer)
+
+	waitForAgentEvent(t, mu, events, models.AgentEventAIDone, func(event map[string]interface{}) bool {
+		return remoteString(event, "run_id") == "msg-guard-1"
+	})
+	if got := len(up.requests()); got != 1 {
+		t.Fatalf("内核上游请求数 = %d, want 1（守卫必须把执行改派回 agentcore 内核）", got)
+	}
+	if raw, err := os.ReadFile(counterPath); err == nil && len(raw) > 0 {
+		t.Fatalf("claude 被拉起 %d 次，绑定族守卫未生效", len(raw))
+	}
+	mu.Lock()
+	var errs []map[string]interface{}
+	for _, f := range *events {
+		if tp, _ := f["type"].(string); tp == models.AgentEventAIError {
+			errs = append(errs, f)
+		}
+	}
+	mu.Unlock()
+	if len(errs) != 0 {
+		t.Fatalf("ai.error 数量 = %d, want 0（守卫只改写 provider 不报错）: %v", len(errs), errs)
+	}
+}
+
+// 守卫对称性（Task G3）：绑定 confirmed 为 claudecode 的会话收到
+// provider=agentcore 的 ai.message，必须仍走 claude CLI 并 --resume 绑定的
+// 原生 id——与 runStart 守卫（TestRunStartProviderForcedToConfirmedBinding）
+// 同一断言面，只是入口换成裸 ai.message。
+func TestMessageProviderForcedToConfirmedBindingClaude(t *testing.T) {
+	setTestAgentHome(t)
+	up, srv := newAgentCoreUpstream(t, agentCoreTextTurn("不该", "被调用"))
+	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
+	t.Setenv("ANTHROPIC_MODEL", "")
+	defer func() { _ = up }()
+
+	projectPath := setupAgentExecutionProjectForTest(t)
+	setAgentAuthorizedExecutionDirectoriesCache([]string{projectPath})
+	binDir := t.TempDir()
+	argsPath := t.TempDir() + "/args"
+	t.Setenv("ARGS_FILE", argsPath)
+	writeFakeExecutable(t, binDir, "claude", `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  printf '%s\n' '2.1.17 (Claude Code)'
+  exit 0
+fi
+printf '%s\n' "$@" >> "$ARGS_FILE"
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"native-claude-1"}'
+printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"ok"}]}}'
+printf '%s\n' '{"type":"result","subtype":"success","session_id":"native-claude-1","result":"ok"}'
+`)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	m := newAgentAIManager()
+	defer m.closeAll()
+	const sid = "s-msg-guard-claude"
+	m.mu.Lock()
+	m.bindings[sid] = agentAIBindingRecord{
+		ConversationID:  sid,
+		Provider:        "claudecode",
+		NativeSessionID: "native-claude-1",
+		State:           "confirmed",
+		BindingVersion:  1,
+	}
+	m.sessions[sid] = &agentAISession{
+		id:              sid,
+		provider:        "claudecode",
+		model:           "glm-5.2",
+		resumeSessionID: "native-claude-1",
+		history:         []agentAIMessage{{Role: "user", Content: "hello"}},
+	}
+	m.mu.Unlock()
+
+	mu, events, writer := captureAIWriter(t)
+	m.message(map[string]interface{}{
+		"session_id":   sid,
+		"message_id":   "msg-guard-2",
+		"content":      "hello again",
+		"provider":     "agentcore",
+		"model":        "glm-5.2",
+		"project_path": projectPath,
+	}, writer)
+
+	waitForAgentEvent(t, mu, events, models.AgentEventAIDone, func(event map[string]interface{}) bool {
+		return remoteString(event, "run_id") == "msg-guard-2"
+	})
+	raw, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatalf("read claude args: %v（守卫必须把执行改派回 claude CLI）", err)
+	}
+	args := string(raw)
+	if !strings.Contains(args, "--resume\nnative-claude-1") {
+		t.Fatalf("claude args = %q, want --resume native-claude-1", args)
+	}
+	if strings.Contains(args, "--session-id") {
+		t.Fatalf("claude args = %q, must not pre-reserve a new session id", args)
+	}
+	if got := len(up.requests()); got != 0 {
+		t.Fatalf("内核上游请求数 = %d, want 0（翻转不得把 claude 会话改派给内核）", got)
+	}
+}
+
 func TestManagedInventoryUsesBindingAlias(t *testing.T) {
 	manager := newAgentAIManager()
 	manager.bindings["ai-canonical"] = agentAIBindingRecord{

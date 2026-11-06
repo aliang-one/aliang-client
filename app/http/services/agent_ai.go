@@ -1856,6 +1856,10 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 	surface := normalizeAgentAISurface(remoteString(msg, "surface"))
 	claudePolicy := parseAgentAIClaudeRemotePolicy(msg)
 	history := remoteAgentAIHistory(msg)
+	// 载荷 transcript 判定必须在 initial_context 拼接之前——initial_context 是
+	// 会话级上下文不是对话历史，journal 回装的「载荷没带货载历史」判定以这里
+	// 为准（与 message() 懒建分支的 len(lazyHistory)==0 判点同位）。
+	payloadHasTranscript := len(history) > 0
 	if initialContext != "" {
 		history = append([]agentAIMessage{{
 			Role:      "system",
@@ -2009,14 +2013,39 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 	// 会把持久化的开关「视为未设置」。逐键兜底（评审 F3：单键 create 的兄弟
 	// 侧也要兜底）；载荷显式带键时以载荷为权威。
 	if provider == "agentcore" && m.coreJournal != nil &&
-		(!disabledMCPServersSet || !disabledSkillsSet) {
-		if _, head, herr := readAgentCoreJournalHistoryFrom(m.coreJournal.dir, sessionID); herr == nil {
+		(!disabledMCPServersSet || !disabledSkillsSet ||
+			(!truncateActive && !payloadHasTranscript)) {
+		hist, head, herr := readAgentCoreJournalHistoryFrom(m.coreJournal.dir, sessionID)
+		if herr == nil {
 			if !disabledMCPServersSet {
 				disabledMCPServers = head.disabledMCPServers
 			}
 			if !disabledSkillsSet {
 				disabledSkills = head.disabledSkills
 			}
+			// 重启失忆修复（2026-11-05）：create 重建内存会话时回装 journal 历史。
+			// 读侧与 message() 懒建分支共用 readAgentCoreJournalHistoryFrom
+			// （msg/turn 行进历史、tool/approval/end 行跳过、文件顺序即历史顺序，
+			// 完全一致）；装回后下方的 limits 截断照常执行（同懒建「装回后裁剪」
+			// 口径）。载荷带 transcript 时以载荷为准（既有语义）；撤回 truncate
+			// 路径的 history 已按截断后的 journal 重建，不二次回装。
+			if !truncateActive && !payloadHasTranscript && len(hist) > 0 {
+				// create 的 initial_context 拼接点在解析期（早于懒建的拼接点），
+				// 回装不能把它冲掉——按解析期的同款构造还原到首部。
+				if initialContext != "" {
+					hist = append([]agentAIMessage{{
+						Role:      "system",
+						MessageID: "initial_context",
+						Content:   initialContext,
+						CreatedAt: time.Now().UTC(),
+					}}, hist...)
+				}
+				history = hist
+			}
+		} else if !truncateActive && !payloadHasTranscript && !errors.Is(herr, os.ErrNotExist) {
+			// 只在历史确实指望 journal 时才告警：载荷自带 transcript 的会话历史
+			// 不缺，journal 读失败只影响开关兜底（镜像懒建分支的告警门）。
+			logger.Warn(fmt.Sprintf("ai.session.create: journal history restore failed session=%s err=%v", sessionID, herr))
 		}
 	}
 	newHistoryMessages, newHistoryChars := agentAIHistoryLimits(provider, contextWindow)
@@ -2076,6 +2105,25 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 	if messageID == "" {
 		messageID = sessionID
 	}
+	// 绑定族守卫（镜像 runStart 的先例，见 runStart 内同款注释；Task G3
+	// 2026-11-05）：绑定已 confirmed 时，原生会话 id 归 persisted.Provider 所有。
+	// v2 面（裸 ai.message，不经 runStart）此前没有这道守卫——服务端设备推断
+	// 翻转 / 客户端误带 / 老服务端带来的 provider 会把 agentcore 会话改派给
+	// claude CLI 路径（内核原生 id 被喂给 --resume，confirmBinding 必然
+	// mismatch，会话从这一回合起永久报错），反方向同理。语义与 runStart 完全
+	// 对齐：只改写 provider、不拒绝消息；reserved 绑定不触发（fresh 铸造/预留
+	// 是它的正当路径）；claude/claudecode 经 providersEquivalent 视为同族；
+	// provider 缺省也强制（缺省但 tool 是外来值时同样会走错 CLI）。
+	// 位置在会话解析（含懒建）之前——v3 路径 runStart 也是在把 msg 交给
+	// message() 之前改写，懒建分支因此同样受保护；新会话（无绑定）零影响。
+	m.mu.Lock()
+	if persisted := m.bindings[sessionID]; persisted.NativeSessionID != "" && persisted.State == "confirmed" {
+		if requested := firstNonEmpty(remoteString(msg, "provider"), remoteString(msg, "tool")); !providersEquivalent(requested, persisted.Provider) {
+			msg["provider"] = persisted.Provider
+			msg["tool"] = persisted.Provider
+		}
+	}
+	m.mu.Unlock()
 	// #5: a fork (re-planning exploration) session runs READ-ONLY so the AI can't
 	// mutate the workspace during exploration. Read the flag from the payload
 	// here (the session object is resolved only later); the atomic run.start path
