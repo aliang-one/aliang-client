@@ -162,6 +162,12 @@ func registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/agent/file-access/settings", agentHandler.HandleFileAccessSettings)
 	// MCP 与技能只读报告：核心侧 routes.go 同名注册透传（双注册教训同上）。
 	mux.HandleFunc("/api/agent/integrations", agentHandler.HandleAgentIntegrations)
+	// 统一 MCP 注册表三端点；双注册纪律——core routes.go + 本 mux 缺任一侧
+	// =404（2026-10-21 教训）。{name} 用方法前缀模式（PUT/DELETE 分流到不同
+	// handler，同 core 侧写法）。
+	mux.HandleFunc("/api/agent/mcp", agentHandler.HandleAliangMCPRegistry)
+	mux.HandleFunc("PUT /api/agent/mcp/servers/{name}", agentHandler.HandleAliangMCPServerPut)
+	mux.HandleFunc("DELETE /api/agent/mcp/servers/{name}", agentHandler.HandleAliangMCPServerDelete)
 	// 仪表盘数据面端点：核心进程会把这两个请求代理到本 runtime，缺注册会让
 	// 仪表盘 Agent 页的「远程终端」列表和「进行中」徽章永远拿不到数据
 	// （2026-10-21 liang-dev 实测 404 透传）。

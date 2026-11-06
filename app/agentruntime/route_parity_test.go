@@ -36,8 +36,10 @@ func TestAgentRouteParityBetweenCoreAndUserAgent(t *testing.T) {
 
 	core := extractAgentRoutePaths(t, string(coreSrc),
 		regexp.MustCompile(`register\("(?:[A-Za-z]+ )?(/(?:api/agent|mcp/aliang)[^"]*)"`))
+	// agent 侧同样剥掉可选方法前缀（mcp 注册表 {name} 路径 PUT/DELETE 分流到
+	// 不同 handler，须方法前缀注册；比对口径与 core 侧对称，路径集合才是真值）。
 	agent := extractAgentRoutePaths(t, string(agentSrc),
-		regexp.MustCompile(`mux\.HandleFunc\("(/(?:api/agent|mcp/aliang)[^"]*)"`))
+		regexp.MustCompile(`mux\.HandleFunc\("(?:[A-Za-z]+ )?(/(?:api/agent|mcp/aliang)[^"]*)"`))
 
 	var drifted []string
 	for path := range core {
