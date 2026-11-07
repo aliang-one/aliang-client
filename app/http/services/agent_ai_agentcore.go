@@ -1386,6 +1386,7 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		emit:      emitFrame,
 		sessionID: run.sessionID,
 		messageID: run.messageID,
+		journal:   m.coreJournal,
 	}
 	if run.subagents == nil {
 		subagentMirror = nil

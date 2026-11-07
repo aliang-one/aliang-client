@@ -257,6 +257,9 @@ type agentCoreSubagentMirror struct {
 	sessionID string
 	messageID string
 	seq       atomic.Int64
+	// journal 是主 run 的调用记录 journal（nil=不落盘，既有测试路径）。tracked
+	// 子 run 的 start/finish/工具行按 task_id 关联落盘，供读侧聚合子 agent 轨迹。
+	journal *agentCoreJournal
 }
 
 // start 登记 started。tracked=false 表示 registry 拒收（cap 满），后续
@@ -266,12 +269,17 @@ func (m *agentCoreSubagentMirror) start(bridgeName, description string) (string,
 	if m == nil {
 		return "", false
 	}
-	taskID := fmt.Sprintf("agentcore-%s-%d", bridgeName, m.seq.Add(1))
+	// taskID 含回合 messageID（spec H1）：mirror 每回合新建、seq 归零——裸 id
+	// 跨回合重号会让 journal/读侧聚合串线，messageID 段消歧。
+	taskID := fmt.Sprintf("agentcore-%s-%s-%d", m.messageID, bridgeName, m.seq.Add(1))
 	// registry 以 toolUseID 为主键且非空必填——agentcore 侧没有 CC 的
 	// tool_use_id，taskID 兼任（progress/finish 经 taskAliases 解析）。
 	record, ok := m.registry.start(taskID, taskID, m.messageID, description, bridgeName, 1, "", false, time.Now())
 	if !ok {
 		return taskID, false
+	}
+	if m.journal != nil {
+		m.journal.appendSubagentStart(m.sessionID, taskID, bridgeName, description)
 	}
 	m.activity.beginSubagent()
 	m.emitRecord(record)
@@ -318,8 +326,29 @@ func (m *agentCoreSubagentMirror) finish(bridgeName, taskID, phase, summary stri
 			record.EndedAt = time.Now()
 		}
 		m.emitRecord(record)
+		// journal finish 行与帧同生命周期（registry ok 之内）：summary 截
+		// 200 rune，result 留子 run 最终文本全文（64KB rune 安全封顶）。裸
+		// 字节截断会在切点劈开多字节 rune——journal 是持久化留痕，绝不能
+		// 送非法字节序列。
+		if m.journal != nil {
+			m.journal.appendSubagentFinish(m.sessionID, taskID, phase,
+				truncateAgentText(summary, 200),
+				truncateAgentCoreMCPOutputRuneSafe(summary, 64*1024),
+				totalTokens, ms)
+		}
 	}
 	m.activity.endSubagent()
+}
+
+// appendToolLine 落子 agent 的工具轨迹行（kind=tool + subagent_task_id）。
+// 桥 Execute 的 toolHook 在 tracked 分支用它替代原 b.onToolCall——同一工具
+// 调用只落一行（带关联键），读侧按 task_id 聚合，不与主会话工具混流。
+// taskID 空串（未 tracked）守卫兜底。
+func (m *agentCoreSubagentMirror) appendToolLine(taskID, tool, summary string, isErr bool) {
+	if m == nil || m.journal == nil || taskID == "" {
+		return
+	}
+	m.journal.appendSubagentTool(m.sessionID, taskID, tool, summary, isErr)
 }
 
 // emitRecord 与内核帧同构：JSON+换行（宿主按行读），session_id 由
@@ -344,6 +373,22 @@ func truncateAgentCoreSubagentTask(task string, maxBytes int) string {
 		cut = cut[:len(cut)-1]
 	}
 	return cut + fmt.Sprintf("\n\n[系统提示：任务超长，已在传输层截断——原始 %d 字节，保留前 %d 字节。请按现有内容执行，勿复述本提示]", len(task), len(cut))
+}
+
+// truncateAgentCoreMCPOutputRuneSafe 是 truncateAgentCoreSubagentTask 的去标
+// 记版：字节封顶 + 回退 UTF-8 边界（复用同一 rune 回退循环），截断尾巴不带
+// 提示标记。journal 的子 agent result 落盘用它——持久化留痕绝不送非法字节
+// 序列（裸字节截断会把切点劈进多字节 rune，读侧解析即 U+FFFD 垃圾）。
+// maxBytes<=0 或 len(s)<=maxBytes 原样返回。
+func truncateAgentCoreMCPOutputRuneSafe(s string, maxBytes int) string {
+	if maxBytes <= 0 || len(s) <= maxBytes {
+		return s
+	}
+	cut := s[:maxBytes]
+	for len(cut) > 0 && !utf8.ValidString(cut) {
+		cut = cut[:len(cut)-1]
+	}
+	return cut
 }
 
 func (b *agentCoreSubagentBridge) Name() string        { return b.name }
@@ -468,27 +513,31 @@ func (b *agentCoreSubagentBridge) Execute(ctx context.Context, input map[string]
 		mcpTools = b.mcpTools()
 	}
 	// 状态镜像：started → progress（子 run 工具调用驱动）→ completed|failed。
-	// 终态在 defer 里发（text/isErr 就绪后）；journal 闭包与 progress 组成
-	// 同一装饰钩子——journal 落行语义不变，镜像只在接线时叠加。
+	// 终态在 defer 里发（text/isErr 就绪后）。defer 只在 tracked 时挂——
+	// registry 拒收（cap 满/nil）时不 finish：begin/end 配平靠 start 的
+	// tracked 短路保证，孤儿 finish 行还会骗读侧「有终态无起点」。
+	// journal 闭包与 progress 组成同一装饰钩子——tracked 时子 run 内置工具
+	// 改走 appendToolLine（带 subagent_task_id 关联键），未 tracked 保持
+	// b.onToolCall 原样（主会话普通 tool 行）。
 	startedAt := time.Now()
 	isErr := false
 	text := ""
 	var totalTokens int64
 	subTaskID, tracked := b.mirror.start(b.name, b.description)
 	var toolUses atomic.Int64
-	defer func() {
-		phase := "completed"
-		if isErr {
-			phase = "failed"
-		}
-		b.mirror.finish(b.name, subTaskID, phase, text, time.Since(startedAt), totalTokens)
-	}()
+	if tracked {
+		defer func() {
+			phase := "completed"
+			if isErr {
+				phase = "failed"
+			}
+			b.mirror.finish(b.name, subTaskID, phase, text, time.Since(startedAt), totalTokens)
+		}()
+	}
 	var toolHook func(tool, summary string, isErr bool)
 	if tracked {
 		toolHook = func(tool, summary string, isErr bool) {
-			if b.onToolCall != nil {
-				b.onToolCall(tool, summary, isErr)
-			}
+			b.mirror.appendToolLine(subTaskID, tool, summary, isErr)
 			n := int(toolUses.Add(1))
 			b.mirror.progress(subTaskID, fmt.Sprintf("工具 #%d: %s", n, tool), tool, n)
 		}

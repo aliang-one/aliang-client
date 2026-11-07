@@ -15,10 +15,13 @@ package services
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"aliang.one/nursorgate/app/agentcore"
 )
@@ -138,8 +141,8 @@ func TestAgentCoreSubagentMirrorLifecycle(t *testing.T) {
 	if first["subagent_type"] != "researcher" || first["description"] != "加密解密调研" {
 		t.Fatalf("started 帧身份错误: %v", first)
 	}
-	if tid, _ := first["task_id"].(string); !strings.HasPrefix(tid, "agentcore-researcher-") {
-		t.Fatalf("task_id 必须带 agentcore 前缀+桥名（并行去串线）: %v", tid)
+	if tid, _ := first["task_id"].(string); !strings.HasPrefix(tid, "agentcore-msg-mirror-researcher-") {
+		t.Fatalf("task_id 必须带 agentcore 前缀+回合 messageID+桥名（跨回合消歧/并行去串线）: %v", tid)
 	}
 	if depth, _ := first["spawn_depth"].(float64); depth != 1 {
 		t.Fatalf("spawn_depth = %v, want 1", first["spawn_depth"])
@@ -289,4 +292,209 @@ func seenSlice(m map[string]bool) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// newMirrorWithJournalForTest 构造带 journal 的 mirror（emit 不接——本组测试
+// 只验落盘，不验帧）。返回 mirror 与 journal 目录。
+func newMirrorWithJournalForTest(t *testing.T, sessionID, messageID string) (*agentCoreSubagentMirror, string) {
+	t.Helper()
+	dir := t.TempDir()
+	return &agentCoreSubagentMirror{
+		registry:  newAgentAISubagentRegistry(),
+		activity:  &agentAIActivity{},
+		sessionID: sessionID,
+		messageID: messageID,
+		journal:   newAgentCoreJournal(dir),
+	}, dir
+}
+
+// TestAgentCoreSubagentMirrorJournalsLifecycle：tracked 子 run 的生命周期落
+// journal——start 行（kind=subagent/event=start）→ 子 run 内置工具关联行
+// （kind=tool + subagent_task_id，该路径有 Read 调用）→ finish 行（result=
+// 子 run 最终文本）。tracked 模式下子 run 内置工具绝不落无标记 tool 行
+// （防双行：原 b.onToolCall 与 appendToolLine 只能走其一）。
+func TestAgentCoreSubagentMirrorJournalsLifecycle(t *testing.T) {
+	finalText := "调研结论：AES-GCM 为宜"
+	toolTurn := `{"type":"message_start","message":{"id":"msg_p","model":"glm-5.2"}}` + "\n\n" +
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"u1","name":"Read"}}` + "\n\n" +
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}` + "\n\n" +
+		`data: {"type":"content_block_stop","index":0}` + "\n\n" +
+		`data: {"type":"message_delta","delta":{"stop_reason":"tool_use"}}`
+	endTurn := `{"type":"message_start","message":{"id":"msg_e","model":"glm-5.2","usage":{"input_tokens":120}}}` + "\n\n" +
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}` + "\n\n" +
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"` + finalText + `"}}` + "\n\n" +
+		`data: {"type":"content_block_stop","index":0}` + "\n\n" +
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":120,"output_tokens":45}}`
+	up, srv := newAgentCoreUpstream(t, toolTurn, endTurn)
+	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
+	t.Setenv("ANTHROPIC_MODEL", "")
+	_ = up
+
+	mirror, dir := newMirrorWithJournalForTest(t, "sess-j", "msg-j")
+	client := agentcore.NewClient(agentCoreBaseURL())
+	bridge := &agentCoreSubagentBridge{
+		client:      client,
+		mainModel:   "glm-5.2",
+		name:        "researcher",
+		description: "加密解密调研",
+		body:        "你是调研员。",
+		projectPath: t.TempDir(),
+		env:         &agentcore.ToolEnv{ProjectPath: t.TempDir()},
+		approve: func(ctx context.Context, call agentcore.ApprovalRequest) (agentcore.ApprovalResponse, error) {
+			return agentcore.ApprovalResponse{Approved: true}, nil
+		},
+		onToolCall: func(tool, summary string, isErr bool) {},
+		mirror:     mirror,
+	}
+	if res := bridge.Execute(context.Background(), map[string]interface{}{"task": "调研加密解密"}, nil); res.IsError {
+		t.Fatalf("Execute 失败: %+v", res)
+	}
+
+	lines := readJournalLines(t, dir, "sess-j")
+	var start, finish map[string]interface{}
+	var taggedToolRows []map[string]interface{}
+	for _, m := range lines {
+		switch m["kind"] {
+		case "subagent":
+			if m["event"] == "start" {
+				start = m
+			} else if m["event"] == "finish" {
+				finish = m
+			}
+		case "tool":
+			if _, tagged := m["subagent_task_id"]; tagged {
+				taggedToolRows = append(taggedToolRows, m)
+			} else if m["tool"] == "Read" {
+				t.Fatalf("tracked 模式下子 run 内置工具不得落无标记 tool 行（journal 双行）: %v", m)
+			}
+		}
+	}
+	if start == nil || finish == nil {
+		t.Fatalf("start/finish 行缺失: %v", lines)
+	}
+	taskID, _ := start["task_id"].(string)
+	if !strings.HasPrefix(taskID, "agentcore-msg-j-researcher-") {
+		t.Fatalf("journal task_id 缺回合 messageID 消歧: %v", taskID)
+	}
+	if start["name"] != "researcher" || start["description"] != "加密解密调研" {
+		t.Fatalf("start 行身份字段错: %v", start)
+	}
+	if finish["task_id"] != taskID || finish["status"] != "completed" {
+		t.Fatalf("finish 行键错: %v", finish)
+	}
+	if result, _ := finish["result"].(string); result != finalText {
+		t.Fatalf("finish result = %q, want 子 run 最终文本 %q", result, finalText)
+	}
+	if summary, _ := finish["summary"].(string); summary != finalText {
+		t.Fatalf("finish summary = %q, want 最终文本（200 rune 内不截）: %q", summary, finalText)
+	}
+	if tokens, _ := finish["total_tokens"].(float64); tokens != 165 {
+		t.Fatalf("finish total_tokens = %v, want 165", finish["total_tokens"])
+	}
+	if len(taggedToolRows) == 0 {
+		t.Fatalf("缺 subagent_task_id 关联 tool 行（子 run 有 Read 调用）: %v", lines)
+	}
+	sawRead := false
+	for _, row := range taggedToolRows {
+		if row["subagent_task_id"] != taskID {
+			t.Fatalf("关联行 task_id 不匹配: %v", row)
+		}
+		if row["tool"] == "Read" {
+			sawRead = true
+		}
+	}
+	if !sawRead {
+		t.Fatalf("Read 工具的关联行缺失: %v", taggedToolRows)
+	}
+	// activity 配平不受 journal 接线影响。
+	if got := mirror.activity.activeSubagents.Load(); got != 0 {
+		t.Fatalf("activeSubagents = %d, want 0", got)
+	}
+}
+
+// TestAgentCoreSubagentMirrorTaskIDDisambiguatesPerMessage：两个 mirror 实例
+// （不同回合 messageID）各 start 同名桥，返回的 taskID 必须不同（spec H1：
+// mirror 每回合新建、seq 归零——裸 id 跨回合重号会让读侧聚合串线）。
+func TestAgentCoreSubagentMirrorTaskIDDisambiguatesPerMessage(t *testing.T) {
+	m1 := newMirrorForTest(t, func([]byte) error { return nil })
+	m2 := &agentCoreSubagentMirror{
+		registry:  newAgentAISubagentRegistry(),
+		activity:  &agentAIActivity{},
+		sessionID: "sess-mirror",
+		messageID: "msg-other",
+	}
+	id1, ok1 := m1.start("researcher", "调研")
+	id2, ok2 := m2.start("researcher", "调研")
+	if !ok1 || !ok2 {
+		t.Fatalf("start 未追踪: %q/%v %q/%v", id1, ok1, id2, ok2)
+	}
+	if id1 == id2 {
+		t.Fatalf("跨回合 taskID 重号: %q == %q", id1, id2)
+	}
+	if !strings.HasPrefix(id1, "agentcore-msg-mirror-researcher-") || !strings.HasPrefix(id2, "agentcore-msg-other-researcher-") {
+		t.Fatalf("taskID 形态缺 messageID 段: %q / %q", id1, id2)
+	}
+}
+
+// TestAgentCoreSubagentMirrorUntrackedNoJournal：registry 拒收（此处 nil 守卫
+// 直接返 false）→ tracked=false → journal 必须**零**落盘（无 start/finish/
+// 工具行）——拒收的轨迹不写半行，孤儿行比丢轨迹更伤读侧聚合。
+func TestAgentCoreSubagentMirrorUntrackedNoJournal(t *testing.T) {
+	dir := t.TempDir()
+	mirror := &agentCoreSubagentMirror{
+		registry:  nil, // 拒收：nil 接收者守卫直接返 false
+		activity:  &agentAIActivity{},
+		sessionID: "sess-cap",
+		messageID: "m",
+		journal:   newAgentCoreJournal(dir),
+	}
+	bridge := &agentCoreSubagentBridge{
+		client:    agentcore.NewClient("http://127.0.0.1:1"),
+		mainModel: "glm-5.2",
+		name:      "researcher",
+		body:      "x",
+		mirror:    mirror,
+	}
+	res := bridge.Execute(context.Background(), map[string]interface{}{"task": "调研"}, nil)
+	if !res.IsError {
+		t.Fatalf("不可达上游应失败")
+	}
+	if _, err := os.Stat(filepath.Join(dir, agentCoreJournalFileName("sess-cap"))); !os.IsNotExist(err) {
+		t.Fatalf("拒收场景 journal 必须零落盘: err=%v", err)
+	}
+	if got := mirror.activity.activeSubagents.Load(); got != 0 {
+		t.Fatalf("拒收场景不得动 activity 计数: %d", got)
+	}
+}
+
+// TestTruncateAgentCoreMCPOutputRuneSafe：journal result 的 rune 安全截断——
+// 字节封顶回退 UTF-8 边界（绝不送非法字节序列），去标记版。
+func TestTruncateAgentCoreMCPOutputRuneSafe(t *testing.T) {
+	s := "密钥调研结论：AES-GCM 模式为宜，注意 IV 只用一次。"
+	cut := truncateAgentCoreMCPOutputRuneSafe(s, 10)
+	if len(cut) > 10 {
+		t.Fatalf("截断超字节上限: len=%d", len(cut))
+	}
+	if !utf8.ValidString(cut) || strings.ContainsRune(cut, utf8.RuneError) {
+		t.Fatalf("截断产出非法字节/U+FFFD: %q", cut)
+	}
+	if !strings.HasPrefix(s, cut) {
+		t.Fatalf("截断结果必须是原文前缀: %q", cut)
+	}
+	// 恰好多字节边界内：6 字节=「中文」完整；5 字节劈开「文」→ 回退到「中」。
+	if got := truncateAgentCoreMCPOutputRuneSafe("中文", 6); got != "中文" {
+		t.Fatalf("完整多字节串应原样: %q", got)
+	}
+	if got := truncateAgentCoreMCPOutputRuneSafe("中文", 5); got != "中" {
+		t.Fatalf("边界回退错误: %q", got)
+	}
+	if got := truncateAgentCoreMCPOutputRuneSafe("短文", 100); got != "短文" {
+		t.Fatalf("短文应原样: %q", got)
+	}
+	if got := truncateAgentCoreMCPOutputRuneSafe("短文", 0); got != "短文" {
+		t.Fatalf("maxBytes<=0 应原样: %q", got)
+	}
+	if got := truncateAgentCoreMCPOutputRuneSafe("短文", -5); got != "短文" {
+		t.Fatalf("负 maxBytes 应原样: %q", got)
+	}
 }
