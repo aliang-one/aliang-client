@@ -108,6 +108,10 @@ func SplitTarget(target string) (host, port string, isDomain bool, err error) {
 	}
 	h, p, splitErr := net.SplitHostPort(target)
 	if splitErr != nil {
+		if net.ParseIP(target) != nil {
+			// 裸 IP(无端口)不是域名:返回 isDomain=false,防 Task 6 构 Metadata 时误送去解析。
+			return target, "", false, nil
+		}
 		return target, "", true, nil // 裸域名
 	}
 	if net.ParseIP(h) != nil {

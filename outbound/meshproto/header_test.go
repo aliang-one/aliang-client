@@ -199,8 +199,16 @@ func TestSplitHostPort(t *testing.T) {
 	if err != nil || host != "10.1.2.3" || port != "8080" || isDomain {
 		t.Fatalf("SplitTarget ip: %v %q %q %v", err, host, port, isDomain)
 	}
-	if _, _, _, err := SplitTarget(DNSTarget); err != nil {
+	host, port, isDomain, err = SplitTarget("10.1.2.3")
+	if err != nil || host != "10.1.2.3" || port != "" || isDomain {
+		t.Fatalf("SplitTarget bare ip: %v %q %q %v", err, host, port, isDomain)
+	}
+	host, port, isDomain, err = SplitTarget(DNSTarget)
+	if err != nil {
 		t.Fatalf("SplitTarget dns: %v", err)
+	}
+	if host != "" || port != "" || isDomain {
+		t.Fatalf("SplitTarget dns must return zero values: %q %q %v", host, port, isDomain)
 	}
 }
 
