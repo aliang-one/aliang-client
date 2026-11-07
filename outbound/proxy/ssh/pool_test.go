@@ -165,7 +165,7 @@ func TestPoolRebuildAfterClientDeath(t *testing.T) {
 		t.Fatal("acquire must return a rebuilt client, not the dead one")
 	}
 	ch.mu.Lock()
-	fresh := ch.client == cl2 && ch.clientErr == nil && ch.failCount == 0
+	fresh := ch.client == cl2 && ch.clientErr == nil && ch.failCount == 0 && ch.lastFail.IsZero()
 	ch.mu.Unlock()
 	if !fresh {
 		t.Fatal("chain must hold the fresh client with clientErr cleared and failCount reset")
@@ -245,6 +245,145 @@ func TestChainBackoffSchedule(t *testing.T) {
 	if dials != 2 {
 		t.Fatalf("dials = %d, want 2", dials)
 	}
+}
+
+// TestPoolSkipsBackingOffChain 钉 spec §4「其余链接流量」:链 0 死且重建
+// 失败进入退避(active=0 恒最小),链 1/2 健康(active=2)——若选链只按
+// 严格最少活跃,死链 0 会吸走全部新连接;必须跳过退避窗口中的链。
+// 修前此用例必红(审查者实证:健康链在场时 ok=0/failed=6)。
+func TestPoolSkipsBackingOffChain(t *testing.T) {
+	baseline := runtime.NumGoroutine()
+
+	dials := make([]int, 3)
+	built := make([]*cascadeClient, 3)
+	p := newPool(3, func(i int) func(context.Context) (*cascadeClient, error) {
+		return func(context.Context) (*cascadeClient, error) {
+			dials[i]++
+			if i == 0 {
+				return nil, errors.New("chain 0 down")
+			}
+			built[i] = fakeCascadeClient()
+			return built[i], nil
+		}
+	})
+	defer p.close()
+
+	// 链 0 重建失败进入退避(死链,active=0)。
+	if _, err := p.chains[0].get(context.Background()); err == nil {
+		t.Fatal("chain 0 dialFn must fail to prime backoff")
+	}
+	// 健康链各背 2 个在途 channel:严格最少活跃下 active=0 的死链必被选中。
+	p.chains[1].addActive()
+	p.chains[1].addActive()
+	p.chains[2].addActive()
+	p.chains[2].addActive()
+
+	picked := make(map[*chain]int)
+	for n := 0; n < 6; n++ {
+		cl, ch, err := p.acquire(context.Background())
+		if err != nil {
+			t.Fatalf("acquire %d must succeed with healthy chains present, got: %v", n+1, err)
+		}
+		if ch == p.chains[0] {
+			t.Fatalf("acquire %d landed on the backing-off chain 0", n+1)
+		}
+		idx := -1
+		for i, c := range p.chains {
+			if c == ch {
+				idx = i
+			}
+		}
+		if cl != built[idx] {
+			t.Fatalf("acquire %d returned client %p, want the one dialed for chain %d", n+1, cl, idx)
+		}
+		picked[ch]++
+	}
+	if len(picked) != 2 {
+		t.Fatalf("want both healthy chains to share traffic, got %d distinct chains", len(picked))
+	}
+	if dials[0] != 1 {
+		t.Fatalf("chain 0 dialed %d times, want 1 (no retry inside backoff window)", dials[0])
+	}
+	if dials[1] != 1 || dials[2] != 1 {
+		t.Fatalf("healthy chain dials = %v, want [_,1,1] (lazy reuse, no rebuild)", dials)
+	}
+
+	p.close()
+	assertNoGoroutineLeak(t, baseline)
+}
+
+// TestPoolAllChainsBackoff 钉全链退避的报错语义(骨架契约原文:全部链都
+// 在退避窗口时才返回错误),且窗口内不触发新拨号。
+func TestPoolAllChainsBackoff(t *testing.T) {
+	dials := 0
+	p := newPool(2, func(int) func(context.Context) (*cascadeClient, error) {
+		return func(context.Context) (*cascadeClient, error) {
+			dials++
+			return nil, errors.New("dial boom")
+		}
+	})
+	defer p.close()
+
+	for i := range p.chains {
+		if _, err := p.chains[i].get(context.Background()); err == nil {
+			t.Fatalf("chain %d get must fail", i)
+		}
+	}
+	if dials != 2 {
+		t.Fatalf("dials = %d, want 2 (one per chain)", dials)
+	}
+
+	_, _, err := p.acquire(context.Background())
+	if err == nil {
+		t.Fatal("acquire with all chains in backoff must fail")
+	}
+	if !strings.Contains(err.Error(), "all") || !strings.Contains(err.Error(), "backoff") {
+		t.Fatalf("error must state all-chains backoff, got: %v", err)
+	}
+	if dials != 2 {
+		t.Fatalf("dials = %d after all-backoff rejection, want 2 (no new dial)", dials)
+	}
+}
+
+// TestChainWaitNilFoldsToErrClosed 钉监控协程的 nil→折算分支:干净关闭时
+// Wait 返回 nil,必须折算成 errChainClosed 标记死亡——否则 clientErr 留
+// nil,死 client 被 get 永久复用(fakeConn 的 Wait 恰好返 nil,正中场景)。
+func TestChainWaitNilFoldsToErrClosed(t *testing.T) {
+	dials := 0
+	c := newChain(func(context.Context) (*cascadeClient, error) {
+		dials++
+		return fakeCascadeClient(), nil
+	})
+
+	cl1, err := c.get(context.Background())
+	if err != nil {
+		t.Fatalf("first get: %v", err)
+	}
+	_ = cl1.Close() // 干净关闭:fakeConn.Wait 返回 nil
+	waitUntil(t, "monitor must mark clientErr even when Wait returns nil", func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return c.clientErr != nil
+	})
+	c.mu.Lock()
+	folded := errors.Is(c.clientErr, errChainClosed)
+	c.mu.Unlock()
+	if !folded {
+		t.Fatalf("clientErr = %v, want errChainClosed", c.clientErr)
+	}
+
+	cl2, err := c.get(context.Background())
+	if err != nil {
+		t.Fatalf("get after clean close must rebuild: %v", err)
+	}
+	if cl2 == cl1 || dials != 2 {
+		t.Fatalf("must rebuild a fresh client, dials = %d", dials)
+	}
+	// 收尾:关掉新 client,不留 fake 的 Wait 协程。
+	c.mu.Lock()
+	_ = cl2.Close()
+	c.client = nil
+	c.mu.Unlock()
 }
 
 func TestPoolSingle(t *testing.T) {

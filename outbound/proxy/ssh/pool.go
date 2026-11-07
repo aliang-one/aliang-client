@@ -36,6 +36,20 @@ type chain struct {
 	active    atomic.Int64 // 当前经此链打开的 channel 数;原子:选链读与释放写并发
 }
 
+// backoffRemainingLocked 返回退避窗口剩余时长(true=仍在窗口内)。
+// 成功拨号会清空 lastFail,故 lastFail 非零 ⟺ 正处失败退避 streak——
+// 这是选链「跳过退避链」判定与 get 自身判退避共用的唯一事实源。
+// 调用方须持有 c.mu。
+func (c *chain) backoffRemainingLocked() (time.Duration, bool) {
+	if c.lastFail.IsZero() {
+		return 0, false
+	}
+	if remain := chainBackoff(c.failCount) - time.Since(c.lastFail); remain > 0 {
+		return remain, true
+	}
+	return 0, false
+}
+
 func newChain(dialFn func(ctx context.Context) (*cascadeClient, error)) *chain {
 	return &chain{dialFn: dialFn}
 }
@@ -43,7 +57,7 @@ func newChain(dialFn func(ctx context.Context) (*cascadeClient, error)) *chain {
 // get 返回存活 client;死了/没建则重建(受退避约束)。
 // 同一条链的重建互斥(全程持 c.mu),并发 get 后到者直接复用新 client。
 // 监控只看最终跳的 Wait——前跳死亡会级联拆掉最终跳传输,足够触发重建
-//(spec 审查已确认此取舍)。
+// (spec 审查已确认此取舍)。
 func (c *chain) get(ctx context.Context) (*cascadeClient, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -54,10 +68,8 @@ func (c *chain) get(ctx context.Context) (*cascadeClient, error) {
 		_ = c.client.Close() // 幂等(sync.Once);死链收尾
 		c.client = nil
 	}
-	if !c.lastFail.IsZero() {
-		if wait := chainBackoff(c.failCount); time.Since(c.lastFail) < wait {
-			return nil, fmt.Errorf("ssh chain rebuilding, backoff %s", wait)
-		}
+	if remain, in := c.backoffRemainingLocked(); in {
+		return nil, fmt.Errorf("ssh chain rebuilding, backoff %s", remain)
 	}
 	cl, err := c.dialFn(ctx)
 	if err != nil {
@@ -68,6 +80,7 @@ func (c *chain) get(ctx context.Context) (*cascadeClient, error) {
 	c.client = cl
 	c.clientErr = nil
 	c.failCount = 0
+	c.lastFail = time.Time{} // 退避只属于失败 streak;成功即出窗(否则选链会错跳健康链)
 	// 监控:conn 一死立刻标记,下次 get 重建;不阻塞当前调用方。
 	go func() {
 		err := cl.Wait()
@@ -96,7 +109,7 @@ func (c *chain) drop() {
 func (c *chain) addActive() { c.active.Add(1) }
 
 // releaseActive 与骨架的「>0 才减」语义等价:CAS 循环保证不落到负值
-//(负值会让该链在最少活跃选择中被永久偏选)。
+// (负值会让该链在最少活跃选择中被永久偏选)。
 func (c *chain) releaseActive() {
 	for {
 		n := c.active.Load()
@@ -109,14 +122,16 @@ func (c *chain) releaseActive() {
 	}
 }
 
-// pool 是 N 条独立链的集合;每次 acquire 选活跃 channel 数最少的链
-//(同分从 next 轮转起点扫,保证均匀)。已知取舍(与设计文档一致):
+// pool 是 N 条独立链的集合;每次 acquire 在「不在退避窗口」的链里选活跃
+// channel 数最少的(同分从 next 轮转起点扫,保证均匀)。已知取舍(与
+// spec §4 及计划拍板一致):
 //   - 选链在 p.mu 内快照即出,建链在 chain.mu 内——一次慢拨号(握手至多
 //     15s)不锁住其余链的 acquire,只有同一条链的重建互斥;
-//   - 没有「全部断时现建救急链」的特设机制:语义等价于任一链退避期满
-//     即重建(懒),acquire 撞上退避窗口就返回错误,由调用方决定重试;
-//   - 选链只看活跃数不看健康度:死链退避期中仍可能被选中,此时 acquire
-//     报错而不是静默换链(多链 failover 不在本池承诺内)。
+//   - 处于退避窗口的链(上次拨号失败后未期满)被选链跳过,死链不再吸走
+//     新连接,流量由其余链接住(spec §4「其余链接流量」);
+//   - 死但未进退避的链保持可选:其 get 立即重建,保留懒自愈语义;
+//   - 全部链都在退避窗口时 acquire 报错并带最近剩余等待——与「全断现建
+//     救急链 ≡ 任一链退避期满即重建」的拍板等价,由调用方决定重试。
 type pool struct {
 	mu     sync.Mutex
 	chains []*chain
@@ -134,22 +149,40 @@ func newPool(size int, dialFn func(index int) func(ctx context.Context) (*cascad
 	return p
 }
 
-// acquire 选活跃数最少的链并取得 client;被选链处于退避窗口时返回错误。
-// 返回的 chain 供调用方在 channel 关闭时 releaseActive 配对减数。
-// 锁序恒为 p.mu → chain.mu(选链持 p.mu 时只做原子读,不嵌套取 chain.mu),
-// get/addActive/close 路径只取 chain.mu,无反向嵌套。
+// acquire 在非退避链里选活跃数最少的并取得 client;全部链都在退避窗口
+// 时返回错误(带最近剩余等待)。返回的 chain 供调用方在 channel 关闭时
+// releaseActive 配对减数。
+// 锁序恒为 p.mu → chain.mu:选链持 p.mu 时只对每条链短取 chain.mu 快照
+// 退避状态(与 close() 的嵌套方向一致),锁内不拨号;get/addActive/
+// releaseActive 路径只取 chain.mu,无反向嵌套。
 func (p *pool) acquire(ctx context.Context) (*cascadeClient, *chain, error) {
 	p.mu.Lock()
 	var best *chain
+	var soonest time.Duration // 全部退避时,最近一条链期满还需多久
 	for i := 0; i < len(p.chains); i++ {
 		idx := (p.next + i) % len(p.chains)
 		c := p.chains[idx]
-		if best == nil || c.active.Load() < best.active.Load() {
+		c.mu.Lock()
+		remain, inBackoff := c.backoffRemainingLocked()
+		active := c.active.Load()
+		c.mu.Unlock()
+		if inBackoff {
+			if soonest == 0 || remain < soonest { // soonest==0 是未置哨兵(remain 恒>0)
+				soonest = remain
+			}
+			continue
+		}
+		if best == nil || active < best.active.Load() {
 			best = c
 		}
 	}
 	p.next = (p.next + 1) % len(p.chains)
 	p.mu.Unlock()
+	if best == nil {
+		return nil, nil, fmt.Errorf(
+			"ssh pool: all %d chains rebuilding in backoff, soonest retry in %s",
+			len(p.chains), soonest.Round(time.Millisecond))
+	}
 	cl, err := best.get(ctx)
 	if err != nil {
 		return nil, nil, err
