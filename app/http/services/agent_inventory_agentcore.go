@@ -311,19 +311,33 @@ func readAgentCoreSessionMetaWithOptions(path string, options agentVibeSessionRe
 			if taskID == "" { // 损坏行：无归属依据
 				return true
 			}
-			entry, ok := subagentEntries[taskID]
-			if !ok {
-				entry = &models.AgentVibeSubagent{TaskID: taskID}
-				subagentEntries[taskID] = entry
-				subagentOrder = append(subagentOrder, taskID)
-			}
+			// entry 创建只发生在 start/finish 两个分支内:未知 event（旧二进制
+			// 读新 journal 的常态演进,写侧将来加 progress/note 是自然方向）
+			// 直接跳过不建 entry,否则会产出 Status/Name 双空的幽灵卡。
 			switch row.Event {
 			case "start":
+				entry, ok := subagentEntries[taskID]
+				if !ok {
+					entry = &models.AgentVibeSubagent{TaskID: taskID}
+					subagentEntries[taskID] = entry
+					subagentOrder = append(subagentOrder, taskID)
+				} else if entry.Status == "completed" || entry.Status == "failed" {
+					// finish 先到的乱序形态（healMergeJournal 搬迁/时钟错位）：
+					// 终态是更强事实,迟到的 start 回放不得把已定稿 entry 打回
+					// started 矛盾态,也不回填 start 侧字段。
+					return true
+				}
 				entry.Status = "started"
 				entry.Name = row.Name
 				entry.Description = row.Description
 				entry.StartedAt = normalizeAgentTime(row.Ts)
 			case "finish":
+				entry, ok := subagentEntries[taskID]
+				if !ok {
+					entry = &models.AgentVibeSubagent{TaskID: taskID}
+					subagentEntries[taskID] = entry
+					subagentOrder = append(subagentOrder, taskID)
+				}
 				// status 由写侧保证 completed|failed,这里透传不造值——异常空值
 				// 保持「已 start 未终态」的 started 降级口径比凭空补 completed
 				// 更不误导（面板按 status 渲染终态徽标）。
@@ -335,7 +349,7 @@ func readAgentCoreSessionMetaWithOptions(path string, options agentVibeSessionRe
 				entry.TotalTokens = row.TotalTokens
 				entry.DurationMs = row.DurationMs
 				entry.EndedAt = normalizeAgentTime(row.Ts)
-			} // 未知 event 维持现行为（跳过,同未知 kind）
+			} // 其余 event 值未知:跳过且不建 entry（同未知 kind 的既有防线）
 		case "end":
 			// 终态行：失败真因 + 诊断块。诊断面板据此在重开旧会话时还原「这一轮
 			// 为什么死」。行按序追加，多次 run 时最后一次 end 胜出。

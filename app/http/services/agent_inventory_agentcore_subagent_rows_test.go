@@ -120,15 +120,75 @@ func TestReadAgentCoreSubagentSameNameCrossTurnsNoMerge(t *testing.T) {
 	if session.Subagents[0].Description != "回合1" || session.Subagents[1].Description != "回合2" {
 		t.Fatalf("跨回合实例串扰: %+v", session.Subagents)
 	}
-	// 只有 start 无 finish 的 entry 保持 Status=started。
-	path = writeCoreJournalRawFixture(t, "sess-sub-nofinish",
-		`{"kind":"session","session_id":"sess-sub-nofinish","project_path":"/tmp/p","model":"m","created_at":"2026-11-07T01:00:00Z"}`,
-		`{"kind":"msg","role":"user","message_id":"m1","text":"还没完","ts":"2026-11-07T01:00:04Z"}`,
-		`{"kind":"subagent","event":"start","task_id":"agentcore-m1-hang-1","name":"hang","description":"未终态","ts":"2026-11-07T01:00:05Z"}`,
+}
+
+// 只有 start 无 finish 的 entry 保持 Status=started（中断/断电场景的面板降级
+// 语义）。独立用例,不与跨回合合并测试纠缠。
+func TestReadAgentCoreSubagentMissingFinishStaysStarted(t *testing.T) {
+	setTestAgentHome(t)
+	path := writeCoreJournalRawFixture(t, "sess-sub-nofinish",
+		`{"kind":"session","session_id":"sess-sub-nofinish","project_path":"/tmp/p","model":"m","created_at":"2026-11-08T01:00:00Z"}`,
+		`{"kind":"msg","role":"user","message_id":"m1","text":"还没完","ts":"2026-11-08T01:00:04Z"}`,
+		`{"kind":"subagent","event":"start","task_id":"agentcore-m1-hang-1","name":"hang","description":"未终态","ts":"2026-11-08T01:00:05Z"}`,
 	)
-	session = readAgentCoreSessionMetaWithOptions(path, agentVibeSessionReadOptions{Limit: agentVibeTranscriptMaxMessages})
-	if len(session.Subagents) != 1 || session.Subagents[0].Status != "started" {
-		t.Fatalf("缺 finish 的 entry 应保持 started: %+v", session.Subagents)
+	session := readAgentCoreSessionMetaWithOptions(path, agentVibeSessionReadOptions{Limit: agentVibeTranscriptMaxMessages})
+	if len(session.Subagents) != 1 {
+		t.Fatalf("Subagents = %d 条, want 1: %+v", len(session.Subagents), session.Subagents)
+	}
+	e := session.Subagents[0]
+	if e.Status != "started" || e.Name != "hang" || e.Description != "未终态" || e.StartedAt != "2026-11-08T01:00:05Z" {
+		t.Fatalf("缺 finish 的 entry 应保持 started 且 start 字段齐全: %+v", e)
+	}
+	if e.EndedAt != "" || e.Summary != "" || e.Result != "" {
+		t.Fatalf("缺 finish 的 entry 不得携带终态字段: %+v", e)
+	}
+}
+
+// 未知 event（旧二进制读新 journal 的常态演进:写侧将来加 progress/note 是
+// 自然方向）不得产出 Status/Name 双空的幽灵 entry——entry 创建只发生在
+// start/finish 分支内。
+func TestReadAgentCoreSubagentUnknownEventNoGhostEntry(t *testing.T) {
+	setTestAgentHome(t)
+	path := writeCoreJournalRawFixture(t, "sess-sub-unknown",
+		`{"kind":"session","session_id":"sess-sub-unknown","project_path":"/tmp/p","model":"m","created_at":"2026-11-08T01:00:00Z"}`,
+		`{"kind":"msg","role":"user","message_id":"m1","text":"未来格式","ts":"2026-11-08T01:00:04Z"}`,
+		`{"kind":"subagent","event":"progress","task_id":"agentcore-m1-explorer-1","name":"explorer","current_step":"读文件","ts":"2026-11-08T01:00:05Z"}`,
+		`{"kind":"subagent","event":"note","task_id":"agentcore-m1-explorer-1","text":"备注","ts":"2026-11-08T01:00:06Z"}`,
+		// 归属未知 entry 的工具行:同样静默不落地、不混流主转录
+		`{"kind":"tool","subagent_task_id":"agentcore-m1-explorer-1","tool":"Read","summary":"孤儿","ts":"2026-11-08T01:00:07Z"}`,
+	)
+	session := readAgentCoreSessionMetaWithOptions(path, agentVibeSessionReadOptions{Limit: agentVibeTranscriptMaxMessages})
+	if len(session.Subagents) != 0 {
+		t.Fatalf("未知 event 不得产出幽灵 entry: %+v", session.Subagents)
+	}
+	for _, msg := range session.Transcript {
+		if msg.Role == "tool" {
+			t.Fatalf("未知 entry 的工具行不得混流进主转录: %+v", msg)
+		}
+	}
+}
+
+// finish 先到的乱序形态（healMergeJournal 搬迁/时钟错位）:终态是更强事实,
+// 迟到的 start 回放不得把已定稿 entry 打回 started 或覆写终态字段。
+func TestReadAgentCoreSubagentFinishBeforeStartKeepsTerminal(t *testing.T) {
+	setTestAgentHome(t)
+	path := writeCoreJournalRawFixture(t, "sess-sub-ooo",
+		`{"kind":"session","session_id":"sess-sub-ooo","project_path":"/tmp/p","model":"m","created_at":"2026-11-08T01:00:00Z"}`,
+		`{"kind":"msg","role":"user","message_id":"m1","text":"乱序","ts":"2026-11-08T01:00:04Z"}`,
+		`{"kind":"subagent","event":"finish","task_id":"agentcore-m1-explorer-1","status":"completed","summary":"探索完成","result":"结论全文","total_tokens":123,"duration_ms":456,"ts":"2026-11-08T01:00:05Z"}`,
+		`{"kind":"subagent","event":"start","task_id":"agentcore-m1-explorer-1","name":"explorer","description":"探索代码","ts":"2026-11-08T01:00:06Z"}`,
+	)
+	session := readAgentCoreSessionMetaWithOptions(path, agentVibeSessionReadOptions{Limit: agentVibeTranscriptMaxMessages})
+	if len(session.Subagents) != 1 {
+		t.Fatalf("Subagents = %d 条, want 1: %+v", len(session.Subagents), session.Subagents)
+	}
+	e := session.Subagents[0]
+	if e.Status != "completed" || e.Summary != "探索完成" || e.Result != "结论全文" ||
+		e.TotalTokens != 123 || e.DurationMs != 456 || e.EndedAt != "2026-11-08T01:00:05Z" {
+		t.Fatalf("终态字段被迟到 start 回放覆写: %+v", e)
+	}
+	if e.StartedAt != "" || e.Name != "" || e.Description != "" {
+		t.Fatalf("迟到 start 不得回填 start 侧字段: %+v", e)
 	}
 }
 
