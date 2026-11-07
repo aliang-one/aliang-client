@@ -1448,4 +1448,39 @@ func TestConfigValidate_MeshRejectsSelfReference(t *testing.T) {
 	if err := cfg.ValidateMesh(selfID); err == nil {
 		t.Fatal("whitespace-wrapped self id should still be rejected")
 	}
+	// selfID 实参本身带空白同样命中:两侧都规整后比对,防调用方传未规整值漏检
+	cfg.Customer.Mesh.Peers = []MeshPeer{{DeviceID: selfID}}
+	if err := cfg.ValidateMesh("  " + selfID + "  "); err == nil {
+		t.Fatal("whitespace-wrapped self id argument should still be rejected")
+	}
+}
+
+// 钉死「规整落盘」副作用:Validate 不只校验,还把 device_id/lan_addrs/
+// fallback.addr 的空白规整就地写回(保存路径随后序列化落盘)。若将来有人
+// 把 Validate 改成纯函数,这个测试会先红——规整丢了=保存期防线退化为只挡
+// 不修,ValidateMesh 的精确比对也会重新暴露空白变体。
+func TestConfigValidate_MeshNormalizesWhitespaceInPlace(t *testing.T) {
+	cfg := &Config{
+		Core: &CoreConfig{APIServer: "https://api.example.com"},
+		Customer: &CustomerConfig{Mesh: &MeshConfig{
+			Peers: []MeshPeer{{
+				DeviceID: "  dev-b  ",
+				LANAddrs: []string{"  192.168.1.20:9443  "},
+			}},
+			Fallback: &MeshFallbackConfig{Enable: boolPtr(true), Addr: "  192.168.1.21:9443  "},
+		}},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("规整后合法的 mesh 配置应通过校验, got %v", err)
+	}
+	peer := cfg.Customer.Mesh.Peers[0]
+	if peer.DeviceID != "dev-b" {
+		t.Fatalf("device_id 应就地规整落盘, got %q", peer.DeviceID)
+	}
+	if len(peer.LANAddrs) != 1 || peer.LANAddrs[0] != "192.168.1.20:9443" {
+		t.Fatalf("lan_addrs 应就地规整落盘, got %#v", peer.LANAddrs)
+	}
+	if cfg.Customer.Mesh.Fallback.Addr != "192.168.1.21:9443" {
+		t.Fatalf("fallback.addr 应就地规整落盘, got %q", cfg.Customer.Mesh.Fallback.Addr)
+	}
 }

@@ -796,18 +796,21 @@ func (c *MeshConfig) Validate() error {
 		if peer.DeviceID == "" {
 			return fmt.Errorf("customer.mesh.peers[%d] device_id required", i)
 		}
-		for j, addr := range peer.LANAddrs {
-			if _, _, err := net.SplitHostPort(strings.TrimSpace(addr)); err != nil {
-				return fmt.Errorf("customer.mesh.peers[%d].lan_addrs[%d] invalid %q: must be host:port", i, j, addr)
+		for j := range peer.LANAddrs {
+			// 与 device_id 同款就地规整:校验与落盘同一份值,不留给
+			// 下游「校验过的形态≠存储的形态」的缝。
+			peer.LANAddrs[j] = strings.TrimSpace(peer.LANAddrs[j])
+			if _, _, err := net.SplitHostPort(peer.LANAddrs[j]); err != nil {
+				return fmt.Errorf("customer.mesh.peers[%d].lan_addrs[%d] invalid %q: must be host:port", i, j, peer.LANAddrs[j])
 			}
 		}
 	}
 	if c.Fallback != nil && c.Fallback.Enable != nil && *c.Fallback.Enable {
-		addr := strings.TrimSpace(c.Fallback.Addr)
-		if addr == "" {
+		c.Fallback.Addr = strings.TrimSpace(c.Fallback.Addr)
+		if c.Fallback.Addr == "" {
 			return fmt.Errorf("customer.mesh.fallback.addr required when fallback enabled")
 		}
-		if _, _, err := net.SplitHostPort(addr); err != nil {
+		if _, _, err := net.SplitHostPort(c.Fallback.Addr); err != nil {
 			return fmt.Errorf("customer.mesh.fallback.addr invalid %q: must be host:port", c.Fallback.Addr)
 		}
 		for _, class := range c.Fallback.Classes {
@@ -828,12 +831,14 @@ func (c *Config) ValidateMesh(selfDeviceID string) error {
 	if c == nil || c.Customer == nil || c.Customer.Mesh == nil {
 		return nil
 	}
-	if strings.TrimSpace(selfDeviceID) == "" {
+	// 两侧都规整后比对:手改配置文件可绕过保存期的就地规整,调用方也可能
+	// 传入带空白的 selfID——任一侧的空白变体都不许漏检。
+	self := strings.TrimSpace(selfDeviceID)
+	if self == "" {
 		return nil
 	}
 	for i, peer := range c.Customer.Mesh.Peers {
-		// 手改配置文件可绕过保存期的就地规整,这里兜底 TrimSpace 再比对。
-		if strings.TrimSpace(peer.DeviceID) == selfDeviceID {
+		if strings.TrimSpace(peer.DeviceID) == self {
 			return fmt.Errorf("customer.mesh.peers[%d] device_id %q is self: mesh peers must not reference this device", i, peer.DeviceID)
 		}
 	}
