@@ -2,7 +2,8 @@
 // 返回新数组引用驱动 Vue 响应式;未知 phase 返回原数组引用避免无谓重渲染。
 // 会话归属(sessionId 过滤)由调用方保证,本函数只按 taskId 聚合。
 
-// 终态 phase:定稿后不再接受 progress 更新之外的字段回写(phase 钉死)。
+// 终态 phase:定稿后条目冻结——迟到的 progress 帧不得复活条目(否则入口条
+// 翻回 active 卡转圈),与 Go 读侧 3e18f3a 的终态守卫对称。
 const ACTIVE_PHASES = new Set(['started', 'progress']);
 const TERMINAL_PHASES = new Set(['completed', 'failed', 'interrupted']);
 
@@ -44,9 +45,9 @@ export function applySubagentEvent(subagents, msg) {
   // started:无则新建(浅拷贝补齐整组键),有则幂等返回既有数据不动。
   if (phase === 'started') {
     if (idx >= 0) {
-      const existing = list[idx];
-      // 不可变约定:仍返回新数组,但条目内容不覆盖(引用换壳,数据等值)。
-      return [...list];
+      // 幂等:已有条目的 name/description/进度数据一律不覆盖,零数据变化
+      // 按纪律返回原数组引用,不触发无谓响应式。
+      return list;
     }
     return [...list, {
       ...blankEntry(msg.taskId),
@@ -59,6 +60,9 @@ export function applySubagentEvent(subagents, msg) {
   // 后续 started 帧会补建);已知则更新三个进度字段。
   if (phase === 'progress') {
     if (idx < 0) return list;
+    // 终态钉死:completed/failed/interrupted 之后的迟到 progress 帧原样返回,
+    // 条目不得复活(否则 hasActiveSubagents 翻回 true 卡转圈)。
+    if (TERMINAL_PHASES.has(list[idx].phase)) return list;
     return list.map((s, i) => (i === idx ? {
       ...s,
       currentStep: msg.currentStep ?? s.currentStep,

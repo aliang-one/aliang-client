@@ -37,6 +37,8 @@ describe('applySubagentEvent', () => {
     expect(out[0].currentStep).toBe('读取文件');
     expect(out[0].lastTool).toBe('Grep');
     expect(out[0].toolUses).toBe(3);
+    // 零数据变化按纪律返回原引用
+    expect(out).toBe(seeded);
   });
 
   it('progress 更新 currentStep/lastTool/toolUses 且 phase 保持 progress', () => {
@@ -98,6 +100,24 @@ describe('applySubagentEvent', () => {
     const seeded = [{ taskId: 't1', name: 'r', description: '', phase: 'progress', currentStep: 'x', lastTool: null, toolUses: 2, totalTokens: null, durationMs: null, summary: null }];
     const out = applySubagentEvent(seeded, ev('t1', 'interrupted'));
     expect(out[0].phase).toBe('interrupted');
+  });
+
+  it('终态后迟到 progress 不复活条目(phase 钉死+原引用)', () => {
+    for (const terminal of ['completed', 'failed', 'interrupted']) {
+      const seeded = [{ taskId: 't1', name: 'r', description: '', phase: terminal, currentStep: null, lastTool: null, toolUses: 5, totalTokens: 800, durationMs: 4321, summary: '定稿摘要' }];
+      const out = applySubagentEvent(seeded, ev('t1', 'progress', { currentStep: '幽灵步骤', toolUses: 99 }));
+      // 引用原样:零变化不触发响应式
+      expect(out).toBe(seeded);
+      // 数据不复活:phase 钉死在终态,进度字段不被迟到帧改写
+      expect(out[0]).toMatchObject({
+        phase: terminal,
+        currentStep: null,
+        lastTool: null,
+        toolUses: 5,
+        durationMs: 4321,
+        summary: '定稿摘要',
+      });
+    }
   });
 
   it('终态帧对未知 taskId 忽略(不新建)', () => {
