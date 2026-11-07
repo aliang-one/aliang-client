@@ -356,6 +356,10 @@ func summarizeAgentVibeSessions(sessions []models.AgentVibeSession) []models.Age
 	for _, session := range sessions {
 		session.Transcript = nil
 		session.TranscriptPage = nil
+		// Subagents 同剥离（评审 H2）：读侧组装点被列表与详情共用，但清单
+		// /云端同步载荷只该是摘要——每条 ≤64KB 的 result+tools 无声放大带宽，
+		// 且 PhoneServer zod 到手即剥、纯浪费。详情契约≠清单契约。
+		session.Subagents = nil
 		summaries = append(summaries, session)
 	}
 	return summaries

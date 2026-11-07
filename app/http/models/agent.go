@@ -199,6 +199,41 @@ type AgentVibeSession struct {
 	// 接口透传）。nil 表示没有带诊断块的 end 行——旧数据或非 agentcore 通道，
 	// 手机端面板据此降级为「无诊断数据」而不是渲染空卡。
 	Diagnostics *AgentVibeDiagnostics `json:"diagnostics,omitempty"`
+	// Subagents 是该会话 journal 里 kind=subagent 行组装出的子agent轨迹
+	// （spec subagent-panel §二，详情 API 专供）。列表/同步出口必须剥离
+	// （summarizeAgentVibeSessions 置 nil）——每条 result 可达 64KB，混进
+	// 清单会无声放大带宽，且 PhoneServer zod 到手即剥、纯浪费。详情契约
+	// ≠ 清单契约。旧 journal 无该行 → nil（omitempty 不下发）。
+	Subagents []AgentVibeSubagent `json:"subagents,omitempty"`
+}
+
+// AgentVibeSubagent 是一次子 run（Task 工具）的读侧汇总。同 task_id 的
+// journal 行合并为同一实例（start 建 entry，finish 补终态，tool 行归入
+// Tools）；不同 task_id 永不合并（task_id 含回合 messageID，写侧保证唯一，
+// 同名子agent跨回合各占一条）。缺 finish 行的 entry Status 保持 started
+// （中断/断电场景的面板降级语义）。
+type AgentVibeSubagent struct {
+	TaskID      string `json:"task_id"`
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	// Status ∈ started|completed|failed（finish 行的 status 键透传）。
+	Status      string                  `json:"status"`
+	Summary     string                  `json:"summary,omitempty"`
+	Result      string                  `json:"result,omitempty"`
+	TotalTokens int64                   `json:"total_tokens,omitempty"`
+	DurationMs  int64                   `json:"duration_ms,omitempty"`
+	StartedAt   string                  `json:"started_at,omitempty"`
+	EndedAt     string                  `json:"ended_at,omitempty"`
+	Tools       []AgentVibeSubagentTool `json:"tools,omitempty"`
+}
+
+// AgentVibeSubagentTool 是子 run 的一条工具轨迹（journal kind=tool 行带
+// subagent_task_id 关联字段）。按文件序（时间序）追加。
+type AgentVibeSubagentTool struct {
+	Tool    string `json:"tool"`
+	Summary string `json:"summary,omitempty"`
+	IsError bool   `json:"is_error,omitempty"`
+	Ts      string `json:"ts,omitempty"`
 }
 
 // AgentVibeDiagnostics 是 agentcore 会话一次 run 的终态诊断快照。JSON 键与

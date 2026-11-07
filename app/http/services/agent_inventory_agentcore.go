@@ -123,28 +123,45 @@ func readAgentCoreSessionMetaWithOptions(path string, options agentVibeSessionRe
 	// 一张 MessageCount=0 的幽灵卡（claude 通道 2026-10-18 husk 审计防御的同
 	// 类问题），必须整体跳过。无头行文件不受影响：合法 msg 行会置位。
 	parsedAny := false
+	// 子agent轨迹聚合（spec subagent-panel §二）：entries 按 task_id 键合并
+	// 同一子 run 的 start/finish/tool 行（有意语义——同 task_id 是同一次子
+	// run，task_id 含回合 messageID 所以同名子agent跨回合绝不串条），
+	// subagentOrder 保住行序（=时间序）输出。行在 truncateBefore 区间归属
+	// 与 healMergeJournal 搬迁中随宿主 msg 行区间处理，与 tool/turn/end 同规
+	// （写侧已保证）。
+	subagentEntries := make(map[string]*models.AgentVibeSubagent)
+	subagentOrder := make([]string, 0, 4)
 	forEachAgentSessionJSONLLine(path, maxLineBytes, func(line []byte) bool {
 		var row struct {
-			Kind         string                       `json:"kind"`
-			SessionID    string                       `json:"session_id"`
-			ProjectPath  string                       `json:"project_path"`
-			Model        string                       `json:"model"`
-			Effort       string                       `json:"effort"`
-			ApprovalMode string                       `json:"approval_mode"`
-			CreatedAt    string                       `json:"created_at"`
-			Origin       string                       `json:"origin"`
-			Role         string                       `json:"role"`
-			MessageID    string                       `json:"message_id"`
-			Text         string                       `json:"text"`
-			Attachments  []models.AgentVibeAttachment `json:"attachments,omitempty"`
-			Thinking     string                       `json:"thinking"`
-			Turn         int                          `json:"turn"`
-			Tool         string                       `json:"tool"`
-			Summary      string                       `json:"summary"`
-			Ts           string                       `json:"ts"`
-			Status       string                       `json:"status"`
-			Error        string                       `json:"error"`
-			Diagnostics  map[string]interface{}       `json:"diagnostics"`
+			Kind           string                       `json:"kind"`
+			SessionID      string                       `json:"session_id"`
+			ProjectPath    string                       `json:"project_path"`
+			Model          string                       `json:"model"`
+			Effort         string                       `json:"effort"`
+			ApprovalMode   string                       `json:"approval_mode"`
+			CreatedAt      string                       `json:"created_at"`
+			Origin         string                       `json:"origin"`
+			Role           string                       `json:"role"`
+			MessageID      string                       `json:"message_id"`
+			Text           string                       `json:"text"`
+			Attachments    []models.AgentVibeAttachment `json:"attachments,omitempty"`
+			Thinking       string                       `json:"thinking"`
+			Turn           int                          `json:"turn"`
+			Tool           string                       `json:"tool"`
+			Summary        string                       `json:"summary"`
+			Ts             string                       `json:"ts"`
+			Status         string                       `json:"status"`
+			Error          string                       `json:"error"`
+			Diagnostics    map[string]interface{}       `json:"diagnostics"`
+			Event          string                       `json:"event"`
+			TaskID         string                       `json:"task_id"`
+			Name           string                       `json:"name"`
+			Description    string                       `json:"description"`
+			SubagentTaskID string                       `json:"subagent_task_id"`
+			IsError        bool                         `json:"is_error"`
+			Result         string                       `json:"result"`
+			TotalTokens    int64                        `json:"total_tokens"`
+			DurationMs     int64                        `json:"duration_ms"`
 		}
 		if err := json.Unmarshal(line, &row); err != nil {
 			return true // 半行容忍：跳过损坏行
@@ -254,6 +271,23 @@ func readAgentCoreSessionMetaWithOptions(path string, options agentVibeSessionRe
 			if row.Tool == "" && row.Summary == "" {
 				return true
 			}
+			// 子agent工具行（带 subagent_task_id）：归组进对应 entry.Tools,
+			// 绝不进主转录——子 run 轨迹与主会话工具流分离是面板设计的前提
+			// （spec subagent-panel）。entry 查不到（start 行写失败的边缘形态）
+			// 同样不进主转录：混流比静默丢失更伤主时间线,与 tool/turn 行的
+			// 无头行损失模式同款接受。此分支不占 toolCount/transcriptRow——
+			// 转录 Index 是可见行的连续序号,不可见行不消费。
+			if taskID := strings.TrimSpace(row.SubagentTaskID); taskID != "" {
+				if entry, ok := subagentEntries[taskID]; ok {
+					entry.Tools = append(entry.Tools, models.AgentVibeSubagentTool{
+						Tool:    row.Tool,
+						Summary: row.Summary,
+						IsError: row.IsError,
+						Ts:      normalizeAgentTime(row.Ts),
+					})
+				}
+				return true
+			}
 			toolCount++
 			transcriptRow++
 			// reader 不信任写侧:超长 summary 与 msg 行同规截断（家规）。
@@ -265,6 +299,43 @@ func readAgentCoreSessionMetaWithOptions(path string, options agentVibeSessionRe
 				Timestamp: normalizeAgentTime(row.Ts),
 				Index:     transcriptRow - 1,
 			})
+		case "subagent":
+			// 子agent行（start/finish）：组装成 Subagents[],不进主转录、不计
+			// MessageCount/displayCount/transcriptRow（同 tool 行的轨迹语义,
+			// 不置 parsedAny——end 行同款,只 enrich 已解析的会话）。无头行文件
+			// 里 session.ID 尚空,行无归属依据,与 tool/turn 行同款跳过。
+			if session.ID == "" {
+				return true
+			}
+			taskID := strings.TrimSpace(row.TaskID)
+			if taskID == "" { // 损坏行：无归属依据
+				return true
+			}
+			entry, ok := subagentEntries[taskID]
+			if !ok {
+				entry = &models.AgentVibeSubagent{TaskID: taskID}
+				subagentEntries[taskID] = entry
+				subagentOrder = append(subagentOrder, taskID)
+			}
+			switch row.Event {
+			case "start":
+				entry.Status = "started"
+				entry.Name = row.Name
+				entry.Description = row.Description
+				entry.StartedAt = normalizeAgentTime(row.Ts)
+			case "finish":
+				// status 由写侧保证 completed|failed,这里透传不造值——异常空值
+				// 保持「已 start 未终态」的 started 降级口径比凭空补 completed
+				// 更不误导（面板按 status 渲染终态徽标）。
+				if status := strings.TrimSpace(row.Status); status != "" {
+					entry.Status = status
+				}
+				entry.Summary = row.Summary
+				entry.Result = row.Result
+				entry.TotalTokens = row.TotalTokens
+				entry.DurationMs = row.DurationMs
+				entry.EndedAt = normalizeAgentTime(row.Ts)
+			} // 未知 event 维持现行为（跳过,同未知 kind）
 		case "end":
 			// 终态行：失败真因 + 诊断块。诊断面板据此在重开旧会话时还原「这一轮
 			// 为什么死」。行按序追加，多次 run 时最后一次 end 胜出。
@@ -324,6 +395,15 @@ func readAgentCoreSessionMetaWithOptions(path string, options agentVibeSessionRe
 	}
 	session.DisplayMessageCount = &displayCount
 	session.Transcript, session.TranscriptPage = window.page(session.MessageCount, options.IncludePageMeta)
+	if len(subagentOrder) > 0 {
+		// 按 order 切片（行序=时间序）输出；缺 finish 的 entry 保持 started。
+		// 列表/同步出口由 summarizeAgentVibeSessions 剥离（详情契约≠清单契约）。
+		subagents := make([]models.AgentVibeSubagent, 0, len(subagentOrder))
+		for _, taskID := range subagentOrder {
+			subagents = append(subagents, *subagentEntries[taskID])
+		}
+		session.Subagents = subagents
+	}
 	if !isSafeAgentProjectPath(session.ProjectPath) {
 		session.ProjectPath = ""
 	}
