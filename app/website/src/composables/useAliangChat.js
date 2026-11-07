@@ -1,4 +1,4 @@
-import { ref, computed, nextTick, onMounted, onUnmounted, watch } from 'vue';
+import { ref, reactive, computed, nextTick, onMounted, onUnmounted, watch } from 'vue';
 import { useI18n } from '../i18n';
 import { useNavigation } from './useNavigation';
 import { slashProviderFor } from '../utils/chatProvider';
@@ -29,6 +29,7 @@ import {
   recallCreatePayload,
   sliceMessagesBefore,
 } from '../utils/chatRecall';
+import { applySubagentEvent, hasActiveSubagents } from '../utils/subagentPanel';
 
 const STORAGE_KEY = 'aliang-chat-data';
 
@@ -38,6 +39,9 @@ const AGENT_AI_RECONNECT_RESET_TYPES = new Set([
   'ai.session.created', 'ai.run.started', 'ai.delta', 'ai.status', 'ai.run.progress',
   'ai.run.notice', 'ai.done', 'ai.error', 'ai.approval.request', 'ai.approval.cancelled',
   'ai.option.request', 'ai.option.cancelled', 'ai.steer.ack',
+  // 子agent活动也是 run 数据面（spec 2026-11-07-subagent-panel §三）：回合主体静默、
+  // 子agent干活期间帧流不断——收到即证明管道活，重连预算随之归零（有利副作用）。
+  'ai.subagent',
 ]);
 
 // 无活动看门狗阈值：模块顶层读取（E2E 经 window.__CHAT_IDLE_TIMEOUT_MS__
@@ -137,6 +141,78 @@ export function deviceSnapshotTranscriptToMessages(rows, provider, fallbackTs) {
   };
 }
 
+// --- 子agent面板 WS 消费链（spec 2026-11-07-subagent-panel §三，导出供单测） ---
+//
+// ai.subagent 帧的消费拆成模块级纯函数（归属守卫+归一+聚合+M1 重拉触发），
+// composable 内 switch case 只做薄壳装配——composable 需 Vue app 上下文难以
+// 整体实例化，纯链单独可测（同 deviceDetailTranscriptToMessages 先例）。
+
+// WS 蛇形帧 → reducer 驼峰消息（后端 agentAISubagentPayload 键名同源）。
+// 字段缺省落 null/''：reducer 侧 blankEntry/maxOr/pickDefined 再兜底一层。
+export function subagentFrameToReducerMsg(e) {
+  if (!e || typeof e !== 'object') return null;
+  return {
+    taskId: typeof e.task_id === 'string' ? e.task_id : '',
+    phase: e.phase,
+    subagentType: typeof e.subagent_type === 'string' ? e.subagent_type : '',
+    description: e.description ?? null,
+    currentStep: e.current_step ?? null,
+    lastTool: e.last_tool ?? null,
+    toolUses: e.tool_uses ?? null,
+    totalTokens: e.total_tokens ?? null,
+    durationMs: e.duration_ms ?? null,
+    summary: e.summary ?? null,
+  };
+}
+
+// ai.subagent 帧消费主链（handleAIEvent case 的全部逻辑）。返回是否被消费，
+// 供调试与测试断言；store 由调用方传入（composable 的 subagentsBySession 或
+// 测试的普通对象），key=sessionId、value=该会话 subagents 数组。
+// hooks.refetch：M1 详情静默重拉入口（composable 传真实现，测试传 spy）。
+export function consumeSubagentFrame(store, e, activeSessionId, hooks = {}) {
+  if (!e || typeof e !== 'object' || e.type !== 'ai.subagent') return false;
+  // 会话归属守卫（spec M2，评审钉死）：仅帧 session_id 等于当前打开会话的
+  // aiSessionId 才消费；不匹配（他会话帧——含经 fallback 挂活跃会话的兜底链
+  // 路由进来的）一律丢弃，防他会话子agent帧污染当前面板。注意不能复用
+  // handleAIEvent 上方的 conv 路由结果判归属：fallback 恰是把未命中帧挂上
+  // 活跃会话的污染路径，守卫必须以「当前打开会话的 aiSessionId」为准。
+  const sid = typeof e.session_id === 'string' ? e.session_id : '';
+  const ownSession = typeof activeSessionId === 'string' && !!activeSessionId && sid === activeSessionId;
+  if (!ownSession) return false;
+  const msg = subagentFrameToReducerMsg(e);
+  store[sid] = applySubagentEvent(store[sid], msg);
+  // M1 报告重拉（spec §三）：completed|failed 到达且「用户正在看该子agent详情」
+  // 时触发一次静默重拉（只消费返回的 subagents[]，转录一律不落壳——详情装载
+  // 是整体替换 messages，全量重拉会顶掉正在流式输出的直播气泡）；不在看则不拉
+  // （由面板打开逻辑兜底）。started/progress 不触发。
+  if ((msg.phase === 'completed' || msg.phase === 'failed')
+    && typeof hooks.isWatching === 'function' && hooks.isWatching(msg.taskId)
+    && typeof hooks.refetch === 'function') {
+    hooks.refetch(sid);
+  }
+  return true;
+}
+
+// M1 详情静默重拉（真实实现，经 vi.mock 的 getAgentSessionDetail 可测）：
+// 只消费 detail.subagents[] 整体替换该会话面板状态；转录一律不落壳。详情未带
+// subagents 键（后端降级/旧版）时保留 WS 聚合态；失败静默——面板打开逻辑兜底。
+// 同会话 in-flight 去重：连续 completed 同窗到达只发一次请求。
+const subagentDetailRefreshInflight = new Set();
+export async function refreshSubagentsFromDetail(store, sessionId) {
+  const sid = String(sessionId || '');
+  if (!sid || subagentDetailRefreshInflight.has(sid)) return;
+  subagentDetailRefreshInflight.add(sid);
+  try {
+    const detail = await getAgentSessionDetail(sid);
+    const list = Array.isArray(detail?.subagents) ? detail.subagents : null;
+    if (list) store[sid] = list;
+  } catch (_) {
+    // 静默：详情缺席不阻断（journal 仍是持久真值，面板打开时再拉）
+  } finally {
+    subagentDetailRefreshInflight.delete(sid);
+  }
+}
+
 export function useAliangChat() {
   const { t } = useI18n();
   const { showDashboard, chatProviderPreset } = useNavigation();
@@ -233,6 +309,35 @@ export function useAliangChat() {
   // 方案交互卡（Task 14）：pending/sending 展开作答，answered 折叠「已选择」
   // 终态常驻（作废即被移除）——与审批族数据结构独立，全量透传给列表渲染。
   const activeOptionCards = computed(() => activeConversation.value?.optionCards || []);
+
+  // 子agent面板状态存储（spec 2026-11-07-subagent-panel §三）：会话维度
+  // key=aiSessionId、value=该会话 subagents 数组（reducer applySubagentEvent
+  // 的不可变更新结果）。瞬态展示数据：不进 localStorage——重进页由断线自愈
+  // 的详情重拉（spec H3）与面板打开逻辑（Task 8）对齐。入口条/面板（Task 7/8）
+  // 经下方 activeSubagents getter 或直接读本对象消费。
+  const subagentsBySession = reactive({});
+  // getter：当前打开会话的 subagents（无打开会话/会话无 aiSessionId 时为空数组）。
+  const activeSubagents = computed(() => {
+    const sid = activeConversation.value?.aiSessionId || '';
+    return (sid && Array.isArray(subagentsBySession[sid]) ? subagentsBySession[sid] : []);
+  });
+  // 入口条「有无活动子agent」谓词（Task 7 渲染开关），reducer 同源实现。
+  const activeHasRunningSubagents = computed(() => hasActiveSubagents(activeSubagents.value));
+
+  // 「正在看该子agent详情」判定（spec M1 的 hook）：面板打开且选中某条目时才
+  // 允许终态帧触发详情静默重拉。Task 8 面板选中态的落点（先声明占位 ref，
+  // 接线后由面板选中逻辑写入：选中置 taskId，关闭/取消选中置 null）。
+  const subagentWatchingTaskId = ref(null);
+  // TODO(Task 8)：面板组件接线后此判定即生效；本任务先落占位实现（ref 恒
+  // null ⇒ 恒 false，M1 重拉暂不触发，由面板打开逻辑兜底）。
+  function isWatchingSubagent(taskId) {
+    return !!taskId && subagentWatchingTaskId.value === taskId;
+  }
+
+  // M1 重拉入口（composable 侧薄壳）：绑定本会话存储交给模块级真实实现。
+  function refetchSubagentsForSession(sessionId) {
+    return refreshSubagentsFromDetail(subagentsBySession, sessionId);
+  }
 
   // True while the active conversation's latest assistant message is still streaming.
   const activeRunning = computed(() => {
@@ -2359,6 +2464,21 @@ export function useAliangChat() {
         }
         break;
       }
+      case 'ai.subagent': {
+        // 子agent生命周期帧（spec 2026-11-07-subagent-panel §三）：归属守卫
+        // +蛇形归一+reducer 聚合+M1 详情重拉都在 consumeSubagentFrame 纯链
+        // （模块级导出供单测），本 case 只做薄壳装配。注意归属判定不能用
+        // 上方 conv 路由结果：fallback 链已把未命中帧挂上活跃会话，恰是
+        // M2 要防的「他会话帧污染当前面板」路径，守卫以当前打开会话的
+        // aiSessionId 为准（含设备壳 aiSessionId=entry.id 的形态）。
+        consumeSubagentFrame(
+          subagentsBySession,
+          e,
+          activeConversation.value?.aiSessionId || '',
+          { isWatching: isWatchingSubagent, refetch: refetchSubagentsForSession },
+        );
+        return; // 面板状态是瞬态展示数据：不落 localStorage（persist 不置位）
+      }
       case 'ai.done': {
         disarmIdleWatchdog();
         const asst = findRunningAssistant(conv);
@@ -2663,5 +2783,11 @@ export function useAliangChat() {
     attachmentUploading,
     addPendingAttachments,
     removePendingAttachment,
+    // 子agent面板（spec 2026-11-07-subagent-panel §三）：入口条/面板组件经
+    // ChatPage 消费；subagentWatchingTaskId 供 Task 8 面板选中态写入。
+    subagentsBySession,
+    activeSubagents,
+    activeHasRunningSubagents,
+    subagentWatchingTaskId,
   };
 }
