@@ -7381,6 +7381,17 @@ func streamStructuredAIDelta(reader io.Reader, format agentAIOutputFormat, run a
 			// + 看门狗喂食。放在 activity 配对之后、结构化发射之前，保证同一
 			// 帧上 activity 状态先于 wire 事件就绪。
 			handleClaudeTaskEvents(event, run, writeJSON)
+			// agentcore 子agent状态镜像帧（ai.subagent）直接透传：帧形已是
+			// 协议形状（agentAISubagentPayload），registry/activity 看门狗喂食
+			// 已在桥侧（agentCoreSubagentMirror）完成——这里只负责把帧送进
+			// 下行：writeJSON = origin 写 + 本地 WS 扇出 + 云端转发，手机 App
+			// （SubagentRows）与仪表盘面板各取所需。无此分支镜像帧死在解码器
+			// 里（2026-11-07 实锤：已合并的镜像功能空转，两端全收不到）。
+			// claude CLI 自身不产该 type，无双发。
+			if remoteString(event, "type") == models.AgentEventAISubagent {
+				_ = writeJSON(event)
+				continue
+			}
 			// 诊断聚合：assistant 帧（回合数/最近用量/停止原因）与 result 帧
 			// （终态）喂给 claudeRunDiagnostics，进度 ticker 与 runCLIPass 收尾
 			// 读它发 ai.run.progress.diagnostics。nil 安全（无挂载即跳过）。
