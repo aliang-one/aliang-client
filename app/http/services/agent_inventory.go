@@ -264,7 +264,10 @@ func normalizeActiveAgentVibeSession(session models.AgentVibeSession) models.Age
 	session.Title = truncateAgentText(session.Title, 200)
 	session.Summary = truncateAgentText(session.Summary, 500)
 	session.Mode = strings.TrimSpace(firstNonEmpty(session.Mode, "vibe"))
-	session.Status = "running"
+	// idle(create-only)会话的状态由上游置定,不得抹成 running(2026-11-07 S1)。
+	if session.Status == "" {
+		session.Status = "running"
+	}
 	session.Model = strings.TrimSpace(session.Model)
 	session.CreatedAt = normalizeAgentTime(session.CreatedAt)
 	session.UpdatedAt = normalizeAgentTime(firstNonEmpty(session.UpdatedAt, time.Now().UTC().Format(time.RFC3339)))
