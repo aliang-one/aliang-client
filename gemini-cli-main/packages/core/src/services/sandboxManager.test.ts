@@ -259,7 +259,7 @@ describe('SandboxManager', () => {
         cwd,
         env: {
           PATH: '/usr/bin',
-          GITHUB_TOKEN: 'ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
+          GITHUB_TOKEN: 'redacted-sample-token',
           MY_SECRET: 'super-secret',
           SAFE_VAR: 'is-safe',
         },

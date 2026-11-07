@@ -120,28 +120,28 @@ describe('sanitizeEnvironment', () => {
   it('should redact variables with values matching all token and credential patterns', () => {
     const env = {
       // GitHub
-      GITHUB_TOKEN_GHP: 'ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
-      GITHUB_TOKEN_GHO: 'gho_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
-      GITHUB_TOKEN_GHU: 'ghu_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
-      GITHUB_TOKEN_GHS: 'ghs_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
-      GITHUB_TOKEN_GHR: 'ghr_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
-      GITHUB_PAT: 'github_pat_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
+      GITHUB_TOKEN_GHP: 'redacted-sample-credential',
+      GITHUB_TOKEN_GHO: 'redacted-sample-credential',
+      GITHUB_TOKEN_GHU: 'redacted-sample-credential',
+      GITHUB_TOKEN_GHS: 'redacted-sample-credential',
+      GITHUB_TOKEN_GHR: 'redacted-sample-credential',
+      GITHUB_PAT: 'redacted-sample-credential',
       // Google
-      GOOGLE_KEY: 'AIzaSyxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
+      GOOGLE_KEY: 'redacted-sample-credential',
       // AWS
       AWS_KEY: 'AKIAxxxxxxxxxxxxxxxx',
       // JWT
-      JWT_TOKEN: 'eyJhbGciOiJIUzI1NiJ9.e30.ZRrHA157xAA_7962-a_3rA',
+      JWT_TOKEN: 'redacted-sample-credential',
       // Stripe
-      STRIPE_SK_LIVE: 'sk_live_xxxxxxxxxxxxxxxxxxxxxxxx',
-      STRIPE_RK_LIVE: 'rk_live_xxxxxxxxxxxxxxxxxxxxxxxx',
-      STRIPE_SK_TEST: 'sk_test_xxxxxxxxxxxxxxxxxxxxxxxx',
+      STRIPE_SK_LIVE: 'redacted-sample-credential',
+      STRIPE_RK_LIVE: 'redacted-sample-credential',
+      STRIPE_SK_TEST: 'redacted-sample-credential',
       STRIPE_RK_TEST: 'rk_test_xxxxxxxxxxxxxxxxxxxxxxxx',
       // Slack
-      SLACK_XOXB: 'xoxb-xxxxxxxxxxxx-xxxxxxxxxxxx-xxxxxxxx',
-      SLACK_XOXA: 'xoxa-xxxxxxxxxxxx-xxxxxxxxxxxx-xxxxxxxx',
-      SLACK_XOXP: 'xoxp-xxxxxxxxxxxx-xxxxxxxxxxxx-xxxxxxxx',
-      SLACK_XOXB_2: 'xoxr-xxxxxxxxxxxx-xxxxxxxxxxxx-xxxxxxxx',
+      SLACK_XOXB: 'redacted-sample-credential',
+      SLACK_XOXA: 'redacted-sample-credential',
+      SLACK_XOXP: 'redacted-sample-credential',
+      SLACK_XOXB_2: 'redacted-sample-credential',
       // URL Credentials
       CREDS_IN_HTTPS_URL: 'https://user:password@example.com',
       CREDS_IN_HTTP_URL: 'http://user:password@example.com',
@@ -218,8 +218,8 @@ describe('sanitizeEnvironment', () => {
       API_KEY: 'should-be-redacted',
       MY_SECRET: 'super-secret',
       // Redacted by value
-      GH_TOKEN: 'ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
-      JWT: 'eyJhbGciOiJIUzI1NiJ9.e30.ZRrHA157xAA_7962-a_3rA',
+      GH_TOKEN: 'redacted-sample-credential',
+      JWT: 'redacted-sample-credential',
       // Allowed by name but redacted by value
       RANDOM_VAR: '-----BEGIN CERTIFICATE-----...',
     };
@@ -235,7 +235,7 @@ describe('sanitizeEnvironment', () => {
   describe('value-first security: secret values must be caught even for allowed variable names', () => {
     it('should redact ALWAYS_ALLOWED variables whose values contain a GitHub token', () => {
       const env = {
-        HOME: 'ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
+        HOME: 'redacted-sample-credential',
         PATH: '/usr/bin',
       };
       const sanitized = sanitizeEnvironment(env, EMPTY_OPTIONS);
@@ -254,7 +254,7 @@ describe('sanitizeEnvironment', () => {
 
     it('should redact user-allowlisted variables whose values contain a secret', () => {
       const env = {
-        MY_SAFE_VAR: 'ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
+        MY_SAFE_VAR: 'redacted-sample-credential',
         OTHER: 'fine',
       };
       const sanitized = sanitizeEnvironment(env, {
@@ -267,7 +267,7 @@ describe('sanitizeEnvironment', () => {
 
     it('should NOT redact GEMINI_CLI_ variables even if their value looks like a secret (fully trusted)', () => {
       const env = {
-        GEMINI_CLI_INTERNAL: 'ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
+        GEMINI_CLI_INTERNAL: 'redacted-sample-credential',
       };
       const sanitized = sanitizeEnvironment(env, EMPTY_OPTIONS);
       expect(sanitized).toEqual(env);
@@ -363,7 +363,7 @@ describe('sanitizeEnvironment', () => {
       AppSecret: 'secret-value',
       db_password: 'password-value',
       RSA_KEY: '-----BEGIN RSA PRIVATE KEY-----...',
-      GITHUB_TOKEN_GHP: 'ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
+      GITHUB_TOKEN_GHP: 'redacted-sample-credential',
       SAFE_VAR: 'is-safe',
     };
     const options = {

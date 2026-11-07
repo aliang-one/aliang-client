@@ -81,14 +81,14 @@ describe('getGitHubRepoInfo', async () => {
 
   it('returns the owner and repo for URL with classic PAT token (ghp_)', async () => {
     vi.mocked(child_process.execSync).mockReturnValueOnce(
-      'https://ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx@github.com/owner/repo.git',
+      'https://redacted-sample-token@github.com/owner/repo.git',
     );
     expect(getGitHubRepoInfo()).toEqual({ owner: 'owner', repo: 'repo' });
   });
 
   it('returns the owner and repo for URL with fine-grained PAT token (github_pat_)', async () => {
     vi.mocked(child_process.execSync).mockReturnValueOnce(
-      'https://github_pat_xxxxxxxxxxxxxxxxxxxxxx_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx@github.com/owner/repo.git',
+      'https://redacted-sample-token@github.com/owner/repo.git',
     );
     expect(getGitHubRepoInfo()).toEqual({ owner: 'owner', repo: 'repo' });
   });
