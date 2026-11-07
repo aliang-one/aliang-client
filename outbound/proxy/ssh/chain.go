@@ -61,7 +61,7 @@ func authMethods(n nodeConfig) ([]gossh.AuthMethod, error) {
 }
 
 // chainDialer 负责把一条完整链(可选逐跳穿透)建立成最终 *cascadeClient
-//(Close 级联关全部跳,其余语义经内嵌 *gossh.Client 透传)。
+// (Close 级联关全部跳,其余语义经内嵌 *gossh.Client 透传)。
 type chainDialer struct {
 	hosts *KnownHosts
 	nodes []nodeConfig // jumps + final
@@ -91,9 +91,19 @@ type cascadeClient struct {
 
 func (c *cascadeClient) Close() error {
 	c.once.Do(func() {
-		errs := []error{c.Client.Close()}
+		// 非空错误带上跳序号:多跳链各跳的关闭错误可能文本相同
+		//(如 "ssh: connection closed"),不归属则无法定位;空保持空,
+		// errors.Join 的全空→空属性不受影响。最终跳序号 = len(prior),
+		// 与 dialChain 的 hop 编号一致。
+		hopErr := func(hop int, err error) error {
+			if err == nil {
+				return nil
+			}
+			return fmt.Errorf("hop %d close: %w", hop, err)
+		}
+		errs := []error{hopErr(len(c.prior), c.Client.Close())}
 		for i := len(c.prior) - 1; i >= 0; i-- {
-			errs = append(errs, c.prior[i].Close())
+			errs = append(errs, hopErr(i, c.prior[i].Close()))
 		}
 		c.err = errors.Join(errs...)
 	})

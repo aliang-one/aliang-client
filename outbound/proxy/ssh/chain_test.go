@@ -103,6 +103,11 @@ func TestDialChainCascadeCloseNoLeak(t *testing.T) {
 	if err := client.Close(); err != nil {
 		t.Fatalf("cascade Close: %v", err)
 	}
+	// 幂等钉子:第二次 Close 返回与首次相同的结果(nil)且不 panic
+	//(cascadeClient 文档承诺「重复 Close 返回首次结果」)。
+	if err := client.Close(); err != nil {
+		t.Fatalf("second Close must return the same nil result, got: %v", err)
+	}
 	assertNoGoroutineLeak(t, baseline)
 }
 
