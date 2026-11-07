@@ -218,7 +218,7 @@ func TestAgentCoreSubagentApprovesSerializedAcrossSubruns(t *testing.T) {
 	// wrap；agentCoreSubagentTools 不再自包）——测试直接用同一道门。
 	gate := newAgentCoreApprovalGate()
 	tools := m.agentCoreSubagentTools(agentAIRun{sessionID: "s-approve", projectPath: os.Getenv("HOME"), model: "glm-5.2"},
-		client, nil, gate.wrap(rawApprove), nil, nil)
+		client, nil, gate.wrap(rawApprove), nil, nil, nil)
 	if len(tools) != 2 {
 		t.Fatalf("桥数 = %d, want 2", len(tools))
 	}
@@ -303,9 +303,19 @@ func TestAgentCoreSubagentsParallelViaKernelLoop(t *testing.T) {
 	m := newAgentAIManager()
 	client := agentcore.NewClient(agentCoreBaseURL())
 	gate := newAgentCoreApprovalGate()
+	// 状态镜像接线（2026-11-07）：并行批内每个桥实例独立 taskID,started/
+	// progress/completed 帧齐发——实测场景「一次派 N 个子 agent」手机可见。
+	visSpy := &mirrorSpy{act: &agentAIActivity{}}
+	visMirror := &agentCoreSubagentMirror{
+		registry:  newAgentAISubagentRegistry(),
+		activity:  visSpy.act,
+		emit:      visSpy.emit,
+		sessionID: "s-kernel-parallel",
+		messageID: "msg-kernel-parallel",
+	}
 	bridges := m.agentCoreSubagentTools(
 		agentAIRun{sessionID: "s-kernel-parallel", projectPath: t.TempDir(), model: "glm-5.2"},
-		client, &agentcore.ToolEnv{ProjectPath: t.TempDir()}, gate.wrap(rawApprove), nil, nil)
+		client, &agentcore.ToolEnv{ProjectPath: t.TempDir()}, gate.wrap(rawApprove), nil, nil, visMirror)
 	if len(bridges) != 2 {
 		t.Fatalf("桥数 = %d, want 2", len(bridges))
 	}
@@ -340,5 +350,34 @@ func TestAgentCoreSubagentsParallelViaKernelLoop(t *testing.T) {
 	// 4 次：主层对 sub-a/sub-b 两个桥工具的审批 + 两个子 run 内 Read 的审批。
 	if got := calls.Load(); got != 4 {
 		t.Fatalf("审批调用数 = %d, want 4", got)
+	}
+
+	// 状态镜像：两个桥各自 started+completed，taskID 互异，无 progress 缺位。
+	visSpy.mu.Lock()
+	started, completed := 0, 0
+	taskIDs := map[string]bool{}
+	for _, f := range visSpy.frames {
+		if t2, _ := f["type"].(string); t2 != "ai.subagent" {
+			continue
+		}
+		switch p, _ := f["phase"].(string); p {
+		case "started":
+			started++
+			if tid, _ := f["task_id"].(string); tid != "" {
+				taskIDs[tid] = true
+			}
+		case "completed":
+			completed++
+		}
+	}
+	visSpy.mu.Unlock()
+	if started != 2 || completed != 2 {
+		t.Fatalf("镜像事件 started=%d completed=%d, want 2/2", started, completed)
+	}
+	if len(taskIDs) != 2 {
+		t.Fatalf("并行桥 taskID 必须互异: %v", taskIDs)
+	}
+	if got := visSpy.act.activeSubagents.Load(); got != 0 {
+		t.Fatalf("activeSubagents = %d, want 0（begin/end 配平）", got)
 	}
 }

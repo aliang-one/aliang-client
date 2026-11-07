@@ -155,7 +155,7 @@ func TestAgentCoreSubagentBridgeExecute(t *testing.T) {
 
 func TestAgentCoreSubagentBridgeDepthOne(t *testing.T) {
 	bridge := &agentCoreSubagentBridge{name: "reviewer"}
-	reg := bridge.subRegistry(nil, true)
+	reg := bridge.subRegistry(nil, nil)
 	if _, ok := reg.Get("reviewer"); ok {
 		t.Fatalf("子 registry 不得包含子 agent 桥（depth=1 结构保证）")
 	}
@@ -174,7 +174,7 @@ func TestAgentCoreSubagentBridgeDepthOne(t *testing.T) {
 
 func TestAgentCoreSubagentToolsWhitelist(t *testing.T) {
 	bridge := &agentCoreSubagentBridge{name: "w", toolsWhitelist: []string{"Read", "Grep"}}
-	reg := bridge.subRegistry(nil, false)
+	reg := bridge.subRegistry(nil, nil)
 	for _, name := range []string{"Read", "Grep", "Write", "Bash", "LS"} {
 		_, ok := reg.Get(name)
 		want := name == "Read" || name == "Grep"
@@ -231,7 +231,7 @@ func TestAgentCoreSubagentToolsAssembly(t *testing.T) {
 
 	m := newAgentAIManager()
 	tools := m.agentCoreSubagentTools(agentAIRun{sessionID: "s", projectPath: "/tmp/p"},
-		nil, nil, nil, nil, nil)
+		nil, nil, nil, nil, nil, nil)
 	if len(tools) != 2 {
 		t.Fatalf("桥数 = %d, want 2: %+v", len(tools), tools)
 	}
@@ -250,7 +250,7 @@ func TestAgentCoreSubagentToolsAssembly(t *testing.T) {
 	setTestAgentHome(t)
 	m2 := newAgentAIManager()
 	if got := m2.agentCoreSubagentTools(agentAIRun{sessionID: "s2", projectPath: "/tmp/p"},
-		nil, nil, nil, nil, nil); got != nil {
+		nil, nil, nil, nil, nil, nil); got != nil {
 		t.Fatalf("空定义集应返回 nil, got %+v", got)
 	}
 }
@@ -268,14 +268,14 @@ func TestAgentCoreSubagentRegistryIncludesPeerTools(t *testing.T) {
 		name:      "reviewer",
 		peerTools: func() []agentcore.Tool { return peerTools },
 	}
-	registry := bridge.subRegistry(nil, false)
+	registry := bridge.subRegistry(nil, nil)
 	for _, want := range []string{"peer.exec", "peer.fetch_file", "peer.device_info", "peer.device_note", "peer.device_list"} {
 		if _, ok := registry.Get(want); !ok {
 			t.Fatalf("sub registry missing peer tool %s", want)
 		}
 	}
 	// peerTools=nil(理论不可达,防御)不注入、不炸。
-	plain := (&agentCoreSubagentBridge{name: "x"}).subRegistry(nil, false)
+	plain := (&agentCoreSubagentBridge{name: "x"}).subRegistry(nil, nil)
 	if _, ok := plain.Get("peer.exec"); ok {
 		t.Fatalf("nil peerTools must not register peer.exec")
 	}

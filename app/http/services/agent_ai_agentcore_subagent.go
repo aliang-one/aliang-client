@@ -8,11 +8,13 @@ package services
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -214,6 +216,10 @@ type agentCoreSubagentBridge struct {
 	// 出，装配期求值一次；2026-11-05 审计盲点 3——此前只注主 run System，
 	// 子 registry 明明有 Read，渐进披露对子 agent 却失效）。空串=无副作用。
 	skillsBlock string
+	// mirror 是子 run 状态镜像（ai.subagent started/progress/completed|failed，
+	// 2026-11-07：手机端此前对 agentcore 派发的子 agent 全程无感知）。nil=不发
+	// （宿主未接线/既有测试路径），完全无感。
+	mirror *agentCoreSubagentMirror
 }
 
 // TimeoutHint 覆盖内核默认单工具窗口（agentcore.TimeoutHint）。
@@ -233,6 +239,102 @@ func (b *agentCoreSubagentBridge) subSystem() string {
 
 // truncateAgentCoreSubagentTask 把 task 入参封到 maxBytes 字节内（rune 安全：
 // 回退到完整 UTF-8 边界，绝不送非法字节序列上游），尾部附截断标记。
+
+// agentCoreSubagentMirror 把 agentcore 子 run 的生命周期镜像成 ai.subagent
+// 协议事件——此前该通道是 claude 专属，用户在手机上派 N 个子 agent（实测
+// 2026-11-06 派 3 个调研）全程无感知。复用 claude 侧同一套基座：
+// run.subagents registry（cap 64/upsert）+ activity.beginSubagent/endSubagent
+// （idle 暂停+watchdog subagent ceiling 对 agentcore 子 run 同样生效）+
+// agentAISubagentPayload 同款帧形（手机端 SubagentRows 零改动渲染）。帧经
+// emit（newAgentCoreEmit 管道，JSON+\n 按行）进 ai 事件流，不进父 delta 流
+// （子 run 仍静默 Emit=nil，防帧交错约束不变）。
+//
+// nil 安全：桥 mirror=nil（宿主未接线/既有测试路径）完全无感。
+type agentCoreSubagentMirror struct {
+	registry  *agentAISubagentRegistry
+	activity  *agentAIActivity
+	emit      func([]byte) error
+	sessionID string
+	messageID string
+	seq       atomic.Int64
+}
+
+// start 登记 started。tracked=false 表示 registry 拒收（cap 满），后续
+// progress/finish 对该 taskID 静默降级（与 claude 侧 registry 满载 fail-soft
+// 同语义——轨迹丢，任务不受影响）。
+func (m *agentCoreSubagentMirror) start(bridgeName, description string) (string, bool) {
+	if m == nil {
+		return "", false
+	}
+	taskID := fmt.Sprintf("agentcore-%s-%d", bridgeName, m.seq.Add(1))
+	// registry 以 toolUseID 为主键且非空必填——agentcore 侧没有 CC 的
+	// tool_use_id，taskID 兼任（progress/finish 经 taskAliases 解析）。
+	record, ok := m.registry.start(taskID, taskID, m.messageID, description, bridgeName, 1, "", false, time.Now())
+	if !ok {
+		return taskID, false
+	}
+	m.activity.beginSubagent()
+	m.emitRecord(record)
+	return taskID, true
+}
+
+// progress 由子 run 工具调用驱动（current_step/last_tool/tool_uses 进手机
+// 状态行），并对齐 claude 侧语义喂 watchdog 进度钟（subagentProgress——子
+// run 静默期间主 run 无 delta，不喂钟的话 no-progress 窗口会误杀长任务）。
+func (m *agentCoreSubagentMirror) progress(taskID, currentStep, lastTool string, uses int) {
+	if m == nil || taskID == "" {
+		return
+	}
+	record, ok := m.registry.progress(taskID, time.Now(), agentAISubagentProgress{
+		CurrentStep: currentStep,
+		LastTool:    lastTool,
+		ToolUses:    uses,
+	})
+	if !ok {
+		return
+	}
+	m.activity.subagentProgress()
+	m.emitRecord(record)
+}
+
+// finish 登记终态（completed|failed）并配平 activity 计数。summary 截到
+// 200 rune——claude 侧 Summary 是短摘要，手机 SubagentRows 只渲染两行；
+// 完整最终文本已经在桥的返回值里（64KB 封顶），不重复进帧。
+func (m *agentCoreSubagentMirror) finish(bridgeName, taskID, phase, summary string, duration time.Duration, totalTokens int64) {
+	if m == nil || taskID == "" {
+		return
+	}
+	record, ok := m.registry.finish(taskID, phase, truncateAgentText(summary, 200), time.Now())
+	if ok {
+		record.TotalTokens = totalTokens
+		// 测量粒度下限：极快子 run（本地回环可亚毫秒）取整后为 0，payload
+		// builder 对 0 值省键——手机端就看不到耗时字段了，标 1ms 兜底。
+		ms := duration.Milliseconds()
+		if ms < 1 {
+			ms = 1
+		}
+		record.DurationMs = ms
+		if record.EndedAt.IsZero() {
+			record.EndedAt = time.Now()
+		}
+		m.emitRecord(record)
+	}
+	m.activity.endSubagent()
+}
+
+// emitRecord 与内核帧同构：JSON+换行（宿主按行读），session_id 由
+// agentAISubagentPayload 携带。
+func (m *agentCoreSubagentMirror) emitRecord(record agentAISubagent) {
+	if m.emit == nil {
+		return
+	}
+	raw, err := json.Marshal(agentAISubagentPayload(m.sessionID, record))
+	if err != nil {
+		return
+	}
+	raw = append(raw, '\n')
+	_ = m.emit(raw)
+}
 func truncateAgentCoreSubagentTask(task string, maxBytes int) string {
 	if maxBytes <= 0 || len(task) <= maxBytes {
 		return task
@@ -279,8 +381,9 @@ func agentCoreSubagentModel(defModel, mainModel string) string {
 // 精确匹配，白名单未知名忽略+Warn）+ MCP 桥 + peer 设备互访桥（两者自带
 // onCall/journal 无需装饰、不受 frontmatter 白名单过滤——白名单语义只对
 // 内核内置名生效，与 MCP 既有先例一致）；**不含任何子 agent 桥（depth=1
-// 结构保证）**。
-func (b *agentCoreSubagentBridge) subRegistry(mcpTools []agentcore.Tool, journal bool) *agentcore.Registry {
+// 结构保证）**。toolHook 非 nil 时内置工具经装饰器回调（journal+状态镜像
+// 组合钩子，由 Execute 组装）；nil=不装饰。
+func (b *agentCoreSubagentBridge) subRegistry(mcpTools []agentcore.Tool, toolHook func(tool, summary string, isErr bool)) *agentcore.Registry {
 	base := agentcore.DefaultRegistry()
 	registry := agentcore.NewRegistry()
 	kernelDefs := base.Defs()
@@ -294,8 +397,8 @@ func (b *agentCoreSubagentBridge) subRegistry(mcpTools []agentcore.Tool, journal
 		if len(b.toolsWhitelist) > 0 && !containsString(b.toolsWhitelist, def.Name) {
 			continue
 		}
-		if journal && b.onToolCall != nil {
-			tool = &agentCoreJournalToolDecorator{inner: tool, onCall: b.onToolCall}
+		if toolHook != nil {
+			tool = &agentCoreJournalToolDecorator{inner: tool, onCall: toolHook}
 		}
 		registry.Register(tool)
 	}
@@ -364,11 +467,39 @@ func (b *agentCoreSubagentBridge) Execute(ctx context.Context, input map[string]
 	if b.mcpTools != nil {
 		mcpTools = b.mcpTools()
 	}
+	// 状态镜像：started → progress（子 run 工具调用驱动）→ completed|failed。
+	// 终态在 defer 里发（text/isErr 就绪后）；journal 闭包与 progress 组成
+	// 同一装饰钩子——journal 落行语义不变，镜像只在接线时叠加。
+	startedAt := time.Now()
+	isErr := false
+	text := ""
+	var totalTokens int64
+	subTaskID, tracked := b.mirror.start(b.name, b.description)
+	var toolUses atomic.Int64
+	defer func() {
+		phase := "completed"
+		if isErr {
+			phase = "failed"
+		}
+		b.mirror.finish(b.name, subTaskID, phase, text, time.Since(startedAt), totalTokens)
+	}()
+	var toolHook func(tool, summary string, isErr bool)
+	if tracked {
+		toolHook = func(tool, summary string, isErr bool) {
+			if b.onToolCall != nil {
+				b.onToolCall(tool, summary, isErr)
+			}
+			n := int(toolUses.Add(1))
+			b.mirror.progress(subTaskID, fmt.Sprintf("工具 #%d: %s", n, tool), tool, n)
+		}
+	} else if b.onToolCall != nil {
+		toolHook = b.onToolCall
+	}
 	cfg := &agentcore.Config{
 		Client:  b.client,
 		Model:   agentCoreSubagentModel(b.defModel, b.mainModel),
 		System:  b.subSystem(),
-		Tools:   b.subRegistry(mcpTools, true),
+		Tools:   b.subRegistry(mcpTools, toolHook),
 		Env:     b.env,
 		Approve: b.approve,
 		Logf:    b.logf,
@@ -380,14 +511,14 @@ func (b *agentCoreSubagentBridge) Execute(ctx context.Context, input map[string]
 		// Emit/Hooks 刻意 nil（spec §3）。
 	}
 	res, err := agentcore.Run(ctx, cfg, []agentcore.Message{{Role: "user", Content: task}})
-	isErr := false
-	text := ""
 	if err != nil {
 		isErr, text = true, "子 agent 执行失败: "+err.Error()
 	} else if res != nil && res.IsError {
 		isErr, text = true, "子 agent 内部错误: "+res.Text
 	} else if res != nil {
 		text = res.Text
+		// 子 run token 用量（对照 claude 侧 progress usage.total_tokens）。
+		totalTokens = int64(res.Usage.InputTokens + res.Usage.OutputTokens)
 	}
 	// Task 调用本身也记 tool 行（spec §7：Task 调用与子 run 内部调用都记）。
 	// 时序：这行在子 run 结束后才落（完成时刻），子 run 内部工具行（装饰器）
@@ -423,7 +554,8 @@ func (m *agentAIManager) agentCoreSubagentTools(run agentAIRun,
 	client *agentcore.Client, env *agentcore.ToolEnv,
 	approve func(context.Context, agentcore.ApprovalRequest) (agentcore.ApprovalResponse, error),
 	logf func(string, ...interface{}),
-	mcpTools []agentcore.Tool) []agentcore.Tool {
+	mcpTools []agentcore.Tool,
+	mirror *agentCoreSubagentMirror) []agentcore.Tool {
 
 	defs := agentCoreSubagentDefsIn(agentHome())
 	if len(defs) == 0 {
@@ -487,6 +619,7 @@ func (m *agentAIManager) agentCoreSubagentTools(run agentAIRun,
 			contextWindow:  run.contextWindow,
 			toolCeiling:    agentCoreSubagentToolCeiling(),
 			skillsBlock:    skillsBlock,
+			mirror:         mirror,
 		})
 	}
 	logger.Info(fmt.Sprintf("agentcore-subagent: 注入 %d 个子 agent 桥", len(out)))

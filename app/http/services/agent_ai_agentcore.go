@@ -1372,6 +1372,24 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 	// 不带的话，不在 anthropic-duration 组里的账号会被 403 挡下（见
 	// agentCoreAuthToken 注释）。拿不到 key 时 WithAPIKey("") 等价于不带，
 	// 行为退回「由代理按分组兜底」。
+	// emit 管道提前到子 agent 注入之前：ai.subagent 状态镜像（agentCoreSubagentMirror）
+	// 需要把桥的 started/progress/终态写进同一条 ai 帧流（2026-11-07：此前
+	// agentcore 派发的子 agent 手机端全程无感知，ai.subagent 通道为 claude 专属）。
+	emitFrame, stopEmit := newAgentCoreEmit(ctx, pipeWriter)
+	defer stopEmit()
+	// 镜像复用 claude 侧同一套基座：run.subagents registry+activity
+	// begin/endSubagent（idle 暂停+watchdog subagent ceiling）+同款 payload。
+	// run.subagents 为 nil 的防御（直构 run 的测试路径）：mirror 退化为 no-op。
+	subagentMirror := &agentCoreSubagentMirror{
+		registry:  run.subagents,
+		activity:  run.activity,
+		emit:      emitFrame,
+		sessionID: run.sessionID,
+		messageID: run.messageID,
+	}
+	if run.subagents == nil {
+		subagentMirror = nil
+	}
 	kernelClient := agentcore.NewClient(agentCoreBaseURL()).WithAPIKey(agentCoreAuthToken())
 	kernelEnv := &agentcore.ToolEnv{
 		ProjectPath: run.projectPath,
@@ -1399,7 +1417,7 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 	// 定义集为空不注入。桥递归子 run（depth=1），MCP 桥/审批/journal/围栏
 	// 全部复用主 run 的这一份。
 	if !run.readOnly {
-		if subTools := m.agentCoreSubagentTools(run, kernelClient, kernelEnv, kernelApprove, kernelLogf, mcpTools); len(subTools) > 0 {
+		if subTools := m.agentCoreSubagentTools(run, kernelClient, kernelEnv, kernelApprove, kernelLogf, mcpTools, subagentMirror); len(subTools) > 0 {
 			for _, tool := range subTools {
 				registry.Register(tool)
 			}
@@ -1416,9 +1434,6 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 			registry.Register(tool)
 		}
 	}
-
-	emitFrame, stopEmit := newAgentCoreEmit(ctx, pipeWriter)
-	defer stopEmit()
 
 	cfg := &agentcore.Config{
 		Client: kernelClient,
