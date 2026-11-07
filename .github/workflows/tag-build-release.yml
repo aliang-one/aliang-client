@@ -141,6 +141,11 @@ jobs:
             archive_ext: zip
             package_type: pkg
     steps:
+      - name: Enable Windows long paths (gemini-cli vendor 树含 >260 字符路径)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: git config --global core.longpaths true
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
