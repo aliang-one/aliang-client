@@ -2,8 +2,10 @@ package ssh
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
+	"sync"
 	"time"
 
 	"aliang.one/nursorgate/inbound/tun/dialer"
@@ -58,7 +60,8 @@ func authMethods(n nodeConfig) ([]gossh.AuthMethod, error) {
 	return methods, nil
 }
 
-// chainDialer 负责把一条完整链(可选逐跳穿透)建立成最终 *gossh.Client。
+// chainDialer 负责把一条完整链(可选逐跳穿透)建立成最终 *cascadeClient
+//(Close 级联关全部跳,其余语义经内嵌 *gossh.Client 透传)。
 type chainDialer struct {
 	hosts *KnownHosts
 	nodes []nodeConfig // jumps + final
@@ -74,32 +77,55 @@ func newChainDialer(final nodeConfig, jumps []nodeConfig, hosts *KnownHosts) *ch
 // handshakeTimeout 约束单跳的完整握手:version 协商+密钥交换+用户认证。
 const handshakeTimeout = 15 * time.Second
 
+// cascadeClient 是 dialChain 的最终交付形态:内嵌 *gossh.Client 透传全部
+// 语义(OpenChannel/Dial/DialContext/…,调用方只需这些),Close 替换为
+// 级联关闭——先关最终跳,再从最后一跳往前依次关闭全部前序跳。任何一跳
+// 关闭出错都不阻断后续跳的关闭(逐跳收集、errors.Join 汇总);幂等
+// (sync.Once),重复 Close 返回首次结果。
+type cascadeClient struct {
+	*gossh.Client
+	prior []*gossh.Client // 前序跳(不含最终跳)
+	once  sync.Once
+	err   error
+}
+
+func (c *cascadeClient) Close() error {
+	c.once.Do(func() {
+		errs := []error{c.Client.Close()}
+		for i := len(c.prior) - 1; i >= 0; i-- {
+			errs = append(errs, c.prior[i].Close())
+		}
+		c.err = errors.Join(errs...)
+	})
+	return c.err
+}
+
 // dialChain 建链:第 0 跳 TCP 直连;后续跳经前一跳的 direct-tcpip 到下一跳
 // 的 sshd,再在其上跑 NewClientConn——即 OpenSSH ProxyJump 语义。
-// 中途任何一跳失败都会关闭已建的前序跳,不留半开链。
-func (d *chainDialer) dialChain(ctx context.Context) (*gossh.Client, error) {
-	var client *gossh.Client
-	// clients 全量收集每跳句柄:循环变量 client 会被逐跳覆盖,不收集则
-	// 前序跳句柄丢失。级联关闭(最终 Close 级联关前跳)由后续任务在此消费。
+// 中途任何一跳失败都会关闭全部已建跳(从最后一跳往前),不留半开链;
+// 成功时返回级联 Close 的最终 client(见 cascadeClient)。
+func (d *chainDialer) dialChain(ctx context.Context) (*cascadeClient, error) {
+	// clients 全量收集每跳句柄:循环变量会被逐跳覆盖,不收集则前序跳
+	// 句柄丢失,失败清场与级联关闭都依赖这份全量。
 	var clients []*gossh.Client
 	for i, n := range d.nodes {
 		if err := ctx.Err(); err != nil {
-			closeClient(client)
+			closeClients(clients)
 			return nil, err
 		}
 		auths, err := authMethods(n)
 		if err != nil {
-			closeClient(client)
+			closeClients(clients)
 			return nil, fmt.Errorf("hop %d auth %s: %w", i, n.hostport, err)
 		}
 		var underlying net.Conn
 		if i == 0 {
 			underlying, err = dialer.DialContext(ctx, "tcp", n.hostport)
 		} else {
-			underlying, err = client.DialContext(ctx, "tcp", n.hostport) // 带 ctx(v0.48 签名)
+			underlying, err = clients[i-1].DialContext(ctx, "tcp", n.hostport) // 带 ctx(v0.48 签名)
 		}
 		if err != nil {
-			closeClient(client)
+			closeClients(clients)
 			return nil, fmt.Errorf("hop %d dial %s: %w", i, n.hostport, err)
 		}
 		// ClientConfig.Timeout 只在 gossh.Dial 的 TCP 段生效,直连
@@ -119,17 +145,22 @@ func (d *chainDialer) dialChain(ctx context.Context) (*gossh.Client, error) {
 		_ = underlying.SetDeadline(time.Time{})
 		if derr != nil {
 			_ = underlying.Close()
-			closeClient(client)
+			closeClients(clients)
 			return nil, fmt.Errorf("hop %d handshake %s: %w", i, n.hostport, derr)
 		}
-		client = gossh.NewClient(cc, chans, reqs)
-		clients = append(clients, client)
+		clients = append(clients, gossh.NewClient(cc, chans, reqs))
 	}
-	return client, nil
+	if len(clients) == 0 {
+		// newChainDialer 恒追加 final 节点,正常构造不会走到;防御性兜底。
+		return nil, fmt.Errorf("empty chain")
+	}
+	return &cascadeClient{Client: clients[len(clients)-1], prior: clients[:len(clients)-1]}, nil
 }
 
-func closeClient(c *gossh.Client) {
-	if c != nil {
-		_ = c.Close()
+// closeClients 从最后一跳往前关闭全部 clients(失败路径清场:必须全量,
+// 只关最近一跳会让更早的跳半开)。
+func closeClients(clients []*gossh.Client) {
+	for i := len(clients) - 1; i >= 0; i-- {
+		_ = clients[i].Close()
 	}
 }
