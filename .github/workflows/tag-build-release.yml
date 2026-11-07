@@ -29,7 +29,7 @@ jobs:
         id: check
         shell: bash
         run: |
-          git fetch origin master --depth=1
+          git fetch origin master
           TAG_COMMIT="$(git rev-list -n 1 "${GITHUB_REF_NAME}")"
           if git merge-base --is-ancestor "$TAG_COMMIT" origin/master; then
             echo "on_master=true" >> "$GITHUB_OUTPUT"
