@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strconv"
 	"sync"
 	"time"
 
@@ -12,17 +13,32 @@ import (
 	gossh "golang.org/x/crypto/ssh"
 )
 
-// nodeConfig 是链上一个 SSH 节点(跳板或终点)的连接参数。
-type nodeConfig struct {
-	hostport      string
-	user          string
-	password      string
-	privateKey    string
-	keyPassphrase string
+// NodeConfig 是链上一个 SSH 节点(跳板或终点)的连接参数(导出形态,
+// registry 组装用)。
+type NodeConfig struct {
+	Host          string // 不含端口
+	Port          uint16
+	User          string
+	Password      string
+	PrivateKey    string
+	KeyPassphrase string
 }
 
-func finalNode(hostport, user, pass, key, keyPass string) nodeConfig {
-	return nodeConfig{hostport: hostport, user: user, password: pass, privateKey: key, keyPassphrase: keyPass}
+// NodeFromAddrPort 组装节点(Host+Port 分立,registry 侧来自配置解析)。
+func NodeFromAddrPort(host string, port uint16, user, pass, key, keyPass string) NodeConfig {
+	return NodeConfig{
+		Host:          host,
+		Port:          port,
+		User:          user,
+		Password:      pass,
+		PrivateKey:    key,
+		KeyPassphrase: keyPass,
+	}
+}
+
+// hostPort 返回节点的 "host:port" 拨号形态(IPv6 由 JoinHostPort 加方括号)。
+func (n NodeConfig) hostPort() string {
+	return net.JoinHostPort(n.Host, strconv.Itoa(int(n.Port)))
 }
 
 // authMethods 返回节点可用认证方式;私钥解析失败返回错误(New 时即校验,
@@ -31,26 +47,26 @@ func finalNode(hostport, user, pass, key, keyPass string) nodeConfig {
 // 会在收到失败应答的 allowed-methods 列表后跳过,不会白发一次交互请求,
 // 因此对只支持 password 的服务器没有额外往返;对只支持 keyboard-interactive
 // 的服务器(常见于禁用 password 的加固 sshd)则靠它认证成功。
-func authMethods(n nodeConfig) ([]gossh.AuthMethod, error) {
+func authMethods(n NodeConfig) ([]gossh.AuthMethod, error) {
 	var methods []gossh.AuthMethod
-	if n.password != "" {
-		methods = append(methods, gossh.Password(n.password))
+	if n.Password != "" {
+		methods = append(methods, gossh.Password(n.Password))
 		methods = append(methods, gossh.KeyboardInteractive(
 			func(_ string, _ string, questions []string, _ []bool) ([]string, error) {
 				answers := make([]string, len(questions))
 				for i := range answers {
-					answers[i] = n.password
+					answers[i] = n.Password
 				}
 				return answers, nil
 			}))
 	}
-	if n.privateKey != "" {
+	if n.PrivateKey != "" {
 		var signer gossh.Signer
 		var err error
-		if n.keyPassphrase != "" {
-			signer, err = gossh.ParsePrivateKeyWithPassphrase([]byte(n.privateKey), []byte(n.keyPassphrase))
+		if n.KeyPassphrase != "" {
+			signer, err = gossh.ParsePrivateKeyWithPassphrase([]byte(n.PrivateKey), []byte(n.KeyPassphrase))
 		} else {
-			signer, err = gossh.ParsePrivateKey([]byte(n.privateKey))
+			signer, err = gossh.ParsePrivateKey([]byte(n.PrivateKey))
 		}
 		if err != nil {
 			return nil, fmt.Errorf("parse private key: %w", err)
@@ -64,11 +80,11 @@ func authMethods(n nodeConfig) ([]gossh.AuthMethod, error) {
 // (Close 级联关全部跳,其余语义经内嵌 *gossh.Client 透传)。
 type chainDialer struct {
 	hosts *KnownHosts
-	nodes []nodeConfig // jumps + final
+	nodes []NodeConfig // jumps + final
 }
 
-func newChainDialer(final nodeConfig, jumps []nodeConfig, hosts *KnownHosts) *chainDialer {
-	nodes := make([]nodeConfig, 0, len(jumps)+1)
+func newChainDialer(final NodeConfig, jumps []NodeConfig, hosts *KnownHosts) *chainDialer {
+	nodes := make([]NodeConfig, 0, len(jumps)+1)
 	nodes = append(nodes, jumps...)
 	nodes = append(nodes, final)
 	return &chainDialer{hosts: hosts, nodes: nodes}
@@ -126,17 +142,17 @@ func (d *chainDialer) dialChain(ctx context.Context) (*cascadeClient, error) {
 		auths, err := authMethods(n)
 		if err != nil {
 			closeClients(clients)
-			return nil, fmt.Errorf("hop %d auth %s: %w", i, n.hostport, err)
+			return nil, fmt.Errorf("hop %d auth %s: %w", i, n.hostPort(), err)
 		}
 		var underlying net.Conn
 		if i == 0 {
-			underlying, err = dialer.DialContext(ctx, "tcp", n.hostport)
+			underlying, err = dialer.DialContext(ctx, "tcp", n.hostPort())
 		} else {
-			underlying, err = clients[i-1].DialContext(ctx, "tcp", n.hostport) // 带 ctx(v0.48 签名)
+			underlying, err = clients[i-1].DialContext(ctx, "tcp", n.hostPort()) // 带 ctx(v0.48 签名)
 		}
 		if err != nil {
 			closeClients(clients)
-			return nil, fmt.Errorf("hop %d dial %s: %w", i, n.hostport, err)
+			return nil, fmt.Errorf("hop %d dial %s: %w", i, n.hostPort(), err)
 		}
 		// ClientConfig.Timeout 只在 gossh.Dial 的 TCP 段生效,直连
 		// NewClientConn 不吃它;手动给底层 conn 设 deadline 让整段握手
@@ -147,16 +163,16 @@ func (d *chainDialer) dialChain(ctx context.Context) (*cascadeClient, error) {
 		// supported"——即这些跳的握手当前无超时保护(候选修复:带超时的
 		// conn 包装或握手看门狗,留给后续任务)。
 		_ = underlying.SetDeadline(time.Now().Add(handshakeTimeout))
-		cc, chans, reqs, derr := gossh.NewClientConn(underlying, n.hostport, &gossh.ClientConfig{
-			User:            n.user,
+		cc, chans, reqs, derr := gossh.NewClientConn(underlying, n.hostPort(), &gossh.ClientConfig{
+			User:            n.User,
 			Auth:            auths,
-			HostKeyCallback: d.hosts.CallbackFor(n.hostport),
+			HostKeyCallback: d.hosts.CallbackFor(n.hostPort()),
 		})
 		_ = underlying.SetDeadline(time.Time{})
 		if derr != nil {
 			_ = underlying.Close()
 			closeClients(clients)
-			return nil, fmt.Errorf("hop %d handshake %s: %w", i, n.hostport, derr)
+			return nil, fmt.Errorf("hop %d handshake %s: %w", i, n.hostPort(), derr)
 		}
 		clients = append(clients, gossh.NewClient(cc, chans, reqs))
 	}

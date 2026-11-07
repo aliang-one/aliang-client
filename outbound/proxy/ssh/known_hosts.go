@@ -1,4 +1,3 @@
-// Package ssh 实现基于 SSH 链(跳板+终点)的出站代理。
 package ssh
 
 import (

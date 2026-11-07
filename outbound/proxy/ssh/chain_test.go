@@ -95,7 +95,7 @@ func TestDialChainCascadeCloseNoLeak(t *testing.T) {
 	baseline := runtime.NumGoroutine()
 
 	d := newChainDialer(finalNode(finalAddr, "fu", "fp", "", ""),
-		[]nodeConfig{finalNode(jumpAddr, "ju", "jp", "", "")}, newTestKnownHosts(t))
+		[]NodeConfig{finalNode(jumpAddr, "ju", "jp", "", "")}, newTestKnownHosts(t))
 	client, err := d.dialChain(context.Background())
 	if err != nil {
 		t.Fatalf("dialChain: %v", err)
@@ -121,7 +121,7 @@ func TestDialChainFailureClosesAllHopsNoLeak(t *testing.T) {
 	baseline := runtime.NumGoroutine()
 
 	d := newChainDialer(finalNode(finalAddr, "fu", "WRONG", "", ""),
-		[]nodeConfig{
+		[]NodeConfig{
 			finalNode(j1Addr, "j1", "p1", "", ""),
 			finalNode(j2Addr, "j2", "p2", "", ""),
 		}, newTestKnownHosts(t))
@@ -147,7 +147,7 @@ func TestDialChainOneJumpEcho(t *testing.T) {
 	_, finalAddr := sshtest.Start(t, sshtest.WithUsername("fu"), sshtest.WithPassword("fp"))
 
 	d := newChainDialer(finalNode(finalAddr, "fu", "fp", "", ""),
-		[]nodeConfig{finalNode(jumpAddr, "ju", "jp", "", "")}, newTestKnownHosts(t))
+		[]NodeConfig{finalNode(jumpAddr, "ju", "jp", "", "")}, newTestKnownHosts(t))
 	client, err := d.dialChain(context.Background())
 	if err != nil {
 		t.Fatalf("1-hop dialChain: %v", err)
@@ -183,7 +183,7 @@ func TestDialChainTwoJumpsEcho(t *testing.T) {
 	_, finalAddr := sshtest.Start(t, sshtest.WithUsername("fu"), sshtest.WithPassword("fp"))
 
 	d := newChainDialer(finalNode(finalAddr, "fu", "fp", "", ""),
-		[]nodeConfig{
+		[]NodeConfig{
 			finalNode(j1Addr, "j1", "p1", "", ""),
 			finalNode(j2Addr, "j2", "p2", "", ""),
 		}, newTestKnownHosts(t))
