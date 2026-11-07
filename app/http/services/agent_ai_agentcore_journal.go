@@ -570,6 +570,66 @@ func (j *agentCoreJournal) appendTool(sessionID, tool, summary string, isError b
 	})
 }
 
+// appendSubagentStart 落 kind=subagent/event=start 行：子 agent 跑起来
+// 即写一行（spec subagent-panel）。taskID 形如 agentcore-<messageID>-<name>-<n>，
+// 自带回合 messageID 消歧。守卫与 appendTool 同款；写失败 Warn 吞掉。
+func (j *agentCoreJournal) appendSubagentStart(sessionID, taskID, name, description string) {
+	if j == nil || j.dir == "" || strings.TrimSpace(sessionID) == "" {
+		return
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.appendLineLocked(sessionID, map[string]interface{}{
+		"kind":        "subagent",
+		"event":       "start",
+		"task_id":     taskID,
+		"name":        name,
+		"description": description,
+		"ts":          time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
+// appendSubagentTool 落子 agent 的工具轨迹行：与主会话工具行同 kind=tool，
+// 但多带 subagent_task_id 关联字段——读侧按 task_id 聚合子 agent 轨迹，
+// 不与主会话工具混流。守卫与 appendTool 同款；写失败 Warn 吞掉。
+func (j *agentCoreJournal) appendSubagentTool(sessionID, taskID, tool, summary string, isError bool) {
+	if j == nil || j.dir == "" || strings.TrimSpace(sessionID) == "" {
+		return
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.appendLineLocked(sessionID, map[string]interface{}{
+		"kind":             "tool",
+		"subagent_task_id": taskID,
+		"tool":             tool,
+		"summary":          summary,
+		"is_error":         isError,
+		"ts":               time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
+// appendSubagentFinish 落 kind=subagent/event=finish 行：status=completed|failed，
+// 带 result 全文与 total_tokens/duration_ms 统计。守卫与 appendTool 同款；
+// 写失败 Warn 吞掉。
+func (j *agentCoreJournal) appendSubagentFinish(sessionID, taskID, status, summary, result string, totalTokens, durationMs int64) {
+	if j == nil || j.dir == "" || strings.TrimSpace(sessionID) == "" {
+		return
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.appendLineLocked(sessionID, map[string]interface{}{
+		"kind":         "subagent",
+		"event":        "finish",
+		"task_id":      taskID,
+		"status":       status,
+		"summary":      summary,
+		"result":       result,
+		"total_tokens": totalTokens,
+		"duration_ms":  durationMs,
+		"ts":           time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
 // appendApprovalAudit 落 kind=approval 审计行（决策/取消/超时统一入口，
 // spec §4.5）。不参与去重、不进历史回放：读侧（inventory/history parser）
 // 对未知 kind 忽略。尽力而为；写失败 Warn 吞掉。守卫与 appendTool 同款。

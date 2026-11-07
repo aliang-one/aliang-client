@@ -534,3 +534,43 @@ func TestJournalHistoryPureImageRowKeepsAttachments(t *testing.T) {
 		t.Fatalf("attachments = %+v", hist[0].Attachments)
 	}
 }
+
+// 子 agent 三行写侧契约（subagent-panel spec）：start/finish 行 kind=subagent
+// 带 task_id，tool 关联行沿用 kind=tool 但带 subagent_task_id——读侧按 task_id
+// 聚合轨迹。taskID 含回合 messageID 消歧（spec H1）。
+func TestAppendSubagentLines(t *testing.T) {
+	j := newAgentCoreJournal(t.TempDir())
+	sid := "sess-sub"
+	taskID := "agentcore-msg7-researcher-1" // 含回合 messageID 消歧(spec H1)
+	j.appendSubagentStart(sid, taskID, "researcher", "加密调研")
+	j.appendSubagentTool(sid, taskID, "Grep", "grep 摘要", false)
+	j.appendSubagentFinish(sid, taskID, "completed", "结论摘要",
+		"完整报告全文", 8123, 45230)
+
+	lines := readJournalLines(t, j.dir, sid)
+	var start, tool, finish map[string]interface{}
+	for _, m := range lines {
+		switch m["kind"] {
+		case "subagent":
+			if m["event"] == "start" {
+				start = m
+			} else {
+				finish = m
+			}
+		case "tool":
+			if m["subagent_task_id"] == taskID {
+				tool = m
+			}
+		}
+	}
+	if start == nil || start["name"] != "researcher" || start["description"] != "加密调研" || start["task_id"] != taskID {
+		t.Fatalf("start 行缺失/字段错: %v", start)
+	}
+	if tool == nil || tool["tool"] != "Grep" || tool["is_error"] != false || tool["summary"] != "grep 摘要" {
+		t.Fatalf("tool 关联行缺失/字段错: %v", tool)
+	}
+	if finish == nil || finish["status"] != "completed" || finish["result"] != "完整报告全文" ||
+		finish["summary"] != "结论摘要" || finish["total_tokens"] != float64(8123) || finish["duration_ms"] != float64(45230) || finish["task_id"] != taskID {
+		t.Fatalf("finish 行缺失/字段错: %v", finish)
+	}
+}
