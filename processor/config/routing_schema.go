@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 )
 
 const CanonicalRoutingSchemaVersion = 1
@@ -171,6 +172,15 @@ func (cfg *CanonicalRoutingSchema) Validate() error {
 				return newRoutingSchemaValidationError("disabled_target_branch", targetField, "target branch toSocks is disabled")
 			}
 		default:
+			// mesh 转发目标 toNode:<deviceID>:本层只做形态校验(deviceID 非空);
+			// 能力校验(mesh 总开关 + peer 存在)在运行输入编译层
+			// (processor/routing,见 meshForwardAvailable)把关。
+			if deviceID, isMesh := splitMeshRuleTarget(target); isMesh {
+				if deviceID == "" {
+					return newRoutingSchemaValidationError("invalid_target", targetField, fmt.Sprintf("mesh target requires non-empty device id, got %q", target))
+				}
+				continue
+			}
 			return newRoutingSchemaValidationError("unknown_target", targetField, fmt.Sprintf("unknown target: %s", target))
 		}
 	}
@@ -197,11 +207,33 @@ func (cfg *CanonicalRoutingSchema) Validate() error {
 	return nil
 }
 
+// meshRuleTargetPrefix 是 mesh 转发规则目标的形态前缀(processor/routing 的
+// SnapshotTargetMeshPrefix 同值镜像——config 不能反向 import routing,会成环)。
+// 形态:toNode:<deviceID>,deviceID 非空。mesh 是规则驱动出口,不作 default_egress。
+const meshRuleTargetPrefix = "toNode:"
+
+// splitMeshRuleTarget 解析 toNode:<deviceID> 形态的规则 target。
+// ok=false 表示不是 mesh 形态;deviceID 为 trim 后的值(可能为空,由调用方校验)。
+func splitMeshRuleTarget(target string) (deviceID string, ok bool) {
+	rest, found := strings.CutPrefix(target, meshRuleTargetPrefix)
+	if !found {
+		return "", false
+	}
+	return strings.TrimSpace(rest), true
+}
+
 func normalizeRuleTarget(target string) (string, error) {
 	switch target {
 	case "direct", "toAliang", "toSocks":
 		return target, nil
 	default:
+		// mesh 规则目标 toNode:<deviceID>:规整 deviceID 空白后原样返回
+		// (前缀精确匹配,deviceID 保留原大小写与 peer 比对)。
+		// default_egress 也走本函数归一,但其 Validate 白名单不接受 mesh
+		// 形态——mesh 由规则命中驱动,不允许成为默认出口。
+		if deviceID, isMesh := splitMeshRuleTarget(target); isMesh && deviceID != "" {
+			return meshRuleTargetPrefix + deviceID, nil
+		}
 		return "", fmt.Errorf("unknown target: %s", target)
 	}
 }

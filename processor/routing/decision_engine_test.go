@@ -3,8 +3,45 @@ package routing
 import (
 	"errors"
 	"net"
+	"strings"
 	"testing"
+
+	"aliang.one/nursorgate/common/model"
+	"aliang.one/nursorgate/processor/config"
 )
+
+func TestDecideRouteFromSnapshot_MeshCapabilityUnavailable(t *testing.T) {
+	// mesh 总开关显式关闭:即使 peers 列表含 dev-b,toNode 规则也不得
+	// 编译进快照——能力检查(总开关+peer 存在)在编译期把关。
+	cfg := &config.Config{
+		Customer: &config.CustomerConfig{
+			ProxyRules: []string{"domains,internal.corp,mesh:dev-b"},
+			Mesh: &config.MeshConfig{
+				Enable: boolPtr(false),
+				Peers:  []config.MeshPeer{{DeviceID: "dev-b"}},
+			},
+		},
+	}
+
+	snapshot, err := CompileRuntimeSnapshotFromRuntimeInputs(cfg, model.RulesSettings{})
+	if err != nil {
+		t.Fatalf("CompileRuntimeSnapshotFromRuntimeInputs() error = %v", err)
+	}
+
+	for _, rule := range snapshot.Rules() {
+		if strings.HasPrefix(string(rule.Target()), "toNode:") {
+			t.Fatalf("mesh 总开关关闭时快照不应含 toNode 规则, got rule %+v", rule)
+		}
+	}
+
+	decision, err := DecideRouteFromSnapshot(snapshot, &MatchContext{Domain: "internal.corp"})
+	if err != nil {
+		t.Fatalf("DecideRouteFromSnapshot() error = %v", err)
+	}
+	if decision != RouteDirect {
+		t.Fatalf("decision = %s, want %s (mesh 能力不可用 → 落默认 direct)", decision, RouteDirect)
+	}
+}
 
 func TestMatchGeoIP(t *testing.T) {
 	orig := geoipLookup

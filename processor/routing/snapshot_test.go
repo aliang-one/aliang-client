@@ -450,6 +450,129 @@ func TestRuntimeSnapshot_CompileGeoIPClashStyleRegression(t *testing.T) {
 	}
 }
 
+func TestRuntimeSnapshot_CompileMeshForwardRule(t *testing.T) {
+	cfg := &config.Config{
+		Customer: &config.CustomerConfig{
+			ProxyRules: []string{
+				"domains,internal.corp,mesh:dev-b",
+				"ip-cidr,10.0.0.0/8,mesh:dev-b",
+				"dns,mesh:dev-b",
+			},
+			Mesh: &config.MeshConfig{Peers: []config.MeshPeer{{DeviceID: "dev-b"}}},
+		},
+	}
+
+	canonical, err := CompileCanonicalRoutingFromRuntimeInputs(cfg, model.RulesSettings{})
+	if err != nil {
+		t.Fatalf("CompileCanonicalRoutingFromRuntimeInputs() error = %v", err)
+	}
+
+	type wantRule struct {
+		id        string
+		ruleType  string
+		condition string
+		target    string
+	}
+	want := []wantRule{
+		{"proxy_rule_0", string(model.RuleTypeDomain), "internal.corp", "toNode:dev-b"},
+		{"proxy_rule_1", string(model.RuleTypeIP), "10.0.0.0/8", "toNode:dev-b"},
+		{"proxy_rule_2", "dns", "all", "toNode:dev-b"},
+	}
+
+	rules := canonical.Routing.Rules
+	if len(rules) != len(want) {
+		t.Fatalf("rules len = %d, want %d, rules = %+v", len(rules), len(want), rules)
+	}
+	for i, w := range want {
+		got := rules[i]
+		if got.ID != w.id || got.Type != w.ruleType || got.Condition != w.condition || got.Target != w.target {
+			t.Fatalf("rules[%d] = {ID: %s, Type: %s, Condition: %s, Target: %s}, want {ID: %s, Type: %s, Condition: %s, Target: %s}",
+				i, got.ID, got.Type, got.Condition, got.Target, w.id, w.ruleType, w.condition, w.target)
+		}
+	}
+
+	snapshot, err := CompileRuntimeSnapshotFromRuntimeInputs(cfg, model.RulesSettings{})
+	if err != nil {
+		t.Fatalf("CompileRuntimeSnapshotFromRuntimeInputs() error = %v", err)
+	}
+	decision, err := DecideRouteFromSnapshot(snapshot, &MatchContext{Domain: "internal.corp"})
+	if err != nil {
+		t.Fatalf("DecideRouteFromSnapshot() error = %v", err)
+	}
+	if decision != RouteDecision("toNode:dev-b") {
+		t.Fatalf("decision = %s, want toNode:dev-b (mesh 域名规则命中透传)", decision)
+	}
+}
+
+func TestRuntimeSnapshot_MeshTargetUnknownPeerRejected(t *testing.T) {
+	cfg := &config.Config{
+		Customer: &config.CustomerConfig{
+			ProxyRules: []string{
+				"domains,internal.corp,mesh:dev-xyz", // 未知 peer:编译期静默跳过
+				"domains,known.com,mesh:dev-b",       // 已知 peer:正常产出
+			},
+			Mesh: &config.MeshConfig{Peers: []config.MeshPeer{{DeviceID: "dev-b"}}},
+		},
+	}
+
+	canonical, err := CompileCanonicalRoutingFromRuntimeInputs(cfg, model.RulesSettings{})
+	if err != nil {
+		t.Fatalf("CompileCanonicalRoutingFromRuntimeInputs() error = %v", err)
+	}
+
+	rules := canonical.Routing.Rules
+	if len(rules) != 1 {
+		t.Fatalf("rules len = %d, want 1 (未知 peer 的 mesh 条目应编译期静默跳过), rules = %+v", len(rules), rules)
+	}
+	if rules[0].Condition != "known.com" || rules[0].Target != "toNode:dev-b" {
+		t.Fatalf("rules[0] = {Condition: %s, Target: %s}, want {Condition: known.com, Target: toNode:dev-b}",
+			rules[0].Condition, rules[0].Target)
+	}
+}
+
+func TestRuntimeSnapshot_CompileMeshDNSRuleFirstWins(t *testing.T) {
+	cfg := &config.Config{
+		Customer: &config.CustomerConfig{
+			ProxyRules: []string{
+				"dns,mesh:dev-b",
+				"dns,mesh:dev-c",
+			},
+			Mesh: &config.MeshConfig{Peers: []config.MeshPeer{{DeviceID: "dev-b"}, {DeviceID: "dev-c"}}},
+		},
+	}
+
+	canonical, err := CompileCanonicalRoutingFromRuntimeInputs(cfg, model.RulesSettings{})
+	if err != nil {
+		t.Fatalf("CompileCanonicalRoutingFromRuntimeInputs() error = %v", err)
+	}
+
+	rules := canonical.Routing.Rules
+	if len(rules) != 2 {
+		t.Fatalf("rules len = %d, want 2 (两条 dns 指向不同 peer 都保留), rules = %+v", len(rules), rules)
+	}
+	if rules[0].Type != "dns" || rules[0].Condition != "all" || rules[0].Target != "toNode:dev-b" {
+		t.Fatalf("rules[0] = {Type: %s, Condition: %s, Target: %s}, want {Type: dns, Condition: all, Target: toNode:dev-b}",
+			rules[0].Type, rules[0].Condition, rules[0].Target)
+	}
+	if rules[1].Type != "dns" || rules[1].Condition != "all" || rules[1].Target != "toNode:dev-c" {
+		t.Fatalf("rules[1] = {Type: %s, Condition: %s, Target: %s}, want {Type: dns, Condition: all, Target: toNode:dev-c}",
+			rules[1].Type, rules[1].Condition, rules[1].Target)
+	}
+
+	// 首条启用的 dns 规则即决策目标:dns 规则在决策层恒真,first-match 取首条。
+	snapshot, err := CompileRuntimeSnapshotFromRuntimeInputs(cfg, model.RulesSettings{})
+	if err != nil {
+		t.Fatalf("CompileRuntimeSnapshotFromRuntimeInputs() error = %v", err)
+	}
+	decision, err := DecideRouteFromSnapshot(snapshot, &MatchContext{})
+	if err != nil {
+		t.Fatalf("DecideRouteFromSnapshot() error = %v", err)
+	}
+	if decision != RouteDecision("toNode:dev-b") {
+		t.Fatalf("decision = %s, want toNode:dev-b (首条 dns 规则胜出)", decision)
+	}
+}
+
 func TestDecideRouteFromSnapshot_GeoIPConditionMatchesCaseInsensitively(t *testing.T) {
 	// geoipLookup 是包级 seam（非并行安全）：替换后 t.Cleanup 恢复，本测试不加 t.Parallel。
 	orig := geoipLookup
