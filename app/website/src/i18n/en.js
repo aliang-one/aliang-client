@@ -448,10 +448,6 @@ export default {
   dash_balanceHint: 'Low balance — top up to keep proxy running',
   dash_balanceOk: 'Balance is healthy',
   dash_serverLink: 'Server Link',
-  // Sidebar compact cards (2026-11-05 spec): system status / file access
-  dash_systemStatusTitle: 'System Status',
-  dash_systemManage: 'Manage…',
-  dash_fileAccessManage: 'View / Request…',
   dash_scoreLatency: 'Score/Latency',
   dash_state: 'State',
   dash_refreshDashboard: 'Refresh Dashboard',
@@ -592,7 +588,7 @@ export default {
   settings_sectionProxyDesc: 'Outbound proxy, AI rules, routing rules and model mapping. Applies to new sessions and the proxy layer.',
   settings_sectionAgentDesc: 'Session records, the user-mode agent, the aliangcode kernel, and device access settings in one place.',
   settings_sectionAccountDesc: 'Account identity and local display preferences.',
-  settings_sectionStatusDesc: 'Read-only observation: live logs. Device-level switches live under "Other" at the bottom.',
+  settings_sectionStatusDesc: 'Read-only observation: live logs.',
   settings_scopeDevice: 'This device only; not synced across devices',
   settings_scopeLocal: 'This browser only',
   // Agent sub-tabs (four-section reorganisation 2026-11-03; device access added 2026-11-04)

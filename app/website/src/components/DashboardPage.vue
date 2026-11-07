@@ -146,12 +146,6 @@
           </button>
         </div>
       </div>
-      <!-- 系统状态/文件访问授权紧凑卡(2026-11-05 spec):自状态页尾「其他」
-           收编至侧栏;移动端同款组件在下方 data-mobile-panel。 -->
-      <div class="mt-6 space-y-3 px-6">
-        <SystemStatusSidebarCard />
-        <FileAccessSidebarCard />
-      </div>
       <div class="mt-8 px-6 space-y-3">
         <p class="text-[10px] font-bold text-slate-400 uppercase tracking-widest px-1">{{ t('dash_quickTools') }}</p>
         <div class="group relative">
@@ -338,11 +332,6 @@
                 {{ t('dash_reinstall') }}
               </button>
             </div>
-          </div>
-          <!-- 系统状态/文件访问授权紧凑卡(2026-11-05 spec,与桌面侧栏同组件) -->
-          <div class="space-y-3">
-            <SystemStatusSidebarCard />
-            <FileAccessSidebarCard />
           </div>
           <!-- 快捷工具块 -->
           <div class="space-y-3">
@@ -1020,8 +1009,6 @@
 import { computed, ref, onMounted, onUnmounted, watch, nextTick } from 'vue';
 import OnboardingGuide from './OnboardingGuide.vue';
 import ScanLoginPanel from './settings/ScanLoginPanel.vue';
-import SystemStatusSidebarCard from './dashboard/SystemStatusSidebarCard.vue';
-import FileAccessSidebarCard from './dashboard/FileAccessSidebarCard.vue';
 import { isOnboardingCompleted, openOnboardingGuide } from '../composables/useOnboardingGuide';
 import { openTutorialDocs } from '../composables/useTutorialDocs';
 import { useI18n } from '../i18n';

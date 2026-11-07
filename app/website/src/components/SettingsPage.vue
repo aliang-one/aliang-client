@@ -125,44 +125,60 @@
           {{ authNotice }}
         </div>
 
-        <!-- ① 代理设置（设备级）：出站代理 / AI 规则 / 分流 / 模型映射。
+        <!-- ① 代理设置（设备级）：主区=出站代理/AI 规则/分流；右栏=运行模式 +
+             模型映射（2026-11-07 双栏迭代，布局对齐 Agent 页）。
              仅影响未单独设置的新会话与代理层；会话级覆盖在聊天页会话设置条。 -->
         <section v-if="currentPage === 'settings'" class="flex flex-col gap-5">
           <SectionHeader :title="t('settings_tabSettings')" :desc="t('settings_sectionProxyDesc')" scope="device" />
-          <!-- 运行模式随 2026-11-05 spec 迁入(自状态页尾「其他」),置于登录占位
-               之上:设备本地操作与电源按钮同级,不被登录挡。 -->
-          <SystemRunModeSettings />
-          <div
-            v-if="!isAuthenticated"
-            class="rounded-2xl border border-dashed border-slate-300 bg-white px-6 py-8 text-center shadow-sm dark:border-slate-700 dark:bg-slate-900"
-          >
-            <div class="mx-auto max-w-2xl space-y-3">
-              <h2 class="text-xl font-bold text-slate-900 dark:text-white">{{ t('settings_loginRequiredSettings') }}</h2>
-              <p class="text-sm text-slate-500 dark:text-slate-300">
-                {{ t('settings_loginRequiredSettingsDesc') }}
-              </p>
+          <div class="flex flex-col gap-5 lg:flex-row lg:items-start">
+            <div class="flex min-w-0 flex-1 flex-col gap-5">
+              <div
+                v-if="!isAuthenticated"
+                class="rounded-2xl border border-dashed border-slate-300 bg-white px-6 py-8 text-center shadow-sm dark:border-slate-700 dark:bg-slate-900"
+              >
+                <div class="mx-auto max-w-2xl space-y-3">
+                  <h2 class="text-xl font-bold text-slate-900 dark:text-white">{{ t('settings_loginRequiredSettings') }}</h2>
+                  <p class="text-sm text-slate-500 dark:text-slate-300">
+                    {{ t('settings_loginRequiredSettingsDesc') }}
+                  </p>
+                </div>
+              </div>
+              <template v-else>
+                <RulesSettings
+                  :config="customerConfig"
+                  :preset-providers="presetProviders"
+                  :loading="isLoadingCustomerConfig"
+                  :saving="isSavingCustomerConfig"
+                  :error="customerConfigError"
+                  :success-message="customerConfigSuccess"
+                  :version="customerConfigVersion"
+                  @save="saveCustomerConfig"
+                />
+              </template>
             </div>
+            <!-- 右栏:运行模式免登录(设备本地,与电源按钮同级);模型映射依赖
+                 customerConfig,登录后可用。 -->
+            <aside class="w-full shrink-0 space-y-5 lg:w-96">
+              <SystemRunModeSettings />
+              <template v-if="isAuthenticated">
+                <ModelMappingSettings
+                  :config="customerConfig"
+                  :loading="isLoadingCustomerConfig"
+                  :saving="isSavingCustomerConfig"
+                  :error="customerConfigError"
+                  :success-message="customerConfigSuccess"
+                  @save="saveCustomerConfig"
+                />
+              </template>
+              <div
+                v-else
+                class="rounded-xl border border-dashed border-slate-300 bg-white px-4 py-6 text-center dark:border-slate-700 dark:bg-slate-900"
+              >
+                <p class="text-sm font-bold text-slate-900 dark:text-white">{{ t('settings_loginRequiredSettings') }}</p>
+                <p class="mt-1 text-xs text-slate-500 dark:text-slate-300">{{ t('settings_loginRequiredSettingsDesc') }}</p>
+              </div>
+            </aside>
           </div>
-          <template v-else>
-            <ModelMappingSettings
-              :config="customerConfig"
-              :loading="isLoadingCustomerConfig"
-              :saving="isSavingCustomerConfig"
-              :error="customerConfigError"
-              :success-message="customerConfigSuccess"
-              @save="saveCustomerConfig"
-            />
-            <RulesSettings
-              :config="customerConfig"
-              :preset-providers="presetProviders"
-              :loading="isLoadingCustomerConfig"
-              :saving="isSavingCustomerConfig"
-              :error="customerConfigError"
-              :success-message="customerConfigSuccess"
-              :version="customerConfigVersion"
-              @save="saveCustomerConfig"
-            />
-          </template>
         </section>
 
         <!-- ② Agent（设备级）：三子 tab = 记录 / 用户态 agent / aliangcode。
@@ -187,7 +203,8 @@
           <AppearanceSettings />
         </section>
 
-        <!-- ③ 状态（只读观测）：实时日志 + 页尾「其他」设备级杂项区块。 -->
+        <!-- ③ 状态（只读观测）：实时日志。系统状态/文件授权已收编 Agent 页右栏
+             （2026-11-07 三轮迭代定案）。 -->
         <section v-else class="flex flex-col gap-5">
           <SectionHeader :title="t('settings_tabLogs')" :desc="t('settings_sectionStatusDesc')" scope="readonly" />
           <div

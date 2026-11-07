@@ -195,8 +195,8 @@
             </span>
           </div>
           <div class="space-y-1 rounded border border-slate-100 p-2 font-mono text-[10px] text-slate-500 dark:border-slate-800">
-            <div><span class="text-slate-400">{{ t('sys_subject') }}</span> {{ sharedCertStatus?.subject || '-' }}</div>
-            <div><span class="text-slate-400">{{ t('sys_validity') }}</span> {{ sharedCertStatus?.not_before || '-' }} - {{ sharedCertStatus?.not_after || '-' }}</div>
+            <div class="truncate"><span class="text-slate-400">{{ t('sys_subject') }}</span> {{ sharedCertStatus?.subject || '-' }}</div>
+            <div class="truncate"><span class="text-slate-400">{{ t('sys_validity') }}</span> {{ sharedCertStatus?.not_before || '-' }} - {{ sharedCertStatus?.not_after || '-' }}</div>
             <div class="truncate"><span class="text-slate-400">{{ t('sys_finger') }}</span> {{ sharedCertStatus?.fingerprint || '-' }}</div>
           </div>
           <div class="grid grid-cols-2 gap-2">

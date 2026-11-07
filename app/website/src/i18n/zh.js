@@ -445,10 +445,6 @@ export default {
   dash_balanceHint: '余额不足 — 请充值以保持代理运行',
   dash_balanceOk: '余额充足',
   dash_serverLink: '服务器连接',
-  // 侧栏紧凑卡(2026-11-05 spec):系统状态/文件访问授权
-  dash_systemStatusTitle: '系统状态',
-  dash_systemManage: '管理…',
-  dash_fileAccessManage: '查看 / 申请…',
   dash_scoreLatency: '评分/延迟',
   dash_state: '状态',
   dash_refreshDashboard: '刷新仪表板',
@@ -589,7 +585,7 @@ export default {
   settings_sectionProxyDesc: '出站代理、AI 规则、分流规则与模型映射。仅影响新会话与代理层。',
   settings_sectionAgentDesc: '会话记录、用户态 Agent、aliangcode 内核与设备互访设置集中地。',
   settings_sectionAccountDesc: '账户身份与本机显示偏好。',
-  settings_sectionStatusDesc: '只读观测：实时日志；页尾「其他」集中了设备级杂项开关。',
+  settings_sectionStatusDesc: '只读观测：实时日志。',
   settings_scopeDevice: '本机生效，换设备不同步',
   settings_scopeLocal: '仅本机浏览器',
   // Agent 四子 tab（四栏重组 2026-11-03；2026-11-04 增设备互访）
