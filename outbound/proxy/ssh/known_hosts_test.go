@@ -83,3 +83,25 @@ func TestKnownHostsPersistAcrossInstances(t *testing.T) {
 		t.Fatalf("second instance must trust persisted fingerprint: %v", err)
 	}
 }
+
+func TestKnownHostsCorruptFileFailsClosedAndClearRecovers(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "known_hosts")
+	kh := NewKnownHosts(path)
+	signer := testSigner(t)
+
+	if err := os.WriteFile(path, []byte("not json"), 0o600); err != nil {
+		t.Fatalf("seed corrupt file: %v", err)
+	}
+	// 损坏 JSON:fail-closed,拒连
+	if err := kh.CallbackFor("s:22")("s", &net.TCPAddr{}, signer.PublicKey()); err == nil {
+		t.Fatal("corrupt known_hosts must reject connection")
+	}
+	// Clear() 不 load 直接重写,是自愈出口
+	if err := kh.Clear(); err != nil {
+		t.Fatalf("Clear: %v", err)
+	}
+	if err := kh.CallbackFor("s:22")("s", &net.TCPAddr{}, signer.PublicKey()); err != nil {
+		t.Fatalf("re-TOFU after Clear rejected: %v", err)
+	}
+}

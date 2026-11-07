@@ -95,6 +95,10 @@ func (k *KnownHosts) Clear() error {
 	return k.saveLocked(nil)
 }
 
+// loadLocked 从磁盘读指纹库。损坏 JSON(半写/手改坏)时的失败模式三元组:
+//   - CallbackFor 拒连(fail-closed):load 失败即返回 error,绝不放过校验;
+//   - List 返回 nil(UI 看不到任何条目,但不 panic);
+//   - Clear() 可程序化恢复:它不 load、直接重写空库,是唯一的自愈出口。
 func (k *KnownHosts) loadLocked() ([]HostEntry, error) {
 	data, err := os.ReadFile(k.path)
 	if os.IsNotExist(err) {
