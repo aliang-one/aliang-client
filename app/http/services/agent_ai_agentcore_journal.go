@@ -590,7 +590,7 @@ func (j *agentCoreJournal) appendSubagentStart(sessionID, taskID, name, descript
 }
 
 // appendSubagentTool 落子 agent 的工具轨迹行：与主会话工具行同 kind=tool，
-// 但多带 subagent_task_id 关联字段——读侧按 task_id 聚合子 agent 轨迹，
+// 但多带 subagent_task_id 关联字段——读侧将按 task_id 聚合(Task 3 落地)子 agent 轨迹，
 // 不与主会话工具混流。守卫与 appendTool 同款；写失败 Warn 吞掉。
 func (j *agentCoreJournal) appendSubagentTool(sessionID, taskID, tool, summary string, isError bool) {
 	if j == nil || j.dir == "" || strings.TrimSpace(sessionID) == "" {
