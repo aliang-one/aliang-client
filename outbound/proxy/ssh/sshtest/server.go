@@ -19,7 +19,6 @@ import (
 
 // Server 是一台内存 sshd。Password/Authorized 二选一或并存。
 type Server struct {
-	t          *testing.T
 	Listener   net.Listener
 	HostKey    gossh.Signer
 	Password   string
@@ -40,7 +39,7 @@ type Server struct {
 // t.Cleanup 自动注册 Close。
 func Start(t *testing.T, opts ...Option) (*Server, string) {
 	t.Helper()
-	s := &Server{t: t, Username: "tester"}
+	s := &Server{Username: "tester"}
 	for _, o := range opts {
 		o(s)
 	}
@@ -197,7 +196,8 @@ type writeCloseSink interface {
 }
 
 // pipe 双向搬运并逐侧半关:一侧 EOF → CloseWrite 对侧 → 对侧也 EOF → 收尾。
-// a、b 的动态类型都必须实现 writeCloseSink(panic 由调用方契约保证)。
+// a、b 的动态类型都必须实现 writeCloseSink,否则 panic 并指认具体类型
+// (裸断言失败只会崩整个测试二进制且不带任何信息)。
 func pipe(a io.ReadWriter, b io.ReadWriter) {
 	done := make(chan struct{}, 2)
 	copySide := func(dst writeCloseSink, src io.Reader) {
@@ -205,8 +205,16 @@ func pipe(a io.ReadWriter, b io.ReadWriter) {
 		_ = dst.CloseWrite()
 		done <- struct{}{}
 	}
-	go copySide(b.(writeCloseSink), a)
-	go copySide(a.(writeCloseSink), b)
+	asink, ok := a.(writeCloseSink)
+	if !ok {
+		panic("sshtest: conn 必须实现 CloseWrite: " + fmt.Sprintf("%T", a))
+	}
+	bsink, ok := b.(writeCloseSink)
+	if !ok {
+		panic("sshtest: conn 必须实现 CloseWrite: " + fmt.Sprintf("%T", b))
+	}
+	go copySide(bsink, a)
+	go copySide(asink, b)
 	<-done
 	<-done
 }
@@ -246,12 +254,14 @@ func (c chanConn) SetReadDeadline(t time.Time) error  { return nil }
 func (c chanConn) SetWriteDeadline(t time.Time) error { return nil }
 
 // EchoListener 是 direct-tcpip 测试的回显目标,返回地址与幂等 close。
+// 与 Start 对称,t.Cleanup 自动注册 close;返回的 close 供提前收尾用,重复调用安全。
 func EchoListener(t *testing.T) (addr string, close func()) {
 	t.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("echo listen: %v", err)
 	}
+	t.Cleanup(func() { _ = l.Close() })
 	go func() {
 		for {
 			c, err := l.Accept()
