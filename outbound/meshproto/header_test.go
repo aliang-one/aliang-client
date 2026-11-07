@@ -181,6 +181,37 @@ func TestParseAcceptsExactMaxHeader(t *testing.T) {
 	}
 }
 
+func TestDNSTarget(t *testing.T) {
+	if !IsDNSTarget(DNSTarget) {
+		t.Fatal("dns target must be recognized")
+	}
+	if IsDNSTarget("example.com:443") {
+		t.Fatal("host target must not be dns")
+	}
+}
+
+func TestSplitHostPort(t *testing.T) {
+	host, port, isDomain, err := SplitTarget("api.aliang.one:443")
+	if err != nil || host != "api.aliang.one" || port != "443" || !isDomain {
+		t.Fatalf("SplitTarget domain: %v %q %q %v", err, host, port, isDomain)
+	}
+	host, port, isDomain, err = SplitTarget("10.1.2.3:8080")
+	if err != nil || host != "10.1.2.3" || port != "8080" || isDomain {
+		t.Fatalf("SplitTarget ip: %v %q %q %v", err, host, port, isDomain)
+	}
+	if _, _, _, err := SplitTarget(DNSTarget); err != nil {
+		t.Fatalf("SplitTarget dns: %v", err)
+	}
+}
+
+func TestParseRejectsControlBytesInVia(t *testing.T) {
+	// 质量复审携带项:Via 条目同样进防环路径日志,须与 From/Class/Target 同等控制字节防护
+	line := `{"from":"dev-a","class":"ai","target":"h:1","via":["ok","bad\nINJECT"],"hops":1}`
+	if _, _, err := Parse([]byte(line)); err == nil {
+		t.Fatal("expected error for control byte in via entry")
+	}
+}
+
 func TestViaNilDefaultsToFrom(t *testing.T) {
 	// Encode 侧:Via=nil 自动补 [From]
 	h := Header{From: "dev-a", Class: ClassAI, Target: "api.aliang.one:443"}

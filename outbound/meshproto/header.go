@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 )
 
 // 流量类别(design §4)
@@ -82,10 +83,37 @@ func Parse(data []byte) (*Header, int, error) {
 		// design §7:防环日志依赖帧头可读,拒绝对端经 JSON 转义注入控制字符(质量评审加固)。
 		return nil, 0, errors.New("meshproto: control byte in from/class/target")
 	}
+	for i, id := range h.Via {
+		if hasControlByte(id) {
+			// Via 条目同样进防环路径日志,与 From/Class/Target 同级防护。
+			return nil, 0, fmt.Errorf("meshproto: via[%d] contains control byte", i)
+		}
+	}
 	if h.Via == nil {
 		h.Via = []string{h.From}
 	}
 	return &h, idx + 1, nil
+}
+
+// DNSTarget 特殊目标:DNS 代转发查询(每次查询独占一条 mesh 连接,design §6 层1)。
+const DNSTarget = "dns:"
+
+func IsDNSTarget(target string) bool { return target == DNSTarget }
+
+// SplitTarget 拆 host:port;裸域名(无端口)由调用方按 443 兜底。
+// 返回 isDomain=false 表示 host 为 IP 字面量。
+func SplitTarget(target string) (host, port string, isDomain bool, err error) {
+	if target == DNSTarget {
+		return "", "", false, nil
+	}
+	h, p, splitErr := net.SplitHostPort(target)
+	if splitErr != nil {
+		return target, "", true, nil // 裸域名
+	}
+	if net.ParseIP(h) != nil {
+		return h, p, false, nil
+	}
+	return h, p, true, nil
 }
 
 // hasControlByte 报告 s 是否含控制字节(<0x20)。
