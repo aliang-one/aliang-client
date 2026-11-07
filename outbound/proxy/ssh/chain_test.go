@@ -6,17 +6,30 @@ import (
 	"testing"
 
 	"aliang.one/nursorgate/outbound/proxy/ssh/sshtest"
+	gossh "golang.org/x/crypto/ssh"
 )
 
 func TestDialChainZeroHopPassword(t *testing.T) {
-	_, addr := sshtest.Start(t, sshtest.WithUsername("u"), sshtest.WithPassword("p"))
-	d := newChainDialer(finalNode(addr, "u", "p", "", ""), nil, newTestKnownHosts(t))
+	srv, addr := sshtest.Start(t, sshtest.WithUsername("u"), sshtest.WithPassword("p"))
+	kh := newTestKnownHosts(t)
+	d := newChainDialer(finalNode(addr, "u", "p", "", ""), nil, kh)
 
 	client, err := d.dialChain(context.Background())
 	if err != nil {
 		t.Fatalf("dialChain: %v", err)
 	}
 	defer client.Close()
+
+	// TOFU 写侧闭环:真实握手路径必须把 sshd 的 host key 指纹写进库
+	//(known_hosts 单元测试只验证过回调本身,这里验证 dialChain 真接线)。
+	entries := kh.List()
+	want := gossh.FingerprintSHA256(srv.HostKey.PublicKey())
+	if len(entries) != 1 {
+		t.Fatalf("known_hosts entries = %d, want 1", len(entries))
+	}
+	if entries[0].Fingerprint != want {
+		t.Fatalf("known_hosts fingerprint = %s, want %s", entries[0].Fingerprint, want)
+	}
 }
 
 func TestDialChainWrongPassword(t *testing.T) {

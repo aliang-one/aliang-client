@@ -79,6 +79,9 @@ const handshakeTimeout = 15 * time.Second
 // 中途任何一跳失败都会关闭已建的前序跳,不留半开链。
 func (d *chainDialer) dialChain(ctx context.Context) (*gossh.Client, error) {
 	var client *gossh.Client
+	// clients 全量收集每跳句柄:循环变量 client 会被逐跳覆盖,不收集则
+	// 前序跳句柄丢失。级联关闭(最终 Close 级联关前跳)由后续任务在此消费。
+	var clients []*gossh.Client
 	for i, n := range d.nodes {
 		if err := ctx.Err(); err != nil {
 			closeClient(client)
@@ -102,8 +105,11 @@ func (d *chainDialer) dialChain(ctx context.Context) (*gossh.Client, error) {
 		// ClientConfig.Timeout 只在 gossh.Dial 的 TCP 段生效,直连
 		// NewClientConn 不吃它;手动给底层 conn 设 deadline 让整段握手
 		// 受 handshakeTimeout 约束,握手完立即清除,不污染后续读写。
-		// 通道适配 conn 的 SetDeadline 可能是 no-op(见 sshtest.WrapChannel),
-		// 尽力而为,不因设不上而阻断。
+		// 现状:hop 0(TCP conn)有 15s 限制;hop ≥1 的底层是
+		// client.DialContext 返回的 x/crypto chanConn,其 SetReadDeadline/
+		// SetWriteDeadline 确定性返回 "ssh: tcpChan: deadline not
+		// supported"——即这些跳的握手当前无超时保护(候选修复:带超时的
+		// conn 包装或握手看门狗,留给后续任务)。
 		_ = underlying.SetDeadline(time.Now().Add(handshakeTimeout))
 		cc, chans, reqs, derr := gossh.NewClientConn(underlying, n.hostport, &gossh.ClientConfig{
 			User:            n.user,
@@ -117,6 +123,7 @@ func (d *chainDialer) dialChain(ctx context.Context) (*gossh.Client, error) {
 			return nil, fmt.Errorf("hop %d handshake %s: %w", i, n.hostport, derr)
 		}
 		client = gossh.NewClient(cc, chans, reqs)
+		clients = append(clients, client)
 	}
 	return client, nil
 }
