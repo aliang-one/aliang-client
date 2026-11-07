@@ -223,3 +223,46 @@ func argValueAfter(args []string, flag string) string {
 	}
 	return ""
 }
+
+// 网页上传的附件路径（持久缓存根内）必须放行并置 PersistPath/Origin=web——
+// 项目目录守卫只管项目外路径，不能把自家缓存拒之门外（2026-11-07 WS 实弹
+// 复现「attachment path is outside the project directory」，spec §3.5）。
+func TestResolveAgentAIAttachmentsAcceptsPersistedCachePaths(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("ALIANG_ATTACHMENT_PERSIST_DIR", root)
+	sid := "web-sess"
+	dir := filepath.Join(root, sid)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := []byte("uploaded-png")
+	cacheAbs := filepath.Join(dir, "up-0.png")
+	if err := os.WriteFile(cacheAbs, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 项目目录设成一个无关目录：缓存根路径不能被项目守卫误杀
+	attachments, err := resolveAgentAIAttachments([]interface{}{
+		map[string]interface{}{"type": "image", "name": "up-0.png", "path": cacheAbs},
+	}, t.TempDir())
+	if err != nil {
+		t.Fatalf("cache-root path rejected: %v", err)
+	}
+	if len(attachments) != 1 || attachments[0].PersistPath == "" {
+		t.Fatalf("attachments = %#v, want PersistPath set", attachments)
+	}
+	if attachments[0].Origin != "web" {
+		t.Fatalf("origin = %q, want web", attachments[0].Origin)
+	}
+
+	// 缓存根外的路径仍被拒绝（防线不弱化）
+	outside := filepath.Join(t.TempDir(), "secret.txt")
+	if err := os.WriteFile(outside, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolveAgentAIAttachments([]interface{}{
+		map[string]interface{}{"type": "image", "name": "s.png", "path": outside},
+	}, t.TempDir()); err == nil {
+		t.Fatal("outside-cache path should still be rejected")
+	}
+}

@@ -3681,7 +3681,23 @@ func resolveAgentAIAttachments(raw interface{}, projectPath string) ([]agentAIAt
 					return nil, err
 				}
 			}
-			if !agentPathInsideDirectory(absolute, projectRoot) {
+			cacheHandled := false
+			if cacheRoot, cacheErr := agentAttachmentCacheRoot(); cacheErr == nil {
+				// macOS 的 /var→/private/var 类 symlink 会让 TempDir 形态的根与
+				// EvalSymlinks 后的 absolute 前缀失配——根也走一次 symlink 解析。
+				resolvedRoot := cacheRoot
+				if resolved, err := filepath.EvalSymlinks(cacheRoot); err == nil {
+					resolvedRoot = resolved
+				}
+				if agentPathInsideDirectory(absolute, resolvedRoot) {
+					if rel, relErr := filepath.Rel(resolvedRoot, absolute); relErr == nil {
+						attachment.PersistPath = filepath.ToSlash(rel)
+						attachment.Origin = "web"
+						cacheHandled = true
+					}
+				}
+			}
+			if !cacheHandled && !agentPathInsideDirectory(absolute, projectRoot) {
 				return nil, fmt.Errorf("attachment path is outside the project directory: %s", absolute)
 			}
 			stat, err := os.Stat(absolute)
@@ -3697,15 +3713,6 @@ func resolveAgentAIAttachments(raw interface{}, projectPath string) ([]agentAIAt
 			totalBytes += stat.Size()
 			if totalBytes > maxTotalBytes {
 				return nil, fmt.Errorf("attachments exceed %d MiB in total", maxTotalBytes/(1024*1024))
-			}
-			// 网页上传（spec §3.5/§3.6）：持久缓存根内的路径视为已持久化，
-			// PersistPath/Origin=web 就地置位并放行——缓存根是 agent 自控目录
-			// （仅上传端点写入），项目目录守卫对根外路径原样拒绝，防线不弱化。
-			if cacheRoot, cacheErr := agentAttachmentCacheRoot(); cacheErr == nil && agentPathInsideDirectory(absolute, cacheRoot) {
-				if rel, relErr := filepath.Rel(cacheRoot, absolute); relErr == nil {
-					attachment.PersistPath = filepath.ToSlash(rel)
-					attachment.Origin = "web"
-				}
 			}
 			attachment.Path = absolute
 			if attachment.Name == "" {
