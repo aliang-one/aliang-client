@@ -74,10 +74,28 @@ func Parse(data []byte) (*Header, int, error) {
 	if h.From == "" || h.Class == "" || h.Target == "" {
 		return nil, 0, errors.New("meshproto: from/class/target required")
 	}
+	if h.Hops < 0 {
+		// 防线上伪造 {"hops":-N} 绕过跳数上限(质量评审)。
+		return nil, 0, errors.New("meshproto: negative hops")
+	}
+	if hasControlByte(h.From) || hasControlByte(h.Class) || hasControlByte(h.Target) {
+		// design §7:防环日志依赖帧头可读,拒绝对端经 JSON 转义注入控制字符(质量评审加固)。
+		return nil, 0, errors.New("meshproto: control byte in from/class/target")
+	}
 	if h.Via == nil {
 		h.Via = []string{h.From}
 	}
 	return &h, idx + 1, nil
+}
+
+// hasControlByte 报告 s 是否含控制字节(<0x20)。
+func hasControlByte(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x20 {
+			return true
+		}
+	}
+	return false
 }
 
 // AppendHop 由每一跳在转发前调用:自查环路 + 递增跳数(design §7 层1/层2)。
