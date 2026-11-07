@@ -600,6 +600,75 @@ func (s *AgentService) deviceListReport(ctx context.Context) (string, error) {
 	return strings.TrimRight(b.String(), "\n"), nil
 }
 
+// DeviceGatesLocal 读取本机两枚 peer 门禁开关现值（dashboard 面，2026-11-07）。
+// 真值源=服务端设备注册表：GET /api/devices 过滤本机 device_id，只回本机条目
+// （开关是本机语义，不掺他人真值）；结构化布尔返回，与 LLM 文本目录
+// deviceListReport 分工。本机不在清单（未注册/被踢）显式报错，不拿零值假装
+// 读到「关」。
+func (s *AgentService) DeviceGatesLocal(ctx context.Context) (map[string]interface{}, error) {
+	raw, err := s.doAgentServerGET(ctx, agentPeerServerURL()+"/api/devices")
+	if err != nil {
+		return nil, err
+	}
+	var devices []map[string]interface{}
+	if err := json.Unmarshal(raw, &devices); err != nil {
+		return nil, fmt.Errorf("device list response is not an array: %w", err)
+	}
+	selfID := strings.TrimSpace(s.currentDeviceID())
+	if selfID == "" {
+		return nil, errors.New("device_id unavailable (device not registered)")
+	}
+	for _, d := range devices {
+		if peerAPIString(d, "id", "device_id") != selfID {
+			continue
+		}
+		return map[string]interface{}{
+			"device_id":          selfID,
+			"name":               peerAPIString(d, "name", "device_name"),
+			"status":             peerAPIString(d, "status"),
+			"peer_exec_enabled":  peerAPIBool(d, "peer_exec_enabled", "peerExecEnabled"),
+			"peer_fetch_enabled": peerAPIBool(d, "peer_fetch_enabled", "peerFetchEnabled"),
+		}, nil
+	}
+	return nil, fmt.Errorf("self device %s not found in account device list", selfID)
+}
+
+// DeviceGateSetLocal 落库本机门禁开关：PATCH /api/devices/{self}/settings，
+// nil 键不落（部分更新，与服务端 Zod optional 对齐）；双 nil 本地拒绝，不烧
+// 一次网络往返换服务端零操作。响应=服务端 publicDevice(updated)，直接回显
+// 两枚开关现值供前端复核。注意：服务端 rebind 注册会强制回落 false
+// （register.ts isRebind 分支），开关重配对后会丢，前端如实提示。
+func (s *AgentService) DeviceGateSetLocal(ctx context.Context, peerExec, peerFetch *bool) (map[string]interface{}, error) {
+	if peerExec == nil && peerFetch == nil {
+		return nil, errors.New("no gate key provided (peer_exec_enabled / peer_fetch_enabled)")
+	}
+	selfID := strings.TrimSpace(s.currentDeviceID())
+	if selfID == "" {
+		return nil, errors.New("device_id unavailable (device not registered)")
+	}
+	body := map[string]interface{}{}
+	if peerExec != nil {
+		body["peer_exec_enabled"] = *peerExec
+	}
+	if peerFetch != nil {
+		body["peer_fetch_enabled"] = *peerFetch
+	}
+	raw, err := s.doAgentServerJSON(ctx, http.MethodPatch,
+		fmt.Sprintf("%s/api/devices/%s/settings", agentPeerServerURL(), url.PathEscape(selfID)),
+		body)
+	if err != nil {
+		return nil, err
+	}
+	updated := peerAPIResultObject(raw)
+	return map[string]interface{}{
+		"device_id":          peerAPIString(updated, "id", "device_id"),
+		"name":               peerAPIString(updated, "name", "device_name"),
+		"status":             peerAPIString(updated, "status"),
+		"peer_exec_enabled":  peerAPIBool(updated, "peer_exec_enabled", "peerExecEnabled"),
+		"peer_fetch_enabled": peerAPIBool(updated, "peer_fetch_enabled", "peerFetchEnabled"),
+	}, nil
+}
+
 // deviceInfoReport 组装设备画像快照：deviceID 为空=本机（冷层+load 摘要）；
 // 非空=远端 GET /api/devices/:id + /api/devices/:id/metadata。这是唯一允许
 // 返回链路基础信息的口（spec §7.3），但仍只给一行式摘要，不给拓扑细节。
