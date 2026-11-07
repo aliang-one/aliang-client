@@ -29,22 +29,32 @@ var errChainClosed = errors.New("ssh chain connection closed")
 type chain struct {
 	mu        sync.Mutex
 	dialFn    func(ctx context.Context) (*cascadeClient, error)
-	client    *cascadeClient
-	clientErr error // 监控协程在 conn 死亡时写入;非 nil 即死
-	lastFail  time.Time
-	failCount int
-	active    atomic.Int64 // 当前经此链打开的 channel 数;原子:选链读与释放写并发
+	client    *cascadeClient // 读写维持 c.mu(选链不看,不受拨号长持影响)
+	clientErr error          // 监控协程在 conn 死亡时写入;非 nil 即死
+	// 退避状态原子化(无锁可读):get 全程持 c.mu 跨拨号(黑洞主机单跳
+	// 挂满 15s、双跳约 30s),任何选链侧的 c.mu 获取都会被一次慢拨号
+	// 串行化整池——因此 lastFail/failCount/active 都只允许原子读。
+	// 写侧仅 get 在 c.mu 内互斥写(先 Store lastFail 再 Add failCount,
+	// 落后读最坏把窗口算短一档,偏「可选」,由 get 在锁内复核兜底)。
+	// lastFail 存 UnixNano(0=无,成功即清),牺牲单调钟——窗口只有
+	// 1~30s,墙钟跳变影响可忽略。
+	lastFail  atomic.Int64
+	failCount atomic.Int32
+	active    atomic.Int64 // 当前经此链打开的 channel 数
 }
 
-// backoffRemainingLocked 返回退避窗口剩余时长(true=仍在窗口内)。
-// 成功拨号会清空 lastFail,故 lastFail 非零 ⟺ 正处失败退避 streak——
+// backoffRemaining 返回退避窗口剩余时长(true=仍在窗口内)。无锁可读:
+// lastFail/failCount 原子读,两者可能来自不同瞬间(撕裂快照),只会把
+// 窗口判得偏短(偏「可选」),选链据此放行后仍由 get 在锁内用同一读数
+// 复核(写侧被 c.mu 互斥,get 自己的读不撕裂),不构成正确性问题。
+// 成功拨号清零 lastFail,故 lastFail 非零 ⟺ 正处失败退避 streak——
 // 这是选链「跳过退避链」判定与 get 自身判退避共用的唯一事实源。
-// 调用方须持有 c.mu。
-func (c *chain) backoffRemainingLocked() (time.Duration, bool) {
-	if c.lastFail.IsZero() {
+func (c *chain) backoffRemaining() (time.Duration, bool) {
+	ns := c.lastFail.Load()
+	if ns == 0 {
 		return 0, false
 	}
-	if remain := chainBackoff(c.failCount) - time.Since(c.lastFail); remain > 0 {
+	if remain := chainBackoff(int(c.failCount.Load())) - time.Since(time.Unix(0, ns)); remain > 0 {
 		return remain, true
 	}
 	return 0, false
@@ -68,19 +78,19 @@ func (c *chain) get(ctx context.Context) (*cascadeClient, error) {
 		_ = c.client.Close() // 幂等(sync.Once);死链收尾
 		c.client = nil
 	}
-	if remain, in := c.backoffRemainingLocked(); in {
+	if remain, in := c.backoffRemaining(); in {
 		return nil, fmt.Errorf("ssh chain rebuilding, backoff %s", remain)
 	}
 	cl, err := c.dialFn(ctx)
 	if err != nil {
-		c.lastFail = time.Now()
-		c.failCount++
+		c.lastFail.Store(time.Now().UnixNano())
+		c.failCount.Add(1)
 		return nil, err
 	}
 	c.client = cl
 	c.clientErr = nil
-	c.failCount = 0
-	c.lastFail = time.Time{} // 退避只属于失败 streak;成功即出窗(否则选链会错跳健康链)
+	c.lastFail.Store(0) // 退避只属于失败 streak;成功即出窗(否则选链会错跳健康链)
+	c.failCount.Store(0)
 	// 监控:conn 一死立刻标记,下次 get 重建;不阻塞当前调用方。
 	go func() {
 		err := cl.Wait()
@@ -152,9 +162,11 @@ func newPool(size int, dialFn func(index int) func(ctx context.Context) (*cascad
 // acquire 在非退避链里选活跃数最少的并取得 client;全部链都在退避窗口
 // 时返回错误(带最近剩余等待)。返回的 chain 供调用方在 channel 关闭时
 // releaseActive 配对减数。
-// 锁序恒为 p.mu → chain.mu:选链持 p.mu 时只对每条链短取 chain.mu 快照
-// 退避状态(与 close() 的嵌套方向一致),锁内不拨号;get/addActive/
-// releaseActive 路径只取 chain.mu,无反向嵌套。
+// 选链全程只做原子读(退避快照 + 活跃数),不取任何 chain.mu——get 会
+// 全程持 chain.mu 跨拨号,选链若碰 chain.mu,一条慢拨号就把全池 acquire
+// 排队串行化(且该链每次退避期满复发)。p.mu → chain.mu 的嵌套只剩
+// close() 一处,方向恒定,get/addActive/releaseActive 只取 chain.mu,
+// 无反向嵌套。
 func (p *pool) acquire(ctx context.Context) (*cascadeClient, *chain, error) {
 	p.mu.Lock()
 	var best *chain
@@ -162,17 +174,13 @@ func (p *pool) acquire(ctx context.Context) (*cascadeClient, *chain, error) {
 	for i := 0; i < len(p.chains); i++ {
 		idx := (p.next + i) % len(p.chains)
 		c := p.chains[idx]
-		c.mu.Lock()
-		remain, inBackoff := c.backoffRemainingLocked()
-		active := c.active.Load()
-		c.mu.Unlock()
-		if inBackoff {
+		if remain, in := c.backoffRemaining(); in {
 			if soonest == 0 || remain < soonest { // soonest==0 是未置哨兵(remain 恒>0)
 				soonest = remain
 			}
 			continue
 		}
-		if best == nil || active < best.active.Load() {
+		if best == nil || c.active.Load() < best.active.Load() {
 			best = c
 		}
 	}

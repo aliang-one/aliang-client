@@ -165,7 +165,8 @@ func TestPoolRebuildAfterClientDeath(t *testing.T) {
 		t.Fatal("acquire must return a rebuilt client, not the dead one")
 	}
 	ch.mu.Lock()
-	fresh := ch.client == cl2 && ch.clientErr == nil && ch.failCount == 0 && ch.lastFail.IsZero()
+	fresh := ch.client == cl2 && ch.clientErr == nil &&
+		ch.failCount.Load() == 0 && ch.lastFail.Load() == 0
 	ch.mu.Unlock()
 	if !fresh {
 		t.Fatal("chain must hold the fresh client with clientErr cleared and failCount reset")
@@ -237,7 +238,7 @@ func TestChainBackoffSchedule(t *testing.T) {
 	}
 	// 回拨 lastFail 到窗口之外,模拟时间流逝越过边界。
 	c.mu.Lock()
-	c.lastFail = c.lastFail.Add(-(chainBackoff(c.failCount) + time.Second))
+	c.lastFail.Store(c.lastFail.Load() - int64(chainBackoff(int(c.failCount.Load()))+time.Second))
 	c.mu.Unlock()
 	if _, err := c.get(context.Background()); err == nil {
 		t.Fatal("get past the window must dial again (and fail again)")
@@ -384,6 +385,59 @@ func TestChainWaitNilFoldsToErrClosed(t *testing.T) {
 	_ = cl2.Close()
 	c.client = nil
 	c.mu.Unlock()
+}
+
+// TestPoolSlowDialDoesNotSerializePool 钉选链的无锁隔离性质:链 A 的 get
+// 全程持 chain.mu 跨拨号(dialFn 挂在门闩上模拟黑洞主机),此刻对其余链
+// 的 acquire 必须立刻成功——选链若在 chain.mu 上排队,一次慢拨号就会把
+// 全池新连接串行化(修前形态:acquire 卡满门闩时长而非 15s 量级即红)。
+func TestPoolSlowDialDoesNotSerializePool(t *testing.T) {
+	baseline := runtime.NumGoroutine()
+
+	entered := make(chan struct{})
+	var enteredOnce sync.Once
+	gate := make(chan struct{})
+	p := newPool(2, func(i int) func(context.Context) (*cascadeClient, error) {
+		return func(context.Context) (*cascadeClient, error) {
+			if i == 0 {
+				enteredOnce.Do(func() { close(entered) }) // 确证已进入 dialFn ⇒ A.mu 已被 get 持有
+				<-gate                                    // 链 A:慢拨号,直至放行
+				return nil, errors.New("chain A slow dial failed")
+			}
+			return fakeCascadeClient(), nil
+		}
+	})
+	defer p.close()
+
+	go func() { _, _ = p.chains[0].get(context.Background()) }()
+	<-entered
+
+	// 让链 B 成为最少活跃链(链 A 在拨号中,选链循环仍会扫到它)。
+	p.chains[0].addActive()
+	p.chains[0].addActive()
+	go func() {
+		time.Sleep(300 * time.Millisecond) // 修前:acquire 应卡到此刻;修后:远早于此
+		close(gate)
+	}()
+
+	start := time.Now()
+	cl, ch, err := p.acquire(context.Background())
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("acquire must succeed on chain B while chain A is dialing: %v", err)
+	}
+	if ch != p.chains[1] {
+		t.Fatalf("acquire landed on %p, want chain 1 (least active, chain 0 dialing)", ch)
+	}
+	if cl == nil {
+		t.Fatal("acquire returned nil client")
+	}
+	if elapsed > 100*time.Millisecond {
+		t.Fatalf("acquire took %s, want <100ms: selection must not queue on chain.mu behind a slow dial", elapsed)
+	}
+
+	p.close()
+	assertNoGoroutineLeak(t, baseline)
 }
 
 func TestPoolSingle(t *testing.T) {
