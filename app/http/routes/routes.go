@@ -274,6 +274,9 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	register("/api/agent/peer/exec", h.Agent.HandlePeerExec, http.MethodPost)
 	register("/api/agent/peer/fetch-file", h.Agent.HandlePeerFetchFile, http.MethodPost)
 	register("/api/agent/peer/devices", h.Agent.HandlePeerDevices, http.MethodGet)
+	// 设备门禁开关（peer_exec_enabled/peer_fetch_enabled）：GET 读 POST 写，
+	// 真值源=PhoneServer 设备注册表（2026-11-07 占位转正）。
+	register("/api/agent/peer/gates", h.Agent.HandlePeerGate, http.MethodGet, http.MethodPost)
 	register("/api/agent/peer/device-info", h.Agent.HandlePeerDeviceInfo, http.MethodGet)
 	register("/api/agent/peer/note", h.Agent.HandlePeerNote, http.MethodPost)
 	// aliang-peer 跨设备 MCP 平台托管注册/状态(GET 读状态,POST 应用)。

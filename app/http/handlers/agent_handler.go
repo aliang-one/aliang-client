@@ -207,6 +207,48 @@ func (h *AgentHandler) HandlePeerDevices(w http.ResponseWriter, r *http.Request)
 	common.Success(w, map[string]interface{}{"result": text})
 }
 
+// HandlePeerGate GET 读 / POST 写本机设备门禁旗标（peer_exec_enabled /
+// peer_fetch_enabled）。真值源 = PhoneServer 设备注册表（agent_peer_gates.go）；
+// POST 载荷至少一键（nil 键不动），写后回读。core 侧 proxyIfNeeded 同 peer
+// 家族（runtime 侧设备身份/凭据才是真值持有者，双注册教训同族）。
+func (h *AgentHandler) HandlePeerGate(w http.ResponseWriter, r *http.Request) {
+	if h.proxyIfNeeded(w, r) {
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		ctx, cancel := context.WithTimeout(r.Context(), 14*time.Second)
+		defer cancel()
+		status, err := h.service.PeerGateStatus(ctx)
+		if err != nil {
+			common.Error(w, http.StatusBadGateway, err.Error(), nil)
+			return
+		}
+		common.Success(w, status)
+	case http.MethodPost:
+		var req struct {
+			PeerExec  *bool `json:"peer_exec_enabled"`
+			PeerFetch *bool `json:"peer_fetch_enabled"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil || (req.PeerExec == nil && req.PeerFetch == nil) {
+			common.ErrorBadRequest(w, "Invalid request body: peer_exec_enabled or peer_fetch_enabled (boolean) required", nil)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 14*time.Second)
+		defer cancel()
+		status, err := h.service.PeerGateUpdate(ctx, req.PeerExec, req.PeerFetch)
+		if err != nil {
+			common.Error(w, http.StatusBadGateway, err.Error(), nil)
+			return
+		}
+		common.Success(w, status)
+	default:
+		// http.Error 直出真实 405（common.Error 会把 4xx 业务码族映射成 500），
+		// 同 HandlePeerMcp 惯例。
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
 func (h *AgentHandler) HandlePeerDeviceInfo(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)

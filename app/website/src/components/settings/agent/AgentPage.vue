@@ -21,82 +21,95 @@
       </button>
     </div>
 
-    <template v-if="active === 'records'">
-      <AgentActivitySettings />
-      <AgentRuntimeSessions />
-    </template>
+    <!-- 主内容 + 右侧栏（2026-11-07：系统状态/文件访问授权自仪表盘侧栏收编至
+         Agent 页右侧；窄屏 <lg 时右栏叠到主内容下方，DOM 顺序=主内容在前）。 -->
+    <div class="flex flex-col gap-5 lg:flex-row lg:items-start">
+      <div class="flex min-w-0 flex-1 flex-col gap-5">
+        <template v-if="active === 'records'">
+          <AgentActivitySettings />
+          <AgentRuntimeSessions />
+        </template>
 
-    <template v-else-if="active === 'user-agent'">
-      <AgentSettings />
-      <AgentScanDirectoriesSettings />
-      <AgentMCPRegistrySettings />
-      <AgentIntegrationsSettings />
-    </template>
+        <template v-else-if="active === 'user-agent'">
+          <AgentSettings />
+          <AgentScanDirectoriesSettings />
+          <AgentMCPRegistrySettings />
+          <AgentIntegrationsSettings />
+        </template>
 
-    <!-- 设备互访：customerConfig 依赖登录态的卡片（PeerMCPSettings 两段式保存
-         需父页 config/save 透传；门禁占位卡为纯展示）。 -->
-    <template v-else-if="active === 'peer-access'">
-      <PeerAccessSettings
-        :config="config"
-        :loading="loading"
-        :saving="saving"
-        :error="error"
-        :success-message="successMessage"
-        @save="emitSave"
-      />
-    </template>
+        <!-- 设备互访：customerConfig 依赖登录态的卡片（PeerMCPSettings 两段式保存
+             需父页 config/save 透传；门禁卡为真开关，自取状态）。 -->
+        <template v-else-if="active === 'peer-access'">
+          <PeerAccessSettings
+            :config="config"
+            :loading="loading"
+            :saving="saving"
+            :error="error"
+            :success-message="successMessage"
+            @save="emitSave"
+          />
+        </template>
 
-    <!-- aliangcode：customerConfig 依赖登录态，唯一带登录占位的子 tab
-         （records / user-agent 未登录也可看，占位语义见 spec §5.4）。 -->
-    <template v-else>
-      <div
-        v-if="!isAuthenticated"
-        class="rounded-2xl border border-dashed border-slate-300 bg-white px-6 py-8 text-center shadow-sm dark:border-slate-700 dark:bg-slate-900"
-      >
-        <div class="mx-auto max-w-2xl space-y-3">
-          <h2 class="text-xl font-bold text-slate-900 dark:text-white">{{ t('settings_loginRequiredCapability') }}</h2>
-          <p class="text-sm text-slate-500 dark:text-slate-300">
-            {{ t('settings_loginRequiredCapabilityDesc') }}
-          </p>
-        </div>
+        <!-- aliangcode：customerConfig 依赖登录态，唯一带登录占位的子 tab
+             （records / user-agent 未登录也可看，占位语义见 spec §5.4）。 -->
+        <template v-else>
+          <div
+            v-if="!isAuthenticated"
+            class="rounded-2xl border border-dashed border-slate-300 bg-white px-6 py-8 text-center shadow-sm dark:border-slate-700 dark:bg-slate-900"
+          >
+            <div class="mx-auto max-w-2xl space-y-3">
+              <h2 class="text-xl font-bold text-slate-900 dark:text-white">{{ t('settings_loginRequiredCapability') }}</h2>
+              <p class="text-sm text-slate-500 dark:text-slate-300">
+                {{ t('settings_loginRequiredCapabilityDesc') }}
+              </p>
+            </div>
+          </div>
+          <template v-else>
+            <AgentCoreSettings
+              :config="config"
+              :loading="loading"
+              :saving="saving"
+              :error="error"
+              :success-message="successMessage"
+              @save="emitSave"
+            />
+            <div class="grid grid-cols-1 items-stretch gap-5 lg:grid-cols-2">
+              <AgentMCPGlobalSettings
+                :config="config"
+                :loading="loading"
+                :saving="saving"
+                :error="error"
+                :success-message="successMessage"
+                @save="emitSave"
+              />
+              <AgentSkillsGlobalSettings
+                :config="config"
+                :loading="loading"
+                :saving="saving"
+                :error="error"
+                :success-message="successMessage"
+                @save="emitSave"
+              />
+            </div>
+            <CustomEnvSettings
+              :config="config"
+              :loading="loading"
+              :saving="saving"
+              :error="error"
+              :success-message="successMessage"
+              @save="emitSave"
+            />
+          </template>
+        </template>
       </div>
-      <template v-else>
-        <AgentCoreSettings
-          :config="config"
-          :loading="loading"
-          :saving="saving"
-          :error="error"
-          :success-message="successMessage"
-          @save="emitSave"
-        />
-        <div class="grid grid-cols-1 items-stretch gap-5 lg:grid-cols-2">
-          <AgentMCPGlobalSettings
-            :config="config"
-            :loading="loading"
-            :saving="saving"
-            :error="error"
-            :success-message="successMessage"
-            @save="emitSave"
-          />
-          <AgentSkillsGlobalSettings
-            :config="config"
-            :loading="loading"
-            :saving="saving"
-            :error="error"
-            :success-message="successMessage"
-            @save="emitSave"
-          />
-        </div>
-        <CustomEnvSettings
-          :config="config"
-          :loading="loading"
-          :saving="saving"
-          :error="error"
-          :success-message="successMessage"
-          @save="emitSave"
-        />
-      </template>
-    </template>
+
+      <!-- 右侧栏:系统状态 + 文件访问授权两张完整卡(2026-11-07 三轮迭代:
+           紧凑卡+弹窗退场,双全卡直嵌,窄栏已适配)。免登录(设备本地态)。 -->
+      <aside class="w-full shrink-0 space-y-5 lg:w-96">
+        <SystemStatusSettings />
+        <AgentFileAccessSettings />
+      </aside>
+    </div>
   </div>
 </template>
 
@@ -113,6 +126,8 @@ import AgentMCPGlobalSettings from '../AgentMCPGlobalSettings.vue';
 import AgentSkillsGlobalSettings from '../AgentSkillsGlobalSettings.vue';
 import CustomEnvSettings from '../CustomEnvSettings.vue';
 import PeerAccessSettings from './PeerAccessSettings.vue';
+import SystemStatusSettings from '../SystemStatusSettings.vue';
+import AgentFileAccessSettings from '../AgentFileAccessSettings.vue';
 import { useNavigation } from '../../../composables/useNavigation';
 import { useAuthStore } from '../../../stores/auth';
 import { useI18n } from '../../../i18n';
@@ -139,7 +154,9 @@ export default {
     AgentMCPGlobalSettings,
     AgentSkillsGlobalSettings,
     CustomEnvSettings,
-    PeerAccessSettings
+    PeerAccessSettings,
+    SystemStatusSettings,
+    AgentFileAccessSettings
   },
   props: {
     config: { type: Object, default: () => ({}) },

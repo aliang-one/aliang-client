@@ -445,10 +445,6 @@ export default {
   dash_balanceHint: '余额不足 — 请充值以保持代理运行',
   dash_balanceOk: '余额充足',
   dash_serverLink: '服务器连接',
-  // 侧栏紧凑卡(2026-11-05 spec):系统状态/文件访问授权
-  dash_systemStatusTitle: '系统状态',
-  dash_systemManage: '管理…',
-  dash_fileAccessManage: '查看 / 申请…',
   dash_scoreLatency: '评分/延迟',
   dash_state: '状态',
   dash_refreshDashboard: '刷新仪表板',
@@ -589,7 +585,7 @@ export default {
   settings_sectionProxyDesc: '出站代理、AI 规则、分流规则与模型映射。仅影响新会话与代理层。',
   settings_sectionAgentDesc: '会话记录、用户态 Agent、aliangcode 内核与设备互访设置集中地。',
   settings_sectionAccountDesc: '账户身份与本机显示偏好。',
-  settings_sectionStatusDesc: '只读观测：实时日志；页尾「其他」为设备级开关杂项。',
+  settings_sectionStatusDesc: '只读观测：实时日志。',
   settings_scopeDevice: '本机生效，换设备不同步',
   settings_scopeLocal: '仅本机浏览器',
   // Agent 四子 tab（四栏重组 2026-11-03；2026-11-04 增设备互访）
@@ -597,13 +593,16 @@ export default {
   agent_subUserAgent: '用户态 agent',
   agent_subAliangCode: 'aliangcode',
   agent_subPeerAccess: '设备互访',
-  // 置灰占位开关（设备门禁层 peer_exec_enabled / peer_fetch_enabled，
-  // 真值源在服务端设备注册表，写通道待跨仓落地，先占位零请求）
-  settings_peerExecPendingTitle: '跨设备执行',
-  settings_peerExecPendingDesc: '允许其他设备在本机执行命令的设备级门禁。',
-  settings_peerTransferPendingTitle: '文件传输',
-  settings_peerTransferPendingDesc: '允许其他设备发起文件传输、拉取本机文件的设备级门禁。',
-  settings_comingSoon: '即将上线',
+  // 设备门禁真开关（peer_exec_enabled / peer_fetch_enabled，2026-11-07 占位转正；
+  // 真值源=服务端设备注册表，经内核 /api/agent/peer/gates 透传读写）
+  peerGate_execTitle: '跨设备执行',
+  peerGate_execDesc: '允许其他设备在本机执行命令的设备级门禁。',
+  peerGate_transferTitle: '文件传输',
+  peerGate_transferDesc: '允许其他设备发起文件传输、拉取本机文件的设备级门禁。',
+  peerGate_loadFailed: '门禁状态读取失败，点击重试。',
+  peerGate_saveFailed: '保存失败，已回滚。',
+  peerGate_unsynced: '本机未同步到设备清单，暂时无法开关。',
+  peerGate_saving: '保存中…',
   settings_scopeDevice: '本机生效，换设备不同步',
   settings_scopeLocal: '仅本机浏览器',
   // 界面偏好（从系统设置抽出）

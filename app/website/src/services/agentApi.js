@@ -122,6 +122,22 @@ export async function setPeerMCPRegistration(peerMcp) {
   });
 }
 
+// --- 设备门禁开关(peer_exec_enabled/peer_fetch_enabled,2026-11-07 转正) ---
+// 真值源=服务端设备注册表;GET 读 POST 写,服务端 PATCH 后回读为准。
+
+export async function getPeerGates() {
+  return request('/api/agent/peer/gates', { method: 'GET' });
+}
+
+// payload: { peer_exec_enabled?: boolean, peer_fetch_enabled?: boolean }
+// 返回=写后回读的最新门禁状态。
+export async function updatePeerGates(payload) {
+  return request('/api/agent/peer/gates', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
 // --- 文件访问授权（一次性预先授权 macOS 隐私目录） ---
 
 export async function getAgentFileAccess() {

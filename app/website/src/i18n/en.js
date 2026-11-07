@@ -448,10 +448,6 @@ export default {
   dash_balanceHint: 'Low balance — top up to keep proxy running',
   dash_balanceOk: 'Balance is healthy',
   dash_serverLink: 'Server Link',
-  // Sidebar compact cards (2026-11-05 spec): system status / file access
-  dash_systemStatusTitle: 'System Status',
-  dash_systemManage: 'Manage…',
-  dash_fileAccessManage: 'View / Request…',
   dash_scoreLatency: 'Score/Latency',
   dash_state: 'State',
   dash_refreshDashboard: 'Refresh Dashboard',
@@ -592,7 +588,7 @@ export default {
   settings_sectionProxyDesc: 'Outbound proxy, AI rules, routing rules and model mapping. Applies to new sessions and the proxy layer.',
   settings_sectionAgentDesc: 'Session records, the user-mode agent, the aliangcode kernel, and device access settings in one place.',
   settings_sectionAccountDesc: 'Account identity and local display preferences.',
-  settings_sectionStatusDesc: 'Read-only observation: live logs. Device-level switches live in Other at the bottom.',
+  settings_sectionStatusDesc: 'Read-only observation: live logs.',
   settings_scopeDevice: 'This device only; not synced across devices',
   settings_scopeLocal: 'This browser only',
   // Agent sub-tabs (four-section reorganisation 2026-11-03; device access added 2026-11-04)
@@ -600,13 +596,16 @@ export default {
   agent_subUserAgent: 'User-mode agent',
   agent_subAliangCode: 'aliangcode',
   agent_subPeerAccess: 'Device Access',
-  // Grayed-out placeholder switches (device-gate layer peer_exec_enabled / peer_fetch_enabled;
-  // source of truth lives in the server device registry, write channel lands cross-repo later)
-  settings_peerExecPendingTitle: 'Cross-device execution',
-  settings_peerExecPendingDesc: 'Device-level gate for letting other devices run commands here.',
-  settings_peerTransferPendingTitle: 'File transfer',
-  settings_peerTransferPendingDesc: 'Device-level gate letting other devices start file transfers to pull files from this machine.',
-  settings_comingSoon: 'Coming soon',
+  // Device gate switches, promoted from placeholder (2026-11-07; source of truth
+  // = server device registry via /api/agent/peer/gates passthrough)
+  peerGate_execTitle: 'Cross-device execution',
+  peerGate_execDesc: 'Device-level gate for letting other devices run commands here.',
+  peerGate_transferTitle: 'File transfer',
+  peerGate_transferDesc: 'Device-level gate letting other devices start file transfers to pull files from this machine.',
+  peerGate_loadFailed: 'Failed to load gate state. Click to retry.',
+  peerGate_saveFailed: 'Save failed; reverted.',
+  peerGate_unsynced: 'This device is not in the device list yet; switches unavailable.',
+  peerGate_saving: 'Saving…',
   mcpGlobal_title: 'MCP master switch',
   mcpGlobal_description: 'Master switch: when off, the AliangCode kernel connects to no MCP server.',
   mcpGlobal_enable: 'Let AliangCode use MCP tools',

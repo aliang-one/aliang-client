@@ -10,61 +10,21 @@
       :success-message="successMessage"
       @save="emitSave"
     />
-    <!-- 设备门禁开关（peer_exec_enabled / peer_fetch_enabled）：真值源在服务端
-         设备注册表，写通道待跨仓（agent + PhoneServer）落地；先置灰占位零请求。 -->
-    <div class="rounded-xl border border-slate-200 bg-white p-5 dark:border-slate-800 dark:bg-background-dark">
-      <div class="space-y-5">
-        <div class="flex items-center justify-between gap-3">
-          <div class="min-w-0">
-            <p class="flex flex-wrap items-center gap-2 text-sm font-semibold text-slate-900 dark:text-white">
-              {{ t('settings_peerExecPendingTitle') }}
-              <span class="rounded bg-slate-200 px-1.5 py-0.5 text-[10px] font-bold text-slate-500 dark:bg-slate-700 dark:text-slate-300">
-                {{ t('settings_comingSoon') }}
-              </span>
-            </p>
-            <p class="mt-0.5 text-[10px] leading-4 text-slate-500 dark:text-slate-400">
-              {{ t('settings_peerExecPendingDesc') }}
-            </p>
-          </div>
-          <input
-            type="checkbox"
-            disabled
-            :aria-label="t('settings_peerExecPendingTitle')"
-            class="h-4 w-4 shrink-0 cursor-not-allowed rounded border-slate-300 text-primary dark:border-slate-600 dark:bg-slate-900"
-          />
-        </div>
-        <div class="flex items-center justify-between gap-3">
-          <div class="min-w-0">
-            <p class="flex flex-wrap items-center gap-2 text-sm font-semibold text-slate-900 dark:text-white">
-              {{ t('settings_peerTransferPendingTitle') }}
-              <span class="rounded bg-slate-200 px-1.5 py-0.5 text-[10px] font-bold text-slate-500 dark:bg-slate-700 dark:text-slate-300">
-                {{ t('settings_comingSoon') }}
-              </span>
-            </p>
-            <p class="mt-0.5 text-[10px] leading-4 text-slate-500 dark:text-slate-400">
-              {{ t('settings_peerTransferPendingDesc') }}
-            </p>
-          </div>
-          <input
-            type="checkbox"
-            disabled
-            :aria-label="t('settings_peerTransferPendingTitle')"
-            class="h-4 w-4 shrink-0 cursor-not-allowed rounded border-slate-300 text-primary dark:border-slate-600 dark:bg-slate-900"
-          />
-        </div>
-      </div>
-    </div>
+    <!-- 设备门禁真开关（peer_exec_enabled / peer_fetch_enabled，2026-11-07 转正）：
+         真值源=服务端设备注册表，经内核 /api/agent/peer/gates 透传读写；
+         拨动即生效，自取状态零 props。 -->
+    <PeerGateSettings />
   </div>
 </template>
 
 <script>
 // 注意路径：本组件在 settings/agent/ 下，PeerMCPSettings 在 settings/ 上一级。
 import PeerMCPSettings from '../PeerMCPSettings.vue';
-import { useI18n } from '../../../i18n';
+import PeerGateSettings from './PeerGateSettings.vue';
 
 export default {
   name: 'PeerAccessSettings',
-  components: { PeerMCPSettings },
+  components: { PeerMCPSettings, PeerGateSettings },
   props: {
     config: { type: Object, default: () => ({}) },
     loading: { type: Boolean, default: false },
@@ -73,10 +33,6 @@ export default {
     successMessage: { type: String, default: '' }
   },
   emits: ['save'],
-  setup() {
-    const { t } = useI18n();
-    return { t };
-  },
   methods: {
     emitSave(payload) {
       this.$emit('save', payload);

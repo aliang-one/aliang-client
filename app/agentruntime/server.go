@@ -147,6 +147,8 @@ func registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/agent/peer/exec", agentHandler.HandlePeerExec)
 	mux.HandleFunc("/api/agent/peer/fetch-file", agentHandler.HandlePeerFetchFile)
 	mux.HandleFunc("/api/agent/peer/devices", agentHandler.HandlePeerDevices)
+	// 设备门禁开关（GET 读 POST 写，2026-11-07 占位转正）：双注册同族。
+	mux.HandleFunc("/api/agent/peer/gates", agentHandler.HandlePeerGate)
 	mux.HandleFunc("/api/agent/peer/device-info", agentHandler.HandlePeerDeviceInfo)
 	mux.HandleFunc("/api/agent/peer/note", agentHandler.HandlePeerNote)
 	mux.HandleFunc("/api/agent/peer/mcp", agentHandler.HandlePeerMcp)
