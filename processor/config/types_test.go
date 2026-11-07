@@ -1382,3 +1382,70 @@ func TestSetGlobalConfigAppliesGeoIPDownloadURLOverride(t *testing.T) {
 		t.Fatalf("geoip.EffectiveDownloadURL() = %q, want default", got)
 	}
 }
+
+func boolPtr(b bool) *bool { return &b }
+
+// customer.mesh 保存通道校验(design §9):坏 peer / 越界跳数 / 兜底缺地址
+// 都必须在保存时被 Config.Validate 拒绝,不能等到运行期才炸。
+// fixture 必须带合法 core 段:Config.Validate 过完 customer 段后会无条件校验
+// core.api_server 必填,缺 core 段会以「core.api_server is required」无关错误
+// 失败(同 peer_mcp_test.go TestPeerMCPKeyAcceptedOnLoad 记录的坑)。
+func TestConfigValidate_MeshRejectsBadPeer(t *testing.T) {
+	cfg := &Config{
+		Core: &CoreConfig{APIServer: "https://api.example.com"},
+		Customer: &CustomerConfig{Mesh: &MeshConfig{
+			Peers: []MeshPeer{{DeviceID: ""}}, // 空 device_id
+		}},
+	}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "mesh.peers") {
+		t.Fatalf("want mesh.peers error, got %v", err)
+	}
+}
+
+func TestConfigValidate_MeshHopsClamped(t *testing.T) {
+	cfg := &Config{
+		Core:     &CoreConfig{APIServer: "https://api.example.com"},
+		Customer: &CustomerConfig{Mesh: &MeshConfig{MaxHops: 99}},
+	}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "mesh.max_hops") {
+		t.Fatalf("want mesh.max_hops error, got %v", err)
+	}
+}
+
+func TestConfigValidate_MeshFallbackRequiresAddr(t *testing.T) {
+	cfg := &Config{
+		Core: &CoreConfig{APIServer: "https://api.example.com"},
+		Customer: &CustomerConfig{Mesh: &MeshConfig{
+			Fallback: &MeshFallbackConfig{Enable: boolPtr(true)},
+		}},
+	}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "mesh.fallback") {
+		t.Fatalf("want mesh.fallback addr error, got %v", err)
+	}
+}
+
+func TestConfigValidate_MeshRejectsSelfReference(t *testing.T) {
+	// spec §3.4/§7 层0:目标节点=自己,配置校验期直接拒绝
+	selfID := "dev-self"
+	cfg := &Config{Customer: &CustomerConfig{Mesh: &MeshConfig{
+		Peers:    []MeshPeer{{DeviceID: selfID}},
+		Fallback: &MeshFallbackConfig{Enable: boolPtr(true), Addr: "192.168.1.20:9443"},
+	}}}
+	if err := cfg.ValidateMesh(selfID); err == nil || !strings.Contains(err.Error(), "self") {
+		t.Fatalf("want self-reference error, got %v", err)
+	}
+	// 未注册首启(device_id 空)跳过自指检查,不误伤
+	if err := cfg.ValidateMesh(""); err != nil {
+		t.Fatalf("empty self id should skip check, got %v", err)
+	}
+	// 非自指 peer 放行
+	cfg.Customer.Mesh.Peers = []MeshPeer{{DeviceID: "dev-other"}}
+	if err := cfg.ValidateMesh(selfID); err != nil {
+		t.Fatalf("peer != self should pass, got %v", err)
+	}
+	// 空白变体同样命中:手改配置文件可绕过保存期的就地规整,读取侧兜底
+	cfg.Customer.Mesh.Peers = []MeshPeer{{DeviceID: "  " + selfID + "  "}}
+	if err := cfg.ValidateMesh(selfID); err == nil {
+		t.Fatal("whitespace-wrapped self id should still be rejected")
+	}
+}

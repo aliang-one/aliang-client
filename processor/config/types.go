@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"aliang.one/nursorgate/common/logger"
+	"aliang.one/nursorgate/outbound/meshproto"
 	"aliang.one/nursorgate/processor/match"
 )
 
@@ -535,6 +536,9 @@ type CustomerConfig struct {
 	// nil 时 Enable 视为 true——对齐 agentcore peer 注入的既有现状(默认开),
 	// 升级不产生行为回退。它门控三处:agentcore 注入、claude/codex 注册。
 	PeerMCP *PeerMCPConfig `json:"peer_mcp,omitempty"`
+	// Mesh 是节点转发网设置(customer.mesh,design docs/mesh-forwarding-network-design.md)。
+	// nil 时整层不生效:不主动经 mesh 出口,也不接受被其他节点转发。
+	Mesh *MeshConfig `json:"mesh,omitempty"`
 }
 
 // CustomerGeoIPSettings 自定义 GeoIP 国家库下载源（customer.geoip）。
@@ -727,6 +731,113 @@ func (c *Config) EffectivePeerMCPCodexEnabled() bool {
 		return true
 	}
 	return c.effectivePeerMCPSub(c.Customer.PeerMCP.CodexEnabled)
+}
+
+// MeshConfig 节点转发网(design docs/mesh-forwarding-network-design.md)。
+type MeshConfig struct {
+	Enable        *bool               `json:"enable,omitempty"`         // mesh 出口总开关(nil=true)
+	ForwardEnable *bool               `json:"forward_enable,omitempty"` // 允许被其他节点转发(design §8,默认关 nil=false)
+	MaxHops       int                 `json:"max_hops,omitempty"`       // 跳数上限,0=默认5,clamp [1,8]
+	Peers         []MeshPeer          `json:"peers,omitempty"`          // 可转发目标节点
+	Fallback      *MeshFallbackConfig `json:"fallback,omitempty"`       // 离线兜底(design §9.4,兜底式)
+}
+
+type MeshPeer struct {
+	DeviceID string   `json:"device_id"`
+	LANAddrs []string `json:"lan_addrs,omitempty"` // 候选 LAN 地址 host:port(beacon 动态补充)
+	Relay    *bool    `json:"relay,omitempty"`     // 允许走中继载体(nil=true)
+}
+
+type MeshFallbackConfig struct {
+	Enable  *bool    `json:"enable,omitempty"`
+	Classes []string `json:"classes,omitempty"` // self/ai/custom 子集(design §9.4)
+	Addr    string   `json:"addr,omitempty"`    // host:port,enable=true 时必填
+}
+
+// EffectiveEnabled mesh 出口总开关:三态指针语义与 peer_mcp.enable 同族,
+// nil=默认开——mesh 是既有直连形态之上的增量出口,加开关不能让升级把
+// 已配好的 mesh 静默关掉;只有显式 false 才关。
+func (c *MeshConfig) EffectiveEnabled() bool { return c == nil || c.Enable == nil || *c.Enable }
+
+// EffectiveForwardEnabled 允许被其他节点转发(design §8)。默认关:被转发
+// 要消耗本机带宽,是让渡型能力,必须显式开启(nil=false),与总开关的
+// 默认开语义刻意相反。
+func (c *MeshConfig) EffectiveForwardEnabled() bool {
+	return c != nil && c.ForwardEnable != nil && *c.ForwardEnable // 默认关(design §8)
+}
+
+// EffectiveMaxHops 跳数上限:0/负数=默认 5,>8 收口到 8(读取端钳制防御,
+// 手改配置文件可绕过保存校验,越界只会被夹回合法域,不会 crash)。
+func (c *MeshConfig) EffectiveMaxHops() int {
+	if c == nil || c.MaxHops <= 0 {
+		return meshproto.DefaultHops
+	}
+	if c.MaxHops > meshproto.MaxHopsCap {
+		return meshproto.MaxHopsCap
+	}
+	return c.MaxHops
+}
+
+// Validate 保存通道(Config.Validate)调用:peers/兜底/跳数的形态校验。
+// 自指拒绝不在这层——config 包拿不到本机 device_id(反向依赖会成环),
+// 由提交路径显式调 ValidateMesh(spec §3.4/§7 层0)。
+func (c *MeshConfig) Validate() error {
+	if c == nil {
+		return nil
+	}
+	if c.MaxHops < 0 || c.MaxHops > meshproto.MaxHopsCap {
+		return fmt.Errorf("customer.mesh.max_hops 必须在 [1,%d] 内(0=默认 %d), got %d", meshproto.MaxHopsCap, meshproto.DefaultHops, c.MaxHops)
+	}
+	for i := range c.Peers {
+		peer := &c.Peers[i]
+		// 就地规整(同 proxy_rules/ai_rules 的 TrimSpace 先例),保存后落盘
+		// 的是规整值,ValidateMesh 的精确比对才不会被空白变体绕过。
+		peer.DeviceID = strings.TrimSpace(peer.DeviceID)
+		if peer.DeviceID == "" {
+			return fmt.Errorf("customer.mesh.peers[%d] device_id required", i)
+		}
+		for j, addr := range peer.LANAddrs {
+			if _, _, err := net.SplitHostPort(strings.TrimSpace(addr)); err != nil {
+				return fmt.Errorf("customer.mesh.peers[%d].lan_addrs[%d] invalid %q: must be host:port", i, j, addr)
+			}
+		}
+	}
+	if c.Fallback != nil && c.Fallback.Enable != nil && *c.Fallback.Enable {
+		addr := strings.TrimSpace(c.Fallback.Addr)
+		if addr == "" {
+			return fmt.Errorf("customer.mesh.fallback.addr required when fallback enabled")
+		}
+		if _, _, err := net.SplitHostPort(addr); err != nil {
+			return fmt.Errorf("customer.mesh.fallback.addr invalid %q: must be host:port", c.Fallback.Addr)
+		}
+		for _, class := range c.Fallback.Classes {
+			switch class {
+			case meshproto.ClassSelf, meshproto.ClassAI, meshproto.ClassCustom:
+			default:
+				return fmt.Errorf("customer.mesh.fallback.classes[%q] must be one of [%s %s %s]", class, meshproto.ClassSelf, meshproto.ClassAI, meshproto.ClassCustom)
+			}
+		}
+	}
+	return nil
+}
+
+// ValidateMesh 自指拒绝(spec §3.4/§7 层0):peers 指向自己即报错——把自己
+// 列为可转发目标只会造出 1 跳自环。selfDeviceID 为空(未注册首启)时跳过
+// 检查。兜底目标走的是 host:port 地址而非 device_id,不在此检查。
+func (c *Config) ValidateMesh(selfDeviceID string) error {
+	if c == nil || c.Customer == nil || c.Customer.Mesh == nil {
+		return nil
+	}
+	if strings.TrimSpace(selfDeviceID) == "" {
+		return nil
+	}
+	for i, peer := range c.Customer.Mesh.Peers {
+		// 手改配置文件可绕过保存期的就地规整,这里兜底 TrimSpace 再比对。
+		if strings.TrimSpace(peer.DeviceID) == selfDeviceID {
+			return fmt.Errorf("customer.mesh.peers[%d] device_id %q is self: mesh peers must not reference this device", i, peer.DeviceID)
+		}
+	}
+	return nil
 }
 
 // EffectiveAgentCoreMaxIdenticalToolTurns 返回打转守卫阈值;未配置(0/nil/负数)
@@ -1032,6 +1143,11 @@ func (c *Config) Validate() error {
 				return fmt.Errorf("invalid geoip configuration: %w", err)
 			}
 		}
+		if mesh := c.Customer.Mesh; mesh != nil {
+			if err := mesh.Validate(); err != nil {
+				return fmt.Errorf("invalid customer.mesh configuration: %w", err)
+			}
+		}
 	}
 
 	return nil
@@ -1092,7 +1208,7 @@ func (c *Config) customerUnknownKeyErrors() error {
 	if len(c.customerUnknownFields) > 0 {
 		sorted := append([]string(nil), c.customerUnknownFields...)
 		sort.Strings(sorted)
-		return fmt.Errorf("customer.%s is forbidden: editable customer fields are [proxy ai_rules proxy_rules traffic_mirror http1_drop model_mapping custom_env_vars geoip agentcore_llm agentcore peer_mcp]", sorted[0])
+		return fmt.Errorf("customer.%s is forbidden: editable customer fields are [proxy ai_rules proxy_rules traffic_mirror http1_drop model_mapping custom_env_vars geoip agentcore_llm agentcore peer_mcp mesh]", sorted[0])
 	}
 
 	providers := make([]string, 0, len(c.aiRuleUnknownFields))
@@ -1129,7 +1245,7 @@ func extractCustomerUnknownFields(root map[string]json.RawMessage) ([]string, ma
 
 	for key := range customerRoot {
 		switch key {
-		case "proxy", "ai_rules", "proxy_rules", "traffic_mirror", "http1_drop", "model_mapping", "custom_env_vars", "geoip", "agentcore_llm", "agentcore", "peer_mcp":
+		case "proxy", "ai_rules", "proxy_rules", "traffic_mirror", "http1_drop", "model_mapping", "custom_env_vars", "geoip", "agentcore_llm", "agentcore", "peer_mcp", "mesh":
 		default:
 			unknownCustomer = append(unknownCustomer, key)
 		}
