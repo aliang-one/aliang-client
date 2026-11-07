@@ -122,6 +122,19 @@ export async function setPeerMCPRegistration(peerMcp) {
   });
 }
 
+// 设备门禁开关(2026-11-07):GET 读本机两枚 peer 门禁现值(真值源=服务端设备
+// 注册表,经 agent 过滤本机),POST 部分更新落库(至少一个显式布尔键)。
+export async function getPeerDeviceGates() {
+  return request('/api/agent/peer/gates', { method: 'GET' });
+}
+
+export async function setPeerDeviceGates(payload) {
+  return request('/api/agent/peer/gates', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
 // --- 文件访问授权（一次性预先授权 macOS 隐私目录） ---
 
 export async function getAgentFileAccess() {

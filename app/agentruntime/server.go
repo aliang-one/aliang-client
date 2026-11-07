@@ -150,6 +150,7 @@ func registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/agent/peer/device-info", agentHandler.HandlePeerDeviceInfo)
 	mux.HandleFunc("/api/agent/peer/note", agentHandler.HandlePeerNote)
 	mux.HandleFunc("/api/agent/peer/mcp", agentHandler.HandlePeerMcp)
+	mux.HandleFunc("/api/agent/peer/gates", agentHandler.HandlePeerGates)
 	mux.HandleFunc("/api/agent/ai/approval-hook", agentHandler.HandleAIApprovalHook)
 	// 仪表盘聊天 WS（2026-10-28 统一）：core 把 /api/agent/ai/stream 透传到本
 	// runtime，由本地 AI 管理器跑（journal/清单与手机同源）。缺注册=404 透传

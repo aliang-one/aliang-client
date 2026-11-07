@@ -14,9 +14,9 @@ import (
 	"time"
 
 	"aliang.one/nursorgate/app/http/common"
-	"aliang.one/nursorgate/processor/config"
 	"aliang.one/nursorgate/app/http/models"
 	"aliang.one/nursorgate/app/http/services"
+	"aliang.one/nursorgate/processor/config"
 
 	"github.com/gorilla/websocket"
 )
@@ -251,6 +251,52 @@ func (h *AgentHandler) HandlePeerNote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	common.Success(w, map[string]interface{}{"result": text})
+}
+
+// HandlePeerGates GET 读 / POST 写本机两枚 peer 门禁开关（peer_exec_enabled /
+// peer_fetch_enabled，2026-11-07 dashboard 面）。写经 proxyIfNeeded 落到
+// user-agent：编排在云服务端且凭据（user JWT）在用户态进程，同 peer 家族
+// 双注册纪律。POST 载荷至少一个显式布尔键（部分更新语义）。
+func (h *AgentHandler) HandlePeerGates(w http.ResponseWriter, r *http.Request) {
+	if h.proxyIfNeeded(w, r) {
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		ctx, cancel := context.WithTimeout(r.Context(), 14*time.Second)
+		defer cancel()
+		gates, err := h.service.DeviceGatesLocal(ctx)
+		if err != nil {
+			common.Error(w, http.StatusBadGateway, err.Error(), nil)
+			return
+		}
+		common.Success(w, gates)
+	case http.MethodPost:
+		var req struct {
+			PeerExecEnabled  *bool `json:"peer_exec_enabled"`
+			PeerFetchEnabled *bool `json:"peer_fetch_enabled"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 16<<10)).Decode(&req); err != nil {
+			common.ErrorBadRequest(w, "Invalid request body: boolean keys required", nil)
+			return
+		}
+		if req.PeerExecEnabled == nil && req.PeerFetchEnabled == nil {
+			common.ErrorBadRequest(w, "at least one of peer_exec_enabled / peer_fetch_enabled required", nil)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		defer cancel()
+		gates, err := h.service.DeviceGateSetLocal(ctx, req.PeerExecEnabled, req.PeerFetchEnabled)
+		if err != nil {
+			common.Error(w, http.StatusBadGateway, err.Error(), nil)
+			return
+		}
+		common.Success(w, gates)
+	default:
+		// common.Error 收业务码（100-299），直传 http.StatusMethodNotAllowed 会被
+		// 映射成 500；此处须真实 405，同 HandlePeerMcp 的 http.Error 惯例。
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
 }
 
 func (h *AgentHandler) HandleAIApprovalHook(w http.ResponseWriter, r *http.Request) {

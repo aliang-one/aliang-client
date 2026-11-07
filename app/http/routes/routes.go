@@ -278,6 +278,8 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	register("/api/agent/peer/note", h.Agent.HandlePeerNote, http.MethodPost)
 	// aliang-peer 跨设备 MCP 平台托管注册/状态(GET 读状态,POST 应用)。
 	register("/api/agent/peer/mcp", h.Agent.HandlePeerMcp, http.MethodGet, http.MethodPost)
+	// 设备门禁开关(GET 读本机现值,POST 部分更新落库)。
+	register("/api/agent/peer/gates", h.Agent.HandlePeerGates, http.MethodGet, http.MethodPost)
 	register("/api/agent/ai/stream", h.Agent.HandleAIStream, http.MethodGet)
 	register("/api/agent/ai/approval-hook", h.Agent.HandleAIApprovalHook, http.MethodPost)
 	// 聊天图片链路（spec 2026-11-05-chat-image-pipeline §3.4）：网页发图上传

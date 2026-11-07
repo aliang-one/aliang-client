@@ -600,13 +600,16 @@ export default {
   agent_subUserAgent: 'User-mode agent',
   agent_subAliangCode: 'aliangcode',
   agent_subPeerAccess: 'Device Access',
-  // Grayed-out placeholder switches (device-gate layer peer_exec_enabled / peer_fetch_enabled;
-  // source of truth lives in the server device registry, write channel lands cross-repo later)
-  settings_peerExecPendingTitle: 'Cross-device execution',
-  settings_peerExecPendingDesc: 'Device-level gate for letting other devices run commands here.',
-  settings_peerTransferPendingTitle: 'File transfer',
-  settings_peerTransferPendingDesc: 'Device-level gate letting other devices start file transfers to pull files from this machine.',
-  settings_comingSoon: 'Coming soon',
+  // Device gate switches (peer_exec_enabled / peer_fetch_enabled; live read/write since
+  // 2026-11-07: source of truth is the server device registry, writes persist via
+  // POST /api/agent/peer/gates partial update)
+  settings_peerExecTitle: 'Cross-device execution',
+  settings_peerExecDesc: 'Device-level gate for letting other devices run commands here.',
+  settings_peerTransferTitle: 'File transfer',
+  settings_peerTransferDesc: 'Device-level gate letting other devices start file transfers to pull files from this machine.',
+  peerGates_rebindHint: 'Applies to this device only; the switch resets to off after re-pairing (rebind) and must be turned on again.',
+  peerGates_loadFailed: 'Failed to load',
+  peerGates_saveFailed: 'Failed to save',
   mcpGlobal_title: 'MCP master switch',
   mcpGlobal_description: 'Master switch: when off, the AliangCode kernel connects to no MCP server.',
   mcpGlobal_enable: 'Let AliangCode use MCP tools',

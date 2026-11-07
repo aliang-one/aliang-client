@@ -679,3 +679,115 @@ func TestPeerStatusErrorReason_IncludesDetails(t *testing.T) {
 		t.Fatalf("details dropped: %q", reason)
 	}
 }
+
+// --- 设备门禁开关读写(dashboard 面,2026-11-07):DeviceGatesLocal 读本机
+// 两枚 peer 门禁现值,DeviceGateSetLocal PATCH 落库。结构化返回(dashboard
+// 要布尔),与 LLM 文本目录(deviceListReport)分工;写语义=服务端
+// PATCH /api/devices/:id/settings 的本机子集,nil 键不落。 ---
+
+func TestDeviceGatesLocal_ReturnsSelfGateValues(t *testing.T) {
+	// 列表含本机+他机,只允许回本机条目(开关是本机语义,不掺他人真值)。
+	ts := newPeerToolsTestServer(t, http.StatusOK, `[
+		{"id":"device-a","name":"Other","status":"online","peer_exec_enabled":true,"peer_fetch_enabled":true},
+		{"id":"device-b","name":"SelfMachine","status":"online","peer_exec_enabled":true,"peer_fetch_enabled":false}
+	]`)
+	svc := peerToolsTestEnv(t, ts)
+
+	gates, err := svc.DeviceGatesLocal(context.Background())
+	if err != nil {
+		t.Fatalf("read gates failed: %v", err)
+	}
+	method, path, _, _, _ := ts.last()
+	if method != http.MethodGet || path != "/api/devices" {
+		t.Fatalf("request = %s %s", method, path)
+	}
+	if gates["device_id"] != "device-b" {
+		t.Fatalf("device_id = %v, want self device-b", gates["device_id"])
+	}
+	if gates["name"] != "SelfMachine" {
+		t.Fatalf("name = %v", gates["name"])
+	}
+	if gates["peer_exec_enabled"] != true || gates["peer_fetch_enabled"] != false {
+		t.Fatalf("gates = %v, want exec=true fetch=false (self values, not other's)", gates)
+	}
+}
+
+func TestDeviceGatesLocal_SelfMissingFromListFails(t *testing.T) {
+	// 本机不在账号清单(未注册/被踢)必须显式报错,不许拿零值假装读到关。
+	ts := newPeerToolsTestServer(t, http.StatusOK, `[
+		{"id":"device-a","name":"Other","peer_exec_enabled":true,"peer_fetch_enabled":true}
+	]`)
+	svc := peerToolsTestEnv(t, ts)
+
+	if _, err := svc.DeviceGatesLocal(context.Background()); err == nil ||
+		!strings.Contains(err.Error(), "self device") {
+		t.Fatalf("missing self must fail, got %v", err)
+	}
+}
+
+func TestDeviceGateSetLocal_PatchesOnlyProvidedKey(t *testing.T) {
+	// 只翻 fetch:PATCH 体必须只带 peer_fetch_enabled 键(exec=nil 不落键,
+	// 部分更新语义与服务端 Zod optional 对齐);返回值回显服务端 updated 现值。
+	fetch := true
+	ts := newPeerToolsTestServer(t, http.StatusOK,
+		`{"id":"device-b","peer_exec_enabled":false,"peer_fetch_enabled":true}`)
+	svc := peerToolsTestEnv(t, ts)
+
+	gates, err := svc.DeviceGateSetLocal(context.Background(), nil, &fetch)
+	if err != nil {
+		t.Fatalf("set gates failed: %v", err)
+	}
+	method, path, _, _, body := ts.last()
+	if method != http.MethodPatch || path != "/api/devices/device-b/settings" {
+		t.Fatalf("request = %s %s", method, path)
+	}
+	var sent map[string]interface{}
+	if err := json.Unmarshal([]byte(body), &sent); err != nil {
+		t.Fatalf("patch body not json: %v", body)
+	}
+	if len(sent) != 1 || sent["peer_fetch_enabled"] != true {
+		t.Fatalf("patch body = %v, want exactly {peer_fetch_enabled:true}", sent)
+	}
+	if gates["peer_exec_enabled"] != false || gates["peer_fetch_enabled"] != true {
+		t.Fatalf("echoed gates = %v, want server updated values", gates)
+	}
+	if gates["device_id"] != "device-b" {
+		t.Fatalf("device_id = %v", gates["device_id"])
+	}
+}
+
+func TestDeviceGateSetLocal_PatchesBothKeys(t *testing.T) {
+	exec := false
+	fetch := true
+	ts := newPeerToolsTestServer(t, http.StatusOK,
+		`{"id":"device-b","peer_exec_enabled":false,"peer_fetch_enabled":true}`)
+	svc := peerToolsTestEnv(t, ts)
+
+	if _, err := svc.DeviceGateSetLocal(context.Background(), &exec, &fetch); err != nil {
+		t.Fatalf("set gates failed: %v", err)
+	}
+	_, _, _, _, body := ts.last()
+	var sent map[string]interface{}
+	if err := json.Unmarshal([]byte(body), &sent); err != nil {
+		t.Fatalf("patch body not json: %v", body)
+	}
+	if sent["peer_exec_enabled"] != false || sent["peer_fetch_enabled"] != true {
+		t.Fatalf("patch body = %v, want both keys", sent)
+	}
+}
+
+func TestDeviceGateSetLocal_RejectsEmptyPatch(t *testing.T) {
+	// 双 nil=无键可落:本地拒绝,不烧一次网络往返换服务端零操作。
+	ts := newPeerToolsTestServer(t, http.StatusOK, `{}`)
+	svc := peerToolsTestEnv(t, ts)
+
+	if _, err := svc.DeviceGateSetLocal(context.Background(), nil, nil); err == nil {
+		t.Fatal("empty patch must fail locally")
+	}
+	ts.mu.Lock()
+	count := len(ts.methods)
+	ts.mu.Unlock()
+	if count != 0 {
+		t.Fatalf("empty patch must not hit server, got %d requests", count)
+	}
+}

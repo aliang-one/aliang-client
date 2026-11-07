@@ -597,13 +597,15 @@ export default {
   agent_subUserAgent: '用户态 agent',
   agent_subAliangCode: 'aliangcode',
   agent_subPeerAccess: '设备互访',
-  // 置灰占位开关（设备门禁层 peer_exec_enabled / peer_fetch_enabled，
-  // 真值源在服务端设备注册表，写通道待跨仓落地，先占位零请求）
-  settings_peerExecPendingTitle: '跨设备执行',
-  settings_peerExecPendingDesc: '允许其他设备在本机执行命令的设备级门禁。',
-  settings_peerTransferPendingTitle: '文件传输',
-  settings_peerTransferPendingDesc: '允许其他设备发起文件传输、拉取本机文件的设备级门禁。',
-  settings_comingSoon: '即将上线',
+  // 设备门禁开关（peer_exec_enabled / peer_fetch_enabled，2026-11-07 接真读写：
+  // 真值源在服务端设备注册表，写经 POST /api/agent/peer/gates 部分更新落库）
+  settings_peerExecTitle: '跨设备执行',
+  settings_peerExecDesc: '允许其他设备在本机执行命令的设备级门禁。',
+  settings_peerTransferTitle: '文件传输',
+  settings_peerTransferDesc: '允许其他设备发起文件传输、拉取本机文件的设备级门禁。',
+  peerGates_rebindHint: '本机生效，换设备不同步；重新配对（换绑）后开关会回落为关闭，需重新开启。',
+  peerGates_loadFailed: '读取失败',
+  peerGates_saveFailed: '保存失败',
   // 界面偏好（从系统设置抽出）
   // MCP / 技能 全局开关（能力接入）
   mcpGlobal_title: 'MCP 全局开关',
