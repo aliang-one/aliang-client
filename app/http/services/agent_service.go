@@ -342,7 +342,7 @@ func (s *AgentService) VibeSessions() []models.AgentVibeSession {
 	if s == nil || s.ai == nil {
 		return snapshot.VibeSessions
 	}
-	return overlayActiveAgentVibeSessions(snapshot, s.ai.activeVibeSessionsSnapshot(), nil).VibeSessions
+	return overlayActiveAgentVibeSessions(snapshot, s.ai.vibeSessionsSnapshot(true), nil).VibeSessions
 }
 
 // RuntimeSessions returns process-local sessions that are actively executing.
@@ -2679,12 +2679,17 @@ func (s *AgentService) buildAgentStatusSyncPayloadLocked(status string) agentSta
 }
 
 func (s *AgentService) collectAgentSyncSnapshotWithActiveRuns(scanDirs []string) agentSyncSnapshot {
+	if s != nil && s.ai != nil {
+		// 先治愈存量错位(ai_import 拆分 journal 并回 canonical),再收集快照
+		// ——治愈后的文件自然退出清单面(2026-11-07)。
+		s.ai.healSplitAgentCoreJournals()
+	}
 	snapshot := collectAgentSyncSnapshot(scanDirs)
 	if s == nil || s.ai == nil {
 		return snapshot
 	}
 	snapshot.VibeSessions = s.ai.annotateManagedVibeSessions(snapshot.VibeSessions)
-	return overlayActiveAgentVibeSessions(snapshot, s.ai.activeVibeSessionsSnapshot(), scanDirs)
+	return overlayActiveAgentVibeSessions(snapshot, s.ai.vibeSessionsSnapshot(true), scanDirs)
 }
 
 func normalizeRegisteredAgentDevice(resp agentRegisterResponse, fallbackDeviceID string) *models.AgentDevice {

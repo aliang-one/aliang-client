@@ -9,12 +9,24 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
 // agentVibeDigestInterval is how often the remote connection re-hashes the
 // cheap parts of the session inventory to detect changes worth pushing.
 const agentVibeDigestInterval = 10 * time.Second
+
+// agentVibeMemorySnapshotDirty: 内存态会话(create 纳管)不在六类磁盘指纹面,
+// digest 永远不变 → hello 只能等 60s 周期。create 纳管时置位,digest tick
+// 消费一次放行即时 hello(仍受 30s 最小间隔门约束,防创建风暴)。
+var agentVibeMemorySnapshotDirty atomic.Bool
+
+func markAgentVibeMemorySnapshotDirty() { agentVibeMemorySnapshotDirty.Store(true) }
+
+func consumeAgentVibeMemorySnapshotDirty() bool {
+	return agentVibeMemorySnapshotDirty.CompareAndSwap(true, false)
+}
 
 // agentVibeDigest fingerprints everything that changes the phone-visible
 // session list without paying for the transcript walk: index titles, pid

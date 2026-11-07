@@ -75,7 +75,16 @@ type agentAIManager struct {
 	scanOnce sync.Once
 }
 
+// activeVibeSessionsSnapshot 只返回活跃(运行中)会话——RuntimeSessions API 的
+// 语义钉子(agent_service.go「intentionally excludes resident but idle」)。
 func (m *agentAIManager) activeVibeSessionsSnapshot() []models.AgentVibeSession {
+	return m.vibeSessionsSnapshot(false)
+}
+
+// vibeSessionsSnapshot 覆盖层快照。includeIdle=true 时纳管 create-only 会话
+// (cancel==nil):否则桌面新建、尚未开跑的会话不进任何上报面,手机永远看不到
+// (2026-11-07 S1)。hello/sync 与 VibeSessions 列表传 true;RuntimeSessions 传 false。
+func (m *agentAIManager) vibeSessionsSnapshot(includeIdle bool) []models.AgentVibeSession {
 	if m == nil {
 		return nil
 	}
@@ -84,7 +93,10 @@ func (m *agentAIManager) activeVibeSessionsSnapshot() []models.AgentVibeSession 
 	defer m.mu.Unlock()
 	sessions := make([]models.AgentVibeSession, 0, len(m.sessions))
 	for _, session := range m.sessions {
-		if session == nil || session.cancel == nil {
+		if session == nil {
+			continue
+		}
+		if !includeIdle && session.cancel == nil {
 			continue
 		}
 		provider := firstNonEmpty(session.provider, "auto")
@@ -109,19 +121,28 @@ func (m *agentAIManager) activeVibeSessionsSnapshot() []models.AgentVibeSession 
 			}
 		}
 		title = firstNonEmpty(title, session.initialContext, agentProjectName(session.projectPath))
+		// origin 按发起 socket 推导(与 journal 头行同源):remote=phone、
+		// aisock-*=dashboard。恒写 "managed" 会被服务端映射成 'phone',
+		// 把 dashboard 会话的来源角标翻错(2026-11-07)。无 socket 标记(旧
+		// 调用方/测试)推导为 unknown,服务端按外部回落 'tui'——有意变更。
+		origin := agentCoreJournalOriginFor(session.originSocket, session.surface)
+		status := "idle"
+		if session.cancel != nil {
+			status = "running"
+		}
 		sessions = append(sessions, models.AgentVibeSession{
 			ID:                    session.id,
 			Provider:              provider,
 			Tool:                  provider,
 			SourceSessionID:       sourceSessionID,
-			Origin:                "managed",
+			Origin:                origin,
 			ManagedConversationID: session.id,
 			BindingState:          bindingState,
 			BindingVersion:        bindingVersion,
 			ProjectPath:           session.projectPath,
 			Title:                 truncateAgentText(title, 200),
 			Mode:                  firstNonEmpty(session.mode, "vibe"),
-			Status:                "running",
+			Status:                status,
 			MessageCount:          len(session.history),
 			Model:                 session.model,
 			Effort:                session.effort,
@@ -1246,6 +1267,9 @@ func (m *agentAIManager) runEmitter(run agentAIRun, write agentTerminalWriter) *
 func (m *agentAIManager) registerAISessionLocked(session *agentAISession) {
 	m.evictOldestIdleAISessionLocked()
 	m.sessions[session.id] = session
+	// create-only 会话不在磁盘指纹面,纳管即打脏标让 digest tick 放行即时
+	// hello(2026-11-07 S1 实时性)。
+	markAgentVibeMemorySnapshotDirty()
 }
 
 // evictOldestIdleAISessionLocked drops the non-running session (cancel == nil)

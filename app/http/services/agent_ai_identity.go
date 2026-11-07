@@ -369,6 +369,24 @@ func (m *agentAIManager) annotateManagedVibeSessions(sessions []models.AgentVibe
 			nativeSessionID = inventoryNativeSessionID(session.Provider, session.ID)
 			session.SourceSessionID = nativeSessionID
 		}
+		// agentcore journal 条目 ID=会话 id(壳),原生句柄只在绑定表;不回填则
+		// 服务端壳只能拿壳 id 冒充原生 id,跨端 resume 恒错(2026-11-07 错位)。
+		if nativeSessionID == "" {
+			if binding, ok := m.bindings[session.ID]; ok &&
+				binding.NativeSessionID != "" &&
+				providersEquivalent(binding.Provider, session.Provider) {
+				nativeSessionID = binding.NativeSessionID
+				session.SourceSessionID = nativeSessionID
+			}
+		}
+		// agentcore 会话 id 即托管会话 id(journal 头行 session_id=conversation id),
+		// 无绑定也声明托管归属——服务端据此物化 canonical 记录而非铸造壳(S1)。
+		// ai_import_ 前缀是历史拆分产物,归 heal 治愈,不自我声明。
+		if session.ManagedConversationID == "" &&
+			providersEquivalent(session.Provider, "agentcore") &&
+			!strings.HasPrefix(session.ID, "ai_import_") {
+			session.ManagedConversationID = session.ID
+		}
 		if session.Origin == "" {
 			session.Origin = "external"
 		}
@@ -376,7 +394,12 @@ func (m *agentAIManager) annotateManagedVibeSessions(sessions []models.AgentVibe
 			if nativeSessionID == "" || binding.NativeSessionID != nativeSessionID || !providersEquivalent(binding.Provider, session.Provider) {
 				continue
 			}
-			session.Origin = "managed"
+			// 同会话绑定(agentcore 常态:条目 id 即绑定会话 id)不翻转 origin
+			// ——dashboard/phone 头行语义保留,服务端来源角标不失真;异会话
+			// 别名(claude TUI 条目→手机会话)维持 managed 现状。
+			if binding.ConversationID != session.ID {
+				session.Origin = "managed"
+			}
 			session.ManagedConversationID = binding.ConversationID
 			session.BindingState = binding.State
 			session.BindingVersion = binding.BindingVersion
@@ -409,4 +432,86 @@ func providersEquivalent(left, right string) bool {
 		return value
 	}
 	return normalize(left) == normalize(right)
+}
+
+// healSplitAgentCoreJournals 治愈存量错位(2026-11-07):手机续聊曾把回合写进
+// ai_import_<hash>.jsonl(壳 id 冒充原生 id 的历史产物),桌面清单因此多出
+// 「新对话」。绑定表存在两种可映射拓扑:
+//  1. 链式(存量主形态,评审实锤):壳绑定 ai_import_h→local-abc 的 native
+//     本身是另一绑定的 ConversationID(kernel adopt 语义:非空 SessionID 原样
+//     采纳,壳线程的原生 id=冒充的壳 id);
+//  2. 同 native:另一会话绑定了同一内核句柄(兼容保留)。
+//
+// 两种形态都把拆分 journal 并回 canonical 并删源、清孤儿绑定。映射不了
+// (无伙伴/目标运行中)则保守跳过——源文件在,下个周期重试。
+// 在 hello/sync 收集入口调用(collectAgentSyncSnapshotWithActiveRuns),治愈后
+// 的文件自然退出清单面。
+func (m *agentAIManager) healSplitAgentCoreJournals() {
+	if m == nil || m.coreJournal == nil || m.coreJournal.dir == "" {
+		return
+	}
+	type healPair struct {
+		sourceID string
+		targetID string
+	}
+	m.mu.Lock()
+	var pairs []healPair
+	for conversationID, binding := range m.bindings {
+		if !strings.HasPrefix(conversationID, "ai_import_") {
+			continue
+		}
+		if !providersEquivalent(binding.Provider, "agentcore") {
+			continue
+		}
+		if binding.State != "confirmed" || strings.TrimSpace(binding.NativeSessionID) == "" {
+			continue
+		}
+		// 运行中的会话(壳或目标)都不动手:回合在写文件,合并会撕出半行。
+		if session := m.sessions[conversationID]; session != nil && session.cancel != nil {
+			continue
+		}
+		targetID := ""
+		// 形态一(链式,主):壳的"native"是另一会话的 id。provider 等价防
+		// 跨族误配(评审建议);ConversationID != 壳 id 排除自环变体。
+		if chained, ok := m.bindings[binding.NativeSessionID]; ok &&
+			chained.ConversationID != conversationID &&
+			providersEquivalent(chained.Provider, binding.Provider) {
+			targetID = chained.ConversationID
+		}
+		// 形态二(同 native,兼容):另一会话绑定了同一内核句柄。
+		if targetID == "" {
+			for candidateID, candidate := range m.bindings {
+				// 目标必须是 canonical 会话:排除自身与其他壳(壳并壳无意义)。
+				if candidateID == conversationID || strings.HasPrefix(candidateID, "ai_import_") {
+					continue
+				}
+				if candidate.NativeSessionID == binding.NativeSessionID && providersEquivalent(candidate.Provider, binding.Provider) {
+					targetID = candidateID
+					break
+				}
+			}
+		}
+		if targetID == "" {
+			continue
+		}
+		if session := m.sessions[targetID]; session != nil && session.cancel != nil {
+			continue
+		}
+		pairs = append(pairs, healPair{sourceID: conversationID, targetID: targetID})
+	}
+	m.mu.Unlock()
+	for _, pair := range pairs {
+		moved, ok := m.coreJournal.healMergeJournal(pair.sourceID, pair.targetID)
+		if !ok {
+			continue
+		}
+		m.mu.Lock()
+		delete(m.bindings, pair.sourceID)
+		m.mu.Unlock()
+		// persistIdentityState 内部自持 m.mu——绝不能在持锁状态下调用
+		// (自锁死=测试 10min 超时 panic,与 cc_session_lineage.go:310 同款纪律)。
+		persistErr := m.persistIdentityState()
+		logger.Info(fmt.Sprintf("agentcore-journal: heal split source=%s target=%s rows=%d persist_err=%v",
+			pair.sourceID, pair.targetID, moved, persistErr))
+	}
 }

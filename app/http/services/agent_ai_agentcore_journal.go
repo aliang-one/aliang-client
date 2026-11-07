@@ -156,6 +156,111 @@ func (j *agentCoreJournal) hasSessionHeaderLocked(path string) bool {
 	return head["kind"] == "session"
 }
 
+// healMergeJournal 把拆分 journal(源)的内容行并回 canonical journal(目标),
+// 成功后删除源文件。存量错位治愈(2026-11-07):手机续聊曾把回合写进
+// ai_import_<hash>.jsonl,桌面清单因此多出「新对话」。
+//
+// 幂等语义:源文件在才动手;目标文件缺失时以源头行字段(换 session_id)补建
+// 头行;追加成功即删源,进程在「追加完/未删源」窗口崩溃则重试会产生少量重复
+// 行(装饰性,可接受)。返回移动的内容行数;源缺失/无头行返回 (0,false) 且
+// 不动任何文件。
+func (j *agentCoreJournal) healMergeJournal(sourceSessionID, targetSessionID string) (int, bool) {
+	if j == nil || j.dir == "" {
+		return 0, false
+	}
+	sourceID := strings.TrimSpace(sourceSessionID)
+	targetID := strings.TrimSpace(targetSessionID)
+	if sourceID == "" || targetID == "" || sourceID == targetID {
+		return 0, false
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	sourcePath := filepath.Join(j.dir, agentCoreJournalFileName(sourceID))
+	raw, err := os.ReadFile(sourcePath)
+	if err != nil {
+		return 0, false
+	}
+	lines := strings.Split(strings.TrimRight(string(raw), "\n"), "\n")
+	if len(lines) == 0 || strings.TrimSpace(lines[0]) == "" {
+		return 0, false
+	}
+	var head map[string]interface{}
+	if json.Unmarshal([]byte(lines[0]), &head) != nil || head["kind"] != "session" {
+		return 0, false
+	}
+	targetPath := filepath.Join(j.dir, agentCoreJournalFileName(targetID))
+	_, statErr := os.Stat(targetPath)
+	if statErr != nil || !j.hasSessionHeaderLocked(targetPath) {
+		// 目标缺失/无头:以源头行字段补建(会话 id 换成目标)。调用方已持
+		// j.mu——这里必须用无锁原语(sessionHeaderLine 纯函数/prependHeaderLocked
+		// 为 Locked 语义),绝不调 ensureSessionHeader(内部加锁=自锁死)。
+		stringField := func(key string) string {
+			value, _ := head[key].(string)
+			return value
+		}
+		var disabledMCP, disabledSkills []string
+		if list, ok := head["disabled_mcp_servers"].([]interface{}); ok {
+			for _, item := range list {
+				if value, ok := item.(string); ok {
+					disabledMCP = append(disabledMCP, value)
+				}
+			}
+		}
+		if list, ok := head["disabled_skills"].([]interface{}); ok {
+			for _, item := range list {
+				if value, ok := item.(string); ok {
+					disabledSkills = append(disabledSkills, value)
+				}
+			}
+		}
+		line := j.sessionHeaderLine(targetID, stringField("project_path"), stringField("model"), stringField("effort"),
+			stringField("created_at"), stringField("origin"), disabledMCP, disabledSkills, stringField("approval_mode"))
+		if line == nil {
+			return 0, false
+		}
+		if statErr != nil {
+			if err := os.MkdirAll(j.dir, 0o700); err != nil {
+				return 0, false
+			}
+			if err := os.WriteFile(targetPath, line, 0o600); err != nil {
+				return 0, false
+			}
+		} else {
+			j.prependHeaderLocked(targetPath, targetID, stringField("project_path"), stringField("model"), stringField("effort"),
+				stringField("created_at"), stringField("origin"), disabledMCP, disabledSkills, stringField("approval_mode"))
+		}
+		if !j.hasSessionHeaderLocked(targetPath) {
+			return 0, false
+		}
+	}
+	var body strings.Builder
+	moved := 0
+	for _, line := range lines[1:] {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		body.WriteString(line)
+		body.WriteString("\n")
+		moved++
+	}
+	file, err := os.OpenFile(targetPath, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return 0, false
+	}
+	if _, err := file.WriteString(body.String()); err != nil {
+		file.Close()
+		return 0, false
+	}
+	if err := file.Close(); err != nil {
+		return 0, false
+	}
+	if err := os.Remove(sourcePath); err != nil {
+		logger.Warn(fmt.Sprintf("agentcore-journal: heal remove source failed source=%s target=%s err=%v", sourceID, targetID, err))
+		return 0, false
+	}
+	return moved, true
+}
+
 // syncSessionSwitches 把会话级 MCP/技能开关同步进 journal 头行（会话级开关
 // 持久化，2026-10-31）。
 //

@@ -593,7 +593,9 @@ func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn) error {
 				if s.remoteHello.baseline(digest) {
 					continue
 				}
-				if s.remoteHello.unchanged(digest) {
+				// 内存态变更(create 纳管 create-only 会话)即使磁盘指纹不变也要
+				// 放行一次 hello;标记被 30s 门 defer 掉就等 60s 周期兜底,不重试。
+				if !consumeAgentVibeMemorySnapshotDirty() && s.remoteHello.unchanged(digest) {
 					continue
 				}
 				if ok, firstDefer := s.remoteHello.allow(digest, time.Now(), agentVibeDigestHelloMinInterval); !ok {
