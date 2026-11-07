@@ -541,7 +541,7 @@ export default {
   dash_serverLinkError: 'Last error: {error}',
   dash_serverLinkHighLatency: 'Handshake latency is above {threshold} ms.',
   dash_serverLinkConnected: 'Latest handshake completed successfully.',
-  dash_serverLinkOffline: 'mTLS link is currently offline. Last successful handshake was {time}.',
+  dash_serverLinkOfflineDetail: 'mTLS link is currently offline. Last successful handshake was {time}.',
   dash_serverLinkNoHandshake: 'No successful mTLS handshake has been recorded yet.',
   dash_proxyStatusUnknown: 'System Proxy Status Unknown',
   dash_proxyActive: 'System Proxy Active',

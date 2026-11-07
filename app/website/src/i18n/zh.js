@@ -538,7 +538,7 @@ export default {
   dash_serverLinkError: '最近错误：{error}',
   dash_serverLinkHighLatency: '握手延迟超过 {threshold} ms。',
   dash_serverLinkConnected: '最新握手已成功完成。',
-  dash_serverLinkOffline: 'mTLS 链接当前离线。上次成功握手于 {time}。',
+  dash_serverLinkOfflineDetail: 'mTLS 链接当前离线。上次成功握手于 {time}。',
   dash_serverLinkNoHandshake: '尚未记录成功的 mTLS 握手。',
   dash_proxyStatusUnknown: '系统代理状态未知',
   dash_proxyActive: '系统代理已激活',
@@ -604,8 +604,6 @@ export default {
   settings_peerTransferPendingTitle: '文件传输',
   settings_peerTransferPendingDesc: '允许其他设备发起文件传输、拉取本机文件的设备级门禁。',
   settings_comingSoon: '即将上线',
-  settings_scopeDevice: '本机生效，换设备不同步',
-  settings_scopeLocal: '仅本机浏览器',
   // 界面偏好（从系统设置抽出）
   // MCP / 技能 全局开关（能力接入）
   mcpGlobal_title: 'MCP 全局开关',

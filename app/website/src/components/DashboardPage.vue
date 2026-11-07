@@ -1495,7 +1495,7 @@ const serverLinkDetailText = computed(() => {
     return 'Latest handshake completed successfully.';
   }
   if (serverLinkLastConnectedAt.value > 0) {
-    return t('dash_serverLinkOffline', { time: formatRelativeTimestamp(serverLinkLastConnectedAt.value) });
+    return t('dash_serverLinkOfflineDetail', { time: formatRelativeTimestamp(serverLinkLastConnectedAt.value) });
   }
   return t('dash_serverLinkNoHandshake');
 });
