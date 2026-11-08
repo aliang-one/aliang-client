@@ -506,8 +506,8 @@ func TestMeshInboundDNSTargetTypeMatrix(t *testing.T) {
 // (design §6 层1 定案),含空 Question 的畸形查询。
 func TestMeshInboundDNSTargetUnsupportedTypeServfail(t *testing.T) {
 	for name, qtype := range map[string]uint16{
-		"CNAME":      dns.TypeCNAME,
-		"NS":         dns.TypeNS,
+		"CNAME": dns.TypeCNAME,
+		"NS":    dns.TypeNS,
 		"未注册类型": dns.TypeNULL,
 	} {
 		t.Run(name, func(t *testing.T) {

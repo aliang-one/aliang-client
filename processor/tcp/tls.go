@@ -279,6 +279,9 @@ func (h *DefaultTLSHandler) DetermineRouteWithContext(metadata *M.Metadata) (Pro
 		return h.defaultFallbackRoute(), false
 	}
 
+	// 离线 AI 改道只在 handleNonTLS 强制分支挂钩(handler.go:479);本 SNI
+	// 判定角落刻意不改道——TLS-flavored 连接打 loopback:56432 属退化配置
+	// (56432 代理明文,在线也握不上手),Task 12 评审定案。
 	if shouldForceAliangRoute(metadata) {
 		logger.Debug(fmt.Sprintf("Route override: forcing aliang for local proxy target %s", metadata.DestinationAddress()))
 		return RouteToALiang, false

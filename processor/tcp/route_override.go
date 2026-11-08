@@ -47,6 +47,8 @@ func shouldForceAliangRoute(metadata *M.Metadata) bool {
 //
 // 类别不另行推断:本判定只在 shouldForceAliangRoute 命中后消费,56432
 // 回环判据(looksLikeAITraffic 同源口径)恒推断 ai,直接以 ClassAI 查门控。
+// B 侧再改道/Via 续传覆盖归 Task 13 集成(计划已列
+// TestMeshOfflineAIRedirectTwoHop)。
 func meshOfflineRedirectForAI() (addr string, ok bool) {
 	if !meshOfflineActive() {
 		return "", false
