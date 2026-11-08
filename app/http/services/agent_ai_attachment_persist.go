@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -40,14 +41,32 @@ var agentAttachmentExtAllowlist = map[string]bool{
 }
 
 // agentAttachmentCacheRoot 解析持久缓存根。env 覆盖（ALIANG_ATTACHMENT_
-// PERSIST_DIR）供测试与高级部署用；缺省 EffectiveAgentHome（root agent 下
-// 解析登录用户家目录，与 CLI 扫描同源）。
+// PERSIST_DIR）供测试与高级部署用；缺省按平台策略（见 For 版）。
 func agentAttachmentCacheRoot() (string, error) {
+	return agentAttachmentCacheRootFor(runtime.GOOS)
+}
+
+// agentAttachmentCacheRootFor 平台策略注入版（goos 可注入供单平台测试，
+// 规避「GOOS 后缀测试文件在其它平台静默跳过」盲区）。
+//
+// 平台撕裂背景（2026-11-08 vm459 Windows 103 根因）：Windows 服务账户
+// (SYSTEM) 与用户 runtime 进程的 %USERPROFILE% 不同（SYSTEM=systemprofile），
+// 而 runtimepath 没有 windows 的 console-user 解析分支——home 侧缓存根在
+// core(56431 服务进程) 与 runtime(56433 用户进程) 之间不共享：下载写入方落
+// 用户 home、取图读取方（服务进程）落 systemprofile → 恒 miss → 103。
+// journal/转录清单不受影响（数据面代理会把请求转发给 runtime 进程），附件
+// 端点没有转发分支，故在本层统一根：windows 恒落 CoreDataDir（ProgramData，
+// 两进程读写一致）；darwin/linux 的 EffectiveAgentHome 自带 console-user
+// 解析（root 进程也能定位桌面用户家目录），home 侧语义保持不变。
+func agentAttachmentCacheRootFor(goos string) (string, error) {
 	if dir := strings.TrimSpace(os.Getenv("ALIANG_ATTACHMENT_PERSIST_DIR")); dir != "" {
 		if abs, err := filepath.Abs(dir); err == nil {
 			return abs, nil
 		}
 		return dir, nil
+	}
+	if goos == "windows" {
+		return filepath.Join(runtimepath.CoreDataDir(), agentAttachmentCacheDirName), nil
 	}
 	home, err := runtimepath.EffectiveAgentHome()
 	if err != nil || strings.TrimSpace(home) == "" {
@@ -58,6 +77,54 @@ func agentAttachmentCacheRoot() (string, error) {
 		}
 	}
 	return filepath.Join(home, agentAttachmentCacheDirName), nil
+}
+
+// migrateLegacyAttachmentCacheRoot 一次性迁移（幂等）：windows 切 CoreDataDir
+// 根之前落在用户 home 侧的历史缓存搬进新根，新根已有的同名文件保留新根版本
+// 不被覆盖；重复执行不炸。非 windows 平台无撕裂，恒 no-op。legacyRoot 由
+// 调用方从当前进程 home 推导（runtime boot 进程=用户态，解析得到真用户
+// home；SYSTEM 进程 home 侧无历史文件，读空目录即自然跳过）。
+func migrateLegacyAttachmentCacheRoot(goos, newRoot, legacyRoot string) {
+	if goos != "windows" || strings.TrimSpace(newRoot) == "" || strings.TrimSpace(legacyRoot) == "" {
+		return
+	}
+	sessions, err := os.ReadDir(legacyRoot)
+	if err != nil {
+		return // 旧根不存在/不可读 = 无历史可迁
+	}
+	for _, sess := range sessions {
+		if !sess.IsDir() {
+			continue
+		}
+		files, err := os.ReadDir(filepath.Join(legacyRoot, sess.Name()))
+		if err != nil {
+			continue
+		}
+		for _, f := range files {
+			if f.IsDir() {
+				continue
+			}
+			dst := filepath.Join(newRoot, sess.Name(), f.Name())
+			if _, err := os.Stat(dst); err == nil {
+				continue // 新根已有：保留新根版本
+			}
+			src := filepath.Join(legacyRoot, sess.Name(), f.Name())
+			data, err := os.ReadFile(src)
+			if err != nil {
+				logger.Warn(fmt.Sprintf("[AGENT-ATTACH] migrate read failed path=%s error=%v", src, err))
+				continue
+			}
+			if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+				logger.Warn(fmt.Sprintf("[AGENT-ATTACH] migrate mkdir failed dir=%s error=%v", filepath.Dir(dst), err))
+				continue
+			}
+			if err := os.WriteFile(dst, data, 0o644); err != nil {
+				logger.Warn(fmt.Sprintf("[AGENT-ATTACH] migrate write failed path=%s error=%v", dst, err))
+				continue
+			}
+			logger.Warn(fmt.Sprintf("[AGENT-ATTACH] migrated legacy cache file dest=%s", dst))
+		}
+	}
 }
 
 // sanitizeAgentAttachmentSessionID 把 sessionID 约束为安全目录名：只留字母
@@ -281,8 +348,16 @@ func agentAttachmentSweep() error {
 	return agentAttachmentSweepCap(agentAttachmentGlobalMaxBytes)
 }
 
-// AgentAttachmentSweepStartup 供 runtime boot 链调用的导出包装。
+// AgentAttachmentSweepStartup 供 runtime boot 链调用的导出包装。windows 上
+// 先把 home 侧历史缓存迁进统一根（幂等），再走常规配额清扫；runtime boot
+// 进程=用户态，此时 legacy 根解析得到的是真用户 home（SYSTEM 进程 home 侧
+// 无历史文件，迁移自然空转）。
 func AgentAttachmentSweepStartup() error {
+	if root, err := agentAttachmentCacheRoot(); err == nil {
+		if userHome, uerr := runtimepath.UserHomeDir(); uerr == nil && strings.TrimSpace(userHome) != "" {
+			migrateLegacyAttachmentCacheRoot(runtime.GOOS, root, filepath.Join(userHome, agentAttachmentCacheDirName))
+		}
+	}
 	return agentAttachmentSweep()
 }
 

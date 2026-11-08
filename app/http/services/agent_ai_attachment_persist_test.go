@@ -120,3 +120,88 @@ func TestAgentAttachmentSweepEvictsOldestSession(t *testing.T) {
 		t.Fatalf("newest session evicted too aggressively: %v", err)
 	}
 }
+
+// 平台缓存根策略（Windows 103 根因修复）：windows 的服务账户(SYSTEM)与用户
+// runtime 进程 %USERPROFILE% 不同，home 侧缓存根在 core/runtime 两进程间不
+// 共享（runtimepath 无 windows console-user 解析）——统一落 CoreDataDir。
+// goos 注入规避「GOOS 后缀测试在单平台静默跳过」盲区（2026-06-10 事故守则）。
+func TestAgentAttachmentCacheRootPlatformPolicy(t *testing.T) {
+	dataRoot := t.TempDir()
+	homeRoot := t.TempDir()
+
+	// (a) windows：恒 CoreDataDir（env 已重定向），与 home 无关
+	t.Setenv("ALIANG_DATA_DIR", dataRoot)
+	t.Setenv("HOME", homeRoot)
+	t.Setenv("USERPROFILE", homeRoot)
+	got, err := agentAttachmentCacheRootFor("windows")
+	if err != nil {
+		t.Fatalf("windows root: %v", err)
+	}
+	if want := filepath.Join(dataRoot, "aliang-attachments"); got != want {
+		t.Fatalf("windows root = %q want %q", got, want)
+	}
+
+	// (b) darwin：home 侧语义不变
+	got, err = agentAttachmentCacheRootFor("darwin")
+	if err != nil {
+		t.Fatalf("darwin root: %v", err)
+	}
+	if want := filepath.Join(homeRoot, "aliang-attachments"); got != want {
+		t.Fatalf("darwin root = %q want %q", got, want)
+	}
+
+	// (c) env 覆盖恒最高（部署级逃生口），压过平台决策
+	override := t.TempDir()
+	t.Setenv("ALIANG_ATTACHMENT_PERSIST_DIR", override)
+	for _, goos := range []string{"windows", "darwin"} {
+		got, err = agentAttachmentCacheRootFor(goos)
+		if err != nil {
+			t.Fatalf("%s root under env override: %v", goos, err)
+		}
+		if got != override {
+			t.Fatalf("%s root under env override = %q want %q", goos, got, override)
+		}
+	}
+}
+
+// home 侧旧根一次性迁移（幂等）：切 ProgramData 根之前落的历史文件搬进新根；
+// 新根已有的同名文件保留新根版本不被覆盖；重复执行不炸不重复拷。
+func TestMigrateLegacyAttachmentCacheRoot(t *testing.T) {
+	legacy := t.TempDir()
+	newRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(legacy, "sess-a"), 0o755); err != nil {
+		t.Fatalf("mkdir legacy: %v", err)
+	}
+	writeFile := func(path string, content []byte) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", path, err)
+		}
+		if err := os.WriteFile(path, content, 0o644); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+	}
+	writeFile(filepath.Join(legacy, "sess-a", "m-old.jpg"), []byte("legacy-old"))
+	writeFile(filepath.Join(legacy, "sess-b", "m-new.jpg"), []byte("legacy-new"))
+	// 新根已有同名文件（版本较新）：迁移不得覆盖
+	writeFile(filepath.Join(newRoot, "sess-a", "m-old.jpg"), []byte("newer-version"))
+
+	migrateLegacyAttachmentCacheRoot("windows", newRoot, legacy)
+	migrateLegacyAttachmentCacheRoot("windows", newRoot, legacy) // 幂等重跑
+
+	b, err := os.ReadFile(filepath.Join(newRoot, "sess-b", "m-new.jpg"))
+	if err != nil || string(b) != "legacy-new" {
+		t.Fatalf("legacy-only file not migrated: %v %q", err, string(b))
+	}
+	b, err = os.ReadFile(filepath.Join(newRoot, "sess-a", "m-old.jpg"))
+	if err != nil || string(b) != "newer-version" {
+		t.Fatalf("newer file clobbered by migration: %v %q", err, string(b))
+	}
+
+	// darwin：迁移为 no-op（平台无撕裂，home 语义不动）
+	writeFile(filepath.Join(legacy, "sess-c", "m-darwin.jpg"), []byte("x"))
+	migrateLegacyAttachmentCacheRoot("darwin", newRoot, legacy)
+	if _, err := os.Stat(filepath.Join(newRoot, "sess-c")); !os.IsNotExist(err) {
+		t.Fatalf("darwin migration must be a no-op")
+	}
+}
