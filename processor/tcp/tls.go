@@ -330,6 +330,16 @@ func (h *DefaultTLSHandler) decideRouteWithRoutingEngine(metadata *M.Metadata) P
 	case routing.RouteToSocks:
 		return RouteToLocalProxy
 	default:
+		// mesh 转发决策 toNode:<deviceID>[:policy](Task 7):decision 整串经
+		// metadata.Route 寄存抵达执行层 dialByRoute(链头解析 deviceID 与失败
+		// 策略)。取点说明(最小侵入):DetermineRouteWithContext 契约无 ctx
+		// 入参,decision 字符串无法经 ctx 传递;metadata 指针全程流经
+		// 决策(tls.go/handler.go)→执行(dialByRoute),Route 字段本就是路由
+		// 溯源标记,寄存后由 dialByRoute 按执行结果覆写为最终标签。
+		if strings.HasPrefix(string(decision), routing.SnapshotTargetMeshPrefix) {
+			metadata.Route = string(decision)
+			return RouteToNode
+		}
 		return h.defaultFallbackRoute()
 	}
 }

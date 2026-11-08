@@ -65,11 +65,11 @@ func TestCanonicalRoutingSchemaValidate_MeshPolicyForms(t *testing.T) {
 	}
 
 	rejected := []string{
-		"toNode:dev-b:fallback:",     // fallback 目标为空
-		"toNode:dev-b:bogus",         // 未知策略段
-		"toNode:dev-b:direct:extra",  // 超出四形态的段数
-		"toNode::deny",               // deviceID 空
-		"toNode:dev-b:DENY",          // 策略关键字小写精确(编译产物恒小写)
+		"toNode:dev-b:fallback:",             // fallback 目标为空
+		"toNode:dev-b:bogus",                 // 未知策略段
+		"toNode:dev-b:direct:extra",          // 超出四形态的段数
+		"toNode::deny",                       // deviceID 空
+		"toNode:dev-b:DENY",                  // 策略关键字小写精确(编译产物恒小写)
 		"toNode:dev-b:fallback:dev-c:direct", // fallback 目标含策略段(段数超限)
 	}
 	for _, target := range rejected {
@@ -124,9 +124,9 @@ func TestParseMeshRuleTarget(t *testing.T) {
 		{"toNode:dev-b:direct", "dev-b", "direct", true},
 		{"toNode:dev-b:deny", "dev-b", "deny", true},
 		{"toNode:dev-b:fallback:dev-c", "dev-b", "fallback:dev-c", true},
-		{"toNode:", "", "", true},              // mesh 形态但 deviceID 空 → 调用方判非法
-		{"toNode:dev-b:bogus", "", "", true},   // 未知策略段 → 非法
-		{"toNode:a:b:c:d", "", "", true},       // 段数超限 → 非法
+		{"toNode:", "", "", true},            // mesh 形态但 deviceID 空 → 调用方判非法
+		{"toNode:dev-b:bogus", "", "", true}, // 未知策略段 → 非法
+		{"toNode:a:b:c:d", "", "", true},     // 段数超限 → 非法
 		{"direct", "", "", false},
 		{"toAliang", "", "", false},
 	}

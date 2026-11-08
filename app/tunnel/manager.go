@@ -19,6 +19,7 @@ import (
 
 	"aliang.one/nursorgate/app/mesh/relay"
 	"aliang.one/nursorgate/outbound/meshproto"
+	"aliang.one/nursorgate/processor/tcp"
 )
 
 type Config struct {
@@ -281,6 +282,11 @@ func validateConfig(config Config) (runConfig, [sha256.Size]byte, error) {
 	// B-side mesh receive relay: the deps provider reads customer.mesh live
 	// per connection, so nothing config-derived gates construction here.
 	meshRelay := relay.New(relay.ProductionDeps(config.DeviceID))
+	// A-side mesh egress head header source (Task 7): the outbound dial
+	// (processor/tcp dialByRoute → mesh Peer) reads the local device id from
+	// this seam; same source as the receive relay above. PikoDial wiring for
+	// the relay carrier lands in Task 9.
+	tcp.SetMeshSelfIDSource(func() string { return config.DeviceID })
 	// The fingerprint includes the token and expiry, so every renewal
 	// reconfigures the session. This drops in-flight streams once per renewal:
 	// piko reads Upstream.Token only at dial time and offers no token

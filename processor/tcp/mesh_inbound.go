@@ -66,7 +66,8 @@ type MeshInboundDeps struct {
 //
 // 拒绝语义(design §3.3 定死):所有拒绝(防环/门禁/类别/解析失败)以一行
 // 文本错误回写对端后关闭连接——错误回源,中间跳不执行任何兜底/失败策略
-// (那是链头的事,Task 7)。
+// (兜底/失败策略仅由链头就地执行,见 handler.go dialViaMesh;本侧注入连接
+// 的中间跳拨出失败同样错误回源,不落策略)。
 //
 // 所有权:拒绝路径由本函数关连接;注入成功后连接移交 deps.Handler(按
 // TCPConnHandler 契约由 handler 负责关闭,同 TUN/HTTP 入站)。
