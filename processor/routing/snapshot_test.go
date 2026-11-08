@@ -559,7 +559,9 @@ func TestRuntimeSnapshot_CompileMeshDNSRuleFirstWins(t *testing.T) {
 			rules[1].Type, rules[1].Condition, rules[1].Target)
 	}
 
-	// 首条启用的 dns 规则即决策目标:dns 规则在决策层恒真,first-match 取首条。
+	// dns 规则不参与连接级决策:决策层对 dns 规则一律不命中,仅有 dns 规则
+	// 可命中时 TCP 决策落默认 direct。DNS 代转发目标由 Task 8 的
+	// meshDNSForwardTarget 直接扫快照规则取首条启用项,不走 DecideRouteFromSnapshot。
 	snapshot, err := CompileRuntimeSnapshotFromRuntimeInputs(cfg, model.RulesSettings{})
 	if err != nil {
 		t.Fatalf("CompileRuntimeSnapshotFromRuntimeInputs() error = %v", err)
@@ -568,8 +570,109 @@ func TestRuntimeSnapshot_CompileMeshDNSRuleFirstWins(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DecideRouteFromSnapshot() error = %v", err)
 	}
+	if decision != RouteDirect {
+		t.Fatalf("decision = %s, want %s (dns 规则不影响 TCP 决策,仅 dns 可命中时落默认)", decision, RouteDirect)
+	}
+}
+
+func TestDecideRouteFromSnapshot_MeshDNSRuleSkippedInTCPDecision(t *testing.T) {
+	// dns 规则排在域名规则之前也不得劫持连接级决策:first-match 对 dns 规则
+	// 一律不命中,由后续域名规则命中;DNS 代转发目标由 Task 8 的
+	// meshDNSForwardTarget 直接扫快照规则取首条启用项,不走 DecideRouteFromSnapshot。
+	cfg := &config.Config{
+		Customer: &config.CustomerConfig{
+			ProxyRules: []string{
+				"dns,mesh:dev-c",
+				"domains,internal.corp,mesh:dev-b",
+			},
+			Mesh: &config.MeshConfig{Peers: []config.MeshPeer{{DeviceID: "dev-b"}, {DeviceID: "dev-c"}}},
+		},
+	}
+
+	snapshot, err := CompileRuntimeSnapshotFromRuntimeInputs(cfg, model.RulesSettings{})
+	if err != nil {
+		t.Fatalf("CompileRuntimeSnapshotFromRuntimeInputs() error = %v", err)
+	}
+
+	decision, err := DecideRouteFromSnapshot(snapshot, &MatchContext{Domain: "internal.corp"})
+	if err != nil {
+		t.Fatalf("DecideRouteFromSnapshot() error = %v", err)
+	}
 	if decision != RouteDecision("toNode:dev-b") {
-		t.Fatalf("decision = %s, want toNode:dev-b (首条 dns 规则胜出)", decision)
+		t.Fatalf("decision = %s, want toNode:dev-b (dns 排前不劫持,由域名规则命中)", decision)
+	}
+}
+
+func TestRuntimeSnapshot_MeshMultiSegmentTailRejected(t *testing.T) {
+	// 多段尾(mesh:x,direct/deny/fallback:y)解析随 Task 7 落地:当前不认
+	// 多段尾——含 mesh: 段但形态不可解析的条目整条静默跳过,尤其不得被
+	// 静默错编译成普通代理规则(domains 前缀分支会吞掉 mesh: 段)。
+	cfg := &config.Config{
+		Customer: &config.CustomerConfig{
+			ProxyRules: []string{
+				"domains,corp.com,mesh:dev-b,direct", // 多段尾:整条跳过
+				"domains,corp.com,mesh:dev-b,",       // 尾逗号空段:整条跳过
+				"domains,ok.com,mesh:dev-b",          // 合法形态对照:正常产出
+			},
+			Mesh: &config.MeshConfig{Peers: []config.MeshPeer{{DeviceID: "dev-b"}}},
+		},
+	}
+
+	canonical, err := CompileCanonicalRoutingFromRuntimeInputs(cfg, model.RulesSettings{})
+	if err != nil {
+		t.Fatalf("CompileCanonicalRoutingFromRuntimeInputs() error = %v", err)
+	}
+
+	rules := canonical.Routing.Rules
+	if len(rules) != 1 {
+		t.Fatalf("rules len = %d, want 1 (多段尾/尾逗号 mesh 条目应整条静默跳过), rules = %+v", len(rules), rules)
+	}
+	if rules[0].Condition != "ok.com" || rules[0].Target != "toNode:dev-b" {
+		t.Fatalf("rules[0] = {Condition: %s, Target: %s}, want {Condition: ok.com, Target: toNode:dev-b}",
+			rules[0].Condition, rules[0].Target)
+	}
+}
+
+func TestSnapshotTargetMeshPrefixMirrorsConfigConstant(t *testing.T) {
+	// 镜像常量钉死(M1):config 不能反向 import routing(import 成环),
+	// 两侧常量必须同值——编译产物形态(toNode:)与 schema 白名单形态由
+	// 本断言锁死,任一侧漂移即红。
+	if SnapshotTargetMeshPrefix != config.MeshRuleTargetPrefix {
+		t.Fatalf("SnapshotTargetMeshPrefix = %q, config.MeshRuleTargetPrefix = %q, want 同值",
+			SnapshotTargetMeshPrefix, config.MeshRuleTargetPrefix)
+	}
+}
+
+func TestSplitMeshTail(t *testing.T) {
+	cases := []struct {
+		name         string
+		raw          string
+		wantBase     string
+		wantDeviceID string
+		wantState    meshTailState
+	}{
+		{"域名尾段", "domains,corp.com,mesh:dev-b", "domains,corp.com", "dev-b", meshTailParsed},
+		{"IP 尾段", "ip-cidr,10.0.0.0/8,mesh:dev-b", "ip-cidr,10.0.0.0/8", "dev-b", meshTailParsed},
+		{"dns 尾段", "dns,mesh:dev-b", "dns", "dev-b", meshTailParsed},
+		{"MESH 大小写前缀敏感段", "dns,MESH:dev-b", "dns", "dev-b", meshTailParsed},
+		{"deviceID 保留大小写", "dns,mesh:Dev-B", "dns", "Dev-B", meshTailParsed},
+		{"段内空白容忍", "dns, mesh:dev-b ", "dns", "dev-b", meshTailParsed},
+		{"多段尾拒绝", "domains,corp.com,mesh:dev-b,direct", "", "", meshTailInvalid},
+		{"尾逗号空段拒绝", "domains,corp.com,mesh:dev-b,", "", "", meshTailInvalid},
+		{"中段 mesh 拒绝", "domains,mesh:dev-b,10.0.0.0/8", "", "", meshTailInvalid},
+		{"空设备拒绝", "domains,corp.com,mesh:", "", "", meshTailInvalid},
+		{"裸 mesh 段空 base 拒绝", "mesh:dev-b", "", "", meshTailInvalid},
+		{"非 mesh 条目", "domains,corp.com,proxy", "domains,corp.com,proxy", "", meshTailNone},
+		{"无逗号非 mesh 条目", "google.com", "google.com", "", meshTailNone},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			base, deviceID, state := splitMeshTail(tc.raw)
+			if base != tc.wantBase || deviceID != tc.wantDeviceID || state != tc.wantState {
+				t.Fatalf("splitMeshTail(%q) = (%q, %q, %d), want (%q, %q, %d)",
+					tc.raw, base, deviceID, state, tc.wantBase, tc.wantDeviceID, tc.wantState)
+			}
+		})
 	}
 }
 

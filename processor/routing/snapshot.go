@@ -185,6 +185,18 @@ func (s *RuntimeSnapshot) StrictUnavailableBranchDeny() bool {
 	return s.strictDeny
 }
 
+// CompileRuntimeSnapshot 将 canonical schema(如 routing apply store 的持久化
+// 产物)物化为决策快照。
+//
+// 不变式(M5,防后人读错快照):store 快照不驱动连接级决策——连接级决策的
+// 两处调用方(processor/rules/engine 与 processor/tcp/tls)都走
+// CompileRuntimeSnapshotFromRuntimeInputs 按需重编译,不读本函数产物;store
+// 快照只用于开关状态派生与持久化回放。因此 mesh 能力闸(meshForwardAvailable:
+// 总开关+peer 存在)只在 runtime-inputs 编译路径把关,本函数对 toNode: 目标
+// 不做能力检查、按前缀放行是安全的——落盘 canonical 在写入时
+// (customer_config_service)已经过 runtime-inputs 闸,手改文件注入的越权
+// toNode 规则由 Validate 的形态校验拦下 deviceID 空/未知形态,peer 越权则由
+// 转发层(连接建立时按需重编译)天然规避。
 func CompileRuntimeSnapshot(canonical *config.CanonicalRoutingSchema) (*RuntimeSnapshot, error) {
 	if canonical == nil {
 		return nil, fmt.Errorf("canonical routing schema is nil")
@@ -363,6 +375,9 @@ func compileCanonicalRoutingFromRuntimeInputs(cfg *config.Config, switches model
 		}
 	}
 
+	// 有意行为(design §4 允许):AI 池条目带 mesh 尾同样会编译为
+	// ai_allowlist_N + toNode:<deviceID> 目标,覆盖默认 toAliang——
+	// mesh 尾是条目级转发声明,与所在池无关。
 	appendRules(aiEntries, "ai_allowlist", SnapshotActionToAliang)
 	appendRules(proxyEntries, "proxy_rule", resolveProxyRuleTarget(canonical.Egress.ToSocks.Enabled))
 	canonical.Routing.Rules = rules
@@ -438,31 +453,56 @@ func resolveProxyRuleTarget(toSocksEnabled bool) SnapshotAction {
 	return SnapshotActionDirect
 }
 
-// splitMeshTail 剥离 mesh 转发尾段：逗号切分后尾段以 mesh: 开头（大小写不敏感）
-// 即视为转发目标，返回剥尾后的 base 条目与 deviceID。
+// meshTailState 是 splitMeshTail 的三态结果。
+type meshTailState int
+
+const (
+	// meshTailNone 无 mesh: 段：非 mesh 条目，交回常规分类。
+	meshTailNone meshTailState = iota
+	// meshTailParsed 合法 mesh 尾：base 与 deviceID 可用。
+	meshTailParsed
+	// meshTailInvalid 含 mesh: 段但形态不可解析：整条静默跳过，
+	// 不得回落常规分类（防静默错编译，见 splitMeshTail 注释）。
+	meshTailInvalid
+)
+
+// splitMeshTail 剥离 mesh 转发尾段：任一逗号段以 mesh: 开头（大小写不敏感）
+// 即判定该条目为 mesh 语法，mesh: 段必须是末段且 deviceID/base 非空，
+// 返回剥尾后的 base 条目与 deviceID。
 // 必须在 match.ClassifyEntry 之前调用——ClassifyEntry 的 domains/ip-cidr 前缀
 // 分支会忽略多余尾段，兜底分支会把未知尾段当动作词噪声剥掉或按 host:port
 // 提取（"dns,mesh:dev-b" 甚至会被 SplitHostPort 吃成域名 "mesh"），两种路径
 // 都会吞掉 mesh 目标。
-// mesh: 后为空或 base 为空 → 不视为 mesh 条目（ok=false），交回常规分类处理。
-func splitMeshTail(raw string) (base, meshDeviceID string, ok bool) {
-	idx := strings.LastIndexByte(raw, ',')
-	if idx < 0 {
-		return raw, "", false
+// 失败策略（止血方案）：mesh: 段之后若还有任何段（含空段，如
+// "mesh:dev-b,direct" 或尾逗号）、deviceID 为空或 base 为空 → meshTailInvalid，
+// 整条静默跳过不编译——回落常规分类会把 "domains,x.com,mesh:dev-b,direct"
+// 静默错编译成普通代理规则（domains 前缀分支吞掉 mesh: 段）。
+// 多段尾（mesh:x,direct/deny/fallback:y）解析随 Task 7 落地，当前不认多段尾。
+func splitMeshTail(raw string) (base, meshDeviceID string, state meshTailState) {
+	parts := strings.Split(raw, ",")
+	meshIdx := -1
+	for i, part := range parts {
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(part)), meshTailPrefix) {
+			meshIdx = i
+			break
+		}
 	}
-	tail := strings.TrimSpace(raw[idx+1:])
-	if !strings.HasPrefix(strings.ToLower(tail), meshTailPrefix) {
-		return raw, "", false
+	if meshIdx < 0 {
+		return raw, "", meshTailNone
 	}
+	if meshIdx != len(parts)-1 {
+		return "", "", meshTailInvalid
+	}
+	tail := strings.TrimSpace(parts[meshIdx])
 	deviceID := strings.TrimSpace(tail[len(meshTailPrefix):])
 	if deviceID == "" {
-		return raw, "", false
+		return "", "", meshTailInvalid
 	}
-	base = strings.TrimSpace(raw[:idx])
+	base = strings.TrimSpace(strings.Join(parts[:meshIdx], ","))
 	if base == "" {
-		return raw, "", false
+		return "", "", meshTailInvalid
 	}
-	return base, deviceID, true
+	return base, deviceID, meshTailParsed
 }
 
 // isDNSEntry 判断剥尾后的条目是否 DNS 关键字条目（dns，大小写不敏感）。
@@ -493,11 +533,17 @@ func meshForwardAvailable(cfg *config.Config, deviceID string) bool {
 }
 
 // classifyEntryForCompile 将原始规则条目编译为 (ruleType, condition, target)。
-// mesh 尾段先剥出再分类；dns,mesh:<id> 不经 ClassifyEntry，直接构造恒真
-// DNS 代转发规则（Condition=all，design §9.3 规则驱动）。
-// condition 为空 = 条目非法或 mesh 能力不可用，调用方静默跳过。
+// mesh 尾段先剥出再分类（meshTailInvalid 整条静默跳过，见 splitMeshTail）；
+// dns,mesh:<id> 不经 ClassifyEntry，直接构造恒真 DNS 代转发规则
+// （Condition=all，design §9.3 规则驱动；该规则不参与连接级决策，由
+// Task 8 的 meshDNSForwardTarget 扫快照规则取首条启用项）。
+// condition 为空 = 条目非法、mesh 形态不可解析或 mesh 能力不可用，调用方静默跳过。
 func classifyEntryForCompile(cfg *config.Config, raw string, fallbackTarget SnapshotAction) (ruleType, condition string, target SnapshotAction) {
-	if base, meshDeviceID, isMesh := splitMeshTail(raw); isMesh {
+	base, meshDeviceID, state := splitMeshTail(raw)
+	if state == meshTailInvalid {
+		return "", "", ""
+	}
+	if state == meshTailParsed {
 		if !meshForwardAvailable(cfg, meshDeviceID) {
 			return "", "", ""
 		}

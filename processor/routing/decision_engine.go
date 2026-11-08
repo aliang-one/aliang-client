@@ -185,10 +185,11 @@ func checkRuleBySnapshot(rule SnapshotRule, ctx *MatchContext) bool {
 	case string(model.RuleTypeGeoIP):
 		return matchGeoIP(rule.Condition(), ctx.IP)
 	case snapshotRuleTypeDNS:
-		// DNS 代转发规则(design §9.3)不参与连接级五元组匹配:
-		// Condition=all 恒真, 由 DNS 代转发决策按首条命中消费;
-		// 其余 condition 形态不命中(防御手写 canonical JSON)。
-		return rule.Condition() == snapshotDNSConditionAll
+		// DNS 代转发规则(design §9.3)不参与连接级决策:一律不命中。
+		// DNS 代转发目标由 Task 8 的 meshDNSForwardTarget 直接扫快照规则
+		// 取首条启用项,不走 DecideRouteFromSnapshot;此处显式分支仅为
+		// 吞掉已知类型,避免 default 分支的 Unknown rule type 告警风暴。
+		return false
 	default:
 		logger.Warn(fmt.Sprintf("Unknown rule type: %s", rule.Type()))
 		return false

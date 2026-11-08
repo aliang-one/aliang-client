@@ -207,15 +207,18 @@ func (cfg *CanonicalRoutingSchema) Validate() error {
 	return nil
 }
 
-// meshRuleTargetPrefix 是 mesh 转发规则目标的形态前缀(processor/routing 的
-// SnapshotTargetMeshPrefix 同值镜像——config 不能反向 import routing,会成环)。
+// MeshRuleTargetPrefix 是 mesh 转发规则目标的形态前缀(processor/routing 的
+// SnapshotTargetMeshPrefix 同值镜像——config 不能反向 import routing,会成环;
+// 两侧同值由 routing 包测试 TestSnapshotTargetMeshPrefixMirrorsConfigConstant 钉死)。
 // 形态:toNode:<deviceID>,deviceID 非空。mesh 是规则驱动出口,不作 default_egress。
-const meshRuleTargetPrefix = "toNode:"
+// 大小写不对称刻意:编译产物恒小写(routing 编译层只产 "toNode:" 一种拼法),
+// 本层按前缀精确匹配、不做大小写归一。
+const MeshRuleTargetPrefix = "toNode:"
 
 // splitMeshRuleTarget 解析 toNode:<deviceID> 形态的规则 target。
 // ok=false 表示不是 mesh 形态;deviceID 为 trim 后的值(可能为空,由调用方校验)。
 func splitMeshRuleTarget(target string) (deviceID string, ok bool) {
-	rest, found := strings.CutPrefix(target, meshRuleTargetPrefix)
+	rest, found := strings.CutPrefix(target, MeshRuleTargetPrefix)
 	if !found {
 		return "", false
 	}
@@ -232,7 +235,7 @@ func normalizeRuleTarget(target string) (string, error) {
 		// default_egress 也走本函数归一,但其 Validate 白名单不接受 mesh
 		// 形态——mesh 由规则命中驱动,不允许成为默认出口。
 		if deviceID, isMesh := splitMeshRuleTarget(target); isMesh && deviceID != "" {
-			return meshRuleTargetPrefix + deviceID, nil
+			return MeshRuleTargetPrefix + deviceID, nil
 		}
 		return "", fmt.Errorf("unknown target: %s", target)
 	}
