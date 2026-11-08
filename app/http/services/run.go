@@ -736,7 +736,10 @@ func bootstrapCanonicalRoutingSchema(mode models.RunMode) *config.CanonicalRouti
 			if proxyType == "http" {
 				upstreamType = "http"
 			} else if proxyType == "ssh" {
-				upstreamType = "ssh" // 显式覆写;沿用默认 "socks" 会与 registry "ssh" 条目错位
+				// 编译失败兜底路径的显式覆写(主路径由快照解析携带 type;此行仅在
+				// CompileCanonicalRoutingFromRuntimeInputs 失败时的 minimal schema
+				// 生效);沿用默认 "socks" 会与 registry "ssh" 条目错位。
+				upstreamType = "ssh"
 			}
 		}
 	}

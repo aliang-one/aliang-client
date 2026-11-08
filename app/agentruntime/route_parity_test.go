@@ -9,19 +9,23 @@ import (
 	"testing"
 )
 
-// 双路由表一致性护栏：同一组 /api/agent/*（含 /mcp/aliang/）端点必须同时注册
-// 在 core 侧 routes.go（56431）与 user-agent 侧 server.go registerAgentRoutes
-// （56433）。漏一边=请求被 core 代理到 56433 后吃 mux 裸 404 并透传回去，本仓
-// 已三次踩坑：2026-10-21 数据面 404、2026-10-23 运行状态 404、2026-10-29
-// auth-recover 自愈链 404。测试直接从两份源码抽取注册清单做集合比对——
-// routes.go 的 register 与 server.go 的 mux.HandleFunc 都无导出的路由表，
-// 源码级比对是最轻且不会腐化的方案。
+// 双路由表一致性护栏：同一组 /api/agent/*（含 /mcp/aliang/ 与 2026-11-08 起纳入
+// 的 /api/proxy/ssh/*）端点必须同时注册在 core 侧 routes.go（56431）与
+// user-agent 侧 server.go registerAgentRoutes（56433）。漏一边=请求被 core 代理
+// 到 56433 后吃 mux 裸 404 并透传回去，本仓已三次踩坑：2026-10-21 数据面 404、
+// 2026-10-23 运行状态 404、2026-10-29 auth-recover 自愈链 404。测试直接从两份
+// 源码抽取注册清单做集合比对——routes.go 的 register 与 server.go 的
+// mux.HandleFunc 都无导出的路由表，源码级比对是最轻且不会腐化的方案。
 //
 // 刻意单边的端点必须在下方例外表登记理由；新增单边端点先登记再提交。
 var routeParityExceptions = map[string]string{
 	// 仅 56433：调用方 session_event_agent.go 直连 user-agent 进程，
 	// 无仪表盘/core 路径依赖。
 	"/api/agent/session-event": "user-agent 专用，core 不代理",
+	// 仅 56431(core)：代理注册表读端点由 core 进程自答——proxies 实例与
+	// 状态都在 core（outbound registry），user-agent runtime 不跑代理注册表。
+	"/api/proxy/list": "core 专用，代理注册表数据在 core 进程",
+	"/api/proxy/get":  "core 专用，代理注册表数据在 core 进程",
 }
 
 func TestAgentRouteParityBetweenCoreAndUserAgent(t *testing.T) {
@@ -35,11 +39,11 @@ func TestAgentRouteParityBetweenCoreAndUserAgent(t *testing.T) {
 	}
 
 	core := extractAgentRoutePaths(t, string(coreSrc),
-		regexp.MustCompile(`register\("(?:[A-Za-z]+ )?(/(?:api/agent|mcp/aliang)[^"]*)"`))
+		regexp.MustCompile(`register\("(?:[A-Za-z]+ )?(/(?:api/agent|api/proxy|mcp/aliang)[^"]*)"`))
 	// agent 侧同样剥掉可选方法前缀（mcp 注册表 {name} 路径 PUT/DELETE 分流到
 	// 不同 handler，须方法前缀注册；比对口径与 core 侧对称，路径集合才是真值）。
 	agent := extractAgentRoutePaths(t, string(agentSrc),
-		regexp.MustCompile(`mux\.HandleFunc\("(?:[A-Za-z]+ )?(/(?:api/agent|mcp/aliang)[^"]*)"`))
+		regexp.MustCompile(`mux\.HandleFunc\("(?:[A-Za-z]+ )?(/(?:api/agent|api/proxy|mcp/aliang)[^"]*)"`))
 
 	var drifted []string
 	for path := range core {

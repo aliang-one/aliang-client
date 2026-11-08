@@ -17,6 +17,7 @@ var isDev = true
 type Handlers struct {
 	Logger         *handlers.LogHandler
 	ProxyRegistry  *handlers.ProxyRegistryHandler
+	SSHKnownHosts  *handlers.SSHKnownHostsHandler
 	SoftwareCfg    *handlers.SoftwareConfigHandler
 	Token          *handlers.TokenHandler
 	Run            *handlers.RunHandler
@@ -72,6 +73,7 @@ func newHandlers(runService *services.RunService) *Handlers {
 	return &Handlers{
 		Logger:             handlers.NewLogHandler(logService, logConfigService),
 		ProxyRegistry:      handlers.NewProxyRegistryHandler(proxyRepository),
+		SSHKnownHosts:      handlers.NewSSHKnownHostsHandlerFromCache(),
 		SoftwareCfg:        handlers.NewSoftwareConfigHandler(softwareCfgService),
 		Token:              handlers.NewTokenHandler(tokenService),
 		Run:                handlers.NewRunHandler(runService),
@@ -116,6 +118,9 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	// Proxy registry routes (/api/proxy/registry/*)
 	register("/api/proxy/list", h.ProxyRegistry.HandleProxyRegistryList, http.MethodGet)
 	register("/api/proxy/get", h.ProxyRegistry.HandleProxyRegistryGet, http.MethodGet)
+	// SSH TOFU 指纹库管理(spec §⑨):GET 列表 / DELETE 单条。双注册另一处
+	// agentruntime server.go registerAgentRoutes(缺任一侧=404,2026-10-21 教训)。
+	register("/api/proxy/ssh/known-hosts", h.SSHKnownHosts.HandleKnownHosts, http.MethodGet, http.MethodDelete)
 
 	register("/api/software-config/save", h.SoftwareCfg.HandleSave, http.MethodPost)
 	register("/api/software-config/activate", h.SoftwareCfg.HandleActivate, http.MethodPost)
