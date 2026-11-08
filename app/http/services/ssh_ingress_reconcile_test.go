@@ -219,3 +219,54 @@ func TestBuildSSHIngressRunConfigUnparseableKeyDefense(t *testing.T) {
 		t.Fatal("LocalNodeID must be left for Reconcile injection, not set at translation")
 	}
 }
+
+// TestReconcileSSHIngressFromConfigBootRestore 钉住启动期恢复入口(与提交
+// 协调路径共用的 ReconcileSSHIngressFromConfig):加载了 enable 配置的状态
+// 下钩子执行后入口在跑且端口监听;禁用/nil 配置不启且停掉在跑实例。
+// core 启动序列(daemon initializeCoreSubsystems 与 interactive runStart)
+// 各以一行调用接线——本用例即该一行的可测单元。
+func TestReconcileSSHIngressFromConfigBootRestore(t *testing.T) {
+	setupIngressReconcileTest(t)
+
+	keyLine, _ := newSSHIngressTestKey(t)
+	port := reserveIngressPort(t)
+	enable := true
+	enabledCfg := &config.Config{
+		Core: &config.CoreConfig{APIServer: "https://api.aliang.one"},
+		Customer: &config.CustomerConfig{SSHIngress: &config.SSHIngressConfig{
+			Enable:         &enable,
+			Port:           uint16(port),
+			AuthorizedKeys: []string{keyLine},
+		}},
+	}
+
+	// 启动钩子语义:enable 配置已加载 → 自动恢复入口。
+	ReconcileSSHIngressFromConfig(enabledCfg)
+	if !sshin.IsRunning() {
+		t.Fatal("boot reconcile must restore an enabled ssh ingress")
+	}
+	assertIngressPortListening(t, port)
+
+	// 禁用配置 → 不启并停掉在跑实例(Reconcile 期望态语义)。
+	ReconcileSSHIngressFromConfig(&config.Config{
+		Core:     &config.CoreConfig{APIServer: "https://api.aliang.one"},
+		Customer: &config.CustomerConfig{},
+	})
+	if sshin.IsRunning() {
+		t.Fatal("boot reconcile with disabled config must stop the ingress")
+	}
+	assertIngressPortRefused(t, port)
+
+	// nil 配置(启动极早期全局配置尚未就绪的防御)→ 期望停,不 panic。
+	ReconcileSSHIngressFromConfig(nil)
+	if sshin.IsRunning() {
+		t.Fatal("boot reconcile with nil config must keep the ingress stopped")
+	}
+
+	// 再次 enable:恢复(启动钩子重入路径,幂等)。
+	ReconcileSSHIngressFromConfig(enabledCfg)
+	if !sshin.IsRunning() {
+		t.Fatal("boot reconcile must restore the ingress again after re-enable")
+	}
+	assertIngressPortListening(t, port)
+}

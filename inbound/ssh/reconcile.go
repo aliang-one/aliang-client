@@ -1,6 +1,6 @@
 // reconcile.go — 配置期望态到运行面的接线(Task 7):进程级 SSH 入口单例
-// 的启停/重启协调。期望态来源唯一=配置提交协调路径
-// (customer_config_service 的 reconcileSSHIngressAfterCommit),本包不读
+// 的启停/重启协调。期望态来源=装配层 services.ReconcileSSHIngressFromConfig
+// (customer 配置提交协调路径与 core 启动序列两处调用、一个实现),本包不读
 // 配置类型——翻译(EffectiveSSHIngress→RunConfig,authorized_keys 行解析)
 // 归装配层,本文件只管生命周期。
 package ssh

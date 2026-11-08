@@ -179,7 +179,7 @@ func (s *CustomerConfigService) UpdateCommittedCustomerConfig(payload []byte) (*
 			clearRoutingDecisionCache()
 			closeDisabledAIAcceleratedConnections(previousCfg, &committedCfg)
 			mirror.InitGlobalForwarder()
-			reconcileSSHIngressAfterCommit(&committedCfg)
+			ReconcileSSHIngressFromConfig(&committedCfg)
 			return nil
 		},
 	)
@@ -237,23 +237,25 @@ func refreshRoutingRuntimeAfterCustomerConfigCommit(committedCfg *config.Config)
 	return err
 }
 
-// reconcileSSHIngressAfterCommit 把已提交配置的 SSH 入口期望态作用到运行面
-// (Task 7 接线,提交协调路径的运行面收尾步):EffectiveSSHIngress nil
-// (未配置/总开关关)→期望停;非 nil→翻译成 inbound/ssh.RunConfig 交
-// Reconcile 启停/按变更重启(端口/凭证变更即重启,重复提交同配置不重启)。
+// ReconcileSSHIngressFromConfig 把给定配置的 SSH 入口期望态作用到运行面。
+// **两个调用点共用本函数(防两处漂移)**:① customer 配置提交协调路径
+// (UpdateCommittedCustomerConfig 的内存提交回调,端口/凭证变更即重启,
+// 重复提交同配置不重启);② core 启动序列(cmd/core.go initializeCoreSubsystems
+// 与 cmd/start.go runStart,配置加载完成后)——重启后自动恢复已启用入口。
+// EffectiveSSHIngress nil(未配置/总开关关)→期望停;非 nil→翻译成
+// inbound/ssh.RunConfig 交 Reconcile 启停。
 //
-// 失败仅日志不阻断配置提交:SSH 入口是服务面非关键路径,回调里其余运行面
-// 刷新已生效,为入口回滚整套配置代价不成比例;坏状态停留止,下次提交重试
-// (协调器恒回调,不做内容去重)。注意:启动期没有自动 reconcile——进程
-// 重启后入口随首次 customer 配置提交恢复,启动期接线归后续任务。
+// 失败仅日志不上抛:提交侧不因入口回滚整套配置(其余运行面刷新已生效,
+// 协调器恒回调不做内容去重,下次提交重试);启动侧不阻断 boot(服务面非
+// 关键路径,下次提交或下次重启重试)。
 //
 // Bind host 语义:Server 监听 config.ServiceBindHost()(默认 127.0.0.1,
 // 显式 --host 放宽)——与 56431/56432「默认安全」姿态一致;LAN 开放入口
 // 需显式 --host,属部署姿态(配置里无 host 字段,刻意不发明)。
-func reconcileSSHIngressAfterCommit(committedCfg *config.Config) {
-	effective := committedCfg.EffectiveSSHIngress()
+func ReconcileSSHIngressFromConfig(cfg *config.Config) {
+	effective := cfg.EffectiveSSHIngress()
 	if effective == nil {
-		// 期望停:不触 cache 目录/agent 单例——无入口配置的存量提交零额外副作用。
+		// 期望停:不触 cache 目录/agent 单例——无入口配置的提交/启动零额外副作用。
 		sshin.Reconcile(nil, "", nil)
 		return
 	}
