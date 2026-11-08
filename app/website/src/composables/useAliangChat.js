@@ -233,11 +233,25 @@ export function subagentDetailToReducerEntry(detail) {
   };
 }
 
-// M1 详情静默重拉（真实实现，经 vi.mock 的 getAgentSessionDetail 可测）：
+// 详情响应 → 面板状态装配内核（spec 2026-11-07-subagent-panel H2/H3 共用）：
 // 只消费 detail.subagents[] 整体替换该会话面板状态（入库前逐条归一为 reducer
-// 条目形状——status→phase，坏条目过滤）；转录一律不落壳。详情未带 subagents
-// 键（后端降级/旧版）时保留 WS 聚合态；失败静默——面板打开逻辑兜底。
-// 同会话 in-flight 去重：连续 completed 同窗到达只发一次请求。
+// 条目形状——status→phase，坏条目过滤）；转录一律不落壳——详情转录装载走
+// applyDeviceTranscript，subagents 绝不能混进 messages。详情未带 subagents 键
+// （后端降级/旧版）时保留既有聚合态不覆写。消费方：refreshSubagentsFromDetail
+// （M1 重拉/断线自愈，自带拉取）与 openDeviceSession（历史装配，直接吃详情
+// 分页响应——subagents 是会话级字段，避免为装配再发一次请求）。
+export function ingestDetailSubagents(store, sessionId, detail) {
+  const sid = String(sessionId || '');
+  if (!sid) return;
+  const list = Array.isArray(detail?.subagents) ? detail.subagents : null;
+  if (list) {
+    store[sid] = list.map(subagentDetailToReducerEntry).filter(Boolean);
+  }
+}
+
+// M1 详情静默重拉（真实实现，经 vi.mock 的 getAgentSessionDetail 可测）：
+// 拉取后经 ingestDetailSubagents 只消费 subagents[]；失败静默——面板打开
+// 逻辑兜底。同会话 in-flight 去重：连续 completed 同窗到达只发一次请求。
 const subagentDetailRefreshInflight = new Set();
 export async function refreshSubagentsFromDetail(store, sessionId) {
   const sid = String(sessionId || '');
@@ -245,10 +259,7 @@ export async function refreshSubagentsFromDetail(store, sessionId) {
   subagentDetailRefreshInflight.add(sid);
   try {
     const detail = await getAgentSessionDetail(sid);
-    const list = Array.isArray(detail?.subagents) ? detail.subagents : null;
-    if (list) {
-      store[sid] = list.map(subagentDetailToReducerEntry).filter(Boolean);
-    }
+    ingestDetailSubagents(store, sid, detail);
   } catch (_) {
     // 静默：详情缺席不阻断（journal 仍是持久真值，面板打开时再拉）
   } finally {
@@ -1123,6 +1134,7 @@ export function useAliangChat() {
       const pageRows = [];
       let before = '';
       let pageError = null;
+      let lastDetail = null; // 最后一页响应（subagents 是会话级字段，历史装配以此为准）
       for (let page = 0; page < DEVICE_DETAIL_MAX_PAGES; page++) {
         try {
           const detail = await getAgentSessionDetail(entry.id, {
@@ -1131,6 +1143,7 @@ export function useAliangChat() {
           });
           const rows = Array.isArray(detail?.transcript) ? detail.transcript : [];
           pageRows.unshift(rows);
+          lastDetail = detail;
           live.deviceLoadedAt = now();
           live.deviceLoadError = '';
           const pg = detail?.transcript_page;
@@ -1149,6 +1162,14 @@ export function useAliangChat() {
         // 空转录+错误条：详情缺席不阻断（本地会话池里壳已在，输入照常）。
         // 只存布尔标记——文案在模板渲染时走 i18n，不冻结赋值时的语言。
         live.deviceLoadError = true;
+      }
+      // 历史装配（spec 2026-11-07-subagent-panel H2）：详情响应顶层的
+      // subagents[] 是会话级字段（每页同值），以最后一页响应装配一次——经
+      // ingestDetailSubagents 与 M1 重拉同源归一入库，只进面板状态；转录装载
+      // 走上面的 applyDeviceTranscript，subagents 绝不混进 messages。键取
+      // aiSessionId（面板 getter 与 ai.subagent 帧守卫的同一把钥匙）。
+      if (lastDetail) {
+        ingestDetailSubagents(subagentsBySession, live.aiSessionId || entry.id, lastDetail);
       }
     }
 
@@ -1443,10 +1464,18 @@ export function useAliangChat() {
                   if (c.deviceSession) {
                     if (deviceSessionSubscribable(c)) {
                       sendAI({ type: 'ai.session.subscribe', session_id: c.deviceSession.id });
+                      // 断线自愈（spec 2026-11-07-subagent-panel H3）：重连成功
+                      // 即对已订阅会话补一次子agent面板刷新——断连窗口内
+                      // started/completed 的 ai.subagent 帧随 socket 全灭，TTL
+                      // 过期前面板只能从详情恢复。无条件拉一次（重连是低频
+                      // 事件）；in-flight 去重与静默失败都在
+                      // refreshSubagentsFromDetail 内兜住。
+                      refreshSubagentsFromDetail(subagentsBySession, c.aiSessionId || c.deviceSession.id);
                     }
                   } else if (c.aiSessionId
                     && (findRunningAssistant(c) || (c.id === activeId.value && sending.value))) {
                     sendAI({ type: 'ai.session.subscribe', session_id: c.aiSessionId });
+                    refreshSubagentsFromDetail(subagentsBySession, c.aiSessionId);
                   }
                 }
               })
@@ -2798,6 +2827,7 @@ export function useAliangChat() {
     scrollToBottom,
     // 方法（模板事件直接绑定的入口）
     applySessionSettings,
+    openDeviceSession, // 侧栏分流之外的可 await 入口（测试/未来调用点）
     applySlash,
     cancelRecall,
     cancelRename,

@@ -13,6 +13,7 @@ vi.mock('../services/agentApi', () => ({
 import { getAgentSessionDetail } from '../services/agentApi';
 import {
   consumeSubagentFrame,
+  ingestDetailSubagents,
   refreshSubagentsFromDetail,
   subagentDetailToReducerEntry,
   subagentFrameToReducerMsg,
@@ -312,5 +313,26 @@ describe('refreshSubagentsFromDetail（M1 静默重拉：只消费 subagents[]�
     expect(getAgentSessionDetail).toHaveBeenCalledTimes(1);
     await expect(refreshSubagentsFromDetail(store, '')).resolves.toBeUndefined();
     expect(getAgentSessionDetail).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('ingestDetailSubagents（历史装配内核：openDeviceSession 与重拉共用的纯装配）', () => {
+  it('只消费 subagents[] 整体替换面板状态；转录键绝不落进 store', () => {
+    const store = {};
+    ingestDetailSubagents(store, 's1', {
+      transcript: [{ role: 'user', content: '详情转录行——绝不进面板状态' }],
+      subagents: [{ task_id: 't1', name: 'reviewer', status: 'completed' }],
+    });
+    expect(Object.keys(store)).toEqual(['s1']);
+    expect(store.s1).toHaveLength(1);
+    expect(store.s1[0]).toMatchObject({ taskId: 't1', phase: 'completed' });
+  });
+
+  it('空 sessionId 拒绝；详情缺 subagents 键保留既有聚合态', () => {
+    const existing = [{ taskId: 't1', phase: 'progress' }];
+    const store = { s1: existing };
+    ingestDetailSubagents(store, '', { subagents: [] });
+    ingestDetailSubagents(store, 's1', { transcript: [] });
+    expect(store.s1).toBe(existing);
   });
 });
