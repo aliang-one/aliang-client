@@ -56,7 +56,7 @@ func startMeshDNSFakeB(t *testing.T, respond bool, response []byte) *meshDNSFake
 		defer conn.Close()
 		_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 		// 帧读取必须与头行共用同一 bufio reader:头+帧一次写出时 bufio 会
-		// 预读吞掉帧字节(bridge.go/WrappedConn 同款坑)。
+		// 预读吞掉帧字节(bridge.go/processor/tcp WrappedConn 同款坑)。
 		reader := bufio.NewReader(conn)
 		line, err := reader.ReadString('\n')
 		if err != nil {

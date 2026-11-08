@@ -215,12 +215,19 @@ func (h *meshItCaptureHandler) Handle(ctx context.Context, conn net.Conn, md *M.
 	default:
 	}
 	// 到达即推(payloads 按块上报,不等问题终结——deadline 只是读侧收尾)。
+	// 容量上限 8:消费方断言满足后仍推块(慢消费/超额流量)时 default 丢弃,
+	// 阻塞发送会把本 handler 卡死在 Handle 内——它是 relay 双向流的一端,
+	// 卡死即拖死整条转发链(Task 13 评审加固)。断言靠 meshItCollectBytes
+	// 的精确计数收口,丢弃不破坏既有用例。
 	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
 	buf := make([]byte, 4096)
 	for {
 		n, readErr := conn.Read(buf)
 		if n > 0 {
-			h.payloads <- append([]byte(nil), buf[:n]...)
+			select {
+			case h.payloads <- append([]byte(nil), buf[:n]...):
+			default:
+			}
 		}
 		if readErr != nil {
 			return nil
@@ -374,15 +381,27 @@ func startMeshItHeaderPeer(t *testing.T) (addr string, headers chan *meshproto.H
 }
 
 // closedMeshItAddr 监听后立即关闭的回环地址(拨它稳定 connection refused)。
+// listen-then-close 有 TOCTOU:关闭到使用之间端口可能被其它进程(或本进程
+// 别的测试)抢走——关后回拨验证确实 refused,不 refused 换址重取,杜绝
+// 「closed 地址其实有人听」造成的假失败(Task 13 评审加固)。
 func closedMeshItAddr(t *testing.T) string {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+	for attempt := 0; attempt < 5; attempt++ {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		addr := ln.Addr().String()
+		_ = ln.Close()
+		conn, dialErr := net.DialTimeout("tcp", addr, time.Second)
+		if dialErr == nil {
+			_ = conn.Close() // 端口已被占:换址重取
+			continue
+		}
+		return addr
 	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
-	return addr
+	t.Fatal("closedMeshItAddr: 连续 5 次未取得可验证 refused 的地址")
+	return ""
 }
 
 // meshItFakeSocks B 侧 toSocks 出口分支的上游落点(注册表注入,生产 socks 出口
