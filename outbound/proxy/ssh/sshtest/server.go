@@ -11,6 +11,7 @@ import (
 	"net"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -33,6 +34,10 @@ type Server struct {
 	// 保证测试结束后 serve/handle/pipe goroutine 全部退出,不泄漏。
 	mu       sync.Mutex
 	chClosed []func()
+
+	// DirectDials 统计服务器实际收到的 direct-tcpip 通道打开次数(含被拒的)。
+	// 供调用方断言「客户端是否重试了通道打开」。
+	DirectDials atomic.Int32
 }
 
 // Start 在 127.0.0.1 随机端口起一台 sshd,返回实例与 host:port。
@@ -157,6 +162,7 @@ type directTCPIPMsg struct {
 }
 
 func (s *Server) handleDirectTCPIP(newCh gossh.NewChannel) {
+	s.DirectDials.Add(1)
 	payload := newCh.ExtraData()
 	var m directTCPIPMsg
 	if err := gossh.Unmarshal(payload, &m); err != nil {

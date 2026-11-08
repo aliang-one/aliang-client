@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -20,6 +21,9 @@ import (
 )
 
 var _ proxy.Proxy = (*SSH)(nil)
+
+// errSSHClosed 是 Close 之后 DialContext 的统一返回(sentinel,可 errors.Is)。
+var errSSHClosed = errors.New("ssh outbound closed")
 
 // SSH 是 SSH 出口代理:DialContext 从链池取一条 SSH 链(可选多跳),在其
 // 最终跳上开 direct-tcpip 通道承载 TCP;UDP 不支持;Close 断开全部链并
@@ -85,13 +89,12 @@ type directTCPIPReq struct {
 }
 
 // DialContext 从池中取一条链,向 metadata 目标开 direct-tcpip 通道。
-// 通道打开失败时换链重试一次(死链场景由另一条/重建的链接住;MaxSessions
-// 等业务性失败重试一次也廉价,最终错误透传);acquire 错误(拨号失败/全池
-// 退避)不重试——重选同链无用,健康分发靠池的选链逻辑(Task 6 审查拍板)。
+// 通道打开失败时按「client 已死」门控换链重试一次(spec §4):仅当监控
+// 协程已把链标记死亡且 drop 实际收走时才重试(死链由另一条/重建的链接
+// 住);活链上的业务性失败(MaxSessions、目标不可达的 ConnectionFailed
+// 等)直接透传,不重试。acquire 错误(拨号失败/全池退避)同样不重试
+// ——重选同链无用,健康分发靠池的选链逻辑(Task 6 审查拍板)。
 func (s *SSH) DialContext(ctx context.Context, metadata *M.Metadata) (net.Conn, error) {
-	if s.closed.Load() {
-		return nil, errors.New("ssh: outbound already closed")
-	}
 	req := directTCPIPReq{
 		Addr:       metadata.HostName,
 		Port:       uint32(metadata.DstPort),
@@ -101,6 +104,12 @@ func (s *SSH) DialContext(ctx context.Context, metadata *M.Metadata) (net.Conn, 
 	payload := gossh.Marshal(req)
 	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
+		// 每次 attempt 顶部都查 closed:Close 与在途调用的竞态窗口
+		//(在途调用通过检查后实例被 Close,死链触发重试路径)在此拦下,
+		// 不复活出 pool.close 已错过、无人回收的新链。
+		if s.closed.Load() {
+			return nil, errSSHClosed
+		}
 		cl, c, err := s.pool.acquire(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("ssh acquire chain: %w", err)
@@ -111,11 +120,16 @@ func (s *SSH) DialContext(ctx context.Context, metadata *M.Metadata) (net.Conn, 
 			return newTrackedChannel(ch, c), nil
 		}
 		// 打开失败:先归还 acquire 记下的活跃数(没有 trackedChannel 替我们
-		// 还),再收走死链——drop 仅在 client 已被标记死亡时动作,业务性
-		// 失败不废链。
+		// 还),再按死亡标记决定去留。
 		c.releaseActive()
-		c.drop()
 		lastErr = err
+		// 换链重试门控:drop 返回 true = client 已死且已收走,重试有意义;
+		// false = 活链业务性失败,透传。注:clientErr 的标记与本次失败之间
+		// 存在固有竞态——client 死了但监控协程尚未置位时 drop 空转、本调用
+		// 按活链透传失败,治愈推迟到标记后的下一次拨号(best-effort,Issue 3)。
+		if !c.drop() {
+			return nil, fmt.Errorf("ssh open channel %s:%d: %w", metadata.HostName, metadata.DstPort, err)
+		}
 	}
 	return nil, fmt.Errorf("ssh open channel %s:%d: %w", metadata.HostName, metadata.DstPort, lastErr)
 }
@@ -128,12 +142,16 @@ func (channelAddr) Network() string { return "ssh-channel" }
 func (channelAddr) String() string  { return "ssh-channel" }
 
 // trackedChannel 把 gossh.Channel 适配成 net.Conn:关闭时向所属链归还
-// 活跃计数(与 acquire 内的 addActive 一进一出配对,不重复计数)。
+// 活跃计数(与 acquire 内的 addActive 一进一出配对)。Close 经 sync.Once
+// 幂等——双 Close 只归还一次,否则会把同链其他在途通道的计数也吃掉,
+// 永久偏置最少活跃选链;重复 Close 返回首次结果。
 // deadline 为 no-op:SSH 通道无 deadline 语义,返回 nil 让调用方的良性
 // 设置不失败(与 sshtest.chanConn 同口径)。
 type trackedChannel struct {
 	gossh.Channel
-	c *chain
+	c        *chain
+	once     sync.Once
+	closeErr error
 }
 
 func newTrackedChannel(ch gossh.Channel, c *chain) *trackedChannel {
@@ -141,9 +159,11 @@ func newTrackedChannel(ch gossh.Channel, c *chain) *trackedChannel {
 }
 
 func (t *trackedChannel) Close() error {
-	err := t.Channel.Close()
-	t.c.releaseActive()
-	return err
+	t.once.Do(func() {
+		t.closeErr = t.Channel.Close()
+		t.c.releaseActive()
+	})
+	return t.closeErr
 }
 
 func (t *trackedChannel) LocalAddr() net.Addr              { return channelAddr{} }

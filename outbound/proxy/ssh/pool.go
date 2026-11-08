@@ -106,14 +106,19 @@ func (c *chain) get(ctx context.Context) (*cascadeClient, error) {
 	return cl, nil
 }
 
-// drop 收走死链(仅当当前 client 已被标记死亡)。
-func (c *chain) drop() {
+// drop 收走死链,返回是否真的收走:仅当 client 已被监控协程标记死亡时
+// 关闭并清空,返回 true;活链或已无 client 时不动,返回 false。调用方
+// (DialContext)以此区分「client 已死,值得换链重试」与「活链上的业务性
+// 失败,透传不重试」(spec §4)。
+func (c *chain) drop() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.client != nil && c.clientErr != nil {
 		_ = c.client.Close()
 		c.client = nil
+		return true
 	}
+	return false
 }
 
 func (c *chain) addActive() { c.active.Add(1) }

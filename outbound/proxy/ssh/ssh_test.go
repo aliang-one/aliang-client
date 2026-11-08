@@ -8,9 +8,12 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"aliang.one/nursorgate/inbound/tun/metadata"
+	"aliang.one/nursorgate/outbound/proxy"
 	"aliang.one/nursorgate/outbound/proxy/proto"
 	"aliang.one/nursorgate/outbound/proxy/ssh/sshtest"
 	gossh "golang.org/x/crypto/ssh"
@@ -261,7 +264,201 @@ func TestSSHCloseIsTerminal(t *testing.T) {
 		t.Fatalf("second Close: %v", err)
 	}
 	md := &metadata.Metadata{HostName: "127.0.0.1", DstPort: 1}
-	if _, err := p.DialContext(context.Background(), md); err == nil {
-		t.Fatal("DialContext after Close must fail (no lazy revival)")
+	if _, err := p.DialContext(context.Background(), md); !errors.Is(err, errSSHClosed) {
+		t.Fatalf("DialContext after Close err = %v, want errSSHClosed (no lazy revival)", err)
+	}
+}
+
+// TestSSHLiveChainOpenFailureNoRetry 钉「换链重试按 client 已死门控」
+// (spec §4):活链上的通道打开失败(目标不可达 → sshd 以 ConnectionFailed
+// 拒绝)必须直接透传,不换链重试——服务器只见一次通道打开请求;
+// 且活链不被废,后续拨号仍复用同一 client。
+func TestSSHLiveChainOpenFailureNoRetry(t *testing.T) {
+	echoAddr, closeEcho := sshtest.EchoListener(t)
+	defer closeEcho()
+	srv, addr := sshtest.Start(t, sshtest.WithUsername("u"), sshtest.WithPassword("p"))
+
+	final := NodeFromAddrPort(hostOf(t, addr), portOf(t, addr), "u", "p", "", "")
+	p, err := New(final, 1, nil, t.TempDir())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer p.Close()
+
+	// 预热:拨可达 echo,链建立并保持活。
+	conn, err := p.DialContext(context.Background(), mdTo(t, echoAddr))
+	if err != nil {
+		t.Fatalf("warm-up dial: %v", err)
+	}
+	echoRound(t, conn, "ok")
+	_ = conn.Close()
+	if got := srv.DirectDials.Load(); got != 1 {
+		t.Fatalf("direct-tcpip opens = %d after warm-up, want 1", got)
+	}
+	p.pool.chains[0].mu.Lock()
+	cl1 := p.pool.chains[0].client
+	p.pool.chains[0].mu.Unlock()
+
+	// 活链失败:目标 127.0.0.1:1(特权端口,无 root 监听恒拒绝)→ sshd
+	// ConnectionFailed 拒绝通道 → 客户端 OpenChannel 报错。必须只发生一次
+	// 通道打开(无重试)且错误透传。
+	_, err = p.DialContext(context.Background(), &metadata.Metadata{HostName: "127.0.0.1", DstPort: 1})
+	if err == nil {
+		t.Fatal("dial to unreachable port must fail")
+	}
+	if got := srv.DirectDials.Load(); got != 2 {
+		t.Fatalf("direct-tcpip opens = %d after live-chain failure, want 2 (exactly one open, no retry)", got)
+	}
+
+	// 活链未被废:client 原样存活,后续可达拨号复用之(不再拨新链)。
+	p.pool.chains[0].mu.Lock()
+	sameClient := p.pool.chains[0].client == cl1 && p.pool.chains[0].clientErr == nil
+	p.pool.chains[0].mu.Unlock()
+	if !sameClient {
+		t.Fatal("live chain must survive a business-level open failure")
+	}
+	conn2, err := p.DialContext(context.Background(), mdTo(t, echoAddr))
+	if err != nil {
+		t.Fatalf("dial after business failure must reuse live chain: %v", err)
+	}
+	echoRound(t, conn2, "ok2")
+	_ = conn2.Close()
+	if got := srv.DirectDials.Load(); got != 3 {
+		t.Fatalf("direct-tcpip opens = %d after reuse, want 3", got)
+	}
+}
+
+// scriptedConn 按测试脚本演绎「client 在拨到后、通道打开前死亡」:
+// Wait 沿用 fakeConn(测试调 Close 即死 → 监控协程标记 clientErr);
+// OpenChannel 停在 open 门闩上,测试放行后才报错——两次事件之间可以
+// 精确插入 Close,复现 Close 与在途换链重试的竞态窗口。
+type scriptedConn struct {
+	fakeConn
+	open chan struct{}
+}
+
+func (s *scriptedConn) OpenChannel(string, []byte) (gossh.Channel, <-chan *gossh.Request, error) {
+	<-s.open
+	return nil, nil, errors.New("scripted: open channel refused")
+}
+
+// nopChannel 是 gossh.Channel 的最小桩,供 trackedChannel 单测。
+type nopChannel struct{}
+
+func (nopChannel) Read([]byte) (int, error)    { return 0, io.EOF }
+func (nopChannel) Write(p []byte) (int, error) { return len(p), nil }
+func (nopChannel) Close() error                { return nil }
+func (nopChannel) CloseWrite() error           { return nil }
+func (nopChannel) SendRequest(string, bool, []byte) (bool, error) {
+	return false, nil
+}
+func (nopChannel) Stderr() io.ReadWriter { return nopRW{} }
+
+type nopRW struct{}
+
+func (nopRW) Read([]byte) (int, error)    { return 0, io.EOF }
+func (nopRW) Write(p []byte) (int, error) { return len(p), nil }
+
+// TestTrackedChannelDoubleClose 钉通道双 Close 幂等:只归还一次活跃计数,
+// 否则双关连接会永久偏置最少活跃选链(多通道在途时把别人的计数也吃掉)。
+func TestTrackedChannelDoubleClose(t *testing.T) {
+	c := newChain(func(context.Context) (*cascadeClient, error) {
+		return nil, errors.New("unused")
+	})
+	c.addActive() // 本通道(acquire 记入)
+	c.addActive() // 另一在途通道
+	ch := newTrackedChannel(nopChannel{}, c)
+	if err := ch.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+	if err := ch.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+	if got := c.active.Load(); got != 1 {
+		t.Fatalf("active after double Close = %d, want 1 (double release must not steal the peer's count)", got)
+	}
+}
+
+// TestSSHCloseBlocksInflightRetry 钉 Close 与在途 DialContext 的竞态窗口:
+// 在途调用通过入口检查、已拿到 client,client 死亡(监控已标记)触发
+// 「换链重试」路径,此刻实例已被 Close——重试必须在拨新链之前被 attempt
+// 顶部的 closed 检查拦下。修前:重试会真连一条新链(dialChain 计数翻倍,
+// 且 pool.close 顺序不利时无人回收)。
+func TestSSHCloseBlocksInflightRetry(t *testing.T) {
+	openGate := make(chan struct{})
+	var dials1 atomic.Int32
+	scCh := make(chan *scriptedConn, 8) // 容量预留给修前形态的多余重拨,避免装置阻塞干扰断言
+	p := &SSH{Base: &proxy.Base{Address: "127.0.0.1:1", Protocol: proto.SSH}}
+	p.pool = newPool(2, func(i int) func(context.Context) (*cascadeClient, error) {
+		return func(context.Context) (*cascadeClient, error) {
+			if i == 0 {
+				return fakeCascadeClient(), nil
+			}
+			dials1.Add(1)
+			sc := &scriptedConn{fakeConn: fakeConn{closed: make(chan struct{})}, open: openGate}
+			scCh <- sc
+			chans := make(chan gossh.NewChannel)
+			close(chans)
+			reqs := make(chan *gossh.Request)
+			close(reqs)
+			return &cascadeClient{Client: gossh.NewClient(sc, chans, reqs)}, nil
+		}
+	})
+
+	// 把 Close 的 pool.close 挡在链 0 之前:测试直持链 0 的 mu,链 1 的
+	// 在途 client 与其死亡标记不会被级联关闭触碰。
+	p.pool.chains[0].mu.Lock()
+	// 偏置选链:链 0 挂一个在途活跃,在途 DialContext 必落链 1。
+	p.pool.chains[0].addActive()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := p.DialContext(context.Background(), &metadata.Metadata{HostName: "127.0.0.1", DstPort: 9})
+		done <- err
+	}()
+
+	// 等链 1 的 scripted client 拨出,然后杀死它 → 监控协程标记 clientErr。
+	sc := <-scCh
+	sc.Close()
+	waitUntil(t, "monitor must mark chain 1 dead after scripted kill", func() bool {
+		p.pool.chains[1].mu.Lock()
+		defer p.pool.chains[1].mu.Unlock()
+		return p.pool.chains[1].clientErr != nil
+	})
+
+	// Close:closed 先置位,级联关闭被挡在链 0 的 mu 上(持有 p.mu)——
+	// 链 1 原样保留:client 在、死亡标记在,正是 drop 会收走的形态。
+	closeDone := make(chan struct{})
+	go func() {
+		_ = p.Close()
+		close(closeDone)
+	}()
+	waitUntil(t, "Close must set closed flag", func() bool { return p.closed.Load() })
+
+	// 放行在途调用:OpenChannel 失败 → drop 收走死链(pool.close 仍挡在
+	// 链 0,链 1 原样)→ attempt 1 顶部必须被 closed 拦下,不得拨新链
+	//(closed 的置位 happens-before openGate 放行,读取确定见 true)。
+	// 修前形态:attempt 1 闯过(不存在的)closed 检查,acquire 在
+	// pool.close 持有的 p.mu 上排队——卡住即证重试未被拦下。
+	close(openGate)
+	select {
+	case err := <-done:
+		if !errors.Is(err, errSSHClosed) {
+			t.Fatalf("inflight DialContext err = %v, want errSSHClosed", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("inflight DialContext stuck: retry reached acquire after Close (closed check missing)")
+	}
+	if got := dials1.Load(); got != 1 {
+		t.Fatalf("chain 1 dialed %d times, want 1 (no revival after Close)", got)
+	}
+
+	// 在途调用已收尾,现在放行 pool.close(不再与 drop 竞争链 1 的 mu),
+	// Close 必须能完成。
+	p.pool.chains[0].mu.Unlock()
+	select {
+	case <-closeDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not complete after releasing the gate")
 	}
 }
