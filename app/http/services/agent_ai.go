@@ -3504,8 +3504,8 @@ func (m *agentAIManager) runUserMessage(session *agentAISession, runID, messageI
 	return nil
 }
 
-// optionResponse 处理用户对 ai.option.request 的选择：清除 pendingOption 并按
-// 选择结果续接一轮新的 AI run。
+// optionResponse 处理用户对 ai.option.request 的选择：清除 pendingOption、
+// 广播 resolved 同型帧（跨端翻卡），并按选择结果续接一轮新的 AI run。
 func (m *agentAIManager) optionResponse(msg map[string]interface{}, writeJSON agentTerminalWriter) {
 	if writeJSON == nil {
 		return
@@ -3518,10 +3518,21 @@ func (m *agentAIManager) optionResponse(msg map[string]interface{}, writeJSON ag
 	}
 	selected := remoteStringSlice(msg, "selected")
 	custom := strings.TrimSpace(remoteString(msg, "custom_text"))
+	originSock := strings.TrimSpace(remoteString(msg, agentAIOriginSocketField))
+	// 决策跨端同步（2026-11-08）：sync_only 表示「该决策的续跑已由发起端
+	// （PhoneServer 手机决议 dispatchUserAiMessage）自行负责，agent 只需清卡 +
+	// 广播翻卡帧」——再走续跑路径会把同一选择双重注入模型。不喂 codex waiter：
+	// 活跑的 requestUserInput 等待态不被旁路注入答案。
+	syncOnly := remoteBool(msg, "sync_only", false)
 
 	m.mu.Lock()
 	inputKey := agentAICodexInputMapKey(sessionID, optionID)
 	if waiter := m.codexInputs[inputKey]; waiter != nil && waiter.sessionID == sessionID {
+		if syncOnly {
+			m.mu.Unlock()
+			m.emitOptionResolved(sessionID, optionID, "codex", "", selected, custom, originSock, writeJSON)
+			return
+		}
 		// 刻意不刷新 session.originSocket（Task 7 评审落档）：codex-input 答复
 		// 续接的是正在运行的旧 run（经 waiter.respond 回传，不起新 run）——
 		// 把 origin 迁到答复方会劫持 session.originSocket，把该 run 后续审批
@@ -3529,6 +3540,10 @@ func (m *agentAIManager) optionResponse(msg map[string]interface{}, writeJSON ag
 		delete(m.codexInputs, inputKey)
 		m.mu.Unlock()
 		waiter.respond <- agentAICodexInputAnswer{selected: selected, custom: custom}
+		// 跨端翻卡（2026-11-08）：此前此分支零帧提前 return，其他端选项卡永
+		// pending——resolved 同型帧经 fanOut 广播（ai.option.request 在审批族
+		// 白名单），dashboard aisock 与手机 WS 均可达。
+		m.emitOptionResolved(sessionID, optionID, "codex", "", selected, custom, originSock, writeJSON)
 		return
 	}
 	session := m.sessions[sessionID]
@@ -3539,18 +3554,31 @@ func (m *agentAIManager) optionResponse(msg map[string]interface{}, writeJSON ag
 	// 不动；未匹配/过期的 option 作答同样刷新 origin——与 message() 的
 	// 「origin 跟随最近盖章入站」语义一致。
 	if session != nil {
-		if v := strings.TrimSpace(remoteString(msg, agentAIOriginSocketField)); v != "" {
-			session.originSocket = v
+		if originSock != "" {
+			session.originSocket = originSock
 		}
 	}
 	if session == nil || session.cancel != nil || session.pendingOption == nil || session.pendingOption.ID != optionID {
 		m.mu.Unlock()
+		if syncOnly {
+			// 迟到/重复 sync 幂等翻卡（2026-11-08）：卡已不在场（另一端已消费）
+			// 时发起端的翻卡信号不能丢——发出口径与命中一致，前端按已作答键位
+			// 天然幂等吸收。
+			m.emitOptionResolved(sessionID, optionID, "", "", selected, custom, originSock, writeJSON)
+		}
 		return
 	}
 	pending := session.pendingOption
 	session.pendingOption = nil
 	provider := session.provider
 	m.mu.Unlock()
+
+	// 先广播翻卡帧再起续跑（2026-11-08）：其他端先看到「已选」，再看到续跑
+	// 回合开跑；此时锁已释放，emit 不入锁（历史自锁死教训）。
+	m.emitOptionResolved(sessionID, optionID, provider, pending.MessageID, selected, custom, originSock, writeJSON)
+	if syncOnly {
+		return
+	}
 
 	content := buildAgentAIOptionFollowup(pending, selected, custom)
 	messageID := pending.MessageID + ".option"
@@ -3561,12 +3589,45 @@ func (m *agentAIManager) optionResponse(msg map[string]interface{}, writeJSON ag
 		sessionID:      sessionID,
 		runID:          remoteString(msg, "run_id"),
 		messageID:      messageID,
-		originSocketID: strings.TrimSpace(remoteString(msg, agentAIOriginSocketField)),
+		originSocketID: originSock,
 	}
 	emitter := m.runEmitter(run, writeJSON)
 	if err := m.runUserMessage(session, remoteString(msg, "run_id"), messageID, content, provider, nil, nil, emitter, nil); err != nil {
 		_ = emitter.emit(agentAIErrorPayload(sessionID, messageID, err))
 	}
+}
+
+// emitOptionResolved option 作答落地后的跨端翻卡帧（2026-11-08 决策跨端同步）：
+// 镜像审批族 status:"resolved" 同型约定（requestApproval 的 <-respond 分支重发
+// ai.approval.request）——ai.option.request 在审批族广播白名单里，经
+// fanOutWrite 全端可达（dashboard aisock + 手机 WS），PhoneServer 依此 settle
+// 派生审批、前端依此翻卡。originSockID 为空（测试/内部路径未盖章）退化为
+// writeJSON 直发，与既有 emit* 函数口径一致。
+func (m *agentAIManager) emitOptionResolved(sessionID, optionID, provider, messageID string, selected []string, customText, originSockID string, writeJSON agentTerminalWriter) {
+	if writeJSON == nil || sessionID == "" || optionID == "" {
+		return
+	}
+	payload := map[string]interface{}{
+		"type":       models.AgentEventAIOptionRequest,
+		"session_id": sessionID,
+		"option_id":  optionID,
+		"status":     "resolved",
+		"selected":   selected,
+	}
+	if provider != "" {
+		payload["provider"] = provider
+	}
+	if messageID != "" {
+		payload["message_id"] = messageID
+	}
+	if customText != "" {
+		payload["custom_text"] = customText
+	}
+	write := writeJSON
+	if originSockID != "" {
+		write = m.fanOutWrite(originSockID, sessionID, writeJSON)
+	}
+	_ = write(payload)
 }
 
 func agentAICodexInputMapKey(sessionID, optionID string) string {
@@ -6467,11 +6528,14 @@ func (m *agentAIManager) codexAppServerUserInputResult(ctx context.Context, run 
 			// 交互输入唯一 deadline(2026-11-01 审计 P0):codex requestUserInput
 			// 此前无任何上限——断连即永挂,ai.run.progress 心跳还让服务端永远
 			// 视为活跑。超时与审批同源(默认 24h,可 env 调),到期按取消收口。
+			// 帧型修正(2026-11-08):超时的是 option 交互,借发
+			// ai.approval.cancelled 会让审批取消处理器对 option id 做 no-op、
+			// 选项卡无从作废——改发 ai.option.cancelled(审批族白名单,同广播)。
 			cleanup()
 			if run.activity != nil {
 				run.activity.setAwaitingApproval(false)
 			}
-			m.emitApprovalCancelled(writeJSON, run.sessionID, []string{optionID}, "approval_timeout")
+			m.emitOptionCancelled(writeJSON, run.sessionID, []string{optionID}, "approval_timeout")
 			return nil, fmt.Errorf("Codex requestUserInput timed out after %s", agentAIApprovalTimeout)
 		}
 		if run.activity != nil {

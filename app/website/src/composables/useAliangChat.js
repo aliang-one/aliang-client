@@ -89,6 +89,9 @@ const AGENT_AI_RECONNECT_RESET_TYPES = new Set([
   'ai.session.created', 'ai.run.started', 'ai.delta', 'ai.status', 'ai.run.progress',
   'ai.run.notice', 'ai.done', 'ai.error', 'ai.approval.request', 'ai.approval.cancelled',
   'ai.option.request', 'ai.option.cancelled', 'ai.steer.ack',
+  // tool_ask 交互（mcp__aliang__ask_user）同属审批族广播面（fanOut 白名单同
+  // 表），数据面帧型一并归零重连预算（2026-11-08 dashboard 渲染接入）。
+  'tool_ask.request', 'tool_ask.cancel',
   // 子agent活动也是 run 数据面（spec 2026-11-07-subagent-panel §三）：回合主体静默、
   // 子agent干活期间帧流不断——收到即证明管道活，重连预算随之归零（有利副作用）。
   'ai.subagent',
@@ -317,6 +320,60 @@ export async function refreshSubagentsFromDetail(store, sessionId) {
   }
 }
 
+// 决策跨端同步（2026-11-08）：ai.option.request 的 resolved 同型帧翻卡——
+// 镜像审批族 status:"resolved" 约定（agent 侧 optionResponse 决策落地后重发
+// 同型帧广播全端）。本端未作答时收到别端（手机/dashboard）作答，按 key 找卡
+// 置 answered；已作答键位 handledOptionIds 幂等吸收；无对应卡（迟到/未知 id）
+// 忽略。resolved 帧不带完整 options 载荷，绝不建新卡。顶层纯函数导出
+// （deviceSystemNoteBubble 同模式，测试直接驱动）。
+export function resolveOptionCard(conv, event, handledOptionIds, resolvedAt) {
+  const optionId = String(event?.option_id || '').trim();
+  if (!optionId) return false;
+  const sessionId = String(event?.session_id || conv?.aiSessionId || '');
+  const key = `${sessionId}:${optionId}`;
+  if (handledOptionIds.has(key)) return false;
+  const cards = Array.isArray(conv?.optionCards) ? conv.optionCards : [];
+  const card = cards.find(c => c.key === key);
+  if (!card) return false;
+  const picked = Array.isArray(event.selected) ? event.selected.map(v => String(v)) : [];
+  card.status = 'answered';
+  card.selected = picked;
+  card.customText = typeof event.custom_text === 'string' ? event.custom_text : '';
+  card.error = '';
+  card.updatedAt = resolvedAt;
+  handledOptionIds.add(key);
+  return true;
+}
+
+// 决策跨端同步（2026-11-08）：tool_ask.request 的 resolved 同型帧翻卡——
+// agent 端 handleAskUser 作答落地后广播（同 option 约定），本端未作答时收到
+// 别端（手机/dashboard）作答，按 key 找卡置 answered。answer 提取与
+// respondToolAsk 同构：selected_option_id→单选、selected_option_ids→多选、
+// message→customText。已答键位幂等吸收；无对应卡忽略，绝不建新卡。
+export function resolveToolAskCard(conv, event, handledToolAskIds, resolvedAt) {
+  const interactionId = String(event?.interaction_id || '').trim();
+  if (!interactionId) return false;
+  const sessionId = String(event?.session_id || conv?.aiSessionId || '');
+  const key = `${sessionId}:${interactionId}`;
+  if (handledToolAskIds.has(key)) return false;
+  const asks = Array.isArray(conv?.toolAsks) ? conv.toolAsks : [];
+  const card = asks.find(c => c.key === key);
+  if (!card) return false;
+  const answer = event.answer && typeof event.answer === 'object' ? event.answer : {};
+  const picked = Array.isArray(answer.selected_option_ids)
+    ? answer.selected_option_ids.map(v => String(v))
+    : answer.selected_option_id
+      ? [String(answer.selected_option_id)]
+      : [];
+  card.status = 'answered';
+  card.selected = picked;
+  card.customText = typeof answer.message === 'string' ? answer.message : '';
+  card.error = '';
+  card.updatedAt = resolvedAt;
+  handledToolAskIds.add(key);
+  return true;
+}
+
 export function useAliangChat() {
   const { t } = useI18n();
   const { showDashboard, chatProviderPreset } = useNavigation();
@@ -397,6 +454,9 @@ export function useAliangChat() {
   // ai.option.request 命中即弃，防已答卡被复活成 pending 邀请重复作答
   // （后端对二次作答本就静默忽略，这里保 UX 一致）。
   const handledOptionIds = new Set();
+  // tool_ask 提问卡键位（2026-11-08 dashboard 渲染接入）：`session:interaction`
+  // 封死已答/已作废卡，镜像 handledOptionIds（迟到重投不复活、作答不重复）。
+  const handledToolAskIds = new Set();
 
   const activeConversation = computed(() =>
     conversations.value.find(c => c.id === activeId.value) || null
@@ -413,6 +473,9 @@ export function useAliangChat() {
   // 方案交互卡（Task 14）：pending/sending 展开作答，answered 折叠「已选择」
   // 终态常驻（作废即被移除）——与审批族数据结构独立，全量透传给列表渲染。
   const activeOptionCards = computed(() => activeConversation.value?.optionCards || []);
+  // tool_ask 提问卡（mcp__aliang__ask_user 交互，2026-11-08）：与 optionCards
+  // 同构瞬态（conversationForStorage 剥离、活过 run 终态等作答）。
+  const activeToolAsks = computed(() => activeConversation.value?.toolAsks || []);
 
   // 子agent面板状态存储（spec 2026-11-07-subagent-panel §三）：会话维度
   // key=aiSessionId、value=该会话 subagents 数组（reducer applySubagentEvent
@@ -922,6 +985,9 @@ export function useAliangChat() {
     // 方案交互卡同为瞬态（Task 14）：后端 run 结束才重发请求，跨页保留的
     // 「已选择」终态/待答卡只会误导（作答通道已随页面关闭而失联）。
     copy.optionCards = [];
+    // tool_ask 提问卡同为瞬态（2026-11-08）：SLA 25min 内后端重发请求帧，
+    // 跨页保留的待答卡只会误导（作答通道已随页面关闭而失联）。
+    copy.toolAsks = [];
     // steer 轻量条是瞬态 UI：ack 状态不跨页持久（陈旧的「已受理」比没有更糟）
     copy.steerItems = [];
     // pendingConfig（「下轮生效」角标）同为瞬态：重载后「是否已开新回合」
@@ -948,6 +1014,7 @@ export function useAliangChat() {
       messages: [],
       approvals: [],
       optionCards: [],
+      toolAsks: [],
       // 本窗口是 AliangCode 对话窗口（2026-10-30 用户拍板）：新建会话默认
       // agentcore；聊天窗只展示自家 agent 的对话，不该默认落成 claudecode。
       provider: chatProviderPreset.value || 'agentcore',
@@ -1657,8 +1724,9 @@ export function useAliangChat() {
     if (!conv || typeof conv !== 'object') return null;
     if (!Array.isArray(conv.messages)) conv.messages = [];
     conv.approvals = [];
-    // optionCards 从不落盘（storage 侧已剥离），此处兜底旧数据/异常形态。
+    // optionCards/toolAsks 从不落盘（storage 侧已剥离），此处兜底旧数据/异常形态。
     conv.optionCards = [];
+    conv.toolAsks = [];
     return conv;
   }
 
@@ -1825,6 +1893,100 @@ export function useAliangChat() {
   function ensureOptionCards(conv) {
     if (!Array.isArray(conv.optionCards)) conv.optionCards = [];
     return conv.optionCards;
+  }
+
+  // --- tool_ask 提问卡（mcp__aliang__ask_user，2026-11-08 dashboard 渲染接入）---
+  // 协议：agent 发 tool_ask.request{session_id, interaction_id, tool_name,
+  // tool_input{title,options,allow_custom,multi}, expires_at(ms)}（审批族广播）；
+  // 作答 tool_ask.response{session_id, interaction_id, status:'answered',
+  // answer{selected_option_id?/selected_option_ids?/message?}}；作废
+  // tool_ask.cancel{session_id, interaction_id(可空=批量), reason}。
+  // 卡片数据结构与 optionCards 完全同形（渲染复用 ChatOptionCard），独立容器
+  // 独立键位（interaction_id 名空间）；卡活过 run 终态等作答（同 option 卡）。
+
+  function ensureToolAsks(conv) {
+    if (!Array.isArray(conv.toolAsks)) conv.toolAsks = [];
+    return conv.toolAsks;
+  }
+
+  function upsertToolAskCard(conv, e) {
+    const interactionId = String(e.interaction_id || '').trim();
+    if (!interactionId) return;
+    const input = e.tool_input && typeof e.tool_input === 'object' ? e.tool_input : {};
+    const sessionId = e.session_id || conv.aiSessionId || '';
+    const key = optionKeyFromValues(sessionId, interactionId);
+    // 镜像审批族防御：已作答/已作废键位的迟到重投帧直接丢弃（不复活卡）。
+    if (handledToolAskIds.has(key)) return;
+    const asks = ensureToolAsks(conv);
+    const existing = asks.find(c => c.key === key);
+    const choices = normalizeOptionChoices(input.options);
+    const next = {
+      key,
+      interactionId,
+      sessionId,
+      messageId: e.message_id || existing?.messageId || '',
+      provider: 'tool_ask',
+      toolName: String(e.tool_name || existing?.toolName || ''),
+      title: String(input.title || existing?.title || ''),
+      header: '',
+      summary: '',
+      // 纯自由文本提问（无选项行）也合法：选项为空时卡片只剩 custom 输入。
+      options: choices,
+      allowCustom: input.allow_custom !== undefined ? !!input.allow_custom : true,
+      multi: !!input.multi,
+      expiresAt: Number(e.expires_at) || existing?.expiresAt || 0,
+      // 同 key 重投（agent 投递重试）整体复位：旧选中/旧错误不作数。
+      // 已作答键位已被 handledToolAskIds 封死，进不了这里。
+      status: 'pending',
+      selected: [],
+      customText: '',
+      error: '',
+      // ③活跃兜底来源标（镜像审批族，渲染层经 chat_approvalFromSession 翻译）
+      sourceId: e.sourceId || existing?.sourceId || '',
+      updatedAt: now(),
+    };
+    if (existing) Object.assign(existing, next);
+    else asks.push(next);
+    scrollToBottom();
+  }
+
+  async function respondToolAsk(conv, card, selected, customText) {
+    if (!conv || !card || card.status !== 'pending') return;
+    const picked = (Array.isArray(selected) ? selected : []).map(v => String(v)).filter(Boolean);
+    const custom = typeof customText === 'string' ? customText.trim() : '';
+    // 选项卡至少选一项；纯自由文本卡（无选项行）允许只填 message。
+    if (!picked.length && !custom) return;
+    card.status = 'sending';
+    card.error = '';
+    card.updatedAt = now();
+    try {
+      await ensureAISocket();
+      // 作答体契约（PhoneServer zod 同构）：单选 selected_option_id、multi
+      // selected_option_ids、自由文本 message；并存合法（agent 端逐一消费）。
+      const answer = {};
+      if (card.multi && picked.length) answer.selected_option_ids = picked;
+      else if (picked.length) answer.selected_option_id = picked[0];
+      if (custom) answer.message = custom;
+      const ok = sendAI({
+        type: 'tool_ask.response',
+        session_id: card.sessionId || conv.aiSessionId,
+        interaction_id: card.interactionId,
+        status: 'answered',
+        answer,
+      });
+      if (!ok) throw new Error('socket-closed');
+      card.status = 'answered';
+      card.selected = picked;
+      card.customText = custom;
+      card.updatedAt = now();
+      // 作答落定即封死键位（镜像 respondOption）：此后同 key 的迟到重投帧
+      // 不再复活本卡（agent pop-on-delivery 幂等，二次帧静默忽略）。
+      handledToolAskIds.add(card.key);
+    } catch (_) {
+      card.status = 'pending';
+      card.error = t('chat_toolAskSendFailed');
+      card.updatedAt = now();
+    }
   }
 
   function upsertOptionCard(conv, e) {
@@ -2340,7 +2502,8 @@ export function useAliangChat() {
     // （fanOut 白名单同表），归属判定镜像同一条链（①直连→②壳三键→③兜底
     // 带来源标）——数据结构独立，路由链共享。
     const isApprovalFamily = e.type === 'ai.approval.request' || e.type === 'ai.approval.cancelled'
-      || e.type === 'ai.option.request' || e.type === 'ai.option.cancelled';
+      || e.type === 'ai.option.request' || e.type === 'ai.option.cancelled'
+      || e.type === 'tool_ask.request' || e.type === 'tool_ask.cancel';
     let routedToShell = false;
     if (!conv && isApprovalFamily && e.session_id) {
       const shell = findDeviceShellBySessionId(e.session_id);
@@ -2520,7 +2683,65 @@ export function useAliangChat() {
         break;
       }
       case 'ai.option.request': {
+        // 决策跨端同步（2026-11-08）：resolved 同型帧先翻卡（别端作答，
+        // 镜像审批族 status 约定），完整 pending 帧才 upsert——status 缺省
+        // 即 v1 旧 agent 兼容（request 帧本无 status 字段）。
+        if (e && e.status === 'resolved') {
+          resolveOptionCard(conv, e, handledOptionIds, now());
+          break;
+        }
         upsertOptionCard(conv, e);
+        break;
+      }
+      case 'tool_ask.request': {
+        // 决策跨端同步（2026-11-08）：resolved 同型帧先翻卡（别端作答，镜像
+        // ai.option 约定），完整 pending 帧才 upsert——status 缺省即 v1 旧
+        // agent 兼容（request 帧本无 status 字段）。
+        if (e && e.status === 'resolved') {
+          resolveToolAskCard(conv, e, handledToolAskIds, now());
+          break;
+        }
+        upsertToolAskCard(conv, e);
+        break;
+      }
+      case 'tool_ask.cancel': {
+        // 镜像 ai.option.cancelled：逐 interaction 清卡 + 系统提示条挂对应
+        // 会话。interaction_id 可空（agent 批量 sweep——run 终结 unregisterRun
+        // 的收口形态），空则作废该 session 全部待答提问卡。ai.done/ai.error
+        // 清审批但绝不清提问卡——卡必须活过 run 终态等 SLA 内作答。
+        const askId = String(e.interaction_id || '').trim();
+        const asks = Array.isArray(conv.toolAsks) ? conv.toolAsks : [];
+        const sid = String(e.session_id || '');
+        const kept = [];
+        let removedAsks = 0;
+        for (const card of asks) {
+          const hit = askId
+            ? askId === card.interactionId && card.key === optionKeyFromValues(sid, card.interactionId)
+            : card.sessionId === sid;
+          if (hit) {
+            // 确认在场被移除的卡才封键位——防作废后迟到重投帧复活。
+            handledToolAskIds.add(card.key);
+            removedAsks++;
+          } else {
+            kept.push(card);
+          }
+        }
+        if (removedAsks) {
+          conv.toolAsks = kept;
+          const cancelledText = e.reason
+            ? t('chat_toolAskCancelledReason', { reason: e.reason })
+            : t('chat_toolAskCancelled');
+          conv.messages.push({
+            role: 'assistant',
+            kind: 'system',
+            note: 'tool_ask_cancelled',
+            content: systemNoteContent(e.sourceId, cancelledText),
+            status: 'done',
+            ts: now(),
+          });
+          scrollToBottom();
+        }
+        persist = true; // 系统条进消息流要落盘（无卡可清时无副作用）
         break;
       }
       case 'ai.option.cancelled': {
@@ -2836,6 +3057,7 @@ export function useAliangChat() {
     activeMessages,
     activeApprovals,
     activeOptionCards,
+    activeToolAsks,
     activeSteerItems,
     activeRunning,
     // 动作槽（发送/停止交替）的 running 门控源：会话级并集判定（本地气泡
@@ -2892,6 +3114,7 @@ export function useAliangChat() {
     recallActive,
     respondApproval,
     respondOption,
+    respondToolAsk,
     sendMessage,
     sendRecall,
     startRecall,

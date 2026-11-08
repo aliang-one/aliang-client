@@ -359,6 +359,13 @@ export default {
   chat_optionCancelled: 'Option selection expired',
   chat_optionCancelledReason: 'Option selection expired ({reason})',
   chat_optionSendFailed: 'Failed to send selection. Please retry.',
+  // tool_ask question card (mcp__aliang__ask_user, 2026-11-08 dashboard
+  // rendering). Paired 1:1 with zh.js (i18n.test.js key-set guard). Title/
+  // submit/selected reuse chat_option* (identical card shape; frame title is
+  // required so the fallback never shows).
+  chat_toolAskCancelled: 'Interactive question expired',
+  chat_toolAskCancelledReason: 'Interactive question expired ({reason})',
+  chat_toolAskSendFailed: 'Failed to send answer. Please retry.',
   // Subagent status entry bar (Task 7, spec 2026-11-07-subagent-panel §3):
   // persistent chat-page entry bar copy. Paired 1:1 with zh.js
   // (i18n.test.js key-set guard).

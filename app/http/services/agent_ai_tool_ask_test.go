@@ -442,3 +442,136 @@ func claudeApprovalDecisionAllows(decision map[string]interface{}) bool {
 	}
 	return false
 }
+
+// 2026-11-08 决策跨端同步顺手修：intake 此前只读 selected_option_id/message，
+// multi 卡的多选作答（answer.selected_option_ids，PhoneServer tool_ask 下发
+// 契约 v2 字段）整路丢弃——downstream（handleAskUser answered 分支）消费
+// SelectedOptionIDs 组装 selected_option_ids/selected_answers，但永远收不到。
+func TestToolAskBridgeIntakeCarriesMultiSelectAnswer(t *testing.T) {
+	m, b := newToolAskTestManager(t, 5*time.Second)
+	writer := newCapturedWriter()
+	token := b.registerRun("sess1", "run1", writer.write)
+	defer b.unregisterRun(token)
+
+	args := `{"title":"多选","options":[{"id":"a","label":"A"},{"id":"b","label":"B"}],"multi":true}`
+	type outcome struct {
+		res *mcp.CallToolResult
+		err error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		res, err := b.handleAskUser(context.Background(), args, token)
+		done <- outcome{res, err}
+	}()
+
+	frames := writer.waitForFrames(1, 2*time.Second)
+	if len(frames) != 1 {
+		t.Fatalf("expected 1 request frame, got %d", len(frames))
+	}
+	interactionID, _ := frames[0]["interaction_id"].(string)
+	if interactionID == "" {
+		t.Fatalf("request frame missing interaction_id: %v", frames[0])
+	}
+
+	m.toolAskResponse(map[string]interface{}{
+		"type":           models.AgentEventToolAskResponse,
+		"interaction_id": interactionID,
+		"status":         models.AgentToolAskStatusAnswered,
+		"answer":         map[string]interface{}{"selected_option_ids": []interface{}{"a", "b"}},
+	}, nil)
+
+	select {
+	case out := <-done:
+		if out.err != nil {
+			t.Fatalf("handleAskUser: %v", out.err)
+		}
+		if out.res.IsError {
+			t.Fatalf("answered result must not be IsError")
+		}
+		text := toolAskResultText(t, out.res)
+		if !strings.Contains(text, `"selected_option_ids":["a","b"]`) || !strings.Contains(text, `"selected_answers"`) {
+			t.Fatalf("multi-select answer dropped by intake: %s", text)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("handleAskUser did not return after answer")
+	}
+}
+
+// 2026-11-08 决策跨端同步：作答落地必须广播 resolved 同型帧（此前零帧——
+// PhoneServer 的 tool_ask 审批行与 dashboard 提问卡都不知情，重复作答双跑）。
+// 帧形 {type:tool_ask.request, status:"resolved", interaction_id, answer}，与
+// ai.option 的 resolved 约定同构；经 rc.writeJSON（生产=run emitter 包 fanOut，
+// tool_ask.request 在审批族白名单）全端可达。
+func TestToolAskBridgeAnsweredEmitsResolvedFrame(t *testing.T) {
+	m, b := newToolAskTestManager(t, 5*time.Second)
+	writer := newCapturedWriter()
+	token := b.registerRun("sess1", "run1", writer.write)
+	defer b.unregisterRun(token)
+
+	args := `{"title":"选环境","options":[{"id":"staging","label":"staging"},{"id":"prod","label":"prod"}],"multi":true}`
+	type outcome struct {
+		res *mcp.CallToolResult
+		err error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		res, err := b.handleAskUser(context.Background(), args, token)
+		done <- outcome{res, err}
+	}()
+
+	frames := writer.waitForFrames(1, 2*time.Second)
+	if len(frames) != 1 {
+		t.Fatalf("expected 1 request frame, got %d", len(frames))
+	}
+	interactionID, _ := frames[0]["interaction_id"].(string)
+
+	m.toolAskResponse(map[string]interface{}{
+		"type":           models.AgentEventToolAskResponse,
+		"interaction_id": interactionID,
+		"status":         models.AgentToolAskStatusAnswered,
+		"answer":         map[string]interface{}{"selected_option_ids": []interface{}{"staging"}, "message": "就它"},
+	}, nil)
+
+	select {
+	case out := <-done:
+		if out.err != nil {
+			t.Fatalf("handleAskUser: %v", out.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("handleAskUser did not return after answer")
+	}
+
+	// 作答后必须有第二帧：resolved 同型广播（工具结果本身不进 WS）。
+	var resolved map[string]interface{}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && resolved == nil {
+		for _, f := range writer.frames() {
+			if f["type"] == models.AgentEventToolAskRequest && f["status"] == "resolved" {
+				resolved = f
+			}
+		}
+		if resolved == nil {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	if resolved == nil {
+		t.Fatalf("expected resolved tool_ask frame after answer, frames=%v", writer.frames())
+	}
+	if resolved["interaction_id"] != interactionID || resolved["session_id"] != "sess1" {
+		t.Fatalf("resolved frame ids = %v", resolved)
+	}
+	ans, _ := resolved["answer"].(map[string]interface{})
+	if ans == nil {
+		t.Fatalf("resolved frame missing answer: %v", resolved)
+	}
+	ids, _ := ans["selected_option_ids"].([]string)
+	if len(ids) != 1 || ids[0] != "staging" {
+		t.Fatalf("resolved answer ids = %v, want [staging]", ans)
+	}
+	if ans["message"] != "就它" {
+		t.Fatalf("resolved answer message = %v, want 就它", ans)
+	}
+	if _, ok := resolved["run_id"]; !ok {
+		t.Fatalf("resolved frame missing run_id: %v", resolved)
+	}
+}

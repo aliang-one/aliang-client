@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"aliang.one/nursorgate/app/http/models"
 )
 
 func TestExtractAgentAIOptionBlocks(t *testing.T) {
@@ -235,6 +237,236 @@ func TestOptionResponseNoMatchIsHarmless(t *testing.T) {
 	}, writer)
 	if got := findAIEvents(mu, events, "ai.run.started"); len(got) != 0 {
 		t.Fatalf("expected no run dispatched for unmatched option")
+	}
+}
+
+// --- 2026-11-08 决策跨端同步：option 作答必须广播 resolved 同型帧 ---
+//
+// 根因：optionResponse 整函数零帧发出——手机端选了电脑卡永 pending（对称方向
+// 同理），PhoneServer 派生审批也无从 settle。镜像审批族 status:"resolved"
+// 同型约定（requestApproval 的 <-respond 分支重发 ai.approval.request）。
+
+// fence 分支正常作答：resolved 帧形状（option_id/selected/message_id 齐全，
+// pendingOption 清空，续跑 run 照常发起）。
+func TestOptionResponseEmitsResolvedFrame(t *testing.T) {
+	binDir := t.TempDir()
+	writeFakeExecutable(t, binDir, "claude", "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"ok\",\"session_id\":\"option-session\"}'\n")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	m := newTestAISocketsManager(t)
+	defer m.closeAll()
+	mu, events, writer := captureAIWriter(t)
+
+	m.mu.Lock()
+	m.sessions["s1"] = &agentAISession{
+		id: "s1", runSeq: 2, provider: "claude", mode: "vibe",
+		projectPath: t.TempDir(), activity: newAgentAIActivity(),
+		originSocket: "aisock-7",
+		pendingOption: &agentAIOptionRequest{
+			ID: "opt_s1_2", MessageID: "m_asst",
+			Options: []agentAIOptionChoice{{ID: "a", Label: "A"}, {ID: "b", Label: "B"}},
+		},
+	}
+	m.mu.Unlock()
+
+	m.optionResponse(map[string]interface{}{
+		"type": models.AgentEventAIOptionResponse, "session_id": "s1", "option_id": "opt_s1_2",
+		"selected": []interface{}{"b"}, "custom_text": "",
+		agentAIOriginSocketField: "aisock-7",
+	}, writer)
+
+	resolved := lastAIEvent(mu, events, models.AgentEventAIOptionRequest)
+	if resolved == nil {
+		t.Fatal("expected resolved ai.option.request frame emitted")
+	}
+	if resolved["status"] != "resolved" {
+		t.Fatalf("resolved frame status = %v, want resolved", resolved["status"])
+	}
+	if resolved["option_id"] != "opt_s1_2" || resolved["session_id"] != "s1" {
+		t.Fatalf("resolved frame ids = %+v", resolved)
+	}
+	sel, _ := resolved["selected"].([]string)
+	if len(sel) != 1 || sel[0] != "b" {
+		t.Fatalf("resolved frame selected = %v, want [b]", resolved["selected"])
+	}
+	if resolved["message_id"] != "m_asst" {
+		t.Fatalf("resolved frame message_id = %v, want m_asst", resolved["message_id"])
+	}
+	if resolved["provider"] != "claude" {
+		t.Fatalf("resolved frame provider = %v, want claude", resolved["provider"])
+	}
+	m.mu.Lock()
+	pending := m.sessions["s1"].pendingOption
+	m.mu.Unlock()
+	if pending != nil {
+		t.Fatalf("pendingOption not cleared after resolved emit: %+v", pending)
+	}
+}
+
+// 广播性：作答 socket 内联之外，run 发起 socket（手机模拟）也必须收到
+// resolved 帧——ai.option.request 在审批族白名单里，fanOutWrite 全端可达。
+func TestOptionResolvedFrameFansOutToRunSocket(t *testing.T) {
+	binDir := t.TempDir()
+	writeFakeExecutable(t, binDir, "claude", "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"ok\",\"session_id\":\"option-session\"}'\n")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	m := newTestAISocketsManager(t)
+	defer m.closeAll()
+	runCh := make(chan map[string]interface{}, 16)
+	decideCh := make(chan map[string]interface{}, 16)
+	runSock := m.registerAISocket("remote", func(p interface{}) error { runCh <- p.(map[string]interface{}); return nil })
+	decideSock := m.registerAISocket("local", func(p interface{}) error { decideCh <- p.(map[string]interface{}); return nil })
+
+	m.mu.Lock()
+	m.sessions["s1"] = &agentAISession{
+		id: "s1", runSeq: 2, provider: "claude", mode: "vibe",
+		projectPath: t.TempDir(), activity: newAgentAIActivity(),
+		originSocket: runSock.id,
+		pendingOption: &agentAIOptionRequest{
+			ID: "opt_x", MessageID: "m1",
+			Options: []agentAIOptionChoice{{ID: "a", Label: "A"}},
+		},
+	}
+	m.mu.Unlock()
+
+	m.optionResponse(map[string]interface{}{
+		"type": models.AgentEventAIOptionResponse, "session_id": "s1", "option_id": "opt_x",
+		"selected":               []interface{}{"a"},
+		agentAIOriginSocketField: decideSock.id,
+	}, func(p interface{}) error { decideCh <- p.(map[string]interface{}); return nil })
+
+	// run 发起通道（手机模拟）必须收到 resolved 帧（fanOut 广播）。
+	drainedResolved := false
+	waitUntilFor(t, 2*time.Second, func() bool {
+		for len(runCh) > 0 {
+			if p := <-runCh; p["type"] == models.AgentEventAIOptionRequest && p["status"] == "resolved" {
+				drainedResolved = true
+				return true
+			}
+		}
+		return false
+	})
+	if !drainedResolved {
+		t.Fatal("run 发起通道未收到 resolved ai.option.request（fanOut 广播缺失）")
+	}
+}
+
+// codex waiter 分支：喂 waiter 之后同样广播 resolved（此前零帧提前 return）。
+func TestOptionResponseCodexWaiterEmitsResolvedFrame(t *testing.T) {
+	m := newTestAISocketsManager(t)
+	defer m.closeAll()
+	mu, events, writer := captureAIWriter(t)
+	respond := make(chan agentAICodexInputAnswer, 1)
+	m.mu.Lock()
+	m.codexInputs[agentAICodexInputMapKey("s1", "opt_c")] = &agentAICodexInputWaiter{
+		sessionID: "s1", runSeq: 1, optionID: "opt_c", respond: respond,
+	}
+	m.sessions["s1"] = &agentAISession{id: "s1", runSeq: 1}
+	m.mu.Unlock()
+
+	m.optionResponse(map[string]interface{}{
+		"type": models.AgentEventAIOptionResponse, "session_id": "s1", "option_id": "opt_c",
+		"selected": []interface{}{"a"}, "custom_text": "备注",
+		agentAIOriginSocketField: "aisock-5",
+	}, writer)
+
+	if got := <-respond; len(got.selected) != 1 || got.selected[0] != "a" || got.custom != "备注" {
+		t.Fatalf("waiter 未收到答案: %+v", got)
+	}
+	resolved := lastAIEvent(mu, events, models.AgentEventAIOptionRequest)
+	if resolved == nil || resolved["status"] != "resolved" {
+		t.Fatalf("codex 作答应发 resolved 帧, got %+v", resolved)
+	}
+	if resolved["provider"] != "codex" {
+		t.Fatalf("codex resolved 帧 provider = %v, want codex", resolved["provider"])
+	}
+}
+
+// sync_only（PhoneServer 手机决议旁路）：只清 pendingOption + 广播翻卡帧，
+// 不得起续跑 run——手机决议已由 PhoneServer dispatchUserAiMessage 起新回合，
+// 再走续跑路径会双重注入同一选择。
+func TestOptionResponseSyncOnlyClearsWithoutRun(t *testing.T) {
+	m := newTestAISocketsManager(t)
+	defer m.closeAll()
+	mu, events, writer := captureAIWriter(t)
+	m.mu.Lock()
+	m.sessions["s1"] = &agentAISession{
+		id: "s1", runSeq: 2, provider: "claude",
+		activity: newAgentAIActivity(),
+		pendingOption: &agentAIOptionRequest{
+			ID: "opt_s", MessageID: "m1",
+			Options: []agentAIOptionChoice{{ID: "a", Label: "A"}},
+		},
+	}
+	m.mu.Unlock()
+
+	m.optionResponse(map[string]interface{}{
+		"type": models.AgentEventAIOptionResponse, "session_id": "s1", "option_id": "opt_s",
+		"selected": []interface{}{"a"}, "sync_only": true,
+	}, writer)
+
+	m.mu.Lock()
+	pending := m.sessions["s1"].pendingOption
+	m.mu.Unlock()
+	if pending != nil {
+		t.Fatalf("sync_only 未清 pendingOption: %+v", pending)
+	}
+	resolved := lastAIEvent(mu, events, models.AgentEventAIOptionRequest)
+	if resolved == nil || resolved["status"] != "resolved" || resolved["option_id"] != "opt_s" {
+		t.Fatalf("sync_only 应发 resolved 帧, got %+v", resolved)
+	}
+	if got := findAIEvents(mu, events, "ai.run.started"); len(got) != 0 {
+		t.Fatalf("sync_only 不得起续跑 run, got %d", len(got))
+	}
+}
+
+// 迟到/重复 sync 幂等：卡已不在场（另一端已消费）仍发 resolved 帧——
+// 发起端的翻卡信号不能因 agent 侧状态而丢。
+func TestOptionResponseSyncOnlyUnknownIdIsIdempotent(t *testing.T) {
+	m := newTestAISocketsManager(t)
+	defer m.closeAll()
+	mu, events, writer := captureAIWriter(t)
+	m.mu.Lock()
+	m.sessions["s1"] = &agentAISession{id: "s1", runSeq: 1}
+	m.mu.Unlock()
+	m.optionResponse(map[string]interface{}{
+		"type": models.AgentEventAIOptionResponse, "session_id": "s1", "option_id": "opt_gone",
+		"selected": []interface{}{"a"}, "sync_only": true,
+	}, writer)
+	resolved := lastAIEvent(mu, events, models.AgentEventAIOptionRequest)
+	if resolved == nil || resolved["status"] != "resolved" || resolved["option_id"] != "opt_gone" {
+		t.Fatalf("迟到 sync_only 应幂等发 resolved 帧, got %+v", resolved)
+	}
+	if got := findAIEvents(mu, events, "ai.run.started"); len(got) != 0 {
+		t.Fatalf("unknown sync_only 不得起 run")
+	}
+}
+
+// codex waiter + sync_only：只发翻卡帧，不喂 waiter——活跑的 requestUserInput
+// 等待态不被旁路注入答案（答案的续跑由发起端自行负责）。
+func TestOptionResponseCodexSyncOnlyDoesNotFeedWaiter(t *testing.T) {
+	m := newTestAISocketsManager(t)
+	defer m.closeAll()
+	mu, events, writer := captureAIWriter(t)
+	respond := make(chan agentAICodexInputAnswer, 1)
+	m.mu.Lock()
+	m.codexInputs[agentAICodexInputMapKey("s1", "opt_c")] = &agentAICodexInputWaiter{
+		sessionID: "s1", runSeq: 1, optionID: "opt_c", respond: respond,
+	}
+	m.sessions["s1"] = &agentAISession{id: "s1", runSeq: 1}
+	m.mu.Unlock()
+
+	m.optionResponse(map[string]interface{}{
+		"type": models.AgentEventAIOptionResponse, "session_id": "s1", "option_id": "opt_c",
+		"selected": []interface{}{"a"}, "sync_only": true,
+	}, writer)
+
+	select {
+	case got := <-respond:
+		t.Fatalf("sync_only 不得喂 waiter, got %+v", got)
+	default:
+	}
+	resolved := lastAIEvent(mu, events, models.AgentEventAIOptionRequest)
+	if resolved == nil || resolved["status"] != "resolved" {
+		t.Fatalf("codex sync_only 应发 resolved 帧, got %+v", resolved)
 	}
 }
 

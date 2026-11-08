@@ -356,6 +356,12 @@ export default {
   chat_optionCancelled: '方案选择已失效',
   chat_optionCancelledReason: '方案选择已失效（{reason}）',
   chat_optionSendFailed: '选择发送失败，请重试。',
+  // tool_ask 提问卡（mcp__aliang__ask_user，2026-11-08 dashboard 渲染接入）：
+  // 与 en.js 成对维护（i18n.test.js 守键集）。标题/提交/已选复用 chat_option*
+  // （卡片结构同形，帧 title 必填覆盖 fallback）。
+  chat_toolAskCancelled: '交互提问已失效',
+  chat_toolAskCancelledReason: '交互提问已失效（{reason}）',
+  chat_toolAskSendFailed: '回答发送失败，请重试。',
   // 子agent状态入口条（Task 7, spec 2026-11-07-subagent-panel §三）：会话页
   // 常驻入口条文案，与 en.js 成对维护（i18n.test.js 守键集）。
   chat_subagentEntry: '子agent',
