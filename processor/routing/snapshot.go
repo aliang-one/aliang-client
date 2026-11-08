@@ -7,7 +7,6 @@ import (
 
 	"aliang.one/nursorgate/common/model"
 	"aliang.one/nursorgate/processor/config"
-	"aliang.one/nursorgate/processor/match"
 )
 
 type SnapshotAction string
@@ -166,6 +165,19 @@ func (s *RuntimeSnapshot) StrictUnavailableBranchDeny() bool {
 	return s.strictDeny
 }
 
+// CompileRuntimeSnapshot 将 canonical schema(如 routing apply store 的持久化
+// 产物)物化为决策快照。
+//
+// 不变式(M5,防后人读错快照):store 快照不驱动连接级决策——连接级决策的
+// 两处调用方(processor/rules/engine 与 processor/tcp/tls)都走
+// CompileRuntimeSnapshotFromRuntimeInputs 按需重编译,不读本函数产物;store
+// 快照只用于开关状态派生与持久化回放。因此 mesh 能力闸(meshForwardAvailable:
+// 总开关+peer 存在)只在 runtime-inputs 编译路径把关,本函数对 toNode: 目标
+// 不做能力检查、按前缀放行是安全的——落盘 canonical 在写入时
+// (customer_config_service)已经过 runtime-inputs 闸,手改文件注入的越权
+// toNode 规则由 Validate 的形态校验拦下 deviceID 空/未知形态,peer 越权则由
+// 决策层按 runtime inputs 按需重编译天然规避——手写 canonical 的 toNode 规则
+// 不在 runtime-inputs 规则源中,对决策天然惰性。
 func CompileRuntimeSnapshot(canonical *config.CanonicalRoutingSchema) (*RuntimeSnapshot, error) {
 	if canonical == nil {
 		return nil, fmt.Errorf("canonical routing schema is nil")
@@ -307,8 +319,12 @@ func compileCanonicalRoutingFromRuntimeInputs(cfg *config.Config, switches model
 
 	// appendRules 按共享内核分类结果追加规则：
 	// - 域名/IP 由 match.ClassifyEntry 统一判定（ip-cidr 等条目编译为 Type=ip，不再误编译为域名）；
+	// - mesh 转发尾段（mesh:<deviceID>）先于 ClassifyEntry 剥出（见 splitMeshTail），
+	//   编译为 Target=toNode:<deviceID> 的规则；能力不可用/未知 peer 静默跳过；
 	// - 去重按 (kind, cond) 全局进行——与 ai_allowlist 同条件的 proxy 规则本就排在后面永不可达，提前剪除；
-	// - ID 按前缀独立连续编号（ai_allowlist_0.. / proxy_rule_0..），与既有产物保持一致。
+	//   mesh 规则的键追加 target——两条 dns 规则指向不同 peer 语义不同，都保留供决策取首条；
+	// - ID 按前缀独立连续编号（ai_allowlist_0.. / proxy_rule_0..），mesh 条目与
+	//   proxy 条目同池编号（mesh 本就是 proxy_rules 的转发变体），与既有产物风格一致。
 	// 编译函数每条连接都会被调用：非法条目在此静默跳过——旧代码会把此类条目编译为
 	// 永不命中的死规则，现改为直接跳过；保存期校验由配置校验层（Task 10）承担。
 	// 不打日志、不报错，避免每连接日志风暴。
@@ -317,33 +333,32 @@ func compileCanonicalRoutingFromRuntimeInputs(cfg *config.Config, switches model
 	appendRules := func(entries []string, idPrefix string, target SnapshotAction) {
 		index := 0
 		for _, raw := range entries {
-			kind, cond, err := match.ClassifyEntry(raw)
-			if err != nil || cond == "" {
+			ruleType, condition, entryTarget := classifyEntryForCompile(cfg, raw, target)
+			if condition == "" || entryTarget == "" {
 				continue
 			}
-			key := kind.String() + "|" + cond
+			key := ruleType + "|" + condition
+			if strings.HasPrefix(string(entryTarget), SnapshotTargetMeshPrefix) {
+				key += "|" + string(entryTarget)
+			}
 			if _, dup := seen[key]; dup {
 				continue
 			}
 			seen[key] = struct{}{}
-			ruleType := model.RuleTypeDomain
-			switch kind {
-			case match.EntryIP:
-				ruleType = model.RuleTypeIP
-			case match.EntryGeoIP:
-				ruleType = model.RuleTypeGeoIP
-			}
 			rules = append(rules, config.CanonicalRoutingRule{
 				ID:        fmt.Sprintf("%s_%d", idPrefix, index),
-				Type:      string(ruleType),
-				Condition: cond,
+				Type:      ruleType,
+				Condition: condition,
 				Enabled:   true,
-				Target:    string(target),
+				Target:    string(entryTarget),
 			})
 			index++
 		}
 	}
 
+	// 有意行为(design §4 允许):AI 池条目带 mesh 尾同样会编译为
+	// ai_allowlist_N + toNode:<deviceID> 目标,覆盖默认 toAliang——
+	// mesh 尾是条目级转发声明,与所在池无关。
 	appendRules(aiEntries, "ai_allowlist", SnapshotActionToAliang)
 	appendRules(proxyEntries, "proxy_rule", resolveProxyRuleTarget(canonical.Egress.ToSocks.Enabled))
 	canonical.Routing.Rules = rules

@@ -16,6 +16,11 @@ import (
 	"time"
 
 	"github.com/andydunstall/piko/client"
+
+	"aliang.one/nursorgate/app/mesh/relay"
+	"aliang.one/nursorgate/outbound/meshproto"
+	meshproxy "aliang.one/nursorgate/outbound/proxy/mesh"
+	"aliang.one/nursorgate/processor/tcp"
 )
 
 type Config struct {
@@ -24,6 +29,12 @@ type Config struct {
 	TunnelToken     string
 	RoutePublicKey  string
 	ExpiresAt       time.Time
+	// PikoProxyURL is the piko server's *proxy* port for A-side mesh relay
+	// dials (design §3.1 carrier A; a different face than PikoUpstreamURL,
+	// which is the upstream listen port). Optional: when absent/illegal the
+	// relay carrier is soft-failed to unavailable and only the LAN carrier
+	// remains. Carried by the optional tunnel.configure key piko_proxy_url.
+	PikoProxyURL string
 	// AllowPrivateTargets permits mapping RFC1918 hosts on the agent's LAN
 	// (NAS, router, printers) in addition to loopback. Loopback is always
 	// allowed. The server controls this via tunnel.configure
@@ -50,6 +61,12 @@ type runConfig struct {
 	handler         http.Handler
 	// tcpBridge is nil unless TCP mappings are enabled for this session.
 	tcpBridge *tcpBridge
+	// meshRelay serves B-side mesh receive on the "<deviceID>.mesh" piko
+	// endpoint (design §3.1 carrier A). Always wired: whether the endpoint
+	// listens at all is the platform whitelist's call (soft-fail), and the
+	// per-connection gate (forward_enable + peers ACL) is read live by
+	// mesh_inbound on every accepted stream.
+	meshRelay *relay.Relay
 	// onState receives mid-session state transitions surfaced from the piko
 	// client (e.g. "reconnecting" while a dropped session retries). Nil for
 	// runners that do not support it.
@@ -68,6 +85,19 @@ type Manager struct {
 	status      Status
 	onStatus    func(Status)
 	run         runFunc
+	// meshDial is the A-side mesh relay dial config (mu guarded), refreshed by
+	// every successful validateConfig and cleared by Stop. Dials read it live
+	// (dialMeshEndpoint) so renewals never leave a stale proxy url behind.
+	meshDial meshDialConfig
+	// meshSelfDeviceID is the local device id from the most recent
+	// validateConfig (mu guarded). Unlike status.DeviceID (set by Configure
+	// AFTER validateConfig runs, and reset semantics tied to state reporting),
+	// this is readable at assembly time on the very first configure — the
+	// egress peer source (Task 14) reads it via currentDeviceID. Deliberately
+	// NOT cleared by Stop: device id is the permanent device identity, and the
+	// offline fallback dials (the peer source's whole purpose) happen exactly
+	// when the session is stopped.
+	meshSelfDeviceID string
 }
 
 func NewManager(onStatus func(Status)) *Manager {
@@ -79,7 +109,7 @@ func (m *Manager) Configure(config Config) (Status, bool, error) {
 	defer m.configureMu.Unlock()
 
 	config = normalizeConfig(config)
-	runtimeConfig, fingerprint, err := validateConfig(config)
+	runtimeConfig, fingerprint, err := m.validateConfig(config)
 	if err != nil {
 		return Status{}, false, err
 	}
@@ -128,6 +158,7 @@ func (m *Manager) Configure(config Config) (Status, bool, error) {
 func normalizeConfig(config Config) Config {
 	config.DeviceID = strings.TrimSpace(config.DeviceID)
 	config.PikoUpstreamURL = strings.TrimSpace(config.PikoUpstreamURL)
+	config.PikoProxyURL = strings.TrimSpace(config.PikoProxyURL)
 	config.TunnelToken = strings.TrimSpace(config.TunnelToken)
 	config.RoutePublicKey = strings.TrimSpace(config.RoutePublicKey)
 	return config
@@ -139,6 +170,10 @@ func (m *Manager) Stop() {
 
 	m.mu.Lock()
 	if m.cancel == nil {
+		// No live session, but a configure may still have left the relay dial
+		// config behind (e.g. the session failed on its own): Stop always
+		// leaves the relay carrier unavailable.
+		m.clearMeshDialLocked()
 		m.mu.Unlock()
 		return
 	}
@@ -148,6 +183,7 @@ func (m *Manager) Stop() {
 	m.done = nil
 	m.fingerprint = [sha256.Size]byte{}
 	m.generation++
+	m.clearMeshDialLocked()
 	m.status.State = "stopped"
 	m.status.Error = ""
 	status := m.status
@@ -238,7 +274,7 @@ func (m *Manager) emit(status Status) {
 	}
 }
 
-func validateConfig(config Config) (runConfig, [sha256.Size]byte, error) {
+func (m *Manager) validateConfig(config Config) (runConfig, [sha256.Size]byte, error) {
 	if config.DeviceID == "" || config.PikoUpstreamURL == "" || config.TunnelToken == "" || config.RoutePublicKey == "" {
 		return runConfig{}, [sha256.Size]byte{}, errors.New("device ID, Piko upstream URL, tunnel token, and route public key are required")
 	}
@@ -256,6 +292,9 @@ func validateConfig(config Config) (runConfig, [sha256.Size]byte, error) {
 	if parsedURL.Scheme != "https" && !(parsedURL.Scheme == "http" && isLoopbackHost(parsedURL.Hostname())) {
 		return runConfig{}, [sha256.Size]byte{}, errors.New("Piko upstream URL must use HTTPS except for loopback development")
 	}
+	// Proxy 面(piko_proxy_url,中继载体 A 侧拨号)按同一套规则校验,见
+	// mesh_dial.go validatePikoProxyURL——两处规则将来单独收紧会静默漂移,
+	// 修改任一处须同步另一处。
 
 	verifier, err := newRouteVerifier(config.RoutePublicKey)
 	if err != nil {
@@ -269,11 +308,42 @@ func validateConfig(config Config) (runConfig, [sha256.Size]byte, error) {
 	if config.TCPEnabled {
 		bridge = newTCPBridge(config.DeviceID, verifier, config.AllowPrivateTargets)
 	}
+	// B-side mesh receive relay: the deps provider reads customer.mesh live
+	// per connection, so nothing config-derived gates construction here.
+	meshRelay := relay.New(relay.ProductionDeps(config.DeviceID))
+	// A-side mesh egress head header source (Task 7): the outbound dial
+	// (processor/tcp dialByRoute → mesh Peer) reads the local device id from
+	// this seam; same source as the receive relay above.
+	tcp.SetMeshSelfIDSource(func() string { return config.DeviceID })
+	// A-side mesh relay dial source (Task 9): the provider returns the
+	// dialMeshEndpoint method value, which reads the manager's CURRENT config
+	// on every dial — the closure deliberately captures the manager, never a
+	// generation's config values, because renewals reset the whole config and
+	// a captured (url, token) pair would go stale. Stored before the
+	// fingerprint early-return in Configure runs, so even a fingerprint-equal
+	// renewal picks up a changed piko_proxy_url (the key is excluded from the
+	// fingerprint below: the dialer is built per dial and hot-swaps without
+	// tearing the upstream session).
+	proxyURL, proxyErr := validatePikoProxyURL(config.PikoProxyURL)
+	if proxyErr != nil {
+		// Soft-fail: the relay carrier degrades to unavailable; the HTTP
+		// tunnel and LAN carrier are unaffected.
+		log.Printf("[AGENT-TUNNEL] mesh relay carrier disabled: %v", proxyErr)
+	}
+	m.setMeshDial(proxyURL, config.TunnelToken)
+	m.setMeshSelfDeviceID(config.DeviceID)
+	tcp.SetMeshPikoDialSource(func() meshproxy.PikoDialFunc { return m.dialMeshEndpoint }) // Task 14 生产装配(同位接线):egress 兜底 peer 源 + 离线信号两缝
+	// (egress/tcp 同一 manager 状态 getter,同源同真假)——本体见
+	// mesh_assembly.go wireMeshAssemblySeams。
+	m.wireMeshAssemblySeams()
 	// The fingerprint includes the token and expiry, so every renewal
 	// reconfigures the session. This drops in-flight streams once per renewal:
 	// piko reads Upstream.Token only at dial time and offers no token
 	// hot-swap, so keeping the session across renewals would let it reconnect
 	// with the stale token and die on the next flap (401 is non-retryable).
+	// PikoProxyURL is deliberately excluded: it feeds only the per-dial relay
+	// dialer (meshDial above), so proxy-face changes hot-swap without dropping
+	// the upstream session.
 	fingerprint := sha256.Sum256([]byte(strings.Join([]string{
 		config.DeviceID,
 		parsedURL.String(),
@@ -289,6 +359,7 @@ func validateConfig(config Config) (runConfig, [sha256.Size]byte, error) {
 		tunnelToken:     config.TunnelToken,
 		handler:         handler,
 		tcpBridge:       bridge,
+		meshRelay:       meshRelay,
 	}, fingerprint, nil
 }
 
@@ -341,6 +412,33 @@ func runTunnel(ctx context.Context, config runConfig, ready func()) error {
 				_ = tcpListener.Shutdown()
 			}()
 			go func() { _ = config.tcpBridge.Serve(tcpListener) }()
+		}
+	}
+
+	// B-side mesh receive lives on "<deviceID>.mesh" (design §3.1 carrier A;
+	// A-side dials it as the relay carrier — see outbound/proxy/mesh). Same
+	// soft-fail contract as the TCP bridge: a token whose endpoint whitelist
+	// lacks the endpoint degrades the relay carrier to unavailable without
+	// touching the HTTP tunnel. Listening is attempted unconditionally — the
+	// per-connection gate (forward_enable + peers ACL) is evaluated live by
+	// mesh_inbound on every accepted stream, so B-side receive comes alive
+	// the moment the platform whitelists the endpoint.
+	if config.meshRelay != nil {
+		meshListener, meshErr := upstream.Listen(ctx, MeshEndpointID(config.deviceID))
+		log.Printf("[AGENT-TUNNEL] mesh listen %s: err=%v addr=%v", MeshEndpointID(config.deviceID), meshErr, func() any {
+			if meshErr == nil {
+				return meshListener.Addr().String()
+			}
+			return ""
+		}())
+		if meshErr != nil {
+			reportMeshRelayDisabled(config.onState, fmt.Sprintf("mesh relay unavailable: %v", meshErr))
+		} else {
+			go func() {
+				<-ctx.Done()
+				_ = meshListener.Shutdown()
+			}()
+			go func() { _ = config.meshRelay.Serve(meshListener, meshproto.CarrierRelay) }()
 		}
 	}
 	ready()

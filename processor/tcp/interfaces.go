@@ -158,6 +158,10 @@ const (
 	RouteToALiang ProxyRoute = iota
 	RouteToLocalProxy
 	RouteDirect
+	// RouteToNode mesh 转发出口(design §3.4,Task 7):决策为 toNode:<deviceID>
+	// [:policy] 形态时由 tls.go 映射;deviceID 与失败策略经 metadata.Route
+	// 寄存的 decision 字符串抵达 dialByRoute 解析(见 dialViaMesh)。
+	RouteToNode
 )
 
 func (r ProxyRoute) String() string {
@@ -168,6 +172,8 @@ func (r ProxyRoute) String() string {
 		return "RouteToLocalProxy"
 	case RouteDirect:
 		return "RouteDirect"
+	case RouteToNode:
+		return "RouteToNode"
 	default:
 		return "RouteUnknown"
 	}

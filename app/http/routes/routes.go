@@ -39,6 +39,7 @@ type Handlers struct {
 	QuickSetup     *handlers.QuickSetupHandler
 	Tutorial       *handlers.TutorialHandler
 	Agent          *handlers.AgentHandler
+	Mesh           *handlers.MeshHandler
 
 	statsCollector     *statistic.StatsCollector
 	httpStatsCollector *statistic.HTTPStatsCollector
@@ -95,6 +96,7 @@ func newHandlers(runService *services.RunService) *Handlers {
 		QuickSetup:         handlers.NewQuickSetupHandler(),
 		Tutorial:           handlers.NewTutorialHandler(),
 		Agent:              handlers.NewAgentHandler(agentService),
+		Mesh:               handlers.NewMeshHandler(),
 		statsCollector:     statsCollector,
 		httpStatsCollector: httpStatsCollector,
 	}
@@ -313,6 +315,15 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	register("PUT /api/agent/mcp/servers/{name}", h.Agent.HandleAliangMCPServerPut, http.MethodPut)
 	register("DELETE /api/agent/mcp/servers/{name}", h.Agent.HandleAliangMCPServerDelete, http.MethodDelete)
 	register("/api/docs/tutorials", h.Tutorial.HandleGetTutorial, http.MethodGet)
+
+	// Mesh LAN 发现(/api/mesh/*):beacon 候选只读,供仪表盘离线模式点选
+	// (Task 10;候选→customer.mesh.peers 由用户手填,不做自动同步。beacon
+	// 生产 Start/Stop 生命周期接线在 Task 14 收尾,未装配时空表)。
+	register("/api/mesh/lan_peers", h.Mesh.HandleLANPeers, http.MethodGet)
+	// mesh 状态聚合(Task 14):本机 device_id/开关现值/LAN 监听口/peers/
+	// beacon 候选,仪表盘组网页数据源;只读——写路径走 /api/config/customer
+	// 的 customer.mesh,不做独立 POST。
+	register("/api/mesh/status", h.Mesh.HandleStatus, http.MethodGet)
 
 	registerDocsRoutes(mux, catalog)
 }

@@ -30,6 +30,7 @@ func TestPikoStateFromLog(t *testing.T) {
 
 func TestManagerSurfacesReconnectingState(t *testing.T) {
 	t.Parallel()
+	restoreMeshSelfIDSeam(t)
 	statuses := make(chan Status, 8)
 	manager := NewManager(func(status Status) { statuses <- status })
 	proceed := make(chan struct{})

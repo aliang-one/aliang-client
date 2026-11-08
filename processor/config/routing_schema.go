@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 )
 
 const CanonicalRoutingSchemaVersion = 1
@@ -171,6 +172,17 @@ func (cfg *CanonicalRoutingSchema) Validate() error {
 				return newRoutingSchemaValidationError("disabled_target_branch", targetField, "target branch toSocks is disabled")
 			}
 		default:
+			// mesh 转发目标 toNode:<deviceID>[:direct|:deny|:fallback:<deviceID2>]
+			// (Task 7 策略 grammar):本层只做形态校验(deviceID 非空、策略段
+			// 白名单、fallback 目标非空);能力校验(mesh 总开关 + peer 存在)在
+			// 运行输入编译层(processor/routing,见 meshForwardAvailable)把关。
+			if deviceID, policy, isMesh := ParseMeshRuleTarget(target); isMesh {
+				if deviceID == "" || !isValidMeshPolicy(policy) {
+					return newRoutingSchemaValidationError("invalid_target", targetField,
+						fmt.Sprintf("invalid mesh target %q: want toNode:<deviceID>[:direct|:deny|:fallback:<deviceID2>]", target))
+				}
+				continue
+			}
 			return newRoutingSchemaValidationError("unknown_target", targetField, fmt.Sprintf("unknown target: %s", target))
 		}
 	}
@@ -197,11 +209,89 @@ func (cfg *CanonicalRoutingSchema) Validate() error {
 	return nil
 }
 
+// MeshRuleTargetPrefix 是 mesh 转发规则目标的形态前缀(processor/routing 的
+// SnapshotTargetMeshPrefix 同值镜像——config 不能反向 import routing,会成环;
+// 两侧同值由 routing 包测试 TestSnapshotTargetMeshPrefixMirrorsConfigConstant 钉死)。
+// 形态:toNode:<deviceID>[:policy],deviceID 非空;policy 为 Task 7 失败策略段
+// (缺省=direct)。mesh 是规则驱动出口,不作 default_egress。
+// 大小写不对称刻意:编译产物恒小写(routing 编译层只产 "toNode:" 一种拼法),
+// 本层按前缀精确匹配、不做大小写归一。
+const MeshRuleTargetPrefix = "toNode:"
+
+// mesh 失败策略段关键字(Task 7 grammar,规则源(mesh:<id>,<policy>)与规则
+// 目标(toNode:<id>:<policy>)两侧共用;链头执行层(processor/tcp dialByRoute)
+// 解析决策字符串时按同值比较)。
+const (
+	MeshPolicyDirect   = "direct"   // mesh 拨出失败 → 回落 direct
+	MeshPolicyDeny     = "deny"     // mesh 拨出失败 → 拒绝连接(不落 direct)
+	MeshPolicyFallback = "fallback" // mesh 拨出失败 → 拨指定节点 fallback:<deviceID2>
+)
+
+// ParseMeshRuleTarget 解析 toNode:<deviceID>[:policy] 形态的规则 target
+// (Task 7 策略 grammar)。policy ∈ {"", "direct", "deny", "fallback:<deviceID2>"}。
+// ok=false 表示不是 mesh 形态(无 toNode: 前缀);ok=true 且 deviceID=="" 表示
+// 「是 mesh 形态但不可解析」(deviceID 空/未知策略段/fallback 目标空/超出四形
+// 态的段数),由调用方按校验错误处理。deviceID 与 fallback 目标 TrimSpace、
+// 保留原大小写(与 peer 比对);策略关键字小写精确(编译产物恒小写,与既有
+// 「前缀精确、不做大小写归一」口径一致)。deviceID 不允许含 ':'——含冒号的
+// id 无法与策略段区分,直接判非法形态。
+func ParseMeshRuleTarget(target string) (deviceID, policy string, ok bool) {
+	rest, found := strings.CutPrefix(target, MeshRuleTargetPrefix)
+	if !found {
+		return "", "", false
+	}
+	parts := strings.Split(strings.TrimSpace(rest), ":")
+	switch len(parts) {
+	case 1:
+		return strings.TrimSpace(parts[0]), "", true
+	case 2:
+		id := strings.TrimSpace(parts[0])
+		switch strings.TrimSpace(parts[1]) {
+		case MeshPolicyDirect, MeshPolicyDeny:
+			return id, strings.TrimSpace(parts[1]), true
+		}
+		return "", "", true
+	case 3:
+		id := strings.TrimSpace(parts[0])
+		kw := strings.TrimSpace(parts[1])
+		second := strings.TrimSpace(parts[2])
+		if id != "" && kw == MeshPolicyFallback && second != "" {
+			return id, MeshPolicyFallback + ":" + second, true
+		}
+		return "", "", true
+	default:
+		return "", "", true
+	}
+}
+
+// isValidMeshPolicy 策略段白名单:缺省("")/direct/deny,或 fallback:<非空目标>。
+func isValidMeshPolicy(policy string) bool {
+	switch policy {
+	case "", MeshPolicyDirect, MeshPolicyDeny:
+		return true
+	}
+	if rest, found := strings.CutPrefix(policy, MeshPolicyFallback+":"); found {
+		return rest != ""
+	}
+	return false
+}
+
 func normalizeRuleTarget(target string) (string, error) {
 	switch target {
 	case "direct", "toAliang", "toSocks":
 		return target, nil
 	default:
+		// mesh 规则目标 toNode:<deviceID>[:policy](Task 7 策略 grammar):
+		// 各段 TrimSpace 后按白名单重建;策略关键字小写精确。
+		// default_egress 也走本函数归一,但其 Validate 白名单不接受 mesh
+		// 形态——mesh 由规则命中驱动,不允许成为默认出口。
+		if deviceID, policy, isMesh := ParseMeshRuleTarget(target); isMesh && deviceID != "" && isValidMeshPolicy(policy) {
+			out := MeshRuleTargetPrefix + deviceID
+			if policy != "" {
+				out += ":" + policy
+			}
+			return out, nil
+		}
 		return "", fmt.Errorf("unknown target: %s", target)
 	}
 }

@@ -29,16 +29,33 @@ func (t *Tunnel) handleUDPConn(uc adapter.UDPConn, flow *udpFlowCloser) {
 		DstPort: id.LocalPort,
 	}
 
-	pc, err := t.Dialer().DialUDP(metadata)
-	if err != nil {
-		logger.Warn(fmt.Sprintf("[UDP] dial %s: %v", metadata.DestinationAddress(), err))
-		return
+	// DNS 代转发门控(design §6 层1,Task 8):UDP/53 且规则激活 → 查询经
+	// mesh 连接由 B 侧代解析,跳过公网 DialUDP——激活路径下不存在公网
+	// socket(交换失败由 forward conn 合成 SERVFAIL,fail-closed 绝不回落
+	// 公网 DNS);门未激活(无 dns 规则/peer 无 LAN 地址)→ 直连透传不变
+	// (fail-open)。
+	var pc net.PacketConn
+	viaMeshDNS := false
+	if metadata.DstPort == 53 {
+		if peer := t.meshDNSForwardPeer(); peer != nil {
+			pc = newDNSForwardPacketConn(peer, logDNSQueryNames)
+			viaMeshDNS = true
+			metadata.Route = "RouteMeshDNS"
+		}
+	}
+	if pc == nil {
+		var err error
+		pc, err = t.Dialer().DialUDP(metadata)
+		if err != nil {
+			logger.Warn(fmt.Sprintf("[UDP] dial %s: %v", metadata.DestinationAddress(), err))
+			return
+		}
+		metadata.MidIP, metadata.MidPort = parseNetAddr(pc.LocalAddr())
+
+		// UDP connections are always direct (no MitM/proxy support)
+		metadata.Route = "RouteDirect"
 	}
 	flow.Add(pc)
-	metadata.MidIP, metadata.MidPort = parseNetAddr(pc.LocalAddr())
-
-	// UDP connections are always direct (no MitM/proxy support)
-	metadata.Route = "RouteDirect"
 
 	pc = statistic.NewUDPTracker(pc, metadata, t.manager)
 	defer pc.Close()
@@ -51,8 +68,10 @@ func (t *Tunnel) handleUDPConn(uc adapter.UDPConn, flow *udpFlowCloser) {
 	}
 	pc = newSymmetricNATPacketConn(pc, metadata)
 
-	// If this is a DNS request (UDP/53), wrap the outbound PacketConn to log queried domain names
-	if metadata.DstPort == 53 {
+	// If this is a DNS request (UDP/53) on the direct path, wrap the outbound
+	// PacketConn to log queried domain names(mesh 代转发路径的 QNAME 日志已
+	// 并入 dnsForwardPacketConn 的 logQuery seam)。
+	if metadata.DstPort == 53 && !viaMeshDNS {
 		pc = &dnsLoggingPacketConn{PacketConn: pc}
 	}
 
@@ -110,18 +129,26 @@ type dnsLoggingPacketConn struct {
 }
 
 func (d *dnsLoggingPacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
-	// Best-effort parse DNS query and log QNAMEs
-	// Only attempt when payload looks like a DNS message (at least header length)
-	if len(b) >= 12 {
-		var m dns.Msg
-		if err := m.Unpack(b); err == nil {
-			// Log all questions (usually 1)
-			for _, q := range m.Question {
-				logger.Debug(fmt.Sprintf("[DNS] query: %s %s", q.Name, dns.TypeToString[q.Qtype]))
-			}
-		}
-	}
+	logDNSQueryNames(b)
 	return d.PacketConn.WriteTo(b, addr)
+}
+
+// logDNSQueryNames 尽力解析 DNS 查询报文并记录 QNAME(直连路径的
+// dnsLoggingPacketConn 与 mesh 代转发路径的 dnsForwardPacketConn 共用,
+// 原 dnsLoggingPacketConn 内联日志语义抽出)。
+func logDNSQueryNames(b []byte) {
+	// Only attempt when payload looks like a DNS message (at least header length)
+	if len(b) < 12 {
+		return
+	}
+	var m dns.Msg
+	if err := m.Unpack(b); err != nil {
+		return
+	}
+	// Log all questions (usually 1)
+	for _, q := range m.Question {
+		logger.Debug(fmt.Sprintf("[DNS] query: %s %s", q.Name, dns.TypeToString[q.Qtype]))
+	}
 }
 
 func pipePacket(origin, remote net.PacketConn, to net.Addr, timeout time.Duration) {

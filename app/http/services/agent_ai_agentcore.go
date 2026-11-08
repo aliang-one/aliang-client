@@ -25,6 +25,7 @@ import (
 	"aliang.one/nursorgate/common/logger"
 	auth "aliang.one/nursorgate/processor/auth"
 	"aliang.one/nursorgate/processor/config"
+	"aliang.one/nursorgate/processor/tcp"
 )
 
 // 内置内核（provider = "agentcore"）的宿主侧接线。
@@ -308,6 +309,17 @@ func agentCoreEnsureUpstream(ctx context.Context) error {
 			return fmt.Errorf("自定义 LLM 端点不可达(%s: %v)——请检查地址与服务状态后重试", custom.BaseURL, err)
 		}
 		conn.Close()
+		return nil
+	}
+	// 探针降级(计划 Task 12):离线 mesh 改道激活时跳过上游可达性探针。
+	// 该探针拨回环 56432 并在失败时自愈拉起本机 run service——离线场景下
+	// 要么误报 upstream 不可达拒跑 AI(隧道不可达与本地代理在不在是两回事,
+	// 改道后真实出网路径是 mesh 兜底节点),要么拉起一个没有平台出口的
+	// 本地代理。判定与数据面改道同源同真假:直接调 processor/tcp
+	// MeshOfflineAIRedirectActive(同一函数,非第二份逻辑);mesh 链路自身
+	// 的可达性由数据面拨号失败语义天然兜底,不需要前置探针。
+	if tcp.MeshOfflineAIRedirectActive() {
+		logger.Info("agentcore: 离线 mesh 改道激活,跳过上游可达性探针(AI 流量经 mesh 兜底节点出网)")
 		return nil
 	}
 	return ensureAIUpstreamReachable(ctx, agentCoreBaseURL(), aiProxyGuardDeps{

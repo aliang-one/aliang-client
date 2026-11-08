@@ -13,6 +13,7 @@ import (
 	httpServer "aliang.one/nursorgate/app/http"
 	"aliang.one/nursorgate/app/http/services"
 	"aliang.one/nursorgate/app/http/storage"
+	"aliang.one/nursorgate/app/tunnel"
 	"aliang.one/nursorgate/common/logger"
 	"aliang.one/nursorgate/common/version"
 	auth "aliang.one/nursorgate/processor/auth"
@@ -173,6 +174,13 @@ func initializeCoreSubsystems() error {
 		writeStartupTrace("initializeCoreSubsystems initializeCoreRuleEngine warning: %v", err)
 		logger.Warn(fmt.Sprintf("Failed to initialize rule engine: %v (continuing anyway)", err))
 	}
+
+	// mesh LAN 载体 + beacon 生产装配(Task 14):core 进程拥有 mesh 数据面
+	// (relay 注入的 processor/tcp 管线/56432 AI 出口/TUN),装配挂在此处而非
+	// NewAgentService——后者在 user agent runtime 也会构造,双装会抢
+	// 56440/56441 并广播双 beacon。device_id 解析常驻身份文件,幂等。
+	tunnel.StartMeshLANAssembly(services.GetSharedAgentService().CurrentDeviceID)
+
 	logger.Info("Core subsystems initialized")
 	return nil
 }

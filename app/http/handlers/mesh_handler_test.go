@@ -1,0 +1,242 @@
+package handlers
+
+import (
+	"context"
+	"encoding/json"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"aliang.one/nursorgate/app/mesh/lanbeacon"
+	"aliang.one/nursorgate/processor/config"
+)
+
+// pickFreeUDPPort 取一个当前空闲的 UDP 端口(收包注入用;bind 竞态由
+// Start 失败兜底,此处单实例一次绑定,重试无必要)。
+func pickFreeUDPPort(t *testing.T) int {
+	t.Helper()
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero})
+	if err != nil {
+		t.Fatalf("pickFreeUDPPort: %v", err)
+	}
+	defer conn.Close()
+	return conn.LocalAddr().(*net.UDPAddr).Port
+}
+
+// TestLANPeersHandlerReturnsCandidates handler 装配 beacon 后 GET 返回
+// 候选:common.Success 信封 + data.peers[] 结构(device_id/mesh_port/
+// cert_fingerprint/last_seen_unix)且按 last_seen 降序。
+func TestLANPeersHandlerReturnsCandidates(t *testing.T) {
+	port := pickFreeUDPPort(t)
+	b := lanbeacon.NewBeacon("self-dev", 56441, port)
+	if err := b.Start(context.Background()); err != nil {
+		t.Fatalf("beacon start: %v", err)
+	}
+	t.Cleanup(b.Stop)
+
+	now := time.Now().Unix()
+	inject := func(deviceID string, meshPort int, ts int64) {
+		conn, err := net.DialUDP("udp4", nil, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port})
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.Close()
+		data, _ := json.Marshal(map[string]any{
+			"device_id":        deviceID,
+			"mesh_port":        meshPort,
+			"cert_fingerprint": "",
+			"ts":               ts,
+		})
+		if _, err := conn.Write(data); err != nil {
+			t.Fatalf("inject %s: %v", deviceID, err)
+		}
+	}
+	inject("dev-old", 41001, now-1)
+	inject("dev-new", 41002, now)
+
+	h := &MeshHandler{beacon: func() *lanbeacon.Beacon { return b }}
+	req := httptest.NewRequest(http.MethodGet, "/api/mesh/lan_peers", nil)
+
+	var resp struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+		Data struct {
+			Peers []lanbeacon.LanPeerCandidate `json:"peers"`
+		} `json:"data"`
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		rec := httptest.NewRecorder()
+		h.HandleLANPeers(rec, req)
+		if rec.Code != 200 {
+			t.Fatalf("GET code = %d, want 200", rec.Code)
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode: %v (body=%s)", err, rec.Body.String())
+		}
+		if len(resp.Data.Peers) == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("候选未就位: %+v", resp.Data)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if resp.Code != 0 || resp.Msg != "success" {
+		t.Fatalf("信封 code/msg = %d/%q", resp.Code, resp.Msg)
+	}
+	if len(resp.Data.Peers) != 2 {
+		t.Fatalf("peers = %d 条, want 2", len(resp.Data.Peers))
+	}
+	// last_seen 降序:新报文在前。
+	newP, oldP := resp.Data.Peers[0], resp.Data.Peers[1]
+	if newP.DeviceID != "dev-new" || newP.MeshPort != 41002 || newP.CertFingerprint != "" || newP.LastSeenUnix != now {
+		t.Fatalf("dev-new 字段不符: %+v", newP)
+	}
+	if oldP.DeviceID != "dev-old" || oldP.MeshPort != 41001 || oldP.LastSeenUnix != now-1 {
+		t.Fatalf("dev-old 字段不符: %+v", oldP)
+	}
+}
+
+// TestLANPeersHandlerNilBeaconEmpty 未装配 beacon(Default()==nil)时返回
+// 空数组 peers:[],不 500——离线仪表盘点选面板拿空表是合法态。
+func TestLANPeersHandlerNilBeaconEmpty(t *testing.T) {
+	h := NewMeshHandler()
+	req := httptest.NewRequest(http.MethodGet, "/api/mesh/lan_peers", nil)
+	rec := httptest.NewRecorder()
+	h.HandleLANPeers(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code = %d, want 200", rec.Code)
+	}
+	var resp struct {
+		Code int `json:"code"`
+		Data struct {
+			Peers []lanbeacon.LanPeerCandidate `json:"peers"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Data.Peers == nil || len(resp.Data.Peers) != 0 {
+		t.Fatalf("未装配 beacon 时 peers = %#v, want 空数组", resp.Data.Peers)
+	}
+}
+
+// TestLANPeersHandlerMethodNotAllowed 非 GET 405(同 HandlePeerGates 的
+// http.Error 惯例)。
+func TestLANPeersHandlerMethodNotAllowed(t *testing.T) {
+	h := NewMeshHandler()
+	req := httptest.NewRequest(http.MethodPost, "/api/mesh/lan_peers", nil)
+	rec := httptest.NewRecorder()
+	h.HandleLANPeers(rec, req)
+	if rec.Code != 405 {
+		t.Fatalf("POST code = %d, want 405", rec.Code)
+	}
+}
+
+// TestMeshStatusHandlerAggregatesState GET /api/mesh/status 聚合:本机
+// device_id、总开关/forward_enable 现值、lan 监听口端口、peers、beacon 候选
+// (Task 14 仪表盘组网页数据源;写路径走既有 /api/config/customer,本端点只读)。
+func TestMeshStatusHandlerAggregatesState(t *testing.T) {
+	forwardOn := true
+	meshCfg := &config.MeshConfig{
+		ForwardEnable: &forwardOn,
+		Peers: []config.MeshPeer{
+			{DeviceID: "dev-b", LANAddrs: []string{"192.168.1.20:56441"}},
+		},
+	}
+	h := &MeshHandler{
+		beacon: func() *lanbeacon.Beacon { return nil }, // 候选面由 lan_peers 用例钉,此处 nil=空表
+		config: func() *config.Config {
+			return &config.Config{Customer: &config.CustomerConfig{Mesh: meshCfg}}
+		},
+		deviceID: func() string { return "dev-a" },
+		lanPort:  func() int { return 56441 },
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/mesh/status", nil)
+	rec := httptest.NewRecorder()
+	h.HandleStatus(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("GET code = %d, want 200", rec.Code)
+	}
+	var resp struct {
+		Code int `json:"code"`
+		Data struct {
+			DeviceID      string                       `json:"device_id"`
+			Enable        bool                         `json:"enable"`
+			ForwardEnable bool                         `json:"forward_enable"`
+			LANListenPort int                          `json:"lan_listen_port"`
+			Peers         []config.MeshPeer            `json:"peers"`
+			LANPeers      []lanbeacon.LanPeerCandidate `json:"lan_peers"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v (body=%s)", err, rec.Body.String())
+	}
+	if resp.Code != 0 {
+		t.Fatalf("信封 code = %d", resp.Code)
+	}
+	d := resp.Data
+	if d.DeviceID != "dev-a" || !d.Enable || !d.ForwardEnable || d.LANListenPort != 56441 {
+		t.Fatalf("标量字段不符: %+v", d)
+	}
+	if len(d.Peers) != 1 || d.Peers[0].DeviceID != "dev-b" || len(d.Peers[0].LANAddrs) != 1 {
+		t.Fatalf("peers = %+v", d.Peers)
+	}
+	if d.LANPeers == nil || len(d.LANPeers) != 0 {
+		t.Fatalf("未装配 beacon 时 lan_peers = %#v, want 空数组", d.LANPeers)
+	}
+}
+
+// TestMeshStatusHandlerUnconfiguredDefaults 未配置 mesh 层的合法态:总开关
+// EffectiveEnabled(nil=默认开)、forward_enable 默认关、peers/lan_peers 空数组、
+// lan 端口 0(未装配)——离线面板拿空表现状,不 5xx。
+func TestMeshStatusHandlerUnconfiguredDefaults(t *testing.T) {
+	h := &MeshHandler{
+		beacon:   func() *lanbeacon.Beacon { return nil },
+		config:   func() *config.Config { return nil },
+		deviceID: func() string { return "" },
+		lanPort:  func() int { return 0 },
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/mesh/status", nil)
+	rec := httptest.NewRecorder()
+	h.HandleStatus(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code = %d, want 200", rec.Code)
+	}
+	var resp struct {
+		Data struct {
+			Enable        bool              `json:"enable"`
+			ForwardEnable bool              `json:"forward_enable"`
+			LANListenPort int               `json:"lan_listen_port"`
+			Peers         []config.MeshPeer `json:"peers"`
+			LANPeers      []interface{}     `json:"lan_peers"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !resp.Data.Enable || resp.Data.ForwardEnable || resp.Data.LANListenPort != 0 {
+		t.Fatalf("未配置默认值不符: %+v", resp.Data)
+	}
+	if resp.Data.Peers == nil || len(resp.Data.Peers) != 0 {
+		t.Fatalf("peers = %#v, want 空数组", resp.Data.Peers)
+	}
+	if resp.Data.LANPeers == nil {
+		t.Fatal("lan_peers 为 null, want 空数组")
+	}
+}
+
+// TestMeshStatusHandlerMethodNotAllowed 非 GET 405。
+func TestMeshStatusHandlerMethodNotAllowed(t *testing.T) {
+	h := NewMeshHandler()
+	req := httptest.NewRequest(http.MethodPost, "/api/mesh/status", nil)
+	rec := httptest.NewRecorder()
+	h.HandleStatus(rec, req)
+	if rec.Code != 405 {
+		t.Fatalf("POST code = %d, want 405", rec.Code)
+	}
+}

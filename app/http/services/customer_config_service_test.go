@@ -750,6 +750,23 @@ func TestValidateEditableCustomerKeysAllowsPeerMCP(t *testing.T) {
 	}
 }
 
+// mesh 必须在可编辑白名单里,否则保存 400;拒绝文案须含更新后的字段清单
+// (改一处必改三处的第三处,见 customer_config_service.go validateEditableCustomerKeys 注释)。
+func TestValidateEditableCustomerKeysAllowsMesh(t *testing.T) {
+	raw := map[string]json.RawMessage{
+		"mesh": json.RawMessage(`{"peers":[{"device_id":"dev-b"}]}`),
+	}
+	if err := validateEditableCustomerKeys(raw); err != nil {
+		t.Fatalf("mesh 应放行, got %v", err)
+	}
+	err := validateEditableCustomerKeys(map[string]json.RawMessage{
+		"no_such_key": json.RawMessage(`{}`),
+	})
+	if err == nil || !strings.Contains(err.Error(), "mesh") {
+		t.Errorf("拒绝文案应含更新后的字段清单, got %v", err)
+	}
+}
+
 // 保存通道 400:agentcore_llm 远端+无 key 必须在保存时被 Config.Validate 拒绝,
 // 不能出现「保存成功、回合时静默整层关闭」的形态。
 func TestSaveCustomerConfigRejectsAgentCoreLLMRemoteNoKey(t *testing.T) {

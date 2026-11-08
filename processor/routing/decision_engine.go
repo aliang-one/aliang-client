@@ -126,6 +126,12 @@ func resolveSnapshotAction(snapshot *RuntimeSnapshot, action SnapshotAction) Rou
 	case SnapshotActionDeny:
 		return RouteDeny
 	default:
+		// mesh 转发目标 toNode:<deviceID> 整串透传为 RouteDecision
+		// (RouteDecision 本就是 string 类型)——由 mesh 出口按 deviceID
+		// 建立转发通道的消费方解析, 非 mesh 的未知动作照旧落 direct。
+		if strings.HasPrefix(string(resolved), SnapshotTargetMeshPrefix) {
+			return RouteDecision(resolved)
+		}
 		return RouteDirect
 	}
 }
@@ -141,7 +147,10 @@ func isSnapshotActionAvailable(action SnapshotAction, capabilities SnapshotBranc
 	case SnapshotActionDeny:
 		return true
 	default:
-		return false
+		// mesh 转发目标 toNode:<deviceID>:能力已在编译期把关
+		// (mesh 总开关 + peer 存在, 见 snapshot.go meshForwardAvailable),
+		// 决策期视为 available——快照随配置变更即重编译, 不存在能力漂移窗口。
+		return strings.HasPrefix(string(action), SnapshotTargetMeshPrefix)
 	}
 }
 
@@ -175,6 +184,12 @@ func checkRuleBySnapshot(rule SnapshotRule, ctx *MatchContext) bool {
 		return matchIP(rule.Condition(), ctx.IP)
 	case string(model.RuleTypeGeoIP):
 		return matchGeoIP(rule.Condition(), ctx.IP)
+	case snapshotRuleTypeDNS:
+		// DNS 代转发规则(design §9.3)不参与连接级决策:一律不命中。
+		// DNS 代转发目标由 Task 8 的 meshDNSForwardTarget 直接扫快照规则
+		// 取首条启用项,不走 DecideRouteFromSnapshot;此处显式分支仅为
+		// 吞掉已知类型,避免 default 分支的 Unknown rule type 告警风暴。
+		return false
 	default:
 		logger.Warn(fmt.Sprintf("Unknown rule type: %s", rule.Type()))
 		return false

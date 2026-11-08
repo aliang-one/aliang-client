@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"sync"
 	"time"
 
 	"aliang.one/nursorgate/common/logger"
@@ -71,6 +72,12 @@ type WrappedConn struct {
 	Buf               []byte // Buffered data from initial read (TLS ClientHello)
 	readOffset        int    // Current position in buffer
 	passThroughLogged bool
+
+	// mu 保护 Buf/readOffset/passThroughLogged:relayStream 的读侧(排空 Buf)
+	// 与另一方向的 stream_start 诊断日志(ConnectionDiagnosticString)并发
+	// 访问同一 WrappedConn(-race 实测,Task 13 集成测试首次全链驱动抓到)。
+	// 仅覆盖字段存取,底层 Conn.Read 不持锁(防诊断侧被网络读阻塞)。
+	mu sync.Mutex
 }
 
 // Read implements net.Conn.Read with buffer support.
@@ -81,6 +88,7 @@ func (w *WrappedConn) Read(p []byte) (int, error) {
 		return 0, net.ErrClosed
 	}
 
+	w.mu.Lock()
 	// If we have buffered data, serve that first
 	if len(w.Buf) > w.readOffset {
 		n := copy(p, w.Buf[w.readOffset:])
@@ -89,15 +97,19 @@ func (w *WrappedConn) Read(p []byte) (int, error) {
 			w.Buf = nil
 			w.readOffset = 0
 		}
+		w.mu.Unlock()
 		return n, nil
 	}
-	if !w.passThroughLogged {
-		w.passThroughLogged = true
+	passThrough := !w.passThroughLogged
+	w.passThroughLogged = true
+	bufLen, consumed := len(w.Buf), w.readOffset
+	w.mu.Unlock()
+	if passThrough {
 		logger.Debug(fmt.Sprintf(
 			"[WRAPPED CONN] passthrough begin underlying_type=%T buffered=%d consumed=%d local=%v remote=%v",
 			w.Conn,
-			len(w.Buf),
-			w.readOffset,
+			bufLen,
+			consumed,
 			w.LocalAddr(),
 			w.RemoteAddr(),
 		))
@@ -183,12 +195,16 @@ func (w *WrappedConn) ConnectionDiagnosticString() string {
 	_, canCloseRead := any(w).(interface{ CloseRead() error })
 	_, canCloseWrite := any(w).(interface{ CloseWrite() error })
 
+	w.mu.Lock()
+	bufLen, readOffset := len(w.Buf), w.readOffset
+	w.mu.Unlock()
+
 	return fmt.Sprintf(
 		"type=%T wrapped=true underlying=%T buf=%d read_offset=%d can_close_read=%t can_close_write=%t",
 		w,
 		w.Conn,
-		len(w.Buf),
-		w.readOffset,
+		bufLen,
+		readOffset,
 		canCloseRead,
 		canCloseWrite,
 	)

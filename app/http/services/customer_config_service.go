@@ -109,6 +109,13 @@ func (s *CustomerConfigService) UpdateCommittedCustomerConfig(payload []byte) (*
 		return nil, &CustomerConfigValidationError{err: err}
 	}
 
+	// mesh 自指拒绝(spec §3.4/§7 层0):config 层拿不到本机 device_id(反向
+	// 依赖会成环),由提交路径显式校验——把自己列为 peers 目标 = 1 跳自环,
+	// 保存期直接拒。device_id 为空(未注册首启)时 ValidateMesh 自行跳过。
+	if err := nextCfg.ValidateMesh(currentAgentDeviceIDForNotify()); err != nil {
+		return nil, &CustomerConfigValidationError{err: err}
+	}
+
 	nextCfgRaw, err := json.Marshal(nextCfg)
 	if err != nil {
 		return nil, fmt.Errorf("marshal validated config: %w", err)
@@ -380,7 +387,7 @@ func normalizeCustomerPayload(payload []byte) (map[string]interface{}, error) {
 				forbidden = append(forbidden, key)
 			}
 			sort.Strings(forbidden)
-			return nil, fmt.Errorf("customer.%s is forbidden: editable customer fields are [proxy ai_rules proxy_rules traffic_mirror http1_drop model_mapping custom_env_vars geoip agentcore_llm agentcore peer_mcp]", forbidden[0])
+			return nil, fmt.Errorf("customer.%s is forbidden: editable customer fields are [proxy ai_rules proxy_rules traffic_mirror http1_drop model_mapping custom_env_vars geoip agentcore_llm agentcore peer_mcp mesh]", forbidden[0])
 		}
 		rawRoot = map[string]json.RawMessage{}
 		if err := json.Unmarshal(rawCustomer, &rawRoot); err != nil {
@@ -408,9 +415,9 @@ func validateEditableCustomerKeys(rawRoot map[string]json.RawMessage) error {
 	for key := range rawRoot {
 		// 字段清单与 processor/config/types.go customerUnknownKeyErrors 的文案逐字同步,改一处必改三处(两 switch + 三文案)。
 		switch key {
-		case "proxy", "ai_rules", "proxy_rules", "traffic_mirror", "http1_drop", "model_mapping", "custom_env_vars", "geoip", "agentcore_llm", "agentcore", "peer_mcp":
+		case "proxy", "ai_rules", "proxy_rules", "traffic_mirror", "http1_drop", "model_mapping", "custom_env_vars", "geoip", "agentcore_llm", "agentcore", "peer_mcp", "mesh":
 		default:
-			return fmt.Errorf("customer.%s is forbidden: editable customer fields are [proxy ai_rules proxy_rules traffic_mirror http1_drop model_mapping custom_env_vars geoip agentcore_llm agentcore peer_mcp]", key)
+			return fmt.Errorf("customer.%s is forbidden: editable customer fields are [proxy ai_rules proxy_rules traffic_mirror http1_drop model_mapping custom_env_vars geoip agentcore_llm agentcore peer_mcp mesh]", key)
 		}
 	}
 	return nil

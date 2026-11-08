@@ -16,6 +16,7 @@ const (
 	ShadowTLS
 	Socks5
 	SSH
+	Mesh
 )
 
 type Proto uint8
@@ -42,6 +43,8 @@ func (proto Proto) String() string {
 		return "socks5"
 	case SSH:
 		return "ssh"
+	case Mesh:
+		return "mesh"
 
 	default:
 		return fmt.Sprintf("proto(%d)", proto)

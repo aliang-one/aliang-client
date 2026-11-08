@@ -36,6 +36,7 @@ func (s *AgentService) configureTunnel(msg map[string]interface{}, writeJSON fun
 	status, changed, err := s.tunnel.Configure(tunnel.Config{
 		DeviceID:            deviceID,
 		PikoUpstreamURL:     remoteString(msg, "piko_upstream_url"),
+		PikoProxyURL:        remoteString(msg, "piko_proxy_url"),
 		TunnelToken:         remoteString(msg, "tunnel_token"),
 		RoutePublicKey:      remoteString(msg, "route_public_key"),
 		ExpiresAt:           expiresAt,

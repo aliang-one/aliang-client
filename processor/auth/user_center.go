@@ -12,6 +12,7 @@ import (
 
 	"aliang.one/nursorgate/common/logger"
 	"aliang.one/nursorgate/processor/config"
+	"aliang.one/nursorgate/processor/egress"
 )
 
 type UserProfile struct {
@@ -151,7 +152,7 @@ func callAuthenticatedAPI(method, endpoint, accessToken string, body any) ([]byt
 	req.Header.Set("Accept", "application/json")
 	applyEndpointSpecificHeaders(req)
 
-	client := &http.Client{Timeout: apiTimeout}
+	client := egress.PlatformClient(apiTimeout)
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send request: %w", err)
