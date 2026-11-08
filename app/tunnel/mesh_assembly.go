@@ -51,6 +51,8 @@ const meshLANPollInterval = 5 * time.Second
 // 立、会话未终结);failed/stopped/从未配置 → false。离线信号语义
 // (true=平台不可达)即 !TunnelSessionActive():connecting 期计在线是保守
 // 取向——半建立的会话不触发兜底/改道翻搅,真失败会很快落到 failed 翻真。
+// Configure 续期窗口(cancel 置 nil 到新 cancel 落位,最长 10s)内信号瞬时
+// 翻真属预期——隧道确实不在,有界自愈。
 func (m *Manager) TunnelSessionActive() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -147,7 +149,6 @@ func startMeshLANAssembly(deviceID func() string, interval time.Duration, beacon
 	meshLAN.beaconPort = beaconPort
 	meshLAN.stop = make(chan struct{})
 	stop := meshLAN.stop
-	interval = meshLAN.interval
 	meshLAN.mu.Unlock()
 
 	reconcileMeshLAN(deviceID)
