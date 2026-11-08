@@ -1,6 +1,7 @@
 package outbound
 
 import (
+	"strings"
 	"testing"
 
 	"aliang.one/nursorgate/outbound/proxy/proto"
@@ -136,6 +137,120 @@ func TestRegistryRefreshAliangReplacesExistingEntry(t *testing.T) {
 	}
 	if got := nextProxy.Addr(); got != "15.nat0.cn:16749" {
 		t.Fatalf("next aliang addr = %q, want 15.nat0.cn:16749", got)
+	}
+}
+
+func TestRegistryRefreshCustomerProxy_SSH(t *testing.T) {
+	registry := GetRegistry()
+	registry.Clear()
+	defer registry.Clear()
+
+	cfg := &config.Config{Customer: &config.CustomerConfig{
+		Proxy: &config.CustomerProxyConfig{
+			Enable: boolPtr(true), Type: "ssh",
+			Server: "127.0.0.1:2222", Username: "u", Password: "p", PoolSize: 2,
+		},
+	}}
+	if err := registry.RefreshCustomerProxy(cfg); err != nil {
+		t.Fatalf("RefreshCustomerProxy ssh: %v", err)
+	}
+	p, err := registry.Get("ssh")
+	if err != nil {
+		t.Fatalf("Get(ssh): %v", err)
+	}
+	if got := p.Proto(); got != proto.SSH {
+		t.Fatalf("ssh proxy proto = %s, want %s", got, proto.SSH)
+	}
+	if got := p.Addr(); got != "127.0.0.1:2222" {
+		t.Fatalf("ssh proxy addr = %q, want 127.0.0.1:2222", got)
+	}
+
+	registry.UnregisterCustomerProxies()
+	if _, err := registry.Get("ssh"); err == nil {
+		t.Fatal("ssh entry must be unregistered")
+	}
+}
+
+// TestRegistryRefreshCustomerProxy_SSHMissingAuthRejected 锁定缺认证的拦截层:
+// 解析层(EffectiveSSHProxy)只拆 server 串不校验认证;密码与私钥皆空的配置
+// 由 registry 分支里的 SSHProxyConfig.Validate 拦下。失败刷新还需把陈旧的
+// ssh 条目清干净(Unregister 先于 Register 的既有语义)。
+func TestRegistryRefreshCustomerProxy_SSHMissingAuthRejected(t *testing.T) {
+	registry := GetRegistry()
+	registry.Clear()
+	defer registry.Clear()
+
+	valid := &config.Config{Customer: &config.CustomerConfig{
+		Proxy: &config.CustomerProxyConfig{
+			Enable: boolPtr(true), Type: "ssh",
+			Server: "127.0.0.1:2222", Username: "u", Password: "p",
+		},
+	}}
+	if err := registry.RefreshCustomerProxy(valid); err != nil {
+		t.Fatalf("RefreshCustomerProxy(valid ssh) error = %v", err)
+	}
+
+	bad := &config.Config{Customer: &config.CustomerConfig{
+		Proxy: &config.CustomerProxyConfig{
+			Enable: boolPtr(true), Type: "ssh",
+			Server: "127.0.0.1:2223", Username: "u",
+			// Password 与 PrivateKey 均空
+		},
+	}}
+	err := registry.RefreshCustomerProxy(bad)
+	if err == nil {
+		t.Fatal("RefreshCustomerProxy(ssh without auth) error = nil, want rejection")
+	}
+	if !strings.Contains(err.Error(), "password or private_key") {
+		t.Fatalf("RefreshCustomerProxy(ssh without auth) error = %v, want registry-layer Validate rejection (password or private_key)", err)
+	}
+	if _, err := registry.Get("ssh"); err == nil {
+		t.Fatal("stale ssh entry must be removed after failed refresh")
+	}
+}
+
+func TestRegistryRefreshCustomerProxy_SSHWithJumps(t *testing.T) {
+	registry := GetRegistry()
+	registry.Clear()
+	defer registry.Clear()
+
+	cfg := &config.Config{Customer: &config.CustomerConfig{
+		Proxy: &config.CustomerProxyConfig{
+			Enable: boolPtr(true), Type: "ssh",
+			Server: "127.0.0.1:2222", Username: "u", Password: "p", PoolSize: 2,
+			JumpServers: []config.SSHJumpServerRaw{
+				{Server: "10.0.0.1:2201", Username: "hop", Password: "hp"},
+			},
+		},
+	}}
+	if err := registry.RefreshCustomerProxy(cfg); err != nil {
+		t.Fatalf("RefreshCustomerProxy ssh+jump: %v", err)
+	}
+	p, err := registry.Get("ssh")
+	if err != nil {
+		t.Fatalf("Get(ssh): %v", err)
+	}
+	// Addr 契约:注册地址是终点(跳板组装进 outbound,不体现在 Addr)。
+	if got := p.Addr(); got != "127.0.0.1:2222" {
+		t.Fatalf("ssh proxy addr = %q, want final endpoint 127.0.0.1:2222", got)
+	}
+	if got := p.Proto(); got != proto.SSH {
+		t.Fatalf("ssh proxy proto = %s, want %s", got, proto.SSH)
+	}
+
+	// 类型切换也要把 ssh 条目清掉:UnregisterCustomerProxies 的 ssh delete
+	// 不只在显式调用时生效,刷新路径同样经过它。
+	switchCfg := &config.Config{Customer: &config.CustomerConfig{
+		Proxy: &config.CustomerProxyConfig{
+			Enable: boolPtr(true), Type: "socks5",
+			Server: "182.138.136.39:27751",
+		},
+	}}
+	if err := registry.RefreshCustomerProxy(switchCfg); err != nil {
+		t.Fatalf("RefreshCustomerProxy(socks5) error = %v", err)
+	}
+	if _, err := registry.Get("ssh"); err == nil {
+		t.Fatal("registry.Get(\"ssh\") error = nil, want ssh removed after type switch")
 	}
 }
 
