@@ -373,3 +373,41 @@ func TestMeshFormBadHeaderLineDisconnects(t *testing.T) {
 		})
 	}
 }
+
+// TestMeshFormHopsBelowCapPasses 正向边界:hops=MeshHopsHardCap-1(最大
+// 合法已转发跳数)必须放行并注入——帽判据是入帧 hops>=cap,AppendHop 后
+// 帧内 Hops=cap 属正常续传值(再下一跳才被拒)。
+func TestMeshFormHopsBelowCapPasses(t *testing.T) {
+	metaCh := make(chan *M.Metadata, 1)
+	frameMetaCh := make(chan *IngressFrameMeta, 1)
+	swapTCPHandler(t, func(ctx context.Context, conn net.Conn, metadata *M.Metadata) error {
+		metaCh <- metadata
+		if fm, ok := ctx.Value(ContextKeyIngressFrameMeta).(*IngressFrameMeta); ok {
+			frameMetaCh <- fm
+		}
+		_, _ = io.Copy(io.Discard, conn)
+		return nil
+	})
+	meshPub, meshSigner := newTestKey(t)
+	_, addr := startTestServer(t, RunConfig{
+		MeshKeys:    []gossh.PublicKey{meshPub},
+		LocalNodeID: func() string { return "node-b" },
+	})
+	ch := openMeshChannel(t, addr, meshSigner)
+	if _, err := ch.Write(meshFrameLine("node-a", "self", "example.org:443", []string{"node-a"}, MeshHopsHardCap-1)); err != nil {
+		t.Fatalf("write frame: %v", err)
+	}
+	select {
+	case <-metaCh:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("hops=%d (MeshHopsHardCap-1) is the max legal value and must be injected", MeshHopsHardCap-1)
+	}
+	select {
+	case fm := <-frameMetaCh:
+		if fm.Hops != MeshHopsHardCap {
+			t.Fatalf("post-AppendHop Hops = %d, want %d", fm.Hops, MeshHopsHardCap)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("frame meta must be observable on the handler ctx")
+	}
+}

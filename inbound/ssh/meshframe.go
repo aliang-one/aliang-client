@@ -17,7 +17,9 @@ import (
 )
 
 // MeshHopsHardCap 是转发跳数硬上限(防环层 2 数值保险,design §7:
-// 默认 5/上限 8)。合并时与 mesh 分支的 meshproto.MaxHopsCap 对齐(同值)。
+// 默认 5/上限 8)。与 mesh 分支同值的 meshproto.MaxHopsCap 对齐;注意
+// 键名差异(本实现 MeshHopsHardCap / mesh 分支 MaxHopsCap)——合并统一
+// 时二选一改名。
 const MeshHopsHardCap = 8
 
 // meshFrameHeaderLimit 界定帧头首行最大长度(64KB):跳数帽下合法帧头远

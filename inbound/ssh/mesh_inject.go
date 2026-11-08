@@ -21,7 +21,9 @@ import (
 )
 
 // mesh 拒帧错误行码表(窄且稳定,不回写内部细节——对端实现/节点身份
-// 不泄漏;与 mesh 分支 B 侧「错误回源」语义一致:一行 JSON 错误后关流)。
+// 不泄漏)。语义与 mesh 分支 B 侧「错误回源」一致(一行错误行后关流),
+// 但线格式不同:本实现回写一行 JSON 码(如 {"err":"loop"});mesh 分支
+// 的 writeMeshRejectLine 是纯文本行——合并统一时二选一。
 const (
 	meshErrLoop            = "loop"
 	meshErrForwardDisabled = "forward-disabled"
