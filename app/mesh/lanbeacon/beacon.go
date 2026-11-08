@@ -139,6 +139,13 @@ func (b *Beacon) Start(ctx context.Context) error {
 	b.started = true
 	go b.broadcastLoop(runCtx)
 	go b.readLoop(b.listenConn)
+	// ctx 全生命周期收口:父 ctx 取消而调用方未调 Stop 时,监听 conn 由
+	// 这里代为关闭,readLoop 不泄漏。Stop 幂等(mu 内 started 位防重入),
+	// 本 watcher 与显式 Stop 任意先后皆收敛为同一次收摊。
+	go func() {
+		<-runCtx.Done()
+		b.Stop()
+	}()
 	return nil
 }
 

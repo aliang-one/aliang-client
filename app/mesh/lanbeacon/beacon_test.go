@@ -3,6 +3,7 @@ package lanbeacon
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"testing"
 	"time"
@@ -169,9 +170,10 @@ func TestBeaconIgnoresForeignPayload(t *testing.T) {
 		},
 	}
 	for name, send := range cases {
-		send()
-		assertStaysEmpty(t, b, 250*time.Millisecond)
-		_ = name
+		t.Run(name, func(t *testing.T) {
+			send()
+			assertStaysEmpty(t, b, 250*time.Millisecond)
+		})
 	}
 }
 
@@ -230,6 +232,69 @@ func TestCandidatesNilBeaconEmpty(t *testing.T) {
 	if got == nil || len(got) != 0 {
 		t.Fatalf("nil beacon Candidates() = %#v, want 空数组", got)
 	}
+}
+
+// TestBeaconCapacityEviction 候选容量上限 64:第 65 个不同 device_id 到达时
+// 淘汰最陈旧(首个);直调 ingest,确定性无 UDP 时序。arrival 用递增时钟
+// 使「最陈旧」可判定,ts 跟随同一时钟保持 age=0 不触超龄。
+func TestBeaconCapacityEviction(t *testing.T) {
+	b := NewBeacon("self-dev", 56441, 56440)
+	base := time.Now()
+	for i := 0; i <= beaconMaxCandidates; i++ {
+		now := base.Add(time.Duration(i) * 10 * time.Millisecond)
+		data, err := json.Marshal(beaconPayload{
+			DeviceID: fmt.Sprintf("dev-%02d", i),
+			MeshPort: 41000 + i,
+			TS:       now.Unix(),
+		})
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		b.ingest(data, now)
+	}
+	cands := b.Candidates()
+	if len(cands) != beaconMaxCandidates {
+		t.Fatalf("候选数 = %d, want %d(容量上限)", len(cands), beaconMaxCandidates)
+	}
+	var hasFirst, hasLast bool
+	for _, c := range cands {
+		if c.DeviceID == "dev-00" {
+			hasFirst = true
+		}
+		if c.DeviceID == fmt.Sprintf("dev-%02d", beaconMaxCandidates) {
+			hasLast = true
+		}
+	}
+	if hasFirst {
+		t.Fatal("dev-00(arrival 最陈旧)应被淘汰")
+	}
+	if !hasLast {
+		t.Fatal("最新候选 dev-64 应在列")
+	}
+}
+
+// TestBeaconRestartResume Stop→再 Start 往返:对端候选随停播 TTL 过期消失,
+// 复启(立即首播)后恢复——总开关往复是生产唯一触发路径,Task 14 生命周期
+// 接线依赖此契约。
+func TestBeaconRestartResume(t *testing.T) {
+	a, b := startBeaconPair(t, func(a, b *Beacon) {
+		b.dedupTTL = 400 * time.Millisecond
+	})
+	poll(t, 4*time.Second, "初次互见:B 应看到 dev-a", func() bool {
+		return hasCandidate(b, "dev-a", 41001)
+	})
+
+	a.Stop()
+	poll(t, 3*time.Second, "停播后 dev-a 应过期消失", func() bool {
+		return !hasCandidate(b, "dev-a", 41001)
+	})
+
+	if err := a.Start(context.Background()); err != nil {
+		t.Fatalf("复启: %v", err)
+	}
+	poll(t, 4*time.Second, "复启后 B 应重新看到 dev-a", func() bool {
+		return hasCandidate(b, "dev-a", 41001)
+	})
 }
 
 // TestDefaultSwapAndClear 进程级默认实例的注册/清空(Task 14 生命周期接线
