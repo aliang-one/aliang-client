@@ -82,15 +82,6 @@ func dialIngress(t *testing.T, addr string, authMethods ...gossh.AuthMethod) (go
 	return conn, err
 }
 
-// directTCPIPMsgMirror 与 RFC 4254 §7.2 direct-tcpip 负载同构
-// (出口侧 sshtest 先例;channel.go 解析在 Task 4 落地)。
-type directTCPIPMsgMirror struct {
-	Addr       string
-	Port       uint32
-	OriginAddr string
-	OriginPort uint32
-}
-
 func TestSSHIngressStartStopIsRunning(t *testing.T) {
 	humanPub, _ := newTestKey(t)
 	s := NewServer(RunConfig{AuthorizedKeys: []gossh.PublicKey{humanPub}}, filepath.Join(t.TempDir(), "k"))
@@ -279,7 +270,7 @@ func TestSSHIngressRejectsNonDirectTCPIPChannels(t *testing.T) {
 	}
 	// direct-tcpip 是唯一放行通道:Accept 后(Task 2 边界)drain+close,
 	// 客户端半关后读到 EOF。
-	payload := gossh.Marshal(directTCPIPMsgMirror{Addr: "127.0.0.1", Port: 9, OriginAddr: "127.0.0.1", OriginPort: 0})
+	payload := gossh.Marshal(directTCPIPMsg{Addr: "127.0.0.1", Port: 9, OriginAddr: "127.0.0.1", OriginPort: 0})
 	ch, _, err := conn.OpenChannel(channelDirectTCPIP, payload)
 	if err != nil {
 		t.Fatalf("direct-tcpip open: %v", err)
@@ -324,7 +315,7 @@ func TestAuthHumanKeyMarksBareForm(t *testing.T) {
 	if err != nil {
 		t.Fatalf("human key must authenticate: %v", err)
 	}
-	payload := gossh.Marshal(directTCPIPMsgMirror{Addr: "127.0.0.1", Port: 9, OriginAddr: "127.0.0.1", OriginPort: 0})
+	payload := gossh.Marshal(directTCPIPMsg{Addr: "127.0.0.1", Port: 9, OriginAddr: "127.0.0.1", OriginPort: 0})
 	if _, _, err := conn.OpenChannel(channelDirectTCPIP, payload); err != nil {
 		t.Fatalf("direct-tcpip open: %v", err)
 	}
@@ -345,7 +336,7 @@ func TestAuthMeshKeyMarksMeshForm(t *testing.T) {
 	if err != nil {
 		t.Fatalf("mesh key must authenticate: %v", err)
 	}
-	payload := gossh.Marshal(directTCPIPMsgMirror{Addr: "127.0.0.1", Port: 9, OriginAddr: "127.0.0.1", OriginPort: 0})
+	payload := gossh.Marshal(directTCPIPMsg{Addr: "127.0.0.1", Port: 9, OriginAddr: "127.0.0.1", OriginPort: 0})
 	if _, _, err := conn.OpenChannel(channelDirectTCPIP, payload); err != nil {
 		t.Fatalf("direct-tcpip open: %v", err)
 	}
@@ -387,7 +378,7 @@ func TestAuthDualListedKeyMeshWinsAtRuntime(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dual-listed key must authenticate: %v", err)
 	}
-	payload := gossh.Marshal(directTCPIPMsgMirror{Addr: "example.com", Port: 443, OriginAddr: "127.0.0.1", OriginPort: 0})
+	payload := gossh.Marshal(directTCPIPMsg{Addr: "example.com", Port: 443, OriginAddr: "127.0.0.1", OriginPort: 0})
 	if _, _, err := conn.OpenChannel(channelDirectTCPIP, payload); err != nil {
 		t.Fatalf("direct-tcpip open: %v", err)
 	}
