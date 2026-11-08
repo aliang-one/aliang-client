@@ -190,7 +190,7 @@ func TestSSHIngressReconcileStartFailureDoesNotBlockCommit(t *testing.T) {
 // 混合列表按好部分继续跑;全量解析失败返回 nil(调用方按期望停处理)。
 func TestBuildSSHIngressRunConfigUnparseableKeyDefense(t *testing.T) {
 	if rc := buildSSHIngressRunConfig(&config.SSHIngressConfig{
-		Port:               56441,
+		Port:               config.SSHIngressDefaultPort,
 		AuthorizedKeys:     []string{"not-a-key", "also not a key"},
 		MeshAuthorizedKeys: []string{"still not a key"},
 	}); rc != nil {
@@ -199,7 +199,7 @@ func TestBuildSSHIngressRunConfigUnparseableKeyDefense(t *testing.T) {
 
 	keyLine, _ := newSSHIngressTestKey(t)
 	rc := buildSSHIngressRunConfig(&config.SSHIngressConfig{
-		Port:               56441,
+		Port:               config.SSHIngressDefaultPort,
 		AuthorizedKeys:     []string{"not-a-key", keyLine},
 		MeshAuthorizedKeys: []string{keyLine},
 	})
@@ -209,8 +209,8 @@ func TestBuildSSHIngressRunConfigUnparseableKeyDefense(t *testing.T) {
 	if len(rc.AuthorizedKeys) != 1 || len(rc.MeshKeys) != 1 {
 		t.Fatalf("unparseable lines must be skipped: authorized=%d mesh=%d, want 1/1", len(rc.AuthorizedKeys), len(rc.MeshKeys))
 	}
-	if rc.Port != 56441 {
-		t.Fatalf("port = %d, want 56441", rc.Port)
+	if rc.Port != config.SSHIngressDefaultPort {
+		t.Fatalf("port = %d, want %d", rc.Port, config.SSHIngressDefaultPort)
 	}
 	if rc.ForwardGate != nil {
 		t.Fatal("ForwardGate must stay nil (merge integration seam, see RunConfig comment)")

@@ -48,6 +48,7 @@ func TestCustomerConfigSSHIngressEditable(t *testing.T) {
 
 func TestEffectiveSSHIngress(t *testing.T) {
 	// nil/未启用 → nil;启用+合法载荷 → 归一化副本(port 默认 56441;公钥 trim;空行剔除)
+	// [合并前变更] 默认口已改 56442 避让 mesh LAN TCP 56441(见 spec §7 端口裁定),本文其余 56441 为历史记录
 }
 ```
 

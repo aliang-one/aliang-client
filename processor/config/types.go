@@ -785,13 +785,15 @@ func (c *Config) EffectivePeerMCPCodexEnabled() bool {
 	return c.effectivePeerMCPSub(c.Customer.PeerMCP.CodexEnabled)
 }
 
-// SSHIngressDefaultPort 是 SSH 入口的默认监听口(与启用段 56431-56433 避让,
-// 另避开 mesh 提案的 beacon UDP 56440)。
-const SSHIngressDefaultPort uint16 = 56441
+// SSHIngressDefaultPort 是 SSH 入口的默认监听口(与启用段 56431-56433 避让)。
+// 56442 而非 56441:mesh LAN 载体已定 TCP 56441(app/tunnel/mesh_assembly.go
+// DefaultMeshLANPort),双方同绑会先绑者赢、后到者静默降级——换口避让;
+// 另避开 mesh 提案的 beacon UDP 56440。未发布,零兼容负担。
+const SSHIngressDefaultPort uint16 = 56442
 
 // SSHIngressConfig 控制 SSH 入口服务面(customer.ssh_ingress)。
 // 双密钥准入:authorized_keys=人用凭证(裸流形态);mesh_authorized_keys=
-// 节点互连凭证(mesh 帧形态)。禁密码。端口默认 56441。
+// 节点互连凭证(mesh 帧形态)。禁密码。端口默认 56442。
 type SSHIngressConfig struct {
 	Enable             *bool    `json:"enable,omitempty"` // 三态:nil=false
 	Port               uint16   `json:"port,omitempty"`
@@ -815,7 +817,7 @@ func (c *SSHIngressConfig) IsEnabled() bool {
 // 两列表=形态歧义(裸流 vs mesh 帧),保存时拦——运行期 mesh 优先只是
 // 第二道防御(inbound/ssh),配置层先拒绝歧义本身。
 // port:uint16 类型上界即 65535,越界值(如 70000)在 JSON 反序列化层即被拒;
-// 0=未配,由 EffectiveSSHIngress 归一为默认 56441,因此这里没有端口分支。
+// 0=未配,由 EffectiveSSHIngress 归一为默认 56442,因此这里没有端口分支。
 func (c *SSHIngressConfig) Validate() error {
 	if c == nil || !c.IsEnabled() {
 		return nil
@@ -859,7 +861,7 @@ func validateSSHIngressKeyLines(field string, lines []string) error {
 }
 
 // EffectiveSSHIngress 返回 SSH 入口服务面的归一化运行副本;未配置/未启用
-// 返回 nil(服务保持关闭)。归一化:port 0→默认 56441;公钥逐条 TrimSpace、
+// 返回 nil(服务保持关闭)。归一化:port 0→默认 56442;公钥逐条 TrimSpace、
 // 剔空行;切片深拷贝,调用方改副本不影响配置原值。读取端不重复跑 Validate
 // (保存通道已拦;手改文件的坏值由 inbound/ssh 装配层的公钥解析兜底报错)。
 func (c *Config) EffectiveSSHIngress() *SSHIngressConfig {

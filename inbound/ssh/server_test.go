@@ -324,6 +324,43 @@ func TestSSHIngressGlobalRequests(t *testing.T) {
 	}
 }
 
+// TestSSHIngressHandshakeDeadlineCutsStalledConn 钉住握手 deadline:挂起
+// 客户端(连接后一个字节都不发)必须在 handshakeTimeout 内被服务端掐断。
+// 注入 250ms 短超时跑(生产值 15s,不实等);客户端读侧自设 3s 上限,
+// 若先撞自己的读超时(而非收到服务端 EOF)即判失败—— deadline 未生效。
+// 正常握手不受影响由既有认证/通道用例背书(它们在 15s 默认值下握手即过)。
+func TestSSHIngressHandshakeDeadlineCutsStalledConn(t *testing.T) {
+	defer func(d time.Duration) { handshakeTimeout = d }(handshakeTimeout)
+	handshakeTimeout = 250 * time.Millisecond
+
+	humanPub, _ := newTestKey(t)
+	_, addr := startTestServer(t, RunConfig{AuthorizedKeys: []gossh.PublicKey{humanPub}})
+
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	// 一个字节不发,等 deadline 到期后服务端关闭连接(客户端读到 EOF)。
+	// 服务端握手会先发自身 version banner,读循环丢弃它直到出错为止。
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	start := time.Now()
+	buf := make([]byte, 256)
+	var readErr error
+	for {
+		if _, readErr = conn.Read(buf); readErr != nil {
+			break
+		}
+	}
+	if ne, ok := readErr.(net.Error); ok && ne.Timeout() {
+		t.Fatalf("stalled conn outlived handshake deadline: client hit its own 3s read timeout after %v", time.Since(start))
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("conn cut too late: %v (want ~handshakeTimeout)", elapsed)
+	}
+}
+
 func TestAuthHumanKeyMarksBareForm(t *testing.T) {
 	// 打桩管线(swap 纪律同 inject_test.go):fire-and-forget 打开不触达
 	// 真实管线单例,免 Error 日志噪音。

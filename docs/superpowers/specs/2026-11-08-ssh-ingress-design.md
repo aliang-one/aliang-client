@@ -63,8 +63,8 @@ socks5/ssh 形态的入口。
 
 - `StartSSHIngress()/StopSSHIngress()/IsSSHIngressRunning()`(模式照
   `inbound/http/server.go` 的 Start/Stop/Is 三件套);
-- 监听口独立可配(默认 `56441`,与启用段 56431-56433 避让;另避开
-  mesh plan Task 10 提案的 beacon UDP 56440),总开关
+- 监听口独立可配(默认 `56442`,与启用段 56431-56433 避让;另避开
+  mesh LAN 载体 TCP 56441 与提案 beacon UDP 56440),总开关
   **默认关**;
 - host key:首启自动生成 ed25519,落
   `cache.GetCacheSubdir("ssh")/ingress_host_key`(与出口 known_hosts
@@ -141,7 +141,7 @@ mesh 帧语义,归类已保守)。
 ## §4 配置层
 
 - 新增 `customer.ssh_ingress`:
-  `{enable(默认 false), port(默认 56441), authorized_keys[](人用
+  `{enable(默认 false), port(默认 56442), authorized_keys[](人用
   公钥), mesh_authorized_keys[](mesh 互连公钥)}`;
 - `CustomerConfig` 加字段**追加在结构尾部**;可编辑面白名单
   (`validateCustomerEditableSurface` + customer_config_service 的
@@ -223,8 +223,11 @@ SSH 入口卡片(代理族下):
   ssh_known_hosts_handler.go 同族文件),host key 路径解析与
   inbound/ssh 同源(`cache.GetCacheSubdir("ssh")` 族)。
 
-**端口默认定 `56441`(TCP)**:mesh plan Task 10 提案 beacon 用
-UDP 56440,TCP/UDP 虽不硬撞,避开可省运维混淆;常量+可配。
+**端口默认定 `56442`(TCP)**:原定 56441,组网分支合入后其 mesh
+LAN 载体恰好绑 TCP 56441(mesh_assembly.go DefaultMeshLANPort),
+双方同绑时先绑者赢、后到者静默降级(SSH ingress reconcile 失败停服
+或 mesh 落随机口),未发布零兼容负担故换口;另避开提案 beacon
+UDP 56440。常量+可配。
 
 ## §8 冲突规避(worktree 策略,与组网分支并行)
 

@@ -199,7 +199,7 @@ function normalizeStringList(items) {
 // 先例）：SettingsPage 的 createDefaultCustomerConfig/normalizeCustomerConfig 链,与
 // SshIngressSettings.test.js。口径与后端 SSHIngressConfig 对齐：enable 三态指针
 // nil=false（读侧非布尔一律 false）;port uint16 上界 65535,0=未设（后端归一默认
-// 56441）,越界/非数读侧归 0,写侧由卡片 port 校验拦截。
+// 56442）,越界/非数读侧归 0,写侧由卡片 port 校验拦截。
 export function normalizeSSHIngressConfig(payload) {
   const source = payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : {};
   const rawPort = source.port;
@@ -311,7 +311,7 @@ export default {
       const normalized = normalizeSSHIngressConfig(config?.ssh_ingress);
       return {
         enabled: normalized.enable,
-        // 0 = 未设置：输入框显示空 + 「默认 56441」placeholder（pool_size 同款口径）
+        // 0 = 未设置：输入框显示空 + 「默认 56442」placeholder（pool_size 同款口径）
         portText: normalized.port > 0 ? String(normalized.port) : '',
         authorizedKeys: [...normalized.authorized_keys],
         meshKeys: [...normalized.mesh_authorized_keys]

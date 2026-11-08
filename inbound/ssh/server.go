@@ -27,6 +27,11 @@ import (
 // session/auth-agent@openssh.com/x11/forwarded-tcpip 等一律拒绝(安全收敛)。
 const channelDirectTCPIP = "direct-tcpip"
 
+// handshakeTimeout 约束单条入口连接的完整握手:version 协商+密钥交换+
+// 用户认证。var 而非 const 仅为测试注入短超时(默认值即生产值);取值与
+// 出口侧先例 outbound/proxy/ssh/chain.go handshakeTimeout 同款 15s。
+var handshakeTimeout = 15 * time.Second
+
 // IngressHostKeyFileName 是 host key 落盘文件名(cache/ssh/ 目录下)。导出供
 // 装配层(Task 7 reconcile)与 host key 指纹 API(ssh_ingress_handler 的
 // FromCache 构造)拼路径——编译器强制三方与 Server.Start 落盘同源,同出口侧
@@ -307,7 +312,13 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn, cfg *gossh.Serve
 		return
 	}
 
+	// 握手 deadline:NewServerConn 不吃任何超时配置,慢速/挂起的客户端
+	// 不允许无限占用连接——手动给 conn 设 deadline 让整段握手受
+	// handshakeTimeout 约束,握手完立即清除,不污染后续会话流量
+	// (先设后清,出口侧 chain.go 同款先例)。
+	_ = conn.SetDeadline(time.Now().Add(handshakeTimeout))
 	sconn, chans, reqs, err := gossh.NewServerConn(conn, cfg)
+	_ = conn.SetDeadline(time.Time{})
 	if err != nil {
 		// 认证失败的记账在 PublicKeyCallback 内完成,此处仅日志。
 		logger.Debug(fmt.Sprintf("SSH ingress handshake from %s failed: %v", ip, err))

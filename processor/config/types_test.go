@@ -1915,7 +1915,7 @@ func TestCustomerConfigSSHIngressEditableSurface(t *testing.T) {
 		"customer": {
 			"ssh_ingress": {
 				"enable": true,
-				"port": 56441,
+				"port": 56442,
 				"authorized_keys": ["` + keyLine + `"]
 			}
 		}
@@ -1986,7 +1986,7 @@ func TestConfigValidateSSHIngressWiring(t *testing.T) {
 }
 
 // EffectiveSSHIngress:未配置/未启用返回 nil;启用时返回归一化副本——
-// port 0→默认 56441、公钥逐条 TrimSpace、空行剔除;副本与原值切片隔离。
+// port 0→默认 56442、公钥逐条 TrimSpace、空行剔除;副本与原值切片隔离。
 func TestEffectiveSSHIngress(t *testing.T) {
 	enabled := true
 	keyLine := generateAuthorizedKeyLine(t)
@@ -2012,8 +2012,8 @@ func TestEffectiveSSHIngress(t *testing.T) {
 	if got == nil {
 		t.Fatal("EffectiveSSHIngress() = nil, want normalized copy")
 	}
-	if got.Port != 56441 {
-		t.Fatalf("Port = %d, want default 56441", got.Port)
+	if got.Port != SSHIngressDefaultPort {
+		t.Fatalf("Port = %d, want default %d", got.Port, SSHIngressDefaultPort)
 	}
 	if len(got.AuthorizedKeys) != 1 || got.AuthorizedKeys[0] != keyLine {
 		t.Fatalf("AuthorizedKeys = %#v, want trimmed single [%s]", got.AuthorizedKeys, keyLine)

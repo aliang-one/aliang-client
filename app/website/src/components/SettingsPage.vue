@@ -311,7 +311,7 @@ function createDefaultCustomerConfig() {
       api_key: ''
     },
     // SSH 入口服务面(customer.ssh_ingress;三态指针 nil=false,前端恒产出显式
-    // 布尔——nil 与 false 行为等价;port 0=后端归一默认 56441)
+    // 布尔——nil 与 false 行为等价;port 0=后端归一默认 56442)
     ssh_ingress: normalizeSSHIngressConfig()
   };
 }

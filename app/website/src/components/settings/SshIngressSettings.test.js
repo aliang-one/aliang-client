@@ -14,7 +14,7 @@ import zh from '../../i18n/zh';
 
 // —— normalizeSSHIngressConfig（线格式归一；SettingsPage 归一化链共用）——
 // 线格式 customer.ssh_ingress{enable,port,authorized_keys[],mesh_authorized_keys[]}；
-// 后端 enable 是三态指针 nil=false，port 0=默认 56441（uint16 上界 65535）。
+// 后端 enable 是三态指针 nil=false，port 0=默认 56442（uint16 上界 65535）。
 describe('SshIngressSettings normalizeSSHIngressConfig', () => {
   it('produces wire-format defaults for a missing section', () => {
     expect(normalizeSSHIngressConfig(undefined)).toEqual({
@@ -28,19 +28,19 @@ describe('SshIngressSettings normalizeSSHIngressConfig', () => {
   it('keeps valid values and normalizes the two key lists', () => {
     expect(normalizeSSHIngressConfig({
       enable: true,
-      port: 56441,
+      port: 56442,
       authorized_keys: ['ssh-ed25519 AAA key1', '  ', 'ssh-ed25519 BBB key2'],
       mesh_authorized_keys: 'not-a-list'
     })).toEqual({
       enable: true,
-      port: 56441,
+      port: 56442,
       authorized_keys: ['ssh-ed25519 AAA key1', 'ssh-ed25519 BBB key2'],
       mesh_authorized_keys: []
     });
   });
 
   it('maps non-boolean enable, non-number/outrange port and non-object payloads to defaults', () => {
-    expect(normalizeSSHIngressConfig({ enable: 'yes', port: '56441' })).toEqual({
+    expect(normalizeSSHIngressConfig({ enable: 'yes', port: '56442' })).toEqual({
       enable: false,
       port: 0,
       authorized_keys: [],
@@ -62,7 +62,7 @@ describe('SettingsPage buildCustomerSavePatch（ssh_ingress 透传链）', () =>
     const current = {
       proxy: { enable: true, type: 'socks5', server: 'old:1080' },
       model_mapping: { enable: true, rules: { 'gpt-4': 'glm-4' } },
-      ssh_ingress: { enable: true, port: 56441, authorized_keys: [HUMAN_KEY], mesh_authorized_keys: [MESH_KEY] }
+      ssh_ingress: { enable: true, port: 56442, authorized_keys: [HUMAN_KEY], mesh_authorized_keys: [MESH_KEY] }
     };
     const patch = buildCustomerSavePatch(
       { proxy: { enable: true, type: 'ssh', server: 'new:22' }, ai_rules: {}, proxy_rules: [] },
@@ -101,7 +101,7 @@ describe('SettingsPage buildCustomerSavePatch（ssh_ingress 透传链）', () =>
 
   it('GET 回显值原样透传不产生伪 diff（无改动 → 无 patch,不发 POST）', () => {
     const current = {
-      ssh_ingress: { enable: true, port: 56441, authorized_keys: [HUMAN_KEY], mesh_authorized_keys: [MESH_KEY] }
+      ssh_ingress: { enable: true, port: 56442, authorized_keys: [HUMAN_KEY], mesh_authorized_keys: [MESH_KEY] }
     };
     const same = buildCustomerSavePatch(
       { ...current, ssh_ingress: { ...current.ssh_ingress } },
@@ -341,7 +341,7 @@ describe('SshIngressSettings 卡片', () => {
     expect(saved).toHaveLength(0);
   });
 
-  it('提交载荷：整配置透传 + ssh_ingress 四字段；端口空发 0（后端归一 56441）', async () => {
+  it('提交载荷：整配置透传 + ssh_ingress 四字段；端口空发 0（后端归一 56442）', async () => {
     const { el, saved } = mountCard(baseConfig());
     await flush();
     setToggle(el, 'sshIngressEnable', true);
@@ -372,7 +372,7 @@ describe('SshIngressSettings 卡片', () => {
   it('置零：关闭开关载荷 enable:false 且其余字段照发（enable=false 时后端跳过钥匙校验）', async () => {
     const { el, saved } = mountCard(baseConfig({
       enable: true,
-      port: 56441,
+      port: 56442,
       authorized_keys: [HUMAN_KEY],
       mesh_authorized_keys: [MESH_KEY]
     }));
@@ -394,13 +394,13 @@ describe('SshIngressSettings 卡片', () => {
   it('回显：开关/端口/人用公钥/mesh 公钥从配置回填；mesh 行只读无删除钮', async () => {
     const { el } = mountCard(baseConfig({
       enable: true,
-      port: 56441,
+      port: 56442,
       authorized_keys: [HUMAN_KEY],
       mesh_authorized_keys: [MESH_KEY]
     }));
     await flush();
     expect(el.querySelector('[data-field="sshIngressEnable"]').checked).toBe(true);
-    expect(el.querySelector('[data-field="sshIngressPort"]').value).toBe('56441');
+    expect(el.querySelector('[data-field="sshIngressPort"]').value).toBe('56442');
     const humanRows = el.querySelectorAll('[data-ssh-key-row]');
     expect(humanRows).toHaveLength(1);
     expect(humanRows[0].textContent).toContain(HUMAN_KEY);
