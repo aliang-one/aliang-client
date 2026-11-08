@@ -359,6 +359,13 @@ export default {
   chat_optionCancelled: 'Option selection expired',
   chat_optionCancelledReason: 'Option selection expired ({reason})',
   chat_optionSendFailed: 'Failed to send selection. Please retry.',
+  // Subagent status entry bar (Task 7, spec 2026-11-07-subagent-panel §3):
+  // persistent chat-page entry bar copy. Paired 1:1 with zh.js
+  // (i18n.test.js key-set guard).
+  chat_subagentEntry: 'Subagents',
+  chat_subagentEntryRunning: '{n} running',
+  chat_subagentEntryDone: '{n} done',
+  chat_subagentEntryView: 'View details',
 
   // -- App --
   app_restoringSession: 'Restoring saved session...',

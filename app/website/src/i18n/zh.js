@@ -356,6 +356,12 @@ export default {
   chat_optionCancelled: '方案选择已失效',
   chat_optionCancelledReason: '方案选择已失效（{reason}）',
   chat_optionSendFailed: '选择发送失败，请重试。',
+  // 子agent状态入口条（Task 7, spec 2026-11-07-subagent-panel §三）：会话页
+  // 常驻入口条文案，与 en.js 成对维护（i18n.test.js 守键集）。
+  chat_subagentEntry: '子agent',
+  chat_subagentEntryRunning: '{n} 运行中',
+  chat_subagentEntryDone: '{n} 已完成',
+  chat_subagentEntryView: '查看详情',
 
   // -- App --
   app_restoringSession: '正在恢复会话…',

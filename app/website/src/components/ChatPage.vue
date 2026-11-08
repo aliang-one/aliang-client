@@ -78,6 +78,14 @@
         @recall="startRecall"
       />
 
+      <!-- 子agent状态入口条（Task 7）：消息区底部常驻，点击置面板打开标志
+           （面板本体 Task 8 接线）。 -->
+      <SubagentStatusBar
+        v-if="activeIsAgentcore && activeSubagents.length > 0"
+        :subagents="activeSubagents"
+        @open="openSubagentPanel"
+      />
+
       <ChatComposer
         v-if="activeId"
         v-model="inputText"
@@ -122,14 +130,16 @@
 // 聊天页编排壳：状态与全部业务逻辑收在 useAliangChat（WS 生命周期/看门狗/
 // 帧路由/审批/steer/三源清单/持久化），渲染拆在 chat/ 组件树（侧栏、顶栏、
 // 设置条、消息列表、气泡、审批卡、输入区）。本文件只做组件接线。
-import { computed, onMounted, onUnmounted } from 'vue';
+import { computed, onMounted, onUnmounted, ref } from 'vue';
 import { isComposingEvent, useAliangChat } from '../composables/useAliangChat';
+import { normalizeDeviceProvider } from '../utils/chatSettings';
 import ChatSidebar from './chat/ChatSidebar.vue';
 import ChatHeader from './chat/ChatHeader.vue';
 import ChatSettingsBar from './chat/ChatSettingsBar.vue';
 import ChatMessageList from './chat/ChatMessageList.vue';
 import ChatComposer from './chat/ChatComposer.vue';
 import ChatComposerTools from './chat/ChatComposerTools.vue';
+import SubagentStatusBar from './chat/SubagentStatusBar.vue';
 
 const {
   activeApprovals,
@@ -141,6 +151,7 @@ const {
   activeRunning,
   activeSessionRunning,
   activeSteerItems,
+  activeSubagents,
   applySessionSettings,
   applySlash,
   cancelRecall,
@@ -202,6 +213,19 @@ const {
   toggleMcpServer,
   toggleSkill,
 } = useAliangChat();
+
+// 子agent入口条挂载门（Task 7, spec 2026-11-07-subagent-panel §三）：仅
+// AliangCode（agentcore 归一）会话且有子agent条目时挂载；条目数据经
+// useAliangChat.activeSubagents（会话归属守卫在 getter 内）下传。
+const activeIsAgentcore = computed(
+  () => normalizeDeviceProvider(activeConversation.value?.provider) === 'agentcore'
+);
+// TODO(Task 8)：面板组件接线后由本标志驱动面板渲染（关闭回写 false），
+// 当前先落占位标志，open 事件只置位不渲染。
+const subagentPanelOpen = ref(false);
+function openSubagentPanel() {
+  subagentPanelOpen.value = true;
+}
 
 // 设置条补丁落点：conv 取当前活跃会话（与拆分前各调用点同源），
 // running 守卫/持久化/清错/服务端同步都在 applySessionSettings 内。
