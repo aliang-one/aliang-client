@@ -2,6 +2,7 @@ package routing
 
 import (
 	"testing"
+	"time"
 
 	"aliang.one/nursorgate/common/model"
 	"aliang.one/nursorgate/processor/config"
@@ -294,6 +295,173 @@ func TestDecideRouteFromSnapshot_MeshDNSRuleSkippedInTCPDecision(t *testing.T) {
 	}
 	if decision != RouteDecision("toNode:dev-b") {
 		t.Fatalf("decision = %s, want toNode:dev-b (dns 排前不劫持,由域名规则命中)", decision)
+	}
+}
+
+// TestMeshDNSForwardTargetFromSnapshot Task 8 门控派生(design §6 层1 规则
+// 驱动):启用的 dns 规则 + peer 配有 LANAddrs → (deviceID, lanAddrs, true);
+// 无规则/无 LANAddrs → false(不激活,现状直连透传 fail-open);多条取首条。
+func TestMeshDNSForwardTargetFromSnapshot(t *testing.T) {
+	meshDNSCfg := func(proxyRules []string, peers ...config.MeshPeer) *config.Config {
+		return &config.Config{
+			Customer: &config.CustomerConfig{
+				ProxyRules: proxyRules,
+				Mesh:       &config.MeshConfig{Peers: peers},
+			},
+		}
+	}
+
+	t.Run("dns 规则命中返回 peer 与 LANAddrs", func(t *testing.T) {
+		cfg := meshDNSCfg([]string{"dns,mesh:dev-b"},
+			config.MeshPeer{DeviceID: "dev-b", LANAddrs: []string{"192.168.1.20:9443"}})
+		id, addrs, ok := meshDNSForwardTargetFromInputs(cfg, model.RulesSettings{})
+		if !ok || id != "dev-b" {
+			t.Fatalf("meshDNSForwardTargetFromInputs = (%q, %v, %v), want (dev-b, ..., true)", id, addrs, ok)
+		}
+		if len(addrs) != 1 || addrs[0] != "192.168.1.20:9443" {
+			t.Fatalf("lanAddrs = %v, want [192.168.1.20:9443]", addrs)
+		}
+	})
+
+	t.Run("无 dns 规则不激活", func(t *testing.T) {
+		cfg := meshDNSCfg([]string{"domains,x.com"},
+			config.MeshPeer{DeviceID: "dev-b", LANAddrs: []string{"192.168.1.20:9443"}})
+		if _, _, ok := meshDNSForwardTargetFromInputs(cfg, model.RulesSettings{}); ok {
+			t.Fatal("无 dns 规则时不应激活代转发")
+		}
+	})
+
+	t.Run("dns 规则但 peer 无 LANAddrs 不激活", func(t *testing.T) {
+		cfg := meshDNSCfg([]string{"dns,mesh:dev-b"}, config.MeshPeer{DeviceID: "dev-b"})
+		if _, _, ok := meshDNSForwardTargetFromInputs(cfg, model.RulesSettings{}); ok {
+			t.Fatal("peer 无 LANAddrs 时不应激活(TUN DNS 一律 custom 仅 LAN 载体,无地址无可拨载体)")
+		}
+	})
+
+	t.Run("多条 dns 规则取首条", func(t *testing.T) {
+		cfg := meshDNSCfg([]string{"dns,mesh:dev-b", "dns,mesh:dev-c"},
+			config.MeshPeer{DeviceID: "dev-b", LANAddrs: []string{"192.168.1.20:9443"}},
+			config.MeshPeer{DeviceID: "dev-c", LANAddrs: []string{"192.168.1.30:9443"}})
+		id, _, ok := meshDNSForwardTargetFromInputs(cfg, model.RulesSettings{})
+		if !ok || id != "dev-b" {
+			t.Fatalf("first-wins 违约: got (%q, %v), want dev-b", id, ok)
+		}
+	})
+
+	t.Run("策略尾目标剥尾取 deviceID", func(t *testing.T) {
+		cfg := meshDNSCfg([]string{"dns,mesh:dev-b,direct"},
+			config.MeshPeer{DeviceID: "dev-b", LANAddrs: []string{"192.168.1.20:9443"}})
+		id, _, ok := meshDNSForwardTargetFromInputs(cfg, model.RulesSettings{})
+		if !ok || id != "dev-b" {
+			t.Fatalf("策略尾形态 = (%q, %v), want (dev-b, true)", id, ok)
+		}
+	})
+
+	t.Run("禁用 dns 规则跳过取首条启用", func(t *testing.T) {
+		// 快照级直测 Enabled 过滤:runtime-inputs 编译产物恒启用,落盘 canonical
+		// 回放可带禁用条目,门控语义按「首条启用」钉死。
+		cfg := meshDNSCfg(nil,
+			config.MeshPeer{DeviceID: "dev-b", LANAddrs: []string{"192.168.1.20:9443"}},
+			config.MeshPeer{DeviceID: "dev-c", LANAddrs: []string{"192.168.1.30:9443"}})
+		snapshot := NewRuntimeSnapshotForDecision(
+			NewSnapshotBranchCapabilities(true, false, false),
+			[]SnapshotRule{
+				NewSnapshotRule("r0", "dns", "all", false, SnapshotAction("toNode:dev-b")),
+				NewSnapshotRule("r1", "dns", "all", true, SnapshotAction("toNode:dev-c")),
+			},
+			SnapshotActionDirect, false)
+		id, _, ok := meshDNSForwardTargetFromSnapshot(snapshot, cfg)
+		if !ok || id != "dev-c" {
+			t.Fatalf("disabled 过滤违约: got (%q, %v), want dev-c", id, ok)
+		}
+	})
+
+	t.Run("畸形 toNode 目标跳过取下一条", func(t *testing.T) {
+		cfg := meshDNSCfg(nil,
+			config.MeshPeer{DeviceID: "dev-c", LANAddrs: []string{"192.168.1.30:9443"}})
+		snapshot := NewRuntimeSnapshotForDecision(
+			NewSnapshotBranchCapabilities(true, false, false),
+			[]SnapshotRule{
+				NewSnapshotRule("r0", "dns", "all", true, SnapshotAction("toNode:")),
+				NewSnapshotRule("r1", "dns", "all", true, SnapshotAction("toNode:dev-c")),
+			},
+			SnapshotActionDirect, false)
+		id, _, ok := meshDNSForwardTargetFromSnapshot(snapshot, cfg)
+		if !ok || id != "dev-c" {
+			t.Fatalf("畸形目标应跳过: got (%q, %v), want dev-c", id, ok)
+		}
+	})
+
+	t.Run("mesh 总开关关闭不激活", func(t *testing.T) {
+		disabled := false
+		cfg := &config.Config{
+			Customer: &config.CustomerConfig{
+				ProxyRules: []string{"dns,mesh:dev-b"},
+				Mesh: &config.MeshConfig{
+					Enable: &disabled,
+					Peers:  []config.MeshPeer{{DeviceID: "dev-b", LANAddrs: []string{"192.168.1.20:9443"}}},
+				},
+			},
+		}
+		if _, _, ok := meshDNSForwardTargetFromInputs(cfg, model.RulesSettings{}); ok {
+			t.Fatal("mesh 总开关关闭时编译期即无 dns 规则,不应激活")
+		}
+	})
+
+	t.Run("nil cfg 不激活", func(t *testing.T) {
+		if _, _, ok := meshDNSForwardTargetFromInputs(nil, model.RulesSettings{}); ok {
+			t.Fatal("nil cfg 不应激活")
+		}
+	})
+}
+
+// TestMeshDNSForwardTargetMemo10s 门控 memo:10s 窗口内不重编译(fail-open 的
+// 热更延迟由 TTL 界定),过期或重置后按新配置派生。
+func TestMeshDNSForwardTargetMemo10s(t *testing.T) {
+	origTTL := meshDNSForwardMemoTTL
+	origCfg := config.GetGlobalConfig()
+	defer func() {
+		meshDNSForwardMemoTTL = origTTL
+		resetMeshDNSForwardMemo()
+		config.SetGlobalConfig(origCfg)
+	}()
+	meshDNSForwardMemoTTL = time.Hour
+	resetMeshDNSForwardMemo()
+
+	withRule := &config.Config{
+		Customer: &config.CustomerConfig{
+			ProxyRules: []string{"dns,mesh:dev-b"},
+			Mesh: &config.MeshConfig{Peers: []config.MeshPeer{
+				{DeviceID: "dev-b", LANAddrs: []string{"192.168.1.20:9443"}},
+			}},
+		},
+	}
+	withoutRule := &config.Config{
+		Customer: &config.CustomerConfig{
+			ProxyRules: []string{"domains,x.com"},
+			Mesh: &config.MeshConfig{Peers: []config.MeshPeer{
+				{DeviceID: "dev-b", LANAddrs: []string{"192.168.1.20:9443"}},
+			}},
+		},
+	}
+
+	config.SetGlobalConfig(withRule)
+	id, _, ok := MeshDNSForwardTarget()
+	if !ok || id != "dev-b" {
+		t.Fatalf("首次调用 = (%q, %v), want (dev-b, true)", id, ok)
+	}
+
+	// TTL 内配置变化不可见(memo 命中,热更容忍 10s 延迟的语义边界)。
+	config.SetGlobalConfig(withoutRule)
+	id, _, ok = MeshDNSForwardTarget()
+	if !ok || id != "dev-b" {
+		t.Fatalf("TTL 内应命中 memo: got (%q, %v), want (dev-b, true)", id, ok)
+	}
+
+	// 重置(等价过期)后按新配置派生。
+	resetMeshDNSForwardMemo()
+	if _, _, ok := MeshDNSForwardTarget(); ok {
+		t.Fatal("重置后无 dns 规则应返回 false")
 	}
 }
 

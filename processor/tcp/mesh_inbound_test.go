@@ -3,6 +3,7 @@ package tcp
 import (
 	"bufio"
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"net"
@@ -13,6 +14,7 @@ import (
 	M "aliang.one/nursorgate/inbound/tun/metadata"
 	"aliang.one/nursorgate/outbound/meshproto"
 	meshproxy "aliang.one/nursorgate/outbound/proxy/mesh"
+	"github.com/miekg/dns"
 )
 
 // meshInboundCaptureHandler 测试内 handler seam:捕获注入的 (ctx, conn, metadata),
@@ -187,15 +189,326 @@ func TestMeshInboundRejectsWhenSelfUnregistered(t *testing.T) {
 	assertMeshReject(t, addr, errs, meshFrameLine(t, nil), "unregistered")
 }
 
-func TestMeshInboundRejectsDNSTargetNotImplemented(t *testing.T) {
-	// dns: 目标属 Task 8;本任务拒绝并回写桩信息,分流点留在
-	// handleMeshDNSTarget。
-	deps := meshInboundDeps(newMeshInboundCapture())
-	addr, errs := startMeshInbound(t, meshproto.CarrierLAN, deps)
+// fakeLocalDNSResolver LocalDNSResolver 的测试 fake:按方法注行为,缺省零值
+// 返回空结果(合法 NODATA 形态);want 前缀字段记录收到的入参供断言。
+type fakeLocalDNSResolver struct {
+	lookupIP   func(ctx context.Context, network, host string) ([]net.IP, error)
+	lookupAddr func(ctx context.Context, addr string) ([]string, error)
+	lookupMX   func(ctx context.Context, name string) ([]*net.MX, error)
+	lookupSRV  func(ctx context.Context, service, proto, name string) (string, []*net.SRV, error)
+	lookupTXT  func(ctx context.Context, name string) ([]string, error)
+
+	gotIPNetwork string
+	gotIPHost    string
+	gotAddrArg   string
+	gotMXName    string
+	gotSRVArgs   [3]string
+	gotTXTName   string
+}
+
+func (f *fakeLocalDNSResolver) LookupIP(ctx context.Context, network, host string) ([]net.IP, error) {
+	f.gotIPNetwork, f.gotIPHost = network, host
+	if f.lookupIP == nil {
+		return nil, nil
+	}
+	return f.lookupIP(ctx, network, host)
+}
+
+func (f *fakeLocalDNSResolver) LookupAddr(ctx context.Context, addr string) ([]string, error) {
+	f.gotAddrArg = addr
+	if f.lookupAddr == nil {
+		return nil, nil
+	}
+	return f.lookupAddr(ctx, addr)
+}
+
+func (f *fakeLocalDNSResolver) LookupMX(ctx context.Context, name string) ([]*net.MX, error) {
+	f.gotMXName = name
+	if f.lookupMX == nil {
+		return nil, nil
+	}
+	return f.lookupMX(ctx, name)
+}
+
+func (f *fakeLocalDNSResolver) LookupSRV(ctx context.Context, service, proto, name string) (string, []*net.SRV, error) {
+	f.gotSRVArgs = [3]string{service, proto, name}
+	if f.lookupSRV == nil {
+		return "", nil, nil
+	}
+	return f.lookupSRV(ctx, service, proto, name)
+}
+
+func (f *fakeLocalDNSResolver) LookupTXT(ctx context.Context, name string) ([]string, error) {
+	f.gotTXTName = name
+	if f.lookupTXT == nil {
+		return nil, nil
+	}
+	return f.lookupTXT(ctx, name)
+}
+
+// newDNSQuery 构造 DNS 查询报文(A 查询形态,按需覆写类型)。
+func newDNSQuery(t *testing.T, id uint16, name string, qtype uint16) []byte {
+	t.Helper()
+	m := new(dns.Msg)
+	m.Id = id
+	m.RecursionDesired = true
+	m.Question = []dns.Question{{Name: name, Qtype: qtype, Qclass: dns.ClassINET}}
+	b, err := m.Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// dialMeshDNSTarget 建立到假 B 的连接并一次性写出「帧头+查询帧」——钉死
+// bufio 预读回放路径(头与载荷一次写出是常态)。
+func dialMeshDNSTarget(t *testing.T, addr net.Addr, query []byte) net.Conn {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", addr.String(), 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 	header := meshFrameLine(t, func(h *meshproto.Header) {
+		h.Class = meshproto.ClassCustom // A 侧 TUN DNS 一律 custom(design §2 行12)
 		h.Target = meshproto.DNSTarget
 	})
-	assertMeshReject(t, addr, errs, header, "dns forward not implemented")
+	var frame [2]byte
+	binary.BigEndian.PutUint16(frame[:], uint16(len(query)))
+	if _, err := conn.Write(append(append([]byte(header), frame[:]...), query...)); err != nil {
+		t.Fatal(err)
+	}
+	return conn
+}
+
+// readDNSResponseFromConn 读回 [len][response] 并拆包。
+func readDNSResponseFromConn(t *testing.T, conn net.Conn) *dns.Msg {
+	t.Helper()
+	var frame [2]byte
+	if _, err := io.ReadFull(conn, frame[:]); err != nil {
+		t.Fatalf("read response frame header: %v", err)
+	}
+	payload := make([]byte, binary.BigEndian.Uint16(frame[:]))
+	if _, err := io.ReadFull(conn, payload); err != nil {
+		t.Fatalf("read response payload: %v", err)
+	}
+	m := new(dns.Msg)
+	if err := m.Unpack(payload); err != nil {
+		t.Fatalf("unpack response: %v", err)
+	}
+	return m
+}
+
+// TestMeshInboundDNSTargetResolvesLocally B 侧代解析(design §6 层1):
+// [len][A 查询] → net.Resolver 形解析(fake 注入,回 1.2.3.4)→ [len][响应]
+// 含 A 记录、TTL 30、ID/Question 回显;解析失败 → SERVFAIL。
+func TestMeshInboundDNSTargetResolvesLocally(t *testing.T) {
+	t.Run("A 查询合成响应", func(t *testing.T) {
+		fake := &fakeLocalDNSResolver{
+			lookupIP: func(ctx context.Context, network, host string) ([]net.IP, error) {
+				return []net.IP{net.ParseIP("1.2.3.4")}, nil
+			},
+		}
+		deps := meshInboundDeps(newMeshInboundCapture())
+		deps.DNSResolver = fake
+		addr, _ := startMeshInbound(t, meshproto.CarrierLAN, deps)
+
+		conn := dialMeshDNSTarget(t, addr, newDNSQuery(t, 0x1234, "example.com.", dns.TypeA))
+		defer conn.Close()
+
+		resp := readDNSResponseFromConn(t, conn)
+		if resp.Rcode != dns.RcodeSuccess {
+			t.Fatalf("Rcode = %d(%s), want success", resp.Rcode, dns.RcodeToString[resp.Rcode])
+		}
+		if resp.Id != 0x1234 {
+			t.Fatalf("Id = %#x, want 0x1234(回显查询 ID)", resp.Id)
+		}
+		if !resp.Response {
+			t.Fatal("response 位未置位")
+		}
+		if len(resp.Answer) != 1 {
+			t.Fatalf("answers = %d, want 1: %v", len(resp.Answer), resp.Answer)
+		}
+		a, ok := resp.Answer[0].(*dns.A)
+		if !ok {
+			t.Fatalf("answer 类型 = %T, want *dns.A", resp.Answer[0])
+		}
+		if a.A.String() != "1.2.3.4" {
+			t.Fatalf("A = %s, want 1.2.3.4", a.A)
+		}
+		if a.Hdr.Ttl != meshDNSAnswerTTL {
+			t.Fatalf("TTL = %d, want %d(固定 TTL)", a.Hdr.Ttl, meshDNSAnswerTTL)
+		}
+		if a.Hdr.Name != "example.com." {
+			t.Fatalf("Name = %q, want example.com.", a.Hdr.Name)
+		}
+		if fake.gotIPNetwork != "ip4" || fake.gotIPHost != "example.com." {
+			t.Fatalf("LookupIP 入参 = (%q, %q), want (ip4, example.com.)", fake.gotIPNetwork, fake.gotIPHost)
+		}
+	})
+
+	t.Run("解析失败 SERVFAIL", func(t *testing.T) {
+		fake := &fakeLocalDNSResolver{
+			lookupIP: func(ctx context.Context, network, host string) ([]net.IP, error) {
+				return nil, errors.New("resolver boom")
+			},
+		}
+		deps := meshInboundDeps(newMeshInboundCapture())
+		deps.DNSResolver = fake
+		addr, _ := startMeshInbound(t, meshproto.CarrierLAN, deps)
+
+		conn := dialMeshDNSTarget(t, addr, newDNSQuery(t, 0x4321, "fail.example.com.", dns.TypeA))
+		defer conn.Close()
+
+		resp := readDNSResponseFromConn(t, conn)
+		if resp.Rcode != dns.RcodeServerFailure {
+			t.Fatalf("Rcode = %d, want SERVFAIL", resp.Rcode)
+		}
+		if resp.Id != 0x4321 {
+			t.Fatalf("Id = %#x, want 0x4321(SERVFAIL 也须回显 ID)", resp.Id)
+		}
+	})
+}
+
+// TestMeshInboundDNSTargetTypeMatrix 类型矩阵(design §6 层1 定案):
+// A/AAAA→LookupIP;PTR→LookupAddr(反算地址);MX/SRV/TXT→对应 Lookup;
+// 其余类型 SERVFAIL。
+func TestMeshInboundDNSTargetTypeMatrix(t *testing.T) {
+	t.Run("AAAA 走 ip6 LookupIP", func(t *testing.T) {
+		fake := &fakeLocalDNSResolver{
+			lookupIP: func(ctx context.Context, network, host string) ([]net.IP, error) {
+				return []net.IP{net.ParseIP("2001:db8::1")}, nil
+			},
+		}
+		deps := meshInboundDeps(newMeshInboundCapture())
+		deps.DNSResolver = fake
+		addr, _ := startMeshInbound(t, meshproto.CarrierLAN, deps)
+		conn := dialMeshDNSTarget(t, addr, newDNSQuery(t, 7, "v6.example.com.", dns.TypeAAAA))
+		defer conn.Close()
+		resp := readDNSResponseFromConn(t, conn)
+		aaaa, ok := resp.Answer[0].(*dns.AAAA)
+		if !ok || aaaa.AAAA.String() != "2001:db8::1" {
+			t.Fatalf("answer = %v, want AAAA 2001:db8::1", resp.Answer)
+		}
+		if fake.gotIPNetwork != "ip6" {
+			t.Fatalf("LookupIP network = %q, want ip6", fake.gotIPNetwork)
+		}
+	})
+
+	t.Run("PTR 反算 in-addr.arpa 为点分地址", func(t *testing.T) {
+		fake := &fakeLocalDNSResolver{
+			lookupAddr: func(ctx context.Context, addr string) ([]string, error) {
+				return []string{"host.example.com."}, nil
+			},
+		}
+		deps := meshInboundDeps(newMeshInboundCapture())
+		deps.DNSResolver = fake
+		addr, _ := startMeshInbound(t, meshproto.CarrierLAN, deps)
+		conn := dialMeshDNSTarget(t, addr, newDNSQuery(t, 8, "4.3.2.1.in-addr.arpa.", dns.TypePTR))
+		defer conn.Close()
+		resp := readDNSResponseFromConn(t, conn)
+		ptr, ok := resp.Answer[0].(*dns.PTR)
+		if !ok || ptr.Ptr != "host.example.com." {
+			t.Fatalf("answer = %v, want PTR host.example.com.", resp.Answer)
+		}
+		if fake.gotAddrArg != "1.2.3.4" {
+			t.Fatalf("LookupAddr 入参 = %q, want 1.2.3.4(反算后的点分地址)", fake.gotAddrArg)
+		}
+	})
+
+	t.Run("MX 合成", func(t *testing.T) {
+		fake := &fakeLocalDNSResolver{
+			lookupMX: func(ctx context.Context, name string) ([]*net.MX, error) {
+				return []*net.MX{{Pref: 10, Host: "mail.example.com"}}, nil
+			},
+		}
+		deps := meshInboundDeps(newMeshInboundCapture())
+		deps.DNSResolver = fake
+		addr, _ := startMeshInbound(t, meshproto.CarrierLAN, deps)
+		conn := dialMeshDNSTarget(t, addr, newDNSQuery(t, 9, "example.com.", dns.TypeMX))
+		defer conn.Close()
+		resp := readDNSResponseFromConn(t, conn)
+		mx, ok := resp.Answer[0].(*dns.MX)
+		if !ok || mx.Preference != 10 || mx.Mx != "mail.example.com." {
+			t.Fatalf("answer = %v, want MX 10 mail.example.com.", resp.Answer)
+		}
+	})
+
+	t.Run("SRV 拆 _service._proto 前缀", func(t *testing.T) {
+		fake := &fakeLocalDNSResolver{
+			lookupSRV: func(ctx context.Context, service, proto, name string) (string, []*net.SRV, error) {
+				return "sip.example.com", []*net.SRV{{Priority: 1, Weight: 2, Port: 5060, Target: "sip.example.com"}}, nil
+			},
+		}
+		deps := meshInboundDeps(newMeshInboundCapture())
+		deps.DNSResolver = fake
+		addr, _ := startMeshInbound(t, meshproto.CarrierLAN, deps)
+		conn := dialMeshDNSTarget(t, addr, newDNSQuery(t, 10, "_sip._tcp.example.com.", dns.TypeSRV))
+		defer conn.Close()
+		resp := readDNSResponseFromConn(t, conn)
+		srv, ok := resp.Answer[0].(*dns.SRV)
+		if !ok || srv.Port != 5060 || srv.Target != "sip.example.com." {
+			t.Fatalf("answer = %v, want SRV 5060 sip.example.com.", resp.Answer)
+		}
+		if got := fake.gotSRVArgs; got != [3]string{"sip", "tcp", "example.com"} {
+			t.Fatalf("LookupSRV 入参 = %v, want [sip tcp example.com]", got)
+		}
+	})
+
+	t.Run("TXT 合成", func(t *testing.T) {
+		fake := &fakeLocalDNSResolver{
+			lookupTXT: func(ctx context.Context, name string) ([]string, error) {
+				return []string{"hello mesh"}, nil
+			},
+		}
+		deps := meshInboundDeps(newMeshInboundCapture())
+		deps.DNSResolver = fake
+		addr, _ := startMeshInbound(t, meshproto.CarrierLAN, deps)
+		conn := dialMeshDNSTarget(t, addr, newDNSQuery(t, 11, "example.com.", dns.TypeTXT))
+		defer conn.Close()
+		resp := readDNSResponseFromConn(t, conn)
+		txt, ok := resp.Answer[0].(*dns.TXT)
+		if !ok || len(txt.Txt) != 1 || txt.Txt[0] != "hello mesh" {
+			t.Fatalf("answer = %v, want TXT [hello mesh]", resp.Answer)
+		}
+	})
+}
+
+// TestMeshInboundDNSTargetUnsupportedTypeServfail 其余类型一律 SERVFAIL
+// (design §6 层1 定案),含空 Question 的畸形查询。
+func TestMeshInboundDNSTargetUnsupportedTypeServfail(t *testing.T) {
+	for name, qtype := range map[string]uint16{
+		"CNAME":      dns.TypeCNAME,
+		"NS":         dns.TypeNS,
+		"未注册类型": dns.TypeNULL,
+	} {
+		t.Run(name, func(t *testing.T) {
+			deps := meshInboundDeps(newMeshInboundCapture())
+			deps.DNSResolver = &fakeLocalDNSResolver{}
+			addr, _ := startMeshInbound(t, meshproto.CarrierLAN, deps)
+			conn := dialMeshDNSTarget(t, addr, newDNSQuery(t, 12, "example.com.", qtype))
+			defer conn.Close()
+			resp := readDNSResponseFromConn(t, conn)
+			if resp.Rcode != dns.RcodeServerFailure {
+				t.Fatalf("Rcode = %d, want SERVFAIL(qtype %d 不支持)", resp.Rcode, qtype)
+			}
+		})
+	}
+
+	t.Run("空 Question SERVFAIL", func(t *testing.T) {
+		deps := meshInboundDeps(newMeshInboundCapture())
+		deps.DNSResolver = &fakeLocalDNSResolver{}
+		addr, _ := startMeshInbound(t, meshproto.CarrierLAN, deps)
+		m := new(dns.Msg)
+		m.Id = 13
+		b, _ := m.Pack()
+		conn := dialMeshDNSTarget(t, addr, b)
+		defer conn.Close()
+		resp := readDNSResponseFromConn(t, conn)
+		if resp.Rcode != dns.RcodeServerFailure {
+			t.Fatalf("Rcode = %d, want SERVFAIL", resp.Rcode)
+		}
+	})
 }
 
 func TestMeshInboundRejectsMalformedHeader(t *testing.T) {

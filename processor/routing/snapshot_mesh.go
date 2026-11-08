@@ -7,6 +7,8 @@ package routing
 
 import (
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"aliang.one/nursorgate/common/model"
 	"aliang.one/nursorgate/processor/config"
@@ -201,4 +203,113 @@ func entryKindToRuleType(kind match.EntryKind) string {
 	default:
 		return string(model.RuleTypeDomain)
 	}
+}
+
+// meshDNSForwardMemoTTL 是 TUN DNS 代转发门控(MeshDNSForwardTarget)的
+// memo 有效期:每条 DNS 查询都过门,逐查询重编译快照太重,热更(规则/开关/
+// peer 变更)容忍 10s 延迟生效。var 而非 const 是刻意的测试缝(覆写+恢复)。
+var meshDNSForwardMemoTTL = 10 * time.Second
+
+// meshDNSForwardMemoEntry 是门控 memo 的缓存条目(含负结果:未激活也缓存,
+// 否则未配置 mesh 的机器每条 DNS 查询都要重编译一遍)。
+type meshDNSForwardMemoEntry struct {
+	at       time.Time
+	deviceID string
+	lanAddrs []string
+	ok       bool
+}
+
+// meshDNSForwardMemo 以 atomic.Value 持有 *meshDNSForwardMemoEntry(nil 语义
+// 用零值 entry 表达:Store(nil) 会 panic,零值 at 的条目必然过期)。
+var meshDNSForwardMemo atomic.Value
+
+// resetMeshDNSForwardMemo 清空门控 memo(测试专用:热更即时生效路径的断言
+// 依赖显式重置;生产永不调用)。
+func resetMeshDNSForwardMemo() {
+	meshDNSForwardMemo.Store(&meshDNSForwardMemoEntry{})
+}
+
+// MeshDNSForwardTarget 返回 TUN UDP/53 mesh 代转发目标(design §6 层1 规则
+// 驱动门控,Task 8 契约):存在启用的 {Type:"dns", Target:"toNode:<id>"}
+// 规则 + mesh 使能 + 该 peer 配有 LANAddrs → (deviceID, lanAddrs, true),
+// 取首条启用 dns 规则(first-wins);否则 ok=false(不激活,TUN 走既有直连
+// 透传,fail-open)。快照经 CompileRuntimeSnapshotFromRuntimeInputs 从全局
+// 配置+决策层开关派生(tls.go 决策同款),结果带 meshDNSForwardMemoTTL 原子
+// memo。编译失败同样不激活(fail-open,与 tls.go 编译失败落默认路由同口径)。
+func MeshDNSForwardTarget() (peerDeviceID string, lanAddrs []string, ok bool) {
+	now := time.Now()
+	if entry, _ := meshDNSForwardMemo.Load().(*meshDNSForwardMemoEntry); entry != nil &&
+		now.Sub(entry.at) < meshDNSForwardMemoTTL {
+		return entry.deviceID, entry.lanAddrs, entry.ok
+	}
+	var deviceID string
+	var addrs []string
+	active := false
+	if cfg := config.GetGlobalConfig(); cfg != nil {
+		deviceID, addrs, active = meshDNSForwardTargetFromInputs(cfg, EffectiveSwitchStatus())
+	}
+	meshDNSForwardMemo.Store(&meshDNSForwardMemoEntry{
+		at:       now,
+		deviceID: deviceID,
+		lanAddrs: addrs,
+		ok:       active,
+	})
+	return deviceID, addrs, active
+}
+
+// meshDNSForwardTargetFromInputs 从运行时输入(配置+开关)派生门控结果:
+// 编译快照 → meshDNSForwardTargetFromSnapshot 扫规则 → 回 cfg 查 peer
+// LANAddrs。纯函数,测试直测。
+func meshDNSForwardTargetFromInputs(cfg *config.Config, switches model.RulesSettings) (string, []string, bool) {
+	if cfg == nil {
+		return "", nil, false
+	}
+	snapshot, err := CompileRuntimeSnapshotFromRuntimeInputs(cfg, switches)
+	if err != nil {
+		// 编译失败 → 门不激活(fail-open:现状直连透传,不让 DNS 因门控而断)。
+		return "", nil, false
+	}
+	return meshDNSForwardTargetFromSnapshot(snapshot, cfg)
+}
+
+// meshDNSForwardTargetFromSnapshot 扫快照取首条启用 dns 规则的目标,再回
+// cfg 的 customer.mesh.peers 取该 peer 的 LANAddrs。畸形 toNode 目标(空
+// deviceID/未知形态)跳过取下一条;peer 不在 peers 列表或无 LANAddrs →
+// 不激活(TUN DNS 一律 custom 仅 LAN 载体,无 LAN 地址即无可拨载体)。
+// 注:dns 规则目标携带的 Task 7 失败策略段(toNode:<id>:direct 等)在此
+// 剥落不消费——DNS 代转发的失败语义已定死为 SERVFAIL 兜底(design §6 层1),
+// 不存在「回落公网 DNS」的失败策略分支。
+func meshDNSForwardTargetFromSnapshot(snapshot *RuntimeSnapshot, cfg *config.Config) (string, []string, bool) {
+	if snapshot == nil || cfg == nil {
+		return "", nil, false
+	}
+	deviceID := ""
+	for _, rule := range snapshot.Rules() {
+		if rule.Type() != snapshotRuleTypeDNS || !rule.Enabled() {
+			continue
+		}
+		id, _, ok := config.ParseMeshRuleTarget(string(rule.Target()))
+		if !ok || id == "" {
+			continue
+		}
+		deviceID = id
+		break
+	}
+	if deviceID == "" {
+		return "", nil, false
+	}
+	if cfg.Customer == nil || cfg.Customer.Mesh == nil {
+		return "", nil, false
+	}
+	for i := range cfg.Customer.Mesh.Peers {
+		peer := &cfg.Customer.Mesh.Peers[i]
+		if strings.TrimSpace(peer.DeviceID) != deviceID {
+			continue
+		}
+		if len(peer.LANAddrs) == 0 {
+			return "", nil, false
+		}
+		return deviceID, append([]string(nil), peer.LANAddrs...), true
+	}
+	return "", nil, false
 }
