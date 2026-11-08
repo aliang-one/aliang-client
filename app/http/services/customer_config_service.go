@@ -481,8 +481,7 @@ func normalizeCustomerPayload(payload []byte) (map[string]interface{}, error) {
 				forbidden = append(forbidden, key)
 			}
 			sort.Strings(forbidden)
-			return nil, fmt.Errorf("customer.%s is forbidden: editable customer fields are [proxy ai_rules proxy_rules traffic_mirror http1_drop model_mapping custom_env_vars geoip agentcore_llm agentcore peer_mcp mesh]", forbidden[0])
-			return nil, fmt.Errorf("customer.%s is forbidden: editable customer fields are [proxy ai_rules proxy_rules traffic_mirror http1_drop model_mapping custom_env_vars geoip agentcore_llm agentcore peer_mcp ssh_ingress]", forbidden[0])
+			return nil, fmt.Errorf("customer.%s is forbidden: editable customer fields are [proxy ai_rules proxy_rules traffic_mirror http1_drop model_mapping custom_env_vars geoip agentcore_llm agentcore peer_mcp mesh ssh_ingress]", forbidden[0])
 		}
 		rawRoot = map[string]json.RawMessage{}
 		if err := json.Unmarshal(rawCustomer, &rawRoot); err != nil {
@@ -512,7 +511,7 @@ func validateEditableCustomerKeys(rawRoot map[string]json.RawMessage) error {
 		switch key {
 		case "proxy", "ai_rules", "proxy_rules", "traffic_mirror", "http1_drop", "model_mapping", "custom_env_vars", "geoip", "agentcore_llm", "agentcore", "peer_mcp", "mesh", "ssh_ingress":
 		default:
-			return fmt.Errorf("customer.%s is forbidden: editable customer fields are [proxy ai_rules proxy_rules traffic_mirror http1_drop model_mapping custom_env_vars geoip agentcore_llm agentcore peer_mcp ssh_ingress]", key)
+			return fmt.Errorf("customer.%s is forbidden: editable customer fields are [proxy ai_rules proxy_rules traffic_mirror http1_drop model_mapping custom_env_vars geoip agentcore_llm agentcore peer_mcp mesh ssh_ingress]", key)
 		}
 	}
 	return nil
