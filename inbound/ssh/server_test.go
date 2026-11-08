@@ -260,7 +260,6 @@ func TestSSHIngressRateLimitsAuthFailures(t *testing.T) {
 }
 
 func TestSSHIngressRejectsNonDirectTCPIPChannels(t *testing.T) {
-	t.Skip("TODO(Task 3):骨架阶段 PublicKeyCallback 恒拒,双密钥接线后转正")
 	humanPub, signer := newTestKey(t)
 	_, addr := startTestServer(t, RunConfig{AuthorizedKeys: []gossh.PublicKey{humanPub}})
 	conn, err := dialIngress(t, addr, gossh.PublicKeys(signer))
@@ -297,7 +296,6 @@ func TestSSHIngressRejectsNonDirectTCPIPChannels(t *testing.T) {
 }
 
 func TestSSHIngressGlobalRequests(t *testing.T) {
-	t.Skip("TODO(Task 3):骨架阶段 PublicKeyCallback 恒拒,双密钥接线后转正")
 	humanPub, signer := newTestKey(t)
 	_, addr := startTestServer(t, RunConfig{AuthorizedKeys: []gossh.PublicKey{humanPub}})
 	conn, err := dialIngress(t, addr, gossh.PublicKeys(signer))
@@ -312,6 +310,89 @@ func TestSSHIngressGlobalRequests(t *testing.T) {
 	ok, _, err = conn.SendRequest("tcpip-forward", true, nil)
 	if err != nil || ok {
 		t.Fatalf("other global requests must be denied: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestAuthHumanKeyMarksBareForm(t *testing.T) {
+	humanPub, humanSigner := newTestKey(t)
+	meshPub, _ := newTestKey(t)
+	s, addr := startTestServer(t, RunConfig{
+		AuthorizedKeys: []gossh.PublicKey{humanPub},
+		MeshKeys:       []gossh.PublicKey{meshPub},
+	})
+	conn, err := dialIngress(t, addr, gossh.PublicKeys(humanSigner))
+	if err != nil {
+		t.Fatalf("human key must authenticate: %v", err)
+	}
+	payload := gossh.Marshal(directTCPIPMsgMirror{Addr: "127.0.0.1", Port: 9, OriginAddr: "127.0.0.1", OriginPort: 0})
+	if _, _, err := conn.OpenChannel(channelDirectTCPIP, payload); err != nil {
+		t.Fatalf("direct-tcpip open: %v", err)
+	}
+	// 认证 Permissions 的形态标记必须传到通道层(观测点在通道 Accept 侧)。
+	if got := s.observedForm(); got != FormBare {
+		t.Fatalf("ingress form = %q, want %q", got, FormBare)
+	}
+}
+
+func TestAuthMeshKeyMarksMeshForm(t *testing.T) {
+	humanPub, _ := newTestKey(t)
+	meshPub, meshSigner := newTestKey(t)
+	s, addr := startTestServer(t, RunConfig{
+		AuthorizedKeys: []gossh.PublicKey{humanPub},
+		MeshKeys:       []gossh.PublicKey{meshPub},
+	})
+	conn, err := dialIngress(t, addr, gossh.PublicKeys(meshSigner))
+	if err != nil {
+		t.Fatalf("mesh key must authenticate: %v", err)
+	}
+	payload := gossh.Marshal(directTCPIPMsgMirror{Addr: "127.0.0.1", Port: 9, OriginAddr: "127.0.0.1", OriginPort: 0})
+	if _, _, err := conn.OpenChannel(channelDirectTCPIP, payload); err != nil {
+		t.Fatalf("direct-tcpip open: %v", err)
+	}
+	// 帧处理在 Task 5 接;本断言=Accept 且形态标记为 mesh。
+	if got := s.observedForm(); got != FormMesh {
+		t.Fatalf("ingress form = %q, want %q", got, FormMesh)
+	}
+}
+
+func TestAuthUnknownKeyRejectedAndRateLimited(t *testing.T) {
+	humanPub, _ := newTestKey(t)
+	_, unknown := newTestKey(t)
+	s, addr := startTestServer(t, RunConfig{AuthorizedKeys: []gossh.PublicKey{humanPub}})
+
+	_, err := dialIngress(t, addr, gossh.PublicKeys(unknown))
+	if err == nil || !strings.Contains(err.Error(), "unable to authenticate") {
+		t.Fatalf("unknown key must be rejected: %v", err)
+	}
+	// 服务端限速器已记账:回环 IP 进入退避窗口(fails=1→2s)。
+	if s.limiter.Allow("127.0.0.1") {
+		t.Fatal("unknown-key failure must put the source IP into a backoff window")
+	}
+	// 已知好钥同样被窗口拦住(限速在 IP 维度,不区分凭证)。
+	if _, err := dialIngress(t, addr, gossh.PublicKeys(unknown)); err == nil ||
+		strings.Contains(err.Error(), "unable to authenticate") {
+		t.Fatalf("windowed IP must be cut before auth even with a valid key: %v", err)
+	}
+}
+
+func TestAuthDualListedKeyMeshWinsAtRuntime(t *testing.T) {
+	// 绕过配置层 Validate(同键双列表歧义拦截)直构造 RunConfig:
+	// 运行期第二道防线——mesh 优先(保守)。
+	dualPub, dualSigner := newTestKey(t)
+	s, addr := startTestServer(t, RunConfig{
+		AuthorizedKeys: []gossh.PublicKey{dualPub},
+		MeshKeys:       []gossh.PublicKey{dualPub},
+	})
+	conn, err := dialIngress(t, addr, gossh.PublicKeys(dualSigner))
+	if err != nil {
+		t.Fatalf("dual-listed key must authenticate: %v", err)
+	}
+	payload := gossh.Marshal(directTCPIPMsgMirror{Addr: "example.com", Port: 443, OriginAddr: "127.0.0.1", OriginPort: 0})
+	if _, _, err := conn.OpenChannel(channelDirectTCPIP, payload); err != nil {
+		t.Fatalf("direct-tcpip open: %v", err)
+	}
+	if got := s.observedForm(); got != FormMesh {
+		t.Fatalf("dual-listed key must conservatively map to %q, got %q", FormMesh, got)
 	}
 }
 

@@ -8,8 +8,8 @@ import (
 // 认证失败退避参数:窗口 = 1s << min(fails, 5),封顶 30s
 // (fails=1→2s,2→4s,3→8s,4→16s,5+→30s)。
 const (
-	authBackoffBase    = time.Second
-	authBackoffCap     = 30 * time.Second
+	authBackoffBase     = time.Second
+	authBackoffCap      = 30 * time.Second
 	authBackoffMaxShift = 5
 )
 

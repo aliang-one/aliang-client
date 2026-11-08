@@ -1,6 +1,7 @@
 package ssh
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -42,6 +43,11 @@ type Server struct {
 
 	hostKeyMu sync.Mutex
 	hostKey   gossh.Signer
+
+	// obsMu 保护 lastIngressForm:最近一次 direct-tcpip 通道读到的入口
+	// 形态。仅测试观测 Permissions→通道传递链用,生产行为不读。
+	obsMu           sync.Mutex
+	lastIngressForm string
 }
 
 // NewServer 创建 SSH 入口服务实例。hostKeyPath 指向 PEM 私钥文件
@@ -163,14 +169,41 @@ func (s *Server) serverConfig(signer gossh.Signer) *gossh.ServerConfig {
 	return cfg
 }
 
-// publicKeyCallback 是公钥准入点。Task 2 骨架阶段:恒拒并计入限速
-// (为限速测试提供失败源);双密钥判定与形态标记在 Task 3 接线。
+// publicKeyCallback 是双密钥准入点(Task 3):公钥即形态区分器——
+// 命中 MeshKeys→Permissions.Extensions["ingress_form"]=mesh;命中
+// AuthorizedKeys→bare;都不命中→拒并计入限速。成功认证清零限速。
+//
+// 比较用解析后的公钥身份(key.Marshal() 字节,编码含类型与公钥体),
+// 不比较 authorized_keys 文本行——同键多行/textual variants 无法借此
+// 区分形态(spec §4 同键歧义;配置层 Validate 的逐字节重复键拦截是
+// 第一道,这里是第二道)。双列表同键(绕过 Validate 直构造 RunConfig
+// 可达)→mesh 优先:运行期保守取向,注释即约定。
 func (s *Server) publicKeyCallback(meta gossh.ConnMetadata, key gossh.PublicKey) (*gossh.Permissions, error) {
 	ip := remoteIP(meta.RemoteAddr())
-	s.limiter.Fail(ip)
-	logger.Debug(fmt.Sprintf("SSH ingress rejected key %s for %q from %s",
-		gossh.FingerprintSHA256(key), meta.User(), ip))
-	return nil, fmt.Errorf("public key authentication is not configured")
+	switch {
+	case keyInList(key, s.rc.MeshKeys):
+		s.limiter.Reset(ip)
+		return &gossh.Permissions{Extensions: map[string]string{extIngressForm: FormMesh}}, nil
+	case keyInList(key, s.rc.AuthorizedKeys):
+		s.limiter.Reset(ip)
+		return &gossh.Permissions{Extensions: map[string]string{extIngressForm: FormBare}}, nil
+	default:
+		s.limiter.Fail(ip)
+		logger.Debug(fmt.Sprintf("SSH ingress rejected unknown key %s for %q from %s",
+			gossh.FingerprintSHA256(key), meta.User(), ip))
+		return nil, fmt.Errorf("unknown public key for %q", meta.User())
+	}
+}
+
+// keyInList 按公钥身份比对:Marshal 编码含类型与公钥体,字节级相等即同钥
+// (v0.48 无 KeysEqual,与出口侧 sshtest 同款比对方式)。
+func keyInList(key gossh.PublicKey, list []gossh.PublicKey) bool {
+	for _, listed := range list {
+		if bytes.Equal(key.Marshal(), listed.Marshal()) {
+			return true
+		}
+	}
+	return false
 }
 
 // acceptLoop 接受连接并派发;监听关闭(Stop)后退出。
@@ -235,7 +268,8 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn, cfg *gossh.Serve
 
 	logger.Debug(fmt.Sprintf("SSH ingress connection from %s authenticated as %q", ip, sconn.User()))
 	go serveGlobalRequests(reqs)
-	s.serveChannels(chans)
+	// v0.48 的 ServerConn.Permissions 是字段(认证回调返回值的落点)。
+	s.serveChannels(chans, sconn.Permissions)
 }
 
 // serveGlobalRequests 应答连接级全局请求:keepalive@openssh.com 放行,
@@ -255,21 +289,43 @@ func serveGlobalRequests(reqs <-chan *gossh.Request) {
 
 // serveChannels 是通道安全收敛白名单:仅 direct-tcpip 放行,其余
 // (session/auth-agent@openssh.com/x11/forwarded-tcpip 等)全拒。
-// Task 2 交付边界:放行后仅 drain+close;Task 4/5 在此按形态分流注入。
-func (s *Server) serveChannels(chans <-chan gossh.NewChannel) {
+// 通道形态经认证 Permissions.Extensions["ingress_form"] 读取——
+// Task 2/3 交付边界:读出形态并记录后统一 drain+close;
+// Task 4/5 在此按形态分流注入管线。
+func (s *Server) serveChannels(chans <-chan gossh.NewChannel, perms *gossh.Permissions) {
 	for newCh := range chans {
 		if newCh.ChannelType() != channelDirectTCPIP {
 			_ = newCh.Reject(gossh.UnknownChannelType, "only direct-tcpip is accepted on this ingress")
 			continue
 		}
+		form := ""
+		if perms != nil {
+			form = perms.Extensions[extIngressForm]
+		}
+		s.observeForm(form)
 		ch, chReqs, err := newCh.Accept()
 		if err != nil {
 			logger.Debug(fmt.Sprintf("SSH ingress direct-tcpip accept failed: %v", err))
 			continue
 		}
+		logger.Debug(fmt.Sprintf("SSH ingress direct-tcpip accepted (form=%s)", form))
 		go gossh.DiscardRequests(chReqs)
 		go drainAndClose(ch)
 	}
+}
+
+// observeForm 记录最近一次 direct-tcpip 通道携带的入口形态,供测试观测
+// Permissions→通道层的传递链(生产行为不读它)。
+func (s *Server) observeForm(form string) {
+	s.obsMu.Lock()
+	s.lastIngressForm = form
+	s.obsMu.Unlock()
+}
+
+func (s *Server) observedForm() string {
+	s.obsMu.Lock()
+	defer s.obsMu.Unlock()
+	return s.lastIngressForm
 }
 
 // drainAndClose 排空并关闭通道(Task 4/5 的注入占位:
