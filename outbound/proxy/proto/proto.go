@@ -15,6 +15,7 @@ const (
 	Aliang
 	ShadowTLS
 	Socks5
+	Mesh
 )
 
 type Proto uint8
@@ -39,6 +40,8 @@ func (proto Proto) String() string {
 		return "shadowtls"
 	case Socks5:
 		return "socks5"
+	case Mesh:
+		return "mesh"
 
 	default:
 		return fmt.Sprintf("proto(%d)", proto)
