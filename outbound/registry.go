@@ -5,12 +5,14 @@ import (
 	"net"
 	"sync"
 
+	"aliang.one/nursorgate/common/cache"
 	"aliang.one/nursorgate/common/logger"
 	"aliang.one/nursorgate/outbound/proxy"
 	"aliang.one/nursorgate/outbound/proxy/aliang"
 	"aliang.one/nursorgate/outbound/proxy/direct"
 	httpproxy "aliang.one/nursorgate/outbound/proxy/http"
 	"aliang.one/nursorgate/outbound/proxy/socks5"
+	sshout "aliang.one/nursorgate/outbound/proxy/ssh"
 	proxyConfig "aliang.one/nursorgate/processor/config"
 )
 
@@ -103,7 +105,7 @@ func CreateHTTPProxy(addr, username, password string) (proxy.Proxy, error) {
 }
 
 // RefreshCustomerProxy rebuilds the runtime customer proxy entries from config.
-// It removes stale SOCKS/HTTP entries first so type/address/auth changes take
+// It removes stale SOCKS/HTTP/SSH entries first so type/address/auth changes take
 // effect immediately after a customer config commit.
 func (r *Registry) RefreshCustomerProxy(cfg *proxyConfig.Config) error {
 	customerProxy, err := cfg.EffectiveCustomerProxy()
@@ -150,6 +152,41 @@ func (r *Registry) RefreshCustomerProxy(cfg *proxyConfig.Config) error {
 		}
 
 		logger.Debug(fmt.Sprintf("HTTP proxy registered at %s", addr))
+	case *proxyConfig.SSHProxyConfig:
+		if err := proxyCfg.Validate(); err != nil {
+			return fmt.Errorf("invalid ssh proxy config: %w", err)
+		}
+		addr := net.JoinHostPort(proxyCfg.Server, fmt.Sprintf("%d", proxyCfg.ServerPort))
+		hostsDir, err := cache.GetCacheSubdir("ssh")
+		if err != nil {
+			return fmt.Errorf("resolve ssh known_hosts dir: %w", err)
+		}
+		final := sshout.NodeFromAddrPort(proxyCfg.Server, proxyCfg.ServerPort, proxyCfg.Username,
+			proxyCfg.Password, proxyCfg.PrivateKey, proxyCfg.KeyPassphrase)
+		jumps := make([]sshout.NodeConfig, 0, len(proxyCfg.JumpServers))
+		for _, j := range proxyCfg.JumpServers {
+			jumps = append(jumps, sshout.NodeFromAddrPort(j.Server, j.ServerPort, j.Username, j.Password, j.PrivateKey, j.KeyPassphrase))
+		}
+		sshProxy, err := sshout.New(final, proxyCfg.PoolSize, jumps, hostsDir)
+		if err != nil {
+			return fmt.Errorf("failed to create ssh proxy: %w", err)
+		}
+		if err := r.Register("ssh", sshProxy); err != nil {
+			return fmt.Errorf("failed to register ssh proxy: %w", err)
+		}
+		// 日志打钳位后的有效池大小(钳位权威在 ssh.New:0→3、<1→1、>16→16);
+		// 否则未设 pool_size 时日志说 pool=0,而实际池是 3。
+		effectivePool := proxyCfg.PoolSize
+		if effectivePool == 0 {
+			effectivePool = 3
+		}
+		if effectivePool < 1 {
+			effectivePool = 1
+		}
+		if effectivePool > 16 {
+			effectivePool = 16
+		}
+		logger.Debug(fmt.Sprintf("SSH proxy registered at %s (pool=%d, jumps=%d)", addr, effectivePool, len(jumps)))
 	default:
 		return fmt.Errorf("unsupported customer proxy config type %T", customerProxy)
 	}
@@ -194,12 +231,23 @@ func (r *Registry) Unregister(name string) error {
 }
 
 // UnregisterCustomerProxies removes the dynamic customer proxy entries.
+// 被移除的实例若实现 Close(如 SSH 的链池)则一并关闭——否则配置刷新或停用后,
+// 旧实例已脱离 registry 但链与监控协程仍活着,泄漏直至进程退出(socks/http
+// 无 Close 方法,closeProxyIfSupported 对它们是 no-op)。
 func (r *Registry) UnregisterCustomerProxies() {
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	removed := make([]proxy.Proxy, 0, 3)
+	for _, name := range []string{"socks", "http", "ssh"} {
+		if p, exists := r.proxies[name]; exists {
+			removed = append(removed, p)
+			delete(r.proxies, name)
+		}
+	}
+	r.mu.Unlock()
 
-	delete(r.proxies, "socks")
-	delete(r.proxies, "http")
+	for _, p := range removed {
+		closeProxyIfSupported(p)
+	}
 	logger.Debug("Customer proxy entries unregistered")
 }
 

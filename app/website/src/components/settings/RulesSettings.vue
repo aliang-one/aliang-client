@@ -72,11 +72,13 @@
               <span class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('rules_proxyType') }}</span>
               <select
                 v-model="form.proxy.type"
+                data-field="proxyType"
                 :disabled="!form.proxy.enable"
                 class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
               >
                 <option value="socks5">SOCKS5</option>
                 <option value="http">HTTP</option>
+                <option value="ssh">SSH</option>
               </select>
             </label>
 
@@ -98,10 +100,11 @@
               <span class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('rules_proxyUsername') }}</span>
               <input
                 v-model.trim="form.proxy.username"
+                data-field="proxyUsername"
                 :disabled="!form.proxy.enable"
                 autocomplete="username"
                 class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
-                :placeholder="t('rules_proxyUsernamePlaceholder')"
+                :placeholder="isSshProxy ? t('rules_proxyUsernamePlaceholderSsh') : t('rules_proxyUsernamePlaceholder')"
                 type="text"
                 @keydown.enter.prevent
               />
@@ -111,14 +114,216 @@
               <span class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('rules_proxyPassword') }}</span>
               <input
                 v-model="form.proxy.password"
+                data-field="proxyPassword"
                 :disabled="!form.proxy.enable"
                 autocomplete="current-password"
                 class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
-                :placeholder="t('rules_proxyPasswordPlaceholder')"
+                :placeholder="isSshProxy ? t('rules_proxyPasswordPlaceholderSsh') : t('rules_proxyPasswordPlaceholder')"
                 type="password"
                 @keydown.enter.prevent
               />
             </label>
+          </div>
+
+          <!-- SSH 专属字段（type==='ssh' 时可见；字段值随类型切换保留，仅提交载荷按类型置零） -->
+          <div v-if="isSshProxy" data-ssh-fields class="mt-2 space-y-4 border-t border-slate-200 pt-4 dark:border-slate-800">
+            <p v-if="sshValidationError" class="text-xs text-red-500" role="alert">{{ sshValidationError }}</p>
+
+            <label class="block space-y-2">
+              <span class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('rules_proxyPrivateKey') }}</span>
+              <textarea
+                v-model="form.proxy.private_key"
+                data-field="proxyPrivateKey"
+                :disabled="!form.proxy.enable"
+                autocomplete="off"
+                spellcheck="false"
+                class="min-h-28 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 font-mono text-xs text-slate-700 shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                :placeholder="t('rules_proxyPrivateKeyPlaceholder')"
+              ></textarea>
+            </label>
+
+            <div class="grid gap-4 md:grid-cols-2">
+              <label class="space-y-2">
+                <span class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('rules_proxyKeyPassphrase') }}</span>
+                <input
+                  v-model="form.proxy.key_passphrase"
+                  data-field="proxyKeyPassphrase"
+                  :disabled="!form.proxy.enable"
+                  autocomplete="new-password"
+                  class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                  :placeholder="t('rules_proxyKeyPassphrasePlaceholder')"
+                  type="password"
+                  @keydown.enter.prevent
+                />
+              </label>
+
+              <label class="space-y-2">
+                <span class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('rules_proxyPoolSize') }}</span>
+                <input
+                  v-model.number="form.proxy.pool_size"
+                  data-field="proxyPoolSize"
+                  :disabled="!form.proxy.enable"
+                  class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                  :placeholder="t('rules_proxyPoolSizePlaceholder')"
+                  type="number"
+                  min="1"
+                  max="16"
+                  @keydown.enter.prevent
+                />
+              </label>
+            </div>
+
+            <!-- 跳板链：server 是单串（host:port 或 ssh://user:pass@host:port，线格式契约
+                 无独立 port 字段，UI 不拆 host/port 两个输入）；私钥经「展开」细节面板折叠，
+                 面板含私钥全文与口令两个输入，控制行高。 -->
+            <div class="space-y-2">
+              <div class="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <h4 class="text-sm font-semibold text-slate-900 dark:text-white">{{ t('rules_proxyJumpTitle') }}</h4>
+                  <p class="text-xs text-slate-500">{{ t('rules_proxyJumpDesc') }}</p>
+                </div>
+                <button
+                  type="button"
+                  data-jump-add
+                  :disabled="!form.proxy.enable"
+                  class="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-600 shadow-sm transition hover:border-primary/30 hover:text-primary disabled:cursor-not-allowed disabled:opacity-60 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300"
+                  @click="addJumpServer"
+                >
+                  <span class="material-symbols-outlined text-sm">add</span>
+                  {{ t('rules_proxyJumpAdd') }}
+                </button>
+              </div>
+
+              <div
+                v-for="(jump, index) in form.proxy.jump_servers"
+                :key="`jump-${index}`"
+                data-jump-row
+                class="space-y-2 rounded-lg border border-slate-200 bg-white p-3 dark:border-slate-700 dark:bg-slate-900/60"
+              >
+                <div class="grid gap-2 md:grid-cols-[minmax(0,2fr)_minmax(0,1fr)_minmax(0,1fr)_auto] md:items-center">
+                  <input
+                    v-model.trim="jump.server"
+                    data-field="jumpServer"
+                    :disabled="!form.proxy.enable"
+                    autocomplete="off"
+                    spellcheck="false"
+                    class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 font-mono text-xs text-slate-700 shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                    :placeholder="t('rules_proxyJumpServerPlaceholder')"
+                    type="text"
+                    @keydown.enter.prevent
+                  />
+                  <input
+                    v-model.trim="jump.username"
+                    data-field="jumpUsername"
+                    :disabled="!form.proxy.enable"
+                    autocomplete="off"
+                    class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                    :placeholder="t('rules_proxyUsername')"
+                    type="text"
+                    @keydown.enter.prevent
+                  />
+                  <input
+                    v-model="jump.password"
+                    data-field="jumpPassword"
+                    :disabled="!form.proxy.enable"
+                    autocomplete="new-password"
+                    class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                    :placeholder="t('rules_proxyPassword')"
+                    type="password"
+                    @keydown.enter.prevent
+                  />
+                  <button
+                    type="button"
+                    data-jump-remove
+                    :aria-label="t('rules_proxyJumpRemove')"
+                    :disabled="!form.proxy.enable"
+                    class="inline-flex h-9 w-9 items-center justify-center rounded-lg text-slate-400 transition hover:bg-red-50 hover:text-red-600 disabled:cursor-not-allowed disabled:opacity-60 dark:hover:bg-red-500/10 dark:hover:text-red-300"
+                    @click="removeJumpServer(index)"
+                  >
+                    <span class="material-symbols-outlined text-base">delete</span>
+                  </button>
+                </div>
+
+                <button
+                  type="button"
+                  data-jump-toggle-key
+                  :disabled="!form.proxy.enable"
+                  class="inline-flex items-center gap-1 text-xs font-medium text-slate-500 transition hover:text-primary disabled:cursor-not-allowed disabled:opacity-60 dark:text-slate-400"
+                  @click="toggleJumpKey(index)"
+                >
+                  <span class="material-symbols-outlined text-sm">{{ jump._keyOpen ? 'expand_less' : 'expand_more' }}</span>
+                  {{ jump._keyOpen ? t('rules_proxyJumpCollapseKey') : t('rules_proxyJumpExpandKey') }}
+                </button>
+
+                <div v-if="jump._keyOpen" class="space-y-2 rounded-lg bg-slate-50 p-3 dark:bg-slate-900/70">
+                  <textarea
+                    v-model="jump.private_key"
+                    data-field="jumpPrivateKey"
+                    :disabled="!form.proxy.enable"
+                    autocomplete="off"
+                    spellcheck="false"
+                    class="min-h-24 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 font-mono text-xs text-slate-700 shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                    :placeholder="t('rules_proxyPrivateKeyPlaceholder')"
+                  ></textarea>
+                  <input
+                    v-model="jump.key_passphrase"
+                    data-field="jumpKeyPassphrase"
+                    :disabled="!form.proxy.enable"
+                    autocomplete="new-password"
+                    class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                    :placeholder="t('rules_proxyKeyPassphrase')"
+                    type="password"
+                    @keydown.enter.prevent
+                  />
+                </div>
+              </div>
+            </div>
+
+            <!-- 服务器指纹（TOFU 库管理）：加载失败静默降级，不阻塞主表单 -->
+            <div data-known-hosts class="space-y-3 rounded-xl border border-dashed border-slate-300 bg-slate-50/60 p-4 dark:border-slate-700 dark:bg-slate-900/40">
+              <div>
+                <h4 class="text-sm font-semibold text-slate-900 dark:text-white">{{ t('rules_knownHostsTitle') }}</h4>
+                <p class="text-xs text-slate-500">{{ t('rules_knownHostsDesc') }}</p>
+              </div>
+
+              <p v-if="knownHosts.loading" class="text-xs text-slate-500">{{ t('rules_loading') }}</p>
+              <p v-else-if="knownHosts.failed" class="text-xs text-amber-600 dark:text-amber-400">{{ t('rules_knownHostsLoadFailed') }}</p>
+              <p v-else-if="!knownHosts.items.length" class="text-xs text-slate-500">{{ t('rules_knownHostsEmpty') }}</p>
+              <ul v-else class="space-y-2">
+                <li
+                  v-for="entry in knownHosts.items"
+                  :key="`${entry.host}:${entry.port}:${entry.fingerprint}`"
+                  :data-known-host="`${entry.host}:${entry.port}`"
+                  class="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs dark:border-slate-700 dark:bg-slate-900"
+                >
+                  <span class="font-mono font-semibold text-slate-700 dark:text-slate-200">{{ entry.host }}:{{ entry.port }}</span>
+                  <span class="text-slate-500 dark:text-slate-400">{{ entry.algorithm }}</span>
+                  <code
+                    class="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[11px] text-slate-600 dark:bg-slate-800 dark:text-slate-300"
+                    :title="entry.fingerprint"
+                  >{{ truncateFingerprint(entry.fingerprint) }}</code>
+                  <span class="text-slate-400">{{ entry.added_at }}</span>
+                  <button
+                    type="button"
+                    data-known-host-remove
+                    :aria-label="t('rules_knownHostsRemove') + '：' + entry.host + ':' + entry.port"
+                    class="ml-auto text-slate-400 transition hover:text-red-600 dark:hover:text-red-300"
+                    @click="removeKnownHost(entry)"
+                  >
+                    <span class="material-symbols-outlined text-base">delete</span>
+                  </button>
+                </li>
+              </ul>
+
+              <button
+                v-if="knownHosts.items.length"
+                type="button"
+                class="text-xs font-medium text-red-500 transition hover:text-red-600 dark:text-red-400"
+                @click="clearKnownHosts"
+              >
+                {{ t('rules_knownHostsClear') }}
+              </button>
+            </div>
           </div>
         </section>
 
@@ -271,7 +476,7 @@
           </div>
           <button
             id="rulesConfigSaveBtn"
-            :disabled="saving || !!serverError || !!proxyRulesError"
+            :disabled="saving || !!serverError || !!proxyRulesError || !!sshValidationError"
             class="inline-flex min-h-11 items-center justify-center gap-2 rounded bg-primary px-4 py-2 text-sm font-medium text-white transition hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-60"
             type="submit"
           >
@@ -340,7 +545,12 @@ function defaultConfig() {
       type: 'socks5',
       server: '',
       username: '',
-      password: ''
+      password: '',
+      // SSH 专属字段（线格式 customer.proxy；非 ssh 类型提交时置零值，见 handleSubmit）
+      private_key: '',
+      key_passphrase: '',
+      pool_size: '',
+      jump_servers: []
     },
     ai_rules: {},
     proxy_rules: []
@@ -670,15 +880,38 @@ function normalizeProxyRules(raw) {
   return normalizeStringList(raw);
 }
 
+// jump_servers 线格式（SSHJumpServerRaw）：server 是单串（host:port 或
+// ssh://user:pass@host:port），无独立 port 字段——UI 与载荷都按单串原样透传。
+// 归一化只白名单五个线格式字段，行内 UI 状态（_keyOpen 折叠开关）在此剥除。
+function normalizeJumpServers(raw) {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  return raw.map((entry) => ({
+    server: typeof entry?.server === 'string' ? entry.server : '',
+    username: typeof entry?.username === 'string' ? entry.username : '',
+    password: typeof entry?.password === 'string' ? entry.password : '',
+    private_key: typeof entry?.private_key === 'string' ? entry.private_key : '',
+    key_passphrase: typeof entry?.key_passphrase === 'string' ? entry.key_passphrase : ''
+  }));
+}
+
 function normalizeConfig(config = {}) {
   const defaults = defaultConfig();
+  const rawPoolSize = config?.proxy?.pool_size;
   return {
     proxy: {
       enable: valueOrDefaultBoolean(config?.proxy?.enable, true),
-      type: config?.proxy?.type === 'http' ? 'http' : defaults.proxy.type,
+      type: ['http', 'ssh'].includes(config?.proxy?.type) ? config.proxy.type : defaults.proxy.type,
       server: typeof config?.proxy?.server === 'string' ? config.proxy.server : defaults.proxy.server,
       username: typeof config?.proxy?.username === 'string' ? config.proxy.username : defaults.proxy.username,
-      password: typeof config?.proxy?.password === 'string' ? config.proxy.password : defaults.proxy.password
+      password: typeof config?.proxy?.password === 'string' ? config.proxy.password : defaults.proxy.password,
+      private_key: typeof config?.proxy?.private_key === 'string' ? config.proxy.private_key : '',
+      key_passphrase: typeof config?.proxy?.key_passphrase === 'string' ? config.proxy.key_passphrase : '',
+      // 空串 = 未设置（输入框空 + placeholder「默认 3」）；提交时转 0，默认与 1..16
+      // 钳位由后端 ssh.New 承担（解析层 0 即 0）
+      pool_size: typeof rawPoolSize === 'number' && Number.isFinite(rawPoolSize) && rawPoolSize > 0 ? rawPoolSize : '',
+      jump_servers: normalizeJumpServers(config?.proxy?.jump_servers)
     },
     ai_rules: normalizeAiRules(config?.ai_rules),
     proxy_rules: normalizeProxyRules(config?.proxy_rules)
@@ -848,6 +1081,12 @@ export default {
         draft: ''
       },
       form: normalizeConfig(this.config),
+      // 服务器指纹（TOFU）区块状态：失败静默降级，不阻塞主表单
+      knownHosts: {
+        loading: false,
+        failed: false,
+        items: []
+      },
       _proxyRulesText: '',
       _providerIncludeTexts: {},
       _showSuccessDialog: false,
@@ -879,6 +1118,10 @@ export default {
       this.cancelProviderEditor();
     };
     document.addEventListener('click', this._providerEditorClickHandler, true);
+    // SSH 类型挂载即拉取指纹列表；socks5/http → ssh 的切换由 type watcher 补拉
+    if (this.form.proxy.type === 'ssh') {
+      this.loadKnownHosts();
+    }
   },
   beforeUnmount() {
     this.clearSuccessDialogTimer();
@@ -890,6 +1133,9 @@ export default {
   computed: {
     providerOrder() {
       return mergeProviderOrder(providerKeys(this.form.ai_rules), this.presetProviders);
+    },
+    isSshProxy() {
+      return this.form.proxy.type === 'ssh';
     },
     serverError() {
       if (!this.form.proxy.enable) return '';
@@ -914,6 +1160,23 @@ export default {
     // HIGH#4：proxy_rules 逗号多域名行的兼容塌缩提示（仅保留末段，其余段被忽略）。
     proxyRulesCollapseHint() {
       return detectCommaCollapseIssue(this._proxyRulesText, this.t);
+    },
+    // —— SSH 校验（与后端 SSHProxyConfig.Validate 对齐的提示层，后端保存时仍是权威）——
+    // username 必填 + 密码/私钥至少其一；跳板行同规则（server/username/认证至少其一，
+    // 序号从 1 起）。仅 enable 且 type==='ssh' 时生效；整行留空的跳板行先经
+    // activeJumpServers 过滤（UI 空行不参与校验也不进载荷）。
+    sshValidationError() {
+      if (!this.form.proxy.enable || this.form.proxy.type !== 'ssh') return '';
+      if (!String(this.form.proxy.username || '').trim()) return this.t('rules_sshValidationErrorUsername');
+      if (!this.form.proxy.password && !this.form.proxy.private_key) return this.t('rules_sshValidationErrorAuth');
+      const jumps = this.activeJumpServers();
+      for (let i = 0; i < jumps.length; i++) {
+        const jump = jumps[i];
+        if (!jump.server) return this.t('rules_sshValidationErrorJumpServer', { index: i + 1 });
+        if (!jump.username) return this.t('rules_sshValidationErrorJumpUsername', { index: i + 1 });
+        if (!jump.password && !jump.private_key) return this.t('rules_sshValidationErrorJumpAuth', { index: i + 1 });
+      }
+      return '';
     },
     providerEditorError() {
       if (!this.providerEditor.provider) return '';
@@ -957,6 +1220,12 @@ export default {
         this.form = normalizeConfig(nextConfig);
         this.ensureProviders();
         this.syncTextFromForm();
+      }
+    },
+    // 切到 ssh 时拉取指纹列表（每次切换刷新；socks5/http 不请求）
+    'form.proxy.type'(nextType) {
+      if (nextType === 'ssh') {
+        this.loadKnownHosts();
       }
     },
     presetProviders: {
@@ -1078,6 +1347,84 @@ export default {
       }
       this.cancelProviderEditor();
     },
+    // —— SSH 跳板链编辑 ——
+    // 参与校验与载荷的跳板行：trim 后整行全空的行静默丢弃（新增即留空的 UI 行），
+    // 半填行保留（交由 sshValidationError 给出序号文案）。产物只含线格式五字段。
+    activeJumpServers() {
+      const rows = Array.isArray(this.form.proxy.jump_servers) ? this.form.proxy.jump_servers : [];
+      return rows
+        .map((row) => ({
+          server: String(row?.server ?? '').trim(),
+          username: String(row?.username ?? '').trim(),
+          password: String(row?.password ?? ''),
+          private_key: String(row?.private_key ?? ''),
+          key_passphrase: String(row?.key_passphrase ?? '')
+        }))
+        .filter((row) => row.server || row.username || row.password || row.private_key || row.key_passphrase);
+    },
+    addJumpServer() {
+      this.form.proxy.jump_servers.push({
+        server: '',
+        username: '',
+        password: '',
+        private_key: '',
+        key_passphrase: '',
+        _keyOpen: false
+      });
+    },
+    removeJumpServer(index) {
+      this.form.proxy.jump_servers.splice(index, 1);
+    },
+    toggleJumpKey(index) {
+      const row = this.form.proxy.jump_servers[index];
+      if (row) {
+        row._keyOpen = !row._keyOpen;
+      }
+    },
+    // —— 服务器指纹（TOFU）区块 ——
+    // 请求失败静默降级（failed 文案），不抛错、不阻塞主表单。
+    async loadKnownHosts() {
+      this.knownHosts.loading = true;
+      this.knownHosts.failed = false;
+      try {
+        const res = await fetch('/api/proxy/ssh/known-hosts', { credentials: 'same-origin' });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const json = await res.json();
+        const items = json?.data?.known_hosts;
+        this.knownHosts.items = Array.isArray(items) ? items : [];
+      } catch {
+        this.knownHosts.items = [];
+        this.knownHosts.failed = true;
+      } finally {
+        this.knownHosts.loading = false;
+      }
+    },
+    async removeKnownHost(entry) {
+      try {
+        const query = `?host=${encodeURIComponent(entry.host)}&port=${encodeURIComponent(entry.port)}`;
+        await fetch(`/api/proxy/ssh/known-hosts${query}`, { method: 'DELETE', credentials: 'same-origin' });
+      } catch {
+        // 删除失败同样静默：下方刷新会把最新列表（或失败文案）带回来
+      }
+      await this.loadKnownHosts();
+    },
+    async clearKnownHosts() {
+      if (typeof window !== 'undefined' && typeof window.confirm === 'function') {
+        if (!window.confirm(this.t('rules_knownHostsClearConfirm'))) {
+          return;
+        }
+      }
+      try {
+        await fetch('/api/proxy/ssh/known-hosts', { method: 'DELETE', credentials: 'same-origin' });
+      } catch {
+        // 同上：刷新兜底
+      }
+      await this.loadKnownHosts();
+    },
+    truncateFingerprint(fingerprint) {
+      const value = String(fingerprint || '');
+      return value.length > 20 ? `${value.slice(0, 20)}…` : value;
+    },
     async handleSubmit() {
       const normalized = normalizeConfig(this.form);
       normalized.proxy_rules = sanitizeLines(this._proxyRulesText);
@@ -1090,6 +1437,20 @@ export default {
       // 保存前逐条校验：任一非法则不提交（错误文案已在对应输入处实时展示）
       if (firstEntryIssue(normalized.proxy_rules, this.t)) return;
       if (this.submitError) return;
+      if (this.sshValidationError) return;
+
+      // SSH 载荷口径：跳板行取过滤后的线格式五字段；pool_size 空串归 0（后端
+      // 默认 3、1..16 钳位由 ssh.New 承担）。非 ssh 类型置零值清除后端旧值
+      //（父层 diff-patch 对空串字段默认不发送，靠 SettingsPage 显式清零兜底）。
+      if (normalized.proxy.type === 'ssh') {
+        normalized.proxy.jump_servers = this.activeJumpServers();
+        normalized.proxy.pool_size = Number(normalized.proxy.pool_size) || 0;
+      } else {
+        normalized.proxy.private_key = '';
+        normalized.proxy.key_passphrase = '';
+        normalized.proxy.pool_size = 0;
+        normalized.proxy.jump_servers = [];
+      }
 
       this.$emit('save', normalized);
     }

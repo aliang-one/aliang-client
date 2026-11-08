@@ -182,6 +182,12 @@ func registerAgentRoutes(mux *http.ServeMux) {
 	// （2026-10-21 liang-dev 实测 404 透传）。
 	mux.HandleFunc("/api/agent/runtime-sessions", agentHandler.HandleRuntimeSessions)
 	mux.HandleFunc("/api/agent/terminal/{sessionId}/scrollback", agentHandler.HandleTerminalScrollback)
+	// SSH TOFU 指纹库管理(spec §⑨):GET 列表 / DELETE 单条或裸删清空,方法分流
+	// 在 handler 内 switch。known_hosts 路径与 core 侧同源(cache/ssh/known_hosts,
+	// 与 outbound registry 共库);无状态,两进程各持一个实例等价。双注册另一处
+	// routes.go(缺任一侧=404,2026-10-21 教训)。
+	sshKnownHostsHandler := handlers.NewSSHKnownHostsHandlerFromCache()
+	mux.HandleFunc("/api/proxy/ssh/known-hosts", sshKnownHostsHandler.HandleKnownHosts)
 }
 
 func loopbackOnly(next http.Handler) http.Handler {

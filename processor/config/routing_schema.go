@@ -147,11 +147,11 @@ func (cfg *CanonicalRoutingSchema) Validate() error {
 	}
 
 	if cfg.Egress.ToSocks.Enabled {
-		if cfg.Egress.ToSocks.Upstream.Type != "socks" && cfg.Egress.ToSocks.Upstream.Type != "http" {
-			return newRoutingSchemaValidationError("invalid_enum", "egress.toSocks.upstream.type", fmt.Sprintf("must be one of [socks http] when toSocks is enabled, got %q", cfg.Egress.ToSocks.Upstream.Type))
+		if cfg.Egress.ToSocks.Upstream.Type != "socks" && cfg.Egress.ToSocks.Upstream.Type != "http" && cfg.Egress.ToSocks.Upstream.Type != "ssh" {
+			return newRoutingSchemaValidationError("invalid_enum", "egress.toSocks.upstream.type", fmt.Sprintf("must be one of [socks http ssh] when toSocks is enabled, got %q", cfg.Egress.ToSocks.Upstream.Type))
 		}
-	} else if cfg.Egress.ToSocks.Upstream.Type != "" && cfg.Egress.ToSocks.Upstream.Type != "socks" && cfg.Egress.ToSocks.Upstream.Type != "http" {
-		return newRoutingSchemaValidationError("invalid_enum", "egress.toSocks.upstream.type", fmt.Sprintf("must be one of [socks http] when provided, got %q", cfg.Egress.ToSocks.Upstream.Type))
+	} else if cfg.Egress.ToSocks.Upstream.Type != "" && cfg.Egress.ToSocks.Upstream.Type != "socks" && cfg.Egress.ToSocks.Upstream.Type != "http" && cfg.Egress.ToSocks.Upstream.Type != "ssh" {
+		return newRoutingSchemaValidationError("invalid_enum", "egress.toSocks.upstream.type", fmt.Sprintf("must be one of [socks http ssh] when provided, got %q", cfg.Egress.ToSocks.Upstream.Type))
 	}
 
 	for i := range cfg.Routing.Rules {

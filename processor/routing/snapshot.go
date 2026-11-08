@@ -406,6 +406,8 @@ func resolveToSocksUpstreamType(cfg *config.Config) (string, bool) {
 			return "http", true
 		case "socks5":
 			return "socks", true
+		case "ssh":
+			return "ssh", true
 		}
 	}
 

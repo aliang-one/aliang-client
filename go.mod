@@ -34,6 +34,7 @@ require (
 	github.com/swaggo/http-swagger/v2 v2.0.2
 	github.com/xjasonlyu/tun2socks/v2 v2.6.0
 	go.uber.org/automaxprocs v1.6.0
+	golang.org/x/crypto v0.48.0
 	golang.org/x/term v0.40.0
 	golang.org/x/time v0.15.0
 	golang.zx2c4.com/wireguard v0.0.0-20250521234502-f333402bd9cb
@@ -117,7 +118,6 @@ require (
 	github.com/zeebo/blake3 v0.2.4 // indirect
 	go.uber.org/zap/exp v0.3.0 // indirect
 	go4.org/netipx v0.0.0-20231129151722-fdeea329fbba // indirect
-	golang.org/x/crypto v0.48.0 // indirect
 	golang.org/x/exp v0.0.0-20250506013437-ce4c2cf36ca6 // indirect
 	golang.org/x/mod v0.33.0 // indirect
 	golang.org/x/oauth2 v0.35.0 // indirect
