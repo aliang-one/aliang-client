@@ -139,6 +139,17 @@ func TestSSHIngressHostKeyStableAcrossRestarts(t *testing.T) {
 	if fp2, _ := s2.HostKeyFingerprint(); fp2 != fp1 {
 		t.Fatalf("host key fingerprint must survive restarts: %q -> %q", fp1, fp2)
 	}
+	// 指纹不变量(Task 7 附带断言):文件解析路径(ReadHostKeyInfo,指纹
+	// API 的口径)与服务端加载路径(Server.Start 落盘→加载)必须产出同一
+	// 指纹——两条路径若出现格式漂移,仪表盘展示的指纹就会与实服务钥错位,
+	// 客户端 known_hosts 核对失真。
+	info, err := ReadHostKeyInfo(path)
+	if err != nil {
+		t.Fatalf("ReadHostKeyInfo(%s): %v", path, err)
+	}
+	if info.Fingerprint != fp1 {
+		t.Fatalf("file-parsed fingerprint %q must equal server-loaded fingerprint %q (no drift between parse paths)", info.Fingerprint, fp1)
+	}
 }
 
 func TestSSHIngressHostKeyRegeneratedOnCorrupt(t *testing.T) {

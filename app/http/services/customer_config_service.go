@@ -14,8 +14,10 @@ import (
 
 	"aliang.one/nursorgate/app/http/models"
 	"aliang.one/nursorgate/app/http/storage"
+	"aliang.one/nursorgate/common/cache"
 	"aliang.one/nursorgate/common/logger"
 	"aliang.one/nursorgate/common/model"
+	sshin "aliang.one/nursorgate/inbound/ssh"
 	M "aliang.one/nursorgate/inbound/tun/metadata"
 	"aliang.one/nursorgate/outbound"
 	"aliang.one/nursorgate/processor/config"
@@ -23,6 +25,8 @@ import (
 	"aliang.one/nursorgate/processor/routing"
 	"aliang.one/nursorgate/processor/rules"
 	"aliang.one/nursorgate/processor/statistic"
+
+	gossh "golang.org/x/crypto/ssh"
 )
 
 const customerConfigFilePath = "~/.aliang/config.json"
@@ -175,6 +179,7 @@ func (s *CustomerConfigService) UpdateCommittedCustomerConfig(payload []byte) (*
 			clearRoutingDecisionCache()
 			closeDisabledAIAcceleratedConnections(previousCfg, &committedCfg)
 			mirror.InitGlobalForwarder()
+			reconcileSSHIngressAfterCommit(&committedCfg)
 			return nil
 		},
 	)
@@ -230,6 +235,93 @@ func refreshRoutingRuntimeAfterCustomerConfigCommit(committedCfg *config.Config)
 		return routing.CompileRuntimeSnapshot(cfg)
 	})
 	return err
+}
+
+// reconcileSSHIngressAfterCommit 把已提交配置的 SSH 入口期望态作用到运行面
+// (Task 7 接线,提交协调路径的运行面收尾步):EffectiveSSHIngress nil
+// (未配置/总开关关)→期望停;非 nil→翻译成 inbound/ssh.RunConfig 交
+// Reconcile 启停/按变更重启(端口/凭证变更即重启,重复提交同配置不重启)。
+//
+// 失败仅日志不阻断配置提交:SSH 入口是服务面非关键路径,回调里其余运行面
+// 刷新已生效,为入口回滚整套配置代价不成比例;坏状态停留止,下次提交重试
+// (协调器恒回调,不做内容去重)。注意:启动期没有自动 reconcile——进程
+// 重启后入口随首次 customer 配置提交恢复,启动期接线归后续任务。
+//
+// Bind host 语义:Server 监听 config.ServiceBindHost()(默认 127.0.0.1,
+// 显式 --host 放宽)——与 56431/56432「默认安全」姿态一致;LAN 开放入口
+// 需显式 --host,属部署姿态(配置里无 host 字段,刻意不发明)。
+func reconcileSSHIngressAfterCommit(committedCfg *config.Config) {
+	effective := committedCfg.EffectiveSSHIngress()
+	if effective == nil {
+		// 期望停:不触 cache 目录/agent 单例——无入口配置的存量提交零额外副作用。
+		sshin.Reconcile(nil, "", nil)
+		return
+	}
+	rc := buildSSHIngressRunConfig(effective)
+	hostKeyPath := sshIngressHostKeyPath()
+	if rc == nil || hostKeyPath == "" {
+		// 全量凭证解析失败(手改文件绕过保存校验)或 cache 目录不可解析:
+		// 开着门无人能进的入口毫无意义,按期望停处理(镜像 Validate
+		// 「至少一把钥匙」规则),Warn 已在各自 helper 内记。
+		sshin.Reconcile(nil, "", nil)
+		return
+	}
+	// LocalNodeID 注入缝:防环 AppendHop 读的节点标识经 AgentService
+	// currentDeviceID 活取(闭包绑定单例指针,读时求值);ForwardGate 留
+	// nil=全放行(凭证列表即 ACL)——customer.mesh 的转发门禁/ACL 随组网
+	// 分支落地后改注入门禁函数,spec §3 裁定与 inbound/ssh RunConfig.
+	// ForwardGate 注释互指(合并集成缝)。
+	sshin.Reconcile(rc, hostKeyPath, GetSharedAgentService().currentDeviceID)
+}
+
+// sshIngressHostKeyPath 解析入口 host key 落盘路径:cache/ssh/ + inbound/ssh
+// 导出的 IngressHostKeyFileName。与 host key 指纹 API(ssh_ingress_handler
+// 的 NewSSHIngressHandlerFromCache)同源同口径——编译器强制展示指纹与
+// Server.Start 落盘钥同文件(错位=展示指纹≠实服务钥,Task 6 交接项)。
+// 解析失败不阻断提交:Warn+空串,调用方按期望停处理。
+func sshIngressHostKeyPath() string {
+	dir, err := cache.GetCacheSubdir("ssh")
+	if err != nil {
+		logger.Warn("resolve ssh ingress host key dir failed, ingress stays stopped: " + err.Error())
+		return ""
+	}
+	return filepath.Join(dir, sshin.IngressHostKeyFileName)
+}
+
+// buildSSHIngressRunConfig 把归一化后的 customer.ssh_ingress 翻译成
+// inbound/ssh.RunConfig:authorized_keys 行逐条 gossh.ParseAuthorizedKey。
+// 单条解析失败跳过并 Warn——配置层 Validate 已在保存通道拦截,此处防御
+// 手改文件绕过校验的坏值(半坏配置按好部分继续跑)。两列表全部解析失败
+// 返回 nil,交给调用方按期望停处理。
+func buildSSHIngressRunConfig(effective *config.SSHIngressConfig) *sshin.RunConfig {
+	authorized := parseSSHIngressAuthorizedKeys("authorized_keys", effective.AuthorizedKeys)
+	mesh := parseSSHIngressAuthorizedKeys("mesh_authorized_keys", effective.MeshAuthorizedKeys)
+	if len(authorized) == 0 && len(mesh) == 0 {
+		logger.Warn("ssh_ingress enabled but no authorized key parses, ingress stays stopped")
+		return nil
+	}
+	return &sshin.RunConfig{
+		Port:           effective.Port,
+		AuthorizedKeys: authorized,
+		MeshKeys:       mesh,
+		// ForwardGate 合并集成缝,见 reconcileSSHIngressAfterCommit 注释。
+		ForwardGate: nil,
+	}
+}
+
+// parseSSHIngressAuthorizedKeys 逐行解析 authorized_keys 行为公钥身份;
+// 坏行跳过+Warn(保存通道已拦,此处防御),返回可解析子集。
+func parseSSHIngressAuthorizedKeys(field string, lines []string) []gossh.PublicKey {
+	keys := make([]gossh.PublicKey, 0, len(lines))
+	for _, line := range lines {
+		pub, _, _, _, err := gossh.ParseAuthorizedKey([]byte(line))
+		if err != nil {
+			logger.Warn(fmt.Sprintf("ssh_ingress.%s key skipped (unparseable): %v", field, err))
+			continue
+		}
+		keys = append(keys, pub)
+	}
+	return keys
 }
 
 func clearRoutingDecisionCache() {
