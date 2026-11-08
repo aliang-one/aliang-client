@@ -180,6 +180,12 @@ func initializeCoreSubsystems() error {
 	// NewAgentService——后者在 user agent runtime 也会构造,双装会抢
 	// 56440/56441 并广播双 beacon。device_id 解析常驻身份文件,幂等。
 	tunnel.StartMeshLANAssembly(services.GetSharedAgentService().CurrentDeviceID)
+	// SSH 入口启动恢复:customer 配置已在上方加载完成,按其期望态 reconcile
+	// ——重启后自动恢复已启用入口(平台代理自愈的同款纪律:失败仅日志不
+	// 阻断 boot)。与配置提交协调路径共用 services.ReconcileSSHIngressFromConfig
+	// 防两处漂移;入口归 core 进程所有(配置提交与路由管线都在 core),
+	// user-agent 侧不接线(拆分所有权重叠,见该函数注释与任务报告)。
+	services.ReconcileSSHIngressFromConfig(config.GetGlobalConfig())
 
 	logger.Info("Core subsystems initialized")
 	return nil

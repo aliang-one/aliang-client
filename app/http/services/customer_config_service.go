@@ -14,8 +14,10 @@ import (
 
 	"aliang.one/nursorgate/app/http/models"
 	"aliang.one/nursorgate/app/http/storage"
+	"aliang.one/nursorgate/common/cache"
 	"aliang.one/nursorgate/common/logger"
 	"aliang.one/nursorgate/common/model"
+	sshin "aliang.one/nursorgate/inbound/ssh"
 	M "aliang.one/nursorgate/inbound/tun/metadata"
 	"aliang.one/nursorgate/outbound"
 	"aliang.one/nursorgate/processor/config"
@@ -23,6 +25,8 @@ import (
 	"aliang.one/nursorgate/processor/routing"
 	"aliang.one/nursorgate/processor/rules"
 	"aliang.one/nursorgate/processor/statistic"
+
+	gossh "golang.org/x/crypto/ssh"
 )
 
 const customerConfigFilePath = "~/.aliang/config.json"
@@ -182,6 +186,7 @@ func (s *CustomerConfigService) UpdateCommittedCustomerConfig(payload []byte) (*
 			clearRoutingDecisionCache()
 			closeDisabledAIAcceleratedConnections(previousCfg, &committedCfg)
 			mirror.InitGlobalForwarder()
+			ReconcileSSHIngressFromConfig(&committedCfg)
 			return nil
 		},
 	)
@@ -237,6 +242,95 @@ func refreshRoutingRuntimeAfterCustomerConfigCommit(committedCfg *config.Config)
 		return routing.CompileRuntimeSnapshot(cfg)
 	})
 	return err
+}
+
+// ReconcileSSHIngressFromConfig 把给定配置的 SSH 入口期望态作用到运行面。
+// **两个调用点共用本函数(防两处漂移)**:① customer 配置提交协调路径
+// (UpdateCommittedCustomerConfig 的内存提交回调,端口/凭证变更即重启,
+// 重复提交同配置不重启);② core 启动序列(cmd/core.go initializeCoreSubsystems
+// 与 cmd/start.go runStart,配置加载完成后)——重启后自动恢复已启用入口。
+// EffectiveSSHIngress nil(未配置/总开关关)→期望停;非 nil→翻译成
+// inbound/ssh.RunConfig 交 Reconcile 启停。
+//
+// 失败仅日志不上抛:提交侧不因入口回滚整套配置(其余运行面刷新已生效,
+// 协调器恒回调不做内容去重,下次提交重试);启动侧不阻断 boot(服务面非
+// 关键路径,下次提交或下次重启重试)。
+//
+// Bind host 语义:Server 监听 config.ServiceBindHost()(默认 127.0.0.1,
+// 显式 --host 放宽)——与 56431/56432「默认安全」姿态一致;LAN 开放入口
+// 需显式 --host,属部署姿态(配置里无 host 字段,刻意不发明)。
+func ReconcileSSHIngressFromConfig(cfg *config.Config) {
+	effective := cfg.EffectiveSSHIngress()
+	if effective == nil {
+		// 期望停:不触 cache 目录/agent 单例——无入口配置的提交/启动零额外副作用。
+		sshin.Reconcile(nil, "", nil)
+		return
+	}
+	rc := buildSSHIngressRunConfig(effective)
+	hostKeyPath := sshIngressHostKeyPath()
+	if rc == nil || hostKeyPath == "" {
+		// 全量凭证解析失败(手改文件绕过保存校验)或 cache 目录不可解析:
+		// 开着门无人能进的入口毫无意义,按期望停处理(镜像 Validate
+		// 「至少一把钥匙」规则),Warn 已在各自 helper 内记。
+		sshin.Reconcile(nil, "", nil)
+		return
+	}
+	// LocalNodeID 注入缝:防环 AppendHop 读的节点标识经 AgentService
+	// currentDeviceID 活取(闭包绑定单例指针,读时求值);ForwardGate 留
+	// nil=全放行(凭证列表即 ACL)——customer.mesh 的转发门禁/ACL 随组网
+	// 分支落地后改注入门禁函数,spec §3 裁定与 inbound/ssh RunConfig.
+	// ForwardGate 注释互指(合并集成缝)。
+	sshin.Reconcile(rc, hostKeyPath, GetSharedAgentService().currentDeviceID)
+}
+
+// sshIngressHostKeyPath 解析入口 host key 落盘路径:cache/ssh/ + inbound/ssh
+// 导出的 IngressHostKeyFileName。与 host key 指纹 API(ssh_ingress_handler
+// 的 NewSSHIngressHandlerFromCache)同源同口径——编译器强制展示指纹与
+// Server.Start 落盘钥同文件(错位=展示指纹≠实服务钥,Task 6 交接项)。
+// 解析失败不阻断提交:Warn+空串,调用方按期望停处理。
+func sshIngressHostKeyPath() string {
+	dir, err := cache.GetCacheSubdir("ssh")
+	if err != nil {
+		logger.Warn("resolve ssh ingress host key dir failed, ingress stays stopped: " + err.Error())
+		return ""
+	}
+	return filepath.Join(dir, sshin.IngressHostKeyFileName)
+}
+
+// buildSSHIngressRunConfig 把归一化后的 customer.ssh_ingress 翻译成
+// inbound/ssh.RunConfig:authorized_keys 行逐条 gossh.ParseAuthorizedKey。
+// 单条解析失败跳过并 Warn——配置层 Validate 已在保存通道拦截,此处防御
+// 手改文件绕过校验的坏值(半坏配置按好部分继续跑)。两列表全部解析失败
+// 返回 nil,交给调用方按期望停处理。
+func buildSSHIngressRunConfig(effective *config.SSHIngressConfig) *sshin.RunConfig {
+	authorized := parseSSHIngressAuthorizedKeys("authorized_keys", effective.AuthorizedKeys)
+	mesh := parseSSHIngressAuthorizedKeys("mesh_authorized_keys", effective.MeshAuthorizedKeys)
+	if len(authorized) == 0 && len(mesh) == 0 {
+		logger.Warn("ssh_ingress enabled but no authorized key parses, ingress stays stopped")
+		return nil
+	}
+	return &sshin.RunConfig{
+		Port:           effective.Port,
+		AuthorizedKeys: authorized,
+		MeshKeys:       mesh,
+		// ForwardGate 合并集成缝,见 ReconcileSSHIngressFromConfig 注释。
+		ForwardGate: nil,
+	}
+}
+
+// parseSSHIngressAuthorizedKeys 逐行解析 authorized_keys 行为公钥身份;
+// 坏行跳过+Warn(保存通道已拦,此处防御),返回可解析子集。
+func parseSSHIngressAuthorizedKeys(field string, lines []string) []gossh.PublicKey {
+	keys := make([]gossh.PublicKey, 0, len(lines))
+	for _, line := range lines {
+		pub, _, _, _, err := gossh.ParseAuthorizedKey([]byte(line))
+		if err != nil {
+			logger.Warn(fmt.Sprintf("ssh_ingress.%s key skipped (unparseable): %v", field, err))
+			continue
+		}
+		keys = append(keys, pub)
+	}
+	return keys
 }
 
 func clearRoutingDecisionCache() {
@@ -388,6 +482,7 @@ func normalizeCustomerPayload(payload []byte) (map[string]interface{}, error) {
 			}
 			sort.Strings(forbidden)
 			return nil, fmt.Errorf("customer.%s is forbidden: editable customer fields are [proxy ai_rules proxy_rules traffic_mirror http1_drop model_mapping custom_env_vars geoip agentcore_llm agentcore peer_mcp mesh]", forbidden[0])
+			return nil, fmt.Errorf("customer.%s is forbidden: editable customer fields are [proxy ai_rules proxy_rules traffic_mirror http1_drop model_mapping custom_env_vars geoip agentcore_llm agentcore peer_mcp ssh_ingress]", forbidden[0])
 		}
 		rawRoot = map[string]json.RawMessage{}
 		if err := json.Unmarshal(rawCustomer, &rawRoot); err != nil {
@@ -415,9 +510,9 @@ func validateEditableCustomerKeys(rawRoot map[string]json.RawMessage) error {
 	for key := range rawRoot {
 		// 字段清单与 processor/config/types.go customerUnknownKeyErrors 的文案逐字同步,改一处必改三处(两 switch + 三文案)。
 		switch key {
-		case "proxy", "ai_rules", "proxy_rules", "traffic_mirror", "http1_drop", "model_mapping", "custom_env_vars", "geoip", "agentcore_llm", "agentcore", "peer_mcp", "mesh":
+		case "proxy", "ai_rules", "proxy_rules", "traffic_mirror", "http1_drop", "model_mapping", "custom_env_vars", "geoip", "agentcore_llm", "agentcore", "peer_mcp", "mesh", "ssh_ingress":
 		default:
-			return fmt.Errorf("customer.%s is forbidden: editable customer fields are [proxy ai_rules proxy_rules traffic_mirror http1_drop model_mapping custom_env_vars geoip agentcore_llm agentcore peer_mcp mesh]", key)
+			return fmt.Errorf("customer.%s is forbidden: editable customer fields are [proxy ai_rules proxy_rules traffic_mirror http1_drop model_mapping custom_env_vars geoip agentcore_llm agentcore peer_mcp ssh_ingress]", key)
 		}
 	}
 	return nil

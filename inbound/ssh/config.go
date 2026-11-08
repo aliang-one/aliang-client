@@ -1,0 +1,40 @@
+// Package ssh 提供节点内置的 SSH 入口服务(x/crypto sshd):
+// 双形态准入——标准 ssh 客户端裸流(direct-tcpip)与 mesh 帧外壳,
+// 公钥即形态区分器,禁密码;生命周期/host key/认证限速/通道安全收敛
+// 见 server.go 与 ratelimit.go。
+package ssh
+
+import gossh "golang.org/x/crypto/ssh"
+
+// 入口连接形态:认证时写入 Permissions.Extensions[extIngressForm],
+// 通道层读取分流(Task 4/5 按形态注入管线)。
+const (
+	FormBare = "bare" // 形态①:authorized_keys 人用凭证,标准客户端裸流
+	FormMesh = "mesh" // 形态②:mesh_authorized_keys 节点互连帧外壳
+)
+
+// extIngressForm 是认证 Permissions 中携带入口形态的扩展键。
+const extIngressForm = "ingress_form"
+
+// RunConfig 是服务运行期配置,由配置层 EffectiveSSHIngress 翻转而来
+// (authorized_keys 行经 gossh.ParseAuthorizedKey 解析为 gossh.PublicKey)。
+// 构造后视为不可变:配置变更由装配层(Reconcile)重建 Server 实例,
+// 不原地改写——认证回调与通道处理全程只读此结构。
+type RunConfig struct {
+	Port uint16
+	// AuthorizedKeys 是形态①凭证(人用 authorized_keys)。
+	AuthorizedKeys []gossh.PublicKey
+	// MeshKeys 是形态②凭证(mesh_authorized_keys)。
+	MeshKeys []gossh.PublicKey
+
+	// LocalNodeID 返回本机节点标识(防环 AppendHop 用)。由装配层注入
+	// (AgentService.currentDeviceID);测试注入闭包。nil=形态②整体禁用
+	// (防御:装配未完成时不放行 mesh 帧)。
+	LocalNodeID func() string
+
+	// ForwardGate 返回(转发总开关, 允许的转发方列表)。合并集成缝:
+	// customer.mesh 的 EffectiveForwardEnabled+Peers ACL 随 mesh 分支落地,
+	// 本分支注入 nil=全放行(凭证列表即 ACL);合并后装配层改注入 mesh
+	// 的门禁函数,测试可注入闭包。
+	ForwardGate func() (bool, []string)
+}

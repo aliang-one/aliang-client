@@ -6,9 +6,11 @@ import (
 	"fmt"
 
 	httpServer "aliang.one/nursorgate/app/http"
+	"aliang.one/nursorgate/app/http/services"
 	"aliang.one/nursorgate/app/tray"
 	"aliang.one/nursorgate/common/logger"
 	auth "aliang.one/nursorgate/processor/auth"
+	"aliang.one/nursorgate/processor/config"
 	"aliang.one/nursorgate/processor/runtime"
 	"aliang.one/nursorgate/processor/setup"
 	"github.com/spf13/cobra"
@@ -67,6 +69,12 @@ func runTray(cmd *cobra.Command, args []string) error {
 	if err := InitializeGlobalRuleEngine(); err != nil {
 		logger.Error(fmt.Sprintf("Failed to initialize global rule engine for tray mode: %v", err))
 	}
+
+	// SSH 入口启动恢复:配置已加载,按期望态 reconcile——重启后自动恢复
+	// 已启用入口(失败仅日志不阻断 boot)。与配置提交协调路径共用
+	// services.ReconcileSSHIngressFromConfig 防漂移;start.go runStart 与
+	// core.go initializeCoreSubsystems 同款接线(三条 core 启动路径齐)。
+	services.ReconcileSSHIngressFromConfig(config.GetGlobalConfig())
 
 	if err := httpServer.StartHttpServer(); err != nil {
 		return fmt.Errorf("failed to start dashboard server for tray mode: %w", err)

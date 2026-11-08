@@ -154,6 +154,15 @@
                   :version="customerConfigVersion"
                   @save="saveCustomerConfig"
                 />
+                <!-- SSH 入口卡片（代理族,出口设置的相邻挂载;常驻显示,与 proxy.type 无关） -->
+                <SshIngressSettings
+                  :config="customerConfig"
+                  :loading="isLoadingCustomerConfig"
+                  :saving="isSavingCustomerConfig"
+                  :error="customerConfigError"
+                  :success-message="customerConfigSuccess"
+                  @save="saveCustomerConfig"
+                />
               </template>
             </div>
             <!-- 右栏:运行模式免登录(设备本地,与电源按钮同级);模型映射依赖
@@ -256,6 +265,7 @@
 // Agent 子组件收拢在 settings/agent/AgentPage.vue；设备级杂项已于 2026-11-05
 // 迁出：运行模式→代理设置首卡，系统状态/文件访问授权→仪表盘侧栏紧凑卡。
 import RulesSettings from './settings/RulesSettings.vue';
+import SshIngressSettings, { normalizeSSHIngressConfig } from './settings/SshIngressSettings.vue';
 import UserInfoSettings from './settings/UserInfoSettings.vue';
 import LogsSettings from './settings/LogsSettings.vue';
 import ModelMappingSettings from './settings/ModelMappingSettings.vue';
@@ -299,7 +309,10 @@ function createDefaultCustomerConfig() {
       enabled: false,
       base_url: '',
       api_key: ''
-    }
+    },
+    // SSH 入口服务面(customer.ssh_ingress;三态指针 nil=false,前端恒产出显式
+    // 布尔——nil 与 false 行为等价;port 0=后端归一默认 56442)
+    ssh_ingress: normalizeSSHIngressConfig()
   };
 }
 
@@ -400,6 +413,7 @@ function normalizeCustomerConfig(payload = {}) {
     custom_env_vars: normalizeCustomEnvVarsConfig(payload?.custom_env_vars),
     agentcore_llm: normalizeAgentCoreLLMConfig(payload?.agentcore_llm),
     agentcore: normalizeAgentCoreTuning(payload?.agentcore),
+    ssh_ingress: normalizeSSHIngressConfig(payload?.ssh_ingress),
     ...(peerMcp ? { peer_mcp: peerMcp } : {})
   };
 }
@@ -473,11 +487,29 @@ function buildConfigPatch(nextValue, currentValue) {
   return Object.is(nextValue, currentValue) ? undefined : nextValue;
 }
 
+// 卡片 save 载荷与当前配置按顶层段浅合并（具名导出供归一化链单测使用,
+// RulesSettings.vue 具名导出先例）。卡片载荷只覆盖自己拥有的顶层段,未随
+// 载荷提交的段沿用 currentConfig——RulesSettings 只发 proxy/ai_rules/
+// proxy_rules 三段,若无此兜底,归一化默认值会 diff 出置零 patch,保存代理
+// 设置就会静默关掉 ssh_ingress（以及 model_mapping/agentcore_llm 等存量段,
+// 同类潜伏缺陷一并由父层统一收口;peer_mcp 靠「缺键不进 patch」的三态规避,
+// 与此不冲突）。
+export function mergeCustomerConfig(nextConfig, currentConfig) {
+  return { ...(currentConfig || {}), ...(nextConfig || {}) };
+}
+
+// 合并后的意图态 → 提交 patch（saveCustomerConfig 主链）。
+export function buildCustomerSavePatch(nextConfig, currentConfig) {
+  const normalizedConfig = normalizeCustomerConfig(mergeCustomerConfig(nextConfig, currentConfig));
+  return buildCustomerConfigPatch(normalizedConfig, currentConfig);
+}
+
 
 export default {
   name: 'SettingsPage',
   components: {
     RulesSettings,
+    SshIngressSettings,
     UserInfoSettings,
     LogsSettings,
     ModelMappingSettings,
@@ -622,8 +654,10 @@ export default {
       this.customerConfigError = '';
       this.customerConfigSuccess = '';
 
-      const normalizedConfig = normalizeCustomerConfig(nextConfig);
-      const patch = buildCustomerConfigPatch(normalizedConfig, this.customerConfig);
+      // 合并兜底见 buildCustomerSavePatch：卡片载荷只覆盖自己拥有的顶层段。
+      // mergedConfig 兼作 POST 响应缺 customer 时的回显兜底（保存意图态）。
+      const mergedConfig = mergeCustomerConfig(nextConfig, this.customerConfig);
+      const patch = buildCustomerSavePatch(nextConfig, this.customerConfig);
 
       try {
         if (!patch || !Object.keys(patch).length) {
@@ -642,7 +676,7 @@ export default {
         }
         const json = await res.json();
         const data = json?.data || json;
-        this.customerConfig = normalizeCustomerConfig(data?.customer || normalizedConfig);
+        this.customerConfig = normalizeCustomerConfig(data?.customer || mergedConfig);
         this.customerConfigVersion = typeof data?.version === 'string' ? data.version : this.customerConfigVersion;
         this.customerConfigError = '';
         this.customerConfigSuccess = this.t('settings_configSaved');

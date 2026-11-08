@@ -116,6 +116,12 @@ func runStart(cmd *cobra.Command, args []string) error {
 		// Don't fail startup - system can run with default configuration
 	}
 
+	// SSH 入口启动恢复:配置已加载,按期望态 reconcile——重启后自动恢复
+	// 已启用入口(失败仅日志不阻断 boot)。与配置提交协调路径共用
+	// services.ReconcileSSHIngressFromConfig 防漂移;daemon 侧
+	// initializeCoreSubsystems 同款接线。
+	services.ReconcileSSHIngressFromConfig(config.GetGlobalConfig())
+
 	// 启动服务器
 	logger.Info("Starting aliang server...")
 

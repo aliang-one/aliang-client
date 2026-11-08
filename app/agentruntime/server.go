@@ -188,6 +188,11 @@ func registerAgentRoutes(mux *http.ServeMux) {
 	// routes.go(缺任一侧=404,2026-10-21 教训)。
 	sshKnownHostsHandler := handlers.NewSSHKnownHostsHandlerFromCache()
 	mux.HandleFunc("/api/proxy/ssh/known-hosts", sshKnownHostsHandler.HandleKnownHosts)
+	// SSH 入口 host key 指纹(spec §7):GET 只读,缺失=404 未启动语义(生成归
+	// inbound/ssh Server.Start,防双进程竞态换钥)。无状态纯文件读,两进程各持
+	// 一个实例等价。双注册另一处 routes.go(缺任一侧=404 透传,2026-10-21 教训)。
+	sshIngressHandler := handlers.NewSSHIngressHandlerFromCache()
+	mux.HandleFunc("/api/proxy/ssh-ingress/hostkey", sshIngressHandler.HandleHostkey)
 }
 
 func loopbackOnly(next http.Handler) http.Handler {
