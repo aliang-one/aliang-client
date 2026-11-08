@@ -20,6 +20,7 @@ import (
 	"aliang.one/nursorgate/common/logger"
 	M "aliang.one/nursorgate/inbound/tun/metadata"
 	"aliang.one/nursorgate/outbound/meshproto"
+	meshproxy "aliang.one/nursorgate/outbound/proxy/mesh"
 )
 
 // RouteMesh 是 mesh 注入连接的 Metadata.Route 初始值(design §3.3 溯源标记)。
@@ -105,9 +106,10 @@ func HandleMeshConn(conn net.Conn, carrier string, deps MeshInboundDeps) error {
 	}
 
 	// 防环 + 跳数上限(design §7 层1/层2):AppendHop 自查 Via 含本机 ID 即
-	// 环路,超上限即拒。成功的 Append(追加本机 ID、递增跳数)仅用于校验——
-	// 本任务注入路径不再向外转发帧头;中间跳续传 Via 属出口接线(Task 7,
-	// dialByRoute 激活点)。
+	// 环路,超上限即拒。成功的 Append(追加本机 ID、递增跳数)后的帧头挂入
+	// 注入 ctx(Via/Hops 续传,Task 7):B 侧规则再决策 toNode 走 mesh 出口时,
+	// 出口(mesh.Peer.DialContext 按 InheritedHeaderFromContext)用该帧头
+	// 原样上线——多跳 A→B→C 的链路向量由此续传,出口不重置不追加。
 	maxHops := deps.MaxHops
 	if maxHops <= 0 {
 		maxHops = meshproto.DefaultHops
@@ -160,7 +162,8 @@ func HandleMeshConn(conn net.Conn, carrier string, deps MeshInboundDeps) error {
 		md.ConnID, hdr.From, hdr.Class, carrier, targetDesc, md.DstPort, hdr.Via))
 
 	// 所有权移交 handler(契约同 TUN/HTTP 入站);返回值透传给 relay 记录。
-	return deps.Handler.Handle(context.Background(), injected, md)
+	// ctx 携带 AppendHop 后帧头(Via/Hops 续传,见上方 AppendHop 注释)。
+	return deps.Handler.Handle(meshproxy.WithInheritedHeader(context.Background(), hdr), injected, md)
 }
 
 // handleMeshDNSTarget 处理 dns: 特殊目标(design §6 层1:每次查询独占一条

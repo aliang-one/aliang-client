@@ -390,6 +390,113 @@ func TestRelayFailureIncludesLANError(t *testing.T) {
 	}
 }
 
+// TestDialContextInheritsHeader 中间跳续传(Task 7 强制验收):ctx 携带
+// 继承帧头(mesh_inbound AppendHop 后挂入)时,出口用继承帧头原样上线——
+// Via/Hops 不被重置、不再追加本跳(入站侧已 Append 过)。
+// 环路语义注:构造 Via 含目标链自身 id 的继承帧头不可达——入站 AppendHop
+// 的 Via 自查在 B 侧收流时已拒绝该帧;本用例以 Via=[A,B] Hops=2 断言
+// Hops 单调递增不被链头语义重置。
+func TestDialContextInheritsHeader(t *testing.T) {
+	fp := startFakePeer(t)
+	peer := NewPeer(PeerTarget{
+		DeviceID: "dev-c",
+		LANAddrs: []string{fp.ln.Addr().String()},
+		SelfID:   "dev-b", // 中间跳 B 出口;链头帧 From/Via 由继承帧头决定
+	})
+
+	inherited := &meshproto.Header{
+		From:   "dev-a",
+		Class:  meshproto.ClassCustom,
+		Target: "c.test:443",
+		Via:    []string{"dev-a", "dev-b"},
+		Hops:   2,
+	}
+	ctx := WithInheritedHeader(context.Background(), inherited)
+	conn, err := peer.DialContext(ctx, &M.Metadata{HostName: "c.test", DstPort: 443})
+	if err != nil {
+		t.Fatalf("DialContext: %v", err)
+	}
+	defer conn.Close()
+
+	hdr := waitHeader(t, fp)
+	if hdr.From != "dev-a" {
+		t.Fatalf("From = %q, want dev-a(继承帧头保留链头 From)", hdr.From)
+	}
+	if len(hdr.Via) != 2 || hdr.Via[0] != "dev-a" || hdr.Via[1] != "dev-b" {
+		t.Fatalf("Via = %v, want [dev-a dev-b](继承帧头原样上线,不再 AppendHop)", hdr.Via)
+	}
+	if hdr.Hops != 2 {
+		t.Fatalf("Hops = %d, want 2(中间跳续传单调递增,不被链头语义重置)", hdr.Hops)
+	}
+	if hdr.Target != "c.test:443" {
+		t.Fatalf("Target = %q, want c.test:443", hdr.Target)
+	}
+	if hdr.Class != meshproto.ClassCustom {
+		t.Fatalf("Class = %q, want custom(继承帧头类别不被本跳重推断)", hdr.Class)
+	}
+
+	// 继承帧头共享 Via 切片防御:出口不得就地改动调用方帧头(追加/重排)。
+	if len(inherited.Via) != 2 || inherited.Hops != 2 {
+		t.Fatalf("inherited header mutated by DialContext: %+v", inherited)
+	}
+}
+
+// TestInheritedHeaderClassGovernsCarrierAdmission 中间跳载体准入按继承帧头
+// 的流量类别判定(design §4 约束针对流量的原始类别):ai 流量经 B 转发,
+// 即使出站目标形态推断为 custom(非 56432 回环),中继载体仍准入、线上帧
+// Class 保持 ai——转发跳不得重推断改判。
+func TestInheritedHeaderClassGovernsCarrierAdmission(t *testing.T) {
+	fp := startFakePeer(t)
+	peer := NewPeer(PeerTarget{
+		DeviceID: "dev-c",
+		Relay:    true,
+		PikoDial: func(ctx context.Context, endpointID string) (net.Conn, error) {
+			return net.Dial("tcp", fp.ln.Addr().String())
+		},
+		SelfID: "dev-b",
+	})
+
+	inherited := &meshproto.Header{
+		From:   "dev-a",
+		Class:  meshproto.ClassAI,
+		Target: "api.openai.com:443",
+		Via:    []string{"dev-a", "dev-b"},
+		Hops:   1,
+	}
+	// 出站形态刻意非 ai(外部地址 + 非 56432 端口):若按推断类别判custom,
+	// 中继会被拒——断言继承类别优先。
+	ctx := WithInheritedHeader(context.Background(), inherited)
+	conn, err := peer.DialContext(ctx, &M.Metadata{DstIP: netip.MustParseAddr("1.2.3.4"), DstPort: 443})
+	if err != nil {
+		t.Fatalf("DialContext: %v (ai 流量转发不得因本跳推断 custom 被禁中继)", err)
+	}
+	defer conn.Close()
+
+	hdr := waitHeader(t, fp)
+	if hdr.Class != meshproto.ClassAI {
+		t.Fatalf("Class = %q, want ai(继承帧头类别原样上线)", hdr.Class)
+	}
+	if hdr.Target != "api.openai.com:443" {
+		t.Fatalf("Target = %q, want 继承帧头目标", hdr.Target)
+	}
+}
+
+// TestInheritedHeaderFromContext 三件套契约:WithInheritedHeader 注入、
+// 未携带返回 false、nil 帧头不误报存在。
+func TestInheritedHeaderFromContext(t *testing.T) {
+	if _, ok := InheritedHeaderFromContext(context.Background()); ok {
+		t.Fatal("未携带继承帧头应返回 ok=false")
+	}
+	hdr := &meshproto.Header{From: "dev-a", Class: meshproto.ClassSelf, Target: "a.test:443"}
+	got, ok := InheritedHeaderFromContext(WithInheritedHeader(context.Background(), hdr))
+	if !ok || got != hdr {
+		t.Fatalf("InheritedHeaderFromContext() = (%p, %v), want 原帧头指针", got, ok)
+	}
+	if _, ok := InheritedHeaderFromContext(WithInheritedHeader(context.Background(), nil)); ok {
+		t.Fatal("nil 继承帧头应返回 ok=false")
+	}
+}
+
 // TestAIProxyPortSyncAnchor 锚定本地 aiProxyPort 与 processor/config 的
 // DefaultHTTPProxyPort 同值(test-only import 无环已实测;两处判据须同步改,
 // 见 mesh.go looksLikeAITraffic 注释)。

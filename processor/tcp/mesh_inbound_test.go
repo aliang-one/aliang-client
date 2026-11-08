@@ -12,15 +12,18 @@ import (
 
 	M "aliang.one/nursorgate/inbound/tun/metadata"
 	"aliang.one/nursorgate/outbound/meshproto"
+	meshproxy "aliang.one/nursorgate/outbound/proxy/mesh"
 )
 
-// meshInboundCaptureHandler 测试内 handler seam:捕获注入的 (conn, metadata),
-// 断言注入形态而非真实处理(design §3.3 注入语义的测试锚)。
+// meshInboundCaptureHandler 测试内 handler seam:捕获注入的 (ctx, conn, metadata),
+// 断言注入形态而非真实处理(design §3.3 注入语义的测试锚)。ctx 一并捕获:
+// Task 7 Via/Hops 续传要求注入连接携带继承帧头(出站拨 mesh 时原样上线)。
 type meshInboundCaptureHandler struct {
 	events chan meshInboundCaptured
 }
 
 type meshInboundCaptured struct {
+	ctx  context.Context
 	conn net.Conn
 	md   *M.Metadata
 }
@@ -29,8 +32,8 @@ func newMeshInboundCapture() *meshInboundCaptureHandler {
 	return &meshInboundCaptureHandler{events: make(chan meshInboundCaptured, 8)}
 }
 
-func (h *meshInboundCaptureHandler) Handle(_ context.Context, conn net.Conn, md *M.Metadata) error {
-	h.events <- meshInboundCaptured{conn: conn, md: md}
+func (h *meshInboundCaptureHandler) Handle(ctx context.Context, conn net.Conn, md *M.Metadata) error {
+	h.events <- meshInboundCaptured{ctx: ctx, conn: conn, md: md}
 	return nil
 }
 
@@ -286,6 +289,54 @@ func TestMeshInboundInjectsConnIntoPipeline(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for HandleMeshConn to return")
+	}
+}
+
+// TestMeshInboundInjectsInheritedHeaderIntoContext Via/Hops 续传注入点
+// (Task 7 强制验收):注入连接的 ctx 必须携带 AppendHop 后的帧头——B 侧
+// 规则再决策 toNode 走 mesh 出口时,出口用继承帧头原样上线(Via/Hops 单调,
+// 不重置不追加),多跳 A→B→C 的链路向量由此续传。
+func TestMeshInboundInjectsInheritedHeaderIntoContext(t *testing.T) {
+	capture := newMeshInboundCapture()
+	deps := meshInboundDeps(capture)
+	addr, _ := startMeshInbound(t, meshproto.CarrierLAN, deps)
+
+	conn, err := net.DialTimeout("tcp", addr.String(), 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	// A 侧链头帧:Via=[dev-a] Hops=0;B 侧 AppendHop(dev-b) 后应为
+	// Via=[dev-a dev-b] Hops=1。
+	if _, err := conn.Write([]byte(meshFrameLine(t, nil))); err != nil {
+		t.Fatal(err)
+	}
+
+	var got meshInboundCaptured
+	select {
+	case got = <-capture.events:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for pipeline injection")
+	}
+	defer got.conn.Close()
+
+	hdr, ok := meshproxy.InheritedHeaderFromContext(got.ctx)
+	if !ok {
+		t.Fatal("injected ctx must carry the inherited mesh header (Via/Hops 续传)")
+	}
+	if hdr.From != "dev-a" {
+		t.Fatalf("From = %q, want dev-a(链头发起者保留)", hdr.From)
+	}
+	if len(hdr.Via) != 2 || hdr.Via[0] != "dev-a" || hdr.Via[1] != "dev-b" {
+		t.Fatalf("Via = %v, want [dev-a dev-b](AppendHop 后帧头注入)", hdr.Via)
+	}
+	if hdr.Hops != 1 {
+		t.Fatalf("Hops = %d, want 1(AppendHop 后跳数)", hdr.Hops)
+	}
+	if hdr.Target != "a.test:443" {
+		t.Fatalf("Target = %q, want a.test:443", hdr.Target)
 	}
 }
 

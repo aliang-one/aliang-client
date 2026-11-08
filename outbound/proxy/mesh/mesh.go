@@ -43,8 +43,8 @@ type PeerTarget struct {
 	LANAddrs []string     // LAN 直连地址 host:port(beacon 发现/手输兜底),顺序尝试
 	Relay    bool         // 允许中继载体(平台端点白名单放行时置位;custom 类别仍被引擎层拒绝)
 	PikoDial PikoDialFunc // 中继载体拨号(注入式)
-	MaxHops  int          // 跳数上限;链头不消费(中间跳续传语义,Task 7:dialByRoute 拨出时携带入站 Via/Hops),构造期归一暂存
-	SelfID   string       // 本机 device_id,帧头 From/Via 链头
+	MaxHops  int          // 跳数上限;出口不消费(入站 AppendHop 与链头帧头各按消费侧语义取用),构造期归一暂存
+	SelfID   string       // 本机 device_id,帧头 From/Via 链头;ctx 携带继承帧头时(中间跳续传)不被使用
 }
 
 // Peer 到单一对端的 mesh 出口,实现 proxy.Proxy(design §3.4 outbound 新增
@@ -78,8 +78,13 @@ func NewPeer(target PeerTarget) *Peer {
 
 // DialContext 实现 proxy.Proxy:LAN 载体优先、中继载体兜底、全部失败错误
 // 回源(design §3.3:mesh 层失败一律错误回源,仅由链头的规则失败策略执行
-// 后续,本出口不吞不回落)。首行 JSON 帧头(design §3.1/§3.2)由链头写入:
-// Via=[From]、Hops 由 0 起;中间跳续传语义属 Task 7(dialByRoute 拨出时携带入站 Via/Hops)。
+// 后续,本出口不吞不回落)。首行 JSON 帧头(design §3.1/§3.2)按两种语义写入:
+//   - 全新链头(ctx 无继承帧头):From=SelfID、Via=[SelfID]、Hops 由 0 起;
+//   - 中间跳续传(ctx 携带 InheritedHeader,Task 7):入站帧头原样上线——
+//     From/Class/Target/Via/Hops 全部继承,不再 AppendHop(B 侧 mesh_inbound
+//     收流时已 Append 过本跳;环路在入站 Via 自查处拒绝,本路径不可达环路帧)。
+//     继承帧头缺 From/Class/Target 时由 Encode 校验兜底报错(入站 Parse 已校验,
+//     双保险防手挂畸形帧头)。
 // Task 8 的 DNS 代转发复用本出口:target=dns: 原样透传(见 targetFromMetadata),
 // B 侧按 meshproto.IsDNSTarget 识别并代解析。
 func (p *Peer) DialContext(ctx context.Context, md *M.Metadata) (net.Conn, error) {
@@ -88,6 +93,19 @@ func (p *Peer) DialContext(ctx context.Context, md *M.Metadata) (net.Conn, error
 		From:   p.target.SelfID,
 		Class:  class,
 		Target: targetFromMetadata(md),
+	}
+	if inherited, ok := InheritedHeaderFromContext(ctx); ok {
+		// 浅拷贝防御:Encode 对 nil Via 会就地补 [From],不共享调用方帧头
+		// 结构体;Via 切片只读共享(本路径不 Append,不改写)。
+		cp := *inherited
+		hdr = &cp
+		// 载体准入/诊断沿用继承帧头的流量类别(design §4 约束按流量的原始
+		// 类别判定,转发跳不得重推断改判):ai 流量经 B 转发不得因目标形态
+		// 被推断成 custom 而禁中继。畸形类别值(Parse 只校验非空)回落本跳
+		// 推断——custom 语义保守。
+		if isValidClass(cp.Class) {
+			class = cp.Class
+		}
 	}
 	// 帧头一次性编码(链头帧 Via 补为 [From]、Hops 0):既 fail-fast——
 	// From/Target 缺失在拨任何载体前就报错,也避免逐载体重复编码。
@@ -217,6 +235,27 @@ func WithConnID(ctx context.Context, connID string) context.Context {
 func ConnIDFromContext(ctx context.Context) string {
 	v, _ := ctx.Value(connIDKey{}).(string)
 	return v
+}
+
+// inheritedHeaderKey 继承帧头的 context key(Task 7 Via/Hops 续传)。
+type inheritedHeaderKey struct{}
+
+// WithInheritedHeader 把入站帧头(mesh_inbound AppendHop 后)挂进 ctx——
+// 中间跳续传:B 侧注入连接经规则决策再拨 mesh 出口时,出口用继承帧头
+// 原样上线(Via/Hops 单调不重置,不再 AppendHop)。生产注入点为
+// processor/tcp HandleMeshConn;测试经本函数直接构造。
+func WithInheritedHeader(ctx context.Context, hdr *meshproto.Header) context.Context {
+	return context.WithValue(ctx, inheritedHeaderKey{}, hdr)
+}
+
+// InheritedHeaderFromContext 取透传的继承帧头;未携带或挂了 nil 返回
+// ok=false(后者按「无继承」处理,走全新链头语义)。
+func InheritedHeaderFromContext(ctx context.Context) (*meshproto.Header, bool) {
+	hdr, ok := ctx.Value(inheritedHeaderKey{}).(*meshproto.Header)
+	if !ok || hdr == nil {
+		return nil, false
+	}
+	return hdr, true
 }
 
 // aiProxyPort 与 processor/config.DefaultHTTPProxyPort(56432)同值,由
