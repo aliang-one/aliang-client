@@ -3,6 +3,7 @@ package egress
 import (
 	"bufio"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -134,6 +135,24 @@ func setPeerSourceForTest(t *testing.T, fn func() *mesh.Peer) {
 	t.Cleanup(func() { SetPeerSource(nil) })
 }
 
+// setOfflineSignalForTest 注入/恢复离线信号,Cleanup 统一清空(未接线=在线)。
+func setOfflineSignalForTest(t *testing.T, offline func() bool) {
+	t.Helper()
+	SetOfflineSignal(offline)
+	t.Cleanup(func() { SetOfflineSignal(nil) })
+}
+
+// fallbackSelfConfig 构造兜底使能且含 self 的最小配置。
+func fallbackSelfConfig() *config.Config {
+	return &config.Config{Customer: &config.CustomerConfig{
+		Mesh: &config.MeshConfig{Fallback: &config.MeshFallbackConfig{
+			Enable:  boolPtr(true),
+			Classes: []string{meshproto.ClassSelf},
+			Addr:    "192.168.1.9:56440",
+		}},
+	}}
+}
+
 // clearProxyEnv 防开发机 HTTP_PROXY 干扰非回环域名(platform.test)请求:
 // 全清 + NO_PROXY 点名放行。
 func clearProxyEnv(t *testing.T) {
@@ -201,13 +220,8 @@ func TestPlatformClientDirectWhenOnline(t *testing.T) {
 func TestPlatformClientRoutesViaMeshWhenFallbackActive(t *testing.T) {
 	clearProxyEnv(t)
 	fr := startFakeRelay(t)
-	setGlobalConfigForTest(t, &config.Config{Customer: &config.CustomerConfig{
-		Mesh: &config.MeshConfig{Fallback: &config.MeshFallbackConfig{
-			Enable:  boolPtr(true),
-			Classes: []string{meshproto.ClassAI, meshproto.ClassSelf},
-			Addr:    "192.168.1.9:56440",
-		}},
-	}})
+	setGlobalConfigForTest(t, fallbackSelfConfig())
+	setOfflineSignalForTest(t, func() bool { return true })
 	setPeerSourceForTest(t, func() *mesh.Peer {
 		return mesh.NewPeer(mesh.PeerTarget{
 			DeviceID: "dev-b",
@@ -280,13 +294,8 @@ func waitRelayHeader(t *testing.T, fr *fakeRelay) *meshproto.Header {
 // direct 重试成功;direct 恰好一次(不循环)。
 func TestPlatformClientFallsBackOnError(t *testing.T) {
 	dead := closedPortAddr(t)
-	setGlobalConfigForTest(t, &config.Config{Customer: &config.CustomerConfig{
-		Mesh: &config.MeshConfig{Fallback: &config.MeshFallbackConfig{
-			Enable:  boolPtr(true),
-			Classes: []string{meshproto.ClassSelf},
-			Addr:    "192.168.1.9:56440",
-		}},
-	}})
+	setGlobalConfigForTest(t, fallbackSelfConfig())
+	setOfflineSignalForTest(t, func() bool { return true })
 	setPeerSourceForTest(t, func() *mesh.Peer {
 		return mesh.NewPeer(mesh.PeerTarget{
 			DeviceID: "dev-b",
@@ -358,6 +367,126 @@ func TestPlatformClientFallbackNotConfiguredIgnoresMesh(t *testing.T) {
 	case hdr := <-fr.headerCh:
 		t.Fatalf("兜底未配置却走了 mesh: %v", hdr)
 	default:
+	}
+}
+
+// assertGoesDirect 门控不激活的统一断言:live 假 B peer 已注入,请求仍必须
+// 直连(httptest 计数==1)且假 B 零帧。
+func assertGoesDirect(t *testing.T, cfg *config.Config, offline func() bool) {
+	t.Helper()
+	fr := startFakeRelay(t)
+	setGlobalConfigForTest(t, cfg)
+	setOfflineSignalForTest(t, offline)
+	setPeerSourceForTest(t, func() *mesh.Peer {
+		return mesh.NewPeer(mesh.PeerTarget{
+			DeviceID: "dev-b",
+			LANAddrs: []string{fr.ln.Addr().String()},
+			Relay:    false,
+			SelfID:   "dev-a",
+		})
+	})
+
+	var hits atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	client := PlatformClient(5 * time.Second)
+	resp, err := client.Get(ts.URL)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("direct hits = %d, want 1", got)
+	}
+	time.Sleep(200 * time.Millisecond)
+	select {
+	case hdr := <-fr.headerCh:
+		t.Fatalf("不应走 mesh 却收到帧: %v", hdr)
+	default:
+	}
+}
+
+// TestPlatformClientOnlineSignalBlocksMesh 离线信号为 false(甚至未接线)时,
+// 即使兜底配置 + peer 齐全也不走 mesh(design §9.4「平台不可达才兜底」,
+// 在线一律直连)。
+func TestPlatformClientOnlineSignalBlocksMesh(t *testing.T) {
+	t.Run("信号注入在线", func(t *testing.T) {
+		assertGoesDirect(t, fallbackSelfConfig(), func() bool { return false })
+	})
+	t.Run("信号未接线视为在线", func(t *testing.T) {
+		assertGoesDirect(t, fallbackSelfConfig(), nil)
+	})
+}
+
+// TestPlatformClientGateVariantsBlockMesh 兜底门控变体:Enable=false /
+// Classes 不含 self / mesh 总开关显式 false——任一不满足即纯 direct。
+func TestPlatformClientGateVariantsBlockMesh(t *testing.T) {
+	online := func() bool { return true }
+	t.Run("兜底Enable=false", func(t *testing.T) {
+		assertGoesDirect(t, &config.Config{Customer: &config.CustomerConfig{
+			Mesh: &config.MeshConfig{Fallback: &config.MeshFallbackConfig{
+				Enable:  boolPtr(false),
+				Classes: []string{meshproto.ClassSelf},
+				Addr:    "192.168.1.9:56440",
+			}},
+		}}, online)
+	})
+	t.Run("Classes不含self", func(t *testing.T) {
+		assertGoesDirect(t, &config.Config{Customer: &config.CustomerConfig{
+			Mesh: &config.MeshConfig{Fallback: &config.MeshFallbackConfig{
+				Enable:  boolPtr(true),
+				Classes: []string{meshproto.ClassAI, meshproto.ClassCustom},
+				Addr:    "192.168.1.9:56440",
+			}},
+		}}, online)
+	})
+	t.Run("mesh总开关显式false", func(t *testing.T) {
+		assertGoesDirect(t, &config.Config{Customer: &config.CustomerConfig{
+			Mesh: &config.MeshConfig{
+				Enable:   boolPtr(false),
+				Fallback: fallbackSelfConfig().Customer.Mesh.Fallback,
+			},
+		}}, online)
+	})
+}
+
+// TestPlatformClientDoubleFailureErrorChain mesh 与 direct 双败:多 %w 错误
+// 链上 errors.Is 两个分量各自可达。mesh 分量经 fake PikoDial 注入哨兵错,
+// direct 分量用已取消 ctx 造 context.Canceled。
+func TestPlatformClientDoubleFailureErrorChain(t *testing.T) {
+	setGlobalConfigForTest(t, fallbackSelfConfig())
+	setOfflineSignalForTest(t, func() bool { return true })
+	meshSentinel := errors.New("mesh: fake relay carrier down")
+	setPeerSourceForTest(t, func() *mesh.Peer {
+		return mesh.NewPeer(mesh.PeerTarget{
+			DeviceID: "dev-b",
+			Relay:    true, // self 类别中继准入,LAN 空载体 → 必落 fake PikoDial
+			PikoDial: func(ctx context.Context, endpointID string) (net.Conn, error) {
+				return nil, meshSentinel
+			},
+			SelfID: "dev-a",
+		})
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // direct 轨道必败(context.Canceled)
+	_, err := PlatformClient(5 * time.Second).Transport.(*http.Transport).
+		DialContext(ctx, "tcp", "platform.test:443")
+	if err == nil {
+		t.Fatal("双败应返回错误")
+	}
+	if !errors.Is(err, meshSentinel) {
+		t.Fatalf("错误链应含 mesh 分量哨兵: %v", err)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("错误链应含 direct 分量 context.Canceled: %v", err)
 	}
 }
 

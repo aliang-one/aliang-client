@@ -1,9 +1,10 @@
 // Package egress 统一自身流量(登录/扫码/激活/刷新/用量/软件更新)的 HTTP
 // 出口(design docs/mesh-forwarding-network-design.md §9.4 兜底式的 egress
 // 变体,计划 Task 11):默认纯直连(与裸 http.Client 在线行为零变化),
-// 仅当离线兜底配置显式使能、self 类别勾选、且有可用 mesh peer 时,平台
-// 流量优先经 B 节点出口(仍然到达平台,经 B 中转)——这是 opt-in 配置的
-// 行为契约;未配置兜底的设备完全不受影响。
+// 仅当离线信号为真、离线兜底配置显式使能、self 类别勾选、且有可用 mesh
+// peer 时(§9.4「平台不可达才兜底」),平台流量才优先经 B 节点出口
+// (仍然到达平台,经 B 中转)——这是 opt-in 配置的行为契约;未配置兜底
+// 的设备完全不受影响。
 package egress
 
 import (
@@ -15,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"aliang.one/nursorgate/common/logger"
 	M "aliang.one/nursorgate/inbound/tun/metadata"
 	"aliang.one/nursorgate/outbound/meshproto"
 	mesh "aliang.one/nursorgate/outbound/proxy/mesh"
@@ -50,34 +52,72 @@ func peerFromSource() *mesh.Peer {
 	return fn()
 }
 
-// meshFallbackSelfActive 兜底门(design §9.4):customer.mesh.fallback 使能
-// (Enable 显式 true)且 self ∈ Classes。逐连接读取——配置变更即刻生效,
-// 恢复在线后兜底自动退位。Addr/peer 的可用性归注入缝的提供器判定,此处
-// 不重复。
+// offlineSignal 离线信号注入缝(与 peerSource 同模式):design §9.4 定死
+// 「平台不可达才兜底」——在线设备即使配好兜底也一律直连。信号未接线
+// (nil)视为在线(保守:不激活 mesh 轨,不吞直连路径)。生产接线 Task 14
+// 从隧道状态取;**共用契约:Task 12 的 AI 离线改道消费同一信号源**,
+// 两处判定必须同源同真假,否则会出现「自身流量经 B 而 AI 流量直连」的
+// 分裂形态。
+var offlineSignal atomic.Value // func() bool
+
+// SetOfflineSignal 注入离线信号提供器(true=平台不可达,激活兜底轨);
+// nil = 清除(未接线 = 视为在线 = 纯 direct)。并发安全。
+func SetOfflineSignal(fn func() bool) {
+	if fn == nil {
+		fn = func() bool { return false }
+	}
+	offlineSignal.Store(fn)
+}
+
+func isOffline() bool {
+	fn, _ := offlineSignal.Load().(func() bool)
+	if fn == nil {
+		return false
+	}
+	return fn()
+}
+
+// meshFallbackSelfActive 兜底门(design §9.4「平台不可达才兜底」),逐连接
+// 读取,四个条件缺一不可:
+//  1. mesh 总开关 EffectiveEnabled(显式 false 时 egress 兜底同样关——总开关
+//     契约穿透所有 mesh 消费方;对等门控见 processor/routing/snapshot_mesh.go
+//     meshForwardAvailable 与 processor/tcp handler meshFallbackAddrForClass,
+//     三消费方语义的完整抽取留 Task 12 第三消费方 AI 改道落地时做);
+//  2. customer.mesh.fallback 使能(Enable 显式 true);
+//  3. self ∈ Fallback.Classes;
+//  4. 离线信号为真(信号驱动,接线归 Task 14,与 Task 12 AI 改道共用)。
+//
+// 兜底随信号起落:平台恢复可达 → 信号翻假 → mesh 轨自动退位回直连。
+// Addr/peer 的可用性归注入缝的提供器判定,此处不重复。
 func meshFallbackSelfActive() bool {
 	cfg := config.GetGlobalConfig()
 	if cfg == nil || cfg.Customer == nil || cfg.Customer.Mesh == nil {
+		return false
+	}
+	if !cfg.Customer.Mesh.EffectiveEnabled() {
 		return false
 	}
 	fb := cfg.Customer.Mesh.Fallback
 	if fb == nil || fb.Enable == nil || !*fb.Enable {
 		return false
 	}
+	selfChecked := false
 	for _, class := range fb.Classes {
 		if class == meshproto.ClassSelf {
-			return true
+			selfChecked = true
+			break
 		}
 	}
-	return false
+	return selfChecked && isOffline()
 }
 
 // platformDialContext 双轨判定(design §9.4 兜底式):
 //
-//	兜底使能 + self 勾选 + 有可用 peer → 先 mesh(mesh.Peer.DialContext,
-//	  WithClass(ClassSelf),target=域名:端口——域名直转语义:不本地解析,
-//	  主机名原样进帧,末跳代解析);mesh 任一失败 → direct 重试一次,失败
-//	  即失败(不循环);
-//	兜底未配置 / 无 peer → 纯 direct(现状,在线行为零变化)。
+//	离线信号真 + 兜底使能 + self 勾选 + 有可用 peer → 先 mesh
+//	  (mesh.Peer.DialContext,WithClass(ClassSelf),target=域名:端口——域名
+//	  直转语义:不本地解析,主机名原样进帧,末跳代解析);mesh 任一失败 →
+//	  direct 重试一次,失败即失败(不循环);
+//	其余(在线/未配置/无 peer)→ 纯 direct(现状,在线行为零变化)。
 //
 // 域名直转的 TLS 语义:mesh 拨出的是到目标 443 的原始 TCP 流,TLS 握手
 // 在 http.Transport 层照常发生(SNI=平台域名)——B 侧按其规则处理,链路
@@ -97,12 +137,15 @@ func platformDialContext(ctx context.Context, network, addr string) (net.Conn, e
 		&M.Metadata{HostName: host, DstPort: uint16(port)},
 	)
 	if err != nil {
-		// mesh 失败 → direct 重试一次:兜底是可用性增强,不能把在线可达的
-		// 平台流量拖死在坏 mesh 路径上;direct 再失败即如实失败。
+		// mesh 失败 → direct 重试一次:兜底是可用性增强,不能把可达的
+		// 平台流量拖死在坏 mesh 路径上;direct 再失败即如实失败。交界处
+		// Warn 一条——离线排障是本特性存在的理由,mesh 轨为何没接住
+		// 必须在日志里可见。
 		dconn, derr := directDialer.DialContext(ctx, network, addr)
 		if derr != nil {
-			return nil, fmt.Errorf("egress: mesh 路由失败(%v), direct 兜底亦失败: %w", err, derr)
+			return nil, fmt.Errorf("egress: mesh 路由失败: %w; direct 兜底亦失败: %w", err, derr)
 		}
+		logger.Warn(fmt.Sprintf("egress: mesh 路由失败,回落 direct(target=%s): %v", addr, err))
 		return dconn, nil
 	}
 	return conn, nil
