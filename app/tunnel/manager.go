@@ -16,6 +16,9 @@ import (
 	"time"
 
 	"github.com/andydunstall/piko/client"
+
+	"aliang.one/nursorgate/app/mesh/relay"
+	"aliang.one/nursorgate/outbound/meshproto"
 )
 
 type Config struct {
@@ -50,6 +53,12 @@ type runConfig struct {
 	handler         http.Handler
 	// tcpBridge is nil unless TCP mappings are enabled for this session.
 	tcpBridge *tcpBridge
+	// meshRelay serves B-side mesh receive on the "<deviceID>.mesh" piko
+	// endpoint (design §3.1 carrier A). Always wired: whether the endpoint
+	// listens at all is the platform whitelist's call (soft-fail), and the
+	// per-connection gate (forward_enable + peers ACL) is read live by
+	// mesh_inbound on every accepted stream.
+	meshRelay *relay.Relay
 	// onState receives mid-session state transitions surfaced from the piko
 	// client (e.g. "reconnecting" while a dropped session retries). Nil for
 	// runners that do not support it.
@@ -269,6 +278,9 @@ func validateConfig(config Config) (runConfig, [sha256.Size]byte, error) {
 	if config.TCPEnabled {
 		bridge = newTCPBridge(config.DeviceID, verifier, config.AllowPrivateTargets)
 	}
+	// B-side mesh receive relay: the deps provider reads customer.mesh live
+	// per connection, so nothing config-derived gates construction here.
+	meshRelay := relay.New(relay.ProductionDeps(config.DeviceID))
 	// The fingerprint includes the token and expiry, so every renewal
 	// reconfigures the session. This drops in-flight streams once per renewal:
 	// piko reads Upstream.Token only at dial time and offers no token
@@ -289,6 +301,7 @@ func validateConfig(config Config) (runConfig, [sha256.Size]byte, error) {
 		tunnelToken:     config.TunnelToken,
 		handler:         handler,
 		tcpBridge:       bridge,
+		meshRelay:       meshRelay,
 	}, fingerprint, nil
 }
 
@@ -341,6 +354,33 @@ func runTunnel(ctx context.Context, config runConfig, ready func()) error {
 				_ = tcpListener.Shutdown()
 			}()
 			go func() { _ = config.tcpBridge.Serve(tcpListener) }()
+		}
+	}
+
+	// B-side mesh receive lives on "<deviceID>.mesh" (design §3.1 carrier A;
+	// A-side dials it as the relay carrier — see outbound/proxy/mesh). Same
+	// soft-fail contract as the TCP bridge: a token whose endpoint whitelist
+	// lacks the endpoint degrades the relay carrier to unavailable without
+	// touching the HTTP tunnel. Listening is attempted unconditionally — the
+	// per-connection gate (forward_enable + peers ACL) is evaluated live by
+	// mesh_inbound on every accepted stream, so B-side receive comes alive
+	// the moment the platform whitelists the endpoint.
+	if config.meshRelay != nil {
+		meshListener, meshErr := upstream.Listen(ctx, MeshEndpointID(config.deviceID))
+		log.Printf("[AGENT-TUNNEL] mesh listen %s: err=%v addr=%v", MeshEndpointID(config.deviceID), meshErr, func() any {
+			if meshErr == nil {
+				return meshListener.Addr().String()
+			}
+			return ""
+		}())
+		if meshErr != nil {
+			reportMeshRelayDisabled(config.onState, fmt.Sprintf("mesh relay unavailable: %v", meshErr))
+		} else {
+			go func() {
+				<-ctx.Done()
+				_ = meshListener.Shutdown()
+			}()
+			go func() { _ = config.meshRelay.Serve(meshListener, meshproto.CarrierRelay) }()
 		}
 	}
 	ready()

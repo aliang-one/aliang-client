@@ -52,6 +52,14 @@ func reportTCPDisabled(_ func(state string), message string) {
 	log.Printf("[AGENT-TUNNEL] tcp bridge disabled: %s", message)
 }
 
+// reportMeshRelayDisabled surfaces a non-fatal mesh endpoint startup failure
+// with the same soft-fail contract as the TCP bridge: the HTTP tunnel stays
+// healthy, and the relay carrier simply stays unavailable until a renewal
+// carries the "<device>.mesh" endpoint in the token whitelist.
+func reportMeshRelayDisabled(_ func(state string), message string) {
+	log.Printf("[AGENT-TUNNEL] mesh relay disabled: %s", message)
+}
+
 // pikoStateFromLog maps piko client log messages to tunnel states. The
 // matched strings are piko v0.10.0 message constants (client/listener.go
 // "disconnected; reconnecting", client/upstream.go "connected" and
