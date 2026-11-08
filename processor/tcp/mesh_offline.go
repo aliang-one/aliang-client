@@ -34,6 +34,11 @@ func meshOfflineActive() bool {
 	return fn()
 }
 
+// MeshOfflineSignalForTest 读回离线信号缝的当前值(生产读方走
+// meshOfflineActive):导出仅供 app/tunnel 装配断言测试钉「egress/tcp 两缝
+// 同源同真假」契约(Task 14)。
+func MeshOfflineSignalForTest() bool { return meshOfflineActive() }
+
 // MeshOfflineAIRedirectActive AI 离线改道是否激活的跨包查询(探针降级等
 // 消费方入口):与数据面改道判定同源同真假——本函数就是
 // meshOfflineRedirectForAI 的布尔投影视图,不存在第二份判定逻辑。

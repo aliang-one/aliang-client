@@ -31,6 +31,9 @@ package test
 import (
 	"bufio"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/base64"
 	"errors"
 	"io"
 	"net"
@@ -42,6 +45,7 @@ import (
 	"time"
 
 	"aliang.one/nursorgate/app/mesh/relay"
+	apptunnel "aliang.one/nursorgate/app/tunnel"
 	"aliang.one/nursorgate/inbound/tun/adapter"
 	M "aliang.one/nursorgate/inbound/tun/metadata"
 	"aliang.one/nursorgate/inbound/tun/tunnel"
@@ -51,6 +55,7 @@ import (
 	"aliang.one/nursorgate/outbound/proxy/proto"
 	auth "aliang.one/nursorgate/processor/auth" // 包名实为 user,别名对齐仓内先例
 	"aliang.one/nursorgate/processor/config"
+	"aliang.one/nursorgate/processor/egress"
 	"aliang.one/nursorgate/processor/routing"
 	"aliang.one/nursorgate/processor/statistic"
 	"aliang.one/nursorgate/processor/tcp"
@@ -73,6 +78,8 @@ func meshItResetGlobals(t *testing.T) {
 		tcp.SetMeshSelfIDSource(nil)
 		tcp.SetMeshOfflineSignal(nil)
 		tcp.SetMeshPikoDialSource(nil)
+		egress.SetOfflineSignal(nil)
+		egress.SetPeerSource(nil)
 		outbound.GetRegistry().Clear()
 	}
 	reset()
@@ -1274,4 +1281,88 @@ func TestMeshOfflineFallbackActivates(t *testing.T) {
 		_ = client.Close()
 		meshItAssertRoute(t, aIngress, "RouteMeshFallback")
 	})
+}
+
+// ===== 用例 9:生产装配冒烟(Task 14) =====
+
+// TestProductionAssemblyEgressOfflineSmoke 生产装配线的端到端冒烟:真
+// manager(Configure 全程真跑——validateConfig 过、runTunnel 拨死回环 piko
+// 落 failed)装配的 egress 双缝驱动真出口——离线(会话 failed) + self 类兜底
+// 勾选时,egress.PlatformClient 的平台请求真走 mesh 轨:帧头 From=dev-a(manager
+// meshSelfDeviceID)/Class=self/Target=TEST-NET 域名,ACL 观察到 from,HTTP 字节
+// 抵达 Peers[0] 对端;同源的 tcp 侧 AI 改道门(MeshOfflineAIRedirectActive)随
+// 同一离线信号激活。B 侧注入管线语义由用例 1-8 钉,此处 B 用捕获器只钉 A 侧
+// 装配真的把流量送进了 mesh。
+func TestProductionAssemblyEgressOfflineSmoke(t *testing.T) {
+	meshItResetGlobals(t)
+
+	capture := newMeshItCaptureHandler()
+	nodeB := startMeshItNode(t, "dev-b", []string{"dev-a"}, capture, nil)
+
+	// 全局配置:mesh 开 + peers[0]=dev-b(egress peer 源装配面)+ self/ai 两类
+	// 离线兜底勾选(egress 双轨 + AI 改道门)。
+	meshItSetConfig(t, nil, "", &config.MeshConfig{
+		ForwardEnable: meshItForwardEnable(),
+		Fallback: &config.MeshFallbackConfig{
+			Enable:  meshItForwardEnable(),
+			Addr:    nodeB.addr,
+			Classes: []string{meshproto.ClassSelf, meshproto.ClassAI},
+		},
+		Peers: meshItPeers([2]string{"dev-b", nodeB.addr}),
+	})
+
+	// 生产装配:真 manager 接线(validateConfig:egress 双缝+selfID+pikoDial)。
+	// 回环死口 piko 下 runTunnel 的 Listen 是惰性重连(piko 客户端后台重试,
+	// 状态停留 connecting/reconnecting = 活跃 = 在线),故用确定性的 Stop()
+	// 翻离线——「平台不可达」信号语义即「无活跃隧道会话」,Stop 后恒真,
+	// 零手工注入缝。
+	mgr := apptunnel.NewManager(nil)
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := mgr.Configure(apptunnel.Config{
+		DeviceID:        "dev-a",
+		PikoUpstreamURL: "http://127.0.0.1:1",
+		TunnelToken:     "mesh-it-token",
+		RoutePublicKey:  base64.StdEncoding.EncodeToString(pub),
+		ExpiresAt:       time.Now().Add(time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	mgr.Stop()
+	deadline := time.After(3 * time.Second)
+	for !egress.OfflineSignalForTest() {
+		select {
+		case <-deadline:
+			t.Fatal("超时等待 Stop 后离线信号翻真")
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+
+	// tcp 侧冒烟:同一离线信号下 AI 改道门激活(行为面布尔投影)。
+	if !tcp.MeshOfflineAIRedirectActive() {
+		t.Fatal("离线 + ai 兜底勾选时 MeshOfflineAIRedirectActive 应为 true")
+	}
+
+	// egress 侧冒烟:平台请求(登录/用量族)经 mesh 轨抵达 Peers[0] 对端。
+	go func() {
+		client := egress.PlatformClient(6 * time.Second)
+		_, _ = client.Get("http://203.0.113.20:81/assembly-probe") //nolint:bodyclose // conn 由捕获器关
+	}()
+
+	meshItWaitForwarder(t, nodeB, "dev-a")
+	inj := meshItWaitArrival(t, capture.events)
+	// IP 目标经 meshMetadataFromTarget 落 DstIP/DstPort(域名才进 HostName)。
+	if inj.md == nil || inj.md.DstIP.String() != "203.0.113.20" || inj.md.DstPort != 81 {
+		t.Fatalf("B 注入 metadata = %+v, want 203.0.113.20:81", inj.md)
+	}
+	select {
+	case chunk := <-capture.payloads:
+		if !strings.Contains(string(chunk), "GET /assembly-probe HTTP/1.1") {
+			t.Fatalf("B 收到字节 = %q, want 含 GET /assembly-probe", chunk)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("超时等待 HTTP 请求字节抵达 B")
+	}
 }

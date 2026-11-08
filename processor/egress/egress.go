@@ -77,6 +77,12 @@ func isOffline() bool {
 	return fn()
 }
 
+// OfflineSignalForTest / PeerSourceForTest 读回两条注入缝的当前值:生产读方
+// 走 isOffline/peerFromSource;导出仅供 app/tunnel 装配断言测试把「两缝同源
+// 同真假」「peer 源已接线」从注释升级为测试钉子(Task 14)。
+func OfflineSignalForTest() bool    { return isOffline() }
+func PeerSourceForTest() *mesh.Peer { return peerFromSource() }
+
 // meshFallbackSelfActive 兜底门(design §9.4「平台不可达才兜底」),逐连接
 // 读取。配置四条件(总开关 EffectiveEnabled + Fallback.Enable + self ∈
 // Classes + Addr 非空)统一走共享助手 config.MeshFallbackActiveForClass

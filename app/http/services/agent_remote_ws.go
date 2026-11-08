@@ -1274,6 +1274,11 @@ func (s *AgentService) currentDeviceID() string {
 	return s.state.DeviceID
 }
 
+// CurrentDeviceID 本机 device_id 的只读查询(解析常驻身份文件,幂等);跨层
+// 消费方入口——mesh LAN 装配(cmd/core)与 /api/mesh/status
+// (handlers.MeshHandler,Task 14)。
+func (s *AgentService) CurrentDeviceID() string { return s.currentDeviceID() }
+
 func currentAgentWebSocketURL() (string, error) {
 	cfg := config.GetGlobalConfig()
 	if cfg == nil || strings.TrimSpace(cfg.AgentBaseURL()) == "" {
