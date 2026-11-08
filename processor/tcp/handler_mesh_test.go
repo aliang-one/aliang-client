@@ -14,6 +14,7 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -38,18 +39,22 @@ func newMeshDialTestEnv(t *testing.T) {
 	swapMeshSelfIDSource(t, func() string { return "dev-a" })
 }
 
+// swapMeshSelfIDSource/swapMeshPikoDialSource 覆写注入缝并恢复(质量评审
+// Important 2 的 swap+Cleanup 模式):seam 为 atomic.Value,同包测试经
+// Load 取原值、Set(nil) 清空归位;非并行安全(覆写+恢复,包内测试无
+// t.Parallel)。
 func swapMeshSelfIDSource(t *testing.T, fn func() string) {
 	t.Helper()
-	orig := meshSelfIDSource
-	meshSelfIDSource = fn
-	t.Cleanup(func() { meshSelfIDSource = orig })
+	orig, _ := meshSelfIDSource.Load().(func() string)
+	SetMeshSelfIDSource(fn)
+	t.Cleanup(func() { SetMeshSelfIDSource(orig) })
 }
 
 func swapMeshPikoDialSource(t *testing.T, fn func() meshproxy.PikoDialFunc) {
 	t.Helper()
-	orig := meshPikoDialSource
-	meshPikoDialSource = fn
-	t.Cleanup(func() { meshPikoDialSource = orig })
+	orig, _ := meshPikoDialSource.Load().(func() meshproxy.PikoDialFunc)
+	SetMeshPikoDialSource(fn)
+	t.Cleanup(func() { SetMeshPikoDialSource(orig) })
 }
 
 func setMeshDialConfig(t *testing.T, peers []config.MeshPeer, fallback *config.MeshFallbackConfig) {
@@ -165,6 +170,60 @@ func expectNotAccepted(t *testing.T, accepted chan net.Conn, what string) {
 
 // ---- 用例 ----
 
+// TestMeshSeamConcurrentSetAndRead 数据竞争钉死(质量评审 Critical 1):生产
+// 写方(app/tunnel manager validateConfig,隧道每次续期重跑 Set)与 mesh
+// 拨号 goroutine 读方跨包并发;缝必须原子化,本测试在 -race 下必须干净。
+func TestMeshSeamConcurrentSetAndRead(t *testing.T) {
+	config.ResetGlobalConfigForTest()
+	t.Cleanup(func() {
+		config.ResetGlobalConfigForTest()
+		SetMeshSelfIDSource(nil)
+		SetMeshPikoDialSource(nil)
+	})
+	setMeshDialConfig(t, []config.MeshPeer{{DeviceID: "dev-b"}}, nil)
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+
+	// 写方:模拟隧道续期反复重设 selfID/PikoDial 提供器(含清空)。
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			SetMeshSelfIDSource(func() string { return fmt.Sprintf("dev-a-%d", i%3) })
+			SetMeshPikoDialSource(func() meshproxy.PikoDialFunc {
+				return func(ctx context.Context, endpointID string) (net.Conn, error) {
+					return nil, fmt.Errorf("noop dial %s", endpointID)
+				}
+			})
+		}
+	}()
+
+	// 读方:模拟 mesh 拨号 goroutine 经装配路径读两缝。
+	handler := &TCPConnectionHandler{}
+	deadline := time.Now().Add(300 * time.Millisecond)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for time.Now().Before(deadline) {
+			if _, err := handler.getMeshProxyForExecution("dev-b"); err != nil {
+				t.Errorf("getMeshProxyForExecution: %v", err)
+				return
+			}
+		}
+	}()
+
+	// 等读方跑满窗口后再停写方,保证读写窗口重叠。
+	time.Sleep(320 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+}
+
 // TestDetermineRouteWithContext_MeshDecisionBecomesRouteToNode 决策→执行
 // 映射(tls.go):mesh 规则命中返回 RouteToNode,decision 整串(含策略段)
 // 寄存 metadata.Route 抵达 dialByRoute——非 toNode 决策不触碰 Route 寄存。
@@ -221,6 +280,14 @@ func TestDialByRouteMeshNodeUnreachableFallsBackDirect(t *testing.T) {
 		t.Fatalf("metadata.Route = %q, want RouteDirect", md.Route)
 	}
 	expectAccepted(t, accepted, "direct 回落")
+
+	// 回落 direct 也失败:终端错误,两段失败同报(质量整改 Minor ①)。
+	mdBoth := meshDialMetadata("toNode:dev-b", closedMeshAddr(t))
+	if _, err := handler.dialByRoute(context.Background(), mdBoth, RouteToNode); err == nil {
+		t.Fatal("direct 回落也失败应报错")
+	} else if !strings.Contains(err.Error(), "direct fallback also failed") {
+		t.Fatalf("错误应标明 direct 回落也失败, got: %v", err)
+	}
 }
 
 // TestDialByRouteMeshFailurePolicyDeny deny 策略:mesh 失败 → 拒绝连接,
@@ -321,6 +388,30 @@ func TestDialByRouteMeshFallbackNodeSecond(t *testing.T) {
 		}
 		defer conn.Close()
 		expectAccepted(t, cAccepted, "失败策略节点 dev-c")
+	})
+
+	t.Run("fallback 目标不在 peers 终局失败", func(t *testing.T) {
+		// 编译期不校验 fallback:<id2> 是否列入 peers(仅非空校验,见
+		// classifyEntryForCompile 注释);运行期拨不到指定节点由「限一次防链」
+		// 收口:终端错误,不回落 direct、不再叠加兜底。
+		newMeshDialTestEnv(t)
+		directAddr, accepted := startAcceptedListener(t)
+		setMeshDialConfig(t,
+			[]config.MeshPeer{{DeviceID: "dev-b", LANAddrs: []string{closed(t)}}},
+			&config.MeshFallbackConfig{Enable: boolPtr(true), Addr: closed(t), Classes: []string{meshproto.ClassCustom}},
+		)
+
+		handler := &TCPConnectionHandler{}
+		md := meshDialMetadata("toNode:dev-b:fallback:dev-nope", directAddr)
+		conn, err := handler.dialByRoute(context.Background(), md, RouteToNode)
+		if err == nil {
+			_ = conn.Close()
+			t.Fatal("fallback 目标不存在必须终局失败(限一次,不再链式)")
+		}
+		if !strings.Contains(err.Error(), "fallback to dev-nope unavailable") {
+			t.Fatalf("错误应标明 fallback 目标不可用, got: %v", err)
+		}
+		expectNotAccepted(t, accepted, "direct(fallback 失败不回落 direct)")
 	})
 }
 

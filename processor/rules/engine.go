@@ -347,6 +347,14 @@ func (e *RuleEngine) StoreBinding(metadata *M.Metadata) {
 		route = cache.RouteToSocks
 	case "RouteDirect":
 		route = cache.RouteDirect
+	case "RouteToNode", "RouteMeshFallback":
+		// mesh 路由不进域绑定缓存,防 EvaluateRoute 复活时静默绕过 mesh
+		// 规则:连接走了 mesh 出口(processor/tcp dialViaMesh),但域-IP
+		// 绑定与路由是两个正交维度——若按 default 缓存成 RouteDirect,
+		// 域绑定缓存被 mesh 路由连接毒化,EvaluateRoute(现休眠)复活后
+		// 命中缓存会把同名连接直连出去,静默绕过用户配置的 mesh 转发。
+		logger.Debug(fmt.Sprintf("Skip DNS binding cache for mesh-routed %s (route=%s)", metadata.HostName, metadata.Route))
+		return
 	default:
 		route = cache.RouteDirect
 	}

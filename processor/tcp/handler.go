@@ -1310,29 +1310,55 @@ func currentCustomerProxyUpstreamType() (string, bool) {
 // 单载体,不触中继端点命名。
 const meshFallbackPseudoDeviceID = "mesh-fallback"
 
-// meshSelfIDSource / meshPikoDialSource 组装层注入缝:本机 device_id 与
-// piko 中继拨号在 processor/tcp 层无自然来源——device_id 属 agent 运行状态
-// (持有在 app/http/services,经 tunnel 配置下发),PikoDial 生产实现由
-// app/tunnel 封装(Task 9 接线)。selfID 生产注入点 app/tunnel manager(与
-// relay.ProductionDeps 的 selfDeviceID 同一来源);测试注入 fake 后
-// t.Cleanup 恢复。nil/空 = 未接线:链头帧头 From 缺失由 meshproto Encode
-// 兜底报错,中继载体不可用(仅 LAN)。
+// meshSelfIDSource / meshPikoDialSource 组装层注入缝,atomic.Value 保护
+// (质量评审 Critical 1):本机 device_id 与 piko 中继拨号在 processor/tcp
+// 层无自然来源——device_id 属 agent 运行状态(持有在 app/http/services,
+// 经 tunnel 配置下发),PikoDial 生产实现由 app/tunnel 封装(Task 9 接线)。
+// 生产写方 app/tunnel manager validateConfig(隧道每次续期重跑 Set)与
+// mesh 拨号 goroutine 读方跨包并发,普通包级变量存在数据竞争(-race 实测,
+// 见 TestMeshSeamConcurrentSetAndRead)。atomic.Value 要求 Store 的具体类型
+// 恒定:两缝恒为各自的 func 类型;nil 归一为空提供器(atomic.Value 不接受
+// nil 接口,归一后 Load 语义与未接线一致)。selfID 生产注入点 app/tunnel
+// manager(与 relay.ProductionDeps 的 selfDeviceID 同一来源);测试注入
+// fake 后 t.Cleanup 恢复(清空 = Set(nil))。未接线:链头帧头 From 缺失由
+// meshproto Encode 兜底报错,中继载体不可用(仅 LAN)。
 var (
-	meshSelfIDSource   func() string
-	meshPikoDialSource func() meshproxy.PikoDialFunc
+	meshSelfIDSource   atomic.Value // func() string
+	meshPikoDialSource atomic.Value // func() meshproxy.PikoDialFunc
 )
 
-// SetMeshSelfIDSource 注入本机 device_id 提供器(mesh 链头帧头 From/Via 用)。
-func SetMeshSelfIDSource(fn func() string) { meshSelfIDSource = fn }
+// SetMeshSelfIDSource 注入本机 device_id 提供器(mesh 链头帧头 From/Via 用);
+// nil = 清除(回到未接线语义)。并发安全(生产写方为隧道续期路径)。
+func SetMeshSelfIDSource(fn func() string) {
+	if fn == nil {
+		fn = func() string { return "" }
+	}
+	meshSelfIDSource.Store(fn)
+}
 
-// SetMeshPikoDialSource 注入 piko 中继载体拨号提供器(Task 9 生产接线)。
-func SetMeshPikoDialSource(fn func() meshproxy.PikoDialFunc) { meshPikoDialSource = fn }
+// SetMeshPikoDialSource 注入 piko 中继载体拨号提供器(Task 9 生产接线);
+// nil = 清除。并发安全。
+func SetMeshPikoDialSource(fn func() meshproxy.PikoDialFunc) {
+	if fn == nil {
+		fn = func() meshproxy.PikoDialFunc { return nil }
+	}
+	meshPikoDialSource.Store(fn)
+}
 
 func meshSelfIDFromSource() string {
-	if meshSelfIDSource == nil {
+	fn, _ := meshSelfIDSource.Load().(func() string)
+	if fn == nil {
 		return ""
 	}
-	return strings.TrimSpace(meshSelfIDSource())
+	return strings.TrimSpace(fn())
+}
+
+func meshPikoDialFromSource() meshproxy.PikoDialFunc {
+	fn, _ := meshPikoDialSource.Load().(func() meshproxy.PikoDialFunc)
+	if fn == nil {
+		return nil
+	}
+	return fn()
 }
 
 // dialViaMesh 执行 toNode:<deviceID>[:policy] 决策(错误回源语义,链头就地
@@ -1389,7 +1415,13 @@ func (h *TCPConnectionHandler) dialViaMesh(ctx context.Context, metadata *M.Meta
 	switch policy {
 	case "", config.MeshPolicyDirect:
 		metadata.Route = "RouteDirect"
-		return h.dialDirect(ctx, metadata)
+		conn, directErr := h.dialDirect(ctx, metadata)
+		if directErr != nil {
+			// 回落 direct 也失败:终端错误,两段失败同报便于回源定位
+			// (与 mesh 出口「LAN 全败+中继败」错误聚合同款口径)。
+			return nil, fmt.Errorf("mesh: %s unreachable, direct fallback also failed: %w", deviceID, directErr)
+		}
+		return conn, nil
 	case config.MeshPolicyDeny:
 		return nil, fmt.Errorf("mesh: route to %s denied by failure policy: %w", deviceID, peerErr)
 	default:
@@ -1436,8 +1468,8 @@ func (h *TCPConnectionHandler) getMeshProxyForExecution(deviceID string) (*meshp
 			SelfID:   meshSelfIDFromSource(),
 			MaxHops:  meshCfg.EffectiveMaxHops(),
 		}
-		if meshPikoDialSource != nil {
-			target.PikoDial = meshPikoDialSource()
+		if dial := meshPikoDialFromSource(); dial != nil {
+			target.PikoDial = dial
 		}
 		return meshproxy.NewPeer(target), nil
 	}

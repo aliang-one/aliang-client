@@ -85,6 +85,7 @@ func NewPeer(target PeerTarget) *Peer {
 //     收流时已 Append 过本跳;环路在入站 Via 自查处拒绝,本路径不可达环路帧)。
 //     继承帧头缺 From/Class/Target 时由 Encode 校验兜底报错(入站 Parse 已校验,
 //     双保险防手挂畸形帧头)。
+//
 // Task 8 的 DNS 代转发复用本出口:target=dns: 原样透传(见 targetFromMetadata),
 // B 侧按 meshproto.IsDNSTarget 识别并代解析。
 func (p *Peer) DialContext(ctx context.Context, md *M.Metadata) (net.Conn, error) {
