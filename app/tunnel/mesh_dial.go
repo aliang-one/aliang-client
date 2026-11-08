@@ -29,6 +29,9 @@ type meshDialConfig struct {
 }
 
 // setMeshDial 原子更新当前中继拨号配置(nil proxyURL = 中继载体不可用)。
+// 新配置整体生效语义:畸形 proxy url(软失败为 nil)会抹掉上一个可用值——
+// 续期帧是整体快照而非增量,平台侧下发须自证合法;last-known-good 保留为
+// 可选后续优化,当前不做。
 func (m *Manager) setMeshDial(proxyURL *url.URL, token string) {
 	m.mu.Lock()
 	m.meshDial = meshDialConfig{proxyURL: proxyURL, token: token}

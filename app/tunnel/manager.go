@@ -283,6 +283,9 @@ func (m *Manager) validateConfig(config Config) (runConfig, [sha256.Size]byte, e
 	if parsedURL.Scheme != "https" && !(parsedURL.Scheme == "http" && isLoopbackHost(parsedURL.Hostname())) {
 		return runConfig{}, [sha256.Size]byte{}, errors.New("Piko upstream URL must use HTTPS except for loopback development")
 	}
+	// Proxy 面(piko_proxy_url,中继载体 A 侧拨号)按同一套规则校验,见
+	// mesh_dial.go validatePikoProxyURL——两处规则将来单独收紧会静默漂移,
+	// 修改任一处须同步另一处。
 
 	verifier, err := newRouteVerifier(config.RoutePublicKey)
 	if err != nil {
