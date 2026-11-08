@@ -67,6 +67,7 @@
         :steer-items="activeSteerItems"
         :approvals="activeApprovals"
         :option-cards="activeOptionCards"
+        :tool-asks="activeToolAsks"
         :hidden-option-ids="hiddenOptionIds"
         :now-tick="nowTick"
         :set-container="setMessagesContainer"
@@ -75,6 +76,7 @@
         :scroll-to-bottom="scrollToBottom"
         @approval-respond="onApprovalRespond"
         @option-respond="onOptionRespond"
+        @tool-ask-respond="onToolAskRespond"
         @recall="startRecall"
       />
 
@@ -160,6 +162,7 @@ const {
   activeIsDevice,
   activeMessages,
   activeOptionCards,
+  activeToolAsks,
   activeRunning,
   activeSessionRunning,
   activeSteerItems,
@@ -198,6 +201,7 @@ const {
   renameSurface,
   respondApproval,
   respondOption,
+  respondToolAsk,
   scrollToBottom,
   sendMessage,
   sendRecall,
@@ -273,6 +277,13 @@ function onApprovalRespond(approval, decision) {
 // 由 useAliangChat.respondOption 发 ai.option.response（成功置 answered 折叠态）。
 function onOptionRespond(card, payload) {
   respondOption(activeConversation.value, card, payload?.selected, payload?.customText);
+}
+
+// tool_ask 提问卡作答落点（2026-11-08）：两步作答的 respond 事件
+// （selected/customText）由 useAliangChat.respondToolAsk 发 tool_ask.response
+// （成功置 answered 折叠态）。
+function onToolAskRespond(card, payload) {
+  respondToolAsk(activeConversation.value, card, payload?.selected, payload?.customText);
 }
 
 // 静态围栏卡防双份集合（Task 14）：活跃会话在挂交互卡的 option_id →

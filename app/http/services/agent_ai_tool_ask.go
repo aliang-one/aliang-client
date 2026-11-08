@@ -157,9 +157,14 @@ func (m *agentAIManager) toolAskResponse(msg map[string]interface{}, writeJSON a
 		Status:        remoteString(msg, "status"),
 	}
 	if answer, ok := msg["answer"].(map[string]interface{}); ok {
+		// 2026-11-08 顺手修：multi 卡的多选作答此前整路丢弃——PhoneServer
+		// tool_ask 下发契约 v2 字段 selected_option_ids 在这里没进结构体，
+		// downstream（handleAskUser answered 分支）组装 selected_option_ids/
+		// selected_answers 永远收不到。单选/多选两字段并存互斥由 server 保证。
 		resp.Answer = &models.AgentToolAskAnswer{
-			SelectedOptionID: remoteString(answer, "selected_option_id"),
-			Message:          remoteString(answer, "message"),
+			SelectedOptionID:  remoteString(answer, "selected_option_id"),
+			SelectedOptionIDs: remoteStringSlice(answer, "selected_option_ids"),
+			Message:           remoteString(answer, "message"),
 		}
 	}
 	b.deliver(resp)
@@ -183,6 +188,38 @@ func (b *agentToolAskBridge) emitCancel(rc *agentToolAskRunContext, interactionI
 		"reason":         reason,
 		"run_id":         rc.runID,
 		"event_seq":      rc.nextSeq.Add(1),
+	}
+	_ = writeAgentAIApprovalRequest(context.Background(), rc.writeJSON, payload, 1, time.Second)
+}
+
+// emitResolved 作答落地后的跨端翻卡帧（2026-11-08 决策跨端同步）：镜像
+// ai.option 的 resolved 同型约定——tool_ask.request 带 status:"resolved"+
+// answer，经审批族白名单 fanOut 广播（dashboard aisock + 手机 WS），
+// PhoneServer 依此 settle tool_ask 审批行、dashboard 依此翻卡。
+func (b *agentToolAskBridge) emitResolved(rc *agentToolAskRunContext, interactionID string, answer *models.AgentToolAskAnswer) {
+	if rc == nil {
+		return
+	}
+	payload := map[string]interface{}{
+		"type":           models.AgentEventToolAskRequest,
+		"session_id":     rc.sessionID,
+		"interaction_id": interactionID,
+		"status":         "resolved",
+		"run_id":         rc.runID,
+		"event_seq":      rc.nextSeq.Add(1),
+	}
+	if answer != nil {
+		ans := map[string]interface{}{}
+		if answer.SelectedOptionID != "" {
+			ans["selected_option_id"] = answer.SelectedOptionID
+		}
+		if len(answer.SelectedOptionIDs) > 0 {
+			ans["selected_option_ids"] = answer.SelectedOptionIDs
+		}
+		if answer.Message != "" {
+			ans["message"] = answer.Message
+		}
+		payload["answer"] = ans
 	}
 	_ = writeAgentAIApprovalRequest(context.Background(), rc.writeJSON, payload, 1, time.Second)
 }
@@ -313,6 +350,12 @@ func (b *agentToolAskBridge) handleAskUser(ctx context.Context, rawArgs, token s
 	case resp := <-pending.answer:
 		switch resp.Status {
 		case models.AgentToolAskStatusAnswered:
+			// 决策跨端同步（2026-11-08）：作答落地必须广播 resolved 同型帧——
+			// 此前零帧，PhoneServer 的 tool_ask 审批行与 dashboard 提问卡都不
+			// 知情（卡永 pending，还能重复作答双重注入）。帧形与 ai.option 的
+			// resolved 约定同构；经 rc.writeJSON（生产=run emitter 包 fanOut，
+			// tool_ask.request 在审批族白名单）全端可达。
+			b.emitResolved(pending.run, interactionID, resp.Answer)
 			body := map[string]interface{}{"status": "answered"}
 			if resp.Answer != nil {
 				// v2：作答体从裸 slug 升级为「id + 人类可读答案」。fence 主通道

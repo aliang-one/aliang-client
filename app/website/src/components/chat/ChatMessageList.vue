@@ -21,7 +21,7 @@
         <!-- 品牌空状态（无活跃会话 / 空转录且无插话/审批在挂）：渐变圆徽 + 标题 +
              副文案。空转录但已有审批/插话时不显示 hero（内容列表照常渲染）。 -->
         <div
-          v-if="!activeId || (activeMessages.length === 0 && steerItems.length === 0 && approvals.length === 0 && optionCards.length === 0)"
+          v-if="!activeId || (activeMessages.length === 0 && steerItems.length === 0 && approvals.length === 0 && optionCards.length === 0 && toolAsks.length === 0)"
           class="flex min-h-[45vh] flex-col items-center justify-center gap-3 py-10 text-center"
         >
           <div class="flex size-16 items-center justify-center rounded-full bg-gradient-to-br from-primary to-emerald-500 text-white shadow-lg shadow-primary/20">
@@ -83,6 +83,15 @@
             :card="card"
             @respond="(payload) => emit('option-respond', card, payload)"
           />
+          <!-- tool_ask 提问卡（2026-11-08 dashboard 渲染接入）：与方案卡同构
+               同区，数据形状兼容 ChatOptionCard（title/options/allowCustom/
+               multi/status），作答上抛 ChatPage → respondToolAsk。 -->
+          <ChatOptionCard
+            v-for="card in toolAsks"
+            :key="card.key"
+            :card="card"
+            @respond="(payload) => emit('tool-ask-respond', card, payload)"
+          />
         </template>
       </div>
     </div>
@@ -123,6 +132,8 @@ const props = defineProps({
   approvals: { type: Array, default: () => [] },
   // 方案交互卡（Task 14，含 answered 终态折叠卡；作废即被移除），透传渲染。
   optionCards: { type: Array, default: () => [] },
+  // tool_ask 提问卡（2026-11-08，与方案卡同构；作废即被移除），透传渲染。
+  toolAsks: { type: Array, default: () => [] },
   // 在挂交互卡的 option_id 集合 → 气泡层静态围栏卡防双份（Task 14）。
   hiddenOptionIds: { type: Array, default: () => [] },
   nowTick: { type: Number, default: 0 },
@@ -138,7 +149,7 @@ const props = defineProps({
   scrollToBottom: { type: Function, required: true },
 });
 
-const emit = defineEmits(['approval-respond', 'option-respond', 'recall']);
+const emit = defineEmits(['approval-respond', 'option-respond', 'tool-ask-respond', 'recall']);
 
 const { t } = useI18n();
 
@@ -158,7 +169,7 @@ const unseenCount = ref(0);
 
 function feedTotal() {
   return props.activeMessages.length + props.steerItems.length + props.approvals.length
-    + props.optionCards.length;
+    + props.optionCards.length + props.toolAsks.length;
 }
 
 watch(feedTotal, (n, o) => {

@@ -93,6 +93,31 @@ func TestContractTruncateRecallFields(t *testing.T) {
 	}
 }
 
+// 2026-11-08 决策跨端同步：ai.option.request 的 resolved 同型帧字段
+// （status/selected/custom_text）必须登记进契约 Optional 表（表对外下发，
+// 漏登=前端拿不到契约提示）。
+func TestContractOptionResolvedFields(t *testing.T) {
+	c := DefaultAgentProtocolContract()
+	schema := findProtocolEvent(c.WebSocket.ServerSends, AgentEventAIOptionRequest)
+	if schema == nil {
+		schema = findProtocolEvent(c.WebSocket.ClientSends, AgentEventAIOptionRequest)
+	}
+	if schema == nil {
+		t.Fatalf("契约表缺 ai.option.request")
+	}
+	want := map[string]bool{"status": false, "selected": false, "custom_text": false}
+	for _, f := range schema.Optional {
+		if _, ok := want[f]; ok {
+			want[f] = true
+		}
+	}
+	for f, found := range want {
+		if !found {
+			t.Fatalf("ai.option.request Optional 缺 %s（resolved 同型帧字段）", f)
+		}
+	}
+}
+
 func findProtocolEvent(events []AgentProtocolEvent, typ string) *AgentProtocolEvent {
 	for i := range events {
 		if events[i].Type == typ {
