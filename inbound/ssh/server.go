@@ -94,7 +94,8 @@ func (s *Server) Start() error {
 	return nil
 }
 
-// Stop 停止服务(幂等):关监听、断开在途连接并等待 goroutine 退出。
+// Stop 停止服务(幂等):关监听、断开在途连接并等待 accept/handle
+// 协程退出(drain/global-request 协程随连接拆除退出,不在此 WaitGroup)。
 func (s *Server) Stop() error {
 	s.mu.Lock()
 	if !s.running {

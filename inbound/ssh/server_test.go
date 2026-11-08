@@ -437,6 +437,98 @@ func TestAuthLimiterBackoffWindows(t *testing.T) {
 	}
 }
 
+func TestAuthLimiterIdleEviction(t *testing.T) {
+	now := time.Unix(1700000000, 0)
+	l := newAuthLimiter()
+	l.now = func() time.Time { return now }
+	ip := "203.0.113.9"
+
+	// fails=3(窗口 8s)。恰好在 TTL 边界(未超过)不驱逐:条目存续,
+	// 再失败窗口续涨到 16s。
+	for i := 0; i < 3; i++ {
+		l.Fail(ip)
+	}
+	now = now.Add(limiterIdleTTL) // 恰好 =,不触发驱逐
+	if !l.Allow(ip) {
+		t.Fatal("exactly-at-TTL entry must not be evicted (window long elapsed)")
+	}
+	l.Fail(ip) // 若条目存续则 fails=4→16s;若被误驱逐则 fails=1→2s
+	now = now.Add(3 * time.Second)
+	if l.Allow(ip) {
+		t.Fatal("entry surviving exact-TTL must escalate its window (fails=4→16s)")
+	}
+	now = now.Add(13 * time.Second) // 16s 窗口走完
+	if !l.Allow(ip) {
+		t.Fatal("window elapsed must allow")
+	}
+
+	// 超过 TTL(严格 >):驱逐并放行,fails 衰减归零——再失败从 2s 窗口
+	// 重新起步(否则攻击停止数小时后该 IP 仍被 30s 帽永久限速)。
+	now = now.Add(limiterIdleTTL + time.Second)
+	if !l.Allow(ip) {
+		t.Fatal("entry past idle TTL must be evicted and allowed")
+	}
+	l.Fail(ip)
+	now = now.Add(1999 * time.Millisecond)
+	if l.Allow(ip) {
+		t.Fatal("post-eviction failure must restart backoff from the 2s window")
+	}
+	now = now.Add(2 * time.Millisecond)
+	if !l.Allow(ip) {
+		t.Fatal("restarted 2s window elapsed must allow")
+	}
+}
+
+func TestAuthLimiterCapacitySweep(t *testing.T) {
+	now := time.Unix(1700000000, 0)
+	l := newAuthLimiter()
+	l.now = func() time.Time { return now }
+
+	// 前半填充(将被清扫的过期条目)。
+	for i := 0; i < limiterMaxEntries/2; i++ {
+		l.Fail(fmt.Sprintf("10.1.%d.%d", i/256, i%256))
+	}
+	now = now.Add(limiterIdleTTL + time.Minute) // 前半过期
+	// 后半填充至满(新鲜条目)。
+	for i := limiterMaxEntries / 2; i < limiterMaxEntries; i++ {
+		l.Fail(fmt.Sprintf("10.1.%d.%d", i/256, i%256))
+	}
+	if len(l.entries) != limiterMaxEntries {
+		t.Fatalf("entries = %d, want %d", len(l.entries), limiterMaxEntries)
+	}
+	// 容量满但过半过期:新 IP 的 Fail 先整表清扫腾位,再记账成功。
+	l.Fail("192.0.2.99")
+	if _, ok := l.entries["192.0.2.99"]; !ok {
+		t.Fatal("Fail at cap must sweep expired entries and record the new IP")
+	}
+	if len(l.entries) > limiterMaxEntries {
+		t.Fatalf("entries = %d exceeds cap %d", len(l.entries), limiterMaxEntries)
+	}
+
+	// 全部新鲜打满:清扫无腾位,新 IP 记账被丢弃(内存有界取舍);
+	// 已有条目的更新不受容量约束(map 不增长)。
+	now = now.Add(time.Minute)
+	for i := 0; len(l.entries) < limiterMaxEntries && i < 2*limiterMaxEntries; i++ {
+		l.Fail(fmt.Sprintf("198.18.%d.%d", i/256, i%256))
+	}
+	if len(l.entries) != limiterMaxEntries {
+		t.Fatalf("fill to cap: entries = %d, want %d", len(l.entries), limiterMaxEntries)
+	}
+	l.Fail("192.0.2.100")
+	if _, ok := l.entries["192.0.2.100"]; ok {
+		t.Fatal("new entry must be dropped when cap holds after sweep")
+	}
+	existing := "198.18.0.0"
+	before := l.entries[existing].fails
+	l.Fail(existing)
+	if l.entries[existing].fails != before+1 {
+		t.Fatal("updating an existing entry must stay effective at cap")
+	}
+	if len(l.entries) != limiterMaxEntries {
+		t.Fatalf("existing-entry update must not grow the map: %d", len(l.entries))
+	}
+}
+
 func TestAuthLimiterConcurrent(t *testing.T) {
 	l := newAuthLimiter()
 	var wg sync.WaitGroup
