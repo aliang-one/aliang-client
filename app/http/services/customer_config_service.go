@@ -306,7 +306,7 @@ func buildSSHIngressRunConfig(effective *config.SSHIngressConfig) *sshin.RunConf
 		Port:           effective.Port,
 		AuthorizedKeys: authorized,
 		MeshKeys:       mesh,
-		// ForwardGate 合并集成缝,见 reconcileSSHIngressAfterCommit 注释。
+		// ForwardGate 合并集成缝,见 ReconcileSSHIngressFromConfig 注释。
 		ForwardGate: nil,
 	}
 }

@@ -315,7 +315,7 @@ func TestSSHIngressReconcileStartsAndStops(t *testing.T) // 配置 enable→IsRu
 - [ ] `go test ./app/http/services/ -count=1`
 - [ ] `cd app/website && npx vitest run && npm run build`
 - [ ] 失败定性(预存 flake 对照 memory:services race flake/handlers notification flake/agent_ai 子进程超时)
-- [ ] 冒烟清单(写给用户):仪表盘开 SSH 入口→保存→ssh -D 连入→流量经节点出口;指纹核对;mesh 凭证连入(待组网合并后端到端);**合并后集成清单**:ForwardGate 接 mesh EffectiveForwardEnabled、dialByRoute 消费 IngressFrameMeta 续传、dns: 代解析启用
+- [ ] 冒烟清单(写给用户):仪表盘开 SSH 入口→保存→ssh -D 连入→流量经节点出口;指纹核对;mesh 凭证连入(待组网合并后端到端);**重启自愈**:重启 core(daemon/start/tray 三条启动路径任一)后已启用入口自动恢复监听(56441 或配置口),无需再保存一次配置;**入口所有权归 core 进程**——user-agent(agentruntime)不跑入口(其 mux 无 /api/config/customer 且非代理进程,注入会走未配置的出口 registry),双进程抢绑只会分脑;**合并后集成清单**:ForwardGate 接 mesh EffectiveForwardEnabled、dialByRoute 消费 IngressFrameMeta 续传、dns: 代解析启用
 - [ ] 提交(若有散落)
 
 ## 任务依赖

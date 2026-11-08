@@ -133,6 +133,35 @@ func TestReconcileStartsStopsAndRestartsOnChange(t *testing.T) {
 	}
 }
 
+// TestReconcileCredentialReorderDoesNotRestart 钉死凭证集合语义:同凭证集
+// 不同列表顺序的两次 Reconcile 是同一期望态(Marshal 字节排序后比对),
+// 不触发重启——监听口不变。顺序敏感实现会在无害重排时掐断在途连接。
+func TestReconcileCredentialReorderDoesNotRestart(t *testing.T) {
+	hostKeyPath := filepath.Join(t.TempDir(), IngressHostKeyFileName)
+	t.Cleanup(func() { Reconcile(nil, hostKeyPath, nil) })
+
+	humanPub, _ := newTestKey(t)
+	meshPub, _ := newTestKey(t)
+	extraPub, _ := newTestKey(t)
+
+	Reconcile(&RunConfig{AuthorizedKeys: []gossh.PublicKey{humanPub, extraPub}, MeshKeys: []gossh.PublicKey{meshPub}},
+		hostKeyPath, func() string { return "node-unit" })
+	addr1 := Addr()
+	if addr1 == "" || !IsRunning() {
+		t.Fatal("reconciled ingress must be running")
+	}
+
+	// 同凭证集、列表顺序全反:期望态等价 → 不重启(Addr 不变)。
+	Reconcile(&RunConfig{AuthorizedKeys: []gossh.PublicKey{extraPub, humanPub}, MeshKeys: []gossh.PublicKey{meshPub}},
+		hostKeyPath, func() string { return "node-unit" })
+	if got := Addr(); got != addr1 {
+		t.Fatalf("credential reorder must not restart: addr %q -> %q", addr1, got)
+	}
+	if !IsRunning() {
+		t.Fatal("reconciled ingress must stay running across reorder")
+	}
+}
+
 func TestReconcileFailedStartStaysStoppedAndRetries(t *testing.T) {
 	hostKeyPath := filepath.Join(t.TempDir(), IngressHostKeyFileName)
 	t.Cleanup(func() { Reconcile(nil, hostKeyPath, nil) })
