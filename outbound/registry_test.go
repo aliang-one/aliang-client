@@ -1,10 +1,15 @@
 package outbound
 
 import (
+	"context"
+	"errors"
 	"strings"
 	"testing"
+	"time"
 
+	M "aliang.one/nursorgate/inbound/tun/metadata"
 	"aliang.one/nursorgate/outbound/proxy/proto"
+	sshout "aliang.one/nursorgate/outbound/proxy/ssh"
 	"aliang.one/nursorgate/processor/config"
 )
 
@@ -168,6 +173,17 @@ func TestRegistryRefreshCustomerProxy_SSH(t *testing.T) {
 	registry.UnregisterCustomerProxies()
 	if _, err := registry.Get("ssh"); err == nil {
 		t.Fatal("ssh entry must be unregistered")
+	}
+
+	// 守护:UnregisterCustomerProxies 不只删条目,还必须 Close 被移除的实例
+	// (closeProxyIfSupported 接线)。删掉 close 循环会让泄漏无声复活——此断言
+	// 拦在 DialContext 顶部的 closed 检查上,无网络。ctx 带 2s 上限:接线健在
+	// 时 ErrClosed 即刻返回;若接线被删,DialContext 会真的去拨池链,2s 后以
+	// ctx 错误干净失败而不是无限挂死。
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, err := p.DialContext(ctx, &M.Metadata{HostName: "127.0.0.1", DstPort: 80}); !errors.Is(err, sshout.ErrClosed) {
+		t.Fatalf("DialContext after Unregister error = %v, want ssh.ErrClosed (removed instance must be closed)", err)
 	}
 }
 

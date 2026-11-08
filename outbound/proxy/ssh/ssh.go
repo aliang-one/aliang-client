@@ -22,8 +22,10 @@ import (
 
 var _ proxy.Proxy = (*SSH)(nil)
 
-// errSSHClosed 是 Close 之后 DialContext 的统一返回(sentinel,可 errors.Is)。
-var errSSHClosed = errors.New("ssh outbound closed")
+// ErrClosed 是 Close 之后 DialContext 的统一返回(sentinel,可 errors.Is)。
+// 导出供 registry 守护测试断言 UnregisterCustomerProxies 确实关闭了被移除
+// 的实例(closed 置位在 DialContext 顶部即拦,断言路径无网络)。
+var ErrClosed = errors.New("ssh outbound closed")
 
 // SSH 是 SSH 出口代理:DialContext 从链池取一条 SSH 链(可选多跳),在其
 // 最终跳上开 direct-tcpip 通道承载 TCP;UDP 不支持;Close 断开全部链并
@@ -106,7 +108,7 @@ func (s *SSH) DialContext(ctx context.Context, metadata *M.Metadata) (net.Conn, 
 		//(在途调用通过检查后实例被 Close,死链触发重试路径)在此拦下,
 		// 不复活出 pool.close 已错过、无人回收的新链。
 		if s.closed.Load() {
-			return nil, errSSHClosed
+			return nil, ErrClosed
 		}
 		cl, c, err := s.pool.acquire(ctx)
 		if err != nil {

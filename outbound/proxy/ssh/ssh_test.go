@@ -268,8 +268,8 @@ func TestSSHCloseIsTerminal(t *testing.T) {
 		t.Fatalf("second Close: %v", err)
 	}
 	md := &metadata.Metadata{HostName: "127.0.0.1", DstPort: 1}
-	if _, err := p.DialContext(context.Background(), md); !errors.Is(err, errSSHClosed) {
-		t.Fatalf("DialContext after Close err = %v, want errSSHClosed (no lazy revival)", err)
+	if _, err := p.DialContext(context.Background(), md); !errors.Is(err, ErrClosed) {
+		t.Fatalf("DialContext after Close err = %v, want ErrClosed (no lazy revival)", err)
 	}
 }
 
@@ -447,8 +447,8 @@ func TestSSHCloseBlocksInflightRetry(t *testing.T) {
 	close(openGate)
 	select {
 	case err := <-done:
-		if !errors.Is(err, errSSHClosed) {
-			t.Fatalf("inflight DialContext err = %v, want errSSHClosed", err)
+		if !errors.Is(err, ErrClosed) {
+			t.Fatalf("inflight DialContext err = %v, want ErrClosed", err)
 		}
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("inflight DialContext stuck: retry reached acquire after Close (closed check missing)")

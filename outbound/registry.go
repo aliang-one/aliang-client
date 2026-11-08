@@ -174,7 +174,19 @@ func (r *Registry) RefreshCustomerProxy(cfg *proxyConfig.Config) error {
 		if err := r.Register("ssh", sshProxy); err != nil {
 			return fmt.Errorf("failed to register ssh proxy: %w", err)
 		}
-		logger.Debug(fmt.Sprintf("SSH proxy registered at %s (pool=%d, jumps=%d)", addr, proxyCfg.PoolSize, len(jumps)))
+		// 日志打钳位后的有效池大小(钳位权威在 ssh.New:0→3、<1→1、>16→16);
+		// 否则未设 pool_size 时日志说 pool=0,而实际池是 3。
+		effectivePool := proxyCfg.PoolSize
+		if effectivePool == 0 {
+			effectivePool = 3
+		}
+		if effectivePool < 1 {
+			effectivePool = 1
+		}
+		if effectivePool > 16 {
+			effectivePool = 16
+		}
+		logger.Debug(fmt.Sprintf("SSH proxy registered at %s (pool=%d, jumps=%d)", addr, effectivePool, len(jumps)))
 	default:
 		return fmt.Errorf("unsupported customer proxy config type %T", customerProxy)
 	}
