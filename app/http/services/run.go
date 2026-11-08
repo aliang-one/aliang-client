@@ -731,10 +731,12 @@ func bootstrapCanonicalRoutingSchema(mode models.RunMode) *config.CanonicalRouti
 	toSocksEnabled := false
 	if globalCfg != nil && globalCfg.Customer != nil && globalCfg.Customer.Proxy != nil {
 		proxyType := strings.ToLower(strings.TrimSpace(globalCfg.Customer.Proxy.Type))
-		if globalCfg.Customer.Proxy.IsEnabled() && (proxyType == "http" || proxyType == "socks5") {
+		if globalCfg.Customer.Proxy.IsEnabled() && (proxyType == "http" || proxyType == "socks5" || proxyType == "ssh") {
 			toSocksEnabled = strings.TrimSpace(globalCfg.Customer.Proxy.Server) != ""
 			if proxyType == "http" {
 				upstreamType = "http"
+			} else if proxyType == "ssh" {
+				upstreamType = "ssh" // 显式覆写;沿用默认 "socks" 会与 registry "ssh" 条目错位
 			}
 		}
 	}

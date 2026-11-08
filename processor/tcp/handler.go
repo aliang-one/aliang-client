@@ -53,6 +53,7 @@ const (
 	DenyReasonToSocksUnsupported   = "toSocks_unsupported_upstream_type"
 	toSocksUpstreamTypeSocks       = "socks"
 	toSocksUpstreamTypeHTTP        = "http"
+	toSocksUpstreamTypeSSH         = "ssh"
 	toSocksBranchName              = "toSocks"
 	toAliangBranchName             = "toAliang"
 )
@@ -1266,6 +1267,8 @@ func (h *TCPConnectionHandler) getToSocksProxyForExecution() (outboundproxy.Prox
 		proxyName = "socks"
 	case toSocksUpstreamTypeHTTP:
 		proxyName = "http"
+	case toSocksUpstreamTypeSSH:
+		proxyName = "ssh"
 	default:
 		return nil, "", newBranchDenyError(
 			toSocksBranchName,
@@ -1293,6 +1296,8 @@ func currentCustomerProxyUpstreamType() (string, bool) {
 		return toSocksUpstreamTypeHTTP, true
 	case "socks5":
 		return toSocksUpstreamTypeSocks, true
+	case "ssh":
+		return toSocksUpstreamTypeSSH, true
 	default:
 		return "", false
 	}

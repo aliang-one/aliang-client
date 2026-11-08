@@ -393,6 +393,31 @@ func TestBootstrapCanonicalRoutingSchemaHonorsDisabledCustomerProxy(t *testing.T
 	}
 }
 
+// type=ssh 的客户代理必须进 bootstrap 白名单,且 upstreamType 显式映射 "ssh":
+// 沿用默认 "socks" 会与 registry "ssh" 条目错位(Get("socks") 失败报 ToSocksUnavailable)。
+func TestBootstrapCanonicalRoutingSchemaSSHCustomerProxy(t *testing.T) {
+	config.ResetGlobalConfigForTest()
+	t.Cleanup(config.ResetGlobalConfigForTest)
+
+	config.SetGlobalConfig(&config.Config{
+		Customer: &config.CustomerConfig{
+			Proxy: &config.CustomerProxyConfig{
+				Enable: customerBoolPtr(true),
+				Type:   "ssh",
+				Server: "127.0.0.1:2222",
+			},
+		},
+	})
+
+	canonical := bootstrapCanonicalRoutingSchema(models.ModeTUN)
+	if !canonical.Egress.ToSocks.Enabled {
+		t.Fatal("bootstrap toSocks.enabled = false, want true for enabled ssh customer proxy")
+	}
+	if got := canonical.Egress.ToSocks.Upstream.Type; got != "ssh" {
+		t.Fatalf("bootstrap toSocks.upstream.type = %q, want ssh (显式映射,不得沿用默认 socks)", got)
+	}
+}
+
 func TestRunServiceSwitchModeStopsRunningServiceWithoutAutoStart(t *testing.T) {
 	defer resetRunServiceHooksForTest()
 	seedActiveIngressSnapshot(t, string(models.ModeHTTP))

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"aliang.one/nursorgate/common/cache"
@@ -304,5 +305,47 @@ func TestApplyPersistsRuleListRoundTrip(t *testing.T) {
 	}
 	if restored.Egress.ToSocks.Upstream.Type != "http" {
 		t.Fatalf("restored upstream type = %q, want http", restored.Egress.ToSocks.Upstream.Type)
+	}
+}
+
+const toSocksSSHEnabledCanonical = `{
+	"version": 1,
+	"ingress": {"mode": "tun"},
+	"egress": {
+		"direct": {"enabled": true},
+		"toAliang": {"enabled": true},
+		"toSocks": {"enabled": true, "upstream": {"type": "ssh"}}
+	},
+	"routing": {"rules": [], "default_egress": "direct"}
+}`
+
+// SSH 出口类型必须进 canonical schema 枚举:校验拒绝即配置存不进,SSH 客户代理
+// 永远无法启用(防静默故障:非白名单类型在 Validate 一层就拦死)。
+// 同时回归:非白名单类型仍拒、enabled+空串 type 仍拒(放行 ssh 不放宽其余语义)。
+func TestCanonicalSchemaToSocksSSH(t *testing.T) {
+	isolateRoutingPersistence(t)
+	ResetRoutingApplyStoreForTest()
+
+	mustApplyCanonical(t, []byte(toSocksSSHEnabledCanonical))
+
+	active := GetRoutingApplyStore().ActiveCanonicalSchema()
+	if active == nil {
+		t.Fatal("active canonical is nil after apply")
+	}
+	if !active.Egress.ToSocks.Enabled {
+		t.Fatal("active toSocks.enabled = false, want true for ssh upstream")
+	}
+	if got := active.Egress.ToSocks.Upstream.Type; got != "ssh" {
+		t.Fatalf("active toSocks.upstream.type = %q, want ssh", got)
+	}
+
+	invalidType := strings.Replace(toSocksSSHEnabledCanonical, `"type": "ssh"`, `"type": "ftp"`, 1)
+	if _, err := GetRoutingApplyStore().Apply([]byte(invalidType), testSnapshotBuilder); err == nil {
+		t.Fatal("Apply(upstream.type=ftp) error = nil, want validation failure")
+	}
+
+	emptyType := strings.Replace(toSocksSSHEnabledCanonical, `"type": "ssh"`, `"type": ""`, 1)
+	if _, err := GetRoutingApplyStore().Apply([]byte(emptyType), testSnapshotBuilder); err == nil {
+		t.Fatal(`Apply(upstream.type="") error = nil, want validation failure when toSocks enabled`)
 	}
 }

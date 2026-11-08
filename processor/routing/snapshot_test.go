@@ -505,3 +505,37 @@ func TestDecideRouteFromSnapshot_GeoIPConditionMatchesCaseInsensitively(t *testi
 		t.Fatalf("decision for US IP = %s, want %s (不命中走默认)", decision, RouteDirect)
 	}
 }
+
+// resolveToSocksUpstreamType 必须识别 ssh:漏掉即 canonical.Egress.ToSocks.Enabled=false,
+// 客户代理流量静默回落 direct(编译过、测试绿、线上坏)——本测试就是那道防线。
+// 整编断言:从运行时输入编译 canonical 后 toSocks 保持启用且 upstream.type=ssh。
+func TestResolveToSocksUpstreamTypeSSH(t *testing.T) {
+	cfg := &config.Config{
+		Customer: &config.CustomerConfig{
+			Proxy: &config.CustomerProxyConfig{
+				Enable: boolPtr(true),
+				Type:   "ssh",
+				Server: "1.2.3.4:22",
+			},
+		},
+	}
+
+	typ, ok := resolveToSocksUpstreamType(cfg)
+	if !ok || typ != "ssh" {
+		t.Fatalf("resolveToSocksUpstreamType = (%q,%v), want (ssh,true)", typ, ok)
+	}
+
+	canonical, err := CompileCanonicalRoutingFromRuntimeInputs(cfg, model.RulesSettings{
+		AliangEnabled: true,
+		SocksEnabled:  true,
+	})
+	if err != nil {
+		t.Fatalf("CompileCanonicalRoutingFromRuntimeInputs() error = %v", err)
+	}
+	if !canonical.Egress.ToSocks.Enabled {
+		t.Fatal("canonical.Egress.ToSocks.Enabled = false, want true (防静默回落 direct 的关键断言)")
+	}
+	if got := canonical.Egress.ToSocks.Upstream.Type; got != "ssh" {
+		t.Fatalf("canonical.Egress.ToSocks.Upstream.Type = %q, want ssh", got)
+	}
+}
