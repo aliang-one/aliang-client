@@ -200,6 +200,16 @@ handler 落在与 customer 配置同族的 service 文件(沿 routes.go:216 的
 - SSH keepalive 可配置(先用 x/crypto 默认;实测有问题再加)
 - compression/加密套件选择(交给协议默认)
 
+## 已知限制(spec 审查立档,2026-11-08)
+
+- **SSH 通道无 deadline 支持**:x/crypto 的 ssh.Channel 不支持
+  SetReadDeadline/SetWriteDeadline(trackedChannel 只能 no-op)。relayStream
+  依赖 SetReadDeadline 做的「半关闭后不无限等」保护对 SSH 出口**静默失效**
+  (对端僵死且 TCP 不断时,拷贝协程可挂)——socks5/http/vless 返回真 TCP
+  conn 有界,本出口是新增的不一致风险面。协议固有限制,与跳板 hop≥1 握手
+  无 deadline 同源。候选缓解:通道级空闲看门狗/keepalive(与 AI 卡死硬顶
+  工作族相关),留待实测有案例后立项。
+
 ## 影响面与兼容
 
 - `proto` 枚举追加尾部,现有协议数值不变。
