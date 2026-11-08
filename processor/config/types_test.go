@@ -1,9 +1,13 @@
 package config
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/json"
 	"strings"
 	"testing"
+
+	gossh "golang.org/x/crypto/ssh"
 
 	"aliang.one/nursorgate/processor/geoip"
 )
@@ -1736,5 +1740,304 @@ func TestValidateCustomerProxySchemeSSH(t *testing.T) {
 		if err := validateCustomerProxyScheme("ssh", scheme); err == nil {
 			t.Fatalf("validateCustomerProxyScheme(ssh, %s) = nil, want mismatch error", scheme)
 		}
+	}
+}
+
+// generateAuthorizedKeyLine 生成一条真实可解析的 ed25519 authorized_keys 行
+// (gossh.MarshalAuthorizedKey 自带尾部换行,这里 TrimSpace 掉)。
+func generateAuthorizedKeyLine(t *testing.T) string {
+	t.Helper()
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("ed25519.GenerateKey() error = %v", err)
+	}
+	sshPub, err := gossh.NewPublicKey(pub)
+	if err != nil {
+		t.Fatalf("gossh.NewPublicKey() error = %v", err)
+	}
+	return strings.TrimSpace(string(gossh.MarshalAuthorizedKey(sshPub)))
+}
+
+func TestSSHIngressConfigValidate(t *testing.T) {
+	keyLine := generateAuthorizedKeyLine(t)
+	enabled := true
+
+	tests := []struct {
+		name    string
+		config  *SSHIngressConfig
+		wantErr bool
+		errMsg  string
+	}{
+		{
+			name:    "nil config skips validation",
+			config:  nil,
+			wantErr: false,
+		},
+		{
+			name: "enable nil means disabled and skips validation",
+			config: &SSHIngressConfig{
+				AuthorizedKeys: []string{"not-a-key"},
+			},
+			wantErr: false,
+		},
+		{
+			name: "explicitly disabled skips validation",
+			config: &SSHIngressConfig{
+				Enable:          new(bool),
+				AuthorizedKeys: []string{"not-a-key"},
+			},
+			wantErr: false,
+		},
+		{
+			name: "enabled without any key rejected",
+			config: &SSHIngressConfig{
+				Enable: &enabled,
+			},
+			wantErr: true,
+			errMsg:  "requires at least one authorized key",
+		},
+		{
+			name: "enabled with only empty strings rejected",
+			config: &SSHIngressConfig{
+				Enable:          &enabled,
+				AuthorizedKeys: []string{""},
+			},
+			wantErr: true,
+			errMsg:  "authorized_keys[0] cannot be empty",
+		},
+		{
+			name: "enabled with blank entry rejected",
+			config: &SSHIngressConfig{
+				Enable:          &enabled,
+				AuthorizedKeys: []string{"   "},
+			},
+			wantErr: true,
+			errMsg:  "authorized_keys[0] cannot be empty",
+		},
+		{
+			name: "invalid authorized key line rejected by ParseAuthorizedKey",
+			config: &SSHIngressConfig{
+				Enable:          &enabled,
+				AuthorizedKeys: []string{"not-a-key"},
+			},
+			wantErr: true,
+			errMsg:  "authorized_keys[0] is not a valid authorized key line",
+		},
+		{
+			name: "invalid mesh key line rejected with field name",
+			config: &SSHIngressConfig{
+				Enable:             &enabled,
+				MeshAuthorizedKeys: []string{"also-not-a-key"},
+			},
+			wantErr: true,
+			errMsg:  "mesh_authorized_keys[0] is not a valid authorized key line",
+		},
+		{
+			name: "same byte-identical key in both lists rejected as ambiguous",
+			config: &SSHIngressConfig{
+				Enable:             &enabled,
+				AuthorizedKeys:     []string{keyLine},
+				MeshAuthorizedKeys: []string{keyLine},
+			},
+			wantErr: true,
+			errMsg:  "listed in both authorized_keys and mesh_authorized_keys",
+		},
+		{
+			name: "distinct keys in both lists pass",
+			config: &SSHIngressConfig{
+				Enable:             &enabled,
+				AuthorizedKeys:     []string{generateAuthorizedKeyLine(t)},
+				MeshAuthorizedKeys: []string{keyLine},
+			},
+			wantErr: false,
+		},
+		{
+			name: "valid human key only passes with port zero meaning default",
+			config: &SSHIngressConfig{
+				Enable:          &enabled,
+				AuthorizedKeys: []string{keyLine},
+			},
+			wantErr: false,
+		},
+		{
+			name: "valid mesh key only passes",
+			config: &SSHIngressConfig{
+				Enable:             &enabled,
+				MeshAuthorizedKeys: []string{keyLine},
+			},
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.config.Validate()
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("Validate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if err != nil && tt.errMsg != "" && !strings.Contains(err.Error(), tt.errMsg) {
+				t.Fatalf("Validate() error = %q, want contains %q", err.Error(), tt.errMsg)
+			}
+		})
+	}
+}
+
+// port=70000 无法落进 uint16:必须在 JSON 反序列化层被拒,而不是静默截断。
+func TestSSHIngressConfigPortOverflowRejectedByJSON(t *testing.T) {
+	var cfg Config
+	err := json.Unmarshal([]byte(`{
+		"customer": {"ssh_ingress": {"enable": true, "port": 70000}}
+	}`), &cfg)
+	if err == nil {
+		t.Fatal("json.Unmarshal(port=70000) error = nil, want uint16 overflow error")
+	}
+	if !strings.Contains(err.Error(), "ssh_ingress") && !strings.Contains(err.Error(), "port") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var okCfg Config
+	if err := json.Unmarshal([]byte(`{
+		"customer": {"ssh_ingress": {"enable": true, "port": 65535}}
+	}`), &okCfg); err != nil {
+		t.Fatalf("json.Unmarshal(port=65535) error = %v, want nil", err)
+	}
+	if okCfg.Customer == nil || okCfg.Customer.SSHIngress == nil || okCfg.Customer.SSHIngress.Port != 65535 {
+		t.Fatalf("port = %+v, want 65535", okCfg.Customer)
+	}
+}
+
+// ssh_ingress 必须在可编辑面白名单里(未知键 switch),且未知键仍被拒、
+// 拒绝文案含更新后的字段清单(与 services 侧文案逐字同步的锚点)。
+func TestCustomerConfigSSHIngressEditableSurface(t *testing.T) {
+	keyLine := generateAuthorizedKeyLine(t)
+	payload := []byte(`{
+		"core": {"api_server": "https://api.aliang.one"},
+		"customer": {
+			"ssh_ingress": {
+				"enable": true,
+				"port": 56441,
+				"authorized_keys": ["` + keyLine + `"]
+			}
+		}
+	}`)
+
+	var cfg Config
+	if err := json.Unmarshal(payload, &cfg); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if cfg.Customer.SSHIngress == nil {
+		t.Fatal("cfg.Customer.SSHIngress = nil, want parsed config")
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v, want nil (ssh_ingress is editable)", err)
+	}
+
+	forbidden := []byte(`{
+		"core": {"api_server": "https://api.aliang.one"},
+		"customer": {"no_such_field": true}
+	}`)
+	var badCfg Config
+	if err := json.Unmarshal(forbidden, &badCfg); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	err := badCfg.Validate()
+	if err == nil {
+		t.Fatal("Validate() error = nil, want forbidden field error")
+	}
+	if !strings.Contains(err.Error(), "customer.no_such_field is forbidden") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "ssh_ingress") {
+		t.Fatalf("拒绝文案应含更新后的字段清单(含 ssh_ingress), got %v", err)
+	}
+}
+
+// Config.Validate 必须接线 SSHIngressConfig.Validate:enable 且缺凭证时报错,
+// 不能静默跳过;未启用时缺凭证不报错。
+func TestConfigValidateSSHIngressWiring(t *testing.T) {
+	enabled, disabled := true, false
+	cfg := &Config{
+		// core.api_server 必填:Config.Validate 先查它,不配到不了 ssh_ingress 的校验。
+		Core: &CoreConfig{APIServer: "https://api.aliang.one"},
+		Customer: &CustomerConfig{
+			SSHIngress: &SSHIngressConfig{Enable: &enabled},
+		},
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("Validate() error = nil, want ssh_ingress validation error")
+	}
+	if !strings.Contains(err.Error(), "invalid ssh_ingress configuration") {
+		t.Fatalf("error should be wrapped as invalid ssh_ingress configuration, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "requires at least one authorized key") {
+		t.Fatalf("error should surface the key requirement, got %v", err)
+	}
+
+	offCfg := &Config{
+		Core: &CoreConfig{APIServer: "https://api.aliang.one"},
+		Customer: &CustomerConfig{
+			SSHIngress: &SSHIngressConfig{Enable: &disabled},
+		},
+	}
+	if err := offCfg.Validate(); err != nil {
+		t.Fatalf("disabled ssh_ingress Validate() error = %v, want nil", err)
+	}
+}
+
+// EffectiveSSHIngress:未配置/未启用返回 nil;启用时返回归一化副本——
+// port 0→默认 56441、公钥逐条 TrimSpace、空行剔除;副本与原值切片隔离。
+func TestEffectiveSSHIngress(t *testing.T) {
+	enabled := true
+	keyLine := generateAuthorizedKeyLine(t)
+
+	if cfg := (*Config)(nil); cfg.EffectiveSSHIngress() != nil {
+		t.Fatal("nil Config EffectiveSSHIngress() != nil")
+	}
+	if cfg := (&Config{}); cfg.EffectiveSSHIngress() != nil {
+		t.Fatal("nil Customer EffectiveSSHIngress() != nil")
+	}
+	disabled := false
+	if cfg := (&Config{Customer: &CustomerConfig{SSHIngress: &SSHIngressConfig{Enable: &disabled}}}); cfg.EffectiveSSHIngress() != nil {
+		t.Fatal("disabled EffectiveSSHIngress() != nil")
+	}
+
+	src := &SSHIngressConfig{
+		Enable:             &enabled,
+		AuthorizedKeys:     []string{"  " + keyLine + "  ", ""},
+		MeshAuthorizedKeys: []string{keyLine + "\t"},
+	}
+	cfg := &Config{Customer: &CustomerConfig{SSHIngress: src}}
+	got := cfg.EffectiveSSHIngress()
+	if got == nil {
+		t.Fatal("EffectiveSSHIngress() = nil, want normalized copy")
+	}
+	if got.Port != 56441 {
+		t.Fatalf("Port = %d, want default 56441", got.Port)
+	}
+	if len(got.AuthorizedKeys) != 1 || got.AuthorizedKeys[0] != keyLine {
+		t.Fatalf("AuthorizedKeys = %#v, want trimmed single [%s]", got.AuthorizedKeys, keyLine)
+	}
+	if len(got.MeshAuthorizedKeys) != 1 || got.MeshAuthorizedKeys[0] != keyLine {
+		t.Fatalf("MeshAuthorizedKeys = %#v, want trimmed single entry", got.MeshAuthorizedKeys)
+	}
+	// 副本隔离:改返回值不得影响配置原值(切片深拷贝;原 Port 保持 0 未被就地改写)。
+	got.AuthorizedKeys[0] = "mutated"
+	got.Port = 1
+	if src.AuthorizedKeys[0] != "  "+keyLine+"  " {
+		t.Fatalf("original AuthorizedKeys mutated: %#v", src.AuthorizedKeys)
+	}
+	if src.Port != 0 {
+		t.Fatalf("original Port mutated: %d", src.Port)
+	}
+
+	explicit := &SSHIngressConfig{
+		Enable:         &enabled,
+		Port:           2222,
+		AuthorizedKeys: []string{keyLine},
+	}
+	cfg = &Config{Customer: &CustomerConfig{SSHIngress: explicit}}
+	if got := cfg.EffectiveSSHIngress(); got.Port != 2222 {
+		t.Fatalf("explicit Port = %d, want 2222 preserved", got.Port)
 	}
 }

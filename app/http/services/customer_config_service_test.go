@@ -750,6 +750,22 @@ func TestValidateEditableCustomerKeysAllowsPeerMCP(t *testing.T) {
 	}
 }
 
+// ssh_ingress 必须在可编辑白名单里,否则保存 400。
+func TestValidateEditableCustomerKeysAllowsSSHIngress(t *testing.T) {
+	raw := map[string]json.RawMessage{
+		"ssh_ingress": json.RawMessage(`{"enable":false}`),
+	}
+	if err := validateEditableCustomerKeys(raw); err != nil {
+		t.Fatalf("ssh_ingress 应放行, got %v", err)
+	}
+	err := validateEditableCustomerKeys(map[string]json.RawMessage{
+		"no_such_key": json.RawMessage(`{}`),
+	})
+	if err == nil || !strings.Contains(err.Error(), "ssh_ingress") {
+		t.Errorf("拒绝文案应含更新后的字段清单, got %v", err)
+	}
+}
+
 // 保存通道 400:agentcore_llm 远端+无 key 必须在保存时被 Config.Validate 拒绝,
 // 不能出现「保存成功、回合时静默整层关闭」的形态。
 func TestSaveCustomerConfigRejectsAgentCoreLLMRemoteNoKey(t *testing.T) {

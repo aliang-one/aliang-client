@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	gossh "golang.org/x/crypto/ssh"
+
 	"aliang.one/nursorgate/common/logger"
 	"aliang.one/nursorgate/processor/match"
 )
@@ -586,6 +588,9 @@ type CustomerConfig struct {
 	// nil 时 Enable 视为 true——对齐 agentcore peer 注入的既有现状(默认开),
 	// 升级不产生行为回退。它门控三处:agentcore 注入、claude/codex 注册。
 	PeerMCP *PeerMCPConfig `json:"peer_mcp,omitempty"`
+	// SSHIngress 是 SSH 入口服务面(customer.ssh_ingress)。nil 时服务关闭——
+	// 默认关,升级零回退。与组网分支的 MeshConfig 为相邻行合并关系(双方尾部追加)。
+	SSHIngress *SSHIngressConfig `json:"ssh_ingress,omitempty"`
 }
 
 // CustomerGeoIPSettings 自定义 GeoIP 国家库下载源（customer.geoip）。
@@ -778,6 +783,117 @@ func (c *Config) EffectivePeerMCPCodexEnabled() bool {
 		return true
 	}
 	return c.effectivePeerMCPSub(c.Customer.PeerMCP.CodexEnabled)
+}
+
+// SSHIngressDefaultPort 是 SSH 入口的默认监听口(与启用段 56431-56433 避让,
+// 另避开 mesh 提案的 beacon UDP 56440)。
+const SSHIngressDefaultPort uint16 = 56441
+
+// SSHIngressConfig 控制 SSH 入口服务面(customer.ssh_ingress)。
+// 双密钥准入:authorized_keys=人用凭证(裸流形态);mesh_authorized_keys=
+// 节点互连凭证(mesh 帧形态)。禁密码。端口默认 56441。
+type SSHIngressConfig struct {
+	Enable             *bool    `json:"enable,omitempty"` // 三态:nil=false
+	Port               uint16   `json:"port,omitempty"`
+	AuthorizedKeys     []string `json:"authorized_keys,omitempty"`
+	MeshAuthorizedKeys []string `json:"mesh_authorized_keys,omitempty"`
+}
+
+// IsEnabled 返回 SSH 入口是否开启。与 PeerMCP 的三态指针同族,但默认反向:
+// 入口是新增暴露面,nil=false——总开关默认关,升级零回退。
+func (c *SSHIngressConfig) IsEnabled() bool {
+	if c == nil || c.Enable == nil {
+		return false
+	}
+	return *c.Enable
+}
+
+// Validate 保存通道(Config.Validate)调用。未启用直接过;启用则:
+// 两列表合计非空(至少一把准入钥匙,否则开了门谁也进不来);逐条按
+// authorized_keys 行格式(gossh.ParseAuthorizedKey,[host:port] 证书主体
+// 前缀等合法变体由其原生容忍)校验;同一公钥(TrimSpace 后逐字节同)跨
+// 两列表=形态歧义(裸流 vs mesh 帧),保存时拦——运行期 mesh 优先只是
+// 第二道防御(inbound/ssh),配置层先拒绝歧义本身。
+// port:uint16 类型上界即 65535,越界值(如 70000)在 JSON 反序列化层即被拒;
+// 0=未配,由 EffectiveSSHIngress 归一为默认 56441,因此这里没有端口分支。
+func (c *SSHIngressConfig) Validate() error {
+	if c == nil || !c.IsEnabled() {
+		return nil
+	}
+	if len(c.AuthorizedKeys) == 0 && len(c.MeshAuthorizedKeys) == 0 {
+		return fmt.Errorf("ssh_ingress requires at least one authorized key when enabled (authorized_keys or mesh_authorized_keys)")
+	}
+	if err := validateSSHIngressKeyLines("authorized_keys", c.AuthorizedKeys); err != nil {
+		return err
+	}
+	if err := validateSSHIngressKeyLines("mesh_authorized_keys", c.MeshAuthorizedKeys); err != nil {
+		return err
+	}
+	meshSeen := make(map[string]struct{}, len(c.MeshAuthorizedKeys))
+	for _, key := range c.MeshAuthorizedKeys {
+		meshSeen[strings.TrimSpace(key)] = struct{}{}
+	}
+	for i, key := range c.AuthorizedKeys {
+		trimmed := strings.TrimSpace(key)
+		if _, ok := meshSeen[trimmed]; ok {
+			return fmt.Errorf("ssh_ingress.authorized_keys[%d] key is listed in both authorized_keys and mesh_authorized_keys", i)
+		}
+	}
+	return nil
+}
+
+// validateSSHIngressKeyLines 逐条校验 authorized_keys 行:空串/纯空白拒绝
+// (Effective 归一虽会剔除空行,但保存通道对显式空条目从严——前端数组残留
+// 空串应在保存时报错,不是悄悄落库)。
+func validateSSHIngressKeyLines(field string, lines []string) error {
+	for i, raw := range lines {
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			return fmt.Errorf("ssh_ingress.%s[%d] cannot be empty", field, i)
+		}
+		if _, _, _, _, err := gossh.ParseAuthorizedKey([]byte(line)); err != nil {
+			return fmt.Errorf("ssh_ingress.%s[%d] is not a valid authorized key line: %v", field, i, err)
+		}
+	}
+	return nil
+}
+
+// EffectiveSSHIngress 返回 SSH 入口服务面的归一化运行副本;未配置/未启用
+// 返回 nil(服务保持关闭)。归一化:port 0→默认 56441;公钥逐条 TrimSpace、
+// 剔空行;切片深拷贝,调用方改副本不影响配置原值。读取端不重复跑 Validate
+// (保存通道已拦;手改文件的坏值由 inbound/ssh 装配层的公钥解析兜底报错)。
+func (c *Config) EffectiveSSHIngress() *SSHIngressConfig {
+	if c == nil || c.Customer == nil || c.Customer.SSHIngress == nil {
+		return nil
+	}
+	src := c.Customer.SSHIngress
+	if !src.IsEnabled() {
+		return nil
+	}
+	enable := true
+	cfg := SSHIngressConfig{
+		Enable:             &enable,
+		Port:               src.Port,
+		AuthorizedKeys:     normalizeSSHIngressKeyLines(src.AuthorizedKeys),
+		MeshAuthorizedKeys: normalizeSSHIngressKeyLines(src.MeshAuthorizedKeys),
+	}
+	if cfg.Port == 0 {
+		cfg.Port = SSHIngressDefaultPort
+	}
+	return &cfg
+}
+
+// normalizeSSHIngressKeyLines TrimSpace 后剔空行,返回新切片(nil 安全)。
+func normalizeSSHIngressKeyLines(lines []string) []string {
+	normalized := make([]string, 0, len(lines))
+	for _, raw := range lines {
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			continue
+		}
+		normalized = append(normalized, line)
+	}
+	return normalized
 }
 
 // EffectiveAgentCoreMaxIdenticalToolTurns 返回打转守卫阈值;未配置(0/nil/负数)
@@ -1104,6 +1220,11 @@ func (c *Config) Validate() error {
 				return fmt.Errorf("invalid geoip configuration: %w", err)
 			}
 		}
+		if sshIngress := c.Customer.SSHIngress; sshIngress != nil {
+			if err := sshIngress.Validate(); err != nil {
+				return fmt.Errorf("invalid ssh_ingress configuration: %w", err)
+			}
+		}
 	}
 
 	return nil
@@ -1164,7 +1285,7 @@ func (c *Config) customerUnknownKeyErrors() error {
 	if len(c.customerUnknownFields) > 0 {
 		sorted := append([]string(nil), c.customerUnknownFields...)
 		sort.Strings(sorted)
-		return fmt.Errorf("customer.%s is forbidden: editable customer fields are [proxy ai_rules proxy_rules traffic_mirror http1_drop model_mapping custom_env_vars geoip agentcore_llm agentcore peer_mcp]", sorted[0])
+		return fmt.Errorf("customer.%s is forbidden: editable customer fields are [proxy ai_rules proxy_rules traffic_mirror http1_drop model_mapping custom_env_vars geoip agentcore_llm agentcore peer_mcp ssh_ingress]", sorted[0])
 	}
 
 	providers := make([]string, 0, len(c.aiRuleUnknownFields))
@@ -1201,7 +1322,7 @@ func extractCustomerUnknownFields(root map[string]json.RawMessage) ([]string, ma
 
 	for key := range customerRoot {
 		switch key {
-		case "proxy", "ai_rules", "proxy_rules", "traffic_mirror", "http1_drop", "model_mapping", "custom_env_vars", "geoip", "agentcore_llm", "agentcore", "peer_mcp":
+		case "proxy", "ai_rules", "proxy_rules", "traffic_mirror", "http1_drop", "model_mapping", "custom_env_vars", "geoip", "agentcore_llm", "agentcore", "peer_mcp", "ssh_ingress":
 		default:
 			unknownCustomer = append(unknownCustomer, key)
 		}
