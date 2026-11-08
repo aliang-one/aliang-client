@@ -18,6 +18,7 @@ type Handlers struct {
 	Logger         *handlers.LogHandler
 	ProxyRegistry  *handlers.ProxyRegistryHandler
 	SSHKnownHosts  *handlers.SSHKnownHostsHandler
+	SSHIngress     *handlers.SSHIngressHandler
 	SoftwareCfg    *handlers.SoftwareConfigHandler
 	Token          *handlers.TokenHandler
 	Run            *handlers.RunHandler
@@ -74,6 +75,7 @@ func newHandlers(runService *services.RunService) *Handlers {
 		Logger:             handlers.NewLogHandler(logService, logConfigService),
 		ProxyRegistry:      handlers.NewProxyRegistryHandler(proxyRepository),
 		SSHKnownHosts:      handlers.NewSSHKnownHostsHandlerFromCache(),
+		SSHIngress:         handlers.NewSSHIngressHandlerFromCache(),
 		SoftwareCfg:        handlers.NewSoftwareConfigHandler(softwareCfgService),
 		Token:              handlers.NewTokenHandler(tokenService),
 		Run:                handlers.NewRunHandler(runService),
@@ -121,6 +123,10 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	// SSH TOFU 指纹库管理(spec §⑨):GET 列表 / DELETE 单条或裸删清空。双注册
 	// 另一处 agentruntime server.go registerAgentRoutes(缺任一侧=404,2026-10-21 教训)。
 	register("/api/proxy/ssh/known-hosts", h.SSHKnownHosts.HandleKnownHosts, http.MethodGet, http.MethodDelete)
+	// SSH 入口 host key 指纹(spec §7):GET 只读(缺失=404 未启动语义,生成归
+	// Server.Start);双注册另一处 agentruntime server.go registerAgentRoutes
+	// (缺任一侧=404 透传,同上 2026-10-21 教训;parity 正则已覆盖 /api/proxy)。
+	register("/api/proxy/ssh-ingress/hostkey", h.SSHIngress.HandleHostkey, http.MethodGet)
 
 	register("/api/software-config/save", h.SoftwareCfg.HandleSave, http.MethodPost)
 	register("/api/software-config/activate", h.SoftwareCfg.HandleActivate, http.MethodPost)

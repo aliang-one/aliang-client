@@ -39,7 +39,7 @@ func newTestKey(t *testing.T) (gossh.PublicKey, gossh.Signer) {
 // t.Cleanup 兜底停机。
 func startTestServer(t *testing.T, rc RunConfig) (*Server, string) {
 	t.Helper()
-	return startTestServerAt(t, rc, filepath.Join(t.TempDir(), "ingress_host_key"))
+	return startTestServerAt(t, rc, filepath.Join(t.TempDir(), IngressHostKeyFileName))
 }
 
 func startTestServerAt(t *testing.T, rc RunConfig, hostKeyPath string) (*Server, string) {
@@ -116,7 +116,7 @@ func TestSSHIngressStartStopIsRunning(t *testing.T) {
 
 func TestSSHIngressHostKeyStableAcrossRestarts(t *testing.T) {
 	humanPub, _ := newTestKey(t)
-	path := filepath.Join(t.TempDir(), "ingress_host_key")
+	path := filepath.Join(t.TempDir(), IngressHostKeyFileName)
 	rc := RunConfig{AuthorizedKeys: []gossh.PublicKey{humanPub}}
 
 	s1 := NewServer(rc, path)
@@ -143,7 +143,7 @@ func TestSSHIngressHostKeyStableAcrossRestarts(t *testing.T) {
 
 func TestSSHIngressHostKeyRegeneratedOnCorrupt(t *testing.T) {
 	humanPub, _ := newTestKey(t)
-	path := filepath.Join(t.TempDir(), "ingress_host_key")
+	path := filepath.Join(t.TempDir(), IngressHostKeyFileName)
 	rc := RunConfig{AuthorizedKeys: []gossh.PublicKey{humanPub}}
 
 	s1 := NewServer(rc, path)

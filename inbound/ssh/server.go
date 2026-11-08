@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+	"time"
 
 	"aliang.one/nursorgate/common/logger"
 	"aliang.one/nursorgate/processor/config"
@@ -25,6 +26,12 @@ import (
 // channelDirectTCPIP 是入口唯一放行的通道类型(RFC 4254 §7.2);
 // session/auth-agent@openssh.com/x11/forwarded-tcpip 等一律拒绝(安全收敛)。
 const channelDirectTCPIP = "direct-tcpip"
+
+// IngressHostKeyFileName 是 host key 落盘文件名(cache/ssh/ 目录下)。导出供
+// 装配层(Task 7 reconcile)与 host key 指纹 API(ssh_ingress_handler 的
+// FromCache 构造)拼路径——编译器强制三方与 Server.Start 落盘同源,同出口侧
+// sshout.KnownHostsFileName 的收敛先例。文件内容归本包管理。
+const IngressHostKeyFileName = "ingress_host_key"
 
 // Server 是 SSH 入口服务实例。生命周期三件套(Start/Stop/IsRunning)幂等,
 // 照 inbound/http 模式;实例不承载热更新——配置变更由装配层(Reconcile,
@@ -157,6 +164,41 @@ func (s *Server) HostKeyFingerprint() (fingerprint, algorithm string) {
 		return "", ""
 	}
 	return gossh.FingerprintSHA256(signer.PublicKey()), signer.PublicKey().Type()
+}
+
+// HostKeyInfo 是 host key 的只读展示面(指纹 API 口径):指纹/算法名/
+// 生成时间(文件 mtime,UTC)。
+type HostKeyInfo struct {
+	Fingerprint string
+	Algorithm   string
+	GeneratedAt time.Time
+}
+
+// ReadHostKeyInfo 只读地读取 path 处的 host key 并返回指纹信息。不生成、
+// 不写盘——生成职责单一归 Server.Start:指纹 API 若也触发生成,双进程
+// (core/user-agent)各持 handler 并发命中缺失文件时会各自生成、原子写
+// rename 最后者胜,与 Server 已加载的钥错位(展示指纹≠实际服务钥)。
+// 文件缺失返回包裹 fs.ErrNotExist 的错误(调用方 errors.Is 判 404 语义);
+// 文件存在但损坏/不可读返回相应错误(由调用方显式报错,不静默换钥)。
+func ReadHostKeyInfo(path string) (HostKeyInfo, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return HostKeyInfo{}, err
+	}
+	signer, err := gossh.ParsePrivateKey(data)
+	if err != nil {
+		return HostKeyInfo{}, fmt.Errorf("parse host key %s: %w", path, err)
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		return HostKeyInfo{}, err
+	}
+	pub := signer.PublicKey()
+	return HostKeyInfo{
+		Fingerprint: gossh.FingerprintSHA256(pub),
+		Algorithm:   pub.Type(),
+		GeneratedAt: st.ModTime().UTC(),
+	}, nil
 }
 
 // serverConfig 构造每连接共用的服务端配置。不设 PasswordCallback 与
