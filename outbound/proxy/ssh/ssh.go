@@ -27,6 +27,11 @@ var _ proxy.Proxy = (*SSH)(nil)
 // 的实例(closed 置位在 DialContext 顶部即拦,断言路径无网络)。
 var ErrClosed = errors.New("ssh outbound closed")
 
+// KnownHostsFileName 是 TOFU 指纹库的落盘文件名。导出给管理 API(handler 侧
+// FromCache)引用,编译器强制两侧同源——本包改名而调用方仍持字面量时不再
+// 静默指向空文件。
+const KnownHostsFileName = "known_hosts"
+
 // SSH 是 SSH 出口代理:DialContext 从链池取一条 SSH 链(可选多跳),在其
 // 最终跳上开 direct-tcpip 通道承载 TCP;UDP 不支持;Close 断开全部链并
 // 终结实例(其后 DialContext 直接报错,不再懒重建)。
@@ -46,7 +51,7 @@ func New(final NodeConfig, poolSize int, jumps []NodeConfig, hostsDir string) (*
 	if hostsDir == "" {
 		return nil, errors.New("ssh: hostsDir 不能为空(known_hosts 需要落盘目录)")
 	}
-	hostsPath := filepath.Join(hostsDir, "known_hosts")
+	hostsPath := filepath.Join(hostsDir, KnownHostsFileName)
 	if err := os.MkdirAll(filepath.Dir(hostsPath), 0o755); err != nil {
 		return nil, fmt.Errorf("ssh: 创建 hosts 目录: %w", err)
 	}

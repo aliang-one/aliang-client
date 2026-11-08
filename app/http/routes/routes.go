@@ -118,8 +118,8 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	// Proxy registry routes (/api/proxy/registry/*)
 	register("/api/proxy/list", h.ProxyRegistry.HandleProxyRegistryList, http.MethodGet)
 	register("/api/proxy/get", h.ProxyRegistry.HandleProxyRegistryGet, http.MethodGet)
-	// SSH TOFU 指纹库管理(spec §⑨):GET 列表 / DELETE 单条。双注册另一处
-	// agentruntime server.go registerAgentRoutes(缺任一侧=404,2026-10-21 教训)。
+	// SSH TOFU 指纹库管理(spec §⑨):GET 列表 / DELETE 单条或裸删清空。双注册
+	// 另一处 agentruntime server.go registerAgentRoutes(缺任一侧=404,2026-10-21 教训)。
 	register("/api/proxy/ssh/known-hosts", h.SSHKnownHosts.HandleKnownHosts, http.MethodGet, http.MethodDelete)
 
 	register("/api/software-config/save", h.SoftwareCfg.HandleSave, http.MethodPost)

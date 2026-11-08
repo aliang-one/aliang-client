@@ -127,10 +127,10 @@ func TestSSHKnownHostsHandler(t *testing.T) {
 		t.Fatalf("DELETE 不存在条目 code = %d, want 404; body=%s", rec.Code, rec.Body.String())
 	}
 
-	// DELETE 缺参数 → 400。
-	for _, q := range []string{"", "host=1.2.3.4", "port=22"} {
+	// DELETE 部分参数(只 host 或只 port)→ 400;全缺=裸删清空,见专项用例。
+	for _, q := range []string{"host=1.2.3.4", "port=22"} {
 		if rec := del(q); rec.Code != http.StatusBadRequest {
-			t.Fatalf("DELETE 缺参数(%q) code = %d, want 400; body=%s", q, rec.Code, rec.Body.String())
+			t.Fatalf("DELETE 部分参数(%q) code = %d, want 400; body=%s", q, rec.Code, rec.Body.String())
 		}
 	}
 
@@ -152,5 +152,42 @@ func TestSSHKnownHostsHandlerEmptyList(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), `"known_hosts":[]`) {
 		t.Fatalf("空库应返回空数组; body=%s", rec.Body.String())
+	}
+}
+
+// 裸 DELETE(不带任何参数)= 清空全部:删空集合语义,幂等;也是损坏 JSON 库
+// 的唯一 API 自愈出口(Clear 不 load 直接重写空库——损坏时 List 恒空、单删
+// 恒 404,没有裸删就永不恢复)。部分参数仍 400。
+func TestSSHKnownHostsHandlerBareDeleteClearsAll(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "known_hosts")
+	seedKnownHostEntry(t, path, "203.0.113.10:22")
+	seedKnownHostEntry(t, path, "198.51.100.7:2200")
+	h := NewSSHKnownHostsHandler(path)
+
+	get := func() *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		h.HandleKnownHosts(rec, httptest.NewRequest(http.MethodGet, "/api/proxy/ssh/known-hosts", nil))
+		return rec
+	}
+	bareDelete := func() *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		h.HandleKnownHosts(rec, httptest.NewRequest(http.MethodDelete, "/api/proxy/ssh/known-hosts", nil))
+		return rec
+	}
+
+	// 预置两条 → 裸 DELETE 200 → 列表空。
+	if rec := bareDelete(); rec.Code != http.StatusOK {
+		t.Fatalf("裸 DELETE code = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if items := getKnownHostsItems(t, get()); len(items) != 0 {
+		t.Fatalf("裸 DELETE 后条数 = %d, want 0", len(items))
+	}
+	if rec := get(); !strings.Contains(rec.Body.String(), `"known_hosts":[]`) {
+		t.Fatalf("裸 DELETE 后应为空数组; body=%s", rec.Body.String())
+	}
+
+	// 空库再裸 DELETE → 200(幂等,删空集合)。
+	if rec := bareDelete(); rec.Code != http.StatusOK {
+		t.Fatalf("空库裸 DELETE code = %d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
 }
