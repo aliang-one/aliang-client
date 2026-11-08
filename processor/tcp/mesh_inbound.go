@@ -278,7 +278,7 @@ func resolveDNSQuery(ctx context.Context, resolver LocalDNSResolver, query []byt
 
 	answers, resolveErr := resolveDNSQuestion(ctx, resolver, req.Question[0])
 	if resolveErr != nil {
-		resp.SetRcode(&req, dns.RcodeServerFailure)
+		resp.SetRcode(&req, dnsRcodeForResolveError(resolveErr))
 	} else {
 		resp.Answer = answers
 	}
@@ -287,6 +287,18 @@ func resolveDNSQuery(ctx context.Context, resolver LocalDNSResolver, query []byt
 		return servfailDNSResponse(query)
 	}
 	return out
+}
+
+// dnsRcodeForResolveError 区分负应答与暂态错误:net.DNSError.IsNotFound
+// (上游 NXDOMAIN/无此主机)是有效负应答,回 RcodeNameError 让客户端负缓存
+// 不重试;其余错误 → SERVFAIL(暂态错误,客户端可重试)。离线冲浪的广告
+// 域名是 NXDOMAIN 重灾区,折叠成 SERVFAIL 会引发重试风暴(质量评审精化)。
+func dnsRcodeForResolveError(err error) int {
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) && dnsErr.IsNotFound {
+		return dns.RcodeNameError
+	}
+	return dns.RcodeServerFailure
 }
 
 // resolveDNSQuestion 按查询类型分发(design §6 层1 定案的类型矩阵):

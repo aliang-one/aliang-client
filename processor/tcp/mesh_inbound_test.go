@@ -368,6 +368,34 @@ func TestMeshInboundDNSTargetResolvesLocally(t *testing.T) {
 			t.Fatalf("Id = %#x, want 0x4321(SERVFAIL 也须回显 ID)", resp.Id)
 		}
 	})
+
+	t.Run("NXDOMAIN 负应答透传", func(t *testing.T) {
+		// 质量评审精化:net.DNSError.IsNotFound(上游 NXDOMAIN/无此主机)是
+		// 有效负应答,回 RcodeNameError 让客户端负缓存不重试;折叠成
+		// SERVFAIL 会在离线冲浪的广告域名上引发重试风暴。
+		fake := &fakeLocalDNSResolver{
+			lookupIP: func(ctx context.Context, network, host string) ([]net.IP, error) {
+				return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
+			},
+		}
+		deps := meshInboundDeps(newMeshInboundCapture())
+		deps.DNSResolver = fake
+		addr, _ := startMeshInbound(t, meshproto.CarrierLAN, deps)
+
+		conn := dialMeshDNSTarget(t, addr, newDNSQuery(t, 0x5566, "ads.example.com.", dns.TypeA))
+		defer conn.Close()
+
+		resp := readDNSResponseFromConn(t, conn)
+		if resp.Rcode != dns.RcodeNameError {
+			t.Fatalf("Rcode = %d(%s), want NXDOMAIN", resp.Rcode, dns.RcodeToString[resp.Rcode])
+		}
+		if resp.Id != 0x5566 {
+			t.Fatalf("Id = %#x, want 0x5566(NXDOMAIN 也须回显 ID)", resp.Id)
+		}
+		if len(resp.Question) != 1 || resp.Question[0].Name != "ads.example.com." {
+			t.Fatalf("Question 回显 = %v, want ads.example.com.(负应答按 RFC 应回显查询)", resp.Question)
+		}
+	})
 }
 
 // TestMeshInboundDNSTargetTypeMatrix 类型矩阵(design §6 层1 定案):
