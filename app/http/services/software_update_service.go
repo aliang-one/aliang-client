@@ -20,6 +20,7 @@ import (
 	"aliang.one/nursorgate/common/logger"
 	appVersion "aliang.one/nursorgate/common/version"
 	"aliang.one/nursorgate/processor/config"
+	"aliang.one/nursorgate/processor/egress"
 )
 
 const (
@@ -81,7 +82,7 @@ var (
 	sharedSoftwareUpdateService   *SoftwareUpdateService
 	softwareUpdateStoreFactory    = func() softwareUpdateStore { return storage.NewSoftwareVersionUpdateStore() }
 	softwareUpdateNow             = time.Now
-	softwareUpdateHTTPClient      = &http.Client{Timeout: 10 * time.Second}
+	softwareUpdateHTTPClient      = egress.PlatformClient(10 * time.Second)
 )
 
 func NewSoftwareUpdateService() *SoftwareUpdateService {

@@ -13,6 +13,7 @@ import (
 
 	"aliang.one/nursorgate/common/logger"
 	"aliang.one/nursorgate/processor/config"
+	"aliang.one/nursorgate/processor/egress"
 )
 
 const (
@@ -92,9 +93,7 @@ func LoginWithPassword(email, password, turnstileToken string) (*UserInfo, error
 	req.Header.Set("Content-Type", "application/json")
 	req = req.WithContext(operation.Context())
 
-	client := &http.Client{
-		Timeout: apiTimeout,
-	}
+	client := egress.PlatformClient(apiTimeout)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -347,7 +346,7 @@ func RefreshSession(refreshToken string) (*UserInfo, error) {
 	req.Header.Set("Content-Type", "application/json")
 	req = req.WithContext(operation.Context())
 
-	client := &http.Client{Timeout: apiTimeout}
+	client := egress.PlatformClient(apiTimeout)
 	resp, err := client.Do(req)
 	if err != nil {
 		if !authority.OperationCurrent(operation) {
@@ -484,7 +483,7 @@ func LogoutSession(refreshToken string) error {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
-	client := &http.Client{Timeout: apiTimeout}
+	client := egress.PlatformClient(apiTimeout)
 	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to send request: %w", err)

@@ -20,6 +20,7 @@ import (
 	"aliang.one/nursorgate/app/http/storage"
 	"aliang.one/nursorgate/common/cache"
 	"aliang.one/nursorgate/processor/config"
+	"aliang.one/nursorgate/processor/egress"
 )
 
 type SoftwareConfigService struct {
@@ -28,7 +29,7 @@ type SoftwareConfigService struct {
 }
 
 func NewSoftwareConfigService() *SoftwareConfigService {
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := egress.PlatformClient(30 * time.Second)
 	return &SoftwareConfigService{
 		store:      storage.NewSoftwareConfigStore(),
 		httpClient: client,
@@ -37,7 +38,7 @@ func NewSoftwareConfigService() *SoftwareConfigService {
 
 func NewSoftwareConfigServiceWithStore(store *storage.SoftwareConfigStore, client *http.Client) *SoftwareConfigService {
 	if client == nil {
-		client = &http.Client{Timeout: 30 * time.Second}
+		client = egress.PlatformClient(30 * time.Second)
 	}
 	return &SoftwareConfigService{store: store, httpClient: client}
 }

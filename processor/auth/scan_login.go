@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"aliang.one/nursorgate/processor/config"
+	"aliang.one/nursorgate/processor/egress"
 )
 
 // ErrScanCodeNotFound 表示 device_code 对应的扫码行不存在或已过期（official-website 返回 404）。
@@ -66,7 +67,7 @@ func ScanInit() (*ScanInitResult, error) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: apiTimeout}
+	client := egress.PlatformClient(apiTimeout)
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send scan init request: %w", err)
@@ -115,7 +116,7 @@ func ScanStatus(deviceCode string) (*ScanStatusResult, error) {
 		return nil, fmt.Errorf("failed to create scan status request: %w", err)
 	}
 
-	client := &http.Client{Timeout: apiTimeout}
+	client := egress.PlatformClient(apiTimeout)
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send scan status request: %w", err)
