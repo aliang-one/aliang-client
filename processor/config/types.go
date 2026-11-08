@@ -778,6 +778,46 @@ func (c *MeshConfig) EffectiveMaxHops() int {
 	return c.MaxHops
 }
 
+// MeshFallbackActiveForClass 离线兜底门控的统一判定(计划 Task 12 评审钉死
+// 的三消费方共享助手),四条件缺一不可:
+//  1. mesh 总开关 EffectiveEnabled(显式 false 时所有兜底消费方一律关——
+//     总开关契约穿透;抽取前 processor/tcp meshFallbackAddrForClass 缺此
+//     检查,即评审抓到的 tcp 侧缺口);
+//  2. customer.mesh.fallback 使能(Enable 显式 true);
+//  3. class ∈ Fallback.Classes(空 Classes = 未勾选任何类别);
+//  4. Addr 非空(TrimSpace 规整后判定)。
+//
+// 消费方(processor/egress meshFallbackSelfActive / processor/tcp
+// meshFallbackAddrForClass):离线信号不在本助手内——各消费方自带(egress
+// isOffline / processor/tcp meshOfflineActive),同一信号源两缝由组装层
+// (Task 14)用同一 manager 状态 getter 接线。processor/routing
+// meshForwardAvailable 语义不同(查 Peers 非查 Fallback,编译期能力检查),
+// 不并入本助手。返回形态 (addr, ok):egress 组 Peer / tcp 拨兜底节点都需
+// 地址;只要 ok 判定的消费方可丢弃 addr。
+func MeshFallbackActiveForClass(cfg *Config, class string) (addr string, ok bool) {
+	if cfg == nil || cfg.Customer == nil || cfg.Customer.Mesh == nil {
+		return "", false
+	}
+	mesh := cfg.Customer.Mesh
+	if !mesh.EffectiveEnabled() {
+		return "", false
+	}
+	fb := mesh.Fallback
+	if fb == nil || fb.Enable == nil || !*fb.Enable {
+		return "", false
+	}
+	addr = strings.TrimSpace(fb.Addr)
+	if addr == "" {
+		return "", false
+	}
+	for _, c := range fb.Classes {
+		if c == class {
+			return addr, true
+		}
+	}
+	return "", false
+}
+
 // Validate 保存通道(Config.Validate)调用:peers/兜底/跳数的形态校验。
 // 自指拒绝不在这层——config 包拿不到本机 device_id(反向依赖会成环),
 // 由提交路径显式调 ValidateMesh(spec §3.4/§7 层0)。

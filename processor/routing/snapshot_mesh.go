@@ -138,6 +138,11 @@ func isDNSEntry(base string) bool {
 // 不做 ≠self 检查（分层防御分工）：自指已在保存期由 Config.ValidateMesh
 // 拒绝（spec §3.4/§7 层0，config 层拿不到本机 device_id 故由提交路径显式调）；
 // 手改配置文件绕过保存校验的漏网自指，由转发层 path vector 兜底拒环。
+// 交叉引用（计划 Task 12 门控统一抽取评审定案）：本闸语义与离线兜底门不同
+// ——查 Peers（toNode 规则目标可达性）而非查 Fallback（离线兜底），故不并入
+// 共享助手 config.MeshFallbackActiveForClass；兜底消费方为 processor/egress
+// meshFallbackSelfActive 与 processor/tcp meshFallbackAddrForClass / AI 离线
+// 改道 meshOfflineRedirectForAI。
 func meshForwardAvailable(cfg *config.Config, deviceID string) bool {
 	if cfg == nil || cfg.Customer == nil || cfg.Customer.Mesh == nil {
 		return false

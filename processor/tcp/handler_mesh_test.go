@@ -551,6 +551,35 @@ func TestDialByRouteMeshUnknownPeerFallsBackDirect(t *testing.T) {
 	expectAccepted(t, accepted, "direct 回落")
 }
 
+// TestMeshFallbackAddrForClassRespectsMasterSwitch tcp 兜底闸总开关穿透钉子
+// (计划 Task 12 评审抓过的缺口):meshFallbackAddrForClass 原实现无
+// EffectiveEnabled 检查——总开关显式 false 时兜底门必须关闭,统一抽取为
+// config.MeshFallbackActiveForClass 后由助手保证。
+func TestMeshFallbackAddrForClassRespectsMasterSwitch(t *testing.T) {
+	newMeshDialTestEnv(t)
+	config.SetGlobalConfig(&config.Config{
+		Customer: &config.CustomerConfig{
+			Mesh: &config.MeshConfig{
+				Enable: boolPtr(false), // 总开关显式 false
+				Fallback: &config.MeshFallbackConfig{
+					Enable:  boolPtr(true),
+					Addr:    "192.168.1.9:56440",
+					Classes: []string{meshproto.ClassAI},
+				},
+			},
+		},
+	})
+	// 56432 回环 → 推断 ai 且被勾选;唯总开关关。
+	md := &M.Metadata{
+		Network: M.TCP,
+		DstIP:   netip.MustParseAddr("127.0.0.1"),
+		DstPort: 56432,
+	}
+	if addr, ok := meshFallbackAddrForClass(context.Background(), md); ok {
+		t.Fatalf("总开关显式 false 时兜底门必须关闭, got addr=%q", addr)
+	}
+}
+
 // TestDialByRouteMiddleHopFailureBubblesWithoutPolicy 中间跳(继承帧头)mesh
 // 拨出失败:错误回源,不落兜底/失败策略——design §3.3「B 的规则若再指向 C
 // 而 C 失败,同样向上冒泡给 A」,否则流量会从中间节点位置出去;§9.4「兜底

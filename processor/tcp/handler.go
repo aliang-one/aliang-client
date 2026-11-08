@@ -1476,30 +1476,17 @@ func (h *TCPConnectionHandler) getMeshProxyForExecution(deviceID string) (*meshp
 	return nil, fmt.Errorf("mesh: peer %q not found in customer.mesh.peers", deviceID)
 }
 
-// meshFallbackAddrForClass 离线兜底可用性判定(design §9.4 兜底式):显式
-// enable + 地址非空 + 该连接类别被勾选(Classes 为空 = 未勾选任何类别)。
-// 类别口径复用 mesh 出口推断(56432 回环 → ai,其余 custom;self 类由
-// egress 发起点显式指定,Task 11 接入后本判定自动覆盖)。
+// meshFallbackAddrForClass 离线兜底可用性判定(design §9.4 兜底式),统一
+// 抽取为共享助手 config.MeshFallbackActiveForClass(计划 Task 12 评审钉死):
+// EffectiveEnabled 总开关 + Fallback.Enable + 类别勾选 + Addr 非空——总开关
+// 检查是抽取时补上的穿透缺口(原实现缺此检查)。类别口径复用 mesh 出口
+// 推断(56432 回环 → ai,其余 custom;self 类由 egress 发起点显式指定,
+// Task 11 接入后同一助手自动覆盖)。离线信号不在此层:本闸消费的是
+// dialViaMesh 链头失败路径(对端不可达),与离线改道(Task 12 AI 流量)的
+// 信号驱动判定互相独立。
 func meshFallbackAddrForClass(ctx context.Context, md *M.Metadata) (string, bool) {
-	cfg := config.GetGlobalConfig()
-	if cfg == nil || cfg.Customer == nil || cfg.Customer.Mesh == nil {
-		return "", false
-	}
-	fb := cfg.Customer.Mesh.Fallback
-	if fb == nil || fb.Enable == nil || !*fb.Enable {
-		return "", false
-	}
-	addr := strings.TrimSpace(fb.Addr)
-	if addr == "" {
-		return "", false
-	}
 	class := meshproxy.InferClass(ctx, md)
-	for _, c := range fb.Classes {
-		if c == class {
-			return addr, true
-		}
-	}
-	return "", false
+	return config.MeshFallbackActiveForClass(config.GetGlobalConfig(), class)
 }
 
 // dialMeshFallbackNode 拨离线兜底节点:兜底地址是对端 mesh 监听口(design

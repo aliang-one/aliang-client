@@ -78,37 +78,21 @@ func isOffline() bool {
 }
 
 // meshFallbackSelfActive 兜底门(design §9.4「平台不可达才兜底」),逐连接
-// 读取,四个条件缺一不可:
-//  1. mesh 总开关 EffectiveEnabled(显式 false 时 egress 兜底同样关——总开关
-//     契约穿透所有 mesh 消费方;对等门控见 processor/routing/snapshot_mesh.go
-//     meshForwardAvailable 与 processor/tcp handler meshFallbackAddrForClass,
-//     三消费方语义的完整抽取留 Task 12 第三消费方 AI 改道落地时做);
-//  2. customer.mesh.fallback 使能(Enable 显式 true);
-//  3. self ∈ Fallback.Classes;
-//  4. 离线信号为真(信号驱动,接线归 Task 14,与 Task 12 AI 改道共用)。
+// 读取。配置四条件(总开关 EffectiveEnabled + Fallback.Enable + self ∈
+// Classes + Addr 非空)统一走共享助手 config.MeshFallbackActiveForClass
+// (计划 Task 12 评审钉死的三消费方抽取;对等消费方见 processor/tcp
+// meshFallbackAddrForClass 与 AI 离线改道 meshOfflineRedirectForAI,
+// processor/routing meshForwardAvailable 语义不同不并入),再叠加本消费方
+// 特有的离线信号(信号驱动,接线归 Task 14,与 processor/tcp
+// SetMeshOfflineSignal 共用同一 manager 状态 getter)。
 //
-// 兜底随信号起落:平台恢复可达 → 信号翻假 → mesh 轨自动退位回直连。
-// Addr/peer 的可用性归注入缝的提供器判定,此处不重复。
+// 抽取带来的语义收紧:助手含 Addr 非空检查(原 egress 闸无此条)——
+// Enable=true 而 Addr 空的配置本就被 Config.Validate 拒绝,此处只是防御
+// 手改配置文件的漏网形态,行为面不变。兜底随信号起落:平台恢复可达 →
+// 信号翻假 → mesh 轨自动退位回直连。peer 的可用性归注入缝的提供器判定。
 func meshFallbackSelfActive() bool {
-	cfg := config.GetGlobalConfig()
-	if cfg == nil || cfg.Customer == nil || cfg.Customer.Mesh == nil {
-		return false
-	}
-	if !cfg.Customer.Mesh.EffectiveEnabled() {
-		return false
-	}
-	fb := cfg.Customer.Mesh.Fallback
-	if fb == nil || fb.Enable == nil || !*fb.Enable {
-		return false
-	}
-	selfChecked := false
-	for _, class := range fb.Classes {
-		if class == meshproto.ClassSelf {
-			selfChecked = true
-			break
-		}
-	}
-	return selfChecked && isOffline()
+	_, ok := config.MeshFallbackActiveForClass(config.GetGlobalConfig(), meshproto.ClassSelf)
+	return ok && isOffline()
 }
 
 // platformDialContext 双轨判定(design §9.4 兜底式):
