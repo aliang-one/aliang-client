@@ -193,9 +193,50 @@ export function consumeSubagentFrame(store, e, activeSessionId, hooks = {}) {
   return true;
 }
 
+// 详情 API（AgentVibeSubagent，models/agent.go 蛇形键 + status 词表）→ reducer
+// 条目形状（驼峰键 + phase 词表）。评审钉死的契约分歧收口：详情发 status
+// 键（started|completed|failed）、WS 帧发 phase 键（词表含 progress/
+// interrupted），原样入库会两形状混存致入口条/面板计数全 0。词表对齐后
+// status→phase 同名直通，无需 interrupted 特判。progress 专有字段（WS 聚合
+// 才有）补默认值，输出与 blankEntry 形状一致；result/tools/startedAt/endedAt
+// 是详情专供字段（WS 条目不含），面板详情页消费，渲染层判空兜底。
+export function subagentDetailToReducerEntry(detail) {
+  if (!detail || typeof detail !== 'object') return null;
+  const taskId = typeof detail.task_id === 'string' ? detail.task_id : '';
+  if (!taskId) return null;
+  const tools = Array.isArray(detail.tools)
+    ? detail.tools
+      .filter((tool) => tool && typeof tool === 'object')
+      .map((tool) => ({
+        tool: typeof tool.tool === 'string' ? tool.tool : '',
+        summary: typeof tool.summary === 'string' ? tool.summary : '',
+        isError: tool.is_error === true,
+        ts: typeof tool.ts === 'string' ? tool.ts : '',
+      }))
+    : [];
+  return {
+    taskId,
+    name: (typeof detail.name === 'string' && detail.name) ? detail.name : taskId,
+    description: detail.description || null,
+    // 缺 finish 行的条目 Go 读侧保持 started；空缺/未知按 started 兜底。
+    phase: (typeof detail.status === 'string' && detail.status) ? detail.status : 'started',
+    currentStep: null,
+    lastTool: null,
+    toolUses: 0,
+    totalTokens: Number.isFinite(detail.total_tokens) ? detail.total_tokens : null,
+    durationMs: Number.isFinite(detail.duration_ms) ? detail.duration_ms : null,
+    summary: detail.summary || null,
+    result: detail.result || null,
+    startedAt: detail.started_at || null,
+    endedAt: detail.ended_at || null,
+    tools,
+  };
+}
+
 // M1 详情静默重拉（真实实现，经 vi.mock 的 getAgentSessionDetail 可测）：
-// 只消费 detail.subagents[] 整体替换该会话面板状态；转录一律不落壳。详情未带
-// subagents 键（后端降级/旧版）时保留 WS 聚合态；失败静默——面板打开逻辑兜底。
+// 只消费 detail.subagents[] 整体替换该会话面板状态（入库前逐条归一为 reducer
+// 条目形状——status→phase，坏条目过滤）；转录一律不落壳。详情未带 subagents
+// 键（后端降级/旧版）时保留 WS 聚合态；失败静默——面板打开逻辑兜底。
 // 同会话 in-flight 去重：连续 completed 同窗到达只发一次请求。
 const subagentDetailRefreshInflight = new Set();
 export async function refreshSubagentsFromDetail(store, sessionId) {
@@ -205,7 +246,9 @@ export async function refreshSubagentsFromDetail(store, sessionId) {
   try {
     const detail = await getAgentSessionDetail(sid);
     const list = Array.isArray(detail?.subagents) ? detail.subagents : null;
-    if (list) store[sid] = list;
+    if (list) {
+      store[sid] = list.map(subagentDetailToReducerEntry).filter(Boolean);
+    }
   } catch (_) {
     // 静默：详情缺席不阻断（journal 仍是持久真值，面板打开时再拉）
   } finally {
@@ -2784,10 +2827,12 @@ export function useAliangChat() {
     addPendingAttachments,
     removePendingAttachment,
     // 子agent面板（spec 2026-11-07-subagent-panel §三）：入口条/面板组件经
-    // ChatPage 消费；subagentWatchingTaskId 供 Task 8 面板选中态写入。
+    // ChatPage 消费；subagentWatchingTaskId 供 Task 8 面板选中态写入；
+    // refetchSubagentsForSession 供面板打开时的详情拉取（只消费 subagents[]）。
     subagentsBySession,
     activeSubagents,
     activeHasRunningSubagents,
     subagentWatchingTaskId,
+    refetchSubagentsForSession,
   };
 }

@@ -14,6 +14,7 @@ import { getAgentSessionDetail } from '../services/agentApi';
 import {
   consumeSubagentFrame,
   refreshSubagentsFromDetail,
+  subagentDetailToReducerEntry,
   subagentFrameToReducerMsg,
 } from './useAliangChat';
 
@@ -162,20 +163,125 @@ describe('consumeSubagentFrame（handleAIEvent 消费链：归属守卫+聚合+M
   });
 });
 
-describe('refreshSubagentsFromDetail（M1 静默重拉：只消费 subagents[]）', () => {
+describe('subagentDetailToReducerEntry（详情 API 蛇形→reducer 驼峰：status→phase）', () => {
+  // 详情 API（AgentVibeSubagent,models/agent.go）契约：蛇形键 + status 词表
+  // started|completed|failed + tools[]（tool/summary/is_error/ts）。评审钉死：
+  // 详情条目原样进 store 会与 WS 帧（phase 键）混存两种形状，入口条/面板
+  // 计数全 0——入库前必须归一为 reducer 条目形状。
+  it('全量字段映射：task_id/status/total_tokens/duration_ms→驼峰+phase，result/tools 透传保留', () => {
+    const entry = subagentDetailToReducerEntry({
+      task_id: 't1',
+      name: 'code-reviewer',
+      description: '审查改动',
+      status: 'completed',
+      summary: '全部通过',
+      result: '## 结论\n**全绿**',
+      total_tokens: 1200,
+      duration_ms: 4200,
+      started_at: '2026-11-07T01:00:00Z',
+      ended_at: '2026-11-07T01:00:04Z',
+      tools: [
+        { tool: 'Bash', summary: 'npm test', is_error: false, ts: '2026-11-07T01:00:01Z' },
+        { tool: 'Edit', summary: '改文件失败', is_error: true, ts: '2026-11-07T01:00:02Z' },
+      ],
+    });
+    expect(entry).toEqual({
+      taskId: 't1',
+      name: 'code-reviewer',
+      description: '审查改动',
+      phase: 'completed',
+      currentStep: null,
+      lastTool: null,
+      toolUses: 0,
+      totalTokens: 1200,
+      durationMs: 4200,
+      summary: '全部通过',
+      result: '## 结论\n**全绿**',
+      startedAt: '2026-11-07T01:00:00Z',
+      endedAt: '2026-11-07T01:00:04Z',
+      tools: [
+        { tool: 'Bash', summary: 'npm test', isError: false, ts: '2026-11-07T01:00:01Z' },
+        { tool: 'Edit', summary: '改文件失败', isError: true, ts: '2026-11-07T01:00:02Z' },
+      ],
+    });
+  });
+
+  it('缺 finish 行的 started 与空 status 兜底为 phase=started；缺 name 回落 taskId', () => {
+    expect(subagentDetailToReducerEntry({ task_id: 't2', status: 'started' }).phase).toBe('started');
+    expect(subagentDetailToReducerEntry({ task_id: 't3' }).phase).toBe('started');
+    const noname = subagentDetailToReducerEntry({ task_id: 't4', status: 'completed' });
+    expect(noname.name).toBe('t4');
+  });
+
+  it('tools 缺省→空数组；is_error 非真值一律归 false；坏行过滤', () => {
+    expect(subagentDetailToReducerEntry({ task_id: 't1' }).tools).toEqual([]);
+    expect(
+      subagentDetailToReducerEntry({
+        task_id: 't1',
+        tools: [null, { tool: 'Bash' }, { tool: 'Read', is_error: 1 }],
+      }).tools,
+    ).toEqual([
+      { tool: 'Bash', summary: '', isError: false, ts: '' },
+      { tool: 'Read', summary: '', isError: false, ts: '' },
+    ]);
+  });
+
+  it('脏输入防御：null/缺 task_id 返回 null（refresh 侧过滤丢弃）', () => {
+    expect(subagentDetailToReducerEntry(null)).toBeNull();
+    expect(subagentDetailToReducerEntry({ name: 'no-id' })).toBeNull();
+    expect(subagentDetailToReducerEntry('str')).toBeNull();
+  });
+});
+
+describe('refreshSubagentsFromDetail（M1 静默重拉：只消费 subagents[]，入库前归一 status→phase）', () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
 
-  it('详情带 subagents[]：整体替换该会话面板状态，转录不落壳', async () => {
+  it('详情带 subagents[]：整体替换该会话面板状态，转录不落壳，条目已归一为 reducer 形状', async () => {
     getAgentSessionDetail.mockResolvedValue({
       transcript: [{ role: 'user', content: '全量重拉的转录行——绝不能进壳' }],
-      subagents: [{ taskId: 't1', name: 'reviewer', phase: 'completed', summary: '全部通过' }],
+      subagents: [{
+        task_id: 't1',
+        name: 'reviewer',
+        status: 'completed',
+        summary: '全部通过',
+        result: '全绿报告',
+        total_tokens: 900,
+        duration_ms: 4200,
+        tools: [{ tool: 'Bash', summary: 'npm test', is_error: false }],
+      }],
     });
     const store = { s1: [{ taskId: 't1', name: 'reviewer', phase: 'progress', currentStep: '旧步骤' }] };
     await refreshSubagentsFromDetail(store, 's1');
     expect(getAgentSessionDetail).toHaveBeenCalledWith('s1');
-    expect(store.s1).toEqual([{ taskId: 't1', name: 'reviewer', phase: 'completed', summary: '全部通过' }]);
+    // phase 键 + 驼峰键：与 WS 聚合条目同形状，入口条/面板计数不因详情来源而归 0
+    expect(store.s1).toEqual([{
+      taskId: 't1',
+      name: 'reviewer',
+      description: null,
+      phase: 'completed',
+      currentStep: null,
+      lastTool: null,
+      toolUses: 0,
+      totalTokens: 900,
+      durationMs: 4200,
+      summary: '全部通过',
+      result: '全绿报告',
+      startedAt: null,
+      endedAt: null,
+      tools: [{ tool: 'Bash', summary: 'npm test', isError: false, ts: '' }],
+    }]);
+  });
+
+  it('详情带空 subagents[]：合法清空（无子agent会话），坏条目（缺 task_id）被过滤', async () => {
+    getAgentSessionDetail.mockResolvedValue({
+      subagents: [{ name: 'bad-no-task-id' }, { task_id: 'ok', status: 'failed', summary: '上游失联' }],
+    });
+    const store = {};
+    await refreshSubagentsFromDetail(store, 's1');
+    expect(store.s1).toHaveLength(1);
+    expect(store.s1[0]).toMatchObject({ taskId: 'ok', phase: 'failed' });
   });
 
   it('详情未带 subagents 键（后端降级/旧版）：保留 WS 聚合态不覆写', async () => {

@@ -1,5 +1,11 @@
 import { describe, it, expect } from 'vitest';
-import { applySubagentEvent, hasActiveSubagents } from '../subagentPanel';
+import {
+  applySubagentEvent,
+  hasActiveSubagents,
+  subagentPhaseMeta,
+  formatSubagentDuration,
+  formatSubagentTokens,
+} from '../subagentPanel';
 
 // 构造 ai.subagent 事件帧的便捷工厂
 const ev = (taskId, phase, extra = {}) => ({ type: 'ai.subagent', taskId, phase, ...extra });
@@ -192,5 +198,44 @@ describe('hasActiveSubagents', () => {
     ])).toBe(false);
     expect(hasActiveSubagents([])).toBe(false);
     expect(hasActiveSubagents(null)).toBe(false);
+  });
+});
+
+describe('subagentPhaseMeta（面板/详情共用 phase 呈现映射，词表单真源）', () => {
+  it('活动态映射 running 色调，终态按词各映射（含 interrupted）', () => {
+    expect(subagentPhaseMeta('started')).toMatchObject({ tone: 'running', labelKey: 'chat_subagentStatusRunning' });
+    expect(subagentPhaseMeta('progress')).toMatchObject({ tone: 'running', labelKey: 'chat_subagentStatusRunning' });
+    expect(subagentPhaseMeta('completed')).toMatchObject({ tone: 'done', labelKey: 'chat_subagentStatusCompleted' });
+    expect(subagentPhaseMeta('failed')).toMatchObject({ tone: 'failed', labelKey: 'chat_subagentStatusFailed' });
+    expect(subagentPhaseMeta('interrupted')).toMatchObject({ tone: 'interrupted', labelKey: 'chat_subagentStatusInterrupted' });
+  });
+
+  it('未知/缺省 phase 安全兜底 running（与入口条计数「未知两侧不计」互不影响——本函数只管呈现）', () => {
+    expect(subagentPhaseMeta('weird').tone).toBe('running');
+    expect(subagentPhaseMeta(undefined).tone).toBe('running');
+  });
+});
+
+describe('formatSubagentDuration（durationMs→秒呈现）', () => {
+  it('正值毫秒转秒显示', () => {
+    expect(formatSubagentDuration(4200)).toBe('4.2s');
+    expect(formatSubagentDuration(500)).toBe('0.5s');
+    expect(formatSubagentDuration(65000)).toBe('1m5s');
+  });
+
+  it('非法/非正值返回空串（渲染层不显示该槽位）', () => {
+    expect(formatSubagentDuration(null)).toBe('');
+    expect(formatSubagentDuration(undefined)).toBe('');
+    expect(formatSubagentDuration(-1)).toBe('');
+    expect(formatSubagentDuration('abc')).toBe('');
+  });
+});
+
+describe('formatSubagentTokens', () => {
+  it('正值千分位显示；非法/非正值返回空串', () => {
+    expect(formatSubagentTokens(1200)).toBe('1,200');
+    expect(formatSubagentTokens(0)).toBe('');
+    expect(formatSubagentTokens(null)).toBe('');
+    expect(formatSubagentTokens('x')).toBe('');
   });
 });

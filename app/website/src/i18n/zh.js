@@ -362,6 +362,26 @@ export default {
   chat_subagentEntryRunning: '{n} 运行中',
   chat_subagentEntryDone: '{n} 已完成',
   chat_subagentEntryView: '查看详情',
+  // 子agent面板与详情（Task 8, spec 2026-11-07-subagent-panel §三），与 en.js
+  // 成对维护（i18n.test.js 守键集）。
+  chat_subagentPanelClose: '关闭',
+  chat_subagentPanelBack: '返回列表',
+  chat_subagentStatusRunning: '运行中',
+  chat_subagentStatusCompleted: '已完成',
+  chat_subagentStatusFailed: '失败',
+  chat_subagentStatusInterrupted: '已中断',
+  chat_subagentCurrentStep: '当前步骤',
+  chat_subagentLastTool: '最近工具',
+  chat_subagentToolUses: '工具次数',
+  chat_subagentToolError: '执行失败',
+  chat_subagentDuration: '耗时',
+  chat_subagentTokens: 'Token',
+  chat_subagentTimeline: '工具时间线',
+  chat_subagentNoTools: '暂无工具调用',
+  chat_subagentReport: '完整报告',
+  chat_subagentReportPending: '运行中，报告尚未生成',
+  chat_subagentCopyReport: '复制报告',
+  chat_subagentCopied: '已复制',
 
   // -- App --
   app_restoringSession: '正在恢复会话…',

@@ -86,6 +86,17 @@
         @open="openSubagentPanel"
       />
 
+      <!-- 子agent面板（Task 8, spec 2026-11-07-subagent-panel §三）：入口条
+           open 后挂载；空数组由面板自身守卫不渲染。选中经 @select 写
+           subagentWatchingTaskId（M1 终态静默重拉钩子），关闭回 null。 -->
+      <SubagentPanel
+        v-if="subagentPanelOpen"
+        :open="subagentPanelOpen"
+        :subagents="activeSubagents"
+        @close="closeSubagentPanel"
+        @select="onSubagentPanelSelect"
+      />
+
       <ChatComposer
         v-if="activeId"
         v-model="inputText"
@@ -130,7 +141,7 @@
 // 聊天页编排壳：状态与全部业务逻辑收在 useAliangChat（WS 生命周期/看门狗/
 // 帧路由/审批/steer/三源清单/持久化），渲染拆在 chat/ 组件树（侧栏、顶栏、
 // 设置条、消息列表、气泡、审批卡、输入区）。本文件只做组件接线。
-import { computed, onMounted, onUnmounted, ref } from 'vue';
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 import { isComposingEvent, useAliangChat } from '../composables/useAliangChat';
 import { normalizeDeviceProvider } from '../utils/chatSettings';
 import ChatSidebar from './chat/ChatSidebar.vue';
@@ -140,6 +151,7 @@ import ChatMessageList from './chat/ChatMessageList.vue';
 import ChatComposer from './chat/ChatComposer.vue';
 import ChatComposerTools from './chat/ChatComposerTools.vue';
 import SubagentStatusBar from './chat/SubagentStatusBar.vue';
+import SubagentPanel from './chat/SubagentPanel.vue';
 
 const {
   activeApprovals,
@@ -180,6 +192,7 @@ const {
   onSidebarItemClick,
   onSlashInput,
   recallActive,
+  refetchSubagentsForSession,
   renameDraft,
   renamingId,
   renameSurface,
@@ -210,6 +223,7 @@ const {
   startRename,
   steerBlocked,
   stopRun,
+  subagentWatchingTaskId,
   toggleMcpServer,
   toggleSkill,
 } = useAliangChat();
@@ -220,12 +234,29 @@ const {
 const activeIsAgentcore = computed(
   () => normalizeDeviceProvider(activeConversation.value?.provider) === 'agentcore'
 );
-// TODO(Task 8)：面板组件接线后由本标志驱动面板渲染（关闭回写 false），
-// 当前先落占位标志，open 事件只置位不渲染。
+// 面板打开标志（Task 8 接线落点）：open 后挂 SubagentPanel（Task 7 占位注释
+// 的兑现）。打开瞬间以当前会话 aiSessionId 拉一次详情（只消费 subagents[]，
+// 走 refreshSubagentsFromDetail 的 status→phase 归一），补齐终态条目的
+// result/tools 与 WS 断连窗口丢失的条目；关闭/取消选中回写 watchingTaskId
+// =null，M1 终态静默重拉钩子随之失活。
 const subagentPanelOpen = ref(false);
 function openSubagentPanel() {
   subagentPanelOpen.value = true;
 }
+function closeSubagentPanel() {
+  subagentPanelOpen.value = false;
+}
+function onSubagentPanelSelect(taskId) {
+  subagentWatchingTaskId.value = taskId || null;
+}
+watch(subagentPanelOpen, (open) => {
+  if (open) {
+    const sid = activeConversation.value?.aiSessionId || '';
+    if (sid) refetchSubagentsForSession(sid);
+  } else {
+    subagentWatchingTaskId.value = null;
+  }
+});
 
 // 设置条补丁落点：conv 取当前活跃会话（与拆分前各调用点同源），
 // running 守卫/持久化/清错/服务端同步都在 applySessionSettings 内。

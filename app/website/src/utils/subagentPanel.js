@@ -92,3 +92,38 @@ export function hasActiveSubagents(subagents) {
   if (!Array.isArray(subagents)) return false;
   return subagents.some(s => s && ACTIVE_PHASES.has(s.phase));
 }
+
+// ---- 呈现层辅助(Task 8 面板/详情共用) ----
+
+// phase → 呈现元数据(i18n 键/图标/色调)。词表真源仍是上方 ACTIVE/TERMINAL
+// 集合,这里只补「词 → 展示」映射,面板与详情不各自维护第二份词表。未知
+// phase 兜底 running 呈现(reducer 未知帧原样保底的容错口径;入口条计数侧
+// 「未知两侧不计」不受影响——本函数只管展示)。
+const PHASE_META = {
+  started: { labelKey: 'chat_subagentStatusRunning', icon: 'progress_activity', tone: 'running' },
+  progress: { labelKey: 'chat_subagentStatusRunning', icon: 'progress_activity', tone: 'running' },
+  completed: { labelKey: 'chat_subagentStatusCompleted', icon: 'check_circle', tone: 'done' },
+  failed: { labelKey: 'chat_subagentStatusFailed', icon: 'cancel', tone: 'failed' },
+  interrupted: { labelKey: 'chat_subagentStatusInterrupted', icon: 'pause_circle', tone: 'interrupted' },
+};
+
+export function subagentPhaseMeta(phase) {
+  return PHASE_META[phase] || PHASE_META.started;
+}
+
+// durationMs → 秒呈现:<60s 显示一位小数秒,≥60s 折算分秒。非法/非正值返回
+// 空串(渲染层以空串判据隐藏该槽位,不显示「0.0s」假数据)。
+export function formatSubagentDuration(ms) {
+  const n = Number(ms);
+  if (!Number.isFinite(n) || n <= 0) return '';
+  const s = n / 1000;
+  if (s < 60) return `${s.toFixed(1)}s`;
+  return `${Math.floor(s / 60)}m${Math.round(s % 60)}s`;
+}
+
+// token 数千分位呈现;非法/非正值返回空串(同上,隐藏槽位)。
+export function formatSubagentTokens(tokens) {
+  const n = Number(tokens);
+  if (!Number.isFinite(n) || n <= 0) return '';
+  return n.toLocaleString('en-US');
+}
