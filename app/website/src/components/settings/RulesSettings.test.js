@@ -1,9 +1,10 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // RulesSettings.vue 模块求值会连带执行 i18n 的 loadLocale()（读 localStorage，
 // node 测试环境无 DOM）；本测试只测 sanitizeList 纯函数，mock 掉该依赖即可导入 SFC。
 vi.mock('../../i18n', () => ({ useI18n: () => ({ t: (k) => k }) }));
 
+import { createApp, h } from 'vue';
 import {
   detectCommaCollapseIssue,
   detectGeoipCommaIssue,
@@ -17,6 +18,9 @@ import {
   seedMissingProviders,
   validateRuleEntry
 } from './RulesSettings.vue';
+import RulesSettings from './RulesSettings.vue';
+import en from '../../i18n/en';
+import zh from '../../i18n/zh';
 
 // 分词器以逗号/分号/换行切分 include 文本；geoip 多国条目（+ 分隔）必须原样穿过，
 // 否则 geoip:CN+HK+US 会被误拆（geoip 条目校验见 RulesSettings.vue validateRuleEntry）。
@@ -313,5 +317,366 @@ describe('RulesSettings provider case-insensitivity', () => {
     expect(providerLabelFor('anthropic', PRESETS)).toBe('Anthropic');
     expect(providerLabelFor('Anthropic', PRESETS)).toBe('Anthropic');
     expect(providerLabelFor('deepseek', PRESETS)).toBe('deepseek');
+  });
+});
+
+// —— SSH 上游代理（Task 12）挂载级测试 ——
+// 挂载走 createApp + jsdom 手法（仓内无 @vue/test-utils，AgentMCPRegistrySettings.test.js
+// 同范式）；i18n 沿用本文件顶部 mock（t 原样回键，断言不硬编码文案）；指纹区块
+// 走全局 fetch，vi.stubGlobal 注入。onSave prop 捕获 'save' 事件载荷。
+const flush = async (rounds = 8) => {
+  for (let i = 0; i < rounds; i += 1) await Promise.resolve();
+};
+
+const mountedApps = [];
+
+function mountRules(config) {
+  const saved = [];
+  const el = document.createElement('div');
+  document.body.appendChild(el);
+  const app = createApp({
+    render: () => h(RulesSettings, {
+      config,
+      onSave: (payload) => saved.push(payload)
+    })
+  });
+  app.mount(el);
+  mountedApps.push({ app, el });
+  return { el, saved };
+}
+
+function sshConfig(proxyOverrides = {}) {
+  return {
+    proxy: {
+      enable: true,
+      type: 'ssh',
+      server: '127.0.0.1:2222',
+      username: 'deploy',
+      password: 'secret',
+      private_key: '',
+      key_passphrase: '',
+      pool_size: '',
+      jump_servers: [],
+      ...proxyOverrides
+    },
+    ai_rules: {},
+    proxy_rules: []
+  };
+}
+
+function setField(el, field, value, root) {
+  const node = (root || el).querySelector(`[data-field="${field}"]`);
+  node.value = value;
+  node.dispatchEvent(new Event('input', { bubbles: true }));
+}
+
+function setType(el, type) {
+  const select = el.querySelector('[data-field="proxyType"]');
+  select.value = type;
+  select.dispatchEvent(new Event('change'));
+}
+
+function submitForm(el) {
+  el.querySelector('form').dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+}
+
+function buttonByText(el, text) {
+  return [...el.querySelectorAll('button')].find((btn) =>
+    btn.textContent.replace(/\s+/g, ' ').trim().includes(text));
+}
+
+const jsonResponse = (payload, ok = true) => ({
+  ok,
+  status: ok ? 200 : 500,
+  json: async () => payload
+});
+
+const knownHostsEnvelope = (items) => ({
+  code: 0,
+  msg: '',
+  data: { known_hosts: items }
+});
+
+const knownHostEntries = () => [
+  { host: 'bastion.example.com', port: '22', fingerprint: 'SHA256:0123456789abcdefghijklmnopqrstuv', algorithm: 'ssh-ed25519', added_at: '2026-11-08T01:02:03Z' },
+  { host: '10.0.0.8', port: '2222', fingerprint: 'SHA256:zyxwvutsrqponmlkjihgfedcba9876543210', algorithm: 'ssh-rsa', added_at: '2026-11-07T08:09:10Z' }
+];
+
+describe('RulesSettings SSH 上游代理', () => {
+  beforeEach(() => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse(knownHostsEnvelope([]))));
+  });
+
+  afterEach(() => {
+    while (mountedApps.length) {
+      const { app, el } = mountedApps.pop();
+      app.unmount();
+      el.remove();
+    }
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it('类型下拉含 ssh 且默认 socks5；ssh 条件字段与指纹区块按类型显隐', async () => {
+    const { el } = mountRules(sshConfig({ type: 'socks5', username: '', password: '' }));
+    await flush();
+    const select = el.querySelector('[data-field="proxyType"]');
+    expect(select.value).toBe('socks5');
+    expect(select.querySelector('option[value="ssh"]')).toBeTruthy();
+    // socks5/http 时 ssh 专属字段与指纹区块不可见
+    expect(el.querySelector('[data-ssh-fields]')).toBeNull();
+    expect(el.querySelector('[data-known-hosts]')).toBeNull();
+
+    setType(el, 'ssh');
+    await flush();
+    expect(el.querySelector('[data-ssh-fields]')).toBeTruthy();
+    expect(el.querySelector('[data-field="proxyPrivateKey"]')).toBeTruthy();
+    expect(el.querySelector('[data-field="proxyKeyPassphrase"]')).toBeTruthy();
+    expect(el.querySelector('[data-field="proxyPoolSize"]')).toBeTruthy();
+    expect(el.querySelector('[data-jump-add]')).toBeTruthy();
+    expect(el.querySelector('[data-known-hosts]')).toBeTruthy();
+    // 切到 ssh 触发指纹列表加载
+    expect(globalThis.fetch).toHaveBeenCalledWith('/api/proxy/ssh/known-hosts', expect.anything());
+  });
+
+  it('校验：ssh 无用户名或密码私钥全空时拦截提交并给出文案', async () => {
+    const { el, saved } = mountRules(sshConfig({ username: '', password: '' }));
+    await flush();
+    // 无 username（密码/私钥也空）→ 用户名文案优先
+    submitForm(el);
+    await flush();
+    expect(saved).toHaveLength(0);
+    expect(el.textContent).toContain('rules_sshValidationErrorUsername');
+    expect(el.querySelector('#rulesConfigSaveBtn').disabled).toBe(true);
+
+    // 补 username，仍无认证 → 认证文案
+    setField(el, 'proxyUsername', 'deploy');
+    await flush();
+    expect(el.textContent).toContain('rules_sshValidationErrorAuth');
+    expect(el.textContent).not.toContain('rules_sshValidationErrorUsername');
+
+    // 补密码后校验通过，提交放行
+    setField(el, 'proxyPassword', 'secret');
+    await flush();
+    expect(el.textContent).not.toContain('rules_sshValidationError');
+    submitForm(el);
+    await flush();
+    expect(saved).toHaveLength(1);
+  });
+
+  it('校验：跳板行缺 username 或认证时拦截（文案带序号），补齐后放行', async () => {
+    const { el, saved } = mountRules(sshConfig());
+    await flush();
+    buttonByText(el, 'rules_proxyJumpAdd').click();
+    await flush();
+    const rows = el.querySelectorAll('[data-jump-row]');
+    expect(rows).toHaveLength(1);
+    // 只填 server 的半填行 → 拦截（序号从 1 起）
+    setField(el, 'jumpServer', 'bastion.example.com:2222', rows[0]);
+    await flush();
+    submitForm(el);
+    await flush();
+    expect(saved).toHaveLength(0);
+    expect(el.textContent).toContain('rules_sshValidationErrorJumpUsername');
+
+    setField(el, 'jumpUsername', 'jump', rows[0]);
+    await flush();
+    expect(el.textContent).toContain('rules_sshValidationErrorJumpAuth');
+    setField(el, 'jumpPassword', 'jump-pass', rows[0]);
+    await flush();
+    expect(el.textContent).not.toContain('rules_sshValidationErrorJump');
+    submitForm(el);
+    await flush();
+    expect(saved).toHaveLength(1);
+  });
+
+  it('跳板行增删与提交载荷：server 单串原样、行对象只含线格式五字段', async () => {
+    const { el, saved } = mountRules(sshConfig());
+    await flush();
+    buttonByText(el, 'rules_proxyJumpAdd').click();
+    buttonByText(el, 'rules_proxyJumpAdd').click();
+    await flush();
+    expect(el.querySelectorAll('[data-jump-row]')).toHaveLength(2);
+
+    const firstRow = el.querySelectorAll('[data-jump-row]')[0];
+    setField(el, 'jumpServer', 'ssh://u2:p2@bastion.example.com:2222', firstRow);
+    setField(el, 'jumpUsername', 'jump', firstRow);
+    setField(el, 'jumpPassword', 'jump-pass', firstRow);
+    // 展开细节面板后补私钥与口令（可选私钥折叠交互）
+    firstRow.querySelector('[data-jump-toggle-key]').click();
+    await flush();
+    setField(el, 'jumpPrivateKey', 'JUMP-PEM', firstRow);
+    setField(el, 'jumpKeyPassphrase', 'jump-pp', firstRow);
+
+    // 第二行整行留空 → 提交前被静默丢弃
+    submitForm(el);
+    await flush();
+    expect(saved).toHaveLength(1);
+    expect(saved[0].proxy.jump_servers).toEqual([{
+      server: 'ssh://u2:p2@bastion.example.com:2222',
+      username: 'jump',
+      password: 'jump-pass',
+      private_key: 'JUMP-PEM',
+      key_passphrase: 'jump-pp'
+    }]);
+
+    // 删除按钮移除行
+    firstRow.querySelector('[data-jump-remove]').click();
+    await flush();
+    expect(el.querySelectorAll('[data-jump-row]')).toHaveLength(1);
+    submitForm(el);
+    await flush();
+    expect(saved[1].proxy.jump_servers).toEqual([]);
+  });
+
+  it('提交载荷：ssh 时带 private_key/key_passphrase/pool_size，空 pool 发 0（后端默认 3）', async () => {
+    const { el, saved } = mountRules(sshConfig());
+    await flush();
+    setField(el, 'proxyPrivateKey', '-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----\n');
+    setField(el, 'proxyKeyPassphrase', 'pp');
+    setField(el, 'proxyPoolSize', '5');
+    submitForm(el);
+    await flush();
+    expect(saved).toHaveLength(1);
+    expect(saved[0].proxy.private_key).toBe('-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----\n');
+    expect(saved[0].proxy.key_passphrase).toBe('pp');
+    expect(saved[0].proxy.pool_size).toBe(5);
+    expect(saved[0].proxy.type).toBe('ssh');
+
+    const { el: el2, saved: saved2 } = mountRules(sshConfig());
+    await flush();
+    submitForm(el2);
+    await flush();
+    expect(saved2[0].proxy.pool_size).toBe(0);
+  });
+
+  it('提交载荷：切回 socks5/http 时新字段置零值不残留（值在表单内保留）', async () => {
+    const { el, saved } = mountRules(sshConfig({
+      private_key: 'OLD-PEM',
+      key_passphrase: 'old-pp',
+      pool_size: 4,
+      jump_servers: [{ server: 'bastion:22', username: 'u', password: 'p', private_key: '', key_passphrase: '' }]
+    }));
+    await flush();
+    // 回显：ssh 字段从 GET customer 回填
+    expect(el.querySelector('[data-field="proxyPrivateKey"]').value).toBe('OLD-PEM');
+    expect(el.querySelector('[data-field="proxyKeyPassphrase"]').value).toBe('old-pp');
+    expect(el.querySelector('[data-field="proxyPoolSize"]').value).toBe('4');
+    expect(el.querySelector('[data-field="jumpServer"]').value).toBe('bastion:22');
+
+    // 切到 socks5：字段隐藏但值保留
+    setType(el, 'socks5');
+    await flush();
+    expect(el.querySelector('[data-ssh-fields]')).toBeNull();
+    // 切回 ssh 不丢已填
+    setType(el, 'ssh');
+    await flush();
+    expect(el.querySelector('[data-field="proxyPrivateKey"]').value).toBe('OLD-PEM');
+    expect(el.querySelector('[data-field="proxyPoolSize"]').value).toBe('4');
+    expect(el.querySelector('[data-field="jumpServer"]').value).toBe('bastion:22');
+
+    // socks5 下提交：新字段置零值，避免后端残留旧值
+    setType(el, 'socks5');
+    await flush();
+    submitForm(el);
+    await flush();
+    expect(saved).toHaveLength(1);
+    expect(saved[0].proxy.type).toBe('socks5');
+    expect(saved[0].proxy.private_key).toBe('');
+    expect(saved[0].proxy.key_passphrase).toBe('');
+    expect(saved[0].proxy.pool_size).toBe(0);
+    expect(saved[0].proxy.jump_servers).toEqual([]);
+  });
+
+  it('指纹区块：GET 渲染列表（指纹截断+title 全文）、单删带参、清空裸 DELETE、操作后刷新', async () => {
+    globalThis.fetch.mockResolvedValue(jsonResponse(knownHostsEnvelope(knownHostEntries())));
+    const { el } = mountRules(sshConfig());
+    await flush();
+    expect(globalThis.fetch).toHaveBeenCalledWith('/api/proxy/ssh/known-hosts', expect.anything());
+    const row = el.querySelector('[data-known-host="bastion.example.com:22"]');
+    expect(row).toBeTruthy();
+    expect(row.textContent).toContain('bastion.example.com:22');
+    expect(row.textContent).toContain('ssh-ed25519');
+    // 指纹截断显示（前 20 字符+…），全文挂 title
+    expect(row.textContent).toContain('SHA256:0123456789abc…');
+    expect(row.textContent).not.toContain('SHA256:0123456789abcdefghijklmnopqrstuv');
+    expect(row.querySelector('code').getAttribute('title')).toBe('SHA256:0123456789abcdefghijklmnopqrstuv');
+
+    // 单条删除：DELETE 带 host/port 参数
+    globalThis.fetch.mockClear();
+    row.querySelector('[data-known-host-remove]').click();
+    await flush();
+    expect(globalThis.fetch).toHaveBeenCalledWith(
+      '/api/proxy/ssh/known-hosts?host=bastion.example.com&port=22',
+      expect.objectContaining({ method: 'DELETE' })
+    );
+    // 操作后刷新列表（清零后至少再 GET 一次）
+    const getCalls = globalThis.fetch.mock.calls.filter(([path]) => path === '/api/proxy/ssh/known-hosts');
+    expect(getCalls.length).toBeGreaterThanOrEqual(1);
+
+    // 清空全部：confirm 后裸 DELETE（无查询参数）
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    globalThis.fetch.mockClear();
+    buttonByText(el, 'rules_knownHostsClear').click();
+    await flush();
+    expect(globalThis.fetch).toHaveBeenCalledWith(
+      '/api/proxy/ssh/known-hosts',
+      expect.objectContaining({ method: 'DELETE' })
+    );
+    expect(globalThis.fetch.mock.calls.some(([path]) => String(path).includes('?'))).toBe(false);
+  });
+
+  it('指纹区块：GET 失败静默降级为加载失败文案，不阻塞主表单', async () => {
+    globalThis.fetch.mockRejectedValue(new Error('network down'));
+    const { el, saved } = mountRules(sshConfig());
+    await flush();
+    expect(el.textContent).toContain('rules_knownHostsLoadFailed');
+    // 主表单照常可提交
+    submitForm(el);
+    await flush();
+    expect(saved).toHaveLength(1);
+  });
+
+  it('指纹区块：空列表显示空文案，不渲染清空按钮', async () => {
+    const { el } = mountRules(sshConfig());
+    await flush();
+    expect(el.textContent).toContain('rules_knownHostsEmpty');
+    expect(buttonByText(el, 'rules_knownHostsClear')).toBeFalsy();
+  });
+
+  it('i18n：SSH 新键 zh/en 同步存在', () => {
+    const sshKeys = [
+      'rules_proxyUsernamePlaceholderSsh',
+      'rules_proxyPasswordPlaceholderSsh',
+      'rules_proxyPrivateKey',
+      'rules_proxyPrivateKeyPlaceholder',
+      'rules_proxyKeyPassphrase',
+      'rules_proxyKeyPassphrasePlaceholder',
+      'rules_proxyPoolSize',
+      'rules_proxyPoolSizePlaceholder',
+      'rules_proxyJumpTitle',
+      'rules_proxyJumpDesc',
+      'rules_proxyJumpAdd',
+      'rules_proxyJumpRemove',
+      'rules_proxyJumpServerPlaceholder',
+      'rules_proxyJumpExpandKey',
+      'rules_proxyJumpCollapseKey',
+      'rules_sshValidationErrorUsername',
+      'rules_sshValidationErrorAuth',
+      'rules_sshValidationErrorJumpServer',
+      'rules_sshValidationErrorJumpUsername',
+      'rules_sshValidationErrorJumpAuth',
+      'rules_knownHostsTitle',
+      'rules_knownHostsDesc',
+      'rules_knownHostsEmpty',
+      'rules_knownHostsLoadFailed',
+      'rules_knownHostsRemove',
+      'rules_knownHostsClear',
+      'rules_knownHostsClearConfirm'
+    ];
+    for (const key of sshKeys) {
+      expect(typeof zh[key], `zh.${key}`).toBe('string');
+      expect(typeof en[key], `en.${key}`).toBe('string');
+    }
   });
 });

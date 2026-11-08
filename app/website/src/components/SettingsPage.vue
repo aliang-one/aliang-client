@@ -259,7 +259,12 @@ function createDefaultCustomerConfig() {
       type: 'socks5',
       server: '',
       username: '',
-      password: ''
+      password: '',
+      // SSH 专属字段（线格式 customer.proxy；0/''/[] = 未设置）
+      private_key: '',
+      key_passphrase: '',
+      pool_size: 0,
+      jump_servers: []
     },
     ai_rules: {},
     proxy_rules: [],
@@ -339,18 +344,38 @@ function normalizeCustomEnvVarsConfig(payload = {}) {
   };
 }
 
+// jump_servers 线格式（SSHJumpServerRaw）：server 单串，只透传五个线格式字段
+function normalizeProxyJumpServers(raw) {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  return raw.map((entry) => ({
+    server: typeof entry?.server === 'string' ? entry.server : '',
+    username: typeof entry?.username === 'string' ? entry.username : '',
+    password: typeof entry?.password === 'string' ? entry.password : '',
+    private_key: typeof entry?.private_key === 'string' ? entry.private_key : '',
+    key_passphrase: typeof entry?.key_passphrase === 'string' ? entry.key_passphrase : ''
+  }));
+}
+
 function normalizeCustomerConfig(payload = {}) {
   const defaults = createDefaultCustomerConfig();
   // 三态布尔:显式布尔才产出 peer_mcp 键(缺键/非布尔不进 patch 与回显,
   // 后端 nil 视为开启)。漏挂此键 = 保存 200 但永不落盘(验收缺陷①同族)。
   const peerMcp = normalizePeerMCPConfig(payload?.peer_mcp);
+  const rawPoolSize = payload?.proxy?.pool_size;
   return {
     proxy: {
       enable: typeof payload?.proxy?.enable === 'boolean' ? payload.proxy.enable : defaults.proxy.enable,
-      type: payload?.proxy?.type === 'http' ? 'http' : defaults.proxy.type,
+      type: ['http', 'ssh'].includes(payload?.proxy?.type) ? payload.proxy.type : defaults.proxy.type,
       server: typeof payload?.proxy?.server === 'string' ? payload.proxy.server : defaults.proxy.server,
       username: typeof payload?.proxy?.username === 'string' ? payload.proxy.username : defaults.proxy.username,
-      password: typeof payload?.proxy?.password === 'string' ? payload.proxy.password : defaults.proxy.password
+      password: typeof payload?.proxy?.password === 'string' ? payload.proxy.password : defaults.proxy.password,
+      private_key: typeof payload?.proxy?.private_key === 'string' ? payload.proxy.private_key : defaults.proxy.private_key,
+      key_passphrase: typeof payload?.proxy?.key_passphrase === 'string' ? payload.proxy.key_passphrase : defaults.proxy.key_passphrase,
+      // 0 = 未设置（RulesSettings 输入框显示空 + 「默认 3」placeholder；默认与钳位由后端承担）
+      pool_size: typeof rawPoolSize === 'number' && Number.isFinite(rawPoolSize) && rawPoolSize > 0 ? rawPoolSize : 0,
+      jump_servers: normalizeProxyJumpServers(payload?.proxy?.jump_servers)
     },
     ai_rules: normalizeAiRules(payload?.ai_rules),
     proxy_rules: normalizeProxyRules(payload?.proxy_rules),
@@ -382,7 +407,11 @@ function buildCustomerConfigPatch(nextConfig, currentConfig) {
   const normalizedCurrent = normalizeCustomerConfig(currentConfig);
   const patch = buildConfigPatch(normalizedNext, normalizedCurrent) || {};
 
-  for (const key of ['username', 'password']) {
+  // buildConfigPatch 对空串字符串字段默认跳过（视为未改动）；凭据类字段清空是
+  // 显式意图（含 SSH 切回 socks5/http 时的 private_key/key_passphrase 残留清除），
+  // 必须显式发空串让后端 deep-merge 覆盖旧值。pool_size(0)/jump_servers([]) 是
+  // 数字/数组，buildConfigPatch 本身会带出差异，无需在此特判。
+  for (const key of ['username', 'password', 'private_key', 'key_passphrase']) {
     const nextValue = String(normalizedNext.proxy?.[key] ?? '');
     const currentValue = String(normalizedCurrent.proxy?.[key] ?? '');
     if (!nextValue && currentValue) {
