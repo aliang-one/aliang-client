@@ -123,6 +123,9 @@ func (c *SSHProxyConfig) Validate() error {
 	if c.ServerPort == 0 {
 		return fmt.Errorf("server_port is required")
 	}
+	if c.Username == "" {
+		return fmt.Errorf("ssh proxy requires username")
+	}
 	if c.Password == "" && c.PrivateKey == "" {
 		return fmt.Errorf("ssh proxy requires password or private_key")
 	}

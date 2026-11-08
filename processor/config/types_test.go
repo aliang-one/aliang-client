@@ -1539,7 +1539,8 @@ func TestConfigValidateSSHProxy(t *testing.T) {
 			"customer": {
 				"proxy": {
 					"type": "ssh",
-					"server": "1.2.3.4:2222"
+					"server": "1.2.3.4:2222",
+					"username": "root"
 				}
 			}
 		}`)
@@ -1552,6 +1553,30 @@ func TestConfigValidateSSHProxy(t *testing.T) {
 			t.Fatal("Validate() error = nil, want missing auth error")
 		}
 		if !strings.Contains(err.Error(), "sshProxy") || !strings.Contains(err.Error(), "password or private_key") {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("主节点缺 username 报错(与跳板口径一致)", func(t *testing.T) {
+		payload := []byte(`{
+			"core": {"api_server": "https://api.aliang.one"},
+			"customer": {
+				"proxy": {
+					"type": "ssh",
+					"server": "1.2.3.4:2222",
+					"password": "pw"
+				}
+			}
+		}`)
+		var cfg Config
+		if err := json.Unmarshal(payload, &cfg); err != nil {
+			t.Fatalf("json.Unmarshal() error = %v", err)
+		}
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatal("Validate() error = nil, want missing username error")
+		}
+		if !strings.Contains(err.Error(), "sshProxy") || !strings.Contains(err.Error(), "ssh proxy requires username") {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})
@@ -1610,7 +1635,7 @@ func TestSSHProxyConfigValidate(t *testing.T) {
 		},
 		{
 			name:    "valid with private key only",
-			config:  &SSHProxyConfig{Server: "1.2.3.4", ServerPort: 22, PrivateKey: "key"},
+			config:  &SSHProxyConfig{Server: "1.2.3.4", ServerPort: 22, Username: "root", PrivateKey: "key"},
 			wantErr: false,
 		},
 		{
@@ -1626,6 +1651,12 @@ func TestSSHProxyConfigValidate(t *testing.T) {
 			errMsg:  "server_port is required",
 		},
 		{
+			name:    "missing username",
+			config:  &SSHProxyConfig{Server: "1.2.3.4", ServerPort: 22, Password: "pw"},
+			wantErr: true,
+			errMsg:  "ssh proxy requires username",
+		},
+		{
 			name:    "missing auth",
 			config:  &SSHProxyConfig{Server: "1.2.3.4", ServerPort: 22, Username: "root"},
 			wantErr: true,
@@ -1634,7 +1665,7 @@ func TestSSHProxyConfigValidate(t *testing.T) {
 		{
 			name: "valid with jump",
 			config: &SSHProxyConfig{
-				Server: "1.2.3.4", ServerPort: 22, Password: "pw",
+				Server: "1.2.3.4", ServerPort: 22, Username: "root", Password: "pw",
 				JumpServers: []SSHJumpServer{{Server: "10.0.0.1", ServerPort: 2201, Username: "hop", Password: "hp"}},
 			},
 			wantErr: false,
@@ -1642,7 +1673,7 @@ func TestSSHProxyConfigValidate(t *testing.T) {
 		{
 			name: "jump missing server and port",
 			config: &SSHProxyConfig{
-				Server: "1.2.3.4", ServerPort: 22, Password: "pw",
+				Server: "1.2.3.4", ServerPort: 22, Username: "root", Password: "pw",
 				JumpServers: []SSHJumpServer{{Username: "hop", Password: "hp"}},
 			},
 			wantErr: true,
@@ -1651,7 +1682,7 @@ func TestSSHProxyConfigValidate(t *testing.T) {
 		{
 			name: "jump missing username",
 			config: &SSHProxyConfig{
-				Server: "1.2.3.4", ServerPort: 22, Password: "pw",
+				Server: "1.2.3.4", ServerPort: 22, Username: "root", Password: "pw",
 				JumpServers: []SSHJumpServer{{Server: "10.0.0.1", ServerPort: 2201, Password: "hp"}},
 			},
 			wantErr: true,
@@ -1660,7 +1691,7 @@ func TestSSHProxyConfigValidate(t *testing.T) {
 		{
 			name: "jump missing auth",
 			config: &SSHProxyConfig{
-				Server: "1.2.3.4", ServerPort: 22, Password: "pw",
+				Server: "1.2.3.4", ServerPort: 22, Username: "root", Password: "pw",
 				JumpServers: []SSHJumpServer{{Server: "10.0.0.1", ServerPort: 2201, Username: "hop"}},
 			},
 			wantErr: true,
@@ -1669,7 +1700,7 @@ func TestSSHProxyConfigValidate(t *testing.T) {
 		{
 			name: "jump index reported",
 			config: &SSHProxyConfig{
-				Server: "1.2.3.4", ServerPort: 22, Password: "pw",
+				Server: "1.2.3.4", ServerPort: 22, Username: "root", Password: "pw",
 				JumpServers: []SSHJumpServer{
 					{Server: "10.0.0.1", ServerPort: 2201, Username: "hop", Password: "hp"},
 					{Server: "10.0.0.2", ServerPort: 2202, Username: "hop2"},
