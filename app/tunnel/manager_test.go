@@ -13,12 +13,15 @@ import (
 )
 
 // restoreMeshSelfIDSeam validateConfig 会写 processor/tcp 的全局 mesh
-// selfID 注入缝(见 manager.go validateConfig),触达 Configure/validateConfig
-// 的测试结束后清空归位,防止全局缝状态跨测试泄漏(质量评审 Important 2;
-// 缝已原子化,并行测试间 Set(nil) 归位并发安全)。
+// selfID/pikoDial 两条注入缝(见 manager.go validateConfig),触达
+// Configure/validateConfig 的测试结束后清空归位,防止全局缝状态跨测试泄漏
+// (质量评审 Important 2;缝已原子化,并行测试间 Set(nil) 归位并发安全)。
 func restoreMeshSelfIDSeam(t *testing.T) {
 	t.Helper()
-	t.Cleanup(func() { tcp.SetMeshSelfIDSource(nil) })
+	t.Cleanup(func() {
+		tcp.SetMeshSelfIDSource(nil)
+		tcp.SetMeshPikoDialSource(nil)
+	})
 }
 
 func TestManagerConfigureIsIdempotentAndStopCancelsSession(t *testing.T) {
@@ -75,7 +78,7 @@ func TestValidateConfigBuildsMeshRelay(t *testing.T) {
 	t.Parallel()
 	restoreMeshSelfIDSeam(t)
 	config := validTestConfig(t)
-	runtimeConfig, _, err := validateConfig(config)
+	runtimeConfig, _, err := NewManager(nil).validateConfig(config)
 	if err != nil {
 		t.Fatal(err)
 	}

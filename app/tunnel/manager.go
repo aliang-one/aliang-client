@@ -19,6 +19,7 @@ import (
 
 	"aliang.one/nursorgate/app/mesh/relay"
 	"aliang.one/nursorgate/outbound/meshproto"
+	meshproxy "aliang.one/nursorgate/outbound/proxy/mesh"
 	"aliang.one/nursorgate/processor/tcp"
 )
 
@@ -28,6 +29,12 @@ type Config struct {
 	TunnelToken     string
 	RoutePublicKey  string
 	ExpiresAt       time.Time
+	// PikoProxyURL is the piko server's *proxy* port for A-side mesh relay
+	// dials (design §3.1 carrier A; a different face than PikoUpstreamURL,
+	// which is the upstream listen port). Optional: when absent/illegal the
+	// relay carrier is soft-failed to unavailable and only the LAN carrier
+	// remains. Carried by the optional tunnel.configure key piko_proxy_url.
+	PikoProxyURL string
 	// AllowPrivateTargets permits mapping RFC1918 hosts on the agent's LAN
 	// (NAS, router, printers) in addition to loopback. Loopback is always
 	// allowed. The server controls this via tunnel.configure
@@ -78,6 +85,10 @@ type Manager struct {
 	status      Status
 	onStatus    func(Status)
 	run         runFunc
+	// meshDial is the A-side mesh relay dial config (mu guarded), refreshed by
+	// every successful validateConfig and cleared by Stop. Dials read it live
+	// (dialMeshEndpoint) so renewals never leave a stale proxy url behind.
+	meshDial meshDialConfig
 }
 
 func NewManager(onStatus func(Status)) *Manager {
@@ -89,7 +100,7 @@ func (m *Manager) Configure(config Config) (Status, bool, error) {
 	defer m.configureMu.Unlock()
 
 	config = normalizeConfig(config)
-	runtimeConfig, fingerprint, err := validateConfig(config)
+	runtimeConfig, fingerprint, err := m.validateConfig(config)
 	if err != nil {
 		return Status{}, false, err
 	}
@@ -138,6 +149,7 @@ func (m *Manager) Configure(config Config) (Status, bool, error) {
 func normalizeConfig(config Config) Config {
 	config.DeviceID = strings.TrimSpace(config.DeviceID)
 	config.PikoUpstreamURL = strings.TrimSpace(config.PikoUpstreamURL)
+	config.PikoProxyURL = strings.TrimSpace(config.PikoProxyURL)
 	config.TunnelToken = strings.TrimSpace(config.TunnelToken)
 	config.RoutePublicKey = strings.TrimSpace(config.RoutePublicKey)
 	return config
@@ -149,6 +161,10 @@ func (m *Manager) Stop() {
 
 	m.mu.Lock()
 	if m.cancel == nil {
+		// No live session, but a configure may still have left the relay dial
+		// config behind (e.g. the session failed on its own): Stop always
+		// leaves the relay carrier unavailable.
+		m.clearMeshDialLocked()
 		m.mu.Unlock()
 		return
 	}
@@ -158,6 +174,7 @@ func (m *Manager) Stop() {
 	m.done = nil
 	m.fingerprint = [sha256.Size]byte{}
 	m.generation++
+	m.clearMeshDialLocked()
 	m.status.State = "stopped"
 	m.status.Error = ""
 	status := m.status
@@ -248,7 +265,7 @@ func (m *Manager) emit(status Status) {
 	}
 }
 
-func validateConfig(config Config) (runConfig, [sha256.Size]byte, error) {
+func (m *Manager) validateConfig(config Config) (runConfig, [sha256.Size]byte, error) {
 	if config.DeviceID == "" || config.PikoUpstreamURL == "" || config.TunnelToken == "" || config.RoutePublicKey == "" {
 		return runConfig{}, [sha256.Size]byte{}, errors.New("device ID, Piko upstream URL, tunnel token, and route public key are required")
 	}
@@ -284,14 +301,33 @@ func validateConfig(config Config) (runConfig, [sha256.Size]byte, error) {
 	meshRelay := relay.New(relay.ProductionDeps(config.DeviceID))
 	// A-side mesh egress head header source (Task 7): the outbound dial
 	// (processor/tcp dialByRoute → mesh Peer) reads the local device id from
-	// this seam; same source as the receive relay above. PikoDial wiring for
-	// the relay carrier lands in Task 9.
+	// this seam; same source as the receive relay above.
 	tcp.SetMeshSelfIDSource(func() string { return config.DeviceID })
+	// A-side mesh relay dial source (Task 9): the provider returns the
+	// dialMeshEndpoint method value, which reads the manager's CURRENT config
+	// on every dial — the closure deliberately captures the manager, never a
+	// generation's config values, because renewals reset the whole config and
+	// a captured (url, token) pair would go stale. Stored before the
+	// fingerprint early-return in Configure runs, so even a fingerprint-equal
+	// renewal picks up a changed piko_proxy_url (the key is excluded from the
+	// fingerprint below: the dialer is built per dial and hot-swaps without
+	// tearing the upstream session).
+	proxyURL, proxyErr := validatePikoProxyURL(config.PikoProxyURL)
+	if proxyErr != nil {
+		// Soft-fail: the relay carrier degrades to unavailable; the HTTP
+		// tunnel and LAN carrier are unaffected.
+		log.Printf("[AGENT-TUNNEL] mesh relay carrier disabled: %v", proxyErr)
+	}
+	m.setMeshDial(proxyURL, config.TunnelToken)
+	tcp.SetMeshPikoDialSource(func() meshproxy.PikoDialFunc { return m.dialMeshEndpoint })
 	// The fingerprint includes the token and expiry, so every renewal
 	// reconfigures the session. This drops in-flight streams once per renewal:
 	// piko reads Upstream.Token only at dial time and offers no token
 	// hot-swap, so keeping the session across renewals would let it reconnect
 	// with the stale token and die on the next flap (401 is non-retryable).
+	// PikoProxyURL is deliberately excluded: it feeds only the per-dial relay
+	// dialer (meshDial above), so proxy-face changes hot-swap without dropping
+	// the upstream session.
 	fingerprint := sha256.Sum256([]byte(strings.Join([]string{
 		config.DeviceID,
 		parsedURL.String(),

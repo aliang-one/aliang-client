@@ -27,8 +27,9 @@ import (
 //	dialer := &pikoclient.Dialer{URL: proxyURL, Token: token} // proxy 端口
 //	peer.PikoDial = dialer.Dial                               // 方法值直接赋
 //
-// 注入式接缝:测试注入 fake;生产由 app/tunnel 封装(Task 9 接线)。本包
-// 不 import piko,保持数据面拨号路径依赖最小。
+// 注入式接缝:测试注入 fake;生产已由 app/tunnel 接线(Task 9:configure 帧
+// 可选键 piko_proxy_url → Manager.DialPeerMesh/dialMeshEndpoint,每次拨号读
+// manager 当前配置)。本包不 import piko,保持数据面拨号路径依赖最小。
 type PikoDialFunc func(ctx context.Context, endpointID string) (net.Conn, error)
 
 // meshRelayEndpointSuffix 中继端点后缀:A 拨 <B_deviceID>.mesh(design

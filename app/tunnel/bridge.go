@@ -168,7 +168,8 @@ func TCPEndpointID(deviceID string) string {
 // MeshEndpointID is the piko endpoint B-side mesh receive listens on (design
 // §3.1 carrier A). The A-side dials the same string via the relay carrier —
 // see outbound/proxy/mesh meshRelayEndpointSuffix (".mesh", mirrored literal:
-// app/tunnel must not import the data-plane proxy package for one constant).
+// manager.go imports the data-plane proxy package since Task 9 for the dial
+// func type, but the mirrored constant keeps bridge.go self-contained).
 func MeshEndpointID(deviceID string) string {
 	return deviceID + ".mesh"
 }
