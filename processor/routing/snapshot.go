@@ -30,9 +30,10 @@ const SnapshotTargetMeshPrefix = "toNode:"
 const meshTailPrefix = "mesh:"
 
 // snapshotRuleTypeDNS / snapshotDNSConditionAll: DNS 代转发规则(design §6 层1/
-// §9.3 规则驱动)。Condition 恒为 all, 决策层恒真; DNS 代转发目标由快照中
-// 首条启用的 dns toNode 规则决定(多 peer 无歧义: 首条命中)。仅存在于快照/
-// canonical 规则层, 不进 model.RuleType 枚举(legacy RoutingRuleSet 无此形态)。
+// §9.3 规则驱动)。Condition 恒为 all(DNS 代转发消费侧语义);连接级决策一律
+// 不命中(见 decision_engine.checkRuleBySnapshot),代转发目标由 Task 8 扫快照
+// 规则取首条启用项(多 peer 无歧义: 首条命中)。仅存在于快照/canonical 规则层,
+// 不进 model.RuleType 枚举(legacy RoutingRuleSet 无此形态)。
 const (
 	snapshotRuleTypeDNS     = "dns"
 	snapshotDNSConditionAll = "all"
@@ -196,7 +197,8 @@ func (s *RuntimeSnapshot) StrictUnavailableBranchDeny() bool {
 // 不做能力检查、按前缀放行是安全的——落盘 canonical 在写入时
 // (customer_config_service)已经过 runtime-inputs 闸,手改文件注入的越权
 // toNode 规则由 Validate 的形态校验拦下 deviceID 空/未知形态,peer 越权则由
-// 转发层(连接建立时按需重编译)天然规避。
+// 决策层按 runtime inputs 按需重编译天然规避——手写 canonical 的 toNode 规则
+// 不在 runtime-inputs 规则源中,对决策天然惰性。
 func CompileRuntimeSnapshot(canonical *config.CanonicalRoutingSchema) (*RuntimeSnapshot, error) {
 	if canonical == nil {
 		return nil, fmt.Errorf("canonical routing schema is nil")
