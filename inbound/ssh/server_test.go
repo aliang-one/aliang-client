@@ -1,6 +1,7 @@
 package ssh
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
@@ -13,6 +14,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	M "aliang.one/nursorgate/inbound/tun/metadata"
 
 	gossh "golang.org/x/crypto/ssh"
 )
@@ -251,6 +254,12 @@ func TestSSHIngressRateLimitsAuthFailures(t *testing.T) {
 }
 
 func TestSSHIngressRejectsNonDirectTCPIPChannels(t *testing.T) {
+	// 打桩管线(swap 纪律同 inject_test.go):消除对真实管线单例的隐式
+	// 依赖与 Error 日志噪音——direct-tcpip 尾段不真拨 127.0.0.1:9。
+	swapTCPHandler(t, func(ctx context.Context, conn net.Conn, metadata *M.Metadata) error {
+		_, _ = io.Copy(io.Discard, conn)
+		return nil
+	})
 	humanPub, signer := newTestKey(t)
 	_, addr := startTestServer(t, RunConfig{AuthorizedKeys: []gossh.PublicKey{humanPub}})
 	conn, err := dialIngress(t, addr, gossh.PublicKeys(signer))
@@ -268,9 +277,8 @@ func TestSSHIngressRejectsNonDirectTCPIPChannels(t *testing.T) {
 			t.Fatalf("channel %q rejection reason = %v, want UnknownChannelType", chType, err)
 		}
 	}
-	// direct-tcpip 是唯一放行通道:Accept 后(Task 4 起 bare 形态注入真实
-	// 管线——本用例未打桩,对 127.0.0.1:9 真拨号失败→Handle 返回→关通道),
-	// 客户端半关后读到 EOF。
+	// direct-tcpip 是唯一放行通道:Accept 后注入(本用例已打桩,桩排空
+	// 即返回→关通道),客户端半关后读到 EOF。
 	payload := gossh.Marshal(directTCPIPMsg{Addr: "127.0.0.1", Port: 9, OriginAddr: "127.0.0.1", OriginPort: 0})
 	ch, _, err := conn.OpenChannel(channelDirectTCPIP, payload)
 	if err != nil {
@@ -306,6 +314,12 @@ func TestSSHIngressGlobalRequests(t *testing.T) {
 }
 
 func TestAuthHumanKeyMarksBareForm(t *testing.T) {
+	// 打桩管线(swap 纪律同 inject_test.go):fire-and-forget 打开不触达
+	// 真实管线单例,免 Error 日志噪音。
+	swapTCPHandler(t, func(ctx context.Context, conn net.Conn, metadata *M.Metadata) error {
+		_, _ = io.Copy(io.Discard, conn)
+		return nil
+	})
 	humanPub, humanSigner := newTestKey(t)
 	meshPub, _ := newTestKey(t)
 	s, addr := startTestServer(t, RunConfig{
@@ -316,8 +330,8 @@ func TestAuthHumanKeyMarksBareForm(t *testing.T) {
 	if err != nil {
 		t.Fatalf("human key must authenticate: %v", err)
 	}
-	// fire-and-forget 打开:未打桩,通道会触达真实管线(拨 127.0.0.1:9
-	// 失败即返回);本用例只断言形态标记,通道生命周期随连接清理收口。
+	// fire-and-forget 打开(已打桩):本用例只断言形态标记,通道生命周期
+	// 随连接清理收口。
 	payload := gossh.Marshal(directTCPIPMsg{Addr: "127.0.0.1", Port: 9, OriginAddr: "127.0.0.1", OriginPort: 0})
 	if _, _, err := conn.OpenChannel(channelDirectTCPIP, payload); err != nil {
 		t.Fatalf("direct-tcpip open: %v", err)

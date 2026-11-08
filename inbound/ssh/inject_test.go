@@ -37,9 +37,11 @@ func swapTCPHandler(t *testing.T, handle func(ctx context.Context, conn net.Conn
 }
 
 // openDirectTCPIP 客户端侧发起 direct-tcpip 通道(目标四元组进 payload)。
+// OriginAddr 用哨兵 10.255.255.1(非客户端真实地址):配合桩侧
+// SrcIP==127.0.0.1 精确断言,杀死「来源误取 payload Origin」变异。
 func openDirectTCPIP(t *testing.T, conn gossh.Conn, addr string, port uint32) gossh.Channel {
 	t.Helper()
-	payload := gossh.Marshal(directTCPIPMsg{Addr: addr, Port: port, OriginAddr: "127.0.0.1", OriginPort: 0})
+	payload := gossh.Marshal(directTCPIPMsg{Addr: addr, Port: port, OriginAddr: "10.255.255.1", OriginPort: 0})
 	ch, _, err := conn.OpenChannel(channelDirectTCPIP, payload)
 	if err != nil {
 		t.Fatalf("direct-tcpip open: %v", err)

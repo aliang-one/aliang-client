@@ -25,9 +25,28 @@ type directTCPIPMsg struct {
 	OriginPort uint32
 }
 
-// sshIngressConnCounter 生成裸流注入的 ConnID 序号(sshing-<N>,
-// 镜像 inbound/tun 的 tun-<N> 口径)。
+// sshIngressConnCounter 生成注入的 ConnID 序号(sshing-<N>,
+// 镜像 inbound/tun 的 tun-<N> 口径;双形态共用同一计数命名空间)。
 var sshIngressConnCounter uint64
+
+// injectDirectTCPIP 是 direct-tcpip 通道的形态分流点(由 serveChannels 调用):
+// 认证层写入的 Permissions.Extensions[extIngressForm] 决定注入形态——
+// bare→形态① 裸流(payload 即目标四元组);mesh→形态② 帧外壳(帧头在
+// channel 数据流首行);未知形态保守 drain(认证层只标 bare/mesh,此为
+// 防御分支)。
+//
+// goroutine 边界:两形态注入同边界(不入 WaitGroup)——在途 Handle 靠
+// 连接级 ctx 取消+连接拆除有界退出,TestStopWithInflightChannel 钉住。
+func injectDirectTCPIP(ctx context.Context, ch gossh.Channel, connRemote net.Addr, form string, payload []byte, rc RunConfig) {
+	switch form {
+	case FormBare:
+		go injectBareStream(ctx, ch, connRemote, payload)
+	case FormMesh:
+		go injectMeshFrame(ctx, ch, connRemote, rc)
+	default:
+		go drainAndClose(ch)
+	}
+}
 
 // injectBareStream 是形态①(裸流)注入路径:解析 direct-tcpip payload →
 // 构造 M.Metadata → 喂 processor/tcp 统一管线(路由决策+双向中继)。

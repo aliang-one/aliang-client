@@ -296,9 +296,8 @@ func serveGlobalRequests(reqs <-chan *gossh.Request) {
 
 // serveChannels 是通道安全收敛白名单:仅 direct-tcpip 放行,其余
 // (session/auth-agent@openssh.com/x11/forwarded-tcpip 等)全拒。
-// 通道形态经认证 Permissions.Extensions["ingress_form"] 读取并分流:
-// bare→injectBareStream 注入 processor 管线(Task 4);mesh→Task 5 接,
-// 暂维持 drain+close(空形态等未知值保守同路)。
+// 通道形态经认证 Permissions.Extensions["ingress_form"] 读取,分流注入
+// 见 channel.go injectDirectTCPIP(bare→裸流;mesh→帧外壳;未知保守 drain)。
 func (s *Server) serveChannels(ctx context.Context, chans <-chan gossh.NewChannel, perms *gossh.Permissions, remote net.Addr) {
 	for newCh := range chans {
 		if newCh.ChannelType() != channelDirectTCPIP {
@@ -317,16 +316,9 @@ func (s *Server) serveChannels(ctx context.Context, chans <-chan gossh.NewChanne
 		}
 		logger.Debug(fmt.Sprintf("SSH ingress direct-tcpip accepted (form=%s)", form))
 		go gossh.DiscardRequests(chReqs)
-		switch form {
-		case FormBare:
-			// 形态①:解析 payload 构 Metadata 注入管线。goroutine 边界与
-			// drain 相同(不入 WaitGroup):在途 Handle 靠连接级 ctx 取消+
-			// 连接拆除有界退出,TestStopWithInflightChannel 钉住。
-			go injectBareStream(ctx, ch, remote, newCh.ExtraData())
-		default:
-			// 形态②(mesh 帧)Task 5 接;空形态等未知值保守同路。
-			go drainAndClose(ch)
-		}
+		// 形态分流注入在 channel.go(bare→裸流;mesh→帧外壳;未知保守
+		// drain);dispatcher 本身同步派发各形态的注入 goroutine。
+		injectDirectTCPIP(ctx, ch, remote, form, newCh.ExtraData(), s.rc)
 	}
 }
 
@@ -344,8 +336,8 @@ func (s *Server) observedForm() string {
 	return s.lastIngressForm
 }
 
-// drainAndClose 排空并关闭通道(裸流形态已由 injectBareStream 接管
-// (Task 4);此处仅剩 mesh 帧形态占位,Task 5 接)。
+// drainAndClose 排空并关闭通道(bare/mesh 两形态均由注入路径接管;
+// 此处仅剩未知形态的防御分支,见 channel.go injectDirectTCPIP)。
 func drainAndClose(ch gossh.Channel) {
 	_, _ = io.Copy(io.Discard, ch)
 	_ = ch.Close()
