@@ -7,7 +7,6 @@ import (
 
 	"aliang.one/nursorgate/common/model"
 	"aliang.one/nursorgate/processor/config"
-	"aliang.one/nursorgate/processor/match"
 )
 
 type SnapshotAction string
@@ -17,26 +16,6 @@ const (
 	SnapshotActionToAliang SnapshotAction = "toAliang"
 	SnapshotActionToSocks  SnapshotAction = "toSocks"
 	SnapshotActionDeny     SnapshotAction = "deny"
-)
-
-// SnapshotTargetMeshPrefix 是 mesh 转发目标在快照/canonical 规则上的前缀形态
-// (toNode:<deviceID>)。不并入 SnapshotAction 枚举——SnapshotAction 的四值
-// 枚举语义(direct/toAliang/toSocks/deny)保持不变, mesh 转发目标是带参数的
-// 目标(deviceID 内嵌在字符串里), 由决策层按前缀识别并整串透传
-// (RouteDecision 本就是 string 类型, 消费方为 mesh 出口转发层)。
-const SnapshotTargetMeshPrefix = "toNode:"
-
-// mesh 规则源尾段关键字(dns 条目不经 match.ClassifyEntry, 见 classifyEntryForCompile)。
-const meshTailPrefix = "mesh:"
-
-// snapshotRuleTypeDNS / snapshotDNSConditionAll: DNS 代转发规则(design §6 层1/
-// §9.3 规则驱动)。Condition 恒为 all(DNS 代转发消费侧语义);连接级决策一律
-// 不命中(见 decision_engine.checkRuleBySnapshot),代转发目标由 Task 8 扫快照
-// 规则取首条启用项(多 peer 无歧义: 首条命中)。仅存在于快照/canonical 规则层,
-// 不进 model.RuleType 枚举(legacy RoutingRuleSet 无此形态)。
-const (
-	snapshotRuleTypeDNS     = "dns"
-	snapshotDNSConditionAll = "all"
 )
 
 type SnapshotBranchCapabilities struct {
@@ -453,128 +432,4 @@ func resolveProxyRuleTarget(toSocksEnabled bool) SnapshotAction {
 		return SnapshotActionToSocks
 	}
 	return SnapshotActionDirect
-}
-
-// meshTailState 是 splitMeshTail 的三态结果。
-type meshTailState int
-
-const (
-	// meshTailNone 无 mesh: 段：非 mesh 条目，交回常规分类。
-	meshTailNone meshTailState = iota
-	// meshTailParsed 合法 mesh 尾：base 与 deviceID 可用。
-	meshTailParsed
-	// meshTailInvalid 含 mesh: 段但形态不可解析：整条静默跳过，
-	// 不得回落常规分类（防静默错编译，见 splitMeshTail 注释）。
-	meshTailInvalid
-)
-
-// splitMeshTail 剥离 mesh 转发尾段：任一逗号段以 mesh: 开头（大小写不敏感）
-// 即判定该条目为 mesh 语法，mesh: 段必须是末段且 deviceID/base 非空，
-// 返回剥尾后的 base 条目与 deviceID。
-// 必须在 match.ClassifyEntry 之前调用——ClassifyEntry 的 domains/ip-cidr 前缀
-// 分支会忽略多余尾段，兜底分支会把未知尾段当动作词噪声剥掉或按 host:port
-// 提取（"dns,mesh:dev-b" 甚至会被 SplitHostPort 吃成域名 "mesh"），两种路径
-// 都会吞掉 mesh 目标。
-// 失败策略（止血方案）：mesh: 段之后若还有任何段（含空段，如
-// "mesh:dev-b,direct" 或尾逗号）、deviceID 为空或 base 为空 → meshTailInvalid，
-// 整条静默跳过不编译——回落常规分类会把 "domains,x.com,mesh:dev-b,direct"
-// 静默错编译成普通代理规则（domains 前缀分支吞掉 mesh: 段）。
-// 多段尾（mesh:x,direct/deny/fallback:y）解析随 Task 7 落地，当前不认多段尾。
-func splitMeshTail(raw string) (base, meshDeviceID string, state meshTailState) {
-	parts := strings.Split(raw, ",")
-	meshIdx := -1
-	for i, part := range parts {
-		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(part)), meshTailPrefix) {
-			meshIdx = i
-			break
-		}
-	}
-	if meshIdx < 0 {
-		return raw, "", meshTailNone
-	}
-	if meshIdx != len(parts)-1 {
-		return "", "", meshTailInvalid
-	}
-	tail := strings.TrimSpace(parts[meshIdx])
-	deviceID := strings.TrimSpace(tail[len(meshTailPrefix):])
-	if deviceID == "" {
-		return "", "", meshTailInvalid
-	}
-	base = strings.TrimSpace(strings.Join(parts[:meshIdx], ","))
-	if base == "" {
-		return "", "", meshTailInvalid
-	}
-	return base, deviceID, meshTailParsed
-}
-
-// isDNSEntry 判断剥尾后的条目是否 DNS 关键字条目（dns，大小写不敏感）。
-func isDNSEntry(base string) bool {
-	return strings.EqualFold(strings.TrimSpace(base), "dns")
-}
-
-// meshForwardAvailable 编译期 mesh 能力检查：总开关 EffectiveEnabled 且
-// deviceID 存在于 customer.mesh.peers。不通过 → 条目静默跳过（与非法条目
-// 同款先例，见 appendRules）。
-// 不做 ≠self 检查（分层防御分工）：自指已在保存期由 Config.ValidateMesh
-// 拒绝（spec §3.4/§7 层0，config 层拿不到本机 device_id 故由提交路径显式调）；
-// 手改配置文件绕过保存校验的漏网自指，由转发层 path vector 兜底拒环。
-func meshForwardAvailable(cfg *config.Config, deviceID string) bool {
-	if cfg == nil || cfg.Customer == nil || cfg.Customer.Mesh == nil {
-		return false
-	}
-	mesh := cfg.Customer.Mesh
-	if !mesh.EffectiveEnabled() {
-		return false
-	}
-	for _, peer := range mesh.Peers {
-		if strings.TrimSpace(peer.DeviceID) == deviceID {
-			return true
-		}
-	}
-	return false
-}
-
-// classifyEntryForCompile 将原始规则条目编译为 (ruleType, condition, target)。
-// mesh 尾段先剥出再分类（meshTailInvalid 整条静默跳过，见 splitMeshTail）；
-// dns,mesh:<id> 不经 ClassifyEntry，直接构造恒真 DNS 代转发规则
-// （Condition=all，design §9.3 规则驱动；该规则不参与连接级决策，由
-// Task 8 的 meshDNSForwardTarget 扫快照规则取首条启用项）。
-// condition 为空 = 条目非法、mesh 形态不可解析或 mesh 能力不可用，调用方静默跳过。
-func classifyEntryForCompile(cfg *config.Config, raw string, fallbackTarget SnapshotAction) (ruleType, condition string, target SnapshotAction) {
-	base, meshDeviceID, state := splitMeshTail(raw)
-	if state == meshTailInvalid {
-		return "", "", ""
-	}
-	if state == meshTailParsed {
-		if !meshForwardAvailable(cfg, meshDeviceID) {
-			return "", "", ""
-		}
-		meshTarget := SnapshotAction(SnapshotTargetMeshPrefix + meshDeviceID)
-		if isDNSEntry(base) {
-			return snapshotRuleTypeDNS, snapshotDNSConditionAll, meshTarget
-		}
-		kind, cond, err := match.ClassifyEntry(base)
-		if err != nil || cond == "" {
-			return "", "", ""
-		}
-		return entryKindToRuleType(kind), cond, meshTarget
-	}
-
-	kind, cond, err := match.ClassifyEntry(raw)
-	if err != nil || cond == "" {
-		return "", "", ""
-	}
-	return entryKindToRuleType(kind), cond, fallbackTarget
-}
-
-// entryKindToRuleType 将共享内核 EntryKind 映射为 canonical 规则 Type 字符串。
-func entryKindToRuleType(kind match.EntryKind) string {
-	switch kind {
-	case match.EntryIP:
-		return string(model.RuleTypeIP)
-	case match.EntryGeoIP:
-		return string(model.RuleTypeGeoIP)
-	default:
-		return string(model.RuleTypeDomain)
-	}
 }
