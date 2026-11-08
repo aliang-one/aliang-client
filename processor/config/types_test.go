@@ -1382,3 +1382,328 @@ func TestSetGlobalConfigAppliesGeoIPDownloadURLOverride(t *testing.T) {
 		t.Fatalf("geoip.EffectiveDownloadURL() = %q, want default", got)
 	}
 }
+
+func TestEffectiveSSHProxy(t *testing.T) {
+	t.Run("URL 形态解析与字段透传", func(t *testing.T) {
+		cfg := &Config{Customer: &CustomerConfig{Proxy: &CustomerProxyConfig{
+			Type: "ssh", Server: "ssh://root:pw@1.2.3.4:2222",
+			PrivateKey: "-----BEGIN OPENSSH PRIVATE KEY-----\n...", PoolSize: 5,
+		}}}
+		got, err := cfg.EffectiveSSHProxy()
+		if err != nil {
+			t.Fatalf("EffectiveSSHProxy() error = %v", err)
+		}
+		if got == nil {
+			t.Fatal("EffectiveSSHProxy() = nil, want derived ssh config")
+		}
+		if got.Server != "1.2.3.4" || got.ServerPort != 2222 || got.Username != "root" || got.Password != "pw" || got.PoolSize != 5 {
+			t.Fatalf("EffectiveSSHProxy() = %#v, want 1.2.3.4:2222 root/pw pool 5", got)
+		}
+		if got.PrivateKey != "-----BEGIN OPENSSH PRIVATE KEY-----\n..." {
+			t.Fatalf("EffectiveSSHProxy() private key = %q, want passthrough", got.PrivateKey)
+		}
+	})
+
+	t.Run("非 URL 形态 host:port 也支持", func(t *testing.T) {
+		cfg := &Config{Customer: &CustomerConfig{Proxy: &CustomerProxyConfig{
+			Type: "ssh", Server: "1.2.3.4:2222", Username: "u", Password: "p",
+		}}}
+		got, err := cfg.EffectiveSSHProxy()
+		if err != nil {
+			t.Fatalf("EffectiveSSHProxy() error = %v", err)
+		}
+		if got.Server != "1.2.3.4" || got.ServerPort != 2222 || got.Username != "u" || got.Password != "p" {
+			t.Fatalf("EffectiveSSHProxy() = %#v, want 1.2.3.4:2222 u/p", got)
+		}
+	})
+
+	t.Run("URL scheme 非 ssh 报错", func(t *testing.T) {
+		cfg := &Config{Customer: &CustomerConfig{Proxy: &CustomerProxyConfig{
+			Type: "ssh", Server: "socks5://1.2.3.4:1080", Password: "p",
+		}}}
+		if _, err := cfg.EffectiveSSHProxy(); err == nil {
+			t.Fatal("EffectiveSSHProxy() error = nil, want scheme mismatch error")
+		}
+	})
+
+	t.Run("pool_size 解析层保持原值(0 即 0,默认 3 由 ssh.New 钳位)", func(t *testing.T) {
+		cfg := &Config{Customer: &CustomerConfig{Proxy: &CustomerProxyConfig{
+			Type: "ssh", Server: "1.2.3.4:22", Password: "p",
+		}}}
+		got, err := cfg.EffectiveSSHProxy()
+		if err != nil {
+			t.Fatalf("EffectiveSSHProxy() error = %v", err)
+		}
+		if got.PoolSize != 0 {
+			t.Fatalf("EffectiveSSHProxy() PoolSize = %d, want 0 (clamp lives in ssh.New)", got.PoolSize)
+		}
+	})
+
+	t.Run("跳板逐项解析并透传认证材料", func(t *testing.T) {
+		cfg := &Config{Customer: &CustomerConfig{Proxy: &CustomerProxyConfig{
+			Type: "ssh", Server: "1.2.3.4:22", Password: "p",
+			JumpServers: []SSHJumpServerRaw{
+				{Server: "ssh://hop1:hp1@10.0.0.1:2201", PrivateKey: "key1"},
+				{Server: "10.0.0.2:2202", Username: "hop2", Password: "hp2"},
+			},
+		}}}
+		got, err := cfg.EffectiveSSHProxy()
+		if err != nil {
+			t.Fatalf("EffectiveSSHProxy() error = %v", err)
+		}
+		if len(got.JumpServers) != 2 {
+			t.Fatalf("EffectiveSSHProxy() jumps = %d, want 2", len(got.JumpServers))
+		}
+		j0, j1 := got.JumpServers[0], got.JumpServers[1]
+		if j0.Server != "10.0.0.1" || j0.ServerPort != 2201 || j0.Username != "hop1" || j0.Password != "hp1" || j0.PrivateKey != "key1" {
+			t.Fatalf("jump[0] = %#v", j0)
+		}
+		if j1.Server != "10.0.0.2" || j1.ServerPort != 2202 || j1.Username != "hop2" || j1.Password != "hp2" {
+			t.Fatalf("jump[1] = %#v", j1)
+		}
+	})
+
+	t.Run("跳板 scheme 不匹配报错并带索引", func(t *testing.T) {
+		cfg := &Config{Customer: &CustomerConfig{Proxy: &CustomerProxyConfig{
+			Type: "ssh", Server: "1.2.3.4:22", Password: "p",
+			JumpServers: []SSHJumpServerRaw{{Server: "http://10.0.0.1:2201", Username: "hop", Password: "hp"}},
+		}}}
+		_, err := cfg.EffectiveSSHProxy()
+		if err == nil {
+			t.Fatal("EffectiveSSHProxy() error = nil, want jump scheme mismatch error")
+		}
+		if !strings.Contains(err.Error(), "jump_servers[0]") {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("非 ssh 类型与未启用返回 nil", func(t *testing.T) {
+		httpCfg := &Config{Customer: &CustomerConfig{Proxy: &CustomerProxyConfig{
+			Type: "http", Server: "127.0.0.1:8080",
+		}}}
+		if got, err := httpCfg.EffectiveSSHProxy(); err != nil || got != nil {
+			t.Fatalf("EffectiveSSHProxy() = %v, %v; want nil, nil for http type", got, err)
+		}
+		off := false
+		disabled := &Config{Customer: &CustomerConfig{Proxy: &CustomerProxyConfig{
+			Enable: &off, Type: "ssh", Server: "1.2.3.4:22", Password: "p",
+		}}}
+		if got, err := disabled.EffectiveSSHProxy(); err != nil || got != nil {
+			t.Fatalf("EffectiveSSHProxy() = %v, %v; want nil, nil when disabled", got, err)
+		}
+	})
+}
+
+func TestValidateCustomerEditableSurfaceSSH(t *testing.T) {
+	payload := []byte(`{
+		"core": {"api_server": "https://api.aliang.one"},
+		"customer": {
+			"proxy": {
+				"type": "ssh",
+				"server": "ssh://root:pw@1.2.3.4:2222"
+			}
+		}
+	}`)
+
+	var cfg Config
+	if err := json.Unmarshal(payload, &cfg); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	// type=ssh 必须过 editable surface:不放行则配置保存不进(spec §2 触点)。
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v, want nil for ssh", err)
+	}
+
+	ftpPayload := []byte(`{
+		"core": {"api_server": "https://api.aliang.one"},
+		"customer": {
+			"proxy": {
+				"type": "ftp",
+				"server": "1.2.3.4:21"
+			}
+		}
+	}`)
+	var ftpCfg Config
+	if err := json.Unmarshal(ftpPayload, &ftpCfg); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+	if err := ftpCfg.Validate(); err == nil {
+		t.Fatal("Validate() error = nil, want type whitelist rejection for ftp")
+	}
+}
+
+func TestConfigValidateSSHProxy(t *testing.T) {
+	t.Run("缺认证报错而非静默跳过", func(t *testing.T) {
+		payload := []byte(`{
+			"core": {"api_server": "https://api.aliang.one"},
+			"customer": {
+				"proxy": {
+					"type": "ssh",
+					"server": "1.2.3.4:2222"
+				}
+			}
+		}`)
+		var cfg Config
+		if err := json.Unmarshal(payload, &cfg); err != nil {
+			t.Fatalf("json.Unmarshal() error = %v", err)
+		}
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatal("Validate() error = nil, want missing auth error")
+		}
+		if !strings.Contains(err.Error(), "sshProxy") || !strings.Contains(err.Error(), "password or private_key") {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("合法配置通过并经 EffectiveCustomerProxy 路由", func(t *testing.T) {
+		payload := []byte(`{
+			"core": {"api_server": "https://api.aliang.one"},
+			"customer": {
+				"proxy": {
+					"type": "ssh",
+					"server": "1.2.3.4:2222",
+					"username": "root",
+					"password": "pw",
+					"pool_size": 5,
+					"jump_servers": [
+						{"server": "10.0.0.1:2201", "username": "hop", "password": "hp"}
+					]
+				}
+			}
+		}`)
+		var cfg Config
+		if err := json.Unmarshal(payload, &cfg); err != nil {
+			t.Fatalf("json.Unmarshal() error = %v", err)
+		}
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate() error = %v, want nil", err)
+		}
+		got, err := cfg.EffectiveCustomerProxy()
+		if err != nil {
+			t.Fatalf("EffectiveCustomerProxy() error = %v", err)
+		}
+		sshCfg, ok := got.(*SSHProxyConfig)
+		if !ok {
+			t.Fatalf("EffectiveCustomerProxy() = %T, want *SSHProxyConfig", got)
+		}
+		if sshCfg.Server != "1.2.3.4" || sshCfg.ServerPort != 2222 || sshCfg.PoolSize != 5 {
+			t.Fatalf("EffectiveCustomerProxy() = %#v", sshCfg)
+		}
+		if len(sshCfg.JumpServers) != 1 || sshCfg.JumpServers[0].Server != "10.0.0.1" || sshCfg.JumpServers[0].ServerPort != 2201 {
+			t.Fatalf("EffectiveCustomerProxy() jumps = %#v", sshCfg.JumpServers)
+		}
+	})
+}
+
+func TestSSHProxyConfigValidate(t *testing.T) {
+	tests := []struct {
+		name    string
+		config  *SSHProxyConfig
+		wantErr bool
+		errMsg  string
+	}{
+		{
+			name:    "valid with password",
+			config:  &SSHProxyConfig{Server: "1.2.3.4", ServerPort: 22, Username: "root", Password: "pw"},
+			wantErr: false,
+		},
+		{
+			name:    "valid with private key only",
+			config:  &SSHProxyConfig{Server: "1.2.3.4", ServerPort: 22, PrivateKey: "key"},
+			wantErr: false,
+		},
+		{
+			name:    "missing server_host",
+			config:  &SSHProxyConfig{ServerPort: 22, Password: "pw"},
+			wantErr: true,
+			errMsg:  "server_host is required",
+		},
+		{
+			name:    "missing server_port",
+			config:  &SSHProxyConfig{Server: "1.2.3.4", Password: "pw"},
+			wantErr: true,
+			errMsg:  "server_port is required",
+		},
+		{
+			name:    "missing auth",
+			config:  &SSHProxyConfig{Server: "1.2.3.4", ServerPort: 22, Username: "root"},
+			wantErr: true,
+			errMsg:  "ssh proxy requires password or private_key",
+		},
+		{
+			name: "valid with jump",
+			config: &SSHProxyConfig{
+				Server: "1.2.3.4", ServerPort: 22, Password: "pw",
+				JumpServers: []SSHJumpServer{{Server: "10.0.0.1", ServerPort: 2201, Username: "hop", Password: "hp"}},
+			},
+			wantErr: false,
+		},
+		{
+			name: "jump missing server and port",
+			config: &SSHProxyConfig{
+				Server: "1.2.3.4", ServerPort: 22, Password: "pw",
+				JumpServers: []SSHJumpServer{{Username: "hop", Password: "hp"}},
+			},
+			wantErr: true,
+			errMsg:  "jump_servers[0] requires server_host and server_port",
+		},
+		{
+			name: "jump missing username",
+			config: &SSHProxyConfig{
+				Server: "1.2.3.4", ServerPort: 22, Password: "pw",
+				JumpServers: []SSHJumpServer{{Server: "10.0.0.1", ServerPort: 2201, Password: "hp"}},
+			},
+			wantErr: true,
+			errMsg:  "jump_servers[0] requires username",
+		},
+		{
+			name: "jump missing auth",
+			config: &SSHProxyConfig{
+				Server: "1.2.3.4", ServerPort: 22, Password: "pw",
+				JumpServers: []SSHJumpServer{{Server: "10.0.0.1", ServerPort: 2201, Username: "hop"}},
+			},
+			wantErr: true,
+			errMsg:  "jump_servers[0] requires password or private_key",
+		},
+		{
+			name: "jump index reported",
+			config: &SSHProxyConfig{
+				Server: "1.2.3.4", ServerPort: 22, Password: "pw",
+				JumpServers: []SSHJumpServer{
+					{Server: "10.0.0.1", ServerPort: 2201, Username: "hop", Password: "hp"},
+					{Server: "10.0.0.2", ServerPort: 2202, Username: "hop2"},
+				},
+			},
+			wantErr: true,
+			errMsg:  "jump_servers[1] requires password or private_key",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.config.Validate()
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Validate() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if err != nil && tt.errMsg != "" && err.Error() != tt.errMsg {
+				t.Errorf("Validate() error message = %v, want %v", err.Error(), tt.errMsg)
+			}
+		})
+	}
+}
+
+func TestValidateCustomerProxySchemeSSH(t *testing.T) {
+	if err := validateCustomerProxyScheme("ssh", "ssh"); err != nil {
+		t.Fatalf("validateCustomerProxyScheme(ssh, ssh) = %v, want nil", err)
+	}
+	if err := validateCustomerProxyScheme("ssh", "SSH"); err != nil {
+		t.Fatalf("validateCustomerProxyScheme(ssh, SSH) = %v, want nil (case-insensitive)", err)
+	}
+	for _, scheme := range []string{"socks5", "socks", "http"} {
+		if err := validateCustomerProxyScheme("ssh", scheme); err == nil {
+			t.Fatalf("validateCustomerProxyScheme(ssh, %s) = nil, want mismatch error", scheme)
+		}
+	}
+}

@@ -93,6 +93,54 @@ func (c *HTTPProxyConfig) Validate() error {
 	return nil
 }
 
+// SSHProxyConfig represents SSH outbound configuration.
+type SSHProxyConfig struct {
+	Server        string          `json:"server_host"`
+	ServerPort    uint16          `json:"server_port"`
+	Username      string          `json:"username,omitempty"`
+	Password      string          `json:"password,omitempty"`
+	PrivateKey    string          `json:"private_key,omitempty"`
+	KeyPassphrase string          `json:"key_passphrase,omitempty"`
+	PoolSize      int             `json:"pool_size,omitempty"`
+	JumpServers   []SSHJumpServer `json:"jump_servers,omitempty"`
+}
+
+// SSHJumpServer 表示一跳跳板(ProxyJump 链上按序穿透的一个节点)。
+type SSHJumpServer struct {
+	Server        string `json:"server_host"`
+	ServerPort    uint16 `json:"server_port"`
+	Username      string `json:"username,omitempty"`
+	Password      string `json:"password,omitempty"`
+	PrivateKey    string `json:"private_key,omitempty"`
+	KeyPassphrase string `json:"key_passphrase,omitempty"`
+}
+
+// Validate validates SSH proxy configuration.
+func (c *SSHProxyConfig) Validate() error {
+	if c.Server == "" {
+		return fmt.Errorf("server_host is required")
+	}
+	if c.ServerPort == 0 {
+		return fmt.Errorf("server_port is required")
+	}
+	if c.Password == "" && c.PrivateKey == "" {
+		return fmt.Errorf("ssh proxy requires password or private_key")
+	}
+	for i := range c.JumpServers {
+		jump := &c.JumpServers[i]
+		if jump.Server == "" || jump.ServerPort == 0 {
+			return fmt.Errorf("jump_servers[%d] requires server_host and server_port", i)
+		}
+		if jump.Username == "" {
+			return fmt.Errorf("jump_servers[%d] requires username", i)
+		}
+		if jump.Password == "" && jump.PrivateKey == "" {
+			return fmt.Errorf("jump_servers[%d] requires password or private_key", i)
+		}
+	}
+	return nil
+}
+
 // ShadowTLSPluginOpts represents ShadowTLS plugin configuration
 type ShadowTLSPluginOpts struct {
 	Host     string `json:"host"`     // TLS camouflage domain (e.g., www.bing.com)
@@ -771,11 +819,28 @@ type AliangServerConfig struct {
 }
 
 type CustomerProxyConfig struct {
-	Enable   *bool  `json:"enable,omitempty"`
-	Type     string `json:"type"`
-	Server   string `json:"server,omitempty"`
-	Username string `json:"username,omitempty"`
-	Password string `json:"password,omitempty"`
+	Enable        *bool              `json:"enable,omitempty"`
+	Type          string             `json:"type"`
+	Server        string             `json:"server,omitempty"`
+	Username      string             `json:"username,omitempty"`
+	Password      string             `json:"password,omitempty"`
+	PrivateKey    string             `json:"private_key,omitempty"`
+	KeyPassphrase string             `json:"key_passphrase,omitempty"`
+	PoolSize      int                `json:"pool_size,omitempty"`
+	JumpServers   []SSHJumpServerRaw `json:"jump_servers,omitempty"`
+}
+
+// SSHJumpServerRaw 是 customer.proxy.jump_servers 的原始(未解析)形态:
+// server 允许 ssh://user:pass@host:port URL 形态或 host:port 裸形态,
+// EffectiveSSHProxy 统一解析成 SSHJumpServer(裸/解析分型,与
+// CustomerProxyConfig vs SSHProxyConfig 的分层同构——裸形态 server 是一个
+// 串,解析形态是 host+port 拆分,共用一型会让同一字段承载两种语义)。
+type SSHJumpServerRaw struct {
+	Server        string `json:"server,omitempty"`
+	Username      string `json:"username,omitempty"`
+	Password      string `json:"password,omitempty"`
+	PrivateKey    string `json:"private_key,omitempty"`
+	KeyPassphrase string `json:"key_passphrase,omitempty"`
 }
 
 func (c *CustomerProxyConfig) IsEnabled() bool {
@@ -993,6 +1058,10 @@ func (c *Config) Validate() error {
 			if err := typedProxy.Validate(); err != nil {
 				return fmt.Errorf("invalid httpProxy configuration: %w", err)
 			}
+		case *SSHProxyConfig:
+			if err := typedProxy.Validate(); err != nil {
+				return fmt.Errorf("invalid sshProxy configuration: %w", err)
+			}
 		}
 	}
 
@@ -1044,9 +1113,9 @@ func (c *Config) validateCustomerEditableSurface() error {
 
 	if c.Customer.Proxy != nil {
 		switch c.Customer.Proxy.Type {
-		case "http", "socks5":
+		case "http", "socks5", "ssh":
 		default:
-			return fmt.Errorf("customer.proxy.type must be one of [http socks5], got %q", c.Customer.Proxy.Type)
+			return fmt.Errorf("customer.proxy.type must be one of [http socks5 ssh], got %q", c.Customer.Proxy.Type)
 		}
 	}
 
@@ -1254,6 +1323,10 @@ func validateCustomerProxyScheme(proxyType, scheme string) error {
 		if normalizedScheme != "socks5" && normalizedScheme != "socks" {
 			return fmt.Errorf("customer.proxy.server scheme %q does not match proxy type %q", scheme, proxyType)
 		}
+	case "ssh":
+		if normalizedScheme != "ssh" {
+			return fmt.Errorf("customer.proxy.server scheme %q does not match proxy type %q", scheme, proxyType)
+		}
 	}
 
 	return nil
@@ -1353,6 +1426,64 @@ func (c *Config) EffectiveHTTPProxy() (*HTTPProxyConfig, error) {
 	}, nil
 }
 
+// EffectiveSSHProxy derives the SSH outbound config from customer.proxy.
+// pool_size 解析层保持原值(0 即 0):默认 3 与 1..16 钳位由 ssh.New 承担
+// (registry 契约)——解析层不偷偷改值,保证配置回显与用户输入一致。
+func (c *Config) EffectiveSSHProxy() (*SSHProxyConfig, error) {
+	if c == nil || c.Customer == nil || c.Customer.Proxy == nil {
+		return nil, nil
+	}
+	if !c.Customer.Proxy.IsEnabled() {
+		return nil, nil
+	}
+	if strings.ToLower(strings.TrimSpace(c.Customer.Proxy.Type)) != "ssh" {
+		return nil, nil
+	}
+
+	raw := c.Customer.Proxy
+	serverHost, serverPort, username, password, err := parseCustomerProxyServer(
+		"ssh",
+		raw.Server,
+		raw.Username,
+		raw.Password,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("customer.proxy.server: %w", err)
+	}
+
+	jumps := make([]SSHJumpServer, 0, len(raw.JumpServers))
+	for i, rawJump := range raw.JumpServers {
+		jumpHost, jumpPort, jumpUser, jumpPass, err := parseCustomerProxyServer(
+			"ssh",
+			rawJump.Server,
+			rawJump.Username,
+			rawJump.Password,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("customer.proxy.jump_servers[%d].server: %w", i, err)
+		}
+		jumps = append(jumps, SSHJumpServer{
+			Server:        jumpHost,
+			ServerPort:    jumpPort,
+			Username:      jumpUser,
+			Password:      jumpPass,
+			PrivateKey:    rawJump.PrivateKey,
+			KeyPassphrase: rawJump.KeyPassphrase,
+		})
+	}
+
+	return &SSHProxyConfig{
+		Server:        serverHost,
+		ServerPort:    serverPort,
+		Username:      username,
+		Password:      password,
+		PrivateKey:    raw.PrivateKey,
+		KeyPassphrase: raw.KeyPassphrase,
+		PoolSize:      raw.PoolSize,
+		JumpServers:   jumps,
+	}, nil
+}
+
 func (c *Config) EffectiveCustomerProxy() (interface{}, error) {
 	if c == nil || c.Customer == nil || c.Customer.Proxy == nil {
 		return nil, nil
@@ -1366,6 +1497,8 @@ func (c *Config) EffectiveCustomerProxy() (interface{}, error) {
 		return c.EffectiveSocksProxy()
 	case "http":
 		return c.EffectiveHTTPProxy()
+	case "ssh":
+		return c.EffectiveSSHProxy()
 	default:
 		return nil, nil
 	}

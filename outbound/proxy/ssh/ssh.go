@@ -31,7 +31,6 @@ var errSSHClosed = errors.New("ssh outbound closed")
 type SSH struct {
 	*proxy.Base
 
-	hosts  *KnownHosts
 	pool   *pool
 	closed atomic.Bool
 }
@@ -71,8 +70,7 @@ func New(final NodeConfig, poolSize int, jumps []NodeConfig, hostsDir string) (*
 
 	d := newChainDialer(final, jumps, hosts)
 	s := &SSH{
-		Base:  &proxy.Base{Address: final.hostPort(), Protocol: proto.SSH},
-		hosts: hosts,
+		Base: &proxy.Base{Address: final.hostPort(), Protocol: proto.SSH},
 	}
 	s.pool = newPool(poolSize, func(int) func(ctx context.Context) (*cascadeClient, error) {
 		return d.dialChain
@@ -146,7 +144,9 @@ func (channelAddr) String() string  { return "ssh-channel" }
 // 幂等——双 Close 只归还一次,否则会把同链其他在途通道的计数也吃掉,
 // 永久偏置最少活跃选链;重复 Close 返回首次结果。
 // deadline 为 no-op:SSH 通道无 deadline 语义,返回 nil 让调用方的良性
-// 设置不失败(与 sshtest.chanConn 同口径)。
+// 设置不失败(与 sshtest.chanConn 同口径)。relayStream 依赖
+// SetReadDeadline 的「半关闭后不无限等」保护对此出口静默失效,
+// 见 spec 已知限制节(docs/superpowers/specs/2026-11-07-ssh-proxy-design.md)。
 type trackedChannel struct {
 	gossh.Channel
 	c        *chain

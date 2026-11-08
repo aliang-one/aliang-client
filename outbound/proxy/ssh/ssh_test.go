@@ -3,6 +3,7 @@ package ssh
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"path/filepath"
@@ -46,6 +47,9 @@ func splitHostPort(addr string) (string, uint16, error) {
 	port, err := strconv.Atoi(portStr)
 	if err != nil {
 		return "", 0, err
+	}
+	if port < 1 || port > 65535 {
+		return "", 0, fmt.Errorf("port %d out of range 1-65535", port)
 	}
 	return host, uint16(port), nil
 }
