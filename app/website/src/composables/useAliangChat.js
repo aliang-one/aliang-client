@@ -9,6 +9,56 @@ import { uploadChatAttachment } from '../services/agentApi';
 // 附件缩略图/原图 URL（spec 2026-11-05-chat-image-pipeline §3.6）：ref 来自
 // journal/wire 行，一律走本机 agent 回环端点取图（COS/预签名 URL 永不出现在
 // 前端）。组件直接 import 本模块级纯函数。
+// --- 设备会话详情装载参数（journal 分页拉全）---
+// create 时的 transcript 喂入是续聊上下文的全部来源（载荷自带历史时后端
+// 跳过 journal 读回），默认 limit=40 的截断尾巴会让续聊静默丢早期上下文——
+// 必须拉全。单页 100 行、最多 5 页（500 行封顶）：防异常服务端拖死打开流程；
+// 超出封顶接受截断，仍远好于 40 行尾巴。
+const DEVICE_DETAIL_PAGE_LIMIT = 100;
+const DEVICE_DETAIL_MAX_PAGES = 5;
+
+// 详情分页拉全（导出纯函数）：openDeviceSession 与草稿↔journal 对账
+// （reconcileDraftWithJournal）同源实现——翻页方向「向更早」（before = 上一页
+// 最旧行的 message_id），每页新行前插保持时间正序；中途页失败降级为已取到
+// 的部分转录（pageError 带回，调用方留痕）；空页即停防异常服务端死循环；
+// maxPages 封顶接受截断。fetchDetail 注入（生产=getAgentSessionDetail，测试=mock）。
+export async function fetchFullJournalTranscript(id, fetchDetail, { limit = DEVICE_DETAIL_PAGE_LIMIT, maxPages = DEVICE_DETAIL_MAX_PAGES } = {}) {
+  const pageRows = [];
+  let before = '';
+  let pageError = null;
+  let lastDetail = null;
+  for (let page = 0; page < maxPages; page++) {
+    try {
+      const detail = await fetchDetail(id, { limit, before: before || undefined });
+      const rows = Array.isArray(detail?.transcript) ? detail.transcript : [];
+      pageRows.unshift(rows);
+      lastDetail = detail;
+      const pg = detail?.transcript_page;
+      if (!pg?.has_more || !pg?.next_before_message_id || !rows.length) break;
+      before = String(pg.next_before_message_id);
+    } catch (err) {
+      pageError = err;
+      break;
+    }
+  }
+  return { transcript: pageRows.flat(), lastDetail, pageError };
+}
+
+// 草稿↔journal 对账判定（导出纯函数）：本地会话对象只有在「发过消息
+// （aiSessionId 存在）+ journal 清单有同 id 会话 + 非 running（流式气泡
+// 保护）+ TTL 外」时才需要以 journal 重建历史。running 中跳过——重建会把
+// 流式中的气泡换成 journal 块级快照；run 终态由既有快照对账接管。
+export function draftNeedsJournalReconcile(conv, journalSessions) {
+  if (!conv || conv.running) return false;
+  if (!conv.aiSessionId) return false;
+  if (!Array.isArray(journalSessions) || !journalSessions.some(s => s && s.id === conv.aiSessionId)) return false;
+  if (Date.now() - (conv.deviceLoadedAt || 0) <= DEVICE_SESSION_DETAIL_TTL_MS) return false;
+  return true;
+}
+
+// 对账 TTL 复用 openDeviceSession 语义，re-export 供调用方/测试单一来源。
+export { DEVICE_SESSION_DETAIL_TTL_MS };
+
 export function chatAttachmentUrl(refId) {
   if (!refId) return '';
   return '/api/agent/ai/attachment?ref=' + encodeURIComponent(refId);
@@ -881,6 +931,10 @@ export function useAliangChat() {
     // 待终态回取快照标记）同为瞬态：跨页无意义，重进页 resubscribe 重建。
     delete copy.snapshotCatchupAt;
     delete copy.recoveredRun;
+    // deviceLoadedAt（journal 详情装载时刻）：瞬态——跨页重开必须重新对账
+    // （草稿↔journal reconcile 与设备壳装载共用此 TTL 键），持久化它会让
+    // 重进页 5 分钟内跳过重建、继续展示过时的本地拼接稿。
+    delete copy.deviceLoadedAt;
     // deviceTranscript 不落盘（评审折叠项）：重开设备会话有 5 分钟 TTL+详情
     // 分页重拉兜底，防大转录长期占 localStorage。
     delete copy.deviceTranscript;
@@ -918,13 +972,31 @@ export function useAliangChat() {
   }
 
   // 侧栏点击分流：设备会话壳 → openDeviceSession（转录装载+订阅）；本地草稿
-  // → 原 selectConversation。
+  // → journal 对账（若后端有同 id 会话）+ 原 selectConversation。
   function onSidebarItemClick(c) {
     if (c?.deviceSession) {
       openDeviceSession(c);
       return;
     }
+    reconcileDraftWithJournal(c);
     selectConversation(c.id);
+  }
+
+  // 草稿↔journal 对账（2026-11-08 vm459 事故）：本地会话对象的 messages 是
+  // 本端视图——手机端续聊的提问、附件、分回合回答都不会回流本端，旧拼接稿
+  // 会永远遮蔽权威数据（该会话又因侧栏去重「草稿优先」拿不到 openDeviceSession
+  // 的 journal 装载路径）。打开时命中同 id journal 会话即以 journal 全量重建
+  // 历史（分页拉全同 openDeviceSession；身份字段/provider/审批配置不动，
+  // running 中跳过——流式气泡保护，run 终态由既有快照对账接管）。TTL 语义
+  // 与设备壳一致：deviceLoadedAt 是瞬态（conversationForStorage 剥离），
+  // 跨页重开必重建。
+  async function reconcileDraftWithJournal(conv) {
+    if (!draftNeedsJournalReconcile(conv, deviceSessions.value)) return;
+    const { transcript } = await fetchFullJournalTranscript(conv.aiSessionId, getAgentSessionDetail);
+    if (!transcript.length) return;
+    applyDeviceTranscript(conv, transcript);
+    conv.deviceLoadedAt = now();
+    saveToStorage();
   }
 
   function selectConversation(id) {
@@ -1128,34 +1200,10 @@ export function useAliangChat() {
     // 详情装载：5 分钟内重复打开不重拉（之后的更新由快照覆盖**展示流**，
     // deviceTranscript 喂入流仍以这里的分页全量为准——见 applyDeviceSnapshotTranscript）
     if (Date.now() - (live.deviceLoadedAt || 0) > DEVICE_SESSION_DETAIL_TTL_MS) {
-      // 翻页方向是「向更早」（before = 上一页最旧行的 message_id）：每页新行
-      // 前插，最终保持时间正序。中途页失败降级为已取到的部分转录（console
-      // 留痕，不亮错误条）；首页失败维持既有「空转录+错误条」。
-      const pageRows = [];
-      let before = '';
-      let pageError = null;
-      let lastDetail = null; // 最后一页响应（subagents 是会话级字段，历史装配以此为准）
-      for (let page = 0; page < DEVICE_DETAIL_MAX_PAGES; page++) {
-        try {
-          const detail = await getAgentSessionDetail(entry.id, {
-            limit: DEVICE_DETAIL_PAGE_LIMIT,
-            before: before || undefined,
-          });
-          const rows = Array.isArray(detail?.transcript) ? detail.transcript : [];
-          pageRows.unshift(rows);
-          lastDetail = detail;
-          live.deviceLoadedAt = now();
-          live.deviceLoadError = '';
-          const pg = detail?.transcript_page;
-          if (!pg?.has_more || !pg?.next_before_message_id || !rows.length) break;
-          before = String(pg.next_before_message_id);
-        } catch (err) {
-          pageError = err;
-          break;
-        }
-      }
-      const transcript = pageRows.flat();
+      const { transcript, lastDetail, pageError } = await fetchFullJournalTranscript(entry.id, getAgentSessionDetail);
       if (transcript.length) {
+        live.deviceLoadedAt = now();
+        live.deviceLoadError = '';
         if (pageError) console.warn('[aliang-chat] device transcript partial pages', pageError);
         applyDeviceTranscript(live, transcript);
       } else if (pageError) {
