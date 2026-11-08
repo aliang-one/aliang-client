@@ -13,6 +13,7 @@ import (
 
 	M "aliang.one/nursorgate/inbound/tun/metadata"
 	"aliang.one/nursorgate/outbound/meshproto"
+	"aliang.one/nursorgate/processor/config"
 )
 
 // fakePeer 模拟 B 侧:接受一条连接,读出首行 JSON 帧头送回测试,之后对
@@ -189,11 +190,11 @@ func TestDialContextRelayCarrierDeniedForCustomClass(t *testing.T) {
 	}
 }
 
-// TestAppendHopInvokedBeforeSend 链头帧头语义(YAGNI 简化):链头不做中间跳
-// AppendHop(那是 Task 6 relay 的事),断言帧头 Via=[SelfID]、Hops 由 0 起。
-// 经中继载体(fake PikoDial)发送,顺带覆盖中继载体路径 + 端点命名
-// <DeviceID>.mesh + AI 默认推断(56432 回环)+ ConnID 透传。
-func TestAppendHopInvokedBeforeSend(t *testing.T) {
+// TestRelayCarrierHeadHeaderAndEndpointNaming 链头帧头语义(YAGNI 简化):
+// 链头不做中间跳 AppendHop(那是 Task 6 relay 的事),断言帧头 Via=[SelfID]、
+// Hops 由 0 起。经中继载体(fake PikoDial)发送,顺带覆盖中继载体路径 +
+// 端点命名 <DeviceID>.mesh + AI 默认推断(56432 回环)+ ConnID 透传。
+func TestRelayCarrierHeadHeaderAndEndpointNaming(t *testing.T) {
 	fp := startFakePeer(t)
 	peer := NewPeer(PeerTarget{
 		DeviceID: "dev-b",
@@ -313,11 +314,88 @@ func TestTargetFromMetadata(t *testing.T) {
 		{"HostName 空回落 DstIP", &M.Metadata{DstIP: netip.MustParseAddr("192.168.1.2"), DstPort: 80}, "192.168.1.2:80"},
 		{"IPv6 补括号", &M.Metadata{HostName: "2001:db8::1", DstPort: 443}, "[2001:db8::1]:443"},
 		{"IPv6 已带括号端口直用", &M.Metadata{HostName: "[2001:db8::1]:8443", DstPort: 443}, "[2001:db8::1]:8443"},
+		{"dns 目标原样透传", &M.Metadata{HostName: "dns:"}, meshproto.DNSTarget},
+		{"dns 目标透传忽略端口", &M.Metadata{HostName: "dns:", DstPort: 53}, meshproto.DNSTarget},
 		{"nil", nil, ""},
 	}
 	for _, tc := range cases {
 		if got := targetFromMetadata(tc.md); got != tc.want {
 			t.Fatalf("%s: target = %q, want %q", tc.name, got, tc.want)
 		}
+	}
+}
+
+// TestDialContextLANTriesInOrder LAN 载体顺序尝试:第一地址不可达换第二个,
+// 帧头最终到达 fake peer。
+func TestDialContextLANTriesInOrder(t *testing.T) {
+	fp := startFakePeer(t)
+	peer := NewPeer(PeerTarget{
+		DeviceID: "dev-b",
+		LANAddrs: []string{closedPortAddr(t), fp.ln.Addr().String()},
+		SelfID:   "dev-a",
+	})
+
+	conn, err := peer.DialContext(context.Background(), &M.Metadata{HostName: "example.com", DstPort: 443})
+	if err != nil {
+		t.Fatalf("DialContext: %v", err)
+	}
+	defer conn.Close()
+
+	hdr := waitHeader(t, fp)
+	if hdr.From != "dev-a" || hdr.Target != "example.com:443" {
+		t.Fatalf("header = %+v, want from dev-a target example.com:443", hdr)
+	}
+}
+
+// TestDialContextHeaderBuildFailFast 帧头预编码 fail-fast:空 metadata
+// (无 HostName/DstIP)在拨任何载体前报错,错误含 build header。
+func TestDialContextHeaderBuildFailFast(t *testing.T) {
+	peer := NewPeer(PeerTarget{
+		DeviceID: "dev-b",
+		LANAddrs: []string{"127.0.0.1:1"}, // 不应被拨
+		SelfID:   "dev-a",
+	})
+	_, err := peer.DialContext(context.Background(), &M.Metadata{})
+	if err == nil {
+		t.Fatal("空 metadata 应在帧头编码处失败")
+	}
+	if !strings.Contains(err.Error(), "build header") {
+		t.Fatalf("错误应含 build header, got: %v", err)
+	}
+}
+
+// TestRelayFailureIncludesLANError 中继失败分支保留 LAN 失败因果链:
+// LAN 全败 + 中继拨号也失败时,错误同时携带两段(lan_last_err)。
+func TestRelayFailureIncludesLANError(t *testing.T) {
+	peer := NewPeer(PeerTarget{
+		DeviceID: "dev-b",
+		LANAddrs: []string{closedPortAddr(t)},
+		Relay:    true,
+		PikoDial: func(ctx context.Context, endpointID string) (net.Conn, error) {
+			return nil, fmt.Errorf("endpoint not allowlisted")
+		},
+		SelfID: "dev-a",
+	})
+
+	ctx := WithClass(context.Background(), meshproto.ClassSelf)
+	_, err := peer.DialContext(ctx, &M.Metadata{HostName: "example.com", DstPort: 443})
+	if err == nil {
+		t.Fatal("LAN 与中继双失败应报错")
+	}
+	if !strings.Contains(err.Error(), "endpoint not allowlisted") {
+		t.Fatalf("错误应含中继失败原因, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "lan_last_err") {
+		t.Fatalf("错误应附 lan_last_err 保留 LAN 失败因果链, got: %v", err)
+	}
+}
+
+// TestAIProxyPortSyncAnchor 锚定本地 aiProxyPort 与 processor/config 的
+// DefaultHTTPProxyPort 同值(test-only import 无环已实测;两处判据须同步改,
+// 见 mesh.go looksLikeAITraffic 注释)。
+func TestAIProxyPortSyncAnchor(t *testing.T) {
+	if aiProxyPort != config.DefaultHTTPProxyPort {
+		t.Fatalf("aiProxyPort = %d, want %d (config.DefaultHTTPProxyPort)——两处判据失同步",
+			aiProxyPort, config.DefaultHTTPProxyPort)
 	}
 }

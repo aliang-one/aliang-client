@@ -80,6 +80,8 @@ func NewPeer(target PeerTarget) *Peer {
 // 回源(design §3.3:mesh 层失败一律错误回源,仅由链头的规则失败策略执行
 // 后续,本出口不吞不回落)。首行 JSON 帧头(design §3.1/§3.2)由链头写入:
 // Via=[From]、Hops 由 0 起;中间跳 AppendHop 属 relay 侧语义(Task 6)。
+// Task 8 的 DNS 代转发复用本出口:target=dns: 原样透传(见 targetFromMetadata),
+// B 侧按 meshproto.IsDNSTarget 识别并代解析。
 func (p *Peer) DialContext(ctx context.Context, md *M.Metadata) (net.Conn, error) {
 	class := classFromContext(ctx, md)
 	hdr := &meshproto.Header{
@@ -125,6 +127,12 @@ func (p *Peer) DialContext(ctx context.Context, md *M.Metadata) (net.Conn, error
 		endpointID := p.target.DeviceID + meshRelayEndpointSuffix
 		conn, err := p.target.PikoDial(ctx, endpointID)
 		if err != nil {
+			if lastErr != nil {
+				// 保留「LAN 全败 → 中继也不可用」因果链:两段失败同报,
+				// 便于链头失败策略与排障定位(如 LAN refused + 端点未放行)。
+				return nil, fmt.Errorf("mesh: relay carrier to %s (%s) failed: %w (lan_last_err: %v)",
+					p.target.DeviceID, endpointID, err, lastErr)
+			}
 			return nil, fmt.Errorf("mesh: relay carrier to %s (%s) failed: %w", p.target.DeviceID, endpointID, err)
 		}
 		if err := writeHeader(conn, line); err != nil {
@@ -211,15 +219,17 @@ func ConnIDFromContext(ctx context.Context) string {
 	return v
 }
 
-// aiProxyPort 与 processor/config.DefaultHTTPProxyPort(56432)同值。本地
-// 常量避免数据面拨号路径反向依赖 processor 配置包(processor/tcp import 了
-// outbound,判据口径见 looksLikeAITraffic)。
+// aiProxyPort 与 processor/config.DefaultHTTPProxyPort(56432)同值,由
+// mesh_test.go 的 TestAIProxyPortSyncAnchor 锚定。本地常量的真实理由是
+// 数据面拨号路径不引入 processor 配置依赖子树(processor/config 的闭包
+// 含 geoip/match/cache 等,与成环无关——config 不依赖 outbound/proxy,
+// test-only import 已实测无环);判据口径见 looksLikeAITraffic。
 const aiProxyPort = 56432
 
 // looksLikeAITraffic AI 流量判据,与 processor/tcp/route_override.go 的
 // shouldForceAliangRoute 同源口径:DstPort==56432 且目标回环(直连回环 IP,
-// 或 HostName 为 localhost/回环字面量)。processor/tcp import 了 outbound,
-// 反向 import 会成环,故在此包一份本地实现——两处判据须同步修改。
+// 或 HostName 为 localhost/回环字面量)。本地实现而非 import 的理由见
+// aiProxyPort 注释(数据面依赖最小化)——两处判据须同步修改。
 func looksLikeAITraffic(md *M.Metadata) bool {
 	if md == nil || md.DstPort != aiProxyPort {
 		return false
@@ -244,11 +254,17 @@ func looksLikeAITraffic(md *M.Metadata) bool {
 // 语义,B 侧免解析),空则回落 DstIP;已带端口的 HostName 直用,其余
 // JoinHostPort,DstPort 零值按 443 兜底——与 meshproto.SplitTarget 的拆分
 // 口径互逆(拆分侧的裸域名 443 兜底由 B 侧消费,Task 6)。
+// Task 8 的 DNS 代转发复用本出口:target=dns: 原样透传(HostName="dns:",
+// 不拼端口),B 侧按 meshproto.IsDNSTarget 识别代解析。
 func targetFromMetadata(md *M.Metadata) string {
 	if md == nil {
 		return ""
 	}
 	host := strings.TrimSpace(md.HostName)
+	if meshproto.IsDNSTarget(host) {
+		// dns: 特殊目标原样透传:落入下方 JoinHostPort 会被拼成 "[dns:]:53"。
+		return meshproto.DNSTarget
+	}
 	if host == "" {
 		if !md.DstIP.IsValid() {
 			return ""
