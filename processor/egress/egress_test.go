@@ -477,7 +477,7 @@ func TestPlatformClientDoubleFailureErrorChain(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // direct 轨道必败(context.Canceled)
-	_, err := PlatformClient(5 * time.Second).Transport.(*http.Transport).
+	_, err := PlatformClient(5*time.Second).Transport.(*http.Transport).
 		DialContext(ctx, "tcp", "platform.test:443")
 	if err == nil {
 		t.Fatal("双败应返回错误")
