@@ -94,3 +94,6 @@ app/http/services/agent/
 
 # local test build
 aliang-rename-test
+
+# 脑暴可视化伴侣的临时画布与交互事件
+.superpowers/
