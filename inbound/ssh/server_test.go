@@ -357,7 +357,9 @@ func TestAuthMeshKeyMarksMeshForm(t *testing.T) {
 	if _, _, err := conn.OpenChannel(channelDirectTCPIP, payload); err != nil {
 		t.Fatalf("direct-tcpip open: %v", err)
 	}
-	// 帧处理在 Task 5 接;本断言=Accept 且形态标记为 mesh。
+	// 形态② 帧注入已落地(channel.go 形态分流→injectMeshFrame);本用例只
+	// 断言 Accept+形态标记(不写帧——注入路径阻塞等帧头直到连接清理静默断开),
+	// 注入/防环/门禁细节断言在 mesh_inject_test.go。
 	if got := s.observedForm(); got != FormMesh {
 		t.Fatalf("ingress form = %q, want %q", got, FormMesh)
 	}

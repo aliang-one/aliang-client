@@ -1,9 +1,10 @@
 // meshframe.go — SSH 入口形态②(mesh 帧外壳)的帧头协议。
 //
 // 与组网分支(feat/mesh-forwarding)的 outbound/meshproto 同源:帧格式权威
-// = docs/mesh-forwarding-network-design.md §3.2(来源 device_id / 流量类别 /
-// 目标 host:port|裸域名|dns: / path vector / 跳数),首行 JSON 头 + 原始
-// 字节双向转发。本分支独立实现、不 import mesh 代码(该分支不在本分支);
+// = docs/mesh-forwarding-network-design.md §3.2(该文档在主检出未跟踪、
+// 随 mesh 分支提交),字段=来源 device_id / 流量类别 / 目标
+// host:port|裸域名|dns: / path vector / 跳数,首行 JSON 头 + 原始字节
+// 双向转发。本分支独立实现、不 import mesh 代码(该分支不在本分支);
 // 两分支合并后由集成批次统一为单一实现(计划 2026-11-08-ssh-ingress Task 5
 // 与 spec §8 的冲突纪律)。
 package ssh

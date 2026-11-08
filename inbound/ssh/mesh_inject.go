@@ -213,6 +213,7 @@ type meshChannelConn struct {
 func newMeshChannelConn(ch gossh.Channel, connRemote net.Addr, host string, port uint16, reader *bufio.Reader) *meshChannelConn {
 	var preread []byte
 	if reader.Buffered() > 0 {
+		// n==Buffered() 时 Peek 不会失败(请求不超过已缓冲字节数),忽略 err。
 		leftover, _ := reader.Peek(reader.Buffered())
 		preread = append([]byte(nil), leftover...)
 	}
