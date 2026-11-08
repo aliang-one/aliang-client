@@ -268,7 +268,8 @@ func TestSSHIngressRejectsNonDirectTCPIPChannels(t *testing.T) {
 			t.Fatalf("channel %q rejection reason = %v, want UnknownChannelType", chType, err)
 		}
 	}
-	// direct-tcpip 是唯一放行通道:Accept 后(Task 2 边界)drain+close,
+	// direct-tcpip 是唯一放行通道:Accept 后(Task 4 起 bare 形态注入真实
+	// 管线——本用例未打桩,对 127.0.0.1:9 真拨号失败→Handle 返回→关通道),
 	// 客户端半关后读到 EOF。
 	payload := gossh.Marshal(directTCPIPMsg{Addr: "127.0.0.1", Port: 9, OriginAddr: "127.0.0.1", OriginPort: 0})
 	ch, _, err := conn.OpenChannel(channelDirectTCPIP, payload)
@@ -315,6 +316,8 @@ func TestAuthHumanKeyMarksBareForm(t *testing.T) {
 	if err != nil {
 		t.Fatalf("human key must authenticate: %v", err)
 	}
+	// fire-and-forget 打开:未打桩,通道会触达真实管线(拨 127.0.0.1:9
+	// 失败即返回);本用例只断言形态标记,通道生命周期随连接清理收口。
 	payload := gossh.Marshal(directTCPIPMsg{Addr: "127.0.0.1", Port: 9, OriginAddr: "127.0.0.1", OriginPort: 0})
 	if _, _, err := conn.OpenChannel(channelDirectTCPIP, payload); err != nil {
 		t.Fatalf("direct-tcpip open: %v", err)

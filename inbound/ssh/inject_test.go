@@ -153,8 +153,9 @@ func TestBareStreamConnIDAndCtxCarry(t *testing.T) {
 		t.Fatalf("dial: %v", err)
 	}
 	// 同一 SSH 连接开两条通道:ConnID 各自独立且前缀 sshing-。
-	ch1 := openDirectTCPIP(t, conn, "127.0.0.1", 443)
-	ch2 := openDirectTCPIP(t, conn, "127.0.0.1", 443)
+	// (fire-and-forget:通道引用无需保留,生命周期随连接清理收口。)
+	openDirectTCPIP(t, conn, "127.0.0.1", 443)
+	openDirectTCPIP(t, conn, "127.0.0.1", 443)
 
 	var recs []handleRecord
 	for len(recs) < 2 {
@@ -189,8 +190,6 @@ func TestBareStreamConnIDAndCtxCarry(t *testing.T) {
 			t.Fatal("in-flight Handle must observe ctx cancellation after connection teardown")
 		}
 	}
-	_ = ch1
-	_ = ch2
 }
 
 func TestStopWithInflightChannel(t *testing.T) {
