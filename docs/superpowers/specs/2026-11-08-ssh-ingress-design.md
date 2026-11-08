@@ -213,7 +213,8 @@ SSH 入口卡片(代理族下):
 
 - `GET /api/proxy/ssh-ingress/hostkey` →
   `{"fingerprint","algorithm","generated_at"}`(读
-  ingress_host_key,不存在时触发生成并返回新指纹);
+  ingress_host_key,缺失=404「SSH 入口尚未启动」(只读;生成职责归
+  Server.Start——双进程并发触发生成会使展示指纹与服务钥错位,职责单一裁定);
 - 鉴权沿用代理配置端点同档(core 默认中间件栈;agent 侧
   loopbackOnly);**routes.go + registerAgentRoutes 双注册**
   (本仓反复踩的 404 坑);parity 正则已由出口任务扩围覆盖
