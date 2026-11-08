@@ -43,7 +43,7 @@ type PeerTarget struct {
 	LANAddrs []string     // LAN 直连地址 host:port(beacon 发现/手输兜底),顺序尝试
 	Relay    bool         // 允许中继载体(平台端点白名单放行时置位;custom 类别仍被引擎层拒绝)
 	PikoDial PikoDialFunc // 中继载体拨号(注入式)
-	MaxHops  int          // 跳数上限;链头不消费(中间跳 relay 语义,Task 6),构造期归一暂存
+	MaxHops  int          // 跳数上限;链头不消费(中间跳续传语义,Task 7:dialByRoute 拨出时携带入站 Via/Hops),构造期归一暂存
 	SelfID   string       // 本机 device_id,帧头 From/Via 链头
 }
 
@@ -79,7 +79,7 @@ func NewPeer(target PeerTarget) *Peer {
 // DialContext 实现 proxy.Proxy:LAN 载体优先、中继载体兜底、全部失败错误
 // 回源(design §3.3:mesh 层失败一律错误回源,仅由链头的规则失败策略执行
 // 后续,本出口不吞不回落)。首行 JSON 帧头(design §3.1/§3.2)由链头写入:
-// Via=[From]、Hops 由 0 起;中间跳 AppendHop 属 relay 侧语义(Task 6)。
+// Via=[From]、Hops 由 0 起;中间跳续传语义属 Task 7(dialByRoute 拨出时携带入站 Via/Hops)。
 // Task 8 的 DNS 代转发复用本出口:target=dns: 原样透传(见 targetFromMetadata),
 // B 侧按 meshproto.IsDNSTarget 识别并代解析。
 func (p *Peer) DialContext(ctx context.Context, md *M.Metadata) (net.Conn, error) {

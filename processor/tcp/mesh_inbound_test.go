@@ -201,6 +201,19 @@ func TestMeshInboundRejectsMalformedHeader(t *testing.T) {
 	assertMeshReject(t, addr, errs, "this is not json\n", "bad header")
 }
 
+func TestMeshInboundRejectsHeaderReadTimeout(t *testing.T) {
+	// 测试缝:meshHeaderReadTimeout 覆写为短 deadline(非并行测试,覆写+恢复),
+	// 断言静默连接触发超时拒绝路径——防慢速/静默连接长期占住 goroutine。
+	restore := meshHeaderReadTimeout
+	meshHeaderReadTimeout = 120 * time.Millisecond
+	defer func() { meshHeaderReadTimeout = restore }()
+
+	deps := meshInboundDeps(newMeshInboundCapture())
+	addr, errs := startMeshInbound(t, meshproto.CarrierLAN, deps)
+	// 不写任何字节:帧头读取超时 → 回写 "read header: ... timeout" 后断链。
+	assertMeshReject(t, addr, errs, "", "read header")
+}
+
 func TestMeshInboundInjectsConnIntoPipeline(t *testing.T) {
 	capture := newMeshInboundCapture()
 	deps := meshInboundDeps(capture)
@@ -248,6 +261,10 @@ func TestMeshInboundInjectsConnIntoPipeline(t *testing.T) {
 	}
 	if got.md.ConnID == "" {
 		t.Fatal("ConnID must be assigned for tracing")
+	}
+	// 源地址派生自 conn.RemoteAddr(loopback 拨入 → 127.0.0.1)。
+	if got.md.SrcIP.String() != "127.0.0.1" {
+		t.Fatalf("SrcIP = %q, want 127.0.0.1 (derived from conn.RemoteAddr)", got.md.SrcIP.String())
 	}
 	_ = got.conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	buf := make([]byte, len(payload))

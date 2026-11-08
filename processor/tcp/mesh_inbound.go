@@ -28,8 +28,9 @@ import (
 const RouteMesh = "RouteMesh"
 
 // meshHeaderReadTimeout 界定帧头首行读取:防慢速/静默连接长期占住 goroutine
-// (参考 app/tunnel/bridge.go handle 的 15s 先例)。
-const meshHeaderReadTimeout = 15 * time.Second
+// (参考 app/tunnel/bridge.go handle 的 15s 先例)。var 而非 const 是刻意的
+// 测试缝:测试覆写为短 deadline 断言超时拒绝路径(覆写+恢复,非并行安全)。
+var meshHeaderReadTimeout = 15 * time.Second
 
 // meshRejectWriteTimeout 界定拒绝回写的写入窗口:对端已失联时不因回写卡死。
 const meshRejectWriteTimeout = 5 * time.Second
@@ -105,7 +106,8 @@ func HandleMeshConn(conn net.Conn, carrier string, deps MeshInboundDeps) error {
 
 	// 防环 + 跳数上限(design §7 层1/层2):AppendHop 自查 Via 含本机 ID 即
 	// 环路,超上限即拒。成功的 Append(追加本机 ID、递增跳数)仅用于校验——
-	// 本任务注入路径不再向外转发帧头;中间跳续传 Via 属出口接线(Task 9)。
+	// 本任务注入路径不再向外转发帧头;中间跳续传 Via 属出口接线(Task 7,
+	// dialByRoute 激活点)。
 	maxHops := deps.MaxHops
 	if maxHops <= 0 {
 		maxHops = meshproto.DefaultHops
