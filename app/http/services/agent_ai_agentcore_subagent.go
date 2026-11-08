@@ -650,6 +650,11 @@ func (m *agentAIManager) agentCoreSubagentTools(run agentAIRun,
 			// 经剥除后可调用名已变，占位若引原名会诱导模型调错工具。
 			desc = "子 agent " + name + "（定义未写 description）"
 		}
+		// 机制前缀（vm459 实测 2026-11-08）：只透传定义 description 时模型
+		// 可见面上无任何字样宣告「这是子agent」——被问「你有子 agent 功能吗」
+		// 照实答没有，也不会主动派发。claude Task 工具描述内建自述
+		// （"Launch a new agent..."），这里对齐：每座桥自带机制语义。
+		desc = "子agent（独立内部线程，完成后报告回主对话）：" + desc
 		out = append(out, &agentCoreSubagentBridge{
 			client:         client,
 			mainModel:      mainModel,
@@ -673,4 +678,28 @@ func (m *agentAIManager) agentCoreSubagentTools(run agentAIRun,
 	}
 	logger.Info(fmt.Sprintf("agentcore-subagent: 注入 %d 个子 agent 桥", len(out)))
 	return out
+}
+
+// agentCoreSubagentMechanismSuffix 返回主 run system prompt 的子 agent 机制
+// 说明块。n=注入桥数；0 返回空串（零副作用拼接）。工具名=定义名、描述=定义
+// description，主 run 可见面上没有机制宣告（vm459 实测 2026-11-08：模型被问
+// 「你有子 agent 功能吗」照实答没有）。claude 侧 Task 工具描述内建自述
+// （"Launch a new agent..."），本块对齐该语义：宣告并行能力与生命周期归属，
+// 引导模型主动派发。
+func agentCoreSubagentMechanismSuffix(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	return "\n\n<subagents>\n" +
+		"You can delegate work to subagents via the provided subagent tools " +
+		"(their descriptions are prefixed with 子agent). Each call spawns an independent " +
+		"internal Aliang Agent run: a separate conversation thread with its own context and " +
+		"tool loop. Subagents dispatched in the same turn run concurrently (up to 4), and each " +
+		"subagent's final report is returned to you as the tool result. Its lifecycle is bound " +
+		"to the current turn.\n" +
+		"Use subagents for parallel research, codebase exploration, or independent subtasks; " +
+		"give each one a self-contained task description with enough context to work alone.\n" +
+		"Parallel subagents share the same working directory — parallelize read-only work " +
+		"(research, exploration); keep file-writing tasks sequential or scoped to distinct files.\n" +
+		"</subagents>"
 }

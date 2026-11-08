@@ -255,6 +255,42 @@ func TestAgentCoreSubagentToolsAssembly(t *testing.T) {
 	}
 }
 
+func TestAgentCoreSubagentBridgeDescriptionSelfDescribe(t *testing.T) {
+	// 机制自述（vm459 实测 2026-11-08）：桥描述此前只透传定义文件 description，
+	// 模型可见面上无任何字样宣告「这是子agent」——被问「你有子 agent 功能吗」
+	// 照实答没有，也不会主动派发。装配层必须给每座桥打上机制前缀。
+	setTestAgentHome(t)
+	writeSubagentDef(t, os.Getenv("HOME"), "researcher.md",
+		"---\nname: researcher\ndescription: 调研任务\ntools: Read, Grep\n---\n你是调研员。")
+
+	m := newAgentAIManager()
+	tools := m.agentCoreSubagentTools(agentAIRun{sessionID: "s", projectPath: "/tmp/p"},
+		nil, nil, nil, nil, nil, nil)
+	if len(tools) != 1 {
+		t.Fatalf("桥数 = %d, want 1", len(tools))
+	}
+	if !strings.Contains(tools[0].Description(), "子agent") {
+		t.Fatalf("桥描述缺机制前缀: %q", tools[0].Description())
+	}
+	if !strings.Contains(tools[0].Description(), "调研任务") {
+		t.Fatalf("桥描述丢失定义 description: %q", tools[0].Description())
+	}
+}
+
+func TestAgentCoreSubagentMechanismSuffix(t *testing.T) {
+	// 主 run system prompt 的机制说明块：0 桥零副作用；有桥必须宣告并行
+	// 语义与生命周期归属（对齐 claude Task 工具描述的内建自述）。
+	if got := agentCoreSubagentMechanismSuffix(0); got != "" {
+		t.Fatalf("0 桥应返回空串, got %q", got)
+	}
+	got := agentCoreSubagentMechanismSuffix(3)
+	for _, marker := range []string{"<subagents>", "子agent", "concurrently", "lifecycle"} {
+		if !strings.Contains(got, marker) {
+			t.Fatalf("机制块缺标记 %q: %q", marker, got)
+		}
+	}
+}
+
 func TestAgentCoreSubagentRegistryIncludesPeerTools(t *testing.T) {
 	// peer 设备互访桥必须进子 registry(与 MCP 桥同款继承):否则主 agent 把
 	// 跨设备任务 delegate 给子 agent 时,子 agent 无从执行(缺口修补的钉子)。

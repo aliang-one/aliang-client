@@ -1416,12 +1416,17 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 	// 子 agent 注入（spec：docs/superpowers/specs/2026-10-27-agentcore-subagents-design.md）：
 	// readOnly run 不注入（mirror MCP 只读决策——上方 raws=nil 同一判据）；
 	// 定义集为空不注入。桥递归子 run（depth=1），MCP 桥/审批/journal/围栏
-	// 全部复用主 run 的这一份。
+	// 全部复用主 run 的这一份。注入非空时给主 run system prompt 追加机制
+	// 说明块（agentCoreSubagentMechanismSuffix）：模型可见面上必须有「这是
+	// 子agent + 可并行 + 生命周期归属」的宣告，否则自我报告错位且不主动派发
+	// （vm459 实测 2026-11-08）。
+	subagentPrompt := ""
 	if !run.readOnly {
 		if subTools := m.agentCoreSubagentTools(run, kernelClient, kernelEnv, kernelApprove, kernelLogf, mcpTools, subagentMirror); len(subTools) > 0 {
 			for _, tool := range subTools {
 				registry.Register(tool)
 			}
+			subagentPrompt = agentCoreSubagentMechanismSuffix(len(subTools))
 		}
 		// 设备互访工具注入（spec 2026-10-29 §7.2 阶段 1 四件）：与 MCP/子 agent
 		// 桥同款宿主注入。桥内共享注册表 handler 实现（POST 编排），自带
@@ -1440,8 +1445,9 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		Client: kernelClient,
 		Model:  model,
 		// 技能清单注入（渐进披露：名称+描述+路径，正文由模型按需 Read）。
-		// 全局关闭或无技能时返回空串，拼接无副作用。
-		System:    agentCoreSystemPromptWithContext(run.projectPath, sessionContext) + m.agentCoreSkillsPromptBlock(run),
+		// 全局关闭或无技能时返回空串，拼接无副作用。子 agent 机制块同理：
+		// 无桥时空串，有桥时宣告并行/生命周期语义。
+		System:    agentCoreSystemPromptWithContext(run.projectPath, sessionContext) + m.agentCoreSkillsPromptBlock(run) + subagentPrompt,
 		Tools:     registry,
 		SessionID: kernelSessionID,
 		// 会话的 effort 档位（手机选档 → server 透传 → 这里进请求体）。
