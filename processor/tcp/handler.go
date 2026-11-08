@@ -477,6 +477,24 @@ func (h *TCPConnectionHandler) handleNonTLS(
 	metadata *M.Metadata,
 ) (remoteConn net.Conn, newOriginConn net.Conn, err error) {
 	if shouldForceAliangRoute(metadata) {
+		// AI 离线改道(计划 Task 12,design §2 行11/§9.4):平台隧道不可达
+		// (离线信号真)且 AI 类离线兜底勾选时,命中从 RouteToALiang 改判
+		// mesh 兜底节点(专用兜底 peer,经 mesh 转发,B 侧把它当普通入站
+		// 连接处理后出其自己的隧道)。在线/未勾选/总开关关 → 判定不通过,
+		// 保持原路由(在线行为零变化)。连接语义:该连接是 56432 回环 AI
+		// 流,继承帧头不存在(链头),mesh 出口按 56432 判据推断 Fresh
+		// header Class=ai;originConn 裸透传返回——wrapAliangHTTPConnByProto
+		// 的 HTTP/2 改包逻辑只适用于 aliang 隧道,mesh 直转路径不套用。
+		// 兜底节点也不可达时如实失败:离线下原路由(RouteToALiang)本就
+		// 拨不通,不再叠加一次注定失败的隧道拨号,错误交由 AI 客户端重试。
+		if fbAddr, redirect := meshOfflineRedirectForAI(); redirect {
+			remote, dialErr := h.dialMeshFallbackNode(ctx, metadata, fbAddr)
+			if dialErr != nil {
+				return nil, originConn, fmt.Errorf("mesh: offline AI redirect to fallback node %s failed: %w", fbAddr, dialErr)
+			}
+			metadata.Route = "RouteMeshFallback"
+			return remote, originConn, nil
+		}
 		metadata.Route = "RouteToALiang"
 		remote, dialErr := h.dialByRoute(ctx, metadata, RouteToALiang)
 		if dialErr != nil {

@@ -19,6 +19,7 @@ import (
 	"time"
 
 	M "aliang.one/nursorgate/inbound/tun/metadata"
+	"aliang.one/nursorgate/outbound"
 	"aliang.one/nursorgate/outbound/meshproto"
 	meshproxy "aliang.one/nursorgate/outbound/proxy/mesh"
 	"aliang.one/nursorgate/processor/config"
@@ -549,6 +550,286 @@ func TestDialByRouteMeshUnknownPeerFallsBackDirect(t *testing.T) {
 		t.Fatalf("metadata.Route = %q, want RouteDirect", md.Route)
 	}
 	expectAccepted(t, accepted, "direct 回落")
+}
+
+// ---- AI 流量离线改道(Task 12,design §2 行11/§9.4)----
+
+// swapMeshOfflineSignal 覆写离线信号缝并恢复(swapMeshSelfIDSource 同款
+// swap+Cleanup 模式;非并行安全)。
+func swapMeshOfflineSignal(t *testing.T, fn func() bool) {
+	t.Helper()
+	orig, _ := meshOfflineSignal.Load().(func() bool)
+	SetMeshOfflineSignal(fn)
+	t.Cleanup(func() { SetMeshOfflineSignal(orig) })
+}
+
+// registerFakeAliangProxy 注册 fake aliang 出口(在线/未勾选路径的
+// RouteToALiang 拨出落点,route_override_test 同款)。
+func registerFakeAliangProxy(t *testing.T) {
+	t.Helper()
+	registry := outbound.GetRegistry()
+	registry.Clear()
+	if err := registry.Register("aliang", &fakeAliangProxy{}); err != nil {
+		t.Fatalf("register fake aliang proxy failed: %v", err)
+	}
+	t.Cleanup(registry.Clear)
+}
+
+// aiRedirectMetadata 构造 56432 回环 AI 流量 metadata(shouldForceAliangRoute
+// 必命中形态)。
+func aiRedirectMetadata() *M.Metadata {
+	return &M.Metadata{
+		Network: M.TCP,
+		ConnID:  "ai-redirect-test",
+		DstIP:   netip.MustParseAddr("127.0.0.1"),
+		DstPort: 56432,
+	}
+}
+
+// setAIRedirectFallbackConfig 配置「AI 类离线兜底勾选」的 fallback。
+func setAIRedirectFallbackConfig(t *testing.T, fbAddr string) {
+	t.Helper()
+	setMeshDialConfig(t, nil, &config.MeshFallbackConfig{
+		Enable:  boolPtr(true),
+		Addr:    fbAddr,
+		Classes: []string{meshproto.ClassAI},
+	})
+}
+
+// TestForceAliangRouteRedirectsToNodeWhenOffline 离线信号真 + AI 类兜底勾选 →
+// shouldForceAliangRoute 命中改判 mesh 兜底节点(专用兜底 peer):帧头
+// Class=ai(56432 判据)/Target=回环:56432/From=链头 selfID;originConn 裸
+// 透传返回(不套 wrapAliangHTTPConnByProto——该改包逻辑只适用于 aliang
+// 隧道);总开关显式 false 时改道关闭(门控统一助手的穿透钉子)。
+func TestForceAliangRouteRedirectsToNodeWhenOffline(t *testing.T) {
+	t.Run("离线改判mesh兜底节点", func(t *testing.T) {
+		newMeshDialTestEnv(t)
+		swapMeshOfflineSignal(t, func() bool { return true })
+		fbAddr, headers := startMeshHeaderPeer(t)
+		setAIRedirectFallbackConfig(t, fbAddr)
+
+		if !MeshOfflineAIRedirectActive() {
+			t.Fatal("离线+AI 兜底勾选时 MeshOfflineAIRedirectActive 应为真")
+		}
+
+		handler := NewTCPConnectionHandler(NewDefaultProtocolDetector(), NewDefaultTLSHandler(), nil, nil)
+		origin := newFakeConn(nil)
+		md := aiRedirectMetadata()
+		remote, newOrigin, err := handler.handleNonTLS(context.Background(), origin, md)
+		if err != nil {
+			t.Fatalf("handleNonTLS failed: %v, want 离线改道拨兜底节点成功", err)
+		}
+		defer remote.Close()
+		if md.Route != "RouteMeshFallback" {
+			t.Fatalf("metadata.Route = %q, want RouteMeshFallback(改道至 toNode 家族的兜底节点)", md.Route)
+		}
+		if newOrigin != net.Conn(origin) {
+			t.Fatalf("originConn 应裸透传返回(不套 wrapAliangHTTPConnByProto), got %T", newOrigin)
+		}
+		select {
+		case hdr := <-headers:
+			if hdr.Class != meshproto.ClassAI {
+				t.Fatalf("帧头 Class = %q, want ai(56432 回环判据)", hdr.Class)
+			}
+			if hdr.Target != "127.0.0.1:56432" {
+				t.Fatalf("帧头 Target = %q, want 127.0.0.1:56432", hdr.Target)
+			}
+			if hdr.From != "dev-a" {
+				t.Fatalf("帧头 From = %q, want dev-a(链头 selfID)", hdr.From)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("兜底节点未被拨(2s 未收到 mesh 帧头)")
+		}
+	})
+
+	t.Run("总开关显式false改道关闭", func(t *testing.T) {
+		newMeshDialTestEnv(t)
+		swapMeshOfflineSignal(t, func() bool { return true })
+		registerFakeAliangProxy(t)
+		fbAddr, headers := startMeshHeaderPeer(t)
+		config.SetGlobalConfig(&config.Config{
+			Customer: &config.CustomerConfig{
+				Mesh: &config.MeshConfig{
+					Enable: boolPtr(false), // 总开关显式 false
+					Fallback: &config.MeshFallbackConfig{
+						Enable:  boolPtr(true),
+						Addr:    fbAddr,
+						Classes: []string{meshproto.ClassAI},
+					},
+				},
+			},
+		})
+
+		if MeshOfflineAIRedirectActive() {
+			t.Fatal("总开关显式 false 时改道判定必须关闭")
+		}
+
+		handler := NewTCPConnectionHandler(NewDefaultProtocolDetector(), NewDefaultTLSHandler(), nil, nil)
+		md := aiRedirectMetadata()
+		remote, _, err := handler.handleNonTLS(context.Background(), newFakeConn(nil), md)
+		if err != nil {
+			t.Fatalf("handleNonTLS failed: %v, want 保持原路由(RouteToALiang)", err)
+		}
+		defer remote.Close()
+		if md.Route != "RouteToALiang" {
+			t.Fatalf("metadata.Route = %q, want RouteToALiang(总开关关,改道不生效)", md.Route)
+		}
+		select {
+		case hdr := <-headers:
+			t.Fatalf("总开关关时兜底节点不应被拨,却收到帧: %v", hdr)
+		default:
+		}
+	})
+
+	t.Run("兜底不可达如实失败", func(t *testing.T) {
+		newMeshDialTestEnv(t)
+		swapMeshOfflineSignal(t, func() bool { return true })
+		setAIRedirectFallbackConfig(t, closedMeshAddr(t))
+
+		handler := NewTCPConnectionHandler(NewDefaultProtocolDetector(), NewDefaultTLSHandler(), nil, nil)
+		md := aiRedirectMetadata()
+		_, _, err := handler.handleNonTLS(context.Background(), newFakeConn(nil), md)
+		if err == nil {
+			t.Fatal("兜底节点不可达时离线改道应如实失败")
+		}
+		if !strings.Contains(err.Error(), "offline AI redirect") {
+			t.Fatalf("错误应标明离线改道语义, got: %v", err)
+		}
+	})
+}
+
+// TestForceAliangRouteUnchangedWhenOnline 在线行为零变化:信号 false / 未接线
+// → 保持 RouteToALiang,兜底节点不被拨。
+func TestForceAliangRouteUnchangedWhenOnline(t *testing.T) {
+	t.Run("信号注入在线", func(t *testing.T) {
+		newMeshDialTestEnv(t)
+		swapMeshOfflineSignal(t, func() bool { return false })
+		registerFakeAliangProxy(t)
+		fbAddr, headers := startMeshHeaderPeer(t)
+		setAIRedirectFallbackConfig(t, fbAddr)
+
+		if MeshOfflineAIRedirectActive() {
+			t.Fatal("在线时 MeshOfflineAIRedirectActive 应为假")
+		}
+
+		handler := NewTCPConnectionHandler(NewDefaultProtocolDetector(), NewDefaultTLSHandler(), nil, nil)
+		md := aiRedirectMetadata()
+		remote, _, err := handler.handleNonTLS(context.Background(), newFakeConn(nil), md)
+		if err != nil {
+			t.Fatalf("handleNonTLS failed: %v, want 在线保持 RouteToALiang 现状", err)
+		}
+		defer remote.Close()
+		if md.Route != "RouteToALiang" {
+			t.Fatalf("metadata.Route = %q, want RouteToALiang(在线零变化)", md.Route)
+		}
+		select {
+		case hdr := <-headers:
+			t.Fatalf("在线时兜底节点不应被拨,却收到帧: %v", hdr)
+		default:
+		}
+	})
+
+	t.Run("信号未接线视为在线", func(t *testing.T) {
+		newMeshDialTestEnv(t)
+		swapMeshOfflineSignal(t, nil) // nil = 未接线 = 在线保守
+		registerFakeAliangProxy(t)
+		fbAddr, headers := startMeshHeaderPeer(t)
+		setAIRedirectFallbackConfig(t, fbAddr)
+
+		if MeshOfflineAIRedirectActive() {
+			t.Fatal("信号未接线(视为在线)时 MeshOfflineAIRedirectActive 应为假")
+		}
+
+		handler := NewTCPConnectionHandler(NewDefaultProtocolDetector(), NewDefaultTLSHandler(), nil, nil)
+		md := aiRedirectMetadata()
+		remote, _, err := handler.handleNonTLS(context.Background(), newFakeConn(nil), md)
+		if err != nil {
+			t.Fatalf("handleNonTLS failed: %v, want 未接线保持 RouteToALiang 现状", err)
+		}
+		defer remote.Close()
+		if md.Route != "RouteToALiang" {
+			t.Fatalf("metadata.Route = %q, want RouteToALiang(未接线零变化)", md.Route)
+		}
+		select {
+		case hdr := <-headers:
+			t.Fatalf("未接线时兜底节点不应被拨,却收到帧: %v", hdr)
+		default:
+		}
+	})
+}
+
+// TestForceAliangRouteNoAIClassKeepsOriginal 离线但兜底 Classes 不含 ai →
+// 保持原路由(RouteToALiang,离线下拨号失败如实上抛,由调用方/AI 客户端
+// 重试策略收口)。
+func TestForceAliangRouteNoAIClassKeepsOriginal(t *testing.T) {
+	newMeshDialTestEnv(t)
+	swapMeshOfflineSignal(t, func() bool { return true })
+	registerFakeAliangProxy(t)
+	fbAddr, headers := startMeshHeaderPeer(t)
+	setMeshDialConfig(t, nil, &config.MeshFallbackConfig{
+		Enable:  boolPtr(true),
+		Addr:    fbAddr,
+		Classes: []string{meshproto.ClassCustom}, // 只勾 custom,不含 ai
+	})
+
+	if MeshOfflineAIRedirectActive() {
+		t.Fatal("ai 类未勾选时 MeshOfflineAIRedirectActive 应为假")
+	}
+
+	handler := NewTCPConnectionHandler(NewDefaultProtocolDetector(), NewDefaultTLSHandler(), nil, nil)
+	md := aiRedirectMetadata()
+	remote, _, err := handler.handleNonTLS(context.Background(), newFakeConn(nil), md)
+	if err != nil {
+		t.Fatalf("handleNonTLS failed: %v, want AI 兜底未勾选保持 RouteToALiang", err)
+	}
+	defer remote.Close()
+	if md.Route != "RouteToALiang" {
+		t.Fatalf("metadata.Route = %q, want RouteToALiang(未勾选 ai 不改道)", md.Route)
+	}
+	select {
+	case hdr := <-headers:
+		t.Fatalf("ai 未勾选时兜底节点不应被拨,却收到帧: %v", hdr)
+	default:
+	}
+}
+
+// TestMeshOfflineSignalSeamConcurrentSetAndRead 离线信号缝并发契约
+// (TestMeshSeamConcurrentSetAndRead / egress TestSetPeerSourceConcurrentSetAndRead
+// 同款):生产写方(Task 14 组装层接线)与 AI 拨号路径读方跨包并发,-race 下
+// 必须无竞争。
+func TestMeshOfflineSignalSeamConcurrentSetAndRead(t *testing.T) {
+	config.ResetGlobalConfigForTest()
+	t.Cleanup(func() {
+		config.ResetGlobalConfigForTest()
+		SetMeshOfflineSignal(nil)
+	})
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			v := i%2 == 0
+			SetMeshOfflineSignal(func() bool { return v })
+		}
+	}()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i <2000; i++ {
+			_ = meshOfflineActive()
+			_ = MeshOfflineAIRedirectActive()
+		}
+	}()
+	time.Sleep(50 * time.Millisecond)
+	close(stop)
+	wg.Wait()
 }
 
 // TestMeshFallbackAddrForClassRespectsMasterSwitch tcp 兜底闸总开关穿透钉子
