@@ -600,6 +600,9 @@ type agentCoreSubagentInterrupted struct {
 	StartedAt string
 	ToolCalls int
 	LastTool  string
+	// LastText 是子 agent 最后一轮说的话（subagent_turn 行，L2）。中断重派
+	// 时主 LLM 能接上下文，而不是只知道跑了几个工具。旧 journal 为空。
+	LastText string
 }
 
 // unfinishedSubagents 扫描会话 journal，返回 start 无 finish 的子 agent
@@ -634,6 +637,7 @@ func (j *agentCoreJournal) unfinishedSubagents(sessionID string) []agentCoreSuba
 			TaskID         string `json:"task_id"`
 			Name           string `json:"name"`
 			Task           string `json:"task"`
+			Text           string `json:"text"`
 			Ts             string `json:"ts"`
 			SubagentTaskID string `json:"subagent_task_id"`
 			Tool           string `json:"tool"`
@@ -658,6 +662,12 @@ func (j *agentCoreJournal) unfinishedSubagents(sessionID string) []agentCoreSuba
 			if e, ok := entries[row.SubagentTaskID]; ok && !e.finished {
 				e.ToolCalls++
 				e.LastTool = row.Tool
+			}
+		case row.Kind == "subagent_turn":
+			if e, ok := entries[row.TaskID]; ok && !e.finished {
+				if t := strings.TrimSpace(row.Text); t != "" {
+					e.LastText = t
+				}
 			}
 		}
 	}
@@ -690,6 +700,31 @@ func (j *agentCoreJournal) appendSubagentTool(sessionID, taskID, tool, summary s
 		"is_error":         isError,
 		"ts":               time.Now().UTC().Format(time.RFC3339),
 	})
+}
+
+// appendSubagentTurn 落 kind=subagent_turn 行：子 run 的每回合 assistant 输出
+// （L2 sidechain，2026-11-09）。此前子 run 的 LLM 往来只在内存——进程一死，
+// 跑了半小时的成果全丢，journal 只剩工具名列表。落盘后崩溃可查、L3 续跑
+// 有据可依。text/thinking 由调用方 rune 安全截断；tokens=本回合用量。
+func (j *agentCoreJournal) appendSubagentTurn(sessionID, taskID string, turn int, text, thinking string, tokens int) {
+	if j == nil || j.dir == "" || strings.TrimSpace(sessionID) == "" || strings.TrimSpace(taskID) == "" {
+		return
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	row := map[string]interface{}{
+		"kind":    "subagent_turn",
+		"task_id": taskID,
+		"turn":    turn,
+		"text":    text,
+		"tokens":  tokens,
+		"ts":      time.Now().UTC().Format(time.RFC3339),
+	}
+	// thinking 只在非空时写键（省字节；多数回合为空）。
+	if thinking = strings.TrimSpace(thinking); thinking != "" {
+		row["thinking"] = thinking
+	}
+	j.appendLineLocked(sessionID, row)
 }
 
 // appendSubagentFinish 落 kind=subagent/event=finish 行：status=completed|failed，

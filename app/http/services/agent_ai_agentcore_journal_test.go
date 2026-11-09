@@ -605,3 +605,54 @@ func TestJournalUnfinishedSubagents(t *testing.T) {
 		t.Fatalf("无会话应返回 nil: %+v", got)
 	}
 }
+
+func TestAppendSubagentTurnSidechain(t *testing.T) {
+	// L2 子 run sidechain（2026-11-09）：子 run 的 LLM 往来此前只在内存——
+	// 进程一死，跑了半小时的调研成果全丢（journal 只剩工具名列表）。落成
+	// kind=subagent_turn 行后崩溃可查、为 L3 续跑铺路。行内带 task_id 关联，
+	// text rune 安全截断。
+	j := newAgentCoreJournal(t.TempDir())
+	sid := "sess-sidechain"
+	taskID := "agentcore-m1-researcher-1"
+	j.appendSubagentTurn(sid, taskID, 1, "第一轮：我先看看目录", "", 100)
+	j.appendSubagentTurn(sid, taskID, 2, "第二轮：找到线索了", "思考链", 250)
+
+	lines := readJournalLines(t, j.dir, sid)
+	turns := make([]map[string]interface{}, 0, 2)
+	for _, m := range lines {
+		if m["kind"] == "subagent_turn" {
+			turns = append(turns, m)
+		}
+	}
+	if len(turns) != 2 {
+		t.Fatalf("subagent_turn 行数 = %d, want 2: %v", len(turns), lines)
+	}
+	if turns[0]["task_id"] != taskID || turns[0]["turn"] != float64(1) ||
+		turns[0]["text"] != "第一轮：我先看看目录" {
+		t.Fatalf("首轮字段错: %v", turns[0])
+	}
+	if turns[1]["thinking"] != "思考链" {
+		t.Fatalf("thinking 丢失: %v", turns[1])
+	}
+	if turns[1]["tokens"] != float64(250) {
+		t.Fatalf("tokens 丢失: %v", turns[1])
+	}
+}
+
+func TestUnfinishedSubagentsReportsLastText(t *testing.T) {
+	// 中断注入增强（L2 联动）：有 sidechain 时应带出子 agent 最后一轮说的话，
+	// 主 LLM 重派时能接上下文，而不是只知道「跑了 3 个工具」。
+	j := newAgentCoreJournal(t.TempDir())
+	sid := "sess-last"
+	j.appendSubagentStart(sid, "t1", "researcher", "调研", "查加密方案")
+	j.appendSubagentTurn(sid, "t1", 1, "先读配置文件", "", 50)
+	j.appendSubagentTurn(sid, "t1", 2, "结论草稿：AES-GCM 更合适", "", 80)
+
+	got := j.unfinishedSubagents(sid)
+	if len(got) != 1 {
+		t.Fatalf("未终态数 = %d", len(got))
+	}
+	if !strings.Contains(got[0].LastText, "AES-GCM 更合适") {
+		t.Fatalf("LastText 未带出最后一轮文本: %q", got[0].LastText)
+	}
+}
