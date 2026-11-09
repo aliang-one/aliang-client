@@ -295,9 +295,15 @@ func memorySeamForTest(t *testing.T, reject func(eff string) bool, succeedStop s
 // 不可表达「未锁存」)。
 func withResetLatch(t *testing.T) {
 	t.Helper()
-	prevLatched, prevSet := agentCoreMemoryEffortLatched, agentCoreMemoryEffortLatchedSet
-	agentCoreMemoryEffortLatched, agentCoreMemoryEffortLatchedSet = "", false
-	t.Cleanup(func() { agentCoreMemoryEffortLatched, agentCoreMemoryEffortLatchedSet = prevLatched, prevSet })
+	prevSet, prevEffort := agentCoreMemoryEffortLatchLoad()
+	agentCoreMemoryEffortLatchReset()
+	t.Cleanup(func() {
+		if prevSet {
+			agentCoreMemoryEffortLatchStore(prevEffort)
+		} else {
+			agentCoreMemoryEffortLatchReset()
+		}
+	})
 }
 
 // fake 计数器经闭包带回,seam 内禁 t.Fatalf(纪律②);提取调用同步执行,
@@ -317,8 +323,8 @@ func TestAgentCoreMemoryExtractEffortFallback(t *testing.T) {
 	if len(got) != 2 || got[0] != "low" || got[1] != "max" {
 		t.Fatalf("回退序应为 low→max(归一后 run.effort): %q", got)
 	}
-	if !agentCoreMemoryEffortLatchedSet || agentCoreMemoryEffortLatched != "max" {
-		t.Fatalf("成功档必须锁存: set=%v %q", agentCoreMemoryEffortLatchedSet, agentCoreMemoryEffortLatched)
+	if set, eff := agentCoreMemoryEffortLatchLoad(); !set || eff != "max" {
+		t.Fatalf("成功档必须锁存: set=%v %q", set, eff)
 	}
 	// 第二次调用直接用锁存档,不再试 low
 	_, _ = m.agentCoreMemoryExtractCall(context.Background(), "m1", eff, "sys", "usr")
@@ -340,7 +346,7 @@ func TestAgentCoreMemoryExtractMaxTokensGuard(t *testing.T) {
 	if len(calls()) != 1 {
 		t.Fatalf("截断不得重试: %q", calls())
 	}
-	if agentCoreMemoryEffortLatchedSet {
+	if set, _ := agentCoreMemoryEffortLatchLoad(); set {
 		t.Fatal("截断丢弃不得锁存档位")
 	}
 }
@@ -360,9 +366,9 @@ func TestAgentCoreMemoryExtractEffortBranches(t *testing.T) {
 		if got := calls(); len(got) != 2 || got[0] != "low" || got[1] != "" {
 			t.Fatalf("候选序应 low→无 effort: %q", got)
 		}
-		if !agentCoreMemoryEffortLatchedSet || agentCoreMemoryEffortLatched != "" {
+		if set, eff := agentCoreMemoryEffortLatchLoad(); !set || eff != "" {
 			// 空串哨兵不可表达「未锁存」——Set 位才是锁存标志
-			t.Fatalf("空串终档也必须置 Set 位锁存: set=%v %q", agentCoreMemoryEffortLatchedSet, agentCoreMemoryEffortLatched)
+			t.Fatalf("空串终档也必须置 Set 位锁存: set=%v %q", set, eff)
 		}
 		_, _ = m.agentCoreMemoryExtractCall(context.Background(), "m1", "", "sys", "usr")
 		if got := calls(); len(got) != 3 || got[2] != "" {
@@ -408,8 +414,8 @@ func TestAgentCoreMemoryExtractEffortBranches(t *testing.T) {
 		if got := calls(); len(got) != 3 || got[0] != "low" || got[1] != "max" || got[2] != "" {
 			t.Fatalf("三档序应 low→max→无 effort: %q", got)
 		}
-		if !agentCoreMemoryEffortLatchedSet || agentCoreMemoryEffortLatched != "" {
-			t.Fatalf("终档锁存: set=%v %q", agentCoreMemoryEffortLatchedSet, agentCoreMemoryEffortLatched)
+		if set, eff := agentCoreMemoryEffortLatchLoad(); !set || eff != "" {
+			t.Fatalf("终档锁存: set=%v %q", set, eff)
 		}
 	})
 
@@ -424,7 +430,7 @@ func TestAgentCoreMemoryExtractEffortBranches(t *testing.T) {
 		if got := calls(); len(got) != 3 {
 			t.Fatalf("全拒应恰试三档: %q", got)
 		}
-		if agentCoreMemoryEffortLatchedSet {
+		if set, _ := agentCoreMemoryEffortLatchLoad(); set {
 			t.Fatal("全拒不得锁存")
 		}
 	})

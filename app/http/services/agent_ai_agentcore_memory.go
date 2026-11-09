@@ -516,10 +516,35 @@ func (AgentCoreMemoryFacade) SetDirForTest(dir string) (restore func()) {
 // 是空串(无 effort 终档),故需 Set 配对位区分「未锁存」,否则每回合重吃 400。
 // 边界:进程锁存不随 customer 配置切换重探;换 provider/模型后仍用锁存档,
 // 重启复位。
-var (
-	agentCoreMemoryEffortLatched    string
-	agentCoreMemoryEffortLatchedSet bool
-)
+// 锁存状态自带互斥:detached 提取 goroutine 读写,两个会话并行成功收尾时
+// 并发进出——裸包级变量是数据竞态(终审 SHOULD-1)。
+type agentCoreMemoryEffortLatch struct {
+	mu     sync.Mutex
+	set    bool
+	effort string
+}
+
+var agentCoreMemoryEffortLatchState agentCoreMemoryEffortLatch
+
+// agentCoreMemoryEffortLatchLoad 返回 (是否已锁存, 锁存档)。
+func agentCoreMemoryEffortLatchLoad() (bool, string) {
+	agentCoreMemoryEffortLatchState.mu.Lock()
+	defer agentCoreMemoryEffortLatchState.mu.Unlock()
+	return agentCoreMemoryEffortLatchState.set, agentCoreMemoryEffortLatchState.effort
+}
+
+func agentCoreMemoryEffortLatchStore(effort string) {
+	agentCoreMemoryEffortLatchState.mu.Lock()
+	agentCoreMemoryEffortLatchState.set, agentCoreMemoryEffortLatchState.effort = true, effort
+	agentCoreMemoryEffortLatchState.mu.Unlock()
+}
+
+// agentCoreMemoryEffortLatchReset 仅测试用:恢复「未锁存」。
+func agentCoreMemoryEffortLatchReset() {
+	agentCoreMemoryEffortLatchState.mu.Lock()
+	agentCoreMemoryEffortLatchState.set, agentCoreMemoryEffortLatchState.effort = false, ""
+	agentCoreMemoryEffortLatchState.mu.Unlock()
+}
 
 // agentCoreMemoryExtractMaxTokens 提取输出预算(spec §5):1024 装不下 ops 包络
 // (单条 500 字符≈250-350 token),4096 给足修正 ops 余量。
@@ -560,8 +585,8 @@ func (m *agentAIManager) agentCoreMemoryExtractCall(ctx context.Context, model, 
 	}
 	// 候选档:锁存优先;否则 low → 归一(run.effort) → 无,归一后去重保序。
 	var candidates []string
-	if agentCoreMemoryEffortLatchedSet {
-		candidates = []string{agentCoreMemoryEffortLatched}
+	if latchedSet, latched := agentCoreMemoryEffortLatchLoad(); latchedSet {
+		candidates = []string{latched}
 	} else {
 		candidates = []string{"low"}
 		if norm := agentcore.NormalizeEffortLevel(runEffort); norm != "" && norm != "low" {
@@ -592,7 +617,7 @@ func (m *agentAIManager) agentCoreMemoryExtractCall(ctx context.Context, model, 
 		if stop == agentcore.StopReasonMaxTokens {
 			return "", fmt.Errorf("agentcore-memory: 提取输出被 max_tokens 截断,丢弃本次")
 		}
-		agentCoreMemoryEffortLatched, agentCoreMemoryEffortLatchedSet = eff, true
+		agentCoreMemoryEffortLatchStore(eff)
 		return text, nil
 	}
 	return "", lastErr
