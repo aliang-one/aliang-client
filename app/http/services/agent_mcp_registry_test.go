@@ -568,3 +568,39 @@ func TestAliangMCPRegistryRoundTripEnvHeaders(t *testing.T) {
 		t.Fatalf("headers 往返丢失: %#v", web)
 	}
 }
+
+func TestAliangMCPEntryToolListRoundTripNormalize(t *testing.T) {
+	home := t.TempDir()
+	// 5 项归一后应剩 2 项 [a b]:trim/去空串/dedup(保首现顺序)
+	inc := []string{"a", " a ", "", "a", "b"}
+	if err := upsertAliangMCPServerForTest(home, "srv", aliangMCPServerEntry{
+		Command: "echo", IncludeTools: inc, ExcludeTools: []string{"x"},
+	}); err != nil {
+		t.Fatalf("写入失败: %v", err)
+	}
+	root, existed, err := loadAliangMCPRegistryRoot(home)
+	if err != nil || !existed {
+		t.Fatalf("读回失败: %v existed=%v", err, existed)
+	}
+	raw := root["servers"].(map[string]interface{})["srv"].(map[string]interface{})
+	incGot, _ := raw["include_tools"].([]interface{})
+	if len(incGot) != 2 || incGot[0] != "a" || incGot[1] != "b" {
+		t.Fatalf("include 归一落盘错误: %v", incGot)
+	}
+	excGot, _ := raw["exclude_tools"].([]interface{})
+	if len(excGot) != 1 || excGot[0] != "x" {
+		t.Fatalf("exclude 落盘错误: %v", excGot)
+	}
+}
+
+func TestAliangMCPEntryToolListCapReject(t *testing.T) {
+	home := t.TempDir()
+	big := make([]string, agentCoreMCPToolListCap+1) // 65 条,超上限必须拒绝
+	for i := range big {
+		big[i] = fmt.Sprintf("t%d", i)
+	}
+	err := upsertAliangMCPServerForTest(home, "srv", aliangMCPServerEntry{Command: "echo", IncludeTools: big})
+	if err == nil || !strings.Contains(err.Error(), "include_tools") {
+		t.Fatalf("超上限应拒绝并点名字段: %v", err)
+	}
+}

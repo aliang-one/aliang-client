@@ -30,6 +30,8 @@ const (
 	agentCoreMCPToolCap     = 128
 	agentCoreMCPInitTimeout = 10 * time.Second
 	agentCoreMCPDescCap     = 500
+	// agentCoreMCPToolListCap 单 server 工具名单上限(写通道 fail-closed)。
+	agentCoreMCPToolListCap = 64
 	// 建连超时后等待迟到 dial 返回的宽限窗：返回的会话就地关闭（收尸），
 	// 防止孤儿 stdio 进程/连接泄漏。
 	agentCoreMCPDialDrainGrace = 2 * time.Second
@@ -42,6 +44,22 @@ const (
 	// 一堆子进程把机器拖住。
 	agentCoreMCPDialConcurrency = 8
 )
+
+// normalizeAgentCoreMCPToolList 工具名单归一:trim/去空串/dedup(保首现顺序)。
+// 写通道落盘前与读通道过滤前共用(读侧兜住手改文件,沿 type 归一先例)。
+func normalizeAgentCoreMCPToolList(list []string) []string {
+	seen := make(map[string]bool, len(list))
+	out := make([]string, 0, len(list))
+	for _, v := range list {
+		v = strings.TrimSpace(v)
+		if v == "" || seen[v] {
+			continue
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	return out
+}
 
 // agentCoreMCPRawServer 是一条未脱敏的 server 配置（连接用）。
 type agentCoreMCPRawServer struct {
