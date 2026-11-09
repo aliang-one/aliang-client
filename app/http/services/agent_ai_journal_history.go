@@ -1,7 +1,7 @@
 package services
 
 // journal 读回（2026-10-28 跨端续聊，spec §4.3）：agentcore 会话不在内存时，
-// 从 journal 文件重建 history 装回内存再跑；订阅快照（emitSessionSnapshot）
+// 从 journal 文件重建 history 装回内存再跑；订阅快照（buildSessionSnapshotPayload）
 // 也用它取转录。读回的是「journal 所见」——斜杠命令/半截输出在旧文件里本就
 // 无痕（spec §9 已声明）。残行/非法行跳过。
 
@@ -83,7 +83,7 @@ func readAgentCoreJournalHistoryFrom(dir, sessionID string) ([]agentAIMessage, a
 }
 
 // readAgentCoreJournalTranscriptFrom journal 读侧共用解析器。includeEndNotes
-// 为 true 时（快照订阅展示面，agent_ai_sockets.go emitSessionSnapshot），
+// 为 true 时（快照订阅展示面，agent_ai_sockets.go buildSessionSnapshotPayload），
 // end(error) 行额外折成 role=system 的系统条进转录（G5 问题悬空修复）——
 // 失败回合在快照里悬空（有提问无任何反馈）是用户「为什么没有回答」的直接
 // 来源。系统条照常吃 agentAISnapshotTranscriptCap 限幅（失败信息值得占位，

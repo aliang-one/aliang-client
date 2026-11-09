@@ -29,6 +29,17 @@ describe('draftNeedsJournalReconcile（草稿打开时对账判定）', () => {
     expect(draftNeedsJournalReconcile({ ...base, running: true }, [{ id: 'local-abc' }])).toBe(false);
   });
 
+  it('running 标记缺失但有 running 气泡：不对账（2026-11-09 审计——该标记只在设备壳上置位，本地草稿流式中恒缺，重建会把直播气泡换成全 done 块级快照）', () => {
+    const conv = {
+      ...base,
+      messages: [
+        { role: 'user', content: '问题', status: 'done', ts: 1 },
+        { role: 'assistant', content: '', status: 'running', ts: 2 },
+      ],
+    };
+    expect(draftNeedsJournalReconcile(conv, [{ id: 'local-abc' }])).toBe(false);
+  });
+
   it('journal 清单无同 id 条目：不对账（后端无会话）', () => {
     expect(draftNeedsJournalReconcile(base, [{ id: 'other' }])).toBe(false);
     expect(draftNeedsJournalReconcile(base, [])).toBe(false);

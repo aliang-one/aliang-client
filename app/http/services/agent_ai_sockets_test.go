@@ -375,9 +375,15 @@ func TestRunEmitterCarriesRunOriginSocket(t *testing.T) {
 func TestDispatchLocalAISubscribeRepliesSnapshot(t *testing.T) {
 	m := newTestAISocketsManager(t)
 	svc := &AgentService{ai: m}
-	sock := m.registerAISocket("local", func(interface{}) error { return nil })
-	defer m.unregisterAISocket(sock.id)
+	// 2026-11-09 序仲裁改造：已盖章注册的 socket 走队列下发（与 delta 同通道
+	// FIFO），快照经 socket 自身写闭包到达本连接——不再是 DispatchLocalAI 的
+	// writeJSON 直写。断言通道随之迁到 socket 写闭包。
 	replies := make(chan map[string]interface{}, 8)
+	sock := m.registerAISocket("local", func(p interface{}) error {
+		replies <- p.(map[string]interface{})
+		return nil
+	})
+	defer m.unregisterAISocket(sock.id)
 	svc.DispatchLocalAI(map[string]interface{}{
 		"type":                   models.AgentEventAISessionSubscribe,
 		"session_id":             "any-session",
@@ -560,10 +566,14 @@ func TestRemoteSubscribeRepliesSnapshotAndRegisters(t *testing.T) {
 	m := newTestAISocketsManager(t)
 	svc := &AgentService{ai: m}
 	// 生产中 remote 常驻 socket 由 runRemoteAgentSession 的 ensureRemoteAISocket
-	// 注册（连接建立先于任何帧）；测试同序注册。
-	m.registerAISocket("remote", func(interface{}) error { return nil })
+	// 注册（连接建立先于任何帧），其写闭包是 currentRemoteWriter() 间接层——
+	// 与帧内 writeJSON 同一 sink。测试同序注册并用同一 sink 收包：2026-11-09
+	// 序仲裁改造后快照走 socket 队列（与 delta 同通道 FIFO），不再经帧内
+	// writeJSON 直写，故断言通道必须挂在 socket 写闭包上。
 	replies := make(chan map[string]interface{}, 8)
 	write := func(p interface{}) error { replies <- p.(map[string]interface{}); return nil }
+	sock := m.registerAISocket("remote", write)
+	defer m.unregisterAISocket(sock.id)
 
 	svc.handleRemoteAgentMessage(context.Background(), map[string]interface{}{
 		"type": models.AgentEventAISessionSubscribe, "session_id": "s-remote-1",
@@ -580,8 +590,8 @@ func TestRemoteSubscribeRepliesSnapshotAndRegisters(t *testing.T) {
 		t.Fatal("远端订阅未回快照")
 	}
 	m.mu.Lock()
-	sock := m.aiSockets[agentAIRemoteSocketID]
-	subscribed := sock != nil && sock.subscribed("s-remote-1")
+	registered := m.aiSockets[agentAIRemoteSocketID]
+	subscribed := registered != nil && registered.subscribed("s-remote-1")
 	m.mu.Unlock()
 	if !subscribed {
 		t.Fatal("订阅未挂到 remote 常驻 socket")
@@ -592,9 +602,48 @@ func TestRemoteSubscribeRepliesSnapshotAndRegisters(t *testing.T) {
 		"type": models.AgentEventAISessionUnsubscribe, "session_id": "s-remote-1",
 	}, write)
 	m.mu.Lock()
-	subscribed = sock != nil && sock.subscribed("s-remote-1")
+	subscribed = registered != nil && registered.subscribed("s-remote-1")
 	m.mu.Unlock()
 	if subscribed {
 		t.Fatal("退订未生效")
+	}
+}
+
+// TestDispatchLocalAISnapshotQueuedAfterPendingDeltas（2026-11-09 审计吞流
+// 根因）：订阅前已在 pump 队列里的在途 delta，快照必须排在它之后——旧实现
+// 快照在读 goroutine 上内联直写、可抢在已入队 delta 之前到达，客户端先收
+// 全 done 快照再收迟到 delta，delta 被 ensureAssistantBubble 的 done 屏障
+// 吞掉（表现为答案消失）。快照改经队列下发后，FIFO 保证序。
+func TestDispatchLocalAISnapshotQueuedAfterPendingDeltas(t *testing.T) {
+	m := newTestAISocketsManager(t)
+	svc := &AgentService{ai: m}
+	dir := t.TempDir()
+	m.coreJournal = newAgentCoreJournal(dir)
+	ts := time.Now().UTC().Format(time.RFC3339)
+	m.coreJournal.ensureSessionHeader("s-q", "/proj", "glm-5.3", "", ts, "phone", nil, nil, "")
+	m.coreJournal.appendUser("s-q", "m1", "第一问", ts)
+	m.coreJournal.appendAssistant("s-q", "a1", "第一答", ts)
+
+	seq := make(chan string, 8)
+	sock := m.registerAISocket("local", func(p interface{}) error {
+		row := p.(map[string]interface{})
+		seq <- fmt.Sprint(row["type"])
+		return nil
+	})
+	defer m.unregisterAISocket(sock.id)
+
+	// 订阅前入队一枚在途 delta（模拟 pump 队列里已排着的流式帧）。
+	sock.enqueue(map[string]interface{}{"type": "ai.delta", "session_id": "s-q", "delta": "…"})
+
+	svc.DispatchLocalAI(map[string]interface{}{
+		"type":                   models.AgentEventAISessionSubscribe,
+		"session_id":             "s-q",
+		agentAIOriginSocketField: sock.id,
+	}, func(p interface{}) error { return nil })
+
+	first := <-seq
+	second := <-seq
+	if first != "ai.delta" || second != models.AgentEventAISessionSnapshot {
+		t.Fatalf("期望 [ai.delta, snapshot],实际 [%s, %s]", first, second)
 	}
 }

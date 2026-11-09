@@ -50,6 +50,12 @@ export async function fetchFullJournalTranscript(id, fetchDetail, { limit = DEVI
 // 流式中的气泡换成 journal 块级快照；run 终态由既有快照对账接管。
 export function draftNeedsJournalReconcile(conv, journalSessions) {
   if (!conv || conv.running) return false;
+  // 流式气泡保护（2026-11-09 审计 REAL-high）：running 标记只在设备壳上置位，
+  // 本地草稿流式中恒 undefined，旧守卫放行——journal 全量重建把直播气泡换成
+  // 全 done 块级快照后，后续 delta 命中 ensureAssistantBubble 的 done 屏障被
+  // 静默吞掉（表现为答案消失）。以「数组里有 running 气泡」为第二道闸。
+  if (Array.isArray(conv.messages)
+    && conv.messages.some(m => m && m.role === 'assistant' && m.status === 'running')) return false;
   if (!conv.aiSessionId) return false;
   if (!Array.isArray(journalSessions) || !journalSessions.some(s => s && s.id === conv.aiSessionId)) return false;
   if (Date.now() - (conv.deviceLoadedAt || 0) <= DEVICE_SESSION_DETAIL_TTL_MS) return false;
@@ -146,52 +152,93 @@ export function deviceSystemNoteBubble(content, ts) {
   return { role: 'assistant', kind: 'system', note: 'turn_failed', content, status: 'done', ts };
 }
 
-// 详情转录行 → 壳气泡 + 喂入流（纯函数，导出供单测）。user/assistant 原样
-// 落气泡并进喂入；role=system 行（G5 错误终态系统条）**只落气泡、绝不进喂入**
-// ——deviceTranscript 是续聊的模型上下文，事实说明喂回去会污染；其余角色
-// （tool 轨迹等）跳过。
-export function deviceDetailTranscriptToMessages(rows, provider, fallbackTs) {
+// 会话仍在跑时的尾部 running 占位（2026-11-09 审计 REAL-high）：快照/详情
+// 整体替换把气泡全置 done，而 journal 快照天然缺在途回合内容（turn 行回合末
+// 才落盘），没有占位则替换后到来的 delta 命中 ensureAssistantBubble 的 done
+// 屏障被静默吞掉（表现为答案消失）。占位仅展示，绝不进喂入流。
+export function deviceRunningTailBubble(ts) {
+  return { role: 'assistant', content: '', status: 'running', ts };
+}
+
+// running 尾占位补齐：仅当已有尾气泡不是 running 时补（幂等）。
+function ensureRunningTail(messages, fallbackTs) {
+  const last = messages[messages.length - 1];
+  if (!last || last.role !== 'assistant' || last.status !== 'running') {
+    messages.push(deviceRunningTailBubble(fallbackTs));
+  }
+}
+
+// 详情转录行 → 壳气泡 + 喂入流（纯函数，导出供单测；applyDeviceTranscript
+// 委托此函数，此前纯函数与内联实装分叉——附件行被丢，2026-11-09 升级到生产
+// 保真）。user/assistant 原样落气泡并进喂入；role=system 行（G5 错误终态系
+// 统条）**只落气泡、绝不进喂入**——deviceTranscript 是续聊的模型上下文，事实
+// 说明喂回去会污染；其余角色（tool 轨迹等）跳过。running=true 时补尾部
+// running 占位（吞流守卫）。附件行（content 空带 attachments）保留进气泡、
+// 不进喂入（spec §3.6 手机图链）。
+export function deviceDetailTranscriptToMessages(rows, provider, fallbackTs, running = false) {
   const list = Array.isArray(rows) ? rows : [];
-  const renderable = list.filter(m => m && (m.role === 'user' || m.role === 'assistant' || m.role === 'system')
-    && typeof m.content === 'string' && m.content);
+  const hasAtts = m => Array.isArray(m.attachments) && m.attachments.length > 0;
+  // system 行无条件保留（空正文也落条，正文兜底 ''）——收编前内联实装同款；
+  // 文本/附件二选一的准入只对 user/assistant 生效。
+  const renderable = list.filter(m => m && (
+    m.role === 'system'
+    || ((m.role === 'user' || m.role === 'assistant')
+      && ((typeof m.content === 'string' && m.content) || hasAtts(m)))
+  ));
+  const messages = renderable.map(m => m.role === 'system'
+    ? deviceSystemNoteBubble(m.content || '', Date.parse(m.timestamp) || fallbackTs)
+    : {
+      role: m.role,
+      content: m.content || '',
+      status: 'done',
+      // 撤回锚点接线（Task 13）：详情 wire 行的 id 即 journal message_id，落
+      // 气泡后可作 truncate_before_message_id；provider 落上（canRecall 依赖）。
+      messageId: m.id || '',
+      provider: provider || '',
+      ts: Date.parse(m.timestamp) || fallbackTs,
+      ...(hasAtts(m)
+        ? { attachments: m.attachments.map(a => ({ name: a.name || '', url: chatAttachmentUrl(a.ref) })) }
+        : {}),
+    });
+  if (running) ensureRunningTail(messages, fallbackTs);
   return {
-    messages: renderable.map(m => m.role === 'system'
-      ? deviceSystemNoteBubble(m.content, Date.parse(m.timestamp) || fallbackTs)
-      : {
-        role: m.role,
-        content: m.content,
-        status: 'done',
-        // 撤回锚点接线（Task 13）：详情 wire 行的 id 即 journal message_id，落
-        // 气泡后可作 truncate_before_message_id；provider 落上（canRecall 依赖）。
-        messageId: m.id || '',
-        provider: provider || '',
-        ts: Date.parse(m.timestamp) || fallbackTs,
-      }),
-    feed: renderable.filter(m => m.role !== 'system').map(m => ({ role: m.role, content: m.content })),
+    messages,
+    // 喂入只收有文本的行（纯图行不回灌内核历史，spec §3.6）。
+    feed: renderable.filter(m => m.role !== 'system' && typeof m.content === 'string' && m.content)
+      .map(m => ({ role: m.role, content: m.content })),
   };
 }
 
-// 快照转录行 → 壳气泡（纯函数，导出供单测；**仅展示流**）。字段名与详情不同
-// （快照用 text，详情用 content）。system 行同款落系统条（快照侧本就不写
-// deviceTranscript，无需喂入分离）。
-export function deviceSnapshotTranscriptToMessages(rows, provider, fallbackTs) {
+// 快照转录行 → 壳气泡（纯函数，导出供单测；**仅展示流**，applyDeviceSnapshot
+// Transcript 委托此函数，2026-11-09 升级到生产保真：附件 + running 尾占位）。
+// 字段名与详情不同（快照用 text/ts/message_id，详情用 content/timestamp/id）。
+// system 行同款落系统条（快照侧本就不写 deviceTranscript，无需喂入分离）。
+export function deviceSnapshotTranscriptToMessages(rows, provider, fallbackTs, running = false) {
   const list = Array.isArray(rows) ? rows : [];
-  const renderable = list.filter(m => m && (m.role === 'user' || m.role === 'assistant' || m.role === 'system')
-    && typeof m.text === 'string' && m.text);
-  return {
-    messages: renderable.map(m => m.role === 'system'
-      ? deviceSystemNoteBubble(m.text, Date.parse(m.ts) || fallbackTs)
-      : {
-        role: m.role,
-        content: m.text,
-        status: 'done',
-        // 快照 id 系 journal 同源（spec §A 已修订），可作撤回锚点；内容仍绝不
-        // 喂入（deviceTranscript 专属流不变）。provider 落上（canRecall 依赖）。
-        messageId: m.message_id || '',
-        provider: provider || '',
-        ts: Date.parse(m.ts) || fallbackTs,
-      }),
-  };
+  const hasAtts = m => Array.isArray(m.attachments) && m.attachments.length > 0;
+  // system 行无条件保留（空正文也落条）——与详情侧同款口径。
+  const renderable = list.filter(m => m && (
+    m.role === 'system'
+    || ((m.role === 'user' || m.role === 'assistant')
+      && ((typeof m.text === 'string' && m.text) || hasAtts(m)))
+  ));
+  const messages = renderable.map(m => m.role === 'system'
+    ? deviceSystemNoteBubble(m.text || '', Date.parse(m.ts) || fallbackTs)
+    : {
+      role: m.role,
+      content: m.text || '',
+      status: 'done',
+      // 快照 id 系 journal 同源（spec §A 已修订），可作撤回锚点；内容仍绝不
+      // 喂入（deviceTranscript 专属流不变）。provider 落上（canRecall 依赖）。
+      messageId: m.message_id || '',
+      provider: provider || '',
+      ts: Date.parse(m.ts) || fallbackTs,
+      ...(hasAtts(m)
+        ? { attachments: m.attachments.map(a => ({ name: a.name || '', url: chatAttachmentUrl(a.ref) })) }
+        : {}),
+    });
+  if (running) ensureRunningTail(messages, fallbackTs);
+  return { messages };
 }
 
 // --- 子agent面板 WS 消费链（spec 2026-11-07-subagent-panel §三，导出供单测） ---
@@ -1061,6 +1108,12 @@ export function useAliangChat() {
     if (!draftNeedsJournalReconcile(conv, deviceSessions.value)) return;
     const { transcript } = await fetchFullJournalTranscript(conv.aiSessionId, getAgentSessionDetail);
     if (!transcript.length) return;
+    // apply 前复查（守卫的 TOCTOU 缝）：守卫判定与 fetch 完成之间用户可能
+    // 已发出新消息并建了 running 气泡——此时替换仍会吞流，宁可放弃本次对账
+    // （下次 TTL 外/终态后再对）。
+    if (conv.running
+      || (Array.isArray(conv.messages)
+        && conv.messages.some(m => m && m.role === 'assistant' && m.status === 'running'))) return;
     applyDeviceTranscript(conv, transcript);
     conv.deviceLoadedAt = now();
     saveToStorage();
@@ -1141,50 +1194,14 @@ export function useAliangChat() {
   // 详情/快照转录 → 壳 messages（复用既有气泡渲染路径）；deviceTranscript
   // （[{role,content}] 原始形态，Task 4 的 agentcore create transcript 喂入
   // 消费——后端 remoteAgentAIHistory 按 row.role/row.content 解析）由
-  // deviceDetailTranscriptToMessages 的 feed 供给。
-  function applyDeviceTranscript(shell, transcript) {
-    const rows = Array.isArray(transcript) ? transcript : [];
-    const bubbles = [];
-    const feed = [];
-    for (const m of rows) {
-      if (!m) continue;
-      // 错误终态系统条（G5 问题悬空修复）：role=system 的行渲染居中弱化胶囊
-      // （note=turn_failed），绝不进气泡对话流、绝不进续聊喂入流。
-      if (m.role === 'system') {
-        bubbles.push({
-          role: 'assistant',
-          kind: 'system',
-          note: 'turn_failed',
-          content: m.content || '',
-          status: 'done',
-          ts: Date.parse(m.timestamp) || now(),
-        });
-        continue;
-      }
-      if (m.role !== 'user' && m.role !== 'assistant') continue;
-      const hasText = typeof m.content === 'string' && m.content;
-      const hasAttachments = Array.isArray(m.attachments) && m.attachments.length > 0;
-      if (!hasText && !hasAttachments) continue;
-      bubbles.push({
-        role: m.role,
-        content: m.content || '',
-        status: 'done',
-        // 撤回锚点接线（Task 13）：详情 wire 行的 id 即 journal message_id，落
-        // 气泡后可作 truncate_before_message_id；provider 落上（canRecall 依赖）。
-        messageId: m.id || '',
-        provider: shell.provider || '',
-        ts: Date.parse(m.timestamp) || now(),
-        // 图片附件（spec §3.6）：ref → 本机端点 URL，气泡缩略图分支渲染。
-        ...(hasAttachments
-          ? { attachments: m.attachments.map(a => ({ name: a.name || '', url: chatAttachmentUrl(a.ref) })) }
-          : {}),
-      });
-      // 续聊喂入保持纯文本语义：空文本纯图行不进 deviceTranscript（本批次图片
-      // 仅显示，不回灌内核历史）。
-      if (hasText) feed.push({ role: m.role, content: m.content });
-    }
-    shell.messages = bubbles;
-    shell.deviceTranscript = feed;
+  // deviceDetailTranscriptToMessages 的 feed 供给。行→气泡的映射本体在模块级
+  // 纯函数（2026-11-09 收编：纯函数此前与内联实装分叉——附件行被丢，升级到
+  // 生产保真后此处只做薄壳装配）。running=true（会话仍在跑）时替换结果补尾
+  // 部 running 占位——吞流守卫，见 deviceRunningTailBubble。
+  function applyDeviceTranscript(shell, transcript, running = false) {
+    const out = deviceDetailTranscriptToMessages(transcript, shell.provider, now(), running);
+    shell.messages = out.messages;
+    shell.deviceTranscript = out.feed;
     scrollToBottom();
   }
 
@@ -1193,43 +1210,8 @@ export function useAliangChat() {
   // 覆盖屏幕，但续聊喂入的 deviceTranscript 必须保持详情分页拉全的版本——快照
   // 绝不写 deviceTranscript，否则截断尾巴会在 create 时顶掉全量上下文（喂入即
   // 全部上下文）。
-  function applyDeviceSnapshotTranscript(shell, rows) {
-    const list = Array.isArray(rows) ? rows : [];
-    const bubbles = [];
-    for (const m of list) {
-      if (!m) continue;
-      // 错误终态系统条（G5）：同详情口径——胶囊展示，绝不进喂入流
-      // （快照本就不写 deviceTranscript，双保险）。
-      if (m.role === 'system') {
-        bubbles.push({
-          role: 'assistant',
-          kind: 'system',
-          note: 'turn_failed',
-          content: m.text || '',
-          status: 'done',
-          ts: Date.parse(m.ts) || now(),
-        });
-        continue;
-      }
-      if (m.role !== 'user' && m.role !== 'assistant') continue;
-      const hasText = typeof m.text === 'string' && m.text;
-      const hasAttachments = Array.isArray(m.attachments) && m.attachments.length > 0;
-      if (!hasText && !hasAttachments) continue;
-      bubbles.push({
-        role: m.role,
-        content: m.text || '',
-        status: 'done',
-        // 快照 id 系 journal 同源（spec §A 已修订），可作撤回锚点；内容仍绝不
-        // 喂入（deviceTranscript 专属流不变）。provider 落上（canRecall 依赖）。
-        messageId: m.message_id || '',
-        provider: shell.provider || '',
-        ts: Date.parse(m.ts) || now(),
-        ...(hasAttachments
-          ? { attachments: m.attachments.map(a => ({ name: a.name || '', url: chatAttachmentUrl(a.ref) })) }
-          : {}),
-      });
-    }
-    shell.messages = bubbles;
+  function applyDeviceSnapshotTranscript(shell, rows, running = false) {
+    shell.messages = deviceSnapshotTranscriptToMessages(rows, shell.provider, now(), running).messages;
   }
 
   // 订阅判定（钉死）：仅 agentcore 且裸 conversation id（journal 源才有转录
@@ -1272,7 +1254,9 @@ export function useAliangChat() {
         live.deviceLoadedAt = now();
         live.deviceLoadError = '';
         if (pageError) console.warn('[aliang-chat] device transcript partial pages', pageError);
-        applyDeviceTranscript(live, transcript);
+        // 会话仍在跑时补尾部 running 占位（吞流守卫）：详情替换后到来的
+        // delta 才有落点；running 标记由清单扫描（entry.status）预置。
+        applyDeviceTranscript(live, transcript, !!live.running);
       } else if (pageError) {
         // 空转录+错误条：详情缺席不阻断（本地会话池里壳已在，输入照常）。
         // 只存布尔标记——文案在模板渲染时走 i18n，不冻结赋值时的语言。
@@ -1321,10 +1305,13 @@ export function useAliangChat() {
     // （raw 写不触发渲染），不在池里（未打开）则保持原对象——下次打开时可见。
     shell = conversations.value.find(c => c.id === shell.id && c.deviceSession) || shell;
 
-    // transcript 非空 → 覆盖壳 messages（快照是 journal 权威流的最新切片）
+    // transcript 非空 → 覆盖壳 messages（快照是 journal 权威流的最新切片）。
+    // 会话仍在跑时补尾部 running 占位（吞流守卫，2026-11-09 审计）：快照的
+    // journal 切片天然缺在途回合内容，无占位则替换后的 delta 被 done 屏障
+    // 静默吞掉；占位由随后到达的 delta 续流、ai.done 收口。
     const rows = Array.isArray(e.transcript) ? e.transcript : [];
     if (rows.length) {
-      applyDeviceSnapshotTranscript(shell, rows);
+      applyDeviceSnapshotTranscript(shell, rows, e.status === 'running');
       if (activeId.value === shell.id) scrollToBottom();
     }
 

@@ -241,17 +241,15 @@ func (m *agentAIManager) unsubscribeAISocket(socketID, sessionID string) {
 	}
 }
 
-// emitSessionSnapshot 订阅握手回包（spec §4.1）：转录快照（journal 读侧现成
-// 解析）+ 待审批 + 状态。尽力而为：转录取不到（非 journal 会话/读失败）就只
-// 回 pending+status，不报错。snapshot 经 writeJSON 直接回给订阅者——本机路径
-// 握手在读 goroutine 上内联执行，与该 socket pump 共用同一 writeJSON 闭包，
-// 并发安全由 HandleAIStream 的 writeMu 串行化保证（handlers/agent_handler.go），
-// 内联写不会与 pump 写交错；manager 不必为此再入队。
-// socketID 当前仅随参数对齐语义（订阅发生地），快照内容只由 sessionID 决定；
-// 留作后续日志/按 origin 裁剪的挂点。
-func (m *agentAIManager) emitSessionSnapshot(socketID, sessionID string, writeJSON agentTerminalWriter) {
-	if writeJSON == nil || sessionID == "" {
-		return
+// buildSessionSnapshotPayload 订阅握手回包载荷（spec §4.1）：转录快照（journal
+// 读侧现成解析）+ 待审批 + 状态。尽力而为：转录取不到（非 journal 会话/读失
+// 败）就只回 pending+status，不报错。纯读、不触任何 socket——调用方先 build
+// 再订阅再入队（2026-11-09 审计序仲裁：journal 读取发生在订阅前，订阅后
+// fanOut 才可能向本 socket 投递 delta，而快照载荷此后才入队，队列 FIFO 保证
+// 订阅后的 delta 恒在快照之后）。
+func (m *agentAIManager) buildSessionSnapshotPayload(sessionID string) map[string]interface{} {
+	if sessionID == "" {
+		return nil
 	}
 	payload := map[string]interface{}{
 		"type":       models.AgentEventAISessionSnapshot,
@@ -300,7 +298,37 @@ func (m *agentAIManager) emitSessionSnapshot(socketID, sessionID string, writeJS
 	if pending := m.pendingApprovalsSnapshotForSession(sessionID); len(pending) > 0 {
 		payload["pending_approvals"] = pending
 	}
-	_ = writeJSON(payload)
+	return payload
+}
+
+// enqueueSessionSnapshot 把已构建载荷投进 socket pump 队列，与 delta 同通道
+// FIFO 保序（2026-11-09 审计：旧实现在读 goroutine 上内联直写，可抢在已入队
+// delta 之前到达——客户端先收全 done 快照再收迟到 delta，delta 被 done 屏障
+// 吞掉）。socket 缺席（本地半订阅极端场景，评审 M4 / manager 未就绪 socketID=
+// ""）回落直写，保持只读握手语义。
+//
+// 本修复覆盖的正是审计事故形态：刷新/重连后新连接是**纯订阅者**（旧 origin
+// socket 已死），其 delta 全部走 fanOutFrom→enqueue，故快照入同一队列即保序。
+// 残余两窗（现架构属性，均自愈，不构成回归）：
+//  1. 构建→订阅之间落进 journal 的 delta 既不在快照里、也还没订阅到（微秒级，
+//     回合末终态快照/详情补齐）；
+//  2. 本连接即 origin 时 delta 走 fanOutWrite 的内联直写（不受队列序约束），
+//     可与队列里的快照竞争——该形态前端本就有本地 running 气泡，无吞流后果。
+func (m *agentAIManager) enqueueSessionSnapshot(socketID string, payload map[string]interface{}, writeJSON agentTerminalWriter) {
+	if payload == nil {
+		return
+	}
+	m.mu.Lock()
+	s := m.aiSockets[socketID]
+	m.mu.Unlock()
+	if s != nil && s.alive() {
+		s.enqueue(payload)
+		return
+	}
+	// socket 缺席（本地半订阅极端场景，评审 M4）：只能直写，只读握手语义不变。
+	if writeJSON != nil {
+		_ = writeJSON(payload)
+	}
 }
 
 // pendingApprovalsSnapshotForSession 单会话版待审批快照（字段口径与全量版

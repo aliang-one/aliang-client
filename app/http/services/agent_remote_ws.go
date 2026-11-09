@@ -929,8 +929,14 @@ func (s *AgentService) handleRemoteAgentMessage(ctx context.Context, msg map[str
 			return
 		}
 		if msgType == models.AgentEventAISessionSubscribe {
+			// 快照先读后订（2026-11-09 审计序仲裁）：journal 读取发生在订阅前
+			// ——订阅后 fanOut 才可能向本 socket 投递 delta，而快照载荷此后才
+			// 入队，队列 FIFO 保证订阅后的 delta 恒在快照之后；先订后读的旧序
+			// 里，已入队 delta 会被晚到的全 done 快照整体替换冲掉（吞流根因，
+			// 前端 running 占位保留为兜底）。
+			payload := s.ai.buildSessionSnapshotPayload(sessionID)
 			s.ai.subscribeAISocket(agentAIRemoteSocketID, sessionID)
-			s.ai.emitSessionSnapshot(agentAIRemoteSocketID, sessionID, writeJSON)
+			s.ai.enqueueSessionSnapshot(agentAIRemoteSocketID, payload, writeJSON)
 		} else {
 			s.ai.unsubscribeAISocket(agentAIRemoteSocketID, sessionID)
 		}
@@ -1133,8 +1139,12 @@ func (s *AgentService) DispatchLocalAI(msg map[string]interface{}, writeJSON fun
 			return
 		}
 		if msgType == models.AgentEventAISessionSubscribe {
+			// 快照先读后订 + 队列下发（2026-11-09 审计序仲裁，与远端路径同
+			// 语义）：socket 不存在（半订阅）时 enqueueSessionSnapshot 回落
+			// 直写，只读握手语义不变。
+			payload := s.ai.buildSessionSnapshotPayload(sessionID)
 			s.ai.subscribeAISocket(socketID, sessionID)
-			s.ai.emitSessionSnapshot(socketID, sessionID, writeJSON)
+			s.ai.enqueueSessionSnapshot(socketID, payload, writeJSON)
 		} else {
 			s.ai.unsubscribeAISocket(socketID, sessionID)
 		}
