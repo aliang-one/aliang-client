@@ -17,6 +17,7 @@ import (
 	"aliang.one/nursorgate/outbound/meshproto"
 	"aliang.one/nursorgate/outbound/proxy"
 	"aliang.one/nursorgate/outbound/proxy/proto"
+	"aliang.one/nursorgate/processor/config"
 )
 
 // PikoDialFunc 拨 piko 端点(中继载体 A 侧,design §3.1 载体 A:每条拨号即
@@ -123,21 +124,24 @@ func (p *Peer) DialContext(ctx context.Context, md *M.Metadata) (net.Conn, error
 	}
 
 	// 载体一:LAN 直连(design §5 LAN 优先,同网段更快)——全类别可达,
-	// 顺序尝试,单地址失败不中断。
+	// 顺序尝试,单地址失败不中断;每地址按 lanDialCandidates 展开为双端口
+	// 候选(手填旧口 56441 + 对端已升级统一口 56432,spec §6.7)。
 	var lastErr error
 	for _, addr := range p.target.LANAddrs {
-		conn, err := dialLAN(ctx, addr)
-		if err != nil {
-			lastErr = err
-			continue
+		for _, candidate := range lanDialCandidates(addr) {
+			conn, err := dialLANFn(ctx, candidate)
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			if err := writeHeader(conn, line); err != nil {
+				_ = conn.Close()
+				lastErr = fmt.Errorf("mesh: write header to %s: %w", candidate, err)
+				continue
+			}
+			proxy.SetKeepAlive(conn)
+			return conn, nil
 		}
-		if err := writeHeader(conn, line); err != nil {
-			_ = conn.Close()
-			lastErr = fmt.Errorf("mesh: write header to %s: %w", addr, err)
-			continue
-		}
-		proxy.SetKeepAlive(conn)
-		return conn, nil
 	}
 
 	// 载体二:piko 中继(design §3.1 载体 A)——仅自身/AI 类别准入(design
@@ -185,6 +189,24 @@ func writeHeader(conn net.Conn, line string) error {
 // lanDialTimeout 是 LAN 载体单地址拨号兜底超时(参考 agent_peer_lan.go
 // agentLanDialTimeout 先例);ctx 自带 deadline 时以 ctx 为准(更紧者生效)。
 const lanDialTimeout = 5 * time.Second
+
+// dialLANFn 是 dialLAN 的拨号缝(测试替换用):候选展开循环经此调用,生产
+// 默认即 dialLAN(真拨号)。var 而非直调是为钉 TestDialContextLANCandidate
+// Fallback 的候选序列。
+var dialLANFn = dialLAN
+
+// lanDialCandidates 手填地址双端口候选(spec §6.7):原样优先(旧版对端
+// 56441 直达),追加统一口候选(手填旧口+对端已升级的场景);已是统一口
+// 或畸形地址(无端口)不展开。beacon 发现项带实际端口,同函数受益(追加项
+// 与实际端口不同才追加——端口本就非统一口时会多一次对同主机的统一口尝试,
+// LAN refused 是瞬时失败,时延可忽略)。
+func lanDialCandidates(addr string) []string {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil || port == strconv.Itoa(config.DefaultHTTPProxyPort) {
+		return []string{addr}
+	}
+	return []string{addr, net.JoinHostPort(host, strconv.Itoa(config.DefaultHTTPProxyPort))}
+}
 
 func dialLAN(ctx context.Context, addr string) (net.Conn, error) {
 	var d net.Dialer
