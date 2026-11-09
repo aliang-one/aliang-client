@@ -183,3 +183,22 @@ SSH 入口卡片端口展示改统一口(56432);`ssh_ingress.port` 输入框移�
 - SSH 载体 `IngressFrameMeta` 与 mesh 分支 `InheritedHeaderFromContext` 的 context 载体统一(SSH 载体多跳续传,跟随 mesh 分支集成批次;见 inbound/ssh/mesh_inject.go 集成期注记);
 - socks5 user/pass 认证与 UDP ASSOCIATE(如有真实需求再立项);
 - 仪表盘统一口状态卡片(嗅探分派计数等观测面)。
+
+---
+
+## 11. 修订记录
+
+### 2026-11-10 修订:ssh_ingress.port 恢复生效(可选专用口)
+
+用户需求推翻 D 系决策中「port 运行面忽略」的定案,恢复专用监听能力,语义改为**双路径**:
+
+| `ssh_ingress.port` | 行为 |
+|---|---|
+| 0/缺省/**56442**(旧默认哨兵) | 跟随统一口:56432 嗅探承载,随代理运行态 |
+| 其他显式值 | 另开常驻专用口 `ServiceBindHost:port`,随入口开关(Reconcile 驱动,不随代理启停);56432 嗅探分派**仍接收**(用户拍板,同一实例双路径) |
+
+- **哨兵映射**:旧默认 56442 由翻译层(`effectivePortForRunConfig`)归零——存量配置升级不凭空复活专用口;前端显示层同口径映射(56442 显示为空,保存发 0)。
+- **host 语义**:专用口绑 ServiceBindHost(默认回环,--host 放宽);统一口路径继承 56432 绑定策略(D2 不变)。
+- **runIdentity 重纳入 port**:起/停/换口是 listener 级变更即重启;bind 冲突停留止态下周期重试。
+- **§6.8 修订**:端口输入框回归(placeholder=「留空 = 统一口 56432」),双模式提示文案替代只读展示。
+- 本修订连同 v1.1.105 的「56442/56441 不再监听」发布说明依然成立:56442 哨兵语义保证默认升级路径不监听 56442。

@@ -278,23 +278,27 @@ func TestReconcilePortChangeRestarts(t *testing.T) {
 	}
 }
 
-// TestReconcileLegacySentinelDoesNotRestart 旧默认 56442 是哨兵(翻译层归零
-// →跟随统一口):存量配置的 56442 与 0 是同一期望态,重复 reconcile 不重启
-// (升级不凭空复活专用口)。
-func TestReconcileLegacySentinelDoesNotRestart(t *testing.T) {
+// TestReconcileRawPortIsDedicated 本层不翻译哨兵:RunConfig.Port 原样生效
+// (56442 在本层=专用口 56442,与 0 不同期望态即重启起专用口)。「56442→
+// 跟随统一口」的哨兵映射在 services 翻译层(effectivePortForRunConfig),
+// 端到端钉子在 services 的 reconcile 测试。
+func TestReconcileRawPortIsDedicated(t *testing.T) {
 	hostKeyPath := filepath.Join(t.TempDir(), IngressHostKeyFileName)
 	t.Cleanup(func() { Reconcile(nil, hostKeyPath, nil) })
 
 	humanPub, _ := newTestKey(t)
-	Reconcile(&RunConfig{AuthorizedKeys: []gossh.PublicKey{humanPub}}, hostKeyPath, func() string { return "node-sentinel" })
+	Reconcile(&RunConfig{AuthorizedKeys: []gossh.PublicKey{humanPub}}, hostKeyPath, func() string { return "node-raw" })
 	inflight := injectInflightConn(t)
 
-	// 56442(翻译层已归零)与 0 同一期望态 → 不重启。
-	Reconcile(&RunConfig{Port: 56442, AuthorizedKeys: []gossh.PublicKey{humanPub}}, hostKeyPath, func() string { return "node-sentinel" })
+	// 原始 56442 ≠ 0:重启起专用口(在途连接拆除,Addr 暴露 56442)。
+	Reconcile(&RunConfig{Port: 56442, AuthorizedKeys: []gossh.PublicKey{humanPub}}, hostKeyPath, func() string { return "node-raw" })
 	if !IsRunning() {
-		t.Fatal("sentinel reconcile must keep ingress running")
+		t.Fatal("raw port reconcile must keep ingress running")
 	}
-	assertConnAlive(t, inflight)
+	assertConnDead(t, inflight)
+	if _, port, err := net.SplitHostPort(Addr()); err != nil || port != "56442" {
+		t.Fatalf("Addr = %q, want dedicated 56442 (raw semantics, no sentinel at this layer)", Addr())
+	}
 }
 
 // TestReconcilePortConflictStaysStoppedAndRetries 专用口被外部占住 → 起口
