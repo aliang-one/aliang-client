@@ -205,15 +205,62 @@ func (h *agentCoreMCPSessionHolder) Close() {
 	h.dead = true // 防关闭后再触发重连(泄漏面)
 }
 
-// call 暂为直通(Task 6 换成重连版)。判死检查先行——Close 后 dead=true,
-// nil session 不会被解引用。
+// agentCoreMCPCallError 携带面向模型的最终文案。Execute 原样采用，不再二次
+// 包装——判死文案与「已自动重连」文案都由 holder 定型，避免出现
+// 「MCP 调用失败: MCP 调用失败(已自动重连): ...」双层前缀。
+type agentCoreMCPCallError struct{ text string }
+
+func (e *agentCoreMCPCallError) Error() string { return e.text }
+
+// call 锁内 CallTool；transport 层失败（err != nil）触发重连：关旧会话 →
+// 重拨（子 ctx 带 cancel，deadline 由 DialWithTimeout 外部施加）→ 换新 →
+// 单次重试。IsError=true 的结果是工具逻辑报错（协议链路健康），不重连。
+// 判死：连续 agentCoreMCPReconnectDeadCap 次「重连后仍失败」→ dead，后续
+// 调用快速失败。重拨失败路径 holder.session 保持为已关闭旧会话、不置 nil
+// ——判死路径与拨号计数断言依赖此语义（spec §4.3c）。
+//
+// 判死检查先行——Close 后 dead=true，nil session 不会被解引用。
 func (h *agentCoreMCPSessionHolder) call(ctx context.Context, tool string, args map[string]interface{}) (*mcp.CallToolResult, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.dead {
-		return nil, fmt.Errorf("MCP server 已在本次运行内判死(连续 %d 次重连失败),本 run 内请勿继续调用该 server 工具", agentCoreMCPReconnectDeadCap)
+		return nil, &agentCoreMCPCallError{text: fmt.Sprintf("MCP server 已在本次运行内判死(连续 %d 次重连失败),本 run 内请勿继续调用该 server 工具", agentCoreMCPReconnectDeadCap)}
 	}
-	return h.session.CallTool(ctx, &mcp.CallToolParams{Name: tool, Arguments: args})
+	res, err := h.session.CallTool(ctx, &mcp.CallToolParams{Name: tool, Arguments: args})
+	if err == nil {
+		h.consecFail = 0
+		return res, nil
+	}
+	if h.closeFn != nil {
+		h.closeFn()
+	}
+	dctx, dcancel := context.WithCancel(ctx)
+	session, closeFn, derr := agentCoreMCPDialWithTimeout(h.dial, dctx, h.raw, agentCoreMCPInitTimeout)
+	if derr != nil {
+		dcancel()
+		h.noteReconnectFailure(derr)
+		return nil, &agentCoreMCPCallError{text: "MCP 调用失败(已自动重连): " + err.Error()}
+	}
+	h.session = session
+	h.closeFn = func() { closeFn(); dcancel() }
+	logger.Info(fmt.Sprintf("agentcore-mcp: server=%s 重连成功", sanitizeAgentCoreMCPSegment(h.raw.Name)))
+	res2, err2 := session.CallTool(ctx, &mcp.CallToolParams{Name: tool, Arguments: args})
+	if err2 != nil {
+		h.noteReconnectFailure(err2)
+		return nil, &agentCoreMCPCallError{text: "MCP 调用失败(已自动重连): " + err2.Error()}
+	}
+	h.consecFail = 0
+	return res2, nil
+}
+
+// noteReconnectFailure 记账：连续失败达判死阈值则标记，本 run 不再拨号。
+func (h *agentCoreMCPSessionHolder) noteReconnectFailure(err error) {
+	h.consecFail++
+	logger.Warn(fmt.Sprintf("agentcore-mcp: server=%s 重连失败(第 %d 次): %v", sanitizeAgentCoreMCPSegment(h.raw.Name), h.consecFail, err))
+	if h.consecFail >= agentCoreMCPReconnectDeadCap {
+		h.dead = true
+		logger.Warn(fmt.Sprintf("agentcore-mcp: server=%s 已判死,本 run 内不再重连", sanitizeAgentCoreMCPSegment(h.raw.Name)))
+	}
 }
 
 // agentCoreMCPBridge 把一个 MCP 工具包成内核 agentcore.Tool。
@@ -246,7 +293,7 @@ func (b *agentCoreMCPBridge) Execute(ctx context.Context, input map[string]inter
 	var text string
 	isErr := false
 	if err != nil {
-		isErr, text = true, "MCP 调用失败: "+err.Error()
+		isErr, text = true, err.Error() // agentCoreMCPCallError 携带最终文案
 	} else {
 		text, isErr = agentCoreMCPResultText(res)
 	}

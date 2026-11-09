@@ -1436,3 +1436,96 @@ func TestAgentCoreMCPRawServersParseToolLists(t *testing.T) {
 		t.Fatalf("exclude 解析错误: %v", raws[0].ExcludeTools)
 	}
 }
+
+// agentCoreMCPCallError 携带面向模型的最终文案,Execute 原样采用不再二次包装
+// (判死文案与「已自动重连」文案都由 holder 定型)。
+func TestAgentCoreMCPHolderReconnectSuccess(t *testing.T) {
+	good := startTestMCPSession(t, "t", func(map[string]interface{}) (string, bool) { return "ok", false })
+	dialCalls := 0
+	dial := func(context.Context, agentCoreMCPRawServer) (*mcp.ClientSession, func(), error) {
+		dialCalls++
+		return good, func() { _ = good.Close() }, nil
+	}
+	init := startTestMCPSession(t, "t", func(map[string]interface{}) (string, bool) { return "ok", false })
+	_ = init.Close() // 初始会话立死,逼出重连
+	h := newAgentCoreMCPSessionHolder(init, func() { _ = init.Close() }, agentCoreMCPRawServer{Name: "srv"}, dial)
+	b := &agentCoreMCPBridge{holder: h, rawTool: "t", name: "mcp__srv__t"}
+	res := b.Execute(context.Background(), map[string]interface{}{}, nil)
+	if res.IsError || !strings.Contains(res.Content, "ok") {
+		t.Fatalf("重连后应成功: %+v", res)
+	}
+	if dialCalls != 1 {
+		t.Fatalf("应恰好重拨一次: %d", dialCalls)
+	}
+}
+
+func TestAgentCoreMCPHolderIsErrorNoReconnect(t *testing.T) {
+	dialCalls := 0
+	dial := func(context.Context, agentCoreMCPRawServer) (*mcp.ClientSession, func(), error) {
+		dialCalls++
+		return nil, nil, fmt.Errorf("不应拨号")
+	}
+	session := startTestMCPSession(t, "t", func(map[string]interface{}) (string, bool) { return "工具报错", true })
+	h := newAgentCoreMCPSessionHolder(session, func() { _ = session.Close() }, agentCoreMCPRawServer{Name: "srv"}, dial)
+	b := &agentCoreMCPBridge{holder: h, rawTool: "t", name: "mcp__srv__t"}
+	res := b.Execute(context.Background(), map[string]interface{}{}, nil)
+	if !res.IsError || !strings.Contains(res.Content, "工具报错") {
+		t.Fatalf("IsError 应原样透传: %+v", res)
+	}
+	if dialCalls != 0 {
+		t.Fatalf("工具逻辑报错不得触发重连: %d", dialCalls)
+	}
+}
+
+func TestAgentCoreMCPHolderDeadAfterCap(t *testing.T) {
+	dialCalls := 0
+	dial := func(context.Context, agentCoreMCPRawServer) (*mcp.ClientSession, func(), error) {
+		dialCalls++
+		s := startTestMCPSession(t, "t", func(map[string]interface{}) (string, bool) { return "ok", false })
+		_ = s.Close() // 拨出来的也立死
+		return s, func() { _ = s.Close() }, nil
+	}
+	init := startTestMCPSession(t, "t", func(map[string]interface{}) (string, bool) { return "ok", false })
+	_ = init.Close()
+	h := newAgentCoreMCPSessionHolder(init, func() { _ = init.Close() }, agentCoreMCPRawServer{Name: "srv"}, dial)
+	b := &agentCoreMCPBridge{holder: h, rawTool: "t", name: "mcp__srv__t"}
+	for i := 0; i < agentCoreMCPReconnectDeadCap; i++ {
+		res := b.Execute(context.Background(), map[string]interface{}{}, nil)
+		if !res.IsError || !strings.Contains(res.Content, "已自动重连") {
+			t.Fatalf("第 %d 次应失败且注明已重连: %+v", i+1, res)
+		}
+	}
+	res := b.Execute(context.Background(), map[string]interface{}{}, nil)
+	if !res.IsError || !strings.Contains(res.Content, "判死") || !strings.Contains(res.Content, "3") {
+		t.Fatalf("判死文案错误: %+v", res)
+	}
+	if dialCalls != agentCoreMCPReconnectDeadCap {
+		t.Fatalf("判死后不得再拨号: dialCalls=%d", dialCalls)
+	}
+}
+
+func TestAgentCoreMCPHolderCloseClosesCurrent(t *testing.T) {
+	var closedLog []string
+	good := startTestMCPSession(t, "t", func(map[string]interface{}) (string, bool) { return "ok", false })
+	dial := func(context.Context, agentCoreMCPRawServer) (*mcp.ClientSession, func(), error) {
+		return good, func() { _ = good.Close(); closedLog = append(closedLog, "s2") }, nil
+	}
+	init := startTestMCPSession(t, "t", func(map[string]interface{}) (string, bool) { return "ok", false })
+	_ = init.Close()
+	h := newAgentCoreMCPSessionHolder(init, func() { closedLog = append(closedLog, "s1") }, agentCoreMCPRawServer{Name: "srv"}, dial)
+	b := &agentCoreMCPBridge{holder: h, rawTool: "t", name: "mcp__srv__t"}
+	if res := b.Execute(context.Background(), map[string]interface{}{}, nil); res.IsError {
+		t.Fatalf("重连应成功: %+v", res)
+	}
+	h.Close() // 必须关到换后的新会话
+	// 重连路径先关旧会话(记录 s1),Close 再关换上的新会话(记录 s2):
+	// 两条都必须证——「旧会话在换时已关」(防泄漏)+「新会话被 Close 关到」。
+	if len(closedLog) != 2 || closedLog[0] != "s1" || closedLog[1] != "s2" {
+		t.Fatalf("关闭序应为 [s1(换时关旧), s2(Close 关新)]: %v", closedLog)
+	}
+	// Close 后再调用:判死快速失败,不拨号不解引用 nil
+	res := b.Execute(context.Background(), map[string]interface{}{}, nil)
+	if !res.IsError || !strings.Contains(res.Content, "判死") {
+		t.Fatalf("Close 后应判死快速失败: %+v", res)
+	}
+}
