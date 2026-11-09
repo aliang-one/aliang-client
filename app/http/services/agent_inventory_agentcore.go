@@ -131,6 +131,11 @@ func readAgentCoreSessionMetaWithOptions(path string, options agentVibeSessionRe
 	// （写侧已保证）。
 	subagentEntries := make(map[string]*models.AgentVibeSubagent)
 	subagentOrder := make([]string, 0, 4)
+	// sawEnd：会话是否出现过 run 终态行（success/stopped/error）。出现即代表
+	// 主回合已收束——此刻仍未 finish 的子 agent 已被确证死亡（进程崩溃/断电
+	// 留下的 start 无 finish 僵尸行），组装时降级 interrupted（审计 2026-11-09）。
+	// 无 end 行的文件（进行中/写入中断）不降级，避免误杀活着的子 run。
+	sawSubagentEnd := false
 	forEachAgentSessionJSONLLine(path, maxLineBytes, func(line []byte) bool {
 		var row struct {
 			Kind           string                       `json:"kind"`
@@ -353,6 +358,7 @@ func readAgentCoreSessionMetaWithOptions(path string, options agentVibeSessionRe
 		case "end":
 			// 终态行：失败真因 + 诊断块。诊断面板据此在重开旧会话时还原「这一轮
 			// 为什么死」。行按序追加，多次 run 时最后一次 end 胜出。
+			sawSubagentEnd = true
 			// 注意不写 session.Status：那是列表视图的既有契约（默认 "closed"，手
 			// 机按它映射），单次 run 的终态语义收进 Diagnostics.Status，两套口径
 			// 不互相污染。
@@ -412,6 +418,16 @@ func readAgentCoreSessionMetaWithOptions(path string, options agentVibeSessionRe
 	if len(subagentOrder) > 0 {
 		// 按 order 切片（行序=时间序）输出；缺 finish 的 entry 保持 started。
 		// 列表/同步出口由 summarizeAgentVibeSessions 剥离（详情契约≠清单契约）。
+		// 会话已收束（有 end 行）而子 agent 仍 started = 进程崩溃/断电僵尸
+		// （正常取消由桥 defer 写 interrupted，进程级死亡则什么终态行都没有）
+		// ——降级 interrupted，防面板永久「运行中」卡（审计 2026-11-09）。
+		if sawSubagentEnd {
+			for _, entry := range subagentEntries {
+				if entry.Status == "started" {
+					entry.Status = "interrupted"
+				}
+			}
+		}
 		subagents := make([]models.AgentVibeSubagent, 0, len(subagentOrder))
 		for _, taskID := range subagentOrder {
 			subagents = append(subagents, *subagentEntries[taskID])

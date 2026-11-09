@@ -1425,20 +1425,20 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		logger.Warn(fmt.Sprintf(format, args...))
 	}
 
-	// 子 agent 注入（spec：docs/superpowers/specs/2026-10-27-agentcore-subagents-design.md）：
-	// readOnly run 不注入（mirror MCP 只读决策——上方 raws=nil 同一判据）；
-	// 定义集为空不注入。桥递归子 run（depth=1），MCP 桥/审批/journal/围栏
-	// 全部复用主 run 的这一份。注入非空时给主 run system prompt 追加机制
-	// 说明块（agentCoreSubagentMechanismSuffix）：模型可见面上必须有「这是
-	// 子agent + 可并行 + 生命周期归属」的宣告，否则自我报告错位且不主动派发
-	// （vm459 实测 2026-11-08）。
+	// 子 agent 注入（spec：docs/superpowers/specs/2026-10-27-agentcore-subagents-design.md；
+	// 原生派发面 2026-11-09：统一 task 路由器，claude Task 同款形态）：
+	// readOnly run 不注入（mirror MCP 只读决策——上方 raws=nil 同一判据）。
+	// 定义集为空回落内置默认（agentCoreSubagentMergedDefs）——装机即有可用
+	// 子 agent（vm459/vm22「没定义=没法派发」事故根治）。router 递归子 run
+	// （depth=1），MCP 桥/审批/journal/围栏全部复用主 run 的这一份。注入时
+	// 给主 run system prompt 追加机制说明块：模型可见面上必须有「这是
+	// 子agent + 可并行 + 生命周期归属 + 上下文隔离 + 写冲突警告」的宣告，
+	// 否则自我报告错位且不主动派发（vm459 实测 2026-11-08）。
 	subagentPrompt := ""
 	if !run.readOnly {
-		if subTools := m.agentCoreSubagentTools(run, kernelClient, kernelEnv, kernelApprove, kernelLogf, mcpTools, subagentMirror); len(subTools) > 0 {
-			for _, tool := range subTools {
-				registry.Register(tool)
-			}
-			subagentPrompt = agentCoreSubagentMechanismSuffix(len(subTools))
+		if router := m.agentCoreSubagentTaskTool(run, kernelClient, kernelEnv, kernelApprove, kernelLogf, mcpTools, subagentMirror); router != nil {
+			registry.Register(router)
+			subagentPrompt = agentCoreSubagentMechanismSuffix(router)
 		}
 		// 设备互访工具注入（spec 2026-10-29 §7.2 阶段 1 四件）：与 MCP/子 agent
 		// 桥同款宿主注入。桥内共享注册表 handler 实现（POST 编排），自带

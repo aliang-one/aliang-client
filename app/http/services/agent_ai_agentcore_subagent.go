@@ -527,8 +527,14 @@ func (b *agentCoreSubagentBridge) Execute(ctx context.Context, input map[string]
 	var toolUses atomic.Int64
 	if tracked {
 		defer func() {
+			// 相位判定先取消后错误（2026-11-09 审计）：主回合停止/超时时
+			// agentcore.Run 返回的 err 就是 ctx 错，isErr 会被置 true——若先判
+			// isErr 会把取消错标 failed，与 claude 侧 finalizeRunSubagents 的
+			// live interrupted 口径分裂（面板历史卡 vs 实时卡语义不一致）。
 			phase := "completed"
-			if isErr {
+			if ctx.Err() != nil {
+				phase = "interrupted"
+			} else if isErr {
 				phase = "failed"
 			}
 			b.mirror.finish(b.name, subTaskID, phase, text, time.Since(startedAt), totalTokens)
@@ -544,9 +550,18 @@ func (b *agentCoreSubagentBridge) Execute(ctx context.Context, input map[string]
 	} else if b.onToolCall != nil {
 		toolHook = b.onToolCall
 	}
+	// model 覆盖（原生派发面 2026-11-09）：input 显式给 model 时优先于定义
+	// frontmatter——派发者按任务选档（claude Task model 参数同语义）；策略
+	// 仍走 agentCoreSubagentModel（仅 glm-* 生效，其余回落主模型）。
+	defModel := b.defModel
+	if v, ok := input["model"].(string); ok {
+		if trimmed := strings.TrimSpace(v); trimmed != "" {
+			defModel = trimmed
+		}
+	}
 	cfg := &agentcore.Config{
 		Client:  b.client,
-		Model:   agentCoreSubagentModel(b.defModel, b.mainModel),
+		Model:   agentCoreSubagentModel(defModel, b.mainModel),
 		System:  b.subSystem(),
 		Tools:   b.subRegistry(mcpTools, toolHook),
 		Env:     b.env,
@@ -605,8 +620,100 @@ func (m *agentAIManager) agentCoreSubagentTools(run agentAIRun,
 	logf func(string, ...interface{}),
 	mcpTools []agentcore.Tool,
 	mirror *agentCoreSubagentMirror) []agentcore.Tool {
+	router := m.agentCoreSubagentTaskTool(run, client, env, approve, logf, mcpTools, mirror)
+	if router == nil {
+		return nil
+	}
+	return []agentcore.Tool{router}
+}
 
+// agentCoreSubagentBuiltinDefs 内置默认定义（2026-11-09 vm459/vm22 事故根治）：
+// 用户定义目录为空/缺名时兜底——此前无定义机器上桥=0、机制块不追加，模型既无
+// 派发工具也无机制认知，「装了最新版还是没法派发」。Model 空=沿用主模型（内置
+// 定义不绑定具体上游）；用户同名定义优先覆盖（合并语义见 agentCoreSubagentMergedDefs）。
+var agentCoreSubagentBuiltinDefs = []agentCoreSubagentDef{
+	{
+		Name:        "researcher",
+		Description: "调研任务——收集资料、对比方案、验证假设、输出结构化结论",
+		Body:        "你是调研员。针对交给你的任务收集资料并验证假设,输出结构化调研报告(事实/依据/结论)。",
+	},
+}
+
+// agentCoreSubagentMergedDefs 用户域定义 + 内置默认合并：同名用户定义优先
+// （用户写了 researcher.md 就用用户的），内置只补缺。
+func agentCoreSubagentMergedDefs() []agentCoreSubagentDef {
 	defs := agentCoreSubagentDefsIn(agentHome())
+	have := make(map[string]bool, len(defs))
+	for _, d := range defs {
+		have[d.Name] = true
+	}
+	for _, d := range agentCoreSubagentBuiltinDefs {
+		if !have[d.Name] {
+			defs = append(defs, d)
+		}
+	}
+	return defs
+}
+
+// agentCoreSubagentTaskRouter 原生统一派发面（vm22 反馈 2026-11-09「多 agent
+// 支持要原生的」）：claude Task 同款形态——一个 task 工具，subagent_type 选
+// 角色、task 派任务、model 可选覆盖；替代此前「N 定义 N 零散工具」。每座桥
+// 降为内部引擎（并行/镜像/journal/超时机器零改动），router 只做类型路由。
+type agentCoreSubagentTaskRouter struct {
+	description  string
+	ceiling      time.Duration
+	bridges      map[string]*agentCoreSubagentBridge
+	types        []string // 稳定序类型名（机制块枚举 + 未知类型报错提示）
+	descriptions map[string]string
+}
+
+func (r *agentCoreSubagentTaskRouter) Name() string        { return "task" }
+func (r *agentCoreSubagentTaskRouter) Description() string { return r.description }
+func (r *agentCoreSubagentTaskRouter) hasType(t string) bool {
+	_, ok := r.bridges[t]
+	return ok
+}
+
+// TimeoutHint/Parallelizable 必须在 router 上实现：内核执行的是注册进
+// registry 的这个工具——单工具窗口（6h，子 run 等审批不被 10min 连坐）与
+// 同回合并行批判定都看它，而不是内部桥。
+func (r *agentCoreSubagentTaskRouter) TimeoutHint() time.Duration { return r.ceiling }
+func (r *agentCoreSubagentTaskRouter) Parallelizable() bool       { return true }
+
+func (r *agentCoreSubagentTaskRouter) InputSchema() map[string]interface{} {
+	return map[string]interface{}{
+		"type": "object",
+		"properties": map[string]interface{}{
+			"subagent_type": map[string]interface{}{"type": "string", "description": "要派发的子 agent 类型名（见 system prompt <subagents> 类型清单）"},
+			"task":          map[string]interface{}{"type": "string", "description": "交给子 agent 的任务描述（自包含——子 agent 看不到本对话）"},
+			"model":         map[string]interface{}{"type": "string", "description": "可选：覆盖子 agent 模型（仅 glm-* 生效，其余回落主模型）"},
+		},
+		"required": []interface{}{"subagent_type", "task"},
+	}
+}
+
+func (r *agentCoreSubagentTaskRouter) Execute(ctx context.Context, input map[string]interface{}, env *agentcore.ToolEnv) agentcore.ToolResult {
+	typ, _ := input["subagent_type"].(string)
+	typ = strings.TrimSpace(typ)
+	if typ == "" {
+		return agentcore.ToolResult{Content: "subagent_type 必填。可用类型: " + strings.Join(r.types, ", "), IsError: true}
+	}
+	b, ok := r.bridges[typ]
+	if !ok {
+		return agentcore.ToolResult{Content: fmt.Sprintf("未知子 agent 类型 %q。可用类型: %s", typ, strings.Join(r.types, ", ")), IsError: true}
+	}
+	// input 原样透传：桥自己校验 task 必填、读可选 model 覆盖。
+	return b.Execute(ctx, input, env)
+}
+
+func (m *agentAIManager) agentCoreSubagentTaskTool(run agentAIRun,
+	client *agentcore.Client, env *agentcore.ToolEnv,
+	approve func(context.Context, agentcore.ApprovalRequest) (agentcore.ApprovalResponse, error),
+	logf func(string, ...interface{}),
+	mcpTools []agentcore.Tool,
+	mirror *agentCoreSubagentMirror) *agentCoreSubagentTaskRouter {
+
+	defs := agentCoreSubagentMergedDefs()
 	if len(defs) == 0 {
 		return nil
 	}
@@ -634,7 +741,9 @@ func (m *agentAIManager) agentCoreSubagentTools(run agentAIRun,
 	}
 	mainModel := agentCoreModel(run)
 	seen := map[string]bool{}
-	out := make([]agentcore.Tool, 0, len(defs))
+	bridges := make(map[string]*agentCoreSubagentBridge, len(defs))
+	types := make([]string, 0, len(defs))
+	descriptions := make(map[string]string, len(defs))
 	for _, def := range defs {
 		// mcp__ 前缀剥除（名空间隔离，见 agentCoreSubagentBridgeName 注释）：
 		// 剥到不含前缀为止（"mcp__mcp__x" 也压干净），剥空则由段白名单回落
@@ -646,16 +755,14 @@ func (m *agentAIManager) agentCoreSubagentTools(run agentAIRun,
 		name := agentCoreSubagentBridgeName(raw, agentCoreSubagentReservedNames, seen)
 		desc := def.Description
 		if strings.TrimSpace(desc) == "" {
-			// 占位引用消解后的工具名（非 def.Name）：原名以 mcp__ 开头的定义
+			// 占位引用消解后的类型名（非 def.Name）：原名以 mcp__ 开头的定义
 			// 经剥除后可调用名已变，占位若引原名会诱导模型调错工具。
 			desc = "子 agent " + name + "（定义未写 description）"
 		}
-		// 机制前缀（vm459 实测 2026-11-08）：只透传定义 description 时模型
-		// 可见面上无任何字样宣告「这是子agent」——被问「你有子 agent 功能吗」
-		// 照实答没有，也不会主动派发。claude Task 工具描述内建自述
-		// （"Launch a new agent..."），这里对齐：每座桥自带机制语义。
-		desc = "子agent（独立内部线程，完成后报告回主对话）：" + desc
-		out = append(out, &agentCoreSubagentBridge{
+		// 桥描述不再带机制前缀：机制自述统一上收到 task 路由器描述 +
+		// <subagents> 机制块（原生派发面 2026-11-09）。桥已不可直接注册，
+		// 逐桥前缀只会污染机制块的类型枚举。
+		bridges[name] = &agentCoreSubagentBridge{
 			client:         client,
 			mainModel:      mainModel,
 			defModel:       def.Model,
@@ -674,32 +781,49 @@ func (m *agentAIManager) agentCoreSubagentTools(run agentAIRun,
 			toolCeiling:    agentCoreSubagentToolCeiling(),
 			skillsBlock:    skillsBlock,
 			mirror:         mirror,
-		})
+		}
+		types = append(types, name)
+		descriptions[name] = desc
 	}
-	logger.Info(fmt.Sprintf("agentcore-subagent: 注入 %d 个子 agent 桥", len(out)))
-	return out
+	router := &agentCoreSubagentTaskRouter{
+		// 机制前缀上收到统一派发面（原生自述）：模型可见面上必须宣告「这是
+		// 子agent」（vm459/vm22 实测：只透传定义 description 时被问「你有
+		// 子 agent 功能吗」照实答没有，也不会主动派发）。
+		description: "子agent（独立内部线程，完成后报告回主对话）：派发一个子 agent 执行任务并返回其完整报告。" +
+			"同回合多次调用并行执行（上限 4）。subagent_type 从 <subagents> 类型清单中选。",
+		ceiling:      agentCoreSubagentToolCeiling(),
+		bridges:      bridges,
+		types:        types,
+		descriptions: descriptions,
+	}
+	logger.Info(fmt.Sprintf("agentcore-subagent: 注入 task 路由器（%d 个类型）", len(types)))
+	return router
 }
 
 // agentCoreSubagentMechanismSuffix 返回主 run system prompt 的子 agent 机制
-// 说明块。n=注入桥数；0 返回空串（零副作用拼接）。工具名=定义名、描述=定义
-// description，主 run 可见面上没有机制宣告（vm459 实测 2026-11-08：模型被问
-// 「你有子 agent 功能吗」照实答没有）。claude 侧 Task 工具描述内建自述
-// （"Launch a new agent..."），本块对齐该语义：宣告并行能力与生命周期归属，
-// 引导模型主动派发。
-func agentCoreSubagentMechanismSuffix(n int) string {
-	if n <= 0 {
+// 说明块。router=nil/0 类型返回空串（零副作用拼接）。工具派发面已收成 task
+// 路由器（原生形态），机制块负责：宣告并行能力与生命周期归属、点明子 agent
+// 看不到主对话（task 必须自包含）、共享工作目录写冲突警告（模型感知盲区，
+// 审计 2026-11-09），并逐类型枚举可用角色。
+func agentCoreSubagentMechanismSuffix(router *agentCoreSubagentTaskRouter) string {
+	if router == nil || len(router.types) == 0 {
 		return ""
 	}
-	return "\n\n<subagents>\n" +
-		"You can delegate work to subagents via the provided subagent tools " +
-		"(their descriptions are prefixed with 子agent). Each call spawns an independent " +
-		"internal Aliang Agent run: a separate conversation thread with its own context and " +
-		"tool loop. Subagents dispatched in the same turn run concurrently (up to 4), and each " +
-		"subagent's final report is returned to you as the tool result. Its lifecycle is bound " +
-		"to the current turn.\n" +
-		"Use subagents for parallel research, codebase exploration, or independent subtasks; " +
-		"give each one a self-contained task description with enough context to work alone.\n" +
-		"Parallel subagents share the same working directory — parallelize read-only work " +
-		"(research, exploration); keep file-writing tasks sequential or scoped to distinct files.\n" +
-		"</subagents>"
+	var b strings.Builder
+	b.WriteString("\n\n<subagents>\n")
+	b.WriteString("You can delegate work to subagents (子agent) via the task tool. Each call spawns an ")
+	b.WriteString("independent internal Aliang Agent run: a separate conversation thread with its own context ")
+	b.WriteString("and tool loop. A subagent does NOT see this conversation — give each task a self-contained ")
+	b.WriteString("description with enough context to work alone. Subagents dispatched in the same turn run ")
+	b.WriteString("concurrently (up to 4); each subagent's final report is returned as the tool result, and its ")
+	b.WriteString("lifecycle is bound to the current turn.\n")
+	b.WriteString("Available subagent types (subagent_type):\n")
+	for _, t := range router.types {
+		fmt.Fprintf(&b, "- %s: %s\n", t, router.descriptions[t])
+	}
+	b.WriteString("Use subagents for parallel research, codebase exploration, or independent subtasks. ")
+	b.WriteString("Parallel subagents share the same working directory — parallelize read-only work; ")
+	b.WriteString("keep file-writing tasks sequential or scoped to distinct files.\n")
+	b.WriteString("</subagents>")
+	return b.String()
 }

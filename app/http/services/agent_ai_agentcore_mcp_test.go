@@ -1019,7 +1019,8 @@ func TestRunAgentCoreSubagentEndToEnd(t *testing.T) {
 	// allow_all（DefaultDecision=auto_approve、零规则）：reviewer 非 mcp__
 	// 前缀不走默认门，全程短路放行、零审批卡。
 	h := startAgentCoreApprovalHarness(t, builtinAllowAllPolicy(), []string{
-		agentCoreToolTurn("toolu_sub1", "reviewer", `{"task":"评审 main.go"}`),
+		// 原生派发面（2026-11-09）：主 run 调 task 工具、subagent_type 选角色。
+		agentCoreToolTurn("toolu_sub1", "task", `{"subagent_type":"reviewer","task":"评审 main.go"}`),
 		agentCoreTextTurn("评审完成：无问题", ""),
 		agentCoreTextTurn("好", "的"),
 	},
@@ -1050,14 +1051,14 @@ func TestRunAgentCoreSubagentEndToEnd(t *testing.T) {
 	if len(reqs) != 3 {
 		t.Fatalf("上游请求次数 = %d, want 3（主1+子1+主2，事件 %v）", len(reqs), log.types())
 	}
-	hasReviewer := false
+	hasTask := false
 	for _, def := range reqs[0].Tools {
-		if def.Name == "reviewer" {
-			hasReviewer = true
+		if def.Name == "task" {
+			hasTask = true
 		}
 	}
-	if !hasReviewer {
-		t.Fatalf("主 run 第 1 回合工具表缺 reviewer: %v", agentCoreToolDefNames(reqs[0].Tools))
+	if !hasTask {
+		t.Fatalf("主 run 第 1 回合工具表缺 task 路由器: %v", agentCoreToolDefNames(reqs[0].Tools))
 	}
 
 	// 子 run 请求（第 2 条）的白名单：只见 Read 不见 Write，也不得再见
@@ -1069,7 +1070,7 @@ func TestRunAgentCoreSubagentEndToEnd(t *testing.T) {
 			subHasRead = true
 		case "Write":
 			subHasWrite = true
-		case "reviewer":
+		case "task":
 			subHasReviewer = true
 		}
 	}
@@ -1078,7 +1079,7 @@ func TestRunAgentCoreSubagentEndToEnd(t *testing.T) {
 			subHasRead, subHasWrite, agentCoreToolDefNames(reqs[1].Tools))
 	}
 	if subHasReviewer {
-		t.Fatalf("子 run 工具表不得含子 agent 桥（depth=1）: %v", agentCoreToolDefNames(reqs[1].Tools))
+		t.Fatalf("子 run 工具表不得含 task 路由器（depth=1）: %v", agentCoreToolDefNames(reqs[1].Tools))
 	}
 
 	// 3) 子 run 真实执行穿透递归：主 run 第 2 回合（第 3 条请求）的
@@ -1091,7 +1092,8 @@ func TestRunAgentCoreSubagentEndToEnd(t *testing.T) {
 		t.Fatalf("tool_result = %q, want 含「评审完成：无问题」（子 run 结果穿透递归回主 run）", content)
 	}
 
-	// 4) journal：恰好一行 Task 行（kind=tool tool=reviewer，非错误，summary
+	// 4) journal：恰好一行 Task 行（kind=tool tool=reviewer=桥名/类型名，
+	// 非「task」工具名——journal 记类型保归属可读；summary
 	// 形态与 MCP e2e 的 q="hi" 口径看齐）。
 	lines := readJournalLines(t, agentCoreJournalDir(), h.sessionID)
 	taskRows := 0
@@ -1126,7 +1128,7 @@ func TestRunAgentCoreSubagentApprovalPropagation(t *testing.T) {
 		return "echo:" + q, false
 	})
 	// 零命中规则 + DefaultDecision=auto_approve（镜像 NoRuleMatch 用例）：
-	// reviewer（非 mcp__）短路放行；子 run 的 mcp__srv__echo 无显式规则命中
+	// 派发（task，非 mcp__）短路放行；子 run 的 mcp__srv__echo 无显式规则命中
 	// → 默认门强制手机审批。
 	h := startAgentCoreApprovalHarness(t, ApprovalPolicy{
 		Scheme:          "custom",
@@ -1137,7 +1139,7 @@ func TestRunAgentCoreSubagentApprovalPropagation(t *testing.T) {
 			Decision: decisionAutoApprove,
 		}},
 	}, []string{
-		agentCoreToolTurn("toolu_sub_ap", "reviewer", `{"task":"用 echo 查一下"}`),
+		agentCoreToolTurn("toolu_sub_ap", "task", `{"subagent_type":"reviewer","task":"用 echo 查一下"}`),
 		agentCoreToolTurn("toolu_sub_mcp", "mcp__srv__echo", `{"q":"hi"}`),
 		agentCoreTextTurn("子收尾", ""),
 		agentCoreTextTurn("好", "的"),

@@ -219,20 +219,23 @@ func TestAgentCoreSubagentApprovesSerializedAcrossSubruns(t *testing.T) {
 	gate := newAgentCoreApprovalGate()
 	tools := m.agentCoreSubagentTools(agentAIRun{sessionID: "s-approve", projectPath: os.Getenv("HOME"), model: "glm-5.2"},
 		client, nil, gate.wrap(rawApprove), nil, nil, nil)
-	if len(tools) != 2 {
-		t.Fatalf("桥数 = %d, want 2", len(tools))
+	// 原生派发面（2026-11-09）：唯一 task 路由器，两次并发调用以 subagent_type
+	// 选不同角色——审批互斥属性不变（同一道 gate 罩两个并发子 run）。
+	if len(tools) != 1 || tools[0].Name() != "task" {
+		t.Fatalf("应为唯一 task 路由器, got %+v", tools)
 	}
+	router := tools[0]
 
 	var wg sync.WaitGroup
 	wg.Add(2)
 	results := make([]string, 2)
 	started := time.Now()
-	for i, tool := range tools {
-		go func(i int, tool agentcore.Tool) {
+	for i, typ := range []string{"sub-a", "sub-b"} {
+		go func(i int, typ string) {
 			defer wg.Done()
-			res := tool.Execute(context.Background(), map[string]interface{}{"task": "干活"}, nil)
+			res := router.Execute(context.Background(), map[string]interface{}{"subagent_type": typ, "task": "干活"}, nil)
 			results[i] = fmt.Sprintf("isErr=%v content=%.80q", res.IsError, res.Content)
-		}(i, tool)
+		}(i, typ)
 	}
 	wg.Wait()
 	elapsed := time.Since(started)
@@ -263,12 +266,14 @@ func TestAgentCoreSubagentApprovesSerializedAcrossSubruns(t *testing.T) {
 // 上游脚本对任何请求交错都正确：req0=主 run 双 tool_use；req1/req2（两子
 // run 的首轮）都是 toolTurn；req3/req4（两子 run 的次轮）都是 endTurn。
 func TestAgentCoreSubagentsParallelViaKernelLoop(t *testing.T) {
+	// 原生派发面（2026-11-09）：同一 task 工具连调两次、subagent_type 选角
+	// ——并行批语义不变（相邻 Parallelizable 调用并发）。
 	dualTurn := `{"type":"message_start","message":{"id":"msg_dual","model":"glm-5.2"}}` + "\n\n" +
-		`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"u-a","name":"sub-a"}}` + "\n\n" +
-		`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"task\":\"A 任务\"}"}}` + "\n\n" +
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"u-a","name":"task"}}` + "\n\n" +
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"subagent_type\":\"sub-a\",\"task\":\"A 任务\"}"}}` + "\n\n" +
 		`data: {"type":"content_block_stop","index":0}` + "\n\n" +
-		`data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"u-b","name":"sub-b"}}` + "\n\n" +
-		`data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"task\":\"B 任务\"}"}}` + "\n\n" +
+		`data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"u-b","name":"task"}}` + "\n\n" +
+		`data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"subagent_type\":\"sub-b\",\"task\":\"B 任务\"}"}}` + "\n\n" +
 		`data: {"type":"content_block_stop","index":1}` + "\n\n" +
 		`data: {"type":"message_delta","delta":{"stop_reason":"tool_use"}}`
 	toolTurn := `{"type":"message_start","message":{"id":"msg_t","model":"glm-5.2"}}` + "\n\n" +
@@ -316,8 +321,8 @@ func TestAgentCoreSubagentsParallelViaKernelLoop(t *testing.T) {
 	bridges := m.agentCoreSubagentTools(
 		agentAIRun{sessionID: "s-kernel-parallel", projectPath: t.TempDir(), model: "glm-5.2"},
 		client, &agentcore.ToolEnv{ProjectPath: t.TempDir()}, gate.wrap(rawApprove), nil, nil, visMirror)
-	if len(bridges) != 2 {
-		t.Fatalf("桥数 = %d, want 2", len(bridges))
+	if len(bridges) != 1 || bridges[0].Name() != "task" {
+		t.Fatalf("应为唯一 task 路由器, got %+v", bridges)
 	}
 	registry := agentcore.NewRegistry()
 	for _, b := range bridges {

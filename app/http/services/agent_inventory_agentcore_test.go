@@ -534,3 +534,57 @@ func TestReadAgentCoreSessionMetaEndBarHeadlessFileSkipped(t *testing.T) {
 		t.Fatalf("诊断 enrich 口径不得受系统条改动影响: %+v", session.Diagnostics)
 	}
 }
+
+func TestAgentCoreSessionSubagentZombieDowngradeOnEnd(t *testing.T) {
+	// 审计修复（2026-11-09）：进程崩溃/断电会留下 start 无 finish 的僵尸行；
+	// 会话已有 end 终态行（stopped/error/success）时，started 子 agent 已被
+	// 确证死亡——读侧必须降级为 interrupted，否则面板永久显示「运行中」。
+	dir := t.TempDir()
+	sid := "sess-zombie"
+	path := filepath.Join(dir, agentCoreJournalFileName(sid))
+	lines := []string{
+		`{"kind":"session","session_id":"` + sid + `","project_path":"/tmp/p","created_at":"2026-11-09T00:00:00Z"}`,
+		`{"kind":"subagent","event":"start","task_id":"t1","name":"researcher","description":"调研","ts":"2026-11-09T00:00:01Z"}`,
+		`{"kind":"end","status":"stopped","ts":"2026-11-09T00:00:05Z"}`,
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatalf("写 journal 失败: %v", err)
+	}
+	sess := readAgentCoreSessionMetaWithOptions(path, agentVibeSessionReadOptions{})
+	if len(sess.Subagents) != 1 {
+		t.Fatalf("Subagents = %d, want 1", len(sess.Subagents))
+	}
+	if sess.Subagents[0].Status != "interrupted" {
+		t.Fatalf("end 后未终态子 agent 应降级 interrupted, got %q", sess.Subagents[0].Status)
+	}
+
+	// 对照：有 finish 终态的子 agent 不受 end 行影响。
+	path2 := filepath.Join(dir, agentCoreJournalFileName("sess-fine"))
+	lines2 := []string{
+		`{"kind":"session","session_id":"sess-fine","project_path":"/tmp/p","created_at":"2026-11-09T00:00:00Z"}`,
+		`{"kind":"subagent","event":"start","task_id":"t1","name":"researcher","description":"调研","ts":"2026-11-09T00:00:01Z"}`,
+		`{"kind":"subagent","event":"finish","task_id":"t1","status":"completed","summary":"结论","result":"全文","total_tokens":10,"duration_ms":5,"ts":"2026-11-09T00:00:04Z"}`,
+		`{"kind":"end","status":"success","ts":"2026-11-09T00:00:05Z"}`,
+	}
+	if err := os.WriteFile(path2, []byte(strings.Join(lines2, "\n")+"\n"), 0o644); err != nil {
+		t.Fatalf("写 journal 失败: %v", err)
+	}
+	sess2 := readAgentCoreSessionMetaWithOptions(path2, agentVibeSessionReadOptions{})
+	if len(sess2.Subagents) != 1 || sess2.Subagents[0].Status != "completed" {
+		t.Fatalf("正常终态不得被降级: %+v", sess2.Subagents)
+	}
+
+	// 对照：无 end 行（会话仍在跑/文件截断）不降级——不能误杀进行中的子 agent。
+	path3 := filepath.Join(dir, agentCoreJournalFileName("sess-live"))
+	lines3 := []string{
+		`{"kind":"session","session_id":"sess-live","project_path":"/tmp/p","created_at":"2026-11-09T00:00:00Z"}`,
+		`{"kind":"subagent","event":"start","task_id":"t1","name":"researcher","description":"调研","ts":"2026-11-09T00:00:01Z"}`,
+	}
+	if err := os.WriteFile(path3, []byte(strings.Join(lines3, "\n")+"\n"), 0o644); err != nil {
+		t.Fatalf("写 journal 失败: %v", err)
+	}
+	sess3 := readAgentCoreSessionMetaWithOptions(path3, agentVibeSessionReadOptions{})
+	if len(sess3.Subagents) != 1 || sess3.Subagents[0].Status != "started" {
+		t.Fatalf("无 end 行不得降级: %+v", sess3.Subagents)
+	}
+}

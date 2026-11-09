@@ -3,11 +3,14 @@ package services
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"aliang.one/nursorgate/app/agentcore"
 )
@@ -230,61 +233,46 @@ func TestAgentCoreSubagentToolsAssembly(t *testing.T) {
 		"---\nname: mcp__mcp__deep\n---\ny")
 
 	m := newAgentAIManager()
-	tools := m.agentCoreSubagentTools(agentAIRun{sessionID: "s", projectPath: "/tmp/p"},
+	router := m.agentCoreSubagentTaskTool(agentAIRun{sessionID: "s", projectPath: "/tmp/p"},
 		nil, nil, nil, nil, nil, nil)
-	if len(tools) != 2 {
-		t.Fatalf("桥数 = %d, want 2: %+v", len(tools), tools)
+	if router == nil {
+		t.Fatal("router 不应为 nil")
 	}
-	names := map[string]bool{}
-	for _, tool := range tools {
-		if strings.HasPrefix(tool.Name(), "mcp__") {
-			t.Fatalf("子 agent 桥名不得以 mcp__ 开头: %s", tool.Name())
+	for _, typ := range router.types {
+		if strings.HasPrefix(typ, "mcp__") {
+			t.Fatalf("类型名不得以 mcp__ 开头: %s", typ)
 		}
-		names[tool.Name()] = true
 	}
-	if !names["srv__echo"] || !names["deep"] {
-		t.Fatalf("mcp__ 前缀剥除语义错误: %v", names)
+	// 类型清单 = 用户定义（mcp__ 前缀剥除后）+ 内置默认（researcher 补缺）。
+	if len(router.types) != 3 || !router.hasType("srv__echo") || !router.hasType("deep") || !router.hasType("researcher") {
+		t.Fatalf("类型清单错误: %v", router.types)
 	}
 
-	// 定义集为空 → nil：换一个空 home（新 manager 保 journal 根一致）。
+	// 定义集为空 → 走内置默认（不再返回 nil），router 仍非 nil。
 	setTestAgentHome(t)
 	m2 := newAgentAIManager()
-	if got := m2.agentCoreSubagentTools(agentAIRun{sessionID: "s2", projectPath: "/tmp/p"},
-		nil, nil, nil, nil, nil, nil); got != nil {
-		t.Fatalf("空定义集应返回 nil, got %+v", got)
-	}
-}
-
-func TestAgentCoreSubagentBridgeDescriptionSelfDescribe(t *testing.T) {
-	// 机制自述（vm459 实测 2026-11-08）：桥描述此前只透传定义文件 description，
-	// 模型可见面上无任何字样宣告「这是子agent」——被问「你有子 agent 功能吗」
-	// 照实答没有，也不会主动派发。装配层必须给每座桥打上机制前缀。
-	setTestAgentHome(t)
-	writeSubagentDef(t, os.Getenv("HOME"), "researcher.md",
-		"---\nname: researcher\ndescription: 调研任务\ntools: Read, Grep\n---\n你是调研员。")
-
-	m := newAgentAIManager()
-	tools := m.agentCoreSubagentTools(agentAIRun{sessionID: "s", projectPath: "/tmp/p"},
+	router2 := m2.agentCoreSubagentTaskTool(agentAIRun{sessionID: "s2", projectPath: "/tmp/p"},
 		nil, nil, nil, nil, nil, nil)
-	if len(tools) != 1 {
-		t.Fatalf("桥数 = %d, want 1", len(tools))
-	}
-	if !strings.Contains(tools[0].Description(), "子agent") {
-		t.Fatalf("桥描述缺机制前缀: %q", tools[0].Description())
-	}
-	if !strings.Contains(tools[0].Description(), "调研任务") {
-		t.Fatalf("桥描述丢失定义 description: %q", tools[0].Description())
+	if router2 == nil || len(router2.types) == 0 {
+		t.Fatalf("空定义集应回落内置默认: %+v", router2)
 	}
 }
 
 func TestAgentCoreSubagentMechanismSuffix(t *testing.T) {
-	// 主 run system prompt 的机制说明块：0 桥零副作用；有桥必须宣告并行
-	// 语义与生命周期归属（对齐 claude Task 工具描述的内建自述）。
-	if got := agentCoreSubagentMechanismSuffix(0); got != "" {
-		t.Fatalf("0 桥应返回空串, got %q", got)
+	// 主 run system prompt 的机制说明块：nil/0 类型零副作用；有类型必须宣告
+	// 并行语义、生命周期归属、子 agent 不见主对话上下文、共享工作目录警告
+	// （对齐 claude Task 工具描述的内建自述），并逐类型枚举。
+	if got := agentCoreSubagentMechanismSuffix(nil); got != "" {
+		t.Fatalf("nil router 应返回空串, got %q", got)
 	}
-	got := agentCoreSubagentMechanismSuffix(3)
-	for _, marker := range []string{"<subagents>", "子agent", "concurrently", "lifecycle"} {
+	router := &agentCoreSubagentTaskRouter{
+		types:        []string{"researcher", "reviewer"},
+		descriptions: map[string]string{"researcher": "调研任务", "reviewer": "代码评审"},
+	}
+	got := agentCoreSubagentMechanismSuffix(router)
+	for _, marker := range []string{"<subagents>", "子agent", "concurrently", "lifecycle",
+		"does NOT see this conversation", "same working directory",
+		"- researcher: 调研任务", "- reviewer: 代码评审"} {
 		if !strings.Contains(got, marker) {
 			t.Fatalf("机制块缺标记 %q: %q", marker, got)
 		}
@@ -314,5 +302,168 @@ func TestAgentCoreSubagentRegistryIncludesPeerTools(t *testing.T) {
 	plain := (&agentCoreSubagentBridge{name: "x"}).subRegistry(nil, nil)
 	if _, ok := plain.Get("peer.exec"); ok {
 		t.Fatalf("nil peerTools must not register peer.exec")
+	}
+}
+
+func TestAgentCoreSubagentBridgeInterruptedPhase(t *testing.T) {
+	// 审计修复（2026-11-09）：主回合取消时子 run journal 终态必须是
+	// interrupted，与 claude 侧 finalizeRunSubagents 的 live 口径一致——
+	// 此前取消路径错标 failed，面板历史卡与实时卡语义分裂。
+	// handler 不读 body 时 net/http 服务端检测不到客户端断开（r.Context()
+	// 不触发），Close 会无限等——必须用测试级 done 通道双路解阻。
+	blockDone := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done(): // 客户端因主 ctx 取消而断开（生产路径）
+		case <-blockDone: // 测试收尾强制解阻
+		}
+	}))
+	defer func() { close(blockDone); srv.Close() }()
+	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
+
+	j := newAgentCoreJournal(t.TempDir())
+	m := &agentCoreSubagentMirror{
+		registry:  newAgentAISubagentRegistry(),
+		activity:  &agentAIActivity{},
+		sessionID: "s-cancel",
+		messageID: "m-cancel",
+		journal:   j,
+	}
+	bridge := &agentCoreSubagentBridge{
+		client:      agentcore.NewClient(agentCoreBaseURL()),
+		mainModel:   "glm-5.2",
+		name:        "researcher",
+		description: "调研",
+		body:        "你是调研员。",
+		projectPath: t.TempDir(),
+		mirror:      m,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { time.Sleep(120 * time.Millisecond); cancel() }()
+	res := bridge.Execute(ctx, map[string]interface{}{"task": "调研"}, nil)
+	if !res.IsError {
+		t.Fatalf("取消路径应返回错误结果: %+v", res)
+	}
+	var finish map[string]interface{}
+	for _, line := range readJournalLines(t, j.dir, "s-cancel") {
+		if line["kind"] == "subagent" && line["event"] == "finish" {
+			finish = line
+		}
+	}
+	if finish == nil || finish["status"] != "interrupted" {
+		t.Fatalf("取消路径 journal 终态应为 interrupted, got %v", finish)
+	}
+}
+
+func TestAgentCoreSubagentTaskRouterShape(t *testing.T) {
+	// 原生派发面（vm22/vm459 反馈 2026-11-09）：N 定义 N 工具的零散形态改为
+	// claudecode Task 同款的统一工具——subagent_type 选角色、task 派任务、
+	// model 可选覆盖。工具名恒为 task，数量恒 1。
+	setTestAgentHome(t)
+	writeSubagentDef(t, os.Getenv("HOME"), "researcher.md",
+		"---\nname: researcher\ndescription: 调研任务\ntools: Read, Grep\n---\n你是调研员。")
+	writeSubagentDef(t, os.Getenv("HOME"), "reviewer.md",
+		"---\nname: reviewer\ndescription: 代码评审\n---\n你是评审员。")
+
+	m := newAgentAIManager()
+	tools := m.agentCoreSubagentTools(agentAIRun{sessionID: "s", projectPath: "/tmp/p"},
+		nil, nil, nil, nil, nil, nil)
+	if len(tools) != 1 || tools[0].Name() != "task" {
+		t.Fatalf("应为唯一 task 工具, got %+v", tools)
+	}
+	schema := tools[0].InputSchema()
+	props, _ := schema["properties"].(map[string]interface{})
+	if _, ok := props["subagent_type"]; !ok {
+		t.Fatalf("schema 缺 subagent_type: %+v", schema)
+	}
+	if _, ok := props["model"]; !ok {
+		t.Fatalf("schema 缺可选 model: %+v", schema)
+	}
+	req, _ := schema["required"].([]interface{})
+	if len(req) != 2 {
+		t.Fatalf("required 应为 subagent_type+task, got %v", req)
+	}
+	if !strings.Contains(tools[0].Description(), "子agent") {
+		t.Fatalf("router 描述缺机制前缀: %q", tools[0].Description())
+	}
+}
+
+func TestAgentCoreSubagentTaskRouterRouting(t *testing.T) {
+	// 路由语义：合法类型分发到对应桥（journal 记桥名=类型名，非 task）、
+	// 未知类型报错并列出可用类型、空 task 报错。
+	up, srv := newAgentCoreUpstream(t, agentCoreTextTurn("评审完成：无问题", ""))
+	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
+	t.Setenv("ANTHROPIC_MODEL", "")
+	_ = up
+
+	setTestAgentHome(t)
+	writeSubagentDef(t, os.Getenv("HOME"), "reviewer.md",
+		"---\nname: reviewer\ndescription: 代码评审\n---\n你是评审员。")
+
+	var journaled []string
+	m := newAgentAIManager()
+	m.coreJournal = newAgentCoreJournal(t.TempDir())
+	tools := m.agentCoreSubagentTools(agentAIRun{sessionID: "s-route", projectPath: t.TempDir(), model: "glm-5.2"},
+		agentcore.NewClient(agentCoreBaseURL()), &agentcore.ToolEnv{ProjectPath: t.TempDir()},
+		func(context.Context, agentcore.ApprovalRequest) (agentcore.ApprovalResponse, error) {
+			return agentcore.ApprovalResponse{Approved: true}, nil
+		},
+		nil, nil, nil)
+	if len(tools) != 1 {
+		t.Fatalf("工具数 = %d", len(tools))
+	}
+	router := tools[0]
+
+	res := router.Execute(context.Background(),
+		map[string]interface{}{"subagent_type": "reviewer", "task": "评审 main.go"}, nil)
+	if res.IsError || !strings.Contains(res.Content, "评审完成") {
+		t.Fatalf("合法类型路由失败: %+v", res)
+	}
+
+	res = router.Execute(context.Background(), map[string]interface{}{"subagent_type": "ghost", "task": "x"}, nil)
+	if !res.IsError || !strings.Contains(res.Content, "reviewer") {
+		t.Fatalf("未知类型应报错并列出可用类型: %+v", res)
+	}
+
+	res = router.Execute(context.Background(), map[string]interface{}{"subagent_type": "reviewer"}, nil)
+	if !res.IsError {
+		t.Fatalf("缺 task 应报错: %+v", res)
+	}
+	_ = journaled
+}
+
+func TestAgentCoreSubagentBuiltinDefaults(t *testing.T) {
+	// 内置默认定义（vm459/vm22 事故根治）：空定义目录也必须有可用子 agent，
+	// 机制块随之追加；用户同名定义覆盖内置。
+	setTestAgentHome(t) // 空目录
+	m := newAgentAIManager()
+	tools := m.agentCoreSubagentTools(agentAIRun{sessionID: "s", projectPath: "/tmp/p"},
+		nil, nil, nil, nil, nil, nil)
+	if len(tools) != 1 {
+		t.Fatalf("空目录也应有内置 task 工具, got %d", len(tools))
+	}
+	router := m.agentCoreSubagentTaskTool(agentAIRun{sessionID: "s", projectPath: "/tmp/p"},
+		nil, nil, nil, nil, nil, nil)
+	if router == nil || len(router.types) == 0 {
+		t.Fatalf("内置类型缺失: %+v", router)
+	}
+	block := agentCoreSubagentMechanismSuffix(router)
+	if !strings.Contains(block, "researcher") {
+		t.Fatalf("机制块缺内置类型: %q", block)
+	}
+
+	// 用户同名定义覆盖内置 description。
+	setTestAgentHome(t)
+	writeSubagentDef(t, os.Getenv("HOME"), "researcher.md",
+		"---\nname: researcher\ndescription: 用户自定义调研\n---\n用户正文。")
+	m2 := newAgentAIManager()
+	router2 := m2.agentCoreSubagentTaskTool(agentAIRun{sessionID: "s2", projectPath: "/tmp/p"},
+		nil, nil, nil, nil, nil, nil)
+	if router2 == nil {
+		t.Fatal("router 不应为 nil")
+	}
+	block2 := agentCoreSubagentMechanismSuffix(router2)
+	if !strings.Contains(block2, "用户自定义调研") || strings.Contains(block2, "输出结构化调研报告") {
+		t.Fatalf("用户定义应覆盖内置: %q", block2)
 	}
 }
