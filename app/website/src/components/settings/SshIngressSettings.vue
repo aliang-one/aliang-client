@@ -1,6 +1,8 @@
 <template>
   <!-- SSH 入口服务面卡片（spec §7；代理族下,SettingsPage 主栏 RulesSettings 相邻挂载）。
-       线格式 customer.ssh_ingress{enable,port,authorized_keys[],mesh_authorized_keys[]};
+       线格式 customer.ssh_ingress{enable,port,authorized_keys[],mesh_authorized_keys[]}。
+       统一口收编(spec §6.4)：SSH 监听并入 56432 统一入口,port 字段运行面忽略,
+       卡片展示只读统一口、保存载荷对 port 原样透传(不产生伪 diff)。
        提交载荷 = 整配置透传 + ssh_ingress 覆盖（父层按顶层段浅合并,卡片不丢别的段）。 -->
   <div class="flex flex-col gap-4 rounded-xl border border-slate-200 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-background-dark">
     <div class="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
@@ -43,24 +45,17 @@
     </div>
 
     <div class="grid gap-4 md:grid-cols-[200px_minmax(0,1fr)]">
-      <label class="space-y-2">
+      <!-- 端口只读展示：SSH 入口已并入 56432 统一入口(独立监听退役),不再可配 -->
+      <div class="space-y-2">
         <span class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('sshIngress_port') }}</span>
-        <input
-          v-model="form.portText"
-          class="w-full rounded-lg border px-3 py-2 text-sm shadow-sm transition focus:outline-none focus:ring-2 dark:text-slate-100"
-          :class="portError
-            ? 'border-red-400 bg-red-50 focus:border-red-500 focus:ring-red-500/20 dark:border-red-500/50 dark:bg-red-900/10'
-            : 'border-slate-300 bg-white focus:border-primary focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900'"
-          data-field="sshIngressPort"
-          :disabled="loading || saving"
-          max="65535"
-          min="1"
-          :placeholder="t('sshIngress_portPlaceholder')"
-          type="number"
-          @keydown.enter.prevent
-        />
-        <p v-if="portError" class="text-xs text-red-500">{{ portError }}</p>
-      </label>
+        <div
+          data-field="sshIngressPortUnified"
+          class="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-600 dark:border-slate-700 dark:bg-slate-900/60 dark:text-slate-300"
+        >
+          {{ t('sshIngress_portUnified') }}
+        </div>
+        <p class="text-xs text-slate-500">{{ t('sshIngress_portUnifiedHint') }}</p>
+      </div>
 
       <!-- host key 指纹区块：只读展示 + 复制;404=入口未启动（生成职责归 Server.Start,
            handler 只读）→ 引导文案;其余失败静默降级 amber,不阻塞主表单 -->
@@ -176,7 +171,7 @@
         class="inline-flex min-h-11 items-center justify-center gap-2 rounded bg-primary px-4 py-2 text-sm font-medium text-white transition hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-60"
         data-ssh-save
         type="button"
-        :disabled="loading || saving || !!validationError || !!portError"
+        :disabled="loading || saving || !!validationError"
         @click="save"
       >
         <span class="material-symbols-outlined text-sm">save</span>
@@ -198,8 +193,9 @@ function normalizeStringList(items) {
 // 线格式归一（customer.ssh_ingress）。具名导出两处共用（RulesSettings.vue 具名导出
 // 先例）：SettingsPage 的 createDefaultCustomerConfig/normalizeCustomerConfig 链,与
 // SshIngressSettings.test.js。口径与后端 SSHIngressConfig 对齐：enable 三态指针
-// nil=false（读侧非布尔一律 false）;port uint16 上界 65535,0=未设（后端归一默认
-// 56442）,越界/非数读侧归 0,写侧由卡片 port 校验拦截。
+// nil=false（读侧非布尔一律 false）;port 字段运行面已忽略（统一口 56432 承载,
+// spec §6.4）,schema 保留只为配置兼容——读侧照旧归一(0=未设,越界归 0),
+// 卡片不提供编辑入口,保存载荷原样透传不产生伪 diff。
 export function normalizeSSHIngressConfig(payload) {
   const source = payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : {};
   const rawPort = source.port;
@@ -270,17 +266,8 @@ export default {
       }
       return '';
     },
-    portError() {
-      const raw = String(this.form.portText ?? '').trim();
-      if (!raw) {
-        return '';
-      }
-      const port = Number(raw);
-      if (!Number.isInteger(port) || port < 1 || port > 65535) {
-        return this.t('sshIngress_portInvalid');
-      }
-      return '';
-    }
+    // portError 已随端口输入退役:统一口 56432 承载(spec §6.4),无可配值
+    // 即无校验面;保存按钮与 save() 不再引用。
   },
   watch: {
     config: {
@@ -311,8 +298,6 @@ export default {
       const normalized = normalizeSSHIngressConfig(config?.ssh_ingress);
       return {
         enabled: normalized.enable,
-        // 0 = 未设置：输入框显示空 + 「默认 56442」placeholder（pool_size 同款口径）
-        portText: normalized.port > 0 ? String(normalized.port) : '',
         authorizedKeys: [...normalized.authorized_keys],
         meshKeys: [...normalized.mesh_authorized_keys]
       };
@@ -398,20 +383,18 @@ export default {
       return value.length > 72 ? `${value.slice(0, 72)}…` : value;
     },
     // 提交载荷：整配置透传 + ssh_ingress 覆盖（ModelMappingSettings/PeerMCPSettings
-    // 同款）。disable 置零口径：enable:false + 其余字段照发——ssh_ingress 无空串
-    // 字段（数字/数组由 SettingsPage buildConfigPatch 自然 diff,无需 T12 式显式
-    // 清空串特判）;enable=false 时后端 Validate 跳过钥匙校验,照发不会误拦。
+    // 同款）。port 原样透传(卡片无编辑入口,统一口承载后运行面忽略——透传
+    // 不产生伪 diff,不破坏既有配置兼容);disable 置零口径：enable:false +
+    // 其余字段照发——enable=false 时后端 Validate 跳过钥匙校验,照发不会误拦。
     save() {
-      if (this.validationError || this.portError) {
+      if (this.validationError) {
         return;
       }
-      const rawPort = String(this.form.portText ?? '').trim();
-      const port = rawPort ? Number(rawPort) : 0;
       this.$emit('save', {
         ...(this.config || {}),
         ssh_ingress: {
           enable: !!this.form.enabled,
-          port,
+          port: normalizeSSHIngressConfig(this.config?.ssh_ingress).port,
           authorized_keys: [...this.form.authorizedKeys],
           mesh_authorized_keys: [...this.form.meshKeys]
         }
