@@ -603,4 +603,23 @@ func TestAliangMCPEntryToolListCapReject(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "include_tools") {
 		t.Fatalf("超上限应拒绝并点名字段: %v", err)
 	}
+	err = upsertAliangMCPServerForTest(home, "srv2", aliangMCPServerEntry{Command: "echo", ExcludeTools: big})
+	if err == nil || !strings.Contains(err.Error(), "exclude_tools") {
+		t.Fatalf("exclude 同一上限应拒绝并点名字段: %v", err)
+	}
+}
+
+// 边界守护:恰好 64 条(=上限)必须放行——上限语义是「超上限拒绝」,
+// 不是「≥64 拒绝」,off-by-one 回归锁。
+func TestAliangMCPEntryToolListCapBoundary(t *testing.T) {
+	home := t.TempDir()
+	ok := make([]string, agentCoreMCPToolListCap)
+	for i := range ok {
+		ok[i] = fmt.Sprintf("t%d", i)
+	}
+	if err := upsertAliangMCPServerForTest(home, "srv", aliangMCPServerEntry{
+		Command: "echo", IncludeTools: ok, ExcludeTools: ok,
+	}); err != nil {
+		t.Fatalf("恰好 %d 条必须放行(include+exclude 双侧): %v", agentCoreMCPToolListCap, err)
+	}
 }
