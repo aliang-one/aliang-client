@@ -129,7 +129,8 @@ func TestAgentCoreMCPBridgeExecute(t *testing.T) {
 	})
 	var journaled []string
 	bridge := &agentCoreMCPBridge{
-		session: session, rawTool: "lookup", name: "mcp__test-srv__lookup",
+		holder:  newAgentCoreMCPSessionHolder(session, func() { _ = session.Close() }, agentCoreMCPRawServer{}, nil),
+		rawTool: "lookup", name: "mcp__test-srv__lookup",
 		description: "测试工具",
 		schema:      map[string]interface{}{"type": "object"},
 		onCall:      func(tool, summary string, isErr bool) { journaled = append(journaled, tool+"|"+summary) },
@@ -151,7 +152,10 @@ func TestAgentCoreMCPBridgeRecoversPanic(t *testing.T) {
 	session := startTestMCPSession(t, "evil", func(map[string]interface{}) (string, bool) {
 		return "", false
 	})
-	bridge := &agentCoreMCPBridge{session: session, rawTool: "evil", name: "mcp__s__evil"}
+	bridge := &agentCoreMCPBridge{
+		holder:  newAgentCoreMCPSessionHolder(session, func() { _ = session.Close() }, agentCoreMCPRawServer{}, nil),
+		rawTool: "evil", name: "mcp__s__evil",
+	}
 	// onCall 里故意 panic：Execute 必须兜住不炸整轮（纵深防御）。
 	bridge.onCall = func(string, string, bool) { panic("journal boom") }
 	res := bridge.Execute(context.Background(), map[string]interface{}{}, nil)
@@ -267,7 +271,7 @@ func TestAgentCoreMCPServerToolDefsDialsConcurrently(t *testing.T) {
 func TestAgentCoreMCPBridgeRecoversOuterPanic(t *testing.T) {
 	var journaled []bool
 	// session 置 nil：CallTool 里解引用 nil 必 panic，打的是外层兜底路径。
-	bridge := &agentCoreMCPBridge{session: nil, rawTool: "x", name: "mcp__s__x",
+	bridge := &agentCoreMCPBridge{holder: newAgentCoreMCPSessionHolder(nil, nil, agentCoreMCPRawServer{}, nil), rawTool: "x", name: "mcp__s__x",
 		onCall: func(tool, summary string, isErr bool) { journaled = append(journaled, isErr) }}
 	res := bridge.Execute(context.Background(), map[string]interface{}{}, nil)
 	if !res.IsError || !strings.Contains(res.Content, "MCP 工具执行崩溃") {
@@ -500,7 +504,12 @@ func TestAgentCoreMCPServerToolDefsFilterBeforeCap(t *testing.T) {
 func TestAgentCoreMCPBridgeTransportError(t *testing.T) {
 	var isErrs []bool
 	session := startTestMCPSession(t, "t", func(map[string]interface{}) (string, bool) { return "ok", false })
-	bridge := &agentCoreMCPBridge{session: session, rawTool: "t", name: "mcp__s__t",
+	bridge := &agentCoreMCPBridge{
+		holder: newAgentCoreMCPSessionHolder(session, func() { _ = session.Close() }, agentCoreMCPRawServer{},
+			func(context.Context, agentCoreMCPRawServer) (*mcp.ClientSession, func(), error) {
+				return nil, nil, fmt.Errorf("dial 拒绝")
+			}),
+		rawTool: "t", name: "mcp__s__t",
 		onCall: func(tool, summary string, isErr bool) { isErrs = append(isErrs, isErr) }}
 	if err := session.Close(); err != nil {
 		t.Fatalf("Close 失败: %v", err)

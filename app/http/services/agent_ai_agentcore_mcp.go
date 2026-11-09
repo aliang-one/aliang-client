@@ -33,6 +33,10 @@ const (
 	agentCoreMCPDescCap     = 500
 	// agentCoreMCPToolListCap 单 server 工具名单上限(写通道 fail-closed)。
 	agentCoreMCPToolListCap = 64
+	// agentCoreMCPReconnectDeadCap 连续重连失败判死上限，spec §4.3/§6：
+	// 连续这么多次「重连后仍失败」就不在本 run 内继续拨号，避免一个死 server
+	// 把每轮工具调用的墙钟都拖进重连超时。
+	agentCoreMCPReconnectDeadCap = 3
 	// 建连超时后等待迟到 dial 返回的宽限窗：返回的会话就地关闭（收尸），
 	// 防止孤儿 stdio 进程/连接泄漏。
 	agentCoreMCPDialDrainGrace = 2 * time.Second
@@ -171,9 +175,50 @@ func agentCoreMCPRawServersIn(home string) []agentCoreMCPRawServer {
 	return out
 }
 
+// agentCoreMCPSessionHolder 同 server 全部桥共享的会话持有者(spec §4.1)。
+// 锁内换会话,closeAll 永远关到当前会话——重连换新后零泄漏。内核每 run 串行
+// 执行工具,锁是纵深防御不承担正确性主责。dial 与测试注入同源(coreMCPDialForTest)。
+type agentCoreMCPSessionHolder struct {
+	mu         sync.Mutex
+	session    *mcp.ClientSession
+	closeFn    func() // 关当前会话(内含子 ctx cancel)
+	raw        agentCoreMCPRawServer
+	dial       func(context.Context, agentCoreMCPRawServer) (*mcp.ClientSession, func(), error)
+	consecFail int  // 连续「重连后仍失败」计数(spec §4.3)
+	dead       bool // run 内判死:后续调用快速失败不再拨号
+}
+
+func newAgentCoreMCPSessionHolder(session *mcp.ClientSession, closeFn func(), raw agentCoreMCPRawServer, dial func(context.Context, agentCoreMCPRawServer) (*mcp.ClientSession, func(), error)) *agentCoreMCPSessionHolder {
+	return &agentCoreMCPSessionHolder{session: session, closeFn: closeFn, raw: raw, dial: dial}
+}
+
+// Close 锁内关当前会话。closeAll 语义锚点:closeFn 一律经此处走,换会话后
+// 关到的是新会话。
+func (h *agentCoreMCPSessionHolder) Close() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closeFn != nil {
+		h.closeFn()
+	}
+	h.session = nil
+	h.closeFn = nil
+	h.dead = true // 防关闭后再触发重连(泄漏面)
+}
+
+// call 暂为直通(Task 6 换成重连版)。判死检查先行——Close 后 dead=true,
+// nil session 不会被解引用。
+func (h *agentCoreMCPSessionHolder) call(ctx context.Context, tool string, args map[string]interface{}) (*mcp.CallToolResult, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.dead {
+		return nil, fmt.Errorf("MCP server 已在本次运行内判死(连续 %d 次重连失败),本 run 内请勿继续调用该 server 工具", agentCoreMCPReconnectDeadCap)
+	}
+	return h.session.CallTool(ctx, &mcp.CallToolParams{Name: tool, Arguments: args})
+}
+
 // agentCoreMCPBridge 把一个 MCP 工具包成内核 agentcore.Tool。
 type agentCoreMCPBridge struct {
-	session     *mcp.ClientSession
+	holder      *agentCoreMCPSessionHolder
 	rawTool     string // server 侧原始工具名
 	name        string // mcp__<server>__<tool>，段已白名单清洗
 	description string
@@ -197,7 +242,7 @@ func (b *agentCoreMCPBridge) Execute(ctx context.Context, input map[string]inter
 			b.safeOnCall(summary, true)
 		}
 	}()
-	res, err := b.session.CallTool(ctx, &mcp.CallToolParams{Name: b.rawTool, Arguments: input})
+	res, err := b.holder.call(ctx, b.rawTool, input)
 	var text string
 	isErr := false
 	if err != nil {
@@ -451,7 +496,7 @@ func agentCoreMCPDialWithTimeout(dial func(context.Context, agentCoreMCPRawServe
 // deadline 或建连后提前 cancel，都会把已建好的连接掐断，该 server 的
 // CallTool 全失败。建连超时因此改由 agentCoreMCPDialWithTimeout 外部施加。
 func (m *agentAIManager) agentCoreMCPServerToolDefs(ctx context.Context, raws []agentCoreMCPRawServer, onCall func(tool, summary string, isErr bool)) ([]agentcore.Tool, func()) {
-	var closes []func()
+	var holders []*agentCoreMCPSessionHolder
 	bridges := make([]agentcore.Tool, 0, agentCoreMCPToolCap)
 	seen := map[string]bool{}
 	closeAll := func() {
@@ -459,8 +504,8 @@ func (m *agentAIManager) agentCoreMCPServerToolDefs(ctx context.Context, raws []
 		// （关 stdin→5s 等退出→SIGTERM→再 5s→SIGKILL），多 server 串行最坏
 		// 分钟级。该代价已由 runAgentCore 接入点解耦吸收（detached goroutine
 		// 调用，决策注释见彼处）；本函数保留串行实现。
-		for _, c := range closes {
-			c()
+		for _, h := range holders {
+			h.Close()
 		}
 	}
 	connected, skipped := 0, 0
@@ -501,6 +546,7 @@ func (m *agentAIManager) agentCoreMCPServerToolDefs(ctx context.Context, raws []
 		raw     agentCoreMCPRawServer
 		session *mcp.ClientSession
 		closeFn func()
+		holder  *agentCoreMCPSessionHolder
 		tools   []*mcp.Tool
 		err     error
 	}
@@ -532,6 +578,11 @@ func (m *agentAIManager) agentCoreMCPServerToolDefs(ctx context.Context, raws []
 					closeFn()
 					cancel()
 				},
+				// holder 与桥共享：重连换会话后 closeAll 仍关得到当前会话。
+				holder: newAgentCoreMCPSessionHolder(session, func() {
+					closeFn()
+					cancel()
+				}, raw, dial),
 			}
 		}(k, idx)
 	}
@@ -566,10 +617,10 @@ func (m *agentAIManager) agentCoreMCPServerToolDefs(ctx context.Context, raws []
 				sanitizeAgentCoreMCPSegment(out.raw.Name), len(tools), len(out.tools),
 				len(out.raw.IncludeTools), len(out.raw.ExcludeTools)))
 		}
-		if out.closeFn != nil {
+		if out.holder != nil {
 			// 成功路径不 cancel：session 生命周期交给 closeAll（closeFn 内一并
 			// cancel，见上）。先登记，保证工具截断提前结束时也不泄漏会话。
-			closes = append(closes, out.closeFn)
+			holders = append(holders, out.holder)
 		}
 		connected++
 		if capped {
@@ -592,7 +643,7 @@ func (m *agentAIManager) agentCoreMCPServerToolDefs(ctx context.Context, raws []
 				desc = desc[:agentCoreMCPDescCap]
 			}
 			bridges = append(bridges, &agentCoreMCPBridge{
-				session: out.session, rawTool: tool.Name,
+				holder: out.holder, rawTool: tool.Name,
 				name:        agentCoreMCPBridgeName(out.raw.Name, tool.Name, seen),
 				description: desc, schema: schema, onCall: onCall,
 			})
