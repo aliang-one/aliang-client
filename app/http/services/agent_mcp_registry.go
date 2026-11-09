@@ -56,6 +56,9 @@ type aliangMCPServerEntry struct {
 	URL     string            `json:"url,omitempty"` // http/sse 必填
 	Headers map[string]string `json:"headers,omitempty"`
 	Enabled *bool             `json:"enabled,omitempty"` // nil=启用
+	// IncludeTools/ExcludeTools 消费侧(agentcore)过滤名单;claude 载荷剥除。
+	IncludeTools []string `json:"include_tools,omitempty"`
+	ExcludeTools []string `json:"exclude_tools,omitempty"`
 }
 
 func (e aliangMCPServerEntry) enabled() bool { return e.Enabled == nil || *e.Enabled }
@@ -192,6 +195,12 @@ func validateAliangMCPEntry(name string, e aliangMCPServerEntry) error {
 	if strings.HasPrefix(name, aliangMCPReservedPrefix) {
 		return fmt.Errorf("server 名称不允许保留前缀 %q", aliangMCPReservedPrefix)
 	}
+	if len(normalizeAgentCoreMCPToolList(e.IncludeTools)) > agentCoreMCPToolListCap {
+		return fmt.Errorf("include_tools 归一后超上限 %d", agentCoreMCPToolListCap)
+	}
+	if len(normalizeAgentCoreMCPToolList(e.ExcludeTools)) > agentCoreMCPToolListCap {
+		return fmt.Errorf("exclude_tools 归一后超上限 %d", agentCoreMCPToolListCap)
+	}
 	switch strings.ToLower(strings.TrimSpace(e.Type)) {
 	case "", "stdio":
 		if strings.TrimSpace(e.Command) == "" {
@@ -229,6 +238,12 @@ func aliangMCPEntryToMap(e aliangMCPServerEntry) map[string]interface{} {
 	}
 	if len(e.Headers) > 0 {
 		out["headers"] = e.Headers
+	}
+	if norm := normalizeAgentCoreMCPToolList(e.IncludeTools); len(norm) > 0 {
+		out["include_tools"] = norm
+	}
+	if norm := normalizeAgentCoreMCPToolList(e.ExcludeTools); len(norm) > 0 {
+		out["exclude_tools"] = norm
 	}
 	if e.Enabled != nil {
 		out["enabled"] = *e.Enabled
@@ -560,6 +575,10 @@ type AliangMCPServerRequest struct {
 	URL     string            `json:"url"`
 	Headers map[string]string `json:"headers"`
 	Enabled *bool             `json:"enabled"`
+	// IncludeTools/ExcludeTools 消费侧(agentcore)过滤名单;claude 载荷剥除。
+	// 与 aliangMCPServerEntry 同名同型同序(结构体转换护栏见下)。
+	IncludeTools []string `json:"include_tools"`
+	ExcludeTools []string `json:"exclude_tools"`
 }
 
 // entry 字段必须与 aliangMCPServerEntry 逐一同名同型同序,结构体转换才是合法
