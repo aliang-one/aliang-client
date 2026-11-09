@@ -572,8 +572,10 @@ func (j *agentCoreJournal) appendTool(sessionID, tool, summary string, isError b
 
 // appendSubagentStart 落 kind=subagent/event=start 行：子 agent 跑起来
 // 即写一行（spec subagent-panel）。taskID 形如 agentcore-<messageID>-<name>-<n>，
-// 自带回合 messageID 消歧。守卫与 appendTool 同款；写失败 Warn 吞掉。
-func (j *agentCoreJournal) appendSubagentStart(sessionID, taskID, name, description string) {
+// 自带回合 messageID 消歧。task=派发任务文本截断（调用方 rune 安全截断）——
+// 崩溃后主 LLM 仍知道当时在做什么（中断注入 feat/subagent-interrupted-injection）；
+// 旧行无此键，读侧容忍缺失。守卫与 appendTool 同款；写失败 Warn 吞掉。
+func (j *agentCoreJournal) appendSubagentStart(sessionID, taskID, name, description, task string) {
 	if j == nil || j.dir == "" || strings.TrimSpace(sessionID) == "" {
 		return
 	}
@@ -585,8 +587,90 @@ func (j *agentCoreJournal) appendSubagentStart(sessionID, taskID, name, descript
 		"task_id":     taskID,
 		"name":        name,
 		"description": description,
+		"task":        task,
 		"ts":          time.Now().UTC().Format(time.RFC3339),
 	})
+}
+
+// agentCoreSubagentInterrupted 是一条未终态子 agent 的对账摘要（中断注入用）。
+type agentCoreSubagentInterrupted struct {
+	TaskID    string
+	Name      string
+	Task      string // start 行 task 文本（旧 journal 行为空）
+	StartedAt string
+	ToolCalls int
+	LastTool  string
+}
+
+// unfinishedSubagents 扫描会话 journal，返回 start 无 finish 的子 agent
+// （行序=时间序）。调用时机=runAgentCore 装配 system prompt——本 run 尚未
+// 派发，journal 内全部 start 行必属已死回合（同会话 run 串行）；本 run 后续
+// 派发的子 agent 不受影响（装配一次性求值）。半行/坏行跳过（与详情读侧同
+// 口径）。文件缺失/全终态返回 nil。
+func (j *agentCoreJournal) unfinishedSubagents(sessionID string) []agentCoreSubagentInterrupted {
+	if j == nil || j.dir == "" || strings.TrimSpace(sessionID) == "" {
+		return nil
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	path := filepath.Join(j.dir, agentCoreJournalFileName(sessionID))
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), agentVibeJSONLMaxLineBytes)
+	type scanEntry struct {
+		agentCoreSubagentInterrupted
+		finished bool
+	}
+	order := make([]string, 0, 2)
+	entries := make(map[string]*scanEntry)
+	for sc.Scan() {
+		var row struct {
+			Kind           string `json:"kind"`
+			Event          string `json:"event"`
+			TaskID         string `json:"task_id"`
+			Name           string `json:"name"`
+			Task           string `json:"task"`
+			Ts             string `json:"ts"`
+			SubagentTaskID string `json:"subagent_task_id"`
+			Tool           string `json:"tool"`
+		}
+		if json.Unmarshal(sc.Bytes(), &row) != nil {
+			continue
+		}
+		switch {
+		case row.Kind == "subagent" && row.Event == "start" && strings.TrimSpace(row.TaskID) != "":
+			if _, ok := entries[row.TaskID]; ok {
+				continue
+			}
+			entries[row.TaskID] = &scanEntry{agentCoreSubagentInterrupted: agentCoreSubagentInterrupted{
+				TaskID: row.TaskID, Name: row.Name, Task: row.Task, StartedAt: row.Ts,
+			}}
+			order = append(order, row.TaskID)
+		case row.Kind == "subagent" && row.Event == "finish":
+			if e, ok := entries[row.TaskID]; ok {
+				e.finished = true
+			}
+		case row.Kind == "tool" && strings.TrimSpace(row.SubagentTaskID) != "":
+			if e, ok := entries[row.SubagentTaskID]; ok && !e.finished {
+				e.ToolCalls++
+				e.LastTool = row.Tool
+			}
+		}
+	}
+	out := make([]agentCoreSubagentInterrupted, 0, len(order))
+	for _, id := range order {
+		if e := entries[id]; !e.finished {
+			out = append(out, e.agentCoreSubagentInterrupted)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // appendSubagentTool 落子 agent 的工具轨迹行：与主会话工具行同 kind=tool，

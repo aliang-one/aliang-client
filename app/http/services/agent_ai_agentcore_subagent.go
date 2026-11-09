@@ -265,7 +265,7 @@ type agentCoreSubagentMirror struct {
 // start 登记 started。tracked=false 表示 registry 拒收（cap 满），后续
 // progress/finish 对该 taskID 静默降级（与 claude 侧 registry 满载 fail-soft
 // 同语义——轨迹丢，任务不受影响）。
-func (m *agentCoreSubagentMirror) start(bridgeName, description string) (string, bool) {
+func (m *agentCoreSubagentMirror) start(bridgeName, description, task string) (string, bool) {
 	if m == nil {
 		return "", false
 	}
@@ -279,7 +279,7 @@ func (m *agentCoreSubagentMirror) start(bridgeName, description string) (string,
 		return taskID, false
 	}
 	if m.journal != nil {
-		m.journal.appendSubagentStart(m.sessionID, taskID, bridgeName, description)
+		m.journal.appendSubagentStart(m.sessionID, taskID, bridgeName, description, task)
 	}
 	m.activity.beginSubagent()
 	m.emitRecord(record)
@@ -523,7 +523,9 @@ func (b *agentCoreSubagentBridge) Execute(ctx context.Context, input map[string]
 	isErr := false
 	text := ""
 	var totalTokens int64
-	subTaskID, tracked := b.mirror.start(b.name, b.description)
+	// task 截断进 start 行（中断注入数据面）：rune 安全 200 rune，与 finish
+	// summary 同口径——崩溃后主 LLM 仍知道当时派的是什么活。
+	subTaskID, tracked := b.mirror.start(b.name, b.description, truncateAgentText(task, 200))
 	var toolUses atomic.Int64
 	if tracked {
 		defer func() {
@@ -825,5 +827,39 @@ func agentCoreSubagentMechanismSuffix(router *agentCoreSubagentTaskRouter) strin
 	b.WriteString("Parallel subagents share the same working directory — parallelize read-only work; ")
 	b.WriteString("keep file-writing tasks sequential or scoped to distinct files.\n")
 	b.WriteString("</subagents>")
+	return b.String()
+}
+
+
+// agentCoreSubagentInterruptedSuffix 中断注入（L1，feat/subagent-interrupted-injection）：
+// 上一回合未终态子 agent 清单进 system prompt——主 LLM 感知中断并可智能重派
+// （session-context 通道复用，装配期一次求值）。超 5 条截最老 5 条防膨胀；
+// 空清单返回空串零副作用。
+func agentCoreSubagentInterruptedSuffix(entries []agentCoreSubagentInterrupted) string {
+	if len(entries) == 0 {
+		return ""
+	}
+	if len(entries) > 5 {
+		entries = entries[:5]
+	}
+	var b strings.Builder
+	b.WriteString("\n\n<interrupted-subagents>\n")
+	b.WriteString("Subagents dispatched by a previous turn of this conversation never returned ")
+	b.WriteString("(the run was stopped or the process died). Their partial work was lost — do not ")
+	b.WriteString("assume any results from them:\n")
+	for _, e := range entries {
+		line := fmt.Sprintf("- %s (started %s, %d tool calls", e.Name, e.StartedAt, e.ToolCalls)
+		if e.LastTool != "" {
+			line += ", last: " + e.LastTool
+		}
+		line += ")"
+		if strings.TrimSpace(e.Task) != "" {
+			line += ": task=" + e.Task
+		}
+		b.WriteString(line + "\n")
+	}
+	b.WriteString("If the work is still needed, re-dispatch with a self-contained task description; ")
+	b.WriteString("mention the interruption to the user if relevant.\n")
+	b.WriteString("</interrupted-subagents>")
 	return b.String()
 }

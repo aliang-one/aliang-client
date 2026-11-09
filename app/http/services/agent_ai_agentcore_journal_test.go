@@ -542,7 +542,7 @@ func TestAppendSubagentLines(t *testing.T) {
 	j := newAgentCoreJournal(t.TempDir())
 	sid := "sess-sub"
 	taskID := "agentcore-msg7-researcher-1" // 含回合 messageID 消歧(spec H1)
-	j.appendSubagentStart(sid, taskID, "researcher", "加密调研")
+	j.appendSubagentStart(sid, taskID, "researcher", "加密调研", "调研 XXX 的加密方案")
 	j.appendSubagentTool(sid, taskID, "Grep", "grep 摘要", false)
 	j.appendSubagentFinish(sid, taskID, "completed", "结论摘要",
 		"完整报告全文", 8123, 45230)
@@ -566,11 +566,42 @@ func TestAppendSubagentLines(t *testing.T) {
 	if start == nil || start["name"] != "researcher" || start["description"] != "加密调研" || start["task_id"] != taskID {
 		t.Fatalf("start 行缺失/字段错: %v", start)
 	}
+	if start["task"] != "调研 XXX 的加密方案" {
+		t.Fatalf("start 行 task 字段缺失/错: %v", start["task"])
+	}
 	if tool == nil || tool["tool"] != "Grep" || tool["is_error"] != false || tool["summary"] != "grep 摘要" {
 		t.Fatalf("tool 关联行缺失/字段错: %v", tool)
 	}
 	if finish == nil || finish["status"] != "completed" || finish["result"] != "完整报告全文" ||
 		finish["summary"] != "结论摘要" || finish["total_tokens"] != float64(8123) || finish["duration_ms"] != float64(45230) || finish["task_id"] != taskID {
 		t.Fatalf("finish 行缺失/字段错: %v", finish)
+	}
+}
+
+func TestJournalUnfinishedSubagents(t *testing.T) {
+	// 中断注入数据面（feat/subagent-interrupted-injection）：start 无 finish
+	// 的子 agent 返回对账摘要（工具计数+最后工具+task 文本）；有 finish 的
+	// 排除；行序=时间序。
+	j := newAgentCoreJournal(t.TempDir())
+	sid := "sess-unfinished"
+	j.appendSubagentStart(sid, "t-done", "researcher", "调研", "任务A")
+	j.appendSubagentFinish(sid, "t-done", "completed", "结论", "全文", 10, 5)
+	j.appendSubagentStart(sid, "t-dead", "reviewer", "评审", "任务B")
+	j.appendSubagentTool(sid, "t-dead", "Grep", "s1", false)
+	j.appendSubagentTool(sid, "t-dead", "Read", "s2", false)
+
+	got := j.unfinishedSubagents(sid)
+	if len(got) != 1 {
+		t.Fatalf("未终态数 = %d, want 1: %+v", len(got), got)
+	}
+	e := got[0]
+	if e.TaskID != "t-dead" || e.Name != "reviewer" || e.Task != "任务B" ||
+		e.ToolCalls != 2 || e.LastTool != "Read" {
+		t.Fatalf("对账摘要字段错: %+v", e)
+	}
+
+	// 无该会话文件 → 空。
+	if got := j.unfinishedSubagents("sess-none"); got != nil {
+		t.Fatalf("无会话应返回 nil: %+v", got)
 	}
 }
