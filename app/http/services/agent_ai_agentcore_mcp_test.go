@@ -1336,3 +1336,20 @@ func TestAgentCoreMCPRawServersInIncludesRegistry(t *testing.T) {
 		t.Fatalf("注册表 stdio 条目必须进采集: %+v", byName["blend"])
 	}
 }
+
+func TestAgentCoreMCPRawServersParseToolLists(t *testing.T) {
+	home := t.TempDir()
+	_ = upsertAliangMCPServerForTest(home, "srv", aliangMCPServerEntry{
+		Command: "echo", IncludeTools: []string{"a", "b"}, ExcludeTools: []string{"x"},
+	})
+	raws := agentCoreMCPRawServersIn(home)
+	if len(raws) != 1 {
+		t.Fatalf("应采到 1 条: %+v", raws)
+	}
+	if len(raws[0].IncludeTools) != 2 || raws[0].IncludeTools[0] != "a" {
+		t.Fatalf("include 解析错误: %v", raws[0].IncludeTools)
+	}
+	if len(raws[0].ExcludeTools) != 1 || raws[0].ExcludeTools[0] != "x" {
+		t.Fatalf("exclude 解析错误: %v", raws[0].ExcludeTools)
+	}
+}

@@ -70,16 +70,22 @@ type agentCoreMCPRawServer struct {
 	Type    string            `json:"type"` // ""|stdio / http / sse
 	URL     string            `json:"url"`
 	Headers map[string]string `json:"headers"`
+	// IncludeTools/ExcludeTools 消费侧过滤名单;注册表源携带,其余源零值
+	// (Task 3 生效,本层只解析透传)。
+	IncludeTools []string `json:"include_tools"`
+	ExcludeTools []string `json:"exclude_tools"`
 }
 
 type agentCoreMCPRawEntry struct {
-	Command  string            `json:"command"`
-	Args     []string          `json:"args"`
-	Env      map[string]string `json:"env"`
-	Type     string            `json:"type"`
-	URL      string            `json:"url"`
-	Headers  map[string]string `json:"headers"`
-	Disabled bool              `json:"disabled"`
+	Command      string            `json:"command"`
+	Args         []string          `json:"args"`
+	Env          map[string]string `json:"env"`
+	Type         string            `json:"type"`
+	URL          string            `json:"url"`
+	Headers      map[string]string `json:"headers"`
+	Disabled     bool              `json:"disabled"`
+	IncludeTools []string          `json:"include_tools"`
+	ExcludeTools []string          `json:"exclude_tools"`
 }
 
 // sanitizeAgentCoreMCPSegment 工具名段白名单化。Anthropic API 工具名必须
@@ -157,6 +163,7 @@ func agentCoreMCPRawServersIn(home string) []agentCoreMCPRawServer {
 		out = append(out, agentCoreMCPRawServer{
 			Name: key, Command: entry.Command, Args: entry.Args, Env: entry.Env,
 			Type: entry.Type, URL: entry.URL, Headers: entry.Headers,
+			IncludeTools: entry.IncludeTools, ExcludeTools: entry.ExcludeTools,
 		})
 	}
 	return out
