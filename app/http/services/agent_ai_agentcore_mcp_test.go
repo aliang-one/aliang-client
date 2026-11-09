@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -420,6 +421,79 @@ func TestAgentCoreMCPServerToolDefsToolCap(t *testing.T) {
 	}
 	if len(uniq) != len(bridges) {
 		t.Fatalf("熔断后不得重名: %d/%d", len(uniq), len(bridges))
+	}
+}
+
+func TestFilterAgentCoreMCPTools(t *testing.T) {
+	tools := []*mcp.Tool{{Name: "a"}, {Name: "b"}, {Name: "c"}}
+	got, err := filterAgentCoreMCPTools(tools, []string{"a", "c"}, nil, "srv")
+	if err != nil || len(got) != 2 || got[0].Name != "a" || got[1].Name != "c" {
+		t.Fatalf("include 白名单交集错误: %v %v", got, err)
+	}
+	_, err = filterAgentCoreMCPTools(tools, []string{"a", "ghost"}, nil, "srv")
+	if err == nil || !strings.Contains(err.Error(), "ghost") {
+		t.Fatalf("include 未知名应硬失败: %v", err)
+	}
+	// exclude 未知名仅警告不判失败;剔除生效
+	got, err = filterAgentCoreMCPTools(tools, nil, []string{"b", "ghost"}, "srv")
+	if err != nil || len(got) != 2 || got[0].Name != "a" || got[1].Name != "c" {
+		t.Fatalf("exclude 黑名单剔除错误: %v %v", got, err)
+	}
+	// 读通道归一(手改文件兜底):trim/去空串/dedup 后照常过滤
+	got, err = filterAgentCoreMCPTools(tools, []string{" a ", "", "a", "c"}, nil, "srv")
+	if err != nil || len(got) != 2 || got[0].Name != "a" {
+		t.Fatalf("读通道归一过滤错误: %v %v", got, err)
+	}
+	// include 与 exclude 同列同一工具:exclude 胜
+	got, err = filterAgentCoreMCPTools(tools, []string{"a", "b"}, []string{"b"}, "srv")
+	if err != nil || len(got) != 1 || got[0].Name != "a" {
+		t.Fatalf("同列冲突应 exclude 胜: %v %v", got, err)
+	}
+}
+
+func TestAgentCoreMCPServerToolDefsToolLevelExclude(t *testing.T) {
+	endpoint := startHTTPTestMCPServer(t, []string{"t1", "t2"}, func(map[string]interface{}) (string, bool) {
+		return "ok", false
+	})
+	m := &agentAIManager{}
+	raws := []agentCoreMCPRawServer{{Name: "srv", Type: "http", URL: endpoint, ExcludeTools: []string{"t2"}}}
+	tools, closeAll := m.agentCoreMCPServerToolDefs(context.Background(), raws, nil)
+	defer closeAll()
+	if len(tools) != 1 || tools[0].Name() != "mcp__srv__t1" {
+		t.Fatalf("exclude 后应只剩 t1: %+v", tools)
+	}
+}
+
+func TestAgentCoreMCPServerToolDefsToolLevelIncludeGhostFails(t *testing.T) {
+	endpoint := startHTTPTestMCPServer(t, []string{"t1"}, func(map[string]interface{}) (string, bool) {
+		return "ok", false
+	})
+	m := &agentAIManager{}
+	raws := []agentCoreMCPRawServer{{Name: "srv", Type: "http", URL: endpoint, IncludeTools: []string{"ghost"}}}
+	tools, closeAll := m.agentCoreMCPServerToolDefs(context.Background(), raws, nil)
+	defer closeAll()
+	if len(tools) != 0 {
+		t.Fatalf("include 未知名应整 server 跳过: %+v", tools)
+	}
+}
+
+// spec 测试 6:过滤必须在 128 cap 计数之前(回归锁)。130 个工具剔 10 个:
+// 正确顺序 → 120 桥(cap 128 未触发);实现错序(先截 128 再剔 10)→ 118,红。
+func TestAgentCoreMCPServerToolDefsFilterBeforeCap(t *testing.T) {
+	names := make([]string, 130)
+	for i := range names {
+		names[i] = fmt.Sprintf("t%03d", i)
+	}
+	endpoint := startHTTPTestMCPServer(t, names, func(map[string]interface{}) (string, bool) {
+		return "ok", false
+	})
+	m := &agentAIManager{}
+	excl := []string{"t000", "t001", "t002", "t003", "t004", "t005", "t006", "t007", "t008", "t009"}
+	raws := []agentCoreMCPRawServer{{Name: "srv", Type: "http", URL: endpoint, ExcludeTools: excl}}
+	tools, closeAll := m.agentCoreMCPServerToolDefs(context.Background(), raws, nil)
+	defer closeAll()
+	if len(tools) != 120 {
+		t.Fatalf("过滤后应剩 120(先过滤后 cap): %d", len(tools))
 	}
 }
 

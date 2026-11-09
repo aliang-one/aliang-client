@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -77,15 +78,16 @@ type agentCoreMCPRawServer struct {
 }
 
 type agentCoreMCPRawEntry struct {
-	Command      string            `json:"command"`
-	Args         []string          `json:"args"`
-	Env          map[string]string `json:"env"`
-	Type         string            `json:"type"`
-	URL          string            `json:"url"`
-	Headers      map[string]string `json:"headers"`
-	Disabled     bool              `json:"disabled"`
-	IncludeTools []string          `json:"include_tools"`
-	ExcludeTools []string          `json:"exclude_tools"`
+	Command  string            `json:"command"`
+	Args     []string          `json:"args"`
+	Env      map[string]string `json:"env"`
+	Type     string            `json:"type"`
+	URL      string            `json:"url"`
+	Headers  map[string]string `json:"headers"`
+	Disabled bool              `json:"disabled"`
+	// 消费侧过滤名单;本层只解析透传,过滤在 agentCoreMCPServerToolDefs 生效(Task 3)
+	IncludeTools []string `json:"include_tools"`
+	ExcludeTools []string `json:"exclude_tools"`
 }
 
 // sanitizeAgentCoreMCPSegment 工具名段白名单化。Anthropic API 工具名必须
@@ -292,6 +294,49 @@ func listAgentCoreMCPTools(ctx context.Context, session *mcp.ClientSession) ([]*
 			break
 		}
 		cursor = res.NextCursor
+	}
+	return out, nil
+}
+
+// filterAgentCoreMCPTools include 白名单交集 + exclude 黑名单剔除(spec §5.2)。
+// 读通道归一先做(手改注册表文件兜底)。include 引用不存在的工具名 → 整 server
+// 判失败(返回 err,调用方走 fail 语义)——把配置错误从「静默丢工具」变成
+// 「显式报错」;exclude 未知名仅 Warn(剔除尚不存在的工具可能是有意预留)。
+// 调用时序:ListTools 之后、128 cap 与命名之前——被过滤的工具不占预算。
+func filterAgentCoreMCPTools(tools []*mcp.Tool, include, exclude []string, serverName string) ([]*mcp.Tool, error) {
+	include = normalizeAgentCoreMCPToolList(include)
+	exclude = normalizeAgentCoreMCPToolList(exclude)
+	names := make(map[string]bool, len(tools))
+	for _, t := range tools {
+		names[t.Name] = true
+	}
+	if len(include) > 0 {
+		missing := make([]string, 0, len(include))
+		for _, n := range include {
+			if !names[n] {
+				missing = append(missing, n)
+			}
+		}
+		if len(missing) > 0 {
+			return nil, fmt.Errorf("include_tools 引用不存在的工具: %v", missing)
+		}
+	}
+	excl := make(map[string]bool, len(exclude))
+	for _, n := range exclude {
+		excl[n] = true
+		if !names[n] {
+			logger.Warn(fmt.Sprintf("agentcore-mcp: server=%s exclude_tools 未匹配任何工具: %q", sanitizeAgentCoreMCPSegment(serverName), n))
+		}
+	}
+	var out []*mcp.Tool
+	for _, t := range tools {
+		if len(include) > 0 && !slices.Contains(include, t.Name) {
+			continue
+		}
+		if excl[t.Name] {
+			continue
+		}
+		out = append(out, t)
 	}
 	return out, nil
 }
@@ -504,6 +549,23 @@ func (m *agentAIManager) agentCoreMCPServerToolDefs(ctx context.Context, raws []
 			}
 			continue
 		}
+		tools, ferr := filterAgentCoreMCPTools(out.tools, out.raw.IncludeTools, out.raw.ExcludeTools, out.raw.Name)
+		if ferr != nil {
+			// 计数互斥(spec §5.2):过滤判失败的 server 只进 skipped,
+			// 不进 connected——「已连接 N(跳过 K)」不得双计。
+			// 语句序:先 closeFn 后 fail(先关会话防泄漏,再记账)——与既有
+			// err 分支(fail 在前)顺序相反,有意为之,勿"纠正"。
+			if out.closeFn != nil {
+				out.closeFn()
+			}
+			fail(out.raw.Name, ferr)
+			continue
+		}
+		if len(tools) != len(out.tools) {
+			logger.Info(fmt.Sprintf("agentcore-mcp: server=%s 工具过滤 保留 %d/%d(include=%d exclude=%d)",
+				sanitizeAgentCoreMCPSegment(out.raw.Name), len(tools), len(out.tools),
+				len(out.raw.IncludeTools), len(out.raw.ExcludeTools)))
+		}
 		if out.closeFn != nil {
 			// 成功路径不 cancel：session 生命周期交给 closeAll（closeFn 内一并
 			// cancel，见上）。先登记，保证工具截断提前结束时也不泄漏会话。
@@ -513,7 +575,7 @@ func (m *agentAIManager) agentCoreMCPServerToolDefs(ctx context.Context, raws []
 		if capped {
 			continue
 		}
-		for _, tool := range out.tools {
+		for _, tool := range tools {
 			if len(bridges) >= agentCoreMCPToolCap {
 				capped = true
 				logger.Warn(fmt.Sprintf("agentcore-mcp: 工具超上限截断 cap=%d", agentCoreMCPToolCap))
