@@ -189,8 +189,12 @@ type AgentVibeSession struct {
 	// Effort 是该会话最近一次运行使用的推理强度档位（low/medium/high/xhigh/max）。
 	// 空串表示「未设置/未下发」。前端会话设置条据此回填真实档位，而不是永远
 	// 显示「默认」——设备会话续聊时若看不到真实档位，用户无法判断该不该重设。
-	Effort         string                   `json:"effort,omitempty"`
-	ApprovalMode   string                   `json:"approval_mode,omitempty"`
+	Effort string `json:"effort,omitempty"`
+	// approval_mode 恒下发（不带 omitempty，2026-11-09 评审修正）：挡位的
+	// 「缺键=保存量」上游契约里，显式空串（切回默认推荐）必须能跨端传播——
+	// omitempty 会把 '' 折叠成缺键，PhoneServer/手机端据契约保存旧值，桌面端
+	// 的重置会被手机下一回合洗回旧挡位。老 PhoneServer 对未知键剥离，无副作用。
+	ApprovalMode   string                   `json:"approval_mode"`
 	Transcript     []AgentVibeMessage       `json:"transcript,omitempty"`
 	TranscriptPage *AgentVibeTranscriptPage `json:"transcript_page,omitempty"`
 	CreatedAt      string                   `json:"created_at,omitempty"`

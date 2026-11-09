@@ -180,12 +180,33 @@ func (m *agentAIManager) registerAISocket(role string, write agentTerminalWriter
 		sock.id = agentAIRemoteSocketID
 	}
 	m.aiSockets[sock.id] = sock
+	// origin 悬空修复（2026-11-09，11-04 生产实证）：本地 socket 断线即从注册
+	// 表摘除，但会话的 originSocket 仍指向死 id——ack 双写与按 origin 的投递
+	// 永远落空（同 optionResponse 作答刷新 TestOptionResponseRefreshesOriginSocket
+	// 的缺口家族）。新本地 socket 注册时把悬空 origin 重指向自己；远端常驻键
+	// 恒存（单例键不会悬空）与仍存活的 origin 均不扰动。
+	if role == "local" {
+		m.refreshStaleSessionOriginsLocked(sock.id)
+	}
 	m.mu.Unlock()
 	if evicted != nil {
 		evicted.closeOnce.Do(func() { close(evicted.closed) })
 	}
 	go sock.pump()
 	return sock
+}
+
+// refreshStaleSessionOriginsLocked 把 originSocket 指向已不在注册表的会话
+// 重指向新注册的本地 socket。调用方必须持有 m.mu（registerAISocket 内联调用）。
+func (m *agentAIManager) refreshStaleSessionOriginsLocked(newSocketID string) {
+	for _, s := range m.sessions {
+		if s == nil || s.originSocket == "" || s.originSocket == agentAIRemoteSocketID || s.originSocket == newSocketID {
+			continue
+		}
+		if m.aiSockets[s.originSocket] == nil {
+			s.originSocket = newSocketID
+		}
+	}
 }
 
 func (m *agentAIManager) unregisterAISocket(id string) {
@@ -295,9 +316,11 @@ func (m *agentAIManager) buildSessionSnapshotPayload(sessionID string) map[strin
 		}
 		payload["transcript"] = tr
 	}
-	if pending := m.pendingApprovalsSnapshotForSession(sessionID); len(pending) > 0 {
-		payload["pending_approvals"] = pending
-	}
+	// pending_approvals 恒在场（2026-11-09 快照权威清卡契约）：空集=权威
+	// 「无在挂」——旧实现空时整字段缺席，前端 running 态无从区分「无在挂」与
+	// 「旧版 agent」，只能只 upsert 不清卡，别端已作答的卡在桌面永 pending。
+	// 前端按字段在场与否决定是否权威清卡（缺席=旧 agent，不越权）。
+	payload["pending_approvals"] = m.pendingApprovalsSnapshotForSession(sessionID)
 	return payload
 }
 

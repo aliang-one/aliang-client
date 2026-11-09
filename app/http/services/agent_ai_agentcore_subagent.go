@@ -31,6 +31,11 @@ const (
 	// task 会原样进子 run 首轮请求，上游可能直接 400（2026-11-05 审计盲点 5：
 	// 此前只有 TrimSpace 空校验，无上限）。64KB 与 MCP 输出截断同量级。
 	agentCoreSubagentTaskCap = 64 * 1024
+
+	// 子 run 回合文本落盘封顶（L2 sidechain）。一轮 assistant 输出通常远小于
+	// 此值；thinking 同样封顶，防单行撑爆 journal。留足上下文给中断重派。
+	agentCoreSubagentTurnTextCap     = 8 * 1024
+	agentCoreSubagentTurnThinkingCap = 4 * 1024
 )
 
 // agentCoreSubagentToolCeiling 解析子 agent 桥的内核执行窗口（TimeoutHint）。
@@ -220,6 +225,10 @@ type agentCoreSubagentBridge struct {
 	// 2026-11-07：手机端此前对 agentcore 派发的子 agent 全程无感知）。nil=不发
 	// （宿主未接线/既有测试路径），完全无感。
 	mirror *agentCoreSubagentMirror
+	// control 是本主 run 的子 agent 控制表（L3，2026-11-09）：per-task 停止与
+	// 追加指令。nil=控制面不接线（既有测试路径），桥照常跑——控制是可选能力，
+	// 不是子 run 的前置条件。
+	control *agentCoreSubagentControl
 }
 
 // TimeoutHint 覆盖内核默认单工具窗口（agentcore.TimeoutHint）。
@@ -265,7 +274,7 @@ type agentCoreSubagentMirror struct {
 // start 登记 started。tracked=false 表示 registry 拒收（cap 满），后续
 // progress/finish 对该 taskID 静默降级（与 claude 侧 registry 满载 fail-soft
 // 同语义——轨迹丢，任务不受影响）。
-func (m *agentCoreSubagentMirror) start(bridgeName, description string) (string, bool) {
+func (m *agentCoreSubagentMirror) start(bridgeName, description, task string) (string, bool) {
 	if m == nil {
 		return "", false
 	}
@@ -279,7 +288,7 @@ func (m *agentCoreSubagentMirror) start(bridgeName, description string) (string,
 		return taskID, false
 	}
 	if m.journal != nil {
-		m.journal.appendSubagentStart(m.sessionID, taskID, bridgeName, description)
+		m.journal.appendSubagentStart(m.sessionID, taskID, bridgeName, description, task)
 	}
 	m.activity.beginSubagent()
 	m.emitRecord(record)
@@ -338,6 +347,16 @@ func (m *agentCoreSubagentMirror) finish(bridgeName, taskID, phase, summary stri
 		}
 	}
 	m.activity.endSubagent()
+}
+
+// appendTurnLine 落子 run 的回合输出行（L2 sidechain）。只在本子 agent 被
+// tracked（registry 收下）时调用——未 tracked 时不落任何行，与 start/finish/
+// tool 三类的 gating 一致（不给面板造无主轨迹）。
+func (m *agentCoreSubagentMirror) appendTurnLine(taskID string, turn int, text, thinking string, tokens int) {
+	if m == nil || m.journal == nil || taskID == "" {
+		return
+	}
+	m.journal.appendSubagentTurn(m.sessionID, taskID, turn, text, thinking, tokens)
 }
 
 // appendToolLine 落子 agent 的工具轨迹行（kind=tool + subagent_task_id）。
@@ -500,14 +519,30 @@ func safeOnToolCall(onCall func(tool, summary string, isErr bool), tool, summary
 
 // Execute：递归子 run。ctx 继承（内核单工具窗口由 TimeoutHint 覆盖为
 // toolCeiling，默认 6h——不再是 10 分钟，见 agentCoreSubagentToolCeiling）。
-// 子 Config 显式置零：Emit=nil（子 run 静默，防帧交错进父管道）、Hooks=nil
-// （防窃主 run 插话队列）——spec §3 钉死，勿照抄父 Config。
+// 子 Config 显式置零：Emit=nil（子 run 静默，防帧交错进父管道）。Hooks 只接
+// 两个自有通道（OnTurnEnd 落 sidechain、GetSteeringMessages 吃子 run 自己的
+// 追加指令队列）——子 run 绝不碰主 run 的插话队列，spec §3 的原始约束成立。
 func (b *agentCoreSubagentBridge) Execute(ctx context.Context, input map[string]interface{}, _ *agentcore.ToolEnv) (result agentcore.ToolResult) {
 	task, _ := input["task"].(string)
 	if strings.TrimSpace(task) == "" {
 		return agentcore.ToolResult{Content: "task 参数必填", IsError: true}
 	}
 	task = truncateAgentCoreSubagentTask(task, agentCoreSubagentTaskCap)
+	// 续跑简报注入（L3，2026-11-09）：resume_task_id 指向上回合被中断的那个子
+	// agent，把它的 sidechain 逐回合进展作为前置说明塞进本轮任务。见
+	// subagentSidechainBriefing 的注释——这是「接着干」的诚实降级，不是重放
+	// 消息（sidechain 没有 tool_use/tool_result，重放会造出非法历史）。
+	// 简报拿不到（旧 journal/没跑完一回合）时静默跳过：普通派发。
+	if resumeID, ok := input["resume_task_id"].(string); ok {
+		if resumeID = strings.TrimSpace(resumeID); resumeID != "" && b.mirror != nil && b.mirror.journal != nil {
+			if briefing := b.mirror.journal.subagentSidechainBriefing(b.mirror.sessionID, resumeID, agentCoreSubagentBriefingMaxChars); briefing != "" {
+				task = "【续跑上下文】下面是你上一次尝试同一个任务时已经做过的进展（那次被中断了）。" +
+					"请接着它的进度继续，不要从头重做；如果简报里的方向已经过时，以本次任务描述为准。\n\n" +
+					briefing + "\n\n【本次任务】\n" + task
+				task = truncateAgentCoreSubagentTask(task, agentCoreSubagentTaskCap)
+			}
+		}
+	}
 	var mcpTools []agentcore.Tool
 	if b.mcpTools != nil {
 		mcpTools = b.mcpTools()
@@ -523,16 +558,36 @@ func (b *agentCoreSubagentBridge) Execute(ctx context.Context, input map[string]
 	isErr := false
 	text := ""
 	var totalTokens int64
-	subTaskID, tracked := b.mirror.start(b.name, b.description)
+	// task 截断进 start 行（中断注入数据面）：rune 安全 200 rune，与 finish
+	// summary 同口径——崩溃后主 LLM 仍知道当时派的是什么活。
+	subTaskID, tracked := b.mirror.start(b.name, b.description, truncateAgentText(task, 200))
+	// 子 run 的 ctx 从父 ctx 派生（L3 控制面）：per-task 停止=只 cancel 这一条，
+	// 父级取消（整回合停止/超时/watchdog）照旧级联——停止语义只增不减。子 run
+	// 收尾后必须归还 cancel（defer 兜底，防 ctx 泄漏）。
+	subCtx, subCancel := context.WithCancel(ctx)
+	// 控制句柄登记（L3）：外部据此按 task_id 停下来/追加指令。control=nil
+	// （测试路径/宿主未接线）时 register 返回 nil，后续都用 nil 安全的空操作。
+	handle := b.control.register(subTaskID, b.name, subCancel)
 	var toolUses atomic.Int64
+	var turnCounter atomic.Int64
+	// 收尾顺序（defer LIFO）：先跑下面的 finish（要读 subCtx.Err() 判相位），
+	// 再跑这里归还 cancel——反了会让「per-task 停止」被判成 completed。
+	defer func() {
+		if handle != nil {
+			b.control.unregister(handle.taskID)
+		}
+		subCancel()
+	}()
 	if tracked {
 		defer func() {
 			// 相位判定先取消后错误（2026-11-09 审计）：主回合停止/超时时
 			// agentcore.Run 返回的 err 就是 ctx 错，isErr 会被置 true——若先判
 			// isErr 会把取消错标 failed，与 claude 侧 finalizeRunSubagents 的
 			// live interrupted 口径分裂（面板历史卡 vs 实时卡语义不一致）。
+			// 读 subCtx 而不是 ctx（L3）：per-task 停止只 cancel 子 ctx，父 ctx
+			// 仍活着——看 ctx 会把「单独停掉这个子 agent」错标 completed。
 			phase := "completed"
-			if ctx.Err() != nil {
+			if subCtx.Err() != nil {
 				phase = "interrupted"
 			} else if isErr {
 				phase = "failed"
@@ -572,9 +627,40 @@ func (b *agentCoreSubagentBridge) Execute(ctx context.Context, input map[string]
 		// 与主 run 同阈值：子 agent 同样跑 loop，打转守卫口径必须一致
 		// （仪表盘 customer.agentcore.max_identical_tool_turns；0 走内核默认）。
 		MaxIdenticalToolTurns: config.GetGlobalConfig().EffectiveAgentCoreMaxIdenticalToolTurns(),
-		// Emit/Hooks 刻意 nil（spec §3）。
+		// Emit 刻意 nil（spec §3：子 run 不产出帧，防帧交错进父 delta 流）。
+		// Hooks 只接两个：
+		//   OnTurnEnd —— 子 run 的每回合 assistant 输出落 sidechain journal
+		//     （L2，2026-11-09）：崩溃后成果可查、中断重派能接上下文。
+		//   GetSteeringMessages —— per-task 追加指令队列（L3，2026-11-09）。
+		//     spec §3 曾以「复用父队列会让子 run 窃走主 run 待插话」为由留
+		//     nil；这里用的是**子 run 自己的**独立队列（handle.steer），主 run
+		//     的插话队列一个字节都不会被子 run 取走，该约束依然成立。
+		// 两个钩子都只碰 journal/自有队列（各自带锁），不碰帧通道，
+		// 帧交错约束不受影响。
+		Hooks: agentcore.LoopHooks{
+			OnTurnEnd: func(tr agentcore.TurnResult) {
+				if !tracked || b.mirror == nil {
+					return
+				}
+				turnN := int(turnCounter.Add(1))
+				tokens := 0
+				if tr.Usage != nil {
+					tokens = tr.Usage.InputTokens + tr.Usage.OutputTokens
+				}
+				b.mirror.appendTurnLine(subTaskID, turnN,
+					truncateAgentText(tr.Text, agentCoreSubagentTurnTextCap),
+					truncateAgentText(tr.Thinking, agentCoreSubagentTurnThinkingCap),
+					tokens)
+			},
+			GetSteeringMessages: func() []agentcore.Message {
+				if handle == nil {
+					return nil
+				}
+				return handle.steer.drain()
+			},
+		},
 	}
-	res, err := agentcore.Run(ctx, cfg, []agentcore.Message{{Role: "user", Content: task}})
+	res, err := agentcore.Run(subCtx, cfg, []agentcore.Message{{Role: "user", Content: task}})
 	if err != nil {
 		isErr, text = true, "子 agent 执行失败: "+err.Error()
 	} else if res != nil && res.IsError {
@@ -619,8 +705,9 @@ func (m *agentAIManager) agentCoreSubagentTools(run agentAIRun,
 	approve func(context.Context, agentcore.ApprovalRequest) (agentcore.ApprovalResponse, error),
 	logf func(string, ...interface{}),
 	mcpTools []agentcore.Tool,
-	mirror *agentCoreSubagentMirror) []agentcore.Tool {
-	router := m.agentCoreSubagentTaskTool(run, client, env, approve, logf, mcpTools, mirror)
+	mirror *agentCoreSubagentMirror,
+	control *agentCoreSubagentControl) []agentcore.Tool {
+	router := m.agentCoreSubagentTaskTool(run, client, env, approve, logf, mcpTools, mirror, control)
 	if router == nil {
 		return nil
 	}
@@ -687,6 +774,10 @@ func (r *agentCoreSubagentTaskRouter) InputSchema() map[string]interface{} {
 			"subagent_type": map[string]interface{}{"type": "string", "description": "要派发的子 agent 类型名（见 system prompt <subagents> 类型清单）"},
 			"task":          map[string]interface{}{"type": "string", "description": "交给子 agent 的任务描述（自包含——子 agent 看不到本对话）"},
 			"model":         map[string]interface{}{"type": "string", "description": "可选：覆盖子 agent 模型（仅 glm-* 生效，其余回落主模型）"},
+			"resume_task_id": map[string]interface{}{
+				"type":        "string",
+				"description": "可选：续跑一个上一回合被中断的子 agent（填 <interrupted-subagents> 里那条的 task_id）。系统会把它的逐回合进展作为前置简报注入，接着干而不是从头再来",
+			},
 		},
 		"required": []interface{}{"subagent_type", "task"},
 	}
@@ -711,7 +802,8 @@ func (m *agentAIManager) agentCoreSubagentTaskTool(run agentAIRun,
 	approve func(context.Context, agentcore.ApprovalRequest) (agentcore.ApprovalResponse, error),
 	logf func(string, ...interface{}),
 	mcpTools []agentcore.Tool,
-	mirror *agentCoreSubagentMirror) *agentCoreSubagentTaskRouter {
+	mirror *agentCoreSubagentMirror,
+	control *agentCoreSubagentControl) *agentCoreSubagentTaskRouter {
 
 	defs := agentCoreSubagentMergedDefs()
 	if len(defs) == 0 {
@@ -781,6 +873,7 @@ func (m *agentAIManager) agentCoreSubagentTaskTool(run agentAIRun,
 			toolCeiling:    agentCoreSubagentToolCeiling(),
 			skillsBlock:    skillsBlock,
 			mirror:         mirror,
+			control:        control,
 		}
 		types = append(types, name)
 		descriptions[name] = desc
@@ -825,5 +918,54 @@ func agentCoreSubagentMechanismSuffix(router *agentCoreSubagentTaskRouter) strin
 	b.WriteString("Parallel subagents share the same working directory — parallelize read-only work; ")
 	b.WriteString("keep file-writing tasks sequential or scoped to distinct files.\n")
 	b.WriteString("</subagents>")
+	return b.String()
+}
+
+// agentCoreSubagentInterruptedSuffix 中断注入（L1，feat/subagent-interrupted-injection）：
+// 上一回合未终态子 agent 清单进 system prompt——主 LLM 感知中断并可智能重派
+// （session-context 通道复用，装配期一次求值）。超 5 条截最老 5 条防膨胀；
+// 空清单返回空串零副作用。
+func agentCoreSubagentInterruptedSuffix(entries []agentCoreSubagentInterrupted) string {
+	if len(entries) == 0 {
+		return ""
+	}
+	if len(entries) > 5 {
+		entries = entries[:5]
+	}
+	var b strings.Builder
+	b.WriteString("\n\n<interrupted-subagents>\n")
+	b.WriteString("Subagents dispatched by a previous turn of this conversation never returned ")
+	b.WriteString("(the run was stopped or the process died). Their partial work was lost — do not ")
+	b.WriteString("assume any results from them:\n")
+	for _, e := range entries {
+		// task_id 必须显示（L3）：主 LLM 只有拿到它才能用 task(resume_task_id=...)
+		// 续跑——没有 id 的中断清单只能诱发改写式重派。
+		line := fmt.Sprintf("- %s [task_id=%s] (started %s, %d tool calls", e.Name, e.TaskID, e.StartedAt, e.ToolCalls)
+		if e.LastTool != "" {
+			line += ", last: " + e.LastTool
+		}
+		line += ")"
+		if strings.TrimSpace(e.Task) != "" {
+			line += ": task=" + e.Task
+		}
+		b.WriteString(line + "\n")
+		// 最后一轮发言（L2 sidechain）：重派时能接上下文，而不是只知道跑了
+		// 几个工具。截短——它只是开头的线索，不是要给主 LLM 读整段。
+		if t := strings.TrimSpace(e.LastText); t != "" {
+			if len(t) > 300 {
+				t = t[:300]
+				for len(t) > 0 && !utf8.ValidString(t) {
+					t = t[:len(t)-1]
+				}
+				t += "…"
+			}
+			b.WriteString("  last output: " + t + "\n")
+		}
+	}
+	b.WriteString("If the work is still needed, continue it with task(resume_task_id=<task_id>, task=<remaining work>) — ")
+	b.WriteString("the subagent will receive the previous run's progress as context and pick up where it stopped. ")
+	b.WriteString("Or re-dispatch fresh with a self-contained task description if a restart is better. ")
+	b.WriteString("Mention the interruption to the user if relevant.\n")
+	b.WriteString("</interrupted-subagents>")
 	return b.String()
 }

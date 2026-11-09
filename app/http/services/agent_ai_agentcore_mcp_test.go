@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -128,7 +129,8 @@ func TestAgentCoreMCPBridgeExecute(t *testing.T) {
 	})
 	var journaled []string
 	bridge := &agentCoreMCPBridge{
-		session: session, rawTool: "lookup", name: "mcp__test-srv__lookup",
+		holder:  newAgentCoreMCPSessionHolder(session, func() { _ = session.Close() }, agentCoreMCPRawServer{}, nil),
+		rawTool: "lookup", name: "mcp__test-srv__lookup",
 		description: "测试工具",
 		schema:      map[string]interface{}{"type": "object"},
 		onCall:      func(tool, summary string, isErr bool) { journaled = append(journaled, tool+"|"+summary) },
@@ -150,7 +152,10 @@ func TestAgentCoreMCPBridgeRecoversPanic(t *testing.T) {
 	session := startTestMCPSession(t, "evil", func(map[string]interface{}) (string, bool) {
 		return "", false
 	})
-	bridge := &agentCoreMCPBridge{session: session, rawTool: "evil", name: "mcp__s__evil"}
+	bridge := &agentCoreMCPBridge{
+		holder:  newAgentCoreMCPSessionHolder(session, func() { _ = session.Close() }, agentCoreMCPRawServer{}, nil),
+		rawTool: "evil", name: "mcp__s__evil",
+	}
 	// onCall 里故意 panic：Execute 必须兜住不炸整轮（纵深防御）。
 	bridge.onCall = func(string, string, bool) { panic("journal boom") }
 	res := bridge.Execute(context.Background(), map[string]interface{}{}, nil)
@@ -266,7 +271,7 @@ func TestAgentCoreMCPServerToolDefsDialsConcurrently(t *testing.T) {
 func TestAgentCoreMCPBridgeRecoversOuterPanic(t *testing.T) {
 	var journaled []bool
 	// session 置 nil：CallTool 里解引用 nil 必 panic，打的是外层兜底路径。
-	bridge := &agentCoreMCPBridge{session: nil, rawTool: "x", name: "mcp__s__x",
+	bridge := &agentCoreMCPBridge{holder: newAgentCoreMCPSessionHolder(nil, nil, agentCoreMCPRawServer{}, nil), rawTool: "x", name: "mcp__s__x",
 		onCall: func(tool, summary string, isErr bool) { journaled = append(journaled, isErr) }}
 	res := bridge.Execute(context.Background(), map[string]interface{}{}, nil)
 	if !res.IsError || !strings.Contains(res.Content, "MCP 工具执行崩溃") {
@@ -423,10 +428,88 @@ func TestAgentCoreMCPServerToolDefsToolCap(t *testing.T) {
 	}
 }
 
+func TestFilterAgentCoreMCPTools(t *testing.T) {
+	tools := []*mcp.Tool{{Name: "a"}, {Name: "b"}, {Name: "c"}}
+	got, err := filterAgentCoreMCPTools(tools, []string{"a", "c"}, nil, "srv")
+	if err != nil || len(got) != 2 || got[0].Name != "a" || got[1].Name != "c" {
+		t.Fatalf("include 白名单交集错误: %v %v", got, err)
+	}
+	_, err = filterAgentCoreMCPTools(tools, []string{"a", "ghost"}, nil, "srv")
+	if err == nil || !strings.Contains(err.Error(), "ghost") {
+		t.Fatalf("include 未知名应硬失败: %v", err)
+	}
+	// exclude 未知名仅警告不判失败;剔除生效
+	got, err = filterAgentCoreMCPTools(tools, nil, []string{"b", "ghost"}, "srv")
+	if err != nil || len(got) != 2 || got[0].Name != "a" || got[1].Name != "c" {
+		t.Fatalf("exclude 黑名单剔除错误: %v %v", got, err)
+	}
+	// 读通道归一(手改文件兜底):trim/去空串/dedup 后照常过滤
+	got, err = filterAgentCoreMCPTools(tools, []string{" a ", "", "a", "c"}, nil, "srv")
+	if err != nil || len(got) != 2 || got[0].Name != "a" {
+		t.Fatalf("读通道归一过滤错误: %v %v", got, err)
+	}
+	// include 与 exclude 同列同一工具:exclude 胜
+	got, err = filterAgentCoreMCPTools(tools, []string{"a", "b"}, []string{"b"}, "srv")
+	if err != nil || len(got) != 1 || got[0].Name != "a" {
+		t.Fatalf("同列冲突应 exclude 胜: %v %v", got, err)
+	}
+}
+
+func TestAgentCoreMCPServerToolDefsToolLevelExclude(t *testing.T) {
+	endpoint := startHTTPTestMCPServer(t, []string{"t1", "t2"}, func(map[string]interface{}) (string, bool) {
+		return "ok", false
+	})
+	m := &agentAIManager{}
+	raws := []agentCoreMCPRawServer{{Name: "srv", Type: "http", URL: endpoint, ExcludeTools: []string{"t2"}}}
+	tools, closeAll := m.agentCoreMCPServerToolDefs(context.Background(), raws, nil)
+	defer closeAll()
+	if len(tools) != 1 || tools[0].Name() != "mcp__srv__t1" {
+		t.Fatalf("exclude 后应只剩 t1: %+v", tools)
+	}
+}
+
+func TestAgentCoreMCPServerToolDefsToolLevelIncludeGhostFails(t *testing.T) {
+	endpoint := startHTTPTestMCPServer(t, []string{"t1"}, func(map[string]interface{}) (string, bool) {
+		return "ok", false
+	})
+	m := &agentAIManager{}
+	raws := []agentCoreMCPRawServer{{Name: "srv", Type: "http", URL: endpoint, IncludeTools: []string{"ghost"}}}
+	tools, closeAll := m.agentCoreMCPServerToolDefs(context.Background(), raws, nil)
+	defer closeAll()
+	if len(tools) != 0 {
+		t.Fatalf("include 未知名应整 server 跳过: %+v", tools)
+	}
+}
+
+// spec 测试 6:过滤必须在 128 cap 计数之前(回归锁)。130 个工具剔 10 个:
+// 正确顺序 → 120 桥(cap 128 未触发);实现错序(先截 128 再剔 10)→ 118,红。
+func TestAgentCoreMCPServerToolDefsFilterBeforeCap(t *testing.T) {
+	names := make([]string, 130)
+	for i := range names {
+		names[i] = fmt.Sprintf("t%03d", i)
+	}
+	endpoint := startHTTPTestMCPServer(t, names, func(map[string]interface{}) (string, bool) {
+		return "ok", false
+	})
+	m := &agentAIManager{}
+	excl := []string{"t000", "t001", "t002", "t003", "t004", "t005", "t006", "t007", "t008", "t009"}
+	raws := []agentCoreMCPRawServer{{Name: "srv", Type: "http", URL: endpoint, ExcludeTools: excl}}
+	tools, closeAll := m.agentCoreMCPServerToolDefs(context.Background(), raws, nil)
+	defer closeAll()
+	if len(tools) != 120 {
+		t.Fatalf("过滤后应剩 120(先过滤后 cap): %d", len(tools))
+	}
+}
+
 func TestAgentCoreMCPBridgeTransportError(t *testing.T) {
 	var isErrs []bool
 	session := startTestMCPSession(t, "t", func(map[string]interface{}) (string, bool) { return "ok", false })
-	bridge := &agentCoreMCPBridge{session: session, rawTool: "t", name: "mcp__s__t",
+	bridge := &agentCoreMCPBridge{
+		holder: newAgentCoreMCPSessionHolder(session, func() { _ = session.Close() }, agentCoreMCPRawServer{},
+			func(context.Context, agentCoreMCPRawServer) (*mcp.ClientSession, func(), error) {
+				return nil, nil, fmt.Errorf("dial 拒绝")
+			}),
+		rawTool: "t", name: "mcp__s__t",
 		onCall: func(tool, summary string, isErr bool) { isErrs = append(isErrs, isErr) }}
 	if err := session.Close(); err != nil {
 		t.Fatalf("Close 失败: %v", err)
@@ -1334,5 +1417,115 @@ func TestAgentCoreMCPRawServersInIncludesRegistry(t *testing.T) {
 	}
 	if byName["blend"].Command != "uvx" || len(byName["blend"].Args) != 1 {
 		t.Fatalf("注册表 stdio 条目必须进采集: %+v", byName["blend"])
+	}
+}
+
+func TestAgentCoreMCPRawServersParseToolLists(t *testing.T) {
+	home := t.TempDir()
+	_ = upsertAliangMCPServerForTest(home, "srv", aliangMCPServerEntry{
+		Command: "echo", IncludeTools: []string{"a", "b"}, ExcludeTools: []string{"x"},
+	})
+	raws := agentCoreMCPRawServersIn(home)
+	if len(raws) != 1 {
+		t.Fatalf("应采到 1 条: %+v", raws)
+	}
+	if len(raws[0].IncludeTools) != 2 || raws[0].IncludeTools[0] != "a" {
+		t.Fatalf("include 解析错误: %v", raws[0].IncludeTools)
+	}
+	if len(raws[0].ExcludeTools) != 1 || raws[0].ExcludeTools[0] != "x" {
+		t.Fatalf("exclude 解析错误: %v", raws[0].ExcludeTools)
+	}
+}
+
+// agentCoreMCPCallError 携带面向模型的最终文案,Execute 原样采用不再二次包装
+// (判死文案与「已自动重连」文案都由 holder 定型)。
+func TestAgentCoreMCPHolderReconnectSuccess(t *testing.T) {
+	good := startTestMCPSession(t, "t", func(map[string]interface{}) (string, bool) { return "ok", false })
+	dialCalls := 0
+	dial := func(context.Context, agentCoreMCPRawServer) (*mcp.ClientSession, func(), error) {
+		dialCalls++
+		return good, func() { _ = good.Close() }, nil
+	}
+	init := startTestMCPSession(t, "t", func(map[string]interface{}) (string, bool) { return "ok", false })
+	_ = init.Close() // 初始会话立死,逼出重连
+	h := newAgentCoreMCPSessionHolder(init, func() { _ = init.Close() }, agentCoreMCPRawServer{Name: "srv"}, dial)
+	b := &agentCoreMCPBridge{holder: h, rawTool: "t", name: "mcp__srv__t"}
+	res := b.Execute(context.Background(), map[string]interface{}{}, nil)
+	if res.IsError || !strings.Contains(res.Content, "ok") {
+		t.Fatalf("重连后应成功: %+v", res)
+	}
+	if dialCalls != 1 {
+		t.Fatalf("应恰好重拨一次: %d", dialCalls)
+	}
+}
+
+func TestAgentCoreMCPHolderIsErrorNoReconnect(t *testing.T) {
+	dialCalls := 0
+	dial := func(context.Context, agentCoreMCPRawServer) (*mcp.ClientSession, func(), error) {
+		dialCalls++
+		return nil, nil, fmt.Errorf("不应拨号")
+	}
+	session := startTestMCPSession(t, "t", func(map[string]interface{}) (string, bool) { return "工具报错", true })
+	h := newAgentCoreMCPSessionHolder(session, func() { _ = session.Close() }, agentCoreMCPRawServer{Name: "srv"}, dial)
+	b := &agentCoreMCPBridge{holder: h, rawTool: "t", name: "mcp__srv__t"}
+	res := b.Execute(context.Background(), map[string]interface{}{}, nil)
+	if !res.IsError || !strings.Contains(res.Content, "工具报错") {
+		t.Fatalf("IsError 应原样透传: %+v", res)
+	}
+	if dialCalls != 0 {
+		t.Fatalf("工具逻辑报错不得触发重连: %d", dialCalls)
+	}
+}
+
+func TestAgentCoreMCPHolderDeadAfterCap(t *testing.T) {
+	dialCalls := 0
+	dial := func(context.Context, agentCoreMCPRawServer) (*mcp.ClientSession, func(), error) {
+		dialCalls++
+		s := startTestMCPSession(t, "t", func(map[string]interface{}) (string, bool) { return "ok", false })
+		_ = s.Close() // 拨出来的也立死
+		return s, func() { _ = s.Close() }, nil
+	}
+	init := startTestMCPSession(t, "t", func(map[string]interface{}) (string, bool) { return "ok", false })
+	_ = init.Close()
+	h := newAgentCoreMCPSessionHolder(init, func() { _ = init.Close() }, agentCoreMCPRawServer{Name: "srv"}, dial)
+	b := &agentCoreMCPBridge{holder: h, rawTool: "t", name: "mcp__srv__t"}
+	for i := 0; i < agentCoreMCPReconnectDeadCap; i++ {
+		res := b.Execute(context.Background(), map[string]interface{}{}, nil)
+		if !res.IsError || !strings.Contains(res.Content, "已自动重连") {
+			t.Fatalf("第 %d 次应失败且注明已重连: %+v", i+1, res)
+		}
+	}
+	res := b.Execute(context.Background(), map[string]interface{}{}, nil)
+	if !res.IsError || !strings.Contains(res.Content, "判死") || !strings.Contains(res.Content, "3") {
+		t.Fatalf("判死文案错误: %+v", res)
+	}
+	if dialCalls != agentCoreMCPReconnectDeadCap {
+		t.Fatalf("判死后不得再拨号: dialCalls=%d", dialCalls)
+	}
+}
+
+func TestAgentCoreMCPHolderCloseClosesCurrent(t *testing.T) {
+	var closedLog []string
+	good := startTestMCPSession(t, "t", func(map[string]interface{}) (string, bool) { return "ok", false })
+	dial := func(context.Context, agentCoreMCPRawServer) (*mcp.ClientSession, func(), error) {
+		return good, func() { _ = good.Close(); closedLog = append(closedLog, "s2") }, nil
+	}
+	init := startTestMCPSession(t, "t", func(map[string]interface{}) (string, bool) { return "ok", false })
+	_ = init.Close()
+	h := newAgentCoreMCPSessionHolder(init, func() { closedLog = append(closedLog, "s1") }, agentCoreMCPRawServer{Name: "srv"}, dial)
+	b := &agentCoreMCPBridge{holder: h, rawTool: "t", name: "mcp__srv__t"}
+	if res := b.Execute(context.Background(), map[string]interface{}{}, nil); res.IsError {
+		t.Fatalf("重连应成功: %+v", res)
+	}
+	h.Close() // 必须关到换后的新会话
+	// 重连路径先关旧会话(记录 s1),Close 再关换上的新会话(记录 s2):
+	// 两条都必须证——「旧会话在换时已关」(防泄漏)+「新会话被 Close 关到」。
+	if len(closedLog) != 2 || closedLog[0] != "s1" || closedLog[1] != "s2" {
+		t.Fatalf("关闭序应为 [s1(换时关旧), s2(Close 关新)]: %v", closedLog)
+	}
+	// Close 后再调用:判死快速失败,不拨号不解引用 nil
+	res := b.Execute(context.Background(), map[string]interface{}{}, nil)
+	if !res.IsError || !strings.Contains(res.Content, "判死") {
+		t.Fatalf("Close 后应判死快速失败: %+v", res)
 	}
 }

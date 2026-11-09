@@ -572,8 +572,10 @@ func (j *agentCoreJournal) appendTool(sessionID, tool, summary string, isError b
 
 // appendSubagentStart 落 kind=subagent/event=start 行：子 agent 跑起来
 // 即写一行（spec subagent-panel）。taskID 形如 agentcore-<messageID>-<name>-<n>，
-// 自带回合 messageID 消歧。守卫与 appendTool 同款；写失败 Warn 吞掉。
-func (j *agentCoreJournal) appendSubagentStart(sessionID, taskID, name, description string) {
+// 自带回合 messageID 消歧。task=派发任务文本截断（调用方 rune 安全截断）——
+// 崩溃后主 LLM 仍知道当时在做什么（中断注入 feat/subagent-interrupted-injection）；
+// 旧行无此键，读侧容忍缺失。守卫与 appendTool 同款；写失败 Warn 吞掉。
+func (j *agentCoreJournal) appendSubagentStart(sessionID, taskID, name, description, task string) {
 	if j == nil || j.dir == "" || strings.TrimSpace(sessionID) == "" {
 		return
 	}
@@ -585,8 +587,191 @@ func (j *agentCoreJournal) appendSubagentStart(sessionID, taskID, name, descript
 		"task_id":     taskID,
 		"name":        name,
 		"description": description,
+		"task":        task,
 		"ts":          time.Now().UTC().Format(time.RFC3339),
 	})
+}
+
+// agentCoreSubagentInterrupted 是一条未终态子 agent 的对账摘要（中断注入用）。
+type agentCoreSubagentInterrupted struct {
+	TaskID    string
+	Name      string
+	Task      string // start 行 task 文本（旧 journal 行为空）
+	StartedAt string
+	ToolCalls int
+	LastTool  string
+	// LastText 是子 agent 最后一轮说的话（subagent_turn 行，L2）。中断重派
+	// 时主 LLM 能接上下文，而不是只知道跑了几个工具。旧 journal 为空。
+	LastText string
+}
+
+// agentCoreSubagentBriefingMaxChars 是续跑简报的总字符封顶（rune 数）。它要塞
+// 进下一个子 run 的首轮 user 消息，撑太大会一开局就吃掉半个上下文窗口。
+const agentCoreSubagentBriefingMaxChars = 6000
+
+// subagentSidechainBriefing 把一个已死子 agent 的 sidechain 还原成「续跑简报」
+// （L3，2026-11-09）。
+//
+// 为什么不「逐条重放消息」：sidechain 只落了每回合的 assistant 文本与 thinking
+// ——**没有** tool_use 块，也没有对应的 tool_result（那两份在内核内存里，进程
+// 一死就没了）。硬造一段 assistant 历史却不配 tool_use/tool_result，上游要么
+// 400（消息结构非法），要么让模型以为自己「已经做过」却拿不到任何事实依据。
+// 所以这里只做诚实的降级：把「上次跑到哪、说了什么」压成一段文字简报，作为
+// 新一轮任务的前置说明——续跑是**接着干**，不是**假装没断过**。
+//
+// 返回空串表示该 task_id 没有可用的 sidechain（旧 journal / 未 tracked /
+// 一回合都没跑完）——调用方据此走普通派发，不注入任何东西。
+func (j *agentCoreJournal) subagentSidechainBriefing(sessionID, taskID string, maxChars int) string {
+	if j == nil || j.dir == "" || strings.TrimSpace(sessionID) == "" || strings.TrimSpace(taskID) == "" {
+		return ""
+	}
+	if maxChars <= 0 {
+		maxChars = agentCoreSubagentBriefingMaxChars
+	}
+	j.mu.Lock()
+	path := filepath.Join(j.dir, agentCoreJournalFileName(sessionID))
+	f, err := os.Open(path)
+	if err != nil {
+		j.mu.Unlock()
+		return ""
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), agentVibeJSONLMaxLineBytes)
+	type turnRow struct {
+		Turn int
+		Text string
+	}
+	turns := make([]turnRow, 0, 8)
+	name := ""
+	for sc.Scan() {
+		var row struct {
+			Kind   string `json:"kind"`
+			Event  string `json:"event"`
+			TaskID string `json:"task_id"`
+			Name   string `json:"name"`
+			Turn   int    `json:"turn"`
+			Text   string `json:"text"`
+		}
+		if json.Unmarshal(sc.Bytes(), &row) != nil {
+			continue
+		}
+		if strings.TrimSpace(row.TaskID) != taskID {
+			continue
+		}
+		switch {
+		case row.Kind == "subagent" && row.Event == "start" && name == "":
+			name = row.Name
+		case row.Kind == "subagent_turn":
+			if text := strings.TrimSpace(row.Text); text != "" {
+				turns = append(turns, turnRow{Turn: row.Turn, Text: text})
+			}
+		}
+	}
+	j.mu.Unlock()
+	if len(turns) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	if name != "" {
+		b.WriteString("上一次尝试的子 agent 类型: " + name + "\n")
+	}
+	fmt.Fprintf(&b, "上一次尝试已进行 %d 个回合，逐回合进展如下（原文摘录）:\n", len(turns))
+	used := 0
+	for _, t := range turns {
+		text := t.Text
+		// 单条先各自封顶 1500 rune，避免「第一轮说了 8000 字」把后面的回合全挤掉
+		// ——续跑最需要的是「最后一轮说到哪」。
+		if runes := []rune(text); len(runes) > 1500 {
+			text = string(runes[:1500]) + "…"
+		}
+		line := fmt.Sprintf("- 第 %d 回合: %s\n", t.Turn, text)
+		if used+len(line) > maxChars*4 { // 粗算：maxChars 是 rune，1 rune 最坏 4 字节
+			b.WriteString("- （更早的回合已省略）\n")
+			break
+		}
+		used += len(line)
+		b.WriteString(line)
+	}
+	return strings.TrimSpace(b.String())
+}
+
+// unfinishedSubagents 扫描会话 journal，返回 start 无 finish 的子 agent
+// （行序=时间序）。调用时机=runAgentCore 装配 system prompt——本 run 尚未
+// 派发，journal 内全部 start 行必属已死回合（同会话 run 串行）；本 run 后续
+// 派发的子 agent 不受影响（装配一次性求值）。半行/坏行跳过（与详情读侧同
+// 口径）。文件缺失/全终态返回 nil。
+func (j *agentCoreJournal) unfinishedSubagents(sessionID string) []agentCoreSubagentInterrupted {
+	if j == nil || j.dir == "" || strings.TrimSpace(sessionID) == "" {
+		return nil
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	path := filepath.Join(j.dir, agentCoreJournalFileName(sessionID))
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), agentVibeJSONLMaxLineBytes)
+	type scanEntry struct {
+		agentCoreSubagentInterrupted
+		finished bool
+	}
+	order := make([]string, 0, 2)
+	entries := make(map[string]*scanEntry)
+	for sc.Scan() {
+		var row struct {
+			Kind           string `json:"kind"`
+			Event          string `json:"event"`
+			TaskID         string `json:"task_id"`
+			Name           string `json:"name"`
+			Task           string `json:"task"`
+			Text           string `json:"text"`
+			Ts             string `json:"ts"`
+			SubagentTaskID string `json:"subagent_task_id"`
+			Tool           string `json:"tool"`
+		}
+		if json.Unmarshal(sc.Bytes(), &row) != nil {
+			continue
+		}
+		switch {
+		case row.Kind == "subagent" && row.Event == "start" && strings.TrimSpace(row.TaskID) != "":
+			if _, ok := entries[row.TaskID]; ok {
+				continue
+			}
+			entries[row.TaskID] = &scanEntry{agentCoreSubagentInterrupted: agentCoreSubagentInterrupted{
+				TaskID: row.TaskID, Name: row.Name, Task: row.Task, StartedAt: row.Ts,
+			}}
+			order = append(order, row.TaskID)
+		case row.Kind == "subagent" && row.Event == "finish":
+			if e, ok := entries[row.TaskID]; ok {
+				e.finished = true
+			}
+		case row.Kind == "tool" && strings.TrimSpace(row.SubagentTaskID) != "":
+			if e, ok := entries[row.SubagentTaskID]; ok && !e.finished {
+				e.ToolCalls++
+				e.LastTool = row.Tool
+			}
+		case row.Kind == "subagent_turn":
+			if e, ok := entries[row.TaskID]; ok && !e.finished {
+				if t := strings.TrimSpace(row.Text); t != "" {
+					e.LastText = t
+				}
+			}
+		}
+	}
+	out := make([]agentCoreSubagentInterrupted, 0, len(order))
+	for _, id := range order {
+		if e := entries[id]; !e.finished {
+			out = append(out, e.agentCoreSubagentInterrupted)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // appendSubagentTool 落子 agent 的工具轨迹行：与主会话工具行同 kind=tool，
@@ -606,6 +791,31 @@ func (j *agentCoreJournal) appendSubagentTool(sessionID, taskID, tool, summary s
 		"is_error":         isError,
 		"ts":               time.Now().UTC().Format(time.RFC3339),
 	})
+}
+
+// appendSubagentTurn 落 kind=subagent_turn 行：子 run 的每回合 assistant 输出
+// （L2 sidechain，2026-11-09）。此前子 run 的 LLM 往来只在内存——进程一死，
+// 跑了半小时的成果全丢，journal 只剩工具名列表。落盘后崩溃可查、L3 续跑
+// 有据可依。text/thinking 由调用方 rune 安全截断；tokens=本回合用量。
+func (j *agentCoreJournal) appendSubagentTurn(sessionID, taskID string, turn int, text, thinking string, tokens int) {
+	if j == nil || j.dir == "" || strings.TrimSpace(sessionID) == "" || strings.TrimSpace(taskID) == "" {
+		return
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	row := map[string]interface{}{
+		"kind":    "subagent_turn",
+		"task_id": taskID,
+		"turn":    turn,
+		"text":    text,
+		"tokens":  tokens,
+		"ts":      time.Now().UTC().Format(time.RFC3339),
+	}
+	// thinking 只在非空时写键（省字节；多数回合为空）。
+	if thinking = strings.TrimSpace(thinking); thinking != "" {
+		row["thinking"] = thinking
+	}
+	j.appendLineLocked(sessionID, row)
 }
 
 // appendSubagentFinish 落 kind=subagent/event=finish 行：status=completed|failed，

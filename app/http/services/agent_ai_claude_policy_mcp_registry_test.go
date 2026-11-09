@@ -122,3 +122,27 @@ func TestClaudeTierMCPArgsProjectWinsOverRegistry(t *testing.T) {
 		t.Fatalf("可信项目同名条目必须胜过注册表, got %v", servers["dup"])
 	}
 }
+
+func TestClaudeTierMCPArgsStripsAgentcoreToolFilters(t *testing.T) {
+	home := t.TempDir()
+	swapClaudeTierHome(t, home)
+	_ = upsertAliangMCPServerForTest(home, "srv", aliangMCPServerEntry{
+		Command: "echo", IncludeTools: []string{"a"}, ExcludeTools: []string{"b"},
+	})
+	policy := agentAIClaudeRemotePolicy{projectMCPTrusted: true}
+	flags, cleanup, err := claudeTierMCPArgs(policy, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	servers := claudeTierPayloadServerNames(t, flags, cleanup)
+	entry := servers["srv"]
+	if entry["command"] != "echo" {
+		t.Fatalf("基础字段必须保留: %v", entry)
+	}
+	if _, has := entry["include_tools"]; has {
+		t.Fatalf("include_tools 不得进 claude 载荷: %v", entry)
+	}
+	if _, has := entry["exclude_tools"]; has {
+		t.Fatalf("exclude_tools 不得进 claude 载荷: %v", entry)
+	}
+}

@@ -542,7 +542,7 @@ func TestAppendSubagentLines(t *testing.T) {
 	j := newAgentCoreJournal(t.TempDir())
 	sid := "sess-sub"
 	taskID := "agentcore-msg7-researcher-1" // 含回合 messageID 消歧(spec H1)
-	j.appendSubagentStart(sid, taskID, "researcher", "加密调研")
+	j.appendSubagentStart(sid, taskID, "researcher", "加密调研", "调研 XXX 的加密方案")
 	j.appendSubagentTool(sid, taskID, "Grep", "grep 摘要", false)
 	j.appendSubagentFinish(sid, taskID, "completed", "结论摘要",
 		"完整报告全文", 8123, 45230)
@@ -566,11 +566,93 @@ func TestAppendSubagentLines(t *testing.T) {
 	if start == nil || start["name"] != "researcher" || start["description"] != "加密调研" || start["task_id"] != taskID {
 		t.Fatalf("start 行缺失/字段错: %v", start)
 	}
+	if start["task"] != "调研 XXX 的加密方案" {
+		t.Fatalf("start 行 task 字段缺失/错: %v", start["task"])
+	}
 	if tool == nil || tool["tool"] != "Grep" || tool["is_error"] != false || tool["summary"] != "grep 摘要" {
 		t.Fatalf("tool 关联行缺失/字段错: %v", tool)
 	}
 	if finish == nil || finish["status"] != "completed" || finish["result"] != "完整报告全文" ||
 		finish["summary"] != "结论摘要" || finish["total_tokens"] != float64(8123) || finish["duration_ms"] != float64(45230) || finish["task_id"] != taskID {
 		t.Fatalf("finish 行缺失/字段错: %v", finish)
+	}
+}
+
+func TestJournalUnfinishedSubagents(t *testing.T) {
+	// 中断注入数据面（feat/subagent-interrupted-injection）：start 无 finish
+	// 的子 agent 返回对账摘要（工具计数+最后工具+task 文本）；有 finish 的
+	// 排除；行序=时间序。
+	j := newAgentCoreJournal(t.TempDir())
+	sid := "sess-unfinished"
+	j.appendSubagentStart(sid, "t-done", "researcher", "调研", "任务A")
+	j.appendSubagentFinish(sid, "t-done", "completed", "结论", "全文", 10, 5)
+	j.appendSubagentStart(sid, "t-dead", "reviewer", "评审", "任务B")
+	j.appendSubagentTool(sid, "t-dead", "Grep", "s1", false)
+	j.appendSubagentTool(sid, "t-dead", "Read", "s2", false)
+
+	got := j.unfinishedSubagents(sid)
+	if len(got) != 1 {
+		t.Fatalf("未终态数 = %d, want 1: %+v", len(got), got)
+	}
+	e := got[0]
+	if e.TaskID != "t-dead" || e.Name != "reviewer" || e.Task != "任务B" ||
+		e.ToolCalls != 2 || e.LastTool != "Read" {
+		t.Fatalf("对账摘要字段错: %+v", e)
+	}
+
+	// 无该会话文件 → 空。
+	if got := j.unfinishedSubagents("sess-none"); got != nil {
+		t.Fatalf("无会话应返回 nil: %+v", got)
+	}
+}
+
+func TestAppendSubagentTurnSidechain(t *testing.T) {
+	// L2 子 run sidechain（2026-11-09）：子 run 的 LLM 往来此前只在内存——
+	// 进程一死，跑了半小时的调研成果全丢（journal 只剩工具名列表）。落成
+	// kind=subagent_turn 行后崩溃可查、为 L3 续跑铺路。行内带 task_id 关联，
+	// text rune 安全截断。
+	j := newAgentCoreJournal(t.TempDir())
+	sid := "sess-sidechain"
+	taskID := "agentcore-m1-researcher-1"
+	j.appendSubagentTurn(sid, taskID, 1, "第一轮：我先看看目录", "", 100)
+	j.appendSubagentTurn(sid, taskID, 2, "第二轮：找到线索了", "思考链", 250)
+
+	lines := readJournalLines(t, j.dir, sid)
+	turns := make([]map[string]interface{}, 0, 2)
+	for _, m := range lines {
+		if m["kind"] == "subagent_turn" {
+			turns = append(turns, m)
+		}
+	}
+	if len(turns) != 2 {
+		t.Fatalf("subagent_turn 行数 = %d, want 2: %v", len(turns), lines)
+	}
+	if turns[0]["task_id"] != taskID || turns[0]["turn"] != float64(1) ||
+		turns[0]["text"] != "第一轮：我先看看目录" {
+		t.Fatalf("首轮字段错: %v", turns[0])
+	}
+	if turns[1]["thinking"] != "思考链" {
+		t.Fatalf("thinking 丢失: %v", turns[1])
+	}
+	if turns[1]["tokens"] != float64(250) {
+		t.Fatalf("tokens 丢失: %v", turns[1])
+	}
+}
+
+func TestUnfinishedSubagentsReportsLastText(t *testing.T) {
+	// 中断注入增强（L2 联动）：有 sidechain 时应带出子 agent 最后一轮说的话，
+	// 主 LLM 重派时能接上下文，而不是只知道「跑了 3 个工具」。
+	j := newAgentCoreJournal(t.TempDir())
+	sid := "sess-last"
+	j.appendSubagentStart(sid, "t1", "researcher", "调研", "查加密方案")
+	j.appendSubagentTurn(sid, "t1", 1, "先读配置文件", "", 50)
+	j.appendSubagentTurn(sid, "t1", 2, "结论草稿：AES-GCM 更合适", "", 80)
+
+	got := j.unfinishedSubagents(sid)
+	if len(got) != 1 {
+		t.Fatalf("未终态数 = %d", len(got))
+	}
+	if !strings.Contains(got[0].LastText, "AES-GCM 更合适") {
+		t.Fatalf("LastText 未带出最后一轮文本: %q", got[0].LastText)
 	}
 }

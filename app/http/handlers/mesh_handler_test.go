@@ -154,7 +154,7 @@ func TestMeshStatusHandlerAggregatesState(t *testing.T) {
 			return &config.Config{Customer: &config.CustomerConfig{Mesh: meshCfg}}
 		},
 		deviceID: func() string { return "dev-a" },
-		lanPort:  func() int { return 56441 },
+		lanPort:  func() int { return 56432 }, // 统一口承载(MeshLANPort 常量化,假缝同步)
 	}
 	req := httptest.NewRequest(http.MethodGet, "/api/mesh/status", nil)
 	rec := httptest.NewRecorder()
@@ -180,7 +180,7 @@ func TestMeshStatusHandlerAggregatesState(t *testing.T) {
 		t.Fatalf("信封 code = %d", resp.Code)
 	}
 	d := resp.Data
-	if d.DeviceID != "dev-a" || !d.Enable || !d.ForwardEnable || d.LANListenPort != 56441 {
+	if d.DeviceID != "dev-a" || !d.Enable || !d.ForwardEnable || d.LANListenPort != 56432 {
 		t.Fatalf("标量字段不符: %+v", d)
 	}
 	if len(d.Peers) != 1 || d.Peers[0].DeviceID != "dev-b" || len(d.Peers[0].LANAddrs) != 1 {

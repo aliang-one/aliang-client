@@ -1321,6 +1321,13 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 	}
 	m.attachCoreSteer(run.sessionID, run.runSeq, coreSteer)
 
+	// 子 agent 控制表（L3，2026-11-09）：per-task 停止 + 追加指令。本回合所有
+	// 在跑子 agent 登记于此，外部端点按 session_id+task_id 下发控制；回合收尾
+	// 由 clearRunning 摘除（与外层 coreSteer 同生命周期）。nil-safe：以下所有
+	// 使用点都容忍 nil。
+	subagentControl := newAgentCoreSubagentControl()
+	m.attachCoreSubagentControl(run.sessionID, run.runSeq, subagentControl)
+
 	// MCP 工具注入（spec §3）：采集→建连→包桥→注册。全部失败也只是空桥，
 	// run 照常（纯内置 8 工具）。内核 Registry 后注册者胜，桥与内置工具
 	// 名空间不重叠（mcp__ 前缀），互不遮蔽。建连是逐 server 串行同步 dial、
@@ -1436,9 +1443,15 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 	// 否则自我报告错位且不主动派发（vm459 实测 2026-11-08）。
 	subagentPrompt := ""
 	if !run.readOnly {
-		if router := m.agentCoreSubagentTaskTool(run, kernelClient, kernelEnv, kernelApprove, kernelLogf, mcpTools, subagentMirror); router != nil {
+		if router := m.agentCoreSubagentTaskTool(run, kernelClient, kernelEnv, kernelApprove, kernelLogf, mcpTools, subagentMirror, subagentControl); router != nil {
 			registry.Register(router)
 			subagentPrompt = agentCoreSubagentMechanismSuffix(router)
+		}
+		// 中断注入（L1，feat/subagent-interrupted-injection）：上一回合未终态
+		// 子 agent 对账进 system prompt——主 LLM 感知中断并可智能重派。装配期
+		// 一次求值，本 run 后续派发不受影响；journal=nil 容忍既有测试路径。
+		if journal != nil {
+			subagentPrompt += agentCoreSubagentInterruptedSuffix(journal.unfinishedSubagents(run.sessionID))
 		}
 		// 设备互访工具注入（spec 2026-10-29 §7.2 阶段 1 四件）：与 MCP/子 agent
 		// 桥同款宿主注入。桥内共享注册表 handler 实现（POST 编排），自带
@@ -2144,6 +2157,114 @@ func (m *agentAIManager) attachCoreSteer(sessionID string, runSeq int, control *
 	defer m.mu.Unlock()
 	if session := m.sessions[sessionID]; session != nil && session.runSeq == runSeq {
 		session.coreSteer = control
+	}
+}
+
+// attachCoreSubagentControl 把子 agent 控制表挂到会话上（L3）。与 attachCoreSteer
+// 同口径：只在 runSeq 仍匹配时挂载——迟到的 run 不得覆盖当前回合的控制面
+// （覆盖等于把外部控制接到已死的 goroutine 表上，子 agent 看着在跑却停不掉）。
+func (m *agentAIManager) attachCoreSubagentControl(sessionID string, runSeq int, control *agentCoreSubagentControl) {
+	if control == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if session := m.sessions[sessionID]; session != nil && session.runSeq == runSeq {
+		session.subagentControl = control
+	}
+}
+
+// coreSubagentControlFor 取当前回合的子 agent 控制表。sessionID+runSeq 双校验：
+// 控制面绑回合，不是绑会话——会话上可能已经换了下一轮（子 agent 早已收工）。
+// 返回 nil 表示「没有在跑的 agentcore 回合」，调用方按 not_running 回。
+func (m *agentAIManager) coreSubagentControlFor(sessionID string, runSeq int) *agentCoreSubagentControl {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	session := m.sessions[sessionID]
+	if session == nil || session.subagentControl == nil {
+		return nil
+	}
+	if runSeq > 0 && session.runSeq != runSeq {
+		return nil
+	}
+	return session.subagentControl
+}
+
+// subagentControl 是子 agent 控制入口（L3）：per-task 停止 / 追加指令 /
+// 在跑清单。
+//
+// 语义边界（必须先说清，否则调用方会误判）：
+//   - 它**只**管 agentcore 内核派发的子 agent。claude/codex 的子 agent 由各自
+//     CLI 托管，本进程拿不到句柄——那里返回 unsupported，不假装成功。
+//   - 停止是「让这个子 run 走 interrupted 收尾」，不是杀进程：子 run 与主 run
+//     同进程，内核在回合边界轮询 ctx，停止最多等到当前这个 LLM 调用/工具执行
+//     协作式结束。
+//   - 追加指令是排队语义：真正进入上下文发生在子 run 下一次 LLM 调用前。若
+//     子 run 在那之前就收工了，指令不会生效（与主 run 的 steer 同款诚实口径）。
+func (m *agentAIManager) subagentControl(msg map[string]interface{}, writeJSON agentTerminalWriter) {
+	if writeJSON == nil {
+		return
+	}
+	reply := func(payload map[string]interface{}) {
+		payload["type"] = models.AgentEventAISubagentControlAck
+		payload["acked_at"] = time.Now().UTC().Format(time.RFC3339Nano)
+		_ = writeJSON(payload)
+	}
+	sessionID := strings.TrimSpace(remoteString(msg, "session_id"))
+	if sessionID == "" {
+		reply(map[string]interface{}{"result": "error", "error": "ai.subagent.control missing session_id", "code": "bad_request"})
+		return
+	}
+	action := strings.ToLower(strings.TrimSpace(remoteString(msg, "action")))
+	taskID := strings.TrimSpace(remoteString(msg, "task_id"))
+	runSeq := 0
+	if raw, ok := msg["run_seq"].(float64); ok {
+		runSeq = int(raw)
+	}
+	runID := strings.TrimSpace(remoteString(msg, "run_id"))
+	// run_id 与 run_seq 二选一即可（服务端两种口径都下发过）；都给时以 run_id
+	// 为准做一次额外核对，防止把控制下到别的回合上。
+	if runID != "" {
+		m.mu.Lock()
+		session := m.sessions[sessionID]
+		if session != nil && session.activeRunID != "" && session.activeRunID != runID {
+			activeRunID := session.activeRunID
+			m.mu.Unlock()
+			logger.Info(fmt.Sprintf("ai.subagent.control: ignored stale run session=%s requested=%s active=%s", sessionID, runID, activeRunID))
+			reply(map[string]interface{}{"result": "not_running", "task_id": taskID, "error": "run already finished", "code": "stale_run"})
+			return
+		}
+		m.mu.Unlock()
+	}
+	control := m.coreSubagentControlFor(sessionID, runSeq)
+	if control == nil {
+		reply(map[string]interface{}{"result": "not_running", "task_id": taskID, "error": "no agentcore turn is running for this session", "code": "turn_ended"})
+		return
+	}
+	switch action {
+	case "list":
+		reply(map[string]interface{}{"result": "ok", "subagents": control.active()})
+	case "stop":
+		if n := control.stop(taskID); n == 0 {
+			reply(map[string]interface{}{"result": "not_found", "task_id": taskID, "error": "no such live subagent (already finished?)", "code": "task_not_found"})
+			return
+		}
+		reply(map[string]interface{}{"result": "stopping", "task_id": taskID})
+	case "steer", "message":
+		content := remoteString(msg, "content")
+		if strings.TrimSpace(content) == "" {
+			reply(map[string]interface{}{"result": "error", "task_id": taskID, "error": "content is empty", "code": "bad_request"})
+			return
+		}
+		if !control.steerTo(taskID, content) {
+			reply(map[string]interface{}{"result": "not_found", "task_id": taskID, "error": "no such live subagent, or it already finished before the message could be queued", "code": "task_not_found"})
+			return
+		}
+		reply(map[string]interface{}{"result": "queued", "task_id": taskID})
+	case "":
+		reply(map[string]interface{}{"result": "error", "error": "action is required (list|stop|steer)", "code": "bad_request"})
+	default:
+		reply(map[string]interface{}{"result": "unsupported", "error": fmt.Sprintf("unknown action %q", action), "code": "unsupported_action"})
 	}
 }
 

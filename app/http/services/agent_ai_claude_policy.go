@@ -221,6 +221,18 @@ func claudeTierMCPArgs(policy agentAIClaudeRemotePolicy, projectPath string) ([]
 		// 双零贡献:走 claude 原生 user 域发现(原两条快速路径的并集)。
 		return nil, func() {}, nil
 	}
+	// claude 载荷剥离(spec §5.1 条目6):include/exclude 是 agentcore 消费侧
+	// 专属语义,claude CLI 载荷不携带。剥在合并产物上;硬约束:不得剔在
+	// readAliangMCPRegistryInto 本体——agentcore 消费侧走同一合并函数,
+	// 剔了整个特性失效。
+	for _, v := range merged {
+		entry, ok := v.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		delete(entry, "include_tools")
+		delete(entry, "exclude_tools")
+	}
 	payload, err := json.Marshal(map[string]interface{}{"mcpServers": merged})
 	if err != nil {
 		return nil, func() {}, err

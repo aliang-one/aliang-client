@@ -223,7 +223,9 @@ describe('SshIngressSettings 卡片', () => {
     expect(el.querySelector('[data-ssh-hostkey]').textContent).toContain('ssh-ed25519');
     expect(el.querySelector('[data-ssh-hostkey]').textContent).toContain('2026-11-08T01:02:03Z');
     expect(el.querySelector('[data-field="sshIngressEnable"]').checked).toBe(false);
-    expect(el.querySelector('[data-field="sshIngressPort"]').value).toBe('');
+    // 端口只读展示(统一口 56432 承载,无输入框)
+    expect(el.querySelector('[data-field="sshIngressPortUnified"]')).toBeTruthy();
+    expect(el.querySelector('input[data-field="sshIngressPort"]')).toBeNull();
   });
 
   it('复制按钮写入剪贴板并切换反馈文案', async () => {
@@ -329,23 +331,11 @@ describe('SshIngressSettings 卡片', () => {
     expect(meshOnly.saved[0].ssh_ingress.authorized_keys).toEqual([]);
   });
 
-  it('端口非法值拦截保存（1-65535 之外）', async () => {
-    const { el, saved } = mountCard(baseConfig({ enable: true, authorized_keys: [HUMAN_KEY] }));
-    await flush();
-    setField(el, 'sshIngressPort', '70000');
-    await flush();
-    expect(el.textContent).toContain('sshIngress_portInvalid');
-    expect(saveButton(el).disabled).toBe(true);
-    clickSave(el);
-    await flush();
-    expect(saved).toHaveLength(0);
-  });
-
-  it('提交载荷：整配置透传 + ssh_ingress 四字段；端口空发 0（后端归一 56442）', async () => {
-    const { el, saved } = mountCard(baseConfig());
+  it('提交载荷：整配置透传 + ssh_ingress 四字段；端口原样透传（卡片无编辑入口）', async () => {
+    // 配置里 port=56442 → 载荷原样带出(运行面已忽略,透传不产生伪 diff)
+    const { el, saved } = mountCard(baseConfig({ port: 56442 }));
     await flush();
     setToggle(el, 'sshIngressEnable', true);
-    setField(el, 'sshIngressPort', '56442');
     setField(el, 'sshIngressKeyDraft', HUMAN_KEY);
     el.querySelector('[data-ssh-key-add]').click();
     await flush();
@@ -361,12 +351,16 @@ describe('SshIngressSettings 卡片', () => {
       mesh_authorized_keys: []
     });
 
-    // 端口清空 → 0
-    setField(el, 'sshIngressPort', '');
+    // 配置里 port=0(未设)→ 载荷照实带 0(后端归一默认)
+    const unset = mountCard(baseConfig());
     await flush();
-    clickSave(el);
+    setToggle(unset.el, 'sshIngressEnable', true);
+    setField(unset.el, 'sshIngressKeyDraft', HUMAN_KEY);
+    unset.el.querySelector('[data-ssh-key-add]').click();
     await flush();
-    expect(saved[1].ssh_ingress.port).toBe(0);
+    clickSave(unset.el);
+    await flush();
+    expect(unset.saved[0].ssh_ingress.port).toBe(0);
   });
 
   it('置零：关闭开关载荷 enable:false 且其余字段照发（enable=false 时后端跳过钥匙校验）', async () => {
@@ -378,14 +372,14 @@ describe('SshIngressSettings 卡片', () => {
     }));
     await flush();
     setToggle(el, 'sshIngressEnable', false);
-    setField(el, 'sshIngressPort', '');
     await flush();
     clickSave(el);
     await flush();
     expect(saved).toHaveLength(1);
     expect(saved[0].ssh_ingress).toEqual({
       enable: false,
-      port: 0,
+      // 端口透传(卡片无编辑入口):56442 原样保留
+      port: 56442,
       authorized_keys: [HUMAN_KEY],
       mesh_authorized_keys: [MESH_KEY]
     });
@@ -400,7 +394,6 @@ describe('SshIngressSettings 卡片', () => {
     }));
     await flush();
     expect(el.querySelector('[data-field="sshIngressEnable"]').checked).toBe(true);
-    expect(el.querySelector('[data-field="sshIngressPort"]').value).toBe('56442');
     const humanRows = el.querySelectorAll('[data-ssh-key-row]');
     expect(humanRows).toHaveLength(1);
     expect(humanRows[0].textContent).toContain(HUMAN_KEY);
@@ -420,8 +413,8 @@ describe('SshIngressSettings 卡片', () => {
       'sshIngress_description',
       'sshIngress_enable',
       'sshIngress_port',
-      'sshIngress_portPlaceholder',
-      'sshIngress_portInvalid',
+      'sshIngress_portUnified',
+      'sshIngress_portUnifiedHint',
       'sshIngress_hostkeyTitle',
       'sshIngress_hostkeyDesc',
       'sshIngress_hostkeyNotStarted',

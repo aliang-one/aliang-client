@@ -13,12 +13,10 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"strconv"
 	"sync"
 	"time"
 
 	"aliang.one/nursorgate/common/logger"
-	"aliang.one/nursorgate/processor/config"
 
 	gossh "golang.org/x/crypto/ssh"
 )
@@ -38,20 +36,23 @@ var handshakeTimeout = 15 * time.Second
 // sshout.KnownHostsFileName 的收敛先例。文件内容归本包管理。
 const IngressHostKeyFileName = "ingress_host_key"
 
-// Server 是 SSH 入口服务实例。生命周期三件套(Start/Stop/IsRunning)幂等,
-// 照 inbound/http 模式;实例不承载热更新——配置变更由装配层(Reconcile,
-// Task 7)重建实例。
+// Server 是 SSH 入口服务实例。生命周期三件套(Start/Stop/IsRunning)幂等;
+// 实例不承载热更新——配置变更由装配层(Reconcile)重建实例。
+//
+// 监听归属(统一口收编,spec §6.4):本实例不再 net.Listen——56432 统一
+// 入口 accept 后嗅探为 SSH 的连接经 HandleIngressConn/ServeConn 注入本实例。
+// Start 因此只剩「host key 就绪 + 运行态置位」两件事。
 type Server struct {
 	rc          RunConfig
 	hostKeyPath string
 	limiter     *authLimiter
 
-	mu       sync.Mutex
-	running  bool
-	listener net.Listener
-	conns    map[net.Conn]struct{}
-	cancel   context.CancelFunc
-	wg       sync.WaitGroup // accept 循环+每连接 goroutine
+	mu      sync.Mutex
+	running bool
+	conns   map[net.Conn]struct{}
+	rootCtx context.Context // Start 建立的根取消链:注入连接的停机兜底
+	cancel  context.CancelFunc
+	wg      sync.WaitGroup // 每连接 goroutine(注入路径 ServeConn 记账)
 
 	hostKeyMu sync.Mutex
 	hostKey   gossh.Signer
@@ -74,7 +75,9 @@ func NewServer(rc RunConfig, hostKeyPath string) *Server {
 	}
 }
 
-// Start 启动监听(幂等:已运行直接返回 nil)。
+// Start 进入运行态(幂等:已运行直接返回 nil)。不再监听——56432 统一
+// 入口承载监听(spec §6.4),本函数只剩「host key 就绪 + 运行态置位」;
+// 连接进入走 HandleIngressConn/ServeConn 注入缝。
 func (s *Server) Start() error {
 	s.mu.Lock()
 	if s.running {
@@ -83,31 +86,27 @@ func (s *Server) Start() error {
 	}
 	// host key 就绪(缺失/损坏则生成+原子落盘)在持生命周期锁下完成:
 	// 防止并发的 Start/Stop 观察到半初始化状态(冷路径,开销可忽略)。
-	signer, err := s.ensureHostKey()
-	if err != nil {
+	if _, err := s.ensureHostKey(); err != nil {
 		s.mu.Unlock()
 		return fmt.Errorf("ssh ingress host key: %w", err)
 	}
-	addr := net.JoinHostPort(config.ServiceBindHost(), strconv.Itoa(int(s.rc.Port)))
-	l, err := net.Listen("tcp", addr)
-	if err != nil {
-		s.mu.Unlock()
-		return fmt.Errorf("ssh ingress listen %s: %w", addr, err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
 	s.running = true
-	s.listener = l
+	// 根取消链保留(Stop 时 cancel):注入连接的拆除主路径是连接快照关闭,
+	// 根 ctx 是 Stop 语义的完整性兜底——handleConn 的 per-conn ctx 监视挂它,
+	// 快照后滑入/交错的注入连接由它兜底关闭(评审 B1:旧监听路径 acceptLoop
+	// 传 Start 作用域 ctx 的同款兜底,注入缝不可丢)。
+	ctx, cancel := context.WithCancel(context.Background())
+	s.rootCtx = ctx
 	s.cancel = cancel
-	s.wg.Add(1)
 	s.mu.Unlock()
 
-	logger.Info(fmt.Sprintf("SSH ingress server starting on %s", l.Addr().String()))
-	go s.acceptLoop(ctx, l, s.serverConfig(signer))
+	logger.Info("SSH ingress server running (listening is owned by the unified ingress 56432)")
 	return nil
 }
 
-// Stop 停止服务(幂等):关监听、断开在途连接并等待 accept/handle
-// 协程退出(drain/global-request 协程随连接拆除退出,不在此 WaitGroup)。
+// Stop 退出运行态(幂等):断开在途连接并等待 handle 协程退出(drain/
+// global-request 协程随连接拆除退出,不在此 WaitGroup)。无监听可关——
+// 连接是统一口注入的,拆连接快照即可。
 func (s *Server) Stop() error {
 	s.mu.Lock()
 	if !s.running {
@@ -117,8 +116,6 @@ func (s *Server) Stop() error {
 	s.running = false
 	cancel := s.cancel
 	s.cancel = nil
-	l := s.listener
-	s.listener = nil
 	pending := make([]net.Conn, 0, len(s.conns))
 	for c := range s.conns {
 		pending = append(pending, c)
@@ -128,11 +125,8 @@ func (s *Server) Stop() error {
 	if cancel != nil {
 		cancel()
 	}
-	if l != nil {
-		_ = l.Close()
-	}
 	// 快照内的在途连接全部断开,让握手/通道 goroutine 解除阻塞退出;
-	// 快照后滑入的连接由 handleConn 的 ctx 监视兜底关闭。
+	// 快照后滑入/交错的连接由根 ctx 兜底关闭(见 Start 注释)。
 	for _, c := range pending {
 		_ = c.Close()
 	}
@@ -146,17 +140,6 @@ func (s *Server) IsRunning() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.running
-}
-
-// Addr 返回监听地址(host:port);未运行返回空串。RunConfig.Port=0 时
-// 供测试/装配层取实际随机端口。
-func (s *Server) Addr() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.listener == nil {
-		return ""
-	}
-	return s.listener.Addr().String()
 }
 
 // HostKeyFingerprint 返回 host key 的 SHA256 指纹(gossh.FingerprintSHA256,
@@ -254,26 +237,57 @@ func keyInList(key gossh.PublicKey, list []gossh.PublicKey) bool {
 	return false
 }
 
-// acceptLoop 接受连接并派发;监听关闭(Stop)后退出。
-func (s *Server) acceptLoop(ctx context.Context, l net.Listener, cfg *gossh.ServerConfig) {
-	defer s.wg.Done()
-	for {
-		conn, err := l.Accept()
-		if err != nil {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-				logger.Debug(fmt.Sprintf("SSH ingress accept error: %v", err))
-				continue
-			}
-		}
-		s.mu.Lock()
-		s.conns[conn] = struct{}{}
-		s.mu.Unlock()
-		s.wg.Add(1)
-		go s.handleConn(ctx, conn, cfg)
+// ServeConn 承载一条外部注入的已 accept 连接(统一口分派缝,spec §6.4):
+// 限速检查/握手 deadline/双形态通道收敛与 listener 路径完全同语义,差别只在
+// 「谁 accept」。阻塞至连接结束;Stop 的连接快照拆除与 wg 排水同样覆盖注入
+// 连接(注入前 wg.Add(1),与 acceptLoop 同款记账)。
+//
+// 入口未在运行态时直接关连接返回——与合并前「入口未启动则无人监听、连接被
+// 拒」语义等价;不回显任何协议字节。
+// ServeConn 承载一条外部注入的已 accept 连接(统一口分派缝,spec §6.4)。
+// 阻塞至连接结束;关闭归本函数与 handleConn(双关幂等)。
+//
+// 停机交错纪律(评审 B1):running 检查、conns 登记、wg.Add 必须在同一
+// s.mu 临界区内完成——与 Stop 的「running 翻转→快照」互斥后,注入连接
+// 要么整段落在快照前(被快照拆除+wg.Wait 排水),要么整段落在翻转后
+// (running=false,关连接返回,零记账)。分三段临界区会产生「登记晚于
+// 快照但 wg.Add 早于 Wait」的交错:Stop 的 wg.Wait 挂死在一条无人拆除、
+// ctx 又是 Background 的长活隧道上,连带 reconcileMu 永久持锁。
+//
+// ctx 取自 Start 的根取消链(不收外部 ctx):handleConn 的 per-conn 监视
+// 挂根 ctx,Stop 的 cancel() 对快照外交错连接兜底关闭——与旧监听路径
+// acceptLoop 传 Start 作用域 ctx 的兜底同源。
+func (s *Server) ServeConn(conn net.Conn) {
+	if conn == nil {
+		return
 	}
+	s.mu.Lock()
+	if !s.running {
+		s.mu.Unlock()
+		_ = conn.Close()
+		return
+	}
+	ctx := s.rootCtx
+	// 与旧 acceptLoop 相同的记账顺序:登记连接 + wg.Add 一气呵成(见上
+	// 交错纪律),wg 计数交给 handleConn(其首行 wg.Done)。
+	s.conns[conn] = struct{}{}
+	s.wg.Add(1)
+	s.mu.Unlock()
+
+	// host key 缺失/损坏时此处会生成并落盘——与 Start 同源同锁(ensureHostKey
+	// 内部 hostKeyMu),不会出现双钥并存。失败即拆除:已登记的连接由
+	// handleConn 的 defer 关闭/除名。
+	signer, err := s.ensureHostKey()
+	if err != nil {
+		logger.Error(fmt.Sprintf("SSH ingress serve injected conn: host key: %v", err))
+		s.wg.Add(-1)
+		_ = conn.Close()
+		s.mu.Lock()
+		delete(s.conns, conn)
+		s.mu.Unlock()
+		return
+	}
+	s.handleConn(ctx, conn, s.serverConfig(signer))
 }
 
 // handleConn 承载一条 TCP 连接:限速检查→SSH 握手→全局请求应答→通道收敛循环。

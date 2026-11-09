@@ -506,3 +506,80 @@ func TestAIProxyPortSyncAnchor(t *testing.T) {
 			aiProxyPort, config.DefaultHTTPProxyPort)
 	}
 }
+
+// ===== 统一口双端口候选(spec §6.7) =====
+
+// TestLANDialCandidatesExpansion 手填地址双端口候选展开:旧口原样优先,
+// 追加统一口候选;已是统一口或畸形地址(无端口)不展开。
+func TestLANDialCandidatesExpansion(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want []string
+	}{
+		{"手填旧口追加统一口", "1.2.3.4:56441", []string{"1.2.3.4:56441", "1.2.3.4:56432"}},
+		{"已是统一口不展开", "1.2.3.4:56432", []string{"1.2.3.4:56432"}},
+		{"畸形无端口原样", "myhost", []string{"myhost"}},
+		{"IPv6 旧口展开", "[::1]:56441", []string{"[::1]:56441", "[::1]:56432"}},
+		{"任意自定义端口也展开", "10.0.0.9:9999", []string{"10.0.0.9:9999", "10.0.0.9:56432"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := lanDialCandidates(tc.in)
+			if len(got) != len(tc.want) {
+				t.Fatalf("lanDialCandidates(%q) = %v, want %v", tc.in, got, tc.want)
+			}
+			for i := range tc.want {
+				if got[i] != tc.want[i] {
+					t.Fatalf("lanDialCandidates(%q)[%d] = %q, want %q", tc.in, i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+// TestDialContextLANCandidateFallback 钉拨号循环的候选展开语义:首个候选
+// (手填旧口)失败后,追加的统一口候选接续尝试并成功。
+func TestDialContextLANCandidateFallback(t *testing.T) {
+	fp := startFakePeer(t)
+	orig := dialLANFn
+	t.Cleanup(func() { dialLANFn = orig })
+
+	var tried []string
+	dialLANFn = func(_ context.Context, addr string) (net.Conn, error) {
+		tried = append(tried, addr)
+		if strings.HasSuffix(addr, ":56441") {
+			return nil, fmt.Errorf("simulated old-port refused")
+		}
+		c, err := net.Dial("tcp", fp.ln.Addr().String())
+		if err != nil {
+			return nil, err
+		}
+		return c, nil
+	}
+
+	peer := NewPeer(PeerTarget{
+		DeviceID: "dev-b",
+		LANAddrs: []string{"127.0.0.1:56441"},
+		SelfID:   "dev-a",
+	})
+	conn, err := peer.DialContext(context.Background(), &M.Metadata{HostName: "example.com", DstPort: 443})
+	if err != nil {
+		t.Fatalf("DialContext: %v", err)
+	}
+	defer conn.Close()
+
+	want := []string{"127.0.0.1:56441", "127.0.0.1:56432"}
+	if len(tried) != len(want) {
+		t.Fatalf("tried = %v, want %v", tried, want)
+	}
+	for i := range want {
+		if tried[i] != want[i] {
+			t.Fatalf("tried[%d] = %q, want %q", i, tried[i], want[i])
+		}
+	}
+	hdr := waitHeader(t, fp)
+	if hdr == nil {
+		t.Fatal("header must reach the peer via the appended candidate")
+	}
+}

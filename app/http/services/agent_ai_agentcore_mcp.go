@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -30,6 +31,12 @@ const (
 	agentCoreMCPToolCap     = 128
 	agentCoreMCPInitTimeout = 10 * time.Second
 	agentCoreMCPDescCap     = 500
+	// agentCoreMCPToolListCap 单 server 工具名单上限(写通道 fail-closed)。
+	agentCoreMCPToolListCap = 64
+	// agentCoreMCPReconnectDeadCap 连续重连失败判死上限，spec §4.3/§6：
+	// 连续这么多次「重连后仍失败」就不在本 run 内继续拨号，避免一个死 server
+	// 把每轮工具调用的墙钟都拖进重连超时。
+	agentCoreMCPReconnectDeadCap = 3
 	// 建连超时后等待迟到 dial 返回的宽限窗：返回的会话就地关闭（收尸），
 	// 防止孤儿 stdio 进程/连接泄漏。
 	agentCoreMCPDialDrainGrace = 2 * time.Second
@@ -43,6 +50,22 @@ const (
 	agentCoreMCPDialConcurrency = 8
 )
 
+// normalizeAgentCoreMCPToolList 工具名单归一:trim/去空串/dedup(保首现顺序)。
+// 写通道落盘前与读通道过滤前共用(读侧兜住手改文件,沿 type 归一先例)。
+func normalizeAgentCoreMCPToolList(list []string) []string {
+	seen := make(map[string]bool, len(list))
+	out := make([]string, 0, len(list))
+	for _, v := range list {
+		v = strings.TrimSpace(v)
+		if v == "" || seen[v] {
+			continue
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	return out
+}
+
 // agentCoreMCPRawServer 是一条未脱敏的 server 配置（连接用）。
 type agentCoreMCPRawServer struct {
 	Name    string            // 配置原始键（user 域为 server 名；插件域为 plugin:<p>:<s>）
@@ -52,6 +75,10 @@ type agentCoreMCPRawServer struct {
 	Type    string            `json:"type"` // ""|stdio / http / sse
 	URL     string            `json:"url"`
 	Headers map[string]string `json:"headers"`
+	// IncludeTools/ExcludeTools 消费侧过滤名单;注册表源携带,其余源零值
+	// (Task 3 生效,本层只解析透传)。
+	IncludeTools []string `json:"include_tools"`
+	ExcludeTools []string `json:"exclude_tools"`
 }
 
 type agentCoreMCPRawEntry struct {
@@ -62,6 +89,9 @@ type agentCoreMCPRawEntry struct {
 	URL      string            `json:"url"`
 	Headers  map[string]string `json:"headers"`
 	Disabled bool              `json:"disabled"`
+	// 消费侧过滤名单;本层只解析透传,过滤在 agentCoreMCPServerToolDefs 生效(Task 3)
+	IncludeTools []string `json:"include_tools"`
+	ExcludeTools []string `json:"exclude_tools"`
 }
 
 // sanitizeAgentCoreMCPSegment 工具名段白名单化。Anthropic API 工具名必须
@@ -139,14 +169,103 @@ func agentCoreMCPRawServersIn(home string) []agentCoreMCPRawServer {
 		out = append(out, agentCoreMCPRawServer{
 			Name: key, Command: entry.Command, Args: entry.Args, Env: entry.Env,
 			Type: entry.Type, URL: entry.URL, Headers: entry.Headers,
+			IncludeTools: entry.IncludeTools, ExcludeTools: entry.ExcludeTools,
 		})
 	}
 	return out
 }
 
+// agentCoreMCPSessionHolder 同 server 全部桥共享的会话持有者(spec §4.1)。
+// 锁内换会话,closeAll 永远关到当前会话——重连换新后零泄漏。内核每 run 串行
+// 执行工具,锁是纵深防御不承担正确性主责。dial 与测试注入同源(coreMCPDialForTest)。
+type agentCoreMCPSessionHolder struct {
+	mu         sync.Mutex
+	session    *mcp.ClientSession
+	closeFn    func() // 关当前会话(内含子 ctx cancel)
+	raw        agentCoreMCPRawServer
+	dial       func(context.Context, agentCoreMCPRawServer) (*mcp.ClientSession, func(), error)
+	consecFail int  // 连续「重连后仍失败」计数(spec §4.3)
+	dead       bool // run 内判死:后续调用快速失败不再拨号
+}
+
+func newAgentCoreMCPSessionHolder(session *mcp.ClientSession, closeFn func(), raw agentCoreMCPRawServer, dial func(context.Context, agentCoreMCPRawServer) (*mcp.ClientSession, func(), error)) *agentCoreMCPSessionHolder {
+	return &agentCoreMCPSessionHolder{session: session, closeFn: closeFn, raw: raw, dial: dial}
+}
+
+// Close 锁内关当前会话。closeAll 语义锚点:closeFn 一律经此处走,换会话后
+// 关到的是新会话。
+func (h *agentCoreMCPSessionHolder) Close() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closeFn != nil {
+		h.closeFn()
+	}
+	h.session = nil
+	h.closeFn = nil
+	h.dead = true // 防关闭后再触发重连(泄漏面)
+}
+
+// agentCoreMCPCallError 携带面向模型的最终文案。Execute 原样采用，不再二次
+// 包装——判死文案与「已自动重连」文案都由 holder 定型，避免出现
+// 「MCP 调用失败: MCP 调用失败(已自动重连): ...」双层前缀。
+type agentCoreMCPCallError struct{ text string }
+
+func (e *agentCoreMCPCallError) Error() string { return e.text }
+
+// call 锁内 CallTool；transport 层失败（err != nil）触发重连：关旧会话 →
+// 重拨（子 ctx 带 cancel，deadline 由 DialWithTimeout 外部施加）→ 换新 →
+// 单次重试。IsError=true 的结果是工具逻辑报错（协议链路健康），不重连。
+// 判死：连续 agentCoreMCPReconnectDeadCap 次「重连后仍失败」→ dead，后续
+// 调用快速失败。重拨失败路径 holder.session 保持为已关闭旧会话、不置 nil
+// ——判死路径与拨号计数断言依赖此语义（spec §4.3c）。
+//
+// 判死检查先行——Close 后 dead=true，nil session 不会被解引用。
+func (h *agentCoreMCPSessionHolder) call(ctx context.Context, tool string, args map[string]interface{}) (*mcp.CallToolResult, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.dead {
+		return nil, &agentCoreMCPCallError{text: fmt.Sprintf("MCP server 已在本次运行内判死(连续 %d 次重连失败),本 run 内请勿继续调用该 server 工具", agentCoreMCPReconnectDeadCap)}
+	}
+	res, err := h.session.CallTool(ctx, &mcp.CallToolParams{Name: tool, Arguments: args})
+	if err == nil {
+		h.consecFail = 0
+		return res, nil
+	}
+	if h.closeFn != nil {
+		h.closeFn()
+	}
+	dctx, dcancel := context.WithCancel(ctx)
+	session, closeFn, derr := agentCoreMCPDialWithTimeout(h.dial, dctx, h.raw, agentCoreMCPInitTimeout)
+	if derr != nil {
+		dcancel()
+		h.noteReconnectFailure(derr)
+		return nil, &agentCoreMCPCallError{text: "MCP 调用失败(已自动重连): " + err.Error()}
+	}
+	h.session = session
+	h.closeFn = func() { closeFn(); dcancel() }
+	logger.Info(fmt.Sprintf("agentcore-mcp: server=%s 重连成功", sanitizeAgentCoreMCPSegment(h.raw.Name)))
+	res2, err2 := session.CallTool(ctx, &mcp.CallToolParams{Name: tool, Arguments: args})
+	if err2 != nil {
+		h.noteReconnectFailure(err2)
+		return nil, &agentCoreMCPCallError{text: "MCP 调用失败(已自动重连): " + err2.Error()}
+	}
+	h.consecFail = 0
+	return res2, nil
+}
+
+// noteReconnectFailure 记账：连续失败达判死阈值则标记，本 run 不再拨号。
+func (h *agentCoreMCPSessionHolder) noteReconnectFailure(err error) {
+	h.consecFail++
+	logger.Warn(fmt.Sprintf("agentcore-mcp: server=%s 重连失败(第 %d 次): %v", sanitizeAgentCoreMCPSegment(h.raw.Name), h.consecFail, err))
+	if h.consecFail >= agentCoreMCPReconnectDeadCap {
+		h.dead = true
+		logger.Warn(fmt.Sprintf("agentcore-mcp: server=%s 已判死,本 run 内不再重连", sanitizeAgentCoreMCPSegment(h.raw.Name)))
+	}
+}
+
 // agentCoreMCPBridge 把一个 MCP 工具包成内核 agentcore.Tool。
 type agentCoreMCPBridge struct {
-	session     *mcp.ClientSession
+	holder      *agentCoreMCPSessionHolder
 	rawTool     string // server 侧原始工具名
 	name        string // mcp__<server>__<tool>，段已白名单清洗
 	description string
@@ -170,11 +289,11 @@ func (b *agentCoreMCPBridge) Execute(ctx context.Context, input map[string]inter
 			b.safeOnCall(summary, true)
 		}
 	}()
-	res, err := b.session.CallTool(ctx, &mcp.CallToolParams{Name: b.rawTool, Arguments: input})
+	res, err := b.holder.call(ctx, b.rawTool, input)
 	var text string
 	isErr := false
 	if err != nil {
-		isErr, text = true, "MCP 调用失败: "+err.Error()
+		isErr, text = true, err.Error() // agentCoreMCPCallError 携带最终文案
 	} else {
 		text, isErr = agentCoreMCPResultText(res)
 	}
@@ -267,6 +386,49 @@ func listAgentCoreMCPTools(ctx context.Context, session *mcp.ClientSession) ([]*
 			break
 		}
 		cursor = res.NextCursor
+	}
+	return out, nil
+}
+
+// filterAgentCoreMCPTools include 白名单交集 + exclude 黑名单剔除(spec §5.2)。
+// 读通道归一先做(手改注册表文件兜底)。include 引用不存在的工具名 → 整 server
+// 判失败(返回 err,调用方走 fail 语义)——把配置错误从「静默丢工具」变成
+// 「显式报错」;exclude 未知名仅 Warn(剔除尚不存在的工具可能是有意预留)。
+// 调用时序:ListTools 之后、128 cap 与命名之前——被过滤的工具不占预算。
+func filterAgentCoreMCPTools(tools []*mcp.Tool, include, exclude []string, serverName string) ([]*mcp.Tool, error) {
+	include = normalizeAgentCoreMCPToolList(include)
+	exclude = normalizeAgentCoreMCPToolList(exclude)
+	names := make(map[string]bool, len(tools))
+	for _, t := range tools {
+		names[t.Name] = true
+	}
+	if len(include) > 0 {
+		missing := make([]string, 0, len(include))
+		for _, n := range include {
+			if !names[n] {
+				missing = append(missing, n)
+			}
+		}
+		if len(missing) > 0 {
+			return nil, fmt.Errorf("include_tools 引用不存在的工具: %v", missing)
+		}
+	}
+	excl := make(map[string]bool, len(exclude))
+	for _, n := range exclude {
+		excl[n] = true
+		if !names[n] {
+			logger.Warn(fmt.Sprintf("agentcore-mcp: server=%s exclude_tools 未匹配任何工具: %q", sanitizeAgentCoreMCPSegment(serverName), n))
+		}
+	}
+	var out []*mcp.Tool
+	for _, t := range tools {
+		if len(include) > 0 && !slices.Contains(include, t.Name) {
+			continue
+		}
+		if excl[t.Name] {
+			continue
+		}
+		out = append(out, t)
 	}
 	return out, nil
 }
@@ -381,7 +543,7 @@ func agentCoreMCPDialWithTimeout(dial func(context.Context, agentCoreMCPRawServe
 // deadline 或建连后提前 cancel，都会把已建好的连接掐断，该 server 的
 // CallTool 全失败。建连超时因此改由 agentCoreMCPDialWithTimeout 外部施加。
 func (m *agentAIManager) agentCoreMCPServerToolDefs(ctx context.Context, raws []agentCoreMCPRawServer, onCall func(tool, summary string, isErr bool)) ([]agentcore.Tool, func()) {
-	var closes []func()
+	var holders []*agentCoreMCPSessionHolder
 	bridges := make([]agentcore.Tool, 0, agentCoreMCPToolCap)
 	seen := map[string]bool{}
 	closeAll := func() {
@@ -389,8 +551,8 @@ func (m *agentAIManager) agentCoreMCPServerToolDefs(ctx context.Context, raws []
 		// （关 stdin→5s 等退出→SIGTERM→再 5s→SIGKILL），多 server 串行最坏
 		// 分钟级。该代价已由 runAgentCore 接入点解耦吸收（detached goroutine
 		// 调用，决策注释见彼处）；本函数保留串行实现。
-		for _, c := range closes {
-			c()
+		for _, h := range holders {
+			h.Close()
 		}
 	}
 	connected, skipped := 0, 0
@@ -431,6 +593,7 @@ func (m *agentAIManager) agentCoreMCPServerToolDefs(ctx context.Context, raws []
 		raw     agentCoreMCPRawServer
 		session *mcp.ClientSession
 		closeFn func()
+		holder  *agentCoreMCPSessionHolder
 		tools   []*mcp.Tool
 		err     error
 	}
@@ -462,6 +625,11 @@ func (m *agentAIManager) agentCoreMCPServerToolDefs(ctx context.Context, raws []
 					closeFn()
 					cancel()
 				},
+				// holder 与桥共享：重连换会话后 closeAll 仍关得到当前会话。
+				holder: newAgentCoreMCPSessionHolder(session, func() {
+					closeFn()
+					cancel()
+				}, raw, dial),
 			}
 		}(k, idx)
 	}
@@ -479,16 +647,33 @@ func (m *agentAIManager) agentCoreMCPServerToolDefs(ctx context.Context, raws []
 			}
 			continue
 		}
-		if out.closeFn != nil {
+		tools, ferr := filterAgentCoreMCPTools(out.tools, out.raw.IncludeTools, out.raw.ExcludeTools, out.raw.Name)
+		if ferr != nil {
+			// 计数互斥(spec §5.2):过滤判失败的 server 只进 skipped,
+			// 不进 connected——「已连接 N(跳过 K)」不得双计。
+			// 语句序:先 closeFn 后 fail(先关会话防泄漏,再记账)——与既有
+			// err 分支(fail 在前)顺序相反,有意为之,勿"纠正"。
+			if out.closeFn != nil {
+				out.closeFn()
+			}
+			fail(out.raw.Name, ferr)
+			continue
+		}
+		if len(tools) != len(out.tools) {
+			logger.Info(fmt.Sprintf("agentcore-mcp: server=%s 工具过滤 保留 %d/%d(include=%d exclude=%d)",
+				sanitizeAgentCoreMCPSegment(out.raw.Name), len(tools), len(out.tools),
+				len(out.raw.IncludeTools), len(out.raw.ExcludeTools)))
+		}
+		if out.holder != nil {
 			// 成功路径不 cancel：session 生命周期交给 closeAll（closeFn 内一并
 			// cancel，见上）。先登记，保证工具截断提前结束时也不泄漏会话。
-			closes = append(closes, out.closeFn)
+			holders = append(holders, out.holder)
 		}
 		connected++
 		if capped {
 			continue
 		}
-		for _, tool := range out.tools {
+		for _, tool := range tools {
 			if len(bridges) >= agentCoreMCPToolCap {
 				capped = true
 				logger.Warn(fmt.Sprintf("agentcore-mcp: 工具超上限截断 cap=%d", agentCoreMCPToolCap))
@@ -505,7 +690,7 @@ func (m *agentAIManager) agentCoreMCPServerToolDefs(ctx context.Context, raws []
 				desc = desc[:agentCoreMCPDescCap]
 			}
 			bridges = append(bridges, &agentCoreMCPBridge{
-				session: out.session, rawTool: tool.Name,
+				holder: out.holder, rawTool: tool.Name,
 				name:        agentCoreMCPBridgeName(out.raw.Name, tool.Name, seen),
 				description: desc, schema: schema, onCall: onCall,
 			})

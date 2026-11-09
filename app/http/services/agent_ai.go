@@ -146,8 +146,14 @@ func (m *agentAIManager) vibeSessionsSnapshot(includeIdle bool) []models.AgentVi
 			MessageCount:          len(session.history),
 			Model:                 session.model,
 			Effort:                session.effort,
-			CreatedAt:             createdAt,
-			UpdatedAt:             now,
+			// approval_mode 随快照上报(2026-11-09 手机同步展示补链):hello/sync
+			// 与 VibeSessions 列表是手机端唯一实时回显通道,漏填则手机永远看到
+			// 旧挡位。字段本身去掉了 omitempty(见 models.AgentVibeSession),
+			// 空串也照常下发——消费端靠「缺键=保存量」区分不了「切回默认」与
+			// 「这条上报没这个话题」,只有恒带键才传得动重置。
+			ApprovalMode: session.approvalMode,
+			CreatedAt:    createdAt,
+			UpdatedAt:    now,
 		})
 	}
 	sort.Slice(sessions, func(i, j int) bool {
@@ -472,6 +478,11 @@ type agentAISession struct {
 	// 没有 stdin 可写，插话只能排队、由下一轮 LLM 调用前取走，所以它与
 	// claudeSteer 的 deliver 语义不同（永远 queued，drain 时才 applied）。
 	coreSteer *agentAICoreSteerControl
+	// subagentControl 是本回合在跑子 agent 的控制表（L3，2026-11-09）：
+	// per-task 停止与追加指令。与 coreSteer 同生命周期（runAgentCore 挂、
+	// clearRunning 清）——子 agent 的生命周期严格归属主回合，回合没了控制
+	// 面必须一起没，否则会留下指向已死 goroutine 的僵尸句柄。
+	subagentControl *agentCoreSubagentControl
 	// tuiTurn 是当前 TUI 注入回合的路由计划（UDS socket / transcript 路径 /
 	// 权限类）。TUI 回合没有 stdin 可写（claudeSteer 恒 nil），UDS 注入是唯一
 	// 插话通道——CC 把回合中收到的注入按「排队消息」处理，当前回合结束后自动
@@ -1989,6 +2000,12 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 		if disabledSkillsSet {
 			existing.disabledSkills = disabledSkills
 		}
+		// approval_mode 换挡落内存(2026-11-09 修复):此前解析值在此分支整体
+		// 丢弃,run.approvalMode 从 session 拷贝恒空串,换挡对执行层零影响,
+		// ack 回显陈旧值把前端 chip 弹回「默认推荐」。带键才写(preserve 同纪律)。
+		if approvalModeSet {
+			existing.approvalMode = approvalMode
+		}
 		// 显式改键立即同步 journal 头行——这是持久化的唯一写点（2026-10-31
 		// 评审修正：不做「每 run 进门同步」，那会把未恢复/未水合的内存态当
 		// 权威、把头行里持久化的名单删掉）。未带键的一侧先从当前头行水合内存
@@ -2006,6 +2023,11 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 				}
 			}
 			m.coreJournal.syncSessionSwitches(sessionID, existing.disabledMCPServers, disabledMCPServersSet, existing.disabledSkills, disabledSkillsSet)
+		}
+		// approval_mode 换挡独立同步 journal(2026-11-09 修复):sync 自带 set
+		// 标记(缺键=preserve),此前被裹进上方 MCP/技能键门禁——纯换挡连
+		// 头行持久化都不落。
+		if approvalModeSet && m.coreJournal != nil {
 			m.coreJournal.syncSessionApprovalMode(sessionID, approvalMode, approvalModeSet)
 		}
 		// 身份三字段空值不覆写已钉值(与 mergeRunStartIdentityLocked 同纪律):
@@ -2096,6 +2118,15 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 			logger.Warn(fmt.Sprintf("ai.session.create: journal history restore failed session=%s err=%v", sessionID, herr))
 		}
 	}
+	// approval_mode 重启兜底(2026-11-09 修复):载荷没带键时从 journal 头行
+	// 回填,与上方 MCP/技能开关同纪律(message() 懒建分支一直有此回填,create
+	// 侧此前缺失→重启后首个 create 把持久化的挡位静默冲回默认)。独立条件——
+	// 上方块的门禁含 MCP/技能/transcript 项,全带键时整块跳过,不能复用。
+	if provider == "agentcore" && m.coreJournal != nil && !approvalModeSet {
+		if _, head, herr := readAgentCoreJournalHistoryFrom(m.coreJournal.dir, sessionID); herr == nil {
+			approvalMode = head.approvalMode
+		}
+	}
 	newHistoryMessages, newHistoryChars := agentAIHistoryLimits(provider, contextWindow)
 	session := &agentAISession{
 		id:                      sessionID,
@@ -2108,6 +2139,7 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 		maxTokens:               maxTokens,
 		disabledMCPServers:      disabledMCPServers,
 		disabledSkills:          disabledSkills,
+		approvalMode:            approvalMode,
 		resumeSessionID:         resumeSessionID,
 		reservedNativeSessionID: reservedNativeSessionID,
 		bindingVersion:          bindingVersion,
@@ -2398,7 +2430,14 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 		m.coreJournal.syncSessionSwitches(sessionID, session.disabledMCPServers, mcpSet, session.disabledSkills, skillsSet)
 	}
 	if approvalMode, ok := parseAgentAIApprovalMode(msg); ok {
-		m.coreJournal.syncSessionApprovalMode(sessionID, approvalMode, ok)
+		// 内存写入(2026-11-09 修复):此前只同步 journal 不落内存,
+		// run.approvalMode 从 session 拷到的是陈旧值,ai.message 换挡对执行
+		// 层零影响。journal 同步保留 nil 守卫(syncSessionApprovalMode 首行
+		// 自判 j==nil,双保险仅为显式可读)。
+		session.approvalMode = approvalMode
+		if m.coreJournal != nil {
+			m.coreJournal.syncSessionApprovalMode(sessionID, approvalMode, ok)
+		}
 	}
 	if surface := normalizeAgentAISurface(remoteString(msg, "surface")); surface != "" {
 		session.surface = surface
@@ -4373,12 +4412,35 @@ func (m *agentAIManager) requestApproval(ctx context.Context, run agentAIRun, wr
 	// 投递 journal,ack/waiter 终结时清除;半开 socket 静默丢帧后由重连重放
 	// 补达(服务端 intake 幂等)。持久化失败只降级为现状,不阻塞审批。
 	m.rememberPendingApprovalRequest(payload)
-	if err := writeAgentAIApprovalRequest(ctx, writeJSON, payload, 5, time.Second); err != nil {
+	if err := writeAgentAIApprovalRequest(ctx, writeJSON, payload, agentAIApprovalSendAttempts, agentAIApprovalSendRetryDelay); err != nil {
+		// 决策丢弃竞态兜底（2026-11-09，11-04 生产实证）：发送失败≠审批无主——
+		// 重试窗口内决策可能已先到（approval() 删 waiter、落 completedApprovals、
+		// 投 respond）。删 waiter 与读 completedApprovals 必须同一临界区：与
+		// approval() 的「删+落账」临界区原子互斥后，任何已生效决策必在此读出
+		// （分两次取锁会在两锁间重开竞态窗口）。有账即决策已生效，喂回内核 +
+		// 同型 resolved 帧照发（对端翻卡），不得返回 error 让内核按超时拒掉
+		// 用户已批准的操作；无账维持既有 error 语义（waiter 已删，迟到的决策
+		// 走 approval() no_match，两端一致）。
 		m.mu.Lock()
 		if waiter := m.approvals[approvalKey]; waiter != nil && waiter.sessionID == run.sessionID && waiter.runSeq == run.runSeq {
 			delete(m.approvals, approvalKey)
 		}
+		completed := m.completedApprovals[approvalKey]
 		m.mu.Unlock()
+		if completed != nil && completed.sessionID == run.sessionID && completed.runSeq == run.runSeq {
+			m.acknowledgePendingApprovalRequest(req.ID)
+			_ = writeJSON(map[string]interface{}{
+				"type":        models.AgentEventAIApprovalRequest,
+				"session_id":  run.sessionID,
+				"message_id":  agentAssistantMessageID(run.messageID),
+				"approval_id": req.ID,
+				"provider":    req.Provider,
+				"kind":        req.Kind,
+				"status":      "resolved",
+				"decision":    completed.response.Decision,
+			})
+			return completed.response, nil
+		}
 		m.acknowledgePendingApprovalRequest(req.ID)
 		return agentAIApprovalResponse{}, fmt.Errorf("send approval request: %w", err)
 	}
@@ -4792,6 +4854,7 @@ func (m *agentAIManager) clearRunning(sessionID string, runSeq int, writeJSON ag
 	var steerControl *agentAICodexSteerControl
 	var claudeSteerControl *agentAIClaudeSteerControl
 	var coreSteerControl *agentAICoreSteerControl
+	var subagentControl *agentCoreSubagentControl
 	if guardOwns && session != nil && session.runSeq == runSeq {
 		steerControl = session.codexSteer
 		claudeSteerControl = session.claudeSteer
@@ -4811,6 +4874,8 @@ func (m *agentAIManager) clearRunning(sessionID string, runSeq int, writeJSON ag
 		session.codexSteer = nil
 		session.claudeSteer = nil
 		session.coreSteer = nil
+		subagentControl = session.subagentControl
+		session.subagentControl = nil
 		session.activeRunID = ""
 		session.goalIdentity = nil
 		session.history = trimAgentAIHistoryForSession(session, session.history)
@@ -4828,6 +4893,14 @@ func (m *agentAIManager) clearRunning(sessionID string, runSeq int, writeJSON ag
 	}
 	if coreSteerControl != nil {
 		coreSteerControl.close("not_running", "agentcore turn ended before steer was applied", "turn_ended")
+	}
+	// 子 agent 控制表随回合退场（L3）：先停全部在跑子 agent——回合已收尾，
+	// 这里还挂着说明是异常路径（正常路径下桥的 defer 各自 unregister 干净），
+	// 留着只会让 goroutine 无主游荡到父 ctx 超时才死。
+	if subagentControl != nil {
+		if n := subagentControl.stop(""); n > 0 {
+			logger.Warn(fmt.Sprintf("agentcore-subagent: turn ended with %d live subagent(s); cancelled session=%s runSeq=%d", n, sessionID, runSeq))
+		}
 	}
 	m.emitApprovalCancelled(writeJSON, sessionID, cancelled, "run_ended")
 }

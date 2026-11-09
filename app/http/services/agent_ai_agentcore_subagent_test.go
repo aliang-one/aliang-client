@@ -234,7 +234,7 @@ func TestAgentCoreSubagentToolsAssembly(t *testing.T) {
 
 	m := newAgentAIManager()
 	router := m.agentCoreSubagentTaskTool(agentAIRun{sessionID: "s", projectPath: "/tmp/p"},
-		nil, nil, nil, nil, nil, nil)
+		nil, nil, nil, nil, nil, nil, nil)
 	if router == nil {
 		t.Fatal("router 不应为 nil")
 	}
@@ -252,7 +252,7 @@ func TestAgentCoreSubagentToolsAssembly(t *testing.T) {
 	setTestAgentHome(t)
 	m2 := newAgentAIManager()
 	router2 := m2.agentCoreSubagentTaskTool(agentAIRun{sessionID: "s2", projectPath: "/tmp/p"},
-		nil, nil, nil, nil, nil, nil)
+		nil, nil, nil, nil, nil, nil, nil)
 	if router2 == nil || len(router2.types) == 0 {
 		t.Fatalf("空定义集应回落内置默认: %+v", router2)
 	}
@@ -344,14 +344,24 @@ func TestAgentCoreSubagentBridgeInterruptedPhase(t *testing.T) {
 	if !res.IsError {
 		t.Fatalf("取消路径应返回错误结果: %+v", res)
 	}
-	var finish map[string]interface{}
+	var finish, start map[string]interface{}
 	for _, line := range readJournalLines(t, j.dir, "s-cancel") {
-		if line["kind"] == "subagent" && line["event"] == "finish" {
+		if line["kind"] != "subagent" {
+			continue
+		}
+		if line["event"] == "finish" {
 			finish = line
+		} else if line["event"] == "start" {
+			start = line
 		}
 	}
 	if finish == nil || finish["status"] != "interrupted" {
 		t.Fatalf("取消路径 journal 终态应为 interrupted, got %v", finish)
+	}
+	// 中断注入数据面：start 行携带 task 文本（截断），崩溃后主 LLM 仍知道
+	// 当时在做什么（feat/subagent-interrupted-injection）。
+	if start == nil || start["task"] != "调研" {
+		t.Fatalf("start 行 task 字段缺失/错: %v", start)
 	}
 }
 
@@ -367,7 +377,7 @@ func TestAgentCoreSubagentTaskRouterShape(t *testing.T) {
 
 	m := newAgentAIManager()
 	tools := m.agentCoreSubagentTools(agentAIRun{sessionID: "s", projectPath: "/tmp/p"},
-		nil, nil, nil, nil, nil, nil)
+		nil, nil, nil, nil, nil, nil, nil)
 	if len(tools) != 1 || tools[0].Name() != "task" {
 		t.Fatalf("应为唯一 task 工具, got %+v", tools)
 	}
@@ -408,7 +418,7 @@ func TestAgentCoreSubagentTaskRouterRouting(t *testing.T) {
 		func(context.Context, agentcore.ApprovalRequest) (agentcore.ApprovalResponse, error) {
 			return agentcore.ApprovalResponse{Approved: true}, nil
 		},
-		nil, nil, nil)
+		nil, nil, nil, nil)
 	if len(tools) != 1 {
 		t.Fatalf("工具数 = %d", len(tools))
 	}
@@ -438,12 +448,12 @@ func TestAgentCoreSubagentBuiltinDefaults(t *testing.T) {
 	setTestAgentHome(t) // 空目录
 	m := newAgentAIManager()
 	tools := m.agentCoreSubagentTools(agentAIRun{sessionID: "s", projectPath: "/tmp/p"},
-		nil, nil, nil, nil, nil, nil)
+		nil, nil, nil, nil, nil, nil, nil)
 	if len(tools) != 1 {
 		t.Fatalf("空目录也应有内置 task 工具, got %d", len(tools))
 	}
 	router := m.agentCoreSubagentTaskTool(agentAIRun{sessionID: "s", projectPath: "/tmp/p"},
-		nil, nil, nil, nil, nil, nil)
+		nil, nil, nil, nil, nil, nil, nil)
 	if router == nil || len(router.types) == 0 {
 		t.Fatalf("内置类型缺失: %+v", router)
 	}
@@ -458,12 +468,33 @@ func TestAgentCoreSubagentBuiltinDefaults(t *testing.T) {
 		"---\nname: researcher\ndescription: 用户自定义调研\n---\n用户正文。")
 	m2 := newAgentAIManager()
 	router2 := m2.agentCoreSubagentTaskTool(agentAIRun{sessionID: "s2", projectPath: "/tmp/p"},
-		nil, nil, nil, nil, nil, nil)
+		nil, nil, nil, nil, nil, nil, nil)
 	if router2 == nil {
 		t.Fatal("router 不应为 nil")
 	}
 	block2 := agentCoreSubagentMechanismSuffix(router2)
 	if !strings.Contains(block2, "用户自定义调研") || strings.Contains(block2, "输出结构化调研报告") {
 		t.Fatalf("用户定义应覆盖内置: %q", block2)
+	}
+}
+
+func TestAgentCoreSubagentInterruptedSuffix(t *testing.T) {
+	// 中断注入（L1）：未终态子 agent 清单进 system prompt——主 LLM 感知中断
+	// 并可智能重派。空清单零副作用；清单必须带类型名/task 文本/重派指引。
+	if got := agentCoreSubagentInterruptedSuffix(nil); got != "" {
+		t.Fatalf("空清单应返回空串, got %q", got)
+	}
+	entries := []agentCoreSubagentInterrupted{
+		{TaskID: "t1", Name: "researcher", Task: "调研加密方案", StartedAt: "2026-11-09T12:04:05Z", ToolCalls: 3, LastTool: "Grep"},
+	}
+	got := agentCoreSubagentInterruptedSuffix(entries)
+	for _, marker := range []string{"<interrupted-subagents>", "never returned", "researcher",
+		"调研加密方案", "re-dispatch", "3 tool calls", "last: Grep",
+		// L3（2026-11-09）：task_id 必须出现在行内（主 LLM 靠它续跑），且
+		// 续跑指引（resume_task_id）必须进块尾。
+		"[task_id=t1]", "resume_task_id"} {
+		if !strings.Contains(got, marker) {
+			t.Fatalf("中断块缺标记 %q: %q", marker, got)
+		}
 	}
 }

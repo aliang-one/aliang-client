@@ -989,6 +989,21 @@ func (s *AgentService) handleRemoteAgentMessage(ctx context.Context, msg map[str
 			s.ai.toolAskResponse(msg, writeJSON)
 		case models.AgentEventAIStop:
 			s.ai.stop(msg, writeJSON)
+		case models.AgentEventAISubagentControl:
+			// 子 agent 控制面（L3）：per-task 停止/追加指令。与 ai.stop 不同，
+			// 它不动主回合——只作用在被点名的那个子 run 上。
+			if !s.aiControlEnabled() {
+				_ = writeJSON(map[string]interface{}{
+					"type":       models.AgentEventAISubagentControlAck,
+					"session_id": remoteString(msg, "session_id"),
+					"task_id":    remoteString(msg, "task_id"),
+					"result":     "error",
+					"error":      "AI control is disabled for this device",
+					"code":       "ai_control_disabled",
+				})
+				return
+			}
+			s.ai.subagentControl(msg, writeJSON)
 		case models.AgentEventAITuiSync:
 			s.ai.tuiSync(msg, writeJSON)
 		case models.AgentEventAISessionClose:
@@ -1118,6 +1133,8 @@ func (s *AgentService) DispatchLocalAI(msg map[string]interface{}, writeJSON fun
 		s.ai.approval(msg, writeJSON)
 	case models.AgentEventAIStop:
 		s.ai.stop(msg, writeJSON)
+	case models.AgentEventAISubagentControl:
+		s.ai.subagentControl(msg, writeJSON)
 	case models.AgentEventAISessionClose:
 		s.ai.close(msg, writeJSON)
 	case models.AgentEventAISessionSubscribe, models.AgentEventAISessionUnsubscribe:

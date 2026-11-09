@@ -80,6 +80,8 @@ const (
 	AgentEventUsageReport             = "usage.report"            // agent→cloud: Claude Code 本地会话小时级用量聚合（后台材料，勿与逐轮 ai.usage 混淆）
 	AgentEventAITask                  = "ai.task"                 // agent→cloud: task/todo list snapshot (claude TodoWrite)
 	AgentEventAISubagent              = "ai.subagent"             // agent→cloud: 子 agent(Task/Agent 工具)生命周期,phase=started|progress|completed|failed|interrupted,task_id 为事件键
+	AgentEventAISubagentControl       = "ai.subagent.control"     // cloud→agent: 子 agent 控制(list/stop/steer),按 session_id+task_id 定位一个在跑子 run
+	AgentEventAISubagentControlAck    = "ai.subagent.control.ack" // agent→cloud: 控制结果(result=ok|stopping|queued|not_found|not_running|unsupported|error)
 	AgentEventFileList                = "file.list"
 	AgentEventFileListResult          = "file.list.result"
 	AgentEventFileRead                = "file.read"
@@ -317,7 +319,7 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				// 行之前，宿主从截断后 journal 全文重建 history（帧不携带
 				// transcript）；仅 agentcore 生效。
 				{Type: AgentEventAISessionCreate, Required: []string{"type", "session_id"}, Optional: []string{"project_path", "mode", "provider", "tool", "model", "effort", "approval_mode", "source_session_id", "resume_session_id", "initial_context", "transcript", "truncate_before_message_id", "claude_remote_policy"}, Emits: []string{AgentEventAISessionCreated, AgentEventAIError}},
-				{Type: AgentEventAIMessage, Required: []string{"type", "session_id", "message_id", "content"}, Optional: []string{"attachments", "provider", "tool", "model", "project_path", "source_session_id", "resume_session_id", "claude_remote_policy", "surface"}, Emits: []string{AgentEventAIMessageReceived, AgentEventAIRunStarted, AgentEventAIDelta, AgentEventAIThinking, AgentEventAICommand, AgentEventAIFileChange, AgentEventAIUsage, AgentEventAITask, AgentEventAIApprovalRequest, AgentEventAIRunProgress, AgentEventAIDone, AgentEventAIError}},
+				{Type: AgentEventAIMessage, Required: []string{"type", "session_id", "message_id", "content"}, Optional: []string{"attachments", "provider", "tool", "model", "project_path", "approval_mode", "source_session_id", "resume_session_id", "claude_remote_policy", "surface"}, Emits: []string{AgentEventAIMessageReceived, AgentEventAIRunStarted, AgentEventAIDelta, AgentEventAIThinking, AgentEventAICommand, AgentEventAIFileChange, AgentEventAIUsage, AgentEventAITask, AgentEventAIApprovalRequest, AgentEventAIRunProgress, AgentEventAIDone, AgentEventAIError}},
 				{Type: AgentEventAISteer, Required: []string{"type", "session_id", "message_id", "content"}, Optional: []string{"mode", "surface"}, Emits: []string{AgentEventAISteerAck}},
 				{Type: AgentEventAIApprovalResponse, Required: []string{"type", "session_id", "approval_id", "decision"}, Optional: []string{"message_id", "scope", "raw", "delivery_id", "attempt"}, Emits: []string{AgentEventAIApprovalAck, AgentEventAIStatus, AgentEventAIError}},
 				{Type: AgentEventAIApprovalState, Required: []string{"type", "approval_id", "status"}, Optional: []string{"session_id"}},

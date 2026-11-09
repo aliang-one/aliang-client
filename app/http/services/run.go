@@ -29,18 +29,26 @@ var (
 	tunStartRunner            = defaultStartTUN
 	tunPrepareStartRunner     = runner2.PrepareStart
 	httpStartRunner           = httpServer.StartMitmHttp
-	httpStopRunner            = httpServer.StopHttpProxy
-	tunStopRunner             = runner2.Stop
+	// httpRestartRunner 是绑定重试路径的起口缝(评审 I1):重绑失败容忍
+	// (Error 留待重试),不共用 boot 路径的 Fatal fail-fast。
+	httpRestartRunner = httpServer.StartMitmHttpTolerant
+	httpStopRunner    = httpServer.StopHttpProxy
+	tunStopRunner     = runner2.Stop
 	// httpProxyIsRunningProbe reports whether the HTTP proxy listener (56432) is
 	// actually accepting connections. Injectable for tests. The auth-expiry stop
 	// path keys off this rather than runService.isRunning, so a desynced flag
 	// (after a mode switch / daemon restart / activation rollback) cannot leave a
 	// live proxy serving a dead token.
-	httpProxyIsRunningProbe      = httpServer.IsHttpRunning
-	tunProxyIsRunningProbe       = engine.IsRunning
-	runModeStoreFactory          = func() runModeSnapshotStore { return storage.NewSoftwareConfigStore() }
-	aliangLinkStatusResolver     = resolveAliangLinkStatus
-	softwareUpdateStatusResolver = func() models.SoftwareVersionUpdateFrontendStatus {
+	httpProxyIsRunningProbe = httpServer.IsHttpRunning
+	// unifiedIngressListenAddrProbe 读当前实际绑定的统一入口地址(空串=未绑)。
+	// 绑定地址随 mesh 总开关变化(config.UnifiedIngressListenAddr),配置提交
+	// 后须比对并重绑才生效——见 ReconcileUnifiedIngressBinding。Injectable 为
+	// 测试提供无需真起 listener 的比对缝。
+	unifiedIngressListenAddrProbe = httpServer.CurrentListenAddr
+	tunProxyIsRunningProbe        = engine.IsRunning
+	runModeStoreFactory           = func() runModeSnapshotStore { return storage.NewSoftwareConfigStore() }
+	aliangLinkStatusResolver      = resolveAliangLinkStatus
+	softwareUpdateStatusResolver  = func() models.SoftwareVersionUpdateFrontendStatus {
 		return GetSharedSoftwareUpdateService().GetFrontendStatus()
 	}
 	sharedRunServiceMu sync.Mutex

@@ -9,7 +9,6 @@ import (
 	"context"
 	"errors"
 	"net"
-	"strconv"
 	"testing"
 	"time"
 
@@ -186,9 +185,11 @@ func TestManagerEgressPeerAssemblyFields(t *testing.T) {
 	}
 }
 
-// TestMeshLANAssemblyLifecycle LAN 载体+beacon 生命周期:总开关开 → LAN 监听
-// 起口+beacon 注册 Default;关 → 端口归零+Default 清空;再开 → 重起(beacon
-// Stop 后用全新实例 Start,避免改已启动实例字段)。
+// TestMeshLANAssemblyLifecycle beacon 生命周期(LAN 帧接收面已收编统一口,
+// spec §6.5,装配只剩发现候选面):总开关开 → beacon 注册 Default 且广播
+// 统一口 56432;关 → Default 清空;再开 → 重起(beacon Stop 后用全新实例
+// Start,避免改已启动实例字段)。MeshLANPort 是常量承载口,不再作运行态
+// 观测(0=未装配旧语义随独立监听退役失效)。
 func TestMeshLANAssemblyLifecycle(t *testing.T) {
 	t.Cleanup(StopMeshLANAssembly)
 	StopMeshLANAssembly()
@@ -198,34 +199,31 @@ func TestMeshLANAssemblyLifecycle(t *testing.T) {
 	beaconPort := pickFreeUDPForAssembly(t)
 	startMeshLANAssembly(deviceID, interval, beaconPort)
 
-	// 初始未配置 → 不启动。
-	if got := MeshLANPort(); got != 0 {
-		t.Fatalf("未配置 mesh 时 MeshLANPort = %d, want 0", got)
+	// MeshLANPort 收敛为常量统一口:与装配态无关的静态拓扑事实。
+	if got := MeshLANPort(); got != config.DefaultHTTPProxyPort {
+		t.Fatalf("MeshLANPort = %d, want 统一口 %d", got, config.DefaultHTTPProxyPort)
+	}
+
+	// 初始未配置 → beacon 不启动。
+	if lanbeacon.Default() != nil {
+		t.Fatal("未配置 mesh 时 lanbeacon.Default 应为 nil")
 	}
 
 	restore := swapGlobalMeshConfig(t, &config.MeshConfig{})
 	defer restore()
 	waitForMeshLAN(t, true)
 
-	port := MeshLANPort()
-	if port <= 0 {
-		t.Fatal("mesh 开后 MeshLANPort 应 > 0")
-	}
-	if lanbeacon.Default() == nil {
+	beacon := lanbeacon.Default()
+	if beacon == nil {
 		t.Fatal("mesh 开后 lanbeacon.Default 应非 nil")
 	}
-	conn, dialErr := net.DialTimeout("tcp", "127.0.0.1:"+strconv.Itoa(port), 500*time.Millisecond)
-	if dialErr != nil {
-		t.Fatalf("MeshLANPort=%d 无 TCP 监听: %v", port, dialErr)
+	if got := beacon.MeshPort(); got != config.DefaultHTTPProxyPort {
+		t.Fatalf("beacon 广播端口 = %d, want 统一口 %d", got, config.DefaultHTTPProxyPort)
 	}
-	_ = conn.Close()
 
 	// 关:下个 tick 收摊。
 	restoreOff := swapGlobalMeshConfig(t, &config.MeshConfig{Enable: boolPtr(false)})
 	waitForMeshLAN(t, false)
-	if got := MeshLANPort(); got != 0 {
-		t.Fatalf("总开关关后 MeshLANPort = %d, want 0", got)
-	}
 	if lanbeacon.Default() != nil {
 		t.Fatal("总开关关后 lanbeacon.Default 应为 nil")
 	}
@@ -233,12 +231,12 @@ func TestMeshLANAssemblyLifecycle(t *testing.T) {
 
 	// 再开:重起(全新 beacon 实例)。
 	waitForMeshLAN(t, true)
-	if MeshLANPort() <= 0 || lanbeacon.Default() == nil {
-		t.Fatalf("再开后应重起: port=%d default=%v", MeshLANPort(), lanbeacon.Default())
+	if lanbeacon.Default() == nil {
+		t.Fatal("再开后应重起 beacon")
 	}
 	StopMeshLANAssembly()
-	if MeshLANPort() != 0 || lanbeacon.Default() != nil {
-		t.Fatalf("Stop 后应收摊: port=%d default=%v", MeshLANPort(), lanbeacon.Default())
+	if lanbeacon.Default() != nil {
+		t.Fatalf("Stop 后应收摊: default=%v", lanbeacon.Default())
 	}
 }
 
@@ -255,12 +253,12 @@ func swapGlobalMeshConfig(t *testing.T, mesh *config.MeshConfig) func() {
 
 func boolPtr(b bool) *bool { return &b }
 
-// waitForMeshLAN 按装配期望态轮询(2s 上限):running 对应端口非零。
+// waitForMeshLAN 按装配期望态轮询(2s 上限):running 对应 beacon 注册态。
 func waitForMeshLAN(t *testing.T, wantRunning bool) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		running := MeshLANPort() > 0
+		running := lanbeacon.Default() != nil
 		if running == wantRunning {
 			return
 		}
