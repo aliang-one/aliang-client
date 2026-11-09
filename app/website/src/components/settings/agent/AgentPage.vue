@@ -91,6 +91,14 @@
                 @save="emitSave"
               />
             </div>
+            <AgentMemorySettings
+              :config="config"
+              :loading="loading"
+              :saving="saving"
+              :error="error"
+              :success-message="successMessage"
+              @save="emitSave"
+            />
             <CustomEnvSettings
               :config="config"
               :loading="loading"
@@ -124,6 +132,7 @@ import AgentMCPRegistrySettings from '../AgentMCPRegistrySettings.vue';
 import AgentCoreSettings from '../AgentCoreSettings.vue';
 import AgentMCPGlobalSettings from '../AgentMCPGlobalSettings.vue';
 import AgentSkillsGlobalSettings from '../AgentSkillsGlobalSettings.vue';
+import AgentMemorySettings from '../AgentMemorySettings.vue';
 import CustomEnvSettings from '../CustomEnvSettings.vue';
 import PeerAccessSettings from './PeerAccessSettings.vue';
 import SystemStatusSettings from '../SystemStatusSettings.vue';
@@ -153,6 +162,7 @@ export default {
     AgentCoreSettings,
     AgentMCPGlobalSettings,
     AgentSkillsGlobalSettings,
+    AgentMemorySettings,
     CustomEnvSettings,
     PeerAccessSettings,
     SystemStatusSettings,

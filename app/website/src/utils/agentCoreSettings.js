@@ -85,15 +85,17 @@ export function applyAgentCoreLLMClearing(patch, nextLLM, currentLLM) {
 // 服务端载荷 → 归一线格式。非对象/缺键输出 {max_identical_tool_turns: 0}
 // (= 未配置,与 Go 侧 nil 层等价)。非法数字(负数/非整数)归一成 0——归一层
 // 不报错,报错是 validate 的职责;这里只保证输出永远是合法线格式。
-// ⚠️ mcp_enabled/skills_enabled(全局总闸,2026-10-31)必须在此透传:本函数的
-// 输出经 normalizeCustomerConfig → buildCustomerConfigPatch 原样进 POST
-// patch 与 GET 回显——在这里剥掉的话,两张全局开关卡「保存 HTTP 200 但永不
-// 落盘、刷新恒显默认开」(2026-10-31 验收缺陷①)。布尔键显式透传,缺键不出
-// 现(= 未配置,后端 nil 视为开启,与 Go 侧三态等价)。
+// ⚠️ mcp_enabled/skills_enabled(全局总闸,2026-10-31)与 memory_enabled(记忆
+// 总开关,2026-11-09)必须在此透传:本函数的输出经 normalizeCustomerConfig →
+// buildCustomerConfigPatch 原样进 POST patch 与 GET 回显——在这里剥掉的话,
+// 全局开关卡「保存 HTTP 200 但永不落盘、刷新恒显默认开」(2026-10-31 验收
+// 缺陷①)。布尔键显式透传,缺键不出现(= 未配置,后端 nil 视为开启,与 Go
+// 侧三态等价;MemoryEnabled *bool json:"memory_enabled,omitempty")。
 export function normalizeAgentCoreTuning(source) {
   let turns = 0;
   let mcpEnabled;
   let skillsEnabled;
+  let memoryEnabled;
   if (source && typeof source === 'object' && !Array.isArray(source)) {
     const raw = source.max_identical_tool_turns;
     if (typeof raw === 'number' && Number.isInteger(raw) && raw > 0) {
@@ -105,11 +107,15 @@ export function normalizeAgentCoreTuning(source) {
     if (typeof source.skills_enabled === 'boolean') {
       skillsEnabled = source.skills_enabled;
     }
+    if (typeof source.memory_enabled === 'boolean') {
+      memoryEnabled = source.memory_enabled;
+    }
   }
   return {
     max_identical_tool_turns: turns,
     ...(mcpEnabled === undefined ? {} : { mcp_enabled: mcpEnabled }),
     ...(skillsEnabled === undefined ? {} : { skills_enabled: skillsEnabled }),
+    ...(memoryEnabled === undefined ? {} : { memory_enabled: memoryEnabled }),
   };
 }
 
