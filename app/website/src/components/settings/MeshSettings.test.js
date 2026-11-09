@@ -741,6 +741,24 @@ describe('MeshSettings 拓扑画布', () => {
     expect(chips).toEqual(['x.com,mesh:dev-b', 'y.com,mesh:dev-b,direct']);
   });
 
+  it('连线命中区：14px 透明线承载点击（可见线 2px/可能轴向零包围盒，点不中）', async () => {
+    const { el } = mountCard(canvasConfig());
+    await flush();
+    const hit = edgeLine(el, 'dev-b');
+    // 命中线存在且足够粗（SVG 命中测试按描边宽度算,透明描边照样命中）
+    expect(hit.getAttribute('stroke')).toBe('transparent');
+    expect(hit.getAttribute('stroke-width')).toBe('14');
+    // 可见线不抢事件,选中态只改可见线样式
+    const visible = el.querySelector('[data-mesh-edge-line="dev-b"]');
+    expect(visible.getAttribute('pointer-events')).toBe('none');
+    expect(visible.getAttribute('stroke-width')).toBe('2');
+    // 点命中线 → 节点对详情（与点徽标等价）
+    hit.dispatchEvent(new Event('click', { bubbles: true }));
+    await flush();
+    expect(el.querySelector('[data-mesh-detail]').textContent).toContain('mesh_pairDetailTitle');
+    expect(visible.getAttribute('class')).toContain('stroke-primary');
+  });
+
   it('点击节点 → 右栏节点详情（规则 chips + 被引用节点对数）', async () => {
     const { el } = mountCard(canvasConfig());
     await flush();

@@ -73,8 +73,24 @@
           role="img"
           viewBox="0 0 640 360"
         >
-          <!-- 连线（节点对容器;仅对该 peer 有 mesh 规则时绘制） -->
+          <!-- 连线（节点对容器;仅对该 peer 有 mesh 规则时绘制）。
+               命中区与可见线分开画:2px 可见线太细点不中,且纯轴向边(peer 在正
+               上/正下方)y1==y2 包围盒高度为 0——加一条 14px 透明命中线解决点击
+               可达性（SVG 命中测试按 stroke 宽度算,透明描边照样命中）。 -->
           <g data-mesh-edges>
+            <line
+              v-for="edge in canvasEdges"
+              :key="`edge-hit-${edge.peerId}`"
+              :x1="edge.x1"
+              :x2="edge.x2"
+              :y1="edge.y1"
+              :y2="edge.y2"
+              :data-mesh-edge="edge.peerId"
+              class="cursor-pointer"
+              stroke="transparent"
+              stroke-width="14"
+              @click="selectPair(edge.peerId)"
+            />
             <line
               v-for="edge in canvasEdges"
               :key="`edge-${edge.peerId}`"
@@ -83,9 +99,9 @@
               :y1="edge.y1"
               :y2="edge.y2"
               :class="selectedPair === edge.peerId ? 'stroke-primary' : 'stroke-slate-400 dark:stroke-slate-600'"
-              :data-mesh-edge="edge.peerId"
+              :data-mesh-edge-line="edge.peerId"
+              pointer-events="none"
               stroke-width="2"
-              @click="selectPair(edge.peerId)"
             />
             <g v-for="edge in canvasEdges" :key="`badge-${edge.peerId}`" :data-mesh-badge="edge.peerId" class="cursor-pointer" @click="selectPair(edge.peerId)">
               <circle
