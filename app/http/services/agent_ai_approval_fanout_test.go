@@ -10,6 +10,7 @@ package services
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -254,5 +255,157 @@ func TestApprovalAcceptForSessionRecordsMemory(t *testing.T) {
 	<-decide("s2", "a3", models.AgentAIApprovalDecisionAccept)
 	if m.sessionApprovalAllows("s2", "codex", models.AgentAIApprovalKindTool, "mcp__x__y", "") {
 		t.Fatal("普通 accept 不应落会话记忆")
+	}
+}
+
+// TestApprovalSendFailureKeepsArrivedDecision 决策丢弃竞态兜底(2026-11-09,
+// 11-04 生产实证):发送失败分支不得吃掉重试窗口内已生效的决策。本地发起
+// WS 死亡时 requestApproval 逐次重试,手机决策可在窗口内先到(approval() 删
+// waiter、落 completedApprovals、投 respond);重试耗尽后原实现直接返回
+// error——内核按超时拒工具而手机已显示决策生效,两端发散。修复契约:有
+// completedApprovals 账即决策已生效,喂回内核(err=nil)+同型 resolved 帧照发
+// (对端翻卡);无账才维持现状 error 返回。
+func TestApprovalSendFailureKeepsArrivedDecision(t *testing.T) {
+	m := newTestAISocketsManager(t)
+	defer m.closeAll()
+	oldAttempts, oldDelay := agentAIApprovalSendAttempts, agentAIApprovalSendRetryDelay
+	agentAIApprovalSendAttempts, agentAIApprovalSendRetryDelay = 3, 20*time.Millisecond
+	t.Cleanup(func() {
+		agentAIApprovalSendAttempts, agentAIApprovalSendRetryDelay = oldAttempts, oldDelay
+	})
+
+	runCh := make(chan map[string]interface{}, 16)
+	m.registerAISocket("remote", func(p interface{}) error {
+		runCh <- p.(map[string]interface{})
+		return nil
+	})
+	// 决策在首次发送失败的同时注入（确定性）：等 waiter 注册后 + 睡眠式的
+	// 「重试窗口内竞速」在慢机/高负载下可能决策晚于最后一次尝试才到，测试
+	// 变成测调度延迟而非测兜底逻辑。writer 在 m.mu 之外被调用，approval()
+	// 内部再取锁不死锁；首次注入后不再重复（Once）。
+	var injectOnce sync.Once
+	// 恒败 origin(本地仪表盘断线形态),经 fanOutWrite 包装镜像生产接线:
+	// origin 内联失败不剥夺扇出,审批卡照达云端。
+	deadWriter := m.fanOutWrite("aisock-dead", "s1", func(payload interface{}) error {
+		injectOnce.Do(func() {
+			// 以手机身份在重试窗口内投决策：approval() 删 waiter、落
+			// completedApprovals、投 respond——随后重试仍逐次失败。
+			m.approval(map[string]interface{}{
+				"type":        models.AgentEventAIApprovalResponse,
+				"session_id":  "s1",
+				"approval_id": "a1",
+				"decision":    models.AgentAIApprovalDecisionAccept,
+			}, nil)
+		})
+		return errors.New("websocket: close sent")
+	})
+
+	run := agentAIRun{sessionID: "s1", runSeq: 1, messageID: "m1", provider: "agentcore"}
+	m.mu.Lock()
+	m.sessions["s1"] = &agentAISession{id: "s1", runSeq: 1, originSocket: "aisock-dead"}
+	m.mu.Unlock()
+
+	type outcome struct {
+		resp agentAIApprovalResponse
+		err  error
+	}
+	got := func() outcome {
+		done := make(chan outcome, 1)
+		go func() {
+			resp, err := m.requestApproval(context.Background(), run, deadWriter, agentAIApprovalRequest{
+				ID:       "a1",
+				Kind:     models.AgentAIApprovalKindTool,
+				ToolName: "Bash",
+			})
+			done <- outcome{resp, err}
+		}()
+		return <-done
+	}()
+
+	if got.err != nil {
+		t.Fatalf("已生效决策不得被发送失败吃掉(11-04 端到端发散形态): err=%v", got.err)
+	}
+	if got.resp.Decision != models.AgentAIApprovalDecisionAccept {
+		t.Fatalf("决策应喂回内核, got %+v", got.resp)
+	}
+	// 同型 resolved 帧仍要广播(对端翻卡依赖它)。
+	waitUntilFor(t, time.Second, func() bool {
+		seen := false
+		for len(runCh) > 0 {
+			p := <-runCh
+			if p["type"] == models.AgentEventAIApprovalRequest && p["status"] == "resolved" && p["approval_id"] == "a1" {
+				seen = true
+			}
+		}
+		return seen
+	})
+}
+
+// TestApprovalSendFailureWithoutDecisionStillErrors 反向契约:重试耗尽且确无
+// 决策到达时,维持既有 error 返回(内核按超时拒绝,行为不变)。
+func TestApprovalSendFailureWithoutDecisionStillErrors(t *testing.T) {
+	m := newTestAISocketsManager(t)
+	defer m.closeAll()
+	oldAttempts, oldDelay := agentAIApprovalSendAttempts, agentAIApprovalSendRetryDelay
+	agentAIApprovalSendAttempts, agentAIApprovalSendRetryDelay = 2, 10*time.Millisecond
+	t.Cleanup(func() {
+		agentAIApprovalSendAttempts, agentAIApprovalSendRetryDelay = oldAttempts, oldDelay
+	})
+
+	deadWriter := m.fanOutWrite("aisock-dead", "s2", func(payload interface{}) error {
+		return errors.New("websocket: close sent")
+	})
+	run := agentAIRun{sessionID: "s2", runSeq: 1, messageID: "m2", provider: "agentcore"}
+	m.mu.Lock()
+	m.sessions["s2"] = &agentAISession{id: "s2", runSeq: 1, originSocket: "aisock-dead"}
+	m.mu.Unlock()
+
+	resp, err := m.requestApproval(context.Background(), run, deadWriter, agentAIApprovalRequest{ID: "a2"})
+	if err == nil {
+		t.Fatalf("无决策到达时应维持 error 返回, got resp=%+v", resp)
+	}
+}
+
+// TestRegisterLocalSocketRefreshesStaleOrigins origin 悬空修复(2026-11-09,
+// 11-04 生产实证):本地仪表盘 WS 断线后 socket 从注册表摘除,但会话的
+// originSocket 仍指向死 id——ack 双写与按 origin 的投递永远落空,与
+// optionResponse 已有的作答刷新(TestOptionResponseRefreshesOriginSocket)
+// 同族缺口。修复契约:新本地 socket 注册时,把 origin 指向已不在注册表的
+// 会话重指向新 socket;远端常驻键(remote)与仍存活的 origin 不得被扰动。
+func TestRegisterLocalSocketRefreshesStaleOrigins(t *testing.T) {
+	m := newTestAISocketsManager(t)
+	defer m.closeAll()
+
+	dead := m.registerAISocket("local", func(p interface{}) error { return nil })
+	alive := m.registerAISocket("local", func(p interface{}) error { return nil })
+	m.mu.Lock()
+	m.sessions["s-running"] = &agentAISession{id: "s-running", runSeq: 1, originSocket: dead.id}
+	m.sessions["s-idle"] = &agentAISession{id: "s-idle", originSocket: dead.id}
+	m.sessions["s-remote-origin"] = &agentAISession{id: "s-remote-origin", originSocket: agentAIRemoteSocketID}
+	m.sessions["s-alive-origin"] = &agentAISession{id: "s-alive-origin", originSocket: alive.id}
+	m.mu.Unlock()
+
+	// 旧 socket 死亡(注册表摘除)后,重连注册新 socket。
+	m.unregisterAISocket(dead.id)
+	fresh := m.registerAISocket("local", func(p interface{}) error { return nil })
+	if fresh == nil || fresh.id == "" {
+		t.Fatal("新 socket 注册失败")
+	}
+
+	m.mu.Lock()
+	gotRunning := m.sessions["s-running"].originSocket
+	gotIdle := m.sessions["s-idle"].originSocket
+	gotRemote := m.sessions["s-remote-origin"].originSocket
+	gotAlive := m.sessions["s-alive-origin"].originSocket
+	m.mu.Unlock()
+
+	if gotRunning != fresh.id || gotIdle != fresh.id {
+		t.Fatalf("悬空 origin 应重指向新 socket: running=%q idle=%q want=%q", gotRunning, gotIdle, fresh.id)
+	}
+	if gotRemote != agentAIRemoteSocketID {
+		t.Fatalf("远端常驻键不得被重指向, got %q", gotRemote)
+	}
+	if gotAlive != alive.id {
+		t.Fatalf("仍存活的 origin 不得被扰动, got %q want %q", gotAlive, alive.id)
 	}
 }

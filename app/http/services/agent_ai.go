@@ -4373,12 +4373,35 @@ func (m *agentAIManager) requestApproval(ctx context.Context, run agentAIRun, wr
 	// 投递 journal,ack/waiter 终结时清除;半开 socket 静默丢帧后由重连重放
 	// 补达(服务端 intake 幂等)。持久化失败只降级为现状,不阻塞审批。
 	m.rememberPendingApprovalRequest(payload)
-	if err := writeAgentAIApprovalRequest(ctx, writeJSON, payload, 5, time.Second); err != nil {
+	if err := writeAgentAIApprovalRequest(ctx, writeJSON, payload, agentAIApprovalSendAttempts, agentAIApprovalSendRetryDelay); err != nil {
+		// 决策丢弃竞态兜底（2026-11-09，11-04 生产实证）：发送失败≠审批无主——
+		// 重试窗口内决策可能已先到（approval() 删 waiter、落 completedApprovals、
+		// 投 respond）。删 waiter 与读 completedApprovals 必须同一临界区：与
+		// approval() 的「删+落账」临界区原子互斥后，任何已生效决策必在此读出
+		// （分两次取锁会在两锁间重开竞态窗口）。有账即决策已生效，喂回内核 +
+		// 同型 resolved 帧照发（对端翻卡），不得返回 error 让内核按超时拒掉
+		// 用户已批准的操作；无账维持既有 error 语义（waiter 已删，迟到的决策
+		// 走 approval() no_match，两端一致）。
 		m.mu.Lock()
 		if waiter := m.approvals[approvalKey]; waiter != nil && waiter.sessionID == run.sessionID && waiter.runSeq == run.runSeq {
 			delete(m.approvals, approvalKey)
 		}
+		completed := m.completedApprovals[approvalKey]
 		m.mu.Unlock()
+		if completed != nil && completed.sessionID == run.sessionID && completed.runSeq == run.runSeq {
+			m.acknowledgePendingApprovalRequest(req.ID)
+			_ = writeJSON(map[string]interface{}{
+				"type":        models.AgentEventAIApprovalRequest,
+				"session_id":  run.sessionID,
+				"message_id":  agentAssistantMessageID(run.messageID),
+				"approval_id": req.ID,
+				"provider":    req.Provider,
+				"kind":        req.Kind,
+				"status":      "resolved",
+				"decision":    completed.response.Decision,
+			})
+			return completed.response, nil
+		}
 		m.acknowledgePendingApprovalRequest(req.ID)
 		return agentAIApprovalResponse{}, fmt.Errorf("send approval request: %w", err)
 	}

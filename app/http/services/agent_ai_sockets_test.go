@@ -598,3 +598,36 @@ func TestRemoteSubscribeRepliesSnapshotAndRegisters(t *testing.T) {
 		t.Fatal("退订未生效")
 	}
 }
+
+// TestDispatchLocalAISnapshotAlwaysCarriesPendingApprovals 快照权威清卡契约
+// (2026-11-09 桌面卡滞留家族③):旧实现 pending 为空时整字段缺席,前端
+// running 态无从区分「无在挂」与「旧版 agent」,只能只 upsert 不清卡——别端
+// 已作答的卡在桌面永 pending。新契约:pending_approvals 恒在场(空集=权威
+// 「无在挂」),前端据字段在场与否决定是否权威清卡(缺席=旧 agent 不越权)。
+func TestDispatchLocalAISnapshotAlwaysCarriesPendingApprovals(t *testing.T) {
+	m := newTestAISocketsManager(t)
+	svc := &AgentService{ai: m}
+	dir := t.TempDir()
+	m.coreJournal = newAgentCoreJournal(dir)
+	m.coreJournal.ensureSessionHeader("s-nopending", "/proj", "glm-5.3", "", time.Now().UTC().Format(time.RFC3339), "phone", nil, nil, "")
+	m.mu.Lock()
+	m.sessions["s-nopending"] = &agentAISession{id: "s-nopending", cancel: func() {}} // running 且无在挂审批
+	m.mu.Unlock()
+
+	replies := make(chan map[string]interface{}, 8)
+	svc.DispatchLocalAI(map[string]interface{}{
+		"type":       models.AgentEventAISessionSubscribe,
+		"session_id": "s-nopending",
+	}, func(p interface{}) error { replies <- p.(map[string]interface{}); return nil })
+	select {
+	case p := <-replies:
+		if _, ok := p["pending_approvals"]; !ok {
+			t.Fatalf("快照必须显式携带 pending_approvals(空集=权威无在挂),实际缺席: %v", p)
+		}
+		if pend, _ := p["pending_approvals"].([]map[string]interface{}); len(pend) != 0 {
+			t.Fatalf("无在挂审批时空集应为 0 项,实际 %v", pend)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("未收到快照")
+	}
+}

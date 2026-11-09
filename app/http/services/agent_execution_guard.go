@@ -122,6 +122,12 @@ var (
 	agentAIApprovalTimeout = resolveEnvDuration("ALIANG_AI_APPROVAL_TIMEOUT", 24*time.Hour)
 	agentAIHardCeiling     = resolveEnvDurationAllowZero("ALIANG_AI_HARD_CEILING", 0)
 
+	// 审批请求帧的发送重试参数（writeAgentAIApprovalRequest 的尝试数与退避）。
+	// 远端 socket 重连瞬断由重试桥接；全败走 requestApproval 失败分支。包级
+	// 变量仅为测试可缩（生产默认 5 次×1s）。
+	agentAIApprovalSendAttempts   = 5
+	agentAIApprovalSendRetryDelay = time.Second
+
 	// agentAINoProgressWindow bounds how long a run may keep EMITTING output
 	// without producing meaningful progress (assistant text/thinking, a file
 	// change, or a completed Codex work item). Raw output keeps the idle

@@ -374,6 +374,99 @@ export function resolveToolAskCard(conv, event, handledToolAskIds, resolvedAt) {
   return true;
 }
 
+// reconcileSnapshotApprovals 快照权威清卡（2026-11-09 桌面卡滞留家族③+④）：
+// 旧实现对账只 upsert 不清卡——running 态下别端已作答的卡在桌面永 pending。
+// 新契约：快照带 pending_approvals 字段（新 agent 恒带，空集=权威「无在挂」）
+// 时，快照会话（snapshotSessionId）名下不在列表内的卡一律收走——按 sessionId
+// **跨全部会话对象**扫（与 sweepApprovalKey 同口径的两半：resolved 帧全局扫卡
+// 救「已作答」侧，快照清卡救「断线窗口错过 resolved」侧；卡经③活跃兜底/
+// ①草稿壳双对象漂到别处，只清路由命中的那个对象会漏）。字段缺席（旧 agent）
+// 不越权；外来会话卡（键为别的 sessionId）不在本快照管辖内，不得收走（评审
+// P1 越权守卫）。
+// **刻意不封键位**（与 resolved/cancelled 终态帧的封键不同）：快照（订阅握手
+// 直写 WS）与审批 request 帧（fanOut 经 pump 队列）两条写路径不保序，先读
+// 后写的陈旧快照可能晚于新 request 帧到达——封键会把竞态窗口里仍 pending 的
+// 真卡永久锁死（审批卡从此隐形、回合挂死到超时）；不封键最坏退化为「迟到
+// 重复 request 帧复活一张陈卡」，下一张快照或终态帧自愈，而终态帧封键
+// （sweepApprovalKey→handledApprovalIds）已兜住复活面。返回是否发生变更。
+export function reconcileSnapshotApprovals(convList, pendingApprovals, snapshotSessionId) {
+  const ownSession = String(snapshotSessionId || '');
+  if (!ownSession || !Array.isArray(pendingApprovals) || !Array.isArray(convList)) return false;
+  const keep = new Set();
+  for (const item of pendingApprovals) {
+    if (!item || typeof item !== 'object') continue;
+    const id = item.approval_id || item.id;
+    if (!id) continue;
+    keep.add(`${String(item.session_id || ownSession)}:${String(id)}`);
+  }
+  let changed = false;
+  for (const conv of convList) {
+    const approvals = Array.isArray(conv?.approvals) ? conv.approvals : [];
+    const stale = approvals.filter(item => item?.key
+      && String(item.sessionId || '') === ownSession
+      && !keep.has(item.key));
+    if (!stale.length) continue;
+    conv.approvals = approvals.filter(item => !stale.includes(item));
+    changed = true;
+  }
+  return changed;
+}
+
+// chatRecoverySubscribeSessionIds 恢复路径的设备壳补订清单（2026-11-09 评审
+// P1）：服务端订阅挂 socket 键、连接结束整体摘除——断线恢复只订本地会话会让
+// 已打开的设备壳失聪（壳卡快照对账永不再达）。isSubscribable 收**会话对象**
+// （镜像 deviceSessionSubscribable 首查 conv?.deviceSession 的形状——评审
+// verify 阶段 node 仿真抓过一版把裸清单条目喂给谓词、恒 false 零壳被订的惰性
+// 接线）。返回可订阅壳的**会话对象**：订阅 id 取 deviceSession.id，子agent
+// 刷新取 aiSessionId 优先（镜像 onclose 自愈口径）。
+export function chatRecoverySubscribeSessionIds(convList, isSubscribable) {
+  const targets = [];
+  for (const conv of Array.isArray(convList) ? convList : []) {
+    if (!conv?.deviceSession) continue;
+    if (typeof isSubscribable === 'function' && !isSubscribable(conv)) continue;
+    if (!String(conv.deviceSession.id || '').trim()) continue;
+    targets.push(conv);
+  }
+  return targets;
+}
+
+// sweepApprovalKey resolved/cancelled 同型帧的全局扫卡（2026-11-09 归属漂移）：
+// request 与 resolved 键恒一致但可落不同会话对象（③活跃兜底漂移/②壳三键抢道/
+// ①草稿壳双对象），只清路由命中的那个会话会漏掉原卡；收卡幂等，对全部会话
+// 扫同键一律收走。返回是否扫到（键位照封——迟到重复帧不复活）。
+export function sweepApprovalKey(convList, sessionId, approvalId, handledApprovalIds) {
+  if (!approvalId || !Array.isArray(convList)) return false;
+  const key = `${String(sessionId || '')}:${String(approvalId)}`;
+  let swept = false;
+  for (const conv of convList) {
+    const approvals = Array.isArray(conv?.approvals) ? conv.approvals : [];
+    if (!approvals.some(item => item?.key === key)) continue;
+    handledApprovalIds.add(key);
+    conv.approvals = approvals.filter(item => item.key !== key);
+    swept = true;
+  }
+  return swept;
+}
+
+// wireChatSocketRecovery 断线自愈的第二生命线（2026-11-09 家族⑤）：重连预算
+// （2 次）耗尽后页面死寂——无定时重连/无轮询，断线窗口内错过的 resolved 帧
+// 永不补达，DOM 卡片永不更新。visibilitychange（回到标签页）与 online（网络
+// 恢复）是用户回归的两个确定性时机，各给一次恢复回调（预算重置与重订阅在
+// recover 闭包内）。doc/win 注入便于测试；返回拆卸函数防 composable 卸载泄漏。
+export function wireChatSocketRecovery(doc, win, recover) {
+  if (!doc || !win || typeof recover !== 'function') return () => {};
+  const onVisible = () => {
+    if (doc.visibilityState === 'visible') recover();
+  };
+  const onOnline = () => recover();
+  doc.addEventListener('visibilitychange', onVisible);
+  win.addEventListener('online', onOnline);
+  return () => {
+    doc.removeEventListener('visibilitychange', onVisible);
+    win.removeEventListener('online', onOnline);
+  };
+}
+
 export function useAliangChat() {
   const { t } = useI18n();
   const { showDashboard, chatProviderPreset } = useNavigation();
@@ -1328,9 +1421,12 @@ export function useAliangChat() {
       if (activeId.value === shell.id) scrollToBottom();
     }
 
-    // pending_approvals → 逐条走既有 upsertApproval；快照行缺 status 时补
+    // pending_approvals 权威清卡（2026-11-09 家族③+④）+ 逐条 upsert：字段在
+    // 场（新 agent 恒带，空集=权威无在挂）先按 sessionId 跨会话对象收走残留
+    // 卡（漂到③活跃兜底/①双对象上的同会话卡一并裁决）；行缺 status 补
     // pending 默认（展开顺序：item 在前——行自带 status 时不得被默认值反客为主，
     // upsertApproval 只认 pending/responding，其余 status 走收卡）。
+    reconcileSnapshotApprovals(conversations.value, e.pending_approvals, sessionId);
     for (const item of Array.isArray(e.pending_approvals) ? e.pending_approvals : []) {
       if (!item || typeof item !== 'object') continue;
       upsertApproval(shell, { ...item, status: item.status || 'pending' });
@@ -1461,7 +1557,11 @@ export function useAliangChat() {
       }
     }
     // pending_approvals 恢复与状态分支解耦（审批等待中关窗重进：running
-    // 快照同样带在挂审批，任何早退分支都不得丢）。
+    // 快照同样带在挂审批，任何早退分支都不得丢）。字段在场时先权威清卡
+    // （2026-11-09 家族③：running 态旧实现只 upsert 不清卡，别端已作答的卡
+    // 永 pending；按 sessionId 跨对象扫，漂移卡同款裁决）；缺席（旧 agent）
+    // 不越权。
+    reconcileSnapshotApprovals(conversations.value, e.pending_approvals, sessionId);
     for (const item of Array.isArray(e.pending_approvals) ? e.pending_approvals : []) {
       if (!item || typeof item !== 'object') continue;
       upsertApproval(local, { ...item, status: item.status || 'pending' });
@@ -1819,6 +1919,8 @@ export function useAliangChat() {
   // 倒计时刷新时钟：30s 粒度足够（文案最小单位是分钟级「即将超时」）。
   const nowTick = ref(now());
   let nowTickTimer = null;
+  // 断线自愈第二生命线的拆卸句柄（见 recoverChatSocketAfterInterruption）。
+  let disposeChatSocketRecovery = null;
 
   async function respondApproval(conv, approval, decision) {
     if (!conv || !approval || approval.status !== 'pending') return;
@@ -2651,6 +2753,12 @@ export function useAliangChat() {
         break;
       }
       case 'ai.approval.request': {
+        // resolved 同型帧先全局扫卡（2026-11-09 归属漂移）：request 与
+        // resolved 键恒一致但可落不同会话对象，只清路由命中的那个会漏掉原卡。
+        // pending 帧不走扫卡（正常 upsert 语义）。
+        if (e && e.status && e.status !== 'pending') {
+          sweepApprovalKey(conversations.value, e.session_id, e.approval_id || e.id, handledApprovalIds);
+        }
         upsertApproval(conv, e);
         persist = true;
         break;
@@ -2660,12 +2768,10 @@ export function useAliangChat() {
         // 粗暴清空）：逐个作废 + 系统提示条挂对应会话（审批族链已路由到设备壳/
         // 活跃兜底）。③ 兜底时带「来自会话 X」前缀（评审折叠项，单行文案内联）。
         // expires_at 到期后端会以 ai.approval.cancelled(reason=approval_timeout)
-        // 收尾，同样走清卡。
+        // 收尾，同样走清卡。作废同走全局扫卡（归属漂移同款，2026-11-09）。
         const ids = Array.isArray(e.approval_ids) ? e.approval_ids : [];
         for (const id of ids) {
-          const key = approvalKeyFromValues(e.session_id, id);
-          handledApprovalIds.add(key);
-          removeApproval(conv, key);
+          sweepApprovalKey(conversations.value, e.session_id, id, handledApprovalIds);
         }
         const cancelledText = e.reason
           ? t('chat_approvalCancelledReason', { reason: e.reason })
@@ -3025,6 +3131,33 @@ export function useAliangChat() {
     inputRef.value = el;
   }
 
+  // 断线自愈第二生命线（2026-11-09 家族⑤）：重连预算（2 次）耗尽后页面死寂，
+  // 无定时重连/无轮询——断线窗口内错过的 resolved 帧永不补达，DOM 卡片永不
+  // 更新。visibilitychange（回到标签页）与 online（网络恢复）是用户回归的
+  // 两个确定性时机，各给一次免费重连+重订阅（预算重置，与生产帧归零点同
+  // 语义）。socket 已 OPEN 时不动作（防每次切标签页空转）。
+  function recoverChatSocketAfterInterruption() {
+    if (aiSocket && aiSocket.readyState === WebSocket.OPEN) return;
+    reconnectAttempts = 0;
+    ensureAISocket()
+      .then(() => {
+        // 新 socket 订阅集全灭（服务端订阅挂 socket 键，连接结束整体摘除）：
+        // 已打开设备壳补订（评审 P1——resubscribeRestoredRuns 只滤本地会话，
+        // 壳订阅唯二入口是 openDeviceSession 与 onclose 自愈，恢复路径必须
+        // 同口径补上，壳卡快照对账才可达）+ 子agent面板补刷（断连窗口内
+        // ai.subagent 帧随 socket 全灭，与 onclose 自愈同款）+ 本地会话
+        // running 对账。
+        for (const shell of chatRecoverySubscribeSessionIds(conversations.value, deviceSessionSubscribable)) {
+          sendAI({ type: 'ai.session.subscribe', session_id: shell.deviceSession.id });
+          refreshSubagentsFromDetail(subagentsBySession, shell.aiSessionId || shell.deviceSession.id);
+        }
+        return resubscribeRestoredRuns();
+      })
+      .catch(() => {
+        // 重连失败：预算不回滚（死线保护仍在），等下次回归时机再试。
+      });
+  }
+
   onMounted(() => {
     console.log('[aliang-chat] ChatPage mounted build=stream-v4 ws=' + aiSocketUrl());
     loadFromStorage();
@@ -3032,12 +3165,17 @@ export function useAliangChat() {
     resubscribeRestoredRuns(); // 后台静默运行对账：恢复的 running 气泡向真值收敛
     // 审批卡 expires_at 倒计时刷新（30s 粒度，见 ChatApprovalCard 的 approvalExpiresLabel）
     nowTickTimer = setInterval(() => { nowTick.value = now(); }, 30000);
+    disposeChatSocketRecovery = wireChatSocketRecovery(document, window, recoverChatSocketAfterInterruption);
   });
 
   onUnmounted(() => {
     if (nowTickTimer) {
       clearInterval(nowTickTimer);
       nowTickTimer = null;
+    }
+    if (disposeChatSocketRecovery) {
+      disposeChatSocketRecovery();
+      disposeChatSocketRecovery = null;
     }
     if (aiSocket) {
       // 主动关窗 ≠ 断线：run 在 agent 侧继续跑。closingIntentionally 让
