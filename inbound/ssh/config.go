@@ -21,9 +21,10 @@ const extIngressForm = "ingress_form"
 // 构造后视为不可变:配置变更由装配层(Reconcile)重建 Server 实例,
 // 不原地改写——认证回调与通道处理全程只读此结构。
 type RunConfig struct {
-	// Port 已废弃:56432 统一入口承载 SSH 监听(spec §6.4),运行面忽略此
-	// 字段。保留 schema 是为了让 customer.ssh_ingress.port 配置字段与 zod
-	// 五处副本的删除留在下批次(爆炸半径不值)。
+	// Port 专用监听口(spec §6.4 修订):0=跟随统一口 56432(不自持监听,
+	// 可用性随代理运行态);>0=另开常驻专用口 ServiceBindHost:port(随入口
+	// 开关)。翻译层把旧默认 56442 哨兵归零(存量配置升级不凭空开专用口),
+	// 见 services.buildSSHIngressRunConfig。
 	Port uint16
 	// AuthorizedKeys 是形态①凭证(人用 authorized_keys)。
 	AuthorizedKeys []gossh.PublicKey

@@ -8,8 +8,6 @@ package http
 import (
 	"net"
 	"testing"
-
-	"aliang.one/nursorgate/processor/config"
 )
 
 // netListenForTest 薄包装 net.Listen(测试里连写两次,省一层判错样板)。
@@ -42,10 +40,11 @@ func TestCurrentListenAddrEmptyWhenNotRunning(t *testing.T) {
 // TestCurrentListenAddrReportsBoundAddr 运行中 → 返回真实绑定地址。
 func TestCurrentListenAddrReportsBoundAddr(t *testing.T) {
 	resetHTTPListenerState(t)
-	addr := config.UnifiedIngressListenAddr()
-	listener, err := netListenForTest(addr)
+	// 绑临时口即可(观测面与端口值无关):绑真实 56432 会与本机在跑的
+	// agent/其他会话测试撞车(address already in use)。
+	listener, err := netListenForTest("127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("listen %s: %v", addr, err)
+		t.Fatalf("listen: %v", err)
 	}
 	t.Cleanup(func() { _ = listener.Close() })
 

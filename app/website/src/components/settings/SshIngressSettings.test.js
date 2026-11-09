@@ -14,7 +14,8 @@ import zh from '../../i18n/zh';
 
 // —— normalizeSSHIngressConfig（线格式归一；SettingsPage 归一化链共用）——
 // 线格式 customer.ssh_ingress{enable,port,authorized_keys[],mesh_authorized_keys[]}；
-// 后端 enable 是三态指针 nil=false，port 0=默认 56442（uint16 上界 65535）。
+// 后端 enable 是三态指针 nil=false，port 0=跟随统一口 56432（56442 旧默认
+// 哨兵由显示层映射为空、保存发 0）。
 describe('SshIngressSettings normalizeSSHIngressConfig', () => {
   it('produces wire-format defaults for a missing section', () => {
     expect(normalizeSSHIngressConfig(undefined)).toEqual({
@@ -223,9 +224,9 @@ describe('SshIngressSettings 卡片', () => {
     expect(el.querySelector('[data-ssh-hostkey]').textContent).toContain('ssh-ed25519');
     expect(el.querySelector('[data-ssh-hostkey]').textContent).toContain('2026-11-08T01:02:03Z');
     expect(el.querySelector('[data-field="sshIngressEnable"]').checked).toBe(false);
-    // 端口只读展示(统一口 56432 承载,无输入框)
-    expect(el.querySelector('[data-field="sshIngressPortUnified"]')).toBeTruthy();
-    expect(el.querySelector('input[data-field="sshIngressPort"]')).toBeNull();
+    // 端口输入回归:未配(port=0)显示空 + 留空占位提示
+    expect(el.querySelector('input[data-field="sshIngressPort"]')).toBeTruthy();
+    expect(el.querySelector('[data-field="sshIngressPort"]').value).toBe('');
   });
 
   it('复制按钮写入剪贴板并切换反馈文案', async () => {
@@ -331,11 +332,23 @@ describe('SshIngressSettings 卡片', () => {
     expect(meshOnly.saved[0].ssh_ingress.authorized_keys).toEqual([]);
   });
 
-  it('提交载荷：整配置透传 + ssh_ingress 四字段；端口原样透传（卡片无编辑入口）', async () => {
-    // 配置里 port=56442 → 载荷原样带出(运行面已忽略,透传不产生伪 diff)
-    const { el, saved } = mountCard(baseConfig({ port: 56442 }));
+  it('端口非法值拦截保存（1-65535 之外）', async () => {
+    const { el, saved } = mountCard(baseConfig({ enable: true, authorized_keys: [HUMAN_KEY] }));
+    await flush();
+    setField(el, 'sshIngressPort', '70000');
+    await flush();
+    expect(el.textContent).toContain('sshIngress_portInvalid');
+    expect(saveButton(el).disabled).toBe(true);
+    clickSave(el);
+    await flush();
+    expect(saved).toHaveLength(0);
+  });
+
+  it('提交载荷：整配置透传 + ssh_ingress 四字段；端口空发 0（跟随统一口）、显式值原样', async () => {
+    const { el, saved } = mountCard(baseConfig());
     await flush();
     setToggle(el, 'sshIngressEnable', true);
+    setField(el, 'sshIngressPort', '56443');
     setField(el, 'sshIngressKeyDraft', HUMAN_KEY);
     el.querySelector('[data-ssh-key-add]').click();
     await flush();
@@ -346,21 +359,27 @@ describe('SshIngressSettings 卡片', () => {
     expect(saved[0].proxy.server).toBe('127.0.0.1:1080');
     expect(saved[0].ssh_ingress).toEqual({
       enable: true,
-      port: 56442,
+      port: 56443,
       authorized_keys: [HUMAN_KEY],
       mesh_authorized_keys: []
     });
 
-    // 配置里 port=0(未设)→ 载荷照实带 0(后端归一默认)
-    const unset = mountCard(baseConfig());
+    // 端口清空 → 0(=跟随统一口)
+    setField(el, 'sshIngressPort', '');
     await flush();
-    setToggle(unset.el, 'sshIngressEnable', true);
-    setField(unset.el, 'sshIngressKeyDraft', HUMAN_KEY);
-    unset.el.querySelector('[data-ssh-key-add]').click();
+    clickSave(el);
     await flush();
-    clickSave(unset.el);
+    expect(saved[1].ssh_ingress.port).toBe(0);
+  });
+
+  it('哨兵：配置 port=56442(旧默认)显示为空,保存发 0(翻译层归零=跟随统一口)', async () => {
+    const { el, saved } = mountCard(baseConfig({ enable: true, authorized_keys: [HUMAN_KEY], port: 56442 }));
     await flush();
-    expect(unset.saved[0].ssh_ingress.port).toBe(0);
+    expect(el.querySelector('[data-field="sshIngressPort"]').value).toBe('');
+    clickSave(el);
+    await flush();
+    expect(saved).toHaveLength(1);
+    expect(saved[0].ssh_ingress.port).toBe(0);
   });
 
   it('置零：关闭开关载荷 enable:false 且其余字段照发（enable=false 时后端跳过钥匙校验）', async () => {
@@ -372,14 +391,15 @@ describe('SshIngressSettings 卡片', () => {
     }));
     await flush();
     setToggle(el, 'sshIngressEnable', false);
+    setField(el, 'sshIngressPort', '');
     await flush();
     clickSave(el);
     await flush();
     expect(saved).toHaveLength(1);
     expect(saved[0].ssh_ingress).toEqual({
       enable: false,
-      // 端口透传(卡片无编辑入口):56442 原样保留
-      port: 56442,
+      // 端口输入已清空 → 发 0(=跟随统一口)
+      port: 0,
       authorized_keys: [HUMAN_KEY],
       mesh_authorized_keys: [MESH_KEY]
     });
@@ -394,6 +414,8 @@ describe('SshIngressSettings 卡片', () => {
     }));
     await flush();
     expect(el.querySelector('[data-field="sshIngressEnable"]').checked).toBe(true);
+    // 56442 是旧默认哨兵:显示为空(保存发 0=跟随统一口),不回显数字
+    expect(el.querySelector('[data-field="sshIngressPort"]').value).toBe('');
     const humanRows = el.querySelectorAll('[data-ssh-key-row]');
     expect(humanRows).toHaveLength(1);
     expect(humanRows[0].textContent).toContain(HUMAN_KEY);
@@ -413,8 +435,9 @@ describe('SshIngressSettings 卡片', () => {
       'sshIngress_description',
       'sshIngress_enable',
       'sshIngress_port',
-      'sshIngress_portUnified',
-      'sshIngress_portUnifiedHint',
+      'sshIngress_portPlaceholder',
+      'sshIngress_portInvalid',
+      'sshIngress_portHint',
       'sshIngress_hostkeyTitle',
       'sshIngress_hostkeyDesc',
       'sshIngress_hostkeyNotStarted',

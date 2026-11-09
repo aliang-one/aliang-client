@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -70,6 +71,17 @@ func ingressHandshakeOK(t *testing.T, signer gossh.Signer) bool {
 	return true
 }
 
+// reserveIngressPort 预约一个空闲回环端口(取口即关;TOCTOU 窗口极小)。
+func reserveIngressPort(t *testing.T) int {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve port: %v", err)
+	}
+	defer l.Close()
+	return l.Addr().(*net.TCPAddr).Port
+}
+
 // commitIngressConfig 走提交协调路径落一段 customer 配置(失败即 Fatal——
 // 本文件断言的是运行面,提交本身必须先成功)。
 func commitIngressConfig(t *testing.T, payload string) {
@@ -106,27 +118,44 @@ func setupIngressReconcileTest(t *testing.T) {
 }
 
 // TestSSHIngressReconcileStartsAndStops 走 customer_config_service 提交协调
-// 路径验证接线(Task 7):enable→IsRunning+载荷公钥可认证;port-only 变更
-// →不重启(运行面忽略 port 的钉子);disable→停+注入缝拒收。凭证变更重启
-// 的连接级断言在 inbound/ssh 的 reconcile_test.go 单测覆盖。
+// 路径验证接线:enable(无端口)→统一口承载(专用口 Addr 空)+载荷公钥可认证;
+// 显式端口→另开常驻专用口(Addr 暴露);56442 哨兵→专用口收回(端到端归零);
+// disable→停+注入缝拒收。凭证变更重启的连接级断言在 inbound/ssh 的
+// reconcile_test.go 单测覆盖。
 func TestSSHIngressReconcileStartsAndStops(t *testing.T) {
 	setupIngressReconcileTest(t)
 
 	keyLine, keySigner := newSSHIngressTestKey(t)
 
-	// enable:合法公钥 → 提交协调路径 reconcile 起服务,认证贯通。
+	// enable:合法公钥、不带端口 → 统一口承载,专用口 Addr 空,认证贯通。
 	commitIngressConfig(t, fmt.Sprintf(`{"customer":{"ssh_ingress":{"enable":true,"authorized_keys":[%q]}}}`, keyLine))
 	if !sshin.IsRunning() {
 		t.Fatal("ssh ingress must be running after enabling commit")
+	}
+	if got := sshin.Addr(); got != "" {
+		t.Fatalf("unified mode must not open dedicated listener, Addr = %q", got)
 	}
 	if !ingressHandshakeOK(t, keySigner) {
 		t.Fatal("committed authorized key must authenticate via the injection seam")
 	}
 
-	// port-only 变更:运行面忽略 port → 期望态等价 → 不重启(仍在跑)。
-	commitIngressConfig(t, fmt.Sprintf(`{"customer":{"ssh_ingress":{"enable":true,"port":56443,"authorized_keys":[%q]}}}`, keyLine))
+	// 显式端口:另开常驻专用口(Addr 暴露该口)。
+	fixed := reserveIngressPort(t)
+	commitIngressConfig(t, fmt.Sprintf(`{"customer":{"ssh_ingress":{"enable":true,"port":%d,"authorized_keys":[%q]}}}`, fixed, keyLine))
 	if !sshin.IsRunning() {
-		t.Fatal("port-only change must not stop the ingress (port is ignored)")
+		t.Fatal("ssh ingress must stay running after explicit port commit")
+	}
+	if _, port, err := net.SplitHostPort(sshin.Addr()); err != nil || port != strconv.Itoa(fixed) {
+		t.Fatalf("Addr = %q, want dedicated port %d", sshin.Addr(), fixed)
+	}
+
+	// 56442 哨兵(旧默认):端到端归零 → 专用口收回,回归统一口承载。
+	commitIngressConfig(t, fmt.Sprintf(`{"customer":{"ssh_ingress":{"enable":true,"port":56442,"authorized_keys":[%q]}}}`, keyLine))
+	if !sshin.IsRunning() {
+		t.Fatal("sentinel port commit must keep ingress running")
+	}
+	if got := sshin.Addr(); got != "" {
+		t.Fatalf("56442 sentinel must withdraw dedicated listener, Addr = %q", got)
 	}
 
 	// disable(deep merge 只动 enable):期望停,注入缝拒收。
@@ -207,8 +236,9 @@ func TestBuildSSHIngressRunConfigUnparseableKeyDefense(t *testing.T) {
 	if len(rc.AuthorizedKeys) != 1 || len(rc.MeshKeys) != 1 {
 		t.Fatalf("unparseable lines must be skipped: authorized=%d mesh=%d, want 1/1", len(rc.AuthorizedKeys), len(rc.MeshKeys))
 	}
-	if rc.Port != config.SSHIngressDefaultPort {
-		t.Fatalf("port = %d, want %d", rc.Port, config.SSHIngressDefaultPort)
+	// 旧默认 56442 是哨兵:翻译层归零=跟随统一口(spec §6.4 修订)。
+	if rc.Port != 0 {
+		t.Fatalf("port = %d, want 0 (56442 sentinel maps to unified ingress)", rc.Port)
 	}
 	if rc.ForwardGate != nil {
 		t.Fatal("ForwardGate must stay nil (merge integration seam, see RunConfig comment)")
