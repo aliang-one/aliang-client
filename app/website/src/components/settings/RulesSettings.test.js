@@ -218,6 +218,84 @@ describe('RulesSettings detectCommaCollapseIssue', () => {
   });
 });
 
+// —— mesh 转发尾段（对齐后端 processor/routing splitMeshTail）——
+// 后端在 ClassifyEntry **之前**剥尾，故前端校验/提取也必须在任何逗号分支前剥，
+// 否则是「前端拒绝后端接受的输入」：今日真实缺陷=`x.com,mesh:dev-b` 被逗号兜底
+// 分支的 ENTRY_CHARS_RE 拒（冒号不在字符集），后端接受。
+// 红线重申：ACTION_TAIL_WORDS 集合不动（后端 legacyActionTail 不含 mesh）。
+describe('RulesSettings validateRuleEntry mesh tail', () => {
+  it('accepts the bare comma form (today rejected by the fallthrough branch)', () => {
+    expect(probe('x.com,mesh:dev-b')).toBe('');
+    expect(probe('x.com,MESH:dev-b')).toBe('');
+    expect(probe('x.com, mesh:dev-b ')).toBe('');
+    // base 仍走常规语法：多域名行照旧按兼容语义（只校验有效段）
+    expect(probe('a.com,b.com,mesh:dev-b')).toBe('');
+  });
+
+  it('accepts one policy segment after mesh:<id>', () => {
+    expect(probe('x.com,mesh:dev-b,direct')).toBe('');
+    expect(probe('x.com,mesh:dev-b,DENY')).toBe('');
+    expect(probe('x.com,mesh:dev-b,fallback:dev-c')).toBe('');
+    expect(probe('x.com,mesh:dev-b, FALLBACK: dev-c ')).toBe('');
+  });
+
+  it('rejects malformed mesh tails instead of silently accepting them', () => {
+    // 空 deviceID / 空 base / 多策略段 / 未知策略段 / 空 fallback 目标
+    expect(probe('x.com,mesh:')).toBe('rules_meshInvalid');
+    expect(probe('mesh:dev-b')).toBe('rules_meshInvalid');
+    expect(probe('x.com,mesh:dev-b,direct,extra')).toBe('rules_meshInvalid');
+    expect(probe('x.com,mesh:dev-b,bogus')).toBe('rules_meshInvalid');
+    expect(probe('x.com,mesh:dev-b,fallback:')).toBe('rules_meshInvalid');
+  });
+
+  it('validates the base, so colon-keyword bases are no longer mis-rejected', () => {
+    // 这两条今日都错：ip-cidr 冒号分支整串拒、geoip 判逗号多国；后端接受
+    expect(probe('ip-cidr:1.2.3.0/24,mesh:dev-b')).toBe('');
+    expect(probe('ip-cidr:1.2.3.0/24,mesh:dev-b,direct')).toBe('');
+    expect(probe('geoip:cn,mesh:dev-b')).toBe('');
+    expect(probe('dns,mesh:dev-b')).toBe('');
+    // base 自身非法仍报 base 的错误文案（不是 mesh 文案）
+    expect(probe('ip-cidr:1.2.3.0/99,mesh:dev-b')).toBe('rules_ipInvalid');
+    expect(probe('exam..ple.com,mesh:dev-b')).toBe('rules_entryEmptyLabel');
+  });
+
+  it('keeps every non-mesh entry byte-for-byte unchanged', () => {
+    expect(probe('example.com,direct')).toBe('');
+    expect(probe('example.com,proxy-server')).toBe('');
+    expect(probe('geoip,CN,proxy')).toBe('');
+    expect(probe('geoip,CN,HK,proxy')).toBe('rules_geoipCommaMultiProxy');
+    expect(probe('ip-cidr,1.2.3.0/24,proxy')).toBe('');
+    expect(probe('example..com')).toBe('rules_entryEmptyLabel');
+  });
+});
+
+describe('RulesSettings extractProxyRuleDomain mesh tail', () => {
+  it('extracts the base condition, not the mesh target', () => {
+    // 不剥尾就会提取出 'mesh:dev-b' → 与 AI include 假重叠
+    expect(extractProxyRuleDomain('x.com,mesh:dev-b')).toBe('x.com');
+    expect(extractProxyRuleDomain('OpenAI.com,mesh:dev-b,direct')).toBe('openai.com');
+    expect(extractProxyRuleDomain('ip-cidr:1.2.3.0/24,mesh:dev-b')).toBe('1.2.3.0/24');
+    expect(extractProxyRuleDomain('geoip:cn,mesh:dev-b')).toBe('geoip:cn');
+    expect(extractProxyRuleDomain('a.com,b.com,mesh:dev-b')).toBe('b.com');
+    // 非法 mesh 形态整条不参与比对
+    expect(extractProxyRuleDomain('x.com,mesh:')).toBe('');
+  });
+});
+
+describe('RulesSettings detectCommaCollapseIssue mesh tail', () => {
+  const hint = (v) => detectCommaCollapseIssue(v, (k, p) => `${k}|${p?.kept ?? ''}`);
+
+  it('never flags a mesh entry as a collapsed multi-domain line', () => {
+    // 不剥尾会误报 kept=mesh:dev-b（把 mesh 目标当成被保留的域名）
+    expect(hint('x.com,mesh:dev-b')).toBe('');
+    // base 本身确实是塌缩形态 → 提示的是 base 的真实保留段（b.com），不是 mesh:dev-b
+    expect(hint('a.com,b.com,mesh:dev-b')).toBe('rules_commaCollapseHint|b.com');
+    expect(hint('a.com,b.com,c.com,mesh:dev-b')).toBe('rules_commaCollapseHint|c.com');
+    // 非法 mesh 形态不提示（红色错误优先）
+    expect(hint('x.com,mesh:')).toBe('');
+  });
+});
+
 // —— 错误文案组装（LOW#18）：firstEntryIssue 的 index 透传为「第 N 行」前缀 ——
 // 前缀 N 从 1 起（index 0 → 第 1 行）；nil issue 返回空串（无错误不渲染）。
 describe('RulesSettings formatEntryIssue', () => {
