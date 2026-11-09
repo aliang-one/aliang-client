@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"aliang.one/nursorgate/app/agentcore"
 )
@@ -22,6 +23,17 @@ func swapAgentCoreMemoryDirForTest(t *testing.T) string {
 	restore := AgentCoreMemory.SetDirForTest(dir)
 	t.Cleanup(restore)
 	return dir
+}
+
+// disableAgentCoreMemoryForTest 关记忆总闸(走产品开关 seam,与生产配置
+// memory_enabled=false 同一条代码路径),还原由 t.Cleanup 负责。既有 run 级
+// 测试断言上游精确请求次数,而记忆提取是新增副作用(成功 run 收尾后向同一
+// 上游多发一次提取请求)——不测提取的测试统一显式关闭。
+func disableAgentCoreMemoryForTest(t *testing.T) {
+	t.Helper()
+	prev := agentCoreMemoryEnabledFn
+	agentCoreMemoryEnabledFn = func() bool { return false }
+	t.Cleanup(func() { agentCoreMemoryEnabledFn = prev })
 }
 
 func TestAgentCoreMemorySlug(t *testing.T) {
@@ -184,9 +196,9 @@ func kernelEffortRejectionErr(t *testing.T) error {
 	}))
 	t.Cleanup(srv.Close)
 	err := agentcore.NewClient(srv.URL).Stream(context.Background(), &agentcore.MessagesRequest{
-		Model:    "m1",
+		Model:     "m1",
 		MaxTokens: 16,
-		Messages: []agentcore.Message{agentcore.TextMessage("user", "hi")},
+		Messages:  []agentcore.Message{agentcore.TextMessage("user", "hi")},
 	}, func(agentcore.StreamEvent) error { return nil })
 	if err == nil {
 		t.Fatal("预期内核自产 400 错误")
@@ -208,9 +220,9 @@ func kernelPlainRejectionErr(t *testing.T) error {
 	}))
 	t.Cleanup(srv.Close)
 	err := agentcore.NewClient(srv.URL).Stream(context.Background(), &agentcore.MessagesRequest{
-		Model:    "m1",
+		Model:     "m1",
 		MaxTokens: 16,
-		Messages: []agentcore.Message{agentcore.TextMessage("user", "hi")},
+		Messages:  []agentcore.Message{agentcore.TextMessage("user", "hi")},
 	}, func(agentcore.StreamEvent) error { return nil })
 	if err == nil {
 		t.Fatal("预期内核自产 403 错误")
@@ -411,4 +423,89 @@ func TestAgentCoreMemoryExtractEffortBranches(t *testing.T) {
 			t.Fatalf("非 effort 拒绝不得重试,应恰 1 次: %d", len(got))
 		}
 	})
+}
+
+// agentCoreMemoryOp 类型定义在主文件(Task 4 Step 2);测试直接引用同包类型。
+func TestAgentCoreMemoryApplyOps(t *testing.T) {
+	swapAgentCoreMemoryDirForTest(t)
+	_, _ = agentCoreMemory.addManual("/p/d", "旧事实")
+	ops := []agentCoreMemoryOp{
+		{Op: "update", ID: 1, Content: "旧事实已被纠正"},
+		{Op: "add", Content: "新事实"},
+		{Op: "add", Content: strings.Repeat("长", 501)}, // 超限丢弃该条
+		{Op: "bogus"}, // 非法 op 丢弃
+	}
+	agentCoreMemory.applyOps("/p/d", ops)
+	got := agentCoreMemory.list("/p/d")
+	if len(got) != 2 {
+		t.Fatalf("应剩 2 条(超限丢弃+非法丢弃): %+v", got)
+	}
+	// 断言按内容查,不按序(平局 ID 降序的排序规则下新 add 可能排前)
+	byContent := map[string]agentCoreMemoryEntry{}
+	for _, e := range got {
+		byContent[e.Content] = e
+	}
+	upd, ok := byContent["旧事实已被纠正"]
+	if !ok || upd.Source != "manual" || upd.ID != 1 {
+		t.Fatalf("update 保 source 与 id: %+v", upd)
+	}
+	if _, ok := byContent["新事实"]; !ok {
+		t.Fatal("add 丢失")
+	}
+}
+
+func TestAgentCoreMemoryExtractPipelineSkips(t *testing.T) {
+	swapAgentCoreMemoryDirForTest(t)
+	m := &agentAIManager{}
+	called := make(chan struct{}, 1)
+	m.coreMemoryCallForTest = func(ctx context.Context, req *agentcore.MessagesRequest) (string, string, error) {
+		called <- struct{}{}
+		// 非空 ops:全空 ops 按契约不落盘,落盘断言需要真实产物
+		return `{"ops":[{"op":"add","content":"管线落盘事实"}]}`, "end_turn", nil
+	}
+	m.agentCoreMemoryExtractAsync("/p/e", "m-x", "", "   ", "   ") // 全空白回合:跳过
+	select {
+	case <-called:
+		t.Fatal("空白回合不得发起提取调用")
+	default:
+	}
+	done := m.agentCoreMemoryExtractAsync("/p/e", "m-x", "", "用户消息", "助手结论")
+	select {
+	case <-called:
+	case <-time.After(2 * time.Second):
+		t.Fatal("正常回合应发起提取")
+	}
+	// 完成信号:channel close 建立 happens-before,替代脆弱 sleep/轮询;
+	// 超时显式 Fatal,禁止静默通过
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("正常回合提取未完成(2s 超时)")
+	}
+	if _, err := os.Stat(filepath.Join(agentCoreMemory.dirFn(), "_p_e.json")); err != nil {
+		t.Fatalf("正常回合提取未落盘: %v", err)
+	}
+}
+
+func TestAgentCoreMemoryExtractFailuresWarnOnly(t *testing.T) {
+	swapAgentCoreMemoryDirForTest(t)
+	m := &agentAIManager{}
+	// ① LLM 报错:不 panic、不落盘(Warn 放弃)
+	m.coreMemoryCallForTest = func(ctx context.Context, req *agentcore.MessagesRequest) (string, string, error) {
+		return "", "", fmt.Errorf("boom")
+	}
+	done := m.agentCoreMemoryExtractAsync("/p/f1", "m-x", "", "u", "a")
+	<-done // 完成信号建立 happens-before,替代脆弱 sleep
+	if _, err := os.Stat(filepath.Join(agentCoreMemory.dirFn(), "_p_f1.json")); !os.IsNotExist(err) {
+		t.Fatal("LLM 失败不得落盘")
+	}
+	// ② 非法 JSON:同上
+	m.coreMemoryCallForTest = func(ctx context.Context, req *agentcore.MessagesRequest) (string, string, error) {
+		return "不是json", "end_turn", nil
+	}
+	done = m.agentCoreMemoryExtractAsync("/p/f2", "m-x", "", "u", "a")
+	<-done
+	if _, err := os.Stat(filepath.Join(agentCoreMemory.dirFn(), "_p_f2.json")); !os.IsNotExist(err) {
+		t.Fatal("非法 JSON 不得落盘")
+	}
 }

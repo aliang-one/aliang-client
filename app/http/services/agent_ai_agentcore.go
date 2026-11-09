@@ -1576,6 +1576,11 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		}
 		endStatus = "success"
 		m.setAgentAIResumeSessionIDIfEmpty(run.sessionID, run.runSeq, capturedResumeSessionID)
+		// 记忆提取(spec §5):正常成功回合收尾后异步小提取;中断/stopped/
+		// 失败/僵尸迟返回不提取(被丢弃的输出没有记忆价值)。detached,
+		// 任何失败只 Warn 绝不影响 run(与 journal 同族纪律)。
+		m.agentCoreMemoryExtractAsync(run.projectPath, agentCoreModel(run), run.effort,
+			agentCoreLastUserText(messages), assistantOutput)
 		// 刻意跳过 ccPeerSessionJSONL / appendLineageMarker：那是 Claude CLI 的
 		// transcript 谱系修补，内核没有对应的 JSONL 文件。
 		//

@@ -17,6 +17,7 @@ import (
 
 	"aliang.one/nursorgate/app/agentcore"
 	"aliang.one/nursorgate/common/logger"
+	"aliang.one/nursorgate/processor/config"
 )
 
 // agentCoreMemoryCap 单项目记忆条数上限,满则 LRU 淘汰(spec §4)。
@@ -183,7 +184,13 @@ func (s *agentCoreMemoryStore) saveLocked(dir, slug string, f *agentCoreMemoryFi
 
 // list 按项目列全量(按 last_hit_at 降序,空回退 created_at;spec §8)。
 func (s *agentCoreMemoryStore) list(projectPath string) []agentCoreMemoryEntry {
-	dir := s.dirFn()
+	return s.listAt(s.dirFn(), projectPath)
+}
+
+// listAt 同 list,但存储目录由调用方显式传入——detached 提取 goroutine 用它,
+// 不在 goroutine 内触碰 dirFn seam(与测试 t.Cleanup 还原写构成数据竞态,
+// 2026-11-10 -race 实测)。
+func (s *agentCoreMemoryStore) listAt(dir, projectPath string) []agentCoreMemoryEntry {
 	slug := agentCoreMemoryProjectSlug(projectPath)
 	if dir == "" || slug == "" {
 		return nil
@@ -445,6 +452,8 @@ func (AgentCoreMemoryFacade) SetDirForTest(dir string) (restore func()) {
 
 // agentcore 进程级 effort 锁存(spec §5):首次成功即置 Set 并记档——档位可能
 // 是空串(无 effort 终档),故需 Set 配对位区分「未锁存」,否则每回合重吃 400。
+// 边界:进程锁存不随 customer 配置切换重探;换 provider/模型后仍用锁存档,
+// 重启复位。
 var (
 	agentCoreMemoryEffortLatched    string
 	agentCoreMemoryEffortLatchedSet bool
@@ -501,10 +510,10 @@ func (m *agentAIManager) agentCoreMemoryExtractCall(ctx context.Context, model, 
 	var lastErr error
 	for _, eff := range candidates {
 		req := &agentcore.MessagesRequest{
-			Model:    model,
+			Model:     model,
 			MaxTokens: agentCoreMemoryExtractMaxTokens,
-			System:   system,
-			Messages: []agentcore.Message{agentcore.TextMessage("user", user)},
+			System:    system,
+			Messages:  []agentcore.Message{agentcore.TextMessage("user", user)},
 		}
 		if eff != "" {
 			req.OutputConfig = &agentcore.OutputConfig{Effort: eff}
@@ -525,4 +534,202 @@ func (m *agentAIManager) agentCoreMemoryExtractCall(ctx context.Context, model, 
 		return text, nil
 	}
 	return "", lastErr
+}
+
+// —— 提取产物落地与收尾钩子(spec §5) ——
+
+// agentCoreMemoryOp 提取 ops 契约(提取 prompt 输出):
+// {"ops":[{"op":"add","content":"…"},{"op":"update","id":7,"content":"…"}]}
+type agentCoreMemoryOp struct {
+	Op      string `json:"op"`
+	ID      int    `json:"id,omitempty"`
+	Content string `json:"content"`
+}
+
+// applyOps 提取产物落地(spec §5)。同步调用方入口(目录经 dirFn 现取);
+// detached goroutine 走 applyOpsAt,不在 goroutine 内触碰 dirFn seam。
+func (s *agentCoreMemoryStore) applyOps(projectPath string, ops []agentCoreMemoryOp) {
+	s.applyOpsAt(s.dirFn(), projectPath, ops)
+}
+
+// applyOpsAt 提取产物落地核心:update 改 content+刷新 last_hit_at(未命中
+// Warn,疑被 LRU 淘汰的对账失败可诊断);add 追加(批内同文只入第一条);
+// 单条超 500 字符丢弃该条+Warn(最小损失面,不截断防残句误导);非法 op
+// 忽略。锁内一次往返。
+func (s *agentCoreMemoryStore) applyOpsAt(dir, projectPath string, ops []agentCoreMemoryOp) {
+	slug := agentCoreMemoryProjectSlug(projectPath)
+	if dir == "" || slug == "" || len(ops) == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	f := s.loadLocked(dir, slug)
+	changed := false
+	seenAdd := map[string]bool{} // 批内 add 去重:同一产物里同文只入第一条
+	for _, op := range ops {
+		content := strings.TrimSpace(op.Content)
+		switch op.Op {
+		case "update":
+			if content == "" || op.ID <= 0 {
+				continue
+			}
+			if len([]rune(content)) > agentCoreMemoryContentCap {
+				logger.Warn(fmt.Sprintf("agentcore-memory: 提取 update 超限丢弃 id=%d len=%d", op.ID, len([]rune(content))))
+				continue
+			}
+			hit := false
+			for i := range f.Memories {
+				if f.Memories[i].ID == op.ID {
+					f.Memories[i].Content = content
+					f.Memories[i].LastHitAt = time.Now().UTC().Format(time.RFC3339)
+					hit = true
+					changed = true
+					break
+				}
+			}
+			if !hit {
+				logger.Warn(fmt.Sprintf("agentcore-memory: 提取 update 未命中条目(疑被 LRU 淘汰) id=%d", op.ID))
+			}
+		case "add":
+			if content == "" {
+				continue
+			}
+			if len([]rune(content)) > agentCoreMemoryContentCap {
+				logger.Warn(fmt.Sprintf("agentcore-memory: 提取 add 超限丢弃 len=%d", len([]rune(content))))
+				continue
+			}
+			if seenAdd[content] {
+				logger.Warn(fmt.Sprintf("agentcore-memory: 提取 add 批内重复跳过 摘要=%.40q", content))
+				continue
+			}
+			seenAdd[content] = true
+			f.Memories = append(f.Memories, agentCoreMemoryEntry{
+				ID: f.NextID, Content: content, Source: "extract",
+				CreatedAt: time.Now().UTC().Format(time.RFC3339),
+			})
+			f.NextID++
+			changed = true
+		}
+	}
+	if !changed {
+		return
+	}
+	s.evictLocked(dir, slug, f)
+	f.Project = projectPath
+	if err := s.saveLocked(dir, slug, f); err != nil {
+		logger.Warn(fmt.Sprintf("agentcore-memory: ops 落盘失败 slug=%s err=%v", slug, err))
+	}
+}
+
+// agentCoreMemoryExtractSystemPrompt 提取规则(system 角色)。禁密钥入记忆是
+// 硬规则(宁漏勿泄);既有条目清单按 last_hit_at 降序前 20 条供 LLM 对账。
+const agentCoreMemoryExtractSystem = `你是记忆提取器。从这轮对话提取值得跨会话长期记住的项目事实,输出严格 JSON,不要输出任何其他文本。
+只提取四类:项目约定、用户偏好、环境事实、踩坑教训。
+禁止:密钥/token/密码/内网地址等敏感值宁漏勿泄;一次性任务细节、代码内容、闲聊一律不记。
+既有记忆清单(可对账去重:已存在的事实若被纠正/补充,输出 update 带其 id;新增输出 add;无值得记的输出空 ops):
+%s
+输出格式:{"ops":[{"op":"add","content":"..."},{"op":"update","id":7,"content":"..."}]}`
+
+// agentCoreMemoryEnabledFn 开关 seam(提取钩子与注入共用,Task 5 消费;禁双轨)。
+var agentCoreMemoryEnabledFn = func() bool {
+	return config.GetGlobalConfig().EffectiveAgentCoreMemoryEnabled()
+}
+
+// truncateRunes 按字符(rune)截断,超长丢弃尾段;短于上限原样返回。
+func truncateRunes(s string, max int) string {
+	if len(s) <= max { // 字节快速路径:字节不超则字符必不超,免 []rune 分配
+		return s
+	}
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max])
+}
+
+// agentCoreMemoryExtractAsync 收尾钩子(spec §5):开关关/输入空/模型不可用
+// 全跳过;ctx 60s 超时;任何失败 Warn 放弃。detached goroutine,run 早已结束。
+// 返回完成信号(goroutine 末尾 close;早退路径同步 close),测试用它替代
+// sleep/轮询建立 happens-before。守卫全部在同步段做完,不满足不起 goroutine
+// ——seam/dirFn 只在调用方 goroutine 读一次存局部变量,与测试 t.Cleanup
+// 还原写无竞态(2026-11-10 -race 实测);goroutine 内一律用捕获的局部值。
+func (m *agentAIManager) agentCoreMemoryExtractAsync(projectPath, model, runEffort, userText, assistantText string) chan struct{} {
+	done := make(chan struct{})
+	skip := func() chan struct{} {
+		close(done)
+		return done
+	}
+	if !agentCoreMemoryEnabledFn() {
+		return skip()
+	}
+	if agentCoreModelUnusable(model) {
+		return skip() // 模型不可用(synthetic/空):提取无从发起,直接放弃
+	}
+	dir := strings.TrimSpace(agentCoreMemory.dirFn())
+	if strings.TrimSpace(projectPath) == "" || dir == "" {
+		return skip()
+	}
+	u, a := truncateRunes(userText, 4000), truncateRunes(assistantText, 4000)
+	if strings.TrimSpace(u) == "" && strings.TrimSpace(a) == "" {
+		return skip()
+	}
+	go func() {
+		defer close(done)
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Warn(fmt.Sprintf("agentcore-memory: 提取 goroutine panic(已吞): %v", r))
+			}
+		}()
+		entries := agentCoreMemory.listAt(dir, projectPath)
+		var dedup strings.Builder
+		for i, e := range entries {
+			if i >= agentCoreMemoryDedupListCap {
+				break
+			}
+			fmt.Fprintf(&dedup, "- [%d] %s\n", e.ID, e.Content)
+		}
+		if dedup.Len() == 0 {
+			dedup.WriteString("(空)")
+		}
+		system := fmt.Sprintf(agentCoreMemoryExtractSystem, dedup.String())
+		user := "本轮用户消息:\n" + u + "\n\n本轮助手结论:\n" + a
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		text, err := m.agentCoreMemoryExtractCall(ctx, model, runEffort, system, user)
+		if err != nil {
+			logger.Warn(fmt.Sprintf("agentcore-memory: 提取调用失败(放弃本次): %v", err))
+			return
+		}
+		var out struct {
+			Ops []agentCoreMemoryOp `json:"ops"`
+		}
+		if err := json.Unmarshal([]byte(strings.TrimSpace(text)), &out); err != nil {
+			logger.Warn(fmt.Sprintf("agentcore-memory: 提取输出非合法 JSON(放弃本次) 摘要=%.200q", text))
+			return
+		}
+		agentCoreMemory.applyOpsAt(dir, projectPath, out.Ops)
+	}()
+	return done
+}
+
+// agentCoreLastUserText 取消息快照最后一条 user 的纯文本(提取输入)。
+// content 是 string 直取;块数组收集 Text 字段拼接;找不到=空串(钩子跳过)。
+func agentCoreLastUserText(messages []agentcore.Message) string {
+	for i := len(messages) - 1; i >= 0; i-- {
+		msg := messages[i]
+		if msg.Role != "user" {
+			continue
+		}
+		switch c := msg.Content.(type) {
+		case string:
+			return c
+		case []agentcore.ContentBlock:
+			var b strings.Builder
+			for _, blk := range c {
+				b.WriteString(blk.Text)
+			}
+			return b.String()
+		}
+	}
+	return ""
 }
