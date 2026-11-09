@@ -276,6 +276,44 @@ func (s *Server) acceptLoop(ctx context.Context, l net.Listener, cfg *gossh.Serv
 	}
 }
 
+// ServeConn 承载一条外部注入的已 accept 连接(统一口分派缝,spec §6.4):
+// 限速检查/握手 deadline/双形态通道收敛与 listener 路径完全同语义,差别只在
+// 「谁 accept」。阻塞至连接结束;Stop 的连接快照拆除与 wg 排水同样覆盖注入
+// 连接(注入前 wg.Add(1),与 acceptLoop 同款记账)。
+//
+// 入口未在运行态时直接关连接返回——与合并前「入口未启动则无人监听、连接被
+// 拒」语义等价;不回显任何协议字节。
+func (s *Server) ServeConn(ctx context.Context, conn net.Conn) {
+	if conn == nil {
+		return
+	}
+	s.mu.Lock()
+	running := s.running
+	s.mu.Unlock()
+	if !running {
+		_ = conn.Close()
+		return
+	}
+
+	// host key 缺失/损坏时此处会生成并落盘——与 Start 同源同锁(ensureHostKey
+	// 内部 hostKeyMu),不会出现双钥并存。
+	signer, err := s.ensureHostKey()
+	if err != nil {
+		logger.Error(fmt.Sprintf("SSH ingress serve injected conn: host key: %v", err))
+		_ = conn.Close()
+		return
+	}
+
+	// 与 acceptLoop 相同的记账顺序:先登记连接再把 wg 计数交给 handleConn
+	// (handleConn 首行 wg.Done)。注入连接不在 acceptLoop 的生命周期内,故
+	// 由本函数自己 Add。
+	s.mu.Lock()
+	s.conns[conn] = struct{}{}
+	s.mu.Unlock()
+	s.wg.Add(1)
+	s.handleConn(ctx, conn, s.serverConfig(signer))
+}
+
 // handleConn 承载一条 TCP 连接:限速检查→SSH 握手→全局请求应答→通道收敛循环。
 func (s *Server) handleConn(ctx context.Context, conn net.Conn, cfg *gossh.ServerConfig) {
 	defer s.wg.Done()

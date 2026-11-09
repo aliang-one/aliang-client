@@ -7,7 +7,9 @@ package ssh
 
 import (
 	"bytes"
+	"context"
 	"fmt"
+	"net"
 	"sort"
 	"sync"
 
@@ -154,4 +156,28 @@ func Addr() string {
 		return ""
 	}
 	return reconcileSrv.Addr()
+}
+
+// HandleIngressConn 是统一口分派的 SSH 入口缝(spec §6.4):把一条已被
+// 56432 嗅探为 SSH 的连接交给当前 reconcile 实例处理。
+//
+// 返回 false = 入口未配置/未启动(期望停),调用方断连且不回显任何协议字节
+// ——与合并前「入口未启动则无人监听、连接被拒」同观感。
+//
+// 锁纪律:只在锁内取实例快照,serve 全在锁外——握手是长事务,持 reconcileMu
+// 会闸住并发的配置提交与状态查询(与 stopReconciledLocked 的短临界区同口径)。
+// 实例被 Reconcile 换掉的瞬间,在途 ServeConn 由其自身 Stop 的连接快照拆除
+// 覆盖,不会静默留活。
+func HandleIngressConn(conn net.Conn) bool {
+	reconcileMu.Lock()
+	srv := reconcileSrv
+	reconcileMu.Unlock()
+	if srv == nil {
+		if conn != nil {
+			_ = conn.Close()
+		}
+		return false
+	}
+	srv.ServeConn(context.Background(), conn)
+	return true
 }
