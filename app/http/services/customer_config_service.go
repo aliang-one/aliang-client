@@ -187,6 +187,7 @@ func (s *CustomerConfigService) UpdateCommittedCustomerConfig(payload []byte) (*
 			closeDisabledAIAcceleratedConnections(previousCfg, &committedCfg)
 			mirror.InitGlobalForwarder()
 			ReconcileSSHIngressFromConfig(&committedCfg)
+			ReconcileUnifiedIngressBinding(&committedCfg)
 			return nil
 		},
 	)
@@ -283,7 +284,43 @@ func ReconcileSSHIngressFromConfig(cfg *config.Config) {
 	sshin.Reconcile(rc, hostKeyPath, GetSharedAgentService().currentDeviceID)
 }
 
-// sshIngressHostKeyPath 解析入口 host key 落盘路径:cache/ssh/ + inbound/ssh
+// ReconcileUnifiedIngressBinding 让统一入口 56432 的实际绑定地址跟上配置的
+// 期望地址(spec §6.2 / D2)。期望地址 = config.UnifiedIngressListenAddrFor:
+// mesh 总开关生效 → 0.0.0.0(对端 LAN 可拨入),否则回环。开/关组网会改变
+// 期望地址,而 listener 只在 StartMitmHttp 的绑定瞬间读一次地址——不重绑
+// 就等于开关不生效(开了组网却还只绑回环 = LAN 拨入被拒)。
+//
+// 与 ReconcileSSHIngressFromConfig 同族、同调用点(customer 配置提交协调
+// 路径 + core/start/tray 启动防漂移),共享「期望态 → 运行态」语义。差别在
+// 作用对象:本函数只重启 listener 的 accept 面,在途连接不受影响(它们持有
+// 自己的 conn,与 listener 脱钩)。
+//
+// 两个前置判据缺一不可:
+//  1. listener 确实在跑(httpProxyIsRunningProbe)——没跑就不管:用户下次
+//     起代理时 StartMitmHttp 会按那时的新地址绑定,这里抢先起口会绕过
+//     run service 的状态机(以及「停代理=停监听」的 D4 契约)。
+//  2. 地址确实不同——相同地址重启是纯抖动(断开在途 accept 面,收益为零)。
+//
+// 刻意的「模式无关」:绑定面只由 mesh 总开关决定(D2),与 HTTP/TUN 入口
+// 模式正交。不按模式加闸,避免「TUN 模式下 56432 恰在跑但绑错」这类漏修。
+//
+// 失败仅日志不上抛(同 ReconcileSSHIngressFromConfig):提交侧不因入口回滚
+// 整套配置,下次提交或下次起代理自然重试。
+func ReconcileUnifiedIngressBinding(cfg *config.Config) {
+	expected := config.UnifiedIngressListenAddrFor(cfg)
+	if !httpProxyIsRunningProbe() {
+		return // 代理没在跑:起口是 run service 的职责,这里不越权
+	}
+	current := unifiedIngressListenAddrProbe()
+	if current == "" || current == expected {
+		return
+	}
+
+	logger.Info(fmt.Sprintf("统一入口绑定地址变更 %s → %s,重启 listener", current, expected))
+	httpStopRunner()
+	go httpStartRunner()
+}
+
 // 导出的 IngressHostKeyFileName。与 host key 指纹 API(ssh_ingress_handler
 // 的 NewSSHIngressHandlerFromCache)同源同口径——编译器强制展示指纹与
 // Server.Start 落盘钥同文件(错位=展示指纹≠实服务钥,Task 6 交接项)。

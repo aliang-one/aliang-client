@@ -49,6 +49,48 @@ func TestSetServiceBindHostRejectsInvalidValueWithoutMutation(t *testing.T) {
 	}
 }
 
+// TestUnifiedIngressListenAddrFollowsMeshSwitch 统一入口 56432 的绑定面
+// (spec D2):mesh 总开关生效 → 0.0.0.0(对端 LAN 可否达,与旧 LAN 载体
+// parity);否则沿用 ServiceBindHost 的安全默认回环。三态指针语义由
+// EffectiveEnabled 定,此处只验绑定面映射。
+func TestUnifiedIngressListenAddrFollowsMeshSwitch(t *testing.T) {
+	resetServiceBindHost(t)
+	ResetGlobalConfigForTest()
+	t.Cleanup(ResetGlobalConfigForTest)
+
+	if got := UnifiedIngressListenAddr(); got != "127.0.0.1:56432" {
+		t.Fatalf("未配置 mesh 时 UnifiedIngressListenAddr() = %q, want 127.0.0.1:56432", got)
+	}
+
+	// Enable 显式 false → 回环(mesh 关不放大暴露面)。
+	off := false
+	SetGlobalConfig(&Config{Customer: &CustomerConfig{Mesh: &MeshConfig{Enable: &off}}})
+	if got := UnifiedIngressListenAddr(); got != "127.0.0.1:56432" {
+		t.Fatalf("mesh 显式关时 = %q, want 127.0.0.1:56432", got)
+	}
+
+	// Enable 显式 true → 0.0.0.0。
+	on := true
+	SetGlobalConfig(&Config{Customer: &CustomerConfig{Mesh: &MeshConfig{Enable: &on}}})
+	if got := UnifiedIngressListenAddr(); got != "0.0.0.0:56432" {
+		t.Fatalf("mesh 开时 = %q, want 0.0.0.0:56432", got)
+	}
+
+	// Enable nil(默认开)→ 0.0.0.0。
+	SetGlobalConfig(&Config{Customer: &CustomerConfig{Mesh: &MeshConfig{}}})
+	if got := UnifiedIngressListenAddr(); got != "0.0.0.0:56432" {
+		t.Fatalf("mesh Enable=nil(默认开)时 = %q, want 0.0.0.0:56432", got)
+	}
+
+	// mesh 开且管理员指定了别的 --host:LAN 可达优先于回环偏好,仍是 0.0.0.0。
+	if err := SetServiceBindHost("192.168.1.9"); err != nil {
+		t.Fatalf("SetServiceBindHost: %v", err)
+	}
+	if got := UnifiedIngressListenAddr(); got != "0.0.0.0:56432" {
+		t.Fatalf("mesh 开 + 指定 host 时 = %q, want 0.0.0.0:56432", got)
+	}
+}
+
 func resetServiceBindHost(t *testing.T) {
 	t.Helper()
 	if err := SetServiceBindHost(DefaultServiceBindHost); err != nil {

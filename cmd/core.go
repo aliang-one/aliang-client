@@ -186,6 +186,10 @@ func initializeCoreSubsystems() error {
 	// 防两处漂移;入口归 core 进程所有(配置提交与路由管线都在 core),
 	// user-agent 侧不接线(拆分所有权重叠,见该函数注释与任务报告)。
 	services.ReconcileSSHIngressFromConfig(config.GetGlobalConfig())
+	// 统一入口绑定防漂移:56432 的绑定面随 mesh 总开关变化,启动期若代理已
+	// 起来(自愈先于本行/上次绑定残留)则按当前配置校正;代理未起时本行为
+	// 空操作(起口归 run service)。与提交协调路径共用同一函数防漂移。
+	services.ReconcileUnifiedIngressBinding(config.GetGlobalConfig())
 
 	logger.Info("Core subsystems initialized")
 	return nil

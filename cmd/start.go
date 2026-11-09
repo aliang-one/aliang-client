@@ -121,6 +121,9 @@ func runStart(cmd *cobra.Command, args []string) error {
 	// services.ReconcileSSHIngressFromConfig 防漂移;daemon 侧
 	// initializeCoreSubsystems 同款接线。
 	services.ReconcileSSHIngressFromConfig(config.GetGlobalConfig())
+	// 统一入口绑定防漂移(同 core.go):56432 绑定面随 mesh 总开关变化,
+	// 代理已在跑则按当前配置校正,未跑则空操作。
+	services.ReconcileUnifiedIngressBinding(config.GetGlobalConfig())
 
 	// 启动服务器
 	logger.Info("Starting aliang server...")

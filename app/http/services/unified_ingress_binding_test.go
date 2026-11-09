@@ -1,0 +1,153 @@
+package services
+
+// ReconcileUnifiedIngressBinding 的语义钉子(spec §6.2 / D2「绑定跟随启用面」):
+// 56432 的绑定地址由 mesh 总开关决定,而 listener 只在 StartMitmHttp 的绑定
+// 瞬间读一次地址 —— 开/关组网若只改配置不重绑,新暴露面/收窄面都不生效。
+// 本文件钉三件事:该重绑时重绑、不该重绑时一动不动、以及「代理没在跑」时
+// 绝不越权起口(那是 run service 的状态机职责,D4「停代理=停监听」)。
+
+import (
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"aliang.one/nursorgate/processor/config"
+)
+
+// ingressBindingProbe 是可注入的运行面替身:running/addr 表当前 listener
+// 实况,stops/starts 记 reconcile 的副作用次数。starts 走原子量,因为实现里
+// 起口在 goroutine 中(start 是阻塞的 accept 循环)。
+type ingressBindingProbe struct {
+	mu      sync.Mutex
+	running bool
+	addr    string
+	stops   int32
+	starts  int32
+}
+
+// install 把三个包级缝换成替身,测试结束自动还原。
+func (p *ingressBindingProbe) install(t *testing.T) {
+	t.Helper()
+	prevRunning, prevAddr := httpProxyIsRunningProbe, unifiedIngressListenAddrProbe
+	prevStop, prevStart := httpStopRunner, httpStartRunner
+	t.Cleanup(func() {
+		httpProxyIsRunningProbe = prevRunning
+		unifiedIngressListenAddrProbe = prevAddr
+		httpStopRunner = prevStop
+		httpStartRunner = prevStart
+	})
+
+	httpProxyIsRunningProbe = func() bool {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return p.running
+	}
+	unifiedIngressListenAddrProbe = func() string {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return p.addr
+	}
+	httpStopRunner = func() {
+		atomic.AddInt32(&p.stops, 1)
+		p.mu.Lock()
+		p.running = false
+		p.mu.Unlock()
+	}
+	httpStartRunner = func() {
+		atomic.AddInt32(&p.starts, 1)
+	}
+}
+
+// waitStarts 等 goroutine 里的起口落到原子量(至多 2s)。
+func (p *ingressBindingProbe) waitStarts(t *testing.T, want int32) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if atomic.LoadInt32(&p.starts) >= want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("start 次数 = %d, 期望 %d", atomic.LoadInt32(&p.starts), want)
+}
+
+// meshConfigForBinding 构造只带 mesh 总开关的最小配置。
+func meshConfigForBinding(enabled *bool) *config.Config {
+	return &config.Config{Customer: &config.CustomerConfig{
+		Mesh: &config.MeshConfig{Enable: enabled},
+	}}
+}
+
+func boolPtrForBinding(v bool) *bool { return &v }
+
+// TestReconcileUnifiedIngressBindingRebindsOnMeshSwitch 绑定地址与期望不符
+// 且 listener 在跑 → 停+起各一次(开组网把回环放宽到 0.0.0.0 的主路径)。
+func TestReconcileUnifiedIngressBindingRebindsOnMeshSwitch(t *testing.T) {
+	probe := &ingressBindingProbe{}
+	probe.install(t)
+	probe.running = true
+	probe.addr = "127.0.0.1:56432"
+
+	ReconcileUnifiedIngressBinding(meshConfigForBinding(boolPtrForBinding(true)))
+
+	if got := atomic.LoadInt32(&probe.stops); got != 1 {
+		t.Fatalf("stop 次数 = %d, want 1", got)
+	}
+	probe.waitStarts(t, 1)
+}
+
+// TestReconcileUnifiedIngressBindingNoopWhenAddrMatches 地址一致时绝不抖动:
+// 重复提交同配置是最常见路径,重启会无谓断开 accept 面。
+func TestReconcileUnifiedIngressBindingNoopWhenAddrMatches(t *testing.T) {
+	probe := &ingressBindingProbe{}
+	probe.install(t)
+	probe.running = true
+	probe.addr = "0.0.0.0:56432"
+
+	ReconcileUnifiedIngressBinding(meshConfigForBinding(boolPtrForBinding(true)))
+
+	time.Sleep(50 * time.Millisecond) // 给可能的异步起口留窗口,再断言为零
+	if got := atomic.LoadInt32(&probe.stops); got != 0 {
+		t.Fatalf("地址一致时不应 stop,实际 %d 次", got)
+	}
+	if got := atomic.LoadInt32(&probe.starts); got != 0 {
+		t.Fatalf("地址一致时不应 start,实际 %d 次", got)
+	}
+}
+
+// TestReconcileUnifiedIngressBindingDoesNotStartWhenProxyStopped 代理没在跑
+// (运行态清单里就没有 56432)→ 不越权起口:起口归 run service,否则「停代理
+// =停监听」的 D4 契约会被配置提交悄悄破坏。
+func TestReconcileUnifiedIngressBindingDoesNotStartWhenProxyStopped(t *testing.T) {
+	probe := &ingressBindingProbe{}
+	probe.install(t)
+	probe.running = false
+	probe.addr = "" // 未绑定
+
+	ReconcileUnifiedIngressBinding(meshConfigForBinding(boolPtrForBinding(true)))
+
+	time.Sleep(50 * time.Millisecond)
+	if got := atomic.LoadInt32(&probe.starts); got != 0 {
+		t.Fatalf("代理未运行时不应越权起口,实际 start %d 次", got)
+	}
+	if got := atomic.LoadInt32(&probe.stops); got != 0 {
+		t.Fatalf("代理未运行时不应 stop,实际 %d 次", got)
+	}
+}
+
+// TestReconcileUnifiedIngressBindingNilConfigFallsBackToLoopback nil 配置
+// (未配置 mesh)按「不开组网」处理:期望回环,若当前绑在 0.0.0.0 则收窄重绑。
+func TestReconcileUnifiedIngressBindingNilConfigFallsBackToLoopback(t *testing.T) {
+	probe := &ingressBindingProbe{}
+	probe.install(t)
+	probe.running = true
+	probe.addr = "0.0.0.0:56432"
+
+	ReconcileUnifiedIngressBinding(nil)
+
+	if got := atomic.LoadInt32(&probe.stops); got != 1 {
+		t.Fatalf("nil 配置下应收窄回环并重绑,stop 次数 = %d", got)
+	}
+	probe.waitStarts(t, 1)
+}
