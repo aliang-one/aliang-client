@@ -392,6 +392,19 @@ func (e *upstreamError) retryable() bool {
 		"server_error", "timeout_error":
 		return true
 	}
+	// 账号级并发限流的文案形态（2026-11-10 vm130 实锤）：部分网关对超并发
+	// 返回非标准 kind（或空 kind）+ 200 信封，文案才是唯一信号。它本质就是
+	// 限流——退避后重试有意义（宿主另有子 agent 并发闸从源头压并发，这里
+	// 只是闸外的兜底，防个别漏网形态直接判死子 run）。
+	msg := strings.ToLower(e.message)
+	for _, marker := range []string{
+		"concurrency limit", "too many concurrent", "concurrent requests",
+		"parallel requests exceed",
+	} {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
 	return false
 }
 

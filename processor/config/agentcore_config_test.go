@@ -158,3 +158,31 @@ func TestEffectiveAgentCoreSkillsEnabled(t *testing.T) {
 		}
 	}
 }
+
+func TestEffectiveAgentCoreSubagentMaxParallel(t *testing.T) {
+	// 并发闸上限（2026-11-10 vm130 事故）：默认 2（保守宁慢勿死）；显式 1..8
+	// 原样；0 = 未配置走默认；负数/越界（手改配置文件绕过保存校验）钳制防御。
+	if got := (&Config{}).EffectiveAgentCoreSubagentMaxParallel(); got != 2 {
+		t.Fatalf("空配置 = %d, want 默认 2", got)
+	}
+	if got := (&Config{Customer: &CustomerConfig{}}).EffectiveAgentCoreSubagentMaxParallel(); got != 2 {
+		t.Fatalf("无 agentcore 块 = %d, want 2", got)
+	}
+	mk := func(v int) *Config {
+		return &Config{Customer: &CustomerConfig{AgentCore: &AgentCoreTuningConfig{SubagentMaxParallel: v}}}
+	}
+	if got := mk(0).EffectiveAgentCoreSubagentMaxParallel(); got != 2 {
+		t.Fatalf("0(未配置) = %d, want 2", got)
+	}
+	for _, v := range []int{1, 2, 4, 8} {
+		if got := mk(v).EffectiveAgentCoreSubagentMaxParallel(); got != v {
+			t.Fatalf("显式 %d = %d", v, got)
+		}
+	}
+	if got := mk(9).EffectiveAgentCoreSubagentMaxParallel(); got != 8 {
+		t.Fatalf("越界 9 = %d, want 钳 8", got)
+	}
+	if got := mk(-1).EffectiveAgentCoreSubagentMaxParallel(); got != 2 {
+		t.Fatalf("负数(手改文件) = %d, want 防御回落 2", got)
+	}
+}

@@ -1325,7 +1325,12 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 	// 在跑子 agent 登记于此，外部端点按 session_id+task_id 下发控制；回合收尾
 	// 由 clearRunning 摘除（与外层 coreSteer 同生命周期）。nil-safe：以下所有
 	// 使用点都容忍 nil。
-	subagentControl := newAgentCoreSubagentControl()
+	// 并发闸（2026-11-10 vm130 事故）：主 LLM 自己占一个上游并发槽，N 个并行
+	// 子 agent 全部直打上游——账号并发限额直接 429 判死子 run，且重试者自身
+	// 也是并发源、退避窗口内兄弟还在打，结构性无解。闸在 LLM 请求之前排队
+	// （排队者零上游占用），容量配置化 customer.agentcore.subagent_max_parallel
+	// （默认 2，保守宁慢勿死）。
+	subagentControl := newAgentCoreSubagentControlWithLimit(config.GetGlobalConfig().EffectiveAgentCoreSubagentMaxParallel())
 	m.attachCoreSubagentControl(run.sessionID, run.runSeq, subagentControl)
 
 	// MCP 工具注入（spec §3）：采集→建连→包桥→注册。全部失败也只是空桥，

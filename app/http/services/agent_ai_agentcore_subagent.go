@@ -543,6 +543,13 @@ func (b *agentCoreSubagentBridge) Execute(ctx context.Context, input map[string]
 			}
 		}
 	}
+	// 并发闸（2026-11-10 vm130 事故）：排队拿槽再起跑——排队中的子 agent 还
+	// 没有 task_id（未 start），面板不可见也不可停，与「审批排队不算运行」
+	// 同口径。ctx 取消时放弃排队（主回合已死，排队无意义）。
+	if err := b.control.acquireRun(ctx); err != nil {
+		return agentcore.ToolResult{Content: "运行已取消，子 agent 未启动（并发排队中被终止）", IsError: true}
+	}
+	defer b.control.releaseRun()
 	var mcpTools []agentcore.Tool
 	if b.mcpTools != nil {
 		mcpTools = b.mcpTools()

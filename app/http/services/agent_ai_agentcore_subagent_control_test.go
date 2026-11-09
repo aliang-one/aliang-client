@@ -696,3 +696,138 @@ func TestSubagentControlAckShape(t *testing.T) {
 		t.Fatalf("结果词越界: %v", last["result"])
 	}
 }
+
+// --- 并发闸（2026-11-10 vm130 事故根治） ---
+
+func TestAgentCoreSubagentConcurrencyGate(t *testing.T) {
+	// limit=2：4 个并发 acquire，2 个立即拿槽、2 个排队；释放后排队者按序补位。
+	c := newAgentCoreSubagentControlWithLimit(2)
+	ctx := context.Background()
+	released := make(chan struct{}, 4)
+	acquired := make(chan int, 4)
+	for i := 0; i < 4; i++ {
+		go func(i int) {
+			if err := c.acquireRun(ctx); err != nil {
+				return
+			}
+			acquired <- i
+			<-released // 持槽直到测试放行
+			c.releaseRun()
+		}(i)
+	}
+	// 恰好 2 个立即拿槽。
+	got := 0
+	deadline := time.After(2 * time.Second)
+	for got < 2 {
+		select {
+		case <-acquired:
+			got++
+		case <-deadline:
+			t.Fatalf("即时拿槽数 = %d, want 2", got)
+		}
+	}
+	select {
+	case <-acquired:
+		t.Fatal("第 3 个不应越过闸")
+	case <-time.After(80 * time.Millisecond):
+	}
+	// 放行一个 → 排队者补位。
+	released <- struct{}{}
+	select {
+	case <-acquired:
+	case <-time.After(2 * time.Second):
+		t.Fatal("释放后排队者未补位")
+	}
+	// 放行剩余三个，全部退出。
+	released <- struct{}{}
+	released <- struct{}{}
+	released <- struct{}{}
+}
+
+func TestAgentCoreSubagentConcurrencyGateCtxCancel(t *testing.T) {
+	// 槽满时 ctx 取消 → 排队者立即放弃（主回合已死，排队无意义）。
+	c := newAgentCoreSubagentControlWithLimit(1)
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := c.acquireRun(ctx); err != nil {
+		t.Fatalf("首槽应立即拿到: %v", err)
+	}
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		cancel()
+	}()
+	if err := c.acquireRun(ctx); err == nil {
+		t.Fatal("ctx 取消后排队者应退出而非死等")
+	}
+	c.releaseRun()
+	// nil 表/无闸：直接放行。
+	var nilC *agentCoreSubagentControl
+	if err := nilC.acquireRun(ctx); err != nil {
+		t.Fatalf("nil 表应放行: %v", err)
+	}
+	noGate := newAgentCoreSubagentControlWithLimit(0)
+	if err := noGate.acquireRun(ctx); err != nil {
+		t.Fatalf("无闸应放行: %v", err)
+	}
+}
+
+// TestAgentCoreSubagentGateSerializesRuns 桥级 e2e：闸容量 1 时两个子 run
+// 串行化——第二个的首轮请求必须晚于第一个的收尾（排队代替撞上游 429 的
+// 结构性验证）。
+func TestAgentCoreSubagentGateSerializesRuns(t *testing.T) {
+	endTurn := agentCoreTextTurn("done", "")
+	var active, peak int32
+	var mu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		active++
+		if active > peak {
+			peak = active
+		}
+		mu.Unlock()
+		time.Sleep(60 * time.Millisecond) // 持流窗口，放大并发检出
+		mu.Lock()
+		active--
+		mu.Unlock()
+		w.Header().Set("content-type", "text/event-stream")
+		fmt.Fprint(w, "data: "+endTurn+"\n\n")
+	}))
+	defer srv.Close()
+	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
+	t.Setenv("ANTHROPIC_MODEL", "")
+
+	control := newAgentCoreSubagentControlWithLimit(1)
+	j := newAgentCoreJournal(t.TempDir())
+	mkBridge := func(name string) *agentCoreSubagentBridge {
+		m := &agentCoreSubagentMirror{
+			registry:  newAgentAISubagentRegistry(),
+			activity:  &agentAIActivity{},
+			sessionID: "s-gate",
+			messageID: "m-gate",
+			journal:   j,
+		}
+		return &agentCoreSubagentBridge{
+			client:      agentcore.NewClient(agentCoreBaseURL()),
+			mainModel:   "glm-5.2",
+			name:        name,
+			description: "测试",
+			body:        "你是测试员。",
+			projectPath: t.TempDir(),
+			mirror:      m,
+			control:     control,
+		}
+	}
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		mkBridge("ga").Execute(context.Background(), map[string]interface{}{"task": "A"}, nil)
+	}()
+	go func() {
+		defer wg.Done()
+		mkBridge("gb").Execute(context.Background(), map[string]interface{}{"task": "B"}, nil)
+	}()
+	wg.Wait()
+	if peak != 1 {
+		t.Fatalf("上游并发峰值 = %d, want 1（闸容量 1 必须串行化）", peak)
+	}
+}

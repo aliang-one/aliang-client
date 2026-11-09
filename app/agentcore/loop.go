@@ -1486,6 +1486,11 @@ func (r *runner) fireOnTurnEnd(toolUses []ContentBlock, stopReason string) {
 		Thinking:   r.turnThinking.String(),
 		ToolCalls:  records,
 		StopReason: stopReason,
+		// Usage 必须带（2026-11-10 vm130 实锤）：宿主的 sidechain journal 逐回合
+		// 记 tokens，漏填时 Usage 指针为 nil、宿主记 0——journal 里 39 个回合
+		// tokens 全 0，用量对账全废。r.usage 是本回合流式累计（finish 路径同源，
+		// 见 finish 的 Usage: &r.usage）。
+		Usage: &r.usage,
 	})
 }
 

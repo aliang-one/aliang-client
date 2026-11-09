@@ -692,10 +692,18 @@ type AgentCoreTuningConfig struct {
 	// true = 显式开启、false = 显式关闭（内核一个 MCP server 都不连）。
 	// 只作用于 agentcore 内核；claude/codex 走各自 CLI 的 MCP 配置，不受它影响。
 	MCPEnabled *bool `json:"mcp_enabled,omitempty"`
-	// SkillsEnabled 是技能注入的全局开关（仪表盘「能力接入 › 技能全局开关」）。
+	// SkillsEnabled 是技能注入的全局开关（仪表盘「能力接入 › 技能全局开关」。
 	// 同样用指针保留三态：nil = 未配置（默认开启）、true/false 显式。只作用于
 	// agentcore 内核。
 	SkillsEnabled *bool `json:"skills_enabled,omitempty"`
+	// SubagentMaxParallel 是并行派发子 agent 的并发上限（2026-11-10 vm130 事故
+	// 根治）。主 LLM 自己占一个上游并发槽，同回合并行 4 个子 agent = 5 路并发
+	// ——上游按账号并发计费/限额时直接 429「Concurrency limit exceeded」，
+	// 且重试者自身也是并发源，退避窗口内兄弟子 agent 还在打，重试耗尽只能
+	// 判死。闸的语义：超出上限的子 run 在宿主侧排队（ctx 感知），拿到槽才
+	// 起跑——排队代替撞限流。0 = 未配置（走默认 2，保守值宁慢勿死）；
+	// 1..8 = 显式上限；负数非法。想拿回 4 路并行的账号并发充裕用户显式配 4。
+	SubagentMaxParallel int `json:"subagent_max_parallel,omitempty"`
 }
 
 // Validate 保存通道(Config.Validate)调用。0 合法(=未配置,走默认);
@@ -706,6 +714,9 @@ func (c *AgentCoreTuningConfig) Validate() error {
 	}
 	if c.MaxIdenticalToolTurns < 0 || c.MaxIdenticalToolTurns > 50 {
 		return fmt.Errorf("agentcore.max_identical_tool_turns 必须在 [0,50] 内(0=用内核默认), got %d", c.MaxIdenticalToolTurns)
+	}
+	if c.SubagentMaxParallel < 0 || c.SubagentMaxParallel > 8 {
+		return fmt.Errorf("agentcore.subagent_max_parallel 必须在 [0,8] 内(0=关闸), got %d", c.SubagentMaxParallel)
 	}
 	return nil
 }
@@ -1053,6 +1064,27 @@ func normalizeSSHIngressKeyLines(lines []string) []string {
 		normalized = append(normalized, line)
 	}
 	return normalized
+}
+
+// agentCoreSubagentMaxParallelDefault 是并行子 agent 并发闸的默认值（2026-11-10
+// vm130 事故）。保守值：主 run + 2 子 agent = 3 路并发，主流账号限额都装得下；
+// 账号并发充裕的用户显式配大（如 4）拿回满速并行。
+const agentCoreSubagentMaxParallelDefault = 2
+
+// EffectiveAgentCoreSubagentMaxParallel 返回并行子 agent 并发闸上限。0 = 未配置
+// 走默认 2；负数（手改配置文件绕过保存校验）与 >8 的越界值同样防御性钳制。
+func (c *Config) EffectiveAgentCoreSubagentMaxParallel() int {
+	if c == nil || c.Customer == nil || c.Customer.AgentCore == nil {
+		return agentCoreSubagentMaxParallelDefault
+	}
+	v := c.Customer.AgentCore.SubagentMaxParallel
+	if v <= 0 {
+		return agentCoreSubagentMaxParallelDefault
+	}
+	if v > 8 {
+		return 8
+	}
+	return v
 }
 
 // EffectiveAgentCoreMaxIdenticalToolTurns 返回打转守卫阈值;未配置(0/nil/负数)

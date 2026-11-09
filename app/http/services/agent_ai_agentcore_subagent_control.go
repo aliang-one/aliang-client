@@ -125,10 +125,48 @@ type agentCoreSubagentControl struct {
 	seq   atomic.Int64
 	subs  map[string]*agentCoreSubagentHandle
 	order []string
+	// sem 是并行子 run 的并发闸（2026-11-10 vm130 事故根治）。nil = 不设限
+	// （配置关闸/测试路径）。容量按 customer.agentcore.subagent_max_parallel
+	// 在 run 装配期定死——run 内固定、跨 run 热更新（新 run 读新配置）。
+	// 闸在 LLM 请求之前拦：排队者不产生上游并发，上游 429 从结构上不可能。
+	sem chan struct{}
 }
 
 func newAgentCoreSubagentControl() *agentCoreSubagentControl {
-	return &agentCoreSubagentControl{subs: make(map[string]*agentCoreSubagentHandle)}
+	return newAgentCoreSubagentControlWithLimit(0)
+}
+
+// newAgentCoreSubagentControlWithLimit 按上限建表。max<=0 不设闸（测试路径/
+// 配置显式放开）。
+func newAgentCoreSubagentControlWithLimit(max int) *agentCoreSubagentControl {
+	c := &agentCoreSubagentControl{subs: make(map[string]*agentCoreSubagentHandle)}
+	if max > 0 {
+		c.sem = make(chan struct{}, max)
+	}
+	return c
+}
+
+// acquireRun 排队拿一个子 run 并发槽。ctx 取消（主回合停止/超时）时放弃排队
+// ——排队者不该在主 run 死后还占着 tool slot 空等。nil 表/nil 闸直接放行。
+func (c *agentCoreSubagentControl) acquireRun(ctx context.Context) error {
+	if c == nil || c.sem == nil {
+		return nil
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case c.sem <- struct{}{}:
+		return nil
+	}
+}
+
+// releaseRun 归还并发槽。幂等安全由 chan 语义保证（多还只会 panic 于容量外
+// ——桥 Execute 的 defer 恰好一次，与 acquire 严格配对）。
+func (c *agentCoreSubagentControl) releaseRun() {
+	if c == nil || c.sem == nil {
+		return
+	}
+	<-c.sem
 }
 
 // register 登记一个在跑子 agent。taskID 为空时自动发号（mirror=nil 的测试
