@@ -289,10 +289,23 @@ describe('deviceSessionToConversation', () => {
       projectPath: '/w',
       model: '',
       effort: '',
+      approvalMode: '',
       deviceSession: entry,
       createdAt: 'c1',
       updatedAt: 'u1',
     });
+  });
+
+  it('回填 approval_mode：续聊时权限 chip 显示真实挡位，而不是假「默认推荐」', () => {
+    // 回归：曾漏映射 approval_mode（后端清单已带该键），设备会话续聊恒显示
+    // 「默认推荐」，且下一条消息重发 create 显式下发空串把服务端挡位抹掉。
+    const conv = deviceSessionToConversation({
+      id: 's12', provider: 'agentcore', approval_mode: 'bypass_all',
+    });
+    expect(conv.approvalMode).toBe('bypass_all');
+    // 非法/缺失值归一为空串（默认推荐），脏输入安全。
+    expect(deviceSessionToConversation({ id: 's13', provider: 'agentcore', approval_mode: 'yolo' }).approvalMode).toBe('');
+    expect(deviceSessionToConversation({ id: 's14', provider: 'agentcore' }).approvalMode).toBe('');
   });
 
   it('回填 model/effort：续聊时设置条显示真实值，而不是假「默认」', () => {

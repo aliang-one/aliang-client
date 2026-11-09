@@ -115,6 +115,27 @@ describe('useDeviceSessions', () => {
     expect(again.deviceSession).toBe(refreshed);
   });
 
+  it('shellForEntry 刷新回填 approval_mode：别端换挡不被已开壳的旧值回滚', async () => {
+    // 回归：清单刷新此前漏回填 approval_mode，已开的设备壳保留建壳时刻旧挡
+    // 位，下一条消息重发 create 显式下发旧值把别端换挡静默回滚。
+    getAgentSessions.mockResolvedValue({ sessions: [AGENTCORE_ENTRY] });
+    const ds = useDeviceSessions();
+    await ds.loadDeviceSessions();
+    const shell = ds.shellForEntry(AGENTCORE_ENTRY);
+
+    const again = ds.shellForEntry({ ...AGENTCORE_ENTRY, approval_mode: 'ask_all' });
+    expect(again).toBe(shell);
+    expect(again.approvalMode).toBe('ask_all');
+    // 显式回默认也必须传播：空串是合法显式值（服务端权威），不能被吞掉
+    const reset = ds.shellForEntry({ ...AGENTCORE_ENTRY, approval_mode: '' });
+    expect(reset.approvalMode).toBe('');
+    // 本地刚切挡在途（pendingConfig）时，清单旧值不得冲掉在途改动
+    shell.pendingConfig = true;
+    const kept = ds.shellForEntry({ ...AGENTCORE_ENTRY, approval_mode: 'bypass_all' });
+    expect(kept.approvalMode).toBe('');
+    shell.pendingConfig = false;
+  });
+
   it('resumeConsumed 后清单刷新不再复活 resume 字段（仅首次 create 语义）', async () => {
     getAgentSessions.mockResolvedValue({ sessions: [CLAUDE_ENTRY] });
     const ds = useDeviceSessions();

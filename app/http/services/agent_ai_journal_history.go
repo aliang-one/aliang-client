@@ -223,6 +223,7 @@ func readAgentCoreJournalHeaderFrom(dir, sessionID string) (agentCoreJournalHead
 	head.origin, _ = row["origin"].(string)
 	head.disabledMCPServers = headerStringList(row["disabled_mcp_servers"])
 	head.disabledSkills = headerStringList(row["disabled_skills"])
+	head.approvalMode, _ = row["approval_mode"].(string)
 	return head, nil
 }
 
