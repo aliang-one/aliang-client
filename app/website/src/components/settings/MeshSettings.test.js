@@ -1,4 +1,5 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { createApp, h } from 'vue';
 
 // SettingsPage.vue → i18n 模块求值会连带 loadLocale()（读 localStorage，
 // 测试环境不保证语言确定性）；mock 掉该依赖（SshIngressSettings.test.js 同
@@ -9,6 +10,9 @@ vi.mock('../../i18n', () => ({ useI18n: () => ({ t: (k) => k }) }));
 import { normalizeMeshConfig, parseMeshRuleTargetCount, MESH_FALLBACK_CLASSES } from './MeshSettings.js';
 import { buildCustomerSavePatch } from '../SettingsPage.vue';
 import { getMeshLanPeers, getMeshStatus } from '../../services/agentApi';
+import MeshSettings from './MeshSettings.vue';
+import en from '../../i18n/en';
+import zh from '../../i18n/zh';
 
 // —— normalizeMeshConfig（线格式归一；SettingsPage 归一化链共用）——
 // 线格式 customer.mesh{enable,forward_enable,max_hops,peers[],fallback}；
@@ -255,5 +259,330 @@ describe('SettingsPage buildCustomerSavePatch（mesh 透传链）', () => {
     const current = { mesh: meshConfigured };
     const same = buildCustomerSavePatch({ mesh: { ...meshConfigured } }, current);
     expect(same).toBeUndefined();
+  });
+});
+
+// —— 挂载级测试（createApp + jsdom 手法，SshIngressSettings.test.js 同范式）——
+// 卡片三路补充只读数据（/api/agent/status、/api/mesh/status、/api/mesh/lan_peers）
+// 全部走 agentApi → 全局 fetch：URL 路由 stub 一次覆盖（信封 code=0 拆 data）。
+const flush = async (rounds = 8) => {
+  for (let i = 0; i < rounds; i += 1) await Promise.resolve();
+};
+
+const mountedApps = [];
+
+function mountCard(config) {
+  const saved = [];
+  const el = document.createElement('div');
+  document.body.appendChild(el);
+  const app = createApp({
+    render: () => h(MeshSettings, {
+      config,
+      onSave: (payload) => saved.push(payload)
+    })
+  });
+  app.mount(el);
+  mountedApps.push({ app, el });
+  return { el, saved };
+}
+
+// 基座配置含全量顶层段（proxy 等），验证 save 载荷是「整配置 + mesh 覆盖」
+// ——SettingsPage 按顶层段浅合并，卡片不得丢掉自己不拥有的段。
+function baseConfig(meshOverrides = {}) {
+  return {
+    proxy: {
+      enable: true,
+      type: 'socks5',
+      server: '127.0.0.1:1080',
+      username: '',
+      password: '',
+      private_key: '',
+      key_passphrase: '',
+      pool_size: 0,
+      jump_servers: []
+    },
+    ai_rules: {},
+    proxy_rules: [],
+    mesh: {
+      enable: true,
+      forward_enable: false,
+      max_hops: 5,
+      peers: [{ device_id: 'dev-b', lan_addrs: ['192.168.1.20:56441'], relay: true }],
+      fallback: { enable: false, classes: [], addr: '' },
+      ...meshOverrides
+    }
+  };
+}
+
+const jsonOk = (data) => ({ ok: true, status: 200, json: async () => ({ code: 0, msg: '', data }) });
+
+const defaultMeshStatus = () => ({
+  device_id: 'dev-a',
+  enable: true,
+  forward_enable: false,
+  lan_listen_port: 56441,
+  peers: [{ device_id: 'dev-b', lan_addrs: ['192.168.1.20:56441'], relay: true }],
+  lan_peers: []
+});
+
+const LAN_PEERS = [
+  { device_id: 'dev-b', mesh_port: 56441, cert_fingerprint: '', last_seen_unix: 123 },
+  { device_id: 'dev-c', mesh_port: 56442, cert_fingerprint: '', last_seen_unix: 122 }
+];
+
+// 三路补充数据的 URL 路由 stub：agentStatus/meshStatus 默认在线+已配置；
+// meshStatusError/agentStatusError 模拟拉取失败（信封失败或网络拒绝）。
+function stubApi({ agentStatus, agentStatusError, meshStatus, meshStatusError, lanPeers } = {}) {
+  vi.stubGlobal('fetch', vi.fn((path) => {
+    if (path === '/api/agent/status') {
+      return agentStatusError
+        ? Promise.reject(new Error('agent down'))
+        : Promise.resolve(jsonOk(agentStatus ?? { runtime: { online: true } }));
+    }
+    if (path === '/api/mesh/status') {
+      return meshStatusError
+        ? Promise.reject(new Error('mesh down'))
+        : Promise.resolve(jsonOk(meshStatus ?? defaultMeshStatus()));
+    }
+    if (path === '/api/mesh/lan_peers') {
+      return Promise.resolve(jsonOk({ peers: lanPeers ?? [] }));
+    }
+    return Promise.reject(new Error(`unexpected fetch: ${path}`));
+  }));
+}
+
+function setField(el, field, value) {
+  const node = el.querySelector(`[data-field="${field}"]`);
+  node.value = value;
+  node.dispatchEvent(new Event('input', { bubbles: true }));
+}
+
+// jsdom 坑：checkbox .click() 不发 change（peer-link 审计存档）——赋 checked 再派发
+function setToggle(el, field, checked) {
+  const node = el.querySelector(`[data-field="${field}"]`);
+  node.checked = checked;
+  node.dispatchEvent(new Event('change', { bubbles: true }));
+}
+
+function selectCandidate(el, field, value) {
+  const node = el.querySelector(`[data-field="${field}"]`);
+  node.value = value;
+  node.dispatchEvent(new Event('change', { bubbles: true }));
+}
+
+function saveButton(el) {
+  return el.querySelector('button[data-mesh-save]');
+}
+
+function clickSave(el) {
+  saveButton(el).click();
+}
+
+function statusPill(el) {
+  return el.querySelector('[data-mesh-status-pill]');
+}
+
+describe('MeshSettings 卡片', () => {
+  beforeEach(() => {
+    stubApi({ lanPeers: LAN_PEERS });
+  });
+
+  afterEach(() => {
+    while (mountedApps.length) {
+      const { app, el } = mountedApps.pop();
+      app.unmount();
+      el.remove();
+    }
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  // —— 状态条三态 + 降级态（离线数据源=/api/agent/status runtime.online,
+  //     AgentSettings runtimeOnline 既有模式;mesh status 拉取失败=降级态）——
+  it('在线（runtime.online=true 且已配置）：绿态 mesh_statusOnline', async () => {
+    const { el } = mountCard(baseConfig());
+    await flush();
+    const pill = statusPill(el);
+    expect(pill.textContent).toContain('mesh_statusOnline');
+    expect(pill.className).toContain('emerald');
+    expect(pill.className).not.toContain('amber');
+  });
+
+  it('离线 + 兜底已启用（保存态 enable+addr）：琥珀 mesh_statusOfflineFallback', async () => {
+    stubApi({ agentStatus: { runtime: { online: false } } });
+    const { el } = mountCard(baseConfig({
+      fallback: { enable: true, classes: ['ai'], addr: '192.168.1.20:56441' }
+    }));
+    await flush();
+    const pill = statusPill(el);
+    expect(pill.textContent).toContain('mesh_statusOfflineFallback');
+    expect(pill.className).toContain('amber');
+  });
+
+  it('离线且无兜底：琥珀 mesh_statusOffline（区别于兜底生效文案）', async () => {
+    stubApi({ agentStatus: { runtime: { online: false } } });
+    const { el } = mountCard(baseConfig());
+    await flush();
+    expect(statusPill(el).textContent).toContain('mesh_statusOffline');
+    expect(statusPill(el).textContent).not.toContain('mesh_statusOfflineFallback');
+  });
+
+  it('未装配（status peers 空+forward=false+无兜底）：灰态 mesh_statusIdle；优先于离线判定', async () => {
+    stubApi({
+      agentStatus: { runtime: { online: false } },
+      meshStatus: { ...defaultMeshStatus(), peers: [], forward_enable: false }
+    });
+    const { el } = mountCard({ ...baseConfig(), mesh: undefined });
+    await flush();
+    const pill = statusPill(el);
+    expect(pill.textContent).toContain('mesh_statusIdle');
+    expect(pill.className).toContain('slate');
+    expect(pill.className).not.toContain('amber');
+  });
+
+  it('mesh status 拉取失败 = 降级态：琥珀 mesh_statusDegraded + 提示（区别于确认离线）', async () => {
+    stubApi({ meshStatusError: true });
+    const { el } = mountCard(baseConfig());
+    await flush();
+    const pill = statusPill(el);
+    expect(pill.textContent).toContain('mesh_statusDegraded');
+    expect(pill.className).toContain('amber');
+    expect(el.textContent).toContain('mesh_statusDegradedHint');
+    // 降级态不误报「兜底生效中」
+    expect(pill.textContent).not.toContain('mesh_statusOfflineFallback');
+  });
+
+  it('卡片挂载拉取 lan_peers 候选并渲染下拉选项', async () => {
+    const { el } = mountCard(baseConfig());
+    await flush();
+    expect(globalThis.fetch).toHaveBeenCalledWith('/api/mesh/lan_peers', expect.anything());
+    const select = el.querySelector('[data-field="meshFallbackCandidate"]');
+    const options = [...select.querySelectorAll('option')];
+    expect(options.map((o) => o.value)).toEqual(['', 'dev-b', 'dev-c']);
+  });
+
+  // —— 兜底常驻卡编辑 + save 载荷 ——
+  it('回显：开关/地址/类别勾选从配置回填', async () => {
+    const { el } = mountCard(baseConfig({
+      fallback: { enable: true, classes: ['ai', 'custom'], addr: '192.168.1.20:56441' }
+    }));
+    await flush();
+    expect(el.querySelector('[data-field="meshFallbackEnable"]').checked).toBe(true);
+    expect(el.querySelector('[data-field="meshFallbackAddr"]').value).toBe('192.168.1.20:56441');
+    expect(el.querySelector('[data-field="meshClassAi"]').checked).toBe(true);
+    expect(el.querySelector('[data-field="meshClassSelf"]').checked).toBe(false);
+    expect(el.querySelector('[data-field="meshClassCustom"]').checked).toBe(true);
+  });
+
+  it('校验：兜底 Enable=true 而 Addr 空 → mesh_validationFallbackAddr + 禁保存', async () => {
+    const { el, saved } = mountCard(baseConfig());
+    await flush();
+    setToggle(el, 'meshFallbackEnable', true);
+    await flush();
+    expect(el.textContent).toContain('mesh_validationFallbackAddr');
+    expect(saveButton(el).disabled).toBe(true);
+    clickSave(el);
+    await flush();
+    expect(saved).toHaveLength(0);
+
+    setField(el, 'meshFallbackAddr', '192.168.1.20:56441');
+    await flush();
+    expect(el.textContent).not.toContain('mesh_validationFallbackAddr');
+    expect(saveButton(el).disabled).toBe(false);
+  });
+
+  it('候选点选：已输 host 补全 host:port；无 host 不产出半截地址', async () => {
+    const { el } = mountCard(baseConfig());
+    await flush();
+    setField(el, 'meshFallbackAddr', '192.168.1.20');
+    selectCandidate(el, 'meshFallbackCandidate', 'dev-b');
+    await flush();
+    expect(el.querySelector('[data-field="meshFallbackAddr"]').value).toBe('192.168.1.20:56441');
+
+    // 完整地址再点选 → 端口被替换为该候选端口
+    selectCandidate(el, 'meshFallbackCandidate', 'dev-c');
+    await flush();
+    expect(el.querySelector('[data-field="meshFallbackAddr"]').value).toBe('192.168.1.20:56442');
+
+    // 清空后点选 → 无 host 不填半截（beacon 候选无源 IP，host 必须手输）
+    setField(el, 'meshFallbackAddr', '');
+    selectCandidate(el, 'meshFallbackCandidate', 'dev-b');
+    await flush();
+    expect(el.querySelector('[data-field="meshFallbackAddr"]').value).toBe('');
+  });
+
+  it('save 载荷：整配置透传 + mesh 恒显式布尔 + peers 规整透传 + fallback 编辑值', async () => {
+    const { el, saved } = mountCard(baseConfig({
+      peers: [{ device_id: ' dev-b ', lan_addrs: ['192.168.1.20:56441'], relay: false }]
+    }));
+    await flush();
+    setToggle(el, 'meshFallbackEnable', true);
+    setField(el, 'meshFallbackAddr', ' 192.168.1.20:56441 ');
+    setToggle(el, 'meshClassSelf', true);
+    setToggle(el, 'meshClassCustom', true);
+    await flush();
+    clickSave(el);
+    await flush();
+    expect(saved).toHaveLength(1);
+    // 整配置透传：父层浅合并不丢其他顶层段
+    expect(saved[0].proxy.server).toBe('127.0.0.1:1080');
+    expect(saved[0].mesh).toEqual({
+      enable: true,
+      forward_enable: false,
+      max_hops: 5,
+      peers: [{ device_id: 'dev-b', lan_addrs: ['192.168.1.20:56441'], relay: false }],
+      fallback: { enable: true, addr: '192.168.1.20:56441', classes: ['self', 'custom'] }
+    });
+    // 恒产出显式布尔（ssh_ingress 先例）：nil 不透传成 undefined
+    expect(typeof saved[0].mesh.enable).toBe('boolean');
+    expect(saved[0].mesh.enable).toBe(true);
+  });
+
+  it('save 载荷：配置缺 mesh 段 → 默认显式布尔（enable=true/forward=false）随兜底一起落盘', async () => {
+    const { el, saved } = mountCard({ ...baseConfig(), mesh: undefined });
+    await flush();
+    setToggle(el, 'meshFallbackEnable', true);
+    setField(el, 'meshFallbackAddr', '10.0.0.5:56441');
+    await flush();
+    clickSave(el);
+    await flush();
+    expect(saved[0].mesh.enable).toBe(true);
+    expect(saved[0].mesh.forward_enable).toBe(false);
+    expect(saved[0].mesh.max_hops).toBe(0);
+    expect(saved[0].mesh.peers).toEqual([]);
+    expect(saved[0].mesh.fallback).toEqual({ enable: true, addr: '10.0.0.5:56441', classes: [] });
+  });
+
+  it('i18n：mesh_* 新键 zh/en 同步存在', () => {
+    const meshKeys = [
+      'mesh_title',
+      'mesh_description',
+      'mesh_statusOnline',
+      'mesh_statusOffline',
+      'mesh_statusOfflineFallback',
+      'mesh_statusDegraded',
+      'mesh_statusDegradedHint',
+      'mesh_statusIdle',
+      'mesh_loading',
+      'mesh_fallbackTitle',
+      'mesh_fallbackDesc',
+      'mesh_fallbackEnable',
+      'mesh_fallbackAddr',
+      'mesh_fallbackAddrPlaceholder',
+      'mesh_fallbackCandidate',
+      'mesh_fallbackCandidatePlaceholder',
+      'mesh_lanPeersEmpty',
+      'mesh_fallbackClasses',
+      'mesh_fallbackClassAI',
+      'mesh_fallbackClassSelf',
+      'mesh_fallbackClassCustom',
+      'mesh_validationFallbackAddr',
+      'mesh_save',
+      'mesh_saving'
+    ];
+    for (const key of meshKeys) {
+      expect(typeof zh[key], `zh.${key}`).toBe('string');
+      expect(typeof en[key], `en.${key}`).toBe('string');
+    }
   });
 });
