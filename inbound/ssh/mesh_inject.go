@@ -6,7 +6,6 @@ package ssh
 import (
 	"bufio"
 	"context"
-	"encoding/json"
 	"fmt"
 	"net"
 	"strconv"
@@ -20,16 +19,16 @@ import (
 	gossh "golang.org/x/crypto/ssh"
 )
 
-// mesh 拒帧错误行码表(窄且稳定,不回写内部细节——对端实现/节点身份
-// 不泄漏)。语义与 mesh 分支 B 侧「错误回源」一致(一行错误行后关流),
-// 但线格式不同:本实现回写一行 JSON 码(如 {"err":"loop"});mesh 分支
-// 的 writeMeshRejectLine 是纯文本行——合并统一时二选一。
+// mesh 拒帧原因短语(spec §6.4 G5 收口:SSH 载体与 TCP 载体统一纯文本
+// 行,短语对齐 HandleMeshConn 的拒绝文案)。窄且稳定,不回写内部细节
+// ——对端实现/节点身份不泄漏。语义与 mesh 分支 B 侧「错误回源」一致:
+// 一行错误行后关流。
 const (
-	meshErrLoop            = "loop"
-	meshErrForwardDisabled = "forward-disabled"
-	meshErrNotAllowed      = "not-allowed"
-	meshErrHopsExceeded    = "hops-exceeded"
-	meshErrDNSUnsupported  = "dns-unsupported"
+	meshRejectDNSUnsupported  = "dns target not supported on ssh carrier"
+	meshRejectForwardDisabled = "forward disabled (customer.mesh.forward_enable)"
+	meshRejectNotAllowedFmt   = "forwarder %q not allowed"
+	meshRejectLoopFmt         = "meshproto: loop detected via %s"
+	meshRejectHopsFmt         = "meshproto: hop limit %d reached"
 )
 
 // meshFrameDefaultPort 是帧目标不带端口时的兜底端口(裸域名/裸 IP 直转
@@ -85,7 +84,7 @@ func injectMeshFrame(ctx context.Context, ch gossh.Channel, connRemote net.Addr,
 	// 合并后集成批次统一启用,本分支不做半套。
 	if strings.HasPrefix(hdr.Target, "dns:") {
 		logger.Debug(fmt.Sprintf("SSH ingress mesh frame from=%s rejected: dns target not supported on ssh carrier", hdr.From))
-		writeMeshRejectLine(ch, meshErrDNSUnsupported)
+		writeMeshRejectLine(ch, meshRejectDNSUnsupported)
 		return
 	}
 
@@ -96,12 +95,12 @@ func injectMeshFrame(ctx context.Context, ch gossh.Channel, connRemote net.Addr,
 		enabled, allowed := rc.ForwardGate()
 		if !enabled {
 			logger.Debug(fmt.Sprintf("SSH ingress mesh frame from=%s rejected: forward disabled", hdr.From))
-			writeMeshRejectLine(ch, meshErrForwardDisabled)
+			writeMeshRejectLine(ch, meshRejectForwardDisabled)
 			return
 		}
 		if !forwarderAllowed(allowed, hdr.From) {
 			logger.Debug(fmt.Sprintf("SSH ingress mesh frame from=%s rejected: not an allowed forwarder", hdr.From))
-			writeMeshRejectLine(ch, meshErrNotAllowed)
+			writeMeshRejectLine(ch, fmt.Sprintf(meshRejectNotAllowedFmt, hdr.From))
 			return
 		}
 	}
@@ -115,7 +114,7 @@ func injectMeshFrame(ctx context.Context, ch gossh.Channel, connRemote net.Addr,
 	}
 	if localID == "" {
 		logger.Debug("SSH ingress mesh frame rejected: local node id unconfigured (form mesh disabled)")
-		writeMeshRejectLine(ch, meshErrForwardDisabled)
+		writeMeshRejectLine(ch, meshRejectForwardDisabled)
 		return
 	}
 
@@ -123,14 +122,14 @@ func injectMeshFrame(ctx context.Context, ch gossh.Channel, connRemote net.Addr,
 	for _, id := range hdr.Via {
 		if id == localID {
 			logger.Debug(fmt.Sprintf("SSH ingress mesh frame from=%s rejected: loop via %s", hdr.From, localID))
-			writeMeshRejectLine(ch, meshErrLoop)
+			writeMeshRejectLine(ch, fmt.Sprintf(meshRejectLoopFmt, localID))
 			return
 		}
 	}
 	// 防环层 2 跳数硬顶:路径字段异常时的数值保险。
 	if hdr.Hops >= MeshHopsHardCap {
 		logger.Debug(fmt.Sprintf("SSH ingress mesh frame from=%s rejected: hops %d reached cap %d", hdr.From, hdr.Hops, MeshHopsHardCap))
-		writeMeshRejectLine(ch, meshErrHopsExceeded)
+		writeMeshRejectLine(ch, fmt.Sprintf(meshRejectHopsFmt, MeshHopsHardCap))
 		return
 	}
 	hdr.AppendHop(localID)
@@ -174,18 +173,15 @@ func injectMeshFrame(ctx context.Context, ch gossh.Channel, connRemote net.Addr,
 	}
 }
 
-// writeMeshRejectLine 向 channel 回写一行 JSON 错误({"err":"<code>"})后由
-// 调用方关闭通道。写入尽力而为:gossh.Channel 无 deadline 语义
-// (channelConn 已知限制同源),错误行单条极小,失联场景由连接拆除/
-// 连接级 ctx 取消兜底,不因回写卡死拒帧路径。
-func writeMeshRejectLine(ch gossh.Channel, code string) {
-	line, err := json.Marshal(struct {
-		Err string `json:"err"`
-	}{code})
-	if err != nil {
-		return
-	}
-	_, _ = ch.Write(append(line, '\n'))
+// writeMeshRejectLine 向 channel 回写一行纯文本拒绝(reason 已格式化),
+// 经 channelConn 适配后委托 processor/tcp.WriteMeshRejectLine——与 TCP 载体
+// 同一实现(G5 收口):行格式/单行转义/写窗口完全同源,对端按同一套解析。
+// 写入尽力而为:gossh.Channel 无 deadline 语义(channelConn 的 SetWriteDeadline
+// 为 no-op),错误行单条极小,失联场景由连接拆除/连接级 ctx 取消兜底,不因
+// 回写卡死拒帧路径。
+func writeMeshRejectLine(ch gossh.Channel, reason string) {
+	conn := &channelConn{Channel: ch, local: &net.TCPAddr{}, remote: &net.TCPAddr{}}
+	tcphandler.WriteMeshRejectLine(conn, reason)
 }
 
 // forwarderAllowed 报告来源 device_id 是否在 ForwardGate 允许列表。

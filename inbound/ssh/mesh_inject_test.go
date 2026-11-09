@@ -42,22 +42,21 @@ func openMeshChannel(t *testing.T, addr string, meshSigner gossh.Signer) gossh.C
 	return ch
 }
 
-// expectMeshReject 断言拒帧语义:先读到一行 JSON 错误 {"err":code},
-// 随后通道被服务端关闭(EOF)。
-func expectMeshReject(t *testing.T, ch gossh.Channel, code string) {
+// expectMeshReject 断言拒帧语义(G5 收口后纯文本行):读到一行含 wantSub
+// 的非空文本,随后通道被服务端关闭(EOF)。行格式与 TCP 载体一致
+// (processor/tcp.WriteMeshRejectLine 同源)。
+func expectMeshReject(t *testing.T, ch gossh.Channel, wantSub string) {
 	t.Helper()
 	line, err := bufio.NewReader(ch).ReadString('\n')
 	if err != nil {
 		t.Fatalf("reject line read: %v", err)
 	}
-	var got struct {
-		Err string `json:"err"`
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" {
+		t.Fatalf("reject line must be non-empty, got %q", line)
 	}
-	if err := json.Unmarshal([]byte(strings.TrimSpace(line)), &got); err != nil {
-		t.Fatalf("reject line is not JSON: %q: %v", line, err)
-	}
-	if got.Err != code {
-		t.Fatalf("reject err = %q, want %q (raw line %q)", got.Err, code, line)
+	if !strings.Contains(trimmed, wantSub) {
+		t.Fatalf("reject line %q must contain %q (unified plain-text reject)", trimmed, wantSub)
 	}
 	if _, err := ch.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
 		t.Fatalf("channel must be closed after reject line, got %v", err)
@@ -252,7 +251,7 @@ func TestMeshFormRejectsLoop(t *testing.T) {
 	if _, err := ch.Write(meshFrameLine("node-a", "self", "example.org:443", []string{"node-a", "node-b"}, 2)); err != nil {
 		t.Fatalf("write frame: %v", err)
 	}
-	expectMeshReject(t, ch, "loop")
+	expectMeshReject(t, ch, "loop detected")
 }
 
 func TestMeshFormRejectsHopsCap(t *testing.T) {
@@ -265,7 +264,7 @@ func TestMeshFormRejectsHopsCap(t *testing.T) {
 	if _, err := ch.Write(meshFrameLine("node-a", "self", "example.org:443", []string{"node-a"}, MeshHopsHardCap)); err != nil {
 		t.Fatalf("write frame: %v", err)
 	}
-	expectMeshReject(t, ch, "hops-exceeded")
+	expectMeshReject(t, ch, "hop limit")
 }
 
 func TestMeshFormRejectsDNSTarget(t *testing.T) {
@@ -279,7 +278,7 @@ func TestMeshFormRejectsDNSTarget(t *testing.T) {
 	if _, err := ch.Write(meshFrameLine("node-a", "custom", "dns:example.org", []string{"node-a"}, 0)); err != nil {
 		t.Fatalf("write frame: %v", err)
 	}
-	expectMeshReject(t, ch, "dns-unsupported")
+	expectMeshReject(t, ch, "dns target not supported")
 }
 
 // TestMeshFormGateClosedWhenDisabled 钉纵深防御:LocalNodeID 未注入
@@ -295,7 +294,7 @@ func TestMeshFormGateClosedWhenDisabled(t *testing.T) {
 	if _, err := ch.Write(meshFrameLine("node-a", "self", "example.org:443", []string{"node-a"}, 0)); err != nil {
 		t.Fatalf("write frame: %v", err)
 	}
-	expectMeshReject(t, ch, "forward-disabled")
+	expectMeshReject(t, ch, "forward disabled")
 }
 
 func TestMeshFormForwardGate(t *testing.T) {
@@ -314,8 +313,8 @@ func TestMeshFormForwardGate(t *testing.T) {
 		gate       func() (bool, []string)
 		wantReject string // 空=应过闸(注入到达)
 	}{
-		{"gate false rejects", func() (bool, []string) { return false, nil }, "forward-disabled"},
-		{"gate true without forwarder rejects", func() (bool, []string) { return true, []string{"node-x"} }, "not-allowed"},
+		{"gate false rejects", func() (bool, []string) { return false, nil }, "forward disabled"},
+		{"gate true without forwarder rejects", func() (bool, []string) { return true, []string{"node-x"} }, "not allowed"},
 		{"gate true with forwarder passes", func() (bool, []string) { return true, []string{"node-a"} }, ""},
 		{"nil gate allows (merge seam)", nil, ""},
 	}
