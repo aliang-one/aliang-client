@@ -218,7 +218,7 @@ func TestAgentCoreSubagentApprovesSerializedAcrossSubruns(t *testing.T) {
 	// wrap；agentCoreSubagentTools 不再自包）——测试直接用同一道门。
 	gate := newAgentCoreApprovalGate()
 	tools := m.agentCoreSubagentTools(agentAIRun{sessionID: "s-approve", projectPath: os.Getenv("HOME"), model: "glm-5.2"},
-		client, nil, gate.wrap(rawApprove), nil, nil, nil)
+		client, nil, gate.wrap(rawApprove), nil, nil, nil, nil)
 	// 原生派发面（2026-11-09）：唯一 task 路由器，两次并发调用以 subagent_type
 	// 选不同角色——审批互斥属性不变（同一道 gate 罩两个并发子 run）。
 	if len(tools) != 1 || tools[0].Name() != "task" {
@@ -320,7 +320,7 @@ func TestAgentCoreSubagentsParallelViaKernelLoop(t *testing.T) {
 	}
 	bridges := m.agentCoreSubagentTools(
 		agentAIRun{sessionID: "s-kernel-parallel", projectPath: t.TempDir(), model: "glm-5.2"},
-		client, &agentcore.ToolEnv{ProjectPath: t.TempDir()}, gate.wrap(rawApprove), nil, nil, visMirror)
+		client, &agentcore.ToolEnv{ProjectPath: t.TempDir()}, gate.wrap(rawApprove), nil, nil, visMirror, nil)
 	if len(bridges) != 1 || bridges[0].Name() != "task" {
 		t.Fatalf("应为唯一 task 路由器, got %+v", bridges)
 	}
