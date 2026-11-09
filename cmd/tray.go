@@ -75,6 +75,9 @@ func runTray(cmd *cobra.Command, args []string) error {
 	// services.ReconcileSSHIngressFromConfig 防漂移;start.go runStart 与
 	// core.go initializeCoreSubsystems 同款接线(三条 core 启动路径齐)。
 	services.ReconcileSSHIngressFromConfig(config.GetGlobalConfig())
+	// 统一入口绑定防漂移(同 core.go/start.go):56432 绑定面随 mesh 总开关
+	// 变化,代理已在跑则按当前配置校正,未跑则空操作。
+	services.ReconcileUnifiedIngressBinding(config.GetGlobalConfig())
 
 	if err := httpServer.StartHttpServer(); err != nil {
 		return fmt.Errorf("failed to start dashboard server for tray mode: %w", err)

@@ -942,8 +942,9 @@ func (c *Config) ValidateMesh(selfDeviceID string) error {
 }
 
 // SSHIngressDefaultPort 是 SSH 入口的默认监听口(与启用段 56431-56433 避让)。
-// 56442 而非 56441:mesh LAN 载体已定 TCP 56441(app/tunnel/mesh_assembly.go
-// DefaultMeshLANPort),双方同绑会先绑者赢、后到者静默降级——换口避让;
+// 56442 而非 56432:SSH 入口与统一代理入口(56432)同绑会先绑者赢、后到者
+// 静默降级——换口避让(独立监听退役后本字段运行面忽略,见 inbound/ssh
+// RunConfig.Port 废弃标注,默认值仅剩配置层语义);
 // 另避开 mesh 提案的 beacon UDP 56440。未发布,零兼容负担。
 const SSHIngressDefaultPort uint16 = 56442
 

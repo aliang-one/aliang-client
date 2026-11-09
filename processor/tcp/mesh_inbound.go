@@ -463,9 +463,16 @@ func servfailDNSResponse(query []byte) []byte {
 }
 
 // writeMeshRejectLine 以一行文本回写错误(design §3.3 错误回源),随后由
-// 调用方关连接。错误文本压成单行,防对端把多行当多次拒绝。
+// 调用方关连接。委托导出薄壳 WriteMeshRejectLine(SSH 载体形态同源复用)。
 func writeMeshRejectLine(conn net.Conn, err error) {
-	msg := strings.ReplaceAll(strings.TrimSpace(err.Error()), "\n", " ")
+	WriteMeshRejectLine(conn, err.Error())
+}
+
+// WriteMeshRejectLine 导出给 SSH 载体形态复用的 mesh 拒绝行(spec §6.4 G5
+// 收口):纯文本一行,行格式与 TCP 载体一致;写入尽力而为(5s 写窗口,
+// 对端失联不卡死拒帧路径)。reason 压成单行,防对端把多行当多次拒绝。
+func WriteMeshRejectLine(conn net.Conn, reason string) {
+	msg := strings.ReplaceAll(strings.TrimSpace(reason), "\n", " ")
 	_ = conn.SetWriteDeadline(time.Now().Add(meshRejectWriteTimeout))
 	_, _ = conn.Write([]byte(msg + "\n"))
 }

@@ -8,6 +8,7 @@ package ssh
 import (
 	"bytes"
 	"fmt"
+	"net"
 	"sort"
 	"sync"
 
@@ -24,8 +25,9 @@ var (
 	reconcileWant runIdentity
 )
 
-// runIdentity 是「是否需要重启」的期望态比对面:端口、凭证集(host key
-// 路径)三者任一变化即重启。
+// runIdentity 是「是否需要重启」的期望态比对面:凭证集或 host key 路径
+// 任一变化即重启(端口已随独立监听退役——统一口 56432 承载,RunConfig.
+// Port 运行面忽略,见 config.go 废弃标注)。
 //
 // 凭证按公钥身份(Marshal 字节,同 publicKeyCallback 比对口径)做集合
 // 语义比较——排序后逐字节,列表顺序变化不触发重启。
@@ -35,7 +37,6 @@ var (
 // 「每次提交必重启」。闭包捕获的单例指针持续有效,不比对也不失新鲜。
 type runIdentity struct {
 	hostKeyPath    string
-	port           uint16
 	authorizedKeys [][]byte
 	meshKeys       [][]byte
 }
@@ -43,7 +44,6 @@ type runIdentity struct {
 func newRunIdentity(rc *RunConfig, hostKeyPath string) runIdentity {
 	return runIdentity{
 		hostKeyPath:    hostKeyPath,
-		port:           rc.Port,
 		authorizedKeys: marshalKeyIdentity(rc.AuthorizedKeys),
 		meshKeys:       marshalKeyIdentity(rc.MeshKeys),
 	}
@@ -51,7 +51,6 @@ func newRunIdentity(rc *RunConfig, hostKeyPath string) runIdentity {
 
 func (a runIdentity) equal(b runIdentity) bool {
 	return a.hostKeyPath == b.hostKeyPath &&
-		a.port == b.port &&
 		keyIdentityEqual(a.authorizedKeys, b.authorizedKeys) &&
 		keyIdentityEqual(a.meshKeys, b.meshKeys)
 }
@@ -93,10 +92,10 @@ func keyIdentityEqual(a, b [][]byte) bool {
 // 启新:同端口无法并存双监听,变更瞬间有短暂断口(服务面可接受,不做
 // 过硬切换)。
 //
-// Bind host 语义(与 56431/56432 服务面同款「默认安全」姿态):Server
-// 监听 config.ServiceBindHost()——默认 127.0.0.1,仅显式 --host 放宽;
-// LAN 开放 SSH 入口需显式 --host 启动,属部署姿态而非配置层语义(配置
-// 里无 host 字段,刻意不发明)。
+// Bind host 语义(统一口收编后):SSH 入口不再自持监听,可达面完全继承
+// 56432 统一入口的绑定策略(config.UnifiedIngressListenAddr:mesh 开
+// 0.0.0.0,否则 ServiceBindHost)——LAN 开放入口不再是独立旋钮,随统一口
+// 绑定面走。
 func Reconcile(rc *RunConfig, hostKeyPath string, localNodeID func() string) {
 	reconcileMu.Lock()
 	defer reconcileMu.Unlock()
@@ -146,12 +145,29 @@ func IsRunning() bool {
 	return reconcileSrv != nil && reconcileSrv.IsRunning()
 }
 
-// Addr 返回 reconcile 管理实例的监听地址(host:port);未跑返回空串。
-func Addr() string {
+// Addr 已随独立监听退役:统一口 56432 承载监听(spec §6.4),入口实例不再
+// 持有自己的 listener,观测面只剩 IsRunning。原消费者(测试/装配层)改用
+// IsRunning + 注入缝(HandleIngressConn)验证。
+// HandleIngressConn 是统一口分派的 SSH 入口缝(spec §6.4):把一条已被
+// 56432 嗅探为 SSH 的连接交给当前 reconcile 实例处理。
+//
+// 返回 false = 入口未配置/未启动(期望停),调用方断连且不回显任何协议字节
+// ——与合并前「入口未启动则无人监听、连接被拒」同观感。
+//
+// 锁纪律:只在锁内取实例快照,serve 全在锁外——握手是长事务,持 reconcileMu
+// 会闸住并发的配置提交与状态查询(与 stopReconciledLocked 的短临界区同口径)。
+// 实例被 Reconcile 换掉的瞬间,在途 ServeConn 由其自身 Stop 的连接快照拆除
+// +根 ctx 兜底覆盖,不会静默留活(评审 B1:注入连接挂 Start 根取消链)。
+func HandleIngressConn(conn net.Conn) bool {
 	reconcileMu.Lock()
-	defer reconcileMu.Unlock()
-	if reconcileSrv == nil {
-		return ""
+	srv := reconcileSrv
+	reconcileMu.Unlock()
+	if srv == nil {
+		if conn != nil {
+			_ = conn.Close()
+		}
+		return false
 	}
-	return reconcileSrv.Addr()
+	srv.ServeConn(conn)
+	return true
 }

@@ -35,8 +35,9 @@ func newTestKey(t *testing.T) (gossh.PublicKey, gossh.Signer) {
 	return signer.PublicKey(), signer
 }
 
-// startTestServer 起一台内置 sshd(Port=0 随机口),host key 落 t.TempDir,
-// t.Cleanup 兜底停机。
+// startTestServer 起一台内置 sshd(独立监听已退役,统一口注入承载——
+// 测试经 serveConnVia 的测试 listener accept→ServeConn 注入),host key
+// 落 t.TempDir,t.Cleanup 兜底停机。
 func startTestServer(t *testing.T, rc RunConfig) (*Server, string) {
 	t.Helper()
 	return startTestServerAt(t, rc, filepath.Join(t.TempDir(), IngressHostKeyFileName))
@@ -49,22 +50,7 @@ func startTestServerAt(t *testing.T, rc RunConfig, hostKeyPath string) (*Server,
 		t.Fatalf("start ssh ingress: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Stop() })
-	return s, dialAddr(t, s)
-}
-
-// dialAddr 取服务实际监听口并拼回环地址(ServiceBindHost 默认 127.0.0.1,
-// 显式拼 127.0.0.1 对 --host 覆盖场景也稳)。
-func dialAddr(t *testing.T, s *Server) string {
-	t.Helper()
-	addr := s.Addr()
-	if addr == "" {
-		t.Fatal("server not running")
-	}
-	_, port, err := net.SplitHostPort(addr)
-	if err != nil {
-		t.Fatalf("split addr %s: %v", addr, err)
-	}
-	return net.JoinHostPort("127.0.0.1", port)
+	return s, serveConnVia(t, s)
 }
 
 // dialIngress 用给定认证方式连入口。成功时注册 t.Cleanup 关闭;失败时
@@ -192,13 +178,16 @@ func TestSSHIngressDisabledRefuses(t *testing.T) {
 	humanPub, signer := newTestKey(t)
 	s, addr := startTestServer(t, RunConfig{AuthorizedKeys: []gossh.PublicKey{humanPub}})
 
-	// 运行中:TCP 层可达(错误要么 nil 要么是认证层错误,不能是拨号层拒绝)。
+	// 运行中:注入缝可达(错误要么 nil 要么是认证层错误,不能是拨号层拒绝)。
 	_, err := dialIngress(t, addr, gossh.PublicKeys(signer))
 	if err != nil && strings.Contains(err.Error(), "connection refused") {
 		t.Fatalf("server must be reachable while running: %v", err)
 	}
 
-	// 停机(=reconcile 层开关关/未启动):连接层直接拒绝。
+	// 停机(=reconcile 层开关关/未启动):注入连接被立即关闭,握手必失败
+	// (统一口收编后测试 listener 仍在,拒绝语义从「TCP 拒连」变为「连接
+	// 被入口拒收即断」;生产里统一口分派见 HandleIngressConn 返回 false)。
+	// 断言:失败必须发生在传输层,不得落到认证层(那意味着入口还在服务)。
 	if err := s.Stop(); err != nil {
 		t.Fatalf("stop: %v", err)
 	}
@@ -206,8 +195,8 @@ func TestSSHIngressDisabledRefuses(t *testing.T) {
 	if err == nil {
 		t.Fatal("dial must fail after stop")
 	}
-	if !strings.Contains(err.Error(), "connection refused") {
-		t.Fatalf("stopped server must refuse at connect layer, got: %v", err)
+	if strings.Contains(err.Error(), "unable to authenticate") {
+		t.Fatalf("stopped server must cut the connection before auth, got auth-level error: %v", err)
 	}
 }
 
