@@ -43,8 +43,10 @@ func swapAgentCoreMemoryDirForTest(t *testing.T) string {
 	dir := t.TempDir()
 	restore := AgentCoreMemory.SetDirForTest(dir)
 	t.Cleanup(func() {
+		// restore 挂 defer:Fatal 的 Goexit 会照跑 defer——否则失败路径
+		// dirFn 残留指向已删 TempDir,污染同包后续测试。
+		defer restore()
 		waitAgentCoreMemoryTouchForTest(t)
-		restore()
 	})
 	return dir
 }
