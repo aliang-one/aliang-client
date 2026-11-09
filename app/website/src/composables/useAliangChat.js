@@ -194,6 +194,401 @@ export function deviceSnapshotTranscriptToMessages(rows, provider, fallbackTs) {
   };
 }
 
+// --- 本地会话跨端回合渲染（2026-11-09 vm22 事故族，导出供单测） ---
+//
+// 手机端向网页正在使用的同一 journal 会话发问后，旧对账把锚点之后**所有**
+// assistant 行拼进最后一个气泡（多答连体）、外来 user 行永不回建（提问隐形）、
+// 活体 delta 续写滞留旧泡或整段丢弃。核心语义：journal 是会话结构的唯一权威，
+// 本地视图是缓存+装饰——快照对账按「回合分段 + 权威修复 + 外来回合补建」
+// 收敛，run 生命周期帧按窗口归属流。纯函数内核 + composable 薄壳装配（同
+// deviceSnapshotTranscriptToMessages 先例）。
+
+// 倒序找首个 running 的 assistant 气泡（原 composable 内联实现上提：纯函数，
+// 供帧处理器/纯内核/测试共用）。
+export function findRunningAssistant(conv) {
+  const msgs = (conv && Array.isArray(conv.messages)) ? conv.messages : [];
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (msgs[i] && msgs[i].role === 'assistant' && msgs[i].status === 'running') return msgs[i];
+  }
+  return null;
+}
+
+// 返回活体 assistant 气泡，必要时产新占位（原内联实现上提 + run 窗口感知）。
+// run 窗口内（conv.runActive，run.started..终态）无 running 泡必产新——外来
+// 回合/选项作答回合的 delta/thinking 不再被「末泡已 done」守卫整段吞掉
+// （2026-11-09 vm22 缺陷③）。窗口外维持旧守卫：终态后的迟到 delta 丢弃，
+// 防空泡垃圾（原注释语义不变）。
+export function ensureAssistantBubble(conv, ts) {
+  if (!conv) return null;
+  const asst = findRunningAssistant(conv);
+  if (asst) return asst;
+  const msgs = Array.isArray(conv.messages) ? conv.messages : [];
+  const last = msgs[msgs.length - 1];
+  if (!conv.runActive
+    && last && last.role === 'assistant' && (last.status === 'done' || last.status === 'error')) {
+    return null;
+  }
+  const fresh = { role: 'assistant', content: '', status: 'running', ts };
+  conv.messages.push(fresh);
+  return fresh;
+}
+
+// 回合启动权威收敛（纯函数）。服务端串行回合语义：新回合 started 即上一回合
+// 已终——滞留 running 的旧泡在此关账（终态帧丢失类的根治口），绝不与新回合
+// 增量合流（挤一泡根因）。ownPending=true 表示本端 send 在途（占位泡即本回合
+// 泡，可能已含先于 run.started 到达的 delta 内容），绝不关账、按复用认领；
+// false（外来回合/后台会话/设备壳）则关账全部 running 后产本回合新泡。
+// 置 runActive/running，返回本回合 ensured 气泡。
+export function beginRunWindow(conv, ts, { ownPending = false } = {}) {
+  if (!conv) return null;
+  conv.runActive = true;
+  conv.running = true;
+  if (!ownPending) {
+    const msgs = Array.isArray(conv.messages) ? conv.messages : [];
+    for (const m of msgs) {
+      if (m && m.role === 'assistant' && m.status === 'running') m.status = 'done';
+    }
+  }
+  return ensureAssistantBubble(conv, ts);
+}
+
+// 回合终态收窗（纯函数）：runActive/running 复位 + 残留 running 泡关账；
+// 返回是否曾有 running 泡（调用方据此决定终态定谳复订阅）。error 气泡由
+// 调用方先置 error，此处只收剩余 running。
+export function endRunWindow(conv) {
+  if (!conv) return false;
+  const had = !!findRunningAssistant(conv);
+  const msgs = Array.isArray(conv.messages) ? conv.messages : [];
+  for (const m of msgs) {
+    if (m && m.role === 'assistant' && m.status === 'running') m.status = 'done';
+  }
+  conv.runActive = false;
+  conv.running = false;
+  return had;
+}
+
+// 会话 running 判定（原内联实现上提 + run 窗口并入）：快照态 OR run 窗口
+// OR 本地气泡推断，三源并集。另一端跑着的会话（壳 running/快照 running）
+// 与本端正在流的会话都算 running——running 期间本端新消息走 steer 分流
+// （跨端统一阶段 2 Task 4 语义），窗口并入后判定不再被滞留旧泡独家把持。
+export function isConversationRunning(conv) {
+  if (!conv) return false;
+  return !!conv.running || !!conv.runActive || !!findRunningAssistant(conv);
+}
+
+// 外来回合启动是否补订阅（纯函数）：run.started 不携带提问行，订阅握手回包
+// （快照）是网页拿到外来 user 行的唯一载体。仅本端命中（matchedById）且非
+// 设备壳的本地会话补订阅——壳走自身快照通道，未命中帧（fallback 兜底）绝不
+// 触发订阅（会话已删/他会话的帧不得放大订阅面）。
+export function runStartedNeedsSnapshot(conv, matchedById) {
+  return !!matchedById && !!conv && !conv.deviceSession
+    && typeof conv.aiSessionId === 'string' && !!conv.aiSessionId;
+}
+
+// 回合终态是否定谳复订阅（纯函数）：journal turn 行终态才齐——恢复会话
+// （recoveredRun）与本回合曾有 running 泡（含外来回合活体补建）的答案全文
+// 由终态后的快照收敛。
+export function runDoneNeedsSnapshot(conv, hadRunning) {
+  return !!conv && !conv.deviceSession
+    && typeof conv.aiSessionId === 'string' && !!conv.aiSessionId
+    && (conv.recoveredRun || hadRunning);
+}
+
+// 快照转录行 + 本地消息 → 对账后的本地消息（纯函数，导出供单测）。
+//
+// 算法（回合分段）：
+//   ① rows（快照读侧已折叠为 user/assistant/system 行）按 user 行切回合；
+//      帽截断孤儿头行（首条 user 行被截走）跳过——回合语义外。
+//   ② 锚 = 最后一个 userRow.message_id 命中本地 user 气泡的回合；无锚整体
+//      no-op（安全语义：本地气泡与 journal 无交集时不越权重排）。
+//   ③ 锚点前区域不动（同引用透传）；锚回合文本按修复律收敛：
+//      - 已定谳（存在后续回合，或快照非 running）：journal 更长即替换（增长
+//        对齐 + 恢复尾巴片段——delta 尾巴与 journal 全文互不为前缀，2026-11-05
+//        「只看到 59 60」形态）；local ⊇ journal 前缀 = 旧对账连体垃圾特征，
+//        替换；双向皆非前缀且 journal 不更长（rune 截断标记）→ 保守不动。
+//      - 流中（末回合 + 快照 running）：仅 journal⊇local 增长式对齐，绝不
+//        收缩（半回合 delta 不许丢）。
+//      - 锚回合无气泡且 journal 有文本 → 补建（吸收旧 noBubble 分支）。
+//   ④ 外来回合逐个补建：user 气泡（journal 同源 messageId/provider/附件；
+//      `.option` 作答行不新建——翻卡即作答，补泡与卡重复）、回合答案气泡
+//      （末回合且 running → running，余 → done）、end(error) 系统条照序。
+//   ⑤ 尾随 running 泡归属：内容非锚回合文本前缀且存在外来回合 → 归末个外来
+//      回合的活体（delta 先于快照落泡的竞态），user 气泡插其前、答案不重复。
+//   ⑥ 无 journal 对应物的本地装饰（失败发送/系统条）按原序保留在所属区域。
+//
+// 幂等：外来气泡二次对账按 messageId/区域复用原对象，零改动即 changed=false
+// （调用方不重赋值不落盘，零渲染抖动）。
+//
+// 返回 { messages, changed, appended, closedRunning, alignedLive, createdRunning }：
+// changed=有改动（调用方重赋值+落盘）；appended=新增泡数（贴底）；
+// closedRunning=关账 running 数（调用方做审批清卡/finishRun 收敛）；
+// alignedLive=流中泡内容被 journal 对齐（调用方打 snapshotCatchupAt 去重窗）；
+// createdRunning=补建了 running 态泡（调用方置 recoveredRun，终态回取全文）。
+export function reconcileLocalSnapshotMessages(localMessages, rows, opts = {}) {
+  const { provider = '', snapshotRunning = false, fallbackTs = 0 } = opts;
+  const local = Array.isArray(localMessages) ? localMessages : [];
+  const list = Array.isArray(rows) ? rows : [];
+  const result = { messages: local, changed: false, appended: 0, closedRunning: 0, alignedLive: false, createdRunning: false };
+  if (!list.length) return result;
+
+  // ① rows → 回合
+  const rounds = [];
+  const tsOf = (r) => (r && typeof r.ts === 'string' && Date.parse(r.ts)) || fallbackTs;
+  for (const row of list) {
+    if (!row) continue;
+    if (row.role === 'user') {
+      rounds.push({ userRow: row, texts: [], notes: [], lastTs: tsOf(row) });
+    } else if (row.role === 'assistant' || row.role === 'system') {
+      if (!rounds.length) continue; // 帽截断孤儿头行
+      const r = rounds[rounds.length - 1];
+      if (row.role === 'assistant' && typeof row.text === 'string' && row.text) r.texts.push(row.text);
+      if (row.role === 'system' && typeof row.text === 'string' && row.text) {
+        r.notes.push({ text: row.text, ts: tsOf(row) });
+      }
+      r.lastTs = tsOf(row) || r.lastTs;
+    }
+  }
+  if (!rounds.length) return result;
+
+  // ② 锚
+  const midIndex = new Map();
+  local.forEach((m, i) => {
+    if (m && m.role === 'user' && typeof m.messageId === 'string' && m.messageId
+      && !midIndex.has(m.messageId)) {
+      midIndex.set(m.messageId, i);
+    }
+  });
+  let anchorIdx = -1;
+  let anchorLocalIdx = -1;
+  for (let i = rounds.length - 1; i >= 0; i--) {
+    const rawMid = rounds[i].userRow && rounds[i].userRow.message_id;
+    const mid = rawMid == null ? '' : String(rawMid);
+    if (mid && midIndex.has(mid)) {
+      anchorIdx = i;
+      anchorLocalIdx = midIndex.get(mid);
+      break;
+    }
+  }
+  if (anchorIdx < 0) return result;
+
+  const anchorRound = rounds[anchorIdx];
+  const foreign = rounds.slice(anchorIdx + 1);
+  const block = local.slice(anchorLocalIdx + 1);
+  const anchorTexts = anchorRound.texts.join('\n\n');
+  const settled = foreign.length > 0 || !snapshotRunning;
+  const isPlainAsst = (m) => !!(m && m.role === 'assistant' && !m.kind && !m.note);
+
+  // 外来回合 mid → 回合序号（复用判定用）
+  const foreignByMid = new Map();
+  foreign.forEach((r, idx) => {
+    const rawMid = r.userRow && r.userRow.message_id;
+    const mid = rawMid == null ? '' : String(rawMid);
+    if (mid) foreignByMid.set(mid, anchorIdx + 1 + idx);
+  });
+
+  // 单回合补建（user 气泡 + 答案泡 + 系统条）。reuseUser/reuseAnswer 传本地
+  // 既有对象则原位复用（幂等），否则新建。liveBubble=该回合活泡已在本地区
+  // （只补 user 行，答案泡由活泡承担）。
+  const emitRound = (k, reuseUser, reuseAnswer, liveBubble) => {
+    const r = rounds[k];
+    const rawMid = r.userRow && r.userRow.message_id;
+    const mid = rawMid == null ? '' : String(rawMid);
+    // `.option` 作答行：已翻卡承载决策，绝不新建 user 泡（既有泡保留）
+    const isOptionRow = /^assistant_.+\.option$/.test(mid);
+    if (reuseUser) {
+      if (!reuseUser.provider) {
+        reuseUser.provider = provider;
+        result.changed = true;
+      }
+      out.push(reuseUser);
+    } else if (!isOptionRow) {
+      const atts = Array.isArray(r.userRow.attachments)
+        ? r.userRow.attachments
+          .filter(a => a && a.ref)
+          .map(a => ({ name: (a && a.name) || '', url: chatAttachmentUrl(a.ref) }))
+        : null;
+      out.push({
+        role: 'user',
+        content: typeof r.userRow.text === 'string' ? r.userRow.text : '',
+        messageId: mid,
+        provider,
+        ts: tsOf(r.userRow),
+        ...(atts && atts.length ? { attachments: atts } : {}),
+      });
+      result.appended++;
+      result.changed = true;
+    }
+    const isLast = k === rounds.length - 1;
+    const liveHere = liveBubble && isLast && snapshotRunning;
+    const text = r.texts.join('\n\n');
+    const answer = liveHere ? liveBubble : reuseAnswer;
+    if (answer) {
+      // 修复律与锚回合同源：流中末回合仅 journal 前缀增长（canAlign 语义）；
+      // 定谳回合 journal 更长即替换（覆盖恢复尾巴片段形态）+ 连体前缀替换。
+      const streaming = isLast && snapshotRunning;
+      if (text && text !== answer.content
+        && (streaming
+          ? text.startsWith(answer.content || '')
+          : (text.length > (answer.content || '').length
+            || (typeof answer.content === 'string' && answer.content.startsWith(text))))) {
+        answer.content = text;
+        result.changed = true;
+      }
+      answer.status = streaming ? 'running' : 'done';
+      out.push(answer);
+    } else if (text || (isLast && snapshotRunning)) {
+      const fresh = {
+        role: 'assistant',
+        content: text,
+        status: (isLast && snapshotRunning) ? 'running' : 'done',
+        ts: r.lastTs || fallbackTs,
+      };
+      out.push(fresh);
+      result.appended++;
+      result.changed = true;
+      if (fresh.status === 'running') result.createdRunning = true;
+    }
+    for (const n of r.notes) {
+      out.push(deviceSystemNoteBubble(n.text, n.ts));
+      result.appended++;
+      result.changed = true;
+    }
+  };
+
+  // ⑤⑥ 区扫描：块内条目按序归区。区界 = 命中外来回合的 user 泡（复用）。
+  // 每区持有 {kind,k,userEntry,items,answerReuse,live};anchor 区候选=最后一个
+  // plain 泡（更早的 running 关账）；尾随 running 且内容非锚文本前缀且存在
+  // 外来回合 → 外来活泡（live），不参与 anchor 修复。
+  const zones = [];
+  let cur = { kind: 'anchor', k: -1, userEntry: null, items: [], answerReuse: null, live: null };
+  for (const entry of block) {
+    if (isPlainAsst(entry)) {
+      if (cur.kind === 'anchor') {
+        cur.items.push({ entry, cls: 'plain' });
+      } else if (!cur.answerReuse && !cur.live) {
+        const c = typeof entry.content === 'string' ? entry.content : '';
+        if (snapshotRunning && entry.status === 'running' && cur.k === rounds.length - 1
+          && !(anchorTexts && c && anchorTexts.startsWith(c))) {
+          cur.live = entry; // 外来回合活体：delta 先于快照落泡
+        } else {
+          cur.answerReuse = entry;
+        }
+      } else {
+        if (entry.status === 'running') {
+          entry.status = 'done';
+          result.closedRunning++;
+          result.changed = true;
+        }
+        cur.items.push({ entry, cls: 'plain' });
+      }
+    } else if (entry && entry.role === 'user') {
+      const mid = typeof entry.messageId === 'string' ? entry.messageId : '';
+      if (mid && foreignByMid.has(mid)) {
+        zones.push(cur);
+        cur = { kind: 'foreign', k: foreignByMid.get(mid), userEntry: entry, items: [], answerReuse: null, live: null };
+      } else {
+        cur.items.push({ entry, cls: 'keep' }); // 失败发送等本地独有物
+      }
+    } else {
+      cur.items.push({ entry, cls: 'keep' }); // 系统条/其他装饰
+    }
+  }
+  zones.push(cur);
+
+  // anchor 区尾随活泡上提（zone 判定只看 foreign 区;anchor 区的活泡单独检出,
+  // 供末回合补建时挂靠——delta 先落泡、快照后到且外来提问无本地泡的竞态形态）
+  let anchorLive = null;
+  for (const z of zones) {
+    if (z.kind !== 'anchor') continue;
+    const plains = z.items.filter(it => it.cls === 'plain').map(it => it.entry);
+    if (!plains.length || !foreign.length || !snapshotRunning) continue;
+    const lastPlain = plains[plains.length - 1];
+    if (lastPlain.status !== 'running') continue;
+    const c = typeof lastPlain.content === 'string' ? lastPlain.content : '';
+    if (anchorTexts && c && anchorTexts.startsWith(c)) continue; // 锚回合自身流泡
+    anchorLive = lastPlain;
+    z.items = z.items.filter(it => it.entry !== lastPlain);
+  }
+
+  // ③④ 分区发射
+  const out = local.slice(0, anchorLocalIdx + 1);
+  let emittedK = anchorIdx;
+  for (const z of zones) {
+    if (z.kind === 'anchor') {
+      const plains = z.items.filter(it => it.cls === 'plain').map(it => it.entry);
+      let candidate = null;
+      for (const e of plains) {
+        if (candidate && candidate.status === 'running') {
+          candidate.status = 'done';
+          result.closedRunning++;
+          result.changed = true;
+        }
+        candidate = e;
+      }
+      if (candidate) {
+        if (settled) {
+          if (candidate.status === 'running') {
+            candidate.status = 'done';
+            result.closedRunning++;
+            result.changed = true;
+          }
+          // 定谳修复律（三形态全覆盖）：journal 更长即替换（增长对齐 + 恢复
+          // 尾巴片段——delta 尾巴与 journal 全文互不为前缀，2026-11-05「只看
+          // 到 59 60」）；local ⊇ journal 前缀 = 旧对账连体垃圾特征，替换；
+          // 双向皆非前缀且 journal 不更长（rune 截断标记等退化）保守不动。
+          const c = candidate.content;
+          if (anchorTexts && anchorTexts !== c
+            && (anchorTexts.length > (c || '').length
+              || (typeof c === 'string' && c.startsWith(anchorTexts)))) {
+            candidate.content = anchorTexts;
+            result.changed = true;
+          }
+        } else if (anchorTexts && anchorTexts !== candidate.content
+          && anchorTexts.startsWith(candidate.content || '')) {
+          // 流中：journal 增长式对齐（canAlign 原语义），绝不收缩
+          candidate.content = anchorTexts;
+          result.alignedLive = true;
+          result.changed = true;
+        }
+      } else if (anchorTexts) {
+        // 锚回合无泡 + journal 有文本 → 补建（旧 noBubble 分支吸收）
+        const fresh = {
+          role: 'assistant',
+          content: anchorTexts,
+          status: settled ? 'done' : 'running',
+          ts: anchorRound.lastTs || fallbackTs,
+        };
+        out.push(fresh);
+        result.appended++;
+        result.changed = true;
+        if (fresh.status === 'running') result.createdRunning = true;
+      }
+      for (const it of z.items) out.push(it.entry);
+    } else {
+      // 区界前的无本地泡外来回合全量补建
+      for (let k = emittedK + 1; k < z.k; k++) emitRound(k, null, null, null);
+      emitRound(z.k, z.userEntry, z.answerReuse, z.live);
+      for (const it of z.items) {
+        if (it.cls === 'plain' && it.entry.status === 'running') {
+          it.entry.status = 'done';
+          result.closedRunning++;
+          result.changed = true;
+        }
+        out.push(it.entry);
+      }
+      emittedK = z.k;
+    }
+  }
+  // 尾冲刷：无区的剩余外来回合（含 anchorLive 挂靠末回合——活泡承担答案，
+  // 只补 user 行，emitRound 对 liveHere 不再产答案泡）
+  for (let k = emittedK + 1; k < rounds.length; k++) {
+    emitRound(k, null, null, (k === rounds.length - 1) ? anchorLive : null);
+  }
+  if (result.appended > 0 || result.closedRunning > 0) result.changed = true;
+  result.messages = out;
+  return result;
+}
+
 // --- 子agent面板 WS 消费链（spec 2026-11-07-subagent-panel §三，导出供单测） ---
 //
 // ai.subagent 帧的消费拆成模块级纯函数（归属守卫+归一+聚合+M1 重拉触发），
@@ -517,14 +912,8 @@ export function useAliangChat() {
 
   // --- 续聊发送分流（跨端统一阶段 2 Task 4） ---
 
-  // 会话「running」判定 = 本地气泡推断（activeRunning）OR 设备壳清单/快照
-  // status（conv.running，composable 原位刷新）。两者并集：另一端跑着的会话
-  // （壳 running 但本地无流式气泡）与本端正在流的会话都算 running。
-  function isConversationRunning(conv) {
-    if (!conv) return false;
-    return !!conv.running || !!findRunningAssistant(conv);
-  }
-
+  // 会话「running」判定:模块级三源并集(快照态 conv.running / run 窗口
+  // conv.runActive / 本地气泡推断)——注释与实现见模块级 isConversationRunning。
   const activeSessionRunning = computed(() => isConversationRunning(activeConversation.value));
 
   // steer 目标（阶段 2 计划钉死 + 评审折叠项）：壳带 managed_conversation_id
@@ -1340,125 +1729,51 @@ export function useAliangChat() {
     shell.running = e.status === 'running';
   }
 
-  // 本地会话快照对账。归属锚定（评审 P1/P2 误种家族的总闸）：journal 的
-  // user 行随消息分发即时落盘、assistant 行在回合/run 终态才落——运行中
-  // 快照尾部的 assistant 行属于**上一回合**，直接前缀延伸/回填会把旧答案
-  // 顶进当前气泡。锚 = transcript 末条 user 行 message_id === 本地末条 user
-  // 气泡 messageId；锚定成立后，本回合输出 = 我们 user 行之后的 assistant
-  // 行（运行中=逐回合 turn 行拼接，结束后=整轮累计最终行），前缀延伸才安全。
+  // 本地会话快照对账（薄壳）。核心语义已上提纯函数 reconcileLocalSnapshot-
+  // Messages（回合分段 + 权威修复 + 外来回合补建；旧「归属锚定/前缀延伸/
+  // 无气泡补建/恢复尾巴补全」四分支全部由其吸收，2026-11-09 vm22 事故族，
+  // 修复律与竞态形态注释见该函数）。本壳只管 composable 侧副作用：在途守卫、
+  // 看门狗武装、收敛结算、审批与权威态同步、落盘与贴底。
   function reconcileLocalSnapshot(e, sessionId) {
     const local = conversations.value.find(c => !c.deviceSession && c.aiSessionId === sessionId);
     if (!local) return;
-    const asst = findRunningAssistant(local);
     const rows = Array.isArray(e.transcript) ? e.transcript : [];
+    const snapshotRunning = e.status === 'running';
     // 本端发送在途（create/ai.message 未落定）：run 可能刚要起跑，此刻的
-    // idle 快照不是终态证据，绝不收敛占位气泡（误收敛=假 done+delta 全丢）。
+    // idle 快照不是终态证据，绝不动消息列表（误收敛=假 done+delta 全丢）。
     const inFlight = local.id === activeId.value && sending.value;
-
-    const localLastUser = [...(local.messages || [])].reverse().find(m => m.role === 'user');
-    const turnIsOurs = !!localLastUser?.messageId
-      && rows.some(r => r && r.role === 'user'
-        && String(r.message_id || '') === String(localLastUser.messageId));
-    let runText = '';
-    if (turnIsOurs) {
-      const userIdx = rows.findIndex(r => r && r.role === 'user'
-        && String(r.message_id || '') === String(localLastUser.messageId));
-      for (let i = userIdx + 1; i < rows.length; i++) {
-        const row = rows[i];
-        if (row && row.role === 'assistant' && typeof row.text === 'string' && row.text) {
-          runText += (runText ? '\n\n' : '') + row.text;
-        }
+    if (!inFlight && rows.length) {
+      const res = reconcileLocalSnapshotMessages(local.messages, rows, {
+        provider: local.provider || '',
+        snapshotRunning,
+        fallbackTs: now(),
+      });
+      if (res.changed) {
+        local.messages = res.messages;
+        if (res.alignedLive) local.snapshotCatchupAt = now(); // 扇出副本去重窗口起点（见 ai.delta）
+        if (res.createdRunning) local.recoveredRun = true; // 补建运行态:后续 delta 只是增量,终态回取全文
+        if (res.appended > 0 && local.id === activeId.value) scrollToBottom();
+        saveToStorage();
       }
-    }
-
-    // 锚定 user 气泡之后本地是否已有 assistant 气泡——「无气泡」形态（占位
-    // 未落盘的刷新窗口/历史陈旧缓存）由快照补建；有气泡则走对齐/收敛。
-    let hasAssistantAfter = false;
-    if (turnIsOurs && localLastUser) {
-      const userIdxLocal = local.messages.findIndex(
-        (m) => m.role === 'user' && m.messageId === localLastUser.messageId
-      );
-      hasAssistantAfter = userIdxLocal >= 0
-        && local.messages.slice(userIdxLocal + 1).some((m) => m.role === 'assistant');
-    }
-
-    if (asst) {
-      const canAlign = !!runText && runText.startsWith(asst.content)
-        && runText.length > asst.content.length;
-      if (e.status === 'running') {
-        // 流继续：锚定成立的 runText 前缀对齐（空气泡回填/部分内容延伸）；
-        // 未锚定（runText 空）绝不种内容。看门狗恢复：onclose 的无条件
-        // disarm 清了计时器，快照证实 run 活着 → 重新武装（此后每帧喂狗）。
-        // 只在「本地是活跃会话或当前无看门狗」时武装——单槽看门狗不能被
-        // 后台对账从活跃会话手里抢走。
-        if (canAlign) {
-          asst.content = runText;
-          local.snapshotCatchupAt = now(); // 扇出副本去重窗口起点（见 ai.delta）
+      if (!snapshotRunning) {
+        // 定谳收敛：journal turn 行终态才齐，权威 idle 快照应用后恢复旗使命
+        // 已尽（终态帧丢失的滞留 running 泡也已由纯内核关账）。
+        local.recoveredRun = false;
+        // 收敛结算镜像旧 done 分支：审批清卡（快照 pending_approvals 为空即
+        // 权威「无在挂」）+ 看门狗解除 + finishRun——不落 finishRun 会把输入
+        // 框永久锁死在 sendDisabled。
+        if (!Array.isArray(e.pending_approvals) || e.pending_approvals.length === 0) {
+          clearApprovalsForSession(local, sessionId);
         }
-        if ((local.id === activeId.value || !idleWatchdogTimer) && !inFlight) {
-          armIdleWatchdog(local);
-        }
-      } else if (!inFlight) {
-        // run 已收敛（快照态不区分 done/error，按完成呈现）：锚定的 runText
-        // 比本地长则对齐补全（journal turn 行在回合结束才落盘——刷新恢复的
-        // 会话此前的 delta 只覆盖刷新点之后的尾巴，头部就在这次快照里补齐）；
-        // sending/看门狗/审批同步收尾——不落 finishRun 会把输入框永久锁死在
-        // sendDisabled。审批清卡镜像 ai.done：run 已结束，快照
-        // pending_approvals 为空即权威「无在挂」。
-        if (canAlign) asst.content = runText;
-        asst.status = 'done';
-        clearApprovalsForSession(local, sessionId);
         if (local.id === activeId.value) disarmIdleWatchdog();
         finishRun(local);
-        if (activeId.value === local.id) scrollToBottom();
       }
-      // inFlight 且收敛态：不动作——终态帧/下一轮快照负责收敛。
-    } else if (!inFlight && turnIsOurs && !hasAssistantAfter) {
-      // 无气泡形态（2026-11-04 刷新丢回答事故主形态）：占位气泡未落盘或
-      // 历史缓存缺答案，快照是唯一真值——running 补建运行态（后续 delta
-      // 经订阅续流落进它）；idle 且 journal 有锚定回答则补建完成气泡，
-      // 历史丢失的回答就此修复。hasAssistantAfter 守卫防对已完成会话
-      // 重复补气泡（全量订阅后每个会话都会收到快照）。
-      if (e.status === 'running') {
-        local.messages.push({
-          role: 'assistant',
-          content: runText || '',
-          status: 'running',
-          ts: now(),
-        });
-        local.recoveredRun = true; // 后续 delta 只是增量,终态后需回取全文
-        if ((local.id === activeId.value || !idleWatchdogTimer) && !inFlight) {
-          armIdleWatchdog(local);
-        }
-        if (activeId.value === local.id) scrollToBottom();
-      } else if (runText) {
-        local.messages.push({
-          role: 'assistant',
-          content: runText,
-          status: 'done',
-          ts: now(),
-        });
-        clearApprovalsForSession(local, sessionId);
-        finishRun(local);
-        if (activeId.value === local.id) scrollToBottom();
-      }
-    } else if (!inFlight && turnIsOurs && hasAssistantAfter && local.recoveredRun) {
-      // 恢复会话的尾巴补全（2026-11-05「只看到 59 60」形态）：恢复后的
-      // delta 只覆盖刷新点之后的增量，done 气泡内容是尾巴碎片；终态回取的
-      // 快照此刻带 journal 全文，直接以全文替换（journal 是该回合的权威
-      // 文本；截断限幅内的更长文本才替换，防退化）。
-      let target = null;
-      for (let i = local.messages.length - 1; i >= 0; i--) {
-        const m = local.messages[i];
-        if (m.role === 'assistant') { target = m; break; }
-      }
-      if (target && target.status === 'done' && runText
-        && runText.length > target.content.length) {
-        target.content = runText;
-        local.recoveredRun = false;
-        finishRun(local);
-        if (activeId.value === local.id) scrollToBottom();
-      }
+    }
+    // running 快照证实 run 活着 → 看门狗再武装（onclose 的无条件 disarm 清了
+    // 计时器）。只在「本地是活跃会话或当前无看门狗」时武装——单槽看门狗不能
+    // 被后台对账从活跃会话手里抢走。
+    if (snapshotRunning && !inFlight && (local.id === activeId.value || !idleWatchdogTimer)) {
+      armIdleWatchdog(local);
     }
     // pending_approvals 恢复与状态分支解耦（审批等待中关窗重进：running
     // 快照同样带在挂审批，任何早退分支都不得丢）。
@@ -1695,30 +2010,9 @@ export function useAliangChat() {
     nextTick(() => inputRef.value?.focus());
   }
 
-  function findRunningAssistant(conv) {
-    const msgs = conv.messages || [];
-    for (let i = msgs.length - 1; i >= 0; i--) {
-      if (msgs[i].role === 'assistant' && msgs[i].status === 'running') return msgs[i];
-    }
-    return null;
-  }
-
-  // Returns the live assistant bubble for a streaming run, creating a fresh
-  // placeholder if sendMessage's placeholder was lost (e.g. page reloaded mid-run
-  // holding a stale session id, or a state desync). Never spawns a stray bubble
-  // after the turn already finished (done/error) — late deltas are then ignored.
-  function ensureAssistantBubble(conv) {
-    const asst = findRunningAssistant(conv);
-    if (asst) return asst;
-    const msgs = conv.messages || [];
-    const last = msgs[msgs.length - 1];
-    if (last && last.role === 'assistant' && (last.status === 'done' || last.status === 'error')) {
-      return null;
-    }
-    const fresh = { role: 'assistant', content: '', status: 'running', ts: now() };
-    conv.messages.push(fresh);
-    return fresh;
-  }
+  // findRunningAssistant/ensureAssistantBubble 上提为模块级纯函数（2026-11-09
+  // vm22 事故族：run 窗口感知/串行回合收敛需要独立单测）——此处不再有闭包版，
+  // 引用解析到模块作用域。
 
   function normalizeConversation(conv) {
     if (!conv || typeof conv !== 'object') return null;
@@ -2580,8 +2874,25 @@ export function useAliangChat() {
         break;
       }
       case 'ai.run.started': {
-        const asst = ensureAssistantBubble(conv);
-        if (asst) asst.status = 'running';
+        // 回合启动权威收敛（beginRunWindow）：服务端串行回合语义——新回合
+        // started 即上一回合已终，滞留 running 旧泡在此关账，绝不与新回合
+        // 增量合流（vm22 挤一泡根因口）。ownPending=sending 在途（本端占位
+        // 即本回合泡，不关账）。外来回合/后台会话由此产泡接住 delta。
+        // matchedById 门控：未命中帧（fallback 兜底挂活跃会话）绝不凭空造泡
+        // /置 runActive——他会话的 run 不得污染活跃会话（旧实现只抬不造）。
+        if (matchedById) {
+          beginRunWindow(conv, now(), { ownPending: conv.id === activeId.value && sending.value });
+          // 外来回合快照拉取：run.started 不携带提问行，订阅握手回包（快照）
+          // 是网页拿到外来 user 行的唯一载体——本端命中即补订阅（inFlight 守卫
+          // 下对本端在途流无副作用）。旧泡关账随 persist 落盘。
+          persist = true;
+          if (runStartedNeedsSnapshot(conv, matchedById)) {
+            sendAI({ type: 'ai.session.subscribe', session_id: conv.aiSessionId });
+          }
+        } else {
+          const asst = findRunningAssistant(conv);
+          if (asst) asst.status = 'running';
+        }
         // 新回合开始：上一手 effort/model 改动已随本回合的 create 生效，
         // 「下轮生效」角标退场（改动只会经 applySessionSettings 挂起）。
         conv.pendingConfig = false;
@@ -2592,7 +2903,7 @@ export function useAliangChat() {
         // 整段推理走 ai.thinking(不带进 journal text),此前落 default 被
         // 静默丢弃——思考阶段(经常数十秒)仪表盘全程隐形,用户看到的是
         // 「始终没有正在输出的对话」。挂进气泡的 thinking 字段随流渲染。
-        const asst = ensureAssistantBubble(conv);
+        const asst = ensureAssistantBubble(conv, now());
         if (!asst) break;
         const delta = e.delta || '';
         if (delta) asst.thinking = (asst.thinking || '') + delta;
@@ -2600,7 +2911,7 @@ export function useAliangChat() {
         break;
       }
       case 'ai.delta': {
-        const asst = ensureAssistantBubble(conv);
+        const asst = ensureAssistantBubble(conv, now());
         if (!asst) break;
         const delta = e.delta || '';
         // 快照对账去重（窄窗口）：subscribe 注册→快照 journal 读之间落进的
@@ -2822,17 +3133,26 @@ export function useAliangChat() {
       }
       case 'ai.done': {
         disarmIdleWatchdog();
-        const asst = findRunningAssistant(conv);
-        if (asst) asst.status = 'done';
+        // 收窗（endRunWindow）：runActive/running 复位 + running 泡关账；
+        // hadRunning 供定谳复订阅判定（含外来回合活体补建的答案全文收敛）。
+        // matchedById 门控同 run.started：未命中帧只关账既有泡，不动 flags。
+        let hadRunning = false;
+        if (matchedById) {
+          hadRunning = endRunWindow(conv);
+        } else {
+          const fallbackAsst = findRunningAssistant(conv);
+          if (fallbackAsst) fallbackAsst.status = 'done';
+        }
         clearApprovalsForSession(conv, e.session_id);
         finishRun(conv);
-        // 恢复会话终态回取（2026-11-05「只看到 59 60」形态）：journal turn
-        // 行在回合结束才落盘——恢复会话收到的 delta 只覆盖刷新点之后的增量，
-        // 头部此刻才第一次可得。再取一次快照，reconcileLocalSnapshot 用
-        // journal 全文对齐补齐。（仅本地会话；设备壳走清单/详情通道。）
-        if (!conv.deviceSession && conv.recoveredRun && conv.aiSessionId) {
+        // 终态定谳复订阅（2026-11-05「只看到 59 60」形态 + vm22 外来回合）：
+        // journal turn 行在回合结束才落盘——恢复会话/活体补建会话收到的
+        // delta 只覆盖片段，全文此刻才第一次可得。再取一次快照，
+        // reconcileLocalSnapshot 用 journal 全文对齐补齐。（仅本地会话；
+        // 设备壳走清单/详情通道。）
+        if (matchedById && runDoneNeedsSnapshot(conv, hadRunning)) {
           // 刻意不清 recoveredRun：终态快照回来时尾巴补全分支还靠它放行，
-          // 补全成功处在 reconcile（runText 全文替换）里落旗。
+          // 补全成功处在 reconcile（journal 全文修复律）里落旗。
           sendAI({ type: 'ai.session.subscribe', session_id: conv.aiSessionId });
         }
         return;
@@ -2858,6 +3178,10 @@ export function useAliangChat() {
           asst.status = 'error';
           if (!asst.content) asst.content = e.error || t('chat_aiError');
         }
+        // 收窗（endRunWindow）：asst 已先置 error，此处收剩余 running + flags。
+        // matchedById 门控同 done/run.started：未命中帧不动 flags（他会话
+        // 帧不得清活跃会话的 run 窗口）。
+        if (matchedById) endRunWindow(conv);
         clearApprovalsForSession(conv, e.session_id);
         finishRun(conv);
         return;
