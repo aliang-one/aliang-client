@@ -5,6 +5,7 @@ package services
 // 与 journal 同族纪律:尽力而为,任何失败只 Warn,绝不影响 run。
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"aliang.one/nursorgate/app/agentcore"
 	"aliang.one/nursorgate/common/logger"
 )
 
@@ -437,4 +439,90 @@ func (AgentCoreMemoryFacade) SetDirForTest(dir string) (restore func()) {
 	prev := agentCoreMemory.dirFn
 	agentCoreMemory.dirFn = func() string { return dir }
 	return func() { agentCoreMemory.dirFn = prev }
+}
+
+// —— 提取调用(spec §5):同端点同模型,effort 回退链+进程锁存 ——
+
+// agentcore 进程级 effort 锁存(spec §5):首次成功即置 Set 并记档——档位可能
+// 是空串(无 effort 终档),故需 Set 配对位区分「未锁存」,否则每回合重吃 400。
+var (
+	agentCoreMemoryEffortLatched    string
+	agentCoreMemoryEffortLatchedSet bool
+)
+
+// agentCoreMemoryExtractMaxTokens 提取输出预算(spec §5):1024 装不下 ops 包络
+// (单条 500 字符≈250-350 token),4096 给足修正 ops 余量。
+const agentCoreMemoryExtractMaxTokens = 4096
+
+// agentCoreMemoryStreamFn 提取 LLM 调用 seam:真身=NewClient+Stream 聚合;
+// 测试注入假身。返回(纯文本, stopReason, err)。
+type agentCoreMemoryStreamFn func(ctx context.Context, req *agentcore.MessagesRequest) (string, string, error)
+
+func (m *agentAIManager) agentCoreMemoryRealStream(ctx context.Context, req *agentcore.MessagesRequest) (string, string, error) {
+	client := agentcore.NewClient(agentCoreBaseURL()).WithAPIKey(agentCoreAuthToken())
+	var b strings.Builder
+	stopReason := ""
+	err := client.Stream(ctx, req, func(ev agentcore.StreamEvent) error {
+		switch ev.Kind {
+		case agentcore.EventText:
+			b.WriteString(ev.Text)
+		case agentcore.EventStop:
+			stopReason = ev.StopReason
+		case agentcore.EventError:
+			return ev.Err
+		}
+		return nil
+	})
+	if err != nil {
+		return "", "", err
+	}
+	return b.String(), stopReason, nil
+}
+
+// agentCoreMemoryExtractCall 同端点同模型提取(spec §5):effort 首选 low,被拒
+// 降归一后 run.effort,再拒无 effort;锁存后直用。非 effort 拒绝的错误不重试。
+// max_tokens 截断定性报错(拒绝半截 JSON,沿 compact.go:324 先例)。
+func (m *agentAIManager) agentCoreMemoryExtractCall(ctx context.Context, model, runEffort, system, user string) (string, error) {
+	stream := m.agentCoreMemoryRealStream
+	if m.coreMemoryCallForTest != nil {
+		stream = m.coreMemoryCallForTest
+	}
+	// 候选档:锁存优先;否则 low → 归一(run.effort) → 无,归一后去重保序。
+	var candidates []string
+	if agentCoreMemoryEffortLatchedSet {
+		candidates = []string{agentCoreMemoryEffortLatched}
+	} else {
+		candidates = []string{"low"}
+		if norm := agentcore.NormalizeEffortLevel(runEffort); norm != "" && norm != "low" {
+			candidates = append(candidates, norm)
+		}
+		candidates = append(candidates, "")
+	}
+	var lastErr error
+	for _, eff := range candidates {
+		req := &agentcore.MessagesRequest{
+			Model:    model,
+			MaxTokens: agentCoreMemoryExtractMaxTokens,
+			System:   system,
+			Messages: []agentcore.Message{agentcore.TextMessage("user", user)},
+		}
+		if eff != "" {
+			req.OutputConfig = &agentcore.OutputConfig{Effort: eff}
+		}
+		text, stop, err := stream(ctx, req)
+		if err != nil {
+			if agentcore.IsEffortRejection(err) && eff != candidates[len(candidates)-1] {
+				logger.Warn(fmt.Sprintf("agentcore-memory: 上游拒绝 effort=%q,降档重试: %v", eff, err))
+				lastErr = err
+				continue
+			}
+			return "", err // 非 effort 拒绝(或终档)不重试
+		}
+		if stop == agentcore.StopReasonMaxTokens {
+			return "", fmt.Errorf("agentcore-memory: 提取输出被 max_tokens 截断,丢弃本次")
+		}
+		agentCoreMemoryEffortLatched, agentCoreMemoryEffortLatchedSet = eff, true
+		return text, nil
+	}
+	return "", lastErr
 }

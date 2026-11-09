@@ -64,6 +64,8 @@ type agentAIManager struct {
 	// coreMCPDialForTest 允许测试注入内存 MCP 会话（忽略 raw 配置直接返回
 	// session）；nil = 用真实 agentCoreMCPDial。仅测试可写。
 	coreMCPDialForTest func(ctx context.Context, raw agentCoreMCPRawServer) (*mcp.ClientSession, func(), error)
+	// coreMemoryCallForTest 记忆提取 LLM 调用 seam(nil=走真身);测试注入假身。
+	coreMemoryCallForTest agentCoreMemoryStreamFn
 	// toolAsk 自有 MCP 交互工具桥(2026-10-16 方案):one-shot --print 下承载
 	// 手机阻塞交互,懒初始化见 ensureToolAskBridge。
 	toolAsk *agentToolAskBridge
