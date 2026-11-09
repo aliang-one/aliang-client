@@ -957,6 +957,10 @@ export default {
   sshIngress_save: '保存 SSH 入口配置',
   sshIngress_saving: '保存中…',
 
+  // -- MeshSettings（mesh 组网卡;键集与 en.js 必须相等,i18n.test.js 守卫）--
+  mesh_title: '节点组网',
+  mesh_description: '多节点转发网：平台不可达时经 LAN／中继载体互转，离线兜底保底出口。',
+
   // -- LogsSettings --
   logs_title: '实时日志',
   logs_runtimeTitle: '运行日志等级',

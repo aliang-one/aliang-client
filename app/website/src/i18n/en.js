@@ -958,6 +958,10 @@ export default {
   sshIngress_save: 'Save SSH ingress',
   sshIngress_saving: 'Saving…',
 
+  // -- MeshSettings (mesh card; key set must equal zh.js, guarded by i18n.test.js) --
+  mesh_title: 'Node Mesh',
+  mesh_description: 'Multi-node forwarding mesh: relay via LAN/carrier when the platform is unreachable, with an offline fallback exit.',
+
   // -- LogsSettings --
   logs_title: 'Live Logs',
   logs_runtimeTitle: 'Runtime Log Level',

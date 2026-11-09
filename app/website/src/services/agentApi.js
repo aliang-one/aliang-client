@@ -135,6 +135,21 @@ export async function setPeerDeviceGates(payload) {
   });
 }
 
+// --- mesh 节点转发网（仪表盘组网卡只读数据源；design §9）---
+// 配置写不走这两个端点——mesh 配置经既有 /api/config/customer 的
+// customer.mesh 段提交（Task 14 后端决策，避免 peer_mcp 两段式复杂度）。
+
+// GET /api/mesh/status：本机 device_id、开关现值、LAN 监听口、已配 peers
+// 与 beacon 候选的只读聚合。拉取失败由调用方降级处理（组网卡状态条降级态）。
+export async function getMeshStatus() {
+  return request('/api/mesh/status', { method: 'GET' });
+}
+
+// GET /api/mesh/lan_peers：LAN beacon 候选（离线可用），供兜底卡 Addr 点选。
+export async function getMeshLanPeers() {
+  return request('/api/mesh/lan_peers', { method: 'GET' });
+}
+
 // --- 文件访问授权（一次性预先授权 macOS 隐私目录） ---
 
 export async function getAgentFileAccess() {
