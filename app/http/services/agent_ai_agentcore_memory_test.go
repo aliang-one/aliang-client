@@ -16,12 +16,36 @@ import (
 	"aliang.one/nursorgate/app/agentcore"
 )
 
-// swapAgentCoreMemoryDirForTest 把包级 store 的目录指向 t.TempDir;测试结束还原。
+// waitAgentCoreMemoryTouchForTest 有界等在途注入 touch goroutine 退出。
+// 注入块每次命中都起 goroutine(同步段已捕获 dir,不再触碰 dirFn seam),
+// 但其写盘晚于测试返回时会与 t.TempDir RemoveAll 相撞(2026-11-10 -race
+// 实测:不等待则 dirFn 数据竞态 + RemoveAll 撞写双炸)。与 Task 4 done
+// channel 同款 happens-before 纪律。
+func waitAgentCoreMemoryTouchForTest(t *testing.T) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		agentCoreMemoryTouchWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("在途注入 touch goroutine 2s 未退出")
+	}
+}
+
+// swapAgentCoreMemoryDirForTest 把包级 store 的目录指向 t.TempDir;测试结束
+// 先等在途 touch goroutine 退出再还原(顺序不可换:还原后 goroutine 写盘
+// 落错目录,等待则堵住 RemoveAll 撞写窗口)。
 func swapAgentCoreMemoryDirForTest(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
 	restore := AgentCoreMemory.SetDirForTest(dir)
-	t.Cleanup(restore)
+	t.Cleanup(func() {
+		waitAgentCoreMemoryTouchForTest(t)
+		restore()
+	})
 	return dir
 }
 
@@ -507,5 +531,107 @@ func TestAgentCoreMemoryExtractFailuresWarnOnly(t *testing.T) {
 	<-done
 	if _, err := os.Stat(filepath.Join(agentCoreMemory.dirFn(), "_p_f2.json")); !os.IsNotExist(err) {
 		t.Fatal("非法 JSON 不得落盘")
+	}
+}
+
+func TestAgentCoreMemoryPromptBlock(t *testing.T) {
+	dir := swapAgentCoreMemoryDirForTest(t)
+	_, _ = agentCoreMemory.addManual("/p/f", "提交信息全中文")
+	blk := agentCoreMemoryPromptBlock("/p/f")
+	if !strings.Contains(blk, "<memory>") || !strings.Contains(blk, "[1] 提交信息全中文") {
+		t.Fatalf("注入块缺失: %q", blk)
+	}
+	if agentCoreMemoryPromptBlock("/p/none") != "" {
+		t.Fatal("空记忆必须零块(prompt 与无记忆逐字节一致)")
+	}
+	_ = dir
+}
+
+func TestAgentCoreMemoryPromptBudget(t *testing.T) {
+	swapAgentCoreMemoryDirForTest(t)
+	for i := 0; i < 30; i++ {
+		_, _ = agentCoreMemory.addManual("/p/g", fmt.Sprintf("条目%03d %s", i, strings.Repeat("内", 300)))
+	}
+	blk := agentCoreMemoryPromptBlock("/p/g")
+	if len([]rune(blk)) > agentCoreMemoryInjectBudgetChars+200 { // 头尾开销余量
+		t.Fatalf("超预算: %d", len([]rune(blk)))
+	}
+	// 新条目(id 大=后写)应保留:块内含最后写入的 id 30,最早的 id 1 被截
+	if !strings.Contains(blk, "[30]") {
+		t.Fatalf("预算应保最新: %q", blk[:200])
+	}
+}
+
+// 注入后 touch 生效:last_hit_at 刷新(等异步落盘)
+func TestAgentCoreMemoryPromptTouchBumps(t *testing.T) {
+	swapAgentCoreMemoryDirForTest(t)
+	_, _ = agentCoreMemory.addManual("/p/h", "会命中")
+	before := agentCoreMemory.list("/p/h")[0].LastHitAt
+	_ = agentCoreMemoryPromptBlock("/p/h")
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		got := agentCoreMemory.list("/p/h")
+		if len(got) == 1 && got[0].LastHitAt != before && got[0].LastHitAt != "" {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("注入后 last_hit_at 必须被异步刷新")
+}
+
+// 多条排序:recency 降序 + 平局 ID 降序(后写靠前)
+func TestAgentCoreMemoryPromptOrder(t *testing.T) {
+	swapAgentCoreMemoryDirForTest(t)
+	for i := 1; i <= 3; i++ {
+		_, _ = agentCoreMemory.addManual("/p/ord", fmt.Sprintf("条目%d", i))
+	}
+	blk := agentCoreMemoryPromptBlock("/p/ord")
+	if strings.Index(blk, "[3]") > strings.Index(blk, "[1]") {
+		t.Fatalf("平局应后写靠前(3 在 1 前): %q", blk)
+	}
+}
+
+// touch 与 DELETE 竞态:已删条目不得被复活
+func TestAgentCoreMemoryTouchAfterDelete(t *testing.T) {
+	swapAgentCoreMemoryDirForTest(t)
+	e, _ := agentCoreMemory.addManual("/p/td", "将删")
+	agentCoreMemory.remove("/p/td", e.ID)
+	agentCoreMemory.touch("/p/td", []int{e.ID}) // 在途 touch 命中已删 id
+	got := agentCoreMemory.list("/p/td")
+	if len(got) != 0 {
+		t.Fatalf("已删条目被 touch 复活: %+v", got)
+	}
+}
+
+// 子 agent prompt 同样带块(同一函数链)
+func TestAgentCoreSystemPromptCarriesMemory(t *testing.T) {
+	swapAgentCoreMemoryDirForTest(t)
+	_, _ = agentCoreMemory.addManual("/p/i", "项目约定X")
+	p := agentCoreSystemPrompt("/p/i")
+	if !strings.Contains(p, "项目约定X") {
+		t.Fatal("子 agent 路径(agentCoreSystemPrompt)也必须注入记忆")
+	}
+}
+
+// 开关关 = 零提取零注入(seam 替换,双覆盖)
+func TestAgentCoreMemoryDisabledKillsBoth(t *testing.T) {
+	swapAgentCoreMemoryDirForTest(t)
+	prev := agentCoreMemoryEnabledFn
+	agentCoreMemoryEnabledFn = func() bool { return false }
+	t.Cleanup(func() { agentCoreMemoryEnabledFn = prev })
+	if agentCoreMemoryPromptBlock("/p/off") != "" {
+		t.Fatal("开关关=注入零块")
+	}
+	m := &agentAIManager{}
+	called := make(chan struct{}, 1)
+	m.coreMemoryCallForTest = func(ctx context.Context, req *agentcore.MessagesRequest) (string, string, error) {
+		called <- struct{}{}
+		return `{"ops":[]}`, "end_turn", nil
+	}
+	m.agentCoreMemoryExtractAsync("/p/off", "m-x", "", "u", "a")
+	select {
+	case <-called:
+		t.Fatal("开关关=不得发起提取调用")
+	case <-time.After(300 * time.Millisecond):
 	}
 }

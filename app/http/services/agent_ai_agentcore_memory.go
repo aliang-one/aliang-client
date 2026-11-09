@@ -373,12 +373,19 @@ type agentCoreMemoryProjectInfo struct {
 }
 
 // touch 注入命中:逐 id 校验条目仍存在才刷 last_hit_at(防与 DELETE 竞态复活,
-// spec §6)。失败只 Warn。
+// spec §6)。失败只 Warn。同步调用方入口(目录经 dirFn 现取);注入 goroutine
+// 走 touchAt,不在 goroutine 内触碰 dirFn seam。
 func (s *agentCoreMemoryStore) touch(projectPath string, ids []int) {
+	s.touchAt(s.dirFn(), projectPath, ids)
+}
+
+// touchAt 同 touch,但存储目录由调用方显式传入(与 listAt/applyOpsAt 同款
+// 两层纪律:goroutine 内零 dirFn 接触,与测试 t.Cleanup 还原写无数据竞态,
+// 2026-11-10 -race 实测)。
+func (s *agentCoreMemoryStore) touchAt(dir, projectPath string, ids []int) {
 	if len(ids) == 0 {
 		return
 	}
-	dir := s.dirFn()
 	slug := agentCoreMemoryProjectSlug(projectPath)
 	if dir == "" || slug == "" {
 		return
@@ -405,6 +412,51 @@ func (s *agentCoreMemoryStore) touch(projectPath string, ids []int) {
 		logger.Warn(fmt.Sprintf("agentcore-memory: touch 落盘失败 slug=%s err=%v", slug, err))
 	}
 }
+
+// agentCoreMemoryPromptBlock 读侧注入(spec §6):空记忆/开关关/无 home=空串
+// (prompt 与无记忆逐字节一致);全量 last_hit_at 降序,6000 字符预算截最旧;
+// 注入即异步 touch 命中(锁内逐 id 校验防 DELETE 竞态复活)。
+func agentCoreMemoryPromptBlock(projectPath string) string {
+	if !agentCoreMemoryEnabledFn() {
+		return ""
+	}
+	entries := agentCoreMemory.list(projectPath)
+	if len(entries) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("<memory>\n项目长期记忆(此前会话沉淀的事实,供参考;与当前对话冲突时以当前对话为准):\n")
+	budget := agentCoreMemoryInjectBudgetChars
+	var hit []int
+	for _, e := range entries {
+		line := fmt.Sprintf("- [%d] %s\n", e.ID, e.Content)
+		if budget-len([]rune(line)) < 0 {
+			break
+		}
+		budget -= len([]rune(line))
+		b.WriteString(line)
+		hit = append(hit, e.ID)
+	}
+	b.WriteString("</memory>\n\n")
+	if len(hit) > 0 {
+		// 同步段拿 dir 局部(两层纪律),goroutine 内零 dirFn 接触;WG 计数
+		// 供测试清理段等 goroutine 退出(与 Task 4 done channel 同款
+		// happens-before),防其写盘与 t.TempDir RemoveAll 相撞。
+		dir := agentCoreMemory.dirFn()
+		agentCoreMemoryTouchWG.Add(1)
+		go func() {
+			defer agentCoreMemoryTouchWG.Done()
+			agentCoreMemory.touchAt(dir, projectPath, hit)
+		}()
+	}
+	return b.String()
+}
+
+// agentCoreMemoryTouchWG 在途注入 touch goroutine 计数;生产无消费者,测试
+// 清理段用它等待 goroutine 退出(无界生产计数、有界消费,泄漏面=毫秒级文件写)。
+var agentCoreMemoryTouchWG sync.WaitGroup
+
+// agentCoreMemoryEnabledFn 已在 Task 4 定义(提取钩子与注入共用同一 seam)。
 
 // AgentCoreMemoryFacade 导出门面:handlers 包经此操作记忆 store——services
 // 内部单例不导出,仓内边界先例=handlers 只用导出 services API(无 import 环:
