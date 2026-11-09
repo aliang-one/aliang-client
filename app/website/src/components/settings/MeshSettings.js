@@ -173,3 +173,29 @@ export function parseMeshRuleTargetCount(rules) {
   }
   return counts;
 }
+
+// proxy_rules 条目 → Map<deviceID, 规则原文[]>（Task 3 详情面板 chips 数据源）。
+// 与 parseMeshRuleTargetCount 同一 splitMeshTail 口径:合法 mesh 条目才归入,
+// 原文按输入顺序保序（chips 展示顺序 = 规则顺序）。
+export function listMeshRulesByPeer(rules) {
+  const grouped = new Map();
+  if (!Array.isArray(rules)) {
+    return grouped;
+  }
+  for (const rule of rules) {
+    if (typeof rule !== 'string') {
+      continue;
+    }
+    const parsed = splitMeshTail(rule);
+    if (!parsed) {
+      continue;
+    }
+    const bucket = grouped.get(parsed.deviceId);
+    if (bucket) {
+      bucket.push(rule);
+    } else {
+      grouped.set(parsed.deviceId, [rule]);
+    }
+  }
+  return grouped;
+}

@@ -276,18 +276,22 @@ const mountedApps = [];
 
 function mountCard(config, extraProps = {}) {
   const saved = [];
+  let card = null;
   const el = document.createElement('div');
   document.body.appendChild(el);
   const app = createApp({
     render: () => h(MeshSettings, {
       config,
       ...extraProps,
+      // 函数 ref：暴露子组件实例供画布位置等具名方法调用（jsdom 无布局，
+      // 真拖拽链路 pointer 事件不可测，直接测具名方法）
+      ref: (instance) => { card = instance; },
       onSave: (payload) => saved.push(payload)
     })
   });
   app.mount(el);
   mountedApps.push({ app, el });
-  return { el, saved };
+  return { el, saved, card: () => card };
 }
 
 // 基座配置含全量顶层段（proxy 等），验证 save 载荷是「整配置 + mesh 覆盖」
@@ -628,6 +632,198 @@ describe('MeshSettings 卡片', () => {
       'mesh_saving'
     ];
     for (const key of meshKeys) {
+      expect(typeof zh[key], `zh.${key}`).toBe('string');
+      expect(typeof en[key], `en.${key}`).toBe('string');
+    }
+  });
+});
+
+// —— Task 3:SVG 拓扑画布（本机居中 + peers 自动布局;连线=节点对容器,
+//    徽标=该 peer 的 mesh 规则条数;点击连线/节点 → 右栏详情;
+//    拖拽位置 localStorage 持久,重挂载复原）——
+const CANVAS_RULES = [
+  'x.com,mesh:dev-b',
+  'y.com,mesh:dev-b,direct',
+  'z.com,mesh:dev-c',
+  'dns',
+  'geoip:cn,proxy'
+];
+
+function canvasConfig(meshOverrides = {}) {
+  return {
+    ...baseConfig(meshOverrides),
+    proxy_rules: CANVAS_RULES,
+    mesh: {
+      enable: true,
+      forward_enable: false,
+      max_hops: 5,
+      peers: [
+        { device_id: 'dev-b', lan_addrs: ['192.168.1.20:56441'], relay: true },
+        { device_id: 'dev-c', lan_addrs: ['192.168.1.21:56441'], relay: true }
+      ],
+      fallback: { enable: false, classes: [], addr: '' },
+      ...meshOverrides
+    }
+  };
+}
+
+const canvasEl = (el) => el.querySelector('[data-mesh-canvas]');
+const nodeIds = (el) => [...el.querySelectorAll('[data-mesh-node]')].map((n) => n.dataset.meshNode);
+const nodeRect = (el, deviceId) => el.querySelector(`[data-mesh-node="${deviceId}"] rect`);
+const edgeLine = (el, peerId) => el.querySelector(`[data-mesh-edge="${peerId}"]`);
+const badgeOf = (el, peerId) => el.querySelector(`[data-mesh-badge="${peerId}"]`);
+
+describe('MeshSettings 拓扑画布', () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+    stubApi({ lanPeers: LAN_PEERS });
+  });
+
+  afterEach(() => {
+    while (mountedApps.length) {
+      const { app, el } = mountedApps.pop();
+      app.unmount();
+      el.remove();
+    }
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+    window.localStorage.clear();
+  });
+
+  it('本机节点居中、peers 环形布局渲染（device_id 标签 + 本机 LAN 端口）', async () => {
+    const { el } = mountCard(canvasConfig());
+    await flush();
+    const ids = nodeIds(el);
+    expect(ids).toContain('dev-a'); // 本机（mesh status.device_id）
+    expect(ids).toContain('dev-b');
+    expect(ids).toContain('dev-c');
+    // 本机居中：rect x = 320 - 60, y = 180 - 24
+    expect(nodeRect(el, 'dev-a').getAttribute('x')).toBe('260');
+    expect(nodeRect(el, 'dev-a').getAttribute('y')).toBe('156');
+    // 本机额外显示 LAN 监听口
+    expect(el.querySelector('[data-mesh-node="dev-a"]').textContent).toContain('dev-a');
+    expect(el.querySelector('[data-mesh-node="dev-a"]').textContent).toContain(':56441');
+    // peers 环绕：第一个 peer 在正上方（angle -π/2 → y = 180-110 = 70 → rect y 46）
+    expect(nodeRect(el, 'dev-b').getAttribute('y')).toBe('46');
+    // dev-c 为第二个 peer（angle π/2 → 正下方 y = 290 → rect y 266）
+    expect(nodeRect(el, 'dev-c').getAttribute('y')).toBe('266');
+  });
+
+  it('连线徽标=该 peer 的 mesh 规则条数（策略段形式计入、非 mesh 条目不计入）', async () => {
+    const { el } = mountCard(canvasConfig());
+    await flush();
+    // dev-b 两条（含 mesh:dev-b,direct 策略段形式）
+    expect(badgeOf(el, 'dev-b').textContent.trim()).toBe('2');
+    expect(badgeOf(el, 'dev-c').textContent.trim()).toBe('1');
+    // 无规则 peer 不画连线（配置有该 peer 但规则数为 0）
+    const lonely = canvasConfig({
+      peers: [
+        { device_id: 'dev-b', lan_addrs: [], relay: true },
+        { device_id: 'dev-d', lan_addrs: [], relay: true }
+      ]
+    });
+    const second = mountCard(lonely);
+    await flush();
+    expect(edgeLine(second.el, 'dev-b')).not.toBeNull();
+    expect(edgeLine(second.el, 'dev-d')).toBeNull();
+  });
+
+  it('点击连线 → 右栏节点对详情（本机→peer + 规则 chips 原文保序）', async () => {
+    const { el } = mountCard(canvasConfig());
+    await flush();
+    expect(el.querySelector('[data-mesh-detail]').textContent).toContain('mesh_detailPlaceholder');
+    edgeLine(el, 'dev-b').dispatchEvent(new Event('click', { bubbles: true }));
+    await flush();
+    const detail = el.querySelector('[data-mesh-detail]');
+    expect(detail.textContent).toContain('mesh_pairDetailTitle');
+    expect(detail.textContent).toContain('dev-b');
+    const chips = [...detail.querySelectorAll('[data-mesh-rule-chip]')].map((c) => c.textContent.trim());
+    expect(chips).toEqual(['x.com,mesh:dev-b', 'y.com,mesh:dev-b,direct']);
+  });
+
+  it('点击节点 → 右栏节点详情（规则 chips + 被引用节点对数）', async () => {
+    const { el } = mountCard(canvasConfig());
+    await flush();
+    el.querySelector('[data-mesh-node="dev-c"]').dispatchEvent(new Event('click', { bubbles: true }));
+    await flush();
+    const detail = el.querySelector('[data-mesh-detail]');
+    expect(detail.textContent).toContain('mesh_nodeDetailTitle');
+    expect(detail.textContent).toContain('dev-c');
+    expect(detail.textContent).toContain('mesh_dependedBy');
+    const chips = [...detail.querySelectorAll('[data-mesh-rule-chip]')].map((c) => c.textContent.trim());
+    expect(chips).toEqual(['z.com,mesh:dev-c']);
+  });
+
+  it('拖拽位置持久：setNodePosition 写 localStorage，重挂载复原（含连线端点跟随）', async () => {
+    const first = mountCard(canvasConfig());
+    await flush();
+    first.card().setNodePosition('dev-b', 100, 300);
+    await flush();
+    // 位置已写入 localStorage
+    const stored = JSON.parse(window.localStorage.getItem('meshNodePositions'));
+    expect(stored['dev-b']).toEqual({ x: 100, y: 300 });
+    // 连线端点跟随节点新位置
+    const line = edgeLine(first.el, 'dev-b');
+    expect(Number(line.getAttribute('x2'))).toBe(100);
+    expect(Number(line.getAttribute('y2'))).toBe(300);
+    expect(nodeRect(first.el, 'dev-b').getAttribute('x')).toBe('40'); // 100 - 60
+
+    // 重新挂载（模拟刷新）：位置同源恢复
+    const second = mountCard(canvasConfig());
+    await flush();
+    expect(nodeRect(second.el, 'dev-b').getAttribute('x')).toBe('40');
+    expect(nodeRect(second.el, 'dev-b').getAttribute('y')).toBe('276'); // 300 - 24
+  });
+
+  it('位置超出画布被夹回可视区（含 NaN 兜底）', async () => {
+    const { el, card } = mountCard(canvasConfig());
+    await flush();
+    card().setNodePosition('dev-b', -500, 9999);
+    await flush();
+    expect(nodeRect(el, 'dev-b').getAttribute('x')).toBe('4'); // 夹到 NODE_HALF_W+4 - 60
+    expect(nodeRect(el, 'dev-b').getAttribute('y')).toBe('308'); // 夹到 332 - 24
+    card().setNodePosition('dev-b', Number.NaN, Number.NaN);
+    await flush();
+    expect(Number.isFinite(Number(nodeRect(el, 'dev-b').getAttribute('x')))).toBe(true);
+    expect(Number.isFinite(Number(nodeRect(el, 'dev-b').getAttribute('y')))).toBe(true);
+  });
+
+  it('未配置任何节点对 → 空态提示替代画布', async () => {
+    // 先立桩再挂载：数据源空（无 peer/不转发/无兜底 = 未装配）
+    stubApi({ meshStatus: { ...defaultMeshStatus(), peers: [] } });
+    const { el } = mountCard({ ...baseConfig(), mesh: undefined, proxy_rules: [] });
+    await flush();
+    expect(el.querySelector('[data-mesh-canvas]')).toBeNull();
+    const empty = el.querySelector('[data-mesh-canvas-empty]');
+    expect(empty).not.toBeNull();
+    expect(empty.textContent).toContain('mesh_unconfiguredHint');
+  });
+
+  it('mesh status 缺失（降级）仍渲染本机中心节点，label 用本机占位文案', async () => {
+    stubApi({ meshStatusError: true });
+    const { el } = mountCard(canvasConfig());
+    await flush();
+    expect(el.querySelector('[data-mesh-canvas]')).not.toBeNull();
+    expect(nodeIds(el)).toContain('dev-b'); // 配置 peers 仍在
+    const self = el.querySelector('[data-mesh-node="__self__"]');
+    expect(self).not.toBeNull();
+    expect(self.textContent).toContain('mesh_nodeSelf');
+  });
+
+  it('画布新键 zh/en 同步存在', () => {
+    const keys = [
+      'mesh_canvasTitle',
+      'mesh_canvasHint',
+      'mesh_unconfiguredHint',
+      'mesh_pairDetailTitle',
+      'mesh_nodeDetailTitle',
+      'mesh_nodeSelf',
+      'mesh_ruleChipsEmpty',
+      'mesh_editInRules',
+      'mesh_dependedBy',
+      'mesh_detailPlaceholder'
+    ];
+    for (const key of keys) {
       expect(typeof zh[key], `zh.${key}`).toBe('string');
       expect(typeof en[key], `en.${key}`).toBe('string');
     }
