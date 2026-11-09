@@ -56,13 +56,16 @@ describe('MeshSettings normalizeMeshConfig', () => {
     expect(out.fallback.classes).toEqual(['ai']);
   });
 
-  it('max_hops：[1,8] 保留、非法（≤0 或 >8 或非数）归 0（后端默认 5）', () => {
+  it('max_hops：[1,8] 保留、>8 钳到 8（对齐后端读侧 EffectiveMaxHops）、≤0/非数归 0（默认 5）', () => {
     expect(normalizeMeshConfig({ max_hops: 5 }).max_hops).toBe(5);
     expect(normalizeMeshConfig({ max_hops: 1 }).max_hops).toBe(1);
     expect(normalizeMeshConfig({ max_hops: 8 }).max_hops).toBe(8);
     expect(normalizeMeshConfig({ max_hops: 0 }).max_hops).toBe(0);
     expect(normalizeMeshConfig({ max_hops: -3 }).max_hops).toBe(0);
-    expect(normalizeMeshConfig({ max_hops: 9 }).max_hops).toBe(0);
+    // >8 钳到 8：后端 EffectiveMaxHops 读侧同款收口——9 的运行表现是 8，
+    // 不是默认 5（归 0 会把 9 错读成 5）；钳制值不透传给后端 Validate
+    expect(normalizeMeshConfig({ max_hops: 9 }).max_hops).toBe(8);
+    expect(normalizeMeshConfig({ max_hops: 100 }).max_hops).toBe(8);
     expect(normalizeMeshConfig({ max_hops: 4.5 }).max_hops).toBe(4);
     expect(normalizeMeshConfig({ max_hops: '5' }).max_hops).toBe(0);
     expect(normalizeMeshConfig({ max_hops: Number.NaN }).max_hops).toBe(0);
@@ -271,13 +274,14 @@ const flush = async (rounds = 8) => {
 
 const mountedApps = [];
 
-function mountCard(config) {
+function mountCard(config, extraProps = {}) {
   const saved = [];
   const el = document.createElement('div');
   document.body.appendChild(el);
   const app = createApp({
     render: () => h(MeshSettings, {
       config,
+      ...extraProps,
       onSave: (payload) => saved.push(payload)
     })
   });
@@ -331,8 +335,8 @@ const LAN_PEERS = [
 ];
 
 // 三路补充数据的 URL 路由 stub：agentStatus/meshStatus 默认在线+已配置；
-// meshStatusError/agentStatusError 模拟拉取失败（信封失败或网络拒绝）。
-function stubApi({ agentStatus, agentStatusError, meshStatus, meshStatusError, lanPeers } = {}) {
+// *Error 模拟拉取失败（信封失败或网络拒绝）。
+function stubApi({ agentStatus, agentStatusError, meshStatus, meshStatusError, lanPeers, lanPeersError } = {}) {
   vi.stubGlobal('fetch', vi.fn((path) => {
     if (path === '/api/agent/status') {
       return agentStatusError
@@ -345,7 +349,9 @@ function stubApi({ agentStatus, agentStatusError, meshStatus, meshStatusError, l
         : Promise.resolve(jsonOk(meshStatus ?? defaultMeshStatus()));
     }
     if (path === '/api/mesh/lan_peers') {
-      return Promise.resolve(jsonOk({ peers: lanPeers ?? [] }));
+      return lanPeersError
+        ? Promise.reject(new Error('lan peers down'))
+        : Promise.resolve(jsonOk({ peers: lanPeers ?? [] }));
     }
     return Promise.reject(new Error(`unexpected fetch: ${path}`));
   }));
@@ -450,6 +456,47 @@ describe('MeshSettings 卡片', () => {
     expect(el.textContent).toContain('mesh_statusDegradedHint');
     // 降级态不误报「兜底生效中」
     expect(pill.textContent).not.toContain('mesh_statusOfflineFallback');
+  });
+
+  // —— 状态组合矩阵（评审回填）——
+  it('组合①：agent status 拉取失败而 mesh status 正常 → 乐观在线绿（降级判定归 mesh status）', async () => {
+    stubApi({ agentStatusError: true });
+    const { el } = mountCard(baseConfig());
+    await flush();
+    const pill = statusPill(el);
+    expect(pill.textContent).toContain('mesh_statusOnline');
+    expect(pill.className).toContain('emerald');
+    // agent status 单路失败不冒充降级态
+    expect(pill.textContent).not.toContain('mesh_statusDegraded');
+    expect(el.textContent).not.toContain('mesh_statusDegradedHint');
+  });
+
+  it('组合②：lan_peers 拉取失败 → 静默空表不报错（发现缺席是合法态,不冒充降级）', async () => {
+    stubApi({ lanPeersError: true });
+    const { el } = mountCard(baseConfig());
+    await flush();
+    const select = el.querySelector('[data-field="meshFallbackCandidate"]');
+    expect([...select.querySelectorAll('option')].map((o) => o.value)).toEqual(['']);
+    expect(select.textContent).toContain('mesh_lanPeersEmpty');
+    expect(statusPill(el).textContent).toContain('mesh_statusOnline');
+    expect(el.textContent).not.toContain('mesh_statusDegradedHint');
+  });
+
+  it('组合③：lanPeers 空表时候选 select disabled', async () => {
+    stubApi({ lanPeers: [] });
+    const { el } = mountCard(baseConfig());
+    await flush();
+    expect(el.querySelector('[data-field="meshFallbackCandidate"]').disabled).toBe(true);
+  });
+
+  it('saving 态：兜底开关与全部编辑控件、保存按钮禁用（与兄弟控件口径一致）', async () => {
+    const { el } = mountCard(baseConfig(), { saving: true });
+    await flush();
+    expect(el.querySelector('[data-field="meshFallbackEnable"]').disabled).toBe(true);
+    expect(el.querySelector('[data-field="meshFallbackAddr"]').disabled).toBe(true);
+    expect(el.querySelector('[data-field="meshFallbackClassAi"], [data-field="meshClassAi"]').disabled).toBe(true);
+    expect(el.querySelector('[data-field="meshFallbackCandidate"]').disabled).toBe(true);
+    expect(saveButton(el).disabled).toBe(true);
   });
 
   it('卡片挂载拉取 lan_peers 候选并渲染下拉选项', async () => {

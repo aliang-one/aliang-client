@@ -17,12 +17,17 @@
 // 勾选序 = AI / 自身 / 自定义）。导出供卡片勾选框与测试共用，勿内联字面量。
 export const MESH_FALLBACK_CLASSES = ['ai', 'self', 'custom'];
 
-// 与后端 meshproto DefaultHops=5 / MaxHopsCap=8 对齐：非法（≤0 或 >8 或非数）
-// 读侧归 0（=用后端默认 5）。不做前端钳制——后端保存期 Validate 只认 [0,8]，
-// 钳制会把手输 9 悄悄变成 8 而不是报错，错误框呈现才是正解。
+// 与后端 meshproto DefaultHops=5 / MaxHopsCap=8 对齐,语义=后端
+// EffectiveMaxHops 读侧同款收口：≤0/非数归 0（=用后端默认 5）；>8 钳到 8
+// （后端读侧对越界值的运行表现就是 8——归 0 会把 9 错读成默认 5）。钳制是
+// 有意选择：越界值不透传给后端 Validate（错误框呈现留给 addr 这类用户
+// 手输字段）；Task 3 若加 max_hops 手输框,输入校验在表单层自行拦截。
 function normalizeMaxHops(raw) {
-  if (typeof raw !== 'number' || !Number.isFinite(raw) || raw <= 0 || raw > 8) {
+  if (typeof raw !== 'number' || !Number.isFinite(raw) || raw <= 0) {
     return 0;
+  }
+  if (raw > 8) {
+    return 8;
   }
   return Math.floor(raw);
 }

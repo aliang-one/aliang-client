@@ -62,7 +62,7 @@
         >
           <span>{{ t('mesh_fallbackEnable') }}</span>
           <span class="relative">
-            <input v-model="form.fallbackEnabled" class="peer sr-only" data-field="meshFallbackEnable" type="checkbox" />
+            <input v-model="form.fallbackEnabled" class="peer sr-only" data-field="meshFallbackEnable" :disabled="loading || saving" type="checkbox" />
             <span class="relative block h-6 w-11 rounded-full bg-slate-300 transition-colors after:absolute after:left-0.5 after:top-0.5 after:h-5 after:w-5 after:rounded-full after:bg-white after:transition-transform after:content-[''] peer-checked:bg-primary peer-checked:after:translate-x-5 peer-focus-visible:outline peer-focus-visible:outline-2 peer-focus-visible:outline-offset-2 peer-focus-visible:outline-primary dark:bg-slate-700"></span>
           </span>
         </label>
