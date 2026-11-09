@@ -180,6 +180,10 @@ func initializeCoreSubsystems() error {
 	// NewAgentService——后者在 user agent runtime 也会构造,双装会抢
 	// 56440/56441 并广播双 beacon。device_id 解析常驻身份文件,幂等。
 	tunnel.StartMeshLANAssembly(services.GetSharedAgentService().CurrentDeviceID)
+	// 统一口 mesh 帧分派接线:56441 独立 LAN 载体已退役,56432 嗅探为 mesh
+	// 的连接由本接线交 HandleMeshConn(carrier=lan)。须在统一口可能 accept
+	// 之前完成(代理自愈随时起口)。
+	tunnel.WireUnifiedIngressMeshDispatch(services.GetSharedAgentService().CurrentDeviceID)
 	// SSH 入口启动恢复:customer 配置已在上方加载完成,按其期望态 reconcile
 	// ——重启后自动恢复已启用入口(平台代理自愈的同款纪律:失败仅日志不
 	// 阻断 boot)。与配置提交协调路径共用 services.ReconcileSSHIngressFromConfig

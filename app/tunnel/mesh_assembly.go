@@ -8,40 +8,35 @@
 //     同一 manager 隧道状态 getter(TunnelSessionActive)同位接线——同源同
 //     真假契约(两缝注释互指,Task 12 评审钉死):漏接 tcp 缝 = AI 改道永久
 //     静默休眠;两缝取值分裂 = 「自身流量经 B 兜底而 AI 流量仍撞死隧道」。
-//   - LAN 载体 + lanbeacon 生命周期:mesh 总开关(层配置存在且
-//     EffectiveEnabled)开 → relay LAN TCP 常驻监听口起口 + beacon Start 后
-//     SetDefault;关 → 双双收摊。config 无变更回调机制(SetGlobalConfig 是
-//     config 层咽喉,不能反向 import app 层),用低频轮询对账——mesh 发现
-//     本就是最终一致(beacon 3s 周期广播),5s 反应延迟无损语义。
+//   - LAN beacon 生命周期:mesh 总开关(层配置存在且 EffectiveEnabled)开 →
+//     beacon Start 后 SetDefault(广播统一口 56432);关 → 收摊。LAN 帧接收
+//     面已收编进 56432 统一入口(WireUnifiedIngressMeshDispatch 分派接线,
+//     spec §6.5),本装配只剩发现候选面。config 无变更回调机制
+//     (SetGlobalConfig 是 config 层咽喉,不能反向 import app 层),用低频
+//     轮询对账——mesh 发现本就是最终一致(beacon 3s 周期广播),5s 反应延迟
+//     无损语义。
 //
-// 进程归属:装配由 cmd/core.go(core 进程)驱动——mesh 数据面(relay 注入
-// 的 processor/tcp 管线、56432 AI 出口、TUN)全部在 core 进程,user agent
-// runtime 不装配(双进程同装会抢 56440/56441 端口并广播双 beacon)。
+// 进程归属:装配由 cmd/core.go(core 进程)驱动——mesh 数据面(统一口
+// 分派注入的 processor/tcp 管线、56432 AI 出口、TUN)全部在 core 进程,
+// user agent runtime 不装配(双进程同装会抢 56440 beacon 并广播双 beacon)。
 package tunnel
 
 import (
 	"context"
-	"fmt"
 	"log"
-	"net"
 	"strings"
 	"sync"
 	"time"
 
 	"aliang.one/nursorgate/app/mesh/lanbeacon"
-	"aliang.one/nursorgate/app/mesh/relay"
-	"aliang.one/nursorgate/outbound/meshproto"
 	meshproxy "aliang.one/nursorgate/outbound/proxy/mesh"
 	"aliang.one/nursorgate/processor/config"
 	"aliang.one/nursorgate/processor/egress"
 	"aliang.one/nursorgate/processor/tcp"
 )
 
-// DefaultMeshLANPort mesh LAN 载体 TCP 常驻监听口(与 UDP beacon 56440 同族
-// 固定高位端口)。固定而非 :0:手填对端 LAN 地址(§9.4 兜底)须跨重启稳定;
-// 被占时回落 :0 并 Warn——beacon 广播实际端口,发现路径不损,仅手填路径
-// 降级(重启换端口)。
-const DefaultMeshLANPort = 56441
+// DefaultMeshLANPort 已退役:LAN 载体 TCP 监听收编进 56432 统一入口
+// (spec §6.5),承载口见 MeshLANPort。原 56441 专用监听口不再存在。
 
 // meshLANPollInterval 装配对账轮询周期(测试经 startMeshLANAssembly 缩短)。
 const meshLANPollInterval = 5 * time.Second
@@ -126,9 +121,8 @@ var meshLAN struct {
 	interval   time.Duration // 对账周期(生产 5s,测试缩短)
 	beaconPort int           // beacon 广播端口(生产 DefaultBeaconPort)
 
-	running  bool              // 当前生效态(mesh 总开关)
-	listener net.Listener      // relay LAN TCP 监听口
-	beacon   *lanbeacon.Beacon // Start 失败时为未启动实例(Stop 幂等安全)
+	running bool              // 当前生效态(mesh 总开关)
+	beacon  *lanbeacon.Beacon // Start 失败时为未启动实例(Stop 幂等安全)
 }
 
 // StartMeshLANAssembly 生产装配入口(core 进程 boot 调用;幂等)。deviceID
@@ -208,44 +202,32 @@ func meshLANDesired(deviceID func() string) bool {
 	return cfg.Customer.Mesh.EffectiveEnabled()
 }
 
-// startMeshLANLocked 起口(meshLAN.mu 保护):LAN 监听 + relay serve + beacon。
-// 任一环节失败保持 running=false,下个对账周期重试(端口被占属环境态,重试
-// 有意义;beacon 失败不拖累监听口——发现候选不可用,转发接收照常)。
+// startMeshLANLocked 起口(meshLAN.mu 保护):beacon 广播统一口 56432 作为
+// LAN 承载口(LAN 帧接收面已收编进统一入口分派,spec §6.5,本装配只剩发现
+// 候选面)。beacon Start 失败保持 running=false,下个对账周期重试(UDP 端口
+// 被占属环境态,重试有意义);帧接收不依赖 beacon——统一口分派独立生效。
 func startMeshLANLocked(deviceID func() string) {
 	selfID := strings.TrimSpace(deviceID())
-	listener, port, err := listenMeshLAN()
-	if err != nil {
-		log.Printf("[MESH-LAN] assembly start failed (will retry): %v", err)
+	beacon := lanbeacon.NewBeacon(selfID, config.DefaultHTTPProxyPort, meshLAN.beaconPort)
+	if berr := beacon.Start(context.Background()); berr != nil {
+		log.Printf("[MESH-LAN] assembly start failed (candidates unavailable, will retry): %v", berr)
 		return
 	}
-	r := relay.New(relay.ProductionDeps(selfID))
-	go func() { _ = r.Serve(listener, meshproto.CarrierLAN) }()
-	beacon := lanbeacon.NewBeacon(selfID, port, meshLAN.beaconPort)
-	if berr := beacon.Start(context.Background()); berr != nil {
-		// 软失败:监听口保留(接收面可用),候选面缺失;SetDefault 不注册,
-		// handler 视角即空表(合法态)。
-		log.Printf("[MESH-LAN] beacon start failed (candidates unavailable): %v", berr)
-	} else {
-		lanbeacon.SetDefault(beacon)
-	}
-	meshLAN.listener = listener
+	lanbeacon.SetDefault(beacon)
 	meshLAN.beacon = beacon
 	meshLAN.running = true
-	log.Printf("[MESH-LAN] assembly started lan_port=%d beacon_port=%d", port, meshLAN.beaconPort)
+	log.Printf("[MESH-LAN] assembly started (carrier=%d beacon_port=%d)", config.DefaultHTTPProxyPort, meshLAN.beaconPort)
 }
 
-// teardownMeshLANLocked 收摊(meshLAN.mu 保护):beacon 先 Stop 再清 Default,
-// listener 关闭令 relay accept 循环退出。
+// teardownMeshLANLocked 收摊(meshLAN.mu 保护):beacon 先 Stop 再清 Default。
+// 帧接收面(统一口分派)不归本装配管——mesh 总开关关时的拒收由
+// HandleMeshConn 门禁承担,这里只收发现候选面。
 func teardownMeshLANLocked() {
 	if meshLAN.beacon != nil {
 		meshLAN.beacon.Stop()
 		meshLAN.beacon = nil
 	}
 	lanbeacon.SetDefault(nil)
-	if meshLAN.listener != nil {
-		_ = meshLAN.listener.Close()
-		meshLAN.listener = nil
-	}
 	wasRunning := meshLAN.running
 	meshLAN.running = false
 	if wasRunning {
@@ -253,30 +235,12 @@ func teardownMeshLANLocked() {
 	}
 }
 
-// listenMeshLAN 绑 LAN 监听口:先试默认固定口,被占回落 :0(取舍见
-// DefaultMeshLANPort 注释)。
-func listenMeshLAN() (net.Listener, int, error) {
-	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", DefaultMeshLANPort))
-	if err == nil {
-		return listener, DefaultMeshLANPort, nil
-	}
-	log.Printf("[MESH-LAN] default port %d unavailable (%v); falling back to ephemeral (manual peer addrs lose stability)", DefaultMeshLANPort, err)
-	listener, err = net.Listen("tcp", ":0")
-	if err != nil {
-		return nil, 0, err
-	}
-	return listener, listener.Addr().(*net.TCPAddr).Port, nil
-}
-
-// MeshLANPort 当前 mesh LAN 监听口端口(0=未装配/未启动);/api/mesh/status
-// 消费(手填对端地址须知道本机端口)。
+// MeshLANPort LAN 载体承载口(常量统一口 56432);/api/mesh/status 消费
+// (手填对端地址须知道本机端口)。独立监听退役后承载口不再随装配态变化
+// (0=未装配的旧语义随之失效):端口是静态拓扑事实,「此刻可不可达」由
+// 代理运行态决定(D4),两者不再混在一个字段里。
 func MeshLANPort() int {
-	meshLAN.mu.Lock()
-	defer meshLAN.mu.Unlock()
-	if meshLAN.listener == nil {
-		return 0
-	}
-	return meshLAN.listener.Addr().(*net.TCPAddr).Port
+	return config.DefaultHTTPProxyPort
 }
 
 // wireMeshAssemblySeams validateConfig 的装配接线点(与 SetMeshSelfIDSource/

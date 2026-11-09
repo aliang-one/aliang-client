@@ -175,6 +175,12 @@ func (b *Beacon) Stop() {
 	}
 }
 
+// MeshPort 返回广播载荷里通告的本机承载口(装配层=统一口 56432)。只读
+// 观测面:装配测试钉「广播端口=统一口」用,诊断面板可复用。
+func (b *Beacon) MeshPort() int {
+	return b.meshPort
+}
+
 // Candidates 返回未过期候选,按 last_seen 降序(平局按 device_id 稳定)。
 // nil 接收者安全:未装配默认实例时返回空数组(peers:[] 而非 null)。
 func (b *Beacon) Candidates() []LanPeerCandidate {
