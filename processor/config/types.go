@@ -696,6 +696,10 @@ type AgentCoreTuningConfig struct {
 	// 同样用指针保留三态：nil = 未配置（默认开启）、true/false 显式。只作用于
 	// agentcore 内核。
 	SkillsEnabled *bool `json:"skills_enabled,omitempty"`
+	// MemoryEnabled 是记忆层总开关（提取+注入）。三态指针沿 MCPEnabled/SkillsEnabled
+	// 先例：nil=未配置（默认开启）、true/false 显式。只作用于 agentcore 内核。
+	// 关闭时不提取、不注入，但 API 仍可读可管（手动管理既有记忆不被开关锁死）。
+	MemoryEnabled *bool `json:"memory_enabled,omitempty"`
 }
 
 // Validate 保存通道(Config.Validate)调用。0 合法(=未配置,走默认);
@@ -733,6 +737,18 @@ func (c *Config) EffectiveAgentCoreSkillsEnabled() bool {
 		return true
 	}
 	return *c.Customer.AgentCore.SkillsEnabled
+}
+
+// EffectiveAgentCoreMemoryEnabled 返回记忆层是否开启。默认开启（同 MCP/技能）：
+// 记忆是加法能力，开关不能把没配过的人的功能关掉。nil（未配置）与 true 等价。
+func (c *Config) EffectiveAgentCoreMemoryEnabled() bool {
+	if c == nil || c.Customer == nil || c.Customer.AgentCore == nil {
+		return true
+	}
+	if c.Customer.AgentCore.MemoryEnabled == nil {
+		return true
+	}
+	return *c.Customer.AgentCore.MemoryEnabled
 }
 
 // PeerMCPConfig 控制 aliang-peer 跨设备工具面(customer.peer_mcp)。三态指针
