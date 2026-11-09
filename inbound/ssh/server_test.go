@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -594,4 +595,92 @@ func TestAuthLimiterConcurrent(t *testing.T) {
 		}(g)
 	}
 	wg.Wait() // -race 检测器兜底:无数据竞争即过。
+}
+
+// ===== 可选专用口(spec §6.4 修订:port 显式指定另开常驻监听口) =====
+
+// TestSSHIngressDedicatedPortListens 显式端口 → Start 起专用监听口(与统一口
+// 注入缝并存,同一实例双路径);Addr 可拨且读到 SSH 横幅。
+func TestSSHIngressDedicatedPortListens(t *testing.T) {
+	humanPub, signer := newTestKey(t)
+	fixed := freeTCPPortForDedicated(t)
+	s := NewServer(RunConfig{Port: fixed, AuthorizedKeys: []gossh.PublicKey{humanPub}}, filepath.Join(t.TempDir(), "k"))
+	if err := s.Start(); err != nil {
+		t.Fatalf("start with dedicated port: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Stop() })
+
+	addr := s.Addr()
+	if addr == "" {
+		t.Fatal("dedicated-port server must expose listen addr")
+	}
+	if _, port, err := net.SplitHostPort(addr); err != nil || port != strconv.Itoa(int(fixed)) {
+		t.Fatalf("Addr = %q, want port %d", addr, fixed)
+	}
+	conn, err := dialIngress(t, net.JoinHostPort("127.0.0.1", strconv.Itoa(int(fixed))), gossh.PublicKeys(signer))
+	if err != nil {
+		t.Fatalf("dial dedicated port: %v", err)
+	}
+	_ = conn.Close()
+
+	// 停机后专用口连接层拒绝。
+	if err := s.Stop(); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	dialErr := dialRawRefused(t, net.JoinHostPort("127.0.0.1", strconv.Itoa(int(fixed))))
+	if dialErr == nil {
+		t.Fatal("dedicated port must be closed after stop")
+	}
+}
+
+// TestSSHIngressUnifiedPortNoListener port=0(跟随统一口)→ 不起专用监听,
+// Addr 为空;注入缝(ServeConn)照常服务。
+func TestSSHIngressUnifiedPortNoListener(t *testing.T) {
+	humanPub, humanSigner := newTestKey(t)
+	s := NewServer(RunConfig{AuthorizedKeys: []gossh.PublicKey{humanPub}}, filepath.Join(t.TempDir(), "k"))
+	if err := s.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Stop() })
+
+	if got := s.Addr(); got != "" {
+		t.Fatalf("unified-port server must not listen, Addr = %q", got)
+	}
+	// 注入缝走本地实例(非 reconcile 单例):桥接对+完整握手。
+	client, server := bridgedPair()
+	defer client.Close()
+	_ = client.SetDeadline(time.Now().Add(5 * time.Second))
+	go s.ServeConn(server)
+	cfg := &gossh.ClientConfig{
+		User:            "ingress",
+		Auth:            []gossh.AuthMethod{gossh.PublicKeys(humanSigner)},
+		HostKeyCallback: gossh.InsecureIgnoreHostKey(),
+		Timeout:         5 * time.Second,
+	}
+	conn, _, _, err := gossh.NewClientConn(client, "127.0.0.1:0", cfg)
+	if err != nil {
+		t.Fatalf("injection seam must still serve: %v", err)
+	}
+	_ = conn.Close()
+}
+
+// freeTCPPortForDedicated 预约空闲回环端口(专用口用例选口)。
+func freeTCPPortForDedicated(t *testing.T) uint16 {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve port: %v", err)
+	}
+	defer l.Close()
+	return uint16(l.Addr().(*net.TCPAddr).Port)
+}
+
+// dialRawRefused 裸拨号判连接层拒绝(拿到错误=拒绝/超时;nil=有连接)。
+func dialRawRefused(t *testing.T, addr string) error {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", addr, time.Second)
+	if err == nil {
+		_ = conn.Close()
+	}
+	return err
 }

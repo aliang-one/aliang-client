@@ -349,12 +349,25 @@ func buildSSHIngressRunConfig(effective *config.SSHIngressConfig) *sshin.RunConf
 		return nil
 	}
 	return &sshin.RunConfig{
-		Port:           effective.Port,
+		// 专用口哨兵映射(spec §6.4 修订):0 与旧默认 56442 一律=跟随统一口
+		// (RunConfig.Port=0,不自持监听);其他显式端口才开常驻专用口。存量
+		// 配置里的 56442 升级后不得凭空复活成专用口。
+		Port:           effectivePortForRunConfig(effective.Port),
 		AuthorizedKeys: authorized,
 		MeshKeys:       mesh,
 		// ForwardGate 合并集成缝,见 ReconcileSSHIngressFromConfig 注释。
 		ForwardGate: nil,
 	}
+}
+
+// effectivePortForRunConfig 把配置层端口翻译成运行面端口:0(未配)与
+// 56442(旧默认哨兵)→ 0(跟随统一口 56432);其他显式值原样(开专用口)。
+// 见 inbound/ssh.RunConfig.Port 与 config.SSHIngressDefaultPort 注释。
+func effectivePortForRunConfig(port uint16) uint16 {
+	if port == 0 || port == config.SSHIngressDefaultPort {
+		return 0
+	}
+	return port
 }
 
 // parseSSHIngressAuthorizedKeys 逐行解析 authorized_keys 行为公钥身份;

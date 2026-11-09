@@ -152,3 +152,27 @@ func TestReconcileUnifiedIngressBindingNilConfigFallsBackToLoopback(t *testing.T
 	}
 	probe.waitStarts(t, 1)
 }
+
+// ===== 可选专用口:翻译层哨兵映射(spec §6.4 修订) =====
+
+// TestEffectivePortForRunConfigSentinel 端口哨兵翻译:0/56442(旧默认)→0
+// (跟随统一口,存量配置升级不凭空开专用口);其他显式值原样(开专用口)。
+func TestEffectivePortForRunConfigSentinel(t *testing.T) {
+	cases := []struct {
+		name string
+		in   uint16
+		want uint16
+	}{
+		{"未配归零", 0, 0},
+		{"旧默认哨兵归零", 56442, 0},
+		{"显式专用口原样", 56443, 56443},
+		{"其他显式值原样", 2222, 2222},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := effectivePortForRunConfig(tc.in); got != tc.want {
+				t.Fatalf("effectivePortForRunConfig(%d) = %d, want %d", tc.in, got, tc.want)
+			}
+		})
+	}
+}

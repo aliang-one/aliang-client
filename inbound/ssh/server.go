@@ -13,10 +13,12 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 
 	"aliang.one/nursorgate/common/logger"
+	"aliang.one/nursorgate/processor/config"
 
 	gossh "golang.org/x/crypto/ssh"
 )
@@ -39,20 +41,23 @@ const IngressHostKeyFileName = "ingress_host_key"
 // Server 是 SSH 入口服务实例。生命周期三件套(Start/Stop/IsRunning)幂等;
 // 实例不承载热更新——配置变更由装配层(Reconcile)重建实例。
 //
-// 监听归属(统一口收编,spec §6.4):本实例不再 net.Listen——56432 统一
-// 入口 accept 后嗅探为 SSH 的连接经 HandleIngressConn/ServeConn 注入本实例。
-// Start 因此只剩「host key 就绪 + 运行态置位」两件事。
+// 监听归属(可选专用口,spec §6.4 修订):RunConfig.Port 显式指定(>0)
+// → 另开常驻专用监听口 ServiceBindHost:port(随入口开关,不随代理启停);
+// Port=0(缺省,含旧默认 56442 由翻译层哨兵归零)→ 不自持监听,由 56432
+// 统一入口嗅探承载(随代理运行态)。两路径并存、同一实例同一套限速/凭证/
+// 通道收敛;注入缝 HandleIngressConn/ServeConn 恒可用。
 type Server struct {
 	rc          RunConfig
 	hostKeyPath string
 	limiter     *authLimiter
 
-	mu      sync.Mutex
-	running bool
-	conns   map[net.Conn]struct{}
-	rootCtx context.Context // Start 建立的根取消链:注入连接的停机兜底
-	cancel  context.CancelFunc
-	wg      sync.WaitGroup // 每连接 goroutine(注入路径 ServeConn 记账)
+	mu       sync.Mutex
+	running  bool
+	listener net.Listener // 专用口监听(Port>0 时起;0=跟随统一口,为 nil)
+	conns    map[net.Conn]struct{}
+	rootCtx  context.Context // Start 建立的根取消链:注入连接的停机兜底
+	cancel   context.CancelFunc
+	wg       sync.WaitGroup // accept 循环 + 每连接 goroutine
 
 	hostKeyMu sync.Mutex
 	hostKey   gossh.Signer
@@ -75,9 +80,9 @@ func NewServer(rc RunConfig, hostKeyPath string) *Server {
 	}
 }
 
-// Start 进入运行态(幂等:已运行直接返回 nil)。不再监听——56432 统一
-// 入口承载监听(spec §6.4),本函数只剩「host key 就绪 + 运行态置位」;
-// 连接进入走 HandleIngressConn/ServeConn 注入缝。
+// Start 进入运行态(幂等:已运行直接返回 nil)。Port>0 时另起专用监听口
+// (bind 冲突即返回错误,reconcile 停留止态下次重试);Port=0 不监听,由
+// 56432 统一入口承载。注入缝 HandleIngressConn/ServeConn 恒可用。
 func (s *Server) Start() error {
 	s.mu.Lock()
 	if s.running {
@@ -86,7 +91,8 @@ func (s *Server) Start() error {
 	}
 	// host key 就绪(缺失/损坏则生成+原子落盘)在持生命周期锁下完成:
 	// 防止并发的 Start/Stop 观察到半初始化状态(冷路径,开销可忽略)。
-	if _, err := s.ensureHostKey(); err != nil {
+	signer, err := s.ensureHostKey()
+	if err != nil {
 		s.mu.Unlock()
 		return fmt.Errorf("ssh ingress host key: %w", err)
 	}
@@ -98,15 +104,34 @@ func (s *Server) Start() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	s.rootCtx = ctx
 	s.cancel = cancel
+
+	// 专用口(可选):显式端口才起监听;bind 失败回滚 running 置位。
+	if s.rc.Port > 0 {
+		addr := net.JoinHostPort(config.ServiceBindHost(), strconv.Itoa(int(s.rc.Port)))
+		l, lerr := net.Listen("tcp", addr)
+		if lerr != nil {
+			s.running = false
+			s.rootCtx = nil
+			s.cancel = nil
+			s.mu.Unlock()
+			return fmt.Errorf("ssh ingress listen %s: %w", addr, lerr)
+		}
+		s.listener = l
+		s.wg.Add(1)
+		s.mu.Unlock()
+
+		logger.Info(fmt.Sprintf("SSH ingress dedicated listener on %s (unified 56432 dispatch also active)", l.Addr().String()))
+		go s.acceptLoop(ctx, l, s.serverConfig(signer))
+		return nil
+	}
 	s.mu.Unlock()
 
-	logger.Info("SSH ingress server running (listening is owned by the unified ingress 56432)")
+	logger.Info("SSH ingress running on unified ingress 56432 (no dedicated listener)")
 	return nil
 }
 
-// Stop 退出运行态(幂等):断开在途连接并等待 handle 协程退出(drain/
-// global-request 协程随连接拆除退出,不在此 WaitGroup)。无监听可关——
-// 连接是统一口注入的,拆连接快照即可。
+// Stop 退出运行态(幂等):关专用监听(若有)、断开在途连接并等待 accept/
+// handle 协程退出(drain/global-request 协程随连接拆除退出,不在此 WaitGroup)。
 func (s *Server) Stop() error {
 	s.mu.Lock()
 	if !s.running {
@@ -116,6 +141,8 @@ func (s *Server) Stop() error {
 	s.running = false
 	cancel := s.cancel
 	s.cancel = nil
+	l := s.listener
+	s.listener = nil
 	pending := make([]net.Conn, 0, len(s.conns))
 	for c := range s.conns {
 		pending = append(pending, c)
@@ -124,6 +151,9 @@ func (s *Server) Stop() error {
 
 	if cancel != nil {
 		cancel()
+	}
+	if l != nil {
+		_ = l.Close() // 中断 accept 循环
 	}
 	// 快照内的在途连接全部断开,让握手/通道 goroutine 解除阻塞退出;
 	// 快照后滑入/交错的连接由根 ctx 兜底关闭(见 Start 注释)。
@@ -140,6 +170,47 @@ func (s *Server) IsRunning() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.running
+}
+
+// Addr 返回专用监听口地址(host:port);未起专用口(Port=0 跟随统一口)或
+// 未运行返回空串。56432 统一入口的可达性以 config.UnifiedIngressListenAddr
+// 为准,不在本观测面。
+func (s *Server) Addr() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.listener == nil {
+		return ""
+	}
+	return s.listener.Addr().String()
+}
+
+// acceptLoop 接受专用口连接并派发;监听关闭(Stop)后退出。连接记账与
+// ServeConn 同款停机交错纪律:登记+wg.Add 在同一 s.mu 临界区完成,与 Stop
+// 的「翻转→快照」互斥(评审 B1);Stop 关 listener 后 ctx.Done 保底退出。
+func (s *Server) acceptLoop(ctx context.Context, l net.Listener, cfg *gossh.ServerConfig) {
+	defer s.wg.Done()
+	for {
+		conn, err := l.Accept()
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				logger.Debug(fmt.Sprintf("SSH ingress accept error: %v", err))
+				continue
+			}
+		}
+		s.mu.Lock()
+		if !s.running {
+			s.mu.Unlock()
+			_ = conn.Close()
+			return
+		}
+		s.conns[conn] = struct{}{}
+		s.wg.Add(1)
+		s.mu.Unlock()
+		go s.handleConn(ctx, conn, cfg)
+	}
 }
 
 // HostKeyFingerprint 返回 host key 的 SHA256 指纹(gossh.FingerprintSHA256,

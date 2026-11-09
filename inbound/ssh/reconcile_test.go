@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -218,6 +219,105 @@ func TestReconcileFailedStartStaysStoppedAndRetries(t *testing.T) {
 	Reconcile(&RunConfig{AuthorizedKeys: []gossh.PublicKey{humanPub}}, goodHostKeyPath, func() string { return "node-unit" })
 	if !IsRunning() {
 		t.Fatal("reconcile must retry start once the host key path is usable")
+	}
+	if err := handshakeViaIngress(t, humanSigner); err != nil {
+		t.Fatalf("handshake through retried ingress: %v", err)
+	}
+}
+
+// ===== 可选专用口:port 进期望态(变更重启/哨兵不重启/绑冲突重试) =====
+
+// freeReconcilePort 预约空闲回环端口(专用口用例选口)。
+func freeReconcilePort(t *testing.T) uint16 {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve port: %v", err)
+	}
+	defer l.Close()
+	return uint16(l.Addr().(*net.TCPAddr).Port)
+}
+
+// TestReconcilePortChangeRestarts 专用口进期望态:0→显式端口重启起专用监听
+// 口(Addr 可拨);端口变更重启(旧口失效/新口监听);显式端口→0 收回专用口
+// 回归统一口(Addr 归零)。
+func TestReconcilePortChangeRestarts(t *testing.T) {
+	hostKeyPath := filepath.Join(t.TempDir(), IngressHostKeyFileName)
+	t.Cleanup(func() { Reconcile(nil, hostKeyPath, nil) })
+
+	humanPub, humanSigner := newTestKey(t)
+	nodeID := func() string { return "node-port" }
+
+	// 初始:跟随统一口(Port=0)→ 无专用口。
+	Reconcile(&RunConfig{AuthorizedKeys: []gossh.PublicKey{humanPub}}, hostKeyPath, nodeID)
+	if !IsRunning() || Addr() != "" {
+		t.Fatalf("port=0 must run without dedicated listener, running=%v addr=%q", IsRunning(), Addr())
+	}
+	inflight := injectInflightConn(t)
+
+	// 0→显式端口:重启起专用口,在途连接拆除。
+	fixed := freeReconcilePort(t)
+	Reconcile(&RunConfig{Port: fixed, AuthorizedKeys: []gossh.PublicKey{humanPub}}, hostKeyPath, nodeID)
+	if !IsRunning() {
+		t.Fatal("port change must keep ingress running")
+	}
+	assertConnDead(t, inflight)
+	if got := Addr(); got == "" {
+		t.Fatal("dedicated port must expose listen addr")
+	} else if _, port, err := net.SplitHostPort(got); err != nil || port != strconv.Itoa(int(fixed)) {
+		t.Fatalf("Addr = %q, want port %d", got, fixed)
+	}
+	if err := handshakeViaIngress(t, humanSigner); err != nil {
+		t.Fatalf("handshake via seam after dedicated-port start: %v", err)
+	}
+
+	// 显式端口→0:收回专用口,回归统一口。
+	Reconcile(&RunConfig{AuthorizedKeys: []gossh.PublicKey{humanPub}}, hostKeyPath, nodeID)
+	if !IsRunning() || Addr() != "" {
+		t.Fatalf("port=0 revert must stop dedicated listener, running=%v addr=%q", IsRunning(), Addr())
+	}
+}
+
+// TestReconcileLegacySentinelDoesNotRestart 旧默认 56442 是哨兵(翻译层归零
+// →跟随统一口):存量配置的 56442 与 0 是同一期望态,重复 reconcile 不重启
+// (升级不凭空复活专用口)。
+func TestReconcileLegacySentinelDoesNotRestart(t *testing.T) {
+	hostKeyPath := filepath.Join(t.TempDir(), IngressHostKeyFileName)
+	t.Cleanup(func() { Reconcile(nil, hostKeyPath, nil) })
+
+	humanPub, _ := newTestKey(t)
+	Reconcile(&RunConfig{AuthorizedKeys: []gossh.PublicKey{humanPub}}, hostKeyPath, func() string { return "node-sentinel" })
+	inflight := injectInflightConn(t)
+
+	// 56442(翻译层已归零)与 0 同一期望态 → 不重启。
+	Reconcile(&RunConfig{Port: 56442, AuthorizedKeys: []gossh.PublicKey{humanPub}}, hostKeyPath, func() string { return "node-sentinel" })
+	if !IsRunning() {
+		t.Fatal("sentinel reconcile must keep ingress running")
+	}
+	assertConnAlive(t, inflight)
+}
+
+// TestReconcilePortConflictStaysStoppedAndRetries 专用口被外部占住 → 起口
+// 失败停留止态(不上抛);释放后同期望态再 reconcile 重试起服(失败不粘死)。
+func TestReconcilePortConflictStaysStoppedAndRetries(t *testing.T) {
+	hostKeyPath := filepath.Join(t.TempDir(), IngressHostKeyFileName)
+	t.Cleanup(func() { Reconcile(nil, hostKeyPath, nil) })
+
+	humanPub, humanSigner := newTestKey(t)
+	occupied := freeReconcilePort(t)
+	l, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(int(occupied))))
+	if err != nil {
+		t.Fatalf("occupy port %d: %v", occupied, err)
+	}
+	Reconcile(&RunConfig{Port: occupied, AuthorizedKeys: []gossh.PublicKey{humanPub}}, hostKeyPath, func() string { return "node-unit" })
+	if IsRunning() {
+		t.Fatal("reconcile with unbindable port must stay stopped")
+	}
+
+	_ = l.Close()
+	Reconcile(&RunConfig{Port: occupied, AuthorizedKeys: []gossh.PublicKey{humanPub}}, hostKeyPath, func() string { return "node-unit" })
+	if !IsRunning() {
+		t.Fatal("reconcile must retry start once the port conflict is gone")
 	}
 	if err := handshakeViaIngress(t, humanSigner); err != nil {
 		t.Fatalf("handshake through retried ingress: %v", err)

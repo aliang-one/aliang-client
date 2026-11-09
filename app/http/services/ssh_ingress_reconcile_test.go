@@ -207,8 +207,9 @@ func TestBuildSSHIngressRunConfigUnparseableKeyDefense(t *testing.T) {
 	if len(rc.AuthorizedKeys) != 1 || len(rc.MeshKeys) != 1 {
 		t.Fatalf("unparseable lines must be skipped: authorized=%d mesh=%d, want 1/1", len(rc.AuthorizedKeys), len(rc.MeshKeys))
 	}
-	if rc.Port != config.SSHIngressDefaultPort {
-		t.Fatalf("port = %d, want %d", rc.Port, config.SSHIngressDefaultPort)
+	// 旧默认 56442 是哨兵:翻译层归零=跟随统一口(spec §6.4 修订)。
+	if rc.Port != 0 {
+		t.Fatalf("port = %d, want 0 (56442 sentinel maps to unified ingress)", rc.Port)
 	}
 	if rc.ForwardGate != nil {
 		t.Fatal("ForwardGate must stay nil (merge integration seam, see RunConfig comment)")
