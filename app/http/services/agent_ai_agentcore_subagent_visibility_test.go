@@ -274,7 +274,7 @@ func TestAgentCoreSubagentMirrorParallelTaskIDs(t *testing.T) {
 	mirror := newMirrorForTest(t, func([]byte) error { return nil })
 	seen := map[string]bool{}
 	for i := 0; i < 3; i++ {
-		taskID, tracked := mirror.start("researcher", "调研")
+		taskID, tracked := mirror.start("researcher", "调研", "任务文本")
 		if !tracked || taskID == "" {
 			t.Fatalf("start 未追踪: %q %v", taskID, tracked)
 		}
@@ -423,8 +423,8 @@ func TestAgentCoreSubagentMirrorTaskIDDisambiguatesPerMessage(t *testing.T) {
 		sessionID: "sess-mirror",
 		messageID: "msg-other",
 	}
-	id1, ok1 := m1.start("researcher", "调研")
-	id2, ok2 := m2.start("researcher", "调研")
+	id1, ok1 := m1.start("researcher", "调研", "任务文本")
+	id2, ok2 := m2.start("researcher", "调研", "任务文本")
 	if !ok1 || !ok2 {
 		t.Fatalf("start 未追踪: %q/%v %q/%v", id1, ok1, id2, ok2)
 	}

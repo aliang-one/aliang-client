@@ -646,6 +646,72 @@ function commaFallbackPart(parts) {
     : parts[parts.length - 1];
 }
 
+// —— mesh 转发尾段（对齐后端 processor/routing splitMeshTail）——
+// 语法：任一逗号段以 `mesh:` 开头（大小写不敏感）即 mesh 条目；mesh: 段必须带非空
+// deviceID、base 非空，其后至多一个策略段 direct|deny|fallback:<id>（关键字大小写
+// 不敏感、fallback 目标非空原样保留）。后端**在 ClassifyEntry 之前**剥离尾段，故前端
+// 校验/提取也必须在任何逗号分支之前剥离——否则 `ip-cidr:1.2.3.0/24,mesh:dev-b` 会被
+// `ip-cidr:` 冒号分支当 IP 条件整串拒绝、`geoip:cn,mesh:dev-b` 会被判成逗号多国，
+// 都是「前端拒绝后端接受的输入」（红线）。
+// 形态非法 → state='invalid'：后端整条静默跳过（不回落常规分类，防把 `x.com,mesh:`
+// 静默错编译成普通代理规则），前端据此本地报错而不是放行。
+const MESH_TAIL_PREFIX = 'mesh:';
+const MESH_POLICY_WORDS = new Set(['direct', 'deny']);
+const MESH_POLICY_FALLBACK = 'fallback';
+
+// 策略段归一：直通词归一小写；fallback:<id> 关键字忽略大小写、目标 TrimSpace 保留
+// 原样；未知段/空目标 → null（后端 normalizeMeshPolicySegment ok=false 同口径）。
+function normalizeMeshPolicySegment(seg) {
+  const s = String(seg || '').trim();
+  if (!s) return null;
+  const lower = s.toLowerCase();
+  if (MESH_POLICY_WORDS.has(lower)) return lower;
+  const colon = s.indexOf(':');
+  if (colon > 0 && s.slice(0, colon).toLowerCase() === MESH_POLICY_FALLBACK) {
+    const target = s.slice(colon + 1).trim();
+    return target ? `${MESH_POLICY_FALLBACK}:${target}` : null;
+  }
+  return null;
+}
+
+// 返回 { base, deviceId, policy, state }；state ∈ 'none'（非 mesh 条目）/
+// 'parsed' / 'invalid'（含 mesh: 段但形态不可解析）。具名导出仅供同目录测试。
+export function splitMeshRuleTail(raw) {
+  const text = String(raw || '');
+  const parts = text.split(',');
+  let meshIndex = -1;
+  for (let i = 0; i < parts.length; i += 1) {
+    if (parts[i].trim().toLowerCase().startsWith(MESH_TAIL_PREFIX)) {
+      meshIndex = i;
+      break;
+    }
+  }
+  if (meshIndex < 0) {
+    return { base: text, deviceId: '', policy: '', state: 'none' };
+  }
+  const tailParts = parts.slice(meshIndex + 1);
+  if (tailParts.length > 1) {
+    return { base: '', deviceId: '', policy: '', state: 'invalid' };
+  }
+  let policy = '';
+  if (tailParts.length === 1) {
+    const normalized = normalizeMeshPolicySegment(tailParts[0]);
+    if (normalized === null) {
+      return { base: '', deviceId: '', policy: '', state: 'invalid' };
+    }
+    policy = normalized;
+  }
+  const deviceId = parts[meshIndex].trim().slice(MESH_TAIL_PREFIX.length).trim();
+  if (!deviceId) {
+    return { base: '', deviceId: '', policy: '', state: 'invalid' };
+  }
+  const base = parts.slice(0, meshIndex).join(',').trim();
+  if (!base) {
+    return { base: '', deviceId: '', policy: '', state: 'invalid' };
+  }
+  return { base, deviceId, policy, state: 'parsed' };
+}
+
 // URL/host:port 的宽容归一提取 + 剥 [] 包裹（对齐后端 classifyDomainEntry 提取段；
 // host:port 对齐 net.SplitHostPort，端口可空、不做数字校验；URL 解析失败时保留原串
 // 交由字符校验报错）。尾点不剥离——尾点属结构非法，交由空标签检查拒绝。
@@ -677,6 +743,17 @@ function normalizeConditionHost(s) {
 export function validateRuleEntry(raw, t) {
   let s = String(raw || '').trim();
   if (!s) return '';
+  // mesh 转发尾段先剥（对齐后端 splitMeshTail 在 ClassifyEntry 之前剥离）：
+  // 若不先剥，`ip-cidr:1.2.3.0/24,mesh:dev-b` 会被下方冒号分支整串拒、
+  // `geoip:cn,mesh:dev-b` 会被判逗号多国——都是「前端拒绝后端接受的输入」。
+  // 形态非法（空 deviceID/多策略段/未知策略段/空 base）→ 本地报错：后端整条
+  // 静默跳过，前端不说的话用户看到的是「保存成功但规则没生效」。
+  const meshTail = splitMeshRuleTail(s);
+  if (meshTail.state === 'invalid') return t('rules_meshInvalid');
+  if (meshTail.state === 'parsed') {
+    // base 按常规语法校验（后端同样先剥尾再 ClassifyEntry）；base 内不再含 mesh: 段
+    return validateRuleEntry(meshTail.base, t);
+  }
   const lower = s.toLowerCase();
   // geoip：冒号风格（多国 + 分隔）——必须先于下方 IP/域名分支短路：
   // geoip 条目含 ':'/'+'（不在 ENTRY_CHARS_RE 字符集），且逗号分支与 host:port 提取都会把它拆坏
@@ -745,6 +822,13 @@ export function validateRuleEntry(raw, t) {
 export function extractProxyRuleDomain(raw) {
   let s = String(raw || '').trim();
   if (!s) return '';
+  // mesh 尾段先剥（后端 splitMeshTail 先于 ClassifyEntry）：条件只取 base，
+  // 否则 `x.com,mesh:dev-b` 会被当成「保留末段」提取出 'mesh:dev-b'，
+  // 与 AI include 的假重叠、（若将来参与去重）错键一并产生。形态非法时
+  // 整条返回 ''——非法行不参与比对，红色错误提示已在优先位置展示。
+  const meshTail = splitMeshRuleTail(s);
+  if (meshTail.state === 'invalid') return '';
+  if (meshTail.state === 'parsed') s = meshTail.base;
   const lower = s.toLowerCase();
   if (lower.startsWith('geoip:')) return `geoip:${lower.slice(6).trim()}`;
   if (lower.startsWith('ip-cidr:')) return lower.slice(8).trim();
@@ -801,10 +885,16 @@ const COLON_KEYWORD_PREFIXES = ['geoip:', 'ip-cidr:', 'ip-range:', 'ip-from:'];
 // 具名导出仅供同目录 RulesSettings.test.js 做塌缩语义回归测试使用。
 export function detectCommaCollapseIssue(rawText, t) {
   for (const line of sanitizeLines(rawText)) {
-    const lower = line.toLowerCase();
+    // mesh 尾段先剥（后端 splitMeshTail 先于 ClassifyEntry）：`x.com,mesh:dev-b`
+    // 的「保留末段」是 mesh 目标而非被塌缩丢弃的域名，不剥会把每个 mesh 条目
+    // 都误报成「其余段被静默忽略」。非法形态不提示（红色错误已优先展示）。
+    const meshTail = splitMeshRuleTail(line);
+    if (meshTail.state === 'invalid') continue;
+    const effective = meshTail.state === 'parsed' ? meshTail.base : line;
+    const lower = effective.toLowerCase();
     if (COLON_KEYWORD_PREFIXES.some((prefix) => lower.startsWith(prefix))) continue;
-    if (!line.includes(',')) continue;
-    const parts = line.split(',');
+    if (!effective.includes(',')) continue;
+    const parts = effective.split(',');
     if (COMMA_KEYWORD_HEADS.has(parts[0].trim().toLowerCase())) continue;
     const tail = parts[parts.length - 1].trim().toLowerCase();
     const kept = (ACTION_TAIL_WORDS.has(tail) ? parts[parts.length - 2] : parts[parts.length - 1]).trim();

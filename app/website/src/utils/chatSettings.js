@@ -209,6 +209,10 @@ export function deviceSessionToConversation(entry) {
     // 的模型抹掉（现已在 create 侧改为「空值不覆盖」双保险）。
     model: entry.model || '',
     effort: entry.effort || '',
+    // approval_mode 必须回填（2026-11-09 修复）：后端清单已带该键，漏映射会让
+    // 设备会话续聊恒显示「默认推荐」，且下一条消息重发 create 显式下发空串把
+    // 服务端挡位抹掉。normalizeApprovalMode 对缺失/非法值归一 ''。
+    approvalMode: normalizeApprovalMode(entry.approval_mode),
     deviceSession: entry,
     createdAt: entry.created_at || '',
     updatedAt: entry.updated_at || '',

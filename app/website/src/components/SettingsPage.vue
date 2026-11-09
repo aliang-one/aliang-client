@@ -163,6 +163,16 @@
                   :success-message="customerConfigSuccess"
                   @save="saveCustomerConfig"
                 />
+                <!-- mesh 组网卡（代理族相邻挂载;Task 1=骨架占位,Task 2 填状态条+
+                     离线兜底常驻卡,Task 3 填拓扑画布;写路径=customer.mesh patch 链） -->
+                <MeshSettings
+                  :config="customerConfig"
+                  :loading="isLoadingCustomerConfig"
+                  :saving="isSavingCustomerConfig"
+                  :error="customerConfigError"
+                  :success-message="customerConfigSuccess"
+                  @save="saveCustomerConfig"
+                />
               </template>
             </div>
             <!-- 右栏:运行模式免登录(设备本地,与电源按钮同级);模型映射依赖
@@ -266,6 +276,8 @@
 // 迁出：运行模式→代理设置首卡，系统状态/文件访问授权→仪表盘侧栏紧凑卡。
 import RulesSettings from './settings/RulesSettings.vue';
 import SshIngressSettings, { normalizeSSHIngressConfig } from './settings/SshIngressSettings.vue';
+import MeshSettings from './settings/MeshSettings.vue';
+import { normalizeMeshConfig } from './settings/MeshSettings.js';
 import UserInfoSettings from './settings/UserInfoSettings.vue';
 import LogsSettings from './settings/LogsSettings.vue';
 import ModelMappingSettings from './settings/ModelMappingSettings.vue';
@@ -312,7 +324,13 @@ function createDefaultCustomerConfig() {
     },
     // SSH 入口服务面(customer.ssh_ingress;三态指针 nil=false,前端恒产出显式
     // 布尔——nil 与 false 行为等价;port 0=后端归一默认 56442)
-    ssh_ingress: normalizeSSHIngressConfig()
+    ssh_ingress: normalizeSSHIngressConfig(),
+    // mesh 节点转发网(customer.mesh;三态指针 enable nil=true /
+    // forward_enable nil=false / relay nil=true / fallback.enable nil=false,
+    // 归一层恒产出显式布尔——ssh_ingress 先例)。⚠️ 必须在
+    // normalizeCustomerConfig 同步挂 normalizeMeshConfig,漏挂 = 保存 200
+    // 但永不落盘(peer_mcp 2026-10-31 验收缺陷①同族)。
+    mesh: normalizeMeshConfig()
   };
 }
 
@@ -414,6 +432,10 @@ function normalizeCustomerConfig(payload = {}) {
     agentcore_llm: normalizeAgentCoreLLMConfig(payload?.agentcore_llm),
     agentcore: normalizeAgentCoreTuning(payload?.agentcore),
     ssh_ingress: normalizeSSHIngressConfig(payload?.ssh_ingress),
+    // mesh:漏挂此键 = 卡片保存 200 但永不落盘(见 createDefaultCustomerConfig
+    // 同款注释;normalizeMeshConfig 恒产出显式布尔,默认值与 GET 回显同构,
+    // 未改动不产生伪 patch)
+    mesh: normalizeMeshConfig(payload?.mesh),
     ...(peerMcp ? { peer_mcp: peerMcp } : {})
   };
 }
@@ -426,11 +448,23 @@ function isPlainObject(value) {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
 
+// 数组等值比较：原语元素用 ===；对象元素（mesh.peers / proxy.jump_servers）
+// 用 JSON 串等值——两侧恒经同一归一化函数产出（键序固定），引用不等但值等
+// 时不进 patch。修复对象数组「每次保存必带伪 diff」的噪声（deep-merge 幂等
+// 故无害，但污染 patch 并放大配置版本抖动）。
 function areArraysEqual(left = [], right = []) {
   if (left.length !== right.length) {
     return false;
   }
-  return left.every((value, index) => value === right[index]);
+  return left.every((value, index) => {
+    if (value === right[index]) {
+      return true;
+    }
+    if (isPlainObject(value) && isPlainObject(right[index])) {
+      return JSON.stringify(value) === JSON.stringify(right[index]);
+    }
+    return false;
+  });
 }
 
 function buildCustomerConfigPatch(nextConfig, currentConfig) {
@@ -449,6 +483,16 @@ function buildCustomerConfigPatch(nextConfig, currentConfig) {
       patch.proxy = isPlainObject(patch.proxy) ? patch.proxy : {};
       patch.proxy[key] = '';
     }
+  }
+
+  // mesh 兜底地址清空同款（空串显式带出）：关兜底后清掉旧 addr,避免再次
+  // 启用时旧地址经 deep-merge「复活」成静默兜底目标。
+  const nextFallbackAddr = String(normalizedNext.mesh?.fallback?.addr ?? '');
+  const currentFallbackAddr = String(normalizedCurrent.mesh?.fallback?.addr ?? '');
+  if (!nextFallbackAddr && currentFallbackAddr) {
+    patch.mesh = isPlainObject(patch.mesh) ? patch.mesh : {};
+    patch.mesh.fallback = isPlainObject(patch.mesh.fallback) ? patch.mesh.fallback : {};
+    patch.mesh.fallback.addr = '';
   }
 
   applyAgentCoreLLMClearing(patch, normalizedNext.agentcore_llm, normalizedCurrent.agentcore_llm);
@@ -510,6 +554,7 @@ export default {
   components: {
     RulesSettings,
     SshIngressSettings,
+    MeshSettings,
     UserInfoSettings,
     LogsSettings,
     ModelMappingSettings,

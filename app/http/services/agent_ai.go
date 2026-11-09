@@ -146,8 +146,14 @@ func (m *agentAIManager) vibeSessionsSnapshot(includeIdle bool) []models.AgentVi
 			MessageCount:          len(session.history),
 			Model:                 session.model,
 			Effort:                session.effort,
-			CreatedAt:             createdAt,
-			UpdatedAt:             now,
+			// approval_mode 随快照上报(2026-11-09 手机同步展示补链):hello/sync
+			// 与 VibeSessions 列表是手机端唯一实时回显通道,漏填则手机永远看到
+			// 旧挡位。字段本身去掉了 omitempty(见 models.AgentVibeSession),
+			// 空串也照常下发——消费端靠「缺键=保存量」区分不了「切回默认」与
+			// 「这条上报没这个话题」,只有恒带键才传得动重置。
+			ApprovalMode: session.approvalMode,
+			CreatedAt:    createdAt,
+			UpdatedAt:    now,
 		})
 	}
 	sort.Slice(sessions, func(i, j int) bool {
@@ -1989,6 +1995,12 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 		if disabledSkillsSet {
 			existing.disabledSkills = disabledSkills
 		}
+		// approval_mode 换挡落内存(2026-11-09 修复):此前解析值在此分支整体
+		// 丢弃,run.approvalMode 从 session 拷贝恒空串,换挡对执行层零影响,
+		// ack 回显陈旧值把前端 chip 弹回「默认推荐」。带键才写(preserve 同纪律)。
+		if approvalModeSet {
+			existing.approvalMode = approvalMode
+		}
 		// 显式改键立即同步 journal 头行——这是持久化的唯一写点（2026-10-31
 		// 评审修正：不做「每 run 进门同步」，那会把未恢复/未水合的内存态当
 		// 权威、把头行里持久化的名单删掉）。未带键的一侧先从当前头行水合内存
@@ -2006,6 +2018,11 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 				}
 			}
 			m.coreJournal.syncSessionSwitches(sessionID, existing.disabledMCPServers, disabledMCPServersSet, existing.disabledSkills, disabledSkillsSet)
+		}
+		// approval_mode 换挡独立同步 journal(2026-11-09 修复):sync 自带 set
+		// 标记(缺键=preserve),此前被裹进上方 MCP/技能键门禁——纯换挡连
+		// 头行持久化都不落。
+		if approvalModeSet && m.coreJournal != nil {
 			m.coreJournal.syncSessionApprovalMode(sessionID, approvalMode, approvalModeSet)
 		}
 		// 身份三字段空值不覆写已钉值(与 mergeRunStartIdentityLocked 同纪律):
@@ -2096,6 +2113,15 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 			logger.Warn(fmt.Sprintf("ai.session.create: journal history restore failed session=%s err=%v", sessionID, herr))
 		}
 	}
+	// approval_mode 重启兜底(2026-11-09 修复):载荷没带键时从 journal 头行
+	// 回填,与上方 MCP/技能开关同纪律(message() 懒建分支一直有此回填,create
+	// 侧此前缺失→重启后首个 create 把持久化的挡位静默冲回默认)。独立条件——
+	// 上方块的门禁含 MCP/技能/transcript 项,全带键时整块跳过,不能复用。
+	if provider == "agentcore" && m.coreJournal != nil && !approvalModeSet {
+		if _, head, herr := readAgentCoreJournalHistoryFrom(m.coreJournal.dir, sessionID); herr == nil {
+			approvalMode = head.approvalMode
+		}
+	}
 	newHistoryMessages, newHistoryChars := agentAIHistoryLimits(provider, contextWindow)
 	session := &agentAISession{
 		id:                      sessionID,
@@ -2108,6 +2134,7 @@ func (m *agentAIManager) create(msg map[string]interface{}, writeJSON agentTermi
 		maxTokens:               maxTokens,
 		disabledMCPServers:      disabledMCPServers,
 		disabledSkills:          disabledSkills,
+		approvalMode:            approvalMode,
 		resumeSessionID:         resumeSessionID,
 		reservedNativeSessionID: reservedNativeSessionID,
 		bindingVersion:          bindingVersion,
@@ -2398,7 +2425,14 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 		m.coreJournal.syncSessionSwitches(sessionID, session.disabledMCPServers, mcpSet, session.disabledSkills, skillsSet)
 	}
 	if approvalMode, ok := parseAgentAIApprovalMode(msg); ok {
-		m.coreJournal.syncSessionApprovalMode(sessionID, approvalMode, ok)
+		// 内存写入(2026-11-09 修复):此前只同步 journal 不落内存,
+		// run.approvalMode 从 session 拷到的是陈旧值,ai.message 换挡对执行
+		// 层零影响。journal 同步保留 nil 守卫(syncSessionApprovalMode 首行
+		// 自判 j==nil,双保险仅为显式可读)。
+		session.approvalMode = approvalMode
+		if m.coreJournal != nil {
+			m.coreJournal.syncSessionApprovalMode(sessionID, approvalMode, ok)
+		}
 	}
 	if surface := normalizeAgentAISurface(remoteString(msg, "surface")); surface != "" {
 		session.surface = surface

@@ -1440,6 +1440,12 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 			registry.Register(router)
 			subagentPrompt = agentCoreSubagentMechanismSuffix(router)
 		}
+		// 中断注入（L1，feat/subagent-interrupted-injection）：上一回合未终态
+		// 子 agent 对账进 system prompt——主 LLM 感知中断并可智能重派。装配期
+		// 一次求值，本 run 后续派发不受影响；journal=nil 容忍既有测试路径。
+		if journal != nil {
+			subagentPrompt += agentCoreSubagentInterruptedSuffix(journal.unfinishedSubagents(run.sessionID))
+		}
 		// 设备互访工具注入（spec 2026-10-29 §7.2 阶段 1 四件）：与 MCP/子 agent
 		// 桥同款宿主注入。桥内共享注册表 handler 实现（POST 编排），自带
 		// journal 落行。审批取舍（v1）：写工具免逐次审批，不挂 kernelApprove。

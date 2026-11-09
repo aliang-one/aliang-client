@@ -4,6 +4,7 @@ import {
   deviceSessionToConversation,
   isAliangCodeSession,
   isTerminalPrefixedSessionId,
+  normalizeApprovalMode,
   normalizeDeviceProvider,
 } from '../utils/chatSettings';
 
@@ -123,6 +124,13 @@ export function useDeviceSessions() {
     cached.deviceSession = entry;
     cached.running = entry.status === 'running';
     cached.updatedAt = Date.parse(entry.updated_at || '') || cached.updatedAt || 0;
+    // approval_mode 回填（2026-11-09 修复）：清单是服务端权威，漏回填会让已
+    // 打开的壳保留建壳时刻的旧挡位，下一条消息重发 create 显式下发旧值，把
+    // 别端的换挡静默回滚。空串是合法显式值（切回默认），照常覆盖；仅本地
+    // 刚切挡在途（pendingConfig 未 ack）时跳过，防止清单旧值冲掉在途改动。
+    if (!cached.pendingConfig) {
+      cached.approvalMode = normalizeApprovalMode(entry.approval_mode);
+    }
     // resume 字段仅首次 create：created ack 消费后置 resumeConsumed（ChatPage
     // 侧），清单刷新不得复活——否则每次刷新都会把刚删掉的 resume 加回来。
     if (isTerminalPrefixedSessionId(entry.id) && !cached.resumeConsumed) {

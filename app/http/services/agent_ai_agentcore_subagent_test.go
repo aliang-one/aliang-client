@@ -344,14 +344,24 @@ func TestAgentCoreSubagentBridgeInterruptedPhase(t *testing.T) {
 	if !res.IsError {
 		t.Fatalf("取消路径应返回错误结果: %+v", res)
 	}
-	var finish map[string]interface{}
+	var finish, start map[string]interface{}
 	for _, line := range readJournalLines(t, j.dir, "s-cancel") {
-		if line["kind"] == "subagent" && line["event"] == "finish" {
+		if line["kind"] != "subagent" {
+			continue
+		}
+		if line["event"] == "finish" {
 			finish = line
+		} else if line["event"] == "start" {
+			start = line
 		}
 	}
 	if finish == nil || finish["status"] != "interrupted" {
 		t.Fatalf("取消路径 journal 终态应为 interrupted, got %v", finish)
+	}
+	// 中断注入数据面：start 行携带 task 文本（截断），崩溃后主 LLM 仍知道
+	// 当时在做什么（feat/subagent-interrupted-injection）。
+	if start == nil || start["task"] != "调研" {
+		t.Fatalf("start 行 task 字段缺失/错: %v", start)
 	}
 }
 
@@ -465,5 +475,23 @@ func TestAgentCoreSubagentBuiltinDefaults(t *testing.T) {
 	block2 := agentCoreSubagentMechanismSuffix(router2)
 	if !strings.Contains(block2, "用户自定义调研") || strings.Contains(block2, "输出结构化调研报告") {
 		t.Fatalf("用户定义应覆盖内置: %q", block2)
+	}
+}
+
+func TestAgentCoreSubagentInterruptedSuffix(t *testing.T) {
+	// 中断注入（L1）：未终态子 agent 清单进 system prompt——主 LLM 感知中断
+	// 并可智能重派。空清单零副作用；清单必须带类型名/task 文本/重派指引。
+	if got := agentCoreSubagentInterruptedSuffix(nil); got != "" {
+		t.Fatalf("空清单应返回空串, got %q", got)
+	}
+	entries := []agentCoreSubagentInterrupted{
+		{TaskID: "t1", Name: "researcher", Task: "调研加密方案", StartedAt: "2026-11-09T12:04:05Z", ToolCalls: 3, LastTool: "Grep"},
+	}
+	got := agentCoreSubagentInterruptedSuffix(entries)
+	for _, marker := range []string{"<interrupted-subagents>", "never returned", "researcher",
+		"调研加密方案", "re-dispatch", "3 tool calls", "last: Grep"} {
+		if !strings.Contains(got, marker) {
+			t.Fatalf("中断块缺标记 %q: %q", marker, got)
+		}
 	}
 }
