@@ -26,9 +26,25 @@ var (
 	connIDCounter int64
 )
 
-// StartHttpProxy starts the HTTP CONNECT proxy server
-// This is a blocking function that runs until stopped
+// StartMitmHttp starts the HTTP CONNECT proxy server.
+// This is a blocking function that runs until stopped. 绑定失败即进程退出
+// (boot fail-fast:起不来让 systemd 拉起重试,坏状态不留活)。绑定重试路径
+// (ReconcileUnifiedIngressBinding)须用 StartMitmHttpTolerant。
 func StartMitmHttp() {
+	startUnifiedIngress(true)
+}
+
+// StartMitmHttpTolerant 是绑定重试路径的容忍变体(评审 I1):绑定失败只记
+// Error 并返回,不 Fatal——重绑(mesh 总开关切换触发停→按新地址重绑)在
+// goroutine 里跑,瞬时端口占用/环境异常把整个 agent 进程杀掉属不成比例的
+// 失败;留活进程让下次提交或自愈链重试。
+func StartMitmHttpTolerant() {
+	startUnifiedIngress(false)
+}
+
+// startUnifiedIngress 是两条启动路径共用主体;fatalOnBindErr 区分 boot
+// fail-fast 与重试容忍。
+func startUnifiedIngress(fatalOnBindErr bool) {
 	httpMutex.Lock()
 	if isHttpRunning {
 		httpMutex.Unlock()
@@ -49,7 +65,12 @@ func StartMitmHttp() {
 	if err != nil {
 		isHttpRunning = false
 		httpMutex.Unlock()
-		logger.GetMainLogger().Fatal(fmt.Sprintf("Failed to listen on %s: %v", listenAddr, err))
+		if fatalOnBindErr {
+			logger.GetMainLogger().Fatal(fmt.Sprintf("Failed to listen on %s: %v", listenAddr, err))
+			return
+		}
+		logger.Error(fmt.Sprintf("统一入口绑定失败(留待重试): %s: %v", listenAddr, err))
+		return
 	}
 
 	httpCtx, httpCancel = context.WithCancel(context.Background())

@@ -50,6 +50,7 @@ type Server struct {
 	mu      sync.Mutex
 	running bool
 	conns   map[net.Conn]struct{}
+	rootCtx context.Context // Start 建立的根取消链:注入连接的停机兜底
 	cancel  context.CancelFunc
 	wg      sync.WaitGroup // 每连接 goroutine(注入路径 ServeConn 记账)
 
@@ -91,8 +92,12 @@ func (s *Server) Start() error {
 	}
 	s.running = true
 	// 根取消链保留(Stop 时 cancel):注入连接的拆除主路径是连接快照关闭,
-	// cancel 是 Stop 语义的完整性兜底(与旧监听路径同款生命周期字段)。
-	_, s.cancel = context.WithCancel(context.Background())
+	// 根 ctx 是 Stop 语义的完整性兜底——handleConn 的 per-conn ctx 监视挂它,
+	// 快照后滑入/交错的注入连接由它兜底关闭(评审 B1:旧监听路径 acceptLoop
+	// 传 Start 作用域 ctx 的同款兜底,注入缝不可丢)。
+	ctx, cancel := context.WithCancel(context.Background())
+	s.rootCtx = ctx
+	s.cancel = cancel
 	s.mu.Unlock()
 
 	logger.Info("SSH ingress server running (listening is owned by the unified ingress 56432)")
@@ -121,7 +126,7 @@ func (s *Server) Stop() error {
 		cancel()
 	}
 	// 快照内的在途连接全部断开,让握手/通道 goroutine 解除阻塞退出;
-	// 快照后滑入的连接由 handleConn 的 ctx 监视兜底关闭。
+	// 快照后滑入/交错的连接由根 ctx 兜底关闭(见 Start 注释)。
 	for _, c := range pending {
 		_ = c.Close()
 	}
@@ -239,34 +244,49 @@ func keyInList(key gossh.PublicKey, list []gossh.PublicKey) bool {
 //
 // 入口未在运行态时直接关连接返回——与合并前「入口未启动则无人监听、连接被
 // 拒」语义等价;不回显任何协议字节。
-func (s *Server) ServeConn(ctx context.Context, conn net.Conn) {
+// ServeConn 承载一条外部注入的已 accept 连接(统一口分派缝,spec §6.4)。
+// 阻塞至连接结束;关闭归本函数与 handleConn(双关幂等)。
+//
+// 停机交错纪律(评审 B1):running 检查、conns 登记、wg.Add 必须在同一
+// s.mu 临界区内完成——与 Stop 的「running 翻转→快照」互斥后,注入连接
+// 要么整段落在快照前(被快照拆除+wg.Wait 排水),要么整段落在翻转后
+// (running=false,关连接返回,零记账)。分三段临界区会产生「登记晚于
+// 快照但 wg.Add 早于 Wait」的交错:Stop 的 wg.Wait 挂死在一条无人拆除、
+// ctx 又是 Background 的长活隧道上,连带 reconcileMu 永久持锁。
+//
+// ctx 取自 Start 的根取消链(不收外部 ctx):handleConn 的 per-conn 监视
+// 挂根 ctx,Stop 的 cancel() 对快照外交错连接兜底关闭——与旧监听路径
+// acceptLoop 传 Start 作用域 ctx 的兜底同源。
+func (s *Server) ServeConn(conn net.Conn) {
 	if conn == nil {
 		return
 	}
 	s.mu.Lock()
-	running := s.running
-	s.mu.Unlock()
-	if !running {
+	if !s.running {
+		s.mu.Unlock()
 		_ = conn.Close()
 		return
 	}
+	ctx := s.rootCtx
+	// 与旧 acceptLoop 相同的记账顺序:登记连接 + wg.Add 一气呵成(见上
+	// 交错纪律),wg 计数交给 handleConn(其首行 wg.Done)。
+	s.conns[conn] = struct{}{}
+	s.wg.Add(1)
+	s.mu.Unlock()
 
 	// host key 缺失/损坏时此处会生成并落盘——与 Start 同源同锁(ensureHostKey
-	// 内部 hostKeyMu),不会出现双钥并存。
+	// 内部 hostKeyMu),不会出现双钥并存。失败即拆除:已登记的连接由
+	// handleConn 的 defer 关闭/除名。
 	signer, err := s.ensureHostKey()
 	if err != nil {
 		logger.Error(fmt.Sprintf("SSH ingress serve injected conn: host key: %v", err))
+		s.wg.Add(-1)
 		_ = conn.Close()
+		s.mu.Lock()
+		delete(s.conns, conn)
+		s.mu.Unlock()
 		return
 	}
-
-	// 与 acceptLoop 相同的记账顺序:先登记连接再把 wg 计数交给 handleConn
-	// (handleConn 首行 wg.Done)。注入连接不在 acceptLoop 的生命周期内,故
-	// 由本函数自己 Add。
-	s.mu.Lock()
-	s.conns[conn] = struct{}{}
-	s.mu.Unlock()
-	s.wg.Add(1)
 	s.handleConn(ctx, conn, s.serverConfig(signer))
 }
 

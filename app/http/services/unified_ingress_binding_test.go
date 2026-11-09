@@ -26,16 +26,17 @@ type ingressBindingProbe struct {
 	starts  int32
 }
 
-// install 把三个包级缝换成替身,测试结束自动还原。
+// install 把包级缝换成替身,测试结束自动还原。起口缝注入 httpRestartRunner
+// (评审 I1:reconcile 用容忍变体,不共用 boot 的 Fatal 路径)。
 func (p *ingressBindingProbe) install(t *testing.T) {
 	t.Helper()
 	prevRunning, prevAddr := httpProxyIsRunningProbe, unifiedIngressListenAddrProbe
-	prevStop, prevStart := httpStopRunner, httpStartRunner
+	prevStop, prevRestart := httpStopRunner, httpRestartRunner
 	t.Cleanup(func() {
 		httpProxyIsRunningProbe = prevRunning
 		unifiedIngressListenAddrProbe = prevAddr
 		httpStopRunner = prevStop
-		httpStartRunner = prevStart
+		httpRestartRunner = prevRestart
 	})
 
 	httpProxyIsRunningProbe = func() bool {
@@ -54,7 +55,7 @@ func (p *ingressBindingProbe) install(t *testing.T) {
 		p.running = false
 		p.mu.Unlock()
 	}
-	httpStartRunner = func() {
+	httpRestartRunner = func() {
 		atomic.AddInt32(&p.starts, 1)
 	}
 }

@@ -318,7 +318,9 @@ func ReconcileUnifiedIngressBinding(cfg *config.Config) {
 
 	logger.Info(fmt.Sprintf("统一入口绑定地址变更 %s → %s,重启 listener", current, expected))
 	httpStopRunner()
-	go httpStartRunner()
+	// 起口走容忍变体(评审 I1):重绑失败 Error 留待重试,不在 goroutine 里
+	// Fatal 杀进程。
+	go httpRestartRunner()
 }
 
 // 导出的 IngressHostKeyFileName。与 host key 指纹 API(ssh_ingress_handler

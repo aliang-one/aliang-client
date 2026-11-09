@@ -37,7 +37,7 @@ func serveConnVia(t *testing.T, s *Server) string {
 			if err != nil {
 				return
 			}
-			go s.ServeConn(context.Background(), c)
+			go s.ServeConn(c)
 		}
 	}()
 	return l.Addr().String()
@@ -80,7 +80,7 @@ func TestServeConnRejectsWhenNotRunning(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		s.ServeConn(context.Background(), server)
+		s.ServeConn(server)
 		close(done)
 	}()
 	<-done
@@ -106,5 +106,34 @@ func TestHandleIngressConnRejectsUnconfigured(t *testing.T) {
 	_ = client.SetReadDeadline(timeNowPlus())
 	if _, err := client.Read(make([]byte, 1)); err == nil {
 		t.Fatal("rejected conn must be closed")
+	}
+}
+
+// TestStopDrainsInterleavedInjectedConns 停机交错压力钉子(评审 B1):注入
+// 连接与 Stop 并发交错时,Stop 必须在有限时间返回(不被「登记晚于快照、
+// ctx 无兜底」的在途连接挂死——那会连带 reconcileMu 永久持锁),且返回后
+// 注入连接全部被拆除。多轮次放大交错窗口;配合 -race 覆盖 wg 记账窗口。
+func TestStopDrainsInterleavedInjectedConns(t *testing.T) {
+	humanPub, _ := newTestKey(t)
+	for round := 0; round < 20; round++ {
+		s := NewServer(RunConfig{AuthorizedKeys: []gossh.PublicKey{humanPub}}, filepath.Join(t.TempDir(), IngressHostKeyFileName))
+		if err := s.Start(); err != nil {
+			t.Fatalf("round %d start: %v", round, err)
+		}
+		for i := 0; i < 8; i++ {
+			client, server := net.Pipe()
+			go func() { _, _ = io.Copy(io.Discard, client) }()
+			go s.ServeConn(server)
+		}
+		done := make(chan struct{})
+		go func() {
+			_ = s.Stop()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("round %d: Stop must return promptly with interleaved injected conns", round)
+		}
 	}
 }

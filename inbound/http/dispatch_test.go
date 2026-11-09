@@ -4,12 +4,9 @@
 package http
 
 import (
-	"bufio"
 	"context"
 	"io"
 	"net"
-	stdhttp "net/http"
-	"strings"
 	"testing"
 	"time"
 
@@ -229,11 +226,3 @@ func TestDispatchConnSocksEndToEnd(t *testing.T) {
 		t.Fatal("dispatchConn did not return")
 	}
 }
-
-// 静态断言:dispatch 的 http 分支必须保留 bufio.Reader 供透明代理分支使用
-// (http.ReadRequest 与 HandleHttpConnection 都需要 *bufio.Reader)。
-var _ = bufio.NewReader
-var _ = stdhttp.ReadRequest
-var _ = context.Background
-var _ = M.TCP
-var _ = strings.TrimSpace

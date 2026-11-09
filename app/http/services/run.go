@@ -29,8 +29,11 @@ var (
 	tunStartRunner            = defaultStartTUN
 	tunPrepareStartRunner     = runner2.PrepareStart
 	httpStartRunner           = httpServer.StartMitmHttp
-	httpStopRunner            = httpServer.StopHttpProxy
-	tunStopRunner             = runner2.Stop
+	// httpRestartRunner 是绑定重试路径的起口缝(评审 I1):重绑失败容忍
+	// (Error 留待重试),不共用 boot 路径的 Fatal fail-fast。
+	httpRestartRunner = httpServer.StartMitmHttpTolerant
+	httpStopRunner    = httpServer.StopHttpProxy
+	tunStopRunner     = runner2.Stop
 	// httpProxyIsRunningProbe reports whether the HTTP proxy listener (56432) is
 	// actually accepting connections. Injectable for tests. The auth-expiry stop
 	// path keys off this rather than runService.isRunning, so a desynced flag

@@ -7,7 +7,6 @@ package ssh
 
 import (
 	"bytes"
-	"context"
 	"fmt"
 	"net"
 	"sort"
@@ -158,7 +157,7 @@ func IsRunning() bool {
 // 锁纪律:只在锁内取实例快照,serve 全在锁外——握手是长事务,持 reconcileMu
 // 会闸住并发的配置提交与状态查询(与 stopReconciledLocked 的短临界区同口径)。
 // 实例被 Reconcile 换掉的瞬间,在途 ServeConn 由其自身 Stop 的连接快照拆除
-// 覆盖,不会静默留活。
+// +根 ctx 兜底覆盖,不会静默留活(评审 B1:注入连接挂 Start 根取消链)。
 func HandleIngressConn(conn net.Conn) bool {
 	reconcileMu.Lock()
 	srv := reconcileSrv
@@ -169,6 +168,6 @@ func HandleIngressConn(conn net.Conn) bool {
 		}
 		return false
 	}
-	srv.ServeConn(context.Background(), conn)
+	srv.ServeConn(conn)
 	return true
 }
