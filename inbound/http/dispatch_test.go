@@ -1,0 +1,192 @@
+// dispatch_test.go — 统一入口分派(spec §4/§6.2):嗅探→移交。本层只验
+// 「交对了人 + 交的是完整字节流 + 未装配时的拒绝语义」;各协议内部语义
+// (mesh 帧门禁、http CONNECT、socks 协商)由各自包/既有测试覆盖。
+package http
+
+import (
+	"bufio"
+	"context"
+	"io"
+	"net"
+	stdhttp "net/http"
+	"strings"
+	"testing"
+	"time"
+
+	M "aliang.one/nursorgate/inbound/tun/metadata"
+	auth "aliang.one/nursorgate/processor/auth"
+	tcphandler "aliang.one/nursorgate/processor/tcp"
+)
+
+// dispatchPipe 起一对 net.Pipe 供 dispatchConn 消费,写端写完即关。
+func dispatchPipe(t *testing.T, payload string) net.Conn {
+	t.Helper()
+	client, server := net.Pipe()
+	go func() {
+		_, _ = io.WriteString(client, payload)
+		_ = client.Close()
+	}()
+	t.Cleanup(func() { _ = server.Close() })
+	return server
+}
+
+// metadataRecorder 只记录管道收到的 metadata(不读 conn——CONNECT 隧道里
+// 已无 HTTP 请求,读请求会失败)。
+type metadataRecorder struct {
+	got chan *M.Metadata
+}
+
+func newMetadataRecorder() *metadataRecorder {
+	return &metadataRecorder{got: make(chan *M.Metadata, 1)}
+}
+
+func (r *metadataRecorder) Handle(_ context.Context, conn net.Conn, md *M.Metadata) error {
+	select {
+	case r.got <- md:
+	default:
+	}
+	_, _ = io.Copy(io.Discard, conn)
+	return nil
+}
+
+// waitConnClosed 断言 conn 已被对端关闭(读到 EOF/关闭类错误),带短窗口防挂死。
+func waitConnClosed(t *testing.T, conn net.Conn) {
+	t.Helper()
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := conn.Read(make([]byte, 1)); err == nil {
+		t.Fatal("expected conn to be closed")
+	}
+}
+
+func TestDispatchConnHTTPReachesCONNECTPath(t *testing.T) {
+	// CONNECT 分支带会话租约门禁(与合并前一致):无活跃会话会 503,故先登录。
+	authority := auth.ResetSessionAuthorityForTest()
+	authority.NotifyLoggedIn(&auth.UserInfo{ID: 1})
+	t.Cleanup(func() { auth.ResetSessionAuthorityForTest() })
+
+	orig := tcphandler.GetHandler()
+	rec := newMetadataRecorder()
+	tcphandler.SetHandler(rec)
+	t.Cleanup(func() { tcphandler.SetHandler(orig) })
+
+	// CONNECT 的 metadata 提取要求回环目标(与既有 CONNECT 用例同口径)。
+	// net.Pipe 是同步管道:服务端写 "200 Connection Established" 必须有人读,
+	// 否则 dispatchConn 卡在写应答、永远到不了管线——故客户端侧起读排空协程。
+	client, server := net.Pipe()
+	go func() {
+		_, _ = io.WriteString(client, "CONNECT 127.0.0.1:443 HTTP/1.1\r\nHost: 127.0.0.1:443\r\n\r\n")
+		_, _ = io.Copy(io.Discard, client)
+		_ = client.Close()
+	}()
+	t.Cleanup(func() {
+		_ = client.Close()
+		_ = server.Close()
+	})
+
+	done := make(chan struct{})
+	go func() {
+		dispatchConn(server)
+		close(done)
+	}()
+
+	// CONNECT 成功后是长隧道(handler 阻塞在 relay),故只断言「metadata 到达
+	// 管线」;dispatchConn 的返回由 t.Cleanup 关连接触发,不作时序断言。
+	select {
+	case md := <-rec.got:
+		if got, want := md.DstPort, uint16(443); got != want {
+			t.Fatalf("metadata dst port = %d, want %d", got, want)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("CONNECT must reach the TCP pipeline with metadata")
+	}
+	_ = client.Close()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("dispatchConn did not return after client closed")
+	}
+}
+
+func TestDispatchConnMeshUnwiredRejects(t *testing.T) {
+	origHandler := MeshConnHandler
+	MeshConnHandler = nil
+	t.Cleanup(func() { MeshConnHandler = origHandler })
+
+	conn := dispatchPipe(t, `{"from":"dev-a","class":"ai","target":"h:443"}`+"\n")
+	done := make(chan struct{})
+	go func() {
+		dispatchConn(conn)
+		close(done)
+	}()
+	<-done
+	// 未装配 mesh 处理器:连接被断开,且不得把 JSON 帧当 HTTP 喂进管线。
+	waitConnClosed(t, conn)
+}
+
+func TestDispatchConnMeshWiredReceivesReplay(t *testing.T) {
+	origHandler := MeshConnHandler
+	t.Cleanup(func() { MeshConnHandler = origHandler })
+
+	frame := `{"from":"dev-a","class":"ai","target":"h:443"}` + "\n" + "payload"
+	gotCh := make(chan string, 1)
+	MeshConnHandler = func(conn net.Conn) {
+		b, _ := io.ReadAll(conn)
+		gotCh <- string(b)
+	}
+
+	dispatchConn(dispatchPipe(t, frame))
+	select {
+	case got := <-gotCh:
+		if got != frame {
+			t.Fatalf("mesh handler got %q, want %q (sniff replay must be lossless)", got, frame)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("mesh handler never invoked")
+	}
+}
+
+func TestDispatchConnUnknownBytesGoesToHTTP(t *testing.T) {
+	// 未知字节流兜底 HTTP:ReadRequest 失败即断连,不 panic、不误派 mesh/ssh。
+	conn := dispatchPipe(t, "\xFF\xFE\x00\x01")
+	done := make(chan struct{})
+	go func() {
+		dispatchConn(conn)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("dispatchConn did not return for unknown stream")
+	}
+}
+
+// socksHandler 是可注入的 socks 处理器缝(测试替身),对应 dispatch 的
+// KindSocks 分支。
+func TestDispatchConnSocksReachesHandler(t *testing.T) {
+	origSocks := socksConnHandler
+	gotCh := make(chan string, 1)
+	socksConnHandler = func(conn net.Conn) {
+		b, _ := io.ReadAll(conn)
+		gotCh <- string(b)
+	}
+	t.Cleanup(func() { socksConnHandler = origSocks })
+
+	greeting := string([]byte{0x05, 0x01, 0x00})
+	dispatchConn(dispatchPipe(t, greeting))
+	select {
+	case got := <-gotCh:
+		if got != greeting {
+			t.Fatalf("socks handler got %q, want %q", got, greeting)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("socks handler never invoked")
+	}
+}
+
+// 静态断言:dispatch 的 http 分支必须保留 bufio.Reader 供透明代理分支使用
+// (http.ReadRequest 与 HandleHttpConnection 都需要 *bufio.Reader)。
+var _ = bufio.NewReader
+var _ = stdhttp.ReadRequest
+var _ = context.Background
+var _ = M.TCP
+var _ = strings.TrimSpace

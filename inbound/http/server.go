@@ -79,8 +79,10 @@ func StartMitmHttp() {
 			}
 		}
 
-		// Handle connection in a separate goroutine
-		go handleRawConnection(conn)
+		// 每个连接先进统一分派:嗅探协议族后移交 ssh/socks/mesh/http。
+		// 与合并前三口分立相比,「连哪个口」不再编码协议,「流量是什么」
+		// 才决定走哪条处理链(spec §4)。
+		go dispatchConn(conn)
 	}
 }
 
@@ -125,7 +127,11 @@ func IsHttpRunning() bool {
 	return isHttpRunning
 }
 
-// 处理客户端连接
+// handleRawConnection 处理一条已嗅探为 HTTP 的连接(统一分派后本函数只剩
+// HTTP 职责,名字沿用旧名以保持既有测试与调用面不变)。reader 必须保留:
+// http.ReadRequest 需要 *bufio.Reader,透明代理分支还要把它交给
+// HandleHttpConnection 续读——对 sniff 回放 conn 再包一层 bufio 是双层缓冲,
+// 读路径无损(内层缓存先耗尽)。
 func handleRawConnection(conn net.Conn) {
 	defer conn.Close()
 
