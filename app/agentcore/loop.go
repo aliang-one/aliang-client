@@ -955,6 +955,10 @@ func isEffortRejection(err error) bool {
 	return false
 }
 
+// IsEffortRejection 导出包装:宿主侧提取调用复用同一判定——跨包安全决策
+// 单点化,services 禁止复制错误形态识别(防漂移)。
+func IsEffortRejection(err error) bool { return isEffortRejection(err) }
+
 // mentionsEffort 判定错误文本是否点名 effort/output_config。
 func mentionsEffort(text string) bool {
 	t := strings.ToLower(text)

@@ -734,11 +734,14 @@ func TestRunAgentCoreSurfacesUpstreamErrorBody(t *testing.T) {
 
 // setTestAgentHome 同时隔离 HOME/USERPROFILE——Windows 上 UserHomeDir 优先读
 // USERPROFILE，只设 HOME 会让 journal 落进真实 profile（2026-10 计划评审）。
+// 同时关记忆提取：run 级既有测试断言上游精确请求次数，提取是新增副作用
+// （成功 run 收尾后向同一上游多发一次），不测提取的测试统一走产品开关关掉。
 func setTestAgentHome(t *testing.T) {
 	t.Helper()
 	dir := t.TempDir()
 	t.Setenv("HOME", dir)
 	t.Setenv("USERPROFILE", dir)
+	disableAgentCoreMemoryForTest(t)
 }
 
 // registerTestAISession 是 registerAISessionLocked 的取锁包装（文档要求

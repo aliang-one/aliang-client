@@ -446,6 +446,10 @@ func agentCoreSystemPromptWithContext(projectPath, sessionContext string) string
 	fmt.Fprintf(&b, "Today's date: %s\n", time.Now().Format("2006-01-02"))
 	b.WriteString("</env>\n\n")
 
+	// 项目记忆(spec §6):全量注入既有长期事实;空记忆=空串,prompt 逐字节
+	// 与从前一致。主 run 与子 agent 同享(同一函数链)。
+	b.WriteString(agentCoreMemoryPromptBlock(projectPath))
+
 	// 会话初始上下文（fork 快照 / goal 上下文 / 其它 system 角色历史）。
 	// CLI 通道由 buildAgentAIPrompt 以 "System: ..." 留在对话里；内核的
 	// messages 收不了 system 角色，只能挂到 system prompt 上，否则这一通道
@@ -1581,6 +1585,11 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		}
 		endStatus = "success"
 		m.setAgentAIResumeSessionIDIfEmpty(run.sessionID, run.runSeq, capturedResumeSessionID)
+		// 记忆提取(spec §5):正常成功回合收尾后异步小提取;中断/stopped/
+		// 失败/僵尸迟返回不提取(被丢弃的输出没有记忆价值)。detached,
+		// 任何失败只 Warn 绝不影响 run(与 journal 同族纪律)。
+		m.agentCoreMemoryExtractAsync(run.projectPath, agentCoreModel(run), run.effort,
+			agentCoreLastUserText(messages), assistantOutput)
 		// 刻意跳过 ccPeerSessionJSONL / appendLineageMarker：那是 Claude CLI 的
 		// transcript 谱系修补，内核没有对应的 JSONL 文件。
 		//

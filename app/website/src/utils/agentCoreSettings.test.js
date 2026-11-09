@@ -162,8 +162,14 @@ describe('normalizeAgentCoreTuning 全局总闸透传', () => {
       .toEqual({ max_identical_tool_turns: 0, mcp_enabled: false });
     expect(normalizeAgentCoreTuning({ skills_enabled: true }))
       .toEqual({ max_identical_tool_turns: 0, skills_enabled: true });
+    expect(normalizeAgentCoreTuning({ memory_enabled: false }))
+      .toEqual({ max_identical_tool_turns: 0, memory_enabled: false });
     expect(normalizeAgentCoreTuning({ max_identical_tool_turns: 3, mcp_enabled: true, skills_enabled: false }))
       .toEqual({ max_identical_tool_turns: 3, mcp_enabled: true, skills_enabled: false });
+    expect(normalizeAgentCoreTuning({ max_identical_tool_turns: 3, memory_enabled: true }))
+      .toEqual({ max_identical_tool_turns: 3, memory_enabled: true });
+    expect(normalizeAgentCoreTuning({ mcp_enabled: true, skills_enabled: false, memory_enabled: true }))
+      .toEqual({ max_identical_tool_turns: 0, mcp_enabled: true, skills_enabled: false, memory_enabled: true });
   });
 
   it('非布尔值不透传', () => {
@@ -173,15 +179,21 @@ describe('normalizeAgentCoreTuning 全局总闸透传', () => {
       .toEqual({ max_identical_tool_turns: 0 });
     expect(normalizeAgentCoreTuning({ mcp_enabled: 1 }))
       .toEqual({ max_identical_tool_turns: 0 });
+    expect(normalizeAgentCoreTuning({ memory_enabled: 'true' }))
+      .toEqual({ max_identical_tool_turns: 0 });
+    expect(normalizeAgentCoreTuning({ memory_enabled: null }))
+      .toEqual({ max_identical_tool_turns: 0 });
   });
 
   it('缺键不产出键(=未配置,后端 nil 视为开启)', () => {
     const next = normalizeAgentCoreTuning({ max_identical_tool_turns: 2 });
     expect('mcp_enabled' in next).toBe(false);
     expect('skills_enabled' in next).toBe(false);
+    expect('memory_enabled' in next).toBe(false);
     const empty = normalizeAgentCoreTuning(undefined);
     expect('mcp_enabled' in empty).toBe(false);
     expect('skills_enabled' in empty).toBe(false);
+    expect('memory_enabled' in empty).toBe(false);
   });
 });
 
