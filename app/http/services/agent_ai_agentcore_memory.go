@@ -468,7 +468,12 @@ type AgentCoreMemoryFacade struct{}
 var AgentCoreMemory = AgentCoreMemoryFacade{}
 
 func (AgentCoreMemoryFacade) List(project string) []agentCoreMemoryEntry {
-	return agentCoreMemory.list(project)
+	out := agentCoreMemory.list(project)
+	if out == nil {
+		// 空集归一为 [] 非 null(评审 NIT):前端/移动端直吃 JSON 数组。
+		out = []agentCoreMemoryEntry{}
+	}
+	return out
 }
 
 func (AgentCoreMemoryFacade) Add(project, content string) (agentCoreMemoryEntry, error) {
@@ -488,7 +493,12 @@ func (AgentCoreMemoryFacade) Clear(project string) error {
 }
 
 func (AgentCoreMemoryFacade) Projects() []agentCoreMemoryProjectInfo {
-	return agentCoreMemory.projects()
+	out := agentCoreMemory.projects()
+	if out == nil {
+		// 空集归一为 [] 非 null(评审 NIT):前端/移动端直吃 JSON 数组。
+		out = []agentCoreMemoryProjectInfo{}
+	}
+	return out
 }
 
 // SetDirForTest 导出测试目录注入:handlers 包测试拿不到 services 未导出

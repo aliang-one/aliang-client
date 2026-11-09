@@ -177,6 +177,15 @@ func registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/agent/mcp", agentHandler.HandleAliangMCPRegistry)
 	mux.HandleFunc("PUT /api/agent/mcp/servers/{name}", agentHandler.HandleAliangMCPServerPut)
 	mux.HandleFunc("DELETE /api/agent/mcp/servers/{name}", agentHandler.HandleAliangMCPServerDelete)
+	// agentcore 记忆 CRUD;双注册纪律——core routes.go 同名注册透传,缺任一
+	// 侧=404(老坑)。全部方法前缀形态,两条均为精确 pattern 互不吞。
+	agentMemoryHandler := handlers.NewAgentMemoryHandler()
+	mux.HandleFunc("GET /api/agent/memory", agentMemoryHandler.HandleMemoryList)
+	mux.HandleFunc("DELETE /api/agent/memory", agentMemoryHandler.HandleMemoryDelete)
+	mux.HandleFunc("POST /api/agent/memory", agentMemoryHandler.HandleMemoryPost)
+	mux.HandleFunc("PUT /api/agent/memory/{id}", agentMemoryHandler.HandleMemoryPut)
+	mux.HandleFunc("DELETE /api/agent/memory/{id}", agentMemoryHandler.HandleMemoryDelete)
+	mux.HandleFunc("GET /api/agent/memory/projects", agentMemoryHandler.HandleMemoryProjects)
 	// 仪表盘数据面端点：核心进程会把这两个请求代理到本 runtime，缺注册会让
 	// 仪表盘 Agent 页的「远程终端」列表和「进行中」徽章永远拿不到数据
 	// （2026-10-21 liang-dev 实测 404 透传）。

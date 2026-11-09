@@ -1,12 +1,15 @@
 package agentruntime
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
 	"aliang.one/nursorgate/app/http/common"
+	"aliang.one/nursorgate/app/http/services"
 )
 
 // TestRegisterAgentRoutesCoversDashboardDataEndpoints 钉死仪表盘数据面端点
@@ -99,5 +102,66 @@ func TestRegisterAgentRoutesIncludesAuthRecover(t *testing.T) {
 
 	if rec.Code == http.StatusNotFound {
 		t.Fatalf("/api/agent/auth-recover status = 404：registerAgentRoutes 漏注册，auth_expired 自愈链断")
+	}
+}
+
+// TestRegisterAgentRoutesCoversAgentMemoryEndpoints 双注册另一半的真函数钉死:
+// 直接调 registerAgentRoutes(零依赖本地 mux),探记忆六 pattern 各得预期码。
+// handlers 包的手抄 mux 测试与生产注册不再是恒等价闭包(手抄侧按 core routes.go
+// 真实 register 形态),本侧漏注册/注册冲突 panic 在此显形(双注册老坑同族)。
+func TestRegisterAgentRoutesCoversAgentMemoryEndpoints(t *testing.T) {
+	t.Setenv("ALIANG_USER_AGENT_RUNTIME", "1")
+	t.Setenv("HOME", t.TempDir())
+	// store 目录换 TempDir:真 registerAgentRoutes 打真 handler,直写真
+	// agentHome() 会污染本机 ~/.aliang/memory。
+	restore := services.AgentCoreMemory.SetDirForTest(t.TempDir())
+	defer restore()
+
+	mux := http.NewServeMux()
+	registerAgentRoutes(mux)
+
+	// POST 铺一条拿 id,驱动 PUT/DELETE 单条探针。
+	postRec := httptest.NewRecorder()
+	mux.ServeHTTP(postRec, httptest.NewRequest(http.MethodPost, "/api/agent/memory",
+		strings.NewReader(`{"project":"/tmp/runtime-probe","content":"运行时探针"}`)))
+	if postRec.Code != http.StatusOK {
+		t.Fatalf("POST /api/agent/memory status = %d, want 200; body=%s", postRec.Code, postRec.Body.String())
+	}
+	var postEnv struct {
+		Data struct {
+			Entry struct {
+				ID int `json:"id"`
+			} `json:"entry"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(postRec.Body).Decode(&postEnv); err != nil {
+		t.Fatalf("POST body not JSON envelope: %v; body=%s", err, postRec.Body.String())
+	}
+	if postEnv.Data.Entry.ID <= 0 {
+		t.Fatalf("POST entry id = %d, want > 0; body=%s", postEnv.Data.Entry.ID, postRec.Body.String())
+	}
+	id := postEnv.Data.Entry.ID
+
+	for _, probe := range []struct {
+		name   string
+		method string
+		target string
+		body   string
+		want   int
+	}{
+		{name: "list", method: http.MethodGet, target: "/api/agent/memory?project=/tmp/runtime-probe", want: http.StatusOK},
+		{name: "projects", method: http.MethodGet, target: "/api/agent/memory/projects", want: http.StatusOK},
+		{name: "put", method: http.MethodPut, target: "/api/agent/memory/" + strconv.Itoa(id), body: `{"project":"/tmp/runtime-probe","content":"运行时改写"}`, want: http.StatusOK},
+		{name: "delete_single", method: http.MethodDelete, target: "/api/agent/memory/" + strconv.Itoa(id) + "?project=/tmp/runtime-probe", want: http.StatusOK},
+		{name: "delete_clear", method: http.MethodDelete, target: "/api/agent/memory?project=/tmp/runtime-probe", want: http.StatusOK},
+	} {
+		t.Run(probe.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, httptest.NewRequest(probe.method, probe.target, strings.NewReader(probe.body)))
+			if rec.Code != probe.want {
+				t.Fatalf("%s %s status = %d, want %d (mux 裸 404 即漏注册); body=%s",
+					probe.method, probe.target, rec.Code, probe.want, rec.Body.String())
+			}
+		})
 	}
 }

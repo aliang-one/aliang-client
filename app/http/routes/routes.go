@@ -41,6 +41,7 @@ type Handlers struct {
 	Tutorial       *handlers.TutorialHandler
 	Agent          *handlers.AgentHandler
 	Mesh           *handlers.MeshHandler
+	Memory         *handlers.AgentMemoryHandler
 
 	statsCollector     *statistic.StatsCollector
 	httpStatsCollector *statistic.HTTPStatsCollector
@@ -99,6 +100,7 @@ func newHandlers(runService *services.RunService) *Handlers {
 		Tutorial:           handlers.NewTutorialHandler(),
 		Agent:              handlers.NewAgentHandler(agentService),
 		Mesh:               handlers.NewMeshHandler(),
+		Memory:             handlers.NewAgentMemoryHandler(),
 		statsCollector:     statsCollector,
 		httpStatsCollector: httpStatsCollector,
 	}
@@ -320,6 +322,14 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	register("/api/agent/mcp", h.Agent.HandleAliangMCPRegistry, http.MethodGet)
 	register("PUT /api/agent/mcp/servers/{name}", h.Agent.HandleAliangMCPServerPut, http.MethodPut)
 	register("DELETE /api/agent/mcp/servers/{name}", h.Agent.HandleAliangMCPServerDelete, http.MethodDelete)
+	// agentcore 记忆 CRUD(spec §8)。双注册另一处 agentruntime server.go
+	// (缺任一侧=404 老坑)。register 是裸 pattern 透传,必须方法前缀防 panic。
+	register("GET /api/agent/memory", h.Memory.HandleMemoryList, http.MethodGet)
+	register("DELETE /api/agent/memory", h.Memory.HandleMemoryDelete, http.MethodDelete)
+	register("POST /api/agent/memory", h.Memory.HandleMemoryPost, http.MethodPost)
+	register("PUT /api/agent/memory/{id}", h.Memory.HandleMemoryPut, http.MethodPut)
+	register("DELETE /api/agent/memory/{id}", h.Memory.HandleMemoryDelete, http.MethodDelete)
+	register("GET /api/agent/memory/projects", h.Memory.HandleMemoryProjects, http.MethodGet)
 	register("/api/docs/tutorials", h.Tutorial.HandleGetTutorial, http.MethodGet)
 
 	// Mesh LAN 发现(/api/mesh/*):beacon 候选只读,供仪表盘离线模式点选
