@@ -2,7 +2,7 @@
 // 再移交对应处理器。本文件只做「交对人」:
 //
 //	KindSSH   → inbound/ssh 注入缝(入口未配置则由缝自身拒收断连)
-//	KindSocks → inbound/socks5 入站(M2 接入前为拒绝占位)
+//	KindSocks → inbound/socks5 入站(no-auth+CONNECT-only,会话租约门禁)
 //	KindMesh  → 装配层接线的 mesh 帧处理器(默认未装配=断连)
 //	其余       → 既有 HTTP 路径(ReadRequest 失败即断连,语义零变化)
 //
@@ -15,6 +15,7 @@ import (
 
 	"aliang.one/nursorgate/common/logger"
 	sniff "aliang.one/nursorgate/inbound/sniff"
+	"aliang.one/nursorgate/inbound/socks5"
 	sshin "aliang.one/nursorgate/inbound/ssh"
 )
 
@@ -23,10 +24,6 @@ import (
 // nil=未装配(纯 HTTP 客户端/未开组网),连接断开——inbound 层不反向 import
 // app 层,接线方向恒为 app→inbound。
 var MeshConnHandler func(conn net.Conn)
-
-// socksConnHandler 是 socks5 分支的处理器缝:M2 接入前为拒绝占位(nil),
-// 装配后指向 inbound/socks5.Handler。测试可覆写断言分派正确。
-var socksConnHandler func(conn net.Conn)
 
 // dispatchConn 处理一条来自统一口的连接。conn 的关闭归本函数(defer);各
 // 处理器内部的关闭为幂等双关(与合并前 server.go 同模式)。
@@ -54,11 +51,10 @@ func dispatchConn(conn net.Conn) {
 		// 拒绝行/防环/门禁/注入全部归 HandleMeshConn,返回即终。
 		MeshConnHandler(downstream)
 	case sniff.KindSocks:
-		if socksConnHandler == nil {
-			logger.Debug(fmt.Sprintf("[DISPATCH] socks rejected (handler not wired) from %s", conn.RemoteAddr()))
-			return
-		}
-		socksConnHandler(downstream)
+		// 直接调 socks5.Handler(其内建 TCPHandler 测试缝 + 惰性默认管线)。
+		// 刻意不在 dispatch 侧赋值任何缝:在 dispatch 包做装配会重新引入
+		// import 期单例装配(评审定案),缝归 socks5 包所有。
+		socks5.Handler(downstream)
 	default:
 		handleRawConnection(downstream)
 	}

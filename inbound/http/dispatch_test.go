@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"aliang.one/nursorgate/inbound/socks5"
 	M "aliang.one/nursorgate/inbound/tun/metadata"
 	auth "aliang.one/nursorgate/processor/auth"
 	tcphandler "aliang.one/nursorgate/processor/tcp"
@@ -160,26 +161,72 @@ func TestDispatchConnUnknownBytesGoesToHTTP(t *testing.T) {
 	}
 }
 
-// socksHandler 是可注入的 socks 处理器缝(测试替身),对应 dispatch 的
-// KindSocks 分支。
-func TestDispatchConnSocksReachesHandler(t *testing.T) {
-	origSocks := socksConnHandler
-	gotCh := make(chan string, 1)
-	socksConnHandler = func(conn net.Conn) {
-		b, _ := io.ReadAll(conn)
-		gotCh <- string(b)
-	}
-	t.Cleanup(func() { socksConnHandler = origSocks })
+// TestDispatchConnSocksEndToEnd dispatch 喂 socks 样本 → 真实 socks5 握手
+// → 管线缝收到正确 Metadata(no-auth 协商+CONNECT 全程过,门禁需登录)。
+//
+// net.Pipe 同步管道下的两处互锁必须避开:①嗅探 Peek(4) 要求首块写 ≥4 字节
+// (greeting 只有 3 字节),且服务端首次应答前要读满「嗅探 4+协商 3」= 7
+// 字节,故首块=greeting+请求头;②成功应答 10 字节要等客户端消费,故客户端
+// 末尾 ReadAll 兜住应答后服务端才走到管线缝。请求段由 socks5 解析器自身
+// 消费,管线侧断言对象是 Metadata 而非字节回放。
+func TestDispatchConnSocksEndToEnd(t *testing.T) {
+	authority := auth.ResetSessionAuthorityForTest()
+	authority.NotifyLoggedIn(&auth.UserInfo{ID: 1})
+	t.Cleanup(func() { auth.ResetSessionAuthorityForTest() })
 
-	greeting := string([]byte{0x05, 0x01, 0x00})
-	dispatchConn(dispatchPipe(t, greeting))
+	origTCP := socks5.TCPHandler
+	t.Cleanup(func() { socks5.TCPHandler = origTCP })
+	mdCh := make(chan *M.Metadata, 1)
+	socks5.TCPHandler = func(_ context.Context, conn net.Conn, md *M.Metadata) error {
+		select {
+		case mdCh <- md:
+		default:
+		}
+		_, _ = io.Copy(io.Discard, conn)
+		_ = conn.Close()
+		return nil
+	}
+
+	greeting := []byte{0x05, 0x01, 0x00}            // VER NMETHODS=1 no-auth
+	requestHead := []byte{0x05, 0x01, 0x00, 0x01}   // CONNECT + ATYP=IPv4
+	requestRest := []byte{127, 0, 0, 1, 0x01, 0xBB} // 127.0.0.1:443
+
+	client, server := net.Pipe()
+	t.Cleanup(func() {
+		_ = client.Close()
+		_ = server.Close()
+	})
+	_ = client.SetDeadline(time.Now().Add(5 * time.Second))
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		dispatchConn(server)
+	}()
+
+	go func() {
+		_, _ = client.Write(append(append([]byte{}, greeting...), requestHead...))
+		method := make([]byte, 2)
+		if _, err := io.ReadFull(client, method); err != nil {
+			return
+		}
+		_, _ = client.Write(requestRest)
+		_, _ = io.ReadAll(client) // 兜住成功应答;服务端应答完成后才进管线缝
+	}()
+
 	select {
-	case got := <-gotCh:
-		if got != greeting {
-			t.Fatalf("socks handler got %q, want %q", got, greeting)
+	case md := <-mdCh:
+		if md.DstPort != 443 || !md.DstIP.IsValid() || md.DstIP.String() != "127.0.0.1" {
+			t.Fatalf("metadata = %s:%d, want 127.0.0.1:443", md.DstIP, md.DstPort)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("socks handler never invoked")
+		t.Fatal("socks5 handler never invoked")
+	}
+	_ = client.Close()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("dispatchConn did not return")
 	}
 }
 
