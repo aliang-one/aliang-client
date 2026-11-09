@@ -234,7 +234,7 @@ func TestAgentCoreSubagentToolsAssembly(t *testing.T) {
 
 	m := newAgentAIManager()
 	router := m.agentCoreSubagentTaskTool(agentAIRun{sessionID: "s", projectPath: "/tmp/p"},
-		nil, nil, nil, nil, nil, nil)
+		nil, nil, nil, nil, nil, nil, nil)
 	if router == nil {
 		t.Fatal("router 不应为 nil")
 	}
@@ -252,7 +252,7 @@ func TestAgentCoreSubagentToolsAssembly(t *testing.T) {
 	setTestAgentHome(t)
 	m2 := newAgentAIManager()
 	router2 := m2.agentCoreSubagentTaskTool(agentAIRun{sessionID: "s2", projectPath: "/tmp/p"},
-		nil, nil, nil, nil, nil, nil)
+		nil, nil, nil, nil, nil, nil, nil)
 	if router2 == nil || len(router2.types) == 0 {
 		t.Fatalf("空定义集应回落内置默认: %+v", router2)
 	}
@@ -377,7 +377,7 @@ func TestAgentCoreSubagentTaskRouterShape(t *testing.T) {
 
 	m := newAgentAIManager()
 	tools := m.agentCoreSubagentTools(agentAIRun{sessionID: "s", projectPath: "/tmp/p"},
-		nil, nil, nil, nil, nil, nil)
+		nil, nil, nil, nil, nil, nil, nil)
 	if len(tools) != 1 || tools[0].Name() != "task" {
 		t.Fatalf("应为唯一 task 工具, got %+v", tools)
 	}
@@ -418,7 +418,7 @@ func TestAgentCoreSubagentTaskRouterRouting(t *testing.T) {
 		func(context.Context, agentcore.ApprovalRequest) (agentcore.ApprovalResponse, error) {
 			return agentcore.ApprovalResponse{Approved: true}, nil
 		},
-		nil, nil, nil)
+		nil, nil, nil, nil)
 	if len(tools) != 1 {
 		t.Fatalf("工具数 = %d", len(tools))
 	}
@@ -448,12 +448,12 @@ func TestAgentCoreSubagentBuiltinDefaults(t *testing.T) {
 	setTestAgentHome(t) // 空目录
 	m := newAgentAIManager()
 	tools := m.agentCoreSubagentTools(agentAIRun{sessionID: "s", projectPath: "/tmp/p"},
-		nil, nil, nil, nil, nil, nil)
+		nil, nil, nil, nil, nil, nil, nil)
 	if len(tools) != 1 {
 		t.Fatalf("空目录也应有内置 task 工具, got %d", len(tools))
 	}
 	router := m.agentCoreSubagentTaskTool(agentAIRun{sessionID: "s", projectPath: "/tmp/p"},
-		nil, nil, nil, nil, nil, nil)
+		nil, nil, nil, nil, nil, nil, nil)
 	if router == nil || len(router.types) == 0 {
 		t.Fatalf("内置类型缺失: %+v", router)
 	}
@@ -468,7 +468,7 @@ func TestAgentCoreSubagentBuiltinDefaults(t *testing.T) {
 		"---\nname: researcher\ndescription: 用户自定义调研\n---\n用户正文。")
 	m2 := newAgentAIManager()
 	router2 := m2.agentCoreSubagentTaskTool(agentAIRun{sessionID: "s2", projectPath: "/tmp/p"},
-		nil, nil, nil, nil, nil, nil)
+		nil, nil, nil, nil, nil, nil, nil)
 	if router2 == nil {
 		t.Fatal("router 不应为 nil")
 	}
@@ -489,7 +489,10 @@ func TestAgentCoreSubagentInterruptedSuffix(t *testing.T) {
 	}
 	got := agentCoreSubagentInterruptedSuffix(entries)
 	for _, marker := range []string{"<interrupted-subagents>", "never returned", "researcher",
-		"调研加密方案", "re-dispatch", "3 tool calls", "last: Grep"} {
+		"调研加密方案", "re-dispatch", "3 tool calls", "last: Grep",
+		// L3（2026-11-09）：task_id 必须出现在行内（主 LLM 靠它续跑），且
+		// 续跑指引（resume_task_id）必须进块尾。
+		"[task_id=t1]", "resume_task_id"} {
 		if !strings.Contains(got, marker) {
 			t.Fatalf("中断块缺标记 %q: %q", marker, got)
 		}

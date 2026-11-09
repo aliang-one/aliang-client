@@ -605,6 +605,97 @@ type agentCoreSubagentInterrupted struct {
 	LastText string
 }
 
+// agentCoreSubagentBriefingMaxChars 是续跑简报的总字符封顶（rune 数）。它要塞
+// 进下一个子 run 的首轮 user 消息，撑太大会一开局就吃掉半个上下文窗口。
+const agentCoreSubagentBriefingMaxChars = 6000
+
+// subagentSidechainBriefing 把一个已死子 agent 的 sidechain 还原成「续跑简报」
+// （L3，2026-11-09）。
+//
+// 为什么不「逐条重放消息」：sidechain 只落了每回合的 assistant 文本与 thinking
+// ——**没有** tool_use 块，也没有对应的 tool_result（那两份在内核内存里，进程
+// 一死就没了）。硬造一段 assistant 历史却不配 tool_use/tool_result，上游要么
+// 400（消息结构非法），要么让模型以为自己「已经做过」却拿不到任何事实依据。
+// 所以这里只做诚实的降级：把「上次跑到哪、说了什么」压成一段文字简报，作为
+// 新一轮任务的前置说明——续跑是**接着干**，不是**假装没断过**。
+//
+// 返回空串表示该 task_id 没有可用的 sidechain（旧 journal / 未 tracked /
+// 一回合都没跑完）——调用方据此走普通派发，不注入任何东西。
+func (j *agentCoreJournal) subagentSidechainBriefing(sessionID, taskID string, maxChars int) string {
+	if j == nil || j.dir == "" || strings.TrimSpace(sessionID) == "" || strings.TrimSpace(taskID) == "" {
+		return ""
+	}
+	if maxChars <= 0 {
+		maxChars = agentCoreSubagentBriefingMaxChars
+	}
+	j.mu.Lock()
+	path := filepath.Join(j.dir, agentCoreJournalFileName(sessionID))
+	f, err := os.Open(path)
+	if err != nil {
+		j.mu.Unlock()
+		return ""
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), agentVibeJSONLMaxLineBytes)
+	type turnRow struct {
+		Turn int
+		Text string
+	}
+	turns := make([]turnRow, 0, 8)
+	name := ""
+	for sc.Scan() {
+		var row struct {
+			Kind   string `json:"kind"`
+			Event  string `json:"event"`
+			TaskID string `json:"task_id"`
+			Name   string `json:"name"`
+			Turn   int    `json:"turn"`
+			Text   string `json:"text"`
+		}
+		if json.Unmarshal(sc.Bytes(), &row) != nil {
+			continue
+		}
+		if strings.TrimSpace(row.TaskID) != taskID {
+			continue
+		}
+		switch {
+		case row.Kind == "subagent" && row.Event == "start" && name == "":
+			name = row.Name
+		case row.Kind == "subagent_turn":
+			if text := strings.TrimSpace(row.Text); text != "" {
+				turns = append(turns, turnRow{Turn: row.Turn, Text: text})
+			}
+		}
+	}
+	j.mu.Unlock()
+	if len(turns) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	if name != "" {
+		b.WriteString("上一次尝试的子 agent 类型: " + name + "\n")
+	}
+	fmt.Fprintf(&b, "上一次尝试已进行 %d 个回合，逐回合进展如下（原文摘录）:\n", len(turns))
+	used := 0
+	for _, t := range turns {
+		text := t.Text
+		// 单条先各自封顶 1500 rune，避免「第一轮说了 8000 字」把后面的回合全挤掉
+		// ——续跑最需要的是「最后一轮说到哪」。
+		if runes := []rune(text); len(runes) > 1500 {
+			text = string(runes[:1500]) + "…"
+		}
+		line := fmt.Sprintf("- 第 %d 回合: %s\n", t.Turn, text)
+		if used+len(line) > maxChars*4 { // 粗算：maxChars 是 rune，1 rune 最坏 4 字节
+			b.WriteString("- （更早的回合已省略）\n")
+			break
+		}
+		used += len(line)
+		b.WriteString(line)
+	}
+	return strings.TrimSpace(b.String())
+}
+
 // unfinishedSubagents 扫描会话 journal，返回 start 无 finish 的子 agent
 // （行序=时间序）。调用时机=runAgentCore 装配 system prompt——本 run 尚未
 // 派发，journal 内全部 start 行必属已死回合（同会话 run 串行）；本 run 后续

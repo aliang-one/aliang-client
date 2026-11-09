@@ -478,6 +478,11 @@ type agentAISession struct {
 	// 没有 stdin 可写，插话只能排队、由下一轮 LLM 调用前取走，所以它与
 	// claudeSteer 的 deliver 语义不同（永远 queued，drain 时才 applied）。
 	coreSteer *agentAICoreSteerControl
+	// subagentControl 是本回合在跑子 agent 的控制表（L3，2026-11-09）：
+	// per-task 停止与追加指令。与 coreSteer 同生命周期（runAgentCore 挂、
+	// clearRunning 清）——子 agent 的生命周期严格归属主回合，回合没了控制
+	// 面必须一起没，否则会留下指向已死 goroutine 的僵尸句柄。
+	subagentControl *agentCoreSubagentControl
 	// tuiTurn 是当前 TUI 注入回合的路由计划（UDS socket / transcript 路径 /
 	// 权限类）。TUI 回合没有 stdin 可写（claudeSteer 恒 nil），UDS 注入是唯一
 	// 插话通道——CC 把回合中收到的注入按「排队消息」处理，当前回合结束后自动
@@ -4849,6 +4854,7 @@ func (m *agentAIManager) clearRunning(sessionID string, runSeq int, writeJSON ag
 	var steerControl *agentAICodexSteerControl
 	var claudeSteerControl *agentAIClaudeSteerControl
 	var coreSteerControl *agentAICoreSteerControl
+	var subagentControl *agentCoreSubagentControl
 	if guardOwns && session != nil && session.runSeq == runSeq {
 		steerControl = session.codexSteer
 		claudeSteerControl = session.claudeSteer
@@ -4868,6 +4874,8 @@ func (m *agentAIManager) clearRunning(sessionID string, runSeq int, writeJSON ag
 		session.codexSteer = nil
 		session.claudeSteer = nil
 		session.coreSteer = nil
+		subagentControl = session.subagentControl
+		session.subagentControl = nil
 		session.activeRunID = ""
 		session.goalIdentity = nil
 		session.history = trimAgentAIHistoryForSession(session, session.history)
@@ -4885,6 +4893,14 @@ func (m *agentAIManager) clearRunning(sessionID string, runSeq int, writeJSON ag
 	}
 	if coreSteerControl != nil {
 		coreSteerControl.close("not_running", "agentcore turn ended before steer was applied", "turn_ended")
+	}
+	// 子 agent 控制表随回合退场（L3）：先停全部在跑子 agent——回合已收尾，
+	// 这里还挂着说明是异常路径（正常路径下桥的 defer 各自 unregister 干净），
+	// 留着只会让 goroutine 无主游荡到父 ctx 超时才死。
+	if subagentControl != nil {
+		if n := subagentControl.stop(""); n > 0 {
+			logger.Warn(fmt.Sprintf("agentcore-subagent: turn ended with %d live subagent(s); cancelled session=%s runSeq=%d", n, sessionID, runSeq))
+		}
 	}
 	m.emitApprovalCancelled(writeJSON, sessionID, cancelled, "run_ended")
 }

@@ -80,6 +80,8 @@ const (
 	AgentEventUsageReport             = "usage.report"            // agent→cloud: Claude Code 本地会话小时级用量聚合（后台材料，勿与逐轮 ai.usage 混淆）
 	AgentEventAITask                  = "ai.task"                 // agent→cloud: task/todo list snapshot (claude TodoWrite)
 	AgentEventAISubagent              = "ai.subagent"             // agent→cloud: 子 agent(Task/Agent 工具)生命周期,phase=started|progress|completed|failed|interrupted,task_id 为事件键
+	AgentEventAISubagentControl       = "ai.subagent.control"     // cloud→agent: 子 agent 控制(list/stop/steer),按 session_id+task_id 定位一个在跑子 run
+	AgentEventAISubagentControlAck    = "ai.subagent.control.ack" // agent→cloud: 控制结果(result=ok|stopping|queued|not_found|not_running|unsupported|error)
 	AgentEventFileList                = "file.list"
 	AgentEventFileListResult          = "file.list.result"
 	AgentEventFileRead                = "file.read"
