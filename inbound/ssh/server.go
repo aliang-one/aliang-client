@@ -13,12 +13,10 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"strconv"
 	"sync"
 	"time"
 
 	"aliang.one/nursorgate/common/logger"
-	"aliang.one/nursorgate/processor/config"
 
 	gossh "golang.org/x/crypto/ssh"
 )
@@ -38,20 +36,22 @@ var handshakeTimeout = 15 * time.Second
 // sshout.KnownHostsFileName 的收敛先例。文件内容归本包管理。
 const IngressHostKeyFileName = "ingress_host_key"
 
-// Server 是 SSH 入口服务实例。生命周期三件套(Start/Stop/IsRunning)幂等,
-// 照 inbound/http 模式;实例不承载热更新——配置变更由装配层(Reconcile,
-// Task 7)重建实例。
+// Server 是 SSH 入口服务实例。生命周期三件套(Start/Stop/IsRunning)幂等;
+// 实例不承载热更新——配置变更由装配层(Reconcile)重建实例。
+//
+// 监听归属(统一口收编,spec §6.4):本实例不再 net.Listen——56432 统一
+// 入口 accept 后嗅探为 SSH 的连接经 HandleIngressConn/ServeConn 注入本实例。
+// Start 因此只剩「host key 就绪 + 运行态置位」两件事。
 type Server struct {
 	rc          RunConfig
 	hostKeyPath string
 	limiter     *authLimiter
 
-	mu       sync.Mutex
-	running  bool
-	listener net.Listener
-	conns    map[net.Conn]struct{}
-	cancel   context.CancelFunc
-	wg       sync.WaitGroup // accept 循环+每连接 goroutine
+	mu      sync.Mutex
+	running bool
+	conns   map[net.Conn]struct{}
+	cancel  context.CancelFunc
+	wg      sync.WaitGroup // 每连接 goroutine(注入路径 ServeConn 记账)
 
 	hostKeyMu sync.Mutex
 	hostKey   gossh.Signer
@@ -74,7 +74,9 @@ func NewServer(rc RunConfig, hostKeyPath string) *Server {
 	}
 }
 
-// Start 启动监听(幂等:已运行直接返回 nil)。
+// Start 进入运行态(幂等:已运行直接返回 nil)。不再监听——56432 统一
+// 入口承载监听(spec §6.4),本函数只剩「host key 就绪 + 运行态置位」;
+// 连接进入走 HandleIngressConn/ServeConn 注入缝。
 func (s *Server) Start() error {
 	s.mu.Lock()
 	if s.running {
@@ -83,31 +85,23 @@ func (s *Server) Start() error {
 	}
 	// host key 就绪(缺失/损坏则生成+原子落盘)在持生命周期锁下完成:
 	// 防止并发的 Start/Stop 观察到半初始化状态(冷路径,开销可忽略)。
-	signer, err := s.ensureHostKey()
-	if err != nil {
+	if _, err := s.ensureHostKey(); err != nil {
 		s.mu.Unlock()
 		return fmt.Errorf("ssh ingress host key: %w", err)
 	}
-	addr := net.JoinHostPort(config.ServiceBindHost(), strconv.Itoa(int(s.rc.Port)))
-	l, err := net.Listen("tcp", addr)
-	if err != nil {
-		s.mu.Unlock()
-		return fmt.Errorf("ssh ingress listen %s: %w", addr, err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
 	s.running = true
-	s.listener = l
-	s.cancel = cancel
-	s.wg.Add(1)
+	// 根取消链保留(Stop 时 cancel):注入连接的拆除主路径是连接快照关闭,
+	// cancel 是 Stop 语义的完整性兜底(与旧监听路径同款生命周期字段)。
+	_, s.cancel = context.WithCancel(context.Background())
 	s.mu.Unlock()
 
-	logger.Info(fmt.Sprintf("SSH ingress server starting on %s", l.Addr().String()))
-	go s.acceptLoop(ctx, l, s.serverConfig(signer))
+	logger.Info("SSH ingress server running (listening is owned by the unified ingress 56432)")
 	return nil
 }
 
-// Stop 停止服务(幂等):关监听、断开在途连接并等待 accept/handle
-// 协程退出(drain/global-request 协程随连接拆除退出,不在此 WaitGroup)。
+// Stop 退出运行态(幂等):断开在途连接并等待 handle 协程退出(drain/
+// global-request 协程随连接拆除退出,不在此 WaitGroup)。无监听可关——
+// 连接是统一口注入的,拆连接快照即可。
 func (s *Server) Stop() error {
 	s.mu.Lock()
 	if !s.running {
@@ -117,8 +111,6 @@ func (s *Server) Stop() error {
 	s.running = false
 	cancel := s.cancel
 	s.cancel = nil
-	l := s.listener
-	s.listener = nil
 	pending := make([]net.Conn, 0, len(s.conns))
 	for c := range s.conns {
 		pending = append(pending, c)
@@ -127,9 +119,6 @@ func (s *Server) Stop() error {
 
 	if cancel != nil {
 		cancel()
-	}
-	if l != nil {
-		_ = l.Close()
 	}
 	// 快照内的在途连接全部断开,让握手/通道 goroutine 解除阻塞退出;
 	// 快照后滑入的连接由 handleConn 的 ctx 监视兜底关闭。
@@ -146,17 +135,6 @@ func (s *Server) IsRunning() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.running
-}
-
-// Addr 返回监听地址(host:port);未运行返回空串。RunConfig.Port=0 时
-// 供测试/装配层取实际随机端口。
-func (s *Server) Addr() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.listener == nil {
-		return ""
-	}
-	return s.listener.Addr().String()
 }
 
 // HostKeyFingerprint 返回 host key 的 SHA256 指纹(gossh.FingerprintSHA256,
@@ -252,28 +230,6 @@ func keyInList(key gossh.PublicKey, list []gossh.PublicKey) bool {
 		}
 	}
 	return false
-}
-
-// acceptLoop 接受连接并派发;监听关闭(Stop)后退出。
-func (s *Server) acceptLoop(ctx context.Context, l net.Listener, cfg *gossh.ServerConfig) {
-	defer s.wg.Done()
-	for {
-		conn, err := l.Accept()
-		if err != nil {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-				logger.Debug(fmt.Sprintf("SSH ingress accept error: %v", err))
-				continue
-			}
-		}
-		s.mu.Lock()
-		s.conns[conn] = struct{}{}
-		s.mu.Unlock()
-		s.wg.Add(1)
-		go s.handleConn(ctx, conn, cfg)
-	}
 }
 
 // ServeConn 承载一条外部注入的已 accept 连接(统一口分派缝,spec §6.4):

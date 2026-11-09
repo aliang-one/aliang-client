@@ -1,10 +1,16 @@
 package services
 
+// SSH 入口 reconcile 接线测试(统一口收编后,spec §6.4):入口不再自持
+// 监听,「起/停」的观测面从端口横幅换成 IsRunning + 注入缝上的真实握手;
+// port 相关断言删除(customer.ssh_ingress.port 运行面忽略)。
+
 import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"fmt"
+	"io"
 	"net"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -31,15 +37,37 @@ func newSSHIngressTestKey(t *testing.T) (authorizedLine string, signer gossh.Sig
 	return string(gossh.MarshalAuthorizedKey(signer.PublicKey())), signer
 }
 
-// reserveIngressPort 预约一个空闲回环端口(取口即关;TOCTOU 窗口极小)。
-func reserveIngressPort(t *testing.T) int {
+// bridgedIngressPair 构造写解耦的双工对(裸 net.Pipe 双向同步会与 gossh
+// 「两端都先写版本」的握手互等死锁;泵桥接后与真实 TCP 缓冲语义对齐)。
+// 与 inbound/ssh 桥接 helper 同构,跨包不可导出故就地复制。
+func bridgedIngressPair() (client, server net.Conn) {
+	c1, s1 := net.Pipe()
+	c2, s2 := net.Pipe()
+	go func() { _, _ = io.Copy(s2, s1); _ = s2.Close() }()
+	go func() { _, _ = io.Copy(s1, s2); _ = s1.Close() }()
+	return c1, c2
+}
+
+// ingressHandshakeOK 经 HandleIngressConn 注入桥接连接跑完整 gossh 握手:
+// true=提交载荷里的公钥确实被运行面接纳(翻译→解析→认证回调端到端贯通)。
+func ingressHandshakeOK(t *testing.T, signer gossh.Signer) bool {
 	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("reserve port: %v", err)
+	client, server := bridgedIngressPair()
+	defer client.Close()
+	_ = client.SetDeadline(time.Now().Add(5 * time.Second))
+	go sshin.HandleIngressConn(server)
+	cfg := &gossh.ClientConfig{
+		User:            "ingress",
+		Auth:            []gossh.AuthMethod{gossh.PublicKeys(signer)},
+		HostKeyCallback: gossh.InsecureIgnoreHostKey(),
+		Timeout:         5 * time.Second,
 	}
-	defer l.Close()
-	return l.Addr().(*net.TCPAddr).Port
+	conn, _, _, err := gossh.NewClientConn(client, "127.0.0.1:0", cfg)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
 }
 
 // commitIngressConfig 走提交协调路径落一段 customer 配置(失败即 Fatal——
@@ -52,36 +80,7 @@ func commitIngressConfig(t *testing.T, payload string) {
 	}
 }
 
-// assertIngressPortListening 断言端口在监听且是 SSH 服务(横幅首字节)。
-func assertIngressPortListening(t *testing.T, port int) {
-	t.Helper()
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
-	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
-	if err != nil {
-		t.Fatalf("dial %s must succeed: %v", addr, err)
-	}
-	defer conn.Close()
-	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	buf := make([]byte, 1)
-	if _, err := conn.Read(buf); err != nil {
-		t.Fatalf("read SSH banner from %s: %v", addr, err)
-	}
-	if buf[0] != 'S' {
-		t.Fatalf("unexpected banner start %q from %s, want 'S' (SSH-...)", buf[0], addr)
-	}
-}
-
-// assertIngressPortRefused 断言端口连接层拒绝(未监听)。
-func assertIngressPortRefused(t *testing.T, port int) {
-	t.Helper()
-	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), time.Second)
-	if err == nil {
-		_ = conn.Close()
-		t.Fatalf("dial 127.0.0.1:%d must be refused, got connection", port)
-	}
-}
-
-// setupIngressReconcileTest 是三个用例共用的隔离底座:全局配置/提交协调器/
+// setupIngressReconcileTest 是几个用例共用的隔离底座:全局配置/提交协调器/
 // 配置库三重置+temp HOME+temp cache(入口 host key 落盘隔离)+提交后兜底
 // 期望停(进程级 reconcile 单例不泄漏到包内其他用例)。
 func setupIngressReconcileTest(t *testing.T) {
@@ -107,82 +106,81 @@ func setupIngressReconcileTest(t *testing.T) {
 }
 
 // TestSSHIngressReconcileStartsAndStops 走 customer_config_service 提交协调
-// 路径验证接线(Task 7):enable→IsRunning+端口监听+载荷公钥可认证;
-// 端口变更→重启(旧口失效/新口监听);disable→停。凭证变更重启的监听器
-// 级断言(Port=0 换随机口)在 inbound/ssh 的 reconcile_test.go 单测覆盖。
+// 路径验证接线(Task 7):enable→IsRunning+载荷公钥可认证;port-only 变更
+// →不重启(运行面忽略 port 的钉子);disable→停+注入缝拒收。凭证变更重启
+// 的连接级断言在 inbound/ssh 的 reconcile_test.go 单测覆盖。
 func TestSSHIngressReconcileStartsAndStops(t *testing.T) {
 	setupIngressReconcileTest(t)
 
 	keyLine, keySigner := newSSHIngressTestKey(t)
-	port1 := reserveIngressPort(t)
-	port2 := reserveIngressPort(t)
 
-	// enable:合法公钥+显式端口 → 提交协调路径 reconcile 起服务。
-	commitIngressConfig(t, fmt.Sprintf(`{"customer":{"ssh_ingress":{"enable":true,"port":%d,"authorized_keys":[%q]}}}`, port1, keyLine))
+	// enable:合法公钥 → 提交协调路径 reconcile 起服务,认证贯通。
+	commitIngressConfig(t, fmt.Sprintf(`{"customer":{"ssh_ingress":{"enable":true,"authorized_keys":[%q]}}}`, keyLine))
 	if !sshin.IsRunning() {
 		t.Fatal("ssh ingress must be running after enabling commit")
 	}
-	assertIngressPortListening(t, port1)
-
-	// 认证贯通:提交载荷里的公钥即准入凭证——接线翻译路径
-	// (EffectiveSSHIngress→RunConfig 解析→Server)端到端可用。
-	conn, err := gossh.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port1), &gossh.ClientConfig{
-		User:            "ingress",
-		Auth:            []gossh.AuthMethod{gossh.PublicKeys(keySigner)},
-		HostKeyCallback: gossh.InsecureIgnoreHostKey(),
-		Timeout:         5 * time.Second,
-	})
-	if err != nil {
-		t.Fatalf("authenticated dial against committed ingress: %v", err)
+	if !ingressHandshakeOK(t, keySigner) {
+		t.Fatal("committed authorized key must authenticate via the injection seam")
 	}
-	_ = conn.Close()
 
-	// 端口变更:重启——旧口失效、新口监听。
-	commitIngressConfig(t, fmt.Sprintf(`{"customer":{"ssh_ingress":{"enable":true,"port":%d,"authorized_keys":[%q]}}}`, port2, keyLine))
+	// port-only 变更:运行面忽略 port → 期望态等价 → 不重启(仍在跑)。
+	commitIngressConfig(t, fmt.Sprintf(`{"customer":{"ssh_ingress":{"enable":true,"port":56443,"authorized_keys":[%q]}}}`, keyLine))
 	if !sshin.IsRunning() {
-		t.Fatal("ssh ingress must stay running after port change")
+		t.Fatal("port-only change must not stop the ingress (port is ignored)")
 	}
-	assertIngressPortRefused(t, port1)
-	assertIngressPortListening(t, port2)
 
-	// disable(deep merge 只动 enable):期望停。
+	// disable(deep merge 只动 enable):期望停,注入缝拒收。
 	commitIngressConfig(t, `{"customer":{"ssh_ingress":{"enable":false}}}`)
 	if sshin.IsRunning() {
 		t.Fatal("ssh ingress must stop after disabling commit")
 	}
-	assertIngressPortRefused(t, port2)
+	client, server := net.Pipe()
+	defer client.Close()
+	if sshin.HandleIngressConn(server) {
+		t.Fatal("HandleIngressConn must report false after disabling commit")
+	}
 }
 
 // TestSSHIngressReconcileStartFailureDoesNotBlockCommit 钉住「失败仅日志不
-// 阻断配置提交」:端口被外部占住 → reconcile 起服失败停留止态,但提交
-// 本身必须成功;冲突消失后再次提交(协调器恒回调,不做内容去重)重试起服。
+// 阻断配置提交」:host key 目录不可创建(cache/ssh 子目录被普通文件冒名)
+// → reconcile 起服失败停留止态,但提交本身必须成功;障碍消失后再次提交
+// (协调器恒回调,不做内容去重)重试起服。注入面刻意收窄到 ssh 子目录——
+// 整个缓存根坏掉会把提交自身的 db 阶段一起打断,测不到目标语义。
 func TestSSHIngressReconcileStartFailureDoesNotBlockCommit(t *testing.T) {
 	setupIngressReconcileTest(t)
 
-	keyLine, _ := newSSHIngressTestKey(t)
-	occupied := reserveIngressPort(t)
-
-	l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", occupied))
-	if err != nil {
-		t.Fatalf("occupy port %d: %v", occupied, err)
+	// cache 根可用,但 cache/ssh 是普通文件:GetCacheSubdir("ssh") 失败 →
+	// host key 路径解析为空 → 按期望停处理。
+	cacheRoot := os.Getenv("ALIANG_CACHE_DIR")
+	if err := os.MkdirAll(cacheRoot, 0o700); err != nil {
+		t.Fatalf("create cache root: %v", err)
+	}
+	sshSubdir := filepath.Join(cacheRoot, "ssh")
+	if err := os.WriteFile(sshSubdir, []byte("x"), 0o600); err != nil {
+		t.Fatalf("forge cache/ssh as plain file: %v", err)
 	}
 
-	payload := fmt.Sprintf(`{"customer":{"ssh_ingress":{"enable":true,"port":%d,"authorized_keys":[%q]}}}`, occupied, keyLine)
+	keyLine, keySigner := newSSHIngressTestKey(t)
+	payload := fmt.Sprintf(`{"customer":{"ssh_ingress":{"enable":true,"authorized_keys":[%q]}}}`, keyLine)
 	service := NewCustomerConfigService()
 	if _, err := service.UpdateCommittedCustomerConfig([]byte(payload)); err != nil {
 		t.Fatalf("commit must not be blocked by ssh ingress reconcile failure: %v", err)
 	}
 	if sshin.IsRunning() {
-		t.Fatal("ingress with unbindable port must stay stopped")
+		t.Fatal("ingress with unusable host key dir must stay stopped")
 	}
 
-	// 释放端口后重复提交:reconcile 重试起服(失败不粘死到下次进程重启)。
-	_ = l.Close()
+	// 障碍消除(移除冒名文件,子目录可正常创建)后重复提交:reconcile 重试起服。
+	if err := os.Remove(sshSubdir); err != nil {
+		t.Fatalf("remove obstacle: %v", err)
+	}
 	commitIngressConfig(t, payload)
 	if !sshin.IsRunning() {
-		t.Fatal("ingress must start on retry once the port conflict is gone")
+		t.Fatal("ingress must start on retry once the host key dir is usable")
 	}
-	assertIngressPortListening(t, occupied)
+	if !ingressHandshakeOK(t, keySigner) {
+		t.Fatal("handshake through retried ingress")
+	}
 }
 
 // TestBuildSSHIngressRunConfigUnparseableKeyDefense 钉住翻译层的坏值防御:
@@ -222,20 +220,19 @@ func TestBuildSSHIngressRunConfigUnparseableKeyDefense(t *testing.T) {
 
 // TestReconcileSSHIngressFromConfigBootRestore 钉住启动期恢复入口(与提交
 // 协调路径共用的 ReconcileSSHIngressFromConfig):加载了 enable 配置的状态
-// 下钩子执行后入口在跑且端口监听;禁用/nil 配置不启且停掉在跑实例。
-// core 启动序列(daemon initializeCoreSubsystems 与 interactive runStart)
-// 各以一行调用接线——本用例即该一行的可测单元。
+// 下钩子执行后入口在跑;禁用/nil 配置不启且停掉在跑实例。core 启动序列
+// (daemon initializeCoreSubsystems 与 interactive runStart)各以一行调用
+// 接线——本用例即该一行的可测单元。
 func TestReconcileSSHIngressFromConfigBootRestore(t *testing.T) {
 	setupIngressReconcileTest(t)
 
 	keyLine, _ := newSSHIngressTestKey(t)
-	port := reserveIngressPort(t)
 	enable := true
 	enabledCfg := &config.Config{
 		Core: &config.CoreConfig{APIServer: "https://api.aliang.one"},
 		Customer: &config.CustomerConfig{SSHIngress: &config.SSHIngressConfig{
 			Enable:         &enable,
-			Port:           uint16(port),
+			Port:           config.SSHIngressDefaultPort,
 			AuthorizedKeys: []string{keyLine},
 		}},
 	}
@@ -245,7 +242,6 @@ func TestReconcileSSHIngressFromConfigBootRestore(t *testing.T) {
 	if !sshin.IsRunning() {
 		t.Fatal("boot reconcile must restore an enabled ssh ingress")
 	}
-	assertIngressPortListening(t, port)
 
 	// 禁用配置 → 不启并停掉在跑实例(Reconcile 期望态语义)。
 	ReconcileSSHIngressFromConfig(&config.Config{
@@ -255,7 +251,6 @@ func TestReconcileSSHIngressFromConfigBootRestore(t *testing.T) {
 	if sshin.IsRunning() {
 		t.Fatal("boot reconcile with disabled config must stop the ingress")
 	}
-	assertIngressPortRefused(t, port)
 
 	// nil 配置(启动极早期全局配置尚未就绪的防御)→ 期望停,不 panic。
 	ReconcileSSHIngressFromConfig(nil)
@@ -268,5 +263,4 @@ func TestReconcileSSHIngressFromConfigBootRestore(t *testing.T) {
 	if !sshin.IsRunning() {
 		t.Fatal("boot reconcile must restore the ingress again after re-enable")
 	}
-	assertIngressPortListening(t, port)
 }
