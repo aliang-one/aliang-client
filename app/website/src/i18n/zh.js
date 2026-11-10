@@ -610,6 +610,8 @@ export default {
   // -- SettingsPage --
   settings_title: 'ALiang Gateway',
   settings_tabSettings: '代理设置',
+  settings_subProxy: '代理设置',
+  settings_subIngress: '入口与组网',
   settings_tabUserCenter: '用户',
   settings_tabLogs: '状态',
   settings_live: '在线',

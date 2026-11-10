@@ -614,6 +614,8 @@ export default {
   // -- SettingsPage --
   settings_title: 'ALiang Gateway',
   settings_tabSettings: 'Proxy',
+  settings_subProxy: 'Proxy',
+  settings_subIngress: 'Ingress & Mesh',
   settings_tabUserCenter: 'User',
   settings_tabLogs: 'Status',
   settings_live: 'LIVE',

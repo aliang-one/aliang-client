@@ -130,7 +130,56 @@
              仅影响未单独设置的新会话与代理层；会话级覆盖在聊天页会话设置条。 -->
         <section v-if="currentPage === 'settings'" class="flex flex-col gap-5">
           <SectionHeader :title="t('settings_tabSettings')" :desc="t('settings_sectionProxyDesc')" scope="device" />
-          <div class="flex flex-col gap-5 lg:flex-row lg:items-start">
+          <!-- 代理设置页内两子 tab（用户需求 2026-11-10）：出口代理常用居默认页；
+               入口(SSH)与组网(mesh)低频收进第二页,样式对齐 Agent 页三子 tab。 -->
+          <div class="flex flex-wrap items-center gap-x-5 gap-y-2 border-b border-slate-200 dark:border-slate-700" role="tablist" :aria-label="t('settings_tabSettings')">
+            <button
+              v-for="tab in proxySubTabs"
+              :key="tab.key"
+              type="button"
+              role="tab"
+              :aria-selected="proxySubTab === tab.key"
+              class="min-h-10 border-b-2 px-1 py-2 text-sm font-medium transition"
+              :class="proxySubTab === tab.key
+                ? 'border-primary text-primary'
+                : 'border-transparent text-slate-500 hover:text-slate-700 dark:text-slate-300 dark:hover:text-slate-100'"
+              @click="proxySubTab = tab.key"
+            >
+              {{ t(tab.labelKey) }}
+            </button>
+          </div>
+
+          <div v-if="proxySubTab === 'ingress'" class="flex flex-col gap-5">
+            <div
+              v-if="!isAuthenticated"
+              class="rounded-2xl border border-dashed border-slate-300 bg-white px-6 py-8 text-center shadow-sm dark:border-slate-700 dark:bg-slate-900"
+            >
+              <h2 class="text-xl font-bold text-slate-900 dark:text-white">{{ t('settings_loginRequiredSettings') }}</h2>
+              <p class="text-sm text-slate-500 dark:text-slate-300">{{ t('settings_loginRequiredSettingsDesc') }}</p>
+            </div>
+            <template v-else>
+              <!-- SSH 入口卡片（可选专用口/统一口双模式;默认折叠,详见卡片内注释） -->
+              <SshIngressSettings
+                :config="customerConfig"
+                :loading="isLoadingCustomerConfig"
+                :saving="isSavingCustomerConfig"
+                :error="customerConfigError"
+                :success-message="customerConfigSuccess"
+                @save="saveCustomerConfig"
+              />
+              <!-- mesh 组网卡（写路径=customer.mesh patch 链） -->
+              <MeshSettings
+                :config="customerConfig"
+                :loading="isLoadingCustomerConfig"
+                :saving="isSavingCustomerConfig"
+                :error="customerConfigError"
+                :success-message="customerConfigSuccess"
+                @save="saveCustomerConfig"
+              />
+            </template>
+          </div>
+
+          <div v-else class="flex flex-col gap-5 lg:flex-row lg:items-start">
             <div class="flex min-w-0 flex-1 flex-col gap-5">
               <div
                 v-if="!isAuthenticated"
@@ -152,25 +201,6 @@
                   :error="customerConfigError"
                   :success-message="customerConfigSuccess"
                   :version="customerConfigVersion"
-                  @save="saveCustomerConfig"
-                />
-                <!-- SSH 入口卡片（代理族,出口设置的相邻挂载;常驻显示,与 proxy.type 无关） -->
-                <SshIngressSettings
-                  :config="customerConfig"
-                  :loading="isLoadingCustomerConfig"
-                  :saving="isSavingCustomerConfig"
-                  :error="customerConfigError"
-                  :success-message="customerConfigSuccess"
-                  @save="saveCustomerConfig"
-                />
-                <!-- mesh 组网卡（代理族相邻挂载;Task 1=骨架占位,Task 2 填状态条+
-                     离线兜底常驻卡,Task 3 填拓扑画布;写路径=customer.mesh patch 链） -->
-                <MeshSettings
-                  :config="customerConfig"
-                  :loading="isLoadingCustomerConfig"
-                  :saving="isSavingCustomerConfig"
-                  :error="customerConfigError"
-                  :success-message="customerConfigSuccess"
                   @save="saveCustomerConfig"
                 />
               </template>
@@ -584,6 +614,12 @@ export default {
   },
   data() {
     return {
+      // 代理设置页内子 tab:proxy=出口代理(默认);ingress=入口(SSH)与组网(mesh)。
+      proxySubTab: 'proxy',
+      proxySubTabs: [
+        { key: 'proxy', labelKey: 'settings_subProxy' },
+        { key: 'ingress', labelKey: 'settings_subIngress' }
+      ],
       presetProviders: [],
       customerConfig: createDefaultCustomerConfig(),
       customerConfigVersion: '',
