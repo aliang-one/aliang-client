@@ -6,15 +6,30 @@
        提交载荷 = 整配置透传 + ssh_ingress 覆盖（父层按顶层段浅合并,卡片不丢别的段）。 -->
   <div class="flex flex-col gap-4 rounded-xl border border-slate-200 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-background-dark">
     <div class="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
-      <div class="flex items-center gap-2">
+      <div class="flex min-w-0 items-center gap-2">
+        <button
+          type="button"
+          class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-slate-400 transition hover:bg-slate-100 hover:text-slate-600 dark:hover:bg-slate-800 dark:hover:text-slate-300"
+          :aria-expanded="bodyExpanded ? 'true' : 'false'"
+          :aria-label="t('sshIngress_toggle')"
+          data-field="sshIngressExpand"
+          :title="t('sshIngress_toggle')"
+          @click="bodyExpanded = !bodyExpanded"
+        >
+          <span
+            class="material-symbols-outlined text-xl transition-transform"
+            :class="bodyExpanded ? 'rotate-180' : ''"
+          >expand_more</span>
+        </button>
         <span class="material-symbols-outlined text-primary">login</span>
-        <div>
+        <div class="min-w-0">
           <h3 class="font-semibold text-slate-900 dark:text-white">{{ t('sshIngress_title') }}</h3>
           <p class="text-xs text-slate-500">{{ t('sshIngress_description') }}</p>
         </div>
       </div>
 
-      <!-- 总开关：三态指针在 UI 上是普通布尔,默认关（nil 与 false 行为等价） -->
+      <!-- 总开关：三态指针在 UI 上是普通布尔,默认关（nil 与 false 行为等价）。
+           折叠态下也常驻——不开箱即可直接开关入口。 -->
       <label
         class="inline-flex cursor-pointer items-center justify-between gap-3 rounded-full border px-3 py-2 text-sm font-medium shadow-sm transition md:min-w-[210px]"
         :class="form.enabled
@@ -44,6 +59,9 @@
       {{ successMessage }}
     </div>
 
+    <!-- 体(默认折叠,低频功能不占版面):端口/指纹/双公钥/提示/保存。v-show 而非
+         v-if——单元测试与状态保留均受益(隐藏态 DOM 仍在,数据不重置)。 -->
+    <div v-show="bodyExpanded" data-ssh-ingress-body class="flex flex-col gap-4">
     <div class="grid gap-4 md:grid-cols-[200px_minmax(0,1fr)]">
       <!-- 端口(可选专用口,spec §6.4 修订):留空=跟随统一口 56432;显式端口
            另开常驻专用监听口。旧默认 56442 是哨兵,显示为空(翻译层归零)。 -->
@@ -181,13 +199,14 @@
         class="inline-flex min-h-11 items-center justify-center gap-2 rounded bg-primary px-4 py-2 text-sm font-medium text-white transition hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-60"
         data-ssh-save
         type="button"
-                :disabled="loading || saving || !!validationError || !!portError"
+        :disabled="loading || saving || !!validationError || !!portError"
         @click="save"
       >
         <span class="material-symbols-outlined text-sm">save</span>
         {{ saving ? t('sshIngress_saving') : t('sshIngress_save') }}
       </button>
     </div>
+    </div><!-- /data-ssh-ingress-body -->
   </div>
 </template>
 
@@ -259,6 +278,8 @@ export default {
     return {
       form: this.formFromConfig(this.config),
       keyDraft: '',
+      // 体默认折叠(低频功能):头部常驻标题+描述+总开关,按钮展开细节。
+      bodyExpanded: false,
       hostkey: { loading: false, failed: false, notStarted: false, info: null },
       copied: false,
       copiedTimer: null

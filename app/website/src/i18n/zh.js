@@ -934,6 +934,7 @@ export default {
   sshIngress_title: 'SSH 入口',
   sshIngress_description: '在节点内置 SSH 服务端，外部可用 ssh -D／-L 连入并把节点当代理出口；默认关闭。',
   sshIngress_enable: '启用 SSH 入口',
+  sshIngress_toggle: '展开/收起 SSH 入口设置',
   sshIngress_port: '监听端口',
   sshIngress_portPlaceholder: '留空 = 统一口 56432',
   sshIngress_portInvalid: '端口须为 1-65535 的整数；留空跟随统一口 56432。',

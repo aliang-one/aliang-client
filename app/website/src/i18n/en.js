@@ -935,6 +935,7 @@ export default {
   sshIngress_title: 'SSH Ingress',
   sshIngress_description: 'Runs a built-in SSH server on this node so clients can connect with ssh -D/-L and use the node as their proxy egress; off by default.',
   sshIngress_enable: 'Enable SSH ingress',
+  sshIngress_toggle: 'Toggle SSH ingress settings',
   sshIngress_port: 'Listen port',
   sshIngress_portPlaceholder: 'Empty = unified 56432',
   sshIngress_portInvalid: 'Port must be an integer between 1 and 65535; leave empty to follow the unified 56432.',

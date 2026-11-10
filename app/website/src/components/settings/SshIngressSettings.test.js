@@ -372,6 +372,23 @@ describe('SshIngressSettings 卡片', () => {
     expect(saved[1].ssh_ingress.port).toBe(0);
   });
 
+  it('体默认折叠(v-show 隐藏),点头部按钮展开后可操作', async () => {
+    const { el } = mountCard(baseConfig());
+    await flush();
+    const body = el.querySelector('[data-ssh-ingress-body]');
+    expect(body).toBeTruthy();
+    expect(body.style.display).toBe('none'); // 默认收起,低频功能不占版面
+    expect(el.querySelector('[data-field="sshIngressExpand"]').getAttribute('aria-expanded')).toBe('false');
+
+    el.querySelector('[data-field="sshIngressExpand"]').click();
+    await flush();
+    expect(body.style.display).not.toBe('none');
+    expect(el.querySelector('[data-field="sshIngressExpand"]').getAttribute('aria-expanded')).toBe('true');
+    // 展开后输入框可正常交互(展开即用,无二次门槛)
+    setField(el, 'sshIngressPort', '56443');
+    expect(el.querySelector('[data-field="sshIngressPort"]').value).toBe('56443');
+  });
+
   it('哨兵：配置 port=56442(旧默认)显示为空,保存发 0(翻译层归零=跟随统一口)', async () => {
     const { el, saved } = mountCard(baseConfig({ enable: true, authorized_keys: [HUMAN_KEY], port: 56442 }));
     await flush();
@@ -432,6 +449,7 @@ describe('SshIngressSettings 卡片', () => {
   it('i18n：SSH 入口新键 zh/en 同步存在', () => {
     const sshIngressKeys = [
       'sshIngress_title',
+      'sshIngress_toggle',
       'sshIngress_description',
       'sshIngress_enable',
       'sshIngress_port',
