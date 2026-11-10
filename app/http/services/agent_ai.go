@@ -417,8 +417,12 @@ type agentAISession struct {
 	id          string
 	mode        string
 	projectPath string
-	provider    string
-	model       string
+	// createdBy 是会话创建来源标记（内存态，零序列化）：ai_mcp=agent-as-MCP
+	// 工具面创建，空=既有来源（手机/桌面/恢复装载）。工具面三操作以此做
+	// session 契约校验（runtime 重启随会话态消失，一致性自然成立）。
+	createdBy string
+	provider  string
+	model     string
 	// effort is the provider-specific reasoning effort (codex:
 	// none/minimal/low/medium/high/xhigh; claude: none/low/medium/high/max).
 	// Applied to the codex CLI as a `<base>-<effort>` model-name suffix that the
