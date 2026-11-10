@@ -26,19 +26,38 @@ import (
 // prune（按 mtime 保留最新）。扫描侧另有 recency cap，二者独立。
 const agentCoreJournalMaxFiles = 100
 
-// agentCoreJournalWrittenCap 去重集合上限：超过即整体清空。去重只防同进程内
-// 同一消息写两行，进程重启集合清零没有正确性问题（重发即新 messageID）。
+// agentCoreJournalWrittenCap 去重集合上限。到顶时按**写入先后**淘汰最旧的键
+// （FIFO），而不是整表清空——清空等于把所有在途消息的去重保护一次性归零，
+// 恰在写压力最大的时刻（日志刷屏/重发风暴）放开重复落盘窗口。进程重启集合
+// 清零没有正确性问题（重发即新 messageID）。
 const agentCoreJournalWrittenCap = 4096
+
+// agentCoreJournalSeqTailBytes 初始化会话 seq 计数器时的尾部扫描窗口：正常
+// 文件最后一行就带 seq，一次小读即命中；窗口内没命中（旧文件无 seq 字段）
+// 才退回「全文件行数」基线。
+const agentCoreJournalSeqTailBytes = 256 * 1024
 
 type agentCoreJournal struct {
 	mu       sync.Mutex
 	dir      string
 	dirReady bool
 	written  map[string]struct{}
+	// writtenOrder 是 written 的写入先后队列，供到顶时 FIFO 淘汰最旧键。
+	// 长度恒等于 len(written)（只在新增键时追加、只在淘汰时出队）。
+	// 用 FIFO 而非真 LRU 是对的：命中去重即丢弃，从不「touch」，故命中
+	// 不改写顺序，写入先后就是唯一的冷热信号。
+	writtenOrder []string
+	// seqs 是会话级单调序号计数器（sessionID → 最近分配值）。会话级 seq 的
+	// 存在理由见 nextSeqLocked 注释；进程重启后按磁盘最后一条 seq 续上。
+	seqs map[string]int64
 }
 
 func newAgentCoreJournal(dir string) *agentCoreJournal {
-	return &agentCoreJournal{dir: strings.TrimSpace(dir), written: make(map[string]struct{})}
+	return &agentCoreJournal{
+		dir:     strings.TrimSpace(dir),
+		written: make(map[string]struct{}),
+		seqs:    make(map[string]int64),
+	}
 }
 
 // agentCoreJournalDir 返回 journal 存储根；agentHome() 不可得时返回空串
@@ -430,8 +449,12 @@ func (j *agentCoreJournal) prependHeaderLocked(path, sessionID, projectPath, mod
 // agentAIJournalAttachment 是 msg 行的附件引用（spec 2026-11-05-chat-image-
 // pipeline §3.2）。Ref=相对持久缓存根；journal 不落绝对路径与 URL（网页经
 // /api/agent/ai/attachment?ref= 取图）。Origin=phone|web。
+// Type 显式落键（2026-11-10 聊天记录身份化）：当前写侧只产 image，但消费方
+// 必须靠它判断渲染，不得再假设「只会是图片」——那个隐含前提会让新附件类型
+// 静默降级成纯文本气泡（历史事故：图片+文字被拆两个提问）。
 type agentAIJournalAttachment struct {
 	Name   string `json:"name"`
+	Type   string `json:"type,omitempty"`
 	Mime   string `json:"mime,omitempty"`
 	Bytes  int64  `json:"bytes,omitempty"`
 	Ref    string `json:"ref"`
@@ -480,10 +503,23 @@ func (j *agentCoreJournal) appendMsg(sessionID, role, messageID, text, ts string
 		// 写失败不记去重键：written 只记「已落盘」，IO 恢复后同消息可补写。
 		return
 	}
-	if len(j.written) >= agentCoreJournalWrittenCap {
-		j.written = make(map[string]struct{})
+	j.markWrittenLocked(key)
+}
+
+// markWrittenLocked 记「该消息已落盘」并维护 FIFO 淘汰队列；调用方必须持有
+// j.mu（appendMsg 在持锁路径上调用）。
+func (j *agentCoreJournal) markWrittenLocked(key string) {
+	if _, dup := j.written[key]; dup {
+		return // 已记过：顺序不变（命中不 touch，见 writtenOrder 注释）
+	}
+	// 先淘汰再插入，保证任何时刻 len(writtenOrder) == len(written) ≤ cap。
+	for len(j.written) >= agentCoreJournalWrittenCap && len(j.writtenOrder) > 0 {
+		oldest := j.writtenOrder[0]
+		j.writtenOrder = j.writtenOrder[1:]
+		delete(j.written, oldest)
 	}
 	j.written[key] = struct{}{}
+	j.writtenOrder = append(j.writtenOrder, key)
 }
 
 // appendEnd 落 run 终态行。status ∈ success|stopped|error。
@@ -523,8 +559,20 @@ func (j *agentCoreJournal) appendEndDiagnostics(sessionID, status, errMsg string
 // 去重键。读侧（agent_inventory_agentcore）目前只认 session/msg/tool 三类，
 // 未知 kind 直接跳过，故新增 turn 行对仪表盘回放无副作用、向后兼容。
 //
+// messageID（2026-11-10 聊天记录身份化）：turn 行此前**没有 message_id**，
+// 这是跨端一切助手侧缺陷的共同根因——
+//   - 读侧只能把「锚点之后所有 assistant 行」拼成一个气泡（多答连体），
+//     因为无从判断哪几行属于同一回合；
+//   - inventory 只能现铸 turn-%06d，序号取决于本次扫描的截断窗口，分页锚点
+//     （before_message_id）对 turn 行因此失效，老历史翻不出来；
+//   - 跨端去重无键，只能靠「role + 空白折叠后内容相等」这种启发式。
+//
+// 现在的 id 形如 assistant_<user_message_id>#<turn>：同族既有命名（见
+// agentAssistantMessageID / 其 "-partial" 后缀），确定性可由 (
+// user_message_id, turn) 复算，不依赖扫描顺序，故可作分页锚点与合并键。
+//
 // 空回合（text/thinking 都空且无工具）不落，避免无意义空行。写失败只 Warn。
-func (j *agentCoreJournal) appendAssistantTurn(sessionID string, turn int, text, thinking, stopReason string, tools []string) {
+func (j *agentCoreJournal) appendAssistantTurn(sessionID, messageID string, turn int, text, thinking, stopReason string, tools []string) {
 	if j == nil || j.dir == "" || strings.TrimSpace(sessionID) == "" {
 		return
 	}
@@ -540,6 +588,11 @@ func (j *agentCoreJournal) appendAssistantTurn(sessionID string, turn int, text,
 		"stop_reason": stopReason,
 		"ts":          time.Now().UTC().Format(time.RFC3339),
 	}
+	// 缺 user_message_id 的极端形态（无 run 的直调/测试）不造 id：宁缺勿错，
+	// 读侧按无 id 回落旧口径，绝不写出一个跨会话可能撞车的猜测值。
+	if id := agentCoreTurnMessageID(messageID, turn); id != "" {
+		row["message_id"] = id
+	}
 	if text != "" {
 		row["text"] = text
 	}
@@ -550,6 +603,17 @@ func (j *agentCoreJournal) appendAssistantTurn(sessionID string, turn int, text,
 		row["tools"] = tools
 	}
 	j.appendLineLocked(sessionID, row)
+}
+
+// agentCoreTurnMessageID 生成 turn 行的确定性 message_id。空 user_message_id 或
+// 非法 turn 序号返回空串（= 不写键）。格式与 agentAssistantMessageID 同族：
+// assistant_<user_message_id>#<turn>。
+func agentCoreTurnMessageID(userMessageID string, turn int) string {
+	userMessageID = strings.TrimSpace(userMessageID)
+	if userMessageID == "" || turn <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("%s#%d", agentAssistantMessageID(userMessageID), turn)
 }
 
 // appendTool 落 journal v2 工具行（kind=tool）。不参与 message_id 去重：
@@ -865,6 +929,13 @@ func (j *agentCoreJournal) appendApprovalAudit(sessionID, approvalID string, run
 // ensureSessionHeader 先建目录。dirReady 置位后目录被运行期删除不会自愈
 // （持续 Warn 失败），仅下次 run 的 ensureSessionHeader 走 Stat 缺失分支
 // 时重建——尽力而为语义下的既定取舍。
+//
+// 会话级 seq（2026-11-10 聊天记录身份化）：写入前统一分配 seq 并落进行里。
+// 同一进程内文件顺序即 seq 顺序（都在本锁内追加，且 seq 在同一临界区取自
+// 单调计数器），故 seq 与文件序恒等；它的价值在于**跨端可比较**——读侧
+// 只拿得到截断/分页/多源合并后的行集合，那时文件顺序已经丢失，只能靠
+// 行内 seq 复原真实先后。seq 覆盖全部行型（含 tool/approval/subagent），
+// 因此它同时是「这一行在会话内第几个落盘」的唯一真值。
 func (j *agentCoreJournal) appendLineLocked(sessionID string, row map[string]interface{}) bool {
 	if !j.dirReady {
 		if err := os.MkdirAll(j.dir, 0o700); err != nil {
@@ -872,6 +943,11 @@ func (j *agentCoreJournal) appendLineLocked(sessionID string, row map[string]int
 			return false
 		}
 		j.dirReady = true
+	}
+	// seq 在 marshal 之前落进 row：与内容同一次序列化，不存在「行写了 seq 没写」
+	// 的中间态。头行（kind=session）不占 seq——它是元数据不是记录。
+	if kind, _ := row["kind"].(string); kind != "session" {
+		row["seq"] = j.nextSeqLocked(sessionID)
 	}
 	line, err := jsonMarshalLine(row)
 	if err != nil {
@@ -905,6 +981,102 @@ func (j *agentCoreJournal) appendLineLocked(sessionID string, row map[string]int
 		return false
 	}
 	return true
+}
+
+// nextSeqLocked 分配会话级单调序号；调用方必须持有 j.mu。
+//
+// 首次见某会话时按磁盘恢复基线：优先读文件尾部窗口的最后一条带 seq 的行
+// （正常情况下一行即命中），窗口内没有 seq（旧文件 / 长 tool 行堆积）才退回
+// 「全文件行数」——旧文件的文件顺序就是 seq 顺序，行数即其上界，重启后从
+// 它续上不会与已有行撞号。两条路径都拿不到（文件不存在）则从 0 起。
+//
+// 为什么不能只用「每 run 的 event_seq」（agent_ai.go agentAIRunEmitter）：那是
+// 单次 run 内的帧序，run 结束即归零、且增量帧与持久行不是一一对应，跨 run
+// 不可比较。跨端合并（快照 + 本地草稿 + 详情分页）需要的是**会话内全局**的
+// 先后，只有写侧能给出。
+func (j *agentCoreJournal) nextSeqLocked(sessionID string) int64 {
+	if j.seqs == nil {
+		j.seqs = make(map[string]int64)
+	}
+	if cur, ok := j.seqs[sessionID]; ok {
+		j.seqs[sessionID] = cur + 1
+		return cur + 1
+	}
+	base := j.seqBaselineLocked(sessionID)
+	j.seqs[sessionID] = base + 1
+	return base + 1
+}
+
+// seqBaselineLocked 从磁盘还原某会话的 seq 基线（已分配到的最大值）；调用方
+// 必须持有 j.mu。读失败/文件缺失一律返回 0（seq 从 1 起，最坏情况与旧行重复
+// 但不破坏单调性——旧行本就没有 seq，不会与新行撞「同 seq 不同内容」）。
+func (j *agentCoreJournal) seqBaselineLocked(sessionID string) int64 {
+	path := filepath.Join(j.dir, agentCoreJournalFileName(sessionID))
+	f, err := os.Open(path)
+	if err != nil {
+		return 0
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil || fi.Size() == 0 {
+		return 0
+	}
+	// ① 尾窗扫描：正常文件的最后一行就带 seq。
+	size := fi.Size()
+	start := size - agentCoreJournalSeqTailBytes
+	if start < 0 {
+		start = 0
+	}
+	buf := make([]byte, size-start)
+	if _, err := f.ReadAt(buf, start); err == nil {
+		lines := splitJSONLLines(buf)
+		for i := len(lines) - 1; i >= 0; i-- {
+			var row map[string]interface{}
+			if json.Unmarshal(lines[i], &row) != nil {
+				continue // 半行（窗口首行可能被切）容忍
+			}
+			if seq, ok := journalRowSeq(row); ok {
+				return seq
+			}
+		}
+	}
+	// ② 旧文件无 seq：以**记录行数**作基线（文件序即 seq 序，行数是上界）。
+	// 必须排除头行：头行不占 seq（见 appendLineLocked），把它算进基线会让
+	// 首条记录从 2 起，破坏「从 1 起严格 +1」。
+	all, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	count := int64(0)
+	for i, line := range splitJSONLLines(all) {
+		if i == 0 {
+			var head map[string]interface{}
+			if json.Unmarshal(line, &head) == nil && head["kind"] == "session" {
+				continue // 头行不占号
+			}
+		}
+		count++
+	}
+	return count
+}
+
+// journalRowSeq 读行内 seq（JSON 数字反序列化为 float64）；缺失/非正数视为无 seq。
+func journalRowSeq(row map[string]interface{}) (int64, bool) {
+	switch v := row["seq"].(type) {
+	case float64:
+		if v > 0 {
+			return int64(v), true
+		}
+	case int64:
+		if v > 0 {
+			return v, true
+		}
+	case int:
+		if v > 0 {
+			return int64(v), true
+		}
+	}
+	return 0, false
 }
 
 // pruneLocked 保留 mtime 最新的 agentCoreJournalMaxFiles 个文件（最旧先删）。

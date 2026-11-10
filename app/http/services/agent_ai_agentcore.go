@@ -1817,7 +1817,7 @@ func agentCoreLoopHooks(m *agentAIManager, run agentAIRun, diag *agentCoreDiagno
 					tools = append(tools, tc.Name)
 				}
 			}
-			m.coreJournal.appendAssistantTurn(run.sessionID, turnN, tr.Text, tr.Thinking, tr.StopReason, tools)
+			m.coreJournal.appendAssistantTurn(run.sessionID, run.messageID, turnN, tr.Text, tr.Thinking, tr.StopReason, tools)
 			if strings.TrimSpace(tr.Text) != "" {
 				diag.noteTextTurn()
 			}

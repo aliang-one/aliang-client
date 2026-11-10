@@ -148,8 +148,11 @@ export function normalizeApprovalDecisions(values) {
 // 系统条先例（审批取消/运行提示条：role:'assistant'+kind:'system'+note+
 // status:'done'）渲染为居中弱化胶囊。note='turn_failed' 供 testid 分流；文案
 // server 已人话化，原样展示。
-export function deviceSystemNoteBubble(content, ts) {
-  return { role: 'assistant', kind: 'system', note: 'turn_failed', content, status: 'done', ts };
+export function deviceSystemNoteBubble(content, ts, seq = 0) {
+  return {
+    role: 'assistant', kind: 'system', note: 'turn_failed', content, status: 'done', ts,
+    ...(seq > 0 ? { seq } : {}),
+  };
 }
 
 // 会话仍在跑时的尾部 running 占位（2026-11-09 审计 REAL-high）：快照/详情
@@ -160,12 +163,70 @@ export function deviceRunningTailBubble(ts) {
   return { role: 'assistant', content: '', status: 'running', ts };
 }
 
+// 会话级单调序号（2026-11-10 聊天记录身份化）。
+//
+// 来源：journal 写侧在每行落盘时分配 seq（agent_ai_agentcore_journal.go
+// nextSeqLocked），读侧原样透传到快照/详情 wire（快照字段名 `seq`，详情字段名
+// `seq`，两端同键）。0/缺字段 = 旧 agent 或本地新气泡，调用方按既有数组序回落。
+//
+// 为什么不用数组序 / ts：数组序在「快照限幅截尾 + 本地草稿 + 详情分页」三方
+// 合并时会丢失真实先后（截尾后首条不再是第 0 条）；ts 在跨端写入时会出现
+// 倒挂（历史事故：云端 position 对实录 47095 反序）。seq 由产生数据的那一端
+// 分配，跨进程重启、跨端合并、跨页翻历史都恒等，是唯一可比的先后真值。
+export function chatMessageSeq(m) {
+  const v = m && m.seq;
+  return Number.isFinite(v) && v > 0 ? v : 0;
+}
+
+// 按会话级 seq 排序（导出纯函数，供单测）。
+//
+// 实现刻意是「占位部分排序」而不是普通 comparator：普通 `sort` 里对不可比的
+// 一对返回 0 会破坏比较器的传递性（a~b、a~c 但 b<c），JS 引擎对这种不一致
+// 比较器的行为是实现定义——结果可能把一个无 seq 的本地气泡甩到别处。这里改成
+// **只重排带 seq 的元素、且只占用它们自己原来的下标位**：无 seq 的条目（本地
+// 草稿、失败发送、运行尾占位、旧 agent 的行）永远原地不动。
+//
+// 语义：新旧混合时旧记录序完全不变；全是新记录时得到真正的 seq 序；部分新旧
+// 混合时新记录在「新记录占据的那些位置」内互相排好。
+export function orderMessagesBySeq(messages) {
+  return orderBySeqSlots(Array.isArray(messages) ? messages : [], chatMessageSeq);
+}
+
+// orderBySeqSlots 把 list 中「有 seq」的元素按 seq 升序取出，再按原下标位回填。
+// 无 seq 的元素及其位置完全不动。O(n log n)，不改原数组；无可排序内容时原样
+// 返回入参（调用方常在无变化场景比对引用）。
+function orderBySeqSlots(list, seqOf) {
+  if (list.length < 2) return list;
+  const slots = [];
+  const picked = [];
+  for (let i = 0; i < list.length; i++) {
+    if (seqOf(list[i])) {
+      slots.push(i);
+      picked.push(list[i]);
+    }
+  }
+  if (picked.length < 2) return list;
+  picked.sort((a, b) => seqOf(a) - seqOf(b));
+  const out = list.slice();
+  for (let k = 0; k < slots.length; k++) out[slots[k]] = picked[k];
+  return out;
+}
+
 // running 尾占位补齐：仅当已有尾气泡不是 running 时补（幂等）。
 function ensureRunningTail(messages, fallbackTs) {
   const last = messages[messages.length - 1];
   if (!last || last.role !== 'assistant' || last.status !== 'running') {
     messages.push(deviceRunningTailBubble(fallbackTs));
   }
+}
+
+// wire 转录行 → 按 seq 排序（详情/快照两侧共用的行级版本）。
+//
+// 详情行 seq 键名 `seq`、快照行同为 `seq`（2026-11-10 身份化后两端同键），
+// 因此一个读取器够用。排序语义与 orderMessagesBySeq 同源（orderBySeqSlots）：
+// 无 seq 的行原地不动，旧 agent（全无 seq）的转录序完全不变。
+function orderRowsBySeq(rows) {
+  return orderBySeqSlots(Array.isArray(rows) ? rows : [], chatMessageSeq);
 }
 
 // 详情转录行 → 壳气泡 + 喂入流（纯函数，导出供单测；applyDeviceTranscript
@@ -180,13 +241,13 @@ export function deviceDetailTranscriptToMessages(rows, provider, fallbackTs, run
   const hasAtts = m => Array.isArray(m.attachments) && m.attachments.length > 0;
   // system 行无条件保留（空正文也落条，正文兜底 ''）——收编前内联实装同款；
   // 文本/附件二选一的准入只对 user/assistant 生效。
-  const renderable = list.filter(m => m && (
+  const renderable = orderRowsBySeq(list.filter(m => m && (
     m.role === 'system'
     || ((m.role === 'user' || m.role === 'assistant')
       && ((typeof m.content === 'string' && m.content) || hasAtts(m)))
-  ));
+  )));
   const messages = renderable.map(m => m.role === 'system'
-    ? deviceSystemNoteBubble(m.content || '', Date.parse(m.timestamp) || fallbackTs)
+    ? deviceSystemNoteBubble(m.content || '', Date.parse(m.timestamp) || fallbackTs, chatMessageSeq(m))
     : {
       role: m.role,
       content: m.content || '',
@@ -196,6 +257,9 @@ export function deviceDetailTranscriptToMessages(rows, provider, fallbackTs, run
       messageId: m.id || '',
       provider: provider || '',
       ts: Date.parse(m.timestamp) || fallbackTs,
+      // seq：journal 会话级序号（2026-11-10 身份化）。带上它，合并/重排才有
+      // 确定性依据；旧 agent 无该字段则为 0（下游按数组序回落）。
+      ...(chatMessageSeq(m) ? { seq: chatMessageSeq(m) } : {}),
       ...(hasAtts(m)
         ? { attachments: m.attachments.map(a => ({ name: a.name || '', url: chatAttachmentUrl(a.ref) })) }
         : {}),
@@ -217,13 +281,13 @@ export function deviceSnapshotTranscriptToMessages(rows, provider, fallbackTs, r
   const list = Array.isArray(rows) ? rows : [];
   const hasAtts = m => Array.isArray(m.attachments) && m.attachments.length > 0;
   // system 行无条件保留（空正文也落条）——与详情侧同款口径。
-  const renderable = list.filter(m => m && (
+  const renderable = orderRowsBySeq(list.filter(m => m && (
     m.role === 'system'
     || ((m.role === 'user' || m.role === 'assistant')
       && ((typeof m.text === 'string' && m.text) || hasAtts(m)))
-  ));
+  )));
   const messages = renderable.map(m => m.role === 'system'
-    ? deviceSystemNoteBubble(m.text || '', Date.parse(m.ts) || fallbackTs)
+    ? deviceSystemNoteBubble(m.text || '', Date.parse(m.ts) || fallbackTs, chatMessageSeq(m))
     : {
       role: m.role,
       content: m.text || '',
@@ -233,6 +297,8 @@ export function deviceSnapshotTranscriptToMessages(rows, provider, fallbackTs, r
       messageId: m.message_id || '',
       provider: provider || '',
       ts: Date.parse(m.ts) || fallbackTs,
+      // seq：journal 会话级序号（2026-11-10 身份化），快照与详情同键名。
+      ...(chatMessageSeq(m) ? { seq: chatMessageSeq(m) } : {}),
       ...(hasAtts(m)
         ? { attachments: m.attachments.map(a => ({ name: a.name || '', url: chatAttachmentUrl(a.ref) })) }
         : {}),
@@ -374,7 +440,10 @@ export function runDoneNeedsSnapshot(conv, hadRunning) {
 export function reconcileLocalSnapshotMessages(localMessages, rows, opts = {}) {
   const { provider = '', snapshotRunning = false, fallbackTs = 0 } = opts;
   const local = Array.isArray(localMessages) ? localMessages : [];
-  const list = Array.isArray(rows) ? rows : [];
+  // 分段前先按 seq 归位（2026-11-10 身份化）：回合切分依赖「user 行在其助手行
+  // 之前」这个序关系，而快照限幅截尾后数组序未必仍等于写侧顺序。带 seq 的行
+  // 按 seq 排、无 seq 的行原地不动（orderBySeqSlots 语义），旧 agent 零影响。
+  const list = orderRowsBySeq(Array.isArray(rows) ? rows : []);
   const result = { messages: local, changed: false, appended: 0, closedRunning: 0, alignedLive: false, createdRunning: false };
   if (!list.length) return result;
 
@@ -384,14 +453,17 @@ export function reconcileLocalSnapshotMessages(localMessages, rows, opts = {}) {
   for (const row of list) {
     if (!row) continue;
     if (row.role === 'user') {
-      rounds.push({ userRow: row, texts: [], notes: [], lastTs: tsOf(row) });
+      rounds.push({ userRow: row, texts: [], notes: [], lastTs: tsOf(row), lastSeq: 0 });
     } else if (row.role === 'assistant' || row.role === 'system') {
       if (!rounds.length) continue; // 帽截断孤儿头行
       const r = rounds[rounds.length - 1];
       if (row.role === 'assistant' && typeof row.text === 'string' && row.text) r.texts.push(row.text);
       if (row.role === 'system' && typeof row.text === 'string' && row.text) {
-        r.notes.push({ text: row.text, ts: tsOf(row) });
+        r.notes.push({ text: row.text, ts: tsOf(row), seq: chatMessageSeq(row) });
       }
+      // 该回合的 seq 取「本回合最后一条带 seq 的助手/系统行」——新建答案泡时
+      // 以它作为该气泡的先后依据（2026-11-10 身份化）。
+      if (chatMessageSeq(row)) r.lastSeq = chatMessageSeq(row);
       r.lastTs = tsOf(row) || r.lastTs;
     }
   }
@@ -454,12 +526,16 @@ export function reconcileLocalSnapshotMessages(localMessages, rows, opts = {}) {
           .filter(a => a && a.ref)
           .map(a => ({ name: (a && a.name) || '', url: chatAttachmentUrl(a.ref) }))
         : null;
+      const userSeq = chatMessageSeq(r.userRow);
       out.push({
         role: 'user',
         content: typeof r.userRow.text === 'string' ? r.userRow.text : '',
         messageId: mid,
         provider,
         ts: tsOf(r.userRow),
+        // seq：外来 user 行的会话级序号（2026-11-10 身份化）。补建气泡带上它，
+        // 后续跨端再合并才有确定性依据；旧 agent 无该字段则为 0（不落键）。
+        ...(userSeq ? { seq: userSeq } : {}),
         ...(atts && atts.length ? { attachments: atts } : {}),
       });
       result.appended++;
@@ -482,6 +558,12 @@ export function reconcileLocalSnapshotMessages(localMessages, rows, opts = {}) {
         result.changed = true;
       }
       answer.status = streaming ? 'running' : 'done';
+      // seq 同步：只在真的变了时改写并记 changed（幂等契约：零改动必须
+      // changed=false，否则调用方每轮都重赋值+落盘，渲染抖动）。
+      if (r.lastSeq > 0 && answer.seq !== r.lastSeq) {
+        answer.seq = r.lastSeq;
+        result.changed = true;
+      }
       out.push(answer);
     } else if (text || (isLast && snapshotRunning)) {
       const fresh = {
@@ -489,6 +571,7 @@ export function reconcileLocalSnapshotMessages(localMessages, rows, opts = {}) {
         content: text,
         status: (isLast && snapshotRunning) ? 'running' : 'done',
         ts: r.lastTs || fallbackTs,
+        ...(r.lastSeq > 0 ? { seq: r.lastSeq } : {}),
       };
       out.push(fresh);
       result.appended++;
@@ -496,7 +579,7 @@ export function reconcileLocalSnapshotMessages(localMessages, rows, opts = {}) {
       if (fresh.status === 'running') result.createdRunning = true;
     }
     for (const n of r.notes) {
-      out.push(deviceSystemNoteBubble(n.text, n.ts));
+      out.push(deviceSystemNoteBubble(n.text, n.ts, n.seq || 0));
       result.appended++;
       result.changed = true;
     }
@@ -597,6 +680,13 @@ export function reconcileLocalSnapshotMessages(localMessages, rows, opts = {}) {
           result.alignedLive = true;
           result.changed = true;
         }
+        // 锚回合答案泡的 seq（2026-11-10 身份化）：复用的既有泡同样要带上
+        // journal 的会话级序号，否则它在下一次跨端合并里仍无先后依据。幂等：
+        // 同值不记 changed（否则每轮对账都重赋值+落盘，渲染抖动）。
+        if (anchorRound.lastSeq > 0 && candidate.seq !== anchorRound.lastSeq) {
+          candidate.seq = anchorRound.lastSeq;
+          result.changed = true;
+        }
       } else if (anchorTexts) {
         // 锚回合无泡 + journal 有文本 → 补建（旧 noBubble 分支吸收）
         const fresh = {
@@ -604,6 +694,7 @@ export function reconcileLocalSnapshotMessages(localMessages, rows, opts = {}) {
           content: anchorTexts,
           status: settled ? 'done' : 'running',
           ts: anchorRound.lastTs || fallbackTs,
+          ...(anchorRound.lastSeq > 0 ? { seq: anchorRound.lastSeq } : {}),
         };
         out.push(fresh);
         result.appended++;

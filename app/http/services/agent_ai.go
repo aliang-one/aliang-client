@@ -552,6 +552,10 @@ type agentAIMessage struct {
 	MessageID string
 	Content   string
 	CreatedAt time.Time
+	// Seq 是 journal 写侧分配的会话级单调序号（2026-11-10 聊天记录身份化）。
+	// 读侧原样透传到快照/详情 wire，供前端确定性排序与幂等合并；0 = 无该
+	// 字段（内存新消息、旧文件），调用方按既有数组序回落。
+	Seq int64
 	// Attachments 是用户消息携带的图片引用（journal msg 行透传，快照/详情
 	// 序列化直接用 wire 形状）。纯图消息 Content 为空。
 	Attachments []models.AgentVibeAttachment
@@ -2222,8 +2226,18 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 		_ = writeJSON(agentAIErrorPayload("", messageID, errors.New("ai.message missing session_id")))
 		return
 	}
-	if messageID == "" {
-		messageID = sessionID
+	// message_id 缺省（2026-11-10 聊天记录身份化）：旧实现回落到 sessionID。
+	// 那是**同一个会话内所有缺 id 的消息共用一个键**——journal 去重键是
+	// sessionID+role+messageID，于是同会话第二条及以后的缺 id 消息全部命中
+	// 去重被静默丢弃（用户侧表现：手机上提问网页看不见）。现在改为就地铸造
+	// 一个唯一 id，并在下面的 ai.message.received 里回传，客户端可据以对账。
+	// 取舍见 resolveAgentAIUserMessageID 注释。
+	if mintedID, minted, err := resolveAgentAIUserMessageID(messageID); err != nil {
+		_ = writeJSON(agentAIErrorPayload(sessionID, "", errors.New("ai.message missing message_id")))
+		return
+	} else if minted {
+		messageID = mintedID
+		logger.Warn(fmt.Sprintf("ai.message: minted message_id session=%s id=%s (client sent none)", sessionID, messageID))
 	}
 	// 绑定族守卫（镜像 runStart 的先例，见 runStart 内同款注释；Task G3
 	// 2026-11-05）：绑定已 confirmed 时，原生会话 id 归 persisted.Provider 所有。
@@ -3055,8 +3069,15 @@ func (m *agentAIManager) steer(msg map[string]interface{}, writeJSON agentTermin
 		emitAgentAISteerAck(writeJSON, "", messageID, "error", "ai.steer missing session_id", "bad_request")
 		return
 	}
-	if messageID == "" {
-		messageID = sessionID
+	// 与 ai.message 同款兜底（2026-11-10 聊天记录身份化）：缺 message_id 时
+	// 回落 sessionID 会让同一会话内所有插话共用去重键，插话轮次在 journal 里
+	// 互相覆盖/丢弃。改为现场铸造唯一 id，并在 ack 里回传，客户端可据以对账。
+	if mintedID, minted, err := resolveAgentAIUserMessageID(messageID); err != nil {
+		emitAgentAISteerAck(writeJSON, sessionID, "", "error", "ai.steer missing message_id", "bad_request")
+		return
+	} else if minted {
+		messageID = mintedID
+		logger.Warn(fmt.Sprintf("ai.steer: minted message_id session=%s id=%s (client sent none)", sessionID, messageID))
 	}
 	if content == "" {
 		emitAgentAISteerAck(writeJSON, sessionID, messageID, "error", "ai.steer content is empty", "bad_request")
@@ -10410,6 +10431,41 @@ func newAgentAIApprovalToken() (string, error) {
 		return "", fmt.Errorf("generate approval token: %w", err)
 	}
 	return hex.EncodeToString(b[:]), nil
+}
+
+// newAgentAIMessageID 就地铸造一个用户发言的 message_id（2026-11-10 聊天记录
+// 身份化）。只在客户端没带 message_id 时走这条兜底路径，正常客户端一律自带。
+//
+// 为什么必须有这个兜底而不是硬拒：旧客户端（以及部分只带 session_id 的老
+// 调用方）一旦被硬拒就彻底发不出消息。而旧实现回落到 sessionID 更糟——journal
+// 的去重键是 sessionID+role+messageID，同会话里所有缺 id 的发言共用同一个键，
+// 于是第二条起全部命中去重被静默丢弃（用户侧表现就是「手机上问的，网页上看
+// 不见」）。铸造唯一 id 同时满足两端：旧客户端继续可用，每条发言在 journal 里
+// 都是独立记录。
+//
+// 取舍说清楚：铸造后同一帧若被重放（重连重发这类），会产生两条独立记录而
+// 不再互相吞掉——丢失变成重复。这是有意的方向：重复是可见、可删的瑕疵，
+// 静默丢失是数据事故。
+func newAgentAIMessageID() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("generate message id: %w", err)
+	}
+	return "msg_" + hex.EncodeToString(b[:]), nil
+}
+
+// resolveAgentAIUserMessageID 把「客户端可能没带的 message_id」解析成一个一定
+// 非空的取值：带了就原样用（trim 后），没带就现场铸造。ai.message 与 ai.steer
+// 共用这一条纪律，避免两处各自兜底再漂移。
+func resolveAgentAIUserMessageID(messageID string) (string, bool, error) {
+	if id := strings.TrimSpace(messageID); id != "" {
+		return id, false, nil
+	}
+	id, err := newAgentAIMessageID()
+	if err != nil {
+		return "", false, err
+	}
+	return id, true, nil
 }
 
 func marshalAgentAIRaw(raw interface{}) json.RawMessage {

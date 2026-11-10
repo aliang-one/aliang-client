@@ -307,6 +307,12 @@ func persistAgentAIAttachmentFiles(sessionID, base string, list []agentAIAttachm
 // agentAIJournalAttachmentsFrom 把带 PersistPath 的附件转成 journal 引用视图
 // （Ref/Name/Mime/Bytes/Origin）。无 PersistPath 的（下载失败/降级带）不入列。
 // Origin 缺省 phone（resolve 阶段命中缓存根的网页图已带 web）。
+//
+// 只收图片是**有意的**：本字段的唯一消费面是图片缩略图（Mime 白名单 + Bytes
+// 占位），文本素材正文内联、文本文件走路径清单，都进不了缩略图位。但这条
+// 隐含前提是历史缺陷源——新增附件类型会被静默降级成「纯文本气泡」，用户侧
+// 表现即「图片+文字被拆成两个提问」。因此 Type 一并写进引用视图：消费方
+// 必须显式判 Type/Mime 决定渲染，绝不能再假设「journal 里只可能有图片」。
 func agentAIJournalAttachmentsFrom(list []agentAIAttachment) []agentAIJournalAttachment {
 	var out []agentAIJournalAttachment
 	for _, a := range list {
@@ -317,6 +323,7 @@ func agentAIJournalAttachmentsFrom(list []agentAIAttachment) []agentAIJournalAtt
 			Name:   a.Name,
 			Ref:    a.PersistPath,
 			Origin: a.Origin,
+			Type:   "image",
 		}
 		switch strings.ToLower(filepath.Ext(a.PersistPath)) {
 		case ".jpg", ".jpeg":
