@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -496,5 +498,182 @@ func TestAgentCoreSubagentInterruptedSuffix(t *testing.T) {
 		if !strings.Contains(got, marker) {
 			t.Fatalf("中断块缺标记 %q: %q", marker, got)
 		}
+	}
+}
+
+// TestAgentCoreSubagentBridgeRetryProgress（vm129 审计 2026-11-10）：子 run
+// Emit=nil 吞掉 api_retry 帧，上游重试链在面板上纯静默。修复后 Hooks.OnRetry
+// 经 mirror 发最小 progress（current_step=「上游重试 #N（类别(状态码)）」）。
+// 序列刻意走「503 → Read 工具 → 503 → 文本」四段：既验证首试重试帧
+// last_tool 省键，也锁死 registry 非空覆盖不变量——工具后再遇重试，
+// lastTool 传空串不得抹掉既有工具名（app/agentcore 同名守卫的唯一
+// 端到端锁定，改 if patch.LastTool != "" 为无条件覆盖本条即红）。
+func TestAgentCoreSubagentBridgeRetryProgress(t *testing.T) {
+	dir := t.TempDir()
+	note := filepath.Join(dir, "note.txt")
+	if err := os.WriteFile(note, []byte("ok"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var attempts int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "text/event-stream")
+		switch atomic.AddInt32(&attempts, 1) {
+		case 1, 3: // 首试与工具后各撞一次 503——两个流各自走一轮重试链
+			w.WriteHeader(http.StatusServiceUnavailable)
+			fmt.Fprint(w, `{"error":{"message":"upstream overloaded","type":"overloaded_error"},"type":"error"}`)
+		case 2:
+			fmt.Fprintf(w, "data: %s\n\n", agentCoreToolTurn("toolu_retry1", "Read", fmt.Sprintf(`{"file_path":%q}`, note)))
+		default:
+			fmt.Fprintf(w, "data: %s\n\n", agentCoreTextTurn("重试后成功", ""))
+		}
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	}))
+	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
+
+	var frames []string
+	m := &agentCoreSubagentMirror{
+		registry:  newAgentAISubagentRegistry(),
+		activity:  &agentAIActivity{},
+		sessionID: "s-retry",
+		messageID: "m-retry",
+		emit:      func(b []byte) error { frames = append(frames, string(b)); return nil },
+	}
+	bridge := &agentCoreSubagentBridge{
+		client:      agentcore.NewClient(agentCoreBaseURL()),
+		mainModel:   "glm-5.2",
+		name:        "researcher",
+		description: "调研",
+		body:        "你是调研员。",
+		projectPath: dir,
+		mirror:      m,
+		approve: func(ctx context.Context, call agentcore.ApprovalRequest) (agentcore.ApprovalResponse, error) {
+			return agentcore.ApprovalResponse{Approved: true}, nil
+		},
+	}
+	res := bridge.Execute(context.Background(), map[string]interface{}{"task": "调研"}, nil)
+	if res.IsError || !strings.Contains(res.Content, "重试后成功") {
+		t.Fatalf("两次 503 重试后应成功: %+v", res)
+	}
+	type progressRow struct {
+		step     string
+		lastTool string
+		hasKey   bool
+	}
+	var rows []progressRow
+	for _, raw := range frames {
+		var payload map[string]interface{}
+		if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+			t.Fatalf("帧不是合法 JSON: %v: %s", err, raw)
+		}
+		if payload["phase"] != "progress" {
+			continue
+		}
+		lt, _ := payload["last_tool"].(string)
+		rows = append(rows, progressRow{
+			step:     fmt.Sprint(payload["current_step"]),
+			lastTool: lt,
+			hasKey:   true,
+		})
+	}
+	// 形状：首试重试 → 工具 → 工具后重试，三段 progress 齐备且各就各位。
+	if len(rows) < 3 {
+		t.Fatalf("progress 帧数 = %d, want >=3（重试/工具/重试）, frames=%d", len(rows), len(frames))
+	}
+	if !strings.Contains(rows[0].step, "上游重试 #1") || !strings.Contains(rows[0].step, "server_error(503)") {
+		t.Fatalf("首试重试帧类别/状态码缺失: %+v", rows[0])
+	}
+	if rows[0].lastTool != "" {
+		t.Fatalf("首试重试不应带 last_tool（此时无任何工具调用）: %+v", rows[0])
+	}
+	if rows[1].lastTool != "Read" {
+		t.Fatalf("工具 progress last_tool = %q, want Read", rows[1].lastTool)
+	}
+	// 核心不变量：工具后再遇重试，lastTool 空串不覆盖既有工具名。
+	if !strings.Contains(rows[2].step, "上游重试 #1") || rows[2].lastTool != "Read" {
+		t.Fatalf("工具后重试帧应保留 last_tool=Read（registry 非空覆盖语义）: %+v", rows[2])
+	}
+	// 终态帧仍正常（completed）。
+	var finished bool
+	for _, raw := range frames {
+		var payload map[string]interface{}
+		_ = json.Unmarshal([]byte(raw), &payload)
+		if payload["phase"] == "completed" {
+			finished = true
+		}
+	}
+	if !finished {
+		t.Fatalf("终态帧缺失")
+	}
+}
+
+// TestAgentCoreSubagentParallelContract（vm129 审计 2026-11-10）：模型可见契约
+// 上的并行上限必须与运行时并发闸同源——写死「上限 4」而闸默认 2，多派的
+// 子 agent 排队且排队期不可见。
+func TestAgentCoreSubagentParallelContract(t *testing.T) {
+	if got := agentCoreSubagentParallelLimit(nil); got != agentcore.MaxParallelToolCalls {
+		t.Fatalf("无闸应回落内核上限 %d, got %d", agentcore.MaxParallelToolCalls, got)
+	}
+	if got := agentCoreSubagentParallelLimit(newAgentCoreSubagentControlWithLimit(2)); got != 2 {
+		t.Fatalf("闸=2 时契约应为 2, got %d", got)
+	}
+	// 闸=0（测试路径/显式放开）回落内核上限，不报 0。
+	if got := agentCoreSubagentParallelLimit(newAgentCoreSubagentControlWithLimit(0)); got != agentcore.MaxParallelToolCalls {
+		t.Fatalf("无闸 control 应回落内核上限, got %d", got)
+	}
+	// 闸配 5-8（合法）也不许契约高估：内核并行工具批信号量恒 4
+	//（loop.go executeParallelBatch），同回合实际并发恒 = min(4, 闸)。
+	if got := agentCoreSubagentParallelLimit(newAgentCoreSubagentControlWithLimit(8)); got != agentcore.MaxParallelToolCalls {
+		t.Fatalf("闸=8 时契约应为内核上限 %d（不许高估）, got %d", agentcore.MaxParallelToolCalls, got)
+	}
+
+	// 机制块：parallelLimit=2 → 「up to 2」；零值 router 回落内核上限。
+	block := agentCoreSubagentMechanismSuffix(&agentCoreSubagentTaskRouter{
+		parallelLimit: 2,
+		types:         []string{"researcher"},
+		descriptions:  map[string]string{"researcher": "调研"},
+	})
+	if !strings.Contains(block, "concurrently (up to 2); excess calls queue until a slot frees") {
+		t.Fatalf("机制块并行上限未与闸同源: %q", block)
+	}
+	blockZero := agentCoreSubagentMechanismSuffix(&agentCoreSubagentTaskRouter{
+		types:        []string{"researcher"},
+		descriptions: map[string]string{"researcher": "调研"},
+	})
+	if !strings.Contains(blockZero, fmt.Sprintf("concurrently (up to %d)", agentcore.MaxParallelToolCalls)) {
+		t.Fatalf("零值 router 应回落内核上限: %q", blockZero)
+	}
+
+	// router 工具描述：构造期从 control 取 cap，文本出现真实数字与排队提示。
+	setTestAgentHome(t)
+	writeSubagentDef(t, os.Getenv("HOME"), "researcher.md",
+		"---\nname: researcher\ndescription: 调研任务\n---\n你是调研员。")
+	mgr := newAgentAIManager()
+	router := mgr.agentCoreSubagentTaskTool(agentAIRun{sessionID: "s", projectPath: "/tmp/p"},
+		nil, nil, nil, nil, nil, nil, newAgentCoreSubagentControlWithLimit(2))
+	if router == nil {
+		t.Fatal("router 不应为 nil")
+	}
+	desc := router.Description()
+	if !strings.Contains(desc, "上限 2") || !strings.Contains(desc, "排队等待空位") {
+		t.Fatalf("工具描述未与闸同源: %q", desc)
+	}
+}
+
+// TestAgentCoreSubagentBuiltinResearcherWindowsHint（vm129 实测 2026-11-10）：
+// 无 bash 的 Windows 机器上内置 researcher 白烧 4 发必败 Bash 探测（~67s），
+// 内置定义必须带「先探测 shell / Bash 失败即切 PowerShell」的指引。
+func TestAgentCoreSubagentBuiltinResearcherWindowsHint(t *testing.T) {
+	body := agentCoreSubagentBuiltinDefs[0].Body
+	for _, marker := range []string{"PowerShell", "不要反复重试 Bash"} {
+		if !strings.Contains(body, marker) {
+			t.Fatalf("内置 researcher 缺 Windows 指引标记 %q: %q", marker, body)
+		}
+	}
+	// 内置 Body 完整性：机制块只枚举 Name+Description（Body 只进子 run
+	// system prompt），这里直接锁 Body 内容。
+	if !strings.Contains(body, "输出结构化调研报告") {
+		t.Fatalf("内置正文锚句缺失: %q", body)
 	}
 }

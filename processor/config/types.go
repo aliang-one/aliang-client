@@ -719,8 +719,13 @@ func (c *AgentCoreTuningConfig) Validate() error {
 	if c.MaxIdenticalToolTurns < 0 || c.MaxIdenticalToolTurns > 50 {
 		return fmt.Errorf("agentcore.max_identical_tool_turns 必须在 [0,50] 内(0=用内核默认), got %d", c.MaxIdenticalToolTurns)
 	}
-	if c.SubagentMaxParallel < 0 || c.SubagentMaxParallel > 8 {
-		return fmt.Errorf("agentcore.subagent_max_parallel 必须在 [0,8] 内(0=关闸), got %d", c.SubagentMaxParallel)
+	if c.SubagentMaxParallel < 0 || c.SubagentMaxParallel > agentCoreSubagentMaxParallelCeiling {
+		// 措辞与 EffectiveAgentCoreSubagentMaxParallel 同口径：0 不是「关闸」
+		// （≤0 一律回落默认，闸不可关），是「未配置」——此前报错文案写
+		// 「0=关闸」，与实现矛盾（vm129 审计 2026-11-10）。数字引常量不手抄
+		// （本批立项理由正是文案与运行时漂移）。
+		return fmt.Errorf("agentcore.subagent_max_parallel 必须在 [0,%d] 内(0=未配置走默认 %d), got %d",
+			agentCoreSubagentMaxParallelCeiling, agentCoreSubagentMaxParallelDefault, c.SubagentMaxParallel)
 	}
 	return nil
 }
@@ -1087,8 +1092,13 @@ func normalizeSSHIngressKeyLines(lines []string) []string {
 // 账号并发充裕的用户显式配大（如 4）拿回满速并行。
 const agentCoreSubagentMaxParallelDefault = 2
 
+// agentCoreSubagentMaxParallelCeiling 是并发闸的防御性上界（保存校验与读取端
+// 钳制共用）。Validate 报错文案同样引它，杜绝文案手抄数字漂移（vm129 审计
+// 2026-11-10 本批立项理由）。
+const agentCoreSubagentMaxParallelCeiling = 8
+
 // EffectiveAgentCoreSubagentMaxParallel 返回并行子 agent 并发闸上限。0 = 未配置
-// 走默认 2；负数（手改配置文件绕过保存校验）与 >8 的越界值同样防御性钳制。
+// 走默认 2；负数（手改配置文件绕过保存校验）与越界值同样防御性钳制。
 func (c *Config) EffectiveAgentCoreSubagentMaxParallel() int {
 	if c == nil || c.Customer == nil || c.Customer.AgentCore == nil {
 		return agentCoreSubagentMaxParallelDefault
@@ -1097,8 +1107,8 @@ func (c *Config) EffectiveAgentCoreSubagentMaxParallel() int {
 	if v <= 0 {
 		return agentCoreSubagentMaxParallelDefault
 	}
-	if v > 8 {
-		return 8
+	if v > agentCoreSubagentMaxParallelCeiling {
+		return agentCoreSubagentMaxParallelCeiling
 	}
 	return v
 }

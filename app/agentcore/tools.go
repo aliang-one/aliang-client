@@ -111,6 +111,11 @@ const defaultToolTimeout = 10 * time.Minute
 // 个子 agent 是模型的事，内核只按资源形状封顶。
 const maxParallelToolCalls = 4
 
+// MaxParallelToolCalls 导出并行工具批上限，宿主生成模型可见契约文本时引用
+// 它（子 agent 无闸时的并行上限、机制块兜底值），避免手抄数字与内核漂移
+// （vm129 审计 2026-11-10：机制文案硬编码「上限 4」而运行时闸默认 2）。
+const MaxParallelToolCalls = maxParallelToolCalls
+
 // TimeoutHint 是可选接口：实现它的工具可为单次 Execute 覆盖默认执行上限
 // （defaultToolTimeout）。典型场景是「工具体本身就是一段完整工作流」的
 // 桥——子 agent 桥的 Execute 递归跑整个子 run，10 分钟窗口会把子 run 里
