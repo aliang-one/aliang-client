@@ -56,6 +56,13 @@ type agentAISubagent struct {
 	// （task_id 暂用 tool_use_id 顶替），等无父标记的 tool_result 到达再发终态。
 	// 真帧到达后 start() 覆盖登记时清零。
 	Legacy bool
+	// TerminalUnsent 标记「终态已定但 wire 帧没出去」：整回合停止/看门狗击杀时
+	// newAgentCoreEmit 的 ctx 守卫先关 io.Pipe，桥 defer 里 mirror.finish 的
+	// emit 撞上关闭的管道被吞——若只靠 finalize 补 active 记录，这类行永远
+	// 不到 wire，服务端/手机侧卡死在 started/progress。置位后由
+	// finalizeRunSubagents 经 drainUnsentTerminals 在 writeJSON 仍活的收尾路径
+	// 重发终态帧（2026-11-10 审计 CONFIRMED P2）。claude 路径不经镜像，恒零值。
+	TerminalUnsent bool
 }
 
 func (s agentAISubagent) active() bool {
@@ -278,6 +285,49 @@ func (r *agentAISubagentRegistry) stalled(now time.Time, window time.Duration) [
 		if ok && record.active() && !record.LastProgressAt.IsZero() && now.Sub(record.LastProgressAt) > window {
 			out = append(out, record)
 		}
+	}
+	return out
+}
+
+// markTerminalUnsent 置位终态重发标记（幂等）。记录须存在且已终态——终态未定
+// 的行由 finalize 的 active 口径自会翻 interrupted 并补帧，标记无意义。emit
+// 失败的唯一已知来源是运行被取消时 emit 管道先于桥 defer 关闭。
+func (r *agentAISubagentRegistry) markTerminalUnsent(id string) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	toolUseID, ok := r.resolveLocked(id)
+	if !ok {
+		return
+	}
+	record := r.byToolUseID[toolUseID]
+	if record.active() {
+		return
+	}
+	record.TerminalUnsent = true
+	r.byToolUseID[toolUseID] = record
+}
+
+// drainUnsentTerminals 取走全部「终态已定但帧未出去」的记录并清标记（幂等：
+// 重复 finalize 不会重发同一帧）。activity 配平已由 mirror.finish 完成，调用
+// 方只负责补发 wire 帧。
+func (r *agentAISubagentRegistry) drainUnsentTerminals() []agentAISubagent {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []agentAISubagent
+	for _, id := range r.order {
+		record, ok := r.byToolUseID[id]
+		if !ok || !record.TerminalUnsent {
+			continue
+		}
+		record.TerminalUnsent = false
+		r.byToolUseID[id] = record
+		out = append(out, record)
 	}
 	return out
 }
@@ -628,6 +678,12 @@ func synthesizeTerminalSubagent(run agentAIRun, taskID, toolUseID, phase string)
 func finalizeRunSubagents(run agentAIRun, writeJSON agentTerminalWriter) {
 	for _, record := range run.subagents.finalize(time.Now()) {
 		run.activity.endSubagent()
+		_ = writeJSON(agentAISubagentPayload(run.sessionID, record))
+	}
+	// 终态已定但帧被吞的行（agentcore 镜像 emit 撞上已关管道，2026-11-10
+	// 审计 CONFIRMED P2）：在此补发。activity 已在 mirror.finish 配平，只补
+	// wire 帧；drain 清标记，重复收尾不会重发。
+	for _, record := range run.subagents.drainUnsentTerminals() {
 		_ = writeJSON(agentAISubagentPayload(run.sessionID, record))
 	}
 }

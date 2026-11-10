@@ -334,7 +334,12 @@ func (m *agentCoreSubagentMirror) finish(bridgeName, taskID, phase, summary stri
 		if record.EndedAt.IsZero() {
 			record.EndedAt = time.Now()
 		}
-		m.emitRecord(record)
+		if err := m.emitRecord(record); err != nil {
+			// 终态帧没出去(整回合停止/看门狗击杀时 ctx 守卫先关了 emit 管道,
+			// 撞上关闭的 io.Pipe 即错):置位重发标记,finalizeRunSubagents 在
+			// writeJSON 仍活的收尾路径补发(2026-11-10 审计 CONFIRMED P2)。
+			m.registry.markTerminalUnsent(taskID)
+		}
 		// journal finish 行与帧同生命周期（registry ok 之内）：summary 截
 		// 200 rune，result 留子 run 最终文本全文（64KB rune 安全封顶）。裸
 		// 字节截断会在切点劈开多字节 rune——journal 是持久化留痕，绝不能
@@ -371,17 +376,18 @@ func (m *agentCoreSubagentMirror) appendToolLine(taskID, tool, summary string, i
 }
 
 // emitRecord 与内核帧同构：JSON+换行（宿主按行读），session_id 由
-// agentAISubagentPayload 携带。
-func (m *agentCoreSubagentMirror) emitRecord(record agentAISubagent) {
+// agentAISubagentPayload 携带。返回 emit 错误——调用方据此判断帧是否真出去
+// 了(emit==nil 是宿主未接线的测试路径,恒 nil)。
+func (m *agentCoreSubagentMirror) emitRecord(record agentAISubagent) error {
 	if m.emit == nil {
-		return
+		return nil
 	}
 	raw, err := json.Marshal(agentAISubagentPayload(m.sessionID, record))
 	if err != nil {
-		return
+		return err
 	}
 	raw = append(raw, '\n')
-	_ = m.emit(raw)
+	return m.emit(raw)
 }
 func truncateAgentCoreSubagentTask(task string, maxBytes int) string {
 	if maxBytes <= 0 || len(task) <= maxBytes {
