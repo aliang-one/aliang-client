@@ -713,6 +713,10 @@ func (s *AgentService) handleRemoteAgentMessage(ctx context.Context, msg map[str
 		// keyed), so periodic re-hellos re-triggering them is safe.
 		s.markRegistrationReady()
 		s.ai.replayPendingTerminals(writeJSON)
+		// 子 agent 终态帧断线暂存重放（2026-11-10 P2 #4，见
+		// agent_ai_subagent_journal.go）：断窗内被吞的 ai.subagent 终态帧在此
+		// 补发，写成功即清账；服务端 (session,msg,task) 幂等 upsert。
+		s.ai.replayPendingSubagentTerminals(writeJSON)
 		// 审批请求投递 journal 重放(L1,2026-11-01):半开 socket 期间丢失的
 		// ai.approval.request 原样补发;服务端 intake 以 approval_id 幂等。
 		s.ai.replayPendingApprovalRequests(writeJSON)
