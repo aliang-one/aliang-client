@@ -45,6 +45,12 @@ type agentAIManager struct {
 	codexInputs       map[string]*agentAICodexInputWaiter
 	pendingTerminals  map[string]map[string]interface{}
 	runJournalEnabled bool
+	// pendingSubagentTerminals 是子 agent 终态帧断线暂存（2026-11-10 P2 #4，见
+	// agent_ai_subagent_journal.go）：sessionID|task_id → 终态 payload。WS 断窗
+	// 内 ai.subagent 终态帧写出失败时 remember，重连 hello 后重放、写成功即清。
+	// 纯内存（进程崩溃场景=registry 同亡，靠服务端详情合成兜底），封顶丢弃最旧。
+	pendingSubagentTerminals map[string]map[string]interface{}
+	pendingSubagentOrder     []string
 	// pendingApprovalRequests 是审批请求投递 journal(L1 可靠投递,2026-11-01,
 	// 见 agent_ai_approval_journal.go):approval_id → 原始 request payload。
 	// 发送前 remember,服务端 ai.approval.request.ack / waiter 终结时清除,
@@ -664,16 +670,21 @@ type agentAIAttachment struct {
 // event has been accepted, no concurrently-ticking progress goroutine can emit
 // after it. Holding the mutex through write preserves event_seq wire order.
 type agentAIRunEmitter struct {
-	mu                  sync.Mutex
-	runID               string
-	nextSeq             int64
-	terminal            bool
-	write               agentTerminalWriter
-	onTerminal          func(map[string]interface{}) error
-	goalIdentity        map[string]interface{}
-	goalOutput          strings.Builder
-	goalProjectPath     string
-	goalWorkspaceBefore string
+	mu         sync.Mutex
+	runID      string
+	nextSeq    int64
+	terminal   bool
+	write      agentTerminalWriter
+	onTerminal func(map[string]interface{}) error
+	// onSubagentTerminalDrop 在子 agent 终态帧写出失败时触发（2026-11-10 P2 #4：
+	// WS 断窗内 ai.subagent terminal 帧被 `_ =` 吞掉=行永卡 started/progress）。
+	// 宿主接 manager 暂存表，重连 hello 后补发；非终态子 agent 帧不进暂存
+	// （started/progress 丢了由服务端详情合成兜底，不值得占缓存）。
+	onSubagentTerminalDrop func(map[string]interface{})
+	goalIdentity           map[string]interface{}
+	goalOutput             strings.Builder
+	goalProjectPath        string
+	goalWorkspaceBefore    string
 	// goalRequiredCheckCount mirrors run.goalRequiredCheckCount; read by
 	// attachGoalReport to decide whether optimistic completion is safe.
 	goalRequiredCheckCount int
@@ -753,7 +764,27 @@ func (e *agentAIRunEmitter) emit(value interface{}) error {
 			}
 		}
 	}
-	return e.write(payload)
+	err := e.write(payload)
+	if err != nil && e.onSubagentTerminalDrop != nil && agentAISubagentFrameTerminal(payload) {
+		// 写失败（断窗/未注册 deadline）的子 agent 终态帧不落空的：暂存待重连
+		// 补发。服务端按 (session,msg,task) 幂等 upsert 且终态防回退，重复投递
+		// 无副作用。
+		e.onSubagentTerminalDrop(payload)
+	}
+	return err
+}
+
+// agentAISubagentFrameTerminal 判断一帧是否子 agent 终态帧
+// （type=ai.subagent 且 phase∈{completed,failed,interrupted}）。
+func agentAISubagentFrameTerminal(payload map[string]interface{}) bool {
+	if strings.TrimSpace(fmt.Sprint(payload["type"])) != models.AgentEventAISubagent {
+		return false
+	}
+	switch strings.TrimSpace(fmt.Sprint(payload["phase"])) {
+	case "completed", "failed", "interrupted":
+		return true
+	}
+	return false
 }
 
 type agentAITool struct {
@@ -1227,16 +1258,17 @@ const agentAIOptionSystemPrompt = `When you have multiple viable approaches/opti
 
 func newAgentAIManager() *agentAIManager {
 	m := &agentAIManager{
-		sessions:                make(map[string]*agentAISession),
-		approvals:               make(map[string]*agentAIApprovalWaiter),
-		completedApprovals:      make(map[string]*agentAICompletedApproval),
-		codexInputs:             make(map[string]*agentAICodexInputWaiter),
-		pendingTerminals:        make(map[string]map[string]interface{}),
-		pendingApprovalRequests: make(map[string]map[string]interface{}),
-		bindings:                make(map[string]agentAIBindingRecord),
-		processedRuns:           make(map[string]agentAIProcessedRun),
-		coreJournal:             newAgentCoreJournal(agentCoreJournalDir()),
-		aiSockets:               make(map[string]*agentAISocket),
+		sessions:                 make(map[string]*agentAISession),
+		approvals:                make(map[string]*agentAIApprovalWaiter),
+		completedApprovals:       make(map[string]*agentAICompletedApproval),
+		codexInputs:              make(map[string]*agentAICodexInputWaiter),
+		pendingTerminals:         make(map[string]map[string]interface{}),
+		pendingSubagentTerminals: make(map[string]map[string]interface{}),
+		pendingApprovalRequests:  make(map[string]map[string]interface{}),
+		bindings:                 make(map[string]agentAIBindingRecord),
+		processedRuns:            make(map[string]agentAIProcessedRun),
+		coreJournal:              newAgentCoreJournal(agentCoreJournalDir()),
+		aiSockets:                make(map[string]*agentAISocket),
 	}
 	return m
 }
@@ -1261,6 +1293,12 @@ func (m *agentAIManager) runEmitter(run agentAIRun, write agentTerminalWriter) *
 				return err
 			}
 			return m.completeProcessedRun(run.runID, payload)
+		}
+		// 子 agent 终态帧断线暂存（P2 #4）：仅 v2 云端 run 接线（与 onTerminal
+		// 同口径——本地纯聊天无重连补发通道，暂存只会泄漏）。 幂等投递：服务端
+		// (session,msg,task) 单行 upsert + 终态防回退。
+		e.onSubagentTerminalDrop = func(payload map[string]interface{}) {
+			m.rememberPendingSubagentTerminal(payload)
 		}
 	}
 	// 跨端同态（spec §4.1）：origin 仍内联，事件副本扇出到订阅 socket。
