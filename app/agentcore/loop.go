@@ -111,6 +111,13 @@ type LoopHooks struct {
 	// 压缩白做）。
 	OnCompact func([]Message, CompactInfo)
 
+	// OnRetry 在上游瞬态失败、内核确定要重试时（退避等待前）调用。与
+	// WithRetryNotice 发的 api_retry 帧同源，但**不依赖帧通道**：子 run 的
+	// Emit=nil 让 streamWriter 全部写帧变空操作，没有这个钩子，子 run 的
+	// 429/慢上游重试链（最坏 6×120s ≈ 12min）在宿主面板/journal 上是纯静默
+	// （vm129「派完就卡死」审计 2026-11-10）。nil=不启用；回调不得阻塞。
+	OnRetry func(RetryNotice)
+
 	// OnToolCall 在每个**实际执行到 executeOne 的**工具调用处触发一次（内置
 	// 与桥接工具统一口径——MCP 桥/子 agent 桥此前各自带 onCall 落 journal，
 	// 内置工具没有任何宿主回调）。宿主用于 journal 工具轨迹（2026-10-28
@@ -1179,6 +1186,12 @@ func (r *runner) streamTurn(ctx context.Context, req *MessagesRequest, writer *s
 		// 会被 stale 扫描器 5min 判死；帧形对齐真 claude-code，宿主 decoder
 		// 既有处理直接生效（markProgress + ai.run.progress）。
 		WithRetryNotice(func(n RetryNotice) {
+			// 重试活性旁路（vm129 审计 2026-11-10）：先走 Hooks.OnRetry——
+			// 子 run Emit=nil 时下面的 writer.RetryNotice 是空操作，这个钩子
+			// 是宿主观测子 run 重试链的唯一通道；主 run 则帧+钩子双路生效。
+			if r.cfg.Hooks.OnRetry != nil {
+				r.cfg.Hooks.OnRetry(n)
+			}
 			if writer == nil {
 				return
 			}

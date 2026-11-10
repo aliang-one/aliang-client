@@ -15,6 +15,7 @@ package services
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -229,6 +230,11 @@ func TestAgentCoreSubagentMirrorProgressCarriesToolUses(t *testing.T) {
 }
 
 // TestAgentCoreSubagentMirrorFailedPath：子 run 失败 → failed 终态帧。
+// 2026-11-10 起序列不再恰为 [started failed]：重试活性旁路（vm129 审计）
+// 让不可达上游的重试链每次重试都发一条 progress 帧——序列变为
+// [started, progress×N, failed]，N≥0（重试次数由内核退避策略定）。契约：
+// 首帧 started、末帧 failed、中间只允许 progress，且连接类失败至少出现一条
+// 「上游重试」progress（旁路的回归守卫——删掉桥的 OnRetry 分支本条即红）。
 func TestAgentCoreSubagentMirrorFailedPath(t *testing.T) {
 	spy := &mirrorSpy{}
 	mirror := newMirrorForTest(t, spy.emit)
@@ -244,8 +250,26 @@ func TestAgentCoreSubagentMirrorFailedPath(t *testing.T) {
 		t.Fatalf("不可达上游应失败")
 	}
 	phases := spy.phases()
-	if len(phases) != 2 || phases[0] != "started" || phases[1] != "failed" {
-		t.Fatalf("失败路径事件序列 = %v, want [started failed]", phases)
+	if len(phases) < 2 || phases[0] != "started" || phases[len(phases)-1] != "failed" {
+		t.Fatalf("失败路径事件序列 = %v, want [started, progress×N, failed]", phases)
+	}
+	for i, p := range phases[1 : len(phases)-1] {
+		if p != "progress" {
+			t.Fatalf("中间帧[%d] = %v, 只允许 progress", i+1, phases)
+		}
+	}
+	// 连接类失败（127.0.0.1:1 拒连）必然走重试链：至少一条重试 progress，
+	// current_step 带类别词（connection_error）。
+	spy.mu.Lock()
+	retrySeen := false
+	for _, f := range spy.frames {
+		if f["phase"] == "progress" && strings.Contains(fmt.Sprint(f["current_step"]), "上游重试 #") {
+			retrySeen = true
+		}
+	}
+	spy.mu.Unlock()
+	if !retrySeen {
+		t.Fatalf("重试活性旁路缺失：不可达上游的重试链应发「上游重试」progress, phases=%v", phases)
 	}
 }
 

@@ -641,15 +641,23 @@ func (b *agentCoreSubagentBridge) Execute(ctx context.Context, input map[string]
 		// （仪表盘 customer.agentcore.max_identical_tool_turns；0 走内核默认）。
 		MaxIdenticalToolTurns: config.GetGlobalConfig().EffectiveAgentCoreMaxIdenticalToolTurns(),
 		// Emit 刻意 nil（spec §3：子 run 不产出帧，防帧交错进父 delta 流）。
-		// Hooks 只接两个：
+		// Hooks 只接三个：
 		//   OnTurnEnd —— 子 run 的每回合 assistant 输出落 sidechain journal
 		//     （L2，2026-11-09）：崩溃后成果可查、中断重派能接上下文。
 		//   GetSteeringMessages —— per-task 追加指令队列（L3，2026-11-09）。
 		//     spec §3 曾以「复用父队列会让子 run 窃走主 run 待插话」为由留
 		//     nil；这里用的是**子 run 自己的**独立队列（handle.steer），主 run
 		//     的插话队列一个字节都不会被子 run 取走，该约束依然成立。
-		// 两个钩子都只碰 journal/自有队列（各自带锁），不碰帧通道，
-		// 帧交错约束不受影响。
+		//   OnRetry —— 上游重试活性旁路（vm129 审计 2026-11-10）：Emit=nil
+		//     把 api_retry 帧一并吞掉，429/慢上游重试链（最坏 ~12-14.5min）
+		//     在面板上纯静默=「派完就卡死」的直接机理。经 mirror 发最小
+		//     progress（lastTool 传空串——registry 只非空覆盖，不丢既有工具
+		//     名），watchdog 进度钟顺带被喂（subagentProgress），stale 判死
+		//     不再误伤长重试。
+		// 三个钩子都只碰 journal/自有队列/registry（各自带锁）。OnRetry 另经
+		// mirror 写 ai.subagent 状态帧（与内核帧同一 emit 管道，io.Pipe 串行化
+		// 保帧原子）——spec §3 约束的是子 run 的 Emit/delta 通道（Emit=nil，
+		// 见上），该约束不受影响。
 		Hooks: agentcore.LoopHooks{
 			OnTurnEnd: func(tr agentcore.TurnResult) {
 				if !tracked || b.mirror == nil {
@@ -664,6 +672,14 @@ func (b *agentCoreSubagentBridge) Execute(ctx context.Context, input map[string]
 					truncateAgentText(tr.Text, agentCoreSubagentTurnTextCap),
 					truncateAgentText(tr.Thinking, agentCoreSubagentTurnThinkingCap),
 					tokens)
+			},
+			OnRetry: func(n agentcore.RetryNotice) {
+				if !tracked || b.mirror == nil {
+					return
+				}
+				b.mirror.progress(subTaskID,
+					fmt.Sprintf("上游重试 #%d（%s）", n.Attempt, agentCoreRetryKindLabel(n)),
+					"", int(toolUses.Load()))
 			},
 			GetSteeringMessages: func() []agentcore.Message {
 				if handle == nil {
@@ -735,7 +751,8 @@ var agentCoreSubagentBuiltinDefs = []agentCoreSubagentDef{
 	{
 		Name:        "researcher",
 		Description: "调研任务——收集资料、对比方案、验证假设、输出结构化结论",
-		Body:        "你是调研员。针对交给你的任务收集资料并验证假设,输出结构化调研报告(事实/依据/结论)。",
+		Body: "你是调研员。针对交给你的任务收集资料并验证假设,输出结构化调研报告(事实/依据/结论)。" +
+			"开工先探测可用 shell:Windows 机器通常没有 Bash 工具,Bash 连续报错时立即改用 PowerShell 工具或系统自带只读命令,不要反复重试 Bash。",
 	},
 }
 
@@ -765,6 +782,13 @@ type agentCoreSubagentTaskRouter struct {
 	bridges      map[string]*agentCoreSubagentBridge
 	types        []string // 稳定序类型名（机制块枚举 + 未知类型报错提示）
 	descriptions map[string]string
+	// parallelLimit 是模型可见契约上的同回合并行上限——与运行时真实并发同源
+	// （构造期取 min(内核并行批闸, cap(闸 sem))，见 agentCoreSubagentParallelLimit）。
+	// 0=未设（零值 router/测试路径），机制块读侧回落内核 MaxParallelToolCalls。
+	// 审计 2026-11-10：文案硬编码「上限 4」而闸默认 2，模型照 4 派、超出者
+	// 排队且排队期不可见——契约必须与运行时同源，两处文本（工具描述 + 机制块）
+	// 都从这里取数。
+	parallelLimit int
 }
 
 func (r *agentCoreSubagentTaskRouter) Name() string        { return "task" }
@@ -895,15 +919,44 @@ func (m *agentAIManager) agentCoreSubagentTaskTool(run agentAIRun,
 		// 机制前缀上收到统一派发面（原生自述）：模型可见面上必须宣告「这是
 		// 子agent」（vm459/vm22 实测：只透传定义 description 时被问「你有
 		// 子 agent 功能吗」照实答没有，也不会主动派发）。
-		description: "子agent（独立内部线程，完成后报告回主对话）：派发一个子 agent 执行任务并返回其完整报告。" +
-			"同回合多次调用并行执行（上限 4）。subagent_type 从 <subagents> 类型清单中选。",
-		ceiling:      agentCoreSubagentToolCeiling(),
-		bridges:      bridges,
-		types:        types,
-		descriptions: descriptions,
+		// 并行上限与运行时闸同源（agentCoreSubagentParallelLimit）——vm129
+		// 审计 2026-11-10：写死「上限 4」而闸默认 2，多派的子 agent 排队且
+		// 排队期不可见，模型照旧上限派发=常态性隐身排队。
+		description: fmt.Sprintf("子agent（独立内部线程，完成后报告回主对话）：派发一个子 agent 执行任务并返回其完整报告。"+
+			"同回合多次调用并行执行（上限 %d），超出并行的调用会排队等待空位。subagent_type 从 <subagents> 类型清单中选。",
+			agentCoreSubagentParallelLimit(control)),
+		ceiling:       agentCoreSubagentToolCeiling(),
+		bridges:       bridges,
+		types:         types,
+		descriptions:  descriptions,
+		parallelLimit: agentCoreSubagentParallelLimit(control),
 	}
 	logger.Info(fmt.Sprintf("agentcore-subagent: 注入 task 路由器（%d 个类型）", len(types)))
 	return router
+}
+
+// agentCoreSubagentParallelLimit 返回模型可见契约上的同回合并行子 agent 上限
+// ——与运行时真实并发同源：内核并行工具批的信号量恒为 MaxParallelToolCalls
+// （loop.go executeParallelBatch），子 agent 并发闸在此基础上再收窄，故同回合
+// 实际并发 = min(内核上限, cap(闸 sem))；无闸（nil control/测试路径/显式放开）
+// 即内核上限。契约只许低估不许高估——高估正是 vm129「文案 4 / 运行时 2」
+// 隐身排队的成因（审计 2026-11-10）。
+func agentCoreSubagentParallelLimit(control *agentCoreSubagentControl) int {
+	limit := agentcore.MaxParallelToolCalls
+	if control != nil && control.sem != nil && cap(control.sem) < limit {
+		limit = cap(control.sem)
+	}
+	return limit
+}
+
+// agentCoreRetryKindLabel 把内核 RetryNotice 压成面板状态行里的一小段——
+// ErrorKind 已对齐真 claude-code api_retry 的类别词（rate_limit_error 等），
+// 直接透传；带状态码时补括号（如 rate_limit_error(429)），连接类失败无码。
+func agentCoreRetryKindLabel(n agentcore.RetryNotice) string {
+	if n.ErrorStatus > 0 {
+		return fmt.Sprintf("%s(%d)", n.ErrorKind, n.ErrorStatus)
+	}
+	return n.ErrorKind
 }
 
 // agentCoreSubagentMechanismSuffix 返回主 run system prompt 的子 agent 机制
@@ -915,13 +968,18 @@ func agentCoreSubagentMechanismSuffix(router *agentCoreSubagentTaskRouter) strin
 	if router == nil || len(router.types) == 0 {
 		return ""
 	}
+	// 零值 router（测试路径直构）没有 parallelLimit——回落内核上限，文案恒真。
+	limit := router.parallelLimit
+	if limit <= 0 {
+		limit = agentcore.MaxParallelToolCalls
+	}
 	var b strings.Builder
 	b.WriteString("\n\n<subagents>\n")
 	b.WriteString("You can delegate work to subagents (子agent) via the task tool. Each call spawns an ")
 	b.WriteString("independent internal Aliang Agent run: a separate conversation thread with its own context ")
 	b.WriteString("and tool loop. A subagent does NOT see this conversation — give each task a self-contained ")
 	b.WriteString("description with enough context to work alone. Subagents dispatched in the same turn run ")
-	b.WriteString("concurrently (up to 4); each subagent's final report is returned as the tool result, and its ")
+	b.WriteString(fmt.Sprintf("concurrently (up to %d); excess calls queue until a slot frees. Each subagent's final report is returned as the tool result, and its ", limit))
 	b.WriteString("lifecycle is bound to the current turn.\n")
 	b.WriteString("Available subagent types (subagent_type):\n")
 	for _, t := range router.types {
