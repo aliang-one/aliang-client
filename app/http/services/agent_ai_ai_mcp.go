@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -251,6 +252,13 @@ func (s *AgentService) AgentMCPStart(ctx context.Context, projectPath, content, 
 // AgentMCPStatus 是 ai_run_status 的端点后端:纯读内存态(running/idle/
 // awaiting_approval + 待审批清单 + 助手尾部摘要)。刻意不经 journal 磁盘读
 // (spec §4.2:内存态即真相,读面/重放是非目标)。
+//
+// 契约判定与状态快照**必须在同一次 m.mu 临界区内完成**:分开取锁会留出
+// TOCTOU 窗口——契约通过后会话被 LRU 逐出(ResidentCap=8 下的高频场景),
+// 端点就会返回 200 {state:"idle", pending_approvals:[]} 而不是契约要求的
+// 400「会话不存在」。因此这里不调用 agentAISessionStatusForSnapshot /
+// pendingApprovalsSnapshotForSession(它们各自取锁,持锁调=自锁死),改为在
+// 临界区内直接读 m.sessions / 遍历 m.approvals 拷贝快照。
 func (s *AgentService) AgentMCPStatus(ctx context.Context, sessionID string) (map[string]interface{}, int, error) {
 	if code, err := s.agentAIMCPPreflight(); err != nil {
 		return nil, code, err
@@ -265,9 +273,11 @@ func (s *AgentService) AgentMCPStatus(ctx context.Context, sessionID string) (ma
 		m.mu.Unlock()
 		return nil, code, err
 	}
+	cur := m.sessions[sid]
+	running := cur != nil && cur.cancel != nil
 	// last_assistant:从尾向前找第一条 assistant 历史,按 rune 截断。
 	last := ""
-	if cur := m.sessions[sid]; cur != nil {
+	if cur != nil {
 		for i := len(cur.history) - 1; i >= 0; i-- {
 			if cur.history[i].Role == "assistant" {
 				last = truncateRunes(cur.history[i].Content, agentAIMCPLastAssistantCap)
@@ -275,15 +285,36 @@ func (s *AgentService) AgentMCPStatus(ctx context.Context, sessionID string) (ma
 			}
 		}
 	}
+	// 待审批清单:字段拷贝逐字对齐 pendingApprovalsSnapshotForSession
+	// (agent_ai_sockets.go:359:session_id/approval_id/kind/provider 恒有,
+	// command/tool_name/expires_at 非空才带),保证输出形状与既有快照一致。
+	pendings := make([]map[string]interface{}, 0, 4)
+	for _, waiter := range m.approvals {
+		if waiter == nil || waiter.sessionID != sid {
+			continue
+		}
+		entry := map[string]interface{}{
+			"session_id":  waiter.sessionID,
+			"approval_id": waiter.request.ID,
+			"kind":        waiter.request.Kind,
+			"provider":    waiter.request.Provider,
+		}
+		if waiter.request.Command != "" {
+			entry["command"] = waiter.request.Command
+		}
+		if waiter.request.ToolName != "" {
+			entry["tool_name"] = waiter.request.ToolName
+		}
+		if !waiter.expiresAt.IsZero() {
+			entry["expires_at"] = waiter.expiresAt.Format(time.RFC3339)
+		}
+		pendings = append(pendings, entry)
+	}
 	m.mu.Unlock()
 
-	// 两个读原语各自取锁(agentAISessionStatusForSnapshot /
-	// pendingApprovalsSnapshotForSession),必须在 m.mu 之外调用。
-	state := m.agentAISessionStatusForSnapshot(sid)
-	pendings := m.pendingApprovalsSnapshotForSession(sid)
-	if pendings == nil {
-		// 载荷不许出 null:外部工具按数组消费,JSON null 会让 schema 校验失配。
-		pendings = make([]map[string]interface{}, 0)
+	state := "idle"
+	if running {
+		state = "running"
 	}
 	if state == "running" && len(pendings) > 0 {
 		state = "awaiting_approval"

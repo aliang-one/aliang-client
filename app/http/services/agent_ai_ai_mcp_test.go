@@ -11,6 +11,7 @@ import (
 	"context"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -608,6 +609,78 @@ func TestAgentMCPApproveAckDualWritesToRunSocket(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("run socket 未收到 ack(ack 双写回归)")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 13. 续聊会话在「预检通过 → 受理」窗口内被逐出重建:run 照跑但契约降级
+// ---------------------------------------------------------------------------
+
+// TestAgentMCPStartDegradesWhenResumedSessionEvicted 覆盖 spec §5 的契约降级
+// 分支:预检看到本面会话(createdBy=ai_mcp)通过后,会话在 m.message 受理前
+// 被 LRU 逐出,受理阶段懒建出一个新的空标记会话。
+//
+// 确定性构造点:AgentMCPStart 的调用序列是「预检取锁/放锁 → 组帧 →
+// agentAIMCPNewCaptureWriter() → m.message」,工厂调用正好落在预检放锁与受理
+// 之间,且同 goroutine 同步执行——在工厂里同步删除会话即可精确复现,不需要
+// 真的调 LRU(也无法调:逐出只挑 cancel==nil 的空闲会话,而本面会话一旦进
+// message() 就同步置了 cancel)。
+//
+// 断言四点:①受理成功(200 + accepted=true,降级≠拒绝,run 照跑);
+// ②createdBy 保持空(不补标);③后续 status 403;④文案「会话不属于 AI 工具面」。
+func TestAgentMCPStartDegradesWhenResumedSessionEvicted(t *testing.T) {
+	svc := newAIMCPTestService(t)
+	m := svc.ai
+	_, srv := newAgentCoreUpstream(t, agentCoreTextTurn("降", "级"))
+	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
+
+	proj := t.TempDir()
+	sid := "mcp-evicted-session"
+	registerAIMCPTestSession(t, m, &agentAISession{
+		id: sid, mode: "vibe", projectPath: proj, provider: "agentcore",
+		createdBy:    agentAIMCPCreatedBy,
+		lastActiveAt: time.Now().UTC(),
+	})
+
+	// 工厂在预检放锁与 m.message 之间被调用:此处同步删会话 = 逐出。
+	// 端点只调一次工厂,但仍加一次性守卫(契约若变化,这个测试不会静默变成
+	// 只删第一次的假阳性)。
+	var once sync.Once
+	prevFactory := agentAIMCPNewCaptureWriter
+	agentAIMCPNewCaptureWriter = func() *agentAIMCPCaptureWriter {
+		once.Do(func() {
+			m.mu.Lock()
+			delete(m.sessions, sid)
+			m.mu.Unlock()
+		})
+		return prevFactory()
+	}
+	t.Cleanup(func() { agentAIMCPNewCaptureWriter = prevFactory })
+
+	payload, code, err := svc.AgentMCPStart(context.Background(), proj, "逐出后继续", "agentcore", sid)
+	// ① 降级不是拒绝:受理必须成功。
+	if err != nil || code != http.StatusOK {
+		t.Fatalf("逐出重建分支 = (%v, %d, %v), want 200/nil(降级应照跑)", payload, code, err)
+	}
+	if accepted, _ := payload["accepted"].(bool); !accepted {
+		t.Fatalf("accepted = %v, want true", payload["accepted"])
+	}
+	if got, _ := payload["session_id"].(string); got != sid {
+		t.Fatalf("session_id = %q, want %q", got, sid)
+	}
+	waitAIMCPRunIdle(t, m, sid)
+
+	// ② 懒建出来的新会话 createdBy 必须保持空(端点绝不补标)。
+	if got := createdByOf(t, m, sid); got != "" {
+		t.Fatalf("逐出重建后 createdBy = %q, want 空(不补标)", got)
+	}
+	// ③④ 契约降级的可观测后果:后续 status 拒,文案同「会话不属于 AI 工具面」。
+	statusPayload, statusCode, statusErr := svc.AgentMCPStatus(context.Background(), sid)
+	if statusCode != http.StatusForbidden {
+		t.Fatalf("降级后 status 状态码 = %d, want 403(payload=%v err=%v)", statusCode, statusPayload, statusErr)
+	}
+	if statusErr == nil || statusErr.Error() != "会话不属于 AI 工具面" {
+		t.Fatalf("降级后 status error = %v, want「会话不属于 AI 工具面」", statusErr)
 	}
 }
 
