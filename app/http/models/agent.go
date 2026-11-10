@@ -287,6 +287,12 @@ type AgentVibeMessage struct {
 	Content   string `json:"content"`
 	Timestamp string `json:"timestamp,omitempty"`
 	Index     int    `json:"index,omitempty"`
+	// Seq 是 journal 写侧分配的会话级单调序号（2026-11-10 聊天记录身份化），
+	// 与 Index 的区别：Index 是「本轮扫描内第几条转录行」，分页/截断一变就
+	// 漂移；Seq 是「这条记录在会话内第几个落盘」，跨进程重启、跨端合并、
+	// 跨页翻历史都恒等。跨端排序与幂等合并一律以 Seq 为准。
+	// 0 = 旧 agent/旧文件无该字段（前端按 Index/数组序回落）。
+	Seq int64 `json:"seq,omitempty"`
 	// Thinking 是回合级思考文本(journal kind=turn 行携带)。2026-10-31 起
 	// 随 turn 行回放下发;server zod 剥未知字段、手机契约未消费——先上梅,
 	// Phase 1/2(思考历史渲染+门控)再点亮,避免届时再动传输结构。

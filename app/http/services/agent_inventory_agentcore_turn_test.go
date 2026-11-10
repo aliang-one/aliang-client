@@ -23,11 +23,11 @@ func TestAgentCoreInventoryReaderTurnRowsReplay(t *testing.T) {
 	j.ensureSessionHeader("conv-turn", "/tmp/proj-turn", "glm-5.2", "", "2026-10-30T08:27:27Z", "phone", nil, nil, "")
 	j.appendUser("conv-turn", "msg-1", "我们不是已经有了每一个设备上边的基础信息", "2026-10-30T08:27:27Z")
 	// 回合1:有正文+思考(应回放)
-	j.appendAssistantTurn("conv-turn", 1, "我先看一下设备信息的现有实现。", "用户想展示设备基础信息,先找相关代码。", "tool_use", []string{"Bash", "peer_device_info"})
+	j.appendAssistantTurn("conv-turn", "msg-1", 1, "我先看一下设备信息的现有实现。", "用户想展示设备基础信息,先找相关代码。", "tool_use", []string{"Bash", "peer_device_info"})
 	// 回合2:纯工具回合,无正文(应跳过,Phase 2 前无可渲染内容)
-	j.appendAssistantTurn("conv-turn", 2, "", "只调了工具没说话。", "tool_use", []string{"Bash"})
+	j.appendAssistantTurn("conv-turn", "msg-1", 2, "", "只调了工具没说话。", "tool_use", []string{"Bash"})
 	// 回合3:有正文(应回放,且 id 与回合1不同)
-	j.appendAssistantTurn("conv-turn", 3, "设备卡片的结构已经理清了。", "", "end_turn", nil)
+	j.appendAssistantTurn("conv-turn", "msg-1", 3, "设备卡片的结构已经理清了。", "", "end_turn", nil)
 
 	meta := readAgentCoreSessionMetaWithOptions(
 		dir+"/"+agentCoreJournalFileName("conv-turn"), agentVibeSessionReadOptions{IncludePageMeta: false})
@@ -65,8 +65,16 @@ func TestAgentCoreInventoryReaderTurnRowsReplay(t *testing.T) {
 	if assistantRows[0].ID == assistantRows[1].ID {
 		t.Fatalf("turn 行 id 必须互异(同回合号跨 run 也不得相撞): %q", assistantRows[0].ID)
 	}
-	if !strings.HasPrefix(assistantRows[0].ID, "turn-") {
-		t.Errorf("turn 行 id 应有稳定前缀, got %q", assistantRows[0].ID)
+	// 2026-11-10 聊天记录身份化：写侧落确定性 id = assistant_<user_message_id>#<turn>，
+	// 不再现铸 turn-%06d（那个序号随扫描窗口漂移，分页锚点因此对 turn 行失效）。
+	if !strings.HasPrefix(assistantRows[0].ID, "assistant_msg-1#") {
+		t.Errorf("turn 行 id 应为确定性 assistant_<user_message_id>#<turn>, got %q", assistantRows[0].ID)
+	}
+	if assistantRows[0].ID != "assistant_msg-1#1" {
+		t.Errorf("回合1 id = %q, want assistant_msg-1#1", assistantRows[0].ID)
+	}
+	if assistantRows[1].ID != "assistant_msg-1#3" {
+		t.Errorf("回合3 id = %q, want assistant_msg-1#3（回合号必须进 id，同 run 内多回合才互异）", assistantRows[1].ID)
 	}
 }
 
@@ -78,7 +86,7 @@ func TestAgentCoreInventoryReaderTurnHeadlessSkipped(t *testing.T) {
 	dir := t.TempDir()
 	j := newAgentCoreJournal(dir)
 	// 故意不写头行:直接 appendAssistantTurn(无头行,session.ID 为空)
-	j.appendAssistantTurn("conv-headless", 1, "无头行回合正文", "", "end_turn", nil)
+	j.appendAssistantTurn("conv-headless", "msg-h", 1, "无头行回合正文", "", "end_turn", nil)
 
 	meta := readAgentCoreSessionMetaWithOptions(
 		dir+"/"+agentCoreJournalFileName("conv-headless"), agentVibeSessionReadOptions{IncludePageMeta: false})

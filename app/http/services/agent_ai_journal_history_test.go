@@ -550,7 +550,7 @@ func TestCreateRestoresJournalHistoryWithoutTranscript(t *testing.T) {
 	m.coreJournal.appendUser("s-g2", "m1", "第一问", now)
 	m.coreJournal.appendAssistant("s-g2", "a1", "第一答", now)
 	m.coreJournal.appendTool("s-g2", "Bash", "ls", false) // 工具行:轨迹不是消息
-	m.coreJournal.appendAssistantTurn("s-g2", 1, "第一回合答复", "thinking 不进历史", "end_turn", nil)
+	m.coreJournal.appendAssistantTurn("s-g2", "q-1", 1, "第一回合答复", "thinking 不进历史", "end_turn", nil)
 
 	up, srv := newAgentCoreUpstream(t, agentCoreTextTurn("第二", "答"))
 	// agentCoreBaseURL 只认回环；httptest 正是 127.0.0.1:PORT——守卫探测必过，
@@ -755,7 +755,7 @@ func TestReadAgentCoreJournalHistoryIncludesTurnRows(t *testing.T) {
 	j := newAgentCoreJournal(dir)
 	j.ensureSessionHeader("s-turn", "/proj", "glm-5.3", "", "2026-11-05T00:00:00Z", "dashboard", nil, nil, "")
 	j.appendUser("s-turn", "m1", "请只回复四个字：测试通过", "2026-11-05T00:01:00Z")
-	j.appendAssistantTurn("s-turn", 1, "测试通过", "The user is asking me to reply with four characters.", "end_turn", nil)
+	j.appendAssistantTurn("s-turn", "q-turn", 1, "测试通过", "The user is asking me to reply with four characters.", "end_turn", nil)
 
 	hist, _, err := readAgentCoreJournalHistoryFrom(dir, "s-turn")
 	if err != nil {
@@ -770,9 +770,11 @@ func TestReadAgentCoreJournalHistoryIncludesTurnRows(t *testing.T) {
 	if hist[1].Role != "assistant" || hist[1].Content != "测试通过" {
 		t.Fatalf("turn 行错(回答必须进历史): %+v", hist[1])
 	}
-	// turn 行无 message_id:MessageID 保持空,不冒充锚点。
-	if hist[1].MessageID != "" {
-		t.Fatalf("turn 行不得伪造 message_id: %+v", hist[1])
+	// turn 行的确定性 message_id 必须透传（2026-11-10 聊天记录身份化）：
+	// assistant_<user_message_id>#<turn>。前端按它做回合分段与跨端合并键——
+	// 旧口径「turn 行无 message_id」正是多答连体/分页锚点失效的共同根因。
+	if hist[1].MessageID != "assistant_q-turn#1" {
+		t.Fatalf("turn 行 message_id 应为确定性 id, got %q", hist[1].MessageID)
 	}
 	// thinking 不进历史(快照契约未消费)。
 	if strings.Contains(hist[1].Content, "The user is asking") {

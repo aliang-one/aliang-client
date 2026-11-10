@@ -167,6 +167,9 @@ func readAgentCoreSessionMetaWithOptions(path string, options agentVibeSessionRe
 			Result         string                       `json:"result"`
 			TotalTokens    int64                        `json:"total_tokens"`
 			DurationMs     int64                        `json:"duration_ms"`
+			// Seq 是写侧落的会话级单调序号（2026-11-10 聊天记录身份化）。
+			// 0 = 旧 agent / 旧文件没有该键，原样透传 0 让前端按数组序回落。
+			Seq int64 `json:"seq"`
 		}
 		if err := json.Unmarshal(line, &row); err != nil {
 			return true // 半行容忍：跳过损坏行
@@ -217,6 +220,7 @@ func readAgentCoreSessionMetaWithOptions(path string, options agentVibeSessionRe
 				Content:     content,
 				Timestamp:   ts,
 				Index:       transcriptRow - 1,
+				Seq:         row.Seq,
 				Attachments: row.Attachments,
 			})
 			displayCount++
@@ -251,13 +255,22 @@ func readAgentCoreSessionMetaWithOptions(path string, options agentVibeSessionRe
 			transcriptRow++
 			ts := normalizeAgentTime(row.Ts)
 			session.MessageCount++
+			// turn 行 id（2026-11-10 聊天记录身份化）：优先用写侧落的确定性
+			// message_id（assistant_<user_mid>#<turn>）——它是跨端可比的稳定
+			// 身份，turn-%06d 只是扫描序（分页/截尾后会漂移，不能当锚点）。
+			// 旧文件无该键时回落旧格式，行为不变。
+			turnID := strings.TrimSpace(row.MessageID)
+			if turnID == "" {
+				turnID = fmt.Sprintf("turn-%06d", turnCount)
+			}
 			window.add(models.AgentVibeMessage{
-				ID:        fmt.Sprintf("turn-%06d", turnCount),
+				ID:        turnID,
 				Role:      "assistant",
 				Content:   content,
 				Thinking:  truncateAgentText(row.Thinking, agentVibeTranscriptMaxContentRunes),
 				Timestamp: ts,
 				Index:     transcriptRow - 1,
+				Seq:       row.Seq,
 			})
 			displayCount++
 			if ts != "" { // 空 ts 不赋值:防损坏行抹掉前一行已落下的有效值
@@ -303,6 +316,7 @@ func readAgentCoreSessionMetaWithOptions(path string, options agentVibeSessionRe
 				Content:   content,
 				Timestamp: normalizeAgentTime(row.Ts),
 				Index:     transcriptRow - 1,
+				Seq:       row.Seq,
 			})
 		case "subagent":
 			// 子agent行（start/finish）：组装成 Subagents[],不进主转录、不计
@@ -389,6 +403,7 @@ func readAgentCoreSessionMetaWithOptions(path string, options agentVibeSessionRe
 				Content:   truncateAgentText(note, agentVibeTranscriptMaxContentRunes),
 				Timestamp: normalizeAgentTime(row.Ts),
 				Index:     transcriptRow - 1,
+				Seq:       row.Seq,
 			})
 		}
 		return true

@@ -306,6 +306,13 @@ func (m *agentAIManager) buildSessionSnapshotPayload(sessionID string) map[strin
 			if msg.MessageID != "" {
 				row["message_id"] = msg.MessageID
 			}
+			// seq（2026-11-10 聊天记录身份化）：会话级单调序号，只在写侧分配，
+			// 读侧原样透传。前端据此做确定性排序与幂等合并——数组序在「快照
+			// 限幅截尾 + 本地草稿 + 详情分页」三方合并时不足以复原真实先后。
+			// 0/缺字段 = 旧 agent，前端按既有数组序回落。
+			if msg.Seq > 0 {
+				row["seq"] = msg.Seq
+			}
 			if !msg.CreatedAt.IsZero() {
 				row["ts"] = msg.CreatedAt.UTC().Format(time.RFC3339)
 			}

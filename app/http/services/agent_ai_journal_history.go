@@ -122,7 +122,8 @@ func readAgentCoreJournalTranscriptFrom(dir, sessionID string, includeEndNotes b
 			if (role != "user" && role != "assistant") || (text == "" && len(atts) == 0) {
 				continue
 			}
-			msg := agentAIMessage{Role: role, MessageID: msgID, Content: text, Attachments: atts}
+			seq, _ := journalRowSeq(row)
+			msg := agentAIMessage{Role: role, MessageID: msgID, Content: text, Seq: seq, Attachments: atts}
 			if ts, ok := row["ts"].(string); ok {
 				if t, err := time.Parse(time.RFC3339, ts); err == nil {
 					msg.CreatedAt = t
@@ -134,15 +135,20 @@ func readAgentCoreJournalTranscriptFrom(dir, sessionID string, includeEndNotes b
 			// user(appendUser)，回答经 appendAssistantTurn/appendAssistant 全部
 			// 落 kind=turn。缺席则快照转录永远只有 user 行：重进页订阅快照、
 			// 内存续聊恢复全部拿不到回答（2026-11-05 仪表盘刷新丢回答事故的
-			// 内核侧根因；inventory 侧 2026-10-31 已补，本读侧漏网）。turn 行
-			// 无 message_id（inventory 同款接受），thinking 字段快照契约未
-			// 消费，不进历史。turn 行本批次无附件（内核回答纯文本）。
+			// 内核侧根因；inventory 侧 2026-10-31 已补，本读侧漏网）。
+			//
+			// message_id（2026-11-10 聊天记录身份化）：写侧现在给 turn 行落
+			// assistant_<user_message_id>#<turn> 确定性 id，这里必须透传——它是
+			// 前端按回合分段、跨端去重、以及「助手侧消息序」的唯一键。旧文件
+			// （无该键）保持空串，前端按无 id 回落既有口径，向后兼容。
 			role, _ := row["role"].(string)
 			text, _ := row["text"].(string)
 			if (role != "user" && role != "assistant") || text == "" {
 				continue
 			}
-			msg := agentAIMessage{Role: role, Content: text}
+			turnMsgID, _ := row["message_id"].(string)
+			turnSeq, _ := journalRowSeq(row)
+			msg := agentAIMessage{Role: role, MessageID: turnMsgID, Content: text, Seq: turnSeq}
 			if ts, ok := row["ts"].(string); ok {
 				if t, err := time.Parse(time.RFC3339, ts); err == nil {
 					msg.CreatedAt = t
@@ -168,7 +174,8 @@ func readAgentCoreJournalTranscriptFrom(dir, sessionID string, includeEndNotes b
 			if note == "" {
 				continue
 			}
-			noteMsg := agentAIMessage{Role: "system", Content: note}
+			noteSeq, _ := journalRowSeq(row)
+			noteMsg := agentAIMessage{Role: "system", Content: note, Seq: noteSeq}
 			if ts, ok := row["ts"].(string); ok {
 				if t, err := time.Parse(time.RFC3339, ts); err == nil {
 					noteMsg.CreatedAt = t

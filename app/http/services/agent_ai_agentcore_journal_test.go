@@ -306,11 +306,11 @@ func writeTruncateFixture(t *testing.T, j *agentCoreJournal, sessionID string) {
 	t.Helper()
 	j.ensureSessionHeader(sessionID, "/proj", "glm-5.3", "", "2026-10-31T00:00:00Z", "dashboard", nil, nil, "")
 	j.appendUser(sessionID, "u1", "第一问", "2026-10-31T00:01:00Z")
-	j.appendAssistantTurn(sessionID, 1, "中间叙述", "", "end_turn", nil)
+	j.appendAssistantTurn(sessionID, "u1", 1, "中间叙述", "", "end_turn", nil)
 	j.appendAssistant(sessionID, "a1", "第一答", "2026-10-31T00:02:00Z")
 	j.appendEnd(sessionID, "success", "")
 	j.appendUser(sessionID, "u2", "第二问", "2026-10-31T00:03:00Z")
-	j.appendAssistantTurn(sessionID, 2, "叙述二", "", "end_turn", nil)
+	j.appendAssistantTurn(sessionID, "u2", 2, "叙述二", "", "end_turn", nil)
 	j.appendAssistant(sessionID, "a2", "第二答", "2026-10-31T00:04:00Z")
 	j.appendEnd(sessionID, "success", "")
 }
@@ -654,5 +654,265 @@ func TestUnfinishedSubagentsReportsLastText(t *testing.T) {
 	}
 	if !strings.Contains(got[0].LastText, "AES-GCM 更合适") {
 		t.Fatalf("LastText 未带出最后一轮文本: %q", got[0].LastText)
+	}
+}
+
+// --- 会话级 seq（2026-11-10 聊天记录身份化） ---
+//
+// 背景：跨端合并（快照限幅截尾 + 本地草稿 + 详情分页）时数组序不足以复原
+// 真实先后，ts 有跨端倒挂实录。seq 由写侧分配，是唯一可比的先后真值。本组
+// 锁死三条不变量：①全部记录行型都占号且严格递增；②头行不占号；③进程重启
+// 后按磁盘续号，绝不与既有行撞号。
+
+// TestAgentCoreJournalSeqMonotonicAcrossRowKinds: 各 kind 交错落盘时 seq
+// 严格递增 1,2,3…，且头行不占号。
+func TestAgentCoreJournalSeqMonotonicAcrossRowKinds(t *testing.T) {
+	dir := t.TempDir()
+	j := newAgentCoreJournal(dir)
+	j.ensureSessionHeader("s-seq", "/proj", "m", "", "2026-11-10T00:00:00Z", "phone", nil, nil, "")
+	j.appendUser("s-seq", "u1", "问一句", "2026-11-10T00:00:01Z")
+	j.appendAssistantTurn("s-seq", "u1", 1, "答一句", "", "end_turn", nil)
+	j.appendTool("s-seq", "Bash", "ls", false)
+	j.appendAssistantTurn("s-seq", "u1", 2, "再答", "", "end_turn", nil)
+	j.appendUser("s-seq", "u2", "再问", "2026-11-10T00:00:05Z")
+	j.appendEnd("s-seq", "success", "")
+
+	lines := readJournalLines(t, dir, "s-seq")
+	var seqs []int64
+	for _, row := range lines {
+		if row["kind"] == "session" {
+			if _, has := row["seq"]; has {
+				t.Fatalf("头行不得占 seq: %v", row)
+			}
+			continue
+		}
+		seq, ok := journalRowSeq(row)
+		if !ok {
+			t.Fatalf("记录行缺 seq: %v", row)
+		}
+		seqs = append(seqs, seq)
+	}
+	if len(seqs) != 6 {
+		t.Fatalf("应有 6 条记录行，实际 %d: %v", len(seqs), seqs)
+	}
+	for i, got := range seqs {
+		if want := int64(i + 1); got != want {
+			t.Fatalf("seq[%d] = %d, want %d（必须从 1 起严格 +1）: %v", i, got, want, seqs)
+		}
+	}
+}
+
+// TestAgentCoreJournalSeqResumesAfterRestart: 新进程（新 journal 实例、空内存
+// 计数器）必须从磁盘最后一条 seq 续上，绝不重号。
+func TestAgentCoreJournalSeqResumesAfterRestart(t *testing.T) {
+	dir := t.TempDir()
+	first := newAgentCoreJournal(dir)
+	first.ensureSessionHeader("s-restart", "/proj", "m", "", "2026-11-10T00:00:00Z", "phone", nil, nil, "")
+	first.appendUser("s-restart", "u1", "第一问", "2026-11-10T00:00:01Z")
+	first.appendAssistantTurn("s-restart", "u1", 1, "第一答", "", "end_turn", nil)
+
+	// 模拟进程重启：全新实例，内存 seqs 为空。
+	second := newAgentCoreJournal(dir)
+	second.appendUser("s-restart", "u2", "第二问", "2026-11-10T00:00:03Z")
+
+	lines := readJournalLines(t, dir, "s-restart")
+	var seqs []int64
+	for _, row := range lines {
+		if seq, ok := journalRowSeq(row); ok {
+			seqs = append(seqs, seq)
+		}
+	}
+	if len(seqs) != 3 {
+		t.Fatalf("应有 3 条带 seq 的行，实际 %v", seqs)
+	}
+	for i := 1; i < len(seqs); i++ {
+		if seqs[i] <= seqs[i-1] {
+			t.Fatalf("重启后 seq 必须继续递增，实际 %v", seqs)
+		}
+	}
+	if seqs[len(seqs)-1] != 3 {
+		t.Fatalf("重启后应续到 3，实际 %d（续号基线取磁盘最后一条）: %v", seqs[len(seqs)-1], seqs)
+	}
+}
+
+// TestAgentCoreJournalSeqLegacyFileBaseline: 旧文件（所有行都无 seq）重启后
+// 从「行数」续号，仍保持严格递增（不与旧行语义冲突——旧行没有 seq，不会
+// 出现同 seq 不同内容）。
+func TestAgentCoreJournalSeqLegacyFileBaseline(t *testing.T) {
+	dir := t.TempDir()
+	sessionID := "s-legacy"
+	path := filepath.Join(dir, agentCoreJournalFileName(sessionID))
+	legacy := strings.Join([]string{
+		`{"kind":"session","session_id":"s-legacy","project_path":"/proj","model":"m","created_at":"2026-11-09T00:00:00Z"}`,
+		`{"kind":"msg","role":"user","message_id":"old-1","text":"旧问","ts":"2026-11-09T00:00:01Z"}`,
+		`{"kind":"turn","turn":1,"role":"assistant","text":"旧答","stop_reason":"end_turn","ts":"2026-11-09T00:00:02Z"}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatalf("写旧文件: %v", err)
+	}
+
+	j := newAgentCoreJournal(dir)
+	j.appendUser(sessionID, "new-1", "新问", "2026-11-10T00:00:01Z")
+
+	lines := readJournalLines(t, dir, sessionID)
+	var seqs []int64
+	for _, row := range lines {
+		if seq, ok := journalRowSeq(row); ok {
+			seqs = append(seqs, seq)
+		}
+	}
+	if len(seqs) != 1 {
+		t.Fatalf("只有新行带 seq，实际 %v", seqs)
+	}
+	// 旧文件 3 行 = 1 头行 + 2 记录行；头行不占号 → 基线 2 → 新行得 3。
+	if seqs[0] != 3 {
+		t.Fatalf("旧文件续号基线应为记录行数 2（新行得 3），实际 %d", seqs[0])
+	}
+}
+
+// TestAgentCoreTurnRowCarriesDeterministicMessageID: turn 行必须带确定性
+// message_id = assistant_<user_message_id>#<turn>（2026-11-10 身份化）。
+// 这是「多答连体 / 分页锚点对 turn 行失效 / 跨端去重无键」三类缺陷的共同解。
+func TestAgentCoreTurnRowCarriesDeterministicMessageID(t *testing.T) {
+	dir := t.TempDir()
+	j := newAgentCoreJournal(dir)
+	j.appendAssistantTurn("s-turnid", "msg-abc", 1, "第一段", "", "tool_use", []string{"Bash"})
+	j.appendAssistantTurn("s-turnid", "msg-abc", 2, "第二段", "", "end_turn", nil)
+
+	lines := readJournalLines(t, dir, "s-turnid")
+	var ids []string
+	for _, row := range lines {
+		if row["kind"] != "turn" {
+			continue
+		}
+		id, _ := row["message_id"].(string)
+		ids = append(ids, id)
+	}
+	if len(ids) != 2 {
+		t.Fatalf("应落 2 条 turn 行，实际 %v", ids)
+	}
+	if ids[0] != "assistant_msg-abc#1" || ids[1] != "assistant_msg-abc#2" {
+		t.Fatalf("turn 行 id 应为确定性 assistant_<mid>#<turn>，实际 %v", ids)
+	}
+}
+
+// TestAgentCoreTurnRowOmitsMessageIDWhenUnknown: 无 user_message_id 的极端
+// 形态绝不伪造 id（宁缺勿错——猜出来的 id 会跨会话撞车，破坏去重与撤回锚点）。
+func TestAgentCoreTurnRowOmitsMessageIDWhenUnknown(t *testing.T) {
+	dir := t.TempDir()
+	j := newAgentCoreJournal(dir)
+	j.appendAssistantTurn("s-nohead", "", 1, "正文", "", "end_turn", nil)
+
+	lines := readJournalLines(t, dir, "s-nohead")
+	for _, row := range lines {
+		if row["kind"] != "turn" {
+			continue
+		}
+		if _, has := row["message_id"]; has {
+			t.Fatalf("缺 user_message_id 时不得写 message_id 键: %v", row)
+		}
+	}
+}
+
+// TestAgentCoreTurnMessageIDFormat: 纯函数格式与幂等（已带 assistant_ 前缀的
+// 输入不得二次加前缀——agentAssistantMessageID 同族语义）。
+func TestAgentCoreTurnMessageIDFormat(t *testing.T) {
+	cases := []struct {
+		mid  string
+		turn int
+		want string
+	}{
+		{"msg-1", 1, "assistant_msg-1#1"},
+		{"assistant_msg-1", 2, "assistant_msg-1#2"},
+		{"  msg-2  ", 3, "assistant_msg-2#3"},
+		{"", 1, ""},
+		{"msg-3", 0, ""},
+		{"msg-3", -1, ""},
+	}
+	for _, c := range cases {
+		if got := agentCoreTurnMessageID(c.mid, c.turn); got != c.want {
+			t.Errorf("agentCoreTurnMessageID(%q, %d) = %q, want %q", c.mid, c.turn, got, c.want)
+		}
+	}
+}
+
+// --- 去重集合淘汰策略（2026-11-10） ---
+//
+// 旧实现在 written 到顶时整表清空：那一刻所有在途消息的去重保护同时归零，
+// 而在途消息最多的时刻恰恰是压力最大的时刻（重发风暴/日志刷屏）。现改为
+// FIFO 淘汰最旧键。本组钉死三条：①不整表清空（新键写入后旧键仍被保护到
+// 自己变最旧为止）；②队列与集合长度恒等（不漏、不涨）；③淘汰后重复的
+// 仍是「已被淘汰的那个旧键」而非全部。
+
+// markWrittenLocked 的直接单测：把 cap 缩到可控规模无法做到（const），
+// 故按真实 cap 灌满后验证语义。
+func TestAgentCoreJournalWrittenFIFOEviction(t *testing.T) {
+	j := newAgentCoreJournal(t.TempDir())
+	j.mu.Lock()
+	defer j.mu.Unlock()
+
+	// 灌满到 cap。
+	for i := 0; i < agentCoreJournalWrittenCap; i++ {
+		j.markWrittenLocked(fmt.Sprintf("k-%05d", i))
+	}
+	if len(j.written) != agentCoreJournalWrittenCap {
+		t.Fatalf("灌满后 len(written) = %d, want %d", len(j.written), agentCoreJournalWrittenCap)
+	}
+	if len(j.writtenOrder) != len(j.written) {
+		t.Fatalf("队列与集合长度必须恒等，%d vs %d", len(j.writtenOrder), len(j.written))
+	}
+	firstKey := "k-00000"
+	if _, ok := j.written[firstKey]; !ok {
+		t.Fatalf("刚灌满时最旧键必须还在（不许整表清空）: %s", firstKey)
+	}
+
+	// 再插一个：只淘汰最旧的一个，其余全部保留。
+	j.markWrittenLocked("k-new-1")
+	if _, ok := j.written[firstKey]; ok {
+		t.Fatalf("超 cap 后最旧键应被淘汰: %s", firstKey)
+	}
+	if _, ok := j.written["k-00001"]; !ok {
+		t.Fatalf("次旧键不得被连带淘汰（这就是「整表清空」缺陷的对照）")
+	}
+	if _, ok := j.written["k-new-1"]; !ok {
+		t.Fatalf("新键必须入集合")
+	}
+	if len(j.written) != agentCoreJournalWrittenCap || len(j.writtenOrder) != agentCoreJournalWrittenCap {
+		t.Fatalf("淘汰后规模必须恰好等于 cap: %d/%d", len(j.written), len(j.writtenOrder))
+	}
+
+	// 重复记同一键：幂等，规模与顺序都不变。
+	orderBefore := append([]string(nil), j.writtenOrder...)
+	j.markWrittenLocked("k-new-1")
+	if len(j.writtenOrder) != len(orderBefore) {
+		t.Fatalf("重复记同一键不得改变队列长度")
+	}
+	for i := range orderBefore {
+		if j.writtenOrder[i] != orderBefore[i] {
+			t.Fatalf("重复记同一键不得改变队列顺序（命中不 touch）")
+		}
+	}
+}
+
+// 行为级证明：淘汰发生后，被淘汰键的重复消息会重新落一行（保护已到期），
+// 而仍在集合里的键依旧被去重。这正是「保护有界但持续」的语义。
+func TestAgentCoreJournalDedupSurvivesEvictionWindow(t *testing.T) {
+	dir := t.TempDir()
+	j := newAgentCoreJournal(dir)
+	const sid = "s-evict"
+
+	j.appendUser(sid, "keep-1", "第一条", "2026-11-10T00:00:01Z")
+	j.appendUser(sid, "keep-1", "第一条", "2026-11-10T00:00:01Z") // 去重
+	// 灌满让 keep-1 保持在窗口内（灌的都是别的会话的键，不影响本会话行数）。
+	j.mu.Lock()
+	for i := 0; i < agentCoreJournalWrittenCap-2; i++ {
+		j.markWrittenLocked(fmt.Sprintf("filler-%05d", i))
+	}
+	j.mu.Unlock()
+	// keep-1 仍在窗口内 → 再发一次仍被去重。
+	j.appendUser(sid, "keep-1", "第一条", "2026-11-10T00:00:01Z")
+
+	if rows := journalUserRows(t, dir, sid); len(rows) != 1 {
+		t.Fatalf("窗口内重复必须去重，实际 %d 行: %v", len(rows), rows)
 	}
 }
