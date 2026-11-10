@@ -275,6 +275,32 @@ func TestAgentMCPStatusReadsOwnSessionOnly(t *testing.T) {
 		}
 	})
 
+	t.Run("running 零 pending", func(t *testing.T) {
+		// 独立钉住 idle→running 那一跳:idle 与 awaiting_approval 各有断言,
+		// 但中间的 running 只被 awaiting_approval 顺带走过。若有人把置 running
+		// 的条件改成「有 pending 才算 running」,只有本子测会红。
+		sid := "mcp-status-running"
+		m.mu.Lock()
+		m.sessions[sid] = &agentAISession{
+			id: sid, mode: "vibe", projectPath: proj, provider: "agentcore",
+			createdBy: agentAIMCPCreatedBy,
+			cancel:    func() {}, // running
+		}
+		m.mu.Unlock()
+
+		payload, code, err := svc.AgentMCPStatus(context.Background(), sid)
+		if err != nil || code != http.StatusOK {
+			t.Fatalf("status = (%v, %d, %v), want 200/nil", payload, code, err)
+		}
+		if got, _ := payload["state"].(string); got != "running" {
+			t.Fatalf("state = %q, want running(cancel!=nil 且零 pending)", got)
+		}
+		pendings, ok := payload["pending_approvals"].([]map[string]interface{})
+		if !ok || len(pendings) != 0 {
+			t.Fatalf("pending_approvals = %#v, want 空数组(本子测前提就是零 pending)", payload["pending_approvals"])
+		}
+	})
+
 	t.Run("非本面403", func(t *testing.T) {
 		sid := "phone-status"
 		registerAIMCPTestSession(t, m, &agentAISession{
@@ -366,6 +392,37 @@ func TestAgentMCPApproveSubmitsDecisionThroughApprovalChain(t *testing.T) {
 			t.Fatalf("非法 decision error = %v, want「unsupported approval decision: maybe」", err)
 		}
 	})
+}
+
+// ---------------------------------------------------------------------------
+// 6b. approve 无 waiter:受理链 ack no_match,端点仍成功但必须如实报 applied=false
+// ---------------------------------------------------------------------------
+
+// spec §4.3:no_match / duplicate 也 ACK 成功(让服务端停止重投),但 applied
+// 必须为 false——这是端点结果对调用方的全部区分价值。若不钉住,把 applied
+// 写死成 true 也能让本文件其余用例全绿。
+func TestAgentMCPApproveReportsAppliedFalseWhenNoWaiter(t *testing.T) {
+	svc := newAIMCPTestService(t)
+	m := svc.ai
+	proj := t.TempDir()
+	sid := "mcp-approve-nowaiter"
+	registerAIMCPTestSession(t, m, &agentAISession{
+		id: sid, mode: "vibe", projectPath: proj, provider: "agentcore",
+		createdBy: agentAIMCPCreatedBy,
+		runSeq:    1,
+	})
+
+	// m.approvals 里没有该会话的任何 waiter -> 受理链走 no_match 分支。
+	payload, code, err := svc.AgentMCPApprove(context.Background(), sid, "no-such-approval-id", "accept")
+	if err != nil || code != http.StatusOK {
+		t.Fatalf("approve = (%v, %d, %v), want 200/nil(no_match 也是成功受理)", payload, code, err)
+	}
+	if ok, _ := payload["ok"].(bool); !ok {
+		t.Fatalf("ok = %v, want true", payload["ok"])
+	}
+	if applied, isBool := payload["applied"].(bool); !isBool || applied {
+		t.Fatalf("applied = %v(%T), want 精确 false(无活 waiter 时决策未生效)", payload["applied"], payload["applied"])
+	}
 }
 
 // ---------------------------------------------------------------------------
