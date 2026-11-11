@@ -54,25 +54,27 @@ var meshDNSResolver LocalDNSResolver = &net.Resolver{}
 
 // serveMeshDNSExit 处理 {"t":"dns"} channel:读 [2B 长度][DNS 报文] 帧 →
 // 解析 → 写 [2B 长度][响应] → 关(SPEC §9;不进入站管线,无 DNS 二跳)。
-// 交换总窗口 meshDNSResolveTimeout 罩全流程:gossh.Channel 无 deadline 语义
-// (channel.go channelConn 同款限制),读取侧改用 AfterFunc 到点关通道实现
-// 窗口(源侧 handleMeshDNSTarget 的 SetDeadline 等效替身),解析窗口另有
-// ctx 超时兜底;慢速/静默对端不无限占住 goroutine。
-func serveMeshDNSExit(ch gossh.Channel) {
+// window/resolver 由分派点(handleMeshExitChannel,同步段)快照传入——本
+// 函数运行在独立注入协程,不触碰包级缝 var,与测试覆写/还原严格免竞态
+// (-race 钉住;分派点 go 语句自带 happens-before)。交换总窗口 window 罩
+// 全流程:gossh.Channel 无 deadline 语义(channel.go channelConn 同款限制),
+// 读取侧改用 AfterFunc 到点关通道实现窗口(源侧 handleMeshDNSTarget 的
+// SetDeadline 等效替身),解析窗口另有 ctx 超时兜底;慢速/静默对端不无限
+// 占住 goroutine。
+func serveMeshDNSExit(ch gossh.Channel, window time.Duration, resolver LocalDNSResolver) {
 	defer ch.Close()
-	resolver := meshDNSResolver
 	if resolver == nil {
 		resolver = &net.Resolver{}
 	}
-	window := time.AfterFunc(meshDNSResolveTimeout, func() { _ = ch.Close() })
-	defer window.Stop()
+	guard := time.AfterFunc(window, func() { _ = ch.Close() })
+	defer guard.Stop()
 
 	query, err := readDNSLengthFrame(ch)
 	if err != nil {
 		logger.Debug(fmt.Sprintf("SSH ingress mesh-exit dns: read frame: %v", err))
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), meshDNSResolveTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), window)
 	defer cancel()
 	if werr := writeDNSLengthFrame(ch, resolveDNSQuery(ctx, resolver, query)); werr != nil {
 		logger.Debug(fmt.Sprintf("SSH ingress mesh-exit dns: write frame: %v", werr))

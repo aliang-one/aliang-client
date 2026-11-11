@@ -79,7 +79,9 @@ func handleMeshExitChannel(ctx context.Context, newCh gossh.NewChannel, extra []
 	go gossh.DiscardRequests(chReqs)
 
 	if tgt.T == "dns" {
-		go serveMeshDNSExit(ch)
+		// 缝值(解析器/交换窗口)在分派点(与调用方同 goroutine,同步段)
+		// 快照传入:注入协程内不触碰包级 var,与测试的覆写/还原严格免竞态。
+		go serveMeshDNSExit(ch, meshDNSResolveTimeout, meshDNSResolver)
 		return
 	}
 	go injectMeshExitStream(ctx, ch, connRemote, tgt, meshDeviceID)
