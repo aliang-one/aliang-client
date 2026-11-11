@@ -32,8 +32,7 @@ func (t *Tunnel) handleUDPConn(uc adapter.UDPConn, flow *udpFlowCloser) {
 	// DNS 代转发门控(design §6 层1,Task 8):UDP/53 且规则激活 → 查询经
 	// mesh 连接由 B 侧代解析,跳过公网 DialUDP——激活路径下不存在公网
 	// socket(交换失败由 forward conn 合成 SERVFAIL,fail-closed 绝不回落
-	// 公网 DNS);门未激活(无 dns 规则/peer 无 LAN 地址)→ 直连透传不变
-	// (fail-open)。
+	// 公网 DNS);门未激活(无 dns 规则)→ 直连透传不变(fail-open)。
 	var pc net.PacketConn
 	viaMeshDNS := false
 	if metadata.DstPort == 53 {

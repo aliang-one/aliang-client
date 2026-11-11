@@ -172,7 +172,8 @@ func (s *RuntimeSnapshot) StrictUnavailableBranchDeny() bool {
 // 两处调用方(processor/rules/engine 与 processor/tcp/tls)都走
 // CompileRuntimeSnapshotFromRuntimeInputs 按需重编译,不读本函数产物;store
 // 快照只用于开关状态派生与持久化回放。因此 mesh 能力闸(meshForwardAvailable:
-// 总开关+peer 存在)只在 runtime-inputs 编译路径把关,本函数对 toNode: 目标
+// 生效开关(含 SSH 入口依赖)+ 身份钥 + peer 存在且已钉扎,SPEC §13.2)只在
+// runtime-inputs 编译路径把关,本函数对 toNode: 目标
 // 不做能力检查、按前缀放行是安全的——落盘 canonical 在写入时
 // (customer_config_service)已经过 runtime-inputs 闸,手改文件注入的越权
 // toNode 规则由 Validate 的形态校验拦下 deviceID 空/未知形态,peer 越权则由

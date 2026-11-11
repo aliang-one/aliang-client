@@ -895,6 +895,10 @@ func (c *MeshConfig) EffectiveMaxHops() int {
 // meshForwardAvailable 语义不同(查 Peers 非查 Fallback,编译期能力检查),
 // 不并入本助手。返回形态 (addr, ok):egress 组 Peer / tcp 拨兜底节点都需
 // 地址;只要 ok 判定的消费方可丢弃 addr。
+//
+// 兜底门不重复检查钉扎/身份:fallback 启用时 host_key 由保存期 Validate 强制
+// 必填(见 MeshConfig.Validate),运行期 DialMeshAddr 对空钉扎 fail-closed——
+// 两道闸已覆盖,此处保持宽口径避免双重报错。
 func MeshFallbackActiveForClass(cfg *Config, class string) (addr string, ok bool) {
 	if cfg == nil || cfg.Customer == nil || cfg.Customer.Mesh == nil {
 		return "", false
