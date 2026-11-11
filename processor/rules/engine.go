@@ -347,6 +347,8 @@ func (e *RuleEngine) StoreBinding(metadata *M.Metadata) {
 		route = cache.RouteToSocks
 	case "RouteDirect":
 		route = cache.RouteDirect
+	// RouteMesh 不在名单里的前提:mesh 注入路径直接赋值 HostName、不走 SetHostName,DNSInfo 恒 nil,根本到不了 StoreBinding。
+	// 若将来给注入连接补 DNSInfo,必须同时加 RouteMesh 分支。
 	case "RouteToNode", "RouteMeshFallback":
 		// mesh 路由不进域绑定缓存,防 EvaluateRoute 复活时静默绕过 mesh
 		// 规则:连接走了 mesh 出口(processor/tcp dialViaMesh),但域-IP

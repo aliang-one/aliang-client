@@ -488,7 +488,7 @@ func (h *TCPConnectionHandler) handleNonTLS(
 		// 的 HTTP/2 改包逻辑只适用于 aliang 隧道,mesh 直转路径不套用。
 		// 兜底节点也不可达时如实失败:离线下原路由(RouteToALiang)本就
 		// 拨不通,不再叠加一次注定失败的隧道拨号,错误交由 AI 客户端重试。
-		if fbAddr, redirect := meshOfflineRedirectForAI(); redirect {
+		if fbAddr, redirect := meshOfflineRedirectForAI(metadata); redirect {
 			remote, dialErr := h.dialMeshFallbackNode(ctx, metadata, fbAddr)
 			if dialErr != nil {
 				return nil, originConn, fmt.Errorf("mesh: offline AI redirect to fallback node %s failed: %w", fbAddr, dialErr)
@@ -1333,6 +1333,12 @@ func currentCustomerProxyUpstreamType() (string, bool) {
 // 单载体,不触中继端点命名。
 const meshFallbackPseudoDeviceID = "mesh-fallback"
 
+// errMeshInjectedLoop mesh 注入防环(SPEC §6.2):由 mesh-exit 注入的连接
+// (B 侧转发而来,Metadata.MeshInjected=true)若再命中本机 mesh 规则会
+// 二次出 mesh 形成环,三处 mesh 拨出入口拨出前一律拒绝——链条由配置期
+// 定死(单跳),该限制无损:需要 A→C→D 就配成对应节点。
+var errMeshInjectedLoop = errors.New("mesh: injected traffic must not re-enter mesh (loop guard)")
+
 // meshSelfIDSource / meshPikoDialSource 组装层注入缝,atomic.Value 保护
 // (质量评审 Critical 1):本机 device_id 与 piko 中继拨号在 processor/tcp
 // 层无自然来源——device_id 属 agent 运行状态(持有在 app/http/services,
@@ -1398,6 +1404,9 @@ func meshPikoDialFromSource() meshproxy.PikoDialFunc {
 // LAN 准入);二、规则失败策略——缺省/direct 回落直连、deny 拒绝连接、
 // fallback:<id2> 拨指定节点(限一次,不再链式,防策略链)。
 func (h *TCPConnectionHandler) dialViaMesh(ctx context.Context, metadata *M.Metadata) (net.Conn, error) {
+	if metadata.MeshInjected {
+		return nil, errMeshInjectedLoop
+	}
 	deviceID, policy, ok := config.ParseMeshRuleTarget(metadata.Route)
 	if !ok || deviceID == "" {
 		// decision 字符串缺失/畸形:只有 RouteToNode 会进入本分支,寄存通路
@@ -1517,6 +1526,9 @@ func meshFallbackAddrForClass(ctx context.Context, md *M.Metadata) (string, bool
 // ctx 决定);单 LAN 载体、不试中继(custom 类别仅 LAN 准入天然满足)。
 // 失败返回错误,由调用方继续走规则失败策略(兜底也失败才走失败策略)。
 func (h *TCPConnectionHandler) dialMeshFallbackNode(ctx context.Context, metadata *M.Metadata, addr string) (net.Conn, error) {
+	if metadata.MeshInjected {
+		return nil, errMeshInjectedLoop
+	}
 	peer := meshproxy.NewPeer(meshproxy.PeerTarget{
 		DeviceID: meshFallbackPseudoDeviceID,
 		LANAddrs: []string{addr},

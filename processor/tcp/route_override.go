@@ -47,9 +47,14 @@ func shouldForceAliangRoute(metadata *M.Metadata) bool {
 //
 // 类别不另行推断:本判定只在 shouldForceAliangRoute 命中后消费,56432
 // 回环判据(looksLikeAITraffic 同源口径)恒推断 ai,直接以 ClassAI 查门控。
+// 注入连接不改道(SPEC §6.2 第 3 守卫):B 侧注入流量命中 AI 离线改道条件
+// 时直接保持原决策,防注入流量二次入 mesh。
 // B 侧再改道/Via 续传覆盖归 Task 13 集成(计划已列
 // TestMeshOfflineAIRedirectTwoHop)。
-func meshOfflineRedirectForAI() (addr string, ok bool) {
+func meshOfflineRedirectForAI(md *M.Metadata) (addr string, ok bool) {
+	if md != nil && md.MeshInjected {
+		return "", false
+	}
 	if !meshOfflineActive() {
 		return "", false
 	}
