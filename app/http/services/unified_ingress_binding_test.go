@@ -166,7 +166,8 @@ func TestReconcileUnifiedIngressBindingDoesNotStartWhenProxyStopped(t *testing.T
 }
 
 // TestReconcileUnifiedIngressBindingNilConfigFallsBackToLoopback nil 配置
-// (未配置 mesh)按「不开组网」处理:期望回环,若当前绑在 0.0.0.0 则收窄重绑。
+// (未配 ssh_ingress 入口)按「入口关」处理:期望回环,若当前绑在 0.0.0.0
+// 则收窄重绑(SPEC §5.5)。
 func TestReconcileUnifiedIngressBindingNilConfigFallsBackToLoopback(t *testing.T) {
 	probe := &ingressBindingProbe{}
 	probe.install(t)

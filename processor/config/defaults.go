@@ -84,8 +84,11 @@ func HTTPProxyListenAddr() string {
 //
 // 对称新风险(SPEC §5.5.1):ssh 开、mesh 关的用户,56432 绑 0.0.0.0 后
 // HTTP 代理面(socks5/CONNECT)随入口一起暴露到 LAN——会话租约
-// (AcquireProxyLease/CanProxy)仍是硬闸,无会话者拿不到代理;该风险已随
-// 发布说明明写。
+// (AcquireProxyLease/CanProxy)仍是硬闸,无会话者拿不到代理;该风险将随
+// 发布说明明写(§5.5.1)。
+//
+// 判据不经 MeshEffectivelyEnabled:那是 mesh 出口的生效门(ssh 关时恒
+// false),若作绑定判据会把 ssh 开+mesh 关的用户误收回环。
 //
 // 每次调用现读全局配置与 serviceBindHost,故配置提交后本函数的返回值可能
 // 变化——绑定变更由 app 层 reconcile 钩子(ReconcileUnifiedIngressBinding)
