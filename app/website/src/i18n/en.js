@@ -1000,6 +1000,17 @@ export default {
   mesh_detailPlaceholder: 'Click a link or node to see details.',
   mesh_save: 'Save mesh config',
   mesh_saving: 'Saving…',
+  // -- Key inputs (SPEC §13.3.4/§13.3.6): peer-row host_key / fallback host_key /
+  //    node identity private key + passphrase; must pair with zh.js or keys fall back to raw names --
+  mesh_peersTitle: 'Peer credentials',
+  mesh_peerHostKey: 'Peer host key',
+  mesh_peerHostKeyPlaceholder: 'e.g. SHA256:AbCdEf… or an authorized_keys line',
+  mesh_peerHostKeyHint: 'Host key verified when dialing this node (SHA256: fingerprint or an authorized_keys line); leave empty to skip verification.',
+  mesh_fallbackHostKey: 'Fallback host key',
+  mesh_privateKey: 'Node identity key',
+  mesh_privateKeyPlaceholder: 'PEM private key (OpenSSH/PKCS#8)',
+  mesh_privateKeyHint: 'The private key stays on this node only; paste the public key into the mesh_authorized_keys of each peer, with the trailing comment set to the local device_id.',
+  mesh_keyPassphrase: 'Key passphrase',
 
   // -- LogsSettings --
   logs_title: 'Live Logs',

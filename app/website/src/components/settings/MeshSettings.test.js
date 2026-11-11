@@ -435,6 +435,20 @@ function baseConfig(meshOverrides = {}) {
   };
 }
 
+// 带全量密钥的基座配置（G3 密钥输入位共用;含 saving 态禁用断言）:peer dev-b
+// 有 host_key、dev-c 没有（渲染空行）、兜底 host_key + 节点私钥/口令齐备。
+function keyConfig() {
+  return baseConfig({
+    private_key: 'sk-old',
+    key_passphrase: 'ph-old',
+    peers: [
+      { device_id: 'dev-b', lan_addrs: ['192.168.1.20:56441'], relay: true, host_key: 'HK-peer-old' },
+      { device_id: 'dev-c', lan_addrs: ['192.168.1.21:56441'], relay: true }
+    ],
+    fallback: { enable: false, classes: [], addr: '', host_key: 'HK-fb-old' }
+  });
+}
+
 const jsonOk = (data) => ({ ok: true, status: 200, json: async () => ({ code: 0, msg: '', data }) });
 
 const defaultMeshStatus = () => ({
@@ -476,6 +490,18 @@ function stubApi({ agentStatus, agentStatusError, meshStatus, meshStatusError, l
 
 function setField(el, field, value) {
   const node = el.querySelector(`[data-field="${field}"]`);
+  node.value = value;
+  node.dispatchEvent(new Event('input', { bubbles: true }));
+}
+
+// peer 行内 host_key 输入位（每 peer 一行，按 device_id 定位；同名 data-field
+// 有多份，querySelector 只认第一个会拿错行）
+function peerKeyInput(el, deviceId) {
+  return el.querySelector(`[data-mesh-peer-row="${deviceId}"] [data-field="meshPeerHostKey"]`);
+}
+
+function setPeerKey(el, deviceId, value) {
+  const node = peerKeyInput(el, deviceId);
   node.value = value;
   node.dispatchEvent(new Event('input', { bubbles: true }));
 }
@@ -607,12 +633,17 @@ describe('MeshSettings 卡片', () => {
   });
 
   it('saving 态：兜底开关与全部编辑控件、保存按钮禁用（与兄弟控件口径一致）', async () => {
-    const { el } = mountCard(baseConfig(), { saving: true });
+    const { el } = mountCard(keyConfig(), { saving: true });
     await flush();
     expect(el.querySelector('[data-field="meshFallbackEnable"]').disabled).toBe(true);
     expect(el.querySelector('[data-field="meshFallbackAddr"]').disabled).toBe(true);
     expect(el.querySelector('[data-field="meshFallbackClassAi"], [data-field="meshClassAi"]').disabled).toBe(true);
     expect(el.querySelector('[data-field="meshFallbackCandidate"]').disabled).toBe(true);
+    // G3 密钥输入位与兄弟控件同口径禁用
+    expect(el.querySelector('[data-field="meshFallbackHostKey"]').disabled).toBe(true);
+    expect(el.querySelector('[data-field="meshPrivateKey"]').disabled).toBe(true);
+    expect(el.querySelector('[data-field="meshKeyPassphrase"]').disabled).toBe(true);
+    expect(peerKeyInput(el, 'dev-b').disabled).toBe(true);
     expect(saveButton(el).disabled).toBe(true);
   });
 
@@ -769,6 +800,16 @@ describe('MeshSettings 卡片', () => {
       'mesh_fallbackClassSelf',
       'mesh_fallbackClassCustom',
       'mesh_validationFallbackAddr',
+      // G3 密钥输入位（SPEC §13.3.6）
+      'mesh_peersTitle',
+      'mesh_peerHostKey',
+      'mesh_peerHostKeyPlaceholder',
+      'mesh_peerHostKeyHint',
+      'mesh_fallbackHostKey',
+      'mesh_privateKey',
+      'mesh_privateKeyPlaceholder',
+      'mesh_privateKeyHint',
+      'mesh_keyPassphrase',
       'mesh_save',
       'mesh_saving'
     ];
@@ -776,6 +817,98 @@ describe('MeshSettings 卡片', () => {
       expect(typeof zh[key], `zh.${key}`).toBe('string');
       expect(typeof en[key], `en.${key}`).toBe('string');
     }
+  });
+});
+
+// —— 密钥输入位（G3/SPEC §13.3.4+§13.3.6）：peer 行 host_key / 兜底行 host_key /
+//    节点身份私钥（textarea）+ 口令（password 框）。没有这组输入位用户只能手改
+//    配置文件；验收链=填→保存→载荷带出；清空→保存→G1 归一化省缺→G2 清空块
+//    显式空串带出（挂载级测试串联两级验证全链）。——
+describe('MeshSettings 密钥输入位（G3）', () => {
+  it('回显：peer 行/兜底 host_key/私钥/口令四类输入位从配置渲染现值', async () => {
+    const { el } = mountCard(keyConfig());
+    await flush();
+    // peer 行：每个配置 peer 一行，行内 host_key 输入位绑定行数据
+    expect(el.querySelector('[data-mesh-peer-row="dev-b"]')).not.toBeNull();
+    expect(el.querySelector('[data-mesh-peer-row="dev-c"]')).not.toBeNull();
+    expect(peerKeyInput(el, 'dev-b').value).toBe('HK-peer-old');
+    expect(peerKeyInput(el, 'dev-c').value).toBe(''); // 无 host_key 的 peer 行渲染空
+    // 兜底行 host_key（与 addr 并列）
+    expect(el.querySelector('[data-field="meshFallbackHostKey"]').value).toBe('HK-fb-old');
+    // 私钥=textarea 容 PEM 多行；口令=password 框；两处 autocomplete 关闭
+    const pk = el.querySelector('[data-field="meshPrivateKey"]');
+    expect(pk.tagName).toBe('TEXTAREA');
+    expect(pk.value).toBe('sk-old');
+    expect(pk.getAttribute('autocomplete')).toBe('off');
+    const ph = el.querySelector('[data-field="meshKeyPassphrase"]');
+    expect(ph.type).toBe('password');
+    expect(ph.getAttribute('autocomplete')).toBe('off');
+    expect(ph.value).toBe('ph-old');
+  });
+
+  it('改输入 → save：载荷携带四个新值（peer 行内编辑值随行带出）', async () => {
+    const { el, saved } = mountCard(keyConfig());
+    await flush();
+    setField(el, 'meshPrivateKey', '-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----');
+    setField(el, 'meshKeyPassphrase', 'ph-new');
+    setField(el, 'meshFallbackHostKey', 'HK-fb-new');
+    setPeerKey(el, 'dev-b', 'SHA256:peer-new');
+    await flush();
+    clickSave(el);
+    await flush();
+    expect(saved).toHaveLength(1);
+    expect(saved[0].mesh.private_key).toContain('BEGIN OPENSSH PRIVATE KEY');
+    expect(saved[0].mesh.key_passphrase).toBe('ph-new');
+    expect(saved[0].mesh.fallback.host_key).toBe('HK-fb-new');
+    expect(saved[0].mesh.peers[0].host_key).toBe('SHA256:peer-new');
+    expect('host_key' in saved[0].mesh.peers[1]).toBe(false); // 未编辑的 peer 行不落键
+    // 父层 patch 侧：改动值 ≠ current → 全部随 patch 带出（不被吞）
+    const patch = buildCustomerSavePatch(saved[0], keyConfig());
+    expect(patch.mesh.private_key).toContain('BEGIN OPENSSH PRIVATE KEY');
+    expect(patch.mesh.key_passphrase).toBe('ph-new');
+    expect(patch.mesh.fallback.host_key).toBe('HK-fb-new');
+    expect(patch.mesh.peers[0].host_key).toBe('SHA256:peer-new');
+  });
+
+  it('清空 → save：卡片载荷省缺四键（G1），经 buildCustomerSavePatch 显式空串带出（G2 清空块激活）', async () => {
+    const current = keyConfig();
+    const { el, saved } = mountCard(current);
+    await flush();
+    setField(el, 'meshPrivateKey', '');
+    setField(el, 'meshKeyPassphrase', '');
+    setField(el, 'meshFallbackHostKey', '');
+    setPeerKey(el, 'dev-b', '');
+    await flush();
+    clickSave(el);
+    await flush();
+    expect(saved).toHaveLength(1);
+    // 卡片载荷：空串经归一化不落键（G1 省缺口径）
+    expect('private_key' in saved[0].mesh).toBe(false);
+    expect('key_passphrase' in saved[0].mesh).toBe(false);
+    expect('host_key' in saved[0].mesh.fallback).toBe(false);
+    expect('host_key' in saved[0].mesh.peers[0]).toBe(false);
+    // G2 清空块：private_key/key_passphrase/fallback.host_key 显式空串；
+    // peers 是数组走整体替换分支，清空经数组 diff 自然带出
+    const patch = buildCustomerSavePatch(saved[0], current);
+    expect(patch.mesh.private_key).toBe('');
+    expect(patch.mesh.key_passphrase).toBe('');
+    expect(patch.mesh.fallback.host_key).toBe('');
+    expect(patch.mesh.peers).toEqual([
+      { device_id: 'dev-b', lan_addrs: ['192.168.1.20:56441'], relay: true },
+      { device_id: 'dev-c', lan_addrs: ['192.168.1.21:56441'], relay: true }
+    ]);
+  });
+
+  it('未填私钥但有 peers（其余合法）：表单不强校验，save 照常提交（后端保存期才是权威）', async () => {
+    const { el, saved } = mountCard(keyConfig());
+    await flush();
+    setField(el, 'meshPrivateKey', '');
+    setField(el, 'meshFallbackHostKey', '');
+    await flush();
+    expect(saveButton(el).disabled).toBe(false);
+    clickSave(el);
+    await flush();
+    expect(saved).toHaveLength(1); // 无表单层硬拒——错误回显走卡片 error prop
   });
 });
 

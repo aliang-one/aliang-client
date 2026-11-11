@@ -200,6 +200,36 @@
       </div>
     </section>
 
+    <!-- —— 节点对凭据（G3/SPEC §13.3.4）:每个配置 peer 一行,行内 host_key 输入位
+         绑定表单行（保存随 peers 数组整体替换带出;清空=省缺,经数组 diff 自然带出,
+         G2 注释同口径）。device_id/lan_addrs/relay 仍由配置文件/后端维护,此处只
+         暴露凭据编辑;行数据源=归一化后的 config peers（watch config 深度重建表单）。 -->
+    <section v-if="form.peerRows.length" class="space-y-3" data-mesh-peers>
+      <div class="flex flex-col gap-1 md:flex-row md:items-center md:justify-between">
+        <h4 class="text-sm font-semibold text-slate-900 dark:text-white">{{ t('mesh_peersTitle') }}</h4>
+        <p class="text-xs text-slate-500">{{ t('mesh_peerHostKeyHint') }}</p>
+      </div>
+      <div
+        v-for="row in form.peerRows"
+        :key="row.device_id"
+        class="grid items-center gap-3 md:grid-cols-[220px_minmax(0,1fr)]"
+        :data-mesh-peer-row="row.device_id"
+      >
+        <span class="truncate font-mono text-sm text-slate-800 dark:text-slate-200">{{ row.device_id }}</span>
+        <input
+          v-model="row.host_key"
+          :aria-label="t('mesh_peerHostKey')"
+          class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 font-mono text-sm shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 disabled:opacity-60 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+          data-field="meshPeerHostKey"
+          :data-peer-id="row.device_id"
+          :disabled="loading || saving"
+          :placeholder="t('mesh_peerHostKeyPlaceholder')"
+          type="text"
+          @keydown.enter.prevent
+        />
+      </div>
+    </section>
+
     <!-- —— 离线兜底常驻卡（§9.4;兜底式非覆盖式,在线时即可预配置）—— -->
     <section class="space-y-3 rounded-xl border border-dashed border-slate-300 bg-slate-50/60 p-4 dark:border-slate-700 dark:bg-slate-900/40" data-mesh-fallback>
       <div class="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
@@ -256,6 +286,21 @@
         </label>
       </div>
 
+      <!-- 兜底行 host_key（G3/SPEC §13.3.4:与 addr 并列;兜底节点=特殊 peer,格式同对端 host key;
+           spread 保底透传既有值,表单值在前覆盖——字面量只认表单三键,清空走 G2 清空块） -->
+      <label class="space-y-2">
+        <span class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('mesh_fallbackHostKey') }}</span>
+        <input
+          v-model="form.fallbackHostKey"
+          class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 font-mono text-sm shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 disabled:opacity-60 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+          data-field="meshFallbackHostKey"
+          :disabled="loading || saving"
+          :placeholder="t('mesh_peerHostKeyPlaceholder')"
+          type="text"
+          @keydown.enter.prevent
+        />
+      </label>
+
       <!-- Classes 三勾选（后端 meshproto ClassAI/ClassSelf/ClassCustom 子集） -->
       <fieldset class="space-y-2">
         <legend class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('mesh_fallbackClasses') }}</legend>
@@ -292,6 +337,43 @@
           </label>
         </div>
       </fieldset>
+    </section>
+
+    <!-- —— 节点身份密钥（G3/SPEC §13.3.4）:私钥 textarea 容 PEM 多行 + 口令密码框,
+         autocomplete off 防浏览器记忆凭据（RulesSettings proxy 私钥同款手法）。
+         表单不强校验——后端保存期拒绝（peers 非空时 private_key 必填等）经卡片
+         error prop 回显,placeholder/hint 把格式与分发口径写清。 -->
+    <section class="space-y-3" data-mesh-identity>
+      <div>
+        <h4 class="text-sm font-semibold text-slate-900 dark:text-white">{{ t('mesh_privateKey') }}</h4>
+        <p class="text-xs text-slate-500">{{ t('mesh_privateKeyHint') }}</p>
+      </div>
+      <div class="grid gap-4 md:grid-cols-[minmax(0,1fr)_240px]">
+        <label class="space-y-2">
+          <textarea
+            v-model="form.privateKey"
+            :aria-label="t('mesh_privateKey')"
+            autocomplete="off"
+            class="min-h-28 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 font-mono text-xs shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 disabled:opacity-60 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+            data-field="meshPrivateKey"
+            :disabled="loading || saving"
+            :placeholder="t('mesh_privateKeyPlaceholder')"
+            spellcheck="false"
+          ></textarea>
+        </label>
+        <label class="space-y-2">
+          <span class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('mesh_keyPassphrase') }}</span>
+          <input
+            v-model="form.keyPassphrase"
+            autocomplete="off"
+            class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 disabled:opacity-60 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+            data-field="meshKeyPassphrase"
+            :disabled="loading || saving"
+            type="password"
+            @keydown.enter.prevent
+          />
+        </label>
+      </div>
     </section>
 
     <p v-if="validationError" class="text-xs text-red-500" role="alert">{{ validationError }}</p>
@@ -699,6 +781,14 @@ export default {
       return {
         fallbackEnabled: mesh.fallback.enable,
         fallbackAddr: mesh.fallback.addr,
+        // 密钥输入位（G3/SPEC §13.3.4）:四类现值从配置回填——「填→保存→刷新仍在」
+        // 的读侧（刷新=props.config 更新,watch 深度重建表单）。缺键渲染空串。
+        fallbackHostKey: mesh.fallback.host_key || '',
+        privateKey: mesh.private_key || '',
+        keyPassphrase: mesh.key_passphrase || '',
+        // peer 行:整行拷贝（device_id/lan_addrs/relay 只作透传底座,行内仅
+        // host_key 可编辑）;无 host_key 的 peer 行也渲染（空输入位）
+        peerRows: mesh.peers.map((peer) => ({ ...peer, host_key: peer.host_key || '' })),
         classes: {
           ai: mesh.fallback.classes.includes('ai'),
           self: mesh.fallback.classes.includes('self'),
@@ -771,13 +861,21 @@ export default {
       }
       const mesh = normalizeMeshConfig({
         ...(this.config?.mesh && typeof this.config.mesh === 'object' ? this.config.mesh : {}),
+        // 密钥表单值（G3/SPEC §13.3.4）:节点私钥/口令与 peers 行内 host_key 进入
+        // 载荷;空串经归一化不落键（G1 省缺）,撤销意图由 SettingsPage G2 清空块
+        // 显式带出空串,后端 deep-merge 才会真正清掉旧值——三段接力缺一不可。
+        private_key: String(this.form.privateKey ?? ''),
+        key_passphrase: String(this.form.keyPassphrase ?? ''),
+        // peers 以表单行为准（行内 host_key 编辑值必须带出）;未编辑字段整行透传
+        peers: this.form.peerRows.map((row) => ({ ...row })),
         fallback: {
           // 密钥透传（SPEC §13.3.2）：fallback 字面量整体替换,只改 js 归一化
-          // 不够——spread 保住既有 config 的 host_key 等密钥键,表单三键在前
+          // 不够——spread 保住既有 config 的 host_key 等密钥键,表单四键在前
           // 覆盖用户可编辑值（degenerate 输入由 normalizeMeshFallback 兜底清洗）。
           ...(this.config?.mesh?.fallback || {}),
           enable: !!this.form.fallbackEnabled,
           addr: String(this.form.fallbackAddr || '').trim(),
+          host_key: String(this.form.fallbackHostKey ?? ''),
           classes: MESH_FALLBACK_CLASSES.filter((cls) => this.form.classes[cls])
         }
       });
