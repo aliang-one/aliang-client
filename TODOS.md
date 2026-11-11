@@ -68,6 +68,11 @@
 13. spec 行文里「第 6 工具组」的序数在群组增删后需要复核(纯文档一致性)。**当前成立**:peer 五工具 + ai_run_* 三工具 = 六组。
 14. 记忆批沿用下来的 NIT 里与 `agentAIMCPPreflight` 同型的一条:每次调用都 `config.GetGlobalConfig()` 取指针后读字段,指针在 `SetGlobalConfig` 下会被整体替换(读取方要么拿旧要么拿新、各自视为不可变),因此**当前无竞态**;但若将来有人改成「锁外原地改字段」,这里会静默读到半更新的配置。**注**:`cmd/mcp.go` 的门控不走这条路(冷子进程直读文件,见 `agentMCPGateOn` 注释)。
 
+*终审(全分支)三条已闭环*
+15. ~~status/approve 的 `session_id 必填` 早返分支无测试兜底(删掉整套仍绿)~~ **已补**:`TestAgentMCPStatusRejectsEmptySessionID` / `TestAgentMCPApproveRejectsEmptySessionID`(两向变异实测变红)。
+16. ~~core 侧三条路由注册存在性无测试(删除注册 / 去掉 `POST ` 前缀两向变异均绿)~~ **已补**:`app/http/routes/ai_mcp_route_test.go` 同时断言注册存在、`mux.Handler` 返回的 pattern 带 `POST ` 前缀、GET 被 ServeMux 兜底成 405 且 `Allow: POST`(两向变异实测变红)。
+17. ~~`handleAIMCPOp` 方法闸注释写错折算目标(实为 500 而非 400)~~ **已改**:注释改为「过 ErrorCodeToHTTPStatus 落 default → 500」,结论(必须 `http.Error`)不变。
+
 **Why:** 五任务全部两关评审通过(0 BLOCKER/0 SHOULD 未决),以上均为「不影响正确性、安全红线、主流程」的观察项;其中 5 是存量真 bug(HTTP 500 而非 405),6/7 是产品口径问题,1/11 是可测性缺口。
 
 **Context:** spec=`docs/superpowers/specs/2026-11-10-agent-as-mcp-design.md`;plan=`docs/superpowers/plans/2026-11-10-agent-as-mcp.md`;记忆批同款卡片修复先例=`AgentMemorySettings.vue` 的 `memoryApiRequest` 挂 `e.status`+`isMissingError` 收窄形态。

@@ -426,6 +426,40 @@ func TestAgentMCPApproveReportsAppliedFalseWhenNoWaiter(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// 6b. session_id 必填:status / approve 的早返分支
+// ---------------------------------------------------------------------------
+
+// status/approve 的 `sid == ""` 早返今天没有任何测试兜底——删掉它整套仍绿
+// (终审变异 #4 实测)。这条分支的实际价值:空 sid 会一路走到
+// agentAIMCPContractCheck → "会话不存在: "(注意冒号后是空的),把「你没传参数」
+// 说成「这个会话不存在」,调用方会拿一个空 id 去反复排查。
+func TestAgentMCPStatusRejectsEmptySessionID(t *testing.T) {
+	svc := newAIMCPTestService(t)
+	for _, sid := range []string{"", "   "} {
+		payload, code, err := svc.AgentMCPStatus(context.Background(), sid)
+		if code != http.StatusBadRequest {
+			t.Fatalf("status(%q) 状态码 = %d, want 400(payload=%v err=%v)", sid, code, payload, err)
+		}
+		if err == nil || err.Error() != "session_id 必填" {
+			t.Fatalf("status(%q) error = %v, want「session_id 必填」(不能被当成「会话不存在」)", sid, err)
+		}
+	}
+}
+
+func TestAgentMCPApproveRejectsEmptySessionID(t *testing.T) {
+	svc := newAIMCPTestService(t)
+	for _, sid := range []string{"", "   "} {
+		payload, code, err := svc.AgentMCPApprove(context.Background(), sid, "ap-1", "accept")
+		if code != http.StatusBadRequest {
+			t.Fatalf("approve(%q) 状态码 = %d, want 400(payload=%v err=%v)", sid, code, payload, err)
+		}
+		if err == nil || err.Error() != "session_id 必填" {
+			t.Fatalf("approve(%q) error = %v, want「session_id 必填」", sid, err)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 // 7. 门控关:三操作各 503
 // ---------------------------------------------------------------------------
 

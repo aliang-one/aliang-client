@@ -356,7 +356,10 @@ func (h *AgentHandler) HandleAIMCPApprove(w http.ResponseWriter, r *http.Request
 // 所以成功分支把 payload 序列化成字符串塞进 result，形状错整次工具调用报废。
 func (h *AgentHandler) handleAIMCPOp(w http.ResponseWriter, r *http.Request, op func(context.Context, map[string]string) (map[string]interface{}, int, error)) {
 	if r.Method != http.MethodPost {
-		// 同 HandlePeerMcp 惯例：common.Error 收业务码，直传 405 会被折成 400。
+		// 必须走 http.Error，不能走 common.Error：后者把 code 当业务码过
+		// ErrorCodeToHTTPStatus，405 落在 default → HTTP 500（存量同型 bug 见
+		// HandleAIApprovalHook：本意 405 实发 500）。手写 405 还附带正确的
+		// Allow 语义（ServeMux 兜底那条路径也带）。
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
