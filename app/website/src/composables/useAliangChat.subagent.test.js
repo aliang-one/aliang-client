@@ -336,3 +336,38 @@ describe('ingestDetailSubagents（历史装配内核：openDeviceSession 与重�
     expect(store.s1).toBe(existing);
   });
 });
+
+describe('ingestDetailSubagents queued 保留（复核 2026-11-10 P1）', () => {
+  it('详情整包替换不抹掉 WS 帧态 queued 条目；详情已有的 task_id 以详情为准', () => {
+    const store = {};
+    // 本地帧态：t-queued 在排队（journal 无行），t-done 已完成（journal 有行）。
+    ingestDetailSubagents(store, 's1', {
+      subagents: [
+        { task_id: 't-done', name: 'researcher', status: 'completed' },
+      ],
+    });
+    const { applySubagentEvent } = require('../utils/subagentPanel');
+    store.s1 = applySubagentEvent(store.s1, { taskId: 't-queued', phase: 'queued', currentStep: '排队等待并发槽' });
+    expect(store.s1.map(s => s.taskId)).toEqual(['t-done', 't-queued']);
+
+    // 重拉：详情只有 t-done（journal 永远补不出 queued 行）——t-queued 必须保留。
+    ingestDetailSubagents(store, 's1', {
+      subagents: [{ task_id: 't-done', name: 'researcher', status: 'completed' }],
+    });
+    expect(store.s1.map(s => s.taskId)).toEqual(['t-queued', 't-done']);
+    expect(store.s1.find(s => s.taskId === 't-queued').phase).toBe('queued');
+  });
+
+  it('详情里出现了的 queued task_id（起跑后 journal 有行）以详情为准不保留', () => {
+    const store = {};
+    ingestDetailSubagents(store, 's2', { subagents: [] });
+    const { applySubagentEvent } = require('../utils/subagentPanel');
+    store.s2 = applySubagentEvent(store.s2, { taskId: 't-x', phase: 'queued' });
+    // 起跑后详情带出了 t-x（status=started）——详情是真值，本地 queued 壳不再保留。
+    ingestDetailSubagents(store, 's2', {
+      subagents: [{ task_id: 't-x', name: 'r', status: 'started' }],
+    });
+    expect(store.s2).toHaveLength(1);
+    expect(store.s2[0]).toMatchObject({ taskId: 't-x', phase: 'started' });
+  });
+});

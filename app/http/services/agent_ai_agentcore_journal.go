@@ -12,6 +12,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -26,19 +27,88 @@ import (
 // prune（按 mtime 保留最新）。扫描侧另有 recency cap，二者独立。
 const agentCoreJournalMaxFiles = 100
 
+// agentCoreUnfinishedScanCap 装配期增量游标 map 的会话数封顶：超限整体清零
+// （丢游标=下次整份重扫，正确性无损）。与 written 的满额重置同哲学。
+const agentCoreUnfinishedScanCap = 1024
+
 // agentCoreJournalWrittenCap 去重集合上限：超过即整体清空。去重只防同进程内
 // 同一消息写两行，进程重启集合清零没有正确性问题（重发即新 messageID）。
 const agentCoreJournalWrittenCap = 4096
 
 type agentCoreJournal struct {
-	mu       sync.Mutex
-	dir      string
-	dirReady bool
-	written  map[string]struct{}
+	mu             sync.Mutex
+	dir            string
+	dirReady       bool
+	written        map[string]struct{}
+	unfinishedScan map[string]*unfinishedScanState // 会话→装配期增量扫描游标（unfinishedSubagents 专用）
 }
 
 func newAgentCoreJournal(dir string) *agentCoreJournal {
 	return &agentCoreJournal{dir: strings.TrimSpace(dir), written: make(map[string]struct{})}
+}
+
+// unfinishedScanEntry 单个子 agent 的扫描状态（含 finish 标记）。
+type unfinishedScanEntry struct {
+	agentCoreSubagentInterrupted
+	finished bool
+}
+
+// unfinishedScanState 会话级增量扫描游标（审计 2026-11-10 ④）：装配期不再
+// 锁内全文件重扫——只读上次游标之后的新行。offset=已消费完整行的文件偏移
+// （未遇换行的残尾留在磁盘上，下轮从同一偏移重读——磁盘本身就是缓冲，
+// 内存侧不再复制残尾）；firstLine=首行内容（外部改写文件的粗校验之一）；
+// entries/order 与全量扫描同构。
+type unfinishedScanState struct {
+	offset    int64
+	firstLine string
+	order     []string
+	entries   map[string]*unfinishedScanEntry
+}
+
+func (s *unfinishedScanState) scanLine(line []byte) {
+	var row struct {
+		Kind           string `json:"kind"`
+		Event          string `json:"event"`
+		TaskID         string `json:"task_id"`
+		Name           string `json:"name"`
+		Task           string `json:"task"`
+		Text           string `json:"text"`
+		Ts             string `json:"ts"`
+		SubagentTaskID string `json:"subagent_task_id"`
+		Tool           string `json:"tool"`
+	}
+	if json.Unmarshal(line, &row) != nil {
+		return
+	}
+	switch {
+	case row.Kind == "subagent" && row.Event == "start" && strings.TrimSpace(row.TaskID) != "":
+		if _, ok := s.entries[row.TaskID]; ok {
+			return
+		}
+		s.entries[row.TaskID] = &unfinishedScanEntry{agentCoreSubagentInterrupted: agentCoreSubagentInterrupted{
+			TaskID: row.TaskID, Name: row.Name, Task: row.Task, StartedAt: row.Ts,
+		}}
+		s.order = append(s.order, row.TaskID)
+	case row.Kind == "subagent" && row.Event == "finish":
+		if e, ok := s.entries[row.TaskID]; ok {
+			e.finished = true
+			// 终态条目只留计数与标识，文本字段即清（复核 2026-11-10 ④ P2）：
+			// 输出口径只消费未终态条目，清文本不改变任何返回值，只压内存驻留。
+			e.LastText = ""
+			e.Task = ""
+		}
+	case row.Kind == "tool" && strings.TrimSpace(row.SubagentTaskID) != "":
+		if e, ok := s.entries[row.SubagentTaskID]; ok && !e.finished {
+			e.ToolCalls++
+			e.LastTool = row.Tool
+		}
+	case row.Kind == "subagent_turn":
+		if e, ok := s.entries[row.TaskID]; ok && !e.finished {
+			if t := strings.TrimSpace(row.Text); t != "" {
+				e.LastText = t
+			}
+		}
+	}
 }
 
 // agentCoreJournalDir 返回 journal 存储根；agentHome() 不可得时返回空串
@@ -229,6 +299,9 @@ func (j *agentCoreJournal) healMergeJournal(sourceSessionID, targetSessionID str
 			j.prependHeaderLocked(targetPath, targetID, stringField("project_path"), stringField("model"), stringField("effort"),
 				stringField("created_at"), stringField("origin"), disabledMCP, disabledSkills, stringField("approval_mode"))
 		}
+		// 头行补建/prepend 使目标文件前缀整体位移 → 装配期增量游标失效；
+		// 纯 O_APPEND 合流路径不动前缀，游标继续有效。
+		delete(j.unfinishedScan, targetID)
 		if !j.hasSessionHeaderLocked(targetPath) {
 			return 0, false
 		}
@@ -701,6 +774,12 @@ func (j *agentCoreJournal) subagentSidechainBriefing(sessionID, taskID string, m
 // 派发，journal 内全部 start 行必属已死回合（同会话 run 串行）；本 run 后续
 // 派发的子 agent 不受影响（装配一次性求值）。半行/坏行跳过（与详情读侧同
 // 口径）。文件缺失/全终态返回 nil。
+//
+// 增量化（审计 2026-11-10 ④）：旧实现每次在 j.mu 内全文件重扫（行级 JSON
+// 解析 O(整文件)，文件单调膨胀线性变慢，还堵住同一把锁上的所有 journal
+// 写）。现按会话维护增量游标：复用时只读上次偏移之后的新行；truncateBefore
+// /healMergeJournal 重写文件时精确失效。另设三重粗校验（文件变短/首行漂移/
+// 游标边界非行首）兜外部改写，命中即整份重扫。
 func (j *agentCoreJournal) unfinishedSubagents(sessionID string) []agentCoreSubagentInterrupted {
 	if j == nil || j.dir == "" || strings.TrimSpace(sessionID) == "" {
 		return nil
@@ -710,61 +789,57 @@ func (j *agentCoreJournal) unfinishedSubagents(sessionID string) []agentCoreSuba
 	path := filepath.Join(j.dir, agentCoreJournalFileName(sessionID))
 	f, err := os.Open(path)
 	if err != nil {
+		// 文件消失（被删/换机）：游标一并作废。
+		delete(j.unfinishedScan, sessionID)
 		return nil
 	}
 	defer f.Close()
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), agentVibeJSONLMaxLineBytes)
-	type scanEntry struct {
-		agentCoreSubagentInterrupted
-		finished bool
+
+	if j.unfinishedScan == nil {
+		j.unfinishedScan = make(map[string]*unfinishedScanState)
 	}
-	order := make([]string, 0, 2)
-	entries := make(map[string]*scanEntry)
-	for sc.Scan() {
-		var row struct {
-			Kind           string `json:"kind"`
-			Event          string `json:"event"`
-			TaskID         string `json:"task_id"`
-			Name           string `json:"name"`
-			Task           string `json:"task"`
-			Text           string `json:"text"`
-			Ts             string `json:"ts"`
-			SubagentTaskID string `json:"subagent_task_id"`
-			Tool           string `json:"tool"`
-		}
-		if json.Unmarshal(sc.Bytes(), &row) != nil {
-			continue
-		}
-		switch {
-		case row.Kind == "subagent" && row.Event == "start" && strings.TrimSpace(row.TaskID) != "":
-			if _, ok := entries[row.TaskID]; ok {
-				continue
-			}
-			entries[row.TaskID] = &scanEntry{agentCoreSubagentInterrupted: agentCoreSubagentInterrupted{
-				TaskID: row.TaskID, Name: row.Name, Task: row.Task, StartedAt: row.Ts,
-			}}
-			order = append(order, row.TaskID)
-		case row.Kind == "subagent" && row.Event == "finish":
-			if e, ok := entries[row.TaskID]; ok {
-				e.finished = true
-			}
-		case row.Kind == "tool" && strings.TrimSpace(row.SubagentTaskID) != "":
-			if e, ok := entries[row.SubagentTaskID]; ok && !e.finished {
-				e.ToolCalls++
-				e.LastTool = row.Tool
-			}
-		case row.Kind == "subagent_turn":
-			if e, ok := entries[row.TaskID]; ok && !e.finished {
-				if t := strings.TrimSpace(row.Text); t != "" {
-					e.LastText = t
-				}
-			}
-		}
+	// 满额整体清零（与 written 的封顶哲学同款，复核 2026-11-10 ④ CONFIRMED
+	// P2）：游标 map 无 prune 反查键（文件名是净化变换不可逆），长寿命进程
+	// 否则单调增长。游标丢了只是下次整份重扫，正确性无损，换内存有界。
+	if j.unfinishedScan[sessionID] == nil && len(j.unfinishedScan) >= agentCoreUnfinishedScanCap {
+		j.unfinishedScan = make(map[string]*unfinishedScanState)
 	}
-	out := make([]agentCoreSubagentInterrupted, 0, len(order))
-	for _, id := range order {
-		if e := entries[id]; !e.finished {
+	state := j.unfinishedScan[sessionID]
+	size := int64(0)
+	if info, err := f.Stat(); err == nil {
+		size = info.Size()
+	}
+	firstLine := agentCoreJournalFirstLine(f)
+	// 复用粗校验：文件变短（截断）/首行漂移（重写换头）/游标落在行中（前缀
+	// 字节级漂移）任一命中 → 游标不可信，整份重扫。
+	resume := state != nil && size >= state.offset && firstLine == state.firstLine &&
+		agentCoreJournalBoundaryIsLineStart(f, state.offset)
+	if !resume {
+		state = &unfinishedScanState{firstLine: firstLine, entries: make(map[string]*unfinishedScanEntry)}
+	}
+	// 首行读取会把 fd 顶过预读窗口，扫描前必须显式定位：fresh 从 0 起，
+	// resume 从游标起。
+	if _, err := f.Seek(state.offset, io.SeekStart); err != nil {
+		delete(j.unfinishedScan, sessionID)
+		return nil
+	}
+	// 增量扫描：从游标续读完整行；无换行残尾留在磁盘，游标不越过它——下轮
+	// 从同一偏移重读（若期间有后续写入紧贴残尾，拼出的坏行按半行容忍跳过）。
+	// 锁内成本从 O(整文件) 降为 O(新增行)。
+	br := bufio.NewReader(f)
+	for {
+		chunk, rerr := br.ReadBytes('\n')
+		if rerr != nil {
+			break // EOF（残尾留磁盘下轮重读）或读错：保留已得，尽力而为
+		}
+		state.offset += int64(len(chunk))
+		state.scanLine(chunk[:len(chunk)-1])
+	}
+	j.unfinishedScan[sessionID] = state
+
+	out := make([]agentCoreSubagentInterrupted, 0, len(state.order))
+	for _, id := range state.order {
+		if e := state.entries[id]; !e.finished {
 			out = append(out, e.agentCoreSubagentInterrupted)
 		}
 	}
@@ -772,6 +847,56 @@ func (j *agentCoreJournal) unfinishedSubagents(sessionID string) []agentCoreSuba
 		return nil
 	}
 	return out
+}
+
+// agentCoreJournalFirstLine 读文件首行（不含换行）。读失败返回空串。
+func agentCoreJournalFirstLine(f *os.File) string {
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return ""
+	}
+	first, _ := bufio.NewReader(f).ReadString('\n')
+	return strings.TrimRight(first, "\n")
+}
+
+// agentCoreJournalBoundaryIsLineStart 校验 offset 处必须是行首（前一字节为
+// 换行；offset==0 恒真）。防截断/搬迁把游标顶进某行的中间。
+func agentCoreJournalBoundaryIsLineStart(f *os.File, offset int64) bool {
+	if offset == 0 {
+		return true
+	}
+	var b [1]byte
+	if _, err := f.ReadAt(b[:], offset-1); err != nil || b[0] != '\n' {
+		return false
+	}
+	return true
+}
+
+// healInterruptedSubagents 装配期对账补记（复核 2026-11-10 ⑤ CONFIRMED P2）：
+// 进程硬崩溃时桥 defer 不跑（本回合 end 行与子 agent finish 行都不落），
+// journal 留下 start 无 finish 僵尸行——读侧 interrupted 降级收紧后（只认
+// start 之后的 end 行）这类僵尸不再被降级，面板永卡「运行中」。同会话 run
+// 串行：装配新 run 的时刻 journal 内全部 start 无 finish 的子 agent 必属
+// 已死回合（与 unfinishedSubagents 的「死」口径同源），此时逐个补落
+// interrupted finish 行，读侧从此闭合。幂等：补过的 task_id 下次对账
+// 不再出现在 unfinished 列表。调用方必须先取 unfinishedSubagents 的结果
+// （先算后补，顺序反了列表恒空）。锁纪律：本方法自取 j.mu，调用方不得持锁。
+func (j *agentCoreJournal) healInterruptedSubagents(sessionID string, unfinished []agentCoreSubagentInterrupted) {
+	if j == nil || j.dir == "" || strings.TrimSpace(sessionID) == "" || len(unfinished) == 0 {
+		return
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	for _, e := range unfinished {
+		j.appendLineLocked(sessionID, map[string]interface{}{
+			"kind":    "subagent",
+			"event":   "finish",
+			"task_id": e.TaskID,
+			"status":  "interrupted",
+			"summary": "上次运行中断，自动补记终态",
+			"result":  "",
+			"ts":      time.Now().UTC().Format(time.RFC3339),
+		})
+	}
 }
 
 // appendSubagentTool 落子 agent 的工具轨迹行：与主会话工具行同 kind=tool，
@@ -1051,6 +1176,8 @@ func (j *agentCoreJournal) truncateBefore(sessionID, beforeMessageID string) (bo
 		_ = os.Remove(tmp)
 		return false, err
 	}
+	// 整文件重写 → 装配期增量游标失效（unfinishedSubagents 下次整份重扫）。
+	delete(j.unfinishedScan, sessionID)
 	logger.Info(fmt.Sprintf("agentcore-journal: truncated session=%s before=%s kept=%d/%d lines", sessionID, beforeMessageID, kept, len(lines)-start))
 	return true, nil
 }

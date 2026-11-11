@@ -371,12 +371,14 @@ export default {
   // (i18n.test.js key-set guard).
   chat_subagentEntry: 'Subagents',
   chat_subagentEntryRunning: '{n} running',
+  chat_subagentEntryQueued: '{n} queued',
   chat_subagentEntryDone: '{n} done',
   chat_subagentEntryView: 'View details',
   // Subagent panel + detail (Task 8, spec 2026-11-07-subagent-panel §3).
   chat_subagentPanelClose: 'Close',
   chat_subagentPanelBack: 'Back to list',
   chat_subagentStatusRunning: 'Running',
+  chat_subagentStatusQueued: 'Queued',
   chat_subagentStatusCompleted: 'Completed',
   chat_subagentStatusFailed: 'Failed',
   chat_subagentStatusInterrupted: 'Interrupted',

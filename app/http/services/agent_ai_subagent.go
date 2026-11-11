@@ -147,6 +147,74 @@ func (r *agentAISubagentRegistry) start(taskID, toolUseID, messageID, descriptio
 	return record, true
 }
 
+// startQueued 登记 queued 记录（agentcore 侧并发闸排队态，审计 2026-11-10 ③）：
+// 排队期面板可见、句柄可停。Status=queued——不算 active()（排队≠运行，watchdog
+// stale 判死/finalize 活跃计数不受它污染；finalize 另有兜底扫 queued）。
+func (r *agentAISubagentRegistry) startQueued(taskID, toolUseID, messageID, description, subagentType string, spawnDepth int, taskType string, background bool, now time.Time) (agentAISubagent, bool) {
+	record, ok := r.start(taskID, toolUseID, messageID, description, subagentType, spawnDepth, taskType, background, now)
+	if !ok {
+		return record, false
+	}
+	// start 与本翻转之间无并发读者（同一宿主 goroutine 同步序列）。
+	if now.IsZero() {
+		now = time.Now()
+	}
+	r.mu.Lock()
+	record.Status = "queued"
+	r.byToolUseID[record.ToolUseID] = record
+	r.mu.Unlock()
+	return record, true
+}
+
+// beginQueued 把 queued 记录翻成 started（拿到并发槽的时刻）。StartedAt 从
+// 真正起跑起算——DurationMs 度量纯执行时长，不含排队等待。
+func (r *agentAISubagentRegistry) beginQueued(toolUseID string, now time.Time) (agentAISubagent, bool) {
+	if r == nil {
+		return agentAISubagent{}, false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	record, ok := r.byToolUseID[toolUseID]
+	if !ok || record.Status != "queued" {
+		return record, false
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	record.Status = "started"
+	record.StartedAt = now
+	record.LastProgressAt = now
+	r.byToolUseID[toolUseID] = record
+	if r.activeCountLocked() == 1 {
+		r.activeSince = now
+	}
+	return record, true
+}
+
+// abandonQueued 把 queued 记录直接翻终态 interrupted（排队等待被打断）。
+// finish() 只认 active 记录——排队态走不到那条路径（phase != Status 即拒）。
+func (r *agentAISubagentRegistry) abandonQueued(toolUseID, summary string, now time.Time) (agentAISubagent, bool) {
+	if r == nil {
+		return agentAISubagent{}, false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	record, ok := r.byToolUseID[toolUseID]
+	if !ok || record.Status != "queued" {
+		return record, false
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	record.Status = "interrupted"
+	record.EndedAt = now
+	if summary != "" {
+		record.Summary = truncateForCloud(summary)
+	}
+	r.byToolUseID[toolUseID] = record
+	return record, true
+}
+
 // startLegacy 兜底登记老版本 CC 的 Agent tool_use（无 task_* 帧）：task_id 用
 // tool_use_id 顶替、打 Legacy 标记。不发射事件——真帧可能紧随其后（实测顺序
 // assistant→task_started），此刻发射必然与真 started 撞出两行。终态在无父标记
@@ -261,7 +329,13 @@ func (r *agentAISubagentRegistry) finalize(now time.Time) []agentAISubagent {
 	var out []agentAISubagent
 	for _, id := range r.order {
 		record, ok := r.byToolUseID[id]
-		if !ok || !record.active() {
+		if !ok {
+			continue
+		}
+		// 兜底扫 queued（审计 2026-11-10 ③）：正常路径排队态由桥自己收尾
+		// （acquireRunQueued 出错即 abandonQueued）；这里防「排队记录漏收尾」
+		// 的旁路（宿主强杀 goroutine 类），漏了会永卡 queued。
+		if !record.active() && record.Status != "queued" {
 			continue
 		}
 		record.Status = "interrupted"

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -606,6 +607,151 @@ func TestAgentCoreSubagentBridgeRetryProgress(t *testing.T) {
 	if !finished {
 		t.Fatalf("终态帧缺失")
 	}
+}
+
+func TestAgentCoreSubagentBridgeQueuedVisibleAndStoppable(t *testing.T) {
+	// 审计修复（2026-11-10 ③）：并发闸排队态可见化——排队中的子 agent 发
+	// queued 帧（面板可见）、句柄排队期可 stop（等待被掐断立即返回取消）。
+	// vm129 实测排队 2m31s 零帧不可停=「卡死感」第三层静默。另守两条配套
+	// 不变量：排队期不落 journal subagent 行（无 start=无孤儿 finish）、
+	// StartedAt 从真正起跑起算（beginQueued 重置）。
+	blockDone := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-blockDone:
+		}
+	}))
+	defer func() { close(blockDone); srv.Close() }()
+	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
+
+	var mu sync.Mutex
+	var frames []map[string]interface{}
+	queuedCh := make(chan string, 4)
+	startedCh := make(chan string, 4)
+	m := &agentCoreSubagentMirror{
+		registry:  newAgentAISubagentRegistry(),
+		activity:  &agentAIActivity{},
+		sessionID: "s-queued",
+		messageID: "m-queued",
+		journal:   newAgentCoreJournal(t.TempDir()),
+		emit: func(b []byte) error {
+			var payload map[string]interface{}
+			if err := json.Unmarshal(b, &payload); err != nil {
+				return err
+			}
+			mu.Lock()
+			frames = append(frames, payload)
+			mu.Unlock()
+			id, _ := payload["task_id"].(string)
+			switch payload["phase"] {
+			case "queued":
+				select {
+				case queuedCh <- id:
+				default:
+				}
+			case "started":
+				select {
+				case startedCh <- id:
+				default:
+				}
+			}
+			return nil
+		},
+	}
+	control := newAgentCoreSubagentControlWithLimit(1)
+	bridge := &agentCoreSubagentBridge{
+		client:      agentcore.NewClient(agentCoreBaseURL()),
+		mainModel:   "glm-5.2",
+		name:        "researcher",
+		description: "调研",
+		body:        "你是调研员。",
+		projectPath: t.TempDir(),
+		mirror:      m,
+		control:     control,
+	}
+	waitFor := func(cond func() bool) {
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if cond() {
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		t.Fatalf("条件 2s 内未满足")
+	}
+
+	// #1 占住唯一的并发槽（上游阻塞不返回）。
+	res1 := make(chan agentcore.ToolResult, 1)
+	go func() { res1 <- bridge.Execute(context.Background(), map[string]interface{}{"task": "占槽"}, nil) }()
+	var id1 string
+	select {
+	case id1 = <-startedCh:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("占槽者未起跑（queued→started 转换未发生）")
+	}
+	waitFor(func() bool { return len(control.active()) == 1 })
+
+	// #2 排队：queued 帧先出（面板可见），句柄登记后排队期可停。
+	// 注意 queuedCh 里还压着 #1 起跑前自己的 queued 帧（queue 无条件先发），
+	// 必须跳过它取 #2 的帧。
+	res2 := make(chan agentcore.ToolResult, 1)
+	go func() { res2 <- bridge.Execute(context.Background(), map[string]interface{}{"task": "排队者"}, nil) }()
+	var id2 string
+readQueued:
+	for {
+		select {
+		case qid := <-queuedCh:
+			if qid != id1 {
+				id2 = qid
+				break readQueued
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("排队者未发 queued 帧")
+		}
+	}
+	waitFor(func() bool { return len(control.active()) == 2 })
+	if n := control.stop(id2); n != 1 {
+		t.Fatalf("排队期 stop 应命中 1 个句柄, got %d", n)
+	}
+	select {
+	case r := <-res2:
+		if !r.IsError || !strings.Contains(r.Content, "并发排队中被终止") {
+			t.Fatalf("排队被停应返回取消结果: %+v", r)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("排队被停后 Execute 未返回")
+	}
+
+	// 帧序列（#2）：恰好 [queued, interrupted]——无 started（从未起跑）。
+	mu.Lock()
+	task2 := make([]string, 0, 2)
+	for _, p := range frames {
+		if p["task_id"] == id2 {
+			task2 = append(task2, fmt.Sprint(p["phase"]))
+		}
+	}
+	mu.Unlock()
+	if len(task2) != 2 || task2[0] != "queued" || task2[1] != "interrupted" {
+		t.Fatalf("排队者帧序列 = %v, want [queued interrupted]", task2)
+	}
+	// journal：排队者不落任何 subagent 行。
+	for _, line := range readJournalLines(t, m.journal.dir, "s-queued") {
+		if line["kind"] == "subagent" {
+			if id, _ := line["task_id"].(string); id == id2 {
+				t.Fatalf("排队者不得落 journal subagent 行: %v", line)
+			}
+		}
+	}
+
+	// 收尾：停掉占槽者，#1 收敛（interrupted 路径）。
+	control.stop("")
+	select {
+	case <-res1:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("停止全部后占槽者未收敛")
+	}
+	_ = id1
 }
 
 // TestAgentCoreSubagentParallelContract（vm129 审计 2026-11-10）：模型可见契约

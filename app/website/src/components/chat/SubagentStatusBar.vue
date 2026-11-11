@@ -19,6 +19,9 @@
     <span v-if="runningCount > 0" class="shrink-0 text-primary">
       {{ t('chat_subagentEntryRunning', { n: runningCount }) }}
     </span>
+    <span v-if="queuedCount > 0" class="shrink-0 text-sky-500">
+      {{ t('chat_subagentEntryQueued', { n: queuedCount }) }}
+    </span>
     <span v-if="doneCount > 0" class="shrink-0 text-slate-400 dark:text-slate-500">
       {{ t('chat_subagentEntryDone', { n: doneCount }) }}
     </span>
@@ -44,20 +47,25 @@ const props = defineProps({
 const emit = defineEmits(['open']);
 const { t } = useI18n();
 
-// 运行中数：started/progress；完成数：completed/failed/interrupted。
+// 运行中数：started/progress；排队数：queued（2026-11-10 ③ 排队可见化——
+// 帧态相位，不算 running 不参与 pulse，但入口条必须有计数，否则「2 运行 +
+// 1 排队」与只派两个不可区分）；完成数：completed/failed/interrupted。
 // 未知 phase 两侧都不计（reducer 未知帧原样返回，这里同口径容错）。
 const RUNNING_PHASES = ['started', 'progress'];
+const QUEUED_PHASES = ['queued'];
 const DONE_PHASES = ['completed', 'failed', 'interrupted'];
 const countByPhases = (phases) => (props.subagents || []).filter(
   s => s && phases.includes(s.phase)
 ).length;
 
 const runningCount = computed(() => countByPhases(RUNNING_PHASES));
+const queuedCount = computed(() => countByPhases(QUEUED_PHASES));
 const doneCount = computed(() => countByPhases(DONE_PHASES));
 
 const entryAriaLabel = computed(() => {
   const parts = [t('chat_subagentEntry')];
   if (runningCount.value > 0) parts.push(t('chat_subagentEntryRunning', { n: runningCount.value }));
+  if (queuedCount.value > 0) parts.push(t('chat_subagentEntryQueued', { n: queuedCount.value }));
   if (doneCount.value > 0) parts.push(t('chat_subagentEntryDone', { n: doneCount.value }));
   return parts.join('，');
 });

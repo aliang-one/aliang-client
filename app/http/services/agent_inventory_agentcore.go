@@ -131,12 +131,17 @@ func readAgentCoreSessionMetaWithOptions(path string, options agentVibeSessionRe
 	// （写侧已保证）。
 	subagentEntries := make(map[string]*models.AgentVibeSubagent)
 	subagentOrder := make([]string, 0, 4)
-	// sawEnd：会话是否出现过 run 终态行（success/stopped/error）。出现即代表
-	// 主回合已收束——此刻仍未 finish 的子 agent 已被确证死亡（进程崩溃/断电
-	// 留下的 start 无 finish 僵尸行），组装时降级 interrupted（审计 2026-11-09）。
-	// 无 end 行的文件（进行中/写入中断）不降级，避免误杀活着的子 run。
-	sawSubagentEnd := false
+	// 行号账本（审计 2026-11-10 收紧）：文件行序=时间序。lineIdx 当前行号；
+	// lastEndLine 最近一条 end 行（-1=未见）；subagentStartLine 各子 agent
+	// start 行的行号。interrupted 降级的判定从「文件里出现过 end」收紧为
+	// 「end 行号 > 该子 agent start 行号」——旧实现是文件级 sawEnd，会话里
+	// 任何历史回合的 end 行都会把正在跑的子 agent 误降级成 interrupted，
+	// 面板假「已中断」且前端钉死终态（2026-11-09 版的误判面）。
+	lineIdx := -1
+	lastEndLine := -1
+	subagentStartLine := make(map[string]int)
 	forEachAgentSessionJSONLLine(path, maxLineBytes, func(line []byte) bool {
+		lineIdx++
 		var row struct {
 			Kind           string                       `json:"kind"`
 			SessionID      string                       `json:"session_id"`
@@ -336,6 +341,9 @@ func readAgentCoreSessionMetaWithOptions(path string, options agentVibeSessionRe
 				entry.Name = row.Name
 				entry.Description = row.Description
 				entry.StartedAt = normalizeAgentTime(row.Ts)
+				// 记 start 行号（重启形态覆盖旧值）：降级判定只看本行之后
+				// 的 end。
+				subagentStartLine[taskID] = lineIdx
 			case "finish":
 				entry, ok := subagentEntries[taskID]
 				if !ok {
@@ -358,7 +366,7 @@ func readAgentCoreSessionMetaWithOptions(path string, options agentVibeSessionRe
 		case "end":
 			// 终态行：失败真因 + 诊断块。诊断面板据此在重开旧会话时还原「这一轮
 			// 为什么死」。行按序追加，多次 run 时最后一次 end 胜出。
-			sawSubagentEnd = true
+			lastEndLine = lineIdx
 			// 注意不写 session.Status：那是列表视图的既有契约（默认 "closed"，手
 			// 机按它映射），单次 run 的终态语义收进 Diagnostics.Status，两套口径
 			// 不互相污染。
@@ -418,14 +426,18 @@ func readAgentCoreSessionMetaWithOptions(path string, options agentVibeSessionRe
 	if len(subagentOrder) > 0 {
 		// 按 order 切片（行序=时间序）输出；缺 finish 的 entry 保持 started。
 		// 列表/同步出口由 summarizeAgentVibeSessions 剥离（详情契约≠清单契约）。
-		// 会话已收束（有 end 行）而子 agent 仍 started = 进程崩溃/断电僵尸
-		// （正常取消由桥 defer 写 interrupted，进程级死亡则什么终态行都没有）
-		// ——降级 interrupted，防面板永久「运行中」卡（审计 2026-11-09）。
-		if sawSubagentEnd {
-			for _, entry := range subagentEntries {
-				if entry.Status == "started" {
-					entry.Status = "interrupted"
-				}
+		// 会话已收束而子 agent 仍 started = 进程崩溃/断电僵尸（正常取消由桥
+		// defer 写 interrupted，进程级死亡则什么终态行都没有）——降级
+		// interrupted，防面板永久「运行中」卡（审计 2026-11-09）。
+		// 判定收紧（审计 2026-11-10）：只认该子 agent start 行之后的 end 行。
+		// start 前的老回合 end 行是历史事实，与在跑子 run 无关——不降级。
+		for taskID, entry := range subagentEntries {
+			if entry.Status != "started" {
+				continue
+			}
+			start, ok := subagentStartLine[taskID]
+			if ok && lastEndLine > start {
+				entry.Status = "interrupted"
 			}
 		}
 		subagents := make([]models.AgentVibeSubagent, 0, len(subagentOrder))
