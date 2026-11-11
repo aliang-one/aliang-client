@@ -926,7 +926,8 @@ func MeshFallbackActiveForClass(cfg *Config, class string) (addr string, ok bool
 // MeshEffectivelyEnabled mesh 出口的生效开关 = 用户开关 ∧ SSH 入口可用
 // (SPEC §10.3)。依赖降级:SSH 入口未启用时 mesh 无出口载体,恒 false——
 // 存量配置(mesh 开、ssh 未配)升级后 mesh 静默降级为关,而不是启动失败。
-// 保存期由 ValidateMeshDependency 硬拒,两条路径不重复报错。
+// 保存期硬拒由 ValidateMeshDependency 承担(customer 配置提交路径);本方法
+// 只做启动/运行期降级判定,两者不重复报错。
 func (c *Config) MeshEffectivelyEnabled() bool {
 	if c == nil || c.Customer == nil {
 		return false
@@ -1048,8 +1049,9 @@ func (c *Config) ValidateMesh(selfDeviceID string) error {
 const SSHIngressDefaultPort uint16 = 56442
 
 // SSHIngressConfig 控制 SSH 入口服务面(customer.ssh_ingress)。
-// 双密钥准入:authorized_keys=人用凭证(裸流形态);mesh_authorized_keys=
-// 节点互连凭证(mesh 帧形态)。禁密码。端口默认 56442。
+// 双密钥准入:authorized_keys=人用凭证(裸流 direct-tcpip 形态);
+// mesh_authorized_keys=节点互连凭证(mesh-exit channel(ExtraData)形态)。
+// 禁密码。端口默认 56442。
 type SSHIngressConfig struct {
 	Enable             *bool    `json:"enable,omitempty"` // 三态:nil=false
 	Port               uint16   `json:"port,omitempty"`
@@ -1070,7 +1072,7 @@ func (c *SSHIngressConfig) IsEnabled() bool {
 // 两列表合计非空(至少一把准入钥匙,否则开了门谁也进不来);逐条按
 // authorized_keys 行格式(gossh.ParseAuthorizedKey,[host:port] 证书主体
 // 前缀等合法变体由其原生容忍)校验;同一公钥(TrimSpace 后逐字节同)跨
-// 两列表=形态歧义(裸流 vs mesh 帧),保存时拦——运行期 mesh 优先只是
+// 两列表=形态歧义(裸流 direct-tcpip vs mesh-exit 形态),保存时拦——运行期 mesh 优先只是
 // 第二道防御(inbound/ssh),配置层先拒绝歧义本身。
 // port:uint16 类型上界即 65535,越界值(如 70000)在 JSON 反序列化层即被拒;
 // 0=未配,由 EffectiveSSHIngress 归一为默认 56442,因此这里没有端口分支。

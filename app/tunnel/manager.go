@@ -421,6 +421,7 @@ func runTunnel(ctx context.Context, config runConfig, ready func()) error {
 				go func(c net.Conn) {
 					c = sshin.WithRemoteLabel(c, "piko-"+endpoint) // 无冒号(SPEC §8.2)
 					if !sshin.HandleIngressConn(c) {
+						// false = 入口未配置,SPEC §8.1 WARN 记账。
 						log.Printf("[MESH-RELAY] ingress not running, dropped conn %s", c.RemoteAddr())
 					}
 				}(conn)

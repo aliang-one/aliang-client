@@ -215,7 +215,9 @@ func normalizeLoadedConfigAIRules(cfg *Config) {
 // 2. Register built-in proxies (direct + aliang) - always available
 // 3. Set the active default proxy for routing
 func ApplyConfig(cfg *Config) error {
-	// Validate configuration
+	// Validate configuration。分工(SPEC §10.3):此处 cfg.Validate 只做形态
+	// 校验,不含 mesh↔SSH 依赖门——保存期硬拒由 ValidateMeshDependency 承担
+	// (customer 配置提交路径);启动期降级走 MeshEffectivelyEnabled,绝不阻断 boot。
 	if err := cfg.Validate(); err != nil {
 		return fmt.Errorf("configuration validation failed: %w", err)
 	}

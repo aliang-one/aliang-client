@@ -120,6 +120,13 @@ func (s *CustomerConfigService) UpdateCommittedCustomerConfig(payload []byte) (*
 		return nil, &CustomerConfigValidationError{err: err}
 	}
 
+	// mesh↔SSH 入口依赖保存期硬拒(SPEC §10.3):开 mesh 必须开 SSH 入口,
+	// 与既有 ValidateMesh 同款包装。启动期不调本函数——降级走
+	// MeshEffectivelyEnabled 不阻断 boot。
+	if err := nextCfg.ValidateMeshDependency(); err != nil {
+		return nil, &CustomerConfigValidationError{err: err}
+	}
+
 	nextCfgRaw, err := json.Marshal(nextCfg)
 	if err != nil {
 		return nil, fmt.Errorf("marshal validated config: %w", err)
