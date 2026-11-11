@@ -880,9 +880,10 @@ func (c *MeshConfig) EffectiveMaxHops() int {
 
 // MeshFallbackActiveForClass 离线兜底门控的统一判定(计划 Task 12 评审钉死
 // 的三消费方共享助手),四条件缺一不可:
-//  1. mesh 总开关 EffectiveEnabled(显式 false 时所有兜底消费方一律关——
-//     总开关契约穿透;抽取前 processor/tcp meshFallbackAddrForClass 缺此
-//     检查,即评审抓到的 tcp 侧缺口);
+//  1. mesh 总开关检查 = MeshEffectivelyEnabled(含 SSH 入口依赖降级)
+//     (显式 false 时所有兜底消费方一律关——总开关契约穿透;抽取前
+//     processor/tcp meshFallbackAddrForClass 缺此检查,即评审抓到的
+//     tcp 侧缺口);
 //  2. customer.mesh.fallback 使能(Enable 显式 true);
 //  3. class ∈ Fallback.Classes(空 Classes = 未勾选任何类别);
 //  4. Addr 非空(TrimSpace 规整后判定)。
@@ -899,7 +900,7 @@ func MeshFallbackActiveForClass(cfg *Config, class string) (addr string, ok bool
 		return "", false
 	}
 	mesh := cfg.Customer.Mesh
-	if !mesh.EffectiveEnabled() {
+	if !cfg.MeshEffectivelyEnabled() {
 		return "", false
 	}
 	fb := mesh.Fallback
@@ -916,6 +917,41 @@ func MeshFallbackActiveForClass(cfg *Config, class string) (addr string, ok bool
 		}
 	}
 	return "", false
+}
+
+// MeshEffectivelyEnabled mesh 出口的生效开关 = 用户开关 ∧ SSH 入口可用。
+// 依赖降级:SSH 入口未启用时 mesh 无出口载体,恒 false——存量配置
+// (mesh 开、ssh 未配)升级后 mesh 静默降级为关,而不是启动失败。
+// 保存期由 ValidateMeshDependency 硬拒,两条路径不重复报错。
+func (c *Config) MeshEffectivelyEnabled() bool {
+	if c == nil || c.Customer == nil {
+		return false
+	}
+	if !c.Customer.Mesh.EffectiveEnabled() {
+		return false
+	}
+	return c.Customer.SSHIngress.IsEnabled()
+}
+
+// ValidateMeshDependency 保存期依赖硬拒:开 mesh 必须开 SSH 入口。启动期
+// 不调用本函数(Config.Validate 也不调)——启动降级走 MeshEffectivelyEnabled,
+// 绝不阻断 boot。
+func (c *Config) ValidateMeshDependency() error {
+	if c == nil || c.Customer == nil || c.Customer.Mesh == nil {
+		return nil
+	}
+	if c.Customer.Mesh.EffectiveEnabled() && !c.Customer.SSHIngress.IsEnabled() {
+		return fmt.Errorf("组网依赖 SSH 入口(ssh_ingress.enable):开启 customer.mesh.enable 前必须先开启 SSH 入口")
+	}
+	return nil
+}
+
+// MeshFallbackHostKey 返回兜底节点的 SSH host key 钉扎(未配置=空串=fail-closed)。
+func MeshFallbackHostKey(cfg *Config) string {
+	if cfg == nil || cfg.Customer == nil || cfg.Customer.Mesh == nil || cfg.Customer.Mesh.Fallback == nil {
+		return ""
+	}
+	return strings.TrimSpace(cfg.Customer.Mesh.Fallback.HostKey)
 }
 
 // Validate 保存通道(Config.Validate)调用:peers/兜底/跳数的形态校验。

@@ -848,6 +848,9 @@ func TestMeshFallbackAddrForClassRespectsMasterSwitch(t *testing.T) {
 					Classes: []string{meshproto.ClassAI},
 				},
 			},
+			// SSH 入口显式开:判据切到 MeshEffectivelyEnabled 后,不补则本
+			// 用例被依赖降级误吞而非测到总开关穿透。
+			SSHIngress: &config.SSHIngressConfig{Enable: boolPtr(true)},
 		},
 	})
 	// 56432 回环 → 推断 ai 且被勾选;唯总开关关。

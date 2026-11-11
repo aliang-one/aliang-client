@@ -142,7 +142,9 @@ func setOfflineSignalForTest(t *testing.T, offline func() bool) {
 	t.Cleanup(func() { SetOfflineSignal(nil) })
 }
 
-// fallbackSelfConfig 构造兜底使能且含 self 的最小配置。
+// fallbackSelfConfig 构造兜底使能且含 self 的最小配置。SSH 入口显式开:
+// 判据切到 config.MeshEffectivelyEnabled 后,ssh_ingress 未置位会让兜底门
+// 被依赖降级误关(非各用例要钉的条件)。
 func fallbackSelfConfig() *config.Config {
 	return &config.Config{Customer: &config.CustomerConfig{
 		Mesh: &config.MeshConfig{Fallback: &config.MeshFallbackConfig{
@@ -150,6 +152,7 @@ func fallbackSelfConfig() *config.Config {
 			Classes: []string{meshproto.ClassSelf},
 			Addr:    "192.168.1.9:56440",
 		}},
+		SSHIngress: &config.SSHIngressConfig{Enable: boolPtr(true)},
 	}}
 }
 
@@ -332,6 +335,9 @@ func TestPlatformClientFallbackNotConfiguredIgnoresMesh(t *testing.T) {
 	fr := startFakeRelay(t)
 	setGlobalConfigForTest(t, &config.Config{Customer: &config.CustomerConfig{
 		Mesh: &config.MeshConfig{}, // mesh 层存在但 Fallback 未配置
+		// SSH 入口显式开:让「Fallback 未配置」成为唯一关闸条件(判据含
+		// SSH 入口依赖后,不补则本用例被依赖降级误吞)。
+		SSHIngress: &config.SSHIngressConfig{Enable: boolPtr(true)},
 	}})
 	setPeerSourceForTest(t, func() *mesh.Peer {
 		return mesh.NewPeer(mesh.PeerTarget{
@@ -427,8 +433,11 @@ func TestPlatformClientOnlineSignalBlocksMesh(t *testing.T) {
 
 // TestPlatformClientGateVariantsBlockMesh 兜底门控变体:Enable=false /
 // Classes 不含 self / mesh 总开关显式 false——任一不满足即纯 direct。
+// 各变体 SSH 入口显式开(判据含 SSH 入口依赖):让被测变体成为唯一关闸
+// 条件,不补则三个用例都被依赖降级误吞。
 func TestPlatformClientGateVariantsBlockMesh(t *testing.T) {
 	online := func() bool { return true }
+	sshIn := func() *config.SSHIngressConfig { return &config.SSHIngressConfig{Enable: boolPtr(true)} }
 	t.Run("兜底Enable=false", func(t *testing.T) {
 		assertGoesDirect(t, &config.Config{Customer: &config.CustomerConfig{
 			Mesh: &config.MeshConfig{Fallback: &config.MeshFallbackConfig{
@@ -436,6 +445,7 @@ func TestPlatformClientGateVariantsBlockMesh(t *testing.T) {
 				Classes: []string{meshproto.ClassSelf},
 				Addr:    "192.168.1.9:56440",
 			}},
+			SSHIngress: sshIn(),
 		}}, online)
 	})
 	t.Run("Classes不含self", func(t *testing.T) {
@@ -445,6 +455,7 @@ func TestPlatformClientGateVariantsBlockMesh(t *testing.T) {
 				Classes: []string{meshproto.ClassAI, meshproto.ClassCustom},
 				Addr:    "192.168.1.9:56440",
 			}},
+			SSHIngress: sshIn(),
 		}}, online)
 	})
 	t.Run("mesh总开关显式false", func(t *testing.T) {
@@ -453,6 +464,7 @@ func TestPlatformClientGateVariantsBlockMesh(t *testing.T) {
 				Enable:   boolPtr(false),
 				Fallback: fallbackSelfConfig().Customer.Mesh.Fallback,
 			},
+			SSHIngress: sshIn(),
 		}}, online)
 	})
 }
