@@ -42,4 +42,16 @@
 **Priority:** P3
 **Depends on:** 无
 
+### agentcore 记忆层最终评审遗留账(合并 b75d3cc,均不阻塞)
+
+**What:** 记忆层终审(READY)遗留 6 条:①记忆双注册=双写者,core 手动编辑与 runtime 异步提取/touch 并发直写同一 JSON、store 无跨进程锁——丢更新窗口按 LWW 有意取舍,收敛路径=core 侧补 proxy 面(沿 registry proxyIfNeeded 先例,`agent_memory_handler.go` 头注释已记);②registry 卡 `AgentMCPRegistrySettings.vue:468-470` 的 `isMissingError` 与记忆卡修复前同款「死且反向」掩蔽模式(正则分支吞掉双注册漏注册 404 事故),建议按记忆卡同款「挂 status+收窄」处置;③「跟随默认」无法清回已落盘的显式布尔(deepMergeJSONObjects 跳过 null 且 Merge 只增不减)——卡片 hint 已如实声明,产品上若要支持清除需后端补显式 unset 语义;④slug 大小写敏感,大小写不敏感盘上同项目可能共文件(沿 journal 同族先例);⑤effort 锁存不随 customer 配置切换重探,重启复位(代码注释已记);⑥Task 5 注入预算不计块头尾开销约 65 字符(理论可达 6065,实际不可达)。
+
+**Why:** 终审 READY 后余留,均不影响正确性/安全红线/主流程;①②与多进程写和既有卡片相关,值得后续批次收敛。
+
+**Context:** spec=`docs/superpowers/specs/2026-11-09-agentcore-memory-design.md`;记忆卡修复先例=`AgentMemorySettings.vue` 的 memoryApiRequest 挂 `e.status`+`isMissingError` 收窄形态。
+
+**Effort:** S
+**Priority:** P3
+**Depends on:** 无
+
 ## Completed
