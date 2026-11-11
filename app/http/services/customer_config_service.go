@@ -285,10 +285,11 @@ func ReconcileSSHIngressFromConfig(cfg *config.Config) {
 }
 
 // ReconcileUnifiedIngressBinding 让统一入口 56432 的实际绑定地址跟上配置的
-// 期望地址(spec §6.2 / D2)。期望地址 = config.UnifiedIngressListenAddrFor:
-// mesh 总开关生效 → 0.0.0.0(对端 LAN 可拨入),否则回环。开/关组网会改变
-// 期望地址,而 listener 只在 StartMitmHttp 的绑定瞬间读一次地址——不重绑
-// 就等于开关不生效(开了组网却还只绑回环 = LAN 拨入被拒)。
+// 期望地址(spec §6.2 / D2,判据修订见 SPEC §5.5)。期望地址 =
+// config.UnifiedIngressListenAddrFor:ssh_ingress 开关决定绑定面(SPEC §5.5)
+// ——ssh 开 → 0.0.0.0(入口要 LAN 可达才能被对端拨入),否则回环。开/关
+// ssh_ingress 会改变期望地址,而 listener 只在 StartMitmHttp 的绑定瞬间读
+// 一次地址——不重绑就等于开关不生效(开了入口却还只绑回环 = LAN 拨入被拒)。
 //
 // 与 ReconcileSSHIngressFromConfig 同族、同调用点(customer 配置提交协调
 // 路径 + core/start/tray 启动防漂移),共享「期望态 → 运行态」语义。差别在
@@ -301,8 +302,9 @@ func ReconcileSSHIngressFromConfig(cfg *config.Config) {
 //     run service 的状态机(以及「停代理=停监听」的 D4 契约)。
 //  2. 地址确实不同——相同地址重启是纯抖动(断开在途 accept 面,收益为零)。
 //
-// 刻意的「模式无关」:绑定面只由 mesh 总开关决定(D2),与 HTTP/TUN 入口
-// 模式正交。不按模式加闸,避免「TUN 模式下 56432 恰在跑但绑错」这类漏修。
+// 刻意的「模式无关」:绑定面只由 ssh_ingress 开关决定(SPEC §5.5),与
+// HTTP/TUN 入口模式正交。不按模式加闸,避免「TUN 模式下 56432 恰在跑但
+// 绑错」这类漏修。
 //
 // 失败仅日志不上抛(同 ReconcileSSHIngressFromConfig):提交侧不因入口回滚
 // 整套配置,下次提交或下次起代理自然重试。

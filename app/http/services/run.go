@@ -41,8 +41,8 @@ var (
 	// live proxy serving a dead token.
 	httpProxyIsRunningProbe = httpServer.IsHttpRunning
 	// unifiedIngressListenAddrProbe 读当前实际绑定的统一入口地址(空串=未绑)。
-	// 绑定地址随 mesh 总开关变化(config.UnifiedIngressListenAddr),配置提交
-	// 后须比对并重绑才生效——见 ReconcileUnifiedIngressBinding。Injectable 为
+	// 绑定地址随 ssh_ingress 开关变化(SPEC §5.5;config.UnifiedIngressListenAddr),
+	// 配置提交后须比对并重绑才生效——见 ReconcileUnifiedIngressBinding。Injectable 为
 	// 测试提供无需真起 listener 的比对缝。
 	unifiedIngressListenAddrProbe = httpServer.CurrentListenAddr
 	tunProxyIsRunningProbe        = engine.IsRunning

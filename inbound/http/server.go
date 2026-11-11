@@ -159,9 +159,9 @@ func IsHttpRunning() bool {
 }
 
 // CurrentListenAddr 当前实际绑定的统一入口地址(未运行返回 "")。供配置
-// reconcile 比对「期望地址 ≠ 实际地址 → 重启 listener」——绑定随 mesh 总
-// 开关变化(config.UnifiedIngressListenAddr 现读配置),变化后必须重绑才能
-// 生效(spec §6.2)。以 isHttpRunning 而非指针非空为判据:StopHttpProxy 关
+// reconcile 比对「期望地址 ≠ 实际地址 → 重启 listener」——绑定随 ssh_ingress
+// 开关变化(SPEC §5.5;config.UnifiedIngressListenAddr 现读配置),变化后必须
+// 重绑才能生效(spec §6.2)。以 isHttpRunning 而非指针非空为判据:StopHttpProxy 关
 // listener 但不清指针(close 后的 Addr() 仍返回旧地址),单看指针会把「已
 // 停」误读成「还在旧地址上跑」,从而让 reconcile 漏掉该起的情形。
 func CurrentListenAddr() string {

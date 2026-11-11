@@ -98,7 +98,7 @@ func keyIdentityEqual(a, b [][]byte) bool {
 // Bind host 语义:专用口(Port>0)监听 ServiceBindHost(默认 127.0.0.1,
 // 显式 --host 放宽)——「默认安全」姿态,LAN 开放需显式 --host;跟随统一口
 // (Port=0)时可达面继承 56432 绑定策略(config.UnifiedIngressListenAddr:
-// mesh 开 0.0.0.0,否则 ServiceBindHost)。
+// ssh_ingress 开 0.0.0.0,否则 ServiceBindHost,SPEC §5.5)。
 func Reconcile(rc *RunConfig, hostKeyPath string, localNodeID func() string) {
 	reconcileMu.Lock()
 	defer reconcileMu.Unlock()
