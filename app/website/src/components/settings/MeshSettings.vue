@@ -709,6 +709,14 @@ export default {
       deep: true,
       handler(nextConfig) {
         this.form = this.formFromConfig(nextConfig);
+        // I1(跨回合安全):配置回读到 ssh_ingress 已开即清「一并开启」意图——
+        // 标志只置位不清零的话,「一并开启→保存→经 SSH 卡关掉 ssh→回 mesh 卡」
+        // 后,陈旧标志经 save 守卫（enable!==true）会静默把 ssh_ingress.enable=
+        // true 带进 patch,复活一个已关闭的 LAN 暴露面;且按钮被陈旧标志隐藏
+        // （警告条在而按钮不在的 UI 不一致）。回读即清,两者一并治愈。
+        if (nextConfig?.ssh_ingress?.enable === true) {
+          this.sshIngressEnableIntent = false;
+        }
       }
     },
     // 保存成功后重拉状态两路（幂等 GET）:开关/兜底现值与 LAN 候选随之刷新,

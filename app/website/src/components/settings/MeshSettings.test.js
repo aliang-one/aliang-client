@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { createApp, h } from 'vue';
+import { createApp, h, reactive } from 'vue';
 
 // SettingsPage.vue → i18n 模块求值会连带 loadLocale()（读 localStorage，
 // 测试环境不保证语言确定性）；mock 掉该依赖（SshIngressSettings.test.js 同
@@ -1363,5 +1363,43 @@ describe('MeshSettings 依赖与身份提示（G4）', () => {
     const missing = mountCard({ ...baseConfig() }); // 无 ssh_ingress 段
     await flush();
     expect(missing.el.querySelector('[data-mesh-device-hint]')).toBeNull();
+  });
+
+  // I1 跨回合安全:意图标志只置位不清零的话,「一并开启→保存→用户经 SSH 卡
+  // 关掉 ssh→回 mesh 卡」后,陈旧标志经 save 守卫（enable!==true）会静默把
+  // ssh_ingress.enable=true 带进 patch,复活一个已关闭的 LAN 暴露面;同时
+  // 按钮被陈旧标志隐藏(警告条在而按钮不在的 UI 不一致)。配置回读到 ssh
+  // 已开即清零——可观测面=ssh 再被关掉后按钮恢复 + save 载荷不翻转。
+  it('I1:配置回读 ssh 已开 → 意图清零;ssh 再被关掉后按钮恢复、保存不静默翻转', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    // reactive 包裹:生产中父层 customerConfig 是 data() 深响应代理,config
+    // 深度变更(保存回读/SSH 卡改写)经代理触发卡片 deep watch;普通对象
+    // prop 无代理,watch 不触发(测试基座须与生产同构)。
+    const config = reactive(dependencyConfig());
+    const { el, saved } = mountCard(config);
+    await flush();
+    // 一并开启 → 意图落位(按钮收敛)
+    el.querySelector('[data-mesh-ssh-enable-together]').click();
+    await flush();
+    expect(el.querySelector('[data-mesh-ssh-enable-together]')).toBeNull();
+    // 保存生效后父层回读:ssh_ingress.enable=true(deep watch 同对象触发)
+    config.ssh_ingress.enable = true;
+    await flush();
+    // 用户经 SSH 卡片关掉 ssh → 配置面回 false,回 mesh 卡
+    config.ssh_ingress.enable = false;
+    await flush();
+    // 警告条回归且按钮可见(陈旧标志不得隐藏按钮)——修复前此处按钮缺失
+    expect(el.querySelector('[data-mesh-ssh-dependency]')).not.toBeNull();
+    expect(el.querySelector('[data-mesh-ssh-enable-together]')).not.toBeNull();
+    // 任意 mesh 编辑保存:载荷不静默翻转 ssh_ingress(不复活 LAN 暴露面)
+    setToggle(el, 'meshFallbackEnable', true);
+    setField(el, 'meshFallbackAddr', '192.168.1.20:56441');
+    await flush();
+    clickSave(el);
+    await flush();
+    expect(saved).toHaveLength(1);
+    expect(saved[0].ssh_ingress.enable).toBe(false);
+    // 父层 patch:ssh_ingress 无 diff
+    expect(buildCustomerSavePatch(saved[0], config)?.ssh_ingress).toBeUndefined();
   });
 });
