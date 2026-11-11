@@ -42,8 +42,8 @@ func MeshOfflineSignalForTest() bool { return meshOfflineActive() }
 // MeshOfflineAIRedirectActive AI 离线改道是否激活的跨包查询(探针降级等
 // 消费方入口):与数据面改道判定同源同真假——本函数就是
 // meshOfflineRedirectForAI 的布尔投影视图,不存在第二份判定逻辑。
-// 调用点无连接上下文,metadata 传 nil(nil 注入连接)只影响注入守卫,
-// 不影响离线信号与兜底门控判定。
+// 调用点无连接上下文,metadata 传 nil(nil = 视同非注入,守卫短路)只影响
+// 注入守卫,不影响离线信号与兜底门控判定。
 // app/http/services agentCoreEnsureUpstream 用它在离线激活时跳过上游探针。
 func MeshOfflineAIRedirectActive() bool {
 	_, ok := meshOfflineRedirectForAI(nil)

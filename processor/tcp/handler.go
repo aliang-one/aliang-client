@@ -1405,7 +1405,7 @@ func meshPikoDialFromSource() meshproxy.PikoDialFunc {
 // fallback:<id2> 拨指定节点(限一次,不再链式,防策略链)。
 func (h *TCPConnectionHandler) dialViaMesh(ctx context.Context, metadata *M.Metadata) (net.Conn, error) {
 	if metadata.MeshInjected {
-		return nil, errMeshInjectedLoop
+		return nil, fmt.Errorf("%w (route=%s)", errMeshInjectedLoop, metadata.Route)
 	}
 	deviceID, policy, ok := config.ParseMeshRuleTarget(metadata.Route)
 	if !ok || deviceID == "" {
@@ -1527,7 +1527,7 @@ func meshFallbackAddrForClass(ctx context.Context, md *M.Metadata) (string, bool
 // 失败返回错误,由调用方继续走规则失败策略(兜底也失败才走失败策略)。
 func (h *TCPConnectionHandler) dialMeshFallbackNode(ctx context.Context, metadata *M.Metadata, addr string) (net.Conn, error) {
 	if metadata.MeshInjected {
-		return nil, errMeshInjectedLoop
+		return nil, fmt.Errorf("%w (route=%s)", errMeshInjectedLoop, metadata.Route)
 	}
 	peer := meshproxy.NewPeer(meshproxy.PeerTarget{
 		DeviceID: meshFallbackPseudoDeviceID,

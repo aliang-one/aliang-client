@@ -51,8 +51,9 @@ type Metadata struct {
 	DNSInfo  *DNSInfo   `json:"dnsInfo"`
 	Route    string     `json:"route"` // Final routing decision for this connection
 	// MeshInjected 标记本连接由 mesh-exit 注入(公钥认证的对端转发而来)。
-	// 路由决策全程不写该字段(tls.go 决策只写 Route),故注入标记可存活到
-	// dialViaMesh。json:"-" 不入任何线格式。
+	// 路由决策全程不写该字段(processor/tcp/tls.go 决策只写 Route),故注入
+	// 标记可存活到 dialViaMesh。json:"-" 不入任何线格式——否则 JSON 序列化
+	// 往返会静默丢掉标记、击穿守卫。
 	MeshInjected bool `json:"-"`
 }
 

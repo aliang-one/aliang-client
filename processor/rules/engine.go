@@ -347,8 +347,15 @@ func (e *RuleEngine) StoreBinding(metadata *M.Metadata) {
 		route = cache.RouteToSocks
 	case "RouteDirect":
 		route = cache.RouteDirect
-	// RouteMesh 不在名单里的前提:mesh 注入路径直接赋值 HostName、不走 SetHostName,DNSInfo 恒 nil,根本到不了 StoreBinding。
-	// 若将来给注入连接补 DNSInfo,必须同时加 RouteMesh 分支。
+	// RouteMesh 不在名单里的真正保证是 Route 覆写不变量:每个成功拨号路径都会
+	// 覆写 metadata.Route(dialByRoute 全分支 handler.go:729/742/1449/1474、
+	// dialViaSocksOrDirect 全路径、handleNonTLS:496/499/509),注入连接的初始
+	// RouteMesh 活不到成功中继之后,而 StoreBinding 只在成功中继后调用,
+	// 结论不变:RouteMesh 到不了 StoreBinding。域名目标注入直接赋值 HostName、
+	// 不走 SetHostName,DNSInfo 恒 nil(该前提仅限域名目标);IP 目标注入
+	// (HostName 空、DstIP 已设)经 TLS 协议检测→handleTLS SNI 提取
+	// (setMetadataHostFromObservedSNI→SetHostName)是能拿到 DNSInfo 的。
+	// 若将来改变 Route 覆写不变量,必须同时给注入连接加 RouteMesh 分支。
 	case "RouteToNode", "RouteMeshFallback":
 		// mesh 路由不进域绑定缓存,防 EvaluateRoute 复活时静默绕过 mesh
 		// 规则:连接走了 mesh 出口(processor/tcp dialViaMesh),但域-IP
