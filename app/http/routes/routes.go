@@ -297,6 +297,12 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	register("/api/agent/peer/gates", h.Agent.HandlePeerGates, http.MethodGet, http.MethodPost)
 	register("/api/agent/ai/stream", h.Agent.HandleAIStream, http.MethodGet)
 	register("/api/agent/ai/approval-hook", h.Agent.HandleAIApprovalHook, http.MethodPost)
+	// agent-as-MCP 工具面端点：真身在 user agent runtime，core 侧只做 proxy
+	// 透传（handler 内 proxyIfNeeded 分流）。register 是裸 pattern 透传，方法
+	// 前缀必须写进 path——同 /api/agent/memory 六端点先例（2026-10-21 教训）。
+	register("POST /api/agent/ai/mcp/start", h.Agent.HandleAIMCPStart, http.MethodPost)
+	register("POST /api/agent/ai/mcp/status", h.Agent.HandleAIMCPStatus, http.MethodPost)
+	register("POST /api/agent/ai/mcp/approve", h.Agent.HandleAIMCPApprove, http.MethodPost)
 	// 聊天图片链路（spec 2026-11-05-chat-image-pipeline §3.4）：网页发图上传
 	// 与网页显示取图（loopback+Origin 守卫在 handler 内,transfers D13 同源）。
 	register("/api/agent/ai/attachment/upload", h.Agent.HandleAttachmentUpload, http.MethodPost)
