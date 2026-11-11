@@ -823,23 +823,35 @@ func (c *Config) EffectivePeerMCPCodexEnabled() bool {
 
 // MeshConfig 节点转发网(design docs/mesh-forwarding-network-design.md)。
 type MeshConfig struct {
-	Enable        *bool               `json:"enable,omitempty"`         // mesh 出口总开关(nil=true)
-	ForwardEnable *bool               `json:"forward_enable,omitempty"` // 允许被其他节点转发(design §8,默认关 nil=false)
-	MaxHops       int                 `json:"max_hops,omitempty"`       // 跳数上限,0=默认5,clamp [1,8]
-	Peers         []MeshPeer          `json:"peers,omitempty"`          // 可转发目标节点
-	Fallback      *MeshFallbackConfig `json:"fallback,omitempty"`       // 离线兜底(design §9.4,兜底式)
+	Enable        *bool               `json:"enable,omitempty"`
+	ForwardEnable *bool               `json:"forward_enable,omitempty"`
+	MaxHops       int                 `json:"max_hops,omitempty"` // 一期不消费,仅为二期链长上限占位
+	Peers         []MeshPeer          `json:"peers,omitempty"`
+	Fallback      *MeshFallbackConfig `json:"fallback,omitempty"`
+	// PrivateKey 本节点的 mesh 身份私钥(PEM,OpenSSH 或 PKCS#8)。
+	// 公钥分发到各对端的 ssh_ingress.mesh_authorized_keys(尾注释=本机 device_id)。
+	// 空 = 本节点不能作为转发发起方(仍可作为被转发方)。
+	PrivateKey string `json:"private_key,omitempty"`
+	// KeyPassphrase 私钥口令。Validate 会 TrimSpace:首尾真有空格的 passphrase
+	// 会被静默改掉导致解不开钥(与 proxy.key_passphrase 既有口径一致,接受)。
+	KeyPassphrase string `json:"key_passphrase,omitempty"`
 }
 
 type MeshPeer struct {
 	DeviceID string   `json:"device_id"`
-	LANAddrs []string `json:"lan_addrs,omitempty"` // 候选 LAN 地址 host:port(beacon 动态补充)
-	Relay    *bool    `json:"relay,omitempty"`     // 允许走中继载体(nil=true)
+	LANAddrs []string `json:"lan_addrs,omitempty"`
+	Relay    *bool    `json:"relay,omitempty"`
+	// HostKey 对端 ssh_ingress 的 host key 钉扎(authorized_keys 行或 SHA256: 指纹)。
+	// 空 = 该 peer 不可用(fail-closed,不做 TOFU)。
+	HostKey string `json:"host_key,omitempty"`
 }
 
 type MeshFallbackConfig struct {
 	Enable  *bool    `json:"enable,omitempty"`
-	Classes []string `json:"classes,omitempty"` // self/ai/custom 子集(design §9.4)
-	Addr    string   `json:"addr,omitempty"`    // host:port,enable=true 时必填
+	Classes []string `json:"classes,omitempty"`
+	Addr    string   `json:"addr,omitempty"`
+	// HostKey 兜底节点 SSH host key 钉扎;enable=true 且 addr 非空时必填(fail-closed)。
+	HostKey string `json:"host_key,omitempty"`
 }
 
 // EffectiveEnabled mesh 出口总开关:三态指针语义与 peer_mcp.enable 同族,
@@ -932,6 +944,10 @@ func (c *MeshConfig) Validate() error {
 				return fmt.Errorf("customer.mesh.peers[%d].lan_addrs[%d] invalid %q: must be host:port", i, j, peer.LANAddrs[j])
 			}
 		}
+		peer.HostKey = strings.TrimSpace(peer.HostKey)
+		if peer.HostKey == "" {
+			return fmt.Errorf("customer.mesh.peers[%d].host_key required (peer host key must be pinned, no TOFU)", i)
+		}
 	}
 	if c.Fallback != nil && c.Fallback.Enable != nil && *c.Fallback.Enable {
 		c.Fallback.Addr = strings.TrimSpace(c.Fallback.Addr)
@@ -941,6 +957,10 @@ func (c *MeshConfig) Validate() error {
 		if _, _, err := net.SplitHostPort(c.Fallback.Addr); err != nil {
 			return fmt.Errorf("customer.mesh.fallback.addr invalid %q: must be host:port", c.Fallback.Addr)
 		}
+		c.Fallback.HostKey = strings.TrimSpace(c.Fallback.HostKey)
+		if c.Fallback.HostKey == "" {
+			return fmt.Errorf("customer.mesh.fallback.host_key required when fallback enabled (no TOFU)")
+		}
 		for _, class := range c.Fallback.Classes {
 			switch class {
 			case meshproto.ClassSelf, meshproto.ClassAI, meshproto.ClassCustom:
@@ -948,6 +968,11 @@ func (c *MeshConfig) Validate() error {
 				return fmt.Errorf("customer.mesh.fallback.classes[%q] must be one of [%s %s %s]", class, meshproto.ClassSelf, meshproto.ClassAI, meshproto.ClassCustom)
 			}
 		}
+	}
+	c.PrivateKey = strings.TrimSpace(c.PrivateKey)
+	c.KeyPassphrase = strings.TrimSpace(c.KeyPassphrase)
+	if len(c.Peers) > 0 && c.PrivateKey == "" {
+		return fmt.Errorf("customer.mesh.private_key required when peers configured (node identity key)")
 	}
 	return nil
 }
