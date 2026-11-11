@@ -115,7 +115,9 @@ func (c *ExitClient) DialContext(ctx context.Context, md *M.Metadata) (net.Conn,
 	}
 	if raw == nil {
 		if !admitted {
-			return nil, errNoTransportAdmits
+			// 携带端点与类别上下文(%w 保 errors.Is 契约):消费方日志从此能
+			// 定位「哪个 peer 的哪类流量没有可用载体」,不再是无来源裸句。
+			return nil, fmt.Errorf("mesh: no transport admits %s (class=%s): %w", c.spec.DeviceID, class, errNoTransportAdmits)
 		}
 		if relayErr != nil && lanErr != nil {
 			return nil, fmt.Errorf("mesh: no SSH transport to %s (lan_last_err: %v, relay_last_err: %w)",

@@ -89,16 +89,6 @@ type Manager struct {
 	// every successful validateConfig and cleared by Stop. Dials read it live
 	// (dialMeshEndpoint) so renewals never leave a stale proxy url behind.
 	meshDial meshDialConfig
-	// meshSelfDeviceID is the local device id from the most recent
-	// validateConfig (mu guarded). Unlike status.DeviceID (set by Configure
-	// AFTER validateConfig runs, and reset semantics tied to state reporting),
-	// this is readable at assembly time on the very first configure — read
-	// via currentDeviceID (no production consumer since the ExitClient
-	// switch: identity now travels inside customer.mesh.private_key; kept as
-	// the assembly-time device-id reader for the mesh dispatch seams).
-	// Deliberately NOT cleared by Stop: device id is the permanent device
-	// identity.
-	meshSelfDeviceID string
 }
 
 func NewManager(onStatus func(Status)) *Manager {
@@ -328,7 +318,6 @@ func (m *Manager) validateConfig(config Config) (runConfig, [sha256.Size]byte, e
 		log.Printf("[AGENT-TUNNEL] mesh relay carrier disabled: %v", proxyErr)
 	}
 	m.setMeshDial(proxyURL, config.TunnelToken)
-	m.setMeshSelfDeviceID(config.DeviceID)
 	tcp.SetMeshTransportDialSource(func() meshproxy.PikoDialFunc { return m.dialMeshEndpoint }) // 生产装配(同位接线):egress 兜底 peer 源 + 离线信号两缝
 	// (egress/tcp 同一 manager 状态 getter,同源同真假)——本体见
 	// mesh_assembly.go wireMeshAssemblySeams。

@@ -1,8 +1,8 @@
 // mesh_dispatch.go — 统一口 mesh 帧分派接线(spec §6.5):56432 嗅探为
 // mesh JSON 帧头的连接交给 HandleMeshConn(carrier=lan)。core boot 调用一次;
 // mesh 关闭态/转发关由 HandleMeshConn 帧门禁拒收(拒绝行回源),无需在此
-// 判断。设备身份每连接现读(闭包)——会话期 device_id 常驻不变,但读时求值
-// 与装配层其余缝(currentDeviceID)同口径,不在接线时快照。
+// 判断。设备身份每连接现读(闭包)——会话期 device_id 常驻不变,读时求值
+// 不在接线时快照。
 package tunnel
 
 import (

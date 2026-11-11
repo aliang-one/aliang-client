@@ -325,6 +325,9 @@ func TestGetMeshExitCacheInvalidatesOnKeyRotate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("getMeshExitForExecution: %v", err)
 	}
+	// rotatedPEM 供 relay 开关翻转子测试复用:相对其当前缓存条目只翻
+	// Relay 一个变量,隔离单一键分量(不与私钥/钉扎变化混淆)。
+	rotatedPEM := testMeshIdentityPEM(t)
 
 	t.Run("LANAddrs顺序无关", func(t *testing.T) {
 		setMeshDialConfig(t, keyPEM, []config.MeshPeer{{DeviceID: "dev-b", LANAddrs: []string{"192.168.1.21:56432", "192.168.1.20:56432"}, HostKey: "SHA256:AAAA"}}, nil)
@@ -350,14 +353,28 @@ func TestGetMeshExitCacheInvalidatesOnKeyRotate(t *testing.T) {
 	})
 
 	t.Run("改私钥重建", func(t *testing.T) {
-		newPEM := testMeshIdentityPEM(t)
-		setMeshDialConfig(t, newPEM, peer, nil)
+		setMeshDialConfig(t, rotatedPEM, peer, nil)
 		got, err := handler.getMeshExitForExecution("dev-b")
 		if err != nil {
 			t.Fatalf("getMeshExitForExecution: %v", err)
 		}
 		if got == orig {
 			t.Fatal("私钥轮换应重建 ExitClient(旧 Signer 随私钥作废)")
+		}
+		orig = got
+	})
+
+	t.Run("relay开关翻转重建", func(t *testing.T) {
+		// Relay 布尔进 CacheKey:翻转 = 中继载体从 Transport 切片增删,
+		// 缓存里的旧切片不得复用。与 orig(= rotatedPEM+AAAA+relay 默认
+		// 放行)只差 Relay 一个分量。
+		setMeshDialConfig(t, rotatedPEM, []config.MeshPeer{{DeviceID: "dev-b", LANAddrs: peer[0].LANAddrs, HostKey: "SHA256:AAAA", Relay: boolPtr(false)}}, nil)
+		got, err := handler.getMeshExitForExecution("dev-b")
+		if err != nil {
+			t.Fatalf("getMeshExitForExecution: %v", err)
+		}
+		if got == orig {
+			t.Fatal("relay 开关翻转应重建 ExitClient(Transport 切片变化)")
 		}
 	})
 }

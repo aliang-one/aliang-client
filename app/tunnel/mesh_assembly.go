@@ -62,11 +62,12 @@ func (m *Manager) meshOfflineSignal() func() bool {
 }
 
 // egressPeer 从当前全局配置装配 egress 兜底 peer(Peers[0]):SSH 依赖降级
-// 由 MeshEffectivelyEnabled 承担(SPEC §10.3);私钥/钉扎缺失 → nil(该
-// peer 能力不成立)。ExitClient 每次调用重建——离线兜底触发频率低,构造期
-// 解析私钥开销可接受(SPEC 计划决策 #1)。LANAddrs 逐项过滤空白后拷贝
-// (不共享配置切片),Relay 缺省放行,PikoDial 取 manager 的
-// dialMeshEndpoint(每次拨号读当前 proxy url/token)。
+// 由 MeshEffectivelyEnabled 承担(SPEC §10.3);私钥缺失 → nil(构造期解析
+// 即失败);钉扎缺失 → 出口仍成立但拨号恒拒(fail-closed,SPEC §10.4)。
+// ExitClient 每次调用重建——离线兜底触发频率低,构造期解析私钥开销可接受
+// (SPEC 计划决策 #1)。LANAddrs 逐项过滤空白后拷贝(不共享配置切片),
+// Relay 缺省放行,PikoDial 取 manager 的 dialMeshEndpoint(每次拨号读当前
+// proxy url/token)。
 func (m *Manager) egressPeer() meshproxy.Dialer {
 	cfg := config.GetGlobalConfig()
 	if cfg == nil || cfg.Customer == nil || cfg.Customer.Mesh == nil {
@@ -103,22 +104,6 @@ func (m *Manager) egressPeer() meshproxy.Dialer {
 		return nil
 	}
 	return client
-}
-
-// currentDeviceID manager 视角的本机 device_id(最近一次 validateConfig 写入
-// 的 meshSelfDeviceID;device_id 是设备常驻身份,续期不变,Stop 不清——离线
-// 兜底拨号恰发生在会话停止后)。
-func (m *Manager) currentDeviceID() string {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.meshSelfDeviceID
-}
-
-// setMeshSelfDeviceID validateConfig 写入当前 device_id(meshDial 同款先例)。
-func (m *Manager) setMeshSelfDeviceID(deviceID string) {
-	m.mu.Lock()
-	m.meshSelfDeviceID = strings.TrimSpace(deviceID)
-	m.mu.Unlock()
 }
 
 // ---------------------------------------------------------------------------

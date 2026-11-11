@@ -197,8 +197,8 @@ func (c *dnsForwardPacketConn) exchange(query []byte) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), dnsForwardExchangeTimeout)
 	defer cancel()
 
-	// HostName="dns:" 经 mesh 出口 targetFromMetadata 识别为 dns: 特殊目标
-	// 原样透传(不拼端口)。
+	// HostName="dns:" 经 mesh 出口的 exitPayload 识别为 dns: 特殊目标(无
+	// h/p,出口侧构造 {"t":"dns"} payload),原样透传不拼端口。
 	md := &M.Metadata{
 		Network:  M.UDP,
 		HostName: meshproto.DNSTarget,

@@ -275,15 +275,10 @@ func meshAssemblyTestKeyPEM(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("generate ed25519: %v", err)
 	}
-	signer, err := gossh.NewSignerFromKey(priv)
-	if err != nil {
-		t.Fatalf("new signer: %v", err)
-	}
 	block, err := gossh.MarshalPrivateKey(priv, "mesh-assembly-test")
 	if err != nil {
 		t.Fatalf("marshal private key: %v", err)
 	}
-	_ = signer
 	return string(pem.EncodeToMemory(block))
 }
 
