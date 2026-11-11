@@ -46,12 +46,28 @@ func testIdentity(t *testing.T) (keyPEM string, signer gossh.Signer) {
 type meshTestSSHD struct {
 	ln     net.Listener
 	hostFP string // host key SHA256 指纹(PeerSpec.HostKey 直用的钉扎格式)
+	deaf   bool   // true = 握手完成后不读 incomingChannels(黑洞:OpenChannel 无回复)
+	done   chan struct{}
 
 	mu       sync.Mutex
 	payloads [][]byte // 每条 mesh-exit channel 的 ExtraData(到达序)
 }
 
 func newMeshTestSSHD(t *testing.T, admittedPub gossh.PublicKey) *meshTestSSHD {
+	t.Helper()
+	return newMeshTestSSHDOpts(t, admittedPub, false)
+}
+
+// newMeshTestSSHDDeaf 同 newMeshTestSSHD,但 SSH 握手正常完成后 serve 循环
+// 不读 incomingChannels——客户端 OpenChannel 永远等不到
+// channelOpenConfirmation(连接保持打开的黑洞对端)。专用夹具:钉
+// 「OpenChannel 必须被 deadline 窗口罩住」的加固(评审 I1)。
+func newMeshTestSSHDDeaf(t *testing.T, admittedPub gossh.PublicKey) *meshTestSSHD {
+	t.Helper()
+	return newMeshTestSSHDOpts(t, admittedPub, true)
+}
+
+func newMeshTestSSHDOpts(t *testing.T, admittedPub gossh.PublicKey, deaf bool) *meshTestSSHD {
 	t.Helper()
 	_, hostPriv, err := ed25519.GenerateKey(rand.Reader) // GenerateKey 返回 (pub, priv, err)
 	if err != nil {
@@ -65,9 +81,17 @@ func newMeshTestSSHD(t *testing.T, admittedPub gossh.PublicKey) *meshTestSSHD {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	s := &meshTestSSHD{ln: ln, hostFP: gossh.FingerprintSHA256(hostSigner.PublicKey())}
+	s := &meshTestSSHD{
+		ln:     ln,
+		hostFP: gossh.FingerprintSHA256(hostSigner.PublicKey()),
+		deaf:   deaf,
+		done:   make(chan struct{}),
+	}
 	go s.serve(hostSigner, admittedPub)
-	t.Cleanup(func() { _ = ln.Close() })
+	t.Cleanup(func() {
+		_ = ln.Close()
+		close(s.done) // deaf 模式下挂起的黑洞连接在此全部释放
+	})
 	return s
 }
 
@@ -114,6 +138,14 @@ func (s *meshTestSSHD) handle(tcp net.Conn, hostSigner gossh.Signer, admittedPub
 	config.AddHostKey(hostSigner)
 	_, chans, reqs, err := gossh.NewServerConn(tcp, config)
 	if err != nil {
+		_ = tcp.Close()
+		return
+	}
+	if s.deaf {
+		// 黑洞模式:握手完成即停——不读 chans(不回 channelOpenConfirmation)、
+		// 不消费 reqs、连接保持打开。客户端 OpenChannel 只能靠 deadline 窗口
+		// 脱困;连接在 t.Cleanup 关 done 时释放。
+		<-s.done
 		_ = tcp.Close()
 		return
 	}
@@ -420,6 +452,46 @@ func TestExitClientHandshakeDeadline(t *testing.T) {
 	// 3 倍余量容忍 CI 抖动;若 deadline 未生效会等默认 10s,必红。
 	if elapsed > 3*shortTimeout {
 		t.Fatalf("handshake took %v, must abort within overridden %v", elapsed, shortTimeout)
+	}
+}
+
+// TestExitClientOpenChannelDeadline 钉评审 I1 加固:SSH 握手正常完成但对端
+// 不读 incomingChannels(OpenChannel 永远等不到 channelOpenConfirmation)——
+// 旧实现在握手后清 deadline 裸奔,黑洞对端会把调用方 goroutine 永久挂死在
+// OpenChannel 上;deadline 窗口必须罩住 OpenChannel。覆写包级 var,defer
+// 还原,不并行(var 为包级状态)。
+func TestExitClientOpenChannelDeadline(t *testing.T) {
+	keyPEM, identity := testIdentity(t)
+	sshd := newMeshTestSSHDDeaf(t, identity.PublicKey())
+
+	const shortTimeout = 300 * time.Millisecond
+	orig := meshExitHandshakeTimeout
+	meshExitHandshakeTimeout = shortTimeout // 必须先于 NewExitClient:构造期读取
+	defer func() { meshExitHandshakeTimeout = orig }()
+
+	client, err := NewExitClient(PeerSpec{
+		DeviceID: "dev-b",
+		LANAddrs: []string{sshd.Addr()},
+		HostKey:  sshd.HostKeyPinned(),
+	}, keyPEM, "", nil)
+	if err != nil {
+		t.Fatalf("NewExitClient: %v", err)
+	}
+	start := time.Now()
+	conn, err := client.DialContext(context.Background(), &M.Metadata{HostName: "x.com:443"})
+	elapsed := time.Since(start)
+	if err == nil {
+		if conn != nil {
+			_ = conn.Close()
+		}
+		t.Fatal("deaf peer must fail OpenChannel, not hang")
+	}
+	if !strings.Contains(err.Error(), "open mesh-exit channel") {
+		t.Fatalf("want open-channel error, got %v", err)
+	}
+	// 握手本 ~2ms 完成,窗口约 300ms 到点;3 倍余量容忍 CI 抖动。
+	if elapsed > 3*shortTimeout {
+		t.Fatalf("OpenChannel took %v, must abort within overridden %v", elapsed, shortTimeout)
 	}
 }
 

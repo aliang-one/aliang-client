@@ -126,7 +126,7 @@ func (c *ExitClient) DialContext(ctx context.Context, md *M.Metadata) (net.Conn,
 
 	if err := raw.SetDeadline(time.Now().Add(c.timeout)); err != nil {
 		_ = raw.Close()
-		return nil, err
+		return nil, fmt.Errorf("mesh: set handshake deadline to %s: %w", c.spec.DeviceID, err)
 	}
 	cc, chans, reqs, err := gossh.NewClientConn(raw, c.spec.DeviceID, &gossh.ClientConfig{
 		User:            c.spec.SSHUser,
@@ -137,10 +137,20 @@ func (c *ExitClient) DialContext(ctx context.Context, md *M.Metadata) (net.Conn,
 		_ = raw.Close()
 		return nil, fmt.Errorf("mesh: ssh handshake to %s: %w", c.spec.DeviceID, err)
 	}
-	_ = raw.SetDeadline(time.Time{}) // 握手完成,清 deadline
 	client := gossh.NewClient(cc, chans, reqs)
 
+	// OpenChannel 窗口 deadline(评审 I1):握手完成不能清 deadline 裸奔——
+	// OpenChannel 仍阻塞在 raw 的读上,黑洞对端(握手正常完成但不回
+	// channelOpenConfirmation)会把调用方 goroutine 永久挂死,正是 deadline
+	// 要防的死法挪了个位置。窗口复用同一超时罩住 OpenChannel(SetDeadline
+	// 整体替换旧 deadline 即换窗),返回(成功或失败)即清——established
+	// 长连接不得带 deadline。
+	if err := raw.SetDeadline(time.Now().Add(c.timeout)); err != nil {
+		_ = client.Close()
+		return nil, fmt.Errorf("mesh: set open-channel deadline to %s: %w", c.spec.DeviceID, err)
+	}
 	ch, chReqs, err := client.OpenChannel(ChannelMeshExit, payload)
+	_ = raw.SetDeadline(time.Time{}) // OpenChannel 已返回,窗口即清(成功失败同路)
 	if err != nil {
 		_ = client.Close()
 		return nil, fmt.Errorf("mesh: open %s channel to %s: %w", ChannelMeshExit, c.spec.DeviceID, err)
@@ -202,7 +212,7 @@ func DialMeshAddr(ctx context.Context, addr, hostKey string, identity gossh.Sign
 	}
 	if err := raw.SetDeadline(time.Now().Add(meshExitHandshakeTimeout)); err != nil {
 		_ = raw.Close()
-		return nil, err
+		return nil, fmt.Errorf("mesh: set handshake deadline to %s: %w", addr, err)
 	}
 	cc, chans, reqs, hErr := gossh.NewClientConn(raw, addr, &gossh.ClientConfig{
 		User:            meshSSHUser,
@@ -213,9 +223,15 @@ func DialMeshAddr(ctx context.Context, addr, hostKey string, identity gossh.Sign
 		_ = raw.Close()
 		return nil, fmt.Errorf("mesh: fallback ssh handshake to %s: %w", addr, hErr)
 	}
-	_ = raw.SetDeadline(time.Time{})
 	client := gossh.NewClient(cc, chans, reqs)
+	// OpenChannel 窗口 deadline(同 DialContext 的评审 I1 加固):黑洞对端不得
+	// 把 OpenChannel 挂死在无 deadline 的 conn 读上;返回(成功或失败)即清。
+	if err := raw.SetDeadline(time.Now().Add(meshExitHandshakeTimeout)); err != nil {
+		_ = client.Close()
+		return nil, fmt.Errorf("mesh: set open-channel deadline to %s: %w", addr, err)
+	}
 	ch, chReqs, oErr := client.OpenChannel(ChannelMeshExit, payload)
+	_ = raw.SetDeadline(time.Time{}) // OpenChannel 已返回,窗口即清(成功失败同路)
 	if oErr != nil {
 		_ = client.Close()
 		return nil, fmt.Errorf("mesh: fallback open %s channel to %s: %w", ChannelMeshExit, addr, oErr)
