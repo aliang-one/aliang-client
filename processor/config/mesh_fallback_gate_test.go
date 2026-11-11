@@ -1,6 +1,6 @@
 package config
 
-// 判据含 SSH 入口依赖,用例须显式开 ssh_ingress。
+// 判据含 SSH 入口依赖(SPEC §10.3),用例须显式开 ssh_ingress。
 
 // MeshFallbackActiveForClass 共享门控助手测试(计划 Task 12 评审钉死的三
 // 消费方统一抽取):MeshEffectivelyEnabled 总开关(含 SSH 入口依赖降级)+

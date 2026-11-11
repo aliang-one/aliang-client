@@ -919,9 +919,9 @@ func MeshFallbackActiveForClass(cfg *Config, class string) (addr string, ok bool
 	return "", false
 }
 
-// MeshEffectivelyEnabled mesh 出口的生效开关 = 用户开关 ∧ SSH 入口可用。
-// 依赖降级:SSH 入口未启用时 mesh 无出口载体,恒 false——存量配置
-// (mesh 开、ssh 未配)升级后 mesh 静默降级为关,而不是启动失败。
+// MeshEffectivelyEnabled mesh 出口的生效开关 = 用户开关 ∧ SSH 入口可用
+// (SPEC §10.3)。依赖降级:SSH 入口未启用时 mesh 无出口载体,恒 false——
+// 存量配置(mesh 开、ssh 未配)升级后 mesh 静默降级为关,而不是启动失败。
 // 保存期由 ValidateMeshDependency 硬拒,两条路径不重复报错。
 func (c *Config) MeshEffectivelyEnabled() bool {
 	if c == nil || c.Customer == nil {
@@ -933,10 +933,12 @@ func (c *Config) MeshEffectivelyEnabled() bool {
 	return c.Customer.SSHIngress.IsEnabled()
 }
 
-// ValidateMeshDependency 保存期依赖硬拒:开 mesh 必须开 SSH 入口。启动期
-// 不调用本函数(Config.Validate 也不调)——启动降级走 MeshEffectivelyEnabled,
-// 绝不阻断 boot。
+// ValidateMeshDependency 保存期依赖硬拒:开 mesh 必须开 SSH 入口
+// (SPEC §10.3)。启动期不调用本函数(Config.Validate 也不调)——启动降级走
+// MeshEffectivelyEnabled,绝不阻断 boot。
 func (c *Config) ValidateMeshDependency() error {
+	// Mesh 块缺失(JSON 无 mesh 键 = 用户从未触及 mesh)直接过:硬拒只在
+	// 保存携带 mesh 块时触发;启动期的对应降级由 MeshEffectivelyEnabled 兜住。
 	if c == nil || c.Customer == nil || c.Customer.Mesh == nil {
 		return nil
 	}
