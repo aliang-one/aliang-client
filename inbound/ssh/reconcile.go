@@ -73,6 +73,8 @@ func marshalKeyIdentity(keys []gossh.PublicKey) [][]byte {
 
 // marshalMeshKeyIdentity 把 mesh 凭证归一为排序后的身份集合:Marshal 字节
 // + "\x00" + DeviceID(注释改了但不改钥字节也要重启,否则日志身份陈旧)。
+// \x00 分隔存在理论歧义(RSA 指数 01 00 01 含 0x00,可能与相邻字节拼出
+// 相同序列):最坏后果是错判「要不要重启」,非安全面,可接受。
 func marshalMeshKeyIdentity(keys []MeshKey) [][]byte {
 	out := make([][]byte, 0, len(keys))
 	for _, mk := range keys {

@@ -221,17 +221,16 @@ func TestBuildSSHIngressRunConfigUnparseableKeyDefense(t *testing.T) {
 		Port:               config.SSHIngressDefaultPort,
 		AuthorizedKeys:     []string{"not-a-key", "also not a key"},
 		MeshAuthorizedKeys: []string{"still not a key"},
-	}, nil); rc != nil {
+	}); rc != nil {
 		t.Fatalf("all-unparseable keys must yield nil run config, got %+v", rc)
 	}
 
 	keyLine, _ := newSSHIngressTestKey(t)
-	meshCfg := &config.MeshConfig{ForwardEnable: boolPtr(true)}
 	rc := buildSSHIngressRunConfig(&config.SSHIngressConfig{
 		Port:               config.SSHIngressDefaultPort,
 		AuthorizedKeys:     []string{"not-a-key", keyLine},
 		MeshAuthorizedKeys: []string{keyLine},
-	}, meshCfg)
+	})
 	if rc == nil {
 		t.Fatal("partially parseable config must yield a run config")
 	}
@@ -242,61 +241,57 @@ func TestBuildSSHIngressRunConfigUnparseableKeyDefense(t *testing.T) {
 	if rc.Port != 0 {
 		t.Fatalf("port = %d, want 0 (56442 sentinel maps to unified ingress)", rc.Port)
 	}
-	// ForwardGate 已注入活闭包(nil=fail-closed,装配层不再留空);此处
-	// mesh.forward_enable=true → 闭包开。mesh=nil 的缺席态见三态用例。
+	// ForwardGate 恒注入(连接期读全局活值,nil 链=fail-closed);其取值
+	// 随全局配置而变,布尔断言归 TestBuildSSHIngressRunConfigForwardGateLiveView。
 	if rc.ForwardGate == nil {
-		t.Fatal("ForwardGate must be injected when mesh config present (nil=fail-closed)")
-	}
-	if !rc.ForwardGate() {
-		t.Fatal("ForwardGate() must reflect mesh.forward_enable=true")
+		t.Fatal("ForwardGate must always be injected (live global view)")
 	}
 	if rc.LocalNodeID != nil {
 		t.Fatal("LocalNodeID must be left for Reconcile injection, not set at translation")
 	}
 }
 
-// TestBuildSSHIngressRunConfigForwardGateThreeStates 钉门禁接线三态
-// (SPEC §10.1 决策 #14):mesh.forward_enable 三态 → ForwardGate() 期望值;
-// mesh 配置整体缺席(nil)→ gate 留 nil,运行面 fail-closed 与「总开关关」
-// 同观感。闭包捕获 mesh 活对象引用而非全局(并发提交/回滚窗口防置换)。
-func TestBuildSSHIngressRunConfigForwardGateThreeStates(t *testing.T) {
+// TestBuildSSHIngressRunConfigForwardGateLiveView 钉门禁活视图(SPEC §10.1
+// 第 2 条实施期修正):闭包连接期读全局活值,forward_enable 切换不经重建
+// 即生效——同一个 RunConfig(同一闭包实例),换全局配置,门禁值跟着变。
+// 若闭包按次提交捕获(旧实现),它会被 Reconcile 的身份相等 no-op 冻结在
+// 旧 Server 里(runIdentity 不比 gate),本用例第三段就会假绿——这正是
+// Critical 缺陷的复现形状。
+func TestBuildSSHIngressRunConfigForwardGateLiveView(t *testing.T) {
+	config.ResetGlobalConfigForTest()
+	t.Cleanup(config.ResetGlobalConfigForTest)
+
 	keyLine, _ := newSSHIngressTestKey(t)
-	effective := &config.SSHIngressConfig{
+	rc := buildSSHIngressRunConfig(&config.SSHIngressConfig{
 		Port:           config.SSHIngressDefaultPort,
 		AuthorizedKeys: []string{keyLine},
+	})
+	if rc == nil || rc.ForwardGate == nil {
+		t.Fatal("run config with injected live gate must build")
+	}
+	// mesh 未配置:nil 链 = fail-closed。
+	if rc.ForwardGate() {
+		t.Fatal("gate must be closed while mesh unconfigured (fail-closed)")
 	}
 
-	open, closed := true, false
-	cases := []struct {
-		name    string
-		mesh    *config.MeshConfig
-		wantNil bool // mesh 整体缺席 → gate=nil(fail-closed)
-		want    bool
-	}{
-		{"mesh absent → nil gate (fail-closed)", nil, true, false},
-		{"forward_enable unset → closed", &config.MeshConfig{}, false, false},
-		{"forward_enable true → open", &config.MeshConfig{ForwardEnable: &open}, false, true},
-		{"forward_enable false → closed", &config.MeshConfig{ForwardEnable: &closed}, false, false},
+	openCfg := &config.Config{
+		Core:     &config.CoreConfig{APIServer: "https://api.aliang.one"},
+		Customer: &config.CustomerConfig{Mesh: &config.MeshConfig{ForwardEnable: boolPtr(true)}},
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			rc := buildSSHIngressRunConfig(effective, tc.mesh)
-			if rc == nil {
-				t.Fatal("run config must build")
-			}
-			if tc.wantNil {
-				if rc.ForwardGate != nil {
-					t.Fatal("absent mesh config must leave ForwardGate nil (fail-closed at runtime)")
-				}
-				return
-			}
-			if rc.ForwardGate == nil {
-				t.Fatal("present mesh config must inject the live gate closure")
-			}
-			if got := rc.ForwardGate(); got != tc.want {
-				t.Fatalf("ForwardGate() = %v, want %v", got, tc.want)
-			}
-		})
+	config.SetGlobalConfig(openCfg)
+	if !rc.ForwardGate() {
+		t.Fatal("gate must open right after global forward_enable=true, without rebuilding the run config")
+	}
+
+	// 同一 rc(同一闭包实例)再读:false → 关。捕获参数的旧实现在这里
+	// 仍返回 true(被 no-op 冻结),活视图必须跟随全局新值。
+	closedCfg := &config.Config{
+		Core:     &config.CoreConfig{APIServer: "https://api.aliang.one"},
+		Customer: &config.CustomerConfig{Mesh: &config.MeshConfig{ForwardEnable: boolPtr(false)}},
+	}
+	config.SetGlobalConfig(closedCfg)
+	if rc.ForwardGate() {
+		t.Fatal("the SAME closure must reflect the new global value after forward_enable=false")
 	}
 }
 

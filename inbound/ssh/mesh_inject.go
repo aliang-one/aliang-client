@@ -26,9 +26,11 @@ import (
 const (
 	meshRejectDNSUnsupported  = "dns target not supported on ssh carrier"
 	meshRejectForwardDisabled = "forward disabled (customer.mesh.forward_enable)"
-	meshRejectNotAllowedFmt   = "forwarder %q not allowed"
-	meshRejectLoopFmt         = "meshproto: loop detected via %s"
-	meshRejectHopsFmt         = "meshproto: hop limit %d reached"
+	// meshRejectNotAllowedFmt 名单 ACL 职能已删除(见 ForwardGate 注释),
+	// 现无调用方,留待 D2 随本文件重写一并清理。
+	meshRejectNotAllowedFmt = "forwarder %q not allowed"
+	meshRejectLoopFmt       = "meshproto: loop detected via %s"
+	meshRejectHopsFmt       = "meshproto: hop limit %d reached"
 )
 
 // meshFrameDefaultPort 是帧目标不带端口时的兜底端口(裸域名/裸 IP 直转

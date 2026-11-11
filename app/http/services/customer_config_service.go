@@ -267,7 +267,7 @@ func ReconcileSSHIngressFromConfig(cfg *config.Config) {
 		sshin.Reconcile(nil, "", nil)
 		return
 	}
-	rc := buildSSHIngressRunConfig(effective, cfg.Customer.Mesh)
+	rc := buildSSHIngressRunConfig(effective)
 	hostKeyPath := sshIngressHostKeyPath()
 	if rc == nil || hostKeyPath == "" {
 		// 全量凭证解析失败(手改文件绕过保存校验)或 cache 目录不可解析:
@@ -278,9 +278,8 @@ func ReconcileSSHIngressFromConfig(cfg *config.Config) {
 	}
 	// LocalNodeID 注入缝:防环 AppendHop 读的节点标识经 AgentService
 	// currentDeviceID 活取(闭包绑定单例指针,读时求值)。ForwardGate 已
-	// 随 buildSSHIngressRunConfig 注入活闭包(mesh.forward_enable 活视图,
-	// nil=fail-closed,SPEC §10.1 决策 #14)——mesh 被转发是让渡型能力,
-	// 门禁必须真的接线:总开关关/配置缺席时,运行面一律拒帧。
+	// 随 buildSSHIngressRunConfig 注入活闭包(连接期读全局活值,见
+	// buildSSHIngressRunConfig 注释)——门禁切换不经重建即生效。
 	sshin.Reconcile(rc, hostKeyPath, GetSharedAgentService().currentDeviceID)
 }
 
@@ -345,20 +344,25 @@ func sshIngressHostKeyPath() string {
 // 文件绕过校验的坏值(半坏配置按好部分继续跑)。两列表全部解析失败返回
 // nil,交给调用方按期望停处理。
 //
-// mesh 参数是 customer.mesh 活对象引用:ForwardGate 闭包捕获它(不捕获
-// 全局配置——全局在并发提交/回滚窗口里可能已被下一次提交替换),连接期
-// 读时求值 mesh.EffectiveForwardEnabled()。mesh=nil(未配置)→gate 留
-// nil,运行面 fail-closed 拒帧,与「总开关关」同观感。
-func buildSSHIngressRunConfig(effective *config.SSHIngressConfig, mesh *config.MeshConfig) *sshin.RunConfig {
+// ForwardGate 连接期读全局活值(实施期修正):按次提交捕获会被 Reconcile
+// 的身份相等 no-op 冻结在旧 Server 里(runIdentity 不比 gate——只切
+// forward_enable 不动凭证/端口时新 RunConfig 被短路,门禁切换永不生效);
+// 全局读是真活视图——切了下一次连接就生效。GetGlobalConfig 读取有锁保护,
+// 并发提交窗口的「读到最新值」正是想要的语义,与 processor/tcp 消费路径
+// 同口径。nil 链 = mesh 未配置 = false(fail-closed,SPEC §10.1 决策 #14)。
+func buildSSHIngressRunConfig(effective *config.SSHIngressConfig) *sshin.RunConfig {
 	authorized := parseSSHIngressAuthorizedKeys("authorized_keys", effective.AuthorizedKeys)
 	meshKeys := parseSSHIngressMeshKeys(effective.MeshAuthorizedKeys)
 	if len(authorized) == 0 && len(meshKeys) == 0 {
 		logger.Warn("ssh_ingress enabled but no authorized key parses, ingress stays stopped")
 		return nil
 	}
-	var gate func() bool
-	if mesh != nil {
-		gate = func() bool { return mesh.EffectiveForwardEnabled() }
+	gate := func() bool {
+		cfg := config.GetGlobalConfig()
+		if cfg == nil || cfg.Customer == nil || cfg.Customer.Mesh == nil {
+			return false
+		}
+		return cfg.Customer.Mesh.EffectiveForwardEnabled()
 	}
 	return &sshin.RunConfig{
 		// 专用口哨兵映射(spec §6.4 修订):0 与旧默认 56442 一律=跟随统一口
@@ -367,8 +371,7 @@ func buildSSHIngressRunConfig(effective *config.SSHIngressConfig, mesh *config.M
 		Port:           effectivePortForRunConfig(effective.Port),
 		AuthorizedKeys: authorized,
 		MeshKeys:       meshKeys,
-		// ForwardGate nil=fail-closed;装配层恒注入活闭包(mesh 非 nil 时,
-		// 见上注释)。
+		// ForwardGate 恒注入(读全局活值,nil 链=fail-closed,见上注释)。
 		ForwardGate: gate,
 	}
 }

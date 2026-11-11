@@ -121,7 +121,8 @@ func TestMeshKeyDeviceIDPassthrough(t *testing.T) {
 		t.Fatalf("mesh key B device id = %q, want fingerprint prefix %q", got, wantFallback)
 	}
 
-	// 裸钥命中:bare 形态且不带 mesh 身份键。
+	// 裸钥命中:bare 形态且不带 mesh 身份键(键缺失而非空串——缺失与空串
+	// 在 e2e 不可分,直打回调是唯一能钉死的地方)。
 	perms, err = s.publicKeyCallback(stubConnMeta{}, bare)
 	if err != nil {
 		t.Fatalf("bare key auth: %v", err)
@@ -129,7 +130,23 @@ func TestMeshKeyDeviceIDPassthrough(t *testing.T) {
 	if perms.Extensions[extIngressForm] != FormBare {
 		t.Fatalf("bare form = %q, want %q", perms.Extensions[extIngressForm], FormBare)
 	}
-	if got, present := perms.Extensions[extMeshDeviceID]; present && got != "" {
-		t.Fatalf("bare key must not carry %s, got %q", extMeshDeviceID, got)
+	if _, present := perms.Extensions[extMeshDeviceID]; present {
+		t.Fatalf("bare key must not carry %s at all", extMeshDeviceID)
+	}
+}
+
+// TestMeshKeyForDuplicateKeepsFirstEntry mesh 列表同钥两次(不同 device_id)
+// → 命中第一个条目:列表顺序决定,确定性;仅标签级影响(审计身份取首个),
+// 可接受——直构造 RunConfig 绕过保存校验可达的运行期兜底取向。
+func TestMeshKeyForDuplicateKeepsFirstEntry(t *testing.T) {
+	pub, _ := newTestKey(t)
+	list := []MeshKey{{Key: pub, DeviceID: "dev-first"}, {Key: pub, DeviceID: "dev-second"}}
+
+	mk, ok := meshKeyFor(pub, list)
+	if !ok {
+		t.Fatal("duplicate-listed key must hit")
+	}
+	if mk.DeviceID != "dev-first" {
+		t.Fatalf("first-listed entry must win the label: got %q, want dev-first", mk.DeviceID)
 	}
 }

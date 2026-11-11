@@ -17,7 +17,9 @@ const (
 const extIngressForm = "ingress_form"
 
 // MeshKey 是形态②(mesh)准入凭证:公钥 + authorized_keys 尾注释承载的
-// device_id(日志/审计的人类可读身份,空则回落指纹前 16 字符)。
+// device_id(日志/审计的人类可读身份,空则回落指纹前 16 字符)。Key 由
+// parseSSHIngressMeshKeys 保证非 nil(gossh.ParseAuthorizedKey 契约)——
+// 解析器是唯一来源,运行面比较/标签均不设 nil 防御(与 keyInList 同口径)。
 type MeshKey struct {
 	Key      gossh.PublicKey
 	DeviceID string

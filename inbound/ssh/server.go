@@ -307,7 +307,7 @@ func (s *Server) publicKeyCallback(meta gossh.ConnMetadata, key gossh.PublicKey)
 // 进入通道层)。
 func meshKeyFor(key gossh.PublicKey, list []MeshKey) (MeshKey, bool) {
 	for _, mk := range list {
-		if mk.Key != nil && bytes.Equal(key.Marshal(), mk.Key.Marshal()) {
+		if bytes.Equal(key.Marshal(), mk.Key.Marshal()) {
 			return mk, true
 		}
 	}
