@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -220,16 +221,17 @@ func TestBuildSSHIngressRunConfigUnparseableKeyDefense(t *testing.T) {
 		Port:               config.SSHIngressDefaultPort,
 		AuthorizedKeys:     []string{"not-a-key", "also not a key"},
 		MeshAuthorizedKeys: []string{"still not a key"},
-	}); rc != nil {
+	}, nil); rc != nil {
 		t.Fatalf("all-unparseable keys must yield nil run config, got %+v", rc)
 	}
 
 	keyLine, _ := newSSHIngressTestKey(t)
+	meshCfg := &config.MeshConfig{ForwardEnable: boolPtr(true)}
 	rc := buildSSHIngressRunConfig(&config.SSHIngressConfig{
 		Port:               config.SSHIngressDefaultPort,
 		AuthorizedKeys:     []string{"not-a-key", keyLine},
 		MeshAuthorizedKeys: []string{keyLine},
-	})
+	}, meshCfg)
 	if rc == nil {
 		t.Fatal("partially parseable config must yield a run config")
 	}
@@ -240,11 +242,98 @@ func TestBuildSSHIngressRunConfigUnparseableKeyDefense(t *testing.T) {
 	if rc.Port != 0 {
 		t.Fatalf("port = %d, want 0 (56442 sentinel maps to unified ingress)", rc.Port)
 	}
-	if rc.ForwardGate != nil {
-		t.Fatal("ForwardGate must stay nil (merge integration seam, see RunConfig comment)")
+	// ForwardGate 已注入活闭包(nil=fail-closed,装配层不再留空);此处
+	// mesh.forward_enable=true → 闭包开。mesh=nil 的缺席态见三态用例。
+	if rc.ForwardGate == nil {
+		t.Fatal("ForwardGate must be injected when mesh config present (nil=fail-closed)")
+	}
+	if !rc.ForwardGate() {
+		t.Fatal("ForwardGate() must reflect mesh.forward_enable=true")
 	}
 	if rc.LocalNodeID != nil {
 		t.Fatal("LocalNodeID must be left for Reconcile injection, not set at translation")
+	}
+}
+
+// TestBuildSSHIngressRunConfigForwardGateThreeStates 钉门禁接线三态
+// (SPEC §10.1 决策 #14):mesh.forward_enable 三态 → ForwardGate() 期望值;
+// mesh 配置整体缺席(nil)→ gate 留 nil,运行面 fail-closed 与「总开关关」
+// 同观感。闭包捕获 mesh 活对象引用而非全局(并发提交/回滚窗口防置换)。
+func TestBuildSSHIngressRunConfigForwardGateThreeStates(t *testing.T) {
+	keyLine, _ := newSSHIngressTestKey(t)
+	effective := &config.SSHIngressConfig{
+		Port:           config.SSHIngressDefaultPort,
+		AuthorizedKeys: []string{keyLine},
+	}
+
+	open, closed := true, false
+	cases := []struct {
+		name    string
+		mesh    *config.MeshConfig
+		wantNil bool // mesh 整体缺席 → gate=nil(fail-closed)
+		want    bool
+	}{
+		{"mesh absent → nil gate (fail-closed)", nil, true, false},
+		{"forward_enable unset → closed", &config.MeshConfig{}, false, false},
+		{"forward_enable true → open", &config.MeshConfig{ForwardEnable: &open}, false, true},
+		{"forward_enable false → closed", &config.MeshConfig{ForwardEnable: &closed}, false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rc := buildSSHIngressRunConfig(effective, tc.mesh)
+			if rc == nil {
+				t.Fatal("run config must build")
+			}
+			if tc.wantNil {
+				if rc.ForwardGate != nil {
+					t.Fatal("absent mesh config must leave ForwardGate nil (fail-closed at runtime)")
+				}
+				return
+			}
+			if rc.ForwardGate == nil {
+				t.Fatal("present mesh config must inject the live gate closure")
+			}
+			if got := rc.ForwardGate(); got != tc.want {
+				t.Fatalf("ForwardGate() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestParseSSHIngressMeshKeysFourForms 钉 mesh_authorized_keys 解析四形态
+// (SPEC §13.4):尾注释=device_id;无注释=空串(运行时回落指纹);尾注释
+// 内部空格原样保留;坏行跳过。
+func TestParseSSHIngressMeshKeysFourForms(t *testing.T) {
+	withComment, _ := newSSHIngressTestKey(t)
+	noComment, _ := newSSHIngressTestKey(t)
+	innerSpace, _ := newSSHIngressTestKey(t)
+
+	// authorized_keys 行格式:"<type> <base64> [comment]"。newSSHIngressTestKey
+	// 产出的行无注释;尾注释手工拼接(保留空格语义)。
+	lines := []string{
+		strings.TrimRight(withComment, "\n") + " dev-b",
+		noComment, // 无尾注释
+		strings.TrimRight(innerSpace, "\n") + " dev-b extra",
+		"not-a-key at all",
+	}
+	keys := parseSSHIngressMeshKeys(lines)
+	if len(keys) != 3 {
+		t.Fatalf("keys = %d, want 3 (bad line skipped)", len(keys))
+	}
+	if keys[0].DeviceID != "dev-b" {
+		t.Fatalf("form1 trailing comment device id = %q, want dev-b", keys[0].DeviceID)
+	}
+	if keys[0].Key == nil {
+		t.Fatal("form1 must carry the parsed public key")
+	}
+	if keys[1].DeviceID != "" {
+		t.Fatalf("form2 no-comment device id = %q, want empty (runtime falls back to fingerprint)", keys[1].DeviceID)
+	}
+	if keys[1].Key == nil {
+		t.Fatal("form2 must carry the parsed public key")
+	}
+	if keys[2].DeviceID != "dev-b extra" {
+		t.Fatalf("form3 inner-space comment = %q, want %q (TrimSpace only strips edges)", keys[2].DeviceID, "dev-b extra")
 	}
 }
 

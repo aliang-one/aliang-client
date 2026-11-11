@@ -16,6 +16,17 @@ const (
 // extIngressForm 是认证 Permissions 中携带入口形态的扩展键。
 const extIngressForm = "ingress_form"
 
+// MeshKey 是形态②(mesh)准入凭证:公钥 + authorized_keys 尾注释承载的
+// device_id(日志/审计的人类可读身份,空则回落指纹前 16 字符)。
+type MeshKey struct {
+	Key      gossh.PublicKey
+	DeviceID string
+}
+
+// extMeshDeviceID 是认证 Permissions 中携带 mesh 对端身份的扩展键(进程内
+// 数据,不上线——Extensions 由服务端产生与消费,SPEC §10.2)。
+const extMeshDeviceID = "mesh_device_id"
+
 // RunConfig 是服务运行期配置,由配置层 EffectiveSSHIngress 翻转而来
 // (authorized_keys 行经 gossh.ParseAuthorizedKey 解析为 gossh.PublicKey)。
 // 构造后视为不可变:配置变更由装配层(Reconcile)重建 Server 实例,
@@ -28,17 +39,18 @@ type RunConfig struct {
 	Port uint16
 	// AuthorizedKeys 是形态①凭证(人用 authorized_keys)。
 	AuthorizedKeys []gossh.PublicKey
-	// MeshKeys 是形态②凭证(mesh_authorized_keys)。
-	MeshKeys []gossh.PublicKey
+	// MeshKeys 是形态②凭证(mesh_authorized_keys):公钥 + 尾注释 device_id。
+	MeshKeys []MeshKey
 
 	// LocalNodeID 返回本机节点标识(防环 AppendHop 用)。由装配层注入
 	// (AgentService.currentDeviceID);测试注入闭包。nil=形态②整体禁用
 	// (防御:装配未完成时不放行 mesh 帧)。
 	LocalNodeID func() string
 
-	// ForwardGate 返回(转发总开关, 允许的转发方列表)。合并集成缝:
-	// customer.mesh 的 EffectiveForwardEnabled+Peers ACL 随 mesh 分支落地,
-	// 本分支注入 nil=全放行(凭证列表即 ACL);合并后装配层改注入 mesh
-	// 的门禁函数,测试可注入闭包。
-	ForwardGate func() (bool, []string)
+	// ForwardGate 返回转发总开关(customer.mesh.forward_enable 活视图)。
+	// nil = fail-closed——装配层恒注入活闭包,nil 语义从「全放行」翻转为
+	// 「拒绝」(SPEC §10.1 决策 #14)。allowed 名单职能已删除:ACL 由
+	// MeshKeys 公钥列表承担,两套 ACL 并存会制造「公钥进了但名单没加」
+	// 的失配。
+	ForwardGate func() bool
 }

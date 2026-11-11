@@ -153,9 +153,10 @@ func TestMeshFormAppendsHopAndInjects(t *testing.T) {
 
 	meshPub, meshSigner := newTestKey(t)
 	_, addr := startTestServer(t, RunConfig{
-		MeshKeys:    []gossh.PublicKey{meshPub},
+		MeshKeys:    []MeshKey{{Key: meshPub}},
 		LocalNodeID: func() string { return "node-b" },
-		// ForwardGate nil=全放行(合并集成缝:本分支凭证列表即 ACL)。
+		// ForwardGate 显式开:本用例验证帧注入链,nil=fail-closed(D2 重写)。
+		ForwardGate: func() bool { return true },
 	})
 	ch := openMeshChannel(t, addr, meshSigner)
 
@@ -243,8 +244,11 @@ func TestMeshFormAppendsHopAndInjects(t *testing.T) {
 func TestMeshFormRejectsLoop(t *testing.T) {
 	meshPub, meshSigner := newTestKey(t)
 	_, addr := startTestServer(t, RunConfig{
-		MeshKeys:    []gossh.PublicKey{meshPub},
+		MeshKeys:    []MeshKey{{Key: meshPub}},
 		LocalNodeID: func() string { return "node-b" },
+		// ForwardGate 显式开:命中各自的目标拒因(nil=fail-closed 会先于
+		// 本用例拒因短路;D2 重写语义)。
+		ForwardGate: func() bool { return true },
 	})
 	ch := openMeshChannel(t, addr, meshSigner)
 	// Via 已含本机 node-b:path vector 防环主防线命中。
@@ -257,8 +261,11 @@ func TestMeshFormRejectsLoop(t *testing.T) {
 func TestMeshFormRejectsHopsCap(t *testing.T) {
 	meshPub, meshSigner := newTestKey(t)
 	_, addr := startTestServer(t, RunConfig{
-		MeshKeys:    []gossh.PublicKey{meshPub},
+		MeshKeys:    []MeshKey{{Key: meshPub}},
 		LocalNodeID: func() string { return "node-b" },
+		// ForwardGate 显式开:命中各自的目标拒因(nil=fail-closed 会先于
+		// 本用例拒因短路;D2 重写语义)。
+		ForwardGate: func() bool { return true },
 	})
 	ch := openMeshChannel(t, addr, meshSigner)
 	if _, err := ch.Write(meshFrameLine("node-a", "self", "example.org:443", []string{"node-a"}, MeshHopsHardCap)); err != nil {
@@ -270,8 +277,11 @@ func TestMeshFormRejectsHopsCap(t *testing.T) {
 func TestMeshFormRejectsDNSTarget(t *testing.T) {
 	meshPub, meshSigner := newTestKey(t)
 	_, addr := startTestServer(t, RunConfig{
-		MeshKeys:    []gossh.PublicKey{meshPub},
+		MeshKeys:    []MeshKey{{Key: meshPub}},
 		LocalNodeID: func() string { return "node-b" },
+		// ForwardGate 显式开:命中各自的目标拒因(nil=fail-closed 会先于
+		// 本用例拒因短路;D2 重写语义)。
+		ForwardGate: func() bool { return true },
 	})
 	ch := openMeshChannel(t, addr, meshSigner)
 	// dns: 目标一期拒连:代解析语义归 mesh 分支 Task 8,合并后集成启用。
@@ -287,8 +297,10 @@ func TestMeshFormRejectsDNSTarget(t *testing.T) {
 func TestMeshFormGateClosedWhenDisabled(t *testing.T) {
 	meshPub, meshSigner := newTestKey(t)
 	_, addr := startTestServer(t, RunConfig{
-		MeshKeys: []gossh.PublicKey{meshPub},
-		// LocalNodeID 刻意不注入。
+		MeshKeys: []MeshKey{{Key: meshPub}},
+		// LocalNodeID 刻意不注入;ForwardGate 显式开——本用例钉的是
+		// LocalNodeID 防御分支,nil=fail-closed 会先短路、测不到目标层。
+		ForwardGate: func() bool { return true },
 	})
 	ch := openMeshChannel(t, addr, meshSigner)
 	if _, err := ch.Write(meshFrameLine("node-a", "self", "example.org:443", []string{"node-a"}, 0)); err != nil {
@@ -310,18 +322,18 @@ func TestMeshFormForwardGate(t *testing.T) {
 
 	cases := []struct {
 		name       string
-		gate       func() (bool, []string)
+		gate       func() bool
 		wantReject string // 空=应过闸(注入到达)
 	}{
-		{"gate false rejects", func() (bool, []string) { return false, nil }, "forward disabled"},
-		{"gate true without forwarder rejects", func() (bool, []string) { return true, []string{"node-x"} }, "not allowed"},
-		{"gate true with forwarder passes", func() (bool, []string) { return true, []string{"node-a"} }, ""},
-		{"nil gate allows (merge seam)", nil, ""},
+		{"gate false rejects", func() bool { return false }, "forward disabled"},
+		{"gate true passes", func() bool { return true }, ""},
+		// fail-closed(SPEC §10.1 决策 #14):nil=装配未接线=拒绝,不再放行。
+		{"nil gate rejects (fail-closed)", nil, "forward disabled"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			_, addr := startTestServer(t, RunConfig{
-				MeshKeys:    []gossh.PublicKey{meshPub},
+				MeshKeys:    []MeshKey{{Key: meshPub}},
 				LocalNodeID: local,
 				ForwardGate: tc.gate,
 			})
@@ -356,7 +368,7 @@ func TestMeshFormBadHeaderLineDisconnects(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			meshPub, meshSigner := newTestKey(t)
 			_, addr := startTestServer(t, RunConfig{
-				MeshKeys:    []gossh.PublicKey{meshPub},
+				MeshKeys:    []MeshKey{{Key: meshPub}},
 				LocalNodeID: func() string { return "node-b" },
 			})
 			ch := openMeshChannel(t, addr, meshSigner)
@@ -389,8 +401,11 @@ func TestMeshFormHopsBelowCapPasses(t *testing.T) {
 	})
 	meshPub, meshSigner := newTestKey(t)
 	_, addr := startTestServer(t, RunConfig{
-		MeshKeys:    []gossh.PublicKey{meshPub},
+		MeshKeys:    []MeshKey{{Key: meshPub}},
 		LocalNodeID: func() string { return "node-b" },
+		// ForwardGate 显式开:命中各自的目标拒因(nil=fail-closed 会先于
+		// 本用例拒因短路;D2 重写语义)。
+		ForwardGate: func() bool { return true },
 	})
 	ch := openMeshChannel(t, addr, meshSigner)
 	if _, err := ch.Write(meshFrameLine("node-a", "self", "example.org:443", []string{"node-a"}, MeshHopsHardCap-1)); err != nil {

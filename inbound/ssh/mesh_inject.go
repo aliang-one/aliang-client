@@ -62,10 +62,11 @@ var ContextKeyIngressFrameMeta = ingressFrameMetaKey{}
 
 // injectMeshFrame 是形态② 注入路径(每 channel 一帧):
 //
-//	解析帧头(失败=断开不兜底)→ dns: 拒 → ForwardGate 门禁(nil=全放行,
-//	合并集成缝)→ LocalNodeID 未注入防御 → 防环(Via 含本机即拒)→
-//	跳数帽(hops>=8 拒)→ AppendHop(本机 ID)→ IngressFrameMeta 挂 ctx →
-//	构 Metadata(裸域名保留不解析)→ 喂 processor 统一管线。
+//	解析帧头(失败=断开不兜底)→ dns: 拒 → ForwardGate 门禁(nil=
+//	fail-closed,装配未接线即拒)→ LocalNodeID 未注入防御 → 防环(Via
+//	含本机即拒)→ 跳数帽(hops>=8 拒)→ AppendHop(本机 ID)→
+//	IngressFrameMeta 挂 ctx → 构 Metadata(裸域名保留不解析)→ 喂
+//	processor 统一管线。
 //
 // 阻塞语义与 injectBareStream 同:独立 goroutine 驱动(不入 WaitGroup),
 // 在途 Handle 靠连接级 ctx 取消+连接拆除有界退出。
@@ -88,21 +89,15 @@ func injectMeshFrame(ctx context.Context, ch gossh.Channel, connRemote net.Addr,
 		return
 	}
 
-	// ForwardGate 门禁(design §8,文案区分):nil=全放行(合并集成缝:
-	// 本分支 mesh 凭证列表即 ACL,防御已含);非 nil:总开关关→
-	// forward-disabled;来源 device_id 不在允许列表→not-allowed。
-	if rc.ForwardGate != nil {
-		enabled, allowed := rc.ForwardGate()
-		if !enabled {
-			logger.Debug(fmt.Sprintf("SSH ingress mesh frame from=%s rejected: forward disabled", hdr.From))
-			writeMeshRejectLine(ch, meshRejectForwardDisabled)
-			return
-		}
-		if !forwarderAllowed(allowed, hdr.From) {
-			logger.Debug(fmt.Sprintf("SSH ingress mesh frame from=%s rejected: not an allowed forwarder", hdr.From))
-			writeMeshRejectLine(ch, fmt.Sprintf(meshRejectNotAllowedFmt, hdr.From))
-			return
-		}
+	// ForwardGate 门禁(SPEC §10.1 决策 #14,fail-closed):nil(装配未
+	// 接线)与总开关关同观感,一律 forward-disabled。allowed 名单职能已
+	// 删除:ACL 由 MeshKeys 公钥列表承担(公钥即身份),两套 ACL 并存会
+	// 制造「公钥进了但名单没加」的失配。(旧名单分支与 forwarderAllowed/
+	// meshRejectNotAllowedFmt 已无调用方,留待 D2 随本文件重写一并清理。)
+	if rc.ForwardGate == nil || !rc.ForwardGate() {
+		logger.Debug(fmt.Sprintf("SSH ingress mesh frame from=%s rejected: forward disabled", hdr.From))
+		writeMeshRejectLine(ch, meshRejectForwardDisabled)
+		return
 	}
 
 	// 纵深防御:LocalNodeID 未注入(装配未完成)或返回空→形态②整体禁用
@@ -184,7 +179,9 @@ func writeMeshRejectLine(ch gossh.Channel, reason string) {
 	tcphandler.WriteMeshRejectLine(conn, reason)
 }
 
-// forwarderAllowed 报告来源 device_id 是否在 ForwardGate 允许列表。
+// forwarderAllowed 报告来源 device_id 是否在名单内。旧名单 ACL 职能已删除
+// (ACL 归 MeshKeys 公钥列表,见 ForwardGate 注释);本函数与
+// meshRejectNotAllowedFmt 当前无调用方,留待 D2 随本文件重写一并清理。
 func forwarderAllowed(allowed []string, from string) bool {
 	for _, id := range allowed {
 		if id == from {
