@@ -13,6 +13,8 @@ import (
 // 开启 + 本机身份私钥 + 对端已钉扎 host_key)的配置块。判据升级前 mesh 编译
 // 测试的 fixture 只搭「总开关+peer 存在」,升级后不补齐即被 fail-closed 静默
 // 跳过;本组 helper 让既有用例只需表达「要测的变量」,能力三件套统一补齐。
+// 注意:显式空 host_key 也会被补齐;钉扎负例请直构(见
+// TestMeshForwardAvailableSSHDependency 的 mk)。
 func sshIngressOn() *config.SSHIngressConfig {
 	return &config.SSHIngressConfig{Enable: boolPtr(true)}
 }
@@ -324,8 +326,9 @@ func TestDecideRouteFromSnapshot_MeshDNSRuleSkippedInTCPDecision(t *testing.T) {
 }
 
 // TestMeshDNSForwardTargetFromSnapshot Task 8 门控派生(design §6 层1 规则
-// 驱动):启用的 dns 规则 + peer 配有 LANAddrs → (deviceID, lanAddrs, true);
-// 无规则/无 LANAddrs → false(不激活,现状直连透传 fail-open);多条取首条。
+// 驱动):启用的 dns 规则 + peer 存在 → (deviceID, lanAddrs, true);relay-only
+// peer 同样激活,lanAddrs 为空不构成关闭条件,载体选择归 Transport(SPEC
+// §13.2 ③);无规则/peer 不在列表 → false(fail-open);多条取首条。
 func TestMeshDNSForwardTargetFromSnapshot(t *testing.T) {
 	meshDNSCfg := func(proxyRules []string, peers ...config.MeshPeer) *config.Config {
 		return &config.Config{
@@ -538,8 +541,14 @@ func TestMeshForwardAvailableSSHDependency(t *testing.T) {
 	if meshForwardAvailable(mk(boolPtr(true), "", "h"), "dev-b") {
 		t.Fatal("无身份钥 → unavailable")
 	}
+	if meshForwardAvailable(mk(boolPtr(true), "   ", "h"), "dev-b") {
+		t.Fatal("身份钥纯空白 → unavailable(TrimSpace 判空钉死,防退化成 ==\"\")")
+	}
 	if meshForwardAvailable(mk(boolPtr(true), "k", ""), "dev-b") {
 		t.Fatal("对端未钉扎 → unavailable (fail-closed)")
+	}
+	if meshForwardAvailable(mk(boolPtr(true), "k", "   "), "dev-b") {
+		t.Fatal("钉扎纯空白 → unavailable(TrimSpace 判空钉死,防退化成 ==\"\")")
 	}
 	if meshForwardAvailable(mk(boolPtr(true), "k", "h"), "dev-xyz") {
 		t.Fatal("peer 不在列表 → unavailable")
