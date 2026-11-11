@@ -1004,7 +1004,7 @@ export default {
   mesh_peersTitle: '节点对凭据',
   mesh_peerHostKey: '对端 host key',
   mesh_peerHostKeyPlaceholder: '如 SHA256:AbCdEf… 或 authorized_keys 行',
-  mesh_peerHostKeyHint: '本机拨号到该节点时校验的 host key（SHA256: 指纹或 authorized_keys 行），留空不校验。',
+  mesh_peerHostKeyHint: '对端 SSH 入口的 host key（SHA256: 指纹或 authorized_keys 行）。必填——留空该节点不可用（不做 TOFU，保存将被拒）。',
   mesh_fallbackHostKey: '兜底节点 host key',
   mesh_privateKey: '节点身份私钥',
   mesh_privateKeyPlaceholder: 'PEM 私钥（OpenSSH/PKCS#8）',

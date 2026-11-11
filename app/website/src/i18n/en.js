@@ -1005,7 +1005,7 @@ export default {
   mesh_peersTitle: 'Peer credentials',
   mesh_peerHostKey: 'Peer host key',
   mesh_peerHostKeyPlaceholder: 'e.g. SHA256:AbCdEf… or an authorized_keys line',
-  mesh_peerHostKeyHint: 'Host key verified when dialing this node (SHA256: fingerprint or an authorized_keys line); leave empty to skip verification.',
+  mesh_peerHostKeyHint: 'Host key of the peer SSH ingress (SHA256: fingerprint or an authorized_keys line). Required — an empty value makes the node unusable (no TOFU; the save will be rejected).',
   mesh_fallbackHostKey: 'Fallback host key',
   mesh_privateKey: 'Node identity key',
   mesh_privateKeyPlaceholder: 'PEM private key (OpenSSH/PKCS#8)',
