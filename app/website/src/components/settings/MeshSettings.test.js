@@ -314,6 +314,68 @@ describe('SettingsPage buildCustomerSavePatch（mesh 透传链）', () => {
     const same = buildCustomerSavePatch({ mesh: { ...meshConfigured } }, current);
     expect(same).toBeUndefined();
   });
+
+  // —— mesh 凭据清空补救（SPEC §13.3.3）：G1 之后 private_key/key_passphrase/
+  // fallback.host_key 空串不落键 → normalizedNext.mesh.<key> 为 undefined,
+  // buildConfigPatch 对「next 缺键」直接跳过 → 旧值经后端 deep-merge 存活,
+  // 用户以为撤销了密钥实际没有。三键必须显式发空串覆盖旧值。
+  it('private_key 从有值改空：空串显式进 patch.mesh（撤销语义）', () => {
+    const current = { mesh: { ...meshConfigured, private_key: 'sk-old' } };
+    const patch = buildCustomerSavePatch(
+      { mesh: { ...meshConfigured, private_key: '' } },
+      current
+    );
+    expect(Object.prototype.hasOwnProperty.call(patch.mesh, 'private_key')).toBe(true);
+    expect(patch.mesh.private_key).toBe('');
+  });
+
+  it('key_passphrase 从有值改空：空串显式进 patch.mesh（撤销语义）', () => {
+    const current = { mesh: { ...meshConfigured, key_passphrase: 'ph-old' } };
+    const patch = buildCustomerSavePatch(
+      { mesh: { ...meshConfigured, key_passphrase: '' } },
+      current
+    );
+    expect(Object.prototype.hasOwnProperty.call(patch.mesh, 'key_passphrase')).toBe(true);
+    expect(patch.mesh.key_passphrase).toBe('');
+  });
+
+  it('fallback.host_key 从有值改空：空串显式进 patch.mesh.fallback（撤销语义）', () => {
+    const current = {
+      mesh: { ...meshConfigured, fallback: { enable: true, classes: ['ai'], addr: 'fb:56441', host_key: 'HK-fb-old' } }
+    };
+    const patch = buildCustomerSavePatch(
+      { mesh: { ...meshConfigured, fallback: { enable: true, classes: ['ai'], addr: 'fb:56441', host_key: '' } } },
+      current
+    );
+    expect(Object.prototype.hasOwnProperty.call(patch.mesh.fallback, 'host_key')).toBe(true);
+    expect(patch.mesh.fallback.host_key).toBe('');
+  });
+
+  it('private_key 有值→有值（不变）：不产生清空伪 patch（「未改动」语义不被补救块破坏）', () => {
+    const current = { mesh: { ...meshConfigured, private_key: 'sk-keep' } };
+    const patch = buildCustomerSavePatch(
+      { mesh: { ...meshConfigured, private_key: 'sk-keep' } },
+      current
+    );
+    expect(patch?.mesh && Object.prototype.hasOwnProperty.call(patch.mesh, 'private_key')).toBeFalsy();
+  });
+
+  // peers[].host_key 清空不走显式空串补救：peers 是数组走整体替换分支——
+  // normalizeMeshPeers 对空串不落键（同 G1）,但 current 侧非空 host_key 仍
+  // 保留 → 两侧 JSON 串不等 → 数组 diff 自然带出（清空生效）。若两侧本就
+  // 都无 host_key,归一化后恒等 → 无 diff = 清「本来没有的东西」为 no-op,
+  // 同样正确。
+  it('peers[].host_key 清空走数组整体替换分支（无需显式空串补救）', () => {
+    const current = {
+      mesh: { ...meshConfigured, peers: [{ device_id: 'dev-b', lan_addrs: ['192.168.1.20:56441'], relay: true, host_key: 'HK-peer-old' }] }
+    };
+    const patch = buildCustomerSavePatch(
+      { mesh: { ...meshConfigured, peers: [{ device_id: 'dev-b', lan_addrs: ['192.168.1.20:56441'], relay: true, host_key: '' }] } },
+      current
+    );
+    expect(patch.mesh.peers).toEqual([{ device_id: 'dev-b', lan_addrs: ['192.168.1.20:56441'], relay: true }]);
+    expect(Object.prototype.hasOwnProperty.call(patch.mesh.peers[0], 'host_key')).toBe(false);
+  });
 });
 
 // —— 挂载级测试（createApp + jsdom 手法，SshIngressSettings.test.js 同范式）——

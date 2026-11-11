@@ -528,6 +528,28 @@ function buildCustomerConfigPatch(nextConfig, currentConfig) {
     patch.mesh.fallback.addr = '';
   }
 
+  // mesh 凭据清空同款（SPEC §13.3.3）：private_key/key_passphrase/fallback.host_key
+  // 为空是显式撤销意图,buildConfigPatch 会当「未改动」跳过,必须显式带出空串
+  // （后端 deep-merge 才会清掉旧值）。判定用 !String(nextVal ?? '')——归一化层
+  // （MeshSettings.js G1）空串不落键,next 侧两形态都有:undefined 与空串。
+  // peers[].host_key 不走此路：peers 数组走整体替换分支,清空自然带出。
+  for (const [key, nextVal, curVal] of [
+    ['private_key',    normalizedNext.mesh?.private_key,    normalizedCurrent.mesh?.private_key],
+    ['key_passphrase', normalizedNext.mesh?.key_passphrase, normalizedCurrent.mesh?.key_passphrase]
+  ]) {
+    if (!String(nextVal ?? '') && String(curVal ?? '')) {
+      patch.mesh = isPlainObject(patch.mesh) ? patch.mesh : {};
+      patch.mesh[key] = '';
+    }
+  }
+  const nextFallbackHostKey    = String(normalizedNext.mesh?.fallback?.host_key ?? '');
+  const currentFallbackHostKey = String(normalizedCurrent.mesh?.fallback?.host_key ?? '');
+  if (!nextFallbackHostKey && currentFallbackHostKey) {
+    patch.mesh = isPlainObject(patch.mesh) ? patch.mesh : {};
+    patch.mesh.fallback = isPlainObject(patch.mesh.fallback) ? patch.mesh.fallback : {};
+    patch.mesh.fallback.host_key = '';
+  }
+
   applyAgentCoreLLMClearing(patch, normalizedNext.agentcore_llm, normalizedCurrent.agentcore_llm);
 
   return Object.keys(patch).length ? patch : undefined;
