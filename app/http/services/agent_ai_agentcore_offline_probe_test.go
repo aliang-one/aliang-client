@@ -47,8 +47,14 @@ func setAgentCoreOfflineProbeEnv(t *testing.T) (accepted chan net.Conn) {
 	t.Setenv("ANTHROPIC_BASE_URL", "http://"+ln.Addr().String())
 
 	// AI 类离线兜底勾选(改道激活的配置半边;信号半边由 swap 注入)。
+	// SSHIngress 必须一并开启(SPEC §10.3 依赖门,c5f2879 起
+	// MeshEffectivelyEnabled 追加 SSHIngress 检查):夹具只配 Mesh 块时
+	// MeshOfflineAIRedirectActive 恒假,本文件全部用例随之失真。
 	config.SetGlobalConfig(&config.Config{
 		Customer: &config.CustomerConfig{
+			SSHIngress: &config.SSHIngressConfig{
+				Enable: boolPtr(true),
+			},
 			Mesh: &config.MeshConfig{
 				Fallback: &config.MeshFallbackConfig{
 					Enable:  boolPtr(true),
