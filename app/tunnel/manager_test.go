@@ -73,19 +73,6 @@ func TestManagerRejectsInsecureRemotePikoURL(t *testing.T) {
 	}
 }
 
-func TestValidateConfigBuildsMeshRelay(t *testing.T) {
-	t.Parallel()
-	restoreMeshTransportDialSeam(t)
-	config := validTestConfig(t)
-	runtimeConfig, _, err := NewManager(nil).validateConfig(config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if runtimeConfig.meshRelay == nil {
-		t.Fatal("validateConfig must wire the mesh relay for the .mesh endpoint")
-	}
-}
-
 func TestManagerWaitConnectedTimesOut(t *testing.T) {
 	t.Parallel()
 	manager := NewManager(nil)

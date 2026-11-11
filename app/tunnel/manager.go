@@ -17,8 +17,7 @@ import (
 
 	"github.com/andydunstall/piko/client"
 
-	"aliang.one/nursorgate/app/mesh/relay"
-	"aliang.one/nursorgate/outbound/meshproto"
+	sshin "aliang.one/nursorgate/inbound/ssh"
 	meshproxy "aliang.one/nursorgate/outbound/proxy/mesh"
 	"aliang.one/nursorgate/processor/tcp"
 )
@@ -61,12 +60,6 @@ type runConfig struct {
 	handler         http.Handler
 	// tcpBridge is nil unless TCP mappings are enabled for this session.
 	tcpBridge *tcpBridge
-	// meshRelay serves B-side mesh receive on the "<deviceID>.mesh" piko
-	// endpoint (design §3.1 carrier A). Always wired: whether the endpoint
-	// listens at all is the platform whitelist's call (soft-fail), and the
-	// per-connection gate (forward_enable + peers ACL) is read live by
-	// mesh_inbound on every accepted stream.
-	meshRelay *relay.Relay
 	// onState receives mid-session state transitions surfaced from the piko
 	// client (e.g. "reconnecting" while a dropped session retries). Nil for
 	// runners that do not support it.
@@ -299,9 +292,6 @@ func (m *Manager) validateConfig(config Config) (runConfig, [sha256.Size]byte, e
 	if config.TCPEnabled {
 		bridge = newTCPBridge(config.DeviceID, verifier, config.AllowPrivateTargets)
 	}
-	// B-side mesh receive relay: the deps provider reads customer.mesh live
-	// per connection, so nothing config-derived gates construction here.
-	meshRelay := relay.New(relay.ProductionDeps(config.DeviceID))
 	// A-side mesh relay dial source (Task 9 / SPEC §7.3): the provider returns
 	// the dialMeshEndpoint method value, which reads the manager's CURRENT
 	// config on every dial — the closure deliberately captures the manager,
@@ -345,7 +335,6 @@ func (m *Manager) validateConfig(config Config) (runConfig, [sha256.Size]byte, e
 		tunnelToken:     config.TunnelToken,
 		handler:         handler,
 		tcpBridge:       bridge,
-		meshRelay:       meshRelay,
 	}, fingerprint, nil
 }
 
@@ -401,31 +390,42 @@ func runTunnel(ctx context.Context, config runConfig, ready func()) error {
 		}
 	}
 
-	// B-side mesh receive lives on "<deviceID>.mesh" (design §3.1 carrier A;
-	// A-side dials it as the relay carrier — see outbound/proxy/mesh). Same
-	// soft-fail contract as the TCP bridge: a token whose endpoint whitelist
-	// lacks the endpoint degrades the relay carrier to unavailable without
-	// touching the HTTP tunnel. Listening is attempted unconditionally — the
-	// per-connection gate (forward_enable + peers ACL) is evaluated live by
-	// mesh_inbound on every accepted stream, so B-side receive comes alive
-	// the moment the platform whitelists the endpoint.
-	if config.meshRelay != nil {
-		meshListener, meshErr := upstream.Listen(ctx, MeshEndpointID(config.deviceID))
-		log.Printf("[AGENT-TUNNEL] mesh listen %s: err=%v addr=%v", MeshEndpointID(config.deviceID), meshErr, func() any {
-			if meshErr == nil {
-				return meshListener.Addr().String()
-			}
-			return ""
-		}())
-		if meshErr != nil {
-			reportMeshRelayDisabled(config.onState, fmt.Sprintf("mesh relay unavailable: %v", meshErr))
-		} else {
-			go func() {
-				<-ctx.Done()
-				_ = meshListener.Shutdown()
-			}()
-			go func() { _ = config.meshRelay.Serve(meshListener, meshproto.CarrierRelay) }()
+	// B-side mesh relay endpoint (SPEC §8):每条 yamux 流 = 一条 SSH 入口
+	// 连接,喂 sshin.HandleIngressConn(完整 SSH 握手 → form 矩阵 →
+	// mesh-exit;每连接必须起 goroutine——HandleIngressConn 阻塞至会话结束,
+	// 串行 accept 会把 B 侧退化为单并发,SPEC §8.1)。与 TCP bridge 同一
+	// soft-fail 契约:token 端点白名单缺该端点只降级本面,不碰 HTTP 隧道。
+	// 无条件尝试 Listen——逐连接门禁归 SSH 入口 form 矩阵,平台白名单放行
+	// 即 B 侧接收生效。
+	meshListener, meshErr := upstream.Listen(ctx, MeshEndpointID(config.deviceID))
+	log.Printf("[AGENT-TUNNEL] mesh listen %s: err=%v addr=%v", MeshEndpointID(config.deviceID), meshErr, func() any {
+		if meshErr == nil {
+			return meshListener.Addr().String()
 		}
+		return ""
+	}())
+	if meshErr != nil {
+		reportMeshRelayDisabled(config.onState, fmt.Sprintf("mesh relay unavailable: %v", meshErr))
+	} else {
+		endpoint := MeshEndpointID(config.deviceID)
+		go func() {
+			<-ctx.Done()
+			_ = meshListener.Shutdown()
+		}()
+		go func() {
+			for {
+				conn, err := meshListener.Accept()
+				if err != nil {
+					return
+				}
+				go func(c net.Conn) {
+					c = sshin.WithRemoteLabel(c, "piko-"+endpoint) // 无冒号(SPEC §8.2)
+					if !sshin.HandleIngressConn(c) {
+						log.Printf("[MESH-RELAY] ingress not running, dropped conn %s", c.RemoteAddr())
+					}
+				}(conn)
+			}
+		}()
 	}
 	ready()
 

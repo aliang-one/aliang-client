@@ -47,23 +47,6 @@ func TestClassInference(t *testing.T) {
 	}
 }
 
-// TestInheritedHeaderFromContext 三件套契约(B 侧专用缝,mesh_inbound 注入
-// 消费,F1 删):WithInheritedHeader 注入、未携带返回 false、nil 帧头不误报
-// 存在。
-func TestInheritedHeaderFromContext(t *testing.T) {
-	if _, ok := InheritedHeaderFromContext(context.Background()); ok {
-		t.Fatal("未携带继承帧头应返回 ok=false")
-	}
-	hdr := &meshproto.Header{From: "dev-a", Class: meshproto.ClassSelf, Target: "a.test:443"}
-	got, ok := InheritedHeaderFromContext(WithInheritedHeader(context.Background(), hdr))
-	if !ok || got != hdr {
-		t.Fatalf("InheritedHeaderFromContext() = (%p, %v), want 原帧头指针", got, ok)
-	}
-	if _, ok := InheritedHeaderFromContext(WithInheritedHeader(context.Background(), nil)); ok {
-		t.Fatal("nil 继承帧头应返回 ok=false")
-	}
-}
-
 // TestAIProxyPortSyncAnchor 锚定本地 aiProxyPort 与 processor/config 的
 // DefaultHTTPProxyPort 同值(test-only import 无环已实测;两处判据须同步改,
 // 见 mesh.go looksLikeAITraffic 注释)。

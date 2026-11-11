@@ -29,7 +29,6 @@ func TestSniffClassifiesAndReplays(t *testing.T) {
 	}{
 		{"ssh banner", []byte("SSH-2.0-OpenSSH_9\r\n"), KindSSH},
 		{"socks greeting", []byte{0x05, 0x02, 0x00, 0x02}, KindSocks},
-		{"mesh json frame", []byte(`{"from":"dev-a","class":"ai","target":"h:443","via":["dev-a"],"hops":0}` + "\n" + "payload"), KindMesh},
 		{"http request", []byte("POST /v1/messages HTTP/1.1\r\nHost: x\r\n\r\n"), KindHTTP},
 		{"unknown binary", []byte{0xFF, 0xFE, 0x00, 0x01}, KindHTTP},
 	}
@@ -81,7 +80,6 @@ func TestKindString(t *testing.T) {
 		KindUnknown: "unknown",
 		KindSSH:     "ssh",
 		KindSocks:   "socks",
-		KindMesh:    "mesh",
 		KindHTTP:    "http",
 	}
 	for kind, want := range cases {
@@ -92,10 +90,10 @@ func TestKindString(t *testing.T) {
 }
 
 func TestClassifyShortHead(t *testing.T) {
-	// 不足 4 字节的首段不得越界:单字节 '{' 仍是 mesh,单字节 0x05 不入 socks
-	// (方法数字节缺失),其余按 HTTP 兜底。
-	if got := classify([]byte("{")); got != KindMesh {
-		t.Fatalf("single '{' = %v, want KindMesh", got)
+	// 不足 4 字节的首段不得越界:单字节 '{' 按 HTTP 兜底(帧协议退役后无
+	// mesh 分派面),单字节 0x05 不入 socks(方法数字节缺失),其余按 HTTP。
+	if got := classify([]byte("{")); got != KindHTTP {
+		t.Fatalf("single '{' = %v, want KindHTTP", got)
 	}
 	if got := classify([]byte{0x05}); got != KindHTTP {
 		t.Fatalf("single 0x05 = %v, want KindHTTP", got)

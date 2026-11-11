@@ -1,6 +1,6 @@
 // dispatch_test.go — 统一入口分派(spec §4/§6.2):嗅探→移交。本层只验
-// 「交对了人 + 交的是完整字节流 + 未装配时的拒绝语义」;各协议内部语义
-// (mesh 帧门禁、http CONNECT、socks 协商)由各自包/既有测试覆盖。
+// 「交对了人 + 交的是完整字节流」;各协议内部语义(http CONNECT、socks 协商)
+// 由各自包/既有测试覆盖。
 package http
 
 import (
@@ -102,44 +102,6 @@ func TestDispatchConnHTTPReachesCONNECTPath(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("dispatchConn did not return after client closed")
-	}
-}
-
-func TestDispatchConnMeshUnwiredRejects(t *testing.T) {
-	origHandler := MeshConnHandler
-	MeshConnHandler = nil
-	t.Cleanup(func() { MeshConnHandler = origHandler })
-
-	conn := dispatchPipe(t, `{"from":"dev-a","class":"ai","target":"h:443"}`+"\n")
-	done := make(chan struct{})
-	go func() {
-		dispatchConn(conn)
-		close(done)
-	}()
-	<-done
-	// 未装配 mesh 处理器:连接被断开,且不得把 JSON 帧当 HTTP 喂进管线。
-	waitConnClosed(t, conn)
-}
-
-func TestDispatchConnMeshWiredReceivesReplay(t *testing.T) {
-	origHandler := MeshConnHandler
-	t.Cleanup(func() { MeshConnHandler = origHandler })
-
-	frame := `{"from":"dev-a","class":"ai","target":"h:443"}` + "\n" + "payload"
-	gotCh := make(chan string, 1)
-	MeshConnHandler = func(conn net.Conn) {
-		b, _ := io.ReadAll(conn)
-		gotCh <- string(b)
-	}
-
-	dispatchConn(dispatchPipe(t, frame))
-	select {
-	case got := <-gotCh:
-		if got != frame {
-			t.Fatalf("mesh handler got %q, want %q (sniff replay must be lossless)", got, frame)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("mesh handler never invoked")
 	}
 }
 

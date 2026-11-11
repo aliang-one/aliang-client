@@ -1,8 +1,8 @@
 // Package mesh 承担 mesh 出口侧(SSH 代理链,A 侧)的公共小件:流量类别
 // 判定与 context 助手(WithClass/InferClass/WithConnID)、拨号最小接口
-// (Dialer)、B 侧注入连接仍消费的继承帧头 context 缝(F1 随帧协议一并
-// 删除)。真正的出口客户端是 ExitClient(SSH mesh-exit channel,见
-// sshexit.go);旧 JSON 帧协议出口(Peer)已随 SPEC 的 SSH 化整体退役。
+// (Dialer)。真正的出口客户端是 ExitClient(SSH mesh-exit channel,见
+// sshexit.go);旧 JSON 帧协议出口(Peer)与 B 侧继承帧头 context 缝
+// (WithInheritedHeader,仅供帧协议注入消费)已随 SPEC §13.1 整体退役。
 package mesh
 
 import (
@@ -96,26 +96,6 @@ func ConnIDFromContext(ctx context.Context) string {
 	v, _ := ctx.Value(connIDKey{}).(string)
 	return v
 }
-
-// inheritedHeaderKey 继承帧头的 context key。**B 侧专用缝**(mesh_inbound
-// AppendHop 后挂入,供注入连接的下游消费方读取与测试断言):A 侧链头出口
-// 已不消费继承帧头(单跳模型,SPEC §6.2 注入连接被 MeshInjected 守卫拦截,
-// 不会二次出 mesh);本缝随帧协议 B 侧一起在 F1 删除,届时连本文件一起收口。
-func WithInheritedHeader(ctx context.Context, hdr *meshproto.Header) context.Context {
-	return context.WithValue(ctx, inheritedHeaderKey{}, hdr)
-}
-
-// InheritedHeaderFromContext 取透传的继承帧头;未携带或挂了 nil 返回
-// ok=false。
-func InheritedHeaderFromContext(ctx context.Context) (*meshproto.Header, bool) {
-	hdr, ok := ctx.Value(inheritedHeaderKey{}).(*meshproto.Header)
-	if !ok || hdr == nil {
-		return nil, false
-	}
-	return hdr, true
-}
-
-type inheritedHeaderKey struct{}
 
 // aiProxyPort 与 processor/config.DefaultHTTPProxyPort(56432)同值,由
 // mesh_test.go 的 TestAIProxyPortSyncAnchor 锚定。本地常量的真实理由是

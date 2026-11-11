@@ -82,7 +82,7 @@ func startUnifiedIngress(fatalOnBindErr bool) {
 	httpListener = listener
 	httpMutex.Unlock()
 
-	logger.Info(fmt.Sprintf("统一入口监听已启动 addr=%s(嗅探 SSH/socks5/mesh/HTTP)", listenAddr))
+	logger.Info(fmt.Sprintf("统一入口监听已启动 addr=%s(嗅探 SSH/socks5/HTTP)", listenAddr))
 
 	// Accept connections in a loop until context is cancelled
 	for {
@@ -107,7 +107,7 @@ func startUnifiedIngress(fatalOnBindErr bool) {
 			}
 		}
 
-		// 每个连接先进统一分派:嗅探协议族后移交 ssh/socks/mesh/http。
+		// 每个连接先进统一分派:嗅探协议族后移交 ssh/socks/http。
 		// 与合并前三口分立相比,「连哪个口」不再编码协议,「流量是什么」
 		// 才决定走哪条处理链(spec §4)。
 		go dispatchConn(conn)

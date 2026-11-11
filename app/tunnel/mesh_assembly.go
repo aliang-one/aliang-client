@@ -10,15 +10,14 @@
 //     真假契约(两缝注释互指,Task 12 评审钉死):漏接 tcp 缝 = AI 改道永久
 //     静默休眠;两缝取值分裂 = 「自身流量经 B 兜底而 AI 流量仍撞死隧道」。
 //   - LAN beacon 生命周期:mesh 总开关(层配置存在且 EffectiveEnabled)开 →
-//     beacon Start 后 SetDefault(广播统一口 56432);关 → 收摊。LAN 帧接收
-//     面已收编进 56432 统一入口(WireUnifiedIngressMeshDispatch 分派接线,
-//     spec §6.5),本装配只剩发现候选面。config 无变更回调机制
+//     beacon Start 后 SetDefault(广播统一口 56432);关 → 收摊。帧协议
+//     接收面已退役(SPEC §13.1),本装配只剩发现候选面。config 无变更回调机制
 //     (SetGlobalConfig 是 config 层咽喉,不能反向 import app 层),用低频
 //     轮询对账——mesh 发现本就是最终一致(beacon 3s 周期广播),5s 反应延迟
 //     无损语义。
 //
-// 进程归属:装配由 cmd/core.go(core 进程)驱动——mesh 数据面(统一口
-// 分派注入的 processor/tcp 管线、56432 AI 出口、TUN)全部在 core 进程,
+// 进程归属:装配由 cmd/core.go(core 进程)驱动——mesh 数据面(56432
+// AI 出口、TUN、SSH 入口)全部在 core 进程,
 // user agent runtime 不装配(双进程同装会抢 56440 beacon 并广播双 beacon)。
 package tunnel
 
@@ -216,8 +215,8 @@ func startMeshLANLocked(deviceID func() string) {
 }
 
 // teardownMeshLANLocked 收摊(meshLAN.mu 保护):beacon 先 Stop 再清 Default。
-// 帧接收面(统一口分派)不归本装配管——mesh 总开关关时的拒收由
-// HandleMeshConn 门禁承担,这里只收发现候选面。
+// 本装配只收发现候选面——转发面走 SSH 入口(HandleIngressConn→form 矩阵,
+// SPEC §8),其开关语义归入口自身,不归本装配管。
 func teardownMeshLANLocked() {
 	if meshLAN.beacon != nil {
 		meshLAN.beacon.Stop()

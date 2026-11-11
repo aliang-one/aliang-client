@@ -54,8 +54,9 @@ func reportTCPDisabled(_ func(state string), message string) {
 
 // reportMeshRelayDisabled surfaces a non-fatal mesh endpoint startup failure
 // with the same soft-fail contract as the TCP bridge: the HTTP tunnel stays
-// healthy, and the relay carrier simply stays unavailable until a renewal
-// carries the "<device>.mesh" endpoint in the token whitelist.
+// healthy, and only the mesh-relay Transport (the "<device>.mesh" endpoint)
+// stays unavailable — the LAN Transport and every other SSH ingress form are
+// unaffected until a renewal carries the endpoint in the token whitelist.
 func reportMeshRelayDisabled(_ func(state string), message string) {
 	log.Printf("[AGENT-TUNNEL] mesh relay disabled: %s", message)
 }

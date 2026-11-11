@@ -165,9 +165,12 @@ func TCPEndpointID(deviceID string) string {
 	return deviceID + ".tcp"
 }
 
-// MeshEndpointID is the piko endpoint B-side mesh receive listens on (design
-// §3.1 carrier A). The A-side dials the same string via the relay carrier —
-// see outbound/proxy/mesh meshRelayEndpointSuffix (".mesh", mirrored literal:
+// MeshEndpointID is the piko endpoint B-side mesh receive listens on (SPEC
+// §8). Under the new model the A-side dial through this endpoint carries a
+// complete SSH transport stream — each yamux stream is fed to
+// sshin.HandleIngressConn (SSH handshake → form matrix → mesh-exit), not a
+// mesh frame. The A-side dials the same string via the relay carrier — see
+// outbound/proxy/mesh meshRelayEndpointSuffix (".mesh", mirrored literal:
 // manager.go imports the data-plane proxy package since Task 9 for the dial
 // func type, but the mirrored constant keeps bridge.go self-contained).
 func MeshEndpointID(deviceID string) string {
