@@ -22,9 +22,9 @@ package test
 //     上游以 outbound 注册表 fake 落到 echo(route_override_test fakeAliangProxy
 //     同款注入面)——「注入流量继承 B 全部规则」由 B 的普通出口分支接管注入
 //     连接来证明。
-//   - 离线/AI 改道复用 SetMeshOfflineSignal/SetMeshSelfIDSource 缝
-//     (handler_mesh_test.go swap 模式);缝是进程级单发,A/B「都离线」即共享
-//     同一 true 信号,正是本用例要的形态。
+//   - 离线/AI 改道复用 SetMeshOfflineSignal 缝(handler_mesh_test.go swap
+//     模式);缝是进程级单发,A/B「都离线」即共享同一 true 信号,正是本用例
+//     要的形态。
 //   - 全部监听 127.0.0.1 随机端口;连接目标 IP 用 TEST-NET(203.0.113.0/24)
 //     避开回环/私网 direct 快速路径;全程零真实外联。
 
@@ -75,22 +75,14 @@ func meshItResetGlobals(t *testing.T) {
 	reset := func() {
 		config.ResetGlobalConfigForTest()
 		config.ResetRoutingApplyStoreForTest()
-		tcp.SetMeshSelfIDSource(nil)
 		tcp.SetMeshOfflineSignal(nil)
-		tcp.SetMeshPikoDialSource(nil)
+		tcp.SetMeshTransportDialSource(nil)
 		egress.SetOfflineSignal(nil)
 		egress.SetPeerSource(nil)
 		outbound.GetRegistry().Clear()
 	}
 	reset()
 	t.Cleanup(reset)
-}
-
-// meshItSelfID 注入链头 selfID(全局缝;本文件各用例 A 侧链头恒 dev-a,中间跳
-// 出口走继承帧头不消费该缝)。
-func meshItSelfID(t *testing.T, id string) {
-	t.Helper()
-	tcp.SetMeshSelfIDSource(func() string { return id })
 }
 
 // meshItPeers 构造 peers 列表(id→addr 成对)。
@@ -628,7 +620,6 @@ func meshItAssertRoute(t *testing.T, ing *meshItIngress, want string) {
 // 并在 B 侧注入还原);B 的 ACL 走过;注入流量经 B 自己的 toSocks 出口分支落地。
 func TestMeshTwoNodeLANEndToEnd(t *testing.T) {
 	meshItResetGlobals(t)
-	meshItSelfID(t, "dev-a")
 
 	echoAddr, echoReceived := startMeshItEcho(t)
 	fakeSocks := registerMeshItFakeSocks(t, echoAddr)
@@ -706,7 +697,6 @@ func TestMeshTwoNodeLANEndToEnd(t *testing.T) {
 // Via=[A,B,C] 递增、Hops 单调不重置;三跳内容透传(ClientHello 原样抵达 C)。
 func TestMeshThreeHopChain(t *testing.T) {
 	meshItResetGlobals(t)
-	meshItSelfID(t, "dev-a")
 
 	cCapture := newMeshItCaptureHandler()
 	cNode := startMeshItNode(t, "dev-c", []string{"dev-a", "dev-b"}, cCapture, nil)
@@ -762,7 +752,6 @@ func TestMeshThreeHopChain(t *testing.T) {
 // goroutine/连接无泄漏(计数回落基线)。
 func TestMeshLoopRejected(t *testing.T) {
 	meshItResetGlobals(t)
-	meshItSelfID(t, "dev-a")
 
 	bGate := newMeshItGate()
 	bNode := startMeshItNode(t, "dev-b", []string{"dev-a"},
@@ -807,7 +796,6 @@ func TestMeshLoopRejected(t *testing.T) {
 // 来自 Via 自查(而非跳数帽);拒绝行回源至 A 侧客户端。
 func TestMeshCrossNodeLoopBlocked(t *testing.T) {
 	meshItResetGlobals(t)
-	meshItSelfID(t, "dev-a")
 
 	cGate := newMeshItGate()
 	cNode := startMeshItNode(t, "dev-c", []string{"dev-a", "dev-b"},
@@ -1014,7 +1002,6 @@ var _ adapter.UDPConn = (*meshItUDPConn)(nil)
 // 回固定 IP)→ 回包交付 TUN 侧;公网 DialUDP 零调用(fail-closed)。
 func TestMeshDNSForwardEndToEnd(t *testing.T) {
 	meshItResetGlobals(t)
-	meshItSelfID(t, "dev-a")
 
 	resolver := &meshItFakeResolver{gotHost: make(chan string, 4)}
 	bNode := startMeshItNode(t, "dev-b", []string{"dev-a"}, newMeshItCaptureHandler(), resolver)
@@ -1054,23 +1041,32 @@ func TestMeshDNSForwardEndToEnd(t *testing.T) {
 		t.Fatal("dns,mesh:dev-b 规则未编译为启用的 toNode:dev-b dns 规则(门未激活)")
 	}
 
-	// A 侧接线缝(生产由 app/tunnel 组装):按 peers 的 LANAddrs 装配 mesh Peer
-	// (MeshDNSForwardTarget 同款派生,免 memo 确定性直取)。
-	tun.SetMeshDNSForwardPeerSource(func() *meshproxy.Peer {
+	// A 侧接线缝(生产由 app/tunnel 组装):按 peers 的 LANAddrs 装配
+	// ExitClient(MeshDNSForwardTarget 同款派生,免 memo 确定性直取)。配置缺
+	// 身份私钥时装配失败 → nil(门未激活,E1 语义;B 侧 SSH 化随 F1 重写
+	// 本 harness 的帧协议假节点)。
+	tun.SetMeshDNSForwardPeerSource(func() meshproxy.Dialer {
 		cfg := config.GetGlobalConfig()
 		if cfg == nil || cfg.Customer == nil || cfg.Customer.Mesh == nil {
 			return nil
 		}
-		for _, peer := range cfg.Customer.Mesh.Peers {
+		meshCfg := cfg.Customer.Mesh
+		for _, peer := range meshCfg.Peers {
 			if peer.DeviceID != "dev-b" || len(peer.LANAddrs) == 0 {
 				continue
 			}
-			return meshproxy.NewPeer(meshproxy.PeerTarget{
+			spec := meshproxy.PeerSpec{
 				DeviceID: "dev-b",
 				LANAddrs: peer.LANAddrs,
+				HostKey:  peer.HostKey,
+				SSHUser:  "mesh",
 				Relay:    false, // TUN DNS 一律 custom 仅 LAN 载体
-				SelfID:   "dev-a",
-			})
+			}
+			client, err := meshproxy.NewExitClient(spec, meshCfg.PrivateKey, meshCfg.KeyPassphrase, nil)
+			if err != nil {
+				return nil
+			}
+			return client
 		}
 		return nil
 	})
@@ -1150,7 +1146,6 @@ func TestMeshOfflineAIRedirectTwoHop(t *testing.T) {
 
 	t.Run("B 再改道到 C 且 Via 续传", func(t *testing.T) {
 		meshItResetGlobals(t)
-		meshItSelfID(t, "dev-a")
 		tcp.SetMeshOfflineSignal(func() bool { return true })
 
 		cCapture := newMeshItCaptureHandler()
@@ -1204,7 +1199,6 @@ func TestMeshOfflineAIRedirectTwoHop(t *testing.T) {
 
 	t.Run("ping-pong 兜底环被拒", func(t *testing.T) {
 		meshItResetGlobals(t)
-		meshItSelfID(t, "dev-a")
 		tcp.SetMeshOfflineSignal(func() bool { return true })
 
 		// A 也常驻 relay:B 的兜底指回 A 时,Via 已含 dev-a → path vector 拦截。
@@ -1245,7 +1239,6 @@ func TestMeshOfflineAIRedirectTwoHop(t *testing.T) {
 // 不触发;切断正常路径后链头先落兜底(RouteMeshFallback,帧头抵达兜底节点)。
 func TestMeshOfflineFallbackActivates(t *testing.T) {
 	meshItResetGlobals(t)
-	meshItSelfID(t, "dev-a")
 
 	fbAddr, fbHeaders := startMeshItHeaderPeer(t)
 	bAddr, bHeaders := startMeshItHeaderPeer(t)

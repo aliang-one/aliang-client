@@ -1,10 +1,12 @@
 package tunnel
 
 import (
-	"bufio"
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/binary"
+	"encoding/pem"
 	"errors"
 	"io"
 	"net"
@@ -14,85 +16,141 @@ import (
 
 	"aliang.one/nursorgate/inbound/tun/adapter"
 	M "aliang.one/nursorgate/inbound/tun/metadata"
-	"aliang.one/nursorgate/outbound/meshproto"
 	meshproxy "aliang.one/nursorgate/outbound/proxy/mesh"
 	"aliang.one/nursorgate/processor/statistic"
 	"github.com/miekg/dns"
 	"github.com/sagernet/gvisor/pkg/tcpip"
 	"github.com/sagernet/gvisor/pkg/tcpip/stack"
+	gossh "golang.org/x/crypto/ssh"
 )
 
 // ===== 测试夹具 =====
 
-// meshDNSFakeB loopback 假 B:accept 一条连接,读帧头与 [len][查询] 送回测试;
-// respond=true 时回写 [len][响应] 后关连接(单问单答),false 时收下查询后
-// 挂住不回包(A 侧超时路径)。
+// meshDNSFakeB loopback 假 B:真 sshd(SPEC §15.1 出口测试夹具配方),mesh-exit
+// channel 的 ExtraData payload 逐条记录;channel 内读 [len][查询] 送回测试,
+// respond=true 时回写 [len][响应] 后关 channel(单问单答),false 时收下查询
+// 后挂住不回包(A 侧超时路径)。A 侧经 ExitClient(SSH)拨入。
 type meshDNSFakeB struct {
-	ln       net.Listener
-	headerCh chan *meshproto.Header
-	queryCh  chan []byte
-	respond  bool
-	response []byte
+	ln        net.Listener
+	hostFP    string
+	payloadCh chan []byte
+	queryCh   chan []byte
+	respond   bool
+	response  []byte
 }
 
-func startMeshDNSFakeB(t *testing.T, respond bool, response []byte) *meshDNSFakeB {
+func startMeshDNSFakeB(t *testing.T, identity gossh.Signer, respond bool, response []byte) *meshDNSFakeB {
 	t.Helper()
+	b := &meshDNSFakeB{
+		payloadCh: make(chan []byte, 4),
+		queryCh:   make(chan []byte, 4),
+		respond:   respond,
+		response:  response,
+	}
+	_, hostPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate host key: %v", err)
+	}
+	hostSigner, err := gossh.NewSignerFromKey(hostPriv)
+	if err != nil {
+		t.Fatalf("new host signer: %v", err)
+	}
+	b.hostFP = gossh.FingerprintSHA256(hostSigner.PublicKey())
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	b := &meshDNSFakeB{
-		ln:       ln,
-		headerCh: make(chan *meshproto.Header, 1),
-		queryCh:  make(chan []byte, 1),
-		respond:  respond,
-		response: response,
-	}
+	b.ln = ln
+	admitted := identity.PublicKey()
 	go func() {
-		conn, err := ln.Accept()
-		if err != nil {
-			return
-		}
-		defer conn.Close()
-		_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
-		// 帧读取必须与头行共用同一 bufio reader:头+帧一次写出时 bufio 会
-		// 预读吞掉帧字节(bridge.go/processor/tcp WrappedConn 同款坑)。
-		reader := bufio.NewReader(conn)
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			return
-		}
-		hdr, _, err := meshproto.Parse([]byte(line))
-		if err != nil {
-			return
-		}
-		b.headerCh <- hdr
-		query, err := readTestDNSFrame(t, reader)
-		if err != nil {
-			return
-		}
-		b.queryCh <- query
-		if respond {
-			if err := writeTestDNSFrame(t, conn, response); err != nil {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
 				return
 			}
-			return // 单问单答即关
+			go b.serve(c, hostSigner, admitted)
 		}
-		_, _ = io.Copy(io.Discard, conn) // 不回包:挂住直到对端断开
 	}()
 	t.Cleanup(func() { _ = ln.Close() })
 	return b
 }
 
+// dnsForwardTestIdentity 生成一把真 ed25519 测试身份:PEM 交给 A 侧
+// ExitClient,signer/pub 供假 B 的 sshd 准入比对——两侧同源。
+func dnsForwardTestIdentity(t *testing.T) (keyPEM string, signer gossh.Signer) {
+	t.Helper()
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate ed25519: %v", err)
+	}
+	signer, err = gossh.NewSignerFromKey(priv)
+	if err != nil {
+		t.Fatalf("new signer: %v", err)
+	}
+	block, err := gossh.MarshalPrivateKey(priv, "dns-forward-test")
+	if err != nil {
+		t.Fatalf("marshal private key: %v", err)
+	}
+	return string(pem.EncodeToMemory(block)), signer
+}
+
+func (b *meshDNSFakeB) serve(c net.Conn, hostSigner gossh.Signer, admittedPub gossh.PublicKey) {
+	sc := &gossh.ServerConfig{
+		PublicKeyCallback: func(_ gossh.ConnMetadata, key gossh.PublicKey) (*gossh.Permissions, error) {
+			if !bytes.Equal(key.Marshal(), admittedPub.Marshal()) {
+				return nil, errors.New("mesh dns fake B: unknown client identity key")
+			}
+			return nil, nil
+		},
+	}
+	sc.AddHostKey(hostSigner)
+	_, chans, reqs, err := gossh.NewServerConn(c, sc)
+	if err != nil {
+		_ = c.Close()
+		return
+	}
+	go gossh.DiscardRequests(reqs)
+	for newCh := range chans {
+		if newCh.ChannelType() != meshproxy.ChannelMeshExit {
+			_ = newCh.Reject(gossh.UnknownChannelType, "unsupported")
+			continue
+		}
+		b.payloadCh <- append([]byte(nil), newCh.ExtraData()...)
+		ch, chReqs, err := newCh.Accept()
+		if err != nil {
+			continue
+		}
+		go gossh.DiscardRequests(chReqs)
+		go func() {
+			defer ch.Close()
+			query, err := readTestDNSFrame(ch)
+			if err != nil {
+				return
+			}
+			b.queryCh <- query
+			if b.respond {
+				if err := writeTestDNSFrame(ch, b.response); err != nil {
+					return
+				}
+			}
+			_, _ = io.Copy(io.Discard, ch) // respond=false:挂住直到对端断开
+		}()
+	}
+}
+
 func (b *meshDNSFakeB) addr() string { return b.ln.Addr().String() }
 
-func waitMeshDNSFakeHeader(t *testing.T, b *meshDNSFakeB) *meshproto.Header {
+func (b *meshDNSFakeB) hostKey() string { return b.hostFP }
+
+// identityPEM 假 B 准入的客户端身份(与 startMeshDNSFakeB 内生成的 signer
+// 同源——A 侧 ExitClient 用它拨入)。
+func waitMeshDNSFakePayload(t *testing.T, b *meshDNSFakeB) []byte {
 	t.Helper()
 	select {
-	case hdr := <-b.headerCh:
-		return hdr
+	case p := <-b.payloadCh:
+		return p
 	case <-time.After(3 * time.Second):
-		t.Fatal("timeout waiting for mesh header at fake B")
+		t.Fatal("timeout waiting for mesh-exit payload at fake B")
 		return nil
 	}
 }
@@ -110,8 +168,7 @@ func waitMeshDNSFakeQuery(t *testing.T, b *meshDNSFakeB) []byte {
 
 // writeTestDNSFrame/readTestDNSFrame 测试侧独立的 [2B 大端长度][载荷] 读写
 // (不依赖被测实现,线格式契约由测试自持)。
-func writeTestDNSFrame(t *testing.T, w io.Writer, payload []byte) error {
-	t.Helper()
+func writeTestDNSFrame(w io.Writer, payload []byte) error {
 	var frame [2]byte
 	binary.BigEndian.PutUint16(frame[:], uint16(len(payload)))
 	if _, err := w.Write(frame[:]); err != nil {
@@ -121,8 +178,7 @@ func writeTestDNSFrame(t *testing.T, w io.Writer, payload []byte) error {
 	return err
 }
 
-func readTestDNSFrame(t *testing.T, r io.Reader) ([]byte, error) {
-	t.Helper()
+func readTestDNSFrame(r io.Reader) ([]byte, error) {
 	var frame [2]byte
 	if _, err := io.ReadFull(r, frame[:]); err != nil {
 		return nil, err
@@ -298,29 +354,38 @@ type proxyDialer = interface {
 	DialUDP(md *M.Metadata) (net.PacketConn, error)
 }
 
-// dnsForwardTestPeer 构造指向 fakeB 的 DNS 代转发 Peer(Relay:false——TUN DNS
-// 一律 custom 仅 LAN 载体,design §2 行12)。
-func dnsForwardTestPeer(lanAddr string) *meshproxy.Peer {
-	return meshproxy.NewPeer(meshproxy.PeerTarget{
+// dnsForwardTestPeer 构造指向 fakeB 的 DNS 代转发 ExitClient(Relay:false——
+// TUN DNS 一律 custom 仅 LAN 载体,design §2 行12)。
+func dnsForwardTestPeer(t *testing.T, keyPEM, lanAddr, hostKey string) meshproxy.Dialer {
+	t.Helper()
+	spec := meshproxy.PeerSpec{
 		DeviceID: "dev-b",
 		LANAddrs: []string{lanAddr},
+		HostKey:  hostKey,
+		SSHUser:  "mesh",
 		Relay:    false,
-		SelfID:   "dev-a",
-	})
+	}
+	client, err := meshproxy.NewExitClient(spec, keyPEM, "", nil)
+	if err != nil {
+		t.Fatalf("NewExitClient: %v", err)
+	}
+	return client
 }
 
 // ===== Step 1 规定用例 =====
 
 // TestDNSForwardPacketConnRelaysQueryViaMesh A 侧 PacketConn 交换语义:
-// WriteTo(查询) 打开 mesh 连接写 [len][查询],假 B 回 [len][响应],
-// ReadFrom 原样交付;帧头 Target=="dns:" Class=="custom";日志 seam 收到查询。
+// WriteTo(查询) 打开 mesh SSH 连接写 [len][查询],假 B 回 [len][响应],
+// ReadFrom 原样交付;mesh-exit ExtraData payload = {"t":"dns"}(特殊目标无
+// h/p);日志 seam 收到查询。
 func TestDNSForwardPacketConnRelaysQueryViaMesh(t *testing.T) {
+	keyPEM, identity := dnsForwardTestIdentity(t)
 	query := newTestDNSQuery(t, 0x77, "mesh.example.com.", dns.TypeA)
 	response := buildTestDNSAResponse(t, 0x77, "mesh.example.com.", "1.2.3.4")
-	fakeB := startMeshDNSFakeB(t, true, response)
+	fakeB := startMeshDNSFakeB(t, identity, true, response)
 
 	var logged [][]byte
-	pc := newDNSForwardPacketConn(dnsForwardTestPeer(fakeB.addr()), func(q []byte) {
+	pc := newDNSForwardPacketConn(dnsForwardTestPeer(t, keyPEM, fakeB.addr(), fakeB.hostKey()), func(q []byte) {
 		logged = append(logged, append([]byte(nil), q...))
 	})
 	defer pc.Close()
@@ -343,12 +408,10 @@ func TestDNSForwardPacketConnRelaysQueryViaMesh(t *testing.T) {
 		t.Fatalf("ReadFrom addr = %v, want 8.8.8.8:53(客户端视角的 DNS 服务器)", from)
 	}
 
-	hdr := waitMeshDNSFakeHeader(t, fakeB)
-	if hdr.Target != meshproto.DNSTarget {
-		t.Fatalf("frame Target = %q, want %q", hdr.Target, meshproto.DNSTarget)
-	}
-	if hdr.Class != meshproto.ClassCustom {
-		t.Fatalf("frame Class = %q, want custom(TUN DNS 一律 custom)", hdr.Class)
+	// mesh-exit ExtraData:dns 特殊目标无 h/p(与 B 侧代解析面的识别契约)。
+	payload := waitMeshDNSFakePayload(t, fakeB)
+	if !bytes.Equal(payload, []byte(`{"t":"dns"}`)) {
+		t.Fatalf("mesh-exit payload = %s, want {\"t\":\"dns\"}(dns 特殊目标)", payload)
 	}
 	if got := waitMeshDNSFakeQuery(t, fakeB); !bytes.Equal(got, query) {
 		t.Fatalf("query frame bytes mismatch: got %d bytes", len(got))
@@ -363,11 +426,12 @@ func TestDNSForwardPacketConnRelaysQueryViaMesh(t *testing.T) {
 // (激活路径下无公网 socket,注入 seam 断言)。整条链走 handleUDPConn。
 func TestDNSForwardFailsClosedWhenPeerUnreachable(t *testing.T) {
 	query := newTestDNSQuery(t, 0x88, "down.example.com.", dns.TypeA)
+	keyPEM, _ := dnsForwardTestIdentity(t)
 	publicPC := newStubPublicPacketConn()
 	dialer := &recordingDialer{dialUDP: make(chan *M.Metadata, 1), pc: publicPC}
 	tun := New(dialer, statistic.DefaultManager)
-	tun.SetMeshDNSForwardPeerSource(func() *meshproxy.Peer {
-		return dnsForwardTestPeer(closedPortAddr(t))
+	tun.SetMeshDNSForwardPeerSource(func() meshproxy.Dialer {
+		return dnsForwardTestPeer(t, keyPEM, closedPortAddr(t), "SHA256:AAAA")
 	})
 
 	uc := newFakeTUNUDPConn(query)
@@ -417,9 +481,10 @@ func TestDNSForwardTimeoutYieldsServfail(t *testing.T) {
 	defer func() { dnsForwardExchangeTimeout = restore }()
 
 	query := newTestDNSQuery(t, 0x99, "slow.example.com.", dns.TypeA)
-	fakeB := startMeshDNSFakeB(t, false, nil)
+	keyPEM, identity := dnsForwardTestIdentity(t)
+	fakeB := startMeshDNSFakeB(t, identity, false, nil)
 
-	pc := newDNSForwardPacketConn(dnsForwardTestPeer(fakeB.addr()), nil)
+	pc := newDNSForwardPacketConn(dnsForwardTestPeer(t, keyPEM, fakeB.addr(), fakeB.hostKey()), nil)
 	defer pc.Close()
 
 	start := time.Now()
@@ -502,7 +567,7 @@ func TestGateInactivePassesThroughDirect(t *testing.T) {
 	t.Run("未注入 peer source", func(t *testing.T) { run(t, nil) })
 	t.Run("source 返回 nil", func(t *testing.T) {
 		run(t, func(tun *Tunnel) {
-			tun.SetMeshDNSForwardPeerSource(func() *meshproxy.Peer { return nil })
+			tun.SetMeshDNSForwardPeerSource(func() meshproxy.Dialer { return nil })
 		})
 	})
 }

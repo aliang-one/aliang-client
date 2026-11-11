@@ -76,7 +76,7 @@ func (m *Manager) DialPeerMesh(ctx context.Context, deviceID string) (net.Conn, 
 }
 
 // dialMeshEndpoint 按 piko 端点 id 拨中继载体。该方法是 processor/tcp 注入缝
-// (SetMeshPikoDialSource)返回的生产拨号函数本体:mesh 出口以
+// (SetMeshTransportDialSource)返回的生产拨号函数本体:mesh 出口以
 // "<deviceID>.mesh" 端点名调用;每次调用读当前配置,闭包捕获的是 manager
 // 本体而非某代配置值。成功路径不逐连接打日志(噪声),失败带 conn_id 记录
 // 便于排障(conn id 经 ctx 由 mesh 出口透传,见 mesh.WithConnID)。

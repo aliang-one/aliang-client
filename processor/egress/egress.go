@@ -29,23 +29,23 @@ import (
 var directDialer = &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
 
 // peerSource mesh peer 注入缝(atomic.Value,同 processor/tcp 的
-// meshSelfIDSource/meshPikoDialSource 先例):egress 不摸全局单例链,peer
-// 由组装层提供。生产接线留 Task 14(app/tunnel 组装层取 Peers[0]/配置
-// 解析:兜底地址解析为 LANAddrs、PikoDial 封装、返回 nil 表示当前无可用
-// peer)。未注入 = 纯 direct。
-var peerSource atomic.Value // func() *mesh.Peer
+// meshTransportDialSource 先例):egress 不摸全局单例链,peer 由组装层提供。
+// 提供器返回 mesh.Dialer(生产 = ExitClient,app/tunnel egressPeer 从
+// customer.mesh.Peers[0] 装配;返回 nil 表示当前无可用 peer)。未注入 =
+// 纯 direct。
+var peerSource atomic.Value // func() mesh.Dialer
 
 // SetPeerSource 注入 mesh peer 提供器;nil = 清除(回到未接线语义)。
 // 并发安全(生产写方为隧道续期路径,读方为每次平台拨号)。
-func SetPeerSource(fn func() *mesh.Peer) {
+func SetPeerSource(fn func() mesh.Dialer) {
 	if fn == nil {
-		fn = func() *mesh.Peer { return nil }
+		fn = func() mesh.Dialer { return nil }
 	}
 	peerSource.Store(fn)
 }
 
-func peerFromSource() *mesh.Peer {
-	fn, _ := peerSource.Load().(func() *mesh.Peer)
+func peerFromSource() mesh.Dialer {
+	fn, _ := peerSource.Load().(func() mesh.Dialer)
 	if fn == nil {
 		return nil
 	}
@@ -80,8 +80,8 @@ func isOffline() bool {
 // OfflineSignalForTest / PeerSourceForTest 读回两条注入缝的当前值:生产读方
 // 走 isOffline/peerFromSource;导出仅供 app/tunnel 装配断言测试把「两缝同源
 // 同真假」「peer 源已接线」从注释升级为测试钉子(Task 14)。
-func OfflineSignalForTest() bool    { return isOffline() }
-func PeerSourceForTest() *mesh.Peer { return peerFromSource() }
+func OfflineSignalForTest() bool     { return isOffline() }
+func PeerSourceForTest() mesh.Dialer { return peerFromSource() }
 
 // meshFallbackSelfActive 兜底门(design §9.4「平台不可达才兜底」),逐连接
 // 读取。配置四条件(总开关 EffectiveEnabled + Fallback.Enable + self ∈
@@ -104,9 +104,9 @@ func meshFallbackSelfActive() bool {
 // platformDialContext 双轨判定(design §9.4 兜底式):
 //
 //	离线信号真 + 兜底使能 + self 勾选 + 有可用 peer → 先 mesh
-//	  (mesh.Peer.DialContext,WithClass(ClassSelf),target=域名:端口——域名
-//	  直转语义:不本地解析,主机名原样进帧,末跳代解析);mesh 任一失败 →
-//	  direct 重试一次,失败即失败(不循环);
+//	  (ExitClient.DialContext,WithClass(ClassSelf),target=域名:端口——域名
+//	  直转语义:不本地解析,主机名原样进 payload,末跳代解析);mesh 任一
+//	  失败 → direct 重试一次,失败即失败(不循环);
 //	其余(在线/未配置/无 peer)→ 纯 direct(现状,在线行为零变化)。
 //
 // 域名直转的 TLS 语义:mesh 拨出的是到目标 443 的原始 TCP 流,TLS 握手

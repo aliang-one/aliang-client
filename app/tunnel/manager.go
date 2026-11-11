@@ -92,11 +92,12 @@ type Manager struct {
 	// meshSelfDeviceID is the local device id from the most recent
 	// validateConfig (mu guarded). Unlike status.DeviceID (set by Configure
 	// AFTER validateConfig runs, and reset semantics tied to state reporting),
-	// this is readable at assembly time on the very first configure — the
-	// egress peer source (Task 14) reads it via currentDeviceID. Deliberately
-	// NOT cleared by Stop: device id is the permanent device identity, and the
-	// offline fallback dials (the peer source's whole purpose) happen exactly
-	// when the session is stopped.
+	// this is readable at assembly time on the very first configure — read
+	// via currentDeviceID (no production consumer since the ExitClient
+	// switch: identity now travels inside customer.mesh.private_key; kept as
+	// the assembly-time device-id reader for the mesh dispatch seams).
+	// Deliberately NOT cleared by Stop: device id is the permanent device
+	// identity.
 	meshSelfDeviceID string
 }
 
@@ -311,19 +312,15 @@ func (m *Manager) validateConfig(config Config) (runConfig, [sha256.Size]byte, e
 	// B-side mesh receive relay: the deps provider reads customer.mesh live
 	// per connection, so nothing config-derived gates construction here.
 	meshRelay := relay.New(relay.ProductionDeps(config.DeviceID))
-	// A-side mesh egress head header source (Task 7): the outbound dial
-	// (processor/tcp dialByRoute → mesh Peer) reads the local device id from
-	// this seam; same source as the receive relay above.
-	tcp.SetMeshSelfIDSource(func() string { return config.DeviceID })
-	// A-side mesh relay dial source (Task 9): the provider returns the
-	// dialMeshEndpoint method value, which reads the manager's CURRENT config
-	// on every dial — the closure deliberately captures the manager, never a
-	// generation's config values, because renewals reset the whole config and
-	// a captured (url, token) pair would go stale. Stored before the
-	// fingerprint early-return in Configure runs, so even a fingerprint-equal
-	// renewal picks up a changed piko_proxy_url (the key is excluded from the
-	// fingerprint below: the dialer is built per dial and hot-swaps without
-	// tearing the upstream session).
+	// A-side mesh relay dial source (Task 9 / SPEC §7.3): the provider returns
+	// the dialMeshEndpoint method value, which reads the manager's CURRENT
+	// config on every dial — the closure deliberately captures the manager,
+	// never a generation's config values, because renewals reset the whole
+	// config and a captured (url, token) pair would go stale. Stored before
+	// the fingerprint early-return in Configure runs, so even a
+	// fingerprint-equal renewal picks up a changed piko_proxy_url (the key is
+	// excluded from the fingerprint below: the dialer is built per dial and
+	// hot-swaps without tearing the upstream session).
 	proxyURL, proxyErr := validatePikoProxyURL(config.PikoProxyURL)
 	if proxyErr != nil {
 		// Soft-fail: the relay carrier degrades to unavailable; the HTTP
@@ -332,7 +329,7 @@ func (m *Manager) validateConfig(config Config) (runConfig, [sha256.Size]byte, e
 	}
 	m.setMeshDial(proxyURL, config.TunnelToken)
 	m.setMeshSelfDeviceID(config.DeviceID)
-	tcp.SetMeshPikoDialSource(func() meshproxy.PikoDialFunc { return m.dialMeshEndpoint }) // Task 14 生产装配(同位接线):egress 兜底 peer 源 + 离线信号两缝
+	tcp.SetMeshTransportDialSource(func() meshproxy.PikoDialFunc { return m.dialMeshEndpoint }) // 生产装配(同位接线):egress 兜底 peer 源 + 离线信号两缝
 	// (egress/tcp 同一 manager 状态 getter,同源同真假)——本体见
 	// mesh_assembly.go wireMeshAssemblySeams。
 	m.wireMeshAssemblySeams()

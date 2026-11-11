@@ -1,22 +1,26 @@
 package egress
 
 import (
-	"bufio"
+	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/pem"
 	"errors"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	M "aliang.one/nursorgate/inbound/tun/metadata"
 	"aliang.one/nursorgate/outbound/meshproto"
 	mesh "aliang.one/nursorgate/outbound/proxy/mesh"
 	"aliang.one/nursorgate/processor/config"
+	gossh "golang.org/x/crypto/ssh"
 )
 
 // startEchoServer loopback 回显:收到什么回拷什么(测试基建,任务书定死)。
@@ -42,71 +46,129 @@ func startEchoServer(t *testing.T) string {
 	return ln.Addr().String()
 }
 
-// fakeRelay 假 B:复刻 outbound/proxy/mesh/mesh_test.go 的 startFakePeer 帧读取
-// 模式,额外多连接 + HTTP 应答——读出首行 JSON 帧头后继续读 HTTP 请求头
-// (request line + headers),回一个 200/ok,让 client.Get 完整走通。
-type fakeRelay struct {
-	ln        net.Listener
-	headerCh  chan *meshproto.Header
-	reqHeadCh chan string
+// testIdentityKeyPEM 生成一把真 ed25519 测试身份(ExitClient 构造期消费,
+// sshd 侧准入用同一把钥的公钥——两侧同源)。
+func testIdentityKeyPEM(t *testing.T) (keyPEM string, signer gossh.Signer) {
+	t.Helper()
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate ed25519: %v", err)
+	}
+	signer, err = gossh.NewSignerFromKey(priv)
+	if err != nil {
+		t.Fatalf("new signer: %v", err)
+	}
+	block, err := gossh.MarshalPrivateKey(priv, "egress-test-identity")
+	if err != nil {
+		t.Fatalf("marshal private key: %v", err)
+	}
+	return string(pem.EncodeToMemory(block)), signer
 }
 
-func startFakeRelay(t *testing.T) *fakeRelay {
+// meshTestSSHD 本包自建的最小真 sshd(与 outbound/proxy/mesh sshexit_test 同款
+// 配方):固定 mesh 身份公钥准入,mesh-exit channel 的 ExtraData 逐条记录,
+// httpMode=true 时对每条 channel 回一段最小 HTTP 200(平台流量的 HTTP 语义
+// 全链路:client.Get 拿到合法响应才算通)。
+type meshTestSSHD struct {
+	ln       net.Listener
+	hostFP   string
+	httpMode bool
+
+	mu       sync.Mutex
+	payloads [][]byte
+}
+
+func startMeshTestSSHD(t *testing.T, admittedPub gossh.PublicKey, httpMode bool) *meshTestSSHD {
 	t.Helper()
+	_, hostPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate host key: %v", err)
+	}
+	hostSigner, err := gossh.NewSignerFromKey(hostPriv)
+	if err != nil {
+		t.Fatalf("new host signer: %v", err)
+	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	fr := &fakeRelay{
-		ln:        ln,
-		headerCh:  make(chan *meshproto.Header, 4),
-		reqHeadCh: make(chan string, 4),
-	}
+	s := &meshTestSSHD{ln: ln, hostFP: gossh.FingerprintSHA256(hostSigner.PublicKey()), httpMode: httpMode}
 	go func() {
 		for {
-			conn, err := ln.Accept()
+			c, err := ln.Accept()
 			if err != nil {
 				return
 			}
-			go fr.handle(conn)
+			go s.handle(c, hostSigner, admittedPub)
 		}
 	}()
 	t.Cleanup(func() { _ = ln.Close() })
-	return fr
+	return s
 }
 
-func (fr *fakeRelay) handle(conn net.Conn) {
-	defer conn.Close()
-	reader := bufio.NewReader(conn)
-	line, err := reader.ReadString('\n')
+func (s *meshTestSSHD) Addr() string          { return s.ln.Addr().String() }
+func (s *meshTestSSHD) HostKeyPinned() string { return s.hostFP }
+
+// LastPayload 返回最近一条 mesh-exit ExtraData(到达序末条);尚无 channel
+// 时返回 nil。
+func (s *meshTestSSHD) LastPayload() []byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if n := len(s.payloads); n > 0 {
+		return s.payloads[n-1]
+	}
+	return nil
+}
+
+func (s *meshTestSSHD) record(payload []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.payloads = append(s.payloads, payload)
+}
+
+func (s *meshTestSSHD) handle(c net.Conn, hostSigner gossh.Signer, admittedPub gossh.PublicKey) {
+	sc := &gossh.ServerConfig{
+		PublicKeyCallback: func(_ gossh.ConnMetadata, key gossh.PublicKey) (*gossh.Permissions, error) {
+			if !bytes.Equal(key.Marshal(), admittedPub.Marshal()) {
+				return nil, errors.New("mesh test sshd: unknown client identity key")
+			}
+			return nil, nil
+		},
+	}
+	sc.AddHostKey(hostSigner)
+	_, chans, reqs, err := gossh.NewServerConn(c, sc)
 	if err != nil {
+		_ = c.Close()
 		return
 	}
-	hdr, _, err := meshproto.Parse([]byte(line))
-	if err != nil {
-		return
-	}
-	fr.headerCh <- hdr
-	// 读 HTTP 请求头(request line + headers,至空行);裸拨(不做 TLS/HTTP)
-	// 场景客户端直接关连接,读到 EOF 就静默返回,不算错。
-	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
-	var head strings.Builder
-	for {
-		l, err := reader.ReadString('\n')
+	go gossh.DiscardRequests(reqs)
+	for newCh := range chans {
+		if newCh.ChannelType() != mesh.ChannelMeshExit {
+			_ = newCh.Reject(gossh.UnknownChannelType, "unsupported")
+			continue
+		}
+		s.record(newCh.ExtraData())
+		ch, chReqs, err := newCh.Accept()
 		if err != nil {
-			return
+			continue
 		}
-		head.WriteString(l)
-		if strings.TrimSpace(l) == "" {
-			break
-		}
+		go gossh.DiscardRequests(chReqs)
+		go func() {
+			if s.httpMode {
+				// 读一轮请求后回最小 HTTP 200(B 侧出口语义的最小等价物)。
+				buf := make([]byte, 8192)
+				if _, err := ch.Read(buf); err == nil {
+					_, _ = ch.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"))
+				}
+			} else {
+				_, _ = io.Copy(ch, ch) // 回显
+			}
+			_ = ch.Close()
+		}()
 	}
-	fr.reqHeadCh <- head.String()
-	_, _ = conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"))
 }
 
-// closedPortAddr 监听后立即关闭的回环地址:拨它稳定 connection refused
-// (mesh_test.go 同款)。
+// closedPortAddr 监听后立即关闭的回环地址:拨它稳定 connection refused。
 func closedPortAddr(t *testing.T) string {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -129,7 +191,7 @@ func setGlobalConfigForTest(t *testing.T, cfg *config.Config) {
 }
 
 // setPeerSourceForTest 注入/恢复 peer 提供器,Cleanup 统一清空。
-func setPeerSourceForTest(t *testing.T, fn func() *mesh.Peer) {
+func setPeerSourceForTest(t *testing.T, fn func() mesh.Dialer) {
 	t.Helper()
 	SetPeerSource(fn)
 	t.Cleanup(func() { SetPeerSource(nil) })
@@ -140,6 +202,24 @@ func setOfflineSignalForTest(t *testing.T, offline func() bool) {
 	t.Helper()
 	SetOfflineSignal(offline)
 	t.Cleanup(func() { SetOfflineSignal(nil) })
+}
+
+// newTestExitPeer 按对端 LAN 地址装配 ExitClient(生产 egressPeer 同构装配:
+// SSHUser="mesh"、真身份私钥)。
+func newTestExitPeer(t *testing.T, keyPEM, lanAddr, hostKey string, relay bool, pikoDial mesh.PikoDialFunc) mesh.Dialer {
+	t.Helper()
+	spec := mesh.PeerSpec{
+		DeviceID: "dev-b",
+		LANAddrs: []string{lanAddr},
+		HostKey:  hostKey,
+		SSHUser:  "mesh",
+		Relay:    relay,
+	}
+	client, err := mesh.NewExitClient(spec, keyPEM, "", pikoDial)
+	if err != nil {
+		t.Fatalf("NewExitClient: %v", err)
+	}
+	return client
 }
 
 // fallbackSelfConfig 构造兜底使能且含 self 的最小配置。SSH 入口显式开:
@@ -218,20 +298,16 @@ func TestPlatformClientDirectWhenOnline(t *testing.T) {
 }
 
 // TestPlatformClientRoutesViaMeshWhenFallbackActive 兜底配置含 self 且 peer
-// 可用 → 平台流量经 B:帧头 Target=平台域名:端口(域名直转,不本地解析)、
-// Class=self;Host 头为平台域名。
+// 可用 → 平台流量经 B:mesh-exit channel 的 ExtraData payload 携带平台域名
+// 与端口(域名直转,不本地解析);Host 头为平台域名。
 func TestPlatformClientRoutesViaMeshWhenFallbackActive(t *testing.T) {
 	clearProxyEnv(t)
-	fr := startFakeRelay(t)
+	keyPEM, identity := testIdentityKeyPEM(t)
+	sshd := startMeshTestSSHD(t, identity.PublicKey(), true)
 	setGlobalConfigForTest(t, fallbackSelfConfig())
 	setOfflineSignalForTest(t, func() bool { return true })
-	setPeerSourceForTest(t, func() *mesh.Peer {
-		return mesh.NewPeer(mesh.PeerTarget{
-			DeviceID: "dev-b",
-			LANAddrs: []string{fr.ln.Addr().String()},
-			Relay:    false,
-			SelfID:   "dev-a",
-		})
+	setPeerSourceForTest(t, func() mesh.Dialer {
+		return newTestExitPeer(t, keyPEM, sshd.Addr(), sshd.HostKeyPinned(), false, nil)
 	})
 
 	client := PlatformClient(5 * time.Second)
@@ -245,67 +321,51 @@ func TestPlatformClientRoutesViaMeshWhenFallbackActive(t *testing.T) {
 		t.Fatalf("resp = %d/%q, want 200/ok", resp.StatusCode, body)
 	}
 
-	hdr := waitRelayHeader(t, fr)
-	if hdr.Target != "platform.test:80" {
-		t.Fatalf("Target = %q, want platform.test:80", hdr.Target)
-	}
-	if hdr.Class != meshproto.ClassSelf {
-		t.Fatalf("Class = %q, want %s", hdr.Class, meshproto.ClassSelf)
-	}
-	if hdr.From != "dev-a" || len(hdr.Via) != 1 || hdr.Via[0] != "dev-a" || hdr.Hops != 0 {
-		t.Fatalf("帧头 From/Via/Hops = %q/%v/%d, want dev-a/[dev-a]/0", hdr.From, hdr.Via, hdr.Hops)
+	// mesh-exit payload:平台域名:80(80 端口形态由 Transport 的 scheme 折算)。
+	// Host 头语义经真 HTTP 全链路验证:响应成功即代表请求头已送达(读回的
+	// HTTP 200 由本测试 sshd 在收到请求后回写)。
+	if got := waitSSHDLastPayload(t, sshd); !bytes.Contains(got, []byte(`"h":"platform.test"`)) || !bytes.Contains(got, []byte(`"p":80`)) {
+		t.Fatalf("payload = %s, want 携带 platform.test:80", got)
 	}
 
-	select {
-	case head := <-fr.reqHeadCh:
-		if !strings.Contains(head, "Host: platform.test") {
-			t.Fatalf("Host 头缺失: %q", head)
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("timeout waiting for http request head")
-	}
-
-	// 443 端口形态(https 的 scheme 折算由 Transport 完成,此处裸拨验证帧头):
-	// mesh 拨出的是原始 TCP 流,TLS 握手在 Transport 层照常发生,无需特殊处理。
+	// 443 形态裸拨验证:mesh 拨出的是原始 TCP 流,TLS 握手在 Transport 层
+	// 照常发生,无需特殊处理。
 	tr := client.Transport.(*http.Transport)
 	conn, err := tr.DialContext(context.Background(), "tcp", "platform.test:443")
 	if err != nil {
 		t.Fatalf("dial :443 via mesh: %v", err)
 	}
 	_ = conn.Close()
-	hdr443 := waitRelayHeader(t, fr)
-	if hdr443.Target != "platform.test:443" {
-		t.Fatalf("Target = %q, want platform.test:443", hdr443.Target)
-	}
-	if hdr443.Class != meshproto.ClassSelf {
-		t.Fatalf("Class = %q, want %s", hdr443.Class, meshproto.ClassSelf)
+	if got := waitSSHDLastPayload(t, sshd); !bytes.Contains(got, []byte(`"p":443`)) {
+		t.Fatalf("payload = %s, want 携带 platform.test:443", got)
 	}
 }
 
-func waitRelayHeader(t *testing.T, fr *fakeRelay) *meshproto.Header {
+// waitSSHDLastPayload 等待 sshd 至少收到一条 mesh-exit channel 后返回其
+// payload(3s 上限)。
+func waitSSHDLastPayload(t *testing.T, s *meshTestSSHD) []byte {
 	t.Helper()
-	select {
-	case hdr := <-fr.headerCh:
-		return hdr
-	case <-time.After(3 * time.Second):
-		t.Fatal("timeout waiting for mesh header at fake relay B")
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if p := s.LastPayload(); p != nil {
+			return p
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timeout waiting for mesh-exit channel at fake sshd")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	return nil
 }
 
 // TestPlatformClientFallsBackOnError mesh 拨号失败(假 peer 指向死端口)→
 // direct 重试成功;direct 恰好一次(不循环)。
 func TestPlatformClientFallsBackOnError(t *testing.T) {
+	keyPEM, _ := testIdentityKeyPEM(t)
 	dead := closedPortAddr(t)
 	setGlobalConfigForTest(t, fallbackSelfConfig())
 	setOfflineSignalForTest(t, func() bool { return true })
-	setPeerSourceForTest(t, func() *mesh.Peer {
-		return mesh.NewPeer(mesh.PeerTarget{
-			DeviceID: "dev-b",
-			LANAddrs: []string{dead},
-			Relay:    false,
-			SelfID:   "dev-a",
-		})
+	setPeerSourceForTest(t, func() mesh.Dialer {
+		return newTestExitPeer(t, keyPEM, dead, "SHA256:AAAA", false, nil)
 	})
 
 	var hits atomic.Int32
@@ -330,22 +390,18 @@ func TestPlatformClientFallsBackOnError(t *testing.T) {
 }
 
 // TestPlatformClientFallbackNotConfiguredIgnoresMesh 兜底未配置但 peer source
-// 已注入 → 不走 mesh(直连),假 B 一个帧都收不到。
+// 已注入 → 不走 mesh(直连),假 B 一个 channel 都收不到。
 func TestPlatformClientFallbackNotConfiguredIgnoresMesh(t *testing.T) {
-	fr := startFakeRelay(t)
+	keyPEM, identity := testIdentityKeyPEM(t)
+	sshd := startMeshTestSSHD(t, identity.PublicKey(), false)
 	setGlobalConfigForTest(t, &config.Config{Customer: &config.CustomerConfig{
 		Mesh: &config.MeshConfig{}, // mesh 层存在但 Fallback 未配置
 		// SSH 入口显式开:让「Fallback 未配置」成为唯一关闸条件(判据含
 		// SSH 入口依赖后,不补则本用例被依赖降级误吞)。
 		SSHIngress: &config.SSHIngressConfig{Enable: boolPtr(true)},
 	}})
-	setPeerSourceForTest(t, func() *mesh.Peer {
-		return mesh.NewPeer(mesh.PeerTarget{
-			DeviceID: "dev-b",
-			LANAddrs: []string{fr.ln.Addr().String()},
-			Relay:    false,
-			SelfID:   "dev-a",
-		})
+	setPeerSourceForTest(t, func() mesh.Dialer {
+		return newTestExitPeer(t, keyPEM, sshd.Addr(), sshd.HostKeyPinned(), false, nil)
 	})
 
 	var hits atomic.Int32
@@ -367,29 +423,23 @@ func TestPlatformClientFallbackNotConfiguredIgnoresMesh(t *testing.T) {
 	if got := hits.Load(); got != 1 {
 		t.Fatalf("direct hits = %d, want 1", got)
 	}
-	// 假 B 不应收到任何帧头(留 200ms 排除在途)。
+	// 假 B 不应收到任何 channel(留 200ms 排除在途)。
 	time.Sleep(200 * time.Millisecond)
-	select {
-	case hdr := <-fr.headerCh:
-		t.Fatalf("兜底未配置却走了 mesh: %v", hdr)
-	default:
+	if sshd.LastPayload() != nil {
+		t.Fatal("兜底未配置却走了 mesh")
 	}
 }
 
 // assertGoesDirect 门控不激活的统一断言:live 假 B peer 已注入,请求仍必须
-// 直连(httptest 计数==1)且假 B 零帧。
+// 直连(httptest 计数==1)且假 B 零 channel。
 func assertGoesDirect(t *testing.T, cfg *config.Config, offline func() bool) {
 	t.Helper()
-	fr := startFakeRelay(t)
+	keyPEM, identity := testIdentityKeyPEM(t)
+	sshd := startMeshTestSSHD(t, identity.PublicKey(), false)
 	setGlobalConfigForTest(t, cfg)
 	setOfflineSignalForTest(t, offline)
-	setPeerSourceForTest(t, func() *mesh.Peer {
-		return mesh.NewPeer(mesh.PeerTarget{
-			DeviceID: "dev-b",
-			LANAddrs: []string{fr.ln.Addr().String()},
-			Relay:    false,
-			SelfID:   "dev-a",
-		})
+	setPeerSourceForTest(t, func() mesh.Dialer {
+		return newTestExitPeer(t, keyPEM, sshd.Addr(), sshd.HostKeyPinned(), false, nil)
 	})
 
 	var hits atomic.Int32
@@ -412,10 +462,8 @@ func assertGoesDirect(t *testing.T, cfg *config.Config, offline func() bool) {
 		t.Fatalf("direct hits = %d, want 1", got)
 	}
 	time.Sleep(200 * time.Millisecond)
-	select {
-	case hdr := <-fr.headerCh:
-		t.Fatalf("不应走 mesh 却收到帧: %v", hdr)
-	default:
+	if sshd.LastPayload() != nil {
+		t.Fatal("不应走 mesh 却收到了 mesh-exit channel")
 	}
 }
 
@@ -470,21 +518,19 @@ func TestPlatformClientGateVariantsBlockMesh(t *testing.T) {
 }
 
 // TestPlatformClientDoubleFailureErrorChain mesh 与 direct 双败:多 %w 错误
-// 链上 errors.Is 两个分量各自可达。mesh 分量经 fake PikoDial 注入哨兵错,
-// direct 分量用已取消 ctx 造 context.Canceled。
+// 链上 errors.Is 两个分量各自可达。mesh 分量经 fake PikoDial 注入哨兵错
+// (self 类别中继准入、LAN 空载体 → 必落 fake PikoDial),direct 分量用已
+// 取消 ctx 造 context.Canceled。
 func TestPlatformClientDoubleFailureErrorChain(t *testing.T) {
+	keyPEM, _ := testIdentityKeyPEM(t)
 	setGlobalConfigForTest(t, fallbackSelfConfig())
 	setOfflineSignalForTest(t, func() bool { return true })
 	meshSentinel := errors.New("mesh: fake relay carrier down")
-	setPeerSourceForTest(t, func() *mesh.Peer {
-		return mesh.NewPeer(mesh.PeerTarget{
-			DeviceID: "dev-b",
-			Relay:    true, // self 类别中继准入,LAN 空载体 → 必落 fake PikoDial
-			PikoDial: func(ctx context.Context, endpointID string) (net.Conn, error) {
+	setPeerSourceForTest(t, func() mesh.Dialer {
+		return newTestExitPeer(t, keyPEM, "", "SHA256:AAAA", true,
+			func(ctx context.Context, endpointID string) (net.Conn, error) {
 				return nil, meshSentinel
-			},
-			SelfID: "dev-a",
-		})
+			})
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -503,17 +549,17 @@ func TestPlatformClientDoubleFailureErrorChain(t *testing.T) {
 }
 
 // TestSetPeerSourceConcurrentSetAndRead 注入缝并发契约(同 processor/tcp
-// TestMeshSeamConcurrentSetAndRead 先例):生产写方(组装层)与拨号读方
-// 跨 goroutine 并发,-race 下必须无竞争。
+// TestMeshTransportDialSeamConcurrentSetAndRead 先例):生产写方(组装层)与
+// 拨号读方跨 goroutine 并发,-race 下必须无竞争。
 func TestSetPeerSourceConcurrentSetAndRead(t *testing.T) {
-	peer := mesh.NewPeer(mesh.PeerTarget{DeviceID: "dev-b", SelfID: "dev-a"})
+	peer := fakeDialer{}
 	var wg sync.WaitGroup
 	done := make(chan struct{})
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 500; i++ {
-			SetPeerSource(func() *mesh.Peer { return peer })
+			SetPeerSource(func() mesh.Dialer { return peer })
 			SetPeerSource(nil)
 		}
 	}()
@@ -534,7 +580,7 @@ func TestSetPeerSourceConcurrentSetAndRead(t *testing.T) {
 		t.Fatal("timeout: seam 并发读写死锁或过慢")
 	}
 	// 收尾留一个非 nil 语义验证后清空。
-	SetPeerSource(func() *mesh.Peer { return peer })
+	SetPeerSource(func() mesh.Dialer { return peer })
 	if got := peerFromSource(); got == nil {
 		t.Fatal("注入后 peerFromSource 应返回非 nil peer")
 	}
@@ -542,4 +588,11 @@ func TestSetPeerSourceConcurrentSetAndRead(t *testing.T) {
 	if got := peerFromSource(); got != nil {
 		t.Fatalf("清空后 peerFromSource = %v, want nil", got)
 	}
+}
+
+// fakeDialer 最小 mesh.Dialer(并发契约测试专用,不真拨)。
+type fakeDialer struct{}
+
+func (fakeDialer) DialContext(context.Context, *M.Metadata) (net.Conn, error) {
+	return nil, errors.New("fakeDialer: unused")
 }

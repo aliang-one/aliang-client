@@ -7,6 +7,9 @@ package tunnel
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/pem"
 	"errors"
 	"net"
 	"testing"
@@ -16,18 +19,18 @@ import (
 	M "aliang.one/nursorgate/inbound/tun/metadata"
 	"aliang.one/nursorgate/outbound/meshproto"
 	meshproxy "aliang.one/nursorgate/outbound/proxy/mesh"
-	"aliang.one/nursorgate/outbound/proxy/proto"
 	"aliang.one/nursorgate/processor/config"
 	"aliang.one/nursorgate/processor/egress"
 	"aliang.one/nursorgate/processor/tcp"
+	gossh "golang.org/x/crypto/ssh"
 )
 
-// restoreMeshAssemblySeams validateConfig 现在写 egress/tcp 四条全局缝
-// (selfID/pikoDial/offline×2/peerSource),触达装配面的测试结束后全部清空
-// 归位(同 restoreMeshSelfIDSeam 的纪律:缝已原子化,归位并发安全)。
+// restoreMeshAssemblySeams validateConfig 现在写 egress/tcp 全局缝
+// (中继拨号/offline×2/peerSource),触达装配面的测试结束后全部清空
+// 归位(同 restoreMeshTransportDialSeam 的纪律:缝已原子化,归位并发安全)。
 func restoreMeshAssemblySeams(t *testing.T) {
 	t.Helper()
-	restoreMeshSelfIDSeam(t)
+	restoreMeshTransportDialSeam(t)
 	t.Cleanup(func() {
 		egress.SetOfflineSignal(nil)
 		egress.SetPeerSource(nil)
@@ -81,8 +84,9 @@ func TestOfflineSeamsShareManagerSource(t *testing.T) {
 }
 
 // TestEgressPeerSourceAssemblesFirstPeer 生产 peer 源装配:validateConfig 后
-// egress 读到当前全局配置 Peers[0] 装配的 Peer(设备号进 Base.Address);
-// mesh 未配置/关/空 peers → nil(纯直连)。快照不缓存:换配即生效。
+// egress 读到当前全局配置 Peers[0] 装配的 ExitClient(决策 #4:消费面走
+// mesh.Dialer 接口,类型断言钉住具体形态);mesh 未配置/SSH 依赖降级/关/
+// 空 peers → nil(纯直连)。快照不缓存:换配即生效。
 func TestEgressPeerSourceAssemblesFirstPeer(t *testing.T) {
 	restoreMeshAssemblySeams(t)
 	manager := NewManager(nil)
@@ -92,22 +96,24 @@ func TestEgressPeerSourceAssemblesFirstPeer(t *testing.T) {
 	}
 
 	restoreConfig := swapGlobalMeshConfig(t, &config.MeshConfig{
-		Peers: []config.MeshPeer{{DeviceID: "dev-b", LANAddrs: []string{"192.168.1.20:56441"}}},
+		PrivateKey: meshAssemblyTestKeyPEM(t),
+		Peers:      []config.MeshPeer{{DeviceID: "dev-b", LANAddrs: []string{"192.168.1.20:56432"}, HostKey: "SHA256:AAAA"}},
 	})
 	defer restoreConfig()
 
 	peer := egress.PeerSourceForTest()
 	if peer == nil {
-		t.Fatal("配置 peers[0] 后 peer 源应返回 Peer")
+		t.Fatal("配置 peers[0] 后 peer 源应返回 ExitClient")
 	}
-	if peer.Address != "dev-b" {
-		t.Fatalf("peer.Address = %q, want dev-b", peer.Address)
+	if _, ok := peer.(*meshproxy.ExitClient); !ok {
+		t.Fatalf("peer 类型 = %T, want *meshproxy.ExitClient(决策 #4 承载形态)", peer)
 	}
 
 	// 换配(mesh 总开关显式关)即时生效:下一次读取返回 nil。
 	restoreConfig2 := swapGlobalMeshConfig(t, &config.MeshConfig{
-		Enable: boolPtr(false),
-		Peers:  []config.MeshPeer{{DeviceID: "dev-b"}},
+		Enable:     boolPtr(false),
+		PrivateKey: meshAssemblyTestKeyPEM(t),
+		Peers:      []config.MeshPeer{{DeviceID: "dev-b", HostKey: "SHA256:AAAA"}},
 	})
 	defer restoreConfig2()
 	if peer := egress.PeerSourceForTest(); peer != nil {
@@ -116,21 +122,23 @@ func TestEgressPeerSourceAssemblesFirstPeer(t *testing.T) {
 }
 
 // TestManagerEgressPeerAssemblyNilCases egressPeer 装配的 nil 分支单元钉:
-// 未配置/空 peers/空白 device_id → nil。
+// 未配置/空 peers/缺身份私钥/空白 device_id → nil。
 func TestManagerEgressPeerAssemblyNilCases(t *testing.T) {
 	restoreMeshAssemblySeams(t)
 	manager := NewManager(nil)
 	if _, _, err := manager.validateConfig(validTestConfig(t)); err != nil {
 		t.Fatal(err)
 	}
+	keyPEM := meshAssemblyTestKeyPEM(t)
 
 	cases := []struct {
 		name string
 		mesh *config.MeshConfig
 	}{
 		{"未配置(nil)", nil},
-		{"空 peers", &config.MeshConfig{}},
-		{"空白 device_id", &config.MeshConfig{Peers: []config.MeshPeer{{DeviceID: "  "}}}},
+		{"空 peers", &config.MeshConfig{PrivateKey: keyPEM}},
+		{"缺身份私钥", &config.MeshConfig{Peers: []config.MeshPeer{{DeviceID: "dev-b", HostKey: "SHA256:AAAA"}}}},
+		{"空白 device_id", &config.MeshConfig{PrivateKey: keyPEM, Peers: []config.MeshPeer{{DeviceID: "  "}}}},
 	}
 	for _, tc := range cases {
 		restore := swapGlobalMeshConfig(t, tc.mesh)
@@ -141,10 +149,10 @@ func TestManagerEgressPeerAssemblyNilCases(t *testing.T) {
 	}
 }
 
-// TestManagerEgressPeerAssemblyFields 装配字段钉:DeviceID 进 Base.Address、
-// 协议=mesh、LANAddrs 过滤空白项后拷贝、PikoDial 为 manager 的
-// dialMeshEndpoint(proxy url 未配置时错误链含 errMeshRelayUnavailable——
-// 中继载体「不可用」软失败契约,证明闭包确为 manager 侧接线而非空置)。
+// TestManagerEgressPeerAssemblyFields 装配字段钉:返回 *ExitClient(决策 #4)、
+// LANAddrs 过滤空白项后拷贝、PikoDial 为 manager 的 dialMeshEndpoint
+// (proxy url 未配置时错误链含 errMeshRelayUnavailable——中继载体「不可用」
+// 软失败契约,证明闭包确为 manager 侧接线而非空置)。
 func TestManagerEgressPeerAssemblyFields(t *testing.T) {
 	restoreMeshAssemblySeams(t)
 	manager := NewManager(nil)
@@ -153,27 +161,30 @@ func TestManagerEgressPeerAssemblyFields(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// TEST-NET 地址:LAN 载体首轮拨号不可达(与本仓集成测试的避网段约定
-	// 一致),随后中继载体分支触发软失败。
+	// LAN 首地址拨「监听即关」的回环端口:connection refused 即时失败(确定性,
+	// 不依赖 TEST-NET 的路由环境差异——某些环境 TEST-NET 会连上黑洞直致 10s
+	// 握手超时),随后中继载体分支触发软失败(self 类别中继准入)。
+	closedLn, lnErr := net.Listen("tcp", "127.0.0.1:0")
+	if lnErr != nil {
+		t.Fatal(lnErr)
+	}
+	closedAddr := closedLn.Addr().String()
+	_ = closedLn.Close()
 	restore := swapGlobalMeshConfig(t, &config.MeshConfig{
+		PrivateKey: meshAssemblyTestKeyPEM(t),
 		Peers: []config.MeshPeer{{
 			DeviceID: "dev-b",
-			LANAddrs: []string{"203.0.113.5:56441", "  "},
+			LANAddrs: []string{closedAddr, "  "},
+			HostKey:  "SHA256:AAAA",
 		}},
 	})
 	defer restore()
 
-	peer := manager.egressPeer()
-	if peer == nil {
-		t.Fatal("egressPeer = nil, want Peer")
+	peer, ok := manager.egressPeer().(*meshproxy.ExitClient)
+	if !ok || peer == nil {
+		t.Fatalf("egressPeer = %T, want *meshproxy.ExitClient", manager.egressPeer())
 	}
-	if peer.Address != "dev-b" {
-		t.Fatalf("Address = %q, want dev-b", peer.Address)
-	}
-	if peer.Protocol != proto.Mesh {
-		t.Fatalf("Protocol = %q, want %q", peer.Protocol, proto.Mesh)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	ctx = meshproxy.WithClass(ctx, meshproto.ClassSelf)
 	_, err := peer.DialContext(ctx, &M.Metadata{HostName: "probe.invalid", DstPort: 443})
@@ -243,12 +254,37 @@ func TestMeshLANAssemblyLifecycle(t *testing.T) {
 // ===== 测试基建 =====
 
 // swapGlobalMeshConfig 换配全局 customer.mesh(返回恢复函数;恢复测试外的
-// 全局配置原样,避免抹掉其他用例的换配)。
+// 全局配置原样,避免抹掉其他用例的换配)。SSH 入口显式开:egressPeer 的
+// 生效门切到 MeshEffectivelyEnabled(SPEC §10.3)后,不补则所有换配被依赖
+// 降级误吞;被测的关闸条件(总开关/peers/私钥)在各用例内自持。
 func swapGlobalMeshConfig(t *testing.T, mesh *config.MeshConfig) func() {
 	t.Helper()
 	prev := config.GetGlobalConfig()
-	config.SetGlobalConfig(&config.Config{Customer: &config.CustomerConfig{Mesh: mesh}})
+	config.SetGlobalConfig(&config.Config{Customer: &config.CustomerConfig{
+		Mesh:       mesh,
+		SSHIngress: &config.SSHIngressConfig{Enable: boolPtr(true)},
+	}})
 	return func() { config.SetGlobalConfig(prev) }
+}
+
+// meshAssemblyTestKeyPEM 生成一把真 ed25519 测试身份(ExitClient 构造期
+// SignerFromPEM 解析,格式非法即装配失败;每用例新钥互不串味)。
+func meshAssemblyTestKeyPEM(t *testing.T) string {
+	t.Helper()
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate ed25519: %v", err)
+	}
+	signer, err := gossh.NewSignerFromKey(priv)
+	if err != nil {
+		t.Fatalf("new signer: %v", err)
+	}
+	block, err := gossh.MarshalPrivateKey(priv, "mesh-assembly-test")
+	if err != nil {
+		t.Fatalf("marshal private key: %v", err)
+	}
+	_ = signer
+	return string(pem.EncodeToMemory(block))
 }
 
 func boolPtr(b bool) *bool { return &b }

@@ -1,9 +1,8 @@
 // payload.go 承担 mesh 出口的目标构造与 ExtraData payload 编码:
 // hostPortFromMetadata 把四形态的连接元数据拆成 (host, port) 二元组,
 // exitPayload 再编码为 mesh-exit channel 的 JSON ExtraData(tcp 带 h/p;
-// dns 特殊目标无 h/p)。旧帧协议的 targetFromMetadata(design §3.2)在
-// Task E1 整体删除前仍由 Peer.DialContext 使用,与本文件并存但语义分流:
-// 帧头 Target 串走旧函数,SSH channel payload 走本文件。
+// dns 特殊目标无 h/p)。导出缝 ExitPayloadForMetadata/ErrUnbuildableTarget
+// 供 processor/tcp 的兜底拨号路径(DialMeshAddr 无 ExitClient 消费面)复用。
 package mesh
 
 import (

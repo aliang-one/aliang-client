@@ -19,14 +19,13 @@ import (
 	"aliang.one/nursorgate/processor/tcp"
 )
 
-// restoreMeshDialSeams 归位 validateConfig 会写的两条全局注入缝(selfID +
-// pikoDial,见 manager.go validateConfig),防止跨测试泄漏(与
-// restoreMeshSelfIDSeam 同款约定)。
+// restoreMeshDialSeams 归位 validateConfig 会写的全局注入缝(中继拨号,
+// 见 manager.go validateConfig),防止跨测试泄漏(与
+// restoreMeshTransportDialSeam 同款约定)。
 func restoreMeshDialSeams(t *testing.T) {
 	t.Helper()
 	t.Cleanup(func() {
-		tcp.SetMeshSelfIDSource(nil)
-		tcp.SetMeshPikoDialSource(nil)
+		tcp.SetMeshTransportDialSource(nil)
 	})
 }
 

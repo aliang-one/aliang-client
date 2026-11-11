@@ -2,8 +2,9 @@
 // 本文件收口三条装配线——
 //
 //   - egress 兜底 peer 源(egress.SetPeerSource):从当前全局配置
-//     customer.mesh.Peers[0] 装配 mesh.Peer,未配置/总开关关/空 peers → nil
-//     (egress 纯直连)。闭包读调用时刻的配置,保存即生效,不缓存快照。
+//     customer.mesh.Peers[0] 装配 ExitClient(SPEC §5.1),未配置/总开关关/
+//     SSH 依赖降级/空 peers/缺身份 → nil(egress 纯直连)。闭包读调用时刻
+//     的配置,保存即生效,不缓存快照。
 //   - 离线信号两缝(egress.SetOfflineSignal + tcp.SetMeshOfflineSignal):
 //     同一 manager 隧道状态 getter(TunnelSessionActive)同位接线——同源同
 //     真假契约(两缝注释互指,Task 12 评审钉死):漏接 tcp 缝 = AI 改道永久
@@ -60,17 +61,22 @@ func (m *Manager) meshOfflineSignal() func() bool {
 	return func() bool { return !m.TunnelSessionActive() }
 }
 
-// egressPeer 从当前全局配置装配 egress 兜底 peer(Peers[0]):LANAddrs 逐项
-// 过滤空白后拷贝(不共享配置切片),Relay 缺省放行,PikoDial 取 manager 的
-// dialMeshEndpoint(每次拨号读当前 proxy url/token),SelfID 取 manager 当前
-// 会话的 device_id。未配置/总开关关/空 peers/空白 device_id → nil。
-func (m *Manager) egressPeer() *meshproxy.Peer {
+// egressPeer 从当前全局配置装配 egress 兜底 peer(Peers[0]):SSH 依赖降级
+// 由 MeshEffectivelyEnabled 承担(SPEC §10.3);私钥/钉扎缺失 → nil(该
+// peer 能力不成立)。ExitClient 每次调用重建——离线兜底触发频率低,构造期
+// 解析私钥开销可接受(SPEC 计划决策 #1)。LANAddrs 逐项过滤空白后拷贝
+// (不共享配置切片),Relay 缺省放行,PikoDial 取 manager 的
+// dialMeshEndpoint(每次拨号读当前 proxy url/token)。
+func (m *Manager) egressPeer() meshproxy.Dialer {
 	cfg := config.GetGlobalConfig()
 	if cfg == nil || cfg.Customer == nil || cfg.Customer.Mesh == nil {
 		return nil
 	}
 	mesh := cfg.Customer.Mesh
-	if !mesh.EffectiveEnabled() || len(mesh.Peers) == 0 {
+	if !cfg.MeshEffectivelyEnabled() || len(mesh.Peers) == 0 {
+		return nil
+	}
+	if strings.TrimSpace(mesh.PrivateKey) == "" {
 		return nil
 	}
 	first := mesh.Peers[0]
@@ -84,14 +90,19 @@ func (m *Manager) egressPeer() *meshproxy.Peer {
 			lanAddrs = append(lanAddrs, addr)
 		}
 	}
-	return meshproxy.NewPeer(meshproxy.PeerTarget{
+	spec := meshproxy.PeerSpec{
 		DeviceID: deviceID,
 		LANAddrs: lanAddrs,
+		HostKey:  strings.TrimSpace(first.HostKey),
+		SSHUser:  "mesh",
 		Relay:    first.Relay == nil || *first.Relay,
-		PikoDial: m.dialMeshEndpoint,
-		MaxHops:  mesh.EffectiveMaxHops(),
-		SelfID:   m.currentDeviceID(),
-	})
+	}
+	client, err := meshproxy.NewExitClient(spec, mesh.PrivateKey, mesh.KeyPassphrase, m.dialMeshEndpoint)
+	if err != nil {
+		log.Printf("[MESH-LAN] egress fallback peer %s unavailable: %v", deviceID, err)
+		return nil
+	}
+	return client
 }
 
 // currentDeviceID manager 视角的本机 device_id(最近一次 validateConfig 写入
@@ -243,9 +254,9 @@ func MeshLANPort() int {
 	return config.DefaultHTTPProxyPort
 }
 
-// wireMeshAssemblySeams validateConfig 的装配接线点(与 SetMeshSelfIDSource/
-// SetMeshPikoDialSource 同位):egress 双缝 + tcp 离线缝。抽成单函数使接线
-// 顺序与注释同处一页;每次 Configure(含幂等续期)重跑,atomic Store 幂等。
+// wireMeshAssemblySeams validateConfig 的装配接线点(与
+// SetMeshTransportDialSource 同位):egress 双缝 + tcp 离线缝。抽成单函数使
+// 接线顺序与注释同处一页;每次 Configure(含幂等续期)重跑,atomic Store 幂等。
 func (m *Manager) wireMeshAssemblySeams() {
 	offline := m.meshOfflineSignal()
 	egress.SetOfflineSignal(offline)

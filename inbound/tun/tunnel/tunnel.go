@@ -55,11 +55,11 @@ type Tunnel struct {
 	dialerMu sync.RWMutex
 	dialer   proxy.Dialer
 
-	// meshDNSForwardFn 是 TUN UDP/53 mesh DNS 代转发对端提供器(Task 8 注入
-	// 缝,nil = 未接线/门未激活):门控判定与 Peer 装配在注入方(Task 9
-	// app/tunnel),见 dns_forward.go SetMeshDNSForwardPeerSource。
+	// meshDNSForwardFn 是 TUN UDP/53 mesh DNS 代转发对端提供器(注入缝,
+	// nil = 未接线/门未激活):门控判定与 ExitClient 装配在注入方
+	// (app/tunnel),见 dns_forward.go SetMeshDNSForwardPeerSource。
 	meshDNSMu        sync.Mutex
-	meshDNSForwardFn func() *meshproxy.Peer
+	meshDNSForwardFn func() meshproxy.Dialer
 
 	// Where the Tunnel statistics are sent to.
 	manager *statistic.Manager
