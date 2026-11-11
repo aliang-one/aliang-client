@@ -26,6 +26,15 @@ func TestTransportAdmitMatrix(t *testing.T) {
 	if !piko.Admit(meshproto.ClassSelf, peerWithAddr) || !piko.Admit(meshproto.ClassAI, peerWithAddr) {
 		t.Fatal("self/ai may ride relay")
 	}
+	// relay-only peer(无 LAN 地址)必须仍能走中继:若有人给 PikoTransport.Admit
+	// 加地址要求,这两行必红(SPEC §7.1 中继准入只看类别不看地址)。
+	if !piko.Admit(meshproto.ClassSelf, peerNoAddr) || !piko.Admit(meshproto.ClassAI, peerNoAddr) {
+		t.Fatal("relay-only peer must still reach relay regardless of addr presence")
+	}
+	// IsRelay 是 DialContext 错误分桶的判据(中继错误与 LAN 错误分开报)。
+	if (LANTransport{}).IsRelay() || !(PikoTransport{}).IsRelay() {
+		t.Fatal("IsRelay must be false for lan and true for piko")
+	}
 }
 
 func TestPikoTransportBuildsEndpointID(t *testing.T) {

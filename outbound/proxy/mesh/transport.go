@@ -16,6 +16,7 @@ const lanDialTimeout = 5 * time.Second
 type Transport interface {
 	Name() string                           // "lan" / "piko" / 未来 "udp"
 	Admit(class string, peer PeerSpec) bool // 载体准入:custom 禁走公共中继;LAN 还需有地址
+	IsRelay() bool                          // 是否中继载体:ExitClient.DialContext 错误分桶的判据
 	DialSSHD(ctx context.Context, peer PeerSpec) (net.Conn, error)
 }
 
@@ -27,6 +28,8 @@ type LANTransport struct{}
 func (LANTransport) Name() string { return "lan" }
 
 func (LANTransport) Admit(_ string, peer PeerSpec) bool { return len(peer.LANAddrs) > 0 }
+
+func (LANTransport) IsRelay() bool { return false }
 
 func (LANTransport) DialSSHD(ctx context.Context, peer PeerSpec) (net.Conn, error) {
 	var lastErr error
@@ -56,6 +59,8 @@ func (PikoTransport) Name() string { return "piko" }
 func (PikoTransport) Admit(class string, _ PeerSpec) bool {
 	return class == meshproto.ClassSelf || class == meshproto.ClassAI
 }
+
+func (PikoTransport) IsRelay() bool { return true }
 
 func (t PikoTransport) DialSSHD(ctx context.Context, peer PeerSpec) (net.Conn, error) {
 	return t.dial(ctx, peer.DeviceID+meshRelayEndpointSuffix)

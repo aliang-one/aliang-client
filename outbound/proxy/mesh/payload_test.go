@@ -67,6 +67,14 @@ func TestExitPayloadVariants(t *testing.T) {
 	if got := exitPayload(&M.Metadata{HostName: "x.com:99999", DstPort: 0}); got != nil {
 		t.Fatalf("port overflow must yield nil, got %s", got)
 	}
+	// 带中括号的 IPv6:SplitHostPort 剥括号,host 落裸 "::1"。
+	if got := exitPayload(&M.Metadata{HostName: "[::1]:8443"}); string(got) != `{"t":"tcp","h":"::1","p":8443}` {
+		t.Fatalf("bracketed ipv6 payload = %s", got)
+	}
+	// 非数字端口:host:port 形态解析成功但端口转 uint16 失败 ⇒ 不可构造 nil。
+	if got := exitPayload(&M.Metadata{HostName: "x.com:abc"}); got != nil {
+		t.Fatalf("non-numeric port must yield nil, got %s", got)
+	}
 	// 导出缝与内部实现同义(processor/tcp 兜底拨号路径消费,Task E1)。
 	if got := ExitPayloadForMetadata(&M.Metadata{HostName: "x.com", DstPort: 443}); string(got) != `{"t":"tcp","h":"x.com","p":443}` {
 		t.Fatalf("exported alias payload = %s", got)

@@ -41,10 +41,12 @@ func TestPinnedHostKeyMatrix(t *testing.T) {
 		wantErr string // "" = 必须通过
 	}{
 		{"authorized_keys match", akLine, pub, ""},
-		{"authorized_keys mismatch", akLine, pub2, "mismatch"},
+		{"authorized_keys mismatch", akLine, pub2, "host key mismatch"},
 		{"authorized_keys empty fail-closed", "", pub, "fail-closed"},
 		{"fingerprint match", fp, pub, ""},
-		{"fingerprint mismatch", fp, pub2, "mismatch"},
+		// 指纹分支精确到 "mismatch (fingerprint)":与字节比对分支("host key
+		// mismatch" 无后缀)可区分,两分支的错误文案不许互相漂移(SPEC §10.4)。
+		{"fingerprint mismatch", fp, pub2, "mismatch (fingerprint)"},
 		{"fingerprint empty fail-closed", "", pub, "fail-closed"},
 	}
 	for _, c := range cases {
