@@ -95,13 +95,19 @@ func (h *MeshHandler) HandleStatus(w http.ResponseWriter, r *http.Request) {
 		resp.LANListenPort = h.lanPort()
 	}
 	if h.config != nil {
-		if cfg := h.config(); cfg != nil && cfg.Customer != nil && cfg.Customer.Mesh != nil {
-			mesh := cfg.Customer.Mesh
-			resp.Enable = mesh.EffectiveEnabled()
+		if cfg := h.config(); cfg != nil {
+			// Effective 的守卫只有 cfg 非 nil:MeshEffectivelyEnabled 对 nil
+			// Customer/Mesh 安全(nil mesh 总开关=默认开),mesh 键缺失而
+			// ssh 开启时真值为 true——若也锁进 Mesh!=nil 守卫,这种已生效态
+			// 会被误报成 false,正是本字段要防的「已启用却不通没法定位」。
 			resp.Effective = cfg.MeshEffectivelyEnabled()
-			resp.ForwardEnable = mesh.EffectiveForwardEnabled()
-			if len(mesh.Peers) > 0 {
-				resp.Peers = mesh.Peers
+			if cfg.Customer != nil && cfg.Customer.Mesh != nil {
+				mesh := cfg.Customer.Mesh
+				resp.Enable = mesh.EffectiveEnabled()
+				resp.ForwardEnable = mesh.EffectiveForwardEnabled()
+				if len(mesh.Peers) > 0 {
+					resp.Peers = mesh.Peers
+				}
 			}
 		}
 	}

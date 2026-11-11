@@ -27,6 +27,8 @@ func IsDNSTarget(target string) bool { return target == DNSTarget }
 
 // SplitTarget 拆 host:port;裸域名(无端口)由调用方按 443 兜底。
 // 返回 isDomain=false 表示 host 为 IP 字面量。
+// 生产消费方已随帧协议退役(F1),仅自身测试引用;一期保留(SPEC §17),
+// 后续实施批次确认确无用再删。
 func SplitTarget(target string) (host, port string, isDomain bool, err error) {
 	if target == DNSTarget {
 		return "", "", false, nil

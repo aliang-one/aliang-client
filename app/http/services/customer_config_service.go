@@ -276,10 +276,12 @@ func ReconcileSSHIngressFromConfig(cfg *config.Config) {
 		sshin.Reconcile(nil, "", nil)
 		return
 	}
-	// LocalNodeID 注入缝:防环 AppendHop 读的节点标识经 AgentService
-	// currentDeviceID 活取(闭包绑定单例指针,读时求值)。ForwardGate 已
-	// 随 buildSSHIngressRunConfig 注入活闭包(连接期读全局活值,见
-	// buildSSHIngressRunConfig 注释)——门禁切换不经重建即生效。
+	// LocalNodeID 注入缝:本机节点标识(观测/日志身份)经 AgentService
+	// currentDeviceID 活取(闭包绑定单例指针,读时求值);防环 AppendHop
+	// 已随帧协议退役(SPEC §13.1),inbound/ssh 本包无读取方,注入保留是
+	// 为装配契约不断链。ForwardGate 已随 buildSSHIngressRunConfig 注入活
+	// 闭包(连接期读全局活值,见 buildSSHIngressRunConfig 注释)——门禁
+	// 切换不经重建即生效。
 	sshin.Reconcile(rc, hostKeyPath, GetSharedAgentService().currentDeviceID)
 }
 

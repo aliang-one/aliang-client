@@ -45,9 +45,9 @@ type RunConfig struct {
 	MeshKeys []MeshKey
 
 	// LocalNodeID 返回本机节点标识。装配层仍注入(AgentService.currentDeviceID);
-	// mesh-exit 形态自 D2 起不再消费(旧帧协议的 AppendHop/LocalNodeID 防御
-	// 随帧协议删除,防环改由注入 Metadata 的 MeshInjected 标记承担,SPEC
-	// §6.2),字段暂留待装配层批次(F1)统一清理,当前本包无读取方。
+	// mesh-exit 形态自 D2 起不再消费(旧帧协议的 AppendHop 防环随帧协议删除,
+	// 防环改由注入 Metadata 的 MeshInjected 标记承担,SPEC §6.2)。F1 已核:
+	// 本包无读取方,字段保留供装配层继续注入,清理候选。
 	LocalNodeID func() string
 
 	// ForwardGate 返回转发总开关(customer.mesh.forward_enable 活视图)。
