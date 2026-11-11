@@ -916,3 +916,131 @@ func TestAgentCoreJournalDedupSurvivesEvictionWindow(t *testing.T) {
 		t.Fatalf("窗口内重复必须去重，实际 %d 行: %v", len(rows), rows)
 	}
 }
+
+func TestJournalUnfinishedSubagentsIncremental(t *testing.T) {
+	// 审计修复（2026-11-10 ④）：装配扫描增量化——同一游标跨调用消化追加行，
+	// 结果与全量扫描等价；残尾（半行）先忽略、补全后识别；游标偏移推进精确。
+	j := newAgentCoreJournal(t.TempDir())
+	sid := "sess-incr"
+
+	j.appendSubagentStart(sid, "t1", "researcher", "调研", "任务A")
+	if got := j.unfinishedSubagents(sid); len(got) != 1 || got[0].TaskID != "t1" {
+		t.Fatalf("首轮未终态 = %+v", got)
+	}
+
+	// 追加后第二轮：t1 已终态 + 新增 t2 → 只报新的。
+	j.appendSubagentFinish(sid, "t1", "completed", "结论", "全文", 10, 5)
+	j.appendSubagentStart(sid, "t2", "reviewer", "评审", "任务B")
+	if got := j.unfinishedSubagents(sid); len(got) != 1 || got[0].TaskID != "t2" {
+		t.Fatalf("增量轮未终态 = %+v", got)
+	}
+
+	// 残尾：写入半行（无换行，模拟写中断）→ 本轮忽略；补全后半行拼回识别。
+	path := filepath.Join(j.dir, agentCoreJournalFileName(sid))
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("打开 journal 失败: %v", err)
+	}
+	f.WriteString(`{"kind":"subagent","event":"start","task_id":"t3","name":"coder","task":"任务C"`)
+	f.Close()
+	if got := j.unfinishedSubagents(sid); len(got) != 1 || got[0].TaskID != "t2" {
+		t.Fatalf("残尾轮应忽略半行 = %+v", got)
+	}
+	f, err = os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("打开 journal 失败: %v", err)
+	}
+	f.WriteString("}\n")
+	f.Close()
+	got := j.unfinishedSubagents(sid)
+	if len(got) != 2 {
+		t.Fatalf("补全后未终态数 = %d, want 2 (t2+t3): %+v", len(got), got)
+	}
+	// 行序=时间序：t2 先于 t3。
+	if got[0].TaskID != "t2" || got[1].TaskID != "t3" {
+		t.Fatalf("行序错乱: %+v", got)
+	}
+
+	// 外部整文件改写（首行漂移）→ 粗校验命中整份重扫，不残留旧游标的鬼条目。
+	if err := os.WriteFile(path, []byte(`{"kind":"session","session_id":"`+sid+`"}`+"\n"), 0o600); err != nil {
+		t.Fatalf("重写 journal 失败: %v", err)
+	}
+	if got := j.unfinishedSubagents(sid); got != nil {
+		t.Fatalf("改写后应整份重扫返回空: %+v", got)
+	}
+}
+
+func TestJournalUnfinishedSubagentsTruncateInvalidates(t *testing.T) {
+	// truncateBefore 整文件重写 → 增量游标必须精确失效；失效后重扫结果与
+	// 全量扫描等价（不因游标残留漏报/多报）。
+	j := newAgentCoreJournal(t.TempDir())
+	sid := "sess-trunc"
+	j.appendMsg(sid, "user", "u1", "第一问", "2026-11-10T00:00:01Z")
+	j.appendMsg(sid, "user", "u2", "第二问", "2026-11-10T00:00:02Z")
+	j.appendSubagentStart(sid, "t1", "researcher", "调研", "任务A")
+	if got := j.unfinishedSubagents(sid); len(got) != 1 || got[0].TaskID != "t1" {
+		t.Fatalf("截断前未终态 = %+v", got)
+	}
+	applied, err := j.truncateBefore(sid, "u2")
+	if err != nil || !applied {
+		t.Fatalf("truncateBefore = (%v, %v)", applied, err)
+	}
+	// truncateBefore 保留 u2 之前（=u1），u2 及其后的 t1 start 行已随重写
+	// 丢弃。失效后整份重扫必须返回空——若游标残留，旧游标越过新文件末尾
+	// 什么都读不到、却会把内存里的旧 entries 当结果吐出（=鬼条目 t1）。
+	if got := j.unfinishedSubagents(sid); got != nil {
+		t.Fatalf("截断后应整份重扫返回空（不得残留旧游标鬼条目）: %+v", got)
+	}
+	// 失效后的新一轮游标继续增量：追加 t2 → 只报 t2。
+	j.appendSubagentStart(sid, "t2", "reviewer", "评审", "任务B")
+	if got := j.unfinishedSubagents(sid); len(got) != 1 || got[0].TaskID != "t2" {
+		t.Fatalf("截断后增量轮 = %+v", got)
+	}
+}
+
+func TestJournalHealInterruptedSubagents(t *testing.T) {
+	// 复核修复（2026-11-10 ⑤ CONFIRMED P2）：进程硬崩溃留下 start 无 finish
+	// 僵尸行，读侧降级收紧后不再覆盖（lastEndLine < startLine）。装配期对账
+	// 补落 interrupted finish 行后：对账列表清空 + journal 有补记行 + 读侧
+	// （详情装配）显示 interrupted——面板不再永卡「运行中」。
+	j := newAgentCoreJournal(t.TempDir())
+	sid := "sess-heal"
+	j.appendSubagentStart(sid, "t-zombie", "researcher", "调研", "崩溃前派的活")
+	j.appendEnd(sid, "success", "") // 老回合 end 行（收紧后不再误降级僵尸）
+
+	got := j.unfinishedSubagents(sid)
+	if len(got) != 1 || got[0].TaskID != "t-zombie" {
+		t.Fatalf("补记前应报出僵尸: %+v", got)
+	}
+	// 先算后补（顺序反了列表恒空）。
+	j.healInterruptedSubagents(sid, got)
+
+	// 对账列表闭合：幂等（下次装配不再重复补记）。
+	if got := j.unfinishedSubagents(sid); got != nil {
+		t.Fatalf("补记后对账应返回空: %+v", got)
+	}
+	// journal 有补记 finish 行（status=interrupted）。
+	var healed map[string]interface{}
+	for _, line := range readJournalLines(t, j.dir, sid) {
+		if line["kind"] == "subagent" && line["event"] == "finish" && line["task_id"] == "t-zombie" {
+			healed = line
+		}
+	}
+	if healed == nil || healed["status"] != "interrupted" {
+		t.Fatalf("补记 finish 行缺失/状态错: %v", healed)
+	}
+	// 详情读侧闭合：手动落头行文件形态（含 start+end+补记 finish）显示 interrupted。
+	path := filepath.Join(j.dir, agentCoreJournalFileName(sid))
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("读 journal 失败: %v", err)
+	}
+	withHeader := `{"kind":"session","session_id":"` + sid + `","project_path":"/tmp/p","created_at":"2026-11-10T00:00:00Z"}` + "\n" + string(data)
+	if err := os.WriteFile(path, []byte(withHeader), 0o600); err != nil {
+		t.Fatalf("落头行失败: %v", err)
+	}
+	sess := readAgentCoreSessionMetaWithOptions(path, agentVibeSessionReadOptions{})
+	if len(sess.Subagents) != 1 || sess.Subagents[0].Status != "interrupted" {
+		t.Fatalf("补记后详情读侧应显示 interrupted: %+v", sess.Subagents)
+	}
+}

@@ -295,6 +295,63 @@ func (m *agentCoreSubagentMirror) start(bridgeName, description, task string) (s
 	return taskID, true
 }
 
+// queue 排队登记（审计 2026-11-10 ③）：在拿并发槽**之前**占 task_id、登记
+// queued 记录并发帧——排队期面板可见（vm129 实测排队 2m31s 零帧=隐身）。
+// 不落 journal start 行：读侧不认识 queued 行，且排队期崩溃无 sidechain
+// 可丢；started 行在真正起跑（beginRun）时才落。tracked=false（registry
+// 拒收）时排队期静默，与 start 的 fail-soft 同口径。
+func (m *agentCoreSubagentMirror) queue(bridgeName, description, task string) (string, bool) {
+	if m == nil {
+		return "", false
+	}
+	taskID := fmt.Sprintf("agentcore-%s-%s-%d", m.messageID, bridgeName, m.seq.Add(1))
+	record, ok := m.registry.startQueued(taskID, taskID, m.messageID, description, bridgeName, 1, "", false, time.Now())
+	if !ok {
+		return taskID, false
+	}
+	// current_step 给排队一行可见文案（payload 键 current_step 空值省键，
+	// queued 帧必带）。
+	record.CurrentStep = "排队等待并发槽"
+	m.emitRecord(record)
+	return taskID, true
+}
+
+// beginRun 拿到并发槽后 queued → started：journal start 行此刻才落（排队期
+// 不落，见 queue）、activity 起跑钟此刻开始（排队等待不算子 run 活跃）。
+func (m *agentCoreSubagentMirror) beginRun(taskID, bridgeName, description, task string) {
+	if m == nil || taskID == "" {
+		return
+	}
+	record, ok := m.registry.beginQueued(taskID, time.Now())
+	if !ok {
+		return // 未 tracked / 已终态：静默（与 start 的 tracked 短路同口径）
+	}
+	if m.journal != nil {
+		m.journal.appendSubagentStart(m.sessionID, taskID, bridgeName, description, task)
+	}
+	m.activity.beginSubagent()
+	m.emitRecord(record)
+}
+
+// abandonQueued 排队期终止（父回合取消 / 排队期被单独 stop）：queued →
+// interrupted 终态帧 + registry 收账。只发帧不落 journal——排队期从未落
+// start 行，落 finish 会产出「有终态无起点」的孤儿行骗读侧。
+func (m *agentCoreSubagentMirror) abandonQueued(taskID, reason string) {
+	if m == nil || taskID == "" {
+		return
+	}
+	record, ok := m.registry.abandonQueued(taskID, reason, time.Now())
+	if !ok {
+		return
+	}
+	if err := m.emitRecord(record); err != nil {
+		// 终态帧没出去（排队期整回合停止/看门狗击杀时 ctx 守卫先关了 emit
+		// 管道——与 finish 路径同构的确定性丢失，复核 2026-11-10 P2）：置位
+		// 重发标记，finalizeRunSubagents 在 writeJSON 仍活的收尾路径补发。
+		m.registry.markTerminalUnsent(taskID)
+	}
+}
+
 // progress 由子 run 工具调用驱动（current_step/last_tool/tool_uses 进手机
 // 状态行），并对齐 claude 侧语义喂 watchdog 进度钟（subagentProgress——子
 // run 静默期间主 run 无 delta，不喂钟的话 no-progress 窗口会误杀长任务）。
@@ -549,37 +606,31 @@ func (b *agentCoreSubagentBridge) Execute(ctx context.Context, input map[string]
 			}
 		}
 	}
-	// 并发闸（2026-11-10 vm130 事故）：排队拿槽再起跑——排队中的子 agent 还
-	// 没有 task_id（未 start），面板不可见也不可停，与「审批排队不算运行」
-	// 同口径。ctx 取消时放弃排队（主回合已死，排队无意义）。
-	if err := b.control.acquireRun(ctx); err != nil {
-		return agentcore.ToolResult{Content: "运行已取消，子 agent 未启动（并发排队中被终止）", IsError: true}
-	}
-	defer b.control.releaseRun()
-	var mcpTools []agentcore.Tool
-	if b.mcpTools != nil {
-		mcpTools = b.mcpTools()
-	}
-	// 状态镜像：started → progress（子 run 工具调用驱动）→ completed|failed。
-	// 终态在 defer 里发（text/isErr 就绪后）。defer 只在 tracked 时挂——
-	// registry 拒收（cap 满/nil）时不 finish：begin/end 配平靠 start 的
-	// tracked 短路保证，孤儿 finish 行还会骗读侧「有终态无起点」。
+	// 状态镜像：queued（排队）→ started → progress（子 run 工具调用驱动）→
+	// completed|failed。终态在 defer 里发（text/isErr 就绪后）。defer 只在
+	// tracked 时挂——registry 拒收（cap 满/nil）时不 finish：begin/end 配平靠
+	// start 的 tracked 短路保证，孤儿 finish 行还会骗读侧「有终态无起点」。
 	// journal 闭包与 progress 组成同一装饰钩子——tracked 时子 run 内置工具
 	// 改走 appendToolLine（带 subagent_task_id 关联键），未 tracked 保持
 	// b.onToolCall 原样（主会话普通 tool 行）。
-	startedAt := time.Now()
+	//
+	// 排队登记前置（审计 2026-11-10 ③）：task_id 与控制句柄在拿并发槽**之前**
+	// 就位——排队期发 queued 帧（面板可见）、句柄可 stop（cancel 掐断排队等
+	// 待）。排队期不落 journal start 行；started 行在真正拿到槽的 beginRun
+	// 时刻才落。task 截断进 start 行（中断注入数据面）：rune 安全 200 rune，
+	// 与 finish summary 同口径——崩溃后主 LLM 仍知道当时派的是什么活。
+	taskBrief := truncateAgentText(task, 200)
+	subTaskID, tracked := b.mirror.queue(b.name, b.description, taskBrief)
 	isErr := false
 	text := ""
 	var totalTokens int64
-	// task 截断进 start 行（中断注入数据面）：rune 安全 200 rune，与 finish
-	// summary 同口径——崩溃后主 LLM 仍知道当时派的是什么活。
-	subTaskID, tracked := b.mirror.start(b.name, b.description, truncateAgentText(task, 200))
 	// 子 run 的 ctx 从父 ctx 派生（L3 控制面）：per-task 停止=只 cancel 这一条，
 	// 父级取消（整回合停止/超时/watchdog）照旧级联——停止语义只增不减。子 run
 	// 收尾后必须归还 cancel（defer 兜底，防 ctx 泄漏）。
 	subCtx, subCancel := context.WithCancel(ctx)
 	// 控制句柄登记（L3）：外部据此按 task_id 停下来/追加指令。control=nil
 	// （测试路径/宿主未接线）时 register 返回 nil，后续都用 nil 安全的空操作。
+	// 排队期即登记（③）：排队中 stop=cancel subCtx → 排队等待被打断。
 	handle := b.control.register(subTaskID, b.name, subCancel)
 	var toolUses atomic.Int64
 	var turnCounter atomic.Int64
@@ -591,6 +642,29 @@ func (b *agentCoreSubagentBridge) Execute(ctx context.Context, input map[string]
 		}
 		subCancel()
 	}()
+
+	// 并发闸（2026-11-10 vm130 事故）：排队拿槽再起跑。等待听父 ctx 与 subCtx
+	// 两个取消源（③：排队可停）。排队终止时发 queued→interrupted 终态帧，
+	// 不产出孤儿 journal 行（排队期从未落 start 行）。
+	if err := b.control.acquireRunQueued(ctx, subCtx); err != nil {
+		if tracked {
+			reason := "父回合已结束，排队终止"
+			if ctx.Err() == nil && subCtx.Err() != nil {
+				reason = "排队中被停止"
+			}
+			b.mirror.abandonQueued(subTaskID, reason)
+		}
+		return agentcore.ToolResult{Content: "运行已取消，子 agent 未启动（并发排队中被终止）", IsError: true}
+	}
+	defer b.control.releaseRun()
+	// queued → started：StartedAt 从真正起跑起算（DurationMs=纯执行时长，
+	// 不含排队等待）。
+	startedAt := time.Now()
+	b.mirror.beginRun(subTaskID, b.name, b.description, taskBrief)
+	var mcpTools []agentcore.Tool
+	if b.mcpTools != nil {
+		mcpTools = b.mcpTools()
+	}
 	if tracked {
 		defer func() {
 			// 相位判定先取消后错误（2026-11-09 审计）：主回合停止/超时时
@@ -923,7 +997,7 @@ func (m *agentAIManager) agentCoreSubagentTaskTool(run agentAIRun,
 		// 审计 2026-11-10：写死「上限 4」而闸默认 2，多派的子 agent 排队且
 		// 排队期不可见，模型照旧上限派发=常态性隐身排队。
 		description: fmt.Sprintf("子agent（独立内部线程，完成后报告回主对话）：派发一个子 agent 执行任务并返回其完整报告。"+
-			"同回合多次调用并行执行（上限 %d），超出并行的调用会排队等待空位。subagent_type 从 <subagents> 类型清单中选。",
+			"同回合多次调用并行执行（上限 %d），超出并行的调用会排队等待空位——排队中的子 agent 在面板可见（queued 状态）且可随时停止，不必等放行。subagent_type 从 <subagents> 类型清单中选。",
 			agentCoreSubagentParallelLimit(control)),
 		ceiling:       agentCoreSubagentToolCeiling(),
 		bridges:       bridges,

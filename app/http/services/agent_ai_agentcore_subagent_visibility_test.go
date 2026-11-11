@@ -15,6 +15,7 @@ package services
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -32,6 +33,9 @@ type mirrorSpy struct {
 	frames []map[string]interface{}
 	raw    [][]byte
 	act    *agentAIActivity // 可选：断言 begin/endSubagent 配平时注入
+	// failEmit 置位时 emit 记录后返回错误（模拟 ctx 守卫先关 emit 管道的
+	// 必败通道——TerminalUnsent 兜底路径的测试开关）。
+	failEmit bool
 }
 
 func (s *mirrorSpy) emit(frame []byte) error {
@@ -42,8 +46,14 @@ func (s *mirrorSpy) emit(frame []byte) error {
 	if err := json.Unmarshal(frame, &m); err == nil {
 		s.frames = append(s.frames, m)
 	}
+	if s.failEmit {
+		return errTestEmitPipeClosed
+	}
 	return nil
 }
+
+// errTestEmitPipeClosed 模拟 io.Pipe 关闭后的写错误（io.ErrClosedPipe 同族）。
+var errTestEmitPipeClosed = errors.New("test: emit pipe closed")
 
 func (s *mirrorSpy) phases() []string {
 	s.mu.Lock()
@@ -115,13 +125,15 @@ func TestAgentCoreSubagentMirrorLifecycle(t *testing.T) {
 	}
 
 	phases := spy.phases()
-	if len(phases) < 2 {
-		t.Fatalf("事件数 = %d, 至少 started+completed: %v", len(phases), phases)
+	// 契约（2026-11-10 ③ 排队可见化）：首帧 queued（排队登记前置）、次帧
+	// started、末帧 completed、中间只允许 progress。
+	if len(phases) < 3 {
+		t.Fatalf("事件数 = %d, 至少 queued+started+completed: %v", len(phases), phases)
 	}
-	if phases[0] != "started" || phases[len(phases)-1] != "completed" {
+	if phases[0] != "queued" || phases[1] != "started" || phases[len(phases)-1] != "completed" {
 		t.Fatalf("事件序列异常: %v", phases)
 	}
-	for _, p := range phases[1 : len(phases)-1] {
+	for _, p := range phases[2 : len(phases)-1] {
 		if p != "progress" {
 			t.Fatalf("中段只能是 progress: %v", phases)
 		}
@@ -232,8 +244,9 @@ func TestAgentCoreSubagentMirrorProgressCarriesToolUses(t *testing.T) {
 // TestAgentCoreSubagentMirrorFailedPath：子 run 失败 → failed 终态帧。
 // 2026-11-10 起序列不再恰为 [started failed]：重试活性旁路（vm129 审计）
 // 让不可达上游的重试链每次重试都发一条 progress 帧——序列变为
-// [started, progress×N, failed]，N≥0（重试次数由内核退避策略定）。契约：
-// 首帧 started、末帧 failed、中间只允许 progress，且连接类失败至少出现一条
+// [queued, started, progress×N, failed]，N≥0（重试次数由内核退避策略定）。
+// 契约：首帧 queued（2026-11-10 ③ 排队登记前置）、次帧 started、末帧 failed、
+// 中间只允许 progress，且连接类失败至少出现一条
 // 「上游重试」progress（旁路的回归守卫——删掉桥的 OnRetry 分支本条即红）。
 func TestAgentCoreSubagentMirrorFailedPath(t *testing.T) {
 	spy := &mirrorSpy{}
@@ -250,10 +263,13 @@ func TestAgentCoreSubagentMirrorFailedPath(t *testing.T) {
 		t.Fatalf("不可达上游应失败")
 	}
 	phases := spy.phases()
-	if len(phases) < 2 || phases[0] != "started" || phases[len(phases)-1] != "failed" {
-		t.Fatalf("失败路径事件序列 = %v, want [started, progress×N, failed]", phases)
+	// 契约（2026-11-10 ③ 排队可见化）：首帧 queued（排队登记前置）、次帧
+	// started、末帧 failed、中间只允许 progress，且连接类失败至少出现一条
+	// 「上游重试」progress（旁路的回归守卫——删掉桥的 OnRetry 分支本条即红）。
+	if len(phases) < 3 || phases[0] != "queued" || phases[1] != "started" || phases[len(phases)-1] != "failed" {
+		t.Fatalf("失败路径事件序列 = %v, want [queued, started, progress×N, failed]", phases)
 	}
-	for i, p := range phases[1 : len(phases)-1] {
+	for i, p := range phases[2 : len(phases)-1] {
 		if p != "progress" {
 			t.Fatalf("中间帧[%d] = %v, 只允许 progress", i+1, phases)
 		}
@@ -520,5 +536,27 @@ func TestTruncateAgentCoreMCPOutputRuneSafe(t *testing.T) {
 	}
 	if got := truncateAgentCoreMCPOutputRuneSafe("短文", -5); got != "短文" {
 		t.Fatalf("负 maxBytes 应原样: %q", got)
+	}
+}
+
+func TestAgentCoreSubagentAbandonQueuedUnsentFallback(t *testing.T) {
+	// 复核修复（2026-11-10 ③ CONFIRMED P2）：排队期整回合停止/看门狗击杀时
+	// ctx 守卫先关 emit 管道，abandonQueued 的终态帧必败（确定性丢失）——
+	// 必须置位 TerminalUnsent 交 finalizeRunSubagents 补发，否则面板永卡
+	// queued（queued 帧出去时管道还活着）。与 finish 路径的兜底同构。
+	spy := &mirrorSpy{failEmit: true}
+	mirror := newMirrorForTest(t, spy.emit)
+	id, tracked := mirror.queue("researcher", "调研", "任务")
+	if !tracked {
+		t.Fatalf("queue 应登记成功")
+	}
+	mirror.abandonQueued(id, "排队中被停止")
+	drained := mirror.registry.drainUnsentTerminals()
+	if len(drained) != 1 || drained[0].TaskID != id || drained[0].Status != "interrupted" {
+		t.Fatalf("emit 失败应置位 TerminalUnsent 并可补发: %+v", drained)
+	}
+	// 幂等：补发后再次 drain 为空。
+	if again := mirror.registry.drainUnsentTerminals(); len(again) != 0 {
+		t.Fatalf("TerminalUnsent 应一次性消费: %+v", again)
 	}
 }

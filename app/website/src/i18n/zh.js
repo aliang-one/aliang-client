@@ -366,6 +366,7 @@ export default {
   // 常驻入口条文案，与 en.js 成对维护（i18n.test.js 守键集）。
   chat_subagentEntry: '子agent',
   chat_subagentEntryRunning: '{n} 运行中',
+  chat_subagentEntryQueued: '{n} 排队中',
   chat_subagentEntryDone: '{n} 已完成',
   chat_subagentEntryView: '查看详情',
   // 子agent面板与详情（Task 8, spec 2026-11-07-subagent-panel §三），与 en.js
@@ -373,6 +374,7 @@ export default {
   chat_subagentPanelClose: '关闭',
   chat_subagentPanelBack: '返回列表',
   chat_subagentStatusRunning: '运行中',
+  chat_subagentStatusQueued: '排队中',
   chat_subagentStatusCompleted: '已完成',
   chat_subagentStatusFailed: '失败',
   chat_subagentStatusInterrupted: '已中断',

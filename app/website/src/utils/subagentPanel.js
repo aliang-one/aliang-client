@@ -4,7 +4,9 @@
 
 // 终态 phase:定稿后条目冻结——迟到的 progress 帧不得复活条目(否则入口条
 // 翻回 active 卡转圈),与 Go 读侧 3e18f3a 的终态守卫对称。
-const ACTIVE_PHASES = new Set(['started', 'progress']);
+// queued(2026-11-10 ③ 排队可见化):并发闸排队态,算活跃(面板要显示)但不算
+// running(入口条计数/转圈只认 running——排队还没跑起来)。
+const ACTIVE_PHASES = new Set(['started', 'progress', 'queued']);
 const TERMINAL_PHASES = new Set(['completed', 'failed', 'interrupted']);
 
 // 条目形状兜底:输入侧允许字段缺失,输出侧始终补齐整组键,渲染层免判空。
@@ -42,9 +44,17 @@ export function applySubagentEvent(subagents, msg) {
   const phase = msg.phase;
   const idx = list.findIndex(s => s && s.taskId === msg.taskId);
 
-  // started:无则新建(浅拷贝补齐整组键),有则幂等返回既有数据不动。
+  // started:无则新建(浅拷贝补齐整组键);queued 条目收到 started = 排队放行,
+  // 翻 started 并清排队文案;其余既有条目幂等返回不动。
   if (phase === 'started') {
     if (idx >= 0) {
+      // 终态钉死:终态后的迟到 started 帧原样返回,条目不得复活。
+      if (TERMINAL_PHASES.has(list[idx].phase)) return list;
+      if (list[idx].phase === 'queued') {
+        // queued→started(排队放行,2026-11-10 ③):phase 翻 started,排队
+        // 文案清掉——起跑后的 current_step 由 progress 帧接管。
+        return list.map((s, i) => (i === idx ? { ...s, phase: 'started', currentStep: null } : s));
+      }
       // 幂等:已有条目的 name/description/进度数据一律不覆盖,零数据变化
       // 按纪律返回原数组引用,不触发无谓响应式。
       return list;
@@ -53,6 +63,26 @@ export function applySubagentEvent(subagents, msg) {
       ...blankEntry(msg.taskId),
       name: (typeof msg.subagentType === 'string' && msg.subagentType) ? msg.subagentType : msg.taskId,
       description: msg.description ?? null,
+    }];
+  }
+
+  // queued(2026-11-10 ③ 排队可见化):无则新建(带上排队文案),有则仅更新
+  // 文案。终态条目忽略(钉死),已 started/progress 的条目忽略(迟到 queued 帧
+  // ——排队放行后起跑态优先)。
+  if (phase === 'queued') {
+    if (idx >= 0) {
+      if (TERMINAL_PHASES.has(list[idx].phase)) return list;
+      if (list[idx].phase !== 'queued') return list;
+      const step = msg.currentStep ?? null;
+      if (!step) return list;
+      return list.map((s, i) => (i === idx ? { ...s, currentStep: step } : s));
+    }
+    return [...list, {
+      ...blankEntry(msg.taskId),
+      phase: 'queued',
+      name: (typeof msg.subagentType === 'string' && msg.subagentType) ? msg.subagentType : msg.taskId,
+      description: msg.description ?? null,
+      currentStep: msg.currentStep ?? null,
     }];
   }
 
@@ -100,6 +130,7 @@ export function hasActiveSubagents(subagents) {
 // phase 兜底 running 呈现(reducer 未知帧原样保底的容错口径;入口条计数侧
 // 「未知两侧不计」不受影响——本函数只管展示)。
 const PHASE_META = {
+  queued: { labelKey: 'chat_subagentStatusQueued', icon: 'hourglass_top', tone: 'queued' },
   started: { labelKey: 'chat_subagentStatusRunning', icon: 'progress_activity', tone: 'running' },
   progress: { labelKey: 'chat_subagentStatusRunning', icon: 'progress_activity', tone: 'running' },
   completed: { labelKey: 'chat_subagentStatusCompleted', icon: 'check_circle', tone: 'done' },

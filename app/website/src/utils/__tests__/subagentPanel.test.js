@@ -239,3 +239,55 @@ describe('formatSubagentTokens', () => {
     expect(formatSubagentTokens('x')).toBe('');
   });
 });
+
+describe('queued 排队态(2026-11-10 ③ 排队可见化)', () => {
+  it('queued 未知 taskId 新建条目,phase=queued 且带排队文案', () => {
+    const out = applySubagentEvent([], ev('tq1', 'queued', {
+      subagentType: 'researcher',
+      description: '调研',
+      currentStep: '排队等待并发槽',
+    }));
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({
+      taskId: 'tq1',
+      name: 'researcher',
+      description: '调研',
+      phase: 'queued',
+      currentStep: '排队等待并发槽',
+    });
+  });
+
+  it('queued→started(排队放行)翻 started 并清排队文案', () => {
+    const seeded = applySubagentEvent([], ev('tq2', 'queued', { currentStep: '排队等待并发槽' }));
+    const out = applySubagentEvent(seeded, ev('tq2', 'started', { subagentType: 'r' }));
+    expect(out[0].phase).toBe('started');
+    expect(out[0].currentStep).toBeNull();
+    // name 不被 started 幂等语义覆盖之外误改:queued 新建时 subagentType 缺省
+    // 回落 taskId,放行帧带 subagentType 也不覆盖(与既有幂等口径一致)。
+    expect(out[0].name).toBe('tq2');
+  });
+
+  it('queued 已存在时仅更新文案;空文案原引用返回', () => {
+    const seeded = applySubagentEvent([], ev('tq3', 'queued', { currentStep: '排队等待并发槽' }));
+    const updated = applySubagentEvent(seeded, ev('tq3', 'queued', { currentStep: '排队中(第 2 位)' }));
+    expect(updated[0].currentStep).toBe('排队中(第 2 位)');
+    expect(updated).not.toBe(seeded);
+    expect(applySubagentEvent(updated, ev('tq3', 'queued'))).toBe(updated);
+  });
+
+  it('已 started 条目的迟到 queued 帧忽略;终态条目的 queued 帧忽略(钉死)', () => {
+    const running = [{ taskId: 'tq4', name: 'r', description: '', phase: 'started', currentStep: null, lastTool: null, toolUses: 0, totalTokens: null, durationMs: null, summary: null }];
+    expect(applySubagentEvent(running, ev('tq4', 'queued'))).toBe(running);
+    const done = [{ taskId: 'tq5', name: 'r', description: '', phase: 'completed', currentStep: null, lastTool: null, toolUses: 1, totalTokens: 10, durationMs: 100, summary: 'ok' }];
+    expect(applySubagentEvent(done, ev('tq5', 'queued'))).toBe(done);
+  });
+
+  it('queued 算活跃(hasActiveSubagents)但呈现不是 running', () => {
+    const queued = applySubagentEvent([], ev('tq6', 'queued'));
+    expect(hasActiveSubagents(queued)).toBe(true);
+    const meta = subagentPhaseMeta('queued');
+    expect(meta.tone).toBe('queued');
+    expect(meta.labelKey).toBe('chat_subagentStatusQueued');
+    expect(meta.tone).not.toBe('running');
+  });
+});

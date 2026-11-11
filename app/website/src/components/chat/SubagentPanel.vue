@@ -119,6 +119,7 @@ const { t } = useI18n();
 
 const RUNNING_TONE_CLASSES = {
   running: 'text-primary',
+  queued: 'text-sky-500',
   done: 'text-primary',
   failed: 'text-red-500',
   interrupted: 'text-amber-500',

@@ -25,6 +25,7 @@ package services
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -155,6 +156,26 @@ func (c *agentCoreSubagentControl) acquireRun(ctx context.Context) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
+	case c.sem <- struct{}{}:
+		return nil
+	}
+}
+
+// errQueuedStopped 排队等待被 per-task stop 打断（区别于父 ctx 级联取消）。
+var errQueuedStopped = errors.New("subagent queued wait stopped")
+
+// acquireRunQueued 排队拿并发槽（审计 2026-11-10 ③）：等待同时听**两个**取消
+// 源——parent（父回合）死=回合取消；queued（该子 agent 的子 ctx）死=排队期
+// 被单独 stop。错误区分来源，调用方据此发不同语义的终态帧。
+func (c *agentCoreSubagentControl) acquireRunQueued(parent, queued context.Context) error {
+	if c == nil || c.sem == nil {
+		return nil
+	}
+	select {
+	case <-parent.Done():
+		return parent.Err()
+	case <-queued.Done():
+		return errQueuedStopped
 	case c.sem <- struct{}{}:
 		return nil
 	}

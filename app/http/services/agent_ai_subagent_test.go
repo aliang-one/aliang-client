@@ -287,3 +287,62 @@ func TestFinalizeRunSubagentsEmitsInterrupted(t *testing.T) {
 		t.Fatalf("finalize must be idempotent, got %d records", len(again))
 	}
 }
+
+func TestAgentAISubagentRegistryQueuedLifecycle(t *testing.T) {
+	// 审计修复（2026-11-10 ③）：并发闸排队态三段生命周期——startQueued 登记
+	// queued（非 active，不污染 watchdog/finalize 活跃口径）→ beginQueued 翻
+	// started（StartedAt 重置=纯执行时长）→ abandonQueued 直接翻 interrupted
+	// （finish() 只认 active，排队态走不到）；finalize 兜底扫漏收尾的 queued。
+	base := time.Date(2026, 11, 10, 0, 0, 0, 0, time.UTC)
+	registry := newAgentAISubagentRegistry()
+
+	rec, ok := registry.startQueued("t-q", "t-q", "m-1", "排队任务", "researcher", 1, "", false, base)
+	if !ok || rec.Status != "queued" {
+		t.Fatalf("startQueued 应登记 queued: %+v ok=%v", rec, ok)
+	}
+	if rec.active() {
+		t.Fatalf("queued 不算 active: %+v", rec)
+	}
+	// queued 不进 stalled 判死名单（LastProgressAt 未过窗）。
+	if got := registry.stalled(base.Add(2*time.Hour), time.Hour); len(got) != 0 {
+		t.Fatalf("queued 不得被 stale 判死: %+v", got)
+	}
+	// finalize 兜底：漏收尾的 queued 翻 interrupted。
+	swept := registry.finalize(base.Add(time.Minute))
+	if len(swept) != 1 || swept[0].TaskID != "t-q" || swept[0].Status != "interrupted" {
+		t.Fatalf("finalize 应扫 queued 翻 interrupted: %+v", swept)
+	}
+
+	// 正常路径：queued → started（StartedAt 重置）→ 正常 finish。
+	if _, ok := registry.startQueued("t-run", "t-run", "m-1", "正常任务", "researcher", 1, "", false, base); !ok {
+		t.Fatal("startQueued t-run failed")
+	}
+	started, ok := registry.beginQueued("t-run", base.Add(30*time.Second))
+	if !ok || started.Status != "started" {
+		t.Fatalf("beginQueued 应翻 started: %+v ok=%v", started, ok)
+	}
+	if !started.StartedAt.Equal(base.Add(30 * time.Second)) {
+		t.Fatalf("StartedAt 应从起跑起算: %v", started.StartedAt)
+	}
+	// 重复 beginQueued 幂等拒绝（已非 queued）。
+	if _, ok := registry.beginQueued("t-run", base.Add(time.Minute)); ok {
+		t.Fatal("非 queued 记录不得再 beginQueued")
+	}
+	fin, ok := registry.finish("t-run", "completed", "结论", base.Add(time.Minute))
+	if !ok || fin.Status != "completed" {
+		t.Fatalf("正常 finish 应成功: %+v ok=%v", fin, ok)
+	}
+
+	// abandonQueued：queued → interrupted（含 summary 原因）。
+	if _, ok := registry.startQueued("t-stop", "t-stop", "m-1", "被停", "researcher", 1, "", false, base); !ok {
+		t.Fatal("startQueued t-stop failed")
+	}
+	ab, ok := registry.abandonQueued("t-stop", "排队中被停止", base.Add(10*time.Second))
+	if !ok || ab.Status != "interrupted" || ab.Summary != "排队中被停止" {
+		t.Fatalf("abandonQueued 应翻 interrupted: %+v ok=%v", ab, ok)
+	}
+	// 已终态记录 abandon 幂等拒绝。
+	if _, ok := registry.abandonQueued("t-stop", "again", base.Add(time.Minute)); ok {
+		t.Fatal("已终态记录不得再 abandonQueued")
+	}
+}

@@ -588,3 +588,54 @@ func TestAgentCoreSessionSubagentZombieDowngradeOnEnd(t *testing.T) {
 		t.Fatalf("无 end 行不得降级: %+v", sess3.Subagents)
 	}
 }
+
+func TestAgentCoreSessionSubagentZombieDowngradeScopedToOwnTurn(t *testing.T) {
+	// 审计修复（2026-11-10 收紧）：旧判定是文件级「有 end 就降级」——会话里
+	// 任何历史回合的 end 行都会把正在跑的子 agent 误降级 interrupted（面板
+	// 假「已中断」+前端钉死终态）。收紧后只认该子 agent start 行之后的 end。
+	dir := t.TempDir()
+	sid := "sess-scope"
+	path := filepath.Join(dir, agentCoreJournalFileName(sid))
+	lines := []string{
+		`{"kind":"session","session_id":"` + sid + `","project_path":"/tmp/p","created_at":"2026-11-10T00:00:00Z"}`,
+		// 老回合：僵尸子 agent（start 无 finish）+ 本回合 end 行——这条必须降级。
+		`{"kind":"subagent","event":"start","task_id":"old1","name":"researcher","description":"上一回合","ts":"2026-11-10T00:00:01Z"}`,
+		`{"kind":"end","status":"success","ts":"2026-11-10T00:00:05Z"}`,
+		// 新回合：start 在 end 之后——正在跑，历史 end 行不得误杀。
+		`{"kind":"subagent","event":"start","task_id":"live1","name":"researcher","description":"本回合在跑","ts":"2026-11-10T00:01:00Z"}`,
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatalf("写 journal 失败: %v", err)
+	}
+	sess := readAgentCoreSessionMetaWithOptions(path, agentVibeSessionReadOptions{})
+	if len(sess.Subagents) != 2 {
+		t.Fatalf("Subagents = %d, want 2: %+v", len(sess.Subagents), sess.Subagents)
+	}
+	byID := make(map[string]string, 2)
+	for _, s := range sess.Subagents {
+		byID[s.TaskID] = s.Status
+	}
+	if byID["old1"] != "interrupted" {
+		t.Fatalf("start 后紧跟 end 的僵尸应降级 interrupted, got %q", byID["old1"])
+	}
+	if byID["live1"] != "started" {
+		t.Fatalf("start 在历史 end 之后的在跑子 agent 不得降级, got %q", byID["live1"])
+	}
+
+	// 对照：同一条目被重启（start→end→start）时按最新 start 行判——重启后
+	// 无新 end 不得降级。
+	path2 := filepath.Join(dir, agentCoreJournalFileName("sess-restart"))
+	lines2 := []string{
+		`{"kind":"session","session_id":"sess-restart","project_path":"/tmp/p","created_at":"2026-11-10T00:00:00Z"}`,
+		`{"kind":"subagent","event":"start","task_id":"t1","name":"researcher","description":"首轮","ts":"2026-11-10T00:00:01Z"}`,
+		`{"kind":"end","status":"stopped","ts":"2026-11-10T00:00:05Z"}`,
+		`{"kind":"subagent","event":"start","task_id":"t1","name":"researcher","description":"续跑","ts":"2026-11-10T00:01:00Z"}`,
+	}
+	if err := os.WriteFile(path2, []byte(strings.Join(lines2, "\n")+"\n"), 0o644); err != nil {
+		t.Fatalf("写 journal 失败: %v", err)
+	}
+	sess2 := readAgentCoreSessionMetaWithOptions(path2, agentVibeSessionReadOptions{})
+	if len(sess2.Subagents) != 1 || sess2.Subagents[0].Status != "started" {
+		t.Fatalf("重启后按最新 start 行判定, 不得降级: %+v", sess2.Subagents)
+	}
+}

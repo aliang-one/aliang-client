@@ -831,7 +831,21 @@ export function ingestDetailSubagents(store, sessionId, detail) {
   if (!sid) return;
   const list = Array.isArray(detail?.subagents) ? detail.subagents : null;
   if (list) {
-    store[sid] = list.map(subagentDetailToReducerEntry).filter(Boolean);
+    const incoming = list.map(subagentDetailToReducerEntry).filter(Boolean);
+    // 保留帧态 queued 条目（复核 2026-11-10 P1）：排队是 ai.subagent 帧态
+    // （agentcore 桥排队期不落 journal start 行），详情聚合自 journal——
+    // 永远补不出 queued 行。整包替换会在三个触发点（面板打开重拉/M1 重拉/
+    // 断线自愈补拉）把仍在排队的条目当场抹掉。合并语义：详情已出现的
+    // task_id 以详情为准（起跑后 journal 有 start 行，详情是真值）；详情
+    // 缺席且本地仍 queued 的条目保留（帧序在前，排在 incoming 之前）。
+    // 已知边界：排队者终态帧在 WS 断窗内丢失时该条目永卡 queued（journal
+    // 无行可对账）——接受，会话重开装配仍保留原样，比整包抹掉的当代交付
+    // 损伤小一个量级。
+    const incomingIds = new Set(incoming.map(s => s && s.taskId).filter(Boolean));
+    const carried = (Array.isArray(store[sid]) ? store[sid] : []).filter(
+      s => s && s.phase === 'queued' && !incomingIds.has(s.taskId)
+    );
+    store[sid] = carried.length ? [...carried, ...incoming] : incoming;
   }
 }
 

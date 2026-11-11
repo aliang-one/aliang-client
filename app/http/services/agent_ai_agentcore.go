@@ -1459,8 +1459,15 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		// 中断注入（L1，feat/subagent-interrupted-injection）：上一回合未终态
 		// 子 agent 对账进 system prompt——主 LLM 感知中断并可智能重派。装配期
 		// 一次求值，本 run 后续派发不受影响；journal=nil 容忍既有测试路径。
+		// 先算后补（healInterruptedSubagents）：崩溃僵尸此刻补落 interrupted
+		// 终态行，读侧面板不再永卡「运行中」（复核 2026-11-10 ⑤ CONFIRMED P2
+		// ——降级收紧后崩溃僵尸失去文件级 end 误降级的「意外覆盖」，须写侧
+		// 主动闭合）。只对可写 run 补记：readOnly 不派发子 agent，下一写 run
+		// 自会闭合。
 		if journal != nil {
-			subagentPrompt += agentCoreSubagentInterruptedSuffix(journal.unfinishedSubagents(run.sessionID))
+			unfinished := journal.unfinishedSubagents(run.sessionID)
+			journal.healInterruptedSubagents(run.sessionID, unfinished)
+			subagentPrompt += agentCoreSubagentInterruptedSuffix(unfinished)
 		}
 		// 设备互访工具注入（spec 2026-10-29 §7.2 阶段 1 四件）：与 MCP/子 agent
 		// 桥同款宿主注入。桥内共享注册表 handler 实现（POST 编排），自带
