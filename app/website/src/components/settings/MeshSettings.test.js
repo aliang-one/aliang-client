@@ -107,6 +107,57 @@ describe('MeshSettings normalizeMeshConfig', () => {
   });
 });
 
+// —— 密钥字段透传（SPEC §13.3.1：后端 customer.mesh 新增三个密钥字段
+//    private_key/key_passphrase/peers[].host_key/fallback.host_key——读侧归一
+//    不抹、保存 patch 不丢；空串不落键 = 「该处没有密钥」，后端 deep-merge
+//    语义一致，与 enable/classes 等可选键的省缺口径一致）——
+describe('MeshSettings 密钥字段透传', () => {
+  it('peers[].host_key 透传；空串/缺键不落键（该 peer 没有 host_key）', () => {
+    const out = normalizeMeshConfig({
+      peers: [
+        { device_id: 'dev-b', lan_addrs: ['192.168.1.20:56441'], relay: true, host_key: 'peer-host-key' },
+        { device_id: 'dev-c', lan_addrs: [], relay: true, host_key: '' },
+        { device_id: 'dev-d', lan_addrs: [], relay: true }
+      ]
+    });
+    expect(out.peers[0]).toEqual({
+      device_id: 'dev-b',
+      lan_addrs: ['192.168.1.20:56441'],
+      relay: true,
+      host_key: 'peer-host-key'
+    });
+    expect('host_key' in out.peers[1]).toBe(false);
+    expect('host_key' in out.peers[2]).toBe(false);
+    // 非字符串照 String() 归一（与既有键写法形态一致）
+    expect(normalizeMeshConfig({ peers: [{ device_id: 'dev-e', host_key: 42 }] }).peers[0].host_key).toBe('42');
+  });
+
+  it('fallback.host_key 透传；空串不落键', () => {
+    const out = normalizeMeshConfig({
+      fallback: { enable: true, addr: '10.0.0.5:56441', classes: ['ai'], host_key: 'fallback-host-key' }
+    });
+    expect(out.fallback).toEqual({
+      enable: true,
+      addr: '10.0.0.5:56441',
+      classes: ['ai'],
+      host_key: 'fallback-host-key'
+    });
+    expect('host_key' in normalizeMeshConfig({ fallback: { enable: true, host_key: '' } }).fallback).toBe(false);
+  });
+
+  it('private_key/key_passphrase 透传；空串不落键（省缺即「未配置密钥」）', () => {
+    const out = normalizeMeshConfig({ private_key: 'mesh-private-key', key_passphrase: 'mesh-passphrase' });
+    expect(out.private_key).toBe('mesh-private-key');
+    expect(out.key_passphrase).toBe('mesh-passphrase');
+    const bare = normalizeMeshConfig({ private_key: '', key_passphrase: '' });
+    expect('private_key' in bare).toBe(false);
+    expect('key_passphrase' in bare).toBe(false);
+    // 默认段同样不落键
+    expect(normalizeMeshConfig(undefined).private_key).toBeUndefined();
+    expect(normalizeMeshConfig(undefined).key_passphrase).toBeUndefined();
+  });
+});
+
 // —— parseMeshRuleTargetCount（proxy_rules 条目 → mesh:<id> 目标计数）——
 // 客户端解析与后端 processor/routing splitMeshTail 语义对齐：任一逗号段
 // （TrimSpace+小写）以 mesh: 开头即 mesh 条目；mesh: 段后至多一个策略段
@@ -602,6 +653,34 @@ describe('MeshSettings 卡片', () => {
     expect(saved[0].mesh.max_hops).toBe(0);
     expect(saved[0].mesh.peers).toEqual([]);
     expect(saved[0].mesh.fallback).toEqual({ enable: true, addr: '10.0.0.5:56441', classes: [] });
+  });
+
+  it('save 载荷：fallback.host_key 经 spread 透传不被字面量抹掉，peers/private_key/key_passphrase 同保（SPEC §13.3.2）', async () => {
+    const { el, saved } = mountCard(baseConfig({
+      private_key: 'mesh-private-key',
+      key_passphrase: 'mesh-passphrase',
+      peers: [{ device_id: 'dev-b', lan_addrs: ['192.168.1.20:56441'], relay: true, host_key: 'peer-host-key' }],
+      fallback: { enable: false, classes: [], addr: '', host_key: 'fallback-host-key' }
+    }));
+    await flush();
+    setToggle(el, 'meshFallbackEnable', true);
+    setField(el, 'meshFallbackAddr', ' 10.0.0.5:56441 ');
+    setToggle(el, 'meshClassAi', true);
+    await flush();
+    clickSave(el);
+    await flush();
+    expect(saved).toHaveLength(1);
+    // 整配置透传三密钥字段：js 归一化不再抹掉
+    expect(saved[0].mesh.private_key).toBe('mesh-private-key');
+    expect(saved[0].mesh.key_passphrase).toBe('mesh-passphrase');
+    expect(saved[0].mesh.peers[0].host_key).toBe('peer-host-key');
+    // fallback 字面量改造：表单三键覆盖用户可编辑值，host_key 从既有 config spread 透传
+    expect(saved[0].mesh.fallback).toEqual({
+      enable: true,
+      addr: '10.0.0.5:56441',
+      classes: ['ai'],
+      host_key: 'fallback-host-key'
+    });
   });
 
   it('i18n：mesh_* 新键 zh/en 同步存在', () => {

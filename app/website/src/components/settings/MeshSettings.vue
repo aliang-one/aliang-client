@@ -772,6 +772,10 @@ export default {
       const mesh = normalizeMeshConfig({
         ...(this.config?.mesh && typeof this.config.mesh === 'object' ? this.config.mesh : {}),
         fallback: {
+          // 密钥透传（SPEC §13.3.2）：fallback 字面量整体替换,只改 js 归一化
+          // 不够——spread 保住既有 config 的 host_key 等密钥键,表单三键在前
+          // 覆盖用户可编辑值（degenerate 输入由 normalizeMeshFallback 兜底清洗）。
+          ...(this.config?.mesh?.fallback || {}),
           enable: !!this.form.fallbackEnabled,
           addr: String(this.form.fallbackAddr || '').trim(),
           classes: MESH_FALLBACK_CLASSES.filter((cls) => this.form.classes[cls])

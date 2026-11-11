@@ -1,8 +1,9 @@
 // mesh 组网卡片纯逻辑模块（与 MeshSettings.vue 同名分层：.js=可纯测的归一化/
 // 解析逻辑，.vue=卡片骨架；import 一律带显式扩展名避免同名解析歧义）。
 // 线格式 customer.mesh 与后端 processor/config types.go MeshConfig 对齐：
-// {enable, forward_enable, max_hops, peers:[{device_id,lan_addrs,relay}],
-//  fallback:{enable,classes,addr}}。
+// {enable, forward_enable, max_hops, peers:[{device_id,lan_addrs,relay,host_key?}],
+//  fallback:{enable,classes,addr,host_key?}, private_key?, key_passphrase?}
+// ——带 ? 的密钥字段只透传不默认（空串/缺键不落键,见各函数内注释）。
 //
 // 三态布尔语义（定死，与后端 Effective* 同源）：
 //   enable          nil → true   （mesh 是直连之上的增量出口，升级不许静默关）
@@ -50,7 +51,11 @@ function normalizeMeshPeers(raw) {
       lan_addrs: Array.isArray(entry.lan_addrs)
         ? entry.lan_addrs.map((addr) => String(addr ?? '').trim()).filter(Boolean)
         : [],
-      relay: typeof entry.relay === 'boolean' ? entry.relay : true
+      relay: typeof entry.relay === 'boolean' ? entry.relay : true,
+      // 密钥透传（SPEC §13.3.1）：host_key 手改配置文件配置,归一化不抹——
+      // 抹掉 = 用户点一次保存密钥就没了。空串不落键 = 「该 peer 没有
+      // host_key」,后端 deep-merge 语义一致（可选键省缺口径同 enable/classes）。
+      ...(entry.host_key ? { host_key: String(entry.host_key) } : {})
     });
   }
   return peers;
@@ -71,7 +76,9 @@ function normalizeMeshFallback(raw) {
   return {
     enable: typeof source.enable === 'boolean' ? source.enable : false,
     classes,
-    addr: typeof source.addr === 'string' ? source.addr.trim() : ''
+    addr: typeof source.addr === 'string' ? source.addr.trim() : '',
+    // 密钥透传（SPEC §13.3.1）：host_key 空串不落键（同上,「没有密钥」省缺）
+    ...(source.host_key ? { host_key: String(source.host_key) } : {})
   };
 }
 
@@ -85,7 +92,11 @@ export function normalizeMeshConfig(payload) {
     forward_enable: typeof source.forward_enable === 'boolean' ? source.forward_enable : false,
     max_hops: normalizeMaxHops(source.max_hops),
     peers: normalizeMeshPeers(source.peers),
-    fallback: normalizeMeshFallback(source.fallback)
+    fallback: normalizeMeshFallback(source.fallback),
+    // 密钥透传（SPEC §13.3.1）：private_key/key_passphrase 空串不落键
+    // （省缺 = 「未配置密钥」,后端 deep-merge 语义一致）
+    ...(source.private_key ? { private_key: String(source.private_key) } : {}),
+    ...(source.key_passphrase ? { key_passphrase: String(source.key_passphrase) } : {})
   };
 }
 
