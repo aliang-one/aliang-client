@@ -37,6 +37,15 @@ func TestMeshValidatePrivateKeyRequired(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "private_key required") {
 		t.Fatalf("trim-only blank must still fail with private_key required, got %v", err)
 	}
+	// 规整先于必填的又一实证:peers 非空时 " k " 经 TrimSpace 变 "k",
+	// 规整后非空故不误触 required,且规整值就地写回。
+	c.PrivateKey = " k "
+	if err := c.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	if c.PrivateKey != "k" {
+		t.Fatalf("private_key not trimmed in place: %q", c.PrivateKey)
+	}
 }
 
 func TestMeshValidateFallbackHostKeyRequiredWhenAddrSet(t *testing.T) {

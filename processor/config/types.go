@@ -825,7 +825,7 @@ func (c *Config) EffectivePeerMCPCodexEnabled() bool {
 type MeshConfig struct {
 	Enable        *bool               `json:"enable,omitempty"`
 	ForwardEnable *bool               `json:"forward_enable,omitempty"`
-	MaxHops       int                 `json:"max_hops,omitempty"` // 一期不消费,仅为二期链长上限占位
+	MaxHops       int                 `json:"max_hops,omitempty"` // 一期不消费,仅为二期链长上限占位(SPEC §17)
 	Peers         []MeshPeer          `json:"peers,omitempty"`
 	Fallback      *MeshFallbackConfig `json:"fallback,omitempty"`
 	// PrivateKey 本节点的 mesh 身份私钥(PEM,OpenSSH 或 PKCS#8)。
@@ -842,7 +842,7 @@ type MeshPeer struct {
 	LANAddrs []string `json:"lan_addrs,omitempty"`
 	Relay    *bool    `json:"relay,omitempty"`
 	// HostKey 对端 ssh_ingress 的 host key 钉扎(authorized_keys 行或 SHA256: 指纹)。
-	// 空 = 该 peer 不可用(fail-closed,不做 TOFU)。
+	// 空 = 该 peer 不可用(fail-closed,不做 TOFU,SPEC §10.4)。
 	HostKey string `json:"host_key,omitempty"`
 }
 
