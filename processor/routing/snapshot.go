@@ -183,7 +183,11 @@ func CompileRuntimeSnapshot(canonical *config.CanonicalRoutingSchema) (*RuntimeS
 		return nil, fmt.Errorf("canonical routing schema is nil")
 	}
 
-	if err := canonical.Validate(); err != nil {
+	// mesh 传 nil:能力闸(含 fallback id2 钉扎)在上游把关——apply 管线以生效
+	// 配置的 peers 校验(routing_apply_state),runtime-inputs 编译以传入 cfg 的
+	// peers 校验(compileCanonicalRoutingFromRuntimeInputs);本函数只做已过闸
+	// canonical 的形状复检,不当第三道(mesh 上下文缺失时不重复判能力)。
+	if err := canonical.Validate(nil); err != nil {
 		return nil, err
 	}
 
@@ -367,7 +371,13 @@ func compileCanonicalRoutingFromRuntimeInputs(cfg *config.Config, switches model
 	// by explicit proxy_rules matches instead of hijacking all unmatched traffic.
 	canonical.Routing.DefaultEgress = string(SnapshotActionDirect)
 
-	if err := canonical.Validate(); err != nil {
+	// mesh 上下文取传入 cfg(fallback id2 钉扎校验用):提交/编译路径的 cfg 即
+	// 新配置本身,peers 与规则同源——不能读全局(与提交时序耦合)。
+	var mesh *config.MeshConfig
+	if cfg != nil && cfg.Customer != nil {
+		mesh = cfg.Customer.Mesh
+	}
+	if err := canonical.Validate(mesh); err != nil {
 		return nil, fmt.Errorf("compile runtime canonical routing failed: %w", err)
 	}
 

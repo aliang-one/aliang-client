@@ -25,7 +25,7 @@ func TestCanonicalRoutingSchemaValidate_MeshTargetEmptyDeviceRejected(t *testing
 		Target:    "toNode:",
 	})
 
-	err := cfg.Validate()
+	err := cfg.Validate(nil)
 	if err == nil {
 		t.Fatal("Validate() = nil error, want invalid_target (mesh 目标 deviceID 非空)")
 	}
@@ -38,7 +38,7 @@ func TestCanonicalRoutingSchemaValidate_MeshDefaultEgressRejected(t *testing.T) 
 	cfg := validCanonicalRoutingSchema()
 	cfg.Routing.DefaultEgress = "toNode:dev-b"
 
-	err := cfg.Validate()
+	err := cfg.Validate(nil)
 	if err == nil {
 		t.Fatal("Validate() = nil error, want unknown_target (mesh 是规则驱动出口,不作默认出口)")
 	}
@@ -59,7 +59,7 @@ func TestCanonicalRoutingSchemaValidate_MeshPolicyForms(t *testing.T) {
 		cfg.Routing.Rules = append(cfg.Routing.Rules, CanonicalRoutingRule{
 			ID: "r0", Type: "domain", Condition: "example.com", Enabled: true, Target: target,
 		})
-		if err := cfg.Validate(); err != nil {
+		if err := cfg.Validate(nil); err != nil {
 			t.Fatalf("Validate() target=%s error = %v, want accepted", target, err)
 		}
 	}
@@ -77,7 +77,7 @@ func TestCanonicalRoutingSchemaValidate_MeshPolicyForms(t *testing.T) {
 		cfg.Routing.Rules = append(cfg.Routing.Rules, CanonicalRoutingRule{
 			ID: "r0", Type: "domain", Condition: "example.com", Enabled: true, Target: target,
 		})
-		if err := cfg.Validate(); err == nil {
+		if err := cfg.Validate(nil); err == nil {
 			t.Fatalf("Validate() target=%s error = nil, want rejected", target)
 		}
 	}
@@ -136,5 +136,58 @@ func TestParseMeshRuleTarget(t *testing.T) {
 			t.Fatalf("ParseMeshRuleTarget(%q) = (%q, %q, %v), want (%q, %q, %v)",
 				tc.in, deviceID, policy, ok, tc.wantDeviceID, tc.wantPolicy, tc.wantOK)
 		}
+	}
+}
+
+// TestMeshRoutingSchemaFallbackID2HostKey fallback 段 id2 的保存期能力校验:
+// id2 不在 peers 里 → 不拦(fallback 目标不要求已列入 peers,运行期失败策略
+// 限一次收口);id2 恰好也配置在 peers 里但未钉扎 host_key → 必败配置,保存期
+// 即拒(与 MeshConfig.Validate 的 peers 钉扎口径一致,双闸防手改配置文件/
+// peers 与路由规则分开提交的时序缝)。
+func TestMeshRoutingSchemaFallbackID2HostKey(t *testing.T) {
+	schemaWithFallback := func() *CanonicalRoutingSchema {
+		cfg := validCanonicalRoutingSchema()
+		cfg.Routing.Rules = append(cfg.Routing.Rules, CanonicalRoutingRule{
+			ID: "r0", Type: "domain", Condition: "example.com", Enabled: true,
+			Target: "toNode:dev-b:fallback:dev-c",
+		})
+		return cfg
+	}
+	pinnedB := MeshPeer{DeviceID: "dev-b", HostKey: "SHA256:pin-b"}
+
+	// 用例 1:fallback id2 不在 peers 里 → schema 校验通过。
+	if err := schemaWithFallback().Validate(&MeshConfig{Peers: []MeshPeer{pinnedB}}); err != nil {
+		t.Fatalf("Validate() = %v, want accepted (fallback id2 不在 peers 不要求存在)", err)
+	}
+
+	// 用例 2:id2 也在 peers 里但 HostKey 为空 → 拒,文案含 host_key。
+	err := schemaWithFallback().Validate(&MeshConfig{Peers: []MeshPeer{
+		pinnedB,
+		{DeviceID: "dev-c", HostKey: ""},
+	}})
+	if err == nil {
+		t.Fatal("Validate() = nil error, want rejected (peers 内 fallback 目标未钉扎 host_key)")
+	}
+	if !strings.Contains(err.Error(), "host_key") {
+		t.Fatalf("Validate() error = %v, want message containing host_key", err)
+	}
+	schemaErr, ok := err.(*RoutingSchemaValidationError)
+	if !ok || schemaErr.Code != "invalid_target" {
+		t.Fatalf("Validate() error = %T(%v), want RoutingSchemaValidationError invalid_target", err, err)
+	}
+
+	// 用例 3:id2 已钉扎 → 通过(校验只拦「在 peers 里却未钉扎」,钉扎齐备
+	// 的合法配置零误伤)。
+	if err := schemaWithFallback().Validate(&MeshConfig{Peers: []MeshPeer{
+		pinnedB,
+		{DeviceID: "dev-c", HostKey: "SHA256:pin-c"},
+	}}); err != nil {
+		t.Fatalf("Validate() = %v, want accepted (fallback id2 已钉扎)", err)
+	}
+
+	// 用例 4:无 mesh 上下文(nil)= peers 视为空 → 通过(HTTP 直改路由 JSON
+	// 等无 mesh 生效配置的路径不误伤;运行期失败策略仍收口)。
+	if err := schemaWithFallback().Validate(nil); err != nil {
+		t.Fatalf("Validate(nil) = %v, want accepted (mesh 上下文缺失不拦)", err)
 	}
 }
