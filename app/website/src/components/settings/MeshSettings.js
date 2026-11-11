@@ -210,3 +210,48 @@ export function listMeshRulesByPeer(rules) {
   }
   return grouped;
 }
+
+// —— authorized_keys 尾注释解析（G4/SPEC §10.3 身份不一致提示的数据源）——
+// 后端 parseSSHIngressMeshKeys（app/http/services/customer_config_service.go）
+// 用 gossh.ParseAuthorizedKey 取 Comment 充当 device_id（TrimSpace）。前端无
+// 该解析器,按同形启发取注释:公钥体（base64）是锚点——各类型公钥线格式首
+// 四字节恒 00 00 00 xx → base64 恒 AAAA 开头;体前段=选项/算法名（ssh-ed25519
+// 等算法段与 AAAA 公钥体不是 comment,锚点法天然排除）,体后整段=注释
+// （含内部空格取整段其余部分）。解析不出锚点（空行/坏行/纯注释行）→ 返回
+// ''（对端可省注释,调用方不提示）。
+export function parseAuthorizedKeyComment(line) {
+  const tokens = String(line ?? '').trim().split(/\s+/);
+  if (!tokens[0]) {
+    return '';
+  }
+  const bodyIndex = tokens.findIndex((token) => token.startsWith('AAAA'));
+  if (bodyIndex < 0) {
+    return '';
+  }
+  return tokens.slice(bodyIndex + 1).join(' ');
+}
+
+// peers[].device_id 与 ssh_ingress.mesh_authorized_keys 尾注释比对
+// （G4/SPEC §10.3）:表内存在注释==device_id 的行即一致;全表解析不出任何
+// 注释（对端可省注释/坏行）→ 无从比对,一律不提示。返回不一致的 device_id
+// 数组（按 peers 顺序;空白/垃圾条目不参与）。
+export function listMeshDeviceIdMismatches(peers, meshAuthorizedKeys) {
+  const known = new Set();
+  for (const line of Array.isArray(meshAuthorizedKeys) ? meshAuthorizedKeys : []) {
+    const comment = parseAuthorizedKeyComment(line);
+    if (comment) {
+      known.add(comment);
+    }
+  }
+  if (!known.size) {
+    return [];
+  }
+  const mismatches = [];
+  for (const peer of Array.isArray(peers) ? peers : []) {
+    const deviceId = String(peer?.device_id ?? '').trim();
+    if (deviceId && !known.has(deviceId)) {
+      mismatches.push(deviceId);
+    }
+  }
+  return mismatches;
+}

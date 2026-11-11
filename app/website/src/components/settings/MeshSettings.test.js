@@ -7,7 +7,13 @@ import { createApp, h } from 'vue';
 // vi.stubGlobal 注入；onSave prop 捕获 'save' 事件载荷。
 vi.mock('../../i18n', () => ({ useI18n: () => ({ t: (k) => k }) }));
 
-import { normalizeMeshConfig, parseMeshRuleTargetCount, MESH_FALLBACK_CLASSES } from './MeshSettings.js';
+import {
+  listMeshDeviceIdMismatches,
+  normalizeMeshConfig,
+  parseAuthorizedKeyComment,
+  parseMeshRuleTargetCount,
+  MESH_FALLBACK_CLASSES
+} from './MeshSettings.js';
 import { buildCustomerSavePatch } from '../SettingsPage.vue';
 import { getMeshLanPeers, getMeshStatus } from '../../services/agentApi';
 import MeshSettings from './MeshSettings.vue';
@@ -810,6 +816,11 @@ describe('MeshSettings 卡片', () => {
       'mesh_privateKeyPlaceholder',
       'mesh_privateKeyHint',
       'mesh_keyPassphrase',
+      // G4 依赖与身份提示（SPEC §10.3）
+      'mesh_sshDependencyTitle',
+      'mesh_sshDependencyWarning',
+      'mesh_sshEnableTogether',
+      'mesh_deviceIdMismatchHint',
       'mesh_save',
       'mesh_saving'
     ];
@@ -1119,5 +1130,238 @@ describe('MeshSettings 拓扑画布', () => {
       expect(typeof zh[key], `zh.${key}`).toBe('string');
       expect(typeof en[key], `en.${key}`).toBe('string');
     }
+  });
+});
+
+// —— G4/SPEC §10.3:依赖降级与身份不一致两条仪表盘提示——
+// ① mesh 有效启用（enable!==false,后端三态 nil=true）而 ssh_ingress.enable
+//    非 true → 依赖警告条 + 「一并开启」按钮;按钮只做一层确认（window.confirm
+//    既有形态,RulesSettings clearKnownHosts 同款）后落意图,随下次整体保存
+//    提交——不单独发请求、不静默改写。
+// ② peers[].device_id 与 ssh_ingress.mesh_authorized_keys 尾注释比对不一致
+//    → peer 行警告级提示（amber,非阻断）;全表无注释（对端可省）→ 不提示。
+
+// —— parseAuthorizedKeyComment（尾注释解析,后端 parseSSHIngressMeshKeys 的
+//    gossh.ParseAuthorizedKey Comment 前端同形启发）——
+// 公钥体（base64）是锚点:各类型公钥线格式首四字节恒 00 00 00 xx → base64
+// 恒 AAAA 开头;体前段=选项/算法名（天然排除,即 ssh-ed25519/AAAA 开头段
+// 不是 comment）,体后整段=注释（含内部空格取整段其余部分）。
+describe('MeshSettings parseAuthorizedKeyComment（G4 尾注释解析）', () => {
+  it('常规形态:算法段+公钥体之后的段=注释', () => {
+    expect(parseAuthorizedKeyComment('ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKx8 dev-b')).toBe('dev-b');
+    expect(parseAuthorizedKeyComment('ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQ dev-c')).toBe('dev-c');
+  });
+
+  it('注释含内部空格取整段其余部分', () => {
+    expect(parseAuthorizedKeyComment('ssh-ed25519 AAAAxyz dev-b office laptop')).toBe('dev-b office laptop');
+  });
+
+  it('算法段与公钥体不进注释;缺公钥体=解析失败、缺注释=空串', () => {
+    // 无 AAAA 锚点（坏行/仅算法段）→ 解析失败,空串不提示
+    expect(parseAuthorizedKeyComment('ssh-ed25519')).toBe('');
+    expect(parseAuthorizedKeyComment('# hand-written note')).toBe('');
+    // 公钥体是最后一段 → 无注释（对端可省注释）
+    expect(parseAuthorizedKeyComment('ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKx8')).toBe('');
+  });
+
+  it('authorized_keys 选项前缀在公钥体之前,不进注释', () => {
+    expect(parseAuthorizedKeyComment('no-pty ssh-ed25519 AAAAC3Nza dev-b')).toBe('dev-b');
+  });
+
+  it('空白/非字符串行 → 空串（不提示）', () => {
+    expect(parseAuthorizedKeyComment('')).toBe('');
+    expect(parseAuthorizedKeyComment('   ')).toBe('');
+    expect(parseAuthorizedKeyComment(null)).toBe('');
+    expect(parseAuthorizedKeyComment(undefined)).toBe('');
+    expect(parseAuthorizedKeyComment(42)).toBe('');
+  });
+
+  it('行首尾空白规整（后端 TrimSpace 同款）', () => {
+    expect(parseAuthorizedKeyComment('  ssh-ed25519 AAAAxyz dev-b  ')).toBe('dev-b');
+  });
+});
+
+// —— listMeshDeviceIdMismatches（peers[].device_id 与准入表尾注释比对）——
+// 比对口径:表内存在注释==device_id 的行即一致;全表解析不出任何注释
+// （对端可省注释/坏行）→ 无从比对,一律不提示。返回不一致 device_id（保序）。
+describe('MeshSettings listMeshDeviceIdMismatches（G4 身份比对）', () => {
+  const peers = [{ device_id: 'dev-b' }, { device_id: 'dev-c' }];
+
+  it('注释==device_id 的 peer 不提示,缺席者提示（保序）', () => {
+    expect(listMeshDeviceIdMismatches(peers, ['ssh-ed25519 AAAAx dev-b'])).toEqual(['dev-c']);
+    expect(listMeshDeviceIdMismatches(peers, [
+      'ssh-ed25519 AAAAx dev-b',
+      'ssh-ed25519 AAAAy dev-c'
+    ])).toEqual([]);
+    expect(listMeshDeviceIdMismatches(peers, ['ssh-ed25519 AAAAy dev-c'])).toEqual(['dev-b']);
+  });
+
+  it('全表无注释（对端可省注释）→ 不提示任何 peer', () => {
+    expect(listMeshDeviceIdMismatches(peers, ['ssh-ed25519 AAAAx'])).toEqual([]);
+    expect(listMeshDeviceIdMismatches(peers, [])).toEqual([]);
+    expect(listMeshDeviceIdMismatches(peers, undefined)).toEqual([]);
+    expect(listMeshDeviceIdMismatches(peers, 'nope')).toEqual([]);
+  });
+
+  it('空白 device_id 的 peer 不参与比对;peers 非数组 → 空', () => {
+    expect(listMeshDeviceIdMismatches([{ device_id: '  ' }, 'junk', null], ['ssh-ed25519 AAAAx dev-b'])).toEqual([]);
+    expect(listMeshDeviceIdMismatches('nope', ['ssh-ed25519 AAAAx dev-b'])).toEqual([]);
+  });
+});
+
+// —— 卡片挂载级:两处提示位条件渲染 + 「一并开启」确认链(save 载荷)——
+describe('MeshSettings 依赖与身份提示（G4）', () => {
+  // ssh_ingress 段（真实形态=SshIngressSettings normalizeSSHIngressConfig
+  // 输出）;mesh_authorized_keys 尾注释默认只认 dev-b,dev-c 缺席。
+  function dependencyConfig(sshOverrides = {}, meshOverrides = {}) {
+    return {
+      ...baseConfig(meshOverrides),
+      ssh_ingress: {
+        enable: false,
+        port: 0,
+        authorized_keys: [],
+        mesh_authorized_keys: ['ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKx8 dev-b'],
+        ...sshOverrides
+      }
+    };
+  }
+
+  beforeEach(() => {
+    stubApi({ lanPeers: LAN_PEERS });
+  });
+
+  afterEach(() => {
+    while (mountedApps.length) {
+      const { app, el } = mountedApps.pop();
+      app.unmount();
+      el.remove();
+    }
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it('mesh 启用 + ssh_ingress 未启用 → 依赖警告条（标题+文案+一并开启按钮）', async () => {
+    const { el } = mountCard(dependencyConfig());
+    await flush();
+    const bar = el.querySelector('[data-mesh-ssh-dependency]');
+    expect(bar).not.toBeNull();
+    expect(bar.textContent).toContain('mesh_sshDependencyTitle');
+    expect(bar.textContent).toContain('mesh_sshDependencyWarning');
+    expect(el.querySelector('[data-mesh-ssh-enable-together]')).not.toBeNull();
+    expect(el.querySelector('[data-mesh-ssh-enable-together]').textContent).toContain('mesh_sshEnableTogether');
+  });
+
+  it('ssh_ingress.enable=true 或 mesh.enable=false → 无警告条', async () => {
+    const on = mountCard(dependencyConfig({ enable: true }));
+    await flush();
+    expect(on.el.querySelector('[data-mesh-ssh-dependency]')).toBeNull();
+
+    const meshOff = mountCard(dependencyConfig({}, { enable: false }));
+    await flush();
+    expect(meshOff.el.querySelector('[data-mesh-ssh-dependency]')).toBeNull();
+  });
+
+  it('mesh.enable/ssh_ingress 段缺省（后端三态 nil=true 口径）→ 仍出警告条', async () => {
+    const cfg = baseConfig();
+    delete cfg.mesh.enable; // 三态 nil=true:有效启用
+    const { el } = mountCard(cfg);
+    await flush();
+    expect(el.querySelector('[data-mesh-ssh-dependency]')).not.toBeNull();
+  });
+
+  it('「一并开启」确认 → 落意图（按钮收敛、警告条保持到保存）,save 载荷带 ssh_ingress.enable=true 其余键透传', async () => {
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    const { el, saved } = mountCard(dependencyConfig({ port: 56442 }));
+    await flush();
+    el.querySelector('[data-mesh-ssh-enable-together]').click();
+    await flush();
+    expect(confirmSpy).toHaveBeenCalledWith('mesh_sshEnableTogether');
+    // 确认≠改写:配置面未动,警告条仍在;按钮收敛（意图已记,等保存）
+    expect(el.querySelector('[data-mesh-ssh-dependency]')).not.toBeNull();
+    expect(el.querySelector('[data-mesh-ssh-enable-together]')).toBeNull();
+
+    clickSave(el);
+    await flush();
+    expect(saved).toHaveLength(1);
+    expect(saved[0].ssh_ingress).toEqual({
+      enable: true,
+      port: 56442,
+      authorized_keys: [],
+      mesh_authorized_keys: ['ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKx8 dev-b']
+    });
+    // 不单独发请求:卡片只发 save 事件,POST 由父层整体保存承担（fetch stub
+    // 只认三读端点,任何额外请求都会 reject——本用例无 rejection 即无单独请求）。
+    // 父层递归 diff:仅 enable 进 patch（其余键未变被剔除）。
+    const patch = buildCustomerSavePatch(saved[0], dependencyConfig({ port: 56442 }));
+    expect(patch.ssh_ingress).toEqual({ enable: true });
+  });
+
+  it('「一并开启」取消 → 不落意图,save 载荷不翻转 ssh_ingress（不静默改写）', async () => {
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
+    const { el, saved } = mountCard(dependencyConfig());
+    await flush();
+    el.querySelector('[data-mesh-ssh-enable-together]').click();
+    await flush();
+    expect(confirmSpy).toHaveBeenCalledTimes(1);
+    // 取消后按钮仍在（可再点）
+    expect(el.querySelector('[data-mesh-ssh-enable-together]')).not.toBeNull();
+    clickSave(el);
+    await flush();
+    expect(saved).toHaveLength(1);
+    // 整配置透传的 ssh_ingress 原样带出（enable 仍 false,未被翻转）,父层无 diff
+    expect(saved[0].ssh_ingress.enable).toBe(false);
+    expect(buildCustomerSavePatch(saved[0], dependencyConfig())?.ssh_ingress).toBeUndefined();
+  });
+
+  it('ssh_ingress 已启用时点确认路径不存在（警告条未渲染即无按钮）,save 载荷不额外带 ssh_ingress 覆盖', async () => {
+    const { el, saved } = mountCard(dependencyConfig({ enable: true }));
+    await flush();
+    expect(el.querySelector('[data-mesh-ssh-enable-together]')).toBeNull();
+    clickSave(el);
+    await flush();
+    expect(saved).toHaveLength(1);
+    expect(saved[0].ssh_ingress.enable).toBe(true);
+  });
+
+  it('device_id 与准入表尾注释不一致 → peer 行警告提示（amber）;一致行无提示;不阻断保存', async () => {
+    const { el } = mountCard(dependencyConfig(
+      { mesh_authorized_keys: ['ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKx8 dev-b'] },
+      // baseConfig 默认仅 dev-b 一个 peer;双 peer 才能同时验证「一致行无提示」
+      { peers: [
+        { device_id: 'dev-b', lan_addrs: ['192.168.1.20:56441'], relay: true },
+        { device_id: 'dev-c', lan_addrs: ['192.168.1.21:56441'], relay: true }
+      ] }
+    ));
+    await flush();
+    // dev-b 注释一致 → 无提示;dev-c 缺席 → 警告级提示（非阻断）
+    expect(el.querySelector('[data-mesh-device-hint="dev-b"]')).toBeNull();
+    const hint = el.querySelector('[data-mesh-device-hint="dev-c"]');
+    expect(hint).not.toBeNull();
+    expect(hint.textContent).toContain('mesh_deviceIdMismatchHint');
+    expect(hint.className).toContain('amber');
+    expect(saveButton(el).disabled).toBe(false);
+  });
+
+  it('准入表全无注释（对端可省）→ 任何 peer 行都不提示', async () => {
+    const { el } = mountCard(dependencyConfig(
+      { mesh_authorized_keys: ['ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKx8'] },
+      { peers: [
+        { device_id: 'dev-b', lan_addrs: ['192.168.1.20:56441'], relay: true },
+        { device_id: 'dev-c', lan_addrs: ['192.168.1.21:56441'], relay: true }
+      ] }
+    ));
+    await flush();
+    expect(el.querySelector('[data-mesh-device-hint="dev-b"]')).toBeNull();
+    expect(el.querySelector('[data-mesh-device-hint="dev-c"]')).toBeNull();
+  });
+
+  it('准入表为空/整段缺失 → 不提示（无从比对）', async () => {
+    const empty = mountCard(dependencyConfig({ mesh_authorized_keys: [] }));
+    await flush();
+    expect(empty.el.querySelector('[data-mesh-device-hint]')).toBeNull();
+
+    const missing = mountCard({ ...baseConfig() }); // 无 ssh_ingress 段
+    await flush();
+    expect(missing.el.querySelector('[data-mesh-device-hint]')).toBeNull();
   });
 });

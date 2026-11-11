@@ -1011,6 +1011,13 @@ export default {
   mesh_privateKeyPlaceholder: 'PEM private key (OpenSSH/PKCS#8)',
   mesh_privateKeyHint: 'The private key stays on this node only; paste the public key into the mesh_authorized_keys of each peer, with the trailing comment set to the local device_id.',
   mesh_keyPassphrase: 'Key passphrase',
+  // -- Dependency & identity hints (G4/SPEC §10.3): warning bar for mesh depending
+  //    on SSH ingress + warning-level hint when peers[].device_id mismatches the
+  //    admission-table trailing comment; must pair with zh.js --
+  mesh_sshDependencyTitle: 'Dependency hint',
+  mesh_sshDependencyWarning: 'The mesh depends on SSH ingress, which is currently disabled — mesh egress will not take effect.',
+  mesh_sshEnableTogether: 'Enable SSH ingress too',
+  mesh_deviceIdMismatchHint: 'device_id does not match the trailing comment in the local admission table (hint only, not blocking).',
 
   // -- LogsSettings --
   logs_title: 'Live Logs',

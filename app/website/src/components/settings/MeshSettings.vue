@@ -32,6 +32,37 @@
       {{ t('mesh_statusDegradedHint') }}
     </p>
 
+    <!-- 依赖降级提示（G4/SPEC §10.3）:mesh 有效启用（enable!==false,后端三态
+         nil=true）而 SSH 入口未启用 → mesh 出口不会生效（F2 运行期降级同口径）。
+         只提示不静默改写:「一并开启」经一层确认（window.confirm 既有形态）落
+         意图标志,随下次整体保存提交（不单独发请求）;意图已记后按钮收敛,
+         警告条保持到保存生效（警告反映的是配置面真相）。 -->
+    <div
+      v-if="sshIngressOff"
+      class="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-200"
+      data-mesh-ssh-dependency
+    >
+      <div class="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+        <div class="flex items-center gap-2">
+          <span class="material-symbols-outlined text-base">warning</span>
+          <div>
+            <p class="text-sm font-semibold">{{ t('mesh_sshDependencyTitle') }}</p>
+            <p class="text-xs">{{ t('mesh_sshDependencyWarning') }}</p>
+          </div>
+        </div>
+        <button
+          v-if="!sshIngressEnableIntent"
+          class="inline-flex min-h-9 shrink-0 items-center justify-center gap-1.5 rounded-md border border-amber-300 bg-white/60 px-3 text-xs font-medium text-amber-800 transition hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-60 dark:border-amber-500/40 dark:bg-transparent dark:text-amber-200 dark:hover:bg-amber-500/20"
+          data-mesh-ssh-enable-together
+          type="button"
+          :disabled="loading || saving"
+          @click="confirmEnableSshIngress"
+        >
+          {{ t('mesh_sshEnableTogether') }}
+        </button>
+      </div>
+    </div>
+
     <div
       v-if="error"
       class="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700 dark:border-red-500/30 dark:bg-red-500/10 dark:text-red-200"
@@ -216,17 +247,30 @@
         :data-mesh-peer-row="row.device_id"
       >
         <span class="truncate font-mono text-sm text-slate-800 dark:text-slate-200">{{ row.device_id }}</span>
-        <input
-          v-model="row.host_key"
-          :aria-label="t('mesh_peerHostKey')"
-          class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 font-mono text-sm shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 disabled:opacity-60 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
-          data-field="meshPeerHostKey"
-          :data-peer-id="row.device_id"
-          :disabled="loading || saving"
-          :placeholder="t('mesh_peerHostKeyPlaceholder')"
-          type="text"
-          @keydown.enter.prevent
-        />
+        <div class="space-y-1">
+          <input
+            v-model="row.host_key"
+            :aria-label="t('mesh_peerHostKey')"
+            class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 font-mono text-sm shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 disabled:opacity-60 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+            data-field="meshPeerHostKey"
+            :data-peer-id="row.device_id"
+            :disabled="loading || saving"
+            :placeholder="t('mesh_peerHostKeyPlaceholder')"
+            type="text"
+            @keydown.enter.prevent
+          />
+          <!-- 身份不一致提示（G4/SPEC §10.3）:device_id 与本机准入表
+               （ssh_ingress.mesh_authorized_keys）尾注释比对不一致 → 警告级
+               （amber）非阻断——保存不拦,后端保存期才是权威;对端可省注释
+               （全表无注释=无从比对）不提示。 -->
+          <p
+            v-if="peerDeviceMismatched(row.device_id)"
+            class="text-[11px] text-amber-600 dark:text-amber-400"
+            :data-mesh-device-hint="row.device_id"
+          >
+            {{ t('mesh_deviceIdMismatchHint') }}
+          </p>
+        </div>
       </div>
     </section>
 
@@ -398,6 +442,7 @@ import { getAgentStatus, getMeshLanPeers, getMeshStatus } from '../../services/a
 import { useI18n } from '../../i18n';
 import {
   MESH_FALLBACK_CLASSES,
+  listMeshDeviceIdMismatches,
   listMeshRulesByPeer,
   normalizeMeshConfig,
   parseMeshRuleTargetCount
@@ -450,7 +495,10 @@ export default {
       selectedPair: '',
       selectedNode: '',
       nodePositions: {},
-      dragging: null
+      dragging: null,
+      // 「一并开启 SSH 入口」意图标志（G4/SPEC §10.3）:确认后才落,随下次
+      // 整体保存带出 ssh_ingress.enable=true——不静默改写,不单独发请求
+      sshIngressEnableIntent: false
     };
   },
   computed: {
@@ -517,6 +565,21 @@ export default {
         return this.t('mesh_validationFallbackAddr');
       }
       return '';
+    },
+    // —— G4/SPEC §10.3 两条仪表盘提示 ——
+    // 依赖降级:mesh 有效启用（enable!==false,对齐后端三态 nil=true）而
+    // ssh_ingress.enable 非 true → mesh 出口不会生效（F2 运行期降级
+    // MeshEffectivelyEnabled 同口径）,卡片内提示。
+    sshIngressOff() {
+      return this.configMesh.enable !== false && this.config?.ssh_ingress?.enable !== true;
+    },
+    // 身份比对:与准入表（ssh_ingress.mesh_authorized_keys）尾注释不一致的
+    // device_id 集合（数据源=归一化 peers 真值;全表无注释不提示）。
+    deviceIdMismatches() {
+      return listMeshDeviceIdMismatches(
+        this.configMesh.peers,
+        this.config?.ssh_ingress?.mesh_authorized_keys
+      );
     },
     // —— 画布数据（§9.2）——
     // 连线徽标数据源 = customer.proxy_rules 真值（非 status 聚合）,
@@ -776,6 +839,21 @@ export default {
       const statusPeers = Array.isArray(this.meshStatus?.peers) ? this.meshStatus.peers : [];
       return statusPeers.some((peer) => String(peer?.device_id || '') === deviceId);
     },
+    // —— G4/SPEC §10.3 ——
+    // 「一并开启」一层确认（RulesSettings clearKnownHosts 的 window.confirm
+    // 既有形态;confirm 不可用的环境直接视为确认,与该先例同口径）:确认→落
+    // 意图标志随下次整体保存提交;取消→什么都不改。
+    confirmEnableSshIngress() {
+      if (typeof window !== 'undefined' && typeof window.confirm === 'function') {
+        if (!window.confirm(this.t('mesh_sshEnableTogether'))) {
+          return;
+        }
+      }
+      this.sshIngressEnableIntent = true;
+    },
+    peerDeviceMismatched(deviceId) {
+      return this.deviceIdMismatches.includes(deviceId);
+    },
     formFromConfig(config) {
       const mesh = normalizeMeshConfig(config?.mesh);
       return {
@@ -879,10 +957,24 @@ export default {
           classes: MESH_FALLBACK_CLASSES.filter((cls) => this.form.classes[cls])
         }
       });
-      this.$emit('save', {
+      this.$emit('save', this.savePayload(mesh));
+    },
+    // 整体保存载荷（整配置透传 + mesh 覆盖）之上的 G4 附加:「一并开启」确认
+    // 后的意图随整体保存带出——ssh_ingress 段原样透传仅翻转 enable（port/
+    // authorized_keys 等不动）,父层递归 diff 只会把 enable 进 patch;不单独
+    // 发请求。已启用则意图空转（幂等）。
+    savePayload(mesh) {
+      const payload = {
         ...(this.config || {}),
         mesh
-      });
+      };
+      if (this.sshIngressEnableIntent && this.config?.ssh_ingress?.enable !== true) {
+        payload.ssh_ingress = {
+          ...(this.config?.ssh_ingress && typeof this.config.ssh_ingress === 'object' ? this.config.ssh_ingress : {}),
+          enable: true
+        };
+      }
+      return payload;
     }
   }
 };

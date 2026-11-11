@@ -1010,6 +1010,12 @@ export default {
   mesh_privateKeyPlaceholder: 'PEM 私钥（OpenSSH/PKCS#8）',
   mesh_privateKeyHint: '私钥仅存本机配置；公钥贴到各对端 mesh_authorized_keys，行尾注释=本机 device_id。',
   mesh_keyPassphrase: '私钥口令',
+  // -- 依赖与身份提示（G4/SPEC §10.3）：mesh 依赖 SSH 入口的降级警告条 +
+  //    peers[].device_id 与准入表尾注释比对不一致的警告级提示；en.js 同段须成对 --
+  mesh_sshDependencyTitle: '依赖提示',
+  mesh_sshDependencyWarning: '组网依赖 SSH 入口，当前未启用，出口不会生效。',
+  mesh_sshEnableTogether: '一并开启 SSH 入口',
+  mesh_deviceIdMismatchHint: 'device_id 与本机准入表尾注释不一致（仅提示，不阻断）。',
 
   // -- LogsSettings --
   logs_title: '实时日志',
