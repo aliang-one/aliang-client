@@ -32,6 +32,9 @@ type PeerSpec struct {
 
 // CacheKey 计算该 peer 在 ExitClient 缓存中的键(SPEC §10.4):全部影响
 // 握手行为的配置值 + 私钥摘要。LANAddrs 排序后拼接(顺序无关)。
+//
+// 换私钥必须使键失效——旧 ExitClient 里缓存的 Signer 随私钥一起作废,
+// 摘要进键即自动重建(SPEC §10.4)。
 func (spec PeerSpec) CacheKey(privateKeyPEM, passphrase string) string {
 	addrs := append([]string(nil), spec.LANAddrs...)
 	sort.Strings(addrs)
