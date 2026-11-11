@@ -165,3 +165,35 @@ func TestRegisterAgentRoutesCoversAgentMemoryEndpoints(t *testing.T) {
 		})
 	}
 }
+
+// TestRegisterAgentRoutesCoversAIMCPEndpoints 钉「双注册另一半」：agent-as-MCP
+// 工具面三端点真身在本 runtime，核心侧 routes.go 同名注册只做 proxy 透传。
+// 缺这里 → 核心转发过来撞 mux 裸 404 并原样透传，外部 MCP 客户端的
+// ai_run_start/status/approve 永远拿 404（2026-10-21 liang-dev 双注册教训）。
+// 只断言「不是 404」：200/400/403/503 都是 handler 真实出手的证明。
+func TestRegisterAgentRoutesCoversAIMCPEndpoints(t *testing.T) {
+	t.Setenv("ALIANG_USER_AGENT_RUNTIME", "1")
+	t.Setenv("HOME", t.TempDir())
+
+	mux := http.NewServeMux()
+	registerAgentRoutes(mux)
+
+	for _, tc := range []struct {
+		name string
+		path string
+		body string
+	}{
+		{name: "start", path: "/api/agent/ai/mcp/start", body: `{}`},
+		{name: "status", path: "/api/agent/ai/mcp/status", body: `{}`},
+		{name: "approve", path: "/api/agent/ai/mcp/approve", body: `{}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body))
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, req)
+			if rec.Code == http.StatusNotFound {
+				t.Fatalf("POST %s status = 404：registerAgentRoutes 漏注册 agent-as-MCP 端点，外部 MCP 工具面全链断", tc.path)
+			}
+		})
+	}
+}

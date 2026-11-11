@@ -322,6 +322,81 @@ func (h *AgentHandler) HandleAIApprovalHook(w http.ResponseWriter, r *http.Reque
 	_ = json.NewEncoder(w).Encode(response)
 }
 
+// HandleAIMCPStart POST /api/agent/ai/mcp/start —— agent-as-MCP 工具面发起。
+// 外部 MCP 客户端（Claude Code 等）的 ai_run_start 工具，经 stdio 工具面转成
+// 对本端点的 POST；真正起 run 的是 runtime 进程里的 AI 管理器。
+func (h *AgentHandler) HandleAIMCPStart(w http.ResponseWriter, r *http.Request) {
+	h.handleAIMCPOp(w, r, func(ctx context.Context, body map[string]string) (map[string]interface{}, int, error) {
+		return h.service.AgentMCPStart(ctx, body["project_path"], body["content"], body["provider"], body["session_id"])
+	})
+}
+
+// HandleAIMCPStatus POST /api/agent/ai/mcp/status —— 查询工具面会话运行态。
+func (h *AgentHandler) HandleAIMCPStatus(w http.ResponseWriter, r *http.Request) {
+	h.handleAIMCPOp(w, r, func(ctx context.Context, body map[string]string) (map[string]interface{}, int, error) {
+		return h.service.AgentMCPStatus(ctx, body["session_id"])
+	})
+}
+
+// HandleAIMCPApprove POST /api/agent/ai/mcp/approve —— 对工具面会话的待审批项下决议。
+func (h *AgentHandler) HandleAIMCPApprove(w http.ResponseWriter, r *http.Request) {
+	h.handleAIMCPOp(w, r, func(ctx context.Context, body map[string]string) (map[string]interface{}, int, error) {
+		return h.service.AgentMCPApprove(ctx, body["session_id"], body["approval_id"], body["decision"])
+	})
+}
+
+// handleAIMCPOp 是三个工具面端点共用的壳：方法闸 → 双进程分流 → 限长解码 →
+// 转调 → 信封。
+//
+// 执行顺序不能换：method 闸必须在 proxyIfNeeded 之前（否则 GET 也会被转发到
+// runtime，多一跳无谓错误）；proxyIfNeeded 必须在解码之前（core 侧只做透明
+// 转发，body 要原样到达 runtime，先解码就会把流吃掉）。
+//
+// 信封形态由下游决定：invokeTool（cmd/mcp.go）只解包 data.result 字符串，
+// 所以成功分支把 payload 序列化成字符串塞进 result，形状错整次工具调用报废。
+func (h *AgentHandler) handleAIMCPOp(w http.ResponseWriter, r *http.Request, op func(context.Context, map[string]string) (map[string]interface{}, int, error)) {
+	if r.Method != http.MethodPost {
+		// 必须走 http.Error，不能走 common.Error：后者把 code 当业务码过
+		// ErrorCodeToHTTPStatus，405 落在 default → HTTP 500（存量同型 bug 见
+		// HandleAIApprovalHook：本意 405 实发 500）。手写 405 还附带正确的
+		// Allow 语义（ServeMux 兜底那条路径也带）。
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if h.proxyIfNeeded(w, r) {
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+	body := map[string]string{}
+	if err := common.DecodeRequest(r, &body); err != nil {
+		common.ErrorBadRequest(w, "请求体非法", nil)
+		return
+	}
+	payload, status, err := op(r.Context(), body)
+	if err != nil {
+		// 按 op 给出的 HTTP 语义码分流，不用业务码判断：两条路各有各的坑。
+		// 503/405 必须走 http.Error（业务码 CodeServiceUnavailable=201 落在
+		// 200-299 段，common.Error 会映射成 HTTP 500）。
+		switch status {
+		case http.StatusServiceUnavailable:
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		case http.StatusForbidden:
+			common.Error(w, common.CodeForbidden, err.Error(), nil)
+		case http.StatusConflict:
+			common.Error(w, common.CodeConflict, err.Error(), nil)
+		default:
+			common.Error(w, common.CodeBadRequest, err.Error(), nil)
+		}
+		return
+	}
+	raw, marshalErr := json.Marshal(payload)
+	if marshalErr != nil {
+		common.ErrorInternalServer(w, "响应序列化失败", map[string]interface{}{"error": marshalErr.Error()})
+		return
+	}
+	common.Success(w, map[string]interface{}{"result": string(raw)})
+}
+
 func (h *AgentHandler) HandleStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)

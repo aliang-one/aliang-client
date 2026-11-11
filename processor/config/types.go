@@ -708,6 +708,12 @@ type AgentCoreTuningConfig struct {
 	// 先例：nil=未配置（默认开启）、true/false 显式。只作用于 agentcore 内核。
 	// 关闭时不提取、不注入，但 API 仍可读可管（手动管理既有记忆不被开关锁死）。
 	MemoryEnabled *bool `json:"memory_enabled,omitempty"`
+	// AIMCP 是 agent-as-MCP 工具面的总开关（customer.ai_mcp）。三态指针沿
+	// MCPEnabled/SkillsEnabled/MemoryEnabled 先例：nil=未配置（默认开启）、
+	// true/false 显式。只门控 ai_run_* 三工具（aliang mcp stdio 第 6 工具组），
+	// 不碰 peer 工具面。stdio 同用户信任模型下不引入新权限（同用户本可直打
+	// 管理口），独立键只为可关。
+	AIMCP *bool `json:"ai_mcp,omitempty"`
 }
 
 // Validate 保存通道(Config.Validate)调用。0 合法(=未配置,走默认);
@@ -765,6 +771,18 @@ func (c *Config) EffectiveAgentCoreMemoryEnabled() bool {
 		return true
 	}
 	return *c.Customer.AgentCore.MemoryEnabled
+}
+
+// EffectiveAgentCoreAIMCPEnabled 返回 agent-as-MCP 工具面是否开启。
+// 默认开启(同家族):nil(未配置)与 true 等价。
+func (c *Config) EffectiveAgentCoreAIMCPEnabled() bool {
+	if c == nil || c.Customer == nil || c.Customer.AgentCore == nil {
+		return true
+	}
+	if c.Customer.AgentCore.AIMCP == nil {
+		return true
+	}
+	return *c.Customer.AgentCore.AIMCP
 }
 
 // PeerMCPConfig 控制 aliang-peer 跨设备工具面(customer.peer_mcp)。三态指针

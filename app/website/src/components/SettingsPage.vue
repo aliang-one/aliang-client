@@ -460,9 +460,10 @@ function normalizeCustomerConfig(payload = {}) {
     model_mapping: normalizeModelMappingConfig(payload?.model_mapping),
     custom_env_vars: normalizeCustomEnvVarsConfig(payload?.custom_env_vars),
     agentcore_llm: normalizeAgentCoreLLMConfig(payload?.agentcore_llm),
-    // memory_enabled(记忆总开关)与 mcp_enabled/skills_enabled 同挂
-    // normalizeAgentCoreTuning 的透传 allowlist——改布尔键清单只动
-    // agentCoreSettings.js,此处共用同一出口,GET 回显与 patch 同源。
+    // memory_enabled(记忆总开关)/ai_mcp(agent-as-MCP 工具面总开关)与
+    // mcp_enabled/skills_enabled 同挂 normalizeAgentCoreTuning 的透传
+    // allowlist——改布尔键清单只动 agentCoreSettings.js,此处共用同一出口,
+    // GET 回显与 patch 同源(漏挂 = 保存 200 但永不落盘,缺陷①同族)。
     agentcore: normalizeAgentCoreTuning(payload?.agentcore),
     ssh_ingress: normalizeSSHIngressConfig(payload?.ssh_ingress),
     // mesh:漏挂此键 = 卡片保存 200 但永不落盘(见 createDefaultCustomerConfig

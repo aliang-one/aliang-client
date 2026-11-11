@@ -164,12 +164,18 @@ describe('normalizeAgentCoreTuning 全局总闸透传', () => {
       .toEqual({ max_identical_tool_turns: 0, skills_enabled: true });
     expect(normalizeAgentCoreTuning({ memory_enabled: false }))
       .toEqual({ max_identical_tool_turns: 0, memory_enabled: false });
+    expect(normalizeAgentCoreTuning({ ai_mcp: false }))
+      .toEqual({ max_identical_tool_turns: 0, ai_mcp: false });
     expect(normalizeAgentCoreTuning({ max_identical_tool_turns: 3, mcp_enabled: true, skills_enabled: false }))
       .toEqual({ max_identical_tool_turns: 3, mcp_enabled: true, skills_enabled: false });
     expect(normalizeAgentCoreTuning({ max_identical_tool_turns: 3, memory_enabled: true }))
       .toEqual({ max_identical_tool_turns: 3, memory_enabled: true });
+    expect(normalizeAgentCoreTuning({ max_identical_tool_turns: 3, ai_mcp: true }))
+      .toEqual({ max_identical_tool_turns: 3, ai_mcp: true });
     expect(normalizeAgentCoreTuning({ mcp_enabled: true, skills_enabled: false, memory_enabled: true }))
       .toEqual({ max_identical_tool_turns: 0, mcp_enabled: true, skills_enabled: false, memory_enabled: true });
+    expect(normalizeAgentCoreTuning({ mcp_enabled: true, skills_enabled: false, memory_enabled: true, ai_mcp: false }))
+      .toEqual({ max_identical_tool_turns: 0, mcp_enabled: true, skills_enabled: false, memory_enabled: true, ai_mcp: false });
   });
 
   it('非布尔值不透传', () => {
@@ -183,6 +189,12 @@ describe('normalizeAgentCoreTuning 全局总闸透传', () => {
       .toEqual({ max_identical_tool_turns: 0 });
     expect(normalizeAgentCoreTuning({ memory_enabled: null }))
       .toEqual({ max_identical_tool_turns: 0 });
+    expect(normalizeAgentCoreTuning({ ai_mcp: 'true' }))
+      .toEqual({ max_identical_tool_turns: 0 });
+    expect(normalizeAgentCoreTuning({ ai_mcp: null }))
+      .toEqual({ max_identical_tool_turns: 0 });
+    expect(normalizeAgentCoreTuning({ ai_mcp: 1 }))
+      .toEqual({ max_identical_tool_turns: 0 });
   });
 
   it('缺键不产出键(=未配置,后端 nil 视为开启)', () => {
@@ -190,10 +202,12 @@ describe('normalizeAgentCoreTuning 全局总闸透传', () => {
     expect('mcp_enabled' in next).toBe(false);
     expect('skills_enabled' in next).toBe(false);
     expect('memory_enabled' in next).toBe(false);
+    expect('ai_mcp' in next).toBe(false);
     const empty = normalizeAgentCoreTuning(undefined);
     expect('mcp_enabled' in empty).toBe(false);
     expect('skills_enabled' in empty).toBe(false);
     expect('memory_enabled' in empty).toBe(false);
+    expect('ai_mcp' in empty).toBe(false);
   });
 });
 

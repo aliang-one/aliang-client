@@ -181,3 +181,68 @@ func TestEffectiveAgentCoreMemoryEnabled(t *testing.T) {
 		}
 	}
 }
+
+// TestEffectiveAgentCoreAIMCPEnabled：agent-as-MCP 工具面总闸三态语义，与
+// MCP/技能/记忆同款——nil=默认开启（升级不得静默关掉存量用户的功能）、
+// true=开启、false=关闭。
+func TestEffectiveAgentCoreAIMCPEnabled(t *testing.T) {
+	tru, fals := true, false
+	cases := []struct {
+		name string
+		cfg  *Config
+		want bool
+	}{
+		{"nil config 默认开启", nil, true},
+		{"无 customer 默认开启", &Config{}, true},
+		{"无 agentcore 块默认开启", &Config{Customer: &CustomerConfig{}}, true},
+		{"未设置字段默认开启", &Config{Customer: &CustomerConfig{AgentCore: &AgentCoreTuningConfig{}}}, true},
+		{"显式 true", &Config{Customer: &CustomerConfig{AgentCore: &AgentCoreTuningConfig{AIMCP: &tru}}}, true},
+		{"显式 false 关闭", &Config{Customer: &CustomerConfig{AgentCore: &AgentCoreTuningConfig{AIMCP: &fals}}}, false},
+	}
+	for _, tc := range cases {
+		if got := tc.cfg.EffectiveAgentCoreAIMCPEnabled(); got != tc.want {
+			t.Errorf("%s: = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestAgentCoreAIMCPJSONRoundTrip 锁死线格式键 ai_mcp(snake_case):发错键会被
+// encoding/json 静默丢弃,是「保存返回 200 但永不生效」的经典来源(同族先例:
+// max_identical_tool_turns)。
+func TestAgentCoreAIMCPJSONRoundTrip(t *testing.T) {
+	raw := []byte(`{"customer":{"agentcore":{"ai_mcp":false}}}`)
+	var cfg Config
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if cfg.Customer == nil || cfg.Customer.AgentCore == nil {
+		t.Fatal("customer.agentcore 层没解析出来")
+	}
+	if cfg.Customer.AgentCore.AIMCP == nil {
+		t.Fatal("ai_mcp=false 没解析进 AIMCP(为 nil 会被读成「默认开启」)")
+	}
+	if *cfg.Customer.AgentCore.AIMCP {
+		t.Fatal("ai_mcp=false 解析成了 true")
+	}
+	if cfg.EffectiveAgentCoreAIMCPEnabled() {
+		t.Fatal("显式 false 经 Effective 读出来仍是开启——门控形同虚设")
+	}
+
+	fals := false
+	out, err := json.Marshal(&Config{Customer: &CustomerConfig{AgentCore: &AgentCoreTuningConfig{AIMCP: &fals}}})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(out), `"ai_mcp":false`) {
+		t.Errorf("线格式键必须是 ai_mcp:false, got %s", out)
+	}
+
+	// nil 用 omitempty 序列化掉——「未配置」与「显式 true」线上都等价于默认开。
+	out, err = json.Marshal(&Config{Customer: &CustomerConfig{AgentCore: &AgentCoreTuningConfig{}}})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(out), "ai_mcp") {
+		t.Errorf("未配置不应出现在线载荷(omitempty), got %s", out)
+	}
+}

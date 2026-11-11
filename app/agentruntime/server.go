@@ -152,6 +152,12 @@ func registerAgentRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/agent/peer/mcp", agentHandler.HandlePeerMcp)
 	mux.HandleFunc("/api/agent/peer/gates", agentHandler.HandlePeerGates)
 	mux.HandleFunc("/api/agent/ai/approval-hook", agentHandler.HandleAIApprovalHook)
+	// agent-as-MCP 工具面端点（spec §7）：真身在此（AI 管理器住本 runtime），
+	// core routes.go 侧同名注册只做 proxy 透传。缺任一侧 = 404（双注册教训，
+	// 2026-10-21 liang-dev 实测）。方法前缀模式与 core 侧 register 形态对齐。
+	mux.HandleFunc("POST /api/agent/ai/mcp/start", agentHandler.HandleAIMCPStart)
+	mux.HandleFunc("POST /api/agent/ai/mcp/status", agentHandler.HandleAIMCPStatus)
+	mux.HandleFunc("POST /api/agent/ai/mcp/approve", agentHandler.HandleAIMCPApprove)
 	// 仪表盘聊天 WS（2026-10-28 统一）：core 把 /api/agent/ai/stream 透传到本
 	// runtime，由本地 AI 管理器跑（journal/清单与手机同源）。缺注册=404 透传
 	// （2026-10-21 liang-dev 双注册教训）。
