@@ -897,8 +897,8 @@ func (c *MeshConfig) EffectiveMaxHops() int {
 // 地址;只要 ok 判定的消费方可丢弃 addr。
 //
 // 兜底门不重复检查钉扎/身份:fallback 启用时 host_key 由保存期 Validate 强制
-// 必填(见 MeshConfig.Validate),运行期 DialMeshAddr 对空钉扎 fail-closed——
-// 两道闸已覆盖,此处保持宽口径避免双重报错。
+// 必填(见 MeshConfig.Validate),运行期 DialMeshAddr(Task C4 落地)对空
+// 钉扎 fail-closed——两道闸已覆盖,此处保持宽口径避免双重报错。
 func MeshFallbackActiveForClass(cfg *Config, class string) (addr string, ok bool) {
 	if cfg == nil || cfg.Customer == nil || cfg.Customer.Mesh == nil {
 		return "", false

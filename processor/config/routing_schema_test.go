@@ -176,7 +176,18 @@ func TestMeshRoutingSchemaFallbackID2HostKey(t *testing.T) {
 		t.Fatalf("Validate() error = %T(%v), want RoutingSchemaValidationError invalid_target", err, err)
 	}
 
-	// 用例 3:id2 已钉扎 → 通过(校验只拦「在 peers 里却未钉扎」,钉扎齐备
+	// 用例 3:id2 未钉扎的纯空白变体("   ")→ 同样拒。经 MeshConfig.Validate
+	// 的保存路径会把空白规整成空串,但免 Validate 的快照提交路径可让空白键
+	// 存活——判据若退化成 =="" 本用例必须红(TrimSpace 钉扎纪律,与
+	// ffa7acd 在 snapshot_mesh_test 确立的口径对齐)。
+	if err := schemaWithFallback().Validate(&MeshConfig{Peers: []MeshPeer{
+		pinnedB,
+		{DeviceID: "dev-c", HostKey: "   "},
+	}}); err == nil {
+		t.Fatal("Validate() = nil error, want rejected (host_key 纯空白等同未钉扎)")
+	}
+
+	// 用例 4:id2 已钉扎 → 通过(校验只拦「在 peers 里却未钉扎」,钉扎齐备
 	// 的合法配置零误伤)。
 	if err := schemaWithFallback().Validate(&MeshConfig{Peers: []MeshPeer{
 		pinnedB,
@@ -185,7 +196,7 @@ func TestMeshRoutingSchemaFallbackID2HostKey(t *testing.T) {
 		t.Fatalf("Validate() = %v, want accepted (fallback id2 已钉扎)", err)
 	}
 
-	// 用例 4:无 mesh 上下文(nil)= peers 视为空 → 通过(HTTP 直改路由 JSON
+	// 用例 5:无 mesh 上下文(nil)= peers 视为空 → 通过(HTTP 直改路由 JSON
 	// 等无 mesh 生效配置的路径不误伤;运行期失败策略仍收口)。
 	if err := schemaWithFallback().Validate(nil); err != nil {
 		t.Fatalf("Validate(nil) = %v, want accepted (mesh 上下文缺失不拦)", err)

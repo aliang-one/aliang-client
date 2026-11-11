@@ -138,11 +138,13 @@ func normalizeCanonicalPayload(input []byte, mesh *MeshConfig) (*CanonicalRoutin
 	return &cfg, nil
 }
 
-// Validate canonical 路由 schema 的保存期校验。mesh 参数是当前生效配置的
-// customer.mesh(nil 安全,视为无 peers):fallback 段 id2 的钉扎检查需要 peers
-// 上下文,但本 schema 载荷本身不携带 mesh——由调用方(apply 管线)从生效配置
-// 取用。主目标的 peer 存在性/钉扎仍归编译层(meshForwardAvailable),本函数
-// 只拦 fallback 段的必败形态(见 mesh 分支注释)。
+// Validate canonical 路由 schema 的保存期校验。mesh 参数是 peers 上下文(nil
+// 安全,视为无 peers):fallback 段 id2 的钉扎检查需要 peers,但本 schema 载荷
+// 本身不携带 mesh——两种取法:apply 管线取当前生效配置的 customer.mesh
+// (routing_apply_state effectiveMeshForRoutingValidation),runtime-inputs
+// 编译路径取传入 cfg 的 mesh(新配置、尚未全局)。主目标的 peer 存在性/钉扎
+// 仍归编译层(meshForwardAvailable),本函数只拦 fallback 段的必败形态
+// (见 mesh 分支注释)。
 func (cfg *CanonicalRoutingSchema) Validate(mesh *MeshConfig) error {
 	if cfg.Ingress.Mode != "tun" && cfg.Ingress.Mode != "http" {
 		return newRoutingSchemaValidationError("invalid_enum", "ingress.mode", fmt.Sprintf("must be one of [tun http], got %q", cfg.Ingress.Mode))
@@ -178,10 +180,11 @@ func (cfg *CanonicalRoutingSchema) Validate(mesh *MeshConfig) error {
 			}
 		default:
 			// mesh 转发目标 toNode:<deviceID>[:direct|:deny|:fallback:<deviceID2>]
-			// (Task 7 策略 grammar):本层只做形态校验(deviceID 非空、策略段
-			// 白名单、fallback 目标非空);能力校验(mesh 生效开关(含 SSH 入口
-			// 依赖)+ 身份钥 + peer 存在且已钉扎,SPEC §13.2)在运行输入编译层
-			// (processor/routing,见 snapshot_mesh.go meshForwardAvailable)把关。
+			// (Task 7 策略 grammar):本层只做形态校验(fallback 段 id2 的钉扎
+			// 复核除外,见下)——deviceID 非空、策略段白名单、fallback 目标非空;
+			// 能力校验(mesh 生效开关(含 SSH 入口依赖)+ 身份钥 + peer 存在且
+			// 已钉扎,SPEC §13.2)在运行输入编译层(processor/routing,见
+			// snapshot_mesh.go meshForwardAvailable)把关。
 			if deviceID, policy, isMesh := ParseMeshRuleTarget(target); isMesh {
 				if deviceID == "" || !isValidMeshPolicy(policy) {
 					return newRoutingSchemaValidationError("invalid_target", targetField,
