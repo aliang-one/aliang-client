@@ -29,23 +29,15 @@ type directTCPIPMsg struct {
 // 镜像 inbound/tun 的 tun-<N> 口径;双形态共用同一计数命名空间)。
 var sshIngressConnCounter uint64
 
-// injectDirectTCPIP 是 direct-tcpip 通道的形态分流点(由 serveChannels 调用):
-// 认证层写入的 Permissions.Extensions[extIngressForm] 决定注入形态——
-// bare→形态① 裸流(payload 即目标四元组);mesh→形态② 帧外壳(帧头在
-// channel 数据流首行);未知形态保守 drain(认证层只标 bare/mesh,此为
-// 防御分支)。
+// injectDirectTCPIP 是 direct-tcpip 通道的注入入口(serveChannels 矩阵放行
+// bare×direct-tcpip 后唯一到达路径):形态分流已上移 serveChannels(按
+// form×channel 矩阵在 Accept 前拒绝,server.go),本函数只负责 bare 裸流
+// (形态①)的注入 goroutine 边界——payload 即目标四元组。
 //
-// goroutine 边界:两形态注入同边界(不入 WaitGroup)——在途 Handle 靠
-// 连接级 ctx 取消+连接拆除有界退出,TestStopWithInflightChannel 钉住。
-func injectDirectTCPIP(ctx context.Context, ch gossh.Channel, connRemote net.Addr, form string, payload []byte, rc RunConfig) {
-	switch form {
-	case FormBare:
-		go injectBareStream(ctx, ch, connRemote, payload)
-	case FormMesh:
-		go injectMeshFrame(ctx, ch, connRemote, rc)
-	default:
-		go drainAndClose(ch)
-	}
+// goroutine 边界:注入不入 WaitGroup——在途 Handle 靠连接级 ctx 取消+连接
+// 拆除有界退出,TestStopWithInflightChannel 钉住。
+func injectDirectTCPIP(ctx context.Context, ch gossh.Channel, connRemote net.Addr, payload []byte) {
+	go injectBareStream(ctx, ch, connRemote, payload)
 }
 
 // injectBareStream 是形态①(裸流)注入路径:解析 direct-tcpip payload →
@@ -139,3 +131,30 @@ func netAddrToIPPort(a net.Addr) (netip.Addr, uint16) {
 	}
 	return addr.Unmap(), uint16(port)
 }
+
+// WithRemoteLabel 给连接包一层 RemoteAddr 标签(piko 中继载体限速串桶修法,
+// SPEC §8.2):yamux 流的 RemoteAddr 探测到底层 websocket 对端(= piko 服
+// 务器 IP),所有中继 peer 会共用限速键。包装后 remoteIP(SplitHostPort
+// 失败 → 原样返回)按 label 隔离。**label 绝不能含冒号**——"piko:dev-b"
+// 会被 SplitHostPort 成功拆分(host="piko"),修法完全失效(调用方以
+// "piko-"+device_id 形态构造,TestWithRemoteLabelRateLimitKey 实证陷阱)。
+// 已知副作用(测试钉住):netAddrToIPPort 对 label 地址解析失败 → SrcIP/
+// SrcPort 归零,peer 真实来源在统计/审计面不可知(SPEC §8.2/§16)。
+type remoteLabelAddr struct{ label string }
+
+func (a *remoteLabelAddr) Network() string { return "tcp" }
+func (a *remoteLabelAddr) String() string  { return a.label }
+
+type remoteLabelConn struct {
+	net.Conn
+	addr *remoteLabelAddr
+}
+
+func WithRemoteLabel(c net.Conn, label string) net.Conn {
+	if c == nil {
+		return nil
+	}
+	return &remoteLabelConn{Conn: c, addr: &remoteLabelAddr{label: label}}
+}
+
+func (c *remoteLabelConn) RemoteAddr() net.Addr { return c.addr }

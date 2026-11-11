@@ -8,7 +8,6 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"net"
 	"os"
@@ -63,9 +62,9 @@ type Server struct {
 	hostKeyMu sync.Mutex
 	hostKey   gossh.Signer
 
-	// obsMu 保护 lastIngressForm/lastIngressDeviceID:最近一次 direct-tcpip
-	// 通道读到的入口形态与 mesh 对端身份(extMeshDeviceID)。仅测试观测
-	// Permissions→通道传递链用,生产行为不读。
+	// obsMu 保护 lastIngressForm/lastIngressDeviceID:最近一次通道读到的
+	// 入口形态与 mesh 对端身份(extMeshDeviceID;观测先于矩阵拒绝判定,
+	// 被拒通道同样留痕)。仅测试观测 Permissions→通道传递链用,生产行为不读。
 	obsMu               sync.Mutex
 	lastIngressForm     string
 	lastIngressDeviceID string
@@ -462,38 +461,55 @@ func serveGlobalRequests(reqs <-chan *gossh.Request) {
 	}
 }
 
-// serveChannels 是通道安全收敛白名单:仅 direct-tcpip 放行,其余
-// (session/auth-agent@openssh.com/x11/forwarded-tcpip 等)全拒。
-// 通道形态经认证 Permissions.Extensions["ingress_form"] 读取,分流注入
-// 见 channel.go injectDirectTCPIP(bare→裸流;mesh→帧外壳;未知保守 drain)。
+// serveChannels 是通道安全收敛矩阵(SPEC §4.2):公钥身份决定 form,form
+// 决定唯一可用 channel;所有拒绝在 Accept 前发出(Reject reason 会原样回给
+// A 侧 OpenChannel)。bare→direct-tcpip 裸流注入(channel.go
+// injectDirectTCPIP);mesh→mesh-exit ExtraData 注入(mesh_inject.go
+// handleMeshExitChannel,SPEC §4);未知 form 全拒(UnknownChannelType——
+// 认证层只产出 bare/mesh,此为防御分支,含 perms 未就绪的 nil 场景)。
+// 观测面在拒绝判定之前:被拒通道同样留下 form/deviceID 审计痕迹
+// (TestMeshExitMatrix 钉住先读 form 再 Reject 的次序)。
 func (s *Server) serveChannels(ctx context.Context, chans <-chan gossh.NewChannel, perms *gossh.Permissions, remote net.Addr) {
 	for newCh := range chans {
-		if newCh.ChannelType() != channelDirectTCPIP {
-			_ = newCh.Reject(gossh.UnknownChannelType, "only direct-tcpip is accepted on this ingress")
-			continue
-		}
-		form := ""
-		deviceID := ""
+		form, meshDeviceID := "", ""
 		if perms != nil {
 			form = perms.Extensions[extIngressForm]
-			deviceID = perms.Extensions[extMeshDeviceID]
+			meshDeviceID = perms.Extensions[extMeshDeviceID]
 		}
 		s.observeForm(form)
-		s.observeDeviceID(deviceID)
-		ch, chReqs, err := newCh.Accept()
-		if err != nil {
-			logger.Debug(fmt.Sprintf("SSH ingress direct-tcpip accept failed: %v", err))
+		s.observeDeviceID(meshDeviceID)
+
+		var allowed string
+		switch form {
+		case FormBare:
+			allowed = channelDirectTCPIP
+		case FormMesh:
+			allowed = channelMeshExit
+		default:
+			_ = newCh.Reject(gossh.UnknownChannelType, "unknown credential form")
 			continue
 		}
-		logger.Debug(fmt.Sprintf("SSH ingress direct-tcpip accepted (form=%s)", form))
-		go gossh.DiscardRequests(chReqs)
-		// 形态分流注入在 channel.go(bare→裸流;mesh→帧外壳;未知保守
-		// drain);dispatcher 本身同步派发各形态的注入 goroutine。
-		injectDirectTCPIP(ctx, ch, remote, form, newCh.ExtraData(), s.rc)
+		if newCh.ChannelType() != allowed {
+			_ = newCh.Reject(gossh.Prohibited, "channel not allowed for this credential form")
+			continue
+		}
+
+		switch form {
+		case FormBare:
+			ch, chReqs, err := newCh.Accept()
+			if err != nil {
+				logger.Debug(fmt.Sprintf("SSH ingress direct-tcpip accept failed: %v", err))
+				continue
+			}
+			go gossh.DiscardRequests(chReqs)
+			injectDirectTCPIP(ctx, ch, remote, newCh.ExtraData())
+		case FormMesh:
+			handleMeshExitChannel(ctx, newCh, newCh.ExtraData(), s.rc, meshDeviceID, remote)
+		}
 	}
 }
 
-// observeForm 记录最近一次 direct-tcpip 通道携带的入口形态,供测试观测
+// observeForm 记录最近一次通道携带的入口形态,供测试观测
 // Permissions→通道层的传递链(生产行为不读它)。
 func (s *Server) observeForm(form string) {
 	s.obsMu.Lock()
@@ -507,7 +523,7 @@ func (s *Server) observedForm() string {
 	return s.lastIngressForm
 }
 
-// observeDeviceID 记录最近一次 direct-tcpip 通道携带的 mesh 对端身份标签
+// observeDeviceID 记录最近一次通道携带的 mesh 对端身份标签
 // (extMeshDeviceID,bare 形态恒空),观测面与 observeForm 同族。
 func (s *Server) observeDeviceID(id string) {
 	s.obsMu.Lock()
@@ -521,14 +537,8 @@ func (s *Server) observedDeviceID() string {
 	return s.lastIngressDeviceID
 }
 
-// drainAndClose 排空并关闭通道(bare/mesh 两形态均由注入路径接管;
-// 此处仅剩未知形态的防御分支,见 channel.go injectDirectTCPIP)。
-func drainAndClose(ch gossh.Channel) {
-	_, _ = io.Copy(io.Discard, ch)
-	_ = ch.Close()
-}
-
-// remoteIP 提取 net.Addr 的 host 部分作为限速键。
+// remoteIP 提取 net.Addr 的 host 部分作为限速键(SplitHostPort 失败时
+// 原样返回——WithRemoteLabel 的标签地址即靠此语义落串桶,SPEC §8.2)。
 func remoteIP(a net.Addr) string {
 	if a == nil {
 		return ""
