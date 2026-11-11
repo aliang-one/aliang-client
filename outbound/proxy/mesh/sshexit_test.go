@@ -228,7 +228,11 @@ func TestExitClientLanPreferredOverRelay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewExitClient: %v", err)
 	}
-	conn, err := client.DialContext(context.Background(), &M.Metadata{HostName: "x.com:443"})
+	// 显式 self 类是必须的:默认推断 custom 会让 piko 在 Admit 即被拦
+	// (custom 禁公共中继),本用例就退化成「custom 禁中继」而非「LAN 优先
+	// 于中继」——即使 transports 顺序被改成 [Piko, LAN] 它也照样绿。
+	ctx := WithClass(context.Background(), meshproto.ClassSelf)
+	conn, err := client.DialContext(ctx, &M.Metadata{HostName: "x.com:443"})
 	if err != nil {
 		t.Fatalf("DialContext: %v", err)
 	}
