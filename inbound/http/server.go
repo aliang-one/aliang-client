@@ -35,9 +35,9 @@ func StartMitmHttp() {
 }
 
 // StartMitmHttpTolerant 是绑定重试路径的容忍变体(评审 I1):绑定失败只记
-// Error 并返回,不 Fatal——重绑(mesh 总开关切换触发停→按新地址重绑)在
-// goroutine 里跑,瞬时端口占用/环境异常把整个 agent 进程杀掉属不成比例的
-// 失败;留活进程让下次提交或自愈链重试。
+// Error 并返回,不 Fatal——重绑(ssh_ingress 开关切换触发停→按新地址重绑,
+// SPEC §5.5)在 goroutine 里跑,瞬时端口占用/环境异常把整个 agent 进程杀掉
+// 属不成比例的失败;留活进程让下次提交或自愈链重试。
 func StartMitmHttpTolerant() {
 	startUnifiedIngress(false)
 }

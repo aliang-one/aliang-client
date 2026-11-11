@@ -70,6 +70,11 @@ func TestUnifiedIngressListenAddrFollowsSSHIngress(t *testing.T) {
 	if got := UnifiedIngressListenAddrFor(nil); got != "127.0.0.1:56432" {
 		t.Fatalf("nil cfg 时 UnifiedIngressListenAddrFor = %q, want 127.0.0.1:56432", got)
 	}
+	// cfg 非 nil 但 Customer 缺失 → 回环(钉住 cfg.Customer != nil 守卫,
+	// 与上面 nil-cfg 分支不重复;Customer nil 与 SSHIngress nil 同由本例兜住)。
+	if got := UnifiedIngressListenAddrFor(&Config{}); got != "127.0.0.1:56432" {
+		t.Fatalf("Customer 缺失时 UnifiedIngressListenAddrFor = %q, want 127.0.0.1:56432", got)
+	}
 	// 全局未配置(customer 缺失)→ 回环。
 	if got := UnifiedIngressListenAddr(); got != "127.0.0.1:56432" {
 		t.Fatalf("未配置 customer 时 UnifiedIngressListenAddr() = %q, want 127.0.0.1:56432", got)
