@@ -38,6 +38,7 @@ import (
 	"time"
 
 	"aliang.one/nursorgate/common/version"
+	"aliang.one/nursorgate/internal/runtimepath"
 	"aliang.one/nursorgate/processor/config"
 	"github.com/spf13/cobra"
 )
@@ -198,13 +199,23 @@ func peerMCPInitializeResult(protocolVersion string) map[string]interface{} {
 		"instructions": "Aliang cross-device toolset: this machine belongs to an Aliang account with other registered devices. " +
 			"When the user asks to run a command on, inspect, or fetch a file from another device or machine, " +
 			"call device_list FIRST to pick the device_id, then peer_exec / peer_fetch_file. " +
-			"Remote targets enforce their own peer-exec gates; failures are reported per call.",
+			"Remote targets enforce their own peer-exec gates; failures are reported per call." +
+			" To drive an AI run on this machine (start / poll / approve), use ai_run_start, ai_run_status, ai_run_approve — those require the device's AI control to be enabled, and only operate on sessions they created.",
 	}
 }
 
 func peerMCPToolDescriptors() []map[string]interface{} {
 	out := make([]map[string]interface{}, 0, len(peerMCPTools))
+	// 门控在组装时读一次：冷子进程的生命周期等于一次 CLI 会话，会话中途改
+	// config.json 不会生效——这是有意的，工具面上半截变化的列表比稳定的旧
+	// 列表更难排查。
+	aiGateOn := agentMCPGateOn()
 	for _, t := range peerMCPTools {
+		// 过滤放在列表出口而不是从表里删：表是编译期常量，list 与 call 两处
+		// 门控读同一张表，「谁在不在表里」才只有一种答案。
+		if isAIMCPToolName(t.name) && !aiGateOn {
+			continue
+		}
 		out = append(out, map[string]interface{}{
 			"name":        t.name,
 			"description": t.description,
@@ -234,8 +245,85 @@ func peerMCPArgInt(args map[string]interface{}, key string) int {
 	return 0
 }
 
+// ---------------------------------------------------------------------------
+// agent-as-MCP 工具组门控（customer.agentcore.ai_mcp，三态，nil=默认开）
+// ---------------------------------------------------------------------------
+
+// agentMCPGateConfigPath 是门控读配置的路径 seam。默认走 runtimepath.UserConfigPath()
+// （~/.aliang/config.json）。
+//
+// 为什么是「包级变量」而不是直接调用：单测必须能换临时 fixture。用户主目录
+// 没有 env 覆盖（UserStateDir 只认 HOME/USERPROFILE），固定路径会让 tools/call
+// 的用例读到开发机上真实的 ~/.aliang/config.json —— 门控值随人而变，测试也就
+// 随人红绿，更糟的是想造 gate off 就得手改真家目录。
+var agentMCPGateConfigPath = func() string {
+	if p, err := runtimepath.UserConfigPath(); err == nil {
+		return p
+	}
+	return ""
+}
+
+// agentMCPGateOn 读 customer.agentcore.ai_mcp 三态：文件不存在 / 解析失败 /
+// 字段缺失(nil) 一律 = 开启。
+//
+// 为什么直读文件而不用 config.GetGlobalConfig()：aliang mcp 是 CLI 每次拉起
+// 的冷子进程，customer config 只由常驻 agent 主进程 SetGlobalConfig 装载，
+// 从它等于把门控写成永久 fail-open，用户在仪表盘/AI 规则里关掉 ai_mcp 也
+// 关不掉工具。
+//
+// 为什么读错也 fail-open（只 Warn）：与家族其它能力开关（MCPEnabled /
+// SkillsEnabled / MemoryEnabled）的加法语义一致 —— 升级/半截写入/磁盘抖动
+// 不得静默剥夺既有能力；要关必须在配置里写出显式的 false。
+//
+// 解析用局部 struct 而不引 processor/config 完整 Config：冷子进程只需要一棵
+// 三字段子树，拉进完整 Config 会把整条依赖链拖进 CLI 启动路径。
+func agentMCPGateOn() bool {
+	path := agentMCPGateConfigPath()
+	if path == "" {
+		return true
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		// 文件不存在是首次安装的常态，不 Warn（否则每次启动都刷一行噪音）；
+		// 其它读错（权限/IO）才是值得留痕的异常。
+		if !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "aliang mcp: read %s for ai_mcp gate: %v (defaulting to enabled)\n", path, err)
+		}
+		return true
+	}
+	var probe struct {
+		Customer struct {
+			AgentCore struct {
+				AIMCP *bool `json:"ai_mcp"`
+			} `json:"agentcore"`
+		} `json:"customer"`
+	}
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		fmt.Fprintf(os.Stderr, "aliang mcp: parse %s for ai_mcp gate: %v (defaulting to enabled)\n", path, err)
+		return true
+	}
+	if probe.Customer.AgentCore.AIMCP == nil {
+		return true
+	}
+	return *probe.Customer.AgentCore.AIMCP
+}
+
+// isAIMCPToolName 判断名字是否属于 agent-as-MCP 工具组。list 与 call 两处
+// 门控共用这一份名单 —— 若各写一条 || 链，加第四个工具时漏改一处就会出现
+// 「列表里没有、但 tools/call 仍能打到」的静默越门（LLM 记着旧工具名就能绕）。
+func isAIMCPToolName(name string) bool {
+	switch name {
+	case "ai_run_start", "ai_run_status", "ai_run_approve":
+		return true
+	}
+	return false
+}
+
 // peerMCPTools 与 services 侧 LLM 工具面一一对应；后端全走 56433 本地路由，
 // 复用同一套实现、脱敏与审计。
+//
+// 第 6 工具组（ai_run_*，agent-as-MCP）走同一张表：tools/list 与 tools/call
+// 都已按表驱动，门控只需在两条出口各加一次过滤，不必为它新开一套分发。
 var peerMCPTools = []peerMCPTool{
 	{
 		name: "peer_exec",
@@ -353,11 +441,113 @@ var peerMCPTools = []peerMCPTool{
 			}
 		},
 	},
+	// ---- 第 6 工具组：agent-as-MCP（ai_run_*） ----
+	//
+	// session 契约句是描述里的承重部分而不是客套：外部 LLM 会先看到工具列表，
+	// 若它以为这里能读到「用户正在手机上聊的那个会话」，就会拿 session_id 去
+	// 猜、去复用 —— 服务端会一律拒（createdBy 标记三处校验），但那时工具调用
+	// 已经白跑一轮。把边界写进描述，是让模型一开始就不提这个请求。
+	//
+	// 逐出提示同理：会话是内存态，重启/压内存就没了。不写清楚的话，模型拿到
+	// 「session not found」会反复用同一个 id 重试，而不是开新会话。
+	{
+		name: "ai_run_start",
+		description: "Start an agentcore AI run on this machine. Async: returns session_id immediately; " +
+			"poll ai_run_status for progress and pending approvals. Restricted to sessions created by " +
+			"this tool face; phone/desktop sessions are not accessible. " +
+			"sessions may be evicted under memory pressure or after an agent restart — if ai_run_status " +
+			"reports the session missing, start a new one.",
+		schema: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"content":      map[string]interface{}{"type": "string", "description": "Task / prompt to send to the agent"},
+				"project_path": map[string]interface{}{"type": "string", "description": "Absolute path of the project the agent should work in"},
+				"session_id":   map[string]interface{}{"type": "string", "description": "Continue an existing tool-face session; omit to create a new one"},
+				"provider":     map[string]interface{}{"type": "string", "description": "Kernel provider hint (optional; omit for auto)"},
+			},
+			"required": []string{"content", "project_path"},
+		},
+		timeoutMs: 60_000,
+		method:    http.MethodPost,
+		path:      "/api/agent/ai/mcp/start",
+		buildReq: func(args map[string]interface{}) interface{} {
+			// 键名 snake_case 原样下发：端点侧（agent_handler.handleAIMCPOp →
+			// AgentMCPStart）按 body["project_path"] 取值，驼峰化一处就是静默空参。
+			req := map[string]interface{}{
+				"project_path": peerMCPArgString(args, "project_path"),
+				"content":      peerMCPArgString(args, "content"),
+			}
+			if v := peerMCPArgString(args, "provider"); v != "" {
+				req["provider"] = v
+			}
+			if v := peerMCPArgString(args, "session_id"); v != "" {
+				req["session_id"] = v
+			}
+			return req
+		},
+	},
+	{
+		name: "ai_run_status",
+		description: "Read the state of an agentcore session (running / idle / awaiting_approval), " +
+			"its pending approvals and the last assistant summary. Restricted to sessions created by " +
+			"this tool face.",
+		schema: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"session_id": map[string]interface{}{"type": "string", "description": "Session id returned by ai_run_start"},
+			},
+			"required": []string{"session_id"},
+		},
+		timeoutMs: 30_000,
+		method:    http.MethodPost,
+		path:      "/api/agent/ai/mcp/status",
+		buildReq: func(args map[string]interface{}) interface{} {
+			return map[string]interface{}{
+				"session_id": peerMCPArgString(args, "session_id"),
+			}
+		},
+	},
+	{
+		name: "ai_run_approve",
+		// applied 语义写进描述是必要的：服务端在「没有匹配 waiter / 已被别的
+		// 路径决议」两种情况下都回 200 + applied=false（而不是报错）。没这句，
+		// 模型会把 applied=false 当成成功，然后等一个永远不会前进的会话。
+		description: "Submit an approval decision for a pending approval of a tool-face session. " +
+			"Returns applied=true only when the decision actually landed; applied=false means it did " +
+			"not (no matching waiter, or already decided).",
+		schema: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"session_id":  map[string]interface{}{"type": "string", "description": "Tool-face session id"},
+				"approval_id": map[string]interface{}{"type": "string", "description": "Approval id from ai_run_status pending_approvals"},
+				"decision":    map[string]interface{}{"type": "string", "description": "accept or deny"},
+			},
+			"required": []string{"session_id", "approval_id", "decision"},
+		},
+		timeoutMs: 30_000,
+		method:    http.MethodPost,
+		path:      "/api/agent/ai/mcp/approve",
+		buildReq: func(args map[string]interface{}) interface{} {
+			return map[string]interface{}{
+				"session_id":  peerMCPArgString(args, "session_id"),
+				"approval_id": peerMCPArgString(args, "approval_id"),
+				"decision":    peerMCPArgString(args, "decision"),
+			}
+		},
+	},
 }
 
 // invokeTool 执行一个 tools/call：本地路由 → {code:0,data:{result}} 解包；
 // 非 2xx / code!=0 → isError 文本（服务端已脱敏）。未知工具名返回 isError。
 func (s *peerMCPServer) invokeTool(name string, rawArgs json.RawMessage) (string, bool) {
+	// 门控先于查表：关闸时这三个名字要落进「未知工具」分支，而不是先被表
+	// 命中再被拦——否则以后有人重构错误分支，很容易把这条早退丢掉。
+	//
+	// 文案与 peer_mcp 关闸同款（unknown tool）是刻意的：模型对「工具不存在」
+	// 的处理是明确的（换路子），对「工具被禁用」会反复重试或改写参数。
+	if isAIMCPToolName(name) && !agentMCPGateOn() {
+		return fmt.Sprintf("unknown tool: %s", name), true
+	}
 	var tool *peerMCPTool
 	for i := range peerMCPTools {
 		if peerMCPTools[i].name == name {

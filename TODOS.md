@@ -42,4 +42,38 @@
 **Priority:** P3
 **Depends on:** 无
 
+### agent-as-MCP 导出面评审遗留账(ai_run_* 三工具,均不阻塞)
+
+**What:** 五个任务两关评审(规格+质量)余留的观察,按归属分组:
+
+*端点后端(Task 2,`app/http/services/agent_ai_ai_mcp.go`)*
+1. **条件键形状无自动化护栏**:status 的 pending_approvals 条目里 `command`/`tool_name`/`expires_at` 是「非空才带」的条件键——变异测试 F(gate 键恒带空串)整套仍绿,说明缺一条「空值不出键」的断言。补法:构造空 Command 的 waiter,断言序列化后 JSON 里没有该键。
+2. `agentAIMCPStatusForError` 的第二个 case 与 default 分支等价,可删。
+3. history 尾部遍历在 `m.mu` 临界区内(存量同款形态,不是本批引入);history 长时会拉长锁持有时间。
+4. `snapshot()` 是浅拷贝,安全性依赖 `fanOutWrite` 的「帧写后不再改」冻结契约;若将来有帧被原地改写,这里会静默串数据。
+
+*端点层(Task 3)*
+5. **`HandleAIApprovalHook` 存量 bug**(`app/http/handlers/agent_handler.go:~304`):用 `common.Error(w, http.StatusMethodNotAllowed, ...)`,而 8 行之上的注释明确写着「直传 405 会被映射成 500」——实测确实返回 500。本批新增的 `handleAIMCPOp` 已按正确写法(`http.Error`)实现,老函数未动(不在本批范围)。修法:改成 `http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)`。
+6. `cleanExistingAgentDirectory` 的 stat 错误会把**绝对路径**回吐给工具调用方(手机/桌面同款行为,存量)。是否脱敏需产品口径。
+7. 已被逐出的工具面会话调 status 返回 `200 {state:"idle"}` 而非 400——「会话不存在」的语义在逐出场景下要不要区分,待定。
+
+*工具面(Task 4)*
+8. 工具面会话可能在内存压力下被逐出(ResidentCap=8)或随 agent 重启消失,之后 status/approve 会 403/400。工具描述里已有「会话可能被逐出,重新 start」的提示,但**没有**把「旧 session_id 会永久失效」讲透。
+9. `cmd/mcp.go` 的 `invokeTool` 注释写「服务端已脱敏」(`:~359`),但 ai_run_* 三端点回的是本机会话状态摘要,脱敏与否取决于上游 handler,措辞偏乐观。
+
+*其它*
+10. `ai_mcp` 的仪表盘 UI 卡片(spec §6 明确 v1 不做):目前只能改文件/API 关闭,产品上缺可见开关。
+11. ~~`ai_mcp` 线格式键缺 JSON round-trip 测试~~ **已补**:`TestAgentCoreAIMCPJSONRoundTrip`(键改名变异实测变红)。
+12. SettingsPage 层仍缺「ai_mcp 三态透传」的**页面级**断言——`agentCoreSettings.test.js` 已覆盖 `normalizeAgentCoreTuning` 本身的三态(`ai_mcp: false/true/非法类型/缺键`),但 SettingsPage 的 `mapCustomerConfigFromApi` 出口没有专门用例;该页共用同一出口,回归风险低。
+13. spec 行文里「第 6 工具组」的序数在群组增删后需要复核(纯文档一致性)。**当前成立**:peer 五工具 + ai_run_* 三工具 = 六组。
+14. 记忆批沿用下来的 NIT 里与 `agentAIMCPPreflight` 同型的一条:每次调用都 `config.GetGlobalConfig()` 取指针后读字段,指针在 `SetGlobalConfig` 下会被整体替换(读取方要么拿旧要么拿新、各自视为不可变),因此**当前无竞态**;但若将来有人改成「锁外原地改字段」,这里会静默读到半更新的配置。**注**:`cmd/mcp.go` 的门控不走这条路(冷子进程直读文件,见 `agentMCPGateOn` 注释)。
+
+**Why:** 五任务全部两关评审通过(0 BLOCKER/0 SHOULD 未决),以上均为「不影响正确性、安全红线、主流程」的观察项;其中 5 是存量真 bug(HTTP 500 而非 405),6/7 是产品口径问题,1/11 是可测性缺口。
+
+**Context:** spec=`docs/superpowers/specs/2026-11-10-agent-as-mcp-design.md`;plan=`docs/superpowers/plans/2026-11-10-agent-as-mcp.md`;记忆批同款卡片修复先例=`AgentMemorySettings.vue` 的 `memoryApiRequest` 挂 `e.status`+`isMissingError` 收窄形态。
+
+**Effort:** S
+**Priority:** P3
+**Depends on:** 无
+
 ## Completed

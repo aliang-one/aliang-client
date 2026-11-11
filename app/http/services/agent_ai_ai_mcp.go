@@ -84,8 +84,18 @@ var agentAIMCPNewCaptureWriter = func() *agentAIMCPCaptureWriter {
 
 // scanAIMCPErrorFrames 扫错误帧(agentAIErrorPayload 形态:type=ai.error 且
 // 文案在 "error" 键)。返回 (文案, true);无错误帧 → ("", false)。
-// message()/approval() 的受理失败都在同一同步段内经 writeJSON 写出,所以
-// 「扫到错误帧」等价于「本次受理被拒」。
+//
+// 边界(勿扩大解读):捕获 writer 只看到受理函数同步段内写出的帧。approval 的
+// 失败全在该段内,「扫到错误帧」严格等价于「决议被拒」;message 则不是——
+// AgentEventAIMessageReceived 在 agent_ai.go:~2287 就写出,早于 busy 守卫
+// (:~2497)与后续校验,而 run 真正开跑是 :~3586 的 `go m.runCLI`。所以 message
+// 侧「扫到错误帧」只等价于「受理被拒」当且仅当该帧来自 run 启动前的同步段;
+// run 启动后的运行期错误帧同样会落进缓冲(run 的 emitter 持有同一个 writer)。
+//
+// 反面做法(不要做):有评审建议「只认 ai.message.received 之前的错误帧」。
+// received 帧早于 busy 守卫写出,按此过滤会把 409「会话运行中」静默降级成
+// 200 受理成功——那是把真拒绝当成功,比多一次误判严重得多。实测该窗口下
+// 40 次探测 0 误拒,运行期错误落到 start 响应上属理论边界。
 func scanAIMCPErrorFrames(frames []map[string]interface{}) (string, bool) {
 	for _, frame := range frames {
 		if frame == nil {
