@@ -1,6 +1,6 @@
-// Package sniff 实现统一入口协议嗅探(spec §5):读前 4 字节分类协议族,
-// 已读字节经回放缓存无损交给下游。本包不依赖任何协议包、不做门禁——分类器
-// 只分类,准入归各协议处理器。
+// Package sniff 实现统一入口协议嗅探(spec §5):读前 4 字节把连接分派到
+// SSH/socks5/HTTP 三协议族,已读字节经回放缓存无损交给下游。本包不依赖任何
+// 协议包、不做门禁——分类器只分类,准入归各协议处理器。
 package sniff
 
 import (
@@ -10,9 +10,8 @@ import (
 	"time"
 )
 
-// Kind 是嗅探出的协议族。粒度刻意停在线格式最外层:完整解析(mesh 帧头的
-// JSON 合法性、socks 版本协商、HTTP 请求头)全部归各协议处理器,嗅探层只
-// 回答「该交给谁」。
+// Kind 是嗅探出的协议族。粒度刻意停在线格式最外层:完整解析(socks 版本
+// 协商、HTTP 请求头)全部归各协议处理器,嗅探层只回答「该交给谁」。
 type Kind int
 
 const (
@@ -22,8 +21,6 @@ const (
 	KindSSH
 	// KindSocks 是 socks5 greeting(VER=0x05,第二字节为方法数)。
 	KindSocks
-	// KindMesh 是一行 JSON 帧头候选('{' 开头),完整解析归 HandleMeshConn。
-	KindMesh
 	// KindHTTP 是兜底:HTTP 请求以及一切未知字节流(与合并前「非 HTTP 即
 	// ReadRequest 失败断连」等价,不劣化)。
 	KindHTTP
@@ -35,8 +32,6 @@ func (k Kind) String() string {
 		return "ssh"
 	case KindSocks:
 		return "socks"
-	case KindMesh:
-		return "mesh"
 	case KindHTTP:
 		return "http"
 	default:
@@ -85,20 +80,17 @@ func Sniff(conn net.Conn) (Kind, net.Conn, error) {
 //
 //	"SSH-"                    → SSH 版本串
 //	0x05 + 方法数(≤0x7F)      → socks5 greeting
-//	'{'                       → mesh JSON 帧头候选
 //	其余                       → HTTP(含未知字节流)
 //
-// 收窄理由:HTTP 方法与状态行不可能以 '{' 或 "SSH-" 开头,socks5 的 VER 恒
-// 0x05 且 NMETHODS 不会超过 0x7F,三类特征不碰撞;被误判的非 mesh '{' 流会
-// 由 HandleMeshConn 回拒绝行后断开,与合并前「未知流断连」等价。
+// 收窄理由:HTTP 方法与状态行不可能以 "SSH-" 开头,socks5 的 VER 恒 0x05
+// 且 NMETHODS 不会超过 0x7F,三类特征不碰撞;被误判进 HTTP 兜底的非 HTTP
+// 流由 ReadRequest 失败断连,与合并前「未知流断连」等价。
 func classify(head []byte) Kind {
 	switch {
 	case len(head) >= 4 && string(head[:4]) == "SSH-":
 		return KindSSH
 	case len(head) >= 2 && head[0] == 0x05 && head[1] <= 0x7F:
 		return KindSocks
-	case head[0] == '{':
-		return KindMesh
 	default:
 		return KindHTTP
 	}

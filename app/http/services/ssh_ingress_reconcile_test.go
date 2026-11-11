@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -240,11 +241,94 @@ func TestBuildSSHIngressRunConfigUnparseableKeyDefense(t *testing.T) {
 	if rc.Port != 0 {
 		t.Fatalf("port = %d, want 0 (56442 sentinel maps to unified ingress)", rc.Port)
 	}
-	if rc.ForwardGate != nil {
-		t.Fatal("ForwardGate must stay nil (merge integration seam, see RunConfig comment)")
+	// ForwardGate 恒注入(连接期读全局活值,nil 链=fail-closed);其取值
+	// 随全局配置而变,布尔断言归 TestBuildSSHIngressRunConfigForwardGateLiveView。
+	if rc.ForwardGate == nil {
+		t.Fatal("ForwardGate must always be injected (live global view)")
 	}
 	if rc.LocalNodeID != nil {
 		t.Fatal("LocalNodeID must be left for Reconcile injection, not set at translation")
+	}
+}
+
+// TestBuildSSHIngressRunConfigForwardGateLiveView 钉门禁活视图(SPEC §10.1
+// 第 2 条实施期修正):闭包连接期读全局活值,forward_enable 切换不经重建
+// 即生效——同一个 RunConfig(同一闭包实例),换全局配置,门禁值跟着变。
+// 若闭包按次提交捕获(旧实现),它会被 Reconcile 的身份相等 no-op 冻结在
+// 旧 Server 里(runIdentity 不比 gate),本用例第三段就会假绿——这正是
+// Critical 缺陷的复现形状。
+func TestBuildSSHIngressRunConfigForwardGateLiveView(t *testing.T) {
+	config.ResetGlobalConfigForTest()
+	t.Cleanup(config.ResetGlobalConfigForTest)
+
+	keyLine, _ := newSSHIngressTestKey(t)
+	rc := buildSSHIngressRunConfig(&config.SSHIngressConfig{
+		Port:           config.SSHIngressDefaultPort,
+		AuthorizedKeys: []string{keyLine},
+	})
+	if rc == nil || rc.ForwardGate == nil {
+		t.Fatal("run config with injected live gate must build")
+	}
+	// mesh 未配置:nil 链 = fail-closed。
+	if rc.ForwardGate() {
+		t.Fatal("gate must be closed while mesh unconfigured (fail-closed)")
+	}
+
+	openCfg := &config.Config{
+		Core:     &config.CoreConfig{APIServer: "https://api.aliang.one"},
+		Customer: &config.CustomerConfig{Mesh: &config.MeshConfig{ForwardEnable: boolPtr(true)}},
+	}
+	config.SetGlobalConfig(openCfg)
+	if !rc.ForwardGate() {
+		t.Fatal("gate must open right after global forward_enable=true, without rebuilding the run config")
+	}
+
+	// 同一 rc(同一闭包实例)再读:false → 关。捕获参数的旧实现在这里
+	// 仍返回 true(被 no-op 冻结),活视图必须跟随全局新值。
+	closedCfg := &config.Config{
+		Core:     &config.CoreConfig{APIServer: "https://api.aliang.one"},
+		Customer: &config.CustomerConfig{Mesh: &config.MeshConfig{ForwardEnable: boolPtr(false)}},
+	}
+	config.SetGlobalConfig(closedCfg)
+	if rc.ForwardGate() {
+		t.Fatal("the SAME closure must reflect the new global value after forward_enable=false")
+	}
+}
+
+// TestParseSSHIngressMeshKeysFourForms 钉 mesh_authorized_keys 解析四形态
+// (SPEC §13.4):尾注释=device_id;无注释=空串(运行时回落指纹);尾注释
+// 内部空格原样保留;坏行跳过。
+func TestParseSSHIngressMeshKeysFourForms(t *testing.T) {
+	withComment, _ := newSSHIngressTestKey(t)
+	noComment, _ := newSSHIngressTestKey(t)
+	innerSpace, _ := newSSHIngressTestKey(t)
+
+	// authorized_keys 行格式:"<type> <base64> [comment]"。newSSHIngressTestKey
+	// 产出的行无注释;尾注释手工拼接(保留空格语义)。
+	lines := []string{
+		strings.TrimRight(withComment, "\n") + " dev-b",
+		noComment, // 无尾注释
+		strings.TrimRight(innerSpace, "\n") + " dev-b extra",
+		"not-a-key at all",
+	}
+	keys := parseSSHIngressMeshKeys(lines)
+	if len(keys) != 3 {
+		t.Fatalf("keys = %d, want 3 (bad line skipped)", len(keys))
+	}
+	if keys[0].DeviceID != "dev-b" {
+		t.Fatalf("form1 trailing comment device id = %q, want dev-b", keys[0].DeviceID)
+	}
+	if keys[0].Key == nil {
+		t.Fatal("form1 must carry the parsed public key")
+	}
+	if keys[1].DeviceID != "" {
+		t.Fatalf("form2 no-comment device id = %q, want empty (runtime falls back to fingerprint)", keys[1].DeviceID)
+	}
+	if keys[1].Key == nil {
+		t.Fatal("form2 must carry the parsed public key")
+	}
+	if keys[2].DeviceID != "dev-b extra" {
+		t.Fatalf("form3 inner-space comment = %q, want %q (TrimSpace only strips edges)", keys[2].DeviceID, "dev-b extra")
 	}
 }
 

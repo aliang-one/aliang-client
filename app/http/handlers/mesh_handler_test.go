@@ -230,6 +230,75 @@ func TestMeshStatusHandlerUnconfiguredDefaults(t *testing.T) {
 	}
 }
 
+// meshStatusEffectiveProbe 是 effective 字段测试的响应解码面(只取两个开关
+// 字段;其余标量由 Aggregate/Unconfigured 用例钉)。
+type meshStatusEffectiveProbe struct {
+	Code int `json:"code"`
+	Data struct {
+		Enable    bool `json:"enable"`
+		Effective bool `json:"effective"`
+	} `json:"data"`
+}
+
+func meshStatusEffective(t *testing.T, cfg *config.Config) (enable, effective bool) {
+	t.Helper()
+	h := &MeshHandler{
+		beacon:   func() *lanbeacon.Beacon { return nil },
+		config:   func() *config.Config { return cfg },
+		deviceID: func() string { return "" },
+		lanPort:  func() int { return 0 },
+	}
+	rec := httptest.NewRecorder()
+	h.HandleStatus(rec, httptest.NewRequest(http.MethodGet, "/api/mesh/status", nil))
+	if rec.Code != 200 {
+		t.Fatalf("code = %d, want 200", rec.Code)
+	}
+	var resp meshStatusEffectiveProbe
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v (body=%s)", err, rec.Body.String())
+	}
+	return resp.Data.Enable, resp.Data.Effective
+}
+
+func meshStatusTestBool(v bool) *bool { return &v }
+
+// TestMeshStatusHandlerEffectiveFollowsSSHIngress effective 字段两向钉 +
+// 守卫出位回归(SPEC §10.3 依赖降级一处生效的前端观感面):
+//   - mesh 开 + ssh 开 → enable=true 且 effective=true(生效);
+//   - mesh 开 + ssh 关 → enable=true 但 effective=false(依赖降级,前端凭它
+//     区分「开关开了但 SSH 入口关着导致 mesh 未生效」);
+//   - 回归钉:mesh 键缺失(Customer.Mesh=nil,合法态)+ ssh 开 → effective
+//     必须 true——Effective 的守卫只有 cfg 非 nil(EffectiveEnabled 对 nil
+//     mesh 安全);曾误锁进 Mesh!=nil 守卫时本向恒 false,制造「已生效却被
+//     报未生效」的反向误判。
+func TestMeshStatusHandlerEffectiveFollowsSSHIngress(t *testing.T) {
+	meshOnSSHOn := &config.Config{Customer: &config.CustomerConfig{
+		Mesh:       &config.MeshConfig{Enable: meshStatusTestBool(true)},
+		SSHIngress: &config.SSHIngressConfig{Enable: meshStatusTestBool(true)},
+	}}
+	enable, effective := meshStatusEffective(t, meshOnSSHOn)
+	if !enable || !effective {
+		t.Fatalf("mesh开+ssh开: enable=%v effective=%v, want true/true", enable, effective)
+	}
+
+	meshOnSSHOff := &config.Config{Customer: &config.CustomerConfig{
+		Mesh:       &config.MeshConfig{Enable: meshStatusTestBool(true)},
+		SSHIngress: &config.SSHIngressConfig{Enable: meshStatusTestBool(false)},
+	}}
+	enable, effective = meshStatusEffective(t, meshOnSSHOff)
+	if !enable || effective {
+		t.Fatalf("mesh开+ssh关: enable=%v effective=%v, want true/false", enable, effective)
+	}
+
+	meshNilSSHOn := &config.Config{Customer: &config.CustomerConfig{
+		SSHIngress: &config.SSHIngressConfig{Enable: meshStatusTestBool(true)},
+	}}
+	enable, effective = meshStatusEffective(t, meshNilSSHOn)
+	if !enable || !effective {
+		t.Fatalf("mesh键缺失+ssh开: enable=%v effective=%v, want true/true(守卫出位回归)", enable, effective)
+	}
+}
+
 // TestMeshStatusHandlerMethodNotAllowed 非 GET 405。
 func TestMeshStatusHandlerMethodNotAllowed(t *testing.T) {
 	h := NewMeshHandler()

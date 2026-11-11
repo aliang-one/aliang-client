@@ -91,7 +91,10 @@ func (s *routingApplyStore) apply(raw []byte, buildSnapshot RoutingSnapshotBuild
 	}
 	postParse := true
 
-	normalized, err := normalizeRoutingPayload(parsed, raw)
+	// mesh 上下文只取一次:normalize 与 Validate 用同一份 peers 快照,避免
+	// 两次读取之间生效配置被换指针造成的校验口径漂移。
+	mesh := effectiveMeshForRoutingValidation()
+	normalized, err := normalizeRoutingPayload(parsed, raw, mesh)
 	if err != nil {
 		atomic.AddUint64(&s.failures, 1)
 		if postParse {
@@ -100,7 +103,7 @@ func (s *routingApplyStore) apply(raw []byte, buildSnapshot RoutingSnapshotBuild
 		return nil, err
 	}
 
-	if err := normalized.Validate(); err != nil {
+	if err := normalized.Validate(mesh); err != nil {
 		atomic.AddUint64(&s.failures, 1)
 		if postParse {
 			atomic.AddUint64(&s.rollbacks, 1)
@@ -359,11 +362,27 @@ func parseRoutingPayload(raw []byte) (map[string]json.RawMessage, error) {
 	return root, nil
 }
 
-func normalizeRoutingPayload(root map[string]json.RawMessage, raw []byte) (*CanonicalRoutingSchema, error) {
+func normalizeRoutingPayload(root map[string]json.RawMessage, raw []byte, mesh *MeshConfig) (*CanonicalRoutingSchema, error) {
 	if _, ok := root["ingress"]; ok {
-		return normalizeCanonicalPayload(raw)
+		return normalizeCanonicalPayload(raw, mesh)
 	}
 	return nil, fmt.Errorf("non-canonical routing payload is not supported; use canonical keys ingress/egress/routing with targets direct|toSocks|toAliang")
+}
+
+// effectiveMeshForRoutingValidation 返回当前生效配置的 customer.mesh(nil 安全),
+// 供路由 schema 保存期校验的 fallback id2 钉扎检查取 peers 上下文。raw 路由
+// 载荷本身不携带 mesh,三条生产路径都保证 SetGlobalConfig 先于本读取:
+//   - customer 配置提交:SetGlobalConfig(&committedCfg) 与 runtime 路由刷新
+//     同一回调内顺序执行(customer_config_service.go);
+//   - 启动装载:ApplyConfig→SetGlobalConfig 在 loadPersistedRoutingSwitches
+//     之前(cmd/start.go/cmd/core.go);
+//   - HTTP 路由开关直改:peers 来自当前生效配置,语义即「以现状校验」。
+func effectiveMeshForRoutingValidation() *MeshConfig {
+	cfg := GetGlobalConfig()
+	if cfg == nil || cfg.Customer == nil {
+		return nil
+	}
+	return cfg.Customer.Mesh
 }
 
 func hashCanonicalRoutingSchema(cfg *CanonicalRoutingSchema) (string, error) {

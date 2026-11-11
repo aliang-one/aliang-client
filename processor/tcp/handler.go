@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -117,6 +118,11 @@ type TCPConnectionHandler struct {
 	tlsHandler       TLSHandler
 	relayManager     RelayManager
 	statsManager     *statistic.Manager
+	// meshExits 是 mesh ExitClient 缓存(SPEC §5.1/§10.4):挂在实例上而非
+	// 包级变量——包级变量跨 ResetHandler(测试)存活会串味。键与失效见
+	// meshproxy.PeerSpec.CacheKey;无 TTL,键不匹配即重建(唯一重建路径)。
+	meshExitsMu sync.RWMutex
+	meshExits   map[string]*meshproxy.ExitClient
 }
 
 // NewTCPConnectionHandler creates a new TCP handler
@@ -131,6 +137,7 @@ func NewTCPConnectionHandler(
 		tlsHandler:       tlsHandler,
 		relayManager:     relayManager,
 		statsManager:     statsManager,
+		meshExits:        make(map[string]*meshproxy.ExitClient),
 	}
 }
 
@@ -488,7 +495,7 @@ func (h *TCPConnectionHandler) handleNonTLS(
 		// 的 HTTP/2 改包逻辑只适用于 aliang 隧道,mesh 直转路径不套用。
 		// 兜底节点也不可达时如实失败:离线下原路由(RouteToALiang)本就
 		// 拨不通,不再叠加一次注定失败的隧道拨号,错误交由 AI 客户端重试。
-		if fbAddr, redirect := meshOfflineRedirectForAI(); redirect {
+		if fbAddr, redirect := meshOfflineRedirectForAI(metadata); redirect {
 			remote, dialErr := h.dialMeshFallbackNode(ctx, metadata, fbAddr)
 			if dialErr != nil {
 				return nil, originConn, fmt.Errorf("mesh: offline AI redirect to fallback node %s failed: %w", fbAddr, dialErr)
@@ -1328,56 +1335,35 @@ func currentCustomerProxyUpstreamType() (string, bool) {
 
 // ---- mesh 拨出执行(design §3.3/§3.4/§9.4,计划 Task 7)----
 
-// meshFallbackPseudoDeviceID 兜底 Peer 的伪 device_id:兜底目标是 host:port
-// 地址而非 peer 条目(design §9.4),该 id 仅用于错误诊断——兜底只拨 LAN
-// 单载体,不触中继端点命名。
-const meshFallbackPseudoDeviceID = "mesh-fallback"
+// errMeshInjectedLoop mesh 注入防环(SPEC §6.2):由 mesh-exit 注入的连接
+// (B 侧转发而来,Metadata.MeshInjected=true)若再命中本机 mesh 规则会
+// 二次出 mesh 形成环,三处 mesh 拨出入口拨出前一律拒绝——链条由配置期
+// 定死(单跳),该限制无损:需要 A→C→D 就配成对应节点。
+var errMeshInjectedLoop = errors.New("mesh: injected traffic must not re-enter mesh (loop guard)")
 
-// meshSelfIDSource / meshPikoDialSource 组装层注入缝,atomic.Value 保护
-// (质量评审 Critical 1):本机 device_id 与 piko 中继拨号在 processor/tcp
-// 层无自然来源——device_id 属 agent 运行状态(持有在 app/http/services,
-// 经 tunnel 配置下发),PikoDial 生产实现由 app/tunnel 封装(Task 9 接线)。
+// meshTransportDialSource 组装层注入缝,atomic.Value 保护(质量评审
+// Critical 1 先例):piko 中继载体拨号在 processor/tcp 层无自然来源——生产
+// 实现由 app/tunnel 封装(manager.dialMeshEndpoint,每次拨号读当前配置)。
 // 生产写方 app/tunnel manager validateConfig(隧道每次续期重跑 Set)与
 // mesh 拨号 goroutine 读方跨包并发,普通包级变量存在数据竞争(-race 实测,
 // 见 TestMeshSeamConcurrentSetAndRead)。atomic.Value 要求 Store 的具体类型
-// 恒定:两缝恒为各自的 func 类型;nil 归一为空提供器(atomic.Value 不接受
-// nil 接口,归一后 Load 语义与未接线一致)。selfID 生产注入点 app/tunnel
-// manager(与 relay.ProductionDeps 的 selfDeviceID 同一来源);测试注入
-// fake 后 t.Cleanup 恢复(清空 = Set(nil))。未接线:链头帧头 From 缺失由
-// meshproto Encode 兜底报错,中继载体不可用(仅 LAN)。
-var (
-	meshSelfIDSource   atomic.Value // func() string
-	meshPikoDialSource atomic.Value // func() meshproxy.PikoDialFunc
-)
+// 恒定:缝恒为 func() meshproxy.PikoDialFunc 类型;nil 归一为空提供器
+// (atomic.Value 不接受 nil 接口,归一后 Load 语义与未接线一致)。未接线
+// = 中继载体不进 ExitClient 的 Transport 切片(仅 LAN,SPEC §7.3);测试
+// 注入 fake 后 t.Cleanup 恢复(清空 = Set(nil))。
+var meshTransportDialSource atomic.Value // func() meshproxy.PikoDialFunc
 
-// SetMeshSelfIDSource 注入本机 device_id 提供器(mesh 链头帧头 From/Via 用);
-// nil = 清除(回到未接线语义)。并发安全(生产写方为隧道续期路径)。
-func SetMeshSelfIDSource(fn func() string) {
-	if fn == nil {
-		fn = func() string { return "" }
-	}
-	meshSelfIDSource.Store(fn)
-}
-
-// SetMeshPikoDialSource 注入 piko 中继载体拨号提供器(Task 9 生产接线);
-// nil = 清除。并发安全。
-func SetMeshPikoDialSource(fn func() meshproxy.PikoDialFunc) {
+// SetMeshTransportDialSource 注入 piko 中继载体拨号提供器(生产接线:
+// app/tunnel manager.validateConfig);nil = 清除。并发安全。
+func SetMeshTransportDialSource(fn func() meshproxy.PikoDialFunc) {
 	if fn == nil {
 		fn = func() meshproxy.PikoDialFunc { return nil }
 	}
-	meshPikoDialSource.Store(fn)
+	meshTransportDialSource.Store(fn)
 }
 
-func meshSelfIDFromSource() string {
-	fn, _ := meshSelfIDSource.Load().(func() string)
-	if fn == nil {
-		return ""
-	}
-	return strings.TrimSpace(fn())
-}
-
-func meshPikoDialFromSource() meshproxy.PikoDialFunc {
-	fn, _ := meshPikoDialSource.Load().(func() meshproxy.PikoDialFunc)
+func meshTransportDialFromSource() meshproxy.PikoDialFunc {
+	fn, _ := meshTransportDialSource.Load().(func() meshproxy.PikoDialFunc)
 	if fn == nil {
 		return nil
 	}
@@ -1387,17 +1373,18 @@ func meshPikoDialFromSource() meshproxy.PikoDialFunc {
 // dialViaMesh 执行 toNode:<deviceID>[:policy] 决策(错误回源语义,链头就地
 // 执行,dialByRoute 的 RouteToNode 分支):
 //
-//	mesh 拨出成功 → 返回;失败 → 中间跳错误回源 / 链头先兜底再失败策略
+//	mesh 拨出成功 → 返回;失败 → 链头先兜底再失败策略
 //
-// 中间跳(ctx 携带继承帧头,mesh_inbound 注入):错误原样回源,不落兜底/
-// 失败策略——design §3.3「B 的规则若再指向 C 而 C 失败,同样向上冒泡给 A」
-// /§9.4「兜底仅由发起节点(链头)执行,中间跳不落兜底」,否则回落 direct
-// 会让流量从中间节点的网络位置出去。
-// 链头:一、离线兜底(customer.mesh.Fallback 显式使能且类别勾选;兜底地址
-// 是对端 mesh 监听口,走 mesh 帧协议,单 LAN 载体天然满足 custom 类别仅
-// LAN 准入);二、规则失败策略——缺省/direct 回落直连、deny 拒绝连接、
+// 单跳模型(SPEC §6.2):中间跳续传已随帧协议退役——B 注入连接被顶部
+// MeshInjected 守卫拦截,不可能走到本函数的 mesh 拨出,失败策略只属于链头。
+// 链头失败路径顺序:一、离线兜底(customer.mesh.Fallback 显式使能且类别
+// 勾选;兜底地址指对端 SSH 入口 56432,经 DialMeshAddr 走 SSH,LAN-only 单
+// 载体);二、规则失败策略——缺省/direct 回落直连、deny 拒绝连接、
 // fallback:<id2> 拨指定节点(限一次,不再链式,防策略链)。
 func (h *TCPConnectionHandler) dialViaMesh(ctx context.Context, metadata *M.Metadata) (net.Conn, error) {
+	if metadata.MeshInjected {
+		return nil, fmt.Errorf("%w (route=%s)", errMeshInjectedLoop, metadata.Route)
+	}
 	deviceID, policy, ok := config.ParseMeshRuleTarget(metadata.Route)
 	if !ok || deviceID == "" {
 		// decision 字符串缺失/畸形:只有 RouteToNode 会进入本分支,寄存通路
@@ -1405,9 +1392,9 @@ func (h *TCPConnectionHandler) dialViaMesh(ctx context.Context, metadata *M.Meta
 		return nil, fmt.Errorf("mesh: route decision %q is not a valid toNode target", metadata.Route)
 	}
 
-	peer, peerErr := h.getMeshProxyForExecution(deviceID)
+	client, peerErr := h.getMeshExitForExecution(deviceID)
 	if peerErr == nil {
-		conn, err := peer.DialContext(ctx, metadata)
+		conn, err := client.DialContext(ctx, metadata)
 		if err == nil {
 			metadata.Route = "RouteToNode"
 			return conn, nil
@@ -1415,15 +1402,10 @@ func (h *TCPConnectionHandler) dialViaMesh(ctx context.Context, metadata *M.Meta
 		peerErr = err
 	}
 
-	if _, inherited := meshproxy.InheritedHeaderFromContext(ctx); inherited {
-		// 中间跳错误回源:链头(A)收到断流后由其自身策略语义收口。
-		return nil, fmt.Errorf("mesh: forward to %s failed on middle hop (error propagated to source): %w", deviceID, peerErr)
-	}
-
 	logger.Warn(fmt.Sprintf("[MESH-OUT] conn_id=%s dial to %s failed, executing head failure policy (policy=%q): %v",
 		ensureTCPConnID(metadata), deviceID, policy, peerErr))
 
-	// 一、离线兜底(位于规则失败策略之前,design §9.4 定死)。
+	// 一、离线兜底(位于规则失败策略之前,SPEC §7.2/design §9.4 定死)。
 	if fbAddr, allowed := meshFallbackAddrForClass(ctx, metadata); allowed {
 		conn, err := h.dialMeshFallbackNode(ctx, metadata, fbAddr)
 		if err == nil {
@@ -1454,11 +1436,11 @@ func (h *TCPConnectionHandler) dialViaMesh(ctx context.Context, metadata *M.Meta
 		if !isFallback || fallbackID == "" {
 			return nil, fmt.Errorf("mesh: invalid failure policy %q for %s", policy, deviceID)
 		}
-		fbPeer, fbErr := h.getMeshProxyForExecution(fallbackID)
+		fbClient, fbErr := h.getMeshExitForExecution(fallbackID)
 		if fbErr != nil {
 			return nil, fmt.Errorf("mesh: failure policy fallback to %s unavailable: %w", fallbackID, fbErr)
 		}
-		conn, err := fbPeer.DialContext(ctx, metadata)
+		conn, err := fbClient.DialContext(ctx, metadata)
 		if err != nil {
 			return nil, fmt.Errorf("mesh: failure policy dial to %s failed: %w", fallbackID, err)
 		}
@@ -1467,61 +1449,92 @@ func (h *TCPConnectionHandler) dialViaMesh(ctx context.Context, metadata *M.Meta
 	}
 }
 
-// getMeshProxyForExecution 从 customer.mesh.peers 装配 toNode:<deviceID> 的
-// mesh 出口 Peer(结构参照 getToSocksProxyForExecution):LAN 地址顺序尝试;
-// 中继默认放行(peer.Relay nil=true),custom 类别由 mesh 出口的载体准入
-// (ClassCarrierAllowed)在引擎层拒绝;SelfID/PikoDial 经组装层注入缝。
-// peer 不存在/未配置 mesh → 错误:编译期 meshForwardAvailable 已把关,此处
-// 兜住决策→拨出窗口内的配置漂移,由链头失败策略收口。
-func (h *TCPConnectionHandler) getMeshProxyForExecution(deviceID string) (*meshproxy.Peer, error) {
+// getMeshExitForExecution 从 customer.mesh.peers 装配并缓存 toNode:<deviceID>
+// 的 ExitClient(SPEC §5.1/§7.3)。peer 不存在/未配置/缺身份 → 错误:编译期
+// meshForwardAvailable 已把关(含 SSH 依赖与钉扎/身份检查,A3),此处兜住
+// 决策→拨出窗口内的配置漂移,由链头失败策略收口。
+func (h *TCPConnectionHandler) getMeshExitForExecution(deviceID string) (*meshproxy.ExitClient, error) {
 	cfg := config.GetGlobalConfig()
-	if cfg == nil || cfg.Customer == nil || cfg.Customer.Mesh == nil {
-		return nil, fmt.Errorf("mesh: customer.mesh not configured (target %s)", deviceID)
+	if cfg == nil || cfg.Customer == nil || cfg.Customer.Mesh == nil || !cfg.MeshEffectivelyEnabled() {
+		return nil, fmt.Errorf("mesh: customer.mesh not configured or degraded (target %s)", deviceID)
 	}
 	meshCfg := cfg.Customer.Mesh
+	if strings.TrimSpace(meshCfg.PrivateKey) == "" {
+		return nil, fmt.Errorf("mesh: customer.mesh.private_key not configured")
+	}
 	for i := range meshCfg.Peers {
 		entry := &meshCfg.Peers[i]
 		if strings.TrimSpace(entry.DeviceID) != deviceID {
 			continue
 		}
-		target := meshproxy.PeerTarget{
+		spec := meshproxy.PeerSpec{
 			DeviceID: strings.TrimSpace(entry.DeviceID),
 			LANAddrs: entry.LANAddrs,
+			HostKey:  strings.TrimSpace(entry.HostKey),
+			SSHUser:  "mesh",
 			Relay:    entry.Relay == nil || *entry.Relay,
-			SelfID:   meshSelfIDFromSource(),
-			MaxHops:  meshCfg.EffectiveMaxHops(),
 		}
-		if dial := meshPikoDialFromSource(); dial != nil {
-			target.PikoDial = dial
+		var pikoDial meshproxy.PikoDialFunc
+		if spec.Relay {
+			if dial := meshTransportDialFromSource(); dial != nil {
+				pikoDial = dial
+			}
 		}
-		return meshproxy.NewPeer(target), nil
+		key := spec.CacheKey(meshCfg.PrivateKey, meshCfg.KeyPassphrase)
+		h.meshExitsMu.RLock()
+		client, ok := h.meshExits[key]
+		h.meshExitsMu.RUnlock()
+		if ok {
+			return client, nil
+		}
+		client, err := meshproxy.NewExitClient(spec, meshCfg.PrivateKey, meshCfg.KeyPassphrase, pikoDial)
+		if err != nil {
+			return nil, err
+		}
+		h.meshExitsMu.Lock()
+		if h.meshExits == nil {
+			h.meshExits = make(map[string]*meshproxy.ExitClient) // 零值 handler 直用(测试)防御
+		}
+		h.meshExits[key] = client // 键不匹配即重建(唯一失效路径,SPEC §10.4)
+		h.meshExitsMu.Unlock()
+		return client, nil
 	}
 	return nil, fmt.Errorf("mesh: peer %q not found in customer.mesh.peers", deviceID)
 }
 
-// meshFallbackAddrForClass 离线兜底可用性判定(design §9.4 兜底式),统一
+// meshFallbackAddrForClass 离线兜底可用性判定(SPEC §7.2 兜底式),统一
 // 抽取为共享助手 config.MeshFallbackActiveForClass(计划 Task 12 评审钉死):
 // EffectiveEnabled 总开关 + Fallback.Enable + 类别勾选 + Addr 非空——总开关
 // 检查是抽取时补上的穿透缺口(原实现缺此检查)。类别口径复用 mesh 出口
 // 推断(56432 回环 → ai,其余 custom;self 类由 egress 发起点显式指定,
-// Task 11 接入后同一助手自动覆盖)。离线信号不在此层:本闸消费的是
-// dialViaMesh 链头失败路径(对端不可达),与离线改道(Task 12 AI 流量)的
-// 信号驱动判定互相独立。
+// 同一助手自动覆盖)。离线信号不在此层:本闸消费的是 dialViaMesh 链头失败
+// 路径(对端不可达),与离线改道(AI 流量)的信号驱动判定互相独立。
 func meshFallbackAddrForClass(ctx context.Context, md *M.Metadata) (string, bool) {
 	class := meshproxy.InferClass(ctx, md)
 	return config.MeshFallbackActiveForClass(config.GetGlobalConfig(), class)
 }
 
-// dialMeshFallbackNode 拨离线兜底节点:兜底地址是对端 mesh 监听口(design
-// §9.4),走 mesh 帧协议与正常拨出同语义(链头帧头/继承帧头由 mesh 出口按
-// ctx 决定);单 LAN 载体、不试中继(custom 类别仅 LAN 准入天然满足)。
+// dialMeshFallbackNode 拨离线兜底节点:兜底地址现指对端 SSH 入口 56432
+// (SPEC §7.2——旧值指向已删除的 mesh 监听口,发布说明必写),经
+// DialMeshAddr 走 SSH(LAN-only 单载体)。本机身份 = customer.mesh.
+// private_key(兜底路径拨号频率低,构造期解析私钥可接受,不缓存)。
 // 失败返回错误,由调用方继续走规则失败策略(兜底也失败才走失败策略)。
 func (h *TCPConnectionHandler) dialMeshFallbackNode(ctx context.Context, metadata *M.Metadata, addr string) (net.Conn, error) {
-	peer := meshproxy.NewPeer(meshproxy.PeerTarget{
-		DeviceID: meshFallbackPseudoDeviceID,
-		LANAddrs: []string{addr},
-		Relay:    false,
-		SelfID:   meshSelfIDFromSource(),
-	})
-	return peer.DialContext(ctx, metadata)
+	if metadata.MeshInjected {
+		return nil, fmt.Errorf("%w (route=%s)", errMeshInjectedLoop, metadata.Route)
+	}
+	cfg := config.GetGlobalConfig()
+	if cfg == nil || cfg.Customer == nil || cfg.Customer.Mesh == nil {
+		return nil, fmt.Errorf("mesh: customer.mesh not configured (fallback %s)", addr)
+	}
+	meshCfg := cfg.Customer.Mesh
+	signer, err := meshproxy.SignerFromPEM(meshCfg.PrivateKey, meshCfg.KeyPassphrase)
+	if err != nil {
+		return nil, fmt.Errorf("mesh: fallback identity key: %w", err)
+	}
+	payload := meshproxy.ExitPayloadForMetadata(metadata)
+	if payload == nil {
+		return nil, meshproxy.ErrUnbuildableTarget()
+	}
+	return meshproxy.DialMeshAddr(ctx, addr, config.MeshFallbackHostKey(cfg), signer, payload)
 }

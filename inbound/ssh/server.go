@@ -8,12 +8,12 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"net"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -62,10 +62,12 @@ type Server struct {
 	hostKeyMu sync.Mutex
 	hostKey   gossh.Signer
 
-	// obsMu 保护 lastIngressForm:最近一次 direct-tcpip 通道读到的入口
-	// 形态。仅测试观测 Permissions→通道传递链用,生产行为不读。
-	obsMu           sync.Mutex
-	lastIngressForm string
+	// obsMu 保护 lastIngressForm/lastIngressDeviceID:最近一次通道读到的
+	// 入口形态与 mesh 对端身份(extMeshDeviceID;观测先于矩阵拒绝判定,
+	// 被拒通道同样留痕)。仅测试观测 Permissions→通道传递链用,生产行为不读。
+	obsMu               sync.Mutex
+	lastIngressForm     string
+	lastIngressDeviceID string
 }
 
 // NewServer 创建 SSH 入口服务实例。hostKeyPath 指向 PEM 私钥文件
@@ -272,7 +274,8 @@ func (s *Server) serverConfig(signer gossh.Signer) *gossh.ServerConfig {
 }
 
 // publicKeyCallback 是双密钥准入点(Task 3):公钥即形态区分器——
-// 命中 MeshKeys→Permissions.Extensions["ingress_form"]=mesh;命中
+// 命中 MeshKeys→Permissions.Extensions["ingress_form"]=mesh 且同时携带
+// device_id 标签(extMeshDeviceID,尾注释为空回落指纹前 16 字符);命中
 // AuthorizedKeys→bare;都不命中→拒并计入限速。成功认证清零限速。
 //
 // 比较用解析后的公钥身份(key.Marshal() 字节,编码含类型与公钥体),
@@ -282,22 +285,48 @@ func (s *Server) serverConfig(signer gossh.Signer) *gossh.ServerConfig {
 // 可达)→mesh 优先:运行期保守取向,注释即约定。
 func (s *Server) publicKeyCallback(meta gossh.ConnMetadata, key gossh.PublicKey) (*gossh.Permissions, error) {
 	ip := remoteIP(meta.RemoteAddr())
-	switch {
-	case keyInList(key, s.rc.MeshKeys):
+	if mk, ok := meshKeyFor(key, s.rc.MeshKeys); ok {
 		s.limiter.Reset(ip)
-		return &gossh.Permissions{Extensions: map[string]string{extIngressForm: FormMesh}}, nil
-	case keyInList(key, s.rc.AuthorizedKeys):
+		return &gossh.Permissions{Extensions: map[string]string{
+			extIngressForm:  FormMesh,
+			extMeshDeviceID: meshDeviceIDLabel(mk),
+		}}, nil
+	}
+	if keyInList(key, s.rc.AuthorizedKeys) {
 		s.limiter.Reset(ip)
 		return &gossh.Permissions{Extensions: map[string]string{extIngressForm: FormBare}}, nil
-	default:
-		s.limiter.Fail(ip)
-		logger.Debug(fmt.Sprintf("SSH ingress rejected unknown key %s for %q from %s",
-			gossh.FingerprintSHA256(key), meta.User(), ip))
-		return nil, fmt.Errorf("unknown public key for %q", meta.User())
 	}
+	s.limiter.Fail(ip)
+	logger.Debug(fmt.Sprintf("SSH ingress rejected unknown key %s for %q from %s",
+		gossh.FingerprintSHA256(key), meta.User(), ip))
+	return nil, fmt.Errorf("unknown public key for %q", meta.User())
 }
 
-// keyInList 按公钥身份比对:Marshal 编码含类型与公钥体,字节级相等即同钥
+// meshKeyFor 按公钥身份查 mesh 凭证,命中返回完整 MeshKey(DeviceID 随之
+// 进入通道层)。
+func meshKeyFor(key gossh.PublicKey, list []MeshKey) (MeshKey, bool) {
+	for _, mk := range list {
+		if bytes.Equal(key.Marshal(), mk.Key.Marshal()) {
+			return mk, true
+		}
+	}
+	return MeshKey{}, false
+}
+
+// meshDeviceIDLabel 尾注释为空时回落指纹前 16 字符。
+func meshDeviceIDLabel(mk MeshKey) string {
+	if id := strings.TrimSpace(mk.DeviceID); id != "" {
+		return id
+	}
+	fp := gossh.FingerprintSHA256(mk.Key)
+	if len(fp) > 16 {
+		return fp[:16]
+	}
+	return fp
+}
+
+// keyInList 按公钥身份比对(只服务裸钥列表 AuthorizedKeys;mesh 列表走
+// meshKeyFor 带出 DeviceID):Marshal 编码含类型与公钥体,字节级相等即同钥
 // (v0.48 无 KeysEqual,与出口侧 sshtest 同款比对方式)。
 func keyInList(key gossh.PublicKey, list []gossh.PublicKey) bool {
 	for _, listed := range list {
@@ -432,35 +461,55 @@ func serveGlobalRequests(reqs <-chan *gossh.Request) {
 	}
 }
 
-// serveChannels 是通道安全收敛白名单:仅 direct-tcpip 放行,其余
-// (session/auth-agent@openssh.com/x11/forwarded-tcpip 等)全拒。
-// 通道形态经认证 Permissions.Extensions["ingress_form"] 读取,分流注入
-// 见 channel.go injectDirectTCPIP(bare→裸流;mesh→帧外壳;未知保守 drain)。
+// serveChannels 是通道安全收敛矩阵(SPEC §4.2):公钥身份决定 form,form
+// 决定唯一可用 channel;所有拒绝在 Accept 前发出(Reject reason 会原样回给
+// A 侧 OpenChannel)。bare→direct-tcpip 裸流注入(channel.go
+// injectDirectTCPIP);mesh→mesh-exit ExtraData 注入(mesh_inject.go
+// handleMeshExitChannel,SPEC §4);未知 form 全拒(UnknownChannelType——
+// 认证层只产出 bare/mesh,此为防御分支,含 perms 未就绪的 nil 场景)。
+// 观测面在拒绝判定之前:被拒通道同样留下 form/deviceID 审计痕迹
+// (TestMeshExitMatrix 钉住先读 form 再 Reject 的次序)。
 func (s *Server) serveChannels(ctx context.Context, chans <-chan gossh.NewChannel, perms *gossh.Permissions, remote net.Addr) {
 	for newCh := range chans {
-		if newCh.ChannelType() != channelDirectTCPIP {
-			_ = newCh.Reject(gossh.UnknownChannelType, "only direct-tcpip is accepted on this ingress")
-			continue
-		}
-		form := ""
+		form, meshDeviceID := "", ""
 		if perms != nil {
 			form = perms.Extensions[extIngressForm]
+			meshDeviceID = perms.Extensions[extMeshDeviceID]
 		}
 		s.observeForm(form)
-		ch, chReqs, err := newCh.Accept()
-		if err != nil {
-			logger.Debug(fmt.Sprintf("SSH ingress direct-tcpip accept failed: %v", err))
+		s.observeDeviceID(meshDeviceID)
+
+		var allowed string
+		switch form {
+		case FormBare:
+			allowed = channelDirectTCPIP
+		case FormMesh:
+			allowed = channelMeshExit
+		default:
+			_ = newCh.Reject(gossh.UnknownChannelType, "unknown credential form")
 			continue
 		}
-		logger.Debug(fmt.Sprintf("SSH ingress direct-tcpip accepted (form=%s)", form))
-		go gossh.DiscardRequests(chReqs)
-		// 形态分流注入在 channel.go(bare→裸流;mesh→帧外壳;未知保守
-		// drain);dispatcher 本身同步派发各形态的注入 goroutine。
-		injectDirectTCPIP(ctx, ch, remote, form, newCh.ExtraData(), s.rc)
+		if newCh.ChannelType() != allowed {
+			_ = newCh.Reject(gossh.Prohibited, "channel not allowed for this credential form")
+			continue
+		}
+
+		switch form {
+		case FormBare:
+			ch, chReqs, err := newCh.Accept()
+			if err != nil {
+				logger.Debug(fmt.Sprintf("SSH ingress direct-tcpip accept failed: %v", err))
+				continue
+			}
+			go gossh.DiscardRequests(chReqs)
+			injectDirectTCPIP(ctx, ch, remote, newCh.ExtraData())
+		case FormMesh:
+			handleMeshExitChannel(ctx, newCh, newCh.ExtraData(), s.rc, meshDeviceID, remote)
+		}
 	}
 }
 
-// observeForm 记录最近一次 direct-tcpip 通道携带的入口形态,供测试观测
+// observeForm 记录最近一次通道携带的入口形态,供测试观测
 // Permissions→通道层的传递链(生产行为不读它)。
 func (s *Server) observeForm(form string) {
 	s.obsMu.Lock()
@@ -474,14 +523,22 @@ func (s *Server) observedForm() string {
 	return s.lastIngressForm
 }
 
-// drainAndClose 排空并关闭通道(bare/mesh 两形态均由注入路径接管;
-// 此处仅剩未知形态的防御分支,见 channel.go injectDirectTCPIP)。
-func drainAndClose(ch gossh.Channel) {
-	_, _ = io.Copy(io.Discard, ch)
-	_ = ch.Close()
+// observeDeviceID 记录最近一次通道携带的 mesh 对端身份标签
+// (extMeshDeviceID,bare 形态恒空),观测面与 observeForm 同族。
+func (s *Server) observeDeviceID(id string) {
+	s.obsMu.Lock()
+	s.lastIngressDeviceID = id
+	s.obsMu.Unlock()
 }
 
-// remoteIP 提取 net.Addr 的 host 部分作为限速键。
+func (s *Server) observedDeviceID() string {
+	s.obsMu.Lock()
+	defer s.obsMu.Unlock()
+	return s.lastIngressDeviceID
+}
+
+// remoteIP 提取 net.Addr 的 host 部分作为限速键(SplitHostPort 失败时
+// 原样返回——WithRemoteLabel 的标签地址即靠此语义落串桶,SPEC §8.2)。
 func remoteIP(a net.Addr) string {
 	if a == nil {
 		return ""

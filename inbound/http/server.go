@@ -35,9 +35,9 @@ func StartMitmHttp() {
 }
 
 // StartMitmHttpTolerant 是绑定重试路径的容忍变体(评审 I1):绑定失败只记
-// Error 并返回,不 Fatal——重绑(mesh 总开关切换触发停→按新地址重绑)在
-// goroutine 里跑,瞬时端口占用/环境异常把整个 agent 进程杀掉属不成比例的
-// 失败;留活进程让下次提交或自愈链重试。
+// Error 并返回,不 Fatal——重绑(ssh_ingress 开关切换触发停→按新地址重绑,
+// SPEC §5.5)在 goroutine 里跑,瞬时端口占用/环境异常把整个 agent 进程杀掉
+// 属不成比例的失败;留活进程让下次提交或自愈链重试。
 func StartMitmHttpTolerant() {
 	startUnifiedIngress(false)
 }
@@ -82,7 +82,7 @@ func startUnifiedIngress(fatalOnBindErr bool) {
 	httpListener = listener
 	httpMutex.Unlock()
 
-	logger.Info(fmt.Sprintf("统一入口监听已启动 addr=%s(嗅探 SSH/socks5/mesh/HTTP)", listenAddr))
+	logger.Info(fmt.Sprintf("统一入口监听已启动 addr=%s(嗅探 SSH/socks5/HTTP)", listenAddr))
 
 	// Accept connections in a loop until context is cancelled
 	for {
@@ -107,7 +107,7 @@ func startUnifiedIngress(fatalOnBindErr bool) {
 			}
 		}
 
-		// 每个连接先进统一分派:嗅探协议族后移交 ssh/socks/mesh/http。
+		// 每个连接先进统一分派:嗅探协议族后移交 ssh/socks/http。
 		// 与合并前三口分立相比,「连哪个口」不再编码协议,「流量是什么」
 		// 才决定走哪条处理链(spec §4)。
 		go dispatchConn(conn)
@@ -159,9 +159,9 @@ func IsHttpRunning() bool {
 }
 
 // CurrentListenAddr 当前实际绑定的统一入口地址(未运行返回 "")。供配置
-// reconcile 比对「期望地址 ≠ 实际地址 → 重启 listener」——绑定随 mesh 总
-// 开关变化(config.UnifiedIngressListenAddr 现读配置),变化后必须重绑才能
-// 生效(spec §6.2)。以 isHttpRunning 而非指针非空为判据:StopHttpProxy 关
+// reconcile 比对「期望地址 ≠ 实际地址 → 重启 listener」——绑定随 ssh_ingress
+// 开关变化(SPEC §5.5;config.UnifiedIngressListenAddr 现读配置),变化后必须
+// 重绑才能生效(spec §6.2)。以 isHttpRunning 而非指针非空为判据:StopHttpProxy 关
 // listener 但不清指针(close 后的 Addr() 仍返回旧地址),单看指针会把「已
 // 停」误读成「还在旧地址上跑」,从而让 reconcile 漏掉该起的情形。
 func CurrentListenAddr() string {

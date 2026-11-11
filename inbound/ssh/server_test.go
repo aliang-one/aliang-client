@@ -273,13 +273,16 @@ func TestSSHIngressRejectsNonDirectTCPIPChannels(t *testing.T) {
 			_ = ch.Close()
 			t.Fatalf("channel %q must be rejected", chType)
 		}
+		// bare form 只放行 direct-tcpip,其余 channel 全按矩阵判「类型不符」
+		// →Prohibited(UnknownChannelType 保留给未知 credential form,
+		// TestMeshExitMatrix 钉)。
 		var oce *gossh.OpenChannelError
-		if !errors.As(err, &oce) || oce.Reason != gossh.UnknownChannelType {
-			t.Fatalf("channel %q rejection reason = %v, want UnknownChannelType", chType, err)
+		if !errors.As(err, &oce) || oce.Reason != gossh.Prohibited {
+			t.Fatalf("channel %q rejection reason = %v, want Prohibited", chType, err)
 		}
 	}
-	// direct-tcpip 是唯一放行通道:Accept 后注入(本用例已打桩,桩排空
-	// 即返回→关通道),客户端半关后读到 EOF。
+	// direct-tcpip 是 bare form 唯一放行通道:Accept 后注入(本用例已打桩,
+	// 桩排空即返回→关通道),客户端半关后读到 EOF。
 	payload := gossh.Marshal(directTCPIPMsg{Addr: "127.0.0.1", Port: 9, OriginAddr: "127.0.0.1", OriginPort: 0})
 	ch, _, err := conn.OpenChannel(channelDirectTCPIP, payload)
 	if err != nil {
@@ -362,7 +365,7 @@ func TestAuthHumanKeyMarksBareForm(t *testing.T) {
 	meshPub, _ := newTestKey(t)
 	s, addr := startTestServer(t, RunConfig{
 		AuthorizedKeys: []gossh.PublicKey{humanPub},
-		MeshKeys:       []gossh.PublicKey{meshPub},
+		MeshKeys:       []MeshKey{{Key: meshPub}},
 	})
 	conn, err := dialIngress(t, addr, gossh.PublicKeys(humanSigner))
 	if err != nil {
@@ -385,21 +388,25 @@ func TestAuthMeshKeyMarksMeshForm(t *testing.T) {
 	meshPub, meshSigner := newTestKey(t)
 	s, addr := startTestServer(t, RunConfig{
 		AuthorizedKeys: []gossh.PublicKey{humanPub},
-		MeshKeys:       []gossh.PublicKey{meshPub},
+		MeshKeys:       []MeshKey{{Key: meshPub, DeviceID: "dev-b"}},
 	})
 	conn, err := dialIngress(t, addr, gossh.PublicKeys(meshSigner))
 	if err != nil {
 		t.Fatalf("mesh key must authenticate: %v", err)
 	}
+	// 矩阵(SPEC §4.2):mesh form 只放行 mesh-exit,direct-tcpip 在 Accept
+	// 前按「类型不符」拒(Prohibited);观测面在拒绝判定之前留痕。
 	payload := gossh.Marshal(directTCPIPMsg{Addr: "127.0.0.1", Port: 9, OriginAddr: "127.0.0.1", OriginPort: 0})
-	if _, _, err := conn.OpenChannel(channelDirectTCPIP, payload); err != nil {
-		t.Fatalf("direct-tcpip open: %v", err)
+	_, _, openErr := conn.OpenChannel(channelDirectTCPIP, payload)
+	var oce *gossh.OpenChannelError
+	if !errors.As(openErr, &oce) || oce.Reason != gossh.Prohibited {
+		t.Fatalf("mesh form × direct-tcpip rejection = %v, want Prohibited", openErr)
 	}
-	// 形态② 帧注入已落地(channel.go 形态分流→injectMeshFrame);本用例只
-	// 断言 Accept+形态标记(不写帧——注入路径阻塞等帧头直到连接清理静默断开),
-	// 注入/防环/门禁细节断言在 mesh_inject_test.go。
 	if got := s.observedForm(); got != FormMesh {
 		t.Fatalf("ingress form = %q, want %q", got, FormMesh)
+	}
+	if got := s.observedDeviceID(); got != "dev-b" {
+		t.Fatalf("device id = %q, want dev-b", got)
 	}
 }
 
@@ -425,22 +432,46 @@ func TestAuthUnknownKeyRejectedAndRateLimited(t *testing.T) {
 
 func TestAuthDualListedKeyMeshWinsAtRuntime(t *testing.T) {
 	// 绕过配置层 Validate(同键双列表歧义拦截)直构造 RunConfig:
-	// 运行期第二道防线——mesh 优先(保守)。
+	// 运行期第二道防线——mesh 优先(保守),且 DeviceID 取 mesh 条目
+	// (裸钥没有 DeviceID 概念,双钥各带不同标签、各自透传 extMeshDeviceID)。
 	dualPub, dualSigner := newTestKey(t)
+	secondPub, secondSigner := newTestKey(t)
 	s, addr := startTestServer(t, RunConfig{
 		AuthorizedKeys: []gossh.PublicKey{dualPub},
-		MeshKeys:       []gossh.PublicKey{dualPub},
+		MeshKeys: []MeshKey{
+			{Key: dualPub, DeviceID: "dev-dual"},
+			{Key: secondPub, DeviceID: "dev-second"},
+		},
 	})
+	payload := gossh.Marshal(directTCPIPMsg{Addr: "example.com", Port: 443, OriginAddr: "127.0.0.1", OriginPort: 0})
+
 	conn, err := dialIngress(t, addr, gossh.PublicKeys(dualSigner))
 	if err != nil {
 		t.Fatalf("dual-listed key must authenticate: %v", err)
 	}
-	payload := gossh.Marshal(directTCPIPMsg{Addr: "example.com", Port: 443, OriginAddr: "127.0.0.1", OriginPort: 0})
-	if _, _, err := conn.OpenChannel(channelDirectTCPIP, payload); err != nil {
-		t.Fatalf("direct-tcpip open: %v", err)
+	// mesh form × direct-tcpip 按矩阵拒(Accept 前,Prohibited);观测面
+	// 在拒绝判定之前留痕(先读 form 再 Reject 的次序)。
+	if _, _, openErr := conn.OpenChannel(channelDirectTCPIP, payload); openErr == nil {
+		t.Fatal("mesh form × direct-tcpip must be rejected by the form×channel matrix")
 	}
 	if got := s.observedForm(); got != FormMesh {
 		t.Fatalf("dual-listed key must conservatively map to %q, got %q", FormMesh, got)
+	}
+	if got := s.observedDeviceID(); got != "dev-dual" {
+		t.Fatalf("dual-listed key DeviceID = %q, want %q (mesh entry wins the label)", got, "dev-dual")
+	}
+
+	// 第二把 mesh 钥:各自透传自己的 extMeshDeviceID(观测点是最近一条
+	// 通道,新连接覆盖前值)。
+	conn2, err := dialIngress(t, addr, gossh.PublicKeys(secondSigner))
+	if err != nil {
+		t.Fatalf("second mesh key must authenticate: %v", err)
+	}
+	if _, _, openErr := conn2.OpenChannel(channelDirectTCPIP, payload); openErr == nil {
+		t.Fatal("mesh form × direct-tcpip must be rejected by the form×channel matrix (second)")
+	}
+	if got := s.observedDeviceID(); got != "dev-second" {
+		t.Fatalf("second mesh key DeviceID = %q, want %q", got, "dev-second")
 	}
 }
 

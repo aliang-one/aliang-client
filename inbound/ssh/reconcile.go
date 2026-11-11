@@ -29,8 +29,10 @@ var (
 // 专用口(port,spec §6.4 修订)任一变化即重启。port=0(跟随统一口)与
 // port 变到其他值都会触发重启——专用口的起/停/换口都是 listener 级变更。
 //
-// 凭证按公钥身份(Marshal 字节,同 publicKeyCallback 比对口径)做集合
-// 语义比较——排序后逐字节,列表顺序变化不触发重启。
+// 凭证按公钥身份做集合语义比较——排序后逐字节,列表顺序变化不触发重启:
+// 裸钥(authorizedKeys)比 Marshal 字节,mesh 凭证(meshKeys)比 Marshal
+// 字节+"\x00"+DeviceID(尾注释也是身份的一部分,日志/审计标签变更同样
+// 重启)。比对口径与 publicKeyCallback 的准入比较同源。
 //
 // LocalNodeID/ForwardGate 是闭包(活视图,连接期读时求值),不参与比对:
 // 装配层每次提交传新闭包实例是常态(方法值),按闭包身份比对会退化成
@@ -47,7 +49,7 @@ func newRunIdentity(rc *RunConfig, hostKeyPath string) runIdentity {
 		hostKeyPath:    hostKeyPath,
 		port:           rc.Port,
 		authorizedKeys: marshalKeyIdentity(rc.AuthorizedKeys),
-		meshKeys:       marshalKeyIdentity(rc.MeshKeys),
+		meshKeys:       marshalMeshKeyIdentity(rc.MeshKeys),
 	}
 }
 
@@ -58,11 +60,30 @@ func (a runIdentity) equal(b runIdentity) bool {
 		keyIdentityEqual(a.meshKeys, b.meshKeys)
 }
 
-// marshalKeyIdentity 把公钥列表归一为排序后的 Marshal 字节集合。
+// marshalKeyIdentity 把公钥列表归一为排序后的 Marshal 字节集合(只服务
+// authorized 裸钥;mesh 凭证走 marshalMeshKeyIdentity)。
 func marshalKeyIdentity(keys []gossh.PublicKey) [][]byte {
 	out := make([][]byte, 0, len(keys))
 	for _, key := range keys {
 		out = append(out, key.Marshal())
+	}
+	sort.Slice(out, func(i, j int) bool { return bytes.Compare(out[i], out[j]) < 0 })
+	return out
+}
+
+// marshalMeshKeyIdentity 把 mesh 凭证归一为排序后的身份集合:Marshal 字节
+// + "\x00" + DeviceID(注释改了但不改钥字节也要重启,否则日志身份陈旧)。
+// \x00 分隔存在理论歧义(RSA 指数 01 00 01 含 0x00,可能与相邻字节拼出
+// 相同序列):最坏后果是错判「要不要重启」,非安全面,可接受。
+func marshalMeshKeyIdentity(keys []MeshKey) [][]byte {
+	out := make([][]byte, 0, len(keys))
+	for _, mk := range keys {
+		b := mk.Key.Marshal()
+		line := make([]byte, 0, len(b)+1+len(mk.DeviceID))
+		line = append(line, b...)
+		line = append(line, 0x00)
+		line = append(line, mk.DeviceID...)
+		out = append(out, line)
 	}
 	sort.Slice(out, func(i, j int) bool { return bytes.Compare(out[i], out[j]) < 0 })
 	return out
@@ -98,7 +119,7 @@ func keyIdentityEqual(a, b [][]byte) bool {
 // Bind host 语义:专用口(Port>0)监听 ServiceBindHost(默认 127.0.0.1,
 // 显式 --host 放宽)——「默认安全」姿态,LAN 开放需显式 --host;跟随统一口
 // (Port=0)时可达面继承 56432 绑定策略(config.UnifiedIngressListenAddr:
-// mesh 开 0.0.0.0,否则 ServiceBindHost)。
+// ssh_ingress 开 0.0.0.0,否则 ServiceBindHost,SPEC §5.5)。
 func Reconcile(rc *RunConfig, hostKeyPath string, localNodeID func() string) {
 	reconcileMu.Lock()
 	defer reconcileMu.Unlock()

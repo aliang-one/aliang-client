@@ -176,23 +176,20 @@ func initializeCoreSubsystems() error {
 	}
 
 	// mesh LAN 载体 + beacon 生产装配(Task 14):core 进程拥有 mesh 数据面
-	// (relay 注入的 processor/tcp 管线/56432 AI 出口/TUN),装配挂在此处而非
+	// (beacon 发现候选/56432 AI 出口/TUN),装配挂在此处而非
 	// NewAgentService——后者在 user agent runtime 也会构造,双装会抢
 	// 56440/56441 并广播双 beacon。device_id 解析常驻身份文件,幂等。
 	tunnel.StartMeshLANAssembly(services.GetSharedAgentService().CurrentDeviceID)
-	// 统一口 mesh 帧分派接线:56441 独立 LAN 载体已退役,56432 嗅探为 mesh
-	// 的连接由本接线交 HandleMeshConn(carrier=lan)。须在统一口可能 accept
-	// 之前完成(代理自愈随时起口)。
-	tunnel.WireUnifiedIngressMeshDispatch(services.GetSharedAgentService().CurrentDeviceID)
 	// SSH 入口启动恢复:customer 配置已在上方加载完成,按其期望态 reconcile
 	// ——重启后自动恢复已启用入口(平台代理自愈的同款纪律:失败仅日志不
 	// 阻断 boot)。与配置提交协调路径共用 services.ReconcileSSHIngressFromConfig
 	// 防两处漂移;入口归 core 进程所有(配置提交与路由管线都在 core),
 	// user-agent 侧不接线(拆分所有权重叠,见该函数注释与任务报告)。
 	services.ReconcileSSHIngressFromConfig(config.GetGlobalConfig())
-	// 统一入口绑定防漂移:56432 的绑定面随 mesh 总开关变化,启动期若代理已
-	// 起来(自愈先于本行/上次绑定残留)则按当前配置校正;代理未起时本行为
-	// 空操作(起口归 run service)。与提交协调路径共用同一函数防漂移。
+	// 统一入口绑定防漂移:56432 的绑定面随 ssh_ingress 开关变化(SPEC §5.5),
+	// 启动期若代理已起来(自愈先于本行/上次绑定残留)则按当前配置校正;代理
+	// 未起时本行为空操作(起口归 run service)。与提交协调路径共用同一函数
+	// 防漂移。
 	services.ReconcileUnifiedIngressBinding(config.GetGlobalConfig())
 
 	logger.Info("Core subsystems initialized")

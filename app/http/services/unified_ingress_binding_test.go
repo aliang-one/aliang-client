@@ -1,8 +1,10 @@
 package services
 
-// ReconcileUnifiedIngressBinding 的语义钉子(spec §6.2 / D2「绑定跟随启用面」):
-// 56432 的绑定地址由 mesh 总开关决定,而 listener 只在 StartMitmHttp 的绑定
-// 瞬间读一次地址 —— 开/关组网若只改配置不重绑,新暴露面/收窄面都不生效。
+// ReconcileUnifiedIngressBinding 的语义钉子(spec §6.2 / D2「绑定跟随启用面」,
+// 判据修订见 SPEC §5.5):
+// 56432 的绑定地址由 ssh_ingress 开关决定(ssh 开 → 0.0.0.0,关/未配 →
+// 回环),而 listener 只在 StartMitmHttp 的绑定瞬间读一次地址 —— 开/关入口
+// 若只改配置不重绑,新暴露面/收窄面都不生效。
 // 本文件钉三件事:该重绑时重绑、不该重绑时一动不动、以及「代理没在跑」时
 // 绝不越权起口(那是 run service 的状态机职责,D4「停代理=停监听」)。
 
@@ -73,27 +75,53 @@ func (p *ingressBindingProbe) waitStarts(t *testing.T, want int32) {
 	t.Fatalf("start 次数 = %d, 期望 %d", atomic.LoadInt32(&p.starts), want)
 }
 
-// meshConfigForBinding 构造只带 mesh 总开关的最小配置。
+// meshConfigForBinding 构造只带 mesh 总开关的最小配置(ssh 未配=nil=关)。
 func meshConfigForBinding(enabled *bool) *config.Config {
 	return &config.Config{Customer: &config.CustomerConfig{
 		Mesh: &config.MeshConfig{Enable: enabled},
 	}}
 }
 
+// sshConfigForBinding 构造只带 ssh_ingress 开关的最小配置(绑定面判据,
+// SPEC §5.5)。
+func sshConfigForBinding(enabled *bool) *config.Config {
+	return &config.Config{Customer: &config.CustomerConfig{
+		SSHIngress: &config.SSHIngressConfig{Enable: enabled},
+	}}
+}
+
 func boolPtrForBinding(v bool) *bool { return &v }
 
-// TestReconcileUnifiedIngressBindingRebindsOnMeshSwitch 绑定地址与期望不符
-// 且 listener 在跑 → 停+起各一次(开组网把回环放宽到 0.0.0.0 的主路径)。
-func TestReconcileUnifiedIngressBindingRebindsOnMeshSwitch(t *testing.T) {
+// TestReconcileUnifiedIngressBindingRebindsOnSSHIngressSwitch 绑定地址与期望
+// 不符且 listener 在跑 → 停+起各一次(开入口把回环放宽到 0.0.0.0 的主路径)。
+func TestReconcileUnifiedIngressBindingRebindsOnSSHIngressSwitch(t *testing.T) {
 	probe := &ingressBindingProbe{}
 	probe.install(t)
 	probe.running = true
 	probe.addr = "127.0.0.1:56432"
 
-	ReconcileUnifiedIngressBinding(meshConfigForBinding(boolPtrForBinding(true)))
+	ReconcileUnifiedIngressBinding(sshConfigForBinding(boolPtrForBinding(true)))
 
 	if got := atomic.LoadInt32(&probe.stops); got != 1 {
 		t.Fatalf("stop 次数 = %d, want 1", got)
+	}
+	probe.waitStarts(t, 1)
+}
+
+// TestReconcileUnifiedIngressBindingNarrowsLoopbackWhenMeshOnSSHOff SPEC §5.5
+// 的语义反转点:mesh 开 + ssh 关时组网在新模型下本就不生效
+// (MeshEffectivelyEnabled 恒 false),旧判据(mesh 开 → 0.0.0.0)下这个
+// 组合会白绑 0.0.0.0 白暴露 HTTP 代理面;新判据把它收回回环。
+func TestReconcileUnifiedIngressBindingNarrowsLoopbackWhenMeshOnSSHOff(t *testing.T) {
+	probe := &ingressBindingProbe{}
+	probe.install(t)
+	probe.running = true
+	probe.addr = "0.0.0.0:56432"
+
+	ReconcileUnifiedIngressBinding(meshConfigForBinding(boolPtrForBinding(true)))
+
+	if got := atomic.LoadInt32(&probe.stops); got != 1 {
+		t.Fatalf("mesh 开 + ssh 关应收窄回环并重绑,stop 次数 = %d", got)
 	}
 	probe.waitStarts(t, 1)
 }
@@ -106,7 +134,7 @@ func TestReconcileUnifiedIngressBindingNoopWhenAddrMatches(t *testing.T) {
 	probe.running = true
 	probe.addr = "0.0.0.0:56432"
 
-	ReconcileUnifiedIngressBinding(meshConfigForBinding(boolPtrForBinding(true)))
+	ReconcileUnifiedIngressBinding(sshConfigForBinding(boolPtrForBinding(true)))
 
 	time.Sleep(50 * time.Millisecond) // 给可能的异步起口留窗口,再断言为零
 	if got := atomic.LoadInt32(&probe.stops); got != 0 {
@@ -126,7 +154,7 @@ func TestReconcileUnifiedIngressBindingDoesNotStartWhenProxyStopped(t *testing.T
 	probe.running = false
 	probe.addr = "" // 未绑定
 
-	ReconcileUnifiedIngressBinding(meshConfigForBinding(boolPtrForBinding(true)))
+	ReconcileUnifiedIngressBinding(sshConfigForBinding(boolPtrForBinding(true)))
 
 	time.Sleep(50 * time.Millisecond)
 	if got := atomic.LoadInt32(&probe.starts); got != 0 {
@@ -138,7 +166,8 @@ func TestReconcileUnifiedIngressBindingDoesNotStartWhenProxyStopped(t *testing.T
 }
 
 // TestReconcileUnifiedIngressBindingNilConfigFallsBackToLoopback nil 配置
-// (未配置 mesh)按「不开组网」处理:期望回环,若当前绑在 0.0.0.0 则收窄重绑。
+// (未配 ssh_ingress 入口)按「入口关」处理:期望回环,若当前绑在 0.0.0.0
+// 则收窄重绑(SPEC §5.5)。
 func TestReconcileUnifiedIngressBindingNilConfigFallsBackToLoopback(t *testing.T) {
 	probe := &ingressBindingProbe{}
 	probe.install(t)

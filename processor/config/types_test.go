@@ -1823,11 +1823,13 @@ func TestConfigValidate_MeshNormalizesWhitespaceInPlace(t *testing.T) {
 	cfg := &Config{
 		Core: &CoreConfig{APIServer: "https://api.example.com"},
 		Customer: &CustomerConfig{Mesh: &MeshConfig{
+			PrivateKey: "k", // peers 配置了就必须有节点身份私钥(保存期必填)
 			Peers: []MeshPeer{{
 				DeviceID: "  dev-b  ",
 				LANAddrs: []string{"  192.168.1.20:9443  "},
+				HostKey:  "  SHA256:peer-b  ",
 			}},
-			Fallback: &MeshFallbackConfig{Enable: boolPtr(true), Addr: "  192.168.1.21:9443  "},
+			Fallback: &MeshFallbackConfig{Enable: boolPtr(true), Addr: "  192.168.1.21:9443  ", HostKey: "  SHA256:fb  "},
 		}},
 	}
 	if err := cfg.Validate(); err != nil {
@@ -1840,8 +1842,14 @@ func TestConfigValidate_MeshNormalizesWhitespaceInPlace(t *testing.T) {
 	if len(peer.LANAddrs) != 1 || peer.LANAddrs[0] != "192.168.1.20:9443" {
 		t.Fatalf("lan_addrs 应就地规整落盘, got %#v", peer.LANAddrs)
 	}
+	if peer.HostKey != "SHA256:peer-b" {
+		t.Fatalf("host_key 应就地规整落盘, got %q", peer.HostKey)
+	}
 	if cfg.Customer.Mesh.Fallback.Addr != "192.168.1.21:9443" {
 		t.Fatalf("fallback.addr 应就地规整落盘, got %q", cfg.Customer.Mesh.Fallback.Addr)
+	}
+	if cfg.Customer.Mesh.Fallback.HostKey != "SHA256:fb" {
+		t.Fatalf("fallback.host_key 应就地规整落盘, got %q", cfg.Customer.Mesh.Fallback.HostKey)
 	}
 }
 

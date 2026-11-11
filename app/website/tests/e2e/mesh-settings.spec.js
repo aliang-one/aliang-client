@@ -30,7 +30,8 @@ const CUSTOMER = {
       { device_id: 'dev-b', lan_addrs: ['192.168.1.20:56441'], relay: true },
       { device_id: 'dev-c', lan_addrs: ['192.168.1.21:56441'], relay: true }
     ],
-    fallback: { enable: false, classes: [], addr: '' }
+    // host_key 有值（G1 透传后 patch 会如实带出/如实省缺——断言要配得上链路）
+    fallback: { enable: false, classes: [], addr: '', host_key: 'HK-old-fallback' }
   }
 };
 
@@ -72,7 +73,9 @@ async function installPageStub(page) {
   });
 }
 
-async function stubApi(page, { onSave } = {}) {
+async function stubApi(page, { onSave, customer } = {}) {
+  // GET 可换源（customer 传函数=可变 store,端到端「保存→刷新回显」测试用）
+  const currentCustomer = typeof customer === 'function' ? customer : () => CUSTOMER;
   await page.route('**/api/**', async (route) => {
     const url = new URL(route.request().url());
     const path = url.pathname;
@@ -93,7 +96,7 @@ async function stubApi(page, { onSave } = {}) {
       return;
     }
     if (path === '/api/config/customer') {
-      await route.fulfill(ok({ customer: CUSTOMER, version: 'v-e2e' }));
+      await route.fulfill(ok({ customer: currentCustomer(), version: 'v-e2e' }));
       return;
     }
     if (path === '/api/config/customer/providers') {
@@ -117,19 +120,29 @@ async function stubApi(page, { onSave } = {}) {
 }
 
 // 只走前端路由（不经侧栏点击）：模块级 currentPage 由 useNavigation 驱动。
+// 锚点=代理设置页子 tab 条（ad19e67 后设置页分「代理设置/入口与组网」两页,
+// 组网卡在第二页——openSettings 只保证设置页打开,不再直视组网标题）。
 async function openSettings(page) {
   await page.goto('/');
   await page.evaluate(async () => {
     const { useNavigation } = await import('/src/composables/useNavigation.js');
     useNavigation().showSettings();
   });
+  await expect(page.getByRole('tab', { name: '代理设置' })).toBeVisible();
+}
+
+// mesh 卡片在代理设置页第二子 tab「入口与组网」下（ad19e67 引入双子 tab 分页,
+// mesh/SSH 收进第二页;规则编辑器仍在默认页）——组网相关测试先切到该子 tab。
+async function openMeshCard(page) {
+  await openSettings(page);
+  await page.getByRole('tab', { name: '入口与组网' }).click();
   await expect(page.getByText('节点组网')).toBeVisible();
 }
 
 test('组网卡渲染：状态条在线 + 拓扑画布（本机居中/peer/规则数徽标）+ 点连线看节点对详情', async ({ page }) => {
   await installPageStub(page);
   await stubApi(page);
-  await openSettings(page);
+  await openMeshCard(page);
 
   // ① 状态条：runtime 在线 + 已配置 → 在线绿态
   const pill = page.locator('[data-mesh-status-pill]');
@@ -171,21 +184,25 @@ test('离线兜底保存：POST /api/config/customer 载荷含 mesh.fallback（�
   let savedBody = null;
   await installPageStub(page);
   await stubApi(page, { onSave: (body) => { savedBody = body; } });
-  await openSettings(page);
+  await openMeshCard(page);
 
   const fallback = page.locator('[data-mesh-fallback]');
   await fallback.locator('[data-field="meshFallbackEnable"]').check({ force: true });
   await fallback.locator('[data-field="meshFallbackAddr"]').fill('192.168.1.20:56441');
   await fallback.locator('[data-field="meshClassAi"]').check({ force: true });
+  // G3 密钥输入位：兜底行 host_key 改值 → patch 如实带出新值
+  await fallback.locator('[data-field="meshFallbackHostKey"]').fill('HK-fb-new');
 
   await page.locator('button[data-mesh-save]').click();
   await expect.poll(() => savedBody).not.toBeNull();
 
-  expect(savedBody.customer.mesh.fallback).toEqual({
-    enable: true,
-    addr: '192.168.1.20:56441',
-    classes: ['ai']
-  });
+  // 逐字段断言（G3）：G1 透传 + G3 输入位之后 fallback 的密钥键会随编辑进 patch，
+  // 整对象 toEqual 对「哪些键在场」会脆断——逐键断言如实表达链路。
+  const savedFallback = savedBody.customer.mesh.fallback;
+  expect(savedFallback.enable).toBe(true);
+  expect(savedFallback.addr).toBe('192.168.1.20:56441');
+  expect(savedFallback.classes).toEqual(['ai']);
+  expect(savedFallback.host_key).toBe('HK-fb-new');
   // 载荷是「与当前配置的差异」而非全量：本卡没动的顶层段（proxy_rules）与
   // 未变的 mesh 开关（enable/forward_enable/max_hops/peers）都不出现在 patch 里
   // ——父层按顶层段浅合并，多带的键反而会把别人的段覆盖成陈旧值。
@@ -213,4 +230,54 @@ test('规则编辑器接受 mesh 尾段：裸逗号形态无红错，非法形�
   // 修好 → 提示消失
   await rulesInput.fill('x.com,mesh:dev-b\ny.com,mesh:dev-b,deny');
   await expect(page.getByText('组网尾段格式非法')).toHaveCount(0);
+});
+
+// G3 端到端（SPEC §13.3.4 验收口径）：四类密钥输入位 填 → 保存 → 刷新仍在——
+// stub 侧用可变 store + deepMerge 复刻后端 deep-merge 语义（对象合并/数组与
+// 标量整体替换），POST 后 GET 返回合并结果,reload 即「刷新页面」。
+function deepMerge(target, patch) {
+  if (Array.isArray(patch) || patch === null || typeof patch !== 'object') {
+    return patch;
+  }
+  const base = target && typeof target === 'object' && !Array.isArray(target) ? target : {};
+  const out = { ...base };
+  for (const [key, value] of Object.entries(patch)) {
+    out[key] = deepMerge(out[key], value);
+  }
+  return out;
+}
+
+test('密钥输入位端到端：填 peer/兜底 host_key + 节点私钥/口令 → 保存 → 刷新回显仍在', async ({ page }) => {
+  const store = { customer: JSON.parse(JSON.stringify(CUSTOMER)) };
+  let savedCount = 0;
+  await installPageStub(page);
+  await stubApi(page, {
+    customer: () => store.customer,
+    onSave: (body) => {
+      store.customer = deepMerge(store.customer, body.customer);
+      savedCount += 1;
+    }
+  });
+  await openMeshCard(page);
+
+  await page.locator('[data-mesh-peer-row="dev-b"] [data-field="meshPeerHostKey"]').fill('SHA256:peer-e2e-new');
+  await page.locator('[data-mesh-fallback] [data-field="meshFallbackHostKey"]').fill('HK-fb-e2e-new');
+  await page.locator('[data-field="meshPrivateKey"]').fill('-----BEGIN OPENSSH PRIVATE KEY-----\ne2e\n-----END OPENSSH PRIVATE KEY-----');
+  await page.locator('[data-field="meshKeyPassphrase"]').fill('ph-e2e');
+  await page.locator('button[data-mesh-save]').click();
+
+  // 保存完成且 stub store 已合并（POST patch 含四个新值）
+  await expect.poll(() => savedCount).toBe(1);
+  expect(store.customer.mesh.private_key).toContain('BEGIN OPENSSH PRIVATE KEY');
+  expect(store.customer.mesh.key_passphrase).toBe('ph-e2e');
+  expect(store.customer.mesh.fallback.host_key).toBe('HK-fb-e2e-new');
+  expect(store.customer.mesh.peers.find((p) => p.device_id === 'dev-b').host_key).toBe('SHA256:peer-e2e-new');
+
+  // 刷新页面（重新 GET 已合并配置）→ 四类输入位回显保存值
+  await page.reload();
+  await openMeshCard(page);
+  await expect(page.locator('[data-mesh-peer-row="dev-b"] [data-field="meshPeerHostKey"]')).toHaveValue('SHA256:peer-e2e-new');
+  await expect(page.locator('[data-mesh-fallback] [data-field="meshFallbackHostKey"]')).toHaveValue('HK-fb-e2e-new');
+  await expect(page.locator('[data-field="meshPrivateKey"]')).toHaveValue(/BEGIN OPENSSH PRIVATE KEY/);
+  await expect(page.locator('[data-field="meshKeyPassphrase"]')).toHaveValue('ph-e2e');
 });

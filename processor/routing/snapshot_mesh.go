@@ -132,9 +132,11 @@ func isDNSEntry(base string) bool {
 	return strings.EqualFold(strings.TrimSpace(base), "dns")
 }
 
-// meshForwardAvailable 编译期 mesh 能力检查：总开关 EffectiveEnabled 且
-// deviceID 存在于 customer.mesh.peers。不通过 → 条目静默跳过（与非法条目
-// 同款先例，见 appendRules）。
+// meshForwardAvailable 编译期 mesh 能力检查：含 SSH 入口依赖降级与钉扎/
+// 身份能力检查（SPEC §13.2）——mesh 生效开关 MeshEffectivelyEnabled（总开关
+// ∧ SSH 入口可用，SPEC §10.3）、本机身份私钥非空（无钥不能作发起方）、
+// deviceID 存在于 customer.mesh.peers 且其 host_key 已钉扎。不通过 → 条目
+// 静默跳过（与非法条目同款先例，见 appendRules）。
 // 不做 ≠self 检查（分层防御分工）：自指已在保存期由 Config.ValidateMesh
 // 拒绝（spec §3.4/§7 层0，config 层拿不到本机 device_id 故由提交路径显式调）；
 // 手改配置文件绕过保存校验的漏网自指，由转发层 path vector 兜底拒环。
@@ -148,11 +150,17 @@ func meshForwardAvailable(cfg *config.Config, deviceID string) bool {
 		return false
 	}
 	mesh := cfg.Customer.Mesh
-	if !mesh.EffectiveEnabled() {
+	if !cfg.MeshEffectivelyEnabled() { // SSH 依赖降级一处生效（SPEC §10.3/§13.2 ①）
 		return false
+	}
+	if strings.TrimSpace(mesh.PrivateKey) == "" {
+		return false // 无身份钥 = 本机不能作发起方，能力不成立（SPEC §13.2 ②）
 	}
 	for _, peer := range mesh.Peers {
 		if strings.TrimSpace(peer.DeviceID) == deviceID {
+			if strings.TrimSpace(peer.HostKey) == "" {
+				return false // 未钉扎 peer 能力不成立（fail-closed，SPEC §13.2 ②）
+			}
 			return true
 		}
 	}
@@ -236,11 +244,12 @@ func resetMeshDNSForwardMemo() {
 
 // MeshDNSForwardTarget 返回 TUN UDP/53 mesh 代转发目标(design §6 层1 规则
 // 驱动门控,Task 8 契约):存在启用的 {Type:"dns", Target:"toNode:<id>"}
-// 规则 + mesh 使能 + 该 peer 配有 LANAddrs → (deviceID, lanAddrs, true),
-// 取首条启用 dns 规则(first-wins);否则 ok=false(不激活,TUN 走既有直连
-// 透传,fail-open)。快照经 CompileRuntimeSnapshotFromRuntimeInputs 从全局
-// 配置+决策层开关派生(tls.go 决策同款),结果带 meshDNSForwardMemoTTL 原子
-// memo。编译失败同样不激活(fail-open,与 tls.go 编译失败落默认路由同口径)。
+// 规则 + mesh 使能 + peer 存在 → (deviceID, lanAddrs, true),取首条启用
+// dns 规则(first-wins);否则 ok=false(不激活,TUN 走既有直连透传,
+// fail-open)。relay-only peer 的 lanAddrs 为空不构成关闭条件,载体选择交
+// Transport 层(SPEC §13.2 ③)。快照经 CompileRuntimeSnapshotFromRuntimeInputs
+// 从全局配置+决策层开关派生(tls.go 决策同款),结果带 meshDNSForwardMemoTTL
+// 原子 memo。编译失败同样不激活(fail-open,与 tls.go 编译失败落默认路由同口径)。
 func MeshDNSForwardTarget() (peerDeviceID string, lanAddrs []string, ok bool) {
 	now := time.Now()
 	if entry, _ := meshDNSForwardMemo.Load().(*meshDNSForwardMemoEntry); entry != nil &&
@@ -263,8 +272,8 @@ func MeshDNSForwardTarget() (peerDeviceID string, lanAddrs []string, ok bool) {
 }
 
 // meshDNSForwardTargetFromInputs 从运行时输入(配置+开关)派生门控结果:
-// 编译快照 → meshDNSForwardTargetFromSnapshot 扫规则 → 回 cfg 查 peer
-// LANAddrs。纯函数,测试直测。
+// 编译快照 → meshDNSForwardTargetFromSnapshot 扫规则 → 回 cfg 查 peer。
+// 纯函数,测试直测。
 func meshDNSForwardTargetFromInputs(cfg *config.Config, switches model.RulesSettings) (string, []string, bool) {
 	if cfg == nil {
 		return "", nil, false
@@ -278,9 +287,11 @@ func meshDNSForwardTargetFromInputs(cfg *config.Config, switches model.RulesSett
 }
 
 // meshDNSForwardTargetFromSnapshot 扫快照取首条启用 dns 规则的目标,再回
-// cfg 的 customer.mesh.peers 取该 peer 的 LANAddrs。畸形 toNode 目标(空
-// deviceID/未知形态)跳过取下一条;peer 不在 peers 列表或无 LANAddrs →
-// 不激活(TUN DNS 一律 custom 仅 LAN 载体,无 LAN 地址即无可拨载体)。
+// cfg 的 customer.mesh.peers 找该 peer。畸形 toNode 目标(空 deviceID/未知
+// 形态)跳过取下一条;peer 不在 peers 列表 → 不激活。relay-only peer(跨
+// NAT)交 Transport 选 piko(SPEC §13.2 ③);无 LAN 地址不再静默关闭 DNS
+// 代转发——LANAddrs 原样透传(空即无 LAN 载体),直拨/piko 的载体选择由
+// Transport 层定。
 // 注:dns 规则目标携带的 Task 7 失败策略段(toNode:<id>:direct 等)在此
 // 剥落不消费——DNS 代转发的失败语义已定死为 SERVFAIL 兜底(design §6 层1),
 // 不存在「回落公网 DNS」的失败策略分支。
@@ -310,9 +321,6 @@ func meshDNSForwardTargetFromSnapshot(snapshot *RuntimeSnapshot, cfg *config.Con
 		peer := &cfg.Customer.Mesh.Peers[i]
 		if strings.TrimSpace(peer.DeviceID) != deviceID {
 			continue
-		}
-		if len(peer.LANAddrs) == 0 {
-			return "", nil, false
 		}
 		return deviceID, append([]string(nil), peer.LANAddrs...), true
 	}

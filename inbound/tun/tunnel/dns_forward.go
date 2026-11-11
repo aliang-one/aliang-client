@@ -1,10 +1,10 @@
 // dns_forward 承载 TUN UDP/53 的 mesh DNS 代转发 A 侧(design §6 层1):
 // 规则门控激活时,DNS 查询不再拨公网 UDP socket,而是每条查询独占一条
-// mesh 连接(target=dns:)发送、由 B 侧代解析回包。门控判定(routing.
-// MeshDNSForwardTarget)与 Peer 装配(SelfID/PikoDial)都在注入方(Task 9
-// app/tunnel 组装),本包不摸全局配置——SetMeshDNSForwardPeerSource 是唯一
-// 接线缝。帧格式与 B 侧(processor/tcp mesh_inbound.go 的 readDNSLengthFrame/
-// writeDNSLengthFrame)对偶:2 字节大端长度前缀双向帧化。
+// mesh SSH 连接(target=dns:)发送、由 B 侧代解析回包。门控判定(routing.
+// MeshDNSForwardTarget)与 ExitClient 装配都在注入方(app/tunnel 组装),
+// 本包不摸全局配置——SetMeshDNSForwardPeerSource 是唯一接线缝。帧格式与
+// B 侧(inbound/ssh mesh_dns.go 的代解析面)对偶:2 字节大端长度前缀双向
+// 帧化。
 package tunnel
 
 import (
@@ -47,7 +47,7 @@ var dnsForwardExchangeTimeout = 5 * time.Second
 //   - QNAME 日志语义(logQuery seam)沿 dnsLoggingPacketConn 并入本 conn,
 //     激活路径不再额外包 dnsLoggingPacketConn。
 type dnsForwardPacketConn struct {
-	peer     *meshproxy.Peer
+	peer     meshproxy.Dialer
 	logQuery func(query []byte)
 
 	// writeMu 串行化交换(一次一条在途查询)。
@@ -67,7 +67,7 @@ var _ net.PacketConn = (*dnsForwardPacketConn)(nil)
 // newDNSForwardPacketConn 构造 DNS 代转发 PacketConn。logQuery 在每次
 // WriteTo 时收到查询原文(尽力解析 QNAME 记日志,原 dnsLoggingPacketConn
 // 语义);nil = 不记。
-func newDNSForwardPacketConn(peer *meshproxy.Peer, logQuery func(query []byte)) *dnsForwardPacketConn {
+func newDNSForwardPacketConn(peer meshproxy.Dialer, logQuery func(query []byte)) *dnsForwardPacketConn {
 	if logQuery == nil {
 		logQuery = func([]byte) {}
 	}
@@ -101,7 +101,10 @@ func (c *dnsForwardPacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 
 	resp, err := c.exchange(b)
 	if err != nil {
-		logger.Debug(fmt.Sprintf("[MESH-DNS] exchange via %s failed, synthesizing SERVFAIL: %v", c.peer.Addr(), err))
+		// 对端标识不进日志(peer 是 Dialer 接口,无地址面):对端是哪个节点
+		// 由注入方的装配日志(app/tunnel)与 B 侧服务端日志收口,本侧只留
+		// 失败原因。
+		logger.Debug(fmt.Sprintf("[MESH-DNS] exchange failed, synthesizing SERVFAIL: %v", err))
 		resp = servfailForwardResponse(b)
 	}
 	if resp == nil {
@@ -194,8 +197,8 @@ func (c *dnsForwardPacketConn) exchange(query []byte) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), dnsForwardExchangeTimeout)
 	defer cancel()
 
-	// HostName="dns:" 经 mesh 出口 targetFromMetadata 识别为 dns: 特殊目标
-	// 原样透传(不拼端口)。
+	// HostName="dns:" 经 mesh 出口的 exitPayload 识别为 dns: 特殊目标(无
+	// h/p,出口侧构造 {"t":"dns"} payload),原样透传不拼端口。
 	md := &M.Metadata{
 		Network:  M.UDP,
 		HostName: meshproto.DNSTarget,
@@ -208,6 +211,15 @@ func (c *dnsForwardPacketConn) exchange(query []byte) ([]byte, error) {
 	defer conn.Close()
 	if dl, ok := ctx.Deadline(); ok {
 		_ = conn.SetDeadline(dl)
+	}
+	// 交换窗口看门狗(E1 载体切换补强):SSH channel 适配层(exitConn)的
+	// SetDeadline 是 no-op(SPEC §16 已知限制),旧帧协议 TCP 连接靠
+	// SetDeadline 兜住的窗口在 SSH 载体上失效——对端收下查询不回包会把
+	// exchange 永久挂死。到期即关连接,读写立即以错误返回;交换完成(成功
+	// 或失败)即停表。
+	if dl, ok := ctx.Deadline(); ok {
+		watchdog := time.AfterFunc(time.Until(dl), func() { _ = conn.Close() })
+		defer watchdog.Stop()
 	}
 	if err := writeDNSLengthFrame(conn, query); err != nil {
 		return nil, err
@@ -284,20 +296,20 @@ func writeDNSLengthFrame(w io.Writer, payload []byte) error {
 	return err
 }
 
-// SetMeshDNSForwardPeerSource 注入 DNS 代转发对端提供器(Task 8 A 侧接线
-// 缝):返回 nil = 门未激活(UDP/53 走既有直连透传,fail-open)。生产由
-// app/tunnel 组装(Task 9):routing.MeshDNSForwardTarget() 取规则驱动目标
-// (10s memo),配注册态 SelfID 与 PikoDial 构 mesh.Peer(Relay:false——
-// TUN DNS 一律 custom 仅 LAN 载体);本包不 import processor/routing、不摸
-// 全局配置。nil 入参 = 清除(回到未接线语义)。并发安全(与 SetDialer 同款)。
-func (t *Tunnel) SetMeshDNSForwardPeerSource(fn func() *meshproxy.Peer) {
+// SetMeshDNSForwardPeerSource 注入 DNS 代转发对端提供器(A 侧接线缝):
+// 返回 nil = 门未激活(UDP/53 走既有直连透传,fail-open)。生产由 app/tunnel
+// 组装:routing.MeshDNSForwardTarget() 取规则驱动目标(10s memo),按 peers
+// 装配 ExitClient(Relay:false——TUN DNS 一律 custom 仅 LAN 载体);本包不
+// import processor/routing、不摸全局配置。nil 入参 = 清除(回到未接线语义)。
+// 并发安全(与 SetDialer 同款)。
+func (t *Tunnel) SetMeshDNSForwardPeerSource(fn func() meshproxy.Dialer) {
 	t.meshDNSMu.Lock()
 	t.meshDNSForwardFn = fn
 	t.meshDNSMu.Unlock()
 }
 
 // meshDNSForwardPeer 取当前 DNS 代转发对端;未接线/门未激活返回 nil。
-func (t *Tunnel) meshDNSForwardPeer() *meshproxy.Peer {
+func (t *Tunnel) meshDNSForwardPeer() meshproxy.Dialer {
 	t.meshDNSMu.Lock()
 	fn := t.meshDNSForwardFn
 	t.meshDNSMu.Unlock()

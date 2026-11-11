@@ -841,23 +841,35 @@ func (c *Config) EffectivePeerMCPCodexEnabled() bool {
 
 // MeshConfig 节点转发网(design docs/mesh-forwarding-network-design.md)。
 type MeshConfig struct {
-	Enable        *bool               `json:"enable,omitempty"`         // mesh 出口总开关(nil=true)
-	ForwardEnable *bool               `json:"forward_enable,omitempty"` // 允许被其他节点转发(design §8,默认关 nil=false)
-	MaxHops       int                 `json:"max_hops,omitempty"`       // 跳数上限,0=默认5,clamp [1,8]
-	Peers         []MeshPeer          `json:"peers,omitempty"`          // 可转发目标节点
-	Fallback      *MeshFallbackConfig `json:"fallback,omitempty"`       // 离线兜底(design §9.4,兜底式)
+	Enable        *bool               `json:"enable,omitempty"`
+	ForwardEnable *bool               `json:"forward_enable,omitempty"`
+	MaxHops       int                 `json:"max_hops,omitempty"` // 一期不消费,仅为二期链长上限占位(SPEC §17)
+	Peers         []MeshPeer          `json:"peers,omitempty"`
+	Fallback      *MeshFallbackConfig `json:"fallback,omitempty"`
+	// PrivateKey 本节点的 mesh 身份私钥(PEM,OpenSSH 或 PKCS#8)。
+	// 公钥分发到各对端的 ssh_ingress.mesh_authorized_keys(尾注释=本机 device_id)。
+	// 空 = 本节点不能作为转发发起方(仍可作为被转发方)。
+	PrivateKey string `json:"private_key,omitempty"`
+	// KeyPassphrase 私钥口令。Validate 会 TrimSpace:首尾真有空格的 passphrase
+	// 会被静默改掉导致解不开钥(与 proxy.key_passphrase 既有口径一致,接受)。
+	KeyPassphrase string `json:"key_passphrase,omitempty"`
 }
 
 type MeshPeer struct {
 	DeviceID string   `json:"device_id"`
-	LANAddrs []string `json:"lan_addrs,omitempty"` // 候选 LAN 地址 host:port(beacon 动态补充)
-	Relay    *bool    `json:"relay,omitempty"`     // 允许走中继载体(nil=true)
+	LANAddrs []string `json:"lan_addrs,omitempty"`
+	Relay    *bool    `json:"relay,omitempty"`
+	// HostKey 对端 ssh_ingress 的 host key 钉扎(authorized_keys 行或 SHA256: 指纹)。
+	// 空 = 该 peer 不可用(fail-closed,不做 TOFU,SPEC §10.4)。
+	HostKey string `json:"host_key,omitempty"`
 }
 
 type MeshFallbackConfig struct {
 	Enable  *bool    `json:"enable,omitempty"`
-	Classes []string `json:"classes,omitempty"` // self/ai/custom 子集(design §9.4)
-	Addr    string   `json:"addr,omitempty"`    // host:port,enable=true 时必填
+	Classes []string `json:"classes,omitempty"`
+	Addr    string   `json:"addr,omitempty"`
+	// HostKey 兜底节点 SSH host key 钉扎;enable=true 且 addr 非空时必填(fail-closed)。
+	HostKey string `json:"host_key,omitempty"`
 }
 
 // EffectiveEnabled mesh 出口总开关:三态指针语义与 peer_mcp.enable 同族,
@@ -886,9 +898,10 @@ func (c *MeshConfig) EffectiveMaxHops() int {
 
 // MeshFallbackActiveForClass 离线兜底门控的统一判定(计划 Task 12 评审钉死
 // 的三消费方共享助手),四条件缺一不可:
-//  1. mesh 总开关 EffectiveEnabled(显式 false 时所有兜底消费方一律关——
-//     总开关契约穿透;抽取前 processor/tcp meshFallbackAddrForClass 缺此
-//     检查,即评审抓到的 tcp 侧缺口);
+//  1. mesh 总开关检查 = MeshEffectivelyEnabled(含 SSH 入口依赖降级)
+//     (显式 false 时所有兜底消费方一律关——总开关契约穿透;抽取前
+//     processor/tcp meshFallbackAddrForClass 缺此检查,即评审抓到的
+//     tcp 侧缺口);
 //  2. customer.mesh.fallback 使能(Enable 显式 true);
 //  3. class ∈ Fallback.Classes(空 Classes = 未勾选任何类别);
 //  4. Addr 非空(TrimSpace 规整后判定)。
@@ -900,12 +913,16 @@ func (c *MeshConfig) EffectiveMaxHops() int {
 // meshForwardAvailable 语义不同(查 Peers 非查 Fallback,编译期能力检查),
 // 不并入本助手。返回形态 (addr, ok):egress 组 Peer / tcp 拨兜底节点都需
 // 地址;只要 ok 判定的消费方可丢弃 addr。
+//
+// 兜底门不重复检查钉扎/身份:fallback 启用时 host_key 由保存期 Validate 强制
+// 必填(见 MeshConfig.Validate),运行期 DialMeshAddr(Task C4 落地)对空
+// 钉扎 fail-closed——两道闸已覆盖,此处保持宽口径避免双重报错。
 func MeshFallbackActiveForClass(cfg *Config, class string) (addr string, ok bool) {
 	if cfg == nil || cfg.Customer == nil || cfg.Customer.Mesh == nil {
 		return "", false
 	}
 	mesh := cfg.Customer.Mesh
-	if !mesh.EffectiveEnabled() {
+	if !cfg.MeshEffectivelyEnabled() {
 		return "", false
 	}
 	fb := mesh.Fallback
@@ -922,6 +939,44 @@ func MeshFallbackActiveForClass(cfg *Config, class string) (addr string, ok bool
 		}
 	}
 	return "", false
+}
+
+// MeshEffectivelyEnabled mesh 出口的生效开关 = 用户开关 ∧ SSH 入口可用
+// (SPEC §10.3)。依赖降级:SSH 入口未启用时 mesh 无出口载体,恒 false——
+// 存量配置(mesh 开、ssh 未配)升级后 mesh 静默降级为关,而不是启动失败。
+// 保存期硬拒由 ValidateMeshDependency 承担(customer 配置提交路径);本方法
+// 只做启动/运行期降级判定,两者不重复报错。
+func (c *Config) MeshEffectivelyEnabled() bool {
+	if c == nil || c.Customer == nil {
+		return false
+	}
+	if !c.Customer.Mesh.EffectiveEnabled() {
+		return false
+	}
+	return c.Customer.SSHIngress.IsEnabled()
+}
+
+// ValidateMeshDependency 保存期依赖硬拒:开 mesh 必须开 SSH 入口
+// (SPEC §10.3)。启动期不调用本函数(Config.Validate 也不调)——启动降级走
+// MeshEffectivelyEnabled,绝不阻断 boot。
+func (c *Config) ValidateMeshDependency() error {
+	// Mesh 块缺失(JSON 无 mesh 键 = 用户从未触及 mesh)直接过:硬拒只在
+	// 保存携带 mesh 块时触发;启动期的对应降级由 MeshEffectivelyEnabled 兜住。
+	if c == nil || c.Customer == nil || c.Customer.Mesh == nil {
+		return nil
+	}
+	if c.Customer.Mesh.EffectiveEnabled() && !c.Customer.SSHIngress.IsEnabled() {
+		return fmt.Errorf("组网依赖 SSH 入口(ssh_ingress.enable):开启 customer.mesh.enable 前必须先开启 SSH 入口")
+	}
+	return nil
+}
+
+// MeshFallbackHostKey 返回兜底节点的 SSH host key 钉扎(未配置=空串=fail-closed)。
+func MeshFallbackHostKey(cfg *Config) string {
+	if cfg == nil || cfg.Customer == nil || cfg.Customer.Mesh == nil || cfg.Customer.Mesh.Fallback == nil {
+		return ""
+	}
+	return strings.TrimSpace(cfg.Customer.Mesh.Fallback.HostKey)
 }
 
 // Validate 保存通道(Config.Validate)调用:peers/兜底/跳数的形态校验。
@@ -950,6 +1005,10 @@ func (c *MeshConfig) Validate() error {
 				return fmt.Errorf("customer.mesh.peers[%d].lan_addrs[%d] invalid %q: must be host:port", i, j, peer.LANAddrs[j])
 			}
 		}
+		peer.HostKey = strings.TrimSpace(peer.HostKey)
+		if peer.HostKey == "" {
+			return fmt.Errorf("customer.mesh.peers[%d].host_key required (peer host key must be pinned, no TOFU)", i)
+		}
 	}
 	if c.Fallback != nil && c.Fallback.Enable != nil && *c.Fallback.Enable {
 		c.Fallback.Addr = strings.TrimSpace(c.Fallback.Addr)
@@ -959,6 +1018,10 @@ func (c *MeshConfig) Validate() error {
 		if _, _, err := net.SplitHostPort(c.Fallback.Addr); err != nil {
 			return fmt.Errorf("customer.mesh.fallback.addr invalid %q: must be host:port", c.Fallback.Addr)
 		}
+		c.Fallback.HostKey = strings.TrimSpace(c.Fallback.HostKey)
+		if c.Fallback.HostKey == "" {
+			return fmt.Errorf("customer.mesh.fallback.host_key required when fallback enabled (no TOFU)")
+		}
 		for _, class := range c.Fallback.Classes {
 			switch class {
 			case meshproto.ClassSelf, meshproto.ClassAI, meshproto.ClassCustom:
@@ -966,6 +1029,11 @@ func (c *MeshConfig) Validate() error {
 				return fmt.Errorf("customer.mesh.fallback.classes[%q] must be one of [%s %s %s]", class, meshproto.ClassSelf, meshproto.ClassAI, meshproto.ClassCustom)
 			}
 		}
+	}
+	c.PrivateKey = strings.TrimSpace(c.PrivateKey)
+	c.KeyPassphrase = strings.TrimSpace(c.KeyPassphrase)
+	if len(c.Peers) > 0 && c.PrivateKey == "" {
+		return fmt.Errorf("customer.mesh.private_key required when peers configured (node identity key)")
 	}
 	return nil
 }
@@ -999,8 +1067,9 @@ func (c *Config) ValidateMesh(selfDeviceID string) error {
 const SSHIngressDefaultPort uint16 = 56442
 
 // SSHIngressConfig 控制 SSH 入口服务面(customer.ssh_ingress)。
-// 双密钥准入:authorized_keys=人用凭证(裸流形态);mesh_authorized_keys=
-// 节点互连凭证(mesh 帧形态)。禁密码。端口默认 56442。
+// 双密钥准入:authorized_keys=人用凭证(裸流 direct-tcpip 形态);
+// mesh_authorized_keys=节点互连凭证(mesh-exit channel(ExtraData)形态)。
+// 禁密码。端口默认 56442。
 type SSHIngressConfig struct {
 	Enable             *bool    `json:"enable,omitempty"` // 三态:nil=false
 	Port               uint16   `json:"port,omitempty"`
@@ -1021,7 +1090,7 @@ func (c *SSHIngressConfig) IsEnabled() bool {
 // 两列表合计非空(至少一把准入钥匙,否则开了门谁也进不来);逐条按
 // authorized_keys 行格式(gossh.ParseAuthorizedKey,[host:port] 证书主体
 // 前缀等合法变体由其原生容忍)校验;同一公钥(TrimSpace 后逐字节同)跨
-// 两列表=形态歧义(裸流 vs mesh 帧),保存时拦——运行期 mesh 优先只是
+// 两列表=形态歧义(裸流 direct-tcpip vs mesh-exit 形态),保存时拦——运行期 mesh 优先只是
 // 第二道防御(inbound/ssh),配置层先拒绝歧义本身。
 // port:uint16 类型上界即 65535,越界值(如 70000)在 JSON 反序列化层即被拒;
 // 0=未配,由 EffectiveSSHIngress 归一为默认 56442,因此这里没有端口分支。

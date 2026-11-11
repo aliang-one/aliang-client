@@ -2,6 +2,7 @@ package services
 
 import (
 	"encoding/json"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -853,3 +854,41 @@ func (c *customerConfigCloseCountingConn) RemoteAddr() net.Addr             { re
 func (c *customerConfigCloseCountingConn) SetDeadline(time.Time) error      { return nil }
 func (c *customerConfigCloseCountingConn) SetReadDeadline(time.Time) error  { return nil }
 func (c *customerConfigCloseCountingConn) SetWriteDeadline(time.Time) error { return nil }
+
+// TestUpdateCommittedCustomerConfig_MeshDependencyFourCombos 是 ValidateMeshDependency
+// 的保存期接线测试(SPEC §10.3):开 mesh 必须开 SSH 入口,走 customer 配置
+// 提交路径逐组合验证——双开/双关/mesh 关过闸,mesh 开+ssh 关在保存期被
+// CustomerConfigValidationError 硬拒;启动期不做该检查(降级走
+// MeshEffectivelyEnabled,见 processor/config 四组合测试),此处只钉提交闸。
+func TestUpdateCommittedCustomerConfig_MeshDependencyFourCombos(t *testing.T) {
+	setupIngressReconcileTest(t)
+
+	keyLine, _ := newSSHIngressTestKey(t)
+	// meshOnPayload:合法 mesh 形态(形态校验必须先过,隔离出依赖门这层)。
+	meshOnPayload := func(ssh string) string {
+		return fmt.Sprintf(`{"customer":{"mesh":{"enable":true,"private_key":"k","peers":[{"device_id":"dev-b","host_key":"SHA256:abc"}]},"ssh_ingress":%s}}`, ssh)
+	}
+
+	t.Run("mesh开+ssh开→提交成功", func(t *testing.T) {
+		commitIngressConfig(t, meshOnPayload(fmt.Sprintf(`{"enable":true,"authorized_keys":[%q]}`, keyLine)))
+	})
+
+	t.Run("mesh关+ssh关→提交成功", func(t *testing.T) {
+		commitIngressConfig(t, `{"customer":{"mesh":{"enable":false},"ssh_ingress":{"enable":false}}}`)
+	})
+
+	t.Run("mesh关+ssh开→提交成功", func(t *testing.T) {
+		commitIngressConfig(t, fmt.Sprintf(`{"customer":{"mesh":{"enable":false},"ssh_ingress":{"enable":true,"authorized_keys":[%q]}}}`, keyLine))
+	})
+
+	t.Run("mesh开+ssh关→保存期硬拒", func(t *testing.T) {
+		service := NewCustomerConfigService()
+		_, err := service.UpdateCommittedCustomerConfig([]byte(meshOnPayload(`{"enable":false}`)))
+		if err == nil {
+			t.Fatal("mesh on + ssh off must be rejected at save time (SPEC §10.3)")
+		}
+		if !strings.Contains(err.Error(), "组网依赖 SSH 入口") {
+			t.Fatalf("reject reason must come from ValidateMeshDependency, got %v", err)
+		}
+	})
+}

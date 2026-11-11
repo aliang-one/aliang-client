@@ -1,9 +1,12 @@
 package config
 
+// 判据含 SSH 入口依赖(SPEC §10.3),用例须显式开 ssh_ingress。
+
 // MeshFallbackActiveForClass 共享门控助手测试(计划 Task 12 评审钉死的三
-// 消费方统一抽取):EffectiveEnabled 总开关 + Fallback.Enable + class ∈
-// Classes + Addr 非空,四条件缺一不可。tcp 兜底闸与 egress 闸替换为调用
-// 本助手后,既有包内回归见各自包测试;此处钉助手自身的语义边界。
+// 消费方统一抽取):MeshEffectivelyEnabled 总开关(含 SSH 入口依赖降级)+
+// Fallback.Enable + class ∈ Classes + Addr 非空,条件缺一不可。tcp 兜底闸
+// 与 egress 闸替换为调用本助手后,既有包内回归见各自包测试;此处钉助手
+// 自身的语义边界。
 
 import (
 	"testing"
@@ -13,10 +16,13 @@ import (
 
 func boolPtrForMeshGate(v bool) *bool { return &v }
 
-// meshGateConfig 构造给定总开关/兜底配置的最小 Config。
+// meshGateConfig 构造给定总开关/兜底配置的最小 Config。SSH 入口显式开:
+// 判据切到 MeshEffectivelyEnabled 后,ssh_ingress 未置位会让门恒关,
+// 各用例将被依赖降级误吞而非测到各自钉的条件。
 func meshGateConfig(master *bool, fb *MeshFallbackConfig) *Config {
 	return &Config{Customer: &CustomerConfig{
-		Mesh: &MeshConfig{Enable: master, Fallback: fb},
+		Mesh:       &MeshConfig{Enable: master, Fallback: fb},
+		SSHIngress: &SSHIngressConfig{Enable: boolPtrForMeshGate(true)},
 	}}
 }
 

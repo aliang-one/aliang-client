@@ -148,7 +148,8 @@ func isSnapshotActionAvailable(action SnapshotAction, capabilities SnapshotBranc
 		return true
 	default:
 		// mesh 转发目标 toNode:<deviceID>:能力已在编译期把关
-		// (mesh 总开关 + peer 存在, 见 snapshot.go meshForwardAvailable),
+		// (mesh 生效开关(含 SSH 入口依赖)+ 身份钥 + peer 存在且已钉扎,
+		//  SPEC §13.2;peer 存在性详见 snapshot_mesh.go meshForwardAvailable),
 		// 决策期视为 available——快照随配置变更即重编译, 不存在能力漂移窗口。
 		return strings.HasPrefix(string(action), SnapshotTargetMeshPrefix)
 	}

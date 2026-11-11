@@ -32,6 +32,37 @@
       {{ t('mesh_statusDegradedHint') }}
     </p>
 
+    <!-- 依赖降级提示（G4/SPEC §10.3）:mesh 有效启用（enable!==false,后端三态
+         nil=true）而 SSH 入口未启用 → mesh 出口不会生效（F2 运行期降级同口径）。
+         只提示不静默改写:「一并开启」经一层确认（window.confirm 既有形态）落
+         意图标志,随下次整体保存提交（不单独发请求）;意图已记后按钮收敛,
+         警告条保持到保存生效（警告反映的是配置面真相）。 -->
+    <div
+      v-if="sshIngressOff"
+      class="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-200"
+      data-mesh-ssh-dependency
+    >
+      <div class="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+        <div class="flex items-center gap-2">
+          <span class="material-symbols-outlined text-base">warning</span>
+          <div>
+            <p class="text-sm font-semibold">{{ t('mesh_sshDependencyTitle') }}</p>
+            <p class="text-xs">{{ t('mesh_sshDependencyWarning') }}</p>
+          </div>
+        </div>
+        <button
+          v-if="!sshIngressEnableIntent"
+          class="inline-flex min-h-9 shrink-0 items-center justify-center gap-1.5 rounded-md border border-amber-300 bg-white/60 px-3 text-xs font-medium text-amber-800 transition hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-60 dark:border-amber-500/40 dark:bg-transparent dark:text-amber-200 dark:hover:bg-amber-500/20"
+          data-mesh-ssh-enable-together
+          type="button"
+          :disabled="loading || saving"
+          @click="confirmEnableSshIngress"
+        >
+          {{ t('mesh_sshEnableTogether') }}
+        </button>
+      </div>
+    </div>
+
     <div
       v-if="error"
       class="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700 dark:border-red-500/30 dark:bg-red-500/10 dark:text-red-200"
@@ -200,6 +231,49 @@
       </div>
     </section>
 
+    <!-- —— 节点对凭据（G3/SPEC §13.3.4）:每个配置 peer 一行,行内 host_key 输入位
+         绑定表单行（保存随 peers 数组整体替换带出;清空=省缺,经数组 diff 自然带出,
+         G2 注释同口径）。device_id/lan_addrs/relay 仍由配置文件/后端维护,此处只
+         暴露凭据编辑;行数据源=归一化后的 config peers（watch config 深度重建表单）。 -->
+    <section v-if="form.peerRows.length" class="space-y-3" data-mesh-peers>
+      <div class="flex flex-col gap-1 md:flex-row md:items-center md:justify-between">
+        <h4 class="text-sm font-semibold text-slate-900 dark:text-white">{{ t('mesh_peersTitle') }}</h4>
+        <p class="text-xs text-slate-500">{{ t('mesh_peerHostKeyHint') }}</p>
+      </div>
+      <div
+        v-for="row in form.peerRows"
+        :key="row.device_id"
+        class="grid items-center gap-3 md:grid-cols-[220px_minmax(0,1fr)]"
+        :data-mesh-peer-row="row.device_id"
+      >
+        <span class="truncate font-mono text-sm text-slate-800 dark:text-slate-200">{{ row.device_id }}</span>
+        <div class="space-y-1">
+          <input
+            v-model="row.host_key"
+            :aria-label="t('mesh_peerHostKey')"
+            class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 font-mono text-sm shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 disabled:opacity-60 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+            data-field="meshPeerHostKey"
+            :data-peer-id="row.device_id"
+            :disabled="loading || saving"
+            :placeholder="t('mesh_peerHostKeyPlaceholder')"
+            type="text"
+            @keydown.enter.prevent
+          />
+          <!-- 身份不一致提示（G4/SPEC §10.3）:device_id 与本机准入表
+               （ssh_ingress.mesh_authorized_keys）尾注释比对不一致 → 警告级
+               （amber）非阻断——保存不拦,后端保存期才是权威;对端可省注释
+               （全表无注释=无从比对）不提示。 -->
+          <p
+            v-if="peerDeviceMismatched(row.device_id)"
+            class="text-[11px] text-amber-600 dark:text-amber-400"
+            :data-mesh-device-hint="row.device_id"
+          >
+            {{ t('mesh_deviceIdMismatchHint') }}
+          </p>
+        </div>
+      </div>
+    </section>
+
     <!-- —— 离线兜底常驻卡（§9.4;兜底式非覆盖式,在线时即可预配置）—— -->
     <section class="space-y-3 rounded-xl border border-dashed border-slate-300 bg-slate-50/60 p-4 dark:border-slate-700 dark:bg-slate-900/40" data-mesh-fallback>
       <div class="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
@@ -256,6 +330,21 @@
         </label>
       </div>
 
+      <!-- 兜底行 host_key（G3/SPEC §13.3.4:与 addr 并列;兜底节点=特殊 peer,格式同对端 host key;
+           spread 保底透传既有值,表单值在前覆盖——字面量只认表单三键,清空走 G2 清空块） -->
+      <label class="space-y-2">
+        <span class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('mesh_fallbackHostKey') }}</span>
+        <input
+          v-model="form.fallbackHostKey"
+          class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 font-mono text-sm shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 disabled:opacity-60 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+          data-field="meshFallbackHostKey"
+          :disabled="loading || saving"
+          :placeholder="t('mesh_peerHostKeyPlaceholder')"
+          type="text"
+          @keydown.enter.prevent
+        />
+      </label>
+
       <!-- Classes 三勾选（后端 meshproto ClassAI/ClassSelf/ClassCustom 子集） -->
       <fieldset class="space-y-2">
         <legend class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('mesh_fallbackClasses') }}</legend>
@@ -294,6 +383,43 @@
       </fieldset>
     </section>
 
+    <!-- —— 节点身份密钥（G3/SPEC §13.3.4）:私钥 textarea 容 PEM 多行 + 口令密码框,
+         autocomplete off 防浏览器记忆凭据（RulesSettings proxy 私钥同款手法）。
+         表单不强校验——后端保存期拒绝（peers 非空时 private_key 必填等）经卡片
+         error prop 回显,placeholder/hint 把格式与分发口径写清。 -->
+    <section class="space-y-3" data-mesh-identity>
+      <div>
+        <h4 class="text-sm font-semibold text-slate-900 dark:text-white">{{ t('mesh_privateKey') }}</h4>
+        <p class="text-xs text-slate-500">{{ t('mesh_privateKeyHint') }}</p>
+      </div>
+      <div class="grid gap-4 md:grid-cols-[minmax(0,1fr)_240px]">
+        <label class="space-y-2">
+          <textarea
+            v-model="form.privateKey"
+            :aria-label="t('mesh_privateKey')"
+            autocomplete="off"
+            class="min-h-28 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 font-mono text-xs shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 disabled:opacity-60 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+            data-field="meshPrivateKey"
+            :disabled="loading || saving"
+            :placeholder="t('mesh_privateKeyPlaceholder')"
+            spellcheck="false"
+          ></textarea>
+        </label>
+        <label class="space-y-2">
+          <span class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('mesh_keyPassphrase') }}</span>
+          <input
+            v-model="form.keyPassphrase"
+            autocomplete="off"
+            class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 disabled:opacity-60 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+            data-field="meshKeyPassphrase"
+            :disabled="loading || saving"
+            type="password"
+            @keydown.enter.prevent
+          />
+        </label>
+      </div>
+    </section>
+
     <p v-if="validationError" class="text-xs text-red-500" role="alert">{{ validationError }}</p>
 
     <div class="flex items-center justify-end gap-3">
@@ -316,6 +442,7 @@ import { getAgentStatus, getMeshLanPeers, getMeshStatus } from '../../services/a
 import { useI18n } from '../../i18n';
 import {
   MESH_FALLBACK_CLASSES,
+  listMeshDeviceIdMismatches,
   listMeshRulesByPeer,
   normalizeMeshConfig,
   parseMeshRuleTargetCount
@@ -368,7 +495,10 @@ export default {
       selectedPair: '',
       selectedNode: '',
       nodePositions: {},
-      dragging: null
+      dragging: null,
+      // 「一并开启 SSH 入口」意图标志（G4/SPEC §10.3）:确认后才落,随下次
+      // 整体保存带出 ssh_ingress.enable=true——不静默改写,不单独发请求
+      sshIngressEnableIntent: false
     };
   },
   computed: {
@@ -435,6 +565,21 @@ export default {
         return this.t('mesh_validationFallbackAddr');
       }
       return '';
+    },
+    // —— G4/SPEC §10.3 两条仪表盘提示 ——
+    // 依赖降级:mesh 有效启用（enable!==false,对齐后端三态 nil=true）而
+    // ssh_ingress.enable 非 true → mesh 出口不会生效（F2 运行期降级
+    // MeshEffectivelyEnabled 同口径）,卡片内提示。
+    sshIngressOff() {
+      return this.configMesh.enable !== false && this.config?.ssh_ingress?.enable !== true;
+    },
+    // 身份比对:与准入表（ssh_ingress.mesh_authorized_keys）尾注释不一致的
+    // device_id 集合（数据源=归一化 peers 真值;全表无注释不提示）。
+    deviceIdMismatches() {
+      return listMeshDeviceIdMismatches(
+        this.configMesh.peers,
+        this.config?.ssh_ingress?.mesh_authorized_keys
+      );
     },
     // —— 画布数据（§9.2）——
     // 连线徽标数据源 = customer.proxy_rules 真值（非 status 聚合）,
@@ -564,6 +709,14 @@ export default {
       deep: true,
       handler(nextConfig) {
         this.form = this.formFromConfig(nextConfig);
+        // I1(跨回合安全):配置回读到 ssh_ingress 已开即清「一并开启」意图——
+        // 标志只置位不清零的话,「一并开启→保存→经 SSH 卡关掉 ssh→回 mesh 卡」
+        // 后,陈旧标志经 save 守卫（enable!==true）会静默把 ssh_ingress.enable=
+        // true 带进 patch,复活一个已关闭的 LAN 暴露面;且按钮被陈旧标志隐藏
+        // （警告条在而按钮不在的 UI 不一致）。回读即清,两者一并治愈。
+        if (nextConfig?.ssh_ingress?.enable === true) {
+          this.sshIngressEnableIntent = false;
+        }
       }
     },
     // 保存成功后重拉状态两路（幂等 GET）:开关/兜底现值与 LAN 候选随之刷新,
@@ -694,11 +847,34 @@ export default {
       const statusPeers = Array.isArray(this.meshStatus?.peers) ? this.meshStatus.peers : [];
       return statusPeers.some((peer) => String(peer?.device_id || '') === deviceId);
     },
+    // —— G4/SPEC §10.3 ——
+    // 「一并开启」一层确认（RulesSettings clearKnownHosts 的 window.confirm
+    // 既有形态;confirm 不可用的环境直接视为确认,与该先例同口径）:确认→落
+    // 意图标志随下次整体保存提交;取消→什么都不改。
+    confirmEnableSshIngress() {
+      if (typeof window !== 'undefined' && typeof window.confirm === 'function') {
+        if (!window.confirm(this.t('mesh_sshEnableTogether'))) {
+          return;
+        }
+      }
+      this.sshIngressEnableIntent = true;
+    },
+    peerDeviceMismatched(deviceId) {
+      return this.deviceIdMismatches.includes(deviceId);
+    },
     formFromConfig(config) {
       const mesh = normalizeMeshConfig(config?.mesh);
       return {
         fallbackEnabled: mesh.fallback.enable,
         fallbackAddr: mesh.fallback.addr,
+        // 密钥输入位（G3/SPEC §13.3.4）:四类现值从配置回填——「填→保存→刷新仍在」
+        // 的读侧（刷新=props.config 更新,watch 深度重建表单）。缺键渲染空串。
+        fallbackHostKey: mesh.fallback.host_key || '',
+        privateKey: mesh.private_key || '',
+        keyPassphrase: mesh.key_passphrase || '',
+        // peer 行:整行拷贝（device_id/lan_addrs/relay 只作透传底座,行内仅
+        // host_key 可编辑）;无 host_key 的 peer 行也渲染（空输入位）
+        peerRows: mesh.peers.map((peer) => ({ ...peer, host_key: peer.host_key || '' })),
         classes: {
           ai: mesh.fallback.classes.includes('ai'),
           self: mesh.fallback.classes.includes('self'),
@@ -771,16 +947,42 @@ export default {
       }
       const mesh = normalizeMeshConfig({
         ...(this.config?.mesh && typeof this.config.mesh === 'object' ? this.config.mesh : {}),
+        // 密钥表单值（G3/SPEC §13.3.4）:节点私钥/口令与 peers 行内 host_key 进入
+        // 载荷;空串经归一化不落键（G1 省缺）,撤销意图由 SettingsPage G2 清空块
+        // 显式带出空串,后端 deep-merge 才会真正清掉旧值——三段接力缺一不可。
+        private_key: String(this.form.privateKey ?? ''),
+        key_passphrase: String(this.form.keyPassphrase ?? ''),
+        // peers 以表单行为准（行内 host_key 编辑值必须带出）;未编辑字段整行透传
+        peers: this.form.peerRows.map((row) => ({ ...row })),
         fallback: {
+          // 密钥透传（SPEC §13.3.2）：fallback 字面量整体替换,只改 js 归一化
+          // 不够——spread 保住既有 config 的 host_key 等密钥键,表单四键在前
+          // 覆盖用户可编辑值（degenerate 输入由 normalizeMeshFallback 兜底清洗）。
+          ...(this.config?.mesh?.fallback || {}),
           enable: !!this.form.fallbackEnabled,
           addr: String(this.form.fallbackAddr || '').trim(),
+          host_key: String(this.form.fallbackHostKey ?? ''),
           classes: MESH_FALLBACK_CLASSES.filter((cls) => this.form.classes[cls])
         }
       });
-      this.$emit('save', {
+      this.$emit('save', this.savePayload(mesh));
+    },
+    // 整体保存载荷（整配置透传 + mesh 覆盖）之上的 G4 附加:「一并开启」确认
+    // 后的意图随整体保存带出——ssh_ingress 段原样透传仅翻转 enable（port/
+    // authorized_keys 等不动）,父层递归 diff 只会把 enable 进 patch;不单独
+    // 发请求。已启用则意图空转（幂等）。
+    savePayload(mesh) {
+      const payload = {
         ...(this.config || {}),
         mesh
-      });
+      };
+      if (this.sshIngressEnableIntent && this.config?.ssh_ingress?.enable !== true) {
+        payload.ssh_ingress = {
+          ...(this.config?.ssh_ingress && typeof this.config.ssh_ingress === 'object' ? this.config.ssh_ingress : {}),
+          enable: true
+        };
+      }
+      return payload;
     }
   }
 };

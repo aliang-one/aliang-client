@@ -1,12 +1,33 @@
 package routing
 
 import (
+	"strings"
 	"testing"
 	"time"
 
 	"aliang.one/nursorgate/common/model"
 	"aliang.one/nursorgate/processor/config"
 )
+
+// sshIngressOn 与 capableMesh 构造满足编译期能力判据(SPEC §13.2:SSH 入口
+// 开启 + 本机身份私钥 + 对端已钉扎 host_key)的配置块。判据升级前 mesh 编译
+// 测试的 fixture 只搭「总开关+peer 存在」,升级后不补齐即被 fail-closed 静默
+// 跳过;本组 helper 让既有用例只需表达「要测的变量」,能力三件套统一补齐。
+// 注意:显式空 host_key 也会被补齐;钉扎负例请直构(见
+// TestMeshForwardAvailableSSHDependency 的 mk)。
+func sshIngressOn() *config.SSHIngressConfig {
+	return &config.SSHIngressConfig{Enable: boolPtr(true)}
+}
+
+func capableMesh(peers ...config.MeshPeer) *config.MeshConfig {
+	mesh := &config.MeshConfig{PrivateKey: "test-identity-key", Peers: peers}
+	for i := range mesh.Peers {
+		if strings.TrimSpace(mesh.Peers[i].HostKey) == "" {
+			mesh.Peers[i].HostKey = "ssh-ed25519 AAAA test-pin"
+		}
+	}
+	return mesh
+}
 
 func TestSplitMeshTail(t *testing.T) {
 	cases := []struct {
@@ -66,7 +87,8 @@ func TestRuntimeSnapshot_CompileMeshPolicyTailForms(t *testing.T) {
 				"domains,deny.corp,mesh:dev-b,deny",
 				"domains,fb.corp,mesh:dev-b,fallback:dev-c",
 			},
-			Mesh: &config.MeshConfig{Peers: []config.MeshPeer{{DeviceID: "dev-b"}, {DeviceID: "dev-c"}}},
+			SSHIngress: sshIngressOn(),
+			Mesh:       capableMesh(config.MeshPeer{DeviceID: "dev-b"}, config.MeshPeer{DeviceID: "dev-c"}),
 		},
 	}
 
@@ -126,7 +148,8 @@ func TestRuntimeSnapshot_MeshMultiSegmentTailRejected(t *testing.T) {
 				"domains,corp.com,mesh:dev-b,",      // 尾逗号空段:整条跳过
 				"domains,ok.com,mesh:dev-b",         // 合法形态对照:正常产出
 			},
-			Mesh: &config.MeshConfig{Peers: []config.MeshPeer{{DeviceID: "dev-b"}}},
+			SSHIngress: sshIngressOn(),
+			Mesh:       capableMesh(config.MeshPeer{DeviceID: "dev-b"}),
 		},
 	}
 
@@ -153,7 +176,8 @@ func TestRuntimeSnapshot_CompileMeshForwardRule(t *testing.T) {
 				"ip-cidr,10.0.0.0/8,mesh:dev-b",
 				"dns,mesh:dev-b",
 			},
-			Mesh: &config.MeshConfig{Peers: []config.MeshPeer{{DeviceID: "dev-b"}}},
+			SSHIngress: sshIngressOn(),
+			Mesh:       capableMesh(config.MeshPeer{DeviceID: "dev-b"}),
 		},
 	}
 
@@ -206,7 +230,8 @@ func TestRuntimeSnapshot_MeshTargetUnknownPeerRejected(t *testing.T) {
 				"domains,internal.corp,mesh:dev-xyz", // 未知 peer:编译期静默跳过
 				"domains,known.com,mesh:dev-b",       // 已知 peer:正常产出
 			},
-			Mesh: &config.MeshConfig{Peers: []config.MeshPeer{{DeviceID: "dev-b"}}},
+			SSHIngress: sshIngressOn(),
+			Mesh:       capableMesh(config.MeshPeer{DeviceID: "dev-b"}),
 		},
 	}
 
@@ -232,7 +257,8 @@ func TestRuntimeSnapshot_CompileMeshDNSRuleFirstWins(t *testing.T) {
 				"dns,mesh:dev-b",
 				"dns,mesh:dev-c",
 			},
-			Mesh: &config.MeshConfig{Peers: []config.MeshPeer{{DeviceID: "dev-b"}, {DeviceID: "dev-c"}}},
+			SSHIngress: sshIngressOn(),
+			Mesh:       capableMesh(config.MeshPeer{DeviceID: "dev-b"}, config.MeshPeer{DeviceID: "dev-c"}),
 		},
 	}
 
@@ -280,7 +306,8 @@ func TestDecideRouteFromSnapshot_MeshDNSRuleSkippedInTCPDecision(t *testing.T) {
 				"dns,mesh:dev-c",
 				"domains,internal.corp,mesh:dev-b",
 			},
-			Mesh: &config.MeshConfig{Peers: []config.MeshPeer{{DeviceID: "dev-b"}, {DeviceID: "dev-c"}}},
+			SSHIngress: sshIngressOn(),
+			Mesh:       capableMesh(config.MeshPeer{DeviceID: "dev-b"}, config.MeshPeer{DeviceID: "dev-c"}),
 		},
 	}
 
@@ -299,14 +326,16 @@ func TestDecideRouteFromSnapshot_MeshDNSRuleSkippedInTCPDecision(t *testing.T) {
 }
 
 // TestMeshDNSForwardTargetFromSnapshot Task 8 门控派生(design §6 层1 规则
-// 驱动):启用的 dns 规则 + peer 配有 LANAddrs → (deviceID, lanAddrs, true);
-// 无规则/无 LANAddrs → false(不激活,现状直连透传 fail-open);多条取首条。
+// 驱动):启用的 dns 规则 + peer 存在 → (deviceID, lanAddrs, true);relay-only
+// peer 同样激活,lanAddrs 为空不构成关闭条件,载体选择归 Transport(SPEC
+// §13.2 ③);无规则/peer 不在列表 → false(fail-open);多条取首条。
 func TestMeshDNSForwardTargetFromSnapshot(t *testing.T) {
 	meshDNSCfg := func(proxyRules []string, peers ...config.MeshPeer) *config.Config {
 		return &config.Config{
 			Customer: &config.CustomerConfig{
 				ProxyRules: proxyRules,
-				Mesh:       &config.MeshConfig{Peers: peers},
+				SSHIngress: sshIngressOn(),
+				Mesh:       capableMesh(peers...),
 			},
 		}
 	}
@@ -331,10 +360,16 @@ func TestMeshDNSForwardTargetFromSnapshot(t *testing.T) {
 		}
 	})
 
-	t.Run("dns 规则但 peer 无 LANAddrs 不激活", func(t *testing.T) {
-		cfg := meshDNSCfg([]string{"dns,mesh:dev-b"}, config.MeshPeer{DeviceID: "dev-b"})
-		if _, _, ok := meshDNSForwardTargetFromInputs(cfg, model.RulesSettings{}); ok {
-			t.Fatal("peer 无 LANAddrs 时不应激活(TUN DNS 一律 custom 仅 LAN 载体,无地址无可拨载体)")
+	t.Run("relay-only peer 无 LANAddrs 也激活(SPEC §13.2 ③)", func(t *testing.T) {
+		// 跨 NAT 形态:peer 无 LAN 地址,交 Transport 选 piko 载体,不再被
+		// len(LANAddrs)==0 静默关闭 DNS 代转发。
+		cfg := meshDNSCfg([]string{"dns,mesh:dev-b"}, config.MeshPeer{DeviceID: "dev-b", Relay: boolPtr(true)})
+		id, addrs, ok := meshDNSForwardTargetFromInputs(cfg, model.RulesSettings{})
+		if !ok || id != "dev-b" {
+			t.Fatalf("relay-only peer = (%q, %v, %v), want (dev-b, ..., true)", id, addrs, ok)
+		}
+		if len(addrs) != 0 {
+			t.Fatalf("relay-only peer 无 LAN 载体, lanAddrs = %v, want 空", addrs)
 		}
 	})
 
@@ -393,13 +428,16 @@ func TestMeshDNSForwardTargetFromSnapshot(t *testing.T) {
 	})
 
 	t.Run("mesh 总开关关闭不激活", func(t *testing.T) {
+		// 其余能力三件套齐备,单独钉死总开关这一变量。
 		disabled := false
 		cfg := &config.Config{
 			Customer: &config.CustomerConfig{
 				ProxyRules: []string{"dns,mesh:dev-b"},
+				SSHIngress: sshIngressOn(),
 				Mesh: &config.MeshConfig{
-					Enable: &disabled,
-					Peers:  []config.MeshPeer{{DeviceID: "dev-b", LANAddrs: []string{"192.168.1.20:9443"}}},
+					Enable:     &disabled,
+					PrivateKey: "test-identity-key",
+					Peers:      []config.MeshPeer{{DeviceID: "dev-b", HostKey: "test-pin", LANAddrs: []string{"192.168.1.20:9443"}}},
 				},
 			},
 		}
@@ -431,17 +469,19 @@ func TestMeshDNSForwardTargetMemo10s(t *testing.T) {
 	withRule := &config.Config{
 		Customer: &config.CustomerConfig{
 			ProxyRules: []string{"dns,mesh:dev-b"},
-			Mesh: &config.MeshConfig{Peers: []config.MeshPeer{
-				{DeviceID: "dev-b", LANAddrs: []string{"192.168.1.20:9443"}},
-			}},
+			SSHIngress: sshIngressOn(),
+			Mesh: capableMesh(config.MeshPeer{
+				DeviceID: "dev-b", LANAddrs: []string{"192.168.1.20:9443"},
+			}),
 		},
 	}
 	withoutRule := &config.Config{
 		Customer: &config.CustomerConfig{
 			ProxyRules: []string{"domains,x.com"},
-			Mesh: &config.MeshConfig{Peers: []config.MeshPeer{
-				{DeviceID: "dev-b", LANAddrs: []string{"192.168.1.20:9443"}},
-			}},
+			SSHIngress: sshIngressOn(),
+			Mesh: capableMesh(config.MeshPeer{
+				DeviceID: "dev-b", LANAddrs: []string{"192.168.1.20:9443"},
+			}),
 		},
 	}
 
@@ -472,5 +512,73 @@ func TestSnapshotTargetMeshPrefixMirrorsConfigConstant(t *testing.T) {
 	if SnapshotTargetMeshPrefix != config.MeshRuleTargetPrefix {
 		t.Fatalf("SnapshotTargetMeshPrefix = %q, config.MeshRuleTargetPrefix = %q, want 同值",
 			SnapshotTargetMeshPrefix, config.MeshRuleTargetPrefix)
+	}
+}
+
+// TestMeshForwardAvailableSSHDependency 编译期能力判据升级(SPEC §13.2 ①②):
+// SSH 入口依赖降级(MeshEffectivelyEnabled)穿透到编译期——ssh 未启用即降级
+// 不可用;本机无身份私钥不能作发起方;对端未钉扎 host_key 能力不成立
+// (fail-closed,规则条目静默跳过而非编译出拨不通的 toNode 规则)。
+func TestMeshForwardAvailableSSHDependency(t *testing.T) {
+	mk := func(ssh *bool, privKey, hostKey string) *config.Config {
+		return &config.Config{
+			Customer: &config.CustomerConfig{
+				Mesh: &config.MeshConfig{
+					Enable:     boolPtr(true),
+					PrivateKey: privKey,
+					Peers:      []config.MeshPeer{{DeviceID: "dev-b", HostKey: hostKey}},
+				},
+				SSHIngress: &config.SSHIngressConfig{Enable: ssh},
+			},
+		}
+	}
+	if !meshForwardAvailable(mk(boolPtr(true), "k", "h"), "dev-b") {
+		t.Fatal("ssh 开+身份钥+对端已钉扎 → available")
+	}
+	if meshForwardAvailable(mk(boolPtr(false), "k", "h"), "dev-b") {
+		t.Fatal("ssh 关 → 依赖降级 unavailable")
+	}
+	if meshForwardAvailable(mk(boolPtr(true), "", "h"), "dev-b") {
+		t.Fatal("无身份钥 → unavailable")
+	}
+	if meshForwardAvailable(mk(boolPtr(true), "   ", "h"), "dev-b") {
+		t.Fatal("身份钥纯空白 → unavailable(TrimSpace 判空钉死,防退化成 ==\"\")")
+	}
+	if meshForwardAvailable(mk(boolPtr(true), "k", ""), "dev-b") {
+		t.Fatal("对端未钉扎 → unavailable (fail-closed)")
+	}
+	if meshForwardAvailable(mk(boolPtr(true), "k", "   "), "dev-b") {
+		t.Fatal("钉扎纯空白 → unavailable(TrimSpace 判空钉死,防退化成 ==\"\")")
+	}
+	if meshForwardAvailable(mk(boolPtr(true), "k", "h"), "dev-xyz") {
+		t.Fatal("peer 不在列表 → unavailable")
+	}
+}
+
+// TestMeshDNSForwardTargetRelayOnlyPeer DNS 代转发目标判据升级(SPEC §13.2 ③):
+// relay-only peer(跨 NAT,无 LAN 地址)不再被 len(LANAddrs)==0 静默关闭,
+// 目标照常返回,载体选择(直拨 vs piko)交 Transport 层。
+func TestMeshDNSForwardTargetRelayOnlyPeer(t *testing.T) {
+	cfg := &config.Config{
+		Customer: &config.CustomerConfig{
+			SSHIngress: sshIngressOn(),
+			Mesh: capableMesh(config.MeshPeer{
+				DeviceID: "dev-b",
+				Relay:    boolPtr(true),
+			}),
+		},
+	}
+	snapshot := NewRuntimeSnapshotForDecision(
+		NewSnapshotBranchCapabilities(true, false, false),
+		[]SnapshotRule{
+			NewSnapshotRule("r0", "dns", "all", true, SnapshotAction("toNode:dev-b")),
+		},
+		SnapshotActionDirect, false)
+	id, addrs, ok := meshDNSForwardTargetFromSnapshot(snapshot, cfg)
+	if !ok || id != "dev-b" {
+		t.Fatalf("relay-only peer = (%q, %v, %v), want (dev-b, ..., true)", id, addrs, ok)
+	}
+	if len(addrs) != 0 {
+		t.Fatalf("relay-only peer 无 LAN 载体, lanAddrs = %v, want 空", addrs)
 	}
 }

@@ -178,7 +178,7 @@ func TestReconcileCredentialReorderDoesNotRestart(t *testing.T) {
 	meshPub, _ := newTestKey(t)
 	extraPub, _ := newTestKey(t)
 
-	Reconcile(&RunConfig{AuthorizedKeys: []gossh.PublicKey{humanPub, extraPub}, MeshKeys: []gossh.PublicKey{meshPub}},
+	Reconcile(&RunConfig{AuthorizedKeys: []gossh.PublicKey{humanPub, extraPub}, MeshKeys: []MeshKey{{Key: meshPub, DeviceID: "dev-b"}}},
 		hostKeyPath, func() string { return "node-unit" })
 	if !IsRunning() {
 		t.Fatal("reconciled ingress must be running")
@@ -186,7 +186,7 @@ func TestReconcileCredentialReorderDoesNotRestart(t *testing.T) {
 	inflight := injectInflightConn(t)
 
 	// 同凭证集、列表顺序全反:期望态等价 → 不重启(在途连接存活)。
-	Reconcile(&RunConfig{AuthorizedKeys: []gossh.PublicKey{extraPub, humanPub}, MeshKeys: []gossh.PublicKey{meshPub}},
+	Reconcile(&RunConfig{AuthorizedKeys: []gossh.PublicKey{extraPub, humanPub}, MeshKeys: []MeshKey{{Key: meshPub, DeviceID: "dev-b"}}},
 		hostKeyPath, func() string { return "node-unit" })
 	if !IsRunning() {
 		t.Fatal("reconciled ingress must stay running across reorder")

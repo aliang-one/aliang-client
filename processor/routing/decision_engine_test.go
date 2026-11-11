@@ -12,7 +12,8 @@ import (
 
 func TestDecideRouteFromSnapshot_MeshCapabilityUnavailable(t *testing.T) {
 	// mesh 总开关显式关闭:即使 peers 列表含 dev-b,toNode 规则也不得
-	// 编译进快照——能力检查(总开关+peer 存在)在编译期把关。
+	// 编译进快照——能力检查(mesh 生效开关(含 SSH 入口依赖)+ 身份钥 +
+	// peer 存在且已钉扎,SPEC §13.2)在编译期把关。
 	cfg := &config.Config{
 		Customer: &config.CustomerConfig{
 			ProxyRules: []string{"domains,internal.corp,mesh:dev-b"},

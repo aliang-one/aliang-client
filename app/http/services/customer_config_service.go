@@ -120,6 +120,13 @@ func (s *CustomerConfigService) UpdateCommittedCustomerConfig(payload []byte) (*
 		return nil, &CustomerConfigValidationError{err: err}
 	}
 
+	// mesh↔SSH 入口依赖保存期硬拒(SPEC §10.3):开 mesh 必须开 SSH 入口,
+	// 与既有 ValidateMesh 同款包装。启动期不调本函数——降级走
+	// MeshEffectivelyEnabled 不阻断 boot。
+	if err := nextCfg.ValidateMeshDependency(); err != nil {
+		return nil, &CustomerConfigValidationError{err: err}
+	}
+
 	nextCfgRaw, err := json.Marshal(nextCfg)
 	if err != nil {
 		return nil, fmt.Errorf("marshal validated config: %w", err)
@@ -276,19 +283,21 @@ func ReconcileSSHIngressFromConfig(cfg *config.Config) {
 		sshin.Reconcile(nil, "", nil)
 		return
 	}
-	// LocalNodeID 注入缝:防环 AppendHop 读的节点标识经 AgentService
-	// currentDeviceID 活取(闭包绑定单例指针,读时求值);ForwardGate 留
-	// nil=全放行(凭证列表即 ACL)——customer.mesh 的转发门禁/ACL 随组网
-	// 分支落地后改注入门禁函数,spec §3 裁定与 inbound/ssh RunConfig.
-	// ForwardGate 注释互指(合并集成缝)。
+	// LocalNodeID 注入缝:本机节点标识(观测/日志身份)经 AgentService
+	// currentDeviceID 活取(闭包绑定单例指针,读时求值);防环 AppendHop
+	// 已随帧协议退役(SPEC §13.1),inbound/ssh 本包无读取方,注入保留是
+	// 为装配契约不断链。ForwardGate 已随 buildSSHIngressRunConfig 注入活
+	// 闭包(连接期读全局活值,见 buildSSHIngressRunConfig 注释)——门禁
+	// 切换不经重建即生效。
 	sshin.Reconcile(rc, hostKeyPath, GetSharedAgentService().currentDeviceID)
 }
 
 // ReconcileUnifiedIngressBinding 让统一入口 56432 的实际绑定地址跟上配置的
-// 期望地址(spec §6.2 / D2)。期望地址 = config.UnifiedIngressListenAddrFor:
-// mesh 总开关生效 → 0.0.0.0(对端 LAN 可拨入),否则回环。开/关组网会改变
-// 期望地址,而 listener 只在 StartMitmHttp 的绑定瞬间读一次地址——不重绑
-// 就等于开关不生效(开了组网却还只绑回环 = LAN 拨入被拒)。
+// 期望地址(spec §6.2 / D2,判据修订见 SPEC §5.5)。期望地址 =
+// config.UnifiedIngressListenAddrFor:ssh_ingress 开关决定绑定面(SPEC §5.5)
+// ——ssh 开 → 0.0.0.0(入口要 LAN 可达才能被对端拨入),否则回环。开/关
+// ssh_ingress 会改变期望地址,而 listener 只在 StartMitmHttp 的绑定瞬间读
+// 一次地址——不重绑就等于开关不生效(开了入口却还只绑回环 = LAN 拨入被拒)。
 //
 // 与 ReconcileSSHIngressFromConfig 同族、同调用点(customer 配置提交协调
 // 路径 + core/start/tray 启动防漂移),共享「期望态 → 运行态」语义。差别在
@@ -301,8 +310,9 @@ func ReconcileSSHIngressFromConfig(cfg *config.Config) {
 //     run service 的状态机(以及「停代理=停监听」的 D4 契约)。
 //  2. 地址确实不同——相同地址重启是纯抖动(断开在途 accept 面,收益为零)。
 //
-// 刻意的「模式无关」:绑定面只由 mesh 总开关决定(D2),与 HTTP/TUN 入口
-// 模式正交。不按模式加闸,避免「TUN 模式下 56432 恰在跑但绑错」这类漏修。
+// 刻意的「模式无关」:绑定面只由 ssh_ingress 开关决定(SPEC §5.5),与
+// HTTP/TUN 入口模式正交。不按模式加闸,避免「TUN 模式下 56432 恰在跑但
+// 绑错」这类漏修。
 //
 // 失败仅日志不上抛(同 ReconcileSSHIngressFromConfig):提交侧不因入口回滚
 // 整套配置,下次提交或下次起代理自然重试。
@@ -337,16 +347,31 @@ func sshIngressHostKeyPath() string {
 }
 
 // buildSSHIngressRunConfig 把归一化后的 customer.ssh_ingress 翻译成
-// inbound/ssh.RunConfig:authorized_keys 行逐条 gossh.ParseAuthorizedKey。
-// 单条解析失败跳过并 Warn——配置层 Validate 已在保存通道拦截,此处防御
-// 手改文件绕过校验的坏值(半坏配置按好部分继续跑)。两列表全部解析失败
-// 返回 nil,交给调用方按期望停处理。
+// inbound/ssh.RunConfig:authorized_keys 行逐条 gossh.ParseAuthorizedKey
+// (mesh 列表另经 parseSSHIngressMeshKeys 带出 device_id 尾注释)。单条
+// 解析失败跳过并 Warn——配置层 Validate 已在保存通道拦截,此处防御手改
+// 文件绕过校验的坏值(半坏配置按好部分继续跑)。两列表全部解析失败返回
+// nil,交给调用方按期望停处理。
+//
+// ForwardGate 连接期读全局活值(实施期修正):按次提交捕获会被 Reconcile
+// 的身份相等 no-op 冻结在旧 Server 里(runIdentity 不比 gate——只切
+// forward_enable 不动凭证/端口时新 RunConfig 被短路,门禁切换永不生效);
+// 全局读是真活视图——切了下一次连接就生效。GetGlobalConfig 读取有锁保护,
+// 并发提交窗口的「读到最新值」正是想要的语义,与 processor/tcp 消费路径
+// 同口径。nil 链 = mesh 未配置 = false(fail-closed,SPEC §10.1 决策 #14)。
 func buildSSHIngressRunConfig(effective *config.SSHIngressConfig) *sshin.RunConfig {
 	authorized := parseSSHIngressAuthorizedKeys("authorized_keys", effective.AuthorizedKeys)
-	mesh := parseSSHIngressAuthorizedKeys("mesh_authorized_keys", effective.MeshAuthorizedKeys)
-	if len(authorized) == 0 && len(mesh) == 0 {
+	meshKeys := parseSSHIngressMeshKeys(effective.MeshAuthorizedKeys)
+	if len(authorized) == 0 && len(meshKeys) == 0 {
 		logger.Warn("ssh_ingress enabled but no authorized key parses, ingress stays stopped")
 		return nil
+	}
+	gate := func() bool {
+		cfg := config.GetGlobalConfig()
+		if cfg == nil || cfg.Customer == nil || cfg.Customer.Mesh == nil {
+			return false
+		}
+		return cfg.Customer.Mesh.EffectiveForwardEnabled()
 	}
 	return &sshin.RunConfig{
 		// 专用口哨兵映射(spec §6.4 修订):0 与旧默认 56442 一律=跟随统一口
@@ -354,9 +379,9 @@ func buildSSHIngressRunConfig(effective *config.SSHIngressConfig) *sshin.RunConf
 		// 配置里的 56442 升级后不得凭空复活成专用口。
 		Port:           effectivePortForRunConfig(effective.Port),
 		AuthorizedKeys: authorized,
-		MeshKeys:       mesh,
-		// ForwardGate 合并集成缝,见 ReconcileSSHIngressFromConfig 注释。
-		ForwardGate: nil,
+		MeshKeys:       meshKeys,
+		// ForwardGate 恒注入(读全局活值,nil 链=fail-closed,见上注释)。
+		ForwardGate: gate,
 	}
 }
 
@@ -381,6 +406,21 @@ func parseSSHIngressAuthorizedKeys(field string, lines []string) []gossh.PublicK
 			continue
 		}
 		keys = append(keys, pub)
+	}
+	return keys
+}
+
+// parseSSHIngressMeshKeys 逐行解析 mesh_authorized_keys,保留尾注释为
+// device_id。坏行跳过+Warn(保存通道已拦,此处防御)。
+func parseSSHIngressMeshKeys(lines []string) []sshin.MeshKey {
+	keys := make([]sshin.MeshKey, 0, len(lines))
+	for _, line := range lines {
+		pub, comment, _, _, err := gossh.ParseAuthorizedKey([]byte(line))
+		if err != nil {
+			logger.Warn(fmt.Sprintf("ssh_ingress.mesh_authorized_keys key skipped (unparseable): %v", err))
+			continue
+		}
+		keys = append(keys, sshin.MeshKey{Key: pub, DeviceID: strings.TrimSpace(comment)})
 	}
 	return keys
 }

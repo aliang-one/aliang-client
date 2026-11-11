@@ -72,16 +72,28 @@ func HTTPProxyListenAddr() string {
 }
 
 // UnifiedIngressListenAddr 统一入口(56432,HTTP CONNECT/SSH/socks5/mesh 四
-// 族共用一个嗅探口)的运行期绑定地址(spec D2「绑定跟随启用面」)。
+// 族共用一个嗅探口)的运行期绑定地址(spec D2「绑定跟随启用面」,判据修订
+// 见 SPEC §5.5)。
 //
-// mesh 总开关生效(EffectiveEnabled,三态 nil=开)→ 0.0.0.0:组网流量靠对端
-// LAN 拨入才可达,绑回环等于把 LAN 载体静默废掉——与退役前的常驻 LAN 口
-// (56441 无主机限制)behavior parity。否则沿用 ServiceBindHost 的安全默认
-// 回环:不开组网就不放大本机暴露面。
+// 绑定面由 ssh_ingress 开关决定:ssh_ingress 开 → 0.0.0.0(SSH 入口要有
+// LAN 可达面才能被对端拨入,绑回环等于把入口静默废掉);否则沿用
+// ServiceBindHost 的安全默认回环。旧判据是 mesh 总开关,mesh 收敛进 SSH
+// 入口后该判据在新模型下两边都错:开 ssh 关 mesh → 绑回环则 LAN 拨不进;
+// 开 mesh 关 ssh(保存期被 ValidateMeshDependency 硬拒,存量降级配置仍可能
+// 命中)→ 白绑 0.0.0.0 把 HTTP 代理面暴露到 LAN。
+//
+// 对称新风险(SPEC §5.5.1):ssh 开、mesh 关的用户,56432 绑 0.0.0.0 后
+// HTTP 代理面(socks5/CONNECT)随入口一起暴露到 LAN——会话租约
+// (AcquireProxyLease/CanProxy)仍是硬闸,无会话者拿不到代理;该风险将随
+// 发布说明明写(§5.5.1)。
+//
+// 判据不经 MeshEffectivelyEnabled:那是 mesh 出口的生效门(ssh 关时恒
+// false),若作绑定判据会把 ssh 开+mesh 关的用户误收回环。
 //
 // 每次调用现读全局配置与 serviceBindHost,故配置提交后本函数的返回值可能
-// 变化——绑定变更由 app 层 reconcile 钩子比对并重启 listener(在途连接不
-// 受影响),本函数只负责给出「此刻应有的地址」。
+// 变化——绑定变更由 app 层 reconcile 钩子(ReconcileUnifiedIngressBinding)
+// 比对并重启 listener(在途连接不受影响),本函数只负责给出「此刻应有的
+// 地址」。
 func UnifiedIngressListenAddr() string {
 	return UnifiedIngressListenAddrFor(GetGlobalConfig())
 }
@@ -92,8 +104,8 @@ func UnifiedIngressListenAddr() string {
 // 先后顺序」依赖——两处口径永远同源。
 func UnifiedIngressListenAddrFor(cfg *Config) string {
 	host := ServiceBindHost()
-	if cfg != nil && cfg.Customer != nil && cfg.Customer.Mesh != nil && cfg.Customer.Mesh.EffectiveEnabled() {
-		host = "0.0.0.0" // mesh 开 = LAN 组网可达(退役前 LAN 载体 parity)
+	if cfg != nil && cfg.Customer != nil && cfg.Customer.SSHIngress.IsEnabled() {
+		host = "0.0.0.0" // LAN 可达面由 ssh_ingress 决定(SPEC §5.5;对称风险见发布说明)
 	}
 	return net.JoinHostPort(host, fmt.Sprintf("%d", DefaultHTTPProxyPort))
 }

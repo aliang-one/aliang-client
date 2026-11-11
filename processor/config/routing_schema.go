@@ -71,14 +71,14 @@ func newRoutingSchemaValidationError(code string, field string, message string) 
 	}
 }
 
-func NormalizeRoutingSchemaJSON(input []byte) (*CanonicalRoutingSchema, error) {
+func NormalizeRoutingSchemaJSON(input []byte, mesh *MeshConfig) (*CanonicalRoutingSchema, error) {
 	var root map[string]json.RawMessage
 	if err := json.Unmarshal(input, &root); err != nil {
 		return nil, fmt.Errorf("failed to parse routing schema JSON: %w", err)
 	}
 
 	if _, ok := root["ingress"]; ok {
-		return normalizeCanonicalPayload(input)
+		return normalizeCanonicalPayload(input, mesh)
 	}
 
 	if len(root) == 0 {
@@ -96,7 +96,7 @@ func NormalizeRoutingSchemaJSON(input []byte) (*CanonicalRoutingSchema, error) {
 	return nil, fmt.Errorf("unsupported legacy keys %v; migrate to canonical keys ingress/egress/routing", legacyKeys)
 }
 
-func normalizeCanonicalPayload(input []byte) (*CanonicalRoutingSchema, error) {
+func normalizeCanonicalPayload(input []byte, mesh *MeshConfig) (*CanonicalRoutingSchema, error) {
 	var cfg CanonicalRoutingSchema
 	decoder := json.NewDecoder(bytes.NewReader(input))
 	decoder.DisallowUnknownFields()
@@ -131,14 +131,21 @@ func normalizeCanonicalPayload(input []byte) (*CanonicalRoutingSchema, error) {
 		cfg.Routing.DefaultEgress = normalizedDefault
 	}
 
-	if err := cfg.Validate(); err != nil {
+	if err := cfg.Validate(mesh); err != nil {
 		return nil, err
 	}
 
 	return &cfg, nil
 }
 
-func (cfg *CanonicalRoutingSchema) Validate() error {
+// Validate canonical 路由 schema 的保存期校验。mesh 参数是 peers 上下文(nil
+// 安全,视为无 peers):fallback 段 id2 的钉扎检查需要 peers,但本 schema 载荷
+// 本身不携带 mesh——两种取法:apply 管线取当前生效配置的 customer.mesh
+// (routing_apply_state effectiveMeshForRoutingValidation),runtime-inputs
+// 编译路径取传入 cfg 的 mesh(新配置、尚未全局)。主目标的 peer 存在性/钉扎
+// 仍归编译层(meshForwardAvailable),本函数只拦 fallback 段的必败形态
+// (见 mesh 分支注释)。
+func (cfg *CanonicalRoutingSchema) Validate(mesh *MeshConfig) error {
 	if cfg.Ingress.Mode != "tun" && cfg.Ingress.Mode != "http" {
 		return newRoutingSchemaValidationError("invalid_enum", "ingress.mode", fmt.Sprintf("must be one of [tun http], got %q", cfg.Ingress.Mode))
 	}
@@ -173,13 +180,30 @@ func (cfg *CanonicalRoutingSchema) Validate() error {
 			}
 		default:
 			// mesh 转发目标 toNode:<deviceID>[:direct|:deny|:fallback:<deviceID2>]
-			// (Task 7 策略 grammar):本层只做形态校验(deviceID 非空、策略段
-			// 白名单、fallback 目标非空);能力校验(mesh 总开关 + peer 存在)在
-			// 运行输入编译层(processor/routing,见 meshForwardAvailable)把关。
+			// (Task 7 策略 grammar):本层只做形态校验(fallback 段 id2 的钉扎
+			// 复核除外,见下)——deviceID 非空、策略段白名单、fallback 目标非空;
+			// 能力校验(mesh 生效开关(含 SSH 入口依赖)+ 身份钥 + peer 存在且
+			// 已钉扎,SPEC §13.2)在运行输入编译层(processor/routing,见
+			// snapshot_mesh.go meshForwardAvailable)把关。
 			if deviceID, policy, isMesh := ParseMeshRuleTarget(target); isMesh {
 				if deviceID == "" || !isValidMeshPolicy(policy) {
 					return newRoutingSchemaValidationError("invalid_target", targetField,
 						fmt.Sprintf("invalid mesh target %q: want toNode:<deviceID>[:direct|:deny|:fallback:<deviceID2>]", target))
+				}
+				// fallback 段的 id2 若也配置在 peers 里,其 host_key 必须已钉扎(fail-closed
+				// 与主目标同口径);不在 peers 里则运行期失败策略收口,不在此拦。
+				if id2, isFb := strings.CutPrefix(policy, MeshPolicyFallback+":"); isFb && id2 != "" {
+					var peers []MeshPeer
+					if mesh != nil {
+						peers = mesh.Peers
+					}
+					for j := range peers {
+						p := &peers[j]
+						if strings.TrimSpace(p.DeviceID) == id2 && strings.TrimSpace(p.HostKey) == "" {
+							return newRoutingSchemaValidationError("invalid_target", targetField,
+								fmt.Sprintf("mesh fallback peer %q is configured but has empty host_key (pin required)", id2))
+						}
+					}
 				}
 				continue
 			}
