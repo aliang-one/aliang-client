@@ -25,6 +25,7 @@ require (
 	github.com/modelcontextprotocol/go-sdk v1.8.0
 	github.com/oschwald/geoip2-golang v1.9.0
 	github.com/pion/stun v0.6.1
+	github.com/quic-go/quic-go v0.59.0
 	github.com/sagernet/gvisor v0.0.0-20250325023245-7a9c0f5725fb
 	github.com/sagernet/sing v0.7.13
 	github.com/sagernet/sing-box v1.12.12
@@ -131,7 +132,6 @@ require (
 	github.com/prometheus/common v0.66.1 // indirect
 	github.com/prometheus/procfs v0.16.1 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
-	github.com/quic-go/quic-go v0.59.0 // indirect
 	github.com/sagernet/fswatch v0.1.1 // indirect
 	github.com/sagernet/netlink v0.0.0-20240612041022-b9a21c07ac6a // indirect
 	github.com/sagernet/nftables v0.3.0-beta.4 // indirect
