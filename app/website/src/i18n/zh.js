@@ -971,6 +971,7 @@ export default {
   sshIngress_privKeyCopied: '已复制',
   sshIngress_privKeyConnectExample: '连接示例：ssh -D 1080 -i <下载的.pem> 任意用户名@<节点IP> -p 56432（用户名随意，鉴权只认公钥）',
   sshIngress_keygenFailed: '密钥生成失败，请重试。',
+  sshIngress_privKeyClose: '关闭',
 
   // -- MeshSettings（mesh 组网卡;键集与 en.js 必须相等,i18n.test.js 守卫）--
   mesh_title: '节点组网',

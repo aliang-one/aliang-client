@@ -972,6 +972,7 @@ export default {
   sshIngress_privKeyCopied: 'Copied',
   sshIngress_privKeyConnectExample: 'Connect: ssh -D 1080 -i <downloaded .pem> anyuser@<node IP> -p 56432 (username is arbitrary; auth is pubkey-only)',
   sshIngress_keygenFailed: 'Key generation failed, please retry.',
+  sshIngress_privKeyClose: 'Close',
 
   // -- MeshSettings (mesh card; key set must equal zh.js, guarded by i18n.test.js) --
   mesh_title: 'Node Mesh',

@@ -499,7 +499,16 @@ describe('SshIngressSettings 卡片', () => {
       'sshIngress_bindHostHint',
       'sshIngress_validationNeedKey',
       'sshIngress_save',
-      'sshIngress_saving'
+      'sshIngress_saving',
+      'sshIngress_oneClick',
+      'sshIngress_privKeyTitle',
+      'sshIngress_privKeyOnceWarning',
+      'sshIngress_privKeyDownload',
+      'sshIngress_privKeyCopy',
+      'sshIngress_privKeyCopied',
+      'sshIngress_privKeyConnectExample',
+      'sshIngress_keygenFailed',
+      'sshIngress_privKeyClose'
     ];
     for (const key of sshIngressKeys) {
       expect(typeof zh[key], `zh.${key}`).toBe('string');
@@ -542,14 +551,9 @@ describe('SshIngressSettings 一键生成并启用', () => {
 
   it('一键流：keygen → 公钥插队头+enable=true → emit save（整配置透传）', async () => {
     stubFetchRouted(() => jsonResponse(keygenEnvelope(keygenPayload())));
-    const saved = [];
-    const el = document.createElement('div');
-    document.body.appendChild(el);
-    const app = createApp({ render: () => h(SshIngressSettings, { config: baseConfig(), onSave: (p) => saved.push(p) }) });
-    // 注意：props 展开进 h() 后是快照、非响应——本例只断言 emit 载荷不受影响；
-    // 需要模拟父层回流的用例用 mountLive（逐键读 reactive）
-    app.mount(el);
-    mountedApps.push({ app, el });
+    // 注意：mountCard 的 props 展开进 h() 后是快照、非响应——本例只断言 emit
+    // 载荷不受影响；需要模拟父层回流的用例用 mountLive（逐键读 reactive）
+    const { el, saved } = mountCard(baseConfig());
     await flush();
 
     el.querySelector('button[data-ssh-oneclick]').click();
@@ -559,6 +563,34 @@ describe('SshIngressSettings 一键生成并启用', () => {
     expect(saved[0].ssh_ingress.enable).toBe(true);
     expect(saved[0].ssh_ingress.authorized_keys[0]).toBe(keygenPayload().public_key);
     expect(saved[0].proxy).toEqual(baseConfig().proxy); // 整配置透传不丢段
+  });
+
+  it('双击防重：keygen 在途期间第二次点击不产生第二个请求', async () => {
+    let postCount = 0;
+    let resolveKeygen;
+    vi.stubGlobal('fetch', vi.fn((url, opts) => {
+      if ((opts?.method || 'GET') === 'POST' && String(url).includes('/ssh-ingress/keygen')) {
+        postCount += 1;
+        return new Promise((res) => { resolveKeygen = res; });
+      }
+      return Promise.resolve(jsonResponse(hostkeyEnvelope(hostkeyPayload())));
+    }));
+    const saved = [];
+    const el = document.createElement('div');
+    document.body.appendChild(el);
+    const app = createApp({ render: () => h(SshIngressSettings, { config: baseConfig(), onSave: (p) => saved.push(p) }) });
+    app.mount(el);
+    mountedApps.push({ app, el });
+    await flush();
+
+    el.querySelector('button[data-ssh-oneclick]').click(); // 第 1 击：fetch 挂起
+    el.querySelector('button[data-ssh-oneclick]').click(); // 第 2 击：在途旗标拦截
+    expect(postCount).toBe(1);
+
+    resolveKeygen(jsonResponse(keygenEnvelope(keygenPayload())));
+    await flush();
+    expect(saved).toHaveLength(1);
+    expect(saved[0].ssh_ingress.authorized_keys[0]).toBe(keygenPayload().public_key);
   });
 
   it('保存成功回流（successMessage 变非空+pending 在）→ 私钥弹窗渲染全文+下载+复制', async () => {

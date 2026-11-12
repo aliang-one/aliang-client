@@ -224,13 +224,13 @@
 
     <!-- 私钥一次性弹窗（spec §2.3）：全文+下载+复制+连接示例；关闭即清零
          持久化（state 同步清,不写 localStorage/日志）。 -->
+    <!-- 背景点击不关闭：私钥不可恢复,须显式点关闭（spec §2.3 已知取舍） -->
     <div
       v-if="privKeyModal"
       class="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
       data-ssh-privkey-modal
       role="dialog"
       aria-modal="true"
-      @click.self="closePrivKeyModal"
     >
       <div class="flex w-full max-w-xl flex-col gap-4 rounded-xl border border-slate-200 bg-white p-5 shadow-xl dark:border-slate-700 dark:bg-slate-900">
         <div class="flex items-center justify-between">
@@ -239,7 +239,7 @@
             type="button"
             class="text-slate-400 transition hover:text-slate-600 dark:hover:text-slate-200"
             data-ssh-privkey-close
-            :aria-label="t('sshIngress_privKeyTitle')"
+            :aria-label="t('sshIngress_privKeyClose')"
             @click="closePrivKeyModal"
           >
             <span class="material-symbols-outlined">close</span>
@@ -259,7 +259,6 @@
           <a
             class="inline-flex min-h-11 items-center gap-1.5 rounded border border-slate-200 px-3 text-xs font-semibold text-slate-600 transition hover:border-primary/30 hover:text-primary dark:border-slate-700 dark:text-slate-300"
             data-ssh-privkey-download
-            download
             :href="privKeyDownloadHref"
             :download="keygenResult?.suggested_filename || 'aliang-ingress-key.pem'"
           >
@@ -356,6 +355,7 @@ export default {
       copied: false,
       copiedTimer: null,
       keygenPending: null,   // 一键流暂存：keygen 结果，保存成功后转 keygenResult
+      keygenInFlight: false, // keygen fetch 在途旗标：封死双击窗口（try/finally 归位）
       keygenResult: null,    // 弹窗展示中的私钥载荷；关闭即清，零持久化
       privKeyModal: false,
       privKeyCopied: false,
@@ -536,15 +536,15 @@ export default {
     // 走 localError 红框；保存结果由父层 error/successMessage props 回流,
     // watch 方向语义见 watch 注释。
     async oneClickSetup() {
-      if (this.loading || this.saving) {
-        return;
-      }
       // 双击防重：loading/saving 是父层保存态,keygen fetch 在途时不置位——
-      // 在途 keygenPending 直接 return,防双击产生两把钥匙把第一把挤成无主
-      if (this.keygenPending) {
+      // 以 keygenInFlight 在途旗标封死整个 fetch 窗口（在途第二次点击直接
+      // return）,防两把钥匙把第一把挤成无主;keygenPending 再兜住 resolve
+      // 后→保存回流前的窗口,两旗标合围全周期
+      if (this.loading || this.saving || this.keygenInFlight || this.keygenPending) {
         return;
       }
       this.localError = '';
+      this.keygenInFlight = true;
       try {
         const res = await fetch('/api/proxy/ssh-ingress/keygen', { method: 'POST', credentials: 'same-origin' });
         const json = await res.json().catch(() => null);
@@ -556,8 +556,10 @@ export default {
         this.form.authorizedKeys = [key.public_key, ...this.form.authorizedKeys.filter((k) => k !== key.public_key)];
         this.form.enabled = true;
         this.save();
-      } catch (err) {
+      } catch (_) {
         this.localError = this.t('sshIngress_keygenFailed');
+      } finally {
+        this.keygenInFlight = false;
       }
     },
     closePrivKeyModal() {
@@ -574,13 +576,16 @@ export default {
         return;
       }
       const ok = await copyText(this.keygenResult.private_key);
-      this.privKeyCopied = ok;
+      if (!ok) {
+        return;
+      }
+      this.privKeyCopied = true;
       if (this.privKeyCopyTimer) {
         clearTimeout(this.privKeyCopyTimer);
       }
       this.privKeyCopyTimer = setTimeout(() => {
         this.privKeyCopied = false;
-      }, 2000);
+      }, 1500);
     },
     // 提交载荷：整配置透传 + ssh_ingress 覆盖（ModelMappingSettings/PeerMCPSettings
     // 同款）。端口取输入:留空发 0(=跟随统一口 56432),显式端口原样(后端翻译
