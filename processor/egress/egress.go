@@ -1,10 +1,11 @@
 // Package egress 统一自身流量(登录/扫码/激活/刷新/用量/软件更新)的 HTTP
-// 出口(design docs/mesh-forwarding-network-design.md §9.4 兜底式的 egress
-// 变体,计划 Task 11):默认纯直连(与裸 http.Client 在线行为零变化),
-// 仅当离线信号为真、离线兜底配置显式使能、self 类别勾选、且有可用 mesh
-// peer 时(§9.4「平台不可达才兜底」),平台流量才优先经 B 节点出口
-// (仍然到达平台,经 B 中转)——这是 opt-in 配置的行为契约;未配置兜底
-// 的设备完全不受影响。
+// 出口。出口链路形态(2026-11-12,替代旧「离线兜底」):开关开
+// (customer.mesh.fallback.enable + next_hop 指向已钉扎 peer)时,平台流量
+// 常驻经链上下一跳出口(下一跳也开着就继续往前链)——触发无条件,不按
+// 本机能否直连平台做限制(离线信号缝已随旧门控移除);下一跳故障时
+// 对外流量如实失败、错误回源,不回落 direct(开关=出口完全依赖下一跳,
+// 发布说明已写明取舍)。开关关 = 纯直连,与裸 http.Client 在线行为零变化;
+// 未配置的设备完全不受影响。
 package egress
 
 import (
@@ -16,7 +17,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"aliang.one/nursorgate/common/logger"
 	M "aliang.one/nursorgate/inbound/tun/metadata"
 	"aliang.one/nursorgate/outbound/meshproto"
 	mesh "aliang.one/nursorgate/outbound/proxy/mesh"
@@ -52,73 +52,39 @@ func peerFromSource() mesh.Dialer {
 	return fn()
 }
 
-// offlineSignal 离线信号注入缝(与 peerSource 同模式):design §9.4 定死
-// 「平台不可达才兜底」——在线设备即使配好兜底也一律直连。信号未接线
-// (nil)视为在线(保守:不激活 mesh 轨,不吞直连路径)。生产接线 Task 14
-// 从隧道状态取;**共用契约:Task 12 的 AI 离线改道消费同一信号源**,
-// 两处判定必须同源同真假,否则会出现「自身流量经 B 而 AI 流量直连」的
-// 分裂形态。
-var offlineSignal atomic.Value // func() bool
-
-// SetOfflineSignal 注入离线信号提供器(true=平台不可达,激活兜底轨);
-// nil = 清除(未接线 = 视为在线 = 纯 direct)。并发安全。
-func SetOfflineSignal(fn func() bool) {
-	if fn == nil {
-		fn = func() bool { return false }
-	}
-	offlineSignal.Store(fn)
-}
-
-func isOffline() bool {
-	fn, _ := offlineSignal.Load().(func() bool)
-	if fn == nil {
-		return false
-	}
-	return fn()
-}
-
-// OfflineSignalForTest / PeerSourceForTest 读回两条注入缝的当前值:生产读方
-// 走 isOffline/peerFromSource;导出仅供 app/tunnel 装配断言测试把「两缝同源
-// 同真假」「peer 源已接线」从注释升级为测试钉子(Task 14)。
-func OfflineSignalForTest() bool     { return isOffline() }
+// PeerSourceForTest 读回注入缝的当前值:生产读方走 peerFromSource;导出
+// 仅供 app/tunnel 装配断言测试把「peer 源已接线」从注释升级为测试钉子。
 func PeerSourceForTest() mesh.Dialer { return peerFromSource() }
 
-// meshFallbackSelfActive 兜底门(design §9.4「平台不可达才兜底」),逐连接
-// 读取。配置四条件(总开关 EffectiveEnabled + Fallback.Enable + self ∈
-// Classes + Addr 非空)统一走共享助手 config.MeshFallbackActiveForClass
-// (计划 Task 12 评审钉死的三消费方抽取;对等消费方见 processor/tcp
-// meshFallbackAddrForClass 与 AI 离线改道 meshOfflineRedirectForAI,
-// processor/routing meshForwardAvailable 语义不同不并入),再叠加本消费方
-// 特有的离线信号(信号驱动,接线归 Task 14,与 processor/tcp
-// SetMeshOfflineSignal 共用同一 manager 状态 getter)。
-//
-// 抽取带来的语义收紧:助手含 Addr 非空检查(原 egress 闸无此条)——
-// Enable=true 而 Addr 空的配置本就被 Config.Validate 拒绝,此处只是防御
-// 手改配置文件的漏网形态,行为面不变。兜底随信号起落:平台恢复可达 →
-// 信号翻假 → mesh 轨自动退位回直连。peer 的可用性归注入缝的提供器判定。
-func meshFallbackSelfActive() bool {
-	_, ok := config.MeshFallbackActiveForClass(config.GetGlobalConfig(), meshproto.ClassSelf)
-	return ok && isOffline()
+// meshDelegateActive 出口链路门(2026-11-12,替代旧兜底门),逐连接读取:
+// config.MeshDelegateNextHop 判定(开关开 ∧ next_hop 指向已钉扎 peer ∧
+// mesh 生效依赖满足)。触发为常驻语义——开关即无条件改道,不叠加任何
+// 在线/离线信号。
+func meshDelegateActive() bool {
+	_, ok := config.GetGlobalConfig().MeshDelegateNextHop()
+	return ok
 }
 
-// platformDialContext 双轨判定(design §9.4 兜底式):
+// platformDialContext 出口链路判定(2026-11-12):
 //
-//	离线信号真 + 兜底使能 + self 勾选 + 有可用 peer → 先 mesh
-//	  (ExitClient.DialContext,WithClass(ClassSelf),target=域名:端口——域名
-//	  直转语义:不本地解析,主机名原样进 payload,末跳代解析);mesh 任一
-//	  失败 → direct 重试一次,失败即失败(不循环);
-//	其余(在线/未配置/无 peer)→ 纯 direct(现状,在线行为零变化)。
+//	开关关/下一跳不合法 → 纯 direct(旧行为零变化);
+//	开关开 → mesh 委托(ExitClient.DialContext,WithClass(ClassSelf),
+//	  target=域名:端口——域名直转语义:不本地解析,主机名原样进 payload,
+//	  末跳代解析);拨号失败如实失败,不回落 direct。
 //
 // 域名直转的 TLS 语义:mesh 拨出的是到目标 443 的原始 TCP 流,TLS 握手
 // 在 http.Transport 层照常发生(SNI=平台域名)——B 侧按其规则处理,链路
-// 成立(与 Task 6 注入管线同构),无需特殊处理。
+// 成立(与注入管线同构),无需特殊处理。
 func platformDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
-	if !meshFallbackSelfActive() {
+	if !meshDelegateActive() {
 		return directDialer.DialContext(ctx, network, addr)
 	}
 	peer := peerFromSource()
 	if peer == nil {
-		return directDialer.DialContext(ctx, network, addr)
+		// 门开但 peer 源未接线/构造失败:开关语义=出口完全依赖下一跳,
+		// 不回落 direct(静默绕链会让「开了开关却没走链」不可见),错误
+		// 回源让装配断链立刻暴露(fail-loud)。
+		return nil, fmt.Errorf("egress: delegate active but peer source unavailable (target=%s)", addr)
 	}
 	host, portStr := hostPortWithDefault(addr)
 	port, _ := strconv.Atoi(portStr) // 拆分失败/非数字时留 0,由 mesh 侧 443 兜底
@@ -127,16 +93,7 @@ func platformDialContext(ctx context.Context, network, addr string) (net.Conn, e
 		&M.Metadata{HostName: host, DstPort: uint16(port)},
 	)
 	if err != nil {
-		// mesh 失败 → direct 重试一次:兜底是可用性增强,不能把可达的
-		// 平台流量拖死在坏 mesh 路径上;direct 再失败即如实失败。交界处
-		// Warn 一条——离线排障是本特性存在的理由,mesh 轨为何没接住
-		// 必须在日志里可见。
-		dconn, derr := directDialer.DialContext(ctx, network, addr)
-		if derr != nil {
-			return nil, fmt.Errorf("egress: mesh 路由失败: %w; direct 兜底亦失败: %w", err, derr)
-		}
-		logger.Warn(fmt.Sprintf("egress: mesh 路由失败,回落 direct(target=%s): %v", addr, err))
-		return dconn, nil
+		return nil, fmt.Errorf("egress: delegate dial via mesh failed (target=%s): %w", addr, err)
 	}
 	return conn, nil
 }
@@ -165,7 +122,7 @@ var platformTransport = func() *http.Transport {
 
 // PlatformClient 返回自身流量(登录/用量/更新等平台调用)统一出口的
 // HTTP 客户端:Timeout 语义与裸 http.Client 一致,由调用方传入;底层
-// Transport 共享,双轨判定见 platformDialContext。
+// Transport 共享,出口链路判定见 platformDialContext。
 func PlatformClient(timeout time.Duration) *http.Client {
 	return &http.Client{Transport: platformTransport, Timeout: timeout}
 }

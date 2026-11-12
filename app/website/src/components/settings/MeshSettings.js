@@ -2,21 +2,19 @@
 // 解析逻辑，.vue=卡片骨架；import 一律带显式扩展名避免同名解析歧义）。
 // 线格式 customer.mesh 与后端 processor/config types.go MeshConfig 对齐：
 // {enable, forward_enable, max_hops, peers:[{device_id,lan_addrs,relay,host_key?}],
-//  fallback:{enable,classes,addr,host_key?}, private_key?, key_passphrase?}
+//  fallback:{enable,next_hop}, private_key?, key_passphrase?}
 // ——带 ? 的密钥字段只透传不默认（空串/缺键不落键,见各函数内注释）。
+// 出口链路(2026-11-12):旧 fallback 字段(classes/addr/host_key)不再读取,
+// 保存时字面量整体替换为一并清除。
 //
 // 三态布尔语义（定死，与后端 Effective* 同源）：
 //   enable          nil → true   （mesh 是直连之上的增量出口，升级不许静默关）
 //   forward_enable  nil → false  （被转发是让渡型能力，默认关）
 //   peer.relay      nil → true   （LAN 不可达时允许走中继载体）
-//   fallback.enable nil → false  （离线兜底默认关）
+//   fallback.enable nil → false  （出口链路默认关）
 // 读侧恒产出显式布尔（ssh_ingress「恒产出显式」先例）：保存 patch 才不会
 // 因缺键被后端 deep-merge 静默吞掉——⚠️ 不要把这里「改回」三态透传，那会
 // 重现 peer_mcp「保存 200 但永不落盘」缺陷族。
-
-// 兜底流量类别（后端 meshproto ClassAI/ClassSelf/ClassCustom；design §9.4
-// 勾选序 = AI / 自身 / 自定义）。导出供卡片勾选框与测试共用，勿内联字面量。
-export const MESH_FALLBACK_CLASSES = ['ai', 'self', 'custom'];
 
 // 与后端 meshproto DefaultHops=5 / MaxHopsCap=8 对齐,语义=后端
 // EffectiveMaxHops 读侧同款收口：≤0/非数归 0（=用后端默认 5）；>8 钳到 8
@@ -63,22 +61,11 @@ function normalizeMeshPeers(raw) {
 
 function normalizeMeshFallback(raw) {
   const source = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
-  const classes = [];
-  const rawClasses = Array.isArray(source.classes) ? source.classes : [];
-  for (const item of rawClasses) {
-    const value = String(item ?? '').trim();
-    // 只认三个合法类别，规整 + 去重；后端 Validate 对非法类别整单拒绝，
-    // 读侧剔除是防御手改配置文件漏进来的垃圾。
-    if (MESH_FALLBACK_CLASSES.includes(value) && !classes.includes(value)) {
-      classes.push(value);
-    }
-  }
   return {
     enable: typeof source.enable === 'boolean' ? source.enable : false,
-    classes,
-    addr: typeof source.addr === 'string' ? source.addr.trim() : '',
-    // 密钥透传（SPEC §13.3.1）：host_key 空串不落键（同上,「没有密钥」省缺）
-    ...(source.host_key ? { host_key: String(source.host_key) } : {})
+    // 出口链路下一跳(2026-11-12):须为 peers 中已钉扎节点,后端保存期校验;
+    // 旧版字段(classes/addr/host_key)不再读取,保存字面量整体替换即清除。
+    next_hop: typeof source.next_hop === 'string' ? source.next_hop.trim() : ''
   };
 }
 

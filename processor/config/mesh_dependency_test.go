@@ -66,29 +66,7 @@ func TestValidateMeshDependencyFourCombos(t *testing.T) {
 	}
 }
 
-func TestMeshFallbackHostKey(t *testing.T) {
-	on := true
-	cfg := &Config{Customer: &CustomerConfig{Mesh: &MeshConfig{
-		Fallback: &MeshFallbackConfig{Enable: &on, Addr: "1.2.3.4:56432", HostKey: " SHA256:x "},
-	}}}
-	if got := MeshFallbackHostKey(cfg); got != "SHA256:x" {
-		t.Fatalf("want trimmed SHA256:x, got %q", got)
-	}
-	if got := MeshFallbackHostKey(nil); got != "" {
-		t.Fatalf("nil cfg → empty, got %q", got)
-	}
-	t.Run("Fallback块缺失", func(t *testing.T) {
-		blank := &Config{Customer: &CustomerConfig{Mesh: &MeshConfig{}}}
-		if got := MeshFallbackHostKey(blank); got != "" {
-			t.Fatalf("nil Fallback → empty, got %q", got)
-		}
-	})
-	t.Run("HostKey纯空白", func(t *testing.T) {
-		ws := &Config{Customer: &CustomerConfig{Mesh: &MeshConfig{
-			Fallback: &MeshFallbackConfig{Enable: &on, Addr: "1.2.3.4:56432", HostKey: "   "},
-		}}}
-		if got := MeshFallbackHostKey(ws); got != "" {
-			t.Fatalf("纯空白 HostKey → empty(fail-closed 默认值), got %q", got)
-		}
-	})
-}
+// (TestMeshFallbackHostKey 已随出口链路改造移除:fallback.host_key 独立
+// 字段不再存在,下一跳钉扎从 peers 条目继承,校验归
+// TestMeshValidateFallbackNextHopRequired / TestMeshDelegateNextHopUnpinnedPeerFailsClosed
+// 见 mesh_fallback_gate_test.go。)

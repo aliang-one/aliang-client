@@ -1,14 +1,12 @@
 // mesh 生产装配(Task 14,design docs/mesh-forwarding-network-design.md):
 // 本文件收口三条装配线——
 //
-//   - egress 兜底 peer 源(egress.SetPeerSource):从当前全局配置
-//     customer.mesh.Peers[0] 装配 ExitClient(SPEC §5.1),未配置/总开关关/
-//     SSH 依赖降级/空 peers/缺身份 → nil(egress 纯直连)。闭包读调用时刻
-//     的配置,保存即生效,不缓存快照。
-//   - 离线信号两缝(egress.SetOfflineSignal + tcp.SetMeshOfflineSignal):
-//     同一 manager 隧道状态 getter(TunnelSessionActive)同位接线——同源同
-//     真假契约(两缝注释互指,Task 12 评审钉死):漏接 tcp 缝 = AI 改道永久
-//     静默休眠;两缝取值分裂 = 「自身流量经 B 兜底而 AI 流量仍撞死隧道」。
+//   - egress 委托 peer 源(egress.SetPeerSource):出口链路下一跳
+//     (config.MeshDelegateNextHop:开关开 ∧ next_hop 指向已钉扎 peer)装配
+//     ExitClient,不满足 → nil(egress 纯直连)。闭包读调用时刻的配置,
+//     保存即生效,不缓存快照。
+//   - tcp 本机节点标识缝(tcp.SetMeshSelfIDSource):via 防环链的追加与
+//     判定要本机 device_id(与 inbound/ssh LocalNodeID 同源同值)。
 //   - TUN DNS 代转发对端源(tunnel.T().SetMeshDNSForwardPeerSource):规则
 //     驱动(routing.MeshDNSForwardTarget 10s memo 取首条启用 dns,mesh:<id>
 //     规则),装配 ExitClient 交给 TUN 单例消费(2026-11-12 接线,SPEC §9)。
@@ -49,51 +47,22 @@ import (
 // meshLANPollInterval 装配对账轮询周期(测试经 startMeshLANAssembly 缩短)。
 const meshLANPollInterval = 5 * time.Second
 
-// TunnelSessionActive 隧道状态 getter(egress/tcp 两缝同接的本体):当前是否
-// 存在活跃隧道会话。connecting/connected/reconnecting 均算活跃(cancel 已
-// 立、会话未终结);failed/stopped/从未配置 → false。离线信号语义
-// (true=平台不可达)即 !TunnelSessionActive():connecting 期计在线是保守
-// 取向——半建立的会话不触发兜底/改道翻搅,真失败会很快落到 failed 翻真。
-// Configure 续期窗口(cancel 置 nil 到新 cancel 落位,最长 10s)内信号瞬时
-// 翻真属预期——隧道确实不在,有界自愈。
-func (m *Manager) TunnelSessionActive() bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.cancel != nil
-}
-
-// meshOfflineSignal 构造两缝共用的离线信号闭包:单一代码点物化「同源同
-// 真假」契约,validateConfig 把同一闭包值分别交给 egress/tcp 两条 Set*。
-func (m *Manager) meshOfflineSignal() func() bool {
-	return func() bool { return !m.TunnelSessionActive() }
-}
-
-// egressPeer 从当前全局配置装配 egress 兜底 peer(Peers[0]):SSH 依赖降级
-// 由 MeshEffectivelyEnabled 承担(SPEC §10.3);私钥缺失 → nil(构造期解析
-// 即失败);钉扎缺失 → 出口仍成立但拨号恒拒(fail-closed,SPEC §10.4)。
-// ExitClient 每次调用重建——离线兜底触发频率低,构造期解析私钥开销可接受
-// (SPEC 计划决策 #1)。LANAddrs 逐项过滤空白后拷贝(不共享配置切片),
-// Relay 缺省放行,PikoDial 取 manager 的 dialMeshEndpoint(每次拨号读当前
-// proxy url/token)。
+// egressPeer 从当前全局配置装配 egress 出口链路下一跳 peer:开关开且
+// next_hop 指向已钉扎 peer(config.MeshDelegateNextHop,含 SSH 依赖降级与
+// 总开关判定)才成立,否则 nil(egress 纯直连)。ExitClient 每次调用重建
+// ——委托触发频率=平台调用粒度,构造期解析私钥开销可接受。LANAddrs 逐项
+// 过滤空白后拷贝(不共享配置切片),Relay 缺省放行,PikoDial 取 manager 的
+// dialMeshEndpoint(每次拨号读当前 proxy url/token)。
 func (m *Manager) egressPeer() meshproxy.Dialer {
 	cfg := config.GetGlobalConfig()
-	if cfg == nil || cfg.Customer == nil || cfg.Customer.Mesh == nil {
+	peer, ok := cfg.MeshDelegateNextHop()
+	if !ok {
 		return nil
 	}
-	mesh := cfg.Customer.Mesh
-	if !cfg.MeshEffectivelyEnabled() || len(mesh.Peers) == 0 {
-		return nil
-	}
-	if strings.TrimSpace(mesh.PrivateKey) == "" {
-		return nil
-	}
-	first := mesh.Peers[0]
-	deviceID := strings.TrimSpace(first.DeviceID)
-	if deviceID == "" {
-		return nil
-	}
-	lanAddrs := make([]string, 0, len(first.LANAddrs))
-	for _, addr := range first.LANAddrs {
+	meshCfg := cfg.Customer.Mesh
+	deviceID := strings.TrimSpace(peer.DeviceID)
+	lanAddrs := make([]string, 0, len(peer.LANAddrs))
+	for _, addr := range peer.LANAddrs {
 		if addr = strings.TrimSpace(addr); addr != "" {
 			lanAddrs = append(lanAddrs, addr)
 		}
@@ -101,13 +70,13 @@ func (m *Manager) egressPeer() meshproxy.Dialer {
 	spec := meshproxy.PeerSpec{
 		DeviceID: deviceID,
 		LANAddrs: lanAddrs,
-		HostKey:  strings.TrimSpace(first.HostKey),
+		HostKey:  strings.TrimSpace(peer.HostKey),
 		SSHUser:  "mesh",
-		Relay:    first.Relay == nil || *first.Relay,
+		Relay:    peer.Relay == nil || *peer.Relay,
 	}
-	client, err := meshproxy.NewExitClient(spec, mesh.PrivateKey, mesh.KeyPassphrase, m.dialMeshEndpoint)
+	client, err := meshproxy.NewExitClient(spec, meshCfg.PrivateKey, meshCfg.KeyPassphrase, m.dialMeshEndpoint)
 	if err != nil {
-		log.Printf("[MESH-LAN] egress fallback peer %s unavailable: %v", deviceID, err)
+		log.Printf("[MESH-LAN] egress delegate peer %s unavailable: %v", deviceID, err)
 		return nil
 	}
 	return client
@@ -307,13 +276,12 @@ func MeshLANPort() int {
 }
 
 // wireMeshAssemblySeams validateConfig 的装配接线点(与
-// SetMeshTransportDialSource 同位):egress 双缝 + tcp 离线缝 + TUN DNS
-// 代转发对端。抽成单函数使接线顺序与注释同处一页;每次 Configure(含幂等
-// 续期)重跑,atomic Store 幂等。
-func (m *Manager) wireMeshAssemblySeams() {
-	offline := m.meshOfflineSignal()
-	egress.SetOfflineSignal(offline)
-	tcp.SetMeshOfflineSignal(offline)
+// SetMeshTransportDialSource 同位):egress 委托 peer 源 + tcp 本机节点
+// 标识缝 + TUN DNS 代转发对端。抽成单函数使接线顺序与注释同处一页;每次
+// Configure(含幂等续期)重跑,atomic Store 幂等。
+func (m *Manager) wireMeshAssemblySeams(deviceID string) {
+	selfID := strings.TrimSpace(deviceID)
+	tcp.SetMeshSelfIDSource(func() string { return selfID })
 	egress.SetPeerSource(m.egressPeer)
 	// TUN DNS 代转发(tunnel.T() 进程级单例,engine.go SetDialer 同款接法):
 	// 规则驱动,fn 内部每调用读 memo 化的门控结果,重复接线幂等。

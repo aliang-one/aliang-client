@@ -495,39 +495,8 @@ func TestExitClientOpenChannelDeadline(t *testing.T) {
 	}
 }
 
-// TestDialMeshAddrRejectsEmptyHostKey 矩阵 8:兜底拨号对空 host key
-// fail-closed(连真 sshd 期望握手被拒);一并钉住 nil 身份/nil payload 两守卫。
-func TestDialMeshAddrRejectsEmptyHostKey(t *testing.T) {
-	_, identity := testIdentity(t)
-	sshd := newMeshTestSSHD(t, identity.PublicKey())
-	payload := exitPayload(&M.Metadata{HostName: "x.com:443"})
-
-	t.Run("empty host key fail-closed", func(t *testing.T) {
-		conn, err := DialMeshAddr(context.Background(), sshd.Addr(), "", identity, payload)
-		if err == nil {
-			if conn != nil {
-				_ = conn.Close()
-			}
-			t.Fatal("empty host key must fail closed")
-		}
-		if !strings.Contains(err.Error(), "fail-closed") {
-			t.Fatalf("want fail-closed rejection, got %v", err)
-		}
-		if sshd.LastPayload() != nil {
-			t.Fatal("no channel must open on fail-closed")
-		}
-	})
-	t.Run("nil identity rejected", func(t *testing.T) {
-		if _, err := DialMeshAddr(context.Background(), sshd.Addr(), sshd.HostKeyPinned(), nil, payload); err == nil || !strings.Contains(err.Error(), "identity") {
-			t.Fatalf("nil identity must be rejected, got %v", err)
-		}
-	})
-	t.Run("nil payload rejected", func(t *testing.T) {
-		if _, err := DialMeshAddr(context.Background(), sshd.Addr(), sshd.HostKeyPinned(), identity, nil); !errors.Is(err, ErrUnbuildableTarget()) {
-			t.Fatalf("nil payload must be unbuildable, got %v", err)
-		}
-	})
-}
+// (TestDialMeshAddrRejectsEmptyHostKey 已随 DialMeshAddr 删除——出口链路
+// 改造后无裸地址拨号通道,空钉扎/nil 身份守卫归 ExitClient 同名矩阵。)
 
 // TestExitClientCustomClassDialsLanOnly 矩阵 9:custom 类别 + relay 已接线
 // + LAN 可达 ⇒ 只走 LAN(fake piko 计数 0;custom 禁公共中继,SPEC §4.3/§7.1)。

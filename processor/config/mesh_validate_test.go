@@ -48,20 +48,8 @@ func TestMeshValidatePrivateKeyRequired(t *testing.T) {
 	}
 }
 
-func TestMeshValidateFallbackHostKeyRequiredWhenAddrSet(t *testing.T) {
-	on := true
-	c := &MeshConfig{Fallback: &MeshFallbackConfig{
-		Enable: &on, Addr: "192.168.1.20:56432", HostKey: "",
-	}}
-	err := c.Validate()
-	if err == nil || !strings.Contains(err.Error(), "fallback.host_key required") {
-		t.Fatalf("want fallback.host_key required, got %v", err)
-	}
-	c.Fallback.HostKey = "SHA256:x"
-	if err := c.Validate(); err != nil {
-		t.Fatalf("validate: %v", err)
-	}
-}
+// (旧 fallback.host_key 必填测试已随出口链路改造移除:next_hop 校验测试
+// 见 mesh_fallback_gate_test.go TestMeshValidateFallbackNextHopRequired。)
 
 func TestMeshValidatePassphraseTrimmed(t *testing.T) {
 	c := &MeshConfig{PrivateKey: "k", KeyPassphrase: " p "}

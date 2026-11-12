@@ -1,7 +1,7 @@
 package mesh
 
 // mesh 出口侧公共小件测试:类别判定、继承帧头 context 缝契约(B 侧专用,
-// F1 删)、aiProxyPort 同步锚。出口拨号本体(ExitClient/DialMeshAddr)的
+// F1 删)、aiProxyPort 同步锚。出口拨号本体(ExitClient)的
 // 全矩阵见 sshexit_test.go;目标构造见 payload_test.go。
 
 import (

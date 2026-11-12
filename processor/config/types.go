@@ -843,7 +843,7 @@ func (c *Config) EffectivePeerMCPCodexEnabled() bool {
 type MeshConfig struct {
 	Enable        *bool               `json:"enable,omitempty"`
 	ForwardEnable *bool               `json:"forward_enable,omitempty"`
-	MaxHops       int                 `json:"max_hops,omitempty"` // 一期不消费,仅为二期链长上限占位(SPEC §17)
+	MaxHops       int                 `json:"max_hops,omitempty"` // 链式转发经停上限(via 链长):0=默认,>8 收口;接收端拒绝过长经停链
 	Peers         []MeshPeer          `json:"peers,omitempty"`
 	Fallback      *MeshFallbackConfig `json:"fallback,omitempty"`
 	// PrivateKey 本节点的 mesh 身份私钥(PEM,OpenSSH 或 PKCS#8)。
@@ -865,11 +865,14 @@ type MeshPeer struct {
 }
 
 type MeshFallbackConfig struct {
-	Enable  *bool    `json:"enable,omitempty"`
-	Classes []string `json:"classes,omitempty"`
-	Addr    string   `json:"addr,omitempty"`
-	// HostKey 兜底节点 SSH host key 钉扎;enable=true 且 addr 非空时必填(fail-closed)。
-	HostKey string `json:"host_key,omitempty"`
+	Enable *bool `json:"enable,omitempty"`
+	// NextHop 出口链路的下一跳设备(enable=true 时必填):须为 peers 中已
+	// 钉扎(host_key 非空)的节点。启用后本机对 Aliang 云与内部接口的出口
+	// 流量常驻交给它;下一跳也启用时继续链向它的下一跳(via 防环),直到
+	// 某台未启用的设备直接出网。旧版字段(classes/addr/host_key)已废弃:
+	// 地址与钉扎改从 peers 条目继承,存量配置中的旧键在加载时被忽略
+	// (发布说明 §升级)。
+	NextHop string `json:"next_hop,omitempty"`
 }
 
 // EffectiveEnabled mesh 出口总开关:三态指针语义与 peer_mcp.enable 同族,
@@ -896,49 +899,36 @@ func (c *MeshConfig) EffectiveMaxHops() int {
 	return c.MaxHops
 }
 
-// MeshFallbackActiveForClass 离线兜底门控的统一判定(计划 Task 12 评审钉死
-// 的三消费方共享助手),四条件缺一不可:
-//  1. mesh 总开关检查 = MeshEffectivelyEnabled(含 SSH 入口依赖降级)
-//     (显式 false 时所有兜底消费方一律关——总开关契约穿透;抽取前
-//     processor/tcp meshFallbackAddrForClass 缺此检查,即评审抓到的
-//     tcp 侧缺口);
-//  2. customer.mesh.fallback 使能(Enable 显式 true);
-//  3. class ∈ Fallback.Classes(空 Classes = 未勾选任何类别);
-//  4. Addr 非空(TrimSpace 规整后判定)。
+// MeshDelegateNextHop 出口链路下一跳(2026-11-12 用户拍板,替代离线兜底):
+// fallback.enable 显式 true 且 next_hop 指向 peers 中已钉扎的节点 → 返回该
+// peer。mesh 生效依赖(SSH 入口开启)由 MeshEffectivelyEnabled 承担——委托
+// 走的也是 mesh 通道,SSH 入口关了载体不存在,能力随之降级。
 //
-// 消费方(processor/egress meshFallbackSelfActive / processor/tcp
-// meshFallbackAddrForClass):离线信号不在本助手内——各消费方自带(egress
-// isOffline / processor/tcp meshOfflineActive),同一信号源两缝由组装层
-// (Task 14)用同一 manager 状态 getter 接线。processor/routing
-// meshForwardAvailable 语义不同(查 Peers 非查 Fallback,编译期能力检查),
-// 不并入本助手。返回形态 (addr, ok):egress 组 Peer / tcp 拨兜底节点都需
-// 地址;只要 ok 判定的消费方可丢弃 addr。
-//
-// 兜底门不重复检查钉扎/身份:fallback 启用时 host_key 由保存期 Validate 强制
-// 必填(见 MeshConfig.Validate),运行期 DialMeshAddr(Task C4 落地)对空
-// 钉扎 fail-closed——两道闸已覆盖,此处保持宽口径避免双重报错。
-func MeshFallbackActiveForClass(cfg *Config, class string) (addr string, ok bool) {
-	if cfg == nil || cfg.Customer == nil || cfg.Customer.Mesh == nil {
-		return "", false
+// 触发为常驻语义:不做「本机能否直连平台」的在线判定(用户明确要求去掉
+// 离线门控)——开关即无条件改道。下一跳故障时对外流量失败、错误回源,
+// 这是接受的取舍(发布说明已写明)。
+func (c *Config) MeshDelegateNextHop() (*MeshPeer, bool) {
+	if c == nil || c.Customer == nil || c.Customer.Mesh == nil || c.Customer.Mesh.Fallback == nil {
+		return nil, false
 	}
-	mesh := cfg.Customer.Mesh
-	if !cfg.MeshEffectivelyEnabled() {
-		return "", false
+	fb := c.Customer.Mesh.Fallback
+	if fb.Enable == nil || !*fb.Enable {
+		return nil, false
 	}
-	fb := mesh.Fallback
-	if fb == nil || fb.Enable == nil || !*fb.Enable {
-		return "", false
+	next := strings.TrimSpace(fb.NextHop)
+	if next == "" || !c.MeshEffectivelyEnabled() {
+		return nil, false
 	}
-	addr = strings.TrimSpace(fb.Addr)
-	if addr == "" {
-		return "", false
-	}
-	for _, c := range fb.Classes {
-		if c == class {
-			return addr, true
+	for i := range c.Customer.Mesh.Peers {
+		p := &c.Customer.Mesh.Peers[i]
+		if strings.TrimSpace(p.DeviceID) == next {
+			if strings.TrimSpace(p.HostKey) == "" {
+				return nil, false // 未钉扎:能力不成立(fail-closed)
+			}
+			return p, true
 		}
 	}
-	return "", false
+	return nil, false
 }
 
 // MeshEffectivelyEnabled mesh 出口的生效开关 = 用户开关 ∧ SSH 入口可用
@@ -969,14 +959,6 @@ func (c *Config) ValidateMeshDependency() error {
 		return fmt.Errorf("组网依赖 SSH 入口(ssh_ingress.enable):开启 customer.mesh.enable 前必须先开启 SSH 入口")
 	}
 	return nil
-}
-
-// MeshFallbackHostKey 返回兜底节点的 SSH host key 钉扎(未配置=空串=fail-closed)。
-func MeshFallbackHostKey(cfg *Config) string {
-	if cfg == nil || cfg.Customer == nil || cfg.Customer.Mesh == nil || cfg.Customer.Mesh.Fallback == nil {
-		return ""
-	}
-	return strings.TrimSpace(cfg.Customer.Mesh.Fallback.HostKey)
 }
 
 // Validate 保存通道(Config.Validate)调用:peers/兜底/跳数的形态校验。
@@ -1011,23 +993,22 @@ func (c *MeshConfig) Validate() error {
 		}
 	}
 	if c.Fallback != nil && c.Fallback.Enable != nil && *c.Fallback.Enable {
-		c.Fallback.Addr = strings.TrimSpace(c.Fallback.Addr)
-		if c.Fallback.Addr == "" {
-			return fmt.Errorf("customer.mesh.fallback.addr required when fallback enabled")
+		c.Fallback.NextHop = strings.TrimSpace(c.Fallback.NextHop)
+		if c.Fallback.NextHop == "" {
+			return fmt.Errorf("customer.mesh.fallback.next_hop required when fallback enabled")
 		}
-		if _, _, err := net.SplitHostPort(c.Fallback.Addr); err != nil {
-			return fmt.Errorf("customer.mesh.fallback.addr invalid %q: must be host:port", c.Fallback.Addr)
-		}
-		c.Fallback.HostKey = strings.TrimSpace(c.Fallback.HostKey)
-		if c.Fallback.HostKey == "" {
-			return fmt.Errorf("customer.mesh.fallback.host_key required when fallback enabled (no TOFU)")
-		}
-		for _, class := range c.Fallback.Classes {
-			switch class {
-			case meshproto.ClassSelf, meshproto.ClassAI, meshproto.ClassCustom:
-			default:
-				return fmt.Errorf("customer.mesh.fallback.classes[%q] must be one of [%s %s %s]", class, meshproto.ClassSelf, meshproto.ClassAI, meshproto.ClassCustom)
+		nextPeer := -1
+		for i := range c.Peers {
+			if c.Peers[i].DeviceID == c.Fallback.NextHop {
+				nextPeer = i
+				break
 			}
+		}
+		if nextPeer < 0 {
+			return fmt.Errorf("customer.mesh.fallback.next_hop %q must reference a configured peer", c.Fallback.NextHop)
+		}
+		if c.Peers[nextPeer].HostKey == "" {
+			return fmt.Errorf("customer.mesh.fallback.next_hop %q peer must have host_key pinned (no TOFU)", c.Fallback.NextHop)
 		}
 	}
 	c.PrivateKey = strings.TrimSpace(c.PrivateKey)
@@ -1040,7 +1021,8 @@ func (c *MeshConfig) Validate() error {
 
 // ValidateMesh 自指拒绝(spec §3.4/§7 层0):peers 指向自己即报错——把自己
 // 列为可转发目标只会造出 1 跳自环。selfDeviceID 为空(未注册首启)时跳过
-// 检查。兜底目标走的是 host:port 地址而非 device_id,不在此检查。
+// 检查。出口链路 next_hop 指向自己也在此层拒绝:下一跳=自己等于没换出口,
+// 且链式转发里必自指成环。
 func (c *Config) ValidateMesh(selfDeviceID string) error {
 	if c == nil || c.Customer == nil || c.Customer.Mesh == nil {
 		return nil
@@ -1054,6 +1036,11 @@ func (c *Config) ValidateMesh(selfDeviceID string) error {
 	for i, peer := range c.Customer.Mesh.Peers {
 		if strings.TrimSpace(peer.DeviceID) == self {
 			return fmt.Errorf("customer.mesh.peers[%d] device_id %q is self: mesh peers must not reference this device", i, peer.DeviceID)
+		}
+	}
+	if fb := c.Customer.Mesh.Fallback; fb != nil && fb.Enable != nil && *fb.Enable {
+		if strings.TrimSpace(fb.NextHop) == self {
+			return fmt.Errorf("customer.mesh.fallback.next_hop %q is self: the fallback chain must point at another device", fb.NextHop)
 		}
 	}
 	return nil

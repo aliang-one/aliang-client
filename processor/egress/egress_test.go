@@ -17,7 +17,6 @@ import (
 	"time"
 
 	M "aliang.one/nursorgate/inbound/tun/metadata"
-	"aliang.one/nursorgate/outbound/meshproto"
 	mesh "aliang.one/nursorgate/outbound/proxy/mesh"
 	"aliang.one/nursorgate/processor/config"
 	gossh "golang.org/x/crypto/ssh"
@@ -197,13 +196,6 @@ func setPeerSourceForTest(t *testing.T, fn func() mesh.Dialer) {
 	t.Cleanup(func() { SetPeerSource(nil) })
 }
 
-// setOfflineSignalForTest 注入/恢复离线信号,Cleanup 统一清空(未接线=在线)。
-func setOfflineSignalForTest(t *testing.T, offline func() bool) {
-	t.Helper()
-	SetOfflineSignal(offline)
-	t.Cleanup(func() { SetOfflineSignal(nil) })
-}
-
 // newTestExitPeer 按对端 LAN 地址装配 ExitClient(生产 egressPeer 同构装配:
 // SSHUser="mesh"、真身份私钥)。
 func newTestExitPeer(t *testing.T, keyPEM, lanAddr, hostKey string, relay bool, pikoDial mesh.PikoDialFunc) mesh.Dialer {
@@ -222,16 +214,15 @@ func newTestExitPeer(t *testing.T, keyPEM, lanAddr, hostKey string, relay bool, 
 	return client
 }
 
-// fallbackSelfConfig 构造兜底使能且含 self 的最小配置。SSH 入口显式开:
-// 判据切到 config.MeshEffectivelyEnabled 后,ssh_ingress 未置位会让兜底门
-// 被依赖降级误关(非各用例要钉的条件)。
-func fallbackSelfConfig() *config.Config {
+// delegateSelfConfig 构造出口链路开关开(next_hop 指向已钉扎 peer dev-b)
+// 的最小配置。SSH 入口显式开:判据切到 config.MeshEffectivelyEnabled 后,
+// ssh_ingress 未置位会让委托门被依赖降级误关(非各用例要钉的条件)。
+func delegateSelfConfig() *config.Config {
 	return &config.Config{Customer: &config.CustomerConfig{
-		Mesh: &config.MeshConfig{Fallback: &config.MeshFallbackConfig{
-			Enable:  boolPtr(true),
-			Classes: []string{meshproto.ClassSelf},
-			Addr:    "192.168.1.9:56440",
-		}},
+		Mesh: &config.MeshConfig{
+			Peers:    []config.MeshPeer{{DeviceID: "dev-b", LANAddrs: []string{"192.168.1.9:56432"}, HostKey: "SHA256:AAAA"}},
+			Fallback: &config.MeshFallbackConfig{Enable: boolPtr(true), NextHop: "dev-b"},
+		},
 		SSHIngress: &config.SSHIngressConfig{Enable: boolPtr(true)},
 	}}
 }
@@ -297,15 +288,14 @@ func TestPlatformClientDirectWhenOnline(t *testing.T) {
 	}
 }
 
-// TestPlatformClientRoutesViaMeshWhenFallbackActive 兜底配置含 self 且 peer
+// TestPlatformClientRoutesViaMeshWhenDelegateActive 出口链路开关开且 peer
 // 可用 → 平台流量经 B:mesh-exit channel 的 ExtraData payload 携带平台域名
 // 与端口(域名直转,不本地解析);Host 头为平台域名。
-func TestPlatformClientRoutesViaMeshWhenFallbackActive(t *testing.T) {
+func TestPlatformClientRoutesViaMeshWhenDelegateActive(t *testing.T) {
 	clearProxyEnv(t)
 	keyPEM, identity := testIdentityKeyPEM(t)
 	sshd := startMeshTestSSHD(t, identity.PublicKey(), true)
-	setGlobalConfigForTest(t, fallbackSelfConfig())
-	setOfflineSignalForTest(t, func() bool { return true })
+	setGlobalConfigForTest(t, delegateSelfConfig())
 	setPeerSourceForTest(t, func() mesh.Dialer {
 		return newTestExitPeer(t, keyPEM, sshd.Addr(), sshd.HostKeyPinned(), false, nil)
 	})
@@ -357,13 +347,13 @@ func waitSSHDLastPayload(t *testing.T, s *meshTestSSHD) []byte {
 	}
 }
 
-// TestPlatformClientFallsBackOnError mesh 拨号失败(假 peer 指向死端口)→
-// direct 重试成功;direct 恰好一次(不循环)。
-func TestPlatformClientFallsBackOnError(t *testing.T) {
+// TestPlatformClientDelegateFailureHonest 下一跳不可达(假 peer 指向死端口)
+// → 拨号如实失败、错误回源,不回落 direct(开关=出口完全依赖下一跳,发布
+// 说明已写明取舍;静默绕链会让「开了开关却没走链」不可见)。
+func TestPlatformClientDelegateFailureHonest(t *testing.T) {
 	keyPEM, _ := testIdentityKeyPEM(t)
 	dead := closedPortAddr(t)
-	setGlobalConfigForTest(t, fallbackSelfConfig())
-	setOfflineSignalForTest(t, func() bool { return true })
+	setGlobalConfigForTest(t, delegateSelfConfig())
 	setPeerSourceForTest(t, func() mesh.Dialer {
 		return newTestExitPeer(t, keyPEM, dead, "SHA256:AAAA", false, nil)
 	})
@@ -376,26 +366,21 @@ func TestPlatformClientFallsBackOnError(t *testing.T) {
 	defer ts.Close()
 
 	client := PlatformClient(5 * time.Second)
-	resp, err := client.Get(ts.URL)
-	if err != nil {
-		t.Fatalf("get after mesh failure: %v", err)
+	if _, err := client.Get(ts.URL); err == nil {
+		t.Fatal("下一跳不可达时委托拨号应如实失败,不回落 direct")
 	}
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200", resp.StatusCode)
-	}
-	if got := hits.Load(); got != 1 {
-		t.Fatalf("direct hits = %d, want 1(只重试一次,不循环)", got)
+	if got := hits.Load(); got != 0 {
+		t.Fatalf("direct hits = %d, want 0(不回落 direct)", got)
 	}
 }
 
-// TestPlatformClientFallbackNotConfiguredIgnoresMesh 兜底未配置但 peer source
-// 已注入 → 不走 mesh(直连),假 B 一个 channel 都收不到。
-func TestPlatformClientFallbackNotConfiguredIgnoresMesh(t *testing.T) {
+// TestPlatformClientDelegateNotConfiguredIgnoresMesh 出口链路未配置但 peer
+// source 已注入 → 不走 mesh(直连),假 B 一个 channel 都收不到。
+func TestPlatformClientDelegateNotConfiguredIgnoresMesh(t *testing.T) {
 	keyPEM, identity := testIdentityKeyPEM(t)
 	sshd := startMeshTestSSHD(t, identity.PublicKey(), false)
 	setGlobalConfigForTest(t, &config.Config{Customer: &config.CustomerConfig{
-		Mesh: &config.MeshConfig{}, // mesh 层存在但 Fallback 未配置
+		Mesh: &config.MeshConfig{}, // mesh 层存在但出口链路未配置
 		// SSH 入口显式开:让「Fallback 未配置」成为唯一关闸条件(判据含
 		// SSH 入口依赖后,不补则本用例被依赖降级误吞)。
 		SSHIngress: &config.SSHIngressConfig{Enable: boolPtr(true)},
@@ -426,18 +411,17 @@ func TestPlatformClientFallbackNotConfiguredIgnoresMesh(t *testing.T) {
 	// 假 B 不应收到任何 channel(留 200ms 排除在途)。
 	time.Sleep(200 * time.Millisecond)
 	if sshd.LastPayload() != nil {
-		t.Fatal("兜底未配置却走了 mesh")
+		t.Fatal("出口链路未配置却走了 mesh")
 	}
 }
 
 // assertGoesDirect 门控不激活的统一断言:live 假 B peer 已注入,请求仍必须
 // 直连(httptest 计数==1)且假 B 零 channel。
-func assertGoesDirect(t *testing.T, cfg *config.Config, offline func() bool) {
+func assertGoesDirect(t *testing.T, cfg *config.Config) {
 	t.Helper()
 	keyPEM, identity := testIdentityKeyPEM(t)
 	sshd := startMeshTestSSHD(t, identity.PublicKey(), false)
 	setGlobalConfigForTest(t, cfg)
-	setOfflineSignalForTest(t, offline)
 	setPeerSourceForTest(t, func() mesh.Dialer {
 		return newTestExitPeer(t, keyPEM, sshd.Addr(), sshd.HostKeyPinned(), false, nil)
 	})
@@ -467,64 +451,77 @@ func assertGoesDirect(t *testing.T, cfg *config.Config, offline func() bool) {
 	}
 }
 
-// TestPlatformClientOnlineSignalBlocksMesh 离线信号为 false(甚至未接线)时,
-// 即使兜底配置 + peer 齐全也不走 mesh(design §9.4「平台不可达才兜底」,
-// 在线一律直连)。
-func TestPlatformClientOnlineSignalBlocksMesh(t *testing.T) {
-	t.Run("信号注入在线", func(t *testing.T) {
-		assertGoesDirect(t, fallbackSelfConfig(), func() bool { return false })
-	})
-	t.Run("信号未接线视为在线", func(t *testing.T) {
-		assertGoesDirect(t, fallbackSelfConfig(), nil)
-	})
-}
-
-// TestPlatformClientGateVariantsBlockMesh 兜底门控变体:Enable=false /
-// Classes 不含 self / mesh 总开关显式 false——任一不满足即纯 direct。
-// 各变体 SSH 入口显式开(判据含 SSH 入口依赖):让被测变体成为唯一关闸
-// 条件,不补则三个用例都被依赖降级误吞。
-func TestPlatformClientGateVariantsBlockMesh(t *testing.T) {
-	online := func() bool { return true }
+// TestPlatformClientDelegateGateVariantsBlockMesh 出口链路门控变体:
+// Enable=false / next_hop 空 / next_hop 不指向任何 peer / peer 未钉扎 /
+// mesh 总开关显式 false / SSH 入口依赖降级——任一不满足即纯 direct。
+// 各变体让被测条件成为唯一关闸条件(SSH 入口显式开的变体注明;依赖降级
+// 变体则显式关 ssh)。
+func TestPlatformClientDelegateGateVariantsBlockMesh(t *testing.T) {
 	sshIn := func() *config.SSHIngressConfig { return &config.SSHIngressConfig{Enable: boolPtr(true)} }
-	t.Run("兜底Enable=false", func(t *testing.T) {
+	sshOff := func() *config.SSHIngressConfig { return &config.SSHIngressConfig{Enable: boolPtr(false)} }
+	pinnedPeer := func() []config.MeshPeer {
+		return []config.MeshPeer{{DeviceID: "dev-b", LANAddrs: []string{"192.168.1.9:56432"}, HostKey: "SHA256:AAAA"}}
+	}
+	t.Run("Enable=false", func(t *testing.T) {
 		assertGoesDirect(t, &config.Config{Customer: &config.CustomerConfig{
-			Mesh: &config.MeshConfig{Fallback: &config.MeshFallbackConfig{
-				Enable:  boolPtr(false),
-				Classes: []string{meshproto.ClassSelf},
-				Addr:    "192.168.1.9:56440",
+			Mesh: &config.MeshConfig{Peers: pinnedPeer(), Fallback: &config.MeshFallbackConfig{
+				Enable: boolPtr(false), NextHop: "dev-b",
 			}},
 			SSHIngress: sshIn(),
-		}}, online)
+		}})
 	})
-	t.Run("Classes不含self", func(t *testing.T) {
+	t.Run("next_hop空", func(t *testing.T) {
 		assertGoesDirect(t, &config.Config{Customer: &config.CustomerConfig{
-			Mesh: &config.MeshConfig{Fallback: &config.MeshFallbackConfig{
-				Enable:  boolPtr(true),
-				Classes: []string{meshproto.ClassAI, meshproto.ClassCustom},
-				Addr:    "192.168.1.9:56440",
+			Mesh: &config.MeshConfig{Peers: pinnedPeer(), Fallback: &config.MeshFallbackConfig{
+				Enable: boolPtr(true),
 			}},
 			SSHIngress: sshIn(),
-		}}, online)
+		}})
+	})
+	t.Run("next_hop不指向任何peer", func(t *testing.T) {
+		assertGoesDirect(t, &config.Config{Customer: &config.CustomerConfig{
+			Mesh: &config.MeshConfig{Peers: pinnedPeer(), Fallback: &config.MeshFallbackConfig{
+				Enable: boolPtr(true), NextHop: "dev-x",
+			}},
+			SSHIngress: sshIn(),
+		}})
+	})
+	t.Run("peer未钉扎", func(t *testing.T) {
+		assertGoesDirect(t, &config.Config{Customer: &config.CustomerConfig{
+			Mesh: &config.MeshConfig{Peers: []config.MeshPeer{{DeviceID: "dev-b"}}, Fallback: &config.MeshFallbackConfig{
+				Enable: boolPtr(true), NextHop: "dev-b",
+			}},
+			SSHIngress: sshIn(),
+		}})
 	})
 	t.Run("mesh总开关显式false", func(t *testing.T) {
 		assertGoesDirect(t, &config.Config{Customer: &config.CustomerConfig{
 			Mesh: &config.MeshConfig{
 				Enable:   boolPtr(false),
-				Fallback: fallbackSelfConfig().Customer.Mesh.Fallback,
+				Peers:    pinnedPeer(),
+				Fallback: delegateSelfConfig().Customer.Mesh.Fallback,
 			},
 			SSHIngress: sshIn(),
-		}}, online)
+		}})
+	})
+	t.Run("SSH入口依赖降级", func(t *testing.T) {
+		assertGoesDirect(t, &config.Config{Customer: &config.CustomerConfig{
+			Mesh: &config.MeshConfig{
+				Peers:    pinnedPeer(),
+				Fallback: delegateSelfConfig().Customer.Mesh.Fallback,
+			},
+			SSHIngress: sshOff(),
+		}})
 	})
 }
 
-// TestPlatformClientDoubleFailureErrorChain mesh 与 direct 双败:多 %w 错误
-// 链上 errors.Is 两个分量各自可达。mesh 分量经 fake PikoDial 注入哨兵错
-// (self 类别中继准入、LAN 空载体 → 必落 fake PikoDial),direct 分量用已
-// 取消 ctx 造 context.Canceled。
-func TestPlatformClientDoubleFailureErrorChain(t *testing.T) {
+// TestPlatformClientDelegateFailureErrorChain 委托拨号失败(中继载体注入
+// 哨兵错;self 类别中继准入、LAN 空载体 → 必落 fake PikoDial)→ 错误链上
+// 哨兵可达,且不回落 direct(取消的 ctx 不会被 direct 轨消费——错误只含
+// mesh 分量)。
+func TestPlatformClientDelegateFailureErrorChain(t *testing.T) {
 	keyPEM, _ := testIdentityKeyPEM(t)
-	setGlobalConfigForTest(t, fallbackSelfConfig())
-	setOfflineSignalForTest(t, func() bool { return true })
+	setGlobalConfigForTest(t, delegateSelfConfig())
 	meshSentinel := errors.New("mesh: fake relay carrier down")
 	setPeerSourceForTest(t, func() mesh.Dialer {
 		return newTestExitPeer(t, keyPEM, "", "SHA256:AAAA", true,
@@ -534,17 +531,17 @@ func TestPlatformClientDoubleFailureErrorChain(t *testing.T) {
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // direct 轨道必败(context.Canceled)
+	cancel()
 	_, err := PlatformClient(5*time.Second).Transport.(*http.Transport).
 		DialContext(ctx, "tcp", "platform.test:443")
 	if err == nil {
-		t.Fatal("双败应返回错误")
+		t.Fatal("委托失败应返回错误")
 	}
 	if !errors.Is(err, meshSentinel) {
 		t.Fatalf("错误链应含 mesh 分量哨兵: %v", err)
 	}
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("错误链应含 direct 分量 context.Canceled: %v", err)
+	if errors.Is(err, context.Canceled) {
+		t.Fatalf("错误链不应含 direct 分量(已不回落 direct): %v", err)
 	}
 }
 

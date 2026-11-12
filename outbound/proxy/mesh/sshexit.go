@@ -1,8 +1,7 @@
 // sshexit.go 承担 mesh 出口的 SSH 侧客户端:ExitClient 到单一 mesh 出口
 // 节点建一条 mesh-exit SSH channel(每条连接一次独立 SSH 握手,无池——
 // SPEC §5.4 三条硬冲突),LAN 载体优先、Piko 中继兜底,准入在拨号前判定;
-// exitConn 把 gossh.Channel 适配为 net.Conn;DialMeshAddr 是无 peer 记录
-// 裸地址的离线兜底拨号(SPEC §7.2)。host key 钉扎与私钥解析复用本包
+// exitConn 把 gossh.Channel 适配为 net.Conn。host key 钉扎与私钥解析复用本包
 // hostkey.go / spec.go。
 package mesh
 
@@ -196,48 +195,6 @@ func (c *exitConn) SetDeadline(time.Time) error      { return nil } // SSH 通�
 func (c *exitConn) SetReadDeadline(time.Time) error  { return nil }
 func (c *exitConn) SetWriteDeadline(time.Time) error { return nil }
 
-// DialMeshAddr 拨一个无 peer 记录的裸地址(离线兜底专用,SPEC §7.2)。
-// addr 指向对端 SSH 入口 56432(不是已删除的 mesh 监听口);identity 为
-// 本机 mesh 身份(B 的 mesh_authorized_keys 准入);hostKey 为兜底节点
-// 钉扎,空 = fail-closed。LAN-only(单载体,不试中继)。payload 由调用方
-// 经 ExitPayloadForMetadata(md) 构造;nil 按不可构造拒绝(OpenChannel 前)。
-func DialMeshAddr(ctx context.Context, addr, hostKey string, identity gossh.Signer, payload []byte) (net.Conn, error) {
-	if identity == nil {
-		return nil, errors.New("mesh: fallback dial requires node identity key")
-	}
-	if payload == nil {
-		return nil, errUnbuildableTarget
-	}
-	raw, err := dialLAN(ctx, addr)
-	if err != nil {
-		return nil, fmt.Errorf("mesh: fallback dial %s: %w", addr, err)
-	}
-	if err := raw.SetDeadline(time.Now().Add(meshExitHandshakeTimeout)); err != nil {
-		_ = raw.Close()
-		return nil, fmt.Errorf("mesh: set handshake deadline to %s: %w", addr, err)
-	}
-	cc, chans, reqs, hErr := gossh.NewClientConn(raw, addr, &gossh.ClientConfig{
-		User:            meshSSHUser,
-		Auth:            []gossh.AuthMethod{gossh.PublicKeys(identity)},
-		HostKeyCallback: pinnedHostKey(hostKey),
-	})
-	if hErr != nil {
-		_ = raw.Close()
-		return nil, fmt.Errorf("mesh: fallback ssh handshake to %s: %w", addr, hErr)
-	}
-	client := gossh.NewClient(cc, chans, reqs)
-	// OpenChannel 窗口 deadline(同 DialContext 的评审 I1 加固):黑洞对端不得
-	// 把 OpenChannel 挂死在无 deadline 的 conn 读上;返回(成功或失败)即清。
-	if err := raw.SetDeadline(time.Now().Add(meshExitHandshakeTimeout)); err != nil {
-		_ = client.Close()
-		return nil, fmt.Errorf("mesh: set open-channel deadline to %s: %w", addr, err)
-	}
-	ch, chReqs, oErr := client.OpenChannel(ChannelMeshExit, payload)
-	_ = raw.SetDeadline(time.Time{}) // OpenChannel 已返回,窗口即清(成功失败同路)
-	if oErr != nil {
-		_ = client.Close()
-		return nil, fmt.Errorf("mesh: fallback open %s channel to %s: %w", ChannelMeshExit, addr, oErr)
-	}
-	go gossh.DiscardRequests(chReqs)
-	return newExitConn(ch, client), nil
-}
+// (DialMeshAddr 已随出口链路改造删除,2026-11-12:旧离线兜底的裸地址拨号
+// 通道不再有生产消费方——委托路径复用 getMeshExitForExecution 的
+// ExitClient 装配,地址/钉扎/身份全从 peers 条目继承,无独立裸地址形态。)

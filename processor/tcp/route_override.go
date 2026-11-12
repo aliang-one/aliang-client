@@ -5,7 +5,6 @@ import (
 	"strings"
 
 	M "aliang.one/nursorgate/inbound/tun/metadata"
-	"aliang.one/nursorgate/outbound/meshproto"
 	"aliang.one/nursorgate/processor/config"
 )
 
@@ -33,30 +32,6 @@ func shouldForceAliangRoute(metadata *M.Metadata) bool {
 	return false
 }
 
-// meshOfflineRedirectForAI AI 流量离线改道判定(计划 Task 12,design §2
-// 行11/§9.4;信号缝见 mesh_offline.go):shouldForceAliangRoute 命中的连接
-// (56432 回环,类别推断恒为 ai)在「离线信号真 + AI 类离线兜底勾选」时,
-// 从 RouteToALiang 改判 mesh 兜底节点(经 mesh 转发到兜底节点,B 出其
-// 隧道),返回兜底地址。三态:
-//   - 在线(信号 false/未接线)→ 不改道,在线行为零变化;
-//   - 离线但 AI 兜底未勾选/总开关关/Addr 空 → 不改道,保持
-//     RouteToALiang(离线下隧道拨号必失败,错误如实上抛由 AI 客户端重试
-//     策略收口);
-//   - 离线且兜底门控通过(共享助手 config.MeshFallbackActiveForClass:
-//     总开关+Enable+ai∈Classes+Addr 非空)→ 改道。
-//
-// 类别不另行推断:本判定只在 shouldForceAliangRoute 命中后消费,56432
-// 回环判据(looksLikeAITraffic 同源口径)恒推断 ai,直接以 ClassAI 查门控。
-// 注入连接不改道(SPEC §6.2 第 3 守卫):B 侧注入流量命中 AI 离线改道条件
-// 时直接保持原决策,防注入流量二次入 mesh。
-// B 侧再改道/Via 续传覆盖归 Task 13 集成(计划已列
-// TestMeshOfflineAIRedirectTwoHop)。
-func meshOfflineRedirectForAI(md *M.Metadata) (addr string, ok bool) {
-	if md != nil && md.MeshInjected {
-		return "", false
-	}
-	if !meshOfflineActive() {
-		return "", false
-	}
-	return config.MeshFallbackActiveForClass(config.GetGlobalConfig(), meshproto.ClassAI)
-}
+// (旧 AI 离线改道判定已随出口链路改造移除,2026-11-12:改道由开关驱动、
+// 常驻语义,落点见 mesh_delegate.go meshDelegateEligible/dialViaMeshDelegate
+// 与 handler.go 的两处消费点。)

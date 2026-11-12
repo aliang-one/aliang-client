@@ -308,10 +308,10 @@ func (m *Manager) validateConfig(config Config) (runConfig, [sha256.Size]byte, e
 		log.Printf("[AGENT-TUNNEL] mesh relay carrier disabled: %v", proxyErr)
 	}
 	m.setMeshDial(proxyURL, config.TunnelToken)
-	tcp.SetMeshTransportDialSource(func() meshproxy.PikoDialFunc { return m.dialMeshEndpoint }) // 生产装配(同位接线):egress 兜底 peer 源 + 离线信号两缝
+	tcp.SetMeshTransportDialSource(func() meshproxy.PikoDialFunc { return m.dialMeshEndpoint }) // 生产装配(同位接线):egress 委托 peer 源 + tcp 本机节点标识缝
 	// (egress/tcp 同一 manager 状态 getter,同源同真假)——本体见
 	// mesh_assembly.go wireMeshAssemblySeams。
-	m.wireMeshAssemblySeams()
+	m.wireMeshAssemblySeams(config.DeviceID)
 	// The fingerprint includes the token and expiry, so every renewal
 	// reconfigures the session. This drops in-flight streams once per renewal:
 	// piko reads Upstream.Token only at dial time and offers no token

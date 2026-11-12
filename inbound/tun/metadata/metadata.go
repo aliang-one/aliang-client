@@ -55,6 +55,12 @@ type Metadata struct {
 	// 标记可存活到 dialViaMesh。json:"-" 不入任何线格式——否则 JSON 序列化
 	// 往返会静默丢掉标记、击穿守卫。
 	MeshInjected bool `json:"-"`
+
+	// MeshVia 出口链路经停链(2026-11-12):每个委托/转发跳把自己的
+	// device_id 追加进链随 payload 传递;接收端发现自己在链里即判回环
+	// (就地处理),链长到 max_hops 即判放大上限。json:"-"——不落 TUN
+	// 元数据,只在 mesh 出口 payload(mesh-exit ExtraData)里编码。
+	MeshVia []string `json:"-"`
 }
 
 func (m *Metadata) DestinationAddrPort() netip.AddrPort {

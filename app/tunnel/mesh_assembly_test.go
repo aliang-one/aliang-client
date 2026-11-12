@@ -1,8 +1,8 @@
 package tunnel
 
-// mesh 生产装配接线测试(Task 14):egress 双缝(SetOfflineSignal/
-// SetPeerSource)+ tcp 离线缝(SetMeshOfflineSignal)的同源同真假断言
-// (Task 12 评审建议:把契约从注释升级为测试钉子)、Peers[0] 装配、
+// mesh 生产装配接线测试(Task 14,2026-11-12 出口链路改造):egress 委托
+// peer 源(SetPeerSource,next_hop 驱动)+ tcp 本机节点标识缝
+// (SetMeshSelfIDSource,via 防环链身份)的接线断言、delegate peer 装配、
 // LAN 载体+beacon 生命周期。
 
 import (
@@ -16,8 +16,8 @@ import (
 	"time"
 
 	"aliang.one/nursorgate/app/mesh/lanbeacon"
-	tuntun "aliang.one/nursorgate/inbound/tun/tunnel"
 	M "aliang.one/nursorgate/inbound/tun/metadata"
+	tuntun "aliang.one/nursorgate/inbound/tun/tunnel"
 	"aliang.one/nursorgate/outbound/meshproto"
 	meshproxy "aliang.one/nursorgate/outbound/proxy/mesh"
 	"aliang.one/nursorgate/processor/config"
@@ -28,60 +28,32 @@ import (
 )
 
 // restoreMeshAssemblySeams validateConfig 现在写 egress/tcp 全局缝
-// (中继拨号/offline×2/peerSource),触达装配面的测试结束后全部清空
-// 归位(同 restoreMeshTransportDialSeam 的纪律:缝已原子化,归位并发安全)。
+// (中继拨号/selfID/peerSource),触达装配面的测试结束后全部清空归位
+// (同 restoreMeshTransportDialSeam 的纪律:缝已原子化,归位并发安全)。
 func restoreMeshAssemblySeams(t *testing.T) {
 	t.Helper()
 	restoreMeshTransportDialSeam(t)
 	t.Cleanup(func() {
-		egress.SetOfflineSignal(nil)
 		egress.SetPeerSource(nil)
-		tcp.SetMeshOfflineSignal(nil)
+		tcp.SetMeshSelfIDSource(nil)
 	})
 }
 
-// TestOfflineSeamsShareManagerSource 同源同真假契约的测试钉子:validateConfig
-// 装配后,egress.SetOfflineSignal 与 tcp.SetMeshOfflineSignal 必须随同一
-// manager 隧道状态同步翻转——漏接任一缝或两缝取值分裂,本测试红。信号语义:
-// true=平台不可达=当前无活跃隧道会话(failed/stopped/从未配置);connecting/
-// connected/reconnecting 均算活跃(在线,保守不激活兜底)。
-func TestOfflineSeamsShareManagerSource(t *testing.T) {
+// TestSelfIDSeamWiredFromManager 本机节点标识缝接线钉子:validateConfig
+// 装配后,tcp 侧读到的 device_id 必须等于配置 DeviceID(与 inbound/ssh
+// LocalNodeID 同源同值)——漏接该缝,via 防环链会因「无身份」整体 fail-closed,
+// 委托能力静默消失,本测试红。
+func TestSelfIDSeamWiredFromManager(t *testing.T) {
 	restoreMeshAssemblySeams(t)
 	manager := NewManager(nil)
-	manager.run = func(ctx context.Context, _ runConfig, ready func()) error {
-		ready()
-		<-ctx.Done()
-		return nil
-	}
 
-	// validateConfig(生产装配点,Configure 内同款调用)接线两缝。
 	testConfig := validTestConfig(t)
 	if _, _, err := manager.validateConfig(testConfig); err != nil {
 		t.Fatal(err)
 	}
 
-	// 从未起会话:无活跃隧道 → 两缝同真(离线)。
-	if !egress.OfflineSignalForTest() {
-		t.Fatal("egress 离线信号 = false, want true(无活跃会话)")
-	}
-	if !tcp.MeshOfflineSignalForTest() {
-		t.Fatal("tcp 离线信号 = false, want true(无活跃会话)")
-	}
-
-	// 会话建立:两缝同翻在线。
-	if _, _, err := manager.Configure(testConfig); err != nil {
-		t.Fatal(err)
-	}
-	if egress.OfflineSignalForTest() || tcp.MeshOfflineSignalForTest() {
-		t.Fatalf("会话活跃期两缝应同步为在线: egress=%t tcp=%t",
-			egress.OfflineSignalForTest(), tcp.MeshOfflineSignalForTest())
-	}
-
-	// Stop:两缝同翻离线。
-	manager.Stop()
-	if !egress.OfflineSignalForTest() || !tcp.MeshOfflineSignalForTest() {
-		t.Fatalf("Stop 后两缝应同步为离线: egress=%t tcp=%t",
-			egress.OfflineSignalForTest(), tcp.MeshOfflineSignalForTest())
+	if got := tcp.MeshSelfIDForTest(); got != testConfig.DeviceID {
+		t.Fatalf("tcp selfID = %q, want %q(validateConfig 接线)", got, testConfig.DeviceID)
 	}
 }
 
@@ -100,6 +72,7 @@ func TestEgressPeerSourceAssemblesFirstPeer(t *testing.T) {
 	restoreConfig := swapGlobalMeshConfig(t, &config.MeshConfig{
 		PrivateKey: meshAssemblyTestKeyPEM(t),
 		Peers:      []config.MeshPeer{{DeviceID: "dev-b", LANAddrs: []string{"192.168.1.20:56432"}, HostKey: "SHA256:AAAA"}},
+		Fallback:   &config.MeshFallbackConfig{Enable: boolPtr(true), NextHop: "dev-b"},
 	})
 	defer restoreConfig()
 
@@ -124,7 +97,8 @@ func TestEgressPeerSourceAssemblesFirstPeer(t *testing.T) {
 }
 
 // TestManagerEgressPeerAssemblyNilCases egressPeer 装配的 nil 分支单元钉:
-// 未配置/空 peers/缺身份私钥/空白 device_id → nil。
+// 未配置/开关关(无 Fallback)/next_hop 不指向 peer/peer 未钉扎/缺身份私钥
+// → nil(纯直连)。
 func TestManagerEgressPeerAssemblyNilCases(t *testing.T) {
 	restoreMeshAssemblySeams(t)
 	manager := NewManager(nil)
@@ -132,15 +106,20 @@ func TestManagerEgressPeerAssemblyNilCases(t *testing.T) {
 		t.Fatal(err)
 	}
 	keyPEM := meshAssemblyTestKeyPEM(t)
+	toggle := &config.MeshFallbackConfig{Enable: boolPtr(true), NextHop: "dev-b"}
+	pinned := func() []config.MeshPeer {
+		return []config.MeshPeer{{DeviceID: "dev-b", LANAddrs: []string{"192.168.1.20:56432"}, HostKey: "SHA256:AAAA"}}
+	}
 
 	cases := []struct {
 		name string
 		mesh *config.MeshConfig
 	}{
 		{"未配置(nil)", nil},
-		{"空 peers", &config.MeshConfig{PrivateKey: keyPEM}},
-		{"缺身份私钥", &config.MeshConfig{Peers: []config.MeshPeer{{DeviceID: "dev-b", HostKey: "SHA256:AAAA"}}}},
-		{"空白 device_id", &config.MeshConfig{PrivateKey: keyPEM, Peers: []config.MeshPeer{{DeviceID: "  "}}}},
+		{"开关关(无 Fallback)", &config.MeshConfig{PrivateKey: keyPEM, Peers: pinned()}},
+		{"next_hop 不指向 peer", &config.MeshConfig{PrivateKey: keyPEM, Peers: pinned(), Fallback: &config.MeshFallbackConfig{Enable: boolPtr(true), NextHop: "dev-x"}}},
+		{"peer 未钉扎", &config.MeshConfig{PrivateKey: keyPEM, Peers: []config.MeshPeer{{DeviceID: "dev-b"}}, Fallback: toggle}},
+		{"缺身份私钥", &config.MeshConfig{Peers: pinned(), Fallback: toggle}},
 	}
 	for _, tc := range cases {
 		restore := swapGlobalMeshConfig(t, tc.mesh)
@@ -179,6 +158,7 @@ func TestManagerEgressPeerAssemblyFields(t *testing.T) {
 			LANAddrs: []string{closedAddr, "  "},
 			HostKey:  "SHA256:AAAA",
 		}},
+		Fallback: &config.MeshFallbackConfig{Enable: boolPtr(true), NextHop: "dev-b"},
 	})
 	defer restore()
 
@@ -405,7 +385,7 @@ func TestMeshDNSForwardPeer(t *testing.T) {
 			meshAssemblyTestKeyPEM(t), dnsPeer(nil))
 		m := NewManager(nil)
 		restoreMeshAssemblySeams(t)
-		m.wireMeshAssemblySeams()
+		m.wireMeshAssemblySeams("dev_test")
 
 		// 读缝钉线(MeshDNSForwardPeerSourceForTest):断言接线真的把
 		// meshDNSForwardPeer 放进了隧道缝——删掉 wireMeshAssemblySeams 里的

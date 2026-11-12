@@ -274,7 +274,8 @@
       </div>
     </section>
 
-    <!-- —— 离线兜底常驻卡（§9.4;兜底式非覆盖式,在线时即可预配置）—— -->
+    <!-- —— 出口链路常驻卡(2026-11-12,替代旧「离线兜底」;开关=无条件链到
+         下一跳,不按本机能否直连平台做限制)—— -->
     <section class="space-y-3 rounded-xl border border-dashed border-slate-300 bg-slate-50/60 p-4 dark:border-slate-700 dark:bg-slate-900/40" data-mesh-fallback>
       <div class="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
         <div>
@@ -295,93 +296,28 @@
         </label>
       </div>
 
-      <!-- Addr 手输 + lan_peers 候选点选（beacon 候选无源 IP:点选只补全端口,
-           host 必须手输——无 host 不产出不可拨号的半截地址） -->
-      <div class="grid gap-4 md:grid-cols-[minmax(0,1fr)_240px]">
-        <label class="space-y-2">
-          <span class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('mesh_fallbackAddr') }}</span>
-          <input
-            v-model="form.fallbackAddr"
-            class="w-full rounded-lg border px-3 py-2 font-mono text-sm shadow-sm transition focus:outline-none focus:ring-2 dark:text-slate-100"
-            :class="validationError
-              ? 'border-red-400 bg-red-50 focus:border-red-500 focus:ring-red-500/20 dark:border-red-500/50 dark:bg-red-900/10'
-              : 'border-slate-300 bg-white focus:border-primary focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900'"
-            data-field="meshFallbackAddr"
-            :disabled="loading || saving"
-            :placeholder="t('mesh_fallbackAddrPlaceholder')"
-            type="text"
-            @keydown.enter.prevent
-          />
-        </label>
-        <label class="space-y-2">
-          <span class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('mesh_fallbackCandidate') }}</span>
-          <select
-            class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 disabled:opacity-60 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
-            data-field="meshFallbackCandidate"
-            :disabled="loading || saving || !lanPeers.length"
-            :value="candidateChoice"
-            @change="onCandidateChange"
-          >
-            <option value="">{{ lanPeers.length ? t('mesh_fallbackCandidatePlaceholder') : t('mesh_lanPeersEmpty') }}</option>
-            <option v-for="peer in lanPeers" :key="peer.device_id" :value="peer.device_id">
-              {{ peer.device_id }} · :{{ peer.mesh_port }}
-            </option>
-          </select>
-        </label>
-      </div>
-
-      <!-- 兜底行 host_key（G3/SPEC §13.3.4:与 addr 并列;兜底节点=特殊 peer,格式同对端 host key;
-           spread 保底透传既有值,表单值在前覆盖——字面量只认表单三键,清空走 G2 清空块） -->
+      <!-- 下一跳 = peers 中已配置的节点(后端 Validate:enable 时 next_hop 必填、
+           须指向 peers 中的节点且已钉扎 host_key;地址与指纹从 peers 条目继承,
+           不再单输)。未钉扎的行标注提示,选中后端也会拒。 -->
       <label class="space-y-2">
-        <span class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('mesh_fallbackHostKey') }}</span>
-        <input
-          v-model="form.fallbackHostKey"
-          class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 font-mono text-sm shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 disabled:opacity-60 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
-          data-field="meshFallbackHostKey"
-          :disabled="loading || saving"
-          :placeholder="t('mesh_peerHostKeyPlaceholder')"
-          type="text"
+        <span class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('mesh_fallbackNextHop') }}</span>
+        <select
+          v-model="form.fallbackNextHop"
+          class="w-full rounded-lg border px-3 py-2 text-sm shadow-sm transition focus:outline-none focus:ring-2 dark:text-slate-100"
+          :class="validationError
+            ? 'border-red-400 bg-red-50 focus:border-red-500 focus:ring-red-500/20 dark:border-red-500/50 dark:bg-red-900/10'
+            : 'border-slate-300 bg-white focus:border-primary focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900'"
+          data-field="meshFallbackNextHop"
+          :disabled="loading || saving || !form.peerRows.length"
           @keydown.enter.prevent
-        />
-        <p class="text-xs text-slate-500">{{ t('mesh_fallbackHostKeyHint') }}</p>
+        >
+          <option value="">{{ form.peerRows.length ? t('mesh_fallbackNextHopPlaceholder') : t('mesh_fallbackNextHopEmpty') }}</option>
+          <option v-for="peer in form.peerRows" :key="peer.device_id" :value="peer.device_id">
+            {{ peer.device_id }}{{ peer.host_key ? '' : ' · ' + t('mesh_fallbackNextHopUnpinned') }}
+          </option>
+        </select>
+        <p class="text-xs text-slate-500">{{ t('mesh_fallbackNextHopHint') }}</p>
       </label>
-
-      <!-- Classes 三勾选（后端 meshproto ClassAI/ClassSelf/ClassCustom 子集） -->
-      <fieldset class="space-y-2">
-        <legend class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('mesh_fallbackClasses') }}</legend>
-        <div class="flex flex-wrap gap-4">
-          <label class="inline-flex cursor-pointer items-center gap-2 text-sm text-slate-700 dark:text-slate-300">
-            <input
-              v-model="form.classes.ai"
-              class="h-4 w-4 rounded border-slate-300 text-primary focus:ring-primary/20 dark:border-slate-600 dark:bg-slate-800"
-              data-field="meshClassAi"
-              :disabled="loading || saving"
-              type="checkbox"
-            />
-            {{ t('mesh_fallbackClassAI') }}
-          </label>
-          <label class="inline-flex cursor-pointer items-center gap-2 text-sm text-slate-700 dark:text-slate-300">
-            <input
-              v-model="form.classes.self"
-              class="h-4 w-4 rounded border-slate-300 text-primary focus:ring-primary/20 dark:border-slate-600 dark:bg-slate-800"
-              data-field="meshClassSelf"
-              :disabled="loading || saving"
-              type="checkbox"
-            />
-            {{ t('mesh_fallbackClassSelf') }}
-          </label>
-          <label class="inline-flex cursor-pointer items-center gap-2 text-sm text-slate-700 dark:text-slate-300">
-            <input
-              v-model="form.classes.custom"
-              class="h-4 w-4 rounded border-slate-300 text-primary focus:ring-primary/20 dark:border-slate-600 dark:bg-slate-800"
-              data-field="meshClassCustom"
-              :disabled="loading || saving"
-              type="checkbox"
-            />
-            {{ t('mesh_fallbackClassCustom') }}
-          </label>
-        </div>
-      </fieldset>
     </section>
 
     <!-- —— 节点身份密钥（G3/SPEC §13.3.4）:私钥 textarea 容 PEM 多行 + 口令密码框,
@@ -439,10 +375,9 @@
 </template>
 
 <script>
-import { getAgentStatus, getMeshLanPeers, getMeshStatus } from '../../services/agentApi';
+import { getAgentStatus, getMeshStatus } from '../../services/agentApi';
 import { useI18n } from '../../i18n';
 import {
-  MESH_FALLBACK_CLASSES,
   listMeshDeviceIdMismatches,
   listMeshRulesByPeer,
   normalizeMeshConfig,
@@ -490,8 +425,6 @@ export default {
       meshStatus: null,
       statusLoading: true,
       statusFailed: false,
-      lanPeers: [],
-      candidateChoice: '',
       // 画布:选中态与节点位置（device_id → {x,y};localStorage 持久）
       selectedPair: '',
       selectedNode: '',
@@ -518,7 +451,7 @@ export default {
         return 'loading';
       }
       const peers = Array.isArray(this.meshStatus?.peers) ? this.meshStatus.peers : [];
-      const fallbackArmed = this.configMesh.fallback.enable && Boolean(this.configMesh.fallback.addr);
+      const fallbackArmed = this.configMesh.fallback.enable && Boolean(this.configMesh.fallback.next_hop);
       const unconfigured = peers.length === 0 && !this.meshStatus.forward_enable && !this.configMesh.fallback.enable;
       if (unconfigured) {
         return 'idle';
@@ -559,11 +492,11 @@ export default {
       }
       return 'border-slate-200 bg-slate-50 text-slate-500 dark:border-slate-700 dark:bg-slate-900/40 dark:text-slate-400';
     },
-    // 校验与后端 MeshConfig.Validate「fallback.enable 时 addr 必填」对齐;
-    // 文案是提示层,后端保存时仍是权威（还校验 host:port 形态）。
+    // 校验与后端 MeshConfig.Validate「fallback.enable 时 next_hop 必填」对齐;
+    // 文案是提示层,后端保存时仍是权威(还校验 next_hop 指向已钉扎 peer)。
     validationError() {
-      if (this.form.fallbackEnabled && !String(this.form.fallbackAddr || '').trim()) {
-        return this.t('mesh_validationFallbackAddr');
+      if (this.form.fallbackEnabled && !String(this.form.fallbackNextHop || '').trim()) {
+        return this.t('mesh_validationFallbackNextHop');
       }
       return '';
     },
@@ -720,19 +653,17 @@ export default {
         }
       }
     },
-    // 保存成功后重拉状态两路（幂等 GET）:开关/兜底现值与 LAN 候选随之刷新,
+    // 保存成功后重拉状态(幂等 GET):开关/链路现值随之刷新,
     // 「启用并保存后状态条当场过渡」同 ssh_ingress hostkey 先例。
     successMessage(message) {
       if (message) {
         this.loadMeshStatus();
-        this.loadLanPeers();
       }
     }
   },
   mounted() {
     this.loadRuntime();
     this.loadMeshStatus();
-    this.loadLanPeers();
     this.restoreNodePositions();
     // 全局 pointermove/up:拖拽跨出节点矩形仍跟手;卸载时移除（避免泄漏）
     this.boundPointerMove = (event) => this.onDragMove(event);
@@ -867,20 +798,16 @@ export default {
       const mesh = normalizeMeshConfig(config?.mesh);
       return {
         fallbackEnabled: mesh.fallback.enable,
-        fallbackAddr: mesh.fallback.addr,
-        // 密钥输入位（G3/SPEC §13.3.4）:四类现值从配置回填——「填→保存→刷新仍在」
-        // 的读侧（刷新=props.config 更新,watch 深度重建表单）。缺键渲染空串。
-        fallbackHostKey: mesh.fallback.host_key || '',
+        // 出口链路下一跳(2026-11-12):从配置回填;选项源=表单 peerRows
+        // (行内 host_key 编辑值即时反映到「未钉扎」标注)。
+        fallbackNextHop: mesh.fallback.next_hop || '',
+        // 密钥输入位(G3/SPEC §13.3.4):现值从配置回填——「填→保存→刷新仍在」
+        // 的读侧(刷新=props.config 更新,watch 深度重建表单)。缺键渲染空串。
         privateKey: mesh.private_key || '',
         keyPassphrase: mesh.key_passphrase || '',
-        // peer 行:整行拷贝（device_id/lan_addrs/relay 只作透传底座,行内仅
-        // host_key 可编辑）;无 host_key 的 peer 行也渲染（空输入位）
-        peerRows: mesh.peers.map((peer) => ({ ...peer, host_key: peer.host_key || '' })),
-        classes: {
-          ai: mesh.fallback.classes.includes('ai'),
-          self: mesh.fallback.classes.includes('self'),
-          custom: mesh.fallback.classes.includes('custom')
-        }
+        // peer 行:整行拷贝(device_id/lan_addrs/relay 只作透传底座,行内仅
+        // host_key 可编辑);无 host_key 的 peer 行也渲染(空输入位)
+        peerRows: mesh.peers.map((peer) => ({ ...peer, host_key: peer.host_key || '' }))
       };
     },
     // —— runtime 在线态（GET /api/agent/status;runtimeOnline 既有模式）——
@@ -907,37 +834,6 @@ export default {
         this.statusLoading = false;
       }
     },
-    // —— LAN beacon 候选（GET /api/mesh/lan_peers;离线可用,失败静默空表）——
-    async loadLanPeers() {
-      try {
-        const data = await getMeshLanPeers();
-        const peers = Array.isArray(data?.peers) ? data.peers : [];
-        this.lanPeers = peers
-          .filter((peer) => peer && typeof peer === 'object' && peer.device_id && peer.mesh_port > 0)
-          .map((peer) => ({
-            device_id: String(peer.device_id),
-            mesh_port: peer.mesh_port,
-            cert_fingerprint: String(peer.cert_fingerprint || ''),
-            last_seen_unix: typeof peer.last_seen_unix === 'number' ? peer.last_seen_unix : 0
-          }));
-      } catch {
-        this.lanPeers = [];
-      }
-    },
-    // 候选点选:beacon 候选只带 device_id+mesh_port(无源 IP)——保留已输 host
-    // 补全/替换端口;无 host 不产出不可拨号的半截地址（后端 SplitHostPort 对
-    // "dev-b:56441" 这类形态并不设防,错值只会在拨号期才暴露）。
-    onCandidateChange(event) {
-      const deviceId = event.target.value;
-      const peer = this.lanPeers.find((item) => item.device_id === deviceId);
-      this.candidateChoice = '';
-      if (!peer) {
-        return;
-      }
-      const raw = String(this.form.fallbackAddr || '').trim();
-      const host = (raw.includes(':') ? raw.slice(0, raw.lastIndexOf(':')) : raw).trim();
-      this.form.fallbackAddr = host ? `${host}:${peer.mesh_port}` : '';
-    },
     // 提交载荷:整配置透传 + mesh 覆盖（ModelMappingSettings/SshIngressSettings
     // 同款）。恒产出显式布尔（normalizeMeshConfig 三态→显式,防保存 200 但
     // 永不落盘）;peers/max_hops/开关等未编辑字段经归一化规整透传（Task 3
@@ -956,14 +852,10 @@ export default {
         // peers 以表单行为准（行内 host_key 编辑值必须带出）;未编辑字段整行透传
         peers: this.form.peerRows.map((row) => ({ ...row })),
         fallback: {
-          // 密钥透传（SPEC §13.3.2）：fallback 字面量整体替换,只改 js 归一化
-          // 不够——spread 保住既有 config 的 host_key 等密钥键,表单四键在前
-          // 覆盖用户可编辑值（degenerate 输入由 normalizeMeshFallback 兜底清洗）。
-          ...(this.config?.mesh?.fallback || {}),
+          // 出口链路(2026-11-12):字面量整体替换 {enable,next_hop}——旧版
+          // 字段(classes/addr/host_key)随替换一并清除,后端结构体已不认这些键。
           enable: !!this.form.fallbackEnabled,
-          addr: String(this.form.fallbackAddr || '').trim(),
-          host_key: String(this.form.fallbackHostKey ?? ''),
-          classes: MESH_FALLBACK_CLASSES.filter((cls) => this.form.classes[cls])
+          next_hop: String(this.form.fallbackNextHop || '').trim()
         }
       });
       this.$emit('save', this.savePayload(mesh));

@@ -2,7 +2,7 @@
 // hostPortFromMetadata 把四形态的连接元数据拆成 (host, port) 二元组,
 // exitPayload 再编码为 mesh-exit channel 的 JSON ExtraData(tcp 带 h/p;
 // dns 特殊目标无 h/p)。导出缝 ExitPayloadForMetadata/ErrUnbuildableTarget
-// 供 processor/tcp 的兜底拨号路径(DialMeshAddr 无 ExitClient 消费面)复用。
+// 供集成测试(test/mesh_integration_test.go)做 payload 等价断言复用。
 package mesh
 
 import (
@@ -23,6 +23,10 @@ type exitMeta struct {
 	T string `json:"t"`
 	H string `json:"h"`
 	P uint16 `json:"p"`
+	// Via 出口链路经停链(2026-11-12):出口侧原样传递 md.MeshVia;本跳
+	// 自己的 id 由委托拨号点(processor/tcp mesh_delegate)在拨出前追加。
+	// dns 变体无链语义,恒不带。键用单字母 v 控制 ExtraData 体积(512 上限)。
+	Via []string `json:"v,omitempty"`
 }
 
 // errUnbuildableTarget 元数据无法构造出口目标(HostName 空/纯空白且
@@ -82,6 +86,10 @@ func exitPayload(md *M.Metadata) []byte {
 	if err != nil || port == 0 {
 		return nil // 端口非法同样按不可构造处理
 	}
-	b, _ := json.Marshal(exitMeta{T: "tcp", H: host, P: uint16(port)})
+	meta := exitMeta{T: "tcp", H: host, P: uint16(port)}
+	if len(md.MeshVia) > 0 {
+		meta.Via = md.MeshVia
+	}
+	b, _ := json.Marshal(meta)
 	return b
 }

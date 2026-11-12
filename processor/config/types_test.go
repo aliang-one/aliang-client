@@ -1772,15 +1772,15 @@ func TestConfigValidate_MeshHopsClamped(t *testing.T) {
 	}
 }
 
-func TestConfigValidate_MeshFallbackRequiresAddr(t *testing.T) {
+func TestConfigValidate_MeshFallbackRequiresNextHop(t *testing.T) {
 	cfg := &Config{
 		Core: &CoreConfig{APIServer: "https://api.example.com"},
 		Customer: &CustomerConfig{Mesh: &MeshConfig{
 			Fallback: &MeshFallbackConfig{Enable: boolPtr(true)},
 		}},
 	}
-	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "mesh.fallback") {
-		t.Fatalf("want mesh.fallback addr error, got %v", err)
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "mesh.fallback.next_hop") {
+		t.Fatalf("want mesh.fallback.next_hop error, got %v", err)
 	}
 }
 
@@ -1788,8 +1788,7 @@ func TestConfigValidate_MeshRejectsSelfReference(t *testing.T) {
 	// spec §3.4/§7 层0:目标节点=自己,配置校验期直接拒绝
 	selfID := "dev-self"
 	cfg := &Config{Customer: &CustomerConfig{Mesh: &MeshConfig{
-		Peers:    []MeshPeer{{DeviceID: selfID}},
-		Fallback: &MeshFallbackConfig{Enable: boolPtr(true), Addr: "192.168.1.20:9443"},
+		Peers: []MeshPeer{{DeviceID: selfID}},
 	}}}
 	if err := cfg.ValidateMesh(selfID); err == nil || !strings.Contains(err.Error(), "self") {
 		t.Fatalf("want self-reference error, got %v", err)
@@ -1816,9 +1815,9 @@ func TestConfigValidate_MeshRejectsSelfReference(t *testing.T) {
 }
 
 // 钉死「规整落盘」副作用:Validate 不只校验,还把 device_id/lan_addrs/
-// fallback.addr 的空白规整就地写回(保存路径随后序列化落盘)。若将来有人
-// 把 Validate 改成纯函数,这个测试会先红——规整丢了=保存期防线退化为只挡
-// 不修,ValidateMesh 的精确比对也会重新暴露空白变体。
+// fallback.next_hop 的空白规整就地写回(保存路径随后序列化落盘)。若将来
+// 有人把 Validate 改成纯函数,这个测试会先红——规整丢了=保存期防线退化为
+// 只挡不修,ValidateMesh 的精确比对也会重新暴露空白变体。
 func TestConfigValidate_MeshNormalizesWhitespaceInPlace(t *testing.T) {
 	cfg := &Config{
 		Core: &CoreConfig{APIServer: "https://api.example.com"},
@@ -1829,7 +1828,7 @@ func TestConfigValidate_MeshNormalizesWhitespaceInPlace(t *testing.T) {
 				LANAddrs: []string{"  192.168.1.20:9443  "},
 				HostKey:  "  SHA256:peer-b  ",
 			}},
-			Fallback: &MeshFallbackConfig{Enable: boolPtr(true), Addr: "  192.168.1.21:9443  ", HostKey: "  SHA256:fb  "},
+			Fallback: &MeshFallbackConfig{Enable: boolPtr(true), NextHop: "  dev-b  "},
 		}},
 	}
 	if err := cfg.Validate(); err != nil {
@@ -1845,11 +1844,8 @@ func TestConfigValidate_MeshNormalizesWhitespaceInPlace(t *testing.T) {
 	if peer.HostKey != "SHA256:peer-b" {
 		t.Fatalf("host_key 应就地规整落盘, got %q", peer.HostKey)
 	}
-	if cfg.Customer.Mesh.Fallback.Addr != "192.168.1.21:9443" {
-		t.Fatalf("fallback.addr 应就地规整落盘, got %q", cfg.Customer.Mesh.Fallback.Addr)
-	}
-	if cfg.Customer.Mesh.Fallback.HostKey != "SHA256:fb" {
-		t.Fatalf("fallback.host_key 应就地规整落盘, got %q", cfg.Customer.Mesh.Fallback.HostKey)
+	if cfg.Customer.Mesh.Fallback.NextHop != "dev-b" {
+		t.Fatalf("fallback.next_hop 应就地规整落盘, got %q", cfg.Customer.Mesh.Fallback.NextHop)
 	}
 }
 

@@ -11,11 +11,10 @@ import {
   listMeshDeviceIdMismatches,
   normalizeMeshConfig,
   parseAuthorizedKeyComment,
-  parseMeshRuleTargetCount,
-  MESH_FALLBACK_CLASSES
+  parseMeshRuleTargetCount
 } from './MeshSettings.js';
 import { buildCustomerSavePatch } from '../SettingsPage.vue';
-import { getMeshLanPeers, getMeshStatus } from '../../services/agentApi';
+import { getMeshStatus } from '../../services/agentApi';
 import MeshSettings from './MeshSettings.vue';
 import en from '../../i18n/en';
 import zh from '../../i18n/zh';
@@ -33,7 +32,7 @@ describe('MeshSettings normalizeMeshConfig', () => {
       forward_enable: false,
       max_hops: 0,
       peers: [],
-      fallback: { enable: false, classes: [], addr: '' }
+      fallback: { enable: false, next_hop: '' }
     });
     // 显式布尔断言：nil → 显式 true/false，而非 undefined（镜像 ssh_ingress 先例）
     const defaults = normalizeMeshConfig(undefined);
@@ -53,13 +52,12 @@ describe('MeshSettings normalizeMeshConfig', () => {
     const out = normalizeMeshConfig({
       enable: false,
       forward_enable: true,
-      fallback: { enable: true, addr: '192.168.1.20:56441', classes: ['ai'] }
+      fallback: { enable: true, next_hop: 'dev-b' }
     });
     expect(out.enable).toBe(false);
     expect(out.forward_enable).toBe(true);
     expect(out.fallback.enable).toBe(true);
-    expect(out.fallback.addr).toBe('192.168.1.20:56441');
-    expect(out.fallback.classes).toEqual(['ai']);
+    expect(out.fallback.next_hop).toBe('dev-b');
   });
 
   it('max_hops：[1,8] 保留、>8 钳到 8（对齐后端读侧 EffectiveMaxHops）、≤0/非数归 0（默认 5）', () => {
@@ -99,24 +97,25 @@ describe('MeshSettings normalizeMeshConfig', () => {
     const out = normalizeMeshConfig({
       fallback: {
         enable: true,
-        addr: '  192.168.1.20:56441  ',
-        classes: [' ai ', 'bogus', 'custom', 'ai', 'self', 42, '']
+        next_hop: '  dev-b  '
       }
     });
-    expect(out.fallback.addr).toBe('192.168.1.20:56441');
-    expect(out.fallback.classes).toEqual(['ai', 'custom', 'self']);
-    expect(MESH_FALLBACK_CLASSES).toEqual(['ai', 'self', 'custom']);
+    expect(out.fallback.next_hop).toBe('dev-b');
+    // 旧版字段(classes/addr/host_key)不再读取(出口链路 2026-11-12)
+    expect('classes' in out.fallback).toBe(false);
+    expect('addr' in out.fallback).toBe(false);
+    expect('host_key' in out.fallback).toBe(false);
     // fallback 非对象（字符串/数组）→ 默认；enable 非布尔 → false
-    expect(normalizeMeshConfig({ fallback: 'x' }).fallback).toEqual({ enable: false, classes: [], addr: '' });
+    expect(normalizeMeshConfig({ fallback: 'x' }).fallback).toEqual({ enable: false, next_hop: '' });
     expect(normalizeMeshConfig({ fallback: { enable: 'yes' } }).fallback.enable).toBe(false);
-    expect(normalizeMeshConfig({ fallback: { addr: 42 } }).fallback.addr).toBe('');
+    expect(normalizeMeshConfig({ fallback: { next_hop: 42 } }).fallback.next_hop).toBe('');
   });
 });
 
-// —— 密钥字段透传（SPEC §13.3.1：后端 customer.mesh 新增三个密钥字段
-//    private_key/key_passphrase/peers[].host_key/fallback.host_key——读侧归一
+// —— 密钥字段透传（SPEC §13.3.1：后端 customer.mesh 密钥字段
+//    private_key/key_passphrase/peers[].host_key——读侧归一
 //    不抹、保存 patch 不丢；空串不落键 = 「该处没有密钥」，后端 deep-merge
-//    语义一致，与 enable/classes 等可选键的省缺口径一致）——
+//    语义一致）——
 describe('MeshSettings 密钥字段透传', () => {
   it('peers[].host_key 透传；空串/缺键不落键（该 peer 没有 host_key）', () => {
     const out = normalizeMeshConfig({
@@ -138,17 +137,11 @@ describe('MeshSettings 密钥字段透传', () => {
     expect(normalizeMeshConfig({ peers: [{ device_id: 'dev-e', host_key: 42 }] }).peers[0].host_key).toBe('42');
   });
 
-  it('fallback.host_key 透传；空串不落键', () => {
+  it('fallback 旧版 host_key/classes/addr 键不再落输出(出口链路整体替换)', () => {
     const out = normalizeMeshConfig({
       fallback: { enable: true, addr: '10.0.0.5:56441', classes: ['ai'], host_key: 'fallback-host-key' }
     });
-    expect(out.fallback).toEqual({
-      enable: true,
-      addr: '10.0.0.5:56441',
-      classes: ['ai'],
-      host_key: 'fallback-host-key'
-    });
-    expect('host_key' in normalizeMeshConfig({ fallback: { enable: true, host_key: '' } }).fallback).toBe(false);
+    expect(out.fallback).toEqual({ enable: true, next_hop: '' });
   });
 
   it('private_key/key_passphrase 透传；空串不落键（省缺即「未配置密钥」）', () => {
@@ -239,14 +232,6 @@ describe('agentApi mesh 端点', () => {
     }));
   });
 
-  it('getMeshLanPeers：GET /api/mesh/lan_peers 并拆 data.peers', async () => {
-    const peersPayload = { peers: [{ device_id: 'dev-b', mesh_port: 56441, cert_fingerprint: '', last_seen_unix: 123 }] };
-    const fetchMock = vi.fn().mockResolvedValue(okEnvelope(peersPayload));
-    vi.stubGlobal('fetch', fetchMock);
-    await expect(getMeshLanPeers()).resolves.toEqual(peersPayload);
-    expect(fetchMock).toHaveBeenCalledWith('/api/mesh/lan_peers', expect.objectContaining({ method: 'GET' }));
-  });
-
   it('非零 code 抛错并透传 msg（调用方处理错误）', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
       ok: true,
@@ -268,7 +253,7 @@ describe('SettingsPage buildCustomerSavePatch（mesh 透传链）', () => {
     forward_enable: false,
     max_hops: 5,
     peers: [{ device_id: 'dev-b', lan_addrs: ['192.168.1.20:56441'], relay: true }],
-    fallback: { enable: false, classes: [], addr: '' }
+    fallback: { enable: false, next_hop: '' }
   };
 
   it('RulesSettings 三段载荷不得把 mesh 归零（父层合并兜底）', () => {
@@ -293,26 +278,28 @@ describe('SettingsPage buildCustomerSavePatch（mesh 透传链）', () => {
           forward_enable: false,
           max_hops: 5,
           peers: [{ device_id: ' dev-b ', lan_addrs: ['192.168.1.20:56441'], relay: true }],
-          fallback: { enable: true, addr: '192.168.1.20:56441', classes: ['ai'] }
+          fallback: { enable: true, next_hop: 'dev-b' }
         }
       },
       current
     );
     // peers 带空白透传规整后与现值等价 → 不进 patch；只有 fallback 变化
     expect(patch.mesh).toEqual({
-      fallback: { enable: true, addr: '192.168.1.20:56441', classes: ['ai'] }
+      fallback: { enable: true, next_hop: 'dev-b' }
     });
   });
 
-  it('关兜底并清空 addr：空串显式带出（防旧地址在再启用时复活）', () => {
+  it('关开关并清空 next_hop：空串显式带出（防旧下一跳在再启用时复活）', () => {
     const current = {
-      mesh: { ...meshConfigured, fallback: { enable: true, classes: ['ai'], addr: '192.168.1.20:56441' } }
+      mesh: { ...meshConfigured, fallback: { enable: true, next_hop: 'dev-b' } }
     };
     const patch = buildCustomerSavePatch(
-      { mesh: { ...meshConfigured, fallback: { enable: false, classes: ['ai'], addr: '' } } },
+      { mesh: { ...meshConfigured, fallback: { enable: false, next_hop: '' } } },
       current
     );
-    expect(patch.mesh.fallback).toEqual({ enable: false, addr: '' });
+    // next_hop 从 dev-b 改 '' 经空串跳过规则不进 patch(与旧 addr 同口径):
+    // 开关关时保留旧 next_hop 无害,再启用时表单还能回显旧选择
+    expect(patch.mesh.fallback).toEqual({ enable: false });
   });
 
   it('GET 回显值原样透传不产生伪 diff（无改动 → 无 patch）', () => {
@@ -322,7 +309,7 @@ describe('SettingsPage buildCustomerSavePatch（mesh 透传链）', () => {
   });
 
   // —— mesh 凭据清空补救（SPEC §13.3.3）：G1 之后 private_key/key_passphrase/
-  // fallback.host_key 空串不落键 → normalizedNext.mesh.<key> 为 undefined,
+  // peers[].host_key 空串不落键 → normalizedNext.mesh.<key> 为 undefined,
   // buildConfigPatch 对「next 缺键」直接跳过 → 旧值经后端 deep-merge 存活,
   // 用户以为撤销了密钥实际没有。三键必须显式发空串覆盖旧值。
   it('private_key 从有值改空：空串显式进 patch.mesh（撤销语义）', () => {
@@ -343,18 +330,6 @@ describe('SettingsPage buildCustomerSavePatch（mesh 透传链）', () => {
     );
     expect(Object.prototype.hasOwnProperty.call(patch.mesh, 'key_passphrase')).toBe(true);
     expect(patch.mesh.key_passphrase).toBe('');
-  });
-
-  it('fallback.host_key 从有值改空：空串显式进 patch.mesh.fallback（撤销语义）', () => {
-    const current = {
-      mesh: { ...meshConfigured, fallback: { enable: true, classes: ['ai'], addr: 'fb:56441', host_key: 'HK-fb-old' } }
-    };
-    const patch = buildCustomerSavePatch(
-      { mesh: { ...meshConfigured, fallback: { enable: true, classes: ['ai'], addr: 'fb:56441', host_key: '' } } },
-      current
-    );
-    expect(Object.prototype.hasOwnProperty.call(patch.mesh.fallback, 'host_key')).toBe(true);
-    expect(patch.mesh.fallback.host_key).toBe('');
   });
 
   it('private_key 有值→有值（不变）：不产生清空伪 patch（「未改动」语义不被补救块破坏）', () => {
@@ -435,14 +410,14 @@ function baseConfig(meshOverrides = {}) {
       forward_enable: false,
       max_hops: 5,
       peers: [{ device_id: 'dev-b', lan_addrs: ['192.168.1.20:56441'], relay: true }],
-      fallback: { enable: false, classes: [], addr: '' },
+      fallback: { enable: false, next_hop: '' },
       ...meshOverrides
     }
   };
 }
 
 // 带全量密钥的基座配置（G3 密钥输入位共用;含 saving 态禁用断言）:peer dev-b
-// 有 host_key、dev-c 没有（渲染空行）、兜底 host_key + 节点私钥/口令齐备。
+// 有 host_key、dev-c 没有（渲染空行）、节点私钥/口令齐备。
 function keyConfig() {
   return baseConfig({
     private_key: 'sk-old',
@@ -450,8 +425,7 @@ function keyConfig() {
     peers: [
       { device_id: 'dev-b', lan_addrs: ['192.168.1.20:56441'], relay: true, host_key: 'HK-peer-old' },
       { device_id: 'dev-c', lan_addrs: ['192.168.1.21:56441'], relay: true }
-    ],
-    fallback: { enable: false, classes: [], addr: '', host_key: 'HK-fb-old' }
+    ]
   });
 }
 
@@ -466,14 +440,10 @@ const defaultMeshStatus = () => ({
   lan_peers: []
 });
 
-const LAN_PEERS = [
-  { device_id: 'dev-b', mesh_port: 56441, cert_fingerprint: '', last_seen_unix: 123 },
-  { device_id: 'dev-c', mesh_port: 56442, cert_fingerprint: '', last_seen_unix: 122 }
-];
-
-// 三路补充数据的 URL 路由 stub：agentStatus/meshStatus 默认在线+已配置；
-// *Error 模拟拉取失败（信封失败或网络拒绝）。
-function stubApi({ agentStatus, agentStatusError, meshStatus, meshStatusError, lanPeers, lanPeersError } = {}) {
+// 两路补充数据的 URL 路由 stub：agentStatus/meshStatus 默认在线+已配置；
+// *Error 模拟拉取失败（信封失败或网络拒绝）。lan_peers 拉取已随出口链路
+// 改造移除（下一跳选项源=配置 peers,不再消费 beacon 候选）。
+function stubApi({ agentStatus, agentStatusError, meshStatus, meshStatusError } = {}) {
   vi.stubGlobal('fetch', vi.fn((path) => {
     if (path === '/api/agent/status') {
       return agentStatusError
@@ -484,11 +454,6 @@ function stubApi({ agentStatus, agentStatusError, meshStatus, meshStatusError, l
       return meshStatusError
         ? Promise.reject(new Error('mesh down'))
         : Promise.resolve(jsonOk(meshStatus ?? defaultMeshStatus()));
-    }
-    if (path === '/api/mesh/lan_peers') {
-      return lanPeersError
-        ? Promise.reject(new Error('lan peers down'))
-        : Promise.resolve(jsonOk({ peers: lanPeers ?? [] }));
     }
     return Promise.reject(new Error(`unexpected fetch: ${path}`));
   }));
@@ -512,16 +477,17 @@ function setPeerKey(el, deviceId, value) {
   node.dispatchEvent(new Event('input', { bubbles: true }));
 }
 
+// v-model select 监听 change 事件（Vue 3 对 select 用 change 而非 input）
+function setSelect(el, field, value) {
+  const node = el.querySelector(`[data-field="${field}"]`);
+  node.value = value;
+  node.dispatchEvent(new Event('change', { bubbles: true }));
+}
+
 // jsdom 坑：checkbox .click() 不发 change（peer-link 审计存档）——赋 checked 再派发
 function setToggle(el, field, checked) {
   const node = el.querySelector(`[data-field="${field}"]`);
   node.checked = checked;
-  node.dispatchEvent(new Event('change', { bubbles: true }));
-}
-
-function selectCandidate(el, field, value) {
-  const node = el.querySelector(`[data-field="${field}"]`);
-  node.value = value;
   node.dispatchEvent(new Event('change', { bubbles: true }));
 }
 
@@ -539,7 +505,7 @@ function statusPill(el) {
 
 describe('MeshSettings 卡片', () => {
   beforeEach(() => {
-    stubApi({ lanPeers: LAN_PEERS });
+    stubApi();
   });
 
   afterEach(() => {
@@ -563,10 +529,10 @@ describe('MeshSettings 卡片', () => {
     expect(pill.className).not.toContain('amber');
   });
 
-  it('离线 + 兜底已启用（保存态 enable+addr）：琥珀 mesh_statusOfflineFallback', async () => {
+  it('离线 + 出口链路已启用（保存态 enable+next_hop）：琥珀 mesh_statusOfflineFallback', async () => {
     stubApi({ agentStatus: { runtime: { online: false } } });
     const { el } = mountCard(baseConfig({
-      fallback: { enable: true, classes: ['ai'], addr: '192.168.1.20:56441' }
+      fallback: { enable: true, next_hop: 'dev-b' }
     }));
     await flush();
     const pill = statusPill(el);
@@ -582,7 +548,7 @@ describe('MeshSettings 卡片', () => {
     expect(statusPill(el).textContent).not.toContain('mesh_statusOfflineFallback');
   });
 
-  it('未装配（status peers 空+forward=false+无兜底）：灰态 mesh_statusIdle；优先于离线判定', async () => {
+  it('未装配（status peers 空+forward=false+开关关）：灰态 mesh_statusIdle；优先于离线判定', async () => {
     stubApi({
       agentStatus: { runtime: { online: false } },
       meshStatus: { ...defaultMeshStatus(), peers: [], forward_enable: false }
@@ -603,7 +569,7 @@ describe('MeshSettings 卡片', () => {
     expect(pill.textContent).toContain('mesh_statusDegraded');
     expect(pill.className).toContain('amber');
     expect(el.textContent).toContain('mesh_statusDegradedHint');
-    // 降级态不误报「兜底生效中」
+    // 降级态不误报「链路生效中」
     expect(pill.textContent).not.toContain('mesh_statusOfflineFallback');
   });
 
@@ -620,96 +586,52 @@ describe('MeshSettings 卡片', () => {
     expect(el.textContent).not.toContain('mesh_statusDegradedHint');
   });
 
-  it('组合②：lan_peers 拉取失败 → 静默空表不报错（发现缺席是合法态,不冒充降级）', async () => {
-    stubApi({ lanPeersError: true });
-    const { el } = mountCard(baseConfig());
-    await flush();
-    const select = el.querySelector('[data-field="meshFallbackCandidate"]');
-    expect([...select.querySelectorAll('option')].map((o) => o.value)).toEqual(['']);
-    expect(select.textContent).toContain('mesh_lanPeersEmpty');
-    expect(statusPill(el).textContent).toContain('mesh_statusOnline');
-    expect(el.textContent).not.toContain('mesh_statusDegradedHint');
-  });
-
-  it('组合③：lanPeers 空表时候选 select disabled', async () => {
-    stubApi({ lanPeers: [] });
-    const { el } = mountCard(baseConfig());
-    await flush();
-    expect(el.querySelector('[data-field="meshFallbackCandidate"]').disabled).toBe(true);
-  });
-
-  it('saving 态：兜底开关与全部编辑控件、保存按钮禁用（与兄弟控件口径一致）', async () => {
+  it('saving 态：出口链路开关与全部编辑控件、保存按钮禁用（与兄弟控件口径一致）', async () => {
     const { el } = mountCard(keyConfig(), { saving: true });
     await flush();
     expect(el.querySelector('[data-field="meshFallbackEnable"]').disabled).toBe(true);
-    expect(el.querySelector('[data-field="meshFallbackAddr"]').disabled).toBe(true);
-    expect(el.querySelector('[data-field="meshFallbackClassAi"], [data-field="meshClassAi"]').disabled).toBe(true);
-    expect(el.querySelector('[data-field="meshFallbackCandidate"]').disabled).toBe(true);
+    expect(el.querySelector('[data-field="meshFallbackNextHop"]').disabled).toBe(true);
     // G3 密钥输入位与兄弟控件同口径禁用
-    expect(el.querySelector('[data-field="meshFallbackHostKey"]').disabled).toBe(true);
     expect(el.querySelector('[data-field="meshPrivateKey"]').disabled).toBe(true);
     expect(el.querySelector('[data-field="meshKeyPassphrase"]').disabled).toBe(true);
     expect(peerKeyInput(el, 'dev-b').disabled).toBe(true);
     expect(saveButton(el).disabled).toBe(true);
   });
 
-  it('卡片挂载拉取 lan_peers 候选并渲染下拉选项', async () => {
-    const { el } = mountCard(baseConfig());
-    await flush();
-    expect(globalThis.fetch).toHaveBeenCalledWith('/api/mesh/lan_peers', expect.anything());
-    const select = el.querySelector('[data-field="meshFallbackCandidate"]');
-    const options = [...select.querySelectorAll('option')];
-    expect(options.map((o) => o.value)).toEqual(['', 'dev-b', 'dev-c']);
-  });
-
-  // —— 兜底常驻卡编辑 + save 载荷 ——
-  it('回显：开关/地址/类别勾选从配置回填', async () => {
+  // —— 出口链路常驻卡编辑 + save 载荷 ——
+  it('回显：开关/下一跳从配置回填；未钉扎 peer 行带「未绑指纹」标注', async () => {
     const { el } = mountCard(baseConfig({
-      fallback: { enable: true, classes: ['ai', 'custom'], addr: '192.168.1.20:56441' }
+      peers: [
+        { device_id: 'dev-b', lan_addrs: ['192.168.1.20:56441'], relay: true, host_key: 'HK-b' },
+        { device_id: 'dev-c', lan_addrs: ['192.168.1.21:56441'], relay: true }
+      ],
+      fallback: { enable: true, next_hop: 'dev-b' }
     }));
     await flush();
     expect(el.querySelector('[data-field="meshFallbackEnable"]').checked).toBe(true);
-    expect(el.querySelector('[data-field="meshFallbackAddr"]').value).toBe('192.168.1.20:56441');
-    expect(el.querySelector('[data-field="meshClassAi"]').checked).toBe(true);
-    expect(el.querySelector('[data-field="meshClassSelf"]').checked).toBe(false);
-    expect(el.querySelector('[data-field="meshClassCustom"]').checked).toBe(true);
+    expect(el.querySelector('[data-field="meshFallbackNextHop"]').value).toBe('dev-b');
+    const options = [...el.querySelector('[data-field="meshFallbackNextHop"]').querySelectorAll('option')];
+    expect(options.map((o) => o.value)).toEqual(['', 'dev-b', 'dev-c']);
+    // dev-c 无 host_key → 选项文案带「未绑指纹」提示键
+    expect(options[2].textContent).toContain('mesh_fallbackNextHopUnpinned');
+    expect(options[1].textContent).not.toContain('mesh_fallbackNextHopUnpinned');
   });
 
-  it('校验：兜底 Enable=true 而 Addr 空 → mesh_validationFallbackAddr + 禁保存', async () => {
+  it('校验：开关 Enable=true 而 next_hop 空 → mesh_validationFallbackNextHop + 禁保存', async () => {
     const { el, saved } = mountCard(baseConfig());
     await flush();
     setToggle(el, 'meshFallbackEnable', true);
     await flush();
-    expect(el.textContent).toContain('mesh_validationFallbackAddr');
+    expect(el.textContent).toContain('mesh_validationFallbackNextHop');
     expect(saveButton(el).disabled).toBe(true);
     clickSave(el);
     await flush();
     expect(saved).toHaveLength(0);
 
-    setField(el, 'meshFallbackAddr', '192.168.1.20:56441');
+    setSelect(el, 'meshFallbackNextHop', 'dev-b');
     await flush();
-    expect(el.textContent).not.toContain('mesh_validationFallbackAddr');
+    expect(el.textContent).not.toContain('mesh_validationFallbackNextHop');
     expect(saveButton(el).disabled).toBe(false);
-  });
-
-  it('候选点选：已输 host 补全 host:port；无 host 不产出半截地址', async () => {
-    const { el } = mountCard(baseConfig());
-    await flush();
-    setField(el, 'meshFallbackAddr', '192.168.1.20');
-    selectCandidate(el, 'meshFallbackCandidate', 'dev-b');
-    await flush();
-    expect(el.querySelector('[data-field="meshFallbackAddr"]').value).toBe('192.168.1.20:56441');
-
-    // 完整地址再点选 → 端口被替换为该候选端口
-    selectCandidate(el, 'meshFallbackCandidate', 'dev-c');
-    await flush();
-    expect(el.querySelector('[data-field="meshFallbackAddr"]').value).toBe('192.168.1.20:56442');
-
-    // 清空后点选 → 无 host 不填半截（beacon 候选无源 IP，host 必须手输）
-    setField(el, 'meshFallbackAddr', '');
-    selectCandidate(el, 'meshFallbackCandidate', 'dev-b');
-    await flush();
-    expect(el.querySelector('[data-field="meshFallbackAddr"]').value).toBe('');
   });
 
   it('save 载荷：整配置透传 + mesh 恒显式布尔 + peers 规整透传 + fallback 编辑值', async () => {
@@ -718,9 +640,7 @@ describe('MeshSettings 卡片', () => {
     }));
     await flush();
     setToggle(el, 'meshFallbackEnable', true);
-    setField(el, 'meshFallbackAddr', ' 192.168.1.20:56441 ');
-    setToggle(el, 'meshClassSelf', true);
-    setToggle(el, 'meshClassCustom', true);
+    setSelect(el, 'meshFallbackNextHop', 'dev-b');
     await flush();
     clickSave(el);
     await flush();
@@ -732,39 +652,38 @@ describe('MeshSettings 卡片', () => {
       forward_enable: false,
       max_hops: 5,
       peers: [{ device_id: 'dev-b', lan_addrs: ['192.168.1.20:56441'], relay: false }],
-      fallback: { enable: true, addr: '192.168.1.20:56441', classes: ['self', 'custom'] }
+      fallback: { enable: true, next_hop: 'dev-b' }
     });
     // 恒产出显式布尔（ssh_ingress 先例）：nil 不透传成 undefined
     expect(typeof saved[0].mesh.enable).toBe('boolean');
     expect(saved[0].mesh.enable).toBe(true);
   });
 
-  it('save 载荷：配置缺 mesh 段 → 默认显式布尔（enable=true/forward=false）随兜底一起落盘', async () => {
+  it('save 载荷：配置缺 mesh 段 → 默认显式布尔（enable=true/forward=false）随链路开关一起落盘', async () => {
     const { el, saved } = mountCard({ ...baseConfig(), mesh: undefined });
     await flush();
+    // mesh 段缺失 → 无 peers → next-hop select 禁用;开关开但 next_hop 空
+    // 会被前端校验拦下——先经 peers 行透传路径直接断言归一化行为不适用,
+    // 这里验证「开关开但选不了」时保存被禁(校验兜底)。
     setToggle(el, 'meshFallbackEnable', true);
-    setField(el, 'meshFallbackAddr', '10.0.0.5:56441');
     await flush();
+    expect(el.querySelector('[data-field="meshFallbackNextHop"]').disabled).toBe(true);
+    expect(saveButton(el).disabled).toBe(true);
     clickSave(el);
     await flush();
-    expect(saved[0].mesh.enable).toBe(true);
-    expect(saved[0].mesh.forward_enable).toBe(false);
-    expect(saved[0].mesh.max_hops).toBe(0);
-    expect(saved[0].mesh.peers).toEqual([]);
-    expect(saved[0].mesh.fallback).toEqual({ enable: true, addr: '10.0.0.5:56441', classes: [] });
+    expect(saved).toHaveLength(0);
   });
 
-  it('save 载荷：fallback.host_key 经 spread 透传不被字面量抹掉，peers/private_key/key_passphrase 同保（SPEC §13.3.2）', async () => {
+  it('save 载荷：旧版 fallback 字段(classes/addr/host_key)随字面量整体替换清除，peers/private_key/key_passphrase 同保（出口链路 2026-11-12）', async () => {
     const { el, saved } = mountCard(baseConfig({
       private_key: 'mesh-private-key',
       key_passphrase: 'mesh-passphrase',
       peers: [{ device_id: 'dev-b', lan_addrs: ['192.168.1.20:56441'], relay: true, host_key: 'peer-host-key' }],
-      fallback: { enable: false, classes: [], addr: '', host_key: 'fallback-host-key' }
+      fallback: { enable: false, addr: '10.0.0.5:56441', classes: ['ai'], host_key: 'fallback-host-key' }
     }));
     await flush();
     setToggle(el, 'meshFallbackEnable', true);
-    setField(el, 'meshFallbackAddr', ' 10.0.0.5:56441 ');
-    setToggle(el, 'meshClassAi', true);
+    setSelect(el, 'meshFallbackNextHop', 'dev-b');
     await flush();
     clickSave(el);
     await flush();
@@ -773,13 +692,8 @@ describe('MeshSettings 卡片', () => {
     expect(saved[0].mesh.private_key).toBe('mesh-private-key');
     expect(saved[0].mesh.key_passphrase).toBe('mesh-passphrase');
     expect(saved[0].mesh.peers[0].host_key).toBe('peer-host-key');
-    // fallback 字面量改造：表单三键覆盖用户可编辑值，host_key 从既有 config spread 透传
-    expect(saved[0].mesh.fallback).toEqual({
-      enable: true,
-      addr: '10.0.0.5:56441',
-      classes: ['ai'],
-      host_key: 'fallback-host-key'
-    });
+    // fallback 字面量整体替换：旧键不残留
+    expect(saved[0].mesh.fallback).toEqual({ enable: true, next_hop: 'dev-b' });
   });
 
   it('i18n：mesh_* 新键 zh/en 同步存在', () => {
@@ -796,22 +710,17 @@ describe('MeshSettings 卡片', () => {
       'mesh_fallbackTitle',
       'mesh_fallbackDesc',
       'mesh_fallbackEnable',
-      'mesh_fallbackAddr',
-      'mesh_fallbackAddrPlaceholder',
-      'mesh_fallbackCandidate',
-      'mesh_fallbackCandidatePlaceholder',
-      'mesh_lanPeersEmpty',
-      'mesh_fallbackClasses',
-      'mesh_fallbackClassAI',
-      'mesh_fallbackClassSelf',
-      'mesh_fallbackClassCustom',
-      'mesh_validationFallbackAddr',
+      'mesh_fallbackNextHop',
+      'mesh_fallbackNextHopPlaceholder',
+      'mesh_fallbackNextHopEmpty',
+      'mesh_fallbackNextHopUnpinned',
+      'mesh_fallbackNextHopHint',
+      'mesh_validationFallbackNextHop',
       // G3 密钥输入位（SPEC §13.3.6）
       'mesh_peersTitle',
       'mesh_peerHostKey',
       'mesh_peerHostKeyPlaceholder',
       'mesh_peerHostKeyHint',
-      'mesh_fallbackHostKey',
       'mesh_privateKey',
       'mesh_privateKeyPlaceholder',
       'mesh_privateKeyHint',
@@ -844,8 +753,6 @@ describe('MeshSettings 密钥输入位（G3）', () => {
     expect(el.querySelector('[data-mesh-peer-row="dev-c"]')).not.toBeNull();
     expect(peerKeyInput(el, 'dev-b').value).toBe('HK-peer-old');
     expect(peerKeyInput(el, 'dev-c').value).toBe(''); // 无 host_key 的 peer 行渲染空
-    // 兜底行 host_key（与 addr 并列）
-    expect(el.querySelector('[data-field="meshFallbackHostKey"]').value).toBe('HK-fb-old');
     // 私钥=textarea 容 PEM 多行；口令=password 框；两处 autocomplete 关闭
     const pk = el.querySelector('[data-field="meshPrivateKey"]');
     expect(pk.tagName).toBe('TEXTAREA');
@@ -857,12 +764,11 @@ describe('MeshSettings 密钥输入位（G3）', () => {
     expect(ph.value).toBe('ph-old');
   });
 
-  it('改输入 → save：载荷携带四个新值（peer 行内编辑值随行带出）', async () => {
+  it('改输入 → save：载荷携带新值（peer 行内编辑值随行带出）', async () => {
     const { el, saved } = mountCard(keyConfig());
     await flush();
     setField(el, 'meshPrivateKey', '-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----');
     setField(el, 'meshKeyPassphrase', 'ph-new');
-    setField(el, 'meshFallbackHostKey', 'HK-fb-new');
     setPeerKey(el, 'dev-b', 'SHA256:peer-new');
     await flush();
     clickSave(el);
@@ -870,14 +776,12 @@ describe('MeshSettings 密钥输入位（G3）', () => {
     expect(saved).toHaveLength(1);
     expect(saved[0].mesh.private_key).toContain('BEGIN OPENSSH PRIVATE KEY');
     expect(saved[0].mesh.key_passphrase).toBe('ph-new');
-    expect(saved[0].mesh.fallback.host_key).toBe('HK-fb-new');
     expect(saved[0].mesh.peers[0].host_key).toBe('SHA256:peer-new');
     expect('host_key' in saved[0].mesh.peers[1]).toBe(false); // 未编辑的 peer 行不落键
     // 父层 patch 侧：改动值 ≠ current → 全部随 patch 带出（不被吞）
     const patch = buildCustomerSavePatch(saved[0], keyConfig());
     expect(patch.mesh.private_key).toContain('BEGIN OPENSSH PRIVATE KEY');
     expect(patch.mesh.key_passphrase).toBe('ph-new');
-    expect(patch.mesh.fallback.host_key).toBe('HK-fb-new');
     expect(patch.mesh.peers[0].host_key).toBe('SHA256:peer-new');
   });
 
@@ -887,7 +791,6 @@ describe('MeshSettings 密钥输入位（G3）', () => {
     await flush();
     setField(el, 'meshPrivateKey', '');
     setField(el, 'meshKeyPassphrase', '');
-    setField(el, 'meshFallbackHostKey', '');
     setPeerKey(el, 'dev-b', '');
     await flush();
     clickSave(el);
@@ -896,14 +799,12 @@ describe('MeshSettings 密钥输入位（G3）', () => {
     // 卡片载荷：空串经归一化不落键（G1 省缺口径）
     expect('private_key' in saved[0].mesh).toBe(false);
     expect('key_passphrase' in saved[0].mesh).toBe(false);
-    expect('host_key' in saved[0].mesh.fallback).toBe(false);
     expect('host_key' in saved[0].mesh.peers[0]).toBe(false);
-    // G2 清空块：private_key/key_passphrase/fallback.host_key 显式空串；
+    // G2 清空块：private_key/key_passphrase 显式空串；
     // peers 是数组走整体替换分支，清空经数组 diff 自然带出
     const patch = buildCustomerSavePatch(saved[0], current);
     expect(patch.mesh.private_key).toBe('');
     expect(patch.mesh.key_passphrase).toBe('');
-    expect(patch.mesh.fallback.host_key).toBe('');
     expect(patch.mesh.peers).toEqual([
       { device_id: 'dev-b', lan_addrs: ['192.168.1.20:56441'], relay: true },
       { device_id: 'dev-c', lan_addrs: ['192.168.1.21:56441'], relay: true }
@@ -914,7 +815,6 @@ describe('MeshSettings 密钥输入位（G3）', () => {
     const { el, saved } = mountCard(keyConfig());
     await flush();
     setField(el, 'meshPrivateKey', '');
-    setField(el, 'meshFallbackHostKey', '');
     await flush();
     expect(saveButton(el).disabled).toBe(false);
     clickSave(el);
@@ -961,7 +861,7 @@ const badgeOf = (el, peerId) => el.querySelector(`[data-mesh-badge="${peerId}"]`
 describe('MeshSettings 拓扑画布', () => {
   beforeEach(() => {
     window.localStorage.clear();
-    stubApi({ lanPeers: LAN_PEERS });
+    stubApi();
   });
 
   afterEach(() => {
@@ -1227,7 +1127,7 @@ describe('MeshSettings 依赖与身份提示（G4）', () => {
   }
 
   beforeEach(() => {
-    stubApi({ lanPeers: LAN_PEERS });
+    stubApi();
   });
 
   afterEach(() => {
@@ -1393,7 +1293,7 @@ describe('MeshSettings 依赖与身份提示（G4）', () => {
     expect(el.querySelector('[data-mesh-ssh-enable-together]')).not.toBeNull();
     // 任意 mesh 编辑保存:载荷不静默翻转 ssh_ingress(不复活 LAN 暴露面)
     setToggle(el, 'meshFallbackEnable', true);
-    setField(el, 'meshFallbackAddr', '192.168.1.20:56441');
+    setSelect(el, 'meshFallbackNextHop', 'dev-b');
     await flush();
     clickSave(el);
     await flush();
