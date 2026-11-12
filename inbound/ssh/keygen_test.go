@@ -68,7 +68,7 @@ func TestGenerateIngressKeyEntropyIndependent(t *testing.T) {
 
 // hostname 清洗:特殊字符折叠为 '-',清洗后为空回落 "node"(防空段/前导破折号)。
 func TestGenerateIngressKeyFilenameSanitize(t *testing.T) {
-	if got := sanitizeIngressHost(`bad host/..\\x`); got != strings.Trim(`bad-host-..-x`, "-") && got != "node" {
+	if got := sanitizeIngressHost(`bad host/..\\x`); got != "bad-host-..-x" {
 		t.Fatalf("sanitizeIngressHost = %q", got)
 	}
 	if got := sanitizeIngressHost("///"); got != "node" {
@@ -76,5 +76,8 @@ func TestGenerateIngressKeyFilenameSanitize(t *testing.T) {
 	}
 	if got := sanitizeIngressHost("My-PC_01"); got != "My-PC_01" {
 		t.Fatalf("safe hostname must be kept verbatim, got %q", got)
+	}
+	if got := sanitizeIngressHost("--foo--"); got != "foo" {
+		t.Fatalf("leading/trailing dashes must be trimmed, got %q", got)
 	}
 }

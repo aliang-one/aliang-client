@@ -49,7 +49,7 @@ func sanitizeIngressHost(host string) string {
 func GenerateIngressKey() (*GeneratedIngressKey, error) {
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
-		return nil, fmt.Errorf("generate ed25519: %w", err)
+		return nil, fmt.Errorf("generate ingress ed25519: %w", err)
 	}
 	signer, err := gossh.NewSignerFromKey(priv)
 	if err != nil {
