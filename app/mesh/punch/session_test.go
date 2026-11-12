@@ -533,3 +533,121 @@ func TestSessionCacheConcurrentSameLeaseRelease(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// (f) 孤儿表项语义:顶替驱逐 + 跨顶替 Release 自关
+// ---------------------------------------------------------------------------
+
+// punchCacheTwinSessions 起 B 侧容错回显 listener 并打通两条会话(各持
+// 独立打洞 socket;同 listener 多会话是 Task 6 既有面):孤儿语义两用例的
+// 公共底座。流面喂饱纪律不适用于孤儿用例(被顶替/自关的会话其流面天然
+// 悬置),handler 读面遇错静默退、读 4 字节回显 4 字节。
+func punchCacheTwinSessions(t *testing.T) (*PunchSession, *PunchSession) {
+	t.Helper()
+	tolerant := func(c net.Conn) {
+		buf := make([]byte, 4)
+		for {
+			if _, err := io.ReadFull(c, buf); err != nil {
+				return
+			}
+			_, _ = c.Write(buf)
+		}
+	}
+	addr, cfg, _ := punchListenerEnv(t, "punch-session-token", 5*time.Second, tolerant)
+	dial := func() *PunchSession {
+		t.Helper()
+		session, err := DialPeer(punchDialerUDPConn(t), DialOpts{
+			Token:      "punch-session-token",
+			TLS:        cfg,
+			Candidates: func() []string { return []string{addr.String()} },
+		})
+		if err != nil {
+			t.Fatalf("孤儿语义用例拨号失败: %v", err)
+		}
+		t.Cleanup(func() {
+			_ = session.Conn.CloseWithError(0, "")
+			_ = session.Transport.Close()
+		})
+		return session
+	}
+	return dial(), dial()
+}
+
+// TestSessionCacheIdleEntryClosedOnReplacement 顶替驱逐:空闲(ref=0)表项
+// 被同 peer 新会话顶替时,旧会话必须在 Put 当场关(Transport.Close→连接
+// 死亡)——不是退回表里等 5min 空闲回收。若此路径失守,被顶替的旧会话
+// 要靠 B 侧 TTL(90s)才死,静默泄漏一条保活连接。
+func TestSessionCacheIdleEntryClosedOnReplacement(t *testing.T) {
+	const peer = "peer-cache-j"
+	sessionA, sessionB := punchCacheTwinSessions(t)
+
+	cache := NewSessionCache()
+	leaseA := cache.Put(peer, sessionA)
+	leaseA.Release() // ref 归零进入空闲计时(远未到点,5min)
+
+	leaseB := cache.Put(peer, sessionB) // 顶替:旧表项无人引用
+	if leaseB == nil {
+		t.Fatal("顶替 Put 新会话被拒")
+	}
+	// 旧会话必须当场死:Done 在秒级围栏内关闭即证「即关而非空闲计时」
+	//(空闲路要等 5min,测试时窗内绝无可能)。
+	select {
+	case <-sessionA.Conn.Context().Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("被顶替的空闲表项应即关(Transport.Close→连接死亡),旧会话仍活(静默泄漏)")
+	}
+	// 新表项完好且在表:开流往返通,表槽指向新会话。
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	stream, err := leaseB.OpenStream(ctx)
+	if err != nil {
+		t.Fatalf("顶替后的新会话开流失败: %v", err)
+	}
+	punchEchoRoundtrip(t, stream, "rep1")
+	if entry := cache.sessions[peer]; entry == nil || entry.session != sessionB {
+		t.Fatalf("表槽应指向顶替者 sessionB,得到 %+v", entry)
+	}
+	leaseB.Release()
+}
+
+// TestSessionCacheOrphanReleaseClosesReplacedEntry 跨顶替 Release 自关:
+// 旧表项仍被持有(ref>0)时被同 peer 新会话顶替——顶替瞬间旧会话不得被
+// 关(refcount 保护:持有者还在用),持有者最后的 Release 归零时发现自己
+// 已被顶替,当场自关收尾;新表项全程完好可用。若此路径失守,被顶替的
+// 持有会话在 Release 后变无主会话,泄漏至 B 侧 TTL 才死。
+func TestSessionCacheOrphanReleaseClosesReplacedEntry(t *testing.T) {
+	const peer = "peer-cache-k"
+	sessionA, sessionB := punchCacheTwinSessions(t)
+
+	cache := NewSessionCache()
+	leaseA := cache.Put(peer, sessionA) // ref=1,持有中
+	leaseB := cache.Put(peer, sessionB) // 顶替持有中的表项:旧表项成孤儿但不当场关
+
+	select {
+	case <-sessionA.Conn.Context().Done():
+		t.Fatal("持有中的会话被顶替时不得当场关(refcount 保护失守)")
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	leaseA.Release() // 孤儿表项最后的 Release:归零当场自关
+	select {
+	case <-sessionA.Conn.Context().Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("孤儿表项最后的 Release 应当场自关,旧会话仍活(无主泄漏)")
+	}
+	// 新表项全程未受牵连:开流往返通、表槽指向新会话、Release 后归零。
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	stream, err := leaseB.OpenStream(ctx)
+	if err != nil {
+		t.Fatalf("跨顶替后的新会话开流失败(被旧表项收摊误伤?): %v", err)
+	}
+	punchEchoRoundtrip(t, stream, "orp2")
+	if entry := cache.sessions[peer]; entry == nil || entry.session != sessionB {
+		t.Fatalf("表槽应指向顶替者 sessionB,得到 %+v", entry)
+	}
+	leaseB.Release()
+	if entry := cache.sessions[peer]; entry == nil || entry.refs != 0 {
+		t.Fatalf("新表项 Release 后 ref 应归零,得到 %+v", entry)
+	}
+}
