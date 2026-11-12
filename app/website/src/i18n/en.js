@@ -964,6 +964,15 @@ export default {
   sshIngress_validationNeedKey: 'Add at least one public key (human or mesh) before enabling SSH ingress.',
   sshIngress_save: 'Save SSH ingress',
   sshIngress_saving: 'Saving…',
+  sshIngress_oneClick: 'Generate & enable in one click',
+  sshIngress_privKeyTitle: 'Private key (shown once)',
+  sshIngress_privKeyOnceWarning: 'This private key is shown only once. Close means gone — regenerate and delete the old key from the list if lost.',
+  sshIngress_privKeyDownload: 'Download .pem',
+  sshIngress_privKeyCopy: 'Copy private key',
+  sshIngress_privKeyCopied: 'Copied',
+  sshIngress_privKeyConnectExample: 'Connect: ssh -D 1080 -i <downloaded .pem> anyuser@<node IP> -p 56432 (username is arbitrary; auth is pubkey-only)',
+  sshIngress_keygenFailed: 'Key generation failed, please retry.',
+  sshIngress_privKeyClose: 'Close',
 
   // -- MeshSettings (mesh card; key set must equal zh.js, guarded by i18n.test.js) --
   mesh_title: 'Node Mesh',

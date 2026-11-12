@@ -963,6 +963,15 @@ export default {
   sshIngress_validationNeedKey: '启用 SSH 入口前请至少添加一把公钥（人用或 mesh 互连）。',
   sshIngress_save: '保存 SSH 入口配置',
   sshIngress_saving: '保存中…',
+  sshIngress_oneClick: '一键生成并启用',
+  sshIngress_privKeyTitle: '私钥（仅此一次）',
+  sshIngress_privKeyOnceWarning: '私钥仅展示这一次，关闭即弃；丢失请重新生成并删除列表中的旧钥匙。',
+  sshIngress_privKeyDownload: '下载 .pem',
+  sshIngress_privKeyCopy: '复制私钥',
+  sshIngress_privKeyCopied: '已复制',
+  sshIngress_privKeyConnectExample: '连接示例：ssh -D 1080 -i <下载的.pem> 任意用户名@<节点IP> -p 56432（用户名随意，鉴权只认公钥）',
+  sshIngress_keygenFailed: '密钥生成失败，请重试。',
+  sshIngress_privKeyClose: '关闭',
 
   // -- MeshSettings（mesh 组网卡;键集与 en.js 必须相等,i18n.test.js 守卫）--
   mesh_title: '节点组网',

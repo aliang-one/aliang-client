@@ -208,6 +208,11 @@ func registerAgentRoutes(mux *http.ServeMux) {
 	// 一个实例等价。双注册另一处 routes.go(缺任一侧=404 透传,2026-10-21 教训)。
 	sshIngressHandler := handlers.NewSSHIngressHandlerFromCache()
 	mux.HandleFunc("/api/proxy/ssh-ingress/hostkey", sshIngressHandler.HandleHostkey)
+	// SSH 入口一键生成(spec 2026-11-12 §1.2):POST 无状态纯生成,私钥只在
+	// 响应出现一次,服务端不落盘。无状态实例两进程各持等价。双注册另一处
+	// routes.go(缺任一侧=404 透传,2026-10-21 教训)。
+	sshIngressKeygenHandler := handlers.NewSSHIngressKeygenHandler()
+	mux.HandleFunc("/api/proxy/ssh-ingress/keygen", sshIngressKeygenHandler.HandleKeygen)
 }
 
 func loopbackOnly(next http.Handler) http.Handler {
