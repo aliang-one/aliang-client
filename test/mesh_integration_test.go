@@ -510,7 +510,7 @@ func TestMeshIntegrationSingleHop(t *testing.T) {
 		DeviceID: "node-b",
 		LANAddrs: []string{b.Addr()},
 		HostKey:  b.HostKeyPinned(),
-	}, keyPEM, "", nil)
+	}, keyPEM, "", nil, nil)
 	if err != nil {
 		t.Fatalf("NewExitClient: %v", err)
 	}
@@ -609,7 +609,7 @@ func TestMeshIntegrationForwardGate(t *testing.T) {
 				DeviceID: "node-b",
 				LANAddrs: []string{b.addr},
 				HostKey:  b.hostFP,
-			}, keyPEM, "", nil)
+			}, keyPEM, "", nil, nil)
 			if err != nil {
 				t.Fatalf("NewExitClient: %v", err)
 			}
@@ -654,7 +654,7 @@ func TestMeshIntegrationHostKeyImpostor(t *testing.T) {
 			DeviceID: "node-b",
 			LANAddrs: []string{b.addr},
 			HostKey:  impostorFP, // 钉错钥乙
-		}, keyPEM, "", nil)
+		}, keyPEM, "", nil, nil)
 		if err != nil {
 			t.Fatalf("NewExitClient: %v", err)
 		}
@@ -672,7 +672,7 @@ func TestMeshIntegrationHostKeyImpostor(t *testing.T) {
 			DeviceID: "node-b",
 			LANAddrs: []string{b.addr},
 			HostKey:  b.hostFP, // 钉对钥甲
-		}, keyPEM, "", nil)
+		}, keyPEM, "", nil, nil)
 		if err != nil {
 			t.Fatalf("NewExitClient: %v", err)
 		}
@@ -701,7 +701,7 @@ func TestMeshIntegrationHandshakeHang(t *testing.T) {
 		DeviceID: "node-b",
 		LANAddrs: []string{silent},
 		HostKey:  hostFP,
-	}, keyPEM, "", nil)
+	}, keyPEM, "", nil, nil)
 	if err != nil {
 		t.Fatalf("NewExitClient: %v", err)
 	}
@@ -756,7 +756,7 @@ func TestMeshIntegrationConcurrentPeers(t *testing.T) {
 		LANAddrs: []string{"127.0.0.1:1"}, // LAN 必败,强制落 piko
 		HostKey:  b1.HostKeyPinned(),
 		Relay:    true,
-	}, pem1, "", piko1)
+	}, pem1, "", piko1, nil)
 	if err != nil {
 		t.Fatalf("NewExitClient 1: %v", err)
 	}
@@ -765,7 +765,7 @@ func TestMeshIntegrationConcurrentPeers(t *testing.T) {
 		LANAddrs: []string{"127.0.0.1:1"},
 		HostKey:  b2.HostKeyPinned(),
 		Relay:    true,
-	}, pem2, "", piko2)
+	}, pem2, "", piko2, nil)
 	if err != nil {
 		t.Fatalf("NewExitClient 2: %v", err)
 	}
@@ -848,7 +848,7 @@ func TestMeshIntegrationDNSRoundTrip(t *testing.T) {
 		DeviceID: "node-b",
 		LANAddrs: []string{b.Addr()},
 		HostKey:  b.HostKeyPinned(),
-	}, keyPEM, "", nil)
+	}, keyPEM, "", nil, nil)
 	if err != nil {
 		t.Fatalf("NewExitClient: %v", err)
 	}
@@ -905,7 +905,7 @@ func TestMeshIntegrationFailureSemantics(t *testing.T) {
 			HostKey:  hostFP,
 			// Relay=false + pikoDial=nil:piko transport 不进切片,
 			// 错误必须是 LAN 失败回源而非 no-admit 短路。
-		}, keyPEM, "", nil)
+		}, keyPEM, "", nil, nil)
 		if err != nil {
 			t.Fatalf("NewExitClient: %v", err)
 		}
@@ -1002,7 +1002,7 @@ func TestMeshIntegrationDNSRealResolver(t *testing.T) {
 		DeviceID: "dev-b",
 		LANAddrs: []string{node.addr},
 		HostKey:  node.hostFP, // FingerprintSHA256 自带 SHA256: 前缀,钉扎指纹格式直用
-	}, keyPEM, "", nil)
+	}, keyPEM, "", nil, nil)
 	if err != nil {
 		t.Fatalf("NewExitClient: %v", err)
 	}

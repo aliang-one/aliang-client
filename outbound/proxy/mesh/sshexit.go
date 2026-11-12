@@ -49,20 +49,27 @@ func pickErr(errs ...error) error {
 // processor/tcp 的 TCPConnectionHandler,SPEC §5.1「正确落点」)。
 type ExitClient struct {
 	spec       PeerSpec
-	transports []Transport // 有序;LAN 优先,Piko 兜底(SPEC §7.3)
+	transports []Transport // 有序;LAN→udp→piko(SPEC §7.3,打洞居中)
 	identity   gossh.Signer
 	hostKeyCB  gossh.HostKeyCallback
 	timeout    time.Duration
 }
 
-// NewExitClient 解析私钥与钉扎并组装 transports。relay=true 且 pikoDial=nil
-// 时不放 PikoTransport(等价中继未接线,落到 LAN-only 语义,SPEC §7.3)。
-func NewExitClient(spec PeerSpec, privateKeyPEM, passphrase string, pikoDial PikoDialFunc) (*ExitClient, error) {
+// NewExitClient 解析私钥与钉扎并组装 transports。装配序恒为 LAN→udp→piko
+// (SPEC §7.3:LAN 可达时走 LAN,piko 恒兜底,UDP 打洞居中):punchDial=nil
+// (gate 关)时不放 UDPTransport,relay=true 且 pikoDial=nil 时不放
+// PikoTransport(等价中继未接线,落到无该载体的语义,SPEC §7.3)。两个
+// gate 都镜像同一门形:构造期不进切片是第一层把关,载体自身的 Admit
+// 防御分支是第二层。
+func NewExitClient(spec PeerSpec, privateKeyPEM, passphrase string, pikoDial PikoDialFunc, punchDial PunchDialFunc) (*ExitClient, error) {
 	signer, err := SignerFromPEM(privateKeyPEM, passphrase)
 	if err != nil {
 		return nil, fmt.Errorf("mesh: identity key: %w", err)
 	}
 	transports := []Transport{LANTransport{}}
+	if punchDial != nil {
+		transports = append(transports, UDPTransport{dial: punchDial})
+	}
 	if spec.Relay && pikoDial != nil {
 		transports = append(transports, PikoTransport{dial: pikoDial})
 	}

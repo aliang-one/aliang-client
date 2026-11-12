@@ -365,7 +365,7 @@ func dnsForwardTestPeer(t *testing.T, keyPEM, lanAddr, hostKey string) meshproxy
 		SSHUser:  "mesh",
 		Relay:    false,
 	}
-	client, err := meshproxy.NewExitClient(spec, keyPEM, "", nil)
+	client, err := meshproxy.NewExitClient(spec, keyPEM, "", nil, nil)
 	if err != nil {
 		t.Fatalf("NewExitClient: %v", err)
 	}

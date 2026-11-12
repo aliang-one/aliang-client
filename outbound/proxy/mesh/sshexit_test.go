@@ -214,7 +214,7 @@ func TestExitClientDialTCP(t *testing.T) {
 		LANAddrs: []string{sshd.Addr()},
 		HostKey:  sshd.HostKeyPinned(),
 		SSHUser:  "mesh",
-	}, keyPEM, "", nil)
+	}, keyPEM, "", nil, nil)
 	if err != nil {
 		t.Fatalf("NewExitClient: %v", err)
 	}
@@ -256,7 +256,7 @@ func TestExitClientLanPreferredOverRelay(t *testing.T) {
 		LANAddrs: []string{sshd.Addr()},
 		HostKey:  sshd.HostKeyPinned(),
 		Relay:    true,
-	}, keyPEM, "", pikoDial)
+	}, keyPEM, "", pikoDial, nil)
 	if err != nil {
 		t.Fatalf("NewExitClient: %v", err)
 	}
@@ -297,7 +297,7 @@ func TestExitClientLanFailFallsBackToRelay(t *testing.T) {
 		LANAddrs: []string{"127.0.0.1:1"}, // 必然 connection refused
 		HostKey:  sshd.HostKeyPinned(),
 		Relay:    true,
-	}, keyPEM, "", pikoDial)
+	}, keyPEM, "", pikoDial, nil)
 	if err != nil {
 		t.Fatalf("NewExitClient: %v", err)
 	}
@@ -331,7 +331,7 @@ func TestExitClientNoTransportAdmits(t *testing.T) {
 	emptyLAN := PeerSpec{DeviceID: "dev-b", HostKey: hostFP, SSHUser: "mesh"}
 
 	t.Run("empty lan relay off", func(t *testing.T) {
-		client, err := NewExitClient(emptyLAN, keyPEM, "", pikoDial)
+		client, err := NewExitClient(emptyLAN, keyPEM, "", pikoDial, nil)
 		if err != nil {
 			t.Fatalf("NewExitClient: %v", err)
 		}
@@ -340,7 +340,7 @@ func TestExitClientNoTransportAdmits(t *testing.T) {
 		}
 	})
 	t.Run("empty lan custom cannot ride relay", func(t *testing.T) {
-		client, err := NewExitClient(PeerSpec{DeviceID: "dev-b", HostKey: hostFP, SSHUser: "mesh", Relay: true}, keyPEM, "", pikoDial)
+		client, err := NewExitClient(PeerSpec{DeviceID: "dev-b", HostKey: hostFP, SSHUser: "mesh", Relay: true}, keyPEM, "", pikoDial, nil)
 		if err != nil {
 			t.Fatalf("NewExitClient: %v", err)
 		}
@@ -350,7 +350,7 @@ func TestExitClientNoTransportAdmits(t *testing.T) {
 		}
 	})
 	t.Run("empty lan ai but relay unwired", func(t *testing.T) {
-		client, err := NewExitClient(PeerSpec{DeviceID: "dev-b", HostKey: hostFP, SSHUser: "mesh", Relay: true}, keyPEM, "", nil)
+		client, err := NewExitClient(PeerSpec{DeviceID: "dev-b", HostKey: hostFP, SSHUser: "mesh", Relay: true}, keyPEM, "", nil, nil)
 		if err != nil {
 			t.Fatalf("NewExitClient: %v", err)
 		}
@@ -378,7 +378,7 @@ func TestExitClientUnbuildableTarget(t *testing.T) {
 		LANAddrs: []string{"127.0.0.1:1"},
 		HostKey:  gossh.FingerprintSHA256(genPubKey(t)),
 		Relay:    true,
-	}, keyPEM, "", pikoDial)
+	}, keyPEM, "", pikoDial, nil)
 	if err != nil {
 		t.Fatalf("NewExitClient: %v", err)
 	}
@@ -405,7 +405,7 @@ func TestExitClientPikoNotInSliceWhenUnwired(t *testing.T) {
 		LANAddrs: []string{sshd.Addr()},
 		HostKey:  sshd.HostKeyPinned(),
 		Relay:    true, // 允许中继,但未接线 ⇒ 仅剩 LAN 载体
-	}, keyPEM, "", nil)
+	}, keyPEM, "", nil, nil)
 	if err != nil {
 		t.Fatalf("NewExitClient: %v", err)
 	}
@@ -436,7 +436,7 @@ func TestExitClientHandshakeDeadline(t *testing.T) {
 		DeviceID: "dev-b",
 		LANAddrs: []string{silent},
 		HostKey:  gossh.FingerprintSHA256(genPubKey(t)),
-	}, keyPEM, "", nil)
+	}, keyPEM, "", nil, nil)
 	if err != nil {
 		t.Fatalf("NewExitClient: %v", err)
 	}
@@ -473,7 +473,7 @@ func TestExitClientOpenChannelDeadline(t *testing.T) {
 		DeviceID: "dev-b",
 		LANAddrs: []string{sshd.Addr()},
 		HostKey:  sshd.HostKeyPinned(),
-	}, keyPEM, "", nil)
+	}, keyPEM, "", nil, nil)
 	if err != nil {
 		t.Fatalf("NewExitClient: %v", err)
 	}
@@ -545,7 +545,7 @@ func TestExitClientCustomClassDialsLanOnly(t *testing.T) {
 		LANAddrs: []string{sshd.Addr()},
 		HostKey:  sshd.HostKeyPinned(),
 		Relay:    true,
-	}, keyPEM, "", pikoDial)
+	}, keyPEM, "", pikoDial, nil)
 	if err != nil {
 		t.Fatalf("NewExitClient: %v", err)
 	}

@@ -105,7 +105,7 @@ func (m *Manager) egressPeer() meshproxy.Dialer {
 		SSHUser:  "mesh",
 		Relay:    first.Relay == nil || *first.Relay,
 	}
-	client, err := meshproxy.NewExitClient(spec, mesh.PrivateKey, mesh.KeyPassphrase, m.dialMeshEndpoint)
+	client, err := meshproxy.NewExitClient(spec, mesh.PrivateKey, mesh.KeyPassphrase, m.dialMeshEndpoint, nil)
 	if err != nil {
 		log.Printf("[MESH-LAN] egress fallback peer %s unavailable: %v", deviceID, err)
 		return nil
@@ -165,7 +165,7 @@ func (m *Manager) meshDNSForwardPeer() meshproxy.Dialer {
 		SSHUser:  "mesh",
 		Relay:    entry.Relay == nil || *entry.Relay,
 	}
-	client, err := meshproxy.NewExitClient(spec, mesh.PrivateKey, mesh.KeyPassphrase, m.dialMeshEndpoint)
+	client, err := meshproxy.NewExitClient(spec, mesh.PrivateKey, mesh.KeyPassphrase, m.dialMeshEndpoint, nil)
 	if err != nil {
 		log.Printf("[MESH-LAN] dns forward peer %s unavailable: %v", deviceID, err)
 		return nil

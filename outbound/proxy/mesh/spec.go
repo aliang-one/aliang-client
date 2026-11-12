@@ -28,6 +28,7 @@ type PeerSpec struct {
 	HostKey  string   // 对端 SSH host key 钉扎;空 = fail-closed(SPEC §10.4)
 	SSHUser  string   // 固定 "mesh"
 	Relay    bool     // true = 允许中继 Transport
+	Punch    bool     // true = 允许 UDP 打洞载体;进 CacheKey(运行期翻开关→键变→缓存重建,工厂置位归 Task 12)
 }
 
 // CacheKey 计算该 peer 在 ExitClient 缓存中的键(SPEC §10.4):全部影响
@@ -44,6 +45,7 @@ func (spec PeerSpec) CacheKey(privateKeyPEM, passphrase string) string {
 		strings.Join(addrs, "|"),
 		spec.HostKey,
 		strconv.FormatBool(spec.Relay),
+		strconv.FormatBool(spec.Punch), // punch 位:翻开关须重建缓存客户端(照 Relay 位先例)
 		spec.SSHUser,
 		hex.EncodeToString(sum[:]),
 	}

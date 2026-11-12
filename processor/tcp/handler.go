@@ -1487,7 +1487,7 @@ func (h *TCPConnectionHandler) getMeshExitForExecution(deviceID string) (*meshpr
 		if ok {
 			return client, nil
 		}
-		client, err := meshproxy.NewExitClient(spec, meshCfg.PrivateKey, meshCfg.KeyPassphrase, pikoDial)
+		client, err := meshproxy.NewExitClient(spec, meshCfg.PrivateKey, meshCfg.KeyPassphrase, pikoDial, nil)
 		if err != nil {
 			return nil, err
 		}

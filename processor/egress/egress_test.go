@@ -215,7 +215,7 @@ func newTestExitPeer(t *testing.T, keyPEM, lanAddr, hostKey string, relay bool, 
 		SSHUser:  "mesh",
 		Relay:    relay,
 	}
-	client, err := mesh.NewExitClient(spec, keyPEM, "", pikoDial)
+	client, err := mesh.NewExitClient(spec, keyPEM, "", pikoDial, nil)
 	if err != nil {
 		t.Fatalf("NewExitClient: %v", err)
 	}
