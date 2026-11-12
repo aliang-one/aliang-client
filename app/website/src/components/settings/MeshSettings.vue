@@ -343,6 +343,7 @@
           type="text"
           @keydown.enter.prevent
         />
+        <p class="text-xs text-slate-500">{{ t('mesh_fallbackHostKeyHint') }}</p>
       </label>
 
       <!-- Classes 三勾选（后端 meshproto ClassAI/ClassSelf/ClassCustom 子集） -->
