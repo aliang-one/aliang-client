@@ -404,8 +404,19 @@ func TestMeshDNSForwardPeer(t *testing.T) {
 		meshDNSForwardPeerForTest(t, []string{"dns,mesh:dev-b"},
 			meshAssemblyTestKeyPEM(t), dnsPeer(nil))
 		m := NewManager(nil)
+		restoreMeshAssemblySeams(t)
 		m.wireMeshAssemblySeams()
-		t.Cleanup(func() { tuntun.T().SetMeshDNSForwardPeerSource(nil) })
+
+		// 读缝钉线(MeshDNSForwardPeerSourceForTest):断言接线真的把
+		// meshDNSForwardPeer 放进了隧道缝——删掉 wireMeshAssemblySeams 里的
+		// SetMeshDNSForwardPeerSource 行本子测必红;再经缝回读断言装配产物。
+		wired := tuntun.T().MeshDNSForwardPeerSourceForTest()
+		if wired == nil {
+			t.Fatal("接线后隧道缝应持有 DNS 代转发提供器")
+		}
+		if wired() == nil {
+			t.Fatal("缝回读应返回与 meshDNSForwardPeer 同源的装配产物")
+		}
 		if m.meshDNSForwardPeer() == nil {
 			t.Fatal("接线后装配仍应可用")
 		}
