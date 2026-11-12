@@ -75,6 +75,13 @@ type DialOpts struct {
 	TLS        PunchTLSConfig
 	Candidates func() []string
 	Budget     time.Duration
+	// KeepAlive 置真时拨号带 quic.Config{KeepAlivePeriod: 15s}(经
+	// punchDialQUICConfig 组装):只该由 SessionCache 路径置真(DialAndPut
+	// 强制置真)——缓存会话要在两次取用的间隙存活等 NAT 映射,保活刷洞;
+	// 一次性拨号(不进缓存)保持 false,会话用完即弃无需保活。与空闲回收
+	// (5min)双参数协作实现「保活只为在飞(含缓存待取)连接服务」不变式,
+	// 全文见 session.go 的 punchKeepAlivePeriod。
+	KeepAlive bool
 }
 
 // PunchSession 是打通后的出让件:Transport 建在调用方 conn 上,生命周期
@@ -115,6 +122,9 @@ func DialPeer(conn *net.UDPConn, opts DialOpts) (*PunchSession, error) {
 	// 单 Transport 铁律(文件头):所有轮次所有候选复用同一个。
 	tr := &quic.Transport{Conn: conn}
 	tlsConf := ClientTLSConfig(opts.TLS)
+	// 缓存路径(KeepAlive=true)带保活配置,其余走 quic-go 全默认:
+	// 组装规则与不变式见 session.go 的 punchDialQUICConfig。
+	qcfg := punchDialQUICConfig(opts)
 	var lastErr error
 rounds:
 	for round := 0; ; round++ {
@@ -134,7 +144,7 @@ rounds:
 			if remain <= 0 {
 				break rounds
 			}
-			sess, err := punchAttemptOnce(tr, tlsConf, cand, opts.Token, remain)
+			sess, err := punchAttemptOnce(tr, tlsConf, qcfg, cand, opts.Token, remain)
 			if err == nil {
 				// 打通:Transport 随会话出让,收摊归调用方(见 PunchSession)。
 				return sess, nil
@@ -160,7 +170,8 @@ rounds:
 // punchAttemptOnce 对单候选做一次完整尝试:Dial(QUIC Initial 即探测)→
 // 开首流 → 写 token 行 → 存活确认。失败时自行收敛本次连接(CloseWithError
 // 幂等,连接已死亦无妨),单次围栏封顶 min(punchDialAttemptTimeout, remain)。
-func punchAttemptOnce(tr *quic.Transport, tlsConf *tls.Config, cand, token string, remain time.Duration) (*PunchSession, error) {
+// qcfg 是 Dial 的 quic.Config(缓存路径带保活,其余 nil 走默认)。
+func punchAttemptOnce(tr *quic.Transport, tlsConf *tls.Config, qcfg *quic.Config, cand, token string, remain time.Duration) (*PunchSession, error) {
 	addr, err := net.ResolveUDPAddr("udp4", cand)
 	if err != nil {
 		// 候选串坏=候选级失败:换道继续,不是门禁也不是通道死刑(v1 打洞
@@ -172,7 +183,7 @@ func punchAttemptOnce(tr *quic.Transport, tlsConf *tls.Config, cand, token strin
 	// attemptCtx 只管辖握手与开流:quic-go 把连接主体挂在
 	// context.WithoutCancel(ctx) 上(transport.go doDial),Dial 成功后
 	// 本函数返回时的 cancel 不伤连接。
-	qconn, err := tr.Dial(attemptCtx, addr, tlsConf, nil)
+	qconn, err := tr.Dial(attemptCtx, addr, tlsConf, qcfg)
 	if err != nil {
 		return nil, punchAttemptErr(cand, err)
 	}
