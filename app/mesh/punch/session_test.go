@@ -456,3 +456,80 @@ func TestSessionCacheConcurrentAcquireRelease(t *testing.T) {
 		t.Fatalf("全部 Release 后 ref 应精确归零,得到 %+v(计数被并发写坏?)", entry)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// (e 续) 并发同 Lease 双 Release:幂等语义在并发下的硬性要求
+// ---------------------------------------------------------------------------
+
+// TestSessionCacheConcurrentSameLeaseRelease 同一 Lease 被多 goroutine 同时
+// Release(并混入 OpenStream):Task 9 的 defer 清理+连接关闭双触发是自然
+// 写法,Release 必须并发幂等——重复 Release 不多退 ref、不 panic、不重置
+// 空闲计时。修复前:锁外读 l.entry 与锁内置 nil 成对竞态(-race 报 DATA
+// RACE),双双通过锁外检查后后进锁者对 nil 表项解引用直接 SIGSEGV。
+// 每轮用 Acquire 现造新 Lease 再闸门齐放 4×Release+4×OpenStream,拉满
+// 交叠窗;轮末断言 ref 恰为 0(多退成负/重复归零计时都会现形)。
+func TestSessionCacheConcurrentSameLeaseRelease(t *testing.T) {
+	const peer = "peer-cache-i"
+	// 容错回显 handler:并发用例不保证喂饱每条开出的流,读面遇错静默退
+	// (punchEchoHandler 会在会话死亡时 t.Errorf,不适用于本用例)。
+	tolerant := func(c net.Conn) {
+		buf := make([]byte, 4)
+		for {
+			if _, err := io.ReadFull(c, buf); err != nil {
+				return
+			}
+			_, _ = c.Write(buf)
+		}
+	}
+	addr, cfg, _ := punchListenerEnv(t, "punch-session-token", 5*time.Second, tolerant)
+	session, err := DialPeer(punchDialerUDPConn(t), DialOpts{
+		Token:      "punch-session-token",
+		TLS:        cfg,
+		Candidates: func() []string { return []string{addr.String()} },
+	})
+	if err != nil {
+		t.Fatalf("拨号失败: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = session.Conn.CloseWithError(0, "")
+		_ = session.Transport.Close()
+	})
+
+	cache := NewSessionCache()
+	lease0 := cache.Put(peer, session)
+	lease0.Release() // 归零,让每轮 Acquire 的 ref 记账自封闭(1→0)
+
+	for round := 0; round < 50; round++ {
+		lease := cache.Acquire(peer)
+		if lease == nil {
+			t.Fatalf("第 %d 轮 Acquire 失败(活会话不该 miss)", round)
+		}
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		for j := 0; j < 4; j++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				lease.Release()
+			}()
+		}
+		for j := 0; j < 4; j++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+				defer cancel()
+				if stream, err := lease.OpenStream(ctx); err == nil {
+					_ = stream.Close()
+				}
+			}()
+		}
+		close(start) // 闸门齐放:8 个 goroutine 同时冲同一 Lease
+		wg.Wait()
+		if entry := cache.sessions[peer]; entry == nil || entry.refs != 0 {
+			t.Fatalf("第 %d 轮:同 Lease 并发重复 Release 应只生效一次(ref 应恰为 0),得到 %+v", round, entry)
+		}
+	}
+}

@@ -158,11 +158,12 @@ func (c *SessionCache) Acquire(peer string) *Lease {
 }
 
 // Put 把 DialPeer 打通的会话入缓存,返回持有 1 个引用的 Lease(标准链:
-// 拨号成功→Put→用→Release)。残缺会话(peer 空/session 或其件为 nil)
-// 拒收返回 nil——那是编程错误,宁可让调用方在 nil 上炸出来也不入表。
-// 表里已有同 peer 旧表项时:无人引用(空闲/已死)→关旧让位;仍被引用
-// (并发双拨的先到者)→不动旧持有者,新表项顶替表槽,旧表项成孤儿,
-// 其最后的 Release 归零时当场自关——不泄漏也不挂死。
+// 拨号成功→Put→用→Release)。残缺会话拒收返回 nil:peer 为空、session
+// 为 nil、或 session 的 Transport/Conn 为 nil(不查 Stream——缓存的流面
+// 全走 Lease.OpenStream,首流闲置无害)——那是编程错误,宁可让调用方在
+// nil 上炸出来也不入表。表里已有同 peer 旧表项时:无人引用(空闲/已死)
+// →关旧让位;仍被引用(并发双拨的先到者)→不动旧持有者,新表项顶替表
+// 槽,旧表项成孤儿,其最后的 Release 归零时当场自关——不泄漏也不挂死。
 func (c *SessionCache) Put(peer string, session *PunchSession) *Lease {
 	if peer == "" || session == nil || session.Conn == nil || session.Transport == nil {
 		return nil
@@ -207,10 +208,11 @@ func (c *SessionCache) DialAndPut(peer string, conn *net.UDPConn, opts DialOpts)
 	return lease, nil
 }
 
-// reapIdleLocked 惰性回收(SkipMemo 先例,无后台 goroutine):每次缓存
-// 操作顺带扫全表,ref=0 且(已死或空闲超时)的表项关会话删表。真围栏
-// 是 B 侧 90s TTL(见文件头),这里只负责整洁;refs>0 的表项绝不动
-// (在飞连接不回收)。
+// reapIdleLocked 惰性回收(SkipMemo 先例,无后台 goroutine):只在
+// Acquire(含 DialAndPut 的先抢一步)取用前顺带扫全表,ref=0 且(已死
+// 或空闲超时)的表项关会话删表;Put/Release 不触发扫描——取用路径密度
+// 足够,无需每写必扫。真围栏是 B 侧 90s TTL(见文件头),这里只负责
+// 整洁;refs>0 的表项绝不动(在飞连接不回收)。
 func (c *SessionCache) reapIdleLocked() {
 	now := c.clock()
 	for peer, entry := range c.sessions {
@@ -237,29 +239,46 @@ type Lease struct {
 // OpenStream 在缓存会话上开一条新流并包成 net.Conn(复用包内
 // punchStreamConn):每条流=一条独立上层「连接」的载体,B 侧过门后免门
 // 直通;ctx 管开流围栏。会话已死时错误由 quic-go 开流面透传。
+// entry 经锁内快照取得(与并发 Release 的置 nil 互斥);开流本身不持
+// 缓存锁——那是可能阻塞的网络操作,不得拖住全缓存。
 func (l *Lease) OpenStream(ctx context.Context) (net.Conn, error) {
-	if l == nil || l.entry == nil {
+	if l == nil {
 		return nil, errors.New("punch cache lease: 未建立或已释放")
 	}
-	stream, err := l.entry.session.Conn.OpenStreamSync(ctx)
+	c := l.cache
+	c.mu.Lock()
+	entry := l.entry
+	c.mu.Unlock()
+	if entry == nil {
+		return nil, errors.New("punch cache lease: 未建立或已释放")
+	}
+	stream, err := entry.session.Conn.OpenStreamSync(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return &punchStreamConn{stream: stream, conn: l.entry.session.Conn}, nil
+	return &punchStreamConn{stream: stream, conn: entry.session.Conn}, nil
 }
 
 // Release 归还引用:ref--;归零起空闲计时(到点由下次缓存操作惰性回收)。
+// 幂等是并发硬语义(Task 9 的 defer 清理+连接关闭双触发是自然写法):
+// 同一 Lease 的并发/重复 Release 只生效一次——不多退 ref、不重置空闲
+// 计时、不 panic。实现上锁外只留 nil Lease 检查,快照+置 nil 都在锁内,
+// 后到者拿到 nil 快照即吞掉(锁外读 entry 会与锁内置 nil 成对竞态,
+// 并发双过检查后进锁即 nil 解引用,规格审查实锤)。
 // 若本表项已被顶替(并发双拨孤儿/死会话驱逐后的残留),不会再有人来取
 // 它——归零当场关会话收尾,不留无主会话。
 func (l *Lease) Release() {
-	if l == nil || l.entry == nil {
+	if l == nil {
 		return
 	}
 	c := l.cache
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	entry := l.entry
-	l.entry = nil // 幂等锚点:同一 Lease 的二次 Release 在此吞掉
+	l.entry = nil // 幂等锚点:锁内置空,并发二次 Release 在下面的 nil 检查吞掉
+	if entry == nil {
+		return
+	}
 	entry.refs--
 	if entry.refs > 0 {
 		return
