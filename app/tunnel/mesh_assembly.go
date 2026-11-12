@@ -9,6 +9,12 @@
 //     同一 manager 隧道状态 getter(TunnelSessionActive)同位接线——同源同
 //     真假契约(两缝注释互指,Task 12 评审钉死):漏接 tcp 缝 = AI 改道永久
 //     静默休眠;两缝取值分裂 = 「自身流量经 B 兜底而 AI 流量仍撞死隧道」。
+//   - TUN DNS 代转发对端源(tunnel.T().SetMeshDNSForwardPeerSource):规则
+//     驱动(routing.MeshDNSForwardTarget 10s memo 取首条启用 dns,mesh:<id>
+//     规则),装配 ExitClient 交给 TUN 单例消费(2026-11-12 接线,SPEC §9)。
+//     peer 无 LAN 地址(relay-only)→ nil fail-open 走本机 DNS(TUN DNS 恒
+//     ClassCustom、PikoTransport 拒 custom——载体层不可达,绝不激活后
+//     SERVFAIL 风暴)。
 //   - LAN beacon 生命周期:mesh 总开关(层配置存在且 EffectiveEnabled)开 →
 //     beacon Start 后 SetDefault(广播统一口 56432);关 → 收摊。帧协议
 //     接收面已退役(SPEC §13.1),本装配只剩发现候选面。config 无变更回调机制
@@ -29,9 +35,11 @@ import (
 	"time"
 
 	"aliang.one/nursorgate/app/mesh/lanbeacon"
+	tuntun "aliang.one/nursorgate/inbound/tun/tunnel"
 	meshproxy "aliang.one/nursorgate/outbound/proxy/mesh"
 	"aliang.one/nursorgate/processor/config"
 	"aliang.one/nursorgate/processor/egress"
+	"aliang.one/nursorgate/processor/routing"
 	"aliang.one/nursorgate/processor/tcp"
 )
 
@@ -100,6 +108,66 @@ func (m *Manager) egressPeer() meshproxy.Dialer {
 	client, err := meshproxy.NewExitClient(spec, mesh.PrivateKey, mesh.KeyPassphrase, m.dialMeshEndpoint)
 	if err != nil {
 		log.Printf("[MESH-LAN] egress fallback peer %s unavailable: %v", deviceID, err)
+		return nil
+	}
+	return client
+}
+
+// meshDNSForwardPeer TUN UDP/53 DNS 代转发对端(规则驱动,SPEC §9/§6 层1):
+// routing.MeshDNSForwardTarget(10s 原子 memo)取首条启用 dns,mesh:<id>
+// 规则的 peer,装配 ExitClient 交给 tunnel.T() 消费(udp.go 门控:对端非 nil
+// 才走 mesh)。构建频率=每 DNS 交换一次,但交换本身一次完整 SSH 握手(百毫
+// 秒量级),构造期解析私钥可忽略——不做缓存,配置热更即时生效。
+//
+// 激活按载体可用性过滤(编译期/运行期分层):A3 放行 relay-only peer 进
+// 编译(meshDNSForwardTargetFromSnapshot 不再因空 LANAddrs 关闭),但 TUN
+// DNS 恒 ClassCustom、PikoTransport.Admit 拒 custom——relay-only peer 在
+// 载体层不可达。peer 无 LAN 地址 → 返回 nil → fail-open 走本机 DNS,绝不
+// 激活后让查询 SERVFAIL 风暴。ssh 关闭时规则本就不编译(design 降级链),
+// 私钥/钉扎缺失由编译期能力闸(meshForwardAvailable)与构造失败双层兜底。
+func (m *Manager) meshDNSForwardPeer() meshproxy.Dialer {
+	deviceID, lanAddrs, ok := routing.MeshDNSForwardTarget()
+	if !ok {
+		return nil
+	}
+	// 载体可用性过滤:lanAddrs 空 = relay-only = custom 不可达,fail-open。
+	if len(lanAddrs) == 0 {
+		return nil
+	}
+	cfg := config.GetGlobalConfig()
+	if cfg == nil || cfg.Customer == nil || cfg.Customer.Mesh == nil {
+		return nil
+	}
+	mesh := cfg.Customer.Mesh
+	if strings.TrimSpace(mesh.PrivateKey) == "" {
+		return nil
+	}
+	var entry *config.MeshPeer
+	for i := range mesh.Peers {
+		if strings.TrimSpace(mesh.Peers[i].DeviceID) == deviceID {
+			entry = &mesh.Peers[i]
+			break
+		}
+	}
+	if entry == nil {
+		return nil // 编译→拨出窗口内 peer 被移除:fail-open
+	}
+	addrs := make([]string, 0, len(entry.LANAddrs))
+	for _, addr := range entry.LANAddrs {
+		if addr = strings.TrimSpace(addr); addr != "" {
+			addrs = append(addrs, addr)
+		}
+	}
+	spec := meshproxy.PeerSpec{
+		DeviceID: deviceID,
+		LANAddrs: addrs,
+		HostKey:  strings.TrimSpace(entry.HostKey),
+		SSHUser:  "mesh",
+		Relay:    entry.Relay == nil || *entry.Relay,
+	}
+	client, err := meshproxy.NewExitClient(spec, mesh.PrivateKey, mesh.KeyPassphrase, m.dialMeshEndpoint)
+	if err != nil {
+		log.Printf("[MESH-LAN] dns forward peer %s unavailable: %v", deviceID, err)
 		return nil
 	}
 	return client
@@ -239,11 +307,15 @@ func MeshLANPort() int {
 }
 
 // wireMeshAssemblySeams validateConfig 的装配接线点(与
-// SetMeshTransportDialSource 同位):egress 双缝 + tcp 离线缝。抽成单函数使
-// 接线顺序与注释同处一页;每次 Configure(含幂等续期)重跑,atomic Store 幂等。
+// SetMeshTransportDialSource 同位):egress 双缝 + tcp 离线缝 + TUN DNS
+// 代转发对端。抽成单函数使接线顺序与注释同处一页;每次 Configure(含幂等
+// 续期)重跑,atomic Store 幂等。
 func (m *Manager) wireMeshAssemblySeams() {
 	offline := m.meshOfflineSignal()
 	egress.SetOfflineSignal(offline)
 	tcp.SetMeshOfflineSignal(offline)
 	egress.SetPeerSource(m.egressPeer)
+	// TUN DNS 代转发(tunnel.T() 进程级单例,engine.go SetDialer 同款接法):
+	// 规则驱动,fn 内部每调用读 memo 化的门控结果,重复接线幂等。
+	tuntun.T().SetMeshDNSForwardPeerSource(m.meshDNSForwardPeer)
 }

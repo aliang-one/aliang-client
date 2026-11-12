@@ -38,7 +38,8 @@ mesh 身份现在由三类密钥共同构成,缺一即该段组网不生效:
 - ssh_ingress.port=0 时 mesh 入站随代理运行态启停;port>0 专用口默认只绑回环,lan_addrs 仍须填 56432;
 - fallback.addr 语义变更:现指对端 SSH 入口 56432(旧值指向已删除的 mesh 监听口,不改则兜底必不通),且启用时 fallback.host_key 必填;
 - `/api/mesh/status` 新增 effective 字段(生效值)与 peers[].host_key 回读;
-- 不变项:DNS 代转发、失败策略(direct/deny/fallback:<id2>)语法零变化。
+- **DNS 代转发已生产接线**:配 `dns,mesh:<id>` 规则即驱动 TUN DNS 经 mesh 由 B 侧代解析;**relay-only peer(无 LAN 地址)的 dns 规则不激活**(TUN DNS 恒 custom 类、Piko 中继拒 custom——此时 fail-open 走本机 DNS);门未激活或编译失败同样 fail-open;
+- 不变项:失败策略(direct/deny/fallback:<id2>)语法零变化。
 
 ## 升级七步(逐台执行)
 

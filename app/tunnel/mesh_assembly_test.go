@@ -16,11 +16,13 @@ import (
 	"time"
 
 	"aliang.one/nursorgate/app/mesh/lanbeacon"
+	tuntun "aliang.one/nursorgate/inbound/tun/tunnel"
 	M "aliang.one/nursorgate/inbound/tun/metadata"
 	"aliang.one/nursorgate/outbound/meshproto"
 	meshproxy "aliang.one/nursorgate/outbound/proxy/mesh"
 	"aliang.one/nursorgate/processor/config"
 	"aliang.one/nursorgate/processor/egress"
+	"aliang.one/nursorgate/processor/routing"
 	"aliang.one/nursorgate/processor/tcp"
 	gossh "golang.org/x/crypto/ssh"
 )
@@ -310,4 +312,102 @@ func pickFreeUDPForAssembly(t *testing.T) int {
 	}
 	defer conn.Close()
 	return conn.LocalAddr().(*net.UDPAddr).Port
+}
+
+// meshDNSForwardPeerForTest DNS 代转发装配矩阵的全局配置脚手架:规则串 +
+// peers → SetGlobalConfig + memo 重置(热更即时生效路径的断言前提)。
+func meshDNSForwardPeerForTest(t *testing.T, proxyRules []string, privateKey string, peers ...config.MeshPeer) {
+	t.Helper()
+	config.ResetGlobalConfigForTest()
+	t.Cleanup(config.ResetGlobalConfigForTest)
+	config.SetGlobalConfig(&config.Config{
+		Customer: &config.CustomerConfig{
+			ProxyRules: proxyRules,
+			SSHIngress: &config.SSHIngressConfig{Enable: boolPtr(true)},
+			Mesh: &config.MeshConfig{
+				PrivateKey: privateKey,
+				Peers:      peers,
+			},
+		},
+	})
+	routing.ResetMeshDNSForwardMemo()
+}
+
+// TestMeshDNSForwardPeer DNS 代转发对端装配矩阵(SPEC §9 接线,2026-11-12):
+// 规则驱动 + 载体可用性分层——relay-only peer 编译放行(meshDNSForwardTarget
+// 不再因空 LANAddrs 关闭)但运行期 fail-open(TUN DNS 恒 ClassCustom、
+// PikoTransport 拒 custom,激活后只会 SERVFAIL 风暴),绝不带病上岗。
+func TestMeshDNSForwardPeer(t *testing.T) {
+	dnsPeer := func(mutation func(*config.MeshPeer)) config.MeshPeer {
+		p := config.MeshPeer{
+			DeviceID: "dev-b",
+			LANAddrs: []string{"192.168.1.20:56432"},
+			HostKey:  "SHA256:test",
+		}
+		if mutation != nil {
+			mutation(&p)
+		}
+		return p
+	}
+
+	t.Run("dns 规则+载体可用 peer → ExitClient", func(t *testing.T) {
+		meshDNSForwardPeerForTest(t, []string{"dns,mesh:dev-b"},
+			meshAssemblyTestKeyPEM(t), dnsPeer(nil))
+		m := NewManager(nil)
+		if m.meshDNSForwardPeer() == nil {
+			t.Fatal("dns 规则 + 载体可用 peer 应装配出 ExitClient")
+		}
+	})
+
+	t.Run("无 dns 规则 → nil fail-open", func(t *testing.T) {
+		meshDNSForwardPeerForTest(t, []string{"domains,x.com"},
+			meshAssemblyTestKeyPEM(t), dnsPeer(nil))
+		m := NewManager(nil)
+		if m.meshDNSForwardPeer() != nil {
+			t.Fatal("无 dns 规则不应激活代转发(直连透传)")
+		}
+	})
+
+	t.Run("relay-only peer → nil fail-open(载体分层)", func(t *testing.T) {
+		// 编译放行(规则可见)但运行期不可达:custom 禁中继,激活后只会
+		// SERVFAIL 风暴——装配层按载体可用性拦下。
+		meshDNSForwardPeerForTest(t, []string{"dns,mesh:dev-b"},
+			meshAssemblyTestKeyPEM(t), dnsPeer(func(p *config.MeshPeer) {
+				p.LANAddrs = nil
+				p.Relay = boolPtr(true)
+			}))
+		m := NewManager(nil)
+		if m.meshDNSForwardPeer() != nil {
+			t.Fatal("relay-only peer 无 LAN 载体,应 fail-open 不激活")
+		}
+	})
+
+	t.Run("缺私钥 → nil", func(t *testing.T) {
+		meshDNSForwardPeerForTest(t, []string{"dns,mesh:dev-b"}, "", dnsPeer(nil))
+		m := NewManager(nil)
+		if m.meshDNSForwardPeer() != nil {
+			t.Fatal("缺节点身份私钥不应装配出口")
+		}
+	})
+
+	t.Run("peer 缺钉扎 → 编译期能力闸拦下 → nil", func(t *testing.T) {
+		// meshForwardAvailable 对未钉扎 peer 判能力不成立,dns 规则不编译。
+		meshDNSForwardPeerForTest(t, []string{"dns,mesh:dev-b"},
+			meshAssemblyTestKeyPEM(t), dnsPeer(func(p *config.MeshPeer) { p.HostKey = "" }))
+		m := NewManager(nil)
+		if m.meshDNSForwardPeer() != nil {
+			t.Fatal("未钉扎 peer 的 dns 规则不应编译/激活")
+		}
+	})
+
+	t.Run("接线冒烟:wireMeshAssemblySeams 后隧道缝走同一装配", func(t *testing.T) {
+		meshDNSForwardPeerForTest(t, []string{"dns,mesh:dev-b"},
+			meshAssemblyTestKeyPEM(t), dnsPeer(nil))
+		m := NewManager(nil)
+		m.wireMeshAssemblySeams()
+		t.Cleanup(func() { tuntun.T().SetMeshDNSForwardPeerSource(nil) })
+		if m.meshDNSForwardPeer() == nil {
+			t.Fatal("接线后装配仍应可用")
+		}
+	})
 }
