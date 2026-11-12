@@ -299,13 +299,22 @@ func writeDNSLengthFrame(w io.Writer, payload []byte) error {
 // SetMeshDNSForwardPeerSource 注入 DNS 代转发对端提供器(A 侧接线缝):
 // 返回 nil = 门未激活(UDP/53 走既有直连透传,fail-open)。生产由 app/tunnel
 // 组装:routing.MeshDNSForwardTarget() 取规则驱动目标(10s memo),按 peers
-// 装配 ExitClient(Relay:false——TUN DNS 一律 custom 仅 LAN 载体);本包不
-// import processor/routing、不摸全局配置。nil 入参 = 清除(回到未接线语义)。
-// 并发安全(与 SetDialer 同款)。
+// 装配 ExitClient(Relay 随 peer 配置——TUN DNS 恒 custom 类,中继载体对其
+// 不可达,载体可用性归装配层过滤);本包不 import processor/routing、不摸
+// 全局配置。nil 入参 = 清除(回到未接线语义)。并发安全(与 SetDialer 同款)。
 func (t *Tunnel) SetMeshDNSForwardPeerSource(fn func() meshproxy.Dialer) {
 	t.meshDNSMu.Lock()
 	t.meshDNSForwardFn = fn
 	t.meshDNSMu.Unlock()
+}
+
+// MeshDNSForwardPeerSourceForTest 读回当前对端提供器(测试缝,先例
+// egress.OfflineSignalForTest):跨包测试钉「接线已发生且 fn 走同一装配」,
+// 未导出的 meshDNSForwardPeer 不可从包外断言。
+func (t *Tunnel) MeshDNSForwardPeerSourceForTest() func() meshproxy.Dialer {
+	t.meshDNSMu.Lock()
+	defer t.meshDNSMu.Unlock()
+	return t.meshDNSForwardFn
 }
 
 // meshDNSForwardPeer 取当前 DNS 代转发对端;未接线/门未激活返回 nil。

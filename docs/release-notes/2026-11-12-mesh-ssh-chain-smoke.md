@@ -56,19 +56,20 @@
 
 **配置(A 侧)**:规则加 `dns,mesh:<B-deviceID>`(尾段语法与失败策略同族,如 `dns,mesh:dev-b,fallback:dev-c`)。
 
-**⚠️ 前置说明(诚实记账)**:线格式与规则解析已就绪(SPEC §15.2 集成用例「DNS 代转发经 mesh-exit 往返」本地回环已绿),但**生产接线(注入侧 `SetMeshDNSForwardPeerSource` 的 app/tunnel 组装)属既有 Task 9 未完成清单**(SPEC §17 开放项)。当前发布包内 A 侧 DNS 查询**预期仍走本机路径、不经 mesh**——本步按「接线后前瞻验证」执行,若实机出现 DNS 经 mesh 的现象请回报(说明接线已补,清单按接线后口径更新)。
+**✅ 已接线(2026-11-12)**:TUN UDP/53 的门控按规则驱动——首条启用 `dns,mesh:<id>` 规则 + peer 载体可用(LAN 地址存在)即激活,A 侧查询经 mesh 由 B 侧代解析;**relay-only peer(无 LAN 地址)的 dns 规则不激活**(TUN DNS 恒 custom 类、Piko 中继拒 custom——此时 fail-open 走本机 DNS,绝不 SERVFAIL 风暴);门未激活/编译失败同样 fail-open。
 
 **操作**:A 侧发起域名解析(访问任一新域名),观察 A、B 两侧。
 
-**预期现象(当前发布包口径)**:
+**预期现象**:
 - 规则解析成功:`/api/mesh/status` 的 `effective` 含该 dns 条目;
-- A 侧解析照常成功(走本机 DNS),B 侧**无** `SSH ingress mesh-exit injected … target=dns…` 日志;
-- 若接线已补(非本包预期):B 侧出现 target 为 dns 的 injected 日志、A 侧域名解析结果正常返回。
+- B 侧出现 `SSH ingress mesh-exit injected … target=dns…` 日志,A 侧域名解析结果正常返回;
+- 查询经 mesh 但 B 侧解析失败 → A 侧收到 SERVFAIL(fail-closed,不静默回落公网 DNS)。
 
 **若失败的排查锚点**:
 1. `effective` 里没有该条 → `dns` 目标段形态不合法(参照 routing 测试矩阵:`dns,mesh:<id>` 大小写前缀不敏感、deviceID 保留大小写、段内空白容忍),检查逗号段拼写;
-2. 整条规则被静默跳过 → 多段尾策略语法错误(mesh: 之后只允许恰一个失败策略段,多余段整条作废);
-3. B 侧有 injected 但解析失败 → B 侧 `resolveDNSQuestion` 类型覆盖面(仅 A/AAAA 族),查 B debug 日志错误行。
+2. 整条规则被静默跳过 → 多段尾策略语法错误(mesh: 之后只允许恰一个失败策略段,多余段整条作废),或 peer 未钉扎/缺节点私钥(编译期能力闸静默跳过——查保存时是否报错);
+3. peer 只有 piko 中继(无 LAN 地址)→ 门不激活属预期(fail-open),A 侧照常解析;
+4. B 侧有 injected 但解析失败 → B 侧 `resolveDNSQuestion` 类型覆盖面(仅 A/AAAA 族),查 B debug 日志错误行。
 
 ## 冒烟 4:跨 NAT(piko relay)
 

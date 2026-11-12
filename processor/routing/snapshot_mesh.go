@@ -236,11 +236,15 @@ type meshDNSForwardMemoEntry struct {
 // 用零值 entry 表达:Store(nil) 会 panic,零值 at 的条目必然过期)。
 var meshDNSForwardMemo atomic.Value
 
-// resetMeshDNSForwardMemo 清空门控 memo(测试专用:热更即时生效路径的断言
-// 依赖显式重置;生产永不调用)。
+// resetMeshDNSForwardMemo 清空门控 memo(包内测试用)。
 func resetMeshDNSForwardMemo() {
 	meshDNSForwardMemo.Store(&meshDNSForwardMemoEntry{})
 }
+
+// ResetMeshDNSForwardMemo 清空 TUN DNS 门控 memo(测试缝,先例
+// egress.OfflineSignalForTest):app/tunnel 层测试热更配置后需即时重派生,
+// 跨包测试拿不到未导出的 resetMeshDNSForwardMemo。
+func ResetMeshDNSForwardMemo() { resetMeshDNSForwardMemo() }
 
 // MeshDNSForwardTarget 返回 TUN UDP/53 mesh 代转发目标(design §6 层1 规则
 // 驱动门控,Task 8 契约):存在启用的 {Type:"dns", Target:"toNode:<id>"}

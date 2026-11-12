@@ -13,6 +13,7 @@ package test
 //	场景 7 DNS 代转发往返    → TestMeshIntegrationDNSRoundTrip(自建服务端 dns 分支)
 //	场景 8 失败语义          → TestMeshIntegrationFailureSemantics
 //	场景 9 ingress 未运行    → TestMeshIntegrationIngressNotRunning(HandleIngressConn 缝)
+//	场景 10 DNS 真 resolver  → TestMeshIntegrationDNSRealResolver(真 inbound/ssh + 系统 resolver)
 //
 // 黑盒约束:test 包只消费导出 API——inbound/ssh(NewServer/Start/Stop/Addr/
 // RunConfig/MeshKey/Form*)、outbound/proxy/mesh(ExitClient/PeerSpec/
@@ -58,6 +59,7 @@ import (
 	meshproto "aliang.one/nursorgate/outbound/meshproto"
 	mesh "aliang.one/nursorgate/outbound/proxy/mesh"
 
+	"github.com/miekg/dns"
 	gossh "golang.org/x/crypto/ssh"
 )
 
@@ -977,5 +979,68 @@ func TestMeshIntegrationIngressNotRunning(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("conn must be closed after HandleIngressConn(false)")
+	}
+}
+
+// ===== 场景 10:DNS 代转发真 resolver 往返(2026-11-12 接线批) =====
+
+// TestMeshIntegrationDNSRealResolver 与场景 7(自建服务端回放固定字节)互补:
+// 本场景走真 inbound/ssh 的 serveMeshDNSExit(miekg 拆问 + 系统 resolver),
+// 查询名选 localhost(/etc/hosts 直出,零外呼)——断言响应帧是合法 DNS 报文
+// 且含 127.0.0.1 A 记录。这是 B 侧代解析真实路径(类型矩阵/负答折叠在包内
+// 单测)与 A 侧线格式(writeDNSLengthFrame 对偶)的集成交汇点。
+func TestMeshIntegrationDNSRealResolver(t *testing.T) {
+	keyPEM, _, aPub := meshKeyPair(t)
+	node := startIngressNode(t, sshin.RunConfig{
+		MeshKeys: []sshin.MeshKey{{Key: aPub, DeviceID: "dev-a"}},
+		// ForwardGate nil = fail-closed(SPEC §10.1);门禁链路已在场景 3
+		// 钉死,本场景要过闸进 serveMeshDNSExit,故显式开。
+		ForwardGate: func() bool { return true },
+	})
+
+	client, err := mesh.NewExitClient(mesh.PeerSpec{
+		DeviceID: "dev-b",
+		LANAddrs: []string{node.addr},
+		HostKey:  node.hostFP, // FingerprintSHA256 自带 SHA256: 前缀,钉扎指纹格式直用
+	}, keyPEM, "", nil)
+	if err != nil {
+		t.Fatalf("NewExitClient: %v", err)
+	}
+
+	md := &M.Metadata{HostName: meshproto.DNSTarget, DstPort: 53}
+	conn, dialErr := meshDialBounded(t, client, context.Background(), md, 8*time.Second)
+	if dialErr != nil {
+		t.Fatalf("DialContext: %v", dialErr)
+	}
+	defer conn.Close()
+
+	// 真实 DNS 查询报文:localhost. A IN(miekg 构造,与客户端栈同形态)。
+	query := new(dns.Msg)
+	query.SetQuestion("localhost.", dns.TypeA)
+	query.RecursionDesired = true
+	wire, err := query.Pack()
+	if err != nil {
+		t.Fatalf("pack query: %v", err)
+	}
+	if err := meshWriteDNSFrame(conn, wire); err != nil {
+		t.Fatalf("write query frame: %v", err)
+	}
+
+	respBytes := meshReadDNSFrameBounded(t, conn, 5*time.Second)
+	var resp dns.Msg
+	if err := resp.Unpack(respBytes); err != nil {
+		t.Fatalf("unpack response %q: %v", respBytes, err)
+	}
+	if resp.Rcode != dns.RcodeSuccess {
+		t.Fatalf("rcode = %s, want NOERROR", dns.RcodeToString[resp.Rcode])
+	}
+	found := false
+	for _, rr := range resp.Answer {
+		if a, ok := rr.(*dns.A); ok && a.A.Equal(net.IPv4(127, 0, 0, 1)) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("answers = %v, want 127.0.0.1 A record for localhost", resp.Answer)
 	}
 }

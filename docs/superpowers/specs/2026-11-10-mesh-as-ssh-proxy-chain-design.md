@@ -687,7 +687,7 @@ A 侧对偶实现 `inbound/tun/tunnel/dns_forward.go:258-282`,线格式 `[2B 大
 
 顺带修掉 §1.3 的分裂:SSH 载体不再拒绝 `dns:`。
 
-> **现状记账**:`SetMeshDNSForwardPeerSource` 今日**生产调用点为 0**(只有 `test/mesh_integration_test.go:1059` 与单测),`routing.MeshDNSForwardTarget()` 同样只有测试调用。本次为其搬运约 200 行,但**不会因此就在生产激活**——接线仍属既有 Task 9 未完成清单。§17 同记。
+> **现状记账(2026-11-12 接线完成)**:`SetMeshDNSForwardPeerSource` 已由 app/tunnel 装配接线(`wireMeshAssemblySeams` → `meshDNSForwardPeer`,规则驱动走 `routing.MeshDNSForwardTarget` 10s memo)。**激活按载体可用性分层**:relay-only peer 编译放行但运行期 fail-open(TUN DNS 恒 ClassCustom、PikoTransport 拒 custom——激活后只会 SERVFAIL 风暴);peer 有 LAN 地址才装配 ExitClient。§17 对应条目已闭。
 
 ## 10. 入站身份与 ACL
 
@@ -1225,7 +1225,7 @@ expect(savedBody.customer.mesh.fallback).toEqual({ enable: true, addr: '192.168.
 - **平台自动交换密钥**:`private_key`/`host_key` 目前靠人工粘贴。平台台账已有 device 记录,可做自动分发——一期不做。
 - **`MeshKey.DeviceID` 与 `peers[].device_id` 的强制一致性**:一期只警告不阻断(两侧本就可以不同设备)。
 - **`SplitTarget` 的存亡**:`mesh_inbound.go:501` 的消费方随文件删除,只剩 `mesh.go:346` 一处;`targetFromMetadata` 会被 `hostPortFromMetadata`(§5.1.1,改用标准库 `SplitHostPort`)取代,届时全仓可能再无 `SplitTarget` 调用方——一期先保留,实施时若确无用再删。
-- **DNS 代转发的生产接线**:本次只保证可编译与线格式正确,`SetMeshDNSForwardPeerSource` / `routing.MeshDNSForwardTarget()` 的生产接线仍属既有 Task 9 未完成清单(§9 记账)。不以"已保留"读成"已可用"。
+- **DNS 代转发的生产接线**:~~仍属既有 Task 9 未完成清单~~**已完成(2026-11-12)**:app/tunnel `meshDNSForwardPeer` 规则驱动装配 + `wireMeshAssemblySeams` 接线 `tunnel.T()`。激活按载体可用性分层——peer 有 LAN 地址才激活;relay-only peer fail-open 走本机 DNS(TUN DNS 恒 ClassCustom,PikoTransport 拒 custom,§9 记账已更新)。
 - **`/api/mesh/status` 会新增 `host_key` 字段**:这是既有 `Peers []config.MeshPeer` 透传的自然结果,不带私钥。需在实施时确认可接受,或显式剔除。
 - **`MeshFallbackActiveForClass` 的签名**:本设计**不动**它(保持 `(addr string, ok bool)`,§7.2 决策)——它有 3 个生产调用方 + 10 处测试断言二值返回,扩三元组是纯噪声。host key 另走新增的 `MeshFallbackHostKey(cfg)` 只读助手。
 - **`customer.mesh.max_hops` 一期无消费方**:单跳模型下它恒应为 1,`Validate` 仍把它钳到 [1,8] 属惰性校验。实施时在字段注释写明「一期不消费,仅为二期链长上限占位」,避免下一个人去接一个不存在的消费方。
