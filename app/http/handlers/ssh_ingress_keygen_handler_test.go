@@ -37,6 +37,9 @@ func TestSSHIngressKeygenHandler(t *testing.T) {
 		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 			t.Fatalf("decode envelope: %v", err)
 		}
+		if resp.Code != 0 {
+			t.Fatalf("envelope code = %d, want 0", resp.Code)
+		}
 		key := resp.Data.Key
 		// snake_case 断言即上面 struct tag 本身——空串=tag 直出失败/字段缺失
 		if key.PublicKey == "" || key.PrivateKey == "" || key.Fingerprint == "" ||
