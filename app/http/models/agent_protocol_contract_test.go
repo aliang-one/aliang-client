@@ -118,6 +118,56 @@ func TestContractOptionResolvedFields(t *testing.T) {
 	}
 }
 
+// 2026-11-12 mesh UDP 打洞（plan 2026-11-12-mesh-udp-punch Task 1）：peer.punch
+// 三帧契约锁。登记位置照 peer.lan 家族先例——整族（含 B→server 的 result）
+// 就近落在 ServerSends 块；candidates 为数组字段，表内写法照 entries/messages
+// 惯例用裸名（无 [] 后缀）。
+func TestContractPeerPunchFrames(t *testing.T) {
+	if AgentEventPeerPunchSession != "peer.punch.session" {
+		t.Fatalf("AgentEventPeerPunchSession=%q, want peer.punch.session", AgentEventPeerPunchSession)
+	}
+	if AgentEventPeerPunchSessionResult != "peer.punch.session.result" {
+		t.Fatalf("AgentEventPeerPunchSessionResult=%q, want peer.punch.session.result", AgentEventPeerPunchSessionResult)
+	}
+	if AgentEventPeerPunchCandidates != "peer.punch.candidates" {
+		t.Fatalf("AgentEventPeerPunchCandidates=%q, want peer.punch.candidates", AgentEventPeerPunchCandidates)
+	}
+	c := DefaultAgentProtocolContract()
+	want := map[string]struct {
+		required []string
+		optional []string
+		emits    []string
+	}{
+		AgentEventPeerPunchSession: {
+			required: []string{"type", "request_id", "session_id", "token", "ttl_seconds"},
+			optional: []string{"advertise_ip"},
+			emits:    []string{AgentEventPeerPunchSessionResult},
+		},
+		AgentEventPeerPunchSessionResult: {
+			required: []string{"type", "request_id", "ok"},
+			optional: []string{"port", "fingerprint", "fail_reason"},
+		},
+		AgentEventPeerPunchCandidates: {
+			required: []string{"type", "session_id", "candidates"},
+		},
+	}
+	for typ, w := range want {
+		schema := findProtocolEvent(c.WebSocket.ServerSends, typ)
+		if schema == nil {
+			t.Fatalf("契约表 ServerSends 缺 %s", typ)
+		}
+		if !sameStringSet(schema.Required, w.required) {
+			t.Fatalf("contract %s Required=%v, want %v", typ, schema.Required, w.required)
+		}
+		if !sameStringSet(schema.Optional, w.optional) {
+			t.Fatalf("contract %s Optional=%v, want %v", typ, schema.Optional, w.optional)
+		}
+		if !sameStringSet(schema.Emits, w.emits) {
+			t.Fatalf("contract %s Emits=%v, want %v", typ, schema.Emits, w.emits)
+		}
+	}
+}
+
 func findProtocolEvent(events []AgentProtocolEvent, typ string) *AgentProtocolEvent {
 	for i := range events {
 		if events[i].Type == typ {

@@ -140,6 +140,16 @@ const (
 	AgentEventPeerLanListenResult = "peer.lan.listen.result" // B→server: 绑定结果(addr+fingerprint)或失败原因
 )
 
+// mesh UDP 打洞（plan 2026-11-12-mesh-udp-punch）：punch 信令帧族，走平台 WS
+// 的 peer 帧家族（peer.exec.*/peer.lan.* 先例）。session 由 A 经服务端编排下
+// 发，result 回绑定结果，candidates 经服务端按 session_id 转发对端。独立成块
+// 以免长常量名迫使上方块整体重排空白（照 TerminalQuota 块先例）。
+const (
+	AgentEventPeerPunchSession       = "peer.punch.session"        // server→B(A 发起): 请求起一次性 punch listener
+	AgentEventPeerPunchSessionResult = "peer.punch.session.result" // B→server→A: 绑定结果(port+fingerprint)或失败原因
+	AgentEventPeerPunchCandidates    = "peer.punch.candidates"     // 双向经 server 按 session_id 转发对端: STUN 公网候选交换
+)
+
 // Terminal output quota challenge protocol (spec §5.2). There is NO
 // pause/resume gate: after a challenge is emitted output keeps streaming; a
 // granted challenge only clears the pending state, and an unanswered one kills
@@ -369,6 +379,14 @@ func DefaultAgentProtocolContract() AgentProtocolContract {
 				// B 绑定成功立即回 result（addr+fingerprint），服务过程异步单连接。
 				{Type: AgentEventPeerLanListen, Required: []string{"type", "request_id", "transfer_id", "token", "source_path", "size_bytes"}, Optional: []string{"sha256", "advertise_ip", "ttl_seconds"}, Emits: []string{AgentEventPeerLanListenResult}},
 				{Type: AgentEventPeerLanListenResult, Required: []string{"type", "request_id", "ok"}, Optional: []string{"addr", "fingerprint", "fail_reason"}},
+				// mesh UDP 打洞（plan 2026-11-12-mesh-udp-punch §帧契约）：punch
+				// 信令三帧，照 peer.lan 先例整族就近登记。session 由 A 经服务端
+				// 发起（ttl_seconds 必填——一次性 listener 的存活上限）；result 回
+				// port+fingerprint；candidates 双向经 server 按 session_id 转发
+				// 对端——STUN 公网候选交换，数组字段表内照惯例用裸名。
+				{Type: AgentEventPeerPunchSession, Required: []string{"type", "request_id", "session_id", "token", "ttl_seconds"}, Optional: []string{"advertise_ip"}, Emits: []string{AgentEventPeerPunchSessionResult}},
+				{Type: AgentEventPeerPunchSessionResult, Required: []string{"type", "request_id", "ok"}, Optional: []string{"port", "fingerprint", "fail_reason"}},
+				{Type: AgentEventPeerPunchCandidates, Required: []string{"type", "session_id", "candidates"}},
 			},
 		},
 		Streams: []AgentProtocolStream{
