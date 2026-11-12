@@ -75,6 +75,8 @@
 | 12 | 失败语义 | **不变**:错误回源,仅链头执行兜底与失败策略 |
 | 13 | SSH 栈复用边界 | **只复用握手/身份/加密原语,不复用 `outbound/proxy/ssh` 的池与 `chain.go`**(§5.4) |
 | 14 | 让渡型能力门禁 | `forward_enable` **仍是硬闸**,`ForwardGate==nil` 语义由「全放行」改为 **fail-closed**(§10.1) |
+| 15 | 出口链路(2026-11-12 拍板) | **toggle=无条件链到下一跳**:fallback 收敛为 `{enable,next_hop}`,地址/钉扎从 peers 条目继承;离线信号门控整族删除——开关即常驻改道,不按本机能否直连平台做限制(§18) |
+| 16 | 链式防环 | **via 经停链**:每个委托跳把本机 device_id 追加进链随 payload 传递;接收端发现自己在链里即就地处理(回环终止),链长 ≥ `max_hops` 即就地处理(放大上限)——`max_hops` 从占位复活为经停上限(§6.4/§18) |
 
 ## 3. 三层职责
 
@@ -1227,5 +1229,34 @@ expect(savedBody.customer.mesh.fallback).toEqual({ enable: true, addr: '192.168.
 - **`SplitTarget` 的存亡**:`mesh_inbound.go:501` 的消费方随文件删除,只剩 `mesh.go:346` 一处;`targetFromMetadata` 会被 `hostPortFromMetadata`(§5.1.1,改用标准库 `SplitHostPort`)取代,届时全仓可能再无 `SplitTarget` 调用方——一期先保留,实施时若确无用再删。
 - **DNS 代转发的生产接线**:~~仍属既有 Task 9 未完成清单~~**已完成(2026-11-12)**:app/tunnel `meshDNSForwardPeer` 规则驱动装配 + `wireMeshAssemblySeams` 接线 `tunnel.T()`。激活按载体可用性分层——peer 有 LAN 地址才激活;relay-only peer fail-open 走本机 DNS(TUN DNS 恒 ClassCustom,PikoTransport 拒 custom,§9 记账已更新)。
 - **`/api/mesh/status` 会新增 `host_key` 字段**:这是既有 `Peers []config.MeshPeer` 透传的自然结果,不带私钥。需在实施时确认可接受,或显式剔除。
-- **`MeshFallbackActiveForClass` 的签名**:本设计**不动**它(保持 `(addr string, ok bool)`,§7.2 决策)——它有 3 个生产调用方 + 10 处测试断言二值返回,扩三元组是纯噪声。host key 另走新增的 `MeshFallbackHostKey(cfg)` 只读助手。
-- **`customer.mesh.max_hops` 一期无消费方**:单跳模型下它恒应为 1,`Validate` 仍把它钳到 [1,8] 属惰性校验。实施时在字段注释写明「一期不消费,仅为二期链长上限占位」,避免下一个人去接一个不存在的消费方。
+- **出口链路的 TLS/MITM 边界**:TLS toAliang 流量在 MITM 后本地已解密,委托载体要求「到目标的原始流」——TLS 流量不适用委托,仍走本机隧道(§18.2;与旧离线兜底行为一致,是有意的形态边界而非缺陷)。
+
+## 18. 出口链路改造(2026-11-12 用户拍板,替代离线兜底)
+
+### 18.1 决策
+
+用户原话定死语义:「我要的开关效果就是跳转到 dev-b,不管我们的电脑能不能直连,不做什么能联网不给走 b 的限制」。
+
+- **触发为常驻语义**:fallback.enable 显式 true 即无条件改道,**离线信号门控整族删除**(`SetOfflineSignal`/`SetMeshOfflineSignal`/`TunnelSessionActive` 缝/`meshOfflineRedirectForAI`/`MeshOfflineAIRedirectActive`)。
+- **配置收敛**:`MeshFallbackConfig` 从 `{enable,classes,addr,host_key}` 收敛为 `{enable,next_hop}`——下一跳必须是 peers 中**已钉扎**的节点(保存期 `Validate` 强制:next_hop 必填/须指向 peers/该 peer 须有 host_key;`ValidateMesh` 加 next_hop≠self 自指拒绝),地址与钉扎从 peers 条目继承。
+- **取舍已写进发布说明**:开关开 = 出口完全依赖下一跳,下一跳挂了对外流量失败、错误回源,**不回落 direct**(静默绕链会让「开了开关却没走链」不可见,fail-loud)。
+- **覆盖面**:toAliang 类明文流量(AI 56432 + 非 TLS toAliang 命中)+ 平台自身出口(processor/egress)。**规则流量(toNode)零变化**——链头失败策略(direct/deny/fallback:<id2>)照旧,不再叠加兜底段。
+
+### 18.2 执行链
+
+- **配置面**(processor/config):`MeshDelegateNextHop()` 替代 `MeshFallbackActiveForClass`(布尔+peer 二值返回);`MeshFallbackHostKey` 删除。
+- **tcp 面**(processor/tcp `mesh_delegate.go` 新文件):`meshDelegateGuard` = 本机 id 未接线 fail-closed ∧ via 含自己拒 ∧ `len(via) >= EffectiveMaxHops` 拒;`dialViaMeshDelegate` 复用 `getMeshExitForExecution` 的 ExitClient 装配(LAN/Piko 载体、钉扎、身份与规则路径同一套),拨出前 `append(via, selfID)`;`dialAliangOrDelegate` 是明文形态专属入口(TLS/MITM 路径不委托)。本机 id 缝 `SetMeshSelfIDSource`(装配层=Manager.deviceID,与 inbound/ssh LocalNodeID 同源)。
+- **链式推进**:接收端(inbound/ssh handleMeshExitChannel)解析 payload `v` → `md.MeshVia`;注入连接守卫放行时再上链 = 链式转发的推进方式,回环/超限由守卫拒掉就地处理。payload `exitMeta` 增 `Via []string`(键 `v`,512 ExtraData 上限内)。
+- **egress 面**:`meshDelegateActive()` 门 + peer 源从 `Peers[0]` 改 `MeshDelegateNextHop`;拨号失败如实失败。探针降级消费方(app/http/services agentCoreEnsureUpstream)改 `tcp.MeshDelegateActive()` 同源判定。
+- **域绑定缓存**:processor/rules `StoreBinding` skip 名单 `RouteMeshFallback`→`RouteMeshDelegate`(mesh 路由连接不毒化缓存,防 EvaluateRoute 复活时静默绕过链路)。
+- **UI**:MeshSettings 兜底卡 → 出口链路卡(toggle + 下一跳 peer 下拉,未钉扎行标注;addr/candidate/host_key/classes 四输入位删除;lan_peers 候选拉取随点选输入位一并移除)。
+- **清理**:`DialMeshAddr`(裸地址拨号,唯一消费方是旧兜底路径)删除;`DialMeshAddr` 守卫矩阵测试随删(空钉扎/nil 身份守卫归 ExitClient 同名矩阵)。
+
+### 18.3 已知边界(记录,不修)
+
+- **TLS toAliang 不上链**:MITM 后本地已解密,委托载体要求原始流——TLS 流量仍走本机隧道(链在 TLS 流量处终止,与旧兜底行为一致)。链式转发对 TLS 流量的完整支持需要端到端形态改造,不在本批。
+- **平台 api 委托到达 B 后按 B 的规则处理**:A 的平台出口流量经 mesh 到 B 是普通 host:port 注入连接,B 按自己的规则引擎决策(toAliang 规则命中 → B 出隧道);B 也开着开关时,其 toAliang 明文命中会继续上链(链式推进),TLS 命中在 B 的 MITM 处终止。
+- **旧键残留**:存量配置里的 `fallback.addr/host_key/classes` 在保存时随字面量整体替换清除;读取侧(js 归一化与后端结构体)都不认这些键,手改配置文件残留旧键无副作用。
+
+- ~~**`MeshFallbackActiveForClass` 的签名**~~:**已随出口链路改造删除(2026-11-12,§18)**——整个离线信号门控族(助手/离线信号缝×2/`MeshFallbackHostKey`)被 `MeshDelegateNextHop` 取代,地址与钉扎从 peers 条目继承,不再有独立 fallback.addr/host_key 形态。
+- ~~**`customer.mesh.max_hops` 一期无消费方**~~:**已复活为消费方(2026-11-12,§18)**——链式转发的经停上限:接收端拒绝 `len(via) >= EffectiveMaxHops()` 的再上链,守卫命中即就地处理(链的终点语义,不报错)。

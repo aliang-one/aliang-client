@@ -26,17 +26,17 @@ mesh 出口流量现在走对端 SSH 入口(ssh_ingress)承载,不再有自己�
 
 mesh 身份现在由三类密钥共同构成,缺一即该段组网不生效:
 
-- 缺 `private_key` / `peers[].host_key` / `fallback.host_key` 的配置:保存期直接拒(前端正常保存路径会看到报错);
+- 缺 `private_key` / `peers[].host_key` 的配置:保存期直接拒(前端正常保存路径会看到报错);
 - 绕过保存的存量配置(手改配置文件后重启):编译期能力闸跳过该 peer 的规则(不报错、不弹窗),规则看起来存在但不生效。
 
-排查方法:`/api/mesh/status` 新增的 `effective` 字段反映编译后的真实生效值——规则在但 `effective` 里没有,就是密钥没填齐,对照「升级七步」第 2/3/6 步补齐。
+排查方法:`/api/mesh/status` 新增的 `effective` 字段反映编译后的真实生效值——规则在但 `effective` 里没有,就是密钥没填齐,对照「升级七步」第 2/3 步补齐。
 
 ## 其它行为变更
 
 - forward_enable 门禁收紧(nil=fail-closed,装配层恒注入活闭包);
 - key_passphrase 会做 TrimSpace(首尾空格被改掉导致解不开钥——与 proxy.key_passphrase 同口径);
 - ssh_ingress.port=0 时 mesh 入站随代理运行态启停;port>0 专用口默认只绑回环,lan_addrs 仍须填 56432;
-- fallback.addr 语义变更:现指对端 SSH 入口 56432(旧值指向已删除的 mesh 监听口,不改则兜底必不通),且启用时 fallback.host_key 必填;
+- **「离线兜底」已重构为「出口链路」(2026-11-12)**:配置收敛为开关+下一跳设备(下拉选已配置的节点,地址与指纹从节点条目继承,不再单独填 `fallback.addr`/`fallback.host_key`/类别勾选)。**开关=无条件委托**:打开后本机对 Aliang 云与内部接口的流量常驻交给下一跳出网,**不再按「本机能不能直连平台」自动切换**;下一跳挂了这些流量会失败、错误回给你——这是有意设计。下一跳也开着开关会继续链向它的下一台,直到某台没开的设备直接出网;规则流量(toNode)完全不受开关影响;
 - `/api/mesh/status` 新增 effective 字段(生效值)与 peers[].host_key 回读;
 - **DNS 代转发已生产接线**:配 `dns,mesh:<id>` 规则即驱动 TUN DNS 经 mesh 由 B 侧代解析;**relay-only peer(无 LAN 地址)的 dns 规则不激活**(TUN DNS 恒 custom 类、Piko 中继拒 custom——此时 fail-open 走本机 DNS);门未激活或编译失败同样 fail-open;
 - 不变项:失败策略(direct/deny/fallback:<id2>)语法零变化。
@@ -48,7 +48,7 @@ mesh 身份现在由三类密钥共同构成,缺一即该段组网不生效:
 3. 对每个 peer,把对端的 SSH 入口公钥填入本机 customer.mesh.peers[].host_key(来源=对端仪表盘「SSH 入口」卡片指纹);
 4. 检查 peers[].lan_addrs 端口为 56432(不是专用口);
 5. 跨网段/跨 NAT 对端确认 relay=true 且平台侧放行 <deviceID>.mesh + 下发 piko_proxy_url;
-6. 离线兜底:fallback.addr 改填对端 IP:56432,并新增 fallback.host_key(旧值指向已删除的 mesh 监听口,不改则兜底必不通);
+6. 出口链路(原「离线兜底」):如果你配了旧版兜底,要做两件事——在组网卡「出口链路」卡重新打开开关、下一跳下拉里重新选那台设备(旧的 `fallback.addr/host_key/classes` 三个字段已废弃,下次保存自动清除);并确认那台设备的 `peers[].host_key` 已钉扎(第 3 步已做)。开关不打开 = 出口链路完全不生效,流量照常走本机网络,不会断网;
 7. 确认前端版本已含组网密钥输入位(host_key×2/节点私钥),否则手改配置文件。
 
 七步做完后,用 `/api/mesh/status` 核对:各 peer 可达、`effective` 字段包含预期出口规则,即升级完成。
