@@ -102,12 +102,18 @@ func punchAcceptLoop(tr *quic.Transport, ln *quic.Listener, ttl time.Duration, t
 	timer := time.NewTimer(ttl)
 	defer timer.Stop()
 
-	acceptErr := make(chan error, 1) // 缓冲 1:子 goroutine 发完即退,主侧必收到
+	// acceptErr 用 close 信号语义:accept goroutine 退出时 close,错误值
+	// 本身只是随发的一次性线索(收摊原因上层自有见证)。join 侧因此在对称
+	// 两条路径上都必然返回——TTL 先至:Transport 关闭唤醒 Accept 报错,发
+	// 送+close 依次落地;accept 报错先至:select 已把值收走也无妨,通道
+	// close 后的接收立即返回零值,不存在「唯一的值被消费、二次收永久挂死」。
+	acceptErr := make(chan error, 1)
 	go func() {
+		defer close(acceptErr)
 		for {
 			qconn, err := ln.Accept(context.Background())
 			if err != nil {
-				acceptErr <- err
+				acceptErr <- err // 缓冲 1 且生命周期内唯一一次发送,必不阻塞
 				return
 			}
 			go punchServeConn(qconn, token, handler)
@@ -119,7 +125,7 @@ func punchAcceptLoop(tr *quic.Transport, ln *quic.Listener, ttl time.Duration, t
 	case <-acceptErr:
 	}
 	_ = tr.Close()
-	<-acceptErr // 等 accept goroutine 退出(Transport 关闭后 Accept 必报错)
+	<-acceptErr // join accept goroutine:close 语义下两分支都必然返回
 }
 
 // punchServeConn 服务单条已过握手的会话:首条 AcceptStream 到的流先过

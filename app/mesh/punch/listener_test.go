@@ -195,6 +195,48 @@ func TestServeListenerTTLTeardownClosesDone(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// (d2) accept 报错先至(调用方提前关 conn)→ done 关闭、不挂死
+// ---------------------------------------------------------------------------
+
+// TestServeListenerCallerConnCloseClosesDone 非 TTL 收摊路径:调用方在 TTL
+// 远未到时提前关 conn(所有权契约里调用方的合法动作),accept 面报错先至
+// ——done 必须照样关闭,不能因收摊调度只按 timer 分支设计而永久挂死。
+// 5s 护栏防测试本身挂死;TTL 给足 90s 保证唯一触发面就是关 conn。
+func TestServeListenerCallerConnCloseClosesDone(t *testing.T) {
+	serverCert, serverFP := testPunchCert(t, "punch-close-server")
+	clientCert, clientFP := testPunchCert(t, "punch-close-client")
+	cfg := PunchTLSConfig{
+		ServerCert:        serverCert,
+		ClientCert:        clientCert,
+		ServerFingerprint: serverFP,
+		ClientFingerprint: clientFP,
+		ExpectedToken:     "punch-test-token",
+	}
+	udpConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("起 listener UDP socket 失败: %v", err)
+	}
+	t.Cleanup(func() { _ = udpConn.Close() }) // 幂等兜底:主体已关,二次关只报错
+	_, done, err := ServeListener(udpConn, ListenerOpts{
+		TTL:     90 * time.Second,
+		Token:   "punch-test-token",
+		TLS:     cfg,
+		Handler: func(net.Conn) {},
+	})
+	if err != nil {
+		t.Fatalf("起 listener 失败: %v", err)
+	}
+
+	_ = udpConn.Close() // 调用方提前收 conn:accept 报错先至路径
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("调用方关 conn 后 done 未关闭(accept-error 先至路径挂死)")
+	}
+}
+
+// ---------------------------------------------------------------------------
 // (e) 两个并发会话各自过门互不串扰
 // ---------------------------------------------------------------------------
 
