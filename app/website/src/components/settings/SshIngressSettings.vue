@@ -536,11 +536,12 @@ export default {
     // 走 localError 红框；保存结果由父层 error/successMessage props 回流,
     // watch 方向语义见 watch 注释。
     async oneClickSetup() {
-      // 双击防重：loading/saving 是父层保存态,keygen fetch 在途时不置位——
-      // 以 keygenInFlight 在途旗标封死整个 fetch 窗口（在途第二次点击直接
-      // return）,防两把钥匙把第一把挤成无主;keygenPending 再兜住 resolve
-      // 后→保存回流前的窗口,两旗标合围全周期
-      if (this.loading || this.saving || this.keygenInFlight || this.keygenPending) {
+      // 双击防重：keygenInFlight 在途旗标封死整个 fetch 窗口;loading/saving
+      // 是父层保存态。keygenPending 刻意不进守卫——它是 v3 恢复链的载体
+      // （跨保存失败保留）,守卫它会把「删钥匙后重按一键换新钥」变成哑按钮
+      // （spec §3 恢复路径）;fetch resolve 到 pending 赋值之间只有微任务,
+      // 真实用户事件插不进来。
+      if (this.loading || this.saving || this.keygenInFlight) {
         return;
       }
       this.localError = '';

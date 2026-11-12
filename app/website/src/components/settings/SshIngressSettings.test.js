@@ -593,6 +593,37 @@ describe('SshIngressSettings 一键生成并启用', () => {
     expect(saved[0].ssh_ingress.authorized_keys[0]).toBe(keygenPayload().public_key);
   });
 
+  it('恢复链·换新钥：失败后删钥匙重按一键 → 第二次 POST 覆盖 pending（v3 恢复路径）', async () => {
+    let postCount = 0;
+    let resolveKeygen;
+    vi.stubGlobal('fetch', vi.fn((url, opts) => {
+      if ((opts?.method || 'GET') === 'POST' && String(url).includes('/ssh-ingress/keygen')) {
+        postCount += 1;
+        return new Promise((res) => { resolveKeygen = res; });
+      }
+      return Promise.resolve(jsonResponse(hostkeyEnvelope(hostkeyPayload())));
+    }));
+    const { el, props } = mountLive(baseConfig());
+    await flush();
+    el.querySelector('button[data-ssh-oneclick]').click(); // 第 1 击 → pending=K1
+    resolveKeygen(jsonResponse(keygenEnvelope(keygenPayload())));
+    await flush();
+    props.error = 'boom';                                   // 保存失败,pending=K1 保留
+    await flush();
+
+    // 用户删钥匙（重置为无钥匙配置,deep watch 重置表单→按钮复现）
+    props.config = baseConfig();
+    await flush();
+    expect(el.querySelector('button[data-ssh-oneclick]')).not.toBeNull();
+
+    el.querySelector('button[data-ssh-oneclick]').click(); // 重按：必须真发第二次 POST
+    expect(postCount).toBe(2);                              // 守卫不得吞掉（pending 不进守卫）
+    resolveKeygen(jsonResponse(keygenEnvelope(keygenPayload())));
+    await flush();
+    // 新钥覆盖旧 pending：列表头是新公钥
+    expect(el.querySelector('[data-ssh-ingress-body]')).not.toBeNull();
+  });
+
   it('保存成功回流（successMessage 变非空+pending 在）→ 私钥弹窗渲染全文+下载+复制', async () => {
     stubFetchRouted(() => jsonResponse(keygenEnvelope(keygenPayload())));
     const { el, props } = mountLive(baseConfig());
