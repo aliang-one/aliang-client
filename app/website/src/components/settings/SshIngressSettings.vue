@@ -45,11 +45,11 @@
     </div>
 
     <div
-      v-if="error"
+      v-if="error || localError"
       class="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700 dark:border-red-500/30 dark:bg-red-500/10 dark:text-red-200"
       role="alert"
     >
-      {{ error }}
+      {{ error || localError }}
     </div>
     <div
       v-else-if="successMessage"
@@ -62,6 +62,20 @@
     <!-- 体(默认折叠,低频功能不占版面):端口/指纹/双公钥/提示/保存。v-show 而非
          v-if——单元测试与状态保留均受益(隐藏态 DOM 仍在,数据不重置)。 -->
     <div v-show="bodyExpanded" data-ssh-ingress-body class="flex flex-col gap-4">
+    <!-- 一键生成并启用（spec §2.1）：keygen→公钥插队头→开启→走既有保存链；
+         已启用且有钥匙时隐藏（归手工流）。禁用不挂 validationError——无钥匙
+         状态它恒真会锁死按钮；只挂 portError（红字同屏可见）。 -->
+    <button
+      v-if="!form.enabled || !form.authorizedKeys.length"
+      class="inline-flex min-h-11 items-center justify-center gap-2 rounded bg-primary px-4 py-2 text-sm font-medium text-white transition hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-60"
+      data-ssh-oneclick
+      type="button"
+      :disabled="loading || saving || !!portError"
+      @click="oneClickSetup"
+    >
+      <span class="material-symbols-outlined text-sm">bolt</span>
+      {{ t('sshIngress_oneClick') }}
+    </button>
     <div class="grid gap-4 md:grid-cols-[200px_minmax(0,1fr)]">
       <!-- 端口(可选专用口,spec §6.4 修订):留空=跟随统一口 56432;显式端口
            另开常驻专用监听口。旧默认 56442 是哨兵,显示为空(翻译层归零)。 -->
@@ -207,6 +221,64 @@
       </button>
     </div>
     </div><!-- /data-ssh-ingress-body -->
+
+    <!-- 私钥一次性弹窗（spec §2.3）：全文+下载+复制+连接示例；关闭即清零
+         持久化（state 同步清,不写 localStorage/日志）。 -->
+    <div
+      v-if="privKeyModal"
+      class="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+      data-ssh-privkey-modal
+      role="dialog"
+      aria-modal="true"
+      @click.self="closePrivKeyModal"
+    >
+      <div class="flex w-full max-w-xl flex-col gap-4 rounded-xl border border-slate-200 bg-white p-5 shadow-xl dark:border-slate-700 dark:bg-slate-900">
+        <div class="flex items-center justify-between">
+          <h4 class="font-semibold text-slate-900 dark:text-white">{{ t('sshIngress_privKeyTitle') }}</h4>
+          <button
+            type="button"
+            class="text-slate-400 transition hover:text-slate-600 dark:hover:text-slate-200"
+            data-ssh-privkey-close
+            :aria-label="t('sshIngress_privKeyTitle')"
+            @click="closePrivKeyModal"
+          >
+            <span class="material-symbols-outlined">close</span>
+          </button>
+        </div>
+        <p class="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-200">
+          {{ t('sshIngress_privKeyOnceWarning') }}
+        </p>
+        <p class="text-xs text-slate-500 dark:text-slate-400">
+          {{ keygenResult?.algorithm }} · <code class="break-all font-mono">{{ keygenResult?.fingerprint }}</code>
+        </p>
+        <pre
+          class="max-h-48 overflow-auto whitespace-pre-wrap break-all rounded-lg border border-slate-200 bg-slate-50 p-3 font-mono text-[11px] text-slate-700 dark:border-slate-700 dark:bg-slate-900/60 dark:text-slate-200"
+          data-ssh-privkey-text
+        >{{ keygenResult?.private_key }}</pre>
+        <div class="flex flex-wrap items-center justify-end gap-3">
+          <a
+            class="inline-flex min-h-11 items-center gap-1.5 rounded border border-slate-200 px-3 text-xs font-semibold text-slate-600 transition hover:border-primary/30 hover:text-primary dark:border-slate-700 dark:text-slate-300"
+            data-ssh-privkey-download
+            download
+            :href="privKeyDownloadHref"
+            :download="keygenResult?.suggested_filename || 'aliang-ingress-key.pem'"
+          >
+            <span class="material-symbols-outlined text-sm">download</span>
+            {{ t('sshIngress_privKeyDownload') }}
+          </a>
+          <button
+            type="button"
+            class="inline-flex min-h-11 items-center gap-1.5 rounded border border-slate-200 px-3 text-xs font-semibold text-slate-600 transition hover:border-primary/30 hover:text-primary dark:border-slate-700 dark:text-slate-300"
+            data-ssh-privkey-copy
+            @click="copyPrivKey"
+          >
+            <span class="material-symbols-outlined text-sm">content_copy</span>
+            {{ privKeyCopied ? t('sshIngress_privKeyCopied') : t('sshIngress_privKeyCopy') }}
+          </button>
+        </div>
+        <p class="text-xs leading-5 text-slate-500 dark:text-slate-400">{{ t('sshIngress_privKeyConnectExample') }}</p>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -282,7 +354,13 @@ export default {
       bodyExpanded: false,
       hostkey: { loading: false, failed: false, notStarted: false, info: null },
       copied: false,
-      copiedTimer: null
+      copiedTimer: null,
+      keygenPending: null,   // 一键流暂存：keygen 结果，保存成功后转 keygenResult
+      keygenResult: null,    // 弹窗展示中的私钥载荷；关闭即清，零持久化
+      privKeyModal: false,
+      privKeyCopied: false,
+      privKeyCopyTimer: null,
+      localError: ''         // keygen 请求自身失败的红框（与父层 error prop 并列）
     };
   },
   computed: {
@@ -307,6 +385,13 @@ export default {
         return this.t('sshIngress_portInvalid');
       }
       return '';
+    },
+    // 下载 href 用 data URL（Blob URL 在 jsdom/部分沙箱不可用；data URL 两端通吃）
+    privKeyDownloadHref() {
+      if (!this.keygenResult) {
+        return '#';
+      }
+      return 'data:application/octet-stream,' + encodeURIComponent(this.keygenResult.private_key);
     }
   },
   watch: {
@@ -316,12 +401,30 @@ export default {
         this.form = this.formFromConfig(nextConfig);
       }
     },
-    // 保存成功后入口可能刚被启用——host key 由 Server.Start 生成（reconcile 随
-    // 配置提交启停）,重拉一次让「启用并保存后自动生成」引导当场过渡为真指纹。
-    // 其他卡片保存的成功消息也会触发,重拉是幂等 GET,无害。
+    // 一键流回流（spec §2.2 v3）：父层每次保存开头清空 error/success、结尾
+    // 再置值——跃迁必触发。successMessage 只认「变为非空」；error 一概不挂
+    // watch,pending 跨保存失败保留——否则一键保存失败后（表单已带钥匙、
+    // 一键按钮已隐藏）用户手工再存成功时,丢 pending 会永久吞掉私钥且无报错
+    // （恢复链单测钉死此语义）。
     successMessage(message) {
       if (message) {
         this.loadHostkey();
+        this.localError = '';
+        if (this.keygenPending) {
+          // 入列校验：公钥已不在列表（用户删过/换过配置）就不弹窗——不交付无主私钥
+          if (this.form.authorizedKeys.includes(this.keygenPending.public_key)) {
+            this.keygenResult = this.keygenPending;
+            this.privKeyModal = true;
+          }
+          this.keygenPending = null;
+        }
+      }
+    },
+    // 折叠态联动（spec §2.1）：拨头部开关且无钥匙 → 自动展开正文,
+    // 一键按钮与红字提示当场入眼（头部常驻提示已列明确不做）。
+    'form.enabled'(enabled) {
+      if (enabled && !this.form.authorizedKeys.length) {
+        this.bodyExpanded = true;
       }
     }
   },
@@ -331,6 +434,9 @@ export default {
   beforeUnmount() {
     if (this.copiedTimer) {
       clearTimeout(this.copiedTimer);
+    }
+    if (this.privKeyCopyTimer) {
+      clearTimeout(this.privKeyCopyTimer);
     }
   },
   methods: {
@@ -424,6 +530,57 @@ export default {
     truncateKey(key) {
       const value = String(key || '');
       return value.length > 72 ? `${value.slice(0, 72)}…` : value;
+    },
+    // 一键生成并启用（spec §2.2）：keygen → 公钥插队头 → enable=true →
+    // 复用现款 save() 契约（整配置透传+ssh_ingress 覆盖）。keygen 自身失败
+    // 走 localError 红框；保存结果由父层 error/successMessage props 回流,
+    // watch 方向语义见 watch 注释。
+    async oneClickSetup() {
+      if (this.loading || this.saving) {
+        return;
+      }
+      // 双击防重：loading/saving 是父层保存态,keygen fetch 在途时不置位——
+      // 在途 keygenPending 直接 return,防双击产生两把钥匙把第一把挤成无主
+      if (this.keygenPending) {
+        return;
+      }
+      this.localError = '';
+      try {
+        const res = await fetch('/api/proxy/ssh-ingress/keygen', { method: 'POST', credentials: 'same-origin' });
+        const json = await res.json().catch(() => null);
+        const key = json && json.data ? json.data.key : null;
+        if (!res.ok || !key || !key.public_key || !key.private_key) {
+          throw new Error('keygen payload incomplete');
+        }
+        this.keygenPending = key;
+        this.form.authorizedKeys = [key.public_key, ...this.form.authorizedKeys.filter((k) => k !== key.public_key)];
+        this.form.enabled = true;
+        this.save();
+      } catch (err) {
+        this.localError = this.t('sshIngress_keygenFailed');
+      }
+    },
+    closePrivKeyModal() {
+      this.privKeyModal = false;
+      this.keygenResult = null;
+      this.privKeyCopied = false;
+      if (this.privKeyCopyTimer) {
+        clearTimeout(this.privKeyCopyTimer);
+        this.privKeyCopyTimer = null;
+      }
+    },
+    async copyPrivKey() {
+      if (!this.keygenResult) {
+        return;
+      }
+      const ok = await copyText(this.keygenResult.private_key);
+      this.privKeyCopied = ok;
+      if (this.privKeyCopyTimer) {
+        clearTimeout(this.privKeyCopyTimer);
+      }
+      this.privKeyCopyTimer = setTimeout(() => {
+        this.privKeyCopied = false;
+      }, 2000);
     },
     // 提交载荷：整配置透传 + ssh_ingress 覆盖（ModelMappingSettings/PeerMCPSettings
     // 同款）。端口取输入:留空发 0(=跟随统一口 56432),显式端口原样(后端翻译
