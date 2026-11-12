@@ -481,3 +481,79 @@ func TestPunchTLSServerRejectsCertlessClient(t *testing.T) {
 	}
 	punchAssertNotAccepted(t, accepted)
 }
+
+// ---------------------------------------------------------------------------
+// (f) ClientFingerprint 空 → 收任意出示的客户端证书(v1 线协议约束)
+// ---------------------------------------------------------------------------
+
+// TestPunchTLSServerEmptyClientFingerprintAcceptsAnyCert 线协议 v1 的
+// peer.punch.session 帧不携带 A 侧证书指纹(Task 1 契约表锁定),B 侧组装
+// PunchTLSConfig 时 ClientFingerprint 只能是空串——空串必须降级为「仍要求
+// 出示证书(RequireAnyClientCert 拦无证书者)、但不钉扎指纹」,否则 B 侧
+// listener 会把每个真实 A 都拒之门外。B 侧访问控制由 token 首流门禁承载;
+// A 钉 B(ServerFingerprint)方向保持 fail-closed 不动(下一测另证)。
+func TestPunchTLSServerEmptyClientFingerprintAcceptsAnyCert(t *testing.T) {
+	serverCert, serverFP := testPunchCert(t, "punch-unpinned-server")
+	// B 侧配置零 ClientFingerprint——services 层(Task 10)真实现场的形态。
+	serverCfg := PunchTLSConfig{ServerCert: serverCert}
+	// A 侧证书与 B 完全无关联(现签另一张),指纹互不可知。
+	clientCert, _ := testPunchCert(t, "punch-stranger-client")
+	addr, accepted := punchTestServer(t, ServerTLSConfig(serverCfg), func(stream *quic.Stream) {
+		// 握手过了就行,流面无人消费也要关掉防吊着。
+		_ = stream.Close()
+	})
+
+	conn := punchTestDial(t, addr, ClientTLSConfig(PunchTLSConfig{
+		ClientCert:        clientCert,
+		ServerFingerprint: serverFP,
+	}))
+	select {
+	case <-accepted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("空 ClientFingerprint 应放行任意出示证书的客户端,连接未被 Accept")
+	}
+	_ = conn.CloseWithError(0, "")
+
+	// 降级不等于放弃「双向」:无证书客户端仍必须被 RequireAnyClientCert 拒。
+	certless := ClientTLSConfig(PunchTLSConfig{ServerFingerprint: serverFP})
+	certless.Certificates = nil
+	tr := punchTestClientTransport(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c2, dialErr := tr.Dial(ctx, addr, certless, nil)
+	if dialErr != nil {
+		_ = c2
+	} else {
+		t.Cleanup(func() { _ = c2.CloseWithError(0, "") })
+		punchClientMustSeeFailure(t, c2)
+	}
+	punchAssertNotAccepted(t, accepted)
+}
+
+// TestPunchTLSClientEmptyServerFingerprintStillFailsClosed 对照组:A 侧
+// ServerFingerprint 为空串时必须维持 fail-closed(不降级、无 TOFU)——降级
+// 只发生在 B 侧(客户端证书方向),服务端指纹方向的信任件一刀不松。
+func TestPunchTLSClientEmptyServerFingerprintStillFailsClosed(t *testing.T) {
+	serverCert, _ := testPunchCert(t, "punch-fp-server")
+	clientCert, clientFP := testPunchCert(t, "punch-fp-client")
+	addr, _ := punchTestServer(t, ServerTLSConfig(PunchTLSConfig{
+		ServerCert:        serverCert,
+		ClientFingerprint: clientFP,
+	}), func(stream *quic.Stream) {
+		t.Error("空 ServerFingerprint 的握手不应把流交付上层")
+	})
+
+	tr := punchTestClientTransport(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, dialErr := tr.Dial(ctx, addr, ClientTLSConfig(PunchTLSConfig{
+		ClientCert: clientCert,
+		// ServerFingerprint 故意空串:A 钉 B 方向 fail-closed 不许降级。
+	}), nil)
+	if dialErr == nil {
+		t.Cleanup(func() { _ = conn.CloseWithError(0, "") })
+		punchClientMustSeeFailure(t, conn)
+	} else if errors.Is(dialErr, os.ErrDeadlineExceeded) {
+		t.Fatalf("拒绝只是握手围栏到点——fail-closed 没拦住: %v", dialErr)
+	}
+}

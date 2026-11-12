@@ -46,6 +46,13 @@ type ListenerOpts struct {
 	Token   string
 	TLS     PunchTLSConfig
 	Handler func(net.Conn)
+	// Transport 调用方在传入 conn 上预建的 quic.Transport(单 Transport
+	// 铁律的出让面,Task 10):B 侧编排要向 A 候选发探测 Dial——同一 conn
+	// 上另建 Transport 会各起读循环互相偷包(dialer.go 文件头,Task 7 实锤),
+	// 探测必须复用 listener 的同一实例,故由调用方预建并经此注入。nil=内部
+	// 自建(既有调用方兼容)。收摊契约:无论谁建,Transport 都随收摊被
+	// Close(与 conn 同寿命),调用方在 done 之后只关 conn,不得复用本实例。
+	Transport *quic.Transport
 }
 
 // ServeListener 在绑定好的 conn 上起 B 侧 punch listener,立即返回本地
@@ -82,7 +89,12 @@ func ServeListener(conn *net.UDPConn, opts ListenerOpts) (localPort int, done <-
 		ttl = punchListenerDefaultTTL
 	}
 
-	tr := &quic.Transport{Conn: conn}
+	// 单 Transport 铁律:注入实例优先(见 ListenerOpts.Transport),否则
+	// 内部自建——两种来源的收摊归宿一致(punchAcceptLoop 统一 Close)。
+	tr := opts.Transport
+	if tr == nil {
+		tr = &quic.Transport{Conn: conn}
+	}
 	ln, err := tr.Listen(ServerTLSConfig(opts.TLS), nil)
 	if err != nil {
 		return 0, nil, fmt.Errorf("punch listener: 起 QUIC listener: %w", err)

@@ -24,8 +24,16 @@ const (
 	stunServerSecondary = "stun1.l.google.com:19302"
 )
 
-// defaultSTUNServers 默认判型服务器对,Task 5 编排层取这对调 Classify。
+// defaultSTUNServers 默认判型服务器对,编排层(services,Task 10)经
+// DefaultSTUNServers 取这对调 Classify——常量不导出(服务器档是包内事实),
+// 导出取数函数并回防御性拷贝,编排层不抄写服务器串。
 var defaultSTUNServers = []string{stunServerPrimary, stunServerSecondary}
+
+// DefaultSTUNServers 返回默认判型服务器对的拷贝(供 services 层 B/A 两侧
+// 编排调 Classify 用):改返回切片不污染包内默认档。
+func DefaultSTUNServers() []string {
+	return append([]string(nil), defaultSTUNServers...)
+}
 
 // discoverAttempts 单次 Discover 在总预算内的发包次数(首发+2 次重传)。
 // UDP 会丢包,单发太脆;次数写死小常数,预算仍由 timeout 参数封顶。

@@ -15,6 +15,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/quic-go/quic-go"
 )
 
 // punchListenerEnv 起 B 侧 listener:loopback UDPConn + 现签证书对 + 双向
@@ -328,5 +330,72 @@ func TestServeListenerHandlerPanicIsolated(t *testing.T) {
 	}
 	if string(echo) != want {
 		t.Fatalf("回显不符: 得到 %q, 期望 %q", string(echo), want)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// (g) 调用方预建 Transport 经 ListenerOpts 注入——单 Transport 铁律的出让面
+// ---------------------------------------------------------------------------
+
+// TestServeListenerUsesProvidedTransport Task 10 的 B 侧编排要在 listener
+// 的同一 transport 上向 A 候选发起探测 Dial(多 Transport 同 conn 互相偷包,
+// Task 7 实锤),ServeListener 必须经 ListenerOpts.Transport 接受调用方预建
+// 的实例:listener 真跑在它上面(拨得通、过门、流面活),收摊时把它关掉
+// (done 后 Dial 必败——调用方无需也不得再自行 Close 二次收摊)。
+func TestServeListenerUsesProvidedTransport(t *testing.T) {
+	serverCert, serverFP := testPunchCert(t, "punch-inject-server")
+	clientCert, clientFP := testPunchCert(t, "punch-inject-client")
+	cfg := PunchTLSConfig{
+		ServerCert:        serverCert,
+		ClientCert:        clientCert,
+		ServerFingerprint: serverFP,
+		ClientFingerprint: clientFP,
+		ExpectedToken:     "punch-test-token",
+	}
+	udpConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("起 UDP socket 失败: %v", err)
+	}
+	t.Cleanup(func() { _ = udpConn.Close() })
+	injected := &quic.Transport{Conn: udpConn}
+
+	served := make(chan struct{}, 1)
+	port, done, err := ServeListener(udpConn, ListenerOpts{
+		TTL:       90 * time.Second,
+		Token:     "punch-test-token",
+		TLS:       cfg,
+		Handler:   func(net.Conn) { served <- struct{}{} },
+		Transport: injected,
+	})
+	if err != nil {
+		t.Fatalf("注入 Transport 起 listener 失败: %v", err)
+	}
+
+	// listener 必须真跑在注入实例上:拨通+过门交付 Handler。
+	addr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port}
+	conn := punchTestDial(t, addr, ClientTLSConfig(cfg))
+	stream := punchTestOpenStream(t, conn)
+	if _, err := stream.Write([]byte("punch-test-token\n")); err != nil {
+		t.Fatalf("客户端写 token 行失败: %v", err)
+	}
+	select {
+	case <-served:
+	case <-time.After(5 * time.Second):
+		t.Fatal("注入 Transport 上 listener 未交付流(没真用上注入实例?)")
+	}
+
+	// 收摊契约:done 关闭时注入实例被关闭——事后经它 Dial 必败,证明
+	// 生命周期归宿在 ServeListener,调用方只管 conn。
+	_ = udpConn.Close() // 调用方提前收 conn 触发 accept 报错收摊路径
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("收摊路径未走完,done 未关闭")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if c, err := injected.Dial(ctx, addr, ClientTLSConfig(cfg), nil); err == nil {
+		_ = c.CloseWithError(0, "")
+		t.Fatal("注入 Transport 在收摊后必须已关闭,Dial 却成功了")
 	}
 }

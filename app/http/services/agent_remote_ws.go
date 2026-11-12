@@ -840,6 +840,19 @@ func (s *AgentService) handleRemoteAgentMessage(ctx context.Context, msg map[str
 		s.setRemoteConnectionState(true, "online", "")
 		logger.Info(fmt.Sprintf("[AGENT-PEER-LAN] listen_result at unexpected peer request_id=%s",
 			remoteString(msg, "request_id")))
+	case models.AgentEventPeerPunchSession:
+		// mesh UDP 打洞（Task 10）B 端信令：绑物理口 socket+STUN 判型+起
+		// QUIC listener 是秒级动作（STUN 探测上限数秒），result 在绑定完成
+		// 即回、服务过程由 TTL 收摊——经 safeGo 离线化，读 loop 畅通优先
+		// （peer.lan.listen 同款）。enabled-device 门禁与 peer.lan 同族。
+		s.setRemoteConnectionState(true, "online", "")
+		safeGo("peer_punch_session", func() { s.handleAgentPeerPunchSession(msg, writeJSON) })
+	case models.AgentEventPeerPunchCandidates:
+		// 打洞候选双向交换的 B 端接收面：按 session_id 路由到在册会话，
+		// 探测 Dial 在注册表内异步起火（起火即忘）；查表轻量，仍走 safeGo
+		// 防探测编排的慢路径拖 read loop。A 侧接收面归 Task 10b。
+		s.setRemoteConnectionState(true, "online", "")
+		safeGo("peer_punch_candidates", func() { s.handleAgentPeerPunchCandidates(msg) })
 	// 注意：这五个旧工具事件（file.list/file.read/file.write/git.status/env.info；
 	// file.write 为 D3 新增，与 file.list/file.read 同走 agent_detail 臂）由下面的
 	// 显式臂直派、有意绕过 default 臂的 tools.RunWithGuards 护栏（无超时看门狗/
@@ -1091,8 +1104,12 @@ func remoteAgentMessageRequiresEnabledDevice(msgType string) bool {
 		// 与 terminal/AI 同族——禁用设备不得响应。
 		// 设备互访阶段 2（spec §6）：LAN 直连 listener 同族——被禁用设备不得
 		// 为他人提供文件服务。
+		// mesh UDP 打洞（Task 10）：punch listener 与候选探测同族——被禁用
+		// 设备不得为他人提供打洞数据面。
 		models.AgentEventPeerExecRequest,
-		models.AgentEventPeerLanListen:
+		models.AgentEventPeerLanListen,
+		models.AgentEventPeerPunchSession,
+		models.AgentEventPeerPunchCandidates:
 		return true
 	default:
 		// tools.list 是元 RPC（非注册表工具项），显式门控；注册表命中的工具事件

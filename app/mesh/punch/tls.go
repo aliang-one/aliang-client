@@ -23,10 +23,13 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
-// punchALPN 是 punch QUIC 隧道的 ALPN。quic-go 要求两端 tls.Config 的
+// PunchALPN 是 punch QUIC 隧道的 ALPN。quic-go 要求两端 tls.Config 的
 // NextProtos 非空且一致,常量集中本包,Server/Client 两个构造函数同源
-// 写入——ALPN 漂移=握手失败,不给两端各写一串留错位空间。
-const punchALPN = "nursor-punch/1"
+// 写入——ALPN 漂移=握手失败,不给两端各写一串留错位空间。导出是给
+// services 层(Task 10)的 B 侧探测 Dial 用:探测 Initial 要与真实拨号
+// 同 ALPN 同形(探测握手永不完成,但 Initial 形态保持一致),常量导出
+// 而非让 services 抄写串——抄写就是 ALPN 漂移的温床。
+const PunchALPN = "nursor-punch/1"
 
 // punchTokenGateTimeout 是 TokenGate 的读围栏:QUIC 握手成功但连上不说
 // 话的慢速占用最多等这么久(照 agentLan 5s 握手围栏口径,agent_peer_
@@ -67,13 +70,32 @@ type PunchTLSConfig struct {
 // RequireAndVerifyClientCert——自签 1h 证书不进 RootCAs,系统链校验必然
 // 失败,链校验在这套生态里没有裁决权;信任裁决全权交给
 // VerifyPeerCertificate 的指纹钉扎(fail-closed,无 TOFU)。
+//
+// ClientFingerprint 空串是 v1 线协议的合法现场(peer.punch.session 帧
+// 不携带 A 侧证书指纹,Task 1 契约表锁定,B 无从预知 A 的指纹):此时
+// 降级为「仍要求出示证书(RequireAnyClientCert 拦无证书者)、不钉扎
+// 指纹」——B 侧的访问控制由 token 首流门禁承载(TokenGate),证书
+// 存在性要求保住 mTLS 的「双向」形态。注意降级只发生在客户端证书方向:
+// A 钉 B 的 ServerFingerprint 方向(ClientTLSConfig)空串仍 fail-closed,
+// 见 punchCertVerifier——那是 A 侧防仿冒 B 的主信任件,一刀不松。
 func ServerTLSConfig(c PunchTLSConfig) *tls.Config {
+	var verify func([][]byte, [][]*x509.Certificate) error
+	if c.ClientFingerprint == "" {
+		verify = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+			// 出示与否由 RequireAnyClientCert 裁决:到这里必然有证书,
+			// 任意自签皆收(v1 线协议约束,见函数头)。
+			return nil
+		}
+	} else {
+		verify = punchCertVerifier(c.ClientFingerprint)
+	}
 	return &tls.Config{
 		Certificates: []tls.Certificate{c.ServerCert},
-		NextProtos:   []string{punchALPN},
+		NextProtos:   []string{PunchALPN},
 		ClientAuth:   tls.RequireAnyClientCert,
-		// 客户端无证书由 RequireAnyClientCert 先拦;有证书则钉扎裁决。
-		VerifyPeerCertificate: punchCertVerifier(c.ClientFingerprint),
+		// 客户端无证书由 RequireAnyClientCert 先拦;有证书则按上面装配的
+		// 裁决器处理(钉扎或 v1 空指纹降级)。
+		VerifyPeerCertificate: verify,
 	}
 }
 
@@ -84,7 +106,7 @@ func ServerTLSConfig(c PunchTLSConfig) *tls.Config {
 func ClientTLSConfig(c PunchTLSConfig) *tls.Config {
 	return &tls.Config{
 		Certificates:          []tls.Certificate{c.ClientCert},
-		NextProtos:            []string{punchALPN},
+		NextProtos:            []string{PunchALPN},
 		InsecureSkipVerify:    true,
 		VerifyPeerCertificate: punchCertVerifier(c.ServerFingerprint),
 	}

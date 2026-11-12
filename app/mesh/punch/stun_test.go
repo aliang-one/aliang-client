@@ -237,3 +237,21 @@ func TestDiscoverTimeoutNoMemo(t *testing.T) {
 		t.Fatal("STUN 不可达路径不得留下 SkipMemo 记录")
 	}
 }
+
+// TestDefaultSTUNServersExported 编排层(services,Task 10)判型取服务器
+// 对的导出面:恰两台、非空、防御性拷贝(改返回值不得污染包内默认档)。
+func TestDefaultSTUNServersExported(t *testing.T) {
+	servers := DefaultSTUNServers()
+	if len(servers) != 2 {
+		t.Fatalf("默认判型服务器应恰两台,得到 %d: %v", len(servers), servers)
+	}
+	for _, s := range servers {
+		if s == "" {
+			t.Fatalf("默认服务器含空串: %v", servers)
+		}
+	}
+	servers[0] = "mutated"
+	if again := DefaultSTUNServers(); again[0] == "mutated" {
+		t.Fatal("DefaultSTUNServers 必须返回防御性拷贝,包内默认档被污染")
+	}
+}
