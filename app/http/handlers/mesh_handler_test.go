@@ -138,12 +138,14 @@ func TestLANPeersHandlerMethodNotAllowed(t *testing.T) {
 }
 
 // TestMeshStatusHandlerAggregatesState GET /api/mesh/status 聚合:本机
-// device_id、总开关/forward_enable 现值、lan 监听口端口、peers、beacon 候选
-// (Task 14 仪表盘组网页数据源;写路径走既有 /api/config/customer,本端点只读)。
+// device_id、总开关/forward_enable/punch_enable 现值、lan 监听口端口、peers、
+// beacon 候选(Task 14 仪表盘组网页数据源;写路径走既有 /api/config/customer,
+// 本端点只读)。
 func TestMeshStatusHandlerAggregatesState(t *testing.T) {
-	forwardOn := true
+	forwardOn, punchOn := true, true
 	meshCfg := &config.MeshConfig{
 		ForwardEnable: &forwardOn,
+		PunchEnable:   &punchOn,
 		Peers: []config.MeshPeer{
 			{DeviceID: "dev-b", LANAddrs: []string{"192.168.1.20:56441"}},
 		},
@@ -168,6 +170,7 @@ func TestMeshStatusHandlerAggregatesState(t *testing.T) {
 			DeviceID      string                       `json:"device_id"`
 			Enable        bool                         `json:"enable"`
 			ForwardEnable bool                         `json:"forward_enable"`
+			PunchEnable   bool                         `json:"punch_enable"`
 			LANListenPort int                          `json:"lan_listen_port"`
 			Peers         []config.MeshPeer            `json:"peers"`
 			LANPeers      []lanbeacon.LanPeerCandidate `json:"lan_peers"`
@@ -180,7 +183,7 @@ func TestMeshStatusHandlerAggregatesState(t *testing.T) {
 		t.Fatalf("信封 code = %d", resp.Code)
 	}
 	d := resp.Data
-	if d.DeviceID != "dev-a" || !d.Enable || !d.ForwardEnable || d.LANListenPort != 56432 {
+	if d.DeviceID != "dev-a" || !d.Enable || !d.ForwardEnable || !d.PunchEnable || d.LANListenPort != 56432 {
 		t.Fatalf("标量字段不符: %+v", d)
 	}
 	if len(d.Peers) != 1 || d.Peers[0].DeviceID != "dev-b" || len(d.Peers[0].LANAddrs) != 1 {
@@ -192,8 +195,8 @@ func TestMeshStatusHandlerAggregatesState(t *testing.T) {
 }
 
 // TestMeshStatusHandlerUnconfiguredDefaults 未配置 mesh 层的合法态:总开关
-// EffectiveEnabled(nil=默认开)、forward_enable 默认关、peers/lan_peers 空数组、
-// lan 端口 0(未装配)——离线面板拿空表现状,不 5xx。
+// EffectiveEnabled(nil=默认开)、forward_enable/punch_enable 默认关、peers/
+// lan_peers 空数组、lan 端口 0(未装配)——离线面板拿空表现状,不 5xx。
 func TestMeshStatusHandlerUnconfiguredDefaults(t *testing.T) {
 	h := &MeshHandler{
 		beacon:   func() *lanbeacon.Beacon { return nil },
@@ -211,6 +214,7 @@ func TestMeshStatusHandlerUnconfiguredDefaults(t *testing.T) {
 		Data struct {
 			Enable        bool              `json:"enable"`
 			ForwardEnable bool              `json:"forward_enable"`
+			PunchEnable   bool              `json:"punch_enable"`
 			LANListenPort int               `json:"lan_listen_port"`
 			Peers         []config.MeshPeer `json:"peers"`
 			LANPeers      []interface{}     `json:"lan_peers"`
@@ -219,7 +223,7 @@ func TestMeshStatusHandlerUnconfiguredDefaults(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if !resp.Data.Enable || resp.Data.ForwardEnable || resp.Data.LANListenPort != 0 {
+	if !resp.Data.Enable || resp.Data.ForwardEnable || resp.Data.PunchEnable || resp.Data.LANListenPort != 0 {
 		t.Fatalf("未配置默认值不符: %+v", resp.Data)
 	}
 	if resp.Data.Peers == nil || len(resp.Data.Peers) != 0 {

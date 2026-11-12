@@ -25,6 +25,7 @@ const CUSTOMER = {
   mesh: {
     enable: true,
     forward_enable: false,
+    punch_enable: false,
     max_hops: 5,
     peers: [
       { device_id: 'dev-b', lan_addrs: ['192.168.1.20:56441'], relay: true },
@@ -39,6 +40,7 @@ const MESH_STATUS = {
   device_id: 'dev-a',
   enable: true,
   forward_enable: false,
+  punch_enable: false,
   lan_listen_port: 56441,
   peers: [{ device_id: 'dev-b', lan_addrs: ['192.168.1.20:56441'], relay: true }],
   lan_peers: []
@@ -204,11 +206,13 @@ test('离线兜底保存：POST /api/config/customer 载荷含 mesh.fallback（�
   expect(savedFallback.classes).toEqual(['ai']);
   expect(savedFallback.host_key).toBe('HK-fb-new');
   // 载荷是「与当前配置的差异」而非全量：本卡没动的顶层段（proxy_rules）与
-  // 未变的 mesh 开关（enable/forward_enable/max_hops/peers）都不出现在 patch 里
-  // ——父层按顶层段浅合并，多带的键反而会把别人的段覆盖成陈旧值。
+  // 未变的 mesh 开关（enable/forward_enable/punch_enable/max_hops/peers）都不
+  // 出现在 patch 里——父层按顶层段浅合并，多带的键反而会把别人的段覆盖成
+  // 陈旧值。punch_enable 未变动（现值 false=默认关）不得产出伪 diff。
   expect(savedBody.customer.proxy_rules).toBeUndefined();
   expect(savedBody.customer.mesh.enable).toBeUndefined();
   expect(savedBody.customer.mesh.forward_enable).toBeUndefined();
+  expect(savedBody.customer.mesh.punch_enable).toBeUndefined();
   expect(savedBody.customer.mesh.peers).toBeUndefined();
 });
 

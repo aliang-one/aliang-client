@@ -841,11 +841,15 @@ func (c *Config) EffectivePeerMCPCodexEnabled() bool {
 
 // MeshConfig 节点转发网(design docs/mesh-forwarding-network-design.md)。
 type MeshConfig struct {
-	Enable        *bool               `json:"enable,omitempty"`
-	ForwardEnable *bool               `json:"forward_enable,omitempty"`
-	MaxHops       int                 `json:"max_hops,omitempty"` // 一期不消费,仅为二期链长上限占位(SPEC §17)
-	Peers         []MeshPeer          `json:"peers,omitempty"`
-	Fallback      *MeshFallbackConfig `json:"fallback,omitempty"`
+	Enable        *bool `json:"enable,omitempty"`
+	ForwardEnable *bool `json:"forward_enable,omitempty"`
+	// PunchEnable UDP 打洞直连(mesh-udp-punch plan Task 11)。默认关:打洞
+	// 要本机直接对公网暴露 UDP 口,是让渡型能力,必须显式开启(nil=false,
+	// 与 ForwardEnable 同族三态)。Task 12 起被工厂/装配门消费。
+	PunchEnable *bool               `json:"punch_enable,omitempty"`
+	MaxHops     int                 `json:"max_hops,omitempty"` // 一期不消费,仅为二期链长上限占位(SPEC §17)
+	Peers       []MeshPeer          `json:"peers,omitempty"`
+	Fallback    *MeshFallbackConfig `json:"fallback,omitempty"`
 	// PrivateKey 本节点的 mesh 身份私钥(PEM,OpenSSH 或 PKCS#8)。
 	// 公钥分发到各对端的 ssh_ingress.mesh_authorized_keys(尾注释=本机 device_id)。
 	// 空 = 本节点不能作为转发发起方(仍可作为被转发方)。
@@ -882,6 +886,15 @@ func (c *MeshConfig) EffectiveEnabled() bool { return c == nil || c.Enable == ni
 // 默认开语义刻意相反。
 func (c *MeshConfig) EffectiveForwardEnabled() bool {
 	return c != nil && c.ForwardEnable != nil && *c.ForwardEnable // 默认关(design §8)
+}
+
+// EffectivePunchEnabled UDP 打洞直连开关。默认关(nil=false):打洞直连
+// 要本机对公网暴露 UDP 口,是让渡型能力,必须显式开启——与
+// EffectiveForwardEnabled 同款「默认关」三态,而与总开关的默认开语义相反。
+// 依赖:生效前提是 mesh 总开关开着(保存期硬拒见 ValidateMeshDependency,
+// 运行期装配门 Task 12 与 EffectiveEnabled 合取)。
+func (c *MeshConfig) EffectivePunchEnabled() bool {
+	return c != nil && c.PunchEnable != nil && *c.PunchEnable // 默认关
 }
 
 // EffectiveMaxHops 跳数上限:0/负数=默认 5,>8 收口到 8(读取端钳制防御,
@@ -957,8 +970,9 @@ func (c *Config) MeshEffectivelyEnabled() bool {
 }
 
 // ValidateMeshDependency 保存期依赖硬拒:开 mesh 必须开 SSH 入口
-// (SPEC §10.3)。启动期不调用本函数(Config.Validate 也不调)——启动降级走
-// MeshEffectivelyEnabled,绝不阻断 boot。
+// (SPEC §10.3);开 punch(UDP 打洞直连)必须开 mesh 总开关。启动期不调用
+// 本函数(Config.Validate 也不调)——启动降级走 MeshEffectivelyEnabled,
+// 绝不阻断 boot。
 func (c *Config) ValidateMeshDependency() error {
 	// Mesh 块缺失(JSON 无 mesh 键 = 用户从未触及 mesh)直接过:硬拒只在
 	// 保存携带 mesh 块时触发;启动期的对应降级由 MeshEffectivelyEnabled 兜住。
@@ -967,6 +981,12 @@ func (c *Config) ValidateMeshDependency() error {
 	}
 	if c.Customer.Mesh.EffectiveEnabled() && !c.Customer.SSHIngress.IsEnabled() {
 		return fmt.Errorf("组网依赖 SSH 入口(ssh_ingress.enable):开启 customer.mesh.enable 前必须先开启 SSH 入口")
+	}
+	// punch 是 mesh 出口内的载体:总开关显式关而 punch 显式开 = 自相矛盾
+	// 配置,保存期硬拒(与 mesh↔SSH 依赖门同款只挂保存通道)。运行期装配门
+	// (Task 12)另与总开关合取,手改配置文件绕过校验也不会让 punch 单飞。
+	if c.Customer.Mesh.EffectivePunchEnabled() && !c.Customer.Mesh.EffectiveEnabled() {
+		return fmt.Errorf("打洞直连依赖组网总开关(customer.mesh.enable):开启 customer.mesh.punch_enable 前必须先开启组网总开关")
 	}
 	return nil
 }

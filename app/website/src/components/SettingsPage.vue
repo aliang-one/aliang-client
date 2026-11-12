@@ -356,10 +356,10 @@ function createDefaultCustomerConfig() {
     // 布尔——nil 与 false 行为等价;port 0=后端归一默认 56442)
     ssh_ingress: normalizeSSHIngressConfig(),
     // mesh 节点转发网(customer.mesh;三态指针 enable nil=true /
-    // forward_enable nil=false / relay nil=true / fallback.enable nil=false,
-    // 归一层恒产出显式布尔——ssh_ingress 先例)。⚠️ 必须在
-    // normalizeCustomerConfig 同步挂 normalizeMeshConfig,漏挂 = 保存 200
-    // 但永不落盘(peer_mcp 2026-10-31 验收缺陷①同族)。
+    // forward_enable nil=false / punch_enable nil=false / relay nil=true /
+    // fallback.enable nil=false,归一层恒产出显式布尔——ssh_ingress 先例)。
+    // ⚠️ 必须在 normalizeCustomerConfig 同步挂 normalizeMeshConfig,漏挂 =
+    // 保存 200 但永不落盘(peer_mcp 2026-10-31 验收缺陷①同族)。
     mesh: normalizeMeshConfig()
   };
 }

@@ -21,16 +21,17 @@ import en from '../../i18n/en';
 import zh from '../../i18n/zh';
 
 // —— normalizeMeshConfig（线格式归一；SettingsPage 归一化链共用）——
-// 线格式 customer.mesh{enable,forward_enable,max_hops,peers[],fallback}；
-// 后端三态指针语义（processor/config types.go MeshConfig.Effective*）：
-// enable nil=true / forward_enable nil=false / peer.relay nil=true /
-// fallback.enable nil=false——读侧恒产出显式布尔（ssh_ingress「恒产出显式」
-// 先例），保存才不会漏键。
+// 线格式 customer.mesh{enable,forward_enable,punch_enable,max_hops,peers[],
+// fallback}；后端三态指针语义（processor/config types.go MeshConfig.Effective*）：
+// enable nil=true / forward_enable nil=false / punch_enable nil=false /
+// peer.relay nil=true / fallback.enable nil=false——读侧恒产出显式布尔
+// （ssh_ingress「恒产出显式」先例），保存才不会漏键。
 describe('MeshSettings normalizeMeshConfig', () => {
-  it('缺失段产出全默认：三态布尔恒显式（enable=true/forward=false/fallback.enable=false）', () => {
+  it('缺失段产出全默认：三态布尔恒显式（enable=true/forward=false/punch=false/fallback.enable=false）', () => {
     expect(normalizeMeshConfig(undefined)).toEqual({
       enable: true,
       forward_enable: false,
+      punch_enable: false,
       max_hops: 0,
       peers: [],
       fallback: { enable: false, classes: [], addr: '' }
@@ -39,6 +40,7 @@ describe('MeshSettings normalizeMeshConfig', () => {
     const defaults = normalizeMeshConfig(undefined);
     expect(typeof defaults.enable).toBe('boolean');
     expect(typeof defaults.forward_enable).toBe('boolean');
+    expect(typeof defaults.punch_enable).toBe('boolean');
     expect(typeof defaults.fallback.enable).toBe('boolean');
   });
 
@@ -49,17 +51,21 @@ describe('MeshSettings normalizeMeshConfig', () => {
     expect(normalizeMeshConfig(42)).toEqual(normalizeMeshConfig(undefined));
   });
 
-  it('显式布尔原样保留（含反向值）', () => {
+  it('显式布尔原样保留（含反向值；punch_enable 同族透传——漏透传=卡片保存丢值）', () => {
     const out = normalizeMeshConfig({
       enable: false,
       forward_enable: true,
+      punch_enable: true,
       fallback: { enable: true, addr: '192.168.1.20:56441', classes: ['ai'] }
     });
     expect(out.enable).toBe(false);
     expect(out.forward_enable).toBe(true);
+    expect(out.punch_enable).toBe(true);
     expect(out.fallback.enable).toBe(true);
     expect(out.fallback.addr).toBe('192.168.1.20:56441');
     expect(out.fallback.classes).toEqual(['ai']);
+    // punch 非布尔（手改配置文件垃圾）→ 归默认关,不透传坏值
+    expect(normalizeMeshConfig({ punch_enable: 'yes' }).punch_enable).toBe(false);
   });
 
   it('max_hops：[1,8] 保留、>8 钳到 8（对齐后端读侧 EffectiveMaxHops）、≤0/非数归 0（默认 5）', () => {
@@ -266,6 +272,7 @@ describe('SettingsPage buildCustomerSavePatch（mesh 透传链）', () => {
   const meshConfigured = {
     enable: true,
     forward_enable: false,
+    punch_enable: false,
     max_hops: 5,
     peers: [{ device_id: 'dev-b', lan_addrs: ['192.168.1.20:56441'], relay: true }],
     fallback: { enable: false, classes: [], addr: '' }
@@ -433,6 +440,7 @@ function baseConfig(meshOverrides = {}) {
     mesh: {
       enable: true,
       forward_enable: false,
+      punch_enable: false,
       max_hops: 5,
       peers: [{ device_id: 'dev-b', lan_addrs: ['192.168.1.20:56441'], relay: true }],
       fallback: { enable: false, classes: [], addr: '' },
@@ -461,6 +469,7 @@ const defaultMeshStatus = () => ({
   device_id: 'dev-a',
   enable: true,
   forward_enable: false,
+  punch_enable: false,
   lan_listen_port: 56441,
   peers: [{ device_id: 'dev-b', lan_addrs: ['192.168.1.20:56441'], relay: true }],
   lan_peers: []
@@ -730,6 +739,7 @@ describe('MeshSettings 卡片', () => {
     expect(saved[0].mesh).toEqual({
       enable: true,
       forward_enable: false,
+      punch_enable: false,
       max_hops: 5,
       peers: [{ device_id: 'dev-b', lan_addrs: ['192.168.1.20:56441'], relay: false }],
       fallback: { enable: true, addr: '192.168.1.20:56441', classes: ['self', 'custom'] }
@@ -749,6 +759,7 @@ describe('MeshSettings 卡片', () => {
     await flush();
     expect(saved[0].mesh.enable).toBe(true);
     expect(saved[0].mesh.forward_enable).toBe(false);
+    expect(saved[0].mesh.punch_enable).toBe(false);
     expect(saved[0].mesh.max_hops).toBe(0);
     expect(saved[0].mesh.peers).toEqual([]);
     expect(saved[0].mesh.fallback).toEqual({ enable: true, addr: '10.0.0.5:56441', classes: [] });
@@ -941,6 +952,7 @@ function canvasConfig(meshOverrides = {}) {
     mesh: {
       enable: true,
       forward_enable: false,
+      punch_enable: false,
       max_hops: 5,
       peers: [
         { device_id: 'dev-b', lan_addrs: ['192.168.1.20:56441'], relay: true },

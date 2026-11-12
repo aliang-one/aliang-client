@@ -62,22 +62,24 @@ func (h *MeshHandler) HandleLANPeers(w http.ResponseWriter, r *http.Request) {
 
 // meshStatusResponse GET /api/mesh/status 的 data 载荷。peers/lan_peers 恒
 // 数组(空配置是合法态,null 会逼前端判空);开关取 Effective* 现值(与
-// 运行时读取同一语义:nil 总开关=默认开,nil forward=默认关)。Effective
-// 是 mesh 出口的生效门(= enable ∧ ssh_ingress 可用,SPEC §10.3 依赖降级
-// 一处生效)——前端用它区分「开关开了但 SSH 入口关着导致 mesh 未生效」。
+// 运行时读取同一语义:nil 总开关=默认开,nil forward/punch=默认关)。
+// Effective 是 mesh 出口的生效门(= enable ∧ ssh_ingress 可用,SPEC §10.3
+// 依赖降级一处生效)——前端用它区分「开关开了但 SSH 入口关着导致 mesh
+// 未生效」。
 type meshStatusResponse struct {
 	DeviceID      string                       `json:"device_id"`
 	Enable        bool                         `json:"enable"`
 	Effective     bool                         `json:"effective"`
 	ForwardEnable bool                         `json:"forward_enable"`
+	PunchEnable   bool                         `json:"punch_enable"`
 	LANListenPort int                          `json:"lan_listen_port"`
 	Peers         []config.MeshPeer            `json:"peers"`
 	LANPeers      []lanbeacon.LanPeerCandidate `json:"lan_peers"`
 }
 
 // HandleStatus GET /api/mesh/status:仪表盘组网页状态聚合——本机 device_id、
-// 总开关/forward_enable 现值、LAN 监听口端口(手填对端地址须知本机端口)、
-// 已配 peers、beacon 候选。全只读,写路径走 /api/config/customer。
+// 总开关/forward_enable/punch_enable 现值、LAN 监听口端口(手填对端地址须知
+// 本机端口)、已配 peers、beacon 候选。全只读,写路径走 /api/config/customer。
 func (h *MeshHandler) HandleStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -105,6 +107,7 @@ func (h *MeshHandler) HandleStatus(w http.ResponseWriter, r *http.Request) {
 				mesh := cfg.Customer.Mesh
 				resp.Enable = mesh.EffectiveEnabled()
 				resp.ForwardEnable = mesh.EffectiveForwardEnabled()
+				resp.PunchEnable = mesh.EffectivePunchEnabled()
 				if len(mesh.Peers) > 0 {
 					resp.Peers = mesh.Peers
 				}
