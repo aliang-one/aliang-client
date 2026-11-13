@@ -143,8 +143,19 @@ func (t *readTool) Execute(ctx context.Context, input map[string]interface{}, en
 		if readErr != nil {
 			return ErrorResult("无法读取 %s: %v", raw, readErr)
 		}
+		// 大图先本地降采样再回填：2MB 级渲染帧 base64 后会把单个请求体撑到
+		// 5~6MB，网关转发大请求到推理上游失败就回笼统 502（视频会话七连败的
+		// 根因）。模型核对预览不需要 1080p，长边 1024 足够。解码失败时原样
+		// 返回——上游 5MiB 闸兜底，不把能用的图拒之门外。
+		data, mediaType, scaled := downscaleImageIfNeeded(data, mediaType)
+		summary := fmt.Sprintf("%s（%s，%d 字节）", raw, mediaType, len(data))
+		if scaled {
+			// 让模型知道看到的是缩略图：要读像素级细节（如小字号文字）时它
+			// 才有机会改用文本路径或请求原始文件，而不是对着缩略图猜。
+			summary += "，已压缩（长边→1024px，JPEG）"
+		}
 		return ToolResult{
-			Content: fmt.Sprintf("%s（%s，%d 字节）", raw, mediaType, len(data)),
+			Content: summary,
 			Images:  []ContentBlock{ImageBlock(mediaType, data)},
 		}
 	}
