@@ -8,7 +8,6 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"time"
 
 	"aliang.one/nursorgate/common/logger"
 	"aliang.one/nursorgate/processor/config"
@@ -381,7 +380,7 @@ func UpdateUserProfile(username string) (*UserProfile, error) {
 		if strings.TrimSpace(current.Username) == "" {
 			current.Username = trimmed
 		}
-		current.UpdatedAt = time.Now()
+		// 锚点纪律:改用户名不延长服务端会话,保持原锚点(见 SaveUserInfo 注释)。
 		if err := SaveUserInfo(current); err != nil {
 			return &envelope.Data, nil
 		}
