@@ -3062,6 +3062,84 @@ func compactCodexThread(ctx context.Context, projectPath, threadID string) error
 	return errors.New("Codex app-server exited before compact completed")
 }
 
+// steerReviveViaMessage 把「内存里没有、磁盘上有历史」的休眠会话收到的插话
+// 转正为新消息，委托 message() 的懒建恢复路径（spec §4.3 跨端/重启续聊）。
+// 返回 true 表示已接管（成功唤醒或已向客户端回错误帧），调用方直接 return；
+// 返回 false 表示不适用（非 agentcore / journal 无记录 / 项目路径校验失败
+// 属于真未知会话），调用方保持原 not_running 报错。
+//
+// 触发场景（2026-11-13 手机实锤）：agent 重启/重装升级后内存注册表清空、
+// 手机 vibe_sessions 列表照常展示磁盘快照，用户对休眠会话插话命中 steer 的
+// "ai session not found"——同一场景 ai.message 走懒建恢复，两条通道语义
+// 不一致。修复后用户感知只是首回合稍慢（装回历史），不再报错。
+//
+// 委托帧字段口径：
+//   - provider/project_path/model/effort 等运行参数从 journal 头行恢复（与
+//     ai.message 懒建同源，载荷权威、头行兜底的纪律在 message 内自洽）；
+//   - source_session_id 带绑定表里的原生会话 id（confirmed 绑定供种 resume，
+//     细节同 message 懒建分支的 seedConfirmedBindingResumeLocked）；
+//   - surface/origin 标记照抄原帧，保证回程扇出寻址与手机渲染不变；
+//   - attachments 丢弃并显式告知：steer 的附件已在上游半物化，与 message
+//     的附件管线（附件 id 物化）语义不同，不能二次穿越。
+func (m *agentAIManager) steerReviveViaMessage(msg map[string]interface{}, sessionID, messageID, content string, writeJSON agentTerminalWriter) bool {
+	if m.coreJournal == nil {
+		return false
+	}
+	head, err := readAgentCoreJournalHeaderFrom(m.coreJournal.dir, sessionID)
+	if err != nil {
+		return false // journal 无记录 = 真未知会话，保持 not_running
+	}
+	if head.projectPath == "" {
+		// 头行缺 project_path 的旧 journal 无法安全定位工作目录——与其拿
+		// 当前帧的 project_path 猜（可能落在错误目录执行），不如明确报错。
+		logger.Warn(fmt.Sprintf("ai.steer: revive skipped session=%s (journal head has no project_path)", sessionID))
+		emitAgentAISteerAck(writeJSON, sessionID, messageID, "error", "该会话的磁盘记录缺少项目路径，无法自动恢复；请改为发送新消息", "revive_unsupported")
+		return true
+	}
+	// 历史装回成功的可观测性：云端/手机能看到这条插话为何变成了普通回合。
+	_ = writeJSON(map[string]interface{}{
+		"type":       models.AgentEventAIRunNotice,
+		"session_id": sessionID,
+		"message_id": messageID,
+		"code":       "steer_revived_as_message",
+		"detail":     "会话不在内存中，已从磁盘恢复历史并将该插话作为新消息执行",
+	})
+	// steer ack 兼容（queued）：等 ack 确认送达的客户端不因转正而把插话标成
+	// 失败——消息本身确实被接管了，只是以新回合的形态执行。先于 message()
+	// 发出：转正后 writeJSON 的回程帧全部经 run emitter 扇出，ack 不再归
+	// steer 通道管。
+	emitAgentAISteerAck(writeJSON, sessionID, messageID, "queued", "", "")
+	revived := cloneAgentAIMap(msg)
+	revived["type"] = models.AgentEventAIMessage
+	revived["session_id"] = sessionID
+	revived["message_id"] = messageID
+	revived["content"] = content
+	revived["project_path"] = head.projectPath
+	if head.model != "" {
+		revived["model"] = head.model
+	}
+	// provider 从头行无法取得（journal 头行不记 provider），agentcore journal
+	// 即 agentcore 会话——绑定的 confirmed 值是最权威的归属（同时满足 message
+	// 入口的绑定族守卫：requested 与 persisted 同族时不改写）。
+	if binding, ok := m.bindingForConversation(sessionID); ok && binding.Provider != "" {
+		revived["provider"] = binding.Provider
+		revived["tool"] = binding.Provider
+		if binding.NativeSessionID != "" {
+			revived["source_session_id"] = binding.NativeSessionID
+		}
+	} else {
+		revived["provider"] = "agentcore"
+		revived["tool"] = "agentcore"
+	}
+	delete(revived, "attachments")
+	delete(revived, "goal_context") // steer 没有目标语义，防误触发 goal 契约
+	// 与手机 ai.message 主路径同款：surface=phone 时不注入 TUI 契约
+	//（headless 通道不注入，见 agent_ai_phone_contract.go 头注释）。
+	// steer() 已在前面给 steerContent 包过一次，这里恢复原始 content。
+	m.message(revived, writeJSON)
+	return true
+}
+
 func (m *agentAIManager) steer(msg map[string]interface{}, writeJSON agentTerminalWriter) {
 	if writeJSON == nil {
 		return
@@ -3121,6 +3199,19 @@ func (m *agentAIManager) steer(msg map[string]interface{}, writeJSON agentTermin
 				emitAgentAISteerAck(writeJSON, sessionID, messageID, result, errMsg, code)
 				return
 			}
+		}
+		// 跨端/重启续聊的 steer 侧（spec §4.3 对齐）：会话不在内存注册表≠死
+		// 亡——磁盘 journal 里可能躺着完整历史。此前这里直接 ack
+		// "ai session not found"（2026-11-13 手机实锤：agent 重装升级后内存
+		// 注册表清空，用户给休眠会话插话直接报错），而 ai.message 同场景走
+		// 懒建恢复。对齐语义：journal 有该会话的记录时，把这条插话**转正为
+		// 新消息**委托 message()——它内部的懒建会从 journal 装回全部历史、
+		// 从 confirmed 绑定供种原生会话 id 续跑，插话作为普通用户回合执行。
+		// 委托帧不带 attachments： steer 的附件是 base64 已物化形态且部分
+		// 校验已在上文发生，转正路径走 message 自己的附件物化管线语义不符。
+		// journal 无记录/无 journal 时保持原 not_running 报错（真未知会话）。
+		if m.steerReviveViaMessage(msg, sessionID, messageID, content, writeJSON) {
+			return
 		}
 		emitAgentAISteerAck(writeJSON, sessionID, messageID, "not_running", fmt.Sprintf("ai session not found: %s", sessionID), "")
 		return
