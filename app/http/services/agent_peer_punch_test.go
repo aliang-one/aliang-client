@@ -512,6 +512,9 @@ func TestAgentPeerPunchClassifyMemoRules(t *testing.T) {
 			bb.serve = func(_ *net.UDPConn, opts punch.ListenerOpts) (int, <-chan struct{}, error) {
 				serveCalled = true
 				done := make(chan struct{})
+				// 注入桩的 done 永无人关闭:reaper <-done 挂死即 goroutine
+				// 泄漏,测试结束前收摊(symmetric 子测试同款先例)。
+				t.Cleanup(func() { close(done) })
 				return 45678, done, nil
 			}
 		})
@@ -608,8 +611,6 @@ type punchFakeB struct {
 	a             *agentPeerPunchA
 	mu            sync.Mutex
 	sessionFrames int
-	handlers      int
-	deadline      time.Duration // echo handler 可挂起时长(默认直接 echo)
 }
 
 func (f *punchFakeB) onFrame(payload map[string]interface{}) error {
@@ -630,13 +631,6 @@ func (f *punchFakeB) onFrame(payload map[string]interface{}) error {
 			f.t.Fatalf("假 B 绑定失败: %v", err)
 		}
 		echo := func(conn net.Conn) {
-			f.mu.Lock()
-			f.handlers++
-			deadline := f.deadline
-			f.mu.Unlock()
-			if deadline > 0 {
-				_ = conn.SetReadDeadline(time.Now().Add(deadline))
-			}
 			_, _ = io.Copy(conn, conn)
 		}
 		port, done, err := punch.ServeListener(sock, punch.ListenerOpts{
@@ -811,7 +805,8 @@ func TestAgentPeerPunchAResultPendingAndTimeout(t *testing.T) {
 
 func TestAgentPeerPunchADialSourceSerializes(t *testing.T) {
 	a, fake := newPunchAForTest(t)
-	// 假 B 首帧回程挂 300ms(模拟信令 RTT),并发双拨应被串行+缓存吸收。
+	// 首帧 session 发出即放行信号:并发第二拨与首拨竞争 dialMu,后至者
+	// 等锁后走双重检查快路径——session 帧总数=1 为串行+缓存的机械锁。
 	var once sync.Once
 	fakeSlowReply := make(chan struct{})
 	orig := a.send
@@ -849,7 +844,7 @@ func TestAgentPeerPunchADialTimeoutNoLeak(t *testing.T) {
 			if payload["type"] == models.AgentEventPeerPunchCandidates {
 				payload["candidates"] = []interface{}{"127.0.0.1:1"}
 			}
-			// session 帧吞掉不回——不,需要回 result 才走到拨号;这里自答。
+			// session 帧自答 result+候选(黑洞候选让拨号在预算内烧完)。
 			if payload["type"] == models.AgentEventPeerPunchSession {
 				go func() {
 					a.handleResultFrame(map[string]interface{}{
