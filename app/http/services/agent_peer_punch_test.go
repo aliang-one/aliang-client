@@ -605,7 +605,8 @@ func TestAgentPeerPunchSessionFrameValidation(t *testing.T) {
 
 // punchFakeB 全功能假 B:onFrame 收 A 侧自发帧——session 帧→起 loopback 真
 // listener(计数 session 帧数供缓存命中断言)→回 result+candidates;
-// candidates 帧(A 侧自发)忽略。doneChs 暴露 listener 收摊信号。
+// candidates 帧(A 侧自发)忽略;listener 收摊由 onFrame 内起的 reaper
+// goroutine 自理。
 type punchFakeB struct {
 	t             *testing.T
 	a             *agentPeerPunchA
@@ -624,11 +625,13 @@ func (f *punchFakeB) onFrame(payload map[string]interface{}) error {
 		requestID, _ := payload["request_id"].(string)
 		cert, fp, err := generateAgentLanCertificate()
 		if err != nil {
-			f.t.Fatalf("假 B 现签证书失败: %v", err)
+			f.t.Errorf("假 B 现签证书失败: %v", err)
+			return nil
 		}
 		sock, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 		if err != nil {
-			f.t.Fatalf("假 B 绑定失败: %v", err)
+			f.t.Errorf("假 B 绑定失败: %v", err)
+			return nil
 		}
 		echo := func(conn net.Conn) {
 			_, _ = io.Copy(conn, conn)
@@ -640,7 +643,8 @@ func (f *punchFakeB) onFrame(payload map[string]interface{}) error {
 			Handler: echo,
 		})
 		if err != nil {
-			f.t.Fatalf("假 B 起听失败: %v", err)
+			f.t.Errorf("假 B 起听失败: %v", err)
+			return nil
 		}
 		f.a.handleResultFrame(map[string]interface{}{
 			"type":        models.AgentEventPeerPunchSessionResult,

@@ -1,14 +1,16 @@
 package services
 
-// mesh UDP 打洞批次 Task 10a——B 侧 WS 帧处理(peer.punch.session →
-// listener 生命周期 + peer.punch.candidates 双向接收的 B 端半边)。
+// mesh UDP 打洞批次 Task 10/15——peer.punch 双端编排体:上半(Task 10a)
+// B 侧 WS 帧处理(peer.punch.session → listener 生命周期 + candidates 双向
+// 接收的 B 端半边);下半(Task 10b)A 侧 cache-first 拨号源(result
+// pending 接收/DialAndPut/dial 源注册,见文末 A 侧分节)。
 //
 // 架构定位:peer.lan 家族的数据面兄弟件。peer.lan 是「B 起 TCP listener、
 // token 过门、单连接一生」;punch 是「B 起 QUIC listener 于打洞 socket 之上、
-// token 过门、TTL 收摊」,多出的编排动作全在洞上:绑物理接口 socket →
+// token 过门、TTL 收摊」,多出的编排动作全在洞上:B 侧绑物理接口 socket →
 // STUN 判型(顺带得自身公网映射)→ 起听 → 收 A 候选后从同一 transport
-// 发探测 Initial 开 B 侧 NAT 映射。A 侧(result pending 接收/DialAndPut/
-// dial 源注册)归 Task 10b,本文件不碰。
+// 发探测 Initial 开 B 侧 NAT 映射;A 侧 miss 时同步走完整信令链+打洞,
+// 活会话经 SessionCache 复用(免逐拨重打洞)。
 //
 // B 端流程的顺序硬约束(Task 4 规格审查锁定):
 //  1. 先绑 socket + Classify,后 QUIC listen——STUN 探测(Discover 的
@@ -646,8 +648,8 @@ func (a *agentPeerPunchA) tryCached(ctx context.Context, peerID string) (net.Con
 	return conn, true
 }
 
-// dialMiss miss 路径(dialMu 串行):重拨检查 → 驱逐旧 socket → 信令链
-// (session→result→Classify→candidates)→ DialAndPut → 开流。
+// dialMiss miss 路径(dialMu 串行):重拨检查 → 驱逐旧 socket → memo 预检
+// → 信令链(session→result→Classify→candidates)→ DialAndPut → 开流。
 func (a *agentPeerPunchA) dialMiss(ctx context.Context, peerID string) (net.Conn, error) {
 	a.dialMu.Lock()
 	defer a.dialMu.Unlock()
@@ -795,10 +797,10 @@ func (a *agentPeerPunchA) dialMiss(ctx context.Context, peerID string) (net.Conn
 		if errors.Is(err, punch.ErrPunchGateRejected) {
 			// token 永久无效,不重试(重试烧的是同一 token)。
 			logger.Info(fmt.Sprintf("[AGENT-PEER-PUNCH-A] gate rejected peer=%s err=%v", peerID, err))
-			return nil, err
+			return nil, fmt.Errorf("agent punch: gate rejected: %w", err)
 		}
 		logger.Info(fmt.Sprintf("[AGENT-PEER-PUNCH-A] punch failed peer=%s err=%v(落 piko)", peerID, err))
-		return nil, err
+		return nil, fmt.Errorf("agent punch: dial peer: %w", err)
 	}
 
 	// ⑤ 成功:socket 入表(会话物理底层),开流交付,lease 即取即释。
