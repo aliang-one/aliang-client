@@ -75,11 +75,7 @@ func TestNewExitClientTransportOrder(t *testing.T) {
 
 	names := func(t *testing.T, c *ExitClient) []string {
 		t.Helper()
-		got := make([]string, 0, len(c.transports))
-		for _, tr := range c.transports {
-			got = append(got, tr.Name())
-		}
-		return got
+		return c.TransportNames() // 载体观测面(Task 12 导出,跨包测试共用)
 	}
 	assertNames := func(t *testing.T, got, want []string) {
 		t.Helper()

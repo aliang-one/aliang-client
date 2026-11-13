@@ -28,7 +28,7 @@ type PeerSpec struct {
 	HostKey  string   // 对端 SSH host key 钉扎;空 = fail-closed(SPEC §10.4)
 	SSHUser  string   // 固定 "mesh"
 	Relay    bool     // true = 允许中继 Transport
-	Punch    bool     // true = 允许 UDP 打洞载体;进 CacheKey(运行期翻开关→键变→缓存重建,工厂置位归 Task 12)
+	Punch    bool     // true = UDP 打洞载体装配进切片;进 CacheKey(运行期翻开关→键变→缓存重建)。置位与 punchDial 接线由工厂保持一致(配置开∧缝接线缺一不可,位=载体实际进切片的完整事实,Task 12)
 }
 
 // CacheKey 计算该 peer 在 ExitClient 缓存中的键(SPEC §10.4):全部影响

@@ -14,7 +14,7 @@ const lanDialTimeout = 5 * time.Second
 
 // Transport 提供一条到对端 sshd 的、尚未握手的 net.Conn。无状态,可跨拨号复用。
 type Transport interface {
-	Name() string                           // "lan" / "piko" / 未来 "udp"
+	Name() string                           // "lan" / "udp" / "piko"
 	Admit(class string, peer PeerSpec) bool // 载体准入:custom 禁走公共中继;LAN 还需有地址
 	IsRelay() bool                          // 是否中继载体:ExitClient.DialContext 错误分桶的判据
 	DialSSHD(ctx context.Context, peer PeerSpec) (net.Conn, error)

@@ -68,6 +68,20 @@ func (m *Manager) meshOfflineSignal() func() bool {
 	return func() bool { return !m.TunnelSessionActive() }
 }
 
+// meshPunchDialForAssembly 装配缝共用的打洞拨号取值(mesh-udp-punch
+// Task 12):开关读调用时刻配置(闭包逐调用回读,保存即生效,不缓存
+// 快照——与本文件既有装配哲学一致)+缝读接线态。合取口径与 types.go
+// ValidateMeshDependency 注记一致:运行期装配门=mesh 总开关∧punch 开关∧
+// 缝接线。第二返回值即 PeerSpec.Punch 位(位与 dial 同源:位=载体实际
+// 进切片的完整事实,任一翻转都翻装配结果)。
+func meshPunchDialForAssembly(mesh *config.MeshConfig) (meshproxy.PunchDialFunc, bool) {
+	if !mesh.EffectiveEnabled() || !mesh.EffectivePunchEnabled() {
+		return nil, false
+	}
+	dial := tcp.MeshPunchDialFromSource()
+	return dial, dial != nil
+}
+
 // egressPeer 从当前全局配置装配 egress 兜底 peer(Peers[0]):SSH 依赖降级
 // 由 MeshEffectivelyEnabled 承担(SPEC §10.3);私钥缺失 → nil(构造期解析
 // 即失败);钉扎缺失 → 出口仍成立但拨号恒拒(fail-closed,SPEC §10.4)。
@@ -98,14 +112,16 @@ func (m *Manager) egressPeer() meshproxy.Dialer {
 			lanAddrs = append(lanAddrs, addr)
 		}
 	}
+	punchDial, punchWired := meshPunchDialForAssembly(mesh)
 	spec := meshproxy.PeerSpec{
 		DeviceID: deviceID,
 		LANAddrs: lanAddrs,
 		HostKey:  strings.TrimSpace(first.HostKey),
 		SSHUser:  "mesh",
 		Relay:    first.Relay == nil || *first.Relay,
+		Punch:    punchWired,
 	}
-	client, err := meshproxy.NewExitClient(spec, mesh.PrivateKey, mesh.KeyPassphrase, m.dialMeshEndpoint, nil)
+	client, err := meshproxy.NewExitClient(spec, mesh.PrivateKey, mesh.KeyPassphrase, m.dialMeshEndpoint, punchDial)
 	if err != nil {
 		log.Printf("[MESH-LAN] egress fallback peer %s unavailable: %v", deviceID, err)
 		return nil
@@ -158,14 +174,16 @@ func (m *Manager) meshDNSForwardPeer() meshproxy.Dialer {
 			addrs = append(addrs, addr)
 		}
 	}
+	punchDial, punchWired := meshPunchDialForAssembly(mesh)
 	spec := meshproxy.PeerSpec{
 		DeviceID: deviceID,
 		LANAddrs: addrs,
 		HostKey:  strings.TrimSpace(entry.HostKey),
 		SSHUser:  "mesh",
 		Relay:    entry.Relay == nil || *entry.Relay,
+		Punch:    punchWired,
 	}
-	client, err := meshproxy.NewExitClient(spec, mesh.PrivateKey, mesh.KeyPassphrase, m.dialMeshEndpoint, nil)
+	client, err := meshproxy.NewExitClient(spec, mesh.PrivateKey, mesh.KeyPassphrase, m.dialMeshEndpoint, punchDial)
 	if err != nil {
 		log.Printf("[MESH-LAN] dns forward peer %s unavailable: %v", deviceID, err)
 		return nil

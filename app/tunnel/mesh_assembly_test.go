@@ -16,8 +16,8 @@ import (
 	"time"
 
 	"aliang.one/nursorgate/app/mesh/lanbeacon"
-	tuntun "aliang.one/nursorgate/inbound/tun/tunnel"
 	M "aliang.one/nursorgate/inbound/tun/metadata"
+	tuntun "aliang.one/nursorgate/inbound/tun/tunnel"
 	"aliang.one/nursorgate/outbound/meshproto"
 	meshproxy "aliang.one/nursorgate/outbound/proxy/mesh"
 	"aliang.one/nursorgate/processor/config"
@@ -421,4 +421,137 @@ func TestMeshDNSForwardPeer(t *testing.T) {
 			t.Fatal("接线后装配仍应可用")
 		}
 	})
+}
+
+// swapTunnelPunchDialSeam 覆写 punch 拨号注入缝(processor/tcp 平行缝)并
+// 收摊清空(app/tunnel 测试进程不链 services 写方,清空即归位)。
+func swapTunnelPunchDialSeam(t *testing.T, fn func() meshproxy.PunchDialFunc) {
+	t.Helper()
+	tcp.SetMeshPunchDialSource(fn)
+	t.Cleanup(func() { tcp.SetMeshPunchDialSource(nil) })
+}
+
+// tunnelPunchDialStub 恒失败的打洞拨号器(装配矩阵只断言载体进没进切片,
+// 不真拨)。
+func tunnelPunchDialStub() meshproxy.PunchDialFunc {
+	return func(_ context.Context, _ string) (net.Conn, error) {
+		return nil, errors.New("tunnel punch stub unavailable")
+	}
+}
+
+// tunnelPunchDialWired 缝接线态的提供器(返回非 nil 拨号器)。
+func tunnelPunchDialWired() func() meshproxy.PunchDialFunc {
+	return func() meshproxy.PunchDialFunc { return tunnelPunchDialStub() }
+}
+
+// assemblyPeerNames 装配产物的载体观测面(非 *ExitClient 直接判负)。
+func assemblyPeerNames(t *testing.T, peer meshproxy.Dialer) []string {
+	t.Helper()
+	client, ok := peer.(*meshproxy.ExitClient)
+	if !ok || client == nil {
+		t.Fatalf("装配产物应为 *ExitClient, got %T", peer)
+	}
+	return client.TransportNames()
+}
+
+// TestAssemblySeamsPunchThreeStates egressPeer/meshDNSForwardPeer 两装配缝
+// 的 punch 同款三态(mesh-udp-punch Task 12):开关开+缝接线 → udp 进切片;
+// 开关关 → 无 udp;开关开+缝未接线 → 哨兵语义(无 udp 不炸)。闭包读调用
+// 时刻配置(保存即生效,不缓存快照)与缝,装配哲学与既有缝一致。
+func TestAssemblySeamsPunchThreeStates(t *testing.T) {
+	keyPEM := meshAssemblyTestKeyPEM(t)
+	egressPeers := func(punch *bool) *config.MeshConfig {
+		return &config.MeshConfig{
+			PrivateKey:  keyPEM,
+			PunchEnable: punch,
+			Peers: []config.MeshPeer{{
+				DeviceID: "dev-b",
+				LANAddrs: []string{"192.168.1.20:56432"},
+				HostKey:  "SHA256:AAAA",
+			}},
+		}
+	}
+
+	t.Run("egressPeer: 开+接线→udp进切片", func(t *testing.T) {
+		restore := swapGlobalMeshConfig(t, egressPeers(boolPtr(true)))
+		defer restore()
+		swapTunnelPunchDialSeam(t, tunnelPunchDialWired())
+		m := NewManager(nil)
+		names := assemblyPeerNames(t, m.egressPeer())
+		if !containsStringTunnel(names, "udp") {
+			t.Fatalf("punch 开+接线 egress 装配应含 udp, got %v", names)
+		}
+	})
+
+	t.Run("egressPeer: 关→无udp", func(t *testing.T) {
+		restore := swapGlobalMeshConfig(t, egressPeers(boolPtr(false)))
+		defer restore()
+		swapTunnelPunchDialSeam(t, tunnelPunchDialWired())
+		m := NewManager(nil)
+		if containsStringTunnel(assemblyPeerNames(t, m.egressPeer()), "udp") {
+			t.Fatal("punch 关时 egress 装配不应含 udp")
+		}
+	})
+
+	t.Run("egressPeer: 开+未接线→哨兵无udp", func(t *testing.T) {
+		restore := swapGlobalMeshConfig(t, egressPeers(boolPtr(true)))
+		defer restore()
+		swapTunnelPunchDialSeam(t, nil)
+		m := NewManager(nil)
+		if containsStringTunnel(assemblyPeerNames(t, m.egressPeer()), "udp") {
+			t.Fatal("缝未接线时 egress 装配不应含 udp(哨兵语义)")
+		}
+	})
+
+	dnsPeer := config.MeshPeer{
+		DeviceID: "dev-b",
+		LANAddrs: []string{"192.168.1.20:56432"},
+		HostKey:  "SHA256:AAAA",
+	}
+
+	t.Run("meshDNSForwardPeer: 开+接线→udp进切片", func(t *testing.T) {
+		meshDNSForwardPeerForTest(t, []string{"dns,mesh:dev-b"}, keyPEM, dnsPeer)
+		swapTunnelPunchDialSeam(t, tunnelPunchDialWired())
+		// meshDNSForwardPeerForTest 不带 punch 位:就地补开(同一全局配置对象)。
+		cfg := config.GetGlobalConfig()
+		cfg.Customer.Mesh.PunchEnable = boolPtr(true)
+		m := NewManager(nil)
+		names := assemblyPeerNames(t, m.meshDNSForwardPeer())
+		if !containsStringTunnel(names, "udp") {
+			t.Fatalf("punch 开+接线 DNS 代转发装配应含 udp, got %v", names)
+		}
+	})
+
+	t.Run("meshDNSForwardPeer: 关→无udp", func(t *testing.T) {
+		meshDNSForwardPeerForTest(t, []string{"dns,mesh:dev-b"}, keyPEM, dnsPeer)
+		swapTunnelPunchDialSeam(t, tunnelPunchDialWired())
+		cfg := config.GetGlobalConfig()
+		cfg.Customer.Mesh.PunchEnable = boolPtr(false)
+		m := NewManager(nil)
+		if containsStringTunnel(assemblyPeerNames(t, m.meshDNSForwardPeer()), "udp") {
+			t.Fatal("punch 关时 DNS 代转发装配不应含 udp")
+		}
+	})
+
+	t.Run("meshDNSForwardPeer: 开+未接线→哨兵无udp", func(t *testing.T) {
+		meshDNSForwardPeerForTest(t, []string{"dns,mesh:dev-b"}, keyPEM, dnsPeer)
+		swapTunnelPunchDialSeam(t, nil)
+		cfg := config.GetGlobalConfig()
+		cfg.Customer.Mesh.PunchEnable = boolPtr(true)
+		m := NewManager(nil)
+		if containsStringTunnel(assemblyPeerNames(t, m.meshDNSForwardPeer()), "udp") {
+			t.Fatal("缝未接线时 DNS 代转发装配不应含 udp(哨兵语义)")
+		}
+	})
+}
+
+// containsStringTunnel 切片含子串判定的包内小助手(与 processor/tcp 侧
+// 同名异包,测试文件不跨包共享夹具的既有约定)。
+func containsStringTunnel(list []string, want string) bool {
+	for _, s := range list {
+		if s == want {
+			return true
+		}
+	}
+	return false
 }

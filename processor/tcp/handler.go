@@ -1393,6 +1393,32 @@ func meshPunchDialFromSource() meshproxy.PunchDialFunc {
 	return fn()
 }
 
+// MeshPunchDialFromSource 打洞拨号提供器的导出读取口:app/tunnel 装配缝
+// (egressPeer/meshDNSForwardPeer)与主路径工厂(getMeshExitForExecution)
+// 经同一缝同源取打洞拨号器(Task 12),不另立第二注册面。
+func MeshPunchDialFromSource() meshproxy.PunchDialFunc {
+	return meshPunchDialFromSource()
+}
+
+// meshDialCarrierLog 载体可见性日志的落点(生产恒 logger.Info,口径对齐
+// 既有 [MESH-OUT] 行;包级变量=同包测试注入面,Task 12)。
+var meshDialCarrierLog = func(msg string) { logger.Info(msg) }
+
+// logMeshDialCarrier [MESH-OUT] 载体可见性日志行(mesh-udp-punch Task 12
+// 评审定谳:旧 server+新 agent 静默丢帧,「本次拨号走哪个载体」必须有
+// 痕迹,落真实流量路径而非装配缝):成功行记最终载体;udp 尝试失败即便
+// 回落成功也随行——静默回落 piko/lan 正是排查重点。失败路径不另打重复
+// 行,由 dialViaMesh 既有 Warn 行携带分桶错误(direct_last_err 含 udp
+// 失败原因,直连载体共桶末次覆盖)。
+func logMeshDialCarrier(connID, deviceID string, trace meshproxy.DialTrace) {
+	msg := fmt.Sprintf("[MESH-OUT] conn_id=%s mesh dial to %s via carrier=%s",
+		connID, deviceID, trace.Used)
+	if trace.UDPErr != nil {
+		msg += fmt.Sprintf(" (udp failed: %v)", trace.UDPErr)
+	}
+	meshDialCarrierLog(msg)
+}
+
 // dialViaMesh 执行 toNode:<deviceID>[:policy] 决策(错误回源语义,链头就地
 // 执行,dialByRoute 的 RouteToNode 分支):
 //
@@ -1417,9 +1443,10 @@ func (h *TCPConnectionHandler) dialViaMesh(ctx context.Context, metadata *M.Meta
 
 	client, peerErr := h.getMeshExitForExecution(deviceID)
 	if peerErr == nil {
-		conn, err := client.DialContext(ctx, metadata)
+		conn, trace, err := client.DialContextTraced(ctx, metadata)
 		if err == nil {
 			metadata.Route = "RouteToNode"
+			logMeshDialCarrier(ensureTCPConnID(metadata), deviceID, trace)
 			return conn, nil
 		}
 		peerErr = err
@@ -1463,11 +1490,12 @@ func (h *TCPConnectionHandler) dialViaMesh(ctx context.Context, metadata *M.Meta
 		if fbErr != nil {
 			return nil, fmt.Errorf("mesh: failure policy fallback to %s unavailable: %w", fallbackID, fbErr)
 		}
-		conn, err := fbClient.DialContext(ctx, metadata)
+		conn, trace, err := fbClient.DialContextTraced(ctx, metadata)
 		if err != nil {
 			return nil, fmt.Errorf("mesh: failure policy dial to %s failed: %w", fallbackID, err)
 		}
 		metadata.Route = "RouteToNode"
+		logMeshDialCarrier(ensureTCPConnID(metadata), fallbackID, trace)
 		return conn, nil
 	}
 }
@@ -1503,6 +1531,16 @@ func (h *TCPConnectionHandler) getMeshExitForExecution(deviceID string) (*meshpr
 				pikoDial = dial
 			}
 		}
+		// UDP 打洞载体接线(Task 12):开关读调用时刻配置,拨号源读平行缝
+		// (未接线=nil→不进切片,哨兵语义);Punch 位与 punchDial 同源置位
+		// ——位=载体实际进切片的完整事实(配置开∧缝接线,任一翻转都翻键
+		// 重建缓存,SPEC §10.4)。「关→强制 nil」是工厂责任:装配门=dial
+		// 非 nil,CacheKey 位只管缓存重建不管装配门(评审定谳)。
+		punchDial := meshPunchDialFromSource()
+		if !meshCfg.EffectivePunchEnabled() {
+			punchDial = nil
+		}
+		spec.Punch = punchDial != nil
 		key := spec.CacheKey(meshCfg.PrivateKey, meshCfg.KeyPassphrase)
 		h.meshExitsMu.RLock()
 		client, ok := h.meshExits[key]
@@ -1510,7 +1548,7 @@ func (h *TCPConnectionHandler) getMeshExitForExecution(deviceID string) (*meshpr
 		if ok {
 			return client, nil
 		}
-		client, err := meshproxy.NewExitClient(spec, meshCfg.PrivateKey, meshCfg.KeyPassphrase, pikoDial, nil)
+		client, err := meshproxy.NewExitClient(spec, meshCfg.PrivateKey, meshCfg.KeyPassphrase, pikoDial, punchDial)
 		if err != nil {
 			return nil, err
 		}
