@@ -698,6 +698,9 @@ func (a *agentPeerPunchA) dialMiss(ctx context.Context, peerID string) (net.Conn
 		"session_id":  sessionID,
 		"token":       token,
 		"ttl_seconds": agentPunchSessionMaxTTLSeconds,
+		// 路由信封(Task 13 契约):server 靠它寻址 B,转发前剥除——B 收到
+		// 的帧与 Task 1 锁定契约逐字一致。B 侧忽略未知字段,向后兼容。
+		"target_device_id": peerID,
 	}); err != nil {
 		return nil, fmt.Errorf("agent punch: send session: %w", err)
 	}
