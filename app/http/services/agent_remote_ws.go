@@ -463,6 +463,11 @@ func (s *AgentService) runRemoteAgentSession(conn *websocket.Conn) error {
 	// 远端常驻 socket：写函数是间接层（重连换道），注册一次进程内有效。
 	// 本函数每条连接跑一次——重连必然重入，断线死亡的 socket 在此复活。
 	s.ai.ensureRemoteAISocket(writeJSON)
+	// 重连补订阅（2026-11-12 视频会话事故）：远端 socket 重建后订阅集为空，
+	// 服务端重发（agent.registered）只看其 interest 注册表（30 分钟 TTL）——
+	// 在飞 run 的会话若不在册就会静默失联。按本机活跃 run 权威补订；门关着
+	// 也没关系，订阅集在内存里，门开后扇出照常投递。
+	s.ai.resubscribeRemoteAISessionsForActiveRuns()
 
 	// Read liveness: enforce a read deadline that is refreshed by inbound pongs
 	// (and any application message). If the peer goes silent the deadline fires
@@ -726,6 +731,9 @@ func (s *AgentService) handleRemoteAgentMessage(ctx context.Context, msg map[str
 		// 且本连接内不再有别的复活点（手机从此静默收不到审批广播）。此处幂等
 		// ensure 一次：门已开，被摘/缺失的 remote socket 就地复活；活着的 no-op。
 		s.ai.ensureRemoteAISocket(s.currentRemoteWriter())
+		// 复活的 socket 若是新建（订阅集为空），同款补订阅（2026-11-12 事故）；
+		// 活着的 no-op。
+		s.ai.resubscribeRemoteAISessionsForActiveRuns()
 		// Tell the server which terminal sessions survived the disconnect (live
 		// set, tombstones excluded); an empty set still emits so the server can
 		// clear stale records. Idempotent on the server side, so re-hellos are

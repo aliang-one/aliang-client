@@ -234,6 +234,40 @@ func (m *agentAIManager) ensureRemoteAISocket(write agentTerminalWriter) {
 	m.registerAISocket("remote", write)
 }
 
+// ensureRemoteAISessionSubscribed 开跑时把远端常驻 socket 订阅到该会话——
+// run 协议帧（ai.run.started/delta/终态）到云端的唯一通道是订阅扇出，而远端
+// socket 的订阅由服务端代 App 维护、随 interest 30 分钟 TTL 过期发 unsubscribe。
+// 桌面/TUI-origin 的回合开跑时云端往往已不在订阅名单里：帧全部蒸发，服务端
+// 自证认领（PhoneServer 8d8f790）拿不到触发帧，云端 run_state 永卡终态——
+// 手机「内容新（hello 拉式镜像不依赖订阅）、状态旧」（2026-11-12 视频会话
+// 事故）。契约：run 活着 ⇒ 云端必须在听。幂等；远端 socket 未注册（离线）
+// 时 no-op，重连由 resubscribeRemoteAISessionsForActiveRuns 兜底。
+func (m *agentAIManager) ensureRemoteAISessionSubscribed(sessionID string) {
+	if sessionID == "" {
+		return
+	}
+	m.subscribeAISocket(agentAIRemoteSocketID, sessionID)
+}
+
+// resubscribeRemoteAISessionsForActiveRuns 重连后把所有活跑会话重新订阅到
+// 远端常驻 socket。远端 socket 随连接生死：断线摘除、重连重建，订阅集清空；
+// 服务端重发（agent.registered）只覆盖其 interest 注册表内的会话（30 分钟
+// TTL），在飞 run 的会话若不在册就会静默失联——这里按本机活跃 run 权威补
+// 订阅（activeRunID 由 runCLI/TUI 开跑写入、clearRunning 系收口清空）。
+func (m *agentAIManager) resubscribeRemoteAISessionsForActiveRuns() {
+	m.mu.Lock()
+	live := make([]string, 0, len(m.sessions))
+	for id, s := range m.sessions {
+		if s != nil && s.activeRunID != "" {
+			live = append(live, id)
+		}
+	}
+	m.mu.Unlock()
+	for _, id := range live {
+		m.subscribeAISocket(agentAIRemoteSocketID, id)
+	}
+}
+
 func (m *agentAIManager) subscribeAISocket(socketID, sessionID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
