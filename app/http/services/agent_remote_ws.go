@@ -848,11 +848,17 @@ func (s *AgentService) handleRemoteAgentMessage(ctx context.Context, msg map[str
 		s.setRemoteConnectionState(true, "online", "")
 		safeGo("peer_punch_session", func() { s.handleAgentPeerPunchSession(msg, writeJSON) })
 	case models.AgentEventPeerPunchCandidates:
-		// 打洞候选双向交换的 B 端接收面：按 session_id 路由到在册会话，
-		// 探测 Dial 在注册表内异步起火（起火即忘）；查表轻量，仍走 safeGo
-		// 防探测编排的慢路径拖 read loop。A 侧接收面归 Task 10b。
+		// 打洞候选双向交换的双端接收面：B 端按 session_id 路由到在册会话，
+		// 探测 Dial 在注册表内异步起火（起火即忘）；A 端按 pending 表喂等
+		// 待方。查表轻量，仍走 safeGo 防探测编排的慢路径拖 read loop。
 		s.setRemoteConnectionState(true, "online", "")
 		safeGo("peer_punch_candidates", func() { s.handleAgentPeerPunchCandidates(msg) })
+	case models.AgentEventPeerPunchSessionResult:
+		// B→server→A 的绑定回包：A 端按 request_id 喂 pending 等待方
+		// （Task 10b）。到达 B 侧属错投——pending 查无即静默消费，防
+		// default 臂 unsupported 噪声（peer.lan.listen_result 同款）。
+		s.setRemoteConnectionState(true, "online", "")
+		safeGo("peer_punch_session_result", func() { sharedAgentPeerPunchA().handleResultFrame(msg) })
 	// 注意：这五个旧工具事件（file.list/file.read/file.write/git.status/env.info；
 	// file.write 为 D3 新增，与 file.list/file.read 同走 agent_detail 臂）由下面的
 	// 显式臂直派、有意绕过 default 臂的 tools.RunWithGuards 护栏（无超时看门狗/

@@ -594,3 +594,300 @@ func TestAgentPeerPunchSessionFrameValidation(t *testing.T) {
 		t.Fatalf("超长 token 应拒: %v", f)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// A 侧(Task 10b):cache-first 拨号源。假 B=真 ServeListener+信令回程直连
+// (handleResultFrame/handleCandidatesFrame),数据面全真。
+// ---------------------------------------------------------------------------
+
+// punchFakeB 全功能假 B:onFrame 收 A 侧自发帧——session 帧→起 loopback 真
+// listener(计数 session 帧数供缓存命中断言)→回 result+candidates;
+// candidates 帧(A 侧自发)忽略。doneChs 暴露 listener 收摊信号。
+type punchFakeB struct {
+	t             *testing.T
+	a             *agentPeerPunchA
+	mu            sync.Mutex
+	sessionFrames int
+	handlers      int
+	deadline      time.Duration // echo handler 可挂起时长(默认直接 echo)
+}
+
+func (f *punchFakeB) onFrame(payload map[string]interface{}) error {
+	switch payload["type"] {
+	case models.AgentEventPeerPunchSession:
+		f.mu.Lock()
+		f.sessionFrames++
+		f.mu.Unlock()
+		token, _ := payload["token"].(string)
+		sessionID, _ := payload["session_id"].(string)
+		requestID, _ := payload["request_id"].(string)
+		cert, fp, err := generateAgentLanCertificate()
+		if err != nil {
+			f.t.Fatalf("假 B 现签证书失败: %v", err)
+		}
+		sock, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		if err != nil {
+			f.t.Fatalf("假 B 绑定失败: %v", err)
+		}
+		echo := func(conn net.Conn) {
+			f.mu.Lock()
+			f.handlers++
+			deadline := f.deadline
+			f.mu.Unlock()
+			if deadline > 0 {
+				_ = conn.SetReadDeadline(time.Now().Add(deadline))
+			}
+			_, _ = io.Copy(conn, conn)
+		}
+		port, done, err := punch.ServeListener(sock, punch.ListenerOpts{
+			TTL:     30 * time.Second,
+			Token:   token,
+			TLS:     punch.PunchTLSConfig{ServerCert: cert, ExpectedToken: token},
+			Handler: echo,
+		})
+		if err != nil {
+			f.t.Fatalf("假 B 起听失败: %v", err)
+		}
+		f.a.handleResultFrame(map[string]interface{}{
+			"type":        models.AgentEventPeerPunchSessionResult,
+			"request_id":  requestID,
+			"ok":          true,
+			"port":        float64(port),
+			"fingerprint": fp,
+		})
+		f.a.handleCandidatesFrame(map[string]interface{}{
+			"type":       models.AgentEventPeerPunchCandidates,
+			"session_id": sessionID,
+			"candidates": []interface{}{fmt.Sprintf("127.0.0.1:%d", port)},
+		})
+		safeGo("punch_fake_b_reaper", func() {
+			<-done
+			_ = sock.Close()
+		})
+	}
+	return nil
+}
+
+func (f *punchFakeB) countSessionFrames() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.sessionFrames
+}
+
+// newPunchAForTest 造全注入 A 侧编排实例:send 缝路由给假 B,bind/classify
+// 桩不碰外网(loopback 绑定+TEST-NET 宣告),cert/dialPeer 走生产件。
+func newPunchAForTest(t *testing.T, mods ...func(*agentPeerPunchA)) (*agentPeerPunchA, *punchFakeB) {
+	t.Helper()
+	fake := &punchFakeB{t: t}
+	a := &agentPeerPunchA{
+		pendingResult:     map[string]chan map[string]interface{}{},
+		pendingCandidates: map[string]chan []string{},
+		candidateStash:    map[string][]string{},
+		sockets:           map[string]*net.UDPConn{},
+		skipMemo:          &punch.SkipMemo{},
+		cache:             punch.NewSessionCache(),
+		gate:              func() bool { return true },
+		bind: func() (*net.UDPConn, string, error) {
+			conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+			return conn, "lo0", err
+		},
+		servers: func() []string { return []string{"127.0.0.1:3478"} },
+		classify: func(*net.UDPConn, []string) (punch.PublicMapping, bool, error) {
+			return punch.PublicMapping{IP: net.IPv4(203, 0, 113, 9), Port: 45001}, false, nil
+		},
+		cert: generateAgentLanCertificate,
+		send: func(payload map[string]interface{}) error {
+			return fake.onFrame(payload)
+		},
+	}
+	for _, mod := range mods {
+		mod(a)
+	}
+	fake.a = a // 回程通道:假 B 的 result/candidates 帧喂给本实例 pending 表
+	t.Cleanup(a.closeAll)
+	return a, fake
+}
+
+func punchAWaitPayload(requestID string) map[string]interface{} {
+	return map[string]interface{}{"type": models.AgentEventPeerPunchSessionResult, "request_id": requestID, "ok": false}
+}
+
+func TestAgentPeerPunchADialSourceFullChainAndCacheHit(t *testing.T) {
+	a, fake := newPunchAForTest(t)
+
+	conn1, err := a.dialSource(context.Background(), "dev-b")
+	if err != nil {
+		t.Fatalf("首拨失败: %v", err)
+	}
+	if _, err := conn1.Write([]byte("hello")); err != nil {
+		t.Fatalf("首拨写失败: %v", err)
+	}
+	buf := make([]byte, 5)
+	if _, err := io.ReadFull(conn1, buf); err != nil || string(buf) != "hello" {
+		t.Fatalf("首拨回显错: %q %v", buf, err)
+	}
+	_ = conn1.Close()
+
+	if n := fake.countSessionFrames(); n != 1 {
+		t.Fatalf("首拨应恰发一帧 session,实发 %d", n)
+	}
+
+	// 第二拨走缓存:不开新 session(对端握手计数不增=不开新 listener),
+	// 数据面照通(同会话第二条流,免门直通)。
+	conn2, err := a.dialSource(context.Background(), "dev-b")
+	if err != nil {
+		t.Fatalf("二拨(缓存)失败: %v", err)
+	}
+	if _, err := conn2.Write([]byte("two")); err != nil {
+		t.Fatalf("二拨写失败: %v", err)
+	}
+	buf2 := make([]byte, 3)
+	if _, err := io.ReadFull(conn2, buf2); err != nil || string(buf2) != "two" {
+		t.Fatalf("二拨回显错: %q %v", buf2, err)
+	}
+	_ = conn2.Close()
+
+	if n := fake.countSessionFrames(); n != 1 {
+		t.Fatalf("二拨应走缓存(session 帧仍为 1),实发 %d", n)
+	}
+}
+
+func TestAgentPeerPunchAClassifyMemoRules(t *testing.T) {
+	t.Run("classify_error_no_record", func(t *testing.T) {
+		a, _ := newPunchAForTest(t, func(a *agentPeerPunchA) {
+			a.classify = func(*net.UDPConn, []string) (punch.PublicMapping, bool, error) {
+				return punch.PublicMapping{}, false, context.DeadlineExceeded
+			}
+		})
+		if _, err := a.dialSource(context.Background(), "dev-b"); err != nil {
+			t.Fatalf("classify error 应不记账且继续打洞: %v", err)
+		}
+		if a.skipMemo.ShouldSkip("dev-b") {
+			t.Fatal("classify error 不得写 SkipMemo(不可达≠symmetric)")
+		}
+	})
+	t.Run("symmetric_record_and_skip", func(t *testing.T) {
+		a, fake := newPunchAForTest(t, func(a *agentPeerPunchA) {
+			a.classify = func(*net.UDPConn, []string) (punch.PublicMapping, bool, error) {
+				return punch.PublicMapping{}, true, nil
+			}
+		})
+		if _, err := a.dialSource(context.Background(), "dev-b"); err == nil {
+			t.Fatal("symmetric 应返回错误(落 piko)")
+		}
+		if !a.skipMemo.ShouldSkip("dev-b") {
+			t.Fatal("symmetric 必须写 SkipMemo(per-peer 记账)")
+		}
+		if n := fake.countSessionFrames(); n != 1 {
+			t.Fatalf("symmetric 只应烧一次 session 帧,实发 %d", n)
+		}
+		// memo 生效:第二次拨号不入打洞(session 帧不增)
+		if _, err := a.dialSource(context.Background(), "dev-b"); err == nil {
+			t.Fatal("memo 命中应继续拒绝")
+		}
+		if n := fake.countSessionFrames(); n != 1 {
+			t.Fatalf("memo 命中不应再发 session 帧,实发 %d", n)
+		}
+	})
+}
+
+func TestAgentPeerPunchAResultPendingAndTimeout(t *testing.T) {
+	t.Run("unknown_result_no_panic", func(t *testing.T) {
+		a, _ := newPunchAForTest(t)
+		a.handleResultFrame(punchAWaitPayload("no-such-request"))
+	})
+	t.Run("result_timeout", func(t *testing.T) {
+		restored := agentPunchResultWait
+		agentPunchResultWait = 150 * time.Millisecond
+		t.Cleanup(func() { agentPunchResultWait = restored })
+		a, _ := newPunchAForTest(t, func(a *agentPeerPunchA) {
+			a.send = func(map[string]interface{}) error { return nil } // 假 B 吞帧不回
+		})
+		if _, err := a.dialSource(context.Background(), "dev-b"); err == nil {
+			t.Fatal("result 超时应失败(落 piko)")
+		}
+	})
+}
+
+func TestAgentPeerPunchADialSourceSerializes(t *testing.T) {
+	a, fake := newPunchAForTest(t)
+	// 假 B 首帧回程挂 300ms(模拟信令 RTT),并发双拨应被串行+缓存吸收。
+	var once sync.Once
+	fakeSlowReply := make(chan struct{})
+	orig := a.send
+	a.send = func(payload map[string]interface{}) error {
+		if payload["type"] == models.AgentEventPeerPunchSession {
+			once.Do(func() { close(fakeSlowReply) })
+		}
+		return orig(payload)
+	}
+	errCh := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			conn, err := a.dialSource(context.Background(), "dev-b")
+			if err == nil {
+				_ = conn.Close()
+			}
+			errCh <- err
+		}()
+	}
+	<-fakeSlowReply // 首帧已出
+	for i := 0; i < 2; i++ {
+		if err := <-errCh; err != nil {
+			t.Fatalf("并发拨号第 %d 路失败: %v", i+1, err)
+		}
+	}
+	if n := fake.countSessionFrames(); n != 1 {
+		t.Fatalf("串行+缓存应只发一帧 session,实发 %d", n)
+	}
+}
+
+func TestAgentPeerPunchADialTimeoutNoLeak(t *testing.T) {
+	a, _ := newPunchAForTest(t, func(a *agentPeerPunchA) {
+		// 假 B 给出黑洞候选:拨号烧预算后失败,socket 必须归还(不泄漏)。
+		a.send = func(payload map[string]interface{}) error {
+			if payload["type"] == models.AgentEventPeerPunchCandidates {
+				payload["candidates"] = []interface{}{"127.0.0.1:1"}
+			}
+			// session 帧吞掉不回——不,需要回 result 才走到拨号;这里自答。
+			if payload["type"] == models.AgentEventPeerPunchSession {
+				go func() {
+					a.handleResultFrame(map[string]interface{}{
+						"type":        models.AgentEventPeerPunchSessionResult,
+						"request_id":  payload["request_id"],
+						"ok":          true,
+						"port":        float64(1),
+						"fingerprint": "0000000000000000000000000000000000000000000000000000000000000000",
+					})
+					a.handleCandidatesFrame(map[string]interface{}{
+						"type":       models.AgentEventPeerPunchCandidates,
+						"session_id": payload["session_id"],
+						"candidates": []interface{}{"127.0.0.1:1"},
+					})
+				}()
+			}
+			return nil
+		}
+	})
+	if _, err := a.dialSource(context.Background(), "dev-b"); err == nil {
+		t.Fatal("黑洞候选应失败")
+	}
+	a.mu.Lock()
+	n := len(a.sockets)
+	a.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("失败路径应归还 socket,残留 %d", n)
+	}
+}
+
+func TestAgentPeerPunchAGateOff(t *testing.T) {
+	a, fake := newPunchAForTest(t, func(a *agentPeerPunchA) {
+		a.gate = func() bool { return false }
+	})
+	if _, err := a.dialSource(context.Background(), "dev-b"); err == nil {
+		t.Fatal("门关应直接错误")
+	}
+	if n := fake.countSessionFrames(); n != 0 {
+		t.Fatalf("门关不应发任何帧,实发 %d", n)
+	}
+}

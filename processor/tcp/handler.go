@@ -1370,6 +1370,29 @@ func meshTransportDialFromSource() meshproxy.PikoDialFunc {
 	return fn()
 }
 
+// meshPunchDialSource 打洞载体拨号提供器注入缝(与 meshTransportDialSource
+// 平行,atomic.Value 形态同款——nil 归一空提供器,任务 10b 落缝):
+// 生产写方 services 侧 init(agent_peer_punch.go),读方 Task 12 工厂
+// (getMeshExitForExecution 按 customer.mesh.punch_enable 取用)。
+var meshPunchDialSource atomic.Value // func() meshproxy.PunchDialFunc
+
+// SetMeshPunchDialSource 注入打洞载体拨号提供器;nil = 清除。并发安全。
+func SetMeshPunchDialSource(fn func() meshproxy.PunchDialFunc) {
+	if fn == nil {
+		fn = func() meshproxy.PunchDialFunc { return nil }
+	}
+	meshPunchDialSource.Store(fn)
+}
+
+// meshPunchDialFromSource 取打洞拨号提供器(未接线=nil)。
+func meshPunchDialFromSource() meshproxy.PunchDialFunc {
+	fn, _ := meshPunchDialSource.Load().(func() meshproxy.PunchDialFunc)
+	if fn == nil {
+		return nil
+	}
+	return fn()
+}
+
 // dialViaMesh 执行 toNode:<deviceID>[:policy] 决策(错误回源语义,链头就地
 // 执行,dialByRoute 的 RouteToNode 分支):
 //

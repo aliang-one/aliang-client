@@ -31,7 +31,10 @@ package services
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"strconv"
@@ -42,7 +45,9 @@ import (
 	"aliang.one/nursorgate/app/mesh/punch"
 	"aliang.one/nursorgate/common/logger"
 	sshin "aliang.one/nursorgate/inbound/ssh"
+	meshproxy "aliang.one/nursorgate/outbound/proxy/mesh"
 	"aliang.one/nursorgate/processor/config"
+	"aliang.one/nursorgate/processor/tcp"
 	"github.com/quic-go/quic-go"
 )
 
@@ -205,10 +210,12 @@ func (s *AgentService) handleAgentPeerPunchSession(msg map[string]interface{}, w
 	sharedAgentPeerPunchB().handleSession(msg, writeJSON, s.currentDeviceID())
 }
 
-// handleAgentPeerPunchCandidates 是 B 端 peer.punch.candidates 的 WS 入口:
-// 按 session_id 路由到在册会话,探测起火在注册表内异步(safeGo)。
+// handleAgentPeerPunchCandidates 是 peer.punch.candidates 的双端 WS 入口:
+// B 端按 session_id 路由到在册会话,探测起火在注册表内异步(safeGo);
+// A 端按 pending 表喂等待方(Task 10b)——双角色各自查表,查无不互扰。
 func (s *AgentService) handleAgentPeerPunchCandidates(msg map[string]interface{}) {
 	sharedAgentPeerPunchB().handleCandidates(msg)
+	sharedAgentPeerPunchA().handleCandidatesFrame(msg)
 }
 
 // handleSession B 端主流程(顺序硬约束见文件头):门禁 → 帧校验 → 绑
@@ -510,4 +517,366 @@ func (b *agentPeerPunchB) sessionByID(sessionID string) *agentPeerPunchSession {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.sessions[sessionID]
+}
+
+// ---------------------------------------------------------------------------
+// A 侧(Task 10b):cache-first 拨号源 + result/candidates pending 接收 +
+// 平行缝注册。
+// ---------------------------------------------------------------------------
+
+// 信令等待是包变量而非配置项(punch 包 classifyDiscoverTimeout 先例):
+// 生产语义是常量;result 等待须覆盖 B 侧 bind+双 STUN 判型的最坏时延
+// (10a 实测 ~6s),candidates 等待覆盖 B 侧回程一跳。
+var (
+	agentPunchResultWait     = 10 * time.Second
+	agentPunchCandidatesWait = 5 * time.Second
+)
+
+// agentPeerPunchA 是 A 侧打洞编排体:cache-first 拨号源(活会话直接开流,
+// miss 走同步完整打洞链)+ pending 接收面(result 按 request_id、candidates
+// 按 session_id 路由)+ per-peer SkipMemo(A 侧知道对端是谁,记账键=对端
+// deviceID——与 B 侧「键=本机」的语义分工见各自结构体注)。
+//
+// 并发契约:dialMu 把 miss 路径全局串行——同 conn 并发重拨会互偷包
+// (Task 8 情报:同 UDP conn 的多个 Transport 互为读循环对家);快路径
+// (Acquire 命中)不持 dialMu,缓存自带的表级并发安全足够。sockets 表存
+// 每 peer 活会话的打洞 socket:SessionCache 只关 Transport 不关底层 conn
+// (Task 8 契约),socket 的回收=下次同 peer 重拨时驱逐旧件(僵尸窗口内
+// 至多滞留一张/peer,进程级封顶 peer 数),注释见 dialMiss。
+type agentPeerPunchA struct {
+	mu                sync.Mutex
+	pendingResult     map[string]chan map[string]interface{}
+	pendingCandidates map[string]chan []string
+	candidateStash    map[string][]string // 早到的 B 候选(B 判型可先于 A 注册完成,信令异步无先序保证)
+	sockets           map[string]*net.UDPConn
+	skipMemo          *punch.SkipMemo
+	cache             *punch.SessionCache
+	dialMu            sync.Mutex
+
+	gate     func() bool
+	bind     func() (*net.UDPConn, string, error)
+	servers  func() []string
+	classify func(*net.UDPConn, []string) (punch.PublicMapping, bool, error)
+	cert     func() (tls.Certificate, string, error)
+	send     func(map[string]interface{}) error
+}
+
+// newAgentPeerPunchA 生产默认:配置门+物理口绑定+默认 STUN 对+现签证书
+// (generateAgentLanCertificate,B 侧不钉 A 但证书出示仍被要求)+真拨号件
+// +自发帧走 currentRemoteWriterFunc(断连 nil 即失败——punch 信令发不出去
+// 就该落 piko,不该等)。
+func newAgentPeerPunchA() *agentPeerPunchA {
+	return &agentPeerPunchA{
+		pendingResult:     map[string]chan map[string]interface{}{},
+		pendingCandidates: map[string]chan []string{},
+		candidateStash:    map[string][]string{},
+		sockets:           map[string]*net.UDPConn{},
+		skipMemo:          &punch.SkipMemo{},
+		cache:             punch.NewSessionCache(),
+		gate:              agentPunchConfigEnabled,
+		bind:              func() (*net.UDPConn, string, error) { return punch.NewBoundUDPConn(punch.DefaultResolver) },
+		servers:           punch.DefaultSTUNServers,
+		classify:          punch.Classify,
+		cert:              generateAgentLanCertificate,
+		send: func(payload map[string]interface{}) error {
+			w := currentRemoteWriterFunc()
+			if w == nil {
+				return errors.New("agent punch: remote writer offline")
+			}
+			return w(payload)
+		},
+	}
+}
+
+// 进程级单例与平行缝注册(镜像 B 侧 shared 形态):init 注册保证 Task 12
+// 的工厂在任意时刻取缝都能拿到当前实例的 dialSource(闭包延迟解引用,
+// 单例懒初始化竞态由 shared 内部锁兜住)。
+var (
+	agentPeerPunchAMu     sync.RWMutex
+	agentPeerPunchAShared *agentPeerPunchA
+)
+
+func sharedAgentPeerPunchA() *agentPeerPunchA {
+	agentPeerPunchAMu.RLock()
+	inst := agentPeerPunchAShared
+	agentPeerPunchAMu.RUnlock()
+	if inst != nil {
+		return inst
+	}
+	agentPeerPunchAMu.Lock()
+	defer agentPeerPunchAMu.Unlock()
+	if agentPeerPunchAShared == nil {
+		agentPeerPunchAShared = newAgentPeerPunchA()
+	}
+	return agentPeerPunchAShared
+}
+
+func init() {
+	tcp.SetMeshPunchDialSource(func() meshproxy.PunchDialFunc {
+		return sharedAgentPeerPunchA().dialSource
+	})
+}
+
+// dialSource 是 PunchDialFunc 的 A 侧本体(cache-first):快路径缓存开流,
+// miss 同步完整打洞链——首拨付信令成本,后续走缓存;一切失败恒错误,
+// 由 ExitClient 装配序(LAN→udp→piko)落 piko 中继。
+func (a *agentPeerPunchA) dialSource(ctx context.Context, peerID string) (net.Conn, error) {
+	if !a.gate() {
+		return nil, errors.New("agent punch: disabled by config")
+	}
+	if conn, ok := a.tryCached(ctx, peerID); ok {
+		return conn, nil
+	}
+	return a.dialMiss(ctx, peerID)
+}
+
+// tryCached 快路径:Acquire 命中→开流;开流失败=会话已死(含僵尸窗口),
+// 返回未命中交 miss 路径驱逐重拨。lease 即取即释——流的生命周期独立于
+// lease,Release 只减引用计数(Task 8 契约)。
+func (a *agentPeerPunchA) tryCached(ctx context.Context, peerID string) (net.Conn, bool) {
+	lease := a.cache.Acquire(peerID)
+	if lease == nil {
+		return nil, false
+	}
+	conn, err := lease.OpenStream(ctx)
+	lease.Release()
+	if err != nil {
+		return nil, false
+	}
+	return conn, true
+}
+
+// dialMiss miss 路径(dialMu 串行):重拨检查 → 驱逐旧 socket → 信令链
+// (session→result→Classify→candidates)→ DialAndPut → 开流。
+func (a *agentPeerPunchA) dialMiss(ctx context.Context, peerID string) (net.Conn, error) {
+	a.dialMu.Lock()
+	defer a.dialMu.Unlock()
+
+	// 双重检查:等锁期间别的 goroutine 已建会话→直接快路径。
+	if conn, ok := a.tryCached(ctx, peerID); ok {
+		return conn, nil
+	}
+
+	// 驱逐旧 socket:该 peer 上一个会话已死(否则快路径就命中了),其
+	// 打洞 socket 由本表持有(SessionCache 只关 Transport);僵尸窗口内
+	// 的滞留件在下次重拨时此刻回收——每 peer 至多一张,进程级封顶。
+	a.mu.Lock()
+	oldSock := a.sockets[peerID]
+	delete(a.sockets, peerID)
+	a.mu.Unlock()
+	if oldSock != nil {
+		_ = oldSock.Close()
+	}
+
+	// memo 预检(per-peer):已知对称 NAT 的对端直接拒绝——省掉 B 侧起听
+	// 90s 与信令一整个来回(评审定谳:NAT 判型/失败记忆,否则对称 NAT
+	// 对端每次拨号白烧 2-3s)。
+	if a.skipMemo.ShouldSkip(peerID) {
+		return nil, fmt.Errorf("agent punch: peer %s skip memo (symmetric suspect)", peerID)
+	}
+
+	token := agentPunchRandomID()
+	sessionID := agentPunchRandomID()
+	requestID := "punch-" + agentPunchRandomID()
+
+	// ① session 帧 → pending 等 result(注册先于发送,消除时序丢帧——
+	// 与 10a B 侧 register 先于 writeJSON 同款纪律)。
+	resCh := make(chan map[string]interface{}, 1)
+	a.mu.Lock()
+	a.pendingResult[requestID] = resCh
+	a.mu.Unlock()
+	defer func() {
+		a.mu.Lock()
+		delete(a.pendingResult, requestID)
+		a.mu.Unlock()
+	}()
+	if err := a.send(map[string]interface{}{
+		"type":        models.AgentEventPeerPunchSession,
+		"request_id":  requestID,
+		"session_id":  sessionID,
+		"token":       token,
+		"ttl_seconds": agentPunchSessionMaxTTLSeconds,
+	}); err != nil {
+		return nil, fmt.Errorf("agent punch: send session: %w", err)
+	}
+	var fingerprint string
+	select {
+	case res := <-resCh:
+		if ok, _ := res["ok"].(bool); !ok {
+			reason := remoteString(res, "fail_reason")
+			return nil, fmt.Errorf("agent punch: peer refused session: %s", reason)
+		}
+		fingerprint = remoteString(res, "fingerprint")
+	case <-ctx.Done():
+		return nil, fmt.Errorf("agent punch: awaiting result: %w", ctx.Err())
+	case <-time.After(agentPunchResultWait):
+		return nil, errors.New("agent punch: result timeout")
+	}
+
+	// ② 绑 socket + Classify(铁律:先于任何拨号,探测窗口不吞打洞包)。
+	socket, _, err := a.bind()
+	if err != nil {
+		// 绑定失败=载体自禁(socket.go 绑定铁律),落 piko。
+		return nil, fmt.Errorf("agent punch: bind: %w", err)
+	}
+	mapping, symmetricSuspect, classifyErr := a.classify(socket, a.servers())
+	var selfCandidates []string
+	if classifyErr != nil {
+		// 铁律:不可达≠symmetric,不写 SkipMemo;打洞照试。
+		logger.Info(fmt.Sprintf("[AGENT-PEER-PUNCH-A] classify unavailable peer=%s err=%v", peerID, classifyErr))
+	} else {
+		if symmetricSuspect {
+			// per-peer 记账后拒绝:本对端 5min 内不再尝试(重拨检查前有
+			// ShouldSkip 预检兜住)。
+			a.skipMemo.Record(peerID)
+			_ = socket.Close()
+			return nil, fmt.Errorf("agent punch: peer %s symmetric nat suspect", peerID)
+		}
+		if mapping.IP != nil && mapping.Port > 0 {
+			selfCandidates = []string{net.JoinHostPort(mapping.IP.String(), strconv.Itoa(mapping.Port))}
+		}
+	}
+
+	// ③ candidates 帧 → pending 等 B 候选。
+	candCh := make(chan []string, 1)
+	a.mu.Lock()
+	a.pendingCandidates[sessionID] = candCh
+	stashed := a.candidateStash[sessionID]
+	delete(a.candidateStash, sessionID)
+	a.mu.Unlock()
+	defer func() {
+		a.mu.Lock()
+		delete(a.pendingCandidates, sessionID)
+		a.mu.Unlock()
+	}()
+	if len(stashed) > 0 {
+		// 注册前早到的候选直接投递(先到先服务,不与后到帧抢序)。
+		select {
+		case candCh <- stashed:
+		default:
+		}
+	}
+	if err := a.send(agentPunchCandidatesPayload(sessionID, selfCandidates)); err != nil {
+		_ = socket.Close()
+		return nil, fmt.Errorf("agent punch: send candidates: %w", err)
+	}
+	var peerCandidates []string
+	select {
+	case peerCandidates = <-candCh:
+	case <-ctx.Done():
+		_ = socket.Close()
+		return nil, fmt.Errorf("agent punch: awaiting candidates: %w", ctx.Err())
+	case <-time.After(agentPunchCandidatesWait):
+		_ = socket.Close()
+		return nil, errors.New("agent punch: candidates timeout")
+	}
+	if len(peerCandidates) == 0 {
+		// B 判型失败无映射可发(v1 线协议无候选)——A 拿 result 端口也
+		// 拼不出公网地址,直连无望,落 piko。
+		_ = socket.Close()
+		return nil, errors.New("agent punch: no peer candidates")
+	}
+
+	// ④ 现签证书 + 真拨号(B 不钉 A,证书出示仍被要求;A 钉 B 指纹
+	// fail-closed)。
+	cert, _, err := a.cert()
+	if err != nil {
+		_ = socket.Close()
+		return nil, fmt.Errorf("agent punch: cert: %w", err)
+	}
+	lease, err := a.cache.DialAndPut(peerID, socket, punch.DialOpts{
+		Token:      token,
+		TLS:        punch.PunchTLSConfig{ClientCert: cert, ServerFingerprint: fingerprint},
+		Candidates: func() []string { return peerCandidates },
+		KeepAlive:  true,
+	})
+	if err != nil {
+		_ = socket.Close()
+		if errors.Is(err, punch.ErrPunchGateRejected) {
+			// token 永久无效,不重试(重试烧的是同一 token)。
+			logger.Info(fmt.Sprintf("[AGENT-PEER-PUNCH-A] gate rejected peer=%s err=%v", peerID, err))
+			return nil, err
+		}
+		logger.Info(fmt.Sprintf("[AGENT-PEER-PUNCH-A] punch failed peer=%s err=%v(落 piko)", peerID, err))
+		return nil, err
+	}
+
+	// ⑤ 成功:socket 入表(会话物理底层),开流交付,lease 即取即释。
+	a.mu.Lock()
+	a.sockets[peerID] = socket
+	a.mu.Unlock()
+	conn, err := lease.OpenStream(ctx)
+	lease.Release()
+	if err != nil {
+		return nil, fmt.Errorf("agent punch: open stream: %w", err)
+	}
+	logger.Info(fmt.Sprintf("[AGENT-PEER-PUNCH-A] punched peer=%s session=%s", peerID, sessionID))
+	return conn, nil
+}
+
+// handleResultFrame A 端 session.result 接收:按 request_id 路由 pending;
+// 无 pending(超时已放弃/错投)静默消费防 default 噪声(peer.lan
+// listen_result 的 unexpected 臂同款)。
+func (a *agentPeerPunchA) handleResultFrame(msg map[string]interface{}) {
+	requestID := remoteString(msg, "request_id")
+	a.mu.Lock()
+	ch, ok := a.pendingResult[requestID]
+	a.mu.Unlock()
+	if !ok {
+		logger.Info(fmt.Sprintf("[AGENT-PEER-PUNCH-A] result for unknown request_id=%s dropped", requestID))
+		return
+	}
+	select {
+	case ch <- msg:
+	default:
+	}
+}
+
+// handleCandidatesFrame A 端 candidates 接收:按 session_id 路由 pending
+// (非法条目过滤在 validAgentPunchCandidates,B 侧同款);无 pending 静默。
+func (a *agentPeerPunchA) handleCandidatesFrame(msg map[string]interface{}) {
+	sessionID := remoteString(msg, "session_id")
+	cands := validAgentPunchCandidates(remoteStringSlice(msg, "candidates"))
+	a.mu.Lock()
+	ch, ok := a.pendingCandidates[sessionID]
+	if !ok && len(cands) > 0 {
+		// 早到帧(B 判型先于 A 的注册完成):暂存等注册方捞回,封顶防滥用。
+		if len(a.candidateStash[sessionID]) < agentPunchMaxCandidates {
+			a.candidateStash[sessionID] = append(a.candidateStash[sessionID], cands...)
+		}
+		a.mu.Unlock()
+		return
+	}
+	a.mu.Unlock()
+	if !ok {
+		return
+	}
+	select {
+	case ch <- cands:
+	default:
+	}
+}
+
+// closeAll 全量收摊(测试卫生件+未来显式收摊钩子):pending 清空(等待方
+// 走超时/ctx 路径自然失败)+socket 全关。
+func (a *agentPeerPunchA) closeAll() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.pendingResult = map[string]chan map[string]interface{}{}
+	a.pendingCandidates = map[string]chan []string{}
+	a.candidateStash = map[string][]string{}
+	for id, sock := range a.sockets {
+		delete(a.sockets, id)
+		_ = sock.Close()
+	}
+}
+
+// agentPunchRandomID 会话/请求标识(crypto/rand hex;rand 失败退化纳秒
+// 36 进制——标识唯一性降级为进程内唯一,不碍信令路由)。
+func agentPunchRandomID() string {
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		return strconv.FormatInt(time.Now().UnixNano(), 36)
+	}
+	return hex.EncodeToString(b)
 }
