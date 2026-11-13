@@ -93,4 +93,18 @@
 **Priority:** P3
 **Depends on:** 无
 
+## Networking
+
+### mesh UDP 打洞载体遗留账(批次 2026-11-12,分支 feat/mesh-udp-punch)
+
+**What:** 打洞一期落地后的七条非阻塞遗留:①端口预测/生日攻击与 coturn 自托管——二期项,闸门=两类真实网络(家宽非对称/蜂窝 CGNAT)真机打洞率数据;②IPv6 打洞(v1 udp4,候选解析 To4 断言对齐 agent_peer_lan);③`advertise_ip` 收下不消费(LAN 提示作候选源,beacon 候选注入同族);④诊断面板 UDP 可用性/载体统计 UI(本期载体可见性已落 [MESH-OUT] 日志行);⑤MeshSettings.vue:521 unconfigured 启发式未考虑 punch_enable(现不可达:punch 无 UI 开关);⑥PhoneServer punch.ts 两条 NIT(result 查表无 TTL 过期检查——A 端 pending 10s≪TTL 120s 无害;audit 元数据缺 from/to 对端 ID,事后关联需 session_id join);⑦v1 无 close 帧(同 session_id 重发=顶替收摊;过期 result 仍转发给 A 的窗口由 A 端 pending miss 兜底)。
+
+**Why:** 均为「不影响正确性、安全红线、主流程」的记账项;验收口径=打洞率锚 70%±7.1% 学术基线(ACM IMC 2025)按网络族分桶,二期投入看一期真机数据。
+
+**Context:** 决策记录=`docs/superpowers/specs/2026-11-12-mesh-udp-punch-design.md`;计划=`docs/superpowers/plans/2026-11-12-mesh-udp-punch.md`;B 侧 mTLS v1 降级(token 门禁+A 钉 B fail-closed,严格强于 peer.lan 纯 token 模型)与 target_device_id 路由信封(转发前剥除)已入 spec §2。
+
+**Effort:** S(逐条独立)
+**Priority:** P3
+**Depends on:** 真机两类网络实测数据(①②);其余无
+
 ## Completed
