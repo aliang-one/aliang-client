@@ -566,7 +566,8 @@ type agentPeerPunchA struct {
 // newAgentPeerPunchA 生产默认:配置门+物理口绑定+默认 STUN 对+现签证书
 // (generateAgentLanCertificate,B 侧不钉 A 但证书出示仍被要求)+真拨号件
 // +自发帧走 currentRemoteWriterFunc(断连 nil 即失败——punch 信令发不出去
-// 就该落 piko,不该等)。
+// 就该落 piko,不该等)。send 先查 AgentPeerPunchSetFrameSink 注入缝
+// (Task 14:集成测试与诊断面接 mock 信令桥;生产恒 nil,零影响)。
 func newAgentPeerPunchA() *agentPeerPunchA {
 	return &agentPeerPunchA{
 		pendingResult:     map[string]chan map[string]interface{}{},
@@ -581,6 +582,9 @@ func newAgentPeerPunchA() *agentPeerPunchA {
 		classify:          punch.Classify,
 		cert:              generateAgentLanCertificate,
 		send: func(payload map[string]interface{}) error {
+			if sink := agentPunchFrameSinkLoad(); sink != nil {
+				return sink(payload)
+			}
 			w := currentRemoteWriterFunc()
 			if w == nil {
 				return errors.New("agent punch: remote writer offline")
@@ -783,13 +787,18 @@ func (a *agentPeerPunchA) dialMiss(ctx context.Context, peerID string) (net.Conn
 	}
 
 	// ④ 现签证书 + 真拨号(B 不钉 A,证书出示仍被要求;A 钉 B 指纹
-	// fail-closed)。
+	// fail-closed)。此处是 DialAndPut 的展开形态(DialPeer→Put 手动链),
+	// 展开只为多一步「首流收口」:PunchSession 的首流只承担过门凭据
+	// (token 行已写毕),缓存路径的取流面是 Lease.OpenStream 的新流,首流
+	// 若任其悬挂,B 侧过门 handler(喂 ssh 入口)会在其上空等 SSH 版本串
+	// 直到握手 deadline——每次成功打洞都在对端留一个 ~15s 的僵尸
+	// ServeConn(Task 14 集成测试实锤)。FIN 掉首流,B 侧读面立即 EOF 退场。
 	cert, _, err := a.cert()
 	if err != nil {
 		_ = socket.Close()
 		return nil, fmt.Errorf("agent punch: cert: %w", err)
 	}
-	lease, err := a.cache.DialAndPut(peerID, socket, punch.DialOpts{
+	session, err := punch.DialPeer(socket, punch.DialOpts{
 		Token:      token,
 		TLS:        punch.PunchTLSConfig{ClientCert: cert, ServerFingerprint: fingerprint},
 		Candidates: func() []string { return peerCandidates },
@@ -804,6 +813,16 @@ func (a *agentPeerPunchA) dialMiss(ctx context.Context, peerID string) (net.Conn
 		}
 		logger.Info(fmt.Sprintf("[AGENT-PEER-PUNCH-A] punch failed peer=%s err=%v(落 piko)", peerID, err))
 		return nil, fmt.Errorf("agent punch: dial peer: %w", err)
+	}
+	lease := a.cache.Put(peerID, session)
+	if lease == nil {
+		// 拨号成功却入表被拒=会话残缺(理论不可达):别泄漏,当场收摊。
+		_ = session.Transport.Close()
+		_ = socket.Close()
+		return nil, errors.New("agent punch: 会话残缺,入缓存被拒")
+	}
+	if session.Stream != nil {
+		_ = session.Stream.Close() // 首流收口(见 ④ 注)
 	}
 
 	// ⑤ 成功:socket 入表(会话物理底层),开流交付,lease 即取即释。
@@ -884,4 +903,75 @@ func agentPunchRandomID() string {
 		return strconv.FormatInt(time.Now().UnixNano(), 36)
 	}
 	return hex.EncodeToString(b)
+}
+
+// ---------------------------------------------------------------------------
+// 导出投递面(Task 14):集成测试与诊断面入口
+// ---------------------------------------------------------------------------
+
+// agentPunchFrameSink 是 punch 信令帧的注入出口:A 侧编排的自发帧(send
+// 缝)与 B 侧编排的回帧(AgentPeerPunchHandleFrame 组的 writer)共用一个
+// 出口——loopback 双角色同进程拓扑下,由接进来的桥按帧型区分方向
+// (session=A 发 / result=B 发 / candidates 在 loopback 恒为 A 发,见
+// test/punch_integration_test.go 的拓扑注记)。nil = 生产默认
+// (currentRemoteWriterFunc)。
+var agentPunchFrameSinkMu sync.RWMutex
+var agentPunchFrameSinkFn func(map[string]interface{}) error
+
+func agentPunchFrameSinkLoad() func(map[string]interface{}) error {
+	agentPunchFrameSinkMu.RLock()
+	defer agentPunchFrameSinkMu.RUnlock()
+	return agentPunchFrameSinkFn
+}
+
+// AgentPeerPunchSetFrameSink 注入 punch 信令帧出口(集成测试与诊断面缝,
+// mesh.ExitClient.TransportNames 观测面同族):非 nil 时 A 侧自发帧与 B 侧
+// result/candidates 回帧均经 sink 投出,调用方(集成测试的 mock 信令桥)
+// 自行路由;nil 恢复生产默认。生产路径恒不置位,零影响。并发安全。
+func AgentPeerPunchSetFrameSink(sink func(map[string]interface{}) error) {
+	agentPunchFrameSinkMu.Lock()
+	agentPunchFrameSinkFn = sink
+	agentPunchFrameSinkMu.Unlock()
+}
+
+// AgentPeerPunchDial A 侧打洞拨号入口(集成测试与诊断面):与生产装配
+// (init 注册给 tcp.SetMeshPunchDialSource 的同源函数)一致地包住共享
+// 单例的 cache-first 拨号源——快路径缓存开流,miss 同步完整打洞链。
+func AgentPeerPunchDial(ctx context.Context, peerID string) (net.Conn, error) {
+	return sharedAgentPeerPunchA().dialSource(ctx, peerID)
+}
+
+// AgentPeerPunchHandleFrame 供集成测试与诊断面投递 punch 帧(生产路径走
+// agent_remote_ws.go 的 WS 分派臂;本缝等价路由:session 进 B 侧编排体,
+// result/candidates 进 A 侧 pending,candidates 亦进 B 侧注册表——与分派
+// 臂逐臂同源,仅少了 setRemoteConnectionState 的 WS 状态副作用与 safeGo
+// 异步化:时序差由两侧既有的 pending 注册先行/candidates 暂存机制吸收,
+// 那两件本来就在为信令异步兜底)。未知帧型静默忽略。
+func AgentPeerPunchHandleFrame(msg map[string]interface{}) {
+	switch remoteString(msg, "type") {
+	case models.AgentEventPeerPunchSession:
+		GetSharedAgentService().handleAgentPeerPunchSession(msg, agentPunchFrameWriter())
+	case models.AgentEventPeerPunchSessionResult:
+		sharedAgentPeerPunchA().handleResultFrame(msg)
+	case models.AgentEventPeerPunchCandidates:
+		GetSharedAgentService().handleAgentPeerPunchCandidates(msg)
+	}
+}
+
+// agentPunchFrameWriter 组 B 侧回帧 writer(AgentPeerPunchHandleFrame 的
+// session 臂用):sink 注入时走桥,否则生产默认(currentRemoteWriterFunc,
+// 断连 nil 即失败——punch 信令发不出去就该落 piko,不该等)。
+func agentPunchFrameWriter() func(interface{}) error {
+	return func(v interface{}) error {
+		if payload, ok := v.(map[string]interface{}); ok {
+			if sink := agentPunchFrameSinkLoad(); sink != nil {
+				return sink(payload)
+			}
+		}
+		w := currentRemoteWriterFunc()
+		if w == nil {
+			return errors.New("agent punch: remote writer offline")
+		}
+		return w(v)
+	}
 }
