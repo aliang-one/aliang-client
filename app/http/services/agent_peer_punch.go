@@ -421,7 +421,9 @@ func (b *agentPeerPunchB) probeDial(sess *agentPeerPunchSession, candidates []st
 			qconn, err := sess.transport.Dial(ctx, addr, tlsConf, nil)
 			cancel()
 			if err == nil {
-				// 理论外(A 侧起了 QUIC 服务端):立即关掉即收,探测只为出门。
+				// 握手面成功是常态非理论外(TLS 1.3 拒单时序不对称:客户端
+				// 发完 Finished 即视为完成,服务端的无证书拒单随后必到且
+				// 永不 Accept——punch 包已立档);立即关掉即收,探测只为出门。
 				_ = qconn.CloseWithError(0, "")
 				continue
 			}
@@ -942,7 +944,8 @@ func AgentPeerPunchDial(ctx context.Context, peerID string) (net.Conn, error) {
 }
 
 // AgentPeerPunchHandleFrame 供集成测试与诊断面投递 punch 帧(生产路径走
-// agent_remote_ws.go 的 WS 分派臂;本缝等价路由:session 进 B 侧编排体,
+// agent_remote_ws.go 的 WS 分派臂;本缝路由等价但少了 enabled-device 门与
+// setRemoteConnectionState——门禁语义以生产臂为准:session 进 B 侧编排体,
 // result/candidates 进 A 侧 pending,candidates 亦进 B 侧注册表——与分派
 // 臂逐臂同源,仅少了 setRemoteConnectionState 的 WS 状态副作用与 safeGo
 // 异步化:时序差由两侧既有的 pending 注册先行/candidates 暂存机制吸收,

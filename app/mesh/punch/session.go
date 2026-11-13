@@ -198,6 +198,12 @@ func (c *SessionCache) DialAndPut(peer string, conn *net.UDPConn, opts DialOpts)
 	if err != nil {
 		return nil, err
 	}
+	// 首流(token 行)即收口(FIN/半关):门禁消费完 token 行后,首流对
+	// 数据面已无用处——不关则 B 侧生产 handler 在其上空等 SSH 版本串到
+	// 入口握手 deadline,每次成功打洞在对端留僵尸 ServeConn(Task 14
+	// 集成测试实锤,15s 级)。数据面自第二流起(免门),调用方 OpenStream
+	// 即得。与 dialMiss 的手工展开链(services 层)语义对齐。
+	_ = session.Stream.Close()
 	lease := c.Put(peer, session)
 	if lease == nil {
 		// dial 成功却入表被拒=会话残缺(理论不可达,DialPeer 出厂件齐全):

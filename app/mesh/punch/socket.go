@@ -12,7 +12,7 @@ import (
 
 // InterfaceResolver 解析系统默认物理接口名。默认实现取
 // inbound/tun/runner/utils/device.go:65 GetDefaultInterface(纯解析、
-// 无缓存无副作用,每次调用跑 route/ip/netsh 级只读探测);测试注入桩用。
+// 无缓存无副作用,每次调用跑 route/ip/PowerShell Get-NetRoute 级只读探测);测试注入桩用。
 type InterfaceResolver func() (string, error)
 
 // DefaultResolver 默认物理口解析器,导出为变量便于测试整体替换。

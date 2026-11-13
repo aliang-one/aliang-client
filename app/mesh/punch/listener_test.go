@@ -1,7 +1,8 @@
-// listener_test.go 见证 B 侧常驻接收面(Task 6)的六面:甜路径(过门后
+// listener_test.go 见证 B 侧常驻接收面(Task 6)的七面:甜路径(过门后
 // 流内剩余字节直达 Handler)/同会话第二条流免门/错 token 拒单且 Handler
 // 不被调/TTL 到点收摊+后续拨号必败/双并发会话互不串扰/Handler panic 被
-// 隔离不拖垮 accept 面。全部跑在 loopback(127.0.0.1 普通 UDPConn,不碰
+// 隔离不拖垮 accept 面/调用方提前关 conn 时 done 必关(修复回归,见
+// TestServeListenerCallerConnCloseClosesDone)。全部跑在 loopback(127.0.0.1 普通 UDPConn,不碰
 // 物理接口绑定),证书与拨号件复用 tls_test.go 的既有 helper。
 
 package punch

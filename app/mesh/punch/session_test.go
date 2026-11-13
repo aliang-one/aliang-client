@@ -350,7 +350,18 @@ func TestSessionCacheKeepAliveInvariant(t *testing.T) {
 	})
 	t.Run("cache 侧端到端+活会话不重拨", func(t *testing.T) {
 		const peer = "peer-cache-f"
-		addr, cfg, _ := punchListenerEnv(t, "punch-session-token", 5*time.Second, punchEchoHandler(t))
+		// handler 按流分职:首流=过门流(DialAndPut 已 FIN,余量空 EOF,
+		// 排水即退);后续流=数据面,回显。punchEchoHandler 的「首流即
+		// 4 字节数据」是 DialPeer 直拨旧契约,与此处不合。
+		var streamN atomic.Int32
+		tokFirstThenEcho := func(c net.Conn) {
+			if streamN.Add(1) == 1 {
+				_, _ = io.Copy(io.Discard, c)
+				return
+			}
+			punchEchoHandler(t)(c)
+		}
+		addr, cfg, _ := punchListenerEnv(t, "punch-session-token", 5*time.Second, tokFirstThenEcho)
 		cache := NewSessionCache()
 		var dials atomic.Int32
 		cache.dial = func(conn *net.UDPConn, opts DialOpts) (*PunchSession, error) {
@@ -368,7 +379,13 @@ func TestSessionCacheKeepAliveInvariant(t *testing.T) {
 		if err != nil {
 			t.Fatalf("DialAndPut 端到端拨号失败: %v", err)
 		}
-		punchEchoRoundtrip(t, l1.entry.session.Stream, "tok1")
+		// 数据面自第二流起(DialAndPut 已 FIN 首流——token 行消费完即收口,
+		// 防 B 侧 handler 空等版本串成僵尸;Task 14 实锤),经 Lease 开新流。
+		s1, err := l1.OpenStream(context.Background())
+		if err != nil {
+			t.Fatalf("DialAndPut 后首条数据流开流失败: %v", err)
+		}
+		punchEchoRoundtrip(t, s1, "tok1")
 
 		// 活会话在场:二次 DialAndPut 必须复用缓存,不再拨号。
 		l2, err := cache.DialAndPut(peer, punchDialerUDPConn(t), DialOpts{Token: "应被忽略不拨"})

@@ -2,6 +2,7 @@ package punch
 
 import (
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -167,7 +168,7 @@ func TestClassifyPartialFailure(t *testing.T) {
 }
 
 // TestClassifyAllUnreachable (补充,对齐计划「两台都不可达≠symmetric」):
-// 两台都超时 → error 路径,调用方按「STUN 不可用」落 piko,且不写 SkipMemo。
+// 两台都超时 → error 路径,调用方按「STUN 不可用」落 piko,且结构性不写 SkipMemo(memo 不在该函数签名内,此断言为文档式自检非机械锁)。
 func TestClassifyAllUnreachable(t *testing.T) {
 	old := classifyDiscoverTimeout
 	classifyDiscoverTimeout = 150 * time.Millisecond
@@ -253,5 +254,98 @@ func TestDefaultSTUNServersExported(t *testing.T) {
 	servers[0] = "mutated"
 	if again := DefaultSTUNServers(); again[0] == "mutated" {
 		t.Fatal("DefaultSTUNServers 必须返回防御性拷贝,包内默认档被污染")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 对抗性补测(质量审查 Minor 1):MAPPED 回落路径 + 错事务 ID 噪声过滤
+// ——
+
+// startSTUNResponderRaw 自由度更高的 responder:reply 变换器由调用方给
+// (MAPPED 变体/错事务 ID 先喷后对,共用构包原语)。
+func startSTUNResponderRaw(t *testing.T, announce net.IP, port int, decorate func(*stun.Message, *stun.Message)) string {
+	t.Helper()
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("起 responder 失败: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	go func() {
+		buf := make([]byte, 1500)
+		for {
+			n, src, err := conn.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			if !stun.IsMessage(buf[:n]) {
+				continue
+			}
+			var req stun.Message
+			if err := stun.Decode(buf[:n], &req); err != nil {
+				continue
+			}
+			if req.Type != stun.BindingRequest {
+				continue
+			}
+			resp, err := stun.Build(
+				stun.NewType(stun.MethodBinding, stun.ClassSuccessResponse),
+				stun.NewTransactionIDSetter(req.TransactionID),
+				&stun.MappedAddress{IP: announce, Port: port},
+			)
+			if err != nil {
+				continue
+			}
+			if decorate != nil {
+				decorate(&req, resp)
+			}
+			if _, err := conn.WriteToUDP(resp.Raw, src); err != nil {
+				return
+			}
+		}
+	}()
+	return conn.LocalAddr().String()
+}
+
+// TestDiscoverMappedAddressFallback XOR 之外,MAPPED-ADDRESS 回落(RFC 5389
+// 老 Server 兼容)同样可得映射——回落分支此前零覆盖(质量审查钉子)。
+func TestDiscoverMappedAddressFallback(t *testing.T) {
+	announceIP := net.IPv4(198, 51, 100, 42)
+	const announcePort = 45012
+	server := startSTUNResponderRaw(t, announceIP, announcePort, nil) // 不加修饰:纯 MAPPED
+	got, err := Discover(testUDPConn(t), server, 2*time.Second)
+	if err != nil {
+		t.Fatalf("MAPPED 回落应成功: %v", err)
+	}
+	if !got.IP.Equal(announceIP) || got.Port != announcePort {
+		t.Fatalf("回落学到的映射不符: got=%v:%d want=%v:%d", got.IP, got.Port, announceIP, announcePort)
+	}
+}
+
+// TestDiscoverIgnoresWrongTransactionID 同源 responder 先喷错事务 ID 应答
+// 再喷正解:RFC 5389 应答真实性凭据(事务匹配)的对抗钉子——错喷必须被
+// 丢弃,正解必须被接受。
+func TestDiscoverIgnoresWrongTransactionID(t *testing.T) {
+	announceIP := net.IPv4(198, 51, 100, 43)
+	const announcePort = 45013
+	var wrong喷 atomic.Int32
+	server := startSTUNResponderRaw(t, announceIP, announcePort, func(req *stun.Message, resp *stun.Message) {
+		if wrong喷.Add(1) == 1 {
+			// 首答:换掉事务 ID(应答内容其余全对)——必须因事务不匹配被弃。
+			var bad [stun.TransactionIDSize]byte
+			for i := range bad {
+				bad[i] = byte(0xA5 ^ req.TransactionID[i])
+			}
+			resp.TransactionID = bad
+		}
+	})
+	got, err := Discover(testUDPConn(t), server, 2*time.Second)
+	if err != nil {
+		t.Fatalf("错事务 ID 应被跳过、正解应被接受: %v", err)
+	}
+	if !got.IP.Equal(announceIP) || got.Port != announcePort {
+		t.Fatalf("学到的映射不符: got=%v:%d", got.IP, got.Port)
+	}
+	if wrong喷.Load() == 0 {
+		t.Fatal("噪声 responder 未被触发,测试无效")
 	}
 }

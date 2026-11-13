@@ -15,6 +15,7 @@ import (
 	"math/big"
 	"net"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -389,6 +390,26 @@ func TestPunchTokenGateAcceptsCorrectToken(t *testing.T) {
 	}
 	if string(echo) != probe {
 		t.Fatalf("回显不符: 得到 %q, 期望 %q", string(echo), probe)
+	}
+}
+
+// TestPunchTokenGateLineOverLimitFailsClosed 超长行(>punchTokenLineLimit
+// 无换行)必须以超限错误 fail-closed——本文件唯一防内存轰炸的安全守卫,
+// 重构循环时被无声丢掉的唯一信号在此钉住(质量审查 Minor 1 补测)。
+func TestPunchTokenGateLineOverLimitFailsClosed(t *testing.T) {
+	addr, cfg, gated := punchTokenGateEnv(t, "punch-test-token", nil)
+	conn := punchTestDial(t, addr, ClientTLSConfig(cfg))
+	stream := punchTestOpenStream(t, conn)
+	huge := strings.Repeat("x", punchTokenLineLimit+1) // 无换行
+	if _, err := stream.Write([]byte(huge)); err != nil {
+		t.Fatalf("客户端写超长行失败: %v", err)
+	}
+	err := punchAwaitGate(t, gated)
+	if err == nil {
+		t.Fatal("超长行应 fail-closed 被拒")
+	}
+	if !strings.Contains(err.Error(), "token 行超限") {
+		t.Fatalf("应报行超限而非其他错误: %v", err)
 	}
 }
 
