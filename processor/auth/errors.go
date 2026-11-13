@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"aliang.one/nursorgate/common/logger"
 	"aliang.one/nursorgate/processor/config"
@@ -140,6 +141,14 @@ func RecoverOrExpireLocalSession(reason string) {
 	reason = strings.TrimSpace(reason)
 	if reason == "" {
 		reason = "expired access token"
+	}
+	// 逾期标尺:access token 被拒时若本地锚点已判逾期,说明后台刷新错过了
+	// lead 窗(滑窗污染或漏 tick),下一次刷新必撞零宽限 401。在这里把逾期量
+	// 直接钉进日志,事故现场不再需要反推。
+	if info := GetCurrentUserInfoOrLoad(); info != nil {
+		if diagnosis := overdueDiagnostic(info, time.Now()); diagnosis != "" {
+			logger.Warn(diagnosis)
+		}
 	}
 	GetSessionAuthority().NotifyAccessRejected(reason)
 	// Trigger recovery directly (not only via the authority listener) so the

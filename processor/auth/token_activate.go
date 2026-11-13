@@ -252,7 +252,10 @@ func RestoreSession() (*UserInfo, error) {
 	latestProfile.RefreshToken = localUserInfo.RefreshToken
 	latestProfile.TokenType = localUserInfo.TokenType
 	latestProfile.ExpiresIn = localUserInfo.ExpiresIn
-	latestProfile.UpdatedAt = time.Now()
+	// 锚点纪律:此路径 refresh 失败、仅用旧 token 同步到了 profile——服务端
+	// 并没有延长会话,锚点必须保持原值。拨到 now 会让续期触发点落在服务端
+	// 死线之后(2026-11-12 登出事故的同型解耦写)。
+	latestProfile.UpdatedAt = localUserInfo.UpdatedAt
 
 	snapshot, err := authority.CommitAuthenticatedSnapshot(operation, latestProfile, ReasonRestored, func(committed *UserInfo) error {
 		if err := SaveUserInfo(committed); err != nil {
@@ -365,6 +368,11 @@ func RefreshSession(refreshToken string) (*UserInfo, error) {
 		if invalidTokenErr := classifyRefreshSessionFailure(resp.StatusCode, body); invalidTokenErr != nil {
 			if !authority.OperationCurrent(operation) {
 				return nil, ErrStaleSessionOperation
+			}
+			// 硬清除前的逾期诊断:把「锚点已判逾期多久」钉进日志,区分
+			// 迟刷(≈20 分钟量级)与锚点被解耦写污染(以小时计)。
+			if diagnosis := overdueDiagnostic(current, time.Now()); diagnosis != "" {
+				logger.Info(diagnosis)
 			}
 			clearLocalSessionAfterInvalidRefreshToken()
 			return nil, fmt.Errorf("saved session expired: %w", invalidTokenErr)
@@ -532,7 +540,9 @@ func effectiveRefreshExpiresIn(expiresIn, upstreamExpiresIn int) int {
 }
 
 func buildUserInfoFromProfile(profile *UserProfile) *UserInfo {
-	info := &UserInfo{UpdatedAt: time.Now()}
+	// UpdatedAt(续期锚点)留零:只有服务端真·签发/续期的路径才允许设置,
+	// 强制每个调用方显式表态,杜绝「顺手拨锚点」的解耦写。
+	info := &UserInfo{}
 	applyUserProfileToUserInfo(info, profile)
 	return info
 }
@@ -575,6 +585,9 @@ var (
 	tokenRefresherMu sync.RWMutex
 	tokenRefresher   *TokenRefresher
 	refreshSessionMu sync.Mutex
+
+	// 看门狗单例:首次 startTokenRefresh 时拉起,常驻巡检循环活性。
+	tokenRefresherWatchdogStarted bool
 )
 
 // startTokenRefresh 启动定时刷新
@@ -593,6 +606,69 @@ func startTokenRefresh() {
 	tokenRefresher = NewTokenRefresher()
 	if err := tokenRefresher.Start(); err != nil {
 		logger.Warn(fmt.Sprintf("Failed to start token refresher: %v", err))
+	}
+
+	if !tokenRefresherWatchdogStarted {
+		tokenRefresherWatchdogStarted = true
+		go tokenRefresherWatchdogLoop()
+	}
+}
+
+// tokenRefresherWatchdogLoop 常驻巡检刷新循环活性。循环是单 goroutine 同步
+// 消费 tick——楔死时 lastTickAt 停止前进且 IsRunning() 恒真,自愈门
+// (startTokenRefresh 的运行中检查)永远打不开。看门狗是循环之外的独立
+// goroutine,专治这一形态:停摆即告警+重建(Stop 旧实例 + 起新实例;
+// 旧 goroutine 解阻后消费 done 退出,refreshSessionMu 保证过渡期串行)。
+func tokenRefresherWatchdogLoop() {
+	ticker := time.NewTicker(tokenRefreshWatchdogTick)
+	defer ticker.Stop()
+	for range ticker.C {
+		rebuildStalledTokenRefresherIfNecessary()
+	}
+}
+
+// rebuildStalledTokenRefresherIfNecessary 判定当前刷新器是否停摆并重建;
+// 返回是否发生了重建。健康循环直接放行。
+func rebuildStalledTokenRefresherIfNecessary() bool {
+	tr := GetTokenRefresher()
+	if tr == nil || !tr.IsRunning() {
+		return false
+	}
+	lastTick := tr.LastTickAt()
+	if lastTick.IsZero() || time.Since(lastTick) < tokenRefreshStallThreshold {
+		return false
+	}
+
+	logger.Warn(fmt.Sprintf("[TokenRefresher] loop appears wedged: no tick consumed for %s (threshold %s); rebuilding refresher",
+		time.Since(lastTick).Round(time.Second), tokenRefreshStallThreshold))
+	notifyRefreshLivenessAlarm(refresherAlarmRebuilt)
+	StopTokenRefresh()
+	startTokenRefresh()
+	return true
+}
+
+// 刷新器活性告警事件:看门狗重建楔死循环时触发。handlers 层可挂桌面通知。
+const refresherAlarmRebuilt = "token_refresher_rebuilt_stalled_loop"
+
+var (
+	refreshLivenessAlarmMu sync.RWMutex
+	refreshLivenessAlarm   func(event string)
+)
+
+// SetRefreshLivenessAlarmHandler 注册刷新器活性告警回调(如桌面通知)。
+func SetRefreshLivenessAlarmHandler(handler func(event string)) {
+	refreshLivenessAlarmMu.Lock()
+	defer refreshLivenessAlarmMu.Unlock()
+	refreshLivenessAlarm = handler
+}
+
+func notifyRefreshLivenessAlarm(event string) {
+	refreshLivenessAlarmMu.RLock()
+	handler := refreshLivenessAlarm
+	refreshLivenessAlarmMu.RUnlock()
+
+	if handler != nil {
+		handler(event)
 	}
 }
 

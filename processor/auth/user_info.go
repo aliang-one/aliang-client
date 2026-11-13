@@ -54,12 +54,16 @@ const (
 )
 
 type authTokenRecord struct {
-	ID           uint      `gorm:"primaryKey"`
-	AccessToken  string    `gorm:"type:text;not null"`
-	RefreshToken string    `gorm:"type:text"`
-	TokenType    string    `gorm:"type:varchar(32)"`
-	ExpiresIn    int       `gorm:"not null;default:0"`
-	UpdatedAt    time.Time `gorm:"not null"`
+	ID           uint   `gorm:"primaryKey"`
+	AccessToken  string `gorm:"type:text;not null"`
+	RefreshToken string `gorm:"type:text"`
+	TokenType    string `gorm:"type:varchar(32)"`
+	ExpiresIn    int    `gorm:"not null;default:0"`
+	// AnchorAt 续期计时锚=服务端最近一次签发/续期会话的时刻。字段名刻意避开
+	// gorm 的 UpdatedAt 自动时间戳:此前任何落库(哪怕只是同步 profile)都会把
+	// 锚盖成 now,重启后 LoadUserInfo 读回被污染的锚,续期窗口被推到服务端死线
+	// 之后(2026-11-12 登出事故的另一半机理)。列名保持 updated_at,零迁移。
+	AnchorAt time.Time `gorm:"column:updated_at;not null"`
 }
 
 func (authTokenRecord) TableName() string {
@@ -67,18 +71,19 @@ func (authTokenRecord) TableName() string {
 }
 
 type authProfileRecord struct {
-	ID                uint      `gorm:"primaryKey"`
-	UserID            int64     `gorm:"not null;default:0;index"`
-	Email             string    `gorm:"type:varchar(255);index"`
-	Username          string    `gorm:"type:varchar(255)"`
-	Role              string    `gorm:"type:varchar(64)"`
-	Balance           float64   `gorm:"not null;default:0"`
-	Concurrency       int       `gorm:"not null;default:0"`
-	Status            string    `gorm:"type:varchar(64);index"`
-	AllowedGroupsJSON string    `gorm:"column:allowed_groups_json;type:text"`
-	RemoteCreatedAt   string    `gorm:"column:remote_created_at;type:varchar(64)"`
-	RemoteUpdatedAt   string    `gorm:"column:remote_updated_at;type:varchar(64)"`
-	UpdatedAt         time.Time `gorm:"not null"`
+	ID                uint    `gorm:"primaryKey"`
+	UserID            int64   `gorm:"not null;default:0;index"`
+	Email             string  `gorm:"type:varchar(255);index"`
+	Username          string  `gorm:"type:varchar(255)"`
+	Role              string  `gorm:"type:varchar(64)"`
+	Balance           float64 `gorm:"not null;default:0"`
+	Concurrency       int     `gorm:"not null;default:0"`
+	Status            string  `gorm:"type:varchar(64);index"`
+	AllowedGroupsJSON string  `gorm:"column:allowed_groups_json;type:text"`
+	RemoteCreatedAt   string  `gorm:"column:remote_created_at;type:varchar(64)"`
+	RemoteUpdatedAt   string  `gorm:"column:remote_updated_at;type:varchar(64)"`
+	// AnchorAt 同 authTokenRecord:避开 gorm 自动戳,列名保持 updated_at。
+	AnchorAt time.Time `gorm:"column:updated_at;not null"`
 }
 
 func (authProfileRecord) TableName() string {
@@ -118,12 +123,17 @@ func InitializeAuthPersistence() error {
 }
 
 // SaveUserInfo persists the current Sub2API session snapshot.
+//
+// ⚠️ 锚点纪律(2026-11-12 Mac 登出事故的根因):UpdatedAt 是续期计时锚
+// (isTokenExpired:UpdatedAt+ExpiresIn-2h lead),语义=「服务端最近一次签发/
+// 续期会话的时刻」。本函数绝不替调用方改写它——凡不代表服务端延期的本地保存
+// (改资料、同步 profile、落库快照)一旦把锚点拨到 now,续期窗口就被推到服务端
+// 死线之后,ticker 按被污染的锚点「准点」触发、撞零宽限 401 → 粘性登出。
+// 只有 login/refresh/扫码等真·服务端签发路径才允许显式 UpdatedAt=now。
 func SaveUserInfo(info *UserInfo) error {
 	if info == nil {
 		return fmt.Errorf("user info cannot be nil")
 	}
-
-	info.UpdatedAt = time.Now()
 
 	// 内存优先 — 运行时正确性依赖此顺序
 	userInfoMutex.Lock()
@@ -247,7 +257,7 @@ func saveUserInfoWithDB(db *gorm.DB, info *UserInfo) error {
 		RefreshToken: info.RefreshToken,
 		TokenType:    info.TokenType,
 		ExpiresIn:    info.ExpiresIn,
-		UpdatedAt:    info.UpdatedAt,
+		AnchorAt:     info.UpdatedAt,
 	}
 
 	profile := authProfileRecord{
@@ -262,7 +272,7 @@ func saveUserInfoWithDB(db *gorm.DB, info *UserInfo) error {
 		AllowedGroupsJSON: string(allowedGroupsJSON),
 		RemoteCreatedAt:   info.CreatedAt,
 		RemoteUpdatedAt:   info.ProfileUpdated,
-		UpdatedAt:         info.UpdatedAt,
+		AnchorAt:          info.UpdatedAt,
 	}
 
 	return db.Transaction(func(tx *gorm.DB) error {
@@ -314,11 +324,11 @@ func loadUserInfoFromSQLite() (*UserInfo, error) {
 		AllowedGroups:  allowedGroups,
 		CreatedAt:      profile.RemoteCreatedAt,
 		ProfileUpdated: profile.RemoteUpdatedAt,
-		UpdatedAt:      token.UpdatedAt,
+		UpdatedAt:      token.AnchorAt,
 	}
 
 	if info.UpdatedAt.IsZero() {
-		info.UpdatedAt = profile.UpdatedAt
+		info.UpdatedAt = profile.AnchorAt
 	}
 
 	return info, nil
