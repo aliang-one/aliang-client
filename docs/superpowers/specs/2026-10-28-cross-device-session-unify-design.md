@@ -184,6 +184,20 @@ socketEntry 含 writer、角色（remote/local）、订阅集合。两条 socket
 >    上下文可带；审计以 approval_id/decision/ts 为准，来源归属由 PhoneServer DB 审计承担。
 >    **记忆命中放行同样落审计行**（approval_id 用 `session-mem:<匹配键>` 标识），与显式决策同口径。
 
+> **Amendment（2026-11-13，steer 恢复委托——手机实锤场景驱动）：**
+> 5. **场景坐实**：agent 重启/重装升级后内存注册表清空，手机 vibe_sessions 列表照常展示（读磁盘快照），
+>    用户对休眠会话插话命中 `ai.steer` 报 "ai session not found"——同一场景 `ai.message` 走懒建恢复
+>    （§4.3 journal 读回），两条通道语义不一致，违背「磁盘有历史的会话，用户感知只是首回合稍慢」的契约。
+> 6. **steer 恢复委托**：steer 帧命中「注册表无此会话」时查 coreJournal 头行——存在且有 `project_path` →
+>    先发 `steer_revived_as_message` notice + `queued` ack（等 ack 的客户端不把插话标成失败），再把插话
+>    转正为 `ai.message` 帧委托懒建恢复路径：journal 历史装回内存，confirmed 绑定供种 provider 与原生
+>    会话 id，surface/origin 照抄保证回程寻址。委托帧异步执行（`go runCLI`），WS 读循环不被阻塞；
+>    委托调用点已先释放 `m.mu`，无死锁。
+> 7. **边界分流**：journal 无记录 → 保持原 `not_running`（真未知会话不静默造会话）；头行缺 `project_path`
+>    → 显式 `revive_unsupported` 报错（与其拿当前帧路径猜工作目录，不如明确报错）；`attachments` 丢弃
+>    （steer 附件已在上游半物化，与 message 附件管线语义不同，不能二次穿越）；`goal_context` 删除
+>    （防误触发 goal 契约）。内存中存在的会话仍走原 steer 路径，真插话语义不变。
+
 - ChatPage 补 run 中插话：解掉 `sending` 守卫，running 状态（由 WS 事件维护）下提交走 `ai.steer`。
   传输/路由/ack 全现成，纯前端。
 - claude/codex 通道 journal steer 行：在 `steer()` 投递 switch 的 claude/codex 分支补
@@ -202,7 +216,8 @@ socketEntry 含 writer、角色（remote/local）、订阅集合。两条 socket
 | 头行缺失降级 | §4.3 幂等补写头行 |
 
 > （Amendment 见 §4.4——实施期修正共 4 条：CLI steer 行不落、斜杠仅 agentcore、steer ack 广播首版不做、
-> 审计行无 socket 角色字段但记忆命中也落审计。）
+> 审计行无 socket 角色字段但记忆命中也落审计。另见 §4.4 2026-11-13 Amendment：steer 恢复委托，
+> 休眠会话插话自动转正为 message 懒建恢复，对齐 §4.3 语义。）
 
 ## 5. 各仓改动清单
 
