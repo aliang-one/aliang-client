@@ -27,7 +27,7 @@ import (
 )
 
 const (
-	agentTransferDownloadAttempts   = 3              // GET URL 过期重签后的整段尝试上限
+	agentTransferDownloadAttempts   = 3 // GET URL 过期重签后的整段尝试上限
 	agentTransferReceiveRetryDelay  = 2 * time.Second
 	agentTransferReceiveHTTPTimeout = 0 // 不设整体超时：2GB 公网链路靠 ctx cancel（见 D16 讨论）
 )
@@ -287,6 +287,7 @@ func verifyAgentTransferCompletePartial(ident agentTransferIdentity, partialPath
 	}
 	return offset, sum, nil
 }
+
 var errAgentTransferFence = errors.New("transfer path escaped inbox fence")
 
 func downloadAgentTransferPayload(ctx context.Context, s *AgentService, ident agentTransferIdentity, getURL, objectETag, partialPath string, writeJSON func(interface{}) error) (int64, string, error) {
@@ -546,5 +547,3 @@ func sendAgentTransferConfirm(s *AgentService, ident agentTransferIdentity, fina
 		logger.Warn(fmt.Sprintf("[TRANSFER] confirm failed transfer_id=%s err=%v", ident.TransferID, err))
 	}
 }
-
-

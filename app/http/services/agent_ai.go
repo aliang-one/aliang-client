@@ -5114,6 +5114,13 @@ func (m *agentAIManager) runCLI(ctx context.Context, run agentAIRun, writeJSON a
 	// cancel/activity/guard/steer 与待审批一并拆掉。正常路径 session.guard
 	// 就是 run.guard，行为不变。
 	defer m.clearRunning(run.sessionID, run.runSeq, writeJSON, run.guard)
+	// 开跑先给云端把订阅订上（2026-11-12 视频会话事故）：本函数是 message()/
+	// optionResponse() 全 provider（claude/codex/agentcore）的统一 run 入口，
+	// 桌面-origin 的回合在 App interest 过期后云端已不在订阅名单——不订回来，
+	// ai.run.started 根本到不了云端，服务端自证认领（PhoneServer 8d8f790）
+	// 拿不到触发帧，云端 run_state 永卡终态。同 goroutine 内先订阅后写帧，
+	// 扇出首帧必然看见订阅。离线时 no-op，重连由活跃 run 补订阅兜底。
+	m.ensureRemoteAISessionSubscribed(run.sessionID)
 	if run.cancel != nil {
 		defer run.cancel()
 	}

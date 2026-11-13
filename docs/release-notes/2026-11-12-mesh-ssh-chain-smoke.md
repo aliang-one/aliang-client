@@ -8,7 +8,7 @@
 
 - `GET /api/mesh/status`:本机 `device_id`、peers 可达性、**`effective` 字段**(编译后真实生效值)、peers[].host_key 回读。**判定口诀:规则在但 `effective` 里没有 = 密钥没填齐**(§14.2 第 2/3/6 步漏项),不会报错、不会弹窗。
 - B 侧 debug 日志(需开 debug 级):`SSH ingress mesh-exit injected conn_id=… from=<A-deviceID> target=<host>:<port>` 是注入成功的直接证据;`SSH ingress mesh-exit rejected (…)` 是注入被拒。
-- A 侧连接日志:命中 mesh 规则的连接会带 `Route=RouteMesh`(兜底改道带 `Route=RouteMeshFallback`),据此确认本机规则命中面。
+- A 侧连接日志:命中 mesh 规则的连接带 `Route=RouteMesh`;出口链路委托带 `Route=RouteMeshDelegate`,据此确认命中面与委托面。
 
 ## 准备:双机升级 + 七步密钥动作
 
@@ -87,21 +87,21 @@
 2. B 侧 WARN 记账「piko 连入但 ingress 未运行」 → B 的 `ssh_ingress` 未开或代理停了(统一口形态下 mesh 入站随代理运行态启停);
 3. 降级后偶发失败 → piko 载体首包握手超时(A 侧 deadline 保护),重试应恢复;持续失败查平台 relay 通道。
 
-## 冒烟 5:离线兜底(断平台,fallback 生效)
+## 冒烟 5:出口链路(开关驱动,常驻委托——不再断平台验证)
 
-**配置(A 侧)**:`fallback.addr` 已改填 **B 的 IP:56432**(SSH 入口,不是旧 mesh 监听口)+ `fallback.host_key` 已填;失败策略使用 `fallback:<B>`(如规则 `x.com,mesh:<B>,fallback:<B>`)。
+**配置(A 侧)**:组网卡「出口链路」卡开关打开、下一跳选 **B**(B 须已在 peers 且已钉扎 host_key;地址与指纹从 peers 条目继承,不再单独填)。可选:配置一条规则 `x.com,mesh:<B>` 验证规则路径零变化。
 
-**操作**:断开 A 与平台的连接(断平台 WS/离线状态),再发起 x.com 流量。
+**操作**:直接发起 AI 对话(x.com 规则流量与 AI 流各来一次),**A 不需要断平台**——开关=无条件委托,在线也走 B。
 
 **预期现象**:
-- A 侧日志:mesh 主路径失败后走兜底,`Route=RouteMeshFallback`,兜底拨号目标为 B 的 `IP:56432`;
-- B 侧:mesh-exit injected 日志照常出现(兜底同样走 SSH 入口注入);
-- A 恢复平台连接后回归主路径(Route=RouteMesh)。
+- A 侧 AI 流日志:`Route=RouteMeshDelegate`(委托给 B 出 B 的隧道);规则流量照旧 `Route=RouteMesh`(开关不影响规则路径);
+- B 侧:mesh-exit injected 日志照常出现,AI 流在 B 就地处理(RouteToALiang 走 B 的隧道);若 B 也开了开关且下一跳是 C,则 B 日志再出现一次 `Route=MeshDelegate`(链式推进),C 侧落地;
+- A 关掉开关:AI 流回归 `Route=RouteToALiang`(A 自己的隧道),零残留。
 
 **若失败的排查锚点**:
-1. 兜底必不通 → `fallback.addr` 还指着旧 mesh 监听口(旧值不改必不通)或缺 `fallback.host_key`(空=fail-closed);
-2. 兜底被拒连 → B 的 SSH host key 换过而 A 的 `fallback.host_key` 未同步,取 B「SSH 入口」卡片指纹更新;
-3. 主路径恢复但兜底仍被优先选中 → 检查 A 侧离线判定与 `MeshFallbackActiveForClass` 的类别矩阵(custom 类别有收窄),核对规则尾段失败策略拼写。
+1. 委托必不通 → B 的 `host_key` 缺失/过期(空=fail-closed,开关开了也不生效;A 组网卡下一跳下拉会标「未绑对端指纹」),取 B「SSH 入口」卡片指纹更新 peers 条目;
+2. 开关开了但 AI 流仍走本机隧道 → 检查 `fallback.enable` 是否真的落盘(`/api/config/customer` 回读 mesh.fallback.next_hop 非空);
+3. 链上第二跳不动 → 中间节点未开开关(链在那台就地终止,属预期);或 `max_hops` 已到上限(经停链长,默认 5)。
 
 ---
 

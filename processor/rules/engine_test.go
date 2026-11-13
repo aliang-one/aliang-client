@@ -40,7 +40,7 @@ func newBindingTestEngine() *RuleEngine {
 // default 会把 mesh 连接缓存成 RouteDirect——EvaluateRoute 现虽休眠,复活
 // 即静默绕过 mesh 规则把后续同名连接直连出去。
 func TestStoreBindingSkipsMeshRoutedConnections(t *testing.T) {
-	for _, route := range []string{"RouteToNode", "RouteMeshFallback"} {
+	for _, route := range []string{"RouteToNode", "RouteMeshDelegate"} {
 		engine := newBindingTestEngine()
 		engine.StoreBinding(meshBindingMetadata(t, route))
 		if _, hit := engine.ipDomainCache.GetByDomain("mesh-bound.example"); hit {

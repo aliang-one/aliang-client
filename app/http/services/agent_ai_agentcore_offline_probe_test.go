@@ -1,11 +1,11 @@
 package services
 
-// AI 上游探针离线降级测试(计划 Task 12,design §9.4):离线 mesh 改道激活
-// 时 agentCoreEnsureUpstream 跳过上游可达性探针(不拨回环探针、不触发自愈
-// 拉起)——离线场景下探针要么误报 upstream 不可达拒跑 AI,要么拉起一个
-// 没有平台出口的本地代理;改道后真实链路经 mesh 兜底节点,可达性由数据面
-// 拨号失败语义天然兜底。在线时探针行为保持现状。判定与数据面改道同源同
-// 真假:直接调 processor/tcp.MeshOfflineAIRedirectActive(同一函数)。
+// AI 上游探针降级测试(2026-11-12 出口链路改造,替代离线降级):出口链路
+// 委托激活时 agentCoreEnsureUpstream 跳过上游可达性探针(不拨回环探针、
+// 不触发自愈拉起)——委托激活时 AI 流量的真实出网路径是链上下一跳,本机
+// 探针结果不再反映实际路径:要么误报 upstream 不可达拒跑 AI,要么拉起一个
+// 没有平台出口的本地代理;委托关闭时探针行为保持现状。判定与数据面改道
+// 同源同真假:直接调 processor/tcp.MeshDelegateActive(同一函数)。
 
 import (
 	"context"
@@ -13,14 +13,13 @@ import (
 	"testing"
 	"time"
 
-	"aliang.one/nursorgate/outbound/meshproto"
 	"aliang.one/nursorgate/processor/config"
 	"aliang.one/nursorgate/processor/tcp"
 )
 
-// setAgentCoreOfflineProbeEnv 组装探针测试环境:回环探针目标(listener,
-// accept 即「探针拨过」)+ AI 类兜底勾选配置 + 指定离线信号真值。
-func setAgentCoreOfflineProbeEnv(t *testing.T) (accepted chan net.Conn) {
+// setAgentCoreDelegateProbeEnv 组装探针测试环境:回环探针目标(listener,
+// accept 即「探针拨过」)+ 出口链路开关开配置。
+func setAgentCoreDelegateProbeEnv(t *testing.T) (accepted chan net.Conn) {
 	t.Helper()
 
 	config.ResetGlobalConfigForTest()
@@ -46,26 +45,26 @@ func setAgentCoreOfflineProbeEnv(t *testing.T) (accepted chan net.Conn) {
 	// agentCoreBaseURL 原样采用本值,探针是否拨过由 accept 观测)。
 	t.Setenv("ANTHROPIC_BASE_URL", "http://"+ln.Addr().String())
 
-	// AI 类离线兜底勾选(改道激活的配置半边;信号半边由 swap 注入)。
-	// SSHIngress 必须一并开启(SPEC §10.3 依赖门,c5f2879 起
-	// MeshEffectivelyEnabled 追加 SSHIngress 检查):夹具只配 Mesh 块时
-	// MeshOfflineAIRedirectActive 恒假,本文件全部用例随之失真。
+	// 出口链路开关开(委托激活的配置半边):next_hop 指向已钉扎 peer。
+	// SSHIngress 必须一并开启(SPEC §10.3 依赖门):夹具只配 Mesh 块时
+	// MeshDelegateActive 恒假,本文件全部用例随之失真。
 	config.SetGlobalConfig(&config.Config{
 		Customer: &config.CustomerConfig{
 			SSHIngress: &config.SSHIngressConfig{
 				Enable: boolPtr(true),
 			},
 			Mesh: &config.MeshConfig{
+				Peers: []config.MeshPeer{
+					{DeviceID: "dev-b", LANAddrs: []string{"192.168.1.9:56432"}, HostKey: "SHA256:AAAA"},
+				},
 				Fallback: &config.MeshFallbackConfig{
 					Enable:  boolPtr(true),
-					Addr:    "192.168.1.9:56440",
-					Classes: []string{meshproto.ClassAI},
+					NextHop: "dev-b",
 				},
 			},
 		},
 	})
 
-	t.Cleanup(func() { tcp.SetMeshOfflineSignal(nil) })
 	return accepted
 }
 
@@ -89,33 +88,44 @@ func expectProbeNotDialed(t *testing.T, accepted chan net.Conn, what string) {
 	}
 }
 
-// TestAIUpstreamProbeSkippedWhenOfflineMeshActive 离线激活 →
-// agentCoreEnsureUpstream 直接通过(探针未拨);在线 → 现状探针(探针拨到
-// 回环目标)。
-func TestAIUpstreamProbeSkippedWhenOfflineMeshActive(t *testing.T) {
-	t.Run("离线激活跳过探针", func(t *testing.T) {
-		accepted := setAgentCoreOfflineProbeEnv(t)
-		tcp.SetMeshOfflineSignal(func() bool { return true })
+// TestAIUpstreamProbeSkippedWhenDelegateActive 委托激活 →
+// agentCoreEnsureUpstream 直接通过(探针未拨);委托关闭 → 现状探针(探针
+// 拨到回环目标)。
+func TestAIUpstreamProbeSkippedWhenDelegateActive(t *testing.T) {
+	t.Run("委托激活跳过探针", func(t *testing.T) {
+		accepted := setAgentCoreDelegateProbeEnv(t)
 
-		if !tcp.MeshOfflineAIRedirectActive() {
-			t.Fatal("离线+AI 兜底勾选时改道判定应为真(前置自检)")
+		if !tcp.MeshDelegateActive() {
+			t.Fatal("开关开 + next_hop 齐备时委托判定应为真(前置自检)")
 		}
 		if err := agentCoreEnsureUpstream(context.Background()); err != nil {
-			t.Fatalf("agentCoreEnsureUpstream() = %v, want 离线激活直接通过", err)
+			t.Fatalf("agentCoreEnsureUpstream() = %v, want 委托激活直接通过", err)
 		}
-		expectProbeNotDialed(t, accepted, "离线激活时探针")
+		expectProbeNotDialed(t, accepted, "委托激活时探针")
 	})
 
-	t.Run("在线保持现状探针", func(t *testing.T) {
-		accepted := setAgentCoreOfflineProbeEnv(t)
-		tcp.SetMeshOfflineSignal(func() bool { return false })
+	t.Run("委托关闭保持现状探针", func(t *testing.T) {
+		accepted := setAgentCoreDelegateProbeEnv(t)
+		// 关掉开关(fallback.enable=false):委托判定翻假,探针恢复现状。
+		swapGlobalCustomerMeshFallback(t, false)
 
-		if tcp.MeshOfflineAIRedirectActive() {
-			t.Fatal("在线时改道判定应为假(前置自检)")
+		if tcp.MeshDelegateActive() {
+			t.Fatal("开关关时委托判定应为假(前置自检)")
 		}
 		if err := agentCoreEnsureUpstream(context.Background()); err != nil {
-			t.Fatalf("agentCoreEnsureUpstream() = %v, want 在线探针可达通过", err)
+			t.Fatalf("agentCoreEnsureUpstream() = %v, want 委托关闭探针可达通过", err)
 		}
-		expectProbeDialed(t, accepted, "在线时探针")
+		expectProbeDialed(t, accepted, "委托关闭时探针")
 	})
+}
+
+// swapGlobalCustomerMeshFallback 翻转当前全局配置里出口链路开关(读-改-写,
+// 供「关闭态」对照用例在夹具之上做最小变异;测试非并行,直接换全局安全)。
+func swapGlobalCustomerMeshFallback(t *testing.T, enable bool) {
+	t.Helper()
+	cfg := config.GetGlobalConfig()
+	off := enable
+	cfg.Customer.Mesh.Fallback.Enable = &off
+	config.SetGlobalConfig(cfg)
+	t.Cleanup(func() {})
 }

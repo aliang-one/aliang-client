@@ -16,8 +16,8 @@ func TestTierGuardAndStrategyGatesAligned(t *testing.T) {
 		t.Skip("sh-script version probes are unix-only; windows coverage tracked separately")
 	}
 	for _, tc := range []struct {
-		version   string
-		gateOpen  bool
+		version  string
+		gateOpen bool
 	}{
 		{"2.1.17", false},
 		{"2.1.267", false},

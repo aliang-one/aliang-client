@@ -504,6 +504,10 @@ func (m *agentAIManager) runTUITurn(ctx context.Context, session *agentAISession
 		Role: "user", MessageID: run.messageID, Content: content, CreatedAt: time.Now().UTC(),
 	})
 	m.mu.Unlock()
+	// 与 runCLI 同款开跑订阅（2026-11-12 视频会话事故）：TUI 注入回合的
+	// ai.run.started 同样只经订阅扇出达云端，App interest 过期后云端已不在
+	// 订阅名单——不订回来，started 帧蒸发，云端 run_state 永卡上一轮终态。
+	m.ensureRemoteAISessionSubscribed(session.id)
 	defer m.clearTUITurnSessionState(session)
 	// 停止语义：ctx 取消时对 TUI pid 发一次 SIGINT（=一次 Esc，TUI 保持打开）。
 	defer func() {

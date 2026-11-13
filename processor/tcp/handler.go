@@ -485,22 +485,22 @@ func (h *TCPConnectionHandler) handleNonTLS(
 	metadata *M.Metadata,
 ) (remoteConn net.Conn, newOriginConn net.Conn, err error) {
 	if shouldForceAliangRoute(metadata) {
-		// AI 离线改道(计划 Task 12,design §2 行11/§9.4):平台隧道不可达
-		// (离线信号真)且 AI 类离线兜底勾选时,命中从 RouteToALiang 改判
-		// mesh 兜底节点(专用兜底 peer,经 mesh 转发,B 侧把它当普通入站
-		// 连接处理后出其自己的隧道)。在线/未勾选/总开关关 → 判定不通过,
-		// 保持原路由(在线行为零变化)。连接语义:该连接是 56432 回环 AI
-		// 流,继承帧头不存在(链头),mesh 出口按 56432 判据推断 Fresh
-		// header Class=ai;originConn 裸透传返回——wrapAliangHTTPConnByProto
-		// 的 HTTP/2 改包逻辑只适用于 aliang 隧道,mesh 直转路径不套用。
-		// 兜底节点也不可达时如实失败:离线下原路由(RouteToALiang)本就
-		// 拨不通,不再叠加一次注定失败的隧道拨号,错误交由 AI 客户端重试。
-		if fbAddr, redirect := meshOfflineRedirectForAI(metadata); redirect {
-			remote, dialErr := h.dialMeshFallbackNode(ctx, metadata, fbAddr)
+		// 出口链路委托(2026-11-12,替代离线兜底):开关开(toggle=常驻
+		// 语义,不按本机能否直连平台做限制)且链守卫通过(via 防环/防放大)
+		// 时,56432 AI 流改判 mesh 委托——交给链上下一跳,由链的末端设备
+		// 出它自己的隧道;下一跳也开着就继续往前链,直到某台未启用的设备
+		// 就地处理。守卫命中(回环/达上限)→ 保持原路由就地处理(链的
+		// 终点语义,不报错)。连接语义:该连接是 56432 回环 AI 流,继承帧
+		// 头不存在(链头),mesh 出口按 56432 判据推断 Fresh header
+		// Class=ai;originConn 裸透传返回——wrapAliangHTTPConnByProto 的
+		// HTTP/2 改包逻辑只适用于 aliang 隧道,mesh 委托路径不套用。委托
+		// 拨号失败如实失败(开关=出口完全依赖下一跳,发布说明已写明取舍),
+		// 不再叠加一次注定失败的本地隧道拨号,错误交由 AI 客户端重试。
+		if h.meshDelegateEligible(metadata) {
+			remote, dialErr := h.dialViaMeshDelegate(ctx, metadata)
 			if dialErr != nil {
-				return nil, originConn, fmt.Errorf("mesh: offline AI redirect to fallback node %s failed: %w", fbAddr, dialErr)
+				return nil, originConn, fmt.Errorf("mesh: delegate AI flow to next hop failed: %w", dialErr)
 			}
-			metadata.Route = "RouteMeshFallback"
 			return remote, originConn, nil
 		}
 		metadata.Route = "RouteToALiang"
@@ -538,12 +538,20 @@ func (h *TCPConnectionHandler) handleNonTLS(
 
 		route, _ := h.tlsHandler.DetermineRouteWithContext(metadata)
 		logger.Debug(fmt.Sprintf("HTTP: Route decision for host=%s ip=%s: %v", metadata.HostName, metadata.DstIP, route))
+		if route == RouteToALiang {
+			remote, dialErr := h.dialAliangOrDelegate(ctx, metadata)
+			if dialErr != nil {
+				return nil, newOriginConn, dialErr
+			}
+			if metadata.Route == "RouteMeshDelegate" {
+				// 委托连接是到目标的原始流,不套 aliang HTTP/2 改包
+				return remote, newOriginConn, nil
+			}
+			return remote, h.wrapAliangHTTPConnByProto(newOriginConn, metadata.AppProto), nil
+		}
 		remote, dialErr := h.dialByRoute(ctx, metadata, route)
 		if dialErr != nil {
 			return nil, newOriginConn, dialErr
-		}
-		if route == RouteToALiang {
-			return remote, h.wrapAliangHTTPConnByProto(newOriginConn, metadata.AppProto), nil
 		}
 		return remote, newOriginConn, nil
 	}
@@ -551,6 +559,10 @@ func (h *TCPConnectionHandler) handleNonTLS(
 	h.enrichMetadataFromReverseLookup(ctx, metadata)
 	route, _ := h.tlsHandler.DetermineRouteWithContext(metadata)
 	logger.Debug(fmt.Sprintf("TCP: Route decision for host=%s ip=%s (non-HTTP payload): %v", metadata.HostName, metadata.DstIP, route))
+	if route == RouteToALiang {
+		remote, dialErr := h.dialAliangOrDelegate(ctx, metadata)
+		return remote, newOriginConn, dialErr
+	}
 	remote, dialErr := h.dialByRoute(ctx, metadata, route)
 	return remote, newOriginConn, dialErr
 }
@@ -1426,10 +1438,10 @@ func logMeshDialCarrier(connID, deviceID string, trace meshproxy.DialTrace) {
 //
 // 单跳模型(SPEC §6.2):中间跳续传已随帧协议退役——B 注入连接被顶部
 // MeshInjected 守卫拦截,不可能走到本函数的 mesh 拨出,失败策略只属于链头。
-// 链头失败路径顺序:一、离线兜底(customer.mesh.Fallback 显式使能且类别
-// 勾选;兜底地址指对端 SSH 入口 56432,经 DialMeshAddr 走 SSH,LAN-only 单
-// 载体);二、规则失败策略——缺省/direct 回落直连、deny 拒绝连接、
-// fallback:<id2> 拨指定节点(限一次,不再链式,防策略链)。
+// 链头失败路径:规则失败策略——缺省/direct 回落直连、deny 拒绝连接、
+// fallback:<id2> 拨指定节点(限一次,不再链式,防策略链)。旧「离线兜底」
+// 段已随出口链路改造移除(2026-11-12):toAliang/平台出口的改道由开关驱动
+// (mesh_delegate.go),规则流量不再叠加兜底段。
 func (h *TCPConnectionHandler) dialViaMesh(ctx context.Context, metadata *M.Metadata) (net.Conn, error) {
 	if metadata.MeshInjected {
 		return nil, fmt.Errorf("%w (route=%s)", errMeshInjectedLoop, metadata.Route)
@@ -1455,18 +1467,7 @@ func (h *TCPConnectionHandler) dialViaMesh(ctx context.Context, metadata *M.Meta
 	logger.Warn(fmt.Sprintf("[MESH-OUT] conn_id=%s dial to %s failed, executing head failure policy (policy=%q): %v",
 		ensureTCPConnID(metadata), deviceID, policy, peerErr))
 
-	// 一、离线兜底(位于规则失败策略之前,SPEC §7.2/design §9.4 定死)。
-	if fbAddr, allowed := meshFallbackAddrForClass(ctx, metadata); allowed {
-		conn, err := h.dialMeshFallbackNode(ctx, metadata, fbAddr)
-		if err == nil {
-			metadata.Route = "RouteMeshFallback"
-			return conn, nil
-		}
-		logger.Warn(fmt.Sprintf("[MESH-OUT] conn_id=%s mesh fallback node %s failed, continuing to failure policy: %v",
-			ensureTCPConnID(metadata), fbAddr, err))
-	}
-
-	// 二、规则失败策略(缺省 = direct)。
+	// 规则失败策略(缺省 = direct)。
 	switch policy {
 	case "", config.MeshPolicyDirect:
 		metadata.Route = "RouteDirect"
@@ -1563,39 +1564,15 @@ func (h *TCPConnectionHandler) getMeshExitForExecution(deviceID string) (*meshpr
 	return nil, fmt.Errorf("mesh: peer %q not found in customer.mesh.peers", deviceID)
 }
 
-// meshFallbackAddrForClass 离线兜底可用性判定(SPEC §7.2 兜底式),统一
-// 抽取为共享助手 config.MeshFallbackActiveForClass(计划 Task 12 评审钉死):
-// EffectiveEnabled 总开关 + Fallback.Enable + 类别勾选 + Addr 非空——总开关
-// 检查是抽取时补上的穿透缺口(原实现缺此检查)。类别口径复用 mesh 出口
-// 推断(56432 回环 → ai,其余 custom;self 类由 egress 发起点显式指定,
-// 同一助手自动覆盖)。离线信号不在此层:本闸消费的是 dialViaMesh 链头失败
-// 路径(对端不可达),与离线改道(AI 流量)的信号驱动判定互相独立。
-func meshFallbackAddrForClass(ctx context.Context, md *M.Metadata) (string, bool) {
-	class := meshproxy.InferClass(ctx, md)
-	return config.MeshFallbackActiveForClass(config.GetGlobalConfig(), class)
-}
-
-// dialMeshFallbackNode 拨离线兜底节点:兜底地址现指对端 SSH 入口 56432
-// (SPEC §7.2——旧值指向已删除的 mesh 监听口,发布说明必写),经
-// DialMeshAddr 走 SSH(LAN-only 单载体)。本机身份 = customer.mesh.
-// private_key(兜底路径拨号频率低,构造期解析私钥可接受,不缓存)。
-// 失败返回错误,由调用方继续走规则失败策略(兜底也失败才走失败策略)。
-func (h *TCPConnectionHandler) dialMeshFallbackNode(ctx context.Context, metadata *M.Metadata, addr string) (net.Conn, error) {
-	if metadata.MeshInjected {
-		return nil, fmt.Errorf("%w (route=%s)", errMeshInjectedLoop, metadata.Route)
+// dialAliangOrDelegate 出口链路的 toAliang 类委托入口(明文形态专属):
+// 仅 AI 分支与非 TLS 明文路径调用本函数。TLS/MITM 路径(resolveTLSRoute)
+// 本地已解密,委托载体要求「到目标的原始流」——TLS 流量不适用委托(与旧
+// 离线兜底行为一致),仍走本机隧道。守卫不通过(开关关/回环/达上限)→
+// dialByRoute 走本机隧道:开关关即旧行为零变化;回环/达上限即本机是链的
+// 终点,就地处理。
+func (h *TCPConnectionHandler) dialAliangOrDelegate(ctx context.Context, metadata *M.Metadata) (net.Conn, error) {
+	if h.meshDelegateEligible(metadata) {
+		return h.dialViaMeshDelegate(ctx, metadata)
 	}
-	cfg := config.GetGlobalConfig()
-	if cfg == nil || cfg.Customer == nil || cfg.Customer.Mesh == nil {
-		return nil, fmt.Errorf("mesh: customer.mesh not configured (fallback %s)", addr)
-	}
-	meshCfg := cfg.Customer.Mesh
-	signer, err := meshproxy.SignerFromPEM(meshCfg.PrivateKey, meshCfg.KeyPassphrase)
-	if err != nil {
-		return nil, fmt.Errorf("mesh: fallback identity key: %w", err)
-	}
-	payload := meshproxy.ExitPayloadForMetadata(metadata)
-	if payload == nil {
-		return nil, meshproxy.ErrUnbuildableTarget()
-	}
-	return meshproxy.DialMeshAddr(ctx, addr, config.MeshFallbackHostKey(cfg), signer, payload)
+	return h.dialByRoute(ctx, metadata, RouteToALiang)
 }

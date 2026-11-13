@@ -29,9 +29,10 @@ const meshExitMaxExtra = 512
 // meshExitTarget 是 mesh-exit ExtraData 的解码形态(t=tcp 带 h/p;t=dns 无
 // 其它字段,SPEC §4.1)。
 type meshExitTarget struct {
-	T string `json:"t"`
-	H string `json:"h"`
-	P uint16 `json:"p"`
+	T   string   `json:"t"`
+	H   string   `json:"h"`
+	P   uint16   `json:"p"`
+	Via []string `json:"v,omitempty"` // 出口链路经停链(与出口侧 exitMeta.v 同形)
 }
 
 // handleMeshExitChannel 是 mesh form 的 channel 分派:ExtraData cap →
@@ -98,7 +99,8 @@ func injectMeshExitStream(ctx context.Context, ch gossh.Channel, connRemote net.
 		HostName:     tgt.H, // ExtraData 里的 h(已拆端口)
 		DstPort:      tgt.P,
 		Route:        tcphandler.RouteMesh, // 决策前统计口径(SPEC §4.1 附注)
-		MeshInjected: true,                 // §6.2 环路守卫,不被决策覆写
+		MeshInjected: true,                 // §6.2 注入溯源,不被决策覆写
+		MeshVia:      tgt.Via,              // 出口链路经停链(委托再上链时防环判定读它)
 	}
 	md.SrcIP, md.SrcPort = netAddrToIPPort(connRemote)
 

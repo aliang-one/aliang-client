@@ -4,13 +4,13 @@ package tcp
 //   - getMeshExitForExecution 缓存键命中/失效(改私钥/换钉扎/换 relay → 重建,
 //     LANAddrs 顺序无关);
 //   - dialViaMesh 链头失败策略(缺省 direct/deny/fallback:<id2> 限一次)与
-//     兜底位次(先兜底后失败策略;兜底经 DialMeshAddr 走 SSH,须真 sshd);
-//   - AI 流量离线改道(Task 12/design §2 行11/§9.4,判定在 route_override.go,
-//     执行落点在本文件的 handleNonTLS 分支)。
+//     「规则流量无兜底段」钉子(出口链路改造后,委托语义不作用于规则路径);
+//   - AI 流量出口链路委托(2026-11-12 替代离线改道,判定/守卫在
+//     mesh_delegate.go,执行落点在本文件的 handleNonTLS 分支)。
 //
-// 注入连接防环守卫见 mesh_guard_test.go;单跳模型下不再有中间跳续传路径
-// (B 注入连接被 MeshInjected 守卫拦截,SPEC §6.2),旧帧语义用例已随
-// Peer 出口退役。
+// 注入连接防环(链守卫:via 含自己/达上限 → 就地处理)见 mesh_guard_test.go;
+// 链式转发的推进=注入连接再上链(守卫放行时),旧单跳拦截语义已被链守卫
+// 取代。
 
 import (
 	"bytes"
@@ -78,14 +78,14 @@ func swapMeshTransportDialSource(t *testing.T, fn func() meshproxy.PikoDialFunc)
 	t.Cleanup(func() { SetMeshTransportDialSource(orig) })
 }
 
-// setMeshDialConfig 隔离配置:mesh 层(peers/兜底,自动携带真身份私钥)+
+// setMeshDialConfig 隔离配置:mesh 层(peers,自动携带真身份私钥)+
 // SSH 入口显式开(MeshEffectivelyEnabled 的依赖降级判据,不补则出口恒降级,
-// 用例会被误吞)。
-func setMeshDialConfig(t *testing.T, keyPEM string, peers []config.MeshPeer, fallback *config.MeshFallbackConfig) {
+// 用例会被误吞)。出口链路开关配置由各用例经 setMeshDelegateConfig 单独装配。
+func setMeshDialConfig(t *testing.T, keyPEM string, peers []config.MeshPeer) {
 	t.Helper()
 	config.SetGlobalConfig(&config.Config{
 		Customer: &config.CustomerConfig{
-			Mesh:       &config.MeshConfig{PrivateKey: keyPEM, Peers: peers, Fallback: fallback},
+			Mesh:       &config.MeshConfig{PrivateKey: keyPEM, Peers: peers},
 			SSHIngress: &config.SSHIngressConfig{Enable: boolPtr(true)},
 		},
 	})
@@ -295,7 +295,7 @@ func TestGetMeshExitCacheHitSameInstance(t *testing.T) {
 	keyPEM := newMeshDialTestEnv(t)
 	setMeshDialConfig(t, keyPEM, []config.MeshPeer{
 		{DeviceID: "dev-b", LANAddrs: []string{"192.168.1.20:56432"}, HostKey: "SHA256:AAAA"},
-	}, nil)
+	})
 
 	handler := NewTCPConnectionHandler(NewDefaultProtocolDetector(), NewDefaultTLSHandler(), nil, nil)
 	first, err := handler.getMeshExitForExecution("dev-b")
@@ -318,7 +318,7 @@ func TestGetMeshExitCacheHitSameInstance(t *testing.T) {
 func TestGetMeshExitCacheInvalidatesOnKeyRotate(t *testing.T) {
 	keyPEM := newMeshDialTestEnv(t)
 	peer := []config.MeshPeer{{DeviceID: "dev-b", LANAddrs: []string{"192.168.1.20:56432", "192.168.1.21:56432"}, HostKey: "SHA256:AAAA"}}
-	setMeshDialConfig(t, keyPEM, peer, nil)
+	setMeshDialConfig(t, keyPEM, peer)
 
 	handler := NewTCPConnectionHandler(NewDefaultProtocolDetector(), NewDefaultTLSHandler(), nil, nil)
 	orig, err := handler.getMeshExitForExecution("dev-b")
@@ -330,7 +330,7 @@ func TestGetMeshExitCacheInvalidatesOnKeyRotate(t *testing.T) {
 	rotatedPEM := testMeshIdentityPEM(t)
 
 	t.Run("LANAddrs顺序无关", func(t *testing.T) {
-		setMeshDialConfig(t, keyPEM, []config.MeshPeer{{DeviceID: "dev-b", LANAddrs: []string{"192.168.1.21:56432", "192.168.1.20:56432"}, HostKey: "SHA256:AAAA"}}, nil)
+		setMeshDialConfig(t, keyPEM, []config.MeshPeer{{DeviceID: "dev-b", LANAddrs: []string{"192.168.1.21:56432", "192.168.1.20:56432"}, HostKey: "SHA256:AAAA"}})
 		got, err := handler.getMeshExitForExecution("dev-b")
 		if err != nil {
 			t.Fatalf("getMeshExitForExecution: %v", err)
@@ -341,7 +341,7 @@ func TestGetMeshExitCacheInvalidatesOnKeyRotate(t *testing.T) {
 	})
 
 	t.Run("换钉扎重建", func(t *testing.T) {
-		setMeshDialConfig(t, keyPEM, []config.MeshPeer{{DeviceID: "dev-b", LANAddrs: peer[0].LANAddrs, HostKey: "SHA256:BBBB"}}, nil)
+		setMeshDialConfig(t, keyPEM, []config.MeshPeer{{DeviceID: "dev-b", LANAddrs: peer[0].LANAddrs, HostKey: "SHA256:BBBB"}})
 		got, err := handler.getMeshExitForExecution("dev-b")
 		if err != nil {
 			t.Fatalf("getMeshExitForExecution: %v", err)
@@ -353,7 +353,7 @@ func TestGetMeshExitCacheInvalidatesOnKeyRotate(t *testing.T) {
 	})
 
 	t.Run("改私钥重建", func(t *testing.T) {
-		setMeshDialConfig(t, rotatedPEM, peer, nil)
+		setMeshDialConfig(t, rotatedPEM, peer)
 		got, err := handler.getMeshExitForExecution("dev-b")
 		if err != nil {
 			t.Fatalf("getMeshExitForExecution: %v", err)
@@ -368,7 +368,7 @@ func TestGetMeshExitCacheInvalidatesOnKeyRotate(t *testing.T) {
 		// Relay 布尔进 CacheKey:翻转 = 中继载体从 Transport 切片增删,
 		// 缓存里的旧切片不得复用。与 orig(= rotatedPEM+AAAA+relay 默认
 		// 放行)只差 Relay 一个分量。
-		setMeshDialConfig(t, rotatedPEM, []config.MeshPeer{{DeviceID: "dev-b", LANAddrs: peer[0].LANAddrs, HostKey: "SHA256:AAAA", Relay: boolPtr(false)}}, nil)
+		setMeshDialConfig(t, rotatedPEM, []config.MeshPeer{{DeviceID: "dev-b", LANAddrs: peer[0].LANAddrs, HostKey: "SHA256:AAAA", Relay: boolPtr(false)}})
 		got, err := handler.getMeshExitForExecution("dev-b")
 		if err != nil {
 			t.Fatalf("getMeshExitForExecution: %v", err)
@@ -405,14 +405,14 @@ func TestGetMeshExitUnbuildableCases(t *testing.T) {
 	})
 
 	t.Run("缺私钥", func(t *testing.T) {
-		setMeshDialConfig(t, "   ", peer, nil)
+		setMeshDialConfig(t, "   ", peer)
 		if _, err := handler.getMeshExitForExecution("dev-b"); err == nil || !strings.Contains(err.Error(), "private_key") {
 			t.Fatalf("缺私钥应报错且指明 private_key, got: %v", err)
 		}
 	})
 
 	t.Run("peer不存在", func(t *testing.T) {
-		setMeshDialConfig(t, keyPEM, peer, nil)
+		setMeshDialConfig(t, keyPEM, peer)
 		if _, err := handler.getMeshExitForExecution("dev-nope"); err == nil {
 			t.Fatal("peer 不存在应报错")
 		}
@@ -427,7 +427,7 @@ func TestGetMeshExitUnbuildableCases(t *testing.T) {
 // 在 -race 下必须干净。
 func TestMeshTransportDialSeamConcurrentSetAndRead(t *testing.T) {
 	keyPEM := newMeshDialTestEnv(t)
-	setMeshDialConfig(t, keyPEM, []config.MeshPeer{{DeviceID: "dev-b", Relay: boolPtr(true)}}, nil)
+	setMeshDialConfig(t, keyPEM, []config.MeshPeer{{DeviceID: "dev-b", Relay: boolPtr(true)}})
 
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
@@ -521,7 +521,7 @@ func TestDetermineRouteWithContext_MeshDecisionBecomesRouteToNode(t *testing.T) 
 func TestDialByRouteMeshNodeUnreachableFallsBackDirect(t *testing.T) {
 	keyPEM := newMeshDialTestEnv(t)
 	directAddr, accepted := startAcceptedListener(t)
-	setMeshDialConfig(t, keyPEM, []config.MeshPeer{{DeviceID: "dev-b", LANAddrs: []string{closedMeshAddr(t)}}}, nil)
+	setMeshDialConfig(t, keyPEM, []config.MeshPeer{{DeviceID: "dev-b", LANAddrs: []string{closedMeshAddr(t)}}})
 
 	handler := NewTCPConnectionHandler(NewDefaultProtocolDetector(), NewDefaultTLSHandler(), nil, nil)
 	md := meshDialMetadata("toNode:dev-b", directAddr)
@@ -550,7 +550,7 @@ func TestDialByRouteMeshNodeUnreachableFallsBackDirect(t *testing.T) {
 func TestDialByRouteMeshFailurePolicyDeny(t *testing.T) {
 	keyPEM := newMeshDialTestEnv(t)
 	directAddr, accepted := startAcceptedListener(t)
-	setMeshDialConfig(t, keyPEM, []config.MeshPeer{{DeviceID: "dev-b", LANAddrs: []string{closedMeshAddr(t)}}}, nil)
+	setMeshDialConfig(t, keyPEM, []config.MeshPeer{{DeviceID: "dev-b", LANAddrs: []string{closedMeshAddr(t)}}})
 
 	handler := NewTCPConnectionHandler(NewDefaultProtocolDetector(), NewDefaultTLSHandler(), nil, nil)
 	md := meshDialMetadata("toNode:dev-b:deny", directAddr)
@@ -565,132 +565,51 @@ func TestDialByRouteMeshFailurePolicyDeny(t *testing.T) {
 	expectNotAccepted(t, accepted, "direct(deny 不得回落)")
 }
 
-// TestDialByRouteMeshFallbackNodeSecond fallback:dev-c:先兜底节点(勾选类别,
-// 经 DialMeshAddr 走 SSH 到对端入口 56432)再失败策略;未勾选类别直接走失败
-// 策略;兜底也不可达时落到失败策略。
-func TestDialByRouteMeshFallbackNodeSecond(t *testing.T) {
-	t.Run("兜底勾选类别先于失败策略节点", func(t *testing.T) {
-		keyPEM := newMeshDialTestEnv(t)
-		keySigner, err := gossh.ParsePrivateKey([]byte(keyPEM))
-		if err != nil {
-			t.Fatalf("parse identity: %v", err)
-		}
-		// 兜底与失败策略节点都是真 sshd:兜底(裸地址 DialMeshAddr)与
-		// ExitClient(LAN 载体)的 SSH 握手都须走通。
-		fb := newMeshTestSSHD(t, keySigner.PublicKey(), "hang")
-		cNode := newMeshTestSSHD(t, keySigner.PublicKey(), "hang")
-		setMeshDialConfig(t, keyPEM,
-			[]config.MeshPeer{
-				{DeviceID: "dev-b", LANAddrs: []string{closedMeshAddr(t)}},
-				{DeviceID: "dev-c", LANAddrs: []string{cNode.Addr()}, HostKey: cNode.HostKeyPinned()},
+// TestDialByRouteMeshNoFallbackStage 规则流量不再有兜底段(2026-11-12 出口
+// 链路改造):即使出口链路开关开且链上下一跳可达,toNode 链头失败也直接走
+// 规则失败策略(fallback:<id2>),下一跳不被拨,Route 不落 RouteMeshDelegate
+// ——委托语义只作用于 toAliang 类明文流量与平台出口(processor/egress),
+// 规则路径零变化。
+func TestDialByRouteMeshNoFallbackStage(t *testing.T) {
+	keyPEM := newMeshDialTestEnv(t)
+	keySigner, err := gossh.ParsePrivateKey([]byte(keyPEM))
+	if err != nil {
+		t.Fatalf("parse identity: %v", err)
+	}
+	swapMeshSelfID(t, "dev-a")
+	nextSSHD := newMeshTestSSHD(t, keySigner.PublicKey(), "hang") // 链上下一跳 dev-d(可达)
+	cNode := newMeshTestSSHD(t, keySigner.PublicKey(), "hang")    // 失败策略节点 dev-c(可达)
+	config.SetGlobalConfig(&config.Config{
+		Customer: &config.CustomerConfig{
+			Mesh: &config.MeshConfig{
+				PrivateKey: keyPEM,
+				Peers: []config.MeshPeer{
+					{DeviceID: "dev-b", LANAddrs: []string{closedMeshAddr(t)}}, // 链头目标,不可达
+					{DeviceID: "dev-c", LANAddrs: []string{cNode.Addr()}, HostKey: cNode.HostKeyPinned()},
+					{DeviceID: "dev-d", LANAddrs: []string{nextSSHD.Addr()}, HostKey: nextSSHD.HostKeyPinned()},
+				},
+				Fallback: &config.MeshFallbackConfig{Enable: boolPtr(true), NextHop: "dev-d"},
 			},
-			&config.MeshFallbackConfig{Enable: boolPtr(true), Addr: fb.Addr(), HostKey: fb.HostKeyPinned(), Classes: []string{meshproto.ClassCustom}},
-		)
-
-		handler := NewTCPConnectionHandler(NewDefaultProtocolDetector(), NewDefaultTLSHandler(), nil, nil)
-		// 回环直连地址 → custom 类别(非 56432 端口)被兜底勾选
-		md := meshDialMetadata("toNode:dev-b:fallback:dev-c", closedMeshAddr(t))
-		conn, err := handler.dialByRoute(context.Background(), md, RouteToNode)
-		if err != nil {
-			t.Fatalf("dialByRoute() error = %v, want 勾选类别先落兜底成功", err)
-		}
-		defer conn.Close()
-		if md.Route != "RouteMeshFallback" {
-			t.Fatalf("metadata.Route = %q, want RouteMeshFallback", md.Route)
-		}
-		// 兜底节点的 sshd 必须收到 mesh-exit channel(payload=目标四元组)。
-		if fb.LastPayload() == nil {
-			t.Fatal("兜底节点 sshd 未收到 mesh-exit channel")
-		}
-		if cNode.LastPayload() != nil {
-			t.Fatal("失败策略节点不应被拨(兜底成功后不再执行)")
-		}
+			SSHIngress: &config.SSHIngressConfig{Enable: boolPtr(true)},
+		},
 	})
 
-	t.Run("未勾选类别直接走失败策略", func(t *testing.T) {
-		keyPEM := newMeshDialTestEnv(t)
-		keySigner, err := gossh.ParsePrivateKey([]byte(keyPEM))
-		if err != nil {
-			t.Fatalf("parse identity: %v", err)
-		}
-		fb := newMeshTestSSHD(t, keySigner.PublicKey(), "hang")
-		cNode := newMeshTestSSHD(t, keySigner.PublicKey(), "hang")
-		setMeshDialConfig(t, keyPEM,
-			[]config.MeshPeer{
-				{DeviceID: "dev-b", LANAddrs: []string{closedMeshAddr(t)}},
-				{DeviceID: "dev-c", LANAddrs: []string{cNode.Addr()}, HostKey: cNode.HostKeyPinned()},
-			},
-			&config.MeshFallbackConfig{Enable: boolPtr(true), Addr: fb.Addr(), HostKey: fb.HostKeyPinned(), Classes: []string{meshproto.ClassAI}}, // 只勾 ai
-		)
-
-		handler := NewTCPConnectionHandler(NewDefaultProtocolDetector(), NewDefaultTLSHandler(), nil, nil)
-		md := meshDialMetadata("toNode:dev-b:fallback:dev-c", closedMeshAddr(t)) // custom 连接
-		conn, err := handler.dialByRoute(context.Background(), md, RouteToNode)
-		if err != nil {
-			t.Fatalf("dialByRoute() error = %v, want 未勾选类别直接走失败策略节点", err)
-		}
-		defer conn.Close()
-		if md.Route != "RouteToNode" {
-			t.Fatalf("metadata.Route = %q, want RouteToNode(失败策略节点拨出)", md.Route)
-		}
-		if cNode.LastPayload() == nil {
-			t.Fatal("失败策略节点 dev-c 未被拨")
-		}
-		if fb.LastPayload() != nil {
-			t.Fatal("兜底节点不应被拨(类别未勾选)")
-		}
-	})
-
-	t.Run("兜底不可达落到失败策略", func(t *testing.T) {
-		keyPEM := newMeshDialTestEnv(t)
-		keySigner, err := gossh.ParsePrivateKey([]byte(keyPEM))
-		if err != nil {
-			t.Fatalf("parse identity: %v", err)
-		}
-		cNode := newMeshTestSSHD(t, keySigner.PublicKey(), "hang")
-		setMeshDialConfig(t, keyPEM,
-			[]config.MeshPeer{
-				{DeviceID: "dev-b", LANAddrs: []string{closedMeshAddr(t)}},
-				{DeviceID: "dev-c", LANAddrs: []string{cNode.Addr()}, HostKey: cNode.HostKeyPinned()},
-			},
-			&config.MeshFallbackConfig{Enable: boolPtr(true), Addr: closedMeshAddr(t), HostKey: "SHA256:AAAA", Classes: []string{meshproto.ClassCustom}},
-		)
-
-		handler := NewTCPConnectionHandler(NewDefaultProtocolDetector(), NewDefaultTLSHandler(), nil, nil)
-		md := meshDialMetadata("toNode:dev-b:fallback:dev-c", closedMeshAddr(t))
-		conn, err := handler.dialByRoute(context.Background(), md, RouteToNode)
-		if err != nil {
-			t.Fatalf("dialByRoute() error = %v, want 兜底失败后失败策略节点接管", err)
-		}
-		defer conn.Close()
-		if cNode.LastPayload() == nil {
-			t.Fatal("失败策略节点 dev-c 未被拨")
-		}
-	})
-
-	t.Run("fallback 目标不在 peers 终局失败", func(t *testing.T) {
-		// 编译期不校验 fallback:<id2> 是否列入 peers(仅非空校验,见
-		// classifyEntryForCompile 注释);运行期拨不到指定节点由「限一次防链」
-		// 收口:终端错误,不回落 direct、不再叠加兜底。
-		keyPEM := newMeshDialTestEnv(t)
-		directAddr, accepted := startAcceptedListener(t)
-		setMeshDialConfig(t, keyPEM,
-			[]config.MeshPeer{{DeviceID: "dev-b", LANAddrs: []string{closedMeshAddr(t)}}},
-			&config.MeshFallbackConfig{Enable: boolPtr(true), Addr: closedMeshAddr(t), HostKey: "SHA256:AAAA", Classes: []string{meshproto.ClassCustom}},
-		)
-
-		handler := NewTCPConnectionHandler(NewDefaultProtocolDetector(), NewDefaultTLSHandler(), nil, nil)
-		md := meshDialMetadata("toNode:dev-b:fallback:dev-nope", directAddr)
-		conn, err := handler.dialByRoute(context.Background(), md, RouteToNode)
-		if err == nil {
-			_ = conn.Close()
-			t.Fatal("fallback 目标不存在必须终局失败(限一次,不再链式)")
-		}
-		if !strings.Contains(err.Error(), "fallback to dev-nope unavailable") {
-			t.Fatalf("错误应标明 fallback 目标不可用, got: %v", err)
-		}
-		expectNotAccepted(t, accepted, "direct(fallback 失败不回落 direct)")
-	})
+	handler := NewTCPConnectionHandler(NewDefaultProtocolDetector(), NewDefaultTLSHandler(), nil, nil)
+	md := meshDialMetadata("toNode:dev-b:fallback:dev-c", closedMeshAddr(t))
+	conn, err := handler.dialByRoute(context.Background(), md, RouteToNode)
+	if err != nil {
+		t.Fatalf("dialByRoute() error = %v, want 链头失败直接落失败策略节点", err)
+	}
+	defer conn.Close()
+	if md.Route != "RouteToNode" {
+		t.Fatalf("metadata.Route = %q, want RouteToNode(失败策略节点拨出)", md.Route)
+	}
+	if cNode.LastPayload() == nil {
+		t.Fatal("失败策略节点 dev-c 未被拨")
+	}
+	if nextSSHD.LastPayload() != nil {
+		t.Fatal("链上下一跳 dev-d 不应被拨(委托语义不作用于规则路径)")
+	}
 }
 
 // TestDialByRouteMeshRelayOnlyForCustomLANNeg custom 类别仅 LAN 载体:LAN
@@ -705,7 +624,7 @@ func TestDialByRouteMeshRelayOnlyForCustomLANNeg(t *testing.T) {
 			return nil, fmt.Errorf("relay dialed for custom class: %s", endpointID)
 		}
 	})
-	setMeshDialConfig(t, keyPEM, []config.MeshPeer{{DeviceID: "dev-b", LANAddrs: []string{closed}, Relay: boolPtr(true)}}, nil)
+	setMeshDialConfig(t, keyPEM, []config.MeshPeer{{DeviceID: "dev-b", LANAddrs: []string{closed}, Relay: boolPtr(true)}})
 
 	handler := NewTCPConnectionHandler(NewDefaultProtocolDetector(), NewDefaultTLSHandler(), nil, nil)
 	// 外部地址 + 非 56432 端口 → 推断 custom;deny 策略隔离后续分支
@@ -753,7 +672,7 @@ func TestDialByRouteMeshRelayCarriesAI(t *testing.T) {
 		LANAddrs: []string{closedMeshAddr(t)},
 		HostKey:  relaySSHD.HostKeyPinned(), // 中继载体同样按对端入口钉扎(SPEC §10.4)
 		Relay:    boolPtr(true),
-	}}, nil)
+	}})
 
 	handler := NewTCPConnectionHandler(NewDefaultProtocolDetector(), NewDefaultTLSHandler(), nil, nil)
 	// 56432 回环 → 推断 ai → 中继载体准入
@@ -781,7 +700,7 @@ func TestDialByRouteMeshRelayCarriesAI(t *testing.T) {
 func TestDialByRouteMeshUnknownPeerFallsBackDirect(t *testing.T) {
 	keyPEM := newMeshDialTestEnv(t)
 	directAddr, accepted := startAcceptedListener(t)
-	setMeshDialConfig(t, keyPEM, []config.MeshPeer{{DeviceID: "dev-b", LANAddrs: []string{closedMeshAddr(t)}}}, nil)
+	setMeshDialConfig(t, keyPEM, []config.MeshPeer{{DeviceID: "dev-b", LANAddrs: []string{closedMeshAddr(t)}}})
 
 	handler := NewTCPConnectionHandler(NewDefaultProtocolDetector(), NewDefaultTLSHandler(), nil, nil)
 	md := meshDialMetadata("toNode:dev-nope", directAddr)
@@ -796,18 +715,18 @@ func TestDialByRouteMeshUnknownPeerFallsBackDirect(t *testing.T) {
 	expectAccepted(t, accepted, "direct 回落")
 }
 
-// ---- AI 流量离线改道(Task 12,design §2 行11/§9.4)----
+// ---- 出口链路委托(2026-11-12,替代 AI 离线改道)----
 
-// swapMeshOfflineSignal 覆写离线信号缝并恢复(swapMeshTransportDialSource
+// swapMeshSelfID 覆写本机节点标识缝并恢复(swapMeshTransportDialSource
 // 同款 swap+Cleanup 模式;非并行安全)。
-func swapMeshOfflineSignal(t *testing.T, fn func() bool) {
+func swapMeshSelfID(t *testing.T, id string) {
 	t.Helper()
-	orig, _ := meshOfflineSignal.Load().(func() bool)
-	SetMeshOfflineSignal(fn)
-	t.Cleanup(func() { SetMeshOfflineSignal(orig) })
+	orig, _ := meshSelfIDSource.Load().(func() string)
+	SetMeshSelfIDSource(func() string { return id })
+	t.Cleanup(func() { SetMeshSelfIDSource(orig) })
 }
 
-// registerFakeAliangProxy 注册 fake aliang 出口(在线/未勾选路径的
+// registerFakeAliangProxy 注册 fake aliang 出口(开关关/守卫拒路径的
 // RouteToALiang 拨出落点,route_override_test 同款)。
 func registerFakeAliangProxy(t *testing.T) {
 	t.Helper()
@@ -830,36 +749,43 @@ func aiRedirectMetadata() *M.Metadata {
 	}
 }
 
-// setAIRedirectFallbackConfig 配置「AI 类离线兜底勾选」的 fallback:兜底地址
-// 指向真 sshd(离线改道经 DialMeshAddr 走 SSH,须钉扎+真握手)。
-func setAIRedirectFallbackConfig(t *testing.T, keyPEM string, sshd *meshTestSSHD) {
+// setMeshDelegateConfig 配置「出口链路开关开」:next_hop=dev-b 指向真 sshd
+// 的已钉扎 peer(委托拨号走 ExitClient LAN 载体,须钉扎+真握手)。
+func setMeshDelegateConfig(t *testing.T, keyPEM string, sshd *meshTestSSHD) {
 	t.Helper()
-	setMeshDialConfig(t, keyPEM, nil, &config.MeshFallbackConfig{
-		Enable:  boolPtr(true),
-		Addr:    sshd.Addr(),
-		HostKey: sshd.HostKeyPinned(),
-		Classes: []string{meshproto.ClassAI},
+	config.SetGlobalConfig(&config.Config{
+		Customer: &config.CustomerConfig{
+			Mesh: &config.MeshConfig{
+				PrivateKey: keyPEM,
+				Peers: []config.MeshPeer{
+					{DeviceID: "dev-b", LANAddrs: []string{sshd.Addr()}, HostKey: sshd.HostKeyPinned()},
+				},
+				Fallback: &config.MeshFallbackConfig{Enable: boolPtr(true), NextHop: "dev-b"},
+			},
+			SSHIngress: &config.SSHIngressConfig{Enable: boolPtr(true)},
+		},
 	})
 }
 
-// TestForceAliangRouteRedirectsToNodeWhenOffline 离线信号真 + AI 类兜底勾选 →
-// shouldForceAliangRoute 命中改判 mesh 兜底节点(经 DialMeshAddr 走 SSH):
-// 兜底 sshd 收到 mesh-exit channel,payload 携带 56432 回环目标;originConn
-// 裸透传返回(不套 wrapAliangHTTPConnByProto——该改包逻辑只适用于 aliang
-// 隧道);总开关显式 false 时改道关闭(门控统一助手的穿透钉子)。
-func TestForceAliangRouteRedirectsToNodeWhenOffline(t *testing.T) {
-	t.Run("离线改判mesh兜底节点", func(t *testing.T) {
+// TestForceAliangRouteDelegatesToNextHop 出口链路委托主路径:开关开(toggle=
+// 常驻语义,不按本机在线状态判定)→ shouldForceAliangRoute 命中改判 mesh
+// 委托(经 ExitClient 走下一跳 SSH):下一跳 sshd 收到 mesh-exit channel,
+// payload 携带 56432 回环目标与 via=["dev-a"](本跳 id 已入链);originConn
+// 裸透传返回(不套 wrapAliangHTTPConnByProto)。开关关/总开关显式 false →
+// 保持 RouteToALiang(在线行为零变化,下一跳不被拨)。
+func TestForceAliangRouteDelegatesToNextHop(t *testing.T) {
+	t.Run("开关开改判mesh委托", func(t *testing.T) {
 		keyPEM := newMeshDialTestEnv(t)
 		keySigner, err := gossh.ParsePrivateKey([]byte(keyPEM))
 		if err != nil {
 			t.Fatalf("parse identity: %v", err)
 		}
-		swapMeshOfflineSignal(t, func() bool { return true })
-		fbSSHD := newMeshTestSSHD(t, keySigner.PublicKey(), "hang")
-		setAIRedirectFallbackConfig(t, keyPEM, fbSSHD)
+		swapMeshSelfID(t, "dev-a")
+		nextSSHD := newMeshTestSSHD(t, keySigner.PublicKey(), "hang")
+		setMeshDelegateConfig(t, keyPEM, nextSSHD)
 
-		if !MeshOfflineAIRedirectActive() {
-			t.Fatal("离线+AI 兜底勾选时 MeshOfflineAIRedirectActive 应为真")
+		if !MeshDelegateActive() {
+			t.Fatal("开关开 + next_hop 齐备时 MeshDelegateActive 应为真")
 		}
 
 		handler := NewTCPConnectionHandler(NewDefaultProtocolDetector(), NewDefaultTLSHandler(), nil, nil)
@@ -867,51 +793,52 @@ func TestForceAliangRouteRedirectsToNodeWhenOffline(t *testing.T) {
 		md := aiRedirectMetadata()
 		remote, newOrigin, err := handler.handleNonTLS(context.Background(), origin, md)
 		if err != nil {
-			t.Fatalf("handleNonTLS failed: %v, want 离线改道拨兜底节点成功", err)
+			t.Fatalf("handleNonTLS failed: %v, want 委托拨下一跳成功", err)
 		}
 		defer remote.Close()
-		if md.Route != "RouteMeshFallback" {
-			t.Fatalf("metadata.Route = %q, want RouteMeshFallback(改道至 toNode 家族的兜底节点)", md.Route)
+		if md.Route != "RouteMeshDelegate" {
+			t.Fatalf("metadata.Route = %q, want RouteMeshDelegate(委托至链上下一跳)", md.Route)
 		}
 		if newOrigin != net.Conn(origin) {
 			t.Fatalf("originConn 应裸透传返回(不套 wrapAliangHTTPConnByProto), got %T", newOrigin)
 		}
-		payload := fbSSHD.LastPayload()
+		payload := nextSSHD.LastPayload()
 		if payload == nil {
-			t.Fatal("兜底节点 sshd 未收到 mesh-exit channel(2s 内)")
+			t.Fatal("下一跳 sshd 未收到 mesh-exit channel(2s 内)")
 		}
 		if !bytes.Contains(payload, []byte(`"h":"127.0.0.1"`)) || !bytes.Contains(payload, []byte(`"p":56432`)) {
-			t.Fatalf("兜底 payload = %s, want 携带 127.0.0.1:56432 目标", payload)
+			t.Fatalf("委托 payload = %s, want 携带 127.0.0.1:56432 目标", payload)
+		}
+		if !bytes.Contains(payload, []byte(`"v":["dev-a"]`)) {
+			t.Fatalf("委托 payload = %s, want 携带 via 链(本跳 id dev-a)", payload)
 		}
 	})
 
-	t.Run("总开关显式false改道关闭", func(t *testing.T) {
+	t.Run("总开关显式false委托关闭", func(t *testing.T) {
 		keyPEM := newMeshDialTestEnv(t)
 		keySigner, err := gossh.ParsePrivateKey([]byte(keyPEM))
 		if err != nil {
 			t.Fatalf("parse identity: %v", err)
 		}
-		swapMeshOfflineSignal(t, func() bool { return true })
+		swapMeshSelfID(t, "dev-a")
 		registerFakeAliangProxy(t)
-		fbSSHD := newMeshTestSSHD(t, keySigner.PublicKey(), "hang")
+		nextSSHD := newMeshTestSSHD(t, keySigner.PublicKey(), "hang")
 		config.SetGlobalConfig(&config.Config{
 			Customer: &config.CustomerConfig{
 				Mesh: &config.MeshConfig{
 					Enable:     boolPtr(false), // 总开关显式 false
 					PrivateKey: keyPEM,
-					Fallback: &config.MeshFallbackConfig{
-						Enable:  boolPtr(true),
-						Addr:    fbSSHD.Addr(),
-						HostKey: fbSSHD.HostKeyPinned(),
-						Classes: []string{meshproto.ClassAI},
+					Peers: []config.MeshPeer{
+						{DeviceID: "dev-b", LANAddrs: []string{nextSSHD.Addr()}, HostKey: nextSSHD.HostKeyPinned()},
 					},
+					Fallback: &config.MeshFallbackConfig{Enable: boolPtr(true), NextHop: "dev-b"},
 				},
 				SSHIngress: &config.SSHIngressConfig{Enable: boolPtr(true)},
 			},
 		})
 
-		if MeshOfflineAIRedirectActive() {
-			t.Fatal("总开关显式 false 时改道判定必须关闭")
+		if MeshDelegateActive() {
+			t.Fatal("总开关显式 false 时委托判定必须关闭")
 		}
 
 		handler := NewTCPConnectionHandler(NewDefaultProtocolDetector(), NewDefaultTLSHandler(), nil, nil)
@@ -922,146 +849,137 @@ func TestForceAliangRouteRedirectsToNodeWhenOffline(t *testing.T) {
 		}
 		defer remote.Close()
 		if md.Route != "RouteToALiang" {
-			t.Fatalf("metadata.Route = %q, want RouteToALiang(总开关关,改道不生效)", md.Route)
+			t.Fatalf("metadata.Route = %q, want RouteToALiang(总开关关,委托不生效)", md.Route)
 		}
-		if fbSSHD.LastPayload() != nil {
-			t.Fatal("总开关关时兜底节点不应被拨")
-		}
-	})
-
-	t.Run("兜底不可达如实失败", func(t *testing.T) {
-		keyPEM := newMeshDialTestEnv(t)
-		swapMeshOfflineSignal(t, func() bool { return true })
-		setMeshDialConfig(t, keyPEM, nil, &config.MeshFallbackConfig{
-			Enable:  boolPtr(true),
-			Addr:    closedMeshAddr(t),
-			HostKey: "SHA256:AAAA",
-			Classes: []string{meshproto.ClassAI},
-		})
-
-		handler := NewTCPConnectionHandler(NewDefaultProtocolDetector(), NewDefaultTLSHandler(), nil, nil)
-		md := aiRedirectMetadata()
-		_, _, err := handler.handleNonTLS(context.Background(), newFakeConn(nil), md)
-		if err == nil {
-			t.Fatal("兜底节点不可达时离线改道应如实失败")
-		}
-		if !strings.Contains(err.Error(), "offline AI redirect") {
-			t.Fatalf("错误应标明离线改道语义, got: %v", err)
+		if nextSSHD.LastPayload() != nil {
+			t.Fatal("总开关关时下一跳不应被拨")
 		}
 	})
-}
 
-// TestForceAliangRouteUnchangedWhenOnline 在线行为零变化:信号 false / 未接线
-// → 保持 RouteToALiang,兜底节点不被拨。
-func TestForceAliangRouteUnchangedWhenOnline(t *testing.T) {
-	t.Run("信号注入在线", func(t *testing.T) {
+	t.Run("开关关保持原路由", func(t *testing.T) {
 		keyPEM := newMeshDialTestEnv(t)
-		keySigner, err := gossh.ParsePrivateKey([]byte(keyPEM))
-		if err != nil {
-			t.Fatalf("parse identity: %v", err)
-		}
-		swapMeshOfflineSignal(t, func() bool { return false })
+		swapMeshSelfID(t, "dev-a")
 		registerFakeAliangProxy(t)
-		fbSSHD := newMeshTestSSHD(t, keySigner.PublicKey(), "hang")
-		setAIRedirectFallbackConfig(t, keyPEM, fbSSHD)
+		setMeshDialConfig(t, keyPEM, []config.MeshPeer{
+			{DeviceID: "dev-b", LANAddrs: []string{closedMeshAddr(t)}, HostKey: "SHA256:AAAA"},
+		}) // 无 fallback 配置 → 委托门关
 
-		if MeshOfflineAIRedirectActive() {
-			t.Fatal("在线时 MeshOfflineAIRedirectActive 应为假")
+		if MeshDelegateActive() {
+			t.Fatal("开关关时 MeshDelegateActive 应为假")
 		}
 
 		handler := NewTCPConnectionHandler(NewDefaultProtocolDetector(), NewDefaultTLSHandler(), nil, nil)
 		md := aiRedirectMetadata()
 		remote, _, err := handler.handleNonTLS(context.Background(), newFakeConn(nil), md)
 		if err != nil {
-			t.Fatalf("handleNonTLS failed: %v, want 在线保持 RouteToALiang 现状", err)
+			t.Fatalf("handleNonTLS failed: %v, want 开关关保持 RouteToALiang 现状", err)
 		}
 		defer remote.Close()
 		if md.Route != "RouteToALiang" {
-			t.Fatalf("metadata.Route = %q, want RouteToALiang(在线零变化)", md.Route)
-		}
-		if fbSSHD.LastPayload() != nil {
-			t.Fatal("在线时兜底节点不应被拨")
-		}
-	})
-
-	t.Run("信号未接线视为在线", func(t *testing.T) {
-		keyPEM := newMeshDialTestEnv(t)
-		keySigner, err := gossh.ParsePrivateKey([]byte(keyPEM))
-		if err != nil {
-			t.Fatalf("parse identity: %v", err)
-		}
-		swapMeshOfflineSignal(t, nil) // nil = 未接线 = 在线保守
-		registerFakeAliangProxy(t)
-		fbSSHD := newMeshTestSSHD(t, keySigner.PublicKey(), "hang")
-		setAIRedirectFallbackConfig(t, keyPEM, fbSSHD)
-
-		if MeshOfflineAIRedirectActive() {
-			t.Fatal("信号未接线(视为在线)时 MeshOfflineAIRedirectActive 应为假")
-		}
-
-		handler := NewTCPConnectionHandler(NewDefaultProtocolDetector(), NewDefaultTLSHandler(), nil, nil)
-		md := aiRedirectMetadata()
-		remote, _, err := handler.handleNonTLS(context.Background(), newFakeConn(nil), md)
-		if err != nil {
-			t.Fatalf("handleNonTLS failed: %v, want 未接线保持 RouteToALiang 现状", err)
-		}
-		defer remote.Close()
-		if md.Route != "RouteToALiang" {
-			t.Fatalf("metadata.Route = %q, want RouteToALiang(未接线零变化)", md.Route)
-		}
-		if fbSSHD.LastPayload() != nil {
-			t.Fatal("未接线时兜底节点不应被拨")
+			t.Fatalf("metadata.Route = %q, want RouteToALiang(开关关零变化)", md.Route)
 		}
 	})
 }
 
-// TestForceAliangRouteNoAIClassKeepsOriginal 离线但兜底 Classes 不含 ai →
-// 保持原路由(RouteToALiang,离线下拨号失败如实上抛,由调用方/AI 客户端
-// 重试策略收口)。
-func TestForceAliangRouteNoAIClassKeepsOriginal(t *testing.T) {
+// TestForceAliangRouteDelegateDialFailureHonest 下一跳不可达 → 委托拨号如实
+// 失败(开关=出口完全依赖下一跳,不回落本机隧道——发布说明已写明取舍)。
+func TestForceAliangRouteDelegateDialFailureHonest(t *testing.T) {
 	keyPEM := newMeshDialTestEnv(t)
-	keySigner, err := gossh.ParsePrivateKey([]byte(keyPEM))
-	if err != nil {
-		t.Fatalf("parse identity: %v", err)
-	}
-	swapMeshOfflineSignal(t, func() bool { return true })
-	registerFakeAliangProxy(t)
-	fbSSHD := newMeshTestSSHD(t, keySigner.PublicKey(), "hang")
-	setMeshDialConfig(t, keyPEM, nil, &config.MeshFallbackConfig{
-		Enable:  boolPtr(true),
-		Addr:    fbSSHD.Addr(),
-		HostKey: fbSSHD.HostKeyPinned(),
-		Classes: []string{meshproto.ClassCustom}, // 只勾 custom,不含 ai
+	swapMeshSelfID(t, "dev-a")
+	config.SetGlobalConfig(&config.Config{
+		Customer: &config.CustomerConfig{
+			Mesh: &config.MeshConfig{
+				PrivateKey: keyPEM,
+				Peers: []config.MeshPeer{
+					{DeviceID: "dev-b", LANAddrs: []string{closedMeshAddr(t)}, HostKey: "SHA256:AAAA"},
+				},
+				Fallback: &config.MeshFallbackConfig{Enable: boolPtr(true), NextHop: "dev-b"},
+			},
+			SSHIngress: &config.SSHIngressConfig{Enable: boolPtr(true)},
+		},
 	})
-
-	if MeshOfflineAIRedirectActive() {
-		t.Fatal("ai 类未勾选时 MeshOfflineAIRedirectActive 应为假")
-	}
 
 	handler := NewTCPConnectionHandler(NewDefaultProtocolDetector(), NewDefaultTLSHandler(), nil, nil)
 	md := aiRedirectMetadata()
-	remote, _, err := handler.handleNonTLS(context.Background(), newFakeConn(nil), md)
-	if err != nil {
-		t.Fatalf("handleNonTLS failed: %v, want AI 兜底未勾选保持 RouteToALiang", err)
+	_, _, err := handler.handleNonTLS(context.Background(), newFakeConn(nil), md)
+	if err == nil {
+		t.Fatal("下一跳不可达时委托拨号应如实失败")
 	}
-	defer remote.Close()
-	if md.Route != "RouteToALiang" {
-		t.Fatalf("metadata.Route = %q, want RouteToALiang(未勾选 ai 不改道)", md.Route)
-	}
-	if fbSSHD.LastPayload() != nil {
-		t.Fatal("ai 未勾选时兜底节点不应被拨")
+	if !strings.Contains(err.Error(), "delegate AI flow") {
+		t.Fatalf("错误应标明委托语义, got: %v", err)
 	}
 }
 
-// TestMeshOfflineSignalSeamConcurrentSetAndRead 离线信号缝并发契约
-// (TestMeshTransportDialSeamConcurrentSetAndRead / egress
-// TestSetPeerSourceConcurrentSetAndRead 同款):生产写方(组装层接线)与
-// AI 拨号路径读方跨包并发,-race 下必须无竞争。
-func TestMeshOfflineSignalSeamConcurrentSetAndRead(t *testing.T) {
+// TestForceAliangRouteChainGuardTerminatesLocally 链守卫命中(via 含自己=
+// 回环 / via 达上限=放大终止)→ 不再上链,就地 RouteToALiang 处理
+// (fake proxy 收到拨出;链的终点语义,不报错)。
+func TestForceAliangRouteChainGuardTerminatesLocally(t *testing.T) {
+	t.Run("via含自己=回环终止", func(t *testing.T) {
+		keyPEM := newMeshDialTestEnv(t)
+		keySigner, err := gossh.ParsePrivateKey([]byte(keyPEM))
+		if err != nil {
+			t.Fatalf("parse identity: %v", err)
+		}
+		swapMeshSelfID(t, "dev-a")
+		registerFakeAliangProxy(t)
+		nextSSHD := newMeshTestSSHD(t, keySigner.PublicKey(), "hang")
+		setMeshDelegateConfig(t, keyPEM, nextSSHD)
+
+		handler := NewTCPConnectionHandler(NewDefaultProtocolDetector(), NewDefaultTLSHandler(), nil, nil)
+		md := aiRedirectMetadata()
+		md.MeshInjected = true
+		md.MeshVia = []string{"dev-a"} // 曾经过本机
+		remote, _, err := handler.handleNonTLS(context.Background(), newFakeConn(nil), md)
+		if err != nil {
+			t.Fatalf("handleNonTLS failed: %v, want 回环终止就地处理", err)
+		}
+		defer remote.Close()
+		if md.Route != "RouteToALiang" {
+			t.Fatalf("metadata.Route = %q, want RouteToALiang(回环链终点就地处理)", md.Route)
+		}
+		if nextSSHD.LastPayload() != nil {
+			t.Fatal("回环终止时下一跳不应被拨")
+		}
+	})
+
+	t.Run("via达上限=放大终止", func(t *testing.T) {
+		keyPEM := newMeshDialTestEnv(t)
+		keySigner, err := gossh.ParsePrivateKey([]byte(keyPEM))
+		if err != nil {
+			t.Fatalf("parse identity: %v", err)
+		}
+		swapMeshSelfID(t, "dev-a")
+		registerFakeAliangProxy(t)
+		nextSSHD := newMeshTestSSHD(t, keySigner.PublicKey(), "hang")
+		setMeshDelegateConfig(t, keyPEM, nextSSHD)
+
+		handler := NewTCPConnectionHandler(NewDefaultProtocolDetector(), NewDefaultTLSHandler(), nil, nil)
+		md := aiRedirectMetadata()
+		for i := 0; i < meshproto.DefaultHops; i++ {
+			md.MeshVia = append(md.MeshVia, fmt.Sprintf("hop-%d", i))
+		}
+		remote, _, err := handler.handleNonTLS(context.Background(), newFakeConn(nil), md)
+		if err != nil {
+			t.Fatalf("handleNonTLS failed: %v, want 达上限终止就地处理", err)
+		}
+		defer remote.Close()
+		if md.Route != "RouteToALiang" {
+			t.Fatalf("metadata.Route = %q, want RouteToALiang(上限链终点就地处理)", md.Route)
+		}
+		if nextSSHD.LastPayload() != nil {
+			t.Fatal("达上限终止时下一跳不应被拨")
+		}
+	})
+}
+
+// TestMeshSelfIDSeamConcurrentSetAndRead 本机节点标识缝并发契约
+// (TestMeshTransportDialSeamConcurrentSetAndRead 同款):生产写方(组装层
+// 接线)与委托判定读方跨 goroutine 并发,-race 下必须无竞争。
+func TestMeshSelfIDSeamConcurrentSetAndRead(t *testing.T) {
 	config.ResetGlobalConfigForTest()
 	t.Cleanup(func() {
 		config.ResetGlobalConfigForTest()
-		SetMeshOfflineSignal(nil)
+		SetMeshSelfIDSource(nil)
 	})
 
 	stop := make(chan struct{})
@@ -1075,51 +993,19 @@ func TestMeshOfflineSignalSeamConcurrentSetAndRead(t *testing.T) {
 				return
 			default:
 			}
-			v := i%2 == 0
-			SetMeshOfflineSignal(func() bool { return v })
+			v := fmt.Sprintf("dev-%d", i)
+			SetMeshSelfIDSource(func() string { return v })
 		}
 	}()
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 2000; i++ {
-			_ = meshOfflineActive()
-			_ = MeshOfflineAIRedirectActive()
+			_ = meshSelfID()
+			_ = MeshDelegateActive()
 		}
 	}()
 	time.Sleep(50 * time.Millisecond)
 	close(stop)
 	wg.Wait()
-}
-
-// TestMeshFallbackAddrForClassRespectsMasterSwitch tcp 兜底闸总开关穿透钉子
-// (计划 Task 12 评审抓过的缺口):meshFallbackAddrForClass 原实现无
-// EffectiveEnabled 检查——总开关显式 false 时兜底门必须关闭,统一抽取为
-// config.MeshFallbackActiveForClass 后由助手保证。
-func TestMeshFallbackAddrForClassRespectsMasterSwitch(t *testing.T) {
-	newMeshDialTestEnv(t)
-	config.SetGlobalConfig(&config.Config{
-		Customer: &config.CustomerConfig{
-			Mesh: &config.MeshConfig{
-				Enable: boolPtr(false), // 总开关显式 false
-				Fallback: &config.MeshFallbackConfig{
-					Enable:  boolPtr(true),
-					Addr:    "192.168.1.9:56440",
-					Classes: []string{meshproto.ClassAI},
-				},
-			},
-			// SSH 入口显式开:判据切到 MeshEffectivelyEnabled 后,不补则本
-			// 用例被依赖降级误吞而非测到总开关穿透。
-			SSHIngress: &config.SSHIngressConfig{Enable: boolPtr(true)},
-		},
-	})
-	// 56432 回环 → 推断 ai 且被勾选;唯总开关关。
-	md := &M.Metadata{
-		Network: M.TCP,
-		DstIP:   netip.MustParseAddr("127.0.0.1"),
-		DstPort: 56432,
-	}
-	if addr, ok := meshFallbackAddrForClass(context.Background(), md); ok {
-		t.Fatalf("总开关显式 false 时兜底门必须关闭, got addr=%q", addr)
-	}
 }

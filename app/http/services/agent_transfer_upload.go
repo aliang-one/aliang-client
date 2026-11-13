@@ -37,7 +37,7 @@ const (
 	agentTransferPartSizeMax = int64(256) << 20
 	agentTransferPartDefault = int64(64) << 20
 
-	agentTransferPartAttempts   = 3              // 单块直传重试
+	agentTransferPartAttempts   = 3               // 单块直传重试
 	agentTransferPartRetryDelay = 2 * time.Second // 重试退避（固定，够 COS 抖动恢复）
 )
 

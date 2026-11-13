@@ -90,11 +90,11 @@ func writeTempFile(t *testing.T, dir, name string, content []byte) string {
 
 func TestSanitizeTransferFileName(t *testing.T) {
 	ok := map[string]string{
-		"报告 最终版.pdf":               "报告 最终版.pdf",
-		"截图 2026-10-22.png":           "截图 2026-10-22.png",
-		"naïve😀.txt":                  "naïve_.txt", // emoji 替换为 _
-		"my.file.v2.tar.gz":            "my.file.v2.tar.gz",
-		".hidden":                      ".hidden",
+		"报告 最终版.pdf":                      "报告 最终版.pdf",
+		"截图 2026-10-22.png":               "截图 2026-10-22.png",
+		"naïve😀.txt":                      "naïve_.txt", // emoji 替换为 _
+		"my.file.v2.tar.gz":               "my.file.v2.tar.gz",
+		".hidden":                         ".hidden",
 		strings.Repeat("汉", 150) + ".zip": strings.Repeat("汉", 65) + ".zip", // 超长截断：196 字节预算 ÷ 3 字节/字 = 65 字
 	}
 	for in, want := range ok {
@@ -238,9 +238,9 @@ func TestAgentTransferZipSlipMatrix(t *testing.T) {
 		"C:/win.txt":                          []byte("x"),
 		`a\b.txt`:                             []byte("x"),
 		strings.Repeat("d/", 40) + "deep.txt": []byte("x"),
-		"CON.txt":                             []byte("x"),  // Windows 保留名条目
-		"sub/nul.txt":                         []byte("x"),  // 中段段保留名
-		"a.txt.":                              []byte("x"),  // 尾点条目（Windows 落盘吞点→重名歧义）
+		"CON.txt":                             []byte("x"), // Windows 保留名条目
+		"sub/nul.txt":                         []byte("x"), // 中段段保留名
+		"a.txt.":                              []byte("x"), // 尾点条目（Windows 落盘吞点→重名歧义）
 	}
 	for name, content := range evil {
 		zipPath := buildEvilZip(t, dir, map[string][]byte{name: content})
@@ -451,16 +451,16 @@ func TestAgentTransferUploadDuplicateAndBusy(t *testing.T) {
 // ---- 接收链 ----------------------------------------------------------------
 
 type fakeTransferSource struct {
-	srv           *httptest.Server
-	payload       []byte
-	etag          string
-	doStall       bool
-	stall         chan struct{}
-	stallClose    sync.Once
-	mu            sync.Mutex
-	requests      []string
-	firstGet      chan struct{}
-	firstGetOnce  sync.Once
+	srv          *httptest.Server
+	payload      []byte
+	etag         string
+	doStall      bool
+	stall        chan struct{}
+	stallClose   sync.Once
+	mu           sync.Mutex
+	requests     []string
+	firstGet     chan struct{}
+	firstGetOnce sync.Once
 }
 
 func newFakeTransferSource(t *testing.T, payload []byte, mutate func(*fakeTransferSource)) *fakeTransferSource {
@@ -715,7 +715,6 @@ func TestAgentTransferCancelReceiveCleansPartial(t *testing.T) {
 	}
 }
 
-
 // ---- 复核修复的回归测试 ----------------------------------------------------
 
 func TestAgentTransferReceiveRejectsTransferIDTraversal(t *testing.T) {
@@ -873,7 +872,6 @@ func TestSanitizeTransferFileNameTruncationCannotRegenerateReserved(t *testing.T
 		t.Fatalf("truncated-into-reserved name must be rejected, got %q", got)
 	}
 }
-
 
 func TestAgentTransferUploadResultDualChannel(t *testing.T) {
 	_ = newAgentTransferEnv(t)

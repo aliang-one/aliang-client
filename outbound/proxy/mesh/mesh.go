@@ -67,7 +67,7 @@ func classFromContext(ctx context.Context, md *M.Metadata) string {
 
 // InferClass 返回连接的 mesh 流量类别(显式 WithClass 优先,否则按
 // looksLikeAITraffic 推断:56432 回环 → ai,其余 → custom)。链头执行层
-// (processor/tcp dialByRoute)对离线兜底类别勾选(SPEC §7.2)的判定复用
+// (processor/tcp mesh_delegate)对连接类别的判定复用
 // 本口径;self 类由 egress 发起点显式 WithClass 指定,推断面仅 ai/custom。
 func InferClass(ctx context.Context, md *M.Metadata) string {
 	return classFromContext(ctx, md)

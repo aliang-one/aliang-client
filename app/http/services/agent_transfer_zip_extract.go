@@ -25,11 +25,11 @@ import (
 )
 
 const (
-	agentTransferZipMaxEntries     = 20000
-	agentTransferZipMaxDepth       = 32
-	agentTransferZipMaxEntryBytes  = int64(2) << 30 // 单条目 2GiB
-	agentTransferZipMaxTotalBytes  = int64(8) << 30 // 总量 8GiB
-	agentTransferZipRatioLimit     = 64
+	agentTransferZipMaxEntries    = 20000
+	agentTransferZipMaxDepth      = 32
+	agentTransferZipMaxEntryBytes = int64(2) << 30 // 单条目 2GiB
+	agentTransferZipMaxTotalBytes = int64(8) << 30 // 总量 8GiB
+	agentTransferZipRatioLimit    = 64
 )
 
 var agentTransferZipDrivePrefix = regexp.MustCompile(`^[A-Za-z]:`)

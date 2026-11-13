@@ -15,33 +15,34 @@ var isDev = true
 
 // Handlers holds all HTTP handler instances
 type Handlers struct {
-	Logger         *handlers.LogHandler
-	ProxyRegistry  *handlers.ProxyRegistryHandler
-	SSHKnownHosts  *handlers.SSHKnownHostsHandler
-	SSHIngress     *handlers.SSHIngressHandler
-	SoftwareCfg    *handlers.SoftwareConfigHandler
-	Token          *handlers.TokenHandler
-	Run            *handlers.RunHandler
-	SystemService  *handlers.SystemServiceHandler
-	LogStream      *handlers.LogStreamHandler
-	SoftwareUpdate *handlers.SoftwareUpdateHandler
-	Rules          *handlers.RulesHandler
-	DNSCache       *handlers.DNSCacheHandler
-	Cert           *handlers.CertHandler
-	Auth           *handlers.AuthHandler
-	Startup        *handlers.StartupHandler
-	Config         *handlers.ConfigHandler
-	TrafficStats   *handlers.TrafficStatsHandler
-	HTTPStats      *handlers.HTTPStatsHandler
-	Status         *handlers.StatusHandler
-	Chat           *handlers.ChatHandler
-	UserCenter     *handlers.UserCenterHandler
-	Dashboard      *handlers.DashboardHandler
-	QuickSetup     *handlers.QuickSetupHandler
-	Tutorial       *handlers.TutorialHandler
-	Agent          *handlers.AgentHandler
-	Mesh           *handlers.MeshHandler
-	Memory         *handlers.AgentMemoryHandler
+	Logger           *handlers.LogHandler
+	ProxyRegistry    *handlers.ProxyRegistryHandler
+	SSHKnownHosts    *handlers.SSHKnownHostsHandler
+	SSHIngress       *handlers.SSHIngressHandler
+	SSHIngressKeygen *handlers.SSHIngressKeygenHandler
+	SoftwareCfg      *handlers.SoftwareConfigHandler
+	Token            *handlers.TokenHandler
+	Run              *handlers.RunHandler
+	SystemService    *handlers.SystemServiceHandler
+	LogStream        *handlers.LogStreamHandler
+	SoftwareUpdate   *handlers.SoftwareUpdateHandler
+	Rules            *handlers.RulesHandler
+	DNSCache         *handlers.DNSCacheHandler
+	Cert             *handlers.CertHandler
+	Auth             *handlers.AuthHandler
+	Startup          *handlers.StartupHandler
+	Config           *handlers.ConfigHandler
+	TrafficStats     *handlers.TrafficStatsHandler
+	HTTPStats        *handlers.HTTPStatsHandler
+	Status           *handlers.StatusHandler
+	Chat             *handlers.ChatHandler
+	UserCenter       *handlers.UserCenterHandler
+	Dashboard        *handlers.DashboardHandler
+	QuickSetup       *handlers.QuickSetupHandler
+	Tutorial         *handlers.TutorialHandler
+	Agent            *handlers.AgentHandler
+	Mesh             *handlers.MeshHandler
+	Memory           *handlers.AgentMemoryHandler
 
 	statsCollector     *statistic.StatsCollector
 	httpStatsCollector *statistic.HTTPStatsCollector
@@ -78,6 +79,7 @@ func newHandlers(runService *services.RunService) *Handlers {
 		ProxyRegistry:      handlers.NewProxyRegistryHandler(proxyRepository),
 		SSHKnownHosts:      handlers.NewSSHKnownHostsHandlerFromCache(),
 		SSHIngress:         handlers.NewSSHIngressHandlerFromCache(),
+		SSHIngressKeygen:   handlers.NewSSHIngressKeygenHandler(),
 		SoftwareCfg:        handlers.NewSoftwareConfigHandler(softwareCfgService),
 		Token:              handlers.NewTokenHandler(tokenService),
 		Run:                handlers.NewRunHandler(runService),
@@ -131,6 +133,10 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	// Server.Start);双注册另一处 agentruntime server.go registerAgentRoutes
 	// (缺任一侧=404 透传,同上 2026-10-21 教训;parity 正则已覆盖 /api/proxy)。
 	register("/api/proxy/ssh-ingress/hostkey", h.SSHIngress.HandleHostkey, http.MethodGet)
+	// SSH 入口一键生成(spec 2026-11-12 §1.2):POST 无状态纯生成,私钥只在
+	// 响应出现一次;双注册另一处 agentruntime server.go registerAgentRoutes
+	// (缺任一侧=404 透传,2026-10-21 教训;route_parity_test.go 为护栏)。
+	register("/api/proxy/ssh-ingress/keygen", h.SSHIngressKeygen.HandleKeygen, http.MethodPost)
 
 	register("/api/software-config/save", h.SoftwareCfg.HandleSave, http.MethodPost)
 	register("/api/software-config/activate", h.SoftwareCfg.HandleActivate, http.MethodPost)

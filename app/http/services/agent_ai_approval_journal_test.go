@@ -29,11 +29,11 @@ func newJournalTestManager(t *testing.T) *agentAIManager {
 
 func approvalJournalPayload(id string) map[string]interface{} {
 	return map[string]interface{}{
-		"type":       "ai.approval.request",
+		"type":        "ai.approval.request",
 		"approval_id": id,
-		"session_id": "s-j",
-		"kind":       "command",
-		"command":    "git push",
+		"session_id":  "s-j",
+		"kind":        "command",
+		"command":     "git push",
 	}
 }
 

@@ -17,7 +17,7 @@ package test
 //
 // 黑盒约束:test 包只消费导出 API——inbound/ssh(NewServer/Start/Stop/Addr/
 // RunConfig/MeshKey/Form*)、outbound/proxy/mesh(ExitClient/PeerSpec/
-// ChannelMeshExit/SignerFromPEM/ExitPayloadForMetadata/DialMeshAddr)、gossh。
+// ChannelMeshExit/SignerFromPEM/ExitPayloadForMetadata)、gossh。
 // B 侧收到注入后的验证不可走 processor/tcp 管线(GetHandler() 单例会把 tcp
 // 注入真拨进外网),故「tcp 目标注入后」的验证改走 mesh-exit 服务端回显模式
 // (自建纯 gossh 服务端,meshExitSSHD);真 inbound/ssh 入口只承担 Reject

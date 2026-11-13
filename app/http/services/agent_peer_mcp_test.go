@@ -318,7 +318,6 @@ func TestAgentCorePeerToolsGatedByPeerMCPEnabled(t *testing.T) {
 	}
 }
 
-
 // —— 2026-11-05 per-kernel 细分开关:逐内核应用/自愈/回显 ——
 
 // 逐内核原语:关 claude 不碰 codex;Expected 随载荷回显。

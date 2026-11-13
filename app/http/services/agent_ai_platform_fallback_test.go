@@ -32,8 +32,8 @@ func policyRun(tier string) agentAIRun {
 	return agentAIRun{
 		sessionID: "sess-1", runSeq: 1, approvalToken: "tok",
 		claudePolicy: agentAIClaudeRemotePolicy{
-			enabled:   true,
-			trustTier: tier,
+			enabled:       true,
+			trustTier:     tier,
 			permissionAsk: []string{"Bash", "Edit", "Write", "NotebookEdit", "mcp__*"},
 		},
 	}

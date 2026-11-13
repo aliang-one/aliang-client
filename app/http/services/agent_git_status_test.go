@@ -329,8 +329,8 @@ func TestLoadGitStatusMapSingleFlight(t *testing.T) {
 			done <- result{m: m}
 		}()
 	}
-	<-entered          // runner 已进入(一次)
-	close(release)     // 放行
+	<-entered      // runner 已进入(一次)
+	close(release) // 放行
 	r1, r2 := <-done, <-done
 	if calls != 1 {
 		t.Fatalf("并发下 status 调用 = %d, want 1(single-flight)", calls)

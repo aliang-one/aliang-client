@@ -10,8 +10,9 @@ import (
 // 2026-10-13 卡顿定位 P0-B: server 的 resize 合并闸之后仍可能送来与当前
 // 几何一致的 terminal.resize(竞态/旧帧);再打 PTY ioctl 就是白送的
 // SIGWINCH→TUI 全屏重绘放大器。本组用例钉死 agent 侧行为:
-//   同值(含归一化后同值) → 只回执 resized,不碰 PTY;
-//   不同值 → 照常 resize 并更新记录几何。
+//
+//	同值(含归一化后同值) → 只回执 resized,不碰 PTY;
+//	不同值 → 照常 resize 并更新记录几何。
 func TestAgentTerminalResizeDedupesSameGeometry(t *testing.T) {
 	m := newAgentTerminalManager()
 	coll, write := newPayloadCollector()
