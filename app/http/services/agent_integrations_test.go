@@ -73,13 +73,14 @@ func TestCollectAgentIntegrationsMergesAndMarksKernelState(t *testing.T) {
 		t.Fatalf("tool_prefix 错误: %q", shell.ToolPrefix)
 	}
 
-	// 2) http + 自定义 headers：内核采集到但 v1 跳过 → skipped_headers
+	// 2) http + 自定义 headers：内核采集到 → injected（2026-11-14 起 headers
+	// 由内核 RoundTripper 注入，skipped_headers 状态已随预筛拆除）
 	remote, ok := byName["remote"]
 	if !ok {
 		t.Fatalf("缺少 remote 条目: %+v", report.MCPServers)
 	}
-	if remote.KernelState != agentIntegrationKernelSkippedHeaders {
-		t.Fatalf("remote 应为 skipped_headers，实际 %q", remote.KernelState)
+	if remote.KernelState != agentIntegrationKernelInjected {
+		t.Fatalf("remote 应为 injected，实际 %q", remote.KernelState)
 	}
 
 	// 3) codex 配置不进内核 → not_collected
@@ -186,12 +187,12 @@ func TestCollectAgentIntegrationsMasterOffMarksDisabled(t *testing.T) {
 	for _, srv := range report.MCPServers {
 		byName[srv.Name] = srv
 	}
-	// 总闸关闭压过一切：stdio 条目与「headers 跳过」条目都不再连。
+	// 总闸关闭压过一切：stdio 条目与 http+headers 条目都不再连。
 	if got := byName["shell"].KernelState; got != agentIntegrationKernelDisabled {
 		t.Fatalf("shell 应为 disabled, got %q", got)
 	}
 	if got := byName["remote"].KernelState; got != agentIntegrationKernelDisabled {
-		t.Fatalf("remote 应为 disabled(总闸压过 headers 跳过), got %q", got)
+		t.Fatalf("remote 应为 disabled(总闸压过 headers 注入), got %q", got)
 	}
 	// codex 条目本就不在内核采集面内，仍是 not_collected。
 	if got := byName["docs"].KernelState; got != agentIntegrationKernelNotCollected {

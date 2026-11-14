@@ -223,14 +223,106 @@ func TestAgentCoreMCPBridgeName(t *testing.T) {
 	}
 }
 
-func TestAgentCoreMCPServerToolDefsSkipsHeaders(t *testing.T) {
+// TestAgentCoreMCPServerToolDefsInjectsHeadersServer 2026-11-14 起 headers
+// 预筛已拆除：带自定义 headers 的 http/sse 条目不再被跳过，照常进入建连
+// （真建连的 header 注入由 TestAgentCoreMCPDialInjectsHeadersToEndToEnd 钉死）。
+func TestAgentCoreMCPServerToolDefsInjectsHeadersServer(t *testing.T) {
 	m := &agentAIManager{}
+	dialed := false
+	m.coreMCPDialForTest = func(ctx context.Context, raw agentCoreMCPRawServer) (*mcp.ClientSession, func(), error) {
+		if raw.Name == "authed" {
+			dialed = true
+		}
+		return startTestMCPSession(t, "t", func(map[string]interface{}) (string, bool) { return "ok", false }), func() {}, nil
+	}
 	bridges, closeAll := m.agentCoreMCPServerToolDefs(context.Background(), []agentCoreMCPRawServer{
 		{Name: "authed", Type: "http", URL: "https://mcp.example.com/mcp", Headers: map[string]string{"Authorization": "Bearer x"}},
 	}, nil)
 	defer closeAll()
-	if len(bridges) != 0 {
-		t.Fatalf("带 headers 的 http server 应预判跳过（不 dial）: %+v", bridges)
+	if len(bridges) != 1 {
+		t.Fatalf("带 headers 的 http server 不应再被预筛跳过: %+v", bridges)
+	}
+	if !dialed {
+		t.Fatal("带 headers 的 http server 应进入建连路径")
+	}
+}
+
+func TestAgentCoreMCPHeaderTransport(t *testing.T) {
+	if withAgentCoreMCPHeaders(nil) != nil || withAgentCoreMCPHeaders(map[string]string{}) != nil {
+		t.Fatal("空 headers 应返回 nil（SDK 走默认客户端）")
+	}
+	// 经测试用 RoundTripper 断言注入结果，不发真请求。
+	var got http.Header
+	rt := &agentCoreMCPHeaderTransport{
+		headers: map[string]string{"Authorization": "Bearer t", "X-K": "v"},
+		base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			got = req.Header.Clone()
+			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: http.NoBody}, nil
+		}),
+	}
+	req, _ := http.NewRequest(http.MethodGet, "https://mcp.example.com/mcp", nil)
+	req.Header.Set("Accept", "text/event-stream") // SDK 摆的协议头
+	if _, err := rt.RoundTrip(req); err != nil {
+		t.Fatalf("RoundTrip: %v", err)
+	}
+	if got.Get("Authorization") != "Bearer t" || got.Get("X-K") != "v" {
+		t.Fatalf("自定义 headers 未注入: %v", got)
+	}
+	if got.Get("Accept") != "text/event-stream" {
+		t.Fatalf("SDK 已摆的协议头不得被覆盖: %v", got)
+	}
+}
+
+// roundTripFunc http.RoundTripper 的函数适配器（测试断言用）。
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+// TestAgentCoreMCPDialInjectsHeadersToEndToEnd 端到端：httptest 起真
+// streamable MCP server，agentCoreMCPDial 真建连，服务端记录每个请求的
+// Authorization。钉死「配置 headers 真的上了 HTTP 请求」这一契约——
+// RoundTripper 单测只能证明注入逻辑，证明不了 SDK 确实用了这个 client。
+// 注意：getServer 每个请求都会被调（init/initialized/SSE GET/CallTool/
+// 关闭 DELETE……次数不可控），记录必须走非阻塞追加，不能往有界 channel
+// 发送——塞满会阻塞 handler，httptest.Server.Close 死等（实测踩坑）。
+func TestAgentCoreMCPDialInjectsHeadersToEndToEnd(t *testing.T) {
+	var mu sync.Mutex
+	var auths []string
+	record := func(r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		auths = append(auths, r.Header.Get("Authorization"))
+	}
+	server := mcp.NewServer(&mcp.Implementation{Name: "e2e", Version: "0"}, nil)
+	server.AddTool(&mcp.Tool{Name: "t", InputSchema: map[string]any{"type": "object"}},
+		func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "ok"}}}, nil
+		})
+	srv := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(r *http.Request) *mcp.Server {
+		record(r)
+		return server
+	}, nil))
+	t.Cleanup(srv.Close)
+
+	raw := agentCoreMCPRawServer{Name: "e2e", Type: "http", URL: srv.URL + "/mcp", Headers: map[string]string{"Authorization": "Bearer e2e-token"}}
+	session, closeFn, err := agentCoreMCPDial(context.Background(), raw)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	if _, err := session.CallTool(context.Background(), &mcp.CallToolParams{Name: "t"}); err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	closeFn()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(auths) == 0 {
+		t.Fatal("服务端未记录到任何请求")
+	}
+	for i, got := range auths {
+		if got != "Bearer e2e-token" {
+			t.Fatalf("第 %d 个请求未携带/错值 Authorization: %q（全部 %v）", i+1, got, auths)
+		}
 	}
 }
 

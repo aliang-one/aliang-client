@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -433,18 +434,47 @@ func filterAgentCoreMCPTools(tools []*mcp.Tool, include, exclude []string, serve
 	return out, nil
 }
 
+// agentCoreMCPHeaderTransport 把配置里的自定义 headers 注入每个出站 HTTP
+// 请求（Authorization 等）。SDK（go-sdk v1.8.0）自身会在请求上摆协议头
+// （MCP-Protocol-Version 等），这里只补配置头、不覆盖已存在的键，两者正交。
+// 安全红线锚点：header 值只存在于此 transport 与 sdk 内部，永不进日志。
+type agentCoreMCPHeaderTransport struct {
+	base    http.RoundTripper
+	headers map[string]string
+}
+
+func (t *agentCoreMCPHeaderTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	for k, v := range t.headers {
+		req.Header.Set(k, v)
+	}
+	base := t.base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	return base.RoundTrip(req)
+}
+
+// withAgentCoreMCPHeaders 为 http/sse transport 挂上自定义 headers 的
+// http.Client（nil/空 headers 返回 nil，让 SDK 走默认客户端——保持与
+// 无 headers 条目完全相同的链路）。
+func withAgentCoreMCPHeaders(headers map[string]string) *http.Client {
+	if len(headers) == 0 {
+		return nil
+	}
+	return &http.Client{Transport: &agentCoreMCPHeaderTransport{headers: headers}}
+}
+
 // agentCoreMCPDial 按 raw 配置建一条连接。transport 选择：stdio→CommandTransport；
-// type=http→Streamable；type=sse→SSE。返回 session 与关闭函数。
-// ⚠️ raw.Headers 暂未注入：go-sdk v1.8.0 两个 HTTP transport 均无 Headers
-// 字段（需自 RoundTripper）；带非空 Headers 的条目由 agentCoreMCPServerToolDefs
-// 预判跳过，别白烧超时预算 dial 一个注定 401 的连接。
+// type=http→Streamable；type=sse→SSE。http/sse 带自定义 headers 时经
+// header RoundTripper 注入（2026-11-14 起 v1 已知限制解除，spec §5 Amendment）。
+// 返回 session 与关闭函数。
 func agentCoreMCPDial(ctx context.Context, raw agentCoreMCPRawServer) (*mcp.ClientSession, func(), error) {
 	var transport mcp.Transport
 	switch {
 	case strings.EqualFold(raw.Type, "http"):
-		transport = &mcp.StreamableClientTransport{Endpoint: raw.URL}
+		transport = &mcp.StreamableClientTransport{Endpoint: raw.URL, HTTPClient: withAgentCoreMCPHeaders(raw.Headers)}
 	case strings.EqualFold(raw.Type, "sse"):
-		transport = &mcp.SSEClientTransport{Endpoint: raw.URL}
+		transport = &mcp.SSEClientTransport{Endpoint: raw.URL, HTTPClient: withAgentCoreMCPHeaders(raw.Headers)}
 	default:
 		cmd := exec.Command(raw.Command, raw.Args...)
 		cmd.Env = os.Environ()
@@ -566,18 +596,6 @@ func (m *agentAIManager) agentCoreMCPServerToolDefs(ctx context.Context, raws []
 		logger.Info(fmt.Sprintf("agentcore-mcp: 注入 %d 个 MCP 工具（cap %d）", len(bridges), agentCoreMCPToolCap))
 	}
 
-	// 预筛：带自定义 headers 的 http/sse 条目 v1 不支持，直接跳过（不 dial）。
-	targets := make([]int, 0, len(raws))
-	for i, raw := range raws {
-		isHTTP := strings.EqualFold(raw.Type, "http") || strings.EqualFold(raw.Type, "sse")
-		if isHTTP && len(raw.Headers) > 0 {
-			skipped++
-			logger.Warn(fmt.Sprintf("agentcore-mcp: server 跳过 server=%s reason=headers 暂不支持（v1 限制）", sanitizeAgentCoreMCPSegment(raw.Name)))
-			continue
-		}
-		targets = append(targets, i)
-	}
-
 	// 测试注入优先：内存 session 替真 dial（忽略 raw）；nil 走真实路径。
 	dial := agentCoreMCPDial
 	if m != nil && m.coreMCPDialForTest != nil {
@@ -597,16 +615,16 @@ func (m *agentAIManager) agentCoreMCPServerToolDefs(ctx context.Context, raws []
 		tools   []*mcp.Tool
 		err     error
 	}
-	outcomes := make([]dialOutcome, len(targets))
+	outcomes := make([]dialOutcome, len(raws))
 	sem := make(chan struct{}, agentCoreMCPDialConcurrency)
 	var wg sync.WaitGroup
-	for k, idx := range targets {
+	for k := range raws {
 		wg.Add(1)
-		go func(k, idx int) {
+		go func(k int) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			raw := raws[idx]
+			raw := raws[k]
 			sctx, cancel := context.WithCancel(ctx)
 			session, closeFn, err := agentCoreMCPDialWithTimeout(dial, sctx, raw, agentCoreMCPInitTimeout)
 			if err != nil {
@@ -631,7 +649,7 @@ func (m *agentAIManager) agentCoreMCPServerToolDefs(ctx context.Context, raws []
 					cancel()
 				}, raw, dial),
 			}
-		}(k, idx)
+		}(k)
 	}
 	wg.Wait()
 

@@ -88,6 +88,30 @@ runAgentCore 入口（现有 Config 组装点附近）
 - 工具总数上限 **128**（防 prompt 爆炸）：按 server 顺序收集，超限截断 + Warn；
   内置 8 工具不受影响。
 
+> **Amendment（2026-11-14，headers 注入落地——v1 已知限制解除）：**
+> 1. **限制的反面坐实**：预筛跳过让 aliangboard（Authorization）/context7
+>    （CONTEXT7_API_KEY）/glm-camp（Authorization）三个 http+headers server
+>    永久不可用，面板标「受限跳过」，K8s 运维工具链整体缺席——实际上
+>    go-sdk v1.8.0 两个 HTTP transport 都暴露 `HTTPClient *http.Client` 字段，
+>    自定义 RoundTripper 注入 headers 是标准做法，限制本可解除。
+> 2. **修法**：`agentCoreMCPHeaderTransport`（`agent_ai_agentcore_mcp.go`）
+>    把配置 headers 逐请求 Set 到 outbound request 上（只补配置头、不覆盖
+>    SDK 已摆的协议头如 MCP-Protocol-Version），经 `withAgentCoreMCPHeaders`
+>    挂到 Streamable/SSE transport 的 `HTTPClient`；空 headers 返回 nil 保持
+>    SDK 默认客户端链路不变。安全红线维持：header 值只进 transport，永不进
+>    日志/journal/审批卡。
+> 3. **预筛与面板状态拆除**：`agentCoreMCPServerToolDefs` 删除 headers 预筛
+>    （http+headers 条目照常进建连）；`agent_integrations.go` 删
+>    `skipped_headers` 状态与 `isHTTPWithHeaders`，headers 条目归
+>    `injected`（全局总闸 disabled 语义不变，优先级仍最高）。
+> 4. **测试**：RoundTripper 单测（注入 + 协议头不覆盖 + 空 headers nil）+
+>    httptest 真 streamable server 端到端（`TestAgentCoreMCPDial
+>    InjectsHeadersToEndToEnd` 断言每个请求都带 Authorization）。
+>    ⚠️ 测试踩坑：streamable 会话的 HTTP 请求数不可控（init/initialized/
+>    SSE GET/CallTool/关闭 DELETE），服务端记录必须走 mutex 非阻塞追加，
+>    有界 channel 塞满会阻塞 handler 使 `httptest.Server.Close` 死等。
+
+
 ## 6. 工具包装（mcpBridgeTool）
 
 实现 `agentcore.Tool` 四方法：
