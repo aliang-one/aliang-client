@@ -95,6 +95,16 @@
 - 切换:编辑态中点另一条消息的「撤回重发」→ 直接切换目标(重置 banner 文案与回填文本),不打断。
 - 失败回滚:create 超时/被拒 → **不发 ai.message**;编辑态保留 + 提示条「撤回未确认,可重试」;由于 journal 截断按 beforeMessageID 位置语义**幂等**,直接重发同一 create 即安全收敛;终态展示以刷新后的 journal 详情为准(重开会话重拉)。
 
+**Amendment（2026-11-14，手机端撤回重发全链——本节 §A 的手机面落地）：**
+
+> 本批补齐 §A 明确不做的「手机端/PhoneServer 代码改动」，把撤回重发延伸到手机通道。三仓分工：
+>
+> 1. **内核（alianggate）**：v3 手机回合入口是 `ai.run.start` 原子帧（不先发 `ai.session.create`），§A 的 create 截断对手机不可达。故 `runStart()`（agent_ai.go）新增同款截断纪律：`truncate_before_message_id` 在身份/绑定解析后、`m.message()` 委托前消费——活跃拒绝先于任何 journal 写（拒绝帧经 runEmitter 带 run_id/message_id，走 v2 终态屏障供云端 outbox 收敛）、journal 截断幂等、截断后 `readAgentCoreJournalHistoryFrom` 全文重建 history 注入 `msg["history"]`；`message()` 存量会话分支新增 historyFrame 门（键存在即消费，空切片合法=撤回到空；懒建分支天然装回截断后 journal）。provider≠agentcore 静默忽略锚点（§A 同款）。回执：`ai.run.notice{code:'truncate_applied'}`（已登记帧型，老客户端忽略无害）。测试 `agent_ai_runstart_truncate_test.go` 五用例（重建/活跃拒绝/撤回到空/重投幂等/非 agentcore 忽略）。
+> 2. **PhoneServer（云端桥）**：`aiMessageSchema` 增 `recall_message_id`；`routes/ai.ts` messages 端点路由级校验运行中拒绝（409 `recall_run_active`，网页端 stop-铁律的手机面）；`dispatch.ts` 在回合状态变更前校验（422 `recall_unsupported_provider` / `recall_anchor_invalid`——锚点必须存在、user 角色、未隐藏、provider=agentcore）并在 claim 前落**软隐藏**（`hiddenAt` 盖章，内存+DB 双写：`hideAiMessagesAfter` 按 position、`hideStructuredEventsByMessageIds` 按 message_id 集合，goalDelete.ts 同款纪律）——展示/分页/LLM 上下文载荷（`aiAgentTranscriptPayload` 过滤 hiddenAt）随即剔除；`agentPublish.ts` 把锚点透传为 run.start（v3）与 create（v2）的 `truncate_before_message_id`。「服务端软隐藏 + 内核硬截断」各管各的权威源，journal 侧一致性由内核幂等截断保证。测试 `recallResend.test.ts` 八用例。
+> 3. **手机 App（RN）**：`sendAiMessage` API/transport 链增 `recallMessageId` 末位可选参；store `appendAgentMessage` 增 options.recallMessageId（进锁键；绝不走 steer 通道——撤回语义是新回合截断）；屏幕接线 §A 组件层既有但未接线的长按菜单（`onEditAndResend`，此前组件+测试已就绪但无屏幕传入）：`recallSupported`=agentcore 且非草稿（服务端同口径前置隐藏入口）→ 长按回填原文 + `recall-draft-banner` 编辑态横幅 → 发送时刻运行中先 stop（interrupt 通道 + 8s 终态轮询，超时放回输入框不硬发）→ `recall_message_id` 随消息发送，成功清编辑态。i18n zh/en `session.recall.*` 四键。
+>
+> 边界留档：手机端导入/TUI 会话（executor='tui'）锚点 id 与 journal 无同源保证，当前不额外拦截，依赖内核锚点 no-op 幂等安全（截不中=原样续聊，无静默分叉——与 §A 设备壳禁用理由不同：手机侧 transcript 本就来自 journal 同源上报，分叉风险不存在）；文件副作用不回滚（§A 同旨）。
+
 ### B. effort / 会话设置呈现
 
 - 设置条保留单行形态(锁定态 `chat-settings-directory` 仍为 span),视觉重设计;effort 当前值 chip 常驻。

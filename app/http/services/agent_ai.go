@@ -2305,6 +2305,18 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 		"received_at": time.Now().UTC().Format(time.RFC3339Nano),
 	})
 
+	// 撤回重发 v3 回执（2026-11-14）：runStart 截断成功时向订阅面回执一帧，
+	// 手机/网页可据此提示「已撤回锚点后的消息」。ai.run.notice 是已登记的
+	// 非致命提示帧（AgentEventAIRunNotice 契约行），老客户端忽略无害。
+	if _, applied := msg["truncate_applied"].(bool); applied {
+		_ = runWrite(map[string]interface{}{
+			"type":       models.AgentEventAIRunNotice,
+			"session_id": sessionID,
+			"message_id": messageID,
+			"code":       "truncate_applied",
+		})
+	}
+
 	if err := m.preemptForGoalRun(
 		sessionID,
 		messageRun.runID,
@@ -2496,6 +2508,13 @@ func (m *agentAIManager) message(msg map[string]interface{}, writeJSON agentTerm
 		if m.coreJournal != nil {
 			m.coreJournal.syncSessionApprovalMode(sessionID, approvalMode, ok)
 		}
+	}
+	// 撤回重发 v3：runStart 截断后注入的截断 history（键存在即消费，值类型
+	// 断言失败视为未带键）。空切片合法（撤回到空）——必须允许空覆盖，否则
+	// 截断后的会话内存里仍留着旧行，模型从本回合起看见已撤回的上下文。
+	// 懒建分支不经此处：journal 已截断，装回的天然就是截断后历史。
+	if historyFrame, hasFrame := msg["history"].([]agentAIMessage); hasFrame {
+		session.history = trimAgentAIHistoryForSession(session, historyFrame)
 	}
 	if surface := normalizeAgentAISurface(remoteString(msg, "surface")); surface != "" {
 		session.surface = surface
@@ -2708,6 +2727,55 @@ func (m *agentAIManager) runStart(msg map[string]interface{}, writeJSON agentTer
 		}
 	}
 	m.mu.Unlock()
+
+	// 撤回重发 v3 通道（2026-11-14）：ai.run.start 携带 truncate_before_message_id
+	// 时，在本回合开跑前截断 journal 到锚点行之前，并从截断后 journal 全文重建
+	// history——与 create() 的截断纪律逐条对齐（spec §A.2 的 v3 面）：
+	//   1. 活跃拒绝先于任何 journal 写（cancel != nil 即 runAgentCore defer LIFO
+	//      已落 end 行的清位锚）——被拒时 journal 必须原封不动；
+	//   2. 截断历史按「文件位置语义」幂等（outbox 重投收敛），截断成功后文件
+	//      必在，ErrNotExist 一律拒绝绝不静默回退；
+	//   3. 截断后的 history 注入 msg["history"]（message() 消费，见下），锚点
+	//      后的 transcript 不会经由任何路径回灌。
+	// 重建结果的内存落地在 message() 内完成：懒建分支装回截断后 journal（天然
+	// 一致）；存量会话分支消费 msg["history"] 覆盖（historyFrame != nil 门）。
+	// 与 create 相同，provider != agentcore 时静默忽略锚点（v2 语义）。
+	truncateBeforeID := strings.TrimSpace(remoteString(msg, "truncate_before_message_id"))
+	if truncateBeforeID != "" && provider == "agentcore" {
+		m.mu.Lock()
+		existingPeek := m.sessions[sessionID]
+		busy := existingPeek != nil && existingPeek.cancel != nil
+		m.mu.Unlock()
+		if busy {
+			emitter := m.runEmitter(agentAIRun{
+				runID: runID, sessionID: sessionID, messageID: messageID,
+				originSocketID: strings.TrimSpace(remoteString(msg, agentAIOriginSocketField)),
+				goalIdentity:   goalRunIdentityFromMessage(msg),
+			}, writeJSON)
+			_ = emitter.emit(agentAIErrorPayload(sessionID, messageID, &agentAITruncateError{code: truncateErrCodeRunActive, msg: "ai.run.start truncate rejected: run active"}))
+			return
+		}
+		if m.coreJournal == nil {
+			_ = writeJSON(agentAIErrorPayload(sessionID, messageID, &agentAITruncateError{code: truncateErrCodeJournalUnavailable, msg: "ai.run.start truncate unavailable: journal disabled"}))
+			return
+		}
+		if _, err := m.coreJournal.truncateBefore(sessionID, truncateBeforeID); err != nil {
+			_ = writeJSON(agentAIErrorPayload(sessionID, messageID, &agentAITruncateError{code: truncateErrCodeFailed, msg: "ai.run.start truncate failed", err: err}))
+			return
+		}
+		hist, _, rerr := readAgentCoreJournalHistoryFrom(m.coreJournal.dir, sessionID)
+		if rerr != nil {
+			// 截断成功后文件必在；ErrNotExist 只会出现在「从未落过 journal」
+			// 的 no-op 截断上——同样拒绝，绝不静默回退空 history（镜像
+			// create 同款注释）。
+			_ = writeJSON(agentAIErrorPayload(sessionID, messageID, &agentAITruncateError{code: truncateErrCodeRebuildFailed, msg: "ai.run.start rebuild failed", err: rerr}))
+			return
+		}
+		// 交给 message()：懒建分支直接装回；存量分支经 historyFrame 门覆盖。
+		// 空 history 合法（撤回到空），保持键存在、值为空切片。
+		msg["history"] = hist
+		msg["truncate_applied"] = true
+	}
 
 	msg["resume_session_id"] = resumeID
 	msg["reserved_native_session_id"] = reservedID
