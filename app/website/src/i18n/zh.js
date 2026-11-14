@@ -906,7 +906,7 @@ export default {
   rules_configSaved: '配置已保存',
   // —— SSH 上游代理（Task 12）：私钥/跳板/指纹文案 ——
   rules_proxyUsernamePlaceholderSsh: '必填',
-  rules_proxyPasswordPlaceholderSsh: '密码或私钥至少填一项',
+  rules_proxyPasswordPlaceholderSsh: '密码登录',
   rules_proxyPrivateKey: '私钥',
   rules_proxyPrivateKeyPlaceholder: '粘贴 PEM 全文，以 -----BEGIN OPENSSH PRIVATE KEY----- 开头',
   rules_proxyKeyPassphrase: '私钥口令',
@@ -918,14 +918,18 @@ export default {
   rules_proxyJumpAdd: '添加跳板',
   rules_proxyJumpRemove: '删除该跳板',
   rules_proxyJumpServerPlaceholder: 'host:port 或 ssh://user:pass@host:port',
-  rules_proxyJumpExpandKey: '私钥（可选）',
-  rules_proxyJumpCollapseKey: '收起私钥',
+  // 跳板行认证同样二选一：按钮在密码/私钥两种登录方式间切换该行
+  rules_sshUseKeyAuth: '改用私钥登录',
+  rules_sshUsePasswordAuth: '改用密码登录',
   // 与后端 SSHProxyConfig.Validate 对齐的前端校验文案（提示层，后端仍是权威）
   rules_sshValidationErrorUsername: 'SSH 上游代理需要填写用户名。',
-  rules_sshValidationErrorAuth: 'SSH 上游代理需要填写密码或私钥至少一项。',
+  rules_sshValidationErrorAuth: 'SSH 上游代理需要填写认证凭据：在「密码登录」中填写密码，或切到「私钥登录」粘贴私钥。',
   rules_sshValidationErrorJumpServer: '第 {index} 个跳板需要填写服务器地址。',
   rules_sshValidationErrorJumpUsername: '第 {index} 个跳板需要填写用户名。',
-  rules_sshValidationErrorJumpAuth: '第 {index} 个跳板需要填写密码或私钥至少一项。',
+  rules_sshValidationErrorJumpAuth: '第 {index} 个跳板需要填写认证凭据：填写密码，或改用私钥登录。',
+  // SSH 认证方式 tab：密码/私钥是互斥的两种凭据
+  rules_sshAuthModePassword: '密码登录',
+  rules_sshAuthModeKey: '私钥登录',
   rules_knownHostsTitle: '服务器指纹',
   rules_knownHostsDesc: '首次连接时记录的 SSH 主机指纹（TOFU）；主机更换后删除旧指纹即可重新校验。',
   rules_knownHostsEmpty: '暂无已记录的服务器指纹。',

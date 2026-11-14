@@ -110,7 +110,8 @@
               />
             </label>
 
-            <label class="space-y-2">
+            <!-- 密码输入仅 socks5/http 走共享网格；SSH 的密码收进下方「认证方式」tab（与私钥二选一） -->
+            <label v-if="!isSshProxy" class="space-y-2">
               <span class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('rules_proxyPassword') }}</span>
               <input
                 v-model="form.proxy.password"
@@ -118,7 +119,7 @@
                 :disabled="!form.proxy.enable"
                 autocomplete="current-password"
                 class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
-                :placeholder="isSshProxy ? t('rules_proxyPasswordPlaceholderSsh') : t('rules_proxyPasswordPlaceholder')"
+                :placeholder="t('rules_proxyPasswordPlaceholder')"
                 type="password"
                 @keydown.enter.prevent
               />
@@ -129,21 +130,73 @@
           <div v-if="isSshProxy" data-ssh-fields class="mt-2 space-y-4 border-t border-slate-200 pt-4 dark:border-slate-800">
             <p v-if="sshValidationError" class="text-xs text-red-500" role="alert">{{ sshValidationError }}</p>
 
-            <label class="block space-y-2">
-              <span class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('rules_proxyPrivateKey') }}</span>
-              <textarea
-                v-model="form.proxy.private_key"
-                data-field="proxyPrivateKey"
+            <!-- 认证方式 tab：密码/私钥二选一。切换仅改显示面，两侧已填的值都保留在表单
+                 状态里不丢；提交载荷只带当前 tab 侧凭据、另一侧显式置零（父层对空串凭据
+                 字段显式发空串让后端 deep-merge 清旧值）。 -->
+            <div data-ssh-auth-tabs role="tablist" class="inline-flex rounded-lg border border-slate-200 bg-slate-100 p-1 dark:border-slate-700 dark:bg-slate-900">
+              <button
+                type="button"
+                data-ssh-auth-tab-password
+                role="tab"
+                :aria-selected="sshAuthMode === 'password'"
                 :disabled="!form.proxy.enable"
-                autocomplete="off"
-                spellcheck="false"
-                class="min-h-28 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 font-mono text-xs text-slate-700 shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
-                :placeholder="t('rules_proxyPrivateKeyPlaceholder')"
-              ></textarea>
+                class="inline-flex items-center gap-1 rounded-md px-3 py-1.5 text-xs font-medium transition"
+                :class="sshAuthMode === 'password'
+                  ? 'bg-white text-slate-900 shadow-sm dark:bg-slate-800 dark:text-white'
+                  : 'text-slate-500 hover:text-slate-700 disabled:cursor-not-allowed disabled:opacity-60 dark:text-slate-400 dark:hover:text-slate-200'"
+                @click="setSshAuthMode('password')"
+              >
+                <span class="material-symbols-outlined text-sm">password</span>
+                {{ t('rules_sshAuthModePassword') }}
+              </button>
+              <button
+                type="button"
+                data-ssh-auth-tab-key
+                role="tab"
+                :aria-selected="sshAuthMode === 'key'"
+                :disabled="!form.proxy.enable"
+                class="inline-flex items-center gap-1 rounded-md px-3 py-1.5 text-xs font-medium transition"
+                :class="sshAuthMode === 'key'
+                  ? 'bg-white text-slate-900 shadow-sm dark:bg-slate-800 dark:text-white'
+                  : 'text-slate-500 hover:text-slate-700 disabled:cursor-not-allowed disabled:opacity-60 dark:text-slate-400 dark:hover:text-slate-200'"
+                @click="setSshAuthMode('key')"
+              >
+                <span class="material-symbols-outlined text-sm">key</span>
+                {{ t('rules_sshAuthModeKey') }}
+              </button>
+            </div>
+
+            <!-- 密码登录面板 -->
+            <label v-if="sshAuthMode === 'password'" data-ssh-auth-password class="block space-y-2">
+              <span class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('rules_proxyPassword') }}</span>
+              <input
+                v-model="form.proxy.password"
+                data-field="proxyPassword"
+                :disabled="!form.proxy.enable"
+                autocomplete="current-password"
+                class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                :placeholder="t('rules_proxyPasswordPlaceholderSsh')"
+                type="password"
+                @keydown.enter.prevent
+              />
             </label>
 
-            <div class="grid gap-4 md:grid-cols-2">
-              <label class="space-y-2">
+            <!-- 私钥登录面板：私钥 + 口令 -->
+            <div v-else data-ssh-auth-key class="space-y-4">
+              <label class="block space-y-2">
+                <span class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('rules_proxyPrivateKey') }}</span>
+                <textarea
+                  v-model="form.proxy.private_key"
+                  data-field="proxyPrivateKey"
+                  :disabled="!form.proxy.enable"
+                  autocomplete="off"
+                  spellcheck="false"
+                  class="min-h-28 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 font-mono text-xs text-slate-700 shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                  :placeholder="t('rules_proxyPrivateKeyPlaceholder')"
+                ></textarea>
+              </label>
+
+              <label class="block space-y-2">
                 <span class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('rules_proxyKeyPassphrase') }}</span>
                 <input
                   v-model="form.proxy.key_passphrase"
@@ -156,7 +209,9 @@
                   @keydown.enter.prevent
                 />
               </label>
+            </div>
 
+            <div class="grid gap-4">
               <label class="space-y-2">
                 <span class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('rules_proxyPoolSize') }}</span>
                 <input
@@ -222,16 +277,40 @@
                     type="text"
                     @keydown.enter.prevent
                   />
-                  <input
-                    v-model="jump.password"
-                    data-field="jumpPassword"
+                  <div v-if="jumpAuthMode(jump) === 'password'" class="flex items-center gap-1">
+                    <input
+                      v-model="jump.password"
+                      data-field="jumpPassword"
+                      :disabled="!form.proxy.enable"
+                      autocomplete="new-password"
+                      class="w-full min-w-0 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                      :placeholder="t('rules_proxyPassword')"
+                      type="password"
+                      @keydown.enter.prevent
+                    />
+                    <button
+                      type="button"
+                      data-jump-switch-to-key
+                      :aria-label="t('rules_sshUseKeyAuth')"
+                      :title="t('rules_sshUseKeyAuth')"
+                      :disabled="!form.proxy.enable"
+                      class="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-slate-400 transition hover:bg-primary/5 hover:text-primary disabled:cursor-not-allowed disabled:opacity-60 dark:hover:bg-primary/10 dark:hover:text-primary"
+                      @click="setJumpAuthMode(jump, 'key')"
+                    >
+                      <span class="material-symbols-outlined text-base">key</span>
+                    </button>
+                  </div>
+                  <button
+                    v-else
+                    type="button"
+                    data-jump-switch-to-password
                     :disabled="!form.proxy.enable"
-                    autocomplete="new-password"
-                    class="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm transition focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
-                    :placeholder="t('rules_proxyPassword')"
-                    type="password"
-                    @keydown.enter.prevent
-                  />
+                    class="inline-flex items-center justify-center gap-1 rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-medium text-slate-500 shadow-sm transition hover:border-primary/30 hover:text-primary disabled:cursor-not-allowed disabled:opacity-60 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300"
+                    @click="setJumpAuthMode(jump, 'password')"
+                  >
+                    <span class="material-symbols-outlined text-sm">password</span>
+                    {{ t('rules_sshUsePasswordAuth') }}
+                  </button>
                   <button
                     type="button"
                     data-jump-remove
@@ -244,18 +323,9 @@
                   </button>
                 </div>
 
-                <button
-                  type="button"
-                  data-jump-toggle-key
-                  :disabled="!form.proxy.enable"
-                  class="inline-flex items-center gap-1 text-xs font-medium text-slate-500 transition hover:text-primary disabled:cursor-not-allowed disabled:opacity-60 dark:text-slate-400"
-                  @click="toggleJumpKey(index)"
-                >
-                  <span class="material-symbols-outlined text-sm">{{ jump._keyOpen ? 'expand_less' : 'expand_more' }}</span>
-                  {{ jump._keyOpen ? t('rules_proxyJumpCollapseKey') : t('rules_proxyJumpExpandKey') }}
-                </button>
-
-                <div v-if="jump._keyOpen" class="space-y-2 rounded-lg bg-slate-50 p-3 dark:bg-slate-900/70">
+                <!-- 私钥面板：登录方式为私钥时替换密码输入（私钥全文 + 可选口令）。
+                     跳板行密码/私钥互斥，payload 按当前侧收敛；切回密码登录用上方格子按钮。 -->
+                <div v-if="jumpAuthMode(jump) === 'key'" data-jump-key-panel class="space-y-2 rounded-lg bg-slate-50 p-3 dark:bg-slate-900/70">
                   <textarea
                     v-model="jump.private_key"
                     data-field="jumpPrivateKey"
@@ -972,7 +1042,8 @@ function normalizeProxyRules(raw) {
 
 // jump_servers 线格式（SSHJumpServerRaw）：server 是单串（host:port 或
 // ssh://user:pass@host:port），无独立 port 字段——UI 与载荷都按单串原样透传。
-// 归一化只白名单五个线格式字段，行内 UI 状态（_keyOpen 折叠开关）在此剥除。
+// 归一化只白名单五个线格式字段；行内 UI 状态（_authModeHint 认证二选一面提示，
+// 仅在两侧全空的空行上有意义）不在归一化层种默认值——回显时面板由有值侧推导。
 function normalizeJumpServers(raw) {
   if (!Array.isArray(raw)) {
     return [];
@@ -984,6 +1055,26 @@ function normalizeJumpServers(raw) {
     private_key: typeof entry?.private_key === 'string' ? entry.private_key : '',
     key_passphrase: typeof entry?.key_passphrase === 'string' ? entry.key_passphrase : ''
   }));
+}
+
+// 跳板行认证二选一的面（password/key）：用户显式选择（_authModeHint）优先——否则
+// 密码已有值的行永远切不进私钥面；无提示时按有值侧推导（回显既有配置，初始挂载
+// 的行对象没有 hint）；两侧全空且无提示默认密码面（新行同）。只读推导，行对象上
+// 不落 _authMode 键——提示态单独放 _authModeHint，避免进线格式载荷。
+// 模板经 methods 里的同名转发方法调用（模板只能访问组件属性）。
+function resolveJumpAuthMode(jump) {
+  if (jump?._authModeHint === 'key') return 'key';
+  if (jump?._authModeHint === 'password') return 'password';
+  if (String(jump?.private_key ?? '').trim() || String(jump?.key_passphrase ?? '').trim()) return 'key';
+  return 'password';
+}
+
+// 主连接认证二选一初始面：私钥/口令有值 → 私钥面（存量并存配置落在有值侧，不静默
+// 丢凭据），否则密码面。仅组件初始化用一次；config watcher 刷新表单时不重置用户已选面。
+function initialSshAuthMode(config = {}) {
+  const privateKey = String(config?.proxy?.private_key ?? '').trim();
+  const passphrase = String(config?.proxy?.key_passphrase ?? '').trim();
+  return privateKey || passphrase ? 'key' : 'password';
 }
 
 function normalizeConfig(config = {}) {
@@ -1171,6 +1262,9 @@ export default {
         draft: ''
       },
       form: normalizeConfig(this.config),
+      // SSH 主连接认证二选一的面（password/key）。初始值按配置推导：私钥/口令有值
+      // → 私钥面，否则密码面（存量「密码+私钥并存」的配置落在有值侧，不静默丢凭据）。
+      sshAuthMode: initialSshAuthMode(this.config),
       // 服务器指纹（TOFU）区块状态：失败静默降级，不阻塞主表单
       knownHosts: {
         loading: false,
@@ -1252,13 +1346,13 @@ export default {
       return detectCommaCollapseIssue(this._proxyRulesText, this.t);
     },
     // —— SSH 校验（与后端 SSHProxyConfig.Validate 对齐的提示层，后端保存时仍是权威）——
-    // username 必填 + 密码/私钥至少其一；跳板行同规则（server/username/认证至少其一，
-    // 序号从 1 起）。仅 enable 且 type==='ssh' 时生效；整行留空的跳板行先经
-    // activeJumpServers 过滤（UI 空行不参与校验也不进载荷）。
+    // username 必填 + 认证二选一（当前 tab 侧有值即可）；跳板行同规则（server/username/
+    // 认证至少其一，序号从 1 起）。仅 enable 且 type==='ssh' 时生效；整行留空的跳板行
+    // 先经 activeJumpServers 过滤（UI 空行不参与校验也不进载荷）。
     sshValidationError() {
       if (!this.form.proxy.enable || this.form.proxy.type !== 'ssh') return '';
       if (!String(this.form.proxy.username || '').trim()) return this.t('rules_sshValidationErrorUsername');
-      if (!this.form.proxy.password && !this.form.proxy.private_key) return this.t('rules_sshValidationErrorAuth');
+      if (!this.sshAuthHasCredential) return this.t('rules_sshValidationErrorAuth');
       const jumps = this.activeJumpServers();
       for (let i = 0; i < jumps.length; i++) {
         const jump = jumps[i];
@@ -1267,6 +1361,16 @@ export default {
         if (!jump.password && !jump.private_key) return this.t('rules_sshValidationErrorJumpAuth', { index: i + 1 });
       }
       return '';
+    },
+    // 认证二选一在「当前 tab 侧」必须有凭据：密码面看 password；私钥面看 private_key
+    // 或 key_passphrase（口令不能单独作为认证凭据，但此处放行口令——后端 Validate
+    // 只要求 password/private_key 至少其一，口令单独存在时后端会拒绝并给权威报错，
+    // 前端不重复下钻判定，避免双权威）。另一种含义：另一 tab 侧残留的凭据不救场。
+    sshAuthHasCredential() {
+      if (this.sshAuthMode === 'key') {
+        return Boolean(String(this.form.proxy.private_key || '').trim());
+      }
+      return Boolean(String(this.form.proxy.password || '').trim());
     },
     providerEditorError() {
       if (!this.providerEditor.provider) return '';
@@ -1439,17 +1543,22 @@ export default {
     },
     // —— SSH 跳板链编辑 ——
     // 参与校验与载荷的跳板行：trim 后整行全空的行静默丢弃（新增即留空的 UI 行），
-    // 半填行保留（交由 sshValidationError 给出序号文案）。产物只含线格式五字段。
+    // 半填行保留（交由 sshValidationError 给出序号文案）。产物只含线格式五字段
+    //（_authModeHint UI 状态在此剥除），且认证按当前面收敛：密码面清 private_key/
+    // key_passphrase，私钥面清 password——线上二选一，另一侧残值不进载荷。
     activeJumpServers() {
       const rows = Array.isArray(this.form.proxy.jump_servers) ? this.form.proxy.jump_servers : [];
       return rows
-        .map((row) => ({
-          server: String(row?.server ?? '').trim(),
-          username: String(row?.username ?? '').trim(),
-          password: String(row?.password ?? ''),
-          private_key: String(row?.private_key ?? ''),
-          key_passphrase: String(row?.key_passphrase ?? '')
-        }))
+        .map((row) => {
+          const mode = resolveJumpAuthMode(row);
+          return {
+            server: String(row?.server ?? '').trim(),
+            username: String(row?.username ?? '').trim(),
+            password: mode === 'password' ? String(row?.password ?? '') : '',
+            private_key: mode === 'key' ? String(row?.private_key ?? '') : '',
+            key_passphrase: mode === 'key' ? String(row?.key_passphrase ?? '') : ''
+          };
+        })
         .filter((row) => row.server || row.username || row.password || row.private_key || row.key_passphrase);
     },
     addJumpServer() {
@@ -1459,17 +1568,27 @@ export default {
         password: '',
         private_key: '',
         key_passphrase: '',
-        _keyOpen: false
+        _authModeHint: 'password'
       });
     },
     removeJumpServer(index) {
       this.form.proxy.jump_servers.splice(index, 1);
     },
-    toggleJumpKey(index) {
-      const row = this.form.proxy.jump_servers[index];
-      if (row) {
-        row._keyOpen = !row._keyOpen;
+    // 模板转发：跳板行认证二选一当前面（模块级 resolveJumpAuthMode 的只读推导）
+    jumpAuthMode(jump) {
+      return resolveJumpAuthMode(jump);
+    },
+    // 跳板行认证二选一切换：仅落 _authModeHint（提示态）。两侧全空的行切换即生效；
+    // 已有凭据的行切到另一面时值保留在表单状态里，提交时按当前面收敛（另一侧置零）。
+    setJumpAuthMode(jump, mode) {
+      if (jump && typeof jump === 'object') {
+        jump._authModeHint = mode;
       }
+    },
+    // 主连接认证 tab 切换：仅改显示面；两侧已填的值都保留在表单状态里不丢，
+    // 提交时按当前面收敛（另一侧置零）。
+    setSshAuthMode(mode) {
+      this.sshAuthMode = mode === 'key' ? 'key' : 'password';
     },
     // —— 服务器指纹（TOFU）区块 ——
     // 请求失败静默降级（failed 文案），不抛错、不阻塞主表单。
@@ -1529,12 +1648,21 @@ export default {
       if (this.submitError) return;
       if (this.sshValidationError) return;
 
-      // SSH 载荷口径：跳板行取过滤后的线格式五字段；pool_size 空串归 0（后端
-      // 默认 3、1..16 钳位由 ssh.New 承担）。非 ssh 类型置零值清除后端旧值
-      //（父层 diff-patch 对空串字段默认不发送，靠 SettingsPage 显式清零兜底）。
+      // SSH 载荷口径：跳板行取过滤后的线格式五字段（认证按当前面收敛）；pool_size
+      // 空串归 0（后端默认 3、1..16 钳位由 ssh.New 承担）。主连接认证二选一：只带
+      // 当前 tab 侧凭据，另一侧显式置零——父层 SettingsPage 对空串凭据字段显式发
+      // 空串（buildCustomerConfigPatch 兜底段），后端 deep-merge 才能清掉旧值。
+      // 非 ssh 类型全部置零值清除后端旧值（父层 diff-patch 对空串字段默认不发送，
+      // 靠 SettingsPage 显式清零兜底）。
       if (normalized.proxy.type === 'ssh') {
         normalized.proxy.jump_servers = this.activeJumpServers();
         normalized.proxy.pool_size = Number(normalized.proxy.pool_size) || 0;
+        if (this.sshAuthMode === 'key') {
+          normalized.proxy.password = '';
+        } else {
+          normalized.proxy.private_key = '';
+          normalized.proxy.key_passphrase = '';
+        }
       } else {
         normalized.proxy.private_key = '';
         normalized.proxy.key_passphrase = '';

@@ -907,7 +907,7 @@ export default {
   rules_configSaved: 'Configuration Saved',
   // -- SSH upstream proxy (Task 12): private key / jump chain / fingerprints --
   rules_proxyUsernamePlaceholderSsh: 'Required',
-  rules_proxyPasswordPlaceholderSsh: 'Password or private key — at least one',
+  rules_proxyPasswordPlaceholderSsh: 'Password authentication',
   rules_proxyPrivateKey: 'Private key',
   rules_proxyPrivateKeyPlaceholder: 'Paste the full PEM, starting with -----BEGIN OPENSSH PRIVATE KEY-----',
   rules_proxyKeyPassphrase: 'Key passphrase',
@@ -919,14 +919,18 @@ export default {
   rules_proxyJumpAdd: 'Add jump host',
   rules_proxyJumpRemove: 'Remove this jump host',
   rules_proxyJumpServerPlaceholder: 'host:port or ssh://user:pass@host:port',
-  rules_proxyJumpExpandKey: 'Private key (optional)',
-  rules_proxyJumpCollapseKey: 'Collapse private key',
+  // Jump-host auth is also either/or; buttons switch the row between password and key auth
+  rules_sshUseKeyAuth: 'Use a private key instead',
+  rules_sshUsePasswordAuth: 'Use a password instead',
   // Front-end validation aligned with the backend SSHProxyConfig.Validate (hint layer; the backend stays authoritative)
   rules_sshValidationErrorUsername: 'The SSH upstream proxy needs a username.',
-  rules_sshValidationErrorAuth: 'The SSH upstream proxy needs a password or a private key — at least one.',
+  rules_sshValidationErrorAuth: 'The SSH upstream proxy needs credentials — fill in the password (password tab) or the private key (private key tab).',
   rules_sshValidationErrorJumpServer: 'Jump host #{index} needs a server address.',
   rules_sshValidationErrorJumpUsername: 'Jump host #{index} needs a username.',
-  rules_sshValidationErrorJumpAuth: 'Jump host #{index} needs a password or a private key — at least one.',
+  rules_sshValidationErrorJumpAuth: 'Jump host #{index} needs credentials — fill in a password or switch to private key auth.',
+  // SSH auth mode tabs: password / private key are mutually exclusive credentials
+  rules_sshAuthModePassword: 'Password login',
+  rules_sshAuthModeKey: 'Private key login',
   rules_knownHostsTitle: 'Server fingerprints',
   rules_knownHostsDesc: 'SSH host fingerprints recorded on first connect (TOFU); remove a stale fingerprint after the host changes to re-verify it.',
   rules_knownHostsEmpty: 'No server fingerprints recorded yet.',

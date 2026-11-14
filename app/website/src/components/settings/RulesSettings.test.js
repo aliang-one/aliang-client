@@ -508,13 +508,46 @@ describe('RulesSettings SSH 上游代理', () => {
     setType(el, 'ssh');
     await flush();
     expect(el.querySelector('[data-ssh-fields]')).toBeTruthy();
-    expect(el.querySelector('[data-field="proxyPrivateKey"]')).toBeTruthy();
-    expect(el.querySelector('[data-field="proxyKeyPassphrase"]')).toBeTruthy();
+    // 认证二选一 tab：默认密码面（无凭据配置时），私钥字段此时不可见
+    expect(el.querySelector('[data-ssh-auth-tabs]')).toBeTruthy();
+    expect(el.querySelector('[data-ssh-auth-tab-password]')).toBeTruthy();
+    expect(el.querySelector('[data-ssh-auth-tab-key]')).toBeTruthy();
+    expect(el.querySelector('[data-ssh-auth-password]')).toBeTruthy();
+    expect(el.querySelector('[data-ssh-auth-key]')).toBeNull();
+    expect(el.querySelector('[data-field="proxyPassword"]')).toBeTruthy();
+    expect(el.querySelector('[data-field="proxyPrivateKey"]')).toBeNull();
+    expect(el.querySelector('[data-field="proxyKeyPassphrase"]')).toBeNull();
     expect(el.querySelector('[data-field="proxyPoolSize"]')).toBeTruthy();
     expect(el.querySelector('[data-jump-add]')).toBeTruthy();
     expect(el.querySelector('[data-known-hosts]')).toBeTruthy();
     // 切到 ssh 触发指纹列表加载
     expect(globalThis.fetch).toHaveBeenCalledWith('/api/proxy/ssh/known-hosts', expect.anything());
+  });
+
+  it('认证方式 tab：默认落有值侧、切换互斥显示且已填值不丢、aria-selected 跟随', async () => {
+    // 密码+私钥并存的存量配置 → 初始落在私钥面（有值侧优先）
+    const { el } = mountRules(sshConfig({ password: 'secret', private_key: 'PEM' }));
+    await flush();
+    expect(el.querySelector('[data-ssh-auth-key]')).toBeTruthy();
+    expect(el.querySelector('[data-field="proxyPrivateKey"]').value).toBe('PEM');
+    expect(el.querySelector('[data-field="proxyPassword"]')).toBeNull();
+
+    // 切到密码面：私钥面板隐藏，密码框回填存量值
+    el.querySelector('[data-ssh-auth-tab-password]').click();
+    await flush();
+    expect(el.querySelector('[data-ssh-auth-password]')).toBeTruthy();
+    expect(el.querySelector('[data-field="proxyPassword"]').value).toBe('secret');
+    expect(el.querySelector('[data-field="proxyPrivateKey"]')).toBeNull();
+    const tabs = el.querySelectorAll('[data-ssh-auth-tabs] [role="tab"]');
+    expect(tabs[0].getAttribute('aria-selected')).toBe('true');
+    expect(tabs[1].getAttribute('aria-selected')).toBe('false');
+
+    // 切回私钥面：已填私钥不丢
+    el.querySelector('[data-ssh-auth-tab-key]').click();
+    await flush();
+    expect(el.querySelector('[data-field="proxyPrivateKey"]').value).toBe('PEM');
+    expect(tabs[0].getAttribute('aria-selected')).toBe('false');
+    expect(tabs[1].getAttribute('aria-selected')).toBe('true');
   });
 
   it('校验：ssh 无用户名或密码私钥全空时拦截提交并给出文案', async () => {
@@ -568,7 +601,7 @@ describe('RulesSettings SSH 上游代理', () => {
     expect(saved).toHaveLength(1);
   });
 
-  it('跳板行增删与提交载荷：server 单串原样、行对象只含线格式五字段', async () => {
+  it('跳板行增删与提交载荷：认证二选一按当前面收敛、行对象只含线格式五字段', async () => {
     const { el, saved } = mountRules(sshConfig());
     await flush();
     buttonByText(el, 'rules_proxyJumpAdd').click();
@@ -580,12 +613,22 @@ describe('RulesSettings SSH 上游代理', () => {
     setField(el, 'jumpServer', 'ssh://u2:p2@bastion.example.com:2222', firstRow);
     setField(el, 'jumpUsername', 'jump', firstRow);
     setField(el, 'jumpPassword', 'jump-pass', firstRow);
-    // 展开细节面板后补私钥与口令（可选私钥折叠交互）
-    firstRow.querySelector('[data-jump-toggle-key]').click();
+    // 密码面行内切换到私钥登录：密码输入消失、私钥面板出现
+    expect(firstRow.querySelector('[data-jump-switch-to-key]')).toBeTruthy();
+    firstRow.querySelector('[data-jump-switch-to-key]').click();
     await flush();
+    expect(firstRow.querySelector('[data-field="jumpPassword"]')).toBeNull();
+    expect(firstRow.querySelector('[data-jump-key-panel]')).toBeTruthy();
     setField(el, 'jumpPrivateKey', 'JUMP-PEM', firstRow);
     setField(el, 'jumpKeyPassphrase', 'jump-pp', firstRow);
+    // 已填的密码不丢——切回密码面仍回填
+    firstRow.querySelector('[data-jump-switch-to-password]').click();
+    await flush();
+    expect(firstRow.querySelector('[data-field="jumpPassword"]').value).toBe('jump-pass');
 
+    // 私钥面提交：载荷只带私钥侧，密码侧被收敛掉
+    firstRow.querySelector('[data-jump-switch-to-key]').click();
+    await flush();
     // 第二行整行留空 → 提交前被静默丢弃
     submitForm(el);
     await flush();
@@ -593,7 +636,7 @@ describe('RulesSettings SSH 上游代理', () => {
     expect(saved[0].proxy.jump_servers).toEqual([{
       server: 'ssh://u2:p2@bastion.example.com:2222',
       username: 'jump',
-      password: 'jump-pass',
+      password: '',
       private_key: 'JUMP-PEM',
       key_passphrase: 'jump-pp'
     }]);
@@ -607,8 +650,11 @@ describe('RulesSettings SSH 上游代理', () => {
     expect(saved[1].proxy.jump_servers).toEqual([]);
   });
 
-  it('提交载荷：ssh 时带 private_key/key_passphrase/pool_size，空 pool 发 0（后端默认 3）', async () => {
+  it('提交载荷：私钥 tab 下带 private_key/key_passphrase 且密码侧收敛置零；空 pool 发 0', async () => {
     const { el, saved } = mountRules(sshConfig());
+    await flush();
+    // 默认密码面 → 切到私钥面再填私钥
+    el.querySelector('[data-ssh-auth-tab-key]').click();
     await flush();
     setField(el, 'proxyPrivateKey', '-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----\n');
     setField(el, 'proxyKeyPassphrase', 'pp');
@@ -618,6 +664,7 @@ describe('RulesSettings SSH 上游代理', () => {
     expect(saved).toHaveLength(1);
     expect(saved[0].proxy.private_key).toBe('-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----\n');
     expect(saved[0].proxy.key_passphrase).toBe('pp');
+    expect(saved[0].proxy.password).toBe('');
     expect(saved[0].proxy.pool_size).toBe(5);
     expect(saved[0].proxy.type).toBe('ssh');
 
@@ -626,6 +673,24 @@ describe('RulesSettings SSH 上游代理', () => {
     submitForm(el2);
     await flush();
     expect(saved2[0].proxy.pool_size).toBe(0);
+    // 密码面提交：私钥侧收敛置零
+    expect(saved2[0].proxy.password).toBe('secret');
+    expect(saved2[0].proxy.private_key).toBe('');
+    expect(saved2[0].proxy.key_passphrase).toBe('');
+  });
+
+  it('提交载荷：密码 tab 填密码+残留私钥并存时，只带密码侧并置零私钥侧', async () => {
+    // 存量并存配置：初始落私钥面，切回密码面后提交 → 密码为准、私钥清零
+    const { el, saved } = mountRules(sshConfig({ password: 'secret', private_key: 'OLD-PEM', key_passphrase: 'old-pp' }));
+    await flush();
+    el.querySelector('[data-ssh-auth-tab-password]').click();
+    await flush();
+    submitForm(el);
+    await flush();
+    expect(saved).toHaveLength(1);
+    expect(saved[0].proxy.password).toBe('secret');
+    expect(saved[0].proxy.private_key).toBe('');
+    expect(saved[0].proxy.key_passphrase).toBe('');
   });
 
   it('提交载荷：切回 socks5/http 时新字段置零值不残留（值在表单内保留）', async () => {
@@ -737,8 +802,10 @@ describe('RulesSettings SSH 上游代理', () => {
       'rules_proxyJumpAdd',
       'rules_proxyJumpRemove',
       'rules_proxyJumpServerPlaceholder',
-      'rules_proxyJumpExpandKey',
-      'rules_proxyJumpCollapseKey',
+      'rules_sshUseKeyAuth',
+      'rules_sshUsePasswordAuth',
+      'rules_sshAuthModePassword',
+      'rules_sshAuthModeKey',
       'rules_sshValidationErrorUsername',
       'rules_sshValidationErrorAuth',
       'rules_sshValidationErrorJumpServer',
