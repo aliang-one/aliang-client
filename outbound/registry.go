@@ -302,6 +302,32 @@ func (r *Registry) GetHardcodedDefault() (proxy.Proxy, error) {
 	return r.Get("direct")
 }
 
+// SSHChainStatus 是状态页 SSH 出口链路状态的聚合视图：ok=false 表示当前
+// 没有已注册的 SSH 出口（未配置客户代理或非 SSH 类型），chains 为空。
+type SSHChainStatus struct {
+	OK     bool                  `json:"ok"`
+	Addr   string                `json:"addr,omitempty"`
+	Chains []sshout.ChainStatus  `json:"chains"`
+}
+
+// SSHChainStatus 返回已注册 SSH 出口的链路运行态。注册表中没有 SSH 实例
+// 时返回 ok=false（前端据此渲染「未配置」态,而非报错）。chains 恒为数组
+// （nil 序列化成 null,前端还得判空）。
+func (r *Registry) SSHChainStatus() SSHChainStatus {
+	r.mu.RLock()
+	p := r.proxies["ssh"]
+	r.mu.RUnlock()
+	ssh, ok := p.(*sshout.SSH)
+	if !ok {
+		return SSHChainStatus{OK: false, Chains: []sshout.ChainStatus{}}
+	}
+	return SSHChainStatus{
+		OK:     true,
+		Addr:   ssh.Addr(),
+		Chains: ssh.Status(),
+	}
+}
+
 // GetAliang 获取 aliang 代理
 func (r *Registry) GetAliang() (proxy.Proxy, error) {
 	r.mu.RLock()

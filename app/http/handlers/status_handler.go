@@ -4,6 +4,7 @@ import (
 	"net/http"
 
 	"aliang.one/nursorgate/app/http/common"
+	"aliang.one/nursorgate/outbound"
 	"aliang.one/nursorgate/processor/statistic"
 )
 
@@ -39,18 +40,54 @@ type StatusHandler struct {
 	trafficCollector *statistic.StatsCollector
 	httpCollector    *statistic.HTTPStatsCollector
 	aiTracker        *statistic.AIActivityTracker
+	connManager      *statistic.Manager
 }
 
 func NewStatusHandler(
 	trafficCollector *statistic.StatsCollector,
 	httpCollector *statistic.HTTPStatsCollector,
 	aiTracker *statistic.AIActivityTracker,
+	connManager *statistic.Manager,
 ) *StatusHandler {
 	return &StatusHandler{
 		trafficCollector: trafficCollector,
 		httpCollector:    httpCollector,
 		aiTracker:        aiTracker,
+		connManager:      connManager,
 	}
+}
+
+// connectionsManager 返回连接明细数据源:优先注入实例(测试可注入独立
+// Manager 隔离),否则全局 DefaultManager。
+func (h *StatusHandler) connectionsManager() *statistic.Manager {
+	if h.connManager != nil {
+		return h.connManager
+	}
+	return statistic.DefaultManager
+}
+
+// HandleGetConnections 返回代理连接明细：活跃连接 + 已关闭连接环形历史
+// （定长 300,新→旧）。只读,无副作用。供状态页「连接记录」面板轮询。
+func (h *StatusHandler) HandleGetConnections(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		common.Error(w, http.StatusMethodNotAllowed, "Method not allowed", nil)
+		return
+	}
+
+	manager := h.connectionsManager()
+	active := manager.ActiveConnections()
+	if active == nil {
+		active = []statistic.ActiveConnection{}
+	}
+	closed := manager.ClosedConnections()
+	if closed == nil {
+		closed = []statistic.ClosedConnection{}
+	}
+
+	common.Success(w, map[string]interface{}{
+		"active": active,
+		"closed": closed,
+	})
 }
 
 func (h *StatusHandler) HandleGetSummary(w http.ResponseWriter, r *http.Request) {
@@ -81,6 +118,7 @@ func (h *StatusHandler) HandleGetSummary(w http.ResponseWriter, r *http.Request)
 		"traffic": traffic,
 		"http":    httpStats,
 		"ai":      sanitizeAIActivitySummary(aiSummary),
+		"ssh":     outbound.GetRegistry().SSHChainStatus(),
 	})
 }
 

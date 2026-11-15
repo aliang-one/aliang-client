@@ -134,6 +134,116 @@
             </div>
           </article>
         </div>
+
+        <div class="grid gap-4 xl:grid-cols-[1.15fr_0.85fr]">
+          <article
+            class="rounded-2xl border border-slate-200/70 bg-white/90 p-4 shadow-[0_18px_40px_rgba(15,23,42,0.07)] backdrop-blur dark:border-slate-800/80 dark:bg-slate-950/70"
+            data-pane="connection-records"
+          >
+            <div class="flex items-start justify-between gap-3">
+              <div>
+                <h3 class="text-base font-semibold text-slate-950 dark:text-white">
+                  {{ t('status_connectionsTitle') }}
+                </h3>
+                <p class="mt-1 text-sm leading-6 text-slate-500 dark:text-slate-400">
+                  {{ t('status_connectionsDesc') }}
+                </p>
+              </div>
+              <div class="flex shrink-0 rounded-full border border-slate-200 bg-slate-100 p-0.5 text-xs font-medium dark:border-slate-800 dark:bg-slate-900">
+                <button
+                  type="button"
+                  data-connections-tab="active"
+                  class="rounded-full px-3 py-1 transition"
+                  :class="connectionsTab === 'active'
+                    ? 'bg-white text-slate-900 shadow-sm dark:bg-slate-800 dark:text-slate-100'
+                    : 'text-slate-500 hover:text-slate-700 dark:text-slate-400'"
+                  @click="connectionsTab = 'active'"
+                >
+                  {{ t('status_connectionsActiveTab', { count: activeConnections.length }) }}
+                </button>
+                <button
+                  type="button"
+                  data-connections-tab="closed"
+                  class="rounded-full px-3 py-1 transition"
+                  :class="connectionsTab === 'closed'
+                    ? 'bg-white text-slate-900 shadow-sm dark:bg-slate-800 dark:text-slate-100'
+                    : 'text-slate-500 hover:text-slate-700 dark:text-slate-400'"
+                  @click="connectionsTab = 'closed'"
+                >
+                  {{ t('status_connectionsClosedTab', { count: closedConnections.length }) }}
+                </button>
+              </div>
+            </div>
+
+            <div v-if="connectionRows.length" class="mt-4 max-h-72 overflow-y-auto" data-connections-table>
+              <table class="w-full text-left text-xs">
+                <thead>
+                  <tr class="text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+                    <th class="py-1.5 pr-3">{{ t('status_connectionsColumnHost') }}</th>
+                    <th class="py-1.5 pr-3">{{ t('status_connectionsColumnRoute') }}</th>
+                    <th class="py-1.5 pr-3 text-right">{{ t('status_connectionsColumnUpload') }}</th>
+                    <th class="py-1.5 pr-3 text-right">{{ t('status_connectionsColumnDownload') }}</th>
+                    <th class="py-1.5 text-right">{{ connectionsTab === 'active' ? t('status_connectionsColumnDuration') : t('status_connectionsColumnClosedAt') }}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr
+                    v-for="row in connectionRows"
+                    :key="row.id"
+                    class="border-t border-slate-100 text-slate-600 dark:border-slate-800/60 dark:text-slate-300"
+                  >
+                    <td class="max-w-[220px] truncate py-1.5 pr-3" :title="row.hostTitle">{{ row.host }}</td>
+                    <td class="py-1.5 pr-3">{{ row.routeLabel }}</td>
+                    <td class="py-1.5 pr-3 text-right font-mono">{{ formatBytes(row.upload) }}</td>
+                    <td class="py-1.5 pr-3 text-right font-mono">{{ formatBytes(row.download) }}</td>
+                    <td class="py-1.5 text-right font-mono text-slate-400">{{ connectionsTab === 'active' ? formatDurationMillis(row.duration) : formatClosedAt(row.endUnix) }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div
+              v-else
+              class="mt-4 rounded-2xl border border-dashed border-slate-300 bg-slate-50 px-4 py-6 text-sm text-slate-500 dark:border-slate-700 dark:bg-slate-900/60 dark:text-slate-400"
+            >
+              {{ t('status_connectionsEmpty') }}
+            </div>
+          </article>
+
+          <article
+            class="rounded-2xl border border-slate-200/70 bg-white/90 p-4 shadow-[0_18px_40px_rgba(15,23,42,0.07)] backdrop-blur dark:border-slate-800/80 dark:bg-slate-950/70"
+            data-pane="ssh-chains"
+          >
+            <div>
+              <h3 class="text-base font-semibold text-slate-950 dark:text-white">
+                {{ t('status_sshTitle') }}
+              </h3>
+              <p class="mt-1 text-sm leading-6 text-slate-500 dark:text-slate-400">
+                {{ t('status_sshDesc') }}
+              </p>
+            </div>
+
+            <div v-if="!sshStatus.ok" class="mt-4 rounded-2xl border border-dashed border-slate-300 bg-slate-50 px-4 py-6 text-sm text-slate-500 dark:border-slate-700 dark:bg-slate-900/60 dark:text-slate-400">
+              {{ t('status_sshNotConfigured') }}
+            </div>
+            <div v-else class="mt-4 grid gap-2" data-ssh-chains>
+              <div
+                v-for="chain in sshChainCards"
+                :key="chain.key"
+                class="flex items-center justify-between gap-3 rounded-xl border px-3 py-2.5 text-sm"
+                :class="chain.cardClass"
+              >
+                <div class="flex items-center gap-2.5">
+                  <span class="h-2 w-2 shrink-0 rounded-full" :class="chain.dotClass"></span>
+                  <span class="font-medium text-slate-900 dark:text-slate-100">{{ chain.label }}</span>
+                </div>
+                <div class="flex items-center gap-2 text-xs">
+                  <span :class="chain.stateClass">{{ chain.stateText }}</span>
+                  <span v-if="chain.activeText" class="text-slate-400">{{ chain.activeText }}</span>
+                </div>
+              </div>
+            </div>
+          </article>
+        </div>
       </section>
 
       <div v-if="statusError" class="rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700 dark:border-rose-900 dark:bg-rose-950/30 dark:text-rose-300">
@@ -253,7 +363,7 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { useI18n } from '../../i18n';
-import { getStatusSummary } from '../../services/statusApi';
+import { getStatusConnections, getStatusSummary } from '../../services/statusApi';
 
 const { t } = useI18n();
 
@@ -270,6 +380,8 @@ const LOG_LEVEL_OPTIONS = [
 
 const entries = ref([]);
 const statusSummary = ref({ ai: {}, traffic: {}, http: {} });
+const connectionsData = ref({ active: [], closed: [] });
+const connectionsTab = ref('active');
 const selectedLevel = ref('all');
 const autoScroll = ref(true);
 const isLogsLoading = ref(false);
@@ -301,6 +413,74 @@ const filterLevelOptions = computed(() => [
 const aiSummary = computed(() => statusSummary.value?.ai || {});
 const trafficStats = computed(() => statusSummary.value?.traffic || {});
 const httpStats = computed(() => statusSummary.value?.http || {});
+const sshStatus = computed(() => statusSummary.value?.ssh || { ok: false, chains: [] });
+const activeConnections = computed(() => Array.isArray(connectionsData.value?.active) ? connectionsData.value.active : []);
+const closedConnections = computed(() => Array.isArray(connectionsData.value?.closed) ? connectionsData.value.closed : []);
+const connectionRows = computed(() => connectionsTab.value === 'active' ? activeConnectionRows.value : closedConnectionRows.value);
+const activeConnectionRows = computed(() => activeConnections.value.map((conn) => ({
+  id: conn.id,
+  host: conn.host || conn.destination,
+  hostTitle: `${conn.host || ''} (${conn.destination})`,
+  routeLabel: routeLabel(conn.route),
+  upload: Number(conn.uploadTotal || 0),
+  download: Number(conn.downloadTotal || 0),
+  duration: Number(conn.durationMillis || 0)
+})));
+const closedConnectionRows = computed(() => closedConnections.value.map((conn) => ({
+  id: conn.id,
+  host: conn.host || conn.destination,
+  hostTitle: `${conn.host || ''} (${conn.destination})`,
+  routeLabel: routeLabel(conn.route),
+  upload: Number(conn.uploadTotal || 0),
+  download: Number(conn.downloadTotal || 0),
+  endUnix: Number(conn.endUnix || 0)
+})));
+const sshChainCards = computed(() => (Array.isArray(sshStatus.value?.chains) ? sshStatus.value.chains : []).map((chain) => {
+  const index = Number(chain.index || 0) + 1;
+  const alive = Boolean(chain.alive);
+  const backoff = Boolean(chain.backoff);
+  const remaining = Math.max(1, Math.round(Number(chain.backoffRemainingMs || 0) / 1000));
+  const activeCount = Number(chain.activeChannels || 0);
+  let stateText;
+  let cardClass;
+  let dotClass;
+  let stateClass;
+  if (backoff) {
+    stateText = t('status_sshChainBackoffIn', { seconds: remaining });
+    cardClass = 'border-amber-200 bg-amber-50/70 dark:border-amber-500/30 dark:bg-amber-500/10';
+    dotClass = 'bg-amber-400';
+    stateClass = 'text-amber-600 dark:text-amber-300';
+  } else if (alive) {
+    stateText = t('status_sshChainAlive');
+    cardClass = 'border-emerald-200 bg-emerald-50/70 dark:border-emerald-500/30 dark:bg-emerald-500/10';
+    dotClass = 'bg-emerald-400';
+    stateClass = 'text-emerald-600 dark:text-emerald-300';
+  } else {
+    stateText = t('status_sshChainIdle');
+    cardClass = 'border-slate-200 bg-slate-50/80 dark:border-slate-800 dark:bg-slate-900/60';
+    dotClass = 'bg-slate-300 dark:bg-slate-600';
+    stateClass = 'text-slate-500 dark:text-slate-400';
+  }
+  return {
+    key: chain.index ?? index,
+    label: t('status_sshChainLabel', { index }),
+    stateText,
+    activeText: activeCount > 0 ? t('status_sshChainActive', { count: activeCount }) : '',
+    cardClass,
+    dotClass,
+    stateClass
+  };
+}));
+
+function routeLabel(route) {
+  if (route === 'RouteToALiang') {
+    return t('status_routeToALiang');
+  }
+  if (route === 'RouteToSocks') {
+    return t('status_routeToSocks');
+  }
+  return route || '--';
+}
 const activeProviders = computed(() => Array.isArray(aiSummary.value?.activeDetections) ? aiSummary.value.activeDetections : []);
 const visibleProviders = computed(() => {
   if (Array.isArray(aiSummary.value?.recentProviderTraffic)) {
@@ -490,6 +670,18 @@ function formatRate(value) {
   return `${formatBytes(value)}/s`;
 }
 
+function formatDurationMillis(millis) {
+  const value = Number(millis || 0);
+  if (!Number.isFinite(value) || value <= 0) {
+    return '--';
+  }
+  return formatDurationSeconds(Math.round(value / 1000));
+}
+
+function formatClosedAt(endUnix) {
+  return formatRelativeFromSeconds(endUnix);
+}
+
 function formatRelativeFromSeconds(seconds) {
   const timestamp = Number(seconds || 0) * 1000;
   if (!Number.isFinite(timestamp) || timestamp <= 0) {
@@ -547,6 +739,15 @@ async function loadStatus() {
     statusError.value = error instanceof Error ? error.message : t('status_summaryLoadFailed');
   } finally {
     isStatusLoading.value = false;
+  }
+}
+
+async function loadConnections() {
+  try {
+    const envelope = await getStatusConnections();
+    connectionsData.value = envelope?.data || { active: [], closed: [] };
+  } catch {
+    // 连接明细是辅助面板,失败不打扰主状态展示,下个轮询周期自愈。
   }
 }
 
@@ -649,6 +850,7 @@ function startStatusPolling() {
   stopStatusPolling();
   statusPollTimer = window.setInterval(() => {
     loadStatus();
+    loadConnections();
   }, 5000);
 }
 
@@ -706,7 +908,7 @@ watch(logsExpanded, (expanded) => {
 });
 
 onMounted(async () => {
-  await loadStatus();
+  await Promise.all([loadStatus(), loadConnections()]);
   startStatusPolling();
 });
 

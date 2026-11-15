@@ -184,6 +184,12 @@ func (s *SSH) DialUDP(*M.Metadata) (net.PacketConn, error) {
 	return nil, errors.ErrUnsupported
 }
 
+// Status 导出池内全部链的运行态快照（状态页消费）。Close 后链被断开，
+// Alive 全为 false；实例终态如实反映，不做特殊化。
+func (s *SSH) Status() []ChainStatus {
+	return s.pool.Status()
+}
+
 // Close 断开全部链(pool.close 级联关全部跳)并终结本实例:其后
 // DialContext 直接报错,不再懒重建——被替换的旧实例不能在残余流量下
 // 复活出无人回收的链。幂等,可安全重复调用。

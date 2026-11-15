@@ -485,3 +485,77 @@ func TestPoolSingle(t *testing.T) {
 		})
 	}
 }
+
+func TestPoolStatus(t *testing.T) {
+	baseline := runtime.NumGoroutine()
+	dialOK := true
+	p := newPool(2, func(int) func(context.Context) (*cascadeClient, error) {
+		return func(context.Context) (*cascadeClient, error) {
+			if !dialOK {
+				return nil, errors.New("dial refused")
+			}
+			return fakeCascadeClient(), nil
+		}
+	})
+	defer p.close()
+
+	// 未拨号:全部链 not alive / not backoff。
+	for _, st := range p.Status() {
+		if st.Alive || st.Backoff || st.Active != 0 {
+			t.Fatalf("fresh chain status = %+v, want idle", st)
+		}
+	}
+
+	_, _, err := p.acquire(context.Background())
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	statuses := p.Status()
+	var acquired *ChainStatus
+	for i := range statuses {
+		if statuses[i].Alive {
+			acquired = &statuses[i]
+		}
+	}
+	if acquired == nil {
+		t.Fatal("no chain reports alive after acquire")
+	}
+	if acquired.Active != 1 {
+		t.Fatalf("acquired chain active = %d, want 1", acquired.Active)
+	}
+	if acquired.Index != 0 && acquired != &statuses[1] {
+		t.Fatalf("acquired chain index = %d, want 0 or 1", acquired.Index)
+	}
+
+	// 失败进退避窗口:status 报 backoff + 剩余时间,且不报 alive。
+	// 用 chains[1]——acquire 的最少活跃选链首选取走 chains[0],它没建过链,
+	// get 必然真实拨号。
+	dialOK = false
+	if _, err := p.chains[1].get(context.Background()); err == nil {
+		t.Fatal("dial should have failed")
+	}
+	st := p.chains[1].status(1)
+	if !st.Backoff {
+		t.Fatalf("failed chain status = %+v, want backoff", st)
+	}
+	if st.Alive {
+		t.Fatal("failed chain must not report alive")
+	}
+	if st.Remaining <= 0 {
+		t.Fatalf("backoff remaining = %d, want >0", st.Remaining)
+	}
+
+	// Status 长度与序号稳定。
+	statuses = p.Status()
+	if len(statuses) != 2 {
+		t.Fatalf("status len = %d, want 2", len(statuses))
+	}
+	for i, s := range statuses {
+		if s.Index != i {
+			t.Fatalf("status[%d].Index = %d, want %d", i, s.Index, i)
+		}
+	}
+
+	p.close()
+	assertNoGoroutineLeak(t, baseline)
+}

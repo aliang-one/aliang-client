@@ -7,7 +7,6 @@ import (
 	"time"
 
 	M "aliang.one/nursorgate/inbound/tun/metadata"
-	"go.uber.org/atomic"
 )
 
 type closeCountingConn struct {
@@ -57,14 +56,7 @@ func (c *packetConnStub) SetReadDeadline(time.Time) error  { return nil }
 func (c *packetConnStub) SetWriteDeadline(time.Time) error { return nil }
 
 func newTestManager() *Manager {
-	return &Manager{
-		uploadTemp:    atomic.NewInt64(0),
-		downloadTemp:  atomic.NewInt64(0),
-		uploadBlip:    atomic.NewInt64(0),
-		downloadBlip:  atomic.NewInt64(0),
-		uploadTotal:   atomic.NewInt64(0),
-		downloadTotal: atomic.NewInt64(0),
-	}
+	return NewTestManager()
 }
 
 func TestTCPTrackerClose_IsIdempotent(t *testing.T) {

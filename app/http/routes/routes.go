@@ -94,7 +94,7 @@ func newHandlers(runService *services.RunService) *Handlers {
 		Config:             handlers.NewConfigHandler(),
 		TrafficStats:       handlers.NewTrafficStatsHandler(statsCollector),
 		HTTPStats:          handlers.NewHTTPStatsHandler(httpStatsCollector),
-		Status:             handlers.NewStatusHandler(statsCollector, httpStatsCollector, aiActivityTracker),
+		Status:             handlers.NewStatusHandler(statsCollector, httpStatsCollector, aiActivityTracker, statistic.DefaultManager),
 		Chat:               handlers.NewChatHandler(),
 		UserCenter:         handlers.NewUserCenterHandler(),
 		Dashboard:          handlers.NewDashboardHandler(),
@@ -254,6 +254,7 @@ func RegisterRoutes(h *Handlers, mux *http.ServeMux) {
 	register("/api/stats/http/clear", h.HTTPStats.HandleClear, http.MethodPost, http.MethodDelete)
 	register("/api/stats/http/preset-domains", h.HTTPStats.HandleGetPresetDomains, http.MethodGet)
 	register("/api/status/summary", h.Status.HandleGetSummary, http.MethodGet)
+	register("/api/status/connections", h.Status.HandleGetConnections, http.MethodGet)
 
 	register("/api/chat/completions", h.Chat.HandleCompletions, http.MethodPost)
 

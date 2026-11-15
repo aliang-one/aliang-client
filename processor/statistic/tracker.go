@@ -87,6 +87,12 @@ func (tt *tcpTracker) Write(b []byte) (int, error) {
 func (tt *tcpTracker) Close() error {
 	tt.closeOnce.Do(func() {
 		tt.manager.Leave(tt)
+		if tt.TrackTraffic && tt.Metadata != nil {
+			tt.manager.recordClosed(ClosedConnection{
+				ActiveConnection: newActiveConnection(tt.trackerInfo, tt.Metadata),
+				EndUnix:          time.Now().Unix(),
+			})
+		}
 		tt.closeError = tt.Conn.Close()
 	})
 	return tt.closeError
@@ -167,6 +173,12 @@ func (ut *udpTracker) WriteTo(b []byte, addr net.Addr) (int, error) {
 func (ut *udpTracker) Close() error {
 	ut.closeOnce.Do(func() {
 		ut.manager.Leave(ut)
+		if ut.TrackTraffic && ut.Metadata != nil {
+			ut.manager.recordClosed(ClosedConnection{
+				ActiveConnection: newActiveConnection(ut.trackerInfo, ut.Metadata),
+				EndUnix:          time.Now().Unix(),
+			})
+		}
 		ut.closeError = ut.PacketConn.Close()
 	})
 	return ut.closeError

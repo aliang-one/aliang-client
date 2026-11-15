@@ -35,3 +35,7 @@ async function request(path, options = {}) {
 export async function getStatusSummary() {
   return request('/api/status/summary');
 }
+
+export async function getStatusConnections() {
+  return request('/api/status/connections');
+}

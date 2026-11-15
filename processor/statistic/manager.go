@@ -23,6 +23,19 @@ func init() {
 	go DefaultManager.handle()
 }
 
+// NewTestManager 构造带全部计数器与空关闭历史的 Manager。导出供 handlers
+// 等跨包测试注入独立实例（不带轮询协程,不写全局）。
+func NewTestManager() *Manager {
+	return &Manager{
+		uploadTemp:    atomic.NewInt64(0),
+		downloadTemp:  atomic.NewInt64(0),
+		uploadBlip:    atomic.NewInt64(0),
+		downloadBlip:  atomic.NewInt64(0),
+		uploadTotal:   atomic.NewInt64(0),
+		downloadTotal: atomic.NewInt64(0),
+	}
+}
+
 type Manager struct {
 	connections   sync.Map
 	stopCh        chan struct{}
@@ -33,10 +46,70 @@ type Manager struct {
 	downloadBlip  *atomic.Int64
 	uploadTotal   *atomic.Int64
 	downloadTotal *atomic.Int64
+
+	// closedMu/closedRecent 是已关闭代理连接的环形历史（状态页连接记录
+	// 消费）：tracker Close 时把终态快照推入,写互斥 + 定长截断。只在
+	// shouldTrackTraffic 的连接上发生(直连不入池也不入史,口径与活跃表
+	// 一致),记录为无锁快照值,读侧零竞争。
+	closedMu     sync.Mutex
+	closedRecent []ClosedConnection
 }
+
+// closedHistoryCapacity 关闭历史的环形上限（条）。
+const closedHistoryCapacity = 300
 
 func (m *Manager) Join(c tracker) {
 	m.connections.Store(c.ID(), c)
+}
+
+// recordClosed 把一条已关闭连接的终态快照推入环形历史（定长 300,超出
+// 淘汰最旧）。由 tracker Close 路径调用,写少读多,单锁无竞争热点。
+func (m *Manager) recordClosed(record ClosedConnection) {
+	m.closedMu.Lock()
+	m.closedRecent = append(m.closedRecent, record)
+	if len(m.closedRecent) > closedHistoryCapacity {
+		m.closedRecent = m.closedRecent[len(m.closedRecent)-closedHistoryCapacity:]
+	}
+	m.closedMu.Unlock()
+}
+
+// ClosedConnections 返回已关闭连接历史(新→旧,定长截断)。返回内部切片
+// 的副本,调用方可自由处理。
+func (m *Manager) ClosedConnections() []ClosedConnection {
+	m.closedMu.Lock()
+	defer m.closedMu.Unlock()
+	records := make([]ClosedConnection, len(m.closedRecent))
+	// 逆序拷贝:最新的在前,状态页直接按此顺序渲染。
+	for i, record := range m.closedRecent {
+		records[len(m.closedRecent)-1-i] = record
+	}
+	return records
+}
+
+// ActiveConnections 返回当前活跃代理连接明细(路由与累计流量口径与
+// Snapshot.ByRoute 一致:RouteDirect 不入列表)。
+func (m *Manager) ActiveConnections() []ActiveConnection {
+	var records []ActiveConnection
+	m.connections.Range(func(_, value any) bool {
+		t, ok := value.(tracker)
+		if !ok {
+			return true
+		}
+		switch conn := t.(type) {
+		case *tcpTracker:
+			if conn == nil || conn.Metadata == nil || conn.Metadata.Route == "" || conn.Metadata.Route == "RouteDirect" {
+				return true
+			}
+			records = append(records, newActiveConnection(conn.trackerInfo, conn.Metadata))
+		case *udpTracker:
+			if conn == nil || conn.Metadata == nil || conn.Metadata.Route == "" || conn.Metadata.Route == "RouteDirect" {
+				return true
+			}
+			records = append(records, newActiveConnection(conn.trackerInfo, conn.Metadata))
+		}
+		return true
+	})
+	return records
 }
 
 func (m *Manager) Leave(c tracker) {
@@ -217,4 +290,45 @@ type Snapshot struct {
 	UploadTotal   int64                  `json:"uploadTotal"`
 	Connections   []tracker              `json:"connections"`
 	ByRoute       map[string]*RouteStats `json:"byRoute"` // Statistics grouped by route type
+}
+
+// ActiveConnection 是一条活跃代理连接的明细快照（状态页连接记录表消费）。
+// 字段为拷贝出的普通值,不含任何锁或 net.Conn 引用,可安全序列化。
+type ActiveConnection struct {
+	ID             string `json:"id"`             // 连接 UUID
+	Network        string `json:"network"`        // tcp / udp
+	Host           string `json:"host"`           // 目标主机名(无 SNI/DNS 绑定时为空)
+	Destination    string `json:"destination"`    // 目标 addr:port
+	Source         string `json:"source"`         // 来源 addr:port
+	Route          string `json:"route"`          // RouteToALiang / RouteToSocks
+	UploadTotal    int64  `json:"uploadTotal"`    // 累计上行字节
+	DownloadTotal  int64  `json:"downloadTotal"`  // 累计下行字节
+	StartUnix      int64  `json:"startUnix"`      // 连接开始时间(Unix 秒)
+	DurationMillis int64  `json:"durationMillis"` // 已持续毫秒
+}
+
+// ClosedConnection 是一条已关闭连接的终态记录(环形历史,定长 300)。
+type ClosedConnection struct {
+	ActiveConnection
+	EndUnix int64 `json:"endUnix"` // 连接关闭时间(Unix 秒)
+}
+
+// newActiveConnection 从 trackerInfo + metadata 拷贝出明细快照。
+func newActiveConnection(info *trackerInfo, metadata *M.Metadata) ActiveConnection {
+	network := "tcp"
+	if metadata.Network == M.UDP {
+		network = "udp"
+	}
+	return ActiveConnection{
+		ID:             info.UUID.String(),
+		Network:        network,
+		Host:           metadata.HostName,
+		Destination:    metadata.DestinationAddress(),
+		Source:         metadata.SourceAddress(),
+		Route:          metadata.Route,
+		UploadTotal:    info.UploadTotal.Load(),
+		DownloadTotal:  info.DownloadTotal.Load(),
+		StartUnix:      info.Start.Unix(),
+		DurationMillis: time.Since(info.Start).Milliseconds(),
+	}
 }

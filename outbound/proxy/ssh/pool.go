@@ -204,6 +204,41 @@ func (p *pool) acquire(ctx context.Context) (*cascadeClient, *chain, error) {
 	return cl, best, nil
 }
 
+// ChainStatus 是单条链的运行态快照（状态页 SSH 出口卡消费）。字段全部
+// 取自选链路径的同一批原子读/锁读，只读不写，对运行路径零干扰。
+type ChainStatus struct {
+	Index     int   `json:"index"`           // 池内序号（0 起）
+	Alive     bool  `json:"alive"`           // client 存活且未被监控标记死亡
+	Backoff   bool  `json:"backoff"`         // 正处拨号失败退避窗口
+	Remaining int64 `json:"backoffRemainingMs"` // 退避剩余毫秒（仅 Backoff=true 时有意义）
+	Active    int64 `json:"activeChannels"`  // 当前经此链打开的 channel 数
+}
+
+// status 汇总单链运行态。Alive 的判定需要读 c.mu（client/clientErr 由
+// get/监控协程持锁写）；Backoff/Active 沿用选链的无锁原子读。
+func (c *chain) status(index int) ChainStatus {
+	st := ChainStatus{Index: index, Active: c.active.Load()}
+	c.mu.Lock()
+	st.Alive = c.client != nil && c.clientErr == nil
+	c.mu.Unlock()
+	if remain, in := c.backoffRemaining(); in {
+		st.Backoff = true
+		st.Remaining = remain.Milliseconds()
+	}
+	return st
+}
+
+// Status 返回池内全部链的运行态快照（顺序稳定，按池内序号）。
+func (p *pool) Status() []ChainStatus {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	statuses := make([]ChainStatus, 0, len(p.chains))
+	for i, c := range p.chains {
+		statuses = append(statuses, c.status(i))
+	}
+	return statuses
+}
+
 // close 关闭全部链的当前 client(级联关全部跳)。链本身保留,后续
 // acquire 会懒重建——close 是「断开」不是「销毁」。
 func (p *pool) close() {
