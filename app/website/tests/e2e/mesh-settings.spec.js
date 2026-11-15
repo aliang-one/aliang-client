@@ -6,7 +6,8 @@ import { expect, test } from '@playwright/test';
 // 覆盖点：
 //   ① 拓扑画布按 /api/mesh/status + customer.proxy_rules 渲染（本机居中/peer/徽标）
 //   ② 点连线 → 节点对详情面板露出规则原文
-//   ③ 出口链路卡保存 → POST /api/config/customer 载荷含 mesh.fallback
+//   ③ 平台流量代理卡保存 → POST /api/config/customer 载荷含 mesh.fallback
+//      （2026-11-15 开关自 mesh 卡挪至代理设置默认页 PlatformProxySettings 卡）
 //   ④ 规则编辑器接受 mesh 尾段（Task 4 修复的裸逗号缺陷在生产构建中同样成立）
 const CUSTOMER = {
   proxy: {
@@ -183,20 +184,22 @@ test('组网卡渲染：状态条在线 + 拓扑画布（本机居中/peer/规�
   await expect(detail).toContainText('dev-c');
 });
 
-test('出口链路保存：POST /api/config/customer 载荷含 mesh.fallback={enable,next_hop}（差异 patch，不带未变段）', async ({ page }) => {
+test('平台流量代理保存：POST /api/config/customer 载荷含 mesh.fallback={enable,next_hop}（差异 patch，不带未变段）', async ({ page }) => {
   let savedBody = null;
   await installPageStub(page);
   await stubApi(page, { onSave: (body) => { savedBody = body; } });
-  await openMeshCard(page);
+  // 开关已挪至代理设置默认页右栏「平台流量代理」卡（2026-11-15,原 mesh 卡
+  // 出口链路区块;内部键/线格式不动）——默认子 tab 即可达,无需切页。
+  await openSettings(page);
 
-  const fallback = page.locator('[data-mesh-fallback]');
-  await fallback.locator('[data-field="meshFallbackEnable"]').check({ force: true });
-  await fallback.locator('[data-field="meshFallbackNextHop"]').selectOption('dev-b');
+  const proxy = page.locator('[data-platform-proxy]');
+  await proxy.locator('[data-field="meshFallbackEnable"]').check({ force: true });
+  await proxy.locator('[data-field="meshFallbackNextHop"]').selectOption('dev-b');
 
-  await page.locator('button[data-mesh-save]').click();
+  await page.locator('button[data-platform-proxy-save]').click();
   await expect.poll(() => savedBody).not.toBeNull();
 
-  // 出口链路字面量整体替换：旧版字段(classes/addr/host_key)不残留
+  // fallback 字面量整体替换：旧版字段(classes/addr/host_key)不残留
   const savedFallback = savedBody.customer.mesh.fallback;
   expect(savedFallback.enable).toBe(true);
   expect(savedFallback.next_hop).toBe('dev-b');
