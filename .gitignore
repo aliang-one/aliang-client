@@ -61,6 +61,7 @@ aliang-linux
 .local/
 .play
 .playwright-mcp
+/node_modules/
 app/website/node_modules
 app/website/dist
 main
