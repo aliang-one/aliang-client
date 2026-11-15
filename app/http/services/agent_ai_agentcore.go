@@ -1376,8 +1376,8 @@ func (m *agentAIManager) runAgentCore(ctx context.Context, run agentAIRun, write
 		}
 		raws = kept
 	}
-	mcpTools, closeMCP := m.agentCoreMCPServerToolDefs(ctx, raws, func(tool, summary string, isErr bool) {
-		m.coreJournal.appendTool(run.sessionID, tool, summary, isErr)
+	mcpTools, closeMCP := m.agentCoreMCPServerToolDefs(ctx, raws, func(tool, summary string, isErr bool, result string) {
+		m.coreJournal.appendTool(run.sessionID, tool, summary, isErr, result)
 	})
 	registry := agentcore.DefaultRegistry()
 	for _, tool := range mcpTools {
@@ -1865,7 +1865,7 @@ func agentCoreLoopHooks(m *agentAIManager, run agentAIRun, diag *agentCoreDiagno
 			if !agentCoreKernelBuiltinTools[name] {
 				return
 			}
-			m.coreJournal.appendTool(run.sessionID, name, summarizeAgentCoreKernelTool(name, input), res.IsError)
+			m.coreJournal.appendTool(run.sessionID, name, summarizeAgentCoreKernelTool(name, input), res.IsError, res.Content)
 		},
 		// 逐回合诊断快照：内核每回合发起请求前、以及终止时把运行状态交给宿主，
 		// 存进 diag 供进度心跳与 journal 终态行消费（诊断面板数据源）。

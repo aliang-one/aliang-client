@@ -271,8 +271,9 @@ type agentCoreMCPBridge struct {
 	name        string // mcp__<server>__<tool>，段已白名单清洗
 	description string
 	schema      map[string]interface{}
-	// onCall：journal v2 工具行回调（宿主注入；nil=不记）。
-	onCall func(tool, summary string, isErr bool)
+	// onCall：journal v2 工具行回调（宿主注入；nil=不记）。result=失败时的
+	// 工具输出原文（成功时传值 journal 层也忽略）。
+	onCall func(tool, summary string, isErr bool, result string)
 }
 
 func (b *agentCoreMCPBridge) Name() string                        { return b.name }
@@ -287,7 +288,7 @@ func (b *agentCoreMCPBridge) Execute(ctx context.Context, input map[string]inter
 	defer func() {
 		if rec := recover(); rec != nil {
 			result = agentcore.ToolResult{Content: fmt.Sprintf("MCP 工具执行崩溃（已兜底）: %v", rec), IsError: true}
-			b.safeOnCall(summary, true)
+			b.safeOnCall(summary, true, result.Content)
 		}
 	}()
 	res, err := b.holder.call(ctx, b.rawTool, input)
@@ -299,17 +300,17 @@ func (b *agentCoreMCPBridge) Execute(ctx context.Context, input map[string]inter
 		text, isErr = agentCoreMCPResultText(res)
 	}
 	text = truncateAgentCoreMCPOutput(text)
-	b.safeOnCall(summary, isErr)
+	b.safeOnCall(summary, isErr, text)
 	return agentcore.ToolResult{Content: text, IsError: isErr}
 }
 
 // safeOnCall journal 回调的 panic 不许二次炸、也不许搅了已定的工具结果。
-func (b *agentCoreMCPBridge) safeOnCall(summary string, isErr bool) {
+func (b *agentCoreMCPBridge) safeOnCall(summary string, isErr bool, result string) {
 	if b.onCall == nil {
 		return
 	}
 	defer func() { _ = recover() }()
-	b.onCall(b.name, summary, isErr)
+	b.onCall(b.name, summary, isErr, result)
 }
 
 // agentCoreMCPResultText 拼接 content blocks 的文本（非 Text 块跳过）。
@@ -572,7 +573,7 @@ func agentCoreMCPDialWithTimeout(dial func(context.Context, agentCoreMCPRawServe
 // GET 长流用 NewRequestWithContext 直绑 ctx（go-sdk v1.8.0）。给 SSE 绑
 // deadline 或建连后提前 cancel，都会把已建好的连接掐断，该 server 的
 // CallTool 全失败。建连超时因此改由 agentCoreMCPDialWithTimeout 外部施加。
-func (m *agentAIManager) agentCoreMCPServerToolDefs(ctx context.Context, raws []agentCoreMCPRawServer, onCall func(tool, summary string, isErr bool)) ([]agentcore.Tool, func()) {
+func (m *agentAIManager) agentCoreMCPServerToolDefs(ctx context.Context, raws []agentCoreMCPRawServer, onCall func(tool, summary string, isErr bool, result string)) ([]agentcore.Tool, func()) {
 	var holders []*agentCoreMCPSessionHolder
 	bridges := make([]agentcore.Tool, 0, agentCoreMCPToolCap)
 	seen := map[string]bool{}

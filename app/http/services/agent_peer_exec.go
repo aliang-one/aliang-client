@@ -151,6 +151,7 @@ func (s *AgentService) peerExecJournalAudit(sourceDeviceID, outcome string, exit
 		"peer.exec",
 		agentPeerExecAuditSummary(sourceDeviceID, outcome, exitCode, failReason, durationMs, command),
 		failReason != "" || exitCode != 0,
+		"", // 审计行失败原因已在 summary 里逐字段带上，result 不重复
 	)
 }
 

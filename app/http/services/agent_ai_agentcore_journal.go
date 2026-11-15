@@ -43,6 +43,11 @@ const agentCoreJournalWrittenCap = 4096
 // 才退回「全文件行数」基线。
 const agentCoreJournalSeqTailBytes = 256 * 1024
 
+// agentCoreJournalToolResultCap 失败工具行 result 键的 rune 截断上限：journal
+// 是轨迹不是全文，取证要的是失败原因而非完整输出（与 peer 桥 summary 200
+// 截断、task 行截断同一哲学）。
+const agentCoreJournalToolResultCap = 2000
+
 type agentCoreJournal struct {
 	mu       sync.Mutex
 	dir      string
@@ -692,21 +697,30 @@ func agentCoreTurnMessageID(userMessageID string, turn int) string {
 }
 
 // appendTool 落 journal v2 工具行（kind=tool）。不参与 message_id 去重：
-// 每次调用一行，是轨迹不是消息。写失败 Warn 吞掉。守卫与 appendEnd 家族
-// 同款（nil/dir 空/sessionID 空直接返回）。
-func (j *agentCoreJournal) appendTool(sessionID, tool, summary string, isError bool) {
+// 每次调用一行，是轨迹不是消息。result=失败时的工具输出原文（仅 isError 且
+// 非空才落 result 键，rune 截断 2000；成功输出不进 journal 防膨胀）——
+// 打转守卫杀掉的回合里失败文本全空，事后取证只能靠人工复现（2026-11-15
+// 会话 agentcore-1794710260005694000-4 实锤），旧行无此键，读侧容忍缺失。
+// 写失败 Warn 吞掉。守卫与 appendEnd 家族同款（nil/dir 空/sessionID 空直接返回）。
+func (j *agentCoreJournal) appendTool(sessionID, tool, summary string, isError bool, result string) {
 	if j == nil || j.dir == "" || strings.TrimSpace(sessionID) == "" {
 		return
 	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	j.appendLineLocked(sessionID, map[string]interface{}{
+	line := map[string]interface{}{
 		"kind":     "tool",
 		"tool":     tool,
 		"summary":  summary,
 		"is_error": isError,
 		"ts":       time.Now().UTC().Format(time.RFC3339),
-	})
+	}
+	if isError {
+		if text := strings.TrimSpace(result); text != "" {
+			line["result"] = truncateRunes(text, agentCoreJournalToolResultCap)
+		}
+	}
+	j.appendLineLocked(sessionID, line)
 }
 
 // appendSubagentStart 落 kind=subagent/event=start 行：子 agent 跑起来
@@ -968,20 +982,26 @@ func (j *agentCoreJournal) healInterruptedSubagents(sessionID string, unfinished
 // appendSubagentTool 落子 agent 的工具轨迹行：与主会话工具行同 kind=tool，
 // 但多带 subagent_task_id 关联字段——读侧将按 task_id 聚合(Task 3 落地)子 agent 轨迹，
 // 不与主会话工具混流。守卫与 appendTool 同款；写失败 Warn 吞掉。
-func (j *agentCoreJournal) appendSubagentTool(sessionID, taskID, tool, summary string, isError bool) {
+func (j *agentCoreJournal) appendSubagentTool(sessionID, taskID, tool, summary string, isError bool, result string) {
 	if j == nil || j.dir == "" || strings.TrimSpace(sessionID) == "" {
 		return
 	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	j.appendLineLocked(sessionID, map[string]interface{}{
+	line := map[string]interface{}{
 		"kind":             "tool",
 		"subagent_task_id": taskID,
 		"tool":             tool,
 		"summary":          summary,
 		"is_error":         isError,
 		"ts":               time.Now().UTC().Format(time.RFC3339),
-	})
+	}
+	if isError {
+		if text := strings.TrimSpace(result); text != "" {
+			line["result"] = truncateRunes(text, agentCoreJournalToolResultCap)
+		}
+	}
+	j.appendLineLocked(sessionID, line)
 }
 
 // appendSubagentTurn 落 kind=subagent_turn 行：子 run 的每回合 assistant 输出

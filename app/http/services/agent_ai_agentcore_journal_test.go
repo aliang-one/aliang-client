@@ -200,8 +200,8 @@ func TestAgentCoreJournalAppendTool(t *testing.T) {
 	dir := t.TempDir()
 	j := newAgentCoreJournal(dir)
 	j.ensureSessionHeader("conv-tool", "/tmp/p", "glm-5.2", "", "2026-10-26T01:00:00Z", "phone", nil, nil, "")
-	j.appendTool("conv-tool", "mcp__s__lookup", "q=hi", false)
-	j.appendTool("conv-tool", "mcp__s__lookup", "q=hi", false) // 完全相同实参:行为级证明 tool 行不去重
+	j.appendTool("conv-tool", "mcp__s__lookup", "q=hi", false, "")
+	j.appendTool("conv-tool", "mcp__s__lookup", "q=hi", false, "") // 完全相同实参:行为级证明 tool 行不去重
 	rows := readJournalLines(t, dir, "conv-tool")
 	if len(rows) != 3 { // 头 + 2 tool 行（相同实参仍两行、无 message_id）
 		t.Fatalf("行数 = %d, want 3: %v", len(rows), rows)
@@ -214,8 +214,58 @@ func TestAgentCoreJournalAppendTool(t *testing.T) {
 	}
 	// nil 接收者与空 sessionID 安全（与 appendMsg 家族守卫同款）。
 	var nilJ *agentCoreJournal
-	nilJ.appendTool("conv-x", "mcp__s__lookup", "q", false)
-	j.appendTool("", "mcp__s__lookup", "q", false)
+	nilJ.appendTool("conv-x", "mcp__s__lookup", "q", false, "")
+	j.appendTool("", "mcp__s__lookup", "q", false, "")
+}
+
+// 工具失败要落 result 原文（取证缺口 2026-11-15：打转守卫杀掉的第一轮里
+// 5 条失败 Bash 的失败文本全空，事后只能靠人工复现补证据）。成功调用与
+// 空串不落键——成功输出可能很大，journal 只为失败留痕，膨胀面可控。
+func TestAgentCoreJournalToolErrorResult(t *testing.T) {
+	dir := t.TempDir()
+	j := newAgentCoreJournal(dir)
+	j.ensureSessionHeader("conv-err", "/tmp/p", "glm-5.2", "", "2026-11-15T01:00:00Z", "phone", nil, nil, "")
+
+	// 失败 + 有输出文本 → 落 result 键
+	j.appendTool("conv-err", "Bash", "grep sessionTitle", true, "grep: server/src/x.ts: No such file or directory")
+	// 失败 + 空串 → 不落键
+	j.appendTool("conv-err", "Bash", "grep again", true, "")
+	// 成功 + 有输出 → 不落键（成功输出不进 journal，防膨胀）
+	j.appendTool("conv-err", "Read", "read file", false, "一整份很长的文件内容")
+
+	rows := readJournalLines(t, dir, "conv-err")
+	if len(rows) != 4 {
+		t.Fatalf("行数 = %d, want 4: %v", len(rows), rows)
+	}
+	fail := rows[1]
+	if fail["kind"] != "tool" || fail["is_error"] != true {
+		t.Fatalf("失败行错误: %v", fail)
+	}
+	if fail["result"] != "grep: server/src/x.ts: No such file or directory" {
+		t.Fatalf("失败行应带 result 原文: %v", fail)
+	}
+	if _, ok := rows[2]["result"]; ok {
+		t.Fatalf("失败但 result 空串不应落 result 键: %v", rows[2])
+	}
+	if _, ok := rows[3]["result"]; ok {
+		t.Fatalf("成功调用不应落 result 键: %v", rows[3])
+	}
+}
+
+// 超长失败输出按 rune 截断到 2000 字符（与子 agent task 行截断同哲学：
+// journal 是轨迹不是全文，多字节字符不许被字节切开）。
+func TestAgentCoreJournalToolErrorResultTruncated(t *testing.T) {
+	dir := t.TempDir()
+	j := newAgentCoreJournal(dir)
+	j.ensureSessionHeader("conv-trunc", "/tmp/p", "glm-5.2", "", "2026-11-15T01:00:00Z", "phone", nil, nil, "")
+
+	long := strings.Repeat("错", 2500) // 2500 个多字节 rune
+	j.appendTool("conv-trunc", "Bash", "big output", true, long)
+	rows := readJournalLines(t, dir, "conv-trunc")
+	got, _ := rows[1]["result"].(string)
+	if runeCount := len([]rune(got)); runeCount != 2000 {
+		t.Fatalf("result rune 数 = %d, want 2000（截断）", runeCount)
+	}
 }
 
 func TestAgentCoreJournalPruneKeepsNewest(t *testing.T) {
@@ -543,7 +593,7 @@ func TestAppendSubagentLines(t *testing.T) {
 	sid := "sess-sub"
 	taskID := "agentcore-msg7-researcher-1" // 含回合 messageID 消歧(spec H1)
 	j.appendSubagentStart(sid, taskID, "researcher", "加密调研", "调研 XXX 的加密方案")
-	j.appendSubagentTool(sid, taskID, "Grep", "grep 摘要", false)
+	j.appendSubagentTool(sid, taskID, "Grep", "grep 摘要", false, "")
 	j.appendSubagentFinish(sid, taskID, "completed", "结论摘要",
 		"完整报告全文", 8123, 45230)
 
@@ -587,8 +637,8 @@ func TestJournalUnfinishedSubagents(t *testing.T) {
 	j.appendSubagentStart(sid, "t-done", "researcher", "调研", "任务A")
 	j.appendSubagentFinish(sid, "t-done", "completed", "结论", "全文", 10, 5)
 	j.appendSubagentStart(sid, "t-dead", "reviewer", "评审", "任务B")
-	j.appendSubagentTool(sid, "t-dead", "Grep", "s1", false)
-	j.appendSubagentTool(sid, "t-dead", "Read", "s2", false)
+	j.appendSubagentTool(sid, "t-dead", "Grep", "s1", false, "")
+	j.appendSubagentTool(sid, "t-dead", "Read", "s2", false, "")
 
 	got := j.unfinishedSubagents(sid)
 	if len(got) != 1 {
@@ -672,7 +722,7 @@ func TestAgentCoreJournalSeqMonotonicAcrossRowKinds(t *testing.T) {
 	j.ensureSessionHeader("s-seq", "/proj", "m", "", "2026-11-10T00:00:00Z", "phone", nil, nil, "")
 	j.appendUser("s-seq", "u1", "问一句", "2026-11-10T00:00:01Z")
 	j.appendAssistantTurn("s-seq", "u1", 1, "答一句", "", "end_turn", nil)
-	j.appendTool("s-seq", "Bash", "ls", false)
+	j.appendTool("s-seq", "Bash", "ls", false, "")
 	j.appendAssistantTurn("s-seq", "u1", 2, "再答", "", "end_turn", nil)
 	j.appendUser("s-seq", "u2", "再问", "2026-11-10T00:00:05Z")
 	j.appendEnd("s-seq", "success", "")

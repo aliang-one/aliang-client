@@ -147,7 +147,7 @@ func TestAgentCoreSubagentBridgeExecute(t *testing.T) {
 		approve: func(ctx context.Context, call agentcore.ApprovalRequest) (agentcore.ApprovalResponse, error) {
 			return agentcore.ApprovalResponse{Approved: true}, nil
 		},
-		onToolCall: func(tool, summary string, isErr bool) { journaled = append(journaled, tool) },
+		onToolCall: func(tool, summary string, isErr bool, result string) { journaled = append(journaled, tool) },
 	}
 	res := bridge.Execute(context.Background(), map[string]interface{}{"task": "评审 main.go"}, nil)
 	if res.IsError || !strings.Contains(res.Content, "评审完成") {
@@ -821,5 +821,39 @@ func TestAgentCoreSubagentBuiltinResearcherWindowsHint(t *testing.T) {
 	// system prompt），这里直接锁 Body 内容。
 	if !strings.Contains(body, "输出结构化调研报告") {
 		t.Fatalf("内置正文锚句缺失: %q", body)
+	}
+}
+
+// fakeJournalTool 是 decorator 单测的最小内核工具：固定返回结果。
+type fakeJournalTool struct{ res agentcore.ToolResult }
+
+func (f *fakeJournalTool) Name() string                        { return "Fake" }
+func (f *fakeJournalTool) Description() string                 { return "decorator 单测假工具" }
+func (f *fakeJournalTool) InputSchema() map[string]interface{} { return map[string]interface{}{"type": "object"} }
+func (f *fakeJournalTool) Execute(context.Context, map[string]interface{}, *agentcore.ToolEnv) agentcore.ToolResult {
+	return f.res
+}
+
+// 装饰器必须把失败工具的输出原文透传进 journal 回调（取证缺口 2026-11-15）；
+// 成功调用 result 同样透传（journal 层只对 is_error 落键，透传无损）。
+func TestAgentCoreJournalToolDecoratorPassesResult(t *testing.T) {
+	var gotErr, gotOK string
+	onCall := func(tool, summary string, isErr bool, result string) {
+		if isErr {
+			gotErr = result
+		} else {
+			gotOK = result
+		}
+	}
+	d := &agentCoreJournalToolDecorator{inner: &fakeJournalTool{res: agentcore.ToolResult{Content: "grep: no such file", IsError: true}}, onCall: onCall}
+	res := d.Execute(context.Background(), map[string]interface{}{}, nil)
+	if !res.IsError || gotErr != "grep: no such file" {
+		t.Fatalf("失败 result 未透传: got=%q res=%+v", gotErr, res)
+	}
+
+	d2 := &agentCoreJournalToolDecorator{inner: &fakeJournalTool{res: agentcore.ToolResult{Content: "ok text", IsError: false}}, onCall: onCall}
+	_ = d2.Execute(context.Background(), map[string]interface{}{}, nil)
+	if gotOK != "ok text" {
+		t.Fatalf("成功 result 未透传: got=%q", gotOK)
 	}
 }
