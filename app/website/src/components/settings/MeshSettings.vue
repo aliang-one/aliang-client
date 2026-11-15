@@ -1,10 +1,13 @@
 <template>
-  <!-- mesh 组网卡（design §9;代理族下 SettingsPage ①代理设置区相邻挂载）。
-       本任务=骨架:顶部状态条 + 离线兜底常驻卡（§9.4,在线时即可配置）;
-       Task 3 填 SVG 拓扑画布与节点对详情。线格式 customer.mesh;提交载荷 =
-       整配置透传 + mesh 覆盖（父层按顶层段浅合并,卡片不丢别的段）。
-       补充只读数据三路（agentApi）:runtime 在线态、mesh 状态聚合、LAN 候选——
-       fetch 内联仅限只读补充（ssh_ingress hostkey 先例）,配置只经 props。 -->
+  <!-- mesh 组网卡（design §9;SettingsPage「入口与组网」子 tab 挂载）。
+       顶部状态条 + SVG 拓扑画布 + peers/身份密钥编辑;出口链路开关已于
+       2026-11-15 挪至代理设置子 tab（PlatformProxySettings「平台流量代理」卡,
+       fallback 唯一 UI 写者）——本卡只读 configMesh.fallback 驱动状态徽标,
+       保存载荷显式省缺 fallback 键（deep-merge preserve,见 save 内注释）。
+       线格式 customer.mesh;提交载荷 = 整配置透传 + mesh 覆盖（父层按顶层段
+       浅合并,卡片不丢别的段）。补充只读数据两路（agentApi）:runtime 在线态、
+       mesh 状态聚合——fetch 内联仅限只读补充（ssh_ingress hostkey 先例）,
+       配置只经 props。 -->
   <div class="flex flex-col gap-4 rounded-xl border border-slate-200 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-background-dark">
     <div class="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
       <div class="flex items-center gap-2">
@@ -274,52 +277,6 @@
       </div>
     </section>
 
-    <!-- —— 出口链路常驻卡(2026-11-12,替代旧「离线兜底」;开关=无条件链到
-         下一跳,不按本机能否直连平台做限制)—— -->
-    <section class="space-y-3 rounded-xl border border-dashed border-slate-300 bg-slate-50/60 p-4 dark:border-slate-700 dark:bg-slate-900/40" data-mesh-fallback>
-      <div class="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
-        <div>
-          <h4 class="text-sm font-semibold text-slate-900 dark:text-white">{{ t('mesh_fallbackTitle') }}</h4>
-          <p class="text-xs text-slate-500">{{ t('mesh_fallbackDesc') }}</p>
-        </div>
-        <label
-          class="inline-flex cursor-pointer items-center justify-between gap-3 rounded-full border px-3 py-2 text-sm font-medium shadow-sm transition md:min-w-[210px]"
-          :class="form.fallbackEnabled
-            ? 'border-primary/20 bg-white text-slate-700 dark:border-primary/30 dark:bg-slate-900 dark:text-slate-200'
-            : 'border-slate-200 bg-white/70 text-slate-500 dark:border-slate-700 dark:bg-slate-900/80 dark:text-slate-300'"
-        >
-          <span>{{ t('mesh_fallbackEnable') }}</span>
-          <span class="relative">
-            <input v-model="form.fallbackEnabled" class="peer sr-only" data-field="meshFallbackEnable" :disabled="loading || saving" type="checkbox" />
-            <span class="relative block h-6 w-11 rounded-full bg-slate-300 transition-colors after:absolute after:left-0.5 after:top-0.5 after:h-5 after:w-5 after:rounded-full after:bg-white after:transition-transform after:content-[''] peer-checked:bg-primary peer-checked:after:translate-x-5 peer-focus-visible:outline peer-focus-visible:outline-2 peer-focus-visible:outline-offset-2 peer-focus-visible:outline-primary dark:bg-slate-700"></span>
-          </span>
-        </label>
-      </div>
-
-      <!-- 下一跳 = peers 中已配置的节点(后端 Validate:enable 时 next_hop 必填、
-           须指向 peers 中的节点且已钉扎 host_key;地址与指纹从 peers 条目继承,
-           不再单输)。未钉扎的行标注提示,选中后端也会拒。 -->
-      <label class="space-y-2">
-        <span class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ t('mesh_fallbackNextHop') }}</span>
-        <select
-          v-model="form.fallbackNextHop"
-          class="w-full rounded-lg border px-3 py-2 text-sm shadow-sm transition focus:outline-none focus:ring-2 dark:text-slate-100"
-          :class="validationError
-            ? 'border-red-400 bg-red-50 focus:border-red-500 focus:ring-red-500/20 dark:border-red-500/50 dark:bg-red-900/10'
-            : 'border-slate-300 bg-white focus:border-primary focus:ring-primary/20 dark:border-slate-700 dark:bg-slate-900'"
-          data-field="meshFallbackNextHop"
-          :disabled="loading || saving || !form.peerRows.length"
-          @keydown.enter.prevent
-        >
-          <option value="">{{ form.peerRows.length ? t('mesh_fallbackNextHopPlaceholder') : t('mesh_fallbackNextHopEmpty') }}</option>
-          <option v-for="peer in form.peerRows" :key="peer.device_id" :value="peer.device_id">
-            {{ peer.device_id }}{{ peer.host_key ? '' : ' · ' + t('mesh_fallbackNextHopUnpinned') }}
-          </option>
-        </select>
-        <p class="text-xs text-slate-500">{{ t('mesh_fallbackNextHopHint') }}</p>
-      </label>
-    </section>
-
     <!-- —— 节点身份密钥（G3/SPEC §13.3.4）:私钥 textarea 容 PEM 多行 + 口令密码框,
          autocomplete off 防浏览器记忆凭据（RulesSettings proxy 私钥同款手法）。
          表单不强校验——后端保存期拒绝（peers 非空时 private_key 必填等）经卡片
@@ -357,14 +314,12 @@
       </div>
     </section>
 
-    <p v-if="validationError" class="text-xs text-red-500" role="alert">{{ validationError }}</p>
-
     <div class="flex items-center justify-end gap-3">
       <button
         class="inline-flex min-h-11 items-center justify-center gap-2 rounded bg-primary px-4 py-2 text-sm font-medium text-white transition hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-60"
         data-mesh-save
         type="button"
-        :disabled="loading || saving || !!validationError"
+        :disabled="loading || saving"
         @click="save"
       >
         <span class="material-symbols-outlined text-sm">save</span>
@@ -491,14 +446,6 @@ export default {
         return 'border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-300';
       }
       return 'border-slate-200 bg-slate-50 text-slate-500 dark:border-slate-700 dark:bg-slate-900/40 dark:text-slate-400';
-    },
-    // 校验与后端 MeshConfig.Validate「fallback.enable 时 next_hop 必填」对齐;
-    // 文案是提示层,后端保存时仍是权威(还校验 next_hop 指向已钉扎 peer)。
-    validationError() {
-      if (this.form.fallbackEnabled && !String(this.form.fallbackNextHop || '').trim()) {
-        return this.t('mesh_validationFallbackNextHop');
-      }
-      return '';
     },
     // —— G4/SPEC §10.3 两条仪表盘提示 ——
     // 依赖降级:mesh 有效启用（enable!==false,对齐后端三态 nil=true）而
@@ -797,10 +744,6 @@ export default {
     formFromConfig(config) {
       const mesh = normalizeMeshConfig(config?.mesh);
       return {
-        fallbackEnabled: mesh.fallback.enable,
-        // 出口链路下一跳(2026-11-12):从配置回填;选项源=表单 peerRows
-        // (行内 host_key 编辑值即时反映到「未钉扎」标注)。
-        fallbackNextHop: mesh.fallback.next_hop || '',
         // 密钥输入位(G3/SPEC §13.3.4):现值从配置回填——「填→保存→刷新仍在」
         // 的读侧(刷新=props.config 更新,watch 深度重建表单)。缺键渲染空串。
         privateKey: mesh.private_key || '',
@@ -839,9 +782,6 @@ export default {
     // 永不落盘）;peers/max_hops/开关等未编辑字段经归一化规整透传（Task 3
     // 画布接管编辑前,卡片不丢配置现值）。
     save() {
-      if (this.validationError) {
-        return;
-      }
       const mesh = normalizeMeshConfig({
         ...(this.config?.mesh && typeof this.config.mesh === 'object' ? this.config.mesh : {}),
         // 密钥表单值（G3/SPEC §13.3.4）:节点私钥/口令与 peers 行内 host_key 进入
@@ -850,14 +790,15 @@ export default {
         private_key: String(this.form.privateKey ?? ''),
         key_passphrase: String(this.form.keyPassphrase ?? ''),
         // peers 以表单行为准（行内 host_key 编辑值必须带出）;未编辑字段整行透传
-        peers: this.form.peerRows.map((row) => ({ ...row })),
-        fallback: {
-          // 出口链路(2026-11-12):字面量整体替换 {enable,next_hop}——旧版
-          // 字段(classes/addr/host_key)随替换一并清除,后端结构体已不认这些键。
-          enable: !!this.form.fallbackEnabled,
-          next_hop: String(this.form.fallbackNextHop || '').trim()
-        }
+        peers: this.form.peerRows.map((row) => ({ ...row }))
       });
+      // fallback 编辑权已挪至代理设置「平台流量代理」卡(2026-11-15):
+      // PlatformProxySettings 是 fallback 的唯一 UI 写者。本卡载荷透传保存态
+      // fallback 现值(上方 config.mesh 展开已携带,经归一化保持显式布尔)——
+      // 不编辑 → 与现值 diff 为零 → 不进 patch → 后端 deep-merge preserve。
+      // ⚠️ 不能省缺该键:父层 buildCustomerSavePatch 是顶层浅合并+归一化链,
+      // 载荷缺键会在父层被归一化成默认值,diff 出 enable:false 反把开关打关
+      // (全量快照契约,与 peers/密钥同族)。
       this.$emit('save', this.savePayload(mesh));
     },
     // 整体保存载荷（整配置透传 + mesh 覆盖）之上的 G4 附加:「一并开启」确认

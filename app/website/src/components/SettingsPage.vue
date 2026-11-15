@@ -205,11 +205,20 @@
                 />
               </template>
             </div>
-            <!-- 右栏:运行模式免登录(设备本地,与电源按钮同级);模型映射依赖
-                 customerConfig,登录后可用。 -->
+            <!-- 右栏:运行模式免登录(设备本地,与电源按钮同级);平台流量代理
+                 （2026-11-15 自「入口与组网」mesh 卡挪入,见卡片头注释）与模型
+                 映射依赖 customerConfig,登录后可用。 -->
             <aside class="w-full shrink-0 space-y-5 lg:w-96">
               <SystemRunModeSettings />
               <template v-if="isAuthenticated">
+                <PlatformProxySettings
+                  :config="customerConfig"
+                  :loading="isLoadingCustomerConfig"
+                  :saving="isSavingCustomerConfig"
+                  :error="customerConfigError"
+                  :success-message="customerConfigSuccess"
+                  @save="saveCustomerConfig"
+                />
                 <ModelMappingSettings
                   :config="customerConfig"
                   :loading="isLoadingCustomerConfig"
@@ -307,6 +316,7 @@
 import RulesSettings from './settings/RulesSettings.vue';
 import SshIngressSettings, { normalizeSSHIngressConfig } from './settings/SshIngressSettings.vue';
 import MeshSettings from './settings/MeshSettings.vue';
+import PlatformProxySettings from './settings/PlatformProxySettings.vue';
 import { normalizeMeshConfig } from './settings/MeshSettings.js';
 import UserInfoSettings from './settings/UserInfoSettings.vue';
 import LogsSettings from './settings/LogsSettings.vue';
@@ -611,6 +621,7 @@ export default {
     RulesSettings,
     SshIngressSettings,
     MeshSettings,
+    PlatformProxySettings,
     UserInfoSettings,
     LogsSettings,
     ModelMappingSettings,
