@@ -197,3 +197,141 @@ func TestApprovalDecisionJournaledAsAuditRow(t *testing.T) {
 		t.Errorf("run_seq = %v, want 3", audit["run_seq"])
 	}
 }
+
+// ---------------------------------------------------------------------------
+// agentcore /clear 真实清空（2026-11-15）：内存 + journal 磁盘两侧都清——
+// 只清内存会被下一帧 create/message 的 journal 读回打穿，「清空」形同虚设。
+// ---------------------------------------------------------------------------
+
+// TestAgentCoreClearCommandJournaled：/clear 应被本地接管、journal 重写为
+// 头行+命令行+应答行（配置保留、旧历史不复活）、内存历史清空。命令行重落
+// 垫在应答之前是硬约束：终态若 assistant-first，读回装成首条历史后上游
+// Messages 契约按角色序拒收，清空过的会话整轮 400。
+func TestAgentCoreClearCommandJournaled(t *testing.T) {
+	dir := t.TempDir()
+	m := newSlashJournalTestManager(t, dir)
+	m.mu.Lock()
+	sess := &agentAISession{
+		id: "s-clear", provider: "agentcore", mode: "vibe", model: "glm-5.3",
+		surface: "phone", originSocket: "remote",
+		history: []agentAIMessage{
+			{Role: "user", MessageID: "u1", Content: "旧问题"},
+			{Role: "assistant", MessageID: "a1", Content: "旧回答"},
+		},
+		initialContext: "立身上下文",
+	}
+	m.sessions["s-clear"] = sess
+	m.mu.Unlock()
+
+	// 先落几条真历史进 journal（模拟既有会话）。
+	m.coreJournal.ensureSessionHeader("s-clear", "/tmp/proj", "glm-5.3", "", time.Now().UTC().Format(time.RFC3339), "phone", nil, nil, "")
+	m.coreJournal.appendUser("s-clear", "u1", "旧问题", time.Now().UTC().Format(time.RFC3339))
+	m.coreJournal.appendAssistant("s-clear", "a1", "旧回答", time.Now().UTC().Format(time.RFC3339))
+
+	if !m.handleLocalSlashCommand(sess, "msg-clear", "/clear", "agentcore", func(interface{}) error { return nil }) {
+		t.Fatal("/clear 应被本地接管")
+	}
+
+	// 内存侧：历史与立身上下文清空、runSeq 归零。
+	m.mu.Lock()
+	cleared := m.sessions["s-clear"]
+	emptyHist := len(cleared.history) == 0 && cleared.initialContext == "" && cleared.runSeq == 0
+	m.mu.Unlock()
+	if !emptyHist {
+		t.Fatalf("内存历史未清空: %+v", cleared.history)
+	}
+
+	// 磁盘侧：头行保留、旧内容行全清、/clear 命令行重落 + 应答行按 spec §4.5
+	// 留痕；模型配置不丢。顺序必须 user→assistant（上游角色序契约）。
+	lines := readJournalLines(t, dir, "s-clear")
+	if len(lines) != 3 || lines[0]["kind"] != "session" {
+		t.Fatalf("/clear 后 journal 应为 头行+命令行+应答行,实际 %d 行: %v", len(lines), lines)
+	}
+	if lines[0]["model"] != "glm-5.3" {
+		t.Errorf("头行 model = %v, want glm-5.3（配置必须保留）", lines[0]["model"])
+	}
+	if lines[1]["kind"] != "msg" || lines[1]["role"] != "user" || lines[1]["text"] != "/clear" {
+		t.Errorf("第二行应为重落的 /clear 命令行,实际 %v", lines[1])
+	}
+	mid, _ := lines[1]["message_id"].(string)
+	if !strings.HasPrefix(mid, "msg-clear-clear-") {
+		t.Errorf("重落命令行 message_id = %q, want msg-clear-clear- 前缀（同 id 重落会被 written 抑制,必须派生）", mid)
+	}
+	if lines[2]["kind"] != "msg" || lines[2]["message_id"] != "assistant_msg-clear" {
+		t.Errorf("第三行应为 /clear 应答行,实际 %v", lines[2])
+	}
+	// 读回 = /clear 命令行 + 应答（旧历史不复活）；首条必须是 user。
+	hist, _, err := readAgentCoreJournalHistoryFrom(dir, "s-clear")
+	if err != nil {
+		t.Fatalf("readback: %v", err)
+	}
+	if len(hist) != 2 || hist[0].Role != "user" || hist[1].Role != "assistant" {
+		t.Fatalf("读回历史应 user→assistant 两行,实际 %+v", hist)
+	}
+}
+
+// TestAgentCoreClearCommandReplayStaysUserFirst：同 messageID 重发 /clear（幂
+// 等重试）会二次 reset——重落命令行的派生 id 必须不被 written 去重键抑制，
+// 否则第二次重放后 journal 又回到 assistant-first。应答行同 id 会被抑制
+// （已知且无害：重放是异常路径，历史仍 user-first 合法，仅缺一条应答留痕）。
+func TestAgentCoreClearCommandReplayStaysUserFirst(t *testing.T) {
+	dir := t.TempDir()
+	m := newSlashJournalTestManager(t, dir)
+	m.mu.Lock()
+	sess := &agentAISession{id: "s-replay", provider: "agentcore", mode: "vibe", model: "glm-5.3"}
+	m.sessions["s-replay"] = sess
+	m.mu.Unlock()
+	m.coreJournal.ensureSessionHeader("s-replay", "/tmp/proj", "glm-5.3", "", time.Now().UTC().Format(time.RFC3339), "phone", nil, nil, "")
+	m.coreJournal.appendUser("s-replay", "u1", "旧问题", time.Now().UTC().Format(time.RFC3339))
+
+	take := func() {
+		if !m.handleLocalSlashCommand(sess, "msg-replay", "/clear", "agentcore", func(interface{}) error { return nil }) {
+			t.Fatal("/clear 应被本地接管")
+		}
+	}
+	take()
+	take() // 同 id 重放:第二次 reset 后命令行仍必须真正落盘(派生 id 避让去重)
+
+	lines := readJournalLines(t, dir, "s-replay")
+	if len(lines) != 2 || lines[0]["kind"] != "session" || lines[1]["role"] != "user" {
+		t.Fatalf("重放后 journal 应为 头行+重落命令行(应答行同 id 被抑制),实际 %d 行: %v", len(lines), lines)
+	}
+	hist, _, err := readAgentCoreJournalHistoryFrom(dir, "s-replay")
+	if err != nil {
+		t.Fatalf("readback: %v", err)
+	}
+	if len(hist) != 1 || hist[0].Role != "user" {
+		t.Fatalf("重放后读回仍应 user-first,实际 %+v", hist)
+	}
+}
+
+// TestAgentCoreClearCommandNoJournal：journal 不可用时降级为仅清内存，
+// 不得 panic，且命令仍被接管（照常应答）。
+func TestAgentCoreClearCommandNoJournal(t *testing.T) {
+	m := newAgentAIManager()
+	m.coreJournal = nil
+	m.mu.Lock()
+	sess := &agentAISession{id: "s-noj", provider: "agentcore", mode: "vibe"}
+	sess.history = []agentAIMessage{{Role: "user", MessageID: "u1", Content: "x"}}
+	m.sessions["s-noj"] = sess
+	m.mu.Unlock()
+
+	if !m.handleLocalSlashCommand(sess, "msg-x", "/clear", "agentcore", func(interface{}) error { return nil }) {
+		t.Fatal("/clear 应被本地接管")
+	}
+	m.mu.Lock()
+	empty := len(m.sessions["s-noj"].history) == 0
+	m.mu.Unlock()
+	if !empty {
+		t.Fatal("journal 缺席时内存历史仍应清空")
+	}
+}
+
+// TestResetSessionJournalHistoryNoop：文件缺失是成功 no-op（磁盘上没有东西
+// 可复活），不报错。
+func TestResetSessionJournalHistoryNoop(t *testing.T) {
+	j := newAgentCoreJournal(t.TempDir())
+	if err := j.resetSessionHistory("never-existed"); err != nil {
+		t.Fatalf("缺文件应为 no-op 成功,实际 err=%v", err)
+	}
+}

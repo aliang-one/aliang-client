@@ -2879,7 +2879,7 @@ func (m *agentAIManager) handleLocalSlashCommand(session *agentAISession, messag
 		"state":        "running",
 	})
 
-	line := m.applyLocalSlashCommand(session, name, args, provider)
+	line := m.applyLocalSlashCommand(session, name, args, provider, messageID, content)
 
 	if provider == "agentcore" && line != "" {
 		m.coreJournal.appendAssistant(session.id, assistantID, line, time.Now().UTC().Format(time.RFC3339))
@@ -2932,9 +2932,17 @@ func (m *agentAIManager) replyLocalSlashCommand(session *agentAISession, message
 
 // applyLocalSlashCommand performs the side effect (if any) for a local slash
 // command and returns a single status line streamed back as the reply.
-func (m *agentAIManager) applyLocalSlashCommand(session *agentAISession, name, args, provider string) string {
+// messageID/content 是本条命令的用户行身份与原文：agentcore 侧 /clear 在
+// reset 后要按原文重落命令行（见 clearAgentCoreSession），保真透传不重造。
+func (m *agentAIManager) applyLocalSlashCommand(session *agentAISession, name, args, provider, messageID, content string) string {
 	switch name {
 	case "clear":
+		// agentcore 无原生转录，journal 就是历史的唯一权威（run 装配从 journal
+		// 读回）——只清内存历史不够，下一帧 create/message 的懒建分支会把磁盘
+		// 上的历史原样装回，「清空」形同虚设。走专用清空：内存 + journal 一起清。
+		if provider == "agentcore" {
+			return m.clearAgentCoreSession(session, messageID, content)
+		}
 		// Detach from the current Claude session so the next turn starts FRESH
 		// (no --resume). resumeSessionID may have been set at ai.session.create
 		// or recaptured post-run (setAgentAIResumeSessionIDIfEmpty); clearing it
@@ -2962,7 +2970,7 @@ func (m *agentAIManager) applyLocalSlashCommand(session *agentAISession, name, a
 		}
 		return fmt.Sprintf("当前模型: %s。请在手机会话工具中切换。", cur)
 	case "help":
-		return "本机命令(remote=local): /clear  /model  /help  /cost  /compact\n注: 模型切换请使用手机会话设置；/compact 会对已连接的 Claude/Codex/内置内核执行真实压缩。"
+		return "本机命令(remote=local): /clear  /model  /help  /cost  /compact\n注: 模型切换请使用会话设置；/clear 会真实清空内核会话上下文（内存 + journal），/compact 对已连接的 Claude/Codex/内置内核执行真实压缩。"
 	case "cost":
 		// Per-turn usage is emitted as ai.usage but not accumulated on the
 		// session, so there is no running total to report here.
@@ -4837,7 +4845,7 @@ func (m *agentAIManager) handleClaudeApprovalHook(ctx context.Context, sessionID
 		// raw 传入边界判定:Claude auto-memory carve-out 需要 transcript_path
 		// 在 slug 编码漂移时精确锁定本会话的 memory 目录。
 		rawDecision, rawMatchedID := hookSvc.evaluateApprovalDecisionForHook(toolName, toolInput, run.projectPath, raw)
-		overridden := applyApprovalModeOverride(run.approvalMode, rawDecision)
+		overridden := applyApprovalModeOverride(run.approvalMode, rawDecision, toolName)
 		if overridden != rawDecision {
 			logger.Info(fmt.Sprintf("approval-hook: MODE-OVERRIDE mode=%s %s→%s tool=%s session=%s (hook)", run.approvalMode, rawDecision, overridden, toolName, sessionID))
 		}
@@ -4861,7 +4869,8 @@ func (m *agentAIManager) handleClaudeApprovalHook(ctx context.Context, sessionID
 	// 与 approval() 记录点存的 waiter.request.Provider 对齐。
 	// double build intentional: hit path stays branch-free
 	// ask_all/bypass_all 下跳过会话批准记忆(用户显式要求每次问/反正全放)。
-	if approvalModeSkipsSessionMemory(run.approvalMode) {
+	// read_only 只对写/执行族跳过——记忆免问不能复活被压制的写权限。
+	if approvalModeSkipsSessionMemoryForTool(run.approvalMode, toolName) {
 		logger.Info(fmt.Sprintf("approval-hook: SESSION-MEMORY-SKIPPED mode=%s tool=%s session=%s (hook)", run.approvalMode, toolName, sessionID))
 	} else if preReq := buildClaudeApprovalRequest(run, raw); m.sessionApprovalAllows(sessionID, preReq.Provider, preReq.Kind, preReq.ToolName, preReq.Command) {
 		logger.Info(fmt.Sprintf("approval-hook: SESSION-APPROVED (memory) tool=%s kind=%s session=%s", preReq.ToolName, preReq.Kind, sessionID))
@@ -6900,7 +6909,7 @@ func (m *agentAIManager) codexAppServerApprovalResult(ctx context.Context, run a
 	if codexSvc != nil {
 		toolName, toolInput := codexPolicyToolHint(method, params, fileChanges)
 		rawDecision, rawMatchedID := codexSvc.evaluateApprovalDecision(toolName, toolInput, run.projectPath)
-		overridden := applyApprovalModeOverride(run.approvalMode, rawDecision)
+		overridden := applyApprovalModeOverride(run.approvalMode, rawDecision, toolName)
 		if overridden != rawDecision {
 			logger.Info(fmt.Sprintf("approval-hook: MODE-OVERRIDE mode=%s %s→%s tool=%s session=%s (codex)", run.approvalMode, rawDecision, overridden, toolName, run.sessionID))
 		}
@@ -6921,10 +6930,12 @@ func (m *agentAIManager) codexAppServerApprovalResult(ctx context.Context, run a
 	// scope=session 行为保留不动，这里只是 agent 侧叠加记忆免往返。provider 取
 	// 请求对象自身（buildCodexApprovalRequest 硬编码 "codex"，而 run.provider
 	// 可能是 "auto"——与 approval() 记录点存的 waiter.request.Provider 对齐）。
-	// ask_all/bypass_all 下跳过会话批准记忆(同 claude hook)。
-	if approvalModeSkipsSessionMemory(run.approvalMode) {
+	// ask_all/bypass_all 下跳过会话批准记忆(同 claude hook)。read_only 只对
+	// 写/执行族跳过——记忆免问不能复活被压制的写权限。
+	// double build intentional (同上游 claude hook):hit path stays branch-free
+	if pre := buildCodexApprovalRequest(run, method, params, fileChanges); approvalModeSkipsSessionMemoryForTool(run.approvalMode, pre.ToolName) {
 		logger.Info(fmt.Sprintf("approval-hook: SESSION-MEMORY-SKIPPED mode=%s method=%s session=%s (codex)", run.approvalMode, method, run.sessionID))
-	} else if pre := buildCodexApprovalRequest(run, method, params, fileChanges); m.sessionApprovalAllows(run.sessionID, pre.Provider, pre.Kind, pre.ToolName, pre.Command) {
+	} else if m.sessionApprovalAllows(run.sessionID, pre.Provider, pre.Kind, pre.ToolName, pre.Command) {
 		logger.Info(fmt.Sprintf("approval-hook: SESSION-APPROVED (memory) tool=%s kind=%s method=%s session=%s (codex)", pre.ToolName, pre.Kind, method, run.sessionID))
 		m.journalSessionApprovalHit(run.sessionID, run.runSeq, pre.Kind, pre.ToolName, pre.Command)
 		return codexApprovalResponseResult(method, params, agentAIApprovalResponse{Decision: models.AgentAIApprovalDecisionAccept})

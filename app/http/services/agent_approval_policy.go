@@ -369,11 +369,13 @@ func remoteApprovalPolicyHash(msg, device map[string]interface{}) string {
 // docs/superpowers/specs/2026-06-22-project-scoped-approval-policy-design.md.
 
 // policyDecision is the outcome of evaluating a policy rule (or the default).
-// 会话级审批模式词表(spec 2026-11-05):空=策略默认;ask_all=每次询问;
-// bypass_all=放过所有。非法值一律归一为空。
+// 会话级审批模式词表(spec 2026-11-05;2026-11-15 三端统一,read_only 并入):
+// 空=策略默认;ask_all=每次询问;bypass_all=放过所有;read_only=只读(文件改写
+// 与命令执行一律改判 require 交用户拍板)。非法值一律归一为空。
 const (
 	agentAIApprovalModeAskAll    = "ask_all"
 	agentAIApprovalModeBypassAll = "bypass_all"
+	agentAIApprovalModeReadOnly  = "read_only"
 )
 
 // parseAgentAIApprovalMode 解析载荷里的 approval_mode:第二个返回值区分
@@ -397,6 +399,8 @@ func normalizeAgentAIApprovalMode(raw string) string {
 		return agentAIApprovalModeAskAll
 	case agentAIApprovalModeBypassAll:
 		return agentAIApprovalModeBypassAll
+	case agentAIApprovalModeReadOnly:
+		return agentAIApprovalModeReadOnly
 	default:
 		return ""
 	}
@@ -407,8 +411,12 @@ func normalizeAgentAIApprovalMode(raw string) string {
 //     护栏,恒不越过。会话批准记忆在 bypass 下无意义(反正放行),调用方跳过。
 //   - ask_all: auto_approve 降级为 require(每次问);auto_deny 恒拒。会话
 //     批准记忆同样跳过——用户显式要求每次问,不再吃 accept_for_session。
+//   - read_only: 文件改写与命令执行(按工具名判,writeFamilyAgentAITool)
+//     降 require 交用户拍板——策略 auto_approve 也不例外;其余(只读工具)
+//     维持策略决策。auto_deny 恒拒;会话批准记忆对写/执行跳过(记忆免问
+//     不能复活写权限)。
 //   - 空:现状。
-func applyApprovalModeOverride(mode string, decision policyDecision) policyDecision {
+func applyApprovalModeOverride(mode string, decision policyDecision, toolName string) policyDecision {
 	switch mode {
 	case agentAIApprovalModeBypassAll:
 		if decision == decisionRequireApproval {
@@ -420,14 +428,46 @@ func applyApprovalModeOverride(mode string, decision policyDecision) policyDecis
 			return decisionRequireApproval
 		}
 		return decision
+	case agentAIApprovalModeReadOnly:
+		if decision == decisionAutoApprove && writeFamilyAgentAITool(toolName) {
+			return decisionRequireApproval
+		}
+		return decision
 	default:
 		return decision
 	}
 }
 
 // approvalModeSkipsSessionMemory 该模式下跳过会话批准记忆检查点。
+// read_only 只对写/执行族跳过——读工具的记忆照常生效,写/执行工具的记忆
+// 即使命中也不能复活被 read_only 压制的操作,由调用方按工具名分流。
 func approvalModeSkipsSessionMemory(mode string) bool {
 	return mode == agentAIApprovalModeAskAll || mode == agentAIApprovalModeBypassAll
+}
+
+// approvalModeSkipsSessionMemoryForTool 是 approvalModeSkipsSessionMemory 的
+// 工具感知版:read_only 下只有写/执行族工具跳过记忆,读工具记忆免问照常。
+func approvalModeSkipsSessionMemoryForTool(mode, toolName string) bool {
+	if mode == agentAIApprovalModeReadOnly {
+		return writeFamilyAgentAITool(toolName)
+	}
+	return approvalModeSkipsSessionMemory(mode)
+}
+
+// writeFamilyAgentAITool 判定工具是否属「写/执行」族(read_only 挡位的压制
+// 面)。覆盖:文件改写(write/edit/multiedit/notebookedit)、命令执行(bash/
+// powershell/shell/command)、codex 派生名(file-change/command)。命名对齐
+// approvalToolPaths 的写工具词表与 buildAgentCoreApprovalRequest 的 command
+// kind 判定;未知工具(含 MCP)一律不算写族——read_only 对 MCP 不扩权也不
+// 误压(策略层怎么判就怎么走),未来新增写型工具在此登记。
+func writeFamilyAgentAITool(toolName string) bool {
+	switch strings.ToLower(strings.TrimSpace(toolName)) {
+	case "write", "edit", "multiedit", "notebookedit",
+		"bash", "powershell", "shell", "command",
+		"file-change":
+		return true
+	}
+	return false
 }
 
 type policyDecision string

@@ -473,7 +473,9 @@ func TestSlashCommandsRequireTrustAndSystemInitForProjectSkills(t *testing.T) {
 		"claude_remote_policy": map[string]interface{}{"project_skill_trusted": false, "project_capability_mode": "disabled", "trust_level": "isolated"},
 	}
 	untrusted := agentSlashCommandsListPayloadWithManager(msg, manager)
-	if commands := untrusted["commands"].([]map[string]interface{}); len(commands) != 0 {
+	// isolated 档门控的是项目派生条目；builtin 是宿主静态基线（零项目内容），
+	// 不受档位门（原架构「云端持有基线」同语义）。
+	if commands := untrusted["commands"].([]map[string]interface{}); len(commands) != len(claudeBuiltinCommands()) {
 		t.Fatalf("untrusted project leaked capabilities: %+v", commands)
 	}
 
@@ -483,8 +485,8 @@ func TestSlashCommandsRequireTrustAndSystemInitForProjectSkills(t *testing.T) {
 		t.Fatalf("verification metadata = %+v", trusted)
 	}
 	commands := trusted["commands"].([]map[string]interface{})
-	// sanitized 档:项目命令经清洗插件命名空间呈现
-	if len(commands) != 1 || commands[0]["name"] != "aliang-project:deploy" || commands[0]["kind"] != "skill" {
+	// sanitized 档:项目命令经清洗插件命名空间呈现（+ 宿主 builtin 基线）
+	if len(commands) != len(claudeBuiltinCommands())+1 || commands[0]["name"] != "aliang-project:deploy" || commands[0]["kind"] != "skill" {
 		t.Fatalf("trusted commands = %+v", commands)
 	}
 
@@ -493,7 +495,7 @@ func TestSlashCommandsRequireTrustAndSystemInitForProjectSkills(t *testing.T) {
 	// namespace entries disappear even though the tier was requested.
 	manager.recordClaudeCapabilities("s1", project, []string{"aliang-project:deploy"}, "2.1.17")
 	downgraded := agentSlashCommandsListPayloadWithManager(msg, manager)
-	if commands := downgraded["commands"].([]map[string]interface{}); len(commands) != 0 {
+	if commands := downgraded["commands"].([]map[string]interface{}); len(commands) != len(claudeBuiltinCommands()) {
 		t.Fatalf("pre-2.2 snapshot leaked project commands into sanitized list: %+v", commands)
 	}
 }
@@ -525,8 +527,9 @@ func TestSlashCommandsFullTierListsProjectBareNames(t *testing.T) {
 	}
 	payload := agentSlashCommandsListPayloadWithManager(msg, manager)
 	commands := payload["commands"].([]map[string]interface{})
-	if len(commands) != 1 || commands[0]["name"] != "deploy" {
-		t.Fatalf("full tier commands = %+v, want bare deploy", commands)
+	// full 档裸名项目条目 + 宿主 builtin 基线；项目条目排首（origin 排序 project < builtin）。
+	if len(commands) != len(claudeBuiltinCommands())+1 || commands[0]["name"] != "deploy" {
+		t.Fatalf("full tier commands = %+v, want bare deploy + builtins", commands)
 	}
 }
 
@@ -557,8 +560,15 @@ func TestSlashCommandsPre2_2SnapshotDowngradesToList(t *testing.T) {
 	}
 	payload := agentSlashCommandsListPayloadWithManager(msg, manager)
 	commands := payload["commands"].([]map[string]interface{})
-	if len(commands) != 0 {
+	// pre-2.2 快照把 sanitized 请求按 isolated 门控：项目条目出局，
+	// 宿主 builtin 基线不受档位门（静态宿主字符串，零项目内容）。
+	if len(commands) != len(claudeBuiltinCommands()) {
 		t.Fatalf("pre-2.2 snapshot must gate project commands out of the sanitized list: %+v", commands)
+	}
+	for _, c := range commands {
+		if c["origin"] != "builtin" {
+			t.Fatalf("non-builtin entry survived gating: %+v", c)
+		}
 	}
 }
 

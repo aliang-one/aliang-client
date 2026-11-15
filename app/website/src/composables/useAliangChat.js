@@ -2152,9 +2152,10 @@ export function useAliangChat() {
   // provider so we only round-trip once; a second call while pending is a no-op.
   async function ensureSlashCommands() {
     const provider = slashActiveProvider.value;
-    // agentcore 内核没有 claude/codex 的插件命令面。绝不发空 provider 请求：
-    // 后端 normalizeSlashProvider 把空值当「未指定」并返回全部 provider 的命令，
-    // 正是要避免的误导。
+    // slashProviderFor 对未知/缺省 provider 回落 claude、不再返回空串，本守卫
+    // 按理不可达——保留为防御（后端 normalizeSlashProvider 把空值当「未指定」
+    // 返回全部 provider 的命令，正是要避免的误导）。agentcore 也有自己的命令面
+    // （本机命令 + 内核 skills/MCP 条目），不再抑制。
     if (!provider) return;
     if (slashCommandsByProvider.value[provider] || slashPending[provider]) return;
     slashPending[provider] = true;
@@ -2180,7 +2181,8 @@ export function useAliangChat() {
       return;
     }
     const token = slashToken(inputText.value);
-    // 无命令面（agentcore）：`/` 按普通文本发送，不弹补全。
+    // 无命令面（provider 归一失败，防御性分支，正常不可达）：`/` 按普通文本
+    // 发送，不弹补全。
     if (token === null || !slashActiveProvider.value) {
       slashOpen.value = false;
       return;
@@ -2926,7 +2928,10 @@ export function useAliangChat() {
     // Slash-command discovery results are not tied to a conversation session; cache
     // them by provider before the conversation-targeting logic below.
     if (e.type === 'slash.commands.list.result') {
-      const provider = e.provider === 'codex' ? 'codex' : 'claude';
+      // 后端回显的是归一后 provider（claude/codex/opencode/agentcore 四桶），
+      // 归桶必须走同一归一器——旧两桶三元式会把 agentcore/opencode 清单错落
+      // 进 claude 桶（agentcore 面板静默不可见，claude 面板反被污染）。
+      const provider = slashProviderFor(e.provider);
       slashPending[provider] = false;
       slashCommandsByProvider.value = {
         ...slashCommandsByProvider.value,
@@ -2935,9 +2940,15 @@ export function useAliangChat() {
       return;
     }
     if (e.type === 'slash.commands.list.error') {
-      const provider = e.provider === 'codex' ? 'codex' : 'claude';
-      slashPending[provider] = false;
-      slashCommandsByProvider.value = { ...slashCommandsByProvider.value, [provider]: [] };
+      if (e.provider) {
+        const provider = slashProviderFor(e.provider);
+        slashPending[provider] = false;
+        slashCommandsByProvider.value = { ...slashCommandsByProvider.value, [provider]: [] };
+      } else {
+        // 后端 error 帧不带 provider（可能连 provider 都没解析出来）：不可
+        // 归因就不误清任何桶，只放行重试旗标——下次打开面板按需重发，幂等。
+        for (const key of Object.keys(slashPending)) slashPending[key] = false;
+      }
       return;
     }
 

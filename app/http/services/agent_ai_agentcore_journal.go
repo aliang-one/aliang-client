@@ -1355,3 +1355,55 @@ func (j *agentCoreJournal) truncateBefore(sessionID, beforeMessageID string) (bo
 	logger.Info(fmt.Sprintf("agentcore-journal: truncated session=%s before=%s kept=%d/%d lines", sessionID, beforeMessageID, kept, len(lines)-start))
 	return true, nil
 }
+
+// resetSessionHistory 把会话 journal 重写为「仅头行」——/clear 的磁盘侧实现。
+//
+// 语义边界：
+//   - 删的是内容行（msg/turn/tool/approval/end 等），留的是头行——头行承载
+//     模型/effort/审批模式/会话级开关/origin，清对话不清配置；
+//   - 文件不存在（从未落过 journal）视为成功 no-op，返回 nil——内存侧清空
+//     已足够，磁盘上没有东西可复活；
+//   - 头行缺失/非法（读侧容忍无头的形态）时写空文件——读侧对空文件返回空
+//     history，行为正确；
+//   - 原子替换（tmp+rename），与 truncateBefore 同款纪律；
+//   - 重写后失效 unfinishedScan 游标（旧偏移指向被丢弃的内容）。
+//
+// 头行生成复用 ensureSessionHeader 的 sessionHeaderLine？不——这里要的是
+// 「保留现有头行原样」，而非按内存会话字段重造（调用点在锁外的命令路径，
+// 不可靠拿到全部头行字段；原样保留才是最小惊讶）。
+func (j *agentCoreJournal) resetSessionHistory(sessionID string) error {
+	if j == nil || j.dir == "" || strings.TrimSpace(sessionID) == "" {
+		return nil
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	path := filepath.Join(j.dir, agentCoreJournalFileName(sessionID))
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			delete(j.unfinishedScan, sessionID)
+			return nil
+		}
+		return err
+	}
+	lines := splitJSONLLines(data)
+	var buf bytes.Buffer
+	if len(lines) > 0 {
+		var first map[string]interface{}
+		if json.Unmarshal(lines[0], &first) == nil && first["kind"] == "session" {
+			buf.Write(lines[0])
+			buf.WriteByte('\n')
+		}
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, buf.Bytes(), 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	delete(j.unfinishedScan, sessionID)
+	logger.Info(fmt.Sprintf("agentcore-journal: reset history (/clear) session=%s kept_header=%v", sessionID, buf.Len() > 0))
+	return nil
+}

@@ -2,6 +2,7 @@ package services
 
 import (
 	"encoding/json"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"aliang.one/nursorgate/app/http/models"
+	"aliang.one/nursorgate/processor/config"
 )
 
 const (
@@ -24,17 +26,23 @@ const (
 // the project's `.claude` tree (plus optional user-level `~/.claude` and enabled
 // plugins) for the Claude provider, `~/.codex/prompts` plus a static builtin
 // baseline for the Codex provider, and `.opencode`/`~/.config/opencode` command
-// roots for the OpenCode provider. It returns the `/`-command surface as
-// AgentCommandInfo-like entries, each tagged with the provider it belongs to.
-// Builtins are intentionally NOT reported for Claude — the cloud owns that
-// static builtin baseline; the agent is the source of truth only for custom
-// commands. For Codex the builtins are surfaced as a convenience baseline
-// because Codex's headless app-server does not enumerate them itself.
+// roots for the OpenCode provider. For the agentcore (AliangCode 内核) provider
+// it surfaces the agent-local builtin set (the commands the dispatcher actually
+// intercepts — /clear /model /help /cost /compact) plus live capability
+// entries: one /skill:<name> per injected skill and one /mcp:<server> per
+// configured MCP server, so the panel reflects what the kernel will really
+// load. It returns the `/`-command surface as AgentCommandInfo-like entries,
+// each tagged with the provider it belongs to.
+// Claude builtins ARE part of the baseline here: the headless CLI's init event
+// reports its own command surface (verified live on 2.1.286 — builtins like
+// compact/clear/model/mcp are present), so filterVerifiedClaudeCommands keeps
+// rather than drops them. For Codex the builtins are surfaced as a convenience
+// baseline because Codex's headless app-server does not enumerate them itself.
 //
 // The optional `provider` field selects which provider's commands to return
-// ("claude"/"claudecode", "codex", or "opencode"). When absent, all providers'
-// commands are returned tagged, so the client can filter by the active
-// conversation.
+// ("claude"/"claudecode", "codex", "opencode", or "agentcore"). When absent,
+// all providers' commands are returned tagged, so the client can filter by the
+// active conversation.
 func agentSlashCommandsListPayload(msg map[string]interface{}) map[string]interface{} {
 	return agentSlashCommandsListPayloadWithManager(msg, nil)
 }
@@ -80,6 +88,7 @@ func agentSlashCommandsListPayloadWithManager(msg map[string]interface{}, manage
 	wantClaude := provider == "" || provider == "claude"
 	wantCodex := provider == "" || provider == "codex"
 	wantOpenCode := provider == "" || provider == "opencode"
+	wantAgentCore := provider == "" || provider == "agentcore"
 
 	var commands []map[string]interface{}
 	if wantClaude {
@@ -92,12 +101,16 @@ func agentSlashCommandsListPayloadWithManager(msg map[string]interface{}, manage
 		if includePlugins {
 			commands = append(commands, collectPluginSlashCommands()...)
 		}
+		commands = append(commands, claudeBuiltinCommands()...)
 	}
 	if wantCodex {
 		commands = append(commands, collectCodexSlashCommands()...)
 	}
 	if wantOpenCode {
 		commands = append(commands, collectOpenCodeSlashCommands(projectPath, includeUser)...)
+	}
+	if wantAgentCore {
+		commands = append(commands, collectAgentCoreSlashCommands(manager)...)
 	}
 	sortSlashCommands(commands)
 	verified := !wantClaude
@@ -130,6 +143,15 @@ func agentSlashCommandsListPayloadWithManager(msg map[string]interface{}, manage
 func filterVerifiedClaudeCommands(commands []map[string]interface{}, available map[string]struct{}) []map[string]interface{} {
 	filtered := make([]map[string]interface{}, 0, len(commands))
 	for _, command := range commands {
+		// Host-side builtin baselines are exempt from the init-snapshot filter:
+		// the snapshot is the CLI's report of ITS command surface, and builtins
+		// are not derived from it. (In practice the snapshot includes builtins —
+		// verified live on 2.1.286 — but the exemption keeps the baseline
+		// independent of that format detail.)
+		if scope, _ := command["scope"].(string); scope == "builtin" {
+			filtered = append(filtered, command)
+			continue
+		}
 		name := normalizeClaudeCapabilityName(remoteString(command, "name"))
 		if name == "" {
 			continue
@@ -159,6 +181,8 @@ func normalizeSlashProvider(raw string) string {
 		return "claude"
 	case "opencode", "open-code", "open_code":
 		return "opencode"
+	case "agentcore", "agent-core", "agent_core":
+		return "agentcore"
 	}
 	return ""
 }
@@ -376,6 +400,91 @@ func codexBuiltinCommands() []map[string]interface{} {
 	out := make([]map[string]interface{}, 0, len(builtins))
 	for _, b := range builtins {
 		out = append(out, slashCapabilityEntry(b.name, b.description, b.argHint, "builtin", "builtin", "", "codex", "command", true, true))
+	}
+	return out
+}
+
+// claudeBuiltinCommands is a static baseline of Claude Code's built-in slash
+// commands. The headless CLI forwards slash tokens inside the prompt turn, so a
+// selected builtin is sent as text and the CLI handles it in-turn (verified:
+// /compact with --resume compacts the native session; /clear /model /help /cost
+// are additionally intercepted agent-side by localSlashBuiltins before a model
+// turn would spawn). The list mirrors the CLI's init-event command surface.
+func claudeBuiltinCommands() []map[string]interface{} {
+	type builtin struct {
+		name, description, argHint string
+	}
+	builtins := []builtin{
+		{"compact", "压缩会话上下文以释放 token（headless 下落成原生 CLI 回合）", "[instructions]"},
+		{"clear", "清空当前会话上下文，下一轮开启全新会话", ""},
+		{"model", "查看当前会话使用的模型（切换请在会话设置里进行）", ""},
+		{"help", "列出本机命令与说明", ""},
+		{"cost", "查看当前会话的 token 用量", ""},
+		{"init", "让 Claude 分析项目并生成 CLAUDE.md", ""},
+		{"review", "让 Claude 审查代码改动", "[target]"},
+		{"mcp", "列出已连接的 MCP server 与工具", ""},
+		{"context", "查看当前上下文窗口占用情况", ""},
+		{"usage", "查看账号用量信息", ""},
+	}
+	out := make([]map[string]interface{}, 0, len(builtins))
+	for _, b := range builtins {
+		out = append(out, slashCapabilityEntry(b.name, b.description, b.argHint, "builtin", "builtin", "", "claude", "command", true, true))
+	}
+	return out
+}
+
+// collectAgentCoreSlashCommands surfaces the AliangCode (agentcore) kernel's
+// slash-command surface. The kernel has no CLI of its own, so the baseline is:
+//  1. the agent-local builtin set (localSlashBuiltins) — these are commands the
+//     dispatcher actually intercepts without a model turn (/compact 特例：落成
+//     内核 Compact() 真实压缩);
+//  2. one /skill:<name> entry per skill the kernel will inject this session
+//     (同一 agentCoreSkillsFor 数据源，含会话级开关语义——这里没有 session_id
+//     上下文，不做会话级过滤，面板展示全量);
+//  3. one /mcp:<server> entry per configured MCP server (agentCoreMCPRawServersIn
+//     的合并结果：.claude.json + 插件 + 统一注册表，跳过 disabled 条目).
+//
+// 选中即插入 `/skill:<name> ` / `/mcp:<server> `，由模型回合解析（技能名进
+// prompt，内核注入的技能清单里就有它；MCP server 名同理会引导模型用对应桥
+// 工具）。全局总闸关闭时对应侧不出条目，面板与内核实际行为保持一致。
+func collectAgentCoreSlashCommands(manager *agentAIManager) []map[string]interface{} {
+	return collectAgentCoreSlashCommandsFor(agentHome(), manager)
+}
+
+func collectAgentCoreSlashCommandsFor(home string, manager *agentAIManager) []map[string]interface{} {
+	type builtin struct {
+		name, description, argHint string
+	}
+	builtins := []builtin{
+		{"compact", "对当前会话历史做一次真实压缩（内核 Compact）", ""},
+		{"clear", "清空当前会话上下文，下一轮从零开始", ""},
+		{"model", "查看当前会话使用的模型（切换请在会话设置里进行）", ""},
+		{"help", "列出本机命令与说明", ""},
+		{"cost", "查看当前会话的 token 用量", ""},
+	}
+	out := make([]map[string]interface{}, 0, len(builtins)+8)
+	for _, b := range builtins {
+		out = append(out, slashCapabilityEntry(b.name, b.description, b.argHint, "builtin", "builtin", "", "agentcore", "command", true, true))
+	}
+	if manager != nil {
+		if config.GetGlobalConfig().EffectiveAgentCoreSkillsEnabled() {
+			for _, skill := range agentCoreSkillsFor(home, nil) {
+				desc := strings.TrimSpace(skill.Description)
+				if desc == "" {
+					desc = "技能：" + skill.Name
+				}
+				out = append(out, slashCapabilityEntry("skill:"+skill.Name, desc, "", "builtin", "kernel", skill.Path, "agentcore", "skill", true, true))
+			}
+		}
+		if config.GetGlobalConfig().EffectiveAgentCoreMCPEnabled() {
+			for _, server := range agentCoreMCPRawServersIn(home) {
+				desc := "MCP server：" + server.Name
+				if len(server.IncludeTools) > 0 {
+					desc += fmt.Sprintf("（tools: %s）", strings.Join(server.IncludeTools, ", "))
+				}
+				out = append(out, slashCapabilityEntry("mcp:"+server.Name, desc, "", "builtin", "kernel", server.Command, "agentcore", "mcp", true, true))
+			}
+		}
 	}
 	return out
 }
@@ -657,6 +766,8 @@ func slashOriginOrder(origin string) int {
 		return 1
 	case "plugin":
 		return 2
+	case "builtin":
+		return 3
 	}
 	return 9
 }

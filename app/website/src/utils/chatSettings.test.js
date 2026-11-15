@@ -96,12 +96,15 @@ describe('sessionCreatePayload', () => {
   });
 
   it('审批模式:词表封闭归一,payload 恒带键(显式空=默认)', () => {
-    expect(APPROVAL_MODES.map((o) => o.value)).toEqual(['', 'ask_all', 'bypass_all']);
+    // 2026-11-15 三端统一:read_only 并入词表(写/执行先问)。
+    expect(APPROVAL_MODES.map((o) => o.value)).toEqual(['', 'read_only', 'ask_all', 'bypass_all']);
     expect(normalizeApprovalMode('bypass_all')).toBe('bypass_all');
     expect(normalizeApprovalMode('ask_all')).toBe('ask_all');
+    expect(normalizeApprovalMode('read_only')).toBe('read_only');
     expect(normalizeApprovalMode('yolo')).toBe('');
     expect(normalizeApprovalMode(undefined)).toBe('');
     expect(sessionCreatePayload({ aiSessionId: 's1', approvalMode: 'ask_all' }).approval_mode).toBe('ask_all');
+    expect(sessionCreatePayload({ aiSessionId: 's1', approvalMode: 'read_only' }).approval_mode).toBe('read_only');
     expect(sessionCreatePayload({ aiSessionId: 's1', approvalMode: 'yolo' }).approval_mode).toBe('');
   });
 

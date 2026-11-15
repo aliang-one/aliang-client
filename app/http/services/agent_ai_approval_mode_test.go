@@ -16,7 +16,7 @@ import (
 
 func TestNormalizeAgentAIApprovalMode(t *testing.T) {
 	cases := map[string]string{
-		"": "", "ask_all": "ask_all", "bypass_all": "bypass_all",
+		"": "", "ask_all": "ask_all", "bypass_all": "bypass_all", "read_only": "read_only",
 		"ASK_ALL": "", "yolo": "", "  ": "", "bypass": "",
 	}
 	for in, want := range cases {
@@ -46,27 +46,53 @@ func TestParseAgentAIApprovalModeSetMarker(t *testing.T) {
 
 func TestApprovalModeDecisionMatrix(t *testing.T) {
 	cases := []struct {
-		name string
-		mode string
-		in   policyDecision
-		want policyDecision
+		name  string
+		mode  string
+		in    policyDecision
+		tool  string
+		want  policyDecision
 	}{
-		{"默认_require", "", decisionRequireApproval, decisionRequireApproval},
-		{"默认_autoApprove", "", decisionAutoApprove, decisionAutoApprove},
-		{"默认_autoDeny", "", decisionAutoDeny, decisionAutoDeny},
-		{"askAll_require", "ask_all", decisionRequireApproval, decisionRequireApproval},
-		{"askAll_降级autoApprove", "ask_all", decisionAutoApprove, decisionRequireApproval},
-		{"askAll_护栏autoDeny", "ask_all", decisionAutoDeny, decisionAutoDeny},
-		{"bypass_require降放行", "bypass_all", decisionRequireApproval, decisionAutoApprove},
-		{"bypass_autoApprove", "bypass_all", decisionAutoApprove, decisionAutoApprove},
-		{"bypass_护栏autoDeny", "bypass_all", decisionAutoDeny, decisionAutoDeny},
+		{"默认_require", "", decisionRequireApproval, "", decisionRequireApproval},
+		{"默认_autoApprove", "", decisionAutoApprove, "", decisionAutoApprove},
+		{"默认_autoDeny", "", decisionAutoDeny, "", decisionAutoDeny},
+		{"askAll_require", "ask_all", decisionRequireApproval, "", decisionRequireApproval},
+		{"askAll_降级autoApprove", "ask_all", decisionAutoApprove, "", decisionRequireApproval},
+		{"askAll_护栏autoDeny", "ask_all", decisionAutoDeny, "", decisionAutoDeny},
+		{"bypass_require降放行", "bypass_all", decisionRequireApproval, "", decisionAutoApprove},
+		{"bypass_autoApprove", "bypass_all", decisionAutoApprove, "", decisionAutoApprove},
+		{"bypass_护栏autoDeny", "bypass_all", decisionAutoDeny, "", decisionAutoDeny},
+		// read_only:写/执行族 auto_approve 降 require;require/auto_deny/读工具不动。
+		{"readOnly_bashAutoApprove降require", "read_only", decisionAutoApprove, "Bash", decisionRequireApproval},
+		{"readOnly_write降require", "read_only", decisionAutoApprove, "Write", decisionRequireApproval},
+		{"readOnly_edit降require", "read_only", decisionAutoApprove, "Edit", decisionRequireApproval},
+		{"readOnly_read保持autoApprove", "read_only", decisionAutoApprove, "Read", decisionAutoApprove},
+		{"readOnly_grep保持autoApprove", "read_only", decisionAutoApprove, "Grep", decisionAutoApprove},
+		{"readOnly_mcp不扩权不误压", "read_only", decisionAutoApprove, "mcp__serena__find_symbol", decisionAutoApprove},
+		{"readOnly_require原样", "read_only", decisionRequireApproval, "Bash", decisionRequireApproval},
+		{"readOnly_护栏autoDeny", "read_only", decisionAutoDeny, "Bash", decisionAutoDeny},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := applyApprovalModeOverride(tc.mode, tc.in); got != tc.want {
-				t.Fatalf("override(%q,%v) = %v, want %v", tc.mode, tc.in, got, tc.want)
+			if got := applyApprovalModeOverride(tc.mode, tc.in, tc.tool); got != tc.want {
+				t.Fatalf("override(%q,%v,%q) = %v, want %v", tc.mode, tc.in, tc.tool, got, tc.want)
 			}
 		})
+	}
+}
+
+// writeFamilyAgentAITool:写/执行族词表钉死——read_only 的压制面以此为界。
+func TestWriteFamilyAgentAITool(t *testing.T) {
+	write := []string{"Write", "Edit", "MultiEdit", "NotebookEdit", "Bash", "PowerShell", "shell", "command", "file-change", " bash "}
+	read := []string{"Read", "Grep", "Glob", "LS", "TodoWrite", "WebSearch", "", "mcp__x__y", "Task"}
+	for _, name := range write {
+		if !writeFamilyAgentAITool(name) {
+			t.Fatalf("%q 应判写/执行族", name)
+		}
+	}
+	for _, name := range read {
+		if writeFamilyAgentAITool(name) {
+			t.Fatalf("%q 不应判写/执行族", name)
+		}
 	}
 }
 
@@ -76,6 +102,27 @@ func TestApprovalModeSkipsSessionMemory(t *testing.T) {
 	}
 	if !approvalModeSkipsSessionMemory("ask_all") || !approvalModeSkipsSessionMemory("bypass_all") {
 		t.Fatal("ask_all/bypass_all 应跳过会话记忆")
+	}
+}
+
+// read_only 的记忆分流:写/执行族跳过记忆(记忆免问不能复活写权限),读工具
+// 记忆照常生效。
+func TestApprovalModeSkipsSessionMemoryForTool(t *testing.T) {
+	for _, tool := range []string{"Bash", "Write", "Edit", "shell"} {
+		if !approvalModeSkipsSessionMemoryForTool("read_only", tool) {
+			t.Fatalf("read_only 下 %q 应跳过会话记忆", tool)
+		}
+	}
+	for _, tool := range []string{"Read", "Grep", "Glob"} {
+		if approvalModeSkipsSessionMemoryForTool("read_only", tool) {
+			t.Fatalf("read_only 下 %q 不应跳过会话记忆(记忆免问照常)", tool)
+		}
+	}
+	if !approvalModeSkipsSessionMemoryForTool("ask_all", "Read") || !approvalModeSkipsSessionMemoryForTool("bypass_all", "Read") {
+		t.Fatal("ask_all/bypass_all 全跳过语义不变")
+	}
+	if approvalModeSkipsSessionMemoryForTool("", "Bash") {
+		t.Fatal("默认模式全不跳过语义不变")
 	}
 }
 

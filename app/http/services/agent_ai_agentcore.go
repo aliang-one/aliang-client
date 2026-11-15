@@ -696,6 +696,53 @@ func agentCorePreservedSystemHistory(history []agentAIMessage) []agentAIMessage 
 	return out
 }
 
+// clearAgentCoreSession 是 agentcore 的 /clear 真实清空（/clear 语义对齐
+// claude/codex 分支的「下一轮从零开始」，但内核通道多一个权威源：journal）。
+//
+// 必须清三处，缺一处都会让历史复活：
+//  1. 内存 history/initialContext/运行序号——与 claude/codex 分支同款字段纪律
+//     （resume 语义不适用，内核通道没有 resumeSessionID 绑定，runSeq 归零让
+//     agentCoreMessages 的 runSeq 匹配门自然失效）；
+//  2. journal 磁盘文件——只清内存的话，下一帧 create（网页端每条消息前都会
+//     重发）或 message 懒建分支会从 journal 读回全部历史，「清空」形同虚设。
+//     重写为「仅头行」而非删文件：保留会话在磁盘上的存在性（三源扫描清单/
+//     跨端快照仍能看到这个会话，只是历史为空），头行的开关/模型/审批配置
+//     原样保留——清的是对话，不是配置；
+//  3. journal 去重集合的会话内游标（written 是全局 messageID 集合无需清理，
+//     但 unfinishedScan 游标指向旧文件偏移，必须失效，否则装配期增量扫描会
+//     从错误位置读）。
+//
+// reset 成功后必须重落一条 user 命令行垫在应答之前：调用方在命令生效后还会
+// appendAssistant 落应答行，若 journal 终态只有「头行+assistant 应答」，重启/
+// 逐出后的懒建读回会把 assistant 装成首条历史，上游 Messages 契约按角色序
+// 拒收，清空过的会话整轮 400（2026-11-15 评审实锤）。同 id 重落会被 written
+// 去重键抑制（reset 不清 written），且同 id 重发的幂等重试会二次 reset——
+// 派生 id 加纳秒后缀，任何一次重放都必然真正落盘。
+//
+// journal 不可用时降级为仅清内存（尽力而为口径，与 journal 写失败只 Warn 的
+// 既有纪律一致），返回文案如实区分「无历史可清」与「reset 失败有残留风险」。
+func (m *agentAIManager) clearAgentCoreSession(session *agentAISession, userMessageID, userContent string) string {
+	m.mu.Lock()
+	session.history = nil
+	session.initialContext = ""
+	session.runSeq = 0
+	session.finalizedRunSeq = 0
+	m.mu.Unlock()
+
+	if m.coreJournal == nil {
+		// journal 未启用：磁盘上没有可读回的历史，内存清空即彻底清空。
+		return "✓ /clear 已清空内存上下文。"
+	}
+	if err := m.coreJournal.resetSessionHistory(session.id); err != nil {
+		logger.Warn(fmt.Sprintf("agentcore-journal: /clear 重置失败 session=%s err=%v", session.id, err))
+		return "✓ /clear 已清空内存上下文；历史记录清理失败，下一轮可能读回旧上下文。"
+	}
+	m.coreJournal.appendUser(session.id,
+		fmt.Sprintf("%s-clear-%d", userMessageID, time.Now().UnixNano()),
+		userContent, time.Now().UTC().Format(time.RFC3339))
+	return "✓ /clear 已清空（会话上下文与历史记录均已重置，配置保留）。"
+}
+
 // handleAgentCoreCompactCommand 对内核对会话历史做一次真实压缩（/compact）。
 //
 // 与 codex 的原生线程压缩同构：命令不落成模型回合，而是宿主侧直接调内核的
@@ -2367,9 +2414,11 @@ func (m *agentAIManager) agentCoreApprove(run agentAIRun, writeJSON agentTermina
 				logger.Info(fmt.Sprintf("approval-hook: MCP default gate require_approval tool=%s session=%s matched=none", call.ToolName, run.sessionID))
 				decision = decisionRequireApproval
 			}
-			// 会话级审批模式覆盖(spec 2026-11-05):bypass_all 降 require 为放行
-			// (跳手机);ask_all 降 auto_approve 为 require(每次问);auto_deny 恒拒。
-			overridden := applyApprovalModeOverride(run.approvalMode, decision)
+			// 会话级审批模式覆盖(spec 2026-11-05;2026-11-15 read_only 并入):
+			// bypass_all 降 require 为放行(跳手机);ask_all 降 auto_approve 为
+			// require(每次问);read_only 降写/执行族 auto_approve 为 require;
+			// auto_deny 恒拒。
+			overridden := applyApprovalModeOverride(run.approvalMode, decision, call.ToolName)
 			if overridden != decision {
 				logger.Info(fmt.Sprintf("approval-hook: MODE-OVERRIDE mode=%s %s→%s tool=%s session=%s", run.approvalMode, decision, overridden, call.ToolName, run.sessionID))
 			}
@@ -2392,7 +2441,8 @@ func (m *agentAIManager) agentCoreApprove(run agentAIRun, writeJSON agentTermina
 		// provider 取请求对象自身，与 approval() 记录点存的 waiter.request.Provider
 		// 对齐（buildAgentCoreApprovalRequest 用 run.provider，两侧一致）。
 		// ask_all/bypass_all 下跳过:用户显式要求每次问/反正全放,记忆免问无意义。
-		if approvalModeSkipsSessionMemory(run.approvalMode) {
+		// read_only 只对写/执行族跳过——记忆免问不能复活被压制的写权限。
+		if approvalModeSkipsSessionMemoryForTool(run.approvalMode, call.ToolName) {
 			logger.Info(fmt.Sprintf("approval-hook: SESSION-MEMORY-SKIPPED mode=%s tool=%s session=%s (agentcore)", run.approvalMode, call.ToolName, run.sessionID))
 		} else if pre := buildAgentCoreApprovalRequest(run, call); m.sessionApprovalAllows(run.sessionID, pre.Provider, pre.Kind, pre.ToolName, pre.Command) {
 			logger.Info(fmt.Sprintf("approval-hook: SESSION-APPROVED (memory) tool=%s kind=%s session=%s (agentcore)", pre.ToolName, pre.Kind, run.sessionID))

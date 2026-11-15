@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -406,4 +407,136 @@ func TestCollectProjectSlashCommandsProviderTag(t *testing.T) {
 			t.Errorf("project command provider=%v want claude", e["provider"])
 		}
 	}
+}
+
+// TestClaudeBuiltinCommands：Claude 内置基线形态（此前注释声称「内置由云端
+// 持有」导致补全面板搜不到 /compact /clear 等——2026-11-15 实测 headless init
+// 快照含内置命令，宿主侧基线落地）。
+func TestClaudeBuiltinCommands(t *testing.T) {
+	cmds := claudeBuiltinCommands()
+	if len(cmds) < 5 {
+		t.Fatalf("expected a sizable claude builtin baseline, got %d", len(cmds))
+	}
+	names := map[string]bool{}
+	for _, c := range cmds {
+		if c["provider"] != "claude" {
+			t.Errorf("builtin %v provider=%v want claude", c["name"], c["provider"])
+		}
+		if c["scope"] != "builtin" || c["origin"] != "builtin" {
+			t.Errorf("builtin %v scope=%v origin=%v want builtin", c["name"], c["scope"], c["origin"])
+		}
+		if d, _ := c["description"].(string); strings.TrimSpace(d) == "" {
+			t.Errorf("builtin %v has empty description", c["name"])
+		}
+		names[c["name"].(string)] = true
+	}
+	for _, want := range []string{"compact", "clear", "model", "help", "cost", "init", "mcp"} {
+		if !names[want] {
+			t.Errorf("missing claude builtin %q", want)
+		}
+	}
+}
+
+// TestFilterVerifiedClaudeCommandsKeepsBuiltins：builtin 条目豁免 init 快照
+// 过滤——快照是 CLI 对自身命令面的上报，宿主基线不派生自它，不得被误杀。
+func TestFilterVerifiedClaudeCommandsKeepsBuiltins(t *testing.T) {
+	commands := []map[string]interface{}{
+		{"name": "compact", "scope": "builtin"},         // builtin：快照为空也保留
+		{"name": "custom-cmd", "scope": "project"},      // 自定义：不在快照里 → 剔除
+		{"name": "verified-cmd", "scope": "project"},    // 在快照里 → 保留
+	}
+	available := map[string]struct{}{"verified-cmd": {}}
+	got := filterVerifiedClaudeCommands(commands, available)
+	names := map[string]bool{}
+	for _, c := range got {
+		names[c["name"].(string)] = true
+	}
+	if !names["compact"] {
+		t.Error("builtin 应豁免快照过滤被保留")
+	}
+	if !names["verified-cmd"] {
+		t.Error("快照内自定义命令应保留")
+	}
+	if names["custom-cmd"] {
+		t.Error("快照外自定义命令应被剔除")
+	}
+}
+
+// TestCollectAgentCoreSlashCommandsFor：agentcore 命令面 = 本机命令基线 +
+// 内核 skills/MCP 能力条目（无 manager 时只有基线）。
+func TestCollectAgentCoreSlashCommandsFor(t *testing.T) {
+	// 无 manager：只出本机命令基线。
+	base := collectAgentCoreSlashCommandsFor(t.TempDir(), nil)
+	names := map[string]bool{}
+	for _, c := range base {
+		if c["provider"] != "agentcore" {
+			t.Errorf("builtin %v provider=%v want agentcore", c["name"], c["provider"])
+		}
+		names[c["name"].(string)] = true
+	}
+	for _, want := range []string{"compact", "clear", "model", "help", "cost"} {
+		if !names[want] {
+			t.Errorf("missing agentcore builtin %q", want)
+		}
+	}
+	if names["skills"] || names["mcp"] {
+		t.Error("无 manager 时不应出现内核能力条目")
+	}
+
+	// 带 manager + home 里有 skills 与 MCP 配置：出 skill:/mcp: 条目。
+	home := t.TempDir()
+	skillsDir := filepath.Join(home, ".claude", "skills")
+	if err := os.MkdirAll(filepath.Join(skillsDir, "pdf"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(skillsDir, "pdf", "SKILL.md"),
+		[]byte("---\nname: pdf\ndescription: Work with PDF files\n---\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeTestHomeFile(t, home, ".claude.json", `{
+		"mcpServers": {"github": {"command": "npx", "args": ["-y", "gh-mcp"]}, "off": {"command": "nope", "disabled": true}}
+	}`)
+	cmds := collectAgentCoreSlashCommandsFor(home, &agentAIManager{})
+	got := map[string]map[string]interface{}{}
+	for _, c := range cmds {
+		got[c["name"].(string)] = c
+	}
+	skill, ok := got["skill:pdf"]
+	if !ok {
+		t.Fatalf("missing skill:pdf entry, got %v", keysOf(got))
+	}
+	if skill["kind"] != "skill" || skill["origin"] != "kernel" {
+		t.Errorf("skill entry kind=%v origin=%v want skill/kernel", skill["kind"], skill["origin"])
+	}
+	mcp, ok := got["mcp:github"]
+	if !ok {
+		t.Fatalf("missing mcp:github entry, got %v", keysOf(got))
+	}
+	if mcp["kind"] != "mcp" {
+		t.Errorf("mcp entry kind=%v want mcp", mcp["kind"])
+	}
+	if _, exists := got["mcp:off"]; exists {
+		t.Error("disabled MCP server 不应出条目")
+	}
+}
+
+// TestNormalizeSlashProviderAgentCore：agentcore 别名拼写全部进命令面。
+func TestNormalizeSlashProviderAgentCore(t *testing.T) {
+	for _, in := range []string{"agentcore", "agent-core", "agent_core", "AgentCore", " AGENTCORE "} {
+		if got := normalizeSlashProvider(in); got != "agentcore" {
+			t.Errorf("normalizeSlashProvider(%q) = %q, want agentcore", in, got)
+		}
+	}
+	if got := normalizeSlashProvider("unknown-thing"); got != "" {
+		t.Errorf("unknown provider = %q, want empty", got)
+	}
+}
+
+func keysOf(m map[string]map[string]interface{}) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }

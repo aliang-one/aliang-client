@@ -200,7 +200,7 @@ func TestClearResetsFinalizedRunSeq(t *testing.T) {
 		t.Fatal("precondition: force-finalized run must be fenced")
 	}
 
-	m.applyLocalSlashCommand(session, "clear", "", "agentcore")
+	m.applyLocalSlashCommand(session, "clear", "", "agentcore", "msg-guard", "/clear")
 
 	if session.runSeq != 0 || session.finalizedRunSeq != 0 {
 		t.Fatalf("after /clear runSeq=%d finalizedRunSeq=%d, want 0/0",

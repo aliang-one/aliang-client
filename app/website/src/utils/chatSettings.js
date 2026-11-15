@@ -93,16 +93,20 @@ export function deviceTranscriptForCreate(conv) {
 // → 覆盖 project_path、deviceTranscriptForCreate → transcript。可选字段——
 // 未设置时键不得出现在载荷（e2e 断言 create 帧字段集，多出的空键会被判为
 // 协议漂移）。
-// 会话级审批模式词表(2026-11-05,spec chat-approval-mode):''=默认推荐
-// (策略现状)/ask_all=每次询问/bypass_all=放过所有。非法值归一为空。
+// 会话级审批模式词表(2026-11-05,spec chat-approval-mode;2026-11-15 三端
+// 统一,read_only 并入):''=默认推荐(策略现状)/ask_all=每次询问/
+// bypass_all=放过所有/read_only=只读(写/执行先问)。非法值归一为空。
 export const APPROVAL_MODES = [
   { value: '', labelKey: 'chat_approvalModeDefault' },
+  { value: 'read_only', labelKey: 'chat_approvalModeReadOnly' },
   { value: 'ask_all', labelKey: 'chat_approvalModeAskAll' },
   { value: 'bypass_all', labelKey: 'chat_approvalModeBypassAll' },
 ];
 
 export function normalizeApprovalMode(raw) {
-  return raw === 'ask_all' || raw === 'bypass_all' ? raw : '';
+  return raw === 'ask_all' || raw === 'bypass_all' || raw === 'read_only'
+    ? raw
+    : '';
 }
 
 export function sessionCreatePayload(conv) {
